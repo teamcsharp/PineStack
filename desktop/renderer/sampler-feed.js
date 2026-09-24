@@ -48,7 +48,25 @@
       const offset = (clock() / 1000) - Number(stream.at);
       if (offset >= 0 && offset <= Number(stream.length || 0) + 4) {
         for (const row of stream.rows || []) {
-          if (Number(row.from) <= offset && offset < Number(row.until)) return row;
+          if (Number(row.from) <= offset && offset < Number(row.until)) {
+            /* stream_now is the accurate clock, but its rows are usually
+             * only {id, from, until}. speaking_now carries words yet is a
+             * four-second snapshot, so around every short-line boundary it
+             * can still describe the previous turn. Enrich the clock-selected
+             * id from the already-fetched full feed instead of either showing
+             * a blank strip or borrowing the stale line's words. */
+            const id = String(row.id || "");
+            const reported = station.speaking_now;
+            const rich = rows.find((item) => String((item || {}).id || "") === id)
+              || (station.chat || []).find((item) => String((item || {}).id || "") === id)
+              || null;
+            const exact = reported && String(reported.id || "") === id
+              ? reported : null;
+            const merged = {...(rich || {}), ...(exact || {}), ...row};
+            merged.text = String((exact && exact.text)
+              || (rich && rich.text) || row.text || "");
+            return merged;
+          }
         }
       }
     }

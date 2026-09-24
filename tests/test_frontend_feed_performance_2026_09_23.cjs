@@ -8,7 +8,7 @@ const RENDERER = path.join(__dirname, '..', 'desktop', 'renderer');
 const read = (name) => fs.readFileSync(path.join(RENDERER, name), 'utf8');
 const settle = () => new Promise((resolve) => setImmediate(resolve));
 
-function feedHarness() {
+function feedHarness(stationFactory) {
   const observers = [];
   const documentListeners = new Map();
   const document = {
@@ -31,6 +31,7 @@ function feedHarness() {
     pineDesktop: {get: async (route) => {
       assert.equal(route, '/api/dj');
       requests += 1;
+      if (stationFactory) return stationFactory(requests);
       return {server_ms: Date.now(), chat: [{id: String(requests)}]};
     }},
     requestAnimationFrame: () => 1,
@@ -57,6 +58,32 @@ function feedHarness() {
     get requests() { return requests; }
   };
 }
+
+test('the current timeline row receives its words when speaking_now is stale', async () => {
+  const h = feedHarness(() => ({
+    server_ms: Date.now(),
+    chat: [
+      {id: 'previous', who: 'Host', text: 'the previous line'},
+      {id: 'current', who: 'Skip', text: 'the dialogue currently being spoken'}
+    ],
+    stream_now: {
+      at: Date.now() / 1000 - 5, length: 20,
+      rows: [
+        {id: 'previous', from: 0, until: 4},
+        {id: 'current', from: 4, until: 11}
+      ]
+    },
+    speaking_now: {id: 'previous', who: 'Host', text: 'the previous line'}
+  }));
+  let payload = null;
+  const leave = h.root.PineStationFeed.subscribe((next) => { payload = next; });
+  await settle();
+  await settle();
+  assert.equal(payload.now.id, 'current');
+  assert.equal(payload.now.who, 'Skip');
+  assert.equal(payload.now.text, 'the dialogue currently being spoken');
+  leave();
+});
 
 function host(active) {
   const classes = new Set(active ? ['active'] : []);

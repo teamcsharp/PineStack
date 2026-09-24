@@ -135,6 +135,8 @@ class LineReviewStore:
                     seq INTEGER PRIMARY KEY AUTOINCREMENT, review_id TEXT NOT NULL,
                     at REAL NOT NULL, body TEXT NOT NULL,
                     FOREIGN KEY(review_id) REFERENCES line_reviews(id));
+                CREATE INDEX IF NOT EXISTS review_decisions_by_review
+                    ON review_decisions(review_id, seq DESC);
                 CREATE TABLE IF NOT EXISTS review_batches (
                     request_id TEXT PRIMARY KEY, body TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS review_instances (
@@ -785,6 +787,10 @@ class LineReviewStore:
             item = self._row(db.execute("SELECT * FROM line_reviews WHERE id=?", (str(review_id),)).fetchone())
             if item is None:
                 return None
+            item["operator_notes"] = [json.loads(row[0]) for row in db.execute(
+                "SELECT body FROM review_decisions WHERE review_id=? "
+                "AND json_extract(body,'$.action')='note' ORDER BY seq DESC LIMIT 100",
+                (item["id"],))]
             if event_seq:
                 event = db.execute('SELECT body FROM review_events WHERE review_id=? AND seq=?',
                                    (item['id'], event_seq)).fetchone()
@@ -806,6 +812,31 @@ class LineReviewStore:
             item["decisions"] = [json.loads(row[0]) for row in db.execute(
                 "SELECT body FROM review_decisions WHERE review_id=? ORDER BY seq DESC LIMIT 100", (item["id"],))]
             return item
+
+    def annotate(self, review_id, note, expected_revision=None, expected_event_seq=None):
+        """Keep operator guidance on the review without changing its verdict."""
+        if not isinstance(note, str) or not note.strip() or len(note) > 2000:
+            raise ValueError("note must be 1 to 2000 characters")
+        if expected_revision is not None:
+            _integer(expected_revision, "expected_revision", 1, 2**63-1)
+        if expected_event_seq is not None:
+            _integer(expected_event_seq, "expected_event_seq", 1, 2**63-1)
+        with self._lock:
+            with self._write() as db:
+                row = db.execute("SELECT * FROM line_reviews WHERE id=?", (str(review_id),)).fetchone()
+                if row is None:
+                    raise KeyError("No such line review")
+                item = self._row(row)
+                if expected_event_seq is not None and expected_event_seq != item["latest_seq"]:
+                    raise ReviewConflictError("This cut has a newer occurrence; reload its evidence before noting")
+                if expected_revision is not None and expected_revision != item["revision"]:
+                    raise ReviewConflictError("This review changed; reload it before noting")
+                entry = {"action": "note", "note": note.strip(), "at": time.time(),
+                         "by": "operator", "event_seq": item["latest_seq"]}
+                db.execute("INSERT INTO review_decisions(review_id,at,body) VALUES (?,?,?)",
+                           (item["id"], entry["at"], _json(entry)))
+                db.execute("UPDATE line_reviews SET revision=revision+1 WHERE id=?", (item["id"],))
+        return {"row": self.get(review_id), "note": entry}
 
     def severity_census(self, gate, advisory, status='pending'):
         """#1196: how this gate's queue splits into hard and advisory.

@@ -125,6 +125,29 @@ class UnheardPick(unittest.TestCase):
         self.assertIs(got, old_gallery)
         self.assertGreater(age, 80 * 3600)
 
+    def test_spoken_round_precedes_older_station_id(self):
+        old_id = row("station_id", age_h=90.0)
+        spoken = row("manager", age_h=10.0)
+        shelves = {"station_id": [old_id], "manager": [spoken]}
+        with mock.patch.object(app, "shelf_rows", lambda k: shelves.get(k, [])), \
+                mock.patch.object(app, "dialogue_row_ready", return_value=True), \
+                mock.patch.object(app, "cupboard_unheard_after", return_value=7200.0):
+            kind, got, _ = app.unheard_pick()
+        self.assertEqual(kind, "manager")
+        self.assertIs(got, spoken)
+
+    def test_recently_refused_row_does_not_block_next_spoken_round(self):
+        first = row("manager", age_h=90.0)
+        second = row("gallery", age_h=10.0)
+        shelves = {"manager": [first], "gallery": [second]}
+        with mock.patch.object(app, "shelf_rows", lambda k: shelves.get(k, [])), \
+                mock.patch.object(app, "dialogue_row_ready", return_value=True), \
+                mock.patch.object(app, "cupboard_unheard_after", return_value=7200.0), \
+                mock.patch.dict(app._UNHEARD_REFUSED, {id(first): time.time() + 300}, clear=True):
+            kind, got, _ = app.unheard_pick()
+        self.assertEqual(kind, "gallery")
+        self.assertIs(got, second)
+
     def test_nothing_younger_than_the_dial_is_taken(self):
         shelves = {"manager": [row("manager", age_h=0.5)], "gallery": [],
                    "news": [], "caller": []}
@@ -222,14 +245,16 @@ class ProducedAdDispatch(unittest.IsolatedAsyncioTestCase):
         old_at, old_rescue = app._UNHEARD_AT[0], app._RESCUE_AT[0]
         old_speaking = app._SPEAKING[0]
         # Only 30 seconds have passed against the ordinary seven-minute dial.
-        # An empty banter larder is what makes this walk due.
+        # No air-ready banter is what makes this walk due. A viable draft
+        # waiting on its recording must not suppress the rescue cadence.
         app._UNHEARD_AT[0] = time.time() - 30.0
         app._SPEAKING[0] = 0
         try:
             with mock.patch.dict(app._RADIO, {"on": True}, clear=False), \
                     mock.patch.object(app, "cupboard_unheard_on", return_value=True), \
                     mock.patch.object(app, "cupboard_unheard_every", return_value=420.0), \
-                    mock.patch.object(app, "larder_stock_count", return_value=0), \
+                    mock.patch.object(app, "larder_stock_count", return_value=1), \
+                    mock.patch.object(app, "larder_ready_count", return_value=0), \
                     mock.patch.object(app, "talk_quiet_for", return_value=0.0), \
                     mock.patch.object(app, "dialogue_quiet_for", return_value=-1.0), \
                     mock.patch.object(app, "radio_paused", return_value=False), \
@@ -256,6 +281,93 @@ class ProducedAdDispatch(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(kwargs["force"])
         self.assertTrue(callable(kwargs["on_handoff"]))
         dialogue.assert_not_awaited()
+
+    async def test_watchdog_timeout_does_not_cancel_waiting_playout(self):
+        handed = asyncio.Event()
+        finished = asyncio.Event()
+
+        async def slow_handoff():
+            await asyncio.sleep(0.04)
+            handed.set()
+            finished.set()
+            return ["broadcast"]
+
+        with self.assertRaises(asyncio.TimeoutError):
+            await asyncio.wait_for(
+                app._unheard_until_handoff(slow_handoff(), handed), 0.01)
+        await asyncio.wait_for(finished.wait(), 1.0)
+
+    async def test_silence_rescue_yields_to_gap_audio_before_long_handoff(self):
+        async def pending(*, force=False):
+            self.assertTrue(force)
+            await asyncio.sleep(1)
+
+        with mock.patch.object(app, "AIR1186_SILENCE_CUPBOARD_S", 0.01), \
+                mock.patch.object(app, "unheard_stock_air", side_effect=pending), \
+                mock.patch.object(app, "_dead_air_late") as late:
+            self.assertEqual(await asyncio.wait_for(
+                app._silence_cupboard_handoff(), 2.0), "")
+            late.assert_called_once_with("the cupboard's silence rescue")
+
+    async def test_silence_rescue_accepts_a_ready_cupboard_handoff(self):
+        with mock.patch.object(app, "unheard_stock_air",
+                               new=mock.AsyncMock(return_value="manager")), \
+                mock.patch.object(app, "_dead_air_late") as late:
+            self.assertEqual(await app._silence_cupboard_handoff(), "manager")
+            late.assert_not_called()
+
+    async def test_cancelled_watchdog_does_not_stack_another_cupboard_handoff(self):
+        handed = asyncio.Event()
+        release = asyncio.Event()
+
+        async def slow_handoff():
+            await release.wait()
+            handed.set()
+            return ["broadcast"]
+
+        waiting = asyncio.create_task(
+            app._unheard_until_handoff(slow_handoff(), handed))
+        await asyncio.sleep(0)
+        waiting.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await waiting
+        self.assertIn(handed, app._UNHEARD_PENDING_HANDOFFS)
+        old_speaking = app._SPEAKING[0]
+        app._SPEAKING[0] = 0
+        try:
+            with mock.patch.dict(app._RADIO, {"on": True}, clear=False), \
+                    mock.patch.object(app, "cupboard_unheard_on", return_value=True), \
+                    mock.patch.object(app, "radio_paused", return_value=False), \
+                    mock.patch.object(app, "talk_quiet_for", return_value=100.0), \
+                    mock.patch.object(app, "dialogue_quiet_for", return_value=-1.0), \
+                    mock.patch.object(app, "_floor_busy", return_value=False), \
+                    mock.patch.object(app, "unheard_pick") as pick:
+                self.assertEqual(await app.unheard_stock_air(force=True), "")
+                pick.assert_not_called()
+        finally:
+            app._SPEAKING[0] = old_speaking
+            release.set()
+            await asyncio.wait_for(handed.wait(), 1.0)
+            await asyncio.sleep(0)
+        self.assertNotIn(handed, app._UNHEARD_PENDING_HANDOFFS)
+
+    async def test_stalled_handoff_defers_row_and_releases_single_flight(self):
+        handed = asyncio.Event()
+        row = {"sid": "stalled-stock"}
+
+        async def never_handed():
+            await asyncio.Event().wait()
+
+        try:
+            with mock.patch.object(app, "UNHEARD_HANDOFF_TIMEOUT", 0.02), \
+                    mock.patch.object(app, "pipeline_log"):
+                self.assertEqual(await asyncio.wait_for(
+                    app._unheard_until_handoff(never_handed(), handed, row), 1.0), [])
+            await asyncio.sleep(0)
+            self.assertGreater(app._UNHEARD_REFUSED[id(row)], time.time())
+            self.assertNotIn(handed, app._UNHEARD_PENDING_HANDOFFS)
+        finally:
+            app._UNHEARD_REFUSED.pop(id(row), None)
 
     async def test_transport_handoff_finishes_watchdog_before_playout_settles(self):
         """A long clip is accepted work at publication, while its tracked
@@ -284,7 +396,7 @@ class ProducedAdDispatch(unittest.IsolatedAsyncioTestCase):
             with mock.patch.dict(app._RADIO, {"on": True}, clear=False), \
                     mock.patch.object(app, "cupboard_unheard_on", return_value=True), \
                     mock.patch.object(app, "cupboard_unheard_every", return_value=420.0), \
-                    mock.patch.object(app, "larder_stock_count", return_value=0), \
+                    mock.patch.object(app, "larder_ready_count", return_value=0), \
                     mock.patch.object(app, "talk_quiet_for", return_value=100.0), \
                     mock.patch.object(app, "dialogue_quiet_for", return_value=100.0), \
                     mock.patch.object(app, "radio_paused", return_value=False), \
@@ -323,15 +435,22 @@ class BanterBootstrap(unittest.TestCase):
     """The reserve gets a playable first round before it grows deep."""
 
     def test_empty_larder_banks_a_short_complete_round_first(self):
-        with mock.patch.object(app, "larder_stock_count", return_value=0):
+        with mock.patch.object(app, "larder_ready_count", return_value=0):
             got = app.banter_bank_plan(30, bank=True)
         self.assertTrue(got["bootstrap"])
         self.assertFalse(got["rich"])
         self.assertEqual(got["judge_lines"], app.BANTER_BOOTSTRAP_LINES)
         self.assertEqual(got["lines"], app.BANTER_BOOTSTRAP_LINES)
 
-    def test_later_banked_rounds_keep_the_rich_expansion(self):
-        with mock.patch.object(app, "larder_stock_count", return_value=1):
+    def test_one_ready_round_still_banks_a_short_complete_round(self):
+        with mock.patch.object(app, "larder_ready_count", return_value=1):
+            got = app.banter_bank_plan(12, bank=True)
+        self.assertTrue(got["bootstrap"])
+        self.assertFalse(got["rich"])
+        self.assertEqual(got["judge_lines"], app.BANTER_BOOTSTRAP_LINES)
+
+    def test_two_ready_rounds_keep_the_rich_expansion(self):
+        with mock.patch.object(app, "larder_ready_count", return_value=2):
             got = app.banter_bank_plan(12, bank=True)
         self.assertFalse(got["bootstrap"])
         self.assertTrue(got["rich"])
@@ -339,7 +458,7 @@ class BanterBootstrap(unittest.TestCase):
         self.assertEqual(got["lines"], 16)
 
     def test_assigned_calls_are_never_shortened_by_an_empty_larder(self):
-        with mock.patch.object(app, "larder_stock_count", return_value=0):
+        with mock.patch.object(app, "larder_ready_count", return_value=0):
             got = app.banter_bank_plan(11, bank=True, bootstrap_ok=False)
         self.assertFalse(got["bootstrap"])
         self.assertTrue(got["rich"])
@@ -383,6 +502,22 @@ class FlatSingleTake(unittest.TestCase):
         self.assertTrue(entry["whole"])
         self.assertTrue(entry["render_stream"])
         self.assertEqual(entry["prep_kind"], "ad")
+
+    def test_station_id_drop_seat_is_a_valid_saved_performance(self):
+        key = "station-id-take"
+        text = "Pine Box FM."
+        clip = {"path": "/voice-media/station-id.wav", "seconds": 4.5}
+        saved = {"clip": clip, "text": text, "voice": "xtts:drop", "who": "drop"}
+        shelf = {"sid": "station-id-flat", "key": key, "text": text,
+                 "seconds": 4.5, "tint_ok": True}
+        with mock.patch.dict(app._PANTRY, {key: saved}, clear=False), \
+                mock.patch.object(app, "dialogue_row_ready", return_value=True), \
+                mock.patch.object(app, "media_present", return_value=True):
+            takes = app._ready_round_takes("station_id", shelf)
+            other = app._ready_round_takes("ad", shelf)
+        self.assertEqual(len(takes), 1)
+        self.assertEqual(takes[0]["who"], "drop")
+        self.assertEqual(other, [])
 
 
 class ReplaceSweep(unittest.TestCase):
@@ -489,7 +624,7 @@ class ConsumerCadenceReport(unittest.TestCase):
     def test_empty_larder_cadence_is_visible_in_unheard_state(self):
         import inspect
         source = inspect.getsource(app.unheard_state)
-        self.assertIn("larder_stock_count()", source)
+        self.assertIn("larder_ready_count()", source)
         self.assertIn("UNHEARD_EMPTY_LARDER_EVERY", source)
 
 

@@ -9,8 +9,11 @@ import io
 import random
 import sys
 import textwrap
+from pathlib import Path
 
-SRC = sys.argv[1]
+_arg = Path(sys.argv[1]) if len(sys.argv) > 1 else None
+SRC = str(_arg if _arg and _arg.is_file()
+          else Path(__file__).resolve().parents[1] / "app.py")
 s = io.open(SRC, encoding="utf-8").read()
 tree = ast.parse(s)
 lines = s.split("\n")
@@ -236,4 +239,5 @@ print("     ask :", routine()[0]["ask"])
 
 print("\n%s  (%d failure(s))" % ("ALL PASS" if not fails else "FAILURES",
                                 len(fails)))
-sys.exit(1 if fails else 0)
+if __name__ == "__main__":
+    sys.exit(1 if fails else 0)

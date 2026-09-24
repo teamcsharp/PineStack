@@ -17,10 +17,10 @@ const vm = require('node:vm');
 
 /* The module attaches itself to whatever it is given as `window`. It needs no
    DOM for the parser, which is the half worth testing here. */
-function loadSegments() {
+function loadSegments(window) {
   const src = fs.readFileSync(
     path.join(__dirname, '../desktop/renderer/pine-segments.js'), 'utf8');
-  const sandbox = {window: {}, globalThis: {}};
+  const sandbox = {window: window || {}, globalThis: {}};
   sandbox.globalThis = sandbox;
   vm.createContext(sandbox);
   vm.runInContext(src, sandbox);
@@ -96,7 +96,7 @@ test('a document with nothing usable still names itself from the file', () => {
 
 test('the module exposes what the glass and the drop road need', () => {
   const S = loadSegments();
-  ['pane', 'topics', 'acceptDrops', 'plotWindow', 'read', 'close']
+  ['pane', 'topics', 'topicWindow', 'acceptDrops', 'plotWindow', 'read', 'close']
     .forEach((name) => assert.equal(typeof S[name], 'function', name));
 });
 
@@ -105,4 +105,108 @@ test('it never reaches for a DOM just to parse', () => {
      test in this file would have thrown before reaching here. */
   const S = loadSegments();
   assert.ok(S.read('# ok\n\n## a\nb', 'x.md').acts.length > 0);
+});
+
+class FakeNode {
+  constructor(tag) {
+    this.tagName = String(tag).toUpperCase();
+    this.children = [];
+    this.parentNode = null;
+    this.listeners = {};
+    this.className = '';
+    this.textContent = '';
+    this.value = '';
+    this.attributes = {};
+    const names = new Set();
+    this.classList = {
+      add: name => names.add(name), remove: name => names.delete(name),
+      contains: name => names.has(name)
+    };
+  }
+  appendChild(node) { node.parentNode = this; this.children.push(node); return node; }
+  removeChild(node) {
+    this.children = this.children.filter((child) => child !== node);
+    node.parentNode = null;
+  }
+  replaceChildren(...nodes) {
+    this.children.forEach(child => { child.parentNode = null; });
+    this.children = [];
+    nodes.forEach(node => this.appendChild(node));
+  }
+  remove() { if (this.parentNode) this.parentNode.removeChild(this); }
+  setAttribute(name, value) { this.attributes[name] = String(value); }
+  addEventListener(name, fn) {
+    if (!this.listeners[name]) this.listeners[name] = [];
+    this.listeners[name].push(fn);
+  }
+  querySelector(selector) {
+    const cls = selector.charAt(0) === '.' ? selector.slice(1) : '';
+    if (cls && String(this.className).split(/\s+/).includes(cls)) return this;
+    for (const child of this.children) {
+      const found = child.querySelector(selector);
+      if (found) return found;
+    }
+    return null;
+  }
+  focus() { this.focused = true; }
+  fire(name, event) {
+    for (const fn of this.listeners[name] || []) fn(event || {});
+  }
+}
+
+function fakeDocument() {
+  return {body: new FakeNode('body'), createElement: tag => new FakeNode(tag)};
+}
+
+test('the script topic window is singular and queues the scenario next', async () => {
+  const document = fakeDocument(), posts = [];
+  const root = {
+    document,
+    pineDesktop: {
+      get: () => Promise.resolve({topics: []}),
+      post: (route, body) => {
+        posts.push({route, body});
+        return Promise.resolve({id: 'topic-1', queued: true, queue_position: 1});
+      }
+    }
+  };
+  const S = loadSegments(root);
+  const first = S.topicWindow();
+  assert.equal(S.topicWindow(), first, 'opening twice returns the standing sheet');
+  assert.equal(document.body.children.length, 1);
+  const input = first.querySelector('.pseg-topic-in');
+  const queue = first.querySelector('.pseg-next');
+  queue.fire('click');
+  assert.equal(posts.length, 0, 'empty scenarios are not sent');
+  input.value = 'the station manager is secretly in the studio';
+  queue.fire('click');
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(posts, [{route: '/api/dj/topics', body: {
+    text: 'the station manager is secretly in the studio', kind: 'topic', next: true
+  }}]);
+  assert.equal(input.value, '');
+  assert.match(first.querySelector('.pseg-note').textContent, /saved and queued/);
+});
+
+test('the Script toolbar puts the scenario control between views and video', () => {
+  const src = fs.readFileSync(
+    path.join(__dirname, '../desktop/renderer/script-page.js'), 'utf8');
+  const bar = src.slice(src.indexOf('  function buildBar()'),
+    src.indexOf('  function buildSaying()', src.indexOf('  function buildBar()')));
+  assert.match(bar, /pineIcon\('c:add'/);
+  assert.match(bar, /PineSegments[\s\S]{0,100}topicWindow/);
+  assert.ok(bar.indexOf('bar.appendChild(pick)') < bar.indexOf('bar.appendChild(topic)'));
+  assert.ok(bar.indexOf('bar.appendChild(topic)') < bar.indexOf('bar.appendChild(reel)'));
+});
+
+test('the tablet scenario sheet mutes dictation and exposes saved topic actions', () => {
+  const src = fs.readFileSync(
+    path.join(__dirname, '../desktop/renderer/pine-segments.js'), 'utf8');
+  assert.match(src, /PineDuck\.hold\('pseg-topic-dictation', 0, wrap\)/);
+  assert.match(src, /addEventListener\('pointerdown', dictationTap, true\)/);
+  assert.match(src, /dot\.finish\(\)/);
+  assert.match(src, /history: true, microphone: true/);
+  assert.match(src, /'\/api\/dj\/topics\/' \+ encodeURIComponent\(saved\.id\)/);
+  assert.match(src, /actOn\(saved, 'queue'/);
+  assert.match(src, /actOn\(saved, 'drop'/);
 });

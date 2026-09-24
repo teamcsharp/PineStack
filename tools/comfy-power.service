@@ -1,0 +1,21 @@
+[Unit]
+Description=Stop or start ComfyUI when the Pine Box agent asks (flag file bridge)
+
+[Service]
+Type=oneshot
+# The companion to comfyui-kick, which only ever RESTARTS. This one can take
+# the engine away entirely - the hard lever the memory valve needs when a
+# render is pressuring the unified pool the radio lives in.
+#
+# The flag carries the ACTION. The container cannot run systemctl and has no
+# business holding a radio; this is the one door, and it does exactly two
+# things, named here so neither the panel nor the agent can widen it.
+# The flag is removed FIRST so a crash cannot leave it looping, and an
+# unconsumed flag is how comfy_unload in app.py proves the bridge is absent.
+ExecStart=/bin/sh -c 'F=/home/ehm_eckx/pinevoice-stack/spark-agent/data/comfy_power; \
+  A=$(head -c 32 "$F" 2>/dev/null | tr -cd "a-z-"); rm -f "$F"; \
+  case "$A" in \
+    stop)  systemctl stop comfyui.service ;; \
+    start) systemctl start comfyui.service ;; \
+    *)     echo "unknown action: $A" ;; \
+  esac'

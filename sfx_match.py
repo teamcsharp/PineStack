@@ -40,6 +40,115 @@ from typing import Any, Iterable
 
 VERSION = 1
 
+# One automatic indexing tick must stay small enough to yield to playback.
+# These helpers are policy only: the durable SQLite queue and media work live
+# in clip_speech, while this module remains free of I/O and station imports.
+INDEX_BATCH_DEFAULT = 12
+INDEX_BATCH_MAX = 64
+INDEX_RETRY_BASE_SECONDS = 30.0
+INDEX_RETRY_MAX_SECONDS = 6 * 60 * 60.0
+INDEX_LANES = ("speech", "vision")
+
+
+def index_batch_size(value: Any, default: int = INDEX_BATCH_DEFAULT) -> int:
+    """A hard boundary for one background indexing tick."""
+    try:
+        wanted = int(value)
+    except (TypeError, ValueError):
+        wanted = int(default)
+    return max(1, min(INDEX_BATCH_MAX, wanted))
+
+
+def index_retry_seconds(failures: Any, base: float = INDEX_RETRY_BASE_SECONDS,
+                        cap: float = INDEX_RETRY_MAX_SECONDS) -> float:
+    """Persisted exponential rest after real worker failures.
+
+    Empty transcripts/descriptions are successful inspections, not failures;
+    callers only use this delay when extraction or a service raises.
+    """
+    try:
+        failed = max(1, int(failures))
+    except (TypeError, ValueError):
+        failed = 1
+    return min(max(1.0, float(cap)), max(1.0, float(base)) * (2 ** (failed - 1)))
+
+
+def index_lane_after(lane: Any) -> str:
+    """The other persistent lane, defaulting a new book to speech first."""
+    return "speech" if str(lane or "").lower() == "vision" else "vision"
+
+
+def clamp_percent(value: Any, default: int) -> int:
+    """Normalize a saved percentage without losing either endpoint."""
+    try:
+        return max(0, min(100, int(value)))
+    except (TypeError, ValueError, OverflowError):
+        return default
+
+
+def choose_ratio_pool(rows: Iterable[Any], ads_percent: Any,
+                      mp4_percent: Any = 80, *, is_ad: Any, is_video: Any,
+                      rng: Any = random) -> list[Any]:
+    """Choose the source and media bucket for one SFX Guy broadcast draw.
+
+    `rows` must already be the station's eligible, weighted draw list. This
+    only chooses a bucket; the caller's ordinary draw and rotation decide the
+    clip. The two percentages are overall targets, subject to available
+    buckets (sfx_ads currently contains MP4s only).
+    """
+    buckets: dict[tuple[bool, bool], list[Any]] = {}
+    for row in rows:
+        key = (bool(is_video(row)), bool(is_ad(row)))
+        buckets.setdefault(key, []).append(row)
+    if not buckets:
+        return []
+
+    def side(percent: int) -> bool:
+        if percent == 0:
+            return False
+        if percent == 100:
+            return True
+        return rng.random() * 100 < percent
+
+    video_share = clamp_percent(mp4_percent, 80) / 100.0
+    ads_share = clamp_percent(ads_percent, 0) / 100.0
+    has_video = any(key[0] for key in buckets)
+    has_audio = any(not key[0] for key in buckets)
+    if not has_video:
+        video_share = 0.0
+    elif not has_audio:
+        video_share = 1.0
+
+    # Solve the two-by-two mix so the ad share is measured across all clips,
+    # not only within MP4s. Missing buckets constrain the attainable share.
+    bounds = {}
+    for media in (False, True):
+        ad = (media, True) in buckets
+        general = (media, False) in buckets
+        bounds[media] = (0.0 if general else 1.0,
+                         1.0 if ad else 0.0)
+    audio_weight = 1.0 - video_share
+    min_ads = video_share * bounds[True][0] + audio_weight * bounds[False][0]
+    max_ads = video_share * bounds[True][1] + audio_weight * bounds[False][1]
+    target = max(min_ads, min(max_ads, ads_share))
+    if video_share == 0:
+        video_ads = 0.0
+        audio_ads = target
+    elif audio_weight == 0:
+        video_ads = target
+        audio_ads = 0.0
+    else:
+        lo = max(bounds[True][0], (target - audio_weight * bounds[False][1]) / video_share)
+        hi = min(bounds[True][1], (target - audio_weight * bounds[False][0]) / video_share)
+        video_ads = max(lo, min(hi, ads_share))
+        audio_ads = (target - video_share * video_ads) / audio_weight
+
+    video = side(video_share * 100)
+    ads = side((video_ads if video else audio_ads) * 100)
+    if (video, ads) not in buckets:
+        ads = not ads
+    return buckets[(video, ads)]
+
 # --- the dial ----------------------------------------------------------------
 #
 # A candidate's score is the sum of the weights of the words it shares with
@@ -380,6 +489,8 @@ class ClipIndex:
         self.folder_entries: dict[int, array.array] = {}
         self.folder_keywords: dict[int, list[str]] = {}
         self.folder_post: dict[str, list[int]] = {}
+        self.row_ix: dict[int, int] = {}
+        self.indexed_tokens: list[set[str]] = []
         self.wordy = 0
         self.clips = 0
         self.built_at = 0.0
@@ -403,7 +514,9 @@ class ClipIndex:
                 entries[fid] = []
             ix = n
             n += 1
-            self.rowids.append(int(rowid))
+            rid = int(rowid)
+            self.rowids.append(rid)
+            self.row_ix[rid] = ix
             self.fids.append(fid)
             self.video.append(1 if is_video else 0)
             try:
@@ -412,12 +525,15 @@ class ClipIndex:
                 self.secs.append(0.0)
             entries[fid].append(ix)
             nm = str(name or "")
+            indexed: set[str] = set()
             if not is_bare_name(nm):
                 toks = tokens(nm)
                 if toks:
                     self.wordy += 1
                 for t in toks:
                     post.setdefault(t, []).append(ix)
+                    indexed.add(t)
+            self.indexed_tokens.append(indexed)
             if nap is not None and n % nap_every == 0:
                 try:
                     nap()
@@ -431,6 +547,33 @@ class ClipIndex:
             given = list((folder_keywords or {}).get(folder) or [])
             self.set_folder_keywords(folder, given or folder_seed_keywords(folder))
         return self
+
+    def add_document_terms(self, rowid: Any, text: Any) -> int:
+        """Add newly learned speech/vision terms without rebuilding the book.
+
+        A completed auto-index item only adds evidence to a clip; it does not
+        change its identity, folder, duration, or media kind. Keeping a token
+        set per row makes retries/idempotent delivery harmless and lets the
+        live matcher see a result immediately.
+        """
+        try:
+            ix = self.row_ix.get(int(rowid))
+        except (TypeError, ValueError):
+            return 0
+        if ix is None:
+            return 0
+        known = self.indexed_tokens[ix]
+        fresh = [tok for tok in tokens(text) if tok not in known]
+        if not fresh:
+            return 0
+        if not known:
+            self.wordy += 1
+        for tok in fresh:
+            posting = self.post.setdefault(tok, array.array("i"))
+            posting.append(ix)
+            self.df[tok] = len(posting)
+            known.add(tok)
+        return len(fresh)
 
     def set_folder_keywords(self, folder: str, keywords: Iterable[str]) -> None:
         """Replace one folder's theme words. Accepts stems (what

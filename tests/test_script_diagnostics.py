@@ -55,6 +55,32 @@ class CaptureAnalysisTests(unittest.TestCase):
         self.assertEqual(result['counts']['same_line_dom_reindex'], 2)
         self.assertNotIn('highlight_identity_changes', result['counts'])
 
+    def test_same_line_automatic_viewport_jump_names_distance_and_owner(self):
+        first = event(index=45, ord0=7)
+        first.update(scroll_top_px=2898, lit_top_px=81, scroll_owner='follow:tick')
+        jumped = event(index=45, ord0=7, start=1, end=2)
+        jumped.update(scroll_top_px=4260, lit_top_px=-1282,
+                       scroll_owner='fold:follow')
+        capture = view([first, jumped])
+        capture['snapshot']['viewport'] = {'height_px': 720}
+
+        result = analyze_capture(capture)
+        finding = next(item for item in result['findings']
+                       if item['code'] == 'automatic_viewport_jump')
+        self.assertIn('1362px', finding['message'])
+        self.assertIn('fold:follow', finding['message'])
+        self.assertEqual(finding['evidence'][0]['line_id'], 'a')
+
+    def test_user_scroll_and_normal_line_advance_are_not_viewport_faults(self):
+        first = event('a', index=45, ord0=7)
+        first.update(scroll_top_px=100, scroll_owner='follow:tick')
+        user = event('a', index=45, ord0=7, start=1, end=2)
+        user.update(scroll_top_px=900, scroll_owner='user:touch')
+        advanced = event('b', index=46, ord0=8, start=2, end=3)
+        advanced.update(scroll_top_px=1700, scroll_owner='follow:tick')
+        self.assertNotIn('automatic_viewport_jump',
+                         self.codes(view([first, user, advanced])))
+
     def test_a_row_whose_script_order_moved_is_not_a_reindex(self):
         # [#1282] the other side of the same law: if (block, ord) moved,
         # the script itself advanced and the page followed it. Not a fault.

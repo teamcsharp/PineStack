@@ -18,6 +18,9 @@ from urllib.parse import urlsplit
 
 
 class System2Media:
+    PREPARATION_HORIZON_FLOOR_HOURS = 4.0
+    PREPARATION_HORIZON_MAX_HOURS = 24.0
+
     def __init__(self, host):
         self.host = host
         self._proofs = {}
@@ -25,6 +28,115 @@ class System2Media:
         # #1074: the stage at which the last delivery was refused, for the
         # runtime's note; a bare False said nothing about which door shut.
         self.last_refusal = ""
+
+    @staticmethod
+    def _finite_number(value, default=0.0):
+        try:
+            number = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return float(default)
+        return number if math.isfinite(number) else float(default)
+
+    def _paused_state(self):
+        """Return a fail-closed pause reading for anything that could air."""
+        try:
+            return bool(self.host.radio_paused()), True
+        except Exception:  # noqa: BLE001 - an unknown pause state must stay silent
+            return True, False
+
+    def air_allowed(self):
+        """Whether an already-prepared item may enter an audible transport."""
+        paused, pause_known = self._paused_state()
+        return bool((self.host._RADIO or {}).get("on")) and pause_known and not paused
+
+    def preparation_contract(self, configured_horizon_hours=None):
+        """Describe bounded preparation admission without performing any work.
+
+        Operator pause is a preparation mode, not an off switch. This contract
+        deliberately permits writers, reviewers and recording rooms while the
+        separate ``air_allowed`` gate keeps publication, speech and playback
+        closed. Readiness comes from the host's durable cupboard measurement;
+        no in-memory counter is manufactured here.
+        """
+        radio = self.host._RADIO or {}
+        station_on = bool(radio.get("on"))
+        paused, pause_known = self._paused_state()
+        horizons = [self.PREPARATION_HORIZON_FLOOR_HOURS]
+        if configured_horizon_hours is not None:
+            horizons.append(self._finite_number(configured_horizon_hours))
+        schedule_horizon = getattr(self.host, "schedule_horizon_hours", None)
+        if callable(schedule_horizon):
+            try:
+                horizons.append(self._finite_number(schedule_horizon()))
+            except Exception:  # noqa: BLE001 - other configured sources remain valid
+                pass
+        prepare_target = getattr(self.host, "prepare_target_seconds", None)
+        if callable(prepare_target):
+            try:
+                horizons.append(self._finite_number(prepare_target()) / 3600.0)
+            except Exception:  # noqa: BLE001
+                pass
+        settings = getattr(self.host, "dj_settings", None)
+        if callable(settings):
+            try:
+                horizons.append(self._finite_number((settings() or {}).get("prepare_hours")))
+            except Exception:  # noqa: BLE001
+                pass
+        horizon_hours = max(self.PREPARATION_HORIZON_FLOOR_HOURS,
+                            min(self.PREPARATION_HORIZON_MAX_HOURS, max(horizons)))
+        target_seconds = horizon_hours * 3600.0
+        ready_seconds, readiness_known = 0.0, False
+        prepared_seconds = getattr(self.host, "prepared_seconds", None)
+        if callable(prepared_seconds):
+            try:
+                ready_seconds = max(0.0, self._finite_number(prepared_seconds()))
+                readiness_known = True
+            except Exception:  # noqa: BLE001
+                pass
+        may_prepare = station_on
+        may_air = station_on and pause_known and not paused
+        mode = ("off" if not station_on else
+                "prepare_while_paused" if paused else "prepare_while_live")
+        return {
+            "mode": mode,
+            "station_on": station_on,
+            "operator_paused": paused,
+            "pause_known": pause_known,
+            "prepare_allowed": may_prepare,
+            "air_allowed": may_air,
+            "horizon_hours": horizon_hours,
+            "target_seconds": target_seconds,
+            "ready_seconds": ready_seconds,
+            "remaining_seconds": max(0.0, target_seconds - ready_seconds),
+            "readiness_known": readiness_known,
+            "durable_hooks": {
+                "pantry": callable(getattr(self.host, "_pantry_save", None)),
+                "larder": callable(getattr(self.host, "_larder_save", None)),
+            },
+            "reason": ("station is off" if not station_on else
+                       "operator pause reserves the station for preparation" if paused else
+                       "station is live; normal preparation admission applies"),
+        }
+
+    def checkpoint_preparation(self, pantry=True, larder=False):
+        """Persist completed preparation through the host's existing stores.
+
+        This method has no publication or playback path. Missing stores are
+        reported instead of being treated as durable, and save failures remain
+        visible to the caller so a job cannot be marked complete on a false ACK.
+        """
+        saved = []
+        if pantry:
+            save = getattr(self.host, "_pantry_save", None)
+            if callable(save):
+                save(True)
+                saved.append("pantry")
+        if larder:
+            save = getattr(self.host, "_larder_save", None)
+            if callable(save):
+                save()
+                saved.append("larder")
+        return tuple(saved)
 
     def _path(self, clip):
         raw = str((clip or {}).get("path") or "")
@@ -240,8 +352,9 @@ class System2Media:
             return False
 
         def allowed():
-            if not h._RADIO.get("on") or h.radio_paused():
-                return _no("the station is paused" if h.radio_paused() else "the station is off")
+            if not self.air_allowed():
+                paused, _known = self._paused_state()
+                return _no("the station is paused" if paused else "the station is off")
             if not can_handoff():
                 return False                     # the runtime's check has said why
             if resolved["kind"] == "track_talk":
@@ -257,7 +370,7 @@ class System2Media:
             return True
 
         if not allowed():
-            self.last_refusal = ("the station is off or paused" if not h._RADIO.get("on") or h.radio_paused()
+            self.last_refusal = ("the station is off or paused" if not self.air_allowed()
                                  else "the reservation is no longer valid for this occurrence")
             return False
         if fresh["media_kind"] != "produced":

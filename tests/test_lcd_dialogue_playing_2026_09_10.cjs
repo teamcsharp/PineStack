@@ -85,6 +85,20 @@ test('a turn whose id is in no chat row is not invented out of nothing', () => {
   assert.deepEqual(rows, []);
 });
 
+test('a sparse stream row keeps same-id words from speaking_now after restart', () => {
+  const rows = stationRows({
+    chat: [],
+    stream_now: {at: AT, length: 30,
+      rows: [{id: 'live-after-restart', from: 0, until: 30}]},
+    speaking_now: {id: 'live-after-restart', who: 'cohost', name: 'Skip',
+      kind: 'banter', text: 'These are the words currently on the radio.'}
+  }, NOW);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].lcdStatus, 'Playing');
+  assert.equal(rows[0].text, 'These are the words currently on the radio.');
+  assert.equal(rows[0].name, 'Skip');
+});
+
 test('a round that has finished stops claiming to be on the air', () => {
   const rows = stationRows(coalesced({
     /* started a full two minutes ago; length 30 plus the 4s grace is past */
@@ -93,6 +107,26 @@ test('a round that has finished stops claiming to be on the air', () => {
   }), NOW);
   assert.equal(rows.some((row) => row.lcdStatus === 'Playing'), false);
   assert.equal(rows.length, 2, 'but the lines are still listed');
+});
+
+test('a paused or expired round cannot revive an old speaking report', () => {
+  const stale = {id: 'one', who: 'dj', text: 'the first line of the round'};
+  const paused = stationRows(coalesced({paused: true, speaking_now: stale}), NOW);
+  assert.equal(paused.some((row) => row.lcdStatus === 'Playing'), false);
+  const expired = stationRows(coalesced({
+    speaking_now: stale,
+    stream_now: {at: NOW / 1000 - 120, length: 30,
+      rows: [{id: 'one', from: 0, until: 5}, {id: 'two', from: 5, until: 30}]}
+  }), NOW);
+  assert.equal(expired.some((row) => row.lcdStatus === 'Playing'), false);
+});
+
+test('a stale airing stamp cannot claim a second Playing row', () => {
+  const station = coalesced();
+  station.chat[1].aired = 'airing';
+  const rows = stationRows(station, NOW);
+  assert.deepEqual(rows.filter((row) => row.lcdStatus === 'Playing')
+    .map((row) => row.id), ['one']);
 });
 
 test('rows without audio are still listed, just not grabbable', () => {

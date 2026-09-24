@@ -153,6 +153,9 @@
   var ROOTS = [
     {root: '.ld-box', handle: '.ld-head'},
     {root: '.sp-find-box', handle: '.sp-find-head'},
+    {root: '.pseg-sheet', handle: '.pseg-sheet-top'},
+    {root: '.ct-box', handle: '.ct-head'},
+    {root: '.pine-console-list', handle: '.pine-console-list-head'},
     {root: '.la-sheet', handle: ':scope > :first-child'},
     {root: '.cd-back > *', handle: ':scope > :first-child'},
     {root: '#pineReportPad', handle: null},
@@ -160,6 +163,14 @@
   ];
   var CONTROLS = 'button, input, select, textarea, a, [contenteditable], label, summary, details';
   var live = null;
+  var topZ = 2147483060;
+
+  function raise(box) {
+    if (!box || !box.style) return;
+    topZ = Math.min(2147483078, topZ + 1);
+    box.style.zIndex = String(topZ);
+    try { if (root.PineSfxTv) root.PineSfxTv.viewChanged(); } catch (e) { /* no wall */ }
+  }
 
   function findRoot(target) {
     for (var i = 0; i < ROOTS.length; i += 1) {
@@ -172,6 +183,15 @@
         if (!h.contains(target)) return null;   /* not on the handle: scroll, select, type */
       }
       return {root: r, handle: h || r};
+    }
+    var generic = target.closest
+      ? target.closest('[role="dialog"], [aria-modal="true"], .modal, .dialog, .popover') : null;
+    if (generic) {
+      var handle = null;
+      try {
+        handle = generic.querySelector('[data-pine-drag-handle], header, .modal-header, .dialog-header');
+      } catch (e) { handle = null; }
+      if (handle && handle.contains(target)) return {root: generic, handle: handle};
     }
     return null;
   }
@@ -195,9 +215,12 @@
     if (ev.pointerType === 'mouse' && ev.button !== 0) return;
     var t = ev.target;
     if (!t || !t.closest) return;
+    var popup = t.closest('[data-pine-drag], [role="dialog"], [aria-modal="true"], .modal, .dialog, .popover');
+    if (popup) raise(popup);
     if (t.closest(CONTROLS)) return;
     var got = findRoot(t);
     if (!got) return;
+    raise(got.root);
     live = {box: got.root, handle: got.handle, id: ev.pointerId,
       x: ev.clientX, y: ev.clientY, from: null, moved: false};
     try { got.handle.setPointerCapture(ev.pointerId); } catch (e) { /* older engine */ }

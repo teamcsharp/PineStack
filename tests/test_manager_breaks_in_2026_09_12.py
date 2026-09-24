@@ -240,8 +240,16 @@ class TheMemoClaimsTheNextRound(unittest.TestCase):
         """Announcing a memo that then fails to arrive is worse than not
         announcing one."""
         with mock.patch.object(app, "manager_break_on", lambda: True),                 mock.patch.object(app, "manager_due_why", lambda: "his entry"),                 mock.patch.object(app, "_ready_shelf_row",
-                                  lambda k, rescue=False, pick=None: None):
+                                  lambda k, rescue=False, pick=None: None),                 mock.patch.object(app, "manager_prepared_page", return_value=None):
             self.assertEqual(app.manager_break_claim(), "")
+
+    def test_recorded_page_can_claim_even_when_shelf_is_empty(self):
+        with mock.patch.object(app, "manager_break_on", return_value=True), \
+                mock.patch.object(app, "manager_due_why", return_value="his entry"), \
+                mock.patch.object(app, "_ready_shelf_row", return_value=None), \
+                mock.patch.object(app, "manager_prepared_page",
+                                  return_value={"id": "ready"}):
+            self.assertEqual(app.manager_break_claim(), "his entry")
 
     def test_it_never_claims_when_nothing_is_due(self):
         with mock.patch.object(app, "manager_break_on", lambda: True),                 mock.patch.object(app, "manager_due_why", lambda: ""),                 mock.patch.object(app, "_ready_shelf_row",
@@ -292,9 +300,23 @@ class EntryGuard(unittest.TestCase):
         now = time.time()
         with mock.patch.object(app, "entry_guard_on", lambda: True),                 mock.patch.object(app, "entry_window_now",
                                   lambda: ("manager", now - 30, now + 200)),                 mock.patch.object(app, "entry_own_aired", lambda k, a, b: 0.0),                 mock.patch.object(app, "_ready_shelf_row",
-                                  lambda k, rescue=False, pick=None: None):
+                                  lambda k, rescue=False, pick=None: None),                 mock.patch.object(app, "manager_prepared_page", return_value=None):
             self.assertEqual(app.entry_guard_road(), "")
             self.assertFalse(app.entry_guard_blocks("caller"))
+
+    def test_recorded_manager_page_blocks_unrelated_call_and_sfx(self):
+        now = time.time()
+        with mock.patch.object(app, "entry_guard_on", return_value=True), \
+                mock.patch.object(app, "entry_window_now",
+                                  return_value=("manager", now - 30, now + 200)), \
+                mock.patch.object(app, "entry_own_aired", return_value=0.0), \
+                mock.patch.object(app, "_ready_shelf_row", return_value=None), \
+                mock.patch.object(app, "manager_prepared_page",
+                                  return_value={"id": "ready"}):
+            self.assertEqual(app.entry_guard_road(), "manager")
+            self.assertTrue(app.entry_guard_blocks("caller"))
+            self.assertTrue(app.entry_guard_blocks("sfxguy"))
+            self.assertFalse(app.entry_guard_blocks("manager"))
 
     def test_the_guard_lifts_once_the_road_has_aired(self):
         """It buys the road its turn, not the whole entry."""

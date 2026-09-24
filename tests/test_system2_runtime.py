@@ -197,12 +197,74 @@ class System2RuntimeTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_paused_station_prepares_without_resuming_or_airing(self):
         self.host.paused = True
+        self.runtime.config['horizon_hours'] = 3
         self.host.add('retained', ready=False)
-        await self.runtime.prepare()
+        with mock.patch.object(self.runtime.store, 'claim_job',
+                               wraps=self.runtime.store.claim_job) as claim:
+            await self.runtime.prepare()
+        self.assertEqual(claim.call_args.kwargs['lookahead_seconds'], 3 * 3600)
         self.host.larder_prepare.assert_awaited_once()
         self.assertTrue(self.host.paused)
         self.assertFalse(await self.runtime.dispatch())
         self.host._banter_air.assert_not_awaited()
+
+    async def test_disabled_content_gates_do_not_review_reject_or_wait_for_tint(self):
+        row = self.host.add('plain', ready=False, waiting=True, tint_ready=False)
+        self.host.content_gate_enabled = lambda gate: False
+        self.host.dialogue_tint_required = lambda: False
+        self.host.dialogue_topic_review = mock.Mock(return_value={
+            'checked': True, 'ok': False, 'topic': 'wrong topic',
+            'score': 0, 'faults': ['off topic']})
+        self.host.tint_retry_due = mock.Mock(return_value=False)
+
+        await self.runtime.prepare()
+
+        self.host.larder_prepare.assert_awaited_once_with(row)
+        self.host.tint_retry_due.assert_not_called()
+        self.host.dialogue_topic_review.assert_not_called()
+        self.assertTrue(row['ready'])
+        self.assertNotIn('off_brief', row)
+        self.assertNotIn('system2_topic_review', row)
+        candidate = self.runtime.candidate('news', row)
+        self.assertTrue(candidate['eligible'])
+        self.assertEqual(candidate['expires_at'], 0)
+        self.assertFalse(candidate['repeat_guard'])
+        self.assertNotIn('Tint is incomplete; accepted turns are retained', candidate['why'])
+        self.runtime.store.record_external(row['takes'][0]['text'], receipt_id='played-earlier')
+        self.assertTrue(self.runtime.repeat_allowed([row['takes'][0]['text']]))
+
+    async def test_enabled_segment_brief_gate_can_reject_off_topic_scene(self):
+        row = self.host.add('reviewed', ready=False)
+        self.host.content_gate_enabled = lambda gate: gate == 'segment_brief'
+        self.host.dialogue_topic_review = mock.Mock(return_value={
+            'checked': True, 'ok': False, 'topic': 'exact topic',
+            'score': 0, 'faults': ['off topic']})
+
+        await self.runtime.prepare()
+
+        self.host.dialogue_topic_review.assert_called_once()
+        self.assertTrue(row['off_brief'])
+        self.assertEqual(row['topic_contract'], 'exact topic')
+        self.assertEqual(self.runtime._work['topic_rejected'][0]['candidate'], 'reviewed')
+
+    async def test_schedule_choice_is_first_ready_material_and_record_needs_no_job(self):
+        self.host.templates = [{'id': 'record', 'kind': 'record', 'minutes': 1},
+                               {'id': 'news', 'kind': 'news', 'minutes': 1}]
+        self.host.script_choice = mock.Mock(return_value={'candidate': 'z-preferred'})
+        self.host.add('a-default')
+        self.host.add('z-preferred')
+
+        status = await self.runtime.refresh()
+
+        record, news = status['hours'][0]['slots']
+        self.assertEqual(record['status'], 'complete')
+        self.assertEqual(record['debt_seconds'], 0)
+        record_job = self.runtime.store.get_job(record['id'] + ':prepare')
+        self.assertEqual(record_job['state'], 'satisfied')
+        self.assertFalse(record_job['coverage_missing'])
+        self.assertEqual(news['allocations'][0]['candidate']['id'], 'z-preferred')
+        self.assertEqual(news['preferred_candidate_id'], 'z-preferred')
+        self.host.script_choice.assert_any_call(news['id'])
 
     async def test_retained_work_is_finished_before_new_generation_and_other_slot_is_skipped(self):
         wrong = self.host.add('wrong', ready=False, made=20, system2_slot='different-slot')
@@ -244,6 +306,7 @@ class System2RuntimeTests(unittest.IsolatedAsyncioTestCase):
         finish.set(); await first
 
     async def test_publication_is_not_heard_and_duplicate_complete_ack_is_idempotent(self):
+        self.host.content_gate_enabled = lambda gate: gate == 'repetition'
         row = self.host.add('ready')
         self.assertTrue(await self.runtime.dispatch())
         entry = self.host.aired[0]
@@ -259,6 +322,17 @@ class System2RuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.runtime.store.get_reservation(proof['reservation_id'])['heard_seconds'], 7)
         self.assertFalse(self.runtime.store.can_play([row['takes'][0]['text']])['allowed'])
         self.assertFalse(await self.runtime.dispatch())
+
+    async def test_disabled_repetition_records_heard_material_for_later_policy(self):
+        self.host.content_gate_enabled = lambda gate: False
+        row = self.host.add('heard-with-gate-off')
+        self.assertTrue(await self.runtime.dispatch())
+        self.now += 7
+        self.runtime.acknowledge(self.host.aired[0])
+        self.assertTrue(self.runtime.repeat_allowed([row['takes'][0]['text']]))
+
+        self.host.content_gate_enabled = lambda gate: gate == 'repetition'
+        self.assertFalse(self.runtime.repeat_allowed([row['takes'][0]['text']]))
 
     async def test_late_policy_withdrawal_never_publishes_or_consumes_the_ready_row(self):
         row = self.host.add('withdrawn')

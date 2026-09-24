@@ -65,6 +65,60 @@ class ScheduleReadinessTests(unittest.IsolatedAsyncioTestCase):
               mock.patch.object(app, "news_shelf_most", return_value=18)):
             self.assertEqual(app.news_want_seconds(), 1440.0)
 
+    def test_hour_shortfall_reads_prepared_stock_once(self) -> None:
+        prepared = mock.Mock(return_value={"banter": 2, "caller": 0})
+        slots = [
+            {"kind": "banter", "label": "The booth"},
+            {"kind": "caller", "label": "The phone"},
+            {"kind": "banter", "label": "The recap"},
+        ]
+        with (mock.patch.object(app, "schedule_read",
+                                return_value={"enabled": True}),
+              mock.patch.object(app, "schedule_slots_now",
+                                return_value=("hour", slots)),
+              mock.patch.object(app, "prepared_by_kind", prepared),
+              mock.patch.object(app, "prep_board",
+                                side_effect=AssertionError("unused board walk"))):
+            got = app.hour_shortfall()
+        prepared.assert_called_once_with()
+        self.assertEqual([row["label"] for row in got["ready"]],
+                         ["The booth", "The recap"])
+        self.assertEqual([row["label"] for row in got["short"]],
+                         ["The phone"])
+
+    def test_bank_health_distinguishes_viable_drafts_from_ready_air(self) -> None:
+        ready = {"sid": "ready"}
+        waiting = {"sid": "waiting"}
+        with (mock.patch.object(app, "_LARDER", [ready, waiting]),
+              mock.patch.object(app, "larder_stock_count", return_value=2),
+              mock.patch.object(app, "larder_ready_count", return_value=1),
+              mock.patch.object(app, "dialogue_row_viable", return_value=True),
+              mock.patch.object(app, "dialogue_audio_ready",
+                                side_effect=lambda kind, row: row is ready),
+              mock.patch.object(app, "dialogue_row_ready",
+                                side_effect=lambda kind, row: row is ready),
+              mock.patch.object(app, "row_unaired", return_value=True),
+              mock.patch.object(app, "dj_settings",
+                                return_value={"dialogue_reserve_target": 4})):
+            got = app.bank_health()
+        self.assertEqual(got["banked"], 1)
+        self.assertEqual(got["viable"], 2)
+        self.assertEqual(got["awaiting_voice"], 1)
+        self.assertEqual(got["unheard_ready"], 1)
+        self.assertTrue(got["bare"])
+
+    def test_phrase_ban_verdict_is_cached_on_the_canonical_entry(self) -> None:
+        entry = {"script": "A: the forbidden phrase appears here."}
+        wrapper = {"entry": entry, "sid": "wrapped"}
+        hit = mock.Mock(return_value="forbidden phrase")
+        with (mock.patch.object(app, "phrase_ban_key", return_value="ban-v1"),
+              mock.patch.object(app, "phrase_ban_hit", hit)):
+            self.assertTrue(app.phrase_ban_row_blocked("banter", wrapper))
+            self.assertTrue(app.phrase_ban_row_blocked("banter", wrapper))
+        hit.assert_called_once()
+        self.assertNotIn("phrase_ban", wrapper)
+        self.assertEqual(entry["phrase_ban"]["key"], "ban-v1")
+
     async def test_tint_progress_resumes_at_first_unfinished_turn(self) -> None:
         # Exercise the individual fallback/resume contract without issuing a
         # real batch request. Batch deferral has its own integration tests.
@@ -296,6 +350,64 @@ class ScheduleReadinessTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(plan["ready_seconds"], 240.0)
         self.assertEqual(len(plan["selected_ids"]), 4)
         self.assertEqual([len(s["stock"]) for s in plan["slots"]], [2, 2])
+
+    def test_director_orchestration_names_short_script_work(self) -> None:
+        script = {
+            "state": "drafts waiting",
+            "draft_turns": [
+                {"who": "host", "text": "One short setup."},
+                {"who": "cohost", "text": "One short reply."},
+            ],
+            "sfx_plan": [{"kind": "sfx"}],
+        }
+        got = app.director_orchestration(
+            "caller", "Phone segment", 240.0, script,
+            state="drafts waiting", review={"seen": False})
+        self.assertEqual(got["status"], "written")
+        self.assertEqual(got["have"]["lines"], 2)
+        self.assertGreater(got["short"]["lines"], 0)
+        self.assertGreater(got["short"]["events"], 0)
+        self.assertIn("review the script", got["needs"])
+        self.assertTrue(any("more scripted line" in need
+                            for need in got["needs"]))
+
+    def test_director_orchestration_marks_ready_segment(self) -> None:
+        script = {
+            "state": "bound",
+            "seconds": 60.0,
+            "turns": [{"who": "host", "text": "line %d" % i}
+                      for i in range(1, 7)],
+            "sfx_plan": [{"kind": "sfx"}],
+        }
+        got = app.director_orchestration(
+            "banter", "Booth", 60.0, script,
+            state="planned", review={"approved": True})
+        self.assertEqual(got["status"], "ready")
+        self.assertTrue(got["stages"]["written"])
+        self.assertTrue(got["stages"]["reviewed"])
+        self.assertTrue(got["stages"]["recorded"])
+        self.assertEqual(got["short"]["lines"], 0)
+
+    def test_director_room_fallback_entries_carry_orchestration(self) -> None:
+        store = {"enabled": True, "active": "test",
+                 "presets": {"test": [{
+                     "id": "phone", "kind": "caller", "label": "Phone",
+                     "minutes": 4.0, "enabled": True}]}}
+
+        class OffRuntime:
+            enabled = False
+
+        with (mock.patch.dict(app.__dict__, {"_system2": lambda: OffRuntime()}),
+              mock.patch.object(app, "director_sheet", return_value={"kinds": {}}),
+              mock.patch.object(app, "schedule_read", return_value=store),
+              mock.patch.object(app, "schedule_preset_now", return_value="test"),
+              mock.patch.object(app, "schedule_prompt_for", return_value=""),
+              mock.patch.object(app, "director_beats", return_value=[])):
+            room = app.director_room(0)
+        orch = room["entries"][0]["orchestration"]
+        self.assertEqual(orch["status"], "needs-script")
+        self.assertEqual(orch["target"]["seconds"], 196.8)
+        self.assertIn("write the segment", orch["needs"])
 
     def test_incomplete_assigned_row_prevents_duplicate_writing(self) -> None:
         demand = [{"commit_id": "one", "kind": "gallery",
@@ -874,6 +986,20 @@ A: Doreen, thank you for calling. Keep June close and stay with Pine Box FM."""
                 self.assertTrue(report["speakerbox"]["hosts"])
                 self.assertTrue(report["resolved"])
 
+    def test_short_speakerbox_pivot_still_builds_a_complete_call(self) -> None:
+        source = "You go out to eat a lot, too."
+        with mock.patch.object(app, "_call_history_scripts", return_value=[]):
+            script = app._fallback_call_script(
+                "Doreen", "how often people eat away from home", source)
+            report = app.call_flow_report(
+                script, "Doreen",
+                topic="how often people eat away from home",
+                speakerbox_text=source)
+        self.assertTrue(report["ok"], report["faults"])
+        self.assertGreaterEqual(report["grounded_questions"], 2)
+        self.assertTrue(report["speakerbox"]["caller"])
+        self.assertTrue(report["speakerbox"]["hosts"])
+
     def test_fallback_identity_is_driven_by_its_speakerbox_pivot(self) -> None:
         first = app._fallback_call_script(
             "Doreen", "heat",
@@ -997,15 +1123,19 @@ A: Doreen, thank you for calling. Keep June close and stay with Pine Box FM."""
             self.assertEqual(app.talk_quiet_limit(), 4.0)
             self.assertEqual(app.talk_watch_tick(), 2.0)
 
-    def test_full_talk_replaces_live_only_round_with_recorded_talk(self) -> None:
+    def test_full_talk_keeps_live_only_round_but_replaces_unready_shelf_work(
+            self) -> None:
         dj = {"talk_radio_mode": True, "talk_radio": 100}
         with (mock.patch.object(app, "gap_stock_kind",
                                 return_value="banter")):
             kind, why = app.gap_kind_policy("deep", dj, now=1234.0)
             backed_kind, backed_why = app.gap_kind_policy(
                 "gallery", dj, now=1234.0)
-        self.assertEqual(kind, "banter")
-        self.assertIn("100% talk", why)
+        # Deep reads the show that just happened and cannot honestly be
+        # banked. The running order keeps it; a stockable road that is not
+        # ready yields to finished audio instead of writing against the air.
+        self.assertEqual(kind, "deep")
+        self.assertEqual(why, "")
         self.assertEqual(backed_kind, "banter")
         self.assertIn("zero-work-to-air", backed_why)
 

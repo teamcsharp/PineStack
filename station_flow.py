@@ -169,7 +169,11 @@ class FlowJournal:
             latest = dict(self.latest)
         stored = []
         first = memory[0]["id"] if memory else 0
-        if self.path.is_file():
+        # An incremental follower normally asks from an id still inside the
+        # 5,000-event memory window. In that case memory is authoritative and
+        # opening SQLite on every UI poll is pure contention with the writer.
+        needs_disk = not (after and memory and after >= int(memory[0]["id"]) - 1)
+        if self.path.is_file() and needs_disk:
             try:
                 with closing(self._connect()) as db:
                     first = db.execute("SELECT MIN(id) FROM events").fetchone()[0] or first

@@ -21,6 +21,7 @@ import struct
 import sys
 import tempfile
 import unittest
+from unittest import mock
 import wave
 from pathlib import Path
 
@@ -427,6 +428,22 @@ class RefusalTests(TempCase):
         second = producer.produce(source)
         self.assertFalse(second.ok)
         self.assertTrue(second.refusals)
+
+    def test_resuming_the_same_revision_keeps_its_original_creation_stamp(self):
+        fixture = Fixture(self.root)
+        producer = fixture.producer("shadow")
+        source, _ = fixture.source()
+        first = sp.Production()
+        with mock.patch.object(sm.time, "time", return_value=100.0):
+            frozen = producer.freeze(source, first)
+        self.assertIsNotNone(frozen)
+        second = sp.Production()
+        with mock.patch.object(sm.time, "time", return_value=200.0):
+            resumed = producer.freeze(source, second)
+        self.assertIsNotNone(resumed, second.reasons)
+        self.assertEqual(resumed["revision"], frozen["revision"])
+        self.assertEqual(resumed["created_at"], 100.0)
+        self.assertEqual(second.refusals, [])
 
     def test_an_interrupted_session_resumes_from_verified_takes(self):
         fixture = Fixture(self.root)

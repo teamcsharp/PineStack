@@ -36,8 +36,17 @@
 (function (root) {
   'use strict';
 
+  /* The kiosk carries this controller in both of its legacy asset bundles.
+   * Only the first canonical copy may mount timers and document handlers. */
+  if (root.PineSfxTv && root.PineSfxTv.__pineCanonicalSfxTv
+      && root.PineSfxTv.__pineSfxTvDocument === document) {
+    if (typeof module !== 'undefined' && module.exports) module.exports = root.PineSfxTv;
+    return;
+  }
+
   var KEY = 'pineSfxTvBox';       // the preference: left, top, width, height
   var POLL_MS = 2500;
+  var WALL_FOLLOW_MS = 750;       // local native state, independent of the server poll
   var MIN = {w: 180, h: 120};
   var DEFAULT = {width: 420, height: 268};
   /* Longer than the .off animation in sfx-tv.css, so the last frame of the
@@ -123,7 +132,9 @@
   var host = null;                 // the window, while a clip is in it
   var video = null;
   var tube = null;
+  var assembly = null;             // the plexus covering a decoder with no frame
   var timer = null;                // the poll
+  var wallFollowTimer = null;      // lightweight native-wall follower
   var hold = null;                 // the "not due yet" timer
   var queue = [];
   /* #1195: WHAT THE STATION HAS RUNG AHEAD, which `queue` above is not.
@@ -205,12 +216,41 @@
   var fullBox = null;              // #1122: the box to go back to
   var badge = null;                // the "x3" / "7 to go" over the picture
   var askWrap = null;              // #1121's hold bubble, while it is up
+  var parodyWrap = null;           // H3 prompt and source-history picker
+  var parodyVideo = null;
+  var parodyCover = null;
+  var parodyDictationRelease = null;
+  var parodyOwnsSurface = false;
+  var parodyPolling = Object.create(null);
+  var parodyQueueTimer = 0;
+  var radialWrap = null;            // the shared hold menu for every video surface
+  var radialMedia = null;
+  var radialMediaWasPlaying = false;
+  var deleteWrap = null;
   var tl = null;                   // [#1219] the timeline along the bottom of the picture
   var tlFill = null;               // [#1219] its fill
   var tlClock = null;              // [#1219] its m:ss corner
   var tlFrame = 0;                 // [#1219] the rAF driving it
   var tlSecond = -1;               // [#1219] the second last printed
   var FULL_KEY = 'pineSfxTvFull';  // #1122: '1' when the next set opens full
+
+  function assemblyDrop() {
+    var old = assembly;
+    assembly = null;
+    try { if (old && old.destroy) old.destroy(); } catch (err) { /* gone */ }
+  }
+
+  function assemblyBind(media, screen, name) {
+    assemblyDrop();
+    if (!media || !screen || !root.PineWallTransition
+        || typeof root.PineWallTransition.cover !== 'function') return;
+    assembly = root.PineWallTransition.cover(media, {
+      container: screen,
+      className: 'sfx-tv-assembly',
+      label: String(name || 'VIDEO') + ' ASSEMBLING',
+      zIndex: 2
+    });
+  }
   /* #1184: THE RIGHT-CLICK SHEET ON THE LISTEN TAB, AND WHAT IT CARRIES.
    *
    * "If I right click a video in the listen tab while it's in endless
@@ -258,8 +298,9 @@
   var sheetOnWall = false;         // the sheet is on the body, not in the set
   var panel = null;                // the Inspect / Path detail panel, if open
   var heard = [];                  // {id, url, sting} of clips already played
-  var HEARD_MOST = 6;              // bounded, and small - the strip shows two
-  var STRIP_EACH = 2;              // "the last 2 ... and the next 2"
+  var HEARD_MOST = 8;              // bounded plain rows; never media elements
+  var STRIP_PAST = 3;              // the last three clips shown in the popup
+  var STRIP_NEXT = 2;              // enough future context without crowding it
   /* #1200: SCROLLING BACKWARDS THROUGH EVERYTHING THAT HAS GONE OUT.
    *
    * "Allow me to roll the wheel or scroll through the previous history of
@@ -267,8 +308,8 @@
    *  scroll backwards in the history and just keep loading more and more
    *  of the history."
    *
-   * `heard` above is the CYCLE'S memory and HEARD_MOST is six; the strip
-   * draws STRIP_EACH (2) of them. So there were two tiles of history in
+   * `heard` above is the CYCLE'S memory and the strip draws its last three.
+   * Earlier entries arrive two at a time when the operator asks for more.
    * the page, they lived only as long as the tab, and there was next to
    * nothing to scroll through at all.
    *
@@ -292,15 +333,10 @@
    * page hung - a fetch of /api/pulse that never returned while the same
    * url answered the desk in 0.02 s.
    *
-   *   HIST_PAGE = 24. The station's poster road renders one still per clip
-   *   in a worker thread behind a SEMAPHORE OF TWO, so a page is not a
-   *   burst of requests - it is a QUEUE with an ffmpeg at the front of it.
-   *   At the 0.4-0.9 s a still has measured, 24 tiles two at a time is
-   *   five to eleven seconds: the last of a page lands while he is still
-   *   looking at the first. Forty would be twenty seconds of queue for
-   *   tiles that are off the end of the strip. 24 is also about five
-   *   screens of 76 px tiles inside a 420 px sheet, so one page is several
-   *   flicks rather than one.
+   *   HIST_PAGE = 2. The popup begins with the last three items and every
+   *   explicit reach reveals exactly two older airings. The wire asks for
+   *   one extra row after the first page because the timestamp cursor is
+   *   inclusive; that boundary row is deduped here, not shown twice.
    *
    *   HIST_MOST = 120, five pages. 120 tiles is roughly 9,100 px of row -
    *   some twenty screenfuls at that width - far more than a browse, and
@@ -310,7 +346,7 @@
    *   the seam where they were says so out loud. An <img> is not the #1312
    *   hazard - it releases its connection once it has loaded - but
    *   unbounded is unbounded. */
-  var HIST_PAGE = 24;              // one page of older tiles
+  var HIST_PAGE = 2;               // each explicit reach reveals two older tiles
   var HIST_MOST = 120;             // the ceiling: five pages held at once
   var HIST_NEAR = 72;              // "against the old end", in px
   var hist = [];                   // plain rows, OLDEST FIRST
@@ -324,6 +360,7 @@
   var stripEl = null;              // the open sheet's strip, for prepending
   var stripClip = null;            // the clip that sheet was opened for
   var stripSay = null;             // that sheet's note line
+  var stripOwedLeft = null;        // one programmatic scroll event to ignore
   var histNoteEl = null;           // the note tile at the old end
   var wallWired = false;           // the document-level gesture road is on
   var wallPress = null;            // a touch hold in progress on the wall
@@ -350,10 +387,69 @@
   var LEVEL_RAMP_MS = 120;
   var LEVEL_RAMP_STEPS = 8;
   var levelRun = null;
+  var levelContext = null;
+
+  /* HTMLMediaElement.volume stops at unity. The set's gain stage carries
+   * the upper half of the public 0-200 range and is disconnected with the
+   * short-lived clip element. */
+  function levelStage(el, want) {
+    if (!el) return null;
+    if (el.__pineSfxLevelStage) return el.__pineSfxLevelStage;
+    if (!(want > 1)) return null;
+    var Ctor = root.AudioContext || root.webkitAudioContext;
+    if (!Ctor) return null;
+    try {
+      levelContext = levelContext || new Ctor();
+      if (levelContext.state !== 'running') {
+        var waking = levelContext.resume();
+        if (waking && typeof waking.then === 'function') {
+          waking.then(function () {
+            if (el && el.isConnected) levelRamp(el, level);
+          }, function () { /* native volume remains at unity */ });
+        }
+        return null;
+      }
+      var source = levelContext.createMediaElementSource(el);
+      var gain = levelContext.createGain();
+      gain.gain.value = Math.max(0, Math.min(1, Number(el.volume) || 0));
+      source.connect(gain);
+      gain.connect(levelContext.destination);
+      el.__pineSfxLevelStage = {source: source, gain: gain};
+      return el.__pineSfxLevelStage;
+    } catch (err) { return null; }
+  }
+
+  function levelDrop(el) {
+    var stage = el && el.__pineSfxLevelStage;
+    if (!stage) return;
+    try { stage.source.disconnect(); } catch (err) { /* gone */ }
+    try { stage.gain.disconnect(); } catch (err2) { /* gone */ }
+    try { delete el.__pineSfxLevelStage; } catch (err3) { /* weak ownership */ }
+  }
+
+  function levelSet(el, want, smooth) {
+    if (!el) return;
+    var value = Math.max(0, Math.min(2, Number(want)));
+    if (!isFinite(value)) return;
+    var stage = levelStage(el, value);
+    if (!stage) {
+      try { el.volume = Math.min(1, value); } catch (err) { /* gone */ }
+      return;
+    }
+    try { el.volume = 1; } catch (err2) { /* gain still owns it */ }
+    try {
+      if (smooth) stage.gain.gain.setTargetAtTime(value, levelContext.currentTime, 0.03);
+      else stage.gain.gain.setValueAtTime(value, levelContext.currentTime);
+    } catch (err3) { try { stage.gain.gain.value = value; } catch (err4) { /* gone */ } }
+  }
 
   function levelRamp(el, want) {
     if (levelRun) { clearInterval(levelRun.timer); levelRun = null; }
     if (!el) return;
+    if (want > 1 || el.__pineSfxLevelStage) {
+      levelSet(el, want, true);
+      return;
+    }
     var from = Number(el.volume);
     if (!isFinite(from)) from = want;
     if (Math.abs(from - want) < 0.005) {
@@ -483,34 +579,53 @@
                  else { try { v.play(); } catch (e) { /* gone */ } } }
       }
     } catch (err) { /* no frame on screen */ }
-    /* The native wall: freeze it, do not veil it. */
-    wallAsk(on ? 'hold' : 'free');
+    /* The native wall is a SurfaceView above the WebView. While its menu is
+       open it must be held AND retired from composition, otherwise no HTML
+       can occupy the picture's rectangle. `menu` preserves the wall's
+       logical veil and `free` restores it, so Listen still owns its backdrop
+       after an inspection closes. */
+    wallAsk(on ? 'menu' : 'free');
     if (!on) wallBox = null;
   }
 
-  /* [#1386c] Stand the sheet CLEAR of the picture. The wall reports its own
-     rectangle in device pixels; anything that overlaps it is unreachable,
-     so the sheet goes under it when there is room and over the top strip
-     when there is not. */
+  function wallCssRect(st) {
+    if (!st) return null;
+    var d = Number(root.devicePixelRatio) || 1;
+    var box = {x: Number(st.x || st.left || 0) / d,
+               y: Number(st.y || st.top || 0) / d,
+               w: Number(st.w || st.width || 0) / d,
+               h: Number(st.h || st.height || 0) / d};
+    return box.w > 0 && box.h > 0 ? box : null;
+  }
+
+  /* The native menu now retires the SurfaceView while it is held, so the
+     sheet can stand IN the picture's rectangle instead of appearing as an
+     unrelated panel at the top of the page. The wall reports DEVICE pixels;
+     every value is converted before it is used in WebView layout. */
   function sheetClear(wrap) {
     if (!wrap) return;
     wallWhere().then(function (st) {
       if (!st || !wrap.parentNode) return;
-      var w = Number(st.w || st.width || 0);
-      var h = Number(st.h || st.height || 0);
-      var y = Number(st.y || st.top || 0);
-      if (!(w > 0 && h > 0)) return;              /* full screen: leave it */
-      wallBox = {x: Number(st.x || 0), y: y, w: w, h: h};
-      var below = y + h + 10;
-      var room = (root.innerHeight || 800) - below;
+      var raw = {x: Number(st.x || 0), y: Number(st.y || 0),
+                 w: Number(st.w || st.width || 0),
+                 h: Number(st.h || st.height || 0)};
+      var box = wallCssRect(st);
+      if (!box) return;                            /* no measured wall */
+      wallBox = raw;                               /* bridge wants device px */
+      var W = root.innerWidth || 1280;
+      var H = root.innerHeight || 800;
+      var wide = Math.max(260, Math.min(box.w, W - 16));
+      var tall = Math.max(150, Math.min(box.h, H - 16));
+      var left = Math.max(8, Math.min(W - wide - 8, box.x));
+      var top = Math.max(8, Math.min(H - tall - 8, box.y));
       wrap.style.position = 'fixed';
-      wrap.style.left = '10px';
-      wrap.style.right = '10px';
+      wrap.style.left = Math.round(left) + 'px';
+      wrap.style.right = 'auto';
       wrap.style.bottom = 'auto';
-      if (room > 170) { wrap.style.top = below + 'px'; }
-      else if (y > 180) { wrap.style.top = '10px';
-                          wrap.style.maxHeight = (y - 20) + 'px'; }
-      else { wrap.style.top = below + 'px'; }     /* nothing fits: below */
+      wrap.style.top = Math.round(top) + 'px';
+      wrap.style.width = Math.round(wide) + 'px';
+      wrap.style.maxHeight = Math.round(tall) + 'px';
+      wrap.style.boxSizing = 'border-box';
     });
   }
 
@@ -628,6 +743,31 @@
     if (box.width < MIN.w || box.height < MIN.h) return;
     try { root.localStorage.setItem(KEY, JSON.stringify(box)); }
     catch (err) { /* a locked store is not a reason to stop the show */ }
+  }
+
+  /* A drag/resize of the native SurfaceView runs on Android's UI thread so
+     it follows the finger even while this WebView is busy. Android calls
+     this ONCE on release to persist the final DEVICE-pixel rectangle. */
+  function rememberWallBox(x, y, w, h) {
+    var d = Number(root.devicePixelRatio) || 1;
+    var W = root.innerWidth || 1280;
+    var H = root.innerHeight || 800;
+    var box = {left: Number(x) / d, top: Number(y) / d,
+               width: Number(w) / d, height: Number(h) / d};
+    if (!(box.width > 0 && box.height > 0)) return null;
+    box.width = Math.max(MIN.w, Math.min(box.width, W - 8));
+    box.height = Math.max(MIN.h, Math.min(box.height, H - 8));
+    box.left = Math.max(0, Math.min(box.left, W - 80));
+    box.top = Math.max(0, Math.min(box.top, H - 40));
+    try { root.localStorage.setItem(KEY, JSON.stringify(box)); }
+    catch (err) { /* the live move still succeeded */ }
+    if (host && !full) {
+      host.style.left = Math.round(box.left) + 'px';
+      host.style.top = Math.round(box.top) + 'px';
+      host.style.width = Math.round(box.width) + 'px';
+      host.style.height = Math.round(box.height) + 'px';
+    }
+    return box;
   }
 
   /* ---- the frame ----------------------------------------------------- */
@@ -768,64 +908,84 @@
     badge.style.display = bits.length ? 'inline-block' : 'none';
   }
 
-  /* #1121: THE HOLD BUBBLE. "If I tap and hold on the video, then show
-   * a pop-up asking me if I would like to assign it to the sampler."
-   * A small question over the picture, two answers, and it goes away
-   * by itself after six seconds so a hold that was a fumble leaves
-   * nothing behind. The hold used to open the sheet (#1306b); that is
-   * the tap's job now. */
+  /* A HOLD IS THE SHORT, HUMAN MENU. The full management sheet remains a
+   * tap/right-click; holding the picture asks only what to do with the media
+   * itself. This stays deliberately short enough to fit over the small tube. */
   function ask(screen) {
     if (!screen || !playing) return;
     askDrop();
+    var clip = playing;
     var wrap = document.createElement('div');
-    wrap.className = 'sfx-tv-ask';
-    var s = wrap.style;
-    s.position = 'absolute'; s.left = '50%'; s.top = '50%';
-    s.transform = 'translate(-50%, -50%)';
-    s.zIndex = '5'; s.maxWidth = '88%'; s.boxSizing = 'border-box';
-    s.padding = '10px 12px'; s.borderRadius = '8px';
-    s.border = '1px solid #65c7da'; s.background = '#0b1116';
-    s.color = '#dfe7ee'; s.font = 'inherit'; s.fontSize = '12px';
-    s.textAlign = 'center';
+    wrap.className = 'sfx-tv-ask sfx-tv';
     var q = document.createElement('div');
-    q.textContent = 'Put this clip on a sampler pad?';
-    q.style.marginBottom = '8px';
-    var row = document.createElement('div');
-    row.style.display = 'flex'; row.style.gap = '8px';
-    row.style.justifyContent = 'center';
+    q.className = 'sfx-tv-ask-title';
+    q.textContent = 'What would you like to do with this video?';
+    var summary = document.createElement('div');
+    summary.className = 'sfx-tv-ask-summary';
+    summary.textContent = String(clip.sting || clip.text || 'this clip');
+    var list = document.createElement('div');
+    list.className = 'sfx-tv-ask-list';
     var say = function (text) {
-      q.textContent = String(text || '');
-      setTimeout(function () { if (askWrap === wrap) askDrop(); }, 2400);
+      summary.textContent = String(text || '');
     };
-    var answer = function (label, go) {
+    var answer = function (label, detail, ref, go) {
       var b = document.createElement('button');
       b.type = 'button';
-      b.textContent = label;
-      var bs = b.style;
-      bs.minHeight = '32px'; bs.minWidth = '32px'; bs.padding = '6px 12px';
-      bs.font = 'inherit'; bs.fontSize = '12px'; bs.borderRadius = '6px';
-      bs.border = '1px solid #65c7da'; bs.background = '#0b1116';
-      bs.color = '#dfe7ee'; bs.cursor = 'pointer';
+      var mark = document.createElement('span');
+      mark.className = 'sfx-tv-ask-icon';
+      mark.innerHTML = (typeof root.pineIcon === 'function'
+        ? (root.pineIcon(ref, label) || '') : '');
+      var words = document.createElement('span');
+      words.className = 'sfx-tv-ask-words';
+      var strong = document.createElement('b'); strong.textContent = label;
+      var small = document.createElement('small'); small.textContent = detail;
+      words.appendChild(strong); words.appendChild(small);
+      b.appendChild(mark); b.appendChild(words);
       b.addEventListener('click', function (ev) {
         ev.stopPropagation();
         go();
       });
-      row.appendChild(b);
+      list.appendChild(b);
       return b;
     };
-    var yes = answer('Yes, to a pad', function () {
-      row.style.display = 'none';
-      toPad(playing, say);
+    answer('Generate parody', 'Dictate and edit an H3 Pine Box FM stinger',
+      'c:microphone', function () {
+        askDrop();
+        parodyOpen(clip);
+      });
+    answer('Examine in depth', 'See its source, dimensions, history, and draw state',
+      'c:data--view--alt', function () {
+        askDrop();
+        sheet(clip);
+        var open = sheetWrap;
+        var notes = open ? open.querySelectorAll('.sfx-tv-note') : [];
+        var note = notes.length ? notes[notes.length - 1] : null;
+        inspect(clip, function (text) {
+          if (note) note.textContent = String(text || '');
+        }, open);
+      });
+    answer('Like', 'Raise this clip in the station\'s selection weight',
+      'c:thumbs-up', function () {
+        weigh(clip, true, say);
+      });
+    answer('Add to sampler', 'Put it on the next free sampler pad',
+      'c:music--add', function () {
+        toPad(clip, say);
+      });
+    var close = document.createElement('button');
+    close.type = 'button'; close.className = 'sfx-tv-ask-close';
+    close.textContent = 'Close';
+    close.addEventListener('click', function (ev) {
+      ev.stopPropagation(); askDrop();
     });
-    yes.style.background = '#65c7da'; yes.style.color = '#0b1116';
-    answer('No', function () { askDrop(); });
     wrap.appendChild(q);
-    wrap.appendChild(row);
+    wrap.appendChild(summary);
+    wrap.appendChild(list);
+    wrap.appendChild(close);
     /* A press on the bubble is not a press on the picture. */
     wrap.addEventListener('pointerdown', function (ev) { ev.stopPropagation(); });
-    screen.appendChild(wrap);
+    document.body.appendChild(wrap);
     askWrap = wrap;
-    setTimeout(function () { if (askWrap === wrap) askDrop(); }, 6000);
   }
 
   function askDrop() {
@@ -835,14 +995,921 @@
     catch (err) { /* already gone */ }
   }
 
+  function parodySourceUrl(clip) {
+    var url = String((clip && clip.url) || '');
+    if (/^(https?:|blob:|data:)/i.test(url)) return url;
+    return base.replace(/\/+$/, '') + url;
+  }
+
+  function parodyCandidates(seed, older) {
+    var source = [];
+    var seenIds = Object.create(null);
+    var add = function (row) {
+      var id = clipId(row);
+      if (!id || seenIds[id] || !histVideo(row)) return;
+      seenIds[id] = 1;
+      source.push({id: id, url: String(row.url || ''), video: true,
+        sting: String(row.sting || row.name || row.text || id),
+        seconds: Number(row.seconds) || 0, ts: Number(row.ts) || 0,
+        source_type: String(row.source_type || 'recent'),
+        source_generation: String(row.source_generation || '')});
+    };
+    (older || []).forEach(add);
+    hist.forEach(add);
+    heard.forEach(add);
+    stripRows().forEach(add);
+    add(seed);
+    return source;
+  }
+
+  function parodyClose() {
+    var wrap = parodyWrap;
+    parodyWrap = null;
+    if (parodyQueueTimer) root.clearInterval(parodyQueueTimer);
+    parodyQueueTimer = 0;
+    try {
+      if (root.PineTalkDot && typeof root.PineTalkDot.cancelCapture === 'function') {
+        root.PineTalkDot.cancelCapture();
+      }
+    } catch (err) { /* the microphone is already closed */ }
+    try { if (parodyDictationRelease) parodyDictationRelease(); }
+    catch (err1) { /* the audio restore is best effort during teardown */ }
+    parodyDictationRelease = null;
+    try { if (parodyVideo) { parodyVideo.pause(); parodyVideo.removeAttribute('src'); parodyVideo.load(); } }
+    catch (err2) { /* already gone */ }
+    parodyVideo = null;
+    try { if (parodyCover && parodyCover.destroy) parodyCover.destroy(); }
+    catch (err3) { /* already gone */ }
+    parodyCover = null;
+    try { if (wrap && wrap.parentNode) wrap.parentNode.removeChild(wrap); }
+    catch (err4) { /* already gone */ }
+    if (parodyOwnsSurface) {
+      parodyOwnsSurface = false;
+      surfaceDown(false);
+    }
+  }
+
+  function parodyQuoted(value) {
+    var out = [], re = /"([^"\n]+)"|\u201c([^\u201d\n]+)\u201d/g, match;
+    while ((match = re.exec(String(value || ''))) !== null) {
+      var line = String(match[1] || match[2] || '').replace(/\s+/g, ' ').trim();
+      if (line) out.push(line);
+    }
+    return out.join(' ').slice(0, 800);
+  }
+
+  function parodyGenerationNotice(got, signatures) {
+    if (!got || !(got.files || []).length) return;
+    if (typeof root.pineGenerationNotice === 'function') {
+      root.pineGenerationNotice(got);
+      return;
+    }
+    var file = got.files[0];
+    var token = signatures && signatures[file];
+    var url = base.replace(/\/+$/, '') + '/api/generations/image/'
+      + encodeURIComponent(file) + (token ? '?t=' + encodeURIComponent(token) : '');
+    var toast = document.createElement('button');
+    toast.type = 'button'; toast.className = 'sfx-tv-render-toast sfx-tv';
+    var thumb = document.createElement(/\.(mp4|m4v|webm|mov|mkv|ogv)$/i.test(file)
+      ? 'video' : 'img');
+    thumb.className = 'sfx-tv-render-thumb';
+    if (thumb.tagName === 'VIDEO') {
+      thumb.muted = true; thumb.playsInline = true; thumb.preload = 'metadata';
+    }
+    thumb.src = url;
+    var words = document.createElement('span');
+    var title = document.createElement('b'); title.textContent = 'Pine Box stinger ready';
+    var detail = document.createElement('small');
+    detail.textContent = String(got.request || got.tags || file).slice(0, 120);
+    words.appendChild(title); words.appendChild(detail);
+    toast.appendChild(thumb); toast.appendChild(words);
+    toast.addEventListener('click', function () {
+      toast.remove(); parodyResultOpen(got, url);
+    });
+    document.body.appendChild(toast);
+    setTimeout(function () { if (toast.parentNode) toast.remove(); }, 20000);
+    try {
+      post('/api/notifications', {kind: 'video', title: 'Pine Box stinger ready',
+        subtitle: detail.textContent, ref: {file: file, gen: got}});
+    } catch (err) { /* the visible notification still works */ }
+  }
+
+  function parodyWatch(promptId, status) {
+    if (!promptId || parodyPolling[promptId]) return;
+    parodyPolling[promptId] = true;
+    var tries = 0;
+    var look = function () {
+      tries += 1;
+      var bridge = api();
+      if (!bridge || !bridge.get) { delete parodyPolling[promptId]; return; }
+      bridge.get('/api/generations?limit=120').then(function (book) {
+        var rows = (book && book.generations) || [];
+        var row = null;
+        for (var i = 0; i < rows.length; i += 1) {
+          if (String(rows[i].prompt_id || '') === String(promptId)) { row = rows[i]; break; }
+        }
+        if (row && row.status === 'done' && (row.files || []).length) {
+          delete parodyPolling[promptId];
+          if (status && status.isConnected) status.textContent = 'Stinger ready.';
+          parodyGenerationNotice(row, book.sig || {});
+          return;
+        }
+        if (row && /^(failed|error|cancelled)$/i.test(String(row.status || ''))) {
+          delete parodyPolling[promptId];
+          if (status && status.isConnected) status.textContent = 'Generation failed: '
+            + String(row.error || row.status);
+          return;
+        }
+        if (tries >= 240) {
+          delete parodyPolling[promptId];
+          if (status && status.isConnected) status.textContent = 'Still rendering; the notification will appear in the gallery.';
+          return;
+        }
+        setTimeout(look, 5000);
+      }, function () {
+        if (tries < 240) setTimeout(look, 7000);
+        else delete parodyPolling[promptId];
+      });
+    };
+    setTimeout(look, 3500);
+  }
+
+  function parodyResultOpen(generation, url) {
+    parodyClose();
+    var shade = document.createElement('div');
+    shade.className = 'sfx-tv-parody-shade sfx-tv';
+    var box = document.createElement('section');
+    box.className = 'sfx-tv-parody sfx-tv-result';
+    var head = document.createElement('header');
+    var title = document.createElement('b'); title.textContent = 'Generated Pine Box FM stinger';
+    var close = document.createElement('button'); close.type = 'button'; close.textContent = 'Close';
+    head.appendChild(title); head.appendChild(close);
+    var media = document.createElement('video');
+    media.controls = true; media.playsInline = true; media.src = url;
+    var prompt = document.createElement('textarea');
+    prompt.value = String(generation.tags || generation.request || '');
+    var status = document.createElement('div'); status.className = 'sfx-tv-parody-status';
+    var actions = document.createElement('div'); actions.className = 'sfx-tv-parody-actions';
+    var action = function (label, go) {
+      var b = document.createElement('button'); b.type = 'button'; b.textContent = label;
+      b.addEventListener('click', go); actions.appendChild(b); return b;
+    };
+    action('Analyze', function () {
+      status.textContent = 'Examining the generated media...';
+      post('/api/comfy/workshop/analyze/' + encodeURIComponent(generation.prompt_id), {})
+        .then(function (got) { status.textContent = String(got.analysis || 'No analysis returned.'); },
+          function (err) { status.textContent = String((err && err.message) || err); });
+    });
+    action('Regenerate', function () {
+      status.textContent = 'Submitting another take...';
+      post('/api/comfy/workshop/variant', {prompt_id: generation.prompt_id,
+        prompt: prompt.value.trim(), use_result: false}).then(function (got) {
+          status.textContent = 'Variant queued.'; parodyWatch(got.prompt_id, status);
+        }, function (err) { status.textContent = String((err && err.message) || err); });
+    });
+    action('Add to DJ topic', function () {
+      var text = 'Discuss this Pine Box FM stinger: ' + prompt.value.trim()
+        + ' Generated media: ' + String((generation.files || [])[0] || '');
+      post('/api/dj/topics', {text: text, kind: 'media', next: false}).then(
+        function () { status.textContent = 'Added to the DJs\' topic bank.'; },
+        function (err) { status.textContent = String((err && err.message) || err); });
+    });
+    var del = action('Delete', function () {
+      if (del.dataset.sure !== '1') {
+        del.dataset.sure = '1'; del.textContent = 'Delete for good?'; return;
+      }
+      var bridge = api();
+      if (!bridge || !bridge.del) { status.textContent = 'No delete road from this screen.'; return; }
+      bridge.del('/api/generations/image/'
+        + encodeURIComponent(String((generation.files || [])[0] || ''))).then(
+          function () { shade.remove(); },
+          function (err) { status.textContent = String((err && err.message) || err); });
+    });
+    del.className = 'bad';
+    close.addEventListener('click', function () { shade.remove(); });
+    box.appendChild(head); box.appendChild(media); box.appendChild(prompt);
+    box.appendChild(actions); box.appendChild(status); shade.appendChild(box);
+    shade.addEventListener('click', function (ev) { if (ev.target === shade) shade.remove(); });
+    document.body.appendChild(shade);
+  }
+
+  function parodyOpen(seed, keepSurfaceDown) {
+    parodyClose();
+    if (keepSurfaceDown) {
+      surfaceDown(true);
+      parodyOwnsSurface = true;
+    }
+    var shade = document.createElement('div');
+    shade.className = 'sfx-tv-parody-shade sfx-tv';
+    var box = document.createElement('section');
+    box.className = 'sfx-tv-parody';
+    box.setAttribute('role', 'dialog');
+    box.setAttribute('aria-label', 'Generate a Pine Box FM parody stinger');
+    var head = document.createElement('header');
+    var title = document.createElement('b'); title.textContent = 'Generate parody stinger';
+    var close = document.createElement('button'); close.type = 'button'; close.textContent = 'Close';
+    head.appendChild(title); head.appendChild(close);
+    var stage = document.createElement('div');
+    stage.className = 'sfx-tv-parody-stage is-loading';
+    var source = document.createElement('video');
+    source.controls = true; source.playsInline = true; source.preload = 'metadata';
+    stage.appendChild(source); parodyVideo = source;
+    var nav = document.createElement('div'); nav.className = 'sfx-tv-parody-nav';
+    var prev = document.createElement('button'); prev.type = 'button'; prev.textContent = 'Previous';
+    var label = document.createElement('span');
+    var next = document.createElement('button'); next.type = 'button'; next.textContent = 'Next';
+    nav.appendChild(prev); nav.appendChild(label); nav.appendChild(next);
+    var trim = document.createElement('div'); trim.className = 'sfx-tv-parody-trim';
+    trim.hidden = true;
+    var trimSpan = document.createElement('div'); trimSpan.className = 'sfx-tv-parody-trim-span';
+    var trimRow = function (name) {
+      var row = document.createElement('label'); row.className = 'sfx-tv-parody-trim-row';
+      var title = document.createElement('span'); title.textContent = name;
+      var slider = document.createElement('input'); slider.type = 'range';
+      slider.min = '0'; slider.step = '1';
+      slider.setAttribute('aria-label', 'Trim ' + name.toLowerCase() + ' point');
+      var value = document.createElement('output'); value.textContent = '0:00.0';
+      row.appendChild(title); row.appendChild(slider); row.appendChild(value);
+      trim.appendChild(row);
+      return {slider: slider, value: value};
+    };
+    var inControl = trimRow('In');
+    var outControl = trimRow('Out');
+    trim.appendChild(trimSpan);
+    var field = document.createElement('textarea');
+    field.placeholder = 'Describe the Pine Box FM parody or dictate it with the microphone...';
+    var controls = document.createElement('div'); controls.className = 'sfx-tv-parody-actions';
+    var mic = document.createElement('button'); mic.type = 'button'; mic.className = 'sfx-tv-parody-mic';
+    mic.title = 'Dictate the H3 prompt'; mic.setAttribute('aria-label', mic.title);
+    mic.innerHTML = (typeof root.pineIcon === 'function'
+      ? (root.pineIcon('c:microphone', 'Dictate prompt') || '') : '') || 'MIC';
+    var send = document.createElement('button'); send.type = 'button';
+    send.className = 'primary'; send.textContent = 'Send to H3';
+    var listening = document.createElement('div');
+    listening.className = 'sfx-tv-parody-listening';
+    listening.hidden = true; listening.setAttribute('role', 'status');
+    listening.setAttribute('aria-live', 'polite');
+    var listeningPulse = document.createElement('i');
+    listeningPulse.setAttribute('aria-hidden', 'true');
+    var listeningWords = document.createElement('span');
+    listeningWords.textContent = 'Listening to your dictation. Device audio is muted.';
+    listening.appendChild(listeningPulse); listening.appendChild(listeningWords);
+    controls.appendChild(mic); controls.appendChild(listening); controls.appendChild(send);
+    var status = document.createElement('div'); status.className = 'sfx-tv-parody-status';
+    status.setAttribute('role', 'status');
+    var queuePanel = document.createElement('div'); queuePanel.className = 'sfx-tv-parody-queue';
+    var queueTitle = document.createElement('b'); queueTitle.textContent = 'Stinger queue';
+    var queueCurrent = document.createElement('div');
+    queueCurrent.className = 'sfx-tv-parody-queue-current';
+    var queueCause = document.createElement('div');
+    queueCause.className = 'sfx-tv-parody-queue-cause';
+    var queueActions = document.createElement('div');
+    queueActions.className = 'sfx-tv-parody-queue-actions';
+    var freeIdle = document.createElement('button'); freeIdle.type = 'button';
+    freeIdle.textContent = 'Free idle Comfy cache';
+    freeIdle.title = 'Only unloads when ComfyUI is not rendering';
+    var relieveOne = document.createElement('button'); relieveOne.type = 'button';
+    relieveOne.textContent = 'Host cache relief';
+    relieveOne.title = 'Run pressure relief tier 1; never tier 3 or active voice engines';
+    queueActions.appendChild(freeIdle); queueActions.appendChild(relieveOne);
+    var queueHistory = document.createElement('details');
+    queueHistory.className = 'sfx-tv-parody-queue-history';
+    var historySummary = document.createElement('summary');
+    historySummary.textContent = 'Prior stingers';
+    var historyRows = document.createElement('div');
+    queueHistory.appendChild(historySummary); queueHistory.appendChild(historyRows);
+    queuePanel.appendChild(queueTitle); queuePanel.appendChild(queueCurrent);
+    queuePanel.appendChild(queueCause); queuePanel.appendChild(queueActions);
+    queuePanel.appendChild(queueHistory);
+    box.appendChild(head); box.appendChild(stage); box.appendChild(nav); box.appendChild(trim);
+    box.appendChild(field); box.appendChild(controls); box.appendChild(status);
+    box.appendChild(queuePanel);
+    shade.appendChild(box); document.body.appendChild(shade); parodyWrap = shade;
+
+    var queueReading = false;
+    var refreshQueue = function () {
+      var bridge = api();
+      if (queueReading || !bridge || !bridge.get) return;
+      queueReading = true;
+      bridge.get('/api/comfy/workshop/parody-queue').then(function (state) {
+        if (parodyWrap !== shade) return;
+        var jobs = (state && state.jobs) || [];
+        var active = jobs.find(function (job) { return job.status === 'running'; });
+        var pending = jobs.filter(function (job) { return job.status === 'queued'; });
+        var current = active || pending[pending.length - 1];
+        var admission = (state && state.admission) || {};
+        var free = Number(admission.available_gb);
+        var needed = Number(admission.required_gb);
+        var memory = admission.available_gb != null && isFinite(free)
+          && isFinite(needed) && needed > 0;
+        queueCause.textContent = (memory ? free.toFixed(1) + ' GB free / '
+          + needed.toFixed(0) + ' GB needed. ' : '') + String(admission.why || '');
+        queueActions.hidden = !memory || free >= needed;
+        freeIdle.disabled = !!(state && state.live && state.live.busy);
+        relieveOne.disabled = freeIdle.disabled;
+        if (current) {
+          var elapsed = current.started ? Math.max(0, Math.floor(Date.now() / 1000
+            - Number(current.started))) : 0;
+          queueCurrent.textContent = current.status === 'running'
+            ? 'H3 rendering / ' + Math.floor(elapsed / 60) + 'm '
+              + String(elapsed % 60).padStart(2, '0') + 's / progress indeterminate'
+              + (pending.length ? ' / ' + pending.length + ' waiting' : '')
+            : 'Waiting / position ' + String(current.position || 1)
+              + ' / ' + pending.length + ' queued';
+        } else queueCurrent.textContent = 'No stinger waiting';
+        historySummary.textContent = 'Prior stingers (' + jobs.length + ')';
+        historyRows.replaceChildren();
+        jobs.forEach(function (job) {
+          var row = document.createElement('div');
+          row.className = 'sfx-tv-parody-queue-row';
+          var title = document.createElement('b');
+          title.textContent = String(job.direction || 'Parody stinger').slice(0, 110);
+          var detail = document.createElement('span');
+          var stats = (job.render && job.render.stats) || {};
+          var duration = Number(stats.duration_s || (job.finished && job.started
+            ? job.finished - job.started : 0));
+          detail.textContent = String(job.status) + (job.position ? ' / #' + job.position : '')
+            + (job.model ? ' / ' + job.model : '')
+            + (job.frames ? ' / ' + job.frames + ' frames' : '')
+            + (duration > 0 ? ' / ' + Math.round(duration) + 's' : '')
+            + (job.reason ? ' / ' + job.reason : '');
+          row.appendChild(title); row.appendChild(detail); historyRows.appendChild(row);
+          if (job.status === 'running' && job.prompt_id) parodyWatch(job.prompt_id, status);
+        });
+      }, function (err) {
+        if (parodyWrap === shade) queueCause.textContent = 'Queue status unavailable: '
+          + String((err && err.message) || err);
+      }).then(function () { queueReading = false; });
+    };
+    var relief = function (button, path, body) {
+      button.disabled = true;
+      status.textContent = 'Asking the host to free idle resources...';
+      post(path, body).then(function (got) {
+        status.textContent = String((got && (got.say || got.why)) ||
+          (got && got.done ? 'Idle cache freed.' : 'No resources were freed.'));
+        refreshQueue();
+      }, function (err) { status.textContent = String((err && err.message) || err); })
+        .then(function () { button.disabled = false; });
+    };
+    freeIdle.addEventListener('click', function () {
+      relief(freeIdle, '/api/comfy/idle/now', {mode: 'free'});
+    });
+    relieveOne.addEventListener('click', function () {
+      relief(relieveOne, '/api/orchestrator/pressure/relieve?tier=1', {});
+    });
+    refreshQueue();
+    parodyQueueTimer = root.setInterval(refreshQueue, 5000);
+
+    var rows = parodyCandidates(seed, []);
+    var index = Math.max(0, rows.length - 1);
+    var trimById = Object.create(null);
+    var trimStart = 0, trimEnd = 0, trimDuration = 0;
+    var trimReady = false, trimUsable = false, submitting = false;
+    var trimTime = function (tenths) {
+      return Math.floor(tenths / 600) + ':'
+        + String(Math.floor(tenths / 10) % 60).padStart(2, '0')
+        + '.' + (tenths % 10);
+    };
+    var showTrim = function () {
+      inControl.slider.value = String(trimStart);
+      outControl.slider.value = String(trimEnd);
+      inControl.value.textContent = trimTime(trimStart);
+      outControl.value.textContent = trimTime(trimEnd);
+      trimSpan.textContent = trimUsable
+        ? trimTime(trimEnd - trimStart) + ' selected'
+        : 'Short source uses the full clip';
+      if (trimUsable && rows[index]) {
+        trimById[rows[index].id] = {start: trimStart, end: trimEnd};
+      }
+    };
+    var setTrim = function () {
+      var seconds = Number(source.duration);
+      if (!isFinite(seconds) || seconds <= 0) {
+        status.textContent = 'The source duration could not be read.';
+        return;
+      }
+      trimDuration = Math.floor(seconds * 10);
+      trimUsable = trimDuration >= 22;
+      var saved = rows[index] && trimById[rows[index].id];
+      trimStart = trimUsable && saved ? Math.max(0, Math.min(saved.start, trimDuration - 22)) : 0;
+      trimEnd = trimUsable && saved
+        ? Math.max(trimStart + 22, Math.min(saved.end, trimDuration, trimStart + 150))
+        : Math.min(trimDuration, 150);
+      inControl.slider.max = String(trimDuration);
+      outControl.slider.max = String(trimDuration);
+      inControl.slider.disabled = !trimUsable;
+      outControl.slider.disabled = !trimUsable;
+      trim.hidden = false;
+      trimReady = true;
+      send.disabled = submitting;
+      showTrim();
+      if (trimUsable) source.currentTime = trimStart / 10;
+    };
+    var wanted = clipId(seed);
+    for (var i = 0; i < rows.length; i += 1) if (rows[i].id === wanted) index = i;
+    wireVideoRadial(source, function () { return rows[index] || seed; });
+    /* The browser's empty-video badge is itself the stretched graphic the
+       assembly cover replaces. Keep an independent CSS gate as well as the
+       Three.js cover: if the cover script is late or a source errors before
+       it can build, the native badge still never receives one painted frame. */
+    var previewWaiting = function () { stage.classList.add('is-loading'); };
+    var previewReady = function () {
+      if (source.readyState >= 2 && source.videoWidth > 0) {
+        stage.classList.remove('is-loading');
+      } else previewWaiting();
+    };
+    ['loadstart', 'emptied', 'waiting', 'stalled', 'error', 'abort']
+      .forEach(function (name) { source.addEventListener(name, previewWaiting); });
+    ['loadeddata', 'playing']
+      .forEach(function (name) { source.addEventListener(name, previewReady); });
+    source.addEventListener('loadedmetadata', setTrim);
+    inControl.slider.addEventListener('input', function () {
+      if (!trimUsable) return;
+      trimStart = Math.max(0, Math.min(Number(inControl.slider.value), trimDuration - 22));
+      trimEnd = Math.max(trimStart + 22, Math.min(trimEnd, trimStart + 150, trimDuration));
+      showTrim(); source.currentTime = trimStart / 10;
+    });
+    outControl.slider.addEventListener('input', function () {
+      if (!trimUsable) return;
+      trimEnd = Math.max(trimStart + 22,
+        Math.min(Number(outControl.slider.value), trimStart + 150, trimDuration));
+      showTrim(); source.currentTime = Math.max(trimStart, trimEnd - 1) / 10;
+    });
+    source.addEventListener('play', function () {
+      if (trimUsable && (source.currentTime < trimStart / 10 ||
+          source.currentTime >= trimEnd / 10)) source.currentTime = trimStart / 10;
+    });
+    source.addEventListener('timeupdate', function () {
+      if (trimUsable && !source.paused && source.currentTime >= trimEnd / 10 - 0.03) {
+        source.pause(); source.currentTime = trimStart / 10;
+      }
+    });
+    var paint = function () {
+      if (!rows.length) { label.textContent = 'No video source'; send.disabled = true; return; }
+      index = Math.max(0, Math.min(rows.length - 1, index));
+      var row = rows[index];
+      label.textContent = (index + 1) + ' of ' + rows.length + ' - ' + row.sting;
+      prev.disabled = index <= 0; next.disabled = index >= rows.length - 1;
+      trimReady = false; trimUsable = false; trim.hidden = true;
+      send.disabled = true;
+      previewWaiting();
+      try { source.pause(); } catch (err) { /* changing source */ }
+      try { if (parodyCover && parodyCover.destroy) parodyCover.destroy(); } catch (err2) {}
+      parodyCover = null;
+      if (root.PineWallTransition && typeof root.PineWallTransition.cover === 'function') {
+        parodyCover = root.PineWallTransition.cover(source, {container: stage,
+          className: 'pine-video-assembly', label: 'SOURCE VIDEO ASSEMBLING', zIndex: 3});
+      }
+      source.removeAttribute('poster');
+      source.src = parodySourceUrl(row); source.load();
+    };
+    prev.addEventListener('click', function () { if (index > 0) { index -= 1; paint(); } });
+    next.addEventListener('click', function () { if (index + 1 < rows.length) { index += 1; paint(); } });
+    close.addEventListener('click', parodyClose);
+    shade.addEventListener('click', function (ev) { if (ev.target === shade) parodyClose(); });
+    var dictating = false;
+    var finishWhenReady = false;
+    var pressStartedAt = 0;
+    var pressWasListening = false;
+    var sourceWasMuted = false;
+    var wallState = null;
+    var parseWall = function (raw) {
+      try { return typeof raw === 'string' ? JSON.parse(raw) : raw; }
+      catch (err) { return null; }
+    };
+    var dictationUi = function (mode) {
+      var on = mode === 'listening' || mode === 'processing';
+      mic.classList.toggle('listening', on);
+      mic.classList.toggle('processing', mode === 'processing');
+      mic.setAttribute('aria-pressed', on ? 'true' : 'false');
+      listening.hidden = !on;
+      listening.classList.toggle('processing', mode === 'processing');
+      listeningWords.textContent = mode === 'processing'
+        ? 'Finishing your dictation. Device audio is still muted.'
+        : 'Listening to your dictation. Device audio is muted.';
+      box.classList.toggle('is-dictating', on);
+    };
+    var releaseDictation = function () {
+      if (!dictating) { dictationUi('idle'); return; }
+      dictating = false;
+      dictationUi('idle');
+      try {
+        if (root.PineDuck && typeof root.PineDuck.release === 'function') {
+          root.PineDuck.release('sfx-parody-dictation');
+        }
+      } catch (err) { /* the level bus may have left with the view */ }
+      try { source.muted = sourceWasMuted; } catch (err2) { /* source gone */ }
+      if (root.pineLevels && typeof root.pineLevels.refresh === 'function') {
+        try { root.pineLevels.refresh('video'); } catch (err3) { /* no wall */ }
+      } else if (wallState && typeof wallState.then === 'function') {
+        wallState.then(function (raw) {
+          var old = parseWall(raw);
+          if (old && isFinite(Number(old.level))) {
+            wallAsk('level', {level: Number(old.level)});
+          }
+        })['catch'](function () { /* no native wall to restore */ });
+      }
+    };
+    parodyDictationRelease = releaseDictation;
+    var stopDictation = function () {
+      if (!dictating) return;
+      var dot = root.PineTalkDot;
+      dictationUi('processing');
+      if (dot && typeof dot.state === 'function' && dot.state() === 'listening') {
+        if (typeof dot.finish === 'function') dot.finish();
+      } else finishWhenReady = true;
+    };
+    var startDictation = function () {
+      var dot = root.PineTalkDot;
+      if (!dot || typeof dot.captureNext !== 'function') {
+        status.textContent = 'The microphone is not available on this screen.'; return;
+      }
+      dictating = true;
+      finishWhenReady = false;
+      sourceWasMuted = !!source.muted;
+      source.muted = true;
+      if (root.PineDuck && typeof root.PineDuck.hold === 'function') {
+        root.PineDuck.hold('sfx-parody-dictation', 0, box);
+      }
+      wallState = wallAsk('state');
+      wallAsk('level', {level: 0});
+      dictationUi('listening');
+      status.textContent = 'Listening - tap the microphone when finished.';
+      try {
+        var started = dot.captureNext(function (text) {
+          releaseDictation();
+          if (parodyWrap !== shade) return;
+          var words = String(text || '').trim();
+          if (words) {
+            field.value = [field.value.trimEnd(), words].filter(Boolean).join(' ');
+            field.dispatchEvent(new Event('input', {bubbles: true}));
+            field.focus({preventScroll: true});
+            if (field.setSelectionRange) field.setSelectionRange(field.value.length, field.value.length);
+          }
+          status.textContent = words ? 'Transcript added to prompt.' : 'Nothing was heard.';
+        });
+        if (started && started['then']) started.then(function () {
+          if (finishWhenReady) {
+            finishWhenReady = false;
+            if (dot.state && dot.state() === 'listening' && dot.finish) dot.finish();
+          }
+          setTimeout(function () {
+            if (!dictating || !dot.state || dot.state() === 'listening') return;
+            releaseDictation();
+            status.textContent = 'The microphone did not begin listening.';
+          }, 0);
+        });
+        if (started && started['catch']) started['catch'](function (err) {
+          releaseDictation(); status.textContent = String((err && err.message) || err);
+        });
+      } catch (err) {
+        releaseDictation(); status.textContent = String(err.message || err);
+      }
+    };
+    mic.addEventListener('pointerdown', function (event) {
+      event.preventDefault();
+      pressStartedAt = Date.now();
+      pressWasListening = dictating;
+      if (dictating) stopDictation(); else startDictation();
+      try { if (mic.setPointerCapture) mic.setPointerCapture(event.pointerId); }
+      catch (err) { /* the take may have started already */ }
+    });
+    mic.addEventListener('pointerup', function () {
+      if (pressStartedAt && !pressWasListening && Date.now() - pressStartedAt >= 450) {
+        stopDictation();
+      }
+      pressStartedAt = 0;
+    });
+    mic.addEventListener('pointercancel', function () {
+      if (pressStartedAt && !pressWasListening && Date.now() - pressStartedAt >= 450) {
+        stopDictation();
+      }
+      pressStartedAt = 0;
+    });
+    mic.addEventListener('click', function (event) {
+      if (event.detail !== 0) return;
+      if (dictating) stopDictation(); else startDictation();
+    });
+    send.addEventListener('click', function () {
+      if (!rows.length) return;
+      if (!trimReady) { status.textContent = 'Wait for the reference video to load.'; return; }
+      var direction = field.value.trim();
+      if (!direction) { status.textContent = 'Dictate or type the parody direction first.'; field.focus(); return; }
+      var chosen = rows[index];
+      submitting = true;
+      send.disabled = true; status.textContent = 'Preparing ' + chosen.sting + ' for H3...';
+      var prompt = 'Create a short Pine Box FM radio stinger as a parody of the reference video. '
+        + 'Keep its recognizable composition and performance while making it feel native to Pine Box FM. '
+        + 'Follow this direction: ' + direction;
+      var body = {mode: 'reference', purpose: 'parody_stinger',
+        source: chosen.id, source_type: chosen.source_type || 'recent',
+        source_generation: chosen.source_generation || '', prompt: prompt,
+        speech: parodyQuoted(direction), frames: 73, steps: 4, air_it: false};
+      if (trimUsable) {
+        body.trim_in_s = trimStart / 10;
+        body.trim_out_s = trimEnd / 10;
+      }
+      post('/api/comfy/workshop', body)
+        .then(function (got) {
+          status.textContent = got && got.queue_id
+            ? 'Stinger saved in the server queue. You can close this window.'
+            : 'Submitted to H3.';
+          if (got && got.prompt_id) parodyWatch(got.prompt_id, status);
+          refreshQueue(); submitting = false; send.disabled = !trimReady;
+        }, function (err) {
+          submitting = false; send.disabled = !trimReady;
+          status.textContent = String((err && err.message) || err);
+        });
+    });
+    paint();
+
+    var bridge = api();
+    if (bridge && bridge.get) bridge.get('/api/sfx/history?limit=120').then(function (got) {
+      if (parodyWrap !== shade) return;
+      var old = ((got && got.rows) || []).slice().reverse().map(function (row) {
+        return {id: String(row.id || ''), url: String(row.url || ''),
+          name: String(row.name || ''), sting: String(row.name || row.id || ''),
+          video: histVideo(row), ts: Number(row.ts) || 0,
+          source_type: 'recent'};
+      });
+      var selected = rows[index] && rows[index].id;
+      rows = parodyCandidates(seed, old);
+      index = Math.max(0, rows.length - 1);
+      for (var n = 0; n < rows.length; n += 1) if (rows[n].id === selected) index = n;
+      paint();
+    }, function () { /* the current and in-memory history remain usable */ });
+  }
+
+  function radialClose(releaseWall, resumeMedia) {
+    var wrap = radialWrap;
+    radialWrap = null;
+    try { if (wrap && wrap.parentNode) wrap.parentNode.removeChild(wrap); }
+    catch (err) { /* already gone */ }
+    var media = radialMedia;
+    var shouldResume = radialMediaWasPlaying && resumeMedia !== false;
+    radialMedia = null; radialMediaWasPlaying = false;
+    if (media && shouldResume) {
+      try {
+        var started = media.play();
+        if (started && started['catch']) started['catch'](function () {});
+      } catch (err2) { /* the popup may have closed */ }
+    }
+    if (releaseWall !== false) surfaceDown(false);
+  }
+
+  function deleteConfirmClose(releaseWall) {
+    var wrap = deleteWrap;
+    deleteWrap = null;
+    if (wrap) {
+      var media = wrap.querySelector('video');
+      try {
+        if (media && media.__pineVideoAssembly) media.__pineVideoAssembly.destroy();
+      } catch (coverErr) { /* the transition may already have retired */ }
+      try { if (media) { media.pause(); media.removeAttribute('src'); media.load(); } }
+      catch (err) { /* already gone */ }
+      try { if (wrap.parentNode) wrap.parentNode.removeChild(wrap); }
+      catch (err2) { /* already gone */ }
+    }
+    if (releaseWall !== false) surfaceDown(false);
+  }
+
+  function deleteConfirm(clip) {
+    radialClose(false, false);
+    deleteConfirmClose(false);
+    var shade = document.createElement('div');
+    shade.className = 'sfx-tv-delete-shade sfx-tv';
+    var box = document.createElement('section');
+    box.className = 'sfx-tv-delete-confirm';
+    box.setAttribute('role', 'alertdialog');
+    box.setAttribute('aria-label', 'Confirm permanent video deletion');
+    var title = document.createElement('b');
+    title.textContent = 'Delete this video permanently?';
+    var stage = document.createElement('div');
+    stage.className = 'sfx-tv-delete-stage';
+    var media = document.createElement('video');
+    media.controls = true; media.loop = true; media.muted = true;
+    media.playsInline = true; media.preload = 'auto';
+    stage.appendChild(media);
+    var help = document.createElement('div');
+    help.className = 'sfx-tv-delete-help';
+    help.textContent = 'Drag left or right across the video to scrub it before deciding.';
+    var status = document.createElement('div');
+    status.className = 'sfx-tv-parody-status';
+    status.textContent = String(clip.sting || clip.text || clipId(clip));
+    var actions = document.createElement('div');
+    actions.className = 'sfx-tv-parody-actions';
+    var cancel = document.createElement('button');
+    cancel.type = 'button'; cancel.textContent = 'Cancel';
+    var remove = document.createElement('button');
+    remove.type = 'button'; remove.className = 'bad';
+    remove.textContent = 'Delete permanently';
+    actions.appendChild(cancel); actions.appendChild(remove);
+    box.appendChild(title); box.appendChild(stage); box.appendChild(help);
+    box.appendChild(status); box.appendChild(actions); shade.appendChild(box);
+    document.body.appendChild(shade); deleteWrap = shade;
+    if (root.PineWallTransition
+        && typeof root.PineWallTransition.cover === 'function') {
+      root.PineWallTransition.cover(media, {container: stage,
+        className: 'sfx-tv-assembly', label: 'VIDEO ASSEMBLING', zIndex: 2});
+    }
+    media.src = parodySourceUrl(clip);
+    try { media.load(); } catch (loadErr) { /* assigning src is sufficient */ }
+    var drag = null;
+    media.addEventListener('pointerdown', function (ev) {
+      if (!isFinite(Number(media.duration)) || Number(media.duration) <= 0) return;
+      drag = {x: Number(ev.clientX) || 0, at: Number(media.currentTime) || 0};
+      try { media.setPointerCapture(ev.pointerId); } catch (err) {}
+    });
+    media.addEventListener('pointermove', function (ev) {
+      if (!drag || !isFinite(Number(media.duration))) return;
+      ev.preventDefault();
+      var width = Math.max(80, media.getBoundingClientRect().width || 0);
+      var at = drag.at + ((Number(ev.clientX) || 0) - drag.x) / width * media.duration;
+      try { media.currentTime = Math.max(0, Math.min(media.duration, at)); }
+      catch (err) { /* metadata changed underneath the gesture */ }
+    });
+    var release = function (ev) {
+      if (!drag) return; drag = null;
+      try { media.releasePointerCapture(ev.pointerId); } catch (err) {}
+    };
+    media.addEventListener('pointerup', release);
+    media.addEventListener('pointercancel', release);
+    cancel.addEventListener('click', function () { deleteConfirmClose(true); });
+    shade.addEventListener('click', function (ev) {
+      if (ev.target === shade) deleteConfirmClose(true);
+    });
+    remove.addEventListener('click', function () {
+      remove.disabled = true; status.textContent = 'Deleting permanently...';
+      var actions = clip && clip.__pineActions;
+      if (actions && typeof actions.remove === 'function') {
+        try {
+          var custom = actions.remove(clip);
+          Promise.resolve(custom).then(function () {
+            status.textContent = 'Deleted permanently.';
+            setTimeout(function () { deleteConfirmClose(true); }, 350);
+          }, function (err) {
+            remove.disabled = false;
+            status.textContent = String((err && err.message) || err);
+          });
+        } catch (err) {
+          remove.disabled = false;
+          status.textContent = String((err && err.message) || err);
+        }
+        return;
+      }
+      scrap(clip, function (text) { status.textContent = String(text || ''); }, function () {
+        withdrawClip(clipId(clip));
+        setTimeout(function () { deleteConfirmClose(true); }, 650);
+      });
+    });
+    var started = media.play();
+    if (started && started['catch']) started['catch'](function () {});
+  }
+
+  function radialOpen(clip, at) {
+    if (!clip) return;
+    radialClose(false);
+    surfaceDown(true);
+    radialMedia = clip.__pineVideo || null;
+    radialMediaWasPlaying = !!(radialMedia && !radialMedia.paused);
+    try { if (radialMedia) radialMedia.pause(); } catch (err) {}
+    var shade = document.createElement('div');
+    shade.className = 'sfx-tv-radial-shade sfx-tv';
+    var menu = document.createElement('div');
+    menu.className = 'sfx-tv-radial';
+    menu.setAttribute('role', 'menu');
+    var W = root.innerWidth || 800, H = root.innerHeight || 600;
+    var x = Math.max(112, Math.min(W - 112, Number(at && at.x) || W / 2));
+    var y = Math.max(112, Math.min(H - 112, Number(at && at.y) || H / 2));
+    menu.style.left = x + 'px'; menu.style.top = y + 'px';
+    var note = document.createElement('span');
+    note.className = 'sfx-tv-radial-note';
+    note.textContent = String(clip.sting || clip.text || 'video');
+    menu.appendChild(note);
+    var actions = clip.__pineActions || {};
+    var item = function (label, iconRef, cls, go) {
+      var b = document.createElement('button');
+      b.type = 'button'; b.className = 'sfx-tv-radial-item ' + cls;
+      b.title = label; b.setAttribute('aria-label', label);
+      b.innerHTML = (typeof root.pineIcon === 'function'
+        ? (root.pineIcon(iconRef, label) || '') : '') || label;
+      b.addEventListener('click', function (ev) { ev.stopPropagation(); go(); });
+      menu.appendChild(b);
+    };
+    item('Send video to sampler', 'c:audio-console', 'sampler', function () {
+      if (typeof actions.sampler === 'function') {
+        Promise.resolve(actions.sampler(clip)).then(function (text) {
+          note.textContent = String(text || 'Sent to sampler.');
+        }, function (err) { note.textContent = String((err && err.message) || err); });
+        return;
+      }
+      toPad(clip, function (text) { note.textContent = String(text || ''); });
+    });
+    item('Make parody with H3', 'c:microphone', 'parody', function () {
+      if (typeof actions.parody === 'function') {
+        radialClose(true); actions.parody(clip); return;
+      }
+      radialClose(false, false); parodyOpen(clip, true);
+    });
+    item('Examine in depth', 'c:microscope', 'examine', function () {
+      if (typeof actions.examine === 'function') {
+        radialClose(true); actions.examine(clip); return;
+      }
+      radialClose(false, false);
+      sheet(clip, at || null);
+      var open = sheetWrap;
+      var notes = open ? open.querySelectorAll('.sfx-tv-note') : [];
+      var detail = notes.length ? notes[notes.length - 1] : null;
+      inspect(clip, function (text) {
+        if (detail) detail.textContent = String(text || '');
+      }, open);
+    });
+    item('Make favorite', 'c:favorite--filled', 'favorite', function () {
+      if (typeof actions.favorite === 'function') {
+        Promise.resolve(actions.favorite(clip)).then(function (text) {
+          note.textContent = String(text || 'Marked as a favorite.');
+        }, function (err) { note.textContent = String((err && err.message) || err); });
+        return;
+      }
+      weigh(clip, true, function (text) { note.textContent = String(text || ''); });
+    });
+    item('Replay clip', 'c:renew', 'replay', function () {
+      if (typeof actions.replay === 'function') {
+        radialClose(true); actions.replay(clip); return;
+      }
+      var nativeReplay = wallAsk('replay');
+      if (nativeReplay && typeof nativeReplay.then === 'function') {
+        radialClose(false);
+        nativeReplay.catch(function () { surfaceDown(false); });
+        return;
+      }
+      radialClose(true);
+      try {
+        var media = clip.__pineVideo || video;
+        if (media && isFinite(Number(media.duration))) {
+          media.currentTime = 0;
+          var started = media.play();
+          if (started && started['catch']) started['catch'](function () {});
+        } else if (rewind) rewind();
+      } catch (err) { if (rewind) rewind(); }
+    });
+    if (actions.remove !== false) {
+      item('Delete permanently', 'c:close--filled', 'delete', function () {
+        deleteConfirm(clip);
+      });
+    }
+    shade.appendChild(menu);
+    shade.addEventListener('click', function (ev) {
+      if (ev.target === shade) radialClose(true);
+    });
+    document.body.appendChild(shade); radialWrap = shade;
+  }
+
+  function wireVideoRadial(media, getClip) {
+    if (!media || media.__pineRadialWired) return;
+    media.__pineRadialWired = true;
+    var held = null, timer = 0;
+    var forget = function () {
+      if (timer) { clearTimeout(timer); timer = 0; }
+      held = null;
+    };
+    media.addEventListener('pointerdown', function (ev) {
+      if (ev.button !== undefined && ev.button !== 0) return;
+      held = {x: Number(ev.clientX) || 0, y: Number(ev.clientY) || 0};
+      timer = setTimeout(function () {
+        timer = 0;
+        var at = held; held = null;
+        var clip = typeof getClip === 'function' ? getClip() : getClip;
+        if (!clip) return;
+        clip.__pineVideo = media;
+        radialOpen(clip, at);
+      }, HOLD_MS);
+    });
+    media.addEventListener('pointermove', function (ev) {
+      if (!held) return;
+      if (Math.abs((Number(ev.clientX) || 0) - held.x) > SLOP_PX
+          || Math.abs((Number(ev.clientY) || 0) - held.y) > SLOP_PX) forget();
+    });
+    media.addEventListener('pointerup', forget);
+    media.addEventListener('pointercancel', forget);
+    media.addEventListener('contextmenu', function (ev) {
+      var clip = typeof getClip === 'function' ? getClip() : getClip;
+      if (!clip) return;
+      ev.preventDefault(); ev.stopPropagation();
+      clip.__pineVideo = media;
+      radialOpen(clip, {x: ev.clientX, y: ev.clientY});
+    });
+  }
+
   function build(name, ready) {      /* #1411: `ready` is a warmed <video> */
     /* #1312: one set at a time, always. A stray from an earlier cut
        would otherwise sit here holding a connection for ever. */
+    assemblyDrop();
     try {
       var old = document.querySelectorAll('.sfx-tv');
       for (var i = 0; i < old.length; i += 1) {
         var v = old[i].querySelector('video');
-        try { if (v) { v.pause(); v.removeAttribute('src'); v.load(); } }
+        try { if (v) { v.pause(); levelDrop(v); v.removeAttribute('src'); v.load(); } }
         catch (e2) { /* already gone */ }
         if (old[i].parentNode) old[i].parentNode.removeChild(old[i]);
       }
@@ -927,11 +1994,12 @@
     video.playsInline = true;
     video.preload = 'auto';
     video.controls = false;
+    video.crossOrigin = 'anonymous';
     /* #789/#981: the shell owns live element volume, and the booth monitor
      * switch governs anything tagged pine-live. A sting that skipped the
      * tag would be the one sound in this window nobody could turn down. */
     video.dataset.pineLive = 'voice';
-    video.volume = level;
+    levelSet(video, level, false);
     tube.appendChild(video);
     var glass = document.createElement('div');
     glass.className = 'sfx-tv-glass';
@@ -943,6 +2011,7 @@
     screen.appendChild(glass);
     screen.appendChild(vignette);
     screen.appendChild(flash);
+    assemblyBind(video, screen, name);
 
     /* #1306b: THE PAD ICON, top right of the PICTURE.
      * "an icon to the top right of the video of a small box that if I
@@ -1064,9 +2133,10 @@
       pressTimer = setTimeout(function () {
         pressTimer = 0;
         /* A hold: still down, never moved. Not a tap on release. */
+        var heldAt = press;
         press = null;
         if (tapTimer) { clearTimeout(tapTimer); tapTimer = 0; }
-        if (playing) ask(screen);
+        if (playing) radialOpen(playing, heldAt);
       }, HOLD_MS);
     });
     host.addEventListener('pointermove', function (ev) {
@@ -1146,10 +2216,12 @@
       ready.removeAttribute('style');
     } catch (err) { /* it is still the picture */ }
     video = ready;
+    assemblyBind(video, host && host.querySelector('.sfx-tv-screen'),
+      playing && (playing.sting || playing.text));
     try { host.classList.remove('waiting'); } catch (err) { /* already off */ }
     try {
       if (old && old !== ready) {
-        old.pause(); old.removeAttribute('src'); old.load();
+        old.pause(); levelDrop(old); old.removeAttribute('src'); old.load();
         if (old.parentNode) old.parentNode.removeChild(old);
       }
     } catch (err) { /* #1147: src first, node second - both tried */ }
@@ -1166,10 +2238,11 @@
   function teardown(mine) {
     if (mine && video && video !== mine) return;   // a newer set owns the screen
     floorRelease('tube');                          // [#1214] the mouth is free
+    assemblyDrop();
     var going = mine || video;
     /* Removing a <video> from the document does NOT stop it, so the src
      * goes first and the node second. */
-    try { if (going) { going.pause(); going.removeAttribute('src'); going.load(); } }
+    try { if (going) { going.pause(); levelDrop(going); going.removeAttribute('src'); going.load(); } }
     catch (err) {}
     try { if (host && host.parentNode) host.parentNode.removeChild(host); }
     catch (err) {}
@@ -1178,7 +2251,7 @@
       var stray = document.querySelectorAll('.sfx-tv');
       for (var i = 0; i < stray.length; i += 1) {
         var v = stray[i].querySelector('video');
-        try { if (v) { v.pause(); v.removeAttribute('src'); v.load(); } }
+        try { if (v) { v.pause(); levelDrop(v); v.removeAttribute('src'); v.load(); } }
         catch (e2) { /* already gone */ }
         if (stray[i].parentNode) stray[i].parentNode.removeChild(stray[i]);
       }
@@ -1223,10 +2296,11 @@
    * the references got tangled. Removing a <video> does not stop it,
    * so the src goes first and the node second - #1147's rule. */
   function teardownNow() {
+    assemblyDrop();
     var all = document.querySelectorAll('.sfx-tv');
     for (var i = 0; i < all.length; i += 1) {
       var v = all[i].querySelector('video');
-      try { if (v) { v.pause(); v.removeAttribute('src'); v.load(); } }
+      try { if (v) { v.pause(); levelDrop(v); v.removeAttribute('src'); v.load(); } }
       catch (err) { /* already gone */ }
       try { if (all[i].parentNode) all[i].parentNode.removeChild(all[i]); }
       catch (err) { /* already gone */ }
@@ -1607,7 +2681,7 @@
     /* #1421: the held bytes if we have them, the station if we do not. */
     if (!ready) screen.src = heldSrc(clip);
     screen.addEventListener('canplaythrough', function () { warmUp(); });
-    screen.volume = level;
+    levelSet(screen, level, false);
     /* #1310: THE PAD'S IN AND OUT, ON THE PICTURE TOO.
      *
      * The same {start, end} the engine clips the audio to, so a video
@@ -1848,7 +2922,7 @@
   function stripRows() {
     var rows = [];
     var i;
-    var back = heard.slice(-STRIP_EACH);
+    var back = heard.slice(-STRIP_PAST);
     for (i = 0; i < back.length; i += 1) {
       rows.push({id: back[i].id, url: back[i].url, sting: back[i].sting,
                  video: !!back[i].video,                     /* #1199 */
@@ -1879,12 +2953,13 @@
       }
     }
     var mine = playing ? clipId(playing) : '';
-    for (i = 0; i < ahead.length && rows.length < (STRIP_EACH * 2) + 1; i += 1) {
+    var aheadAdded = 0;
+    for (i = 0; i < ahead.length && aheadAdded < STRIP_NEXT; i += 1) {
       if (mine && String(ahead[i].id) === mine) continue;
       rows.push({id: ahead[i].id, url: ahead[i].url, sting: ahead[i].sting,
                  video: !!ahead[i].video,                    /* #1199 */
                  seconds: ahead[i].seconds, at: ahead[i].at, when: 'next'});
-      if (rows.length >= STRIP_EACH + 1 + STRIP_EACH) break;
+      aheadAdded += 1;
     }
     return rows;
   }
@@ -1929,6 +3004,19 @@
                       + '&dir=' + (dir === 'prev' ? 'prev' : 'next'));
   }
 
+  /* The native wall owns its ExoPlayer runway. An operator-selected clip
+     must be inserted directly after the current item, not left behind the
+     three already warmed entries where "Next" appears to do nothing. */
+  function wallSelect(clip) {
+    if (!clip || !clip.url || !wallRunning()) return false;
+    try { markOf(clip); } catch (err) { /* it can still be selected */ }
+    ring(clip);                         /* every other surface sees the cut */
+    wallAsk('play', {id: clipId(clip), url: String(clip.url),
+                     seconds: Number(clip.seconds || clip.length) || 0});
+    sheetClose();                       /* releases the held endless player */
+    return true;
+  }
+
   function step(clip, dir, say) {
     var id = clipId(clip);
     if (!id) { say('no id on this clip'); return; }
@@ -1937,6 +3025,7 @@
       if (got && got.ok && got.clip && got.clip.url) {
         /* #1124: a run in progress carries on from the clip stepped to. */
         if (runLeft > 0) runFrom = clipId(got.clip);
+        if (wallSelect(got.clip)) return;
         if (!root.PineSfxTv.cut(got.clip, {ring: true})) say('it would not open');
         return;
       }
@@ -2326,31 +3415,14 @@
          saying out loud rather than leaving him to notice. */
       + (row.when === 'past' && Number(row.plays) > 1
          ? ' - ' + row.plays + ' airings' : '')
-      + ' - tap to open its menu';
+      + ' - tap to play it';
     b.addEventListener('click', function (ev) {
       ev.stopPropagation();
-      if (mine) { say('that is the one on the tube'); return; }
-      /* The tile is a handle onto the SAME sheet, opened for that clip:
-         "tap them to jump to them and play / examine / manage them as
-         well". So it re-opens here rather than playing at once, and the
-         sheet it opens carries a Play it of its own - examining a clip
-         and jumping to it are two different intentions and a single tap
-         must not guess between them.
-         #1200: AND A HISTORY TILE IS THE SAME TAP, deliberately. A clip
-         out of the ledger is a clip that has already gone out, which is
-         exactly what a `heard` tile is, and the sheet already knows what
-         that means: it is not the one on the tube, so it grows a Play it,
-         and Play it takes jump()'s BACK road - a replay ALONGSIDE the
-         cycle with the queue untouched, not a rewind of the plan. Inspect,
-         Path, Where is it, More/Less, Send to a pad, Never again and
-         Delete all read the clip's id, and the ledger row carries the same
-         id the cycle does, so every one of them is already correct for a
-         clip that aired an hour ago. There was nothing to add and adding
-         a second behaviour would have been the fault. */
-      var at = sheetAt;
-      sheetClose();
-      sheet({id: row.id, url: row.url, sting: row.sting,
-             seconds: row.seconds}, at);
+      /* A queue tile is a transport control. Inspection remains available
+         from the video hold menu; the unmodified tap now does the immediate
+         thing its position in the queue promises and starts that item. */
+      jump({id: row.id, url: row.url, sting: row.sting,
+            seconds: row.seconds, video: !!row.video}, say);
     });
     return b;
   }
@@ -2582,8 +3654,10 @@
    * station described itself. Without that rule an inclusive cursor
    * sitting on a second that holds a whole page of clips would ask the
    * same question for ever. */
-  function histFetch() {
+  function histFetch(most) {
     if (histBusy || !histMore) return;
+    var wanted = Math.max(1, Math.min(3, Number(most) || HIST_PAGE));
+    var asked = Math.min(3, wanted + (histAt > 0 ? 1 : 0));
     var bridge = api();
     if (!bridge || !bridge.get) {
       histMore = false;
@@ -2596,11 +3670,11 @@
     histBad = false;
     histSay = 'looking further back...';
     histPaint();
-    var path = '/api/sfx/history?limit=' + HIST_PAGE
+    var path = '/api/sfx/history?limit=' + asked
       + (histAt > 0 ? '&before=' + histAt : '');
     bridge.get(path).then(function (got) {
       histBusy = false;
-      try { histLand(got); }
+      try { histLand(got, asked); }
       catch (err) {
         histBad = true;
         histSay = 'that page would not draw: '
@@ -2621,9 +3695,8 @@
     });
   }
 
-  function histLand(got) {
+  function histLand(got, asked) {
     var rows = (got && got.rows) || [];
-    var live = liveIds();
     var fresh = [];
     var oldest = 0;
     var i;
@@ -2636,7 +3709,9 @@
       var key = ts + '|' + id;
       if (histSeen[key]) continue;
       histSeen[key] = 1;
-      if (live[id] === 1) continue;     /* the cycle already draws this one */
+      /* A history row is an airing, not another live queue entry. Keep it
+       * even when the same id is currently on the strip: a clip that really
+       * recurred must remain visible in the operator's last-three history. */
       fresh.push({key: key, id: id, ts: ts,
                   url: String(r.url || ''),
                   sting: String(r.name || id),
@@ -2660,7 +3735,7 @@
     }
     histMore = (got && typeof got.more === 'boolean')
       ? !!got.more
-      : rows.length >= HIST_PAGE;      /* an older station with no `more` */
+      : rows.length >= (Number(asked) || HIST_PAGE); /* an older station */
     histSay = histMore ? '' : 'that is the whole history - nothing older';
     hist = fresh.concat(hist);
     histDraw(fresh.length);
@@ -2695,7 +3770,7 @@
     }
     var grew = (Number(strip.scrollWidth) || 0) - wide;
     if (grew > 0) {
-      try { strip.scrollLeft = (Number(strip.scrollLeft) || 0) + grew; }
+      try { stripPlace(strip, (Number(strip.scrollLeft) || 0) + grew); }
       catch (err) { /* nothing scrolls here */ }
     }
     histCeiling();
@@ -2815,15 +3890,20 @@
     return b;
   }
 
-  /* #1200: THE NOTE AT THE OLD END - three states that must never look
+  /* #1200: THE CONTROL AT THE OLD END - three states that must never look
      alike. A page in flight, the end of the ledger and a page that FAILED
      are one spinning tile if nobody writes them down, and the third of
      those silently teaches him there is no more history when there is.
-     A <div>, never a button: there is nothing to press here, because the
-     gesture that asks for more is the scroll itself. */
+     A real button: a sideways drag or wheel can reach it, and tapping it
+     explicitly pulls the next two older entries. */
   function histNote() {
-    var box = document.createElement('div');
+    var box = document.createElement('button');
+    box.type = 'button';
     box.className = 'sfx-tv-oldend';
+    box.addEventListener('click', function (ev) {
+      ev.preventDefault(); ev.stopPropagation();
+      histFetch(HIST_PAGE);
+    });
     histWord(box);
     return box;
   }
@@ -2911,7 +3991,25 @@
   function stripScrolled() {
     var strip = stripEl;
     if (!strip) return;
-    if ((Number(strip.scrollLeft) || 0) <= HIST_NEAR) histFetch();
+    var at = Number(strip.scrollLeft) || 0;
+    /* Positioning the popup at NOW and preserving the viewed tile after a
+       prepend both produce real browser scroll events. They are not a
+       request for another page. Remember the exact clamped position owed by
+       that assignment and consume only that event; a finger that moves to a
+       different position remains an ordinary history gesture. */
+    if (stripOwedLeft !== null && Math.abs(at - stripOwedLeft) <= 1) {
+      stripOwedLeft = null;
+      return;
+    }
+    stripOwedLeft = null;
+    if (at <= HIST_NEAR) histFetch();
+  }
+
+  function stripPlace(strip, wanted) {
+    var most = Math.max(0, (Number(strip.scrollWidth) || 0)
+      - (Number(strip.clientWidth) || 0));
+    stripOwedLeft = Math.max(0, Math.min(most, Number(wanted) || 0));
+    strip.scrollLeft = wanted;
   }
 
   function stripBuild(clip, say) {
@@ -2925,9 +4023,11 @@
     strip.addEventListener('wheel', stripWheel, {passive: false});
     strip.addEventListener('scroll', stripScrolled);
     stripEl = strip;
+    stripOwedLeft = null;
     stripClip = clip || null;
     stripSay = (typeof say === 'function') ? say : function () {};
     stripFill();
+    if (!hist.length && histMore && !histBusy) histFetch(STRIP_PAST);
     return strip;
   }
 
@@ -2969,7 +4069,7 @@
        this to the real width; a strip that does not overflow stays at 0
        and fires no scroll event, which is why opening the sheet does not
        quietly ask the station for a page nobody wanted. */
-    try { strip.scrollLeft = 1e7; } catch (err) { /* nothing scrolls here */ }
+    try { stripPlace(strip, 1e7); } catch (err) { /* nothing scrolls here */ }
   }
 
   /* #1184: JUMPING, FORWARD AND BACK, AND WHAT EACH MEANS TO THE CYCLE.
@@ -3002,8 +4102,9 @@
       if (rest[i] && String(rest[i].url) === String(row.url)) rest.splice(i, 1);
     }
     var fresh = {id: row.id, url: row.url, sting: row.sting,
-                 seconds: Number(row.seconds) || 0};
+                 seconds: Number(row.seconds) || 0, video: !!row.video};
     say('putting it on...');
+    if (wallSelect(fresh)) return;
     if (!root.PineSfxTv.cut(fresh, {})) { say('it would not open'); return; }
     /* cut() emptied the queue; the rest of the plan goes back behind it
        so the cycle resumes rather than waiting for the next ring-ahead.
@@ -3284,6 +4385,70 @@
     });
   }
 
+  var shuffleFlight = null;
+  function shuffleRecentIds() {
+    var out = [];
+    var have = Object.create(null);
+    var add = function (value) {
+      var id = typeof value === 'string' ? value : clipId(value || {});
+      id = String(id || '');
+      if (!id || have[id]) return;
+      have[id] = true;
+      out.push(id);
+    };
+    add(playing);
+    for (var key in marks) if (Object.prototype.hasOwnProperty.call(marks, key)) add(key);
+    for (var i = hist.length - 1; i >= 0 && out.length < 400; i -= 1) add(hist[i]);
+    for (i = coming.length - 1; i >= 0 && out.length < 400; i -= 1) add(coming[i]);
+    for (i = queue.length - 1; i >= 0 && out.length < 400; i -= 1) add(queue[i]);
+    return out.slice(0, 400);
+  }
+
+  /* The dice is a pool rebuild, not Next wearing another label. The server
+     rescans/indexes behind an immediate fresh batch; both renderers throw
+     away their warmed runway while retaining recent-play exclusions. */
+  function shuffleSet(say) {
+    if (shuffleFlight) { say('the new clip pool is already being built...'); return shuffleFlight; }
+    if (!api() || typeof api().post !== 'function') {
+      say('the station is not connected');
+      return null;
+    }
+    var recent = shuffleRecentIds();
+    say('reshuffling the full FFX deck without repeating spent clips...');
+    shuffleFlight = api().post('/api/sfx/video/shuffle', {
+      exclude: recent,
+      most: 8,
+      who: 'operator dice'
+    }).then(function (got) {
+      var clips = (got && got.clips) || [];
+      if (!clips.length) {
+        say(String((got && got.say) || 'no fresh clips cleared the recent-play guard'));
+        return got;
+      }
+      queue.length = 0;
+      coming.length = 0;
+      warmDrop();
+      runLeft = 0; runFrom = ''; replays = 0;
+      var first = clips[0];
+      var reset = wallAsk('shuffle', {exclude: recent, clips: clips});
+      Promise.resolve(reset).then(function () {
+        if (wallRunning()) {
+          sheetClose();
+          return;
+        }
+        for (var i = 1; i < clips.length; i += 1) queue.push(clips[i]);
+        sheetClose();
+        if (root.PineSfxTv && root.PineSfxTv.cut) root.PineSfxTv.cut(first);
+      });
+      return got;
+    }, function (err) {
+      say('the library rebuild failed: ' + String((err && err.message) || err).slice(0, 80));
+      throw err;
+    });
+    shuffleFlight.then(function () { shuffleFlight = null; }, function () { shuffleFlight = null; });
+    return shuffleFlight;
+  }
+
   var sheetAt = null;
   function sheet(clip, at) {
     /* [#1441] A WALL SHEET DOES NOT HANG OFF THE SET'S FRAME. When `at`
@@ -3322,45 +4487,33 @@
     var say = function (text) { note.textContent = String(text || ''); };
     var rowA = document.createElement('div');
     rowA.className = 'sfx-tv-sheetrow';
-    /* [#1386b] FULL SCREEN. "I need to be able to have the video show up
-       as full screen if I choose it in the option." It belongs on the
-       first row because it is the option people reach for first, and it
-       toggles rather than latching, so the same tap gets the frame back
-       to the size the operator dragged it to. */
+    /* FULL SCREEN IS ONE COMMAND. The old sheet built a native-wall button
+       here and a second web-frame button beside Prev/Next. Their state could
+       disagree, which is how one menu showed both "full screen" and
+       "Windowed" at once. This button owns the preference, both renderers,
+       and the release of the held playlist. */
     var fullBtn = document.createElement('button');
-    var fullFrame = (function () {
-      try {
-        var all = document.querySelectorAll('.sfx-tv');
-        for (var i = 0; i < all.length; i += 1) {
-          if (!all[i].classList.contains('sfx-tv-sheet')) return all[i];
-        }
-      } catch (err) { /* not on screen */ }
-      return null;
-    }());
-    function fullLabel() { fullBtn.textContent = 'full screen'; }
-    /* [#1386c] The picture on this glass is usually the NATIVE wall, not a
-       frame in the page - so full screen is a bridge command, not a class.
-       The first cut toggled a CSS class on a `.sfx-tv` element that is not
-       there, which is why the button did nothing at all. */
-    var wentFull = false;
+    fullBtn.className = 'sfx-tv-full-toggle';
+    var wentFull = fullWanted();
+    function fullLabel() { fullBtn.textContent = wentFull ? 'Windowed' : 'Full screen'; }
+    function closeAfter(going) {
+      if (going && typeof going.then === 'function') {
+        going.then(function () { sheetClose(); }, function () { sheetClose(); });
+      } else {
+        sheetClose();
+      }
+    }
     fullBtn.onclick = function (ev) {
       if (ev && ev.stopPropagation) ev.stopPropagation();
       wentFull = !wentFull;
-      if (fullFrame) fullFrame.classList.toggle('sfx-tv-full', wentFull);
-      if (wentFull) {
-        wallAsk('full');
-        say('full screen - tap again for the window back');
-      } else {
-        var b = wallBox;
-        if (b) wallAsk('state', {x: b.x, y: b.y, w: b.w, h: b.h});
-        else if (fullFrame) {
-          var r = fullFrame.getBoundingClientRect();
-          wallAsk('state', {x: Math.round(r.left), y: Math.round(r.top),
-                            w: Math.round(r.width), h: Math.round(r.height)});
-        }
-        say('back to the size you dragged it to');
-      }
-      fullBtn.textContent = wentFull ? 'windowed' : 'full screen';
+      setFull(wentFull);
+      fullLabel();
+      say(wentFull ? 'full screen - the endless set is running'
+                   : 'back to the size you dragged it to');
+      /* `full` and `window` atomically release the native menu hold. Closing
+         the HTML sheet afterwards also frees older builds and the web set. */
+      closeAfter(wallAsk(wentFull ? 'full' : 'window',
+                         wentFull ? null : nativeWallRect()));
     };
     fullLabel();
     rowA.appendChild(fullBtn);
@@ -3369,7 +4522,7 @@
     /* #1112: a third row for the two that take the picture away, so
        the labels stay short enough for a 420 px set on the tablet. */
     var rowC = document.createElement('div');
-    rowC.className = 'sfx-tv-sheetrow';
+    rowC.className = 'sfx-tv-sheetrow sfx-tv-sheet-close';
 
     /* #1112: a delete or a ban is the end of this clip's time on the
        set: the note is left long enough to read, then the sheet goes
@@ -3438,8 +4591,12 @@
       /* 16px is the sheet's own top+bottom inset against the frame. */
       var allowed = Math.max(0, room - 16);
       var wanted = wrap.scrollHeight;
+      /* Tightening changes scrollHeight. Removing the class as soon as the
+         tightened sheet fits creates a ResizeObserver loop: wide, tight,
+         wide, tight - visibly pulsing under the operator's finger. Fit is a
+         one-way decision for this short-lived sheet. A fresh open measures
+         again from the normal layout. */
       if (wanted > allowed) wrap.classList.add('sfx-tv-tight');
-      else wrap.classList.remove('sfx-tv-tight');
       /* Say so rather than leaving a silent scrollbar to be discovered. */
       try {
         var over = body.scrollHeight - body.clientHeight > 4;
@@ -3510,6 +4667,10 @@
                   + 'and save it back',
                   function () { editClip(clip, say, at); }),
            'c:edit', 'Edit');
+    marked(button(rowF, 'Shuffle', 'Rescan the FFX library and replace the '
+                  + 'entire upcoming queue from the persistent no-repeat deck',
+                  function () { shuffleSet(say); }),
+           'm:casino', 'Shuffle clips');
     marked(button(rowF, 'Path', 'The real file path, in every spelling '
                   + 'the station knows, ready to copy',
                   function () { showPath(clip, wrap, say); }),
@@ -3523,13 +4684,25 @@
                     }),
              'c:skip--forward--filled', 'Play it');
     }
-    button(rowA, 'Inspect', 'What the station knows about this clip',
+    /* Fullscreen keeps a row of its own. Five controls shared this row on
+       the tablet, compressing the primary action until the operator could
+       not reliably hit it while the fit observer was settling. */
+    var rowTools = document.createElement('div');
+    rowTools.className = 'sfx-tv-sheetrow';
+    button(rowTools, 'Inspect', 'What the station knows about this clip',
            function () { inspect(clip, say, wrap); });     /* #1184 */
-    button(rowA, 'Where is it', 'Show where this clip lives',
+    button(rowTools, 'Where is it', 'Show where this clip lives',
            function () { locate(clip, say); });
-    button(rowA, '\u25b2 More', 'Play it more often',
+    var parodyButton = button(rowTools, '',
+      'Dictate a Pine Box FM parody prompt for H3',
+      function () { sheetClose(); parodyOpen(clip); });
+    parodyButton.className = 'sfx-tv-parody-button';
+    parodyButton.setAttribute('aria-label', 'Generate parody');
+    parodyButton.innerHTML = (typeof root.pineIcon === 'function'
+      ? (root.pineIcon('c:microphone', 'Generate parody') || '') : '') || 'MIC';
+    button(rowTools, '\u25b2 More', 'Play it more often',
            function () { weigh(clip, true, say); });
-    button(rowA, '\u25bc Less', 'Play it less often',
+    button(rowTools, '\u25bc Less', 'Play it less often',
            function () { weigh(clip, false, say); });
     button(rowB, 'Send to a pad', 'Put it on the first free sampler pad',
            function () { toPad(clip, say); });
@@ -3554,6 +4727,12 @@
     var shut = button(rowC, 'Close', 'Put this away',
                       function () { sheetClose(); });      /* #1112 */
     shut.className = 'quiet';
+    /* Android does not owe a synthetic click when a SurfaceView transition
+       changes the composition tree under the finger. Pointer-up is the
+       earliest complete tap and sheetClose() is deliberately idempotent. */
+    shut.addEventListener('pointerup', function (ev) {
+      ev.preventDefault(); ev.stopPropagation(); sheetClose();
+    });
     /* #1309b: and the only way left to dismiss the picture itself,
        now that the title bar with its ✕ is gone. #1112: the sheet goes
        through the one door first; the set comes down at once after,
@@ -3569,10 +4748,8 @@
       });
     away.className = 'quiet';
 
-    /* #1122/#1123: A FOURTH ROW - the clip beside this one either way,
-       and the window filled or put back. Three short labels, so a
-       420 px set on the tablet still fits them; and 32 px tall inline,
-       because the stylesheet's sheet buttons are sized for a mouse. */
+    /* The clip beside this one either way. Fullscreen lives in row A now;
+       there is deliberately no second stateful button here. */
     var rowD = document.createElement('div');
     rowD.className = 'sfx-tv-sheetrow';
     var tall = function (b) { b.style.minHeight = '32px'; return b; };
@@ -3580,14 +4757,6 @@
                 function () { step(clip, 'prev', say); }));
     tall(button(rowD, 'Next', 'The clip after this one in its folder',
                 function () { step(clip, 'next', say); }));
-    var fill = tall(button(rowD, full ? 'Windowed' : 'Full screen',
-      'Fill the window with the picture, or put it back in its box',
-      function () {
-        setFull(!full);
-        fill.textContent = full ? 'Windowed' : 'Full screen';
-        say(full ? 'full screen, until it is turned off'
-                 : 'back in its window');
-      }));
 
     /* #1124: THE RUN. "offer a slider for playing the next sequential
        clips. So I can basically expand it. So if I expand it to say
@@ -3647,6 +4816,7 @@
        at, so it goes where the eye lands first. */
     body.appendChild(stripBuild(clip, say));
     body.appendChild(rowA);
+    body.appendChild(rowTools);
     body.appendChild(rowF);                                /* #1184 */
     body.appendChild(rowB);
     body.appendChild(rowD);
@@ -3746,7 +4916,11 @@
       ? (root.pineIcon('c:close--filled', 'Close') || '') : '') || 'x';
     var qs = quit.style;
     qs.position = 'absolute';
-    qs.top = '4px'; qs.right = '4px';
+    qs.top = '4px';
+    /* The app reserves 110 physical pixels in each corner for hot-corner
+       gestures. Keep this visible escape outside that native claim so a tap
+       reaches the menu instead of changing views. */
+    qs.right = Math.ceil(128 / (Number(root.devicePixelRatio) || 1)) + 'px';
     qs.minWidth = '34px'; qs.minHeight = '34px';
     qs.display = 'flex'; qs.alignItems = 'center';
     qs.justifyContent = 'center';
@@ -3756,6 +4930,9 @@
     quit.addEventListener('click', function (ev) {
       ev.stopPropagation();
       sheetClose();
+    });
+    quit.addEventListener('pointerup', function (ev) {
+      ev.preventDefault(); ev.stopPropagation(); sheetClose();
     });
     wrap.appendChild(quit);
     /* Placed only once it has a height: above the finger where there is
@@ -3986,7 +5163,7 @@
     var el = warm.el;
     warm = null;
     warmUnpark(el);                                        /* [#1212] */
-    try { el.pause(); el.removeAttribute('src'); el.load(); }
+    try { el.pause(); levelDrop(el); el.removeAttribute('src'); el.load(); }
     catch (err) { /* already gone */ }
   }
 
@@ -4000,13 +5177,14 @@
       el.preload = 'auto';
       el.playsInline = true;
       el.controls = false;
+      el.crossOrigin = 'anonymous';
       /* [#1216] THE LEVEL BEFORE THE FIRST FRAME. This element becomes the
          picture on the next seam; giving it the level here is what makes
          the clip start at the right loudness instead of being corrected
          once somebody's poll gets round to it. Muted as well, so a
          decoder waking up early can never be heard. */
       el.muted = true;                                     /* [#1212] */
-      el.volume = level;                                   /* [#1216] */
+      levelSet(el, level, false);                          /* [#1216] */
       el.src = heldSrc(head);                              /* #1421 */
       el.load();
     } catch (err) { return; }
@@ -4054,7 +5232,7 @@
     /* [#1212] it was muted for the warm and nothing else; [#1216] the
        level is the one that is set NOW, not the one that was set when it
        was warmed, and it is written before the element has been heard. */
-    try { el.muted = false; el.volume = level; } catch (err) { /* it plays */ }
+    try { el.muted = false; levelSet(el, level, false); } catch (err) { /* it plays */ }
     return el;
   }
 
@@ -4268,6 +5446,23 @@
    * runs for days. */
   var ringSeen = Object.create(null);
   var ringOrder = [];
+  var ringAsk = Object.create(null);
+  var wallShowing = '';
+  var wallFlight = null;
+  var wallUiObserver = null;
+
+  function wallSignal(id) {
+    /* The native-wall follower runs independently of the station feed. Tell
+       Listen as soon as its source row is usable; otherwise `playing` is
+       current here while the backdrop waits for its next one-second paint. */
+    try {
+      if (typeof root.dispatchEvent === 'function'
+          && typeof root.CustomEvent === 'function') {
+        root.dispatchEvent(new root.CustomEvent('pine-wall-clip',
+          {detail: {id: id}}));
+      }
+    } catch (err) { /* the next ordinary paint sees the same row */ }
+  }
 
   function ringRemember(rows) {
     if (!rows || !rows.length) return;
@@ -4330,16 +5525,28 @@
       if (cs.display === 'none' || cs.visibility === 'hidden') continue;
       if (Number(cs.opacity) === 0) continue;
       var z = parseInt(cs.zIndex, 10);
-      /* [#1442b] STRICTLY above. The view hosts sit AT the floor and one
-         of them is always full-screen, so `<` let a host through as a
-         pop-up covering everything. */
-      if (!isFinite(z) || z <= UI_Z_FLOOR) continue;
+      var popup = false;
+      try {
+        popup = !!(el.matches && el.matches(
+          '[data-pine-drag], [role="dialog"], [aria-modal="true"], .modal, .dialog, .popover'));
+      } catch (err) { popup = false; }
+      /* View hosts sit AT the floor. Pop-ups historically did too, so only
+         the known full-screen hosts are excluded at that exact layer. */
+      if (!popup && (!isFinite(z) || z < UI_Z_FLOOR)) continue;
+      if (z === UI_Z_FLOOR && (el.id === 'sampler'
+          || /(^|\s)pine-view-host(\s|$)/.test(String(el.className || '')))) continue;
       var r;
       try { r = el.getBoundingClientRect(); } catch (err) { continue; }
       if (r.width * r.height < UI_AREA_MIN) continue;
-      /* The wall's own frame, if the page ever builds one, is not a
-         pop-up over the wall. */
-      if (/sfx-tv-frame|sfx-tv-host/.test(String(el.className || ''))) continue;
+      /* The wall's own WebView fallback is not a pop-up over the wall.
+         During the native hand-off it can survive for one poll with its
+         final frame still mounted. Treating that exact host as chrome hides
+         the new native picture while its audio continues, which looks like
+         the old video froze and the next video's soundtrack started. Real
+         SFX dialogs (the editor and inspector) are different nodes and must
+         still retire the native surface. */
+      if (el === host
+          || /sfx-tv-frame|sfx-tv-host/.test(String(el.className || ''))) continue;
       if (r.right > x1 && r.left < x2 && r.bottom > y1 && r.top < y2) return true;
     }
     return false;
@@ -4369,8 +5576,15 @@
    * picture whenever it is up - EXCEPT bare, see below. */
   function listenUp() {
     try {
+      var view = document.getElementById('listen');
       var face = document.getElementById('plNow');
-      return !!(face && face.isConnected && face.clientWidth > 0);
+      /* Injected views remain connected and laid out after their rail tab
+         closes. Geometry alone therefore kept the wall veiled on Script.
+         The rail and shell already publish the ownership truth as open or
+         active; use that same contract as listen.js. */
+      var cls = view && view.classList;
+      var open = !!(cls && (cls.contains('open') || cls.contains('active')));
+      return !!(open && face && face.isConnected && face.clientWidth > 0);
     } catch (err) { return false; }
   }
 
@@ -4449,11 +5663,15 @@
   function wallReconcile(st) {
     var bridge = api();
     if (!bridge || typeof bridge.videoWall !== 'function') return;
-    var want, wide;
+    var want, wide, panelOwns;
     try {
+      panelOwns = listenOwnsPicture();
       /* [#1448] full-bleed while the listen view is bare - there is no
-         panel over the picture there, so the surface may have all of it. */
-      wide = listenUp() && listenBare();
+         panel over the picture there, so the surface may have all of it.
+         An ordinary Listen view is the opposite: its HTML backdrop owns
+         the picture even when the floating set remembered fullscreen.
+         Letting that unrelated preference win hid both renderers. */
+      wide = !panelOwns && (fullWanted() || (listenUp() && listenBare()));
       /* [#1448b] AND BARE OUTRANKS THE VEIL. listen.js veils this module
          so the endless clip is not on screen twice (#1184/#1434), which
          is right while the PAGE draws the wallpaper. Bare, the page is
@@ -4461,7 +5679,7 @@
          nobody is asking - measured, the surface stayed
          `{"on":true,"veiled":true}` on a bare view. The "twice" it guards
          against is honoured by pageBackdrop(false) below instead. */
-      want = (!!veiled && !wide) || listenOwnsPicture() || uiOverPicture();
+      want = (!!veiled && !wide) || panelOwns || uiOverPicture();
     } catch (err) { return; }
     pageBackdrop(!wide);
     var shapeChanged = (wallWide !== wide);
@@ -4481,13 +5699,52 @@
 
   function wallVisibility() { wallReconcile(null); }
 
+  function wireWallUi() {
+    if (wallUiObserver || !root.MutationObserver || !document.body) return;
+    wallUiObserver = new root.MutationObserver(function (changes) {
+      for (var i = 0; i < changes.length; i += 1) {
+        var change = changes[i];
+        var candidates = [];
+        if (change.target) candidates.push(change.target);
+        if (change.addedNodes) candidates = candidates.concat(Array.prototype.slice.call(change.addedNodes));
+        if (change.removedNodes) candidates = candidates.concat(Array.prototype.slice.call(change.removedNodes));
+        for (var j = 0; j < candidates.length; j += 1) {
+          var node = candidates[j];
+          try {
+            if (node && node.matches && node.matches(
+              '[data-pine-drag], [role="dialog"], [aria-modal="true"], .modal, .dialog, .popover')) {
+              wallFollow();
+              return;
+            }
+          } catch (err) { /* the fallback poll owns it */ }
+        }
+      }
+    });
+    wallUiObserver.observe(document.body,
+      {childList: true, attributes: true, attributeFilter: ['hidden', 'class', 'style']});
+  }
+
+  function leaveListen() {
+    /* Listen fullscreen is view-scoped. Closing the view always returns the
+       endless set to its movable window, even if an older fullscreen choice
+       was still persisted from the floating controller. */
+    veiled = false;
+    try { if (host) host.style.visibility = ''; } catch (err) { /* no set up */ }
+    try { setFull(false); } catch (err) { full = false; }
+    wallWide = null;
+    try { pageBackdrop(true); } catch (err) { /* the view is already closing */ }
+    try { wallVisibility(); return true; }
+    catch (err) { return false; }
+  }
+
   /* #1435: what the WALL says is on screen, as a clip this page can use.
      Silent when the wall is not running, so a browser with no bridge -
      a Tailscale viewer on the listen page - is untouched. */
   function wallFollow() {
     var bridge = api();
     if (!wallHas || !bridge || typeof bridge.videoWall !== 'function') return;
-    bridge.videoWall('state').then(function (got) {
+    if (wallFlight) return wallFlight;
+    var flight = bridge.videoWall('state').then(function (got) {
       var st = wallState(got);
       var id = st && st.playing;
       /* [#1442b] BEFORE the veiled early-return below: a wall that is
@@ -4504,11 +5761,50 @@
          for ...ece41c45f7 while the wall was on 1cd53fb0. Only a wall
          with nothing to say is skipped now. */
       if (!id) return;
-      var row = ringSeen[id];
-      if (!row) return;                      /* a larder clip we never saw */
-      if (playing && playing.id === id) return;
-      playing = row;                         /* #1435: the one source now */
-    })['catch'](function () { /* the wall will be asked again next poll */ });
+      wallClip(id);
+    })['catch'](function () { /* the wall will be asked again shortly */ });
+    wallFlight = flight;
+    flight.then(function () {
+      if (wallFlight === flight) wallFlight = null;
+    }, function () {
+      if (wallFlight === flight) wallFlight = null;
+    });
+    return flight;
+  }
+
+  /* A native transition is pushed here immediately. The state follower also
+     calls this, so losing either callback or one bridge request cannot strand
+     Listen on the previous picture. URL resolution is deliberately outside
+     `wallFlight`: a slow server lookup must not block local state checks. */
+  function wallClip(id) {
+    id = String(id || '');
+    if (!id) return Promise.resolve(null);
+    wallShowing = id;
+    var row = ringSeen[id];
+    if (row) {
+      if (!playing || playing.id !== id) {
+        playing = row;
+        wallSignal(id);
+      }
+      return Promise.resolve(row);
+    }
+    var bridge = api();
+    var asked = Number(ringAsk[id]) || 0;
+    if (!bridge || typeof bridge.get !== 'function' || now() - asked < 30000) {
+      return Promise.resolve(null);
+    }
+    ringAsk[id] = now();
+    return bridge.get('/api/sfx/url?id=' + encodeURIComponent(id)).then(function (info) {
+      if (!info || !info.url) return null;
+      info.id = info.id || id;
+      info.video = true;
+      ringRemember([info]);
+      if (wallShowing === id) {
+        playing = info;
+        wallSignal(id);
+      }
+      return info;
+    })['catch'](function () { return null; });
   }
 
   /* The endless clips the page has queued are the wall's now - playing
@@ -4519,6 +5815,14 @@
     }
     coming.length = 0;
     if (warm && warm.clip && warm.clip.endless) warmDrop();
+    /* The native wall owns picture AND sound once it has answered `on`.
+       Clearing only the runway left a clip that was already in the WebView
+       mounted until its delayed `ended` teardown happened. If that timer was
+       throttled, the browser held its last frame indefinitely while the
+       native playlist continued audibly underneath it. Retire the fallback
+       immediately. An open inspector/editor keeps its deliberate hold and
+       closes through sheetClose/editorClose instead. */
+    if (host && video && !sheetHeld() && !editorBox) teardown(video);
   }
 
   /* #1426b: WHERE the picture goes. The geometry the operator dragged the
@@ -4888,6 +6192,10 @@
        name. The browser's own menu is suppressed so his is the only
        thing that appears. */
     document.addEventListener('contextmenu', function (ev) {
+      /* Listen owns its background. It has one gesture there - double tap
+         to enter or leave its screen-only mode - and never exposes clip
+         deletion or management controls on that display surface. */
+      if (listenUp()) { ev.preventDefault(); return; }
       /* Over the open sheet: swallow the browser menu and leave the
          sheet alone. Checked first, because _overControl will call the
          sheet a control (it carries the sfx-tv token by design) and we
@@ -4931,8 +6239,9 @@
         var was = wallPress;
         wallPress = null;
         if (!was || !playing) return;
+        if (radialWrap) { radialClose(true); return; }
         if (sheetHeld()) { sheetClose(); return; }
-        sheet(playing, was);
+        radialOpen(playing, was);
       }, WALL_HOLD_MS);
     });
     document.addEventListener('pointermove', function (ev) {
@@ -5273,6 +6582,8 @@
   }
 
   root.PineSfxTv = {
+    __pineCanonicalSfxTv: true,
+    __pineSfxTvDocument: document,
     /* 2026-09-14: for the LISTEN view's backdrop - is the set on, and
        hide the floating set while the view shows the clip as wallpaper. */
     timeline: function () { return tlRead(); },   /* [#1219] */
@@ -5287,18 +6598,44 @@
          for the same thing and two writers would fight over it. */
       try { wallVisibility(); } catch (err) { /* no bridge, no wall */ }
     },
+    viewChanged: function () {
+      /* Listen calls this on its class transition so leaving the view hands
+         the native wall back immediately, rather than after the video poll. */
+      try { wallVisibility(); return true; }
+      catch (err) { return false; }
+    },
+    syncWall: function () { return wallFollow(); },
+    wallClip: wallClip,
+    shuffle: shuffleSet,
+    openRadial: radialOpen,
+    openParody: parodyOpen,
+    openEditor: function (path, name) {
+      if (!/^\/video-editor\/\?source=[0-9a-f]{32}&sfx=1$/.test(String(path || ''))) {
+        throw new Error('The station did not return a clip editor URL');
+      }
+      editorWindow(path, function () {}, {sting: String(name || 'Sound effect')});
+    },
+    wireRadial: wireVideoRadial,
+    leaveListen: leaveListen,
     mount: function (opts) {
       if (mounted) return;
       mounted = true;
       base = String((opts && opts.baseUrl) || '');
       wireDuck();                                          /* #1167 */
       wireWall();                                          /* #1184 */
+      wireWallUi();
       poll();
       timer = setInterval(poll, POLL_MS);
+      /* The server poll carries the whole clip ring and station policy. The
+         native wall's current id is a tiny local bridge read, so follow it
+         separately: Listen should not display the old clip for another
+         server-poll interval after native playback has already advanced. */
+      wallFollowTimer = setInterval(wallFollow, WALL_FOLLOW_MS);
       /* In browser runtimes this is a numeric handle. In Node-backed
          diagnostics it is a Timer, and the television must not own the
          process after every surface and assertion has finished. */
       if (timer && typeof timer.unref === 'function') timer.unref();
+      if (wallFollowTimer && typeof wallFollowTimer.unref === 'function') wallFollowTimer.unref();
       /* A window that shrank under a set left near the edge would strand
        * it off screen; the clamp is the same one the opener uses. */
       root.addEventListener('resize', function () {
@@ -5339,7 +6676,7 @@
      *
      * pineLevels (audio-law.js, #1187) is the bus that calls this. */
     level: function (value) {
-      var want = Math.max(0, Math.min(1, Number(value)));
+      var want = Math.max(0, Math.min(2, Number(value)));
       if (!isFinite(want)) return;
       if (Math.abs(want - level) < 0.001) {               /* [#1216] */
         level = want;
@@ -5348,7 +6685,7 @@
       level = want;
       /* The clip warming behind this one takes it at once: it is not
          sounding, so there is nothing to ramp and nothing to hear. */
-      try { if (warm && warm.el) warm.el.volume = level; } catch (err) { /* gone */ }
+      try { if (warm && warm.el) levelSet(warm.el, level, false); } catch (err) { /* gone */ }
       if (!video) return;
       var el = video;
       if (level > 0 && el.muted) el.muted = false;
@@ -5356,8 +6693,9 @@
     },
     stop: function () {
       if (timer) clearInterval(timer);
+      if (wallFollowTimer) clearInterval(wallFollowTimer);
       if (hold) clearTimeout(hold);
-      timer = hold = null;
+      timer = wallFollowTimer = hold = null;
       mounted = false;
       warmDrop();                                          /* #1411 */
       replays = 0; runLeft = 0; runFrom = ''; lastDouble = 0;  /* #1121/#1124 */
@@ -5465,6 +6803,18 @@
       var px = Number(x) / d;
       var py = Number(y) / d;
       if (!isFinite(px) || !isFinite(py)) return false;
+      /* A bare Listen screen uses the native surface, so its taps arrive
+         here instead of at listen.js's DOM host. They still belong to
+         Listen: one tap does nothing destructive; two toggle its chrome. */
+      if (listenUp()) {
+        try {
+          var listen = root.PineListen;
+          if (listen && typeof listen.nativeTap === 'function') {
+            return !!listen.nativeTap(px, py);
+          }
+        } catch (err) { /* consuming it is still safer than an inspector */ }
+        return true;
+      }
       /* [#1444] and WHICH WINDOW it came from. A sheet that knows its box
          is centred on it rather than opened above the finger - there is
          no finger here, and the operator means "on the video". */
@@ -5472,6 +6822,34 @@
       try { over = readBox(); } catch (err) { over = null; }
       try { sheet(playing, {x: px, y: py, box: over}); }
       catch (err) { return false; }
+      return true;
+    },
+    /* The native SurfaceView owns fullscreen Listen input. Its long-press
+       callback lands here so the same radial menu appears over that surface
+       and over the ordinary web video window. */
+    holdPicture: function (x, y) {
+      if (!playing) return false;
+      var d = Number(root.devicePixelRatio) || 1;
+      var px = Number(x) / d;
+      var py = Number(y) / d;
+      if (!isFinite(px) || !isFinite(py)) return false;
+      if (radialWrap) { radialClose(true); return true; }
+      radialOpen(playing, {x: px, y: py});
+      return true;
+    },
+    /* Android moves/resizes the SurfaceView at touch rate and reports only
+       the final rectangle. Keeping that hot path out of evaluateJavascript
+       is what makes a drag stay under the finger on a busy Script view. */
+    wallBoxChanged: function (x, y, w, h) {
+      return rememberWallBox(x, y, w, h);
+    },
+    /* The native hold watchdog uses this if a menu was abandoned. One door
+       out means the shade, owed finish and playback hold are all released. */
+    releaseHold: function () {
+      if (radialWrap) { radialClose(false); return true; }
+      if (deleteWrap) { deleteConfirmClose(false); return true; }
+      if (!sheetHeld()) return false;
+      sheetClose();
       return true;
     },
     /* #1200: NUMBERS RATHER THAN A CLAIM IN A COMMENT. The one thing that

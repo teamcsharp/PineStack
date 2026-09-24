@@ -421,7 +421,6 @@
      * stills go on cycling; only the moving ones wait. */
     if (!reporting && clips.length && vid && backdropTurn % CLIP_EVERY === 0) {
       const pick = clips[Math.floor(Math.random() * clips.length)];
-      vid.src = genUrl(pick);   /* 2026-09-15 (#1151) */
       /* HIDDEN UNTIL IT HAS A FRAME. The plexus covers the download, which
        * is a real wait: that route has no Range support, so the clip comes
        * whole before a single frame exists. */
@@ -435,6 +434,7 @@
         showPlexus(false);
         if (still) still.style.opacity = "0";
       };
+      vid.src = genUrl(pick);   /* 2026-09-15 (#1151) */
       vid.play().catch(() => {
         /* Autoplay refused, or the clip will not decode. Fall back to a
          * still rather than leaving a black rectangle behind the show.
@@ -1064,6 +1064,27 @@
     noteAt = 0;
     paintChrome();
     writeBare(bare);
+    const tv = root.PineSfxTv;
+    if (tv && typeof tv.viewChanged === "function") tv.viewChanged();
+  }
+
+  /* In bare mode PineVideoWall is above the WebView, so the two physical
+   * taps cannot reach host.pointerup below. The native wall forwards them
+   * here in CSS pixels. Keep the same timing/distance contract and consume
+   * every single tap without opening the clip-management inspector. */
+  function nativeTap(x, y) {
+    if (!viewOpen()) return false;
+    const at = Date.now();
+    const px = Number(x) || 0;
+    const py = Number(y) || 0;
+    const near = Math.abs(px - tapX) <= DOUBLE_TAP_PX
+      && Math.abs(py - tapY) <= DOUBLE_TAP_PX;
+    if (at - tapAt <= DOUBLE_TAP_MS && near) toggleBare();
+    tapAt = at;
+    tapX = px;
+    tapY = py;
+    stir();
+    return true;
   }
 
   /* Does this tap belong to the backdrop rather than to a control? While
@@ -1161,8 +1182,15 @@
     if (!chromeWatch && typeof root.MutationObserver === "function") {
       chromeWatch = new root.MutationObserver(function () {
         if (viewOpen()) return;
-        /* NOT deliberate: leaving the view is not the operator cancelling
-         * his full screen, so #1163 keeps it for the next time round. */
+        /* The injected Listen DOM remains connected and measurable when its
+         * tab closes. Explicitly release its veil now so endless video goes
+         * back to the saved popup window on the newly selected view. */
+        const tv = root.PineSfxTv;
+        if (tv && typeof tv.leaveListen === "function") tv.leaveListen();
+        else {
+          if (tv && typeof tv.veil === "function") tv.veil(false);
+          if (tv && typeof tv.viewChanged === "function") tv.viewChanged();
+        }
         showChrome(false);
         /* #1147: and the plexus is a requestAnimationFrame loop. A closed
          * view must not keep one running behind another screen. */
@@ -1545,12 +1573,12 @@
        * is not. */
       + '<div id="plDesk" class="pl-desk" hidden>'
       /* The canonical listener bus carries the cut and boost stages together.
-       * 600% matches the panel gain controls and the Levels sheet. */
+       * Every stream uses the same 0-200 contract. */
       + '<label class="pl-deskrow"><span>music</span>'
-      + '<input id="plDeskMusic" type="range" min="0" max="600" step="1">'
+      + '<input id="plDeskMusic" type="range" min="0" max="200" step="1">'
       + '<i id="plDeskMusicVal"></i></label>'
       + '<label class="pl-deskrow"><span>djs</span>'
-      + '<input id="plDeskVoice" type="range" min="0" max="600" step="1">'
+      + '<input id="plDeskVoice" type="range" min="0" max="200" step="1">'
       + '<i id="plDeskVoiceVal"></i></label>'
       /* #1194: THE DUCK ROW IS THE PANEL'S djDuck AND NOTHING ELSE.
        * It sets how far the music dips while a DJ is talking - the depth
@@ -1573,7 +1601,7 @@
       + '<input id="plDeskLocal" type="range" min="0" max="100" step="1">'
       + '<i id="plDeskLocalVal"></i></label>'
       + '<label class="pl-deskrow" title="How loud clips and sound effects play on this terminal."><span>clips / sfx</span>'
-      + '<input id="plDeskSfx" type="range" min="0" max="100" step="1">'
+      + '<input id="plDeskSfx" type="range" min="0" max="200" step="1">'
       + '<i id="plDeskSfxVal"></i></label>'
       /* [#1187]: "Offer a slider for setting the volume of videos that play
        * as well."  Everything with a picture and a soundtrack on this glass:
@@ -1581,15 +1609,12 @@
        * the NATIVE endless wall, which is an ExoPlayer on a SurfaceView and
        * is reached through the bridge rather than through the DOM.
        *
-       * 0-100 and no further, deliberately.  This lands on a real
-       * <video>.volume (and on ExoPlayer's own volume), which cannot exceed
-       * 1; a knob that said 150% would have dead travel on it, which is the
-       * lie #1222 exists to remove. */
+       * Above unity is carried by a real gain stage in both renderers. */
       + '<label class="pl-deskrow" title="How loud videos play on this '
       + 'terminal - the SFX set, the little CRT tube, and the endless set. '
-      + 'A video cannot play louder than itself, so this one stops at 100%. '
+      + 'Above 100% uses the video playback gain stage. '
       + 'Remembered on this device."><span>videos</span>'
-      + '<input id="plDeskVideo" type="range" min="0" max="100" step="1">'
+      + '<input id="plDeskVideo" type="range" min="0" max="200" step="1">'
       + '<i id="plDeskVideoVal"></i></label>'
       + '<i class="pl-deskwhy">This terminal only. The station has no '
       + 'per-listener level; these are the desk this panel already has. '
@@ -1600,6 +1625,27 @@
   }
 
   function wire() {
+    const backdrop = el("plBackVid");
+    if (backdrop) {
+      backdrop.addEventListener("ended", function () {
+        /* The native wall can move to an older offline-larder clip before
+         * the short browser ring has named it. Ask at the boundary instead
+         * of leaving the last frame up until the next ordinary feed tick. */
+        const tv = root.PineSfxTv;
+        if (!tv || typeof tv.syncWall !== "function") return;
+        let going = null;
+        try { going = tv.syncWall(); } catch (err) { return; }
+        if (going && typeof going.then === "function") {
+          going.then(function () { paintEndless(Date.now(), true); },
+            function () { /* the next feed tick retries */ });
+        }
+      });
+    }
+    if (typeof root.addEventListener === "function") {
+      root.addEventListener("pine-wall-clip", function () {
+        if (mounted) paintEndless(Date.now(), true);
+      });
+    }
     const vol = el("plVol");
     if (vol) {
       try {
@@ -1975,7 +2021,7 @@
     try {
       const m = JSON.parse(localStorage.getItem("pineListenerLevels") || "{}") || {};
       const v = Number(m[kind]);
-      if (Number.isFinite(v)) return Math.max(0, Math.min(1, v));
+      if (Number.isFinite(v)) return Math.max(0, Math.min(2, v));
     } catch (err) { /* first run */ }
     return 1;
   }
@@ -2936,6 +2982,8 @@
      * messages land in #plNote, which exists only once Listen has been
      * mounted; a caller elsewhere should pass its own reporter. */
     grab: doGrab,
+    nativeTap,
+    isOpen: viewOpen,
     applyVolume,
     silence
   };

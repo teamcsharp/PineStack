@@ -53,8 +53,8 @@ class PipelineDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
                             self.raw(review_cancel_pending=True), self.raw(off_brief=True)]
         got = app.orchestrator_pipeline_state()
         self.assertEqual(got["total"], 6)
-        self.assertEqual(got["stages"], {"ready": 0, "awaiting_tint": 1, "rewriting": 1,
-            "awaiting_recording": 0, "recording": 1, "needs_replacement": 2,
+        self.assertEqual(got["stages"], {"ready": 1, "awaiting_tint": 1, "rewriting": 1,
+            "awaiting_recording": 0, "recording": 1, "needs_replacement": 1,
             "withdrawal_pending": 1})
         self.assertEqual(got["roads"]["banter"]["needs_replacement"], 1)
 
@@ -126,6 +126,21 @@ class PipelineDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(result["health"]["talk_gap_monitoring"], monitoring)
             self.assertEqual(result["health"]["talk_gap_seconds"], 999 if monitoring else 0)
         self.assertEqual(quiet.call_count, 1)
+
+    async def test_lean_flow_omits_static_graph_without_losing_events(self):
+        self.patch("_STATION_FLOW", mock.Mock(read=mock.Mock(return_value={
+            "events": [{"id": 1}], "nodes": [{"id": "draft"}],
+            "edges": [{"id": "draft:tts"}]})))
+        self.patch("page_playback_state", mock.Mock(return_value={}))
+        self.patch("_floor_busy", mock.Mock(return_value=False))
+        self.patch("talk_quiet_limit", mock.Mock(return_value=12))
+        self.patch("talk_quiet_for", mock.Mock(return_value=0))
+        self.patch("_RADIO", {"on": False})
+        self.patch("radio_paused", mock.Mock(return_value=False))
+        result = await app.station_flow_api(lean=1, authorization="test")
+        self.assertEqual(result["events"], [{"id": 1}])
+        self.assertNotIn("nodes", result)
+        self.assertNotIn("edges", result)
 
     async def test_review_room_counts_match_current_contract_and_include_single_reads(self):
         app._SHELF["ad"] = [self.raw(prepared=False), self.raw(prepared=True, tint_ok=False),

@@ -1,5 +1,5 @@
 /* THE ORCHESTRATOR GLASS: THAT IT DRAWS THE REAL PAYLOAD, THAT A TRIANGLE
- * OPENS, AND THAT A CLOSED POP-UP ASKS FOR NOTHING. (#1191)
+ * OPENS, AND THAT A CLOSED POP-UP STOPS ITS DETAIL POLL. (#1191)
  *
  * "I want to be able to access a pop-up that gives me advanced information
  *  about how the orchestrator is behaving in the background... I want to be
@@ -29,7 +29,8 @@
  *    been starved before by exactly that shape of surface - on the tablet's
  *    400 kB/s link a 2.4 kB route was measured waiting 19 s behind six full
  *    sockets. The test counts the requests, closes the pop-up, lets several
- *    poll periods pass, and asserts the count did not move.
+ *    poll periods pass, and asserts the glass route count did not move. The
+ *    mascot now keeps a separate recovery watch alive while mounted.
  *
  * There is no jsdom in this repo, so the DOM calls this module actually
  * makes are stubbed just far enough to run it for real.
@@ -161,6 +162,7 @@ function world() {
   delete globalThis.pineIcon;
   delete globalThis.PineDuck;
   delete globalThis.PineCorners;
+  delete globalThis.PineRevive;
   return {body, store};
 }
 
@@ -543,21 +545,22 @@ test('[#1186] a hand inside the panel holds the update, and the panel says so', 
   glass.close();
 });
 
-test('A CLOSED POP-UP ASKS FOR NOTHING AT ALL', async () => {
+test('a closed glass stops its detail poll while the mascot keeps recovery watch', async () => {
   const {body} = world();
   const asked = station(payload());
   const glass = load();
 
-  /* The face that opens it has no clock of its own either. */
+  /* The persistent face has a bounded recovery clock of its own. */
   glass.dot();
   await wait(60);
-  assert.equal(asked.length, 0,
-    'the launcher asked the station ' + asked.length + ' time(s) before '
-    + 'anything was opened');
+  assert.ok(asked.includes('/api/broadcast/watch'));
+  assert.ok(asked.includes('/api/broadcast/health'));
+  assert.ok(asked.includes('/api/broadcast/console'));
+  assert.equal(asked.filter((route) => route === '/api/orchestrator/glass').length, 0);
 
   glass.open();
   await wait(30);
-  const opened = asked.length;
+  const opened = asked.filter((route) => route === '/api/orchestrator/glass').length;
   assert.ok(opened >= 1, 'an open pop-up must ask at least once');
 
   glass.close();
@@ -566,9 +569,146 @@ test('A CLOSED POP-UP ASKS FOR NOTHING AT ALL', async () => {
   /* Several poll periods. A timer left alive behind a removed node is a
      poll nobody can see and nobody can stop. */
   await wait(glass.EVERY_MS * 2 + 200);
-  assert.equal(asked.length, opened,
-    'a closed pop-up went on polling: ' + (asked.length - opened)
-    + ' further request(s) after it was shut');
+  assert.equal(asked.filter((route) => route === '/api/orchestrator/glass').length, opened,
+    'a closed pop-up went on polling its detail route');
+});
+
+test('the persistent mascot shows the active rung and opens recovery on tap', async () => {
+  const {body} = world();
+  const opened = [];
+  globalThis.PineRevive = {open: () => opened.push('recovery')};
+  globalThis.pineDesktop = {get: async (route) => {
+    if (route === '/api/broadcast/watch') return {
+      on: true, paused: false, working: true, rung: 'flush the queue',
+      say: 'Flushing the queued round now',
+      ladder: [{step: 'check sound'}, {step: 'flush the queue'}, {step: 'restart show'}]
+    };
+    if (route === '/api/broadcast/health') return {stuck: true};
+    if (route === '/api/broadcast/console') return {stuck: true, watch_working: true};
+    return payload();
+  }};
+  const glass = load();
+  const dot = glass.dot();
+  await wait(40);
+  assert.equal(dot.getAttribute('data-recovery'), 'working');
+  assert.match(words(dot), /Recovering 2\/3/);
+  assert.match(words(dot), /flush the queue/);
+  dot.fire('pointerdown', {clientX: 200, clientY: 200, pointerId: 1});
+  dot.fire('pointerup', {pointerId: 1});
+  assert.deepEqual(opened, ['recovery']);
+  assert.equal(findByClass(body, 'og').length, 0, 'tap opened the glass instead of recovery');
+
+  glass.open();
+  await wait(40);
+  const control = findByClass(body, 'og-recovery')[0];
+  assert.match(words(control), /Recovering 2\/3/);
+  assert.match(words(control), /flush the queue/);
+  assert.match(words(control), /Flushing the queued round now/);
+  control.fire('click', {stopPropagation: () => {}});
+  assert.deepEqual(opened, ['recovery', 'recovery']);
+  glass.close();
+});
+
+test('fault, normal quiet, and unreachable station have distinct mascot states', async () => {
+  world();
+  let watch = {on: true, paused: false, working: false, rung: ''};
+  let health = {stuck: true, say: 'Dialogue is not reaching air'};
+  let consoleState = {stuck: false};
+  globalThis.pineDesktop = {get: async (route) => route === '/api/broadcast/watch'
+    ? watch : route === '/api/broadcast/health' ? health : consoleState};
+  const glass = load();
+  const dot = glass.dot();
+  await wait(40);
+  assert.equal(dot.getAttribute('data-recovery'), 'attention');
+  assert.match(words(dot), /Recovery needed/);
+
+  health = {stuck: false};
+  glass.refreshRecovery();
+  await wait(40);
+  assert.equal(dot.getAttribute('data-recovery'), 'idle');
+  assert.doesNotMatch(words(dot), /Recovery needed/);
+
+  watch = null; health = null; consoleState = null;
+  glass.refreshRecovery();
+  await wait(40);
+  assert.equal(dot.getAttribute('data-recovery'), 'unknown');
+  assert.match(words(dot), /Station unreachable/);
+});
+
+test('console watch reports recovery when the watch route is unavailable', async () => {
+  world();
+  globalThis.pineDesktop = {get: async (route) => {
+    if (route === '/api/broadcast/watch') throw new Error('watch unavailable');
+    if (route === '/api/broadcast/health') return {stuck: true};
+    return {on: true, paused: false, watch_working: true,
+      watch_road: 'dialogue rescue', watch: 'Checking the DJ handoff'};
+  }};
+  const glass = load();
+  const dot = glass.dot();
+  await wait(40);
+  assert.equal(dot.getAttribute('data-recovery'), 'working');
+  assert.match(words(dot), /dialogue rescue/);
+  assert.match(dot.getAttribute('title'), /Checking the DJ handoff/);
+});
+
+test('an operator pause is not a fault and only a tap resumes it', async () => {
+  world();
+  const posts = [];
+  let paused = true;
+  let repairs = 0;
+  globalThis.PineRevive = {open: () => { repairs += 1; }};
+  globalThis.pineDesktop = {
+    get: async (route) => route === '/api/broadcast/watch'
+      ? {on: true, paused: false, working: false}
+      : route === '/api/broadcast/health'
+        ? {stuck: true, paused, say: 'The station is paused'}
+        : {on: true, paused, stuck: true},
+    post: async (route, body) => {
+      posts.push({route, body});
+      if (route === '/api/radio/pause') paused = false;
+      return {paused};
+    }
+  };
+  const glass = load();
+  const dot = glass.dot();
+  await wait(40);
+  assert.equal(dot.getAttribute('data-recovery'), 'paused');
+  assert.match(words(dot), /Station paused/);
+  assert.match(words(dot), /Tap to resume/);
+  assert.deepEqual(posts, [], 'the status poll resumed an intentional pause');
+  dot.fire('pointerdown', {clientX: 200, clientY: 200, pointerId: 1});
+  dot.fire('pointerup', {pointerId: 1});
+  await wait(40);
+  assert.deepEqual(posts, [{route: '/api/radio/pause', body: {paused: false}}]);
+  assert.equal(repairs, 0, 'a deliberate pause was sent into the repair ladder');
+});
+
+test('Off Air is distinct from a fault and FM starts only after a tap', async () => {
+  world();
+  const posts = [];
+  let on = false;
+  globalThis.pineDesktop = {
+    get: async (route) => route === '/api/broadcast/watch'
+      ? {on, paused: false, working: false}
+      : route === '/api/broadcast/health' ? {stuck: false}
+        : {on, paused: false, stuck: false},
+    post: async (route, body) => {
+      posts.push({route, body});
+      on = true;
+      return {on: true};
+    }
+  };
+  const glass = load();
+  const dot = glass.dot();
+  await wait(40);
+  assert.equal(dot.getAttribute('data-recovery'), 'offair');
+  assert.match(words(dot), /Off air/);
+  assert.match(words(dot), /Tap to put FM on/);
+  assert.deepEqual(posts, [], 'the watch silently resumed deliberate Off Air');
+  dot.fire('pointerdown', {clientX: 200, clientY: 200, pointerId: 1});
+  dot.fire('pointerup', {pointerId: 1});
+  await wait(40);
+  assert.deepEqual(posts, [{route: '/api/dj/start', body: {station: 'all'}}]);
 });
 
 test('a reply that arrives after the close is dropped, not drawn', async () => {

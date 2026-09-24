@@ -34,6 +34,7 @@ from pathlib import Path
 from threading import BoundedSemaphore, RLock, Thread
 from typing import Any
 from urllib.parse import quote, urlparse
+from starlette.background import BackgroundTask
 
 import httpx
 from station_flow import FlowJournal
@@ -75,15 +76,20 @@ import record_binding                    # #1237: a line bound to a record airs 
 import phrase_trace
 import word_cause_edits
 import clip_speech
+import comfy_workshop
+from parody_stinger_queue import ParodyQueue
 import clip_senses                      # [#1241] where a phrase comes from, and the ban
 import recast_desk                        # [#1215]: the cupboard recast desk
 from director import (director_add, director_beats, director_beats_clause,
                       director_beats_set, director_clause, director_graph,
-                      director_lessons_clause, director_notes, director_path,
+                      director_feedback_clause, director_lessons_clause,
+                      director_notes, director_path,
                       director_restore, director_retire, director_sheet,
                       director_spend, director_touch, script_approve,
-                      script_candidate, script_key, script_lessons,
-                      script_mark_aired, script_note_edit, script_queue_state,
+                      script_candidate, script_choice, script_choose,
+                      script_feedback, script_key, script_lessons,
+                      script_mark_aired, script_note_edit, script_note_feedback,
+                      script_queue_state,
                       script_record,
                       script_seen_clear, script_seen_mark,
                       script_send_to_record, script_state, script_tint_history,
@@ -92,7 +98,8 @@ from crystal_acceptance import evaluate_acceptance as crystal_editorial_acceptan
 from prompt_learning import PromptLearningStore, _patterns as crystal_learning_patterns
 from caller_topic import (  # [#1240/#1249] the storyline as direction, the caller's subject as spine
     plot_act_direction, plot_label_scrub, topic_subject, topic_nouns,
-    topic_adherence, topic_words_dropped, topic_contract_clause,
+    topic_adherence, dialogue_topic_adherence, topic_words_dropped,
+    topic_contract_clause,
     fallback_call_script as _topic_fallback_call_script,
     SKELETON_TELL as _TOPIC_SKELETON_TELL)
 from response_bank import ResponseBank, add_listening_responses
@@ -265,6 +272,154 @@ def _with_review_instances(work):
 # #1314: the last policy this process read, so a stalling station can
 # answer without going to the desk for it.
 _LINE_REVIEW_POLICY_MEMO: dict[str, Any] = {"at": 0.0, "value": None}
+
+
+CONTENT_GATE_PATH = data_path("content_gates.json")
+CONTENT_GATE_INFO = {
+    "profile": "Stored dialogue versus the current writing profile",
+    "segment_brief": "Segment brief and off-brief decisions",
+    "call_contract": "Caller conversation and novelty contract",
+    "tint": "Crystal rewrite and tint readiness",
+    "tint_structure": "Crystal rewrite structure",
+    "recording_tint": "Tint requirements at recording",
+    "repetition": "Repeated lines, phrases, and stock reuse limits",
+    "freshness": "Age-based stock and bulletin expiration",
+    "timing": "Deadline and floor-timing refusals of dialogue",
+    "phrase_ban": "Banned phrases in written or recorded stock",
+    "language": "Language and spelling judgments",
+    "line_quality": "General dialogue quality judgments",
+    "radio_draft": "Draft dialogue judgments",
+    "blend": "Blended dialogue judgments",
+    "track_talk": "Track-talk content judgments",
+    "track_talk_fidelity": "Track-talk fidelity judgments",
+    "ad_length": "Advertisement length judgments",
+    "ad_repetition": "Repeated advertisement judgments",
+    "draft_fragment": "Draft fragment judgments",
+    "draft_trimming": "Draft trimming judgments",
+}
+_CONTENT_GATE_LOCK = RLock()
+_CONTENT_GATE_EVIDENCE: Any = collections.deque(maxlen=80)
+
+
+def _content_gate_load() -> dict[str, Any]:
+    default = {"revision": 0, "master_enabled": False,
+               "gates": {key: False for key in CONTENT_GATE_INFO},
+               "updated_at": 0.0}
+    try:
+        raw = json.loads(CONTENT_GATE_PATH.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict) or not isinstance(raw.get("master_enabled"), bool):
+            return default
+        gates = raw.get("gates")
+        if not isinstance(gates, dict):
+            return default
+        return {"revision": max(0, int(raw.get("revision") or 0)),
+                "master_enabled": raw["master_enabled"],
+                "gates": {key: gates.get(key) is True for key in CONTENT_GATE_INFO},
+                "updated_at": float(raw.get("updated_at") or 0)}
+    except (OSError, ValueError, TypeError):
+        return default
+
+
+_CONTENT_GATE_STATE = _content_gate_load()
+
+
+def content_gate_enabled(gate: str) -> bool:
+    state = _CONTENT_GATE_STATE
+    return bool(state["master_enabled"] and state["gates"].get(str(gate), False))
+
+
+def content_gate_bypassed(gate: str, reason: Any, source: Any = "") -> None:
+    _CONTENT_GATE_EVIDENCE.append({"at": time.time(), "gate": str(gate),
+                                   "reason": str(reason)[:180],
+                                   "source": str(source)[:120]})
+
+
+def content_gate_status() -> dict[str, Any]:
+    state = _CONTENT_GATE_STATE
+    return {**state, "gates": dict(state["gates"]),
+            "effective": {key: content_gate_enabled(key) for key in CONTENT_GATE_INFO},
+            "inventory": dict(CONTENT_GATE_INFO),
+            "evidence": list(_CONTENT_GATE_EVIDENCE)[-25:],
+            "technical_checks": ["missing or empty media", "incomplete audio takes",
+                                 "invalid media paths", "authentication"]}
+
+
+class ContentGateConflict(Exception):
+    pass
+
+
+def content_gate_patch(patch: dict[str, Any]) -> dict[str, Any]:
+    global _CONTENT_GATE_STATE
+    if not isinstance(patch, dict) or set(patch) - {
+            "expected_revision", "master_enabled", "gates", "approval"}:
+        raise ValueError("unknown content gate field")
+    with _CONTENT_GATE_LOCK:
+        current = _CONTENT_GATE_STATE
+        expected = patch.get("expected_revision")
+        if isinstance(expected, bool) or not isinstance(expected, int):
+            raise ValueError("expected_revision must be an integer")
+        if expected != current["revision"]:
+            raise ContentGateConflict("Content gate policy changed; reload it")
+        master = patch.get("master_enabled", current["master_enabled"])
+        if not isinstance(master, bool):
+            raise ValueError("master_enabled must be a boolean")
+        gates = dict(current["gates"])
+        changes = patch.get("gates", {})
+        if not isinstance(changes, dict) or set(changes) - set(CONTENT_GATE_INFO):
+            raise ValueError("gates must contain only known gate names")
+        if any(not isinstance(value, bool) for value in changes.values()):
+            raise ValueError("each gate value must be a boolean")
+        if not master and any(changes.values()):
+            raise ValueError("enable the master gate before individual gates")
+        gates.update(changes)
+        if not master:
+            gates = {key: False for key in gates}
+        enabling = ((master and not current["master_enabled"])
+                    or any(value and not current["gates"][key]
+                           for key, value in changes.items()))
+        if enabling and patch.get("approval") != "enable":
+            raise ValueError("operator approval is required to enable content gates")
+        if master == current["master_enabled"] and gates == current["gates"]:
+            return content_gate_status()
+        new = {"revision": current["revision"] + 1,
+               "master_enabled": master, "gates": gates,
+               "updated_at": time.time()}
+        if master and any(gates.values()):
+            legacy = _LINE_REVIEW.policy()
+            disabled = set(legacy.get("disabled_gates") or []) - {
+                key for key, enabled in gates.items() if enabled}
+            if not legacy.get("enabled") or disabled != set(legacy.get("disabled_gates") or []):
+                _LINE_REVIEW.policy({"enabled": True,
+                                     "disabled_gates": sorted(disabled)})
+                _LINE_REVIEW_POLICY_MEMO.update(at=0.0, value=None)
+        CONTENT_GATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = CONTENT_GATE_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps(new, indent=2) + "\n", encoding="utf-8")
+        tmp.replace(CONTENT_GATE_PATH)
+        _CONTENT_GATE_STATE = new
+        return content_gate_status()
+
+
+@app.get("/api/orchestrator/content-gates")
+async def api_content_gates_get(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_read_auth(authorization)
+    return content_gate_status()
+
+
+@app.patch("/api/orchestrator/content-gates")
+@app.post("/api/orchestrator/content-gates")
+async def api_content_gates_patch(
+    request: Request, authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_auth(authorization)
+    try:
+        return await asyncio.to_thread(content_gate_patch, await request.json())
+    except ContentGateConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 def line_review_policy() -> dict[str, Any]:
@@ -601,6 +756,10 @@ def line_review_permits(gate: str, source: str, candidate: str = "",
     """
     if _REJECTION_LAB_PREVIEW.get():
         return False
+    if not technical and not content_gate_enabled(gate):
+        if reasons:
+            content_gate_bypassed(gate, reasons, source)
+        return True
     verdict = _LINE_REVIEW.evaluate(
         gate, str(source or ""), str(candidate or ""), reasons,
         context=context, technical=technical, advisory=advisory)
@@ -615,13 +774,18 @@ def line_review_permits(gate: str, source: str, candidate: str = "",
 def line_review_drop_gate(why: str) -> tuple[str, bool]:
     """Keep editorial choice separate from absent or unplayable recordings."""
     reason = str(why or "").lower()
+    if "buried" in reason or "binned" in reason:
+        return "line_quality", False
+    if "expired" in reason:
+        return "freshness", False
+    if any(word in reason for word in (
+            "deadline", "too late", "cancelled", "interrupted",
+            "lost the floor", "render queue", "mid-flight")):
+        return "timing", False
     technical = any(word in reason for word in (
         "no audio", "empty audio", "voice failed", "voice render", "tts failed",
-        "no voice", "deadline", "render failed", "too late", "cancelled",
-        "interrupted", "missing audio", "engine failed", "lost the floor",
-        "expired", "playback failed", "no playable", "render queue",
-        "would not render", "mid-flight",
-        "buried", "binned"))
+        "no voice", "render failed", "missing audio", "engine failed",
+        "playback failed", "no playable", "would not render"))
     if technical:
         return "recording_requirement", True
     if any(word in reason for word in ("repeat", "rerun", "already said", "phrase")):
@@ -1322,7 +1486,7 @@ DEFAULT_DJ = {
     #  he uses MP fours more often or MP threes. I basically want him by
     #  default using twice as many MP fours as MP threes."
     #
-    # Twice as many is two in three, so 67. #1122 opened the draw to video
+    # #1122 opened the draw to video
     # at all (2,779 .mp4 against 11,257 .mp3 in the library at the time) by
     # putting both families in SFX_TYPES, and from that day the mix was
     # whatever the folder happened to hold - roughly one picture in five,
@@ -1332,7 +1496,8 @@ DEFAULT_DJ = {
     #
     # It re-weights the DRAW; it removes nothing from the library, so every
     # mp3 he has now is still one he can play.
-    "sfx_video_share": 67,
+    "sfx_video_share": 80,
+    "sfx_ads_share": 20,
     # #1366: the endless set. Off by default - it changes what the
     # operator's own screens are doing, so it only ever starts by hand.
     "sfx_video_mode": False,
@@ -2489,6 +2654,11 @@ def validate_settings(data: Any) -> dict[str, Any]:
                        DEFAULT_DJ["sfx_video_share"]) if
             raw_dj.get("sfx_video_share") is not None else
             DEFAULT_DJ["sfx_video_share"]))),
+        "sfx_ads_share": max(0, min(100, int(
+            raw_dj.get("sfx_ads_share",
+                       DEFAULT_DJ["sfx_ads_share"]) if
+            raw_dj.get("sfx_ads_share") is not None else
+            DEFAULT_DJ["sfx_ads_share"]))),
         "sfx_video_mode": bool(raw_dj.get("sfx_video_mode",
                                           DEFAULT_DJ["sfx_video_mode"])),
         # [#1251] the dialogue matcher: two switches, two floors.
@@ -5655,39 +5825,9 @@ def _comfy_video_workflow(prompt: str) -> dict[str, Any]:
     installed on this box, saving an .mp4 straight into the gallery."""
     graph = _load_workflow_override(data_path("comfy_video_workflow.json"))
     if graph is None:
-        graph = {
-            "37": {"class_type": "UNETLoader", "inputs": {
-                "unet_name": "wan2.2_ti2v_5B_fp16.safetensors",
-                "weight_dtype": "default"}},
-            "38": {"class_type": "CLIPLoader", "inputs": {
-                "clip_name": "umt5_xxl_fp8_e4m3fn_scaled.safetensors",
-                "type": "wan", "device": "default"}},
-            "39": {"class_type": "VAELoader",
-                   "inputs": {"vae_name": "wan2.2_vae.safetensors"}},
-            "48": {"class_type": "ModelSamplingSD3",
-                   "inputs": {"shift": 8.0, "model": ["37", 0]}},
-            "6": {"class_type": "CLIPTextEncode",
-                  "inputs": {"text": "{prompt}", "clip": ["38", 0]}},
-            "7": {"class_type": "CLIPTextEncode",
-                  "inputs": {"text": _WAN_NEGATIVE, "clip": ["38", 0]}},
-            # ponytail: 848x480 x 81 frames (~3.4 s @ 24 fps) keeps renders
-            # in minutes; raise in comfy_video_workflow.json for longer clips.
-            "55": {"class_type": "Wan22ImageToVideoLatent", "inputs": {
-                "vae": ["39", 0], "width": 848, "height": 480,
-                "length": 81, "batch_size": 1}},
-            "3": {"class_type": "KSampler", "inputs": {
-                "seed": 42, "steps": 20, "cfg": 5.0,
-                "sampler_name": "uni_pc", "scheduler": "simple",
-                "denoise": 1.0, "model": ["48", 0], "positive": ["6", 0],
-                "negative": ["7", 0], "latent_image": ["55", 0]}},
-            "8": {"class_type": "VAEDecode",
-                  "inputs": {"samples": ["3", 0], "vae": ["39", 0]}},
-            "57": {"class_type": "CreateVideo",
-                   "inputs": {"images": ["8", 0], "fps": 24}},
-            "58": {"class_type": "SaveVideo", "inputs": {
-                "video": ["57", 0], "filename_prefix": "PineBox",
-                "format": "mp4", "codec": "h264"}},
-        }
+        # The verified H3 graph lives in tracked source. data/ remains a
+        # deployment override, never the only copy of the working workflow.
+        graph = comfy_workshop.build_workflow(prompt, mode="text")
     return _fill_workflow(graph, prompt)
 
 
@@ -5954,10 +6094,17 @@ def _read_gpu_temp() -> dict[str, Any]:
 
 
 async def _track_generation(prompt_id: str, started_at: float | None = None,
-                            base_stats: dict[str, Any] | None = None) -> None:
+                            base_stats: dict[str, Any] | None = None,
+                            kind: str = "image", publish: bool = False) -> None:
     """Poll ComfyUI /history until the render lands, then record the output
-    filenames + capture render stats so the gallery can show the image."""
-    for _ in range(120):  # ~6 minutes at 3 s
+    filenames + capture render stats so the gallery can show the image.
+
+    [#1285] Video waits far longer than a picture: a MiniMax H3 clip is a
+    cold 46 GB model load plus sampling, and it can queue behind another.
+    Six minutes used to be the whole budget, so a clip that WAS coming got
+    filed as "unknown" and the gallery never showed it."""
+    tries = 400 if kind == "video" else 120   # ~20 min vs ~6 min at 3 s
+    for _ in range(tries):
         await asyncio.sleep(3)
         try:
             async with httpx.AsyncClient(timeout=10) as client:
@@ -5989,9 +6136,32 @@ async def _track_generation(prompt_id: str, started_at: float | None = None,
                                         stats["duration_s"])
             stats.update(_summarize_system_stats(await _comfy_system_stats()))
             stats.update(_read_gpu_temp())
+            aired_files: list[str] = []
+            if publish and kind == "video":
+                try:
+                    aired_files = await asyncio.to_thread(
+                        workshop_publish_files, files, prompt_id)
+                except Exception as exc:                         # noqa: BLE001
+                    pipeline_log(
+                        "drop", "the workshop clip landed but could not join "
+                        "the SFX shelf: %s" % type(exc).__name__)
             await update_generation(
-                prompt_id, files=files, status="done", stats=stats)
+                prompt_id, files=files, status="done", stats=stats,
+                aired_files=aired_files)
+            if aired_files:
+                fire_and_forget(_sfx_pool_refresh())
             await announce_render_complete()
+            # [#1285] H3 keeps ~46 GB resident. Hand it back as soon as the
+            # clip lands IF the box is tight - but stay warm when there is
+            # room, because a cold reload costs the next render ~30 s.
+            if kind == "video":
+                try:
+                    if (comfy_host_available_gb() or 0.0) < VIDEO_RENDER_FLOOR_GB:
+                        await comfy_unload(
+                            "free", 0.0,
+                            "a video render finished and the box was tight")
+                except Exception:  # noqa: BLE001
+                    pass
             return
         status = hist.get("status") or {}
         if status.get("completed"):
@@ -6034,10 +6204,22 @@ async def reconcile_generations() -> dict[str, int]:
                 entry = hist.get(pid) or {}
                 files = _comfy_output_files({pid: entry}) if entry else []
                 if files:
-                    await update_generation(pid, files=files, status="done")
+                    aired_files = list(gen.get("aired_files") or [])
+                    if (bool(gen.get("air_it")) and not aired_files
+                            and str(gen.get("kind") or "") == "video"):
+                        aired_files = await asyncio.to_thread(
+                            workshop_publish_files, files, pid)
+                    await update_generation(
+                        pid, files=files, status="done",
+                        aired_files=aired_files)
+                    if aired_files:
+                        fire_and_forget(_sfx_pool_refresh())
                     counts["finished"] += 1
                 elif pid in queued_ids:
-                    fire_and_forget(_track_generation(pid, gen.get("ts")))
+                    fire_and_forget(_track_generation(
+                        pid, gen.get("ts"), gen.get("stats"),
+                        str(gen.get("kind") or "image"),
+                        bool(gen.get("air_it"))))
                     counts["tracking"] += 1
                 elif time.time() - float(gen.get("ts") or 0) > 900:
                     # Not on disk, not queued, and long past: it will never land.
@@ -6054,6 +6236,16 @@ async def _startup_paused() -> None:
     on by itself is the opposite of what the switch is for."""
     try:
         radio_pause_load()
+    except Exception:  # noqa: BLE001
+        pass
+    # Endless video is the station's banking screen, not a second thing
+    # that happens to be visible while FM carries on underneath it. The
+    # setting survives a restart, so restore the other half of that mode
+    # even when an older paused.json predates this contract.
+    try:
+        if sfx_video_mode_on() and not radio_paused():
+            _sfx_video_banking_settings(True)
+            radio_pause_set(True, why="endless video restored banking mode")
     except Exception:  # noqa: BLE001
         pass
     # #1147: A REBOOT IS A FRESH START ON THE VOICE FEED, exactly like a
@@ -8059,16 +8251,131 @@ def _comfy_output_files(history: dict[str, Any]) -> list[str]:
     return unique
 
 
+class RenderRefused(Exception):
+    """A render that was never submitted because the box could not spare the
+    memory. NOT an engine fault - it must never page the Comfy Doctor."""
+
+
+# [#1285] MiniMax H3 loads ~46 GB of weights and its sampling working set sits
+# on top of that. On unified memory a render that runs the pool dry does not
+# merely fail: it takes the station down with the whole box.
+#
+# Be honest about what this gate is worth. The 2026-09-23 freeze gave NO
+# warning at all - no NVRM error, no OOM kill, no memory cliff - so this
+# floor would not have caught it. It catches the ordinary case (a heavy
+# render started while the station is already tight); the hard GPU lockout
+# is held off by staying inside the proven render shape, and survived by the
+# hardware watchdog. Three different guards, none of them sufficient alone.
+VIDEO_RENDER_FLOOR_GB = float(os.getenv("VIDEO_RENDER_FLOOR_GB", "60"))
+IMAGE_RENDER_FLOOR_GB = float(os.getenv("IMAGE_RENDER_FLOOR_GB", "20"))
+
+
+# [#1285] The box runs HOT. Idle sits at 83-88 C and a light H3 render
+# reaches 95.5 C against a kernel critical trip of 104 C - and the station's
+# own generations.jsonl shows 85-95 C going back three weeks. Four hard
+# freezes left no NVRM error, no OOM kill and no thermal log, and an armed
+# hardware watchdog did not reboot the box, which is what losing the whole
+# SoC looks like rather than a kernel hang.
+#
+# A ceiling cannot prove heat is the cause. It is here because it is the one
+# reading that moved with the failures, and because refusing a render costs
+# a clip while a freeze costs the broadcast.
+RENDER_TEMP_CEILING_C = float(os.getenv("RENDER_TEMP_CEILING_C", "90"))
+# The cadence is deliberately short enough to build a useful reel while the
+# machine is cool, but it never replaces the thermal and free-memory gates in
+# render_admission. The old variable remains a fallback for existing installs.
+VIDEO_RENDER_INTERVAL_S = comfy_workshop.render_interval_seconds(
+    os.getenv("VIDEO_RENDER_INTERVAL_S",
+              os.getenv("VIDEO_RENDER_GAP_S", "90")))
+VIDEO_RENDER_GAP_S = VIDEO_RENDER_INTERVAL_S  # compatibility for status code
+_LAST_VIDEO_RENDER = [0.0]
+
+
+def box_hottest_c() -> float | None:
+    """The hottest thermal zone on the box, or None if it will not say.
+
+    Every zone here is an `acpitz` reading off the same SoC, so the maximum
+    is the honest number - averaging them hides the one that is about to
+    trip. Cheap: seven small reads from sysfs.
+    """
+    hottest = None
+    try:
+        root = "/sys/class/thermal"
+        for name in os.listdir(root):
+            if not name.startswith("thermal_zone"):
+                continue
+            try:
+                with open("%s/%s/temp" % (root, name), "r",
+                          encoding="utf-8") as fh:
+                    c = int(fh.read().strip()) / 1000.0
+            except (OSError, ValueError):
+                continue
+            if 0.0 < c < 200.0 and (hottest is None or c > hottest):
+                hottest = c
+    except Exception:  # noqa: BLE001
+        return None
+    return hottest
+
+
+def render_admission(kind: str) -> tuple[bool, str, float | None]:
+    """May a render start right now? Returns (ok, why_not, available_gb).
+
+    A blind meter refuses VIDEO and admits IMAGE on purpose. An image render
+    peaks around 20 GB and has never hurt this box; a video render is the one
+    that can end the broadcast, so when the reading is missing it does not get
+    the benefit of the doubt.
+    """
+    floor = VIDEO_RENDER_FLOOR_GB if kind == "video" else IMAGE_RENDER_FLOOR_GB
+    if kind == "video":
+        # Heat first: it is the reading that tracked the freezes.
+        hot = box_hottest_c()
+        if hot is not None and hot >= RENDER_TEMP_CEILING_C:
+            return False, ("the box is at %.0f C and a video render needs it "
+                           "below %.0f C - it has frozen hard at this "
+                           "temperature" % (hot, RENDER_TEMP_CEILING_C)), None
+        since = time.time() - _LAST_VIDEO_RENDER[0]
+        if _LAST_VIDEO_RENDER[0] and since < VIDEO_RENDER_INTERVAL_S:
+            remaining = max(1, int(math.ceil(VIDEO_RENDER_INTERVAL_S - since)))
+            return False, ("the last video render started %.0f seconds ago; "
+                           "the configured %d-second interval has %d seconds left"
+                           % (since, int(VIDEO_RENDER_INTERVAL_S), remaining)), None
+    avail = comfy_host_available_gb()
+    if avail is None:
+        if kind == "video":
+            return False, ("the box will not say how much memory it has free, "
+                           "and a video render is too heavy to start blind"), None
+        return True, "", None
+    if avail < floor:
+        return False, ("the box has %.1f GB free and a %s render needs %.0f GB "
+                       "of room to stay clear of the station"
+                       % (avail, kind, floor)), avail
+    return True, "", avail
+
+
 async def _submit_generation(
-    tags: str, request_text: str, kind: str = "image"
+    tags: str, request_text: str, kind: str = "image", *,
+    workflow: dict[str, Any] | None = None,
+    metadata: dict[str, Any] | None = None,
 ) -> tuple[str, str]:
     """Submit one render to ComfyUI, record it (with node-graph complexity +
     a start time for the duration stat), and start tracking it. Shared by the
     voice path and the gallery 'regenerate' button. Returns (prompt_id,
     model_name); raises on submit failure."""
-    workflow = (
-        _comfy_video_workflow(tags) if kind == "video" else _comfy_workflow(tags)
-    )
+    admitted, why_not, _avail_gb = render_admission(kind)
+    if not admitted:
+        pipeline_log("gpu", "a %s render was not started - %s (#1285)"
+                     % (kind, why_not))
+        raise RenderRefused(why_not)
+    if kind == "video":
+        # Stamped at SUBMIT, not at completion: the gap that matters is
+        # between one render starting and the next, and a render that never
+        # finishes (the freeze case) still spent the heat.
+        _LAST_VIDEO_RENDER[0] = time.time()
+    if workflow is None:
+        workflow = (
+            _comfy_video_workflow(tags)
+            if kind == "video" else _comfy_workflow(tags)
+        )
     model_name = _workflow_model_name(workflow)
     complexity = _workflow_complexity(workflow)
     async with httpx.AsyncClient(timeout=15) as client:
@@ -8079,7 +8386,7 @@ async def _submit_generation(
         prompt_id = str((response.json() or {}).get("prompt_id") or "")
     _COMFY_LAST_USED[0] = time.time()      # #796: the idle-unload clock
     started_at = time.time()
-    append_generation({
+    rec: dict[str, Any] = {
         "ts": int(started_at),
         "request": request_text,
         "tags": tags,
@@ -8089,10 +8396,19 @@ async def _submit_generation(
         "status": "queued",
         "kind": kind,
         "stats": complexity,
-    })
+    }
+    # Workshop context survives a restart, but callers cannot replace the
+    # bookkeeping fields above with arbitrary metadata.
+    for key in ("mode", "source", "source_type", "speech", "purpose", "air_it",
+                "frames", "steps", "seed", "at_share", "variant_of",
+                "source_generation", "trim_in_s", "trim_out_s"):
+        if metadata and key in metadata:
+            rec[key] = metadata[key]
+    append_generation(rec)
     if prompt_id:
         asyncio.create_task(
-            _track_generation(prompt_id, started_at, complexity))
+            _track_generation(prompt_id, started_at, complexity, kind,
+                              bool(rec.get("air_it"))))
     return prompt_id, model_name
 
 
@@ -8131,6 +8447,17 @@ async def comfyui_generate(
     try:
         _prompt_id, model_name = await _submit_generation(
             prompt, user_text, kind
+        )
+    except RenderRefused as refusal:
+        # [#1285] Nothing is broken - the box is busy. Paging the Comfy
+        # Doctor here would send a repair crew to a healthy engine.
+        if direct:
+            return (f"Not right now - {refusal}. Ask again in a few minutes "
+                    "and it will go straight through.")
+        return (
+            f"Tell the user the {kind} was NOT started because {refusal}. "
+            "Say it plainly and without alarm - nothing is broken, the box "
+            "is simply busy - and invite them to ask again shortly."
         )
     except Exception as exc:
         # #1152: a failed render is the doctor's page. Self-heal in the
@@ -15016,13 +15343,17 @@ def crystal_tint_holds() -> bool:
     a rewrite that passes, but a rewrite that fails goes out as written
     and a recorded round is READY on its audio alone."""
     try:
+        if not content_gate_enabled("tint"):
+            return False
+        if not crystal_tint_two_pass():
+            return False
         policy = line_review_policy()
         if not policy.get("enabled", True) or "tint" in policy.get("disabled_gates", []):
             return False
         return bool(dj_settings().get("crystal_tint_hold",
                                       DEFAULT_DJ["crystal_tint_hold"]))
     except Exception:  # noqa: BLE001
-        return True
+        return False
 
 
 def crystal_grade_strict() -> bool:
@@ -15044,6 +15375,8 @@ def dialogue_tint_wanted() -> bool:
     plus the hold. A mocked-true dialogue_tint_required still means the
     pass is wanted, so the #1057 regressions read exactly as before."""
     try:
+        if not content_gate_enabled("tint"):
+            return False
         return bool(dialogue_tint_required()
                     or (crystal_tint_two_pass()
                         and crystal_coverage_target() > 0))
@@ -15058,11 +15391,12 @@ def dialogue_tint_required() -> bool:
     (crystal_tint_hold). Otherwise the pass is wanted, attempted and
     recorded, and never the reason a line is silenced."""
     try:
+        if not content_gate_enabled("tint"):
+            return False
         return bool(crystal_tint_two_pass() and crystal_coverage_target() > 0
                     and crystal_tint_holds())
     except Exception:  # noqa: BLE001
-        return bool(dj_settings().get("crystal_tint_pass", True)
-                    and dj_settings().get("crystal_tint_hold", False))
+        return False
 
 
 def crystal_coverage_target() -> int:
@@ -15204,7 +15538,9 @@ def dialogue_audio_ready(kind: str, row: Any) -> bool:
 def dialogue_row_ready(kind: str, row: Any) -> bool:
     """One authoritative zero-work-to-air predicate for scheduled stock."""
     try:
-        if not isinstance(row, dict) or row.get("off_brief") or row.get("review_cancel_pending"):
+        if not isinstance(row, dict) or row.get("review_cancel_pending"):
+            return False
+        if row.get("off_brief") and content_gate_enabled("segment_brief"):
             return False
         # [#1239] A PREPARED round already has its audio. Editing the
         # words at the mouth would leave the recording saying the
@@ -15212,11 +15548,14 @@ def dialogue_row_ready(kind: str, row: Any) -> bool:
         # the shelf. The callable lookup keeps early module-load
         # restoration safe, exactly as the call gate below does.
         _phrase_gate = globals().get("phrase_ban_row_blocked")
-        if callable(_phrase_gate) and _phrase_gate(kind, row):
+        if (content_gate_enabled("phrase_ban") and callable(_phrase_gate)
+                and _phrase_gate(kind, row)):
             return False
         entry = dialogue_entry(row)
         if entry is not None:
-            if entry.get("off_brief") or entry.get("review_cancel_pending"):
+            if entry.get("review_cancel_pending"):
+                return False
+            if entry.get("off_brief") and content_gate_enabled("segment_brief"):
                 return False
             if not _larder_current(entry):
                 return False
@@ -15227,7 +15566,8 @@ def dialogue_row_ready(kind: str, row: Any) -> bool:
             # call contract is defined later in this large module, before the
             # service starts accepting work.
             _call_gate = globals().get("call_entry_contract")
-            if (str(kind) == "caller" and callable(_call_gate)
+            if (content_gate_enabled("call_contract") and str(kind) == "caller"
+                    and callable(_call_gate)
                     and not _call_gate(entry)):
                 return False
         return (dialogue_tint_ready(kind, row)
@@ -15245,7 +15585,9 @@ def dialogue_row_viable(kind: str, row: Any) -> bool:
     never prevent the scheduler from writing their replacement.
     """
     try:
-        if not isinstance(row, dict) or row.get("off_brief"):
+        if not isinstance(row, dict):
+            return False
+        if row.get("off_brief") and content_gate_enabled("segment_brief"):
             return False
         entry = dialogue_entry(row)
         if entry is None and row.get("produced") and not dialogue_audio_ready(kind, row):
@@ -15254,20 +15596,24 @@ def dialogue_row_viable(kind: str, row: Any) -> bool:
             # work indefinitely as if it were just waiting for a voice.
             return False
         if entry is not None:
-            if entry.get("off_brief") or not _larder_current(entry):
+            if ((entry.get("off_brief") and content_gate_enabled("segment_brief"))
+                    or not _larder_current(entry)):
                 return False
             _call_gate = globals().get("call_entry_contract")
-            if (str(kind) == "caller" and callable(_call_gate)
+            if (content_gate_enabled("call_contract") and str(kind) == "caller"
+                    and callable(_call_gate)
                     and not _call_gate(entry)):
                 return False
             # #1082: a struck-out tint retires the row. It stays visible
             # for diagnosis but no longer holds a stocking slot, so the
             # scheduler writes its replacement instead of asking again.
-            if tint_exhausted(entry) and not dialogue_tint_ready(kind, row):
+            if (content_gate_enabled("tint") and tint_exhausted(entry)
+                    and not dialogue_tint_ready(kind, row)):
                 return False
             return bool(str(entry.get("script_plain")
                             or entry.get("script") or "").strip())
-        if tint_exhausted(row) and not dialogue_tint_ready(kind, row):
+        if (content_gate_enabled("tint") and tint_exhausted(row)
+                and not dialogue_tint_ready(kind, row)):
             return False
         return bool(str(row.get("text_plain") or row.get("text") or "").strip())
     except Exception:  # noqa: BLE001
@@ -15956,6 +16302,8 @@ _REPEAT_SAFE_MEMO: dict[tuple[int, str], bool] = {}
 
 
 def repeat_safe(kind: str, row: dict[str, Any]) -> bool:
+    if not content_gate_enabled("repetition"):
+        return True
     try:
         if str(kind) not in ("caller", "manager"):
             return True                 # evergreen by nature - no work at all
@@ -16196,6 +16544,29 @@ def larder_ready_count() -> int:
         return 0
 
 
+def larder_empty_beat_chain(entry: dict[str, Any]) -> bool:
+    """A beat-engine row whose recorded writer calls made no dialogue.
+
+    These rows are admission artifacts, not authored rounds. Quote doors can
+    add enough unrelated source lines afterward to make the ordinary length
+    gates accept one, so the beat trace is the only authoritative distinction.
+    """
+    if str(entry.get("writer_engine") or "") != "beats":
+        return False
+    chain = entry.get("beat_chain")
+    if not isinstance(chain, list) or not chain:
+        return False
+    made = 0
+    for row in chain:
+        if not isinstance(row, dict):
+            continue
+        try:
+            made += max(0, int(row.get("made") or 0))
+        except (TypeError, ValueError):
+            continue
+    return made == 0
+
+
 def larder_trim() -> None:
     """2026-09-08: the larder holds larder_cap() rounds of stock PLUS the
     repertoire - rhymed rounds inside their keep - bounded at
@@ -16203,6 +16574,18 @@ def larder_trim() -> None:
     one. Before this `del _LARDER[:-larder_cap()]` cut the repertoire
     with the stock on every append."""
     try:
+        # A zero-output beat trace is not a retirement decision and must not
+        # be harvested into gold. It is proof that no writer was admitted;
+        # later quote doors merely made the artifact look long enough.
+        invalid = [entry for entry in _LARDER
+                   if larder_empty_beat_chain(entry)]
+        if invalid:
+            _LARDER[:] = [entry for entry in _LARDER
+                          if not larder_empty_beat_chain(entry)]
+            pipeline_log("lookahead", "%d zero-output beat artifact(s) "
+                         "were removed from the larder; none entered gold"
+                         % len(invalid))
+            _larder_save()
         cap = max(1, larder_cap())
         rep = [e for e in _LARDER if tinted_kept("banter", e)]
         rep_ids = {id(e) for e in rep}
@@ -17027,6 +17410,9 @@ CUPBOARD_UNHEARD_HOURS = float(os.getenv("PINE_UNHEARD_HOURS", "2"))
 CUPBOARD_UNHEARD_EVERY = float(os.getenv("PINE_UNHEARD_EVERY", "420"))
 _UNHEARD_AT = [0.0]
 _UNHEARD_LOG: list[dict[str, Any]] = []
+_UNHEARD_REFUSED: dict[int, float] = {}
+_UNHEARD_PENDING_HANDOFFS: set[asyncio.Event] = set()
+UNHEARD_HANDOFF_TIMEOUT = 60.0
 # #1265: this walks every shelf and the larder, and it rides in
 # dj_state(), which every panel polls. It measures stock that has been
 # waiting for DAYS - three-second resolution was never meaningful.
@@ -17628,7 +18014,7 @@ def cupboard_cue_state() -> dict[str, Any]:
 
 
 def unheard_pick() -> tuple[str, dict[str, Any] | None, float]:
-    """The one round that has waited longest and can actually go out.
+    """The longest-waiting spoken round, then a station ID if none is ready.
 
     Oldest first across every road that is open out of turn, so the
     cupboard drains in the order it filled and no road can starve another
@@ -17640,6 +18026,10 @@ def unheard_pick() -> tuple[str, dict[str, Any] | None, float]:
     now = time.time()
     after = cupboard_unheard_after()
     best: tuple[str, dict[str, Any] | None, float] = ("", None, 0.0)
+    best_id: tuple[str, dict[str, Any] | None, float] = ("", None, 0.0)
+    for key, until in list(_UNHEARD_REFUSED.items()):
+        if until <= now:
+            _UNHEARD_REFUSED.pop(key, None)
     try:
         for kind, row, at in cupboard_cued():
             if id(row) in _READY_SHELF_BUSY:
@@ -17659,12 +18049,18 @@ def unheard_pick() -> tuple[str, dict[str, Any] | None, float]:
                     continue
                 if id(row) in _READY_SHELF_BUSY:
                     continue
+                if id(row) in _UNHEARD_REFUSED:
+                    continue
                 if not dialogue_row_ready(kind, row):
                     continue
-                best = (kind, row, age)
+                if kind == "station_id":
+                    if age > best_id[2]:
+                        best_id = (kind, row, age)
+                elif age > best[2]:
+                    best = (kind, row, age)
     except Exception:  # noqa: BLE001
         pass
-    return best
+    return best if best[1] is not None else best_id
 
 
 CUPBOARD_REPLACE_AFTER = float(os.getenv("PINE_UNHEARD_REPLACE", "345600"))
@@ -18155,7 +18551,8 @@ def _unheard_playout_done(task: asyncio.Task[Any]) -> None:
 
 
 async def _unheard_until_handoff(coro: Any,
-                                 handed: asyncio.Event) -> list[str]:
+                                 handed: asyncio.Event,
+                                 row: dict[str, Any] | None = None) -> list[str]:
     """Wait for refusal/completion or the earlier transport acceptance.
 
     Page playout deliberately holds the floor until the queued burst's airtime
@@ -18163,23 +18560,45 @@ async def _unheard_until_handoff(coro: Any,
     that this tracked task keeps owning the floor and following receipts while
     the watchdog is free to complete its pass.
     """
+    _UNHEARD_PENDING_HANDOFFS.add(handed)
     task = asyncio.create_task(coro)
     waiter = asyncio.create_task(handed.wait())
     _BG_TASKS.add(task)
     _SPEECH_TASKS.add(task)
     task.add_done_callback(_unheard_playout_done)
+    expired = False
+    def expire() -> None:
+        nonlocal expired
+        if handed.is_set() or task.done():
+            return
+        expired = True
+        if row is not None:
+            _UNHEARD_REFUSED[id(row)] = time.time() + 300.0
+        pipeline_log("air", "cupboard handoff timed out without transport "
+                     "acceptance; deferring this row and releasing its task")
+        task.cancel()
+
+    deadline = asyncio.get_running_loop().call_later(
+        UNHEARD_HANDOFF_TIMEOUT, expire)
+    def retire(_done: asyncio.Task[Any]) -> None:
+        deadline.cancel()
+        _UNHEARD_PENDING_HANDOFFS.discard(handed)
+    task.add_done_callback(retire)
     try:
         done, _pending = await asyncio.wait(
             {task, waiter}, return_when=asyncio.FIRST_COMPLETED)
         if task in done:
-            return await task
+            try:
+                return await task
+            except asyncio.CancelledError:
+                if expired:
+                    return []
+                raise
         return []
     except asyncio.CancelledError:
-        # Before acceptance the old cancellation contract still applies: a
-        # timed-out attempt must release its row and floor. Once handed off,
-        # cancellation would tear down audio the page has already accepted.
-        if not handed.is_set() and not task.done():
-            task.cancel()
+        # The watchdog's budget is for its own pass, not for the playout.
+        # Keep the tracked task alive so a round waiting behind the floor
+        # can still publish, release that floor and credit its handoff.
         raise
     finally:
         if not waiter.done():
@@ -18274,6 +18693,7 @@ async def unheard_stock_air(force: bool = False) -> str:
     if AIR1186_REST_S >= DIALOGUE_QUIET_ALARM:
         rest = min(rest, UNHEARD_QUIET_DIALOGUE)
         hush = max(hush, AIR1186_REST_S)
+    urgent = bool(force or hush >= SILENCE_LOSES_AFTER)
     if force:
         rest = 0.0                                  # #1313: dead air waits for nothing
     if now - _UNHEARD_AT[0] < rest:
@@ -18283,8 +18703,10 @@ async def unheard_stock_air(force: bool = False) -> str:
     # #1313: `force` is the silence rescue, and silence outranks the
     # floor. Something actually SOUNDING still stops it - that is not
     # ceremony, that is two voices at once.
-    if _SPEAKING[0] or (_floor_busy() and not force):
+    if _SPEAKING[0] or (_floor_busy() and not urgent):
         return _unheard_no("somebody has the floor")
+    if _UNHEARD_PENDING_HANDOFFS:
+        return _unheard_no("waiting for a prior cupboard handoff")
     # The clock is spent on the WALK, not on the airing. unheard_pick()
     # reads every row of four shelves through dialogue_row_ready, and this
     # sits in the watchdog pass - charging it only when something actually
@@ -18326,6 +18748,7 @@ async def unheard_stock_air(force: bool = False) -> str:
             "air", "%s had waited %s on the shelf without ever being heard - it "
             "goes out of turn, because no slot was ever going to come for it "
             "(#1260)" % (SHELF_LABEL.get(kind, kind), cupboard_ago(age)))
+        _UNHEARD_PENDING_HANDOFFS.discard(handed)
         handed.set()
 
     # A produced ad is a single mixed file. It has no dialogue takes and must
@@ -18334,15 +18757,19 @@ async def unheard_stock_air(force: bool = False) -> str:
     if kind == "ad" and str(row.get("produced") or ""):
         said = await _unheard_until_handoff(
             _unheard_produced_ad_air(
-                row, force=force, on_handoff=account_handoff), handed)
+                row, force=urgent, on_handoff=account_handoff), handed, row)
     else:
         said = await _unheard_until_handoff(
             _ready_shelf_air(
-                kind, _RADIO.get("now"), rescue=True, pick=row, force=force,
-                on_handoff=account_handoff), handed)
+                kind, _RADIO.get("now"), rescue=True, pick=row, force=urgent,
+                on_handoff=account_handoff), handed, row)
     if handed.is_set():
         return kind
     if not said:
+        # A refused head row must not monopolize the next cupboard walk.
+        # Keep it for review and retry after five minutes while other
+        # finished performances get their turn.
+        _UNHEARD_REFUSED[id(row)] = time.time() + 300.0
         # #1304: and it says WHICH refusal, because "the door refused"
         # was the sentence 120 unheard rounds hid behind.
         door = ""
@@ -18378,6 +18805,8 @@ def stock_expires_at(kind: str, row: dict[str, Any]) -> float:
     is written on the row when it is shelved so the cupboard, the System2
     planner and the operator read the same clock; this function is the
     truth when the row's stamp is stale."""
+    if not content_gate_enabled("freshness"):
+        return 0.0
     try:
         entry = row.get("entry") if isinstance(row.get("entry"), dict) else row
         at = float(row.get("at") or entry.get("at") or 0)
@@ -19046,6 +19475,8 @@ def shelf_is_repeat(kind: str, row: dict[str, Any]) -> bool:
             return False
         if not repeat_safe(kind, row):                            # #1055
             return False
+        if not content_gate_enabled("repetition"):
+            return True
         # 2026-09-15 (#1189): the innings ceiling, off the honest count
         # when the operator has thrown the switch. Legacy is `aired`
         # exactly as before.
@@ -19065,7 +19496,8 @@ def shelf_repeat_ready(kind: str, row: dict[str, Any]) -> bool:
         # while the shelf was handing the same gallery round out for
         # the eighth time. Three places asked this question and only
         # one of them had the answer.
-        if time.time() - float(row.get("aired_at") or 0) < shelf_rest_now():   # #1068
+        if (content_gate_enabled("repetition")
+                and time.time() - float(row.get("aired_at") or 0) < shelf_rest_now()):   # #1068
             return False
         key = str(row.get("key") or "")
         return not key or bool(pantry_get(key))
@@ -19999,6 +20431,10 @@ def segment_audit(kind: str, script: str, *, product: str = "", titles: str = ""
     if out.get("checked") and not out.get("ok"):
         out["machine_ok"] = False
         out["machine_faults"] = [out.get("why") or "off brief"]
+        if not content_gate_enabled("segment_brief"):
+            content_gate_bypassed("segment_brief", out["machine_faults"], script)
+            out.update(ok=True, policy_bypassed=True)
+            return out
         # #1192: `capture=False` IS THE RE-READ, and it exists for one
         # caller: review_queue_regrade, asking whether a row that has
         # been sitting in the operator's queue for a week would still
@@ -20141,6 +20577,13 @@ def shelf_put(kind: str, row: dict[str, Any]) -> None:
         row = dict(row)
         row.setdefault("at", time.time())
         row["kind"] = str(kind)
+        # A preparation task may belong to one exact scheduled exchange.
+        # Keep that identity on the durable shelf row and its entry so a
+        # later fill-out can take only the next cycle of the same exchange.
+        try:
+            segment_chain_stamp(row, segment_build_context())
+        except Exception:  # noqa: BLE001
+            pass
         row["expires_at"] = stock_expires_at(str(kind), row)          # #1068
         if globals().get("system2_stamp_entry"):
             system2_stamp_entry(row.get("entry") or row)
@@ -21487,11 +21930,15 @@ async def recording_sitting(entries: list[dict[str, Any]],
     """#1010: work the pooled scripts one performer at a time."""
     out: dict[str, Any] = {"at": time.time(), "rounds": 0, "actors": [],
                            "finished": 0, "say": ""}
+    def complete(entry: dict[str, Any]) -> bool:
+        return bool(entry.get("prepared") and dialogue_audio_ready(
+            str(entry.get("prep_kind") or "banter"), entry))
+
     # A sitting is a VOICE operation, never a back door around the second
     # pass. The ordinary preparer tints before pooling; the hand-operated
     # endpoint did not, so enforce the invariant at the room's own door too.
     pool = [e for e in (entries or [])
-            if isinstance(e, dict) and not e.get("prepared")
+            if isinstance(e, dict) and not complete(e)
             and dialogue_row_viable(str(e.get("prep_kind") or "banter"), e)
             and dialogue_tint_ready(str(e.get("prep_kind") or "banter"), e)]
     del pool[RECORDING_POOL_MOST:]
@@ -21544,11 +21991,11 @@ async def recording_sitting(entries: list[dict[str, Any]],
     for voice in order:
         if prep_should_stop():
             break
-        made_before = sum(1 for e in pool if e.get("prepared"))
+        made_before = sum(1 for e in pool if complete(e))
         _PREP_DEADLINE[0] = time.time() + max(15.0, float(slice_seconds))
         try:
             for entry in pool:
-                if entry.get("prepared") or prep_should_stop():
+                if complete(entry) or prep_should_stop():
                     continue
                 try:
                     await larder_prepare(entry, only_voice=voice)
@@ -21558,7 +22005,7 @@ async def recording_sitting(entries: list[dict[str, Any]],
                     continue
         finally:
             _PREP_DEADLINE[0] = 0.0
-        made_after = sum(1 for e in pool if e.get("prepared"))
+        made_after = sum(1 for e in pool if complete(e))
         try:
             name = str((voice_meta(voice) or {}).get("name") or voice)
         except Exception:  # noqa: BLE001
@@ -21571,7 +22018,7 @@ async def recording_sitting(entries: list[dict[str, Any]],
                      f"script(s) in one sitting - "
                      f"{made_after - made_before} round(s) finished on the "
                      "way out (#1010)")
-    out["finished"] = sum(1 for e in pool if e.get("prepared"))
+    out["finished"] = sum(1 for e in pool if complete(e))
     # #1010: and WHY, when nothing came out. A sitting that finishes
     # nothing is usually not a fault - the room stood down for the live
     # show, or the preparer already had those scripts in flight - and
@@ -24683,15 +25130,20 @@ async def _paged_settle(until: float) -> None:
         lead = VOICE_BROADCAST_LEAD_MS / 1000.0
     except Exception:  # noqa: BLE001
         lead = 7.0
+    def wait_left() -> float:
+        reserved = float(_PAGE_AIR_UNTIL[0] or 0)
+        deadline = min(float(until or 0), reserved) if reserved > 0 else float(until or 0)
+        return deadline - lead - time.time()
+
     slept = 0.0
-    wait = float(until or 0) - lead - time.time()
+    wait = wait_left()
     while wait > 0 and slept < 600.0:
         if radio_paused():
             return
         step = min(wait, 5.0)
         await asyncio.sleep(step)
         slept += step
-        wait = float(until or 0) - lead - time.time()
+        wait = wait_left()
 
 # The delivery meter (#423): how much of each clip the box actually
 # carried. HA's announce returns when playback finishes, so a 20-second
@@ -25671,9 +26123,27 @@ def playout() -> Any:
     try:
         switch = _playout_module.PlayoutSwitch(PLAYOUT_DIR, env={},
                                                clock=time.time)
-        _PLAYOUT = _playout_module.LinearSequencer(
-            clock=time.time, mode_reader=switch.mode,
-            events_path=PLAYOUT_DIR / "events.jsonl")
+        try:
+            # [#1328] THE DURABLE BOOK (#1327).  Everything the
+            # sequencer knew used to be built empty on every boot, and
+            # this station boots about every eighteen minutes: measured
+            # off events.jsonl over 7.74 h, 44 of 322 rounds that had
+            # reached `hold` were still held when their process ended -
+            # 351 lines and 1,881.7 s of finished audio - and with them
+            # went every counter and the whole sequence line.
+            _PLAYOUT = _playout_module.LinearSequencer(
+                clock=time.time, mode_reader=switch.mode,
+                events_path=PLAYOUT_DIR / "events.jsonl",
+                state_path=PLAYOUT_DIR / "state.json")
+        except TypeError:
+            # A sequencer from before the book.  The two files deploy
+            # separately and a sequencer that cannot be CONSTRUCTED is a
+            # station with no floor at all - `playout()` would answer
+            # None and the whole of #1218 would go quiet without ever
+            # saying why.  Run exactly as the station ran yesterday.
+            _PLAYOUT = _playout_module.LinearSequencer(
+                clock=time.time, mode_reader=switch.mode,
+                events_path=PLAYOUT_DIR / "events.jsonl")
         _PLAYOUT.switch = switch
     except Exception as exc:  # noqa: BLE001
         _PLAYOUT_WHY = "the playout sequencer could not be opened: %r" % (exc,)
@@ -25759,6 +26229,134 @@ def playout_ask(road: str, kind: str = "", dialogue: Any = None,
             "queued": False, "mode": "off", "road": road}
 
 
+_PLAYOUT_LINE_CUES: collections.OrderedDict[int, list[dict[str, Any]]] = collections.OrderedDict()
+_PLAYOUT_LINE_CUES_LOCK = RLock()
+_PLAYOUT_LINE_CUES_MAX = 32
+
+
+def _playout_block_line_cues(block: int) -> list[dict[str, Any]]:
+    """The immutable per-line windows for one committed script block.
+
+    A sounding occurrence is polled several times a second by the Script
+    view. Cache the small block slice rather than copying and searching the
+    complete ledger on every poll.
+    """
+    with _PLAYOUT_LINE_CUES_LOCK:
+        held = _PLAYOUT_LINE_CUES.get(int(block))
+        if held is not None:
+            _PLAYOUT_LINE_CUES.move_to_end(int(block))
+            return list(held)
+    ledger: list[dict[str, Any]] = []
+    for row in script_ledger_rows():
+        try:
+            if int(row.get("block") or 0) != int(block):
+                continue
+        except (TypeError, ValueError):
+            continue
+        ledger.append(row)
+    if not ledger:
+        return []
+    ledger.sort(key=lambda row: int(row.get("ord") or 0))
+    air: dict[str, dict[str, Any]] = {}
+    try:
+        committed = float(ledger[0].get("at") or 0) or time.time()
+        for row in airlog_rows(committed - 1800.0, committed + 7200.0,
+                               quiet=True):
+            line_id = str(row.get("id") or "")
+            if line_id:
+                air[line_id] = row
+    except Exception:  # noqa: BLE001
+        air = {}
+    cues: list[dict[str, Any]] = []
+    for row in ledger:
+        line_id = str(row.get("line_id") or row.get("id") or "")
+        heard = air.get(line_id) or {}
+        if not heard and str(row.get("kind") or "") == "sfx":
+            text = " ".join(str(row.get("text") or "").lower().split())
+            for candidate in air.values():
+                if (str(candidate.get("sid") or "") == str(row.get("sid") or "")
+                        and " ".join(str(candidate.get("text") or "").lower().split()) == text):
+                    heard = candidate
+                    break
+        try:
+            lo = float(heard.get("clip_from", row.get("clip_from")))
+            hi = float(heard.get("clip_until", row.get("clip_until")))
+        except (TypeError, ValueError):
+            continue
+        if hi <= lo:
+            continue
+        cues.append({
+            "line_id": line_id,
+            "ord": row.get("ord"),
+            "from": lo,
+            "until": hi,
+            "file": str(heard.get("clip_media") or row.get("clip_media")
+                        or heard.get("media") or row.get("media") or ""),
+            "who": str(heard.get("name") or row.get("name")
+                       or row.get("who") or ""),
+            "text": str(row.get("text") or ""),
+        })
+    cues.sort(key=lambda row: (float(row["from"]), int(row.get("ord") or 0)))
+    if cues:
+        with _PLAYOUT_LINE_CUES_LOCK:
+            _PLAYOUT_LINE_CUES[int(block)] = cues
+            _PLAYOUT_LINE_CUES.move_to_end(int(block))
+            while len(_PLAYOUT_LINE_CUES) > _PLAYOUT_LINE_CUES_MAX:
+                _PLAYOUT_LINE_CUES.popitem(last=False)
+    return list(cues)
+
+
+def _playout_exact_line(sounding: dict[str, Any]) -> dict[str, Any]:
+    """Resolve the listener's measured playhead to the exact script line."""
+    if not isinstance(sounding, dict) or sounding.get("line_id"):
+        return {}
+    try:
+        block = int(sounding.get("block") or 0)
+        position = float(sounding.get("position_s", sounding.get("offset_s")))
+    except (TypeError, ValueError):
+        return {}
+    if not block or position < 0:
+        return {}
+    media = str(sounding.get("file") or sounding.get("media") or "")
+    cues = _playout_block_line_cues(block)
+    matches = [row for row in cues
+               if float(row["from"]) <= position < float(row["until"])
+               and (not media or not row.get("file") or row["file"] == media)]
+    if not matches and cues and position >= float(cues[-1]["until"]):
+        # The listener can enter a just-published block before the final air
+        # rows reach the memo. Refresh once when its known cue sheet ends
+        # before the measured playhead.
+        with _PLAYOUT_LINE_CUES_LOCK:
+            _PLAYOUT_LINE_CUES.pop(block, None)
+        cues = _playout_block_line_cues(block)
+        matches = [row for row in cues
+                   if float(row["from"]) <= position < float(row["until"])
+                   and (not media or not row.get("file") or row["file"] == media)]
+    if not matches:
+        return {}
+    row = matches[-1]
+    return {
+        "line_id": row["line_id"],
+        "ord": row.get("ord"),
+        "line_from": round(float(row["from"]), 3),
+        "line_until": round(float(row["until"]), 3),
+        "line_position_s": round(position - float(row["from"]), 3),
+        "speaker": row.get("who"),
+        "text": row.get("text"),
+    }
+
+
+def _playout_with_exact_line(payload: dict[str, Any]) -> dict[str, Any]:
+    got = dict(payload or {})
+    sounding = got.get("sounding")
+    if not isinstance(sounding, dict):
+        return got
+    exact = _playout_exact_line(sounding)
+    if exact:
+        got["sounding"] = {**sounding, **exact}
+    return got
+
+
 def playout_state(limit: int = 12) -> dict[str, Any]:
     seq = playout()
     if seq is None:
@@ -25766,7 +26364,7 @@ def playout_state(limit: int = 12) -> dict[str, Any]:
                 "verdict": "the playout sequencer is not loaded",
                 "why": _PLAYOUT_WHY or "playout_sequencer.py is not importable"}
     try:
-        got = dict(seq.state(limit=limit))
+        got = _playout_with_exact_line(dict(seq.state(limit=limit)))
         got["available"] = True
         return got
     except Exception as exc:  # noqa: BLE001
@@ -25787,7 +26385,7 @@ PLAYOUT_ROAD_BY_KIND = {
 # The sheet is OWED these (#1261's memo from upstairs, and the advert
 # log): they ask with priority and may go in front of a HELD round, never
 # in front of a sounding one - the floor sees to that.
-PLAYOUT_PRIORITY_KINDS = frozenset({"ad", "advert", "upstairs"})
+PLAYOUT_PRIORITY_KINDS = frozenset({"ad", "advert", "upstairs", "manager"})
 
 
 def playout_clip_road(clip: Any) -> tuple[str, bool]:
@@ -28497,32 +29095,103 @@ def page_recovery_write(clips: list[dict[str, Any]]) -> None:
     temporary.replace(PAGE_RECOVERY_PATH)
 
 
+def page_recovery_prepare_row(clip: dict[str, Any]) -> None:
+    """A replay of an already-heard plain line is a new air occurrence."""
+    if (not clip.get("speech") or (clip.get("stream") or {}).get("rows")
+            or str(clip.get("kind") or "") in ("reply", "sfx")):
+        return
+    row_id = str(clip.get("row_id") or "")
+    if not row_id or any(
+            str(row.get("id") or "") == row_id and line_heard_at(row) > 0
+            for row in _RADIO.get("chat") or [] if isinstance(row, dict)):
+        clip["recovered_from_row_id"] = row_id
+        clip["row_id"] = uuid.uuid4().hex
+
+
+def page_recovery_chat_rows(clip: dict[str, Any], delivery: str) -> None:
+    """Join the recovered delivery to the same rows its audible ACK will name."""
+    if not delivery:
+        return
+    chat = _RADIO.setdefault("chat", [])
+    scheduled = float(clip.get("broadcast_ms") or 0) / 1000.0
+    media = str(clip.get("url") or "").split("?", 1)[0].rsplit("/", 1)[-1]
+    plain = not (clip.get("stream") or {}).get("rows")
+    for source in _page_delivery_rows(clip):
+        row_id = str(source.get("id") or "")
+        if not row_id:
+            continue
+        old = None
+        if plain:
+            for index in range(len(chat) - 1, -1, -1):
+                candidate = chat[index]
+                if (isinstance(candidate, dict)
+                        and str(candidate.get("id") or "") == row_id
+                        and line_heard_at(candidate) <= 0):
+                    old = chat.pop(index)
+                    break
+        row = dict(old or source)
+        row.update({"id": row_id, "ts": int(time.time()),
+                    "aired": "published", "recovery": True,
+                    "clip_media": media, "air_at": scheduled + float(source.get("from") or 0)})
+        if plain:
+            row["seconds"] = float(clip.get("seconds") or 0) or max(
+                2.5, len(str(clip.get("text") or "")) / 14.0)
+        else:
+            row.update(clip_from=float(source.get("from") or 0),
+                       clip_until=float(source.get("until") or 0),
+                       clip_tail=float(source.get("clip_tail") or 0))
+        page_delivery_apply(row, delivery)
+        chat.append(row)
+
+
 def page_reservation_repair() -> list[dict[str, Any]]:
-    """Rebuild unexplained future gaps from real audio; never retime started audio."""
+    """Close future gaps without retiming a clip still audibly playing."""
     now = time.time()
     cursor = now + VOICE_BROADCAST_LEAD_MS / 1000.0
+    silent = not page_voice_audible_recent(within=20.0)
+    gap_limit = 20.0 if silent else max(45.0, PAGED_ANNOUNCE_EARLY)
     changed, pending = [], []
+    cut_ms = int(_RADIO.get("voice_cut_ms") or 0)
     for clip in list(_RADIO.get("voice_clips") or []):
         did = str(clip.get("delivery_id") or "")
+        # A pause or reboot cuts the old programme. Its future reservations
+        # cannot own the clock of the new programme, even when the audio row
+        # remains in history for diagnostics.
+        if cut_ms and clip.get("ts") and int(clip["ts"]) <= cut_ms:
+            _PAGE_RESERVATION_UPDATES.pop(did, None)
+            continue
         delivery = _PAGE_DELIVERIES.get(did) or {}
         if delivery.get("state") == "ended":
             _PAGE_RESERVATION_UPDATES.pop(did, None)
             continue
         start = float(clip.get("broadcast_ms") or 0) / 1000.0
         duration = page_clip_seconds(clip)
-        started = any(p.get("started") for p in (delivery.get("listeners") or {}).values())
-        if started or start <= now:
+        started = any(
+            p.get("started") and (
+                # Older in-memory receipts had no clock; leave them alone.
+                "at" not in p or (
+                    p.get("event") == "playing"
+                    and float(p.get("audible_volume") or 0) > 0
+                    and now - float(p.get("at") or 0) <= 10.0))
+            for p in (delivery.get("listeners") or {}).values())
+        if started:
             if start + duration > now:
                 cursor = max(cursor, start + duration)
             continue
-        # Legitimate lead/prebuffer windows remain. A day of unexplained
-        # empty reservations cannot be manufactured by a 13-second WAV.
-        if start > cursor + max(300.0, PAGED_ANNOUNCE_EARLY):
+        if start <= now and (not silent or now - start <= 20.0):
+            if start + duration > now:
+                cursor = max(cursor, start + duration)
+            continue
+        # A received clip that never started cannot reserve dead air. Once
+        # the listener has been silent for 20 s, close gaps between pending
+        # clips as well as gaps hundreds of seconds long.
+        if (start <= now and silent) or start > cursor + gap_limit:
             clip["broadcast_ms"] = int(cursor * 1000)
             clip["reservation_repaired"] = True
             _PAGE_RESERVATION_UPDATES[did] = clip["broadcast_ms"]
             changed.append(did)
             start = cursor
+            playout_tell("retime_unstarted", did, start)
         cursor = max(cursor, start + duration)
         pending.append(clip)
     _PAGE_AIR_UNTIL[0] = cursor
@@ -28558,6 +29227,7 @@ async def page_recovery_start() -> None:
             clip["ts"] = max(int(time.time() * 1000), int(_RADIO.get("voice_cut_ms") or 0) + 1)
             clip["delivery_state"] = "published"
             clip["recovered_after_restart"] = True
+            page_recovery_prepare_row(clip)
             # #1339: a preserved delivery is being broadcast again, and
             # it is a NEW occurrence - the audit's reusable-sample rule.
             # A clip whose media did not survive the restart cannot be
@@ -28586,10 +29256,7 @@ async def page_recovery_start() -> None:
                 rows=_rec_rows, length=_rec_len,
                 producer="page_recovery_start")
             delivery = page_feed_append(clip)
-            for source in (clip.get("stream") or {}).get("rows") or []:
-                row = dict(source, ts=int(time.time()), aired="published", recovery=True)
-                page_delivery_apply(row, delivery)
-                _RADIO.setdefault("chat", []).append(row)
+            page_recovery_chat_rows(clip, delivery)
         await _paged_settle(float(_PAGE_AIR_UNTIL[0] or 0))
     finally:
         _floor_drop(owned)
@@ -29024,7 +29691,8 @@ def _acknowledge_delivery_lines(delivery_id: str, clip: dict[str, Any],
                 # up. Saying so here is what lets the stamp move off
                 # the estimate and onto the moment it sounded.
                 heard=True)
-        if who not in ("dj", "cohost", "third", "caller", "caller2", "drop"):
+        if who not in ("dj", "cohost", "third", "caller", "caller2", "drop",
+                       "manager"):
             continue
         speech = True
         delivery.setdefault("played_rows", set()).add(rid)
@@ -29716,6 +30384,8 @@ def unban_word(word: str) -> None:
 
 
 def banned_words_clause() -> str:
+    if not content_gate_enabled("phrase_ban"):
+        return ""
     words = [str(r.get("word") or "") for r in banned_words()]
     words = [w for w in words if w]
     if not words:
@@ -29730,6 +30400,8 @@ def strip_banned(text: str) -> str:
     """Last line of defence (#642): a model that says it anyway gets edited.
     The prompt does the work; this catches the leak."""
     out = str(text or "")
+    if not content_gate_enabled("phrase_ban"):
+        return out
     for row in banned_words():
         word = str(row.get("word") or "").strip()
         if not word:
@@ -29759,6 +30431,8 @@ def strip_banned(text: str) -> str:
 
 def avoid_reruns() -> str:
     out = banned_words_clause()
+    if not content_gate_enabled("repetition"):
+        return out
     phrases = overused_phrases()
     if phrases:
         out += ("\nYou have been leaning on these exact phrasings lately — "
@@ -31528,8 +32202,8 @@ def radio_prompt_desk_state() -> dict[str, Any]:
                    ("speech_rate", "Speech rate", "range", 75, 125, 1)],
         "third": [("third_name", "Third-seat name", "text", 0, 0, 0),
                   ("sfxguy_rate", "SFX Guy interjections", "range", 0, 100, 1),
-                  # #1366: sound at one end, pictures at the other. 67 is
-                  # two mp4 for every mp3, which is where it starts.
+                  ("sfx_ads_share", "SFX Guy generated ads",
+                   "range", 0, 100, 1),
                   ("sfx_video_share",
                    "SFX Guy pictures (mp3 \u2190 \u2192 mp4)",
                    "range", 0, 100, 1),
@@ -34671,7 +35345,20 @@ def dj_state() -> dict[str, Any]:
             "length": float(_STREAM_NOW.get("length") or 0),
             "rows": [{"id": str(r.get("id") or ""),
                       "from": float(r.get("from") or 0),
-                      "until": float(r.get("until") or 0)}
+                      "until": float(r.get("until") or 0),
+                      # #1436: the local 250 ms clock often advances to
+                      # the next turn before the four-second speaking_now
+                      # snapshot does. An id and two numbers can highlight
+                      # that turn, but cannot put its words in the live strip.
+                      # Carry the same bounded identity the stream already
+                      # owns so the exact row selected by time is also the
+                      # exact row the operator can read and tap.
+                      "text": str(r.get("text") or "")[:1600],
+                      "who": str(r.get("who") or ""),
+                      "name": str(r.get("name") or ""),
+                      "kind": str(r.get("kind") or ""),
+                      "voice": str(r.get("voice") or ""),
+                      "aired": "airing"}
                      for r in (_STREAM_NOW.get("rows") or [])],
         } if _STREAM_NOW else None),
         # # --- broadcast admission (2026-09-15) ---
@@ -36810,6 +37497,8 @@ def profile_compatible(stored: Any, current: Any) -> bool:
     per generation of work orphaned by a dial.
 
     A schedule change must not be able to throw the cupboard away."""
+    if not content_gate_enabled("profile"):
+        return True
     a, b = str(stored or ""), str(current or "")
     if a == b:
         return True
@@ -36938,13 +37627,17 @@ def _larder_current(entry: dict[str, Any]) -> bool:
             return True
     except Exception:  # noqa: BLE001
         pass
-    return str(entry.get("profile") or "") == _larder_profile_signature()
+    # The bank already uses this compatibility rule when it binds stock.
+    # Recording and playback must not reject the very same bound round just
+    # because the turn range or plot act advanced after it was written.
+    return profile_compatible(entry.get("profile"),
+                              _larder_profile_signature())
 
 
 def larder_unviable_why(e: dict[str, Any]) -> str:
     """Why a larder row is no longer viable - "" when it is."""
     try:
-        if e.get("off_brief"):
+        if e.get("off_brief") and content_gate_enabled("segment_brief"):
             return "off brief: the round failed its segment brief"
         if not _larder_current(e):
             return "the contract moved (cast, crystal or plot act)"
@@ -39051,6 +39744,9 @@ def retire_rejected_call_entry(entry: dict[str, Any]) -> bool:
     single-use promise. Remove its row and only those takes no other retained
     item owns; the pipeline event already preserves the rejection reason.
     """
+    if not (content_gate_enabled("call_contract")
+            and content_gate_enabled("tint")):
+        return False
     try:
         if (str(entry.get("prep_kind") or "") != "caller"
                 or not entry.get("caller_name")):
@@ -39193,7 +39889,7 @@ async def larder_prepare(entry: dict[str, Any],
                 return False
             prep_note(_pkind, "waiting for tint")
             return False
-        if entry.get("off_brief"):
+        if entry.get("off_brief") and content_gate_enabled("segment_brief"):
             prep_note(_pkind, "rejected off brief")
             pipeline_log("lookahead", f"{SHELF_LABEL.get(_pkind, _pkind)} "
                          "was tinted but failed its segment brief; it will "
@@ -40811,7 +41507,7 @@ def track_talk_load() -> None:
                 # Rejected dialogue is not useful inventory. It stays out of
                 # the exact queue and its now-unowned audio is reclaimed by
                 # the normal pantry/media pruning pass.
-                if side.get("off_brief"):
+                if side.get("off_brief") and content_gate_enabled("track_talk"):
                     restored.pop(part, None)
                     rejected += 1
             if restored.get("intro") or restored.get("outro"):
@@ -41295,12 +41991,12 @@ def track_talk_text_report(text: Any, track: Any,
             "artist": str((track or {}).get("artist") or "")[:160]
             if isinstance(track, dict) else ""}
     report.update(machine_ok=not faults, machine_faults=list(faults))
-    technical = bool(not words or not anchors or any(
-        fault in faults for fault in (
-            "the line looks like a transcript instead of one link",
-            "the line contains model or lyric scaffolding",
-            "the line repeats tint direction instead of presenter speech")))
+    technical = not words
     report["technical"] = technical
+    if faults and not technical and not content_gate_enabled("track_talk"):
+        content_gate_bypassed("track_talk", faults, raw)
+        report.update(ok=True, policy_bypassed=True)
+        return report
     if faults and not technical and line_review_permits(
             "track_talk", " ".join(raw.split()), reasons=faults,
             context={"kind": "track_talk", "stage": "grade", "part": str(part),
@@ -41349,6 +42045,11 @@ def track_talk_tint_fidelity(source: Any, candidate: Any,
             "shared_terms": shared[:12], "source_terms": sorted(original)[:20],
             "faults": faults}
     report.update(machine_ok=not faults, machine_faults=list(faults))
+    if faults and str(candidate or "").strip() \
+            and not content_gate_enabled("track_talk_fidelity"):
+        content_gate_bypassed("track_talk_fidelity", faults, candidate)
+        report.update(ok=True, policy_bypassed=True)
+        return report
     if (faults and str(source or "").strip()
             and re.search(r"[^\W_]", str(candidate or ""))
             and not _looks_meta(str(candidate or ""))
@@ -41425,7 +42126,8 @@ def track_talk_part_ready(part: Any) -> bool:
     """A track side is tinted and has a durable voice take."""
     try:
         if (not isinstance(part, dict) or not str(part.get("text") or "")
-                or part.get("off_brief") or part.get("review_cancel_pending")):
+                or (part.get("off_brief") and content_gate_enabled("track_talk"))
+                or part.get("review_cancel_pending")):
             return False
         if dialogue_tint_required() and not part.get("tint_ok"):
             return False
@@ -41847,7 +42549,7 @@ async def prep_track_talk() -> bool:
         report = track_talk_text_report(text, track, part)
         side["brief"] = report
         side["off_brief"] = not bool(report.get("ok"))
-        if side["off_brief"]:
+        if side["off_brief"] and content_gate_enabled("track_talk"):
             line_review_capture("track_talk", " ".join(text.split()),
                 reasons=list(report.get("faults") or []),
                 context={"kind": "track_talk", "stage": "row_deleted",
@@ -41888,8 +42590,10 @@ async def prep_track_talk() -> bool:
             ("an introduction" if part == "intro" else "a send-off")
             + " is ready for "
             + (str(track.get("title") or "a record")[:60])
-            + (f" - {(made or {}).get('seconds')}s of tinted audio waiting"
-               if made else " - tinted, waiting on a voice")
+            + (f" - {(made or {}).get('seconds')}s of "
+               + ("tinted " if dialogue_tint_wanted() else "")
+               + "audio waiting" if made else
+               " - written, waiting on a voice")
             + " (#869)")
         # A model write without a durable take is unfinished work, not a
         # successful task. Reporting True here produced nominal successes
@@ -41908,7 +42612,7 @@ async def prep_track_talk() -> bool:
             review_scopes.close()
 
 
-async def prep_voice_pending(kind: str) -> bool:
+async def prep_voice_pending(kind: str, wanted_sid: str = "") -> bool:
     """#989 (B5): give a voice to the reads this road has already
     written, instead of writing another one.
 
@@ -41927,6 +42631,7 @@ async def prep_voice_pending(kind: str) -> bool:
     for index, row in enumerate(list(_SHELF.get(str(kind)) or [])):
         try:
             if (not isinstance(row, dict) or alt_sid(str(kind), row) not in wanted
+                    or (wanted_sid and alt_sid(str(kind), row) != wanted_sid)
                     or dialogue_row_ready(str(kind), row)
                     or not dialogue_row_viable(str(kind), row)
                     or row.get("tinting") or row.get("preparing")
@@ -41963,7 +42668,7 @@ async def prep_voice_pending(kind: str) -> bool:
             if not await ensure_shelf_row_tinted(
                     str(kind), row, critical=True):
                 continue
-            if row.get("off_brief"):
+            if row.get("off_brief") and content_gate_enabled("segment_brief"):
                 continue
             text = str(row.get("text") or "")
             made = await prep_render_line(text, who,
@@ -42066,6 +42771,11 @@ async def _prep_one_work(kind: str) -> bool:
     # lines the moment there is a script to record.
     prep_note(str(kind), "writing")
     prep_context_set(str(kind))
+    _segment_token = None
+    try:
+        _segment_token = segment_prepare_open(str(kind))
+    except Exception:  # noqa: BLE001
+        _segment_token = None
     # 2026-09-15 (#1197): THE BRIEF NOW ARRIVES.
     #
     # prep_context_set above is exactly what makes _schedule_prompt_clause
@@ -42096,6 +42806,10 @@ async def _prep_one_work(kind: str) -> bool:
     except Exception:  # noqa: BLE001
         return False
     finally:
+        try:
+            segment_prepare_close(_segment_token)
+        except Exception:  # noqa: BLE001
+            pass
         if _seeded_brief:
             alt_brief_clear()           # 2026-09-15 (#1197): never outlive
         prep_context_clear()
@@ -42843,6 +43557,8 @@ async def pantry_keeper() -> None:
                     if (not _bank_all and alt_sid(_kind, _row)
                             not in _committed_unready):
                         continue
+                    if alt_sid(_kind, _row) in _PANTRY_ORDER_RECORD_ACTIVE:
+                        continue
                     # #916: a PRODUCED spot has no pantry `key` because its
                     # audio is a durable mp3 under /ads-audio rather than a
                     # pantry clip — it is finished, and rendering its script
@@ -42859,7 +43575,8 @@ async def pantry_keeper() -> None:
                         # rewrite here used to prevent already accepted rounds
                         # farther down this recording pass from reaching TTS.
                         continue
-                    if _row.get("off_brief"):
+                    if (_row.get("off_brief")
+                            and content_gate_enabled("segment_brief")):
                         continue              # curate/replace; never voice junk
                     try:
                         _late = await prep_render_line(
@@ -43556,11 +44273,20 @@ async def larder_keeper() -> None:
             if _OLLAMA_GATE.locked() and _stocked >= 2 and not radio_paused():
                 continue
             _LARDER_WRITING[0] = True
+            _segment_token = None
             try:
                 # The script is written ahead; when it reaches speak_turns
                 # its first audio batch renders while the prior clip plays.
+                try:
+                    _segment_token = segment_prepare_open("banter")
+                except Exception:  # noqa: BLE001
+                    _segment_token = None
                 await dj_banter(None, bank=True, render_stream=True)
             finally:
+                try:
+                    segment_prepare_close(_segment_token)
+                except Exception:  # noqa: BLE001
+                    pass
                 _LARDER_WRITING[0] = False
         except Exception as _bank_err:  # noqa: BLE001
             # [#1388] A BARE SHELF THAT NEVER FILLS SAYS NOTHING.
@@ -44034,7 +44760,7 @@ def dialogue_stock_census(kind: str) -> dict[str, Any]:
             if not isinstance(row, dict):
                 note("not a row", row)
                 continue
-            if row.get("off_brief"):
+            if row.get("off_brief") and content_gate_enabled("segment_brief"):
                 note("off brief", row)
                 continue
             try:
@@ -44051,7 +44777,7 @@ def dialogue_stock_census(kind: str) -> dict[str, Any]:
                     note("no words", row)
                     continue
             else:
-                if entry.get("off_brief"):
+                if entry.get("off_brief") and content_gate_enabled("segment_brief"):
                     note("off brief", row, entry)
                     continue
                 if not profile_compatible(entry.get("profile"), profile):
@@ -44130,7 +44856,7 @@ def dialogue_stock_items(kind: str, include_unready: bool = True,
             tint_required = dialogue_tint_required()
 
         def _viable(row: dict[str, Any]) -> bool:
-            if row.get("off_brief"):
+            if row.get("off_brief") and content_gate_enabled("segment_brief"):
                 return False
             # #1068: an item past its expiry is not stock; the desk writes
             # its replacement instead of counting it. Repeats inside their
@@ -44140,7 +44866,8 @@ def dialogue_stock_items(kind: str, include_unready: bool = True,
                 return False
             entry = dialogue_entry(row)
             if entry is not None:
-                basic = bool(not entry.get("off_brief")
+                basic = bool((not entry.get("off_brief")
+                              or not content_gate_enabled("segment_brief"))
                              and profile_compatible(
                                  entry.get("profile"), profile)
                              and str(entry.get("script_plain")
@@ -44228,6 +44955,8 @@ def dialogue_stock_items(kind: str, include_unready: bool = True,
                     "kind": road, "row": record, "entry": record,
                     "ready": ready, "seconds": round(audio, 3),
                     "audio_seconds": round(audio, 3),
+                    "lines": 2,
+                    "ready_lines": 2 - remaining,
                     # commitment_inventory_plan expands this single exact
                     # carrier over the wall-clock entry it owns.
                     "projected_seconds": 1.0, "fills_entry": True,
@@ -44259,11 +44988,30 @@ def dialogue_stock_items(kind: str, include_unready: bool = True,
                          dialogue_stock_seconds(road, row, True))
             if ready and actual <= 0:
                 continue
+            entry = dialogue_entry(row) or row
+            lines = (int(entry.get("chunks") or 0)
+                     or alt_lines_in(str(entry.get("script")
+                                         or entry.get("text") or "")))
+            made_lines = min(lines, int(entry.get("made") or 0))
+            if ready:
+                made_lines = lines
             out.append({
                 "id": alt_sid(road, row), "kind": road,
-                "row": row, "entry": dialogue_entry(row) or row,
+                "row": row, "entry": entry,
                 "ready": ready, "seconds": round(actual, 3),
                 "projected_seconds": round(max(actual, projected), 3),
+                "lines": lines, "ready_lines": made_lines,
+                "chain_id": str(entry.get("chain_id")
+                                or row.get("chain_id") or ""),
+                "cycle_id": str(entry.get("cycle_id")
+                                or row.get("cycle_id") or ""),
+                "chain_order": int(entry.get("chain_order")
+                                   or row.get("chain_order") or 0),
+                "segment_subject": (str(entry.get("segment_subject")
+                                        or row.get("segment_subject") or "")[:600]),
+                "continuation_context": (str(
+                    entry.get("continuation_context")
+                    or row.get("continuation_context") or "")[:1800]),
                 "available": round(available, 3),
                 "remaining_airings": (max(1, row_innings(road, row)
                                            - int(row.get("aired") or 0))
@@ -45060,7 +45808,7 @@ def orch_load() -> None:
         _ORCH["read"] = True
 
 
-def orch_save() -> None:
+def orch_save(*, strict: bool = False) -> None:
     try:
         del _ORCH["asks"][ORCH_ASK_KEEP:]
         for path, rows in ((ORCH_ASK_PATH, _ORCH["asks"]),
@@ -45070,6 +45818,8 @@ def orch_save() -> None:
             tmp.write_text(json.dumps(rows, indent=1, default=str))
             tmp.replace(path)
     except Exception:  # noqa: BLE001
+        if strict:
+            raise
         pass                            # a forgetful desk still asks
 
 
@@ -46275,18 +47025,22 @@ def directive_record(found: dict[str, Any], source: str = "spoken") -> str:
         return "I did not catch an instruction in that."
     row = {"at": time.time(), "text": text[:300], "road": road,
            "move": move, "source": str(source)[:20]}
-    try:
-        with _ORCH_LOCK:
-            seat = _ORCH["policy"].get("operator_notes")
-            rows = list((seat or {}).get("value") or []) if isinstance(
-                seat, dict) else []
-            rows.append(row)
-            del rows[:-DIRECTIVE_KEEP]
-            _ORCH["policy"]["operator_notes"] = {"value": rows,
-                                                 "at": time.time()}
-        orch_save()
-    except Exception:  # noqa: BLE001
-        pass
+    with _ORCH_LOCK:
+        prior = _ORCH["policy"].get("operator_notes")
+        rows = list((prior or {}).get("value") or []) if isinstance(
+            prior, dict) else []
+        rows.append(row)
+        del rows[:-DIRECTIVE_KEEP]
+        _ORCH["policy"]["operator_notes"] = {"value": rows,
+                                             "at": time.time()}
+        try:
+            orch_save(strict=True)
+        except Exception:
+            if prior is None:
+                _ORCH["policy"].pop("operator_notes", None)
+            else:
+                _ORCH["policy"]["operator_notes"] = prior
+            raise
     did = ""
     if road and move:
         try:
@@ -46749,8 +47503,8 @@ def orch_routine_questions() -> list[dict[str, Any]]:
              _opt("As it is", "noop"),
              _opt("More music, lighter on the talk", "ballast:+3"),
          ]},
-        {"ask": "The crystal's second pass rewrites every line into its "
-                "world. It is the most expensive thing on the station.",
+        {"ask": "Crystal tinting changes the station's writing. The second "
+                "pass is the most expensive part.",
          "when": True,
          "options": [
              _opt("Keep it on everything", "tint:full"),
@@ -46996,7 +47750,7 @@ def orch_apply(does: str, alone: bool = False) -> str:
                     "value": float(_share), "at": time.time()}
             said = {"full": "the crystal tints everything",
                     "easy": "the crystal tints on the fast model",
-                    "off": "the second pass is off"}.get(arg, "")
+                    "off": "crystal tinting is off throughout the station"}.get(arg, "")
         elif verb == "drive":
             _ORCH["policy"]["drive_road"] = {
                 "value": str(arg), "at": time.time(), "revision": uuid.uuid4().hex[:16]}
@@ -52023,6 +52777,25 @@ def coord_brief() -> dict[str, Any]:
     return dict(out)
 
 
+def record_talk_supply() -> dict[str, Any]:
+    """Count only record-bound bookends on the current music lookahead."""
+    tracks = [row for row in track_talk_state(TRACK_TALK_MAX).get("tracks", [])
+              if not row.get("tape")]
+    held = [row for row in tracks if row.get("intro") or row.get("outro")]
+    ready = [row for row in tracks if row.get("intro") == "ready"
+             and row.get("outro") == "ready"]
+    return {
+        "held_records": len(held), "ready_pairs": len(ready),
+        "ready_seconds": round(sum(max(0.0, float(row.get("seconds") or 0))
+                                   for row in ready), 1),
+        "ready_parts": sum(row.get(part) == "ready" for row in held
+                           for part in ("intro", "outro")),
+        "written_parts": sum(bool(row.get(part)) for row in held
+                             for part in ("intro", "outro")),
+        "tracks": tracks[:12],
+    }
+
+
 def coord_road_report(road: str) -> dict[str, Any]:
     """#958: "anytime they're behind, if I click on that, I want to see a
     pop up explaining what is being done."
@@ -52053,20 +52826,32 @@ def coord_road_report(road: str) -> dict[str, Any]:
             "rows": int(needs.get("rows") or 0),
             "cap": int(needs.get("cap") or 0),
         }
-        rows = road_source(road)                 # #1169
-        out["shelf"] = {
-            "rows": len(rows), "cap": shelf_cap(road),
-            "ceiling": shelf_cap(road) * SHELF_ROW_CEILING,
-            "seconds": round(sum(float(r.get("seconds") or 0)
-                                 for r in rows), 1),
-            "full": bool(shelf_full(road)),
-        }
+        if road == "track_talk":
+            supply = record_talk_supply()
+            out["record_talk"] = supply
+            out["shelf"] = {
+                "rows": supply["held_records"], "ready_rows": supply["ready_pairs"],
+                "cap": shelf_cap(road),
+                "ceiling": shelf_cap(road) * SHELF_ROW_CEILING,
+                "seconds": supply["ready_seconds"],
+                "full": bool(track_talk_full()),
+            }
+        else:
+            rows = road_source(road)             # #1169
+            out["shelf"] = {
+                "rows": len(rows), "cap": shelf_cap(road),
+                "ceiling": shelf_cap(road) * SHELF_ROW_CEILING,
+                "seconds": round(sum(float(r.get("seconds") or 0)
+                                     for r in rows), 1),
+                "full": bool(shelf_full(road)),
+            }
         out["quota"] = (quota_state() or {}).get(road) or {}
         out["bare_arrivals"] = int(_BARE_ARRIVALS.get(road) or 0)
         out["cannot"] = CANNOT_PREPARE.get(road) or ""
         # #986: words with no voice — the shape that had the advert road
         # holding twelve unusable reads while four other roads starved.
-        out["unvoiced"] = shelf_unvoiced(road)
+        out["unvoiced"] = (supply["written_parts"] - supply["ready_parts"]
+                           if road == "track_talk" else shelf_unvoiced(road))
         out["unvoiced_cap"] = SHELF_UNVOICED_MOST
         out["cost_seconds"] = round(float(task_cost(road) or 0), 1)
         # The coming entries this road has to fill.
@@ -52133,6 +52918,17 @@ def _coord_road_doing(rep: dict[str, Any]) -> list[dict[str, str]]:
             say.append({"tag": "clear",
                         "text": "This one is never prepared ahead: "
                                 + str(rep["cannot"]) + "."})
+        if road == "track_talk":
+            supply = rep.get("record_talk") or {}
+            for track in (supply.get("tracks") or [])[:4]:
+                waiting = [part for part in ("intro", "outro")
+                           if track.get(part) == "written"]
+                if waiting:
+                    say.append({"tag": "blocked", "text": (
+                        str(track.get("title") or "A queued record")[:80]
+                        + " has a written " + " and ".join(waiting)
+                        + " waiting for a durable voice take.")})
+                    break
         prep = rep.get("preparing") or {}
         if prep:
             stage = str(prep.get("stage") or "")
@@ -52711,13 +53507,13 @@ def coord_spot_ready() -> dict[str, Any] | None:
             if not made:
                 continue
             entry = next((r for r in ad_list() if r.get("id") == made), None)
-            if entry and entry.get("audio") and (
+            if entry and entry.get("auto_air") is not False and entry.get("audio") and (
                     PRODUCED_ADS_DIR / str(entry["audio"])).is_file():
                 # Selection is a peek. The handoff commits this exact row
                 # only after the player accepts its finished audio.
                 return entry
         pool = [r for r in ad_list()
-                if r.get("audio")
+                if r.get("auto_air") is not False and r.get("audio")
                 and (PRODUCED_ADS_DIR / str(r["audio"])).is_file()]
         if not pool:
             return None
@@ -53195,6 +53991,92 @@ def coord_work_order_say(order: dict[str, Any]) -> str:
 
 _PANTRY_ORDER_AT = [0.0]
 _PANTRY_ORDER_LAST: dict[str, Any] = {}
+_PANTRY_ORDER_RECORD_ACTIVE: set[str] = set()
+
+
+def pantry_order_schedule_work() -> dict[str, Any]:
+    """Read and prioritize the bound hour off the coordinator's event loop."""
+    if _rooms_module is None:
+        return {}
+    return _rooms_module.schedule_cupboard_handoff(
+        bank_view(60), ALT_PREP_KINDS, shelf_full,
+        write_most=ALT_GEN_LIVE, record_most=RECORDING_POOL_MOST)
+
+
+def pantry_order_plan(handoff: dict[str, Any]) -> dict[str, Any]:
+    """Put exact missing bound airtime ahead of aggregate road demand."""
+    plan = dict(_COORD_PLAN)
+    existing = {str(t.get("road") or ""): dict(t)
+                for t in (plan.get("tasks") or []) if isinstance(t, dict)}
+    tasks = []
+    for need in (handoff.get("write") or []):
+        road = str(need.get("road") or "")
+        if not road:
+            continue
+        task = existing.pop(road, {})
+        task["want_seconds"] = max(float(task.get("want_seconds") or 0),
+                                   float(need.get("want_seconds") or 0))
+        due = float(need.get("due_in") or 0)
+        old_due = task.get("due_in")
+        task["due_in"] = min(due, float(old_due)) if old_due is not None else due
+        task["bare"] = bool(task.get("bare") or need.get("bare"))
+        task["scheduled_commit_id"] = str(need.get("commit_id") or "")
+        task["why"] = str(need.get("why") or task.get("why") or "")
+        task.setdefault("label", str(need.get("label") or road))
+        task["road"] = road
+        tasks.append(task)
+    tasks.extend(existing.values())
+    plan["tasks"] = tasks
+    return plan
+
+
+def pantry_order_record_target(order: dict[str, Any]) -> tuple[str, Any]:
+    """Resolve one current committed item by identity, after bank planning."""
+    road = str(order.get("road") or "")
+    ident = str(order.get("item_id") or "")
+    if not road or not ident:
+        return "", None
+    plan = commitment_inventory_plan(1.0, fresh=True)
+    item = next((item for item in (plan.get("selected") or [])
+                 if str(item.get("id") or "") == ident
+                 and str(item.get("kind") or "") == road), None)
+    if not isinstance(item, dict) or item.get("ready"):
+        return "", None
+    row = item.get("row")
+    if not isinstance(row, dict) or dialogue_row_ready(road, row):
+        return "", None
+    entry = dialogue_entry(row)
+    if entry is None:
+        return ("single", row) if road in ("ad", "station_id") else ("", None)
+    if ((entry.get("prepared") and dialogue_audio_ready(road, entry))
+            or entry.get("preparing") or entry.get("tinting")
+            or not dialogue_row_viable(road, entry)
+            or not dialogue_tint_ready(road, entry)):
+        return "", None
+    return "round", entry
+
+
+async def pantry_order_record(order: dict[str, Any]) -> None:
+    """One bounded recording visit; the live room can refuse it at any time."""
+    ident = str(order.get("item_id") or "")
+    try:
+        if not pantry_window() or prep_should_stop():
+            order["state"] = "waiting for a recording window"
+            return
+        shape, entry = await asyncio.to_thread(pantry_order_record_target, order)
+        if not shape or not pantry_window() or prep_should_stop():
+            order["state"] = "no longer ready for recording"
+            return
+        if shape == "single":
+            made = await prep_voice_pending(str(order.get("road") or ""), ident)
+        else:
+            result = await recording_sitting([entry], 45.0)
+            made = bool(result.get("lines_made") or result.get("finished"))
+        order["state"] = "recorded" if made else "waiting for recording"
+    except Exception as exc:  # noqa: BLE001
+        order["state"] = "recording failed (%s)" % type(exc).__name__
+    finally:
+        _PANTRY_ORDER_RECORD_ACTIVE.discard(ident)
 
 
 def pantry_orders_state() -> dict[str, Any]:
@@ -53270,9 +54152,16 @@ async def pantry_orders_tick() -> dict[str, Any]:
         if now - float(_PANTRY_ORDER_AT[0] or 0) < float(PANTRY_ORDER_EVERY):
             return out
         _PANTRY_ORDER_AT[0] = now
-        order = coord_work_order(dict(_COORD_PLAN))
+        try:
+            handoff = await asyncio.to_thread(pantry_order_schedule_work)
+        except Exception:  # noqa: BLE001
+            handoff = {}
+        plan = pantry_order_plan(handoff)
+        order = await asyncio.to_thread(coord_work_order, plan)
         order["mode"] = mode
         order["placed"] = 0
+        order["recording_dispatched"] = 0
+        order["schedule_handoff"] = handoff
         out = order
         if mode != track_talk_segment.MODE_AIR:
             _PANTRY_ORDER_LAST.clear()
@@ -53286,12 +54175,31 @@ async def pantry_orders_tick() -> dict[str, Any]:
                        + "\n\nTHE PLAN IT WAS READ FROM:\n"
                        + str(_COORD_PLAN.get("why") or "")))
             return out
+        for record in (handoff.get("record") or []):
+            ident = str(record.get("item_id") or "")
+            if not ident or ident in _PANTRY_ORDER_RECORD_ACTIVE:
+                continue
+            shape, _ = await asyncio.to_thread(pantry_order_record_target, record)
+            if not shape:
+                record["state"] = "no longer ready for recording"
+                continue
+            _PANTRY_ORDER_RECORD_ACTIVE.add(ident)
+            try:
+                fire_and_forget(pantry_order_record(record))
+            except Exception:  # noqa: BLE001
+                _PANTRY_ORDER_RECORD_ACTIVE.discard(ident)
+                continue
+            order["recording_dispatched"] = 1
+            break
         # The brake the commission route skips and its sibling enforces.
         live = 0
+        active_roads: set[str] = set()
         try:
-            live = sum(1 for j in _ALT_JOBS.values()
-                       if str(j.get("state") or "")
-                       in ("queued", "waiting", "writing"))
+            active = [j for j in _ALT_JOBS.values()
+                      if str(j.get("state") or "")
+                      in ("queued", "waiting", "writing")]
+            live = len(active)
+            active_roads = {str(j.get("kind") or "") for j in active}
         except Exception:  # noqa: BLE001
             live = 0
         window = ""
@@ -53314,6 +54222,17 @@ async def pantry_orders_tick() -> dict[str, Any]:
                 row["held"] = ("nothing on the board writes %s ahead"
                                % str(row.get("label") or road))
                 continue
+            if road in active_roads:
+                row["held"] = "a writing ticket for this road is already active"
+                continue
+            if await asyncio.to_thread(shelf_full, road):
+                row["held"] = "this road's shelf is full"
+                continue
+            if (row.get("scheduled_commit_id")
+                    and not await asyncio.to_thread(
+                        commitment_write_needed, road, 1.0)):
+                row["held"] = "the bound hour no longer needs a new script"
+                continue
             job = "ord" + uuid.uuid4().hex[:9]
             alt_job_put(job, kind=road, count=items, state="queued",
                         made=0, refused=0, new=[],
@@ -53324,6 +54243,7 @@ async def pantry_orders_tick() -> dict[str, Any]:
             fire_and_forget(alt_generate_job(job, road, items))
             row["job"] = job
             live += 1
+            active_roads.add(road)
             order["placed"] = int(order.get("placed") or 0) + 1
         _PANTRY_ORDER_LAST.clear()
         _PANTRY_ORDER_LAST.update(order)
@@ -54591,7 +55511,8 @@ async def _torrent_talk() -> None:
                         aired = bool(await dj_banter(track, render_stream=bool(
                             dj.get("stream_show", True)), shelf_only=talk_is_incessant(dj)))
                 elif kind == "manager":
-                    aired = bool(await dj_manager_note(track, shelf_only=talk_is_incessant(dj)))
+                    aired = await dj_manager_scheduled_round(
+                        track, shelf_only=talk_is_incessant(dj))
                     if not aired:
                         _served_kind, _fallback_cover = "banter", True
                         aired = bool(await dj_banter(track, render_stream=bool(
@@ -55379,7 +56300,8 @@ def manager_break_claim() -> str:
         why = manager_due_why()
         if not why:
             return _claim_no("no memo is due")
-        if _ready_shelf_row("manager", rescue=True) is None:
+        if (manager_prepared_page() is None
+                and _ready_shelf_row("manager", rescue=True) is None):
             # The one that matters, and the one nothing could see: the
             # shelf may hold finished memos and still hand back None -
             # eligibility, a missing voice chunk, or a row that is on the
@@ -55409,10 +56331,16 @@ async def manager_break_in() -> str:
     if not why:
         return _manager_no("no memo is due")
     # Is there one to break in WITH? Peek only - nothing is reserved.
+    page = None
     try:
-        ready = _ready_shelf_row("manager", rescue=True) is not None
+        page = manager_prepared_page()
     except Exception:  # noqa: BLE001
-        ready = False
+        pass
+    try:
+        fallback_ready = _ready_shelf_row("manager", rescue=True) is not None
+    except Exception:  # noqa: BLE001
+        fallback_ready = False
+    ready = page is not None or fallback_ready
     if not ready:
         return _manager_no("a memo is due and none is finished and recorded")
     now = time.time()
@@ -55430,16 +56358,23 @@ async def manager_break_in() -> str:
                 "its next turn so he can break in; a live call and a memo "
                 "are never cut (#1261)" % why)
         return _manager_no("waiting for the floor to come free")
-    # The floor is free. Say what is happening, then deal with it.
+    # The floor is free. A recorded page gives the manager his own voice.
+    said = []
     said_line = ""
-    try:
-        said_line = await dj_speak(
-            "interject", _RADIO.get("now"),
-            line=random.choice(MANAGER_BREAK_LINES),
-            who="dj", round_as="manager", sting=False)
-    except Exception:  # noqa: BLE001
-        said_line = ""          # the memo still goes out, just unannounced
-    said = await _ready_shelf_air("manager", _RADIO.get("now"), rescue=True)
+    if page and await dj_upstairs_page(page):
+        said = [str(page.get("text") or "")]
+        quota_stamp("manager")
+    else:
+        if page and not fallback_ready:
+            return _manager_no("the recorded memo was refused and no fallback is ready")
+        try:
+            said_line = await dj_speak(
+                "interject", _RADIO.get("now"),
+                line=random.choice(MANAGER_BREAK_LINES),
+                who="dj", round_as="manager", sting=False)
+        except Exception:  # noqa: BLE001
+            said_line = ""      # the memo still goes out, just unannounced
+        said = await _ready_shelf_air("manager", _RADIO.get("now"), rescue=True)
     if not said:
         # The bridge line has already gone out, so say why nothing
         # followed it rather than leaving the pair having announced a memo
@@ -55782,7 +56717,9 @@ def entry_guard_road() -> str:
                 # what makes the guard safe: standing others down is
                 # only ever a swap, never a hole.
                 if entry_own_aired(kind, start, deadline) <= 1.0 \
-                        and _ready_shelf_row(road_of, rescue=True) is not None:
+                        and ((road_of == "manager"
+                              and manager_prepared_page() is not None)
+                             or _ready_shelf_row(road_of, rescue=True) is not None):
                     road = road_of
     except Exception:  # noqa: BLE001
         road = ""
@@ -55930,6 +56867,7 @@ async def entry_unanswered_fill() -> str:
 AIR1186_PARK_S = 20.0            # a floor grab, a memo, a gap filler
 AIR1186_PARK_WEDGE_S = 15.0      # clearing a page wedge
 AIR1186_PARK_AIR_S = 25.0        # anything that waits for a playout
+AIR1186_SILENCE_CUPBOARD_S = 3.0 # let the gap filler answer a quiet room promptly
 # Where the current pass is, and when it last got all the way round. A
 # surface reading `at` far in the past and `where` naming a step is
 # looking at a parked watchdog, which is what tonight was.
@@ -55974,6 +56912,16 @@ async def _dead_air_serve_once() -> str:
     return (await entry_unanswered_fill()
             or await entry_arrears_serve()
             or await unheard_stock_air())
+
+
+async def _silence_cupboard_handoff() -> str:
+    """Start the cupboard rescue, then yield quickly to ready-made gap audio."""
+    try:
+        return await asyncio.wait_for(
+            unheard_stock_air(force=True), AIR1186_SILENCE_CUPBOARD_S)
+    except asyncio.TimeoutError:
+        _dead_air_late("the cupboard's silence rescue")
+        return ""
 
 
 async def dead_air_watch() -> None:
@@ -56160,12 +57108,7 @@ async def dead_air_watch() -> None:
                     # honest thing is to stop waiting and say so, not to
                     # hold the whole station's dead-air machine open.
                     _dead_air_pass("the cupboard (silence rescue)")
-                    _went = ""
-                    try:
-                        _went = await asyncio.wait_for(
-                            unheard_stock_air(force=True), AIR1186_PARK_AIR_S)
-                    except asyncio.TimeoutError:
-                        _dead_air_late("the cupboard's silence rescue")
+                    _went = await _silence_cupboard_handoff()
                     if not _went:
                         _dead_air_pass("the gap filler")
                         try:
@@ -57659,7 +58602,7 @@ def ad_delete(ad_id: str) -> None:
 
 def ad_pick() -> dict[str, Any] | None:
     """Prefer the reads that have run least, so the rotation stays wide."""
-    rows = ad_list()
+    rows = [r for r in ad_list() if r.get("auto_air") is not False]
     if not rows:
         return None
     fewest = min(r.get("uses", 0) for r in rows)
@@ -59834,6 +60777,7 @@ def _schedule_clause(preset: str, slot: dict[str, Any], text: str,
                                or (_RADIO.get("sched_pos") or {}).get(
                                    "occurrence") or ""))
             + director_lessons_clause(str(slot.get("kind") or ""))
+            + director_feedback_clause(str(slot.get("kind") or ""))
             # [#1240/#1249] AND THE STORY AS A STAGE DIRECTION, and the
             # phone's subject for a caller entry. Here, for the reason
             # the director's notes are here: this clause is the one choke
@@ -63097,14 +64041,17 @@ async def alt_generate_job(job: str, kind: str, count: int,
                 made += 1
                 pipeline_log(
                     "lookahead",
-                    f"an alternate {SHELF_LABEL.get(kind, kind)} was "
+                    ("a record bookend" if kind == "track_talk" else
+                     f"an alternate {SHELF_LABEL.get(kind, kind)}") + " was "
                     f"written on request — {made} of {count} (#926)")
             else:
                 alt_job_put(job, refused=int(
                     (_ALT_JOBS.get(job) or {}).get("refused") or 0) + 1)
         alt_job_put(job, state="done", made=made, new=fresh, why="")
-        note_action(f"🗓 {made} alternate(s) prepared: "
-                    + SHELF_LABEL.get(kind, kind) + " (#926)")
+        note_action((f"🗓 {made} record bookend(s) prepared (#926)"
+                     if kind == "track_talk" else
+                     f"🗓 {made} alternate(s) prepared: "
+                     + SHELF_LABEL.get(kind, kind) + " (#926)"))
     except Exception as exc:  # noqa: BLE001
         alt_job_put(job, state="failed", made=made, new=fresh,
                     why=f"{type(exc).__name__}: {exc}"[:180])
@@ -67521,69 +68468,83 @@ def _upstairs_audio_write(wav_bytes: bytes, page_id: str) -> str | None:
 
 
 async def dj_upstairs_page(row: dict[str, Any] | None = None) -> bool:
-    """The whole beat: the pair notice the intercom, it PLAYS, they deal
-    with it."""
+    """Play the manager's recorded page, then let the pair answer it."""
     made = row or await dj_upstairs_write()
     if not made:
         return False
     if not made.get("audio"):
         made = await dj_upstairs_render(made) or {}
     name = str(made.get("audio") or "")
-    if not name or not (UPSTAIRS_AUDIO_DIR / name).is_file():
+    spoken = str(made.get("text") or "").strip()
+    if (not spoken or not UPSTAIRS_AUDIO_SHAPE.fullmatch(name)
+            or not (UPSTAIRS_AUDIO_DIR / name).is_file()):
+        return False
+    to = str(_RADIO.get("voice_to") or "box")
+    if to == "off" or radio_paused():
         return False
     path, sig = f"/upstairs-audio/{name}", media_sign(name)
-    label = "📟 a page from upstairs"
-    # (a) the pair hear the intercom light up and say so — through banter so
-    # the near-duplicate drop in dj_speak cannot eat a fixed phrase.
-    try:
-        await dj_banter(_RADIO.get("now"), lines=2, angle=(
-            "The INTERCOM from upstairs has just lit up in the booth. One of "
-            "you notices it out loud — 'hold on, that is upstairs', 'the "
-            "manager is paging us again', 'oh, here we go' — and the other "
-            "reacts to being paged, briefly. TWO lines, no more: the message "
-            "itself is about to play and you must not talk over it."))
-    except Exception:
-        pass
-    # (b) it is a noise the desk made, so it belongs in the booth list.
-    _desk_sound(label, await _clip_seconds_async(path) or 0.0)
-    _RADIO["chat"].append({
-        "ts": int(time.time()), "who": "board", "kind": "upstairs",
-        "name": "upstairs", "text": str(made.get("text") or ""),
-        "gripe": str(made.get("gripe") or ""),
+    seconds = float(await _clip_seconds_async(path) or 0.0)
+    line_id = uuid.uuid4().hex
+    boss = manager_call_name()
+    occurrence = await asyncio.to_thread(
+        admission_admit_line, {"path": path, "sig": sig, "seconds": seconds},
+        who="manager", kind="manager", text=spoken, name=boss,
+        line_id=line_id, producer="dj_upstairs_page")
+    started = time.time()
+    box_accepted = False
+    if to in ("box", "both") and box_talk_ok():
+        try:
+            box_accepted = bool(await _play_on_box(path, sig))
+        except Exception:  # noqa: BLE001
+            box_accepted = False
+    delivery_id = ""
+    page_clip: dict[str, Any] = {}
+    if to == "here" or (to in ("box", "both") and not box_accepted):
+        page_clip = {
+            "url": f"{path}?t={sig}", "text": spoken,
+            "remember_text": spoken, "seconds": seconds,
+            "voice": str(made.get("voice") or ""), "speech": True,
+            "row_id": line_id, "who": "manager", "kind": "manager",
+            "page_id": str(made.get("id") or ""),
+        }
+        try:
+            delivery_id = page_feed_append(page_clip)
+        except Exception:  # noqa: BLE001
+            delivery_id = ""
+    if not box_accepted and not delivery_id:
+        admission_withdraw(occurrence, "neither transport carried the manager page")
+        return False
+    air_at = (float(page_clip.get("broadcast_ms") or 0) / 1000.0
+              if delivery_id else started) or started
+    entry = {
+        "id": line_id, "ts": int(started), "air_at": air_at,
+        "who": "manager", "name": boss, "kind": "manager",
+        "round": "manager", "text": spoken, "seconds": seconds,
+        "voice": str(made.get("voice") or ""),
+        "media": name, "sig": sig, "page_audio": name,
         "page_id": str(made.get("id") or ""),
-        "page_audio": name, "page_sig": sig,
-    })
+        "aired": "box" if box_accepted else "published",
+    }
+    if delivery_id:
+        page_delivery_apply(entry, delivery_id)
+    _RADIO["chat"].append(entry)
     del _RADIO["chat"][:-RADIO_CHAT_KEEP]
-    # #1339: committed before (c). Whichever way `voice_to` is set, one
-    # of the two roads below carries it, so there is no withdrawal here -
-    # the only way this one does not air is an exception, and an
-    # exception leaves the occurrence admitted and visible, which is the
-    # honest record of what happened.
-    await asyncio.to_thread(
-        admission_admit_line, {"path": path, "sig": sig}, who="board",
-        kind="upstairs", text=str(made.get("text") or ""),
-        name="upstairs", line_id=str(made.get("id") or ""),
-        producer="dj_upstairs_page")
-    # (c) PLAY IT — the point of the whole request is that you hear him.
-    to = _RADIO.get("voice_to") or "box"
-    if to in ("box", "both"):
-        await _play_on_box(path, sig)
-    if to in ("here", "both") or not box_talk_ok():
-        page_feed_append({              # #1147: honest broadcast stamp
-            "url": f"{path}?t={sig}", "text": label,
-            "voice": str(made.get("voice") or "")})
-    await _episode_stage(f"{path}?t={sig}", label)
+    try:
+        await _episode_stage(f"{path}?t={sig}", f"{boss}: {spoken}")
+    except Exception:  # noqa: BLE001
+        pass
     upstairs_update(str(made.get("id") or ""),
                     uses=int(made.get("uses") or 0) + 1,
                     last=int(time.time()))
-    pipeline_log("air", "a page from upstairs went out — "
+    pipeline_log("air", "a page from upstairs went out - "
                         f"{made.get('vocode') or 'vocoded'} (#749)")
-    # (d) and they have to process it, on air.
+    if delivery_id:
+        await _paged_settle(air_at + seconds)
     try:
         await dj_banter(_RADIO.get("now"), lines=4, angle=(
             "You have both just been made to listen to a page from the "
             "MANAGER UPSTAIRS over the studio intercom. What he said, word "
-            f"for word, was: \"{str(made.get('text') or '')[:900]}\" "
+            f"for word, was: \"{spoken[:900]}\" "
             "Deal with it, live, in front of everybody: one of you takes it "
             "personally and the other one finds it funny, or you both go "
             "quiet and then start arguing about which of you he meant. Do "
@@ -67594,30 +68555,69 @@ async def dj_upstairs_page(row: dict[str, Any] | None = None) -> bool:
     return True
 
 
+def manager_prepared_page() -> dict[str, Any] | None:
+    """Find a recorded page without asking the live road to write or render."""
+    rows = [row for row in upstairs_list()
+            if str(row.get("text") or "").strip()
+            and UPSTAIRS_AUDIO_SHAPE.fullmatch(str(row.get("audio") or ""))]
+    rows.sort(key=lambda row: (int(row.get("last") or 0),
+                               int(row.get("uses") or 0),
+                               -int(row.get("ts") or 0)))
+    for row in rows:
+        if (UPSTAIRS_AUDIO_DIR / str(row["audio"])).is_file():
+            return row
+    return None
+
+
+async def dj_manager_scheduled_round(track: dict[str, Any] | None = None,
+                                     *, shelf_only: bool = False) -> bool:
+    """Give a scheduled memo the boss's recorded voice, then its fallback."""
+    try:
+        page = await asyncio.to_thread(manager_prepared_page)
+    except Exception:  # noqa: BLE001
+        page = None
+    if page and await dj_upstairs_page(page):
+        quota_stamp("manager")
+        return True
+    return bool(await dj_manager_note(track, shelf_only=shelf_only))
+
+
 async def upstairs_clock() -> None:
     """Roughly N pages an hour, on their own clock, jittered — and quite
     deliberately not checking whether a call is in progress, because "it can
     land mid-phone-call" is the ask."""
     first = True
+    pending = False
     while _RADIO.get("on"):
         rate = float(dj_settings().get("upstairs_per_hour") or 0)
         if rate <= 0:
+            pending = False
             await asyncio.sleep(300)
             continue
-        gap = max(120.0, 3600.0 / rate)
-        # The first page of a fresh show comes early, so the feature is
-        # visible without waiting twenty minutes for it.
-        wait = random.uniform(90.0, 200.0) if first else \
-            random.uniform(gap * 0.6, gap * 1.4)
-        first = False
+        if pending:
+            wait = 20.0
+        else:
+            gap = max(120.0, 3600.0 / rate)
+            # The first page of a fresh show comes early, so the feature is
+            # visible without waiting twenty minutes for it.
+            wait = random.uniform(90.0, 200.0) if first else \
+                random.uniform(gap * 0.6, gap * 1.4)
+            first = False
         await asyncio.sleep(wait)
         if not _RADIO.get("on"):
             return
         if float(dj_settings().get("upstairs_per_hour") or 0) <= 0:
+            pending = False
             continue
-        # #951: upstairs rings during the memo entry, not over a call.
+        # The scheduled manager road now plays a prepared page itself.
+        if str((schedule_take() or {}).get("kind") or "") == "manager":
+            pending = False
+            continue
+        # Keep a due page pending while the running order owns the air.
         if not clock_may_air("manager"):
+            pending = True
             continue
+        pending = False
         try:
             await dj_upstairs_page()
         except Exception as exc:            # noqa: BLE001
@@ -68385,7 +69385,7 @@ async def dj_ad_break(zero_work_only: bool = False, on_handoff: Any = None) -> s
     # a finished booth round cover instead of commissioning copy on air.
     if zero_work_only:
         try:
-            _cupboard = [r for r in ad_list() if r.get("audio")
+            _cupboard = [r for r in ad_list() if r.get("auto_air") is not False and r.get("audio")
                          and (PRODUCED_ADS_DIR / str(r["audio"])).is_file()]
             if _cupboard:
                 _few = min(int(r.get("uses") or 0) for r in _cupboard)
@@ -68412,7 +69412,7 @@ async def dj_ad_break(zero_work_only: bool = False, on_handoff: Any = None) -> s
     # already cut.
     try:
         if random.random() < AD_PRODUCED_BREAK_SHARE:
-            _cupboard = [r for r in ad_list() if r.get("audio")
+            _cupboard = [r for r in ad_list() if r.get("auto_air") is not False and r.get("audio")
                          and (PRODUCED_ADS_DIR / str(r["audio"])).is_file()]
             if _cupboard:
                 _few = min(int(r.get("uses") or 0) for r in _cupboard)
@@ -69237,6 +70237,10 @@ def callback_angles(count: int = 2) -> list[str]:
 
 
 COMFY_OUTPUT = Path("/comfy-output")
+# [#1285] Generated clips live under ComfyUI's own output tree, beside
+# video/, so ComfyUI's scanners index them and there is exactly ONE copy of
+# every generation. The SFX guy plays them from here; nothing is copied out.
+SFX_ADS_DIR = COMFY_OUTPUT / "sfx_ads"
 
 # #831: where a picture actually LIVES under the mounted output tree.
 #
@@ -69612,24 +70616,73 @@ def vision_prompt_active() -> str:
     return vision_prompt_for("")
 
 
+def _analysis_text_match(left: Any, right: Any) -> bool:
+    """Whether two bounded copies came from the same vision response.
+
+    Prepared gallery entries deliberately keep a shorter copy of the vision
+    description than the booth dossier. Prefix equality therefore means the
+    same response; fuzzy overlap would make two readings of one picture
+    indistinguishable and is not provenance.
+    """
+    a = " ".join(str(left or "").split()).casefold()
+    b = " ".join(str(right or "").split()).casefold()
+    if not (a and b):
+        return False
+    shorter = min(len(a), len(b))
+    return shorter >= 48 and (a.startswith(b) or b.startswith(a))
+
+
+def image_analysis_identity(name: str, analysis: str = "") -> str:
+    """The latest explicit analysis id for this image and description."""
+    want = str(name or "").strip()
+    desc = str(analysis or "")
+    try:
+        held = (_RADIO.get("image_analysis_by_image") or {}).get(want) or {}
+        if held.get("id") and (not desc or _analysis_text_match(
+                held.get("analysis"), desc)):
+            return str(held["id"])
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        for row in reversed(_RADIO.get("chat") or []):
+            if (str(row.get("kind") or "") == "image_analysis"
+                    and str(row.get("image") or "") == want
+                    and (not desc or _analysis_text_match(
+                        row.get("analysis"), desc))):
+                return str(row.get("id") or "")
+    except Exception:  # noqa: BLE001
+        pass
+    return ""
+
+
 def image_analysis_ready(name: str, analysis: str, model: str = "",
-                         ms: int = 0, prompt: str = "") -> None:
-    """Record a completed vision pass as a quiet booth event."""
+                         ms: int = 0, prompt: str = "") -> str:
+    """Record a completed vision pass and retain its provenance identity."""
     text = " ".join(str(analysis or "").split())[:1600]
     if not (name and text):
-        return
+        return ""
     key = f"{name}:{hashlib.sha1(text.encode()).hexdigest()[:10]}"
     if _RADIO.get("image_analysis_id") == key:
-        return
+        return image_analysis_identity(name, text)
     _RADIO["image_analysis_id"] = key
-    _RADIO["chat"].append({
-        "id": uuid.uuid4().hex[:6], "ts": int(time.time()),
-        "air_at": time.time(), "who": "analysis", "kind": "image_analysis",
+    now = time.time()
+    row = {
+        "id": uuid.uuid4().hex[:6], "ts": int(now),
+        "air_at": now, "who": "analysis", "kind": "image_analysis",
         "text": f"Image analysis complete: {name}", "analysis": text,
         "image": name, "model": model, "ms": int(ms or 0),
         "prompt": str(prompt or ""), "aired": "analysis",
-    })
+    }
+    _RADIO["chat"].append(row)
     del _RADIO["chat"][:-RADIO_CHAT_KEEP]
+    try:
+        links = _RADIO.setdefault("image_analysis_by_image", {})
+        links[str(name)] = {"id": row["id"], "analysis": text, "at": now}
+        while len(links) > 240:
+            links.pop(next(iter(links)))
+    except Exception:  # noqa: BLE001
+        pass
+    return str(row["id"])
 
 
 async def dj_gallery_round(bank_to: list[dict[str, Any]] | None = None,
@@ -69778,7 +70831,8 @@ async def dj_gallery_round(bank_to: list[dict[str, Any]] | None = None,
         try:
             if bank_to:
                 bank_to[-1]["prep_gallery"] = [
-                    {"name": str(n), "desc": str(d)[:600]}
+                    {"name": str(n), "desc": str(d)[:600],
+                     "analysis_id": image_analysis_identity(str(n), str(d))}
                     for n, d in pieces]
                 if seed:
                     speakbox_remember(seed)
@@ -70130,19 +71184,43 @@ GALLERY_PENDING_LIFE = 420.0
 
 
 def gallery_pending_set(names: list[str],
-                        descs: list[str] | None = None) -> None:
+                        descs: list[str] | None = None,
+                        analysis_ids: list[str] | None = None) -> None:
     """The paintings a round now on air is about, left up for its lines."""
     try:
         keep = [str(n) for n in (names or []) if n][:3]
         if not keep:
             return
+        descriptions = [str(d or "") for d in (descs or [])][:len(keep)]
+        linked = [str(i or "") for i in (analysis_ids or [])][:len(keep)]
+        while len(linked) < len(keep):
+            at = len(linked)
+            linked.append(image_analysis_identity(
+                keep[at], descriptions[at] if at < len(descriptions) else ""))
         _GALLERY_PENDING.clear()
         _GALLERY_PENDING.update({
             "names": keep,
-            "bags": [_gallery_words(d) for d in (descs or [])],
+            "bags": [_gallery_words(d) for d in descriptions],
+            "analysis_ids": linked,
             "at": time.time()})
     except Exception:  # noqa: BLE001
         pass
+
+
+def gallery_pending_analysis_ids(names: list[str]) -> list[str]:
+    """Analysis records feeding the selected pending paintings."""
+    try:
+        standing = list(_GALLERY_PENDING.get("names") or [])
+        linked = list(_GALLERY_PENDING.get("analysis_ids") or [])
+        out = []
+        for name in names or []:
+            if name in standing:
+                at = standing.index(name)
+                if at < len(linked) and linked[at]:
+                    out.append(str(linked[at]))
+        return list(dict.fromkeys(out))
+    except Exception:  # noqa: BLE001
+        return []
 
 
 def gallery_pending_pick(text: str) -> list[str]:
@@ -70233,6 +71311,9 @@ def gallery_line_mark(names: list[str], since: float,
         # round where everybody is talking about pictures.
         entry["images"] = ([names[best]] if best is not None and score >= 2
                            else names[:3])
+        linked = gallery_pending_analysis_ids(entry["images"])
+        if linked:
+            entry["image_analysis_ids"] = linked
         marked += 1
     # #1005: say how many the backward pass could actually reach. On the
     # prepared road that number is routinely ZERO - the rows had not been
@@ -75009,7 +76090,13 @@ def sfx_folders() -> list[Path]:
     # the endless set draws from pick them up with no second mechanism.
     # is_dir() so a station that has never glued anything sees no change
     # at all, and the lookup is wrapped like every other one above it.
-    for mine in (SFX_GLUE_DIR, SFX_EDITED_DIR):
+    # [#1285] ...AND THE GENERATED ADS, for the same reason.
+    # A clip H3 made for the station is the station's own clip as much as a
+    # glued one is, and the operator asked for everything generated to be
+    # reachable from ComfyUI's output tree rather than copied into a second
+    # home. SFX_ADS_DIR is under /comfy-output, which is bind-mounted
+    # read-write, so the walk reads it exactly like the two above.
+    for mine in (SFX_GLUE_DIR, SFX_EDITED_DIR, SFX_ADS_DIR):
         try:
             if mine.is_dir() and mine not in out:
                 out.append(mine)
@@ -78343,7 +79430,8 @@ async def _sfx_cadence_additions_inner(who: str, text: str, completed: int,
                 "the round" % _drew)
     guy_interval = int(settings.get("sfxguy_every_units", 4) or 0)
     if (sfx_due_after(completed, guy_interval) and settings.get("drop_voice")
-            and random.random() < float(settings.get("sfxguy_rate") or 0) / 100.0):
+            and (ready_takes is not None
+                 or random.random() < float(settings.get("sfxguy_rate") or 0) / 100.0)):
         _SFX_CADENCE_STATUS["guy_due"] += 1
         take = sfxguy_ready_pick(text, str(settings["drop_voice"]))
         if take and fits(float(take.get("seconds") or 0)):
@@ -78577,11 +79665,88 @@ def sfx_video_share() -> int:
         return 0
 
 
+def sfx_ads_share() -> int:
+    try:
+        return max(0, min(100, int(dj_settings().get("sfx_ads_share") or 0)))
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def sfx_ratios_state() -> dict[str, int]:
+    dj = dj_settings()
+    return {"ads_share": sfx_ads_share(),
+            "video_share": int(dj.get("sfx_video_share", 80)),
+            "effective_video_share": sfx_video_share()}
+
+
 def sfx_video_mode_on() -> bool:
     try:
         return bool(dj_settings().get("sfx_video_mode"))
     except Exception:  # noqa: BLE001
         return False
+
+
+def _sfx_video_banking_settings(owned: bool) -> None:
+    """Remember whether endless video, rather than a separate hand, owns
+    the current pause.
+
+    Ownership is the important distinction on the way back: turning the
+    set off may resume a pause it created, but must never cancel a pause
+    the operator had already established."""
+    settings = load_settings()
+    dj = dict(settings.get("dj") or {})
+    dj["sfx_video_banking_owned"] = bool(owned)
+    save_settings({**settings, "dj": dj})
+
+
+def sfx_video_banking_owned() -> bool:
+    try:
+        return bool(dj_settings().get("sfx_video_banking_owned"))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _sfx_video_withdraw() -> None:
+    """Withdraw clips the endless planner sold ahead of the current frame."""
+    try:
+        now_ms = int(time.time() * 1000)
+        ring = _RADIO.get("voice_clips") or []
+        ring[:] = [c for c in ring if not (c.get("endless")
+                   and int(c.get("broadcast_ms") or 0) > now_ms - 2000)]
+        _SFX_CYCLE.update({"until": 0.0, "queued": 0, "requests": [],
+                           "why": "the endless set is off"})
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def sfx_video_banking_set(on: bool, why: str = "") -> dict[str, Any]:
+    """Set the endless screen and its Off Air banking mode as one action.
+
+    On acquires the pause only when the station was on air. Off releases
+    only a pause this mode acquired. This lets endless video run during a
+    separately requested pause without stealing ownership of it."""
+    on = bool(on)
+    settings = load_settings()
+    dj = dict(settings.get("dj") or {})
+    was_on = bool(dj.get("sfx_video_mode"))
+    owned = bool(dj.get("sfx_video_banking_owned"))
+    if on:
+        acquire = not radio_paused()
+        dj["sfx_video_mode"] = True
+        dj["sfx_video_banking_owned"] = bool(owned or acquire)
+        save_settings({**settings, "dj": dj})
+        if acquire:
+            radio_pause_set(True, why=why or "endless video banking mode")
+    else:
+        dj["sfx_video_mode"] = False
+        dj["sfx_video_banking_owned"] = False
+        save_settings({**settings, "dj": dj})
+        _sfx_video_withdraw()
+        if owned and radio_paused():
+            radio_pause_set(False,
+                            why=why or "endless video banking mode ended")
+    return {"was_on": was_on, "owned": owned,
+            "banking_owned": sfx_video_banking_owned()}
 
 
 def sfx_video_seam_on() -> bool:
@@ -78669,7 +79834,7 @@ def sfx_cycle_slot(real: Any) -> float:
     return max(SFX_CYCLE_SHORTEST, round(got, 2))
 SFX_CYCLE_LEAD = 1.0             # hand the set the next one this early
 _SFX_CYCLE: dict[str, Any] = {"at": 0.0, "until": 0.0, "rung": 0,
-                              "clip": "", "why": ""}
+                              "clip": "", "why": "", "shuffle_epoch": 0}
 
 
 # #1395: THE PLAYLIST, RUNG AHEAD.
@@ -78762,11 +79927,14 @@ def _sfx_cycle_note(sample: Path, seconds: float, start: float, who: str,
         pass
 SFX_CYCLE_GAP = 0.0              # back to back; the set fades one into the next
 
-# --- #1433: AN HOUR BEFORE A CLIP MAY COME ROUND AGAIN --------------------
+# --- #1433/#1450: A SHUFFLED BOOK, NOT REPEATED RANDOM DRAWS ---------------
 #
-# See the note on sfx_video_fresh_pick for why a uniformly random pick is
-# not an unrepeating one, and why the cycle had nothing written down to
-# consult even if it had wanted to.
+# An hour-long cooldown still repeats on a station that runs all day.  The
+# durable clip book now carries a deck generation: once a video is selected,
+# that row (and exact duplicate rows) stays spent until every eligible video
+# has had a turn.  The timestamp ledger remains useful for diagnostics and
+# for protecting the join between generations, but age no longer makes a
+# clip eligible again.
 SFX_VIDEO_COOLDOWN = float(os.getenv("SFX_VIDEO_COOLDOWN", "3600"))
 SFX_VIDEO_PLAYED_PATH = data_path("sfx_video_played.json")
 # An hour of short clips is a few hundred; this is room for a day of them
@@ -78776,6 +79944,13 @@ _SFX_VIDEO_PLAYED: dict[str, float] = {}
 _SFX_VIDEO_PLAYED_READY = [False]
 _SFX_VIDEO_PLAYED_DIRTY = [0]
 _SFX_VIDEO_PLAYED_LOCK = RLock()
+SFX_VIDEO_FOLDER_REST = 12
+SFX_VIDEO_BOUNDARY_KEEP = 400
+_SFX_VIDEO_ROTATION_LOCK = RLock()
+_SFX_VIDEO_ROTATION: dict[str, Any] = {
+    "ready": False, "cycle": 0, "used": set(), "folders": [],
+    "resets": 0, "why": "", "picked": 0,
+}
 
 
 def _sfx_video_played_load() -> None:
@@ -78832,18 +80007,207 @@ def _sfx_video_played_save() -> None:
         pass
 
 
+def _sfx_video_rotation_load() -> None:
+    """Load this deck generation once and migrate the old recent ring.
+
+    The sqlite rows are the durable truth.  The in-memory set only keeps the
+    matcher and explicit-request roads from paying an indexed lookup for each
+    candidate.
+    """
+    with _SFX_VIDEO_ROTATION_LOCK:
+        if _SFX_VIDEO_ROTATION.get("ready"):
+            return
+    try:
+        _sfx_video_played_load()
+        con = sfx_db()
+        with _SFX_DB_LOCK:
+            row = con.execute(
+                "SELECT value FROM sfx_meta WHERE name = 'video_deck_cycle'"
+            ).fetchone()
+            cycle = max(1, int((row and row[0]) or 1))
+            # First deploy of the deck must not immediately replay what the
+            # old hour ring still remembers.
+            now = time.time()
+            with _SFX_VIDEO_PLAYED_LOCK:
+                recent = [sid for sid, at in _SFX_VIDEO_PLAYED.items()
+                          if now - float(at or 0) < SFX_VIDEO_COOLDOWN]
+            if recent:
+                con.executemany(
+                    "UPDATE clips SET deck_cycle = ? WHERE sid = ?",
+                    [(cycle, sid) for sid in recent])
+                con.commit()
+            rows = con.execute(
+                "SELECT sid FROM clips WHERE video = 1 AND deck_cycle = ? "
+                "AND sid IS NOT NULL AND sid <> ''", (cycle,)).fetchall()
+        used = {str(r[0]) for r in rows if r and r[0]}
+        with _SFX_VIDEO_ROTATION_LOCK:
+            _SFX_VIDEO_ROTATION.update({
+                "ready": True, "cycle": cycle, "used": used, "why": "",
+            })
+    except Exception as exc:  # noqa: BLE001
+        with _SFX_VIDEO_ROTATION_LOCK:
+            _SFX_VIDEO_ROTATION["why"] = "load: %s" % str(exc)[:120]
+
+
+def sfx_video_rotation_cycle() -> int:
+    _sfx_video_rotation_load()
+    with _SFX_VIDEO_ROTATION_LOCK:
+        return max(1, int(_SFX_VIDEO_ROTATION.get("cycle") or 1))
+
+
+def sfx_video_recent_folders() -> list[str]:
+    with _SFX_VIDEO_ROTATION_LOCK:
+        return list(_SFX_VIDEO_ROTATION.get("folders") or [])
+
+
+def sfx_video_folder_recent(folder: str) -> bool:
+    return bool(folder and folder in sfx_video_recent_folders())
+
+
+def _sfx_video_rotation_mark(keys: list[str], folder: str = "") -> None:
+    """Reserve ids in the current generation in one local transaction."""
+    clean = list(dict.fromkeys(str(k) for k in keys if k))
+    if not clean:
+        return
+    _sfx_video_rotation_load()
+    cycle = sfx_video_rotation_cycle()
+    try:
+        con = sfx_db()
+        with _SFX_DB_LOCK:
+            con.executemany(
+                "UPDATE clips SET deck_cycle = ? WHERE sid = ?",
+                [(cycle, sid) for sid in clean])
+            con.commit()
+    except Exception as exc:  # noqa: BLE001
+        with _SFX_VIDEO_ROTATION_LOCK:
+            _SFX_VIDEO_ROTATION["why"] = "reserve: %s" % str(exc)[:120]
+    with _SFX_VIDEO_ROTATION_LOCK:
+        used = _SFX_VIDEO_ROTATION.setdefault("used", set())
+        used.update(clean)
+        if folder:
+            folders = _SFX_VIDEO_ROTATION.setdefault("folders", [])
+            folders[:] = [f for f in folders if f != folder]
+            folders.append(folder)
+            del folders[:-SFX_VIDEO_FOLDER_REST]
+        _SFX_VIDEO_ROTATION["picked"] = int(
+            _SFX_VIDEO_ROTATION.get("picked") or 0) + len(clean)
+
+
+def _sfx_video_rotation_mark_clip(key: str, folder: str = "") -> None:
+    """Spend one clip and every video that would look like the same choice.
+
+    Stable ids prevent a file from repeating, but the collection contains
+    many different ids called things such as ``12 clip-110`` in different
+    source folders. To the operator that is one recurring choice. Spend the
+    complete visible-title family for this deck pass, along with any exact
+    duplicate rows, while keeping generated stingers (whose names differ)
+    independently eligible.
+    """
+    if not key:
+        return
+    _sfx_video_rotation_load()
+    cycle = sfx_video_rotation_cycle()
+    siblings = [str(key)]
+    actual_folder = str(folder or "")
+    try:
+        con = sfx_db()
+        with _SFX_DB_LOCK:
+            row = con.execute(
+                "SELECT name, bytes, seconds, folder FROM clips "
+                "WHERE sid = ? LIMIT 1", (str(key),)).fetchone()
+            if row is not None:
+                actual_folder = actual_folder or str(row["folder"] or "")
+                # A repeated visible title is not useful variety even when
+                # its source folder or transcode differs. This local indexed
+                # book query is cheap and never reads the media share.
+                if row["name"]:
+                    family = con.execute(
+                        "SELECT sid FROM clips WHERE video = 1 AND "
+                        "(name = ? OR (bytes = ? AND seconds = ?))",
+                        (row["name"], row["bytes"], row["seconds"])).fetchall()
+                    siblings = [str(r[0]) for r in family if r and r[0]] or siblings
+            con.executemany(
+                "UPDATE clips SET deck_cycle = ? WHERE sid = ?",
+                [(cycle, sid) for sid in siblings])
+            con.commit()
+    except Exception as exc:  # noqa: BLE001
+        with _SFX_VIDEO_ROTATION_LOCK:
+            _SFX_VIDEO_ROTATION["why"] = "reserve: %s" % str(exc)[:120]
+    with _SFX_VIDEO_ROTATION_LOCK:
+        used = _SFX_VIDEO_ROTATION.setdefault("used", set())
+        used.update(siblings)
+        if actual_folder:
+            folders = _SFX_VIDEO_ROTATION.setdefault("folders", [])
+            folders[:] = [f for f in folders if f != actual_folder]
+            folders.append(actual_folder)
+            del folders[:-SFX_VIDEO_FOLDER_REST]
+        _SFX_VIDEO_ROTATION["picked"] = int(
+            _SFX_VIDEO_ROTATION.get("picked") or 0) + 1
+
+
+def sfx_video_reserve_many(keys: list[str]) -> None:
+    """Put a client/native runway into both recency and deck memory.
+
+    A shuffle exclusion names stable ids, but the operator sees clip titles.
+    Reserve through the same title-family road as an aired clip so a cached
+    ``rasslin/12 clip-110`` cannot be replaced by another ``12 clip-110``
+    row from a different shelf immediately after Shuffle.
+    """
+    clean = list(dict.fromkeys(str(k) for k in keys if k))
+    if not clean:
+        return
+    now = time.time()
+    _sfx_video_played_load()
+    with _SFX_VIDEO_PLAYED_LOCK:
+        for key in clean:
+            _SFX_VIDEO_PLAYED[key] = now
+        _SFX_VIDEO_PLAYED_DIRTY[0] += len(clean)
+    for key in clean:
+        _sfx_video_rotation_mark_clip(key)
+    if _SFX_VIDEO_PLAYED_DIRTY[0] >= 10:
+        _sfx_video_played_save()
+
+
 def sfx_video_on_cooldown(key: str) -> bool:
-    """Has this clip been on the tube inside the cooldown?"""
-    if not key or SFX_VIDEO_COOLDOWN <= 0:
+    """Has this clip already been spent in the current shuffled book?"""
+    if not key:
         return False
+    # Keep the former crash-tail guarantee independently of the deck memo:
+    # the last few history rows may not have reached either durable file yet.
     _sfx_video_played_load()
     with _SFX_VIDEO_PLAYED_LOCK:
         at = _SFX_VIDEO_PLAYED.get(str(key))
-        return at is not None and (time.time() - float(at)) < SFX_VIDEO_COOLDOWN
+        if (at is not None and SFX_VIDEO_COOLDOWN > 0 and
+                time.time() - float(at) < SFX_VIDEO_COOLDOWN):
+            return True
+    _sfx_video_rotation_load()
+    with _SFX_VIDEO_ROTATION_LOCK:
+        if str(key) in _SFX_VIDEO_ROTATION.get("used", set()):
+            return True
+        cycle = max(1, int(_SFX_VIDEO_ROTATION.get("cycle") or 1))
+    # Exact duplicate rows can be marked together without having been added
+    # to the small hot set yet.  The sid index makes this lookup local/cheap.
+    try:
+        row = sfx_db_reader().execute(
+            "SELECT deck_cycle FROM clips WHERE sid = ? LIMIT 1",
+            (str(key),)).fetchone()
+        spent = row is not None and int(row[0] or 0) == cycle
+        if spent:
+            with _SFX_VIDEO_ROTATION_LOCK:
+                _SFX_VIDEO_ROTATION.setdefault("used", set()).add(str(key))
+        return spent
+    except Exception:  # noqa: BLE001
+        # Before the book opens, retain the old one-hour protection rather
+        # than making a recently aired clip eligible.
+        _sfx_video_played_load()
+        with _SFX_VIDEO_PLAYED_LOCK:
+            at = _SFX_VIDEO_PLAYED.get(str(key))
+            return bool(at is not None and
+                        time.time() - float(at) < SFX_VIDEO_COOLDOWN)
 
 
-def sfx_video_note_played(key: str) -> None:
-    """This clip is on the air now; it may not come back for an hour."""
+def sfx_video_note_played(key: str, folder: str = "") -> None:
+    """This clip is on the air now; spend it in the durable deck."""
     if not key:
         return
     _sfx_video_played_load()
@@ -78852,6 +80216,7 @@ def sfx_video_note_played(key: str) -> None:
         _SFX_VIDEO_PLAYED_DIRTY[0] += 1
         if _SFX_VIDEO_PLAYED_DIRTY[0] >= 10:
             _sfx_video_played_save()
+    _sfx_video_rotation_mark_clip(str(key), folder)
 
 
 def sfx_video_cooldown_state() -> dict[str, Any]:
@@ -78861,38 +80226,48 @@ def sfx_video_cooldown_state() -> dict[str, Any]:
         warm = sum(1 for at in _SFX_VIDEO_PLAYED.values()
                    if now - at < SFX_VIDEO_COOLDOWN)
         held = len(_SFX_VIDEO_PLAYED)
+    _sfx_video_rotation_load()
+    with _SFX_VIDEO_ROTATION_LOCK:
+        rotation = {
+            "cycle": int(_SFX_VIDEO_ROTATION.get("cycle") or 1),
+            "used": len(_SFX_VIDEO_ROTATION.get("used") or set()),
+            "resets": int(_SFX_VIDEO_ROTATION.get("resets") or 0),
+            "recent_folders": list(_SFX_VIDEO_ROTATION.get("folders") or []),
+            "policy": "every eligible clip before reuse",
+            "why": str(_SFX_VIDEO_ROTATION.get("why") or ""),
+        }
     return {"cooldown_s": SFX_VIDEO_COOLDOWN, "held": held,
-            "on_cooldown": warm, "rejected": int(_SFX_CYCLE.get("stale") or 0)}
+            "on_cooldown": warm, "rejected": int(_SFX_CYCLE.get("stale") or 0),
+            "rotation": rotation}
 
 
 async def sfx_video_fresh_pick(tries: int = 40) -> Any:
-    """A clip out of the book that has NOT been on this tube for an hour.
+    """The next random row in the current no-repeat deck generation.
 
-    `_sfx_db_pick_any` is uniformly random over the whole book, and
-    uniform is not unrepeating: collisions over a few hundred picks are
-    ordinary, and the pool is narrower than the book whenever the length
-    dial or the folder pin is set, because both are AND-ed into the same
-    query. So the pick is drawn again when it lands on something recent.
-
-    It returns None rather than knowingly replaying a recent clip. The caller
-    may try the pre-warmed pool, but that road applies the same cooldown.
+    Random OFFSET now operates only over rows not yet spent in this cycle;
+    it is therefore random *and* unrepeating.  Recent source folders are
+    excluded when the book has alternatives, which keeps an endless run from
+    looking like one show's folder on repeat.  A generation advances only
+    after the indexed query proves the eligible book is exhausted.
     """
-    for _ in range(max(1, tries)):
-        got = await sfx_db_pick_row_async(True)
-        if got is None:
-            continue
-        try:
-            if not sfx_video_on_cooldown(sfx_id(got[0])):
-                return got
-        except Exception:  # noqa: BLE001
-            return got
-        _SFX_CYCLE["stale"] = int(_SFX_CYCLE.get("stale") or 0) + 1
+    del tries  # kept for callers/tests from the former rejection sampler
+    got = await sfx_db_pick_rotation_async(True)
+    if got is not None:
+        return got
+    with _SFX_VIDEO_ROTATION_LOCK:
+        exhausted = _SFX_VIDEO_ROTATION.get("why") == "exhausted"
+    if exhausted:
+        reset = await asyncio.get_running_loop().run_in_executor(
+            _SFX_DB_EXEC, sfx_video_rotation_reset)
+        if reset:
+            return await sfx_db_pick_rotation_async(True)
     return None
 
 
 async def sfx_video_cycle() -> None:
     """Keep the set's queue topped up for as long as the mode is on."""
     plan: list[dict[str, Any]] = []          # what has been rung, in order
+    plan_epoch = int(_SFX_CYCLE.get("shuffle_epoch") or 0)
     while True:
         try:
             if not sfx_video_mode_on():
@@ -78903,6 +80278,13 @@ async def sfx_video_cycle() -> None:
                 await asyncio.sleep(3.0)
                 continue
             now = time.time()
+            epoch = int(_SFX_CYCLE.get("shuffle_epoch") or 0)
+            if epoch != plan_epoch:
+                # Shuffle owns the whole upcoming runway.  Keeping this
+                # private plan used to re-introduce the old clips as soon as
+                # the native replacement batch had landed.
+                plan = []
+                plan_epoch = epoch
             # Forget what has already played; what is left is the queue the
             # set is holding.
             plan = [p for p in plan if p["end"] > now]     # played
@@ -79062,7 +80444,7 @@ async def sfx_video_cycle() -> None:
             # _sfx_cycle_note below runs `if asked_who`, so the set's own
             # picks - almost all of them - were going out unrecorded, and a
             # cooldown with nothing written down to read is not a cooldown.
-            sfx_video_note_played(key)
+            sfx_video_note_played(key, pick.parent.name)
             if asked_who:
                 _sfx_cycle_note(pick, seconds, start, asked_who,
                                 _match_why)                          # #1417/[#1251]
@@ -79083,9 +80465,15 @@ async def sfx_video_cycle() -> None:
 def sfx_video_mode_state() -> dict[str, Any]:
     cycle = dict(_SFX_CYCLE)
     cycle["left"] = max(0.0, round(float(cycle.get("until") or 0) - time.time(), 1))
+    banking = sfx_video_banking_owned()
     return {"on": sfx_video_mode_on(),
+            "banking": bool(sfx_video_mode_on() and radio_paused()),
+            "banking_owned": banking,
+            "off_air": radio_paused(),
+            "banked_seconds": round(prepared_seconds(), 1),
             "seamless": sfx_video_seam_on(),          # 2026-09-15 (#1184)
             "share": sfx_video_share(),
+            "ads_share": sfx_ads_share(),
             "dial": int((dj_settings() or {}).get("sfx_video_share") or 0),
             "length": int((dj_settings() or {}).get("sfx_video_len") or 0),
             "cycle": cycle, "pool": len(_SFX_VIDEO_MEMO.get("pool") or []),
@@ -79120,9 +80508,11 @@ def sfx_video_mode_state() -> dict[str, Any]:
             # once-a-second clock, which this does not touch. Saying so
             # here costs one clause and saves an evening of wondering why
             # the wall still blinks.
-            "say": ("the endless set is on - %d clip(s) rung, %s is on the "
+            "say": ("the endless set is on and the broadcast is off air "
+                    "banking dialogue%s - %d clip(s) rung, %s is on the "
                     "tube with %.0fs left%s%s"
-                    % (cycle.get("rung") or 0, cycle.get("clip") or "nothing",
+                    % ((" (this set owns the pause)" if banking else ""),
+                       cycle.get("rung") or 0, cycle.get("clip") or "nothing",
                        cycle.get("left") or 0, _sfx_video_level_say(),
                        (" - seamless: the tube cuts on the frame, the "
                         "listen wall still fades") if sfx_video_seam_on()
@@ -79492,6 +80882,26 @@ def sfx_soundboard_state() -> dict[str, Any]:
             "say": say}
 
 
+def sfx_ratio_draw(pool: list[Path], names: list[str], fresh: set[str],
+                   ads_share: int, video_share: int) -> tuple:
+    """Apply both saved ratios once to the eligible weighted SFX draw."""
+    if not names or _sfx_match is None:
+        return pool, names, fresh, None
+    try:
+        chosen = _sfx_match.choose_ratio_pool(
+            names, ads_share, video_share,
+            is_ad=lambda name: Path(name).parent == SFX_ADS_DIR,
+            is_video=sfx_is_video)
+    except Exception:  # noqa: BLE001
+        return pool, names, fresh, None
+    if not chosen:
+        return pool, names, fresh, None
+    allowed = set(chosen)
+    return ([path for path in pool if str(path) in allowed], chosen,
+            {name for name in fresh if name in allowed},
+            sfx_is_video(chosen[0]))
+
+
 def sting_due(after: str = "") -> Path | None:   # [#1251] the line it follows
     """Whether to drop one now, and which. Spontaneous means unpredictable,
     not constant: a roll of the dice, and never twice inside the gap."""
@@ -79537,18 +80947,9 @@ def sting_due(after: str = "") -> Path | None:   # [#1251] the line it follows
     # and the unrepeated ring all keep working exactly as they do now.
     # A side with nothing in it is not narrowed to - a library of pure
     # mp3 still plays, at any setting of the dial.
-    _share = sfx_video_share()
-    _want_video = None       # [#1251] the side the share actually took
-    if 0 < _share < 100 or _share in (0, 100):
-        _want_video = random.random() * 100.0 < _share
-        _side = [n for n in names_pool if sfx_is_video(n) == _want_video]
-        if not _side:
-            _want_video = None  # [#1251] that side is empty - no narrowing
-        if _side:
-            names_pool = _side
-            _sided = {str(p) for p in _side}
-            pool = [p for p in pool if str(p) in _sided] or pool
-            fresh = {n for n in fresh if n in _sided}
+    pool, names_pool, fresh, _want_video = sfx_ratio_draw(
+        pool, names_pool, fresh, sfx_ads_share(), sfx_video_share())
+    _allowed = set(names_pool)
     # [#1251] MATCHED TO THE LINE, WHEN THE SWITCH IS ON.
     #
     # Above the three preference roads because "appropriate to the
@@ -79565,7 +80966,7 @@ def sting_due(after: str = "") -> Path | None:   # [#1251] the line it follows
     if sfx_match_on(False):
         try:
             _matched = sfx_match_sting_pick(
-                after, want_video=_want_video)
+                after, want_video=_want_video, allowed_paths=_allowed)
         except Exception:  # noqa: BLE001
             _matched = None          # a matcher that throws is a matcher off
         if _matched:
@@ -79576,9 +80977,10 @@ def sting_due(after: str = "") -> Path | None:   # [#1251] the line it follows
     # have never been drawn at all.
     _unheard = _STING_DRAW_MEMO.get("unheard") or set()
     if _unheard and len(_unheard) >= STING_SUBPOOL_MIN and random.random() < SFX_UNHEARD_SHARE:   # [#1188]
-        _pool = [n for n in names_pool if n in _unheard] or sorted(_unheard)
-        _pick = unrepeated(_pool, "sting",
-                           keep=sting_keep(len(set(_pool))))   # #1223
+        _pool = [n for n in names_pool if n in _unheard]
+        _pick = (unrepeated(_pool, "sting",
+                            keep=sting_keep(len(set(_pool))))
+                 if _pool else None)                             # #1223
         if _pick:
             try:
                 _STING_DRAW_MEMO.get("unheard", set()).discard(_pick)   # [#1188] drawn = heard
@@ -81228,7 +82630,7 @@ async def dj_sting(to_box: bool, after: str = "", who: str = "",
         if is_video:
             # Ordinary stings and the endless set share one tube and one
             # cooldown, so neither road can immediately replay the other.
-            sfx_video_note_played(key)
+            sfx_video_note_played(key, sample.parent.name)
         # #905: THE SUCCESS BRANCH, which #903 left out — the row was
         # stamped "airing" before the attempt and nothing ever took it
         # down, so every sting that played kept shouting "going out right
@@ -83366,9 +84768,8 @@ GAP_AIRED = ("box", "stream", "both")
 #
 #   heard      - the window contained at least one line a listener
 #                acknowledged audible, so the timeline is built from
-#                hearing stamps. A hole between two HEARD lines is real
-#                dead air whatever was published inside it. This is the
-#                reading the operator has been asking for.
+#                hearing stamps. A hole between two HEARD lines is speech
+#                absence; board audio inside it is reported separately.
 #   published  - the window contained no hearing stamp AND no listener
 #                was connected across it. There was nobody to
 #                acknowledge anything, so the publication timeline is
@@ -83531,9 +84932,9 @@ def gap_basis(rows: list[dict[str, Any]], lo: float, hi: float) -> str:
     So:
 
       one hearing stamp anywhere in the window -> "heard". A listener's
-      player IS reporting, the road works, and a hole between two lines
-      that were heard is real dead air no matter how much was published
-      inside it. This is the operator's reading.
+      player IS reporting, and a hole between two heard lines is speech
+      absence. Audible board clips inside it are separate evidence, not
+      proof of silence.
 
       no stamp, and no listener connected across the window ->
       "published". There was nobody to acknowledge anything. The
@@ -83675,12 +85076,8 @@ def _gap_marks_between(lo: float, hi: float) -> list[str]:
         return []
 
 
-def _gap_paused_between(lo: float, hi: float) -> float:
-    """#1150: how much of a silence was OFF AIR ON PURPOSE.
-
-    Pause and resume are marked in _GAP_MARKS; the overlap with them is
-    not dead air. In memory rather than off data/pause_log.jsonl,
-    because gap_brief is read on the /api/dj poll."""
+def _gap_pause_intervals(lo: float, hi: float) -> list[tuple[float, float]]:
+    """The portions of this interval deliberately off air."""
     spans: list[tuple[float, float]] = []
     open_at: float | None = None
     try:
@@ -83694,7 +85091,7 @@ def _gap_paused_between(lo: float, hi: float) -> float:
                 spans.append((open_at, at))
                 open_at = None
     except Exception:  # noqa: BLE001
-        return 0.0
+        return []
     if open_at is None:
         # A pause the marks never closed - the station is off air now.
         # Its own try: a fault here may not forget the closed pauses.
@@ -83705,10 +85102,50 @@ def _gap_paused_between(lo: float, hi: float) -> float:
             open_at = None
     if open_at is not None:
         spans.append((open_at, max(hi, open_at)))
-    try:
-        return sum(max(0.0, min(b, hi) - max(a, lo)) for a, b in spans)
-    except Exception:  # noqa: BLE001
+    return [(max(a, lo), min(b, hi)) for a, b in spans
+            if min(b, hi) > max(a, lo)]
+
+
+def _gap_paused_between(lo: float, hi: float) -> float:
+    """#1150: exclude an operator pause from the speech-gap clock."""
+    return sum(b - a for a, b in _gap_pause_intervals(lo, hi))
+
+
+def _gap_union_seconds(spans: list[tuple[float, float]]) -> float:
+    end = total = 0.0
+    for start, stop in sorted(spans):
+        if stop <= start:
+            continue
+        total += max(0.0, stop - max(start, end))
+        end = max(end, stop)
+    return total
+
+
+def _gap_board_intervals(chat: list[dict[str, Any]],
+                         basis: str) -> list[tuple[float, float]]:
+    """Only an audible board receipt can disprove full-channel silence."""
+    if basis != GAP_BASIS_HEARD:
+        return []
+    out = []
+    for row in chat:
+        if not isinstance(row, dict) or row.get("who") != "board":
+            continue
+        start = line_heard_at(row)
+        length = _gap_row_len(row)
+        if start > 0 and length > 0:
+            out.append((start, start + length))
+    return out
+
+
+def _gap_board_seconds(intervals: list[tuple[float, float]], lo: float,
+                       hi: float, paused: list[tuple[float, float]]) -> float:
+    board = [(max(a, lo), min(b, hi)) for a, b in intervals
+             if min(b, hi) > max(a, lo)]
+    if not board:
         return 0.0
+    excluded = [(max(a, p0), min(b, p1)) for a, b in board
+                for p0, p1 in paused if min(b, p1) > max(a, p0)]
+    return max(0.0, _gap_union_seconds(board) - _gap_union_seconds(excluded))
 
 
 def _gap_cause(row: dict[str, Any]) -> str:
@@ -83749,8 +85186,8 @@ def gap_rows(chat: list[dict[str, Any]] | None = None,
     lines, end-of-previous to start-of-next, with what preceded and
     followed it and what the station was doing meanwhile.
 
-    #1150: `seconds` is the DEAD part - the pause the operator asked for
-    is not a hole in the show. `wall_seconds` keeps the measured span
+    #1150: `seconds` is the speech-absent part - the pause the operator
+    asked for is not a hole in the show. `wall_seconds` keeps the measured span
     and `paused_seconds` the overlap with the pause marks, and a silence
     that was wholly a pause is not a row at all.
 
@@ -83760,18 +85197,24 @@ def gap_rows(chat: list[dict[str, Any]] | None = None,
     reader that finds a row without the field is reading a row written
     before this item and should assume "published", which is what every
     row written before this item was."""
-    lines = gap_lines(chat, basis)
+    source = chat if chat is not None else list(_RADIO.get("chat") or [])
+    lines = gap_lines(source, basis)
     _basis = str(lines[0].get("basis") or "") if lines else (
         basis or GAP_BASIS_PUBLISHED)
+    board_intervals = _gap_board_intervals(source, _basis)
     out: list[dict[str, Any]] = []
     prev: dict[str, Any] | None = None
     for cur in lines:
         if prev is not None:
             hole = cur["t"] - prev["end"]
-            paused_s = min(hole, _gap_paused_between(prev["end"], cur["t"]))
+            paused = _gap_pause_intervals(prev["end"], cur["t"])
+            paused_s = min(hole, sum(b - a for a, b in paused))
             dead = max(0.0, hole - paused_s)
             if dead >= least:                       # #1150: pause-honest
                 lo, hi = prev["end"], cur["t"]
+                coverage_known = _basis == GAP_BASIS_HEARD
+                board_s = (min(dead, _gap_board_seconds(
+                    board_intervals, lo, hi, paused)) if coverage_known else None)
                 rnd = _gap_round_at(hi)
                 started_inside = bool(rnd) and lo < float(rnd.get("at") or 0) <= hi
                 if prev["page"] and prev["page"] == cur["page"]:
@@ -83787,6 +85230,14 @@ def gap_rows(chat: list[dict[str, Any]] | None = None,
                     "seconds": round(dead, 1),      # #1150: the hole
                     "wall_seconds": round(hole, 1),  # ...end to end
                     "paused_seconds": round(paused_s, 1),
+                    "speech_absent_s": round(dead, 1),
+                    "board_sfx_s": round(board_s, 1) if board_s is not None else None,
+                    "no_known_audio_s": (round(max(0.0, dead - board_s), 1)
+                                         if board_s is not None else None),
+                    "possible_full_channel_s": (round(max(0.0, dead - board_s), 1)
+                                                if board_s is not None else None),
+                    "full_channel_s": None,
+                    "audio_coverage_basis": (_basis if coverage_known else "unverified"),
                     # 2026-09-15: what these seconds were measured
                     # BETWEEN - two lines a listener said they heard, or
                     # two lines the station merely handed over. Never
@@ -83992,6 +85443,20 @@ def gap_report(hours: float = 3.0,
     span = (lines[-1]["end"] - lines[0]["t"]) if len(lines) > 1 else 0.0
     spoken = sum(float(ln["seconds"]) for ln in lines)
     total = sum(float(r.get("seconds") or 0) for r in rows)
+    covered_rows = [r for r in rows if r.get("board_sfx_s") is not None]
+    audio_coverage = {
+        "speech_absent_s": round(total, 1),
+        "board_sfx_s": round(sum(float(r.get("board_sfx_s") or 0)
+                                 for r in covered_rows), 1),
+        "no_known_audio_s": round(sum(float(r.get("no_known_audio_s") or 0)
+                                      for r in covered_rows), 1),
+        "possible_full_channel_s": round(sum(
+            float(r.get("possible_full_channel_s") or 0) for r in covered_rows), 1),
+        "unclassified_history_s": round(sum(float(r.get("seconds") or 0)
+                                             for r in rows if r.get("board_sfx_s") is None), 1),
+        "full_channel_s": None,
+        "scope": "Voice and board SFX only; historical music and other audio routes are not proven.",
+    }
     secs = sorted(float(r.get("seconds") or 0) for r in rows)
     by_cause: dict[str, dict[str, Any]] = {}
     by_kind: dict[str, dict[str, Any]] = {}
@@ -84073,14 +85538,14 @@ def gap_report(hours: float = 3.0,
     if longest:
         _p = longest.get("prev") or {}
         _n = longest.get("next") or {}
-        say = (f"longest silence {float(longest.get('seconds') or 0):.0f}s at "
+        say = (f"longest speech gap {float(longest.get('seconds') or 0):.0f}s at "
                f"{time.strftime('%H:%M', time.localtime(float(longest.get('at') or 0)))}"
                f" - {longest.get('cause')} - after {_p.get('name') or _p.get('who')}"
                f", before {_n.get('name') or _n.get('who')}"
                + (f" ({(longest.get('round') or {}).get('kind')} round)"
                   if (longest.get("round") or {}).get("kind") else ""))
     elif lines:
-        say = "no silence of ten seconds or more between cast lines"
+        say = "no speech gap of ten seconds or more between cast lines"
     return {
         "at": now, "hours": hours, "since": since,
         "source": "chat ring" + (" + gap_log.jsonl" if older else ""),
@@ -84090,6 +85555,8 @@ def gap_report(hours: float = 3.0,
         "longest_s": round(secs[-1], 1) if secs else 0.0,
         "median_s": round(secs[len(secs) // 2], 1) if secs else 0.0,
         "silence_share": round(total / span, 3) if span > 0 else 0.0,
+        "speech_absence_share": round(total / span, 3) if span > 0 else 0.0,
+        "audio_coverage": audio_coverage,
         "longest": longest,
         "by_cause": [{"cause": k, **v} for k, v in ranked],
         "by_round_kind": by_kind, "by_boundary": by_boundary,
@@ -84202,7 +85669,8 @@ def _ready_round_takes(kind: str, row: Any) -> list[dict[str, Any]]:
                             or clip.get("seconds") or 0)
             if not key or not text or not voice:
                 return _takes_no(kind, "the single take has no key, text or voice")
-            if who not in ("dj", "cohost", "third", "caller", "caller2"):
+            if (who not in ("dj", "cohost", "third", "caller", "caller2")
+                    and not (kind == "station_id" and who == "drop")):
                 return _takes_no(kind, "the single take is on a seat that cannot air")
             if not name or not media_present(name):
                 return _takes_no(kind, "the single take's clip is missing from disk")
@@ -84253,7 +85721,8 @@ def _ready_round_takes(kind: str, row: Any) -> list[dict[str, Any]]:
             # says the station's name is not a defect worth binning a
             # hundred rounds for, and #459 already allows the pair to
             # say it.
-            if (not text.strip() or not voice or who not in ("dj", "cohost", "third", "caller", "caller2")
+            if (not text.strip() or not voice or (who not in ("dj", "cohost", "third", "caller", "caller2")
+                    and not (kind == "station_id" and who == "drop"))
                     # #1218: one cached answer instead of two stats per
                     # take, per row, per sweep. Same verdict - a missing
                     # or empty clip still fails here.
@@ -84269,7 +85738,8 @@ def _ready_round_takes(kind: str, row: Any) -> list[dict[str, Any]]:
                     "a take has no text" if not text.strip() else
                     "a take has no voice" if not voice else
                     "a take is on a seat that cannot air" if who not in
-                    ("dj", "cohost", "third", "caller", "caller2") else
+                    ("dj", "cohost", "third", "caller", "caller2")
+                    and not (kind == "station_id" and who == "drop") else
                     "a take has no clip name" if not name else
                     "a take's clip is missing from disk" if not media_present(name)
                     else "the pantry's text does not match the take"
@@ -84297,6 +85767,8 @@ def _ready_round_takes(kind: str, row: Any) -> list[dict[str, Any]]:
             return out
 
         seats = {"A": "dj", "B": "cohost", "C": "caller", "D": "third", "E": "caller2"}
+        if kind == "station_id" and ready and ready[0]["who"] == "drop":
+            seats["A"] = "drop"
         source = runs((seats.get(marker, ""), spoken_text(text)) for marker, text in
                       _prep_intro_pad(banter_turns(str(entry.get("script") or ""),
                          str(entry.get("caller_name") or ""), str(entry.get("caller2_name") or "")),
@@ -88588,6 +90060,127 @@ SEGMENT_FILL_MOST = 6
 # "multiple stories" and "multiple versions of that thing".
 SEGMENT_FILL_ROADS = ("gallery", "manager", "news", "caller", "banter")
 
+# The writer and recorder run concurrently.  A process global would let one
+# road's scheduled brief leak into another, so the commitment follows the
+# preparation coroutine in the same way as tint/review scope above.
+_SEGMENT_BUILD_CONTEXT: ContextVar[dict[str, Any]] = ContextVar(
+    "segment_build_context", default={})
+
+
+def segment_build_context() -> dict[str, Any]:
+    """The scheduled exchange owned by this preparation coroutine."""
+    try:
+        return copy.deepcopy(_SEGMENT_BUILD_CONTEXT.get() or {})
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _segment_entry(row: Any) -> dict[str, Any]:
+    if not isinstance(row, dict):
+        return {}
+    entry = row.get("entry")
+    return entry if isinstance(entry, dict) else row
+
+
+def segment_subject(row: Any) -> str:
+    """A compact subject carried from one cycle into the next.
+
+    Prefer explicit source metadata over generated prose.  The fallback is
+    the opening of the script, which is still better continuity evidence than
+    drawing an unrelated shelf row merely because it shares a road name.
+    """
+    entry = _segment_entry(row)
+    try:
+        call = entry.get("call") or {}
+        if isinstance(call, dict) and str(call.get("topic") or "").strip():
+            return " ".join(str(call["topic"]).split())[:600]
+        titles = str(entry.get("prep_news_titles") or "").strip()
+        if titles:
+            return " ".join(titles.split())[:600]
+        pictures = [p for p in (entry.get("prep_gallery") or [])
+                    if isinstance(p, dict)]
+        if pictures:
+            named = "; ".join(
+                " ".join(str(p.get("desc") or p.get("name") or "").split())
+                for p in pictures if p.get("desc") or p.get("name"))
+            if named:
+                return named[:600]
+        seed = str(entry.get("seed_text") or "").strip()
+        if seed:
+            return " ".join(seed.split())[:600]
+        script = str(entry.get("script_plain") or entry.get("script")
+                     or entry.get("text") or "")
+        turns = [" ".join(text.split()) for _seat, text in
+                 banter_turns(script, str(entry.get("caller_name") or ""),
+                              str(entry.get("caller2_name") or ""))]
+        return " ".join(turns[:2])[:600]
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def segment_continuation_text(row: Any) -> str:
+    """The recent spoken edge a continuation must answer, bounded for JSON."""
+    entry = _segment_entry(row)
+    try:
+        turns = banter_turns(
+            str(entry.get("script_plain") or entry.get("script") or ""),
+            str(entry.get("caller_name") or ""),
+            str(entry.get("caller2_name") or ""))
+        tail = turns[-4:]
+        return "\n".join(f"{seat}: {' '.join(text.split())}"
+                         for seat, text in tail)[:1800]
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _segment_chain_id(road: str, occurrence: str) -> str:
+    raw = f"{str(road or '')}|{str(occurrence or '')}"
+    return "seg-" + hashlib.sha1(raw.encode("utf-8", "ignore")).hexdigest()[:16]
+
+
+def segment_chain_stamp(row: Any, contract: Any) -> dict[str, Any]:
+    """Persist one schedule chain/cycle identity on a row and its entry."""
+    if not isinstance(row, dict) or not isinstance(contract, dict):
+        return row if isinstance(row, dict) else {}
+    chain_id = str(contract.get("chain_id") or "")
+    if not chain_id:
+        return row
+    order = max(0, int(contract.get("chain_order") or 0))
+    cycle_id = str(contract.get("cycle_id") or f"{chain_id}:{order + 1}")
+    values = {
+        "chain_id": chain_id,
+        "cycle_id": cycle_id,
+        "chain_order": order,
+        "segment_commit_id": str(contract.get("commit_id") or ""),
+        "segment_slot_id": str(contract.get("slot_id") or ""),
+    }
+    prior = str(contract.get("continuation_context") or "")
+    subject = str(contract.get("segment_subject") or "")
+    holders = [row]
+    entry = row.get("entry")
+    if isinstance(entry, dict):
+        holders.append(entry)
+    for holder in holders:
+        # Never move a durable row from one scheduled exchange to another.
+        if holder.get("chain_id") and holder.get("chain_id") != chain_id:
+            continue
+        holder.update(values)
+        if subject:
+            holder["segment_subject"] = subject[:600]
+        if prior:
+            holder["continued_from"] = prior[:1800]
+    own_subject = segment_subject(entry if isinstance(entry, dict) else row)
+    own_tail = segment_continuation_text(
+        entry if isinstance(entry, dict) else row)
+    for holder in holders:
+        if holder.get("chain_id") != chain_id:
+            continue
+        if own_subject:
+            holder["segment_subject"] = own_subject
+        if own_tail:
+            holder["continuation_context"] = own_tail
+    return row
+
 
 def slot_left(road: str) -> float:
     """#1166: seconds left in the entry on air, when the entry belongs to
@@ -88731,14 +90324,109 @@ def segment_budget(kind: str, minutes: float = 0.0,
     # A cycle is the shape; the turn count the writer is given is the
     # cycles rounded back up, so a round always lands on a cycle boundary
     # rather than being cut in the middle of a rebuttal.
+    lines = max(2, cycles * TURNS_PER_CYCLE)
+    # A record-backed link is exactly an intro and an outro.  Pricing its
+    # wall-clock carrier as thirty lines of prose makes every readiness view
+    # report a deficit that no writer should ever attempt to fill.
+    if kind in ("record", "track_talk"):
+        lines = 2
     return {"kind": kind, "seconds": round(want, 1),
+            "planned_seconds": round(want, 1),
             "talk_seconds": round(talk, 1), "share": share,
             "turn_seconds": round(per, 2), "turns": turns,
-            "cycles": cycles, "lines": max(2, cycles * TURNS_PER_CYCLE),
+            "cycles": cycles, "lines": lines, "planned_lines": lines,
             "say": ("%s owns %.0fs, about %.0fs of it talk at %.1fs a turn - "
                     "%d cycle(s), %d turns"
                     % (kind or "the segment", want, talk, per, cycles,
-                       max(2, cycles * TURNS_PER_CYCLE)))}
+                       lines))}
+
+
+def segment_readiness_contract(kind: str, *, seconds: float = 0.0,
+                               minutes: float = 0.0,
+                               prepared_seconds: float = 0.0,
+                               ready_seconds: float = 0.0,
+                               prepared_lines: int = 0,
+                               ready_lines: int = 0,
+                               commit_id: str = "", slot_id: str = "",
+                               chain_order: int = 0,
+                               subject: str = "",
+                               continuation: str = "") -> dict[str, Any]:
+    """One shared duration/readiness contract for every scheduled road."""
+    budget = segment_budget(kind, minutes=minutes, seconds=seconds)
+    planned_seconds = max(0.0, float(budget.get("planned_seconds") or 0))
+    planned_lines = max(0, int(budget.get("planned_lines") or 0))
+    prepared_seconds = min(planned_seconds, max(0.0,
+                                                float(prepared_seconds or 0)))
+    ready_seconds = min(prepared_seconds, max(0.0, float(ready_seconds or 0)))
+    prepared_lines = min(planned_lines, max(0, int(prepared_lines or 0)))
+    ready_lines = min(prepared_lines, max(0, int(ready_lines or 0)))
+    occurrence = str(commit_id or slot_id or f"{kind}:unscheduled")
+    chain_id = _segment_chain_id(kind, occurrence)
+    order = max(0, int(chain_order or 0))
+    return {
+        **budget,
+        "commit_id": str(commit_id or ""),
+        "slot_id": str(slot_id or ""),
+        "chain_id": chain_id,
+        "cycle_id": f"{chain_id}:{order + 1}",
+        "chain_order": order,
+        "segment_subject": str(subject or "")[:600],
+        "continuation_context": str(continuation or "")[:1800],
+        "prepared_seconds": round(prepared_seconds, 1),
+        "ready_seconds": round(ready_seconds, 1),
+        "seconds_deficit": round(max(0.0,
+                                      planned_seconds - prepared_seconds), 1),
+        "recording_seconds_deficit": round(max(
+            0.0, prepared_seconds - ready_seconds), 1),
+        "prepared_lines": prepared_lines,
+        "ready_lines": ready_lines,
+        "line_deficit": max(0, planned_lines - prepared_lines),
+        "recording_line_deficit": max(0, prepared_lines - ready_lines),
+    }
+
+
+def segment_prepare_contract(road: str) -> dict[str, Any]:
+    """Bind the next new row to the nearest deficient scheduled entry."""
+    road = str(road or "")
+    if road not in SEGMENT_FILL_ROADS:
+        return {}
+    try:
+        slots = [s for s in (commitment_inventory_plan().get("slots") or [])
+                 if str(s.get("road") or "") == road]
+        if not slots:
+            return {}
+        due = next((s for s in slots
+                    if float(s.get("short_seconds") or 0) > 1.0), slots[0])
+        stock = list(due.get("stock") or [])
+        prepared_lines = sum(int(item.get("lines") or 0) for item in stock)
+        ready_lines = sum(int(item.get("ready_lines") or 0) for item in stock)
+        last = _segment_entry(stock[-1]) if stock else {}
+        subject = (str(last.get("segment_subject") or "")
+                   or segment_subject(last))
+        continuation = (str(last.get("continuation_context") or "")
+                        or segment_continuation_text(last))
+        contract = segment_readiness_contract(
+            road, seconds=float(due.get("owns_seconds") or 0),
+            prepared_seconds=float(due.get("planned_seconds") or 0),
+            ready_seconds=float(due.get("ready_seconds") or 0),
+            prepared_lines=prepared_lines, ready_lines=ready_lines,
+            commit_id=str(due.get("commit_id") or ""),
+            slot_id=str(due.get("slot_id") or ""),
+            chain_order=len(stock), subject=subject,
+            continuation=continuation)
+        return contract
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def segment_prepare_open(road: str) -> Any:
+    """Install this road's nearest schedule contract on the current task."""
+    return _SEGMENT_BUILD_CONTEXT.set(segment_prepare_contract(road))
+
+
+def segment_prepare_close(token: Any) -> None:
+    if token is not None:
+        _SEGMENT_BUILD_CONTEXT.reset(token)
 
 
 def segment_budget_now(road: str) -> dict[str, Any]:
@@ -90795,7 +92483,7 @@ def call_flow_report(script: Any, caller_name: str = "",
         _novel("the selected Speakerbox source is already assigned "
                "to another call")
     faults.extend(tint_grade.get("faults") or [])
-    return {
+    report = {
         "ok": not faults, "turns": len(turns), "soft_faults": soft,
         "caller_turns": len(caller_at), "host_turns": len(host_at),
         "caller_share": round(share, 3), "first_caller": first_caller,
@@ -90827,6 +92515,10 @@ def call_flow_report(script: Any, caller_name: str = "",
         "story": str(_story.get("id") or ""),                     # #1039
         "plot": _plot_id,                                        # #1157
     }
+    if faults and not content_gate_enabled("call_contract"):
+        content_gate_bypassed("call_contract", faults, script)
+        report.update(ok=True, machine_ok=False, policy_bypassed=True)
+    return report
 
 
 def call_entry_contract(entry: Any) -> bool:
@@ -90838,6 +92530,8 @@ def call_entry_contract(entry: Any) -> bool:
     paused station will replace them with graded calls; their orphaned audio is
     then eligible for ordinary pantry cleanup instead of being aired or kept.
     """
+    if not content_gate_enabled("call_contract"):
+        return True
     try:
         if not isinstance(entry, dict) or not entry.get("caller_name"):
             return False
@@ -96638,7 +98332,7 @@ async def speak_turns(turns: list[tuple[str, str]],
             tint_report=tint_report, ready_takes=ready_takes,
             on_handoff=on_handoff, can_handoff=can_handoff,
             turn_source=turn_source, passage_source=passage_source,
-            turn_dice=turn_dice)
+            turn_dice=turn_dice, round_meta=round_meta)
     _owned = await _floor_take(("a call from " + caller_name)
                                if caller_name else "a booth round")
     try:
@@ -96653,7 +98347,7 @@ async def speak_turns(turns: list[tuple[str, str]],
             tint_report=tint_report, ready_takes=ready_takes,
             on_handoff=on_handoff, can_handoff=can_handoff,
             turn_source=turn_source, passage_source=passage_source,
-            turn_dice=turn_dice)
+            turn_dice=turn_dice, round_meta=round_meta)
     finally:
         _floor_drop(_owned)
 
@@ -96958,7 +98652,10 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                       # [#1386] {turn -> the roll that shaped it}, so
                       # the script editor can show the dice beside the
                       # line they produced.
-                      turn_dice: dict[int, dict[str, Any]] | None = None) -> list[str]:
+                      turn_dice: dict[int, dict[str, Any]] | None = None,
+                      # Fresh rounds carry their immutable scene card here;
+                      # prepared takes carry the same metadata on each take.
+                      round_meta: dict[str, Any] | None = None) -> list[str]:
     """Put an exchange on air, turn by turn, in the two session voices.
 
     Shared by the written exchange and the generated one, so an approved bit
@@ -98312,6 +100009,10 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                         _kind = "sfxguy"
                     if ready_takes is not None and _ti >= 0:
                         _kind = str(ready_meta.get("prep_kind") or "banter")
+                    _pics = (gallery_pending_pick(chunk)
+                             if who in ("dj", "cohost", "third", "caller")
+                             else [])
+                    _analysis_ids = gallery_pending_analysis_ids(_pics)
                     entry = {
                         "id": rid,
                         "ts": int(time.time()), "who": who, "kind": _kind,
@@ -98332,10 +100033,9 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                         # gallery round is up. Attached as the row is
                         # WRITTEN, which is the half gallery_line_mark
                         # cannot reach on the prepared road.
-                        **({"images": _pics}
-                           if who in ("dj", "cohost", "third", "caller")
-                           and (_pics := gallery_pending_pick(chunk))
-                           else {}),
+                        **({"images": _pics} if _pics else {}),
+                        **({"image_analysis_ids": _analysis_ids}
+                           if _analysis_ids else {}),
                         "name": booth_actor_name(
                             who, caller_name if who == caller_seat  # #1164
                             else caller2_name if who == "caller2" else ""),
@@ -99448,11 +101148,23 @@ async def _banter_beats(context: str, sheet: str, lines: int,
             attempts += 1
             try:
                 _raw, candidate, answers = await write(rows, retry=retry)
+            except WritingDeferred:
+                # Admission is not a failed writing attempt. Let the larder
+                # keeper ask again after a lane opens instead of spending the
+                # retry and glue visits against the same full queue and then
+                # banking the emergency two-line fallback as a finished round.
+                raise
             except Exception as exc:  # noqa: BLE001
                 beat_error = "%s: %s" % (
                     type(exc).__name__, str(exc)[:160])
+                if not retry:
+                    continue
                 break
-            if len(candidate) >= len(rows) and answers:
+            # The structural check buys one correction, not an unbounded
+            # veto. After that retry, a complete or partial spoken beat is
+            # more valuable than throwing the whole chain away; the next
+            # pass resumes at the first turn the model did not produce.
+            if candidate and (answers or retry):
                 accepted = candidate[:len(rows)]
                 break
         trace.append({"beat": len(trace) + 1, "from": rows[0]["turn"],
@@ -99464,8 +101176,6 @@ async def _banter_beats(context: str, sheet: str, lines: int,
             break
         made.extend(accepted)
         cursor += len(accepted)
-        if len(accepted) < len(rows):
-            break
         await asyncio.sleep(0)
 
     # One bounded glue visit gets the remainder. It is also the no-empty
@@ -99475,7 +101185,11 @@ async def _banter_beats(context: str, sheet: str, lines: int,
         started = time.monotonic()
         try:
             _raw, candidate, answers = await write(rows, retry=True)
-            accepted = candidate[:len(rows)] if answers else []
+            # This is the one final glue visit. Its output has already been
+            # parsed and re-seated onto the plan, so keep whatever usable
+            # turns it made even when the cheap adjacency check still
+            # dislikes their wording.
+            accepted = candidate[:len(rows)]
             error = ""
         except Exception as exc:  # noqa: BLE001
             accepted = []
@@ -99486,6 +101200,33 @@ async def _banter_beats(context: str, sheet: str, lines: int,
                       "ms": int((time.monotonic() - started) * 1000),
                       **({"error": error} if error else {})})
         made.extend(accepted)
+
+    # A model outage may leave both the ordinary beat and the single glue
+    # visit empty. Silence is not a valid bank row. Keep the exact opening
+    # passage when there is one; otherwise take the round's explicit subject
+    # rather than persona or formatting text from the compact context. A
+    # second line answers one concrete word from it, making the fallback a
+    # conversation and giving the ordinary richness rescue something honest
+    # to extend.
+    if plan and len(made) < min(2, len(plan)):
+        anchor = _verbatim_turn_text(seed_text).strip()
+        if not anchor:
+            match = re.search(
+                r"(?ms)^SUBJECT AND DIRECTION:\s*(.+?)"
+                r"(?:\n[A-Z][A-Z ]{3,}:|\Z)", compact)
+            anchor = spoken_text(match.group(1) if match else "").strip()
+        anchor = " ".join(anchor.split())[:700]
+        if not anchor:
+            anchor = ("There is a concrete point in front of us, and it "
+                      "deserves a direct answer.")
+        if not made:
+            made.append((str(plan[0]["seat"]), anchor))
+        if len(made) == 1 and len(plan) > 1:
+            words = sorted(_beat_content_words(made[-1][1]))
+            subject = words[0] if words else "point"
+            made.append((str(plan[1]["seat"]),
+                         "That %s is exactly what needs a straight answer; "
+                         "stay with it." % subject))
 
     return "\n".join("%s: %s" % row for row in made).strip()
 
@@ -100716,7 +102457,8 @@ async def dj_banter(track: dict[str, Any] | None = None,
             )
         _engine_mode = banter_engine_mode(bank)
         _beat_trace.clear()
-        if _bank_rich and _engine_mode == "beats" and not caller_name:
+        if (_bank_rich and _engine_mode == "beats" and not caller_name
+                and not _system2_job):
             # A beat carries only stable authorship, subject and source
             # context. The giant all-turn request above remains the complete
             # one-call contract, while the bank road gets a short instruction
@@ -100754,6 +102496,10 @@ async def dj_banter(track: dict[str, Any] | None = None,
                 result_contract=("structured_turns" if caller_name
                                  else "spoken"),
             )
+    except WritingDeferred as exc:
+        pipeline_log("lookahead", "the banked beat chain remains owed - "
+                     + str(exc)[:160])
+        return []
     except Exception as exc:
         # #805: this `except` was SILENT, and the ledger showed what
         # silence costs — 52 of 99 calls in 12h aired zero turns, most
@@ -101756,7 +103502,8 @@ async def dj_banter(track: dict[str, Any] | None = None,
                          "brief and was rejected before it could occupy a "
                          "reserve slot")
         return []
-    if caller_name and entry.get("off_brief"):
+    if (caller_name and entry.get("off_brief")
+            and content_gate_enabled("segment_brief")):
         _radio_entry_rejected(entry, "live_call_rejected")
         return []
     try:
@@ -102281,7 +104028,10 @@ async def _banter_air(entry: dict[str, Any],
         _descs = [str((p or {}).get("desc") or "")
                   for p in (entry.get("prep_gallery") or [])]
         if [p for p in _pics if p]:
-            gallery_pending_set([p for p in _pics if p], _descs)
+            gallery_pending_set(
+                [p for p in _pics if p], _descs,
+                [str((p or {}).get("analysis_id") or "")
+                 for p in (entry.get("prep_gallery") or [])])
         else:
             _GALLERY_PENDING.clear()
     except Exception:  # noqa: BLE001
@@ -106054,8 +107804,9 @@ async def ask_model(prompt: str, limit: int = 300,
     )
     if result.get("deferred"):
         pipeline_log("lookahead", str(result.get("reason") or "writer admission deferred"))
-        if "tint" in str((mark or {}).get("kind") or ""):
-            raise WritingDeferred(str(result.get("reason") or "the tint writer is fully admitted"))
+        _mark_kind = str((mark or {}).get("kind") or "")
+        if "tint" in _mark_kind or _mark_kind == "banter beat":
+            raise WritingDeferred(str(result.get("reason") or "the writer is fully admitted"))
         return ""                       # no compute/quality failure is charged
     _retry_responses = _TINT_REPAIR_RESPONSES.get()
     if _is_tint and _retry_responses is not None:
@@ -106825,7 +108576,10 @@ async def generate_answer(
         # the policy file, moved on the dial when it names a road and a
         # direction, and heard by every writing prompt from here.
         feature_meta["directive"] = True
-        said = directive_record(directive_cmd, source="spoken")
+        try:
+            said = directive_record(directive_cmd, source="spoken")
+        except Exception:  # noqa: BLE001
+            said = "I could not save that standing order. Please try again."
         return said, {**feature_meta, "model": "orchestrator"}
     elif manual_cmd:
         # #1026: the pages go to the feed (the panel's strip, beacon and
@@ -110481,6 +112235,41 @@ async def music_artist_read(
             "mind": mind}
 
 
+@app.post("/api/music/track/read")
+async def music_track_read(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Transcribe and analyse one track through the catalogue reader.
+
+    The album sheet needs the narrow operation: sending a single song
+    through the same lyric extraction, digest, mind and audit road as an
+    artist scan, without quietly starting work on the artist's entire
+    catalogue. The existing status endpoint serves both kinds of job.
+    """
+    require_auth(authorization)
+    payload = await request.json()
+    track_id = str(payload.get("id") or "").strip()
+    track = music_track(track_id)
+    if not track:
+        raise HTTPException(status_code=404, detail="No such track")
+    artist = str(track.get("artist") or "Unknown artist")
+    mind = mind_id(str(payload.get("mind") or ""))
+    job_id = "ly_" + uuid.uuid4().hex[:8]
+    with _LYRIC_LOCK:
+        _LYRIC_JOBS[job_id] = {
+            "id": job_id, "artist": artist,
+            "track_id": track_id, "track": track.get("title") or track_id,
+            "stage": "reading", "total": 1, "done": 0,
+            "progress": 0.0, "current": "", "instrumental": 0,
+            "mind": mind, "started": time.time(),
+        }
+    fire_and_forget(_lyric_run(job_id, artist, [track], mind,
+                               bool(payload.get("force"))))
+    return {"job": job_id, "artist": artist, "track": track.get("title"),
+            "tracks": 1, "mind": mind}
+
+
 @app.get("/api/music/artist/read/{job_id}")
 async def music_artist_read_status(
     job_id: str,
@@ -110542,6 +112331,13 @@ def crystals_save(data: dict[str, Any]) -> None:
 
 
 def crystal_active() -> list[dict[str, Any]]:
+    # The operator's tint switch governs the whole pipeline, including the
+    # prompt clause and source redirection, not only the second-pass writer.
+    try:
+        if not bool(dj_settings().get("crystal_tint_pass", True)):
+            return []
+    except Exception:  # noqa: BLE001
+        return []
     return [c for c in crystals_read().values() if c.get("on")]
 
 
@@ -110653,6 +112449,8 @@ def sfx_words() -> int:
 
 def crystal_tint_two_pass() -> bool:
     """#1006: is the tint a second pass rather than a clause?"""
+    if not content_gate_enabled("tint"):
+        return False
     try:
         if not crystal_active():
             return False
@@ -110874,7 +112672,9 @@ def crystal_tint_note(crystal: dict[str, Any] | None = None,
         # a model splitting its attention between imitating a style and
         # writing an advert, which is how the first pass got its
         # reputation.
-        if bool(dj_settings().get("crystal_tint_pass", True)):
+        if not bool(dj_settings().get("crystal_tint_pass", True)):
+            return ""
+        if crystal_tint_two_pass():
             return ""
         c = crystal or (crystal_active() or [None])[0]
         if not c:
@@ -115281,11 +117081,14 @@ async def crystal_tint(script: str, kind: str = "",
     same number of turns, the same beats in the same order. Anything else
     and the two versions are not comparable, and #1016's whole point is
     choosing between them."""
-    orch_used("the crystal", str(kind or "a round")[:40])  # 2026-09-15 (#1191)
     out: dict[str, Any] = {"ok": False, "script": "", "why": "",
                            "armed": "", "prompt": "", "chunks": [],
                            "world": "", "ms": 0, "progress": {},
                            "coverage": {}, "evaluation": {}}
+    if not crystal_tint_two_pass():
+        out["why"] = "the tint switch is off or no crystal is on"
+        return out
+    orch_used("the crystal", str(kind or "a round")[:40])  # 2026-09-15 (#1191)
     _learning_context = _LINE_REVIEW_CONTEXT.get()
     _learning_scope = _LINE_REVIEW_CONTEXT.set({**_learning_context,
         "script_plain": str(_learning_context.get("script_plain") or
@@ -118123,6 +119926,11 @@ async def radio_pause_api(
     want = payload.get("paused")
     if want is None:
         want = not radio_paused()               # a plain toggle
+    # "Back on air" means the banking screen is over too. This is the
+    # only manual pause transition that changes endless mode; pausing an
+    # already-running endless set simply leaves its ownership intact.
+    if not bool(want) and sfx_video_mode_on() and sfx_video_banking_owned():
+        sfx_video_banking_set(False, why="the pause control returned FM to air")
     radio_pause_set(bool(want), why="the pause control (panel/API)")
     return {"paused": radio_paused(),
             "for_seconds": round(radio_paused_for(), 1),
@@ -118150,24 +119958,22 @@ async def radio_unpause_listener_api(
     t: str = "",
     authorization: str | None = Header(default=None),
 ) -> dict[str, Any]:
-    """#1149: an inert station is not a dead end for a guest.
+    """Report a listener's play request without changing operator pause.
 
-    Anyone holding a live tune-in link who arrives at a PAUSED broadcast
-    can set it playing again - the whole resume road (schedule restore,
-    cut_ms stamp, needle drop) runs exactly as if the operator pressed
-    the button. Deliberately one-way: a listener can only ever wake the
-    station, never silence it, and the FM switch stays the operator's.
+    A public tune-in or gallery surface is never an authority to resume the
+    broadcast. The paused workshop continues preparing material on its own;
+    only the authenticated pause control may put that material back on air.
     On the public door this rides the allowlist like shout and vote."""
     require_listen_auth(t, authorization)
     was = radio_paused()
     if was:
-        radio_pause_set(False, why="a tune-in listener pressed play")
-        pipeline_log("air", "unpaused from a tune-in link - a listener "
-                            "pressed play on an idle station")
+        pipeline_log("air", "a tune-in listener requested play while the "
+                            "operator pause remained in force")
     return {"paused": radio_paused(), "was_paused": was,
             "on": bool(_RADIO.get("on")),
-            "say": ("the record is dropping - the booth banked material "
-                    "through the pause, so there is something to say"
+            "banking": bool(was),
+            "say": ("the operator has the station paused; the booth keeps "
+                    "preparing material, but listener play cannot resume it"
                     if was else "the broadcast was already rolling")}
 
 
@@ -119141,11 +120947,14 @@ async def dj_voice_ack_api(
 
 @app.get("/api/dj/flow")
 async def station_flow_api(
-    after: int = 0, before: int = 0, limit: int = 300,
+    after: int = 0, before: int = 0, limit: int = 300, lean: int = 0,
     authorization: str | None = Header(default=None),
 ) -> dict[str, Any]:
     require_read_auth(authorization)
     result = await asyncio.to_thread(_STATION_FLOW.read, after, before, limit)
+    if int(lean or 0):
+        result.pop("nodes", None)
+        result.pop("edges", None)
     monitoring = bool(_RADIO.get("on")) and not radio_paused()
     result["health"] = {
         "on": bool(_RADIO.get("on")), "paused": radio_paused(),
@@ -120297,6 +122106,207 @@ def _booth_picture(row: dict[str, Any], text: str = "") -> dict[str, Any]:
         made = {}
     return {"name": name, "url": "/api/generations/image/" + quote(name),
             "made": made}
+
+
+def _image_analysis_line(row: dict[str, Any], fallback_id: str = "") -> dict[str, Any]:
+    """The bounded dialogue shape used by the image-analysis dossier."""
+    return {
+        "id": str(row.get("id") or fallback_id),
+        "who": str(row.get("who") or ""),
+        "name": str(row.get("name") or booth_actor_name(
+            str(row.get("who") or ""), "")),
+        "text": " ".join(str(row.get("text") or "").split())[:1600],
+        "voice": str(row.get("voice") or ""),
+        "engine": str(row.get("engine") or ""),
+        "seconds": round(float(row.get("seconds") or 0), 1),
+        "recorded": bool(row.get("recorded") or row.get("media")
+                         or row.get("clip_media")),
+        "air_at": float(row.get("air_at") or row.get("ts") or 0),
+    }
+
+
+async def image_analysis_detail(line_id: str, text: str = "",
+                                at: float = 0.0) -> dict[str, Any]:
+    """One vision pass, the picture it saw, and every script it produced.
+
+    A paused station writes gallery rounds into the cupboard, so looking only
+    at the live booth ring makes a completed analysis appear to have produced
+    nothing. The prepared entry retains the exact (bounded) vision response
+    beside its image; prefix equality links that entry without guessing. New
+    entries also carry the analysis id directly. Aired rows use that same id,
+    with a narrow image/time fallback for older ledger rows.
+    """
+    want = str(line_id or "").strip()
+    hint = " ".join(str(text or "").split())[:600]
+    row = _booth_ring_row(want)
+    recovered = ""
+    if not row:
+        row, recovered = _booth_ledger_row(want, hint, float(at or 0))
+    if not row or str(row.get("kind") or "") != "image_analysis":
+        raise HTTPException(status_code=404,
+                            detail="That image analysis is no longer in the booth")
+
+    analysis = " ".join(str(row.get("analysis") or "").split())[:1600]
+    picture = _booth_picture(row, str(row.get("text") or hint))
+    image = str(picture.get("name") or row.get("image") or "")
+    if image:
+        picture["url"] = ("/api/generations/image/%s?t=%s"
+                          % (quote(image), media_sign("gen:" + image)))
+
+    sections: list[dict[str, Any]] = []
+    seen_text: set[tuple[str, str]] = set()
+    prepared_lines = 0
+    recorded_lines = 0
+
+    # The cupboard is the normal destination while paused. Its copy of the
+    # description is capped at 600 chars, hence _analysis_text_match rather
+    # than literal equality against the 1,600-char dossier copy.
+    for candidate in list(shelf_rows("gallery")):
+        entry = (candidate or {}).get("entry") or {}
+        if not isinstance(entry, dict):
+            continue
+        matched = False
+        link = ""
+        for art in (entry.get("prep_gallery") or []):
+            if not isinstance(art, dict) or str(art.get("name") or "") != image:
+                continue
+            if str(art.get("analysis_id") or "") == want:
+                matched, link = True, "analysis id"
+                break
+            if _analysis_text_match(art.get("desc"), analysis):
+                matched, link = True, "stored vision response"
+                break
+        if not matched:
+            continue
+        try:
+            sid = alt_sid_of("gallery", candidate)
+            transcript = await shelf_transcript("gallery", sid)
+        except Exception:  # noqa: BLE001
+            continue
+        raw_lines = list(transcript.get("cast") or transcript.get("lines") or [])
+        lines = []
+        for index, source in enumerate(raw_lines):
+            line = _image_analysis_line(
+                dict(source), f"prepared:{sid}:{index}")
+            key = (line["who"], line["text"])
+            if not line["text"] or key in seen_text:
+                continue
+            seen_text.add(key)
+            lines.append(line)
+            recorded_lines += int(bool(line["recorded"]))
+        if lines:
+            prepared_lines += len(lines)
+            sections.append({
+                "id": sid, "kind": "gallery", "state": "prepared",
+                "title": "Prepared gallery segment",
+                "connection": link,
+                "at": float(transcript.get("at") or candidate.get("at") or 0),
+                "recorded": sum(1 for line in lines if line["recorded"]),
+                "lines": lines,
+            })
+
+    # Exact ids are used whenever the line was made after this change. Older
+    # rows still carry the image itself; select the nearest following script
+    # and keep to its segment id, rather than sweeping in every later reuse.
+    all_rows: list[dict[str, Any]] = []
+    try:
+        all_rows.extend(dict(r) for r in (_RADIO.get("chat") or []))
+        with _AIRLOG_LOCK:
+            all_rows.extend(dict(r) for r in _AIRLOG_INDEX.values())
+    except Exception:  # noqa: BLE001
+        pass
+    by_id: dict[str, dict[str, Any]] = {}
+    for source in all_rows:
+        rid = str(source.get("id") or "")
+        if rid and rid != want:
+            by_id[rid] = source
+    attached = [r for r in by_id.values()
+                if image and image in [str(n) for n in (r.get("images") or [])]]
+    exact = [r for r in attached
+             if want in [str(n) for n in (r.get("image_analysis_ids") or [])]]
+    chosen = exact
+    inferred = False
+    if not chosen and attached:
+        began = float(row.get("ts") or row.get("air_at") or 0)
+        after = sorted(
+            [r for r in attached
+             if float(r.get("ts") or r.get("air_at") or 0) >= began - 5
+             and float(r.get("ts") or r.get("air_at") or 0) <= began + 14400],
+            key=lambda r: float(r.get("ts") or r.get("air_at") or 0))
+        if after:
+            sid = str(after[0].get("sid") or "")
+            chosen = ([r for r in after if str(r.get("sid") or "") == sid]
+                      if sid else [r for r in after
+                                   if abs(float(r.get("ts") or 0)
+                                          - float(after[0].get("ts") or 0)) <= 900])
+            inferred = True
+    aired_lines = []
+    for index, source in enumerate(sorted(
+            chosen, key=lambda r: float(r.get("air_at") or r.get("ts") or 0))):
+        line = _image_analysis_line(source, f"aired:{index}")
+        key = (line["who"], line["text"])
+        if not line["text"] or key in seen_text:
+            continue
+        seen_text.add(key)
+        aired_lines.append(line)
+        recorded_lines += int(bool(line["recorded"]))
+    if aired_lines:
+        sections.insert(0, {
+            "id": str(chosen[0].get("sid") or ""),
+            "kind": "gallery", "state": "aired",
+            "title": "Dialogue sent to the broadcast",
+            "connection": ("analysis id" if exact else
+                           "image-bound legacy segment"),
+            "inferred": inferred,
+            "at": float(aired_lines[0].get("air_at") or 0),
+            "recorded": sum(1 for line in aired_lines if line["recorded"]),
+            "lines": aired_lines,
+        })
+
+    count = sum(len(section["lines"]) for section in sections)
+    if count:
+        status = (f"{count} dialogue line(s) are linked to this analysis; "
+                  f"{prepared_lines} remain prepared in the cupboard.")
+    else:
+        status = ("The image interpretation is complete. Dialogue has not "
+                  "been banked from it yet, or its older provenance record "
+                  "does not name this analysis.")
+    trail = [
+        {"label": "Image selected", "state": "complete",
+         "detail": image or "image identity unavailable"},
+        {"label": "Vision interpretation", "state": "complete",
+         "detail": (str(row.get("model") or "vision model")
+                    + (f" in {int(row.get('ms') or 0)} ms"
+                       if row.get("ms") else ""))},
+        {"label": "Dialogue written", "state": "complete" if count else "waiting",
+         "detail": f"{count} linked line(s) across {len(sections)} segment(s)"},
+        {"label": "Voice and broadcast", "state": (
+            "complete" if count and recorded_lines >= count else
+            "working" if recorded_lines else "waiting"),
+         "detail": f"{recorded_lines} of {count} line(s) have recorded media"},
+    ]
+    return {
+        "ok": True, "id": want, "image": picture,
+        "analysis": analysis, "prompt": str(row.get("prompt") or "")[:4000],
+        "model": str(row.get("model") or ""), "ms": int(row.get("ms") or 0),
+        "at": float(row.get("air_at") or row.get("ts") or 0),
+        "status": status, "dialogue_count": count,
+        "prepared_count": prepared_lines, "recorded_count": recorded_lines,
+        "sections": sections, "trail": trail,
+        "from_ledger": bool(recovered), "recovered_by": recovered,
+    }
+
+
+@app.get("/api/dj/image-analysis/{line_id}")
+async def image_analysis_detail_api(
+    line_id: str,
+    text: str = "",
+    at: float = 0.0,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """The complete image-to-interpretation-to-dialogue chain."""
+    require_read_auth(authorization)
+    return await image_analysis_detail(line_id, text, at)
 
 
 @app.get("/api/dj/provenance/{line_id}")
@@ -122277,7 +124287,12 @@ async def slideshow_state_api(limit: int = 24) -> dict[str, Any]:
     out["playlist"] = total
     out["newest_at"] = newest
     out["newest_age"] = max(0.0, time.time() - newest) if newest else None
-    out["rows"] = rows[:want]
+    shown = rows[:want]
+    for row in shown:
+        name = str(row.get("file") or "")
+        row["url"] = ("/api/generations/image/%s?t=%s&w=160"
+                      % (quote(name), media_sign("gen:" + name)))
+    out["rows"] = shown
     # Everything in /comfy-output is served by /api/generations/image/{name},
     # which the terminal already uses for the wall - so the lock screen has
     # a URL for every row without this route inventing one.
@@ -123720,7 +125735,7 @@ def phrase_ban_key() -> str:
 def phrase_ban_hit(text: Any, kind: str = "") -> str:
     """The first banned phrase this text carries, or "". A scoped ban is
     only in force on its own road; everywhere is everywhere."""
-    if not text:
+    if not content_gate_enabled("phrase_ban") or not text:
         return ""
     for row in phrase_ban_rows():
         scope = str(row.get("scope") or "everywhere")
@@ -123735,6 +125750,8 @@ def phrase_ban_strip(text: Any, kind: str = "") -> tuple[str, int]:
     """Every sentence carrying a banned phrase, gone. Used at the mouth and
     on the tint's way out."""
     out = str(text or "")
+    if not content_gate_enabled("phrase_ban"):
+        return out, 0
     cut = 0
     for row in phrase_ban_rows():
         scope = str(row.get("scope") or "everywhere")
@@ -123757,6 +125774,8 @@ def phrase_ban_row_blocked(kind: str, row: Any) -> bool:
     panel's poll re-reads paperwork instead of re-scanning 40 kB per row.
     With no phrase banned - the normal state - this costs one memoised
     dict lookup."""
+    if not content_gate_enabled("phrase_ban"):
+        return False
     try:
         key = phrase_ban_key()
         if not key or not isinstance(row, dict):
@@ -123781,6 +125800,8 @@ def phrase_ban_tint_guard(out: dict[str, Any], kind: str = "") -> None:
     pass's own output is therefore held to the ban: the sentence goes, and a
     rewrite that is nothing but the banned sentence is refused outright so
     the plain version airs instead."""
+    if not content_gate_enabled("phrase_ban"):
+        return
     try:
         text = str(out.get("script") or "")
         if not text:
@@ -124044,6 +126065,9 @@ def phrase_ban_sweep(phrase: str, carriers: list[dict[str, Any]]) -> dict[str, A
     """LOOP. Retire the rounds phrase_ban_scan found, then burn the gold
     bars. Without this the ban only covers what has not been written yet,
     and a fortnight of prepared radio still says it."""
+    if not content_gate_enabled("phrase_ban"):
+        return {"disabled": True, "rounds": 0, "found": 0,
+                "bars": 0, "retired": []}
     gone: list[dict[str, Any]] = []
     why = "phrase banned: \u201c%s\u201d" % phrase
     for got in carriers or []:
@@ -124812,6 +126836,48 @@ def admin_options_for_line(row: dict[str, Any], prov: dict[str, Any]) -> list[di
         v = dj.get(k)
         if isinstance(v, (int, float, bool, str)) and len(str(v)) <= 60:
             put(k, _pretty_key(k), v, "a desk dial", None, "governs the station; not traceable on one line")
+    # The inspector is not merely a receipt. Point each row at the store it
+    # can truthfully edit, and name why a historical fact cannot be changed.
+    # `editor_value` is deliberately separate from the compact table value:
+    # a summary with an ellipsis must never be written back over the store.
+    persona_scope = {"persona": "dj", "cohost_persona": "cohost",
+                     "third_persona": "third"}
+    station_value = str((dj.get("radio_prompt_overrides") or {})
+                        .get("station_system") or "")
+    historical = {
+        "model": "this is the model that wrote this call; choose the model on the writing-room desk for future calls",
+        "temp": "this is the temperature recorded on this completed call",
+        "budget": "this is the reply budget recorded on this completed call",
+        "num_ctx": "this is the context window recorded on this completed call",
+        "speakbox_quoted": "this is the passage that reached this completed prompt; edit its source document on the Speakbox desk",
+        "crystal": "this is the crystal that reached this completed prompt; crystals are switched and weighted on the Crystal desk",
+        "mind_adjustments": "this is one recorded mind note; the Mind desk owns the ordered note book",
+    }
+    for option in out:
+        key = str(option.get("key") or "")
+        edit: dict[str, Any]
+        if key in persona_scope:
+            edit = {"scope": "persona", "key": persona_scope[key],
+                    "value": str(dj.get(key) or ""),
+                    "label": str(option.get("label") or key),
+                    "how": "saved to this seat's standing character for future rounds",
+                    "applies": ["future", "round"]}
+        elif key == "system_prompt":
+            edit = {"scope": "station", "key": "", "value": station_value,
+                    "label": "the station's disposition",
+                    "how": "saved to the standing station instruction",
+                    "applies": ["future", "round"]}
+        elif key in dj and isinstance(dj.get(key), (str, int, float, bool)):
+            edit = {"scope": "dj_option", "key": key,
+                    "value": str(dj.get(key)),
+                    "label": str(option.get("label") or key),
+                    "how": "saved to the station's canonical DJ settings",
+                    "applies": ["future"]}
+        else:
+            edit = {"scope": "", "key": key, "value": str(option.get("value") or ""),
+                    "why": historical.get(
+                        key, "this row is evidence from a completed line, not a writable setting")}
+        option["edit"] = edit
     return out[:120]
 
 
@@ -126428,7 +128494,7 @@ async def line_liked_api(
 # every refusal here is a sentence for the strip under the box. The parsing
 # and the merges are in paperwork_fields.py, tested without the station.
 PAPERWORK_SCOPES = ("topic", "mood", "station", "persona", "prompt", "theme",
-                    "guest", "turn", "script", "passage")
+                    "guest", "turn", "script", "passage", "dj_option")
 PAPERWORK_SEAT_KEY = {"dj": "persona", "cohost": "cohost_persona",
                       "third": "third_persona"}
 PAPERWORK_SEAT_SAY = {"dj": "host", "cohost": "co-host", "third": "third seat"}
@@ -126591,6 +128657,38 @@ def paperwork_field_apply(scope: str, key: str, value: str, was: str,
                                  "ones that can are %s"
                             % (scope[:24], ", ".join(PAPERWORK_SCOPES)))
     now = time.time()
+    if scope == "dj_option":
+        settings = load_settings()
+        dj = settings.setdefault("dj", {})
+        if key not in dj or not isinstance(dj.get(key), (str, int, float, bool)):
+            raise HTTPException(409, "this option is not a scalar setting on the DJ desk")
+        probe = key.lower()
+        if any(mark in probe for mark in ("token", "password", "secret", "key")):
+            raise HTTPException(403, "credentials are never edited from a line's paperwork")
+        old = dj.get(key)
+        try:
+            if isinstance(old, bool):
+                word = value.strip().lower()
+                if word not in ("true", "false", "on", "off", "1", "0", "yes", "no"):
+                    raise ValueError("use true or false")
+                fresh: Any = word in ("true", "on", "1", "yes")
+            elif isinstance(old, int) and not isinstance(old, bool):
+                fresh = int(value.strip())
+            elif isinstance(old, float):
+                fresh = float(value.strip())
+                if not math.isfinite(fresh):
+                    raise ValueError("use a finite number")
+            else:
+                fresh = value[:6000]
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(400, "%s needs the same kind of value it has now: %s"
+                                % (key, exc)) from exc
+        dj[key] = fresh
+        save_settings(settings)
+        note_action("the %s DJ option changed in the line inspector (#1231)" % key)
+        return {"ok": True, "scope": scope, "key": key, "changed": fresh != old,
+                "value": fresh, "label": _pretty_key(key),
+                "say": "saved - %s is now %s for future rounds" % (key, fresh)}
     if scope == "topic":
         with _BOMBSHELL_LOCK:
             rows = read_bombshells()
@@ -128224,6 +130322,122 @@ async def _replay_media_for(row: dict[str, Any]) -> tuple[str, str, float]:
     return made, media_sign(made), round(span, 2)
 
 
+async def _line_action_voice(line_id: str, authorization: str | None) -> tuple[dict[str, Any], Path]:
+    row = await asyncio.to_thread(_booth_row, line_id)
+    if not row or str(row.get("who") or "").lower() not in {"dj", "host", "cohost", "third"}:
+        raise HTTPException(status_code=404, detail="no presenter line with that id")
+    if not (row.get("media") or row.get("clip_media")):
+        raise HTTPException(status_code=409, detail="that line has no saved voice clip")
+    clip = await booth_clip_api(line=line_id, authorization=authorization)
+    if not isinstance(clip, FileResponse) or clip.headers.get("x-pine-exact") != "1":
+        raise HTTPException(status_code=409, detail="an exact voice clip is not available")
+    path = Path(clip.path)
+    if not path.is_file() or path.stat().st_size == 0:
+        raise HTTPException(status_code=409, detail="the voice clip is missing or empty")
+    return row, path
+
+
+def _line_sfx_ad_write(voice: Path, sfx: Path, name: str) -> str | None:
+    if not AD_AUDIO_SHAPE.fullmatch(name) or not voice.is_file() or not sfx.is_file():
+        return None
+    target = PRODUCED_ADS_DIR / name
+    try:
+        import imageio_ffmpeg
+        import subprocess
+
+        PRODUCED_ADS_DIR.mkdir(parents=True, exist_ok=True)
+        result = subprocess.run(
+            [imageio_ffmpeg.get_ffmpeg_exe(), "-nostdin", "-hide_banner",
+             "-loglevel", "error", "-y", "-i", str(voice), "-i", str(sfx),
+             "-filter_complex",
+             "[0:a]aresample=44100,adelay=600|600[voice];"
+             "[1:a]aresample=44100,atrim=0:2.2,volume=0.26[sfx];"
+             "[voice][sfx]amix=inputs=2:duration=first:dropout_transition=0,"
+             "alimiter=limit=0.92[mix]",
+             "-map", "[mix]", "-ac", "2", "-ar", "44100",
+             "-codec:a", "libmp3lame", "-b:a", "128k", str(target)],
+            capture_output=True, timeout=120)
+        if result.returncode == 0 and target.is_file() and target.stat().st_size > 1000:
+            return name
+    except Exception:  # noqa: BLE001
+        pass
+    target.unlink(missing_ok=True)
+    return None
+
+
+def line_ad_schedule(entry: dict[str, Any], spoken: str, made: str,
+                     line_id: str, seconds: float) -> bool:
+    """Put a finished spoken ad on the existing ad-break shelf."""
+    shelf_put("ad", {
+        "produced": entry["id"], "product": entry["product"],
+        "text": spoken, "audio": made, "source_line_id": line_id,
+        "seconds": seconds, "auto_air": True,
+    })
+    return any(str(row.get("produced") or "") == str(entry["id"])
+               for row in shelf_rows("ad"))
+
+
+@app.post("/api/line-actions/dry-voice")
+async def line_action_dry_voice(
+    request: Request, authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_auth(authorization)
+    payload = await request.json()
+    line_id = str(payload.get("line_id") or "").strip() if isinstance(payload, dict) else ""
+    if not line_id:
+        raise HTTPException(status_code=400, detail="line_id is required")
+    await _line_action_voice(line_id, authorization)
+    return {"ok": True, "exact": True, "voice_only": True,
+            "route": "/api/booth/clip?line=" + quote(line_id, safe=""),
+            "line_id": line_id, "auto_air": False}
+
+
+@app.post("/api/line-actions/make-ad")
+async def line_action_make_ad(
+    request: Request, authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_auth(authorization)
+    payload = await request.json()
+    if not isinstance(payload, dict) or payload.get("music") is not False \
+            or payload.get("sfx") != "random":
+        raise HTTPException(status_code=400, detail="music=false and sfx=random are required")
+    line_id = str(payload.get("line_id") or "").strip()
+    if not line_id:
+        raise HTTPException(status_code=400, detail="line_id is required")
+    row, voice = await _line_action_voice(line_id, authorization)
+    spoken = str(row.get("text") or "").strip()
+    if not spoken:
+        raise HTTPException(status_code=409, detail="the source line has no transcript")
+    sfx = await asyncio.to_thread(sfx_db_pick, False)
+    if not sfx or not sfx.is_file():
+        raise HTTPException(status_code=503, detail="no playable SFX is available")
+    sfx_id = hashlib.sha1(str(sfx).encode("utf-8")).hexdigest()[:16]
+    name = uuid.uuid4().hex[:12] + ".mp3"
+    made = await asyncio.to_thread(_line_sfx_ad_write, voice, sfx, name)
+    if not made:
+        raise HTTPException(status_code=503, detail="the ad mix could not be rendered")
+    try:
+        entry = await asyncio.to_thread(
+            ad_save, spoken[:80], spoken, "produced", {
+                "audio": made, "voice": str(row.get("voice") or ""),
+                "bed": "", "music": False, "source_line_id": line_id,
+                "source_text": spoken, "source_voice": str(row.get("voice") or ""),
+                "source_exact": True, "sfx_id": sfx_id,
+                "sfx_source": str(sfx), "auto_air": True})
+    except Exception:  # noqa: BLE001
+        (PRODUCED_ADS_DIR / made).unlink(missing_ok=True)
+        raise
+    scheduled = await asyncio.to_thread(
+        line_ad_schedule, entry, spoken, made, line_id,
+        float(row.get("seconds") or 0.0))
+    if not scheduled:
+        raise HTTPException(status_code=503, detail=(
+            "The ad was saved but the broadcast shelf could not schedule it"))
+    return {"ok": True, "ad_id": entry["id"], "sfx_id": sfx_id,
+            "music": False, "auto_air": True, "scheduled": True,
+            "say": "Ad scheduled for the next available break."}
+
+
 async def script_line_replay(line_id: str, block: int = 0) -> dict[str, Any]:
     """[#1194] Say one line again, on the broadcast. See the note above."""
     line_id = str(line_id or "").strip()
@@ -128369,6 +130583,7 @@ async def hour_contract_api(
 
 @app.get("/api/playout")                                  # [#1218]
 async def playout_api(limit: int = Query(default=12, ge=1, le=120),
+                      lean: bool = False,
                       authorization: str | None = Header(default=None)) -> Any:
     """THE SEQUENCE, AND WHO TRIED TO GET IN FRONT OF IT (#1218, #1246).
 
@@ -128383,6 +130598,22 @@ async def playout_api(limit: int = Query(default=12, ge=1, le=120),
     are `would_queue`, which is the census to read before enforcing."""
     require_read_auth(authorization)
     payload = playout_state(limit)
+    if lean:
+        # The Script view asks this on the cadence of a spoken highlight.
+        # The full controller state is an audit document (roughly 100 kB on
+        # a busy station); shipping it every tick both delays the answer and
+        # creates the lag this endpoint is meant to diagnose.
+        return {
+            "schema_version": payload.get("schema_version"),
+            "available": payload.get("available"),
+            "mode": payload.get("mode"),
+            "linear": payload.get("linear"),
+            "verdict": payload.get("verdict"),
+            "sounding": payload.get("sounding"),
+            "current": payload.get("current"),
+            "next": payload.get("next"),
+            "now": payload.get("now", time.time()),
+        }
     payload["mode_file"] = str(PLAYOUT_MODE_FILE)
     payload["how_to_enforce"] = (
         "write ONE word into the mode file: 'off' (the default - the "
@@ -131324,6 +133555,8 @@ _SPARK_ASSETS = {
     # and the tablet have had all along.
     "sfx-tv.js": "application/javascript; charset=utf-8",
     "sfx-tv.css": "text/css; charset=utf-8",
+    "wall-transition.js": "application/javascript; charset=utf-8",
+    "pinebox.png": "image/png",
 }
 
 
@@ -131334,7 +133567,8 @@ async def spark_asset(name: str) -> Response:
     kind = _SPARK_ASSETS.get(name)
     if kind is None:
         raise HTTPException(status_code=404, detail="No such asset")
-    path = _SPARK_ASSET_DIR / name
+    path = (_SPARK_ASSET_DIR.parent / "assets" / "pinebox-256.png"
+            if name == "pinebox.png" else _SPARK_ASSET_DIR / name)
     try:
         body = await asyncio.to_thread(path.read_bytes)
     except OSError:
@@ -135114,6 +137348,24 @@ async def api_line_review_get(
         "note": "This is the known workflow, not a claim that this cut reached every stage.",
         "flow_url": "/api/dj/flow", "logic_url": "/api/orchestrator/logic"}
     row["preference"] = line_review_preferences(str(row.get("context", {}).get("kind") or ""), str(row.get("gate") or ""))
+    entry = row.get("context", {}).get("entry")
+    stored = (entry.get("profile") if isinstance(entry, dict) else None)
+    if stored:
+        current = _larder_profile_signature()
+        try:
+            old_fields = json.loads(stored)
+            now_fields = json.loads(current)
+            ignored = ("turns", "plot")
+            compared = sorted((set(old_fields) | set(now_fields)) - set(ignored))
+            differences = [key for key in compared if old_fields.get(key) != now_fields.get(key)]
+        except (TypeError, ValueError, AttributeError):
+            old_fields, now_fields, ignored, compared, differences = stored, current, (), [], []
+        row["profile_check"] = {
+            "compatible": profile_compatible(stored, current),
+            "stored": old_fields, "current": now_fields,
+            "ignored_fields": list(ignored), "compared_fields": compared,
+            "differences": differences,
+            "impact": "Writing-profile compatibility; clip existence and audio readiness are checked separately."}
     return row
 
 
@@ -135135,6 +137387,68 @@ async def api_line_review_approve_current(
         {"batch_id": result["batch_id"], "approved": result["approved"],
          "skipped": result["skipped"], "scope": "instance"})
     return result
+
+
+@app.post("/api/orchestrator/rejections/{review_id}/note")
+async def api_line_review_note(
+    review_id: str, request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Retain guidance on a cut without changing its review decision."""
+    require_auth(authorization)
+    try:
+        body = await request.json()
+        if not isinstance(body, dict) or set(body) - {"note", "expected_revision", "expected_event_seq"}:
+            raise ValueError("supply note and optional expected_revision/expected_event_seq")
+        result = await asyncio.to_thread(
+            _LINE_REVIEW.annotate, review_id, body.get("note"),
+            body.get("expected_revision"), body.get("expected_event_seq"))
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="rejected line not found") from exc
+    except ReviewConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    station_flow_event("repair", "operator", "Operator noted a rejected line",
+                       {"review_id": review_id, "note": result["note"]["note"][:240]},
+                       trace_id=review_id)
+    return {"ok": True, "say": "Note saved; the review is still open.", **result}
+
+
+@app.post("/api/orchestrator/rejections/{review_id}/reply")
+async def api_line_review_reply(
+    review_id: str, request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Keep the operator's reply on the review and direct the next script."""
+    require_auth(authorization)
+    try:
+        body = await request.json()
+        if not isinstance(body, dict) or set(body) - {"note", "expected_revision", "expected_event_seq"}:
+            raise ValueError("supply note and optional expected_revision/expected_event_seq")
+        record = await asyncio.to_thread(_LINE_REVIEW.get, review_id)
+        if record is None:
+            raise KeyError("No such line review")
+        kind = str((record.get("context") or {}).get("kind") or "").strip()
+        if not kind:
+            raise ValueError("this review has no segment kind to direct")
+        result = await asyncio.to_thread(
+            _LINE_REVIEW.annotate, review_id, body.get("note"),
+            body.get("expected_revision"), body.get("expected_event_seq"))
+        direction = await asyncio.to_thread(
+            director_add, kind, result["note"]["note"], "next", who="operator")
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="rejected line not found") from exc
+    except ReviewConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    station_flow_event("repair", "operator", "Operator directed the next script from a review",
+                       {"review_id": review_id, "kind": kind,
+                        "note_id": direction["id"], "note": direction["text"][:240]},
+                       trace_id=review_id)
+    return {"ok": True, "say": f"Reply saved; the next {kind} script will use it.",
+            "review": result["row"], "direction": direction}
 
 
 @app.post("/api/orchestrator/rejections/{review_id}")
@@ -135646,8 +137960,9 @@ async def orch_command_run(text: str) -> dict[str, Any]:       # [#1211]
             ok = False
             say = "the station is not on air, so nothing can be put out"
         else:
-            said = await _ready_shelf_air(kind, _RADIO.get("now"),
-                                          rescue=True, pick=row)
+            said = await _ready_shelf_air(
+                kind, _RADIO.get("now"), rescue=True, pick=row,
+                force=talk_quiet_for() >= SILENCE_LOSES_AFTER)
             ok = bool(said)
             say = (("%d line(s) of that %s round went out" % (len(said), kind))
                    if said else
@@ -135986,9 +138301,13 @@ async def api_orch_note_write(
             status_code=400,
             detail="unknown road %r - leave it out for an order about the "
                    "whole show" % road)
-    said = directive_record({"text": text, "road": road,
-                             "move": str(payload.get("move") or "")},
-                            source=str(payload.get("source") or "typed"))
+    try:
+        said = directive_record({"text": text, "road": road,
+                                 "move": str(payload.get("move") or "")},
+                                source=str(payload.get("source") or "typed"))
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=503,
+                            detail="standing order could not be saved") from exc
     return {"ok": True, "said": said, "road": road,
             "standing": directive_notes(road=(road or None), limit=6),
             "say": "written into the policy book; the next round of that "
@@ -136323,6 +138642,236 @@ def _director_aired(start: float, deadline: float) -> list[dict[str, Any]]:
     return rows
 
 
+def _director_topic_from_prompt(prompt: str) -> str:
+    """The active subject embedded in a scheduled writing brief."""
+    text = str(prompt or "")
+    patterns = (
+        r"THE TOPIC, DROPPED INTO THIS ROUND[^:]*:\s*[\"']([^\"']+)",
+        r"THE SUBJECT(?: OF THIS CALL)?[^:]*:\s*([^\n]+)",
+        r"THE PHONE'S SUBJECT[^:]*:\s*([^\n]+)",
+        r"ANSWER THIS[^\n]*\n\s*[\"']([^\"']+)",
+    )
+    for pattern in patterns:
+        found = re.search(pattern, text, re.I)
+        if found:
+            return topic_subject(found.group(1))[:600]
+    return ""
+
+
+def dialogue_topic_review(script: str, prompt: str) -> dict[str, Any]:
+    """Continuity review shared by the calendar and System2 admission."""
+    subject = _director_topic_from_prompt(prompt)
+    review = dialogue_topic_adherence(banter_turns(str(script or "")), subject)
+    review["topic"] = subject
+    return review
+
+
+def _director_source_evidence(candidate: dict[str, Any]) -> dict[str, Any]:
+    source = candidate.get("source") if isinstance(candidate, dict) else {}
+    if not isinstance(source, dict):
+        source = {"name": str(source or "")}
+    keep = ("prep_name", "caller_name", "source", "topic", "topic_id",
+            "premise", "angle", "system2_trace_id", "system2_trace_ids",
+            "system2_job", "system2_slot", "brief", "model")
+    out = {}
+    for key in keep:
+        value = source.get(key, candidate.get(key))
+        if value in (None, "", [], {}):
+            continue
+        if isinstance(value, str):
+            value = value[:1200]
+        out[key] = value
+    return out
+
+
+def _director_sfx_plan(turn_count: int) -> list[dict[str, Any]]:
+    """Visible assembly cues for the SFX seat; exact clips remain a live draw."""
+    if turn_count < 2:
+        return []
+    try:
+        settings = dj_settings()
+        every = max(1, int(settings.get("sfx_every_units") or 3))
+        guy_every = max(1, int(settings.get("sfxguy_every_units") or 5))
+    except Exception:                              # noqa: BLE001
+        every, guy_every = 3, 5
+    cues = []
+    for after in range(every - 1, turn_count, every):
+        cues.append({"after": after, "seat": "board", "who": "The SFX Guy",
+                     "kind": "sfx", "text": "A stinger is scheduled here; the board chooses the clip at assembly."})
+    if turn_count >= guy_every:
+        cues.append({"after": min(turn_count - 1, guy_every - 1), "seat": "drop",
+                     "who": "The SFX Guy", "kind": "sfxguy",
+                     "text": "The SFX Guy has a voiced drop scheduled at this beat."})
+    return cues[:6]
+
+
+DIRECTOR_LINE_SECONDS = 14.0
+DIRECTOR_EVENT_SECONDS = 10.0
+DIRECTOR_RECORD_BOOKEND_LINES = 2
+
+
+def _director_script_lines(script: dict[str, Any]) -> list[dict[str, Any]]:
+    """The spoken lines the operator can review before the segment airs."""
+    try:
+        bound = list((script or {}).get("turns") or [])
+        if bound:
+            return [dict(row) for row in bound if str((row or {}).get("text") or "").strip()]
+        draft = list((script or {}).get("draft_turns") or [])
+        return [dict(row) for row in draft if str((row or {}).get("text") or "").strip()]
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def _director_script_seconds(script: dict[str, Any],
+                             turns: list[dict[str, Any]] | None = None) -> float:
+    """Measured seconds if the candidate is bound, otherwise a speech estimate.
+
+    The estimate is only a planning warning. It never proves a recording is
+    ready and it never substitutes for the cue sheet that air actually uses.
+    """
+    try:
+        measured = float((script or {}).get("seconds") or 0)
+        if measured > 0:
+            return measured
+    except Exception:  # noqa: BLE001
+        pass
+    words = 0
+    try:
+        for row in (turns if turns is not None else _director_script_lines(script)):
+            words += len(re.findall(r"\w+", str((row or {}).get("text") or "")))
+    except Exception:  # noqa: BLE001
+        words = 0
+    # Broadcast speech on this station normally lands around 145-175 wpm.
+    # Use the slower end so warnings appear before a short script reaches air.
+    return round(words / 2.4, 1) if words else 0.0
+
+
+def director_orchestration(kind: str, label: str, owns_seconds: float,
+                           script: dict[str, Any] | None = None,
+                           *, state: str = "",
+                           review: dict[str, Any] | None = None) -> dict[str, Any]:
+    """One segment's line/event/runtime contract for the script view.
+
+    This is a read-only planner: no model calls, no disk writes, no shelf
+    mutation. It lets the director and the script page agree on whether an
+    upcoming segment is written, reviewed, recorded, scheduled and long
+    enough before the clock reaches it.
+    """
+    script = script if isinstance(script, dict) else {}
+    review = review if isinstance(review, dict) else {}
+    try:
+        owns = max(0.0, float(owns_seconds or 0))
+    except Exception:  # noqa: BLE001
+        owns = 0.0
+    road = str(SCHED_PREP_KIND.get(str(kind or "")) or kind or "")
+    preparable = bool(road in ALT_PREP_KINDS or road == "track_talk")
+    if str(kind or "") == "record":
+        line_target = DIRECTOR_RECORD_BOOKEND_LINES
+        event_target = DIRECTOR_RECORD_BOOKEND_LINES
+    else:
+        line_target = max(1, int((owns + DIRECTOR_LINE_SECONDS - 0.001)
+                                 // DIRECTOR_LINE_SECONDS)) if owns else 1
+        event_target = max(line_target, int((owns + DIRECTOR_EVENT_SECONDS - 0.001)
+                                            // DIRECTOR_EVENT_SECONDS)) if owns else line_target
+    turns = _director_script_lines(script)
+    spoken = len(turns)
+    sfx = list(script.get("sfx_plan") or [])
+    beats = list(script.get("beats") or [])
+    events = spoken + len(sfx) + len(beats)
+    seconds = _director_script_seconds(script, turns)
+    seconds_floor = owns * 0.82 if owns else 0.0
+    line_short = max(0, line_target - spoken)
+    event_short = max(0, event_target - events)
+    seconds_short = round(max(0.0, seconds_floor - seconds), 1)
+    written = bool(spoken or script.get("drafts") or script.get("draft_head"))
+    recorded = bool(str(script.get("state") or "") == "bound"
+                    and float(script.get("seconds") or 0) > 0)
+    reviewed = bool(review.get("approved") or review.get("seen")
+                    or review.get("tint_approved"))
+    scheduled = owns > 0
+    executed = str(state or "").startswith("aired") or str(state or "").startswith("went by")
+    ready = bool(recorded and line_short <= 0 and event_short <= 0
+                 and seconds_short <= max(12.0, owns * 0.08))
+    if not scheduled:
+        status = "unscheduled"
+    elif ready:
+        status = "ready"
+    elif recorded:
+        status = "recorded-short"
+    elif written:
+        status = "written"
+    elif preparable:
+        status = "needs-script"
+    else:
+        status = "live-only"
+    needs: list[str] = []
+    if not written and preparable:
+        needs.append("write the segment")
+    if written and not reviewed:
+        needs.append("review the script")
+    if written and not recorded:
+        needs.append("record the lines")
+    if line_short > 0:
+        needs.append("%d more scripted line%s" % (
+            line_short, "" if line_short == 1 else "s"))
+    if event_short > 0:
+        needs.append("%d more event%s or stinger%s" % (
+            event_short, "" if event_short == 1 else "s",
+            "" if event_short == 1 else "s"))
+    if seconds_short > 0:
+        needs.append("%ds more prepared airtime" % int(seconds_short))
+    if not needs and status == "live-only":
+        needs.append(CANNOT_PREPARE.get(str(kind or ""), "handled live at airtime"))
+    coverage = {
+        "lines": round(spoken / max(1, line_target), 3),
+        "events": round(events / max(1, event_target), 3),
+        "seconds": round(seconds / max(1.0, seconds_floor or owns or 1.0), 3),
+    }
+    return {
+        "kind": str(kind or ""), "road": road, "label": str(label or road or kind),
+        "owns_seconds": round(owns, 1),
+        "target": {"lines": line_target, "events": event_target,
+                   "seconds": round(seconds_floor, 1)},
+        "have": {"lines": spoken, "events": events,
+                 "seconds": round(seconds, 1),
+                 "sfx": len(sfx), "beats": len(beats)},
+        "short": {"lines": line_short, "events": event_short,
+                  "seconds": seconds_short},
+        "coverage": coverage,
+        "stages": {"written": written, "reviewed": reviewed,
+                   "recorded": recorded, "scheduled": scheduled,
+                   "executed": executed},
+        "preparable": preparable,
+        "status": status,
+        "needs": needs[:6],
+        "say": ("%s: %d/%d lines, %d/%d events, %.0fs/%.0fs prepared"
+                % (status, spoken, line_target, events, event_target,
+                   seconds, seconds_floor or owns)),
+    }
+
+
+def _director_variant(raw: dict[str, Any], prompt: str,
+                      index: int) -> dict[str, Any]:
+    raw = raw or {}
+    nested = raw.get("candidate") if isinstance(raw.get("candidate"), dict) else {}
+    candidate = nested or raw
+    script = str(raw.get("script") or candidate.get("script") or "")
+    identity = str(raw.get("id") or candidate.get("id") or "draft-%d" % index)
+    turns = [{"seat": str(marker or ""), "who": _director_seat(str(marker or "")),
+              "text": str(said or "")[:900], "candidate": identity}
+             for marker, said in banter_turns(script)]
+    review = dialogue_topic_review(script, prompt)
+    return {"id": identity, "index": index, "turns": turns,
+            "seconds": round(float(raw.get("seconds") or candidate.get("seconds") or 0), 2),
+            "ready": bool(raw.get("ready", candidate.get("ready", False))),
+            "eligible": bool(raw.get("eligible", candidate.get("eligible", True))),
+            "why": str(raw.get("why") or candidate.get("why") or "")[:500],
+            "created_at": float(raw.get("at") or candidate.get("at") or 0),
+            "source": _director_source_evidence(candidate),
+            "topic": review.get("topic") or "", "topic_review": review,
+            "sfx_plan": _director_sfx_plan(len(turns))}
+
+
 def _director_script(slot: dict[str, Any]) -> dict[str, Any]:
     """The words this entry is going to say, and where they came from.
 
@@ -136332,7 +138881,9 @@ def _director_script(slot: dict[str, Any]) -> dict[str, Any]:
     presented as the plan."""
     out: dict[str, Any] = {"turns": [], "seconds": 0.0, "state": "nothing",
                            "candidate": "", "source": "", "drafts": 0,
-                           "draft_head": "", "tint": {}}
+                           "draft_head": "", "draft_turns": [],
+                           "draft_candidates": [], "draft_variants": [],
+                           "selected_candidate": "", "tint": {}}
     try:
         allocations = list(slot.get("allocations") or [])
         drafts = list(slot.get("drafts") or [])
@@ -136340,6 +138891,26 @@ def _director_script(slot: dict[str, Any]) -> dict[str, Any]:
         if drafts and not allocations:
             head = str((drafts[0] or {}).get("script") or "")
             out["draft_head"] = " ".join(head.split())[:240]
+            # A draft is still real work the orchestrator has prepared. The
+            # director used to reduce it to one 240-character sentence, so
+            # the calendar looked empty until recording and allocation were
+            # both complete. Preserve the conversation for review while
+            # continuing to label it unbound and therefore non-editable.
+            choice = script_choice(str(slot.get("id") or ""))
+            out["selected_candidate"] = str(choice.get("candidate") or "")
+            for index, draft in enumerate(drafts[:12]):
+                variant = _director_variant(draft or {}, str(slot.get("prompt") or ""), index)
+                out["draft_variants"].append(variant)
+                out["draft_candidates"].append(variant["id"])
+            picked_variant = next((variant for variant in out["draft_variants"]
+                                   if variant["id"] == out["selected_candidate"]), None)
+            if not picked_variant and out["draft_variants"]:
+                picked_variant = out["draft_variants"][0]
+            if picked_variant:
+                out["draft_turns"] = list(picked_variant["turns"])
+                out["topic"] = picked_variant["topic"]
+                out["topic_review"] = picked_variant["topic_review"]
+                out["sfx_plan"] = picked_variant["sfx_plan"]
         if not allocations:
             # An edited segment is still THIS segment while it re-records
             # the line that was changed. Show its words and say why it is
@@ -136415,7 +138986,13 @@ def _director_script(slot: dict[str, Any]) -> dict[str, Any]:
         for marker, said in banter_turns(script):
             out["turns"].append({"seat": str(marker or ""),
                                  "who": _director_seat(str(marker or "")),
-                                 "text": str(said or "")[:900]})
+                                 "text": str(said or "")[:900],
+                                 "candidate": out["candidate"]})
+        out["source_evidence"] = _director_source_evidence(picked)
+        out["topic_review"] = dialogue_topic_review(
+            script, str(slot.get("prompt") or ""))
+        out["topic"] = out["topic_review"].get("topic") or ""
+        out["sfx_plan"] = _director_sfx_plan(len(out["turns"]))
     except Exception:  # noqa: BLE001
         pass
     return out
@@ -136494,6 +139071,11 @@ def director_room(which: int = 0) -> dict[str, Any]:
                                "tint_approved": False,
                                "aired_unapproved": False,
                                "state": "unplanned"},
+                    "orchestration": director_orchestration(
+                        kind, str(slot.get("label") or kind), owns,
+                        {"turns": [], "state": "nothing", "drafts": 0},
+                        state="unplanned",
+                        review={"state": "unplanned"}),
                     "beats": director_beats(kind, str(slot.get("id") or "")),
                 })
                 at += owns
@@ -136599,6 +139181,10 @@ def director_room(which: int = 0) -> dict[str, Any]:
             state = "nothing behind it"
         if kind != "record":
             talk_seconds += max(0.0, deadline - start)
+        review = script_state(str(slot.get("id") or ""))
+        beats = director_beats(kind, str(slot.get("id") or ""))
+        if isinstance(script, dict):
+            script.setdefault("beats", beats)
         out["entries"].append({
             "ordinal": int(slot.get("ordinal") or 0),
             "kind": kind,
@@ -136619,8 +139205,12 @@ def director_room(which: int = 0) -> dict[str, Any]:
             "direction": _director_direction(
                 kind, str(slot.get("template_id") or ""),
                 str(slot.get("id") or "")),
-            "review": script_state(str(slot.get("id") or "")),
-            "beats": director_beats(kind, str(slot.get("id") or "")),
+            "review": review,
+            "beats": beats,
+            "orchestration": director_orchestration(
+                kind, str(slot.get("label") or kind),
+                max(0.0, deadline - start), script,
+                state=state, review=review),
         })
     # WHAT THE HOUR COSTS TO VOICE. The room says this out loud because it
     # is the reason the long-round roads starve: the marginal render term
@@ -137123,6 +139713,39 @@ def director_edit_turn(occurrence: str, index: int, said: str,
             hit = take
             break
     if hit is None:
+        if sid:
+            # A draft is meant to be edited before recording. Rebuild its
+            # script in place and clear any partial render evidence so the
+            # normal keeper records the revised wording as one coherent
+            # candidate. Bound/airable material still follows the stricter
+            # take-rekey path below.
+            rebuilt = []
+            for at, (mark, text) in enumerate(turns):
+                rebuilt.append("%s: %s" % (mark, said if at == index
+                                           else " ".join(str(text).split())))
+            entry["script"] = "\n".join(rebuilt)
+            entry.pop("script_tinted", None)
+            entry.pop("tint", None)
+            entry.pop("tinting", None)
+            entry["takes"] = []
+            entry["freshened"] = True
+            entry["preparing"] = False
+            try:
+                _larder_save()
+            except Exception:                    # noqa: BLE001
+                pass
+            try:
+                _pantry_save()
+            except Exception:                    # noqa: BLE001
+                pass
+            edit = script_note_edit(script_key(sid), kind, index, was, said,
+                                    seat=str(marker or ""), candidate=sid)
+            pipeline_log("action", "the director rewrote a draft %s turn"
+                         % kind, extra="was: %s\nnow: %s" % (was[:300], said[:300]))
+            return {"ok": True, "changed": True, "edit": edit,
+                    "kind": kind, "seat": marker, "candidate": sid,
+                    "state": script_state(script_key(sid)),
+                    "say": "draft rewritten - it will record with the new line"}
         raise HTTPException(
             409, "that turn has no matching recording, so editing it would "
                  "leave the round unusable rather than changed. It can be "
@@ -137187,7 +139810,72 @@ async def api_director_edit(occurrence: str,
         director_edit_turn, occurrence,
         int((payload or {}).get("index") or 0),
         str((payload or {}).get("text") or ""),
-        str((payload or {}).get("was") or ""))
+        str((payload or {}).get("was") or ""),
+        str((payload or {}).get("candidate") or ""))
+
+
+def _director_refresh_after_choice() -> None:
+    try:
+        factory = globals().get("_system2")
+        runtime = factory() if callable(factory) else None
+        if not runtime:
+            return
+        runtime._last_refresh = 0
+        fire_and_forget(runtime.refresh(force=True, want_status=False))
+    except Exception:                              # noqa: BLE001
+        pass
+
+
+@app.post("/api/director/segment/{occurrence}/winner")
+async def api_director_winner(occurrence: str,
+                              payload: dict[str, Any]) -> dict[str, Any]:
+    """Choose a prepared variant and teach the planner that preference."""
+    body = payload or {}
+    try:
+        choice = await asyncio.to_thread(
+            script_choose, occurrence, str(body.get("kind") or ""),
+            str(body.get("candidate") or ""),
+            [str(one) for one in (body.get("candidates") or [])],
+            str(body.get("who") or "operator"))
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    _director_refresh_after_choice()
+    return {"ok": True, "choice": choice,
+            "say": "winner selected - the planner will prefer this draft"}
+
+
+@app.post("/api/director/segment/{occurrence}/feedback")
+async def api_director_feedback(occurrence: str,
+                                payload: dict[str, Any]) -> dict[str, Any]:
+    """Record one line correction and commission a replacement pass."""
+    body = payload or {}
+    action = str(body.get("action") or "")
+    try:
+        feedback = await asyncio.to_thread(
+            script_note_feedback, occurrence, str(body.get("kind") or ""),
+            action, str(body.get("candidate") or ""),
+            int(body.get("index") if body.get("index") is not None else -1),
+            str(body.get("line") or ""), str(body.get("previous") or ""),
+            str(body.get("topic") or ""), str(body.get("note") or ""))
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    instruction = {
+        "off_topic": "Rewrite this occurrence and keep every turn on its active subject.",
+        "doesnt_make_sense": "Rewrite this occurrence so each reply follows logically from the line before it.",
+        "rewrite": "Rewrite this occurrence with a fresh, clearer version of the flagged line.",
+        "refer_to_previous": "Rewrite this occurrence so the flagged line answers the immediately previous line directly.",
+        "discuss_instead": "Rewrite this occurrence around this subject instead: "
+                            + str(body.get("note") or body.get("topic") or "")[:500],
+    }.get(action, "Rewrite the flagged line.")
+    try:
+        await asyncio.to_thread(
+            director_add, str(body.get("kind") or ""), instruction,
+            "next", str(body.get("slot_id") or ""), occurrence, "operator")
+    except Exception:                              # noqa: BLE001
+        pass
+    _director_refresh_after_choice()
+    return {"ok": True, "feedback": feedback,
+            "say": "noted - the orchestrator will use that correction on the replacement"}
 
 
 @app.post("/api/director/segment/{occurrence}/approve")
@@ -140076,6 +142764,20 @@ async def dj_topics_remove(
     return {"removed": topic_id, "left": len(kept)}
 
 
+@app.post("/api/dj/topics/{topic_id}/queue")
+async def dj_topics_queue(
+    topic_id: str,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Put one saved scenario at the front of the next-banter queue."""
+    require_auth(authorization)
+    row = next((r for r in read_bombshells() if r.get("id") == topic_id), None)
+    if row is None:
+        raise HTTPException(status_code=404, detail="No such topic")
+    queued = await asyncio.to_thread(queue_bombshell, row)
+    return {"topic": row, **queued}
+
+
 @app.post("/api/dj/topics/{topic_id}/drop")
 async def dj_topics_drop(
     topic_id: str,
@@ -142357,10 +145059,12 @@ def courier_write(rows: list[dict[str, Any]]) -> None:
     tmp.replace(EXPORT_COURIER_PATH)
 
 
-def courier_add(path: Path, dest: str, what: str = "broadcast") -> dict[str, Any]:
-    row = {"id": uuid.uuid4().hex[:10], "name": path.name, "path": str(path),
+def courier_add(path: Path, dest: str, what: str = "broadcast", *,
+                name: str | None = None, force: bool = False) -> dict[str, Any]:
+    row = {"id": uuid.uuid4().hex[:10], "name": name or path.name, "path": str(path),
            "dest": dest, "what": what, "at": time.time(), "state": "pending",
-           "bytes": int(path.stat().st_size) if path.is_file() else 0}
+           "bytes": int(path.stat().st_size) if path.is_file() else 0,
+           "force": force}
     with _COURIER_LOCK:
         rows = courier_read()
         rows.append(row)
@@ -147148,6 +149852,8 @@ def sfx_forget_everywhere(sid: str, mates: list[Path]) -> dict[str, Any]:
         for key in ids:
             if _SFX_VIDEO_PLAYED.pop(key, None) is not None:
                 out["cooldown"] += 1
+        with _SFX_VIDEO_ROTATION_LOCK:
+            _SFX_VIDEO_ROTATION.setdefault("used", set()).difference_update(ids)
         if out["cooldown"]:
             _sfx_video_played_save()
     except Exception:  # noqa: BLE001
@@ -147613,6 +150319,26 @@ def _sfx_file_facts(sample: Path) -> dict[str, Any]:
     except OSError:
         pass
     return out
+
+
+@app.get("/api/sfx/url")
+async def sfx_url_api(
+    id: str = "",
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """A signed playback road for an id the native larder already holds.
+
+    Unlike the inspector this never walks the library or probes the file. The
+    native wall has already proved that its cached copy exists; Listen only
+    needs the station URL for the matching backdrop, and dead entries fail at
+    the media route without blocking the event loop here.
+    """
+    require_read_auth(authorization)
+    sid = str(id or "").strip()
+    if not sid or len(sid) > 160 or any(ch in sid for ch in "/\\?&#"):
+        raise HTTPException(status_code=400, detail="Invalid sample id")
+    return {"id": sid, "url": f"/sfx/{sid}?t={media_sign(sid)}",
+            "video": True}
 
 
 @app.get("/api/sfx/info")
@@ -149948,6 +152674,10 @@ async def sfx_file(
         "X-Content-Type-Options": "nosniff",
         "Accept-Ranges": "bytes",
         "Cache-Control": "private, max-age=3600",
+        # The desktop shell is file:// and its real >100% video gain uses a
+        # MediaElementSource. Signed clip URLs are already capability URLs;
+        # allowing that renderer to read the media does not widen discovery.
+        "Access-Control-Allow-Origin": "*",
     }
     if path == raw and sfx_is_video(raw):
         # #1420: this clip is going out at its own level because its
@@ -150079,6 +152809,31 @@ async def station_flow_asset(name: str) -> Response:
     if name not in {"station-flow.js", "station-flow.css"}:
         return Response(status_code=404)
     path = Path(__file__).resolve().parent / "frontend" / name
+    if not path.is_file():
+        return Response(status_code=404)
+    return Response(path.read_bytes(), media_type=VENDOR_TYPES[path.suffix],
+                    headers={"Cache-Control": "no-cache",
+                             "X-Content-Type-Options": "nosniff"})
+
+
+@app.get("/comfy-workshop/{name}")
+async def comfy_workshop_asset(name: str) -> Response:
+    """Tracked Workshop UI assets; never an arbitrary frontend file."""
+    if name not in {"comfy-workshop.js", "comfy-workshop.css"}:
+        return Response(status_code=404)
+    path = Path(__file__).resolve().parent / "frontend" / name
+    if not path.is_file():
+        return Response(status_code=404)
+    return Response(path.read_bytes(), media_type=VENDOR_TYPES[path.suffix],
+                    headers={"Cache-Control": "no-cache",
+                             "X-Content-Type-Options": "nosniff"})
+
+
+@app.get("/gen-ads/{name}")
+async def gen_ads_asset(name: str) -> Response:
+    if name not in {"gen-ads.js", "gen-ads.css"}:
+        return Response(status_code=404)
+    path = Path(__file__).resolve().parent / "desktop" / "renderer" / name
     if not path.is_file():
         return Response(status_code=404)
     return Response(path.read_bytes(), media_type=VENDOR_TYPES[path.suffix],
@@ -152829,7 +155584,7 @@ async def air_watch() -> None:
                                   say="nobody is listening - nothing to cure")
                 continue
             if quiet < AIR_LADDER[0][0]:
-                if int(_AIR_WATCH.get("rung") or -1) >= 0:
+                if int(_AIR_WATCH.get("rung", -1)) >= 0:
                     step = AIR_LADDER[int(_AIR_WATCH["rung"])][1]
                     _AIR_WATCH["worked"] = step
                     air_fix_note({"at": time.time(), "event": "recovered",
@@ -152952,7 +155707,7 @@ async def air_watch() -> None:
             for index, (after, _step, _said) in enumerate(AIR_LADDER):
                 if quiet >= after:
                     due = index
-            held = int(_AIR_WATCH.get("rung") or -1)
+            held = int(_AIR_WATCH.get("rung", -1))
             if AIR1186_LOOP_K.get("cap_rung"):
                 # See air_watch_roads: the stall road can open part-way
                 # up a ladder nobody climbed, because its `quiet` is
@@ -153295,7 +156050,7 @@ async def broadcast_watch_api(
     """#1213: what the orchestrator has been doing about the silence."""
     require_read_auth(authorization)
     quiet = air_quiet_for()
-    rung = int(_AIR_WATCH.get("rung") or -1)
+    rung = int(_AIR_WATCH.get("rung", -1))
     AIR1186_WATCHAPI_K = air_stall_mode()
     return {
         "at": time.time(),
@@ -153369,7 +156124,7 @@ async def broadcast_console_api(
         "why": str(state.get("why") or ""),
         # #1213: and what the orchestrator is doing about it unaided.
         "watch": str(_AIR_WATCH.get("say") or ""),
-        "watch_working": int(_AIR_WATCH.get("rung") or -1) >= 0,
+        "watch_working": int(_AIR_WATCH.get("rung", -1)) >= 0,
         # 2026-09-15 (#1186): ...AND WHICH ROAD SAID SO, WITH NUMBERS.
         #
         # `watch` above is the sentence that read "quiet 1043s, but
@@ -153890,12 +156645,34 @@ async def cupboard_judge(kind: str, row: dict[str, Any]) -> dict[str, Any]:
                  or row.get("text") or text)[:1400]
     stops = "\n".join("- %s" % r["say"] for r in (why.get("reasons") or [])
                       ) or "- nothing: it is ready and next in line"
+    # The desk is allowed to learn from the operator's actual decisions,
+    # not to claim a taste it has never observed. These counts and the
+    # current per-road rule are durable facts gathered over time.
+    try:
+        _retire_load()
+        with _RETIRE_LOCK:
+            practice = [dict(v) for v in (_RETIRE.get("ledger") or {}).values()
+                        if str(v.get("kind") or "") == str(kind)]
+        kept_before = sum(1 for v in practice if v.get("state") == "keep")
+        removed_before = sum(1 for v in practice
+                             if v.get("state") in ("remove", "gone", "forced"))
+        rule = retire_rule(kind)
+        practice_say = (
+            "%d earlier %s decision(s) were keep and %d were remove; "
+            "the standing rule asks about %s items and keeps an accepted "
+            "one for %s hours with %s airings"
+            % (kept_before, kind, removed_before, rule.get("ask"),
+               "good" if float(rule.get("keep_hours") or 0) < 0
+               else ("%g" % float(rule.get("keep_hours") or 0)),
+               int(rule.get("innings") or 1)))
+    except Exception:  # noqa: BLE001
+        practice_say = "no earlier operator decision could be read"
     prompt = (
         "You run the running order of a live radio station. A finished, "
-        "recorded segment has been sitting in the cupboard for %s and has "
-        "never been on the air.\n\n"
+        "recorded segment has been sitting in the cupboard for %s.\n\n"
         "THE SEGMENT (%s, %.0f seconds, %d airing(s) of %d used):\n%s\n\n"
         "WHY THE MACHINE HAS NOT PLAYED IT:\n%s\n\n"
+        "WHAT THE OPERATOR'S RECORDED PRACTICE SAYS:\n%s\n\n"
         "Judge it. Answer in exactly three lines and nothing else:\n"
         "VERDICT: air | replace | hold\n"
         "WHY: one sentence about THIS segment's words - is it still worth "
@@ -153905,7 +156682,7 @@ async def cupboard_judge(kind: str, row: dict[str, Any]) -> dict[str, Any]:
         % (cupboard_ago(float(why.get("age") or 0)),
            why.get("label") or kind, float(why.get("seconds") or 0),
            int(why.get("aired") or 0), int(why.get("innings") or 1),
-           script, stops))
+           script, stops, practice_say))
     said = ""
     try:
         said = await ask_model(prompt, limit=220, spice=0.1,
@@ -153972,6 +156749,120 @@ async def cupboard_judge(kind: str, row: dict[str, Any]) -> dict[str, Any]:
     except Exception:  # noqa: BLE001
         pass
     return {**judged, "item": why}
+
+
+def retire_question_state(most: int = 12) -> dict[str, Any]:
+    """The unresolved question behind a retirement action notice.
+
+    This is deliberately the actual ledger and the actual air gates, not
+    prose inferred from the notification. It lets a detail popup answer
+    "what do you need from me?" before it shows historical diagnostics."""
+    state = retire_state()
+    rows = []
+    for pending in list(state.get("pending") or [])[:max(1, min(50, most))]:
+        rid = str(pending.get("id") or "")
+        kind, row = _retire_find(rid)
+        why = cupboard_why_row(kind, row) if row is not None else {}
+        reasons = [str(r.get("say") or "") for r in (why.get("reasons") or [])
+                   if str(r.get("say") or "").strip()]
+        rows.append({
+            "id": rid, "kind": kind or str(pending.get("kind") or ""),
+            "label": pending.get("label") or why.get("label") or kind,
+            "text": pending.get("text") or "",
+            "asked_because": pending.get("why") or "its cupboard life ended",
+            "airings": int(pending.get("aired") or 0),
+            "ready": bool(row is not None and dialogue_row_ready(kind, row)),
+            "reasons": reasons[:5],
+            "question": "air it, hold it for later, or replace it?",
+        })
+    total = len(state.get("pending") or [])
+    return {
+        "at": time.time(), "pending": total, "shown": len(rows),
+        "question": ("Should each waiting round be aired, held for later, "
+                     "or removed and replaced?"),
+        "choices": ["air", "hold", "replace"], "items": rows,
+        "say": ("%d round%s need%s that answer before leaving the cupboard"
+                % (total, "" if total == 1 else "s",
+                   "s" if total == 1 else "")),
+    }
+
+
+async def retire_orchestrator_decide(ids: list[str] | None = None,
+                                     most: int = 24) -> dict[str, Any]:
+    """Let the orchestrator answer and act on waiting cupboard questions.
+
+    `air` keeps and cues finished work, or sends unfinished work through
+    the recording room before cueing it. `hold` keeps it under the road's
+    standing retention rule. `replace` removes it through the canonical
+    retirement path, which preserves its audit and any harvested gold.
+    Every verdict and resulting action is written back onto the ledger."""
+    state = retire_state()
+    pending = list(state.get("pending") or [])
+    wanted = {str(x) for x in (ids or []) if str(x)}
+    if wanted:
+        pending = [p for p in pending if str(p.get("id") or "") in wanted]
+    pending = pending[:max(1, min(50, int(most or 24)))]
+    decisions: list[dict[str, Any]] = []
+    for item in pending:
+        rid = str(item.get("id") or "")
+        kind, row = _retire_find(rid)
+        if row is None:
+            decisions.append({"id": rid, "verdict": "gone",
+                              "action": "none", "why": "it already left"})
+            continue
+        judged = await cupboard_judge(kind, row)
+        verdict = str(judged.get("verdict") or "hold")
+        action = "keep"
+        if verdict == "replace":
+            retire_decide([rid], "remove", None)
+            action = "remove"
+        elif verdict == "air":
+            ready = bool(dialogue_row_ready(kind, row))
+            # The cue is durable and outranks ordinary shelf order. An
+            # unfinished row keeps that cue while the room completes it.
+            row["cue_at"] = time.time()
+            if not ready:
+                cupboard_finish_add(kind, row,
+                                     "the orchestrator chose it for air")
+                action = "finish and cue"
+            else:
+                action = "cue"
+            try:
+                _pantry_save(True)
+            except Exception:  # noqa: BLE001
+                pass
+            retire_decide([rid], "keep", None)
+        else:
+            retire_decide([rid], "keep", None)
+            action = "keep"
+        record = {"id": rid, "kind": kind, "verdict": verdict,
+                  "action": action, "why": judged.get("why") or "",
+                  "at": time.time(), "by": "orchestrator"}
+        decisions.append(record)
+        try:
+            _retire_load()
+            with _RETIRE_LOCK:
+                ledger = _RETIRE.get("ledger") or {}
+                if rid in ledger:
+                    ledger[rid]["model_decision"] = dict(record)
+                    ledger[rid]["decided_by"] = "orchestrator"
+            _retire_save(force=True)
+        except Exception:  # noqa: BLE001
+            pass
+        pipeline_log("lookahead",
+                     "the orchestrator answered the retirement question "
+                     "for a %s round: %s -> %s" % (kind, verdict, action),
+                     extra=json.dumps(record, default=str)[:1800])
+    remaining = retire_pending_count()
+    if decisions:
+        note_action("the orchestrator decided %d cupboard item(s): %s"
+                    % (len(decisions), ", ".join(
+                        "%s %s" % (d["verdict"], d["action"])
+                        for d in decisions[:8])))
+    return {"ok": True, "decided": len(decisions), "remaining": remaining,
+            "decisions": decisions,
+            "say": ("the orchestrator decided %d item(s); %d still wait"
+                    % (len(decisions), remaining))}
 
 
 @app.post("/api/cupboard/act")
@@ -154564,10 +157455,12 @@ async def sfx_doctor_do_api(
         """
         sfx_all_index_reset()
         _SFX_POOL_SIGNATURE[0] = None
+        _SFX_VIDEO_MEMO.clear()
         _SFX_VIDEO_MEMO.update({"key": None, "pool": [], "at": 0.0,
                                 "built": False})
         _SFX_ID_MEMO.clear()
         _SFX_ID_REVERSE.clear()
+        _SFX_POOL_IDS.clear()
         _SFX_POOL_IDS.update({"key": None, "map": {}})
         sfx_video_kick()
         return {"ok": True,
@@ -154660,14 +157553,32 @@ def sfx_db() -> Any:
             mtime    REAL,
             seconds  REAL,
             playable INTEGER NOT NULL DEFAULT 0,
-            seen_at  REAL
+            seen_at  REAL,
+            deck_cycle INTEGER NOT NULL DEFAULT 0
         )""")
+        # #1450: existing books predate the durable shuffled deck.  Adding a
+        # generation is an in-place migration; zero means never drawn.
+        columns = {str(r[1]) for r in con.execute("PRAGMA table_info(clips)")}
+        if "deck_cycle" not in columns:
+            con.execute(
+                "ALTER TABLE clips ADD COLUMN deck_cycle INTEGER NOT NULL DEFAULT 0")
+        con.execute("""CREATE TABLE IF NOT EXISTS sfx_meta (
+            name TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )""")
+        con.execute(
+            "INSERT OR IGNORE INTO sfx_meta(name, value) "
+            "VALUES ('video_deck_cycle', '1')")
         # The pick's index. `playable` first because every pick filters on
         # it, then `video`, so one index serves both the sting draw and
         # the set's draw.
         con.execute("CREATE INDEX IF NOT EXISTS clips_pick "
                     "ON clips(playable, video)")
         con.execute("CREATE INDEX IF NOT EXISTS clips_sid ON clips(sid)")
+        con.execute("CREATE INDEX IF NOT EXISTS clips_deck_pick "
+                    "ON clips(playable, video, deck_cycle)")
+        con.execute("CREATE INDEX IF NOT EXISTS clips_duplicate "
+                    "ON clips(video, name, bytes, seconds)")
         con.commit()
         _SFX_DB[0] = con
         return con
@@ -154794,6 +157705,134 @@ def sfx_db_pick_row(video: bool = True,
     """
     got = _sfx_db_pick_any(video, tries)
     return got
+
+
+def sfx_db_pick_rotation_row(video: bool = True) -> tuple[Path, float] | None:
+    """One uniform random row from the unspent part of the video deck.
+
+    This is still COUNT/OFFSET over a covering local index, never
+    ``ORDER BY RANDOM()`` and never a share walk.  Folder exclusions are a
+    presentation guard, not a dead end: if every eligible row lives in a
+    recently used folder, the same query is retried without that clause.
+    """
+    try:
+        con = sfx_db_reader()
+        cycle = sfx_video_rotation_cycle()
+        want = 1 if video else 0
+        aim = 0.0
+        if video:
+            try:
+                aim = float((dj_settings() or {}).get("sfx_video_len") or 0)
+            except Exception:  # noqa: BLE001
+                aim = 0.0
+        windows = ([(aim * 0.6, aim * 1.6)] if aim > 0 else []) + [None]
+        pin = sfx_pin_prefix()
+        recent = sfx_video_recent_folders() if video else []
+        for win in windows:
+            for avoid in ([recent, []] if recent else [[]]):
+                where = "playable = 1 AND video = ? AND deck_cycle < ?"
+                args: tuple[Any, ...] = (want, cycle)
+                if win:
+                    where += " AND seconds BETWEEN ? AND ?"
+                    args += (win[0], win[1])
+                if pin:
+                    where += " AND path LIKE ?"
+                    args += (pin.replace("%", "%%") + "%",)
+                if avoid:
+                    marks = ",".join("?" for _ in avoid)
+                    where += " AND folder NOT IN (" + marks + ")"
+                    args += tuple(avoid)
+                counted = con.execute(
+                    "SELECT COUNT(*) AS n FROM clips WHERE " + where,
+                    args).fetchone()
+                count = int((counted and counted["n"]) or 0)
+                if not count:
+                    continue
+                row = con.execute(
+                    "SELECT path, seconds FROM clips WHERE " + where
+                    + " LIMIT 1 OFFSET ?",
+                    args + (random.randrange(count),)).fetchone()
+                if row is None:
+                    continue
+                with _SFX_VIDEO_ROTATION_LOCK:
+                    _SFX_VIDEO_ROTATION["why"] = ""
+                return (Path(str(row["path"])), float(row["seconds"] or 0.0))
+        with _SFX_VIDEO_ROTATION_LOCK:
+            _SFX_VIDEO_ROTATION["why"] = "exhausted"
+        return None
+    except Exception as exc:  # noqa: BLE001
+        with _SFX_VIDEO_ROTATION_LOCK:
+            _SFX_VIDEO_ROTATION["why"] = "pick: %s" % str(exc)[:120]
+        return None
+
+
+async def sfx_db_pick_rotation_async(
+        video: bool = True) -> tuple[Path, float] | None:
+    """The generation-aware pick on the clip book's private worker."""
+    try:
+        return await asyncio.get_running_loop().run_in_executor(
+            _SFX_DB_EXEC, sfx_db_pick_rotation_row, video)
+    except Exception as exc:  # noqa: BLE001
+        with _SFX_VIDEO_ROTATION_LOCK:
+            _SFX_VIDEO_ROTATION["why"] = "pick: %s" % str(exc)[:120]
+        return None
+
+
+def sfx_video_rotation_reset() -> bool:
+    """Advance an exhausted book while protecting the generation boundary.
+
+    A temporary folder pin rotates only its own subtree; it must not erase
+    progress through the rest of the library.  An unrestricted draw advances
+    the generation in O(1), then stamps the newest tail into the new cycle so
+    the join cannot immediately echo what just played.
+    """
+    _sfx_video_rotation_load()
+    with _SFX_VIDEO_ROTATION_LOCK:
+        cycle = max(1, int(_SFX_VIDEO_ROTATION.get("cycle") or 1))
+        resets = int(_SFX_VIDEO_ROTATION.get("resets") or 0)
+    pin = sfx_pin_prefix()
+    try:
+        _sfx_video_played_load()
+        with _SFX_VIDEO_PLAYED_LOCK:
+            boundary = [sid for sid, _at in sorted(
+                _SFX_VIDEO_PLAYED.items(), key=lambda item: item[1],
+                reverse=True)[:SFX_VIDEO_BOUNDARY_KEEP]]
+        con = sfx_db()
+        with _SFX_DB_LOCK:
+            if pin:
+                con.execute(
+                    "UPDATE clips SET deck_cycle = ? WHERE playable = 1 "
+                    "AND video = 1 AND deck_cycle = ? AND path LIKE ?",
+                    (max(0, cycle - 1), cycle,
+                     pin.replace("%", "%%") + "%"))
+            else:
+                cycle += 1
+                con.execute(
+                    "UPDATE sfx_meta SET value = ? "
+                    "WHERE name = 'video_deck_cycle'", (str(cycle),))
+            if boundary:
+                con.executemany(
+                    "UPDATE clips SET deck_cycle = ? WHERE sid = ?",
+                    [(cycle, sid) for sid in boundary])
+            con.commit()
+        with _SFX_VIDEO_ROTATION_LOCK:
+            folders = list(_SFX_VIDEO_ROTATION.get("folders") or [])
+            picked = int(_SFX_VIDEO_ROTATION.get("picked") or 0)
+            _SFX_VIDEO_ROTATION.update({
+                "ready": False, "cycle": cycle, "used": set(),
+                "folders": folders, "resets": resets + 1,
+                "why": "", "picked": picked,
+            })
+        _sfx_video_rotation_load()
+        pipeline_log(
+            "air", "the endless video deck reached its end; generation %d "
+            "began with %d recent clip(s) held across the join"
+            % (cycle, len(boundary)))
+        return True
+    except Exception as exc:  # noqa: BLE001
+        with _SFX_VIDEO_ROTATION_LOCK:
+            _SFX_VIDEO_ROTATION["why"] = "reset: %s" % str(exc)[:120]
+        return False
 
 
 def sfx_db_pick(video: bool = True, tries: int = 6) -> Path | None:
@@ -156233,7 +159272,9 @@ def sfx_match_video_pick(at_ms: int = 0) -> Any:
         key = sfx_id(path)
         if key in banned:
             continue
-        if sfx_video_on_cooldown(key):          # #1433: the hour still holds
+        if sfx_video_folder_recent(path.parent.name):
+            continue                           # #1450: vary the source shelf
+        if sfx_video_on_cooldown(key):          # #1450: this deck still holds
             continue
         why = _sfx_match.explain(cand)
         _SFX_MATCH["picks"] = int(_SFX_MATCH.get("picks") or 0) + 1
@@ -156244,7 +159285,8 @@ def sfx_match_video_pick(at_ms: int = 0) -> Any:
     return None
 
 
-def sfx_match_sting_pick(after: str = "", want_video: Any = None) -> Any:
+def sfx_match_sting_pick(after: str = "", want_video: Any = None,
+                         allowed_paths: set[str] | None = None) -> Any:
     """#1251: the SFX guy's sting, matched to the line it punctuates.
 
     `after` is the line that has just been said - dj_speak hands it to
@@ -156284,6 +159326,8 @@ def sfx_match_sting_pick(after: str = "", want_video: Any = None) -> Any:
     survivors: list[str] = []
     why_by_path: dict[str, tuple] = {}
     for path, _seconds, cand in sfx_match_rows(tied):
+        if allowed_paths is not None and str(path) not in allowed_paths:
+            continue
         key = sfx_id(path)
         if key in banned:
             continue
@@ -156601,6 +159645,38 @@ async def sfx_match_try_api(                                   # [#1251]
                     "would run" % floor)}
 
 
+@app.get("/api/sfx/video/profiles")
+async def sfx_video_profiles_api(
+    limit: int = Query(default=12, ge=1, le=24),
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Random MP4 profile material without putting a clip on the air."""
+    require_read_auth(authorization)
+    clips: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for _ in range(limit * 12):
+        if len(clips) >= limit:
+            break
+        got = await sfx_db_pick_row_async(True)
+        if not got:
+            continue
+        path, seconds = got
+        if path.suffix.lower() != ".mp4":
+            continue
+        key = sfx_id(path)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        clips.append({
+            "id": key,
+            "file": path.name,
+            "seconds": round(float(seconds or 0), 2),
+            "motion": True,
+            "url": "/sfx/%s?t=%s" % (key, media_sign(key)),
+        })
+    return {"clips": clips, "count": len(clips), "muted": True}
+
+
 @app.post("/api/sfx/video/cue")
 async def sfx_video_cue_api(
     payload: dict[str, Any] | None = None,
@@ -156718,6 +159794,7 @@ async def sfx_video_cue_api(
         "text": "", "sting": pick.stem,
         "video": True, "seconds": seconds,
         "id": key,
+        "folder": pick.parent.name,
         # #1306: NOW, not a lead ahead of now.
         "broadcast_ms": stamp,
     }
@@ -156736,7 +159813,7 @@ async def sfx_video_cue_api(
                 "say": "the set's own ring refused it: " + type(exc).__name__}
     # Reserve it before this request answers. Two rapid taps otherwise both
     # draw while the first one's slower history write is still in flight.
-    sfx_video_note_played(key)
+    sfx_video_note_played(key, pick.parent.name)
     sting_remember(str(pick))
 
     # Everything below is the record, not the broadcast, so it happens
@@ -156762,6 +159839,95 @@ async def sfx_video_cue_api(
     except Exception:  # noqa: BLE001
         pass
     return {"ok": True, "clip": clip, "say": pick.stem + " is on the set"}
+
+
+@app.post("/api/sfx/video/shuffle")
+async def sfx_video_shuffle_api(
+    payload: dict[str, Any] | None = None,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Rebuild the draw roads and hand the endless set a wholly new runway.
+
+    This is deliberately not a sequence of client-side Next presses. The
+    operator is saying the current pool is stale or repetitive, so all RAM
+    indexes are invalidated, the durable clip-book walk starts in the
+    background, recent client ids join the server cooldown, and a batch is
+    drawn from the still-usable committed book immediately.
+    """
+    require_auth(authorization)
+    body = payload or {}
+    raw_exclude = body.get("exclude") or []
+    if not isinstance(raw_exclude, list):
+        raw_exclude = []
+    excluded = {
+        str(value).strip() for value in raw_exclude
+        if re.fullmatch(r"[a-f0-9]{16}", str(value).strip())
+    }
+    if excluded:
+        sfx_video_reserve_many(list(excluded))
+
+    # The operator asked for an entirely new runway.  Withdraw future rows
+    # from the former automatic plan and advance the cycle's private epoch;
+    # otherwise that local plan survives the native queue replacement and
+    # quietly feeds the old choices back in on the next poll.
+    now_ms = int(time.time() * 1000)
+    ring = _RADIO.setdefault("voice_clips", [])
+    ring[:] = [row for row in ring if not (
+        isinstance(row, dict) and row.get("endless") and
+        int(row.get("broadcast_ms") or row.get("ts") or 0) >= now_ms)]
+    _SFX_CYCLE["shuffle_epoch"] = int(
+        _SFX_CYCLE.get("shuffle_epoch") or 0) + 1
+    _SFX_CYCLE["requests"] = []
+    _SFX_CYCLE.update({"queued": 0, "until": time.time(), "why": ""})
+
+    sfx_all_index_reset()
+    _SFX_POOL_SIGNATURE[0] = None
+    _SFX_VIDEO_MEMO.clear()
+    _SFX_VIDEO_MEMO.update({"key": None, "pool": [], "at": 0.0,
+                            "built": False})
+    _SFX_ID_MEMO.clear()
+    _SFX_ID_REVERSE.clear()
+    _SFX_POOL_IDS.clear()
+    _SFX_POOL_IDS.update({"key": None, "map": {}})
+    sfx_video_kick()
+    scan_started = sfx_db_kick(force=False)
+
+    most = max(3, min(12, int(body.get("most") or 8)))
+    clips: list[dict[str, Any]] = []
+    drawn: set[str] = set(excluded)
+    # cue() is the canonical admission/history/cooldown road. Reusing it
+    # keeps the batch traceable and puts every row onto all other surfaces.
+    for _ in range(most * 2):
+        if len(clips) >= most:
+            break
+        got = await sfx_video_cue_api({"who": "shuffle"}, authorization)
+        row = got.get("clip") if isinstance(got, dict) else None
+        sid = str((row or {}).get("id") or "")
+        if not row or not sid:
+            break
+        if sid in drawn:
+            continue
+        drawn.add(sid)
+        clips.append(row)
+
+    note_action("you shuffled the endless set; %d new clips were queued"
+                % len(clips))
+    scan_now = bool(scan_started or _SFX_DB_SCAN.get("running"))
+    return {
+        "ok": bool(clips),
+        "clips": clips,
+        "excluded": len(excluded),
+        "scan_started": scan_started,
+        "scan": dict(_SFX_DB_SCAN),
+        "rotation": sfx_video_cooldown_state().get("rotation", {}),
+        "say": ("rebuilt the runway with %d unplayed clips from the shuffled "
+                "library deck; %s" % (
+                    len(clips), "the FFX scan is running behind them" if scan_now
+                    else "the committed full-library index supplied them")
+                 if clips else
+                 "the library rebuild started, but no fresh video cleared "
+                 "the no-repeat deck yet"),
+    }
 
 
 
@@ -157160,9 +160326,193 @@ def sfx_edit_editor() -> Any:
     return editor
 
 
+def video_editor_library_search(query: str, limit: int = 40) -> list[dict[str, Any]]:
+    """Search the local clip book without walking or exposing the media share."""
+    con = sfx_db_reader()
+    columns = {str(row[1]) for row in con.execute("PRAGMA table_info(clips)")}
+    optional = [name for name in ("said", "seen_desc") if name in columns]
+    fields = ["name", "folder", *optional]
+    words = re.findall(r"[a-z0-9']+", str(query or "").lower())[:8]
+    args: list[Any] = []
+    clauses = ["playable=1", "video=1"]
+    for word in words:
+        clauses.append("(" + " OR ".join(
+            f"LOWER(COALESCE({field},'')) LIKE ?" for field in fields) + ")")
+        args.extend([f"%{word}%"] * len(fields))
+    select = ["sid", "name", "folder", "seconds", *optional]
+    order = "seen_at DESC"
+    if words:
+        order = "CASE WHEN LOWER(COALESCE(name,'')) LIKE ? THEN 0 ELSE 1 END, seen_at DESC"
+        args.append(words[0] + "%")
+    args.append(max(1, min(80, int(limit or 40))))
+    rows = con.execute(
+        "SELECT " + ",".join(select) + " FROM clips WHERE "
+        + " AND ".join(clauses) + " ORDER BY " + order + " LIMIT ?", args
+    ).fetchall()
+    out = []
+    for row in rows:
+        sid = str(row["sid"] or "")
+        if not re.fullmatch(r"[0-9a-f]{16}", sid):
+            continue
+        said = str(row["said"] or "") if "said" in optional else ""
+        seen = str(row["seen_desc"] or "") if "seen_desc" in optional else ""
+        out.append({
+            "id": sid, "clip_id": sid, "name": str(row["name"] or sid),
+            "folder": str(row["folder"] or ""),
+            "seconds": round(float(row["seconds"] or 0), 3),
+            "spoken": said[:240], "topic": seen[:240],
+            "url": f"/sfx/{sid}?t={media_sign(sid)}",
+            "poster_url": f"/api/sfx/poster/{sid}?t={media_sign(sid)}",
+        })
+    return out
+
+
+@app.get("/api/video-editor/library")
+async def video_editor_library(
+    q: str = "",
+    limit: int = Query(default=40, ge=1, le=80),
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_read_auth(authorization)
+    query = " ".join(str(q or "").split())[:160]
+    rows = await asyncio.to_thread(video_editor_library_search, query, limit)
+    return {"query": query, "clips": rows, "count": len(rows)}
+
+
+@app.post("/api/video-editor/library/import")
+async def video_editor_library_import(
+    payload: dict[str, Any], authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_auth(authorization)
+    sid = str(payload.get("clip_id") or "")
+    if not re.fullmatch(r"[0-9a-f]{16}", sid):
+        raise HTTPException(status_code=400, detail="Invalid clip identity")
+    def resolve() -> Path | None:
+        path = sfx_db_path_of(sid)
+        return path if path is not None and path.is_file() and sfx_is_video(path) else None
+
+    path = await asyncio.to_thread(resolve)
+    if path is None:
+        raise HTTPException(status_code=404, detail="Video clip is unavailable")
+    try:
+        source_id = await asyncio.to_thread(
+            sfx_edit_editor().import_source, path, path.stem)
+        record = await asyncio.to_thread(
+            sfx_edit_editor().read, "sources", source_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=429, detail=str(exc)) from exc
+    return {**record, "source_id": source_id, "clip_id": sid,
+            "poster_url": f"/api/sfx/poster/{sid}?t={media_sign(sid)}"}
+
+
+@app.post("/api/video-editor/parody/open")
+async def video_editor_parody_open(
+    payload: dict[str, Any], authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_auth(authorization)
+    prompt_id = str(payload.get("prompt_id") or "")
+    if not re.fullmatch(r"[0-9a-f-]{32,36}", prompt_id):
+        raise HTTPException(status_code=400, detail="Invalid generation identity")
+    row = workshop_generation(prompt_id)
+    if row is None or row.get("status") != "done":
+        raise HTTPException(status_code=404, detail="Generated video is not ready")
+    files = row.get("files") or []
+    if not isinstance(files, list):
+        raise HTTPException(status_code=400, detail="Invalid generated video record")
+    try:
+        generated, kind = workshop_source_path("generation", str(files[0]))
+        original, original_kind = workshop_source_path(
+            str(row.get("source_type") or ""), str(row.get("source") or ""))
+    except (IndexError, ValueError, FileNotFoundError) as exc:
+        raise HTTPException(status_code=404, detail="Video or reference is unavailable") from exc
+    if kind != "video" or original_kind != "video":
+        raise HTTPException(status_code=400, detail="Parody editing needs two videos")
+    editor = sfx_edit_editor()
+    try:
+        original_id = await asyncio.to_thread(editor.import_source, original, original.stem)
+        generated_id = await asyncio.to_thread(editor.import_source, generated, generated.stem)
+    except ValueError as exc:
+        raise HTTPException(status_code=429, detail=str(exc)) from exc
+    return {"editor_url": (f"/video-editor/?source={original_id}"
+                           f"&secondary={generated_id}&parody=1"),
+            "original_source_id": original_id,
+            "generated_source_id": generated_id}
+
+
+@app.post("/api/video-editor/splice-exports")
+async def video_editor_splice_export(
+    payload: dict[str, Any], authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    source_ids = payload.get("source_ids") if isinstance(payload, dict) else None
+    try:
+        require_auth(authorization)
+    except HTTPException as exc:
+        if exc.status_code != 401:
+            raise
+        from video_editor import save_token_ok
+        if (not isinstance(source_ids, list) or not source_ids
+                or not save_token_ok(str(payload.get("save_token") or ""),
+                                     str(source_ids[0]))):
+            raise
+    try:
+        return await asyncio.to_thread(
+            sfx_edit_editor().start_splice_export, payload, SFX_ADS_DIR,
+            lambda path, seconds: sfx_db_write_row(path, seconds, 1))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/video-editor/splice-exports/{identifier}")
+async def video_editor_splice_status(
+    identifier: str, authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_read_auth(authorization)
+    try:
+        row = dict(sfx_edit_editor().read("exports", identifier))
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    if "source_ids" not in row:
+        raise HTTPException(status_code=404, detail="No such splice export")
+    if row.get("status") == "complete":
+        path = SFX_ADS_DIR / str(row["name"])
+        if path.is_file():
+            sid = sfx_id(path)
+            row["url"] = f"/sfx/{sid}?t={media_sign(sid)}"
+    return row
+
+
 def sfx_edit_plan_for(path: Path) -> dict[str, Any]:
     return _sfx_glue.edit_plan(path, DATA_DIR, SFX_EDITED_DIR,
                                audio_only=not sfx_is_video(path))
+
+
+def sfx_edit_resolve(payload: dict[str, Any]) -> Path:
+    """Resolve an SFX cue by its book identity, booth line, or unique stem."""
+    sid = str(payload.get("clip") or payload.get("id") or "")
+    if not sid and payload.get("line"):
+        sid, why = sfx_id_of_line(str(payload["line"]))
+        if not sid:
+            raise HTTPException(status_code=404, detail=why or "No such clip")
+    if not sid and payload.get("name"):
+        name = str(payload["name"]).strip()
+        if (not name or len(name) > 160 or "/" in name or "\\" in name
+                or ".." in name):
+            raise HTTPException(status_code=400, detail="Invalid clip name")
+        con = sfx_db_reader()
+        hits = con.execute(
+            "SELECT sid FROM clips WHERE name = ? AND playable = 1 LIMIT 2",
+            (Path(name).stem,)).fetchall() if con is not None else []
+        if len(hits) > 1:
+            raise HTTPException(status_code=409,
+                                detail="More than one clip has this name; select its line or id")
+        if hits:
+            sid = str(hits[0][0])
+    if not re.fullmatch(r"[0-9a-f]{16}", sid):
+        raise HTTPException(status_code=404, detail="No such clip")
+    path = sfx_by_id(sid) or sfx_db_path_of(sid)
+    if path is None or not path.is_file() or sfx_id(path) != sid:
+        raise HTTPException(status_code=404, detail="No such clip")
+    return path
 
 
 @app.get("/api/sfx/edit/where")
@@ -157218,10 +160568,7 @@ async def sfx_edit_open_api(
     screen recording is analysed on - so an edit never competes with the
     broadcast for CPU and two of them queue behind each other."""
     require_auth(authorization)
-    sid = str((payload or {}).get("clip") or (payload or {}).get("id") or "")
-    path = sfx_by_id(sid)
-    if path is None or not path.is_file():
-        raise HTTPException(status_code=404, detail="No such clip")
+    path = sfx_edit_resolve(payload or {})
     editor = sfx_edit_editor()
     plan = sfx_edit_plan_for(path)
     audio_only = bool(plan.get("audio_only"))
@@ -157267,6 +160614,76 @@ async def sfx_edit_open_api(
             "editor_url": record["editor_url"],
             "in_place": bool(plan.get("in_place")), "audio_only": audio_only,
             "say": str(plan.get("say") or "")}
+
+
+@app.post("/api/sfx/edit/split")
+async def sfx_edit_split_api(
+    payload: dict[str, Any], authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    source_id = str(payload.get("source_id") or "")
+    try:
+        require_auth(authorization)
+    except HTTPException as exc:
+        if exc.status_code != 401:
+            raise
+        from video_editor import save_token_ok
+        if not save_token_ok(str(payload.get("save_token") or ""), source_id):
+            raise
+    editor = sfx_edit_editor()
+    try:
+        source = editor.read("sources", source_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    mine = source.get("pine_sfx") or {}
+    if not mine.get("audio_only"):
+        raise HTTPException(status_code=400, detail="Split needs an SFX audio source")
+    sid = str(mine.get("id") or "")
+    if not re.fullmatch(r"[0-9a-f]{16}", sid):
+        raise HTTPException(status_code=400, detail="Invalid original identity")
+    original = sfx_db_path_of(sid) or sfx_by_id(sid)
+    if (original is None or not original.is_file()
+            or original.resolve() != Path(str(mine.get("path") or "")).resolve()
+            or sfx_id(original) != sid):
+        raise HTTPException(status_code=404, detail="Original SFX is unavailable")
+    if not isinstance(payload.get("keep_original", True), bool):
+        raise HTTPException(status_code=400, detail="Keep original must be true or false")
+    plan = sfx_edit_plan_for(original)
+    destination = original.parent if plan.get("in_place") else SFX_EDITED_DIR
+
+    def retire(path: Path) -> None:
+        key = sfx_id(path)
+        if sfx_db_stand_down([key]) < 1:
+            raise ValueError("Could not retire the clip from the SFX library")
+        sfx_ban_set(key, True)
+
+    def audit(path: Path, targets: list[Path], keep: bool) -> None:
+        note_action("split SFX %s into %d clips; original %s" % (
+            path.name, len(targets), "kept" if keep else "retired"))
+
+    try:
+        return await asyncio.to_thread(
+            editor.start_split_export, payload, original, destination,
+            lambda path, seconds: sfx_db_write_row(path, seconds, 1),
+            retire, audit, _sfx_glue.probe)
+    except (ValueError, OSError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/sfx/edit/split/{identifier}")
+async def sfx_edit_split_status(
+    identifier: str, authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_read_auth(authorization)
+    try:
+        record = dict(sfx_edit_editor().read("exports", identifier))
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    if not record.get("split"):
+        raise HTTPException(status_code=404, detail="No such split export")
+    if record.get("status") == "complete":
+        for row in record.get("outputs") or []:
+            row["url"] = f"/sfx/{row['id']}?t={media_sign(row['id'])}"
+    return record
 
 
 def sfx_edit_land(export_id: str) -> dict[str, Any]:
@@ -157492,7 +160909,7 @@ async def sfx_video_cut_api(
             match = re.search(r"/sfx/([^/?#]+)", url)
             key = match.group(1) if match else ""
         if key:
-            sfx_video_note_played(key)
+            sfx_video_note_played(key, str(body.get("folder") or ""))
     except Exception:  # noqa: BLE001
         pass
     try:
@@ -157502,6 +160919,40 @@ async def sfx_video_cut_api(
     return {"ok": True, "clip": clip,
             "say": str(clip.get("sting") or "clip") + " is on every set"}
 
+
+
+@app.get("/api/sfx/ratios")
+async def sfx_ratios_get_api(
+    authorization: str | None = Header(default=None),
+) -> dict[str, int]:
+    require_read_auth(authorization)
+    return sfx_ratios_state()
+
+
+@app.post("/api/sfx/ratios")
+async def sfx_ratios_post_api(
+    payload: dict[str, Any],
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_auth(authorization)
+    if not payload or set(payload) - {"ads_share", "video_share"}:
+        raise HTTPException(status_code=400, detail="Choose ads_share or video_share")
+    changes = {}
+    for field, key in (("ads_share", "sfx_ads_share"),
+                       ("video_share", "sfx_video_share")):
+        if field not in payload:
+            continue
+        value = payload[field]
+        if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 100:
+            raise HTTPException(status_code=400,
+                                detail=f"{field} must be an integer from 0 to 100")
+        changes[key] = value
+    settings = await asyncio.to_thread(load_settings)
+    dj = dict(settings.get("dj") or {})
+    dj.update(changes)
+    await asyncio.to_thread(save_settings, {**settings, "dj": dj})
+    note_action("you set the SFX Guy mix ratios")
+    return {"ok": True, **sfx_ratios_state()}
 
 
 @app.get("/api/sfx/video/mode")
@@ -157544,30 +160995,26 @@ async def sfx_video_mode_api(
     if changed:
         settings = load_settings()
         dj = dict(settings.get("dj") or {})
-        dj.update(changed)
+        ordinary = {k: v for k, v in changed.items()
+                    if k != "sfx_video_mode"}
+        dj.update(ordinary)
         save_settings({**settings, "dj": dj})
-        if "sfx_video_mode" in changed and not changed["sfx_video_mode"]:
-            # 2026-09-14: "whenever I turn off endless video mode ... it
-            # turns off". The cycle rings clips ahead of now, so OFF used
-            # to mean "after the two already rung". Withdraw those from
-            # the ring and reset the plan; the sets drop what they hold.
-            try:
-                now_ms = int(time.time() * 1000)
-                ring = _RADIO.get("voice_clips") or []
-                ring[:] = [c for c in ring if not (c.get("endless")
-                           and int(c.get("broadcast_ms") or 0) > now_ms - 2000)]
-                _SFX_CYCLE.update({"until": 0.0, "queued": 0, "requests": [],
-                                   "why": "the endless set is off"})
-            except Exception:  # noqa: BLE001
-                pass
-        note_action("you %s" % (
-            ("turned the endless video set %s"
-             % ("on" if changed["sfx_video_mode"] else "off"))
-            if "sfx_video_mode" in changed else
-            ("set the SFX Guy's picture share to %d%%"
-             % changed["sfx_video_share"]) if "sfx_video_share" in changed else
-            ("set the endless set's clip length to %ss"
-             % (changed.get("sfx_video_len") or "any"))))
+        if "sfx_video_mode" in changed:
+            sfx_video_banking_set(changed["sfx_video_mode"],
+                                  why="the endless video control")
+        if "sfx_video_mode" in changed:
+            _video_note = "turned the endless video set %s" % (
+                "on" if changed["sfx_video_mode"] else "off")
+        elif "sfx_video_share" in changed:
+            _video_note = "set the SFX Guy's picture share to %d%%" % (
+                changed["sfx_video_share"])
+        elif "sfx_video_len" in changed:
+            _video_note = "set the endless set's clip length to %ss" % (
+                changed.get("sfx_video_len") or "any")
+        else:
+            _video_note = "turned seamless video %s" % (
+                "on" if changed.get("sfx_video_seam") else "off")
+        note_action("you %s" % _video_note)
     return {"ok": True, "changed": changed, **sfx_video_mode_state()}
 
 @app.get("/api/sfx/anxiety")
@@ -158982,6 +162429,83 @@ SERVICE_CONTAINERS = {
 }
 
 
+CORE_SERVICE_RECOVERY = {
+    "searxng": (SEARXNG_URL + "/config", "searxng"),
+    "open-webui": (OPENWEBUI_URL + "/health", "open-webui"),
+}
+_CORE_SERVICE_RETRY_AT = {name: 0.0 for name in CORE_SERVICE_RECOVERY}
+_CORE_SERVICE_FAILURES = {name: 0 for name in CORE_SERVICE_RECOVERY}
+
+
+async def core_service_healthy(client: httpx.AsyncClient, url: str) -> bool:
+    try:
+        response = await client.get(url)
+        return 200 <= response.status_code < 400
+    except (httpx.HTTPError, OSError):
+        return False
+
+
+async def core_services_recovery_once() -> dict[str, str]:
+    """Recover only web search and WebUI after confirmed failed probes."""
+    report = {}
+    async with httpx.AsyncClient(timeout=4) as client:
+        for name, (url, container) in CORE_SERVICE_RECOVERY.items():
+            if await core_service_healthy(client, url):
+                _CORE_SERVICE_FAILURES[name] = 0
+                _CORE_SERVICE_RETRY_AT[name] = 0.0
+                report[name] = "healthy"
+                continue
+            if time.monotonic() < _CORE_SERVICE_RETRY_AT[name]:
+                report[name] = "cooldown"
+                continue
+            await asyncio.sleep(3)
+            if await core_service_healthy(client, url):
+                _CORE_SERVICE_FAILURES[name] = 0
+                report[name] = "healthy"
+                continue
+            _CORE_SERVICE_FAILURES[name] += 1
+            delay = min(3600.0, 60.0 * 2 ** min(6, _CORE_SERVICE_FAILURES[name] - 1))
+            _CORE_SERVICE_RETRY_AT[name] = time.monotonic() + delay
+            try:
+                reply = await client.post(
+                    f"http://127.0.0.1:2375/containers/{container}/restart?t=10",
+                    timeout=20)
+                if reply.status_code != 204:
+                    report[name] = f"proxy HTTP {reply.status_code}"
+                    continue
+            except (httpx.HTTPError, OSError) as exc:
+                report[name] = f"proxy unavailable: {type(exc).__name__}"
+                continue
+            report[name] = "restart requested"
+            for wait in (5, 10, 15):
+                await asyncio.sleep(wait)
+                if await core_service_healthy(client, url):
+                    _CORE_SERVICE_FAILURES[name] = 0
+                    _CORE_SERVICE_RETRY_AT[name] = 0.0
+                    report[name] = "recovered"
+                    break
+    return report
+
+
+async def core_services_recovery_loop() -> None:
+    while True:
+        try:
+            report = await core_services_recovery_once()
+            for name, state in report.items():
+                if state not in {"healthy", "cooldown"}:
+                    pipeline_log("repair", f"{name}: {state}")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            pipeline_log("repair", f"core service recovery: {type(exc).__name__}")
+        await asyncio.sleep(60)
+
+
+@app.on_event("startup")
+async def _startup_core_services_recovery() -> None:
+    fire_and_forget(core_services_recovery_loop())
+
+
 @app.post("/api/service/restart")
 async def service_restart(
     request: Request,
@@ -159678,6 +163202,20 @@ async def list_generations(
     return {"generations": rows, "sig": sig}
 
 
+@app.get("/api/generations/poster-url/{filename}")
+async def generation_poster_url(
+    filename: str, authorization: str | None = Header(default=None),
+) -> dict[str, str]:
+    require_read_auth(authorization)
+    if not _SAFE_FILE_RE.fullmatch(filename) or ".." in filename:
+        raise HTTPException(status_code=400, detail="Invalid generation filename")
+    path = await asyncio.to_thread(comfy_output_find, filename)
+    if path is None or not path.is_file() or not sfx_is_video(path):
+        raise HTTPException(status_code=404, detail="No generated video")
+    sid = sfx_id(path)
+    return {"poster": f"/api/sfx/poster/{sid}?t={media_sign(sid)}"}
+
+
 @app.post("/api/generations/reconcile")
 async def generations_reconcile(
     authorization: str | None = Header(default=None),
@@ -160010,6 +163548,1051 @@ async def api_generate(
             status_code=502, detail=f"ComfyUI unavailable: {exc}"
         ) from exc
     return {"prompt_id": prompt_id, "model": model_name, "tags": prompt[:2000]}
+
+
+# ---- #1285: THE COMFY WORKSHOP -------------------------------------------
+
+def workshop_media_row(sid: str, name: str, folder: str, video: bool,
+                       seconds: float = 0.0, stamp: float = 0.0) -> dict[str, Any]:
+    """A clip-book row with signed preview roads and no filesystem path."""
+    signature = media_sign(sid)
+    return {
+        "id": sid, "name": name or sid, "folder": folder,
+        "video": bool(video), "kind": "video" if video else "audio",
+        "seconds": round(float(seconds or 0), 2), "at": int(stamp or 0),
+        "url": f"/sfx/{sid}?t={signature}",
+        "poster": (f"/api/sfx/poster/{sid}?t={signature}" if video else ""),
+    }
+
+
+def workshop_catalog(query: str = "") -> dict[str, Any]:
+    """One bounded read for the Workshop's three source shelves."""
+    ask = " ".join(str(query or "").split()).lower()[:80]
+    clips: list[dict[str, Any]] = []
+    try:
+        con = sfx_db_reader()
+        if con is not None:
+            sql = ("SELECT sid,name,folder,video,seconds,seen_at FROM clips "
+                   "WHERE playable=1")
+            args: list[Any] = []
+            if ask:
+                sql += " AND (lower(name) LIKE ? OR lower(folder) LIKE ?)"
+                args.extend([f"%{ask}%", f"%{ask}%"])
+            sql += " ORDER BY seen_at DESC LIMIT 120"
+            with _SFX_DB_LOCK:
+                rows = con.execute(sql, args).fetchall()
+            for row in rows:
+                clips.append(workshop_media_row(
+                    str(row[0] or ""), str(row[1] or ""), str(row[2] or ""),
+                    bool(row[3]), float(row[4] or 0), float(row[5] or 0)))
+    except Exception:                                                    # noqa: BLE001
+        clips = []
+
+    recent: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    try:
+        for row in reversed(sfx_history_rows()[-240:]):
+            sid = str(row.get("id") or "")
+            if not sid or sid in seen:
+                continue
+            seen.add(sid)
+            path = sfx_db_path_of(sid)
+            name = str(row.get("name") or (path.name if path else sid))
+            video = sfx_is_video(path or name)
+            recent.append(workshop_media_row(
+                sid, Path(name).stem, path.parent.name if path else "on air",
+                video, float(row.get("seconds") or 0),
+                float(row.get("ts") or 0)))
+            if len(recent) >= 40:
+                break
+    except Exception:                                                    # noqa: BLE001
+        recent = []
+
+    gallery: list[dict[str, Any]] = []
+    try:
+        for path in gallery_files(160):
+            if ask and ask not in path.stem.lower():
+                continue
+            gallery.append({
+                "id": path.name, "name": path.stem, "kind": "image",
+                "video": False, "seconds": 0,
+                "url": "/api/generations/image/" + quote(path.name),
+                "poster": "/api/generations/image/" + quote(path.name)
+            })
+            if len(gallery) >= 80:
+                break
+    except Exception:                                                    # noqa: BLE001
+        gallery = []
+
+    dialogue: list[dict[str, Any]] = []
+    used_lines: set[str] = set()
+    try:
+        for row in reversed(script_ledger_rows()[-500:]):
+            text = " ".join(str(row.get("text") or "").split())
+            if not text or text in used_lines:
+                continue
+            if ask and ask not in text.lower() \
+                    and ask not in str(row.get("who") or "").lower():
+                continue
+            used_lines.add(text)
+            dialogue.append({"id": str(row.get("id") or ""),
+                             "who": str(row.get("who") or "DJ"),
+                             "text": text[:800],
+                             "at": int(row.get("ts") or 0)})
+            if len(dialogue) >= 80:
+                break
+    except Exception:                                                    # noqa: BLE001
+        dialogue = []
+
+    jobs = [row for row in read_generations(40)
+            if str(row.get("kind") or "") == "video"][:12]
+    return {"recent": recent, "clips": clips, "gallery": gallery,
+            "dialogue": dialogue, "jobs": jobs}
+
+
+def workshop_source_path(source_type: str, source_id: str) -> tuple[Path, str]:
+    """Resolve a signed UI identity to a server-owned path."""
+    kind = str(source_type or "")
+    key = str(source_id or "").strip()
+    if kind in {"recent", "clip"}:
+        if not re.fullmatch(r"[a-f0-9]{16}", key):
+            raise ValueError("Invalid clip id")
+        path = sfx_db_path_of(key) or sfx_by_id(key)
+        if path is None or not path.is_file():
+            raise FileNotFoundError("That clip is no longer on the shelf")
+        media_kind = "video" if sfx_is_video(path) else "audio"
+        return path, media_kind
+    if kind == "gallery":
+        if not _SAFE_FILE_RE.fullmatch(key) or "/" in key or ".." in key:
+            raise ValueError("Invalid gallery filename")
+        path = comfy_output_find(key)
+        if path is None or not path.is_file() or path.suffix.lower() not in GALLERY_TYPES:
+            raise FileNotFoundError("That gallery image is no longer available")
+        return path, "image"
+    if kind == "generation":
+        if not _SAFE_FILE_RE.fullmatch(key) or "/" in key or ".." in key:
+            raise ValueError("Invalid generated-media filename")
+        path = comfy_output_find(key)
+        if path is None or not path.is_file():
+            raise FileNotFoundError("That generated source is no longer available")
+        suffix = path.suffix.lower()
+        if suffix in SFX_VIDEO_TYPES:
+            return path, "video"
+        if suffix in GALLERY_TYPES:
+            return path, "image"
+        if suffix in MUSIC_TYPES:
+            return path, "audio"
+        raise ValueError("That generated file is not reference media")
+    raise ValueError("Choose a source from the Workshop")
+
+
+def workshop_reference_video(path: Path, at_share: float = 0.0,
+                             trim_in_s: float | None = None,
+                             trim_out_s: float | None = None) -> bytes:
+    """Make a short 24 fps reference clip; H3 accepts two to fifteen seconds."""
+    duration = _media_duration_probe(path)
+    if duration <= 0:
+        raise ValueError("The selected video has no measurable duration")
+    start, take = comfy_workshop.reference_window(
+        duration, at_share, trim_in_s, trim_out_s)
+    folder = RADIO_CACHE / "_workshop"
+    folder.mkdir(parents=True, exist_ok=True)
+    out = folder / ("ref-" + uuid.uuid4().hex[:12] + ".mp4")
+    try:
+        try:
+            import imageio_ffmpeg
+            ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+        except Exception:                                                # noqa: BLE001
+            ffmpeg = "ffmpeg"
+        cmd = [ffmpeg, "-nostdin", "-y"]
+        if duration < 2.2:
+            cmd += ["-stream_loop", "-1"]
+        cmd += ["-ss", f"{start:.3f}", "-i", str(path), "-t", f"{take:.3f}",
+                "-vf", "fps=24", "-c:v", "libx264", "-preset", "veryfast",
+                "-crf", "24", "-pix_fmt", "yuv420p", "-c:a", "aac",
+                "-b:a", "128k", "-movflags", "+faststart", str(out)]
+        got = _real_subprocess_run(cmd, capture_output=True, timeout=180)
+        if got.returncode != 0 or not out.is_file() or out.stat().st_size < 4096:
+            raise ValueError("The selected video could not be prepared")
+        return out.read_bytes()
+    finally:
+        try:
+            out.unlink()
+        except OSError:
+            pass
+
+
+async def workshop_upload(name: str, content: bytes, content_type: str) -> str:
+    """Upload one validated source through ComfyUI's input road."""
+    clean = re.sub(r"[^A-Za-z0-9_.-]", "-", Path(name).name)[:100]
+    async with httpx.AsyncClient(timeout=120) as client:
+        response = await client.post(
+            f"{COMFYUI_URL}/upload/image",
+            data={"type": "input", "subfolder": "pine-workshop",
+                  "overwrite": "true"},
+            files={"image": (clean, content, content_type)})
+        response.raise_for_status()
+        row = response.json() or {}
+    uploaded = str(row.get("name") or clean)
+    subfolder = str(row.get("subfolder") or "").strip("/\\")
+    return f"{subfolder}/{uploaded}" if subfolder else uploaded
+
+
+async def workshop_prepare_source(path: Path, media_kind: str, mode: str,
+                                  at_share: float,
+                                  trim_in_s: float | None = None,
+                                  trim_out_s: float | None = None) -> tuple[str, str]:
+    """Extract/trim off-loop, then return (Comfy input name, graph kind)."""
+    if mode == "frame":
+        if media_kind == "video":
+            blob = await asyncio.to_thread(
+                clip_speech.frame_of, str(path), max(0.0, min(1.0, at_share)))
+        elif media_kind == "image":
+            blob = await asyncio.to_thread(path.read_bytes)
+        else:
+            raise ValueError("Frame mode needs a picture or video")
+        if not blob:
+            raise ValueError("A frame could not be read from that source")
+        name = "pine-frame-" + uuid.uuid4().hex[:12] + ".jpg"
+        return await workshop_upload(name, blob, "image/jpeg"), "image"
+
+    if media_kind == "video":
+        blob = await asyncio.to_thread(
+            workshop_reference_video, path, at_share, trim_in_s, trim_out_s)
+        name = "pine-reference-" + uuid.uuid4().hex[:12] + ".mp4"
+        return await workshop_upload(name, blob, "video/mp4"), "video"
+    blob = await asyncio.to_thread(path.read_bytes)
+    if len(blob) > 48 * 1024 * 1024:
+        raise ValueError("That reference is too large; choose a shorter clip")
+    suffix = path.suffix.lower() or (".jpg" if media_kind == "image" else ".wav")
+    mime = (_IMAGE_TYPES.get(suffix) or MUSIC_TYPES.get(suffix)
+            or "application/octet-stream")
+    name = "pine-reference-" + uuid.uuid4().hex[:12] + suffix
+    return await workshop_upload(name, blob, mime), media_kind
+
+
+def workshop_publish_files(files: list[str], prompt_id: str) -> list[str]:
+    """Idempotently put finished Workshop videos onto the generated SFX shelf."""
+    published: list[str] = []
+    for filename in files:
+        source = comfy_output_find(str(filename or ""))
+        if source is None or source.suffix.lower() not in SFX_VIDEO_TYPES:
+            continue
+        # [#1285] The render already saved into output/sfx_ads, so there is
+        # nothing to copy - publishing is just the book row. A clip that
+        # landed somewhere else (an old graph, a hand-made prefix) is moved
+        # in rather than duplicated, so one generation is still one file.
+        target = source
+        if source.parent != SFX_ADS_DIR:
+            try:
+                SFX_ADS_DIR.mkdir(parents=True, exist_ok=True)
+                stem = re.sub(r"[^A-Za-z0-9_-]", "-", source.stem).strip("-")[:70]
+                target = SFX_ADS_DIR / (
+                    "h3-%s-%s%s" % (str(prompt_id or "")[:8],
+                                    stem or "workshop", source.suffix.lower()))
+                if not target.is_file():
+                    source.replace(target)
+                else:
+                    target = source
+            except OSError:
+                target = source
+        seconds = _media_duration_probe(target)
+        if sfx_db_write_row(target, seconds, playable=1):
+            published.append(target.name)
+    if published:
+        _SFX_POOL_AT[0] = 0.0
+        note_action("Workshop video joined the SFX shelf: " + published[0])
+    return published
+
+
+GEN_AD_SENDS_PATH = data_path("gen_ad_sends.jsonl")
+_GEN_AD_SENDS_LOCK = RLock()
+
+
+def gen_ad_sends() -> list[dict[str, Any]]:
+    try:
+        return [row for line in GEN_AD_SENDS_PATH.read_text(encoding="utf-8").splitlines()
+                if (row := json.loads(line)) and isinstance(row, dict)]
+    except (OSError, ValueError):
+        return []
+
+
+def gen_ad_path(identifier: str) -> Path:
+    if not re.fullmatch(r"[0-9a-f]{16}", str(identifier or "")):
+        raise HTTPException(status_code=400, detail="Invalid ad identity")
+    path = sfx_db_path_of(identifier)
+    if path is None or path.suffix.lower() not in SFX_VIDEO_TYPES:
+        raise HTTPException(status_code=404, detail="No such generated ad")
+    if path.resolve().parent != SFX_ADS_DIR.resolve():
+        raise HTTPException(status_code=404, detail="No such generated ad")
+    return path
+
+
+def gen_ads_catalog() -> list[dict[str, Any]]:
+    con = sfx_db_reader()
+    if con is None:
+        return []
+    rows = con.execute(
+        "SELECT sid,path,name,seconds,seen_at FROM clips "
+        "WHERE folder = 'sfx_ads' AND video = 1 AND playable = 1 "
+        "ORDER BY seen_at DESC LIMIT 500").fetchall()
+    generations = {}
+    for row in _read_all_generations():
+        if str(row.get("kind") or "") != "video":
+            continue
+        for name in row.get("files") or []:
+            generations[str(name)] = row
+        for name in row.get("aired_files") or []:
+            generations[str(name)] = row
+    history = {}
+    for row in sfx_history_rows():
+        history.setdefault(str(row.get("id") or ""), []).append(
+            {"at": row.get("ts"), "event": "aired", "who": row.get("who")})
+    for row in gen_ad_sends():
+        history.setdefault(str(row.get("id") or ""), []).append(
+            {"at": row.get("ts"), "event": "sent", "who": "operator"})
+    plays = sfx_plays()
+    result = []
+    for row in rows:
+        sid = str(row["sid"] or "")
+        path = Path(str(row["path"] or ""))
+        if not re.fullmatch(r"[0-9a-f]{16}", sid) or not path.is_file():
+            continue
+        if (path.resolve().parent != SFX_ADS_DIR.resolve()
+                or path.suffix.lower() not in SFX_VIDEO_TYPES):
+            continue
+        generation = generations.get(path.name) or {}
+        events = sorted(history.get(sid, []), key=lambda event: event.get("at") or 0,
+                        reverse=True)
+        result.append({"id": sid, "name": str(row["name"] or path.stem),
+                       "url": f"/sfx/{sid}?t={media_sign(sid)}",
+                       "poster_url": f"/api/sfx/poster/{sid}?t={media_sign(sid)}",
+                       "duration": float(row["seconds"] or 0),
+                       "created_at": float(row["seen_at"] or path.stat().st_mtime),
+                       "prompt_id": str(generation.get("prompt_id") or ""),
+                       "history": events[:100],
+                       "air_count": int((plays.get(sid) or {}).get("plays") or 0),
+                       "status": "ready", "kind": "generated" if generation else "edited"})
+    return result
+
+
+@app.get("/api/gen-ads")
+async def gen_ads_list(authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    require_read_auth(authorization)
+    return {"rows": await asyncio.to_thread(gen_ads_catalog)}
+
+
+@app.post("/api/gen-ads/{identifier}/send")
+async def gen_ads_send(
+    identifier: str, authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_auth(authorization)
+    path = await asyncio.to_thread(gen_ad_path, identifier)
+    signature = media_sign(identifier)
+    occurrence = await asyncio.to_thread(
+        admission_admit_line, {"path": f"/sfx/{identifier}", "sig": signature},
+        who="board", kind="sfx", text=path.stem, name=path.stem,
+        line_id=identifier, producer="gen_ads_send")
+    delivery = ""
+    played = ""
+    try:
+        delivery = page_feed_append({"url": f"/sfx/{identifier}?t={signature}",
+                                     "text": "", "sting": path.stem})
+    except Exception:
+        pass
+    if (_RADIO.get("voice_to") or "box") in ("box", "both"):
+        try:
+            played = await _play_on_box(f"/sfx/{identifier}", signature)
+        except Exception:
+            pass
+    if not delivery and not played:
+        admission_withdraw(occurrence, "genAds send was not accepted")
+        raise HTTPException(status_code=503, detail="No broadcast output accepted the ad")
+    if played:
+        await asyncio.to_thread(sfx_history_add, path, "operator")
+        await asyncio.to_thread(sfx_note_play, identifier, path.name, "operator")
+    _STING_AT[0] = time.time()
+    with _GEN_AD_SENDS_LOCK:
+        GEN_AD_SENDS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with GEN_AD_SENDS_PATH.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps({"ts": int(time.time()), "id": identifier}) + "\n")
+    return {"id": identifier, "sent": True,
+            "page_delivery": delivery, "on": played}
+
+
+@app.get("/api/comfy/workshop")
+async def comfy_workshop_state(
+    q: str = "", authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_read_auth(authorization)
+    catalog, admission, temperature = await asyncio.gather(
+        asyncio.to_thread(workshop_catalog, q),
+        asyncio.to_thread(render_admission, "video"),
+        asyncio.to_thread(box_hottest_c))
+    ok, why, available = admission
+    return {**catalog, "admission": {"ok": ok, "why": why,
+                                      "available_gb": available,
+                                      "required_gb": VIDEO_RENDER_FLOOR_GB,
+                                      "temperature_c": temperature},
+            "limits": {"frames": list(comfy_workshop.FRAME_CHOICES),
+                       "duration_s": {"min": 3, "default": 5, "max": 15},
+                       "steps": list(comfy_workshop.STEP_CHOICES),
+                       "video_render_interval_seconds":
+                           VIDEO_RENDER_INTERVAL_S}}
+
+
+def workshop_generation(prompt_id: str) -> dict[str, Any] | None:
+    """One durable gallery row, addressed by the Comfy ticket it came from."""
+    wanted = str(prompt_id or "").strip()
+    if not wanted:
+        return None
+    return next((row for row in reversed(_read_all_generations())
+                 if str(row.get("prompt_id") or "") == wanted), None)
+
+
+def workshop_reference_view(row: dict[str, Any]) -> dict[str, Any]:
+    """Browser-safe identity and signed URL for a generation's source."""
+    source = str(row.get("source") or "")
+    source_type = str(row.get("source_type") or "")
+    if not source or not source_type:
+        return {"available": False,
+                "reason": "This generation did not record a reference source."}
+    try:
+        if source_type in {"recent", "clip"}:
+            path, kind = workshop_source_path(source_type, source)
+            sid = sfx_id(path)
+            return {"available": True, "id": source, "kind": kind,
+                    "name": path.stem, "source_type": source_type,
+                    "url": f"/sfx/{source}?t={media_sign(source)}",
+                    "poster": (f"/api/sfx/poster/{sid}?t={media_sign(sid)}"
+                               if kind == "video" else "")}
+        if source_type in {"gallery", "generation"}:
+            path, kind = workshop_source_path(source_type, source)
+            name = path.name
+            sid = sfx_id(path) if kind == "video" else ""
+            return {"available": True, "id": source, "kind": kind,
+                    "name": path.stem, "source_type": source_type,
+                    "url": ("/api/generations/image/" + quote(name)
+                            + "?t=" + media_sign("gen:" + name)),
+                    "poster": (f"/api/sfx/poster/{sid}?t={media_sign(sid)}"
+                               if sid else "")}
+    except (ValueError, FileNotFoundError) as exc:
+        return {"available": False, "id": source,
+                "source_type": source_type, "reason": str(exc)}
+    return {"available": False, "id": source,
+            "source_type": source_type,
+            "reason": "The recorded reference type is not supported."}
+
+
+GALLERY_EXPORT_SHARE = r"\\10.89.1.125\QuickSwap\PineBoxRecordings"
+
+
+def gallery_export_sources(prompt_id: str, file: str, scope: str) -> list[tuple[str, Path]]:
+    if scope not in {"original", "generated", "both"}:
+        raise HTTPException(status_code=400, detail="Choose original, generated, or both")
+    row = workshop_generation(prompt_id) if prompt_id else None
+    if prompt_id and row is None:
+        raise HTTPException(status_code=404, detail="No such generation")
+    if row and file not in (row.get("files") or []):
+        raise HTTPException(status_code=400, detail="File does not belong to this generation")
+    sources: list[tuple[str, Path]] = []
+    try:
+        if scope in {"original", "both"}:
+            if not row or not row.get("source") or not row.get("source_type"):
+                raise HTTPException(status_code=409, detail="This render has no original reference")
+            original, _ = workshop_source_path(
+                str(row["source_type"]), str(row["source"]))
+            sources.append(("original", original))
+        if scope in {"generated", "both"}:
+            generated, _ = workshop_source_path("generation", file)
+            sources.append(("generated", generated))
+    except (ValueError, FileNotFoundError) as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return sources
+
+
+def gallery_export_name(raw: str, fallback: str, suffix: str) -> str:
+    base = str(raw or "").strip() or fallback
+    if base.lower().endswith(suffix.lower()):
+        base = base[:-len(suffix)]
+    if (not re.fullmatch(r'[^\x00-\x1f<>:"/\\|?*]{1,100}', base)
+            or base in {".", ".."} or base.endswith((" ", "."))
+            or base.split(".")[0].upper() in {
+                "CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)),
+                *(f"LPT{i}" for i in range(1, 10))}):
+        raise HTTPException(status_code=400, detail="Choose a valid filename")
+    return base + suffix
+
+
+def gallery_export_bundle(target: Path, sources: list[tuple[str, Path]], base: str) -> None:
+    import zipfile
+
+    with zipfile.ZipFile(target, "w", zipfile.ZIP_STORED, allowZip64=True) as bundle:
+        for label, path in sources:
+            bundle.write(path, base + "-" + label + path.suffix.lower())
+
+
+@app.post("/api/gallery/export")
+async def gallery_export_prepare(
+    request: Request, authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_auth(authorization)
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Invalid export request")
+    prompt_id = str(body.get("prompt_id") or "")
+    file = str(body.get("file") or "")
+    scope = str(body.get("scope") or "generated")
+    destination = str(body.get("destination") or "device")
+    if destination not in {"device", "share"}:
+        raise HTTPException(status_code=400, detail="Choose device or PineBoxRecordings")
+    sources = await asyncio.to_thread(gallery_export_sources, prompt_id, file, scope)
+    suffix = ".zip" if scope == "both" else sources[0][1].suffix.lower()
+    name = gallery_export_name(str(body.get("name") or ""), Path(file).stem, suffix)
+    if destination == "device":
+        signed = media_sign("gallery-export|" + "|".join(
+            (prompt_id, file, scope, name)))
+        url = ("/api/gallery/export/file?prompt_id=" + quote(prompt_id)
+               + "&file=" + quote(file) + "&scope=" + quote(scope)
+               + "&name=" + quote(name) + "&t=" + quote(signed))
+        return {"ok": True, "name": name, "url": url, "destination": "device"}
+    stage = data_path("exports/gallery")
+    stage.mkdir(parents=True, exist_ok=True)
+    target = stage / (uuid.uuid4().hex + suffix)
+    try:
+        if scope == "both":
+            await asyncio.to_thread(gallery_export_bundle, target, sources,
+                                    name[:-len(suffix)])
+        else:
+            await asyncio.to_thread(shutil.copyfile, sources[0][1], target)
+        row = courier_add(target, GALLERY_EXPORT_SHARE, "gallery",
+                          name=name, force=True)
+    except OSError as exc:
+        target.unlink(missing_ok=True)
+        raise HTTPException(status_code=500, detail=f"Could not stage gallery export: {exc}") from exc
+    return {"ok": True, "name": name, "destination": GALLERY_EXPORT_SHARE,
+            "id": row["id"], "state": "pending", "bytes": row["bytes"]}
+
+
+@app.get("/api/gallery/export/file")
+async def gallery_export_download(
+    prompt_id: str = "", file: str = "", scope: str = "generated",
+    name: str = "", t: str = "",
+) -> FileResponse:
+    signed = media_sign("gallery-export|" + "|".join(
+        (prompt_id, file, scope, name)))
+    if not t or not hmac.compare_digest(t, signed):
+        raise HTTPException(status_code=403, detail="Bad export signature")
+    sources = await asyncio.to_thread(gallery_export_sources, prompt_id, file, scope)
+    suffix = ".zip" if scope == "both" else sources[0][1].suffix.lower()
+    if gallery_export_name(name, Path(file).stem, suffix) != name:
+        raise HTTPException(status_code=400, detail="Invalid export filename")
+    if scope != "both":
+        return FileResponse(sources[0][1], filename=name)
+    stage = data_path("exports/gallery")
+    stage.mkdir(parents=True, exist_ok=True)
+    target = stage / (uuid.uuid4().hex + ".zip")
+    try:
+        await asyncio.to_thread(gallery_export_bundle, target, sources, name[:-4])
+    except OSError as exc:
+        target.unlink(missing_ok=True)
+        raise HTTPException(status_code=500, detail=f"Could not prepare gallery zip: {exc}") from exc
+    return FileResponse(target, filename=name, media_type="application/zip",
+                        background=BackgroundTask(target.unlink, missing_ok=True))
+
+
+@app.get("/api/comfy/workshop/reference/{prompt_id}")
+async def comfy_workshop_reference(
+    prompt_id: str, authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_read_auth(authorization)
+    row = workshop_generation(prompt_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="No such generation")
+    return workshop_reference_view(row)
+
+
+async def workshop_analyze_generation(row: dict[str, Any]) -> str:
+    """Look at a finished Workshop image or sampled video frames."""
+    files = [str(name) for name in (row.get("files") or []) if str(name or "")]
+    if not files:
+        raise ValueError("This generation has not produced media yet")
+    path, media_kind = await asyncio.to_thread(
+        workshop_source_path, "generation", files[0])
+    images: list[str] = []
+    if media_kind == "image":
+        blob = await asyncio.to_thread(path.read_bytes)
+        if blob:
+            images.append(base64.b64encode(blob).decode())
+    elif media_kind == "video":
+        for share in (0.18, 0.5, 0.82):
+            frame = await asyncio.to_thread(
+                clip_speech.frame_of, str(path), share)
+            if frame:
+                images.append(base64.b64encode(frame).decode())
+    else:
+        raise ValueError("Only generated pictures and videos can be examined")
+    if not images:
+        raise ValueError("No readable frames could be taken from this media")
+    request_text = " ".join(str(
+        row.get("tags") or row.get("request") or "").split())[:1800]
+    look = (
+        "Examine this generated Pine Box FM media in depth. Describe the "
+        "visible people, objects, setting, composition, actions, changes "
+        "across the supplied frames, text on screen, visual defects, and how "
+        "faithfully it follows this generation direction: " + request_text)
+    async with _OLLAMA_GATE, httpx.AsyncClient(timeout=150) as client:
+        response = await client.post(
+            f"{OLLAMA_URL}/api/chat",
+            json={"model": VISION_MODEL,
+                  "messages": [{"role": "user", "content": look,
+                                "images": images}],
+                  "stream": False, "think": False, "keep_alive": "30m",
+                  "options": {"num_ctx": model_ctx(), "temperature": 0.35,
+                              "num_predict": 620}})
+        response.raise_for_status()
+        analysis = str(((response.json().get("message") or {})
+                        .get("content") or "")).strip()
+    analysis = re.sub(r"<think>.*?</think>", " ", analysis, flags=re.S)
+    analysis = " ".join(analysis.split())[:4000]
+    if not analysis:
+        raise ValueError("The vision model returned no interpretation")
+    await update_generation(str(row.get("prompt_id") or ""),
+                            analysis=analysis, analyzed_at=time.time(),
+                            analysis_model=VISION_MODEL)
+    return analysis
+
+
+@app.post("/api/comfy/workshop/analyze/{prompt_id}")
+@app.post("/api/comfy/workshop/analyse/{prompt_id}")
+async def comfy_workshop_analyze(
+    prompt_id: str, request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_auth(authorization)
+    row = workshop_generation(prompt_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="No such generation")
+    try:
+        payload = await request.json()
+    except Exception:  # noqa: BLE001
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    analysis = str(row.get("analysis") or "").strip()
+    if not analysis or payload.get("refresh"):
+        try:
+            analysis = await workshop_analyze_generation(row)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Vision analysis unavailable: {exc}") from exc
+    return {"ok": True, "prompt_id": prompt_id, "analysis": analysis,
+            "model": str(row.get("analysis_model") or VISION_MODEL),
+            "file": str((row.get("files") or [""])[0])}
+
+
+@app.post("/api/comfy/workshop/favorite/{prompt_id}")
+async def comfy_workshop_favorite(
+    prompt_id: str,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Remember a gallery preference without mutating or airing the render."""
+    require_auth(authorization)
+    row = workshop_generation(prompt_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="No such generation")
+    await update_generation(prompt_id, favorite=True, favored_at=time.time())
+    return {"ok": True, "prompt_id": prompt_id, "favorite": True}
+
+
+@app.post("/api/comfy/workshop")
+async def comfy_workshop_render(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_auth(authorization)
+    payload = await request.json()
+    if isinstance(payload, dict) and str(payload.get("purpose") or "").lower() == "parody_stinger":
+        if str(payload.get("mode") or "") != "reference" or not str(payload.get("source") or ""):
+            raise HTTPException(status_code=400, detail="Choose a reference video")
+        if not str(payload.get("prompt") or "").strip():
+            raise HTTPException(status_code=400, detail="Enter a parody direction")
+        queued = _parody_stinger_queue().add(payload)
+        _parody_stinger_wake.set()
+        return {"queued": True, "queue_id": queued["id"], "status": "queued"}
+    return await _comfy_workshop_render_payload(payload)
+
+
+async def _comfy_workshop_render_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Expected an object")
+    mode = str(payload.get("mode") or "text").lower()
+    if mode not in comfy_workshop.MODES:
+        raise HTTPException(status_code=400, detail="Unknown Workshop mode")
+    prompt = str(payload.get("prompt") or "").strip()
+    purpose = str(payload.get("purpose") or "").strip().lower()[:40]
+    speech = str(payload.get("speech") or "").strip()
+    if purpose == "image_ad" and not speech:
+        speech = comfy_workshop.quoted_speech(prompt)
+    if not prompt and not speech:
+        raise HTTPException(status_code=400, detail="Enter a prompt or choose a line")
+    upload_name = ""
+    media_kind = ""
+    source_id = str(payload.get("source") or "")
+    source_type = str(payload.get("source_type") or "")
+    reference_s = 0.0
+    trim_requested = "trim_in_s" in payload or "trim_out_s" in payload
+    trim_in_s = payload.get("trim_in_s") if trim_requested else None
+    trim_out_s = payload.get("trim_out_s") if trim_requested else None
+    try:
+        at_share = max(0.0, min(1.0, float(payload.get("at_share") or 0)))
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="Invalid reference position") from exc
+    if mode != "text":
+        try:
+            path, media_kind = await asyncio.to_thread(
+                workshop_source_path, source_type, source_id)
+            if trim_requested and (mode != "reference" or media_kind != "video"):
+                raise ValueError("Video trim needs a video reference")
+            if media_kind == "video":
+                source_s = await asyncio.to_thread(_media_duration_probe, path)
+                if mode == "reference":
+                    trim_start, reference_s = comfy_workshop.reference_window(
+                        source_s, at_share, trim_in_s, trim_out_s)
+                    if trim_requested:
+                        trim_in_s = trim_start
+                        trim_out_s = trim_start + reference_s
+                else:
+                    reference_s = source_s
+            upload_name, media_kind = await workshop_prepare_source(
+                path, media_kind, mode, at_share, trim_in_s, trim_out_s)
+        except (ValueError, FileNotFoundError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    elif trim_requested:
+        raise HTTPException(status_code=400, detail="Video trim needs a video reference")
+    if purpose == "image_ad" and (mode != "frame" or media_kind != "image"):
+        raise HTTPException(status_code=400,
+                            detail="A video ad needs a gallery image")
+
+    try:
+        duration_request = payload.get("duration_seconds", payload.get("duration_s"))
+        frame_count = (comfy_workshop.duration_frames(
+            duration_request, prompt=prompt, speech=speech,
+            reference_s=reference_s,
+            duration_mode=str(payload.get("duration_mode") or "auto"))
+            if duration_request is not None
+            or payload.get("frames") is None or
+            (reference_s > 0 and str(payload.get("frames")) == "73")
+            else comfy_workshop.clamp_frames(payload.get("frames")))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    step_count = comfy_workshop.clamp_steps(payload.get("steps"))
+    noise_seed = comfy_workshop.render_seed(payload.get("seed"))
+    final_prompt = comfy_workshop.compose_prompt(
+        prompt, speech, media_kind, mode)
+    try:
+        graph = comfy_workshop.build_workflow(
+            final_prompt, mode=mode, upload_name=upload_name,
+            media_kind=media_kind, frames=frame_count,
+            steps=step_count, seed=noise_seed)
+        prompt_id, model = await _submit_generation(
+            final_prompt, prompt or speech, "video", workflow=graph,
+            metadata={"mode": mode, "source": source_id,
+                      "source_type": source_type, "speech": speech[:800],
+                      "purpose": purpose,
+                      "source_generation": str(
+                          payload.get("source_generation") or "")[:120],
+                      "variant_of": str(
+                          payload.get("source_generation") or "")[:120],
+                      "air_it": bool(payload.get("air_it")),
+                      "frames": frame_count, "steps": step_count,
+                      "seed": noise_seed, "at_share": at_share,
+                      "trim_in_s": trim_in_s if trim_requested else None,
+                      "trim_out_s": trim_out_s if trim_requested else None})
+    except RenderRefused as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502,
+                            detail=f"ComfyUI unavailable: {exc}") from exc
+    return {"prompt_id": prompt_id, "model": model, "mode": mode,
+            "prompt": final_prompt, "air_it": bool(payload.get("air_it")),
+            "seed": noise_seed, "frames": frame_count,
+            "duration_seconds": round(frame_count / 24, 2),
+            "duration_s": round(frame_count / 24, 2)}
+
+
+_PARODY_STINGER_QUEUE: ParodyQueue | None = None
+_parody_stinger_wake = asyncio.Event()
+_parody_stinger_task: asyncio.Task | None = None
+
+
+def _parody_stinger_queue() -> ParodyQueue:
+    global _PARODY_STINGER_QUEUE
+    if _PARODY_STINGER_QUEUE is None:
+        _PARODY_STINGER_QUEUE = ParodyQueue(DATA_DIR / "parody_stinger_queue.sqlite3")
+    return _PARODY_STINGER_QUEUE
+
+
+@app.get("/api/comfy/workshop/parody-queue")
+async def comfy_workshop_parody_queue(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_read_auth(authorization)
+    jobs = await asyncio.to_thread(_parody_stinger_queue().list)
+    generations = await asyncio.to_thread(_read_all_generations)
+    by_prompt = {str(row.get("prompt_id") or ""): row for row in generations
+                 if row.get("prompt_id")}
+    for item in jobs:
+        if item["prompt_id"]:
+            generation = by_prompt.get(item["prompt_id"])
+            if generation:
+                item["render"] = {"status": generation.get("status"),
+                                  "model": generation.get("model"),
+                                  "frames": generation.get("frames"),
+                                  "stats": generation.get("stats") or {},
+                                  "files": generation.get("files") or []}
+    live = await comfy_idle_live()
+    admitted, why, available = await asyncio.to_thread(render_admission, "video")
+    required = VIDEO_RENDER_FLOOR_GB
+    if not live.get("up") or not live.get("observed"):
+        cause = "ComfyUI queue is unavailable; waiting to verify it is idle"
+    elif live.get("busy"):
+        cause = "ComfyUI is busy rendering; its active work will finish first"
+    elif not admitted:
+        cause = why
+    else:
+        cause = "Ready for the next stinger"
+    free = live.get("available_gb")
+    if free is None:
+        free = available
+    return {"jobs": jobs, "live": live,
+            "admission": {"ok": admitted and live.get("up") and live.get("observed")
+                          and not live.get("busy"), "why": cause,
+                          "available_gb": free, "required_gb": required}}
+
+
+async def _parody_stinger_step(queue: ParodyQueue, freed_for: str) -> tuple[int, str]:
+    active = await asyncio.to_thread(queue.active)
+    if active:
+        if active["status"] == "running":
+            generation = await asyncio.to_thread(workshop_generation, active["prompt_id"])
+            if generation and generation.get("status") == "done":
+                await asyncio.to_thread(queue.update, active["id"], "done")
+            elif generation and generation.get("status") in ("failed", "error", "cancelled", "lost", "unknown"):
+                await asyncio.to_thread(queue.update, active["id"], "failed",
+                                        str(generation.get("error") or
+                                            ("Render history needs review" if
+                                             generation["status"] in ("lost", "unknown") else
+                                             generation["status"])))
+            elif time.time() - float(active["started"] or 0) > 1800:
+                live = await comfy_idle_live()
+                if live.get("up") and live.get("observed") and not live.get("busy"):
+                    await asyncio.to_thread(queue.update, active["id"], "failed",
+                                            "Render has no completed output after 30 minutes and ComfyUI is idle")
+        return 5, freed_for
+    item = await asyncio.to_thread(queue.next)
+    if item is None:
+        return 15, ""
+    live = await comfy_idle_live()
+    free = live.get("available_gb")
+    if not live.get("up") or not live.get("observed"):
+        reason = "ComfyUI queue is unavailable; waiting to verify it is idle"
+    elif live.get("busy"):
+        reason = "ComfyUI is busy rendering; its active work will finish first"
+    else:
+        admitted, reason, _available = await asyncio.to_thread(render_admission, "video")
+        if not admitted and free is not None and free < VIDEO_RENDER_FLOOR_GB \
+                and freed_for != item["id"]:
+            freed_for = item["id"]
+            await asyncio.to_thread(queue.note, item["id"],
+                                    "Freeing finished idle Comfy cache")
+            fresh = await comfy_idle_live()
+            if fresh.get("up") and fresh.get("observed") and not fresh.get("busy"):
+                await comfy_unload("free", fresh.get("idle_seconds") or 0,
+                                   "a queued parody stinger needs memory")
+            live = await comfy_idle_live()
+            if live.get("up") and live.get("observed") and not live.get("busy"):
+                admitted, reason, _available = await asyncio.to_thread(
+                    render_admission, "video")
+            else:
+                admitted = False
+                reason = "ComfyUI became busy; waiting for its active work"
+        if admitted:
+            body = await asyncio.to_thread(queue.claim, item["id"])
+            if body is not None:
+                try:
+                    result = await _comfy_workshop_render_payload(body)
+                except HTTPException as exc:
+                    if exc.status_code == 409:
+                        await asyncio.to_thread(queue.update, item["id"], "queued",
+                                                str(exc.detail))
+                    elif exc.status_code in (502, 503):
+                        await asyncio.to_thread(queue.update, item["id"], "paused",
+                                                "Submission uncertain: %s; check gallery" % exc.detail)
+                    else:
+                        await asyncio.to_thread(queue.update, item["id"], "failed",
+                                                str(exc.detail))
+                except Exception as exc:  # noqa: BLE001
+                    await asyncio.to_thread(queue.update, item["id"], "paused",
+                                            "Submission uncertain: %s; check gallery" % exc)
+                else:
+                    await asyncio.to_thread(queue.update, item["id"], "running", "",
+                                            result["prompt_id"], result["model"])
+                return 0, freed_for
+    await asyncio.to_thread(queue.note, item["id"], reason)
+    return 10, freed_for
+
+
+async def _parody_stinger_worker() -> None:
+    queue = _parody_stinger_queue()
+    freed_for = ""
+    while True:
+        try:
+            delay, freed_for = await _parody_stinger_step(queue, freed_for)
+            if delay == 15:
+                _parody_stinger_wake.clear()
+                try:
+                    await asyncio.wait_for(_parody_stinger_wake.wait(), timeout=15)
+                except asyncio.TimeoutError:
+                    pass
+            elif delay:
+                await asyncio.sleep(delay)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            pipeline_log("gpu", "parody queue worker: %s" % exc)
+            await asyncio.sleep(10)
+
+
+@app.on_event("startup")
+async def _parody_stinger_start() -> None:
+    global _parody_stinger_task
+    _parody_stinger_queue()
+    _parody_stinger_task = asyncio.create_task(_parody_stinger_worker())
+
+
+@app.on_event("shutdown")
+async def _parody_stinger_stop() -> None:
+    if _parody_stinger_task is not None:
+        _parody_stinger_task.cancel()
+        try:
+            await _parody_stinger_task
+        except asyncio.CancelledError:
+            pass
+
+
+@app.post("/api/comfy/workshop/variant")
+async def comfy_workshop_variant(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Render another take from the same recipe or from its finished clip.
+
+    The old generation remains in the gallery.  A variant always receives a
+    new noise seed and records its parent/source, so choosing among takes is
+    evidence rather than an irreversible replacement.
+    """
+    require_auth(authorization)
+    payload = await request.json()
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Expected an object")
+    parent = workshop_generation(str(payload.get("prompt_id") or ""))
+    if parent is None:
+        raise HTTPException(status_code=404, detail="No such generation")
+
+    use_result = bool(payload.get("use_result"))
+    mode = str(parent.get("mode") or "text")
+    if mode not in comfy_workshop.MODES:
+        mode = "text"
+    source = str(parent.get("source") or "")
+    source_type = str(parent.get("source_type") or "")
+    source_generation = ""
+    upload_name = ""
+    media_kind = ""
+    at_share = max(0.0, min(1.0, float(parent.get("at_share") or 0)))
+    trim_in_s = None if use_result else parent.get("trim_in_s")
+    trim_out_s = None if use_result else parent.get("trim_out_s")
+
+    try:
+        if use_result:
+            files = [str(name) for name in (parent.get("files") or [])
+                     if str(name or "")]
+            if not files:
+                raise ValueError("This render has not produced media yet")
+            source = files[0]
+            source_type = "generation"
+            source_generation = str(parent.get("prompt_id") or "")
+            path, media_kind = await asyncio.to_thread(
+                workshop_source_path, source_type, source)
+            mode = "reference" if media_kind in {"video", "audio"} else "frame"
+            upload_name, media_kind = await workshop_prepare_source(
+                path, media_kind, mode, at_share)
+        elif mode != "text":
+            path, media_kind = await asyncio.to_thread(
+                workshop_source_path, source_type, source)
+            upload_name, media_kind = await workshop_prepare_source(
+                path, media_kind, mode, at_share, trim_in_s, trim_out_s)
+    except (ValueError, FileNotFoundError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    prompt = str(payload.get("prompt") or parent.get("tags")
+                 or parent.get("request") or "").strip()[:2600]
+    if not prompt:
+        raise HTTPException(status_code=400, detail="This generation has no prompt")
+    try:
+        duration_request = payload.get("duration_seconds", payload.get("duration_s"))
+        reference_s = 0.0
+        if mode == "reference" and media_kind == "video":
+            source_s = await asyncio.to_thread(_media_duration_probe, path)
+            _, reference_s = comfy_workshop.reference_window(
+                source_s, at_share, trim_in_s, trim_out_s)
+        frames = (comfy_workshop.duration_frames(
+            duration_request, prompt=prompt,
+            speech=str(parent.get("speech") or ""), reference_s=reference_s,
+            duration_mode=str(payload.get("duration_mode") or "auto"))
+            if duration_request is not None or payload.get("frames") is None
+            else comfy_workshop.clamp_frames(
+                payload.get("frames", parent.get("frames"))))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    steps = comfy_workshop.clamp_steps(
+        payload.get("steps", parent.get("steps")))
+    seed = comfy_workshop.render_seed(payload.get("seed"))
+    try:
+        graph = comfy_workshop.build_workflow(
+            prompt, mode=mode, upload_name=upload_name,
+            media_kind=media_kind, frames=frames, steps=steps, seed=seed)
+        prompt_id, model = await _submit_generation(
+            prompt, "Variant of " + str(parent.get("request") or
+                                        (parent.get("files") or ["render"])[0]),
+            "video", workflow=graph,
+            metadata={"mode": mode, "source": source,
+                      "source_type": source_type,
+                      "speech": str(parent.get("speech") or "")[:800],
+                      "air_it": bool(payload.get("air_it")),
+                      "frames": frames, "steps": steps, "seed": seed,
+                      "at_share": at_share,
+                      "trim_in_s": trim_in_s,
+                      "trim_out_s": trim_out_s,
+                      "variant_of": str(parent.get("prompt_id") or ""),
+                      "source_generation": source_generation})
+    except RenderRefused as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502,
+                            detail=f"ComfyUI unavailable: {exc}") from exc
+    return {"prompt_id": prompt_id, "model": model, "mode": mode,
+            "prompt": prompt, "seed": seed, "variant_of": parent.get("prompt_id"),
+            "use_result": use_result, "frames": frames,
+            "duration_seconds": round(frames / 24, 2),
+            "duration_s": round(frames / 24, 2)}
 
 
 # --- G1: THE LEDGERS (#1023 #1031 #1036 #1022 #1034 #1020 #1030) ---------
@@ -160417,6 +165000,12 @@ def airlog_row_from(entry: dict[str, Any]) -> dict[str, Any]:
             row["images"] = [str(i) for i in entry["images"]][:3]
         except Exception:  # noqa: BLE001
             pass
+    if entry.get("image_analysis_ids"):
+        try:
+            row["image_analysis_ids"] = [
+                str(i) for i in entry["image_analysis_ids"] if i][:3]
+        except Exception:  # noqa: BLE001
+            pass
     if entry.get("replay"):
         row["replay"] = True
     if entry.get("sfx"):                                   # [#1200]
@@ -160587,7 +165176,31 @@ def airlog_boot_withdraw(rows: dict[str, dict[str, Any]]) -> int:
         airlog_write_rows([dict(row) for row in stuck])
     except Exception:  # noqa: BLE001
         pass                    # a forgetful book never stops the air
+    # [#1328] WHAT THE SEQUENCER'S OWN BOOK SAYS ABOUT THESE ROUNDS.
+    #
+    # #1327 restores a round that was rendered and waiting as an inert
+    # CLAIM - it is not in `_held`, so it reserves no air and refuses no
+    # road, which is why it cannot fight this sweep whichever runs
+    # first.  What it cannot do is decide: it does not stat a file and
+    # it does not read the air log.  This sweep does both, and the rows
+    # it is holding are by definition rows nobody heard.  So it reads
+    # the claims, writes what they know into the withdrawal book, and
+    # then answers them by name below.
+    #
+    # This is also the first call to `playout_tell` on the boot road, so
+    # it is what builds the sequencer - which is what performs the
+    # restore.  On the ordinary road the restore therefore happens
+    # inside this sweep, before its verdict, with no timing to arrange.
+    _pl_carried: dict[str, dict[str, Any]] = {}
+    try:
+        for _claim in (playout_tell("carried") or []):
+            _claim_sid = str((_claim or {}).get("sid") or "")
+            if _claim_sid:
+                _pl_carried[_claim_sid] = dict(_claim)
+    except Exception:  # noqa: BLE001
+        pass
     for sid, group in by_round.items():
+        _pl_claim = _pl_carried.get(str(sid)) or {}        # [#1328]
         try:
             withdrawn_book_write({
                 "at": round(now, 3), "sid": sid,
@@ -160599,7 +165212,33 @@ def airlog_boot_withdraw(rows: dict[str, dict[str, Any]]) -> int:
                           for r in group][:12],
                 "seconds": round(sum(float(r.get("seconds") or 0)
                                      for r in group), 2),
+                # [#1328] ...AND WHAT WAS ACTUALLY LOST.  Without this the
+                # book could say a count of rows; with it, it names the
+                # round: which block of the script it was, which road
+                # made it, how long it had been waiting for its air
+                # moment, and the file that may still be on disk. That is
+                # what a road wanting to re-air it has to read, and it is
+                # the difference between a withdrawal and a receipt.
+                **({"playout": {k: _pl_claim.get(k) for k in (
+                    "key", "block", "ord", "road", "kind", "lines",
+                    "seconds", "cues", "media", "media_path",
+                    "occurrence", "audio_ready", "carried_age_s",
+                    "blockers", "needs", "why")}}
+                   if _pl_claim else {}),
             })
+        except Exception:  # noqa: BLE001
+            pass
+        # [#1328] THE CLAIM IS ANSWERED.  The round is withdrawn and the
+        # book says why, so the sequencer must stop carrying it - or the
+        # two books would disagree about the same round for the rest of
+        # the process, and the census would show a claim nobody will
+        # ever meet.  A claim reserved nothing, so dropping it moves no
+        # stamp; this is bookkeeping, and it is the whole handshake.
+        try:
+            playout_tell("forget",
+                         str(_pl_claim.get("key") or "")
+                         or ("sid:" + str(sid)),
+                         why="the boot sweep withdrew it (#1301)")
         except Exception:  # noqa: BLE001
             pass
     try:
@@ -163556,7 +168195,19 @@ def screenplay_compose(since: float, until: float, d: dict[str, Any],
     _blk_at: list[int] = []
     for _e in events:
         _g = _ord_of(_ord, _e.get("row") or {})               # 2026-09-14
-        _blk_at.append(int(_g[0]) if _g else -1)
+        # A one-row, unscripted block is catch-up bookkeeping, not a new
+        # segment. #1339 deliberately gave every line minted outside a
+        # prepared round a place in the ledger; treating each of those
+        # places as a scene boundary turned one conversation into a stack
+        # of one-line segment cards. A scripted block remains a real
+        # boundary, as does a multi-row catch-up run such as an SFX passage.
+        if _g:
+            _b = int(_g[0])
+            _scripted = bool(_g[2]) if len(_g) > 2 else True
+            _blk_at.append(
+                _b if (_scripted or _blocksize.get(_b, 0) >= 2) else -1)
+        else:
+            _blk_at.append(-1)
     _inside: set[int] = set()
     for _i, _b in enumerate(_blk_at):
         _before = next((_blk_at[_j] for _j in range(_i - 1, -1, -1)
@@ -179503,13 +184154,16 @@ RETIRE_PAGE_HTML = r"""<!doctype html>
   <span id="counts" class="meta"></span>
   <span style="flex:1"></span>
   <button id="refresh">Refresh</button>
+  <button id="modelAll" class="go" title="Have the orchestrator read each waiting round, the station's reasons and your recorded keep/remove practice, then air, hold or replace it and record why">Let the orchestrator decide</button>
   <button id="removeAll" class="rm">Remove all waiting</button>
   <button id="keepAll" class="kp">Keep all waiting</button>
   <!-- #1384 (#1107): the recording room, resumed from here. -->
   <button id="finishAll" class="kp" title="Send every round that is written but not fully recorded back to the recording room. Greyed rows are those rounds; they are not valid segments until it finishes them.">Resume recording the incomplete ones</button>
   <span id="finishBrief" class="meta"></span>
+  <span id="modelStatus" class="meta"></span>
 </header>
 <main>
+  <div id="question" class="banner"></div>
   <div class="note">Every item the station would have deleted from the cupboard waits here when its type's rule says
   to ask. Nothing waiting is deleted until you say so; <b>Keep</b> extends its life (and its airings when they were
   used up). Timers count down live. Rules are per type: whether to ask (rhymed only, everything, never), how many
@@ -179660,6 +184314,13 @@ function render() {
     + " in the cupboard (" + (c.rhymed || 0) + " rhymed) · larder cap " + (c.larder_cap || "?") + " + repertoire " + (c.repertoire_rows || "?");
   document.getElementById("removeAll").disabled = document.getElementById("keepAll").disabled = !(state.pending || []).length;
   const pend = state.pending || [];
+  const question = document.getElementById("question");
+  question.innerHTML = pend.length
+    ? '<b>Question:</b> Should each of these ' + pend.length
+      + ' waiting round(s) be aired, held for later, or removed and replaced?'
+      + '<div class="meta">Every row below includes the words, why the station asked, its readiness, airings and remaining life.</div>'
+    : '<b>No decision is waiting.</b> The station has no unanswered retirement question.';
+  document.getElementById("modelAll").disabled = !pend.length;
   document.getElementById("pending").innerHTML = pend.length ? '<table><tr><th>type</th><th>round</th><th>airings</th><th>life</th><th>asked</th><th></th></tr>'
     + pend.map((p) => '<tr class="pending' + (p.rhymed ? ' rhymed' : '') + '">' + itemCells(p)
       + '<td>' + (p.aired || 0) + '/' + (p.innings || 1) + (p.rest_left ? '<div class="meta">rests ' + fmt(p.rest_left) + '</div>' : '') + '</td>'
@@ -179834,6 +184495,20 @@ document.addEventListener("click", async (ev) => {
   }
 });
 document.getElementById("refresh").onclick = load;
+document.getElementById("modelAll").onclick = async () => {
+  if (busy || !(state.pending || []).length) return;
+  busy = true;
+  const b = document.getElementById("modelAll");
+  const status = document.getElementById("modelStatus");
+  b.disabled = true; status.textContent = "the orchestrator is reading the evidence and deciding...";
+  try {
+    const got = await api("/api/retire/decide-model", {
+      ids: (state.pending || []).map((p) => p.id), most: 50});
+    status.textContent = got.say || "decided";
+    await load();
+  } catch (e) { status.textContent = "the orchestrator refused: " + e.message; }
+  finally { busy = false; b.disabled = !(state.pending || []).length; }
+};
 document.getElementById("removeAll").onclick = () => { if (confirm("Remove every waiting item from the cupboard?")) decide((state.pending || []).map((p) => p.id), "remove", null); };
 document.getElementById("keepAll").onclick = () => decide((state.pending || []).map((p) => p.id), "keep", null);
 ["fRhymed", "fPending", "fAired", "fUnheard"].forEach((id) => document.getElementById(id).onchange = render);
@@ -179855,6 +184530,40 @@ async def api_retire(
     if summary:
         return retire_summary()
     return retire_state()
+
+
+@app.get("/api/retire/questions")
+async def api_retire_questions(
+    authorization: str | None = Header(default=None),
+    key: str = "",
+    most: int = 12,
+) -> dict[str, Any]:
+    """The actual unanswered items behind a retirement action notice."""
+    _journal_auth(authorization, key)
+    return retire_question_state(most)
+
+
+@app.post("/api/retire/decide-model")
+async def api_retire_decide_model(
+    request: Request,
+    authorization: str | None = Header(default=None),
+    key: str = "",
+) -> dict[str, Any]:
+    """Have the orchestrator judge and process the selected waiting items."""
+    if key and not authorization:
+        authorization = "Bearer " + str(key)
+    require_auth(authorization)
+    try:
+        payload = await request.json()
+    except Exception:  # noqa: BLE001
+        payload = {}
+    payload = payload if isinstance(payload, dict) else {}
+    ids = payload.get("ids")
+    if ids is not None and not isinstance(ids, list):
+        ids = [ids]
+    return await retire_orchestrator_decide(
+        [str(x) for x in (ids or []) if str(x)],
+        max(1, min(50, int(payload.get("most") or 24))))
 
 
 @app.post("/api/retire/decide")
@@ -180428,6 +185137,7 @@ CONTROL_PANEL_HTML = r"""
      below without changing how one letter of text looks. -->
 <link rel="stylesheet" href="/icons/pineicons.css">
 <script src="/icons/pine-icons.js"></script>
+<script src="/spark/asset/wall-transition.js"></script>
 <style>
 :root {
   color-scheme: dark;
@@ -181256,15 +185966,146 @@ button.danger {
 .gz-row .gz-acts button { padding: 3px 10px; font-size: 11px; }
 
 /* Lightbox */
-.lb-card { max-width: 900px; margin: 0 auto; }
+.lb-card { position: relative; width: min(1180px,100%); max-width: calc(100vw - 24px);
+  max-height: calc(100dvh - 24px); min-width: min(280px,100%); min-height: 160px;
+  margin: 0 auto; padding-bottom: 24px; box-sizing: border-box;
+  overflow: auto; resize: both; container-type: inline-size; }
+.lb-resize-handle { position: sticky; left: 100%; bottom: 0; z-index: 12;
+  display: flex; align-items: center; justify-content: center; width: 28px; height: 28px;
+  margin: -28px 0 0 auto; padding: 0; border: 1px solid #5f8b91;
+  border-radius: 4px; background: #19272d; color: #b5edf0;
+  cursor: nwse-resize; touch-action: none; user-select: none; }
+.lb-resize-handle:focus-visible { outline: 2px solid #8bd8e7; }
 .lb-imgwrap {
   position: relative; border-radius: 10px; overflow: hidden;
   border: 1px solid #2c3a4f; background: #0b1016; min-height: 60px;
 }
-#lightboxImg, .lb-mosaic { width: 100%; display: block; }
+.lb-imgwrap.lb-video {
+  width: 100%; height: auto; max-height: 66dvh;
+  aspect-ratio: 16 / 9;
+  margin-inline: auto;
+}
+.lb-pane { position: relative; min-width: 0; min-height: 0; background: #05090d; }
+.lb-pane > img, .lb-pane > video, .lb-mosaic {
+  width: 100%; height: 100%; display: block; object-fit: contain; background: #05090d;
+}
+.lb-pane > [hidden] { display: none; }
+.lb-video-cover { position: absolute; inset: 0; z-index: 6;
+  display: flex; align-items: center; justify-content: center;
+  background: #05090d; pointer-events: none; }
+.lb-video-cover[hidden] { display: none; }
+.lb-video-cover img { width: 100%; height: 100%; object-fit: contain; }
+.lb-video-cover.fallback img { width: min(18%,112px); height: auto;
+  aspect-ratio: 1; }
+.lb-media-state { position: absolute; z-index: 11; inset: 0; display: flex;
+  flex-direction: column; align-items: center; justify-content: center; gap: 10px;
+  padding: clamp(18px,4vw,48px); background: #05090d; color: #d9e4ea;
+  text-align: center; overflow-wrap: anywhere; }
+.lb-media-state[hidden] { display: none; }
+.lb-media-state button { min-height: 40px; }
+.lb-imgwrap:not(.lb-video) .lb-pane > img { height: auto; }
+.lb-imgwrap.lb-video .lb-generated { position: absolute; inset: 0; }
+.lb-reference { position: absolute; inset: 0; z-index: 3;
+  clip-path: inset(0 calc(100% - var(--lb-wipe, 50%)) 0 0); }
+.lb-pane-label { position: absolute; top: 10px; z-index: 7; padding: 4px 8px;
+  border: 1px solid #3b5065; border-radius: 4px; background: rgba(5,9,13,.82);
+  color: #dce8ee; font-size: 11px; pointer-events: none; }
+.lb-generated .lb-pane-label { right: 10px; }
+.lb-reference .lb-pane-label { left: 10px; }
+.lb-wipe-line { position: absolute; z-index: 8; top: 0; bottom: 0;
+  left: var(--lb-wipe, 50%); width: 2px; transform: translateX(-1px);
+  background: #65c7da; box-shadow: 0 0 14px rgba(101,199,218,.8);
+  pointer-events: none; }
+.lb-wipe { position: absolute; z-index: 9; left: var(--lb-wipe, 50%); top: 50%;
+  width: 42px; height: 54px; min-width: 42px; padding: 0; margin: 0;
+  transform: translate(-50%,-50%); border: 1px solid #65c7da;
+  border-radius: 5px; background: #111a22; color: #dce8ee;
+  box-shadow: 0 0 14px rgba(101,199,218,.42); cursor: ew-resize;
+  touch-action: none; user-select: none; }
+.lb-wipe::before { content: "\\2194"; font-size: 25px; line-height: 1; }
+.lb-wipe:hover, .lb-wipe:focus-visible { background: #182733; outline: 2px solid #8bd8e7;
+  outline-offset: 2px; }
+.lb-wipe.locked { cursor: default; border-color: #e5c46b; color: #e5c46b;
+  box-shadow: 0 0 14px rgba(229,196,107,.35); }
+.lb-comparebar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
+  padding: 8px 0 0; color: var(--muted); font-size: 12px; }
+.lb-comparebar button { min-height: 36px; }
+.lb-comparebar button[aria-pressed="true"] { border-color: #65c7da;
+  background: #17313a; color: #e8fdff; }
+.lb-imgwrap.lb-side { display: grid; grid-template-columns: minmax(0,1fr) minmax(0,1fr);
+  gap: 2px; aspect-ratio: 16 / 4.5; max-height: 66vh; }
+.lb-imgwrap.lb-video.lb-side {
+  width: 100%; height: auto; aspect-ratio: 32 / 9;
+}
+.lb-imgwrap.lb-side .lb-reference { position: relative; inset: auto;
+  clip-path: none; grid-column: 1; grid-row: 1; }
+.lb-imgwrap.lb-side .lb-generated { grid-column: 2; grid-row: 1; }
+.lb-imgwrap.lb-side .lb-wipe, .lb-imgwrap.lb-side .lb-wipe-line { display: none; }
+.lb-imgwrap.lb-side .lb-pane { position: relative; }
+.pine-video-assembly, .lb-video-assembly { border-radius: inherit; }
 .lb-meta { margin-top: 12px; color: #dfe7f2; font-size: 14px; line-height: 1.6; }
 .lb-meta b { color: var(--muted); font-weight: 600; }
+.lb-analysis { margin-top: 8px; padding-top: 8px; border-top: 1px solid #263442;
+  white-space: normal; overflow-wrap: anywhere; }
 .lb-actions { display: flex; gap: 10px; margin-top: 12px; flex-wrap: wrap; }
+.lb-export { display: grid; grid-template-columns: repeat(2,minmax(0,1fr))
+  minmax(140px,1.5fr) auto; gap: 8px; align-items: end; margin-top: 14px;
+  padding-top: 12px; border-top: 1px solid #263442; }
+.lb-export label { display: grid; gap: 4px; min-width: 0; font-size: 12px;
+  color: var(--muted); }
+.lb-export select, .lb-export input { width: 100%; min-width: 0; margin: 0; }
+@container (max-width: 680px) {
+  .lb-export { grid-template-columns: repeat(2,minmax(0,1fr)); }
+  .lb-export label:nth-child(3) { grid-column: 1/-1; }
+  .lb-export button { grid-column: 1/-1; }
+}
+.lb-admaker { display: grid; grid-template-columns: minmax(0,1fr); gap: 7px;
+  margin-top: 12px; padding-top: 12px; border-top: 1px solid #263442; }
+.lb-admaker[hidden] { display: none; }
+.lb-admaker textarea { width: 100%; min-width: 0; min-height: 58px; resize: vertical; }
+.lb-admaker .lb-actions { margin-top: 2px; }
+.lb-editor-overlay { position: fixed; inset: 0; z-index: 2147483600;
+  display: flex; align-items: center; justify-content: center; padding: 8px;
+  box-sizing: border-box; background: rgba(2,6,10,.94); }
+.lb-editor-dialog { width: min(1400px,calc(100vw - 16px));
+  height: min(920px,calc(100dvh - 16px)); min-width: min(320px,100%);
+  min-height: 260px; display: grid; grid-template-rows: auto minmax(0,1fr);
+  overflow: hidden; resize: both; border: 1px solid #40586a; border-radius: 6px;
+  background: #080d12; box-shadow: 0 22px 70px rgba(0,0,0,.72); }
+.lb-editor-bar { display: flex; align-items: center; gap: 10px; min-width: 0;
+  padding: 7px 9px; border-bottom: 1px solid #2c3a4f; background: #101820; }
+.lb-editor-bar strong { min-width: 0; overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap; }
+.lb-editor-bar button { margin-left: auto; flex: 0 0 auto; min-height: 36px; }
+.lb-editor-frame { width: 100%; height: 100%; min-width: 0; min-height: 0;
+  display: block; border: 0; background: #080d12; }
+@media (max-width: 720px) {
+  .lb-editor-overlay { padding: 0; }
+  .lb-editor-dialog { width: 100vw; height: 100dvh; min-width: 0;
+    min-height: 0; resize: none; border: 0; border-radius: 0; }
+}
+@container (max-width: 680px) {
+  .lb-imgwrap.lb-video.lb-side { grid-template-columns: 1fr;
+    grid-template-rows: repeat(2, minmax(0,1fr));
+    aspect-ratio: 8 / 9; max-height: none; }
+  .lb-imgwrap.lb-side .lb-reference { grid-column: 1; grid-row: 1; }
+  .lb-imgwrap.lb-side .lb-generated { grid-column: 1; grid-row: 2; }
+  .lb-comparebar { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); }
+  .lb-comparebar button { width: 100%; min-width: 0; }
+  .lb-comparebar span { grid-column: 1/-1; }
+}
+@media (max-width: 720px) {
+  #lightbox { padding: 6px !important; }
+  .lb-card { width: 100%; }
+  .lb-imgwrap.lb-video { width: 100%; height: auto; max-height: 52dvh; }
+  .lb-comparebar { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); }
+  .lb-comparebar button { width: 100%; }
+  .lb-comparebar span { grid-column: 1/-1; }
+  .lb-imgwrap.lb-video.lb-side { grid-template-columns: 1fr; grid-template-rows: 1fr 1fr;
+    width: 100%; height: auto; aspect-ratio: auto; max-height: none; }
+  .lb-imgwrap.lb-side .lb-reference { grid-column: 1; grid-row: 1; aspect-ratio: 16/9; }
+  .lb-imgwrap.lb-side .lb-generated { grid-column: 1; grid-row: 2; aspect-ratio: 16/9; }
+}
 @keyframes film-pop {
   0%   { transform: scale(0.1); opacity: 0; filter: brightness(2.4); }
   55%  { transform: scale(1.14); opacity: 1; filter: brightness(1.5); }
@@ -184166,15 +189007,15 @@ it from the shelf and read it first"
                title="Music level. Above 100% is a real gain stage — an audio
 element on its own cannot go past 100%.">
           🎵 Music
-          <input id="djGainMusic" type="range" min="0" max="600" value="100"
-                 oninput="djApplyGain()">
+          <input id="djGainMusic" type="range" min="0" max="200" value="100"
+                 oninput="djGainUser('music', event)">
           <span id="djGainMusicVal" class="val">100%</span>
         </label>
         <label class="film-size" style="flex:1;min-width:220px"
                title="How loud the DJs are, relative to the music.">
           🎙 DJ voice
-          <input id="djGainVoice" type="range" min="0" max="600" value="160"
-                 oninput="djApplyGain()">
+          <input id="djGainVoice" type="range" min="0" max="200" value="160"
+                 oninput="djGainUser('voice', event)">
           <span id="djGainVoiceVal" class="val">160%</span>
         </label>
       </div>
@@ -184702,25 +189543,92 @@ used. Right: colour by how recently — newest red/yellow, oldest white/blue.">
 </main>
 
 <div id="lightbox"
-     style="display:none;position:fixed;inset:0;z-index:50;
+     style="display:none;position:fixed;inset:0;z-index:2147483200;
             background:rgba(4,8,14,0.92);padding:24px;overflow-y:auto"
      onclick="closeLightbox(event)">
   <div class="lb-card" onclick="event.stopPropagation()">
     <div id="lbImgWrap" class="lb-imgwrap">
-      <img id="lightboxImg" alt="render">
-      <video id="lightboxVid" style="display:none;width:100%"
-             controls autoplay loop muted playsinline></video>
+      <div id="lbGeneratedPane" class="lb-pane lb-generated">
+        <span class="lb-pane-label">generated</span>
+        <img id="lightboxImg" alt="generated render">
+        <video id="lightboxVid" style="display:none"
+               controls playsinline preload="auto"></video>
+        <div id="lbGeneratedCover" class="lb-video-cover fallback" hidden
+             aria-hidden="true"><img src="/spark/asset/pinebox.png" alt=""></div>
+        <div id="lbGeneratedState" class="lb-media-state" hidden></div>
+      </div>
+      <div id="lbReferencePane" class="lb-pane lb-reference" hidden>
+        <span class="lb-pane-label">original</span>
+        <img id="lightboxRefImg" alt="original reference" hidden>
+        <video id="lightboxRefVid" controls playsinline preload="auto" hidden></video>
+        <div id="lbReferenceCover" class="lb-video-cover fallback" hidden
+             aria-hidden="true"><img src="/spark/asset/pinebox.png" alt=""></div>
+        <div id="lbReferenceState" class="lb-media-state" hidden>
+          <span></span>
+          <button type="button" onclick="retryLightboxReference()">Retry original</button>
+        </div>
+      </div>
+      <i id="lbWipeLine" class="lb-wipe-line" hidden></i>
+      <button id="lbWipe" class="lb-wipe" type="button"
+              aria-label="Drag the comparison divider; double-click to lock"
+              aria-pressed="false" hidden></button>
+    </div>
+    <div id="lbCompareBar" class="lb-comparebar" hidden>
+      <button id="lbIndependent" type="button" onclick="lightboxIndependentPlayback()">Independent</button>
+      <button id="lbPlayBoth" onclick="lightboxPlayback()">Play both</button>
+      <button id="lbPlaySequence" onclick="lightboxSequencePlayback(false)">Play in sequence</button>
+      <button id="lbReplaySequence" onclick="lightboxSequencePlayback(true)"
+              title="Replay original, then generated">&#8634; Replay sequence</button>
+      <button id="lbCompareMode" onclick="toggleLightboxCompare()">Side by side</button>
+      <button id="lbParodyEdit" type="button" onclick="editLightboxParody()" hidden>Edit</button>
+      <span id="lbCompareNote">original and generated, synchronized</span>
     </div>
     <div id="lightboxMeta" class="lb-meta"></div>
     <label style="margin-top:14px">Edit the prompt and render a new version</label>
     <textarea id="lbPrompt" style="min-height:70px"
       placeholder="Prompt / tags…"></textarea>
+    <div id="lbAdMaker" class="lb-admaker" hidden>
+      <label for="lbAdSpeech">Exact spoken line</label>
+      <textarea id="lbAdSpeech"
+        placeholder="Welcome to the Pine Box"></textarea>
+      <div class="lb-actions">
+        <button id="lbAdRender" class="primary"
+          onclick="makeImageVideoAd()">Generate video with audio</button>
+      </div>
+    </div>
+    <div class="lb-export">
+      <label for="lbExportScope">Media
+        <select id="lbExportScope">
+          <option value="generated">Generated</option>
+          <option value="original">Original</option>
+          <option value="both">Both (ZIP)</option>
+        </select>
+      </label>
+      <label for="lbExportDestination">Save to
+        <select id="lbExportDestination">
+          <option value="device">This device</option>
+          <option value="share">PineBoxRecordings</option>
+        </select>
+      </label>
+      <label for="lbExportName">Filename
+        <input id="lbExportName" type="text" maxlength="100" autocomplete="off">
+      </label>
+      <button id="lbExportButton" type="button" title="Export selected gallery media"
+              onclick="exportLightbox()">&#11015; Export</button>
+    </div>
     <div class="lb-actions">
       <button class="primary" onclick="regenLightbox()">Regenerate</button>
+      <button id="lbSameVariant" onclick="variantLightbox(false)">Another from same setup</button>
+      <button id="lbResultVariant" onclick="variantLightbox(true)">Use this render as reference</button>
+      <button id="lbAnalyze" onclick="analyzeLightbox()">Analyze</button>
+      <button id="lbTopic" onclick="topicLightbox()">Add to DJ topic</button>
+      <button id="lbImageAd" onclick="toggleImageAd()">Make video ad</button>
       <button class="danger" onclick="deleteLightbox()">Delete image</button>
       <button onclick="closeLightbox()">Close</button>
     </div>
     <div id="lbStatus" class="status"></div>
+    <button id="lbResizeHandle" class="lb-resize-handle" type="button"
+            title="Drag to resize the viewer" aria-label="Resize viewer">&#10530;</button>
   </div>
 </div>
 
@@ -185298,6 +190206,12 @@ const PINE_3JS = [
   {key: "comfydoc", label: "🩺 Comfy Doctor",    open: () => comfyDoctorPanel(),
    frame: {shade: () => comfyDoc, close: () => comfyDoctorClose(),
            width: 820, height: 600}},
+  {key: "comfyworkshop", label: "Comfy Workshop", open: () => comfyWorkshopOpen(),
+   frame: {shade: () => comfyWorkshopView && comfyWorkshopView.element,
+           card: ".cw-dialog", close: () => comfyWorkshopClose(),
+           onResize: () => { if (comfyWorkshopView) comfyWorkshopView.resize(); },
+           width: 1120, height: 820}},
+  {key: "genads", label: "Generated ads", open: () => genAdsOpen()},
   {key: "steward",  label: "🏥 Services",        open: () => stewardPanel(),
    frame: {shade: () => stewardBox, close: () => stewardClose(),
            width: 840, height: 620}},
@@ -185712,6 +190626,7 @@ function pineSlidesRestore() {
 
 function pine3JSAllOff() {
   try { stationFlowClose(); } catch (e) {}
+  try { comfyWorkshopClose(); } catch (e) {}
   rhymeCloudSource = null;                                     // #1068
   // Disarm the auto-reopeners FIRST (the on-air poll re-opens the inline
   // Mind within seconds otherwise), and stop the studio spiral BEFORE the
@@ -185779,6 +190694,7 @@ const PINE_3JS_BLURB = {
   orchlogic: "the orchestrator's logic, drawn",
   phone: "the call road: deck, RNG, writing, recording room, air",
   rapassembly: "a thought becoming a rhymed line on the air",
+  comfyworkshop: "MiniMax H3 video from text, a selected frame, or station reference media",
   crystal: "the data crystal itself",
   cloud: "the words the station is using",
   rhymecloud: "the rhymes it is landing on",
@@ -186031,6 +190947,7 @@ async function connect() {
 
 let galleryItems = [];
 const galleryURLs = {};
+const galleryPosterURLs = {};
 let galleryTimer = null;
 
 async function imageURL(filename) {
@@ -186050,14 +190967,24 @@ async function imageURL(filename) {
 }
 
 async function fetchImageInto(img, filename) {
+  if (isVideoFile(filename) && img.tagName === "IMG") {
+    img.dataset.posterFile = filename;
+    if (!galleryPosterURLs[filename]) {
+      galleryPosterURLs[filename] = api(
+        "/api/generations/poster-url/" + encodeURIComponent(filename)
+      ).then((data) => data.poster || "").catch(() => "");
+    }
+    const poster = await galleryPosterURLs[filename];
+    if (poster && img.dataset.posterFile === filename) img.src = poster;
+    return;
+  }
   const url = await imageURL(filename);
   if (url) img.src = url;
 }
 
 function isVideoFile(f) { return /\.(mp4|webm)$/i.test(f || ""); }
 
-// <img> or autoplaying <video>, matching the file. Both take .src, so
-// fetchImageInto works on either.
+// Decorative clips use still posters. Full video is loaded only in a player.
 /* #1425: DECORATION DOES NOT GET A DECODER WHEN NOBODY IS LOOKING.
  *
  * The long note in the commit carries the measurements. The short of it:
@@ -186153,22 +191080,31 @@ const PineDecor = (function () {
   return {watch, sweep};
 })();
 
+function mediaAssemblyBind(video) {
+  if (!video || !video.parentNode) return;
+  video.style.visibility = "";
+  if (!window.PineWallTransition
+      || typeof window.PineWallTransition.cover !== "function") return;
+  window.PineWallTransition.cover(video, {
+    container: video.parentNode,
+    className: "pine-video-assembly",
+    label: "CLIP ASSEMBLING",
+    zIndex: 2,
+  });
+}
+
+function mediaAssemblyDrop(host) {
+  if (!host || !host.querySelectorAll) return;
+  host.querySelectorAll("video").forEach((video) => {
+    const cover = video.__pineVideoAssembly;
+    if (cover && typeof cover.destroy === "function") cover.destroy();
+  });
+}
+
 function mediaElement(filename) {
-  if (isVideoFile(filename)) {
-    const vid = document.createElement("video");
-    vid.muted = true;
-    vid.defaultMuted = true;
-    vid.setAttribute("muted", "");
-    vid.dataset.pineDecor = "1";
-    vid.loop = true;
-    vid.autoplay = true;
-    vid.playsInline = true;
-    vid.preload = "metadata";      // #1425: not the whole file, for a tile
-    PineDecor.watch(vid);          // #1425
-    return vid;
-  }
   const img = document.createElement("img");
   img.loading = "lazy";
+  if (isVideoFile(filename)) img.src = "/spark/asset/pinebox.png";
   return img;
 }
 
@@ -186185,6 +191121,7 @@ async function loadGallery() {
     grid.textContent = error.message;
     return;
   }
+  mediaAssemblyDrop(grid);
   grid.innerHTML = "";
   if (!galleryItems.length) {
     const empty = document.createElement("div");
@@ -186811,6 +191748,656 @@ function metaRow(label, value) {
 }
 
 let lightboxItem = null;
+let lightboxReference = null;
+let lightboxSide = false;
+let lightboxCovers = [];
+let lightboxWipeLocked = false;
+let lightboxPlaybackMode = "independent";
+let lightboxSequenceStage = "";
+let lightboxOpenSerial = 0;
+let lightboxReferenceSerial = 0;
+let lightboxGeneratedSerial = 0;
+const lightboxDuckPlaying = new Set();
+let lightboxDuckFactor = 1;
+
+function lightboxDuckApply() {
+  try { djApplyGain(true); } catch (e) {}
+  try {
+    const level = pineMixerRead().video * lightboxDuckFactor;
+    if (window.PineSfxTv && window.PineSfxTv.level) window.PineSfxTv.level(level);
+    pineWallLevel(level);
+  } catch (e) {}
+}
+
+function lightboxDuckChange(video, playing, force) {
+  const key = video && video.id;
+  if (key !== "lightboxVid" && key !== "lightboxRefVid") return;
+  if (!playing && !force && !video.paused && !video.ended) return;
+  if (playing) lightboxDuckPlaying.add(key);
+  else lightboxDuckPlaying.delete(key);
+  const next = lightboxDuckPlaying.size ? 0.1 : 1;
+  if (next !== lightboxDuckFactor) {
+    lightboxDuckFactor = next;
+    lightboxDuckApply();
+  }
+}
+
+function lightboxDuckReset() {
+  lightboxDuckPlaying.clear();
+  if (lightboxDuckFactor !== 1) {
+    lightboxDuckFactor = 1;
+    lightboxDuckApply();
+  }
+}
+window.addEventListener("pagehide", lightboxDuckReset);
+
+function lightboxCoverDrop() {
+  lightboxCovers.forEach((cover) => {
+    try { cover.destroy(); } catch (e) { /* already gone */ }
+  });
+  lightboxCovers = [];
+}
+
+function lightboxCoverFor(video) {
+  return document.getElementById(video.id === "lightboxRefVid"
+    ? "lbReferenceCover" : "lbGeneratedCover");
+}
+
+function lightboxCoverReset(video) {
+  const cover = lightboxCoverFor(video);
+  if (!cover) return;
+  cover.dataset.serial = String(Number(cover.dataset.serial || 0) + 1);
+  cover.classList.add("fallback");
+  cover.querySelector("img").src = "/spark/asset/pinebox.png";
+  cover.hidden = false;
+  video.removeAttribute("poster");
+  video.style.visibility = "visible";
+}
+
+function lightboxPoster(video, url, current) {
+  if (!url) return;
+  const cover = lightboxCoverFor(video);
+  if (!cover) return;
+  const serial = cover.dataset.serial;
+  const probe = new Image();
+  probe.onload = () => {
+    if (!current() || cover.dataset.serial !== serial) return;
+    cover.querySelector("img").src = url;
+    cover.classList.remove("fallback");
+    video.poster = url;
+  };
+  probe.src = url;
+}
+
+function lightboxMediaState(which, message, retry) {
+  const state = document.getElementById(
+    which === "reference" ? "lbReferenceState" : "lbGeneratedState");
+  if (!state) return;
+  state.replaceChildren();
+  if (!message) {
+    state.hidden = true;
+    return;
+  }
+  const copy = document.createElement("span");
+  copy.textContent = String(message);
+  state.appendChild(copy);
+  if (typeof retry === "function") {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = which === "reference" ? "Retry original" : "Retry video";
+    button.onclick = retry;
+    state.appendChild(button);
+  }
+  state.hidden = false;
+}
+
+function lightboxVideoReady(video, pane, label, current, onReady, onError) {
+  if (!video || !pane) return;
+  if (video.__pineVideoAssembly
+      && typeof video.__pineVideoAssembly.destroy === "function") {
+    video.__pineVideoAssembly.destroy();
+  }
+  if (video.__pineCoverCleanup) video.__pineCoverCleanup();
+  lightboxCoverReset(video);
+  const cover = lightboxCoverFor(video);
+  let notified = false;
+  let frameHandle = 0;
+  let playbackStart = 0;
+  const reveal = () => {
+    if (current() && !video.paused && video.readyState >= 2 && cover)
+      cover.hidden = true;
+  };
+  const progress = (event) => {
+    if (video.currentTime > playbackStart + 0.02
+        || (event.type === "seeked" && video.currentTime > 0.02)) reveal();
+  };
+  const paused = () => {
+    if (cover) cover.hidden = false;
+  };
+  video.__pineCoverCleanup = () => {
+    video.removeEventListener("timeupdate", progress);
+    video.removeEventListener("seeked", progress);
+    video.removeEventListener("pause", paused);
+    if (frameHandle && video.cancelVideoFrameCallback)
+      video.cancelVideoFrameCallback(frameHandle);
+    frameHandle = 0;
+  };
+  video.addEventListener("pause", paused);
+  if (typeof video.requestVideoFrameCallback !== "function") {
+    video.addEventListener("timeupdate", progress);
+    video.addEventListener("seeked", progress);
+  }
+  const ready = () => {
+    if (!current() || video.readyState < 2 || video.videoWidth <= 0) return;
+    if (!notified && onReady) onReady();
+    notified = true;
+  };
+  const playing = () => {
+    if (!current()) return;
+    ready();
+    playbackStart = Number(video.currentTime) || 0;
+    if (typeof video.requestVideoFrameCallback === "function") {
+      if (frameHandle && video.cancelVideoFrameCallback)
+        video.cancelVideoFrameCallback(frameHandle);
+      frameHandle = video.requestVideoFrameCallback(reveal);
+    }
+  };
+  const failed = () => {
+    if (!current()) return;
+    lightboxDuckChange(video, false, true);
+    video.__pineCoverCleanup();
+    if (cover) cover.hidden = false;
+    if (onError) onError();
+  };
+  video.onloadeddata = ready;
+  video.oncanplay = ready;
+  video.onplaying = playing;
+  video.onerror = failed;
+  if (video.readyState >= 2) ready();
+}
+
+function lightboxRadialClip(which) {
+  const video = document.getElementById(
+    which === "reference" ? "lightboxRefVid" : "lightboxVid");
+  if (!video) return null;
+  const replay = () => {
+    try { video.currentTime = 0; } catch (e) {}
+    const started = video.play();
+    if (started && started.catch) started.catch(() => {});
+  };
+  if (which === "reference") {
+    const ref = lightboxReference;
+    if (!ref || ref.kind !== "video") return null;
+    const clip = {
+      id: ref.id || ref.name || "reference-video",
+      url: ref.url || video.currentSrc || video.src,
+      sting: ref.name || "original reference",
+      video: true,
+      source_type: ref.source_type || "recent",
+      source_generation: "",
+    };
+    clip.__pineActions = {
+      replay: replay,
+      parody: () => window.PineSfxTv.openParody(clip),
+      remove: false,
+    };
+    return clip;
+  }
+  if (!lightboxItem || !isVideoFile(lightboxItem.file)) return null;
+  const item = lightboxItem;
+  const clip = {
+    id: item.file,
+    url: video.currentSrc || video.src,
+    sting: genLabel(item),
+    video: true,
+    source_type: "generation",
+    source_generation: item.prompt_id || "",
+  };
+  clip.__pineActions = {
+    replay: replay,
+    parody: () => window.PineSfxTv.openParody(clip),
+    examine: () => analyzeLightbox(),
+    favorite: async () => {
+      if (!item.prompt_id) throw new Error("This video predates the generation record.");
+      await api("/api/comfy/workshop/favorite/" + encodeURIComponent(item.prompt_id), {
+        method: "POST", body: JSON.stringify({})
+      });
+      return "Marked as a favorite.";
+    },
+    remove: async () => { await deleteLightbox(); },
+  };
+  return clip;
+}
+
+function wireLightboxRadials() {
+  const tv = window.PineSfxTv;
+  if (!tv || typeof tv.wireRadial !== "function") return;
+  tv.wireRadial(document.getElementById("lightboxVid"),
+    () => lightboxRadialClip("generated"));
+  tv.wireRadial(document.getElementById("lightboxRefVid"),
+    () => lightboxRadialClip("reference"));
+}
+
+function lightboxComparePosition(value) {
+  const wrap = document.getElementById("lbImgWrap");
+  const pct = Math.max(0, Math.min(100, Number(value) || 0));
+  if (wrap) wrap.style.setProperty("--lb-wipe", pct + "%");
+  const handle = document.getElementById("lbWipe");
+  if (handle) {
+    handle.dataset.position = String(pct);
+    handle.setAttribute("aria-valuenow", String(Math.round(pct)));
+  }
+}
+
+function lightboxWipeLock(locked) {
+  lightboxWipeLocked = !!locked;
+  const handle = document.getElementById("lbWipe");
+  if (!handle) return;
+  handle.classList.toggle("locked", lightboxWipeLocked);
+  handle.setAttribute("aria-pressed", lightboxWipeLocked ? "true" : "false");
+  handle.title = lightboxWipeLocked
+    ? "Divider locked. Double-click to move it again."
+    : "Drag this handle to compare. Double-click to lock it.";
+}
+
+function wireLightboxWipe() {
+  const handle = document.getElementById("lbWipe");
+  const wrap = document.getElementById("lbImgWrap");
+  if (!handle || !wrap || handle.dataset.wired === "1") return;
+  handle.dataset.wired = "1";
+  let dragging = false;
+  const move = (event) => {
+    if (!dragging || lightboxWipeLocked) return;
+    const bounds = wrap.getBoundingClientRect();
+    if (!bounds.width) return;
+    lightboxComparePosition(((event.clientX - bounds.left) / bounds.width) * 100);
+  };
+  handle.addEventListener("pointerdown", (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    if (lightboxWipeLocked) return;
+    dragging = true;
+    try { handle.setPointerCapture(event.pointerId); } catch (e) {}
+    move(event);
+  });
+  handle.addEventListener("pointermove", move);
+  const release = (event) => {
+    if (!dragging) return;
+    dragging = false;
+    try { handle.releasePointerCapture(event.pointerId); } catch (e) {}
+  };
+  handle.addEventListener("pointerup", release);
+  handle.addEventListener("pointercancel", release);
+  handle.addEventListener("dblclick", (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    lightboxWipeLock(!lightboxWipeLocked);
+  });
+  handle.addEventListener("keydown", (event) => {
+    if (lightboxWipeLocked || (event.key !== "ArrowLeft" && event.key !== "ArrowRight")) return;
+    event.preventDefault();
+    const now = Number(handle.dataset.position || 50);
+    lightboxComparePosition(now + (event.key === "ArrowLeft" ? -2 : 2));
+  });
+}
+
+function syncLightboxReference(force) {
+  const made = document.getElementById("lightboxVid");
+  const source = document.getElementById("lightboxRefVid");
+  if (lightboxPlaybackMode !== "sync" || !made || !source || source.hidden
+      || !made.duration || !source.duration) return;
+  const rate = Math.max(0.25, Math.min(16, source.duration / made.duration));
+  if (Math.abs(source.playbackRate - rate) > 0.01) {
+    try { source.playbackRate = rate; } catch (e) { /* use the decoder's supported rate */ }
+  }
+  const target = Math.max(0, Math.min(source.duration,
+    (made.currentTime / made.duration) * source.duration));
+  if (force || Math.abs(source.currentTime - target) > 0.16) {
+    try { source.currentTime = target; } catch (e) { /* metadata may still be settling */ }
+  }
+  if (!made.paused && source.paused) {
+    const play = source.play();
+    if (play && play.catch) play.catch(() => {});
+  }
+}
+
+function lightboxSetPlaybackMode(mode, stage) {
+  lightboxPlaybackMode = mode === "sequence" || mode === "sync"
+    ? mode : "independent";
+  lightboxSequenceStage = stage || "";
+  const made = document.getElementById("lightboxVid");
+  const source = document.getElementById("lightboxRefVid");
+  if (lightboxPlaybackMode === "independent" && source) {
+    try { source.playbackRate = 1; } catch (e) {}
+  }
+  [made, source].forEach((video) => {
+    if (video) video.loop = lightboxPlaybackMode === "sync";
+  });
+  const independent = document.getElementById("lbIndependent");
+  const both = document.getElementById("lbPlayBoth");
+  const sequence = document.getElementById("lbPlaySequence");
+  if (independent) independent.setAttribute("aria-pressed",
+    String(lightboxPlaybackMode === "independent"));
+  if (both) both.setAttribute("aria-pressed",
+    String(lightboxPlaybackMode === "sync"));
+  if (sequence) sequence.setAttribute("aria-pressed",
+    String(lightboxPlaybackMode === "sequence"));
+  lightboxPlaybackLabel();
+}
+
+function lightboxIndependentPlayback() {
+  lightboxSetPlaybackMode("independent", "");
+}
+
+function lightboxPlayback() {
+  const made = document.getElementById("lightboxVid");
+  if (!made || made.style.display === "none") return;
+  const source = document.getElementById("lightboxRefVid");
+  const wasSync = lightboxPlaybackMode === "sync";
+  if (!wasSync) {
+    try { if (source) source.pause(); } catch (e) {}
+    lightboxSetPlaybackMode("sync", "");
+  }
+  if (made.paused) {
+    const play = made.play();
+    if (play && play.catch) play.catch(() => {});
+  } else if (wasSync) made.pause();
+  else syncLightboxReference(true);
+}
+
+function lightboxSequencePlayback(replay) {
+  const made = document.getElementById("lightboxVid");
+  const source = document.getElementById("lightboxRefVid");
+  const status = document.getElementById("lbStatus");
+  if (!made || !source || source.hidden || source.readyState < 2
+      || made.readyState < 2) {
+    if (status) status.textContent =
+      "Both the original and generated clips must be ready before sequential playback.";
+    return;
+  }
+  const active = lightboxSequenceStage === "generated" ? made : source;
+  if (!replay && lightboxPlaybackMode === "sequence" && active
+      && !active.paused && !active.ended) {
+    active.pause();
+    lightboxPlaybackLabel();
+    return;
+  }
+  if (!replay && lightboxPlaybackMode === "sequence"
+      && lightboxSequenceStage && lightboxSequenceStage !== "complete") {
+    const resumed = active.play();
+    if (resumed && resumed.catch) resumed.catch(() => {});
+    return;
+  }
+  try { source.pause(); made.pause(); } catch (e) {}
+  try { source.currentTime = 0; made.currentTime = 0; } catch (e) {}
+  lightboxSetPlaybackMode("sequence", "original");
+  if (status) status.textContent = "Playing original, then generated.";
+  const started = source.play();
+  if (started && started.catch) started.catch((error) => {
+    if (status) status.textContent = "The original could not start: " + error.message;
+  });
+}
+
+function lightboxPlaybackLabel() {
+  const made = document.getElementById("lightboxVid");
+  const source = document.getElementById("lightboxRefVid");
+  const button = document.getElementById("lbPlayBoth");
+  const sequence = document.getElementById("lbPlaySequence");
+  const note = document.getElementById("lbCompareNote");
+  if (button && made) button.textContent =
+    lightboxPlaybackMode === "sync" && !made.paused ? "Pause both" : "Play both";
+  if (sequence) {
+    const active = lightboxSequenceStage === "generated" ? made : source;
+    sequence.textContent = lightboxSequenceStage === "complete"
+      ? "Replay sequence"
+      : (lightboxPlaybackMode === "sequence" && active && !active.paused
+        ? "Pause sequence" : (lightboxPlaybackMode === "sequence"
+          && lightboxSequenceStage ? "Resume sequence" : "Play in sequence"));
+  }
+  if (note && lightboxReference) {
+    const name = lightboxReference.name || "original";
+    note.textContent = lightboxPlaybackMode === "sequence"
+      ? name + " first, then generated"
+      : name + " and generated, " + (lightboxPlaybackMode === "sync"
+        ? "synchronized" : "independent");
+  }
+}
+
+function toggleLightboxCompare() {
+  const wrap = document.getElementById("lbImgWrap");
+  const button = document.getElementById("lbCompareMode");
+  if (!wrap || !lightboxReference) return;
+  lightboxSide = !lightboxSide;
+  wrap.classList.toggle("lb-side", lightboxSide);
+  if (button) button.textContent = lightboxSide ? "Reveal slider" : "Side by side";
+}
+
+async function loadLightboxReference(item, openSerial) {
+  const pane = document.getElementById("lbReferencePane");
+  const refImg = document.getElementById("lightboxRefImg");
+  const refVid = document.getElementById("lightboxRefVid");
+  const compare = document.getElementById("lbCompareBar");
+  const wipe = document.getElementById("lbWipe");
+  const line = document.getElementById("lbWipeLine");
+  if (!pane || !item || !item.prompt_id) return;
+  const attempt = ++lightboxReferenceSerial;
+  const current = () => lightboxOpenSerial === openSerial
+    && lightboxReferenceSerial === attempt
+    && lightboxItem && lightboxItem.prompt_id === item.prompt_id;
+  lightboxMediaState("reference", "", null);
+  try { refVid.pause(); } catch (e) {}
+  lightboxDuckChange(refVid, false, true);
+  lightboxCoverReset(refVid);
+  refVid.removeAttribute("src");
+  try { refVid.load(); } catch (e) {}
+  refVid.hidden = true;
+  refImg.hidden = true;
+  try {
+    const ref = await api("/api/comfy/workshop/reference/"
+      + encodeURIComponent(item.prompt_id));
+    if (!current()) return;
+    if (!ref || !ref.available) {
+      pane.hidden = false;
+      compare.hidden = false;
+      lightboxMediaState("reference", (ref && ref.reason)
+        || "The recorded original is no longer available.",
+        retryLightboxReference);
+      lightboxPlaybackLabel();
+      return;
+    }
+    lightboxReference = ref;
+    document.getElementById("lbParodyEdit").hidden =
+      !(ref.kind === "video" && isVideoFile(item.file));
+    pane.hidden = false;
+    compare.hidden = false;
+    wipe.hidden = false;
+    line.hidden = false;
+    if (ref.kind === "video") {
+      const wrap = document.getElementById("lbImgWrap");
+      lightboxSide = true;
+      if (wrap) wrap.classList.add("lb-side");
+      document.getElementById("lbCompareMode").textContent = "Reveal slider";
+      refImg.hidden = true;
+      refVid.hidden = false;
+      refVid.controls = true;
+      refVid.muted = false;
+      refVid.defaultMuted = false;
+      refVid.preload = "auto";
+      refVid.loop = lightboxPlaybackMode === "sync";
+      lightboxVideoReady(refVid, pane, "ORIGINAL ASSEMBLING", current, () => {
+        lightboxMediaState("reference", "", null);
+        syncLightboxReference(true);
+        const made = document.getElementById("lightboxVid");
+        if (lightboxPlaybackMode === "sync" && made && !made.paused) {
+          const started = refVid.play();
+          if (started && started.catch) started.catch(() => {});
+        }
+        lightboxPlaybackLabel();
+      }, () => lightboxMediaState("reference",
+        "The original video could not be loaded or decoded. Its source may have moved.",
+        retryLightboxReference));
+      lightboxPoster(refVid, ref.poster, current);
+      refVid.src = ref.url;
+      refVid.load();
+      wireLightboxRadials();
+    } else {
+      refVid.hidden = true;
+      refVid.controls = false;
+      lightboxCoverFor(refVid).hidden = true;
+      refImg.hidden = false;
+      refImg.style.visibility = "hidden";
+      refImg.onload = () => {
+        if (!current()) return;
+        refImg.style.visibility = "visible";
+        lightboxMediaState("reference", "", null);
+      };
+      refImg.onerror = () => {
+        if (!current()) return;
+        refImg.style.visibility = "hidden";
+        lightboxMediaState("reference",
+          "The original image could not be loaded. Its source may have moved.",
+          retryLightboxReference);
+      };
+      refImg.src = ref.url;
+    }
+    lightboxPlaybackLabel();
+  } catch (e) {
+    if (!current()) return;
+    pane.hidden = false;
+    compare.hidden = false;
+    lightboxMediaState("reference", "Could not resolve the original: "
+      + ((e && e.message) || String(e)), retryLightboxReference);
+  }
+}
+
+function retryLightboxReference() {
+  if (!lightboxItem || !lightboxItem.prompt_id) return;
+  loadLightboxReference(lightboxItem, lightboxOpenSerial);
+}
+
+async function editLightboxParody() {
+  const item = lightboxItem;
+  const button = document.getElementById("lbParodyEdit");
+  if (!item || !item.prompt_id || !lightboxReference || button.disabled) return;
+  button.disabled = true;
+  try {
+    const opened = await api("/api/video-editor/parody/open", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({prompt_id: item.prompt_id}),
+      signal: AbortSignal.timeout(45000)
+    });
+    openLightboxVideoEditor(opened.editor_url + (SERVER_KEY
+      ? "&key=" + encodeURIComponent(SERVER_KEY) : ""));
+  } catch (error) {
+    setStatus("Video edit could not open: " + error.message, true);
+  } finally {
+    button.disabled = false;
+  }
+}
+
+let lightboxVideoEditor = null;
+
+function closeLightboxVideoEditor() {
+  const overlay = lightboxVideoEditor;
+  if (!overlay) return;
+  lightboxVideoEditor = null;
+  if (typeof overlay.__pineCleanup === "function") overlay.__pineCleanup();
+  overlay.remove();
+}
+
+function openLightboxVideoEditor(path) {
+  closeLightboxVideoEditor();
+  const overlay = document.createElement("div");
+  overlay.className = "lb-editor-overlay";
+  overlay.setAttribute("role", "presentation");
+  const dialog = document.createElement("section");
+  dialog.className = "lb-editor-dialog";
+  dialog.setAttribute("role", "dialog");
+  dialog.setAttribute("aria-modal", "true");
+  dialog.setAttribute("aria-label", "Splice original and generated videos");
+  const bar = document.createElement("div");
+  bar.className = "lb-editor-bar";
+  const title = document.createElement("strong");
+  title.textContent = "Video splice editor";
+  const close = document.createElement("button");
+  close.type = "button";
+  close.textContent = "Close editor";
+  const frame = document.createElement("iframe");
+  frame.className = "lb-editor-frame";
+  frame.title = "Video splice editor";
+  frame.setAttribute("allow", "autoplay; fullscreen");
+  frame.src = String(path || "");
+  bar.append(title, close);
+  dialog.append(bar, frame);
+  overlay.appendChild(dialog);
+  const onMessage = (event) => {
+    if (event.source !== frame.contentWindow || !event.data) return;
+    if (event.data.type === "pine-video-editor-close") {
+      closeLightboxVideoEditor();
+    } else if (event.data.type === "pine-video-editor-export") {
+      const detail = event.data.detail || {};
+      const status = document.getElementById("lbStatus");
+      if (status) status.textContent = "Spliced video saved"
+        + (detail.path ? " to " + detail.path : " to /sfx_ads") + ".";
+    }
+  };
+  const onKey = (event) => {
+    if (event.key === "Escape") closeLightboxVideoEditor();
+  };
+  overlay.__pineCleanup = () => {
+    window.removeEventListener("message", onMessage);
+    document.removeEventListener("keydown", onKey);
+  };
+  overlay.addEventListener("pointerdown", (event) => {
+    if (event.target === overlay) closeLightboxVideoEditor();
+  });
+  dialog.addEventListener("pointerdown", (event) => event.stopPropagation());
+  close.addEventListener("click", closeLightboxVideoEditor);
+  window.addEventListener("message", onMessage);
+  document.addEventListener("keydown", onKey);
+  document.body.appendChild(overlay);
+  lightboxVideoEditor = overlay;
+  close.focus();
+}
+
+async function loadLightboxGeneratedVideo(video, file, openSerial) {
+  lightboxDuckChange(video, false, true);
+  const pane = document.getElementById("lbGeneratedPane");
+  const attempt = ++lightboxGeneratedSerial;
+  const current = () => lightboxOpenSerial === openSerial
+    && lightboxGeneratedSerial === attempt
+    && lightboxItem && lightboxItem.file === file;
+  lightboxMediaState("generated", "", null);
+  lightboxVideoReady(video, pane, "GENERATED VIDEO ASSEMBLING", current,
+    () => {
+      lightboxMediaState("generated", "", null);
+      syncLightboxReference(true);
+      lightboxPlaybackLabel();
+    }, () => lightboxMediaState("generated",
+      "The generated video could not be loaded or decoded.",
+      retryLightboxGenerated));
+  api("/api/generations/poster-url/" + encodeURIComponent(file))
+    .then((data) => lightboxPoster(video, data.poster, current))
+    .catch(() => {});
+  try {
+    const url = await imageURL(file);
+    if (!current()) return;
+    if (!url) throw new Error("The generated file could not be resolved.");
+    video.src = url;
+    video.load();
+  } catch (e) {
+    if (!current()) return;
+    lightboxMediaState("generated", (e && e.message) || String(e),
+      retryLightboxGenerated);
+  }
+}
+
+function retryLightboxGenerated() {
+  if (!lightboxItem || !isVideoFile(lightboxItem.file)) return;
+  const video = document.getElementById("lightboxVid");
+  if (video) loadLightboxGeneratedVideo(
+    video, lightboxItem.file, lightboxOpenSerial);
+}
 
 function showLastRender() {
   // Newest finished render; fall back to raw ComfyUI output files.
@@ -186828,6 +192415,7 @@ function genByFile(file) {
 // Every gallery/filmstrip click funnels here. `file` is the filename;
 // `fallback` carries caption/model/ts when there's no generation record.
 function showLightbox(file, fallback) {
+  lightboxDuckReset();
   const g = genByFile(file) || {};
   fallback = fallback || {};
   const item = {
@@ -186835,26 +192423,149 @@ function showLightbox(file, fallback) {
     request: g.request || fallback.request || "",
     tags: g.tags || fallback.tags || fallback.cap || "",
     model: g.model || fallback.model || "",
+    prompt_id: g.prompt_id || fallback.prompt_id || "",
+    mode: g.mode || fallback.mode || "",
+    source: g.source || fallback.source || "",
+    source_type: g.source_type || fallback.source_type || "",
+    seed: g.seed != null ? g.seed : fallback.seed,
+    variant_of: g.variant_of || fallback.variant_of || "",
+    purpose: g.purpose || fallback.purpose || "",
+    analysis: g.analysis || fallback.analysis || "",
+    analysis_model: g.analysis_model || fallback.analysis_model || "",
     ts: g.ts || fallback.ts || 0,
     status: g.status || "",
     stats: g.stats || null,
   };
   lightboxItem = item;
+  const openSerial = ++lightboxOpenSerial;
   const overlay = document.getElementById("lightbox");
   overlay.style.display = "block";
+  wireLightboxResize();
+  if (!overlay.__pineBackdrop) {
+    overlay.__pineBackdrop = true;
+    overlay.addEventListener("pointerdown", (event) => {
+      if (event.target !== overlay) return;
+      event.preventDefault();
+      event.stopPropagation();
+      closeLightbox();
+    });
+  }
   const wrap = document.getElementById("lbImgWrap");
+  lightboxCoverDrop();
+  lightboxReference = null;
+  lightboxSide = false;
+  wrap.classList.remove("lb-side");
   wrap.querySelectorAll(".lb-mosaic").forEach((c) => c.remove());
   const img = document.getElementById("lightboxImg");
   const vid = document.getElementById("lightboxVid");
   const isVid = isVideoFile(file);
+  vid.muted = false;
+  vid.defaultMuted = false;
+  wrap.classList.toggle("lb-video", isVid);
   img.style.display = isVid ? "none" : "block";
   vid.style.display = isVid ? "block" : "none";
+  const pane = document.getElementById("lbReferencePane");
+  const refImg = document.getElementById("lightboxRefImg");
+  const refVid = document.getElementById("lightboxRefVid");
+  pane.hidden = true; refImg.hidden = true; refVid.hidden = true;
+  lightboxCoverReset(refVid);
+  lightboxCoverFor(refVid).hidden = true;
+  lightboxCoverReset(vid);
+  lightboxCoverFor(vid).hidden = !isVid;
+  lightboxMediaState("reference", "", null);
+  lightboxMediaState("generated", "", null);
+  refImg.removeAttribute("src");
+  try { refVid.pause(); } catch (e) {}
+  refVid.removeAttribute("src"); refVid.load();
+  document.getElementById("lbCompareBar").hidden = true;
+  document.getElementById("lbParodyEdit").hidden = true;
+  document.getElementById("lbWipe").hidden = true;
+  document.getElementById("lbWipeLine").hidden = true;
+  document.getElementById("lbCompareMode").textContent = "Side by side";
+  const wipe = document.getElementById("lbWipe");
+  wireLightboxWipe();
+  lightboxWipeLock(false);
+  lightboxComparePosition(50);
   img.removeAttribute("src");
+  try { vid.pause(); } catch (e) {}
   vid.removeAttribute("src");
-  if (file) fetchImageInto(isVid ? vid : img, file);
+  vid.load();
+  vid.onplay = () => {
+    lightboxDuckChange(vid, true);
+    if (lightboxPlaybackMode === "sync") {
+      syncLightboxReference(true);
+      const go = refVid.hidden ? null : refVid.play();
+      if (go && go.catch) go.catch(() => {});
+    } else if (lightboxPlaybackMode === "sequence") {
+      lightboxSequenceStage = "generated";
+    }
+    lightboxPlaybackLabel();
+  };
+  vid.onpause = () => {
+    lightboxDuckChange(vid, false);
+    if (lightboxPlaybackMode === "sync") {
+      try { refVid.pause(); } catch (e) {}
+    }
+    lightboxPlaybackLabel();
+  };
+  vid.onended = () => {
+    lightboxDuckChange(vid, false);
+    if (lightboxPlaybackMode === "sequence") {
+      lightboxSequenceStage = "complete";
+      const status = document.getElementById("lbStatus");
+      if (status) status.textContent = "Original and generated clips completed.";
+    }
+    lightboxPlaybackLabel();
+  };
+  vid.ontimeupdate = () => syncLightboxReference(false);
+  vid.onseeking = () => syncLightboxReference(true);
+  vid.onloadedmetadata = () => syncLightboxReference(true);
+  refVid.onloadedmetadata = () => syncLightboxReference(true);
+  refVid.onplay = () => {
+    lightboxDuckChange(refVid, true);
+    if (lightboxPlaybackMode === "sequence") {
+      lightboxSequenceStage = "original";
+      lightboxPlaybackLabel();
+    }
+  };
+  refVid.onpause = () => {
+    lightboxDuckChange(refVid, false);
+    lightboxPlaybackLabel();
+  };
+  refVid.onended = () => {
+    lightboxDuckChange(refVid, false);
+    if (lightboxPlaybackMode !== "sequence") return;
+    lightboxSequenceStage = "generated";
+    try { vid.currentTime = 0; } catch (e) {}
+    const started = vid.play();
+    if (started && started.catch) started.catch((error) => {
+      const status = document.getElementById("lbStatus");
+      if (status) status.textContent =
+        "The generated clip could not start: " + error.message;
+    });
+    lightboxPlaybackLabel();
+  };
+  lightboxSetPlaybackMode("independent", "");
+  if (file) {
+    if (isVid) loadLightboxGeneratedVideo(vid, file, openSerial);
+    else fetchImageInto(img, file);
+  }
   renderLightboxMeta(item);
   document.getElementById("lbPrompt").value = item.tags || item.request || "";
+  document.getElementById("lbExportScope").value = "generated";
+  document.getElementById("lbExportName").value = file.replace(/\.[^.]+$/, "");
   document.getElementById("lbStatus").textContent = "";
+  document.getElementById("lbSameVariant").hidden = !isVid || !item.prompt_id;
+  document.getElementById("lbResultVariant").hidden = !isVid || !item.prompt_id;
+  document.getElementById("lbAnalyze").hidden = !item.prompt_id;
+  document.getElementById("lbTopic").hidden = !item.prompt_id;
+  document.getElementById("lbImageAd").hidden = isVid;
+  document.getElementById("lbAdMaker").hidden = true;
+  document.getElementById("lbAdSpeech").value = "";
+  const del = document.querySelector("#lightbox .danger");
+  if (del) del.textContent = isVid ? "Delete video" : "Delete image";
+  if (isVid) loadLightboxReference(item, openSerial);
+  if (isVid) wireLightboxRadials();
 }
 
 function renderLightboxMeta(item) {
@@ -186864,6 +192575,12 @@ function renderLightboxMeta(item) {
   if (item.tags) meta.appendChild(metaRow("Tags", item.tags));
   const s = item.stats || {};
   const rows = [["Model", item.model || "—"]];
+  if (item.mode) rows.push(["Generation mode", item.mode]);
+  if (item.purpose) rows.push(["Purpose", item.purpose.replace(/_/g, " ")]);
+  if (item.source) rows.push(["Reference", item.source_type
+    ? item.source_type + " · " + item.source : item.source]);
+  if (item.seed != null) rows.push(["Variant seed", item.seed]);
+  if (item.variant_of) rows.push(["Variant of", item.variant_of]);
   if (s.duration_s != null) rows.push(["Render time", s.duration_s + " s"]);
   if (s.nodes != null) {
     rows.push(["Node graph",
@@ -186885,6 +192602,16 @@ function renderLightboxMeta(item) {
   if (item.ts) rows.push(["When", new Date(item.ts * 1000).toLocaleString()]);
   rows.push(["File", item.file]);
   rows.forEach((r) => meta.appendChild(metaRow(r[0], String(r[1]))));
+  if (item.analysis) {
+    const reading = document.createElement("div");
+    reading.className = "lb-analysis";
+    const title = document.createElement("b");
+    title.textContent = "Analysis" + (item.analysis_model
+      ? " (" + item.analysis_model + ")" : "") + ": ";
+    reading.appendChild(title);
+    reading.appendChild(document.createTextNode(item.analysis));
+    meta.appendChild(reading);
+  }
   if (!Object.keys(s).length) {
     const note = document.createElement("div");
     note.className = "muted";
@@ -186896,21 +192623,172 @@ function renderLightboxMeta(item) {
   }
 }
 
+async function analyzeLightbox() {
+  const status = document.getElementById("lbStatus");
+  if (!lightboxItem || !lightboxItem.prompt_id) {
+    status.textContent = "This item predates the saved generation record.";
+    return;
+  }
+  const button = document.getElementById("lbAnalyze");
+  if (button) button.disabled = true;
+  status.textContent = "Examining the selected media and its visible changes...";
+  try {
+    const result = await api("/api/comfy/workshop/analyze/"
+      + encodeURIComponent(lightboxItem.prompt_id), {
+        method: "POST", body: JSON.stringify({})
+      });
+    lightboxItem.analysis = result.analysis || "";
+    lightboxItem.analysis_model = result.model || "";
+    renderLightboxMeta(lightboxItem);
+    status.textContent = lightboxItem.analysis
+      ? "Analysis attached to this generation." : "No interpretation was returned.";
+  } catch (e) {
+    status.textContent = e.message;
+  } finally {
+    if (button) button.disabled = false;
+  }
+}
+
+async function topicLightbox() {
+  const status = document.getElementById("lbStatus");
+  if (!lightboxItem) return;
+  const direction = document.getElementById("lbPrompt").value.trim();
+  const parts = [
+    "Discuss this generated media: " + (lightboxItem.file || "gallery item") + ".",
+    direction ? "Its generation direction was: " + direction : "",
+    lightboxItem.analysis ? "The visual analysis says: " + lightboxItem.analysis : "",
+  ].filter(Boolean);
+  status.textContent = "Adding this media and its interpretation to the DJ topic bank...";
+  try {
+    await api("/api/dj/topics", {method: "POST", body: JSON.stringify({
+      text: parts.join(" ").slice(0, 5000), kind: "media", next: false,
+      media: lightboxItem.file, generation: lightboxItem.prompt_id || ""
+    })});
+    status.textContent = "Added to the DJs' topic bank.";
+  } catch (e) {
+    status.textContent = e.message;
+  }
+}
+
+function lightboxQuotedSpeech(value) {
+  const parts = [];
+  const pattern = /"([^"\n]+)"|“([^”\n]+)”/g;
+  let match;
+  while ((match = pattern.exec(String(value || ""))) !== null) {
+    const line = String(match[1] || match[2] || "").replace(/\s+/g, " ").trim();
+    if (line) parts.push(line);
+  }
+  return parts.join(" ").slice(0, 800);
+}
+
+function toggleImageAd() {
+  if (!lightboxItem || isVideoFile(lightboxItem.file)) return;
+  const panel = document.getElementById("lbAdMaker");
+  const speech = document.getElementById("lbAdSpeech");
+  panel.hidden = !panel.hidden;
+  if (!panel.hidden) {
+    if (!speech.value.trim()) {
+      speech.value = lightboxQuotedSpeech(
+        document.getElementById("lbPrompt").value);
+    }
+    speech.focus();
+  }
+}
+
+async function makeImageVideoAd() {
+  if (!lightboxItem || !lightboxItem.file
+      || isVideoFile(lightboxItem.file)) return;
+  const prompt = document.getElementById("lbPrompt").value.trim();
+  const speechInput = document.getElementById("lbAdSpeech");
+  const speech = speechInput.value.trim() || lightboxQuotedSpeech(prompt);
+  const status = document.getElementById("lbStatus");
+  const button = document.getElementById("lbAdRender");
+  if (!prompt && !speech) {
+    status.textContent = "Enter a video direction or spoken line.";
+    return;
+  }
+  button.disabled = true;
+  status.textContent = "Preparing the selected image as a video ad…";
+  try {
+    const made = await api("/api/comfy/workshop", {
+      method: "POST",
+      body: JSON.stringify({
+        mode: "frame",
+        purpose: "image_ad",
+        source: lightboxItem.file,
+        source_type: "generation",
+        source_generation: lightboxItem.prompt_id || "",
+        prompt: prompt,
+        speech: speech,
+        frames: 124,
+        steps: 4,
+        air_it: false,
+      }),
+    });
+    status.textContent = "Video ad queued with " + (made.model || "MiniMax H3")
+      + (made.seed != null ? " · variant " + made.seed : "") + ".";
+    setTimeout(refreshActivityImages, 4000);
+    setTimeout(loadGallery, 4000);
+  } catch (e) {
+    status.textContent = e.message;
+  } finally {
+    button.disabled = false;
+  }
+}
+
 async function regenLightbox() {
   const prompt = document.getElementById("lbPrompt").value.trim();
   const status = document.getElementById("lbStatus");
   if (!prompt) { status.textContent = "Enter a prompt."; return; }
   status.textContent = "Submitting a new render…";
   try {
-    const r = await api("/api/generate", {
-      method: "POST", body: JSON.stringify({ prompt })
+    const isVideo = !!(lightboxItem && isVideoFile(lightboxItem.file)
+      && lightboxItem.prompt_id);
+    const r = await api(isVideo
+      ? "/api/comfy/workshop/variant" : "/api/generate", {
+      method: "POST", body: JSON.stringify(isVideo
+        ? {prompt_id: lightboxItem.prompt_id, prompt: prompt, use_result: false}
+        : {prompt: prompt})
     });
     status.textContent =
       "Rendering with " + (r.model || "model") +
+      (r.seed != null ? " · variant " + r.seed : "") +
       " — it'll scroll into the gallery when done.";
     setTimeout(refreshActivityImages, 4000);
   } catch (e) {
     status.textContent = e.message;
+  }
+}
+
+async function variantLightbox(useResult) {
+  const status = document.getElementById("lbStatus");
+  if (!lightboxItem || !lightboxItem.prompt_id) {
+    status.textContent = "This item predates the saved generation setup.";
+    return;
+  }
+  const prompt = document.getElementById("lbPrompt").value.trim();
+  if (!prompt) { status.textContent = "Enter a prompt."; return; }
+  const button = document.getElementById(
+    useResult ? "lbResultVariant" : "lbSameVariant");
+  if (button) button.disabled = true;
+  status.textContent = useResult
+    ? "Preparing this finished clip as the next reference…"
+    : "Preparing another take from the same setup…";
+  try {
+    const made = await api("/api/comfy/workshop/variant", {
+      method: "POST",
+      body: JSON.stringify({prompt_id: lightboxItem.prompt_id,
+        prompt: prompt, use_result: !!useResult})
+    });
+    status.textContent = "Variant " + made.seed + " queued with "
+      + (made.model || "the saved model")
+      + (useResult ? " using this render as its reference."
+        : " from the original setup.");
+    setTimeout(refreshActivityImages, 4000);
+  } catch (e) {
+    status.textContent = e.message;
+  } finally {
+    if (button) button.disabled = false;
   }
 }
 
@@ -186919,8 +192797,12 @@ async function deleteLightbox() {
   const file = lightboxItem.file;
   const status = document.getElementById("lbStatus");
   const img = document.getElementById("lightboxImg");
+  const video = document.getElementById("lightboxVid");
   status.textContent = "Deleting…";
-  mosaicDissolve(img, async () => {
+  if (isVideoFile(file) && video && video.__pineVideoAssembly) {
+    video.__pineVideoAssembly.waiting();
+  }
+  const remove = async () => {
     try {
       await api("/api/generations/image/" + encodeURIComponent(file),
         { method: "DELETE" });
@@ -186941,8 +192823,13 @@ async function deleteLightbox() {
     } catch (e) {
       status.textContent = e.message;
       img.style.display = "block";
+      if (video && video.__pineVideoAssembly) {
+        video.__pineVideoAssembly.reveal();
+      }
     }
-  });
+  };
+  if (isVideoFile(file)) await remove();
+  else mosaicDissolve(img, remove);
 }
 
 // Canvas "mosaic dissolve": progressively coarsen the image into blocks,
@@ -186990,11 +192877,106 @@ function mosaicDissolve(imgEl, done) {
   requestAnimationFrame(frame);
 }
 
+function wireLightboxResize() {
+  const grip = document.getElementById("lbResizeHandle");
+  const card = grip && grip.closest(".lb-card");
+  if (!grip || !card || grip.__pineWired) return;
+  grip.__pineWired = true;
+  let start = null;
+  grip.addEventListener("pointerdown", (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    const box = card.getBoundingClientRect();
+    start = {x: event.clientX, y: event.clientY,
+      width: box.width, height: box.height};
+    grip.setPointerCapture(event.pointerId);
+  });
+  grip.addEventListener("pointermove", (event) => {
+    if (!start) return;
+    card.style.width = Math.max(280, Math.min(window.innerWidth - 24,
+      start.width + event.clientX - start.x)) + "px";
+    card.style.height = Math.max(160, Math.min(window.innerHeight - 24,
+      start.height + event.clientY - start.y)) + "px";
+  });
+  const stop = () => { start = null; };
+  grip.addEventListener("pointerup", stop);
+  grip.addEventListener("pointercancel", stop);
+}
+
+async function exportLightbox() {
+  if (!lightboxItem || !lightboxItem.file) return;
+  const button = document.getElementById("lbExportButton");
+  const status = document.getElementById("lbStatus");
+  const item = lightboxItem;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 300000);
+  button.disabled = true;
+  status.textContent = "Preparing export...";
+  try {
+    const result = await api("/api/gallery/export", {
+      method: "POST",
+      signal: controller.signal,
+      body: JSON.stringify({
+        prompt_id: item.prompt_id || "", file: item.file,
+        scope: document.getElementById("lbExportScope").value,
+        destination: document.getElementById("lbExportDestination").value,
+        name: document.getElementById("lbExportName").value,
+      }),
+    });
+    if (result.url) {
+      if (/PineBoxKiosk\//.test(navigator.userAgent)) {
+        if (!window.pineDesktop || !window.pineDesktop.saveGalleryExport) {
+          throw new Error("This tablet build cannot save gallery exports yet.");
+        }
+        const saved = await window.pineDesktop.saveGalleryExport({
+          route: result.url, name: result.name,
+        });
+        if (!saved || !saved.ok) {
+          throw new Error((saved && saved.detail) || "The tablet could not save the file.");
+        }
+        status.textContent = "Saved " + result.name + " to " + saved.where;
+      } else {
+        const link = document.createElement("a");
+        link.href = result.url;
+        link.download = result.name;
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+        status.textContent = "Downloading " + result.name;
+      }
+    } else {
+      status.textContent = result.name + " queued for PineBoxRecordings.";
+    }
+  } catch (error) {
+    status.textContent = "Export failed: " + error.message;
+  } finally {
+    clearTimeout(timeout);
+    button.disabled = false;
+  }
+}
+
 function closeLightbox(event) {
   if (event && event.target !== document.getElementById("lightbox")) return;
+  lightboxDuckReset();
+  lightboxOpenSerial += 1;
+  lightboxReferenceSerial += 1;
+  lightboxGeneratedSerial += 1;
   document.getElementById("lightbox").style.display = "none";
   const img = document.getElementById("lightboxImg");
   if (img) img.style.display = "block";
+  [document.getElementById("lightboxVid"),
+   document.getElementById("lightboxRefVid")].forEach((video) => {
+    if (!video) return;
+    try { video.pause(); } catch (e) {}
+    video.removeAttribute("src");
+    try { video.load(); } catch (e) {}
+  });
+  lightboxCoverDrop();
+  lightboxMediaState("reference", "", null);
+  lightboxMediaState("generated", "", null);
+  lightboxSetPlaybackMode("independent", "");
+  lightboxReference = null;
+  lightboxItem = null;
 }
 
 function currentPrompt() {
@@ -201129,7 +207111,7 @@ function pineMixerRead() {
   if (window.__pineDesktopVolume !== undefined) {
     return {voice: 1, music: 1, sfx: 1, video: 1};
   }
-  const one = (v) => { const n = Number(v); return Number.isFinite(n) ? Math.max(0, Math.min(1.5, n)) : 1; };
+  const one = (v) => { const n = Number(v); return Number.isFinite(n) ? Math.max(0, Math.min(2, n)) : 1; };
   let m = {};
   try { m = JSON.parse(localStorage.getItem(PINE_MIXER_KEY) || "{}") || {}; } catch (e) { m = {}; }
   return {voice: one(m.voice), music: one(m.music), sfx: one(m.sfx), video: one(m.video)};
@@ -201137,7 +207119,7 @@ function pineMixerRead() {
 function pineMixerVoiceLevel(el_, base) {
   const m = pineMixerRead();
   const sting = !!(el_ && el_.dataset && el_.dataset.pineSting === "1");
-  return Math.max(0, Math.min(1, Number(base) * (sting ? m.sfx : m.voice)));
+  return Math.max(0, Math.min(2, Number(base) * (sting ? m.sfx : m.voice)));
 }
 /* [#1192]: THE TABLET'S ENDLESS SET IS NATIVE, AND NO SLIDER COULD REACH IT.
  *
@@ -201162,8 +207144,13 @@ let pineWallWant = null;
 let pineWallBooked = false;
 let pineWallSent = null;
 function pineWallLevel(value) {
-  const want = Math.max(0, Math.min(1, Number(value)));
+  let want = Math.max(0, Math.min(2, Number(value)));
   if (!Number.isFinite(want)) return false;
+  try {
+    if (window.PineDuck && typeof window.PineDuck.level === "function") {
+      want *= Math.max(0, Math.min(1, Number(window.PineDuck.level()) || 0));
+    }
+  } catch (e) { /* the persisted level still applies */ }
   const bridge = window.pineDesktop;
   if (!bridge || typeof bridge.videoWall !== "function") return false;
   pineWallWant = want;
@@ -201194,7 +207181,7 @@ function pineMixerApply() {
     /* [#1192]: .sfx-tv-screen too - sfx-tv.js's own set names its element
      * that way, and only the panel's little CRT set uses .sfx-tv-tube. */
     document.querySelectorAll(".sfx-tv-tube video, .sfx-tv-screen video").forEach((v) => {
-      v.volume = Math.max(0, Math.min(1, m.video));
+      v.volume = Math.max(0, Math.min(1, m.video * lightboxDuckFactor));
       if (m.video > 0 && v.muted) v.muted = false;
     });
   } catch (e) { /* no tube up */ }
@@ -201209,10 +207196,10 @@ function pineMixerApply() {
      * answer everywhere else in this file. */
     if (window.PineSfxTv && window.PineSfxTv.level
         && window.__pineDesktopVolume === undefined) {
-      window.PineSfxTv.level(Math.max(0, Math.min(1, m.video)));
+      window.PineSfxTv.level(Math.max(0, Math.min(2, m.video * lightboxDuckFactor)));
     }
   } catch (e) { /* no set on this page */ }
-  try { pineWallLevel(m.video); } catch (e) { /* no wall on this build */ }   /* [#1192] */
+  try { pineWallLevel(m.video * lightboxDuckFactor); } catch (e) { /* no wall on this build */ }   /* [#1192] */
 }
 if (!window.pineMixer) {
   window.pineMixer = {
@@ -201227,25 +207214,69 @@ if (!window.pineMixer) {
   };
 }
 
-function djApplyGain() {
+function djGainUser(which, event) {
+  const bus = window.pineLevels;
+  if (event && event.isTrusted === false && bus && bus.get) {
+    djApplyGain();
+    return;
+  }
+  const input = document.getElementById(which === "voice" ? "djGainVoice" : "djGainMusic");
+  if (bus && bus.apply && input) {
+    bus.apply(which, Number(input.value) / 100);
+  } else {
+    djApplyGain();
+  }
+}
+
+function djApplyGain(transientOnly) {
+  const sharedLevels = window.pineLevels && window.pineLevels.get
+    ? window.pineLevels.get() : null;
+  if (sharedLevels && !transientOnly) {
+    for (const [stream, id] of [["music", "djGainMusic"], ["voice", "djGainVoice"]]) {
+      const input = document.getElementById(id);
+      const value = Number(sharedLevels[stream]);
+      if (input && Number.isFinite(value)) {
+        input.value = String(Math.round(Math.max(0, Math.min(2, value)) * 100));
+      }
+    }
+  }
   const level = djLevels();
-  ["djGainMusic", "djGainVoice", "djDuck"].forEach((id) => {
+  if (!transientOnly) ["djGainMusic", "djGainVoice", "djDuck"].forEach((id) => {
     const out = document.getElementById(id + "Val");
     const input = document.getElementById(id);
     if (out && input) out.textContent = input.value + "%";
   });
-  localStorage.setItem("djLevels", JSON.stringify({
+  const mediaSettings = document.getElementById("pmSettings");
+  if (mediaSettings && !transientOnly) mediaSettings.querySelectorAll("input[data-main-id]").forEach((slider) => {
+    const main = document.getElementById(slider.dataset.mainId);
+    if (!main || document.activeElement === slider) return;
+    slider.value = main.value;
+    if (slider.nextElementSibling) slider.nextElementSibling.textContent = main.value + "%";
+  });
+  if (!transientOnly) localStorage.setItem("djLevels", JSON.stringify({
     music: level.music, voice: level.voice, duck: level.duck,
   }));
 
-  const music = gainFor(document.getElementById("musicPlayer"), "music");
+  const musicPlayer = document.getElementById("musicPlayer");
+  const music = gainFor(musicPlayer, "music");
   // Ramp rather than jump: a step change in gain is an audible click.
   if (music) {
     // #744: an ad preview ducks the music exactly the way the DJs do,
     // at the operator's own duck depth and with the same click-free ramp.
-    const target = level.music
-      * ((djSpeaking || adPreviewUrl) ? (1 - level.duck) : 1)
-      * pineMixerRead().music;                                     /* #1419 */
+    const unified = !!sharedLevels;
+    const shared = unified ? Number(sharedLevels.music) : NaN;
+    const chosen = Number.isFinite(shared)
+      ? shared : level.music * pineMixerRead().music;
+    if (chosen <= 0 && musicPlayer && !musicPlayer.paused) musicPlayer.pause();
+    const staged = window.__pineDesktopVolume !== undefined && chosen < 1
+      ? 1 : chosen;
+    /* The unified listener level is the FINAL gain. The old panel used to
+     * multiply its speech duck over that value on every voice transition,
+     * making a visible 38% setting become 27% while the control still said
+     * 38%. Keep ducking only for an old host without the unified bus. */
+    const automaticDuck = unified ? 0 : level.duck;
+    const target = staged * lightboxDuckFactor
+      * ((djSpeaking || adPreviewUrl) ? (1 - automaticDuck) : 1);
     /* [#1192]: 0.12 was a THIRD of a second to arrive and measurably nothing
      * at all for the first 33 ms - "I'm adjusting them but it doesn't update
      * in real time".  A click needs a step change measured in samples; 0.03 s
@@ -201253,20 +207284,33 @@ function djApplyGain() {
      * ramp at 48 kHz and still silent. */
     music.node.gain.setTargetAtTime(target, music.context.currentTime, 0.03);
   }
-  // The DJ-voice <audio> elements play directly (not through the mixer), so
-  // the level slider must drive their .volume (audit #3/#15/#17/#18: the old
-  // GainNode was bound to id "djVoiceAudio", which never exists — the slider
-  // was dead). Element volume caps at 1.0; the clips are already RMS-leveled
-  // so 100% is the intended loudness.
-  const vlvl = Math.max(0, Math.min(1, level.voice));
+  // Every DJ element gets its own gain stage. A sting and a spoken line can
+  // alternate on the same player, so this is selected from the canonical bus
+  // each time rather than remembered by the element.
+  const vlvl = Math.max(0, Math.min(2, level.voice));
   /* #1147: inside the desktop app the SHELL owns live element volume
    * (#789/#981 - its injected script rewrites .volume within a second),
    * so writing here only made the level flutter twice per clip and the
    * panel slider look dead. One owner: the shell when present, this
    * slider in a plain browser. */
-  if (typeof djVoiceEls !== "undefined"
-      && window.__pineDesktopVolume === undefined) {
-    djVoiceEls.forEach((a) => { if (a) a.volume = pineMixerVoiceLevel(a, vlvl); });   /* #1419 */
+  if (typeof djVoiceEls !== "undefined") {
+    const shared = sharedLevels;
+    djVoiceEls.forEach((a, ix) => {
+      if (!a) return;
+      const sting = !!(a.dataset && a.dataset.pineSting === "1");
+      let want = shared ? Number(shared[sting ? "sfx" : "voice"]) : NaN;
+      if (!Number.isFinite(want)) want = pineMixerVoiceLevel(a, vlvl);
+      want = Math.max(0, Math.min(2, want));
+      const stage = gainFor(a, "voice" + ix);
+      if (stage) {
+        const boost = want > 1 ? want : 1;
+        stage.node.gain.setTargetAtTime(boost * lightboxDuckFactor,
+                                       stage.context.currentTime, 0.03);
+      }
+      if (window.__pineDesktopVolume === undefined) {
+        a.volume = Math.min(1, want) * (stage ? 1 : lightboxDuckFactor);
+      }
+    });   /* #1419 */
   }
 }
 
@@ -201340,12 +207384,17 @@ function pineMediaSettings() {
     input.min = main ? main.min : "0";
     input.max = main ? main.max : "200";
     input.value = main ? main.value : "100";
+    input.dataset.mainId = mainId;
     const val = row(label, input);
     val.textContent = input.value + "%";
     input.oninput = () => {
       if (main) main.value = input.value;
       val.textContent = input.value + "%";
-      djApplyGain();
+      const stream = mainId === "djGainMusic" ? "music"
+        : mainId === "djGainVoice" ? "voice" : "";
+      if (stream && window.pineLevels && window.pineLevels.apply) {
+        window.pineLevels.apply(stream, Number(input.value) / 100);
+      } else djApplyGain();
     };
   };
   route("music output", "music", (djLastState.music_to || "here"));
@@ -201364,11 +207413,20 @@ function djGainReset() {
     const el_ = document.getElementById(id);
     if (el_) el_.value = String(v);
   };
-  set("djGainMusic", 100); set("djGainVoice", 160); set("djDuck", 70);
+  if (window.pineLevels && window.pineLevels.applyAll) {
+    window.pineLevels.applyAll({music: 1, voice: 1.6});
+  } else {
+    set("djGainMusic", 100); set("djGainVoice", 160);
+  }
+  set("djDuck", 70);
   djApplyGain();
 }
 
 function djLoadLevels() {
+  if (window.pineLevels && window.pineLevels.get) {
+    djApplyGain();
+    return;
+  }
   try {
     const saved = JSON.parse(localStorage.getItem("djLevels") || "null");
     if (saved) {
@@ -206568,6 +212626,15 @@ function djResync(clock) {
     djLastTrack = "";
     return;
   }
+  /* A zero listener level parks the record. Keep following the station's
+   * clock, but do not reload or resume a track until the operator raises it. */
+  if (window.pineLevels && typeof window.pineLevels.get === "function"
+      && Number((window.pineLevels.get() || {}).music) <= 0) {
+    if (!player.paused) player.pause();
+    djLastTrack = "";
+    radioFollowing = true;
+    return;
+  }
   const age = djStateAt ? (Date.now() - djStateAt) / 1000 : 0;
   let target = (clock.server_ms - clock.started_ms) / 1000 + age;
   if (!isFinite(target) || target < 0) target = 0;
@@ -208020,10 +214087,19 @@ function djVoiceRetime(updates, serverMs, localNow = Date.now()) {
     changed = true;
   }
   if (changed) {
+    djVoiceQueue.sort(djVoiceCompare);
     if (djVoiceTimer) { clearTimeout(djVoiceTimer); djVoiceTimer = null; }
     djVoiceNext();
   }
   return changed;
+}
+
+function djVoiceCompare(left, right) {
+  const when = Number(left.broadcastAt || 0) - Number(right.broadcastAt || 0);
+  if (when) return when;
+  if (String(left.kind || "") === "reply" && String(right.kind || "") !== "reply") return -1;
+  if (String(right.kind || "") === "reply" && String(left.kind || "") !== "reply") return 1;
+  return 0;
 }
 
 function djVoicePlay(clip) {
@@ -208044,14 +214120,11 @@ function djVoicePlay(clip) {
    * sting in front of a presenter. It opens the little CRT set instead,
    * which carries its own sound. */
   if (clip.video) { djVideoTv(clip); return; }
-  /* #1147: a REPLY is a person being answered and outranks the queue -
-   * it goes to the head (the same #206 rule the floor honours), so an
-   * ack never waits out a 45-second announce hold behind a burst. */
-  if (String(clip.kind || "") === "reply") {
-    djVoiceQueue.unshift(clip);
-  } else {
-    djVoiceQueue.push(clip);
-  }
+  /* A reply wins a tie, but must never hide already-due speech behind a
+   * reservation in the future. Keep the queue ordered by actual airtime. */
+  djVoiceQueue.push(clip);
+  djVoiceQueue.sort(djVoiceCompare);
+  if (djVoiceTimer) { clearTimeout(djVoiceTimer); djVoiceTimer = null; }
   djVoiceNext();
 }
 
@@ -209023,7 +215096,9 @@ function djVoiceNext() {
         djVoiceNext();
         return;
       }
-      djVoiceQueue.push(clip); djVoiceNext();
+      djVoiceQueue.push(clip);
+      djVoiceQueue.sort(djVoiceCompare);
+      djVoiceNext();
     }, delay);
     djTalkMarkLive();
   };
@@ -218494,11 +224569,91 @@ let djMind = null;
 let stationFlowView = null;
 let stationFlowOpening = false;
 let stationFlowTicket = 0;
+let comfyWorkshopView = null;
+let comfyWorkshopOpening = false;
+let comfyWorkshopTicket = 0;
 
 function stationFlowClose() {
   stationFlowTicket++;
   if (stationFlowView) stationFlowView.close();
   stationFlowView = null;
+}
+
+function comfyWorkshopClose() {
+  comfyWorkshopTicket++;
+  const view = comfyWorkshopView;
+  comfyWorkshopView = null;
+  if (view && typeof view.close === "function") {
+    try { view.close(); } catch (e) { /* already gone */ }
+  }
+}
+
+async function comfyWorkshopOpen() {
+  if (comfyWorkshopView || comfyWorkshopOpening) return;
+  comfyWorkshopOpening = true;
+  const ticket = ++comfyWorkshopTicket;
+  if (!document.getElementById("comfyWorkshopStyle")) {
+    const style = document.createElement("link");
+    style.id = "comfyWorkshopStyle";
+    style.rel = "stylesheet";
+    style.href = "/comfy-workshop/comfy-workshop.css?v=1";
+    document.head.append(style);
+  }
+  try {
+    const module = await import("/comfy-workshop/comfy-workshop.js?v=1");
+    const view = await module.openComfyWorkshop({
+      request: (path, options) => api(path, options),
+      onClose: () => { if (comfyWorkshopView === view) comfyWorkshopView = null; }
+    });
+    if (ticket !== comfyWorkshopTicket) { view.close(); return; }
+    comfyWorkshopView = view;
+  } catch (error) {
+    setStatus("Comfy Workshop could not open: " + error.message, true);
+  } finally {
+    comfyWorkshopOpening = false;
+  }
+}
+
+let genAdsView = null;
+let genAdsOpening = false;
+let genAdsScriptPromise = null;
+function genAdsScript() {
+  if (window.PineGenAds) return Promise.resolve();
+  if (genAdsScriptPromise) return genAdsScriptPromise;
+  genAdsScriptPromise = new Promise((resolve, reject) => {
+    const script = document.createElement("script");
+    script.src = "/gen-ads/gen-ads.js?v=1";
+    script.onload = () => window.PineGenAds ? resolve()
+      : reject(new Error("Generated ads did not initialize"));
+    script.onerror = () => reject(new Error("Generated ads script did not load"));
+    document.head.append(script);
+  }).catch((error) => {
+    genAdsScriptPromise = null;
+    throw error;
+  });
+  return genAdsScriptPromise;
+}
+async function genAdsOpen() {
+  if (genAdsView || genAdsOpening) return;
+  genAdsOpening = true;
+  if (!document.getElementById("genAdsStyle")) {
+    const style = document.createElement("link");
+    style.id = "genAdsStyle";
+    style.rel = "stylesheet";
+    style.href = "/gen-ads/gen-ads.css?v=1";
+    document.head.append(style);
+  }
+  try {
+    await genAdsScript();
+    genAdsView = window.PineGenAds.open({
+      request: (path, options) => api(path, options),
+      onClose: () => { genAdsView = null; }
+    });
+  } catch (error) {
+    setStatus("Generated ads could not open: " + error.message, true);
+  } finally {
+    genAdsOpening = false;
+  }
 }
 
 let system2View = null;
@@ -233950,6 +240105,7 @@ function buildFilmstrip() {
     filmSignature = sig;
     filmItemCount = 0;
     track.style.animation = "none";
+    mediaAssemblyDrop(track);
     track.innerHTML =
       '<div class="film-empty">Images you generate will scroll by here…</div>';
     count.textContent = "";
@@ -233966,6 +240122,7 @@ function buildFilmstrip() {
   // Animate ONLY genuinely-new images (not every image on first load).
   const firstBuild = prevFilmFiles.size === 0;
   // Duplicate the sequence so the marquee loops seamlessly (0 → -50%).
+  mediaAssemblyDrop(track);
   track.innerHTML = "";
   const addCells = () =>
     entries.forEach((e, idx) => {
@@ -234368,6 +240525,15 @@ function consoleAddRender(g) {
   feed.appendChild(entry);
   trimAndScrollConsole(feed);
 }
+
+// The shared video workshop calls these when an H3 job lands. Keeping the
+// notification and gallery viewer on the panel's canonical roads means one
+// thumbnail opens the same comparison, analysis and variant tools as a tile.
+window.pineGenerationNotice = consoleAddRender;
+window.pineOpenGeneration = (generation) => {
+  const file = generation && (generation.files || [])[0];
+  if (file) showLightbox(file, generation);
+};
 
 /* ---- Header performance HUD (#34) ---- */
 
@@ -238064,13 +244230,13 @@ RADIO_PAGE_HTML = r"""<!doctype html>
   <div class="levels">
     <div class="lev">
       <label for="lvMusic">🎵 music</label>
-      <input id="lvMusic" type="range" min="0" max="100" value="20"
+      <input id="lvMusic" type="range" min="0" max="200" value="20"
              oninput="setLevels()" onchange="setLevels()">
       <span class="val" id="lvMusicVal">20%</span>
     </div>
     <div class="lev">
       <label for="lvVoice">🎙 DJs</label>
-      <input id="lvVoice" type="range" min="0" max="100" value="100"
+      <input id="lvVoice" type="range" min="0" max="200" value="100"
              oninput="setLevels()" onchange="setLevels()">
       <span class="val" id="lvVoiceVal">100%</span>
     </div>
@@ -238078,7 +244244,7 @@ RADIO_PAGE_HTML = r"""<!doctype html>
          stings - at their own level, like the two above. -->
     <div class="lev">
       <label for="lvSfx">🎬 SFX</label>
-      <input id="lvSfx" type="range" min="0" max="100" value="60"
+      <input id="lvSfx" type="range" min="0" max="200" value="60"
              oninput="setLevels()" onchange="setLevels()">
       <span class="val" id="lvSfxVal">60%</span>
     </div>
@@ -238239,7 +244405,9 @@ function setPlayerLevel(player, level) {
   if (gain) {
     const now = listenerAudioContext.currentTime;
     gain.gain.cancelScheduledValues(now);
-    gain.gain.setValueAtTime(Math.max(0, Math.min(1, level)), now);
+    gain.gain.setValueAtTime(Math.max(0, Math.min(2, level)), now);
+    player.volume = 1;
+    return;
   }
   // Keep this in sync for engines without Web Audio support. On mobile
   // engines that ignore media-element volume, the gain stage above wins.
@@ -238270,7 +244438,7 @@ function applyLevels() {
       tv.muted = true;
       tv.volume = 0;
     } else {
-      tv.volume = Math.max(0, Math.min(1, sfxLevel));
+      setPlayerLevel(tv, sfxLevel);
       tv.muted = sfxLevel <= 0;
     }
   }
@@ -239750,9 +245918,9 @@ function applySplitLevels() {
     splitMusic.gain.cancelScheduledValues(now);
     splitVoice.gain.cancelScheduledValues(now);
     splitMusic.gain.setTargetAtTime(
-      Math.max(0, Math.min(1.5, musicLevel)), now, 0.03);
+      Math.max(0, Math.min(2, musicLevel)), now, 0.03);
     splitVoice.gain.setTargetAtTime(
-      Math.max(0, Math.min(1.5, voiceLevel)), now, 0.03);
+      Math.max(0, Math.min(2, voiceLevel)), now, 0.03);
   } catch (e) {}
 }
 

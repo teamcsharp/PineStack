@@ -69,6 +69,15 @@ class SavedTakeValidationTests(unittest.TestCase):
         self.assertEqual([t.get("text") or t.get("chunk") for t in saved], [t[1] for t in self.turns])
         self.assertEqual(self.row, before)
 
+    def test_station_id_drop_take_is_valid_but_other_roads_cannot_use_it(self):
+        text = "Pine Box FM."
+        take = self.take(0, text, "drop", "stored-drop")
+        self.entry.update({"script": "A: " + text, "prep_kind": "station_id",
+                           "chunks": 1, "made": 1, "takes": [take],
+                           "keys": [take["key"]]})
+        self.assertEqual(len(app._ready_round_takes("station_id", self.row)), 1)
+        self.assertEqual(app._ready_round_takes("gallery", self.row), [])
+
     def test_source_turn_order_cannot_be_changed_by_reindexing_takes(self):
         takes = self.entry["takes"]
         takes[0], takes[1] = takes[1], takes[0]

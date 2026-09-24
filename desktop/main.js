@@ -3964,7 +3964,7 @@ async function courierRound() {
         let already = false;
         try {
           const st = fs.statSync(target);
-          already = Number(job.bytes) > 0 && st.size === Number(job.bytes);
+          already = !job.force && Number(job.bytes) > 0 && st.size === Number(job.bytes);
         } catch { already = false; }
         if (!already) {
           const response = await fetch(`${cfg.baseUrl}${job.url}`,

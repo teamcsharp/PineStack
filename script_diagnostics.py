@@ -477,6 +477,7 @@ def analyze_capture(view, server_context=None):
 
     # [#1189] WHAT KIND OF THING was sounding when nothing on the page named it.
     file_classes = Counter()
+    viewport_jumps = []
     previous = None
     for index, event in enumerate(events):
         audio = event['audio']
@@ -514,6 +515,27 @@ def analyze_capture(view, server_context=None):
             finding('mark_without_evidence', index)
         if previous:
             same_id = bool(event.get('highlight_id')) and event.get('highlight_id') == previous.get('highlight_id')
+            before_scroll = _number(previous.get('scroll_top_px'))
+            after_scroll = _number(event.get('scroll_top_px'))
+            owner = str(event.get('scroll_owner') or '')
+            viewport = _mapping(view.get('snapshot')).get('viewport')
+            pane_height = _number(_mapping(viewport).get('height_px')) or 0
+            jump_floor = max(240.0, pane_height * .60)
+            # The incident button already records who last moved the pane. A
+            # large automatic move while the same line remains highlighted is
+            # the operator-visible jump itself, independent of audio order.
+            # User/wheel/touch owners stay observations rather than faults.
+            if (same_id and before_scroll is not None and after_scroll is not None
+                    and abs(after_scroll - before_scroll) >= jump_floor
+                    and owner and not any(word in owner.lower()
+                                          for word in ('user', 'wheel', 'touch', 'drag'))):
+                viewport_jumps.append({
+                    'index': index,
+                    'delta_px': round(after_scroll - before_scroll),
+                    'owner': owner[:80],
+                    'line_id': str(event.get('highlight_id') or '')[:80],
+                })
+                finding('automatic_viewport_jump', index)
             if same_id:
                 # [#1282] THE SCRIPT'S OWN ORDER KEY IS THE DISCRIMINATOR, not the
                 # document revision. A revision guard was written here first, and it
@@ -581,6 +603,15 @@ def analyze_capture(view, server_context=None):
         'same_file_line_observation_gap': 'Active-line observations passed over a captured cue window; sampling gaps do not prove skipped audio.',
         'mark_without_evidence': 'The view marked a line ON AIR while its position was estimated, not read from a player; the mark must come from evidence.',   # [#1189]
     }
+    if viewport_jumps:
+        farthest = max(viewport_jumps, key=lambda item: abs(item['delta_px']))
+        owners = Counter(item['owner'] for item in viewport_jumps)
+        messages['automatic_viewport_jump'] = (
+            'The script pane moved automatically by as much as %dpx while the same line '
+            'remained highlighted; the scroll owner was %s.' % (
+                abs(farthest['delta_px']),
+                ', '.join('%s x%d' % pair for pair in owners.most_common(4))))
+        evidence['automatic_viewport_jump'] = viewport_jumps[:8]
     # [#1189] SAY WHAT IT WAS. 'path aliases require review' over a board sting is not
     # something an operator can act on; the class of the file is.
     if file_classes:

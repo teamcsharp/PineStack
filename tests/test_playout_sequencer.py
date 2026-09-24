@@ -87,6 +87,16 @@ class LinearPlayoutContractTests(unittest.TestCase):
         self.assertIsNone(self.seq.head())
         self.assertLessEqual(self.seq.page_floor(), self.clock())
 
+    def test_an_old_ready_round_keeps_its_slot_while_earlier_audio_plays(self):
+        """Age is not staleness while the round's turn is still ahead."""
+        self.seq.dispatched("long-opening", route="page", starts_at=self.clock(),
+                            seconds=120, delivery_id="opening-delivery")
+        self.seq.hold("ready-round", block=4, seconds=30, lines=5,
+                      road="banter", audio_ready=True)
+        self.clock.move(25)  # older than hold_reserve_s, 95s before its turn
+        self.assertEqual(self.seq.reserve_until(), self.clock() + 95 + 30)
+        self.assertEqual(self.seq.head()["key"], "ready-round")
+
     def test_shadow_records_pressure_without_enforcing_it(self):
         self.mode = MODE_SHADOW
         self.seq.hold("ready", block=1, seconds=20, audio_ready=True)
@@ -95,6 +105,18 @@ class LinearPlayoutContractTests(unittest.TestCase):
         self.assertFalse(verdict["enforced"])
         self.assertGreater(verdict["would_be_after"], 0)
         self.assertEqual(self.seq.page_floor(), 0.0)
+
+    def test_repaired_reservations_move_only_unstarted_audio(self):
+        self.seq.dispatched("one", route="page", starts_at=1060,
+                            seconds=5, delivery_id="one-delivery")
+        self.seq.dispatched("two", route="page", starts_at=1170,
+                            seconds=5, delivery_id="two-delivery")
+        self.assertTrue(self.seq.retime_unstarted("one-delivery", 1007))
+        self.assertTrue(self.seq.retime_unstarted("two-delivery", 1012))
+        self.assertAlmostEqual(self.seq.air_free_at("page"), 1017)
+        self.seq.heard(delivery_id="one-delivery", event="playing",
+                       position_s=1, audible=1, listener="tablet", at=1009)
+        self.assertFalse(self.seq.retime_unstarted("one-delivery", 1020))
 
 
 if __name__ == "__main__":

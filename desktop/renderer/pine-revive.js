@@ -739,31 +739,16 @@
     var slider = el('appVolume');
     if (slider) {
       var was = num(slider.value, -1);
-      if (was <= 5) {
-        slider.value = '55';
-        fire(slider, 'input');
-        did.push('the App volume was at ' + was + '% - put it to 55%');
-      } else {
-        found.push('the App volume is at ' + was + '%');
-      }
+      found.push('the App volume is at ' + was + '% (operator setting unchanged)');
     } else {
       found.push('this build has no App volume slider');
     }
 
     if (W.pineMixer && typeof W.pineMixer.get === 'function') {
       var mix = W.pineMixer.get() || {};
-      var fixes = {};
-      var names = [];
-      if (num(mix.voice, 1) <= 0.001) { fixes.voice = 1; names.push('voices'); }
-      if (num(mix.music, 1) <= 0.001) { fixes.music = 1; names.push('music'); }
-      if (names.length) {
-        try { W.pineMixer.set(fixes); } catch (err) { /* reported below */ }
-        did.push('the listener mixer had ' + names.join(' and ')
-                 + ' at zero - put back to unity');
-      } else {
-        found.push('the mixer reads voices ' + round(num(mix.voice, 1), 2)
-                   + ', music ' + round(num(mix.music, 1), 2));
-      }
+      found.push('the mixer reads voices ' + round(num(mix.voice, 1), 2)
+                 + ', music ' + round(num(mix.music, 1), 2)
+                 + ' (operator settings left unchanged)');
     }
 
     if (typeof W.pineMonitorSay === 'function') {
@@ -781,13 +766,17 @@
     }
 
     var player = el('desktopRadioPlayer');
-    if (player && player.paused && ctx.routeHere) {
+    var musicLevel = W.pineMixer && typeof W.pineMixer.get === 'function'
+      ? num((W.pineMixer.get() || {}).music, 1) : 1;
+    if (player && player.paused && ctx.routeHere && musicLevel > 0) {
       try {
         var going = player.play();
         if (going && going.catch) going.catch(function () { /* said below */ });
         did.push('this app music element was paused - started it from your click, '
                  + 'which is the gesture Chromium wants before it will play anything');
       } catch (err) { found.push('this app music element refused to start: ' + err); }
+    } else if (player && musicLevel <= 0) {
+      found.push('the music slider is at zero; the record remains paused');
     }
 
     return inEvery(panelReviveFn).then(function (answers) {

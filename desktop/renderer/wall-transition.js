@@ -554,6 +554,7 @@
     this.canvas.style.display = 'block';
     var tick = function () {
       self.frame = requestAnimationFrame(tick);
+      if (!self.canvas.isConnected) { self.stop(); return; }
       if (!self.size()) return;
       if (self.mode === 'three') {
         self.drift();
@@ -578,8 +579,166 @@
     this.points = [];
   };
 
+  /* ONE CONTRACT FOR AN EMPTY VIDEO.
+   *
+   * Chromium paints an empty <video> with a native play badge which CSS
+   * cannot restyle or contain.  `cover` owns the interval between a source
+   * being assigned and the first decoded frame: the element is invisible,
+   * the plexus assembles a short label over the exact same box, and the
+   * picture replaces it only on loadeddata/playing.  Callers retain their
+   * own transport and source logic; this is deliberately only presentation.
+   *
+   * The helper is opt-in rather than a MutationObserver over the document.
+   * Hidden warmers, one-pixel editor sources and profile-video decoders must
+   * never each allocate a WebGL context just because they are <video>s. */
+  function cover(video, options) {
+    options = options || {};
+    if (!video || !video.parentNode) return null;
+    if (video.__pineVideoAssembly) return video.__pineVideoAssembly;
+
+    var container = options.container || video.parentNode;
+    var canvas = document.createElement('canvas');
+    canvas.className = options.className || 'pine-video-assembly';
+    canvas.setAttribute('aria-hidden', 'true');
+    canvas.style.position = 'absolute';
+    canvas.style.inset = '0';
+    canvas.style.width = '100%';
+    canvas.style.height = '100%';
+    canvas.style.display = 'block';
+    canvas.style.pointerEvents = 'none';
+    canvas.style.background = options.background || '#05090d';
+    canvas.style.zIndex = String(options.zIndex == null ? 2 : options.zIndex);
+    try {
+      if (root.getComputedStyle
+          && root.getComputedStyle(container).position === 'static') {
+        container.style.position = 'relative';
+      }
+    } catch (err) { /* the absolute canvas still follows a positioned host */ }
+    container.appendChild(canvas);
+
+    var mark = document.createElement('img');
+    mark.className = 'pine-video-assembly-mark';
+    mark.alt = '';
+    mark.setAttribute('aria-hidden', 'true');
+    mark.src = (typeof root.desktopMusicUrl === 'function'
+      ? root.desktopMusicUrl('/spark/asset/pinebox.png')
+      : (/^https?:$/.test(location.protocol) ? '/spark/asset/pinebox.png'
+        : 'http://127.0.0.1:8096/spark/asset/pinebox.png'));
+    mark.style.cssText = 'position:absolute;left:50%;top:50%;' +
+      'width:min(18%,112px);height:auto;aspect-ratio:1;object-fit:contain;' +
+      'transform:translate(-50%,-50%);pointer-events:none;z-index:' +
+      String((options.zIndex == null ? 2 : Number(options.zIndex)) + 1);
+    mark.onerror = function () { mark.style.display = 'none'; };
+    container.appendChild(mark);
+
+    var made = null;
+    var gone = false;
+    var waiting = true;
+    var before = video.style.visibility;
+    var label = String(options.label || 'VIDEO ASSEMBLING');
+    var frameHandle = 0;
+    var seekStarted = false;
+
+    if (!video.getAttribute('poster')) video.setAttribute('poster', mark.src);
+
+    function start() {
+      if (gone) return;
+      waiting = true;
+      if (frameHandle && video.cancelVideoFrameCallback) {
+        video.cancelVideoFrameCallback(frameHandle);
+      }
+      frameHandle = 0;
+      if (video.readyState < 2) seekStarted = false;
+      video.style.visibility = 'hidden';
+      canvas.style.display = 'block';
+      if (mark.complete && !mark.naturalWidth) mark.style.display = 'none';
+      else mark.style.display = 'block';
+      if (made) made.start();
+    }
+    function reveal() {
+      if (gone) return;
+      waiting = false;
+      if (frameHandle && video.cancelVideoFrameCallback) {
+        video.cancelVideoFrameCallback(frameHandle);
+      }
+      frameHandle = 0;
+      video.style.visibility = before || 'visible';
+      canvas.style.display = 'none';
+      mark.style.display = 'none';
+      if (made) made.stop();
+    }
+    function ready() {
+      if (video.readyState < 2 || video.videoWidth <= 0) { start(); return; }
+      if (!frameHandle && typeof video.requestVideoFrameCallback === 'function') {
+        frameHandle = video.requestVideoFrameCallback(function () {
+          frameHandle = 0;
+          reveal();
+        });
+      }
+      if (!seekStarted && !video.seeking && video.paused
+          && isFinite(video.duration) && video.duration > 0.12
+          && video.currentTime < 0.01) {
+        seekStarted = true;
+        try { video.currentTime = Math.min(0.04, video.duration / 4); }
+        catch (err) { /* the frame callback or poster is still available */ }
+      }
+      if (typeof video.requestVideoFrameCallback !== 'function'
+          && !video.paused && video.currentTime > 0.04) reveal();
+    }
+    function seeked() {
+      if (video.readyState >= 2 && video.videoWidth > 0) reveal();
+    }
+    function progressed() {
+      if (typeof video.requestVideoFrameCallback !== 'function') ready();
+    }
+    function destroy() {
+      if (gone) return;
+      gone = true;
+      if (frameHandle && video.cancelVideoFrameCallback) {
+        video.cancelVideoFrameCallback(frameHandle);
+      }
+      ['loadstart', 'emptied', 'waiting', 'stalled', 'error', 'abort'].forEach(function (name) {
+        video.removeEventListener(name, start);
+      });
+      ['loadeddata', 'playing'].forEach(function (name) {
+        video.removeEventListener(name, ready);
+      });
+      video.removeEventListener('seeked', seeked);
+      video.removeEventListener('timeupdate', progressed);
+      video.style.visibility = before;
+      try { delete video.__pineVideoAssembly; } catch (err) { /* sealed node */ }
+      if (made) made.dispose();
+      if (canvas.parentNode) canvas.parentNode.removeChild(canvas);
+      if (mark.parentNode) mark.parentNode.removeChild(mark);
+    }
+
+    ['loadstart', 'emptied', 'waiting', 'stalled', 'error', 'abort'].forEach(function (name) {
+      video.addEventListener(name, start);
+    });
+    ['loadeddata', 'playing'].forEach(function (name) {
+      video.addEventListener(name, ready);
+    });
+    video.addEventListener('seeked', seeked);
+    video.addEventListener('timeupdate', progressed);
+    var controller = {waiting: start, reveal: reveal, destroy: destroy,
+      canvas: canvas, video: video, isWaiting: function () { return waiting; }};
+    video.__pineVideoAssembly = controller;
+    start();
+    new Plexus(canvas).build().then(function (plexus) {
+      if (gone) { plexus.dispose(); return; }
+      made = plexus;
+      /* The cloud does not just idle: it gathers into the state it is
+       * constructing, then loosens naturally while decoding continues. */
+      try { plexus.assemble(label, root.THREE); } catch (err) { /* drift remains */ }
+      if (waiting) plexus.start();
+    });
+    ready();
+    return controller;
+  }
+
   root.PineWallTransition = {
     create: function (canvas) { return new Plexus(canvas).build(); },
+    cover: cover,
     ASSEMBLE_MAX: ASSEMBLE_MAX
   };
   /* The name it deserves now that it is used in more than one place. */

@@ -67,6 +67,9 @@ const BITS_PER_PIXEL = 11;
 const ASSUMED = { width: 1340, height: 800 };
 
 const DEFAULTS = { size: 'half', fps: 15 };
+const FIRST_FRAME_TIMEOUT_MS = 12000;
+const STALLED_FRAME_TIMEOUT_MS = 5000;
+const WATCH_EVERY_MS = 1000;
 
 /* THE CAMERA'S KNOWN DOOR.
  *
@@ -100,6 +103,13 @@ class Mirror {
     this.convert = null;
     this.spare = Buffer.alloc(0);
     this.restarts = 0;
+    this.pipeAt = 0;
+    this.pipeFrames = 0;
+    this.rebuilding = false;
+    this.retryTimer = null;
+    this.watchdog = null;
+    this.failedStarts = 0;
+    this.lastRestartReason = '';
   }
 
   target(args) {
@@ -189,6 +199,8 @@ class Mirror {
     this.running = true;
     this.startedAt = Date.now();
     this.pipe();
+    this.watchdog = setInterval(() => this.health(), WATCH_EVERY_MS);
+    if (this.watchdog.unref) this.watchdog.unref();
     return this.where();
   }
 
@@ -203,7 +215,7 @@ class Mirror {
   retune(size) {
     if (!SIZES[size] || size === this.shape.size) return this.where();
     this.shape.size = size;
-    if (this.running) this.rebuild();
+    if (this.running) this.rebuild('capture size changed');
     return this.where();
   }
 
@@ -262,8 +274,13 @@ class Mirror {
       'Content-Type': 'multipart/x-mixed-replace; boundary=' + BOUNDARY,
       'Cache-Control': 'no-store, no-cache, must-revalidate',
       'Pragma': 'no-cache',
-      'Connection': 'close'
+      'Connection': 'keep-alive'
     });
+    try {
+      request.socket.setNoDelay(true);
+      request.socket.setKeepAlive(true, 1000);
+      request.socket.setTimeout(0);
+    } catch (error) { /* a local socket may already have closed */ }
     this.watchers.add(response);
     /* The frame already in hand, so a window that opens between frames shows
      * a picture immediately rather than a blank rectangle. */
@@ -276,13 +293,21 @@ class Mirror {
 
   push(response, jpeg) {
     try {
-      response.write('--' + BOUNDARY + '\r\n');
-      response.write('Content-Type: image/jpeg\r\n');
-      response.write('Content-Length: ' + jpeg.length + '\r\n\r\n');
-      response.write(jpeg);
-      response.write('\r\n');
+      if (response.destroyed || response.writableEnded) {
+        this.watchers.delete(response);
+        return false;
+      }
+      /* A local viewer can still decode more slowly than full-resolution
+       * JPEGs arrive. Keep at most the response's own bounded socket buffer;
+       * the next current frame is better than an ever-growing queue of stale
+       * ones and keeps the Electron main process responsive. */
+      if (response.writableNeedDrain) return false;
+      const head = Buffer.from('--' + BOUNDARY + '\r\nContent-Type: image/jpeg\r\n'
+        + 'Content-Length: ' + jpeg.length + '\r\n\r\n');
+      return response.write(Buffer.concat([head, jpeg, Buffer.from('\r\n')]));
     } catch (error) {
       this.watchers.delete(response);
+      return false;
     }
   }
 
@@ -290,6 +315,8 @@ class Mirror {
 
   pipe() {
     if (!this.running) return;
+    this.pipeAt = Date.now();
+    this.pipeFrames = this.frames;
     const { width, height, bitrate } = this.shapeFor(this.shape.size);
     const fps = this.shape.fps;
 
@@ -340,11 +367,16 @@ class Mirror {
 
     /* Whichever end dies, both are replaced - a half-built pipe produces no
      * pictures and holds a process open. */
-    const again = () => this.rebuild();
-    this.record.on('exit', again);
-    this.convert.on('exit', again);
-    this.record.on('error', (error) => { this.lastError = error.message; again(); });
-    this.convert.on('error', (error) => { this.lastError = error.message; again(); });
+    this.record.on('exit', () => this.rebuild('tablet encoder ended'));
+    this.convert.on('exit', () => this.rebuild('desktop decoder ended'));
+    this.record.on('error', (error) => {
+      this.lastError = error.message;
+      this.rebuild('tablet encoder error');
+    });
+    this.convert.on('error', (error) => {
+      this.lastError = error.message;
+      this.rebuild('desktop decoder error');
+    });
   }
 
   grumble(bytes) {
@@ -378,22 +410,42 @@ class Mirror {
       this.latest = Buffer.from(jpeg);
       this.frames += 1;
       this.lastFrameAt = Date.now();
+      this.failedStarts = 0;
+      this.lastError = '';
       for (const watcher of this.watchers) this.push(watcher, this.latest);
     }
   }
 
-  rebuild() {
+  /** A live child process is not proof of a live picture. */
+  health(now = Date.now()) {
+    if (!this.running || this.rebuilding || !this.pipeAt) return false;
+    const madeFrame = this.frames > this.pipeFrames;
+    const from = madeFrame ? this.lastFrameAt : this.pipeAt;
+    const limit = madeFrame ? STALLED_FRAME_TIMEOUT_MS : FIRST_FRAME_TIMEOUT_MS;
+    if (now - from <= limit) return false;
+    this.rebuild(madeFrame ? 'frame pipe stalled' : 'no first frame arrived');
+    return true;
+  }
+
+  rebuild(why) {
     if (!this.running || this.rebuilding) return;
     this.rebuilding = true;
+    this.lastRestartReason = String(why || 'stream ended');
+    this.lastError = this.lastRestartReason;
+    const hadFrames = this.frames > this.pipeFrames;
+    this.failedStarts = hadFrames ? 0 : Math.min(4, this.failedStarts + 1);
     this.kill();
     this.restarts += 1;
-    /* A breath before trying again: an unplugged tablet would otherwise
-     * spawn adb in a tight loop for as long as the window stays open. */
-    setTimeout(() => {
+    /* Back off only repeated starts that produced no picture. A healthy
+     * stream that merely hit Android's recording cap reconnects quickly. */
+    const delay = hadFrames ? 350 : Math.min(5000, 500 * (2 ** this.failedStarts));
+    clearTimeout(this.retryTimer);
+    this.retryTimer = setTimeout(() => {
+      this.retryTimer = null;
       this.rebuilding = false;
       this.spare = Buffer.alloc(0);
       this.pipe();
-    }, 700);
+    }, delay);
   }
 
   kill() {
@@ -409,6 +461,11 @@ class Mirror {
 
   close() {
     this.running = false;
+    clearInterval(this.watchdog);
+    clearTimeout(this.retryTimer);
+    this.watchdog = null;
+    this.retryTimer = null;
+    this.rebuilding = false;
     this.kill();
     for (const watcher of this.watchers) {
       try { watcher.end(); } catch (error) { /* gone */ }
@@ -430,6 +487,8 @@ class Mirror {
       frames: this.frames,
       watchers: this.watchers.size,
       restarts: this.restarts,
+      rebuilding: this.rebuilding,
+      restartReason: this.lastRestartReason,
       sinceFrameMs: still,
       size: this.shape.size,
       measured: this.measured,

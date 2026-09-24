@@ -150,6 +150,20 @@ class PlaybackAcknowledgmentTests(unittest.TestCase):
 
 
 class FlowJournalTests(unittest.TestCase):
+    def test_recent_incremental_reads_do_not_reopen_sqlite(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "flow.db"
+            path.write_bytes(b"present")
+            journal = FlowJournal(path)
+            journal.events.append({"id": 100, "at": 1.0, "node": "draft",
+                                   "status": "ok", "summary": "fresh",
+                                   "details": {}})
+            with mock.patch.object(journal, "_connect",
+                                   side_effect=AssertionError("disk read")):
+                result = journal.read(after=99, limit=10)
+            self.assertEqual([row["summary"] for row in result["events"]],
+                             ["fresh"])
+
     def test_history_survives_memory_rotation_and_supports_cursors(self):
         with tempfile.TemporaryDirectory() as folder:
             journal = FlowJournal(Path(folder) / "flow.db", keep=2)

@@ -79,6 +79,36 @@ class ReviewApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(again.json()["changed"])
         self.assertEqual(len(station._LARDER), 1)
 
+    async def test_note_endpoint_keeps_rejection_pending_and_checks_revision(self):
+        endpoint = "/api/orchestrator/rejections/" + self.row["id"] + "/note"
+        body = {"note": "Try the host's original wording next time.",
+                "expected_revision": self.row["revision"],
+                "expected_event_seq": self.row["event_seq"]}
+        denied = await self.request("POST", endpoint, body, authenticated=False)
+        self.assertIn(denied.status_code, (401, 403))
+        saved = await self.request("POST", endpoint, body)
+        self.assertEqual(saved.status_code, 200, saved.text)
+        self.assertEqual(saved.json()["row"]["review_status"], "pending")
+        detail = await self.request("GET", "/api/orchestrator/rejections/" + self.row["id"])
+        self.assertEqual(detail.json()["operator_notes"][0]["note"], body["note"])
+        self.assertEqual((await self.request("POST", endpoint, body)).status_code, 409)
+        self.assertEqual((await self.request("POST", endpoint, {"note": " "})).status_code, 400)
+        self.assertEqual(station._LARDER, [])
+
+    async def test_review_detail_explains_profile_compatibility(self):
+        stored = '{"reply":6500,"turns":[6,8],"plot":["older",1],"tint":[]}'
+        current = '{"reply":6500,"turns":[12,16],"plot":["newer",2],"tint":[]}'
+        row = self.store.record("call_contract", "A separate call", "A revised call",
+            ["repeated premise"], context={"kind": "caller", "entry": {"profile": stored}})
+        with mock.patch.object(station, "_larder_profile_signature", return_value=current):
+            response = await self.request("GET", "/api/orchestrator/rejections/" + row["id"])
+        self.assertEqual(response.status_code, 200, response.text)
+        check = response.json()["profile_check"]
+        self.assertTrue(check["compatible"])
+        self.assertEqual(check["differences"], [])
+        self.assertEqual(check["ignored_fields"], ["turns", "plot"])
+        self.assertEqual(check["stored"]["reply"], 6500)
+
     async def test_bulk_snapshot_is_authenticated_idempotent_and_never_runs_rooms_in_request(self):
         endpoint = "/api/orchestrator/rejections/approve-current"
         body = {"request_id": "api-current-batch"}

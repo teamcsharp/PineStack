@@ -1164,6 +1164,15 @@ class ScriptProducer:
         except sm.ManifestError as exc:
             out.refusals.append(refuse("script_refused", str(exc)))
             return None
+        # A resumed sitting rebuilds the same content-addressed revision.
+        # `created_at` is deliberately outside that digest, so generating a
+        # fresh timestamp made an otherwise identical, already-admitted
+        # script look like an attempt to mutate pinned broadcast history.
+        # Keep the original provenance stamp; the store will still reject
+        # any other difference under this immutable revision.
+        existing = self.store.load_script(str(script["revision"]))
+        if existing is not None and existing.get("created_at") is not None:
+            script["created_at"] = existing["created_at"]
         stored = self.store.put_script(script)
         if not stored.get("ok"):
             out.refusals.append(refuse(

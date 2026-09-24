@@ -49,3 +49,80 @@ test('valid silence and explicitly audio-free capture are described accurately',
   assert.equal(M.audioNotice({...source,has_audio:false,audio_capture:{video_only_explicit:true}}),'This recording was captured without audio.');
   assert.match(M.audioNotice({...source,has_audio:false}),/No audio was captured/);
 });
+
+test('splice timeline locates source time across independent segments',()=>{
+  const clips=[{source_id:'original',in_s:2,out_s:5},{source_id:'generated',in_s:7,out_s:9}];
+  assert.equal(M.spliceLength(clips),5);
+  assert.deepEqual(M.spliceLocate(clips,0),{index:0,source_id:'original',source_s:2,start_s:0});
+  assert.deepEqual(M.spliceLocate(clips,3.5),{index:1,source_id:'generated',source_s:7.5,start_s:3});
+  assert.equal(M.spliceLocate(clips,5).source_s,9);
+  assert.equal(M.spliceLocate([],0),null);
+});
+
+test('splice split, trim, move and delete leave source ranges and prior states intact',()=>{
+  const sources={original:{id:'original',duration:10},generated:{id:'generated',duration:12}};
+  const first=[M.spliceClip(sources.original,1,6),M.spliceClip(sources.generated,2,8)];
+  const split=M.spliceSplit(first,0,3);
+  assert.deepEqual(split.slice(0,2),[{source_id:'original',in_s:1,out_s:3},{source_id:'original',in_s:3,out_s:6}]);
+  assert.deepEqual(first[0],{source_id:'original',in_s:1,out_s:6});
+  assert.deepEqual(M.spliceSplit(split,0,1.05),split);
+  const trimmed=M.spliceTrim(split,1,'in',100,sources);
+  assert.ok(Math.abs(trimmed[1].out_s-trimmed[1].in_s-.1)<1e-9);
+  assert.equal(split[1].in_s,3);
+  assert.deepEqual(M.spliceMove(split,2,0).map(c=>c.source_id),['generated','original','original']);
+  assert.deepEqual(M.spliceMove(split,0,9),split);
+});
+
+test('splice export contains ordered sources and complete editable clip decisions',()=>{
+  const sources={original:{id:'original',duration:10},generated:{id:'generated',duration:12}};
+  const clips=[M.spliceClip(sources.generated,4,5),M.spliceClip(sources.original,1,2)];
+  const body=M.spliceBody(['original','generated'],clips,'  Parody  ','permit',sources);
+  assert.deepEqual(body.source_ids,['original','generated']);
+  assert.equal(body.name,'Parody');assert.equal(body.save_token,'permit');
+  assert.deepEqual(body.clips.map(c=>[c.source_id,c.in_s,c.out_s,c.track,c.start_s]),[
+    ['generated',4,5,'base',0],['original',1,2,'base',1]
+  ]);
+  for(const clip of body.clips){assert.equal(clip.volume,1);assert.equal(clip.transition,'cut');assert.deepEqual(clip.mask,{closed:false,feather:0,invert:false,keyframes:[]});}
+  assert.throws(()=>M.spliceBody(['original','generated'],[{source_id:'other',in_s:0,out_s:1}],'x','',sources),/outside/);
+  assert.throws(()=>M.spliceBody(['original','generated'],[{source_id:'original',in_s:9,out_s:11}],'x','',sources),/outside/);
+  assert.throws(()=>M.spliceBody(['original','original'],clips,'x','',sources),/distinct/);
+  assert.throws(()=>M.spliceBody(['original','generated'],Array(41).fill(clips[0]),'x','',sources),/40 segments/);
+  const longSources={...sources,original:{id:'original',duration:20}};
+  assert.throws(()=>M.spliceBody(['original','generated'],Array(40).fill(M.spliceClip(longSources.original,0,20)),'x','',longSources),/ten minutes/);
+});
+
+test('audio split keeps independent named ranges through split, trim and reorder',()=>{
+  const audio={id:'sfx-a',duration:12,pine_sfx:{name:'Station sting'}};
+  const original=[M.audioSplitCreate(audio)];
+  assert.deepEqual(original,[{source_id:'sfx-a',in_s:0,out_s:12,name:'Station sting'}]);
+  const split=M.audioSplitAt(original,0,5);
+  assert.deepEqual(split,[{source_id:'sfx-a',in_s:0,out_s:5,name:'Station sting'},
+    {source_id:'sfx-a',in_s:5,out_s:12,name:'Part 2'}]);
+  assert.deepEqual(original,[{source_id:'sfx-a',in_s:0,out_s:12,name:'Station sting'}]);
+  assert.deepEqual(M.audioSplitAt(split,1,5.15),split);
+  const trimmed=M.audioSplitTrim(split,1,'in',6,audio);
+  assert.equal(trimmed[1].name,'Part 2');
+  assert.equal(trimmed[1].in_s,6);
+  const shortest=M.audioSplitTrim(split,1,'in',99,audio);
+  assert.ok(Math.abs(shortest[1].out_s-shortest[1].in_s-.2)<1e-9);
+  assert.deepEqual(M.spliceMove(trimmed,1,0).map(c=>c.name),['Part 2','Station sting']);
+});
+
+test('audio split export matches the single-source API and validates each piece',()=>{
+  const audio={id:'sfx-a',duration:12};
+  const clips=[{source_id:'sfx-a',in_s:5,out_s:8,name:'  Tail  '},
+    {source_id:'sfx-a',in_s:0,out_s:2,name:'Head'}];
+  assert.deepEqual(M.audioSplitBody(audio,clips,true,'permit'),{
+    source_id:'sfx-a',clips:[{in_s:5,out_s:8,name:'Tail'},{in_s:0,out_s:2,name:'Head'}],
+    keep_original:true,save_token:'permit'
+  });
+  assert.equal(M.audioSplitBody(audio,clips,false,'').keep_original,false);
+  assert.equal(clips[0].name,'  Tail  ');
+  assert.throws(()=>M.audioSplitBody(audio,[],true,''),/2 and 20/);
+  assert.throws(()=>M.audioSplitBody(audio,[clips[0]],true,''),/2 and 20/);
+  assert.throws(()=>M.audioSplitBody(audio,Array(21).fill(clips[0]),true,''),/2 and 20/);
+  assert.throws(()=>M.audioSplitBody(audio,[{...clips[0],name:' '},clips[1]],true,''),/Name every/);
+  assert.throws(()=>M.audioSplitBody(audio,[{...clips[0],out_s:13},clips[1]],true,''),/outside/);
+  assert.throws(()=>M.audioSplitBody(audio,[{...clips[0],source_id:'other'},clips[1]],true,''),/outside/);
+  assert.throws(()=>M.audioSplitBody(audio,[{...clips[0],out_s:5.1},clips[1]],true,''),/outside/);
+});

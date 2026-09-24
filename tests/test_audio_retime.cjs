@@ -47,3 +47,25 @@ test('active or completed deliveries are never requeued by repeated corrections'
   assert.equal(ctx.calls, 0);
   assert.equal(ctx.djVoiceQueue.length, 1);
 });
+
+test('a retimed reply cannot hold already-due speech behind future airtime', () => {
+  const queue = [
+    {delivery_id: 'reply', kind: 'reply', broadcastAt: 90000000},
+    {delivery_id: 'due', broadcastAt: 5000},
+  ];
+  const ctx = harness(queue);
+  assert.equal(ctx.djVoiceRetime([{delivery_id: 'reply', broadcast_ms: 20000}], 1000, 5000), true);
+  assert.deepEqual(queue.map((clip) => clip.delivery_id), ['due', 'reply']);
+  assert.equal(ctx.calls, 1);
+});
+
+test('new replies win an exact airtime tie but not an earlier booked slot', () => {
+  const queue = [
+    {kind: 'line', broadcastAt: 5000},
+    {kind: 'reply', broadcastAt: 20000},
+    {kind: 'sting', broadcastAt: 20000},
+  ];
+  const ctx = harness(queue);
+  queue.sort(ctx.djVoiceCompare);
+  assert.deepEqual(queue.map((clip) => clip.kind), ['line', 'reply', 'sting']);
+});

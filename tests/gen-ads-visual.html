@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Generated ads visual check</title>
+  <link rel="stylesheet" href="../desktop/renderer/gen-ads.css">
+  <script src="../desktop/renderer/pine-icons.js"></script>
+  <script src="../data/vendor/three.min.js"></script>
+  <script>
+    window.__pgaRender = {count: 0, pixels: [], disposed: 0};
+    var OriginalRenderer = THREE.WebGLRenderer;
+    THREE.WebGLRenderer = function (options) {
+      var renderer = new OriginalRenderer(options);
+      var originalRender = renderer.render;
+      var originalDispose = renderer.dispose;
+      renderer.render = function () {
+        originalRender.apply(renderer, arguments);
+        var gl = renderer.getContext();
+        var samples = [];
+        [0.02, 0.2, 0.5, 0.8, 0.98].forEach(function (part) {
+          var pixel = new Uint8Array(4);
+          gl.readPixels(Math.floor(gl.drawingBufferWidth * part), Math.floor(gl.drawingBufferHeight / 2),
+            1, 1, gl.RGBA, gl.UNSIGNED_BYTE, pixel);
+          samples.push(Array.from(pixel));
+        });
+        window.__pgaRender.count += 1;
+        window.__pgaRender.pixels = samples;
+      };
+      renderer.dispose = function () {
+        window.__pgaRender.disposed += 1;
+        return originalDispose.apply(renderer, arguments);
+      };
+      return renderer;
+    };
+    THREE.WebGLRenderer.prototype = OriginalRenderer.prototype;
+  </script>
+</head>
+<body style="margin:0;background:#243434">
+  <audio id="broadcast"></audio>
+  <script src="../desktop/renderer/pine-duck.js"></script>
+  <script>
+    document.getElementById('broadcast').volume = 0.8;
+    window.pineDesktop = {
+      get: function () { return Promise.resolve({rows: [
+        {id: 1, name: 'Pine Box FM / September station launch', url: '/tests/gen-ads-visual.mp4',
+          poster_url: '/tests/gen-ads-visual-poster.png',
+          duration: 3, created_at: '2026-09-24T08:00:00Z', prompt_id: 42, air_count: 2,
+          history: [{aired_at: '2026-09-24T10:00:00Z', program: 'Morning'},
+            {aired_at: '2026-09-24T08:30:00Z', program: 'Overnight'}]},
+        {id: 2, name: 'Second generated video ad with a long name that should wrap cleanly',
+          url: '/tests/gen-ads-visual.mp4', duration: 3, air_count: 0, history: []}
+      ]}); },
+      post: function () { return Promise.resolve({ok: true}); }
+    };
+    window.desktopMusicUrl = function (url) { return url; };
+  </script>
+  <script src="../desktop/renderer/gen-ads.js"></script>
+  <script>window.PineGenAds.open();</script>
+</body>
+</html>

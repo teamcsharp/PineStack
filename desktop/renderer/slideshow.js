@@ -530,7 +530,7 @@
       var media;
       if (row.kind === 'video') {
         media = document.createElement('video');
-        media.src = src.url(row.file);
+        media.style.visibility = 'hidden';
         media.autoplay = true;
         media.playsInline = true;
         /* MUTED, ALWAYS. #1008: what comes out of this tablet's speaker is
@@ -538,9 +538,78 @@
          * over the air the operator is listening to. */
         media.muted = true;
         media.loop = false;
+        var cover = new Image();
+        cover.className = 'sl-media';
+        cover.alt = '';
+        cover.style.background = '#05080b';
+        cover.style.objectFit = 'contain';
+        var icon = new Image();
+        icon.className = 'sl-media';
+        icon.alt = '';
+        icon.style.cssText = 'object-fit:contain;width:min(96px,24%);height:min(96px,24%);'
+          + 'inset:50% auto auto 50%;transform:translate(-50%,-50%);background:transparent';
+        icon.src = src.base() + '/spark/asset/pinebox.png';
+        to.appendChild(cover);
+        to.appendChild(icon);
+        var posterUrl = row.poster_url || row.poster;
+        if (posterUrl) {
+          cover.src = /^(https?:)?\/\//.test(posterUrl) ? posterUrl
+            : src.base() + (posterUrl.charAt(0) === '/' ? '' : '/')
+              + posterUrl;
+          cover.addEventListener('load', function () { icon.hidden = true; });
+          cover.addEventListener('error', function () { cover.removeAttribute('src'); });
+        }
+        var frameGeneration = 0, firstTime = NaN;
+        var framePending = false, frameShown = false;
+        function frameReady() {
+          return media.readyState >= 2 && media.videoWidth > 0 && media.videoHeight > 0;
+        }
+        function revealFrame() {
+          if (frameShown || !frameReady()) return;
+          frameShown = true;
+          media.style.visibility = 'visible';
+          cover.hidden = true;
+          icon.hidden = true;
+        }
+        function hideFrame() {
+          frameGeneration += 1;
+          firstTime = NaN;
+          framePending = false;
+          frameShown = false;
+          media.style.visibility = 'hidden';
+          cover.hidden = false;
+          icon.hidden = !!(posterUrl && cover.complete && cover.naturalWidth);
+        }
+        media.addEventListener('loadstart', hideFrame);
+        media.addEventListener('emptied', hideFrame);
+        function armFrame() {
+          if (!frameReady()) return;
+          if (!Number.isFinite(firstTime)) firstTime = Number(media.currentTime) || 0;
+          if (typeof media.requestVideoFrameCallback !== 'function' || framePending) return;
+          framePending = true;
+          var token = frameGeneration;
+          try {
+            media.requestVideoFrameCallback(function () {
+              if (token !== frameGeneration) return;
+              framePending = false;
+              revealFrame();
+            });
+          } catch (err) { framePending = false; /* timeupdate remains the fallback */ }
+        }
+        media.addEventListener('loadeddata', armFrame);
+        media.addEventListener('playing', armFrame);
+        media.addEventListener('seeked', function () {
+          if (!media.seeking) revealFrame();
+        });
+        media.addEventListener('timeupdate', function () {
+          if (!Number.isFinite(firstTime)) { armFrame(); return; }
+          if (Number.isFinite(firstTime)
+            && Number(media.currentTime) > firstTime + 0.04) revealFrame();
+        });
         media.addEventListener('ended', function () {
           if (!S.paused) step(1);
         });
+        media.src = src.url(row.file);
       } else {
         media = new Image();
         media.decoding = 'async';

@@ -34,6 +34,17 @@ const how = document.getElementById('how');
 
 let shown = null;          /* the last answer from the main process */
 let full = false;
+let streamAttempt = 0;
+let streamRetry = null;
+
+function bindStream(delay) {
+  clearTimeout(streamRetry);
+  streamRetry = setTimeout(function () {
+    if (!shown || !shown.url) return;
+    streamAttempt += 1;
+    live.src = shown.url + '?connection=' + streamAttempt;
+  }, Math.max(0, Number(delay) || 0));
+}
 
 function cover(words, bad) {
   veil.textContent = words || '';
@@ -58,11 +69,12 @@ async function begin() {
   /* The first frame clears the veil - "running" is not the same as "there
    * are pictures", and covering the gap with a black rectangle would make a
    * dead stream look like a sleeping tablet. */
-  live.addEventListener('load', function () { cover(''); }, { once: true });
+  live.addEventListener('load', function () { cover(''); });
   live.addEventListener('error', function () {
     cover('the picture stopped coming', true);
+    bindStream(700);
   });
-  live.src = open.url;
+  bindStream(0);
   watch();
 }
 
@@ -328,7 +340,12 @@ async function goFull(want) {
   } catch (error) { /* the window said no; nothing to do about it */ }
 }
 
-glass.addEventListener('dblclick', function () { goFull(!full); });
+glass.addEventListener('dblclick', function (event) {
+  /* Ctrl+click is a direct tablet touch. Two quick touches must remain two
+   * touches instead of also changing the mirror window underneath them. */
+  if (event.ctrlKey) return;
+  goFull(!full);
+});
 document.getElementById('big').addEventListener('click', function () { goFull(!full); });
 
 document.addEventListener('keydown', function (event) {
@@ -403,15 +420,17 @@ function touchOn(want) {
 
 touchBtn.addEventListener('click', function () { touchOn(!touching); });
 
-/* THE LEFT BUTTON REACHES THROUGH; the wheel and the middle button stay this
- * window's own, because zooming and panning are things you do to the VIEW
- * and the tablet has no business seeing them. */
+/* THE LEFT BUTTON REACHES THROUGH while Touch is latched on. Ctrl is the
+ * momentary version: hold it for one click without changing the persistent
+ * switch. The wheel and middle button stay this window's own, because
+ * zooming and panning are things you do to the VIEW. */
 glass.addEventListener('pointerdown', function (event) {
-  if (!touching || event.button !== 0) return;
+  if ((!touching && !event.ctrlKey) || event.button !== 0) return;
   const at = whereOnTablet(event);
   if (!at) return;
   event.preventDefault();
-  press = { at: at, when: Date.now(), x: event.clientX, y: event.clientY };
+  press = { at: at, when: Date.now(), x: event.clientX, y: event.clientY,
+    momentary: !touching && event.ctrlKey };
   try { glass.setPointerCapture(event.pointerId); } catch (error) { /* fine */ }
 });
 
@@ -708,6 +727,7 @@ ontop.addEventListener('click', async function () {
  * seconds is stalled, and the operator needs to know that before they start
  * wondering why the tablet is frozen. */
 async function watch() {
+  let wasLive = null;
   for (;;) {
     try {
       const said = await api.mirrorHow();
@@ -721,7 +741,11 @@ async function watch() {
           cover('The picture has stopped. ' + (said.why || 'Reconnecting…'), true);
         } else if (said.live) {
           cover('');
+          /* If the image decoder gave up while the producer was being
+           * repaired, make one fresh local connection after recovery. */
+          if (wasLive === false) bindStream(0);
         }
+        if (said.frames > 0) wasLive = !!said.live;
       }
     } catch (error) { /* the window may be closing */ }
     await new Promise(function (go) { setTimeout(go, 1000); });

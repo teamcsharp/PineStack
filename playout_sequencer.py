@@ -104,6 +104,39 @@ MAKING_STALE_S = 1500.0    # matches FLOOR_STALE_SECONDS: a wedged maker is forg
 KEEP_EVENTS = 400
 KEEP_RECENT = 24
 
+# [#1327] THE DURABLE BOOK.  See LinearSequencer._save and ._restore.
+SNAP_EVERY_S = 2.0            # an unchanged book is never rewritten
+SNAP_FORCE_EVERY_S = 0.25     # ...and even a STRUCTURAL change waits this long,
+                              # so a burst of 35 page dispatches stamped in one
+                              # go - the ordinary shape of a round reaching the
+                              # feed, and 35 x 3.5 ms measured - costs the event
+                              # loop one write and not thirty-five.  The #1441
+                              # guard force-exits 6 s after the signal, so a
+                              # quarter second of book is nothing set against a
+                              # process that lives eighteen minutes, and a
+                              # skipped write is taken by the very next count.
+SNAP_SLOW_S = 0.05            # a write costing more than this earns a backoff
+SNAP_BUDGET = 20.0            # ...of 20x its own cost: at most ~5% of wall time
+SNAP_BACKOFF_MAX_S = 5.0
+SNAP_ERRORS_MAX = 20          # a book that cannot be written stops trying
+SNAP_LIVE_MAX_AGE_S = 3600.0        # older: nothing comes back live
+SNAP_CENSUS_MAX_AGE_S = 172800.0    # ...and past this not even the counters
+SNAP_CARRIED_KEEP_S = 1800.0        # how long a claim nobody answered is kept
+SNAP_MAX_CLIP_S = 1800.0            # a restored row longer than this is a bug
+SNAP_KEEP_LINE = 60
+SNAP_KEEP_HELD = 40
+SNAP_KEEP_CARRIED = 40
+# Counter prefixes that mark a STRUCTURAL change - a round appearing,
+# leaving, or reaching a transport.  Everything else (a listener ack, a
+# silent receipt) only sets the dirty flag and waits for the coalesce.
+SNAP_FORCE = frozenset({"held", "not_ready", "making", "forgotten", "released",
+                        "released_by_occurrence", "dispatched", "ended",
+                        "forced", "held_stale", "making_stale", "carried_stale"})
+SNAP_LINE_KEEP_FIELDS = ("oid", "route", "starts_at", "seconds", "dispatched_at",
+                         "producer", "lane", "label", "media", "sid", "lines",
+                         "block", "ord", "key", "delivery_id", "corrected_end")
+
+
 # Roads that are a competing CONVERSATION rather than a clip. While a round
 # is being made and is nearly ready these wait; a clip or a record may fill.
 DIALOGUE_ROADS = frozenset({"rescue", "continuity", "cover", "torrent",
@@ -183,6 +216,12 @@ class LinearSequencer:
                  making_stale_s: float = MAKING_STALE_S,
                  events_path: str | Path | None = None,
                  keep_events: int = KEEP_EVENTS,
+                 state_path: str | Path | None = None,      # [#1327]
+                 snap_every_s: float = SNAP_EVERY_S,
+                 live_max_age_s: float = SNAP_LIVE_MAX_AGE_S,
+                 census_max_age_s: float = SNAP_CENSUS_MAX_AGE_S,
+                 carried_keep_s: float = SNAP_CARRIED_KEEP_S,
+                 snap_force_every_s: float = SNAP_FORCE_EVERY_S,
                  log: Callable[[str, dict[str, Any]], None] | None = None):
         self.clock = clock
         self.mode_reader = mode_reader or (lambda: MODE_OFF)
@@ -209,6 +248,38 @@ class LinearSequencer:
         self._started = float(clock())
         self._linear_since = 0.0
         self._last_mode = MODE_OFF
+        # [#1327] THE DURABLE BOOK.  Everything above this line was
+        # built empty on every boot, and this station boots about
+        # every eighteen minutes.
+        self.state_path = Path(state_path) if state_path else None
+        self.snap_every_s = max(0.0, float(snap_every_s))
+        self.live_max_age_s = float(live_max_age_s)
+        self.census_max_age_s = float(census_max_age_s)
+        self.carried_keep_s = float(carried_keep_s)
+        self.snap_force_every_s = max(0.0, float(snap_force_every_s))
+        self._carried: dict[str, dict[str, Any]] = {}
+        self._boot = uuid.uuid4().hex[:12]
+        self._first_started = self._started
+        self._snap_ready = False
+        self._snap_at = 0.0
+        self._snap_dirty = False
+        self._snap_backoff = 0.0
+        self._snap_writes = 0
+        self._snap_skips = 0
+        self._snap_errors = 0
+        self._snap_cost_s = 0.0
+        self._snap_last_s = 0.0
+        self._restored = self._restore()
+        self._snap_ready = True
+        # A BOOT HAS A NAME NOW.  `events.jsonl` had no process
+        # boundary in it at all - the only way to find one was to
+        # guess from a `mode` event - so nothing could count what a
+        # restart cost without inferring where the restarts were.
+        self._event("boot", boot=self._boot,
+                    restored_line=int(self._restored.get("line") or 0),
+                    restored_carried=int(self._restored.get("carried") or 0),
+                    book_age_s=self._restored.get("age_s"),
+                    why=str(self._restored.get("why") or "")[:160])
 
     # ------------------------------------------------------------- mode
 
@@ -300,6 +371,12 @@ class LinearSequencer:
                    "lines": int(lines or made.get("lines") or 0),
                    "seconds": max(0.0, float(seconds or 0.0)),
                    "media": str(media or "").rsplit("/", 1)[-1].split("?")[0],
+                   # [#1327] ...and the whole of it.  A carried claim has to
+                   # be checkable against the disk, and a basename is not a
+                   # path: /media is pruned (#1342), so a round can outlive
+                   # its own audio and must never be offered back without
+                   # something able to test that.
+                   "media_path": str(media or ""),
                    "sid": str(sid or made.get("sid") or ""),
                    "label": str(label or made.get("label") or "")[:80],
                    "block": int(block or made.get("block") or 0),
@@ -319,7 +396,13 @@ class LinearSequencer:
         """The round is not coming (refused, withdrawn, its task ended)."""
         with self.lock:
             key = str(key or "")
-            was = self._making.pop(key, None) or self._held.pop(key, None)
+            # [#1327] ...including a CLAIM carried from the last
+            # player.  This is the handshake with the boot sweep: the
+            # sweep is the road that can read the air log and the disk,
+            # it withdraws the round, and then it says so here, so the
+            # two books cannot disagree for the rest of the process.
+            was = (self._making.pop(key, None) or self._held.pop(key, None)
+                   or self._carried.pop(key, None))
             if not was:
                 return False
             self._count("forgotten")
@@ -411,6 +494,21 @@ class LinearSequencer:
                         seconds=round(seconds, 1), producer=producer, label=row["label"])
             self._prune(now)
             return dict(row)
+
+    def retime_unstarted(self, delivery_id: str, starts_at: float) -> bool:
+        """Keep the linear book aligned when a silent page reservation is repaired."""
+        with self.lock:
+            for row in self._line:
+                if (row.get("delivery_id") != str(delivery_id)
+                        or row.get("heard_by") or row.get("ended_at")):
+                    continue
+                row["starts_at"] = float(starts_at)
+                self._line.sort(key=lambda r: (float(r["starts_at"]),
+                                               float(r["dispatched_at"])))
+                self._event("retimed", delivery_id=str(delivery_id),
+                            starts_at=round(float(starts_at), 3))
+                return True
+            return False
 
     def heard(self, *, delivery_id: str = "", oid: str = "", route: str = ROUTE_PAGE,
               event: str = "", position_s: float | None = None,
@@ -798,6 +896,18 @@ class LinearSequencer:
                     n += 1
                     self._count("making_stale")
                     self._event("making_stale", key=key, road=row.get("road"))
+            # [#1327] A CLAIM NOBODY ANSWERED.  It reserved nothing and
+            # refused nothing, so dropping it changes no decision - it
+            # only stops the book growing a tail of rounds whose audio
+            # the media sweep has long since taken.
+            for key, row in list(self._carried.items()):
+                if now - float(row.get("carried_at") or now) > self.carried_keep_s:
+                    self._carried.pop(key, None)
+                    n += 1
+                    self._count("carried_stale")
+                    self._event("carried_stale", key=key,
+                                road=row.get("road"),
+                                block=row.get("block"))
             return n
 
     # ------------------------------------------------------------ reading
@@ -852,6 +962,9 @@ class LinearSequencer:
                 left = max(0.0, float(soon.get("since") or now) + float(soon.get("eta_s") or 0) - now)
                 parts.append("making: %s (%d lines, about %ds left)"
                              % (soon.get("road") or soon.get("kind") or "?", int(soon.get("lines") or 0), int(left)))
+            if self._carried:                              # [#1327]
+                parts.append("carried from the last player: %d "
+                             "(claims, reserving nothing)" % len(self._carried))
             queued = int(self._counts.get("queued") or 0)
             would = int(self._counts.get("would_queue") or 0)
             if mode == MODE_LINEAR and queued:
@@ -932,6 +1045,17 @@ class LinearSequencer:
                     "making": [dict(r, for_s=round(now - float(r.get("since") or now), 1),
                                     left_s=round(max(0.0, float(r.get("since") or now) + float(r.get("eta_s") or 0) - now), 1))
                                for r in making],
+                    "carried": self.carried(now),          # [#1327]
+                    "book": {"path": (str(self.state_path)
+                                      if self.state_path else ""),
+                             "restored": dict(self._restored),
+                             "writes": self._snap_writes,
+                             "skipped": self._snap_skips,
+                             "errors": self._snap_errors,
+                             "last_write_s": self._snap_last_s,
+                             "total_write_s": round(self._snap_cost_s, 3),
+                             "backoff_s": round(self._snap_backoff, 3),
+                             "first_started_at": self._first_started},
                     "asks": {k: dict(v) for k, v in self._asks.items()},
                     "jumpers": jumpers,
                     "jumped_total": int(self._counts.get("queued") or 0),
@@ -941,6 +1065,340 @@ class LinearSequencer:
                     "events": [dict(e) for e in self._events[-max(1, int(limit)):]],
                     "now": now,
                     "started_at": self._started}
+
+
+    # ------------------------------------------------------- the durable book
+
+    def carried(self, now: float | None = None) -> list[dict[str, Any]]:
+        """[#1327] WHAT THE LAST PLAYER LEFT, AND WHAT IT WOULD TAKE TO
+        LET IT SPEAK.
+
+        A round that was rendered and waiting its turn when the process
+        ended does NOT come back as the head.  Its audio is still on
+        disk, but nothing in this process is waiting to hand it to a
+        transport - the coroutine that owned it went with the process -
+        and a head nobody can dispatch is manufactured silence: it
+        reserves the air (`reserve_until`) and refuses every filler
+        (`ask_fill`) until it goes stale.  Measured: the median held
+        round waits 182 s and the p90 793 s against a 240 s staleness
+        floor, so a resurrected head would sit on the air for minutes
+        for nothing.
+
+        So it comes back as a CLAIM: named, ranked by the same
+        `(block, ord)` the ledger gave it, and INERT.  `head()` cannot
+        see it, `reserve_until` does not count it, `ask_fill` does not
+        hear it.
+
+        `blockers` are the reasons this module can see on its own.  The
+        ones it deliberately cannot - it does not stat a file and it does
+        not read the air log (see the module docstring) - are NAMED in
+        `needs`, for the one caller that can make them: the boot sweep,
+        which is already joining these rounds to their air-log rows.
+
+        SAYING SOMETHING TWICE IS WORSE THAN LOSING IT, so every one of
+        them is a veto and the default answer is no."""
+        with self.lock:
+            now = float(now if now is not None else self.clock())
+            out = []
+            for row in sorted(self._carried.values(), key=self._rank):
+                key = str(row.get("key") or "")
+                age = max(0.0, now - float(row.get("carried_at") or now))
+                blockers = []
+                if key and (key in self._held or key in self._making):
+                    blockers.append("this process is already making or holding "
+                                    "a round under the same name")
+                if not row.get("audio_ready"):
+                    blockers.append(str(row.get("why_not_ready")
+                                        or "its audio was never finished, so it "
+                                           "was never a committed round"))
+                if age > self.carried_keep_s:
+                    blockers.append("it has been carried %ds, past the %ds this "
+                                    "book keeps a claim"
+                                    % (int(age), int(self.carried_keep_s)))
+                if not str(row.get("media_path") or row.get("media") or ""):
+                    blockers.append("the book has no media for it, so nothing "
+                                    "can check that its audio is still there")
+                item = dict(row)
+                item["carried_age_s"] = round(age, 1)
+                item["blockers"] = blockers
+                item["needs"] = ["its media must still resolve on disk",
+                                 "its air-log rows must still read `prepared` - "
+                                 "anything else means a route already aired it",
+                                 "its slot must not have closed"]
+                item["why"] = ("the last player had it rendered and waiting its "
+                               "turn%s; it reserves nothing here%s"
+                               % ((" (block %s)" % row.get("block"))
+                                  if row.get("block") else "",
+                                  (" - " + "; ".join(blockers)) if blockers else ""))
+                out.append(item)
+            return out
+
+    def _snapshot(self, now: float) -> dict[str, Any]:
+        """The whole book, small enough to rewrite on change."""
+        self._walk(now)
+        line = [dict(r) for r in self._line
+                if not r.get("ended_at")][-SNAP_KEEP_LINE:]
+        live = {str(r.get("delivery_id") or "") for r in line}
+        return {
+            "schema_version": SCHEMA_VERSION, "at": now,
+            "pid": os.getpid(), "boot": self._boot,
+            "started_at": self._started,
+            "first_started_at": float(self._first_started or self._started),
+            "line": line,
+            "held": [dict(r) for r in self._held.values()][-SNAP_KEEP_HELD:],
+            "making": [dict(r) for r in self._making.values()][-SNAP_KEEP_HELD:],
+            "carried": [dict(r) for r in self._carried.values()][-SNAP_KEEP_CARRIED:],
+            "by_delivery": {k: list(v) for k, v in self._by_delivery.items()
+                            if k in live},
+            "counts": dict(self._counts),
+            "asks": {k: dict(v) for k, v in self._asks.items()},
+            "recent": [dict(r) for r in self._recent[-KEEP_RECENT:]],
+        }
+
+    def _save(self, force: bool = False) -> bool:
+        """Write the book if it is dirty and the coalesce window has passed.
+
+        NEVER at shutdown.  Two thirds of this station's restarts are
+        force-exited by the #1441 guard 6 s after the signal, and no
+        shutdown hook had ever run at all before that guard was fitted,
+        so a book written on the way out is a book that is never
+        written.  This one rides `_count`, which every state-changing
+        method in this module already calls, so the newest durable state
+        is at most one coalesce window old.
+
+        It measures itself.  `data/` is a bind mount and a write that
+        costs 20 ms under the sequencer lock is a write the event loop
+        pays for too, so a slow book backs itself off to 20x its own
+        cost - at most ~5% of the wall clock - and a book that cannot be
+        written at all gives up after SNAP_ERRORS_MAX and says so in
+        `state()`.  A forgetful book never stops the air.
+
+        OWNERSHIP.  `data/playout` is written by the container as ROOT
+        while its parent belongs to the host user.  This book is written
+        by exactly the process that already writes `events.jsonl` beside
+        it, so it inherits those rights and no others; the tmp file is
+        removed on a failed replace rather than left root-owned in the
+        directory.  If that ever stops being true the write fails, is
+        counted, and is given up on - never a reason to be silent."""
+        if self.state_path is None or not self._snap_ready:
+            return False
+        if self._snap_errors >= SNAP_ERRORS_MAX:
+            return False
+        now = float(self.clock())
+        if not force:
+            self._snap_dirty = True
+            if now - self._snap_at < self.snap_every_s:
+                self._snap_skips += 1
+                return False
+        elif now - self._snap_at < max(self.snap_force_every_s,
+                                       self._snap_backoff):
+            self._snap_dirty = True
+            self._snap_skips += 1
+            return False
+        began = time.time()
+        tmp = None
+        try:
+            payload = json.dumps(self._snapshot(now), ensure_ascii=False,
+                                 default=str)
+            self.state_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.state_path.with_name(
+                self.state_path.name + "." + uuid.uuid4().hex + ".tmp")
+            with open(tmp, "w", encoding="utf-8") as handle:
+                handle.write(payload)
+            os.replace(tmp, self.state_path)
+        except Exception:  # noqa: BLE001
+            self._snap_errors += 1
+            try:
+                if tmp is not None and tmp.exists():
+                    tmp.unlink()
+            except OSError:
+                pass
+            return False
+        cost = max(0.0, time.time() - began)
+        self._snap_at = now
+        self._snap_dirty = False
+        self._snap_writes += 1
+        self._snap_cost_s = round(self._snap_cost_s + cost, 4)
+        self._snap_last_s = round(cost, 4)
+        self._snap_backoff = (min(SNAP_BACKOFF_MAX_S, cost * SNAP_BUDGET)
+                              if cost > SNAP_SLOW_S else 0.0)
+        return True
+
+    def _restore(self) -> dict[str, Any]:
+        """Read the last player's book.  NEVER raises, never claims air.
+
+        Three tiers, and the rule that picks them is: restore what makes
+        this process more careful, never what makes it louder.
+
+        The blanket guard is the same one `playout()` earned upstairs: a
+        book that cannot be read is not a reason for the station to be
+        silent.  Every partial result it can leave behind is safe by
+        construction - a half-merged census moves nothing, and a
+        half-restored line only ever pushes a stamp later."""
+        got: dict[str, Any] = {"read": False, "why": "", "line": 0,
+                               "carried": 0, "census": False, "age_s": 0.0,
+                               "dropped": []}
+        if self.state_path is None:
+            got["why"] = "no book is kept"
+            return got
+        try:
+            return self._restore_book(got)
+        except Exception as exc:  # noqa: BLE001
+            got["failed"] = "%r" % (exc,)
+            got["why"] = ("the book from the last player could not be read, "
+                          "and this process starts as every process used to")
+            return got
+
+    def _restore_book(self, got: dict[str, Any]) -> dict[str, Any]:
+        try:
+            snap = json.loads(self.state_path.read_text(encoding="utf-8",
+                                                        errors="replace"))
+        except (OSError, ValueError, TypeError):
+            got["why"] = "there was no readable book from the last player"
+            return got
+        if not isinstance(snap, dict):
+            got["why"] = "the book was not a book"
+            return got
+        if int(snap.get("schema_version") or 0) != SCHEMA_VERSION:
+            got["why"] = ("the book was written to schema %s, this is %s"
+                          % (snap.get("schema_version"), SCHEMA_VERSION))
+            return got
+        now = float(self.clock())
+        age = max(0.0, now - float(snap.get("at") or 0))
+        got["read"] = True
+        got["age_s"] = round(age, 1)
+        if age > self.census_max_age_s:
+            got["why"] = ("the book is %dh old - older than the air log itself "
+                          "keeps, so not even its counters mean anything now"
+                          % int(age / 3600))
+            return got
+        # ---- TIER 2: the census.  No decision in this module reads any of
+        # it, so it cannot move the air; losing it is what made adherence
+        # unmeasurable across a process that lives eighteen minutes.
+        for key, value in (snap.get("counts") or {}).items():
+            try:
+                self._counts[str(key)] = (int(self._counts.get(str(key), 0))
+                                          + int(value))
+            except (TypeError, ValueError):
+                continue
+        for road, slot in (snap.get("asks") or {}).items():
+            if not isinstance(slot, dict):
+                continue
+            mine = self._asks.setdefault(str(road),
+                                         {"allowed": 0, "queued": 0,
+                                          "would_queue": 0, "last_why": "",
+                                          "last_at": 0.0, "pushed_s": 0.0})
+            for field in ("allowed", "queued", "would_queue"):
+                try:
+                    mine[field] = (int(mine.get(field) or 0)
+                                   + int(slot.get(field) or 0))
+                except (TypeError, ValueError):
+                    pass
+            try:
+                mine["pushed_s"] = round(float(mine.get("pushed_s") or 0)
+                                         + float(slot.get("pushed_s") or 0), 1)
+            except (TypeError, ValueError):
+                pass
+            try:
+                if float(slot.get("last_at") or 0) > float(mine.get("last_at") or 0):
+                    mine["last_at"] = float(slot.get("last_at") or 0)
+                    mine["last_why"] = str(slot.get("last_why") or "")[:200]
+            except (TypeError, ValueError):
+                pass
+        self._recent = ([dict(r) for r in (snap.get("recent") or [])
+                         if isinstance(r, dict)] + self._recent)[-KEEP_RECENT:]
+        try:
+            self._first_started = float(snap.get("first_started_at")
+                                        or snap.get("started_at")
+                                        or self._started)
+        except (TypeError, ValueError):
+            self._first_started = self._started
+        got["census"] = True
+        if age > self.live_max_age_s:
+            got["why"] = ("the book is %ds old - the counters are kept, but "
+                          "nothing that touches the air comes back from a book "
+                          "that cold" % int(age))
+            return got
+        # ---- TIER 1: the air the listener is ALREADY HEARING.
+        for row in (snap.get("line") or []):
+            if not isinstance(row, dict) or not row.get("oid"):
+                continue
+            if row.get("ended_at"):
+                got["dropped"].append("ended")
+                continue
+            try:
+                seconds = float(row.get("seconds") or 0)
+                starts_at = float(row.get("starts_at") or 0)
+            except (TypeError, ValueError):
+                got["dropped"].append("unmeasured")
+                continue
+            if not (0 < seconds <= SNAP_MAX_CLIP_S) or starts_at <= 0:
+                got["dropped"].append("unmeasured")
+                continue
+            if starts_at > now:
+                # PROMISED, NOT SOUNDING.  `page_recovery_start` re-stamps a
+                # preserved delivery at a NEW moment; a reservation held at
+                # the old one would be a ghost that pushes the real thing
+                # later and calls the gap somebody else's fault.
+                got["dropped"].append("promised")
+                continue
+            try:
+                end = float(row.get("corrected_end") or 0) or (starts_at + seconds)
+            except (TypeError, ValueError):
+                end = starts_at + seconds
+            if end <= now + 0.5:
+                got["dropped"].append("over")
+                continue
+            if end > now + SNAP_MAX_CLIP_S:
+                got["dropped"].append("beyond the horizon")
+                continue
+            fresh = {k: row.get(k) for k in SNAP_LINE_KEEP_FIELDS}
+            fresh.update({"oid": str(row.get("oid")),
+                          "route": str(row.get("route") or ROUTE_PAGE),
+                          "starts_at": starts_at, "seconds": seconds,
+                          "dispatched_at": float(row.get("dispatched_at")
+                                                 or starts_at),
+                          # The listener's own words belong to a page that may
+                          # have reloaded.  Keep only `corrected_end` - where
+                          # the clip actually is - and start the stall test
+                          # clean, so a restored row cannot raise a false
+                          # alarm about a listener nobody has asked yet.
+                          "heard_by": "", "last_position_s": None,
+                          "last_heard_at": 0.0, "progressed_at": 0.0,
+                          "ended_at": 0.0, "ended_why": "", "acks": 0,
+                          "stalled": False, "restored": True})
+            self._line.append(fresh)
+            if fresh.get("delivery_id"):
+                self._by_delivery[str(fresh["delivery_id"])] = (fresh["oid"],
+                                                                fresh["route"])
+            got["line"] += 1
+        self._line.sort(key=lambda r: (float(r["starts_at"]),
+                                       float(r["dispatched_at"])))
+        # ---- TIER 3: the claims.  Inert by construction - they live in
+        # their own book, and `head`, `reserve_until` and `ask_fill` each
+        # read `_held`, which they are not in.
+        for bucket, ready in (("held", True), ("making", False)):
+            for row in (snap.get(bucket) or []):
+                if not isinstance(row, dict) or not row.get("key"):
+                    continue
+                item = dict(row)
+                item["audio_ready"] = bool(row.get("audio_ready", ready))
+                try:
+                    item["carried_at"] = float(row.get("carried_at")
+                                               or row.get("ready_at")
+                                               or row.get("since")
+                                               or snap.get("at") or now)
+                except (TypeError, ValueError):
+                    item["carried_at"] = now
+                item["carried"] = True
+                self._carried[str(row["key"])] = item
+                got["carried"] += 1
+        for row in (snap.get("carried") or []):
+            if isinstance(row, dict) and row.get("key"):
+                self._carried.setdefault(str(row["key"]), dict(row, carried=True))
+        got["why"] = ("restored %d sounding row(s) and %d claim(s) from a book "
+                      "%ds old" % (got["line"], got["carried"], int(age)))
+        return got
 
     # ---------------------------------------------------------- internals
 
@@ -1059,6 +1517,14 @@ class LinearSequencer:
 
     def _count(self, key: str) -> None:
         self._counts[key] = int(self._counts.get(key, 0)) + 1
+        # [#1327] ...AND THE BOOK GOES WITH IT.  Every state-changing
+        # method in this module already counts what it did, which makes
+        # this the one hook a later change cannot forget - unlike
+        # `_event`, which `ended()` and a plain `heard()` never reach.
+        # A structural change writes now; an ack waits for the coalesce
+        # window.
+        if self.state_path is not None:
+            self._save(force=key.split(":", 1)[0] in SNAP_FORCE)
 
     def _event(self, what: str, **fields: Any) -> None:
         row = {"at": float(self.clock()), "type": str(what)}

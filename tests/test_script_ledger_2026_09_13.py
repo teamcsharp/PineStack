@@ -54,6 +54,7 @@ class ScriptLedgerOrder(unittest.TestCase):
 
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="ledger-"))
+        self.pruned_at = app._SCRIPT_LEDGER_PRUNED[0]
         self.patches = [
             mock.patch.object(app, "SCRIPT_LEDGER_PATH",
                               self.tmp / "script_ledger.jsonl"),
@@ -64,12 +65,14 @@ class ScriptLedgerOrder(unittest.TestCase):
             p.start()
         app._SCRIPT_LEDGER_MEMO["at"] = 0.0
         app._SCRIPT_LEDGER_MEMO["rows"] = []
+        app._SCRIPT_LEDGER_PRUNED[0] = 0.0
 
     def tearDown(self):
         for p in self.patches:
             p.stop()
         app._SCRIPT_LEDGER_MEMO["at"] = 0.0
         app._SCRIPT_LEDGER_MEMO["rows"] = []
+        app._SCRIPT_LEDGER_PRUNED[0] = self.pruned_at
 
     def rows(self, prefix, n):
         return [{"line_id": f"{prefix}{i}", "who": "dj",
@@ -166,6 +169,19 @@ class ScriptLedgerOrder(unittest.TestCase):
         self.assertTrue(row["settings_revision"])
         self.assertIn("host", row["system_prompts"])
 
+    def test_commit_extends_the_warm_ledger_without_rereading_it(self):
+        """A live commit must not turn the next Script poll into a 10 MB read."""
+        app.script_ledger_commit("first", self.rows("a", 1), "banter")
+        app._SCRIPT_LEDGER_MEMO["at"] = 0.0
+        self.assertEqual([row["line_id"] for row in app.script_ledger_rows()],
+                         ["a0"])
+
+        app.script_ledger_commit("second", self.rows("b", 1), "banter")
+        with mock.patch.object(type(app.SCRIPT_LEDGER_PATH), "read_text",
+                               side_effect=AssertionError("warm ledger reread")):
+            rows = app.script_ledger_rows()
+        self.assertEqual([row["line_id"] for row in rows], ["a0", "b0"])
+
 
 def air(rid, at, text, who="dj", kind="banter"):
     return {"id": rid, "who": who, "kind": kind, "round": "banter",
@@ -244,6 +260,79 @@ class ScreenplayTakesTheLedgersWord(unittest.TestCase):
                      if e.get("line") == "sting")
         self.assertEqual((sting.get("block"), sting.get("ord")), (1, 2))
         self.assertEqual(sting.get("aired"), "stream")
+
+    def test_heard_block_precedes_prepared_block_and_keeps_its_own_scene(self):
+        """Two gallery rounds are two segments even though their kind agrees.
+
+        This is report #1280: eight prepared rows were merged into the scene
+        of the later block that was sounding, so following that line unfolded
+        the prepared rows and moved the document by thousands of pixels.
+        """
+        prepared = [
+            {**air(f"prepared-{i}", 100.0 + i, f"banked {i}", kind="gallery"),
+             "round": "gallery", "sid": "gallery-14406", "aired": "prepared"}
+            for i in range(8)
+        ]
+        sounding = [
+            {**air(f"sounding-{i}", 200.0 + i, f"live {i}", kind="gallery"),
+             "round": "gallery", "sid": "gallery-14448",
+             "aired": "stream" if i < 2 else "prepared"}
+            for i in range(4)
+        ]
+        order = {
+            **{row["id"]: (14406, i, True)
+               for i, row in enumerate(prepared)},
+            **{row["id"]: (14448, i, True)
+               for i, row in enumerate(sounding)},
+        }
+        script = self.compose(prepared + sounding, order)
+        ids = self.ids(script)
+        self.assertLess(ids.index("sounding-0"), ids.index("prepared-0"))
+        by_line = {e.get("line"): e for e in script["elements"]
+                   if e.get("type") == "dialogue"}
+        prepared_segs = {by_line[row["id"]].get("seg") for row in prepared}
+        sounding_segs = {by_line[row["id"]].get("seg") for row in sounding}
+        self.assertEqual(len(prepared_segs), 1)
+        self.assertEqual(len(sounding_segs), 1)
+        self.assertNotEqual(prepared_segs, sounding_segs)
+
+    def test_single_line_catch_up_blocks_do_not_shred_one_segment(self):
+        """Unscripted ledger catch-up identifies order, not a scene change.
+
+        Rescue and legacy roads can mint related lines one at a time. They
+        should read as one segment while their round and clock remain
+        continuous, instead of one segment card per line.
+        """
+        rows = [
+            {**air(f"caught-{i}", 100.0 + i * 3, f"turn {i}"),
+             "aired": "stream", "sid": f"legacy-{i}"}
+            for i in range(4)
+        ]
+        order = {row["id"]: (900 + i, 0, False)
+                 for i, row in enumerate(rows)}
+        script = self.compose(rows, order)
+        scenes = [e for e in script["elements"] if e.get("type") == "scene"]
+        dialogue = [e for e in script["elements"]
+                    if e.get("type") == "dialogue"]
+        self.assertEqual(len(scenes), 1)
+        self.assertEqual(len(dialogue), 4)
+        self.assertEqual(len({e.get("seg") for e in dialogue}), 1)
+
+    def test_live_ring_overlays_a_lagging_durable_playout_state(self):
+        durable = {"air": [{
+            "id": "live-line", "aired": "prepared", "air_at": 100.0,
+            "text": "the durable copy", "who": "dj",
+        }]}
+        live = [{
+            "id": "live-line", "aired": "stream", "air_at": 105.0,
+            app.HEARD_STAMP: 105.2, app.HEARD_STAMP_BY: "tablet",
+        }]
+        app.screenplay_overlay_live(durable, live)
+        row = durable["air"][0]
+        self.assertEqual(row["aired"], "stream")
+        self.assertEqual(row["air_at"], 105.0)
+        self.assertEqual(row[app.HEARD_STAMP], 105.2)
+        self.assertEqual(row[app.HEARD_STAMP_BY], "tablet")
 
 
 class TheRecordOnTheDeck(unittest.TestCase):

@@ -341,6 +341,55 @@ def topic_adherence(turns, topic, hosts=HOST_MARKERS, callers=CALLER_MARKERS) ->
     return out
 
 
+def dialogue_topic_adherence(turns, topic) -> dict:
+    """Grade an ordinary studio conversation against its active subject.
+
+    Unlike ``topic_adherence`` this has no caller protocol. It asks three
+    simple continuity questions: does the opening name the subject, do at
+    least half the spoken turns keep touching it, and does the exchange ever
+    wander for three turns in a row. That catches a toilet conversation that
+    abruptly becomes one about broth without requiring every sentence to
+    repeat the same noun.
+    """
+    clean = [(str(marker or "").upper(), " ".join(str(text or "").split()))
+             for marker, text in (turns or []) if str(text or "").strip()]
+    nouns = topic_nouns(topic)
+    stems = [_stem(noun) for noun in nouns]
+    out = {"checked": bool(stems), "ok": True, "nouns": nouns[:12],
+           "score": 1.0, "turns": len(clean), "addressing": len(clean),
+           "opening": True, "faults": [], "wandering": []}
+    if not stems or not clean:
+        return out
+    hits = [_mentions(text, stems) for _marker, text in clean]
+    opening = any(hits[:min(2, len(hits))])
+    addressing = sum(1 for hit in hits if hit)
+    score = addressing / len(hits)
+    wandering = []
+    run = []
+    for index, hit in enumerate(hits):
+        if hit:
+            run = []
+        else:
+            run.append(index)
+            if len(run) >= 3:
+                wandering.extend(run[-1:])
+    need = max(1, (len(hits) + 1) // 2)
+    ok = bool(opening and addressing >= need and not wandering)
+    faults = []
+    if not opening:
+        faults.append("the opening does not establish the active subject (%s)"
+                      % ", ".join(nouns[:5]))
+    if addressing < need:
+        faults.append("only %d of %d turns address the active subject (%s)"
+                      % (addressing, len(hits), ", ".join(nouns[:5])))
+    if wandering:
+        faults.append("the conversation leaves the subject for three or more consecutive turns")
+    out.update({"ok": ok, "score": round(score, 2),
+                "addressing": addressing, "opening": opening,
+                "faults": faults, "wandering": wandering[:12]})
+    return out
+
+
 def topic_words_dropped(source, candidate, nouns) -> list:
     """The subject words a rewrite dropped: present in the source line, absent
     from the candidate (by stem). For the tint's contract."""
@@ -494,16 +543,21 @@ def fallback_call_script(caller_name: str, topic: str = "",
         lead2 = "what you rang about"
         states = "I rang about what the station has been talking about tonight."
 
-    texture_words = [w for w in re.findall(r"[A-Za-z0-9']+", texture) if len(w) > 3]
-    texture_anchor = " ".join(texture_words[:3]) or obj
+    # Repeat a bounded phrase from the actual pivot. The old four-character
+    # filter erased every distinctive word in short, ordinary seeds such as
+    # "You go out to eat a lot, too", then substituted an unrelated prop.
+    # The contract quite correctly refused that as no caller-to-host handoff.
+    texture_words = re.findall(r"[A-Za-z0-9']+", texture)
+    texture_anchor = " ".join(texture_words[:10]) or obj
     if texture:
         source_turn = (
-            f"B: The {p_last} - {SKELETON_TELL}. You said you brought another "
-            "thought with you; what is it?\n"
+            f"B: The {obj} made you check twice, and the {p_last} - "
+            f"{SKELETON_TELL}. You said you brought another thought with "
+            "you; what is it?\n"
             f"C: The other thing turning in my head is this: {texture}. It "
             f"changes how I read the {p_last}, because it gives us a second "
             "subject instead of one more symptom.\n"
-            f"B: That {texture_anchor} point opens the call up, but the "
+            f"B: You said \"{texture_anchor}\". That opens the call up, but the "
             f"{p_last} - still the story: if we follow it, we do not end on "
             f"the {obj}; it is the door back into the {p_first}.\n")
     else:
@@ -520,8 +574,8 @@ def fallback_call_script(caller_name: str, topic: str = "",
         f"B: {name}, good to have you. What made you call tonight?\n"
         f"C: {states} It stopped being an abstract worry when {incident}; "
         "that was the moment it became something happening in my own room.\n"
-        f"A: So {lead2} - hold on, {name}, say the {p_last} part again, "
-        "slowly, because I want it exactly as it happened. What came first?\n"
+        f"A: When the {obj} made you stop, what came first? Say the {p_last} "
+        f"part again slowly, {name}, because I want it exactly as it happened.\n"
         f"C: I moved closer, checked it twice, and wrote down the time. The "
         f"{obj} made me look, and then there it was: the {p_last}. "
         "Nothing dramatic happened after that, which made it feel more "

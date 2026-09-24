@@ -86,6 +86,23 @@ class LineReviewTests(unittest.TestCase):
         self.assertEqual(reopened.get(kept["id"])["review_status"], "kept")
         self.assertEqual(reopened.summaries()["unreviewed"], 0)
 
+    def test_note_is_durable_without_approving_or_dismissing_cut(self):
+        row = self.record(gate="call_contract")
+        saved = self.store.annotate(row["id"], "Try a different premise",
+                                    row["revision"], row["event_seq"])
+        self.assertEqual(saved["row"]["review_status"], "pending")
+        self.assertEqual(saved["row"]["revision"], row["revision"] + 1)
+        self.assertEqual(saved["row"]["operator_notes"][0]["note"], "Try a different premise")
+        self.assertFalse(self.evaluate(gate="call_contract")["allowed"])
+        reopened = LineReviewStore(self.path)
+        self.assertEqual(reopened.get(row["id"], event_seq=row["event_seq"])
+                         ["operator_notes"][0]["note"], "Try a different premise")
+        self.assertEqual(reopened.summaries()["unreviewed"], 1)
+        with self.assertRaises(ReviewConflictError):
+            reopened.annotate(row["id"], "Old revision", row["revision"], row["event_seq"])
+        with self.assertRaises(ValueError):
+            reopened.annotate(row["id"], "  ")
+
     def test_every_duplicate_occurrence_keeps_full_text_context_and_cursor(self):
         text = "A complete sentence and its details. " * 900
         row = self.record(source=text, candidate=text + "Candidate tail", context={"kind": "banter", "speaker": "HOST", "script": text * 2})

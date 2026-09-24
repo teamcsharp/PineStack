@@ -21,6 +21,8 @@ import uuid
 VERSION = 1
 REPEAT_SECONDS = 3600.0
 ACTIVE = ('reserved', 'playing', 'suspended')
+READY_SHORTFALL_SECONDS = 8.0
+READY_SHORTFALL_RATIO = 0.15
 
 
 class System2Conflict(ValueError):
@@ -307,6 +309,10 @@ class System2Store:
     @staticmethod
     def _slot_matches(candidate, slot):
         if candidate['kind'] != slot['kind']: return False
+        if slot['kind'] == 'recap':
+            source = candidate.get('source') or {}
+            if (candidate.get('slot_id') != slot['id'] or not isinstance(source, dict)
+                    or source.get('system2_slot') != slot['id']): return False
         if slot.get('require_slot_binding') and candidate.get('slot_id') != slot['id']: return False
         for field in ('slot_id', 'template_id', 'hour_id'):
             target = slot['id'] if field == 'slot_id' else slot.get(field)
@@ -360,6 +366,25 @@ class System2Store:
         else:
             slot['debt_seconds'] = round(max(0, slot['target_seconds'] - slot['coverage_seconds']), 6)
         return metrics
+
+    @staticmethod
+    def _slot_ready(slot):
+        """Whether whole prepared performances provide practical coverage.
+
+        Performances cannot be trimmed to fill a fractional final gap. Keep
+        reporting that residual as debt, but stop commissioning duplicate
+        conversations once at least one performance exists and the shortfall
+        is within fifteen percent of target (bounded to eight to twenty seconds).
+        """
+        target = float(slot.get('target_seconds') or 0)
+        if target <= .001:
+            return True
+        if slot.get('coverage_mode') == 'one_performance':
+            return int(slot.get('performance_debt') or 0) <= 0
+        debt = float(slot.get('debt_seconds') or 0)
+        tolerance = max(READY_SHORTFALL_SECONDS,
+                        min(20.0, target * READY_SHORTFALL_RATIO))
+        return int(slot.get('coverage_performances') or 0) > 0 and debt <= tolerance
 
     def plan_hour(self, hour_start, templates, candidates=(), *, config_revision='', expected_revision=None, plan_id=None):
         hour_start = _number(hour_start, 'hour_start')
@@ -504,7 +529,7 @@ class System2Store:
                         held = sum(m['remaining'] for m in metrics)
                         need = slot['debt_seconds']
                         room = slot['deadline'] - max(slot['start'], self.now()) - held
-                        if need <= .001 or room <= 0 or (first_only and slot['allocations']): break
+                        if self._slot_ready(slot) or room <= 0 or (first_only and slot['allocations']): break
                         choices = [c for c in catalogue if self._slot_matches(c, slot) and c['id'] not in used
                             and not (set(c['fingerprints']) & fingerprints) and c['seconds'] <= room
                             and not any((booked['id'] == c['id'] or set(booked['fingerprints']) & set(c['fingerprints']))
@@ -513,7 +538,10 @@ class System2Store:
                             and not self._eligible(db, c, max(slot['start'], self.now()) + held)]
                         if not choices: break
                         # Prefer the smallest whole performance that fills the debt; otherwise the largest fit.
-                        candidate = min(choices, key=lambda c: (c['seconds'] < need, abs(c['seconds'] - need), c['id']))
+                        preferred = str(slot.get('preferred_candidate_id') or '')
+                        candidate = min(choices, key=lambda c: (
+                            bool(preferred and c['id'] != preferred),
+                            c['seconds'] < need, abs(c['seconds'] - need), c['id']))
                         slot['allocations'].append({'candidate': copy.deepcopy(candidate), 'planned_start': max(slot['start'], self.now()) + held})
                         used.add(candidate['id']); fingerprints.update(candidate['fingerprints'])
                         if first_only: break
@@ -522,7 +550,7 @@ class System2Store:
                 slot['status'] = ('outside_hour_capacity' if slot['start'] >= hour_start + 3600 else
                     'complete' if (slot.get('heard_performances', 0) >= 1 if slot.get('coverage_mode') == 'one_performance'
                                    else slot['heard_seconds'] >= slot['target_seconds']) else
-                    'ready' if slot['debt_seconds'] <= .001 else 'needs_preparation')
+                    'ready' if self._slot_ready(slot) else 'needs_preparation')
                 self._save(db, 's2_slots', slot, ('hour_id', 'ordinal'))
                 self._job_for_slot(db, slot)
             valid = {slot['id'] for slot in slots}
@@ -545,9 +573,11 @@ class System2Store:
         job = {'id': identity, 'slot_id': slot['id'], 'hour_id': slot['hour_id'], 'kind': slot['kind'],
             'revision': slot['revision'], 'deadline': slot['start'], 'hard_deadline': slot['deadline'],
             'target_ready_seconds': debt, 'slot_target_seconds': slot['target_seconds'],
-            'slot_ready_seconds': slot['ready_seconds'], 'coverage_missing': slot['coverage_seconds'] <= .001,
+            'slot_ready_seconds': slot['ready_seconds'],
+            'coverage_missing': slot['target_seconds'] > .001 and slot['coverage_seconds'] <= .001,
             'estimated_work_seconds': debt * slot['prep_cost_per_second'] if slot.get('prep_cost_per_second') is not None else None,
-            'state': 'pending' if debt > .001 and slot['deadline'] > self.now() else 'satisfied' if debt <= .001 else 'expired',
+            'state': ('satisfied' if self._slot_ready(slot) else
+                      'pending' if slot['deadline'] > self.now() else 'expired'),
             'attempts': int((old or {}).get('attempts') or 0),
             'retry_at': float((old or {}).get('retry_at') or 0) if old and old['revision'] == slot['revision'] else 0}
         if old and old['revision'] == slot['revision'] and old.get('attempts'):
@@ -643,7 +673,7 @@ class System2Store:
                     if why:
                         refuse(why, c); continue
                     refuse('WOULD FIT', c)
-                blocker = ('the slot is satisfied' if need <= .001 else
+                blocker = ('the slot is satisfied' if self._slot_ready(slot) else
                            'the slot deadline has passed - it can never be '
                            'filled now' if room <= 0 else
                            'nothing was refused; it simply has no candidate '
@@ -778,7 +808,7 @@ class System2Store:
                     raise System2Conflict('Candidate is allocated to another current or future occurrence.')
             slot['allocations'] = [{'candidate': copy.deepcopy(candidate), 'planned_start': self.now()}]
             self._slot_totals(db, slot)
-            slot['status'] = 'ready' if slot['debt_seconds'] <= .001 else 'needs_preparation'
+            slot['status'] = 'ready' if self._slot_ready(slot) else 'needs_preparation'
             self._save(db, 's2_slots', slot, ('hour_id', 'ordinal'))
             self._job_for_slot(db, slot)
             return slot
@@ -1121,9 +1151,12 @@ class System2Store:
                          row['state'] == 'completed' and (not audible or row['heard_seconds'] >= row['actual_seconds']))
             receipt = {'id': receipt_id, 'at': at, 'reservation_id': reservation_id, 'line_id': line_id,
                 'completed': bool(completed), 'audible': bool(audible), 'duplicate_position': duplicate}
+            candidate = row['candidate']
             fingerprints = (['t:' + text_hash(line['text'])] + (['a:' + line['audio_hash'].lower()] if line.get('audio_hash') else [])
-                            if line else row['candidate']['fingerprints'])
-            receipt['repeat_violation'] = bool(audible and not duplicate and self._repeat_reason(db, {'fingerprints': fingerprints}, at, reservation_id))
+                            if line else ['t:' + value for value in candidate['text_hashes']]
+                            + ['a:' + value for value in candidate['audio_hashes']])
+            receipt['repeat_violation'] = bool(candidate['repeat_guard'] and audible and not duplicate
+                and self._repeat_reason(db, {'fingerprints': fingerprints}, at, reservation_id))
             before_heard, before_delivered = row['heard_seconds'], row['delivered_seconds']
             if not duplicate:
                 if audible:

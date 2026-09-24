@@ -200,6 +200,21 @@ test('script repaint anchors the visible on-air row before a generic visible row
   assert.ok(anchor.indexOf("box.querySelector('.sp-el.sp-now')") < anchor.indexOf('for (var i = 0;'));
 });
 
+test('a delayed segment fold cannot restore an anchor from another active line', () => {
+  const fs = require('node:fs'), path = require('node:path');
+  const source = fs.readFileSync(path.join(__dirname, '../desktop/renderer/script-page.js'), 'utf8');
+  const guard = source.slice(source.indexOf('  var foldHold = null;'),
+    source.indexOf('  /* ---------------------------------------- THE STATION',
+      source.indexOf('  var foldHold = null;')));
+  assert.match(guard, /foldGuardSerial \+= 1/);
+  assert.match(guard, /serial !== foldGuardSerial/);
+  assert.match(guard, /hold\.line !== String\(nowLineId \|\| ''\)/);
+  const follow = source.slice(source.indexOf('  function segFollow('),
+    source.indexOf('  function loadPlan(', source.indexOf('  function segFollow(')));
+  assert.match(follow, /clearTimeout\(foldGuardTimer\)/);
+  assert.match(follow, /foldGuardEnd\('follow', guard\)/);
+});
+
 test('incident events retain the viewport movement owner and segment layout', () => {
   const rec = diagnostics.createRecorder();
   rec.observe(sample(1000, {scroll_owner: 'fold:live', scroll_owner_at_ms: 990,
@@ -210,4 +225,27 @@ test('incident events retain the viewport movement owner and segment layout', ()
   assert.equal(got.events[0].live_segment, 'seg-a');
   assert.equal(got.events[0].highlighted_segment, 'seg-a');
   assert.equal(got.events[0].nodes_transitioning, 4);
+});
+
+test('an audible line still marked prepared chases one fresh screenplay', () => {
+  const fs = require('node:fs'), path = require('node:path'), vm = require('node:vm');
+  const source = fs.readFileSync(path.join(__dirname, '../desktop/renderer/script-page.js'), 'utf8');
+  const start = source.indexOf('  function chaseStalePage(');
+  const end = source.indexOf('  function markNow(', start);
+  let now = 100000, loads = 0;
+  const context = {
+    Date: {now: () => now}, Number,
+    chasedAt: 0, chasedFor: Object.create(null),
+    PineScriptResolver: {isLineId: () => true},
+    loadScreenplay: fresh => { assert.equal(fresh, true); loads += 1; }
+  };
+  vm.createContext(context);
+  vm.runInContext(source.slice(start, end), context);
+  const pending = {classList: {contains: name => name === 'pending'}};
+  assert.equal(context.chaseStalePage('line-a', pending), true);
+  assert.equal(context.chaseStalePage('line-a', pending), false);
+  assert.equal(loads, 1, 'the quarter-second mark tick must not refetch repeatedly');
+  now += 20001;
+  assert.equal(context.chaseStalePage('line-a', pending), true);
+  assert.equal(loads, 2, 'the same line can be refreshed after the throttle window');
 });

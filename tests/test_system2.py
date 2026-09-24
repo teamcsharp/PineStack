@@ -178,6 +178,19 @@ class System2Tests(unittest.TestCase):
         self.assertEqual(actual['status'], 'complete')
         self.assertEqual(actual['ready_seconds'], 0)
 
+    def test_whole_performance_with_small_residual_is_ready_but_reports_debt(self):
+        template = [{'id': 'bulletin', 'kind': 'news', 'seconds': 120}]
+        hour = self.plan([candidate('almost-full', seconds=107)], template)
+        slot = hour['slots'][0]
+        self.assertEqual(slot['debt_seconds'], 13)
+        self.assertEqual(slot['status'], 'ready')
+        self.assertEqual(self.store.get_job(slot['id'] + ':prepare')['state'], 'satisfied')
+
+        short = self.plan([candidate('too-short', seconds=90)], template,
+                          start=self.now + 300)
+        self.assertEqual(short['slots'][0]['status'], 'needs_preparation')
+        self.assertEqual(short['slots'][0]['debt_seconds'], 30)
+
     def test_current_record_binding_replaces_only_unowned_allocation_without_revision_change(self):
         template = [{'id': 'link', 'kind': 'track_talk', 'seconds': 180,
                      'target_seconds': 15, 'coverage_mode': 'one_performance'}]

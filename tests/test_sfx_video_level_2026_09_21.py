@@ -23,7 +23,9 @@ import time
 from pathlib import Path
 from typing import Any
 
-SRC = sys.argv[1] if len(sys.argv) > 1 else "app.py"
+_arg = Path(sys.argv[1]) if len(sys.argv) > 1 else None
+SRC = str(_arg if _arg and _arg.is_file()
+          else Path(__file__).resolve().parents[1] / "app.py")
 s = io.open(SRC, encoding="utf-8").read()
 tree = ast.parse(s)
 lines = s.split("\n")
@@ -375,4 +377,5 @@ finally:
 print("\n%d checks failed" % len(fails))
 for line in fails:
     print("  " + line)
-raise SystemExit(1 if fails else 0)
+if __name__ == "__main__":
+    raise SystemExit(1 if fails else 0)

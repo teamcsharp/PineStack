@@ -21,6 +21,7 @@ def function_source(name):
 
 def banter_beat_source():
     names = {"_BANTER_BEAT_ROW", "_BANTER_BEAT_STOCK", "_BANTER_BEAT_STOP",
+             "WritingDeferred",
              "_beat_content_words", "_beat_answers", "_beat_sequence_answers",
              "_banter_beat_plan",
              "_banter_beats"}
@@ -99,9 +100,9 @@ class RuntimeSingleFlightTests(unittest.IsolatedAsyncioTestCase):
 
         cue = body("sfx_video_cue_api")
         self.assertIn("await sfx_video_fresh_pick()", cue)
-        self.assertIn("sfx_video_note_played(key)", cue)
+        self.assertIn("sfx_video_note_played(key", cue)
         self.assertNotIn("await sfx_db_pick_row_async(True)", cue)
-        self.assertIn("sfx_video_note_played(key)", body("sfx_video_cut_api"))
+        self.assertIn("sfx_video_note_played(key", body("sfx_video_cut_api"))
         self.assertIn("sfx_video_on_cooldown", body("sfx_cycle_request"))
         self.assertNotIn("return first", body("sfx_video_fresh_pick"))
 
@@ -158,6 +159,89 @@ class RuntimeSingleFlightTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([row["made"] for row in trace], [4, 4, 1])
         self.assertTrue(namespace["_beat_answers"]("the signal is clear", "that signal is fading"))
         self.assertFalse(namespace["_beat_answers"]("the signal is clear", "back to the music"))
+
+    async def test_banked_beat_chain_keeps_the_retry_and_never_returns_empty(self):
+        prompts = []
+
+        async def off_topic(prompt, **_kwargs):
+            prompts.append(prompt)
+            rows = re.findall(r"(?m)^(\d+)  ([ABCD])  -", prompt)
+            return "\n".join("%s: unrelated reply %s." % (seat, turn)
+                              for turn, seat in rows)
+
+        def parse(script, *_args):
+            return [(marker, text.strip()) for marker, text in
+                    re.findall(r"(?m)^([ABCD]):\s*(.+)$", script)]
+
+        namespace = {"asyncio": asyncio, "re": re, "time": time, "Any": Any,
+                     "ask_model": off_topic, "banter_turns": parse,
+                     "spoken_text": lambda value: value,
+                     "prep_should_stop": lambda: "",
+                     "_verbatim_turn_text": lambda value: str(value)}
+        exec(banter_beat_source(), namespace)
+        trace = []
+        sheet = "\n".join("%2d  %s  - answers the prior turn" %
+                          (turn, "A" if turn % 2 else "B")
+                          for turn in range(1, 6))
+        script = await namespace["_banter_beats"](
+            "SUBJECT AND DIRECTION: discuss the signal.", sheet, 5,
+            ["A", "B"], seed_text="The signal begins here.", trace=trace)
+        self.assertEqual(len(parse(script)), 5)
+        self.assertEqual(len(prompts), 2, "one failed check gets one retry")
+        self.assertEqual(trace[0]["attempts"], 2)
+        self.assertEqual(trace[0]["made"], 4)
+
+        async def broken(*_args, **_kwargs):
+            raise RuntimeError("writer unavailable")
+
+        namespace["ask_model"] = broken
+        trace = []
+        script = await namespace["_banter_beats"](
+            "SUBJECT AND DIRECTION: the toilet is overflowing in the booth.",
+            sheet, 5, ["A", "B"], trace=trace)
+        turns = parse(script)
+        self.assertGreaterEqual(len(turns), 2)
+        self.assertIn("toilet", turns[0][1].lower())
+        self.assertEqual(trace[-1]["beat"], "glue")
+
+        async def deferred(*_args, **_kwargs):
+            raise namespace["WritingDeferred"]("the station lane is full")
+
+        namespace["ask_model"] = deferred
+        with self.assertRaises(namespace["WritingDeferred"]):
+            await namespace["_banter_beats"](
+                "SUBJECT AND DIRECTION: discuss the signal.",
+                sheet, 5, ["A", "B"], trace=[])
+
+        ask = next(row for row in TREE.body
+                   if isinstance(row, ast.AsyncFunctionDef)
+                   and row.name == "ask_model")
+        ask_body = ast.get_source_segment(SOURCE, ask) or ""
+        self.assertIn('_mark_kind == "banter beat"', ask_body)
+
+    def test_system2_keeps_its_exact_budget_out_of_the_beat_chain(self):
+        node = next(row for row in TREE.body
+                    if isinstance(row, ast.AsyncFunctionDef)
+                    and row.name == "dj_banter")
+        body = ast.get_source_segment(SOURCE, node) or ""
+        self.assertIn('and not _system2_job', body)
+
+    def test_zero_output_beat_artifacts_never_enter_the_cupboard_or_gold(self):
+        namespace = {"Any": Any}
+        exec(function_source("larder_empty_beat_chain"), namespace)
+        invalid = {"writer_engine": "beats", "beat_chain": [
+            {"beat": 1, "made": 0}, {"beat": "glue", "made": 0}]}
+        self.assertTrue(namespace["larder_empty_beat_chain"](invalid))
+        self.assertFalse(namespace["larder_empty_beat_chain"](
+            {**invalid, "beat_chain": [{"beat": 1, "made": 2}]}))
+        self.assertFalse(namespace["larder_empty_beat_chain"](
+            {"writer_engine": "one", "beat_chain": []}))
+        trim = next(row for row in TREE.body
+                    if isinstance(row, ast.FunctionDef)
+                    and row.name == "larder_trim")
+        trim_body = ast.get_source_segment(SOURCE, trim) or ""
+        self.assertIn("larder_empty_beat_chain(entry)", trim_body)
+        self.assertIn("none entered gold", trim_body)
 
     def test_broadcast_destination_survives_settings_validation(self):
         # This contract is integration-tested through app.py elsewhere. Keep a
@@ -237,8 +321,10 @@ class RuntimeSingleFlightTests(unittest.IsolatedAsyncioTestCase):
                       if isinstance(row, ast.AsyncFunctionDef)
                       and row.name == "_speak_turns_floorless")
         source = ast.get_source_segment(SOURCE, rounds) or ""
-        self.assertIn("await asyncio.to_thread(\n"
-                      "                    admission_admit_round", source)
+        self.assertRegex(
+            source,
+            r"await asyncio\.to_thread\(\s+admission_admit_round",
+        )
 
     def test_continuous_polls_only_read_non_blocking_snapshots(self):
         def body(name):

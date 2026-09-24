@@ -186,6 +186,101 @@ def _room(key: str, name: str, why: str) -> dict[str, Any]:
             "window_seconds": int(WINDOW_S)}
 
 
+def schedule_cupboard_handoff(
+        bank: dict[str, Any], preparable: Any, shelf_full: Any,
+        *, horizon_seconds: float = 3600.0, write_most: int = 3,
+        record_most: int = 6) -> dict[str, Any]:
+    """Prioritize missing scripts and bound, written-only stock by air time.
+
+    ``bank_view(60)`` has already spent the cupboard against exact slots.
+    Its short seconds require new writing; its bound items with written lines
+    require recording. This pure handoff returns orders only. The existing
+    writing ticket and recording room doors still own admission and live-air
+    relief when the caller dispatches an order.
+    """
+    out: dict[str, Any] = {"available": False, "work": [], "write": [],
+                           "record": [], "blocked": [], "write_waiting": 0,
+                           "record_waiting": 0, "truncated": False}
+    if not isinstance(bank, dict) or not bank.get("available"):
+        return out
+    out["available"] = True
+    allowed = set(preparable)
+    horizon = min(3600.0, max(0.0, _told(horizon_seconds) or 0.0))
+    write_limit = max(0, min(3, int(write_most)))
+    record_limit = max(0, min(6, int(record_most)))
+    if horizon <= 0:
+        return out
+    writing: dict[str, dict[str, Any]] = {}
+    recording: dict[str, dict[str, Any]] = {}
+    slots = [s for s in (bank.get("slots") or []) if isinstance(s, dict)]
+    slots.sort(key=lambda s: _told(s.get("in_seconds"))
+               if _told(s.get("in_seconds")) is not None else float("inf"))
+    for slot in slots[:80]:
+        road = str(slot.get("road") or "")
+        due = _told(slot.get("in_seconds"))
+        if road not in allowed or due is None or due > horizon:
+            continue
+        due = max(0.0, due)
+        commit_id = str(slot.get("commit_id") or "")
+        short = _told(slot.get("short_seconds")) or 0.0
+        owns = _told(slot.get("owns_seconds")) or 0.0
+        # New writing cannot rescue a slot that has already started airing.
+        # Keep scanning its items below: recording bound stock may still help.
+        if short > 1.0 and owns > 0 and not slot.get("current"):
+            seat = writing.setdefault(road, {
+                "action": "write", "road": road, "label": str(slot.get("label") or road),
+                "due_in": round(due, 1), "commit_id": commit_id,
+                "want_seconds": 0.0, "bare": slot.get("state") == "missing"})
+            seat["want_seconds"] = round(min(horizon,
+                seat["want_seconds"] + min(owns, short)), 1)
+        if (_told(slot.get("written_only_seconds")) or 0.0) <= 1.0:
+            continue
+        for item in (slot.get("items") or []):
+            if not isinstance(item, dict) or item.get("ready"):
+                continue
+            counts = item.get("counts") if isinstance(item.get("counts"), dict) else {}
+            written = _told(counts.get("written")) or 0.0
+            ident = str(item.get("id") or item.get("sid") or "")
+            if written <= 0 or not ident or ident in recording:
+                continue
+            recording[ident] = {
+                "action": "record", "road": road,
+                "label": str(slot.get("label") or road),
+                "item_id": ident, "sid": str(item.get("sid") or ""),
+                "due_in": round(due, 1), "commit_id": commit_id,
+                "written_lines": int(written),
+                "allocated_seconds": round(_told(item.get("allocated_seconds")) or 0.0, 1),
+            }
+    out["truncated"] = len(slots) > 80
+    for road, order in writing.items():
+        try:
+            if shelf_full(road):
+                out["blocked"].append({**order, "why": "the shelf is full"})
+                continue
+        except Exception:  # noqa: BLE001
+            out["blocked"].append({**order, "why": "shelf capacity is unknown"})
+            continue
+        order["why"] = ("%ds of the next hour's %s airtime has no bound "
+                        "script; the first gap is due in %ds"
+                        % (int(order["want_seconds"]), road,
+                           int(order["due_in"])))
+        out["write"].append(order)
+    out["write"].sort(key=lambda row: (row["due_in"], -row["want_seconds"]))
+    out["record"] = sorted(recording.values(),
+                           key=lambda row: (row["due_in"], row["item_id"]))
+    out["write_waiting"] = len(out["write"])
+    out["record_waiting"] = len(out["record"])
+    out["write"] = out["write"][:write_limit]
+    out["record"] = out["record"][:record_limit]
+    out["truncated"] = bool(out["truncated"]
+        or out["write_waiting"] > write_limit
+        or out["record_waiting"] > record_limit)
+    out["work"] = sorted(out["write"] + out["record"],
+                         key=lambda row: (row["due_in"],
+                                          0 if row["action"] == "record" else 1))
+    return out
+
+
 # ------------------------------------------------------------ the rooms
 
 def _writing_desk(app: Any, now: float) -> dict[str, Any]:

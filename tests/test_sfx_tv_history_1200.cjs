@@ -323,45 +323,40 @@ test('#1200: the wheel scrolls the strip, and never the sheet under it',
   tv.stop();
 });
 
-test('#1200: reaching the old end asks the station for a page and appends it',
+test('#1200: the popup starts with three and each explicit reach adds two',
      async () => {
   world();
-  const box = station([page(9000, HIST_PAGE, true)]);
+  const box = station([page(9000, 3, true), page(8998, 3, true)]);
   const tv = load();
   tv.mount({baseUrl: 'http://box:8096'});
   await wait(40);
   const {strip} = openStrip(tv);
-  assert.equal(tiles(strip).length, 0, 'the strip fetched before he touched it');
-
-  wheel(strip, -400);
   await wait(40);
 
   const asks = box.asked.filter((r) => String(r).indexOf('/api/sfx/history') === 0);
-  assert.equal(asks.length, 1, 'asked ' + asks.length + ' times for one reach');
+  assert.equal(asks.length, 1, 'opening should make one bounded initial request');
   /* The exact road, because the wrong one answers 200 with the wrong rows. */
-  assert.equal(asks[0], '/api/sfx/history?limit=' + HIST_PAGE);
-  assert.equal(tiles(strip).length, HIST_PAGE,
-               'the page was fetched and not drawn');
-  assert.equal(tv.history().length, HIST_PAGE);
+  assert.equal(asks[0], '/api/sfx/history?limit=3');
+  assert.equal(tiles(strip).length, 3, 'the initial three were not drawn');
+  assert.equal(tv.history().length, 3);
 
   /* OLDEST ON THE LEFT. The station sends newest first; the strip runs
      the other way, and a page inserted in wire order would read
      backwards without anything reporting it. */
   const drawn = tiles(strip);
   const first = tv.history()[0];
-  assert.equal(first.id, 'id' + (9000 - HIST_PAGE + 1),
+  assert.equal(first.id, 'id8998',
                'the oldest row is not at the left of the strip');
-  assert.ok(String(drawn[0].title).indexOf('clip-' + (9000 - HIST_PAGE + 1)) >= 0,
+  assert.ok(String(drawn[0].title).indexOf('clip-8998') >= 0,
             'the leftmost tile is not the oldest one: ' + drawn[0].title);
 
-  /* AND THE NEXT ASK CARRIES THE CURSOR. Without `before` the station can
-     only answer the same page again, which is what #1200 was for. */
-  strip.scrollLeft = 0;
-  wheel(strip, -400);
+  /* The old-end control asks for three wire rows: the inclusive boundary
+     plus exactly two new visible entries. */
+  note(strip).fire('click', {preventDefault() {}, stopPropagation() {}});
   await wait(40);
   const next = box.asked.filter((r) => String(r).indexOf('/api/sfx/history') === 0);
-  assert.equal(next[1],
-               '/api/sfx/history?limit=' + HIST_PAGE + '&before=' + (9000 - HIST_PAGE + 1));
+  assert.equal(next[1], '/api/sfx/history?limit=3&before=8998');
+  assert.equal(tv.history().length, 5, 'one reach should reveal exactly two older items');
   tv.stop();
 });
 
@@ -442,11 +437,6 @@ test('#1200: the end of the history says so, and stops asking', async () => {
   tv.mount({baseUrl: 'http://box:8096'});
   await wait(40);
   const {strip} = openStrip(tv);
-
-  assert.equal(noteWords(strip), 'scroll back for more',
-               'the strip did not offer the history at all');
-
-  wheel(strip, -400);
   await wait(40);
   assert.equal(tv.histState().more, false);
   assert.equal(noteWords(strip), 'that is the whole history - nothing older');
@@ -649,27 +639,24 @@ test('#1200: the ceiling holds, and says where it cut', async () => {
   tv.stop();
 });
 
-test('#1200: opening the strip asks for nothing, and shows now', async () => {
+test('#1200: opening the strip fetches only the last three and keeps the old-end control', async () => {
   world();
-  const box = station([page(9000, HIST_PAGE, true)]);
+  const box = station([page(9000, 3, true)]);
   const tv = load();
   tv.mount({baseUrl: 'http://box:8096'});
   await wait(40);
   const {strip} = openStrip(tv);
   await wait(40);
-  /* The strip is at scrollLeft 0 the moment it is built, so a naive
-     "at the old end -> fetch" would ask the station for twenty-four
-     ffmpeg renders every single time he right-clicks the picture. The
-     gesture is what asks. */
   const asks = box.asked.filter((r) => String(r).indexOf('/api/sfx/history') === 0);
-  assert.equal(asks.length, 0, 'opening the sheet fetched a page nobody wanted');
+  assert.deepEqual(asks, ['/api/sfx/history?limit=3']);
+  assert.equal(tiles(strip).length, 3);
   assert.ok(note(strip), 'there is no note at the old end');
   assert.equal(strip.children[0], note(strip),
                'the note is not at the old end of the strip');
   tv.stop();
 });
 
-test('#1200: a history tile opens the same sheet a played tile does',
+test('#1200: tapping a history tile immediately plays that item',
      async () => {
   world();
   station([page(9000, 3, false)]);
@@ -685,13 +672,11 @@ test('#1200: a history tile opens the same sheet a played tile does',
                'a tile must be a real button: hot-corners.js walks up from the '
                + 'press and finds the tag, so a tap in a corner is never also '
                + 'a corner gesture');
-  /* A clip out of the ledger is a clip that has already gone out, which
-     is exactly what a `heard` tile is - so the tap is the same tap, and
-     the sheet it opens already grows a Play it for a clip that is not on
-     the tube. Nothing had to be added and a second behaviour would have
-     been the fault. */
-  assert.ok(String(tile.title).indexOf('tap to open its menu') > 0,
+  assert.ok(String(tile.title).indexOf('tap to play it') > 0,
             'a history tile offers something else: ' + tile.title);
+  tile.fire('click', {stopPropagation() {}});
+  assert.equal(String(tv.playing().id), 'id8998',
+               'the tap did not put the selected history item on the tube');
   /* And it says WHEN, because "played" on a hundred and twenty tiles
      tells him nothing he could not see from where the tile sits. */
   const when = tile.children[0].children.filter((k) => k.tag === 'i')[0];

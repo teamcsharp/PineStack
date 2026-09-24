@@ -197,7 +197,7 @@ function initRailResizer() {
  * the view calls one name on both surfaces. */
 const PINE_MIXER_KEY = "pineMixer";
 function pineMixerRead() {
-  const one = (v) => { const n = Number(v); return Number.isFinite(n) ? Math.max(0, Math.min(1.5, n)) : 1; };
+  const one = (v) => { const n = Number(v); return Number.isFinite(n) ? Math.max(0, Math.min(2, n)) : 1; };
   let m = {};
   try { m = JSON.parse(localStorage.getItem(PINE_MIXER_KEY) || "{}") || {}; } catch (err) { m = {}; }
   return {voice: one(m.voice), music: one(m.music), sfx: one(m.sfx), video: one(m.video)};
@@ -343,7 +343,10 @@ function appVolumeScript(audible = true) {
           : (node.dataset && node.dataset.pineSting === "1") ? "sfx"
           : (tag === "music" ? "music" : "voice");
         const mix = Number.isFinite(Number(mixer[kind])) ? Number(mixer[kind]) : 1;
-        const nextVolume = nodeAudible ? Math.min(1, volume * share * mix) : 0;
+        /* The element carries the cut and the page's gain stage carries the
+         * boost. This keeps 200% real without squaring sub-unity levels. */
+        const nextVolume = nodeAudible
+          ? Math.min(1, volume * share * Math.min(1, mix)) : 0;
         if (Math.abs(node.volume - nextVolume) > 0.001) node.volume = nextVolume;
         /* #1147: MUTE ONLY, NEVER FORCE-UNMUTE. The page's solo gate
          * (#1008 pineSoloGate) gags this surface when another listener
@@ -630,7 +633,7 @@ function paintMediaLevel() {
   if (document.activeElement === slider) return;   /* never under the thumb */
   const bus = mediaLevelBus();
   const now = bus ? Number((bus.get() || {}).video) : Number(mixerLevels.video);
-  const pct = Math.round(Math.max(0, Math.min(1, Number.isFinite(now) ? now : 1)) * 100);
+  const pct = Math.round(Math.max(0, Math.min(2, Number.isFinite(now) ? now : 1)) * 100);
   if (Number(slider.value) !== pct) slider.value = String(pct);
   const label = $("vol_videoValue");
   if (label) label.textContent = pct + "%";
@@ -644,7 +647,7 @@ function initMediaLevel() {
   slider.dataset.wired = "1";
   paintMediaLevel();
   slider.addEventListener("input", () => {
-    const want = Math.max(0, Math.min(100, Number(slider.value) || 0)) / 100;
+    const want = Math.max(0, Math.min(200, Number(slider.value) || 0)) / 100;
     const bus = mediaLevelBus();
     if (bus) bus.apply("video", want);
     else { try { window.pineMixer.set({video: want}); } catch (err) { /* nothing here */ } }
@@ -912,7 +915,7 @@ function applyAppVolume() {
    * script above can never reach it, so its level is written here or it
    * is the one sound in this window the sliders do not move. */
   try {
-    if (window.PineSfxTv) window.PineSfxTv.level(Math.min(1, desktopVoiceGain() * mixerLevels.video));   /* #1419 */
+    if (window.PineSfxTv) window.PineSfxTv.level(Math.min(2, desktopVoiceGain() * mixerLevels.video));   /* #1419 */
   } catch (err) { /* the frames are already levelled */ }
 }
 
@@ -1980,6 +1983,7 @@ function desktopMusicUrl(url) {
   if (/^https?:\/\//i.test(url)) return url;
   return `${config.baseUrl}${url.startsWith("/") ? "" : "/"}${url}`;
 }
+window.desktopMusicUrl = desktopMusicUrl;
 
 function syncDesktopRadio(clock) {
   const player = $("desktopRadioPlayer");
@@ -2496,7 +2500,7 @@ async function loadConfig() {
          anything called applyAppVolume(). A clip that started in between
          began at the wrong loudness and was edited mid-picture, which is
          the whole of this request. */
-      window.PineSfxTv.level(Math.min(1, desktopVoiceGain() * mixerLevels.video));
+      window.PineSfxTv.level(Math.min(2, desktopVoiceGain() * mixerLevels.video));
     }
   } catch (err) { /* the rest of the window still comes up */ }
   loadFrames();
@@ -3054,6 +3058,10 @@ const THREEJS_VIEWS = [
     systems: "/api/comfy/doctor · systemd bridge",
     what: "The image renderer's troubleshooter, as a console",
     desc: "Knocks on ComfyUI, reads its vitals and restarts it when it is down; Deep proves the whole road with a real test render. Every step lands in the console as it happens." },
+  { key: "comfyworkshop", icon: "FILM", name: "Comfy Workshop", since: "#1285",
+    systems: "MiniMax H3 · ComfyUI · the SFX clip book",
+    what: "Build a video from text, a frame, or station reference media",
+    desc: "Choose recent SFX, the clip book, or gallery art; pair it with prepared DJ rhetoric; then submit a thermally guarded H3 video and optionally put the finished clip into SFX rotation." },
   { key: "steward", icon: "🏥", name: "Services", since: "#1153",
     systems: "/api/steward · the services census",
     what: "Every service in the stack, checked and repaired",
@@ -11487,7 +11495,7 @@ function initSamplePopup() {
   const btn = $("sampleBtn");
   const pop = $("samplePopup");
   if (!btn || !pop) return;
-  let job = "", audioUrl = "", videoUrl = "", dur = 0, ranges = [],
+  let job = "", audioUrl = "", videoUrl = "", videoPosterUrl = "", dur = 0, ranges = [],
       hoverBtn = false;
   const anim = { timer: 0, tick: 0, prog: 0, stage: "", note: "",
                  streams: [], el: null, bar: null };
@@ -11590,6 +11598,7 @@ function initSamplePopup() {
   /* ---- the popup ------------------------------------------------------ */
   function draw(stage, note) {
     animStop();
+    pop.querySelectorAll("video, audio").forEach((old) => old.pause());
     pop.innerHTML = "<b>🎬 Add a sample</b>";
     const urlRow = document.createElement("div");
     urlRow.className = "sp-row";
@@ -11616,12 +11625,96 @@ function initSamplePopup() {
     }
     if (stage === "ready") {
       let media;
+      let frame;
       if (videoUrl) {
         media = document.createElement("video");
         media.controls = true; media.playsInline = true;
         media.preload = "metadata";
-        media.style.cssText = "width:100%;max-height:280px;background:#000;"
-          + "border-radius:8px";
+        frame = document.createElement("div");
+        frame.style.cssText = "position:relative;width:100%;aspect-ratio:16/9;"
+          + "max-height:280px;background:#000;overflow:hidden;border-radius:8px";
+        const icon = document.createElement("img");
+        icon.alt = "";
+        icon.src = desktopMusicUrl("/spark/asset/pinebox.png");
+        icon.style.cssText = "position:absolute;left:50%;top:50%;width:96px;"
+          + "height:96px;max-width:25%;max-height:50%;object-fit:contain;"
+          + "transform:translate(-50%,-50%)";
+        frame.appendChild(icon);
+        let poster = null;
+        if (videoPosterUrl) {
+          poster = document.createElement("img");
+          poster.alt = "";
+          poster.style.cssText = "position:absolute;inset:0;width:100%;height:100%;"
+            + "object-fit:contain";
+          poster.addEventListener("load", () => { icon.hidden = true; });
+          poster.addEventListener("error", () => { poster.remove(); icon.hidden = false; });
+          poster.src = desktopMusicUrl(videoPosterUrl);
+          frame.appendChild(poster);
+        }
+        const play = document.createElement("button");
+        play.type = "button";
+        play.title = "Play video preview";
+        play.setAttribute("aria-label", play.title);
+        play.innerHTML = typeof window.pineIcon === "function"
+          ? window.pineIcon("c:play--filled", play.title) : "Play";
+        play.style.cssText = "position:absolute;right:8px;bottom:8px;"
+          + "width:40px;height:40px;display:grid;place-items:center;z-index:1;"
+          + "background:#17232b;color:#edf3f5;border:1px solid #354853;"
+          + "border-radius:4px";
+        play.addEventListener("click", () => {
+          media.play().catch(() => { play.title = "Video preview could not play"; });
+        });
+        frame.appendChild(play);
+        media.style.cssText = "position:absolute;inset:0;width:100%;height:100%;"
+          + "object-fit:contain;visibility:hidden;background:transparent";
+        let frameGeneration = 0, firstTime = NaN;
+        let framePending = false, frameShown = false;
+        const frameReady = () => media.readyState >= 2
+          && media.videoWidth > 0 && media.videoHeight > 0;
+        const revealFrame = () => {
+          if (frameShown || !frameReady()) return;
+          frameShown = true;
+          media.style.visibility = "visible";
+          play.style.display = "none";
+          icon.hidden = true;
+          if (poster) poster.hidden = true;
+        };
+        const hideFrame = () => {
+          frameGeneration += 1;
+          firstTime = NaN;
+          framePending = false;
+          frameShown = false;
+          media.style.visibility = "hidden";
+          play.style.display = "grid";
+          icon.hidden = !!(poster && poster.complete && poster.naturalWidth);
+          if (poster) poster.hidden = false;
+        };
+        media.addEventListener("loadstart", hideFrame);
+        media.addEventListener("emptied", hideFrame);
+        const armFrame = () => {
+          if (!frameReady()) return;
+          if (!Number.isFinite(firstTime)) firstTime = Number(media.currentTime) || 0;
+          if (typeof media.requestVideoFrameCallback !== "function" || framePending) return;
+          framePending = true;
+          const token = frameGeneration;
+          try {
+            media.requestVideoFrameCallback(() => {
+              if (token !== frameGeneration) return;
+              framePending = false;
+              revealFrame();
+            });
+          } catch (err) { framePending = false; /* timeupdate remains the fallback */ }
+        };
+        media.addEventListener("loadeddata", armFrame);
+        media.addEventListener("playing", armFrame);
+        media.addEventListener("seeked", () => {
+          if (!media.seeking) revealFrame();
+        });
+        media.addEventListener("timeupdate", () => {
+          if (!Number.isFinite(firstTime)) { armFrame(); return; }
+          if (Number.isFinite(firstTime)
+            && Number(media.currentTime) > firstTime + 0.04) revealFrame();
+        });
         media.src = videoUrl;
         media.onerror = () => {          // no picture kept — audio still cuts
           videoUrl = "";
@@ -11635,7 +11728,8 @@ function initSamplePopup() {
       media.addEventListener("loadedmetadata", () => {
         dur = media.duration || 0; paint();
       });
-      pop.appendChild(media);
+      if (frame) { frame.appendChild(media); pop.appendChild(frame); }
+      else pop.appendChild(media);
       const bar = document.createElement("div");
       bar.className = "sp-bar";
       bar.onclick = (ev) => {
@@ -11713,7 +11807,9 @@ function initSamplePopup() {
       paint();
     }
     $("spClose").onclick = () => {
-      animStop(); pop.style.display = "none";
+      animStop();
+      pop.querySelectorAll("video, audio").forEach((old) => old.pause());
+      pop.style.display = "none";
     };
     $("spFetch").onclick = () => fetchUrl($("spUrl").value.trim());
     if (stage === "idle") $("spUrl").focus();
@@ -11816,6 +11912,7 @@ function initSamplePopup() {
         if (st.stage === "done" && st.audio) {
           audioUrl = desktopMusicUrl(st.audio);
           videoUrl = st.video ? desktopMusicUrl(st.video) : "";
+          videoPosterUrl = st.poster_url || st.poster || "";
           ranges = [];
           anim.prog = 1;
           draw("ready", (st.title || "ready") + " — set IN/OUT off the "

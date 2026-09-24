@@ -51,19 +51,37 @@
     return n;
   }
 
-  /* A spoken line, or nothing. `data-line` is the aired row's id, which is
-   * what every station road keys on. */
+  /* A spoken line, or nothing. Aired surfaces carry `data-line`; prepared
+   * calendar/chat/screenplay surfaces carry `data-dialogue-id`. Keeping the
+   * lookup here makes the hold sheet genuinely universal instead of making
+   * every view grow a slightly different long-press implementation. */
   function lineAt(target) {
     if (!target || !target.closest) return null;
-    var node = target.closest('[data-line]');
+    var node = target.closest('[data-line], [data-dialogue-id], .sp-itin-message');
     if (!node) return null;
-    var id = String(node.dataset.line || '').trim();
+    var id = String(node.dataset.line || node.dataset.dialogueId || '').trim();
+    if (!id && node.getAttribute) id = String(node.getAttribute('data-line-id') || '').trim();
     if (!id) return null;
+    var words = node.querySelector && node.querySelector(
+      '[data-dialogue-text], .sp-itin-message-text, .sp-segline-text');
     return {
       id: id,
-      said: String(node.textContent || '').trim(),
+      said: String((words && words.textContent) || node.textContent || '').trim(),
       node: node
     };
+  }
+
+  function spokenLine(line, sfxRow) {
+    if (!line || sfxRow) return false;
+    var node = line.node;
+    if (!node) return false;
+    if (node.dataset && node.dataset.spoken === 'true') return true;
+    if (node.dataset && node.dataset.spoken === 'false') return false;
+    if (node.classList && node.classList.contains('sp-dialogue')) return true;
+    if (node.dataset && node.dataset.dialogueId) return true;
+    var row = feedRow(line);
+    return !!(row && row.id && row.kind !== 'sfx'
+      && (row.kind === 'dialogue' || row.kind === 'voice' || row.voice || row.speaker));
   }
 
   /* ------------------------------------------------------------ the hold */
@@ -144,6 +162,14 @@
     document.addEventListener('pointerup', clear, true);
     document.addEventListener('pointercancel', clear, true);
     document.addEventListener('click', maybeSwallow, true);
+    document.addEventListener('contextmenu', function (event) {
+      var line = lineAt(event.target);
+      if (!line) return;
+      event.preventDefault();
+      event.stopPropagation();
+      clear();
+      open(line);
+    }, true);
   }
 
   /* ------------------------------------------------------------ the menu */
@@ -221,6 +247,22 @@
       'the next free pad, ready to fire', 'pad', function (stage) {
         return toPad(line, stage);
       });
+    if (sfxRow && !sfxRow.deleted) {
+      choice(list, 'c:edit', 'Edit and split this sound effect',
+        'set in and out points; save separate clips', 'mark', function (stage) {
+          return editSfx(line, sfxRow, stage);
+        });
+    }
+    if (spokenLine(line, sfxRow)) {
+      choice(list, 'c:bullhorn', 'Make ad with random SFX',
+        'use this spoken line; no music', 'mark', function (stage) {
+          return makeAdFromLine(line, stage);
+        });
+      choice(list, 'c:microphone', 'Save dry voice clip',
+        'isolated voice only; no SFX or music', 'to:c:folder', function (stage) {
+          return saveDryVoice(line, stage);
+        });
+    }
     choice(list, 'c:screen', 'Download it to the tablet',
       'into Downloads / Pine Box', 'to:c:screen', function (stage) {
         return keep(line, 'downloads', stage);
@@ -1006,6 +1048,27 @@
     });
   }
 
+  function editSfx(line, row, stage) {
+    var tv = root.PineSfxTv;
+    if (!tv || typeof tv.openEditor !== 'function') {
+      return Promise.resolve({ok: false, why: 'the clip editor is not loaded here'});
+    }
+    stage.say('opening the sound effect editor...');
+    return Promise.resolve(api().post('/api/sfx/edit/open', {
+      clip: row.sfx || '', line: row.line || String(line.id), name: row.name || ''
+    })).then(function (got) {
+      if (!got || !got.editor_url) {
+        return {ok: false, why: String((got && (got.say || got.detail)) ||
+          'the editor could not open this sound effect')};
+      }
+      tv.openEditor(String(got.editor_url), row.name || 'Sound effect');
+      close();
+      return {ok: true, then: String(got.say || 'editor opened')};
+    }, function (err) {
+      return {ok: false, why: saidWhy(err)};
+    });
+  }
+
 
   /* The bytes never enter the page - the bridge fetches and writes them,
    * and answers with the full path so the operator knows where it went. */
@@ -1035,8 +1098,54 @@
     });
   }
 
+  function makeAdFromLine(line, stage) {
+    if (!api().post) return Promise.resolve({ok: false, why: 'station bridge unavailable'});
+    stage.say('making the SFX-only ad...');
+    return Promise.resolve(api().post('/api/line-actions/make-ad', {
+      line_id: line.id, sfx: 'random', music: false
+    })).then(function (got) {
+      if (!got || got.ok !== true || got.music !== false
+          || got.auto_air !== true || got.scheduled !== true
+          || !got.ad_id || !got.sfx_id) {
+        return {ok: false, why: String((got && (got.detail || got.error))
+          || 'the station did not confirm a scheduled SFX-only ad')};
+      }
+      return {ok: true, then: String(got.say || 'ad made with SFX and no music')};
+    }, function (err) {
+      return {ok: false, why: String((err && err.message) || err)};
+    });
+  }
+
+  function saveDryVoice(line, stage) {
+    var bridge = root.pineDesktop;
+    if (!bridge || !bridge.post || !bridge.keepClip) {
+      return Promise.resolve({ok: false, why: 'this terminal cannot save dry voice clips'});
+    }
+    stage.say('checking the isolated voice clip...');
+    return Promise.resolve(bridge.post('/api/line-actions/dry-voice', {
+      line_id: line.id
+    })).then(function (got) {
+      if (!got || got.ok !== true || got.exact !== true || got.voice_only !== true
+          || !/^\/api\//.test(String(got.route || ''))) {
+        return {ok: false, why: String((got && (got.detail || got.error))
+          || 'an exact voice-only clip is not available')};
+      }
+      return bridge.keepClip({route: got.route, said: line.said, id: line.id,
+        where: 'recordings'}).then(function (saved) {
+        if (!saved || !saved.ok) {
+          return {ok: false, why: String((saved && saved.detail) || 'the clip was not saved')};
+        }
+        return {ok: true, then: 'dry voice saved to ' + String(saved.where || 'recordings')};
+      });
+    }, function (err) {
+      return {ok: false, why: String((err && err.message) || err)};
+    });
+  }
+
   root.PineLineActions = {start: start, open: open, close: close, lineAt: lineAt,
-                          sfxOf: sfxOf, stingName: stingName};   /* [#1200] */
+                          sfxOf: sfxOf, stingName: stingName, spokenLine: spokenLine,
+                          makeAdFromLine: makeAdFromLine, saveDryVoice: saveDryVoice,
+                          editSfx: editSfx};
   if (typeof module !== 'undefined' && module.exports) {
     module.exports = root.PineLineActions;
   }

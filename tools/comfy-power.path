@@ -1,0 +1,8 @@
+[Unit]
+Description=Watch for the Pine Box agent ComfyUI power flag
+
+[Path]
+PathExists=/home/ehm_eckx/pinevoice-stack/spark-agent/data/comfy_power
+
+[Install]
+WantedBy=multi-user.target

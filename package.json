@@ -34,6 +34,8 @@
       { "from": "script_diagnostics.py", "to": "agent/script_diagnostics.py" },
       { "from": "script_report_store.py", "to": "agent/script_report_store.py" },
       { "from": "video_editor.py", "to": "agent/video_editor.py" },
+      { "from": "comfy_workshop.py", "to": "agent/comfy_workshop.py" },
+      { "from": "parody_stinger_queue.py", "to": "agent/parody_stinger_queue.py" },
       { "from": "desktop/renderer/video-editor.html", "to": "agent/desktop/renderer/video-editor.html" },
       { "from": "desktop/renderer/video-editor.js", "to": "agent/desktop/renderer/video-editor.js" },
       { "from": "desktop/renderer/video-editor.css", "to": "agent/desktop/renderer/video-editor.css" },

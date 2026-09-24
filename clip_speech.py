@@ -29,8 +29,13 @@ from __future__ import annotations
 
 import io
 import json
+import secrets
 import socket
-from typing import Any, Iterator
+import time
+from contextlib import nullcontext
+from typing import Any, Callable, Iterator
+
+import sfx_match
 
 WYOMING_HOST = "127.0.0.1"
 WYOMING_PORT = 10300
@@ -261,3 +266,289 @@ def words_of(text: Any) -> list[str]:
     not grow a second opinion about either."""
     body = " ".join(str(text or "").lower().split())
     return [w for w in body.replace("'", "").split() if w.isalpha()]
+
+
+class IncrementalClipIndexer:
+    """Durable, bounded speech/vision work over the existing clip book.
+
+    The `clips` completion columns remain the source of coverage truth and
+    `sfx_meta` stores which lane gets the next tick. `sfx_index_work` only
+    owns leases and retry evidence. No loop or service call lives here: a
+    supervisor supplies processors and invokes `run_next` whenever resources
+    permit, so playback is never queued behind indexing.
+    """
+
+    LANES = {
+        "speech": {
+            "value": "said", "done": "said_at", "total": "playable",
+            "complete": "listened", "productive": "with_words",
+            "where": "c.playable = 1 AND c.seconds > 0 AND c.seconds <= ?",
+        },
+        "vision": {
+            "value": "seen_desc", "done": "seen_desc_at", "total": "video",
+            "complete": "looked_at", "productive": "described",
+            "where": "c.playable = 1 AND c.video = 1 AND c.seconds > 0",
+        },
+    }
+
+    def __init__(self, connection: Any, *, clock: Callable[[], float] = time.time,
+                 lock: Any = None, lease_seconds: float = 180.0,
+                 retry_base_seconds: float = sfx_match.INDEX_RETRY_BASE_SECONDS,
+                 retry_max_seconds: float = sfx_match.INDEX_RETRY_MAX_SECONDS):
+        self.connection = connection
+        self.clock = clock
+        self.lock = lock
+        self.lease_seconds = max(5.0, float(lease_seconds))
+        self.retry_base_seconds = max(1.0, float(retry_base_seconds))
+        self.retry_max_seconds = max(self.retry_base_seconds,
+                                     float(retry_max_seconds))
+        self._ensure_schema()
+
+    def _guard(self) -> Any:
+        return self.lock if self.lock is not None else nullcontext()
+
+    def _ensure_schema(self) -> None:
+        with self._guard():
+            columns = {str(row[1]) for row in
+                       self.connection.execute("PRAGMA table_info(clips)")}
+            for name, declaration in (
+                    ("said", "TEXT"), ("said_at", "REAL"),
+                    ("seen_desc", "TEXT"), ("seen_desc_at", "REAL")):
+                if name not in columns:
+                    self.connection.execute(
+                        "ALTER TABLE clips ADD COLUMN %s %s" % (name, declaration))
+            self.connection.execute("""CREATE TABLE IF NOT EXISTS sfx_meta (
+                name TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )""")
+            self.connection.execute("""CREATE TABLE IF NOT EXISTS sfx_index_work (
+                kind TEXT NOT NULL,
+                path TEXT NOT NULL,
+                claims INTEGER NOT NULL DEFAULT 0,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                failures INTEGER NOT NULL DEFAULT 0,
+                completed INTEGER NOT NULL DEFAULT 0,
+                productive INTEGER NOT NULL DEFAULT 0,
+                started INTEGER NOT NULL DEFAULT 0,
+                claimed_at REAL NOT NULL DEFAULT 0,
+                claimed_until REAL NOT NULL DEFAULT 0,
+                claim_token TEXT NOT NULL DEFAULT '',
+                last_attempt_at REAL NOT NULL DEFAULT 0,
+                retry_at REAL NOT NULL DEFAULT 0,
+                last_error TEXT NOT NULL DEFAULT '',
+                updated_at REAL NOT NULL DEFAULT 0,
+                PRIMARY KEY (kind, path)
+            )""")
+            self.connection.execute(
+                "CREATE INDEX IF NOT EXISTS sfx_index_ready "
+                "ON sfx_index_work(kind, retry_at, claimed_until)")
+            self.connection.commit()
+
+    def _lane(self, kind: Any) -> tuple[str, dict[str, str]]:
+        key = str(kind or "").lower()
+        if key not in self.LANES:
+            raise ValueError("index kind must be speech or vision")
+        return key, self.LANES[key]
+
+    def claim(self, kind: str, limit: int = 0) -> list[dict[str, Any]]:
+        """Lease one bounded batch; overlapping workers cannot share a row."""
+        key, lane = self._lane(kind)
+        wanted = sfx_match.index_batch_size(limit)
+        now = float(self.clock())
+        params: list[Any] = [key]
+        duration = ""
+        if key == "speech":
+            duration = lane["where"]
+            params.append(float(MOST_SECONDS))
+        else:
+            duration = lane["where"]
+        params.extend((now, now, wanted))
+        with self._guard():
+            try:
+                self.connection.execute("BEGIN IMMEDIATE")
+                rows = self.connection.execute(
+                    "SELECT c.rowid, c.path, c.seconds, c.video, "
+                    "COALESCE(w.attempts, 0), COALESCE(w.failures, 0) "
+                    "FROM clips c LEFT JOIN sfx_index_work w "
+                    "ON w.kind = ? AND w.path = c.path WHERE " + duration +
+                    " AND c.%s IS NULL " % lane["done"] +
+                    "AND COALESCE(w.retry_at, 0) <= ? "
+                    "AND COALESCE(w.claimed_until, 0) <= ? "
+                    "ORDER BY COALESCE(w.attempts, 0), c.seconds, c.rowid "
+                    "LIMIT ?", tuple(params)).fetchall()
+                jobs: list[dict[str, Any]] = []
+                for row in rows:
+                    token = secrets.token_hex(12)
+                    path = str(row[1])
+                    self.connection.execute(
+                        "INSERT INTO sfx_index_work "
+                        "(kind,path,claims,claimed_at,claimed_until,claim_token,updated_at) "
+                        "VALUES (?,?,1,?,?,?,?) ON CONFLICT(kind,path) DO UPDATE SET "
+                        "claims=claims+1, claimed_at=excluded.claimed_at, "
+                        "claimed_until=excluded.claimed_until, "
+                        "claim_token=excluded.claim_token, started=0, "
+                        "updated_at=excluded.updated_at",
+                        (key, path, now, now + self.lease_seconds, token, now))
+                    jobs.append({"kind": key, "rowid": int(row[0]), "path": path,
+                                 "seconds": float(row[2] or 0),
+                                 "video": bool(row[3]), "token": token,
+                                 "attempts": int(row[4]), "failures": int(row[5])})
+                self.connection.commit()
+                return jobs
+            except Exception:
+                self.connection.rollback()
+                raise
+
+    def start(self, job: dict[str, Any]) -> bool:
+        now = float(self.clock())
+        with self._guard():
+            cur = self.connection.execute(
+                "UPDATE sfx_index_work SET attempts=attempts+1, started=1, "
+                "last_attempt_at=?, updated_at=? WHERE kind=? AND path=? "
+                "AND claim_token=? AND claimed_until>=? AND started=0",
+                (now, now, job["kind"], job["path"], job["token"], now))
+            self.connection.commit()
+            return bool(cur.rowcount)
+
+    def release(self, job: dict[str, Any]) -> bool:
+        """Return an unstarted lease without spending an attempt."""
+        now = float(self.clock())
+        with self._guard():
+            cur = self.connection.execute(
+                "UPDATE sfx_index_work SET claim_token='', claimed_until=0, "
+                "updated_at=? WHERE kind=? AND path=? AND claim_token=? AND started=0",
+                (now, job["kind"], job["path"], job["token"]))
+            self.connection.commit()
+            return bool(cur.rowcount)
+
+    def finish(self, job: dict[str, Any], value: Any = "", *,
+               error: Any = None) -> bool:
+        """Commit one result, or persist a cooled-down retry after failure."""
+        key, lane = self._lane(job.get("kind"))
+        now = float(self.clock())
+        with self._guard():
+            try:
+                self.connection.execute("BEGIN IMMEDIATE")
+                current = self.connection.execute(
+                    "SELECT failures FROM sfx_index_work WHERE kind=? AND path=? "
+                    "AND claim_token=? AND claimed_until>=? AND started=1",
+                    (key, job["path"], job["token"], now)).fetchone()
+                if current is None:
+                    self.connection.rollback()
+                    return False
+                if error is None:
+                    text = " ".join(str(value or "").split())[:1200]
+                    cur = self.connection.execute(
+                        "UPDATE clips SET %s=?, %s=? WHERE path=? AND %s IS NULL"
+                        % (lane["value"], lane["done"], lane["done"]),
+                        (text, now, job["path"]))
+                    if not cur.rowcount:
+                        self.connection.rollback()
+                        return False
+                    self.connection.execute(
+                        "UPDATE sfx_index_work SET completed=1, productive=?, "
+                        "started=0, claim_token='', claimed_until=0, retry_at=0, last_error='', "
+                        "updated_at=? WHERE kind=? AND path=?",
+                        (1 if text else 0, now, key, job["path"]))
+                else:
+                    failures = int(current[0] or 0) + 1
+                    delay = sfx_match.index_retry_seconds(
+                        failures, self.retry_base_seconds, self.retry_max_seconds)
+                    self.connection.execute(
+                        "UPDATE sfx_index_work SET failures=?, retry_at=?, "
+                        "last_error=?, started=0, claim_token='', claimed_until=0, updated_at=? "
+                        "WHERE kind=? AND path=?",
+                        (failures, now + delay, str(error)[:240], now,
+                         key, job["path"]))
+                self.connection.commit()
+                return True
+            except Exception:
+                self.connection.rollback()
+                raise
+
+    def run_batch(self, kind: str, processor: Callable[[dict[str, Any]], Any],
+                  limit: int = 0, *, should_stop: Callable[[], Any] | None = None,
+                  on_indexed: Callable[[dict[str, Any], str], Any] | None = None,
+                  yield_hook: Callable[[], Any] | None = None) -> dict[str, Any]:
+        """Run at most one batch, yielding between items when requested."""
+        jobs = self.claim(kind, limit)
+        result = {"kind": str(kind), "selected": len(jobs), "attempted": 0,
+                  "completed": 0, "productive": 0, "failed": 0, "released": 0}
+        for offset, job in enumerate(jobs):
+            if should_stop is not None and should_stop():
+                for pending in jobs[offset:]:
+                    result["released"] += int(self.release(pending))
+                break
+            if not self.start(job):
+                continue
+            result["attempted"] += 1
+            try:
+                value = " ".join(str(processor(job) or "").split())
+                if self.finish(job, value):
+                    result["completed"] += 1
+                    result["productive"] += int(bool(value))
+                    if on_indexed is not None and value:
+                        on_indexed(job, value)
+            except Exception as exc:  # noqa: BLE001
+                if self.finish(job, error=exc):
+                    result["failed"] += 1
+            if yield_hook is not None:
+                yield_hook()
+        result["progress"] = self.progress(kind)
+        return result
+
+    def _meta(self, name: str, default: str = "") -> str:
+        row = self.connection.execute(
+            "SELECT value FROM sfx_meta WHERE name=?", (name,)).fetchone()
+        return str(row[0]) if row is not None else default
+
+    def _set_meta(self, name: str, value: str) -> None:
+        with self._guard():
+            self.connection.execute(
+                "INSERT INTO sfx_meta(name,value) VALUES (?,?) "
+                "ON CONFLICT(name) DO UPDATE SET value=excluded.value",
+                (name, value))
+            self.connection.commit()
+
+    def run_next(self, processors: dict[str, Callable[[dict[str, Any]], Any]],
+                 limits: dict[str, int] | None = None, **kwargs: Any) -> dict[str, Any]:
+        """Advance one persistent lane per scheduler tick, then rotate."""
+        lane = self._meta("incremental_index_next_lane", "speech")
+        if lane not in self.LANES or lane not in processors:
+            lane = next((name for name in sfx_match.INDEX_LANES
+                         if name in processors), "")
+        if not lane:
+            raise ValueError("at least one speech or vision processor is required")
+        result = self.run_batch(lane, processors[lane],
+                                int((limits or {}).get(lane) or 0), **kwargs)
+        other = sfx_match.index_lane_after(lane)
+        self._set_meta("incremental_index_next_lane",
+                       other if other in processors else lane)
+        result["next_kind"] = self._meta("incremental_index_next_lane", lane)
+        return result
+
+    def progress(self, kind: str) -> dict[str, Any]:
+        """Aggregate coverage plus durable attempt/retry counters."""
+        key, lane = self._lane(kind)
+        total_where = "playable=1" if key == "speech" else "playable=1 AND video=1"
+        row = self.connection.execute(
+            "SELECT COUNT(*), SUM(CASE WHEN %s IS NOT NULL THEN 1 ELSE 0 END), "
+            "SUM(CASE WHEN COALESCE(%s, '') <> '' THEN 1 ELSE 0 END) "
+            "FROM clips WHERE %s" % (lane["done"], lane["value"], total_where)).fetchone()
+        now = float(self.clock())
+        work = self.connection.execute(
+            "SELECT COALESCE(SUM(claims),0), COALESCE(SUM(attempts),0), "
+            "COALESCE(SUM(failures),0), "
+            "SUM(CASE WHEN retry_at>? THEN 1 ELSE 0 END), "
+            "SUM(CASE WHEN claimed_until>? AND claim_token<>'' THEN 1 ELSE 0 END), "
+            "MIN(CASE WHEN retry_at>? THEN retry_at END) "
+            "FROM sfx_index_work WHERE kind=?", (now, now, now, key)).fetchone()
+        total, completed, productive = (int(row[0] or 0), int(row[1] or 0),
+                                        int(row[2] or 0))
+        out = {lane["total"]: total, lane["complete"]: completed,
+               lane["productive"]: productive, "left": max(0, total - completed),
+               "claims": int(work[0] or 0), "attempts": int(work[1] or 0),
+               "failures": int(work[2] or 0), "retrying": int(work[3] or 0),
+               "claimed": int(work[4] or 0),
+               "next_retry_at": float(work[5] or 0)}
+        return out

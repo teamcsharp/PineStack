@@ -15,6 +15,8 @@ def main():
     # container when it is recreated; `docker restart` keeps the old env.
     parser.add_argument('--recreate', action='store_true',
                         help='docker compose up -d --force-recreate spark-agent instead of docker restart')
+    parser.add_argument('--preserve-page', action='store_true',
+                        help='retain pending page audio for replay after restart')
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[1]
     output = root / args.output
@@ -43,6 +45,32 @@ def main():
             next_log = time.monotonic() + 15
         if read.returncode == 0 and not state.get('unavailable'):
             report['quiet_before_restart'] = state
+            if args.preserve_page:
+                backup_code = '''
+import json, os, urllib.request
+from pathlib import Path
+
+with urllib.request.urlopen("http://127.0.0.1:8096/api/dj/voice?since=0", timeout=20) as response:
+    feed = json.load(response)
+now = int(feed["server_ms"])
+clips = [row for row in feed.get("clips", [])
+         if isinstance(row, dict) and row.get("delivery_id") and row.get("url")
+         and int(row.get("broadcast_ms") or 0) >= now - 45000][-120:]
+path = Path(os.getenv("SPARK_AGENT_DATA_DIR", "/app/data")) / "page_delivery_recovery.json"
+path.parent.mkdir(parents=True, exist_ok=True)
+temporary = path.with_suffix(".tmp")
+temporary.write_text(json.dumps({"reason": "Pending page audio retained at quiet deploy",
+                                 "clips": clips}, ensure_ascii=False), encoding="utf-8")
+os.replace(temporary, path)
+print(json.dumps({"clips": len(clips), "path": str(path)}))
+'''
+                backup = subprocess.run(
+                    ['docker', 'exec', '-i', 'spark-agent', 'python', '-'],
+                    input=backup_code, capture_output=True, text=True, timeout=35)
+                if backup.returncode:
+                    raise SystemExit('Page audio preservation failed; no restart performed: '
+                                     + backup.stderr[-500:])
+                report['page_preservation'] = json.loads(backup.stdout)
             report['restart_requested'] = True
             output.write_text(json.dumps(report, indent=2), encoding='utf-8')
             result = subprocess.run(restart_command,

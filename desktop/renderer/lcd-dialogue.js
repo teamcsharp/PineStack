@@ -14,7 +14,7 @@
       const aired = row.aired || previous.aired;
       const audio = ['box', 'stream', 'both', 'airing'].includes(aired)
         || !!(row.audio_url || row.clip_url);
-      const label = status || (aired === 'airing' ? 'Playing' : ['box', 'stream', 'both'].includes(aired) ? 'Aired'
+      const label = status || (['airing', 'box', 'stream', 'both'].includes(aired) ? 'Aired'
         : aired === 'prepared' ? 'Recorded / waiting' : ['published', 'page'].includes(aired) ? 'Awaiting playback'
         : aired === 'failed' ? 'Audio failed' : 'Booth activity');
       rows.set(String(row.id), {...previous, ...row, id: String(row.id), lcdStatus: label, lcdAudio: audio});
@@ -62,19 +62,29 @@
      * the screenshot came to show a track title where the talking should be.
      * The thing currently being SAID is the latest thing playing; the record
      * is the bed under it and sits just below. */
-    record(station.now, station.playing ? 'Playing' : 'Aired');
+    record(station.now, station.playing && !station.paused ? 'Playing' : 'Aired');
 
     const stream = station.stream_now;
     const offset = now / 1000 - Number(stream?.at || 0);
     let current;
-    if (stream?.at && offset >= 0 && offset <= Number(stream.length || 0) + 4) {
+    if (!station.paused && stream?.at && offset >= 0
+        && offset < Number(stream.length || 0)) {
       for (const row of stream.rows || []) {
         if (Number(row.from) <= offset && offset < Number(row.until)) {
           current = {...row, aired: 'airing', air_at: Number(stream.at) + Number(row.from)};
         }
       }
     }
-    const live = current || station.speaking_now;
+    const reported = station.paused || (stream?.at && !current
+      && (stream.rows || []).some((row) => String(row.id) === String(station.speaking_now?.id)))
+      ? null : station.speaking_now;
+    /* stream_now is the accurate clock but its rows carry only id/from/until.
+     * Merge the same-ID speaking report before falling back to chat so a
+     * restart or a short chat ring can never erase words the station is
+     * explicitly reporting as audible. */
+    const live = current
+      ? {...((reported && String(reported.id) === String(current.id)) ? reported : {}), ...current}
+      : reported;
     if (live?.id) {
       const before = rows.get(String(live.id)) || {};
       /* [#1386] THE SPEAKING LINE STAYS WHERE THE SCRIPT PUT IT.

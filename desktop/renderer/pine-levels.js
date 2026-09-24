@@ -23,21 +23,19 @@
  * Neither number is wrong on its own; there was simply nowhere that showed
  * both, so turning one up could always be undone by the other.
  *
- * HOW THIS FIXES IT. One slider per stream, 0 to 600%, and it drives BOTH
+ * HOW THIS FIXES IT. One slider per stream, 0 to 200%, and it drives BOTH
  * systems the only way that is coherent:
  *
  *   below 100%  cut with pineMixer (an element volume, which cannot exceed 1)
  *   above 100%  hold pineMixer at 1 and boost with the gain node, which the
  *               panel already routes analyser -> gain -> speakers and which
- *               accepts up to 600%
+ *               accepts up to 200%
  *
  * So the number on the slider is the number that reaches the speakers, which
  * is the whole of what he asked for.
  *
- * VIDEOS get their own slider, 0 to 100%, because `pineMixer.video` lands on a
- * real <video>.volume and that genuinely cannot go above 1. Saying 150% on a
- * control that saturates at 100% would be the same lie this file exists to
- * remove.
+ * Video and SFX use the same range. Their browser players and the native
+ * wall now have explicit gain stages, so values above unity are real gain.
  *
  * It mounts its own button, the way #1218 taught: a surface that supplies its
  * own way in works wherever it is loaded, and on the tablet nothing else was
@@ -78,7 +76,7 @@
   }
 
   function setVideo(pct) {
-    var want = Math.max(0, Math.min(100, Number(pct) || 0));
+    var want = Math.max(0, Math.min(200, Number(pct) || 0));
     return setLevel('video', want);
   }
 
@@ -128,23 +126,23 @@
     node.appendChild(head);
 
     var refreshers = [];
-    refreshers.push(row(node, 'voice', 'The DJs', 600,
+    refreshers.push(row(node, 'voice', 'The DJs', 200,
       function () { return levelOf('voice'); },
       function (v) { setLevel('voice', v); },
       'Above 100% is a real boost, not a cap.'));
-    refreshers.push(row(node, 'music', 'The music', 600,
+    refreshers.push(row(node, 'music', 'The music', 200,
       function () { return levelOf('music'); },
       function (v) { setLevel('music', v); }));
-    refreshers.push(row(node, 'sfx', 'Clips / SFX', 100,
+    refreshers.push(row(node, 'sfx', 'Clips / SFX', 200,
       function () { return levelOf('sfx'); },
       function (v) { setLevel('sfx', v); }));
-    refreshers.push(row(node, 'video', 'Videos', 100,
+    refreshers.push(row(node, 'video', 'Videos', 200,
       videoLevel, setVideo,
-      'A video cannot play louder than itself, so this one stops at 100%.'));
+      'Above 100% uses the playback gain stage.'));
 
     node.appendChild(el('div', 'plv-foot',
-      'This terminal only. The station keeps its own levels; these sit on top '
-      + 'and take effect as you drag.'));
+      'One remembered level per source on this terminal. This is the final '
+      + 'listener gain; playback transitions do not rewrite it.'));
 
     root.document.body.appendChild(node);
     sheet = node;

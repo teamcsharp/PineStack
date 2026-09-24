@@ -1,6 +1,7 @@
 """Real media edits in isolated directories; never import the station app."""
 import base64
 import io
+import json
 import time
 import uuid
 import sys
@@ -12,7 +13,8 @@ import numpy as np
 from PIL import Image
 import pytest
 
-from video_editor import VideoEditor, create_video_editor_router, normalize_edit, export_command
+from video_editor import (EXPORT_SHARE, VideoEditor, create_video_editor_router,
+                          normalize_edit, export_command)
 
 
 @pytest.fixture(scope="module")
@@ -78,6 +80,7 @@ def test_trim_preserves_audio_offset_and_original(media):
     job = editor.start_export({"source_id": item["id"], "in_s": .5, "out_s": 3,
                                "include_audio": True})
     done = wait_record(editor, "exports", job["id"])
+    assert job["id"] in done["name"]
     assert done["duration"] == pytest.approx(2.5, abs=.1)
     assert done["has_audio"]
     output = editor.folder("exports", job["id"]) / "edited.mp4"
@@ -152,6 +155,58 @@ def test_interrupted_job_remains_explicit(tmp_path):
     editor.worker.shutdown(wait=True)
 
 
+def test_delivery_requires_matching_file_on_share(tmp_path):
+    root = tmp_path / "data" / "video_edits"
+    share = tmp_path / "share"
+    share.mkdir()
+    editor = VideoEditor(root, tmp_path, export_verify_dir=share)
+    identifier = uuid.uuid4().hex
+    name = f"Pine-{identifier}-edited.mp4"
+    folder = editor.folder("exports", identifier)
+    folder.mkdir(parents=True)
+    (folder / "edited.mp4").write_bytes(b"real-edited-clip")
+    editor.write("exports", identifier, {"id": identifier, "status": "complete",
+                 "name": name, "created_at_ms": int(time.time() * 1000)})
+    (root.parent / "settings.json").write_text(
+        json.dumps({"export_desk_dir": EXPORT_SHARE}), encoding="utf-8")
+    assert editor.delivery_status(identifier)["status"] == "not_requested"
+
+    ledger = root.parent / "export_courier.json"
+    row = {"id": "0123456789", "what": "video-edit", "name": name,
+           "bytes": len(b"real-edited-clip"), "dest": EXPORT_SHARE,
+           "at": time.time(), "state": "pending"}
+    ledger.write_text(json.dumps([row]), encoding="utf-8")
+    assert editor.delivery_status(identifier)["status"] == "pending"
+    row.update(state="delivered", delivered=EXPORT_SHARE + "\\" + name)
+    ledger.write_text(json.dumps([row]), encoding="utf-8")
+    assert editor.delivery_status(identifier)["status"] == "verifying"
+    (share / name).write_bytes(b"fake-edited-clip")
+    assert editor.delivery_status(identifier)["status"] == "conflict"
+    (share / name).write_bytes(b"real-edited-clip")
+    delivered = editor.delivery_status(identifier)
+    assert delivered["status"] == "delivered"
+    assert delivered["verified"] == "sha256"
+    assert delivered["path"] == EXPORT_SHARE + "\\" + name
+    editor.close()
+
+
+def test_delivery_preflight_rejects_wrong_destination(tmp_path):
+    root = tmp_path / "data" / "video_edits"
+    share = tmp_path / "share"
+    share.mkdir()
+    editor = VideoEditor(root, tmp_path, export_verify_dir=share)
+    identifier = uuid.uuid4().hex
+    folder = editor.folder("exports", identifier)
+    folder.mkdir(parents=True)
+    (folder / "edited.mp4").write_bytes(b"clip")
+    editor.write("exports", identifier, {"id": identifier, "status": "complete",
+                 "name": "edited.mp4"})
+    (root.parent / "settings.json").write_text(
+        json.dumps({"export_desk_dir": r"C:\Other"}), encoding="utf-8")
+    assert editor.delivery_status(identifier)["status"] == "wrong_destination"
+    editor.close()
+
+
 def test_shutdown_terminates_running_media_process(tmp_path):
     editor = VideoEditor(tmp_path, tmp_path)
     failures = []
@@ -175,8 +230,11 @@ def test_shutdown_terminates_running_media_process(tmp_path):
     assert not editor.processes
 
 
-def test_routes_auth_upload_analysis_range_and_export(media, tmp_path):
+def test_routes_auth_upload_analysis_range_and_export(media, tmp_path, monkeypatch):
     _, original = media
+    share = tmp_path / "recordings-share"
+    share.mkdir()
+    monkeypatch.setenv("VIDEO_EDITOR_EXPORT_VERIFY_DIR", str(share))
 
     def auth(value):
         if value != "Bearer test":
@@ -210,4 +268,9 @@ def test_routes_auth_upload_analysis_range_and_export(media, tmp_path):
                 break
             time.sleep(.03)
         assert done["status"] == "complete", done
-        assert client.get(done["url"]).content[4:8] == b"ftyp"
+        exported = client.get(done["url"]).content
+        assert exported[4:8] == b"ftyp"
+        (share / done["name"]).write_bytes(exported)
+        delivery = client.get(f"/api/video-editor/exports/{job['id']}/delivery").json()
+        assert delivery["status"] == "delivered"
+        assert delivery["verified"] == "sha256"

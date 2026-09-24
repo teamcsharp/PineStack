@@ -8,7 +8,7 @@
   <link rel="stylesheet" href="./video-editor.css">
 </head>
 <body>
-  <main class="editor">
+  <main class="editor" id="recordingEditor">
     <header class="topbar">
       <button id="back" class="quiet">Back</button>
       <div class="heading"><h1>Edit video</h1><span id="sourceName">Loading your recording</span></div>
@@ -17,10 +17,12 @@
       <button id="save" class="primary" disabled>Save copy</button>
       <!-- [#1223] only for a clip out of the station's library -->
       <button id="saveOver" class="primary" hidden disabled>Save over the original</button>
+      <button id="openSplit" class="quiet" type="button" hidden>Split into pieces</button>
     </header>
     <section class="viewer" id="viewer" aria-label="Video preview">
       <video id="video" playsinline preload="auto"></video>
       <canvas id="preview" aria-label="Video preview and drawing surface"></canvas>
+      <div id="recordingCover" class="ve-media-cover" aria-hidden="true"><img src="/spark/asset/pinebox.png" alt=""></div>
       <div id="loading" class="loading"><span id="loadingText">Opening the recording…</span><span id="loadingBar" class="loading-bar" hidden><i id="loadingFill"></i></span></div>
       <span id="decodingNote" class="viewer-note decoding" hidden>Decoding the first frame…</span>
       <span id="cropHint" class="viewer-note" hidden>Drag the corners or move the box</span>
@@ -78,6 +80,160 @@
       </div>
     </section>
     <footer><span id="status" role="status" aria-live="polite">Your original recording is kept.</span><button id="retry" class="link" hidden>Try again</button><a id="download" class="link" hidden download>Download copy</a></footer>
+  </main>
+  <main class="parody-editor" id="parodyEditor" hidden>
+    <header class="parody-topbar">
+      <button id="parodyBack" class="quiet" type="button">Back</button>
+      <div class="parody-heading"><h1>Splice editor</h1><span id="parodyProjectSummary">Original + generated</span></div>
+      <div class="parody-history" role="group" aria-label="Edit history">
+        <button id="parodyUndo" type="button" disabled aria-label="Undo edit" title="Undo (Ctrl+Z)">Undo</button>
+        <button id="parodyRedo" type="button" disabled aria-label="Redo edit" title="Redo (Ctrl+Shift+Z)">Redo</button>
+      </div>
+      <button id="parodySave" class="primary" type="button" disabled>Export to SFX ads</button>
+    </header>
+    <div class="parody-workspace">
+      <aside class="parody-bin" aria-label="Media bin">
+        <div class="parody-bin-heading"><h2>Media</h2><span id="parodyBinCount">0 clips</span></div>
+        <form id="parodySearchForm" class="parody-search" role="search">
+          <label for="parodySearch">Search station clips</label>
+          <div><input id="parodySearch" type="search" maxlength="160" autocomplete="off" placeholder="Name, words, subject, folder or topic"><button id="parodySearchButton" type="submit">Search</button></div>
+        </form>
+        <div class="parody-bin-monitor">
+          <video id="parodySourcePreview" controls playsinline preload="metadata" aria-label="Selected source preview" poster="/spark/asset/pinebox.png"></video>
+          <span id="parodySourcePreviewName">Select a source to preview it</span>
+        </div>
+        <div id="parodyMediaBin" class="parody-media-bin" role="list" aria-label="Available video clips"></div>
+        <p id="parodyLibraryStatus" class="parody-library-status" role="status" aria-live="polite"></p>
+      </aside>
+      <section class="parody-stage" aria-label="Sequence editor">
+        <section class="parody-preview" id="parodyPreview" aria-label="Sequence preview">
+          <video id="parodyVideo" controls playsinline preload="auto" aria-label="Spliced sequence preview"></video>
+          <video id="parodyOverlayVideo" playsinline preload="auto" aria-label="Overlay preview"></video>
+          <video id="parodyPreloadVideo" playsinline preload="auto" muted aria-hidden="true"></video>
+          <canvas id="parodyMaskCanvas" aria-label="Overlay rotobezier mask editor"></canvas>
+          <div id="parodyCover" class="ve-media-cover" aria-hidden="true"><img src="/spark/asset/pinebox.png" alt=""></div>
+          <div id="parodyLoading" class="parody-loading"><span>Opening sources...</span><button id="parodyRetrySources" type="button" hidden>Try again</button></div>
+          <output id="parodyBlendStatus" class="parody-blend-status" aria-live="off"></output>
+        </section>
+        <div class="parody-transport">
+          <button id="parodyPlay" type="button" disabled aria-label="Play sequence">Play</button>
+          <output id="parodyPosition" aria-live="off">0:00.00 / 0:00.00</output>
+          <input id="parodyScrub" type="range" min="0" max="1" step="0.01" value="0" disabled aria-label="Sequence playhead">
+        </div>
+        <section class="parody-tools" aria-label="Selected segment controls">
+          <div class="parody-tools-row">
+            <button id="parodySplit" type="button" disabled>Split at playhead</button>
+            <button id="parodyMoveLeft" type="button" disabled aria-label="Move selected segment left" title="Move left">Move left</button>
+            <button id="parodyMoveRight" type="button" disabled aria-label="Move selected segment right" title="Move right">Move right</button>
+            <button id="parodyDelete" type="button" disabled>Delete segment</button>
+          </div>
+          <div class="parody-tools-row parody-range-controls">
+            <span id="parodySelectedLabel">Select a segment</span>
+            <label>In <input id="parodyIn" type="number" min="0" step="0.01" inputmode="decimal" disabled></label>
+            <button id="parodySetIn" type="button" disabled>In at playhead</button>
+            <label>Out <input id="parodyOut" type="number" min="0" step="0.01" inputmode="decimal" disabled></label>
+            <button id="parodySetOut" type="button" disabled>Out at playhead</button>
+          </div>
+          <div class="parody-tools-row parody-clip-controls">
+            <label>Track <select id="parodyTrack" disabled><option value="base">V1 sequential</option><option value="overlay">V2 overlay</option></select></label>
+            <label>Timeline start <input id="parodyStart" type="number" min="0" step="0.01" inputmode="decimal" disabled></label>
+            <label>Transition <select id="parodyTransition" disabled><option value="cut">Cut</option><option value="dissolve">Dissolve</option><option value="fade">Fade</option><option value="wipe">Wipe</option></select></label>
+            <label>Blend <input id="parodyTransitionDuration" type="number" min="0" max="10" step="0.05" inputmode="decimal" disabled></label>
+            <label>Gain <input id="parodyVolume" type="range" min="0" max="2" value="1" step="0.01" disabled><output id="parodyVolumeValue">100%</output></label>
+            <label>Audio in <input id="parodyAudioFadeIn" type="number" min="0" max="30" step="0.05" inputmode="decimal" disabled></label>
+            <label>Audio out <input id="parodyAudioFadeOut" type="number" min="0" max="30" step="0.05" inputmode="decimal" disabled></label>
+            <label>Opacity <input id="parodyOpacity" type="range" min="0" max="1" value="1" step="0.01" disabled><output id="parodyOpacityValue">100%</output></label>
+          </div>
+          <div class="parody-tools-row parody-mask-controls" aria-label="Overlay mask controls">
+            <button id="parodyMaskEdit" type="button" aria-pressed="false" disabled>Edit mask</button>
+            <button id="parodyMaskPen" type="button" aria-pressed="false" disabled>Pen</button>
+            <button id="parodyMaskClose" type="button" disabled>Close path</button>
+            <button id="parodyMaskKeyframeAdd" type="button" disabled>Add keyframe</button>
+            <label>Keyframe <select id="parodyMaskKeyframe" disabled></select></label>
+            <button id="parodyMaskKeyframeDelete" type="button" disabled>Delete keyframe</button>
+            <label>Feather <input id="parodyMaskFeather" type="range" min="0" max="32" value="0" step="1" disabled><output id="parodyMaskFeatherValue">0</output></label>
+            <label><input id="parodyMaskInvert" type="checkbox" disabled> Invert</label>
+            <button id="parodyMaskClear" type="button" disabled>Clear mask</button>
+          </div>
+        </section>
+        <section class="parody-timeline-section" aria-label="Sequence timeline">
+          <div class="parody-timeline-head"><h2>Timeline</h2><span id="parodySequenceCount">0 segments</span></div>
+          <div class="parody-track">
+            <div class="parody-track-head"><strong>V1</strong><span>Program video</span><button id="parodyTrackMute" type="button" aria-pressed="false">Mute preview</button><button id="parodyTrackLock" type="button" aria-pressed="false">Lock</button></div>
+            <div id="parodyTimeline" class="parody-timeline" role="group" aria-label="Segments in play order" tabindex="0"><p class="parody-empty">Drag or tap media to add it</p></div>
+          </div>
+          <div class="parody-track" id="parodyOverlayTrack">
+            <div class="parody-track-head"><button id="parodyOverlayToggle" class="parody-track-toggle" type="button" aria-expanded="true" aria-controls="parodyOverlayTimeline"><strong>V2</strong><span>Timed overlays</span></button><button id="parodyOverlayMute" type="button" aria-pressed="false">Mute overlay</button><button id="parodyOverlayLock" type="button" aria-pressed="false">Lock</button></div>
+            <div id="parodyOverlayTimeline" class="parody-timeline parody-overlay-timeline" role="group" aria-label="Overlay clips by timeline position" tabindex="0"><p class="parody-empty">Drop media here for an overlay</p></div>
+          </div>
+        </section>
+      </section>
+    </div>
+    <footer class="parody-footer">
+      <label>Export name <input id="parodyName" type="text" value="Parody splice" maxlength="120" autocomplete="off"></label>
+      <span id="parodyStatus" role="status" aria-live="polite">Your source videos are kept.</span>
+      <a id="parodyDownload" class="link" hidden download>Download copy</a>
+    </footer>
+  </main>
+  <main class="split-editor" id="splitEditor" hidden>
+    <header class="split-topbar">
+      <button id="splitBack" class="quiet" type="button">Back</button>
+      <div class="split-heading"><h1>Split audio</h1><span id="splitSourceName">Opening clip...</span></div>
+      <button id="splitSingle" class="quiet" type="button">Single clip</button>
+      <button id="splitUndo" type="button" disabled aria-label="Undo split edit" title="Undo">Undo</button>
+      <button id="splitRedo" type="button" disabled aria-label="Redo split edit" title="Redo">Redo</button>
+      <button id="splitExport" class="primary" type="button" disabled>Export pieces</button>
+    </header>
+    <section class="split-monitor" aria-label="Audio preview">
+      <video id="splitMedia" playsinline preload="auto" aria-label="Audio clip preview"></video>
+      <div id="splitCover" class="ve-media-cover" aria-hidden="true"><img src="/spark/asset/pinebox.png" alt=""></div>
+      <div id="splitLoading" class="split-loading">Opening audio...</div>
+    </section>
+    <div class="split-transport">
+      <button id="splitPlay" type="button" disabled aria-label="Play sequence">Play</button>
+      <output id="splitPosition">0:00.00 / 0:00.00</output>
+      <input id="splitScrub" type="range" min="0" max="1" step="0.01" value="0" disabled aria-label="Audio playhead">
+      <div class="split-mode" role="group" aria-label="Preview mode">
+        <button id="splitSequenceMode" type="button" aria-pressed="true" class="selected">Sequence</button>
+        <button id="splitPieceMode" type="button" aria-pressed="false">Selected piece</button>
+      </div>
+    </div>
+    <section class="split-timeline-section" aria-label="Audio piece timeline">
+      <div class="split-section-heading"><h2>Pieces</h2><span id="splitCount">0 pieces</span></div>
+      <div id="splitTimeline" class="split-timeline" role="group" aria-label="Pieces in play order"></div>
+    </section>
+    <section class="split-tools" aria-label="Selected piece controls">
+      <div class="split-actions">
+        <button id="splitAtPlayhead" type="button" disabled>Split at playhead</button>
+        <button id="splitMoveLeft" type="button" disabled aria-label="Move piece left" title="Move left">&#8592;</button>
+        <button id="splitMoveRight" type="button" disabled aria-label="Move piece right" title="Move right">&#8594;</button>
+        <button id="splitDelete" type="button" disabled>Delete piece</button>
+      </div>
+      <div class="split-details">
+        <label>Name <input id="splitName" type="text" maxlength="120" autocomplete="off" disabled></label>
+        <label>In <input id="splitIn" type="number" min="0" step="0.01" inputmode="decimal" disabled></label>
+        <label>Out <input id="splitOut" type="number" min="0" step="0.01" inputmode="decimal" disabled></label>
+        <button id="splitSetIn" type="button" disabled>In at playhead</button>
+        <button id="splitSetOut" type="button" disabled>Out at playhead</button>
+      </div>
+      <div class="split-trim" id="splitTrim" aria-label="Selected piece source range">
+        <canvas id="splitSourceWave" aria-label="Source waveform"></canvas>
+        <div id="splitTrimBand" class="split-trim-band"></div>
+        <button id="splitInHandle" class="split-handle" type="button" disabled role="slider" aria-label="Piece in point" aria-valuemin="0" aria-valuemax="0" aria-valuenow="0"></button>
+        <button id="splitOutHandle" class="split-handle" type="button" disabled role="slider" aria-label="Piece out point" aria-valuemin="0" aria-valuemax="0" aria-valuenow="0"></button>
+        <div id="splitTrimHead" class="split-trim-head"></div>
+      </div>
+    </section>
+    <div class="split-delivery">
+      <fieldset><legend>Original clip</legend>
+        <label><input type="radio" name="splitOriginal" value="keep" checked> Keep original</label>
+        <label><input type="radio" name="splitOriginal" value="replace"> Replace original</label>
+      </fieldset>
+      <span id="splitStatus" role="status" aria-live="polite">Your original clip is kept.</span>
+    </div>
+    <section id="splitResults" class="split-results" aria-label="Exported pieces" hidden>
+      <h2>Exported pieces</h2><ul id="splitOutputList"></ul>
+    </section>
   </main>
   <script src="./video-edit-model.js"></script>
   <script src="./video-editor.js"></script>

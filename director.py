@@ -473,6 +473,97 @@ def script_candidate(occurrence: str) -> str:
     return str((script_record(occurrence) or {}).get("candidate") or "")
 
 
+def script_choose(occurrence: str, kind: str, candidate: str,
+                  candidates: list[str] | None = None,
+                  who: str = "operator") -> dict[str, Any]:
+    """Remember which prepared variant the operator wants this slot to use."""
+    winner = str(candidate or "")[:160]
+    offered = [str(one)[:160] for one in (candidates or []) if str(one)]
+    if not winner:
+        raise ValueError("a winning draft needs a candidate id")
+    if offered and winner not in offered:
+        raise ValueError("that draft is not one of this segment's candidates")
+    row = script_record(occurrence, make=True)
+    row["kind"] = str(kind or row.get("kind") or "")[:40]
+    row["winner"] = winner
+    row["winner_at"] = time.time()
+    row["winner_by"] = str(who or "operator")[:40]
+    row.setdefault("selections", []).append({
+        "candidate": winner, "offered": offered[:20],
+        "at": row["winner_at"], "who": row["winner_by"]})
+    del row["selections"][:-40]
+    scripts_write(scripts_read())
+    return {"candidate": winner, "at": row["winner_at"],
+            "who": row["winner_by"]}
+
+
+def script_choice(occurrence: str) -> dict[str, Any]:
+    row = script_record(occurrence)
+    if not row or not row.get("winner"):
+        return {}
+    return {"candidate": str(row.get("winner") or ""),
+            "at": float(row.get("winner_at") or 0),
+            "who": str(row.get("winner_by") or "")}
+
+
+def script_note_feedback(occurrence: str, kind: str, action: str,
+                         candidate: str = "", index: int = -1,
+                         line: str = "", previous: str = "",
+                         topic: str = "", note: str = "") -> dict[str, Any]:
+    """A structured line note that can teach the next writing pass."""
+    allowed = {"off_topic", "doesnt_make_sense", "rewrite",
+               "refer_to_previous", "discuss_instead"}
+    action = str(action or "").strip().lower()
+    if action not in allowed:
+        raise ValueError("unknown dialogue feedback action")
+    row = script_record(occurrence, make=True)
+    row["kind"] = str(kind or row.get("kind") or "")[:40]
+    feedback = {"action": action, "candidate": str(candidate or "")[:160],
+                "index": int(index), "line": str(line or "")[:1600],
+                "previous": str(previous or "")[:1200],
+                "topic": str(topic or "")[:800],
+                "note": str(note or "")[:800], "at": time.time()}
+    row.setdefault("feedback", []).append(feedback)
+    del row["feedback"][:-80]
+    scripts_write(scripts_read())
+    return feedback
+
+
+def script_feedback(kind: str = "", most: int = 40) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for occurrence, row in (scripts_read().get("segments") or {}).items():
+        if kind and str((row or {}).get("kind") or "") != str(kind):
+            continue
+        for feedback in (row or {}).get("feedback") or []:
+            out.append({**feedback, "occurrence": occurrence,
+                        "kind": str((row or {}).get("kind") or "")})
+    out.sort(key=lambda item: float(item.get("at") or 0), reverse=True)
+    return out[:max(1, int(most))]
+
+
+def director_feedback_clause(kind: str) -> str:
+    """Recent operator corrections, compressed into concrete writing rules."""
+    try:
+        rows = script_feedback(kind, most=6)
+        if not rows:
+            return ""
+        labels = {
+            "off_topic": "This line left the active subject; keep every turn on it",
+            "doesnt_make_sense": "This line did not follow logically; make the reply legible",
+            "rewrite": "The operator asked for this kind of line to be rewritten",
+            "refer_to_previous": "Answer the immediately preceding line directly",
+            "discuss_instead": "Discuss the operator's replacement subject instead",
+        }
+        out = ["\n\nRECENT LINE NOTES FROM THE OPERATOR. Apply the lesson, never quote the note:"]
+        for at, row in enumerate(rows, 1):
+            detail = str(row.get("note") or row.get("topic") or "")[:220]
+            out.append("\n  %d. %s%s" % (at, labels.get(str(row.get("action")),
+                "Revise the line"), (": " + detail) if detail else "."))
+        return "".join(out)
+    except Exception:                              # noqa: BLE001
+        return ""
+
+
 # --- 2026-09-10: WHAT THE STATION LEARNS FROM BEING EDITED ---------------
 #
 #    "...that feeds the main system that tells it how to react and behave.

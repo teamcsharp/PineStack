@@ -102,6 +102,8 @@ def digest(value):
 
 
 class System2Runtime:
+    RECAP_LEAD_FLOOR_SECONDS = 420.0
+    RECAP_LEAD_MAX_SECONDS = 900.0
     RETENTION_INTERVAL_SECONDS = 6 * 3600
     RETENTION_MAX_AGE_SECONDS = 7 * 86400
     RETENTION_REPEAT_SECONDS = 2 * 3600
@@ -171,6 +173,12 @@ class System2Runtime:
     def enabled(self):
         return self.config.get("engine") == "system2"
 
+    def content_gate_enabled(self, gate):
+        policy = getattr(self.host, "content_gate_enabled", None)
+        if callable(policy):
+            return bool(policy(gate))
+        return gate == "tint" and bool(self.host.dialogue_tint_required())
+
     @property
     def owns_preparation(self):
         """#1070: do the legacy pantry and larder keepers stand down?
@@ -194,7 +202,8 @@ class System2Runtime:
                      if s["start"] <= now < s["deadline"]), None)
         if not slot or slot.get("non_dialogue"):
             return False
-        if any((slot["id"], a["candidate"]["id"]) not in self._dispatched
+        if any(self.recap_matches(slot, a["candidate"])
+               and (slot["id"], a["candidate"]["id"]) not in self._dispatched
                for a in slot.get("allocations", [])):
             return False
         h = self.host
@@ -299,16 +308,19 @@ class System2Runtime:
         reason = []
         viable = bool(resolved["ready"] or kind != "track_talk" and h.dialogue_row_viable(kind, row))
         if not viable: reason.append("Current source, voice or segment contract needs attention")
-        if kind != "track_talk" and not h.dialogue_tint_ready(kind, row): reason.append("Tint is incomplete; accepted turns are retained")
+        if (kind != "track_talk" and self.content_gate_enabled("tint")
+                and not h.dialogue_tint_ready(kind, row)):
+            reason.append("Tint is incomplete; accepted turns are retained")
         if not complete: reason.append("The complete ordered script does not yet have verified recordings")
         expires = 0
-        if kind == "news":
+        if kind == "news" and self.content_gate_enabled("freshness"):
             expires = float(entry.get("prep_news_at") or entry.get("at") or 0) + h.NEWS_PREP_LIFE
-        try:
-            # #1068: every road's stock expires, on the host's one clock.
-            expires = float(h.stock_expires_at(kind, row) or expires)
-        except Exception:
-            pass
+        if self.content_gate_enabled("freshness"):
+            try:
+                # #1068: every road's stock expires, on the host's one clock.
+                expires = float(h.stock_expires_at(kind, row) or 0)
+            except Exception:
+                pass
         if expires and expires < time.time():
             # #1074: the store refuses an expired row silently (candidate_expired);
             # the status page showed it as ready. Say it, and say it here.
@@ -317,16 +329,19 @@ class System2Runtime:
         result = {"id": identity, "kind": kind, "seconds": sum(float(x.get("seconds") or 0) for x in lines),
                   "ready": complete,
                   "eligible": viable, "expires_at": expires,
+                  "repeat_guard": self.content_gate_enabled("repetition"),
                   "script": str(entry.get("script") or entry.get("text") or ""),
                   "source_id": digest(entry.get("script_plain") or entry.get("script") or ""),
                   "lines": lines, "audio_hashes": [x["audio_hash"] for x in lines if x.get("audio_hash")],
                   "source": copy.deepcopy({k: entry[k] for k in ("script_plain", "script_tinted", "tint",
                       "tint_report", "desk", "swaths", "prep_news_stories", "prep_gallery", "caller_name",
                       "system2_trace_id", "system2_trace_ids", "system2_job", "system2_slot", "tint_retry_budget",
-                      "system2_guest", "system2_source_evidence", "system2_authoring_budget") if k in entry}),
+                      "system2_guest", "system2_source_evidence", "system2_authoring_budget",
+                      "system2_topic_review", "topic_contract", "topic_id", "topic_shape",
+                      "topic", "premise", "angle") if k in entry}),
                   "why": reason, "created_at": float(entry.get("at") or row.get("at") or 0)}
-        if entry.get("system2_slot") and self.binding_live(entry["system2_slot"]):
-            result["slot_id"] = entry["system2_slot"]        # #1390: a live pin only
+        if entry.get("system2_slot") and (kind == "recap" or self.binding_live(entry["system2_slot"])):
+            result["slot_id"] = entry["system2_slot"]        # recaps never change their observed hour
         if kind == "track_talk":
             result.update(track_id=resolved.get("track_id") or row.get("track_id"), part=resolved.get("part") or row.get("part"))
         self._rows[identity] = (kind, row)
@@ -424,17 +439,50 @@ class System2Runtime:
             road = str(h.SCHED_PREP_KIND.get(kind) or kind)
             seconds = max(15, float(slot.get("minutes") or 3) * 60)
             brief = h.schedule_prompt_for(settings, slot)
-            out.append({**copy.deepcopy(slot), "id": str(slot.get("id") or f"slot-{index}"),
+            template_id = str(slot.get("id") or f"slot-{index}")
+            occurrence = "hour-" + str(int(float(hour) * 1000)) + ":" + template_id
+            choice = h.script_choice(occurrence) if hasattr(h, "script_choice") else {}
+            out.append({**copy.deepcopy(slot), "id": template_id,
                         "kind": road, "slot_kind": kind, "seconds": seconds,
                         "label": str(slot.get("label") or h.SCHEDULE_KIND_NAMES.get(kind) or kind),
                         "prompt": h._schedule_clause(preset, slot, brief),
                         "hour_key": key, "preset": preset,
                         "target_seconds": 0 if kind == "record" else seconds,
-                        "non_dialogue": kind == "record"})
+                        "non_dialogue": kind == "record",
+                        "preferred_candidate_id": str(choice.get("candidate") or "")})
+            if road == "recap":
+                out[-1]["require_slot_binding"] = True
             if road == "track_talk":
                 out[-1].update(coverage_mode="one_performance", target_performances=1,
                                target_seconds=min(15.0, seconds), allocation_mode="current")
         return out
+
+    def recap_lead_seconds(self):
+        """Leave room for a complete observed-hour scene, including voice work."""
+        lead = self.RECAP_LEAD_FLOOR_SECONDS
+        stat = getattr(self.host, "task_stat", None)
+        if callable(stat):
+            try:
+                for kind in ("recap", "banter"):
+                    row = stat(kind) or {}
+                    if row.get("measured"):
+                        p90 = float(row.get("p90") or 0)
+                        if math.isfinite(p90) and p90 > 0:
+                            lead = max(lead, p90 * 1.25 + 90.0)
+                            break
+            except (TypeError, ValueError):
+                pass
+        return min(self.RECAP_LEAD_MAX_SECONDS, lead)
+
+    @staticmethod
+    def recap_matches(slot, candidate, entry=None):
+        if slot.get("kind") != "recap":
+            return True
+        source = candidate.get("source") or {}
+        sid = slot.get("id")
+        return (candidate.get("slot_id") == sid
+                and isinstance(source, dict) and source.get("system2_slot") == sid
+                and (entry is None or entry.get("system2_slot") == sid))
 
     REFRESH_SECONDS = 60.0   # #1070: was 15; each refresh decodes every candidate body twice
 
@@ -1034,8 +1082,8 @@ class System2Runtime:
             # #1084: a second sitting takes a road nobody is already on.
             busy = {str(w.get("kind") or "") for w in self._works.values()
                     if w.get("state") == "preparing"}
-            # Recap is deliberately claimed here: its guard below refuses to
-            # snapshot until the final three minutes before the slot. Deep
+            # Recap is deliberately claimed here: its guard below waits for
+            # the measured preparation window before the slot. Deep
             # remains live-only because it has no scheduled shelf consumer.
             _cannot = set(getattr(self.host, "CANNOT_PREPARE", {}) or {})
             kinds = [k for k in ("ad", "manager", "caller", "gallery", "news",
@@ -1047,9 +1095,20 @@ class System2Runtime:
             # renewer keeps a long sitting alive either way; what the shorter
             # lease bounds is the time a slot stays unclaimable when an
             # attempt dies without completing (see reclaim_jobs for restarts).
+            # Keep the next hour first. Only evergreen ad/gallery work may
+            # use spare on-air capacity farther out; news stays near its slot.
+            lookahead = 3600
+            if h.radio_paused():
+                lookahead = int(self.config["horizon_hours"]) * 3600
             job = await asyncio.to_thread(                         # #1224
                 self.store.claim_job, "system2-preparer", kinds=kinds,
-                lease_seconds=900)
+                lease_seconds=900, lookahead_seconds=lookahead)
+            if not job and not h.radio_paused() and self.config["horizon_hours"] > 1:
+                job = await asyncio.to_thread(
+                    self.store.claim_job, "system2-preparer",
+                    kinds=[k for k in ("ad", "gallery") if k in kinds],
+                    lease_seconds=900,
+                    lookahead_seconds=int(self.config["horizon_hours"]) * 3600)
             if not job:
                 return
             kind = job["kind"]
@@ -1082,8 +1141,8 @@ class System2Runtime:
                 brief = str(job["template"].get("prompt") or "")
                 # A recap describes observed events so far. It cannot be
                 # truthfully written as a completed hour in advance.
-                if kind == "recap" and float(job["template"]["start"]) - time.time() > 180:
-                    work["why"] = "Recap takes an observed-hour snapshot three minutes before its scheduled start"
+                if kind == "recap" and float(job["template"]["start"]) - time.time() > self.recap_lead_seconds():
+                    work["why"] = "Recap waits for its measured observed-hour preparation window"
                     self.store.complete_job(job["id"], "system2-preparer", job["token"], success=False, retry_after=60)
                     return
                 h.alt_brief_set(brief + "\nSYSTEM2 PRODUCTION: Write one complete compact scene with a clear opening, substantive exchange, and close. "
@@ -1110,9 +1169,9 @@ class System2Runtime:
                     bound = entry.get("system2_slot")
                     if bound and bound != job["slot_id"] and self.binding_live(bound):
                         continue                    # #1390: a stale pin does not hold
-                    if job["template"].get("require_slot_binding") and bound != job["slot_id"]:
+                    if (kind == "recap" or job["template"].get("require_slot_binding")) and bound != job["slot_id"]:
                         continue
-                    if not h.tint_retry_due(entry, kind):
+                    if self.content_gate_enabled("tint") and not h.tint_retry_due(entry, kind):
                         continue
                     # A long legacy scene cannot satisfy a shorter occurrence.
                     # Keep its accepted work for a slot where it can fit.
@@ -1162,7 +1221,8 @@ class System2Runtime:
                             caller_name=caller_name, caller_voice=caller_voice,
                             render_stream=True, whole=bool(caller_name))
                         for entry in pile:
-                            if guest and not any(marker == "D" for marker, _text in h.banter_turns(entry.get("script") or "")):
+                            if (guest and self.content_gate_enabled("segment_brief")
+                                    and not any(marker == "D" for marker, _text in h.banter_turns(entry.get("script") or ""))):
                                 entry.update(off_brief=True, system2_event_error="The guest has no speaking turn; the scene cannot fulfill this guest event")
                             entry.update(prep_kind=kind, system2_slot=job["slot_id"], system2_trace_id=work["trace_id"])
                             await h.larder_prepare(entry)
@@ -1207,19 +1267,38 @@ class System2Runtime:
                     identity = h.alt_sid(kind, row)
                     entry = h.dialogue_entry(row) or row
                     if entry.get("system2_trace_id") == work["trace_id"] or identity == work.get("candidate_id"):
-                        fresh.append(await asyncio.to_thread(self.candidate, kind, row))
+                        if self.content_gate_enabled("segment_brief"):
+                            reviewer = getattr(h, "dialogue_topic_review", None)
+                            if callable(reviewer):
+                                review = reviewer(str(entry.get("script") or ""), brief)
+                                entry["system2_topic_review"] = review
+                                entry["topic_contract"] = str(review.get("topic") or "")
+                                if review.get("checked") and not review.get("ok"):
+                                    entry["off_brief"] = True
+                                    entry["system2_event_error"] = (
+                                        "Topic continuity failed: "
+                                        + "; ".join(review.get("faults") or []))[:700]
+                                    work.setdefault("topic_rejected", []).append({
+                                        "candidate": identity,
+                                        "topic": review.get("topic"),
+                                        "score": review.get("score"),
+                                        "faults": review.get("faults")})
+                        candidate = await asyncio.to_thread(self.candidate, kind, row)
+                        if kind == "recap" and self.recap_matches(job["template"], candidate, entry):
+                            if candidate["ready"] and candidate["eligible"] and candidate["seconds"] > 0:
+                                # The shelf's stored seconds must come from verified takes.
+                                row["seconds"] = entry["seconds"] = candidate["seconds"]
+                        fresh.append(candidate)
                 # #1074: an attempt that made no model call (the tint lane
                 # refused every ask) rests two minutes, not thirty seconds -
                 # the same row was re-claimed twice a minute with a full
                 # refresh each time and nothing to show for it.
+                self.media.checkpoint_preparation(pantry=True, larder=kind == "banter")
                 self.store.complete_job(job["id"], "system2-preparer", job["token"], candidates=fresh,
-                                        success=changed,
-                                        retry_after=(120 if not changed and not work.get("calls") else 30))
+                                         success=changed,
+                                         retry_after=(120 if not changed and not work.get("calls") else 30))
                 work.update(state="ready" if any(x["ready"] for x in fresh) else "retained" if fresh else "waiting",
-                            candidate_ids=[x["id"] for x in fresh], changed=changed)
-                h._pantry_save(True)
-                if kind == "banter" and hasattr(h, "_larder_save"):
-                    h._larder_save()
+                             candidate_ids=[x["id"] for x in fresh], changed=changed)
             except asyncio.CancelledError:
                 work["state"] = "interrupted"
                 try:
@@ -1398,12 +1477,18 @@ class System2Runtime:
                 return False
             for allocation in slot["allocations"]:
                 candidate = allocation["candidate"]
+                if not self.recap_matches(slot, candidate):
+                    self.refuse(slot, candidate, "Recap belongs to another observed hour")
+                    continue
                 if (slot["id"], candidate["id"]) in self._dispatched:
                     continue
                 live = self._rows.get(candidate["id"])
                 if live is None:
                     continue
                 kind, row = live
+                if not self.recap_matches(slot, candidate, h.dialogue_entry(row) or row):
+                    self.refuse(slot, candidate, "Recap shelf row belongs to another observed hour")
+                    continue
                 resolved = await asyncio.to_thread(self.media.resolve, kind, row)
                 takes = resolved["takes"]
                 if not resolved["ready"]:
@@ -1638,6 +1723,8 @@ class System2Runtime:
         than whether any of it is. A round that is mostly fresh goes out
         and the repeated line rides along; a round that is mostly a
         repeat is still refused, which is the thing the gate is for."""
+        if not self.content_gate_enabled("repetition"):
+            return True
         proof = (entry or {}).get("_system2") or {}
         reservation = proof.get("reservation_id", "")
         verdict = self.store.can_play(texts, reservation_id=reservation)

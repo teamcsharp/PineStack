@@ -35,6 +35,30 @@ class CrystalModelOutputTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await app.ask_model('Write dialogue.', mark={'kind': 'caller'}), '')
         self.assertEqual(app.line_review_permits.call_args.args[0], 'draft_fragment')
 
+    async def test_structured_dialogue_preserves_complete_speaker_lines(self):
+        text = ('A: The first host finishes the thought.\n'
+                'B: The second host answers it directly!\n'
+                'C: The caller is cut off before finishing')
+        self.call.return_value = {'message': {'content': text},
+                                  'done_reason': 'stop'}
+        got = await app.ask_model('Write the call.', limit=600,
+                                  mark={'kind': 'caller'},
+                                  result_contract='structured_turns')
+        self.assertEqual(got, ('A: The first host finishes the thought.\n'
+                               'B: The second host answers it directly!'))
+        self.assertEqual(app.line_review_permits.call_args.args[0],
+                         'draft_trimming')
+
+    async def test_structured_dialogue_stops_at_a_complete_turn_boundary(self):
+        first = 'A: A complete first turn lands here.'
+        text = first + '\nB: A second complete turn lands over there.'
+        self.call.return_value = {'message': {'content': text},
+                                  'done_reason': 'stop'}
+        got = await app.ask_model('Write the call.', limit=len(first),
+                                  mark={'kind': 'caller'},
+                                  result_contract='structured_turns')
+        self.assertEqual(got, first)
+
     async def test_overflow_and_token_exhaustion_retain_full_evidence_without_delivering_a_prefix(self):
         text = 'A: A complete first sentence.\nB: A tail that the budget interrupted'
         for limit, reason in ((30, 'stop'), (300, 'length')):

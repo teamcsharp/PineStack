@@ -786,12 +786,14 @@
       got = await root.pineDesktop.micStop();
     } catch (err) {
       setState(IDLE);
+      finishEmptyCapture();
       announce(String((err && err.message) || err), true);
       return;
     }
     var text = String((got && got.text) || '').trim();
     if (!text) {
       setState(IDLE);
+      finishEmptyCapture();
       /* EVERY EMPTY ANSWER NAMES ITSELF.
        *
        * "Nothing was made out of that" used to be the sentence for all of
@@ -830,6 +832,7 @@
     chunks = [];
     if (!wav || wav.byteLength < 2000) {
       setState(IDLE);
+      finishEmptyCapture();
       announce('That was too short to hear.', true);
       return;
     }
@@ -838,6 +841,7 @@
       var text = String((heard && heard.text) || '').trim();
       if (!text) {
         setState(IDLE);
+        finishEmptyCapture();
         /* [#1224] An empty transcript carries its own reason now - the
            station puts one in `detail` and sendNative() has repeated it
            since the day "Nothing was made out of that" cost three takes
@@ -849,6 +853,7 @@
       await act(text);
     } catch (err) {
       setState(IDLE);
+      finishEmptyCapture();
       announce(String((err && err.message) || err), true);
     }
   }
@@ -893,6 +898,14 @@
    * debug block by choice); Cancel throws it away. */
   var capture = null;
   var pad = null;
+
+  function finishEmptyCapture() {
+    if (!capture) return false;
+    var take = capture;
+    capture = null;
+    try { take(''); } catch (err) { /* the caller still gets its UI back */ }
+    return true;
+  }
 
   function wantsReport(text) {
     var t = String(text || '').toLowerCase();
@@ -1487,13 +1500,150 @@
      * second, quietly different experience. */
     act: act,
     cancel: cancel,
+    cancelCapture: function () {
+      capture = null;
+      if (state === LISTENING) cancel();
+    },
     /* 2026-09-14: lend the ear - the next heard sentence goes to `fn`
        instead of the model (the caution sheet dictates its reason
        this way). Starts listening at once. */
-    captureNext: function (fn) { capture = typeof fn === 'function' ? fn : null; try { listen(); } catch (e) { capture = null; throw e; } },
+    captureNext: function (fn) {
+      capture = typeof fn === 'function' ? fn : null;
+      try {
+        var pending = listen();
+        if (pending && typeof pending['catch'] === 'function') {
+          return pending['catch'](function (err) { capture = null; throw err; });
+        }
+        return pending;
+      } catch (e) { capture = null; throw e; }
+    },
     /* 2026-09-14: the report pad, for a button or a test. */
     report: reportOpen,
     state: function () { return state; }
   };
+  /* One microphone follows the focused text field, including fields created
+   * later by gallery and script popups. Every take appends to the current text. */
+  if (root.document && root.document.addEventListener) {
+    var dictatedField = null;
+    var fieldMic = root.document.createElement('button');
+    var pressStartedAt = 0;
+    var pressWasListening = false;
+    var micBusy = false;
+    var micMonitor = 0;
+    var finishWhenReady = false;
+    fieldMic.type = 'button';
+    fieldMic.tabIndex = -1;
+    fieldMic.className = 'pine-field-mic';
+    fieldMic.title = 'Tap to dictate or stop; hold to dictate while pressed';
+    fieldMic.setAttribute('aria-label', fieldMic.title);
+    fieldMic.innerHTML = (typeof root.pineIcon === 'function'
+      ? root.pineIcon('c:microphone', 'Dictate') : '') || '&#127908;';
+    fieldMic.style.cssText = 'position:fixed;z-index:2147483646;display:none;width:36px;height:36px;padding:7px;border:1px solid #5f8b91;border-radius:4px;background:#19272d;color:#b5edf0;align-items:center;justify-content:center;cursor:pointer';
+    function textField(node) {
+      if (!node || node.disabled || node.readOnly) return false;
+      if (node.tagName === 'TEXTAREA') return true;
+      if (node.tagName === 'INPUT') return /^(text|search|url|email|tel)$/.test(node.type || 'text');
+      return node.isContentEditable === true;
+    }
+    function placeMic() {
+      if (!dictatedField || !dictatedField.isConnected) {
+        fieldMic.style.display = 'none';
+        return;
+      }
+      var rect = dictatedField.getBoundingClientRect();
+      var width = root.visualViewport ? root.visualViewport.width : root.innerWidth;
+      var height = root.visualViewport ? root.visualViewport.height : root.innerHeight;
+      if (rect.bottom < 0 || rect.top > height) {
+        fieldMic.style.display = 'none';
+        return;
+      }
+      fieldMic.style.display = 'flex';
+      fieldMic.style.left = Math.max(0, Math.min(width - 38, rect.right - 40)) + 'px';
+      fieldMic.style.top = Math.max(0, Math.min(height - 38, rect.top + 4)) + 'px';
+    }
+    function appendWords(field, words) {
+      if (!field || !field.isConnected || !words) return;
+      var old = field.isContentEditable ? field.textContent : field.value;
+      var joined = old + (old && !/\s$/.test(old) ? ' ' : '') + words;
+      if (field.isContentEditable) field.textContent = joined;
+      else field.value = joined;
+      field.dispatchEvent(new Event('input', {bubbles: true}));
+      field.focus();
+      if (field.setSelectionRange) field.setSelectionRange(joined.length, joined.length);
+    }
+    function startMic() {
+      if (micBusy || !dictatedField || !textField(dictatedField)) return;
+      var target = dictatedField;
+      micBusy = true;
+      finishWhenReady = false;
+      fieldMic.setAttribute('aria-pressed', 'true');
+      var startedAt = Date.now();
+      root.clearInterval(micMonitor);
+      micMonitor = root.setInterval(function () {
+        if (Date.now() - startedAt < 3000 || root.PineTalkDot.state() !== IDLE) return;
+        root.clearInterval(micMonitor);
+        micMonitor = 0;
+        micBusy = false;
+        fieldMic.setAttribute('aria-pressed', 'false');
+      }, 500);
+      Promise.resolve(root.PineTalkDot.captureNext(function (words) {
+        appendWords(target, String(words || '').trim());
+        root.clearInterval(micMonitor);
+        micMonitor = 0;
+        micBusy = false;
+        fieldMic.setAttribute('aria-pressed', 'false');
+      })).then(function () {
+        if (finishWhenReady) {
+          finishWhenReady = false;
+          root.PineTalkDot.finish();
+        }
+      }).catch(function () {
+        finishWhenReady = false;
+        root.clearInterval(micMonitor);
+        micMonitor = 0;
+        micBusy = false;
+        fieldMic.setAttribute('aria-pressed', 'false');
+      });
+    }
+    function stopMic() {
+      if (!micBusy) return;
+      if (root.PineTalkDot.state() === LISTENING) root.PineTalkDot.finish();
+      else finishWhenReady = true;
+    }
+    fieldMic.addEventListener('pointerdown', function (event) {
+      event.preventDefault();
+      pressStartedAt = Date.now();
+      pressWasListening = micBusy;
+      if (micBusy) stopMic();
+      else startMic();
+      try {
+        if (fieldMic.setPointerCapture) fieldMic.setPointerCapture(event.pointerId);
+      } catch (err) { /* the take has already started */ }
+    });
+    fieldMic.addEventListener('pointerup', function () {
+      if (pressStartedAt && !pressWasListening
+          && Date.now() - pressStartedAt >= 450) stopMic();
+      pressStartedAt = 0;
+    });
+    fieldMic.addEventListener('pointercancel', function () {
+      if (pressStartedAt && !pressWasListening
+          && Date.now() - pressStartedAt >= 450) stopMic();
+      pressStartedAt = 0;
+    });
+    fieldMic.addEventListener('click', function (event) {
+      if (event.detail !== 0) return;
+      if (micBusy) stopMic();
+      else startMic();
+    });
+    root.document.addEventListener('focusin', function (event) {
+      if (!textField(event.target)) return;
+      dictatedField = event.target;
+      placeMic();
+    });
+    root.addEventListener('resize', placeMic);
+    root.addEventListener('scroll', placeMic, true);
+    if (root.visualViewport) root.visualViewport.addEventListener('resize', placeMic);
+    (root.document.body || root.document.documentElement).appendChild(fieldMic);
+  }
   if (typeof module !== 'undefined' && module.exports) module.exports = root.PineTalkDot;
 })(typeof window !== 'undefined' ? window : globalThis);
