@@ -47,6 +47,9 @@ label beside it.
 """
 from __future__ import annotations
 
+from segment_contract import AVERAGE_TURN_SECONDS, DIALOGUE_ROADS
+
+import math
 import time
 from typing import Any
 
@@ -55,6 +58,7 @@ MEMO_S = 12.0           # two glass polls; the walk is not free
 ROWS_MOST = 40          # never-heard rows listed with actions
 REASON_MOST = 60        # rows asked "why are you not on the air"
 TOP_MOST = 5            # "the top few by name"
+QUALITY_ROADS = DIALOGUE_ROADS | {"news"}
 
 _MEMO: dict[str, Any] = {"at": 0.0, "value": None}
 
@@ -199,7 +203,8 @@ def schedule_cupboard_handoff(
     relief when the caller dispatches an order.
     """
     out: dict[str, Any] = {"available": False, "work": [], "write": [],
-                           "record": [], "blocked": [], "write_waiting": 0,
+                           "quality": [], "record": [], "blocked": [],
+                           "write_waiting": 0, "quality_waiting": 0,
                            "record_waiting": 0, "truncated": False}
     if not isinstance(bank, dict) or not bank.get("available"):
         return out
@@ -211,6 +216,7 @@ def schedule_cupboard_handoff(
     if horizon <= 0:
         return out
     writing: dict[str, dict[str, Any]] = {}
+    quality: dict[str, dict[str, Any]] = {}
     recording: dict[str, dict[str, Any]] = {}
     slots = [s for s in (bank.get("slots") or []) if isinstance(s, dict)]
     slots.sort(key=lambda s: _told(s.get("in_seconds"))
@@ -224,16 +230,77 @@ def schedule_cupboard_handoff(
         commit_id = str(slot.get("commit_id") or "")
         short = _told(slot.get("short_seconds")) or 0.0
         owns = _told(slot.get("owns_seconds")) or 0.0
+        coverage = slot.get("coverage") if isinstance(slot.get("coverage"), dict) else {}
+        # A bound draft can claim the whole slot through projected yield while
+        # its actual words cover only a fraction. The writing room owes that
+        # gap until measured playable material has closed it.
+        ready_seconds = _told(slot.get("ready_seconds")) or 0.0
+        if (_told(coverage.get("playable_seconds")) or 0.0) < owns - 1.0:
+            short = max(short, _told(coverage.get("script_short_seconds")) or 0.0)
+            contract = slot.get("contract") if isinstance(slot.get("contract"), dict) else {}
+            if (ready_seconds >= owns - 1.0
+                    and (_told(contract.get("speech_seconds")) or 0.0) > 0.0):
+                short = max(short, _told(coverage.get("duration_short_seconds")) or 0.0)
+        short = max(short, _told(coverage.get("writing_structure_short_seconds")) or 0.0)
+        structure = _told(coverage.get("writing_structure_short_seconds")) or 0.0
+        speech_debt = max(_told(coverage.get("script_short_seconds")) or 0.0,
+                          _told(coverage.get("recording_short_seconds")) or 0.0)
+        body_debt = _told(coverage.get("duration_short_seconds")) or 0.0
+        if (ready_seconds >= owns - 1.0 and road in QUALITY_ROADS):
+            short = max(short, speech_debt)
+        quality_debt = max(structure, speech_debt, body_debt)
+        if (road in QUALITY_ROADS and quality_debt > 1.0 and owns > 0
+                and not slot.get("current")
+                and ready_seconds >= owns - 1.0):
+            candidates = [item for item in (slot.get("items") or [])
+                          if isinstance(item, dict) and item.get("ready")
+                          and item.get("round") and item.get("sid")]
+            if candidates and road not in quality:
+                item = max(candidates, key=lambda row: (
+                    _told(row.get("allocated_seconds")) or 0.0,
+                    str(row.get("sid"))))
+                contract = slot.get("contract") if isinstance(slot.get("contract"), dict) else {}
+                lines = item.get("lines") or []
+                current_turns = sum(1 for line in lines if isinstance(line, dict)
+                                    and str(line.get("text") or "").strip()
+                                    and line.get("state") != "missing")
+                missing = max(0, int(_told(coverage.get("missing_turns")) or 0),
+                              int(_told(coverage.get("missing_events")) or 0),
+                              len(coverage.get("missing_roles") or []))
+                seconds_per_turn = min(AVERAGE_TURN_SECONDS, max(3.0,
+                    (_told(item.get("seconds")) or
+                     _told(item.get("allocated_seconds")) or 0.0)
+                    / max(1, current_turns)))
+                missing = max(missing, math.ceil(quality_debt / seconds_per_turn))
+                quality[road] = {
+                    "action": "quality", "road": road,
+                    "label": str(slot.get("label") or road),
+                    "commit_id": commit_id,
+                    "item_id": str(item.get("id") or ""),
+                    "sid": str(item.get("sid")),
+                    "due_in": round(due, 1),
+                    "allocated_seconds": round(_told(item.get("allocated_seconds")) or 0.0, 1),
+                    "source_turns": current_turns,
+                    "add_turns": min(24, max(1, missing)),
+                    "missing_roles": list(coverage.get("missing_roles") or []),
+                    "minimum_turns": int(_told(contract.get("minimum_turns")) or 0),
+                    "structural_short_seconds": round(structure, 1),
+                    "speech_short_seconds": round(speech_debt, 1),
+                    "body_short_seconds": round(body_debt, 1),
+                    "why": "the bound round fills the clock but owes speech or dialogue structure",
+                }
         # New writing cannot rescue a slot that has already started airing.
         # Keep scanning its items below: recording bound stock may still help.
         if short > 1.0 and owns > 0 and not slot.get("current"):
-            seat = writing.setdefault(road, {
-                "action": "write", "road": road, "label": str(slot.get("label") or road),
-                "due_in": round(due, 1), "commit_id": commit_id,
-                "want_seconds": 0.0, "bare": slot.get("state") == "missing"})
-            seat["want_seconds"] = round(min(horizon,
-                seat["want_seconds"] + min(owns, short)), 1)
-        if (_told(slot.get("written_only_seconds")) or 0.0) <= 1.0:
+            if not (road in quality and ready_seconds >= owns - 1.0):
+                seat = writing.setdefault(road, {
+                    "action": "write", "road": road, "label": str(slot.get("label") or road),
+                    "due_in": round(due, 1), "commit_id": commit_id,
+                    "want_seconds": 0.0, "bare": slot.get("state") == "missing"})
+                seat["want_seconds"] = round(min(horizon,
+                    seat["want_seconds"] + min(owns, short)), 1)
+        if ((_told(slot.get("written_only_seconds")) or 0.0) <= 1.0
+                and road != "track_talk"):
             continue
         for item in (slot.get("items") or []):
             if not isinstance(item, dict) or item.get("ready"):
@@ -241,7 +308,7 @@ def schedule_cupboard_handoff(
             counts = item.get("counts") if isinstance(item.get("counts"), dict) else {}
             written = _told(counts.get("written")) or 0.0
             ident = str(item.get("id") or item.get("sid") or "")
-            if written <= 0 or not ident or ident in recording:
+            if (written <= 0 and road != "track_talk") or not ident or ident in recording:
                 continue
             recording[ident] = {
                 "action": "record", "road": road,
@@ -250,8 +317,13 @@ def schedule_cupboard_handoff(
                 "due_in": round(due, 1), "commit_id": commit_id,
                 "written_lines": int(written),
                 "allocated_seconds": round(_told(item.get("allocated_seconds")) or 0.0, 1),
+                "bookends": ([str(line.get("part") or "")
+                              for line in (item.get("lines") or [])
+                              if line.get("state") != "rendered"]
+                             if road == "track_talk" else []),
             }
     out["truncated"] = len(slots) > 80
+    out["quality"] = list(quality.values())
     for road, order in writing.items():
         try:
             if shelf_full(road):
@@ -260,22 +332,26 @@ def schedule_cupboard_handoff(
         except Exception:  # noqa: BLE001
             out["blocked"].append({**order, "why": "shelf capacity is unknown"})
             continue
-        order["why"] = ("%ds of the next hour's %s airtime has no bound "
-                        "script; the first gap is due in %ds"
+        order["why"] = ("%ds of the next hour's %s script or dialogue "
+                        "structure is owed; the first gap is due in %ds"
                         % (int(order["want_seconds"]), road,
                            int(order["due_in"])))
         out["write"].append(order)
     out["write"].sort(key=lambda row: (row["due_in"], -row["want_seconds"]))
+    out["quality"].sort(key=lambda row: (row["due_in"], row["road"]))
     out["record"] = sorted(recording.values(),
                            key=lambda row: (row["due_in"], row["item_id"]))
     out["write_waiting"] = len(out["write"])
+    out["quality_waiting"] = len(out["quality"])
     out["record_waiting"] = len(out["record"])
     out["write"] = out["write"][:write_limit]
+    out["quality"] = out["quality"][:write_limit]
     out["record"] = out["record"][:record_limit]
     out["truncated"] = bool(out["truncated"]
         or out["write_waiting"] > write_limit
+        or out["quality_waiting"] > write_limit
         or out["record_waiting"] > record_limit)
-    out["work"] = sorted(out["write"] + out["record"],
+    out["work"] = sorted(out["write"] + out["quality"] + out["record"],
                          key=lambda row: (row["due_in"],
                                           0 if row["action"] == "record" else 1))
     return out

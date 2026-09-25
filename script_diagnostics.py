@@ -468,14 +468,18 @@ def analyze_capture(view, server_context=None):
     events, rows = view['events'], view['rows']
     counts = Counter(events=len(events), observations=sum(max(1, _count(e.get('samples'))) for e in events))
     evidence = {}
+    rows_by_media = {}
+    for row_id, row in rows.items():
+        for identity in row_identities(row):
+            rows_by_media.setdefault(identity, []).append(row_id)
 
-    def finding(code, index):
+    def finding(code, index, detail=None):
         counts[code] += 1
         evidence.setdefault(code, [])
         if len(evidence[code]) < 8:
-            evidence[code].append(index)
+            evidence[code].append(index if detail is None else detail)
 
-    # [#1189] WHAT KIND OF THING was sounding when nothing on the page named it.
+    # [#1189] WHAT KIND OF THING was sounding when the active row did not name it.
     file_classes = Counter()
     viewport_jumps = []
     previous = None
@@ -484,11 +488,18 @@ def analyze_capture(view, server_context=None):
         observed = audio.get('source') in ('bridge', 'local')
         active = rows.get(event.get('active_id'), {})
         # [#1189] IDENTITIES, not spellings: /sfx/<id> against a levelled cache name or
-        # a row's clip_media is one clip. Only a row that names something ELSE is a mismatch.
+        # a row's clip_media is one clip. A different captured row naming the
+        # player file is a mapping disagreement, not missing media evidence.
         names = row_identities(active)
         if observed and audio.get('file') and names and media_ident(audio['file']) not in names:
-            finding('observed_file_mismatch', index)
-            file_classes[file_class(audio['file'])] += 1        # [#1189]
+            matching_ids = rows_by_media.get(media_ident(audio['file']), [])
+            if matching_ids:
+                finding('observed_active_row_mismatch', index, {
+                    'index': index, 'active_id': str(event.get('active_id') or ''),
+                    'matching_ids': matching_ids[:4]})
+            else:
+                finding('observed_file_mismatch', index)
+                file_classes[file_class(audio['file'])] += 1
         placed = event.get('mark')
         # [#1189] with the decision recorded, highlight and active are read in the same
         # breath; a difference is a placement fault. Without it (an older client) the two
@@ -597,6 +608,8 @@ def analyze_capture(view, server_context=None):
         'highlight_document_regression': 'The highlighted identity moved to an earlier element in the same document revision; this describes the view, not audible order.',
         'highlight_active_mismatch': 'The highlighted identity differs from the client active-line identity.',
         'observed_file_mismatch': 'The observed player file differs from the active row media identity; path aliases require review.',
+        'observed_active_row_mismatch': ('The player file names a different captured row while the active row names other media; '
+                                         'the script-to-player mapping disagreed in this observation.'),
         'observed_position_regression': 'The observed position moved backward within the same player file.',
         'observed_file_restart': 'The same clip sounded again from its start; this is a repeat of that clip, not a backward seek.',   # [#1282]
         'same_file_line_regression': 'Active-line observations moved backward across cue windows within the same observed file.',

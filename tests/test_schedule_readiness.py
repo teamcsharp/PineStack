@@ -9,6 +9,14 @@ import app
 
 class ScheduleReadinessTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
+        binding_gates = {"call_contract", "tint", "segment_brief",
+                         "phrase_ban", "track_talk", "track_talk_fidelity"}
+        gates = mock.patch.object(app, "_CONTENT_GATE_STATE", {
+            "master_enabled": True,
+            "gates": {key: key in binding_gates for key in app.CONTENT_GATE_INFO},
+        })
+        gates.start()
+        self.addCleanup(gates.stop)
         app._INVENTORY_PLAN.update({"at": 0.0, "hours": 0.0, "plan": {}})
         app._COMMITS.update({"at": 0.0, "rows": []})
         journal = mock.patch.object(app, "station_flow_event")
@@ -1102,6 +1110,7 @@ A: Doreen, thank you for calling. Keep June close and stay with Pine Box FM."""
                   "banter_max_lines": 3}),
               mock.patch.object(app, "seat_away_who", return_value=""),
               mock.patch.object(app, "_LARDER", []),
+              mock.patch.object(app, "dialogue_starved", return_value=(False, 0)),
               mock.patch.object(app, "banter_material") as live_material):
             self.assertEqual(await app.dj_banter(shelf_only=True), [])
         live_material.assert_not_called()

@@ -109,6 +109,7 @@ import conversation_assembly as ca
 import line_alignment as la
 import manifest_store as ms
 import script_manifest as sm
+import segment_contract as sc
 import speaker_session as ss
 
 __all__ = [
@@ -119,6 +120,7 @@ __all__ = [
     "Settings", "ProductionSwitch", "ProductionLedger", "words_between",
     "RoundLine", "RoundSource", "Production", "ScriptProducer",
     "round_source", "compare_windows", "estimated_windows", "references",
+    "measured_round_supply",
 ]
 
 SCHEMA = 1
@@ -171,7 +173,7 @@ DEFAULT_REQUEST_CAP = 800             # app.py: VOICE_MAX_CHARS
 
 DEFAULT_BUDGET_S = 90.0
 DEFAULT_EVERY_S = 180.0
-DEFAULT_MAX_LINES = 48
+DEFAULT_MAX_LINES = 72
 LEDGER_KEEP = 4000
 
 
@@ -532,6 +534,42 @@ class RoundSource:
         return seen
 
 
+def measured_round_supply(source: RoundSource,
+                          cue_map: Mapping[str, Any]) -> dict[str, Any]:
+    """Contract supply from verified mix frames, excluding the final pad."""
+    if str(cue_map.get("derivation") or "") != "measured":
+        raise ValueError("a measured cue map is required for playable duration")
+    rate = int(cue_map.get("sample_rate") or 0)
+    if rate <= 0:
+        raise ValueError("the cue map has no sample rate")
+    cues = [cue for cue in (cue_map.get("cues") or [])
+            if str(cue.get("kind") or "line") == "line"]
+    if len(cues) != len(source.lines):
+        raise ValueError("the cue map does not cover every scripted line")
+    body_frames = max(0, int(cue_map.get("body_frames") or 0))
+    speech_frames = sum(max(0, int(cue.get("speech_end_sample") or 0)
+                            - int(cue.get("speech_start_sample",
+                                          cue.get("start_sample")) or 0))
+                        for cue in cues)
+    known_turns = {line.turn for line in source.lines if line.turn >= 0}
+    unknown_turns = sum(1 for line in source.lines if line.turn < 0)
+    turns = len(known_turns) + unknown_turns
+    return {
+        "scripted_seconds": round(sum(sc.estimated_speech_seconds(line.text)
+                                      for line in source.lines), 3),
+        "recorded_seconds": round(speech_frames / rate, 3),
+        "playable_seconds": round(body_frames / rate, 3),
+        "body_frames": body_frames,
+        "speech_frames": speech_frames,
+        "sample_rate": rate,
+        "roles": sorted({sc.normalize_role(line.actor) for line in source.lines}),
+        "turns": turns,
+        "events": turns,
+        "lines": len(source.lines),
+        "measured": True,
+    }
+
+
 def round_source(conversation_id: str,
                  plan: Sequence[Sequence[Any]],
                  voices: Mapping[str, str],
@@ -560,10 +598,17 @@ def round_source(conversation_id: str,
     rows: list[RoundLine] = []
     cast: dict[str, dict] = {}
     refusals: list[dict] = []
-    turn_of: dict[str, int] = {}
+    turn_of: dict[int, int] = {}
     chunk_of: dict[str, int] = {}
     turns = {int(r.get("at", -1)): r for r in (line_plan or [])
              if isinstance(r, Mapping)}
+    has_ranges = any("line_from" in row and "line_to" in row
+                     for row in turns.values())
+    for turn in turns.values():
+        start = int(turn.get("line_from", -1))
+        end = int(turn.get("line_to", -1))
+        for line_index in range(max(0, start), max(0, end)):
+            turn_of[line_index] = int(turn.get("at", -1))
     for ordinal, row in enumerate(plan or []):
         try:
             text, voice, who = str(row[0]), str(row[1]), str(row[2])
@@ -603,10 +648,9 @@ def round_source(conversation_id: str,
                 "media_missing", "line %d names %s, which is not on disk"
                 % (ordinal + 1, name), ordinal=ordinal + 1, media=name))
             continue
-        seat = turn_of.get(who)
-        turn = -1
+        turn = turn_of.get(ordinal, -1)
         chunk = chunk_of.get(text + "\x00" + who, 0)
-        got = turns.get(ordinal)
+        got = turns.get(ordinal) if turn < 0 and not has_ranges else None
         if isinstance(got, Mapping):
             turn = int(got.get("at", -1))
         rows.append(RoundLine(
@@ -616,7 +660,6 @@ def round_source(conversation_id: str,
             instructions=(str(instructions_for(who, voice))
                           if instructions_for else "")))
         chunk_of[text + "\x00" + who] = chunk + 1
-        del seat
         if who not in cast:
             config: dict[str, Any] = {}
             if config_for:
@@ -886,6 +929,7 @@ class Production:
     playback_occurrence_id: str = ""
     media: str = ""
     seconds: float = 0.0
+    supply: dict = field(default_factory=dict)
     refusals: list = field(default_factory=list)
     disagreement: dict = field(default_factory=dict)
     cost_seconds: float = 0.0
@@ -1110,6 +1154,7 @@ class ScriptProducer:
         out.step_seconds["assemble"] = self.clock() - mark
         mark = self.clock()
         try:
+            out.supply = measured_round_supply(source, made.cue_map)
             # 4 ------------------------------------- record and admit
             record = self.finish(script, made, out)
             if record is None:
@@ -1747,6 +1792,8 @@ class ScriptProducer:
         payload["production"]["disagreement"] = {
             k: v for k, v in dict(result.disagreement).items()
             if k != "per_line"}
+        if result.ok and result.supply:
+            payload["production"]["supply"] = dict(result.supply)
         if result.aired and result.cue_map:
             cue_map = dict(result.cue_map)
             # THE BEATS TRAVEL WITH THE MAP. `conversation_assembly` keeps

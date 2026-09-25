@@ -420,7 +420,27 @@ class LinearSequencer:
             now = float(self.clock())
             oid = str(oid or "")
             route = str(route or ROUTE_PAGE)
-            held = self._held.pop(str(key or ""), None) if key else None
+            held = self._held.get(str(key or "")) if key else None
+            held_key_mismatch = False
+            if held is not None:
+                held_media = str(held.get("media") or "").replace("\\", "/").rsplit("/", 1)[-1].split("?", 1)[0]
+                sent_media = str(media or "").replace("\\", "/").rsplit("/", 1)[-1].split("?", 1)[0]
+                held_oid = str(held.get("occurrence") or "")
+                held_block = int(held.get("block") or 0)
+                if ((held_media and sent_media and held_media != sent_media)
+                        or (held_oid and oid and held_oid != oid
+                            and not (held_media and sent_media and held_media == sent_media))
+                        or (held_block and block and held_block != int(block))):
+                    # A sid may name several rounds. A delayed handoff for an
+                    # older file must not consume the newer round's hold.
+                    self._count("release_mismatch")
+                    self._event("release_mismatch", key=str(key), oid=oid,
+                                route=route, held_media=held_media,
+                                sent_media=sent_media)
+                    held = None
+                    held_key_mismatch = True
+                else:
+                    held = self._held.pop(str(key), None)
             if held is None and oid:
                 # The occurrence is the second canonical join between an
                 # admitted round and its transport handoff. Recover by it if
@@ -428,14 +448,15 @@ class LinearSequencer:
                 # label leaves a ready round reserving the air until stale
                 # eviction while dialogue is pushed behind filler clips.
                 matches = [held_key for held_key, held_row in self._held.items()
-                           if str(held_row.get("occurrence") or "") == oid]
+                           if str(held_row.get("occurrence") or "") == oid
+                           and not (held_key_mismatch and held_key == str(key))]
                 if len(matches) == 1:
                     held = self._held.pop(matches[0], None)
                     self._count("released_by_occurrence")
                     self._event("key_reconciled", key=matches[0],
                                 reported_key=str(key or ""), oid=oid,
                                 route=route)
-            if key:
+            if key and not held_key_mismatch:
                 self._making.pop(str(key), None)
             if held is not None:
                 self._making.pop(str(held.get("key") or ""), None)

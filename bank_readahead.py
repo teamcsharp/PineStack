@@ -47,8 +47,11 @@ the strict disk check; a ledger read many times a minute must not.
 from __future__ import annotations
 
 import asyncio
+import math
 import time
 from typing import Any
+
+import segment_contract as segment_contracts
 
 BANK_MEMO_S = 10.0            # the view is re-walked at most this often
 PRODUCE_EVERY_S = 15.0        # the standing task's look interval
@@ -60,6 +63,7 @@ LOG_MOST = 24                 # how many productions the view remembers
 _MEMO: dict[str, Any] = {"at": 0.0, "minutes": 0, "value": None}
 _REFUSED: dict[str, dict[str, Any]] = {}     # sid -> {"at", "why", "code"}
 _LOG: list[dict[str, Any]] = []              # the last productions, newest last
+_CONTRACTS: dict[str, dict[str, Any]] = {}   # commit id -> current scheduled obligation
 
 STATE_RENDERED = "rendered"
 STATE_WRITTEN = "written"
@@ -116,6 +120,23 @@ def line_states(app: Any, kind: str, row: Any) -> list[dict[str, Any]]:
     yet is read straight off its script."""
     out: list[dict[str, Any]] = []
     if not isinstance(row, dict):
+        return out
+    if kind == "track_talk":
+        for part, who in (("intro", "dj"), ("outro", "cohost")):
+            side = row.get(part)
+            side = side if isinstance(side, dict) else {}
+            written = bool(str(side.get("text") or "").strip())
+            try:
+                ready = bool(app.track_talk_part_ready(side))
+            except Exception:  # noqa: BLE001
+                ready = written and _pantry_has(app, str(side.get("key") or ""))
+            out.append({"part": part, "who": who,
+                        "text": str(side.get("text") or "")[:120],
+                        "key": str(side.get("key") or ""),
+                        "state": (STATE_RENDERED if ready else
+                                  STATE_WRITTEN if written else STATE_MISSING),
+                        "seconds": round(_float(side.get("seconds")), 1)
+                                   if ready else 0.0})
         return out
     try:
         entry = app.dialogue_entry(row)
@@ -220,6 +241,8 @@ def item_view(app: Any, kind: str, item: dict[str, Any],
         state = "produced"
     elif ready or (lines and counts[STATE_WRITTEN] == 0 and counts[STATE_MISSING] == 0):
         state = STATE_RENDERED
+    elif counts[STATE_MISSING] and (counts[STATE_RENDERED] or counts[STATE_WRITTEN]):
+        state = "partial"
     elif counts[STATE_RENDERED] or counts[STATE_WRITTEN]:
         state = STATE_WRITTEN if counts[STATE_WRITTEN] else STATE_RENDERED
     else:
@@ -246,6 +269,92 @@ def item_view(app: Any, kind: str, item: dict[str, Any],
     }
 
 
+def _contract_supply(app: Any, kind: str, item: dict[str, Any],
+                     public: dict[str, Any]) -> dict[str, Any]:
+    """Measure one assigned item without treating a forecast as finished audio."""
+    row = item.get("row")
+    entry = _round_entry(app, row)
+    source = entry or (row if isinstance(row, dict) else {})
+    allocated = max(0.0, _float(public.get("allocated_seconds")))
+    playable = min(allocated, max(0.0, _float(public.get("ready_seconds"))))
+    if kind == "track_talk":
+        bookends: dict[str, dict[str, bool]] = {}
+        roles: list[str] = []
+        scripted = recorded = 0.0
+        for part, who in (("intro", "dj"), ("outro", "cohost")):
+            side = source.get(part)
+            side = side if isinstance(side, dict) else {}
+            written = bool(str(side.get("text") or "").strip())
+            try:
+                ready = bool(app.track_talk_part_ready(side))
+            except Exception:  # noqa: BLE001
+                ready = written and _pantry_has(app, str(side.get("key") or ""))
+            bookends[part] = {"written": written, "recorded": ready}
+            if written:
+                roles.append(who)
+                scripted += segment_contracts.estimated_speech_seconds(side.get("text"))
+            if ready:
+                recorded += max(0.0, _float(side.get("seconds")))
+        turns = len(roles)
+        return {"scripted_seconds": round(scripted, 3),
+                "recorded_seconds": round(recorded, 3),
+                "playable_seconds": playable, "turns": turns,
+                "events": turns, "roles": roles, "bookends": bookends}
+    script = str(source.get("script") or source.get("script_plain")
+                 or source.get("text_plain") or source.get("text") or "")
+    turns: list[Any] = []
+    if entry is not None:
+        try:
+            turns = list(app.banter_turns(script, str(entry.get("caller_name") or ""),
+                                          str(entry.get("caller2_name") or "")))
+        except Exception:  # noqa: BLE001
+            turns = []
+    roles = [segment_contracts.normalize_role(marker)
+             for marker, said in turns if str(said or "").strip()]
+    if not turns and script.strip():
+        turns = [(str(source.get("who") or "dj"), script)]
+        roles = [segment_contracts.normalize_role(turns[0][0])]
+    production = (entry or {}).get("production") or {}
+    supply = production.get("supply") if isinstance(production, dict) else None
+    if (bool(item.get("ready")) and isinstance(supply, dict)
+            and supply.get("measured") and _cue_map_measured(app, entry)):
+        return {"scripted_seconds": round(min(allocated,
+                    max(0.0, _float(supply.get("scripted_seconds")))), 3),
+                "recorded_seconds": round(min(allocated,
+                    max(0.0, _float(supply.get("recorded_seconds")))), 3),
+                "playable_seconds": round(min(playable,
+                    max(0.0, _float(supply.get("playable_seconds")))), 3),
+                "turns": max(0, _int(supply.get("turns"))),
+                "events": max(0, _int(supply.get("events"))),
+                "roles": list(supply.get("roles") or [])}
+    recorded = sum(max(0.0, _float(take.get("seconds")))
+                   for take in (entry or {}).get("takes", [])
+                   if isinstance(take, dict) and _pantry_has(app, str(take.get("key") or "")))
+    if entry is None or (item.get("ready") and not (entry.get("takes") or [])):
+        recorded = playable
+    return {"scripted_seconds": round(min(allocated,
+                    segment_contracts.estimated_speech_seconds(script)), 3),
+            "recorded_seconds": round(min(allocated, recorded), 3),
+            "playable_seconds": playable,
+            "turns": len(turns), "events": len(turns), "roles": roles}
+
+
+def contract_write_needed(kind: str, max_age: float = 30.0) -> bool:
+    """A recent bank walk found authored or measured airtime debt."""
+    now = time.time()
+    return any(str(row.get("road") or "") == kind
+               and now - _float(row.get("at")) <= max_age
+               and (_float((row.get("coverage") or {}).get("script_short_seconds")) > 1.0
+                    and _float((row.get("coverage") or {}).get("playable_seconds"))
+                        < _float((row.get("coverage") or {}).get("target_seconds")) - 1.0
+                    or _float((row.get("coverage") or {}).get("writing_structure_short_seconds")) > 1.0
+                    or (_float(row.get("speech_seconds")) > 0.0
+                        and _float(row.get("ready_seconds")) >= _float(row.get("owns_seconds")) - 1.0
+                        and _float((row.get("coverage") or {}).get("duration_short_seconds")) > 1.0))
+               and _float(row.get("starts_in")) > 0.0
+               for row in list(_CONTRACTS.values()))
+
+
 # ---------------------------------------------------------------- the view
 
 def _plan(app: Any, minutes: int) -> dict[str, Any]:
@@ -269,11 +378,13 @@ def bank_state(app: Any, minutes: int = 60) -> dict[str, Any]:
 
 
 def _bank_state_fresh(app: Any, minutes: int, now: float) -> dict[str, Any]:
+    global _CONTRACTS
     window = float(minutes) * 60.0
     plan = _plan(app, minutes)
     selected = {str(item.get("id") or ""): item
                 for item in (plan.get("selected") or []) if isinstance(item, dict)}
     slots_out: list[dict[str, Any]] = []
+    contracts: dict[str, dict[str, Any]] = {}
     totals = {"rendered_seconds": 0.0, "written_only_seconds": 0.0,
               "missing_seconds": 0.0, "live_lines": 0,
               "lines": {STATE_RENDERED: 0, STATE_WRITTEN: 0,
@@ -288,6 +399,7 @@ def _bank_state_fresh(app: Any, minutes: int, now: float) -> dict[str, Any]:
             continue
         kind = str(slot.get("road") or slot.get("kind") or "")
         items: list[dict[str, Any]] = []
+        supplies: list[dict[str, Any]] = []
         for public in slot.get("stock") or []:
             if not isinstance(public, dict):
                 continue
@@ -296,6 +408,7 @@ def _bank_state_fresh(app: Any, minutes: int, now: float) -> dict[str, Any]:
                 continue
             view = item_view(app, kind, item, public)
             items.append(view)
+            supplies.append(_contract_supply(app, kind, item, public))
             totals["items"] += 1
             for state, n in view["counts"].items():
                 totals["lines"][state] = totals["lines"].get(state, 0) + n
@@ -310,6 +423,15 @@ def _bank_state_fresh(app: Any, minutes: int, now: float) -> dict[str, Any]:
         ready = _float(slot.get("ready_seconds"))
         planned = _float(slot.get("planned_seconds"))
         short = _float(slot.get("short_seconds"), max(0.0, owns - planned))
+        contract = segment_contracts.build_segment_contract(slot, now=now)
+        coverage = segment_contracts.evaluate_segment_contract(contract, supplies)
+        tasks = segment_contracts.preparation_tasks(contract, coverage)
+        commit_id = str(slot.get("commit_id") or "")
+        if commit_id:
+            contracts[commit_id] = {"at": now, "road": kind,
+                                    "starts_in": starts, "coverage": coverage,
+                                    "ready_seconds": ready, "owns_seconds": owns,
+                                    "speech_seconds": contract["speech_seconds"]}
         totals["rendered_seconds"] += ready
         totals["written_only_seconds"] += max(0.0, planned - ready)
         totals["missing_seconds"] += short
@@ -325,6 +447,7 @@ def _bank_state_fresh(app: Any, minutes: int, now: float) -> dict[str, Any]:
             "owns_seconds": round(owns, 1), "ready_seconds": round(ready, 1),
             "written_only_seconds": round(max(0.0, planned - ready), 1),
             "short_seconds": round(short, 1),
+            "contract": contract, "coverage": coverage, "tasks": tasks,
             "state": ("rendered" if short <= 1.0 and planned - ready <= 1.0 and items
                       else "written" if items and short <= 1.0
                       else "partial" if items else "missing"),
@@ -332,6 +455,7 @@ def _bank_state_fresh(app: Any, minutes: int, now: float) -> dict[str, Any]:
         })
     for key in ("rendered_seconds", "written_only_seconds", "missing_seconds"):
         totals[key] = round(totals[key], 1)
+    _CONTRACTS = contracts
     queue = production_queue(app, minutes=max(minutes, 60), plan=plan)
     say = ("%d min of finished audio is bound to the next %d min (%d min written "
            "only, %d min with nothing behind it); %d of %d bound rounds carry a "
@@ -349,7 +473,7 @@ def _bank_state_fresh(app: Any, minutes: int, now: float) -> dict[str, Any]:
         "plan_say": str(plan.get("say") or ""),
         "totals": totals, "slots": slots_out,
         "production": {
-            "queue": queue[:QUEUE_MOST], "queued": len(queue),
+            "queue": _public_queue(queue[:QUEUE_MOST]), "queued": len(queue),
             "log": list(_LOG)[-LOG_MOST:],
             "refused": {sid: dict(v) for sid, v in list(_REFUSED.items())[-QUEUE_MOST:]},
             "task": dict(getattr(app, "_BANK_PRODUCER", {}) or {}),

@@ -66,7 +66,7 @@ try:                                              # [#1252]
     from pine_qr import qr_svg as _qr_svg
 except Exception:                                 # noqa: BLE001
     _qr_svg = None
-from segment_contract import ad_sale_evidence
+from segment_contract import WORDS_PER_MINUTE, ad_sale_evidence, normalize_role
 from store_retention import retention_sweep, store_sizes
 import station_modifiers                 # #1169/#1170: the modifier desk
 import segment_prompts                   # [#1195] the segment prompt book: alternatives, modes, - speaker box -
@@ -102,6 +102,10 @@ from caller_topic import (  # [#1240/#1249] the storyline as direction, the call
     topic_contract_clause,
     fallback_call_script as _topic_fallback_call_script,
     SKELETON_TELL as _TOPIC_SKELETON_TELL)
+from call_scenarios import (call_aired_conclusion_report, call_conclusion_report,
+                            call_path_draw,
+                            call_scenario_clause, load_scenario_catalog,
+                            save_scenario_catalog, select_call_scenario)
 from response_bank import ResponseBank, add_listening_responses
 from rap_battle import (COMBATANTS as RAP_COMBATANTS, RapBattle,
                         SEAT_NAMES as RAP_SEAT_NAMES)
@@ -25395,7 +25399,13 @@ def _clip_seconds(path: str) -> float:
 async def _clip_seconds_async(path: str) -> float:
     """_clip_seconds, with the file read off the event loop."""
     try:
-        return await asyncio.to_thread(_clip_seconds, path)
+        raw = str(path or "").split("?", 1)[0]
+        if raw.startswith("/ads-audio/"):
+            name = raw.rsplit("/", 1)[-1]
+            if not AD_AUDIO_SHAPE.match(name):
+                return 0.0
+            raw = str(PRODUCED_ADS_DIR / name)
+        return await asyncio.to_thread(_clip_seconds, raw)
     except Exception:  # noqa: BLE001
         # The synchronous road answers 0.0 for anything it cannot read
         # and raises nothing; a length that cannot be measured must not
@@ -25759,6 +25769,8 @@ def _admission_producer(depth: int = 2) -> str:
 def _admission_lane(path: str, kind: str = "", reply: bool = False) -> str:
     if reply or str(kind or "") == "reply":
         return "reply"
+    if str(kind or "") == "ad" or str(path or "").startswith("/ads-audio/"):
+        return "advert"
     low = (str(path or "") + " " + str(kind or "")).lower()
     for needle, lane in (("/sfx/", "sfx"), ("sting", "sfx"), ("sfx", "sfx"),
                          ("advert", "advert"), ("/ad/", "advert"),
@@ -26382,10 +26394,10 @@ PLAYOUT_ROAD_BY_KIND = {
     "banter": "banter", "manager": "manager", "rescue": "rescue",
     "unheard": "unheard", "record": "record_talk", "upstairs": "upstairs",
 }
-# The sheet is OWED these (#1261's memo from upstairs, and the advert
-# log): they ask with priority and may go in front of a HELD round, never
-# in front of a sounding one - the floor sees to that.
-PLAYOUT_PRIORITY_KINDS = frozenset({"ad", "advert", "upstairs", "manager"})
+# Paid reads may take the next boundary. Manager pages are repeatable stock;
+# allowing them to outrank a held round filled the page feed half an hour
+# ahead and left that round waiting behind dozens of memos.
+PLAYOUT_PRIORITY_KINDS = frozenset({"ad", "advert"})
 
 
 def playout_clip_road(clip: Any) -> tuple[str, bool]:
@@ -27005,7 +27017,7 @@ def _with_nabu_speech_ownership(function: Any) -> Any:
 
 @_with_nabu_speech_ownership
 async def _play_on_box(path: str, sig: str, reply: bool = False,
-                       replay: bool = False) -> str:
+                       replay: bool = False, on_dispatch: Any = None) -> str:
     """Hand a finished clip to the Pine Box speaker. Best effort — the panel
     still plays it even when Home Assistant is unreachable."""
     # #1117: OFF AIR, THE STATION DOES NOT REACH THE SPEAKER.
@@ -27143,6 +27155,7 @@ async def _play_on_box(path: str, sig: str, reply: bool = False,
     call_budget = (min(ANNOUNCE_TIMEOUT, seconds + 25.0) if seconds
                    else 18.0)
     async with _ANNOUNCE_LOCK:
+        dispatch = on_dispatch
         # The same retry the spoken path has had since #182. A bare 500 from
         # announce is usually the box having dropped its own Wyoming socket,
         # which a wait or a rebuild fixes — and without this a stinger simply
@@ -27174,6 +27187,13 @@ async def _play_on_box(path: str, sig: str, reply: bool = False,
                         _ANNOUNCE_LAST["error"] = f"Nabu speech level could not be applied: {type(exc).__name__}"
                         pipeline_log("air", _ANNOUNCE_LAST["error"])
                         return ""
+                if callable(dispatch):
+                    try:
+                        dispatch()
+                    except Exception as exc:  # noqa: BLE001
+                        pipeline_log("air", "the box dispatch clock could not be stamped",
+                                     extra=str(exc)[:160])
+                    dispatch = None
                 attempt_started = time.monotonic()
                 attempt_wall = time.time()          # #822 proof window
                 async with httpx.AsyncClient(timeout=call_budget) as client:
@@ -27385,7 +27405,7 @@ _play_on_box_admitted = _play_on_box
 
 @wraps(_play_on_box_admitted)
 async def _play_on_box(path: str, sig: str, reply: bool = False,
-                       replay: bool = False) -> str:
+                       replay: bool = False, on_dispatch: Any = None) -> str:
     ticket = admission_ticket(path, sig, route="box", reply=reply,
                               seconds=await _clip_seconds_async(path),
                               producer=_admission_producer(2))
@@ -27398,7 +27418,8 @@ async def _play_on_box(path: str, sig: str, reply: bool = False,
         return ""
     try:
         played = await _play_on_box_admitted(path, sig, reply=reply,
-                                             replay=replay)
+                                             replay=replay,
+                                             on_dispatch=on_dispatch)
     except BaseException as exc:                      # noqa: BLE001
         admission_delivery(ticket, "failed",
                            {"error": "%s: %s" % (type(exc).__name__, exc),
@@ -29079,10 +29100,21 @@ def page_recovery_read() -> list[dict[str, Any]]:
         except Exception:  # noqa: BLE001
             return False
 
+    def _still_owed(row: dict[str, Any]) -> bool:
+        try:
+            start = float(row.get("broadcast_ms") or 0) / 1000.0
+            if start <= 0:
+                return True  # legacy recovery rows have no air reservation
+            stream = row.get("stream") if isinstance(row.get("stream"), dict) else {}
+            seconds = max(0.0, float(row.get("seconds") or stream.get("length") or 0))
+            return start + seconds >= time.time() - 120.0
+        except (TypeError, ValueError):
+            return False
+
     try:
         return [r for r in json.loads(PAGE_RECOVERY_PATH.read_text(encoding="utf-8")).get("clips", [])
                 if isinstance(r, dict) and r.get("delivery_id") and r.get("url")
-                and _still_there(r)][:120]
+                and _still_owed(r) and _still_there(r)][:120]
     except (OSError, ValueError, TypeError):
         return []
 
@@ -42375,7 +42407,7 @@ def _track_talk_review_rewrite(source: str, candidate: str, track: dict[str, Any
             disposition="rewrite_rejected")
 
 
-async def prep_track_talk() -> bool:
+async def prep_track_talk(wanted_track_id: str = "") -> bool:
     """#869: one half of the dialogue around one upcoming record.
 
     The host's introduction BEFORE it, and the co-host's send-off AFTER
@@ -42396,6 +42428,8 @@ async def prep_track_talk() -> bool:
         for track in track_lookahead():
             if track.get("tape") or not track.get("id"):
                 continue            # the mail writes its own introduction
+            if wanted_track_id and str(track.get("id")) != wanted_track_id:
+                continue
             # #1179: THE SEND-OFF FIRST.  One part per visit, and the
             # intro is the half that already has a live fallback on the
             # air path - an expensive one, 50.4s of dead air an airing,
@@ -45295,7 +45329,14 @@ def commitment_write_needed(kind: str, hours: float = 0.0) -> bool:
     try:
         state = (commitment_inventory_plan(hours).get("roads") or {}).get(
             str(kind)) or {}
-        return float(state.get("short_seconds") or 0) > 1.0
+        if float(state.get("short_seconds") or 0) > 1.0:
+            return True
+        # The FIFO planner reserves forecast seconds for written stock. A
+        # recent bank walk also measures the actual words in that stock; a
+        # short draft must not close the writing room's obligation.
+        if _bank_module is not None:
+            return bool(_bank_module.contract_write_needed(str(kind)))
+        return False
     except Exception:  # noqa: BLE001
         return False
 
@@ -51981,6 +52022,9 @@ def horizon_hour_demand(key: Any = "", hours: Any = 0) -> dict:
         "overridden": False,
         "priced": False,
         "entries": [],
+        "scheduled_seconds": 0.0,
+        "unpriced_seconds": 0.0,
+        "unpriced_entries": 0,
         "owed_seconds": 0.0,
         "held_seconds": 0.0,
         "short_seconds": 0.0,
@@ -52035,10 +52079,10 @@ def horizon_hour_demand(key: Any = "", hours: Any = 0) -> dict:
                 "cannot": cannot,
                 "priced": False,
                 "held_seconds": 0.0,
-                "short_seconds": 0.0 if cannot else round(owns, 1),
+                "short_seconds": None,
                 "expired_seconds": 0.0,
-                "covered": bool(cannot),
-                "bare": (not cannot),
+                "covered": None,
+                "bare": None,
             }
             walked = plan.get(i)
             if isinstance(walked, dict):
@@ -52051,7 +52095,13 @@ def horizon_hour_demand(key: Any = "", hours: Any = 0) -> dict:
                     if field in walked:
                         one[field] = walked[field]
             out["entries"].append(one)
-            out["owed_seconds"] += owns
+            out["scheduled_seconds"] += owns
+            if not one["priced"]:
+                out["unpriced_seconds"] += owns
+                out["unpriced_entries"] += 1
+                continue
+            priced_owns = float(one.get("owns_seconds") or 0)
+            out["owed_seconds"] += priced_owns
             out["held_seconds"] += float(one.get("held_seconds") or 0)
             out["short_seconds"] += float(one.get("short_seconds") or 0)
             out["expired_seconds"] += float(one.get("expired_seconds") or 0)
@@ -52063,13 +52113,14 @@ def horizon_hour_demand(key: Any = "", hours: Any = 0) -> dict:
                 seat = out["roads"].setdefault(
                     road, {"owed": 0.0, "held": 0.0, "short": 0.0,
                            "entries": 0, "bare": 0})
-                seat["owed"] += owns
+                seat["owed"] += priced_owns
                 seat["held"] += float(one.get("held_seconds") or 0)
                 seat["short"] += float(one.get("short_seconds") or 0)
                 seat["entries"] += 1
                 if one.get("bare"):
                     seat["bare"] += 1
-        for field in ("owed_seconds", "held_seconds", "short_seconds",
+        for field in ("scheduled_seconds", "unpriced_seconds",
+                      "owed_seconds", "held_seconds", "short_seconds",
                       "expired_seconds"):
             out[field] = round(float(out[field]), 1)
         for seat in out["roads"].values():
@@ -52077,14 +52128,16 @@ def horizon_hour_demand(key: Any = "", hours: Any = 0) -> dict:
                 seat[field] = round(float(seat[field]), 1)
         out["ok"] = True
         out["say"] = (
-            "%s runs %s: %d entries, %ds owed, %ds held, %ds short, "
+            "%s runs %s: %d entries, %ds future priced, %ds held, %ds short, "
             "%d bare" % (want, out["preset"] or "the plan", len(out["entries"]),
                          int(out["owed_seconds"]), int(out["held_seconds"]),
                          int(out["short_seconds"]), out["bare"]))
+        if out["unpriced_entries"]:
+            out["say"] += ("; %d calendar entry(s) outside the priced walk"
+                           % out["unpriced_entries"])
         if not out["priced"]:
             out["say"] += (" - demand only: that hour is beyond the walk, so "
-                           "the stock figures are what the sheet owes and not "
-                           "what is behind it")
+                           "scheduled seconds are shown without invented stock")
     except Exception:  # noqa: BLE001
         out["say"] = "the horizon desk could not read that hour"
     return out
@@ -52103,17 +52156,21 @@ def horizon_plan(hours: Any = 6.0) -> dict:
         store = schedule_read()
         out["stamp"] = horizon_stamp(store, span)
         first = _sched_hour_key()
-        owed = held = short = expired = 0.0
+        owed = held = short = expired = unpriced = scheduled = 0.0
         bare = 0
         for step in range(int(span)):
             got = horizon_hour_demand(_sched_hour_shift(first, step), span)
             out["hours"].append(got)
             owed += float(got.get("owed_seconds") or 0)
+            scheduled += float(got.get("scheduled_seconds") or 0)
+            unpriced += float(got.get("unpriced_seconds") or 0)
             held += float(got.get("held_seconds") or 0)
             short += float(got.get("short_seconds") or 0)
             expired += float(got.get("expired_seconds") or 0)
             bare += int(got.get("bare") or 0)
         out["owed_seconds"] = round(owed, 1)
+        out["scheduled_seconds"] = round(scheduled, 1)
+        out["unpriced_seconds"] = round(unpriced, 1)
         out["held_seconds"] = round(held, 1)
         out["short_seconds"] = round(short, 1)
         out["expired_seconds"] = round(expired, 1)
@@ -52121,10 +52178,11 @@ def horizon_plan(hours: Any = 6.0) -> dict:
         out["cover"] = round(held / owed, 3) if owed > 0 else 0.0
         out["ok"] = True
         out["say"] = (
-            "%d hours ahead: %ds owed, %ds held (%d%%), %ds short, %d bare "
-            "entries" % (len(out["hours"]), int(owed), int(held),
+            "%d calendar hours from this hour: %ds future priced, %ds held "
+            "(%d%%), %ds short, %d bare entries; %ds unpriced calendar time"
+            % (len(out["hours"]), int(owed), int(held),
                          int(100 * (held / owed if owed > 0 else 0)),
-                         int(short), bare))
+                         int(short), bare, int(unpriced)))
     except Exception:  # noqa: BLE001
         out["say"] = "the horizon desk could not build a plan"
     return out
@@ -53992,6 +54050,7 @@ def coord_work_order_say(order: dict[str, Any]) -> str:
 _PANTRY_ORDER_AT = [0.0]
 _PANTRY_ORDER_LAST: dict[str, Any] = {}
 _PANTRY_ORDER_RECORD_ACTIVE: set[str] = set()
+_PANTRY_ORDER_QUALITY_ACTIVE: set[str] = set()
 
 
 def pantry_order_schedule_work() -> dict[str, Any]:
@@ -54043,6 +54102,10 @@ def pantry_order_record_target(order: dict[str, Any]) -> tuple[str, Any]:
     if not isinstance(item, dict) or item.get("ready"):
         return "", None
     row = item.get("row")
+    if road == "track_talk":
+        if not isinstance(row, dict) or track_talk_pair_ready(row):
+            return "", None
+        return "track_talk", row
     if not isinstance(row, dict) or dialogue_row_ready(road, row):
         return "", None
     entry = dialogue_entry(row)
@@ -54067,7 +54130,9 @@ async def pantry_order_record(order: dict[str, Any]) -> None:
         if not shape or not pantry_window() or prep_should_stop():
             order["state"] = "no longer ready for recording"
             return
-        if shape == "single":
+        if shape == "track_talk":
+            made = await prep_track_talk(ident.partition(":")[2])
+        elif shape == "single":
             made = await prep_voice_pending(str(order.get("road") or ""), ident)
         else:
             result = await recording_sitting([entry], 45.0)
@@ -54077,6 +54142,374 @@ async def pantry_order_record(order: dict[str, Any]) -> None:
         order["state"] = "recording failed (%s)" % type(exc).__name__
     finally:
         _PANTRY_ORDER_RECORD_ACTIVE.discard(ident)
+
+
+def pantry_order_quality_target(order: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    """Recheck the exact future commitment and its still-playable source."""
+    road = str(order.get("road") or "")
+    ident = str(order.get("item_id") or "")
+    commit = str(order.get("commit_id") or "")
+    if not (road and ident and commit):
+        return None
+    plan = commitment_inventory_plan(1.0, fresh=True)
+    slot = next((s for s in (plan.get("slots") or [])
+                 if s.get("commit_id") == commit and s.get("road") == road
+                 and not s.get("current") and float(s.get("in_seconds") or 0) >= 90
+                 and any(i.get("id") == ident for i in (s.get("stock") or []))), None)
+    item = next((i for i in (plan.get("selected") or [])
+                 if i.get("id") == ident and i.get("kind") == road
+                 and i.get("ready")), None)
+    if not slot or not item:
+        return None
+    row = item.get("row")
+    if (not isinstance(row, dict)
+            or alt_sid(road, row) != str(order.get("sid") or "")
+            or not isinstance(dialogue_entry(row), dict)
+            or not dialogue_row_ready(road, row)):
+        return None
+    return slot, row
+
+
+def pantry_order_quality_target_reason(order: dict[str, Any]) -> str:
+    """Explain why a bank-bound quality order lost its fresh inventory match."""
+    road = str(order.get("road") or "")
+    ident = str(order.get("item_id") or "")
+    commit = str(order.get("commit_id") or "")
+    plan = commitment_inventory_plan(1.0, fresh=True)
+    slots = [s for s in (plan.get("slots") or [])
+             if s.get("commit_id") == commit and s.get("road") == road]
+    if not slots:
+        nearby = [s for s in (plan.get("slots") or []) if s.get("road") == road]
+        return "commitment moved; next=" + str((nearby[0] if nearby else {}).get("commit_id") or "none")
+    slot = slots[0]
+    if slot.get("current") or float(slot.get("in_seconds") or 0) < 90:
+        return "the bound slot is on air or within its 90-second guard"
+    if not any(i.get("id") == ident for i in (slot.get("stock") or [])):
+        return "bound stock changed; now=" + ",".join(
+            str(i.get("id") or "") for i in (slot.get("stock") or [])[:3])
+    item = next((i for i in (plan.get("selected") or [])
+                 if i.get("id") == ident and i.get("kind") == road), None)
+    if not item:
+        return "bound stock is absent from the selected inventory"
+    if not item.get("ready"):
+        return "bound stock is no longer ready"
+    row = item.get("row")
+    if not isinstance(row, dict):
+        return "bound stock has no source row"
+    if alt_sid(road, row) != str(order.get("sid") or ""):
+        return "bound stock source ID changed"
+    if not isinstance(dialogue_entry(row), dict):
+        return "bound stock has no script entry"
+    if not dialogue_row_ready(road, row):
+        return "bound stock failed the current air-readiness gate"
+    return "the binding recovered during the second inventory read"
+
+
+def pantry_order_quality_save(road: str) -> None:
+    if road == "banter":
+        _larder_save()
+    else:
+        _pantry_save(True)
+
+
+QUALITY_REPAIR_VERSION = 5
+
+
+async def pantry_order_quality(job: str, order: dict[str, Any]) -> None:
+    """Improve one bound round in place, leaving the old take on air until ready."""
+    road = str(order.get("road") or "")
+    sid = str(order.get("sid") or "")
+    try:
+        target = await asyncio.to_thread(pantry_order_quality_target, order)
+        if not target:
+            alt_job_put(job, state="refused", why="the exact future binding changed")
+            return
+        _slot, row = target
+        source = dialogue_entry(row)
+        if not isinstance(source, dict):
+            return
+        draft = row.get("quality_draft")
+        if (isinstance(draft, dict)
+                and row.get("quality_commit_id") != str(order.get("commit_id") or "")):
+            row.pop("quality_draft", None)
+            pantry_order_quality_save(road)
+            draft = None
+        if isinstance(draft, dict):
+            draft.pop("preparing", None)
+            draft.pop("tinting", None)
+            if draft.get("quality_repair_needed"):
+                repairs = int(draft.get("quality_repair_attempts") or 0)
+                if repairs >= 2:
+                    row.pop("quality_draft", None)
+                    pantry_order_quality_save(road)
+                    alt_job_put(job, state="refused", why="two structural repairs were spent")
+                    return
+                if not alt_window() or prep_should_stop():
+                    alt_job_put(job, state="waiting for repair", why="waiting to repair the recorded structure")
+                    return
+                old = banter_turns(str(source.get("script") or ""),
+                                   str(source.get("caller_name") or ""),
+                                   str(source.get("caller2_name") or ""))
+                current = banter_turns(str(draft.get("script") or ""),
+                                       str(draft.get("caller_name") or ""),
+                                       str(draft.get("caller2_name") or ""))
+                target_turns = len(old) + max(1, int(order.get("add_turns") or 1))
+                missing = [str(role) for role in (order.get("missing_roles") or [])
+                           if normalize_role(role) not in
+                           {normalize_role(mark) for mark, _ in current}]
+                required = max(1, target_turns - len(current), len(missing))
+                need = required + 2
+                body_due = max(0.0, float(order.get("body_short_seconds") or 0.0))
+                target_seconds = float(source.get("seconds") or 0.0) + body_due
+                remaining = max(0.0, target_seconds - float(draft.get("seconds") or 0.0))
+                word_goal = (math.ceil((remaining + max(5.0, remaining * 0.25))
+                                       * WORDS_PER_MINUTE / 60.0)
+                             if body_due > 1.0 and remaining > 1.0 else 0)
+                labels = sorted({str(mark).upper() for mark, _ in old + current}
+                                | {"A", "B"})
+                prompt = (
+                    "Add at least " + str(need) + " NEW substantial speaker turns "
+                    + ("with at least " + str(word_goal) + " spoken words in total. "
+                       if word_goal else "")
+                    + "to this radio conversation. Continue its facts and current "
+                    "story; do not repeat old turns. Use only " + ", ".join(labels)
+                    + ". Include these missing roles: " + ", ".join(missing)
+                    + ". Output only new MARKER: speech lines.\n\nCONTEXT:\n"
+                    + str(draft.get("script") or "")[-7000:])
+                draft["quality_repair_attempts"] = repairs + 1
+                pantry_order_quality_save(road)
+                alt_job_put(job, state="writing", why="repairing the recorded structure")
+                said = str(await ask_model(prompt, limit=min(6500, max(1800, need * 230)),
+                                           mark={"kind": "writers room",
+                                                 "why": "bound structural repair"}) or "")
+                fresh = banter_turns(said, str(draft.get("caller_name") or ""),
+                                     str(draft.get("caller2_name") or ""))
+                offered_words = sum(len(re.findall(r"[^\W_]+(?:'[^\W_]+)*", text))
+                                    for _, text in fresh)
+                if len(fresh) < required or offered_words < word_goal or any(
+                        normalize_role(role) not in
+                        {normalize_role(mark) for mark, _ in current + fresh}
+                        for role in missing):
+                    row["quality_last_fault"] = {
+                        "repair_required_turns": required,
+                        "repair_offered_turns": len(fresh),
+                        "repair_required_words": word_goal,
+                        "repair_offered_words": offered_words,
+                        "repair_offered_chars": len(said)}
+                    pantry_order_quality_save(road)
+                    alt_job_put(job, state="waiting for repair", why="the structural repair was too short")
+                    return
+                expanded = current[:-1] + fresh + current[-1:] if current else fresh
+                _dialogue_audio_drop(draft)
+                for key in ("script_plain", "script_tinted", "tint", "tint_progress",
+                            "tint_revalidation", "tint_tried", "use", "brief_plain_ok",
+                            "brief", "off_brief", "review_cancel_pending", "production",
+                            "cue_map", "missing_voice_chunks"):
+                    draft.pop(key, None)
+                draft["script"] = "\n".join("%s: %s" % (m, t) for m, t in expanded)
+                draft["freshened"] = True
+                draft.pop("quality_repair_needed", None)
+                pantry_order_quality_save(road)
+        else:
+            if int(row.get("quality_protocol") or 0) < QUALITY_REPAIR_VERSION:
+                row["quality_attempts"] = 0
+                row["quality_offer_failures"] = 0
+                row["quality_protocol"] = QUALITY_REPAIR_VERSION
+                pantry_order_quality_save(road)
+            if int(row.get("quality_attempts") or 0) >= 2:
+                alt_job_put(job, state="refused", why="two writing attempts were spent")
+                return
+            if int(row.get("quality_offer_failures") or 0) >= 3:
+                alt_job_put(job, state="refused", why="three unusable writing offers were spent")
+                return
+            started = time.time()
+            while not alt_window() or prep_should_stop():
+                if time.time() - started > ALT_GEN_WAIT:
+                    alt_job_put(job, state="gave up", why="no quiet writing window")
+                    return
+                alt_job_put(job, state="waiting", why="waiting for a quiet writing window")
+                await asyncio.sleep(3)
+            target = await asyncio.to_thread(pantry_order_quality_target, order)
+            if not target or target[1] is not row:
+                alt_job_put(job, state="refused", why="the binding changed before writing")
+                return
+            source = dialogue_entry(row)
+            old_script = str(source.get("script") or "")
+            turns = banter_turns(old_script, str(source.get("caller_name") or ""),
+                                 str(source.get("caller2_name") or ""))
+            need = max(1, int(order.get("add_turns") or 1))
+            body_due = max(0.0, float(order.get("body_short_seconds") or 0.0))
+            word_goal = (math.ceil((body_due + max(5.0, body_due * 0.25))
+                                   * WORDS_PER_MINUTE / 60.0)
+                         if body_due > 1.0 else 0)
+            labels = {str(mark).upper() for mark, _ in turns}
+            role_markers = {"dj": "A", "cohost": "B", "caller": "C",
+                            "third": "D", "caller2": "E"}
+            labels.update(role_markers.get(normalize_role(role), "")
+                          for role in (order.get("missing_roles") or []))
+            labels.discard("")
+            prompt = (
+                "Write ONLY an additional " + str(need) + " or more substantial "
+                + ("turns with at least " + str(word_goal) + " spoken words in total. "
+                   if word_goal else "turns ")
+                + "for this " + road + " radio conversation. The "
+                "station will insert your new turns before its existing final "
+                "sign-off; do not copy, summarize, or rewrite the old turns. "
+                "Continue its specific facts, guests, caller, paintings and "
+                "narrative. Use only these speaker markers: " + ", ".join(sorted(labels))
+                + ". Missing roles to include: "
+                + ", ".join(str(x) for x in (order.get("missing_roles") or []))
+                + ". Output only new MARKER: speech lines, no stage directions "
+                  "or commentary.\n\nCONTEXT:\n" + old_script[-7000:])
+            alt_job_put(job, state="writing", why="expanding the bound round")
+            said = str(await ask_model(prompt, limit=min(6500, max(1800, need * 230)),
+                                       mark={"kind": "writers room", "why": "bound structural repair"}) or "")
+            fresh = banter_turns(said, str(source.get("caller_name") or ""),
+                                 str(source.get("caller2_name") or ""))
+            offered_words = sum(len(re.findall(r"[^\W_]+(?:'[^\W_]+)*", text))
+                                for _, text in fresh)
+            if len(fresh) < need or offered_words < word_goal:
+                row["quality_offer_failures"] = int(row.get("quality_offer_failures") or 0) + 1
+                row["quality_last_fault"] = {"wanted_turns": need,
+                                             "offered_turns": len(fresh),
+                                             "wanted_words": word_goal,
+                                             "offered_words": offered_words,
+                                             "offered_chars": len(said)}
+                pantry_order_quality_save(road)
+                alt_job_put(job, state="refused", why="the writing offer had "
+                            + str(len(fresh)) + " of " + str(need) + " turns and "
+                            + str(offered_words) + " of " + str(word_goal) + " words")
+                return
+            present_roles = {normalize_role(mark) for mark, _ in turns + fresh}
+            missing_roles = [str(role) for role in (order.get("missing_roles") or [])
+                             if normalize_role(role) not in present_roles]
+            if missing_roles:
+                row["quality_offer_failures"] = int(row.get("quality_offer_failures") or 0) + 1
+                row["quality_last_fault"] = {"missing_roles": missing_roles,
+                                             "offered_turns": len(fresh)}
+                pantry_order_quality_save(road)
+                alt_job_put(job, state="refused", why="the rewrite still lacks: "
+                            + ", ".join(missing_roles))
+                return
+            row["quality_attempts"] = int(row.get("quality_attempts") or 0) + 1
+            row["quality_offer_failures"] = 0
+            pantry_order_quality_save(road)
+            draft = copy.deepcopy(source)
+            for key in ("takes", "keys", "prepared", "preparing", "frozen",
+                        "made", "seconds", "chunks", "partial", "yielded",
+                        "yielded_at", "script_plain", "script_tinted", "production",
+                        "cue_map", "missing_voice_chunks", "quality_draft",
+                        "tint", "tint_progress", "tint_revalidation", "tint_tried",
+                        "use", "brief_plain_ok", "review_cancel_pending",
+                        "prep_turns", "off_brief"):
+                draft.pop(key, None)
+            expanded = turns[:-1] + fresh + turns[-1:] if turns else fresh
+            draft["script"] = "\n".join("%s: %s" % (m, t) for m, t in expanded)
+            draft["freshened"] = True
+            draft["prep_kind"] = road
+            draft["quality_source"] = sid
+            row["quality_draft"] = draft
+            row["quality_commit_id"] = str(order.get("commit_id") or "")
+            pantry_order_quality_save(road)
+        if not pantry_window() or prep_should_stop():
+            alt_job_put(job, state="waiting for recording", why="the recording room is busy")
+            return
+        alt_job_put(job, state="recording", why="cutting the expanded script")
+        _PREP_DEADLINE[0] = time.time() + max(20.0, prep_room_left())
+        try:
+            await larder_prepare(draft)
+        finally:
+            _PREP_DEADLINE[0] = 0.0
+            pantry_order_quality_save(road)
+        if draft.get("off_brief") or draft.get("review_cancel_pending"):
+            row.pop("quality_draft", None)
+            pantry_order_quality_save(road)
+            alt_job_put(job, state="refused", why="the expanded script failed review")
+            return
+        if not dialogue_row_ready(road, {"entry": draft}):
+            alt_job_put(job, state="waiting for recording", why="the new take is not fully playable")
+            return
+        final_turns = banter_turns(str(draft.get("script") or ""),
+                                   str(draft.get("caller_name") or ""),
+                                   str(draft.get("caller2_name") or ""))
+        original_turns = banter_turns(str(source.get("script") or ""),
+                                      str(source.get("caller_name") or ""),
+                                      str(source.get("caller2_name") or ""))
+        final_roles = {normalize_role(mark) for mark, _ in final_turns}
+        if (len(final_turns) < len(original_turns) + max(1, int(order.get("add_turns") or 1))
+                or any(normalize_role(role) not in final_roles
+                       for role in (order.get("missing_roles") or []))):
+            row["quality_last_fault"] = {
+                "source_turns": len(original_turns), "draft_turns": len(final_turns),
+                "added_turns": max(1, int(order.get("add_turns") or 1)),
+                "repair_attempts": int(draft.get("quality_repair_attempts") or 0)}
+            if int(draft.get("quality_repair_attempts") or 0) < 2:
+                draft["quality_repair_needed"] = True
+                pantry_order_quality_save(road)
+                alt_job_put(job, state="waiting for repair", why="the recorded rewrite needs a structural repair")
+                return
+            row.pop("quality_draft", None)
+            pantry_order_quality_save(road)
+            alt_job_put(job, state="refused", why="the recorded rewrite still owes structure")
+            return
+        body_due = max(0.0, float(order.get("body_short_seconds") or 0.0))
+        target_seconds = float(source.get("seconds") or 0.0) + body_due
+        if body_due > 1.0 and float(draft.get("seconds") or 0.0) + 1.0 < target_seconds:
+            row["quality_last_fault"] = {
+                "recorded_seconds": float(draft.get("seconds") or 0.0),
+                "target_seconds": target_seconds,
+                "remaining_seconds": target_seconds - float(draft.get("seconds") or 0.0)}
+            if int(draft.get("quality_repair_attempts") or 0) < 2:
+                draft["quality_repair_needed"] = True
+                pantry_order_quality_save(road)
+                alt_job_put(job, state="waiting for repair", why="the recorded rewrite still owes airtime")
+                return
+            row.pop("quality_draft", None)
+            pantry_order_quality_save(road)
+            alt_job_put(job, state="refused", why="the recorded rewrite still owes airtime")
+            return
+        floor = max(float(order.get("allocated_seconds") or 0),
+                    float(source.get("seconds") or 0))
+        if float(draft.get("seconds") or 0) + 1 < floor:
+            row.pop("quality_draft", None)
+            pantry_order_quality_save(road)
+            alt_job_put(job, state="refused", why="the new take is shorter than the bound audio")
+            return
+        target = await asyncio.to_thread(pantry_order_quality_target, order)
+        if not target or target[1] is not row or dialogue_entry(row) is not source:
+            alt_job_put(job, state="refused", why="the binding changed before replacement")
+            return
+        if road == "banter":
+            identity = {key: row.get(key) for key in (
+                "sid", "at", "priority", "quality_attempts", "quality_successes")}
+            row.clear()
+            row.update(draft)
+            row.update(identity)
+        else:
+            row["entry"] = draft
+            row["seconds"] = float(draft.get("seconds") or 0)
+        row["quality_attempts"] = 0
+        row["quality_successes"] = int(row.get("quality_successes") or 0) + 1
+        row.pop("quality_draft", None)
+        row.pop("quality_last_fault", None)
+        _INVENTORY_PLAN["at"] = 0.0
+        _COMMITS["at"] = 0.0
+        pantry_order_quality_save(road)
+        try:
+            audit = await asyncio.to_thread(commitment_inventory_plan, 1.0, True)
+            selected = any(i.get("id") == str(order.get("item_id") or "")
+                           and i.get("row") is row and i.get("ready")
+                           for i in (audit.get("selected") or []))
+        except Exception:  # noqa: BLE001
+            selected = False
+        alt_job_put(job, state="done", made=1, new=[sid], selected=selected,
+                    why="the exact bound row was upgraded"
+                    if selected else "upgraded, but the schedule moved before audit")
+        pipeline_log("lookahead", "the bound %s round %s was upgraded in place" % (road, sid))
+    except Exception as exc:  # noqa: BLE001
+        alt_job_put(job, state="failed", why="%s: %s" % (type(exc).__name__, str(exc)[:140]))
+    finally:
+        _PANTRY_ORDER_QUALITY_ACTIVE.discard(sid)
 
 
 def pantry_orders_state() -> dict[str, Any]:
@@ -54126,6 +54559,19 @@ def pantry_orders_state() -> dict[str, Any]:
     return out
 
 
+def pantry_order_clock_ready() -> bool:
+    """Do not spend the first commission pass before System2 publishes its slot."""
+    if not _RADIO.get("on"):
+        return True
+    runtime = globals().get("_system2")
+    try:
+        if not callable(runtime) or not runtime().enabled:
+            return True
+    except Exception:  # noqa: BLE001
+        return True
+    return bool((_RADIO.get("sched_pos") or {}).get("started"))
+
+
 async def pantry_orders_tick() -> dict[str, Any]:
     # 2026-09-15 (#1191): recorded as a SUMMONS against the coordinator
     # that fired it, and then as a pass of its own. See ORCH_DOORS.
@@ -54148,6 +54594,8 @@ async def pantry_orders_tick() -> dict[str, Any]:
         mode = pantry_orders_mode()
         if mode == track_talk_segment.MODE_OFF:
             return out
+        if not pantry_order_clock_ready():
+            return out
         now = time.time()
         if now - float(_PANTRY_ORDER_AT[0] or 0) < float(PANTRY_ORDER_EVERY):
             return out
@@ -54161,6 +54609,7 @@ async def pantry_orders_tick() -> dict[str, Any]:
         order["mode"] = mode
         order["placed"] = 0
         order["recording_dispatched"] = 0
+        order["quality_dispatched"] = 0
         order["schedule_handoff"] = handoff
         out = order
         if mode != track_talk_segment.MODE_AIR:
@@ -54197,7 +54646,7 @@ async def pantry_orders_tick() -> dict[str, Any]:
         try:
             active = [j for j in _ALT_JOBS.values()
                       if str(j.get("state") or "")
-                      in ("queued", "waiting", "writing")]
+                      in ("queued", "waiting", "writing", "recording")]
             live = len(active)
             active_roads = {str(j.get("kind") or "") for j in active}
         except Exception:  # noqa: BLE001
@@ -54208,6 +54657,57 @@ async def pantry_orders_tick() -> dict[str, Any]:
         except Exception:  # noqa: BLE001
             window = ""
         order["window"] = window
+        for repair in (handoff.get("quality") or []):
+            road = str(repair.get("road") or "")
+            sid = str(repair.get("sid") or "")
+            if any(normalize_role(role) not in
+                   {normalize_role(mark) for mark in "ABCDE"}
+                   for role in (repair.get("missing_roles") or [])):
+                repair["held"] = "the script marker parser cannot evidence the missing role"
+                continue
+            if live >= ALT_GEN_LIVE:
+                repair["held"] = "the writing room is at its ticket limit"
+                continue
+            if road in active_roads or sid in _PANTRY_ORDER_QUALITY_ACTIVE:
+                repair["held"] = "a ticket for this road or round is active"
+                continue
+            target = (await asyncio.to_thread(pantry_order_quality_target, repair)
+                      if sid else None)
+            if not target:
+                repair["held"] = "the exact future binding is no longer playable"
+                repair["target_check"] = await asyncio.to_thread(
+                    pantry_order_quality_target_reason, repair)
+                continue
+            bound_row = target[1]
+            if (int(bound_row.get("quality_attempts") or 0) >= 2
+                    and int(bound_row.get("quality_protocol") or 0) >= QUALITY_REPAIR_VERSION
+                    and not isinstance(bound_row.get("quality_draft"), dict)):
+                repair["held"] = "two bounded writing attempts were already spent"
+                continue
+            if (int(bound_row.get("quality_offer_failures") or 0) >= 3
+                    and int(bound_row.get("quality_protocol") or 0) >= QUALITY_REPAIR_VERSION
+                    and not isinstance(bound_row.get("quality_draft"), dict)):
+                repair["held"] = "three unusable writing offers were already spent"
+                continue
+            if isinstance(bound_row.get("quality_draft"), dict) and not pantry_window():
+                repair["held"] = "the partial replacement awaits a recording window"
+                continue
+            job = "qlt" + uuid.uuid4().hex[:9]
+            _PANTRY_ORDER_QUALITY_ACTIVE.add(sid)
+            alt_job_put(job, kind=road, count=1, state="queued", made=0,
+                        source=sid, commit_id=repair.get("commit_id"),
+                        ordered="structural quality", why=repair.get("why"))
+            try:
+                fire_and_forget(pantry_order_quality(job, repair))
+            except Exception:  # noqa: BLE001
+                _PANTRY_ORDER_QUALITY_ACTIVE.discard(sid)
+                alt_job_put(job, state="failed", why="the quality ticket could not start")
+                continue
+            repair["job"] = job
+            live += 1
+            active_roads.add(road)
+            order["quality_dispatched"] = 1
+            break
         for row in (order.get("orders") or []):
             road = str(row.get("road") or "")
             items = max(1, min(int(ALT_GEN_MOST),
@@ -54247,7 +54747,7 @@ async def pantry_orders_tick() -> dict[str, Any]:
             order["placed"] = int(order.get("placed") or 0) + 1
         _PANTRY_ORDER_LAST.clear()
         _PANTRY_ORDER_LAST.update(order)
-        if order.get("placed"):
+        if order.get("placed") or order.get("quality_dispatched"):
             note_action("the orchestrator commissioned the pantry - "
                         + str(order.get("say") or "")[:200])
         pipeline_log(
@@ -68469,6 +68969,8 @@ def _upstairs_audio_write(wav_bytes: bytes, page_id: str) -> str | None:
 
 async def dj_upstairs_page(row: dict[str, Any] | None = None) -> bool:
     """Play the manager's recorded page, then let the pair answer it."""
+    if str(_RADIO.get("voice_to") or "box") == "here" and upstairs_page_backlogged():
+        return False
     made = row or await dj_upstairs_write()
     if not made:
         return False
@@ -68500,6 +69002,9 @@ async def dj_upstairs_page(row: dict[str, Any] | None = None) -> bool:
     delivery_id = ""
     page_clip: dict[str, Any] = {}
     if to == "here" or (to in ("box", "both") and not box_accepted):
+        if upstairs_page_backlogged():
+            admission_withdraw(occurrence, "the page already holds manager audio ahead")
+            return False
         page_clip = {
             "url": f"{path}?t={sig}", "text": spoken,
             "remember_text": spoken, "seconds": seconds,
@@ -68569,9 +69074,19 @@ def manager_prepared_page() -> dict[str, Any] | None:
     return None
 
 
+UPSTAIRS_PAGE_MAX_AHEAD = 60.0
+
+
+def upstairs_page_backlogged() -> bool:
+    """Keep repeatable manager pages on their shelf while the page is sold."""
+    return float(_PAGE_AIR_UNTIL[0] or 0) - time.time() > UPSTAIRS_PAGE_MAX_AHEAD
+
+
 async def dj_manager_scheduled_round(track: dict[str, Any] | None = None,
                                      *, shelf_only: bool = False) -> bool:
     """Give a scheduled memo the boss's recorded voice, then its fallback."""
+    if str(_RADIO.get("voice_to") or "box") == "here" and upstairs_page_backlogged():
+        return False
     try:
         page = await asyncio.to_thread(manager_prepared_page)
     except Exception:  # noqa: BLE001
@@ -68619,8 +69134,9 @@ async def upstairs_clock() -> None:
             continue
         pending = False
         try:
-            await dj_upstairs_page()
+            pending = not await dj_upstairs_page()
         except Exception as exc:            # noqa: BLE001
+            pending = True
             pipeline_log("drop", f"a page from upstairs died: {exc}"[:200])
 
 
@@ -69608,6 +70124,11 @@ async def _air_produced_ad(entry: dict[str, Any], on_handoff: Any = None) -> boo
         return False
     _air_at = time.time()                                         # #892
     path, sig = f"/ads-audio/{name}", media_sign(name)
+    seconds = await _clip_seconds_async(path)
+    if seconds <= 0:
+        pipeline_log("air", "the produced advert has no measurable audio duration",
+                     extra=name[:80])
+        return False
     label = "📣 " + (entry.get("product") or "a produced spot")
     # #731: what is being SOLD right now, so the booth can light the tile of
     # the spot actually on air. A stored rerun never set this, which is why a
@@ -69634,20 +70155,31 @@ async def _air_produced_ad(entry: dict[str, Any], on_handoff: Any = None) -> boo
     # credit a temporary label identity and then credit the row again later.
     page_delivery = ""
     box_played = False
+    box_dispatched = False
     # --- broadcast admission (#1339) ---
     # The spot is one finished audio object and it exists on disk - that
     # was checked at the top of this function - so the gate can name it
     # before either road is asked to carry it.
     _ad_occurrence = await asyncio.to_thread(
         admission_admit_line,
-        {"path": path, "sig": sig}, who="dj", kind="ad",
+        {"path": path, "sig": sig, "seconds": seconds}, who="dj", kind="ad",
         text=str(entry.get("text") or label), name=label,
         line_id=str(booth_row.get("id") or ""), producer="_air_produced_ad")
     # --- broadcast admission (#1339) --- end
+    def _ad_box_dispatch() -> None:
+        nonlocal box_dispatched
+        box_dispatched = True
+        playout_tell("dispatched", str(_ad_occurrence or "")
+                     or ("box-ad:" + str(booth_row.get("id") or "")),
+                     route="box", starts_at=time.time(), seconds=seconds,
+                     producer="_air_produced_ad", lane="advert", media=path,
+                     label=label, lines=1)
+
     try:
         if page_carries_live(ad_to, ad_to in ("box", "both"), box_down):
             page_delivery = page_feed_append({
                 "url": f"{path}?t={sig}", "text": label,
+                "seconds": seconds,
                 "voice": entry.get("voice") or "", "speech": True,
                 "who": "dj", "kind": "ad", "row_id": str(booth_row.get("id") or ""),
                 "remember_text": str(entry.get("text") or label),
@@ -69655,7 +70187,12 @@ async def _air_produced_ad(entry: dict[str, Any], on_handoff: Any = None) -> boo
             if page_delivery and callable(on_handoff):
                 on_handoff()
         if ad_to in ("box", "both"):
-            box_played = bool(await _play_on_box(path, sig))
+            box_played = bool(await _play_on_box(
+                path, sig, on_dispatch=_ad_box_dispatch))
+            if box_dispatched:
+                playout_tell("ended", str(_ad_occurrence or "")
+                             or ("box-ad:" + str(booth_row.get("id") or "")),
+                             route="box", why="the box handoff returned")
             if box_played and not page_delivery and callable(on_handoff):
                 on_handoff()
     finally:
@@ -100447,7 +100984,10 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                 # actually carrying the stream. Page-routed streams start their
                 # booth clock in djVoiceNext.onplaying, because a browser queue
                 # can lag behind the server handoff.
-                if to_box:
+                _box_dispatched = False
+                def _box_dispatch() -> None:
+                    nonlocal _box_dispatched
+                    _box_dispatched = True
                     _stream_now_set(rows, length)
                     playout_tell(                          # [#1218]
                         "dispatched", str(_round_occurrence or "")
@@ -100488,7 +101028,8 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                         return []
                     if ready_meta.get("_system2") and callable(on_handoff):
                         on_handoff()  # submitted; only the audible ACK credits it
-                    played = await _play_on_box(one["path"], one["sig"])
+                    played = await _play_on_box(one["path"], one["sig"],
+                                                on_dispatch=_box_dispatch)
                     # #807: _LAST_PLAYOUT is a SHARED meter — during a
                     # minutes-long burst, any concurrent ack or sting
                     # stamps it with ITS key, so the burst's verdict read
@@ -100507,6 +101048,10 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                             played_ok = bool(lp.get("ok"))
                         else:
                             played_ok = True
+                    if _box_dispatched:
+                        playout_tell("ended", str(_round_occurrence or "")
+                                     or ("box:" + str(one.get("sig") or "")),
+                                     route="box", why="the box handoff returned")
                     if not played_ok:
                         # It never went out — or came back short — so the booth
                         # must not confidently follow a call nobody can hear.
@@ -102149,6 +102694,7 @@ async def dj_banter(track: dict[str, Any] | None = None,
         # at zero, and then this is today byte for byte: the prose that
         # was here stays as the fallback.
         _beat_sheet, _dice_rolls = "", []
+        _scenario_direction = ""
         _turn_source: dict[int, str] = {}
         # [#1386] THE SUBJECT CHANGES PART WAY THROUGH.
         #
@@ -102205,6 +102751,13 @@ async def dj_banter(track: dict[str, Any] | None = None,
                     speakerbox=str(_cm.get("speakerbox_text")
                                    or (seed or {}).get("text") or ""),
                     story=bool(_cm.get("story")))
+                if isinstance(_cm.get("scenario"), dict):
+                    try:
+                        _scenario_direction = call_scenario_clause(_cm["scenario"])
+                        _beat_sheet += "\n" + _scenario_direction
+                    except ValueError as _scenario_error:
+                        pipeline_log("call", "the scenario direction was skipped: "
+                                     + str(_scenario_error)[:160])
                 _dice_rolls = []
                 raise _CallSheetDone
             _beat_sheet, _dice_rolls = banter_beat_sheet(
@@ -102691,6 +103244,7 @@ async def dj_banter(track: dict[str, Any] | None = None,
                     "final turn is one host answering that and saying thank "
                     "you or goodbye. "
                     "Do not reuse any recent premise, conflict or landing."
+                    + ("\n" + _scenario_direction if _scenario_direction else "")
                     + call_novelty_prompt(str(                      # #1157
                         ((call_meta or {}).get("plot") or {}).get("id")
                         or ""))
@@ -102810,6 +103364,15 @@ async def dj_banter(track: dict[str, Any] | None = None,
                 extra=str(_topic_tc["subject"])[:300])
         except Exception:  # noqa: BLE001
             pass
+        if isinstance(call_meta.get("scenario"), dict):
+            try:
+                call_meta["scenario_report"] = call_conclusion_report(
+                    call_meta["scenario"],
+                    banter_turns(script or "", caller_name, caller2_name),
+                    source="draft")
+            except ValueError as exc:
+                pipeline_log("call", "the scenario conclusion could not be checked: "
+                             + str(exc)[:160])
     _seed_forced = False                                    # #862
     _seed_put = ""
     if not _system2_job and not caller_name and seed.get("text"):
@@ -103956,6 +104519,64 @@ def _turn_source_map(entry: dict[str, Any]) -> dict[int, str]:
     return {k: v for k, v in out.items() if v}
 
 
+def _call_scenario_air_target(entry: dict[str, Any],
+                              mark: dict[str, Any]) -> tuple[str, list[dict[str, Any]]] | None:
+    """Identify this call's ordered feed lines before consulting hearing receipts."""
+    call = entry.get("call") if isinstance(entry, dict) else None
+    if not isinstance(call, dict) or not isinstance(call.get("scenario"), dict):
+        return None
+    had = mark.get("had") or set()
+    fresh = [row for row in (_RADIO.get("chat") or [])
+             if isinstance(row, dict) and str(row.get("id") or "") not in had]
+    caller = str(entry.get("caller_name") or "").casefold()
+    caller_rows = [row for row in fresh
+                   if row.get("who") == "caller" and row.get("sid")
+                   and str(row.get("name") or "").casefold() == caller]
+    if not caller_rows:
+        return None
+    sid = str(caller_rows[-1]["sid"])
+    expected = [{"line_id": str(row.get("id") or ""),
+                 "who": str(row.get("who") or ""), "kind": "dialogue",
+                 "turn": row.get("turn")}
+                for row in fresh if row.get("sid") == sid
+                and row.get("who") in ("dj", "cohost", "third", "caller", "caller2")]
+    return (sid, expected) if expected else None
+
+
+async def _call_scenario_air_poll(entry: dict[str, Any], sid: str,
+                                  expected: list[dict[str, Any]], since: float) -> None:
+    """Wait off the broadcast path for durable page-heard call evidence."""
+    plan = (entry.get("call") or {}).get("scenario")
+    if not isinstance(plan, dict):
+        return
+    report: dict[str, Any] = {}
+    for attempt in range(9):
+        try:
+            receipts = await airlog_rows_async(since - 5.0, time.time() + 5.0,
+                                               rounds="caller", quiet=True)
+            report = call_aired_conclusion_report(
+                plan, receipts, sid=sid, expected_lines=expected)
+            if report.get("status") in ("matched", "missed"):
+                break
+        except (TypeError, ValueError) as exc:
+            report = {"sid": sid, "status": "insufficient_evidence",
+                      "aired_verified": False,
+                      "soft_faults": [str(exc)[:200]]}
+            break
+        if attempt < 8:
+            await asyncio.sleep(30)
+    report.setdefault("sid", sid)
+    report["at"] = time.time()
+    report["caller"] = str(entry.get("caller_name") or "")[:100]
+    (entry.get("call") or {})["scenario_air_report"] = report
+    history = _RADIO.setdefault("call_scenario_reports", [])
+    history.append(report)
+    del history[:-32]
+    pipeline_log("call", "scenario conclusion after air: "
+                 + str(report.get("status") or "unknown"),
+                 extra=str(report.get("sid") or "")[:48])
+
+
 async def _banter_air(entry: dict[str, Any],
                       track: dict[str, Any] | None, *,
                       ready_takes: list[dict[str, Any]] | None = None,
@@ -104238,6 +104859,14 @@ async def _banter_air(entry: dict[str, Any],
         round_air_mark(entry, _sp_mark, spoken)
     except Exception:  # noqa: BLE001
         pass
+    try:
+        target = _call_scenario_air_target(entry, _sp_mark)
+        if target:
+            asyncio.create_task(_call_scenario_air_poll(
+                entry, target[0], target[1], float(_sp_mark.get("at") or time.time())))
+    except Exception as exc:  # noqa: BLE001
+        pipeline_log("call", "scenario air review could not start: "
+                     + type(exc).__name__)
     if ready_takes is None and entry.get("seek_verdict") and spoken:
         asyncio.create_task(_sfx_verdict(spoken[-1]))
     if spoken:
@@ -105617,6 +106246,21 @@ async def dj_caller(track: dict[str, Any] | None = None,
         "case_id": str(_case.get("id") or ""),
         "case": str(_case.get("title") or ""),
     }
+    try:
+        _scenario_catalog = await asyncio.to_thread(
+            load_scenario_catalog, data_path("call_scenarios.json"))
+        _scenario = select_call_scenario(
+            _scenario_catalog,
+            target_heat=case_heat(_case) / 3.0 if _case else None)
+        if _scenario:
+            _call_meta["scenario"] = call_path_draw(
+                _scenario, caller_name=_cname,
+                topic=str(_call_meta.get("topic") or ""),
+                case_outcome=str(rule.get("text") or ""))
+            _call_meta["scenario_catalog"] = str(_scenario_catalog.get("source") or "")
+    except (OSError, TypeError, ValueError) as exc:
+        pipeline_log("call", "the scenario draw was skipped: "
+                     + str(exc)[:160])
     if bank_to is None and _cname:
         # #673/#703: the booth says who is on which line. The banked road
         # posts nothing — nothing is airing yet; its card goes up when the
@@ -130675,7 +131319,7 @@ async def script_production_api(limit: int = Query(default=12, ge=1, le=200),
         "roads disagreed about, or 'on' to carry the assembled cue map and "
         "identities to air. Add 'continuous' for the continuous-take road, "
         "'budget=90' for the seconds one round may spend, 'every=180' for "
-        "the seconds between two productions and 'lines=48' for the longest "
+        "the seconds between two productions and 'lines=72' for the longest "
         "round it will attempt. It is re-read within three seconds; no "
         "restart.")
     return payload
@@ -135460,6 +136104,39 @@ async def api_call_sheet(
     return await call_sheet(max(0.25, min(24.0, float(hours or 4.0))))
 
 
+@app.get("/api/call/scenarios")
+async def api_call_scenarios_get(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_read_auth(authorization)
+    return await asyncio.to_thread(
+        load_scenario_catalog, data_path("call_scenarios.json"))
+
+
+@app.get("/api/call/scenarios/reports")
+async def api_call_scenarios_reports(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_read_auth(authorization)
+    return {"reports": list(_RADIO.get("call_scenario_reports") or [])[-32:]}
+
+
+@app.put("/api/call/scenarios")
+async def api_call_scenarios_put(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_auth(authorization)
+    payload = await request.json()
+    try:
+        return await asyncio.to_thread(
+            save_scenario_catalog, data_path("call_scenarios.json"), payload)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except OSError as exc:
+        raise HTTPException(status_code=503, detail="scenario catalog unavailable") from exc
+
+
 @app.get("/api/schedule/brief-audit")
 async def api_brief_audit(
     authorization: str | None = Header(default=None),
@@ -137738,6 +138415,15 @@ def orch_glass_state(most: int = 48) -> dict[str, Any]:
             "left_seconds": order.get("left_seconds"),
             "say": order.get("say"),
         }
+        handoff = order.get("schedule_handoff") or {}
+        out["commission"]["quality_dispatched"] = int(order.get("quality_dispatched") or 0)
+        out["commission"]["quality"] = [{
+            **{key: repair.get(key) for key in (
+                "road", "commit_id", "item_id", "sid", "due_in", "add_turns",
+                "speech_short_seconds", "body_short_seconds", "held", "target_check", "job")},
+            "state": str((_ALT_JOBS.get(str(repair.get("job") or "")) or {}).get("state") or ""),
+        } for repair in list(handoff.get("quality") or [])[:3]
+            if isinstance(repair, dict)]
     except Exception:  # noqa: BLE001
         out["commission"] = {}
     try:
@@ -138649,12 +139335,13 @@ def _director_topic_from_prompt(prompt: str) -> str:
         r"THE TOPIC, DROPPED INTO THIS ROUND[^:]*:\s*[\"']([^\"']+)",
         r"THE SUBJECT(?: OF THIS CALL)?[^:]*:\s*([^\n]+)",
         r"THE PHONE'S SUBJECT[^:]*:\s*([^\n]+)",
-        r"ANSWER THIS[^\n]*\n\s*[\"']([^\"']+)",
     )
     for pattern in patterns:
         found = re.search(pattern, text, re.I)
         if found:
-            return topic_subject(found.group(1))[:600]
+            subject = re.split(r"\s+Whoever rings this entry\b", found.group(1),
+                               maxsplit=1, flags=re.I)[0]
+            return topic_subject(subject)[:600]
     return ""
 
 
@@ -138708,6 +139395,39 @@ def _director_sfx_plan(turn_count: int) -> list[dict[str, Any]]:
 DIRECTOR_LINE_SECONDS = 14.0
 DIRECTOR_EVENT_SECONDS = 10.0
 DIRECTOR_RECORD_BOOKEND_LINES = 2
+
+
+def _director_contract_review(candidate: dict[str, Any],
+                              turns: list[tuple[str, str]],
+                              topic_review: dict[str, Any]) -> dict[str, Any]:
+    """Review the allocated recording, not an operator's approval of it."""
+    lines = list(candidate.get("lines") or [])
+    spoken = [" ".join(str(text or "").split()) for _seat, text in turns]
+    recorded = [" ".join(str(row.get("text") or "").split())
+                for row in lines if isinstance(row, dict)]
+    proofs = bool(lines) and all(
+        isinstance(row, dict)
+        and re.fullmatch(r"[a-fA-F0-9]{64}", str(row.get("audio_hash") or ""))
+        and float(row.get("seconds") or 0) > 0 for row in lines)
+    seconds = float(candidate.get("seconds") or 0)
+    checks = {
+        "candidate_ready": candidate.get("ready") is True,
+        "candidate_eligible": candidate.get("eligible") is True
+                              and not candidate.get("blocked_reasons"),
+        "recorded_lines": proofs,
+        # A single scripted turn may be recorded as several adjacent clips.
+        "words_match_recording": bool(spoken) and " ".join(spoken) == " ".join(recorded),
+        "duration_matches_recording": proofs and seconds > 0
+                                      and abs(seconds - sum(float(row["seconds"])
+                                                          for row in lines)) <= 0.5,
+        "topic_continuity": (topic_review.get("ok") is True
+                             if topic_review.get("checked") else True),
+        "not_expired": (not float(candidate.get("expires_at") or 0)
+                        or float(candidate["expires_at"]) > time.time()),
+    }
+    return {"checked": True, "ok": all(checks.values()),
+            "basis": "recorded-contract", "checks": checks,
+            "topic_checked": bool(topic_review.get("checked"))}
 
 
 def _director_script_lines(script: dict[str, Any]) -> list[dict[str, Any]]:
@@ -138768,6 +139488,10 @@ def director_orchestration(kind: str, label: str, owns_seconds: float,
     if str(kind or "") == "record":
         line_target = DIRECTOR_RECORD_BOOKEND_LINES
         event_target = DIRECTOR_RECORD_BOOKEND_LINES
+    elif str(kind or "") == "ad":
+        # A produced spot is one complete audio event, not fourteen-second
+        # dialogue turns. Its measured duration still has to fill the slot.
+        line_target = event_target = 1
     else:
         line_target = max(1, int((owns + DIRECTOR_LINE_SECONDS - 0.001)
                                  // DIRECTOR_LINE_SECONDS)) if owns else 1
@@ -138786,18 +139510,25 @@ def director_orchestration(kind: str, label: str, owns_seconds: float,
     written = bool(spoken or script.get("drafts") or script.get("draft_head"))
     recorded = bool(str(script.get("state") or "") == "bound"
                     and float(script.get("seconds") or 0) > 0)
-    reviewed = bool(review.get("approved") or review.get("seen")
-                    or review.get("tint_approved"))
+    manual_reviewed = bool(review.get("approved") or review.get("seen")
+                           or review.get("tint_approved"))
+    automatic_review = script.get("auto_review") or {}
+    automatically_reviewed = bool(automatic_review.get("checked")
+                                  and automatic_review.get("ok"))
+    reviewed = manual_reviewed or automatically_reviewed
     scheduled = owns > 0
     executed = str(state or "").startswith("aired") or str(state or "").startswith("went by")
-    ready = bool(recorded and line_short <= 0 and event_short <= 0
-                 and seconds_short <= max(12.0, owns * 0.08))
+    content_ready = bool(recorded and line_short <= 0 and event_short <= 0
+                         and seconds_short <= max(12.0, owns * 0.08))
+    ready = reviewed and content_ready
     if not scheduled:
         status = "unscheduled"
     elif ready:
         status = "ready"
-    elif recorded:
+    elif recorded and not content_ready:
         status = "recorded-short"
+    elif recorded:
+        status = "awaiting-review"
     elif written:
         status = "written"
     elif preparable:
@@ -138839,8 +139570,12 @@ def director_orchestration(kind: str, label: str, owns_seconds: float,
                   "seconds": seconds_short},
         "coverage": coverage,
         "stages": {"written": written, "reviewed": reviewed,
+                   "manually_reviewed": manual_reviewed,
+                   "automatically_reviewed": automatically_reviewed,
                    "recorded": recorded, "scheduled": scheduled,
                    "executed": executed},
+        "review": {"manual": manual_reviewed,
+                   "automatic": automatic_review},
         "preparable": preparable,
         "status": status,
         "needs": needs[:6],
@@ -138861,6 +139596,11 @@ def _director_variant(raw: dict[str, Any], prompt: str,
               "text": str(said or "")[:900], "candidate": identity}
              for marker, said in banter_turns(script)]
     review = dialogue_topic_review(script, prompt)
+    auto_review = {"checked": bool(turns and review.get("checked")),
+                   "ok": bool(turns and review.get("checked")
+                              and review.get("ok") is True
+                              and candidate.get("eligible") is True),
+                   "basis": "topic-continuity", "recording_checked": False}
     return {"id": identity, "index": index, "turns": turns,
             "seconds": round(float(raw.get("seconds") or candidate.get("seconds") or 0), 2),
             "ready": bool(raw.get("ready", candidate.get("ready", False))),
@@ -138869,6 +139609,7 @@ def _director_variant(raw: dict[str, Any], prompt: str,
             "created_at": float(raw.get("at") or candidate.get("at") or 0),
             "source": _director_source_evidence(candidate),
             "topic": review.get("topic") or "", "topic_review": review,
+            "auto_review": auto_review,
             "sfx_plan": _director_sfx_plan(len(turns))}
 
 
@@ -138880,10 +139621,14 @@ def _director_script(slot: dict[str, Any]) -> dict[str, Any]:
     might be chosen, so it is counted and its opening quoted, never
     presented as the plan."""
     out: dict[str, Any] = {"turns": [], "seconds": 0.0, "state": "nothing",
-                           "candidate": "", "source": "", "drafts": 0,
+                           "candidate": "", "candidates": [],
+                           "performances": [], "source": "", "sources": [],
+                           "drafts": 0,
                            "draft_head": "", "draft_turns": [],
                            "draft_candidates": [], "draft_variants": [],
-                           "selected_candidate": "", "tint": {}}
+                            "selected_candidate": "", "tint": {},
+                            "auto_review": {"checked": False, "ok": False,
+                                            "basis": "none"}}
     try:
         allocations = list(slot.get("allocations") or [])
         drafts = list(slot.get("drafts") or [])
@@ -138911,6 +139656,7 @@ def _director_script(slot: dict[str, Any]) -> dict[str, Any]:
                 out["topic"] = picked_variant["topic"]
                 out["topic_review"] = picked_variant["topic_review"]
                 out["sfx_plan"] = picked_variant["sfx_plan"]
+                out["auto_review"] = picked_variant["auto_review"]
         if not allocations:
             # An edited segment is still THIS segment while it re-records
             # the line that was changed. Show its words and say why it is
@@ -138934,65 +139680,153 @@ def _director_script(slot: dict[str, Any]) -> dict[str, Any]:
                 pass
             out["state"] = "drafts waiting" if drafts else "nothing"
             return out
-        picked = (allocations[0] or {}).get("candidate") or {}
-        out["candidate"] = str(picked.get("id") or "")
-        out["seconds"] = float(picked.get("seconds") or 0)
+        # A duration slot is normally filled by several whole performances.
+        # The director used to expose allocations[0] only, although System2
+        # would dispatch every allocation in order. That made a 239-second
+        # four-performance slot look like one 45-second short script and hid
+        # three quarters of the words from advance review. Preserve the old
+        # top-level fields for callers, but make them describe the complete
+        # scheduled sequence and retain each candidate's local turn index so
+        # an edit still reaches the correct shelf row.
         out["state"] = "bound"
-        src = picked.get("source") or {}
-        if isinstance(src, dict):
-            out["source"] = str(src.get("caller_name")
-                                or src.get("prep_name") or "")
-        # 2026-09-10: THE LIVE ENTRY, NOT THE CANDIDATE'S SNAPSHOT.
-        #
-        # A candidate carries the script as it stood when the candidate was
-        # written; the row on the shelf is what actually gets rendered and
-        # dispatched. Normally identical - but the moment the operator
-        # rewrites a turn they diverge, and reading the snapshot here meant
-        # the room showed the OLD words back to the person who had just
-        # changed them, and then refused their next edit on that turn
-        # because the `was` it handed back no longer matched. Measured on
-        # the first live edit. The room is meant to be one-to-one with what
-        # is going to air, so it reads what is going to air.
-        script = str(picked.get("script") or "")
-        try:
-            live_row = director_segment_row(str(slot.get("id") or ""))
-            if live_row:
-                live_entry = dialogue_entry(live_row[1]) or {}
-                if str(live_entry.get("script") or "").strip():
-                    script = str(live_entry["script"])
-                    out["live"] = True
-                # 2026-09-10: WHAT THE CRYSTAL DID, for the second gate.
-                # "I want to perfect the script before we even get to the
-                # tinting phase, and then we start perfecting the tint as
-                # well" - so the room has to be able to say whether the
-                # words on screen are the tinted ones or the plain ones,
-                # and how much of the round the crystal actually reached.
-                tinted = str(live_entry.get("script_tinted") or "").strip()
-                report = live_entry.get("tint")
-                cov = (report or {}).get("coverage") if isinstance(
-                    report, dict) else {}
-                out["tint"] = {
-                    "is_tinted": bool(tinted and tinted == script.strip()),
-                    "has_tinted_take": bool(tinted),
-                    "covered": int((cov or {}).get("covered") or 0),
-                    "eligible": int((cov or {}).get("eligible") or 0),
-                    "target": int((cov or {}).get("target") or 0),
-                    "met": bool((cov or {}).get("met")),
-                    "must_flow": bool(tint_must_flow(str(slot.get("kind")
-                                                        or ""))),
+        prompt = str(slot.get("prompt") or "")
+        all_sfx: list[dict[str, Any]] = []
+        tint_rows: list[dict[str, Any]] = []
+        source_rows: list[dict[str, Any]] = []
+        topics: list[str] = []
+        turn_offset = 0
+        for performance_index, allocation in enumerate(allocations):
+            picked = ((allocation or {}).get("candidate") or {})
+            candidate = str(picked.get("id") or "")
+            seconds = max(0.0, float(picked.get("seconds") or 0))
+            script = str(picked.get("script") or "")
+            live_entry: dict[str, Any] = {}
+            if candidate:
+                try:
+                    _kind, live_row = alt_find(candidate)
+                    live_entry = dialogue_entry(live_row) or {} if live_row is not None else {}
+                    if str(live_entry.get("script") or "").strip():
+                        out["live"] = True
+                        # A verified allocation names immutable recorded words.
+                        # The shelf row may have been rewritten since binding;
+                        # those new words are not what its audio will say.
+                        if not (picked.get("ready") and picked.get("lines")):
+                            script = str(live_entry["script"])
+                except Exception:  # noqa: BLE001
+                    live_entry = {}
+
+            evidence = _director_source_evidence(picked)
+            source_rows.append(evidence)
+            src = picked.get("source") or {}
+            source_name = ""
+            if isinstance(src, dict):
+                source_name = str(src.get("caller_name")
+                                  or src.get("prep_name") or "")
+            if source_name and source_name not in out["sources"]:
+                out["sources"].append(source_name)
+
+            review = dialogue_topic_review(script, prompt)
+            topic = str(review.get("topic") or "")
+            if topic and topic not in topics:
+                topics.append(topic)
+            parsed_turns = banter_turns(script)
+            contract_review = _director_contract_review(
+                picked, parsed_turns, review)
+            local_turns = []
+            for candidate_index, (marker, said) in enumerate(parsed_turns):
+                turn = {
+                    "seat": str(marker or ""),
+                    "who": _director_seat(str(marker or "")),
+                    "text": str(said or "")[:900],
+                    "candidate": candidate,
+                    "candidate_index": candidate_index,
+                    "performance_index": performance_index,
+                    "performance_start": float(
+                        (allocation or {}).get("planned_start") or 0),
+                    "performance_seconds": round(seconds, 3),
                 }
-        except Exception:  # noqa: BLE001
-            pass
-        for marker, said in banter_turns(script):
-            out["turns"].append({"seat": str(marker or ""),
-                                 "who": _director_seat(str(marker or "")),
-                                 "text": str(said or "")[:900],
-                                 "candidate": out["candidate"]})
-        out["source_evidence"] = _director_source_evidence(picked)
-        out["topic_review"] = dialogue_topic_review(
-            script, str(slot.get("prompt") or ""))
-        out["topic"] = out["topic_review"].get("topic") or ""
-        out["sfx_plan"] = _director_sfx_plan(len(out["turns"]))
+                local_turns.append(turn)
+                out["turns"].append(turn)
+
+            local_sfx = _director_sfx_plan(len(local_turns))
+            for cue in local_sfx:
+                shifted = dict(cue)
+                shifted["after"] = int(cue.get("after") or 0) + turn_offset
+                shifted["candidate"] = candidate
+                shifted["performance_index"] = performance_index
+                all_sfx.append(shifted)
+
+            tinted = str(live_entry.get("script_tinted") or "").strip()
+            report = live_entry.get("tint")
+            cov = (report or {}).get("coverage") if isinstance(
+                report, dict) else {}
+            tint_row = {
+                "candidate": candidate,
+                "is_tinted": bool(tinted and tinted == script.strip()),
+                "has_tinted_take": bool(tinted),
+                "covered": int((cov or {}).get("covered") or 0),
+                "eligible": int((cov or {}).get("eligible") or 0),
+                "target": int((cov or {}).get("target") or 0),
+                "met": bool((cov or {}).get("met")),
+                "must_flow": bool(tint_must_flow(str(slot.get("kind") or ""))),
+            }
+            tint_rows.append(tint_row)
+            out["performances"].append({
+                "index": performance_index,
+                "candidate": candidate,
+                "seconds": round(seconds, 3),
+                "planned_start": float(
+                    (allocation or {}).get("planned_start") or 0),
+                "state": str((allocation or {}).get("state") or ""),
+                "turns": len(local_turns),
+                "turn_start": turn_offset,
+                "turn_end": turn_offset + len(local_turns),
+                "source": source_name,
+                "source_evidence": evidence,
+                "topic": topic,
+                "topic_review": review,
+                "auto_review": contract_review,
+                "tint": tint_row,
+                "sfx_plan": local_sfx,
+            })
+            if candidate:
+                out["candidates"].append(candidate)
+            out["seconds"] += seconds
+            turn_offset += len(local_turns)
+
+        out["candidate"] = out["candidates"][0] if out["candidates"] else ""
+        out["source"] = ", ".join(out["sources"])
+        out["source_evidence"] = source_rows[0] if source_rows else {}
+        out["sources_evidence"] = source_rows
+        out["topic"] = topics[0] if len(topics) == 1 else "; ".join(topics)
+        out["topic_review"] = (out["performances"][0]["topic_review"]
+                               if len(out["performances"]) == 1 else {
+                                   "checked": any(bool(p["topic_review"].get("checked"))
+                                                  for p in out["performances"]),
+                                   "ok": all(p["topic_review"].get("ok") is not False
+                                             for p in out["performances"]),
+                                   "topic": out["topic"],
+                                   "performances": [p["topic_review"]
+                                                    for p in out["performances"]],
+                               })
+        out["sfx_plan"] = all_sfx
+        out["tints"] = tint_rows
+        out["tint"] = (tint_rows[0] if len(tint_rows) == 1 else {
+            "performances": tint_rows,
+            "has_tinted_take": any(r["has_tinted_take"] for r in tint_rows),
+            "is_tinted": bool(tint_rows) and all(r["is_tinted"] for r in tint_rows),
+            "met": bool(tint_rows) and all(r["met"] for r in tint_rows),
+            "must_flow": any(r["must_flow"] for r in tint_rows),
+        })
+        reviews = [p["auto_review"] for p in out["performances"]]
+        out["auto_review"] = {
+            "checked": bool(reviews) and len(reviews) == len(allocations)
+                       and all(r["checked"] for r in reviews),
+            "ok": bool(reviews) and len(reviews) == len(allocations)
+                  and all(r["ok"] for r in reviews),
+            "basis": "recorded-contract", "performances": reviews,
+        }
+        out["seconds"] = round(float(out["seconds"]), 3)
     except Exception:  # noqa: BLE001
         pass
     return out
@@ -139181,7 +140015,8 @@ def director_room(which: int = 0) -> dict[str, Any]:
             state = "nothing behind it"
         if kind != "record":
             talk_seconds += max(0.0, deadline - start)
-        review = script_state(str(slot.get("id") or ""))
+        review = dict(script_state(str(slot.get("id") or "")))
+        review["automatic"] = script.get("auto_review") or {}
         beats = director_beats(kind, str(slot.get("id") or ""))
         if isinstance(script, dict):
             script.setdefault("beats", beats)

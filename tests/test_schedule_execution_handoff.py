@@ -6,6 +6,8 @@ from unittest import mock
 
 import app
 
+_REAL_CLIP_SECONDS_ASYNC = app._clip_seconds_async
+
 
 class ScheduleExecutionHandoffTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
@@ -265,8 +267,10 @@ class ProducedAdHandoffTests(unittest.IsolatedAsyncioTestCase):
             "ad_booth_row": mock.Mock(side_effect=booth),
             "page_carries_live": mock.Mock(return_value=False),
             "page_feed_append": mock.Mock(side_effect=publish),
+            "_clip_seconds_async": mock.AsyncMock(return_value=27.5),
+            "playout_tell": mock.Mock(),
             "_play_on_box": mock.AsyncMock(return_value=False),
-            "_episode_stage": mock.Mock(), "ad_aired": mock.Mock(),
+            "_episode_stage": mock.AsyncMock(), "ad_aired": mock.Mock(),
             "ad_remember": mock.Mock(), "air_remember": mock.Mock(),
             "speakbox_remember": mock.Mock(), "talk_said_now": mock.Mock(),
             "dj_settings": mock.Mock(return_value={}), "ad_pick": mock.Mock(return_value=None),
@@ -307,7 +311,7 @@ class ProducedAdHandoffTests(unittest.IsolatedAsyncioTestCase):
     async def test_cancelled_unaccepted_gap_handoff_releases_claim_and_retains_row(self):
         started = asyncio.Event()
 
-        async def play(*args):
+        async def play(*args, **kwargs):
             started.set()
             await asyncio.Event().wait()
 
@@ -332,6 +336,8 @@ class ProducedAdHandoffTests(unittest.IsolatedAsyncioTestCase):
         app.speakbox_remember.assert_not_called()
         clip = self.clips[0]
         self.assertEqual(clip["row_id"], "ad-row")
+        self.assertEqual(clip["seconds"], 27.5)
+        self.assertEqual(app.page_clip_seconds(clip), 27.5)
         self.assertEqual(clip["remember_text"], self.entry["text"])
         self.assertIsNot(clip["produced_ad"], self.entry)
         app._acknowledge_delivery_lines("delivery", clip)
@@ -340,11 +346,21 @@ class ProducedAdHandoffTests(unittest.IsolatedAsyncioTestCase):
         app.speakbox_remember.assert_called_once()
         app.air_remember.assert_called_once_with(self.entry["text"], "dj", "ad")
 
+    async def test_produced_ad_uses_advert_lane_and_measures_real_file(self):
+        target = self.root / "abcdef.mp3"
+        target.write_bytes(b"mp3 fixture")
+        with mock.patch.object(app, "_clip_seconds", return_value=31.0) as measured:
+            self.assertEqual(await _REAL_CLIP_SECONDS_ASYNC("/ads-audio/abcdef.mp3?t=1"), 31.0)
+        measured.assert_called_once_with(str(target))
+        self.assertEqual(app._admission_lane("/ads-audio/abcdef.mp3", "ad"), "advert")
+        self.assertEqual(app._admission_lane("/ads-audio/abcdef.mp3"), "advert")
+
     async def test_page_receipt_before_box_completion_does_not_double_credit(self):
         app.page_carries_live.return_value = True
         self.radio["voice_to"] = "both"
 
-        async def box(*args):
+        async def box(*args, **kwargs):
+            kwargs["on_dispatch"]()
             app._acknowledge_delivery_lines("delivery", self.clips[0])
             return True
 
@@ -352,6 +368,10 @@ class ProducedAdHandoffTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(await app._air_produced_ad(self.entry))
         app.ad_aired.assert_called_once_with(self.entry, "page")
         app.air_remember.assert_called_once()
+        dispatched = [call for call in app.playout_tell.call_args_list
+                      if call.args and call.args[0] == "dispatched"]
+        self.assertEqual(dispatched[0].kwargs["lane"], "advert")
+        self.assertIn("ended", [call.args[0] for call in app.playout_tell.call_args_list])
 
     async def test_published_handoff_survives_cancel_of_second_route(self):
         app.page_carries_live.return_value = True

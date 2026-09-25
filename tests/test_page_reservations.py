@@ -57,7 +57,8 @@ class PageReservationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(active["broadcast_ms"], 999000)
         self.assertEqual([r["delivery_id"] for r in updates], ["first", "second"])
         self.assertEqual(second["broadcast_ms"] - first["broadcast_ms"], 2000)
-        saved = app.page_recovery_read()
+        with mock.patch.object(app.time, "time", return_value=1000):
+            saved = app.page_recovery_read()
         self.assertEqual([r["delivery_id"] for r in saved], ["first", "second"])
         self.assertEqual(saved[-1]["stream"]["rows"][-1]["text"], "The actual last line.")
 
@@ -204,6 +205,18 @@ class PageReservationTests(unittest.IsolatedAsyncioTestCase):
                     "event": event, "current_time": position, "sequence": sequence,
                     "volume": .4, "audible_volume": .4})
         self.assertEqual(app.page_recovery_read(), [])
+
+    async def test_expired_reservations_are_not_replayed_after_restart(self):
+        audio = self.wav(seconds=2)
+        app.page_recovery_write([
+            {"delivery_id": "stale", "url": str(audio),
+             "broadcast_ms": 100000, "seconds": 2},
+            {"delivery_id": "pending", "url": str(audio),
+             "broadcast_ms": 1008000, "seconds": 2},
+        ])
+        with mock.patch.object(app.time, "time", return_value=1000):
+            self.assertEqual([row["delivery_id"] for row in app.page_recovery_read()],
+                             ["pending"])
 
 
 if __name__ == "__main__":

@@ -65,7 +65,7 @@ class ReadyStreamPlaybackTests(unittest.IsolatedAsyncioTestCase):
             "booth_actor_name": mock.Mock(side_effect=lambda who, *a: who),
             "airlog_round_now": mock.Mock(return_value="gallery"),
             "_model_call_for": mock.Mock(return_value={}),
-            "_episode_stage": mock.Mock(), "_stream_now_set": mock.Mock(),
+            "_episode_stage": mock.AsyncMock(), "_stream_now_set": mock.Mock(),
             "_stream_now_clear": mock.Mock(), "pipeline_log": mock.Mock(),
             "station_flow_event": mock.Mock(), "note_drop": mock.Mock(),
             "air_remember": mock.Mock(), "speakbox_remember": mock.Mock(),
@@ -112,7 +112,8 @@ class ReadyStreamPlaybackTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([r["who"] for r in rows], [t["who"] for t in self.takes])
         self.assertEqual([r["voice"] for r in self.radio["chat"]], [t["voice"] for t in self.takes])
         self.assertEqual([r["kind"] for r in rows], ["gallery"] * 3)
-        self.assertEqual([(r["from"], r["until"]) for r in rows], [(0, 3), (3, 6), (6, 9)])
+        self.assertEqual([(round(r["from"], 1), round(r["until"], 1)) for r in rows],
+                         [(0, 2.7), (2.7, 5.4), (5.4, 8.1)])
         app.air_remember.assert_not_called()
         app.speakbox_remember.assert_not_called()
         self.ack("playing", 0.2, 1)
@@ -154,6 +155,31 @@ class ReadyStreamPlaybackTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(app._BOX_HOLD, [])
         app.air_remember.assert_not_called()
 
+    async def test_box_clock_starts_at_dispatch_not_while_waiting(self):
+        self.radio["voice_to"] = "box"
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def box(*args, **kwargs):
+            entered.set()
+            await release.wait()
+            kwargs["on_dispatch"]()
+            return "verified-box-url"
+
+        app._play_on_box.side_effect = box
+        with mock.patch.object(app, "playout_tell") as playout:
+            task = asyncio.create_task(self.play())
+            try:
+                await asyncio.wait_for(entered.wait(), timeout=10)
+                app._stream_now_set.assert_not_called()
+                self.assertNotIn("dispatched", [call.args[0] for call in playout.call_args_list])
+            finally:
+                release.set()
+            await task
+            app._stream_now_set.assert_called_once()
+            self.assertIn("dispatched", [call.args[0] for call in playout.call_args_list])
+            self.assertIn("ended", [call.args[0] for call in playout.call_args_list])
+
     async def test_cancel_after_page_handoff_does_not_revert_acceptance(self):
         self.radio["voice_to"] = "both"
         self.radio["monitor"] = True  # the explicit simultaneous page/box route
@@ -167,7 +193,8 @@ class ReadyStreamPlaybackTests(unittest.IsolatedAsyncioTestCase):
     async def test_page_then_box_receipt_credits_each_take_and_source_once(self):
         self.radio["voice_to"] = "both"
         self.radio["monitor"] = True
-        async def box(*args):
+        async def box(*args, **kwargs):
+            kwargs["on_dispatch"]()
             self.ack("playing", 0.2, 1)
             self.ack("playing", 3.2, 2)
             self.ack("playing", 6.2, 3)
@@ -208,6 +235,7 @@ class ReadyStreamPlaybackTests(unittest.IsolatedAsyncioTestCase):
             "slot_id": "gallery-slot", "started": 1000.0}
         self.radio["sched_slot"] = {"id": "gallery-slot", "kind": "gallery", "minutes": 1 / 3}
         self.patch("schedule_read", mock.Mock(return_value={"enabled": True}))
+        self.patch("segment_overrun", mock.Mock(return_value=0.0))
         self.patch("VOICE_BROADCAST_LEAD_MS", 1000)
         self.takes[0]["round"]["_ready_slot"] = {"occurrence": "gallery-occurrence",
             "slot_id": "gallery-slot", "kind": "gallery", "deadline": 1020.0}

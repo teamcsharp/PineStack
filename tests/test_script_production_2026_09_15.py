@@ -148,6 +148,7 @@ class SwitchTests(TempCase):
         self.assertEqual(sp.ROAD_CONTINUOUS, la.MODE_CONTINUOUS)
 
     def test_numbers(self):
+        self.assertEqual(sp.parse_settings("on").max_lines, 72)
         got = sp.parse_settings("on budget=12.5 every=7 lines=3")
         self.assertEqual((got.budget_s, got.every_s, got.max_lines),
                          (12.5, 7.0, 3))
@@ -222,6 +223,24 @@ class RoundSourceTests(TempCase):
         self.assertTrue(getattr(source.lines[0], "context_after")
                         .startswith("cohost: "))
 
+    def test_multiple_render_chunks_count_as_one_spoken_turn(self):
+        fixture = Fixture(self.root, plan=[
+            ("Opening half.", "hostvoice", "dj"),
+            ("Closing half.", "hostvoice", "dj"),
+            ("Reply.", "cohostvoice", "cohost"),
+        ])
+        source, refusals = sp.round_source(
+            "round-chunks", fixture.plan, fixture.voices,
+            engine_for=fixture.engine, clip_for=fixture.clip,
+            media_root=fixture.media,
+            line_plan=[{"at": 0, "line_from": 0, "line_to": 2},
+                       {"at": 1, "line_from": 2, "line_to": 3}])
+        self.assertEqual(refusals, [])
+        self.assertEqual([line.turn for line in source.lines], [0, 0, 1])
+        result = fixture.producer("shadow").produce(source)
+        self.assertTrue(result.ok, result.reasons)
+        self.assertEqual(result.supply["turns"], 2)
+
 
 # --------------------------------------------------------------------------
 # the whole road, in shadow
@@ -252,6 +271,19 @@ class ShadowProductionTests(TempCase):
         for cue in self.result.cue_map["cues"]:
             self.assertTrue(cue["exact"])
             self.assertLessEqual(cue["speech_end_sample"], cue["cue_end_sample"])
+
+    def test_supply_uses_measured_body_and_speech_not_file_tail(self):
+        supply = self.producer.round_payload(self.result)["production"]["supply"]
+        cues = self.result.cue_map["cues"]
+        self.assertEqual(supply["body_frames"], self.result.cue_map["body_frames"])
+        self.assertEqual(supply["sample_rate"], RATE)
+        self.assertEqual(supply["speech_frames"], sum(
+            cue["speech_end_sample"] - cue["speech_start_sample"]
+            for cue in cues if cue["kind"] == "line"))
+        self.assertLess(supply["playable_seconds"], self.result.seconds)
+        self.assertLessEqual(supply["recorded_seconds"], supply["playable_seconds"])
+        self.assertEqual(supply["roles"], ["cohost", "dj"])
+        self.assertEqual(supply["lines"], len(self.source.lines))
 
     def test_the_finished_sequence_is_the_frozen_sequence(self):
         script = self.producer.store.load_script(self.result.revision)

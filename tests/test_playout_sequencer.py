@@ -77,6 +77,38 @@ class LinearPlayoutContractTests(unittest.TestCase):
         self.assertEqual(sent["oid"], "occ-round-7")
         self.assertEqual(self.seq.state()["counts"]["released_by_occurrence"], 1)
 
+    def test_older_round_with_reused_sid_does_not_release_newer_audio(self):
+        self.seq.hold("sid:repeat", block=12, seconds=30, lines=4,
+                      road="banter", media="/media/new.wav", audio_ready=True)
+
+        old = self.seq.dispatched(
+            "delivery:old", route="page", starts_at=self.clock(), seconds=20,
+            key="sid:repeat", media="/media/old.wav?t=signature",
+            delivery_id="old-delivery")
+
+        self.assertEqual(old["media"], "old.wav")
+        self.assertEqual(self.seq.head()["media"], "new.wav")
+        self.assertEqual(self.seq.state()["counts"]["release_mismatch"], 1)
+
+        self.seq.dispatched(
+            "delivery:new", route="page", starts_at=self.clock() + 20,
+            seconds=30, key="sid:repeat", media="/media/new.wav?t=signature",
+            delivery_id="new-delivery")
+        self.assertIsNone(self.seq.head())
+        self.assertEqual(self.seq.state()["counts"]["released"], 1)
+
+    def test_occurrence_lookup_cannot_release_a_different_file(self):
+        self.seq.hold("sid:repeat", block=12, seconds=30,
+                      occurrence="occ-12", media="/media/new.wav",
+                      audio_ready=True)
+
+        self.seq.dispatched("occ-12", route="page", starts_at=self.clock(),
+                            seconds=20, key="sid:repeat",
+                            media="/media/old.wav", delivery_id="old-delivery")
+
+        self.assertEqual(self.seq.head()["media"], "new.wav")
+        self.assertNotIn("released", self.seq.state()["counts"])
+
     def test_withdrawn_and_stale_holds_cannot_choke_the_line(self):
         self.seq.hold("withdrawn", block=1, seconds=20, audio_ready=True)
         self.seq.hold("next", block=2, seconds=20, audio_ready=True)

@@ -160,6 +160,22 @@ class CaptureAnalysisTests(unittest.TestCase):
         self.assertIn('a line', result['findings'][0]['message'])
         self.assertIn('no captured row names', result['findings'][0]['message'])
 
+    def test_player_file_named_by_another_row_is_a_mapping_mismatch(self):
+        capture = view([event('a', file='other.wav') for _ in range(10)])
+        capture['rows']['b']['media'] = 'other.wav'
+        result = analyze_capture(capture)
+        finding = next(f for f in result['findings']
+                       if f['code'] == 'observed_active_row_mismatch')
+        self.assertEqual(finding['count'], 10)
+        self.assertEqual(len(finding['evidence']), 8)
+        self.assertEqual(finding['evidence'][0],
+                         {'index': 0, 'active_id': 'a', 'matching_ids': ['b']})
+        self.assertEqual(finding['evidence'][-1]['index'], 7)
+        self.assertIn('script-to-player mapping', finding['message'])
+        self.assertNotIn('observed_file_mismatch', result['counts'])
+        self.assertNotIn('no captured row names', render_report(
+            build_report(capture), '/api/script-reports/one.json'))
+
     def test_published_prepared_do_not_become_audible_claims(self):
         capture = view([event(source='estimated')])
         capture['rows']['a']['aired'] = 'published'
