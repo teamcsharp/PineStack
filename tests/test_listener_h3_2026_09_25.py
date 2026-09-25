@@ -73,7 +73,7 @@ def test_listener_and_h3_paths_are_durable_and_visible():
     assert '"&hls=1"' in source
     assert "async def sfx_replay_source_api" in source
     assert "async def sfx_h3_stinger_api" in source
-    assert "voice_ad_render(goal, reference_clip=reference)" in source
+    assert "reference_clip=reference, spoken_copy=spoken_copy" in source
     assert "before >= target and not force" in source
 
 

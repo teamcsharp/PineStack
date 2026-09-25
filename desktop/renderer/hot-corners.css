@@ -92,6 +92,49 @@
 .hc-primary { background: var(--cyan, #65c7da); color: #05131a; border-color: var(--cyan, #65c7da); }
 .hc-wide { width: 100%; }
 
+/* THE REPLAY STINGER DESK. The source and the words live together: the
+   operator can watch the exact reference range, dictate into either field,
+   and submit one durable H3 request without leaving the replay surface. */
+.hc-replay-offer { width: min(650px, calc(100vw - 24px)); }
+.hc-stinger-field { display: flex; flex-direction: column; gap: 5px; }
+.hc-stinger-label, .hc-stinger-source-title {
+  color: var(--text, #edf3f5); font-size: 12px; font-weight: 650;
+}
+.hc-stinger-text {
+  width: 100%; min-height: 60px; resize: vertical; padding: 9px 42px 9px 10px;
+  border: 1px solid var(--line, #35414c); border-radius: 7px;
+  background: var(--panel-2, #222b35); color: var(--text, #edf3f5);
+  font: 13px/1.4 Inter, "Segoe UI", system-ui, sans-serif;
+}
+.hc-stinger-text:focus { outline: 1px solid var(--cyan, #65c7da); border-color: var(--cyan, #65c7da); }
+.hc-stinger-history { display: grid; grid-template-columns: 38px minmax(0, 1fr) 38px; gap: 6px; }
+.hc-stinger-icon { width: 38px; min-width: 38px; padding: 0; }
+.hc-stinger-picker {
+  min-width: 0; height: 38px; padding: 0 9px;
+  border: 1px solid var(--line, #35414c); border-radius: 7px;
+  background: var(--panel-2, #222b35); color: var(--text, #edf3f5);
+  font: 12px/1.4 Inter, "Segoe UI", system-ui, sans-serif;
+}
+.hc-stinger-source {
+  display: grid; grid-template-columns: minmax(0, 1fr); gap: 7px;
+  padding: 9px; border: 1px solid var(--line, #35414c); border-radius: 7px;
+  background: rgba(5, 14, 19, .46);
+}
+.hc-stinger-video {
+  display: block; width: 100%; max-height: min(34vh, 260px); object-fit: contain;
+  background: #05090c; border-radius: 5px;
+}
+.hc-stinger-scrub { height: 24px; }
+.hc-stinger-points { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 9px; }
+.hc-stinger-point { display: grid; grid-template-columns: 28px minmax(0, 1fr); align-items: center; gap: 5px; color: var(--muted, #8fa0ad); font-size: 11px; }
+.hc-stinger-point input { width: 100%; margin: 0; accent-color: var(--cyan, #65c7da); }
+.hc-stinger-range, .hc-stinger-status { min-height: 18px; }
+
+@media (max-width: 520px) {
+  .hc-stinger-points { grid-template-columns: 1fr; gap: 5px; }
+  .hc-stinger-video { max-height: 25vh; }
+}
+
 /* THE EXPORT SHEET. "anywhere from the last five seconds to the last 20
    minutes" - ten steps on one slider; the ticks past what the ring holds
    are greyed, and the slider's end is pulled back to the last one it can

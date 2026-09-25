@@ -17,8 +17,15 @@ test('V2 track has a real disclosure control and timeline trim edges are draggab
   assert.match(js, /window\.addEventListener\('pointermove', move, \{passive: false\}\)/);
   assert.match(js, /trimReadout\.textContent = 'In '.*'   Out '.*'   Length '/);
   assert.match(js, /node\.setPointerCapture\(event\.pointerId\)/);
+  assert.match(html, /id="parodyTrimFrame"/);
+  assert.match(js, /function setTrimMode\(on\)/);
+  assert.match(js, /function queueTrimFrame\(current\)/);
+  assert.match(js, /trimPreviewTarget = \{clip: current, local: local,/);
+  assert.match(js, /Math\.abs\(preview\.currentTime - pending\) > \.035/);
+  assert.match(js, /sourcePreview\.pause\(\); overlayPreview\.pause\(\)/);
   assert.match(css, /\.parody-segment \.clip-edge\{[^}]*touch-action:none[^}]*cursor:ew-resize/);
   assert.match(css, /\.clip-trim-readout\{[^}]*ui-monospace/);
+  assert.match(css, /\.parody-trim-frame\{/);
 });
 
 test('Electron bridge is preferred for GET and POST', async () => {

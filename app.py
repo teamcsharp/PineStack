@@ -8788,6 +8788,7 @@ def voice_ad_person_clip(goal: str) -> dict[str, Any]:
 
 async def voice_ad_render(
     goal: str, reference_clip: dict[str, Any] | None = None,
+    spoken_copy: str = "", trim_in_s: Any = None, trim_out_s: Any = None,
 ) -> tuple[str, dict[str, Any]]:
     """Submit an H3 reference ad and leave a discoverable gallery record."""
     # A replayed MP4 is an explicit creative reference, not merely another
@@ -8796,7 +8797,29 @@ async def voice_ad_render(
     clip = (dict(reference_clip or {})
             if reference_clip and reference_clip.get("id") and reference_clip.get("video")
             else await asyncio.to_thread(voice_ad_person_clip, goal))
-    copy = voice_ad_spoken_copy(goal)
+    # The stinger desk can send an explicit line separately from the visual
+    # direction.  Keep it separate all the way to compose_prompt(), where H3
+    # receives it in the exact <d> dialogue contract rather than as an
+    # ambiguous sentence inside the scene direction.
+    copy = " ".join(str(spoken_copy or "").split())[:700]
+    if not copy:
+        copy = voice_ad_spoken_copy(goal)
+
+    selected_trim: tuple[float, float] | None = None
+    if trim_in_s is not None or trim_out_s is not None:
+        if not clip.get("id") or not clip.get("video"):
+            raise ValueError("A source range needs a replayed video clip")
+        try:
+            trim_start, trim_length = comfy_workshop.reference_window(
+                float(clip.get("seconds") or 0.0), trim_in_s=trim_in_s,
+                trim_out_s=trim_out_s)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(str(exc)) from exc
+        selected_trim = (trim_start, trim_start + trim_length)
+        # Duration planning must follow the piece the operator selected, not
+        # the full source that surrounds it.
+        clip["source_seconds"] = clip.get("seconds")
+        clip["seconds"] = trim_length
     direction = ("Create a polished short Pine Box advertisement from the "
                  "reference performance. The person or people on screen must "
                  + str(goal or "deliver the ad")
@@ -8822,8 +8845,13 @@ async def voice_ad_render(
             "duration_seconds": part["duration_seconds"],
             "duration_mode": "at_least", "air_it": True,
             "sequence_part": part["part"], "sequence_parts": part["parts"],
-            **({"trim_in_s": part["trim_in_s"], "trim_out_s": part["trim_out_s"]}
-               if "trim_in_s" in part else {}),
+            # A hand-picked source interval wins over automatic tiling of a
+            # long source.  Multi-part spoken copy deliberately reuses the
+            # selected performance window rather than silently changing it.
+            **({"trim_in_s": selected_trim[0], "trim_out_s": selected_trim[1]}
+               if selected_trim else
+               ({"trim_in_s": part["trim_in_s"], "trim_out_s": part["trim_out_s"]}
+                if "trim_in_s" in part else {})),
         }))
     _parody_stinger_wake.set()
     if _RADIO.get("on"):
@@ -8836,7 +8864,10 @@ async def voice_ad_render(
             {"clip": clip, "queue_id": str(jobs[0].get("id") or ""),
              "queue_ids": [str(job.get("id") or "") for job in jobs],
              "parts": len(jobs),
-             "status": str(jobs[0].get("status") or "queued"), "model": "h3"})
+             "status": str(jobs[0].get("status") or "queued"), "model": "h3",
+             "spoken_copy": copy,
+             "trim_in_s": selected_trim[0] if selected_trim else None,
+             "trim_out_s": selected_trim[1] if selected_trim else None})
 
 
 # --- Open WebUI passthrough ------------------------------------------------
@@ -155234,13 +155265,19 @@ async def sfx_replay_source_api(
     if path is None:
         raise HTTPException(status_code=404, detail="That clip is no longer available")
     sid = sfx_id(path)
+    video = sfx_is_video(path)
+    seconds = float(sfx_seconds_held(path) or 0.0)
+    # A newly indexed MP4 can be playable before its held duration reaches
+    # the shelf cache. The stinger desk still needs a real timeline now.
+    if video and seconds <= 0:
+        seconds = await asyncio.to_thread(_media_duration_probe, path)
     return {
         "ok": True,
         "id": sid,
         "name": path.stem[:160],
         "url": "/sfx/%s?t=%s" % (sid, media_sign(sid)),
-        "video": sfx_is_video(path),
-        "seconds": round(float(sfx_seconds_held(path) or 0.0), 2),
+        "video": video,
+        "seconds": round(seconds, 2),
     }
 
 
@@ -155260,15 +155297,27 @@ async def sfx_h3_stinger_api(
         payload = {}
     payload = payload if isinstance(payload, dict) else {}
     direction = " ".join(str(payload.get("direction") or "").split())[:900]
+    spoken_copy = " ".join(str(payload.get("spoken_copy") or "").split())[:700]
     name = path.stem[:160] if path is not None else "the requested station replay"
     goal = (direction or
             ("turn the replayed clip '%s' into a concise Pine Box station "
              "stinger with an energetic on-camera delivery" % name))
-    reference = ({"id": sfx_id(path), "name": name, "video": sfx_is_video(path),
-                  "seconds": round(float(sfx_seconds_held(path) or 0.0), 2),
-                  "match": "the replayed station clip"}
-                 if path is not None else None)
-    message, ad = await voice_ad_render(goal, reference_clip=reference)
+    if path is not None:
+        video = sfx_is_video(path)
+        seconds = float(sfx_seconds_held(path) or 0.0)
+        if video and seconds <= 0:
+            seconds = await asyncio.to_thread(_media_duration_probe, path)
+        reference = {"id": sfx_id(path), "name": name, "video": video,
+                     "seconds": round(seconds, 2),
+                     "match": "the replayed station clip"}
+    else:
+        reference = None
+    try:
+        message, ad = await voice_ad_render(
+            goal, reference_clip=reference, spoken_copy=spoken_copy,
+            trim_in_s=payload.get("trim_in_s"), trim_out_s=payload.get("trim_out_s"))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {"ok": True, "message": message, "ad": ad,
             "source": ({"id": reference["id"], "name": name,
                         "video": reference["video"]} if reference else {})}

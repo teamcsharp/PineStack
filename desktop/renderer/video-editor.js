@@ -1690,7 +1690,7 @@
   function startParodyEditor() {
     var model = window.PineVideoEditModel;
     var el = function (id) { return document.getElementById(id); };
-    var requiredIds = ['parodyAudioFadeIn','parodyAudioFadeOut','parodyBack','parodyBinCount','parodyBlendStatus','parodyCover','parodyDelete','parodyDownload','parodyEditor','parodyIn','parodyLibraryStatus','parodyLoading','parodyMaskCanvas','parodyMaskClear','parodyMaskClose','parodyMaskEdit','parodyMaskFeather','parodyMaskFeatherValue','parodyMaskInvert','parodyMaskKeyframe','parodyMaskKeyframeAdd','parodyMaskKeyframeDelete','parodyMaskPen','parodyMediaBin','parodyMoveLeft','parodyMoveRight','parodyName','parodyOpacity','parodyOpacityValue','parodyOut','parodyOverlayLock','parodyOverlayMute','parodyOverlayTimeline','parodyOverlayToggle','parodyOverlayTrack','parodyOverlayVideo','parodyPlay','parodyPosition','parodyPreloadVideo','parodyPreview','parodyProjectSummary','parodyRedo','parodyRetrySources','parodySave','parodyScrub','parodySearch','parodySearchForm','parodySelectedLabel','parodySequenceCount','parodySetIn','parodySetOut','parodySourcePreview','parodySourcePreviewName','parodySplit','parodyStart','parodyStatus','parodyTimeline','parodyTrack','parodyTrackLock','parodyTrackMute','parodyTransition','parodyTransitionDuration','parodyUndo','parodyVideo','parodyVolume','parodyVolumeValue','recordingEditor'];
+    var requiredIds = ['parodyAudioFadeIn','parodyAudioFadeOut','parodyBack','parodyBinCount','parodyBlendStatus','parodyCover','parodyDelete','parodyDownload','parodyEditor','parodyIn','parodyLibraryStatus','parodyLoading','parodyMaskCanvas','parodyMaskClear','parodyMaskClose','parodyMaskEdit','parodyMaskFeather','parodyMaskFeatherValue','parodyMaskInvert','parodyMaskKeyframe','parodyMaskKeyframeAdd','parodyMaskKeyframeDelete','parodyMaskPen','parodyMediaBin','parodyMoveLeft','parodyMoveRight','parodyName','parodyOpacity','parodyOpacityValue','parodyOut','parodyOverlayLock','parodyOverlayMute','parodyOverlayTimeline','parodyOverlayToggle','parodyOverlayTrack','parodyOverlayVideo','parodyPlay','parodyPosition','parodyPreloadVideo','parodyPreview','parodyProjectSummary','parodyRedo','parodyRetrySources','parodySave','parodyScrub','parodySearch','parodySearchForm','parodySelectedLabel','parodySequenceCount','parodySetIn','parodySetOut','parodySourcePreview','parodySourcePreviewName','parodySplit','parodyStart','parodyStatus','parodyTimeline','parodyTrack','parodyTrackLock','parodyTrackMute','parodyTransition','parodyTransitionDuration','parodyTrimFrame','parodyUndo','parodyVideo','parodyVolume','parodyVolumeValue','recordingEditor'];
     var missingIds = requiredIds.filter(function (id) { return !el(id); });
     if (missingIds.length) throw new Error('Editor markup mismatch; missing: #' + missingIds.join(', #'));
     if (!model) throw new Error('The video edit model did not load.');
@@ -1703,11 +1703,12 @@
     var historyPast = [], historyFuture = [], playing = false, exporting = false, gone = false, pollTimer = 0, searchTimer = 0;
     var seeded = false, loadGeneration = 0, searchGeneration = 0, trackLocked = false, trackMuted = false;
     var overlayLocked = false, overlayMuted = false, overlayCollapsed = false, maskEditing = false, maskPen = false, maskFrameIndex = 0;
-    var draggingIndex = -1, suppressClickUntil = 0;
+    var draggingIndex = -1, suppressClickUntil = 0, trimActive = false, previewLayerFrame = 0, previewLayerAt = 0;
     var preview = el('parodyVideo'), scrub = el('parodyScrub');
     var previewCover = bindMediaCover(preview, el('parodyCover'));
     var sourcePreview = el('parodySourcePreview'), timeline = el('parodyTimeline'), overlayTimeline = el('parodyOverlayTimeline');
     var overlayPreview = el('parodyOverlayVideo'), preloadPreview = el('parodyPreloadVideo'), maskCanvas = el('parodyMaskCanvas');
+    var trimFrameLabel = el('parodyTrimFrame');
     var maskContext = maskCanvas.getContext('2d');
     var parent = window;
     try { if (window.parent !== window && window.parent.location.origin === location.origin) parent = window.parent; } catch (_) { /* standalone */ }
@@ -1757,6 +1758,20 @@
     function stop() {
       playing = false; preview.pause(); overlayPreview.pause();
       el('parodyPlay').textContent = 'Play'; el('parodyPlay').setAttribute('aria-label', 'Play sequence');
+    }
+    function setTrimMode(on) {
+      trimActive = !!on;
+      el('parodyPreview').classList.toggle('is-trimming', trimActive);
+      trimFrameLabel.hidden = !trimActive;
+      if (trimActive) {
+        /* Scrubbing must have the decoder to itself. A bin audition, a live
+           overlay and mask painting are all optional while the operator is
+           choosing one exact source frame. */
+        try { sourcePreview.pause(); overlayPreview.pause(); } catch (_) { /* detached media */ }
+        maskCanvas.style.visibility = 'hidden';
+      } else {
+        maskCanvas.style.visibility = '';
+      }
     }
     function displayPosition() {
       var total = length();
@@ -1825,13 +1840,25 @@
         try { preloadPreview.currentTime = next.in_s; } catch (_) { /* Browser is still buffering. */ }
       });
     }
+    function queuePreviewLayers(position) {
+      previewLayerAt = position;
+      if (previewLayerFrame) return;
+      previewLayerFrame = requestAnimationFrame(function () {
+        previewLayerFrame = 0;
+        updatePreviewLayers(previewLayerAt);
+      });
+    }
     function updatePreviewLayers(position) {
       var base = clips[activeIndex], baseLocal = base ? position - startOf(activeIndex) : 0;
       if (base && base.track !== 'overlay') {
         preview.volume = audioEnvelope(base, baseLocal); preview.style.opacity = String(transitionOpacity(base, baseLocal));
         preview.style.clipPath = base.transition === 'wipe' && base.transition_s > 0 ? 'inset(0 ' + ((1 - model.clamp(baseLocal / base.transition_s, 0, 1)) * 100) + '% 0 0)' : '';
         el('parodyBlendStatus').textContent = base.transition === 'cut' ? '' : base.transition + ' ' + Number(base.transition_s || 0).toFixed(2) + 's';
-        preloadAdjacent(activeIndex);
+        if (!trimActive) preloadAdjacent(activeIndex);
+      }
+      if (trimActive) {
+        overlayPreview.pause(); overlayPreview.style.opacity = '0';
+        return;
       }
       var overlays = model.spliceActiveOverlays(clips, position), layer = overlays.length ? overlays[overlays.length - 1] : null;
       if (!layer || layer.index === activeIndex) {
@@ -1849,10 +1876,12 @@
           overlayPreview.volume = audioEnvelope(layer.clip, local); overlayPreview.style.opacity = String(transitionOpacity(layer.clip, local));
           overlayPreview.style.clipPath = layer.clip.transition === 'wipe' && layer.clip.transition_s > 0 ? 'inset(0 ' + ((1 - model.clamp(local / layer.clip.transition_s, 0, 1)) * 100) + '% 0 0)' : '';
           applyMaskPreview(overlayPreview, layer.clip, local);
-          if (playing) overlayPreview.play().catch(function () { /* It resumes on the next time update. */ });
+          if (playing && overlayPreview.paused) {
+            overlayPreview.play().catch(function () { /* It resumes on the next time update. */ });
+          }
         }
       }
-      drawMask();
+      if (maskEditing) drawMask();
     }
     function seekSequence(position) {
       at = model.clamp(position, 0, length());
@@ -1891,10 +1920,22 @@
         return;
       }
       at = offset + model.clamp(preview.currentTime - clip.in_s, 0, clip.out_s - clip.in_s);
-      displayPosition(); updatePreviewLayers(at);
+      displayPosition(); queuePreviewLayers(at);
     }
     preview.addEventListener('loadedmetadata', applySeek);
-    preview.addEventListener('seeked', function () { pending = null; if (playing) preview.play().catch(playFailed); updateFromVideo(); });
+    preview.addEventListener('loadeddata', applySeek);
+    preview.addEventListener('seeked', function () {
+      /* Handle drags can issue a newer seek before the decoder reports the
+         previous one. Never let that old completion erase the frame under
+         the operator's finger. */
+      if (pending !== null && Math.abs(preview.currentTime - pending) > .035) {
+        applySeek();
+        return;
+      }
+      pending = null;
+      if (playing) preview.play().catch(playFailed);
+      updateFromVideo();
+    });
     preview.addEventListener('timeupdate', updateFromVideo);
     preview.addEventListener('ended', updateFromVideo);
     preview.addEventListener('play', function () {
@@ -1905,6 +1946,7 @@
     function playSequence() {
       if (!clips.length || exporting) return;
       if (playing) { stop(); return; }
+      try { sourcePreview.pause(); } catch (_) { /* source monitor is optional */ }
       if (at >= length() - .02) seekSequence(0);
       playing = true;
       el('parodyPlay').textContent = 'Pause'; el('parodyPlay').setAttribute('aria-label', 'Pause sequence');
@@ -1939,13 +1981,35 @@
       stop(); selected = index;
       var before = JSON.stringify(clips), original = model.copy(clips), clip = original[index];
       var segment = node.parentNode, timeLabel = segment.querySelector('small'), trimReadout = segment.querySelector('.clip-trim-readout');
-      var trimPreviewFrame = 0;
+      var trimPreviewFrame = 0, trimPreviewTarget = null;
       var startX = event.clientX, secondsPerPixel = (clip.out_s - clip.in_s) / Math.max(44, node.parentNode.getBoundingClientRect().width - 44);
       function showTrim(current) {
         trimReadout.textContent = 'In ' + model.clock(current.in_s) + '   Out ' + model.clock(current.out_s) + '   Length ' + model.clock(current.out_s - current.in_s);
         trimReadout.hidden = false;
       }
-      remember(); segment.classList.add('selected', 'trimming'); node.classList.add('active'); showTrim(clip);
+      function queueTrimFrame(current) {
+        var local = edge === 'out' ? Math.max(current.in_s, current.out_s - .03) : current.in_s;
+        trimPreviewTarget = {clip: current, local: local,
+          boundary: startOf(index) + Math.max(0, local - current.in_s)};
+        trimFrameLabel.textContent = (edge === 'out' ? 'OUT FRAME ' : 'IN FRAME ') + model.clock(local);
+        if (trimPreviewFrame) return;
+        trimPreviewFrame = requestAnimationFrame(function () {
+          trimPreviewFrame = 0;
+          var target = trimPreviewTarget;
+          trimPreviewTarget = null;
+          if (!target) return;
+          if (activeId === target.clip.source_id && preview.readyState >= 1) {
+            at = target.boundary;
+            pending = target.local;
+            applySeek();
+            displayPosition(); queuePreviewLayers(at);
+          } else {
+            seekSequence(target.boundary);
+          }
+        });
+      }
+      remember(); stop(); setTrimMode(true); selected = index;
+      segment.classList.add('selected', 'trimming'); node.classList.add('active'); showTrim(clip); queueTrimFrame(clip);
       try { if (navigator.vibrate) navigator.vibrate(8); } catch (_) {}
       try { node.setPointerCapture(event.pointerId); } catch (_) {}
       function move(pointer) {
@@ -1959,26 +2023,21 @@
         segment.style.setProperty('--clip-width', Math.min(460, Math.max(100, duration / Math.max(total, .01) * Math.max(660, timeline.clientWidth || 800))) + 'px');
         el('parodyIn').value = current.in_s.toFixed(2); el('parodyOut').value = current.out_s.toFixed(2);
         showTrim(current); displayPosition();
-        if (!trimPreviewFrame) trimPreviewFrame = requestAnimationFrame(function () {
-          trimPreviewFrame = 0;
-          var local = edge === 'out' ? Math.max(current.in_s, current.out_s - .03) : current.in_s;
-          var boundary = startOf(index) + Math.max(0, local - current.in_s);
-          if (activeId === current.source_id && preview.readyState >= 1) {
-            at = boundary; pending = local;
-            try { preview.currentTime = local; } catch (_) { /* metadata is arriving */ }
-            displayPosition(); updatePreviewLayers(at);
-          } else seekSequence(boundary);
-        });
+        /* Keep replacing the pending target while the finger moves. The next
+           animation frame must seek to the newest handle position, not the
+           first pointermove it happened to observe. */
+        queueTrimFrame(current);
       }
       function end(pointer) {
         window.removeEventListener('pointermove', move); window.removeEventListener('pointerup', end); window.removeEventListener('pointercancel', end);
         if (trimPreviewFrame) cancelAnimationFrame(trimPreviewFrame);
+        trimPreviewFrame = 0; trimPreviewTarget = null;
         try { if (node.hasPointerCapture(pointer.pointerId)) node.releasePointerCapture(pointer.pointerId); } catch (_) {}
         try { if (navigator.vibrate) navigator.vibrate(5); } catch (_) {}
         if (JSON.stringify(clips) === before) historyPast.pop();
         var current = clips[index], boundary = startOf(index) + (edge === 'out'
           ? Math.max(0, current.out_s - current.in_s - .03) : .001);
-        render(); seekSequence(boundary);
+        setTrimMode(false); render(); seekSequence(boundary);
       }
       window.addEventListener('pointermove', move, {passive: false}); window.addEventListener('pointerup', end); window.addEventListener('pointercancel', end);
     }

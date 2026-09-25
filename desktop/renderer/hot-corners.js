@@ -2260,22 +2260,247 @@
     });
   }
 
-  /* The replay is intentionally private to this glass.  The follow-up is
-   * explicit: it lets the operator turn THAT source into an H3 stinger,
-   * without accidentally queueing video generation whenever they only
-   * wanted to hear a clip again. */
-  function offerReplayStinger(key, name) {
+  var STINGER_HISTORY_STORE = 'pineH3StingerHistory';
+  var STINGER_HISTORY_LIMIT = 24;
+
+  function stingerHistory() {
+    try {
+      var parsed = JSON.parse(root.localStorage.getItem(STINGER_HISTORY_STORE) || '[]');
+      if (!Array.isArray(parsed)) return [];
+      return parsed.filter(function (item) {
+        return item && typeof item === 'object' &&
+          (typeof item.direction === 'string' || typeof item.spoken_copy === 'string');
+      }).slice(0, STINGER_HISTORY_LIMIT);
+    } catch (e) { return []; }
+  }
+
+  function saveStingerHistory(rows) {
+    try { root.localStorage.setItem(STINGER_HISTORY_STORE,
+      JSON.stringify(rows.slice(0, STINGER_HISTORY_LIMIT))); } catch (e) { /* local only */ }
+  }
+
+  function stingerTime(value) {
+    value = Math.max(0, Number(value) || 0);
+    var minutes = Math.floor(value / 60);
+    var seconds = Math.floor(value % 60);
+    var tenths = Math.floor((value - Math.floor(value)) * 10);
+    return minutes + ':' + String(seconds).padStart(2, '0') + '.' + tenths;
+  }
+
+  function stingerField(label, hint, rows) {
+    var wrap = make('label', 'hc-stinger-field');
+    wrap.appendChild(make('span', 'hc-stinger-label', label));
+    var field = make('textarea', 'hc-stinger-text');
+    field.rows = rows || 2;
+    field.placeholder = hint;
+    field.setAttribute('aria-label', label);
+    /* PineTalkDot detects all live text fields and puts its shared mic at
+       the right edge. That gives this popup the same tap/hold dictation as
+       every other Pine Box field without a second microphone icon. */
+    wrap.appendChild(field);
+    return {wrap: wrap, field: field};
+  }
+
+  /* The replay is intentionally private to this glass.  Its follow-up is
+   * explicit: the same source now becomes a small H3 stinger desk, rather
+   * than an accidental video-generation action when an operator only wanted
+   * to hear a clip again. */
+  function offerReplayStinger(key, name, sourceInfo) {
     if (!key) return;
-    var s = sheet('Replay ready', 'hc-replay-offer', {duck: false});
-    s.body.appendChild(make('p', 'hc-dim', '"' + name + '" is replaying on this screen.'));
-    s.body.appendChild(make('p', 'hc-dim',
-      'Use this exact video when it has one; audio-only clips get a matching dialogue-capable performer.'));
-    var status = make('p', 'hc-dim', '');
+    sourceInfo = sourceInfo && typeof sourceInfo === 'object' ? sourceInfo : {};
+    var s = sheet('Make H3 station stinger', 'hc-replay-offer', {duck: false});
+    s.body.appendChild(make('p', 'hc-dim', 'Source: ' + name));
+
+    var direction = stingerField('Video direction',
+      'What should the person do on camera?', 2);
+    var spoken = stingerField('Exact spoken copy',
+      'What should they say?', 2);
+    s.body.appendChild(direction.wrap);
+    s.body.appendChild(spoken.wrap);
+
+    var remembered = stingerHistory();
+    var rememberedAt = -1;
+    var history = make('div', 'hc-stinger-history');
+    var earlier = button('hc-btn hc-stinger-icon', '', 'c:caret--left');
+    earlier.title = 'Use the previous stinger prompt';
+    earlier.setAttribute('aria-label', earlier.title);
+    var later = button('hc-btn hc-stinger-icon', '', 'c:caret--right');
+    later.title = 'Use the next stinger prompt';
+    later.setAttribute('aria-label', later.title);
+    var picker = make('select', 'hc-stinger-picker');
+    picker.setAttribute('aria-label', 'Previous stinger prompts');
+    history.appendChild(earlier); history.appendChild(picker); history.appendChild(later);
+    s.body.appendChild(history);
+
+    function paintHistory() {
+      while (picker.firstChild) picker.removeChild(picker.firstChild);
+      var fresh = make('option', '', 'Prompt history');
+      fresh.value = '-1';
+      picker.appendChild(fresh);
+      remembered.forEach(function (item, index) {
+        var words = String(item.spoken_copy || item.direction || 'Untitled prompt')
+          .replace(/\s+/g, ' ').slice(0, 96);
+        var option = make('option', '', words);
+        option.value = String(index);
+        picker.appendChild(option);
+      });
+      picker.value = String(rememberedAt);
+      earlier.disabled = rememberedAt < 0 || rememberedAt >= remembered.length - 1;
+      later.disabled = !remembered.length || rememberedAt <= 0;
+    }
+    function recall(index) {
+      if (index < 0 || index >= remembered.length) {
+        rememberedAt = -1;
+      } else {
+        rememberedAt = index;
+        direction.field.value = String(remembered[index].direction || '');
+        spoken.field.value = String(remembered[index].spoken_copy || '');
+        direction.field.dispatchEvent(new Event('input', {bubbles: true}));
+        spoken.field.dispatchEvent(new Event('input', {bubbles: true}));
+      }
+      paintHistory();
+    }
+    earlier.addEventListener('click', function () { recall(rememberedAt + 1); });
+    later.addEventListener('click', function () { recall(rememberedAt - 1); });
+    picker.addEventListener('change', function () { recall(Number(picker.value)); });
+    paintHistory();
+
+    var isVideo = !!sourceInfo.video && !!sourceInfo.url;
+    var clipSeconds = Math.max(0, Number(sourceInfo.seconds) || 0);
+    var trimIn = 0;
+    var trimOut = Math.min(clipSeconds || 15, 15);
+    var preview = null;
+    var scrub = null;
+    var inPoint = null;
+    var outPoint = null;
+    var rangeNote = null;
+    var rangeReady = false;
+    var sourceRange = null;
+
+    function updateRange() {
+      if (!rangeReady || !preview || !scrub || !inPoint || !outPoint) return;
+      var duration = Math.max(0, Number(preview.duration) || clipSeconds);
+      if (duration < 2.2) {
+        rangeNote.textContent = 'This source is too short for an H3 video reference.';
+        inPoint.disabled = true;
+        outPoint.disabled = true;
+        return;
+      }
+      trimIn = Math.max(0, Math.min(trimIn, duration - 2.2));
+      trimOut = Math.max(trimIn + 2.2, Math.min(trimOut, duration, trimIn + 15));
+      inPoint.value = String(trimIn);
+      outPoint.value = String(trimOut);
+      scrub.max = String(duration);
+      inPoint.max = String(duration);
+      outPoint.max = String(duration);
+      rangeNote.textContent = 'Looping ' + stingerTime(trimIn) + ' to ' + stingerTime(trimOut)
+        + ' (' + stingerTime(trimOut - trimIn) + ').';
+    }
+    function seek(value, play) {
+      if (!preview) return;
+      var duration = Math.max(0, Number(preview.duration) || clipSeconds);
+      var at = Math.max(0, Math.min(Number(value) || 0, duration));
+      try { preview.currentTime = at; } catch (e) { /* metadata is still arriving */ }
+      if (scrub) scrub.value = String(at);
+      if (play) {
+        try { Promise.resolve(preview.play()).catch(function () { /* gesture gate */ }); }
+        catch (e2) { /* a source can leave while closing */ }
+      }
+    }
+    if (isVideo) {
+      sourceRange = make('section', 'hc-stinger-source');
+      sourceRange.appendChild(make('b', 'hc-stinger-source-title', 'Source video'));
+      preview = make('video', 'hc-stinger-video');
+      preview.muted = true;
+      preview.playsInline = true;
+      preview.preload = 'metadata';
+      preview.src = stationUrl(sourceInfo.url);
+      sourceRange.appendChild(preview);
+      scrub = make('input', 'hc-range hc-stinger-scrub');
+      scrub.type = 'range'; scrub.min = '0'; scrub.step = '.1'; scrub.value = '0';
+      scrub.setAttribute('aria-label', 'Scrub source video');
+      sourceRange.appendChild(scrub);
+      var points = make('div', 'hc-stinger-points');
+      var makePoint = function (label, value) {
+        var row = make('label', 'hc-stinger-point');
+        row.appendChild(make('span', '', label));
+        var control = make('input', '');
+        control.type = 'range'; control.min = '0'; control.step = '.1'; control.value = String(value);
+        control.setAttribute('aria-label', label + ' point');
+        row.appendChild(control);
+        points.appendChild(row);
+        return control;
+      };
+      inPoint = makePoint('In', trimIn);
+      outPoint = makePoint('Out', trimOut);
+      sourceRange.appendChild(points);
+      rangeNote = make('p', 'hc-dim hc-stinger-range', 'Reading the source range...');
+      sourceRange.appendChild(rangeNote);
+      s.body.appendChild(sourceRange);
+      var sourceLoaded = function () {
+        clipSeconds = Math.max(0, Number(preview.duration) || clipSeconds);
+        trimIn = 0;
+        trimOut = Math.min(clipSeconds, 15);
+        rangeReady = true;
+        updateRange();
+        seek(trimIn, true);
+      };
+      preview.addEventListener('loadedmetadata', sourceLoaded);
+      preview.addEventListener('timeupdate', function () {
+        if (!rangeReady) return;
+        if (scrub && !scrub.matches(':active')) scrub.value = String(preview.currentTime || 0);
+        if (!preview.paused && preview.currentTime >= trimOut - .025) seek(trimIn, true);
+      });
+      preview.addEventListener('ended', function () { seek(trimIn, true); });
+      scrub.addEventListener('input', function () { seek(scrub.value, false); });
+      scrub.addEventListener('change', function () { seek(scrub.value, true); });
+      inPoint.addEventListener('input', function () {
+        trimIn = Math.min(Number(inPoint.value) || 0, trimOut - 2.2);
+        trimOut = Math.max(trimOut, trimIn + 2.2);
+        updateRange(); seek(trimIn, true);
+      });
+      outPoint.addEventListener('input', function () {
+        trimOut = Math.max(Number(outPoint.value) || 0, trimIn + 2.2);
+        trimIn = Math.min(trimIn, trimOut - 2.2);
+        updateRange(); seek(Math.max(trimIn, trimOut - .1), true);
+      });
+      if (clipSeconds) sourceLoaded();
+    } else {
+      s.body.appendChild(make('p', 'hc-dim',
+        'This audio source will be paired with an indexed dialogue-capable performer.'));
+    }
+
+    var status = make('p', 'hc-dim hc-stinger-status', '');
     var send = button('hc-btn hc-primary hc-wide', 'Make H3 station stinger', 'c:play--filled');
     send.addEventListener('click', function () {
+      var visual = String(direction.field.value || '').trim();
+      var words = String(spoken.field.value || '').trim();
+      if (!visual && !words) {
+        status.textContent = 'Add a video direction or spoken copy first.';
+        direction.field.focus();
+        return;
+      }
+      if (isVideo && (!rangeReady || clipSeconds < 2.2)) {
+        status.textContent = 'This source needs at least 2.2 seconds for an H3 video reference.';
+        return;
+      }
       send.disabled = true;
-      status.textContent = '';
-      stationPost('/api/sfx/' + encodeURIComponent(key) + '/h3-stinger', {}).then(function (got) {
+      status.textContent = 'Saving this stinger request...';
+      var payload = {direction: visual, spoken_copy: words};
+      if (isVideo) {
+        payload.trim_in_s = Math.round(trimIn * 10) / 10;
+        payload.trim_out_s = Math.round(trimOut * 10) / 10;
+      }
+      stationPost('/api/sfx/' + encodeURIComponent(key) + '/h3-stinger', payload).then(function (got) {
+        if (visual || words) {
+          remembered = remembered.filter(function (item) {
+            return item.direction !== visual || item.spoken_copy !== words;
+          });
+          remembered.unshift({direction: visual, spoken_copy: words, at: now()});
+          saveStingerHistory(remembered);
+          rememberedAt = 0;
+          paintHistory();
+        }
         status.textContent = String((got && got.message) || 'Request completed.');
         toast('Request completed.');
       }, function (err) {
@@ -2285,6 +2510,10 @@
     });
     s.body.appendChild(send);
     s.body.appendChild(status);
+    s.onClose = function () {
+      if (!preview) return;
+      try { preview.pause(); preview.removeAttribute('src'); preview.load(); } catch (e) { /* already gone */ }
+    };
   }
 
   function replaySfx() {
@@ -2320,12 +2549,12 @@
           } catch (e) { shown = false; }
           if (shown) {
             toast('replaying ' + replayName + ' on the set');
-            offerReplayStinger(replayKey, replayName);
+            offerReplayStinger(replayKey, replayName, source);
             return;
           }
         }
         playAudio(stationUrl(url), replayName, function () {
-          offerReplayStinger(replayKey, replayName);
+          offerReplayStinger(replayKey, replayName, source);
         });
       }, function (err) {
         toast('could not load the replay source: ' + String((err && err.message) || err), true);
