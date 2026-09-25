@@ -37,7 +37,11 @@
 
   var HOST_CLASS = 'sp-page';
   var SCREENPLAY_REST_MS = 20000;   /* the script is minutes-scale news */
-  var FEED_MAX = 240;               /* the booth ring's own size */
+  /* The feed is the live working surface, not the permanent transcript.
+     The screenplay and trace ledger retain every line; holding hundreds of
+     completed rows here makes the tablet relayout a history nobody can see. */
+  var FEED_MAX = 120;
+  var FEED_EVENT_MAX = 48;
 
   var mounted = false;
   var host = null;
@@ -9598,6 +9602,12 @@
      * drawn while `prepared` used to still read `prepared` long after
      * it had aired. */
     var rows = (state && state.chat) || [];
+    if (rows.length > FEED_MAX) {
+      rows = rows.slice().sort(function (a, b) {
+        return Number((a && (a.air_at || a.ts)) || 0)
+          - Number((b && (b.air_at || b.ts)) || 0);
+      }).slice(-FEED_MAX);
+    }
     var added = 0;
     var want = [];
     for (var i = 0; i < rows.length; i += 1) {
@@ -9669,6 +9679,15 @@
       }
       box.appendChild(eventRow(Object.assign({}, subject || {}, ev)));
       added += 1;
+    }
+    /* Activity has its own stream and therefore never belongs in the chat
+       window above. Bound it separately, oldest first, so a busy booth still
+       keeps its most recent SFX, render, and orchestration receipts visible. */
+    var events = [].slice.call(box.children).filter(function (child) {
+      return /sp-msg-ev/.test(String(child.className || ''));
+    });
+    for (var eventAt = 0; eventAt < events.length - FEED_EVENT_MAX; eventAt += 1) {
+      events[eventAt].remove();
     }
     /* #1287: THE TRIM STOPS EVICTING ROWS IT STILL WANTS.
      *
