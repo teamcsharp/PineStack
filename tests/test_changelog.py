@@ -84,6 +84,23 @@ class ChangeLogTests(unittest.TestCase):
         self.assertEqual(page["total"], 3)
         self.assertEqual(page["entries"][0]["commit"], third)
 
+    def test_recorded_new_head_still_uses_an_incremental_git_read(self):
+        self.log.page()  # durable baseline
+        third = self.commit({"five.py": "five\n"}, "Recorded future task")
+        self.log.record(third, {"task_name": "Keep the player full width"})
+        original_git = self.log._git
+        calls = []
+
+        def watched(*args, **kwargs):
+            calls.append(args)
+            return original_git(*args, **kwargs)
+
+        self.log._git = watched
+        page = self.log.page(limit=1)
+        self.assertEqual(page["entries"][0]["commit"], third)
+        self.assertEqual(page["entries"][0]["task_name"], "Keep the player full width")
+        self.assertFalse(any("log" in args and "--all" in args for args in calls))
+
     def test_cold_process_serves_durable_snapshot_without_calling_git(self):
         self.log.page()  # establish the cache a fresh service process will inherit
         cold = ChangeLog(self.repo, Path(self.tmp.name) / "tasks.json")

@@ -215,8 +215,12 @@ class ChangeLog:
                 self._save_disk_cache(head, stamp, rows)
                 return [dict(row) for row in rows]
             cached_head = str(disk.get("head") or "")
-            incremental = (cached_head and int(disk.get("ledger_stamp") or -1) == stamp
-                           and self._is_ancestor(cached_head, head))
+            # A task record can be written immediately after its commit. It
+            # changes the ledger stamp but not the Git graph, so the new head
+            # is still safely append-only from this cache. Rewalking history
+            # here made a fresh changelog card appear stale until a full scan
+            # completed.
+            incremental = bool(cached_head and self._is_ancestor(cached_head, head))
             raw = self._git(
                 "log", *( [] if incremental else ["--all"] ), "--no-renames", "--numstat",
                 "--format=%x1e%H%x1f%P%x1f%ct%x1f%an%x1f%s%x1f%b%x1d",
@@ -283,7 +287,11 @@ class ChangeLog:
                 }, details))
             if incremental:
                 seen = {str(row.get("commit") or "") for row in rows}
-                rows.extend(row for row in disk["entries"] if str(row.get("commit") or "") not in seen)
+                rows.extend(self._with_ledger(
+                    dict(row), ledger.get(str(row.get("commit") or ""))
+                    or ledger.get(str(row.get("short_commit") or "")))
+                    for row in disk["entries"]
+                    if str(row.get("commit") or "") not in seen)
             self._cache_key = cache_key
             self._cache = rows
             self._save_disk_cache(head, stamp, rows)
