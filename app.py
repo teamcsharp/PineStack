@@ -9270,6 +9270,14 @@ async def voice_render_any(text: str, voice: str, engine: str = "",
     text = str(text or "").strip()
     if not text:
         return None
+    # A named booth role is an on-air render, even when a preparatory caller
+    # did not know its eventual line id. Give the feed one durable receipt so
+    # it never falls back to an anonymous "Voice Rendering" row. Real batches
+    # already supply their N/M position and are deliberately left untouched.
+    if who and not line:
+        line = uuid.uuid4().hex
+    if who and not script_total:
+        script_index, script_total = 1, 1
     engine = engine or voice_engine_for(voice)
     # #784: LENGTH is the other way a written line could not be rendered. The
     # box road cuts a long line into slider-sized pieces; the page road never
