@@ -21,6 +21,9 @@ test('render feed names speakers and exposes source-backed script progress', () 
   assert.match(js, /speaker \+ ' rendering'/);
   assert.match(js, /script_total/);
   assert.match(js, /sp-msg-render-progress/);
+  assert.match(js, /function feedSetActiveMarquee/);
+  assert.match(js, /feedDress\(line, ev\)/);
   assert.match(css, /\.sp-msg\.sp-msg-render/);
+  assert.match(css, /\.sp-msg-marquee\.is-moving\.sp-msg-marquee-active/);
   assert.match(css, /\.sp-msg-render \.sp-msg-marquee/);
 });

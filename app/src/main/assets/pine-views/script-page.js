@@ -9558,6 +9558,25 @@
     feedCrawlWidth = -1;
   }
 
+  function feedSetActiveMarquee(box) {
+    /* The feed can hold a long render history. Only the newest voicing
+       receipt is still live, so it is the one that earns a moving marquee.
+       Leaving every historical line on requestAnimationFrame made an idle
+       tablet do the work of a row of news tickers. */
+    var rows = box ? box.querySelectorAll('.sp-msg-ev[data-render-at]') : [];
+    var newest = null;
+    var newestAt = -1;
+    for (var index = 0; index < rows.length; index += 1) {
+      var candidate = rows[index];
+      var at = Number(candidate.dataset.renderAt) || 0;
+      if (at >= newestAt) { newest = candidate; newestAt = at; }
+    }
+    for (var item = 0; item < rows.length; item += 1) {
+      var viewport = rows[item].querySelector('.sp-msg-marquee');
+      if (viewport) viewport.classList.toggle('sp-msg-marquee-active', rows[item] === newest);
+    }
+  }
+
   function paintFeed(state) {
     var box = el('spFeed');
     if (!box) return;
@@ -9689,6 +9708,7 @@
         if (feedLive === oldId) feedLive = '';
       }
     }
+    feedSetActiveMarquee(box);
     if (!added && over <= 0) return;
     if (feedStick) box.scrollTop = box.scrollHeight;
   }
@@ -9940,6 +9960,13 @@
     line.pineEvent = ev;
     if (ev.line) line.dataset.line = String(ev.line);
     var stage = String(ev.stage || 'station');
+    if (stage.toLowerCase() === 'voicing') {
+      line.dataset.renderAt = String(Number(ev.at) || 0);
+    }
+    /* Activity events carry the live render receipt. Dress them just like
+       script rows so speaker identity, line contribution, and progress are
+       visible instead of reverting to a generic infrastructure event. */
+    feedDress(line, ev);
     line.title = 'Open details for this ' + stage + ' event';
     line.addEventListener('click', function () { feedDetailOpen(line.pineEvent || ev); });
     line.addEventListener('keydown', function (key) {

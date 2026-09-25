@@ -855,7 +855,7 @@
 .sp-msg-marquee:not(.is-moving) .sp-msg-marquee-track > span:first-child {
   max-width: 100%; overflow: hidden; text-overflow: ellipsis;
 }
-.sp-msg-marquee.is-moving .sp-msg-marquee-track {
+.sp-msg-marquee.is-moving.sp-msg-marquee-active .sp-msg-marquee-track {
   animation: sp-feed-voice-crawl var(--sp-feed-crawl, 26s) linear infinite;
   will-change: transform;
 }
@@ -898,7 +898,7 @@
   .sp-msg.sp-msg-render { grid-template-columns: 32px minmax(0, 1fr); }
 }
 @media (prefers-reduced-motion: reduce) {
-  .sp-msg-marquee.is-moving .sp-msg-marquee-track { animation: none; }
+  .sp-msg-marquee.is-moving.sp-msg-marquee-active .sp-msg-marquee-track { animation: none; }
   .sp-msg-marquee.is-moving .sp-msg-marquee-track > span[aria-hidden] { display: none; }
   .sp-msg-marquee.is-moving .sp-msg-marquee-track > span:first-child {
     max-width: 100%; overflow: hidden; text-overflow: ellipsis;
