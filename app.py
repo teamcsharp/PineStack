@@ -27614,7 +27614,8 @@ def voice_engine() -> str:
 
 async def speak(
     text: str, event: str = "default", engine: str | None = None,
-    voice: str | None = None, plain: bool = False,
+    voice: str | None = None, plain: bool = False, line: str = "",
+    speaker: str = "", script_index: int = 0, script_total: int = 0,
 ) -> dict[str, Any]:
     """Say something through whichever engine the settings panel has armed.
     Every engine answers the same shape, so callers never branch.
@@ -27669,7 +27670,8 @@ async def speak(
         }}
     result = await voice_generate(
         styled, voice if voice is not None else _event_voice(event), chosen,
-        fx=fx)
+        fx=fx, line=line, speaker=speaker,
+        script_index=script_index, script_total=script_total)
     result["spoken"] = styled
     # This is the box answering YOU, not the station broadcasting at you —
     # it keeps working with the show switched off the speaker (#647).
@@ -33876,8 +33878,10 @@ async def _dj_speak_floorless(kind: str, track: dict[str, Any] | None = None,
                     if _sfx_stream:
                         why = "box declined the exact finished clip"
                     else:
-                        result = await speak(spoken, event="default",
-                                             voice=forced, plain=True)
+                        result = await speak(
+                            spoken, event="default", voice=forced, plain=True,
+                            line=line_id, speaker=booth_actor_name(who, name),
+                            script_index=1, script_total=1)
                         why = _speak_why(result)
             else:
                 # A long single line (an intro can run 600 chars ≈ 40s)
@@ -33892,8 +33896,10 @@ async def _dj_speak_floorless(kind: str, track: dict[str, Any] | None = None,
                 for at, piece in enumerate(pieces):
                     if at:
                         piece = breath_for(f"{who}{at}") + piece
-                    result = await speak(piece, event="default",
-                                         voice=forced, plain=True)
+                    result = await speak(
+                        piece, event="default", voice=forced, plain=True,
+                        line=line_id, speaker=booth_actor_name(who, name),
+                        script_index=1, script_total=1)
                     # home_assistant_say declines rather than raising when
                     # the satellite is not ready, so an empty return is
                     # not success.

@@ -30,6 +30,7 @@ test('render feed names speakers and exposes source-backed script progress', () 
 
 test('the live single-line route supplies the feed receipt it creates', () => {
   const app = fs.readFileSync('app.py', 'utf8');
+  assert.match(app, /async def speak\([\s\S]*?script_index: int = 0, script_total: int = 0/);
   assert.match(app, /line=line_id, speaker=booth_actor_name\(who, name\),\s*script_index=1, script_total=1/);
   assert.match(app, /who=who, line=line_id, script_index=1, script_total=1/);
 });
