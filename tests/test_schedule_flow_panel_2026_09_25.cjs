@@ -22,6 +22,8 @@ test('segment flow editor is duration-aware and has all requested beat types', (
   assert.match(js, /sp-feed-detail-graph/);
   assert.match(css, /\.sp-flow-graph/);
   assert.match(css, /\.sp-flow-provenance/);
+  assert.match(css, /\.sp-player \{[\s\S]*?width: 100%; max-width: none; min-width: 0;/);
+  assert.match(css, /\.sp-left \{[\s\S]*?grid-template-columns: minmax\(0, 1fr\);/);
   assert.match(css, /\.sp-flow-timing-fill/);
   assert.match(css, /\.sp-itin-graph/);
 });
