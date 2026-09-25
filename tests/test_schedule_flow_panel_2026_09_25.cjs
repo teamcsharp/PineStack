@@ -27,3 +27,9 @@ test('render feed names speakers and exposes source-backed script progress', () 
   assert.match(css, /\.sp-msg-marquee\.is-moving\.sp-msg-marquee-active/);
   assert.match(css, /\.sp-msg-render \.sp-msg-marquee/);
 });
+
+test('the live single-line route supplies the feed receipt it creates', () => {
+  const app = fs.readFileSync('app.py', 'utf8');
+  assert.match(app, /line=line_id, speaker=booth_actor_name\(who, name\),\s*script_index=1, script_total=1/);
+  assert.match(app, /who=who, line=line_id, script_index=1, script_total=1/);
+});

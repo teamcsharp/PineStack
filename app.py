@@ -33495,7 +33495,9 @@ async def _dj_speak_floorless(kind: str, track: dict[str, Any] | None = None,
             # dialogue never goes into the void, it goes on the shelf.
             try:
                 clip = await voice_generate(
-                    spoken, forced, voice_engine_for(forced), fx=fx)
+                    spoken, forced, voice_engine_for(forced), fx=fx,
+                    line=line_id, speaker=booth_actor_name(who, name),
+                    script_index=1, script_total=1)
             except Exception:
                 clip = None
         if clip:
@@ -33636,9 +33638,9 @@ async def _dj_speak_floorless(kind: str, track: dict[str, Any] | None = None,
             # precisely when it was needed and the line was lost.
             # voice_render_any cannot come back empty while any engine on
             # this box answers.
-            clip = await voice_render_any(spoken,
-                                          forced or _event_voice("default"),
-                                          engine, fx=fx, who=who)
+            clip = await voice_render_any(
+                spoken, forced or _event_voice("default"), engine, fx=fx,
+                who=who, line=line_id, script_index=1, script_total=1)
 
     if clip and sting and not by_hand and kind != "reply":
         clip, _sfx_stream = await _sfx_single_clip(
@@ -33987,7 +33989,9 @@ async def _dj_speak_floorless(kind: str, track: dict[str, Any] | None = None,
         # if there is a voice for it, hold it for the box and show it in the
         # backlog. Only a line with no voice at all is logged as a pure drop.
         if True:                                                   # #784
-            clip = await voice_render_any(spoken, forced, fx=fx, who=who)
+            clip = await voice_render_any(
+                spoken, forced, fx=fx, who=who, line=line_id,
+                script_index=1, script_total=1)
         if clip:
             box_hold(clip, spoken, who, line_id)                # #778
             note_drop(who, spoken,
@@ -34197,7 +34201,9 @@ async def _dj_speak_floorless(kind: str, track: dict[str, Any] | None = None,
             # routing that had just failed, so it could not rescue an
             # engine-down or a clone-id-into-Piper failure, which is every
             # one of them. The ladder ends at Piper's own default voice.
-            clip = await voice_render_any(spoken, forced, fx=fx, who=who)
+            clip = await voice_render_any(
+                spoken, forced, fx=fx, who=who, line=line_id,
+                script_index=1, script_total=1)
         if clip and clip.get("path"):
             page_delivery = page_feed_append({
                 "url": f"{clip['path']}?t={clip['sig']}",
