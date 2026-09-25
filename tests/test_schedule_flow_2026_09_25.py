@@ -61,6 +61,47 @@ def test_flow_clause_names_each_operator_beat_and_its_extra_direction():
     assert "Leave room for a sharp host reaction." in clause
 
 
+def test_scripted_line_is_bounded_and_compiled_as_exact_dialogue():
+    node = app._schedule_flow_node({
+        "id": "operator-line", "type": "scripted_line", "seconds": 11,
+        "after": "orchestrator-turn-3",
+        "line": {"speaker": "Host", "text": "Welcome to Pine Box.",
+                 "source": "operator"},
+    })
+
+    assert node["after"] == "orchestrator-turn-3"
+    assert node["line"] == {"speaker": "Host", "text": "Welcome to Pine Box.",
+                            "source": "operator"}
+    clause = app.schedule_flow_clause({"flow": [node]})
+    assert "Scripted line for Host: Welcome to Pine Box." in clause
+    assert "Preserve this exact wording" in clause
+
+
+def test_voice_ad_command_keeps_action_and_requested_copy():
+    goal = app.voice_ad_goal(
+        "generate me an ad of someone jumping up and down yelling welcome to the pine box"
+    )
+
+    assert goal == "someone jumping up and down yelling welcome to the pine box"
+    assert app.voice_ad_spoken_copy(goal) == "welcome to the pine box"
+    assert app.voice_ad_goal("make an ad") == ""
+
+
+def test_voice_ad_falls_back_to_a_short_mp4_when_dialogue_index_is_thin(monkeypatch):
+    monkeypatch.setattr(app, "sfx_match_score", lambda *args, **kwargs: [])
+    monkeypatch.setattr(app, "sfx_db_reader", lambda: None)
+    monkeypatch.setattr(app, "sfx_db_pick_short_video",
+                        lambda _cap: (app.Path("reference.mp4"), 4.0))
+    monkeypatch.setattr(app, "sfx_is_video", lambda _path: True)
+    monkeypatch.setattr(app, "sfx_id", lambda _path: "f" * 16)
+
+    assert app.voice_ad_person_clip("jump and yell welcome") == {
+        "id": "f" * 16, "name": "reference", "seconds": 4.0,
+        "video": True,
+        "match": "short MP4 fallback while dialogue matching is unavailable",
+    }
+
+
 def test_reusable_graph_library_keeps_its_id_and_original_save_time_on_update():
     graphs, saved = app.schedule_flow_library_upsert([], {
         "name": "News with a caller", "kind": "news", "minutes": 4,

@@ -322,10 +322,13 @@
   border-radius: 50%;
   background: #1c242c;
   cursor: pointer;
+  touch-action: none;
+  user-select: none;
   -webkit-tap-highlight-color: transparent;
   transition: width .18s ease, height .18s ease, border-radius .18s ease,
-              right .18s ease, bottom .18s ease;
+              right .18s ease, bottom .18s ease, left .18s ease, top .18s ease;
 }
+.pine-talk-dot[hidden] { display: none; }
 .pine-talk-dot.pine-talk-moved {
   left: var(--pine-talk-left);
   top: var(--pine-talk-top);
@@ -557,6 +560,16 @@
   box-shadow: 0 12px 30px rgba(0, 0, 0, .5);
 }
 .pine-talk-say.bad { border-color: #e46b6b; color: #e46b6b; }
+
+.pine-voice-ad-popup { position: fixed; inset: 0; z-index: 2147483085; display: grid; place-items: center; padding: 18px; background: rgba(3, 7, 10, .72); }
+.pine-voice-ad-card { display: grid; gap: 10px; width: min(680px, 94vw); max-height: min(86dvh, 760px); padding: 14px; border: 1px solid #65c7da; border-radius: 8px; background: #101a21; box-shadow: 0 24px 70px #000b; }
+.pine-voice-ad-card > b { color: #8de1ed; font: 600 16px/1.2 Inter, Segoe UI, system-ui, sans-serif; }
+.pine-voice-ad-card > span { color: #c8d4d9; font: 12px/1.4 Inter, Segoe UI, system-ui, sans-serif; overflow-wrap: anywhere; }
+.pine-voice-ad-card video { display: block; width: 100%; max-height: min(58dvh, 520px); background: #000; border-radius: 5px; }
+.pine-voice-ad-actions { display: flex; justify-content: flex-end; gap: 8px; }
+.pine-voice-ad-actions a, .pine-voice-ad-actions button { min-height: 32px; padding: 0 10px; border: 1px solid #36515c; border-radius: 5px; color: #e7f1f4; background: #17252d; font: 11px/1 Inter, Segoe UI, system-ui, sans-serif; text-decoration: none; }
+.pine-voice-ad-actions a { display: inline-grid; place-items: center; }
+.pine-voice-ad-actions button { cursor: pointer; }
 
 /* #1355: which ear. Right-click the dot.
 

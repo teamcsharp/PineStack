@@ -220,7 +220,41 @@
      is stored as viewport coordinates so it follows every station view but
      never survives outside a rotated or resized screen. */
   var DOT_POSITION_KEY = 'pineTalkDotPositionV1';
+  var DOT_ENABLED_KEY = 'pineTalkDotEnabledV1';
   var DOT_EDGE = 8;
+
+  function dotEnabled() {
+    try { return !root.localStorage || root.localStorage.getItem(DOT_ENABLED_KEY) !== '0'; }
+    catch (err) { return true; }
+  }
+
+  function dotEvent(enabled) {
+    try {
+      if (root.dispatchEvent && typeof root.CustomEvent === 'function') {
+        root.dispatchEvent(new root.CustomEvent('pine-talk-dot-change', {detail: {enabled: !!enabled}}));
+      }
+    } catch (err) { /* the control still works without custom events */ }
+  }
+
+  function setEnabled(enabled) {
+    enabled = !!enabled;
+    try { if (root.localStorage) root.localStorage.setItem(DOT_ENABLED_KEY, enabled ? '1' : '0'); }
+    catch (err) { /* storage is optional */ }
+    var dot = el('pineTalkDot');
+    if (enabled && !dot) dot = mount();
+    if (dot) {
+      dot.hidden = !enabled;
+      dot.setAttribute('aria-hidden', enabled ? 'false' : 'true');
+    }
+    ['pineTalkSay', 'pineTalkTelemetry'].forEach(function (id) {
+      var node = el(id); if (!enabled && node) node.hidden = true;
+    });
+    if (!enabled && state === LISTENING) cancel();
+    dotEvent(enabled);
+    return enabled;
+  }
+
+  function toggleEnabled() { return setEnabled(!dotEnabled()); }
 
   function dotStoredPosition() {
     try {
@@ -325,8 +359,67 @@
     dot.addEventListener('pointercancel', finish);
   }
 
+  var voiceAdWatcher = 0;
+  var voiceAdKnown = {};
+  var voiceAdPrimed = false;
+  function adNode(tag, cls, words) {
+    var node = document.createElement(tag);
+    node.className = cls || '';
+    node.textContent = words || '';
+    return node;
+  }
+  function voiceAdPopup(row) {
+    if (!row || el('pineVoiceAdPopup')) return;
+    var file = String(((row.files || [])[0]) || '');
+    if (!file) return;
+    var veil = document.createElement('div');
+    veil.id = 'pineVoiceAdPopup'; veil.className = 'pine-voice-ad-popup';
+    var box = document.createElement('section'); box.className = 'pine-voice-ad-card';
+    box.appendChild(adNode('b', '', 'Your Pine Box ad is ready'));
+    box.appendChild(adNode('span', '', String(row.request || row.tags || 'H3 video ad').slice(0, 320)));
+    var video = document.createElement('video');
+    video.controls = true; video.playsInline = true; video.preload = 'metadata';
+    video.src = where() + '/api/generations/image/' + encodeURIComponent(file);
+    box.appendChild(video);
+    var actions = adNode('div', 'pine-voice-ad-actions');
+    var open = adNode('a', 'pine-voice-ad-open', 'Open media');
+    open.href = video.src; open.target = '_blank'; open.rel = 'noopener';
+    var close = adNode('button', 'pine-voice-ad-close', 'Close'); close.type = 'button';
+    close.addEventListener('click', function () { veil.remove(); });
+    actions.appendChild(open); actions.appendChild(close); box.appendChild(actions);
+    veil.addEventListener('click', function (event) { if (event.target === veil) veil.remove(); });
+    veil.appendChild(box); document.body.appendChild(veil);
+    try { video.play(); } catch (err) { /* media still has visible controls */ }
+  }
+  function pollVoiceAds() {
+    if (!root.fetch) return;
+    root.fetch(where() + '/api/generations?limit=40').then(function (response) {
+      if (!response.ok) throw new Error('gallery unavailable');
+      return response.json();
+    }).then(function (payload) {
+      var ready = [];
+      (Array.isArray(payload && payload.generations) ? payload.generations : []).forEach(function (row) {
+        if (!row || String(row.purpose || '') !== 'voice_ad') return;
+        var id = String(row.prompt_id || ''); if (!id) return;
+        var was = voiceAdKnown[id];
+        voiceAdKnown[id] = String(row.status || '');
+        if (voiceAdPrimed && String(row.status || '') === 'done' && was !== 'done') ready.push(row);
+      });
+      voiceAdPrimed = true;
+      if (ready.length) voiceAdPopup(ready[0]);
+    }, function () { /* transient gallery trouble never blocks dictation */ });
+  }
+  function watchVoiceAds() {
+    if (voiceAdWatcher) return;
+    pollVoiceAds();
+    voiceAdWatcher = root.setInterval ? root.setInterval(pollVoiceAds, 7000) : 1;
+  }
+
   function mount() {
-    if (el('pineTalkDot')) return el('pineTalkDot');
+    if (el('pineTalkDot')) {
+      el('pineTalkDot').hidden = !dotEnabled();
+      return el('pineTalkDot');
+    }
     /* Before anything else: put back whatever a previous life of this page
      * left ducked. See duck() for the measurement that made this needed. */
     try { unstick(); } catch (err) { /* never block the mount */ }
@@ -363,6 +456,8 @@
     });
     dot.title = 'Tap to speak. Drag to move this control. Right-click to choose a microphone.';
     document.body.appendChild(dot);
+    dot.hidden = !dotEnabled();
+    dot.setAttribute('aria-hidden', dot.hidden ? 'true' : 'false');
     dotRestore(dot);
     dotDrag(dot);
     if (root.addEventListener) {
@@ -400,6 +495,7 @@
       band.innerHTML = '<i></i><em></em>';
       telemetry.querySelector('[data-talk-spectrum]').appendChild(band);
     }
+    watchVoiceAds();
     return dot;
   }
 
@@ -1805,6 +1901,7 @@
     useMic: useMic,
     micPin: micPin,
     mount: mount, listen: listen, finish: finish, duck: duck,
+    enabled: dotEnabled, setEnabled: setEnabled, toggle: toggleEnabled,
     /* `act` is the door for a sentence that arrived some other way - a
      * wake word, a typed command, or a test - and it deliberately does
      * everything the spoken road does from the transcript onwards:

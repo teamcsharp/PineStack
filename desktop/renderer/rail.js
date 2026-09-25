@@ -828,10 +828,29 @@
       try { root.PineHotCorners.railTab(); } catch (err) { /* the rail is more important than the handle */ }
     }
 
-    /* The talk dot, on every screen - the operator asked for it on all of
-     * them, not only the one it was designed against. */
+    /* The movable talk control gets a durable, non-overlapping switch on the
+     * rail. Hiding the dot never strands it: TALK remains here on every view. */
     if (root.PineTalkDot) {
-      try { root.PineTalkDot.mount(); } catch (err) { /* not fatal */ }
+      try {
+        var talk = make('button', 'pineViewTab-talk', 'pine-view-tab');
+        talk.textContent = 'TALK';
+        talk.title = 'Show or hide the movable voice control';
+        function paintTalk() {
+          var on = typeof root.PineTalkDot.enabled === 'function'
+            ? root.PineTalkDot.enabled() : true;
+          talk.classList.toggle('on', on);
+          talk.classList.toggle('off', !on);
+          talk.setAttribute('aria-pressed', on ? 'true' : 'false');
+        }
+        talk.addEventListener('click', function () {
+          try { root.PineTalkDot.toggle(); } catch (err) { /* not fatal */ }
+          paintTalk();
+        });
+        if (root.addEventListener) root.addEventListener('pine-talk-dot-change', paintTalk);
+        rail.appendChild(talk);
+        root.PineTalkDot.mount();
+        paintTalk();
+      } catch (err) { /* not fatal */ }
     }
 
     /* The sampler's own edge handle is now redundant - it is in the rail -

@@ -8532,6 +8532,115 @@ async def comfyui_generate(
     )
 
 
+# A spoken "make an ad" is a distinct video production request, not merely a
+# generic image/video prompt. It keeps one short follow-up alive for the box
+# and Nabu, whose conversation transports do not always return history.
+VOICE_AD_COMMAND = re.compile(
+    r"\b(?:make|create|generate|produce|render)\b(?:\s+me)?\s+"
+    r"(?:an?\s+)?ad\b", re.IGNORECASE)
+VOICE_AD_PENDING: dict[str, float] = {"until": 0.0}
+
+
+def voice_ad_goal(text: Any) -> str | None:
+    """Return the requested ad direction, empty for an explicit bare ad."""
+    said = " ".join(str(text or "").split())[:1800]
+    found = VOICE_AD_COMMAND.search(said)
+    if not found:
+        return None
+    tail = said[found.end():].strip(" .,:;-\u2014")
+    tail = re.sub(r"^(?:about|for|of|with)\s+", "", tail, flags=re.I)
+    return tail[:1200]
+
+
+def voice_ad_spoken_copy(goal: str) -> str:
+    """Pull the actual requested copy out of an ordinary spoken direction."""
+    found = re.search(r"\b(?:saying|say|yelling|shouting|announcing|"
+                      r"declaring|with(?:\s+the)?\s+(?:line|words?))\s+"
+                      r"[\"']?(.+?)\s*$", str(goal or ""), re.I)
+    return (found.group(1).strip(" \"'.")[:800] if found else "")
+
+
+def voice_ad_person_clip(goal: str) -> dict[str, Any]:
+    """Choose a speech-indexed MP4 through the SFX match index.
+
+    The ranking searches clip names, visual descriptions, folder keywords and
+    indexed spoken words. A transcript-backed video fallback keeps the command
+    useful while the semantic index is rebuilding.
+    """
+    context = "person people human face speaking dialogue character voice commercial advertisement"
+    picked: list[tuple[Any, float, Any]] = []
+    try:
+        ranked = sfx_match_score(str(goal or ""), context, video=True,
+                                 floor=0.0, limit=48)
+        for path, seconds, candidate in sfx_match_rows(ranked, most=48):
+            if path and sfx_is_video(path) and float(seconds or 0) >= 1.0:
+                picked.append((path, float(seconds or 0), candidate))
+    except Exception:  # noqa: BLE001
+        picked = []
+    if picked:
+        # Do not always pick rank one: several close semantic matches should
+        # still make separately requested ads feel like separate productions.
+        path, seconds, candidate = random.choice(picked[:min(8, len(picked))])
+        return {"id": sfx_id(path), "name": path.stem[:120],
+                "seconds": round(seconds, 2), "video": True,
+                "match": str(getattr(candidate, "folder", "indexed clip"))[:120]}
+    try:
+        con = sfx_db_reader()
+        with _SFX_DB_LOCK:
+            rows = con.execute(
+                "SELECT sid,name,seconds,folder FROM clips "
+                "WHERE playable=1 AND video=1 AND length(trim(COALESCE(said,''))) >= 6 "
+                "ORDER BY seen_at DESC LIMIT 240").fetchall()
+        if rows:
+            row = random.choice(rows[:min(80, len(rows))])
+            return {"id": str(row[0] or ""), "name": str(row[1] or "clip")[:120],
+                    "seconds": round(float(row[2] or 0), 2), "video": True,
+                    "match": str(row[3] or "speech-indexed clip")[:120]}
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        fallback = sfx_db_pick_short_video(12.0) or sfx_db_pick_row(True)
+        if fallback:
+            path, seconds = fallback
+            if path and sfx_is_video(path):
+                return {"id": sfx_id(path), "name": path.stem[:120],
+                        "seconds": round(float(seconds or 0), 2), "video": True,
+                        "match": "short MP4 fallback while dialogue matching is unavailable"}
+    except Exception:  # noqa: BLE001
+        pass
+    return {}
+
+
+async def voice_ad_render(goal: str) -> tuple[str, dict[str, Any]]:
+    """Submit an H3 reference ad and leave a discoverable gallery record."""
+    clip = await asyncio.to_thread(voice_ad_person_clip, goal)
+    if not clip.get("id"):
+        return ("I could not find a dialogue-capable video clip in the indexed "
+                "SFX library yet, so I did not start the ad.", {})
+    copy = voice_ad_spoken_copy(goal)
+    direction = ("Create a polished short Pine Box advertisement from the "
+                 "reference performance. The person or people on screen must "
+                 + str(goal or "deliver the ad")
+                 + ". Keep expressive natural motion, direct-to-camera commercial "
+                 "energy, and clean synchronized dialogue. No captions or logos.")
+    try:
+        result = await _comfy_workshop_render_payload({
+            "mode": "reference", "source": clip["id"], "source_type": "clip",
+            "at_share": random.random(), "prompt": direction, "speech": copy,
+            "purpose": "voice_ad", "duration_seconds": 6,
+        })
+    except HTTPException as exc:
+        return ("The H3 ad was not started: " + str(exc.detail), {})
+    if _RADIO.get("on"):
+        fire_and_forget(dj_ad(
+            "a listener commissioned a short H3 video ad: " + str(goal)[:180]
+            + "; say it is being made for the gallery", remember=False))
+    return ("On it. H3 is making the ad from a dialogue-capable MP4 reference "
+            "and it will pop up in the Pine Box gallery when it is ready.",
+            {"clip": clip, "prompt_id": str(result.get("prompt_id") or ""),
+             "model": str(result.get("model") or "h3")})
+
+
 # --- Open WebUI passthrough ------------------------------------------------
 
 
@@ -60674,6 +60783,8 @@ CANONICAL_HOUR: tuple[tuple[str, str, float, str], ...] = (
 # schedule.
 
 SCHEDULE_FLOW_TYPES: dict[str, dict[str, Any]] = {
+    "scripted_line": {"label": "Scripted line", "seconds": 12,
+                      "instruction": "Deliver the supplied scripted line exactly as written, then let the next speaker answer it naturally on air."},
     "news_mention": {"label": "News mention", "seconds": 48,
                        "instruction": "Discuss the selected current news item with its dossier; name the facts you can support and then react to them."},
     "speakerbox_quote": {"label": "Speakerbox quote", "seconds": 30,
@@ -60713,6 +60824,16 @@ def _schedule_flow_clip_ref(raw: Any) -> dict[str, Any]:
     }
 
 
+def _schedule_flow_scripted_line(raw: Any) -> dict[str, str]:
+    """Keep an operator-inserted scripted line readable and bounded."""
+    row = raw if isinstance(raw, dict) else {}
+    return {
+        "speaker": str(row.get("speaker") or "Host").strip()[:60] or "Host",
+        "text": str(row.get("text") or "").strip()[:900],
+        "source": str(row.get("source") or "operator").strip()[:80] or "operator",
+    }
+
+
 def _schedule_flow_node(raw: Any, index: int = 0) -> dict[str, Any] | None:
     """Clean one operator-authored beat before it reaches the durable sheet."""
     row = raw if isinstance(raw, dict) else {}
@@ -60733,8 +60854,15 @@ def _schedule_flow_node(raw: Any, index: int = 0) -> dict[str, Any] | None:
         "seconds": round(max(2.0, min(900.0, seconds)), 1),
         "detail": str(row.get("detail") or "").strip()[:400],
     }
+    # The opaque target node id places an operator's beat between the
+    # orchestrator's read-only lines without rewriting the aired script.
+    after = str(row.get("after") or "").strip()[:96]
+    if after:
+        node["after"] = after
     if kind == "sfx":
         node["clip"] = _schedule_flow_clip_ref(row.get("clip"))
+    elif kind == "scripted_line":
+        node["line"] = _schedule_flow_scripted_line(row.get("line"))
     return node
 
 
@@ -60957,6 +61085,11 @@ def schedule_flow_clause(slot: dict[str, Any]) -> str:
                      "for the on-air SFX event rather than describing a clip."
                      % (clip["name"], "MP4" if clip["video"] else "audio",
                         float(clip["seconds"] or 0)))
+        scripted = (_schedule_flow_scripted_line(node.get("line"))
+                    if node.get("type") == "scripted_line" else {})
+        if scripted.get("text"):
+            line += (" Scripted line for %s: %s Preserve this exact wording."
+                     % (scripted["speaker"], scripted["text"]))
         parts.append(line)
     if extra:
         parts.append("ADDITIONAL SYSTEM DIRECTION FOR THIS ONE SEGMENT: " + extra)
@@ -109886,6 +110019,7 @@ async def generate_answer(
         "system_status_used": False,
         "image_requested": False,
         "video_requested": False,
+        "ad_video_requested": False,
         "tune_requested": False,
         "openwebui_used": False,
         "memory_used": False,
@@ -109897,6 +110031,26 @@ async def generate_answer(
             settings.get("active_prompt", 0)
             % max(1, len(settings.get("prompts") or [1]))].get("name", ""),
     }
+
+    # A bare command deliberately asks once rather than guessing the copy.
+    # The short pending window also works for the Nabu's stateless turns.
+    ad_goal = voice_ad_goal(user_text)
+    pending_ad = float(VOICE_AD_PENDING.get("until") or 0) > time.time()
+    if ad_goal is not None or pending_ad:
+        if ad_goal is None:
+            ad_goal = " ".join(str(user_text or "").split())[:1200]
+        if not str(ad_goal or "").strip():
+            VOICE_AD_PENDING["until"] = time.time() + 300.0
+            return ("What do you want the person to say or do in the ad?", {
+                **feature_meta, "ad_video_requested": True,
+                "model": "h3", "prompt_tokens": 0, "completion_tokens": 0,
+            })
+        VOICE_AD_PENDING["until"] = 0.0
+        answer, ad = await voice_ad_render(str(ad_goal))
+        return answer, {**feature_meta, "video_requested": bool(ad),
+                         "ad_video_requested": True, "model": "comfy-h3",
+                         "prompt_tokens": 0, "completion_tokens": 0,
+                         "voice_ad": ad}
 
     # Explicit "open web ui ..." routes the question to Open WebUI and returns.
     if is_openwebui_request(user_text):
@@ -187339,6 +187493,8 @@ async def chat_completions(
             "from_library": metadata["from_library"],
             "system_status_used": metadata["system_status_used"],
             "image_requested": metadata["image_requested"],
+            "video_requested": metadata["video_requested"],
+            "ad_video_requested": metadata.get("ad_video_requested", False),
             "openwebui_used": metadata["openwebui_used"],
             "memory_used": metadata["memory_used"],
             "memory_saved": metadata["memory_saved"],
