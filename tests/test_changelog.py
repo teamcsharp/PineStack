@@ -48,6 +48,7 @@ class ChangeLogTests(unittest.TestCase):
         self.assertEqual(older["entries"][0]["task_name"], "First task")
 
     def test_records_future_task_telemetry_without_rewriting_the_commit(self):
+        self.log.page(limit=1)  # establish the Git cache before ledger changes
         self.log.record(self.second[:12], {"task_name": "Show the SFX receipt",
                                            "prompt": "Make clips visible on air",
                                            "goal": "Visible cadence history",
@@ -60,6 +61,21 @@ class ChangeLogTests(unittest.TestCase):
                                           "source": "task ledger"})
         self.assertEqual(row["elapsed_ms"], 4300)
         self.assertEqual(row["goal"], "Visible cadence history")
+
+    def test_ledger_refreshes_cached_head_without_another_git_log(self):
+        self.log.page(limit=1)
+        original_git = self.log._git
+        calls = []
+
+        def watched(*args, **kwargs):
+            calls.append(args)
+            return original_git(*args, **kwargs)
+
+        self.log._git = watched
+        self.log.record(self.second, {"prompt": "Name the new task"})
+        page = self.log.page(limit=1)
+        self.assertEqual(page["entries"][0]["prompt"], "Name the new task")
+        self.assertFalse(any("log" in args for args in calls))
 
     def test_cache_adds_new_head_commits_without_rewalking_old_history(self):
         self.assertEqual(self.log.page()["total"], 2)  # writes the durable baseline

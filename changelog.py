@@ -147,6 +147,50 @@ class ChangeLog:
                           "binary": binary})
         return files
 
+    @staticmethod
+    def _with_ledger(row: dict[str, Any], details: Any) -> dict[str, Any]:
+        """Overlay new task telemetry without re-reading Git history.
+
+        Recording a prompt or duration changes only the sidecar ledger. The
+        commit graph and file list have not moved, so replaying a full history
+        scan just to update one small card makes the live panel needlessly
+        slow. Keep the Git facts and replace only facts supplied by the
+        ledger.
+        """
+        details = details if isinstance(details, dict) else {}
+        if not details:
+            return dict(row)
+        out = dict(row)
+        if details.get("task_name"):
+            out["task_name"] = _text(details["task_name"], 240)
+        if details.get("prompt"):
+            out["prompt"] = _text(details["prompt"])
+            out["prompt_source"] = "task ledger"
+        if details.get("goal"):
+            out["goal"] = _text(details["goal"], 1200)
+        if details.get("result"):
+            out["result"] = _text(details["result"], 1600)
+        tokens = dict(out.get("tokens") or {})
+        changed_tokens = False
+        for field, key in (("input_tokens", "input"), ("output_tokens", "output")):
+            if field in details:
+                tokens[key] = _number(details.get(field), field)
+                changed_tokens = True
+        if changed_tokens:
+            tokens["source"] = "task ledger"
+            out["tokens"] = tokens
+        if "elapsed_ms" in details:
+            out["elapsed_ms"] = _number(details.get("elapsed_ms"), "elapsed_ms")
+            out["elapsed_source"] = "task ledger"
+        if details.get("completed_at"):
+            try:
+                completed_at = float(details["completed_at"])
+            except (TypeError, ValueError):
+                completed_at = float((out.get("git") or {}).get("committed_at") or 0)
+            out["completed_at"] = completed_at
+            out["completed_label"] = cst_label(completed_at)
+        return out
+
     def _read(self) -> list[dict[str, Any]]:
         head = self._head()
         stamp = self._ledger_stamp()
@@ -155,11 +199,21 @@ class ChangeLog:
             if self._cache_key == cache_key:
                 return [dict(row) for row in self._cache]
             disk = self._disk_cache()
+            ledger = self._ledger()
             if disk.get("head") == head and disk.get("ledger_stamp") == stamp:
                 self._cache_key = cache_key
                 self._cache = disk["entries"]
                 return [dict(row) for row in self._cache]
-            ledger = self._ledger()
+            # The task ledger can change independently of Git. Rehydrate its
+            # fields on the cached records instead of walking every commit.
+            if disk.get("head") == head and isinstance(disk.get("entries"), list):
+                rows = [self._with_ledger(dict(row), ledger.get(str(row.get("commit") or ""))
+                                          or ledger.get(str(row.get("short_commit") or "")))
+                        for row in disk["entries"]]
+                self._cache_key = cache_key
+                self._cache = rows
+                self._save_disk_cache(head, stamp, rows)
+                return [dict(row) for row in rows]
             cached_head = str(disk.get("head") or "")
             incremental = (cached_head and int(disk.get("ledger_stamp") or -1) == stamp
                            and self._is_ancestor(cached_head, head))
@@ -199,7 +253,7 @@ class ChangeLog:
                     completed_at = float(completed_at)
                 except (TypeError, ValueError):
                     completed_at = float(at)
-                rows.append({
+                rows.append(self._with_ledger({
                     "commit": commit,
                     "short_commit": commit[:12],
                     "parents": [part[:12] for part in parents.split() if part],
@@ -226,7 +280,7 @@ class ChangeLog:
                     "major": len(files) > 3,
                     "git": {"subject": _text(subject, 600), "body": _text(body, 5000),
                             "committed_at": at, "committed_label": cst_label(at)},
-                })
+                }, details))
             if incremental:
                 seen = {str(row.get("commit") or "") for row in rows}
                 rows.extend(row for row in disk["entries"] if str(row.get("commit") or "") not in seen)
