@@ -140,6 +140,10 @@ STARVE_WAIT_MAX = float(os.getenv("STREAM_STARVE_WAIT", "0.25"))
 # the moving live edge through a tower handoff or a brief box stall.
 HLS_SEGMENT_SECONDS = float(os.getenv("STREAM_HLS_SEGMENT", "4"))
 HLS_LIST_SIZE = int(os.getenv("STREAM_HLS_LIST", "15"))
+# A phone should not begin its first moving-car session on a single segment.
+# Three completed four-second chunks are enough for a tower handoff while
+# keeping the initial tune-in delay bounded.
+HLS_START_SEGMENTS = int(os.getenv("STREAM_HLS_START_SEGMENTS", "3"))
 HLS_ROOT = os.getenv("STREAM_HLS_DIR", "")
 
 
@@ -564,9 +568,13 @@ class _HlsEncoder:
             self.stop()
             return False
 
-    def ready(self) -> bool:
+    def ready(self, minimum_segments: int = 1) -> bool:
         try:
-            return self.playlist.is_file() and self.playlist.stat().st_size > 0
+            if not self.playlist.is_file() or self.playlist.stat().st_size <= 0:
+                return False
+            needed = max(1, int(minimum_segments))
+            return sum(1 for path in self.dir.glob("seg*.ts")
+                       if path.is_file()) >= needed
         except OSError:
             return False
 

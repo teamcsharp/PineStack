@@ -117,7 +117,7 @@ from rap_battle import (COMBATANTS as RAP_COMBATANTS, RapBattle,
 from sfx_cadence import SfxCadence, due_after as sfx_due_after
 # The broadcast stream (#1253): one URL, one socket, the mix made here.
 # station_stream.py carries why the tune page cannot do this in a car.
-from station_stream import StationStream, icy_block
+from station_stream import HLS_START_SEGMENTS, StationStream, icy_block
 import library
 import library_extract
 # What the prompts may no longer carry - see prompt_cuts.py for why a cut is
@@ -149990,10 +149990,11 @@ async def station_stream_hls(
     from station_stream import listener_mix
     personal_mix = listener_mix(mix)
     enc = STATION_STREAM.hls(br, mix=personal_mix)
-    # The first playlist takes a moment to exist; the backlog prime means
-    # it arrives with several segments already in it.
-    for _ in range(40):
-        if enc.ready():
+    # Wait for a modest initial HLS runway rather than handing a phone a
+    # one-segment live edge. The separate segment requests then carry it
+    # smoothly across a tower handoff or a momentary server stall.
+    for _ in range(60):
+        if enc.ready(HLS_START_SEGMENTS):
             break
         await asyncio.sleep(0.25)
     try:

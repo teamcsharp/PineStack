@@ -45,6 +45,7 @@ def test_hls_personal_mix_is_a_private_lane_without_a_join_burst(tmp_path):
     assert one.mix == (62, 100, 60)
     assert one.prime == []
     assert station_stream.HLS_LIST_SIZE >= 15
+    assert station_stream.HLS_START_SEGMENTS >= 3
 
 
 def test_tailnet_hls_delivery_avoids_render_pool_and_video_poll_has_hls_flag():
