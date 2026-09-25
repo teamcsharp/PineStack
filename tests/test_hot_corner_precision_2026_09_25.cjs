@@ -75,6 +75,15 @@ test('sensitivity changes the gesture threshold instead of only changing its lab
   assert.equal(api.config().sensitivity, 100);
 });
 
+test('SFX replay uses the canonical sample ID instead of the human clip label', () => {
+  const {api} = setup();
+  const prior = {kind: 'sfx', sfx: 'A human-readable clip label',
+    sfx_sample_id: '0123456789abcdef'};
+  const malformed = {kind: 'sfx', sfx: 'Another human-readable clip label'};
+  assert.equal(api._replaySampleId(prior), '0123456789abcdef');
+  assert.equal(api._lastSfx([prior, malformed]), prior);
+});
+
 test('a pointer that begins on a button is never adopted as a corner gesture', () => {
   const {root, document} = setup();
   const button = document.body.appendChild(new Element('button'));

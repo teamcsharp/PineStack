@@ -2203,14 +2203,27 @@
 
   /* ------------------------------------------ "sfx": the last clip again */
 
+  /* The chat row's `sfx` field is a human label, while `sfx_sample_id` is
+   * the durable opaque identifier accepted by replay-source. Never pass a
+   * label back to that API as though it were an ID. */
+  function replaySampleId(row) {
+    var keys = [row && row.sfx_sample_id, row && row.sfx_id,
+      row && row.sample_id, row && row.sfx];
+    for (var i = 0; i < keys.length; i += 1) {
+      var candidate = String(keys[i] || '').toLowerCase();
+      if (/^[a-f0-9]{16}$/.test(candidate)) return candidate;
+    }
+    return '';
+  }
+
   /* The newest SFX row that has something to play. The desk's own cues
-   * (a hang-up, a ring) carry sfx:'' and no url - they are the station's
-   * bookkeeping, not a clip. */
+   * (a hang-up, a ring) carry no canonical source and no URL - they are
+   * station bookkeeping, not a replayable clip. */
   function lastSfx(chat) {
     for (var i = (chat || []).length - 1; i >= 0; i -= 1) {
       var r = chat[i];
       if (!r || String(r.kind || '') !== 'sfx') continue;
-      if (r.url || r.sfx || r.sfx_sample_id) return r;
+      if (r.url || replaySampleId(r)) return r;
     }
     return null;
   }
@@ -2521,7 +2534,7 @@
     station().then(function (got) {
       var row = lastSfx((got && got.chat) || []);
       if (!row) { toast('no SFX clip has played yet', true); return; }
-      var key = String(row.sfx || row.sfx_sample_id || '');
+      var key = replaySampleId(row);
       /* The station prefixes a cadence sample's text with the speaker
        * glyph (U+1F50A, written as its surrogate pair here); the name is
        * what follows it. */
@@ -2733,6 +2746,7 @@
     _stepTable: stepTable,
     _heardRow: heardRow,
     _lastSfx: lastSfx,
+    _replaySampleId: replaySampleId,
     _stationUrl: stationUrl,
     _editorPath: editorPath,
     _editorMessage: editorMessage
