@@ -29,7 +29,9 @@ class SfxStreamCadenceTests(unittest.IsolatedAsyncioTestCase):
         self.patch('complaint_due', mock.Mock(return_value=False))
         self.patch('sfx_seconds', mock.Mock(return_value=1.0))
         self.patch('sfx_id', mock.Mock(return_value='scratch-id'))
+        self.patch('sfx_by_id', mock.Mock(side_effect=lambda _sid: self.sample))
         self.patch('sfx_note_play', mock.Mock())
+        self.patch('sfx_history_add', mock.Mock())
         self.patch('sfxguy_ready_pick', mock.Mock(return_value=None))
         self.patch('sfxguy_ready_commit', mock.Mock())
         self.patch('sfxguy_ready_release', mock.Mock())
@@ -81,6 +83,8 @@ class SfxStreamCadenceTests(unittest.IsolatedAsyncioTestCase):
         app._sfx_cadence_audible(rows, 14)  # the same complete hardware copy
         self.assertEqual(app._SFX_CADENCE.state()['heard_units'], 4)
         self.assertEqual(app.sfx_note_play.call_count, 2)
+        self.assertEqual(app.sfx_history_add.call_count, 2)
+        app.sfx_history_add.assert_called_with(self.sample, 'board')
         self.assertEqual(app.sfx_levelled.call_count, 2)
 
     async def test_video_cadence_welds_levelled_audio_and_rings_silent_picture(self):

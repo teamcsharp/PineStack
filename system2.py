@@ -1004,9 +1004,16 @@ class System2Store:
                 if job['state'] == 'working' and job.get('lease_until', 0) > self.now(): continue
                 choices.append(job)
             if not choices: return None
-            # Within the active horizon, ensure each segment exists before topping one up.
-            job = min(choices, key=lambda j: (not j['coverage_missing'], j['deadline'],
-                j['estimated_work_seconds'] if j['estimated_work_seconds'] is not None else float('inf'), j['id']))
+            # Near airtime, finish the earliest incomplete slot before
+            # seeding later ones. Farther out, establish coverage first.
+            urgent_until = self.now() + 900
+            imminent_partial = [job for job in choices
+                                 if (not job['coverage_missing'] and self.now() < job['deadline'] <= urgent_until)]
+            pool = imminent_partial or choices
+            job = min(pool, key=lambda j: (
+                not j['coverage_missing'], j['deadline'],
+                j['estimated_work_seconds'] if j['estimated_work_seconds'] is not None else float('inf'),
+                j['id']))
             job.update(state='working', owner=owner, token=uuid.uuid4().hex,
                        lease_until=self.now() + lease_seconds, claimed_at=self.now(), attempts=job['attempts'] + 1)
             slot = self._get(db, 's2_slots', job['slot_id'])

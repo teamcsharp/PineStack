@@ -108,6 +108,18 @@ class System2Tests(unittest.TestCase):
         self.assertEqual(job['template']['air_room_seconds'], 63)
         self.assertEqual(job['template']['ready_seconds'], 91)
 
+    def test_imminent_partial_scene_precedes_later_empty_segment(self):
+        templates = [{'id': 'news', 'kind': 'news', 'seconds': 180},
+                     {'id': 'caller', 'kind': 'caller', 'seconds': 180}]
+        hour = self.plan([candidate('short-news', seconds=25)], templates,
+                         start=self.now + 300)
+        self.assertGreater(hour['slots'][0]['debt_seconds'], 0)
+        self.assertFalse(hour['slots'][0]['coverage_seconds'] == 0)
+        self.assertEqual(hour['slots'][1]['coverage_seconds'], 0)
+        job = self.store.claim_job('writer')
+        self.assertEqual(job['kind'], 'news')
+        self.assertFalse(job['coverage_missing'])
+
     def test_late_start_drops_unhanded_tail_but_preserves_heard_first_take(self):
         template = [{'id': 'n', 'kind': 'news', 'seconds': 180}]
         first = candidate('heard-first', seconds=91, air_seconds=94)

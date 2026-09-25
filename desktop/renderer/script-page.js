@@ -4534,6 +4534,11 @@
     add.type = 'button';
     add.addEventListener('click', function () { itineraryAdd(list, sheet); });
     tools.appendChild(add);
+    var copy = make('button', 'sp-itin-add', 'Copy schedule');
+    copy.type = 'button';
+    copy.title = 'Make an editable copy of the current schedule before trying a new running order';
+    copy.addEventListener('click', function () { itineraryCopySchedule(sheet); });
+    tools.appendChild(copy);
     sheet.box.appendChild(tools);
     sheet.box.appendChild(list);
     sheet.revealLive = true;
@@ -4720,6 +4725,42 @@
       list.replaceChildren(make('div', 'sp-segrow-why',
         'The schedule did not answer: ' + ((err && err.message) || err)));
     });
+  }
+
+  function itineraryCopySchedule(sheet) {
+    api().get('/api/schedule').then(function (state) {
+      var source = String((state && state.active) || 'schedule');
+      var proposed = source + ' copy ' + new Date().toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'});
+      var name = root.prompt('Name this editable schedule copy', proposed);
+      if (!name || !String(name).trim()) return;
+      return api().post('/api/schedule/preset', {name: String(name).trim(), copy_from: source})
+        .then(function (got) {
+          sheet.say('Saved ' + String((got && got.active) || name)
+            + '. Select it on Day, Week or Month when you want it on air.');
+        });
+    }, function (err) { sheet.say(String((err && err.message) || err), true); })
+      ['catch'](function (err) { sheet.say(String((err && err.message) || err), true); });
+  }
+
+  function itineraryReorder(entry, before, sheet, done) {
+    var moved = String((entry && entry.slot_id) || '');
+    var target = String((before && before.slot_id) || '');
+    var preset = String((entry && entry.schedule_preset) || '');
+    if (!moved || !target || moved === target) return;
+    api().get('/api/schedule').then(function (state) {
+      var active = preset || String((state && state.active) || '');
+      var slots = ((state && state.presets && state.presets[active]) || []).slice();
+      var from = slots.findIndex(function (slot) { return String(slot.id || '') === moved; });
+      var to = slots.findIndex(function (slot) { return String(slot.id || '') === target; });
+      if (from < 0 || to < 0) throw new Error('Those segments are not on the editable schedule.');
+      var row = slots.splice(from, 1)[0];
+      if (from < to) to -= 1;
+      slots.splice(to, 0, row);
+      return api().post('/api/schedule/slots', {preset: active, slots: slots});
+    }).then(function () {
+      sheet.say('Running order saved. The orchestrator will rebuild the affected upcoming segments.');
+      if (typeof done === 'function') done();
+    }, function (err) { sheet.say(String((err && err.message) || err), true); });
   }
 
   function itinClock(ts) {
@@ -5517,6 +5558,374 @@
     return wrap;
   }
 
+  /* ---- #1301: the scheduled conversation-flow editor ---------------- */
+
+  /* A slot's flow is deliberately a small JSON shape. It is persisted with
+     the scheduler and compiled into the writing-room clause on the server;
+     this page only gives the operator a direct, tactile way to arrange it. */
+  var FLOW_TYPES = [
+    ['news_mention', 'News mention', 48],
+    ['speakerbox_quote', 'Speakerbox quote', 30],
+    ['random_topic', 'Random topic', 52],
+    ['caller', 'Caller', 82],
+    ['manager_message', 'Manager message', 42],
+    ['sfx', 'SFX', 6],
+    ['ad_drop', 'Ad drop', 32],
+    ['painting_ad', 'Painting ad', 58],
+    ['product', 'Product pitch', 48]
+  ];
+
+  function flowType(type) {
+    return FLOW_TYPES.find(function (row) { return row[0] === String(type || ''); })
+      || FLOW_TYPES[2];
+  }
+
+  function flowNode(raw, index) {
+    var spec = flowType(raw && raw.type);
+    var seconds = Number(raw && raw.seconds);
+    if (!isFinite(seconds) || seconds <= 0) seconds = spec[2];
+    return {id: String((raw && raw.id) || ('flow-' + Date.now() + '-' + index + '-' + Math.random().toString(36).slice(2, 7))),
+      type: spec[0], seconds: Math.max(2, Math.min(900, Math.round(seconds * 10) / 10)),
+      detail: String((raw && raw.detail) || '').slice(0, 400)};
+  }
+
+  function flowIconButton(cls, icon, label) {
+    var button = make('button', cls, '');
+    button.type = 'button';
+    button.title = label;
+    button.setAttribute('aria-label', label);
+    button.innerHTML = folderIcon(icon, label);
+    if (!button.innerHTML) button.textContent = label;
+    return button;
+  }
+
+  function flowDictation(field, sheet) {
+    var button = flowIconButton('sp-flow-mic', 'c:microphone', 'Dictate into this field');
+    var timer = 0;
+    var pressTimer = 0;
+    var holding = false;
+    var ignoreClick = false;
+    function finish() {
+      if (timer) clearTimeout(timer);
+      timer = 0;
+      button.classList.remove('on');
+    }
+    function start() {
+      var dot = root.PineTalkDot;
+      if (!dot || typeof dot.captureNext !== 'function') {
+        sheet.say('No microphone is available on this surface.', true);
+        return;
+      }
+      button.classList.add('on');
+      try {
+        dot.captureNext(function (words) {
+          var text = String(words || '').trim();
+          if (text) {
+            field.value = String(field.value || '')
+              + (String(field.value || '').trim() ? ' ' : '') + text;
+            field.dispatchEvent(new Event('input', {bubbles: true}));
+          }
+          finish();
+        });
+        timer = setTimeout(finish, 30000);
+      } catch (err) {
+        finish();
+        sheet.say('The microphone could not start.', true);
+      }
+    }
+    button.addEventListener('click', function () {
+      if (ignoreClick) { ignoreClick = false; return; }
+      if (button.classList.contains('on') && root.PineTalkDot
+          && typeof root.PineTalkDot.finish === 'function') {
+        root.PineTalkDot.finish(); finish(); return;
+      }
+      start();
+    });
+    button.addEventListener('pointerdown', function () {
+      holding = false;
+      pressTimer = setTimeout(function () { holding = true; start(); }, 220);
+    });
+    button.addEventListener('pointerup', function () {
+      if (pressTimer) clearTimeout(pressTimer);
+      pressTimer = 0;
+      if (!holding) return;
+      ignoreClick = true;
+      if (root.PineTalkDot && typeof root.PineTalkDot.finish === 'function') root.PineTalkDot.finish();
+      finish();
+    });
+    button.addEventListener('pointercancel', function () {
+      if (pressTimer) clearTimeout(pressTimer);
+      pressTimer = 0; finish();
+    });
+    return button;
+  }
+
+  function flowField(label, field, sheet, cls, dictate) {
+    var wrap = make('label', 'sp-flow-field' + (cls ? ' ' + cls : ''));
+    wrap.appendChild(make('span', 'sp-flow-field-label', label));
+    var inner = make('div', 'sp-flow-field-inner');
+    inner.appendChild(field);
+    if (dictate !== false) inner.appendChild(flowDictation(field, sheet));
+    else wrap.classList.add('sp-flow-no-mic');
+    wrap.appendChild(inner);
+    return wrap;
+  }
+
+  function itineraryFlowOpen(entry, parentSheet, refresh) {
+    var name = String(entry.label || entry.kind || 'Scheduled segment');
+    var sheet = sheetShell('spSegmentFlow', 'sp-flowedit', 'Shape: ' + name);
+    if (root.PineDuck && typeof root.PineDuck.hold === 'function') {
+      root.PineDuck.hold('sp-spSegmentFlow', root.PineDuck.REPORT, sheet.back);
+    }
+    var flow = (Array.isArray(entry.flow) ? entry.flow : []).map(flowNode);
+    var selected = flow.length ? flow[0].id : '';
+    var dragId = '';
+    var preset = String(entry.schedule_preset || '');
+
+    var form = make('section', 'sp-flow-editor');
+    var basics = make('div', 'sp-flow-basics');
+    var label = document.createElement('input');
+    label.type = 'text'; label.maxLength = 80; label.value = name;
+    label.setAttribute('aria-label', 'Segment name');
+    var minutes = document.createElement('input');
+    minutes.type = 'number'; minutes.min = '.25'; minutes.max = '600'; minutes.step = '.25';
+    minutes.value = String(Math.max(.25, Number(entry.minutes) || 3));
+    minutes.setAttribute('aria-label', 'Segment duration in minutes');
+    basics.appendChild(flowField('Segment name', label, sheet));
+    basics.appendChild(flowField('Minutes', minutes, sheet, 'sp-flow-minutes', false));
+    form.appendChild(basics);
+
+    var direction = document.createElement('textarea');
+    direction.className = 'sp-flow-direction';
+    direction.rows = 3;
+    direction.placeholder = 'Additional system direction for this segment...';
+    direction.value = String(entry.flow_prompt || '');
+    direction.setAttribute('aria-label', 'Additional system direction for this segment');
+    form.appendChild(flowField('System direction for this segment', direction, sheet));
+
+    var timing = make('section', 'sp-flow-timing');
+    var timingHead = make('div', 'sp-flow-timing-head');
+    var timingLabel = make('b', '', 'Conversation timing');
+    var timingRead = make('span', 'sp-flow-timing-read', '');
+    timingHead.appendChild(timingLabel); timingHead.appendChild(timingRead);
+    var timingRail = make('div', 'sp-flow-timing-rail');
+    var timingFill = make('div', 'sp-flow-timing-fill');
+    timingRail.appendChild(timingFill);
+    timing.appendChild(timingHead); timing.appendChild(timingRail);
+    form.appendChild(timing);
+
+    var utility = make('div', 'sp-flow-utility');
+    var suggest = flowIconButton('sp-flow-suggest', 'c:magic-wand--filled', 'Let the orchestrator suggest a timed flow');
+    var suggestWords = make('span', '', 'Orchestrator suggests');
+    suggest.appendChild(suggestWords);
+    var speakerbox = flowIconButton('sp-flow-speakerbox', 'c:search', 'Find Speakerbox passages for this segment');
+    speakerbox.appendChild(make('span', '', 'Speakerbox suggestions'));
+    utility.appendChild(suggest); utility.appendChild(speakerbox);
+    form.appendChild(utility);
+
+    var speakResults = make('div', 'sp-flow-speakerbox-results');
+    speakResults.hidden = true;
+    form.appendChild(speakResults);
+
+    var work = make('div', 'sp-flow-work');
+    var palette = make('aside', 'sp-flow-palette');
+    palette.appendChild(make('b', 'sp-flow-section-title', 'Add a beat'));
+    FLOW_TYPES.forEach(function (spec) {
+      var button = make('button', 'sp-flow-palette-node', spec[1]);
+      button.type = 'button'; button.draggable = true;
+      button.dataset.type = spec[0];
+      button.title = 'Drag ' + spec[1] + ' into the conversation flow';
+      button.addEventListener('dragstart', function (event) {
+        dragId = ''; event.dataTransfer.setData('text/pine-flow-type', spec[0]);
+        event.dataTransfer.effectAllowed = 'copy';
+      });
+      button.addEventListener('click', function () { add(spec[0]); });
+      palette.appendChild(button);
+    });
+    var graph = make('section', 'sp-flow-graph');
+    graph.setAttribute('aria-label', 'Conversation flow graph');
+    var side = make('aside', 'sp-flow-sidebar');
+    work.appendChild(palette); work.appendChild(graph); work.appendChild(side);
+    form.appendChild(work);
+
+    var saveBar = make('div', 'sp-flow-savebar');
+    var applyKind = make('button', 'sp-flow-apply-kind', 'Apply to every ' + String(entry.kind || 'segment'));
+    applyKind.type = 'button';
+    applyKind.title = 'Use this flow for every matching segment in this saved schedule';
+    var save = make('button', 'sp-flow-save', 'Save segment flow');
+    save.type = 'button';
+    saveBar.appendChild(applyKind); saveBar.appendChild(save);
+    form.appendChild(saveBar);
+    sheet.box.appendChild(form);
+
+    function total() { return flow.reduce(function (sum, node) { return sum + (Number(node.seconds) || 0); }, 0); }
+    function target() { return Math.max(15, (Number(minutes.value) || 3) * 60); }
+    function updateTiming() {
+      var used = total(), allowed = target(), ratio = Math.min(1, used / allowed);
+      timingFill.style.width = (ratio * 100).toFixed(1) + '%';
+      timing.classList.toggle('over', used > allowed);
+      timingRead.textContent = Math.round(used) + 's of ' + Math.round(allowed) + 's'
+        + (used > allowed ? ' - over by ' + Math.round(used - allowed) + 's' : ' - ' + Math.round(allowed - used) + 's open');
+    }
+    function add(type, detail) {
+      var spec = flowType(type);
+      var node = flowNode({type: spec[0], seconds: spec[2], detail: detail || ''}, flow.length);
+      flow.push(node); selected = node.id; render();
+    }
+    function selectedNode() {
+      return flow.find(function (node) { return node.id === selected; }) || null;
+    }
+    function reorder(from, before) {
+      var origin = flow.findIndex(function (node) { return node.id === from; });
+      var aim = flow.findIndex(function (node) { return node.id === before; });
+      if (origin < 0 || aim < 0 || origin === aim) return;
+      var moved = flow.splice(origin, 1)[0];
+      if (origin < aim) aim -= 1;
+      flow.splice(aim, 0, moved); selected = moved.id; render();
+    }
+    function renderGraph() {
+      graph.replaceChildren();
+      graph.classList.toggle('empty', !flow.length);
+      if (!flow.length) {
+        graph.appendChild(make('div', 'sp-flow-empty', 'Drag a beat here, or ask the orchestrator to lay one out.'));
+      }
+      flow.forEach(function (node, index) {
+        var spec = flowType(node.type);
+        var card = make('article', 'sp-flow-node' + (node.id === selected ? ' selected' : ''));
+        card.draggable = true; card.dataset.node = node.id;
+        card.title = 'Drag to change this beat\'s position';
+        card.appendChild(make('span', 'sp-flow-node-order', String(index + 1)));
+        var words = make('div', 'sp-flow-node-words');
+        words.appendChild(make('b', '', spec[1]));
+        words.appendChild(make('span', '', Math.round(node.seconds) + ' seconds'));
+        card.appendChild(words);
+        var drop = flowIconButton('sp-flow-node-delete', 'c:trash-can', 'Remove this beat');
+        drop.addEventListener('click', function (event) {
+          event.stopPropagation(); flow = flow.filter(function (item) { return item.id !== node.id; });
+          selected = flow.length ? flow[Math.max(0, index - 1)].id : ''; render();
+        });
+        card.appendChild(drop);
+        card.addEventListener('click', function () { selected = node.id; render(); });
+        card.addEventListener('dragstart', function (event) {
+          dragId = node.id; event.dataTransfer.setData('text/pine-flow-node', node.id);
+          event.dataTransfer.effectAllowed = 'move'; card.classList.add('dragging');
+        });
+        card.addEventListener('dragend', function () { card.classList.remove('dragging'); });
+        card.addEventListener('dragover', function (event) { event.preventDefault(); card.classList.add('over'); });
+        card.addEventListener('dragleave', function () { card.classList.remove('over'); });
+        card.addEventListener('drop', function (event) {
+          event.preventDefault(); card.classList.remove('over');
+          var type = event.dataTransfer.getData('text/pine-flow-type');
+          var source = event.dataTransfer.getData('text/pine-flow-node') || dragId;
+          if (type) {
+            var spec2 = flowType(type);
+            var made = flowNode({type: spec2[0], seconds: spec2[2]}, flow.length);
+            flow.splice(index, 0, made); selected = made.id; render(); return;
+          }
+          if (source) reorder(source, node.id);
+        });
+        graph.appendChild(card);
+      });
+      graph.ondragover = function (event) { event.preventDefault(); graph.classList.add('drop-ready'); };
+      graph.ondragleave = function () { graph.classList.remove('drop-ready'); };
+      graph.ondrop = function (event) {
+        event.preventDefault(); graph.classList.remove('drop-ready');
+        var type = event.dataTransfer.getData('text/pine-flow-type');
+        if (type) add(type);
+        else {
+          var source = event.dataTransfer.getData('text/pine-flow-node') || dragId;
+          var origin = flow.findIndex(function (node) { return node.id === source; });
+          if (origin >= 0) { flow.push(flow.splice(origin, 1)[0]); selected = source; render(); }
+        }
+      };
+    }
+    function renderSide() {
+      side.replaceChildren();
+      var node = selectedNode();
+      if (!node) {
+        side.appendChild(make('div', 'sp-flow-empty', 'Select a beat to adjust it.'));
+        return;
+      }
+      side.appendChild(make('b', 'sp-flow-section-title', 'Selected beat'));
+      var type = document.createElement('select');
+      FLOW_TYPES.forEach(function (spec) {
+        var option = make('option', '', spec[1]); option.value = spec[0];
+        option.selected = spec[0] === node.type; type.appendChild(option);
+      });
+      type.setAttribute('aria-label', 'Beat type');
+      type.addEventListener('change', function () { node.type = type.value; render(); });
+      var seconds = document.createElement('input');
+      seconds.type = 'number'; seconds.min = '2'; seconds.max = '900'; seconds.step = '1'; seconds.value = String(node.seconds);
+      seconds.setAttribute('aria-label', 'Beat duration in seconds');
+      seconds.addEventListener('input', function () {
+        node.seconds = Math.max(2, Math.min(900, Number(seconds.value) || flowType(node.type)[2])); updateTiming(); renderGraph();
+      });
+      var detail = document.createElement('textarea');
+      detail.rows = 4; detail.maxLength = 400; detail.placeholder = 'What should this beat draw on?'; detail.value = node.detail;
+      detail.setAttribute('aria-label', 'Beat detail');
+      detail.addEventListener('input', function () { node.detail = detail.value.slice(0, 400); });
+      side.appendChild(flowField('Type', type, sheet, '', false));
+      side.appendChild(flowField('Seconds', seconds, sheet, '', false));
+      side.appendChild(flowField('Detail', detail, sheet));
+      var remove = flowIconButton('sp-flow-sidebar-delete', 'c:trash-can', 'Remove selected beat');
+      remove.appendChild(make('span', '', 'Remove beat'));
+      remove.addEventListener('click', function () {
+        flow = flow.filter(function (item) { return item.id !== node.id; }); selected = flow.length ? flow[0].id : ''; render();
+      });
+      side.appendChild(remove);
+    }
+    function render() { updateTiming(); renderGraph(); renderSide(); }
+
+    function suggestFlow() {
+      suggest.disabled = true; suggestWords.textContent = 'Planning...';
+      api().post('/api/schedule/flow/suggest', {kind: String(entry.kind || 'banter'),
+        label: label.value, minutes: Number(minutes.value) || 3, notes: String(entry.notes || '')})
+        .then(function (got) {
+          flow = ((got && got.nodes) || []).map(flowNode);
+          selected = flow.length ? flow[0].id : '';
+          render(); sheet.say(String((got && got.say) || 'The orchestrator proposed a flow.'));
+        }, function (err) { sheet.say(String((err && err.message) || err), true); })
+        ['finally'](function () { suggest.disabled = false; suggestWords.textContent = 'Orchestrator suggests'; });
+    }
+    suggest.addEventListener('click', suggestFlow);
+    speakerbox.addEventListener('click', function () {
+      speakerbox.disabled = true; speakResults.hidden = false;
+      speakResults.textContent = 'Searching Speakerbox...';
+      var query = [label.value, entry.notes, direction.value, entry.prompt].filter(Boolean).join(' ').slice(0, 700);
+      api().get('/api/speakbox/search?k=5&q=' + encodeURIComponent(query || String(entry.kind || 'banter')))
+        .then(function (got) {
+          var hits = (got && got.hits) || [];
+          speakResults.replaceChildren();
+          if (!hits.length) { speakResults.appendChild(make('div', 'sp-flow-empty', 'No matching Speakerbox passages were returned.')); return; }
+          hits.forEach(function (hit) {
+            var line = make('button', 'sp-flow-speak-hit', ''); line.type = 'button';
+            var source = String(hit.name || hit.doc || hit.file || 'Speakerbox passage');
+            var passage = String(hit.text || hit.passage || hit.quote || hit.preview || '').replace(/\s+/g, ' ').slice(0, 260);
+            line.appendChild(make('b', '', source)); line.appendChild(make('span', '', passage || 'Add this passage to the flow'));
+            line.addEventListener('click', function () { add('speakerbox_quote', source + (passage ? ': ' + passage : '')); sheet.say('Speakerbox quote added to the flow.'); });
+            speakResults.appendChild(line);
+          });
+        }, function (err) { speakResults.textContent = String((err && err.message) || err); })
+        ['finally'](function () { speakerbox.disabled = false; });
+    });
+    minutes.addEventListener('input', updateTiming);
+    function saveFlow(allOfKind) {
+      save.disabled = true; applyKind.disabled = true;
+      api().post('/api/schedule/flow/slot', {preset: preset, slot_id: String(entry.slot_id || ''),
+        kind: String(entry.kind || ''), label: label.value, minutes: Number(minutes.value) || 3,
+        notes: String(entry.notes || ''), flow_prompt: direction.value, flow: flow,
+        apply_kind: !!allOfKind}).then(function (got) {
+          sheet.say(String((got && got.say) || 'Segment flow saved.'));
+          if (typeof refresh === 'function') setTimeout(refresh, 350);
+        }, function (err) { sheet.say(String((err && err.message) || err), true); })
+        ['finally'](function () { save.disabled = false; applyKind.disabled = false; });
+    }
+    save.addEventListener('click', function () { saveFlow(false); });
+    applyKind.addEventListener('click', function () { saveFlow(true); });
+    render();
+    return sheet;
+  }
+
   function itineraryPaint(list, hours, sheet) {
     for (var h = 0; h < hours.length; h += 1) {
       var page = hours[h] || {};
@@ -5544,7 +5953,10 @@
       }
       for (k = 0; k < rows.length; k += 1) {
         var next = rows[k + 1] ? Number(rows[k + 1].start) || 0 : 0;
-        list.appendChild(itinRow(rows[k] || {}, next, sheet));
+        var item = Object.assign({}, rows[k] || {}, {
+          schedule_preset: String((page.sheet && page.sheet.preset) || '')
+        });
+        list.appendChild(itinRow(item, next, sheet));
       }
     }
   }
@@ -5641,6 +6053,7 @@
     row.appendChild(conversation);
     var go = function (ev, force) {
       if (ev) ev.preventDefault();
+      if (row.pineFlowHeld) { row.pineFlowHeld = false; return; }
       conversation.hidden = force ? false : !conversation.hidden;
       controls.hidden = conversation.hidden;
       row.setAttribute('aria-expanded', conversation.hidden ? 'false' : 'true');
@@ -5651,6 +6064,66 @@
       if (ev.key !== 'Enter' && ev.key !== ' ' && ev.key !== 'Spacebar') return;
       go(ev);
     });
+    /* Tap reviews the prepared words. Hold opens the operator's flow editor;
+       moving a finger first remains ordinary scrolling on the tablet. */
+    var hold = null;
+    row.addEventListener('pointerdown', function (ev) {
+      if (ev.button !== undefined && ev.button > 0) return;
+      if (ev.target && ev.target.closest && ev.target.closest('button,input,select,textarea')) return;
+      hold = {x: ev.clientX || 0, y: ev.clientY || 0, fired: false};
+      hold.timer = setTimeout(function () {
+        if (!hold) return;
+        hold.fired = true; row.pineFlowHeld = true;
+        itineraryFlowOpen(entry, sheet, function () {
+          var list = document.querySelector('#' + ITIN_ID + ' .sp-itin-list');
+          if (list) itineraryHour(list, sheet);
+        });
+      }, SEG_HOLD_MS);
+    });
+    row.addEventListener('pointermove', function (ev) {
+      if (!hold) return;
+      if (Math.abs((ev.clientX || 0) - hold.x) > SEG_HOLD_SLOP
+          || Math.abs((ev.clientY || 0) - hold.y) > SEG_HOLD_SLOP) {
+        clearTimeout(hold.timer); hold = null;
+      }
+    });
+    row.addEventListener('pointerup', function () {
+      if (hold) clearTimeout(hold.timer);
+      hold = null;
+    });
+    row.addEventListener('pointercancel', function () {
+      if (hold) clearTimeout(hold.timer);
+      hold = null;
+    });
+    row.addEventListener('contextmenu', function (ev) {
+      ev.preventDefault();
+      itineraryFlowOpen(entry, sheet, function () {
+        var list = document.querySelector('#' + ITIN_ID + ' .sp-itin-list');
+        if (list) itineraryHour(list, sheet);
+      });
+    });
+    if (entry.slot_id) {
+      row.draggable = true;
+      row.addEventListener('dragstart', function (ev) {
+        ev.dataTransfer.setData('text/pine-schedule-slot', String(entry.slot_id));
+        row.classList.add('sp-itin-dragging');
+      });
+      row.addEventListener('dragend', function () { row.classList.remove('sp-itin-dragging'); });
+      row.addEventListener('dragover', function (ev) {
+        ev.preventDefault(); row.classList.add('sp-itin-drop');
+      });
+      row.addEventListener('dragleave', function () { row.classList.remove('sp-itin-drop'); });
+      row.addEventListener('drop', function (ev) {
+        var source = ev.dataTransfer.getData('text/pine-schedule-slot');
+        if (!source || source === String(entry.slot_id || '')) return;
+        ev.preventDefault(); row.classList.remove('sp-itin-drop');
+        itineraryReorder({slot_id: source, schedule_preset: entry.schedule_preset}, entry, sheet,
+          function () {
+            var list = document.querySelector('#' + ITIN_ID + ' .sp-itin-list');
+            if (list) itineraryHour(list, sheet);
+          });
+      });
+    }
     return row;
   }
 
@@ -9253,6 +9726,13 @@
     var stage = String(row.stage || '').toLowerCase();
     var kind = String(row.kind || '').toLowerCase();
     var round = String(row.round || '').toLowerCase();
+    /* A renderer is not a speaker. The generic worker label made a useful
+       progress row read like infrastructure noise; name the person whose
+       words are in flight instead. */
+    if (stage === 'voicing') {
+      var speaker = feedSpeaker(row);
+      return speaker ? speaker + ' rendering' : 'Voice rendering';
+    }
     if (stage) return feedHuman(stage);
     if (kind === 'interject' || kind === 'image_analysis' || kind === 'sfx') {
       return feedHuman(kind);
@@ -9277,6 +9757,13 @@
     var speaker = feedSpeaker(row);
     var stage = String(row.stage || '').toLowerCase();
     if (stage === 'voicing') {
+      var total = Math.max(0, Number(row.script_total) || 0);
+      var index = Math.max(0, Math.min(total, Number(row.script_index) || 0));
+      if (total) {
+        return 'line ' + index + ' of ' + total + ' - '
+          + Math.round((1 / total) * 100) + '% of script; '
+          + Math.round((index / total) * 100) + '% queued through render';
+      }
       return speaker ? 'rendering a line for ' + speaker : 'rendering the next broadcast line';
     }
     if (stage === 'writing') return 'preparing dialogue for a scheduled segment';
@@ -9333,6 +9820,14 @@
     });
   }
 
+  function feedRenderProgress(row) {
+    var total = Math.max(0, Number(row && row.script_total) || 0);
+    var index = Math.max(0, Math.min(total, Number(row && row.script_index) || 0));
+    if (String((row && row.stage) || '').toLowerCase() !== 'voicing' || !total) return null;
+    return {index: index, total: total, contribution: 100 / total,
+      complete: (index / total) * 100};
+  }
+
   function feedFrame(row, extraClass) {
     var line = make('div', 'sp-msg' + (extraClass ? ' ' + extraClass : ''));
     line.setAttribute('role', 'button');
@@ -9348,8 +9843,14 @@
     line.appendChild(context);
     var body = feedCrawl(feedWords(row));
     line.appendChild(body);
+    var progress = make('span', 'sp-msg-render-progress');
+    progress.hidden = true;
+    var progressFill = make('span', 'sp-msg-render-progress-fill');
+    progress.appendChild(progressFill);
+    line.appendChild(progress);
     line.pineFeedNodes = {operation: operation, purpose: purpose,
-      purposeText: purposeText, body: body, badge: null};
+      purposeText: purposeText, body: body, progress: progress,
+      progressFill: progressFill, badge: null};
     return line;
   }
 
@@ -9381,6 +9882,8 @@
     var purpose = parts ? parts.purpose : line.querySelector('.sp-msg-purpose');
     var purposeText = parts ? parts.purposeText : line.querySelector('.sp-msg-purpose-text');
     var body = parts ? parts.body : line.querySelector('.sp-msg-marquee');
+    var progress = parts ? parts.progress : line.querySelector('.sp-msg-render-progress');
+    var progressFill = parts ? parts.progressFill : line.querySelector('.sp-msg-render-progress-fill');
     var operation = feedOperation(row);
     var why = feedPurpose(row);
     if (head && head.textContent !== operation) head.textContent = operation;
@@ -9397,6 +9900,16 @@
       if (parts) parts.badge = null;
     }
     feedCrawlDress(body, feedWords(row));
+    var render = feedRenderProgress(row);
+    line.classList.toggle('sp-msg-render', !!render);
+    if (progress) progress.hidden = !render;
+    if (render && progressFill) {
+      progressFill.style.width = render.complete.toFixed(1) + '%';
+      progress.title = 'Line ' + render.index + ' of ' + render.total
+        + ': this line contributes ' + render.contribution.toFixed(1)
+        + '%; render queue is ' + render.complete.toFixed(1) + '% complete.';
+      progress.setAttribute('aria-label', progress.title);
+    }
     /* [#1200] a clip deleted from the library reads as gone in the feed. */
     if (line.pineDeleted !== !!row.deleted) {
       line.pineDeleted = !!row.deleted;

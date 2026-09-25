@@ -43,6 +43,7 @@ from sfx_cue import CueCandidate, choose_due_cue
 from sfx_reaction import COMPLAINT_LINES, complaint_due
 from news_dossier import fetch_service as fetch_news_dossier, public_url as news_public_url
 from line_blacklist import Blacklist
+from changelog import ChangeLog
 from line_review import LineReviewStore, ReviewConflictError
 from rejection_lab import RejectionLabStore
 from rejection_lab_runtime import LabRuntime
@@ -238,6 +239,7 @@ _LINE_REVIEW = LineReviewStore(data_path("line_review.sqlite3"))
 _REJECTION_LAB = RejectionLabStore(data_path("rejection_lab.sqlite3"))
 _PROMPT_LEARNING = PromptLearningStore(data_path("prompt_learning.sqlite3"))
 _SFX_CADENCE = SfxCadence(data_path("sfx_cadence.sqlite3"))
+_CHANGELOG = ChangeLog(Path(__file__).resolve().parent, data_path("changelog_tasks.json"))
 director_path(DATA_DIR)                 # the director's book lives here too
 _SFX_CADENCE_STATUS = {"sample_due": 0, "sample_omitted": 0,
                        "guy_due": 0, "guy_omitted": 0, "last_sample": ""}
@@ -9247,7 +9249,9 @@ def _model_call_full(text: str) -> dict[str, Any]:
 
 async def voice_render_any(text: str, voice: str, engine: str = "",
                            fx: dict[str, float] | None = None,
-                           who: str = "") -> dict[str, Any] | None:
+                           who: str = "", line: str = "",
+                           script_index: int = 0,
+                           script_total: int = 0) -> dict[str, Any] | None:
     """Render this line through the assigned actor whenever possible.
 
     THE contract for #784: ordinary lines use every available engine to stay
@@ -9319,7 +9323,9 @@ async def voice_render_any(text: str, voice: str, engine: str = "",
             secs = 0.0
             for piece in pieces:
                 part = await voice_render_any(piece, voice, engine,
-                                              fx=fx, who=who)
+                                              fx=fx, who=who, line=line,
+                                              script_index=script_index,
+                                              script_total=script_total)
                 if part and part.get("path"):
                     made.append(part["path"])
                     secs += float(part.get("seconds") or 0)
@@ -9479,8 +9485,10 @@ async def voice_render_any(text: str, voice: str, engine: str = "",
         if extra_lane:
             _ENGINE_PREP_BY[eng] = 1
         try:
-            clip = await voice_generate(text, name, eng,
-                                        fx=None if not name else fx)
+            clip = await voice_generate(
+                text, name, eng, fx=None if not name else fx, line=line,
+                speaker=booth_actor_name(who, "") if who else "",
+                script_index=script_index, script_total=script_total)
         except Exception as exc:
             # #784: WHY, not just that. "every engine refused" with no reason
             # attached is not a diagnosis, and this is the last line of
@@ -24731,7 +24739,9 @@ def _replay_save() -> None:
 
 async def voice_generate(text: str, voice: str, engine: str,
                          fx: dict[str, float] | None = None,
-                         line: str = "") -> dict[str, Any]:
+                         line: str = "", speaker: str = "",
+                         script_index: int = 0,
+                         script_total: int = 0) -> dict[str, Any]:
     """text + voice in, a stored audio path out. Nothing is created unless
     synthesis succeeds. `fx` wets the line — echo and a room — for the callers
     that want the pair to sound like they are in a booth rather than a
@@ -24818,7 +24828,8 @@ async def voice_generate(text: str, voice: str, engine: str,
     # other callers render things that are not script lines; when it is
     # given, the feed can show the words and point at the script.
     note_activity("voicing", f"{engine} · {len(text)} chars",
-                  line=line, text=text)
+                  line=line, text=text, speaker=speaker,
+                  script_index=script_index, script_total=script_total)
     pipeline_log("voice", f"{engine} · {voice or 'default voice'} · "
                           f"{len(text)} chars in",
                  extra=(f"INPUT to {engine} "
@@ -30127,7 +30138,8 @@ def air_at_set(row: dict[str, Any], when: float,
 
 
 def note_activity(stage: str, detail: str = "",
-                  line: str = "", text: str = "") -> None:
+                  line: str = "", text: str = "", speaker: str = "",
+                  script_index: int = 0, script_total: int = 0) -> None:
     """#1277: ...and WHICH LINE it is, and what the line says.
 
     The feed used to show `voicing · xtts · 163 chars` while the station
@@ -30141,6 +30153,12 @@ def note_activity(stage: str, detail: str = "",
         now["line"] = str(line)
     if text:
         now["text"] = str(text)[:400]
+    if speaker:
+        now["speaker"] = str(speaker)[:100]
+    if script_total > 0:
+        now["script_index"] = max(0, min(int(script_index or 0),
+                                           int(script_total)))
+        now["script_total"] = int(script_total)
     _RADIO["activity"] = now
     log = _RADIO.setdefault("activity_log", [])
     # #790: the detail rides in the log too, so the Route cell's history can
@@ -30151,6 +30169,12 @@ def note_activity(stage: str, detail: str = "",
         row["line"] = str(line)
     if text:
         row["text"] = str(text)[:400]
+    if speaker:
+        row["speaker"] = str(speaker)[:100]
+    if script_total > 0:
+        row["script_index"] = max(0, min(int(script_index or 0),
+                                           int(script_total)))
+        row["script_total"] = int(script_total)
     log.append(row)
     del log[:-120]
 
@@ -60620,6 +60644,130 @@ CANONICAL_HOUR: tuple[tuple[str, str, float, str], ...] = (
 )
 
 
+# --- #1301: THE OPERATOR'S CONVERSATION FLOW ------------------------------
+#
+# A scheduled segment is more than its road and its duration.  The operator
+# can lay out the beats that make the duration real: a news mention followed
+# by a quote and a sting, a caller reacting to the previous subject, an ad
+# drop, and so on.  Keep that plan on the SLOT (not on a candidate) because it
+# has to survive re-writes, pre-recording and an hour being copied into a new
+# schedule.
+
+SCHEDULE_FLOW_TYPES: dict[str, dict[str, Any]] = {
+    "news_mention": {"label": "News mention", "seconds": 48,
+                       "instruction": "Discuss the selected current news item with its dossier; name the facts you can support and then react to them."},
+    "speakerbox_quote": {"label": "Speakerbox quote", "seconds": 30,
+                          "instruction": "Bring in the selected Speakerbox passage as a quoted source, then make the cast respond to its actual point."},
+    "random_topic": {"label": "Random topic", "seconds": 52,
+                     "instruction": "Pivot through a fresh topic from the topic bank and let both hosts give it a real conversational turn."},
+    "caller": {"label": "Caller", "seconds": 82,
+               "instruction": "Put a caller on the line who is responding to the immediately preceding subject; the caller must have heard that subject."},
+    "manager_message": {"label": "Manager message", "seconds": 42,
+                        "instruction": "Have an upstairs message interrupt or steer the room, and let the cast react before continuing."},
+    "sfx": {"label": "SFX", "seconds": 6,
+            "instruction": "The SFX Guy plays an audible, normalized clip that fits the beat. Make it a real on-air event, not a note about one."},
+    "ad_drop": {"label": "Ad drop", "seconds": 32,
+                "instruction": "Run a concise produced ad drop, then give the hosts one natural reaction or transition."},
+    "painting_ad": {"label": "Painting ad", "seconds": 58,
+                    "instruction": "Pitch a painting on air with concrete, strange details and a clear call to action."},
+    "product": {"label": "Product pitch", "seconds": 48,
+                "instruction": "Pitch one random product as a live on-air product read, with the cast treating it as a real offer."},
+}
+
+
+def _schedule_flow_node(raw: Any, index: int = 0) -> dict[str, Any] | None:
+    """Clean one operator-authored beat before it reaches the durable sheet."""
+    row = raw if isinstance(raw, dict) else {}
+    kind = str(row.get("type") or row.get("kind") or "").strip().lower()
+    if kind not in SCHEDULE_FLOW_TYPES:
+        return None
+    default = float(SCHEDULE_FLOW_TYPES[kind]["seconds"])
+    try:
+        seconds = float(row.get("seconds") or default)
+    except (TypeError, ValueError):
+        seconds = default
+    if seconds != seconds:
+        seconds = default
+    return {
+        "id": (str(row.get("id") or "").strip()[:48]
+               or f"flow-{index + 1}-{uuid.uuid4().hex[:8]}"),
+        "type": kind,
+        "seconds": round(max(2.0, min(900.0, seconds)), 1),
+        "detail": str(row.get("detail") or "").strip()[:400],
+    }
+
+
+def schedule_flow_nodes(raw: Any) -> list[dict[str, Any]]:
+    """Return a bounded, ordered, clean flow. Empty is deliberately valid."""
+    if not isinstance(raw, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for index, item in enumerate(raw[:32]):
+        node = _schedule_flow_node(item, index)
+        if node:
+            out.append(node)
+    return out
+
+
+def schedule_flow_suggestion(kind: str, minutes: Any = 3,
+                             label: str = "", notes: str = "") -> dict[str, Any]:
+    """The orchestrator's editable, duration-aware first pass at a segment."""
+    road = str(kind or "banter").strip().lower()
+    try:
+        target = max(15.0, min(36000.0, float(minutes) * 60.0))
+    except (TypeError, ValueError):
+        target = 180.0
+    shapes: dict[str, list[str]] = {
+        "news": ["news_mention", "speakerbox_quote", "sfx", "random_topic", "sfx"],
+        "caller": ["random_topic", "caller", "sfx", "caller"],
+        "banter_caller": ["random_topic", "caller", "sfx", "random_topic"],
+        "manager": ["manager_message", "random_topic", "sfx"],
+        "gallery": ["painting_ad", "sfx", "product"],
+        "ad": ["ad_drop", "sfx", "product"],
+        "record": ["sfx", "random_topic", "sfx"],
+        "recap": ["random_topic", "speakerbox_quote", "sfx"],
+    }
+    types = list(shapes.get(road) or ["random_topic", "speakerbox_quote", "sfx", "random_topic"])
+    base = sum(float(SCHEDULE_FLOW_TYPES[item]["seconds"]) for item in types)
+    scale = target / base if base > 0 else 1.0
+    nodes = []
+    for index, item in enumerate(types):
+        default = float(SCHEDULE_FLOW_TYPES[item]["seconds"])
+        # Stings remain audible, even when the operator is making a very
+        # short segment. The non-SFX beats absorb the rest of the scaling.
+        seconds = max(4.0 if item == "sfx" else 10.0, default * scale)
+        nodes.append(_schedule_flow_node({"id": f"suggested-{index + 1}",
+                                          "type": item, "seconds": seconds}, index))
+    return {
+        "kind": road, "label": str(label or "")[:80],
+        "target_seconds": round(target, 1), "nodes": [node for node in nodes if node],
+        "say": "The orchestrator laid out %d timed beats for this segment." % len(nodes),
+        "notes": str(notes or "")[:400],
+    }
+
+
+def schedule_flow_clause(slot: dict[str, Any]) -> str:
+    """Turn an operator's graph into a writer instruction every road sees."""
+    nodes = schedule_flow_nodes((slot or {}).get("flow"))
+    extra = str((slot or {}).get("flow_prompt") or "").strip()[:1800]
+    if not nodes and not extra:
+        return ""
+    parts = ["\n\nOPERATOR CONVERSATION FLOW (#1301): Follow these beats in this exact order. Each is an on-air event, not a production note. Keep moving until the segment's scheduled duration is honestly filled."]
+    for index, node in enumerate(nodes):
+        info = SCHEDULE_FLOW_TYPES.get(str(node.get("type") or ""), {})
+        line = "%d. %s for about %ss. %s" % (
+            index + 1, str(info.get("label") or node.get("type") or "beat"),
+            int(round(float(node.get("seconds") or 0))),
+            str(info.get("instruction") or ""))
+        detail = str(node.get("detail") or "").strip()
+        if detail:
+            line += " Operator detail: " + detail
+        parts.append(line)
+    if extra:
+        parts.append("ADDITIONAL SYSTEM DIRECTION FOR THIS ONE SEGMENT: " + extra)
+    return "\n".join(parts)
+
+
 def _sched_slot(raw: Any) -> dict[str, Any]:
     """One entry off the panel, cleaned. Everything missing gets a sane
     default, so a half-written row can never take the station down."""
@@ -60649,6 +60797,7 @@ def _sched_slot(raw: Any) -> dict[str, Any]:
     # about the pitch. Named here or it does not survive a save at all.
     pin = row.get("pinned_id")
     pin = str(pin).strip()[:64] if pin not in (None, "") else None
+    flow = schedule_flow_nodes(row.get("flow"))
     return {
         "id": (str(row.get("id") or "").strip()[:48]
                or f"slot-{uuid.uuid4().hex[:10]}"),
@@ -60659,6 +60808,11 @@ def _sched_slot(raw: Any) -> dict[str, Any]:
         "prompt_id": pid or None,
         "notes": str(row.get("notes") or "")[:400],
         "pinned_id": pin or None,                              # #926
+        # #1301: a per-segment conversation score plus the small instruction
+        # that accompanies only this slot. Both travel with copied presets and
+        # hour overrides, and both are passed to the writing room below.
+        "flow": flow,
+        "flow_prompt": str(row.get("flow_prompt") or "").strip()[:1800],
         # #891: the record pinned to THIS entry, if one is. Cleaned here so
         # it rides every road a slot travels — the preset shelf, an hour's
         # own copy of the order, and the panel — without a second store.
@@ -61627,6 +61781,11 @@ def _schedule_clause(preset: str, slot: dict[str, Any], text: str,
                                    "occurrence") or ""))
             + director_lessons_clause(str(slot.get("kind") or ""))
             + director_feedback_clause(str(slot.get("kind") or ""))
+            # #1301: the operator's timed graph is a per-SLOT contract, not
+            # another generic road preference. Put it on this shared clause
+            # path so System2 and the legacy runner both execute the same
+            # sequence of news, calls, quotes, drops and SFX.
+            + schedule_flow_clause(slot)
             # [#1240/#1249] AND THE STORY AS A STAGE DIRECTION, and the
             # phone's subject for a caller entry. Here, for the reason
             # the director's notes are here: this clause is the one choke
@@ -62871,6 +63030,95 @@ async def schedule_slots_api(
     note_action(f"🗓 schedule saved: {name} "
                 f"({len(store['presets'][name])} entries) (#843)")
     return schedule_public(store)
+
+
+@app.post("/api/schedule/flow/suggest")
+async def schedule_flow_suggest_api(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Ask the orchestrator for a timed, editable opening graph.
+
+    It intentionally does not save. The graph is a proposal until the
+    operator presses Save in the segment editor, which keeps a helpful
+    suggestion from silently changing the hour on air.
+    """
+    require_auth(authorization)
+    payload = await request.json()
+    payload = payload if isinstance(payload, dict) else {}
+    return await asyncio.to_thread(
+        schedule_flow_suggestion,
+        str(payload.get("kind") or "banter"), payload.get("minutes") or 3,
+        str(payload.get("label") or ""), str(payload.get("notes") or ""))
+
+
+@app.post("/api/schedule/flow/slot")
+async def schedule_flow_slot_api(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Save one graph, or deliberately apply it to matching future roads.
+
+    A separate narrow endpoint prevents a graph UI with a stale copy of the
+    entire schedule from accidentally overwriting unrelated slots. General
+    list reordering still belongs to POST /api/schedule/slots.
+    """
+    require_auth(authorization)
+    payload = await request.json()
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Expected an object")
+    slot_id = str(payload.get("slot_id") or "").strip()[:48]
+    if not slot_id:
+        raise HTTPException(status_code=400, detail="Choose a scheduled segment")
+    with _SCHEDULE_LOCK:
+        store = schedule_read()
+        preset = (str(payload.get("preset") or "").strip()[:60]
+                  or str(store.get("active") or ""))
+        rows = list((store.get("presets") or {}).get(preset) or [])
+        if not rows:
+            raise HTTPException(status_code=404, detail="No such schedule")
+        target = next((row for row in rows
+                       if str((row or {}).get("id") or "") == slot_id), None)
+        if target is None:
+            raise HTTPException(status_code=404, detail="No such segment on that schedule")
+        flow = schedule_flow_nodes(payload.get("flow"))
+        flow_prompt = str(payload.get("flow_prompt") or "").strip()[:1800]
+        apply_kind = bool(payload.get("apply_kind"))
+        changed: list[dict[str, Any]] = []
+        target_kind = str(target.get("kind") or "")
+        for index, raw in enumerate(rows):
+            if not isinstance(raw, dict):
+                continue
+            is_target = str(raw.get("id") or "") == slot_id
+            if not is_target and (not apply_kind
+                                  or str(raw.get("kind") or "") != target_kind):
+                continue
+            row = dict(raw)
+            row["flow"] = flow
+            row["flow_prompt"] = flow_prompt
+            # These are the actual segment properties the editor exposes.
+            # Missing keys preserve the existing schedule rather than asking a
+            # stale browser tab to resubmit fields it never showed.
+            for field, limit in (("label", 80), ("notes", 400)):
+                if field in payload:
+                    row[field] = str(payload.get(field) or "").strip()[:limit]
+            if "minutes" in payload:
+                try:
+                    row["minutes"] = float(payload.get("minutes"))
+                except (TypeError, ValueError):
+                    pass
+            rows[index] = _sched_slot(row)
+            changed.append(rows[index])
+        store["presets"][preset] = rows
+        schedule_write(store)
+    _RADIO["sched_prompt"] = ""
+    note_action("schedule conversation flow saved: " + preset + " ("
+                + str(len(changed)) + " segment" + ("s" if len(changed) != 1 else "")
+                + ") (#1301)")
+    return {"ok": True, "preset": preset, "slots": changed,
+            "schedule": schedule_public(store),
+            "say": "Saved the conversation flow for %d segment%s." % (
+                len(changed), "s" if len(changed) != 1 else "")}
 
 
 @app.post("/api/schedule/preset")
@@ -80602,7 +80850,16 @@ def _sfx_cadence_audible(rows, position: float, previous: float = 0.0) -> None:
     for row in complete:
         if str(row["id"]) in added and row.get("sfx_sample_id"):
             try:
-                sfx_note_play(str(row["sfx_sample_id"]), str(row.get("text") or "").removeprefix("🔊 "), "board")
+                sample_id = str(row["sfx_sample_id"])
+                sfx_note_play(sample_id, str(row.get("text") or "").removeprefix("🔊 "), "board")
+                # A cadence clip is welded into a finished broadcast clip, not
+                # sent through dj_sting().  It still needs the same durable
+                # on-air history as a manually cued sting once its receipt is
+                # audible, otherwise the operator sees a silent board while
+                # the mixed programme is actually playing it.
+                source = sfx_by_id(sample_id)
+                if source:
+                    sfx_history_add(source, "board")
             except Exception:
                 pass  # the durable cadence receipt is already saved
         if str(row["id"]) in added and row.get("sfx_video_id"):
@@ -100188,6 +100445,13 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
     if not await _system2_repeat_rows_async(playlist, ready_meta):
         return []
 
+    # The feed receives this at render start, not after the completed clip is
+    # published. It can therefore show which person is being rendered and how
+    # far the actual script has progressed while the engine is still working.
+    for _script_index, _script_item in enumerate(playlist):
+        _script_item["script_index"] = _script_index + 1
+        _script_item["script_total"] = len(playlist)
+
     def _turn_voice(item: dict[str, Any]) -> str | None:
         if ready_takes is not None:
             return str(item.get("voice") or "")
@@ -100263,7 +100527,10 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
             try:
                 _made = await voice_render_any(
                     text, v, "" if cold else engine,
-                    fx=_turn_fx(item), who=item["who"])
+                    fx=_turn_fx(item), who=item["who"],
+                    line=str(item.get("line_id") or ""),
+                    script_index=int(item.get("script_index") or 0),
+                    script_total=int(item.get("script_total") or 0))
             finally:
                 engine_live_exit()
             take_note(item["who"], v, engine, text, _made,
@@ -100539,7 +100806,10 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                         clip = await voice_generate(
                             spoken_text(item["chunk"]), v,
                             voice_engine_for(v), fx=_turn_fx(item),
-                            line=str(item.get("line_id") or ""))   # #1277
+                            line=str(item.get("line_id") or ""),
+                            speaker=booth_actor_name(str(item.get("who") or ""), ""),
+                            script_index=int(item.get("script_index") or 0),
+                            script_total=int(item.get("script_total") or 0))   # #1277
                     except Exception:
                         clip = None
                     # A clone that fails must NOT drop the turn from the call —
@@ -100553,7 +100823,10 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                     if not clip:
                         clip = await voice_render_any(
                             spoken_text(item["chunk"]), v, fx=_turn_fx(item),
-                            who=item["who"])
+                            who=item["who"],
+                            line=str(item.get("line_id") or ""),
+                            script_index=int(item.get("script_index") or 0),
+                            script_total=int(item.get("script_total") or 0))
                 if not (clip and clip.get("path")):
                     # #767: premake missed, the re-render raised and piper
                     # raised too. This had no else — the turn vanished out of
@@ -122151,6 +122424,40 @@ async def station_flow_api(
     return result
 
 
+@app.get("/api/changelog")
+async def changelog_api(
+    limit: int = 60,
+    before: str = "",
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """The committed station history plus task facts that were captured."""
+    require_read_auth(authorization)
+    try:
+        return await asyncio.to_thread(_CHANGELOG.page, limit, before)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+@app.post("/api/changelog/task")
+async def changelog_task_api(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Attach an agent's real prompt, tokens, goal, and elapsed time to Git."""
+    require_auth(authorization)
+    body = await request.json()
+    if not isinstance(body, dict) or not str(body.get("commit") or "").strip():
+        raise HTTPException(status_code=400, detail="A Git commit is required")
+    try:
+        return await asyncio.to_thread(_CHANGELOG.record, str(body["commit"]), body)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
 @app.post("/api/dj/monitor")
 async def dj_monitor_api(
     request: Request,
@@ -140543,6 +140850,8 @@ def director_room(which: int = 0) -> dict[str, Any]:
                     "start": 0.0, "deadline": 0.0, "state": "unplanned",
                     "notes": str(slot.get("notes") or ""),
                     "prompt": str(schedule_prompt_for(store, slot) or "")[:1200],
+                    "flow": schedule_flow_nodes(slot.get("flow")),
+                    "flow_prompt": str(slot.get("flow_prompt") or "")[:1800],
                     "script": {"turns": [], "state": "nothing", "drafts": 0},
                     "aired": [], "aired_seconds": 0.0,
                     "direction": _director_direction(
@@ -140682,6 +140991,8 @@ def director_room(which: int = 0) -> dict[str, Any]:
             "state": state,
             "notes": str(slot.get("notes") or ""),
             "prompt": str(slot.get("prompt") or "")[:1600],
+            "flow": schedule_flow_nodes(slot.get("flow")),
+            "flow_prompt": str(slot.get("flow_prompt") or "")[:1800],
             "script": script,
             "aired": aired,
             "aired_seconds": round(heard, 1),

@@ -864,9 +864,38 @@
   from { transform: translate3d(0, 0, 0); }
   to { transform: translate3d(calc(-50% - 26px), 0, 0); }
 }
+/* A render row is a live queue entry, not ordinary feed chatter. Give its
+   voiced line the available width and make the script's measured contribution
+   visible below it while the engine is working. */
+.sp-msg.sp-msg-render {
+  grid-template-columns: 36px minmax(0, 1fr);
+  grid-template-rows: auto minmax(20px, auto) 5px;
+  align-items: start;
+  min-height: 65px;
+}
+.sp-msg-render .sp-msg-avatar { grid-column: 1; grid-row: 1 / 4; }
+.sp-msg-render .sp-msg-context {
+  grid-column: 2; grid-row: 1; display: flex; align-items: baseline;
+  gap: 8px; min-width: 0;
+}
+.sp-msg-render .sp-msg-who { flex: 0 0 auto; color: #7fd1ff; }
+.sp-msg-render .sp-msg-purpose { min-width: 0; flex: 1 1 auto; }
+.sp-msg-render .sp-msg-marquee {
+  grid-column: 2; grid-row: 2; width: 100%; align-self: center;
+  color: #dfe7ee;
+}
+.sp-msg-render-progress {
+  grid-column: 2; grid-row: 3; display: block; height: 5px; overflow: hidden;
+  border-radius: 2px; background: #263842; box-shadow: inset 0 0 0 1px rgba(127,209,255,.12);
+}
+.sp-msg-render-progress-fill {
+  display: block; height: 100%; min-width: 2px; width: 0;
+  background: #7fd1ff; transition: width .35s ease;
+}
 @media (max-width: 760px) {
   .sp-msg { grid-template-columns: 32px minmax(92px, .72fr) minmax(0, 1.4fr); gap: 7px; }
   .sp-msg-avatar { width: 30px; height: 30px; min-width: 30px; }
+  .sp-msg.sp-msg-render { grid-template-columns: 32px minmax(0, 1fr); }
 }
 @media (prefers-reduced-motion: reduce) {
   .sp-msg-marquee.is-moving .sp-msg-marquee-track { animation: none; }
@@ -2819,6 +2848,9 @@ video.sp-folder-media { height: auto; max-height: 120px; background: #000000; bo
 .sp-itin-row.sp-itin-go { cursor: pointer; }
 .sp-itin-row.sp-itin-go:hover { background: #0c151b; }
 .sp-itin-row.sp-itin-go:focus-visible { outline: 2px solid #65c7da; outline-offset: -2px; }
+.sp-itin-row[draggable="true"] { cursor: grab; }
+.sp-itin-row.sp-itin-dragging { opacity: .48; }
+.sp-itin-row.sp-itin-drop { box-shadow: inset 3px 0 #e3be63; background: #1a170d; }
 .sp-itin-row.sp-itin-nogo .sp-itin-name { color: #a8b6bf; }
 .sp-itin-conversation {
   flex: 0 0 calc(100% - 52px); width: calc(100% - 52px);
@@ -3360,6 +3392,87 @@ html.pine-tech-wide #pineViewRail:focus-within {
 html.pine-tech-wide .sp-tech.sp-tech-wide .wc-bar,
 html.pine-tech-wide .sp-tech.sp-tech-wide .wc-strip {
   padding-right: 26px;
+}
+
+/* ---- #1301: per-segment conversation graph ----------------------- */
+.sp-flowedit-box { width: min(1180px, calc(100vw - 24px)); max-height: calc(100dvh - 24px); overflow-x: hidden; overflow-y: auto; }
+.sp-flow-editor { display: flex; flex-direction: column; min-width: 0; }
+.sp-flow-basics { display: grid; grid-template-columns: minmax(0, 1fr) 150px; gap: 8px; padding: 10px 12px 0; }
+.sp-flow-field { display: block; min-width: 0; }
+.sp-flow-field-label { display: block; margin: 0 0 4px; color: #8ea0ad; font-size: 10px; }
+.sp-flow-field-inner { position: relative; min-width: 0; }
+.sp-flow-field-inner input, .sp-flow-field-inner textarea, .sp-flow-field-inner select { width: 100%; min-width: 0; min-height: 35px; padding-right: 42px; box-sizing: border-box; }
+.sp-flow-no-mic .sp-flow-field-inner input, .sp-flow-no-mic .sp-flow-field-inner textarea, .sp-flow-no-mic .sp-flow-field-inner select { padding-right: 8px; }
+.sp-flow-field-inner textarea { display: block; resize: vertical; }
+.sp-flow-editor > .sp-flow-field { padding: 10px 12px 0; }
+.sp-flow-mic { position: absolute; right: 4px; top: 50%; transform: translateY(-50%); width: 31px; height: 31px; padding: 0; border-radius: 5px; }
+.sp-flow-mic .pi-icon { width: 17px; height: 17px; }
+.sp-flow-mic.on { color: #071116; background: #65c7da; border-color: #65c7da; }
+.sp-flow-timing { margin: 12px 12px 0; padding: 8px 10px; border: 1px solid #28414b; border-radius: 7px; background: #101b21; }
+.sp-flow-timing.over { border-color: #e3be63; }
+.sp-flow-timing-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; font-size: 10px; }
+.sp-flow-timing-head b { color: #65c7da; }
+.sp-flow-timing-read { color: #b8c9d0; font-variant-numeric: tabular-nums; text-align: right; }
+.sp-flow-timing-rail { height: 8px; margin-top: 7px; overflow: hidden; border-radius: 3px; background: #263842; }
+.sp-flow-timing-fill { height: 100%; width: 0; min-width: 2px; background: #65c7da; transition: width .18s ease; }
+.sp-flow-timing.over .sp-flow-timing-fill { background: #e3be63; }
+.sp-flow-utility { display: flex; flex-wrap: wrap; gap: 7px; padding: 10px 12px 0; }
+.sp-flow-suggest, .sp-flow-speakerbox, .sp-flow-apply-kind, .sp-flow-save { min-height: 35px; padding: 0 9px; border-radius: 5px; font-size: 10px; }
+.sp-flow-suggest, .sp-flow-speakerbox { display: inline-flex; align-items: center; gap: 5px; }
+.sp-flow-suggest .pi-icon, .sp-flow-speakerbox .pi-icon { width: 17px; height: 17px; }
+.sp-flow-suggest { color: #65c7da; border-color: #3c7680; }
+.sp-flow-speakerbox { color: #d7b6e8; border-color: #755486; }
+.sp-flow-speakerbox-results { margin: 8px 12px 0; border: 1px solid #2b3d49; border-radius: 7px; overflow: hidden; }
+.sp-flow-speak-hit { display: grid; width: 100%; gap: 3px; padding: 8px 10px; text-align: left; border: 0; border-radius: 0; border-bottom: 1px solid #22323b; background: #101820; }
+.sp-flow-speak-hit:last-child { border-bottom: 0; }
+.sp-flow-speak-hit b { color: #a9dce2; font-size: 10px; }
+.sp-flow-speak-hit span { color: #c2d0d7; font-size: 10px; line-height: 1.35; white-space: normal; overflow-wrap: anywhere; }
+.sp-flow-work { display: grid; grid-template-columns: 160px minmax(250px, 1fr) 230px; gap: 9px; padding: 12px; min-width: 0; }
+.sp-flow-palette, .sp-flow-sidebar { min-width: 0; padding: 8px; border: 1px solid #2b3d49; border-radius: 7px; background: #101820; }
+.sp-flow-section-title { display: block; margin: 0 0 7px; color: #8ea0ad; font-size: 10px; }
+.sp-flow-palette-node { display: block; width: 100%; min-height: 31px; margin: 0 0 5px; padding: 0 7px; text-align: left; border-radius: 5px; font-size: 9.5px; }
+.sp-flow-palette-node:active { cursor: grabbing; }
+.sp-flow-graph { display: flex; flex-wrap: wrap; align-content: flex-start; gap: 8px 20px; min-height: 198px; padding: 11px; border: 1px solid #30535c; border-radius: 7px; background-color: #0c151a; background-image: radial-gradient(#2a4650 1px, transparent 1px); background-size: 16px 16px; }
+.sp-flow-graph.empty, .sp-flow-graph.drop-ready { outline: 2px dashed #65c7da; outline-offset: -5px; }
+.sp-flow-node { position: relative; display: grid; grid-template-columns: 21px minmax(80px, 1fr) 28px; align-items: center; gap: 6px; width: min(170px, 100%); min-height: 50px; padding: 6px; border: 1px solid #3e6470; border-radius: 7px; background: #13232b; cursor: grab; user-select: none; }
+.sp-flow-node::after { content: ''; position: absolute; top: 50%; right: -16px; width: 11px; border-top: 1px solid #65c7da; }
+.sp-flow-node::before { content: ''; position: absolute; top: calc(50% - 3px); right: -16px; width: 6px; height: 6px; border-top: 1px solid #65c7da; border-right: 1px solid #65c7da; transform: rotate(45deg); }
+.sp-flow-node:last-child::before, .sp-flow-node:last-child::after { display: none; }
+.sp-flow-node.selected { border-color: #65c7da; box-shadow: 0 0 0 1px rgba(101,199,218,.25); }
+.sp-flow-node.dragging { opacity: .45; }
+.sp-flow-node.over { border-color: #e3be63; }
+.sp-flow-node-order { display: grid; width: 20px; height: 20px; place-items: center; border-radius: 50%; background: #24424b; color: #b7e2e7; font-size: 9px; font-variant-numeric: tabular-nums; }
+.sp-flow-node-words { min-width: 0; }
+.sp-flow-node-words b, .sp-flow-node-words span { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sp-flow-node-words b { color: #e0eaee; font-size: 10px; }
+.sp-flow-node-words span { margin-top: 2px; color: #8ea0ad; font-size: 9px; font-variant-numeric: tabular-nums; }
+.sp-flow-node-delete { width: 26px; height: 26px; padding: 0; border-color: transparent; color: #9fadb4; }
+.sp-flow-node-delete:hover, .sp-flow-sidebar-delete:hover { color: #f19a8f; border-color: #8e5049; }
+.sp-flow-node-delete .pi-icon { width: 15px; height: 15px; }
+.sp-flow-sidebar .sp-flow-field { margin: 0 0 8px; }
+.sp-flow-sidebar .sp-flow-field-inner input, .sp-flow-sidebar .sp-flow-field-inner textarea, .sp-flow-sidebar .sp-flow-field-inner select { font-size: 10px; }
+.sp-flow-sidebar-delete { display: inline-flex; align-items: center; gap: 6px; min-height: 32px; padding: 0 7px; border-radius: 5px; font-size: 9.5px; }
+.sp-flow-sidebar-delete .pi-icon { width: 16px; height: 16px; }
+.sp-flow-empty { align-self: center; color: #8ea0ad; font-size: 10px; line-height: 1.4; }
+.sp-flow-savebar { display: flex; justify-content: flex-end; flex-wrap: wrap; gap: 8px; padding: 0 12px 12px; }
+.sp-flow-apply-kind { color: #e3be63; border-color: #806a37; }
+.sp-flow-save { color: #071116; background: #65c7da; border-color: #65c7da; font-weight: 700; }
+@media (max-width: 860px) {
+  .sp-flow-work { grid-template-columns: 135px minmax(200px, 1fr); }
+  .sp-flow-sidebar { grid-column: 1 / -1; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)) auto; gap: 8px; align-items: end; }
+  .sp-flow-sidebar .sp-flow-section-title { grid-column: 1 / -1; margin-bottom: 0; }
+  .sp-flow-sidebar .sp-flow-field { margin: 0; }
+}
+@media (max-width: 570px) {
+  .sp-flowedit-box { width: calc(100vw - 10px); max-height: calc(100dvh - 10px); }
+  .sp-flow-basics, .sp-flow-work { grid-template-columns: 1fr; }
+  .sp-flow-sidebar { grid-column: auto; display: block; }
+  .sp-flow-sidebar .sp-flow-field { margin: 0 0 8px; }
+  .sp-flow-palette { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 5px; }
+  .sp-flow-palette .sp-flow-section-title { grid-column: 1 / -1; }
+  .sp-flow-palette-node { margin: 0; }
+  .sp-flow-node { width: 100%; }
+  .sp-flow-node::before, .sp-flow-node::after { display: none; }
 }
 /* Dictation now lives inside each editable field through talk-dot.js. */
 .sp-review-mic,

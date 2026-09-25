@@ -44,6 +44,7 @@ object ViewAssets {
         "pine-dismiss.js",        // tap away and a panel closes - one rule
         "view-chrome.js",         // the shared bar, tree and transport
         "console-line.js",        // the one-line backend readout, all screens
+        "changelog.js",           // Git-backed task history from the audit footer
         "console-trace.js",       // tap that line: where the work came from
         "audio-law.js",           // ONE door to every level and route
         // THE SHARED DUCK, before anything that speaks over the air:
@@ -124,6 +125,7 @@ object ViewAssets {
     /** Concatenated into one <style>; each keys off its own class prefix. */
     private val STYLES = listOf(
         "view-chrome.css",
+        "changelog.css",          // the Git task history panel
         "boot-splash.css",        // the startup assembly
         "console-trace.css",      // the trace popup and the strip's menu
         "script.css",

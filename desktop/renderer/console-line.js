@@ -154,6 +154,8 @@
     bar.innerHTML = '<i class="pine-console-dot"></i>'
       + '<button class="pine-console-audit" type="button" title="Open the detailed audit log"'
       + ' aria-label="Open the detailed audit log"><em>AUDIT</em><span>waiting for the station journal</span></button>'
+      + '<button class="pine-console-change" type="button" title="Open Pine Box changelog"'
+      + ' aria-label="Open Pine Box changelog">i</button>'
       + '<div class="pine-console-viewport"><div class="pine-console-track"></div></div>'
       + '<button class="pine-console-more" type="button" title="Open the last 300 audit events"'
       + ' aria-label="Open the last 300 audit events">'
@@ -172,6 +174,10 @@
       event.stopPropagation();
       if (Date.now() < suppressClickUntil) {
         event.preventDefault();
+        return;
+      }
+      if (event.target && event.target.closest && event.target.closest('.pine-console-change')) {
+        if (root.PineChangeLog) root.PineChangeLog.open();
         return;
       }
       if (event.target && event.target.closest && event.target.closest('.pine-console-audit')) {
