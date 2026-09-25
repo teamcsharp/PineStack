@@ -5584,13 +5584,24 @@
       || FLOW_TYPES[2];
   }
 
+  function flowClip(raw) {
+    raw = raw && typeof raw === 'object' ? raw : {};
+    var id = String(raw.id || '').trim().toLowerCase();
+    if (!/^[0-9a-f]{16}$/.test(id)) return {};
+    var seconds = Number(raw.seconds);
+    return {id: id, name: String(raw.name || 'Scheduled clip').slice(0, 120),
+      seconds: isFinite(seconds) ? Math.max(0, Math.min(120, seconds)) : 0,
+      video: !!raw.video};
+  }
+
   function flowNode(raw, index) {
     var spec = flowType(raw && raw.type);
     var seconds = Number(raw && raw.seconds);
     if (!isFinite(seconds) || seconds <= 0) seconds = spec[2];
     return {id: String((raw && raw.id) || ('flow-' + Date.now() + '-' + index + '-' + Math.random().toString(36).slice(2, 7))),
       type: spec[0], seconds: Math.max(2, Math.min(900, Math.round(seconds * 10) / 10)),
-      detail: String((raw && raw.detail) || '').slice(0, 400)};
+      detail: String((raw && raw.detail) || '').slice(0, 400),
+      clip: spec[0] === 'sfx' ? flowClip(raw && raw.clip) : {}};
   }
 
   function flowIconButton(cls, icon, label) {
@@ -5848,6 +5859,7 @@
       var spec = flowType(type);
       var node = flowNode({type: spec[0], seconds: spec[2], detail: detail || ''}, flow.length);
       flow.push(node); selected = node.id; render();
+      if (node.type === 'sfx') primeSfxNodes();
     }
     function selectedNode() {
       return flow.find(function (node) { return node.id === selected; }) || null;
@@ -5860,6 +5872,40 @@
       if (origin < aim) aim -= 1;
       flow.splice(aim, 0, moved); selected = moved.id; render();
     }
+    function sfxClipWords(clip) {
+      clip = flowClip(clip);
+      if (!clip.id) return '';
+      return (clip.video ? 'MP4' : 'audio') + ' - ' + clip.name
+        + (clip.seconds ? ' (' + clip.seconds.toFixed(1) + 's)' : '');
+    }
+    var sfxPlanBusy = false;
+    function primeSfxNodes(force) {
+      if (sfxPlanBusy || !api() || !api().post) return;
+      var node = flow.find(function (item) {
+        return item.type === 'sfx' && !item.sfxPlanning
+          && (force ? item.id === force : (!flowClip(item.clip).id && !item.sfxTried));
+      });
+      if (!node) return;
+      sfxPlanBusy = true; node.sfxPlanning = true;
+      renderGraph(); renderSide();
+      var excluded = flow.filter(function (item) { return item.id !== node.id; })
+        .map(function (item) { return flowClip(item.clip).id; }).filter(Boolean);
+      api().post('/api/schedule/flow/sfx/plan', {
+        label: label.value, notes: sourceNotes.value, prompt: direction.value,
+        detail: node.detail, seconds: node.seconds, excluded: excluded
+      }).then(function (got) {
+        node.clip = flowClip(got && got.clip);
+        node.sfxTried = true;
+        if (node.id === selected) render(); else renderGraph();
+      }, function () {
+        node.sfxTried = true;
+        if (node.id === selected) render(); else renderGraph();
+      })['finally'](function () {
+        node.sfxPlanning = false; sfxPlanBusy = false;
+        if (node.id === selected) render(); else renderGraph();
+        if (!force) primeSfxNodes();
+      });
+    }
     function renderGraph() {
       graph.replaceChildren();
       graph.classList.toggle('empty', !flow.length);
@@ -5868,13 +5914,19 @@
       }
       flow.forEach(function (node, index) {
         var spec = flowType(node.type);
-        var card = make('article', 'sp-flow-node' + (node.id === selected ? ' selected' : ''));
+        var card = make('article', 'sp-flow-node' + (node.type === 'sfx' ? ' is-sfx' : '')
+          + (node.id === selected ? ' selected' : ''));
         card.draggable = true; card.dataset.node = node.id;
         card.title = 'Drag to change this beat\'s position';
         card.appendChild(make('span', 'sp-flow-node-order', String(index + 1)));
         var words = make('div', 'sp-flow-node-words');
         words.appendChild(make('b', '', spec[1]));
         words.appendChild(make('span', '', Math.round(node.seconds) + ' seconds'));
+        if (node.type === 'sfx') {
+          var clipWords = sfxClipWords(node.clip);
+          words.appendChild(make('span', 'sp-flow-node-clip', clipWords
+            || (node.sfxPlanning ? 'Selecting a clip...' : 'No clip selected')));
+        }
         card.appendChild(words);
         var drop = flowIconButton('sp-flow-node-delete', 'c:trash-can', 'Remove this beat');
         drop.addEventListener('click', function (event) {
@@ -5930,7 +5982,13 @@
         option.selected = spec[0] === node.type; type.appendChild(option);
       });
       type.setAttribute('aria-label', 'Beat type');
-      type.addEventListener('change', function () { node.type = type.value; render(); });
+      type.addEventListener('change', function () {
+        node.type = type.value;
+        node.clip = {};
+        node.sfxTried = false;
+        render();
+        if (node.type === 'sfx') primeSfxNodes();
+      });
       var seconds = document.createElement('input');
       seconds.type = 'number'; seconds.min = '2'; seconds.max = '900'; seconds.step = '1'; seconds.value = String(node.seconds);
       seconds.setAttribute('aria-label', 'Beat duration in seconds');
@@ -5944,6 +6002,20 @@
       side.appendChild(flowField('Type', type, sheet, '', false));
       side.appendChild(flowField('Seconds', seconds, sheet, '', false));
       side.appendChild(flowField('Detail', detail, sheet));
+      if (node.type === 'sfx') {
+        var selectedClip = flowClip(node.clip);
+        var clip = make('section', 'sp-flow-sfx-clip');
+        clip.appendChild(make('b', '', 'Scheduled clip'));
+        clip.appendChild(make('span', '', sfxClipWords(selectedClip)
+          || (node.sfxPlanning ? 'Selecting from the indexed clip library...' : 'No eligible clip selected.')));
+        var reseat = flowIconButton('sp-flow-sfx-reseat', 'c:renew',
+          'Choose another scheduled SFX clip');
+        reseat.addEventListener('click', function () {
+          node.clip = {}; node.sfxTried = false; primeSfxNodes(node.id);
+        });
+        clip.appendChild(reseat);
+        side.appendChild(clip);
+      }
       var remove = flowIconButton('sp-flow-sidebar-delete', 'c:trash-can', 'Remove selected beat');
       remove.appendChild(make('span', '', 'Remove beat'));
       remove.addEventListener('click', function () {
@@ -6018,7 +6090,7 @@
       direction.value = String(graph.flow_prompt || '');
       minutes.value = String(Math.max(.25, Number(graph.minutes) || 3));
       graphName.value = String(graph.name || 'Untitled segment graph');
-      refreshLibraryControls(); render();
+      refreshLibraryControls(); render(); primeSfxNodes();
       sheet.say('Loaded saved graph: ' + graphName.value + '.');
     }
     function loadSavedGraphs(prefer) {
@@ -6082,7 +6154,8 @@
         .then(function (got) {
           flow = ((got && got.nodes) || []).map(flowNode);
           selected = flow.length ? flow[0].id : '';
-          render(); sheet.say(String((got && got.say) || 'The orchestrator proposed a flow.'));
+          render(); primeSfxNodes();
+          sheet.say(String((got && got.say) || 'The orchestrator proposed a flow.'));
         }, function (err) { sheet.say(String((err && err.message) || err), true); })
         ['finally'](function () { suggest.disabled = false; suggestWords.textContent = 'Orchestrator suggests'; });
     }
@@ -6122,6 +6195,7 @@
     save.addEventListener('click', function () { saveFlow(false); });
     applyKind.addEventListener('click', function () { saveFlow(true); });
     render();
+    primeSfxNodes();
     loadSystemPrompt();
     loadSavedGraphs();
     return sheet;

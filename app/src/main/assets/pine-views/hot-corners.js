@@ -59,12 +59,12 @@
 
   /* ------------------------------------------------------- the constants */
 
-  var CORNER_PX = 110;      /* the square at each corner a swipe may start in */
-  var COMMIT_PX = 150;      /* how far it must travel toward the centre */
-  var COMMIT_MS = 1500;     /* and how quickly */
-  var COMMIT_DEG = 35;      /* within this many degrees of the diagonal */
-  var JUDGE_PX = 40;        /* past this the direction is judged; short of it a
-                               wobble is still a wobble */
+  var MIN_ZONE_PX = 20;
+  var MAX_ZONE_PX = 120;
+  var DEFAULT_ZONE_PX = 42;
+  var MIN_SENSITIVITY = 0;
+  var MAX_SENSITIVITY = 100;
+  var DEFAULT_SENSITIVITY = 50;
 
   /* #1166: "Make sure I can also activate hot corners by tapping on the
    * corners. or clicking."
@@ -73,7 +73,8 @@
    * same pointerdown - same corner square, same gates, same glow - and the
    * two are told apart only at the up. These are the numbers that do it.
    *
-   * TAP_PX is deliberately UNDER JUDGE_PX. Short of JUDGE_PX the judge
+   * TAP_PX is deliberately under the early direction threshold. Short of
+   * that threshold the judge
    * returns 'going' and never rules on direction, so a press that stayed
    * inside TAP_PX cannot have been thrown out as "not toward the centre"
    * along the way - a tap and a failed swipe can therefore never be
@@ -83,7 +84,7 @@
    * TAP_MS leaves the long press alone. Half a second is far longer than a
    * tap on glass and far shorter than a deliberate hold, so anything that
    * wants press-and-hold in a corner later still has it to claim. */
-  var TAP_PX = 24;
+  var TAP_PX = 12;
   var TAP_MS = 500;
 
   var STORE = 'pineHotCorners';
@@ -138,7 +139,12 @@
   };
   var CORNER_WORDS = {tl: 'Top left', tr: 'Top right', bl: 'Bottom left', br: 'Bottom right'};
   var CORNERS = ['tl', 'tr', 'bl', 'br'];
-  var DEFAULTS = {enabled: true, tl: 'shot', tr: 'export', bl: 'inspect', br: 'sfx'};
+  var DEFAULTS = {
+    enabled: true,
+    tl: 'shot', tr: 'export', bl: 'inspect', br: 'sfx',
+    activationZonePx: DEFAULT_ZONE_PX,
+    sensitivity: DEFAULT_SENSITIVITY
+  };
   /* "Heard" - the row reached an output. `airing` is what the station
    * stamps on the row that is sounding now (lcd-dialogue.js reads it the
    * same way); prepared / held / analysis were written and never heard. */
@@ -148,6 +154,12 @@
   /* ------------------------------------------------------------ helpers */
 
   function now() { return Date.now(); }
+
+  function whole(value, fallback, min, max) {
+    value = Number(value);
+    if (!isFinite(value)) value = fallback;
+    return Math.max(min, Math.min(max, Math.round(value)));
+  }
 
   function merge(into, from) {
     for (var k in from) {
@@ -285,8 +297,9 @@
   var cfg = merge({}, DEFAULTS);
 
   /* What a patch is allowed to say. A corner is one of the six actions or
-   * it is 'off'; `enabled` is a boolean; `ring` is the native side's own
-   * number (how long the replay ring keeps) and is carried, not judged. */
+   * it is 'off'; `enabled` is a boolean; the zone and sensitivity are
+   * bounded so a stale or malformed preference cannot cover the display;
+   * `ring` is the native side's own number and is carried, not judged. */
   function clean(patch) {
     var out = {};
     if (!patch || typeof patch !== 'object') return out;
@@ -296,6 +309,14 @@
       if (patch[c] === undefined || patch[c] === null) continue;
       var v = String(patch[c]).toLowerCase();
       out[c] = ACTIONS.indexOf(v) >= 0 ? v : 'off';
+    }
+    if (patch.activationZonePx !== undefined) {
+      out.activationZonePx = whole(patch.activationZonePx, DEFAULT_ZONE_PX,
+        MIN_ZONE_PX, MAX_ZONE_PX);
+    }
+    if (patch.sensitivity !== undefined) {
+      out.sensitivity = whole(patch.sensitivity, DEFAULT_SENSITIVITY,
+        MIN_SENSITIVITY, MAX_SENSITIVITY);
     }
     if (patch.ring !== undefined) out.ring = patch.ring;
     return out;
@@ -321,10 +342,30 @@
 
   /* ---------------------------------------------------------- the judge */
 
+  function activationZonePx() {
+    return whole(cfg.activationZonePx, DEFAULT_ZONE_PX, MIN_ZONE_PX, MAX_ZONE_PX);
+  }
+
+  /* Higher sensitivity makes a valid diagonal shorter, more forgiving and
+   * a little less hurried. The activation square is deliberately separate:
+   * it says where a gesture may start, while this says how clearly it must
+   * be made once it has started. */
+  function gestureProfile() {
+    var sensitivity = whole(cfg.sensitivity, DEFAULT_SENSITIVITY,
+      MIN_SENSITIVITY, MAX_SENSITIVITY);
+    return {
+      commitPx: Math.round(220 - sensitivity * 1.1),
+      commitMs: Math.round(1100 + sensitivity * 4),
+      commitDeg: Math.round(26 + sensitivity * 0.14),
+      judgePx: 24
+    };
+  }
+
   /* Which corner a point is in, or ''. Pure, so it can be tested. */
   function cornerAt(x, y, w, h) {
-    var left = x <= CORNER_PX, right = x >= w - CORNER_PX;
-    var top = y <= CORNER_PX, bottom = y >= h - CORNER_PX;
+    var zone = activationZonePx();
+    var left = x <= zone, right = x >= w - zone;
+    var top = y <= zone, bottom = y >= h - zone;
     if (top && left) return 'tl';
     if (top && right) return 'tr';
     if (bottom && left) return 'bl';
@@ -344,21 +385,21 @@
   /* One drag, judged: {state: 'going'|'commit'|'drop', progress, why}.
    * dx/dy are the pointer's travel from where it went down; ms the time.
    *
-   * The direction is judged once the finger has gone JUDGE_PX, not at the
-   * commit distance: a press at the top-left corner dragged straight down
-   * is a scroll, and it is handed back after 40 px rather than 150, so a
-   * corner is never a dead zone for scrolling. */
+   * The direction is judged early, rather than at the commit distance: a
+   * press at the top-left corner dragged straight down is a scroll and is
+   * handed back before a corner becomes a dead zone for scrolling. */
   function judge(corner, dx, dy, ms) {
-    if (ms > COMMIT_MS) return {state: 'drop', progress: 0, why: 'too slow'};
+    var profile = gestureProfile();
+    if (ms > profile.commitMs) return {state: 'drop', progress: 0, why: 'too slow'};
     var s = signs(corner);
     var ax = dx * s.x, ay = dy * s.y;          /* positive = toward the centre */
     var dist = Math.sqrt(dx * dx + dy * dy);
-    var progress = Math.max(0, Math.min(1, dist / COMMIT_PX));
-    if (dist < JUDGE_PX) return {state: 'going', progress: progress};
+    var progress = Math.max(0, Math.min(1, dist / profile.commitPx));
+    if (dist < profile.judgePx) return {state: 'going', progress: progress};
     if (ax <= 0 || ay <= 0) return {state: 'drop', progress: 0, why: 'not toward the centre'};
     var deg = Math.abs(Math.atan2(ay, ax) * 180 / Math.PI - 45);
-    if (deg > COMMIT_DEG) return {state: 'drop', progress: 0, why: 'off the diagonal'};
-    if (dist < COMMIT_PX) return {state: 'going', progress: progress};
+    if (deg > profile.commitDeg) return {state: 'drop', progress: 0, why: 'off the diagonal'};
+    if (dist < profile.commitPx) return {state: 'going', progress: progress};
     return {state: 'commit', progress: 1};
   }
 
@@ -513,11 +554,12 @@
     var corner = cornerAt(ev.clientX, ev.clientY, w, h);
     if (!corner) return;
     if ((cfg[corner] || 'off') === 'off') return;
-    /* #1166: `onControl` is decided HERE, where the finger actually
-     * landed, and is read only by the tap at the up - see onUp and
-     * overControl. The swipe does not consult it and is unchanged. */
+    /* A corner shortcut must never turn a button drag into a shortcut. The
+     * test is done at pointerdown, while the element under the finger is
+     * still known; that also leaves scroll and drag controls passive. */
+    if (overControl(ev.target)) return;
     live = {id: ev.pointerId, corner: corner, x: ev.clientX, y: ev.clientY,
-            t: now(), onControl: overControl(ev.target)};
+            t: now()};
     glowShow(corner, 0);
   }
 
@@ -566,8 +608,7 @@
       var dist = Math.sqrt(dx * dx + dy * dy);
       var ms = now() - was.t;
       var what = cfg[was.corner] || 'off';
-      if (was.onControl                      /* somebody else's press */
-          || dist > TAP_PX                   /* it was going somewhere */
+      if (dist > TAP_PX                       /* it was going somewhere */
           || ms > TAP_MS                     /* a press, not a tap */
           || sheets.length                   /* a sheet owns the screen now */
           || !cfg.enabled
@@ -2367,9 +2408,11 @@
     /* [#1221] the editor window, so the slide can be proved over CDP without
      * cutting a fresh recording out of the ring first. */
     videoEditor: openVideoEditor,
-    /* #1181: the rail keeps clear of the corner squares, and it can only
-     * do that if it knows how big they are. One number, one owner. */
-    CORNER_PX: CORNER_PX,
+    /* The legacy number remains for older callers; new callers ask the
+     * function because the operator may change this live. */
+    CORNER_PX: DEFAULT_ZONE_PX,
+    activationZonePx: activationZonePx,
+    gestureProfile: gestureProfile,
     ACTIONS: ACTIONS.slice(),
     ACTION_WORDS: merge({}, ACTION_WORDS),
     STEPS: STEPS.slice(),

@@ -60695,6 +60695,24 @@ SCHEDULE_FLOW_TYPES: dict[str, dict[str, Any]] = {
 }
 
 
+def _schedule_flow_clip_ref(raw: Any) -> dict[str, Any]:
+    """Keep an SFX-node selection durable without exposing a media path."""
+    row = raw if isinstance(raw, dict) else {}
+    sid = str(row.get("id") or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{16}", sid):
+        return {}
+    try:
+        seconds = float(row.get("seconds") or 0)
+    except (TypeError, ValueError):
+        seconds = 0.0
+    return {
+        "id": sid,
+        "name": str(row.get("name") or "Scheduled clip").strip()[:120],
+        "seconds": round(max(0.0, min(120.0, seconds)), 2),
+        "video": bool(row.get("video")),
+    }
+
+
 def _schedule_flow_node(raw: Any, index: int = 0) -> dict[str, Any] | None:
     """Clean one operator-authored beat before it reaches the durable sheet."""
     row = raw if isinstance(raw, dict) else {}
@@ -60708,13 +60726,16 @@ def _schedule_flow_node(raw: Any, index: int = 0) -> dict[str, Any] | None:
         seconds = default
     if seconds != seconds:
         seconds = default
-    return {
+    node = {
         "id": (str(row.get("id") or "").strip()[:48]
                or f"flow-{index + 1}-{uuid.uuid4().hex[:8]}"),
         "type": kind,
         "seconds": round(max(2.0, min(900.0, seconds)), 1),
         "detail": str(row.get("detail") or "").strip()[:400],
     }
+    if kind == "sfx":
+        node["clip"] = _schedule_flow_clip_ref(row.get("clip"))
+    return node
 
 
 def schedule_flow_nodes(raw: Any) -> list[dict[str, Any]]:
@@ -60726,6 +60747,74 @@ def schedule_flow_nodes(raw: Any) -> list[dict[str, Any]]:
         node = _schedule_flow_node(item, index)
         if node:
             out.append(node)
+    return out
+
+
+def schedule_flow_sfx_pick(context: str = "", seconds: Any = 6,
+                           excluded: set[str] | None = None) -> dict[str, Any]:
+    """Choose one inspectable clip for a scheduled SFX beat.
+
+    This is a planning read from the indexed book.  It never plays, reserves,
+    or marks a clip as heard; the durable reference is only committed when the
+    graph itself is saved.  A video is preferred whenever the station's video
+    share is a majority, which makes the graph reflect the operator's MP4
+    policy while retaining an audio fallback for a thin video shelf.
+    """
+    try:
+        cap = max(0.5, min(12.0, float(seconds or 6)))
+    except (TypeError, ValueError):
+        cap = 6.0
+    held = set(excluded or set())
+    try:
+        prefer_video = sfx_video_share() >= 50
+    except Exception:  # noqa: BLE001
+        prefer_video = True
+    try:
+        banned, weights = sfx_bans(), sfx_weights()
+    except Exception:  # noqa: BLE001
+        banned, weights = set(), {}
+    for want_video in (prefer_video, not prefer_video):
+        for _ in range(8):
+            try:
+                picked = (sfx_db_pick_short_video(cap) if want_video
+                          else sfx_db_pick_row(False))
+            except Exception:  # noqa: BLE001
+                picked = None
+            if not picked:
+                break
+            path, length = picked
+            try:
+                length = float(length or 0)
+            except (TypeError, ValueError):
+                continue
+            if not 0 < length <= cap:
+                continue
+            sid = sfx_id(path)
+            if sid in held or sid in banned or float(weights.get(sid, 1.0) or 0) <= 0.05:
+                continue
+            return {"id": sid, "name": str(path.stem)[:120],
+                    "seconds": round(length, 2), "video": bool(want_video)}
+    return {}
+
+
+def schedule_flow_sfx_assign(nodes: Any, context: str = "") -> list[dict[str, Any]]:
+    """Fill unassigned SFX beats once, keeping chosen clips unique per graph."""
+    out = schedule_flow_nodes(nodes)
+    held = {str((node.get("clip") or {}).get("id") or "")
+            for node in out if str(node.get("type") or "") == "sfx"}
+    held.discard("")
+    for node in out:
+        if str(node.get("type") or "") != "sfx":
+            continue
+        clip = _schedule_flow_clip_ref(node.get("clip"))
+        if clip:
+            continue
+        clip = schedule_flow_sfx_pick(
+            " ".join(part for part in (context, str(node.get("detail") or "")) if part),
+            node.get("seconds"), held)
+        if clip:
+            node["clip"] = clip
+            held.add(str(clip["id"]))
     return out
 
 
@@ -60794,6 +60883,8 @@ def schedule_flow_library_upsert(raw: Any, incoming: Any) -> tuple[list[dict[str
     found = next((item for item in graphs if item["id"] == wanted), None)
     now = round(time.time(), 3)
     graph = _schedule_flow_graph(incoming, len(graphs), found["id"] if found else "")
+    graph["flow"] = schedule_flow_sfx_assign(
+        graph.get("flow"), " ".join((graph["name"], graph.get("flow_prompt") or "")))
     graph["created_at"] = float(found.get("created_at") or now) if found else now
     graph["updated_at"] = now
     if found:
@@ -60833,9 +60924,12 @@ def schedule_flow_suggestion(kind: str, minutes: Any = 3,
         seconds = max(4.0 if item == "sfx" else 10.0, default * scale)
         nodes.append(_schedule_flow_node({"id": f"suggested-{index + 1}",
                                           "type": item, "seconds": seconds}, index))
+    nodes = schedule_flow_sfx_assign(
+        [node for node in nodes if node],
+        " ".join((str(label or ""), str(notes or ""))))
     return {
         "kind": road, "label": str(label or "")[:80],
-        "target_seconds": round(target, 1), "nodes": [node for node in nodes if node],
+        "target_seconds": round(target, 1), "nodes": nodes,
         "say": "The orchestrator laid out %d timed beats for this segment." % len(nodes),
         "notes": str(notes or "")[:400],
     }
@@ -60857,6 +60951,12 @@ def schedule_flow_clause(slot: dict[str, Any]) -> str:
         detail = str(node.get("detail") or "").strip()
         if detail:
             line += " Operator detail: " + detail
+        clip = _schedule_flow_clip_ref(node.get("clip")) if node.get("type") == "sfx" else {}
+        if clip:
+            line += (" Scheduled clip: %s (%s, %.1fs). Use this selected clip "
+                     "for the on-air SFX event rather than describing a clip."
+                     % (clip["name"], "MP4" if clip["video"] else "audio",
+                        float(clip["seconds"] or 0)))
         parts.append(line)
     if extra:
         parts.append("ADDITIONAL SYSTEM DIRECTION FOR THIS ONE SEGMENT: " + extra)
@@ -63149,6 +63249,26 @@ async def schedule_flow_suggest_api(
         str(payload.get("label") or ""), str(payload.get("notes") or ""))
 
 
+@app.post("/api/schedule/flow/sfx/plan")
+async def schedule_flow_sfx_plan_api(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Pick a visible clip for one new SFX graph node without saving it."""
+    require_auth(authorization)
+    payload = await request.json()
+    payload = payload if isinstance(payload, dict) else {}
+    held = {str(item).strip().lower() for item in (payload.get("excluded") or [])
+            if re.fullmatch(r"[0-9a-fA-F]{16}", str(item).strip())}
+    context = " ".join(str(payload.get(key) or "")
+                         for key in ("label", "notes", "detail", "prompt"))[:1800]
+    clip = await asyncio.to_thread(
+        schedule_flow_sfx_pick, context, payload.get("seconds") or 6, held)
+    return {"ok": bool(clip), "clip": clip,
+            "say": ("Selected " + str(clip.get("name") or "clip")
+                    if clip else "No eligible SFX clip is indexed yet.")}
+
+
 @app.get("/api/schedule/flow/library")
 async def schedule_flow_library_api(
     authorization: str | None = Header(default=None),
@@ -63208,7 +63328,9 @@ async def schedule_flow_slot_api(
                        if str((row or {}).get("id") or "") == slot_id), None)
         if target is None:
             raise HTTPException(status_code=404, detail="No such segment on that schedule")
-        flow = schedule_flow_nodes(payload.get("flow"))
+        flow = schedule_flow_sfx_assign(
+            payload.get("flow"), " ".join(str(payload.get(key) or "")
+                                              for key in ("label", "notes", "flow_prompt")))
         flow_prompt = str(payload.get("flow_prompt") or "").strip()[:1800]
         apply_kind = bool(payload.get("apply_kind"))
         changed: list[dict[str, Any]] = []

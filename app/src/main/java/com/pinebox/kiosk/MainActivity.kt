@@ -405,7 +405,8 @@ class MainActivity : AppCompatActivity() {
      * single event, so a swipe out of the top-left or bottom-left corner
      * would open the rail and the page would never hear of it.
      *
-     * So: while hot corners are on, a finger landing inside CORNER_PX of any
+     * So: while hot corners are on, a finger landing inside the configured
+     * activation square of any
      * corner locks the drawer closed for the length of that one gesture,
      * and the events fall through to the WebView, where hot-corners.js is
      * watching. The lock is put back once the finger is up (after the UP
@@ -469,10 +470,11 @@ class MainActivity : AppCompatActivity() {
         val w = root.width
         val h = root.height
         if (w <= 0 || h <= 0) return null
-        val left = x <= CORNER_PX
-        val right = x >= w - CORNER_PX
-        val top = y <= CORNER_PX
-        val bottom = y >= h - CORNER_PX
+        val zone = HotCorners.live.activationZonePx.toFloat()
+        val left = x <= zone
+        val right = x >= w - zone
+        val top = y <= zone
+        val bottom = y >= h - zone
         return when {
             left && top -> "tl"
             right && top -> "tr"
@@ -1711,12 +1713,6 @@ class MainActivity : AppCompatActivity() {
 
         /** See widenDragEdge. 20dp is DrawerLayout's own; 40 is a thumb. */
         private const val EDGE_DP = 40f
-
-        /** THE CORNER SQUARE, in pixels - see dispatchTouchEvent. 110 px at
-         *  this screen's 1.25 px/dp is 88dp, a thumb and a half: big enough
-         *  to land in without looking, small enough that the widened drawer
-         *  edge keeps the whole middle of the left side. */
-        private const val CORNER_PX = 110f
 
         private const val RETRY_MS = 4_000L
 

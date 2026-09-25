@@ -214,6 +214,117 @@
 
   /* ---- the furniture -------------------------------------------------- */
 
+  /* The talk dot is deliberately above every operating surface, which also
+     means the default corner can cover a command in a dense tablet sheet.
+     A short drag moves it; an ordinary tap still starts dictation. The point
+     is stored as viewport coordinates so it follows every station view but
+     never survives outside a rotated or resized screen. */
+  var DOT_POSITION_KEY = 'pineTalkDotPositionV1';
+  var DOT_EDGE = 8;
+
+  function dotStoredPosition() {
+    try {
+      var raw = root.localStorage && root.localStorage.getItem(DOT_POSITION_KEY);
+      var value = raw && JSON.parse(raw);
+      if (value && isFinite(Number(value.left)) && isFinite(Number(value.top))) {
+        return {left: Number(value.left), top: Number(value.top)};
+      }
+    } catch (err) { /* storage is optional on an embedded surface */ }
+    return null;
+  }
+
+  function dotSize(dot) {
+    var box = null;
+    try { box = dot && dot.getBoundingClientRect && dot.getBoundingClientRect(); }
+    catch (err) { box = null; }
+    return {width: Math.max(1, Number(box && box.width) || 56),
+      height: Math.max(1, Number(box && box.height) || 56)};
+  }
+
+  function dotClamp(dot, left, top) {
+    var size = dotSize(dot);
+    var wide = Number(root.innerWidth) || size.width + DOT_EDGE * 2;
+    var high = Number(root.innerHeight) || size.height + DOT_EDGE * 2;
+    return {
+      left: Math.max(DOT_EDGE, Math.min(Number(left) || 0,
+        Math.max(DOT_EDGE, wide - size.width - DOT_EDGE))),
+      top: Math.max(DOT_EDGE, Math.min(Number(top) || 0,
+        Math.max(DOT_EDGE, high - size.height - DOT_EDGE)))
+    };
+  }
+
+  function dotPlace(dot, left, top, save) {
+    if (!dot) return null;
+    var point = dotClamp(dot, left, top);
+    dot.classList.toggle('pine-talk-moved', true);
+    dot.style.left = Math.round(point.left) + 'px';
+    dot.style.top = Math.round(point.top) + 'px';
+    dot.style.right = 'auto';
+    dot.style.bottom = 'auto';
+    try {
+      if (document.documentElement && document.documentElement.style) {
+        document.documentElement.style.setProperty('--pine-talk-left', dot.style.left);
+        document.documentElement.style.setProperty('--pine-talk-top', dot.style.top);
+      }
+      if (save && root.localStorage) {
+        root.localStorage.setItem(DOT_POSITION_KEY, JSON.stringify(point));
+      }
+    } catch (err) { /* moving the dot must still work without storage */ }
+    return point;
+  }
+
+  function dotRestore(dot) {
+    var point = dotStoredPosition();
+    if (point) dotPlace(dot, point.left, point.top, false);
+  }
+
+  function dotKeepVisible(dot) {
+    if (!dot || !dot.classList.contains('pine-talk-moved')) return;
+    var box = null;
+    try { box = dot.getBoundingClientRect(); } catch (err) { box = null; }
+    if (!box) return;
+    dotPlace(dot, box.left, box.top, true);
+  }
+
+  function dotDrag(dot) {
+    var active = null;
+    var moved = false;
+    function finish(ev) {
+      if (!active || (ev && ev.pointerId !== active.id)) return;
+      try { if (dot.releasePointerCapture) dot.releasePointerCapture(active.id); }
+      catch (err) { /* the pointer may already be gone */ }
+      if (moved) {
+        dotPlace(dot, active.left + active.dx, active.top + active.dy, true);
+        /* The click that follows a drag must not start a recording. */
+        dot.__pineDragged = true;
+      }
+      dot.classList.toggle('pine-talk-moving', false);
+      active = null;
+    }
+    dot.addEventListener('pointerdown', function (ev) {
+      if (ev.button != null && ev.button !== 0) return;
+      var box = null;
+      try { box = dot.getBoundingClientRect(); } catch (err) { box = null; }
+      active = {id: ev.pointerId, x: Number(ev.clientX) || 0, y: Number(ev.clientY) || 0,
+        left: Number(box && box.left) || 0, top: Number(box && box.top) || 0, dx: 0, dy: 0};
+      moved = false;
+      try { if (dot.setPointerCapture) dot.setPointerCapture(ev.pointerId); }
+      catch (err) { /* capture is a convenience, not a requirement */ }
+    });
+    dot.addEventListener('pointermove', function (ev) {
+      if (!active || ev.pointerId !== active.id) return;
+      active.dx = (Number(ev.clientX) || 0) - active.x;
+      active.dy = (Number(ev.clientY) || 0) - active.y;
+      if (!moved && Math.hypot(active.dx, active.dy) < 8) return;
+      moved = true;
+      dot.classList.toggle('pine-talk-moving', true);
+      dotPlace(dot, active.left + active.dx, active.top + active.dy, false);
+      ev.preventDefault();
+    });
+    dot.addEventListener('pointerup', finish);
+    dot.addEventListener('pointercancel', finish);
+  }
+
   function mount() {
     if (el('pineTalkDot')) return el('pineTalkDot');
     /* Before anything else: put back whatever a previous life of this page
@@ -225,7 +336,15 @@
     dot.title = 'Hold a moment and speak - the station will hear you';
     dot.innerHTML = '<canvas id="pineTalkFx" class="pine-talk-fx"></canvas>'
       + '<i class="pine-talk-core"></i>';
-    dot.addEventListener('click', toggle);
+    dot.addEventListener('click', function (ev) {
+      if (dot.__pineDragged) {
+        dot.__pineDragged = false;
+        ev.preventDefault();
+        ev.stopPropagation();
+        return;
+      }
+      toggle(ev);
+    });
     /* 2026-09-14: the canvas is the voice window; a tap on it while
        listening cancels rather than sends (see cancel()). */
     var fx = dot.querySelector('#pineTalkFx');
@@ -242,9 +361,13 @@
       ev.preventDefault();
       micMenu();
     });
-    dot.title = 'Click and speak - the station will hear you. '
-      + 'Right-click to choose which microphone.';
+    dot.title = 'Tap to speak. Drag to move this control. Right-click to choose a microphone.';
     document.body.appendChild(dot);
+    dotRestore(dot);
+    dotDrag(dot);
+    if (root.addEventListener) {
+      root.addEventListener('resize', function () { dotKeepVisible(dot); });
+    }
 
     var say = document.createElement('div');
     say.id = 'pineTalkSay';
@@ -455,6 +578,14 @@
     dot.classList.toggle('listening', next === LISTENING);
     dot.classList.toggle('thinking', next === THINKING);
     dot.classList.toggle('field-capture', !!fieldCapture && next !== IDLE);
+    /* A small dot can safely sit near an edge; its capture surface cannot.
+       Re-clamp after the state class has changed and the browser knows its
+       expanded dimensions. */
+    if (dot.classList.contains('pine-talk-moved')) {
+      var settleDot = function () { dotKeepVisible(dot); };
+      if (root.requestAnimationFrame) root.requestAnimationFrame(settleDot);
+      else if (root.setTimeout) root.setTimeout(settleDot, 0);
+    }
   }
 
   /* ---- ducking -------------------------------------------------------- */

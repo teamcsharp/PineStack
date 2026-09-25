@@ -3768,16 +3768,36 @@ ipcMain.handle("replay:keep-edited", async (_event, want) => {
  * hot-corners.js:1835 and :1885 have been calling these on a surface that
  * answers neither, so the desk's corner settings lived only until the app
  * closed. Read, or merge-and-persist; either way what settles is
- * {enabled, tl, tr, bl, br, ring} and a set pushes that same object back
+ * {enabled, tl, tr, bl, br, activationZonePx, sensitivity, ring} and a set pushes that same object back
  * into the page, exactly as the tablet's HotCorners.kt does. `ring` is the
  * screen ring's hold and is read-only here - replayHold is the road that
  * changes it. */
 const CORNER_KEYS = ["tl", "tr", "bl", "br"];
+const CORNER_ZONE_MIN = 20;
+const CORNER_ZONE_MAX = 120;
+const CORNER_ZONE_DEFAULT = 42;
+const CORNER_SENSITIVITY_MIN = 0;
+const CORNER_SENSITIVITY_MAX = 100;
+const CORNER_SENSITIVITY_DEFAULT = 50;
+
+function boundedCornerNumber(value, fallback, minimum, maximum) {
+  const number = Number(value);
+  return Number.isFinite(number)
+    ? Math.max(minimum, Math.min(maximum, Math.round(number)))
+    : fallback;
+}
 
 function cornersRead() {
   const cfg = readConfig() || {};
   const held = cfg.hotCorners || {};
-  const out = { enabled: held.enabled !== false, ring: screenRing.state().holds };
+  const out = {
+    enabled: held.enabled !== false,
+    activationZonePx: boundedCornerNumber(held.activationZonePx, CORNER_ZONE_DEFAULT,
+      CORNER_ZONE_MIN, CORNER_ZONE_MAX),
+    sensitivity: boundedCornerNumber(held.sensitivity, CORNER_SENSITIVITY_DEFAULT,
+      CORNER_SENSITIVITY_MIN, CORNER_SENSITIVITY_MAX),
+    ring: screenRing.state().holds,
+  };
   for (const key of CORNER_KEYS) out[key] = String(held[key] || "");
   return out;
 }
@@ -3795,6 +3815,14 @@ ipcMain.handle("corners:set", (_event, patch) => {
     for (const key of CORNER_KEYS) {
       if (Object.prototype.hasOwnProperty.call(given, key)) {
         held[key] = String(given[key] || "");
+      }
+    }
+    for (const [key, fallback, minimum, maximum] of [
+      ["activationZonePx", CORNER_ZONE_DEFAULT, CORNER_ZONE_MIN, CORNER_ZONE_MAX],
+      ["sensitivity", CORNER_SENSITIVITY_DEFAULT, CORNER_SENSITIVITY_MIN, CORNER_SENSITIVITY_MAX],
+    ]) {
+      if (Object.prototype.hasOwnProperty.call(given, key)) {
+        held[key] = boundedCornerNumber(given[key], fallback, minimum, maximum);
       }
     }
     writeConfig({ hotCorners: held });

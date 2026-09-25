@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import app
 
 
@@ -24,6 +26,26 @@ def test_orchestrator_suggestion_honors_a_segment_time_budget():
     assert got["target_seconds"] == 240.0
     assert [node["type"] for node in got["nodes"]].count("sfx") >= 1
     assert sum(node["seconds"] for node in got["nodes"]) >= 220
+
+
+def test_sfx_graph_beats_keep_a_selected_mp4_and_name_it_in_the_writer_clause(monkeypatch):
+    """A visible graph SFX beat is a real planned library selection, not a placeholder."""
+    monkeypatch.setattr(app, "sfx_video_share", lambda: 80)
+    monkeypatch.setattr(app, "sfx_bans", lambda: set())
+    monkeypatch.setattr(app, "sfx_weights", lambda: {})
+    monkeypatch.setattr(
+        app, "sfx_db_pick_short_video", lambda _cap: (Path("/clips/rimshot.mp4"), 4.5))
+    monkeypatch.setattr(app, "sfx_db_pick_row", lambda _video: None)
+    monkeypatch.setattr(app, "sfx_id", lambda _path: "a" * 16)
+
+    nodes = app.schedule_flow_sfx_assign(
+        [{"id": "sting", "type": "sfx", "seconds": 6}], "News coverage")
+
+    assert nodes[0]["clip"] == {
+        "id": "a" * 16, "name": "rimshot", "seconds": 4.5, "video": True}
+    clause = app.schedule_flow_clause({"flow": nodes})
+    assert "Scheduled clip: rimshot (MP4, 4.5s)" in clause
+    assert "rather than describing a clip" in clause
 
 
 def test_flow_clause_names_each_operator_beat_and_its_extra_direction():

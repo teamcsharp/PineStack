@@ -52,6 +52,8 @@ class ConfigStore(private val context: Context) {
         val hotCornerTr = stringPreferencesKey("hotCornerTr")
         val hotCornerBl = stringPreferencesKey("hotCornerBl")
         val hotCornerBr = stringPreferencesKey("hotCornerBr")
+        val hotCornerActivationZonePx = intPreferencesKey("hotCornerActivationZonePx")
+        val hotCornerSensitivity = intPreferencesKey("hotCornerSensitivity")
     }
 
     val flow: Flow<Config> = context.dataStore.data.map { prefs ->
@@ -79,6 +81,17 @@ class ConfigStore(private val context: Context) {
                     ?: fallback.hotCorners.bl,
                 br = prefs[Keys.hotCornerBr]?.takeIf { it in HotCornerPrefs.ACTIONS }
                     ?: fallback.hotCorners.br,
+                activationZonePx = HotCornerPrefs.bounded(
+                    prefs[Keys.hotCornerActivationZonePx]
+                        ?: fallback.hotCorners.activationZonePx,
+                    HotCornerPrefs.MIN_ACTIVATION_ZONE_PX,
+                    HotCornerPrefs.MAX_ACTIVATION_ZONE_PX,
+                ),
+                sensitivity = HotCornerPrefs.bounded(
+                    prefs[Keys.hotCornerSensitivity] ?: fallback.hotCorners.sensitivity,
+                    HotCornerPrefs.MIN_SENSITIVITY,
+                    HotCornerPrefs.MAX_SENSITIVITY,
+                ),
             ),
         )
     }
@@ -103,6 +116,8 @@ class ConfigStore(private val context: Context) {
             prefs[Keys.hotCornerTr] = next.hotCorners.tr
             prefs[Keys.hotCornerBl] = next.hotCorners.bl
             prefs[Keys.hotCornerBr] = next.hotCorners.br
+            prefs[Keys.hotCornerActivationZonePx] = next.hotCorners.activationZonePx
+            prefs[Keys.hotCornerSensitivity] = next.hotCorners.sensitivity
         }
         return next
     }

@@ -67,6 +67,11 @@ function load(file) {
 (async () => {
   for (const file of ['../desktop/renderer/talk-dot.js',
     '../app/src/main/assets/pine-views/talk-dot.js']) {
+    const source = fs.readFileSync(path.join(__dirname, file), 'utf8');
+    assert.match(source, /DOT_POSITION_KEY/, 'the floating dot persists its position');
+    assert.match(source, /pointerdown/, 'the floating dot accepts a drag gesture');
+    assert.match(source, /dot\.__pineDragged/, 'a drag cannot accidentally start dictation');
+    assert.match(source, /dotKeepVisible/, 'rotation and expanded capture keep the moved dot on screen');
     const h = load(file);
     assert.equal(h.buttons.length, 2, 'each editable input gets a mic');
     assert.equal(h.fields[0].padding, '44px', 'text makes room for its icon');

@@ -326,6 +326,13 @@
   transition: width .18s ease, height .18s ease, border-radius .18s ease,
               right .18s ease, bottom .18s ease;
 }
+.pine-talk-dot.pine-talk-moved {
+  left: var(--pine-talk-left);
+  top: var(--pine-talk-top);
+  right: auto;
+  bottom: auto;
+}
+.pine-talk-dot.pine-talk-moving { cursor: grabbing; }
 .pine-talk-core {
   position: absolute; inset: 0; margin: auto;
   width: 14px; height: 14px; border-radius: 50%;
@@ -355,6 +362,11 @@
   border-radius: 16px;
   border-color: #65c7da;
   right: 46px;
+}
+.pine-talk-dot.pine-talk-moved.listening,
+.pine-talk-dot.pine-talk-moved.thinking {
+  right: auto;
+  bottom: auto;
 }
 .pine-talk-dot.listening .pine-talk-core,
 .pine-talk-dot.thinking .pine-talk-core { opacity: 0; }

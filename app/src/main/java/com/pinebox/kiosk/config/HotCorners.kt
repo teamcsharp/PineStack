@@ -90,8 +90,8 @@ object HotCorners {
     /**
      * THE ONE FUNCTION THAT CHANGES THEM.
      *
-     * Merges [patch] - any subset of {enabled, tl, tr, bl, br} - into the
-     * stored preferences, persists the result, refreshes [live], hands the
+     * Merges [patch] - any subset of the action, activation-zone and
+     * sensitivity fields - into the stored preferences, persists the result, refreshes [live], hands the
      * push script to [push] (the caller owns the WebView and its thread),
      * and returns the merged object for the caller to settle or paint with.
      */
