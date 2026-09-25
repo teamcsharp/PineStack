@@ -2937,6 +2937,11 @@
   var dotNode = null;
   var DOT_PLACE = 'pineOrchDotAt';
   var DOT_SHUT = 'pineOrchDotShut';
+  var DOT_LAYOUT = 'pineOrchDotLayout';
+  var DOT_DRAG_PX = 3;
+  var DOT_HOLD_MS = 460;
+  var DOT_WIDTH = 160;
+  var DOT_HEIGHT = 92;
   var RECOVERY_MS = 10000;
   var recoveryTimer = null;
   var recoveryPending = false;
@@ -3079,11 +3084,58 @@
     recoveryPending = false;
   }
 
+  function dotHidden() {
+    try { return root.localStorage.getItem(DOT_SHUT) === '1'; }
+    catch (err) { return false; }
+  }
+
+  function refreshDotRestore() {
+    try {
+      if (root.PineConsoleLine && typeof root.PineConsoleLine.refreshOrchestrator === 'function') {
+        root.PineConsoleLine.refreshOrchestrator();
+      }
+    } catch (err) { /* the console is optional on embeddable views */ }
+  }
+
+  function hideDot(node) {
+    try { root.localStorage.setItem(DOT_SHUT, '1'); } catch (err) { /* fine */ }
+    if (node && node.parentNode) node.parentNode.removeChild(node);
+    if (dotNode === node) dotNode = null;
+    stopRecoveryWatch();
+    refreshDotRestore();
+  }
+
+  function dotPoint(node, left, top) {
+    var width = Math.max(DOT_WIDTH, Number(node && node.offsetWidth) || 0);
+    var height = Math.max(DOT_HEIGHT, Number(node && node.offsetHeight) || 0);
+    var viewportWidth = root.innerWidth || width + 16;
+    var viewportHeight = root.innerHeight || height + 40;
+    return {
+      left: Math.max(8, Math.min(Math.max(8, viewportWidth - width - 8), Math.round(left))),
+      /* Keep a reachable strip above the shared bottom console. */
+      top: Math.max(8, Math.min(Math.max(8, viewportHeight - height - 30), Math.round(top)))
+    };
+  }
+
+  function paintDotPoint(node, left, top) {
+    var point = dotPoint(node, left, top);
+    node.style.left = point.left + 'px';
+    node.style.top = point.top + 'px';
+    return point;
+  }
+
+  function rememberDotPoint(node) {
+    try {
+      root.localStorage.setItem(DOT_PLACE, JSON.stringify({
+        left: parseInt(node.style.left, 10) || 0,
+        top: parseInt(node.style.top, 10) || 0
+      }));
+    } catch (err) { /* a position that will not save is not a fault */ }
+  }
+
   function dot() {
     if (dotNode) return dotNode;
-    try {
-      if (root.localStorage.getItem(DOT_SHUT) === '1') return null;
-    } catch (err) { /* no storage: show it */ }
+    if (dotHidden()) return null;
     var node = el('button', 'og-dot');
     node.id = 'pineOrchDot';
     node.setAttribute('type', 'button');
@@ -3093,66 +3145,76 @@
     node.appendChild(pre);
     node.appendChild(el('span', 'og-dot-state', recovery.headline));
     node.appendChild(el('span', 'og-dot-step', recovery.step));
-    var left = 0, top = 0;
+    var left = 0, top = 0, saved = null, needsFreshPlacement = false;
     try {
-      var saved = JSON.parse(root.localStorage.getItem(DOT_PLACE) || 'null');
+      saved = JSON.parse(root.localStorage.getItem(DOT_PLACE) || 'null');
       if (saved) { left = saved.left; top = saved.top; }
     } catch (err) { saved = null; }
-    if (!left && !top) {
-      left = Math.max(8, (root.innerWidth || 1200) - 150);
-      top = Math.max(8, (root.innerHeight || 800) - 150);
+    try { needsFreshPlacement = root.localStorage.getItem(DOT_LAYOUT) !== '2'; }
+    catch (err) { needsFreshPlacement = !saved; }
+    if ((!left && !top) || needsFreshPlacement) {
+      /* The old default lived in the replay corner. Start center-right so
+         this control is useful immediately without covering the transport. */
+      left = Math.round(((root.innerWidth || 1200) - DOT_WIDTH) * 0.62);
+      top = Math.round(((root.innerHeight || 800) - DOT_HEIGHT) * 0.56);
+      try { root.localStorage.setItem(DOT_LAYOUT, '2'); } catch (err) { /* fine */ }
     }
-    /* Off the hot corners, using their own test rather than a guess. */
-    var hops = 0;
-    while (hops < 8 && cornerAt(left, top)) { left -= 24; top -= 24; hops += 1; }
-    node.style.left = Math.max(0, left) + 'px';
-    node.style.top = Math.max(0, top) + 'px';
+    paintDotPoint(node, left, top);
 
-    /* A press opens the glass; a DRAG does not, or the dot could never be
-       moved without also opening what it opens. Four pixels of travel is
-       the threshold, which is under a deliberate tap and over the wobble a
-       thumb makes on the tablet. */
-    var from = null;
+    /* Drag to place, tap to collapse into the bottom-console bot icon, and
+       press/hold to open the recovery/orchestrator surface. A button owns
+       its press even inside a configured hot corner, so saved edge
+       placements stay draggable. */
+    var from = null, held = false, holdTimer = null;
+    function clearHold() {
+      if (holdTimer) root.clearTimeout(holdTimer);
+      holdTimer = null;
+    }
     var moved = false;
     node.addEventListener('pointerdown', function (ev) {
-      if (cornerAt(ev.clientX, ev.clientY)) return;
+      if (ev && ev.preventDefault) ev.preventDefault();
       moved = false;
+      held = false;
       from = {x: ev.clientX, y: ev.clientY,
               left: parseInt(node.style.left, 10) || 0,
               top: parseInt(node.style.top, 10) || 0};
       try { node.setPointerCapture(ev.pointerId); } catch (err) { /* fine */ }
+      clearHold();
+      holdTimer = root.setTimeout(function () {
+        if (!from || moved) return;
+        held = true;
+        if (recovery.kind === 'working' || recovery.kind === 'attention'
+            || recovery.kind === 'paused' || recovery.kind === 'offair') openRecovery();
+        else toggle();
+      }, DOT_HOLD_MS);
     });
     node.addEventListener('pointermove', function (ev) {
       if (!from) return;
       var dx = ev.clientX - from.x, dy = ev.clientY - from.y;
-      if (!moved && (dx * dx + dy * dy) < 16) return;
+      if (!moved && (dx * dx + dy * dy) < DOT_DRAG_PX * DOT_DRAG_PX) return;
       moved = true;
-      node.style.left = Math.max(0, from.left + dx) + 'px';
-      node.style.top = Math.max(0, from.top + dy) + 'px';
+      clearHold();
+      paintDotPoint(node, from.left + dx, from.top + dy);
     });
     node.addEventListener('pointerup', function (ev) {
       if (!from) return;
       from = null;
+      clearHold();
       try { node.releasePointerCapture(ev.pointerId); } catch (err) { /* fine */ }
-      if (!moved) {
+      if (moved) { rememberDotPoint(node); return; }
+      if (!held) {
+        /* A red/amber recovery launcher remains a direct recovery control;
+           the ordinary watching-state launcher folds into the console. */
         if (recovery.kind === 'working' || recovery.kind === 'attention'
             || recovery.kind === 'paused' || recovery.kind === 'offair') openRecovery();
-        else toggle();
-        return;
+        else hideDot(node);
       }
-      try {
-        root.localStorage.setItem(DOT_PLACE, JSON.stringify({
-          left: parseInt(node.style.left, 10) || 0,
-          top: parseInt(node.style.top, 10) || 0}));
-      } catch (err) { /* a position that will not save is not a fault */ }
     });
+    node.addEventListener('pointercancel', function () { from = null; clearHold(); });
     /* And a way to put it away that does not need a preferences page. */
     node.addEventListener('contextmenu', function (ev) {
       if (ev && ev.preventDefault) ev.preventDefault();
-      try { root.localStorage.setItem(DOT_SHUT, '1'); } catch (err) { /* fine */ }
-      if (node.parentNode) node.parentNode.removeChild(node);
-      dotNode = null;
-      stopRecoveryWatch();
+      hideDot(node);
     });
     root.document.body.appendChild(node);
     dotNode = node;
@@ -3163,7 +3225,9 @@
 
   function undot() {
     try { root.localStorage.removeItem(DOT_SHUT); } catch (err) { /* fine */ }
-    return dot();
+    var node = dot();
+    refreshDotRestore();
+    return node;
   }
 
   root.PineOrchGlass = {
@@ -3172,6 +3236,7 @@
     toggle: toggle,
     dot: dot,
     undot: undot,
+    isDotHidden: dotHidden,
     isOpen: function () { return !!box; },
     /* [#1213] the fold, for a test, a corner gesture or a future button. */
     collapse: collapse,

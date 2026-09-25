@@ -145,6 +145,19 @@
     return '';
   }
 
+  function paintOrchestratorButton(bar) {
+    bar = bar || el();
+    if (!bar) return;
+    var button = bar.querySelector('.pine-console-orchestrator');
+    if (!button) return;
+    var hidden = false;
+    try {
+      hidden = !!(root.PineOrchGlass && typeof root.PineOrchGlass.isDotHidden === 'function'
+        && root.PineOrchGlass.isDotHidden());
+    } catch (err) { hidden = false; }
+    button.hidden = !hidden;
+  }
+
   function mount() {
     if (el()) return el();
     var bar = document.createElement('div');
@@ -154,6 +167,9 @@
     bar.innerHTML = '<i class="pine-console-dot"></i>'
       + '<button class="pine-console-audit" type="button" title="Open the detailed audit log"'
       + ' aria-label="Open the detailed audit log"><em>AUDIT</em><span>waiting for the station journal</span></button>'
+      + '<button class="pine-console-orchestrator" type="button" hidden'
+      + ' title="Restore the orchestrator control" aria-label="Restore the orchestrator control">'
+      + (icon('c:bot', 'Restore orchestrator') || '') + '</button>'
       + '<button class="pine-console-change" type="button" title="Open Pine Box changelog"'
       + ' aria-label="Open Pine Box changelog">i</button>'
       + '<div class="pine-console-viewport"><div class="pine-console-track"></div></div>'
@@ -180,6 +196,13 @@
         if (root.PineChangeLog) root.PineChangeLog.open();
         return;
       }
+      if (event.target && event.target.closest && event.target.closest('.pine-console-orchestrator')) {
+        if (root.PineOrchGlass && typeof root.PineOrchGlass.undot === 'function') {
+          root.PineOrchGlass.undot();
+        }
+        paintOrchestratorButton(bar);
+        return;
+      }
       if (event.target && event.target.closest && event.target.closest('.pine-console-audit')) {
         openList(bar);
         return;
@@ -192,6 +215,7 @@
       }
       openList(bar);
     });
+    paintOrchestratorButton(bar);
     return bar;
   }
 
@@ -362,6 +386,6 @@
 
   root.PineConsoleLine = {start: start, paint: paint, latest: latest,
     mount: mount, history: history, sync: syncFlow, open: openList,
-    speed: function () { return speed; }};
+    speed: function () { return speed; }, refreshOrchestrator: paintOrchestratorButton};
   if (typeof module !== 'undefined' && module.exports) module.exports = root.PineConsoleLine;
 })(typeof window !== 'undefined' ? window : globalThis);

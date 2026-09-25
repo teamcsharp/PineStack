@@ -573,8 +573,8 @@ test('a closed glass stops its detail poll while the mascot keeps recovery watch
     'a closed pop-up went on polling its detail route');
 });
 
-test('the persistent mascot shows the active rung and opens recovery on tap', async () => {
-  const {body} = world();
+test('the persistent recovery mascot can be dragged from a corner and still opens recovery', async () => {
+  const {body, store} = world();
   const opened = [];
   globalThis.PineRevive = {open: () => opened.push('recovery')};
   globalThis.pineDesktop = {get: async (route) => {
@@ -593,8 +593,18 @@ test('the persistent mascot shows the active rung and opens recovery on tap', as
   assert.equal(dot.getAttribute('data-recovery'), 'working');
   assert.match(words(dot), /Recovering 2\/3/);
   assert.match(words(dot), /flush the queue/);
-  dot.fire('pointerdown', {clientX: 200, clientY: 200, pointerId: 1});
+  /* It may begin inside a configured corner and still be moved. */
+  const startLeft = parseInt(dot.style.left, 10);
+  const startTop = parseInt(dot.style.top, 10);
+  dot.fire('pointerdown', {clientX: 2, clientY: 898, pointerId: 1, preventDefault: () => {}});
+  dot.fire('pointermove', {clientX: 2 + 278 - startLeft, clientY: 898 + 416 - startTop, pointerId: 1});
   dot.fire('pointerup', {pointerId: 1});
+  assert.equal(dot.style.left, '278px');
+  assert.equal(dot.style.top, '416px');
+  assert.match(String(store.get('pineOrchDotAt')), /278/);
+
+  dot.fire('pointerdown', {clientX: 280, clientY: 420, pointerId: 2, preventDefault: () => {}});
+  dot.fire('pointerup', {pointerId: 2});
   assert.deepEqual(opened, ['recovery']);
   assert.equal(findByClass(body, 'og').length, 0, 'tap opened the glass instead of recovery');
 
@@ -607,6 +617,33 @@ test('the persistent mascot shows the active rung and opens recovery on tap', as
   control.fire('click', {stopPropagation: () => {}});
   assert.deepEqual(opened, ['recovery', 'recovery']);
   glass.close();
+});
+
+test('the ordinary mascot drags freely, collapses on tap, and restores in place', async () => {
+  const {store} = world();
+  station(payload());
+  const glass = load();
+  const dot = glass.dot();
+  await wait(40);
+  assert.equal(dot.getAttribute('data-recovery'), 'idle');
+
+  const startLeft = parseInt(dot.style.left, 10);
+  const startTop = parseInt(dot.style.top, 10);
+  dot.fire('pointerdown', {clientX: 8, clientY: 8, pointerId: 1, preventDefault: () => {}});
+  dot.fire('pointermove', {clientX: 8 + 380 - startLeft, clientY: 8 + 360 - startTop, pointerId: 1});
+  dot.fire('pointerup', {pointerId: 1});
+  assert.equal(dot.style.left, '380px');
+  assert.equal(dot.style.top, '360px');
+  assert.match(String(store.get('pineOrchDotAt')), /380/);
+
+  dot.fire('pointerdown', {clientX: 380, clientY: 360, pointerId: 2, preventDefault: () => {}});
+  dot.fire('pointerup', {pointerId: 2});
+  assert.equal(glass.isDotHidden(), true);
+  const restored = glass.undot();
+  assert.ok(restored);
+  assert.equal(glass.isDotHidden(), false);
+  assert.equal(restored.style.left, '380px');
+  assert.equal(restored.style.top, '360px');
 });
 
 test('fault, normal quiet, and unreachable station have distinct mascot states', async () => {
