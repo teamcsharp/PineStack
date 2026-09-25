@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- One player on the broadcast. Inflated once per row of
+     /api/radio/listeners.
+
+     The tick is a TextView, not a CheckBox, on purpose: the whole row is the
+     target (48dp, the full width) rather than a 20dp box a thumb misses, and
+     the check has to show a state the station owns, not one the widget
+     remembers for itself. -->
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="@dimen/tap"
+    android:layout_marginBottom="4dp"
+    android:background="@drawable/chip"
+    android:clickable="true"
+    android:focusable="true"
+    android:gravity="center_vertical"
+    android:orientation="horizontal"
+    android:paddingStart="10dp"
+    android:paddingEnd="10dp">
+
+    <TextView
+        android:id="@+id/playerTick"
+        android:layout_width="22dp"
+        android:layout_height="wrap_content"
+        android:textColor="@color/chip_text"
+        android:textSize="15sp" />
+
+    <LinearLayout
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:layout_weight="1"
+        android:orientation="vertical">
+
+        <TextView
+            android:id="@+id/playerName"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:ellipsize="end"
+            android:maxLines="1"
+            android:textColor="@color/chip_text"
+            android:textSize="14sp" />
+
+        <TextView
+            android:id="@+id/playerDetail"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:ellipsize="end"
+            android:maxLines="1"
+            android:textColor="@color/pine_dim"
+            android:textSize="10sp" />
+    </LinearLayout>
+</LinearLayout>

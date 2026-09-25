@@ -1,0 +1,68 @@
+<resources>
+    <string name="pine_voice_ime">Pine Box voice input</string>
+    <string name="app_name">Pine Box</string>
+    <string name="status_connecting">Reaching the station…</string>
+    <string name="status_offline">The station at %1$s did not answer. Retrying…</string>
+    <string name="status_retry">Retry now</string>
+
+    <!-- The rail -->
+    <string name="rail_open">Open the Pine Box rail</string>
+    <string name="rail_close">Close the rail</string>
+    <string name="rail_title">Pine Box</string>
+    <string name="rail_checking">checking the station…</string>
+    <!-- The battery card. "Power" rather than "Battery" because the card
+         answers a question about the broadcast, not about a component. -->
+    <!-- The one-tap music kill. The wording says what it does to the AIR,
+         not what it does to a slider. -->
+    <string name="rail_music_off">Music off — talk over it</string>
+    <string name="rail_music_back">Music back on</string>
+    <string name="rail_fix">Reinitialise</string>
+    <string name="rail_fix_go">↻   Get the broadcast back</string>
+    <string name="rail_fix_idle">one tap runs every fix we know</string>
+    <string name="rail_power">Power</string>
+    <string name="rail_power_saver">Open battery settings</string>
+    <string name="rail_air">Air</string>
+    <string name="rail_fm">FM</string>
+    <string name="rail_pause">Off air</string>
+    <string name="rail_resume">Back on air</string>
+    <string name="rail_endless_video">Toggle endless video</string>
+    <string name="rail_endless_checking">endless video: checking station</string>
+    <string name="rail_broadcast">Broadcast</string>
+    <string name="rail_streams">Streams</string>
+    <string name="rail_players">Playing it</string>
+    <string name="rail_players_waiting">asking the station who is listening…</string>
+    <string name="rail_music">Music</string>
+    <string name="rail_voice">DJs</string>
+    <string name="rail_reply">Replies</string>
+    <string name="rail_monitor">Heard in this app</string>
+    <string name="rail_monitor_note">The panel player itself. Its level lives in this browser storage, not on the station.</string>
+    <!-- The hot corners: the switch, its caption and the four rows. The
+         choices themselves are listed in config/HotCorners.kt so the drawer
+         and the bridge share one list of words. -->
+    <string name="rail_corners">Hot corners</string>
+    <string name="rail_corners_switch">Hot corners</string>
+    <string name="rail_corners_note">corner swipes toward the centre · the screen ring holds %1$d s</string>
+    <string name="rail_corner_tl">Top left</string>
+    <string name="rail_corner_tr">Top right</string>
+    <string name="rail_corner_bl">Bottom left</string>
+    <string name="rail_corner_br">Bottom right</string>
+    <string name="rail_jumps">Jump to</string>
+    <string name="rail_logs">Logs</string>
+    <string name="rail_logs_full">Full log</string>
+    <string name="rail_route_unknown">routing unknown</string>
+    <string name="rail_here">App</string>
+    <string name="rail_box">Box</string>
+    <string name="rail_both">Both</string>
+    <string name="rail_off">Off</string>
+    <string name="rail_nabu">Nabu</string>
+    <string name="rail_web">Web page</string>
+    <string name="rail_app">Application</string>
+    <string name="rail_pinebox">Pine Box</string>
+    <!-- #1241: the SC stack as its own application, with its own icon. -->
+    <string name="spark_name">SC Stack</string>
+    <string name="spark_retry">Try again</string>
+    <string name="spark_unreachable">%1$s did not answer</string>
+    <!-- DGX Terminal: its own entry in the app list, beside Pine Box
+         and the SC stack. -->
+    <string name="dgx_name">DGX Terminal</string>
+</resources>

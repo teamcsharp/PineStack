@@ -1,0 +1,83 @@
+/* #1222: the levels sheet. Small, out of the way, and legible on a tablet in
+   a dark room - the same register as the orchestrator glass beside it. */
+
+.plv-dot {
+  position: fixed;
+  right: 14px;
+  bottom: 96px;
+  z-index: 2147482500;
+  width: 46px;
+  height: 46px;
+  border-radius: 50%;
+  border: 1px solid #2a4257;
+  background: #0b1520f2;
+  color: #8cd4c0;
+  font: 600 11px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
+  letter-spacing: .04em;
+  box-shadow: 0 10px 30px #000a;
+  cursor: pointer;
+}
+.plv-dot:active { transform: scale(.94); }
+
+.plv-sheet {
+  position: fixed;
+  right: 14px;
+  bottom: 150px;
+  z-index: 2147482600;
+  width: min(330px, calc(100vw - 28px));
+  padding: 12px 13px 11px;
+  border-radius: 10px;
+  border: 1px solid #2a4257;
+  background: #0b1520f7;
+  color: #dbe6f0;
+  font: 12px/1.45 system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+  box-shadow: 0 16px 44px #000b;
+}
+
+.plv-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 9px;
+}
+.plv-title-t { font-weight: 600; color: #8cd4c0; letter-spacing: .01em; }
+.plv-x {
+  border: 0;
+  background: transparent;
+  color: #8b8f97;
+  font: 600 13px/1 ui-monospace, monospace;
+  cursor: pointer;
+  padding: 3px 5px;
+}
+.plv-x:hover { color: #dbe6f0; }
+
+.plv-row { margin: 0 0 11px; }
+.plv-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  margin-bottom: 3px;
+}
+.plv-name { color: #dbe6f0; }
+.plv-val {
+  color: #8cd4c0;
+  font: 600 12px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+/* Tall enough to catch with a thumb rather than a cursor. */
+.plv-slide {
+  width: 100%;
+  height: 26px;
+  margin: 0;
+  accent-color: #8cd4c0;
+  background: transparent;
+}
+
+.plv-hint { color: #8b8f97; font-size: 10.5px; margin-top: 2px; }
+.plv-foot {
+  color: #8b8f97;
+  font-size: 10.5px;
+  border-top: 1px solid #1c2c3a;
+  padding-top: 8px;
+  margin-top: 2px;
+}

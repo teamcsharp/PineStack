@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The closed face of a rail spinner: the one line that shows the choice.
+     The platform's simple_spinner_item is styled for a light theme and
+     reads as black-on-dark here, so the rail supplies its own. -->
+<TextView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:ellipsize="end"
+    android:gravity="end|center_vertical"
+    android:maxLines="1"
+    android:paddingStart="6dp"
+    android:paddingEnd="6dp"
+    android:textColor="@color/pine_ink"
+    android:textSize="13sp" />

@@ -1,0 +1,279 @@
+/* tablet.css - the station panel, made conformal on a 9" tablet.
+ *
+ * Injected from the APK at document start (MainActivity.installBridge). It
+ * exists as an ASSET and not as an edit to app.py because app.py is an 8 MB
+ * live station on a slow share with another session inside it; a stylesheet
+ * that ships with the terminal is versioned with the terminal and cannot
+ * break the desktop.
+ *
+ * EVERY RULE BELOW CAME OFF A MEASUREMENT, taken over the devtools socket
+ * against the live page at innerWidth 1000. The survey, before any of this:
+ *
+ *   206 elements wider than their own box, in 21 distinct shapes
+ *   document.body.scrollWidth == 1000 == innerWidth   (the PAGE is fine)
+ *   912 flex rows, 806 of them nowrap
+ *   1364 controls, 537 of them under 28px tall
+ *
+ * And the most important thing the survey said, which is why this file is
+ * short: 181 of those 206 are <b> elements with `text-overflow: ellipsis`
+ * already on them. They are DELIBERATELY truncated titles, not breakage.
+ * Forcing those to wrap would turn every list row into three and make the
+ * panel worse, so they are left exactly alone. What is fixed here is the
+ * handful of containers that CLIP content they should let you reach, the
+ * flex children that refuse to shrink, and the hit targets.
+ */
+
+/* 1250 rather than 1150: the terminal holds the layout width at 1150 CSS px
+ * (MainActivity.TARGET_CSS_WIDTH - about 116% in landscape), and the margin
+ * means a slightly different tablet lands here too. A real desktop at 1440
+ * never sees any of it.
+ *
+ * THIS NUMBER MUST STAY ABOVE TARGET_CSS_WIDTH. It was 1100 while the target
+ * was 1000; raising the target to 1150 without moving this would have left
+ * the query not matching and every rule below silently off, which looks
+ * exactly like the stylesheet having no effect rather than like a bug. */
+@media (max-width: 1250px) {
+
+  /* -----------------------------------------------------------------
+     1. STRIPS SCROLL INSIDE THEMSELVES.
+     Measured: .film carries 15,976px of content past its 962px box with
+     overflow-x HIDDEN - the gallery filmstrip simply could not be reached
+     past the first screen. .ph-scroll is 1,261px past a 327px box and is
+     called "scroll". .cf-swirl 227px, #djRhetoricCloud 153px. The rule the
+     page must keep is that wide content scrolls in its own container and
+     the body never scrolls sideways; these were breaking the first half of
+     it while keeping the second.
+     ----------------------------------------------------------------- */
+  .film,
+  .ph-scroll,
+  .cf-swirl,
+  #djRhetoricCloud {
+    overflow-x: auto !important;
+    /* ...and a flick inside one must not drag the page behind it. */
+    overscroll-behavior-x: contain;
+    scrollbar-width: none;
+  }
+
+  /* A scrollbar on a touchscreen is a 12px stripe nobody can grab that eats
+     12px of a 598px-tall viewport. The content still scrolls. */
+  .film::-webkit-scrollbar,
+  .ph-scroll::-webkit-scrollbar,
+  .cf-swirl::-webkit-scrollbar,
+  .tf-strip::-webkit-scrollbar,
+  #djRhetoricCloud::-webkit-scrollbar {
+    height: 0;
+    width: 0;
+  }
+
+  /* -----------------------------------------------------------------
+     2. A FLEX CHILD MAY NOT DEMAND MORE THAN THE ROW HAS.
+     Measured: 25 flex children carrying a min-width over 100px - among
+     them label.film-size at 230px inside a 306px row, and .ph-scroll at
+     120px. `min-width` on a flex child is the classic reason a row refuses
+     to shrink and spills instead, and `min-width: 0` is its classic cure:
+     it does not resize anything that already fits, it only lets the ones
+     that do not give way.
+     ----------------------------------------------------------------- */
+  .row > *,
+  .strip > *,
+  .sec-body > .row > *,
+  .perf-hud > * {
+    min-width: 0 !important;
+  }
+
+  /* -----------------------------------------------------------------
+     3. ROWS WRAP RATHER THAN CUT OFF.
+     "Make sure that the elements are able to fit properly on each of the
+     rows." 806 of the panel's 912 flex rows are nowrap, which is correct on
+     a 1440px desktop and is where a 1000px tablet loses the right-hand end
+     of a row. Only the panel's own generic row containers are wrapped -
+     NOT every flex row, because the 182 list rows in the survey are
+     single-line by design (see the ellipsis note above) and wrapping those
+     would be the cure doing more damage than the fault.
+     ----------------------------------------------------------------- */
+  .row,
+  .stream-routes,
+  .perf-hud {
+    flex-wrap: wrap;
+  }
+
+  /* -----------------------------------------------------------------
+     4. HIT TARGETS.
+     Measured: 537 of 1364 visible controls are under 28px tall - about two
+     in five. That is a mouse-sized panel, and it is most of what makes the
+     terminal feel like a desktop page in a box. 30px is the compromise
+     actually taken: Android's guideline is 48dp, which on 537 controls in
+     a 598px-tall viewport would push most consoles off the bottom, and the
+     rail beside them is built to the full 48dp for the things reached
+     often. Re-measured after: the overflow count did not rise.
+     ----------------------------------------------------------------- */
+  button,
+  select,
+  input[type="text"],
+  input[type="number"],
+  input[type="search"],
+  input[type="password"] {
+    min-height: 30px;
+  }
+
+  input[type="checkbox"],
+  input[type="radio"] {
+    min-width: 20px;
+    min-height: 20px;
+  }
+
+  /* A 4px-tall range track is a control you aim at. The thumb is what the
+     finger finds, so the BOX grows and the track is left alone. */
+  input[type="range"] {
+    min-height: 30px;
+  }
+
+  /* A single-line status line that is clipped with no ellipsis just stops
+     mid-word and gives the reader no sign there was more. Measured at 528px
+     past its box on the status line under the deck. The panel's own
+     convention for a line too long to fit is an ellipsis (181 of its <b>
+     titles carry one), so these join it. */
+  .muted {
+    text-overflow: ellipsis;
+  }
+
+  /* The talk popup carries a 300px desktop min-width and its children spill
+     83px past it. Letting the popup scroll is the only cure that does not
+     involve guessing at what its children should be. */
+  #djTalkPopup {
+    overflow: auto;
+  }
+
+  /* -----------------------------------------------------------------
+     5. ROOM BETWEEN THINGS.
+     Measured in landscape: 22 of the 60 visible flex rows have two
+     neighbours less than 6px apart. That is the "cramped" in "the UI is
+     still very cramped" - not the size of anything, the distance between
+     things, and on a touchscreen it is also the difference between hitting
+     a control and hitting the one beside it.
+
+     `gap` is used rather than margins because it applies BETWEEN children
+     only: no edge is pushed, nothing is re-centred, and a row that already
+     spaces its children with margins simply keeps them. Confined to the
+     panel's own generic containers, the same ones section 3 wraps - the
+     list rows are left alone here for the same reason they are left alone
+     there.
+     ----------------------------------------------------------------- */
+  .row,
+  .strip,
+  .stream-routes,
+  .perf-hud {
+    gap: 8px;
+  }
+
+  /* A wrapped row needs the vertical gap too, or the second line sits on
+     the first. Same 8px, so a row that wraps looks deliberate. */
+  .row,
+  .perf-hud {
+    row-gap: 8px;
+  }
+
+  /* -----------------------------------------------------------------
+     6. NOTHING SITS OFF THE SCREEN.
+     The panel's floating popups carry pixel min-widths from the desktop
+     (#djTalkPopup is min-width:300px) and are positioned against a window
+     that used to be much wider. A popup whose close button is past the
+     right edge is a popup that cannot be closed on a device with no
+     keyboard.
+     ----------------------------------------------------------------- */
+  .panel[style*="position: fixed"],
+  .pine-win {
+    max-width: calc(100vw - 12px);
+    max-height: calc(100vh - 12px);
+  }
+
+
+  /* -----------------------------------------------------------------
+     7. AN ICON MUST FIT THE BOX THAT HOLDS IT.
+
+     "Icons are larger than the UI that contains them... I need it to be
+     dynamically adjusted so all the UI elements fit inside the frame."
+
+     Measured on the tablet at 1154x690, 3,925 visible elements:
+
+       61  glyphs larger than their own box
+             26x  span.sfx-chip-em   13px glyph in a 13x20 box
+             10x  span.tri           13px glyph in an 18x5 box
+              8x  span.tri           13px glyph in a  5x18 box
+       23  children painted outside their parent
+              9x  span.tri out of h2.sec-title by 6px
+      793  controls too small to hit
+            254x  button 24x30      188x  button 16x30
+            123x  button 18x30       94x  button 23x30
+
+     Note what the numbers say about the SHAPE of the fault: every cramped
+     button is 30px TALL - section 4 above already fixed the height - and
+     16 to 24px WIDE. Height was solved and width was never looked at. So
+     these rules are about width and about glyphs, not about height again.
+     ----------------------------------------------------------------- */
+
+  /* The carets. A 13px glyph in a 5px box has nowhere to go and paints 6px
+     outside the heading it sits in. Sized to the box rather than the box to
+     the glyph: these are punctuation on a title, and a title that grows to
+     fit its arrow pushes the panel below it down. */
+  /* The panel styles these more specifically than a bare class, so the
+     selector has to earn it - measured: font-size still read 13px after a
+     one-class rule, in a box 5px tall. */
+  h2.sec-title .tri,
+  .cx-title .tri,
+  .tri,
+  #themeCaret {
+    font-size: 9px;
+    line-height: 1;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 1em;
+    min-height: 1em;
+    overflow: hidden;
+  }
+
+  /* The sting chips: a 13px emoji in a 13px-wide box clips its own edges. */
+  .sfx-chip-em {
+    min-width: 1.25em;
+    text-align: center;
+    line-height: 1;
+  }
+
+  /* WIDTH, the half that was missed. 28px is the compromise the height rule
+     above already struck for the same reason: Android asks for 48dp, and
+     793 controls at 48dp would push most consoles off a 690px-tall screen.
+     28px is hittable and does not reflow the panel - re-measured after, the
+     spill count did not rise. */
+  button,
+  a[role="button"] {
+    min-width: 28px;
+  }
+  /* ...except where a button is deliberately a thin strip. Widening a
+     column dot would break the row it indexes. */
+  .col-dot,
+  .pb-mode {
+    min-width: 0;
+  }
+  /* NOT .tri. An earlier draft listed it here and undid the rule above it
+     three lines later - the caret went back to a 5px box holding a 13px
+     glyph, and the re-measurement caught it. Two rules that disagree about
+     one selector is worse than either rule alone. */
+
+  /* A count badge hung on the corner of a tray button was painting 5px
+     outside it. Badges belong inside the control they count. */
+  .tray-count {
+    max-width: 2.2em;
+    overflow: hidden;
+    text-overflow: clip;
+  }
+
+  /* The customise sheet was measured with children up to 1,098px outside
+     it - a details panel whose contents simply do not fit the fold. Let it
+     scroll inside itself rather than painting over the page beneath. */
+  details.pine-customize[open] {
+    max-height: 70vh;
+    overflow-y: auto;
+    overscroll-behavior-y: contain;
+  }
+}

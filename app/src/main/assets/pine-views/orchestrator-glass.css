@@ -1,0 +1,762 @@
+/* THE ORCHESTRATOR GLASS (orchestrator-glass.js, #1191).
+
+   The same dark glass as the clip doctor, the talk dot's transcript and the
+   Pine Cam box, so it reads as the station explaining itself rather than as
+   a browser dialog. It floats at BODY level over whatever view is up, it is
+   dragged by its head, and it is sized in px because its position is saved
+   and restored - a box that comes back somewhere else is a box the operator
+   has to find again.
+
+   ONE RULE WORTH STATING because it is easy to undo: everything in here is
+   drawn in a single colour per state and never in an emoji. The icons are
+   Carbon vectors from the injected sprite (pine-icons.js) and inherit
+   currentColor, so a chip that turns amber turns its icon amber with it. */
+
+.og {
+  position: fixed;
+  z-index: 2147483005;
+  display: flex;
+  flex-direction: column;
+  min-width: 320px;
+  min-height: 260px;
+  max-width: 96vw;
+  max-height: 92vh;
+  border: 1px solid #35414c;
+  border-radius: 12px;
+  background: rgba(10, 14, 18, .975);
+  color: #edf3f5;
+  box-shadow: 0 18px 50px rgba(0, 0, 0, .62);
+  font: 13px/1.5 Inter, "Segoe UI", system-ui, sans-serif;
+  overflow: hidden;
+}
+
+/* The mood is on the box, not only on the chip: a two-pixel edge is
+   readable from across the room, which is the whole point of the face. */
+.og[data-mood="angry"] { border-color: #b4423a; }
+.og[data-mood="anxious"] { border-color: #b8873a; }
+.og[data-mood="rushing"] { border-color: #b8873a; }
+.og[data-mood="thinking"] { border-color: #3f7f96; }
+.og[data-mood="pleased"] { border-color: #3f8f63; }
+
+/* ------------------------------------------------------------- the head */
+
+.og-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 8px 8px 8px 12px;
+  border-bottom: 1px solid #35414c;
+  background: rgba(16, 22, 28, .9);
+  cursor: grab;
+  touch-action: none;          /* the drag is ours, not the scroller's */
+  user-select: none;
+  /* [#1213] THE HEAD IS NOT SHRINKABLE. This is the fault itself.
+     `.og` is a column flex box with a saved pixel height and a list that
+     always wants more room than it has, so the column was shrinking the head
+     - measured at 53px against the 73.9px its own contents need - and the
+     avatar button was clamped with it. A button whose height is clamped does
+     not shrink what is inside it; the face simply overflowed, 16.9px of it,
+     onto the panel behind. The list already has `overflow-y: auto`, so it is
+     the one that can give room and this one never has to.
+     AND IT CLIPS, as a guarantee that no future font can put anything in this
+     strip outside the panel - which is only safe BECAUSE of the line above:
+     `overflow: hidden` removes a flex item's automatic minimum size, so on
+     its own it would have let the head shrink to nothing. */
+  flex: 0 0 auto;
+  overflow: hidden;
+}
+.og-head:active { cursor: grabbing; }
+.og-name {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+  color: #8ea0ad;
+  padding-top: 3px;
+}
+.og-state {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  align-items: center;
+  margin-left: 4px;
+  padding-top: 2px;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+/* GLYPHY, TOP RIGHT. A real button, so hot-corners' own _overControl
+   already answers true over him and a press on his face can never be taken
+   for a corner gesture. The monospace is load-bearing: the sprite is drawn
+   on a character grid and a proportional font shears his head off. */
+.og-avatar {
+  flex: 0 0 auto;
+  margin-left: auto;
+  background: rgba(6, 9, 12, .8);
+  border: 1px solid #2b353f;
+  border-radius: 8px;
+  padding: 3px 5px;
+  cursor: pointer;
+  color: #9fd6e8;
+  /* [#1213] THE CARD IS PINNED TO WHAT IS IN IT. `flex: 0 0 auto` above
+     governs the main axis only; across it the button was taking whatever
+     height the squeezed head had left. max-content is Glyphy's own height,
+     whatever the host renders him at - 48.9px of pre on the desk at 8px,
+     73.4px on the PineTab where the WebView clamps the same pre to a 12px
+     minimum - so this holds on both without naming a number. */
+  align-self: flex-start;
+  min-height: max-content;
+  overflow: hidden;
+  display: block;
+  box-sizing: border-box;
+}
+.og-avatar:hover { border-color: #4a5a68; }
+.og-avatar:active { transform: translateY(1px); }
+.og-face {
+  margin: 0;
+  font: 8px/1.02 "Cascadia Mono", Consolas, "DejaVu Sans Mono", monospace;
+  white-space: pre;
+  letter-spacing: 0;
+}
+.og[data-mood="angry"] .og-avatar { color: #e3796f; }
+.og[data-mood="anxious"] .og-avatar,
+.og[data-mood="rushing"] .og-avatar { color: #e0ad63; }
+.og[data-mood="pleased"] .og-avatar { color: #74c493; }
+
+.og-x {
+  flex: 0 0 auto;
+  background: none;
+  border: 0;
+  color: #8ea0ad;
+  cursor: pointer;
+  padding: 2px;
+  line-height: 0;
+}
+.og-x:hover { color: #edf3f5; }
+
+/* What he is saying, why, or the brief - stepped by pressing his face. */
+.og-say {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  padding: 7px 12px;
+  border-bottom: 1px solid #222b33;
+  background: rgba(14, 19, 25, .8);
+}
+.og-say-what {
+  flex: 0 0 auto;
+  font-size: 10px;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+  color: #6f8090;
+}
+.og-say-text { color: #cfe3ea; }
+/* [#1213] the face folds the panel now, so the line that shows what he says
+   is the thing that steps through saying / because / the brief. */
+.og-say { cursor: pointer; }
+
+.og-recovery {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  align-items: baseline;
+  column-gap: 8px;
+  width: 100%;
+  min-width: 0;
+  border: 0;
+  border-bottom: 1px solid #303b43;
+  padding: 6px 12px;
+  background: #172129;
+  color: #a8c3cc;
+  font: inherit;
+  font-size: 11px;
+  text-align: left;
+  cursor: pointer;
+}
+.og-recovery:hover { background: #20313a; }
+.og-recovery-state { flex: 0 0 auto; font-weight: 700; }
+.og-recovery-step { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.og-recovery-note { grid-column: 1 / -1; min-width: 0; overflow-wrap: anywhere; font-size: 10px; }
+.og-recovery-note:empty { display: none; }
+.og-recovery[data-recovery="working"] { background: #392a17; color: #f2c975; border-color: #9c7235; }
+.og-recovery[data-recovery="attention"] { background: #3b2021; color: #f2a39e; border-color: #ac514d; }
+.og-recovery[data-recovery="paused"], .og-recovery[data-recovery="offair"] {
+  background: #1a3033;
+  color: #a8e0dc;
+  border-color: #538986;
+}
+.og-recovery[data-recovery="unknown"] { color: #c3a5a5; }
+.og.og-min .og-recovery { padding: 4px 12px 8px; }
+.og.og-min .og-recovery-note { display: none; }
+
+/* [#1186] "paused while you read - N updates waiting".
+   A LINE, NOT A TOAST. The complaint was that things moved while he read;
+   answering it with something that appears over the reading would be the same
+   fault in a friendlier colour. It sits under the SAYING row, it is only there
+   while something is actually held, and pressing it takes the update now. */
+.og-held {
+  padding: 5px 12px;
+  border-bottom: 1px solid #222b33;
+  background: rgba(30, 26, 12, .85);
+  color: #e0ad63;
+  font-size: 11px;
+  letter-spacing: .02em;
+  cursor: pointer;
+}
+.og-held[hidden] { display: none; }
+.og-held:hover { background: rgba(44, 37, 15, .9); color: #f0c789; }
+
+/* ------------------------------------------------------- [#1213] THE PILL
+
+   "if I click the orchestrator I want it to collapse."
+
+   Folded, the panel is his face, the badges and the one line he is saying.
+   The height is the only thing forced: place() writes an inline px height
+   that a saved size restores, and a pill has to be as tall as its contents.
+   The WIDTH is left alone on purpose - it is the width he dragged it to, and
+   a box that changes width when it folds is a box that has moved. */
+.og.og-min {
+  height: auto !important;
+  min-height: 0 !important;
+  resize: none;
+}
+.og.og-min .og-main { display: none !important; }
+.og.og-min .og-name { display: none; }
+.og.og-min .og-held { display: none !important; }
+.og.og-min .og-head { border-bottom: 0; padding: 6px 6px 6px 10px; }
+.og.og-min .og-say {
+  border-bottom: 0;
+  padding: 4px 12px 8px;
+  align-items: center;
+}
+.og.og-min .og-say-text {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+
+/* ------------------------------------------------------------- the body */
+
+.og-main {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 6px 8px 12px;
+}
+
+/* ---------------------------------------------------------- the triangle */
+
+.og-fold { margin: 2px 0; }
+.og-tri {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  text-align: left;
+  background: none;
+  border: 0;
+  border-radius: 6px;
+  color: #d7e5ec;
+  font: inherit;
+  padding: 5px 6px;
+  cursor: pointer;
+}
+.og-tri:hover { background: rgba(255, 255, 255, .045); }
+/* THE TRIANGLE ITSELF. There is no c:caret--down in the 114 vendored
+   Carbon icons, so the right-facing caret is turned ninety degrees when the
+   fold opens - which is what a disclosure triangle does anyway, and it
+   animates rather than swapping glyph. */
+.og-tri .og-i {
+  flex: 0 0 auto;
+  display: inline-flex;
+  line-height: 0;
+  color: #7f95a4;
+  transition: transform .12s ease;
+}
+.og-fold.open > .og-tri .og-i { transform: rotate(90deg); color: #9fd6e8; }
+.og-tri-title { flex: 1 1 auto; min-width: 0; }
+.og-tri-sum {
+  flex: 0 0 auto;
+  font-size: 11px;
+  color: #7f95a4;
+  white-space: nowrap;
+}
+.og-body {
+  padding: 2px 6px 8px 22px;
+  border-left: 1px solid #222c34;
+  margin-left: 11px;
+}
+
+/* A pass that is open right now, and a road with a saturated multiplier on
+   it, are the two things worth spotting without reading. */
+.og-fold.og-live > .og-tri { background: rgba(63, 127, 150, .16); }
+.og-fold.og-pinned > .og-tri-title,
+.og-fold.og-pinned > .og-tri .og-tri-title { color: #e0ad63; }
+.og-fold.og-blindfold > .og-tri { color: #b8a06a; }
+
+/* ------------------------------------------------------------ the pieces */
+
+.og-lead {
+  color: #bed3dc;
+  margin: 4px 0 8px;
+}
+.og-sub {
+  margin: 10px 0 4px;
+  font-size: 10px;
+  letter-spacing: .07em;
+  text-transform: uppercase;
+  color: #6f8090;
+}
+.og-quiet {
+  color: #8296a3;
+  font-style: italic;
+  margin: 4px 0;
+}
+.og-pair {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  padding: 1px 0;
+}
+.og-pair-k { flex: 1 1 auto; color: #8ea0ad; min-width: 0; }
+.og-pair-v {
+  flex: 0 0 auto;
+  color: #edf3f5;
+  font-variant-numeric: tabular-nums;
+}
+
+.og-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  border: 1px solid #35414c;
+  border-radius: 999px;
+  padding: 0 7px;
+  font-size: 11px;
+  line-height: 18px;
+  color: #a9bcc7;
+  white-space: nowrap;
+}
+.og-kind { border-color: #2f4854; color: #86b8cb; }
+.og-more { border-color: #4a4230; color: #c9ab72; }
+.og-count { border-color: #2b353f; color: #8ea0ad; }
+.og-note { border: 0; color: #7f95a4; padding: 0; font-size: 11px; }
+.og-bad { border-color: #6d3a35; color: #e3796f; }
+.og-factor { border-color: #4a4230; color: #e0ad63; font-variant-numeric: tabular-nums; }
+.og-mood { border-color: #2f4854; color: #86b8cb; }
+.og-mood-angry { border-color: #6d3a35; color: #e3796f; }
+.og-mood-anxious, .og-mood-rushing { border-color: #5c4a2c; color: #e0ad63; }
+.og-mood-pleased { border-color: #2f5a41; color: #74c493; }
+
+.og-step {
+  display: flex;
+  gap: 6px;
+  align-items: baseline;
+  padding: 2px 0;
+  flex-wrap: wrap;
+}
+.og-step-text { flex: 1 1 200px; color: #cfe3ea; min-width: 0; word-break: break-word; }
+.og-sys {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  padding: 2px 0;
+  flex-wrap: wrap;
+}
+.og-sys .og-i { line-height: 0; color: #6f8090; }
+.og-sys-name { color: #cfe3ea; }
+
+/* ------------------------------------------------- the arithmetic chain */
+
+.og-link {
+  border-left: 2px solid #2f4854;
+  padding: 4px 0 6px 8px;
+  margin: 4px 0;
+}
+/* AT ITS CAP. A factor pinned at its ceiling for 187 hours carries no
+   information, and noticing that is the most useful thing on this screen -
+   so it is the loudest thing in the fold. */
+.og-link.og-capped { border-left-color: #c08a3a; background: rgba(192, 138, 58, .07); }
+.og-link-head {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.og-link-name { color: #edf3f5; }
+.og-link-sum {
+  font-variant-numeric: tabular-nums;
+  color: #9fd6e8;
+  margin: 2px 0;
+}
+.og-cap {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: #e0ad63;
+  font-size: 11px;
+  letter-spacing: .05em;
+}
+.og-cap .og-i { line-height: 0; }
+.og-rule { color: #8ea0ad; font-size: 12px; margin: 2px 0 4px; }
+.og-input {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  padding: 0 0 0 10px;
+}
+.og-input-k { flex: 1 1 auto; color: #7f95a4; font-size: 12px; min-width: 0; }
+.og-input-v {
+  flex: 0 0 auto;
+  color: #cfe3ea;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Asked against granted, side by side, because the gap between them is the
+   thing the operator is looking for. */
+.og-two { display: flex; gap: 8px; }
+.og-col {
+  flex: 1 1 0;
+  border: 1px solid #2b353f;
+  border-radius: 8px;
+  padding: 6px 8px;
+  min-width: 0;
+}
+.og-col-h {
+  font-size: 10px;
+  letter-spacing: .07em;
+  text-transform: uppercase;
+  color: #6f8090;
+}
+.og-col-v {
+  font-size: 16px;
+  color: #edf3f5;
+  font-variant-numeric: tabular-nums;
+}
+.og-col-s { font-size: 11px; color: #8ea0ad; }
+
+/* --------------------------------------------- #1202: THE HEADLINE NUMBER
+
+   "It is nightmarish to hear of lines being recorded stored and never
+   intended to be used or played."
+
+   The waste pane leads with what was made and never heard, in minutes, at a
+   size that can be read without reading - and it is the only number on this
+   screen drawn at 26px, deliberately, because a second headline is no
+   headline. The amber variant is not "an error"; it is the measured fact
+   that some minutes of speech were made and never went out, which is what he
+   opened this panel to find out. When the number could not be read it stays
+   in the plain frame and says so in words, because a red-hot "could not be
+   counted" would read as a big bad number, which is the opposite of true. */
+.og-big {
+  border: 1px solid #2b353f;
+  border-left: 3px solid #3f7f96;
+  border-radius: 8px;
+  background: rgba(63, 127, 150, .07);
+  padding: 8px 10px;
+  margin: 4px 0 10px;
+}
+.og-big.og-big-bad {
+  border-left-color: #c08a3a;
+  background: rgba(192, 138, 58, .09);
+}
+.og-big-h {
+  font-size: 10px;
+  letter-spacing: .07em;
+  text-transform: uppercase;
+  color: #6f8090;
+}
+.og-big-v {
+  font-size: 26px;
+  line-height: 1.15;
+  color: #edf3f5;
+  font-variant-numeric: tabular-nums;
+}
+.og-big.og-big-bad .og-big-v { color: #e0ad63; }
+.og-big-s { font-size: 11px; color: #8ea0ad; margin-top: 2px; }
+
+.og-refuse {
+  border-left: 2px solid #6d5a35;
+  padding: 4px 0 4px 8px;
+  color: #d9c79c;
+}
+
+.og-warn {
+  display: flex;
+  gap: 6px;
+  align-items: flex-start;
+  border: 1px solid #5c4a2c;
+  border-radius: 8px;
+  background: rgba(192, 138, 58, .09);
+  padding: 6px 8px;
+  margin: 4px 0 8px;
+  color: #dcc189;
+}
+.og-warn .og-i { flex: 0 0 auto; line-height: 0; padding-top: 2px; }
+
+.og-blind { padding: 3px 0; }
+.og-blind-g { display: block; color: #cfe3ea; }
+.og-blind-n {
+  display: block;
+  color: #7f95a4;
+  font-size: 11px;
+  word-break: break-word;
+}
+
+/* The persistent face carries the watch state even with the glass closed. */
+.og-dot {
+  position: fixed;
+  z-index: 2147483004;
+  background: rgba(10, 14, 18, .9);
+  border: 1px solid #2b353f;
+  border-radius: 8px;
+  padding: 5px 7px 6px;
+  cursor: pointer;
+  color: #9fd6e8;
+  box-shadow: 0 8px 22px rgba(0, 0, 0, .45);
+  touch-action: none;
+  line-height: 1.15;
+  width: 144px;
+  min-height: 80px;
+  max-width: calc(100vw - 16px);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 3px;
+  overflow: hidden;
+}
+.og-dot:hover { border-color: #4a5a68; }
+.og-dot:active { transform: translateY(1px); }
+.og-dot-state, .og-dot-step {
+  display: block;
+  width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: center;
+  font: 700 10px/1.2 Inter, "Segoe UI", system-ui, sans-serif;
+}
+.og-dot-step {
+  font-weight: 500;
+  font-size: 9px;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+.og-dot[data-recovery="working"] {
+  border: 2px solid #e2a84d;
+  background: #2c2418;
+  color: #ffd18a;
+  box-shadow: 0 0 0 3px rgba(226, 168, 77, .24), 0 8px 22px rgba(0, 0, 0, .45);
+  animation: og-recovery-pulse 1.5s ease-in-out infinite;
+}
+.og-dot[data-recovery="attention"] {
+  border: 2px solid #db6d65;
+  background: #311c1c;
+  color: #ffd0cc;
+  box-shadow: 0 0 0 3px rgba(219, 109, 101, .24), 0 8px 22px rgba(0, 0, 0, .45);
+}
+.og-dot[data-recovery="paused"], .og-dot[data-recovery="offair"] {
+  border: 2px solid #6aaba5;
+  background: #193033;
+  color: #b9eae3;
+}
+.og-dot[data-recovery="unknown"] { border-color: #906767; color: #e0b3b0; }
+@keyframes og-recovery-pulse {
+  50% { box-shadow: 0 0 0 6px rgba(226, 168, 77, .07), 0 8px 22px rgba(0, 0, 0, .45); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .og-dot[data-recovery="working"] { animation: none; }
+}
+
+/* THE TABLET. The kiosk runs this file byte-identical, on a narrower screen
+   and under a thumb rather than a pointer, so the touch targets grow and the
+   two-column comparison stacks rather than squeezing to nothing. */
+@media (max-width: 760px) {
+  .og { min-width: 280px; max-width: 98vw; }
+  .og-tri { padding: 9px 6px; }
+  .og-x { padding: 6px; }
+  .og-two { flex-direction: column; }
+  /* The headline stays a headline on a 9-inch glass - it is the number he
+     opened the panel for, and shrinking it with the rest would bury it. */
+  .og-big-v { font-size: 24px; }
+}
+
+/* #1204 - THE PRESSURE PANE'S OFFER. A button that spends something has to
+   show what it spends, so the price sits under every one of them and is
+   never a hover or a second screen. The armed state is a different colour
+   because the second press is the one that acts. */
+.og-offer {
+  border: 1px solid #2b353f;
+  border-radius: 8px;
+  padding: 7px 8px;
+  margin: 6px 0;
+  background: rgba(14, 20, 26, .6);
+}
+.og-offer-cold { opacity: .62; }
+.og-offer-b {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  text-align: left;
+  background: #17303c;
+  color: #cfe9f2;
+  border: 1px solid #2f4d5c;
+  border-radius: 7px;
+  padding: 7px 9px;
+  font: inherit;
+  cursor: pointer;
+}
+.og-offer-b:hover:not(:disabled) { border-color: #66b6cf; }
+.og-offer-b:disabled { cursor: default; opacity: .6; }
+.og-offer-b .og-i { flex: 0 0 auto; line-height: 0; }
+.og-offer-armed {
+  background: #4a3313;
+  color: #f0cf95;
+  border-color: #9b7233;
+}
+.og-offer-cost {
+  color: #8ea3b1;
+  font-size: 11px;
+  margin-top: 5px;
+  line-height: 1.45;
+}
+/* The valve's own log lines, quoted verbatim - they are the record that
+   used to live only in a text file on the host. */
+.og-valve-line {
+  color: #9fb4c1;
+  font-size: 11px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  padding: 2px 0;
+  word-break: break-word;
+}
+@media (max-width: 760px) {
+  .og-offer-b { padding: 10px; }
+}
+
+/* =========================================================== [#1211] #1211
+ *
+ * THE COMMAND LINE AT THE FOOT, AND WHERE AN ANSWER LANDS.
+ *
+ * `.og-cmd` sits below `.og-main` and outside it. That is a layout choice
+ * and a correctness one at the same time: the list is reconciled on every
+ * poll (#1186), so anything a person is typing into or reading out of must
+ * not live in it. `flex: 0 0 auto` for the same reason `.og-head` has one -
+ * this column hands its height to the list first, and a shrinkable footer
+ * would be squeezed to nothing the moment the list grew.
+ *
+ * A folded panel (#1213) hides the list; it hides this too, because the
+ * pill is the face, the mood and one line, and a command line on a pill is
+ * neither. */
+.og-cmd {
+  flex: 0 0 auto;
+  border-top: 1px solid rgba(255, 255, 255, 0.10);
+  padding: 6px 8px 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 46%;
+  overflow-y: auto;
+}
+.og.og-min .og-cmd { display: none; }
+
+.og-cmd-row { display: flex; gap: 6px; align-items: stretch; }
+
+.og-cmd-in {
+  flex: 1 1 auto;
+  min-width: 0;
+  font: inherit;
+  font-size: 11px;
+  line-height: 1.4;
+  color: inherit;
+  background: rgba(0, 0, 0, 0.35);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 3px;
+  padding: 4px 6px;
+}
+.og-cmd-in:focus {
+  outline: none;
+  border-color: rgba(120, 190, 255, 0.55);
+}
+
+.og-cmd-go,
+.og-cmd-b,
+.og-cmd-x {
+  flex: 0 0 auto;
+  font: inherit;
+  font-size: 11px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: inherit;
+  background: rgba(255, 255, 255, 0.07);
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  border-radius: 3px;
+  padding: 4px 8px;
+  cursor: pointer;
+}
+.og-cmd-go:hover,
+.og-cmd-b:hover,
+.og-cmd-x:hover { background: rgba(255, 255, 255, 0.14); }
+.og-cmd-go[disabled],
+.og-cmd-b[disabled] { opacity: 0.5; cursor: default; }
+
+/* THE ANSWER, IN THE STATION'S OWN WORDS. Never invented on this side, so
+   it is styled as a quotation rather than as a status chip. */
+.og-cmd-out {
+  font-size: 11px;
+  line-height: 1.45;
+  padding: 4px 6px;
+  border-left: 2px solid rgba(120, 190, 255, 0.55);
+  background: rgba(120, 190, 255, 0.07);
+  word-break: break-word;
+}
+.og-cmd-out.og-cmd-bad {
+  border-left-color: rgba(255, 140, 120, 0.7);
+  background: rgba(255, 140, 120, 0.08);
+}
+.og-cmd-more { display: flex; flex-direction: column; gap: 2px; }
+.og-cmd-line {
+  font-size: 10px;
+  line-height: 1.4;
+  opacity: 0.8;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* THE TURN EDITOR. It opens here rather than inside the round's own fold
+   because a fold is rebuilt by the reconcile and a half-typed line in one
+   would be thrown away by the next poll. */
+.og-cmd-edit {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  border-top: 1px dashed rgba(255, 255, 255, 0.14);
+  padding-top: 5px;
+}
+.og-cmd-h { font-size: 10px; opacity: 0.85; line-height: 1.4; }
+.og-cmd-turn { display: flex; flex-direction: column; gap: 3px; }
+.og-cmd-who { font-size: 10px; opacity: 0.7; }
+.og-cmd-area {
+  font: inherit;
+  font-size: 11px;
+  line-height: 1.45;
+  color: inherit;
+  background: rgba(0, 0, 0, 0.35);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 3px;
+  padding: 4px 6px;
+  resize: vertical;
+  min-height: 2.6em;
+}
+.og-cmd-area:focus {
+  outline: none;
+  border-color: rgba(120, 190, 255, 0.55);
+}
+.og-cmd-x { align-self: flex-start; }

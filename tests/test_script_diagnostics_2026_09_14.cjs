@@ -182,7 +182,9 @@ test('script repaint settles folds before restoring and live follow has no smoot
   const source = fs.readFileSync(path.join(__dirname, '../desktop/renderer/script-page.js'), 'utf8');
   const paint = source.slice(source.indexOf('  function paintScript('),
     source.indexOf('  /* ONE SCROLL CONTROLLER.', source.indexOf('  function paintScript(')));
-  assert.ok(paint.indexOf('stitchScript(box, order);') < paint.indexOf('segApply(false);'));
+  assert.ok(paint.includes('bindScriptOrder(order, elements, scriptAsOf);'));
+  assert.ok(paint.indexOf('bindScriptOrder(order, elements, scriptAsOf);')
+    < paint.indexOf('segApply(false);'));
   assert.ok(paint.indexOf('segApply(false);') < paint.indexOf('scriptRestore(box, anchor);'));
 
   const follow = source.slice(source.indexOf('  function keepLitInView('),

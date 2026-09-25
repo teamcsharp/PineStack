@@ -1,0 +1,122 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- THE RAIL IS NATIVE, AND IT HAS TO BE.
+     The station panel at :8096 has no sidebar of its own - the sidebar the
+     operator means is the Pine Box DESKTOP's rail (desktop/renderer/index.html
+     lines 16-159), which is Electron chrome and never reaches the tablet.
+     So it is mirrored here as a real Android drawer: DrawerLayout gives the
+     left-edge drag, the animated slide and the tap-outside dismiss for free,
+     and all three were named in the request.
+
+     DrawerLayout's contract: the CONTENT child comes first and is sized
+     match_parent; every drawer child comes after it and carries
+     layout_gravity. Reversing that order draws the drawer under the panel. -->
+<androidx.drawerlayout.widget.DrawerLayout
+    xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools"
+    android:id="@+id/drawerLayout"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@color/pine_ground"
+    android:keepScreenOn="true"
+    tools:openDrawer="start">
+
+    <!-- The WebView fills everything; the status panel sits on top of it and is
+         GONE whenever the station is answering. It exists because a kiosk with
+         no address bar and no chrome has no other way to say what went wrong -
+         a blank screen is indistinguishable from a dead tablet. -->
+    <FrameLayout
+        android:id="@+id/root"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:background="@color/pine_ground">
+
+        <WebView
+            android:id="@+id/panel"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent" />
+
+        <!-- The affordance. A 14dp ribbon down the left bezel.
+             DrawerLayout::onInterceptTouchEvent runs BEFORE this view sees
+             anything, so a DRAG from the edge still opens the drawer; only a
+             plain TAP falls through to this view's click listener. That is the
+             whole reason it can be both a hint and a button.
+
+             #1153 - "This yellow bar on the left side of the screen is no
+             longer needed. Get rid of that superimposed yellow line on the
+             left side of the screen."
+
+             THE HINT IS OFF; THE BUTTON STAYS. What the operator was looking
+             at was @drawable/edge_handle on this view - a horizontal gradient
+             from #66E3B341 (pine_amber at 40%) through #22E3B341 to nothing,
+             14dp wide and the full height of the glass. Measured from a
+             screencap: rgb(92,76,35) at x=0 fading out by x=15, which is
+             0.4*#E3B341 over the #0A0C10 ground to within four counts. It is
+             NOT in the panel: a CDP walk of every element in the WebView
+             found no yellow on the left edge, and Page.captureScreenshot came
+             back without the bar, because this is a native View sitting on
+             top of the WebView and the page cannot see it.
+
+             It was only ever a hint, and by now the rail has better ones -
+             the drag edge is widened to 40dp in MainActivity.widenDragEdge
+             and every view has the rail down its right-hand side. So the
+             background goes and the view stays: it is still the tap target
+             MainActivity:876 hangs openDrawer on, and deleting it outright
+             would be an NPE on start. -->
+        <View
+            android:id="@+id/edgeHandle"
+            android:layout_width="14dp"
+            android:layout_height="match_parent"
+            android:layout_gravity="start"
+            android:background="@null"
+            android:contentDescription="@string/rail_open" />
+
+        <LinearLayout
+            android:id="@+id/statusPanel"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:background="@color/pine_ground"
+            android:gravity="center"
+            android:orientation="vertical"
+            android:padding="32dp"
+            android:visibility="visible">
+
+            <TextView
+                android:id="@+id/statusText"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:gravity="center"
+                android:textColor="@color/pine_ink"
+                android:textSize="18sp"
+                android:text="@string/status_connecting" />
+
+            <Button
+                android:id="@+id/statusRetry"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="20dp"
+                android:minHeight="48dp"
+                android:text="@string/status_retry"
+                android:visibility="gone" />
+        </LinearLayout>
+    </FrameLayout>
+
+    <!-- The drawer child, EMPTY in the layout.
+         DrawerLayout only needs a child of the right width and gravity to
+         give the edge drag something to move; the rail's sixty-odd views are
+         inflated into this after the first frame. Measured on the TB310FU
+         with `am start -W`: inflating them in onCreate cost 340ms of cold
+         start (1193 -> 1567ms) for chrome nobody is looking at during a
+         launch. See MainActivity.standUpTheRest.
+
+         340dp of a 1072dp-wide landscape screen (1340px at density 200 =
+         1.25 px/dp, from `wm size` / `wm density`): just under a third, so
+         the show stays visible behind the rail rather than covered. -->
+    <FrameLayout
+        android:id="@+id/rail"
+        android:layout_width="340dp"
+        android:layout_height="match_parent"
+        android:layout_gravity="start"
+        android:background="@color/pine_rail"
+        android:clickable="true"
+        android:focusable="true" />
+</androidx.drawerlayout.widget.DrawerLayout>

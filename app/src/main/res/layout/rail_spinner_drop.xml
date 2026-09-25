@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- One row of a rail spinner's open list. 48dp tall - the same thumb
+     target the rest of the rail is built to (see dimens.xml). -->
+<TextView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="@dimen/tap"
+    android:background="@color/pine_card"
+    android:ellipsize="end"
+    android:gravity="center_vertical"
+    android:maxLines="1"
+    android:paddingStart="14dp"
+    android:paddingEnd="14dp"
+    android:textColor="@color/pine_ink"
+    android:textSize="14sp" />

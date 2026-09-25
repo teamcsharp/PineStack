@@ -1,0 +1,69 @@
+/* The working bar. It sits ON the element the operator pressed, along its
+   bottom edge, so there is never a question of WHAT is busy. */
+
+.pb-busy {
+  position: absolute;
+  left: 0; right: 0; bottom: 0;
+  padding: 0;
+  pointer-events: none;
+  z-index: 3;
+}
+.pb-busy-lane {
+  position: relative;
+  height: 3px;
+  overflow: hidden;
+  background: rgba(255, 255, 255, .14);
+}
+.pb-busy-fill {
+  position: absolute;
+  left: 0; top: 0; bottom: 0;
+  width: 38%;
+  background: var(--cyan, #65c7da);
+  border-radius: 0 2px 2px 0;
+}
+
+/* UNMEASURED: a sweep that travels. It deliberately does not fill from the
+   left, because filling implies a fraction and there isn't one. */
+.pb-busy:not(.measured) .pb-busy-fill {
+  animation: pbSweep 1.15s ease-in-out infinite;
+}
+@keyframes pbSweep {
+  0%   { left: -38%; width: 38%; }
+  50%  { width: 52%; }
+  100% { left: 100%; width: 38%; }
+}
+
+/* MEASURED: a real fraction, so it eases to each new width rather than
+   jumping - a bar that snaps reads as a glitch. */
+.pb-busy.measured .pb-busy-fill {
+  animation: none;
+  left: 0;
+  transition: width .22s ease-out;
+}
+
+.pb-busy.done .pb-busy-fill { background: var(--green, #54d18b); }
+.pb-busy.failed .pb-busy-fill {
+  animation: none; left: 0; width: 100%;
+  background: #d86b57;
+}
+.pb-busy.done, .pb-busy.failed { transition: opacity .3s ease; }
+.pb-busy.done { opacity: .85; }
+
+.pb-busy-say {
+  display: block;
+  padding: 3px 8px 4px;
+  font-size: 10px;
+  line-height: 1.3;
+  color: var(--muted, #8fa0ad);
+  background: rgba(0, 0, 0, .5);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.pb-busy.failed .pb-busy-say { color: #e9a08f; }
+
+/* The pressed element keeps its shape while a bar is on it, so a row does
+   not grow by three pixels and shove the list. */
+.pb-busy-on { overflow: hidden; }
+
+@media (prefers-reduced-motion: reduce) {
+  .pb-busy:not(.measured) .pb-busy-fill { animation: none; left: 0; width: 100%; opacity: .5; }
+}

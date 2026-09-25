@@ -1,0 +1,15 @@
+<resources>
+    <!-- NoActionBar + a dark ground: the panel paints its own chrome, and a
+         white flash between activity start and first paint is very visible
+         on a wall-mounted terminal. -->
+    <style name="Theme.PineBoxKiosk" parent="Theme.AppCompat.NoActionBar">
+        <item name="android:windowBackground">@color/pine_ground</item>
+        <item name="android:colorBackground">@color/pine_ground</item>
+        <item name="android:windowNoTitle">true</item>
+        <item name="android:windowActionBar">false</item>
+        <item name="android:windowFullscreen">true</item>
+        <item name="android:windowContentOverlay">@null</item>
+        <item name="android:statusBarColor">@color/pine_ground</item>
+        <item name="android:navigationBarColor">@color/pine_ground</item>
+    </style>
+</resources>

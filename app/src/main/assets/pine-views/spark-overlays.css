@@ -1,0 +1,628 @@
+/* The Spark overlays. Class prefix `so-`.
+ *
+ * TWO LAYOUTS, ONE SET OF WIDGETS.
+ *
+ *   .so-overlay    floats them at the desktop application's own corners,
+ *                  over whatever is behind — the renders on the tablet, the
+ *                  panel in the Electron app.
+ *   .so-dashboard  gives them the screen as a grid: the standalone monitor
+ *                  at /spark, where nothing is behind them.
+ *
+ * The widgets do not know which one they are in. Only this file does.
+ *
+ * READABLE OVER A PHOTOGRAPH. That is the constraint the desktop app solved
+ * with `fillRect(rect, QColor(0,0,0,200))` behind every panel, and it is why
+ * these have a near-opaque ground and a hairline border rather than a tasteful
+ * translucent one: a render can be white, and a readout that disappears over
+ * a bright picture is not a readout.
+ */
+
+/* BORDER-BOX, DECLARED HERE AND NOT INHERITED.
+ *
+ * This module is dropped into three hosts — the station's panel, the
+ * Electron renderer, and a bare page at /spark — and only some of them set
+ * a global box-sizing. MEASURED at 800px: the band's grid columns were
+ * 256px and the PERFORMANCE widget rendered 270, because its 11px of
+ * padding and 1px of border were added OUTSIDE that width. Fourteen pixels
+ * is exactly the 6px overlap the fit probe reported once the 8px gap is
+ * taken off. A portable module cannot assume its host's reset. */
+.so, .so *, .so *::before, .so *::after { box-sizing: border-box; }
+
+.so {
+  position: absolute;
+  inset: 0;
+  font-family: Inter, "Segoe UI", system-ui, sans-serif;
+  color: #edf3f5;
+  /* The widgets take their own taps; the gaps between them must fall
+   * through to whatever is behind — on the tablet that is the slideshow's
+   * swipe surface. */
+  pointer-events: none;
+  z-index: 5;
+}
+
+.so-w {
+  pointer-events: auto;
+  background: #060a0ee6;
+  border: 1px solid #2b3742;
+  border-radius: 10px;
+  padding: 9px 11px 10px;
+  font-size: 11.5px;
+  line-height: 1.45;
+  /* A panel over a photograph needs an edge the photograph cannot supply. */
+  box-shadow: 0 6px 24px #00000066;
+  /* EVERY BOX MUST BE ABLE TO GET SMALLER THAN ITS CONTENT. A flex or grid
+   * item defaults to min-width:auto — it refuses to shrink below its
+   * content — so at 420px the figures ran straight out of the right-hand
+   * side and were clipped by the page. This one line, repeated on every
+   * nested row below, is what makes the readouts survive a narrow screen. */
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.so-w.off { display: none; }
+
+.so-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  /* Wraps rather than squeezing the tabs off the edge. */
+  flex-wrap: wrap;
+  gap: 6px 10px;
+  margin-bottom: 6px;
+  min-width: 0;
+}
+.so-title {
+  font-size: 9.5px;
+  letter-spacing: .16em;
+  color: #6d7f8c;
+  white-space: nowrap;
+}
+.so-body { display: block; }
+
+.so-note {
+  margin: 5px 0 2px;
+  font-size: 10.5px;
+  line-height: 1.55;
+  color: #8fa0ad;
+}
+
+/* ---- the switchboard -------------------------------------------------- */
+
+.so-switch {
+  position: absolute;
+  left: 10px;
+  top: 10px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  pointer-events: auto;
+  z-index: 20;
+}
+.so-chip {
+  padding: 4px 9px;
+  background: #10171de6;
+  color: #6d7f8c;
+  border: 1px solid #2b3742;
+  border-radius: 999px;
+  font: inherit;
+  font-size: 9.5px;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+  cursor: pointer;
+  touch-action: manipulation;
+}
+.so-chip.on { color: #05131a; background: #65c7da; border-color: #65c7da; }
+
+/* TOP RIGHT, not bottom centre: the bottom centre is where the services
+ * readout lives, and a failure notice drawn over the thing it is reporting
+ * on is a poor way to report on it. The switchboard holds the top left. */
+.so-banner {
+  position: absolute;
+  right: 10px;
+  top: 10px;
+  max-width: 46%;
+  padding: 7px 14px;
+  background: #3a1b22ee;
+  border: 1px solid #6b2b33;
+  border-radius: 8px;
+  font-size: 11px;
+  color: #ff9aab;
+  pointer-events: auto;
+  z-index: 21;
+}
+
+/* ---- gauges, grids, sparklines --------------------------------------- */
+
+.so-canvas { display: block; width: 100%; }
+
+.so-gauge { margin-bottom: 7px; }
+.so-gauge-top {
+  display: flex;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  min-width: 0;
+  gap: 2px 8px;
+  font-size: 9.5px;
+  letter-spacing: .1em;
+  color: #8fa0ad;
+  margin-bottom: 3px;
+}
+.so-gauge-val { color: #edf3f5; letter-spacing: 0; font-size: 11px; }
+
+.so-track {
+  height: 7px;
+  background: #141d25;
+  border-radius: 4px;
+  overflow: hidden;
+}
+/* A gauge with no reading is STRIPED, not empty — an empty bar and a zero
+ * bar look identical, and only one of them is a fact. */
+.so-track.unknown {
+  background: repeating-linear-gradient(135deg, #141d25 0 5px, #1b2630 5px 10px);
+}
+.so-fill { height: 100%; width: 0; border-radius: 4px; transition: width .5s ease; }
+
+.so-section {
+  margin: 11px 0 6px;
+  font-size: 9.5px;
+  letter-spacing: .12em;
+  text-transform: uppercase;
+  color: #65c7da;
+  font-weight: 600;
+}
+
+/* Two columns when there is room for two, one when there is not — rather
+ * than two columns that overflow. */
+.so-grid, .so-counters {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(128px, 1fr));
+  gap: 2px 10px;
+  margin-top: 4px;
+  min-width: 0;
+}
+.so-cell { display: flex; justify-content: space-between; gap: 8px; padding: 1px 0; min-width: 0; }
+.so-cell-k { font-size: 9.5px; letter-spacing: .06em; color: #6d7f8c; }
+.so-cell-v { font-size: 11px; color: #edf3f5; text-align: right; min-width: 0; overflow-wrap: anywhere; }
+.so-counters { border-top: 1px solid #18222b; margin-top: 9px; padding-top: 7px; }
+
+.so-legend { display: flex; flex-wrap: wrap; gap: 4px 9px; min-width: 0; }
+.so-key { display: inline-flex; align-items: center; gap: 4px; font-size: 10px; color: #b9c6cf; }
+.so-key i { width: 7px; height: 7px; border-radius: 2px; display: inline-block; }
+
+/* PER-CORE. Twenty little columns; they grow from the bottom, so `align-items:
+ * flex-end` is what makes a bar a bar rather than a block that hangs. */
+.so-cores {
+  display: flex;
+  align-items: flex-end;
+  gap: 2px;
+  height: 26px;
+  margin-top: 7px;
+}
+.so-core {
+  flex: 1 1 0;
+  min-width: 3px;
+  height: 100%;
+  background: #141d25;
+  border-radius: 2px;
+  display: flex;
+  align-items: flex-end;
+  overflow: hidden;
+}
+.so-core b { display: block; width: 100%; height: 2%; transition: height .5s ease; }
+
+.so-foot {
+  margin-top: 6px;
+  font-size: 10px;
+  color: #8fa0ad;
+}
+
+/* ---- the activity banner: what ComfyUI is rendering -------------------- */
+
+/* Green only while something is actually happening. An idle banner that
+   still wears the "working" colour is a light that is always on. */
+.so-activity { border-color: #2b3742; }
+.so-activity.busy { border-color: #3a5a2f; }
+.so-act-line { font-size: 13px; margin-bottom: 6px; color: #8fa0ad; }
+.so-activity.busy .so-act-line { color: #9ee6a8; }
+.so-act-track { margin-bottom: 4px; }
+.so-act-track[hidden] { display: none; }
+
+/* The sentence under the bar that says what the bar is measured against.
+   Small, but it is the difference between a reading and a claim. */
+.so-act-basis {
+  font-size: 9.5px;
+  line-height: 1.5;
+  color: #6d7f8c;
+  margin-bottom: 6px;
+}
+
+/* The render's parameters, as chips: model, size, steps, cfg, sampler,
+   scheduler, batch, frames, LoRAs, node count, output prefix. */
+.so-act-detail {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  font-size: 10.5px;
+  color: #b9c6cf;
+  min-width: 0;
+}
+.so-fact {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 5px;
+  max-width: 100%;
+  padding: 2px 8px;
+  background: #121a21;
+  border: 1px solid #223039;
+  border-radius: 999px;
+  overflow-wrap: anywhere;
+}
+.so-fact i {
+  font-style: normal;
+  font-size: 8.5px;
+  letter-spacing: .1em;
+  text-transform: uppercase;
+  color: #6d7f8c;
+}
+
+/* THE PROMPT, which is the thing you actually want to read off a render.
+   Given real room — four lines — and scrollable rather than truncated,
+   because a prompt cut at 40 characters tells you nothing. */
+.so-act-prompt {
+  margin-top: 7px;
+  padding: 6px 8px;
+  background: #0a1219;
+  border-left: 2px solid #3a5a2f;
+  border-radius: 3px;
+  font-size: 11px;
+  line-height: 1.55;
+  color: #cfdae1;
+  max-height: 5.2em;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+.so-act-negative {
+  margin-top: 4px;
+  font-size: 10px;
+  line-height: 1.5;
+  color: #7d8b96;
+  max-height: 3em;
+  overflow: hidden;
+}
+.so-act-prompt[hidden], .so-act-negative[hidden] { display: none; }
+
+/* The board itself — device, ComfyUI version, VRAM, python. Always on, so
+   the panel says something even when nothing is rendering. */
+.so-act-board {
+  margin-top: 7px;
+  padding-top: 6px;
+  border-top: 1px solid #18222b;
+  font-size: 9.5px;
+  line-height: 1.5;
+  color: #6d7f8c;
+}
+
+/* ---- OpenWebUI -------------------------------------------------------- */
+
+.so-owui .so-cell-k { flex: 1 1 auto; color: #b9c6cf; overflow-wrap: anywhere; }
+.so-owui .so-cell-v { flex: 0 0 auto; color: #65c7da; }
+.so-owui .so-section:first-of-type { margin-top: 2px; }
+
+/* ---- services --------------------------------------------------------- */
+
+.so-tabs { display: flex; flex-wrap: wrap; gap: 3px; justify-content: flex-end; min-width: 0; }
+.so-tab {
+  padding: 2px 7px;
+  background: #121a21;
+  color: #6d7f8c;
+  border: 1px solid #223039;
+  border-radius: 999px;
+  font: inherit;
+  font-size: 9px;
+  letter-spacing: .05em;
+  cursor: pointer;
+  touch-action: manipulation;
+}
+.so-tab.on { color: #05131a; background: #65c7da; border-color: #65c7da; }
+
+.so-svc-head { display: flex; align-items: center; flex-wrap: wrap; gap: 3px 7px; margin-bottom: 5px; min-width: 0; }
+.so-dot { width: 8px; height: 8px; border-radius: 50%; flex: 0 0 auto; }
+.so-svc-name { font-size: 12.5px; }
+.so-svc-detail { font-size: 10.5px; color: #8fa0ad; }
+.so-svc-fact {
+  font-size: 10.5px;
+  color: #b9c6cf;
+  padding: 1px 0 1px 15px;
+  /* The desktop's log lines were monospaced; these are facts rather than
+   * log output, so they read as sentences with a marker instead. */
+  position: relative;
+}
+.so-svc-fact::before {
+  content: "·";
+  position: absolute;
+  left: 5px;
+  color: #45525d;
+}
+
+/* ---- the giant temperature -------------------------------------------- */
+
+.so-temp { text-align: center; padding: 6px 14px 10px; }
+.so-temp-num {
+  font-size: 74px;
+  font-weight: 200;
+  line-height: 1;
+  letter-spacing: -.03em;
+  font-variant-numeric: tabular-nums;
+}
+.so-temp-unit { font-size: 11px; color: #8fa0ad; margin-top: 2px; }
+.so-temp-where { font-size: 10px; color: #6d7f8c; }
+
+/* ---- the rings -------------------------------------------------------- */
+
+.so-ring { padding: 6px; width: 148px; }
+.so-ring-label {
+  text-align: center;
+  font-size: 9px;
+  letter-spacing: .14em;
+  color: #6d7f8c;
+  margin-top: 2px;
+}
+.so-ring-note {
+  margin-top: 6px;
+  font-size: 10px;
+  line-height: 1.5;
+  color: #8fa0ad;
+}
+
+/* ======================================================================
+ * OVERLAY MODE — four regions, and nothing outside them.
+ *
+ * THE RULE THIS LAYOUT EXISTS FOR: no widget may overlap another, and no
+ * widget may be cut off by an edge. Absolute corners could satisfy neither
+ * on a nine-inch screen — two widgets shared every bottom corner and the
+ * right-hand column ran under the rail — so the layer is a grid and the
+ * regions scroll.
+ *
+ *   landscape   [ left | picture | right ]  with a top and bottom band
+ *   portrait    the picture on top, every readout in one band beneath it
+ * ==================================================================== */
+
+.so-overlay {
+  display: grid;
+  gap: 8px;
+  padding: 8px;
+  /* The rail paints over anything beneath it; the mounting view measures
+   * it. Standalone there is no rail and this is zero. */
+  right: var(--sl-rail, 0px);
+  /* The station's console line owns the foot of the glass. */
+  padding-bottom: calc(8px + var(--sl-console, 0px));
+  grid-template-columns: minmax(0, 296px) minmax(0, 1fr) minmax(0, 296px);
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  grid-template-areas:
+    "l t r"
+    "l m r"
+    "l b r";
+}
+
+.so-region {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-height: 0;
+  min-width: 0;
+  /* A column taller than the screen SCROLLS. Trimming a readout off the
+   * bottom is the failure this replaces. */
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: none;
+  /* The gaps belong to whatever is behind — a swipe on bare picture still
+   * changes the picture. The widgets take their own taps. */
+  pointer-events: none;
+}
+.so-region::-webkit-scrollbar { display: none; }
+.so-band { display: contents; }
+.so-region-l { grid-area: l; }
+.so-region-r { grid-area: r; align-items: stretch; }
+.so-region-t { grid-area: t; overflow: visible; }
+.so-region-b { grid-area: b; max-height: 42vh; }
+
+/* A region with nothing in it must not hold a column open. */
+.so-region:empty { display: none; }
+
+.so-overlay .so-w {
+  flex: 0 0 auto;
+  /* The region scrolls, not the widget — nested scrollers on a touch
+   * screen fight each other for the same drag. */
+  overflow: visible;
+}
+
+/* The two rails are the readouts; the middle is deliberately empty so the
+ * picture is still a picture. */
+.so-overlay .so-ring { align-self: center; }
+
+.so-overlay .so-switch { position: static; }
+.so-overlay .so-banner { position: static; max-width: none; margin-top: 4px; }
+
+/* ---- portrait, and any narrow screen -------------------------------
+ * 800px of width cannot carry two 296px columns and still show a render, so
+ * the three regions fold into ONE strip along the foot and the picture keeps
+ * the top of the glass. The strip is a single scroller: three separate ones
+ * would each get a third of the height and each be cut off, which is the
+ * fault this whole layout replaces. */
+@media (max-width: 899px) {
+  .so-overlay {
+    display: flex;
+    flex-direction: column;
+  }
+  .so-region-t { flex: 0 0 auto; }
+  .so-band {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(198px, 1fr));
+    align-content: start;
+    gap: 8px;
+    /* Pushed to the foot, so the space above it is the picture. */
+    margin-top: auto;
+    max-height: 58%;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    scrollbar-width: none;
+  }
+  .so-band::-webkit-scrollbar { display: none; }
+  /* The three regions stop being boxes and hand their widgets straight to
+   * the strip, so every readout is one cell of one grid — nothing can
+   * overlap and nothing is left below the fold. */
+  .so-region-l, .so-region-r, .so-region-b { display: contents; }
+  .so-temp-num { font-size: 52px; }
+  .so-ring { width: auto; }
+  /* The readouts that are one number must not take a whole tall cell just
+   * because a neighbour is long; the band is a grid and a stretched cell is
+   * empty space someone has to scroll past. */
+  .so-temp, .so-ring { align-self: start; }
+  .so-services { grid-column: 1 / -1; }
+}
+
+/* ======================================================================
+ * DASHBOARD MODE — /spark, where the readouts ARE the screen.
+ * ==================================================================== */
+
+.so-dashboard {
+  position: relative;
+  inset: auto;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(290px, 1fr));
+  align-content: start;
+  gap: 10px;
+  padding: 54px 12px 16px;
+  pointer-events: auto;
+}
+.so-dashboard .so-w { position: relative; }
+/* THE SWITCHBOARD JOINS THE GRID rather than floating over it. Absolutely
+ * positioned at the top left it sat UNDER the page's own fixed title bar —
+ * visible enough to look like a rendering fault and not reachable at all.
+ * In overlay mode it still floats, because there it has nothing above it. */
+.so-dashboard .so-switch {
+  position: static;
+  grid-column: 1 / -1;
+  /* FIRST, not last. It is appended after the widgets so that overlay mode
+   * stacks it above them, and grid flow would otherwise put the controls
+   * below everything they control. */
+  order: -1;
+  margin-bottom: 2px;
+}
+/* The activity banner is the width of the screen when there is something to
+ * say, because that is the one readout you want to see from across a room. */
+.so-dashboard .so-activity { grid-column: 1 / -1; }
+.so-dashboard .so-services { grid-column: span 2; }
+.so-dashboard .so-ring { justify-self: center; }
+
+@media (max-width: 700px) {
+  .so-dashboard { grid-template-columns: 1fr; }
+  .so-dashboard .so-services { grid-column: 1 / -1; }
+}
+
+/* A nine-inch tablet in portrait cannot carry two 300px columns beside a
+ * picture, so overlay mode collapses to the two edges and lets the panels
+ * scroll rather than overlap. */
+@media (max-width: 820px) {
+  .so-overlay .so-w[data-so-corner="tl"],
+  .so-overlay .so-w[data-so-corner="tr"] { width: 246px; }
+  .so-overlay .so-w[data-so-corner="tc"],
+  .so-overlay .so-w[data-so-corner="bc"] { width: min(420px, 78%); }
+  .so-temp-num { font-size: 56px; }
+}
+
+/* ======================================================================
+ * THE POP-UP — the SC stack over whatever is already on screen.
+ *
+ * A real window: dragged by its bar, resized from its corner, put away.
+ * It hosts the dashboard, so every widget inside it is the same widget the
+ * standalone app draws; only this frame is different.
+ * ==================================================================== */
+
+.so-popup {
+  position: fixed;
+  /* Above the rail (2147483001) — a pop-up the rail draws over is a pop-up
+     with a slice missing. Below nothing else, because nothing else here
+     goes higher. */
+  z-index: 2147483010;
+  display: flex;
+  flex-direction: column;
+  min-width: 280px;
+  min-height: 220px;
+  background: #070c11f7;
+  border: 1px solid #35414c;
+  border-radius: 12px;
+  box-shadow: 0 18px 60px #000000a6;
+  overflow: hidden;
+  font-family: Inter, "Segoe UI", system-ui, sans-serif;
+  color: #edf3f5;
+}
+.so-popup.wide {
+  left: 0 !important;
+  top: 0 !important;
+  width: 100% !important;
+  height: 100% !important;
+  border-radius: 0;
+}
+
+.so-popup-bar {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 7px 8px 7px 12px;
+  background: #0d141b;
+  border-bottom: 1px solid #1b2630;
+  /* The whole bar is the drag handle, so the browser must not decide a
+     drag is a text selection or a scroll. */
+  cursor: move;
+  touch-action: none;
+  user-select: none;
+}
+.so-popup-title {
+  font-size: 10px;
+  letter-spacing: .18em;
+  color: #65c7da;
+}
+.so-popup-buttons { display: flex; gap: 4px; }
+.so-popup-btn {
+  width: 28px;
+  height: 26px;
+  background: #16202a;
+  color: #b9c6cf;
+  border: 1px solid #2b3742;
+  border-radius: 7px;
+  font: inherit;
+  font-size: 13px;
+  line-height: 1;
+  cursor: pointer;
+  touch-action: manipulation;
+}
+.so-popup-btn:hover { background: #1e2a36; color: #edf3f5; }
+
+.so-popup-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  position: relative;
+}
+/* Inside the pop-up the dashboard has no page bar above it, so it needs no
+   room for one. */
+.so-popup-body .so-dashboard { padding: 10px; }
+
+.so-popup-grip {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  width: 22px;
+  height: 22px;
+  cursor: nwse-resize;
+  touch-action: none;
+  /* Two hairlines, which is the whole of the universal grip idiom. */
+  background:
+    linear-gradient(135deg, transparent 0 46%, #3d4a55 46% 54%, transparent 54% 100%),
+    linear-gradient(135deg, transparent 0 70%, #3d4a55 70% 78%, transparent 78% 100%);
+}
+.so-popup.wide .so-popup-grip { display: none; }

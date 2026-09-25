@@ -1,0 +1,128 @@
+/* THE PANEL'S 3JS WINDOWS, MADE USABLE ON A TABLET.
+ *
+ * "I'm tapping these windows and they're not popping up and I need them to
+ * be instantaneous and responsive on the tablet."
+ *
+ * THEY WERE POPPING UP. Measured: `pineShow3JS("phone")` returned "phone"
+ * and the window was really there - `pine-win #pineWin-phone`, 1039x593 at
+ * (58,49) - and it was INVISIBLE, because the panel's windows live at
+ * z-index 382 and the terminal's view hosts sit at 2147483000. Whatever
+ * view was open covered the window completely. Nothing was broken; one
+ * number was three million too small.
+ *
+ * So the windows are lifted above the views. Everything else here is the
+ * full-screen promotion the operator asked for.
+ */
+
+/* THE LIFT. Above every view host, below the talk dot and the trace popup,
+   which must stay reachable while a scene is up. */
+.pine-win,
+.pine-win-shade,
+#pineWinLayer { z-index: 2147483020 !important; }
+
+/* ------------------------------------------------- the full-screen mode */
+
+/* #1193: THE PROMOTION RULES ARE NOT HERE ANY MORE - .p3-full, the card
+ * override, body.p3-on and the X all live inside pineThreeCore() in
+ * three-full.js, as a string it injects into whichever document it is
+ * running in.
+ *
+ * WHY THEY MOVED. On the desk this stylesheet is loaded into the SHELL
+ * (index.html:32) and the scene it was meant to promote is inside the
+ * controlFrame <webview>, which is a different document with a different
+ * stylesheet. Every rule in this block landed where there was nothing to
+ * style: a scene would have been told it was full screen and stayed a
+ * 700px dialog. Rules that must travel with the code now travel with it,
+ * and there is exactly one copy of them rather than one here and one
+ * injected, which is the pair that drifts.
+ *
+ * The lift above STAYS here. It is a tablet rule: the panel and the rail's
+ * view hosts share one document there, and the panel's windows sat three
+ * million z-indexes below whatever view was open. Inside the webview there
+ * are no view hosts to be covered by, so it has nothing to do there and is
+ * not worth sending. */
+
+/* ---------------------------------------------------------- the chooser */
+
+.p3-sheet {
+  position: fixed;
+  z-index: 2147483040;
+  left: 50%; bottom: 20px;
+  transform: translateX(-50%);
+  width: min(560px, calc(100vw - 20px));
+  max-height: 76vh; overflow-y: auto;
+  padding: 14px;
+  border: 1px solid var(--line, #35414c);
+  border-radius: 14px;
+  background: var(--panel, #161d24);
+  box-shadow: 0 26px 64px rgba(0, 0, 0, .72);
+  color: var(--text, #edf3f5);
+}
+.p3-head { display: flex; justify-content: space-between; align-items: baseline; }
+.p3-head b { font-size: 13px; display: flex; align-items: center; gap: 6px; }
+/* The Carbon glyph beside the title - a cube, for the 3D scenes. Sized
+ * against the label rather than left at whatever the sprite ships at, and
+ * absent entirely when pine-icons.js is not in the bundle: glyph() returns
+ * an empty string and no holder is built. */
+.p3-mark { display: inline-flex; width: 14px; height: 14px; }
+.p3-mark svg { width: 100%; height: 100%; fill: currentColor; }
+.p3-head i { font-style: normal; font-size: 11px; color: var(--muted, #8fa0ad); }
+/* #1202: THE ORCHESTRATOR PAGE, APART FROM THE SCENES.
+
+   A ruled-off strip above the grid rather than a tile in it, because it is a
+   different kind of thing: a pop-up in THIS document, not a scene the panel
+   builds in another one. The rule and the caption are the whole design - a
+   person should be able to tell at a glance that the button below the line
+   and the buttons below the grid are not the same sort of object, without
+   reading either.
+
+   It is full width on purpose. The grid is auto-fill at 150px, so a tile
+   here would land beside three scenes and read as a fourth. */
+.p3-apart {
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid var(--line, #35414c);
+}
+.p3-apart-h {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 10px;
+  letter-spacing: .07em;
+  text-transform: uppercase;
+  color: var(--muted, #8fa0ad);
+  margin-bottom: 7px;
+}
+.p3-orch { width: 100%; }
+.p3-orch b { font-size: 13px; }
+
+.p3-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: 8px;
+  margin-top: 10px;
+}
+.p3-pick {
+  min-height: 56px;
+  padding: 10px;
+  border: 1px solid var(--line, #35414c);
+  border-radius: 10px;
+  background: var(--panel-2, #222b35);
+  color: var(--text, #edf3f5);
+  font: inherit; text-align: left; cursor: pointer;
+}
+.p3-pick:disabled { opacity: .55; cursor: default; }
+.p3-pick b { display: block; font-size: 12.5px; }
+.p3-pick i {
+  display: block; font-style: normal; font-size: 10.5px;
+  color: var(--muted, #8fa0ad); margin-top: 3px;
+}
+.p3-dim, .p3-note {
+  margin: 8px 0 0; font-size: 11px; color: var(--muted, #8fa0ad);
+}
+.p3-close {
+  width: 100%; margin-top: 12px; padding: 10px;
+  border: 1px solid var(--line, #35414c); border-radius: 10px;
+  background: transparent; color: var(--muted, #8fa0ad);
+  font: inherit; cursor: pointer;
+}

@@ -1,0 +1,1242 @@
+/* Listen and Music, in one stylesheet.
+ *
+ * ONE FILE FOR TWO VIEWS, ON PURPOSE. They are two arrangements of the
+ * same components against the same feed - a now-playing block, a
+ * progress bar, a list of tracks - and splitting them would mean two
+ * copies of the palette, two breakpoints and two chances for the same
+ * control to end up a different colour in the two places the operator
+ * flips between. sampler.css does the same for the pads and the trim
+ * editor.
+ *
+ * THEY CARRY THEIR OWN PALETTE, and that is not a preference.
+ * The sampler learned this the hard way: `var(--cyan)` and friends exist
+ * in the Pine Box desktop's stylesheet, and when the view is INJECTED
+ * INTO THE STATION PANEL on the tablet they resolve to nothing - so a
+ * button styled `background: var(--cyan); color: #05131a` became
+ * near-black text on a transparent background and looked like it had
+ * vanished when tapped. Defining the tokens on the host means these views
+ * look the same wherever they are mounted and cannot be broken by
+ * whatever page they land in. The var() fallbacks let the desktop's own
+ * theme win where it does define them.
+ */
+#listen, .pb-listen, #music, .pb-music {
+  --bg: #101419;
+  --panel: #1c242c;
+  --panel-2: #222b35;
+  --text: #edf3f5;
+  --muted: #8fa0ad;
+  --line: #35414c;
+  --green: #54d18b;
+  --amber: #e3be63;
+  --red: #e46b6b;
+  --cyan: #65c7da;
+}
+
+/* =====================================================  LISTEN  ======== */
+
+/* Lean-back means READ FROM ACROSS A ROOM. Everything on this screen is
+   sized against the viewport rather than in fixed pixels, because the
+   same markup has to be legible on a 27" desktop window and on a 9"
+   tablet propped on a shelf two metres away. clamp() gives a floor so it
+   never collapses on a narrow window and a ceiling so a maximised
+   desktop does not become a billboard. */
+.view.pb-listen.active {
+  display: block;
+  position: relative;
+  height: 100%;
+  overflow: hidden;
+  background: var(--bg);
+  color: var(--text);
+}
+
+/* The gallery behind. One element, replaced - never a stack. This view is
+   the one most likely to be left running for hours on a 4 GB tablet, and
+   holding decoded frames is the classic way to run a WebView out of
+   memory. The fade is on opacity, which costs nothing extra. */
+.pl-back {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  opacity: .34;
+  filter: saturate(.85);
+  transition: opacity 900ms ease;
+  pointer-events: none;
+}
+.pl-back:not([src]) { opacity: 0; }
+
+/* Text over a photograph is unreadable at some point in every gallery, so
+   there is always a gradient between them. Not a flat scrim: the top and
+   bottom carry the type, the middle can show the picture. */
+.pl-shade {
+  position: absolute;
+  inset: 0;
+  background:
+    linear-gradient(180deg, rgba(8,11,15,.92) 0%, rgba(8,11,15,.30) 38%,
+                    rgba(8,11,15,.55) 68%, rgba(8,11,15,.95) 100%);
+  pointer-events: none;
+}
+
+.pl-face {
+  position: relative;
+  height: 100%;
+  display: grid;
+  /* #1151 - "This bar at the bottom isn't working."
+     ONE COLUMN, AND minmax(0,1fr) RATHER THAN THE IMPLICIT auto. An
+     implicit grid column is `auto`, which sizes to the MAX-CONTENT of its
+     items, and one of the items down there is a canvas - an element with a
+     real intrinsic width that listen.js rewrites from its own clientWidth
+     every frame. That is a loop: the canvas grew by devicePixelRatio a
+     frame, the column grew with it, and on the tablet the whole face was
+     32896px wide inside a 1120px view within about fifteen frames. The
+     spectrogram was the visible casualty, but the progress bar, the NEXT
+     row and the search box were running off the same cliff. minmax(0,1fr)
+     is a column exactly as wide as this grid and no wider, so nothing
+     inside can decide how wide the outside is. */
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: auto 1fr auto auto auto auto;
+  gap: clamp(8px, 1.6vh, 20px);
+  padding: clamp(14px, 3vh, 40px) clamp(16px, 4vw, 56px);
+  box-sizing: border-box;
+  min-height: 0;
+}
+
+.pl-top {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+.pl-top b {
+  font-size: clamp(13px, 1.6vw, 20px);
+  letter-spacing: .14em;
+  text-transform: uppercase;
+  color: var(--cyan);
+}
+/* Hours and minutes only - a seconds field is movement without meaning
+   at reading distance, and it is drawn off the STATION's clock so two
+   terminals cannot disagree about the time of the same broadcast. */
+.pl-clock {
+  font-style: normal;
+  font-size: clamp(20px, 3.2vw, 46px);
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+  opacity: .9;
+}
+
+/* The headline. It holds either a spoken line or a track title, and a
+   spoken line can be a long sentence, so the type is clamped by LINE
+   COUNT rather than by character count: cutting a sentence at n
+   characters puts the interesting half off screen. */
+.pl-now {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  min-height: 0;
+}
+.pl-head {
+  margin: 0;
+  font-size: clamp(22px, 4.4vw, 64px);
+  line-height: 1.14;
+  font-weight: 600;
+  display: -webkit-box;
+  -webkit-line-clamp: 4;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.pl-sub {
+  margin: 6px 0 0;
+  font-size: clamp(13px, 1.5vw, 22px);
+  color: var(--muted);
+}
+/* A voice reads as the station speaking; a record reads as the station
+   playing. Colour is the only difference, and it is enough. */
+.pl-now.voice .pl-head { color: var(--green); }
+/* 2026-09-15 (#1206): a record holds the headline while somebody speaks.
+   The title stays a title - the marquee below is where the speech is - and
+   the only tell is a quiet mark on the subtitle, so the screen still says
+   the booth is live without shouting a paragraph at him. */
+.pl-now.speaking .pl-sub { color: var(--green); }
+.pl-now.quiet .pl-head { color: var(--muted); font-weight: 400; }
+
+/* THE RECORD UNDERNEATH. When a voice has the headline this is the only
+   place the track is named, so it goes DIM, never away. */
+.pl-under {
+  display: grid;
+  gap: 6px;
+  opacity: .92;
+}
+.pl-under[hidden] { display: none; }
+.pl-underline {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  min-width: 0;
+}
+.pl-underline b {
+  font-size: clamp(13px, 1.5vw, 20px);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.pl-underline em {
+  font-style: normal;
+  color: var(--muted);
+  font-size: clamp(11px, 1.2vw, 16px);
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.pl-bar {
+  height: 5px;
+  border-radius: 3px;
+  background: rgba(255,255,255,.14);
+  overflow: hidden;
+}
+.pl-bar u {
+  display: block;
+  height: 100%;
+  background: var(--cyan);
+  /* The fill is repainted four times a second from the local tick, so the
+     transition is short enough to be smoothing rather than lag. */
+  transition: width 260ms linear;
+}
+/* Paused is not "playing slowly". The bar stops moving, and it says so by
+   going amber - #1145 is the record of what a clock that keeps running
+   through a pause actually looks like. */
+.pl-bar.paused u { background: var(--amber); transition: none; }
+.pl-time {
+  font-style: normal;
+  font-size: clamp(11px, 1.1vw, 15px);
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.pl-next {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  min-width: 0;
+  font-size: clamp(12px, 1.3vw, 17px);
+}
+.pl-next span {
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: .1em;
+  font-size: .78em;
+  flex: 0 0 auto;
+}
+.pl-next b {
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.pl-next em { font-style: normal; color: var(--muted); flex: 0 0 auto; }
+
+/* The controls are the only things on this screen meant to be TOUCHED, so
+   they are given real height rather than the app's usual density. 44px is
+   the smallest target a thumb finds reliably, and this view is for
+   thumbs. */
+.pl-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px 16px;
+  /* #1151: a grid item's automatic minimum size is its MIN-CONTENT, and
+     min-content here includes the spectrogram canvas's intrinsic width -
+     which is the other half of the loop the column fixes above. Zero, and
+     the row can be as narrow as the face is. */
+  min-width: 0;
+}
+.pl-vol { display: flex; align-items: center; gap: 8px; }
+.pl-vol span, .pl-sleep span {
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: .1em;
+  font-size: 10.5px;
+}
+.pl-vol input[type="range"] { width: clamp(120px, 18vw, 260px); height: 28px; }
+
+.pl-sleep { display: flex; align-items: center; gap: 6px; }
+.pl-sleep button, .pl-grab, .pl-pics {
+  min-height: 40px;
+  padding: 0 14px;
+  border-radius: 9px;
+  border: 1px solid var(--line);
+  background: rgba(28,36,44,.82);
+  color: var(--muted);
+  font-size: 12.5px;
+  font-weight: 600;
+  letter-spacing: .04em;
+  cursor: pointer;
+}
+.pl-sleep button.on {
+  background: var(--amber);
+  border-color: var(--amber);
+  color: #1a1405;
+}
+.pl-sleep i {
+  font-style: normal;
+  color: var(--amber);
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+  min-width: 68px;
+}
+.pl-grab { color: var(--text); border-color: var(--cyan); }
+.pl-grab:disabled {
+  opacity: .38;
+  cursor: default;
+  border-color: var(--line);
+}
+/* A grab against a busy station measured between 1.1 s and 13.5 s for the
+   same clip. That has to read as WORKING, not as broken, or the operator
+   presses it again and the second press queues behind the first. */
+@keyframes pl-working { 0%,100% { opacity: .55 } 50% { opacity: 1 } }
+.pl-grab.working { animation: pl-working 1.3s ease-in-out infinite; }
+.pl-grabwhy { font-style: normal; color: var(--muted); font-size: 11.5px; }
+
+.pl-note {
+  margin: 0;
+  min-height: 16px;
+  font-size: 12px;
+  color: var(--muted);
+}
+.pl-note.bad { color: var(--red); }
+
+/* =====================================================  MUSIC  ========= */
+
+/* Three columns, because the three questions are independent: what is on
+   and what is queued; what can be asked for; what the hour intends. A
+   single scrolling column would put the running order below the fold on
+   every screen, which is where a plan goes to be ignored. */
+/* THE HOST SELECTOR, AND WHY THERE ARE TWO OF THEM.
+ *
+ * `.view.pb-music.active` is the DESKTOP's element - Electron's own
+ * switcher owns `.view` and toggles `.active`. On the tablet rail.js builds
+ * `<section class="pine-view-host pb-music open">`, which carries NEITHER
+ * of those classes, so this entire rule never matched there. pine-sampler/
+ * boot.js had already found and documented that for the sampler; Music was
+ * never given the same treatment.
+ *
+ * What it cost, measured on the tablet at 690x1154: the host fell back to
+ * rail.js's `display:block`, so the three columns STACKED - 601 + 1265 +
+ * 1660 = 3526px of content inside a 1154px box with `overflow:hidden`. Two
+ * thirds of the Music view could not be reached in either orientation.
+ * (#muShelf alone measured 977px past the bottom edge in landscape.)
+ *
+ * The host class must be named with THREE classes, not two: rail.js writes
+ * `.pine-view-host.open{display:block}` and concatenates its stylesheet
+ * AFTER this file, so a two-class selector ties and loses. script-page.css
+ * carries the same note for the same reason.
+ *
+ * PADDING IS SET SEPARATELY per host, and that is not tidiness. rail.js
+ * gives every host `padding-right:34px` to keep the rail reachable and
+ * view-chrome.css gives it `padding-bottom:26px` for the console strip.
+ * Both are single-selector rules, so a three-class `padding` shorthand here
+ * would silently erase them and put the view back under the furniture -
+ * which is exactly the fault this file is fixing in script-page.css.
+ *
+ * COLUMNS BY AVAILABLE SPACE, not by orientation. auto-fit against a 260px
+ * floor gives three columns on the 1154px landscape glass, two on the 690px
+ * portrait one and two on a 600px phone, with no orientation query to keep
+ * in step. `minmax(min(100%, 260px), 1fr)` rather than `minmax(260px, 1fr)`
+ * so a viewport narrower than the floor still yields one column instead of
+ * overflowing.
+ *
+ * ROWS MUST BE minmax(0, 1fr). With no row declared the implicit row is
+ * `auto` and grows to the tallest column, which is what let #muShelf run a
+ * thousand pixels off the bottom even where the grid DID apply. */
+.view.pb-music.active,
+.pine-view-host.open.pb-music {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 260px), 1fr));
+  grid-auto-rows: minmax(0, 1fr);
+  gap: 12px;
+  height: 100%;
+  box-sizing: border-box;
+  overflow: hidden;
+  background: var(--bg);
+  color: var(--text);
+}
+/* The desktop element is not fixed, so it has to establish the containing
+   block for .mu-note itself. The tablet host is already position:fixed -
+   setting `relative` on it here would unpin it from the viewport. */
+.view.pb-music.active { padding: 12px; position: relative; }
+/* 12px of breathing room INSIDE the 34px rail gutter and the 26px console
+   strip, rather than instead of them. */
+.pine-view-host.open.pb-music { padding: 12px 46px 38px 12px; }
+
+.mu-col {
+  display: grid;
+  grid-auto-rows: min-content;
+  gap: 8px;
+  min-height: 0;
+  min-width: 0;
+  /* A SIZE CONTAINER, so the lists inside can be capped against THIS BOX
+     rather than against the viewport. `34vh` was the old cap and it is the
+     wrong ruler in both directions: on the 690x1154 portrait glass 34vh is
+     392px inside a 540px column, which overflowed it (measured: column 1
+     ran 601px inside a 540px row and the excess was clipped away), while on
+     the 1154x690 landscape glass 34vh is only 234px inside a 630px column,
+     wasting a third of it. The pads use the same mechanism and the same
+     support has already been proven on this tablet - see sampler.css. */
+  container-type: size;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 10px;
+  overflow: hidden;
+  /* The middle and right columns each have one list that should take the
+     slack; `.grow` marks it and this makes the column a real flex box
+     for it without disturbing the rest. */
+  grid-template-rows: auto auto auto auto auto auto;
+  align-content: start;
+}
+.mu-col:has(.grow) { grid-template-rows: auto 1fr auto auto auto; }
+
+.mu-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding-bottom: 4px;
+  border-bottom: 1px solid var(--line);
+}
+.mu-head b { font-size: 12.5px; letter-spacing: .05em; }
+.mu-sub { flex: 1; color: var(--muted); font-size: 10.5px; text-align: right; }
+
+.mu-btn {
+  background: var(--panel-2);
+  color: var(--muted);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  min-height: 30px;
+  padding: 0 10px;
+  font-size: 11px;
+  cursor: pointer;
+}
+.mu-btn:hover { color: var(--text); border-color: var(--cyan); }
+
+.mu-now { display: grid; gap: 4px; }
+.mu-title { margin: 0; font-size: 16px; font-weight: 600; }
+.mu-by { margin: 0; font-size: 11.5px; color: var(--muted); }
+.mu-bar { height: 4px; border-radius: 2px; background: rgba(255,255,255,.14); overflow: hidden; }
+.mu-bar u { display: block; height: 100%; background: var(--cyan); transition: width 260ms linear; }
+.mu-time { font-style: normal; font-size: 10.5px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.mu-voice { margin: 2px 0 0; font-size: 11.5px; color: var(--green); }
+.mu-voice:empty { display: none; }
+.mu-next { margin: 2px 0 0; font-size: 11.5px; color: var(--amber); }
+
+.mu-list {
+  overflow-y: auto;
+  min-height: 0;
+  /* The viewport-relative cap stays first as the fallback: if `cqh` is not
+     understood the declaration below is dropped and this one still bounds
+     the list. */
+  max-height: 34vh;
+  /* 58% of the column, which leaves the head, the now-playing block and the
+     next line their measured 200-220px in every orientation. */
+  max-height: 58cqh;
+  display: grid;
+  gap: 3px;
+  align-content: start;
+}
+.mu-list.grow { max-height: none; }
+
+/* A HIDDEN LIST MUST ACTUALLY GO. `.mu-list` sets `display: grid`, and that
+ * beats the user-agent's `[hidden] { display: none }` on specificity - so
+ * without this the folded book stays exactly where it was and the fold looks
+ * broken rather than absent. */
+.mu-list[hidden] { display: none; }
+
+/* The foldable head. It already looked like a bar; this makes it behave like
+ * one, and says so on touch by not selecting its own words when held. */
+.mu-fold {
+  cursor: pointer;
+  user-select: none;
+  -webkit-user-select: none;
+}
+.mu-fold:hover { border-bottom-color: var(--cyan); }
+.mu-caret {
+  display: inline-block;
+  width: 10px;
+  font-size: 10px;
+  color: var(--muted);
+  transform-origin: 50% 50%;
+}
+.mu-fold.folded .mu-caret { transform: rotate(-90deg); }
+/* Folded, the bar is the whole section, so it carries the section's weight
+ * rather than sitting under a gap that leads nowhere. */
+.mu-fold.folded { border-bottom-color: var(--line); opacity: .82; }
+
+.mu-row {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  grid-template-areas: "main tail" "sub tail";
+  gap: 0 8px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  border: 1px solid transparent;
+  font-size: 11.5px;
+  line-height: 1.3;
+}
+.mu-row b {
+  grid-area: main;
+  font-weight: 600;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.mu-row em {
+  grid-area: sub;
+  font-style: normal;
+  color: var(--muted);
+  font-size: 10.5px;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.mu-row i {
+  grid-area: tail;
+  font-style: normal;
+  color: var(--muted);
+  font-size: 10.5px;
+  align-self: center;
+  font-variant-numeric: tabular-nums;
+}
+/* A row that DOES something on a tap looks like it does; a row that is
+   only information does not. The queue is deliberately in the second
+   group - reordering the music queue has no confirmed route, and a drag
+   handle that silently does nothing is worse than no handle. */
+.mu-row.take { background: var(--panel-2); border-color: var(--line); cursor: pointer; }
+.mu-row.take:hover { border-color: var(--cyan); }
+
+.mu-row.order.live { border-color: var(--green); }
+.mu-row.order.live b { color: var(--green); }
+/* Past and disabled are DIFFERENT things and must not look the same:
+   one has happened, the other never will. #963 is the record of what
+   happens when a client decides "past" for itself. */
+.mu-row.order.past { opacity: .45; }
+.mu-row.order.off { opacity: .55; text-decoration: line-through; }
+
+/* ------------------------------------------------- the expanded record */
+
+/* WHY THE PANEL IS INSIDE THE LIST AND NOT A POPOVER.
+   The operator's gesture is "tap on every song in the queue and expand
+   it", and the comparison they are making is between records - this one
+   has a read on file and the next three do not. A popover covers the rows
+   it is being compared against; an in-place panel pushes them down and
+   keeps them. The list already scrolls, which is the cost.
+
+   The type steps DOWN inside the panel rather than up. A detail panel is
+   read close-to, the row above it is read at a glance, and a panel whose
+   type matched the row's would make the list look like it had grown a
+   second list. */
+.mu-item { display: grid; gap: 0; min-width: 0; }
+.mu-item.open > .mu-row {
+  border-color: var(--cyan);
+  border-bottom-left-radius: 0;
+  border-bottom-right-radius: 0;
+}
+
+.mu-detail {
+  display: grid;
+  gap: 7px;
+  padding: 8px;
+  border: 1px solid var(--cyan);
+  border-top: 0;
+  border-radius: 0 0 6px 6px;
+  background: rgba(0, 0, 0, .28);
+}
+
+.mu-sec { display: grid; gap: 3px; min-width: 0; }
+.mu-sec > b {
+  font-size: 10px;
+  letter-spacing: .09em;
+  text-transform: uppercase;
+  color: var(--cyan);
+}
+
+/* Label left, value right, on one line - the shape a spec sheet wants,
+   and it survives a 200px column because the value wraps and the label
+   does not. */
+.mu-fact {
+  display: grid;
+  grid-template-columns: 72px 1fr;
+  gap: 8px;
+  font-size: 11px;
+  line-height: 1.35;
+}
+.mu-fact span { color: var(--muted); }
+.mu-fact i { font-style: normal; min-width: 0; overflow-wrap: anywhere; }
+
+/* A read, a prepared intro or a reception note is PROSE and is the thing
+   the operator opened the row for, so it is never clamped to one line and
+   never ellipsised - unlike .mu-row, which is. The tail ("aired 3×",
+   "written, not yet recorded") sits under it rather than beside it,
+   because at 200px wide a tail beside the text steals a third of the
+   column. */
+.mu-line { display: grid; gap: 2px; font-size: 11px; line-height: 1.42; }
+.mu-line span {
+  font-size: 9.5px;
+  letter-spacing: .07em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+.mu-line p { margin: 0; color: var(--text); overflow-wrap: anywhere; }
+.mu-line i { font-style: normal; font-size: 10px; color: var(--amber); }
+
+/* NOTHING PREPARED MUST NOT LOOK LIKE SOMETHING BROKEN. Measured
+   2026-09-11: none of the 22 records in the live queue, the just-played
+   and the record on air had an analysis or a read on file, so the empty
+   case is the common one. An empty section is a sentence in the muted
+   colour; a section nobody has paid for yet is amber with its press
+   beside it, because those are different states and only one of them is
+   something the operator can act on. */
+.mu-empty {
+  margin: 0;
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--muted);
+  font-style: italic;
+}
+.mu-empty.pending { color: var(--amber); font-style: normal; }
+
+/* The caveats - the 300-of-558 cap on the read library, the 200-character
+   clip, what the research door really costs. Small, because they are the
+   answer to a question the operator has not asked yet but will. */
+.mu-fine {
+  margin: 0;
+  font-size: 9.5px;
+  line-height: 1.45;
+  color: var(--muted);
+  opacity: .82;
+}
+
+.mu-btn.small {
+  min-height: 26px;
+  padding: 0 8px;
+  font-size: 10.5px;
+  justify-self: start;
+}
+.mu-feet {
+  display: flex;
+  gap: 6px;
+  padding-top: 2px;
+  border-top: 1px solid var(--line);
+}
+
+.mu-ask { display: flex; gap: 6px; }
+.mu-ask input {
+  flex: 1;
+  min-width: 0;
+  min-height: 32px;
+  padding: 0 8px;
+  border-radius: 6px;
+  border: 1px solid var(--line);
+  background: var(--panel-2);
+  color: var(--text);
+  font-size: 12px;
+}
+
+.mu-note {
+  position: absolute;
+  left: 12px;
+  bottom: 4px;
+  margin: 0;
+  font-size: 11px;
+  color: var(--muted);
+}
+.mu-note.bad { color: var(--red); }
+
+/* ---------------------------------------------------------- small glass */
+
+/* The tablet lands in landscape at roughly 1000x600 CSS px. Listen is
+   already fluid and needs nothing; Music's three columns become two and
+   then one, with the running order last because it is the pane you
+   consult rather than the pane you work. */
+/* Music's two column queries are GONE, not moved. They keyed off
+   `.view.pb-music.active`, which never matched the tablet host, so neither
+   of them had ever run there; and `repeat(auto-fit, minmax(min(100%,260px),
+   1fr))` above now does the same job by measuring the space instead of
+   guessing at it from the width. Listen still wants one: its headline is
+   clamped by LINE COUNT, and four lines of 4.4vw type is a different amount
+   of screen on a narrow glass than on a wide one. */
+@media (max-width: 900px) {
+  .pl-head { -webkit-line-clamp: 3; }
+}
+
+/* THE COVER AND THE METERS (Listen).
+ *
+ * The art sits BESIDE the headline, not behind it: the backdrop is already
+ * the gallery, and a cover competing with a gallery still is two pictures
+ * and no subject. */
+.pl-art {
+  width: clamp(64px, 14vw, 128px);
+  aspect-ratio: 1;
+  border-radius: 10px;
+  object-fit: cover;
+  border: 1px solid var(--line, #35414c);
+  background: var(--panel, #1c242c);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, .45);
+}
+
+.pl-meters {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 10px 0 4px;
+  max-width: 520px;
+}
+.pl-meter {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+.pl-meter span {
+  flex: 0 0 34px;
+  font-size: 10px;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+  color: var(--muted, #8fa0ad);
+}
+/* A fixed height so the bars have somewhere to move. Canvas has no
+   intrinsic size, and a canvas in a flex row collapses to zero without
+   one - which reads as a meter that never moves rather than one that was
+   never given any room. */
+.pl-meter canvas {
+  flex: 1 1 auto;
+  height: 26px;
+  min-width: 0;
+  border-radius: 5px;
+  background: rgba(255, 255, 255, .04);
+}
+.pl-meter-note {
+  font-size: 10px;
+  font-style: normal;
+  color: var(--muted, #8fa0ad);
+}
+
+/* Portrait: the cover shrinks rather than pushing the headline off. */
+@media (max-width: 760px) {
+  .pl-art { width: clamp(56px, 18vw, 96px); }
+  .pl-meter canvas { height: 22px; }
+}
+
+/* The hold-to-open desk, and the moving backdrop. */
+.pl-desk {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  margin: 8px 0 2px;
+  padding: 10px 12px;
+  max-width: 520px;
+  border: 1px solid var(--line, #35414c);
+  border-radius: 10px;
+  /* OPAQUE. At rgba(0,0,0,.35) the track title, the NEXT row and the
+     search box all read THROUGH the panel - the operator's photo shows
+     "MUSIC" and the song title printed over each other. A popover that you
+     can read the page through is not a popover. */
+  background: var(--panel, #161d24);
+  background: color-mix(in srgb, var(--panel, #161d24) 96%, #000);
+}
+.pl-deskrow { display: flex; align-items: center; gap: 10px; }
+.pl-deskrow span {
+  flex: 0 0 40px; font-size: 10px; letter-spacing: .08em;
+  text-transform: uppercase; color: var(--muted, #8fa0ad);
+}
+.pl-deskrow input[type="range"] { flex: 1 1 auto; min-width: 0; }
+.pl-deskrow i {
+  flex: 0 0 42px; text-align: right; font-style: normal;
+  font-size: 11px; color: var(--muted, #8fa0ad);
+  font-variant-numeric: tabular-nums;
+}
+/* #1194: THE HONEST FAILURE NEEDS ROOM TO BE READ.
+   The value cell is 42px of tabular numbers, which is right for "120%" and
+   clips "(no desk here)" down to a shrug. When a row genuinely has no desk
+   to turn it stops being a number cell: it takes the width it needs and it
+   goes red, because a slider that cannot move the sound must look different
+   from one that can. */
+.pl-deskrow i.gone {
+  flex: 0 1 auto; font-size: 10px; letter-spacing: .01em;
+  color: var(--red, #e46b6b); text-align: right;
+}
+.pl-deskwhy { font-style: normal; font-size: 10px; line-height: 1.5; color: var(--muted, #8fa0ad); }
+#plDeskWhere { display: block; margin-top: 3px; opacity: .85; }
+
+/* The video backdrop sits exactly where the still does. object-fit: cover,
+   because a backdrop that letterboxes shows the room its own black bars. */
+.pl-back-vid { object-fit: cover; }
+
+/* THE DESK, BEHIND AN ICON.
+ * "These are taking up too much room... collapsible inside of an icon
+ * because they are rarely going to be edited." Anchored to the button left
+ * of the volume knob; a tap anywhere else closes it. */
+.pl-deskbtn {
+  flex: 0 0 auto;
+  display: grid; place-items: center;
+  width: 34px; height: 34px; padding: 0;
+  border: 1px solid var(--line, #35414c);
+  border-radius: 8px;
+  background: var(--panel, #1c242c);
+  color: var(--muted, #8fa0ad);
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+.pl-deskbtn.on { color: var(--text, #edf3f5); border-color: var(--cyan, #65c7da); }
+.pl-deskbtn svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 1.7; }
+
+/* A popover, not a block in the flow: it must not push the show down. */
+/* FIXED, not absolute.
+ *
+ * It was absolute with no positioned ancestor, so it resolved against
+ * .pl-face and landed in the MIDDLE of the view - over the track title, the
+ * NEXT row and the search box at once. Measured on the tablet: the popover
+ * sat at 0,421 with .pl-face as its offsetParent.
+ *
+ * Fixed to the viewport instead, just above the console strip. A panel that
+ * appears in one predictable place is worth more than one that tries to
+ * follow its button and lands on the content. */
+.pl-desk {
+  position: fixed;
+  z-index: 2147483003;
+  left: 12px;
+  bottom: 34px;
+  width: min(420px, 86vw);
+  max-height: 60vh;
+  overflow-y: auto;
+  box-shadow: 0 18px 44px rgba(0, 0, 0, .6);
+}
+.pl-talkonly {
+  align-self: flex-start;
+  margin-top: 2px;
+  padding: 6px 12px;
+  border: 1px solid var(--line, #35414c);
+  border-radius: 999px;
+  background: var(--panel-2, #222b35);
+  color: var(--text, #edf3f5);
+  font: inherit; font-size: 11px; cursor: pointer;
+}
+.pl-talkonly.on { border-color: var(--amber, #e3be63); color: var(--amber, #e3be63); }
+
+/* THE REQUEST BOX. */
+.pl-searchwrap { position: relative; flex: 1 1 200px; min-width: 0; }
+.pl-search {
+  width: 100%; min-height: 34px;
+  padding: 0 10px;
+  border: 1px solid var(--line, #35414c);
+  border-radius: 8px;
+  background: rgba(0, 0, 0, .35);
+  color: var(--text, #edf3f5);
+  font: inherit; font-size: 12px;
+}
+.pl-hits {
+  position: absolute; z-index: 50; left: 0; right: 0; bottom: 40px;
+  max-height: 46vh; overflow-y: auto;
+  border: 1px solid var(--line, #35414c);
+  border-radius: 10px;
+  background: var(--bg, #101419);
+  box-shadow: 0 18px 40px rgba(0, 0, 0, .55);
+}
+.pl-hitshead {
+  display: block; padding: 7px 10px 3px;
+  font-style: normal; font-size: 10px; letter-spacing: .07em;
+  text-transform: uppercase; color: var(--muted, #8fa0ad);
+}
+.pl-hit {
+  display: block; width: 100%; min-height: 42px;
+  padding: 7px 10px; border: 0; border-top: 1px solid var(--line, #35414c);
+  background: transparent; color: inherit; font: inherit;
+  text-align: left; cursor: pointer;
+}
+.pl-hit b { display: block; font-size: 13px; }
+.pl-hit span { display: block; font-size: 10px; color: var(--muted, #8fa0ad); }
+.pl-hit.asking { opacity: .5; }
+.pl-hit-none { cursor: default; color: var(--muted, #8fa0ad); font-size: 12px; }
+
+/* The plexus behind the show, while a clip is still arriving.
+
+   #1147 - "I don't want this logo to show every time the video changes.
+   Like this play button doesn't look good. I instead want plexus graphics
+   in the background undulating."
+
+   AND IT COULD NOT BE SEEN. This canvas carries `.pl-back` as well, for
+   the position and the object-fit, and `.pl-back` says `opacity:.34` -
+   while `.pl-back:not([src]){opacity:0}` says nothing at all for an
+   element that has no src attribute and never could, which a <canvas> is.
+   So the stand-in that listen.js has been raising over every loading clip
+   since it was written has been drawing at zero opacity the whole time,
+   and what the operator saw instead was the WebView's own play badge
+   underneath it. It is a full-strength picture now, and unsaturated: it is
+   the SUBJECT between clips, not wallpaper behind one.
+
+   Both selectors are two classes, so this one wins on coming later in the
+   file - which is also why it has to stay below .pl-back. */
+.pl-back-fx { display: none; z-index: 0; }
+.pl-back.pl-back-fx { opacity: 1; filter: none; }
+
+/* THE BACKDROP MOVES, AND CHANGES WITHOUT A CUT.
+   Two layers cross-fading (see swapStill) and a slow alternating drift, so
+   the picture is never static and never swaps between two frames. Long
+   durations on purpose: this is the wall of a room, not a slide advance. */
+.pl-back {
+  transition: opacity 1.6s ease-in-out;
+  will-change: transform, opacity;
+}
+.pl-drift-0 { animation: plDrift0 28s ease-in-out forwards; }
+.pl-drift-1 { animation: plDrift1 28s ease-in-out forwards; }
+.pl-drift-2 { animation: plDrift2 28s ease-in-out forwards; }
+.pl-drift-3 { animation: plDrift3 28s ease-in-out forwards; }
+@keyframes plDrift0 {
+  from { transform: scale(1.04) translate3d(-1.2%, 0.6%, 0); }
+  to   { transform: scale(1.16) translate3d(1.4%, -0.8%, 0); }
+}
+@keyframes plDrift1 {
+  from { transform: scale(1.16) translate3d(1.4%, -0.8%, 0); }
+  to   { transform: scale(1.03) translate3d(-1.0%, 0.9%, 0); }
+}
+@keyframes plDrift2 {
+  from { transform: scale(1.03) translate3d(0.8%, -1.1%, 0); }
+  to   { transform: scale(1.15) translate3d(-0.9%, 1.2%, 0); }
+}
+@keyframes plDrift3 {
+  from { transform: scale(1.15) translate3d(-0.9%, 1.2%, 0); }
+  to   { transform: scale(1.04) translate3d(0.7%, -0.7%, 0); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .pl-back[class*="pl-drift-"] { animation: none; transform: none; }
+}
+
+/* THE GRAB PAD, top right of the Listen view.
+ *
+ * Square, because it is a PAD - the same object as the sixteen in the
+ * sampler, and the hand should recognise it as one. It sits away from the
+ * transport on purpose: it does not change what is playing, it keeps it. */
+.pl-pad {
+  position: relative;
+  width: 54px;
+  height: 54px;
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  border-radius: 10px;
+  background: #1c242c;
+  border: 1px solid #3d4b57;
+  color: #cfe0e6;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+  touch-action: manipulation;
+}
+.pl-pad i {
+  display: block;
+  width: 16px; height: 16px;
+  border-radius: 3px;
+  background: linear-gradient(140deg, #54d18b, #65c7da);
+}
+.pl-pad b {
+  font-size: 9px;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+  font-weight: 700;
+  color: #8fa0ad;
+}
+.pl-pad:hover { border-color: #65c7da; }
+.pl-pad:active { transform: scale(.95); }
+.pl-pad.busy { border-color: #e3be63; }
+.pl-pad.busy i { animation: pl-pad-work .8s linear infinite; }
+@keyframes pl-pad-work {
+  50% { opacity: .35; transform: scale(.82); }
+}
+/* What it just did, beside the pad rather than inside it - the pad stays a
+ * pad, and a sentence never changes its size. */
+/* The top strip holds the station name, the pad and the clock. */
+.pl-top { display: flex; align-items: center; gap: 12px; }
+.pl-top .pl-pad { margin-left: auto; }
+
+#plPadSay {
+  position: absolute;
+  right: 60px;
+  top: 50%;
+  transform: translateY(-50%);
+  white-space: nowrap;
+  font-size: 11px;
+  color: #9fe08f;
+  pointer-events: none;
+  text-shadow: 0 1px 3px rgba(0,0,0,.8);
+}
+#plPadSay.bad { color: #e46b6b; }
+@media (prefers-reduced-motion: reduce) {
+  .pl-pad.busy i { animation: none; }
+}
+
+/* THE ENDLESS SET AS THE BACKDROP (listen.js paintEndless).
+   "In endless video mode replace the background of the page ... just have
+   the background be the video's loading." The same element the gallery
+   uses for its occasional clip, with a little more presence than a
+   wallpaper still gets: the operator asked for the video to BE the
+   background, not to hide behind the shade. Still under the text - the
+   shade gradient above it is what keeps the headline readable. */
+.pl-back-vid.pl-endless {
+  object-fit: cover;
+  opacity: .58;
+  filter: none;
+}
+
+/* THE LINE ON AIR, AS A MARQUEE, WITH THE VOICE UNDER IT (listen.js
+   paintSaid / drawSpectrogram).
+   Last in the controls row and the full width of it, so the buttons stay
+   on one line above and the text has the whole width to travel. The
+   track holds the line twice and moves by exactly one copy per cycle -
+   that is the seam-free loop; the duration is set from the measured
+   width by the script so the speed stays ~90 px/s whatever the length.
+   The mask fades the edges rather than cutting them. */
+.pl-said {
+  order: 20;
+  flex: 1 1 100%;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  margin-top: 2px;
+}
+.pl-marquee {
+  overflow: hidden;
+  white-space: nowrap;
+  font-size: 13.5px;
+  line-height: 1.45;
+  color: var(--text, #dfe7ee);
+  -webkit-mask-image: linear-gradient(90deg, transparent 0, #000 3%, #000 97%, transparent 100%);
+  mask-image: linear-gradient(90deg, transparent 0, #000 3%, #000 97%, transparent 100%);
+  transition: opacity 600ms ease;
+}
+.pl-marquee-track {
+  display: inline-flex;
+  will-change: transform;
+  animation: plMarquee 12s linear infinite;
+}
+.pl-said-copy {
+  display: inline-block;
+  white-space: nowrap;
+  box-sizing: border-box;
+  padding-right: 4em;
+}
+/* The speaker, in a colour the text is not. */
+.pl-said-copy b {
+  color: var(--cyan, #65c7da);
+  font-weight: 700;
+  margin-right: .6em;
+}
+/* Nothing being said: the last line stays, dimmed. */
+.pl-said.dim .pl-marquee { opacity: .42; }
+@keyframes plMarquee {
+  from { transform: translate3d(0, 0, 0); }
+  to   { transform: translate3d(-50%, 0, 0); }
+}
+
+/* A fixed height for the same reason the meters have one: a canvas in a
+   flex column has no size of its own. */
+.pl-said-spec {
+  display: block;
+  width: 100%;
+  /* #1151: and the canvas itself never asks for more room than it was
+     given. Its width and height ATTRIBUTES are an intrinsic size that
+     layout is entitled to use; these two lines say it may not. */
+  min-width: 0;
+  max-width: 100%;
+  height: 48px;
+  border-radius: 6px;
+  background: #05080a;
+}
+.pl-said-note {
+  font-style: normal;
+  font-size: 10.5px;
+  color: var(--muted, #8fa0ad);
+}
+.pl-said-note:empty { display: none; }
+@media (prefers-reduced-motion: reduce) {
+  .pl-marquee-track { animation: none; }
+}
+
+/* =============================================  THE SCREEN ALONE  ======
+
+   #1152 - "When under the Listen tab, in endless video mode, allow me to
+   double tap the background in order to go full screen and hide all of the
+   UI except for the dot."
+
+   #1150 - "Whenever this screen is idle after 10 seconds, fade the UI to
+   20% until I tap the screen to show it again. In endless video mode."
+
+   ONE ELEMENT CARRIES BOTH. Every piece of chrome this view has is inside
+   .pl-face; the gallery layers, the clip, the plexus and the shade are its
+   siblings, and the talk dot is not in this view at all. So a deliberate
+   hide and an idle fade are the same property on the same box, which is
+   the only shape of this that a tablet can afford: one opacity the
+   compositor animates, rather than nine style writes a frame.
+
+   TWO HOSTS, AS EVERYWHERE ELSE IN THIS FILE. `.view.pb-listen.active` is
+   Electron's element and `.pine-view-host.open.pb-listen` is the one
+   rail.js builds on the tablet; neither carries the other's classes. Both
+   are reached here by keying on .pb-listen and the state class together,
+   which is two classes - enough to beat the one-class rules above without
+   needing to be written out twice.
+
+   listen.js is the only thing that writes .pl-bare and .pl-idle, and it
+   takes them both off again whenever this view stops being the open one.
+   Nothing here is remembered between sessions. */
+
+.pb-listen .pl-face,
+.pb-listen .pl-shade {
+  /* #1150 asks for about six hundred milliseconds, and the same curve
+     serves the deliberate hide: a cut to black on a double tap reads as a
+     screen that broke rather than a screen that obeyed. */
+  transition: opacity 600ms ease;
+}
+
+/* #1150: a fifth of itself, and still perfectly tappable - this is a fade,
+   not a hide, and the operator's own number. */
+.pb-listen.pl-idle .pl-face { opacity: .2; }
+
+/* #1152: gone, and nothing under the finger. pointer-events matters as
+   much as the opacity does: an invisible search box that still takes a tap
+   is how a bare screen turns into a keyboard nobody asked for, and it is
+   also what lets the SECOND double tap land on the backdrop and bring
+   everything back. */
+.pb-listen.pl-bare .pl-face {
+  opacity: 0;
+  pointer-events: none;
+}
+
+/* "...go full screen." The shade is a gradient that exists to keep the
+   headline readable over a photograph. With no headline on the glass it is
+   just a dark sheet over the operator's video, so it goes too - and the
+   clip comes up off its wallpaper opacity to its own full strength. That
+   is the difference between hiding the UI and being full screen. */
+.pb-listen.pl-bare .pl-shade { opacity: 0; }
+.pb-listen.pl-bare .pl-back-vid.pl-endless { opacity: 1; }
+
+@media (prefers-reduced-motion: reduce) {
+  .pb-listen .pl-face,
+  .pb-listen .pl-shade { transition: none; }
+}
+
+/* ===============================================  THE TABS  ============
+
+   #1156 - "When I am in full screen, fade the tabs down to 5%."
+
+   Full screen is the bare mode #1152 asked for: a double tap on the clip
+   takes .pl-face away and drops the shade. What was left on the glass
+   afterwards was the picture, the talk dot - which the operator asked for
+   by name - and the view rail down the right-hand edge at full strength.
+
+   THE RAIL IS NOT THIS VIEW'S TO REACH DOWN INTO. rail.js builds
+   #pineViewRail on the BODY and gives it z-index 2147483001, one above the
+   view host it floats over, so there is no selector starting at #listen
+   that can find it. listen.js therefore stamps `pine-listen-bare` on
+   <html> whenever bare mode is on and takes it off on every road out -
+   the second double tap, Escape, the tab going hidden, the view being
+   closed - and the rule below is the only thing that reads it. rail.js
+   itself is untouched.
+
+   SPECIFICITY, SINCE TWO STYLESHEETS ARE INVOLVED. RAIL_CSS is injected by
+   rail.js and lands AFTER this file, so a plain `#pineViewRail` here would
+   lose every tie. `html.pine-listen-bare #pineViewRail` is an id and a
+   class, which beats a bare id whatever the source order - and rail.js
+   sets no opacity of its own, so nothing is being fought over.
+
+   FIVE PERCENT, AND STILL A BUTTON. Opacity has never affected hit
+   testing: the tabs take a tap at .05 exactly as they do at 1, and the
+   rail keeps its own scrolling. That is the whole reason the operator's
+   number is safe to obey - he asked for the tabs faded, not disabled, and
+   he must be able to leave the view without guessing where the edge is.
+   Nothing here touches pointer-events, and nothing may.
+
+   A FINGER ON THE RAIL BRINGS IT BACK, AND COSTS NOTHING. :hover, :active
+   and :focus-within are three pseudo-classes and no JavaScript at all - no
+   listener, no timer, no frame, which is the only kind of "while the
+   finger is near it" this tablet should be asked to pay for. On glass
+   Chromium applies :hover on touch and holds it until the next tap
+   somewhere else, so the rail comes up under the thumb, stays up while it
+   is being used, and settles back to five percent once the operator
+   touches the picture again. */
+
+#pineViewRail {
+  /* The same 600ms ease the chrome fades on, so the two halves of one
+     gesture move together rather than one snapping and one gliding. */
+  transition: opacity 600ms ease;
+}
+html.pine-listen-bare #pineViewRail { opacity: .05; }
+html.pine-listen-bare #pineViewRail:hover,
+html.pine-listen-bare #pineViewRail:active,
+html.pine-listen-bare #pineViewRail:focus-within { opacity: 1; }
+
+@media (prefers-reduced-motion: reduce) {
+  #pineViewRail { transition: none; }
+}
+
+/* ==========================================  THE LINE ON A RESTORED
+                                                FULL SCREEN  ============
+
+   #1163 - "If I set the video to full screen, then reload it in full
+   screen as well on the next video open. Retain the scale settings on
+   reload in the web client."
+
+   #1152 refused to remember the bare screen, and said why: "a remembered
+   bare screen is a tablet that looks dead on the shelf the next morning".
+   The operator has overruled that, and he is right to - this kiosk
+   relaunches every few minutes on its own, so a session-only full screen
+   is one he keeps losing to something he did not do. But the objection was
+   never wrong about the failure mode, only about the price. A tablet that
+   looks dead is a tablet that was told nothing. This is the telling.
+
+   It is a SIBLING of .pl-face, not a child, because .pl-face is the
+   element bare mode takes to zero - a note inside it would be a note
+   nobody can read. And it is pointer-events:none, so the double tap it
+   describes goes through it to the backdrop, where onBackdrop() is
+   waiting.
+
+   Bottom centre, above the console strip's 26px and well clear of the
+   talk dot in the corner. Six seconds on listen.js's clock, then the same
+   600ms ease everything else in this view fades on. */
+
+.pl-barenote {
+  position: absolute;
+  left: 50%;
+  bottom: 44px;
+  transform: translateX(-50%);
+  z-index: 3;
+  margin: 0;
+  padding: 7px 15px;
+  border: 1px solid rgba(101, 199, 218, .3);
+  border-radius: 999px;
+  background: rgba(8, 11, 15, .72);
+  color: var(--text, #dfe7ee);
+  font-size: 12.5px;
+  letter-spacing: .02em;
+  white-space: nowrap;
+  max-width: calc(100% - 32px);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 600ms ease;
+}
+.pl-barenote.on { opacity: 1; }
+
+/* #1163: and while that line is up the rail is at full strength, not at
+   #1156's five percent. Five percent is right for a full screen the
+   operator just chose; it is wrong for the first six seconds after a
+   relaunch he did not choose, when the way OUT of the view is the one
+   thing he must be able to find. Two classes and an id, so it beats the
+   #1156 rule above it without needing !important. */
+html.pine-listen-bare.pine-listen-bare-said #pineViewRail { opacity: 1; }
+
+@media (prefers-reduced-motion: reduce) {
+  .pl-barenote { transition: none; }
+}

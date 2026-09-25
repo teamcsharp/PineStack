@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- A route chip.
+     THREE states, and the pressed one is not decoration: the operator asked
+     for "immediate visual feedback on touch". A ripple would need a Material
+     theme this app deliberately does not carry (Theme.AppCompat.NoActionBar,
+     so the panel paints its own chrome), so the feedback is a state_pressed
+     fill, which draws on the very next frame with no animator involved. -->
+<selector xmlns:android="http://schemas.android.com/apk/res/android">
+    <item android:state_pressed="true">
+        <shape android:shape="rectangle">
+            <solid android:color="@color/pine_press" />
+            <stroke android:width="1dp" android:color="@color/pine_amber" />
+            <corners android:radius="8dp" />
+        </shape>
+    </item>
+    <item android:state_activated="true">
+        <shape android:shape="rectangle">
+            <solid android:color="@color/pine_amber" />
+            <stroke android:width="1dp" android:color="@color/pine_amber" />
+            <corners android:radius="8dp" />
+        </shape>
+    </item>
+    <item>
+        <shape android:shape="rectangle">
+            <solid android:color="@color/pine_chip" />
+            <stroke android:width="1dp" android:color="@color/pine_rule" />
+            <corners android:radius="8dp" />
+        </shape>
+    </item>
+</selector>

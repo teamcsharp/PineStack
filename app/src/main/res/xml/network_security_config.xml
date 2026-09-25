@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The station answers on plain http on the LAN and there is no
+     certificate to be had for 10.89.1.246. Cleartext is therefore permitted
+     for THAT HOST ONLY: the base-config below forbids it everywhere else,
+     so a mistyped baseUrl pointing at the open internet fails closed.
+
+     MOVING THE STATION means editing this file - a runtime writeConfig
+     cannot widen the network policy, which is exactly the point. -->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="false">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">10.89.1.246</domain>
+        <!-- THE SAME STATION, REACHED FROM ANYWHERE.
+             lilspark is on the tailnet at 100.74.95.59, and the operator
+             carries this tablet out of the house: "connect the tablet up to
+             my phone through 3G or the localized network and be able to
+             connect and interact with the radio."
+
+             Tailnet traffic is already encrypted and authenticated by
+             WireGuard between the two nodes, so plain http inside it is not
+             the open internet - but Android does not know that, and the
+             base-config above fails closed. Both the address and the
+             MagicDNS name are named because net/Reach.kt tries both: the
+             address needs no resolver, the name survives the address
+             changing. -->
+        <domain includeSubdomains="false">100.74.95.59</domain>
+        <domain includeSubdomains="true">lilspark.tail1fec29.ts.net</domain>
+        <!-- Only for the case where the station is ever run on the tablet
+             itself (it is not today - the box carries it). -->
+        <domain includeSubdomains="false">127.0.0.1</domain>
+        <domain includeSubdomains="false">localhost</domain>
+    </domain-config>
+</network-security-config>

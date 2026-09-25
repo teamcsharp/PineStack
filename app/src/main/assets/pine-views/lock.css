@@ -1,0 +1,270 @@
+/* The station on a locked tablet.
+ *
+ * Read at arm's length on a shelf, so the type is larger than anywhere else
+ * in the terminal and the layout is one column of big blocks rather than
+ * the dense panel. It sits above everything - including the rail and the
+ * console strip - because while it is up it IS the screen; the talk dot is
+ * the one thing deliberately left above it, so the operator can speak to
+ * the station without unlocking.
+ */
+
+.lk-screen {
+  position: fixed;
+  inset: 0;
+  z-index: 2147483050;
+  overflow: hidden;
+  background: #080b0f;
+  color: #edf3f5;
+  font-size: 15px;
+  -webkit-tap-highlight-color: transparent;
+}
+
+/* The slideshow's picture, behind everything. */
+.lk-art {
+  position: absolute; inset: 0;
+  width: 100%; height: 100%;
+  object-fit: cover;
+  opacity: 1;
+  transition: opacity .35s ease;
+}
+/* Enough shade that white type is legible over any picture, without
+   losing the picture - a lock screen that is only a gradient is not
+   showing the operator his station's work. */
+.lk-shade {
+  position: absolute; inset: 0;
+  background:
+    linear-gradient(180deg, rgba(4, 7, 10, .82) 0%, rgba(4, 7, 10, .45) 34%,
+      rgba(4, 7, 10, .72) 72%, rgba(4, 7, 10, .93) 100%);
+}
+
+.lk-grid {
+  position: relative;
+  height: 100%;
+  display: grid;
+  grid-template-rows: auto auto minmax(0, 1fr) auto auto;
+  gap: clamp(8px, 1.6vh, 18px);
+  padding: clamp(14px, 3vh, 34px) clamp(16px, 4vw, 48px);
+}
+
+/* ---- 1 the head ---- */
+.lk-head {
+  display: flex; align-items: flex-start; justify-content: space-between;
+  gap: 16px;
+}
+.lk-when b {
+  display: block;
+  font-size: clamp(40px, 8vw, 84px);
+  line-height: 1;
+  font-weight: 300;
+  letter-spacing: -.02em;
+}
+.lk-when i {
+  font-style: normal; font-size: clamp(11px, 1.4vw, 15px);
+  color: #9fb0bd;
+}
+.lk-who { text-align: right; }
+.lk-who b { display: block; font-size: clamp(14px, 1.8vw, 20px); }
+.lk-air {
+  font-style: normal; font-size: clamp(11px, 1.3vw, 14px);
+  letter-spacing: .06em; text-transform: uppercase;
+}
+.lk-air[data-state="on"] { color: #54d18b; }
+.lk-air[data-state="paused"] { color: #e3be63; }
+.lk-air[data-state="off"] { color: #d86b57; }
+
+/* ---- 2 what is on ---- */
+.lk-now {
+  display: flex; align-items: center; gap: clamp(10px, 2vw, 20px);
+}
+.lk-cover {
+  flex: 0 0 auto;
+  width: clamp(56px, 9vw, 104px);
+  height: clamp(56px, 9vw, 104px);
+  object-fit: cover;
+  border-radius: 8px;
+}
+.lk-nowtext { flex: 1 1 auto; min-width: 0; }
+.lk-nowtext b {
+  display: block;
+  font-size: clamp(17px, 2.6vw, 30px);
+  line-height: 1.15;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.lk-nowtext i {
+  display: block; font-style: normal;
+  font-size: clamp(12px, 1.5vw, 17px); color: #9fb0bd;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.lk-barwrap {
+  height: 3px; margin: 8px 0 4px;
+  background: rgba(255, 255, 255, .18);
+  border-radius: 2px; overflow: hidden;
+}
+.lk-bar { display: block; height: 100%; width: 0; background: #65c7da; }
+.lk-dim { font-style: normal; font-size: clamp(10px, 1.2vw, 13px); color: #9fb0bd; }
+.lk-dim.bad { color: #e9a08f; }
+
+.lk-transport { display: flex; gap: 8px; flex: 0 0 auto; }
+.lk-btn {
+  min-width: 52px; height: 46px;
+  border: 1px solid rgba(255, 255, 255, .22);
+  border-radius: 10px;
+  background: rgba(0, 0, 0, .42);
+  color: #edf3f5; font-size: 17px; cursor: pointer;
+}
+
+/* ---- 3 the script ---- */
+.lk-script { min-height: 0; display: flex; flex-direction: column; }
+.lk-script h4 {
+  margin: 0 0 6px;
+  font-size: 10px; letter-spacing: .12em; text-transform: uppercase;
+  color: #9fb0bd; font-weight: 600;
+  display: flex; gap: 10px; align-items: baseline;
+}
+.lk-scriptbody {
+  flex: 1 1 auto; min-height: 0;
+  overflow-y: auto;
+  padding: 10px 12px;
+  border: 1px solid rgba(255, 255, 255, .14);
+  border-radius: 10px;
+  background: rgba(0, 0, 0, .38);
+  font-size: clamp(12px, 1.4vw, 15px);
+  line-height: 1.5;
+}
+/* The screenplay's own shapes, kept - a script that does not look like a
+   script is just a list of sentences. */
+.lk-el { white-space: pre-wrap; overflow-wrap: anywhere; }
+.lk-scene, .lk-subheader {
+  margin: 10px 0 4px; color: #65c7da;
+  font-size: .82em; letter-spacing: .08em; text-transform: uppercase;
+}
+.lk-character {
+  margin: 8px 0 0; padding-left: 24%;
+  letter-spacing: .06em; color: #edf3f5;
+}
+.lk-parenthetical { padding-left: 18%; color: #9fb0bd; font-style: italic; }
+.lk-dialogue { padding: 0 12% 0 12%; }
+.lk-action { margin: 6px 0; color: #c8d4dc; }
+.lk-transition { text-align: right; color: #9fb0bd; letter-spacing: .08em; }
+
+/* ---- 4 the ask ---- */
+.lk-ask { position: relative; }
+.lk-input {
+  width: 100%;
+  height: 46px;
+  padding: 0 14px;
+  border: 1px solid rgba(255, 255, 255, .22);
+  border-radius: 10px;
+  background: rgba(0, 0, 0, .5);
+  color: #edf3f5;
+  font: inherit; font-size: 14px;
+}
+.lk-input::placeholder { color: #8b9aa6; }
+.lk-hits {
+  position: absolute; left: 0; right: 0; bottom: 52px;
+  z-index: 2;
+  max-height: 40vh; overflow-y: auto;
+  padding: 4px;
+  border: 1px solid rgba(255, 255, 255, .18);
+  border-radius: 10px;
+  background: #121820;
+  box-shadow: 0 18px 40px rgba(0, 0, 0, .6);
+}
+.lk-hit {
+  display: block; width: 100%;
+  padding: 9px 10px;
+  border: 0; border-radius: 7px;
+  background: transparent; color: #edf3f5;
+  font: inherit; font-size: 13px; text-align: left; cursor: pointer;
+}
+.lk-hit:hover { background: rgba(101, 199, 218, .14); }
+.lk-hit b { display: block; }
+.lk-hit i { font-style: normal; color: #9fb0bd; font-size: 11.5px; }
+
+/* ---- 5 the slideshow line ---- */
+.lk-foot { display: flex; justify-content: space-between; gap: 12px; }
+
+/* While the lock screen is up, nothing underneath should be reachable -
+   but the talk dot is deliberately ABOVE it, so the station can still be
+   spoken to without unlocking. */
+body.pine-locked #pineConsoleLine,
+body.pine-locked #pineViewRail,
+body.pine-locked #pineSamplerTab { display: none !important; }
+body.pine-locked .pine-talk-dot { z-index: 2147483090; }
+
+/* Portrait: the picture takes the top, the words stack under it. */
+@media (orientation: portrait) {
+  .lk-now { flex-wrap: wrap; }
+  .lk-transport { width: 100%; }
+  .lk-btn { flex: 1 1 auto; }
+  .lk-character { padding-left: 12%; }
+  .lk-dialogue { padding: 0 6%; }
+}
+
+/* THE WAY OUT. This screen covers Android's keyguard, so it also covers the
+   unlock gesture - without this the tablet is genuinely stuck, which is
+   exactly what happened. Thumb-sized, always in the same corner. */
+.lk-out {
+  position: absolute;
+  top: clamp(10px, 2vh, 22px);
+  right: clamp(12px, 3vw, 34px);
+  width: 46px; height: 46px;
+  border: 1px solid rgba(255, 255, 255, .28);
+  border-radius: 50%;
+  background: rgba(0, 0, 0, .55);
+  color: #edf3f5;
+  font-size: 17px; line-height: 1;
+  cursor: pointer;
+  z-index: 3;
+}
+/* The head has to leave room for it, or the station name sits underneath. */
+.lk-head { padding-right: 58px; }
+
+/* THE PICTURE MOVES WHILE IT SITS, AND CROSS-FADES WHEN IT CHANGES.
+ *
+ * Two layers, one fading over the other - see nextPicture(). The fade is
+ * long because this is the background of a room, not a slide advance; the
+ * drift is longer still, so at any instant it reads as a still photograph
+ * that happens not to be quite still.
+ *
+ * Four drifts, used in turn, so a zoom-in is followed by a zoom-out and
+ * the wall does not develop a tic. Each one starts where the last ended in
+ * scale, which is what stops the change of direction being visible. */
+.lk-art {
+  transition: opacity 1.6s ease-in-out;
+  will-change: transform, opacity;
+}
+.lk-drift-0 { animation: lkDrift0 26s ease-in-out forwards; }
+.lk-drift-1 { animation: lkDrift1 26s ease-in-out forwards; }
+.lk-drift-2 { animation: lkDrift2 26s ease-in-out forwards; }
+.lk-drift-3 { animation: lkDrift3 26s ease-in-out forwards; }
+
+/* In, drifting right. */
+@keyframes lkDrift0 {
+  from { transform: scale(1.04) translate3d(-1.2%, 0.6%, 0); }
+  to   { transform: scale(1.16) translate3d(1.4%, -0.8%, 0); }
+}
+/* Out, drifting left - the opposite of the one before it. */
+@keyframes lkDrift1 {
+  from { transform: scale(1.16) translate3d(1.4%, -0.8%, 0); }
+  to   { transform: scale(1.03) translate3d(-1.0%, 0.9%, 0); }
+}
+/* In, drifting down. */
+@keyframes lkDrift2 {
+  from { transform: scale(1.03) translate3d(0.8%, -1.1%, 0); }
+  to   { transform: scale(1.15) translate3d(-0.9%, 1.2%, 0); }
+}
+/* Out, drifting up. */
+@keyframes lkDrift3 {
+  from { transform: scale(1.15) translate3d(-0.9%, 1.2%, 0); }
+  to   { transform: scale(1.04) translate3d(0.7%, -0.7%, 0); }
+}
+
+/* Somebody who has asked for less motion gets a still picture and a plain
+   fade - the change is still graceful, it just does not wander. */
+@media (prefers-reduced-motion: reduce) {
+  .lk-art[class*="lk-drift-"] { animation: none; transform: none; }
+}
+
+/* The arrows sit with the transport, not over the artwork. */
+.lk-transport { align-items: center; }

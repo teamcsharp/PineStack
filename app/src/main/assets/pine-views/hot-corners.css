@@ -1,0 +1,405 @@
+/* HOT CORNERS - the glow, the sheets, the annotator, the toast.
+ *
+ * "If I swipe into the tablet from the top left of the screen down to the
+ * center, I want to take a screenshot ... draw on the screen and outline
+ * things with my finger in red ... swipe in from the right side, I want to
+ * save a recording ... swipe from the left corner up to the center ... an
+ * inspector window ... bottom right corner ... replay the last sound
+ * effects clip ... preferences for each of the hot corners."
+ *
+ * Palette and radii follow line-actions.css (the sheets sit over the same
+ * views); z-indexes sit with the other pop-ups, above the view hosts
+ * (2147483000) and the rail (2147483001), below the report pad
+ * (2147483040) so a filed report lands on top of everything here.
+ */
+
+/* THE GLOW. One fixed disc centred on the corner point, so a quarter of
+   it shows; moved with transform and opacity only - no layout while the
+   finger is moving. */
+.hc-glow {
+  position: fixed;
+  z-index: 2147483030;
+  width: 320px; height: 320px;
+  margin: -160px 0 0 -160px;
+  border-radius: 50%;
+  background: radial-gradient(circle, rgba(101, 199, 218, .55) 0%,
+    rgba(101, 199, 218, .25) 45%, rgba(101, 199, 218, 0) 72%);
+  pointer-events: none;
+  opacity: 0;
+  transform: scale(.25);
+  transform-origin: center;
+  will-change: transform, opacity;
+  transition: opacity .18s ease-out;
+}
+.hc-glow.on { transition: none; }
+.hc-glow.tl { left: 0; top: 0; }
+.hc-glow.tr { left: 100vw; top: 0; }
+.hc-glow.bl { left: 0; top: 100vh; }
+.hc-glow.br { left: 100vw; top: 100vh; }
+
+/* THE SHEETS - export, preferences. Centred by translate until PineDrag
+   freezes them where they are dropped. */
+.hc-sheet {
+  position: fixed;
+  z-index: 2147483032;
+  left: 50%; top: 50%;
+  transform: translate(-50%, -50%);
+  width: min(420px, calc(100vw - 24px));
+  max-height: calc(100vh - 40px);
+  display: flex; flex-direction: column;
+  border: 1px solid var(--line, #35414c);
+  border-radius: 12px;
+  background: var(--panel, #161d24);
+  color: var(--text, #edf3f5);
+  box-shadow: 0 24px 60px rgba(0, 0, 0, .7);
+  font: 13px/1.5 Inter, "Segoe UI", system-ui, sans-serif;
+  overflow: hidden;
+}
+.hc-sheet *, .hc-sheet *::before, .hc-sheet *::after { box-sizing: border-box; }
+.hc-head {
+  flex: 0 0 auto;
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 11px 13px;
+  border-bottom: 1px solid var(--line, #35414c);
+  cursor: grab;
+  touch-action: none;
+}
+.hc-head b { font-size: 13px; color: var(--cyan, #65c7da); }
+.hc-x {
+  width: 30px; height: 30px; padding: 0; margin: 0;
+  border: 1px solid var(--line, #35414c); border-radius: 7px;
+  background: var(--panel-2, #222b35); color: var(--text, #edf3f5);
+  font: inherit; font-size: 16px; line-height: 1; cursor: pointer;
+}
+.hc-body {
+  flex: 1 1 auto; min-height: 0; overflow-y: auto;
+  padding: 12px 13px 14px;
+  display: flex; flex-direction: column; gap: 10px;
+}
+.hc-dim { margin: 0; color: var(--muted, #8fa0ad); font-size: 12px; }
+
+.hc-btn {
+  display: inline-flex; align-items: center; justify-content: center; gap: 7px;
+  height: 38px; min-height: 38px; padding: 0 14px; margin: 0;
+  border: 1px solid var(--line, #35414c); border-radius: 9px;
+  background: var(--panel-2, #222b35); color: var(--text, #edf3f5);
+  font: inherit; font-size: 12.5px; font-weight: 600; cursor: pointer;
+  white-space: nowrap;
+  -webkit-tap-highlight-color: transparent;
+}
+.hc-btn svg { width: 16px; height: 16px; fill: currentColor; flex: 0 0 auto; }
+.hc-btn:disabled { opacity: .55; cursor: default; }
+.hc-primary { background: var(--cyan, #65c7da); color: #05131a; border-color: var(--cyan, #65c7da); }
+.hc-wide { width: 100%; }
+
+/* THE EXPORT SHEET. "anywhere from the last five seconds to the last 20
+   minutes" - ten steps on one slider; the ticks past what the ring holds
+   are greyed, and the slider's end is pulled back to the last one it can
+   honour. */
+.hc-big {
+  font-size: 22px; font-weight: 700; letter-spacing: .01em;
+  color: var(--cyan, #65c7da); text-align: center; padding: 2px 0 0;
+  font-variant-numeric: tabular-nums;
+}
+.hc-range {
+  width: 100%; height: 34px; margin: 0;
+  accent-color: var(--cyan, #65c7da);
+  touch-action: pan-y;
+}
+.hc-ticks {
+  display: flex; justify-content: space-between;
+  font-size: 10px; color: var(--muted, #8fa0ad);
+  font-variant-numeric: tabular-nums;
+}
+.hc-ticks span { flex: 1 1 0; text-align: center; white-space: nowrap; }
+.hc-ticks span.at { color: var(--cyan, #65c7da); font-weight: 700; }
+.hc-ticks span.off { opacity: .35; text-decoration: line-through; }
+
+/* THE PREFERENCE SHEET. One row per corner. */
+.hc-row {
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  min-height: 38px; font-size: 12.5px;
+}
+.hc-master { font-weight: 600; }
+.hc-master input { width: 20px; height: 20px; margin: 0 8px 0 0; accent-color: var(--cyan, #65c7da); }
+.hc-corner { color: var(--muted, #8fa0ad); }
+.hc-pick {
+  flex: 0 1 62%; min-width: 0; height: 34px; padding: 0 8px; margin: 0;
+  border: 1px solid var(--line, #35414c); border-radius: 7px;
+  background: var(--panel-2, #222b35); color: var(--text, #edf3f5);
+  font: inherit; font-size: 12px; cursor: pointer;
+}
+.hc-pick:disabled { opacity: .5; cursor: default; }
+.hc-pick option { background: var(--panel-2, #222b35); color: var(--text, #edf3f5); }
+
+/* THE ANNOTATOR. Full screen: the picture is the canvas, the ink is red,
+   and the bar floats at the bottom. touch-action:none so the WebView never
+   turns a stroke into a scroll. */
+.hc-ink {
+  position: fixed; inset: 0;
+  z-index: 2147483034;
+  /* [#1221] The SHEET is not the picture any more. The picture is on
+     .hc-ink-plate, which can be pushed off the screen; the sheet itself has to
+     be see-through or a parked plate would leave a black screen to draw on. */
+  background: transparent;
+  touch-action: none;
+  overscroll-behavior: contain;
+}
+/* #1154: "it is a little laggy when I'm drawing the strokes."
+
+   The ink was never the cost - the stroke handler measures 0.055 ms a move
+   - but the panel underneath was still doing 60 ms of style, layout and
+   paint for every frame it produced, all of it into a screen this opaque
+   sheet completely covers. While the sheet is up that work is skipped, and
+   the tablet went from 3.9 fps to 11 fps (median frame gap 167 ms -> 86
+   ms), which is the pacer's own floor.
+
+   ONE CLASS, SET ON <html> BY hot-corners.js, so a single removal puts the
+   whole page back however the sheet went away - a per-element list left a
+   terminal dark once already. content-visibility, not display:none: layout
+   and scroll positions survive, so nothing jumps when it comes back.
+
+   The exceptions are the overlays that must still speak over a modal: the
+   annotator itself, its toast, the corner sheets, and the report pad that
+   filing opens. */
+html.hc-hushed body > *:not(.hc-ink):not(.hc-toast):not(.hc-sheet):not(#pineReportPad) {
+  content-visibility: hidden;
+}
+
+/* [#1221] THE PLATE - the picture, and the thing that leaves. It is opaque, so
+   with it home the sheet looks exactly as it always did. */
+.hc-ink-plate {
+  position: absolute; inset: 0; z-index: 0;
+  background: #000;
+  will-change: transform;
+}
+.hc-ink-pic { display: block; position: absolute; left: 0; top: 0; }
+
+/* THE INK. Above the plate, below the furniture, and it never moves. */
+.hc-ink-canvas {
+  display: block; position: absolute; left: 0; top: 0; z-index: 1;
+  touch-action: none;
+  cursor: crosshair;
+}
+
+/* [#1221] THE FURNITURE - the grab handle, the toolbar and the scrub strip.
+   It covers the sheet so the bar and the strip keep the offsets they were
+   measured at (#1148, #1155), but it lets pointers through everywhere it is
+   not actually drawing anything, or it would take the ink's strokes. */
+.hc-ink-chrome {
+  position: absolute; inset: 0; z-index: 2;
+  pointer-events: none;
+  will-change: transform;
+}
+.hc-ink-chrome > * { pointer-events: auto; }
+
+/* [#1221] A red edge while the capture is parked, so "the whole screen takes
+   ink" is something the screen says rather than something to remember. */
+.hc-ink.hc-slid::after {
+  content: ''; position: absolute; inset: 0; z-index: 3;
+  pointer-events: none;
+  box-shadow: inset 0 0 0 3px rgba(255, 40, 40, .5);
+}
+
+/* [#1221] THE GRAB HANDLE. A grip, a word and a button, across the top edge of
+   whichever window it belongs to. touch-action:none so the WebView gives us
+   the whole horizontal drag instead of turning it into a scroll. */
+.hc-grab {
+  display: flex; align-items: center; gap: 10px;
+  height: 34px; padding: 0 10px;
+  background: rgba(22, 29, 36, .96); color: var(--text, #edf3f5);
+  border-bottom: 1px solid var(--line, #35414c);
+  font: 12px/1.3 Inter, "Segoe UI", system-ui, sans-serif;
+  touch-action: none; cursor: grab;
+  -webkit-user-select: none; user-select: none;
+}
+.hc-grab:active { cursor: grabbing; }
+.hc-grab-grip {
+  flex: 0 0 auto; width: 26px; height: 12px;
+  background:
+    linear-gradient(var(--muted, #8fa0ad) 0 0) 0 2px / 26px 2px no-repeat,
+    linear-gradient(var(--muted, #8fa0ad) 0 0) 0 6px / 26px 2px no-repeat,
+    linear-gradient(var(--muted, #8fa0ad) 0 0) 0 10px / 26px 2px no-repeat;
+  opacity: .8; border-radius: 1px;
+}
+.hc-grab-word { flex: 1 1 auto; color: var(--muted, #8fa0ad); overflow: hidden;
+  white-space: nowrap; text-overflow: ellipsis; }
+.hc-grab-go { flex: 0 0 auto; height: 26px; min-height: 26px; padding: 0 10px;
+  touch-action: manipulation; }
+.hc-ink-chrome .hc-grab { position: absolute; left: 0; right: 0; top: 0; }
+.hc-video-editor .hc-grab { flex: 0 0 auto; }
+
+/* [#1221] THE TAB LEFT BEHIND. The only piece of a parked window still on
+   screen; its caret points the way the window will come back from. */
+.hc-slide-tab {
+  position: fixed; top: 50%; transform: translateY(-50%);
+  z-index: 2147483036;
+  padding: 4px;
+  background: rgba(22, 29, 36, .96);
+  border: 1px solid var(--line, #35414c);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, .6);
+}
+.hc-slide-tab.left { left: 0; border-left: 0; border-radius: 0 12px 12px 0; }
+.hc-slide-tab.right { right: 0; border-right: 0; border-radius: 12px 0 0 12px; }
+.hc-slide-tab-btn { height: 34px; min-height: 34px; padding: 0 10px;
+  touch-action: manipulation; }
+
+/* [#1221] THE FREE INK PAD behind the video editor. It sits one z below the
+   editor, so while the editor is home it is completely covered and takes no
+   pointers at all; parking the editor turns it on and the whole screen draws. */
+.hc-free-ink {
+  position: fixed; inset: 0; z-index: 2147483034;
+  display: block;
+  touch-action: none;
+  pointer-events: none;
+}
+.hc-free-ink.on { pointer-events: auto; cursor: crosshair;
+  box-shadow: inset 0 0 0 3px rgba(255, 40, 40, .5); }
+.hc-ink-bar {
+  position: absolute; left: 50%; bottom: 14px;
+  transform: translateX(-50%);
+  max-width: calc(100vw - 20px);
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap; justify-content: center;
+  padding: 8px 10px;
+  border: 1px solid var(--line, #35414c); border-radius: 12px;
+  background: rgba(22, 29, 36, .94); color: var(--text, #edf3f5);
+  box-shadow: 0 14px 40px rgba(0, 0, 0, .6);
+  font: 13px/1.4 Inter, "Segoe UI", system-ui, sans-serif;
+}
+.hc-ink-note { color: var(--muted, #8fa0ad); font-size: 12px; margin-right: 4px; }
+.hc-ink-bar .hc-btn { touch-action: manipulation; }
+
+/* THE SCRUB STRIP (#1148). "Whenever I access the screen capture to follow
+   report, I also want to be able to scrub between the last five seconds of
+   the broadcast to find the right frame."
+
+   It sits UNDER the ink toolbar, so the toolbar is lifted out of its way -
+   two heights, because the waiting line is one text row and the strip
+   proper is a row of thumbnails plus a slider. Where there is no ring
+   (the desk has no replayFrames) neither class is ever set and the toolbar
+   stays exactly where it has always been.
+
+   MEASURED ON THE TABLET, not guessed: the waiting line is 38 px tall and
+   the full strip 145 px, both sitting 14 px off the bottom. 172 cleared the
+   taller one with eight to spare; the first draft said 136 and the toolbar
+   sat ON TOP of the thumbnails.
+
+   #1155 ADDED TWO ROWS to the strip - the coarse slider that carries the
+   whole ring, and the line that says where the window sits - so the
+   toolbar is lifted again. RE-MEASURED ON THE TABLET, not guessed: the
+   strip is now 214 px tall and sits 14 px up, so its top edge is 228 px
+   off the bottom; 240 clears it with twelve to spare. 226 was the first
+   try and the toolbar overlapped the thumbnails by three pixels. */
+.hc-ink.hc-scrub-wait .hc-ink-bar { bottom: 62px; }
+.hc-ink.hc-scrub .hc-ink-bar { bottom: 240px; }
+
+.hc-strip {
+  position: absolute; left: 50%; bottom: 14px;
+  transform: translateX(-50%);
+  max-width: calc(100vw - 20px);
+  display: flex; flex-direction: column; gap: 6px;
+  padding: 8px 10px;
+  border: 1px solid var(--line, #35414c); border-radius: 12px;
+  background: rgba(22, 29, 36, .94); color: var(--text, #edf3f5);
+  box-shadow: 0 14px 40px rgba(0, 0, 0, .6);
+  font: 12px/1.35 Inter, "Segoe UI", system-ui, sans-serif;
+  touch-action: manipulation;
+}
+.hc-strip-line { color: var(--muted, #8fa0ad); font-size: 12px; padding: 2px 4px; }
+
+/* Oldest on the left, "now" on the right. It scrolls rather than shrinking
+   the pictures to nothing on a narrow screen. */
+.hc-strip-thumbs {
+  display: flex; align-items: flex-end; gap: 6px;
+  max-width: calc(100vw - 44px);
+  overflow-x: auto; overflow-y: hidden;
+  -webkit-overflow-scrolling: touch;
+  padding-bottom: 2px;
+}
+.hc-strip-thumb {
+  flex: 0 0 auto;
+  display: flex; flex-direction: column; align-items: center; gap: 2px;
+  padding: 3px; margin: 0;
+  border: 1px solid var(--line, #35414c); border-radius: 8px;
+  background: #0b1116; color: var(--muted, #8fa0ad);
+  font: inherit; font-size: 11px; cursor: pointer;
+  touch-action: manipulation;
+}
+.hc-strip-thumb img {
+  display: block; width: 92px; height: 56px;
+  object-fit: cover; border-radius: 5px; background: #000;
+}
+.hc-strip-thumb.on {
+  border-color: #65c7da;
+  color: var(--text, #edf3f5);
+  box-shadow: 0 0 0 1px #65c7da inset;
+}
+.hc-strip-at { line-height: 1.2; }
+.hc-strip-slider { width: 100%; margin: 0; touch-action: manipulation; }
+
+/* #1155 THE COARSE SLIDER - the whole recording range. "I would like to go
+   back the whole recording range."
+
+   direction: rtl so that hard RIGHT is now and dragging LEFT walks into the
+   past, the way a timeline reads everywhere else on the station, while the
+   value stays plain seconds-before-now and the script inverts nothing.
+
+   A taller thumb than the fine slider on purpose: this is the one a thumb
+   drags across twenty minutes of ring, and it wants to be found without
+   looking. The rule above it separates the two so they cannot be confused
+   for one control. */
+.hc-strip-far {
+  display: flex; align-items: center; gap: 8px;
+  padding-top: 6px;
+  border-top: 1px solid var(--line, #35414c);
+}
+.hc-strip-coarse {
+  flex: 1 1 auto; width: 100%; margin: 0;
+  direction: rtl;
+  height: 28px;
+  touch-action: manipulation;
+  accent-color: #65c7da;
+}
+
+@media (max-width: 620px) {
+  .hc-strip-thumb img { width: 64px; height: 40px; }
+  .hc-ink.hc-scrub .hc-ink-bar { bottom: 224px; }
+}
+
+/* THE TOAST. The same foot-of-screen line the line actions use. */
+.hc-toast {
+  position: fixed; left: 50%; bottom: 22px;
+  z-index: 2147483036;
+  transform: translate(-50%, 12px);
+  max-width: min(92vw, 640px);
+  padding: 9px 14px;
+  border: 1px solid var(--line, #35414c); border-radius: 10px;
+  background: var(--panel, #161d24); color: var(--text, #edf3f5);
+  box-shadow: 0 14px 40px rgba(0, 0, 0, .55);
+  font: 12.5px/1.45 Inter, "Segoe UI", system-ui, sans-serif;
+  opacity: 0; pointer-events: none;
+  transition: opacity .2s ease, transform .2s ease;
+  overflow-wrap: anywhere;
+}
+.hc-toast.up { opacity: 1; transform: translate(-50%, 0); }
+.hc-toast.bad { border-color: #a8563f; color: #ffcdbc; }
+
+/* A separate frame leaves the station player and script view mounted. */
+.hc-video-editor {
+  position: fixed; inset: 0; z-index: 2147483035;
+  display: flex; flex-direction: column; background: #111820;
+  color: #edf3f5; font: 14px/1.4 Inter, "Segoe UI", system-ui, sans-serif;
+  will-change: transform;                                        /* [#1221] */
+}
+.hc-video-editor-bar {
+  flex: 0 0 auto; display: flex; align-items: center;
+  justify-content: space-between; gap: 12px; padding: 6px 12px;
+  border-bottom: 1px solid #35414c;
+}
+.hc-video-editor-frame { flex: 1 1 auto; width: 100%; min-height: 0; border: 0; }
+
+@media (max-width: 520px) {
+  .hc-ticks span:nth-child(even) { visibility: hidden; }
+  .hc-ink-note { display: none; }
+  .hc-grab-word { display: none; }                               /* [#1221] */
+}

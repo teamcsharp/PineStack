@@ -1,0 +1,882 @@
+/* #1263 The SFX guy's television.
+ *
+ * A little set that pops up over whatever view is showing when a sting
+ * with a picture goes out, and comes on the way a CRT does: a dot, opened
+ * out into a line, the line pulled open into a picture. When the clip ends
+ * it goes back the other way - the picture collapses into a line, the line
+ * into a dot, and the dot fades.
+ *
+ * The animation is on the TUBE, an inner element, and never on the frame.
+ * The frame's left/top/width/height are the operator's saved preference;
+ * animating them would write an animation frame into that preference
+ * fifty times a second and fight a drag that was happening at the time.
+ */
+.sfx-tv {
+  position: fixed;
+  /* #1322: THE FALLBACK, NOT THE ANSWER. Both surfaces carry layers in
+     the 2147483000 band - the kiosk floats every injected view there,
+     and the shell has view-chrome, the hold sheets and a <webview> of
+     its own - so build() sets the real z-index inline (2147483020). 900
+     is what is left if an inline style is ever refused: over every
+     view, under a modal shade. */
+  z-index: 900;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  /* #1309b: the box IS the video - no frame, no bar, no padding. A
+     thin shadow only, so the picture has an edge against whatever is
+     behind it rather than a chrome of its own. */
+  background: #000;
+  border: 0;
+  border-radius: 8px;
+  box-shadow: 0 18px 54px rgba(0, 0, 0, .74);
+  cursor: grab;
+  max-width: calc(100vw - 8px);
+  max-height: calc(100vh - 8px);
+}
+
+.sfx-tv-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: none;
+  padding: 5px 6px 5px 10px;
+  background: rgba(18, 26, 38, .96);
+  border-bottom: 1px solid rgba(159, 216, 255, .2);
+  font-size: 12px;
+  font-weight: 600;
+  color: #cfe6f6;
+  cursor: grab;
+  user-select: none;
+  touch-action: none;           /* or the pointer drag becomes a scroll */
+}
+.sfx-tv-head:active { cursor: grabbing; }
+.sfx-tv-head > b {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 600;
+}
+.sfx-tv-head button {
+  flex: none;
+  padding: 1px 7px;
+  font-size: 12px;
+  line-height: 1.4;
+  color: #cfe6f6;
+  background: transparent;
+  border: 1px solid rgba(159, 216, 255, .28);
+  border-radius: 5px;
+  cursor: pointer;
+}
+.sfx-tv-head button:hover { background: rgba(159, 216, 255, .14); }
+
+.sfx-tv-screen {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  background: #000;
+}
+
+/* #1308b: the BOX exists before its decoder has a frame, but the empty
+   <video> never does. Chromium's stretched play badge cannot be styled;
+   PineWallTransition hides the element and the assembly canvas owns the
+   same rectangle until loadeddata/playing. */
+.sfx-tv.waiting .sfx-tv-tube { visibility: hidden; }
+.sfx-tv-assembly {
+  position: absolute; inset: 0; width: 100%; height: 100%; display: block;
+  z-index: 2; background: #05090d; pointer-events: none;
+}
+
+.sfx-tv-tube {
+  position: absolute;
+  inset: 0;
+  background: #000;
+  transform-origin: 50% 50%;
+  will-change: transform, filter, opacity;
+  /* [#1386] THE PICTURE IS THE FLOOR OF THIS BOX, SAID EXPLICITLY.
+     `will-change: transform` promotes this to its own compositor layer,
+     and on the tablet's WebView a promoted layer holding a <video> is
+     handed to a hardware overlay plane that draws OVER ordinary web
+     content whatever its z-index says. So the hold sheet - z-index 6,
+     correct on the desktop - came up BEHIND the picture on the glass and
+     none of its options could be tapped. An explicit 0 puts the tube at
+     the bottom of the frame's own stacking order; the promotions below
+     are what actually win the argument on Android. */
+  z-index: 0;
+}
+.sfx-tv-tube video {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  background: #000;
+}
+
+/* The scan lines, the glow and the white pop are what make it read as a
+   tube rather than a <video> in a box. All three are inert to the
+   pointer, so the frame underneath still takes every drag. */
+.sfx-tv-glass {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  opacity: .5;
+  background: repeating-linear-gradient(to bottom,
+    rgba(0, 0, 0, 0) 0px, rgba(0, 0, 0, 0) 2px,
+    rgba(0, 0, 0, .34) 2px, rgba(0, 0, 0, .34) 3px);
+}
+.sfx-tv-vignette {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background: radial-gradient(ellipse at 50% 46%,
+    rgba(255, 255, 255, .07) 0%, rgba(0, 0, 0, 0) 52%, rgba(0, 0, 0, .6) 100%);
+}
+.sfx-tv-flash {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background: #fff;
+  opacity: 0;
+}
+
+/* #1306b: the pad icon, over the top right of the picture. */
+/* [#1386b] THE SURFACE COMES DOWN WHILE THE OPTIONS ARE UP.
+ *
+ * "whenever I tap on a video the UI for the video pops up behind the
+ * video. So I'm not able to tap anything to make any choices."
+ *
+ * Measured on the glass: `dumpsys activity top` shows an
+ * android.view.SurfaceView as a CHILD of the WebView. Android promotes a
+ * playing <video> to a hardware overlay plane, and that plane is
+ * composited above ALL web content - every z-index, every promoted layer,
+ * the lot. The z-order work below is correct and cannot win against it,
+ * because the argument is not happening in the web layer at all.
+ *
+ * `visibility: hidden` on the element is what actually retires the
+ * surface. The tube keeps its geometry, so the sheet still has a black
+ * ground under it and the frame does not resize; only the overlay plane
+ * goes, and the options become visible and tappable. It comes straight
+ * back when the sheet closes.
+ */
+.sfx-tv.sfx-tv-sheetup .sfx-tv-tube video { visibility: hidden; }
+.sfx-tv.sfx-tv-sheetup .sfx-tv-tube { background: #000; }
+
+/* [#1386b] FULL SCREEN, because they are video options and one of them
+   should be "make it big". Fixed rather than the Fullscreen API: this
+   WebView is already a kiosk filling the glass, and requestFullscreen on
+   a promoted <video> hands the picture back to the very overlay plane
+   this file spends its time getting out from under. */
+.sfx-tv.sfx-tv-full {
+  left: 0 !important;
+  top: 0 !important;
+  right: 0 !important;
+  bottom: 0 !important;
+  width: 100% !important;
+  height: 100% !important;
+  border-radius: 0;
+}
+
+/* [#1386] Every control that sits OVER the picture needs its own layer
+   for the same reason the sheet does - see the note on .sfx-tv-tube. */
+.sfx-tv-pad,
+.sfx-tv-time,
+.sfx-tv-time-clock {
+  transform: translateZ(0);
+}
+
+.sfx-tv-pad {
+  position: absolute;
+  top: 8px; right: 8px;
+  z-index: 4;
+  width: 26px; height: 26px;
+  display: inline-flex; align-items: center; justify-content: center;
+  border: 1px solid rgba(159, 216, 255, .35);
+  border-radius: 6px;
+  background: rgba(8, 14, 20, .62);
+  color: #cfe8f5;
+  cursor: pointer;
+  font-size: 13px;
+  line-height: 1;
+  padding: 0;
+}
+.sfx-tv-pad .pi-icon { width: 15px; height: 15px; }
+.sfx-tv-pad:hover { background: rgba(159, 216, 255, .2); }
+
+/* [#1219] THE TIMELINE ALONG THE BOTTOM EDGE OF THE PICTURE. A 4px band
+   and a small clock in the corner, over the glass and the vignette and
+   under the pad icon; inert to the pointer so the drag and the taps on
+   the picture are untouched. The panel's own tube (app.py, djTvShow)
+   carries the same rules. The clock sits 22px in so it clears the 18px
+   resize grip, which shares this corner. */
+.sfx-tv-time {
+  position: absolute; left: 0; right: 0; bottom: 0; height: 4px; z-index: 4;
+  pointer-events: none;
+  /* NOT overflow:hidden - .sfx-tv-time-clock is a child of this 4px
+     band and sits above it, over the picture. */
+  background: rgba(255, 255, 255, .14);
+}
+.sfx-tv-time-fill {
+  position: absolute; left: 0; top: 0; bottom: 0; width: 0;
+  background: #65c7da;
+  box-shadow: 0 0 6px rgba(101, 199, 218, .6);
+}
+.sfx-tv-time-clock {
+  position: absolute; right: 22px; bottom: 6px; z-index: 4;
+  pointer-events: none;
+  font-weight: 600; font-size: 10px; line-height: 1; letter-spacing: .04em;
+  color: #dfe7ee; text-shadow: 0 1px 2px #000, 0 0 4px #000;
+  font-variant-numeric: tabular-nums;
+}
+.sfx-tv-time-clock:empty { display: none; }
+.sfx-tv-pad.said::after {
+  content: attr(data-say);
+  position: absolute;
+  top: 30px; right: 0;
+  white-space: nowrap;
+  font-size: 10px;
+  letter-spacing: .04em;
+  color: #cfe8f5;
+  background: rgba(8, 14, 20, .88);
+  border: 1px solid rgba(159, 216, 255, .3);
+  border-radius: 5px;
+  padding: 3px 6px;
+}
+
+/* #1306b: the hold sheet - inspect, weigh, pad, delete. */
+.sfx-tv-ask {
+  position: fixed;
+  z-index: 2147483052;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  width: min(620px, calc(100vw - 24px));
+  max-height: calc(100vh - 24px);
+  overflow: auto;
+  box-sizing: border-box;
+  padding: 14px;
+  border: 1px solid #314252;
+  border-radius: 8px;
+  background: #0b1117;
+  color: #dfe7ee;
+  box-shadow: 0 18px 55px rgba(0, 0, 0, .65);
+  font: 13px/1.4 system-ui, sans-serif;
+}
+.sfx-tv-ask-title { margin-bottom: 7px; font-size: 15px; font-weight: 750; }
+.sfx-tv-ask-summary {
+  margin-bottom: 10px;
+  color: #9eabb6;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+.sfx-tv-ask-list { display: grid; gap: 7px; }
+.sfx-tv-ask-list > button {
+  display: grid;
+  grid-template-columns: 34px minmax(0, 1fr);
+  gap: 10px;
+  align-items: center;
+  min-width: 0;
+  min-height: 58px;
+  padding: 8px 10px;
+  border: 1px solid #314252;
+  border-radius: 7px;
+  background: #17212b;
+  color: #dfe7ee;
+  text-align: left;
+  cursor: pointer;
+}
+.sfx-tv-ask-list > button:hover { background: #20303d; border-color: #65c7da; }
+.sfx-tv-ask-icon { display: grid; place-items: center; width: 30px; height: 30px; }
+.sfx-tv-ask-icon .pi-icon { width: 22px; height: 22px; }
+.sfx-tv-ask-words { min-width: 0; }
+.sfx-tv-ask-words b, .sfx-tv-ask-words small { display: block; white-space: normal; }
+.sfx-tv-ask-words b { font-size: 13px; }
+.sfx-tv-ask-words small { margin-top: 2px; color: #9eabb6; font-size: 11px; }
+.sfx-tv-ask-close {
+  width: 100%; min-height: 38px; margin-top: 8px; border: 1px solid #314252;
+  border-radius: 6px; background: transparent; color: #b8c4ce; cursor: pointer;
+}
+
+.sfx-tv-radial-shade {
+  position: fixed;
+  z-index: 2147483053;
+  inset: 0;
+  background: rgba(2, 6, 10, .42);
+  touch-action: none;
+}
+.sfx-tv-radial {
+  position: absolute;
+  width: 248px;
+  height: 248px;
+  transform: translate(-50%, -50%);
+  border: 1px solid rgba(101, 199, 218, .34);
+  border-radius: 50%;
+  background: rgba(11, 17, 23, .82);
+  box-shadow: inset 0 0 0 72px rgba(11, 17, 23, .35), 0 18px 60px rgba(0, 0, 0, .68);
+  font: 12px/1.3 system-ui, sans-serif;
+}
+.sfx-tv-radial-item {
+  position: absolute;
+  display: grid;
+  place-items: center;
+  width: 54px;
+  height: 54px;
+  padding: 0;
+  border: 1px solid #426174;
+  border-radius: 50%;
+  background: #17212b;
+  color: #e5f3f7;
+  box-shadow: 0 7px 20px rgba(0, 0, 0, .45);
+  cursor: pointer;
+  touch-action: manipulation;
+}
+.sfx-tv-radial-item:hover, .sfx-tv-radial-item:focus-visible {
+  border-color: #65c7da;
+  background: #20303d;
+  outline: none;
+}
+.sfx-tv-radial-item .pi-icon { width: 24px; height: 24px; }
+.sfx-tv-radial-item.sampler { left: 50%; top: 4px; transform: translateX(-50%); }
+.sfx-tv-radial-item.parody { right: 13px; top: 41px; }
+.sfx-tv-radial-item.examine { right: 13px; bottom: 34px; }
+.sfx-tv-radial-item.favorite { left: 50%; bottom: 2px; transform: translateX(-50%); }
+.sfx-tv-radial-item.replay { left: 13px; bottom: 34px; }
+.sfx-tv-radial-item.delete {
+  left: 19px;
+  top: 47px;
+  width: 42px;
+  height: 42px;
+  border-color: #85483f;
+  color: #efb6ad;
+}
+.sfx-tv-radial-item.delete .pi-icon { width: 18px; height: 18px; }
+.sfx-tv-radial-note {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 108px;
+  max-height: 50px;
+  transform: translate(-50%, -50%);
+  overflow: hidden;
+  color: #b8c8d2;
+  text-align: center;
+  overflow-wrap: anywhere;
+}
+.sfx-tv-delete-shade {
+  position: fixed;
+  z-index: 2147483054;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  box-sizing: border-box;
+  padding: 16px;
+  background: rgba(2, 6, 10, .86);
+}
+.sfx-tv-delete-confirm {
+  width: min(760px, 100%);
+  max-height: calc(100vh - 32px);
+  overflow-x: hidden;
+  overflow-y: auto;
+  box-sizing: border-box;
+  padding: 14px;
+  border: 1px solid #714039;
+  border-radius: 8px;
+  background: #0b1117;
+  color: #dfe7ee;
+  box-shadow: 0 20px 70px rgba(0, 0, 0, .72);
+  font: 13px/1.4 system-ui, sans-serif;
+}
+.sfx-tv-delete-confirm > b { display: block; margin-bottom: 10px; font-size: 15px; }
+.sfx-tv-delete-stage {
+  position: relative;
+  width: 100%;
+  max-height: 58vh;
+  aspect-ratio: 16 / 9;
+  overflow: hidden;
+  border: 1px solid #273746;
+  border-radius: 6px;
+  background: #05090d;
+}
+.sfx-tv-delete-stage > video {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  background: #05090d;
+  touch-action: pan-y;
+}
+.sfx-tv-delete-help { margin-top: 7px; color: #9eabb6; }
+
+.sfx-tv-parody-shade {
+  position: fixed;
+  z-index: 2147483054;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  box-sizing: border-box;
+  padding: 16px;
+  background: rgba(2, 6, 10, .84);
+}
+.sfx-tv-parody {
+  width: min(820px, 100%);
+  max-height: calc(100vh - 88px);
+  max-height: calc(100dvh - 88px);
+  overflow-x: hidden;
+  overflow-y: auto;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  align-content: start;
+  box-sizing: border-box;
+  padding: 14px;
+  border: 1px solid #314252;
+  border-radius: 8px;
+  background: #0b1117;
+  color: #dfe7ee;
+  box-shadow: 0 20px 70px rgba(0, 0, 0, .72);
+  font: 13px/1.4 system-ui, sans-serif;
+}
+.sfx-tv-parody > header {
+  display: flex; align-items: center; gap: 10px; margin-bottom: 10px;
+}
+.sfx-tv-parody > header > b { flex: 1; min-width: 0; font-size: 15px; }
+.sfx-tv-parody button {
+  min-height: 36px; padding: 6px 11px; border: 1px solid #314252;
+  border-radius: 6px; background: #17212b; color: #dfe7ee; cursor: pointer;
+}
+.sfx-tv-parody button:hover { background: #20303d; border-color: #65c7da; }
+.sfx-tv-parody button:disabled { cursor: default; opacity: .45; }
+.sfx-tv-parody button.primary { background: #39798a; border-color: #65c7da; color: #fff; }
+.sfx-tv-parody button.bad { border-color: #8f493f; color: #efb6ad; }
+.sfx-tv-parody-stage {
+  position: relative; width: 100%; height: clamp(170px, 30vh, 310px);
+  height: clamp(170px, 30dvh, 310px); overflow: hidden;
+  border: 1px solid #273746; border-radius: 6px; background: #05090d;
+}
+.sfx-tv-parody-stage > video, .sfx-tv-result > video {
+  display: block; width: 100%; height: 100%; object-fit: contain; background: #05090d;
+}
+.sfx-tv-parody-stage.is-loading > video { visibility: hidden !important; }
+.sfx-tv-result > video { max-height: 56vh; aspect-ratio: 16 / 9; border-radius: 6px; }
+.sfx-tv-parody-nav {
+  display: grid; grid-template-columns: auto minmax(0, 1fr) auto;
+  gap: 8px; align-items: center; margin-top: 8px;
+}
+.sfx-tv-parody-nav > span {
+  min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  text-align: center; color: #aebbc5;
+}
+.sfx-tv-parody-trim { display: grid; gap: 5px; margin-top: 10px; }
+.sfx-tv-parody-trim[hidden] { display: none; }
+.sfx-tv-parody-trim-row {
+  display: grid; grid-template-columns: 24px minmax(0, 1fr) 48px;
+  align-items: center; gap: 9px; color: #b4c5cf; font-size: 11px;
+}
+.sfx-tv-parody-trim-row input[type=range] {
+  width: 100%; min-width: 0; margin: 0; accent-color: #6cc6d4;
+}
+.sfx-tv-parody-trim-row output { text-align: right; font-variant-numeric: tabular-nums; }
+.sfx-tv-parody-trim-span { text-align: right; color: #9eabb6; font-size: 10px; }
+.sfx-tv-parody > textarea {
+  display: block; width: 100%; min-width: 0; min-height: 72px; max-height: 18vh; box-sizing: border-box;
+  margin-top: 10px; padding: 9px; resize: vertical; border: 1px solid #314252;
+  border-radius: 6px; background: #080e13; color: #e4edf3; font: inherit;
+}
+.sfx-tv-parody-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 9px; align-items: center; }
+.sfx-tv-parody-mic { width: 42px; padding: 0 !important; display: grid; place-items: center; }
+.sfx-tv-parody-mic .pi-icon, .sfx-tv-parody-button .pi-icon { width: 18px; height: 18px; }
+.sfx-tv-parody-mic.listening { background: #7f3030; border-color: #ef7777; }
+.sfx-tv-parody-mic.processing { background: #74541f; border-color: #d9ae55; }
+.sfx-tv-parody-listening {
+  flex: 1 1 260px; min-width: 0; display: flex; align-items: center; gap: 8px;
+  min-height: 36px; box-sizing: border-box; padding: 6px 9px;
+  border: 1px solid #8d4545; border-radius: 6px;
+  background: #261416; color: #ffd7d2; overflow-wrap: anywhere;
+}
+.sfx-tv-parody-listening[hidden] { display: none; }
+.sfx-tv-parody-listening > i {
+  flex: 0 0 auto; width: 10px; height: 10px; border-radius: 50%;
+  background: #ff7777; box-shadow: 0 0 0 0 rgba(255, 119, 119, .6);
+  animation: sfx-tv-listening-pulse 1.15s ease-out infinite;
+}
+.sfx-tv-parody-listening.processing { border-color: #80652f; background: #211b10; color: #f2deb0; }
+.sfx-tv-parody-listening.processing > i { background: #d9ae55; }
+.sfx-tv-parody.is-dictating { border-color: #8d4545; }
+@keyframes sfx-tv-listening-pulse {
+  0% { box-shadow: 0 0 0 0 rgba(255, 119, 119, .55); }
+  75%, 100% { box-shadow: 0 0 0 9px rgba(255, 119, 119, 0); }
+}
+.sfx-tv-parody-status { margin-top: 9px; color: #9eabb6; white-space: normal; overflow-wrap: anywhere; }
+.sfx-tv-parody-queue {
+  display: grid; gap: 6px; margin-top: 12px; padding-top: 10px;
+  border-top: 1px solid #314252; font-size: 11px;
+}
+.sfx-tv-parody-queue > b { font-size: 12px; }
+.sfx-tv-parody-queue-current { color: #dfe7ee; font-variant-numeric: tabular-nums; }
+.sfx-tv-parody-queue-cause { color: #c4d1d8; overflow-wrap: anywhere; }
+.sfx-tv-parody-queue-actions { display: flex; flex-wrap: wrap; gap: 7px; }
+.sfx-tv-parody-queue-actions[hidden] { display: none; }
+.sfx-tv-parody-queue-actions > button { min-height: 30px; font-size: 11px; }
+.sfx-tv-parody-queue-history > summary { cursor: pointer; color: #9eabb6; }
+.sfx-tv-parody-queue-history > div { display: grid; gap: 6px; margin-top: 7px; }
+.sfx-tv-parody-queue-row {
+  display: grid; gap: 2px; padding: 6px 0; border-top: 1px solid #273746;
+  min-width: 0; overflow-wrap: anywhere;
+}
+.sfx-tv-parody-queue-row > b { font-weight: 600; }
+.sfx-tv-parody-queue-row > span { color: #9eabb6; }
+.sfx-tv-render-toast {
+  position: fixed; z-index: 2147483055; right: 14px; top: 14px;
+  display: grid; grid-template-columns: 72px minmax(0, 1fr); gap: 10px;
+  align-items: center; width: min(390px, calc(100vw - 28px)); min-height: 76px;
+  padding: 7px; border: 1px solid #65c7da; border-radius: 8px;
+  background: #0b1117; color: #dfe7ee; text-align: left; cursor: pointer;
+  box-shadow: 0 16px 45px rgba(0, 0, 0, .65);
+}
+.sfx-tv-render-thumb { width: 72px; height: 58px; object-fit: cover; border-radius: 5px; background: #05090d; }
+.sfx-tv-render-toast span, .sfx-tv-render-toast b, .sfx-tv-render-toast small { min-width: 0; display: block; }
+.sfx-tv-render-toast small { margin-top: 3px; color: #9eabb6; overflow: hidden; text-overflow: ellipsis; }
+
+@media (max-width: 540px) {
+  .sfx-tv-radial { width: 224px; height: 224px; }
+  .sfx-tv-radial-item { width: 50px; height: 50px; }
+  .sfx-tv-radial-item.delete { width: 40px; height: 40px; }
+  .sfx-tv-delete-shade { padding: 8px; }
+  .sfx-tv-delete-confirm { max-height: calc(100vh - 16px); padding: 10px; }
+  .sfx-tv-parody-shade { padding: 8px; }
+  .sfx-tv-parody { max-height: calc(100vh - 64px); max-height: calc(100dvh - 64px); padding: 10px; }
+  .sfx-tv-parody-stage { height: clamp(150px, 25dvh, 240px); }
+  .sfx-tv-parody-nav { grid-template-columns: 1fr 1fr; }
+  .sfx-tv-parody-nav > span { grid-column: 1 / -1; grid-row: 1; }
+  .sfx-tv-parody-nav > button:first-child { grid-column: 1; grid-row: 2; }
+  .sfx-tv-parody-nav > button:last-child { grid-column: 2; grid-row: 2; }
+}
+
+.sfx-tv-sheet {
+  position: absolute;
+  left: 8px; right: 8px; bottom: 8px;
+  z-index: 6;
+  /* [#1386] ...and a compositor layer of its own, so it is composited
+     ABOVE the video's overlay plane rather than under it. z-index alone
+     does not settle this against a hardware video surface; a promoted
+     layer does. */
+  transform: translateZ(0);
+  will-change: transform;
+  padding: 9px 10px;
+  border-radius: 8px;
+  border: 1px solid rgba(159, 216, 255, .34);
+  background: rgba(8, 14, 20, .93);
+  color: #dcecf6;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, .55);
+  /* [#1256] It used to be laid out from the bottom up with no ceiling, so
+     once it held more than the frame is tall it grew straight out of the
+     top and took the strip and the glue rails' heads with it. */
+  max-height: calc(100% - 16px);
+  display: flex;
+  flex-direction: column;
+}
+
+/* [#1256] The only part that scrolls. `min-height: 0` is load-bearing: a
+   flex child will not shrink below its content without it, and a capped
+   column whose child refuses to shrink overflows exactly as before. */
+.sfx-tv-sheetbody {
+  min-height: 0;
+  flex: 1 1 auto;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(159, 216, 255, .32) transparent;
+}
+.sfx-tv-sheetbody::-webkit-scrollbar { width: 5px; }
+.sfx-tv-sheetbody::-webkit-scrollbar-track { background: transparent; }
+.sfx-tv-sheetbody::-webkit-scrollbar-thumb {
+  background: rgba(159, 216, 255, .32);
+  border-radius: 3px;
+}
+
+/* [#1256] A step down, applied when the sheet measured itself against its
+   own frame and did not fit. Smaller beats scrolling; scrolling is only
+   the guarantee underneath it. */
+.sfx-tv-sheet.sfx-tv-tight { padding: 6px 7px; }
+/* [#1256b] `> b` matched nothing once #1256 moved the name into the body. */
+.sfx-tv-sheet.sfx-tv-tight > b,
+.sfx-tv-sheet.sfx-tv-tight > .sfx-tv-sheetbody > b {
+  font-size: 10px; margin-bottom: 4px;
+}
+/* [#1256b] The strip is the tallest thing in the sheet and the tight step
+   did not reach it. `stripTile` sets these inline, so a class rule needs
+   !important to win - there is no lower-specificity road to an inline
+   declaration. Tiles stay square-ish and tappable, just smaller. */
+.sfx-tv-sheet.sfx-tv-tight .sfx-tv-strip { margin-bottom: 4px !important; }
+.sfx-tv-sheet.sfx-tv-tight .sfx-tv-tile { width: 58px !important; }
+.sfx-tv-sheet.sfx-tv-tight .sfx-tv-shot { height: 30px !important; }
+.sfx-tv-sheet.sfx-tv-tight .sfx-tv-note { font-size: 9.5px; min-height: 11px; }
+.sfx-tv-sheet.sfx-tv-tight .sfx-tv-sheetrow { gap: 4px; margin-bottom: 4px; }
+.sfx-tv-sheet.sfx-tv-tight button { font-size: 10px; padding: 3px 4px; }
+.sfx-tv-sheet.sfx-tv-tight.sfx-tv-hasglue {
+  padding-left: 32px; padding-right: 32px;
+}
+.sfx-tv-sheet.sfx-tv-tight .sfx-tv-glue { width: 26px; }
+
+/* [#1256] When even the tight step needs the scroll, say so at the edge
+   rather than leaving it to be discovered by a thumb. */
+.sfx-tv-sheet.sfx-tv-scrolls .sfx-tv-sheetbody {
+  -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 10px,
+                      #000 calc(100% - 10px), transparent 100%);
+          mask-image: linear-gradient(to bottom, transparent 0, #000 10px,
+                      #000 calc(100% - 10px), transparent 100%);
+}
+/* [#1256b] Both, because #1256 put the name one level down inside the
+   scrolling body and this rule carries the ellipsis that keeps a long
+   clip name on ONE line. Without it the sheet grows instead of shrinks. */
+.sfx-tv-sheet > b,
+.sfx-tv-sheet > .sfx-tv-sheetbody > b {
+  display: block;
+  font-size: 11px;
+  letter-spacing: .06em;
+  margin-bottom: 7px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.sfx-tv-sheetrow { display: flex; gap: 6px; margin-bottom: 6px; }
+.sfx-tv-sheet button {
+  flex: 1 1 auto;
+  font: inherit;
+  font-size: 11px;
+  padding: 5px 6px;
+  border-radius: 6px;
+  border: 1px solid rgba(159, 216, 255, .3);
+  background: rgba(159, 216, 255, .08);
+  color: #dcecf6;
+  cursor: pointer;
+}
+.sfx-tv-sheet button:hover { background: rgba(159, 216, 255, .18); }
+.sfx-tv-sheet button.sfx-tv-full-toggle {
+  min-height: 42px;
+  font-size: 13px;
+  border-color: rgba(101, 199, 218, .62);
+  background: rgba(101, 199, 218, .14);
+}
+.sfx-tv-sheet button.bad { border-color: rgba(216, 107, 87, .55); color: #e9b5aa; }
+.sfx-tv-sheet button.quiet { flex: 0 0 auto; opacity: .75; }
+.sfx-tv-sheet .sfx-tv-sheet-close button.quiet { flex: 1 1 0; min-width: 0; }
+.sfx-tv-note {
+  display: block;
+  font-size: 10.5px;
+  font-style: normal;
+  opacity: .8;
+  min-height: 13px;
+}
+
+.sfx-tv-grip {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  width: 18px;
+  height: 18px;
+  z-index: 6;
+  cursor: nwse-resize;
+  touch-action: none;
+  background: linear-gradient(135deg, transparent 50%,
+    rgba(159, 216, 255, .5) 50%, rgba(159, 216, 255, .5) 60%, transparent 60%,
+    transparent 74%, rgba(159, 216, 255, .5) 74%, rgba(159, 216, 255, .5) 84%,
+    transparent 84%);
+}
+
+/* on: dot -> line -> picture.  off: picture -> line -> dot. */
+@keyframes sfxTvOn {
+  0%   { transform: scale(.004, .004); filter: brightness(4); opacity: 1; }
+  34%  { transform: scale(1, .006);    filter: brightness(3.4); opacity: 1; }
+  58%  { transform: scale(1, .06);     filter: brightness(2); opacity: 1; }
+  100% { transform: scale(1, 1);       filter: brightness(1); opacity: 1; }
+}
+@keyframes sfxTvOff {
+  0%   { transform: scale(1, 1);       filter: brightness(1); opacity: 1; }
+  40%  { transform: scale(1, .014);    filter: brightness(3.2); opacity: 1; }
+  62%  { transform: scale(1, .006);    filter: brightness(5); opacity: 1; }
+  100% { transform: scale(.004, .004); filter: brightness(7); opacity: 0; }
+}
+@keyframes sfxTvFlash { 0% { opacity: .8; } 100% { opacity: 0; } }
+
+.sfx-tv-tube.on  { animation: sfxTvOn .42s cubic-bezier(.18, .9, .3, 1) both; }
+.sfx-tv-tube.off { animation: sfxTvOff .46s cubic-bezier(.7, 0, .9, .35) both; }
+.sfx-tv-flash.pop { animation: sfxTvFlash .3s ease-out both; }
+
+@media (prefers-reduced-motion: reduce) {
+  .sfx-tv-tube.on, .sfx-tv-tube.off, .sfx-tv-flash.pop { animation: none; }
+  .sfx-tv-tube.off { opacity: 0; }
+}
+
+
+/* #1309b: nothing but the picture. The head is no longer built at all;
+   this keeps any older markup from reserving space for it. */
+.sfx-tv-head { display: none !important; }
+.sfx-tv:active { cursor: grabbing; }
+.sfx-tv-screen { flex: 1 1 auto; }
+
+
+/* #1200: the strip pages backwards through the station's own history.
+
+   "I wanna be able to scroll backwards in the history and just keep
+    loading more and more of the history."
+
+   touch-action is the whole of the TOUCH gesture on the tablet, which has
+   no wheel: a sideways drag along the strip is handed to the WebView's own
+   scroller, with its own momentum, so there is no touch code to go wrong
+   and the drag can never become the sheet's vertical scroll or a drag of
+   the floating set. overscroll-behavior stops a flick that reaches either
+   end from being passed on to the page underneath - the wheel handler
+   preventDefaults for the same reason, and both roads need saying because
+   only one of them is JavaScript. */
+.sfx-tv-strip {
+  touch-action: pan-x;
+  overscroll-behavior-x: contain;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(159, 216, 255, .32) transparent;
+}
+.sfx-tv-strip::-webkit-scrollbar { height: 5px; }
+.sfx-tv-strip::-webkit-scrollbar-track { background: transparent; }
+.sfx-tv-strip::-webkit-scrollbar-thumb {
+  background: rgba(159, 216, 255, .32);
+  border-radius: 3px;
+}
+
+/* A tile out of the ledger, a shade quieter than the cycle's own. */
+.sfx-tv-tile.sfx-tv-hist { opacity: .9; }
+
+/* The note at the old end, and the seam the ceiling cut. Three states have
+   to be told apart at a glance - loading, the end of the ledger, and a page
+   that FAILED - so the note carries a Carbon icon that changes with them
+   (hourglass, checkmark, warning) and never an emoji. */
+.sfx-tv-oldend,
+.sfx-tv-seam {
+  flex: 0 0 auto;
+  width: 66px;
+  min-height: 57px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+  padding: 0 4px;
+  border-radius: 6px;
+  border: 1px dashed rgba(159, 216, 255, .28);
+  background: rgba(159, 216, 255, .04);
+  color: #b9d3e4;
+  font: inherit;
+  font-size: 8.5px;
+  line-height: 11px;
+  text-align: center;
+}
+.sfx-tv-oldend { cursor: pointer; }
+.sfx-tv-oldend:hover { background: rgba(101, 199, 218, .12); border-style: solid; }
+.sfx-tv-seam {
+  border-style: solid;
+  border-color: rgba(216, 168, 87, .5);
+  color: #e8cfa6;
+  cursor: pointer;
+}
+.sfx-tv-seam:hover { background: rgba(216, 168, 87, .12); }
+.sfx-tv-oldend .pi-icon,
+.sfx-tv-seam .pi-icon { width: 14px; height: 14px; }
+.sfx-tv-oldword {
+  font-style: normal;
+  display: block;
+  overflow: hidden;
+}
+
+/* ---- [#1243] the two glue rails on the sheet's edges ---------------- */
+.sfx-tv-sheet.sfx-tv-hasglue { padding-left: 38px; padding-right: 38px; }
+.sfx-tv-sheet .sfx-tv-glue {
+  position: absolute;
+  top: 6px;
+  bottom: 6px;
+  width: 30px;
+  flex: none;                 /* the sheet's own button rule is flex: 1 1 auto */
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  padding: 4px 2px;
+  margin: 0;
+  border-radius: 7px;
+  border: 1px solid rgba(159, 216, 255, .34);
+  background: rgba(101, 199, 218, .12);
+  color: #bfe6f2;
+  cursor: pointer;
+  overflow: hidden;
+}
+.sfx-tv-sheet .sfx-tv-glue-prev { left: 4px; }
+.sfx-tv-sheet .sfx-tv-glue-next { right: 4px; }
+.sfx-tv-sheet .sfx-tv-glue:hover { background: rgba(101, 199, 218, .24); }
+.sfx-tv-sheet .sfx-tv-glue > i {
+  font-style: normal;
+  font-size: 9px;
+  letter-spacing: .14em;
+  line-height: 10px;
+  writing-mode: vertical-rl;
+  text-orientation: mixed;
+  white-space: nowrap;
+  overflow: hidden;
+}
+.sfx-tv-sheet .sfx-tv-glue .pi-icon { width: 14px; height: 14px; flex: none; }
+/* Nothing next door. Not `disabled` - a disabled button on a touch screen
+   swallows the tap and its own title with it, and the reason never
+   reaches anybody. It stays tappable and says why. */
+.sfx-tv-sheet .sfx-tv-glue.off {
+  opacity: .45;
+  border-color: rgba(159, 216, 255, .18);
+  background: rgba(159, 216, 255, .05);
+  cursor: help;
+}
+.sfx-tv-sheet .sfx-tv-glue.working {
+  border-color: rgba(101, 199, 218, .8);
+  background: rgba(101, 199, 218, .3);
+  cursor: progress;
+}
+
+/* ---- [#1223] the clip editor, over the set ------------------------- */
+.sfx-tv-editor {
+  position: fixed;
+  left: 0; top: 0; right: 0; bottom: 0;
+  z-index: 2147483047;        /* one above the clip sheet that opened it */
+  display: flex;
+  flex-direction: column;
+  background: rgba(4, 7, 10, .97);
+}
+.sfx-tv-editorbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 10px;
+  border-bottom: 1px solid rgba(159, 216, 255, .22);
+  color: #dcecf6;
+  font-size: 12px;
+}
+.sfx-tv-editorbar > b {
+  flex: 1 1 auto;
+  font-weight: 600;
+  letter-spacing: .04em;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.sfx-tv-editorbar > button {
+  flex: 0 0 auto;
+  font: inherit;
+  font-size: 11px;
+  padding: 5px 10px;
+  border-radius: 6px;
+  border: 1px solid rgba(159, 216, 255, .3);
+  background: rgba(159, 216, 255, .08);
+  color: #dcecf6;
+  cursor: pointer;
+}
+.sfx-tv-editorbar > button:hover { background: rgba(159, 216, 255, .18); }
+.sfx-tv-editorframe {
+  flex: 1 1 auto;
+  width: 100%;
+  border: 0;
+  background: #05080b;
+}
