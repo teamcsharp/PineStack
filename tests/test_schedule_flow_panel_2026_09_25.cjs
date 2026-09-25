@@ -12,9 +12,18 @@ test('segment flow editor is duration-aware and has all requested beat types', (
   assert.match(js, /function itineraryFlowOpen/);
   assert.match(js, /\/api\/schedule\/flow\/suggest/);
   assert.match(js, /\/api\/schedule\/flow\/slot/);
+  assert.match(js, /\/api\/schedule\/flow\/library/);
   assert.match(js, /sp-flow-timing/);
+  assert.match(js, /sp-flow-library/);
+  assert.match(js, /sp-itin-graph/);
+  assert.match(js, /PineSegmentFlow/);
+  assert.match(js, /sp-flow-provenance/);
+  assert.match(js, /function itineraryFlowForSegment/);
+  assert.match(js, /sp-feed-detail-graph/);
   assert.match(css, /\.sp-flow-graph/);
+  assert.match(css, /\.sp-flow-provenance/);
   assert.match(css, /\.sp-flow-timing-fill/);
+  assert.match(css, /\.sp-itin-graph/);
 });
 
 test('render feed names speakers and exposes source-backed script progress', () => {

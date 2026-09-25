@@ -925,6 +925,12 @@
 .sp-feed-detail-table td { color: #dfe7ee; font-size: 10.5px; }
 .sp-feed-detail-actions { display: flex; flex-wrap: wrap; gap: 7px; padding: 10px 12px 12px; }
 .sp-feed-detail-actions button { min-height: 38px; }
+.sp-feed-detail-graph {
+  width: 34px; height: 34px; margin-left: auto; margin-right: 7px; padding: 0;
+  border-radius: 5px; color: #65c7da; border-color: #3f7781;
+}
+.sp-feed-detail-graph .pi-icon { width: 18px; height: 18px; }
+.sp-feed-detail-graph:disabled { color: #687881; border-color: #33444c; }
 .sp-analysis-mount, .sp-analysis-dossier, .sp-analysis-top,
 .sp-analysis-reading, .sp-analysis-dialogue, .sp-analysis-turn-body {
   min-width: 0;
@@ -2588,6 +2594,8 @@ video.sp-folder-media { height: auto; max-height: 120px; background: #000000; bo
 .sp-segins-dl .pi-icon { width: 18px; height: 18px; }
 .sp-find-head .sp-segins-dl:first-of-type { margin-left: auto; }
 .sp-find-head .sp-segins-dl + .sp-find-x { margin-left: 0; }
+.sp-segins-flow { width: 38px; height: 38px; margin-left: auto; padding: 0; border-radius: 5px; color: #65c7da; border-color: #3f7781; }
+.sp-segins-flow .pi-icon { width: 19px; height: 19px; }
 @media (max-width: 560px) { .sp-segins-dl-text { display: none; } }
 
 /* ---- the facts, shared by all three windows ---------------------- */
@@ -2838,6 +2846,14 @@ video.sp-folder-media { height: auto; max-height: 120px; background: #000000; bo
 .sp-itin-state {
   flex: 0 0 auto; max-width: 34%;
   font-size: 10.5px; color: #8ea0ad; text-align: right; word-break: break-word;
+}
+.sp-itin-graph {
+  flex: 0 0 32px; width: 32px; height: 32px; padding: 0;
+  border-radius: 5px; color: #9aadb5;
+}
+.sp-itin-graph .pi-icon { width: 18px; height: 18px; }
+.sp-itin-graph:hover, .sp-itin-graph:focus-visible, .sp-itin-graph.has-flow {
+  color: #65c7da; border-color: #3f7781; background: #102228;
 }
 .sp-itin-row.sp-itin-live { background: #0a1a1e; }
 .sp-itin-row.sp-itin-live .sp-itin-state { color: #65c7da; }
@@ -3397,6 +3413,34 @@ html.pine-tech-wide .sp-tech.sp-tech-wide .wc-strip {
 /* ---- #1301: per-segment conversation graph ----------------------- */
 .sp-flowedit-box { width: min(1180px, calc(100vw - 24px)); max-height: calc(100dvh - 24px); overflow-x: hidden; overflow-y: auto; }
 .sp-flow-editor { display: flex; flex-direction: column; min-width: 0; }
+.sp-flow-origin {
+  display: grid; gap: 4px; margin: 10px 12px 0; padding: 8px 10px;
+  border-left: 3px solid #65c7da; background: #0d181e;
+}
+.sp-flow-origin b { color: #65c7da; font-size: 10px; text-transform: uppercase; }
+.sp-flow-origin span { color: #dce7ea; font-size: 10.5px; line-height: 1.4; overflow-wrap: anywhere; }
+.sp-flow-origin i { color: #8297a1; font: 9px ui-monospace, Consolas, monospace; overflow-wrap: anywhere; }
+.sp-flow-provenance {
+  position: relative; display: grid; gap: 9px; margin: 10px 12px 0; padding: 10px 10px 10px 23px;
+  border: 1px solid #2f5660; border-radius: 7px; background: #0c171c;
+}
+.sp-flow-provenance::before {
+  content: ''; position: absolute; left: 12px; top: 32px; bottom: 17px; width: 2px; background: #4d8995;
+}
+.sp-flow-provenance-title { color: #9fd9e0; font-size: 10px; }
+.sp-flow-provenance-route { position: relative; display: flex; flex-wrap: wrap; gap: 5px 8px; align-items: center; }
+.sp-flow-provenance-route::before, .sp-flow-provenance .sp-flow-field::before {
+  content: ''; position: absolute; left: -16px; top: 11px; width: 7px; height: 7px;
+  border: 2px solid #65c7da; border-radius: 50%; background: #0c171c;
+}
+.sp-flow-provenance-route b { color: #dbe8ec; font-size: 10px; text-transform: uppercase; }
+.sp-flow-provenance-route span { color: #8da3ab; font-size: 9.5px; font-family: ui-monospace, Consolas, monospace; }
+.sp-flow-provenance .sp-flow-field { position: relative; margin: 0; }
+.sp-flow-prompt-save {
+  justify-self: start; display: inline-flex; align-items: center; gap: 5px; min-height: 34px;
+  padding: 0 8px; border-radius: 5px; color: #b6e2e7; border-color: #3f7781; font-size: 10px;
+}
+.sp-flow-prompt-save .pi-icon { width: 16px; height: 16px; }
 .sp-flow-basics { display: grid; grid-template-columns: minmax(0, 1fr) 150px; gap: 8px; padding: 10px 12px 0; }
 .sp-flow-field { display: block; min-width: 0; }
 .sp-flow-field-label { display: block; margin: 0 0 4px; color: #8ea0ad; font-size: 10px; }
@@ -3416,6 +3460,23 @@ html.pine-tech-wide .sp-tech.sp-tech-wide .wc-strip {
 .sp-flow-timing-rail { height: 8px; margin-top: 7px; overflow: hidden; border-radius: 3px; background: #263842; }
 .sp-flow-timing-fill { height: 100%; width: 0; min-width: 2px; background: #65c7da; transition: width .18s ease; }
 .sp-flow-timing.over .sp-flow-timing-fill { background: #e3be63; }
+.sp-flow-library {
+  display: grid; grid-template-columns: minmax(170px, 1fr) auto minmax(170px, 1fr) auto auto;
+  align-items: end; gap: 8px; margin: 10px 12px 0; padding: 9px 10px;
+  border: 1px solid #2d4852; border-radius: 7px; background: #0d181e;
+}
+.sp-flow-library-title { grid-column: 1 / -1; color: #9fd9e0; font-size: 10px; }
+.sp-flow-library .sp-flow-field { margin: 0; }
+.sp-flow-library-cycle { display: flex; gap: 4px; padding-bottom: 1px; }
+.sp-flow-library-arrow { width: 32px; height: 35px; padding: 0; border-radius: 5px; }
+.sp-flow-library-arrow .pi-icon { width: 17px; height: 17px; }
+.sp-flow-library-save, .sp-flow-library-copy {
+  display: inline-flex; align-items: center; gap: 5px; min-height: 35px;
+  padding: 0 8px; border-radius: 5px; font-size: 10px;
+}
+.sp-flow-library-save { color: #071116; background: #65c7da; border-color: #65c7da; }
+.sp-flow-library-copy { color: #c5d5db; border-color: #48616a; }
+.sp-flow-library-save .pi-icon, .sp-flow-library-copy .pi-icon { width: 16px; height: 16px; }
 .sp-flow-utility { display: flex; flex-wrap: wrap; gap: 7px; padding: 10px 12px 0; }
 .sp-flow-suggest, .sp-flow-speakerbox, .sp-flow-apply-kind, .sp-flow-save { min-height: 35px; padding: 0 9px; border-radius: 5px; font-size: 10px; }
 .sp-flow-suggest, .sp-flow-speakerbox { display: inline-flex; align-items: center; gap: 5px; }
@@ -3432,11 +3493,11 @@ html.pine-tech-wide .sp-tech.sp-tech-wide .wc-strip {
 .sp-flow-section-title { display: block; margin: 0 0 7px; color: #8ea0ad; font-size: 10px; }
 .sp-flow-palette-node { display: block; width: 100%; min-height: 31px; margin: 0 0 5px; padding: 0 7px; text-align: left; border-radius: 5px; font-size: 9.5px; }
 .sp-flow-palette-node:active { cursor: grabbing; }
-.sp-flow-graph { display: flex; flex-wrap: wrap; align-content: flex-start; gap: 8px 20px; min-height: 198px; padding: 11px; border: 1px solid #30535c; border-radius: 7px; background-color: #0c151a; background-image: radial-gradient(#2a4650 1px, transparent 1px); background-size: 16px 16px; }
+.sp-flow-graph { display: flex; flex-direction: column; flex-wrap: nowrap; align-content: stretch; gap: 18px; min-height: 198px; padding: 11px; border: 1px solid #30535c; border-radius: 7px; background-color: #0c151a; background-image: radial-gradient(#2a4650 1px, transparent 1px); background-size: 16px 16px; }
 .sp-flow-graph.empty, .sp-flow-graph.drop-ready { outline: 2px dashed #65c7da; outline-offset: -5px; }
-.sp-flow-node { position: relative; display: grid; grid-template-columns: 21px minmax(80px, 1fr) 28px; align-items: center; gap: 6px; width: min(170px, 100%); min-height: 50px; padding: 6px; border: 1px solid #3e6470; border-radius: 7px; background: #13232b; cursor: grab; user-select: none; }
-.sp-flow-node::after { content: ''; position: absolute; top: 50%; right: -16px; width: 11px; border-top: 1px solid #65c7da; }
-.sp-flow-node::before { content: ''; position: absolute; top: calc(50% - 3px); right: -16px; width: 6px; height: 6px; border-top: 1px solid #65c7da; border-right: 1px solid #65c7da; transform: rotate(45deg); }
+.sp-flow-node { position: relative; display: grid; grid-template-columns: 21px minmax(80px, 1fr) 28px; align-items: center; gap: 6px; width: 100%; min-height: 50px; padding: 6px; border: 1px solid #3e6470; border-radius: 7px; background: #13232b; cursor: grab; user-select: none; box-sizing: border-box; }
+.sp-flow-node::after { content: ''; position: absolute; left: 50%; bottom: -15px; height: 11px; border-left: 1px solid #65c7da; }
+.sp-flow-node::before { content: ''; position: absolute; left: calc(50% - 3px); bottom: -15px; width: 6px; height: 6px; border-right: 1px solid #65c7da; border-bottom: 1px solid #65c7da; transform: rotate(45deg); }
 .sp-flow-node:last-child::before, .sp-flow-node:last-child::after { display: none; }
 .sp-flow-node.selected { border-color: #65c7da; box-shadow: 0 0 0 1px rgba(101,199,218,.25); }
 .sp-flow-node.dragging { opacity: .45; }
@@ -3455,6 +3516,8 @@ html.pine-tech-wide .sp-tech.sp-tech-wide .wc-strip {
 .sp-flow-sidebar-delete .pi-icon { width: 16px; height: 16px; }
 .sp-flow-empty { align-self: center; color: #8ea0ad; font-size: 10px; line-height: 1.4; }
 .sp-flow-savebar { display: flex; justify-content: flex-end; flex-wrap: wrap; gap: 8px; padding: 0 12px 12px; }
+.sp-flow-return { width: 35px; height: 35px; margin-right: auto; padding: 0; border-radius: 5px; }
+.sp-flow-return .pi-icon { width: 17px; height: 17px; }
 .sp-flow-apply-kind { color: #e3be63; border-color: #806a37; }
 .sp-flow-save { color: #071116; background: #65c7da; border-color: #65c7da; font-weight: 700; }
 @media (max-width: 860px) {
@@ -3466,13 +3529,15 @@ html.pine-tech-wide .sp-tech.sp-tech-wide .wc-strip {
 @media (max-width: 570px) {
   .sp-flowedit-box { width: calc(100vw - 10px); max-height: calc(100dvh - 10px); }
   .sp-flow-basics, .sp-flow-work { grid-template-columns: 1fr; }
+  .sp-flow-library { grid-template-columns: minmax(0, 1fr) auto auto; }
+  .sp-flow-library-pick, .sp-flow-library-name { grid-column: 1 / -1; }
+  .sp-flow-library-save, .sp-flow-library-copy { justify-content: center; }
   .sp-flow-sidebar { grid-column: auto; display: block; }
   .sp-flow-sidebar .sp-flow-field { margin: 0 0 8px; }
   .sp-flow-palette { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 5px; }
   .sp-flow-palette .sp-flow-section-title { grid-column: 1 / -1; }
   .sp-flow-palette-node { margin: 0; }
   .sp-flow-node { width: 100%; }
-  .sp-flow-node::before, .sp-flow-node::after { display: none; }
 }
 /* Dictation now lives inside each editable field through talk-dot.js. */
 .sp-review-mic,

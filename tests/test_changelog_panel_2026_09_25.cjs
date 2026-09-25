@@ -16,3 +16,8 @@ test('elapsed telemetry presents unknown and measured work without guessing', ()
   assert.equal(changelog.elapsed(4300), '4.3 s');
   assert.equal(changelog.elapsed(65000), '1 m 5 s');
 });
+
+test('the panel exposes a normal open road for durable history', () => {
+  assert.equal(typeof changelog.open, 'function');
+  assert.equal(typeof changelog.close, 'function');
+});

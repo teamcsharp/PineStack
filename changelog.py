@@ -290,8 +290,14 @@ class ChangeLog:
             return [dict(row) for row in rows]
 
     def page(self, limit: int = 60, before: str = "") -> dict[str, Any]:
-        limit = max(1, min(200, int(limit)))
         rows = self._read()
+        return self._page_rows(rows, limit, before, self._head())
+
+    @staticmethod
+    def _page_rows(rows: list[dict[str, Any]], limit: int, before: str,
+                   head: str = "") -> dict[str, Any]:
+        """Paginate either a live Git read or a durable cached snapshot."""
+        limit = max(1, min(200, int(limit)))
         start = 0
         if before:
             needle = str(before).strip()
@@ -302,11 +308,32 @@ class ChangeLog:
             else:
                 raise ValueError("That changelog cursor is no longer in this Git history")
         entries = rows[start:start + limit]
-        return {"entries": entries, "total": len(rows), "head": self._head() if rows else "",
+        return {"entries": entries, "total": len(rows), "head": head if rows else "",
                 "has_more": start + len(entries) < len(rows),
                 "next_before": entries[-1]["commit"] if entries else "",
                 "retroactive": True,
                 "timezone": "America/Chicago"}
+
+    def cached_page(self, limit: int = 60, before: str = "") -> dict[str, Any] | None:
+        """Return the last durable Git snapshot without invoking Git.
+
+        A station panel must remain inspectable while a fresh process warms a
+        multi-year repository. This intentionally does not take ``_lock``:
+        the live reader may be holding it while subprocess Git finishes, but
+        the atomically-written on-disk cache remains safe to read.
+        """
+        rows = self._cache
+        head = self._cache_key[0] if self._cache_key else ""
+        if not rows:
+            disk = self._disk_cache()
+            candidate = disk.get("entries") if isinstance(disk.get("entries"), list) else []
+            rows = candidate
+            head = _text(disk.get("head"), 64)
+        if not rows:
+            return None
+        page = self._page_rows([dict(row) for row in rows], limit, before, head)
+        page["stale"] = True
+        return page
 
     def record(self, commit: str, payload: dict[str, Any]) -> dict[str, Any]:
         """Attach task telemetry to an existing commit without editing Git history."""

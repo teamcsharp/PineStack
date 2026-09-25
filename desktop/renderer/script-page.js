@@ -5685,8 +5685,43 @@
     var selected = flow.length ? flow[0].id : '';
     var dragId = '';
     var preset = String(entry.schedule_preset || '');
+    var returnTarget = parentSheet && parentSheet.returnTarget
+      ? parentSheet.returnTarget : null;
+    var lineOrigin = entry && entry.flow_origin && typeof entry.flow_origin === 'object'
+      ? entry.flow_origin : null;
 
     var form = make('section', 'sp-flow-editor');
+    if (lineOrigin) {
+      var origin = make('section', 'sp-flow-origin');
+      origin.appendChild(make('b', '', 'Selected scripted line'));
+      origin.appendChild(make('span', '', String(lineOrigin.text || 'This line belongs to this scheduled segment.')));
+      origin.appendChild(make('i', '', String(lineOrigin.id || '')));
+      form.appendChild(origin);
+    }
+    var provenance = make('section', 'sp-flow-provenance');
+    provenance.appendChild(make('b', 'sp-flow-provenance-title', 'How this segment is assembled'));
+    var route = make('div', 'sp-flow-provenance-route');
+    route.appendChild(make('b', '', String(entry.kind || 'segment')));
+    route.appendChild(make('span', '', 'slot ' + String(entry.slot_id || 'not pinned')));
+    route.appendChild(make('span', '', 'prompt ' + String(entry.prompt_id || 'active variant')));
+    provenance.appendChild(route);
+    var systemPrompt = document.createElement('textarea');
+    systemPrompt.rows = 6; systemPrompt.maxLength = 4000;
+    systemPrompt.placeholder = 'The system prompt that guides this road...';
+    systemPrompt.value = String(entry.prompt || '');
+    systemPrompt.setAttribute('aria-label', 'Active system prompt');
+    provenance.appendChild(flowField('Active system prompt', systemPrompt, sheet));
+    var sourceNotes = document.createElement('textarea');
+    sourceNotes.rows = 3; sourceNotes.maxLength = 400;
+    sourceNotes.placeholder = 'Station inputs, constraints, or preparation notes...';
+    sourceNotes.value = String(entry.notes || '');
+    sourceNotes.setAttribute('aria-label', 'Segment input notes');
+    provenance.appendChild(flowField('Station inputs and preparation', sourceNotes, sheet));
+    var savePrompt = flowIconButton('sp-flow-prompt-save', 'c:save',
+      'Save the active system prompt for this segment kind');
+    savePrompt.appendChild(make('span', '', 'Save system prompt'));
+    provenance.appendChild(savePrompt);
+    form.appendChild(provenance);
     var basics = make('div', 'sp-flow-basics');
     var label = document.createElement('input');
     label.type = 'text'; label.maxLength = 80; label.value = name;
@@ -5698,6 +5733,36 @@
     basics.appendChild(flowField('Segment name', label, sheet));
     basics.appendChild(flowField('Minutes', minutes, sheet, 'sp-flow-minutes', false));
     form.appendChild(basics);
+
+    var savedGraphs = [];
+    var selectedGraph = '';
+    var library = make('section', 'sp-flow-library');
+    library.appendChild(make('b', 'sp-flow-library-title', 'Saved segment graphs'));
+    var libraryPick = document.createElement('select');
+    libraryPick.setAttribute('aria-label', 'Saved segment graph');
+    library.appendChild(flowField('Open a saved graph', libraryPick, sheet,
+      'sp-flow-library-pick', false));
+    var cycle = make('div', 'sp-flow-library-cycle');
+    var previousGraph = flowIconButton('sp-flow-library-arrow', 'c:caret--left',
+      'Previous saved graph');
+    var nextGraph = flowIconButton('sp-flow-library-arrow', 'c:caret--right',
+      'Next saved graph');
+    cycle.appendChild(previousGraph); cycle.appendChild(nextGraph);
+    library.appendChild(cycle);
+    var graphName = document.createElement('input');
+    graphName.type = 'text'; graphName.maxLength = 80;
+    graphName.placeholder = 'Name this reusable graph'; graphName.value = name + ' graph';
+    graphName.setAttribute('aria-label', 'Saved graph name');
+    library.appendChild(flowField('Save graph as', graphName, sheet,
+      'sp-flow-library-name'));
+    var saveGraph = flowIconButton('sp-flow-library-save', 'c:save', 'Save this graph');
+    var saveGraphWords = make('span', '', 'Save graph');
+    saveGraph.appendChild(saveGraphWords);
+    var copyGraph = flowIconButton('sp-flow-library-copy', 'c:copy--to-clipboard',
+      'Save this graph as a new reusable graph');
+    copyGraph.appendChild(make('span', '', 'Save copy'));
+    library.appendChild(saveGraph); library.appendChild(copyGraph);
+    form.appendChild(library);
 
     var direction = document.createElement('textarea');
     direction.className = 'sp-flow-direction';
@@ -5753,6 +5818,14 @@
     form.appendChild(work);
 
     var saveBar = make('div', 'sp-flow-savebar');
+    if (returnTarget) {
+      var backToOrder = flowIconButton('sp-flow-return', 'c:caret--left',
+        'Return to the running order');
+      backToOrder.addEventListener('click', function () {
+        sheet.close(); itineraryOpen(returnTarget);
+      });
+      saveBar.appendChild(backToOrder);
+    }
     var applyKind = make('button', 'sp-flow-apply-kind', 'Apply to every ' + String(entry.kind || 'segment'));
     applyKind.type = 'button';
     applyKind.title = 'Use this flow for every matching segment in this saved schedule';
@@ -5880,10 +5953,132 @@
     }
     function render() { updateTiming(); renderGraph(); renderSide(); }
 
+    var systemPromptDirty = false;
+    systemPrompt.addEventListener('input', function () { systemPromptDirty = true; });
+    function promptSlot(book) {
+      var blob = (book && book[String(entry.kind || '')]) || {};
+      var variants = Array.isArray(blob.variants) ? blob.variants.slice() : [];
+      if (!variants.length) variants.push({id: '', name: 'Station default', text: ''});
+      var index = variants.findIndex(function (row) {
+        return String(row.id || '') === String(entry.prompt_id || '');
+      });
+      if (index < 0) index = Math.max(0, Math.min(variants.length - 1, Number(blob.active) || 0));
+      return {variants: variants, index: index};
+    }
+    function loadSystemPrompt() {
+      if (!api() || !api().get || !String(entry.kind || '')) return;
+      api().get('/api/schedule/prompts').then(function (book) {
+        var picked = promptSlot(book);
+        var text = String((picked.variants[picked.index] || {}).text || '');
+        if (!systemPromptDirty && text) systemPrompt.value = text;
+      }, function () { /* The director supplied the prompt already. */ });
+    }
+    function saveSystemPrompt() {
+      if (!api() || !api().get || !api().post || !String(entry.kind || '')) {
+        sheet.say('This segment has no writable prompt route.', true); return;
+      }
+      var text = String(systemPrompt.value || '').trim();
+      if (!text) { sheet.say('The system prompt is empty.', true); return; }
+      savePrompt.disabled = true;
+      api().get('/api/schedule/prompts').then(function (book) {
+        var picked = promptSlot(book);
+        var row = Object.assign({}, picked.variants[picked.index] || {});
+        row.id = String(row.id || entry.prompt_id || (String(entry.kind) + '-operator'));
+        row.name = String(row.name || entry.label || entry.kind || 'Station prompt').slice(0, 80);
+        row.text = text;
+        picked.variants[picked.index] = row;
+        return api().post('/api/schedule/prompts', {
+          [String(entry.kind || '')]: {active: picked.index, variants: picked.variants}
+        });
+      }).then(function () {
+        systemPromptDirty = false;
+        entry.prompt = text; entry.prompt_id = String(entry.prompt_id || '');
+        sheet.say('Saved the active system prompt for future ' + String(entry.kind || 'segment') + ' segments.');
+      }, function (err) { sheet.say(String((err && err.message) || err), true); })
+        ['finally'](function () { savePrompt.disabled = false; });
+    }
+    savePrompt.addEventListener('click', saveSystemPrompt);
+
+    function activeSavedGraph() {
+      return savedGraphs.find(function (graph) { return graph.id === selectedGraph; }) || null;
+    }
+    function refreshLibraryControls() {
+      var graph = activeSavedGraph();
+      previousGraph.disabled = savedGraphs.length < 2;
+      nextGraph.disabled = savedGraphs.length < 2;
+      saveGraphWords.textContent = graph ? 'Update graph' : 'Save graph';
+      saveGraph.title = graph ? 'Update the selected saved graph' : 'Save this graph for reuse';
+    }
+    function useSavedGraph(graph) {
+      if (!graph) return;
+      selectedGraph = String(graph.id || '');
+      libraryPick.value = selectedGraph;
+      flow = (Array.isArray(graph.flow) ? graph.flow : []).map(flowNode);
+      selected = flow.length ? flow[0].id : '';
+      direction.value = String(graph.flow_prompt || '');
+      minutes.value = String(Math.max(.25, Number(graph.minutes) || 3));
+      graphName.value = String(graph.name || 'Untitled segment graph');
+      refreshLibraryControls(); render();
+      sheet.say('Loaded saved graph: ' + graphName.value + '.');
+    }
+    function loadSavedGraphs(prefer) {
+      if (!api() || !api().get) return;
+      api().get('/api/schedule/flow/library').then(function (got) {
+        savedGraphs = Array.isArray(got && got.graphs) ? got.graphs : [];
+        var wanted = String(prefer || selectedGraph || '');
+        if (!savedGraphs.some(function (graph) { return String(graph.id || '') === wanted; })) wanted = '';
+        selectedGraph = wanted;
+        libraryPick.replaceChildren();
+        var current = make('option', '', 'Current segment graph');
+        current.value = ''; libraryPick.appendChild(current);
+        savedGraphs.forEach(function (graph) {
+          var option = make('option', '', String(graph.name || 'Untitled segment graph'));
+          option.value = String(graph.id || ''); libraryPick.appendChild(option);
+        });
+        libraryPick.value = selectedGraph;
+        refreshLibraryControls();
+      }, function (err) { sheet.say(String((err && err.message) || err), true); });
+    }
+    function cycleSavedGraph(step) {
+      if (!savedGraphs.length) return;
+      var index = savedGraphs.findIndex(function (graph) { return graph.id === selectedGraph; });
+      index = (index + step + savedGraphs.length) % savedGraphs.length;
+      useSavedGraph(savedGraphs[index]);
+    }
+    function saveSavedGraph(asCopy) {
+      saveGraph.disabled = true; copyGraph.disabled = true;
+      var graph = activeSavedGraph();
+      api().post('/api/schedule/flow/library', {
+        id: asCopy ? '' : String((graph && graph.id) || ''),
+        name: String(graphName.value || label.value || 'Untitled segment graph'),
+        kind: String(entry.kind || ''), minutes: Number(minutes.value) || 3,
+        flow_prompt: direction.value, flow: flow
+      }).then(function (got) {
+        var saved = got && got.graph;
+        selectedGraph = String((saved && saved.id) || '');
+        graphName.value = String((saved && saved.name) || graphName.value || 'Untitled segment graph');
+        sheet.say(String((got && got.say) || 'Saved reusable segment graph.'));
+        loadSavedGraphs(selectedGraph);
+      }, function (err) { sheet.say(String((err && err.message) || err), true); })
+        ['finally'](function () { saveGraph.disabled = false; copyGraph.disabled = false; });
+    }
+
+    libraryPick.addEventListener('change', function () {
+      var picked = savedGraphs.find(function (graph) { return graph.id === libraryPick.value; });
+      if (!picked) {
+        selectedGraph = ''; refreshLibraryControls(); return;
+      }
+      useSavedGraph(picked);
+    });
+    previousGraph.addEventListener('click', function () { cycleSavedGraph(-1); });
+    nextGraph.addEventListener('click', function () { cycleSavedGraph(1); });
+    saveGraph.addEventListener('click', function () { saveSavedGraph(false); });
+    copyGraph.addEventListener('click', function () { saveSavedGraph(true); });
+
     function suggestFlow() {
       suggest.disabled = true; suggestWords.textContent = 'Planning...';
       api().post('/api/schedule/flow/suggest', {kind: String(entry.kind || 'banter'),
-        label: label.value, minutes: Number(minutes.value) || 3, notes: String(entry.notes || '')})
+        label: label.value, minutes: Number(minutes.value) || 3, notes: String(sourceNotes.value || '')})
         .then(function (got) {
           flow = ((got && got.nodes) || []).map(flowNode);
           selected = flow.length ? flow[0].id : '';
@@ -5917,7 +6112,7 @@
       save.disabled = true; applyKind.disabled = true;
       api().post('/api/schedule/flow/slot', {preset: preset, slot_id: String(entry.slot_id || ''),
         kind: String(entry.kind || ''), label: label.value, minutes: Number(minutes.value) || 3,
-        notes: String(entry.notes || ''), flow_prompt: direction.value, flow: flow,
+        notes: String(sourceNotes.value || ''), flow_prompt: direction.value, flow: flow,
         apply_kind: !!allOfKind}).then(function (got) {
           sheet.say(String((got && got.say) || 'Segment flow saved.'));
           if (typeof refresh === 'function') setTimeout(refresh, 350);
@@ -5927,8 +6122,95 @@
     save.addEventListener('click', function () { saveFlow(false); });
     applyKind.addEventListener('click', function () { saveFlow(true); });
     render();
+    loadSystemPrompt();
+    loadSavedGraphs();
     return sheet;
   }
+
+  function itineraryFlowSwitch(entry, sheet, refresh) {
+    var target = {occurrence: String((entry && entry.occurrence) || ''),
+      slot_id: String((entry && entry.slot_id) || '')};
+    itineraryClose();
+    return itineraryFlowOpen(entry, {returnTarget: target}, refresh);
+  }
+
+  function flowEntryHasLine(entry, lineId) {
+    var wanted = String(lineId || '');
+    if (!wanted) return false;
+    var groups = [((entry || {}).script || {}).turns, (entry || {}).aired];
+    return groups.some(function (rows) {
+      return Array.isArray(rows) && rows.some(function (row) {
+        return wanted === String((row || {}).line || '')
+          || wanted === String((row || {}).line_id || '')
+          || wanted === String((row || {}).id || '');
+      });
+    });
+  }
+
+  function flowEntryForLine(hours, line) {
+    var lineId = String((line && line.id) || '');
+    var source = elements.find(function (item) {
+      return lineId && (String((item || {}).line || '') === lineId
+        || String((item || {}).id || '') === lineId);
+    }) || {};
+    var when = Number((line && line.at) || source.air_at || source.at) || 0;
+    var kind = String((line && line.kind) || source.kind || source.round || '').toLowerCase();
+    var all = [];
+    (hours || []).forEach(function (page) {
+      ((page && page.entries) || []).forEach(function (entry) {
+        all.push(Object.assign({}, entry, {schedule_preset:
+          String(((page && page.sheet) || {}).preset || '')}));
+      });
+    });
+    var exact = all.find(function (entry) { return flowEntryHasLine(entry, lineId); });
+    if (exact) return exact;
+    var timed = all.filter(function (entry) {
+      var start = Number(entry.start) || 0, end = Number(entry.deadline) || 0;
+      return when && start && start <= when && (!end || when < end);
+    });
+    return timed.find(function (entry) { return String(entry.kind || '').toLowerCase() === kind; })
+      || timed[0] || all.find(function (entry) {
+        return kind && String(entry.kind || '').toLowerCase() === kind;
+      }) || null;
+  }
+
+  function itineraryFlowForLine(line, close) {
+    line = line || {};
+    var lineId = String(line.id || '');
+    if (!lineId || !api() || !api().get) {
+      return Promise.reject(new Error('This item has no scheduled line to trace.'));
+    }
+    return Promise.all([
+      api().get('/api/director?hour=0'), api().get('/api/director?hour=1')
+    ]).then(function (hours) {
+      var entry = flowEntryForLine(hours.filter(Boolean), line);
+      if (!entry) throw new Error('The current running order has no segment for this line.');
+      entry.flow_origin = {id: lineId, text: String(line.said || line.text || '').slice(0, 520),
+        at: Number(line.at) || 0};
+      if (typeof close === 'function') close();
+      itineraryClose();
+      itineraryFlowOpen(entry, {returnTarget: {occurrence: String(entry.occurrence || ''),
+        slot_id: String(entry.slot_id || '')}}, null);
+      return entry;
+    });
+  }
+
+  function itineraryFlowForSegment(ident, close) {
+    var block = Number((ident && ident.block) || 0);
+    if (!block) return Promise.reject(new Error('This segment has no script block to trace.'));
+    return segInspect(block).then(function (data) {
+      var first = ((data && data.lines) || []).find(function (line) {
+        return String((line || {}).line_id || '');
+      });
+      if (!first) throw new Error('The segment has no line that can be linked to its schedule.');
+      return itineraryFlowForLine({id: String(first.line_id || ''),
+        said: String(first.text || ''), text: String(first.text || ''),
+        kind: String((data && data.prompt_kind) || (ident && ident.round) || '')}, close);
+    });
+  }
+
+  root.PineSegmentFlow = {openForLine: itineraryFlowForLine,
+    openForSegment: itineraryFlowForSegment};
 
   function itineraryPaint(list, hours, sheet) {
     for (var h = 0; h < hours.length; h += 1) {
@@ -6009,6 +6291,17 @@
     mid.appendChild(make('span', 'sp-itin-hold',
       itinBanked(entry) + (said ? '  ·  ' + said : '')));
     row.appendChild(mid);
+    var graphButton = flowIconButton('sp-itin-graph', 'c:chart--network',
+      'Design this segment in the node graph');
+    graphButton.classList.toggle('has-flow', Array.isArray(entry.flow) && entry.flow.length > 0);
+    graphButton.addEventListener('click', function (ev) {
+      ev.preventDefault(); ev.stopPropagation();
+      itineraryFlowSwitch(entry, sheet, function () {
+        var list = document.querySelector('#' + ITIN_ID + ' .sp-itin-list');
+        if (list) itineraryHour(list, sheet);
+      });
+    });
+    row.appendChild(graphButton);
     row.appendChild(make('span', 'sp-itin-state', state || 'not said yet'));
 
     var found = itinFirstLine(entry, until);
@@ -6078,7 +6371,7 @@
       hold.timer = setTimeout(function () {
         if (!hold) return;
         hold.fired = true; row.pineFlowHeld = true;
-        itineraryFlowOpen(entry, sheet, function () {
+        itineraryFlowSwitch(entry, sheet, function () {
           var list = document.querySelector('#' + ITIN_ID + ' .sp-itin-list');
           if (list) itineraryHour(list, sheet);
         });
@@ -6101,7 +6394,7 @@
     });
     row.addEventListener('contextmenu', function (ev) {
       ev.preventDefault();
-      itineraryFlowOpen(entry, sheet, function () {
+      itineraryFlowSwitch(entry, sheet, function () {
         var list = document.querySelector('#' + ITIN_ID + ' .sp-itin-list');
         if (list) itineraryHour(list, sheet);
       });
@@ -6138,6 +6431,7 @@
       'Segment ' + (ident.block ? ident.block : '(unnumbered)'));
     segWindowOpen(sheet, ident);   /* [#1238] a tap in this window is served out of
                                       one answer, not a fresh request each time */
+    segFlowInspectButton(sheet, ident);
     segExportButtons(sheet, ident);                         /* [#1220] */
     /* A diagnostic surface: the broadcast ducks while it is open and
        lets go by itself when the sheet leaves the page. */
@@ -7819,6 +8113,20 @@
       toast.done(12000);
       return null;
     });
+  }
+
+  function segFlowInspectButton(sheet, ident) {
+    if (!sheet || !sheet.head || !sheet.x) return;
+    var graph = flowIconButton('sp-segins-flow', 'c:chart--network',
+      'Open this inspected segment in the node graph');
+    graph.addEventListener('click', function () {
+      graph.disabled = true;
+      itineraryFlowForSegment(ident, sheet.close)['catch'](function (err) {
+        graph.disabled = false;
+        sheet.say(String((err && err.message) || err), true);
+      });
+    });
+    sheet.head.insertBefore(graph, sheet.x);
   }
 
   /* The Segment window's own header carries the same two roads, so a
@@ -10182,6 +10490,20 @@
     if (root.PineDuck && root.PineDuck.hold) {
       root.PineDuck.hold('sp-spFeedDetail', root.PineDuck.REPORT, detail.back);
     }
+    var graph = flowIconButton('sp-feed-detail-graph', 'c:chart--network',
+      'Open this line in its scheduled node graph');
+    graph.disabled = !(row.line || row.id);
+    graph.addEventListener('click', function () {
+      graph.disabled = true;
+      itineraryFlowForLine({id: String(row.line || row.id || ''), text: String(row.text || words),
+        said: String(row.text || words), at: Number(row.air_at || row.at) || 0,
+        kind: String(row.kind || row.round || '')}, detail.close)
+        ['catch'](function (err) {
+          graph.disabled = false;
+          detail.say(String((err && err.message) || err), true);
+        });
+    });
+    detail.head.insertBefore(graph, detail.x);
     if (stage === 'image_analysis') {
       feedAnalysisOpen(detail, row);
       return detail;

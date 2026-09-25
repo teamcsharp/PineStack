@@ -211,6 +211,22 @@
      * thumbs, where the finger was pointed. See sfxOf() below. */
     var sfxRow = sfxOf(line);
     if (sfxRow) votes.appendChild(binButton(line, sfxRow));
+    if (line.id && root.PineSegmentFlow && typeof root.PineSegmentFlow.openForLine === 'function') {
+      var graph = make('button', 'la-vote la-flow-graph');
+      graph.type = 'button';
+      graph.title = 'Open this line in its scheduled node graph';
+      graph.setAttribute('aria-label', graph.title);
+      graph.appendChild(icon('c:chart--network'));
+      press(graph, function () {
+        graph.disabled = true;
+        root.PineSegmentFlow.openForLine(line, close).catch(function (err) {
+          graph.disabled = false;
+          var say = sheet && sheet.querySelector('.la-vote-say');
+          if (say) say.textContent = String((err && err.message) || err);
+        });
+      });
+      votes.appendChild(graph);
+    }
     votes.appendChild(voteButton(line, 'up', 'c:thumbs-up', 'I liked this'));
     votes.appendChild(voteButton(line, 'down', 'c:thumbs-down', 'This did not work'));
     headRow.appendChild(votes);

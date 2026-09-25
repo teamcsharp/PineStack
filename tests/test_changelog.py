@@ -84,6 +84,19 @@ class ChangeLogTests(unittest.TestCase):
         self.assertEqual(page["total"], 3)
         self.assertEqual(page["entries"][0]["commit"], third)
 
+    def test_cold_process_serves_durable_snapshot_without_calling_git(self):
+        self.log.page()  # establish the cache a fresh service process will inherit
+        cold = ChangeLog(self.repo, Path(self.tmp.name) / "tasks.json")
+
+        def unavailable(*args, **kwargs):
+            raise AssertionError("cached_page must not invoke Git")
+
+        cold._git = unavailable
+        page = cold.cached_page(limit=1)
+        self.assertIsNotNone(page)
+        self.assertTrue(page["stale"])
+        self.assertEqual(page["entries"][0]["commit"], self.second)
+
     def test_cst_label_is_operator_readable(self):
         self.assertEqual(cst_label(0), "not recorded")
         self.assertRegex(cst_label(1790000000), r" CST$")

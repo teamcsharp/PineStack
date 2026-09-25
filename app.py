@@ -60729,6 +60729,81 @@ def schedule_flow_nodes(raw: Any) -> list[dict[str, Any]]:
     return out
 
 
+SCHEDULE_FLOW_LIBRARY_LIMIT = 120
+
+
+def _schedule_flow_graph(raw: Any, index: int = 0,
+                         known_id: str = "") -> dict[str, Any]:
+    """Clean one reusable conversation graph before it reaches the shelf."""
+    row = raw if isinstance(raw, dict) else {}
+    graph_id = str(known_id or row.get("id") or "").strip()[:64]
+    if not graph_id:
+        graph_id = f"graph-{uuid.uuid4().hex[:12]}"
+    kind = str(row.get("kind") or "").strip().lower()[:40]
+    if kind not in SCHEDULE_KIND_NAMES:
+        kind = ""
+    name = str(row.get("name") or row.get("label") or "").strip()[:80]
+    if not name:
+        name = "Untitled segment graph"
+    try:
+        minutes = float(row.get("minutes") or 3)
+    except (TypeError, ValueError):
+        minutes = 3.0
+    if minutes != minutes:
+        minutes = 3.0
+    try:
+        created_at = float(row.get("created_at") or 0)
+    except (TypeError, ValueError):
+        created_at = 0.0
+    try:
+        updated_at = float(row.get("updated_at") or 0)
+    except (TypeError, ValueError):
+        updated_at = 0.0
+    return {
+        "id": graph_id,
+        "name": name,
+        "kind": kind,
+        "minutes": round(max(0.25, min(600.0, minutes)), 3),
+        "flow": schedule_flow_nodes(row.get("flow")),
+        "flow_prompt": str(row.get("flow_prompt") or "").strip()[:1800],
+        "created_at": round(max(0.0, created_at), 3),
+        "updated_at": round(max(0.0, updated_at), 3),
+    }
+
+
+def schedule_flow_library(raw: Any) -> list[dict[str, Any]]:
+    """Return the bounded named graph shelf in the order the operator saved it."""
+    if not isinstance(raw, list):
+        return []
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for index, item in enumerate(raw[-SCHEDULE_FLOW_LIBRARY_LIMIT:]):
+        graph = _schedule_flow_graph(item, index)
+        if graph["id"] in seen:
+            graph["id"] = f"graph-{uuid.uuid4().hex[:12]}"
+        seen.add(graph["id"])
+        out.append(graph)
+    return out
+
+
+def schedule_flow_library_upsert(raw: Any, incoming: Any) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Save one named graph without letting a browser replace the whole shelf."""
+    graphs = schedule_flow_library(raw)
+    wanted = str((incoming or {}).get("id") or "").strip()[:64] \
+        if isinstance(incoming, dict) else ""
+    found = next((item for item in graphs if item["id"] == wanted), None)
+    now = round(time.time(), 3)
+    graph = _schedule_flow_graph(incoming, len(graphs), found["id"] if found else "")
+    graph["created_at"] = float(found.get("created_at") or now) if found else now
+    graph["updated_at"] = now
+    if found:
+        index = graphs.index(found)
+        graphs[index] = graph
+    else:
+        graphs.append(graph)
+    return graphs[-SCHEDULE_FLOW_LIBRARY_LIMIT:], graph
+
+
 def schedule_flow_suggestion(kind: str, minutes: Any = 3,
                              label: str = "", notes: str = "") -> dict[str, Any]:
     """The orchestrator's editable, duration-aware first pass at a segment."""
@@ -60961,6 +61036,7 @@ def schedule_defaults() -> dict[str, Any]:
         # Empty is the normal state — an hour only appears here once the
         # operator has actually changed something about it.
         "hours": {},
+        "flow_library": [],
         "prompts": {
             k["kind"]: {
                 "active": 0,
@@ -61059,6 +61135,7 @@ def schedule_read() -> dict[str, Any]:
         # #883: the per-hour overrides. Scrubbed the same way everything
         # else here is — a half-written hour is dropped, never raised on.
         store["hours"] = _sched_hours_clean(raw.get("hours"), store)
+        store["flow_library"] = schedule_flow_library(raw.get("flow_library"))
         prompts = raw.get("prompts")
         if isinstance(prompts, dict):
             for kind, blob in prompts.items():
@@ -63070,6 +63147,36 @@ async def schedule_flow_suggest_api(
         schedule_flow_suggestion,
         str(payload.get("kind") or "banter"), payload.get("minutes") or 3,
         str(payload.get("label") or ""), str(payload.get("notes") or ""))
+
+
+@app.get("/api/schedule/flow/library")
+async def schedule_flow_library_api(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """The reusable segment-graph shelf, separate from any one hour."""
+    require_read_auth(authorization)
+    store = schedule_read()
+    return {"graphs": [dict(graph) for graph in store.get("flow_library") or []]}
+
+
+@app.post("/api/schedule/flow/library")
+async def schedule_flow_library_save_api(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Create or update exactly one reusable graph without replacing its shelf."""
+    require_auth(authorization)
+    payload = await request.json()
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Expected an object")
+    with _SCHEDULE_LOCK:
+        store = schedule_read()
+        graphs, graph = schedule_flow_library_upsert(store.get("flow_library"), payload)
+        store["flow_library"] = graphs
+        schedule_write(store)
+    note_action("segment graph saved: " + str(graph.get("name") or "Untitled") + " (#1306)")
+    return {"ok": True, "graph": graph, "graphs": graphs,
+            "say": "Saved the reusable segment graph: " + str(graph["name"]) + "."}
 
 
 @app.post("/api/schedule/flow/slot")
@@ -122470,7 +122577,21 @@ async def changelog_api(
     """The committed station history plus task facts that were captured."""
     require_read_auth(authorization)
     try:
-        return await asyncio.to_thread(_CHANGELOG.page, limit, before)
+        # A fresh process can need a long Git walk to rebuild its durable
+        # changelog cache. Serve that snapshot promptly instead of allowing
+        # the panel transport to time out while the refresh completes.
+        return await asyncio.wait_for(
+            asyncio.to_thread(_CHANGELOG.page, limit, before), timeout=1.5)
+    except TimeoutError:
+        try:
+            cached = await asyncio.to_thread(_CHANGELOG.cached_page, limit, before)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if cached is not None:
+            return cached
+        return {"entries": [], "total": 0, "head": "", "has_more": False,
+                "next_before": "", "retroactive": True,
+                "timezone": "America/Chicago", "stale": True, "warming": True}
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except RuntimeError as exc:
@@ -140886,6 +141007,7 @@ def director_room(which: int = 0) -> dict[str, Any]:
                     "occurrence": "", "minutes": owns / 60.0,
                     "start": 0.0, "deadline": 0.0, "state": "unplanned",
                     "notes": str(slot.get("notes") or ""),
+                    "prompt_id": str(slot.get("prompt_id") or ""),
                     "prompt": str(schedule_prompt_for(store, slot) or "")[:1200],
                     "flow": schedule_flow_nodes(slot.get("flow")),
                     "flow_prompt": str(slot.get("flow_prompt") or "")[:1800],
@@ -141027,6 +141149,7 @@ def director_room(which: int = 0) -> dict[str, Any]:
             "start": start, "deadline": deadline,
             "state": state,
             "notes": str(slot.get("notes") or ""),
+            "prompt_id": str(slot.get("prompt_id") or ""),
             "prompt": str(slot.get("prompt") or "")[:1600],
             "flow": schedule_flow_nodes(slot.get("flow")),
             "flow_prompt": str(slot.get("flow_prompt") or "")[:1800],

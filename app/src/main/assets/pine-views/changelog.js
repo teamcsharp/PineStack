@@ -8,6 +8,7 @@
   var loading = false;
   var pageState = {entries: [], total: 0, has_more: false};
   var threeLoad = null;
+  var refreshTimer = 0;
 
   function make(tag, cls, text) {
     var node = document.createElement(tag);
@@ -263,7 +264,10 @@
     var count = panel.querySelector('.cl-count');
     body.replaceChildren();
     if (count) count.textContent = pageState.total ? pageState.total + ' committed changes' : '';
-    if (!pageState.entries.length && !loading) {
+    if (pageState.stale) body.appendChild(make('p', 'cl-refreshing', pageState.entries.length
+      ? 'Showing the saved station history while Git refreshes.'
+      : 'Building the station history from Git...'));
+    if (!pageState.entries.length && !loading && !pageState.stale) {
       body.appendChild(make('p', 'cl-empty', 'No committed changes are available.'));
     }
     pageState.entries.forEach(function (entry) { body.appendChild(entryNode(entry)); });
@@ -286,9 +290,17 @@
       pageState.entries = before ? pageState.entries.concat(rows) : rows;
       pageState.total = Number(result && result.total) || pageState.entries.length;
       pageState.has_more = !!(result && result.has_more);
+      pageState.stale = !!(result && result.stale);
+      pageState.warming = !!(result && result.warming);
       cursor = String(result && result.next_before || '');
       loading = false;
       render();
+      if (pageState.stale && !before && !refreshTimer) {
+        refreshTimer = root.setTimeout(function () {
+          refreshTimer = 0;
+          if (panel && !panel.hidden) load('');
+        }, 1800);
+      }
       return result;
     }, function (error) {
       loading = false;
@@ -304,6 +316,7 @@
   function close() {
     if (!panel) return;
     panel.querySelectorAll('.cl-flow-board').forEach(stopFlow);
+    if (refreshTimer) { root.clearTimeout(refreshTimer); refreshTimer = 0; }
     panel.hidden = true;
     try { if (root.PineSfxTv) root.PineSfxTv.viewChanged(); } catch (err) { /* no video wall */ }
   }
@@ -339,7 +352,7 @@
     build();
     if (!panel.hidden) { close(); return; }
     panel.hidden = false;
-    pageState = {entries: [], total: 0, has_more: false};
+    pageState = {entries: [], total: 0, has_more: false, stale: false, warming: false};
     cursor = '';
     load('');
     try { if (root.PineSfxTv) root.PineSfxTv.viewChanged(); } catch (err) { /* no video wall */ }
