@@ -77,6 +77,14 @@
 .parody-timeline{position:relative;display:flex;align-items:stretch;min-width:0;min-height:88px;overflow-x:auto;gap:2px;padding:6px 5px 8px;scrollbar-color:#777 #202227;touch-action:pan-x}.parody-timeline.drag-over{box-shadow:inset 0 0 0 2px #80d8c1}.parody-empty{margin:auto;color:#7e838c;font-size:12px;pointer-events:none}.parody-overlay-timeline{display:block;white-space:nowrap}.parody-overlay-timeline .parody-segment{position:absolute;top:6px;bottom:8px;display:flex;min-width:82px;height:auto;max-width:none;vertical-align:top}
 .parody-segment{position:relative;display:flex;flex:0 0 var(--clip-width,120px);flex-direction:column;justify-content:flex-end;min-width:100px;max-width:460px;min-height:88px;border:2px solid #4d8f7a;border-radius:3px;background:#1b3932 center/cover no-repeat;padding:7px 30px;text-align:left;overflow:hidden;font-size:12px;cursor:grab;user-select:none;touch-action:pan-x}.parody-segment:before{content:"";position:absolute;inset:0;background:linear-gradient(0deg,#07100ee8 0 35%,#07100e22 78%);pointer-events:none}.parody-segment.library{border-color:#5f8fb9;background-color:#1b2c39}.parody-segment.generated{border-color:#d59a43;background-color:#453522}.parody-segment.selected{outline:3px solid white;outline-offset:-6px}.parody-segment.trimming{outline-color:#ffe361;cursor:ew-resize}.parody-segment.drag-target{box-shadow:inset 4px 0 #ffe361}.parody-segment strong,.parody-segment small{position:relative;z-index:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;pointer-events:none}.parody-segment strong{font-size:11px}.parody-segment small{font-size:10px;font-variant-numeric:tabular-nums}.parody-segment .clip-edge{position:absolute;top:0;bottom:0;z-index:3;width:30px;min-height:0;padding:0;border:0;border-radius:2px;background:#f4ce23;touch-action:none;cursor:ew-resize;transition:width .08s ease,filter .08s ease}.parody-segment .clip-edge.active{width:38px;filter:brightness(1.18);box-shadow:0 0 0 2px #fff8 inset}.parody-segment .clip-edge:after{content:"";position:absolute;top:50%;left:50%;width:3px;height:28px;border-inline:1px solid #554800;transform:translate(-50%,-50%)}.parody-segment .clip-edge.in{left:0}.parody-segment .clip-edge.out{right:0}.parody-segment .clip-edge:disabled{opacity:.2;cursor:default}.clip-trim-readout{position:absolute;z-index:5;top:6px;left:50%;max-width:calc(100% - 72px);transform:translateX(-50%);padding:5px 8px;border-radius:5px;background:#050506e8;color:#fff5a8;box-shadow:0 1px 5px #000;font:700 10px/1.2 ui-monospace,SFMono-Regular,Consolas,monospace;white-space:nowrap;pointer-events:none}
 .parody-footer{display:flex;gap:12px;align-items:center;justify-content:space-between;flex-wrap:wrap;min-height:50px;font-size:12px;color:var(--muted)}.parody-footer label{display:flex;align-items:center;gap:7px}.parody-footer input{width:min(220px,40vw)}.parody-footer [role=status]{flex:1;text-align:center}.parody-footer .error{color:#ff8d86}
+/* The gallery embeds this desk in a compact command frame. Its outer rail owns
+   navigation, history, export, and the filename; this strip keeps panel rails. */
+html.parody-embedded .parody-editor{gap:4px;padding-top:0}
+html.parody-embedded .parody-topbar{min-height:30px;padding:0 4px;justify-content:space-between}
+html.parody-embedded .parody-topbar>:not(#parodyBinToggle):not(#parodyInspectorToggle){display:none}
+html.parody-embedded .parody-topbar .parody-icon-button{width:28px;min-width:28px;min-height:28px}
+html.parody-embedded .parody-topbar .parody-panel-glyph{transform:scale(.82)}
+html.parody-embedded .parody-footer{display:none}
 @media(max-width:900px){.parody-editor{height:auto;min-height:100dvh;overflow:auto}.parody-topbar{flex-wrap:wrap}.parody-topbar button{padding:7px 9px;min-height:40px}.parody-heading{min-width:130px}.parody-workspace{display:flex;flex-direction:column;overflow:visible}.parody-bin{flex:none;max-height:43vh;border-right:0;border-bottom:1px solid var(--line);padding:0 0 8px}.parody-bin-monitor{display:none}.parody-media-bin{min-height:116px}.parody-stage{overflow:visible}.parody-preview{flex:none;height:min(38vh,320px);min-height:180px}.parody-transport{flex-wrap:wrap}.parody-transport input{order:2;flex-basis:100%}.parody-track{grid-template-columns:76px minmax(0,1fr)}.parody-track-head{padding:6px}.parody-tools-row{justify-content:center}.parody-range-controls>span{flex-basis:100%;text-align:center}.parody-footer label,.parody-footer [role=status]{flex-basis:100%;text-align:center;justify-content:center}.parody-footer input{width:min(240px,60vw)}}
 @media(max-width:560px){.parody-topbar #parodySave{order:3;width:100%}.parody-history button{min-width:62px}.parody-bin{max-height:48vh}.parody-bin-item{grid-template-columns:62px minmax(0,1fr) auto}.parody-bin-item img{width:62px;height:42px}.parody-range-controls label{flex:1}.parody-range-controls input{width:100%}.parody-track{grid-template-columns:62px minmax(0,1fr)}.parody-track-head span{display:none}.parody-track-head button{font-size:0}.parody-track-head button:after{font-size:10px}.parody-track-head #parodyTrackMute:after{content:"Mute"}.parody-track-head #parodyTrackLock:after{content:"Lock"}.parody-footer{padding-bottom:max(6px,env(safe-area-inset-bottom))}}
 
@@ -117,3 +125,38 @@
 .parody-preview #parodyVideo:not(.ve-frame-ready),.split-monitor video:not(.ve-frame-ready){visibility:hidden;pointer-events:none}
 .parody-preview .ve-media-cover,.split-monitor .ve-media-cover{pointer-events:none}
 .parody-loading,.split-loading{z-index:2}
+
+/* The program image is the editor's workbench. Keep transport and lanes as a
+   compact reference below it, while retaining enough room to trim precisely. */
+@media(min-width:901px){
+  .parody-stage{grid-template-rows:minmax(300px,1fr) 32px minmax(88px,.2fr);gap:3px}
+  .parody-transport{min-height:32px;gap:7px}
+  .parody-transport output{min-width:112px;font-size:12px}
+  .parody-play-button{display:grid;place-items:center;width:28px;min-width:28px;min-height:28px!important;padding:0!important;border-radius:4px;font-size:0!important}
+  .parody-play-button:before{content:"\25b6";font-size:13px;line-height:1}
+  .parody-play-button.is-playing:before{content:"\23f8";font-size:12px}
+  .parody-timeline-section{padding-top:0}
+  .parody-timeline-section .parody-timeline-head{min-height:16px;font-size:10px;line-height:1}
+  .parody-timeline-section .parody-timeline-head h2{font-size:12px}
+  .parody-v1-track{min-height:38px}
+  .parody-v1-track .parody-track-head{padding:2px 5px}
+  .parody-v1-track .parody-track-head strong{font-size:11px}
+  .parody-v1-track .parody-track-head span{font-size:9px}
+  .parody-v1-track .parody-track-actions{gap:2px}
+  .parody-v1-track .parody-track-action{width:20px;min-width:20px;min-height:18px!important}
+  .parody-v1-track .parody-track-action:before{font-size:10px}
+  .parody-v1-track .parody-track-action.lock:before{font-size:11px}
+  .parody-v1-track .parody-timeline{min-height:36px;padding:1px 3px}
+  .parody-v1-track .parody-segment{min-height:32px;padding:2px 24px;font-size:10px}
+  .parody-v1-track .parody-segment strong{font-size:10px}
+  .parody-v1-track .parody-segment small{font-size:9px}
+  .parody-v1-track .parody-segment .clip-edge{width:20px}
+  .parody-v1-track .parody-segment .clip-edge.active{width:26px}
+  .parody-v1-track .parody-segment .clip-edge:after{height:18px}
+  .parody-v2-track.collapsed{min-height:28px}
+  .parody-v2-track.collapsed .parody-track-head{min-height:28px;padding:1px 5px}
+  .parody-v2-track.collapsed .parody-track-toggle{min-height:24px;padding-top:1px;padding-bottom:1px}
+  .parody-v2-track .parody-track-plus{width:18px;height:18px;flex-basis:18px;font-size:15px}
+  .parody-v2-track .parody-track-actions{margin-top:0}
+  .parody-v2-track .parody-track-action{width:20px;min-width:20px;min-height:20px!important}
+}

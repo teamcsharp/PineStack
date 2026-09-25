@@ -188954,11 +188954,23 @@ button.danger {
   min-height: 260px; display: grid; grid-template-rows: auto minmax(0,1fr);
   overflow: hidden; resize: both; border: 1px solid #40586a; border-radius: 6px;
   background: #080d12; box-shadow: 0 22px 70px rgba(0,0,0,.72); }
-.lb-editor-bar { display: flex; align-items: center; gap: 10px; min-width: 0;
-  padding: 7px 9px; border-bottom: 1px solid #2c3a4f; background: #101820; }
+.lb-editor-bar { display: flex; align-items: center; gap: 4px; min-width: 0;
+  min-height: 32px; padding: 2px 7px; border-bottom: 1px solid #2c3a4f; background: #101820; }
 .lb-editor-bar strong { min-width: 0; overflow: hidden; text-overflow: ellipsis;
-  white-space: nowrap; }
-.lb-editor-bar button { margin-left: auto; flex: 0 0 auto; min-height: 36px; }
+  white-space: nowrap; margin-right: auto; font-size: 12px; }
+.lb-editor-export-name { width: clamp(130px,18vw,250px); min-width: 0; height: 28px;
+  box-sizing: border-box; border: 1px solid #40586a; border-radius: 4px;
+  background: #19222c; color: #f1f5f7; padding: 3px 7px; font: 12px inherit; }
+.lb-editor-bar .lb-editor-command { display: grid; place-items: center; flex: 0 0 auto;
+  width: 28px; min-width: 28px; min-height: 28px; margin: 0; padding: 0;
+  border-radius: 4px; font-size: 0; }
+.lb-editor-command:before { color: #d8e2e9; font-size: 16px; line-height: 1; }
+.lb-editor-command[data-command=back]:before { content: "\\2190"; }
+.lb-editor-command[data-command=undo]:before { content: "\\21b6"; }
+.lb-editor-command[data-command=redo]:before { content: "\\21b7"; }
+.lb-editor-command[data-command=export]:before { content: "\\21e9"; }
+.lb-editor-command[data-command=close] { margin-left: 5px; }
+.lb-editor-command[data-command=close]:before { content: "\\00d7"; font-size: 20px; }
 .lb-editor-frame { width: 100%; height: 100%; min-width: 0; min-height: 0;
   display: block; border: 0; background: #080d12; }
 @media (max-width: 720px) {
@@ -195201,19 +195213,40 @@ function openLightboxVideoEditor(path) {
   bar.className = "lb-editor-bar";
   const title = document.createElement("strong");
   title.textContent = "Video splice editor";
-  const close = document.createElement("button");
-  close.type = "button";
-  close.textContent = "Close editor";
+  const exportName = document.createElement("input");
+  exportName.className = "lb-editor-export-name";
+  exportName.type = "text";
+  exportName.value = "Parody splice";
+  exportName.maxLength = 120;
+  exportName.autocomplete = "off";
+  exportName.setAttribute("aria-label", "Export name");
+  exportName.title = "Export name";
+  const editorCommand = (command, label) => {
+    const button = document.createElement("button");
+    button.className = "lb-editor-command";
+    button.type = "button";
+    button.dataset.command = command;
+    button.setAttribute("aria-label", label);
+    button.title = label;
+    return button;
+  };
+  const back = editorCommand("back", "Back to the gallery");
+  const undo = editorCommand("undo", "Undo edit");
+  const redo = editorCommand("redo", "Redo edit");
+  const exportCopy = editorCommand("export", "Export to SFX ads");
+  const close = editorCommand("close", "Close editor");
   const frame = document.createElement("iframe");
   frame.className = "lb-editor-frame";
   frame.title = "Video splice editor";
   frame.setAttribute("allow", "autoplay; fullscreen");
-  frame.src = String(path || "");
-  bar.append(title, close);
+  const editorPath = String(path || "") + (String(path || "").includes("?") ? "&" : "?") + "embed=1";
+  const editorOrigin = new URL(editorPath, window.location.href).origin;
+  frame.src = editorPath;
+  bar.append(title, exportName, back, undo, redo, exportCopy, close);
   dialog.append(bar, frame);
   overlay.appendChild(dialog);
   const onMessage = (event) => {
-    if (event.source !== frame.contentWindow || !event.data) return;
+    if (event.source !== frame.contentWindow || event.origin !== editorOrigin || !event.data) return;
     if (event.data.type === "pine-video-editor-close") {
       closeLightboxVideoEditor();
     } else if (event.data.type === "pine-video-editor-export") {
@@ -195226,6 +195259,12 @@ function openLightboxVideoEditor(path) {
   const onKey = (event) => {
     if (event.key === "Escape") closeLightboxVideoEditor();
   };
+  const sendCommand = (command) => {
+    if (command === "close") { closeLightboxVideoEditor(); return; }
+    if (!frame.contentWindow) return;
+    frame.contentWindow.postMessage({type: "pine-video-editor-command", command: command,
+      export_name: exportName.value}, editorOrigin);
+  };
   overlay.__pineCleanup = () => {
     window.removeEventListener("message", onMessage);
     document.removeEventListener("keydown", onKey);
@@ -195234,7 +195273,9 @@ function openLightboxVideoEditor(path) {
     if (event.target === overlay) closeLightboxVideoEditor();
   });
   dialog.addEventListener("pointerdown", (event) => event.stopPropagation());
-  close.addEventListener("click", closeLightboxVideoEditor);
+  [back, undo, redo, exportCopy, close].forEach((button) => {
+    button.addEventListener("click", () => sendCommand(button.dataset.command));
+  });
   window.addEventListener("message", onMessage);
   document.addEventListener("keydown", onKey);
   document.body.appendChild(overlay);

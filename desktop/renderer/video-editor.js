@@ -2,6 +2,9 @@
 (function () {
   'use strict';
   if (new URLSearchParams(location.search).get('parody') === '1') {
+    if (new URLSearchParams(location.search).get('embed') === '1') {
+      document.documentElement.classList.add('parody-embedded');
+    }
     try { startParodyEditor(); }
     catch (error) {
       window.__pineVideoEditorBootError = error;
@@ -1758,21 +1761,31 @@
     function startOf(index) { return model.spliceStartOf(clips, index); }
     function setProgramRoles(active, buffer) {
       active.classList.add('parody-program-active'); active.classList.remove('parody-program-buffer');
-      active.removeAttribute('aria-hidden'); active.controls = true;
+      active.removeAttribute('aria-hidden'); active.controls = false;
       buffer.classList.remove('parody-program-active'); buffer.classList.add('parody-program-buffer');
       buffer.setAttribute('aria-hidden', 'true'); buffer.controls = false; buffer.muted = true;
     }
-    function resetPreviewCover(record) {
-      coverPoster(previewCover, record); previewCover.hidden = false;
+    function resetPreviewCover() {
+      var image = previewCover.querySelector('img');
+      image.onerror = null; image.classList.remove('ve-real-poster');
+      image.src = '/spark/asset/pinebox.png'; preview.poster = '/spark/asset/pinebox.png';
+      previewCover.hidden = false;
       preview.classList.remove('ve-frame-ready');
     }
     function revealPreviewFrame(media) {
       if (media !== preview || media.readyState < 2 || !(media.videoWidth > 0 && media.videoHeight > 0)) return;
       media.classList.add('ve-frame-ready'); previewCover.hidden = true;
     }
+    function setTransportPlaying(isPlaying) {
+      var button = el('parodyPlay');
+      button.classList.toggle('is-playing', !!isPlaying);
+      button.textContent = isPlaying ? 'Pause sequence' : 'Play sequence';
+      button.setAttribute('aria-label', isPlaying ? 'Pause sequence' : 'Play sequence');
+      button.title = isPlaying ? 'Pause sequence' : 'Play sequence';
+    }
     function stop() {
       playing = false; programPlayers.forEach(function (media) { media.pause(); }); overlayPreview.pause();
-      el('parodyPlay').textContent = 'Play'; el('parodyPlay').setAttribute('aria-label', 'Play sequence');
+      setTransportPlaying(false);
     }
     function setTrimMode(on) {
       trimActive = !!on;
@@ -1946,7 +1959,7 @@
       pending = place.source_s;
       if (activeId !== place.source_id) {
         preview.pause(); activeId = place.source_id;
-        resetPreviewCover(record);
+        resetPreviewCover();
         preview.muted = trackMuted; preview.volume = 1; preview.src = record.url;
         preview.load();
       } else applySeek();
@@ -1990,7 +2003,7 @@
       player.addEventListener('ended', function () { if (player === preview) updateFromVideo(); });
       player.addEventListener('play', function () {
         if (player !== preview) return;
-        playing = true; el('parodyPlay').textContent = 'Pause'; el('parodyPlay').setAttribute('aria-label', 'Pause sequence');
+        playing = true; setTransportPlaying(true);
       });
       player.addEventListener('error', function () {
         if (player === preview) { stop(); message('The sequence preview could not load this source.', true); }
@@ -2003,7 +2016,7 @@
       try { sourcePreview.pause(); } catch (_) { /* source monitor is optional */ }
       if (at >= length() - .02) seekSequence(0);
       playing = true;
-      el('parodyPlay').textContent = 'Pause'; el('parodyPlay').setAttribute('aria-label', 'Pause sequence');
+      setTransportPlaying(true);
       preloadAdjacent(activeIndex);
       if (pending === null && preview.readyState >= 2) preview.play().catch(playFailed);
       else applySeek();
@@ -2405,6 +2418,18 @@
       stop();
       if (window.parent !== window) window.parent.postMessage({type: 'pine-video-editor-close'}, '*');
       else if (history.length > 1) history.back(); else window.close();
+    });
+    window.addEventListener('message', function (event) {
+      if (window.parent === window || event.source !== window.parent
+        || event.origin !== window.location.origin || !event.data
+        || event.data.type !== 'pine-video-editor-command') return;
+      var commands = {
+        back: 'parodyBack', undo: 'parodyUndo', redo: 'parodyRedo', export: 'parodySave'
+      }, target = commands[event.data.command], button = target && el(target);
+      if (event.data.command === 'export' && typeof event.data.export_name === 'string') {
+        el('parodyName').value = event.data.export_name.slice(0, 120);
+      }
+      if (button && !button.disabled) button.click();
     });
     document.addEventListener('keydown', function (event) {
       if (/INPUT|TEXTAREA/.test(event.target.tagName) || event.target.isContentEditable || event.altKey) return;

@@ -206,9 +206,14 @@ test('parody Edit stays inside the station and reports splice exports', () => {
     'the kiosk must not launch a second top-level WebView');
   assert.match(edit, /function openLightboxVideoEditor\(path\)/);
   assert.match(edit, /document\.createElement\("iframe"\)/);
+  assert.match(edit, /lb-editor-export-name/);
+  assert.match(edit, /embed=1/);
+  assert.match(edit, /pine-video-editor-command/);
+  assert.match(edit, /editorOrigin/);
   assert.match(edit, /pine-video-editor-export/);
   assert.match(edit, /Spliced video saved/);
   assert.match(panel, /\.lb-editor-dialog[\s\S]*resize: both/);
+  assert.match(panel, /\.lb-editor-command\[data-command=close\]:before/);
 });
 
 test('decorative gallery videos use still posters and full clips open in the player', () => {

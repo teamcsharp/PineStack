@@ -13,9 +13,16 @@ test('V2 starts compact, track controls are icons, and timeline trim edges are d
   assert.match(html, /id="parodyOverlayToggle"[^>]+aria-expanded="false"[^>]+aria-controls="parodyOverlayTimeline"/);
   assert.match(html, /id="parodyBinToggle"[^>]+aria-controls="parodyWorkspace"/);
   assert.match(html, /id="parodyInspectorToggle"[^>]+aria-controls="parodyInspector"/);
+  assert.doesNotMatch(html, /id="parodyVideo" controls/);
   assert.match(html, /class="parody-track-action mute"/);
   assert.match(html, /class="parody-track-action lock"/);
+  assert.match(html, /id="parodyPlay" class="parody-play-button"/);
   assert.match(js, /function setOverlayCollapsed\(collapsed\)/);
+  assert.match(js, /function setTransportPlaying\(isPlaying\)/);
+  assert.match(js, /button\.classList\.toggle\('is-playing', !!isPlaying\)/);
+  assert.match(js, /active\.removeAttribute\('aria-hidden'\); active\.controls = false/);
+  assert.match(js, /function resetPreviewCover\(\)/);
+  assert.match(js, /image\.src = '\/spark\/asset\/pinebox\.png'; preview\.poster = '\/spark\/asset\/pinebox\.png'/);
   assert.match(js, /parodyOverlayTimeline'\)\.hidden = overlayCollapsed/);
   assert.match(js, /handle\.addEventListener\('pointerdown'.*startEdgeTrim/);
   assert.match(js, /window\.addEventListener\('pointermove', move, \{passive: false\}\)/);
@@ -33,6 +40,8 @@ test('V2 starts compact, track controls are icons, and timeline trim edges are d
   assert.match(css, /\.parody-workspace\{grid-template-columns:clamp\(230px,20vw,320px\) minmax\(0,1fr\) clamp\(260px,22vw,340px\)/);
   assert.match(css, /\.parody-program-buffer\{/);
   assert.match(css, /\.parody-track-action\.mute:before\{content:"M"\}/);
+  assert.match(css, /\.parody-stage\{grid-template-rows:minmax\(300px,1fr\) 32px minmax\(88px,\.2fr\)/);
+  assert.match(css, /\.parody-play-button\.is-playing:before\{content:"\\23f8"/);
 });
 
 test('timeline playback promotes an already buffered next source instead of reloading the visible player', () => {
@@ -43,6 +52,20 @@ test('timeline playback promotes an already buffered next source instead of relo
   assert.match(js, /promotePreloaded\(nextBase, nextPosition\)/);
   assert.match(js, /setProgramRoles\(preview, preloadPreview\)/);
   assert.match(js, /programPlayers\.forEach\(function \(player\)/);
+});
+
+test('embedded splice desk keeps the wrapper compact and accepts only parent commands', () => {
+  const root = path.join(__dirname, '..');
+  const css = fs.readFileSync(path.join(root, 'desktop/renderer/video-editor.css'), 'utf8');
+  const js = fs.readFileSync(path.join(root, 'desktop/renderer/video-editor.js'), 'utf8');
+  assert.match(css, /html\.parody-embedded \.parody-topbar\{min-height:30px/);
+  assert.match(css, /:not\(#parodyBinToggle\):not\(#parodyInspectorToggle\)/);
+  assert.match(css, /html\.parody-embedded \.parody-footer\{display:none/);
+  assert.match(js, /document\.documentElement\.classList\.add\('parody-embedded'\)/);
+  assert.match(js, /event\.source !== window\.parent/);
+  assert.match(js, /event\.data\.type !== 'pine-video-editor-command'/);
+  assert.match(js, /export_name/);
+  assert.match(js, /back: 'parodyBack', undo: 'parodyUndo', redo: 'parodyRedo', export: 'parodySave'/);
 });
 
 test('Electron bridge is preferred for GET and POST', async () => {

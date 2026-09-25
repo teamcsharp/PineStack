@@ -27,7 +27,7 @@ test('every literal getElementById event target exists in the markup', () => {
   assert.match(js, /console\.error\('\[video-editor\] startup failed'/);
 });
 
-test('Camtasia-style controls, native players and both timeline lanes are present', () => {
+test('Camtasia-style controls, custom program transport and both timeline lanes are present', () => {
   for (const id of ['parodyUndo', 'parodyRedo', 'parodyMediaBin', 'parodySearch',
     'parodyVideo', 'parodySourcePreview', 'parodyPreloadVideo', 'parodyOverlayVideo',
     'parodyTimeline', 'parodyOverlayTimeline', 'parodyTrack', 'parodyTransition',
@@ -35,7 +35,8 @@ test('Camtasia-style controls, native players and both timeline lanes are presen
     'parodyMaskCanvas', 'parodyMaskPen', 'parodyMaskKeyframeAdd']) {
     assert.match(html, new RegExp('id="' + id + '"'));
   }
-  assert.match(html, /id="parodyVideo" controls/);
+  assert.doesNotMatch(html, /id="parodyVideo" controls/);
+  assert.match(html, /id="parodyPlay" class="parody-play-button"/);
   assert.match(html, /id="parodySourcePreview" controls/);
   assert.match(parody, /setupDropLane\(timeline, 'base'\)/);
   assert.match(parody, /setupDropLane\(overlayTimeline, 'overlay'\)/);
