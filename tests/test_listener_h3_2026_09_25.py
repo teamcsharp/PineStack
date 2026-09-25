@@ -67,6 +67,9 @@ def test_listener_and_h3_paths_are_durable_and_visible():
     assert "async def listener_make_ad" in source
     assert "async def h3_capacity_relief" in source
     assert "async def h3_hourly_ad_clock" in source
+    clock = source[source.index("async def h3_hourly_ad_clock"):source.index("async def h3_capacity_keeper")]
+    assert 'and _RADIO.get("on")' in clock
+    assert "_H3_HOURLY_LAST[0] = marker" in clock
     assert '"air_it": True' in source
     assert "async def gen_ads_broadcast" in source
     assert 'href="__PWA_MANIFEST__"' in source

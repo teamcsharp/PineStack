@@ -88,6 +88,7 @@ class MainActivity : AppCompatActivity() {
 
     private lateinit var bridge: PineDesktopBridge
     private var videoWall: com.pinebox.kiosk.video.PineVideoWall? = null  // #1426
+    private var splicePreview: com.pinebox.kiosk.video.PineSplicePreview? = null
 
     /** Null until the deferred build has run. */
     private var rail: RailController? = null
@@ -725,6 +726,8 @@ class MainActivity : AppCompatActivity() {
         timerGuard?.let { webView.removeCallbacks(it) }      // #1241
         timerGuard = null
         videoWall?.stop()
+        splicePreview?.stop()
+        splicePreview = null
         videoWall?.onTap = null
         videoWall?.onLongPress = null
         videoWall?.onClipChanged = null
@@ -733,6 +736,7 @@ class MainActivity : AppCompatActivity() {
         videoWall = null
         if (::bridge.isInitialized) {
             bridge.videoWall = null
+            bridge.splicePreview = null
             bridge.liveActivity = null
         }
         jackWatch?.stop()
@@ -1118,6 +1122,10 @@ class MainActivity : AppCompatActivity() {
         }
         videoWall = wall
         bridge.videoWall = wall
+        val preview = com.pinebox.kiosk.video.PineSplicePreview(this, app.client, lifecycleScope)
+        root.addView(preview, android.widget.FrameLayout.LayoutParams(1, 1))
+        splicePreview = preview
+        bridge.splicePreview = preview
         android.util.Log.i("PineVideoWall", "install: wall handed to the bridge")
     }
 
@@ -1545,6 +1553,21 @@ class MainActivity : AppCompatActivity() {
     }
 
     private inner class PanelChrome : WebChromeClient() {
+        private val brandedVideoPoster: Bitmap by lazy {
+            val poster = Bitmap.createBitmap(512, 288, Bitmap.Config.ARGB_8888)
+            val canvas = android.graphics.Canvas(poster)
+            canvas.drawColor(android.graphics.Color.rgb(6, 12, 14))
+            assets.open("pinebox-256.png").use { input ->
+                android.graphics.BitmapFactory.decodeStream(input)?.let { logo ->
+                    val bounds = android.graphics.Rect(200, 88, 312, 200)
+                    canvas.drawBitmap(logo, null, bounds, android.graphics.Paint(android.graphics.Paint.FILTER_BITMAP_FLAG))
+                    logo.recycle()
+                }
+            }
+            poster
+        }
+
+        override fun getDefaultVideoPoster(): Bitmap = brandedVideoPoster
 
         /**
          * The panel's console, in logcat. This is how a bridge fault is

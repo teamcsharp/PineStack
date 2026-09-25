@@ -1212,8 +1212,14 @@
     var stage = document.createElement('div');
     stage.className = 'sfx-tv-parody-stage is-loading';
     var source = document.createElement('video');
-    source.controls = true; source.playsInline = true; source.preload = 'metadata';
+    source.controls = true; source.playsInline = true; source.preload = 'auto';
     stage.appendChild(source); parodyVideo = source;
+    var retrySource = document.createElement('button'); retrySource.type = 'button';
+    retrySource.className = 'sfx-tv-source-retry'; retrySource.title = 'Play or retry reference video';
+    retrySource.setAttribute('aria-label', retrySource.title);
+    var sourceLogo = document.createElement('img'); sourceLogo.alt = 'Pine Box';
+    sourceLogo.src = root.__pineLogo || base.replace(/\/+$/, '') + '/spark/asset/pinebox.png';
+    retrySource.appendChild(sourceLogo); stage.appendChild(retrySource);
     var nav = document.createElement('div'); nav.className = 'sfx-tv-parody-nav';
     var prev = document.createElement('button'); prev.type = 'button'; prev.textContent = 'Previous';
     var label = document.createElement('span');
@@ -1237,7 +1243,10 @@
     var outControl = trimRow('Out');
     trim.appendChild(trimSpan);
     var field = document.createElement('textarea');
+    field.setAttribute('data-pine-mic-owned', '');
     field.placeholder = 'Describe the Pine Box FM parody or dictate it with the microphone...';
+    var fieldWrap = document.createElement('div'); fieldWrap.className = 'sfx-tv-parody-field';
+    fieldWrap.appendChild(field);
     var controls = document.createElement('div'); controls.className = 'sfx-tv-parody-actions';
     var mic = document.createElement('button'); mic.type = 'button'; mic.className = 'sfx-tv-parody-mic';
     mic.title = 'Dictate the H3 prompt'; mic.setAttribute('aria-label', mic.title);
@@ -1254,7 +1263,7 @@
     var listeningWords = document.createElement('span');
     listeningWords.textContent = 'Listening to your dictation. Device audio is muted.';
     listening.appendChild(listeningPulse); listening.appendChild(listeningWords);
-    controls.appendChild(mic); controls.appendChild(listening); controls.appendChild(send);
+    fieldWrap.appendChild(mic); controls.appendChild(listening); controls.appendChild(send);
     var status = document.createElement('div'); status.className = 'sfx-tv-parody-status';
     status.setAttribute('role', 'status');
     var queuePanel = document.createElement('div'); queuePanel.className = 'sfx-tv-parody-queue';
@@ -1282,7 +1291,7 @@
     queuePanel.appendChild(queueCause); queuePanel.appendChild(queueActions);
     queuePanel.appendChild(queueHistory);
     box.appendChild(head); box.appendChild(stage); box.appendChild(nav); box.appendChild(trim);
-    box.appendChild(field); box.appendChild(controls); box.appendChild(status);
+    box.appendChild(fieldWrap); box.appendChild(controls); box.appendChild(status);
     box.appendChild(queuePanel);
     shade.appendChild(box); document.body.appendChild(shade); parodyWrap = shade;
 
@@ -1412,28 +1421,51 @@
        assembly cover replaces. Keep an independent CSS gate as well as the
        Three.js cover: if the cover script is late or a source errors before
        it can build, the native badge still never receives one painted frame. */
+    var pendingTrimSeek = null;
+    var seekTrim = function (at) {
+      source.pause(); pendingTrimSeek = at;
+      if (source.readyState >= 1 && !source.seeking) source.currentTime = at;
+    };
     var previewWaiting = function () { stage.classList.add('is-loading'); };
     var previewReady = function () {
       if (source.readyState >= 2 && source.videoWidth > 0) {
         stage.classList.remove('is-loading');
       } else previewWaiting();
     };
-    ['loadstart', 'emptied', 'waiting', 'stalled', 'error', 'abort']
+    ['loadstart', 'emptied', 'error', 'abort']
       .forEach(function (name) { source.addEventListener(name, previewWaiting); });
-    ['loadeddata', 'playing']
+    ['waiting', 'stalled'].forEach(function (name) {
+      source.addEventListener(name, function () { if (source.readyState < 2) previewWaiting(); });
+    });
+    ['loadeddata', 'playing', 'canplay', 'seeked']
       .forEach(function (name) { source.addEventListener(name, previewReady); });
+    source.addEventListener('seeked', function () {
+      if (pendingTrimSeek !== null && Math.abs(source.currentTime - pendingTrimSeek) > .025) {
+        source.currentTime = pendingTrimSeek; return;
+      }
+      pendingTrimSeek = null; previewReady();
+      if (parodyCover && parodyCover.reveal && source.readyState >= 2) parodyCover.reveal();
+    });
+    source.addEventListener('error', function () {
+      status.textContent = 'The reference video could not load. Tap the Pine Box logo to retry.';
+      send.disabled = true;
+    });
+    retrySource.addEventListener('click', function () {
+      if (!source.getAttribute('src') || source.error) paint();
+      source.play().catch(function (error) { status.textContent = 'Reference playback failed: ' + error.message; });
+    });
     source.addEventListener('loadedmetadata', setTrim);
     inControl.slider.addEventListener('input', function () {
       if (!trimUsable) return;
       trimStart = Math.max(0, Math.min(Number(inControl.slider.value), trimDuration - 22));
       trimEnd = Math.max(trimStart + 22, Math.min(trimEnd, trimStart + 150, trimDuration));
-      showTrim(); source.currentTime = trimStart / 10;
+      showTrim(); seekTrim(trimStart / 10);
     });
     outControl.slider.addEventListener('input', function () {
       if (!trimUsable) return;
       trimEnd = Math.max(trimStart + 22,
         Math.min(Number(outControl.slider.value), trimStart + 150, trimDuration));
-      showTrim(); source.currentTime = Math.max(trimStart, trimEnd - 1) / 10;
+      showTrim(); seekTrim(Math.max(trimStart, trimEnd - 1) / 10);
     });
     source.addEventListener('play', function () {
       if (trimUsable && (source.currentTime < trimStart / 10 ||
@@ -1451,6 +1483,7 @@
       label.textContent = (index + 1) + ' of ' + rows.length + ' - ' + row.sting;
       prev.disabled = index <= 0; next.disabled = index >= rows.length - 1;
       trimReady = false; trimUsable = false; trim.hidden = true;
+      pendingTrimSeek = null;
       send.disabled = true;
       previewWaiting();
       try { source.pause(); } catch (err) { /* changing source */ }
@@ -5547,7 +5580,7 @@
          SFX dialogs (the editor and inspector) are different nodes and must
          still retire the native surface. */
       if (el === host
-          || /sfx-tv-frame|sfx-tv-host/.test(String(el.className || ''))) continue;
+          || /sfx-tv-frame|sfx-tv-host|pine-field-mics/.test(String(el.className || ''))) continue;
       if (r.right > x1 && r.left < x2 && r.bottom > y1 && r.top < y2) return true;
     }
     return false;
@@ -5664,25 +5697,15 @@
   function wallReconcile(st) {
     var bridge = api();
     if (!bridge || typeof bridge.videoWall !== 'function') return;
-    var want, wide, panelOwns;
+    var want, wide;
     try {
-      panelOwns = listenOwnsPicture();
-      /* [#1448] full-bleed while the listen view is bare - there is no
-         panel over the picture there, so the surface may have all of it.
-         An ordinary Listen view is the opposite: its HTML backdrop owns
-         the picture even when the floating set remembered fullscreen.
-         Letting that unrelated preference win hid both renderers. */
-      wide = !panelOwns && (fullWanted() || (listenUp() && listenBare()));
-      /* [#1448b] AND BARE OUTRANKS THE VEIL. listen.js veils this module
-         so the endless clip is not on screen twice (#1184/#1434), which
-         is right while the PAGE draws the wallpaper. Bare, the page is
-         not meant to draw it at all, so the veil is answering a question
-         nobody is asking - measured, the surface stayed
-         `{"on":true,"veiled":true}` on a bare view. The "twice" it guards
-         against is honoured by pageBackdrop(false) below instead. */
-      want = (!!veiled && !wide) || panelOwns || uiOverPicture();
+      /* Normal Listen keeps the native PIP visible. Fullscreen Listen uses
+         that same hardware surface full-bleed. There is never a second
+         WebView decoder trying to follow it. */
+      wide = fullWanted() || (listenUp() && listenBare());
+      want = uiOverPicture();
     } catch (err) { return; }
-    pageBackdrop(!wide);
+    pageBackdrop(!(wallHas || (st && st.on)) || want);
     var shapeChanged = (wallWide !== wide);
     if (!shapeChanged && st && typeof st.veiled === 'boolean'
         && !!st.veiled === want) return;
@@ -5864,6 +5887,26 @@
   }
 
   function wallRunning() { return wallHas; }
+
+  function repairEndless() {
+    var bridge = api();
+    if (!bridge || typeof bridge.videoWall !== 'function') {
+      return Promise.reject(new Error('This device has no native endless-video player.'));
+    }
+    wallWant = true;
+    return bridge.videoWall('repair', nativeWallRect()).then(function (got) {
+      var state = wallState(got);
+      wallHas = !!(state && state.on);
+      if (!wallHas) throw new Error((state && state.last_error) || 'The endless player did not restart.');
+      wallTakesOver();
+      wallReconcile(state);
+      wallFollow();
+      return state;
+    }, function (error) {
+      wallWant = null; wallHas = false;
+      throw error;
+    });
+  }
 
   async function poll() {
     wireDuck();                                            /* #1167 */
@@ -6542,6 +6585,23 @@
     matchRow.appendChild(matchDial);
     matchRow.appendChild(matchSay);
     paintMatch(null);
+    var repair = document.createElement('button');
+    repair.type = 'button';
+    repair.textContent = 'Repair endless video';
+    repair.setAttribute('aria-label', 'Repair endless video playback');
+    repair.setAttribute('style', 'min-height:36px;border-radius:8px;border:1px solid #2a7180;background:#102b31;color:#dfe7ee;cursor:pointer');
+    repair.addEventListener('click', function (ev) {
+      ev.stopPropagation();
+      repair.disabled = true;
+      note.textContent = 'Checking the cached native player and restoring its video surface...';
+      repairEndless().then(function (state) {
+        var queued = Number(state.queued) || 0;
+        note.textContent = 'Restored native endless video: ' + (state.playback || 'starting')
+          + ', ' + queued + ' clip' + (queued === 1 ? '' : 's') + ' queued.';
+      }, function (err) {
+        note.textContent = 'Repair could not restore video: ' + String((err && err.message) || err).slice(0, 130);
+      }).finally(function () { repair.disabled = false; });
+    });
     var close = document.createElement('button');
     close.type = 'button';
     close.textContent = 'Close';
@@ -6567,9 +6627,10 @@
         function (v) { return v + '% of his clips carry a picture (mp4 vs mp3)'; }, 'share'), note);
       box.insertBefore(row('Clip length the endless set aims for', 0, 60, 1, Number((st && st.length) || 0),
         function (v) { return v ? ('about ' + v + ' seconds (draws between ' + Math.round(v * 0.6) + ' and ' + Math.round(v * 1.6) + ')') : 'any length in the library'; }, 'length'), note);
+      box.insertBefore(repair, note);
       box.appendChild(close);
       note.textContent = String((st && st.say) || '');
-    }, function (err) { note.textContent = 'the station did not answer: ' + String((err && err.message) || err).slice(0, 60); box.appendChild(close); });
+    }, function (err) { note.textContent = 'the station did not answer: ' + String((err && err.message) || err).slice(0, 60); box.appendChild(repair); box.appendChild(close); });
   }
 
   function endlessFlip() {
@@ -6589,6 +6650,8 @@
        hide the floating set while the view shows the clip as wallpaper. */
     timeline: function () { return tlRead(); },   /* [#1219] */
     endless: function () { return !!endlessOn; },
+    nativeWallActive: function () { return !!wallHas; },
+    repairEndless: repairEndless,
     veil: function (on) {
       veiled = !!on;
       try { if (host) host.style.visibility = veiled ? 'hidden' : ''; } catch (err) { /* no set up */ }

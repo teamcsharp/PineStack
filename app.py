@@ -79,6 +79,8 @@ import paperwork_fields                  # [#1231] the inspector's editable boxe
 import track_talk_segment                # #1179: a record's talk desk
 import record_binding                    # #1237: a line bound to a record airs with it
 import phrase_trace
+import line_repeat
+import prompt_history
 import word_cause_edits
 import clip_speech
 import comfy_workshop
@@ -30630,6 +30632,19 @@ def said_forget(text: str) -> None:
 
 
 LINE_BLACKLIST = Blacklist(data_path("line_blacklist.json"))
+PROMPT_HISTORY = prompt_history.History(data_path("prompt_history.sqlite3"))
+prompt_history.install(app, globals(), PROMPT_HISTORY)
+
+
+async def recorded_ollama_post(client: Any, url: str, *, purpose: str = "local inference", **kwargs: Any) -> Any:
+    def context() -> dict[str, Any]:
+        settings = load_settings()
+        prompts = settings.get("prompts") or []
+        active = prompts[int(settings.get("active_prompt") or 0) % len(prompts)] if prompts else {}
+        return {"dj": copy.deepcopy(dj_settings()), "agent_prompt": copy.deepcopy(active),
+                "schedule_kind": str(_RADIO.get("sched_kind") or ""),
+                "schedule_prompt": str(_RADIO.get("sched_prompt") or "")}
+    return await PROMPT_HISTORY.post(client, url, context=context, purpose=purpose, **kwargs)
 
 
 def line_forgotten(text: str) -> bool:
@@ -72147,8 +72162,8 @@ async def describe_gallery_image(want: str = "",
         _look = str(prompt or "").strip() or vision_prompt_active()
         _vt0 = time.monotonic()
         async with _OLLAMA_GATE, httpx.AsyncClient(timeout=120) as client:
-            response = await client.post(
-                f"{OLLAMA_URL}/api/chat",
+            response = await recorded_ollama_post(client,
+                f"{OLLAMA_URL}/api/chat", purpose="gallery vision",
                 json={
                     # A model that can actually SEE (#441).
                     "model": VISION_MODEL,
@@ -110080,7 +110095,7 @@ async def ask_model(prompt: str, limit: int = 300,
         pass
     _MODEL_CALLS.append(_row)
     try:                                                    # #1020 (G1)
-        airlog_model_call(_row, {**_spent, "prompt_eval_count":
+        airlog_model_call({**_row, "prompt": str(prompt), "script": kept}, {**_spent, "prompt_eval_count":
                                  result.get("prompt_eval_count") or 0},
                           took)
     except Exception:  # noqa: BLE001
@@ -110208,9 +110223,10 @@ async def call_ollama(
                                                       "body": wire_body})
             if globals().get("system2_capture_model"):
                 system2_capture_model(messages, options, model, purpose)
-            response = await client.post(
+            response = await recorded_ollama_post(client,
                 f"{OLLAMA_URL}/api/chat",
                 json=wire_body,
+                purpose=purpose,
             )
             response.raise_for_status()
             result = response.json()
@@ -128540,6 +128556,109 @@ async def api_said_forget(
             "say": "This line is barred from future speech; an already playing take may finish."}
 
 
+def line_repeat_snapshot(line_id: str, text: str = "") -> dict[str, Any]:
+    """Disk reads and matching stay off the broadcast event loop."""
+    now = time.time()
+    row = line_row_of(line_id)
+    text = str(row.get("text") or text or "").strip()
+    if not line_repeat.normalize(text):
+        raise HTTPException(status_code=400, detail="A complete dialogue line is required")
+    rows = airlog_rows(now - 48 * 3600, now + 1, quiet=True)
+    rows.extend(dict(r) for r in list(_RADIO.get("chat") or []) if isinstance(r, dict))
+    calls, clipped = line_repeat.read_calls(REPEAT_CALLS_PATH, now - 48 * 3600)
+    calls.extend(dict(r) for r in list(_MODEL_CALLS) if isinstance(r, dict))
+    for r in rows:
+        written = (r.get("trace") or {}).get("written") or {}
+        if written.get("script"):
+            calls.append(dict(written))
+    report = line_repeat.analyze(text, rows, calls, now)
+    if clipped:
+        report["coverage"] += " Writing evidence is limited to the last 32 MiB of retained calls."
+    carriers = []
+    for kind, stock in [("banter", list(_LARDER))] + [
+            (str(k), list(v or [])) for k, v in list(_SHELF.items())]:
+        for candidate in stock:
+            entry = dialogue_entry(candidate) or candidate
+            if (line_repeat.script_contains(entry.get("script"), text)
+                    or any(line_repeat.normalize(t.get("text")) == line_repeat.normalize(text)
+                           for t in entry.get("takes", []) if isinstance(t, dict))):
+                carriers.append({"kind": kind, "id": alt_sid_of(kind, candidate),
+                                 "system": "prepared recordings", "at": entry.get("at"),
+                                 "aired": candidate.get("aired"), "heard": candidate.get("heard")})
+    for candidate in list(_gold_rows()):
+        if line_repeat.normalize(candidate.get("text")) == line_repeat.normalize(text):
+            carriers.append({"kind": "gold", "id": str(candidate.get("id") or ""),
+                             "system": "gold reuse bank", "at": candidate.get("at")})
+    kind, _ = round_of_line(row)
+    if not kind:
+        kind = str(row.get("round") or row.get("kind") or "")
+    if kind not in ALT_PREP_KINDS:
+        kinds = {c["kind"] for c in carriers if c["kind"] in ALT_PREP_KINDS}
+        kind = next(iter(kinds)) if len(kinds) == 1 else ""
+    prompt = schedule_segment_prompt(kind=kind) if kind else {}
+    report.update(ok=True, line_id=line_id, text=text, now=now,
+                  blocked=line_forgotten(text), resolved=bool(row), kind=kind,
+                  carriers=carriers[:60], omitted_carriers=max(0, len(carriers) - 60),
+                  current_inputs=scene_inputs(kind, str(row.get("who") or "")),
+                  current_prompt={k: prompt.get(k) for k in (
+                      "text", "source", "variant", "active", "window", "alternatives", "uses")},
+                  can_generate=kind in ALT_PREP_KINDS,
+                  generation_why="" if kind in ALT_PREP_KINDS else "No unique preparation system is linked to this line.")
+    if carriers:
+        report["causes"].append("Prepared stock still contains this line in: " + ", ".join(
+            sorted({c["system"] + " / " + c["kind"] for c in carriers})) + ".")
+    return report
+
+
+@app.get("/api/said/repeats")
+async def line_repeats_api(
+    line_id: str = "", text: str = "",
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_read_auth(authorization)
+    if len(line_id) > 160 or len(text) > 4000:
+        raise HTTPException(status_code=400, detail="Dialogue selection is too large")
+    return await asyncio.to_thread(line_repeat_snapshot, line_id, text)
+
+
+@app.post("/api/said/repeats/repair")
+async def line_repeat_repair_api(
+    request: Request, authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_auth(authorization)
+    payload = await request.json()
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Expected an object")
+    action = str(payload.get("action") or "")
+    if action not in ("generate", "refresh_plan"):
+        raise HTTPException(status_code=400, detail="Unknown repeat repair")
+    line_id = str(payload.get("line_id") or "")[:160]
+    report = await asyncio.to_thread(line_repeat_snapshot, line_id, str(payload.get("text") or "")[:4000])
+    if action == "refresh_plan":
+        _INVENTORY_PLAN["at"] = 0.0
+        await _system2().refresh(force=True, want_status=False)
+        return {"ok": True, "say": "Prepared inventory and the running plan were re-evaluated. History and prompts were preserved."}
+    kind = report["kind"]
+    if not report["can_generate"]:
+        raise HTTPException(status_code=409, detail=report["generation_why"])
+    active = [j for j in _ALT_JOBS.values() if j.get("state") in ("queued", "waiting", "writing")]
+    existing = next((j for j in active if j.get("repeat_key") == line_repeat.fingerprint(report["text"])), None)
+    if existing:
+        return {"ok": True, "job": existing["job"], "say": "Fresh material is already queued for this line."}
+    if len(active) >= ALT_GEN_LIVE:
+        raise HTTPException(status_code=409, detail="The writing queue is full; let the current jobs finish first")
+    current = await asyncio.to_thread(schedule_segment_prompt, kind=kind)
+    brief = str(current.get("clause") or current.get("text") or "") + (
+        "\nOperator requests genuinely new material, a different premise and new dialogue. "
+        "Do not repeat or paraphrase this rejected turn: " + report["text"])
+    job = "repeat_" + uuid.uuid4().hex[:10]
+    alt_job_put(job, kind=kind, count=1, state="queued", made=0, new=[], why="",
+                repeat_key=line_repeat.fingerprint(report["text"]), source=line_id)
+    asyncio.create_task(alt_generate_job(job, kind, 1, brief=brief))
+    pipeline_log("lookahead", "operator requested fresh " + kind + " material after repeat diagnosis", extra=line_id)
+    return {"ok": True, "job": job, "say": "Fresh " + kind + " material queued for the next quiet writing window."}
+
+
 @app.delete("/api/phrase/ban")                                 # [#1239]
 async def phrase_unban_api(
     q: str = "",
@@ -131306,7 +131425,7 @@ async def said_why_api(
     want = str(line_id or "").strip()
     prov: dict[str, Any] = {}
     try:
-        prov = await dj_provenance_api(want, authorization)
+        prov = await dj_provenance_api(want, authorization=authorization)
     except HTTPException:
         prov = {}
     except Exception:  # noqa: BLE001
@@ -147804,6 +147923,17 @@ async def export_courier_file_api(
     return FileResponse(row["path"], filename=str(row.get("name") or "export"))
 
 
+@app.get("/api/export/courier/status/{jid}")
+async def export_courier_status_api(jid: str, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    require_read_auth(authorization)
+    rows = await asyncio.to_thread(courier_read)
+    row = next((r for r in rows if str(r.get("id")) == jid), None)
+    if not row:
+        raise HTTPException(404, "No such archive copy")
+    return {"id": jid, "state": row.get("state"), "why": row.get("why", ""),
+            "destination": row.get("dest") or GALLERY_EXPORT_SHARE}
+
+
 @app.post("/api/export/courier/done")
 async def export_courier_done_api(
     request: Request,
@@ -161364,8 +161494,8 @@ async def sfx_vision_bite(most: int = 0) -> dict[str, Any]:
             try:
                 blob = base64.b64encode(frame).decode()
                 async with _OLLAMA_GATE, httpx.AsyncClient(timeout=90) as client:
-                    answer = await client.post(
-                        f"{OLLAMA_URL}/api/chat",
+                    answer = await recorded_ollama_post(client,
+                        f"{OLLAMA_URL}/api/chat", purpose="sound effect vision",
                         json={"model": VISION_MODEL,
                               "messages": [{"role": "user",
                                             "content": SFX_VISION_ASK,
@@ -163097,6 +163227,8 @@ async def video_editor_splice_export(
                                      str(source_ids[0]))):
             raise
     try:
+        if payload.get("preview") is True:
+            return await asyncio.to_thread(sfx_edit_editor().start_splice_preview, payload)
         return await asyncio.to_thread(
             sfx_edit_editor().start_splice_export, payload, SFX_ADS_DIR,
             lambda path, seconds: sfx_db_write_row(path, seconds, 1))
@@ -163115,7 +163247,7 @@ async def video_editor_splice_status(
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     if "source_ids" not in row:
         raise HTTPException(status_code=404, detail="No such splice export")
-    if row.get("status") == "complete":
+    if row.get("status") == "complete" and not row.get("preview"):
         path = SFX_ADS_DIR / str(row["name"])
         if path.is_file():
             sid = sfx_id(path)
@@ -165844,6 +165976,37 @@ async def list_generations(
     return {"generations": rows, "sig": sig}
 
 
+def generation_history_page(before: str = "", purpose: str = "", limit: int = 30) -> dict[str, Any]:
+    records = _read_all_generations()
+    end = len(records)
+    if before:
+        end = next((i for i in range(len(records) - 1, -1, -1)
+                    if str(records[i].get("prompt_id") or "") == before), -1)
+        if end < 0:
+            raise HTTPException(409, "The gallery changed; refresh its history")
+    limit = max(1, min(60, limit))
+    rows = []
+    for i in range(end - 1, -1, -1):
+        row = records[i]
+        if row.get("status") != "done" or not row.get("files") or not row.get("prompt_id"):
+            continue
+        if purpose and row.get("purpose") != purpose:
+            continue
+        rows.append(row)
+        if len(rows) > limit:
+            break
+    page = rows[:limit]
+    return {"generations": page, "next": str(page[-1]["prompt_id"]) if len(rows) > limit else "",
+            "sig": {str(f): media_sign("gen:" + str(f)) for r in page for f in r.get("files", [])}}
+
+
+@app.get("/api/generations/history")
+async def generations_history(before: str = "", purpose: str = "", limit: int = 30,
+                              authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    require_read_auth(authorization)
+    return await asyncio.to_thread(generation_history_page, before[:200], purpose[:80], limit)
+
+
 @app.get("/api/generations/poster-url/{filename}")
 async def generation_poster_url(
     filename: str, authorization: str | None = Header(default=None),
@@ -166017,6 +166180,32 @@ async def comfy_outputs(
             status_code=502, detail=f"ComfyUI unreachable: {exc}"
         ) from exc
     return {"files": _comfy_output_files(history)[:limit]}
+
+
+@app.get("/api/generations/media/{filename}")
+async def generation_media(filename: str, request: Request, t: str = "",
+                           authorization: str | None = Header(default=None)) -> Response:
+    if not (t and hmac.compare_digest(t, media_sign("gen:" + filename))):
+        require_listen_auth(t, authorization)
+    if not re.fullmatch(r"[\w.\- ()\[\]]{1,200}", filename) or ".." in filename:
+        raise HTTPException(400, "Bad filename")
+    path = await asyncio.to_thread(comfy_output_find, filename)
+    if not path:
+        raise HTTPException(404, "The generated media file is missing from the output archive")
+    size = await asyncio.to_thread(lambda: path.stat().st_size)
+    if size <= 0:
+        raise HTTPException(409, "The generated media file is empty")
+    kind = SFX_VIDEO_TYPES.get(path.suffix.lower()) or _IMAGE_TYPES.get(path.suffix.lower(), "application/octet-stream")
+    headers = {"Accept-Ranges": "bytes", "X-Content-Type-Options": "nosniff",
+               "Cache-Control": "private, max-age=3600"}
+    window = _range_slice(str(request.headers.get("range") or ""), size)
+    if window == (-1, -1):
+        return Response(status_code=416, headers={"Content-Range": f"bytes */{size}"})
+    if window:
+        first, last = window
+        headers.update({"Content-Range": f"bytes {first}-{last}/{size}", "Content-Length": str(last - first + 1)})
+        return StreamingResponse(_range_stream(path, first, last), status_code=206, media_type=kind, headers=headers)
+    return FileResponse(path, media_type=kind, headers=headers)
 
 
 @app.get("/api/generations/image/{filename}")
@@ -166653,7 +166842,7 @@ def workshop_reference_view(row: dict[str, Any]) -> dict[str, Any]:
             sid = sfx_id(path) if kind == "video" else ""
             return {"available": True, "id": source, "kind": kind,
                     "name": path.stem, "source_type": source_type,
-                    "url": ("/api/generations/image/" + quote(name)
+                    "url": ("/api/generations/" + ("media/" if kind == "video" else "image/") + quote(name)
                             + "?t=" + media_sign("gen:" + name)),
                     "poster": (f"/api/sfx/poster/{sid}?t={media_sign(sid)}"
                                if sid else "")}
@@ -166823,8 +167012,8 @@ async def workshop_analyze_generation(row: dict[str, Any]) -> str:
         "across the supplied frames, text on screen, visual defects, and how "
         "faithfully it follows this generation direction: " + request_text)
     async with _OLLAMA_GATE, httpx.AsyncClient(timeout=150) as client:
-        response = await client.post(
-            f"{OLLAMA_URL}/api/chat",
+        response = await recorded_ollama_post(client,
+            f"{OLLAMA_URL}/api/chat", purpose="generated media analysis",
             json={"model": VISION_MODEL,
                   "messages": [{"role": "user", "content": look,
                                 "images": images}],
@@ -166990,7 +167179,7 @@ async def _comfy_workshop_render_payload(payload: dict[str, Any]) -> dict[str, A
                       "source_generation": str(
                           payload.get("source_generation") or "")[:120],
                       "variant_of": str(
-                          payload.get("source_generation") or "")[:120],
+                          payload.get("variant_of") or payload.get("source_generation") or "")[:120],
                       "air_it": bool(payload.get("air_it")),
                       "frames": frame_count, "steps": step_count,
                       "seed": noise_seed, "at_share": at_share,
@@ -167417,6 +167606,7 @@ async def comfy_workshop_variant(
 AIR_LOG_PATH = data_path("air_log.jsonl")
 NEWS_SAID_PATH = data_path("news_said.jsonl")
 MODEL_CALLS_PATH = data_path("model_calls.jsonl")
+REPEAT_CALLS_PATH = data_path("repeat_calls.jsonl")
 HEAT_RING_PATH = data_path("heat_ring.json")
 PAUSE_LOG_PATH = data_path("pause_log.jsonl")
 AIRLOG_KEEP_S = 48 * 3600.0             # every ledger here keeps two days
@@ -167663,6 +167853,7 @@ def airlog_row_from(entry: dict[str, Any]) -> dict[str, Any]:
                  or ("caller" if who in ("caller", "caller2") else "")
                  or (kind if kind in AIRLOG_TURN_ROUNDS else "banter"),
         "text": " ".join(str(entry.get("text") or "").split())[:600],
+        "repeat_text_key": line_repeat.fingerprint(entry.get("text") or ""),
         "aired": str(entry.get("aired") or ""),
         # 2026-09-15 (#1422c): AND THE HEARING STAMP, BESIDE IT.
         #
@@ -168101,6 +168292,7 @@ def airlog_compact_all() -> dict[str, int]:
     """The hourly housekeeping, all of it in one thread."""
     out = {"air_log": airlog_compact()}
     out["model_calls"] = airlog_jsonl_trim(MODEL_CALLS_PATH, AIRLOG_KEEP_S)
+    out["repeat_calls"] = airlog_jsonl_trim(REPEAT_CALLS_PATH, AIRLOG_KEEP_S)
     out["news_said"] = airlog_jsonl_trim(NEWS_SAID_PATH, 7 * 86400.0, "ts")
     out["pause_log"] = airlog_jsonl_trim(PAUSE_LOG_PATH, 30 * 86400.0)
     return out
@@ -168599,6 +168791,14 @@ def airlog_model_call(row: dict[str, Any], spent: dict[str, Any] | None,
                if isinstance(row.get("segprompt"), dict) else {}),
         }
         airlog_append_bg(MODEL_CALLS_PATH, out)
+        # Keep prompt evidence out of the frequently-polled telemetry ledger.
+        airlog_append_bg(REPEAT_CALLS_PATH, {
+            **out, "prompt": str(row.get("prompt") or "")[:32000],
+            "script": str(row.get("script") or "")[:32000],
+            "temp": row.get("temp"), "seed": row.get("seed"),
+            "repeat_truncated": any(len(str(row.get(k) or "")) > 32000
+                                    for k in ("prompt", "script")),
+        })
     except Exception:  # noqa: BLE001
         pass
 
@@ -185504,8 +185704,8 @@ async def art_prompt_api(
     try:
         blob = base64.b64encode(path.read_bytes()).decode()
         async with _OLLAMA_GATE, httpx.AsyncClient(timeout=120) as client:
-            answer = await client.post(
-                f"{OLLAMA_URL}/api/chat",
+            answer = await recorded_ollama_post(client,
+                f"{OLLAMA_URL}/api/chat", purpose="image prompt recovery",
                 json={"model": VISION_MODEL,
                       # #1079: and this one too - same runner, same
                       # rebuild. (#1070: the pin rides the one options
@@ -195204,6 +195404,7 @@ function closeLightboxVideoEditor() {
   lightboxVideoEditor = null;
   if (typeof overlay.__pineCleanup === "function") overlay.__pineCleanup();
   overlay.remove();
+  document.body.classList.remove("pine-splice-open");
 }
 
 function openLightboxVideoEditor(path) {
@@ -195286,6 +195487,7 @@ function openLightboxVideoEditor(path) {
   window.addEventListener("message", onMessage);
   document.addEventListener("keydown", onKey);
   document.body.appendChild(overlay);
+  document.body.classList.add("pine-splice-open");
   lightboxVideoEditor = overlay;
   close.focus();
 }

@@ -1,5 +1,5 @@
 /* Git history kept dense enough for station work, with no speculative data. */
-.pine-console-change, .pine-console-orchestrator, .pine-console-talk-dot {
+.pine-console-gallery, .pine-console-change, .pine-console-orchestrator, .pine-console-talk-dot {
   flex: 0 0 24px; width: 24px; height: 20px; padding: 0; display: grid; place-items: center;
   border: 0; border-right: 1px solid #35414c; border-radius: 0; background: transparent;
   color: #65c7da; font: 700 14px/1 system-ui, sans-serif; cursor: pointer;

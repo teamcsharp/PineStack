@@ -29,7 +29,7 @@ test('V2 starts compact, track controls are icons, and timeline trim edges are d
   assert.match(js, /trimReadout\.textContent = 'In '.*'   Out '.*'   Length '/);
   assert.match(js, /node\.setPointerCapture\(event\.pointerId\)/);
   assert.match(html, /id="parodyTrimFrame"/);
-  assert.match(js, /function setTrimMode\(on\)/);
+  assert.match(js, /function setTrimMode\(on, keepJoin\)/);
   assert.match(js, /function queueTrimFrame\(current\)/);
   assert.match(js, /trimPreviewTarget = \{clip: current, local: local,/);
   assert.match(js, /Math\.abs\(preview\.currentTime - pending\) > \.035/);

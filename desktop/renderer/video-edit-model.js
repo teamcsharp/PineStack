@@ -150,7 +150,14 @@
     if (!clip) return 0;
     if (clip.track === 'overlay') return Math.max(0, finite(clip.start_s, 0));
     var total = 0;
-    for (var i = 0; i < index; i += 1) if (clips[i].track !== 'overlay') total += clips[i].out_s - clips[i].in_s;
+    var bases = 0;
+    for (var i = 0; i <= index; i += 1) {
+      var item = clips[i];
+      if (item.track === 'overlay') continue;
+      if (bases && item.transition && item.transition !== 'cut') total -= Math.max(0, finite(item.transition_s, 0));
+      if (i < index) total += item.out_s - item.in_s;
+      bases++;
+    }
     return total;
   }
   function spliceLength(clips) {
@@ -158,7 +165,7 @@
     clips.forEach(function (clip, index) {
       var duration = clip.out_s - clip.in_s;
       if (clip.track === 'overlay') end = Math.max(end, spliceStartOf(clips, index) + duration);
-      else { base += duration; end = Math.max(end, base); }
+      else { base = spliceStartOf(clips, index) + duration; end = Math.max(end, base); }
     });
     return end;
   }
@@ -166,6 +173,7 @@
     var total = spliceLength(clips), position = clamp(finite(at, 0), 0, total), offset = 0;
     for (var i = 0; i < clips.length; i += 1) {
       if (clips[i].track === 'overlay') continue;
+      offset = spliceStartOf(clips, i);
       var length = clips[i].out_s - clips[i].in_s;
       var lastBase = !clips.slice(i + 1).some(function (clip) { return clip.track !== 'overlay'; });
       if (position < offset + length || lastBase && position <= offset + length + 1e-6)

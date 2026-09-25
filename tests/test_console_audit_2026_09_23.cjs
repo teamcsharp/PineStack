@@ -9,6 +9,20 @@ const trace = fs.readFileSync(path.join(renderer, 'console-trace.js'), 'utf8');
 const css = fs.readFileSync(path.join(renderer, 'console-trace.css'), 'utf8');
 const chrome = fs.readFileSync(path.join(renderer, 'view-chrome.css'), 'utf8');
 
+test('repeated full activity snapshots do not churn the retained audit window', () => {
+  const vm = require('node:vm');
+  const code = line.slice(line.indexOf('  function keyOf('), line.indexOf('  function icon('));
+  const h = vm.runInNewContext('var seen = [], keys = Object.create(null), SEEN_MAX = 300;'
+    + code + '\n({remember, history})');
+  const rows = Array.from({length: 600}, (_, i) => ({at: i + 1, stage: 'voice', detail: 'line ' + i}));
+  rows.forEach(h.remember);
+  assert.equal(h.history().length, 300);
+  assert.equal(rows.filter(h.remember).length, 0);
+  assert.equal(h.remember({id: 1, at: 601, stage: 'flow'}), true);
+  assert.equal(rows.filter(h.remember).length, 0);
+  assert.equal(h.history()[0].id, 1);
+});
+
 test('the marquee follows the durable journal incrementally and retains 300 events', () => {
   assert.match(line, /var SEEN_MAX = 300/);
   assert.match(line, /\/api\/dj\/flow\?lean=1&limit=/);

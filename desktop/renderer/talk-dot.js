@@ -439,34 +439,18 @@
     return node;
   }
   function voiceAdPopup(row) {
-    if (!row || el('pineVoiceAdPopup')) return;
-    var file = String(((row.files || [])[0]) || '');
-    if (!file) return;
-    var veil = document.createElement('div');
-    veil.id = 'pineVoiceAdPopup'; veil.className = 'pine-voice-ad-popup';
-    var box = document.createElement('section'); box.className = 'pine-voice-ad-card';
-    box.appendChild(adNode('b', '', 'Your Pine Box ad is ready'));
-    box.appendChild(adNode('span', '', String(row.request || row.tags || 'H3 video ad').slice(0, 320)));
-    var video = document.createElement('video');
-    video.controls = true; video.playsInline = true; video.preload = 'metadata';
-    video.src = where() + '/api/generations/image/' + encodeURIComponent(file);
-    box.appendChild(video);
-    var actions = adNode('div', 'pine-voice-ad-actions');
-    var open = adNode('a', 'pine-voice-ad-open', 'Open media');
-    open.href = video.src; open.target = '_blank'; open.rel = 'noopener';
-    var close = adNode('button', 'pine-voice-ad-close', 'Close'); close.type = 'button';
-    close.addEventListener('click', function () { veil.remove(); });
-    actions.appendChild(open); actions.appendChild(close); box.appendChild(actions);
-    veil.addEventListener('click', function (event) { if (event.target === veil) veil.remove(); });
-    veil.appendChild(box); document.body.appendChild(veil);
-    try { video.play(); } catch (err) { /* media still has visible controls */ }
+    if (!row || el('pineVoiceAdPopup') || !root.PineAdViewer) return;
+    root.PineAdViewer.open(row);
   }
   function pollVoiceAds() {
-    if (!root.fetch) return;
-    root.fetch(where() + '/api/generations?limit=40').then(function (response) {
+    if (!root.fetch && !(root.pineDesktop && root.pineDesktop.get)) return;
+    var read = root.pineDesktop && root.pineDesktop.get
+      ? root.pineDesktop.get('/api/generations?limit=40')
+      : root.fetch(where() + '/api/generations?limit=40').then(function (response) {
       if (!response.ok) throw new Error('gallery unavailable');
       return response.json();
-    }).then(function (payload) {
+    });
+    read.then(function (payload) {
       var ready = [];
       (Array.isArray(payload && payload.generations) ? payload.generations : []).forEach(function (row) {
         if (!row || String(row.purpose || '') !== 'voice_ad') return;
@@ -2037,6 +2021,7 @@
     }
     function textField(node) {
       if (!node || node.disabled || node.readOnly) return false;
+      if (node.hasAttribute && node.hasAttribute('data-pine-mic-owned')) return false;
       if (node.tagName === 'TEXTAREA') return true;
       if (node.tagName === 'INPUT') return /^(text|search|url|email|tel|number)$/.test(node.type || 'text');
       return node.isContentEditable === true && !node.parentElement?.isContentEditable;

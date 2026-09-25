@@ -57,6 +57,15 @@ test('parody trims and queues without refusing; dictation appends',
       }
       const file = files[pathname];
       if (!file) { response.writeHead(404); response.end(); return; }
+      if (file[1] === 'video/mp4') {
+        const media = fs.readFileSync(path.join(root, file[0]));
+        const range = String(request.headers.range || '').match(/^bytes=(\d+)-(\d*)$/);
+        const start = range ? Number(range[1]) : 0;
+        const end = range && range[2] ? Math.min(Number(range[2]),media.length-1) : media.length-1;
+        const headers = {'Content-Type':'video/mp4','Accept-Ranges':'bytes','Content-Length':end-start+1};
+        if (range) headers['Content-Range'] = `bytes ${start}-${end}/${media.length}`;
+        response.writeHead(range ? 206 : 200,headers);response.end(media.subarray(start,end+1));return;
+      }
       response.writeHead(200, {'Content-Type': file[1]});
       fs.createReadStream(path.join(root, file[0])).pipe(response);
     });
@@ -80,6 +89,28 @@ test('parody trims and queues without refusing; dictation appends',
           const sliders = page.locator('.sfx-tv-parody-trim input[type=range]');
           await sliders.nth(0).evaluate(el => { el.value = '4'; el.dispatchEvent(new Event('input')); });
           await sliders.nth(1).evaluate(el => { el.value = '28'; el.dispatchEvent(new Event('input')); });
+          await page.waitForFunction(() => {
+            const video = document.querySelector('.sfx-tv-parody-stage video');
+            return !video.seeking && Math.abs(video.currentTime - 2.7) < .04;
+          }).catch(async error => {
+            console.log(await page.locator('.sfx-tv-parody-stage video').evaluate(v=>({time:v.currentTime,duration:v.duration,ready:v.readyState,seeking:v.seeking,error:v.error?.message})));
+            throw error;
+          });
+          await page.locator('.sfx-tv-parody-stage video').evaluate(video => {
+            video.dispatchEvent(new Event('waiting'));
+            video.dispatchEvent(new Event('seeked'));
+          });
+          assert.equal(await page.locator('.sfx-tv-parody-stage video').evaluate(video => getComputedStyle(video).visibility), 'visible');
+          const relativeMic = () => page.evaluate(() => {
+            const field = document.querySelector('.sfx-tv-parody-field textarea').getBoundingClientRect();
+            const mic = document.querySelector('.sfx-tv-parody-field .sfx-tv-parody-mic').getBoundingClientRect();
+            return {right:field.right-mic.right, center:mic.y+mic.height/2-field.y-field.height/2};
+          });
+          const beforeMic = await relativeMic();
+          await page.locator('.sfx-tv-parody').evaluate(box => { box.scrollTop += 90; });
+          const afterMic = await relativeMic();
+          assert.ok(Math.abs(beforeMic.right-afterMic.right)<1);
+          assert.ok(Math.abs(afterMic.center)<1);
           await page.getByRole('button', {name:'Send to H3'}).click();
           await page.getByText('Stinger saved in the server queue').waitFor();
           const body = await page.evaluate(() => sent.find(item =>

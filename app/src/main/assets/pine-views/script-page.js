@@ -15062,6 +15062,15 @@
     addBand('sequence', liveSequence, 'c:script');
     addBand('sync', sync, 'c:waveform');
     addBand('readiness', readiness, 'c:calendar');
+    var promptHistory = make('button', 'sp-band-reopen');
+    promptHistory.type = 'button'; promptHistory.title = 'System prompt history';
+    promptHistory.setAttribute('aria-label', 'System prompt history');
+    promptHistory.setAttribute('aria-pressed', 'false');
+    promptHistory.innerHTML = folderIcon('c:time', 'System prompt history') || 'History';
+    promptHistory.addEventListener('click', function () {
+      if (root.PinePromptHistory) root.PinePromptHistory.toggle(right, promptHistory);
+    });
+    restore.appendChild(promptHistory);
     top.appendChild(bands);
     top.appendChild(restore);
     right.appendChild(top);

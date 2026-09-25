@@ -13,8 +13,10 @@ if (-not (Test-Path -LiteralPath $views) -or -not (Test-Path -LiteralPath $sampl
 }
 
 $copied = 0
+foreach ($name in @('line-repeat.js', 'line-repeat.css', 'ad-viewer.js', 'prompt-history.js', 'prompt-history.css')) {
+    Copy-Item -LiteralPath (Join-Path $renderer $name) -Destination (Join-Path $views $name)
+}
 Get-ChildItem -LiteralPath $views -File | ForEach-Object {
-    if ($_.Name -eq 'talk-dot.js') { return }
     $source = Join-Path $renderer $_.Name
     if (Test-Path -LiteralPath $source) {
         Copy-Item -LiteralPath $source -Destination $_.FullName

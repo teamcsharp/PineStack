@@ -211,6 +211,15 @@
      * thumbs, where the finger was pointed. See sfxOf() below. */
     var sfxRow = sfxOf(line);
     if (sfxRow) votes.appendChild(binButton(line, sfxRow));
+    if (!sfxRow && root.PineLineRepeat) {
+      var repeat = make('button', 'la-vote la-repeat');
+      repeat.type = 'button';
+      repeat.title = 'Diagnose repeated dialogue';
+      repeat.setAttribute('aria-label', repeat.title);
+      repeat.appendChild(icon('c:recycle'));
+      press(repeat, function () { close(); root.PineLineRepeat.open(line); });
+      votes.appendChild(repeat);
+    }
     if (line.id && root.PineSegmentFlow && typeof root.PineSegmentFlow.openForLine === 'function') {
       var graph = make('button', 'la-vote la-flow-graph');
       graph.type = 'button';

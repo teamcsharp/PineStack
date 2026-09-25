@@ -114,6 +114,7 @@ class PineDesktopBridge(
             "screenShot", "replayExport", "replayEdit", "replayKeepEdited", "hotCorners", "hotCornersSet",
             /* #1426: the native endless-video surface. */
             "videoWall",
+            "splicePreview",
             /* #1148: "Whenever I access the screen capture to follow
              * report, I also want to be able to scrub between the last
              * five seconds of the broadcast to find the right frame." */
@@ -1319,6 +1320,13 @@ class PineDesktopBridge(
          * should be drawing a picture itself. A build with no wall (no
          * activity yet) answers on:false and the page keeps its <video>,
          * which is exactly the old behaviour. */
+        "splicePreview" -> {
+            val result = withContext(Dispatchers.Main) {
+                splicePreview?.command(args.optString(0, "state"), args.optJSONObject(1) ?: JSONObject())
+                    ?: JSONObject().put("supported", false)
+            }
+            BridgeEnvelope.ok(id, result.toString())
+        }
         "videoWall" -> {
             val wall = videoWall
             val want = args.optString(0, "state")
@@ -1371,6 +1379,7 @@ class PineDesktopBridge(
                             clip.optDouble("seconds", clip.optDouble("length", 0.0)))
                     }
                     "replay" -> wall.replay()
+                    "repair" -> wall.repair()
                     "shuffle" -> wall.shuffleQueue(
                         args.optJSONObject(1)?.optJSONArray("clips"))
                     /* [#1192]: "Offer a slider for setting the volume of
@@ -1552,6 +1561,7 @@ class PineDesktopBridge(
      * and one 427x240 video alone on the document. See PineVideoWall for
      * the numbers. The page's job is now only to say WHERE and WHETHER. */
     @Volatile var videoWall: com.pinebox.kiosk.video.PineVideoWall? = null
+    @Volatile var splicePreview: com.pinebox.kiosk.video.PineSplicePreview? = null
 
     /**
      * HOW LOUD IT IS RIGHT NOW, 0..1.

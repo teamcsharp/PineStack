@@ -1736,10 +1736,111 @@
     var overlayPreview = el('parodyOverlayVideo'), preloadPreview = el('parodyPreloadVideo'), maskCanvas = el('parodyMaskCanvas');
     var programPlayers = [preview, preloadPreview], previewCover = el('parodyCover');
     var trimFrameLabel = el('parodyTrimFrame');
+    var joinFrame = document.createElement('figure'), joinVideo = document.createElement('video'), joinLabel = document.createElement('figcaption');
+    joinFrame.className = 'parody-join-frame'; joinFrame.hidden = true;
+    joinVideo.playsInline = true; joinVideo.preload = 'auto'; joinVideo.muted = true;
+    joinVideo.setAttribute('aria-label', 'Connecting boundary frame');
+    joinFrame.append(joinVideo, joinLabel); el('parodyPreview').appendChild(joinFrame);
+    var joinTarget = null, frameRequest = 0, framePlayer = null;
+    var metrics = {handoffs:0, warmHandoffs:0, coldHandoffs:0, frames:0, maxFrameGapMs:0, lastFrameAt:0, maxHandoffMs:0};
+    var handoffAt = 0;
+    window.PineSpliceDiagnostics = function () {
+      var quality = programPlayers.reduce(function (total, player) {
+        var current = player.getVideoPlaybackQuality ? player.getVideoPlaybackQuality() : {};
+        total.dropped += current.droppedVideoFrames || 0; total.frames += current.totalVideoFrames || 0;
+        return total;
+      }, {dropped:0,frames:0});
+      return Object.assign({}, metrics, {playing:playing, activeIndex:activeIndex, at:at,
+        pending:pending, trimActive:trimActive, joinTarget:joinTarget,
+        clips:clips.map(function (clip) { return {source_id:clip.source_id,in_s:clip.in_s,out_s:clip.out_s}; }),
+        droppedFrames:quality.dropped, totalFrames:quality.frames, cachedPreview:nativeCacheState,
+        cachePreparing:cachePreparing,cachePlaying:cachePlaying});
+    };
     var maskContext = maskCanvas.getContext('2d');
     var parent = window;
     try { if (window.parent !== window && window.parent.location.origin === location.origin) parent = window.parent; } catch (_) { /* standalone */ }
     var desktop = parent.pineDesktop || window.pineDesktop || {};
+    var cacheRevision = 0, cachePreparing = false, cachePlaying = false, cacheTimer = 0, nativeCacheState = null, cacheAspect = 640 / 384;
+    var cachedVideo = document.createElement('video');
+    cachedVideo.className = 'parody-cached-preview'; cachedVideo.playsInline = true; cachedVideo.preload = 'auto'; cachedVideo.hidden = true;
+    el('parodyPreview').appendChild(cachedVideo);
+    function cachedBody() {
+      var ids = model.spliceSourceIds(clips, sourceIds), first = sources[ids[0]] || {};
+      var body = model.spliceBody(ids, clips, '', params.get('save') || first.save_token || '', sources);
+      body.preview = true;
+      return body;
+    }
+    function cacheBox() {
+      var r = el('parodyPreview').getBoundingClientRect(), x = r.x, y = r.y, scale = 1;
+      if (parent !== window && window.frameElement) {
+        var frame = window.frameElement, outer = frame.getBoundingClientRect();
+        scale = outer.width / frame.offsetWidth;
+        x = outer.x + r.x * scale; y = outer.y + r.y * scale;
+      }
+      var ratio = parent.devicePixelRatio || 1;
+      var width = Math.min(r.width, r.height * cacheAspect), height = width / cacheAspect;
+      x += (r.width - width) * scale / 2; y += (r.height - height) * scale / 2;
+      return {x:Math.round(x * ratio),y:Math.round(y * ratio),w:Math.round(width * scale * ratio),h:Math.round(height * scale * ratio)};
+    }
+    async function playCachedSequence() {
+      if (cachePreparing || cachePlaying) { stop(); seekSequence(at); return; }
+      stop(); setTrimMode(false);
+      var mine = ++cacheRevision;
+      cachePreparing = true; setTransportPlaying(true); message('Preparing frame-accurate preview...');
+      try {
+        var body = cachedBody(), identity = JSON.stringify(body);
+        var result = await request('POST', '/api/video-editor/splice-exports', body);
+        while (!gone && mine === cacheRevision && !['complete','failed','error'].includes(result.status)) {
+          if (identity !== JSON.stringify(cachedBody())) { stop(); return; }
+          message('Caching preview... ' + Math.round(Number(result.progress || 0) * 100) + '%');
+          await wait(500);
+          if (mine !== cacheRevision || gone) return;
+          result = await request('GET', result.poll_url);
+        }
+        if (gone || mine !== cacheRevision) return;
+        if (identity !== JSON.stringify(cachedBody())) { stop(); return; }
+        if (result.status !== 'complete' || !result.url) throw new Error(result.error || 'The preview could not be rendered.');
+        if (at >= length() - .05) at = 0;
+        cachePreparing = false; cachePlaying = true; playing = true;
+        var startAt = at;
+        cacheAspect = result.width / result.height || cacheAspect;
+        el('parodyPreview').classList.add('is-cached-playing'); previewCover.hidden = true;
+        if (typeof desktop.splicePreview === 'function') {
+          var state = await desktop.splicePreview('prepare', Object.assign(cacheBox(), {id:result.id,at:at,muted:trackMuted}));
+          if (!state.supported) throw new Error('Native splice playback is unavailable on this build.');
+          async function pollNative() {
+            if (mine !== cacheRevision || gone) return;
+            try {
+              var got = await desktop.splicePreview('state');
+              if (mine !== cacheRevision || gone) return;
+              nativeCacheState = got;
+              if (got.phase === 'failed') throw new Error(got.error || 'The cached preview failed to play.');
+              if (got.phase === 'ready' || got.phase === 'ended') {
+                at = Math.min(length(), got.at); displayPosition(); message('Cached preview');
+              } else message('Buffering cached preview...');
+              if (got.phase === 'ended') { stop(); seekSequence(at); return; }
+              cacheTimer = setTimeout(pollNative, 100);
+            } catch (error) { if (mine === cacheRevision) { stop(); message(error.message, true); } }
+          }
+          pollNative();
+        } else {
+          cachedVideo.muted = trackMuted;
+          cachedVideo.src = result.url;
+          cachedVideo.onloadedmetadata = function () { if (mine === cacheRevision) cachedVideo.currentTime = startAt; };
+          cachedVideo.onplaying = function () { if (mine === cacheRevision) { cachedVideo.hidden = false; message('Cached preview'); } };
+          cachedVideo.load();
+          await cachedVideo.play();
+        }
+      } catch (error) { if (mine === cacheRevision) { stop(); message(error.message || 'Preview failed', true); } }
+    }
+    cachedVideo.addEventListener('timeupdate', function () {
+      if (cachePlaying) { at = cachedVideo.currentTime; displayPosition(); }
+    });
+    cachedVideo.addEventListener('ended', function () { if (cachePlaying) { at = length(); stop(); seekSequence(at); } });
+    cachedVideo.addEventListener('error', function () { if (cachePlaying) { stop(); message('The cached preview could not be decoded.', true); } });
+    window.addEventListener('resize', function () {
+      if (cachePlaying && desktop.splicePreview) desktop.splicePreview('box', cacheBox()).catch(function () {});
+    });
     el('recordingEditor').hidden = true;
     el('parodyEditor').hidden = false;
     setProgramRoles(preview, preloadPreview);
@@ -1808,10 +1909,58 @@
       button.title = isPlaying ? 'Pause sequence' : 'Play sequence';
     }
     function stop() {
+      cacheRevision++; clearTimeout(cacheTimer);
+      if ((cachePlaying || cachePreparing) && desktop.splicePreview) desktop.splicePreview('stop').catch(function () {});
+      cachePlaying = false; cachePreparing = false;
+      el('parodyPreview').classList.remove('is-cached-playing');
+      cachedVideo.pause(); cachedVideo.hidden = true;
       playing = false; programPlayers.forEach(function (media) { media.pause(); }); overlayPreview.pause();
+      cancelFrameClock(); metrics.lastFrameAt = 0; handoffAt = 0;
       setTransportPlaying(false);
     }
-    function setTrimMode(on) {
+    function cancelFrameClock() {
+      if (frameRequest && framePlayer && framePlayer.cancelVideoFrameCallback) framePlayer.cancelVideoFrameCallback(frameRequest);
+      frameRequest = 0; framePlayer = null;
+    }
+    function frameClock() {
+      if (!playing || gone || frameRequest || !preview.requestVideoFrameCallback) return;
+      var player = preview; framePlayer = player;
+      frameRequest = player.requestVideoFrameCallback(function (now, metadata) {
+        frameRequest = 0; framePlayer = null;
+        if (!playing || gone || player !== preview) return;
+        metrics.frames++;
+        if (handoffAt) { metrics.maxHandoffMs = Math.max(metrics.maxHandoffMs, now - handoffAt); handoffAt = 0; }
+        if (metrics.lastFrameAt) metrics.maxFrameGapMs = Math.max(metrics.maxFrameGapMs, now - metrics.lastFrameAt);
+        metrics.lastFrameAt = now;
+        updateFromVideo(metadata.mediaTime); frameClock();
+      });
+    }
+    function applyJoinSeek() {
+      if (!joinTarget || joinVideo.readyState < 1 || joinVideo.seeking) return;
+      if (Math.abs(joinVideo.currentTime - joinTarget.time) > .015) joinVideo.currentTime = joinTarget.time;
+      else if (joinVideo.readyState >= 2) joinVideo.style.visibility = 'visible';
+    }
+    joinVideo.addEventListener('loadedmetadata', applyJoinSeek);
+    joinVideo.addEventListener('seeked', applyJoinSeek);
+    joinVideo.addEventListener('loadeddata', applyJoinSeek);
+    joinVideo.addEventListener('error', function () { joinVideo.style.visibility = 'hidden'; joinLabel.textContent = 'Connecting frame unavailable'; });
+    function showJoin(index, edge) {
+      var step = edge === 'out' ? 1 : -1, neighbor = index + step;
+      while (neighbor >= 0 && neighbor < clips.length && clips[neighbor].track === 'overlay') neighbor += step;
+      var other = clips[neighbor], record = other && sources[other.source_id];
+      if (!record || clips[index].track === 'overlay') { joinFrame.hidden = true; joinTarget = null; return; }
+      var fps = Number(record.fps) || 30;
+      var time = edge === 'out' ? other.in_s : Math.max(other.in_s, other.out_s - 1 / fps);
+      var sameBoundary = joinTarget && joinTarget.source === other.source_id && Math.abs(joinTarget.time - time) < .0001;
+      joinTarget = {source:other.source_id,time:time,edge:edge === 'out' ? 'in' : 'out',index:neighbor};
+      joinFrame.hidden = false;
+      if (!sameBoundary) joinVideo.style.visibility = 'hidden';
+      joinLabel.textContent = (edge === 'out' ? 'NEXT IN ' : 'PREVIOUS OUT ') + model.clock(time);
+      if (joinVideo.dataset.sourceId !== other.source_id) {
+        joinVideo.dataset.sourceId = other.source_id; joinVideo.src = record.url; joinVideo.load();
+      } else applyJoinSeek();
+    }
+    function setTrimMode(on, keepJoin) {
       trimActive = !!on;
       el('parodyPreview').classList.toggle('is-trimming', trimActive);
       trimFrameLabel.hidden = !trimActive;
@@ -1823,6 +1972,10 @@
         maskCanvas.style.visibility = 'hidden';
       } else {
         maskCanvas.style.visibility = '';
+        if (!keepJoin) {
+          joinFrame.hidden = true; joinTarget = null;
+          joinVideo.pause(); joinVideo.removeAttribute('src'); delete joinVideo.dataset.sourceId; joinVideo.load();
+        }
       }
     }
     function displayPosition() {
@@ -1895,21 +2048,29 @@
          browser's buffer and causes the exact boundary hitch this player is
          meant to avoid. A keyed prebuffer stays resident until it is used. */
       if (preloadPreview.dataset.preloadKey === key) return;
+      var buffer = preloadPreview;
+      if (buffer.__clearWarm) buffer.__clearWarm();
       preloadPreview.pause(); preloadPreview.dataset.sourceId = next.source_id;
       preloadPreview.dataset.preloadKey = key; preloadPreview.dataset.ready = 'false';
-      preloadPreview.src = record.url; preloadPreview.load();
-      function sameTarget() { return preloadPreview.dataset.preloadKey === key; }
+      function sameTarget() { return !gone && buffer === preloadPreview && buffer.dataset.preloadKey === key; }
       function prime() {
         if (!sameTarget()) return;
-        try { preloadPreview.currentTime = next.in_s; } catch (_) { /* Metadata is still arriving. */ }
+        try { buffer.currentTime = next.in_s; } catch (_) { /* Metadata is still arriving. */ }
       }
       function warmed() {
-        if (!sameTarget() || preloadPreview.readyState < 3) return;
-        if (Math.abs(preloadPreview.currentTime - next.in_s) < .18) preloadPreview.dataset.ready = 'true';
+        if (!sameTarget() || buffer.readyState < 2 || buffer.seeking) return;
+        if (Math.abs(buffer.currentTime - next.in_s) < .04) buffer.dataset.ready = 'true';
       }
-      preloadPreview.addEventListener('loadedmetadata', prime, {once: true});
-      preloadPreview.addEventListener('seeked', warmed, {once: true});
-      preloadPreview.addEventListener('canplay', warmed, {once: true});
+      buffer.addEventListener('loadedmetadata', prime);
+      buffer.addEventListener('seeked', warmed);
+      buffer.addEventListener('loadeddata', warmed);
+      buffer.addEventListener('canplay', warmed);
+      buffer.__clearWarm = function () {
+        buffer.removeEventListener('loadedmetadata', prime); buffer.removeEventListener('seeked', warmed);
+        buffer.removeEventListener('loadeddata', warmed); buffer.removeEventListener('canplay', warmed);
+        buffer.__clearWarm = null;
+      };
+      buffer.src = record.url; buffer.load();
     }
     function queuePreviewLayers(position) {
       previewLayerAt = position;
@@ -1957,12 +2118,15 @@
     function preloadedFor(index) {
       var clip = clips[index], key = clip && clip.source_id + ':' + Number(clip.in_s).toFixed(3);
       return !!clip && preloadPreview.dataset.preloadKey === key && preloadPreview.dataset.ready === 'true'
-        && preloadPreview.readyState >= 3 && Math.abs(preloadPreview.currentTime - clip.in_s) < .18;
+        && preloadPreview.readyState >= 2 && !preloadPreview.seeking && Math.abs(preloadPreview.currentTime - clip.in_s) < .04;
     }
     function promotePreloaded(index, position) {
       if (!preloadedFor(index)) return false;
+      cancelFrameClock();
       var next = clips[index], record = sources[next.source_id], previous = preview, ready = preloadPreview;
+      if (ready.__clearWarm) ready.__clearWarm();
       preview = ready; preloadPreview = previous; activeId = next.source_id; activeIndex = index;
+      delete preloadPreview.dataset.preloadKey;
       pending = null; at = position;
       setProgramRoles(preview, preloadPreview);
       preview.muted = trackMuted; preview.volume = audioEnvelope(next, 0);
@@ -1970,6 +2134,7 @@
       var playback = preview.play(); previous.pause();
       if (playback && typeof playback.catch === 'function') playback.catch(playFailed);
       displayPosition(); updatePreviewLayers(at);
+      metrics.warmHandoffs++; frameClock();
       return true;
     }
     function seekSequence(position) {
@@ -1989,28 +2154,34 @@
       } else applySeek();
     }
     function applySeek() {
-      if (pending === null || preview.readyState < 1) return;
+      if (pending === null || preview.readyState < 1 || preview.seeking) return;
       try {
         if (Math.abs(preview.currentTime - pending) > .025) preview.currentTime = pending;
         else { pending = null; if (playing) preview.play().catch(playFailed); }
       } catch (_) { /* metadata is arriving */ }
     }
     function playFailed() { stop(); message('Tap Play again to start the preview.', true); }
-    function updateFromVideo() {
+    function updateFromVideo(presentedTime) {
+      if (cachePlaying || cachePreparing) return;
       if (pending !== null || !clips.length || preview.seeking) return;
+      if (trimActive) { revealPreviewFrame(preview); return; }
       var clip = clips[activeIndex];
       if (!clip || clip.source_id !== activeId) return;
       var offset = startOf(activeIndex);
-      if (preview.currentTime >= clip.out_s - .02) {
+      var sourceTime = typeof presentedTime === 'number' ? presentedTime : preview.currentTime;
+      var frameDuration = 1 / (Number((sources[activeId] || {}).fps) || 30);
+      if (playing && sourceTime >= clip.out_s - frameDuration - .005) {
         var nextBase = nextBaseIndex(activeIndex);
         if (nextBase >= 0) {
           var nextPosition = startOf(nextBase);
-          if (clips[nextBase].source_id === activeId || !promotePreloaded(nextBase, nextPosition)) seekSequence(nextPosition);
+          metrics.handoffs++;
+          handoffAt = performance.now();
+          if (!promotePreloaded(nextBase, nextPosition)) { metrics.coldHandoffs++; seekSequence(nextPosition); }
         }
         else { at = length(); stop(); displayPosition(); updatePreviewLayers(at); }
         return;
       }
-      at = offset + model.clamp(preview.currentTime - clip.in_s, 0, clip.out_s - clip.in_s);
+      at = offset + model.clamp(sourceTime - clip.in_s, 0, clip.out_s - clip.in_s);
       displayPosition(); queuePreviewLayers(at);
     }
     programPlayers.forEach(function (player) {
@@ -2023,11 +2194,11 @@
         if (pending !== null && Math.abs(preview.currentTime - pending) > .035) { applySeek(); return; }
         pending = null; if (playing) preview.play().catch(playFailed); updateFromVideo();
       });
-      player.addEventListener('timeupdate', function () { if (player === preview) updateFromVideo(); });
+      player.addEventListener('timeupdate', function () { if (player === preview && (!playing || !player.requestVideoFrameCallback)) updateFromVideo(); });
       player.addEventListener('ended', function () { if (player === preview) updateFromVideo(); });
       player.addEventListener('play', function () {
         if (player !== preview) return;
-        playing = true; setTransportPlaying(true);
+        playing = true; setTransportPlaying(true); frameClock();
       });
       player.addEventListener('error', function () {
         if (player === preview) { stop(); message('The sequence preview could not load this source.', true); }
@@ -2036,7 +2207,11 @@
     overlayPreview.addEventListener('loadedmetadata', function () { updatePreviewLayers(at); if (playing) overlayPreview.play().catch(function () {}); });
     function playSequence() {
       if (!clips.length || exporting) return;
+      if (cachePlaying || cachePreparing || (sources[clips[0].source_id] || {}).preview_cache) {
+        playCachedSequence(); return;
+      }
       if (playing) { stop(); return; }
+      setTrimMode(false);
       try { sourcePreview.pause(); } catch (_) { /* source monitor is optional */ }
       if (at >= length() - .02) seekSequence(0);
       playing = true;
@@ -2067,9 +2242,11 @@
       }
       window.addEventListener('pointermove', move, {passive: false}); window.addEventListener('pointerup', end); window.addEventListener('pointercancel', end);
     }
+    var edgeTrimId = null;
     function startEdgeTrim(event, index, edge, node) {
       event.preventDefault(); event.stopPropagation();
-      if (exporting || !clips[index] || (clips[index].track === 'overlay' ? overlayLocked : trackLocked)) return;
+      if (edgeTrimId !== null || exporting || !clips[index] || (clips[index].track === 'overlay' ? overlayLocked : trackLocked)) return;
+      edgeTrimId = event.pointerId;
       stop(); selected = index;
       var before = JSON.stringify(clips), original = model.copy(clips), clip = original[index];
       var segment = node.parentNode, timeLabel = segment.querySelector('small'), trimReadout = segment.querySelector('.clip-trim-readout');
@@ -2101,13 +2278,16 @@
         });
       }
       remember(); stop(); setTrimMode(true); selected = index;
+      activeIndex = index; showJoin(index, edge);
       segment.classList.add('selected', 'trimming'); node.classList.add('active'); showTrim(clip); queueTrimFrame(clip);
       try { if (navigator.vibrate) navigator.vibrate(8); } catch (_) {}
       try { node.setPointerCapture(event.pointerId); } catch (_) {}
       function move(pointer) {
+        if (pointer.pointerId !== event.pointerId) return;
         pointer.preventDefault();
         var value = (edge === 'in' ? clip.in_s : clip.out_s) + (pointer.clientX - startX) * secondsPerPixel;
-        clips = model.spliceTrim(original, index, edge, value, sources); selected = index; at = startOf(index);
+        // A drag owns only its strip; never restore a snapshot of neighboring trims.
+        clips[index] = model.spliceTrim(original, index, edge, value, sources)[index]; selected = index; at = startOf(index);
         var current = clips[index], duration = current.out_s - current.in_s, total = length();
         node.setAttribute('aria-valuenow', String(edge === 'in' ? current.in_s : current.out_s));
         timeLabel.textContent = model.clock(current.in_s) + ' - ' + model.clock(current.out_s) + '  (' + model.clock(duration) + ')';
@@ -2121,7 +2301,11 @@
         queueTrimFrame(current);
       }
       function end(pointer) {
+        if (pointer.pointerId !== event.pointerId) return;
+        if (pointer.type === 'pointerup') move(pointer);
+        edgeTrimId = null;
         window.removeEventListener('pointermove', move); window.removeEventListener('pointerup', end); window.removeEventListener('pointercancel', end);
+        node.removeEventListener('lostpointercapture', end); window.removeEventListener('blur', interrupted);
         if (trimPreviewFrame) cancelAnimationFrame(trimPreviewFrame);
         trimPreviewFrame = 0; trimPreviewTarget = null;
         try { if (node.hasPointerCapture(pointer.pointerId)) node.releasePointerCapture(pointer.pointerId); } catch (_) {}
@@ -2129,9 +2313,11 @@
         if (JSON.stringify(clips) === before) historyPast.pop();
         var current = clips[index], boundary = startOf(index) + (edge === 'out'
           ? Math.max(0, current.out_s - current.in_s - .03) : .001);
-        setTrimMode(false); render(); seekSequence(boundary);
+        setTrimMode(false, true); render(); seekSequence(boundary); showJoin(index, edge);
       }
+      function interrupted() { end({pointerId:event.pointerId,type:'pointercancel'}); }
       window.addEventListener('pointermove', move, {passive: false}); window.addEventListener('pointerup', end); window.addEventListener('pointercancel', end);
+      node.addEventListener('lostpointercapture', end); window.addEventListener('blur', interrupted);
     }
     function render() {
       var total = length(), scroll = timeline.scrollLeft, overlayScroll = overlayTimeline.scrollLeft;

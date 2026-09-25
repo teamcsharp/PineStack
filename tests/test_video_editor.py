@@ -65,6 +65,27 @@ def test_analysis_reads_real_audio_and_time_offset(media):
     assert Image.open(folder / "thumbnails.jpg").size == (960, 192)
 
 
+def test_splice_preview_is_cached_export_equivalent_and_invalidates_trim(media):
+    editor, original = media
+    item = source(editor, original)
+    body = {"source_ids": [item["id"]], "clips": [
+        {"source_id": item["id"], "in_s": .5, "out_s": 2},
+        {"source_id": item["id"], "in_s": 2.5, "out_s": 4,
+         "transition": "dissolve", "transition_s": .25}]}
+    pending = editor.start_splice_preview(body)
+    assert editor.start_splice_preview(body)["id"] == pending["id"]
+    done = wait_record(editor, "exports", pending["id"])
+    assert done["preview"] and done["duration"] == pytest.approx(2.75, abs=.1)
+    cached = editor.folder("exports", done["id"]) / "edited.mp4"
+    stamp = cached.stat().st_mtime_ns
+    assert editor.start_splice_preview(body)["id"] == done["id"]
+    assert cached.stat().st_mtime_ns == stamp
+    body["clips"][1]["in_s"] = 3
+    changed = editor.start_splice_preview(body)
+    assert changed["id"] != done["id"]
+    wait_record(editor, "exports", changed["id"])
+
+
 def test_pyav_probe_works_without_ffprobe(media):
     editor, original = media
     info = editor.probe_av(original)

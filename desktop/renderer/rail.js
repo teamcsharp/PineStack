@@ -175,6 +175,9 @@
     'background:#101419;color:#edf3f5;overflow:hidden;',
     'font-family:Inter,Segoe UI,system-ui,sans-serif}',
     '.pine-view-host.open{display:block}',
+    /* Covered panel canvases and meters otherwise keep forcing layout behind the view. */
+    'body:not(.p3-on):has(> .pine-view-host.open) > ',
+    ':is(main,header,#djBar,#activity,#techfeed,#perfHud,#mpxProc,#glyphy){display:none!important}',
     /* The rail must stay reachable over an open view. */
     '.pine-view-host{padding-right:34px}',
     '.pine-view-note{padding:22px;font-size:13px;line-height:1.6;color:#8fa0ad}'

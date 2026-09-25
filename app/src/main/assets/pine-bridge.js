@@ -148,6 +148,7 @@
     /* #1426: the native endless-video surface. A build without it
        answers {on:false} and the page keeps its own <video>. */
     videoWall: promised("videoWall"),
+    splicePreview: promised("splicePreview"),
     /* #1427: the rolling screen recorder's switch. */
     replayRun: promised("replayRun"),
 

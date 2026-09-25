@@ -479,11 +479,16 @@
 }
 .sfx-tv-parody-trim-row output { text-align: right; font-variant-numeric: tabular-nums; }
 .sfx-tv-parody-trim-span { text-align: right; color: #9eabb6; font-size: 10px; }
-.sfx-tv-parody > textarea {
+.sfx-tv-parody-field { position:relative; margin-top:10px; }
+.sfx-tv-parody-field > textarea {
   display: block; width: 100%; min-width: 0; min-height: 72px; max-height: 18vh; box-sizing: border-box;
-  margin-top: 10px; padding: 9px; resize: vertical; border: 1px solid #314252;
+  margin-top:0; padding:9px 51px 9px 9px; resize:vertical; border:1px solid #314252;
   border-radius: 6px; background: #080e13; color: #e4edf3; font: inherit;
 }
+.sfx-tv-parody-field > .sfx-tv-parody-mic { position:absolute; right:5px; top:50%; transform:translateY(-50%); }
+.sfx-tv-parody-stage > .sfx-tv-source-retry { display:none; position:absolute; inset:0; z-index:4; width:100%; height:100%; background:transparent; border:0; place-items:center; }
+.sfx-tv-parody-stage.is-loading > .sfx-tv-source-retry { display:grid; }
+.sfx-tv-source-retry img { width:92px; height:92px; object-fit:contain; }
 .sfx-tv-parody-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 9px; align-items: center; }
 .sfx-tv-parody-mic { width: 42px; padding: 0 !important; display: grid; place-items: center; }
 .sfx-tv-parody-mic .pi-icon, .sfx-tv-parody-button .pi-icon { width: 18px; height: 18px; }

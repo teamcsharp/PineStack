@@ -50,6 +50,7 @@ test('media search/import and nonblocking source buffering use their contracts',
   assert.match(parody, /\/api\/video-editor\/library\/import/);
   assert.match(parody, /\{clip_id: clipId\}/);
   assert.match(parody, /preloadAdjacent\(activeIndex\)/);
-  assert.match(parody, /preloadPreview\.src = record\.url/);
+  assert.match(parody, /var buffer = preloadPreview/);
+  assert.match(parody, /buffer\.src = record\.url/);
   assert.match(parody, /model\.editorRequest/);
 });

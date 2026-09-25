@@ -1194,6 +1194,85 @@ class VideoEditor:
                 str(target)]
         return cmd
 
+    def start_splice_preview(self, body):
+        """Cache the export's exact composition without publishing a station clip."""
+        sources, plan = self._normalize_splice(body)
+        stamps = {sid: (path.stat().st_size, path.stat().st_mtime_ns)
+                  for sid, (_, path) in sources.items()}
+        identity = json.dumps({"version": 1, "plan": plan, "sources": stamps},
+                              sort_keys=True, separators=(",", ":"))
+        identifier = hashlib.sha256(identity.encode()).hexdigest()[:32]
+        with self.lock:
+            folder = self.folder("exports", identifier)
+            try:
+                previous = self.read("exports", identifier)
+                if previous.get("status") in {"queued", "working"} or (
+                        previous.get("status") == "complete" and (folder / "edited.mp4").is_file()):
+                    return previous
+            except ValueError:
+                pass
+            folder.mkdir(parents=True, exist_ok=True)
+            record = {"id": identifier, "status": "queued", "preview": True,
+                      "source_ids": plan["source_ids"], "name": "splice-preview.mp4",
+                      "created_at_ms": int(time.time() * 1000), "target_s": plan["duration_s"],
+                      "poll_url": f"/api/video-editor/splice-exports/{identifier}"}
+            self.write("exports", identifier, record)
+
+            def render():
+                record.update(status="working", progress=0.0)
+                self.write("exports", identifier, record)
+                masks = {}
+                temp = folder / "preview-part.mp4"
+                try:
+                    for index, clip in enumerate(plan["overlays"]):
+                        if clip["mask"]:
+                            masks[index] = folder / f"mask-{index}.mkv"
+                            self._render_mask_video(clip["mask"], clip["duration_s"], masks[index])
+                    self.run_progress(self._splice_command(plan, sources, temp, masks),
+                                      plan["duration_s"], lambda share, done: self._splice_progress(
+                                          identifier, record, share, done),
+                                      timeout=1800, log=folder / "render.log")
+                    verified = self.probe(temp)
+                    if abs(verified["duration"] - plan["duration_s"]) > .5:
+                        raise ValueError("The preview duration does not match the edited timeline")
+                    os.replace(temp, folder / "edited.mp4")
+                    record.update(status="complete", progress=1.0, **verified,
+                                  url=f"/api/video-editor/exports/{identifier}/file")
+                    self.write("exports", identifier, record)
+                    self._prune_splice_previews(identifier)
+                finally:
+                    temp.unlink(missing_ok=True)
+                    for path in masks.values():
+                        path.unlink(missing_ok=True)
+            try:
+                self.submit("exports", identifier, render)
+            except Exception:
+                record.update(status="failed", error="The preview render queue is full")
+                self.write("exports", identifier, record)
+                raise
+            return record.copy()
+
+    def _prune_splice_previews(self, keep):
+        """Only disposable preview records count toward this cache budget."""
+        with self.lock:
+            candidates = []
+            for folder in (self.root / "exports").iterdir():
+                if not IDENTIFIER.fullmatch(folder.name) or folder.name in self.active or folder.name == keep:
+                    continue
+                try:
+                    row = json.loads((folder / "record.json").read_text(encoding="utf-8"))
+                    if row.get("preview") is True:
+                        path = folder / "edited.mp4"
+                        candidates.append((row.get("created_at_ms", 0), folder.name,
+                                           path.stat().st_size if path.is_file() else 0))
+                except (ValueError, OSError):
+                    continue
+            used = (self.folder("exports", keep) / "edited.mp4").stat().st_size
+            for count, (_, identifier, size) in enumerate(sorted(candidates, reverse=True), 1):
+                used += size
+                if count >= 24 or used > 1024 * 1024 * 1024:
+                    self.discard_new("exports", identifier)
+
     def start_splice_export(self, body, ads_dir, publish):
         """Render an ordered, transitioned NLE timeline and retain every source."""
         sources, plan = self._normalize_splice(body)
@@ -1470,6 +1549,7 @@ def create_video_editor_router(root, assets, require_auth, require_read_auth):
     async def source(identifier: str, request: Request):
         require_read_auth(request.headers.get("authorization"))
         record = dict(checked_read("sources", identifier))
+        record["preview_cache"] = True
         # [#1242] The permit rides WITH the record, because the record is the
         # one thing every surface already fetches on open — the desk's
         # cross-origin iframe, the tablet, a phone on the LAN. Reads are open

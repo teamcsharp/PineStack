@@ -100,6 +100,9 @@ object ViewAssets {
                                   // rooms and the made-against-heard account
         "three-full.js",          // every 3JS scene, full screen on glass
         "line-deep.js",           // why a line was said, and how often
+        "line-repeat.js",         // repeat receipts, prompt history, targeted repairs
+        "ad-viewer.js",           // signed media playback and archive browsing
+        "prompt-history.js",
         "line-actions.js",        // hold a line: pad, keep, or examine
         "sfx-tv.js",              // #1306b: the SFX guy's little CRT set
         "clip-doctor.js",         // #1361b: why the video button gave nothing
@@ -135,6 +138,8 @@ object ViewAssets {
         "lock.css",               // the locked screen
         "vote-arrows.css",        // the up and down arrows
         "line-actions.css",       // the hold sheet and the examination
+        "line-repeat.css",        // repeat diagnosis and repair controls
+        "prompt-history.css",
         "sfx-tv.css",             // #1306b: the set, its glass and its sheet
         "clip-doctor.css",        // #1361b: the doctor's sheet
         "pine-cam.css",           // #1358: the box and the flag

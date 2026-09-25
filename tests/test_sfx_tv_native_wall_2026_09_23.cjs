@@ -128,13 +128,34 @@ test('leaving Listen immediately restores the popup ownership', () => {
     'the wall is not recomputed after Listen closes');
 });
 
-test('ordinary Listen cannot hide both the page backdrop and native wall', () => {
+test('ordinary Listen keeps the native PIP authoritative', () => {
   const reconcile = fn('wallReconcile');
   assert.match(reconcile,
-    /wide = !panelOwns && \(fullWanted\(\) \|\| \(listenUp\(\) && listenBare\(\)\)\)/,
-    'the floating fullscreen preference still suppresses the Listen backdrop');
-  assert.match(reconcile, /want = \(!!veiled && !wide\) \|\| panelOwns/,
-    'the Listen panel no longer owns native-wall visibility');
+    /wide = fullWanted\(\) \|\| \(listenUp\(\) && listenBare\(\)\)/,
+    'bare Listen must use the native surface full-bleed');
+  assert.match(reconcile, /want = uiOverPicture\(\)/,
+    'Listen must not veil the native PIP merely because its tab is open');
+  assert.match(reconcile, /pageBackdrop\(!\(wallHas \|\| \(st && st\.on\)\) \|\| want\)/,
+    'the WebView backdrop must stop while the native player owns video');
+  assert.match(listenSource, /nativeWallActive/,
+    'Listen has no authoritative-native handoff');
+  assert.match(listenSource, /vid\.removeAttribute\("src"\)/,
+    'the competing WebView decoder is not released');
+});
+
+test('native endless repair rebuilds the local runway and reports its state', () => {
+  assert.match(source, /function repairEndless\(\)/);
+  assert.match(source, /bridge\.videoWall\('repair', nativeWallRect\(\)\)/);
+  assert.match(source, /repairEndless: repairEndless/);
+  assert.match(source, /Repair endless video/);
+  const wall = fs.readFileSync(path.join(__dirname, '..', 'app', 'src', 'main', 'java',
+    'com', 'pinebox', 'kiosk', 'video', 'PineVideoWall.kt'), 'utf8');
+  const bridge = fs.readFileSync(path.join(__dirname, '..', 'app', 'src', 'main', 'java',
+    'com', 'pinebox', 'kiosk', 'bridge', 'PineDesktopBridge.kt'), 'utf8');
+  assert.match(wall, /fun repair\(\)/);
+  assert.match(wall, /ArrayList\(listed\.drop\(from\)\)/);
+  assert.match(wall, /\.put\("last_repair", lastRepair\)/);
+  assert.match(bridge, /"repair" -> wall\.repair\(\)/);
 });
 
 test('Listen resolves native larder clips that have fallen off the short ring', () => {
@@ -171,6 +192,8 @@ test('native takeover removes a stale WebView frame without hiding the native pi
   const overlap = fn('uiOverPicture');
   assert.match(overlap, /if \(el === host[\s\S]{0,100}continue/,
     'the fallback frame is still mistaken for a popup that veils native video');
+  assert.match(overlap, /pine-field-mics/,
+    'the transparent field microphone layer must not permanently veil the native PIP');
 });
 
 test('an ended Listen backdrop asks the native wall immediately', () => {
@@ -185,8 +208,7 @@ test('an ended Listen backdrop asks the native wall immediately', () => {
 });
 
 test('the two APK surfaces carry the exact canonical video controller', () => {
-  const android = 'C:/_tools/pinebox-android/PineBoxKiosk/app/src/main/assets';
-  if (!fs.existsSync(android)) return;
+  const android = path.join(__dirname, '../app/src/main/assets');
   const canonical = fs.readFileSync(SRC);
   for (const surface of ['pine-views', 'pine-sampler']) {
     assert.deepEqual(fs.readFileSync(path.join(android, surface, 'sfx-tv.js')), canonical,

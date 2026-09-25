@@ -659,12 +659,36 @@
       && !!(tv && typeof tv.endless === "function" && tv.endless()
       && typeof tv.playing === "function" && onScreen());
     const clip = on ? tv.playing() : null;
+    /* The tablet's SurfaceView is the authoritative endless picture. On a
+       normal Listen page it remains a movable PIP; on bare Listen it fills
+       the view. Do not start a second WebView decoder and then try to keep
+       two unrelated media clocks aligned. */
+    const native = !!(tv && typeof tv.nativeWallActive === "function"
+      && tv.nativeWallActive());
     const want = clip && clip.url ? absolute(String(clip.url)) : "";
     /* #1173: the SLOT, not the file. The station's plan can hand the same
      * clip out twice, and two turns of it are two different pictures with
      * two different start stamps - which matters now that the seek below
      * reads that stamp. Keyed on the url as before, plus the moment. */
     var slot = want ? want + "#" + String((clip && clip.at) || 0) : "";
+
+    if (native && want) {
+      if (!endlessBackdrop) {
+        endlessBackdrop = true;
+        if (still) still.style.opacity = "0";
+        const second = document.getElementById("plBack2");
+        if (second) second.style.opacity = "0";
+      }
+      endlessWaiting = false;
+      showPlexus(false);
+      if (vid) {
+        vid.pause(); vid.hidden = true; vid.classList.remove("pl-endless");
+        delete vid.dataset.endless; vid.removeAttribute("src");
+        try { vid.load(); } catch (err) { /* the native player remains live */ }
+      }
+      if (typeof tv.veil === "function") tv.veil(true);
+      return;
+    }
 
     if (want && vid) {
       if (!endlessBackdrop) {

@@ -126,6 +126,8 @@
     if (!row) return false;
     var key = keyOf(row);
     if (keys[key]) return false;
+    // A full snapshot must not reinsert history already outside the retained window.
+    if (seen.length >= SEEN_MAX && Number(row.at || 0) <= Number(seen[0].at || 0)) return false;
     keys[key] = true;
     seen.push(row);
     seen.sort(function (a, b) { return (Number(a.at) || 0) - (Number(b.at) || 0); });
@@ -177,6 +179,9 @@
     bar.innerHTML = '<i class="pine-console-dot"></i>'
       + '<button class="pine-console-audit" type="button" title="Open the detailed audit log"'
       + ' aria-label="Open the detailed audit log"><em>AUDIT</em><span>waiting for the station journal</span></button>'
+      + '<button class="pine-console-gallery" type="button"'
+      + ' title="Pine Box Gallery" aria-label="Pine Box Gallery">'
+      + (icon('c:image', 'Pine Box Gallery') || 'G') + '</button>'
       + '<button class="pine-console-orchestrator" type="button" hidden'
       + ' title="Restore the orchestrator control" aria-label="Restore the orchestrator control">'
       + (icon('c:bot', 'Restore orchestrator') || '') + '</button>'
@@ -214,6 +219,10 @@
       }
       if (event.target && event.target.closest && event.target.closest('.pine-console-change')) {
         if (root.PineChangeLog) root.PineChangeLog.open();
+        return;
+      }
+      if (event.target && event.target.closest && event.target.closest('.pine-console-gallery')) {
+        if (root.PineAdViewer) root.PineAdViewer.openGallery();
         return;
       }
       if (event.target && event.target.closest && event.target.closest('.pine-console-orchestrator')) {
