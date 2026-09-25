@@ -84,14 +84,16 @@
   <main class="parody-editor" id="parodyEditor" hidden>
     <header class="parody-topbar">
       <button id="parodyBack" class="quiet" type="button">Back</button>
+      <button id="parodyBinToggle" class="parody-icon-button" type="button" aria-controls="parodyWorkspace" aria-expanded="true" aria-label="Hide media panel" title="Hide media panel"><span class="parody-panel-glyph media" aria-hidden="true"></span></button>
       <div class="parody-heading"><h1>Splice editor</h1><span id="parodyProjectSummary">Original + generated</span></div>
       <div class="parody-history" role="group" aria-label="Edit history">
         <button id="parodyUndo" type="button" disabled aria-label="Undo edit" title="Undo (Ctrl+Z)">Undo</button>
         <button id="parodyRedo" type="button" disabled aria-label="Redo edit" title="Redo (Ctrl+Shift+Z)">Redo</button>
       </div>
+      <button id="parodyInspectorToggle" class="parody-icon-button" type="button" aria-controls="parodyInspector" aria-expanded="true" aria-label="Hide segment inspector" title="Hide segment inspector"><span class="parody-panel-glyph inspector" aria-hidden="true"></span></button>
       <button id="parodySave" class="primary" type="button" disabled>Export to SFX ads</button>
     </header>
-    <div class="parody-workspace">
+    <div class="parody-workspace" id="parodyWorkspace">
       <aside class="parody-bin" aria-label="Media bin">
         <div class="parody-bin-heading"><h2>Media</h2><span id="parodyBinCount">0 clips</span></div>
         <form id="parodySearchForm" class="parody-search" role="search">
@@ -121,7 +123,21 @@
           <output id="parodyPosition" aria-live="off">0:00.00 / 0:00.00</output>
           <input id="parodyScrub" type="range" min="0" max="1" step="0.01" value="0" disabled aria-label="Sequence playhead">
         </div>
+        <section class="parody-timeline-section" aria-label="Sequence timeline">
+          <div class="parody-timeline-head"><h2>Timeline</h2><span id="parodySequenceCount">0 segments</span></div>
+          <div class="parody-track parody-v1-track">
+            <div class="parody-track-head"><strong>V1</strong><span>Program video</span><div class="parody-track-actions"><button id="parodyTrackMute" class="parody-track-action mute" type="button" aria-pressed="false" aria-label="Mute V1 preview" title="Mute V1 preview"></button><button id="parodyTrackLock" class="parody-track-action lock" type="button" aria-pressed="false" aria-label="Lock V1 track" title="Lock V1 track"></button></div></div>
+            <div id="parodyTimeline" class="parody-timeline" role="group" aria-label="Segments in play order" tabindex="0"><p class="parody-empty">Drag or tap media to add it</p></div>
+          </div>
+          <div class="parody-track parody-v2-track collapsed" id="parodyOverlayTrack">
+            <div class="parody-track-head"><button id="parodyOverlayToggle" class="parody-track-toggle" type="button" aria-expanded="false" aria-controls="parodyOverlayTimeline" aria-label="Show V2 overlays" title="Show V2 overlays"><span class="parody-track-plus" aria-hidden="true">+</span><span class="parody-track-name"><strong>V2</strong><span>Timed overlays</span></span></button><div class="parody-track-actions"><button id="parodyOverlayMute" class="parody-track-action mute" type="button" aria-pressed="false" aria-label="Mute V2 overlay" title="Mute V2 overlay"></button><button id="parodyOverlayLock" class="parody-track-action lock" type="button" aria-pressed="false" aria-label="Lock V2 track" title="Lock V2 track"></button></div></div>
+            <div id="parodyOverlayTimeline" class="parody-timeline parody-overlay-timeline" role="group" aria-label="Overlay clips by timeline position" tabindex="0" hidden><p class="parody-empty">Drop media here for an overlay</p></div>
+          </div>
+        </section>
+      </section>
+      <aside class="parody-inspector" id="parodyInspector" aria-label="Selected segment inspector">
         <section class="parody-tools" aria-label="Selected segment controls">
+          <div class="parody-inspector-heading"><h2>Segment</h2><span id="parodySelectedLabel">Select a segment</span></div>
           <div class="parody-tools-row">
             <button id="parodySplit" type="button" disabled>Split at playhead</button>
             <button id="parodyMoveLeft" type="button" disabled aria-label="Move selected segment left" title="Move left">Move left</button>
@@ -129,7 +145,6 @@
             <button id="parodyDelete" type="button" disabled>Delete segment</button>
           </div>
           <div class="parody-tools-row parody-range-controls">
-            <span id="parodySelectedLabel">Select a segment</span>
             <label>In <input id="parodyIn" type="number" min="0" step="0.01" inputmode="decimal" disabled></label>
             <button id="parodySetIn" type="button" disabled>In at playhead</button>
             <label>Out <input id="parodyOut" type="number" min="0" step="0.01" inputmode="decimal" disabled></label>
@@ -157,18 +172,7 @@
             <button id="parodyMaskClear" type="button" disabled>Clear mask</button>
           </div>
         </section>
-        <section class="parody-timeline-section" aria-label="Sequence timeline">
-          <div class="parody-timeline-head"><h2>Timeline</h2><span id="parodySequenceCount">0 segments</span></div>
-          <div class="parody-track">
-            <div class="parody-track-head"><strong>V1</strong><span>Program video</span><button id="parodyTrackMute" type="button" aria-pressed="false">Mute preview</button><button id="parodyTrackLock" type="button" aria-pressed="false">Lock</button></div>
-            <div id="parodyTimeline" class="parody-timeline" role="group" aria-label="Segments in play order" tabindex="0"><p class="parody-empty">Drag or tap media to add it</p></div>
-          </div>
-          <div class="parody-track" id="parodyOverlayTrack">
-            <div class="parody-track-head"><button id="parodyOverlayToggle" class="parody-track-toggle" type="button" aria-expanded="true" aria-controls="parodyOverlayTimeline"><strong>V2</strong><span>Timed overlays</span></button><button id="parodyOverlayMute" type="button" aria-pressed="false">Mute overlay</button><button id="parodyOverlayLock" type="button" aria-pressed="false">Lock</button></div>
-            <div id="parodyOverlayTimeline" class="parody-timeline parody-overlay-timeline" role="group" aria-label="Overlay clips by timeline position" tabindex="0"><p class="parody-empty">Drop media here for an overlay</p></div>
-          </div>
-        </section>
-      </section>
+      </aside>
     </div>
     <footer class="parody-footer">
       <label>Export name <input id="parodyName" type="text" value="Parody splice" maxlength="120" autocomplete="off"></label>

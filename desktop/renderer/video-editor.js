@@ -1690,7 +1690,7 @@
   function startParodyEditor() {
     var model = window.PineVideoEditModel;
     var el = function (id) { return document.getElementById(id); };
-    var requiredIds = ['parodyAudioFadeIn','parodyAudioFadeOut','parodyBack','parodyBinCount','parodyBlendStatus','parodyCover','parodyDelete','parodyDownload','parodyEditor','parodyIn','parodyLibraryStatus','parodyLoading','parodyMaskCanvas','parodyMaskClear','parodyMaskClose','parodyMaskEdit','parodyMaskFeather','parodyMaskFeatherValue','parodyMaskInvert','parodyMaskKeyframe','parodyMaskKeyframeAdd','parodyMaskKeyframeDelete','parodyMaskPen','parodyMediaBin','parodyMoveLeft','parodyMoveRight','parodyName','parodyOpacity','parodyOpacityValue','parodyOut','parodyOverlayLock','parodyOverlayMute','parodyOverlayTimeline','parodyOverlayToggle','parodyOverlayTrack','parodyOverlayVideo','parodyPlay','parodyPosition','parodyPreloadVideo','parodyPreview','parodyProjectSummary','parodyRedo','parodyRetrySources','parodySave','parodyScrub','parodySearch','parodySearchForm','parodySelectedLabel','parodySequenceCount','parodySetIn','parodySetOut','parodySourcePreview','parodySourcePreviewName','parodySplit','parodyStart','parodyStatus','parodyTimeline','parodyTrack','parodyTrackLock','parodyTrackMute','parodyTransition','parodyTransitionDuration','parodyTrimFrame','parodyUndo','parodyVideo','parodyVolume','parodyVolumeValue','recordingEditor'];
+    var requiredIds = ['parodyAudioFadeIn','parodyAudioFadeOut','parodyBack','parodyBinCount','parodyBinToggle','parodyBlendStatus','parodyCover','parodyDelete','parodyDownload','parodyEditor','parodyIn','parodyInspector','parodyInspectorToggle','parodyLibraryStatus','parodyLoading','parodyMaskCanvas','parodyMaskClear','parodyMaskClose','parodyMaskEdit','parodyMaskFeather','parodyMaskFeatherValue','parodyMaskInvert','parodyMaskKeyframe','parodyMaskKeyframeAdd','parodyMaskKeyframeDelete','parodyMaskPen','parodyMediaBin','parodyMoveLeft','parodyMoveRight','parodyName','parodyOpacity','parodyOpacityValue','parodyOut','parodyOverlayLock','parodyOverlayMute','parodyOverlayTimeline','parodyOverlayToggle','parodyOverlayTrack','parodyOverlayVideo','parodyPlay','parodyPosition','parodyPreloadVideo','parodyPreview','parodyProjectSummary','parodyRedo','parodyRetrySources','parodySave','parodyScrub','parodySearch','parodySearchForm','parodySelectedLabel','parodySequenceCount','parodySetIn','parodySetOut','parodySourcePreview','parodySourcePreviewName','parodySplit','parodyStart','parodyStatus','parodyTimeline','parodyTrack','parodyTrackLock','parodyTrackMute','parodyTransition','parodyTransitionDuration','parodyTrimFrame','parodyUndo','parodyVideo','parodyVolume','parodyVolumeValue','parodyWorkspace','recordingEditor'];
     var missingIds = requiredIds.filter(function (id) { return !el(id); });
     if (missingIds.length) throw new Error('Editor markup mismatch; missing: #' + missingIds.join(', #'));
     if (!model) throw new Error('The video edit model did not load.');
@@ -1702,12 +1702,12 @@
     var libraryRows = [], importJobs = {}, clips = [], selected = -1, at = 0, activeId = '', activeIndex = -1, pending = null;
     var historyPast = [], historyFuture = [], playing = false, exporting = false, gone = false, pollTimer = 0, searchTimer = 0;
     var seeded = false, loadGeneration = 0, searchGeneration = 0, trackLocked = false, trackMuted = false;
-    var overlayLocked = false, overlayMuted = false, overlayCollapsed = false, maskEditing = false, maskPen = false, maskFrameIndex = 0;
+    var overlayLocked = false, overlayMuted = false, overlayCollapsed = true, maskEditing = false, maskPen = false, maskFrameIndex = 0;
     var draggingIndex = -1, suppressClickUntil = 0, trimActive = false, previewLayerFrame = 0, previewLayerAt = 0;
     var preview = el('parodyVideo'), scrub = el('parodyScrub');
-    var previewCover = bindMediaCover(preview, el('parodyCover'));
     var sourcePreview = el('parodySourcePreview'), timeline = el('parodyTimeline'), overlayTimeline = el('parodyOverlayTimeline');
     var overlayPreview = el('parodyOverlayVideo'), preloadPreview = el('parodyPreloadVideo'), maskCanvas = el('parodyMaskCanvas');
+    var programPlayers = [preview, preloadPreview], previewCover = el('parodyCover');
     var trimFrameLabel = el('parodyTrimFrame');
     var maskContext = maskCanvas.getContext('2d');
     var parent = window;
@@ -1715,6 +1715,7 @@
     var desktop = parent.pineDesktop || window.pineDesktop || {};
     el('recordingEditor').hidden = true;
     el('parodyEditor').hidden = false;
+    setProgramRoles(preview, preloadPreview);
 
     function message(value, bad) {
       el('parodyStatus').textContent = value;
@@ -1755,8 +1756,22 @@
     }
     function length() { return model.spliceLength(clips); }
     function startOf(index) { return model.spliceStartOf(clips, index); }
+    function setProgramRoles(active, buffer) {
+      active.classList.add('parody-program-active'); active.classList.remove('parody-program-buffer');
+      active.removeAttribute('aria-hidden'); active.controls = true;
+      buffer.classList.remove('parody-program-active'); buffer.classList.add('parody-program-buffer');
+      buffer.setAttribute('aria-hidden', 'true'); buffer.controls = false; buffer.muted = true;
+    }
+    function resetPreviewCover(record) {
+      coverPoster(previewCover, record); previewCover.hidden = false;
+      preview.classList.remove('ve-frame-ready');
+    }
+    function revealPreviewFrame(media) {
+      if (media !== preview || media.readyState < 2 || !(media.videoWidth > 0 && media.videoHeight > 0)) return;
+      media.classList.add('ve-frame-ready'); previewCover.hidden = true;
+    }
     function stop() {
-      playing = false; preview.pause(); overlayPreview.pause();
+      playing = false; programPlayers.forEach(function (media) { media.pause(); }); overlayPreview.pause();
       el('parodyPlay').textContent = 'Play'; el('parodyPlay').setAttribute('aria-label', 'Play sequence');
     }
     function setTrimMode(on) {
@@ -1829,16 +1844,35 @@
       media.style.clipPath = (clip.mask.invert ? '' : 'polygon(' + points + ')');
       media.style.filter = clip.mask.feather ? 'blur(' + Math.min(24, clip.mask.feather / 4) + 'px)' : '';
     }
+    function nextBaseIndex(index) {
+      for (var i = index + 1; i < clips.length; i += 1) if (clips[i].track !== 'overlay') return i;
+      return -1;
+    }
     function preloadAdjacent(index) {
       var next = null;
       for (var i = index + 1; i < clips.length; i += 1) if (clips[i].track !== 'overlay') { next = clips[i]; break; }
       var record = next && sources[next.source_id];
-      if (!record || !record.url || preloadPreview.dataset.sourceId === next.source_id) return;
-      preloadPreview.dataset.sourceId = next.source_id; preloadPreview.src = record.url; preloadPreview.load();
-      preloadPreview.addEventListener('loadedmetadata', function loaded() {
-        preloadPreview.removeEventListener('loadedmetadata', loaded);
-        try { preloadPreview.currentTime = next.in_s; } catch (_) { /* Browser is still buffering. */ }
-      });
+      var key = next ? next.source_id + ':' + Number(next.in_s).toFixed(3) : '';
+      if (!record || !record.url) return;
+      /* Loading the same source again on every playhead frame cancels the
+         browser's buffer and causes the exact boundary hitch this player is
+         meant to avoid. A keyed prebuffer stays resident until it is used. */
+      if (preloadPreview.dataset.preloadKey === key) return;
+      preloadPreview.pause(); preloadPreview.dataset.sourceId = next.source_id;
+      preloadPreview.dataset.preloadKey = key; preloadPreview.dataset.ready = 'false';
+      preloadPreview.src = record.url; preloadPreview.load();
+      function sameTarget() { return preloadPreview.dataset.preloadKey === key; }
+      function prime() {
+        if (!sameTarget()) return;
+        try { preloadPreview.currentTime = next.in_s; } catch (_) { /* Metadata is still arriving. */ }
+      }
+      function warmed() {
+        if (!sameTarget() || preloadPreview.readyState < 3) return;
+        if (Math.abs(preloadPreview.currentTime - next.in_s) < .18) preloadPreview.dataset.ready = 'true';
+      }
+      preloadPreview.addEventListener('loadedmetadata', prime, {once: true});
+      preloadPreview.addEventListener('seeked', warmed, {once: true});
+      preloadPreview.addEventListener('canplay', warmed, {once: true});
     }
     function queuePreviewLayers(position) {
       previewLayerAt = position;
@@ -1883,18 +1917,36 @@
       }
       if (maskEditing) drawMask();
     }
+    function preloadedFor(index) {
+      var clip = clips[index], key = clip && clip.source_id + ':' + Number(clip.in_s).toFixed(3);
+      return !!clip && preloadPreview.dataset.preloadKey === key && preloadPreview.dataset.ready === 'true'
+        && preloadPreview.readyState >= 3 && Math.abs(preloadPreview.currentTime - clip.in_s) < .18;
+    }
+    function promotePreloaded(index, position) {
+      if (!preloadedFor(index)) return false;
+      var next = clips[index], record = sources[next.source_id], previous = preview, ready = preloadPreview;
+      preview = ready; preloadPreview = previous; activeId = next.source_id; activeIndex = index;
+      pending = null; at = position;
+      setProgramRoles(preview, preloadPreview);
+      preview.muted = trackMuted; preview.volume = audioEnvelope(next, 0);
+      preview.classList.add('ve-frame-ready'); previewCover.hidden = true;
+      var playback = preview.play(); previous.pause();
+      if (playback && typeof playback.catch === 'function') playback.catch(playFailed);
+      displayPosition(); updatePreviewLayers(at);
+      return true;
+    }
     function seekSequence(position) {
       at = model.clamp(position, 0, length());
       var place = model.spliceLocate(clips, at);
-      displayPosition(); updatePreviewLayers(at);
       if (!place) { stop(); preview.removeAttribute('src'); activeId = ''; activeIndex = -1; return; }
       var record = sources[place.source_id];
       if (!record) return;
       activeIndex = place.index;
+      displayPosition(); updatePreviewLayers(at);
       pending = place.source_s;
       if (activeId !== place.source_id) {
         preview.pause(); activeId = place.source_id;
-        previewCover.setPoster(record); previewCover.reset();
+        resetPreviewCover(record);
         preview.muted = trackMuted; preview.volume = 1; preview.src = record.url;
         preview.load();
       } else applySeek();
@@ -1913,35 +1965,37 @@
       if (!clip || clip.source_id !== activeId) return;
       var offset = startOf(activeIndex);
       if (preview.currentTime >= clip.out_s - .02) {
-        var nextBase = -1;
-        for (var nextIndex = activeIndex + 1; nextIndex < clips.length; nextIndex += 1) if (clips[nextIndex].track !== 'overlay') { nextBase = nextIndex; break; }
-        if (nextBase >= 0) seekSequence(startOf(nextBase));
+        var nextBase = nextBaseIndex(activeIndex);
+        if (nextBase >= 0) {
+          var nextPosition = startOf(nextBase);
+          if (clips[nextBase].source_id === activeId || !promotePreloaded(nextBase, nextPosition)) seekSequence(nextPosition);
+        }
         else { at = length(); stop(); displayPosition(); updatePreviewLayers(at); }
         return;
       }
       at = offset + model.clamp(preview.currentTime - clip.in_s, 0, clip.out_s - clip.in_s);
       displayPosition(); queuePreviewLayers(at);
     }
-    preview.addEventListener('loadedmetadata', applySeek);
-    preview.addEventListener('loadeddata', applySeek);
-    preview.addEventListener('seeked', function () {
-      /* Handle drags can issue a newer seek before the decoder reports the
-         previous one. Never let that old completion erase the frame under
-         the operator's finger. */
-      if (pending !== null && Math.abs(preview.currentTime - pending) > .035) {
-        applySeek();
-        return;
-      }
-      pending = null;
-      if (playing) preview.play().catch(playFailed);
-      updateFromVideo();
+    programPlayers.forEach(function (player) {
+      player.addEventListener('loadedmetadata', function () { if (player === preview) applySeek(); });
+      player.addEventListener('loadeddata', function () { if (player === preview) { revealPreviewFrame(player); applySeek(); } });
+      player.addEventListener('seeked', function () {
+        if (player !== preview) return;
+        /* A handle drag can issue a newer seek before the decoder reports the
+           earlier one. Do not let the stale completion steal the live frame. */
+        if (pending !== null && Math.abs(preview.currentTime - pending) > .035) { applySeek(); return; }
+        pending = null; if (playing) preview.play().catch(playFailed); updateFromVideo();
+      });
+      player.addEventListener('timeupdate', function () { if (player === preview) updateFromVideo(); });
+      player.addEventListener('ended', function () { if (player === preview) updateFromVideo(); });
+      player.addEventListener('play', function () {
+        if (player !== preview) return;
+        playing = true; el('parodyPlay').textContent = 'Pause'; el('parodyPlay').setAttribute('aria-label', 'Pause sequence');
+      });
+      player.addEventListener('error', function () {
+        if (player === preview) { stop(); message('The sequence preview could not load this source.', true); }
+      });
     });
-    preview.addEventListener('timeupdate', updateFromVideo);
-    preview.addEventListener('ended', updateFromVideo);
-    preview.addEventListener('play', function () {
-      playing = true; el('parodyPlay').textContent = 'Pause'; el('parodyPlay').setAttribute('aria-label', 'Pause sequence');
-    });
-    preview.addEventListener('error', function () { stop(); message('The sequence preview could not load this source.', true); });
     overlayPreview.addEventListener('loadedmetadata', function () { updatePreviewLayers(at); if (playing) overlayPreview.play().catch(function () {}); });
     function playSequence() {
       if (!clips.length || exporting) return;
@@ -1950,6 +2004,7 @@
       if (at >= length() - .02) seekSequence(0);
       playing = true;
       el('parodyPlay').textContent = 'Pause'; el('parodyPlay').setAttribute('aria-label', 'Pause sequence');
+      preloadAdjacent(activeIndex);
       if (pending === null && preview.readyState >= 2) preview.play().catch(playFailed);
       else applySeek();
     }
@@ -2296,22 +2351,51 @@
       historyPast.push(snapshot()); restore(historyFuture.pop());
     });
     el('parodyTrackLock').addEventListener('click', function () {
-      trackLocked = !trackLocked; this.setAttribute('aria-pressed', String(trackLocked)); this.textContent = trackLocked ? 'Unlock' : 'Lock'; render();
+      trackLocked = !trackLocked; this.setAttribute('aria-pressed', String(trackLocked));
+      this.setAttribute('aria-label', trackLocked ? 'Unlock V1 track' : 'Lock V1 track');
+      this.title = trackLocked ? 'Unlock V1 track' : 'Lock V1 track'; render();
     });
     el('parodyTrackMute').addEventListener('click', function () {
-      trackMuted = !trackMuted; preview.muted = trackMuted; this.setAttribute('aria-pressed', String(trackMuted)); this.textContent = trackMuted ? 'Unmute preview' : 'Mute preview';
+      trackMuted = !trackMuted; preview.muted = trackMuted; this.setAttribute('aria-pressed', String(trackMuted));
+      this.setAttribute('aria-label', trackMuted ? 'Unmute V1 preview' : 'Mute V1 preview');
+      this.title = trackMuted ? 'Unmute V1 preview' : 'Mute V1 preview';
     });
     el('parodyOverlayLock').addEventListener('click', function () {
-      overlayLocked = !overlayLocked; this.setAttribute('aria-pressed', String(overlayLocked)); this.textContent = overlayLocked ? 'Unlock' : 'Lock'; render();
+      overlayLocked = !overlayLocked; this.setAttribute('aria-pressed', String(overlayLocked));
+      this.setAttribute('aria-label', overlayLocked ? 'Unlock V2 track' : 'Lock V2 track');
+      this.title = overlayLocked ? 'Unlock V2 track' : 'Lock V2 track'; render();
     });
     el('parodyOverlayMute').addEventListener('click', function () {
-      overlayMuted = !overlayMuted; overlayPreview.muted = overlayMuted; this.setAttribute('aria-pressed', String(overlayMuted)); this.textContent = overlayMuted ? 'Unmute overlay' : 'Mute overlay';
+      overlayMuted = !overlayMuted; overlayPreview.muted = overlayMuted; this.setAttribute('aria-pressed', String(overlayMuted));
+      this.setAttribute('aria-label', overlayMuted ? 'Unmute V2 overlay' : 'Mute V2 overlay');
+      this.title = overlayMuted ? 'Unmute V2 overlay' : 'Mute V2 overlay';
+    });
+    function setBinCollapsed(collapsed) {
+      var hidden = !!collapsed, toggle = el('parodyBinToggle');
+      el('parodyWorkspace').classList.toggle('bin-collapsed', hidden);
+      toggle.setAttribute('aria-expanded', String(!hidden));
+      toggle.setAttribute('aria-label', hidden ? 'Show media panel' : 'Hide media panel');
+      toggle.title = hidden ? 'Show media panel' : 'Hide media panel';
+    }
+    function setInspectorCollapsed(collapsed) {
+      var hidden = !!collapsed, toggle = el('parodyInspectorToggle');
+      el('parodyWorkspace').classList.toggle('inspector-collapsed', hidden);
+      toggle.setAttribute('aria-expanded', String(!hidden));
+      toggle.setAttribute('aria-label', hidden ? 'Show segment inspector' : 'Hide segment inspector');
+      toggle.title = hidden ? 'Show segment inspector' : 'Hide segment inspector';
+    }
+    el('parodyBinToggle').addEventListener('click', function () {
+      setBinCollapsed(!el('parodyWorkspace').classList.contains('bin-collapsed'));
+    });
+    el('parodyInspectorToggle').addEventListener('click', function () {
+      setInspectorCollapsed(!el('parodyWorkspace').classList.contains('inspector-collapsed'));
     });
     function setOverlayCollapsed(collapsed) {
       overlayCollapsed = !!collapsed;
       el('parodyOverlayTrack').classList.toggle('collapsed', overlayCollapsed);
       el('parodyOverlayTimeline').hidden = overlayCollapsed;
       el('parodyOverlayToggle').setAttribute('aria-expanded', String(!overlayCollapsed));
+      el('parodyOverlayToggle').setAttribute('aria-label', overlayCollapsed ? 'Show V2 overlays' : 'Hide V2 overlays');
       el('parodyOverlayToggle').title = overlayCollapsed ? 'Show V2 overlays' : 'Hide V2 overlays';
     }
     el('parodyOverlayToggle').addEventListener('click', function () {

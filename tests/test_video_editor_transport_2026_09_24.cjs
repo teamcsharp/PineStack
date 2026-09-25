@@ -5,12 +5,16 @@ const M = require('../desktop/renderer/video-edit-model.js');
 const fs = require('node:fs');
 const path = require('node:path');
 
-test('V2 track has a real disclosure control and timeline trim edges are draggable', () => {
+test('V2 starts compact, track controls are icons, and timeline trim edges are draggable', () => {
   const root = path.join(__dirname, '..');
   const html = fs.readFileSync(path.join(root, 'desktop/renderer/video-editor.html'), 'utf8');
   const css = fs.readFileSync(path.join(root, 'desktop/renderer/video-editor.css'), 'utf8');
   const js = fs.readFileSync(path.join(root, 'desktop/renderer/video-editor.js'), 'utf8');
-  assert.match(html, /id="parodyOverlayToggle"[^>]+aria-expanded="true"[^>]+aria-controls="parodyOverlayTimeline"/);
+  assert.match(html, /id="parodyOverlayToggle"[^>]+aria-expanded="false"[^>]+aria-controls="parodyOverlayTimeline"/);
+  assert.match(html, /id="parodyBinToggle"[^>]+aria-controls="parodyWorkspace"/);
+  assert.match(html, /id="parodyInspectorToggle"[^>]+aria-controls="parodyInspector"/);
+  assert.match(html, /class="parody-track-action mute"/);
+  assert.match(html, /class="parody-track-action lock"/);
   assert.match(js, /function setOverlayCollapsed\(collapsed\)/);
   assert.match(js, /parodyOverlayTimeline'\)\.hidden = overlayCollapsed/);
   assert.match(js, /handle\.addEventListener\('pointerdown'.*startEdgeTrim/);
@@ -26,6 +30,19 @@ test('V2 track has a real disclosure control and timeline trim edges are draggab
   assert.match(css, /\.parody-segment \.clip-edge\{[^}]*touch-action:none[^}]*cursor:ew-resize/);
   assert.match(css, /\.clip-trim-readout\{[^}]*ui-monospace/);
   assert.match(css, /\.parody-trim-frame\{/);
+  assert.match(css, /\.parody-workspace\{grid-template-columns:clamp\(230px,20vw,320px\) minmax\(0,1fr\) clamp\(260px,22vw,340px\)/);
+  assert.match(css, /\.parody-program-buffer\{/);
+  assert.match(css, /\.parody-track-action\.mute:before\{content:"M"\}/);
+});
+
+test('timeline playback promotes an already buffered next source instead of reloading the visible player', () => {
+  const root = path.join(__dirname, '..');
+  const js = fs.readFileSync(path.join(root, 'desktop/renderer/video-editor.js'), 'utf8');
+  assert.match(js, /function promotePreloaded\(index, position\)/);
+  assert.match(js, /preloadPreview\.dataset\.preloadKey === key\) return/);
+  assert.match(js, /promotePreloaded\(nextBase, nextPosition\)/);
+  assert.match(js, /setProgramRoles\(preview, preloadPreview\)/);
+  assert.match(js, /programPlayers\.forEach\(function \(player\)/);
 });
 
 test('Electron bridge is preferred for GET and POST', async () => {
