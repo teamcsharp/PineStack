@@ -74,6 +74,30 @@
   }
   var M = window.PineVideoEditModel, $ = function (id) { return document.getElementById(id); };
   var video = $('video'), canvas = $('preview'), ctx = canvas.getContext('2d'), viewer = $('viewer');
+  var toolSidebar = $('toolSidebar');
+  var toolTabs = document.querySelector('.tabs'), toolControls = document.querySelector('.controls');
+  var timelineTransport = $('timelineTransport'), oldPlayback = document.querySelector('.playback');
+  if (toolSidebar && toolTabs && toolControls) {
+    toolSidebar.appendChild(toolTabs);
+    toolSidebar.appendChild(toolControls);
+  }
+  if (timelineTransport) {
+    timelineTransport.appendChild($('play'));
+    timelineTransport.appendChild($('position'));
+    timelineTransport.appendChild($('selection'));
+    timelineTransport.appendChild($('soundView'));
+  }
+  var audioToggle = document.querySelector('.audio-toggle'), recordingTopbar = $('recordingTopbar');
+  if (audioToggle && recordingTopbar) recordingTopbar.insertBefore(audioToggle, $('undo'));
+  if (oldPlayback) oldPlayback.hidden = true;
+  var toolsToggle = $('toolsToggle');
+  if (toolsToggle && toolSidebar) toolsToggle.addEventListener('click', function () {
+    var open = toolSidebar.hidden;
+    toolSidebar.hidden = !open;
+    toolsToggle.setAttribute('aria-expanded', String(open));
+    toolsToggle.setAttribute('aria-label', open ? 'Hide editing tools' : 'Show editing tools');
+    toolsToggle.title = open ? 'Hide editing tools' : 'Show editing tools';
+  });
   var lastFrame = document.createElement('canvas'), frameContext = lastFrame.getContext('2d'), hasFrame = false, exportState = null;
   var source = null, edit = null, past = [], future = [], tab = 'trim', tool = 'pen';
   var frameRect = {x: 0, y: 0, w: 1, h: 1}, gesture = null, raf = 0, busy = false, disposed = false;
@@ -395,7 +419,7 @@
     showLoading('The preview could not load.', -1);
     status('Try opening the recording again.', true, reloadMedia);
   });
-  ['play', 'pause', 'timeupdate', 'ended'].forEach(function (name) { video.addEventListener(name, function () { $('play').textContent = video.paused ? '▶' : 'Ⅱ'; $('play').setAttribute('aria-label', video.paused ? 'Play selection' : 'Pause preview'); repaint(); }); });
+  ['play', 'pause', 'timeupdate', 'ended'].forEach(function (name) { video.addEventListener(name, function () { $('play').classList.toggle('is-playing', !video.paused); $('play').setAttribute('aria-label', video.paused ? 'Play selection' : 'Pause preview'); repaint(); }); });
   function play() {
     if (!source || busy) return;
     if (!video.paused) { video.pause(); return; }
@@ -2294,7 +2318,9 @@
     maskCanvas.addEventListener('pointerdown', function (event) {
       var clip = clips[selected]; if (!maskEditing || !clip || clip.track !== 'overlay' || overlayLocked) return;
       event.preventDefault();
-      var rect = maskCanvas.getBoundingClientRect(), nx = model.clamp((event.clientX - rect.left) / rect.width, 0, 1), ny = model.clamp((event.clientY - rect.top) / rect.height, 0, 1);
+      var rect = maskCanvas.getBoundingClientRect();
+      var nx = model.clamp((event.clientX - rect.left) / rect.width, 0, 1);
+      var ny = model.clamp((event.clientY - rect.top) / rect.height, 0, 1);
       var original = model.copy(clips), before = JSON.stringify(clips), working = model.spliceDecorate(original[selected]);
       if (!working.mask.keyframes.length) {
         working.mask.keyframes.push({at: model.clamp(at - startOf(selected), 0, working.out_s - working.in_s), points: []}); maskFrameIndex = 0;

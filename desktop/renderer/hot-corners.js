@@ -2301,15 +2301,16 @@
   }
 
   function stingerField(label, hint, rows) {
-    var wrap = make('label', 'hc-stinger-field');
+    var wrap = make('div', 'hc-stinger-field');
+    wrap.setAttribute('data-pine-mic-container', '');
     wrap.appendChild(make('span', 'hc-stinger-label', label));
     var field = make('textarea', 'hc-stinger-text');
     field.rows = rows || 2;
     field.placeholder = hint;
     field.setAttribute('aria-label', label);
-    /* PineTalkDot detects all live text fields and puts its shared mic at
-       the right edge. That gives this popup the same tap/hold dictation as
-       every other Pine Box field without a second microphone icon. */
+    field.setAttribute('data-pine-mic-inline', '');
+    /* PineTalkDot mounts its shared mic inside this field wrapper, so it
+       follows the textarea while the sheet scrolls and remains inside it. */
     wrap.appendChild(field);
     return {wrap: wrap, field: field};
   }

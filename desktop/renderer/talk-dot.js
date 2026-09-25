@@ -221,6 +221,7 @@
      never survives outside a rotated or resized screen. */
   var DOT_POSITION_KEY = 'pineTalkDotPositionV1';
   var DOT_ENABLED_KEY = 'pineTalkDotEnabledV1';
+  var DOT_COLLAPSED_KEY = 'pineTalkDotCollapsedV1';
   var DOT_EDGE = 8;
 
   function dotEnabled() {
@@ -228,13 +229,76 @@
     catch (err) { return true; }
   }
 
+  function dotCollapsed() {
+    try { return !!(root.localStorage && root.localStorage.getItem(DOT_COLLAPSED_KEY) === '1'); }
+    catch (err) { return false; }
+  }
+
   function dotEvent(enabled) {
     try {
       if (root.dispatchEvent && typeof root.CustomEvent === 'function') {
-        root.dispatchEvent(new root.CustomEvent('pine-talk-dot-change', {detail: {enabled: !!enabled}}));
+        root.dispatchEvent(new root.CustomEvent('pine-talk-dot-change', {
+          detail: {enabled: !!enabled, collapsed: dotCollapsed()}}));
       }
     } catch (err) { /* the control still works without custom events */ }
   }
+
+  function syncCollapseButton(dot) {
+    var button = el('pineTalkCollapse');
+    if (!button || !dot) return;
+    var visible = dotEnabled() && !dotCollapsed() && state === IDLE && !dot.hidden;
+    button.hidden = !visible;
+    if (!visible) return;
+    var box = null;
+    try { box = dot.getBoundingClientRect(); } catch (err) { box = null; }
+    if (!box) return;
+    var size = 24;
+    var left = Math.max(DOT_EDGE, Math.min(box.right - size + 5,
+      (Number(root.innerWidth) || box.right) - size - DOT_EDGE));
+    var top = Math.max(DOT_EDGE, Math.min(box.top - 7,
+      (Number(root.innerHeight) || box.bottom) - size - DOT_EDGE));
+    button.style.left = Math.round(left) + 'px';
+    button.style.top = Math.round(top) + 'px';
+  }
+
+  function ensureCollapseButton(dot) {
+    var button = el('pineTalkCollapse');
+    if (!button) {
+      button = document.createElement('button');
+      button.type = 'button';
+      button.id = 'pineTalkCollapse';
+      button.className = 'pine-talk-collapse';
+      button.title = 'Collapse voice control to the bottom bar';
+      button.setAttribute('aria-label', button.title);
+      button.innerHTML = '<svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 7.5 10 13l6-5.5"/></svg>';
+      button.addEventListener('click', function (event) {
+        event.preventDefault();
+        event.stopPropagation();
+        setCollapsed(true);
+      });
+      document.body.appendChild(button);
+    }
+    syncCollapseButton(dot);
+    return button;
+  }
+
+  function setCollapsed(collapsed) {
+    collapsed = !!collapsed;
+    if (collapsed && state !== IDLE) return false;
+    try { if (root.localStorage) root.localStorage.setItem(DOT_COLLAPSED_KEY, collapsed ? '1' : '0'); }
+    catch (err) { /* storage is optional */ }
+    var dot = el('pineTalkDot');
+    if (!dot && !collapsed && dotEnabled()) dot = mount();
+    if (dot) {
+      dot.hidden = !dotEnabled() || collapsed;
+      dot.setAttribute('aria-hidden', dot.hidden ? 'true' : 'false');
+      syncCollapseButton(dot);
+    }
+    dotEvent(dotEnabled());
+    return true;
+  }
+
+  function restoreFromBar() { return setCollapsed(false); }
 
   function setEnabled(enabled) {
     enabled = !!enabled;
@@ -243,8 +307,9 @@
     var dot = el('pineTalkDot');
     if (enabled && !dot) dot = mount();
     if (dot) {
-      dot.hidden = !enabled;
-      dot.setAttribute('aria-hidden', enabled ? 'false' : 'true');
+      dot.hidden = !enabled || dotCollapsed();
+      dot.setAttribute('aria-hidden', dot.hidden ? 'true' : 'false');
+      syncCollapseButton(dot);
     }
     ['pineTalkSay', 'pineTalkTelemetry'].forEach(function (id) {
       var node = el(id); if (!enabled && node) node.hidden = true;
@@ -304,6 +369,7 @@
         root.localStorage.setItem(DOT_POSITION_KEY, JSON.stringify(point));
       }
     } catch (err) { /* moving the dot must still work without storage */ }
+    syncCollapseButton(dot);
     return point;
   }
 
@@ -313,7 +379,11 @@
   }
 
   function dotKeepVisible(dot) {
-    if (!dot || !dot.classList.contains('pine-talk-moved')) return;
+    if (!dot) return;
+    if (!dot.classList.contains('pine-talk-moved')) {
+      syncCollapseButton(dot);
+      return;
+    }
     var box = null;
     try { box = dot.getBoundingClientRect(); } catch (err) { box = null; }
     if (!box) return;
@@ -417,7 +487,9 @@
 
   function mount() {
     if (el('pineTalkDot')) {
-      el('pineTalkDot').hidden = !dotEnabled();
+      el('pineTalkDot').hidden = !dotEnabled() || dotCollapsed();
+      el('pineTalkDot').setAttribute('aria-hidden', el('pineTalkDot').hidden ? 'true' : 'false');
+      ensureCollapseButton(el('pineTalkDot'));
       return el('pineTalkDot');
     }
     /* Before anything else: put back whatever a previous life of this page
@@ -456,10 +528,11 @@
     });
     dot.title = 'Tap to speak. Drag to move this control. Right-click to choose a microphone.';
     document.body.appendChild(dot);
-    dot.hidden = !dotEnabled();
+    dot.hidden = !dotEnabled() || dotCollapsed();
     dot.setAttribute('aria-hidden', dot.hidden ? 'true' : 'false');
     dotRestore(dot);
     dotDrag(dot);
+    ensureCollapseButton(dot);
     if (root.addEventListener) {
       root.addEventListener('resize', function () { dotKeepVisible(dot); });
     }
@@ -682,6 +755,7 @@
       if (root.requestAnimationFrame) root.requestAnimationFrame(settleDot);
       else if (root.setTimeout) root.setTimeout(settleDot, 0);
     }
+    syncCollapseButton(dot);
   }
 
   /* ---- ducking -------------------------------------------------------- */
@@ -1902,6 +1976,7 @@
     micPin: micPin,
     mount: mount, listen: listen, finish: finish, duck: duck,
     enabled: dotEnabled, setEnabled: setEnabled, toggle: toggleEnabled,
+    collapsed: dotCollapsed, setCollapsed: setCollapsed, restoreFromBar: restoreFromBar,
     /* `act` is the door for a sentence that arrived some other way - a
      * wake word, a typed command, or a test - and it deliberately does
      * everything the spoken road does from the transcript onwards:
@@ -1930,8 +2005,8 @@
     report: reportOpen,
     state: function () { return state; }
   };
-  /* Field dictation stays in the field, including fields created by later
-   * popups. The overlay avoids changing the layout of established forms. */
+  /* Field dictation follows each field through nested scrolling. Established
+   * forms use a fixed overlay; popups may opt into a local inline mount. */
   if (root.document && root.document.addEventListener) {
     var fieldButtons = new Map();
     var fieldLayer = root.document.createElement('div');
@@ -1978,11 +2053,17 @@
       var rect = field.getBoundingClientRect();
       var view = viewport();
       var size = Math.min(32, Math.max(0, rect.height - 4), Math.max(0, rect.width - 4));
+      var inline = button.classList.contains('pine-field-mic-inline');
       var x = rect.right - size - 3;
       var y = rect.top + Math.max(2, (rect.height - size) / 2);
       setMicHidden(button, size < 22 || rect.width < 48 || rect.right <= 0
         || rect.left >= view.width || rect.bottom <= 0 || rect.top >= view.height
         || !!(field.closest && field.closest('[hidden], [aria-hidden="true"]')));
+      if (inline) {
+        button.style.width = size + 'px';
+        button.style.height = size + 'px';
+        return;
+      }
       /* An elementFromPoint walks the whole document. Do it on first reveal
          and focus, not after every live-feed DOM change. The observer below
          keeps the ordinary placement set to fields that are actually visible. */
@@ -2114,7 +2195,9 @@
       else finishWhenReady = true;
     }
     function makeMic(field) {
-      reserveSpace(field);
+      var inlineContainer = field.hasAttribute('data-pine-mic-inline')
+        && field.closest && field.closest('[data-pine-mic-container]');
+      if (!inlineContainer) reserveSpace(field);
       var button = root.document.createElement('button');
       var pressedAt = 0;
       var wasListening = false;
@@ -2122,6 +2205,7 @@
       var held = false;
       button.type = 'button';
       button.className = 'pine-field-mic';
+      if (inlineContainer) button.classList.add('pine-field-mic-inline');
       button.hidden = true;
       button.title = 'Tap to dictate or stop; hold to talk and release to transcribe';
       button.setAttribute('aria-label', button.title);
@@ -2159,7 +2243,8 @@
         if (event.detail !== 0) return;
         if (micBusy) stopMic(); else startMic(field, button);
       });
-      if (fieldLayer.appendChild) fieldLayer.appendChild(button);
+      if (inlineContainer) inlineContainer.appendChild(button);
+      else if (fieldLayer.appendChild) fieldLayer.appendChild(button);
       return button;
     }
     (root.document.body || root.document.documentElement).appendChild(fieldLayer);

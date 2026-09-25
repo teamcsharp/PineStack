@@ -158,6 +158,16 @@
     button.hidden = !hidden;
   }
 
+  function paintTalkRestoreButton(bar) {
+    bar = bar || el();
+    if (!bar) return;
+    var button = bar.querySelector('.pine-console-talk-dot');
+    if (!button) return;
+    var talk = root.PineTalkDot;
+    button.hidden = !(talk && typeof talk.enabled === 'function' && talk.enabled()
+      && typeof talk.collapsed === 'function' && talk.collapsed());
+  }
+
   function mount() {
     if (el()) return el();
     var bar = document.createElement('div');
@@ -170,6 +180,9 @@
       + '<button class="pine-console-orchestrator" type="button" hidden'
       + ' title="Restore the orchestrator control" aria-label="Restore the orchestrator control">'
       + (icon('c:bot', 'Restore orchestrator') || '') + '</button>'
+      + '<button class="pine-console-talk-dot" type="button" hidden'
+      + ' title="Restore voice control" aria-label="Restore voice control">'
+      + (icon('c:microphone', 'Restore voice control') || 'V') + '</button>'
       + '<button class="pine-console-change" type="button" title="Open Pine Box changelog"'
       + ' aria-label="Open Pine Box changelog">i</button>'
       + '<div class="pine-console-viewport"><div class="pine-console-track"></div></div>'
@@ -178,6 +191,13 @@
       + (icon('c:terminal', 'Open audit terminal') || '&gt;_') + '</button>';
     document.body.appendChild(bar);
     wireSpeed(bar);
+    paintTalkRestoreButton(bar);
+    if (root.addEventListener && !bar.__pineTalkRestoreWired) {
+      bar.__pineTalkRestoreWired = true;
+      root.addEventListener('pine-talk-dot-change', function () {
+        paintTalkRestoreButton(bar);
+      });
+    }
     var track = bar.querySelector('.pine-console-track');
     if (track) track.addEventListener('animationiteration', function () {
       if (!pendingMarqueeRows) return;
@@ -201,6 +221,15 @@
           root.PineOrchGlass.undot();
         }
         paintOrchestratorButton(bar);
+        return;
+      }
+      if (event.target && event.target.closest && event.target.closest('.pine-console-talk-dot')) {
+        if (root.PineTalkDot && typeof root.PineTalkDot.restoreFromBar === 'function') {
+          root.PineTalkDot.restoreFromBar();
+          paintTalkRestoreButton(bar);
+          var dot = document.getElementById('pineTalkDot');
+          if (dot && typeof dot.focus === 'function') dot.focus();
+        }
         return;
       }
       if (event.target && event.target.closest && event.target.closest('.pine-console-audit')) {
@@ -386,6 +415,7 @@
 
   root.PineConsoleLine = {start: start, paint: paint, latest: latest,
     mount: mount, history: history, sync: syncFlow, open: openList,
-    speed: function () { return speed; }, refreshOrchestrator: paintOrchestratorButton};
+    speed: function () { return speed; }, refreshOrchestrator: paintOrchestratorButton,
+    refreshTalkRestore: paintTalkRestoreButton};
   if (typeof module !== 'undefined' && module.exports) module.exports = root.PineConsoleLine;
 })(typeof window !== 'undefined' ? window : globalThis);

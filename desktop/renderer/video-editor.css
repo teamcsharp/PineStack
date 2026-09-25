@@ -160,3 +160,58 @@ html.parody-embedded .parody-footer{display:none}
   .parody-v2-track .parody-track-actions{margin-top:0}
   .parody-v2-track .parody-track-action{width:20px;min-width:20px;min-height:20px!important}
 }
+
+/* Recording editor: preview gets the main canvas, tools live in a drawer,
+   and transport sits directly above the compact timeline. */
+#recordingEditor{min-height:0;overflow:hidden;gap:5px}
+#recordingEditor .topbar{min-height:44px;flex:0 0 auto;gap:6px}
+#recordingEditor .topbar button{min-height:36px;padding:5px 10px;border-radius:8px}
+#recordingEditor .heading h1{margin-bottom:2px}
+#recordingEditor .audio-toggle{min-height:34px;margin-left:auto;gap:4px;font-size:12px}
+#recordingEditor .audio-toggle input{width:18px;height:18px}
+#recordingEditor .editor-tools-toggle{width:36px;min-width:36px;padding:7px}
+#recordingEditor .editor-tools-toggle svg{width:20px;height:20px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round}
+#recordingEditor .editor-tools-toggle circle{fill:var(--panel,#171a20)}
+#recordingEditor .editor-workspace{position:relative;display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px;flex:1 1 auto;min-height:0}
+#recordingEditor .viewer{height:100%;min-height:0;flex:none;border-radius:8px}
+#recordingEditor .editor-tools{width:min(310px,29vw);min-width:250px;min-height:0;max-height:100%;display:flex;flex-direction:column;gap:6px;overflow:auto;padding:7px;border-left:1px solid var(--line,#343944);background:var(--panel,#171a20)}
+#recordingEditor .editor-tools[hidden]{display:none}
+#recordingEditor .tabs{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:4px;flex:0 0 auto}
+#recordingEditor .tabs button{min-width:0;width:100%;min-height:36px;padding:5px 7px;border-radius:6px;font-size:12px}
+#recordingEditor .controls{width:100%;min-height:0;flex:1 0 auto;align-items:flex-start;justify-content:stretch;padding:6px 0}
+#recordingEditor .panel{width:100%;justify-content:flex-start;align-content:flex-start;gap:6px}
+#recordingEditor .panel button{min-height:36px;padding:6px 9px;border-radius:7px;font-size:12px}
+#recordingEditor .panel label{flex-wrap:wrap;gap:5px}
+#recordingEditor .adjustments{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+#recordingEditor .adjustments label{width:100%;grid-template-columns:minmax(0,1fr) 30px}
+#recordingEditor .playback{display:none}
+#recordingEditor .timeline-section{flex:0 0 auto;padding:0 8px}
+#recordingEditor .timeline-transport{display:flex;align-items:center;gap:8px;min-height:32px;padding:0 5px}
+#recordingEditor .timeline-transport .play{position:relative;width:34px;min-width:34px;height:30px;min-height:30px;padding:0;font-size:0;border-radius:6px}
+#recordingEditor .timeline-transport .play::before{content:"";position:absolute;left:13px;top:8px;border-top:7px solid transparent;border-bottom:7px solid transparent;border-left:10px solid currentColor}
+#recordingEditor .timeline-transport .play.is-playing::before{left:10px;top:8px;width:4px;height:14px;border:0;background:currentColor}
+#recordingEditor .timeline-transport .play.is-playing::after{content:"";position:absolute;left:19px;top:8px;width:4px;height:14px;background:currentColor}
+#recordingEditor .timeline-transport output{min-width:70px;font-size:12px;font-variant-numeric:tabular-nums}
+#recordingEditor .timeline-transport>span{flex:1;min-width:40px;overflow:hidden;color:var(--muted);font-size:11px;text-overflow:ellipsis;white-space:nowrap}
+#recordingEditor .timeline-transport #soundView{min-height:28px;padding:3px 8px;font-size:11px}
+#recordingEditor .timeline{height:55px;margin:0 5px}
+#recordingEditor .frames,#recordingEditor .frames img,#recordingEditor .frames .sprite{height:33px}
+#recordingEditor .wave,#recordingEditor .spectrogram{height:21px}
+#recordingEditor .trim-handle{width:24px}
+#recordingEditor .trim-handle span{height:20px}
+#recordingEditor .timeline-labels{min-height:19px;font-size:10px}
+#recordingEditor .timeline-labels #soundView{display:none}
+#recordingEditor footer{flex:0 0 auto;min-height:25px;padding-bottom:0;font-size:11px}
+@media(max-width:760px){
+  #recordingEditor .topbar{flex-wrap:wrap;min-height:0}
+  #recordingEditor .heading{order:-1;flex:1 1 100%;}
+  #recordingEditor .heading span{max-width:90vw}
+  #recordingEditor .topbar button{min-height:34px;padding:4px 8px}
+  #recordingEditor .editor-workspace{display:block}
+  #recordingEditor .viewer{position:absolute;inset:0;width:100%;height:100%}
+  #recordingEditor .editor-tools{position:absolute;z-index:6;right:0;top:0;bottom:0;width:min(310px,88vw);max-height:none;box-shadow:0 0 0 100vmax #0007}
+  #recordingEditor .timeline-section{padding:0 3px}
+  #recordingEditor .timeline{height:55px}
+  #recordingEditor .frames,#recordingEditor .frames img,#recordingEditor .frames .sprite{height:33px}
+  #recordingEditor footer{min-height:23px}
+}

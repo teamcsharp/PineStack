@@ -16,6 +16,7 @@ function harness() {
     createElement() {
       return {
         style: {}, isConnected: true,
+        classList: {contains() { return false; }},
         setAttribute() {},
         addEventListener(type, fn) { buttonHandlers[type] = fn; },
         setPointerCapture() {},
@@ -33,6 +34,7 @@ function harness() {
       this.current = '';
     }
     get value() { return this.current; }
+    hasAttribute() { return false; }
     set value(next) { this.nativeSets++; this.current = next; }
     getBoundingClientRect() { return {top: 20, right: 300, bottom: 60}; }
     dispatchEvent(event) { this.events.push(event.type); }

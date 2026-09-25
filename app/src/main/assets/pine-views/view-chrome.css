@@ -329,6 +329,25 @@
               right .18s ease, bottom .18s ease, left .18s ease, top .18s ease;
 }
 .pine-talk-dot[hidden] { display: none; }
+.pine-talk-collapse {
+  position: fixed;
+  z-index: 2147483081;
+  display: grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 1px solid #51626e;
+  border-radius: 50%;
+  background: #10171d;
+  color: #c7eaf0;
+  cursor: pointer;
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+}
+.pine-talk-collapse[hidden] { display: none; }
+.pine-talk-collapse svg { width: 14px; height: 14px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+.pine-talk-collapse:hover, .pine-talk-collapse:focus-visible { background: #24323c; outline: 1px solid #65c7da; }
 .pine-talk-dot.pine-talk-moved {
   left: var(--pine-talk-left);
   top: var(--pine-talk-top);

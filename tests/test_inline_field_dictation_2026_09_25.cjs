@@ -10,6 +10,7 @@ function field(left, top) {
     parentElement: null, events: [], padding: '',
     style: {setProperty(name, value) { if (name === 'padding-right') node.padding = value; }},
     closest: () => null,
+    hasAttribute: () => false,
     contains: () => false,
     getBoundingClientRect: () => ({left, top, right: left + 210,
       bottom: top + 38, width: 210, height: 38}),
@@ -22,12 +23,13 @@ function field(left, top) {
 
 function load(file) {
   const fields = [field(20, 30), field(20, 90)];
-  const dot = {id: 'pineTalkDot'};
+  const dot = {id: 'pineTalkDot', setAttribute() {}};
   let layer;
   let clock = 1000;
   function element() {
     return {
       style: {}, children: [], listeners: {}, attrs: {},
+      classList: {contains() { return false; }},
       setAttribute(name, value) { this.attrs[name] = value; },
       addEventListener(name, fn) { this.listeners[name] = fn; },
       appendChild(child) { this.children.push(child); },

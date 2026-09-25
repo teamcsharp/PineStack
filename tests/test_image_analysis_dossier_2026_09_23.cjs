@@ -38,7 +38,8 @@ test('the current strip keeps the exact timed row words and tap target', () => {
   assert.match(backend, /"name": str\(r\.get\("name"\) or ""\)/);
   assert.match(script, /resumeAirFollow\('live strip', sayingLineId\)/);
   assert.match(script, /sayingLineId = String\(\(shown && shown\.id\) \|\| ''\)/);
-  assert.match(script, /feedNow && feedNow\.id[\s\S]*String\(feedNow\.id\) !== String\(shown\.id\)[\s\S]*!headIsRead\(\)/);
+  assert.match(script, /feedNow && shown && String\(feedNow\.id\) === String\(shown\.id\)/);
+  assert.match(script, /text: shown\.text \|\| feedNow\.text/);
 });
 
 test('the shared feed favors the timed current row over a stale snapshot', async () => {

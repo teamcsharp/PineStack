@@ -84872,6 +84872,13 @@ def gold_pick(exclude_who: str = "", min_rest: float | None = None) -> dict[str,
     try:
         now = time.time()
         rest = GOLD_REST if min_rest is None else float(min_rest)
+        # Gap-fill callers used to pass their five-minute cadence straight
+        # through, bypassing the spoken-line repeat window. Keep the gold
+        # exception consistent with air_repeat_check: at most half the
+        # configured window, but never sooner than this road's own rest.
+        window = repeat_window()
+        if window > 0:
+            rest = max(rest, window / 2.0)
         # #1412: THE STAT COMES LAST. This stat'ed every gold row - 1,400
         # of them - on the event loop per pick, against a disk the vector
         # store was being written to; the pulse caught it at 6.8 s, five

@@ -99,5 +99,7 @@ test('every visible editor video has an aspect-preserving cover or native poster
   }
   assert.match(css, /\.ve-media-cover img\.ve-real-poster\{[^}]*object-fit:contain/);
   assert.match(markup, /id="parodySourcePreview"[^>]*controls[^>]*poster="\/spark\/asset\/pinebox\.png"/);
-  assert.match(markup, /id="parodyVideo"[^>]*controls/);
+  assert.match(markup, /id="parodyVideo"[^>]*playsinline/);
+  assert.match(markup, /id="parodyPlay"[^>]*aria-label="Play sequence"/);
+  assert.match(source, /el\('parodyPlay'\)\.addEventListener\('click', play/);
 });

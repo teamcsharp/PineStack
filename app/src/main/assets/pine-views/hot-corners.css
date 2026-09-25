@@ -96,7 +96,27 @@
    operator can watch the exact reference range, dictate into either field,
    and submit one durable H3 request without leaving the replay surface. */
 .hc-replay-offer { width: min(650px, calc(100vw - 24px)); }
-.hc-stinger-field { display: flex; flex-direction: column; gap: 5px; }
+.hc-stinger-field { position: relative; display: flex; flex-direction: column; gap: 5px; }
+.hc-stinger-field > .pine-field-mic-inline {
+  position: absolute;
+  right: 6px;
+  bottom: 12px;
+  z-index: 2;
+  padding: 4px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: #8fcbd2;
+  cursor: pointer;
+  pointer-events: auto;
+}
+.hc-stinger-field > .pine-field-mic-inline svg { width: 17px; height: 17px; }
+.hc-stinger-field > .pine-field-mic-inline:hover,
+.hc-stinger-field > .pine-field-mic-inline:focus-visible,
+.hc-stinger-field > .pine-field-mic-inline[aria-pressed="true"] {
+  color: #c4f4f3;
+  background: #24424a;
+}
 .hc-stinger-label, .hc-stinger-source-title {
   color: var(--text, #edf3f5); font-size: 12px; font-weight: 650;
 }

@@ -1,12 +1,14 @@
 /* Git history kept dense enough for station work, with no speculative data. */
-.pine-console-change, .pine-console-orchestrator {
+.pine-console-change, .pine-console-orchestrator, .pine-console-talk-dot {
   flex: 0 0 24px; width: 24px; height: 20px; padding: 0; display: grid; place-items: center;
   border: 0; border-right: 1px solid #35414c; border-radius: 0; background: transparent;
   color: #65c7da; font: 700 14px/1 system-ui, sans-serif; cursor: pointer;
 }
 .pine-console-orchestrator .pi-icon { width: 15px; height: 15px; }
+.pine-console-talk-dot .pi-icon { width: 15px; height: 15px; }
 .pine-console-change:hover, .pine-console-change:focus-visible,
-.pine-console-orchestrator:hover, .pine-console-orchestrator:focus-visible { color: #edf3f5; background: #24323c; outline: 1px solid #65c7da; }
+.pine-console-orchestrator:hover, .pine-console-orchestrator:focus-visible,
+.pine-console-talk-dot:hover, .pine-console-talk-dot:focus-visible { color: #edf3f5; background: #24323c; outline: 1px solid #65c7da; }
 .pine-changelog {
   position: fixed; z-index: 2147483075; left: 18px; bottom: 30px; width: min(780px, calc(100vw - 64px));
   max-height: min(760px, calc(100vh - 64px)); display: flex; flex-direction: column;
@@ -64,7 +66,7 @@
 .cl-loading, .cl-empty, .cl-error { padding: 20px 8px; color: #8fa0ad; }
 .cl-error { color: #efad9c; }
 @media (max-width: 720px) {
-  .pine-console-change, .pine-console-orchestrator { flex-basis: 22px; width: 22px; }
+  .pine-console-change, .pine-console-orchestrator, .pine-console-talk-dot { flex-basis: 22px; width: 22px; }
   .pine-changelog { left: 7px; bottom: 29px; width: calc(100vw - 38px); max-height: calc(100vh - 48px); }
   .cl-body { padding-left: 10px; padding-right: 10px; }
   .cl-entry-body { padding-left: 33px; }

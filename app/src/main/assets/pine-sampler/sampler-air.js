@@ -138,7 +138,9 @@
    * one. And a second full-length ring is another 23 MB on a 4 GB tablet for
    * history that would never be read. */
   var ctx = null;
-  var capture = null;       /* the ScriptProcessor doing the copying   */
+  var capture = null;       /* the active capture processor            */
+  var captureInput = null;
+  var voiceInput = null;
   var voiceCapture = null;  /* the same, for everything but the record */
   var voiceRing = null;
   var voiceWrite = 0;
@@ -270,6 +272,7 @@
       try { URL.revokeObjectURL(url); } catch (err) { /* fine */ }
       return true;
     }).catch(function (err) {
+      try { URL.revokeObjectURL(url); } catch (ignored) { /* already gone */ }
       workletWhy = 'the page refused the worklet module: ' + err.message;
       throw err;
     });
@@ -285,6 +288,9 @@
     sink = c.createGain();
     sink.gain.value = 0;          /* it must hear, not speak */
     sink.connect(c.destination);
+    // Stable inputs keep existing players connected when the processor changes.
+    captureInput = c.createGain();
+    voiceInput = c.createGain();
     /* THE WORKLET FIRST. It is asked for asynchronously, so the
      * ScriptProcessor below is wired up immediately and REPLACED when the
      * worklet is ready. */
@@ -309,13 +315,16 @@
           }
         };
         if (sink) tap.connect(sink);
+        captureInput.connect(tap);
         if (capture) {
+          captureInput.disconnect(capture);
           try { capture.disconnect(); } catch (err) { /* gone */ }
           capture.onaudioprocess = null;
         }
         capture = tap;
         captureHow = 'worklet';
       } catch (err) {
+        workletWhy = err.message;
         captureHow = 'script processor (' + err.message + ')';
       }
     }).catch(function () {
@@ -349,6 +358,7 @@
       if (filled < ring.length) filled = Math.min(ring.length, filled + n);
     };
     capture.connect(sink);
+    captureInput.connect(capture);
 
     /* The voices-only ring. Same shape, its own clock, fed in tap(). */
     voiceRing = new Float32Array(Math.round(VOICE_HISTORY_S * c.sampleRate));
@@ -370,7 +380,9 @@
           }
         };
         if (sink) tap.connect(sink);
+        voiceInput.connect(tap);
         if (voiceCapture) {
+          voiceInput.disconnect(voiceCapture);
           try { voiceCapture.disconnect(); } catch (err) { /* gone */ }
           voiceCapture.onaudioprocess = null;
         }
@@ -394,6 +406,7 @@
       }
     };
     voiceCapture.connect(sink);
+    voiceInput.connect(voiceCapture);
     return true;
   }
 
@@ -460,7 +473,7 @@
         ctx = ctx || scope.context;
         if (scope.context === context() && ensureRing()) {
           try {
-            scope.analyser.connect(capture);
+            scope.analyser.connect(captureInput);
             listenForSpectrum(element, scope.analyser);
             taps.set(element, {joined: true});
             live = true;
@@ -485,7 +498,8 @@
     try {
       var source = c.createMediaElementSource(element);
       source.connect(c.destination);   /* it must still be heard */
-      source.connect(capture);         /* and now it is also kept */
+      source.connect(captureInput);    /* and now it is also kept */
+      listenForSpectrum(element, source);
       made = {joined: true, source: source};
       live = true;
       reason = 'listening';
@@ -540,7 +554,8 @@
             && tappable(player) && !taps.has(player)) {   /* #1420 */
             ctx = ctx || scope.context;
             if (scope.context === context() && ensureRing()) {
-              scope.analyser.connect(capture);
+              scope.analyser.connect(captureInput);
+              listenForSpectrum(player, scope.analyser);
               taps.set(player, {joined: true});
               if (known.indexOf(player) < 0) known.push(player);
               live = true;
@@ -806,8 +821,8 @@
     var c = context();
     if (!c) return;
     /* The same signal, into the voices-only ring. */
-    if (voiceCapture) {
-      try { from.connect(voiceCapture); } catch (err) { /* already, or refused */ }
+    if (voiceInput) {
+      try { from.connect(voiceInput); } catch (err) { /* already, or refused */ }
     }
     if (!speechAnalyser) {
       speechAnalyser = c.createAnalyser();
