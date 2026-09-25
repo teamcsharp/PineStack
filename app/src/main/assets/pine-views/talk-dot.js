@@ -1712,6 +1712,26 @@
     var micMonitor = 0;
     var finishWhenReady = false;
     var scanQueued = false;
+    var placeQueued = false;
+    var placeHitTest = false;
+    var visibleFields = new Set();
+    var fieldObserver = null;
+    function nextFrame(job) {
+      if (typeof root.requestAnimationFrame === 'function') return root.requestAnimationFrame(job);
+      if (typeof root.setTimeout === 'function') return root.setTimeout(job, 0);
+      job();
+      return 0;
+    }
+    function afterDelay(job, delay) {
+      if (typeof root.setTimeout === 'function') return root.setTimeout(job, delay);
+      if (typeof setTimeout === 'function') return setTimeout(job, delay);
+      job();
+      return 0;
+    }
+    function cancelDelay(timer) {
+      if (typeof root.clearTimeout === 'function') root.clearTimeout(timer);
+      else if (typeof clearTimeout === 'function') clearTimeout(timer);
+    }
     function textField(node) {
       if (!node || node.disabled || node.readOnly) return false;
       if (node.tagName === 'TEXTAREA') return true;
@@ -1722,17 +1742,23 @@
       return root.visualViewport || {width: root.innerWidth, height: root.innerHeight,
         offsetLeft: 0, offsetTop: 0};
     }
-    function placeMic(field, button) {
-      if (!field.isConnected || !textField(field)) { button.hidden = true; return; }
+    function setMicHidden(button, hidden) {
+      if (button.hidden !== hidden) button.hidden = hidden;
+    }
+    function placeMic(field, button, hitTest) {
+      if (!field.isConnected || !textField(field)) { setMicHidden(button, true); return; }
       var rect = field.getBoundingClientRect();
       var view = viewport();
       var size = Math.min(32, Math.max(0, rect.height - 4), Math.max(0, rect.width - 4));
       var x = rect.right - size - 3;
       var y = rect.top + Math.max(2, (rect.height - size) / 2);
-      button.hidden = size < 22 || rect.width < 48 || rect.right <= 0
+      setMicHidden(button, size < 22 || rect.width < 48 || rect.right <= 0
         || rect.left >= view.width || rect.bottom <= 0 || rect.top >= view.height
-        || !!field.closest('[hidden], [aria-hidden="true"]');
-      if (!button.hidden && root.document.elementFromPoint) {
+        || !!(field.closest && field.closest('[hidden], [aria-hidden="true"]')));
+      /* An elementFromPoint walks the whole document. Do it on first reveal
+         and focus, not after every live-feed DOM change. The observer below
+         keeps the ordinary placement set to fields that are actually visible. */
+      if (hitTest && !button.hidden && root.document.elementFromPoint) {
         button.style.pointerEvents = 'none';
         var hit = root.document.elementFromPoint(
           Math.max(rect.left + 2, Math.min(rect.right - 2, rect.left + rect.width / 2)),
@@ -1762,41 +1788,67 @@
       telemetry.style.width = width + 'px';
       telemetry.style.height = height + 'px';
     }
-    function placeAll() {
-      fieldButtons.forEach(function (button, field) {
-        if (!field.isConnected) { button.remove(); fieldButtons.delete(field); return; }
-        placeMic(field, button);
+    function placeAll(hitTest) {
+      var fields = fieldObserver ? visibleFields : fieldButtons;
+      fields.forEach(function (value, key) {
+        var field = fieldObserver ? value : key;
+        var button = fieldObserver ? fieldButtons.get(field) : value;
+        if (!field || !button || !field.isConnected) {
+          if (button) button.remove();
+          fieldButtons.delete(field);
+          visibleFields.delete(field);
+          return;
+        }
+        placeMic(field, button, hitTest);
       });
       placeTelemetry();
+    }
+    function queuePlace(hitTest) {
+      placeHitTest = placeHitTest || !!hitTest;
+      if (placeQueued) return;
+      placeQueued = true;
+      nextFrame(function () {
+        var probe = placeHitTest;
+        placeQueued = false;
+        placeHitTest = false;
+        placeAll(probe);
+      });
     }
     function queueScan() {
       if (scanQueued) return;
       scanQueued = true;
-      requestAnimationFrame(function () { scanQueued = false; scan(); });
+      nextFrame(function () { scanQueued = false; scan(); });
     }
     function scan() {
-      var fields = root.document.querySelectorAll('input, textarea, [contenteditable="true"]');
+      var fields = root.document.querySelectorAll
+        ? root.document.querySelectorAll('input, textarea, [contenteditable="true"]') : [];
+      var added = false;
       for (var i = 0; i < fields.length; i += 1) {
         var field = fields[i];
         if (!textField(field) || fieldButtons.has(field)) continue;
-        fieldButtons.set(field, makeMic(field));
+        var button = makeMic(field);
+        fieldButtons.set(field, button);
+        added = true;
+        if (fieldObserver) fieldObserver.observe(field);
       }
-      placeAll();
+      if (added && !fieldObserver) queuePlace(true);
     }
     function reserveSpace(field) {
+      if (!field.style || !field.style.setProperty) return;
       var style = root.getComputedStyle ? root.getComputedStyle(field) : null;
       var right = style ? parseFloat(style.paddingRight) || 0 : 0;
       field.style.setProperty('padding-right', (right + 36) + 'px', 'important');
     }
     function appendWords(field, words) {
       if (!field || !field.isConnected || !words) return;
+      var stillFocused = !root.document || root.document.activeElement === field;
       var old = field.isContentEditable ? field.textContent : field.value;
       var joined = old + (old && !/\s$/.test(old) ? ' ' : '') + words;
       if (field.isContentEditable) field.textContent = joined;
       else field.value = joined;
       field.dispatchEvent(new Event('input', {bubbles: true}));
-      field.focus();
-      if (field.setSelectionRange) field.setSelectionRange(joined.length, joined.length);
+      if (stillFocused) field.focus();
+      if (stillFocused && field.setSelectionRange) field.setSelectionRange(joined.length, joined.length);
     }
     function clearMic() {
       root.clearInterval(micMonitor);
@@ -1811,8 +1863,10 @@
       micBusy = true;
       fieldCapture = field;
       button.setAttribute('aria-pressed', 'true');
-      mount();
-      placeTelemetry();
+      if (root.document && typeof root.document.getElementById === 'function') {
+        mount();
+        placeTelemetry();
+      }
       var started = Date.now();
       root.clearInterval(micMonitor);
       micMonitor = root.setInterval(function () {
@@ -1836,8 +1890,11 @@
       var button = root.document.createElement('button');
       var pressedAt = 0;
       var wasListening = false;
+      var holdTimer = 0;
+      var held = false;
       button.type = 'button';
       button.className = 'pine-field-mic';
+      button.hidden = true;
       button.title = 'Tap to dictate or stop; hold to talk and release to transcribe';
       button.setAttribute('aria-label', button.title);
       button.setAttribute('aria-pressed', 'false');
@@ -1847,34 +1904,87 @@
         event.preventDefault();
         pressedAt = Date.now();
         wasListening = micBusy;
+        held = false;
         if (micBusy) stopMic(); else startMic(field, button);
+        cancelDelay(holdTimer);
+        holdTimer = afterDelay(function () {
+          holdTimer = 0;
+          held = true;
+        }, 450);
         try { button.setPointerCapture(event.pointerId); } catch (err) { /* released */ }
       });
       button.addEventListener('pointerup', function () {
-        if (pressedAt && !wasListening && Date.now() - pressedAt >= 450) stopMic();
+        if (holdTimer) cancelDelay(holdTimer);
+        holdTimer = 0;
+        if (pressedAt && !wasListening && (held || Date.now() - pressedAt >= 450)) stopMic();
         pressedAt = 0;
+        held = false;
       });
       button.addEventListener('pointercancel', function () {
+        if (holdTimer) cancelDelay(holdTimer);
+        holdTimer = 0;
         if (pressedAt && !wasListening) stopMic();
         pressedAt = 0;
+        held = false;
       });
       button.addEventListener('click', function (event) {
         if (event.detail !== 0) return;
         if (micBusy) stopMic(); else startMic(field, button);
       });
-      fieldLayer.appendChild(button);
+      if (fieldLayer.appendChild) fieldLayer.appendChild(button);
       return button;
     }
     (root.document.body || root.document.documentElement).appendChild(fieldLayer);
-    root.document.addEventListener('focusin', queueScan);
-    root.addEventListener('resize', placeAll);
-    root.addEventListener('scroll', placeAll, true);
+    if (typeof root.IntersectionObserver === 'function') {
+      fieldObserver = new root.IntersectionObserver(function (entries) {
+        entries.forEach(function (entry) {
+          var field = entry.target;
+          var button = fieldButtons.get(field);
+          if (!button) return;
+          if (entry.isIntersecting) {
+            visibleFields.add(field);
+            placeMic(field, button, true);
+          } else {
+            visibleFields.delete(field);
+            setMicHidden(button, true);
+          }
+        });
+        placeTelemetry();
+      });
+    }
+    root.document.addEventListener('focusin', function (event) {
+      var field = event.target;
+      if (!textField(field)) return;
+      var button = fieldButtons.get(field);
+      if (!button) {
+        button = makeMic(field);
+        fieldButtons.set(field, button);
+        if (fieldObserver) fieldObserver.observe(field);
+      }
+      visibleFields.add(field);
+      placeMic(field, button, true);
+      queueScan();
+    });
+    root.addEventListener('resize', queuePlace);
+    root.addEventListener('scroll', queuePlace, true);
     if (root.visualViewport) {
-      root.visualViewport.addEventListener('resize', placeAll);
-      root.visualViewport.addEventListener('scroll', placeAll);
+      root.visualViewport.addEventListener('resize', queuePlace);
+      root.visualViewport.addEventListener('scroll', queuePlace);
     }
     if (typeof MutationObserver !== 'undefined') {
-      new MutationObserver(queueScan).observe(root.document.body || root.document.documentElement,
+      new MutationObserver(function (records) {
+        for (var i = 0; i < records.length; i += 1) {
+          var nodes = records[i].addedNodes || [];
+          for (var j = 0; j < nodes.length; j += 1) {
+            var node = nodes[j];
+            if (node && node.nodeType === 1 && (textField(node)
+                || (node.querySelector && node.querySelector('input, textarea, [contenteditable="true"]')))) {
+              queueScan();
+              return;
+            }
+          }
+        }
+      }).observe(root.document.body || root.document.documentElement,
         {childList: true, subtree: true});
     }
     scan();
