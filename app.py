@@ -6160,6 +6160,9 @@ async def _track_generation(prompt_id: str, started_at: float | None = None,
                 aired_files=aired_files)
             if aired_files:
                 fire_and_forget(_sfx_pool_refresh())
+                for filename in aired_files:
+                    identifier = sfx_id(SFX_ADS_DIR / filename)
+                    fire_and_forget(gen_ads_broadcast(identifier, who="listener"))
             await announce_render_complete()
             # [#1285] H3 keeps ~46 GB resident. Hand it back as soon as the
             # clip lands IF the box is tight - but stay warm when there is
@@ -6224,6 +6227,10 @@ async def reconcile_generations() -> dict[str, int]:
                         aired_files=aired_files)
                     if aired_files:
                         fire_and_forget(_sfx_pool_refresh())
+                        for filename in aired_files:
+                            identifier = sfx_id(SFX_ADS_DIR / filename)
+                            fire_and_forget(gen_ads_broadcast(identifier,
+                                                               who="listener"))
                     counts["finished"] += 1
                 elif pid in queued_ids:
                     fire_and_forget(_track_generation(
@@ -6804,6 +6811,78 @@ async def comfy_idle_state() -> dict[str, Any]:
             "why": _comfy_idle.explain(doc, live),
             "log": (doc.get("log") or [])[-12:],
             "renders": (doc.get("renders") or [])[-12:]}
+
+
+H3_MEMORY_RESERVE_GB = float(os.getenv("H3_MEMORY_RESERVE_GB", "60"))
+
+
+async def h3_capacity_relief(reason: str, force: bool = False) -> dict[str, Any]:
+    """Return idle memory to H3 without interrupting work that is active.
+
+    GB10 memory is shared between ComfyUI, Ollama and the voice engines.  A
+    video request therefore cannot be rescued by only asking ComfyUI to drop
+    a cache; an idle writer model can be the missing 10-20 GB.  This routine
+    is used both by the visible H3 queue and the background reserve keeper.
+    """
+    target = max(H3_MEMORY_RESERVE_GB, float(VIDEO_RENDER_FLOOR_GB))
+    before = comfy_host_available_gb()
+    actions: list[str] = []
+    live = await comfy_idle_live()
+    if live.get("busy"):
+        return {"ok": False, "available_gb": before, "required_gb": target,
+                "actions": actions,
+                "why": "ComfyUI is actively rendering; its work is protected"}
+    if before is not None and before >= target and not force:
+        return {"ok": True, "available_gb": before, "required_gb": target,
+                "actions": actions, "why": "H3 reserve is already available"}
+
+    # First ask ComfyUI to unload its own caches.  A broken /free endpoint is
+    # recorded, then the Ollama relief below still gives the request a path.
+    try:
+        freed = await comfy_unload("free", live.get("idle_seconds") or 0,
+                                   reason)
+        actions.append("ComfyUI cache: " + str(freed.get("why") or "checked"))
+    except Exception as exc:  # noqa: BLE001
+        actions.append("ComfyUI cache: " + type(exc).__name__)
+
+    # Never evict a model while the station is actively calling Ollama.  When
+    # the lane is quiet, H3 has priority over warm idle chat models; the
+    # station will reload one on its next turn.
+    if not _OLLAMA_JOBS:
+        try:
+            async with httpx.AsyncClient(timeout=45) as client:
+                response = await client.get(f"{OLLAMA_URL}/api/ps")
+                response.raise_for_status()
+                models = (response.json() or {}).get("models") or []
+                for row in models:
+                    name = str((row or {}).get("name") or "").strip()
+                    # The embedding model is tiny and shared with the vector
+                    # shelf, so keeping it warm buys more than it costs.
+                    if not name or name.startswith("nomic-"):
+                        continue
+                    response = await client.post(
+                        f"{OLLAMA_URL}/api/generate",
+                        json={"model": name, "keep_alive": 0})
+                    response.raise_for_status()
+                    actions.append("released idle Ollama model " + name)
+                    await asyncio.sleep(0.4)
+                    now = comfy_host_available_gb()
+                    if now is not None and now >= target:
+                        break
+        except Exception as exc:  # noqa: BLE001
+            actions.append("Ollama relief: " + type(exc).__name__)
+    else:
+        actions.append("Ollama relief deferred while the station is writing")
+
+    await asyncio.sleep(1)
+    after = comfy_host_available_gb()
+    ok = after is not None and after >= target
+    why = ("H3 reserve is ready" if ok else
+           "waiting for %.1f GB more free memory" % max(0.0, target - float(after or 0)))
+    pipeline_log("gpu", "H3 capacity relief: %s (%s)" %
+                 (why, "; ".join(actions) or "nothing idle to release"))
+    return {"ok": ok, "available_gb": after, "required_gb": target,
+            "actions": actions, "why": why}
 
 
 
@@ -8611,9 +8690,16 @@ def voice_ad_person_clip(goal: str) -> dict[str, Any]:
     return {}
 
 
-async def voice_ad_render(goal: str) -> tuple[str, dict[str, Any]]:
+async def voice_ad_render(
+    goal: str, reference_clip: dict[str, Any] | None = None,
+) -> tuple[str, dict[str, Any]]:
     """Submit an H3 reference ad and leave a discoverable gallery record."""
-    clip = await asyncio.to_thread(voice_ad_person_clip, goal)
+    # A replayed MP4 is an explicit creative reference, not merely another
+    # candidate in the random shelf.  Audio-only replays still use the
+    # dialogue-capable video picker because H3 needs a visible performer.
+    clip = (dict(reference_clip or {})
+            if reference_clip and reference_clip.get("id") and reference_clip.get("video")
+            else await asyncio.to_thread(voice_ad_person_clip, goal))
     if not clip.get("id"):
         return ("I could not find a dialogue-capable video clip in the indexed "
                 "SFX library yet, so I did not start the ad.", {})
@@ -8623,22 +8709,23 @@ async def voice_ad_render(goal: str) -> tuple[str, dict[str, Any]]:
                  + str(goal or "deliver the ad")
                  + ". Keep expressive natural motion, direct-to-camera commercial "
                  "energy, and clean synchronized dialogue. No captions or logos.")
-    try:
-        result = await _comfy_workshop_render_payload({
-            "mode": "reference", "source": clip["id"], "source_type": "clip",
-            "at_share": random.random(), "prompt": direction, "speech": copy,
-            "purpose": "voice_ad", "duration_seconds": 6,
-        })
-    except HTTPException as exc:
-        return ("The H3 ad was not started: " + str(exc.detail), {})
+    # H3 is a durable station workload.  Do not turn a temporary memory
+    # shortage into a lost listener request: the capacity keeper will make
+    # room and this FIFO submits it as soon as the engine can accept it.
+    queued = await asyncio.to_thread(_parody_stinger_queue().add, {
+        "mode": "reference", "source": clip["id"], "source_type": "clip",
+        "at_share": random.random(), "prompt": direction, "speech": copy,
+        "purpose": "voice_ad", "duration_seconds": 6, "air_it": True,
+    })
+    _parody_stinger_wake.set()
     if _RADIO.get("on"):
         fire_and_forget(dj_ad(
             "a listener commissioned a short H3 video ad: " + str(goal)[:180]
             + "; say it is being made for the gallery", remember=False))
-    return ("On it. H3 is making the ad from a dialogue-capable MP4 reference "
-            "and it will pop up in the Pine Box gallery when it is ready.",
-            {"clip": clip, "prompt_id": str(result.get("prompt_id") or ""),
-             "model": str(result.get("model") or "h3")})
+    return ("On it. The H3 ad is queued from a dialogue-capable MP4 reference; "
+            "the station will make room, then air it and put it in the gallery.",
+            {"clip": clip, "queue_id": str(queued.get("id") or ""),
+             "status": str(queued.get("status") or "queued"), "model": "h3"})
 
 
 # --- Open WebUI passthrough ------------------------------------------------
@@ -122757,8 +122844,12 @@ async def dj_video_api(
             lag_ms = int(max(0.0, min(180.0, float(lag or 0))) * 1000)
         except (TypeError, ValueError):
             lag_ms = 0
+        # An HLS lane starts at its own live edge; the MP3 join burst is
+        # not in that audio and would hold the picture back by 30 seconds.
+        hls = str(request.query_params.get("hls") or "").lower()
         late = {"videos": dj_video_late(server_ms, lag_ms),
-                "burst_s": dj_video_burst_s()}
+                "burst_s": 0.0 if hls in ("1", "true", "yes")
+                else dj_video_burst_s()}
     # 2026-09-14: "allow me to use endless video mode even if the station
     # is on pause ... endless video mode as a screensaver" while the rooms
     # bank the show. The pause gate stands for the station's own stings;
@@ -149399,6 +149490,7 @@ _PUBLIC_GET_PREFIX = ("/app-icon-", "/tune/", "/media/", "/music/",
                       # first, so the fall-through is a refusal.
                       "/sfx/")
 _PUBLIC_POST = {"/api/dj/join", "/api/dj/request", "/api/dj/shout",
+                "/api/listener/ads",
                 "/api/music/vote",
                 # #1149: wake-only - the route refuses to pause anything,
                 # and it still demands a live listen token inside.
@@ -149679,12 +149771,9 @@ async def station_stream_mp3(
     # #1253: the listener chooses the quality, exactly as they have for
     # the clips since #999. One mix, several encoders - a phone on 48k
     # and a desktop on 128k share every decode behind them.
-    # #1265: `split` sends the mix UNMIXED - record left, DJs right - so
-    # the listener's own browser can balance the two instantly. A mixer
-    # that is thirty seconds ahead of the ear cannot do that job; see the
-    # note in station_stream. Plain /stream.mp3 is untouched, because a
-    # head unit opening the .m3u has no Web Audio to undo a split with.
-    sink = STATION_STREAM.attach(br, split=bool(split))
+    # `split` remains an ignored compatibility query for old links. The
+    # broadcast itself is now always the centred two-channel programme.
+    sink = STATION_STREAM.attach(br)
 
     async def body() -> Any:
         since = 0
@@ -149761,7 +149850,7 @@ async def station_stream_hls(
     request: Request,
     t: str = "",
     br: str = "",
-    split: int = 0,
+    mix: str = "",
     authorization: str | None = Header(default=None),
 ) -> Response:
     """The broadcast as HLS. This is the road an iPhone should take.
@@ -149784,7 +149873,11 @@ async def station_stream_hls(
     # exists, `ready()` is one stat and the playlist is a few hundred
     # bytes. All three cost the loop far less than a round trip through
     # a pool that 407 other call sites are hammering.
-    enc = STATION_STREAM.hls(br, split=bool(split))
+    # This is personal listener state, encoded into its own HLS lane. It
+    # never changes the studio, the tablet, or another listener's mix.
+    from station_stream import listener_mix
+    personal_mix = listener_mix(mix)
+    enc = STATION_STREAM.hls(br, mix=personal_mix)
     # The first playlist takes a moment to exist; the backlog prime means
     # it arrives with several segments already in it.
     for _ in range(40):
@@ -149799,13 +149892,12 @@ async def station_stream_hls(
     # ffmpeg writes bare segment names. They have to come back as URLs on
     # this door, carrying the same token the playlist itself needed.
     suffix = f"?t={quote(t)}" if t else ""
-    # The split variant is its own segment folder, so a listener on one
-    # shape can never be handed a segment of the other.
-    lane = f"{enc.bitrate}s" if enc.split else str(enc.bitrate)
+    lane = "%d-%d-%d-%d" % ((enc.bitrate,) + personal_mix)
     out = []
     for line in raw.splitlines():
         if line and not line.startswith("#"):
-            out.append(f"/hls/{lane}/{line}{suffix}")
+            join = "&" if suffix else "?"
+            out.append(f"/hls/{lane}/{line}{suffix}{join}mix={','.join(map(str, personal_mix))}")
         else:
             out.append(line)
     return Response(
@@ -149820,6 +149912,7 @@ async def station_stream_hls_segment(
     rate: str,
     name: str,
     t: str = "",
+    mix: str = "",
     authorization: str | None = Header(default=None),
 ) -> Response:
     """One HLS segment. Name-checked: this reads from a directory the
@@ -149827,11 +149920,12 @@ async def station_stream_hls_segment(
     require_listen_auth(t, authorization)
     if not re.fullmatch(r"seg\d{1,8}\.(ts|aac|m4s)", name):
         return Response(status_code=404)
-    if not re.fullmatch(r"\d{2,3}s?", str(rate)):
+    parsed = re.fullmatch(r"(\d{2,3})-(\d{1,3})-(\d{1,3})-(\d{1,3})", str(rate))
+    if not parsed:
         return Response(status_code=404)
-    lane_split = str(rate).endswith("s")
-    enc = STATION_STREAM.hls_existing(
-        int(str(rate).rstrip("s")), split=lane_split)
+    from station_stream import listener_mix
+    lane_mix = listener_mix(parsed.group(2, 3, 4))
+    enc = STATION_STREAM.hls_existing(int(parsed.group(1)), mix=lane_mix)
     if enc is None:
         return Response(status_code=404)
     path = enc.dir / name
@@ -150000,7 +150094,12 @@ async def tune_page(token: str, request: Request) -> HTMLResponse:
     return HTMLResponse(
         page.replace("__SERVER_KEY__", json.dumps(token))
             .replace("__AWAY__", "true" if public else "false")
-            .replace("__BUILD__", str(int(_BUILD_MS))),
+            .replace("__BUILD__", str(int(_BUILD_MS)))
+            # Safari fetches a manifest while parsing HEAD, before the old
+            # JavaScript rewrite ran. Put the token in initial markup so an
+            # installed shortcut starts on its signed listener URL.
+            .replace("__PWA_MANIFEST__",
+                     "/manifest.webmanifest?t=" + quote(token)),
         headers={"Cache-Control": "no-store, no-cache, must-revalidate",
                  "Pragma": "no-cache"})
 
@@ -150039,6 +150138,25 @@ async def dj_shout(
                    f"station, live: \"{text}\" Read it out, take it "
                    "personally, and answer them by name on air.")))
     return {"heard": text, "on_air": bool(_RADIO.get("on"))}
+
+
+@app.post("/api/listener/ads")
+async def listener_make_ad(
+    request: Request,
+    t: str = "",
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Commission a short H3 ad from a signed listener page."""
+    require_listen_auth(t, authorization)
+    payload = await request.json()
+    goal = " ".join(str(payload.get("prompt") or "").split())[:1200]
+    if len(goal) < 2:
+        raise HTTPException(status_code=400,
+                            detail="Describe the ad you want to make")
+    message, ad = await voice_ad_render(goal)
+    if not ad:
+        raise HTTPException(status_code=503, detail=message)
+    return {"ok": True, "message": message, "ad": ad}
 
 
 # [#1244] NOT A ROUTE ANY MORE, BECAUSE IT NEVER WAS ONE.
@@ -154982,6 +155100,68 @@ async def sfx_file(
                                  status_code=206, headers=headers,
                                  media_type=media_type)
     return FileResponse(path, media_type=media_type, headers=headers)
+
+
+@app.get("/api/sfx/{sfx_key}/replay-source")
+async def sfx_replay_source_api(
+    sfx_key: str,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """The signed, levelled browser source for replaying one aired SFX clip.
+
+    Chat rows intentionally do not retain capability signatures.  A replay
+    must therefore obtain a fresh one here instead of handing an ``audio``
+    element an unsigned /sfx URL, which silently turns into an HTML refusal.
+    """
+    require_read_auth(authorization)
+    if not re.fullmatch(r"[a-f0-9]{16}", sfx_key):
+        raise HTTPException(status_code=404, detail="That clip identifier is not valid")
+    path = await asyncio.to_thread(sfx_by_id, sfx_key)
+    if path is None:
+        raise HTTPException(status_code=404, detail="That clip is no longer available")
+    sid = sfx_id(path)
+    return {
+        "ok": True,
+        "id": sid,
+        "name": path.stem[:160],
+        "url": "/sfx/%s?t=%s" % (sid, media_sign(sid)),
+        "video": sfx_is_video(path),
+        "seconds": round(float(sfx_seconds_held(path) or 0.0), 2),
+    }
+
+
+@app.post("/api/sfx/{sfx_key}/h3-stinger")
+async def sfx_h3_stinger_api(
+    sfx_key: str,
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Queue an H3 station stinger from the clip the operator just replayed."""
+    require_auth(authorization)
+    if not re.fullmatch(r"[a-f0-9]{16}", sfx_key):
+        raise HTTPException(status_code=404, detail="That clip identifier is not valid")
+    path = await asyncio.to_thread(sfx_by_id, sfx_key)
+    if path is None:
+        raise HTTPException(status_code=404, detail="That clip is no longer available")
+    try:
+        payload = await request.json()
+    except Exception:  # noqa: BLE001
+        payload = {}
+    payload = payload if isinstance(payload, dict) else {}
+    direction = " ".join(str(payload.get("direction") or "").split())[:900]
+    name = path.stem[:160]
+    goal = (direction or
+            ("turn the replayed clip '%s' into a concise Pine Box station "
+             "stinger with an energetic on-camera delivery" % name))
+    reference = {"id": sfx_id(path), "name": name, "video": sfx_is_video(path),
+                 "seconds": round(float(sfx_seconds_held(path) or 0.0), 2),
+                 "match": "the replayed station clip"}
+    message, ad = await voice_ad_render(goal, reference_clip=reference)
+    if not ad:
+        raise HTTPException(status_code=503, detail=message)
+    return {"ok": True, "message": message, "ad": ad,
+            "source": {"id": reference["id"], "name": name,
+                       "video": reference["video"]}}
 
 
 @app.get("/api/dj/sfx")
@@ -166183,6 +166363,9 @@ async def gen_ads_send(
     identifier: str, authorization: str | None = Header(default=None),
 ) -> dict[str, Any]:
     require_auth(authorization)
+    # Keep this route self-contained.  It is the operator's directly
+    # inspectable broadcast handoff, and tooling exercises it separately from
+    # the background H3 completion road below.
     path = await asyncio.to_thread(gen_ad_path, identifier)
     signature = media_sign(identifier)
     occurrence = await asyncio.to_thread(
@@ -166212,6 +166395,42 @@ async def gen_ads_send(
         GEN_AD_SENDS_PATH.parent.mkdir(parents=True, exist_ok=True)
         with GEN_AD_SENDS_PATH.open("a", encoding="utf-8") as stream:
             stream.write(json.dumps({"ts": int(time.time()), "id": identifier}) + "\n")
+    return {"id": identifier, "sent": True,
+            "page_delivery": delivery, "on": played}
+
+
+async def gen_ads_broadcast(identifier: str, who: str = "operator") -> dict[str, Any]:
+    """Dispatch one generated video ad through the normal station paths."""
+    path = await asyncio.to_thread(gen_ad_path, identifier)
+    signature = media_sign(identifier)
+    occurrence = await asyncio.to_thread(
+        admission_admit_line, {"path": f"/sfx/{identifier}", "sig": signature},
+        who="board", kind="sfx", text=path.stem, name=path.stem,
+        line_id=identifier, producer="gen_ads_send")
+    delivery = ""
+    played = ""
+    try:
+        delivery = page_feed_append({"url": f"/sfx/{identifier}?t={signature}",
+                                     "text": "", "sting": path.stem})
+    except Exception:
+        pass
+    if (_RADIO.get("voice_to") or "box") in ("box", "both"):
+        try:
+            played = await _play_on_box(f"/sfx/{identifier}", signature)
+        except Exception:
+            pass
+    if not delivery and not played:
+        admission_withdraw(occurrence, "genAds send was not accepted")
+        raise HTTPException(status_code=503, detail="No broadcast output accepted the ad")
+    if played:
+        await asyncio.to_thread(sfx_history_add, path, who)
+        await asyncio.to_thread(sfx_note_play, identifier, path.name, who)
+    _STING_AT[0] = time.time()
+    with _GEN_AD_SENDS_LOCK:
+        GEN_AD_SENDS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with GEN_AD_SENDS_PATH.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps({"ts": int(time.time()), "id": identifier,
+                                     "who": who}) + "\n")
     return {"id": identifier, "sent": True,
             "page_delivery": delivery, "on": played}
 
@@ -166511,7 +166730,8 @@ async def comfy_workshop_render(
 ) -> dict[str, Any]:
     require_auth(authorization)
     payload = await request.json()
-    if isinstance(payload, dict) and str(payload.get("purpose") or "").lower() == "parody_stinger":
+    if isinstance(payload, dict) and str(payload.get("purpose") or "").lower() in (
+            "parody_stinger", "voice_ad"):
         if str(payload.get("mode") or "") != "reference" or not str(payload.get("source") or ""):
             raise HTTPException(status_code=400, detail="Choose a reference video")
         if not str(payload.get("prompt") or "").strip():
@@ -166706,11 +166926,15 @@ async def _parody_stinger_step(queue: ParodyQueue, freed_for: str) -> tuple[int,
                 and freed_for != item["id"]:
             freed_for = item["id"]
             await asyncio.to_thread(queue.note, item["id"],
-                                    "Freeing finished idle Comfy cache")
-            fresh = await comfy_idle_live()
-            if fresh.get("up") and fresh.get("observed") and not fresh.get("busy"):
-                await comfy_unload("free", fresh.get("idle_seconds") or 0,
-                                   "a queued parody stinger needs memory")
+                                    "Making room for H3: releasing idle models")
+            relief = globals().get("h3_capacity_relief")
+            if callable(relief):
+                await relief("a queued H3 stinger needs memory")
+            else:  # kept for the isolated queue contract test
+                fresh = await comfy_idle_live()
+                if fresh.get("up") and fresh.get("observed") and not fresh.get("busy"):
+                    await comfy_unload("free", fresh.get("idle_seconds") or 0,
+                                       "a queued parody stinger needs memory")
             live = await comfy_idle_live()
             if live.get("up") and live.get("observed") and not live.get("busy"):
                 admitted, reason, _available = await asyncio.to_thread(
@@ -166765,11 +166989,66 @@ async def _parody_stinger_worker() -> None:
             await asyncio.sleep(10)
 
 
+_H3_HOURLY_LAST = [""]
+
+
+def h3_hourly_ad_prompt() -> str:
+    """A compact current-show brief for the next automatic H3 sponsor sting."""
+    recent = []
+    for row in reversed(list(_RADIO.get("chat") or [])):
+        text = " ".join(str((row or {}).get("text") or "").split())
+        if text and len(text) > 12:
+            recent.append(text[:180])
+        if len(recent) >= 3:
+            break
+    now = _RADIO.get("now") or {}
+    record = " ".join(str(now.get(key) or "") for key in ("title", "artist"))
+    subject = " ".join(reversed(recent)) or record or "the live Pine Box FM show"
+    return ("Make a short, funny but professional Pine Box FM sponsor stinger "
+            "that naturally follows this hour's conversation: " + subject[:520])
+
+
+async def h3_hourly_ad_clock() -> None:
+    """Queue one fresh, dialogue-aware video ad after each live hour begins."""
+    while True:
+        try:
+            now = time.localtime()
+            marker = time.strftime("%Y%m%d%H", now)
+            # Give the orchestrator time to establish the hour's topic.  The
+            # durable H3 queue handles the rest even when memory is tight.
+            if now.tm_min >= 3 and marker != _H3_HOURLY_LAST[0] and _RADIO.get("on"):
+                _H3_HOURLY_LAST[0] = marker
+                message, job = await voice_ad_render(h3_hourly_ad_prompt())
+                pipeline_log("ads", "hourly H3 ad: %s%s" %
+                             (message[:180], "" if job else " (not queued)"))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            pipeline_log("ads", "hourly H3 ad keeper: %s" % type(exc).__name__)
+        await asyncio.sleep(30)
+
+
+async def h3_capacity_keeper() -> None:
+    """Keep the H3 reserve available between requests whenever work is idle."""
+    while True:
+        try:
+            available = comfy_host_available_gb()
+            if available is not None and available < H3_MEMORY_RESERVE_GB:
+                await h3_capacity_relief("the H3 reserve keeper")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            pipeline_log("gpu", "H3 reserve keeper: %s" % type(exc).__name__)
+        await asyncio.sleep(90)
+
+
 @app.on_event("startup")
 async def _parody_stinger_start() -> None:
     global _parody_stinger_task
     _parody_stinger_queue()
     _parody_stinger_task = asyncio.create_task(_parody_stinger_worker())
+    fire_and_forget(h3_hourly_ad_clock())
+    fire_and_forget(h3_capacity_keeper())
 
 
 @app.on_event("shutdown")
@@ -184927,6 +185206,24 @@ async def api_comfy_idle_now(
                              "the operator pressed the button")
     out["done"] = True
     out["state"] = await comfy_idle_state()
+    return out
+
+
+@app.post("/api/h3/relieve")
+async def api_h3_relieve(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Make room for queued H3 video work while preserving active renders."""
+    require_auth(authorization)
+    try:
+        payload = await request.json()
+    except Exception:  # noqa: BLE001
+        payload = {}
+    out = await h3_capacity_relief(
+        "the operator made room for queued H3 work",
+        force=bool((payload or {}).get("force")))
+    out["queue"] = await asyncio.to_thread(_parody_stinger_queue().list)
     return out
 
 
@@ -246474,7 +246771,7 @@ RADIO_PAGE_HTML = r"""<!doctype html>
 <meta name="theme-color" content="#04060b">
 <link rel="apple-touch-icon" href="/app-icon-180.png">
 <link rel="icon" type="image/png" sizes="192x192" href="/app-icon-192.png">
-<link id="pwaManifest" rel="manifest" href="/manifest.webmanifest">
+<link id="pwaManifest" rel="manifest" href="__PWA_MANIFEST__">
 <!-- Single-colour icons, not colour emoji. The stylesheet carries the
      font inline and its unicode-range confines it to pictographs. -->
 <link rel="stylesheet" href="/icons/pineicons.css">
@@ -246750,6 +247047,13 @@ the library files untouched">📶 quality</label>
            onkeydown="if(event.key==='Enter')shout()">
     <button onclick="shout()">Say it</button>
   </div>
+  <div class="row" style="margin-top:8px">
+    <input id="adIdea" placeholder="Make an H3 ad to air..."
+           onkeydown="if(event.key==='Enter')makeAd()">
+    <button onclick="dictateAd()" title="Dictate an H3 ad prompt"
+            aria-label="Dictate an H3 ad prompt">Mic</button>
+    <button onclick="makeAd()">Make ad</button>
+  </div>
   <div class="row" style="margin-top:6px;gap:4px">
     <button aria-label="Applause" onclick="shout('👏')" title="Applause">👏</button>
     <button aria-label="This one is hot" onclick="shout('🔥')" title="This one is hot">🔥</button>
@@ -246836,9 +247140,6 @@ function applyLevels() {
   }
   /* #1416: a sting rides the voice element at the SFX level. */
   if (voice) setPlayerLevel(voice, voiceSting ? sfxLevel : voiceLevel);
-  /* #1265: on the stream road the balance lives in the gain nodes, and
-   * this is the line that makes the sliders mean anything there at all. */
-  applySplitLevels();
   /* #1416: the stage's video is a clip, not the broadcast - on the road
    * where this page is the one making the sound.
    *
@@ -246883,6 +247184,7 @@ function setLevels(save) {
     if (sfx) localStorage.pbfmSfx = sfx.value;
   } catch (e) { /* private browsing — the levels just do not persist */ }
   applyLevels();
+  refreshPersonalMix();
 }
 
 /* #999: THE LISTENER'S BITRATE.
@@ -247138,6 +247440,49 @@ function shout(react) {
     .catch((e) => {
       const note = document.getElementById("note");
       if (note) note.textContent = e.message;
+    });
+}
+
+function dictateAd() {
+  const box = document.getElementById("adIdea");
+  const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!box || !Recognition) {
+    const note = document.getElementById("note");
+    if (note) note.textContent = "Dictation is not available in this browser.";
+    return;
+  }
+  const recognition = new Recognition();
+  recognition.lang = navigator.language || "en-US";
+  recognition.interimResults = true;
+  recognition.continuous = false;
+  const initial = box.value.trim();
+  recognition.onresult = (event) => {
+    let words = "";
+    for (let i = event.resultIndex; i < event.results.length; i += 1) {
+      words += event.results[i][0].transcript;
+    }
+    box.value = (initial ? initial + " " : "") + words.trim();
+  };
+  recognition.onerror = () => {
+    const note = document.getElementById("note");
+    if (note) note.textContent = "Dictation could not hear that; type the ad instead.";
+  };
+  recognition.start();
+}
+
+function makeAd() {
+  const box = document.getElementById("adIdea");
+  const prompt = ((box && box.value) || "").trim();
+  if (!prompt) return;
+  const note = document.getElementById("note");
+  if (note) note.textContent = "H3 ad queued; making room if the station needs it.";
+  api("/api/listener/ads", {method: "POST", body: JSON.stringify({prompt})})
+    .then((got) => {
+      if (box) box.value = "";
+      if (note) note.textContent = got.message || "H3 ad queued for the broadcast.";
+    })
+    .catch((err) => {
+      if (note) note.textContent = err.message || "The H3 ad could not be queued.";
     });
 }
 
@@ -247586,10 +247931,11 @@ async function tvPoll() {
      * can answer with the clip that ear is INSIDE rather than the one
      * the station is airing this instant. Whole seconds, so identical
      * polls still share a flight (see api() above). */
-    data = await api("/api/dj/video?lag=" + Math.round(tvLagSeconds()));
+    data = await api("/api/dj/video?lag=" + Math.round(tvLagSeconds())
+      + (wantsHls() ? "&hls=1" : ""));
   } catch (e) { return; }
-  if (typeof data.burst_s === "number" && data.burst_s > 0) {
-    tvBurst = data.burst_s;                                /* [#1244] */
+  if (typeof data.burst_s === "number") {
+    tvBurst = Math.max(0, data.burst_s);                    /* [#1244] */
   }
   tvEndless = !!data.endless;                              /* [#1244] */
   tvSayState();                                            /* [#1244] */
@@ -248280,62 +248626,26 @@ function wantsHls() {
   } catch (e) { return false; }
 }
 
-/* #1265: THE BALANCE HAPPENS HERE, NOT ON THE BOX.
- *
- * The listener is ~30 s behind live by design - that burst is what rides
- * out the box's stalls - so anything the mixer changes is heard half a
- * minute later, which is useless for a slider you are trying to set by
- * ear while driving. So the stream is requested UNMIXED (record left,
- * DJs right) and these two gain nodes do the mixing in this browser.
- * Moving a slider is then a gain change on a live audio node: instant.
- *
- * If Web Audio cannot be established we do NOT ask for the split shape -
- * a split stream played raw is the record in one ear and the talk in the
- * other, which is a far worse failure than a slider that needs a moment.
- */
-let splitCtx = null, splitMusic = null, splitVoice = null, splitOn = false;
-
-function buildSplitGraph(el) {
-  if (splitOn) return true;
-  try {
-    const Ctx = window.AudioContext || window.webkitAudioContext;
-    if (!Ctx || !el) return false;
-    splitCtx = splitCtx || new Ctx();
-    const src = splitCtx.createMediaElementSource(el);
-    const splitter = splitCtx.createChannelSplitter(2);
-    const merger = splitCtx.createChannelMerger(2);
-    splitMusic = splitCtx.createGain();
-    splitVoice = splitCtx.createGain();
-    src.connect(splitter);
-    splitter.connect(splitMusic, 0);      /* left  = the record */
-    splitter.connect(splitVoice, 1);      /* right = the DJs   */
-    /* Both gains feed both ears, so the result is centred mono rather
-     * than the two sources sitting in opposite speakers. */
-    splitMusic.connect(merger, 0, 0); splitMusic.connect(merger, 0, 1);
-    splitVoice.connect(merger, 0, 0); splitVoice.connect(merger, 0, 1);
-    merger.connect(splitCtx.destination);
-    splitOn = true;
-    applySplitLevels();
-    return true;
-  } catch (e) {
-    splitOn = false;
-    return false;
-  }
+/* Safari's native HLS path does not reliably expose an AudioContext graph.
+ * The controls therefore travel with THIS listener's HLS URL and the station
+ * makes a private mix lane. No other receiver or the studio is changed. */
+let mixRestart = null, mixWanted = "", streamMixApplied = "";
+function personalMix() {
+  const m = document.getElementById("lvMusic");
+  const v = document.getElementById("lvVoice");
+  const s = document.getElementById("lvSfx");
+  return [m, v, s].map((el) => Math.max(0, Math.min(200, Number(el && el.value) || 0))).join(",");
 }
-
-function applySplitLevels() {
-  if (!splitOn || !splitCtx) return;
-  try {
-    const now = splitCtx.currentTime;
-    /* A short ramp rather than a step: instant to the hand, no zipper
-     * noise in the ear. */
-    splitMusic.gain.cancelScheduledValues(now);
-    splitVoice.gain.cancelScheduledValues(now);
-    splitMusic.gain.setTargetAtTime(
-      Math.max(0, Math.min(2, musicLevel)), now, 0.03);
-    splitVoice.gain.setTargetAtTime(
-      Math.max(0, Math.min(2, voiceLevel)), now, 0.03);
-  } catch (e) {}
+function refreshPersonalMix() {
+  if (!streamMode || !playing || !wantsHls()) return;
+  mixWanted = personalMix();
+  if (mixWanted === streamMixApplied) return;
+  if (mixRestart) clearTimeout(mixRestart);
+  mixRestart = setTimeout(() => {
+    mixRestart = null;
+    if (!streamMode || !playing || mixWanted === streamMixApplied) return;
+    startStream();
+  }, 180);
 }
 
 function streamUrl() {
@@ -248346,9 +248656,7 @@ function streamUrl() {
   let url = road + "?_=" + Date.now();
   if (GUEST) url += "&t=" + encodeURIComponent(KEY);
   if (rate > 0) url += "&br=" + rate;
-  /* Only ask for the unmixed shape if this browser can put it back
-   * together. See buildSplitGraph. */
-  if (splitOn) url += "&split=1";
+  if (wantsHls()) url += "&mix=" + encodeURIComponent(personalMix());
   return url;
 }
 
@@ -248438,9 +248746,6 @@ function streamElement() {
    * the same self-feeding stall #998 documents for the record element,
    * rebuilt on a new road. Only the watchdog below may give up, and only
    * after the playhead has genuinely stopped moving. */
-  /* Wire the balance BEFORE any src is set: the decision to ask for the
-   * split shape depends on whether this succeeded. */
-  buildSplitGraph(radio);
   radio.onplaying = () => {
     streamTries = 0;
     /* [#1244] the socket has started feeding this element. A fresh src
@@ -248457,6 +248762,7 @@ function streamElement() {
 function startStream() {
   const el = streamElement();
   streamTries = 0;
+  streamMixApplied = wantsHls() ? personalMix() : "";
   el.src = streamUrl();
   el.volume = 1;
   el.play().catch((e) => streamRecover("play: " + (e && e.message)));

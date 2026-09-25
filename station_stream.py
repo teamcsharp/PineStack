@@ -309,17 +309,65 @@ def _pcm(buf: bytes) -> np.ndarray:
     return np.frombuffer(buf, dtype="<i2").astype(np.int32)
 
 
+def _centered_pcm(buf: bytes) -> np.ndarray:
+    """Return a two-channel programme signal with every source in both ears.
+
+    A few legacy video and SFX files have useful audio on only one side.  The
+    listener stream used to preserve that mistake, and an experimental
+    split-bus mode made it worse by putting music left and dialogue right.
+    Fold each decoded source before it reaches the programme mixer, then
+    duplicate that centred programme into the two-channel encoder input.
+    """
+    values = _pcm(buf)
+    if values.size < CHANNELS:
+        return values
+    frames = values[:(values.size // CHANNELS) * CHANNELS].reshape(-1, CHANNELS)
+    centre = (frames[:, 0] + frames[:, 1]) // 2
+    frames[:, 0] = centre
+    frames[:, 1] = centre
+    return values
+
+
+def listener_mix(raw: Any = None) -> tuple[int, int, int]:
+    """A bounded personal (music, DJ, SFX) mix for one HLS listener."""
+    if isinstance(raw, (tuple, list)):
+        parts = list(raw)
+    else:
+        parts = str(raw or "").split(",")
+    if len(parts) != 3:
+        return (100, 100, 100)
+    try:
+        return tuple(max(0, min(200, int(float(value)))) for value in parts)  # type: ignore[return-value]
+    except (TypeError, ValueError):
+        return (100, 100, 100)
+
+
+def _mixed_program(bed: np.ndarray, voice: np.ndarray | None,
+                   voice_is_sfx: bool, mix: Any = None) -> bytes:
+    """Mix one centred stereo programme frame for one listener's settings."""
+    music_pct, dj_pct, sfx_pct = listener_mix(mix)
+    music_gain = MUSIC_LEVEL * music_pct / 100.0
+    voice_gain = VOICE_LEVEL * (sfx_pct if voice_is_sfx else dj_pct) / 100.0
+    combined = bed * music_gain
+    if voice is not None:
+        combined[:min(combined.size, voice.size)] += (
+            voice[:min(combined.size, voice.size)] * voice_gain)
+    np.clip(combined, -32768, 32767, out=combined)
+    return combined.astype("<i2").tobytes()
+
+
 class _Voice:
     """A DJ clip waiting for, or sitting on, its air moment."""
 
-    __slots__ = ("key", "air_at", "path", "length", "decoder", "started")
+    __slots__ = ("key", "air_at", "path", "length", "sfx", "decoder", "started")
 
     def __init__(self, key: str, air_at: float, path: str,
-                 length: float) -> None:
+                 length: float, sfx: bool = False) -> None:
         self.key = key
         self.air_at = float(air_at)
         self.path = path
         self.length = float(length or 0)
+        self.sfx = bool(sfx)
         self.decoder: _Decoder | None = None
         self.started = False
 
@@ -450,11 +498,10 @@ class _HlsEncoder:
     """
 
     def __init__(self, bitrate: int, root: Path,
-                 split: bool = False) -> None:
+                 mix: tuple[int, int, int] = (100, 100, 100)) -> None:
         self.bitrate = int(bitrate)
-        self.split = bool(split)
-        self.dir = root / (f"hls{self.bitrate}"
-                           + ("s" if self.split else ""))
+        self.mix = listener_mix(mix)
+        self.dir = root / ("hls%d-m%d-%d-%d" % ((self.bitrate,) + self.mix))
         self.playlist = self.dir / "live.m3u8"
         self.proc: subprocess.Popen | None = None
         self.prime: list[bytes] = []
@@ -561,8 +608,8 @@ class StationStream:
         self.bitrate = int(bitrate)
 
         self._lock = threading.Lock()
-        self._encoders: dict[int, _Encoder] = {}
-        self._hls: dict[int, _HlsEncoder] = {}
+        self._encoders: dict[tuple[int, bool], _Encoder] = {}
+        self._hls: dict[tuple[int, tuple[int, int, int]], _HlsEncoder] = {}
         self._hls_root = Path(HLS_ROOT) if HLS_ROOT else Path(
             tempfile.mkdtemp(prefix="pinebox-hls-"))
         self._next_id = 1
@@ -608,7 +655,7 @@ class StationStream:
 
     def rates(self) -> dict[int, int]:
         with self._lock:
-            return {(f"{r}k split" if sp else f"{r}k"): len(e.sinks)
+            return {f"{r}k": len(e.sinks)
                     for (r, sp), e in self._encoders.items()}
 
     def listener_rows(self) -> list[dict[str, Any]]:
@@ -624,10 +671,10 @@ class StationStream:
         return [sk.row() for sk in sinks]
 
     def attach(self, bitrate: Any = None, split: bool = False) -> "_Sink":
-        """A listener at one quality. The mix is shared; the encode is not."""
+        """A listener at one quality on the centred stereo programme."""
         rate = snap_rate(bitrate if bitrate is not None else self.bitrate)
-        key = (rate, bool(split))
-        sink = _Sink(rate, bool(split))
+        key = (rate, False)
+        sink = _Sink(rate, False)
         # Bind first: offer() is a no-op until the sink knows which loop
         # to hand chunks to, and the burst is offered a few lines below.
         try:
@@ -638,7 +685,7 @@ class StationStream:
         with self._lock:
             enc = self._encoders.get(key)
             if enc is None:
-                enc = _Encoder(rate, bool(split))
+                enc = _Encoder(rate, False)
                 if not enc.start():
                     self.stats["last_error"] = f"encoder {rate}k would not start"
                 # The burst this rate has never had. The mixer writes it
@@ -662,7 +709,7 @@ class StationStream:
         return sink
 
     def hls(self, bitrate: Any = None,
-            split: bool = False) -> "_HlsEncoder":
+            mix: Any = None) -> "_HlsEncoder":
         """The HLS encoder at this rate, started and primed if it is new.
 
         Unlike an mp3 listener there is no socket to hold: a player just
@@ -670,17 +717,20 @@ class StationStream:
         the mixer reaps an encoder nobody has asked about.
         """
         rate = snap_rate(bitrate if bitrate is not None else self.bitrate)
-        key = (rate, bool(split))
+        personal_mix = listener_mix(mix)
+        key = (rate, personal_mix)
         with self._lock:
             enc = self._hls.get(key)
             if enc is None:
-                enc = _HlsEncoder(rate, self._hls_root, bool(split))
+                enc = _HlsEncoder(rate, self._hls_root, personal_mix)
                 if not enc.start():
                     self.stats["last_error"] = f"hls {rate}k would not start"
-                # The same backlog the mp3 encoders get, so the very first
-                # playlist already lists several seconds of segments
-                # instead of making the player wait for them in real time.
-                enc.prime = list(self._pcm_burst)
+                # HLS has its own small rolling buffer.  Giving it the MP3
+                # join burst put a new iPhone half a minute behind the
+                # programme, while a slider-created mix had no burst at all.
+                # Start every HLS lane at its live edge so the audio and its
+                # companion video share one predictable clock.
+                enc.prime = []
                 self._hls[key] = enc
             enc.asked_at = time.time()
             self._last_listener_at = time.time()
@@ -688,7 +738,7 @@ class StationStream:
         return enc
 
     def hls_existing(self, bitrate: int,
-                     split: bool = False) -> "_HlsEncoder | None":
+                     mix: Any = None) -> "_HlsEncoder | None":
         """The HLS encoder at this rate if one is already running.
 
         Segment requests must never be able to SPAWN an encoder: a player
@@ -696,7 +746,7 @@ class StationStream:
         playlist, and answering it by starting a lame process is how one
         abandoned tab keeps the box busy for ever."""
         with self._lock:
-            enc = self._hls.get((int(bitrate), bool(split)))
+            enc = self._hls.get((int(bitrate), listener_mix(mix)))
             if enc is not None:
                 enc.asked_at = time.time()
             return enc
@@ -850,7 +900,8 @@ class StationStream:
                         if not path or not Path(path).is_file():
                             continue
                         voice = _Voice(key, air_at, path,
-                                       float(row.get("length") or 0))
+                                       float(row.get("length") or 0),
+                                       bool(row.get("sfx")))
                         # Decode AHEAD of the air moment, not at it.
                         voice.decoder = _Decoder(path)
                         voice.decoder.start()
@@ -859,10 +910,6 @@ class StationStream:
 
                 paused = bool(state.get("paused"))
                 on_air = bool(state.get("on", True)) and not paused
-                with self._lock:
-                    want_split = (any(e.split for e in self._encoders.values())
-                                  or any(h.split for h in self._hls.values()))
-
                 # #1253: DO NOT OUTRUN THE DECODERS.
                 #
                 # Catch-up after a stall is only free when the audio is
@@ -917,7 +964,6 @@ class StationStream:
 
                 # -- assemble ----------------------------------------------
                 made_sound = False
-                split_frame = SILENCE
                 if not on_air:
                     # Off air, or paused: the socket is HELD OPEN and fed
                     # silence. Persistence is the point - a car must not
@@ -932,7 +978,7 @@ class StationStream:
                     if airing is not None and airing.decoder is not None:
                         raw, live = airing.decoder.read_frame()
                         if live:
-                            voice_pcm = _pcm(raw)
+                            voice_pcm = _centered_pcm(raw)
                         else:
                             airing.decoder.close()
                             airing = None
@@ -958,41 +1004,17 @@ class StationStream:
                             if not live:
                                 self.stats["underruns"] += 1
                             self.stats["padded_music"] = music.padded
-                            bed = _pcm(raw)
+                            bed = _centered_pcm(raw)
                     else:
                         bed = np.zeros(FRAME_SAMPLES * CHANNELS,
                                        dtype=np.int32)
 
                     made_sound = (music is not None) or (voice_pcm is not None)
-                    mixed = bed * bed_gain
-                    if voice_pcm is not None:
-                        n = min(mixed.size, voice_pcm.size)
-                        mixed[:n] += voice_pcm[:n] * VOICE_LEVEL
-                    np.clip(mixed, -32768, 32767, out=mixed)
-                    frame = mixed.astype("<i2").tobytes()
-
-                    # #1265: the same instant, UNMIXED - record left, DJs
-                    # right - for listeners doing their own balance. Only
-                    # built when somebody is actually on that road, and
-                    # deliberately NOT ducked: ducking is a mixing
-                    # decision, and on this road the listener is the one
-                    # doing the mixing.
-                    if want_split:
-                        m = bed.reshape(-1, CHANNELS).mean(axis=1)
-                        if voice_pcm is not None:
-                            v = voice_pcm.reshape(-1, CHANNELS).mean(axis=1)
-                            n = min(m.size, v.size)
-                            if n < m.size:
-                                v = np.concatenate(
-                                    [v, np.zeros(m.size - n, dtype=v.dtype)])
-                            v = v[:m.size]
-                        else:
-                            v = np.zeros(m.size, dtype=m.dtype)
-                        pair = np.empty(m.size * 2, dtype=np.int32)
-                        pair[0::2] = m
-                        pair[1::2] = v
-                        np.clip(pair, -32768, 32767, out=pair)
-                        split_frame = pair.astype("<i2").tobytes()
+                    # Preserve the existing ducking curve, then apply the
+                    # listener's own controls to the centred stereo buses.
+                    bed = bed * (bed_gain / max(MUSIC_LEVEL, 0.0001))
+                    frame = _mixed_program(bed, voice_pcm,
+                                           bool(airing is not None and airing.sfx))
 
                 # -- hand it to every encoder ------------------------------
                 # One mix, several rates. A listener on 48k and one on
@@ -1015,7 +1037,7 @@ class StationStream:
                     pass
                 for enc in encoders:
                     before = enc.restarts
-                    shaped = split_frame if enc.split else frame
+                    shaped = frame
                     if enc.prime:
                         backlog, enc.prime = enc.prime, []
                         for past in backlog:
@@ -1028,7 +1050,11 @@ class StationStream:
                     if enc.restarts != before:
                         self.stats["encoder_restarts"] += 1
                 for hls in hlses:
-                    hshaped = split_frame if hls.split else frame
+                    hshaped = (frame if not on_air or hls.mix == (100, 100, 100)
+                               else _mixed_program(
+                                   bed, voice_pcm,
+                                   bool(airing is not None and airing.sfx),
+                                   hls.mix))
                     if hls.prime:
                         backlog, hls.prime = hls.prime, []
                         for past in backlog:
@@ -1108,8 +1134,8 @@ class StationStream:
             "listeners": self.listeners,
             "bitrate": self.bitrate,
             "rates": self.rates(),
-            "hls_rates": [f"{r}k split" if sp else f"{r}k"
-                          for (r, sp) in sorted(self._hls)],
+            "hls_rates": ["%dk (%d/%d/%d)" % ((r,) + mix)
+                          for (r, mix) in sorted(self._hls)],
             "listener_rows": self.listener_rows(),
             "recent_sessions": list(self.sessions)[-12:],
             "join_burst_s": JOIN_BURST_SECONDS,

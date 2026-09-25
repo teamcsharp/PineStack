@@ -218,6 +218,38 @@
     return Promise.resolve(bridge().get('/api/dj'));
   }
 
+  /* A corner replay starts with a chat row, which has an opaque SFX id but
+   * deliberately no durable media capability.  Ask the station to mint a
+   * fresh signed source instead of giving an <audio> element a protected URL
+   * and letting it report the resulting HTML 401 as an unsupported codec. */
+  function stationGet(path) {
+    if (has('get')) return Promise.resolve(bridge().get(path));
+    if (typeof root.fetch !== 'function') return Promise.reject(new Error('no station connection'));
+    return stationKey().then(function (key) {
+      var opts = key ? {headers: {Authorization: 'Bearer ' + key}} : {};
+      return root.fetch(stationUrl(path), opts).then(function (res) {
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        return res.json();
+      });
+    });
+  }
+
+  function stationPost(path, payload) {
+    if (has('post')) return Promise.resolve(bridge().post(path, payload || {}));
+    if (typeof root.fetch !== 'function') return Promise.reject(new Error('no station connection'));
+    return stationKey().then(function (key) {
+      var headers = {'Content-Type': 'application/json'};
+      if (key) headers.Authorization = 'Bearer ' + key;
+      return root.fetch(stationUrl(path), {method: 'POST', headers: headers,
+        body: JSON.stringify(payload || {})}).then(function (res) {
+        return res.json().then(function (body) {
+          if (!res.ok) throw new Error(String((body && body.detail) || ('HTTP ' + res.status)));
+          return body;
+        });
+      });
+    });
+  }
+
   /* The station key the way talk-dot's serverKey() finds it: the page's
    * SERVER_KEY (the kiosk's panel page), else the bridge's config (the
    * desk). '' where neither is reachable - said, not assumed. */
@@ -2196,7 +2228,7 @@
    * is marked as the sampler's own so the air tap does not record it
    * back into its ring, the broadcast is ducked while it plays, and every
    * road out releases the duck. */
-  function playAudio(src, name) {
+  function playAudio(src, name, onPlaying) {
     stopAudio();
     var audio = new Audio(src);
     if (root.PineAir && typeof root.PineAir.mine === 'function') root.PineAir.mine(audio);
@@ -2221,10 +2253,38 @@
     try { p = audio.play(); } catch (e) { p = Promise.reject(e); }
     Promise.resolve(p).then(function () {
       toast('replaying ' + name);
+      if (typeof onPlaying === 'function') onPlaying();
     }, function (err) {
       stopAudio();
       toast('could not replay ' + name + ': ' + String((err && err.message) || err), true);
     });
+  }
+
+  /* The replay is intentionally private to this glass.  The follow-up is
+   * explicit: it lets the operator turn THAT source into an H3 stinger,
+   * without accidentally queueing video generation whenever they only
+   * wanted to hear a clip again. */
+  function offerReplayStinger(key, name) {
+    if (!key) return;
+    var s = sheet('Replay ready', 'hc-replay-offer', {duck: false});
+    s.body.appendChild(make('p', 'hc-dim', '"' + name + '" is replaying on this screen.'));
+    s.body.appendChild(make('p', 'hc-dim',
+      'Use this exact video when it has one; audio-only clips get a matching dialogue-capable performer.'));
+    var status = make('p', 'hc-dim', '');
+    var send = button('hc-btn hc-primary hc-wide', 'Make H3 station stinger', 'c:play--filled');
+    send.addEventListener('click', function () {
+      send.disabled = true;
+      status.textContent = 'Queuing the H3 stinger and making room if needed...';
+      stationPost('/api/sfx/' + encodeURIComponent(key) + '/h3-stinger', {}).then(function (got) {
+        status.textContent = String((got && got.message) || 'H3 stinger queued for the station and gallery.');
+        toast('H3 stinger queued from ' + name);
+      }, function (err) {
+        send.disabled = false;
+        status.textContent = String((err && err.message) || err || 'The H3 stinger could not be queued.');
+      });
+    });
+    s.body.appendChild(send);
+    s.body.appendChild(status);
   }
 
   function replaySfx() {
@@ -2237,20 +2297,39 @@
        * glyph (U+1F50A, written as its surrogate pair here); the name is
        * what follows it. */
       var name = String(row.text || key || 'the clip').replace(/^\uD83D\uDD0A\s*/, '');
-      var url = String(row.url || ('/sfx/' + encodeURIComponent(key)));
-      /* A clip with a picture goes back on the SFX set, through the same
-       * cut() the sampler's pads use - on THIS glass only (no ring), which
-       * is what a replay is. cut() answers false where no set is mounted
-       * and the audio road below takes over. */
-      if (row.video && root.PineSfxTv && typeof root.PineSfxTv.cut === 'function') {
-        var shown = false;
-        try {
-          shown = !!root.PineSfxTv.cut({id: key, url: url, sting: name,
-            seconds: Number(row.seconds) || 0, video: true, ts: row.ts}, {ring: false});
-        } catch (e) { shown = false; }
-        if (shown) { toast('replaying ' + name + ' on the set'); return; }
-      }
-      playAudio(stationUrl(url), name);
+      /* Do not trust row.url here. It may be an old unsigned /sfx key; the
+       * replay-source road returns the same signed, levelled bytes that the
+       * station itself can play, including MP4 metadata for the SFX set. */
+      var source = key ? stationGet('/api/sfx/' + encodeURIComponent(key) + '/replay-source')
+        : Promise.resolve({url: row.url, video: !!row.video, seconds: row.seconds || 0});
+      source.then(function (gotSource) {
+        var source = gotSource || {};
+        var replayKey = String(source.id || key || '');
+        var replayName = String(source.name || name || 'the clip');
+        var url = String(source.url || row.url || '');
+        if (!url) { toast('the station has no playable source for ' + replayName, true); return; }
+        /* A clip with a picture goes back on the SFX set, through the same
+         * cut() the sampler's pads use - on THIS glass only (no ring), which
+         * is what a replay is. cut() answers false where no set is mounted
+         * and the audio road below takes over. */
+        if (source.video && root.PineSfxTv && typeof root.PineSfxTv.cut === 'function') {
+          var shown = false;
+          try {
+            shown = !!root.PineSfxTv.cut({id: replayKey, url: url, sting: replayName,
+              seconds: Number(source.seconds) || 0, video: true, ts: row.ts}, {ring: false});
+          } catch (e) { shown = false; }
+          if (shown) {
+            toast('replaying ' + replayName + ' on the set');
+            offerReplayStinger(replayKey, replayName);
+            return;
+          }
+        }
+        playAudio(stationUrl(url), replayName, function () {
+          offerReplayStinger(replayKey, replayName);
+        });
+      }, function (err) {
+        toast('could not load the replay source: ' + String((err && err.message) || err), true);
+      });
     }, function (err) {
       toast(String((err && err.message) || err), true);
     });

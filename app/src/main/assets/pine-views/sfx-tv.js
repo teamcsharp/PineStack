@@ -1266,8 +1266,8 @@
     var queueActions = document.createElement('div');
     queueActions.className = 'sfx-tv-parody-queue-actions';
     var freeIdle = document.createElement('button'); freeIdle.type = 'button';
-    freeIdle.textContent = 'Free idle Comfy cache';
-    freeIdle.title = 'Only unloads when ComfyUI is not rendering';
+    freeIdle.textContent = 'Make room for H3';
+    freeIdle.title = 'Releases idle Comfy and Ollama models; active renders stay protected';
     var relieveOne = document.createElement('button'); relieveOne.type = 'button';
     relieveOne.textContent = 'Host cache relief';
     relieveOne.title = 'Run pressure relief tier 1; never tier 3 or active voice engines';
@@ -1352,7 +1352,7 @@
         .then(function () { button.disabled = false; });
     };
     freeIdle.addEventListener('click', function () {
-      relief(freeIdle, '/api/comfy/idle/now', {mode: 'free'});
+      relief(freeIdle, '/api/h3/relieve', {force: true});
     });
     relieveOne.addEventListener('click', function () {
       relief(relieveOne, '/api/orchestrator/pressure/relieve?tier=1', {});
