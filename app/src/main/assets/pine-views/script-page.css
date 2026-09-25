@@ -77,11 +77,45 @@
 .sp-right {
   position: relative;
   display: grid;
-  grid-template-rows: auto auto auto auto minmax(0, 1fr) auto;
+  grid-template-rows: auto minmax(0, 1fr) auto;
   gap: 8px;
   min-width: 0;
   min-height: 0;
 }
+.sp-script-top { display: grid; gap: 6px; min-width: 0; min-height: 0; }
+.sp-bands { display: grid; gap: 6px; min-width: 0; min-height: 0; }
+.sp-band-row {
+  display: grid;
+  grid-template-columns: 28px minmax(0, 1fr);
+  gap: 4px;
+  min-width: 0;
+  min-height: 0;
+}
+.sp-band-row[hidden], .sp-bands[hidden], .sp-band-restore[hidden] { display: none; }
+.sp-band-collapse, .sp-band-reopen {
+  display: grid;
+  place-items: center;
+  width: 28px;
+  min-width: 28px;
+  min-height: 28px;
+  padding: 0;
+  border: 1px solid var(--sp-line);
+  border-radius: 4px;
+  background: var(--sp-panel);
+  color: var(--sp-muted);
+  cursor: pointer;
+}
+.sp-band-collapse { align-self: stretch; }
+.sp-band-collapse:hover, .sp-band-collapse:focus-visible,
+.sp-band-reopen:hover, .sp-band-reopen:focus-visible {
+  border-color: var(--sp-on);
+  color: var(--sp-on);
+  outline: 2px solid var(--sp-on);
+  outline-offset: -2px;
+}
+.sp-band-collapse svg, .sp-band-reopen svg { width: 16px; height: 16px; }
+.sp-band-restore { display: flex; gap: 5px; min-height: 28px; min-width: 0; }
+.sp-band-reopen { flex: 0 0 28px; }
 
 /* ---------------------------------------------------------------- 1 2 3 */
 
@@ -1185,7 +1219,7 @@ button.sp-analysis-turn:hover, button.sp-analysis-turn:focus-visible { backgroun
 /* The one-line readout under the heading: what is happening with it. */
 .sp-now-line {
   flex: 0 0 auto;
-  margin: 0 0 6px;
+  margin: 0;
   padding: 0;
   border: 1px solid var(--sp-line, #35414c);
   border-left-width: 3px;
@@ -1267,6 +1301,7 @@ button.sp-analysis-turn:hover, button.sp-analysis-turn:focus-visible { backgroun
   border-top: 1px solid var(--sp-line);
   background: var(--sp-line);
 }
+.sp-band-sequence .sp-live-sequence { grid-column: auto; }
 .sp-live-sequence[hidden] { display: none; }
 .sp-live-cue {
   flex: 0 0 min(190px, 45%);
@@ -1374,8 +1409,8 @@ button.sp-analysis-turn:hover, button.sp-analysis-turn:focus-visible { backgroun
 .sp-ready-detail-title span, .sp-ready-facts { color: var(--sp-muted); }
 .sp-ready-facts { display: flex; flex-wrap: wrap; gap: 4px 10px; margin: 5px 0; font-variant-numeric: tabular-nums; }
 .sp-ready-needs { margin: 6px 0; padding-left: 18px; color: var(--sp-amber); }
-.sp-ready-brief, .sp-ready-stock, .sp-ready-performance, .sp-ready-contract { margin-top: 8px; border-top: 1px solid var(--sp-line); padding-top: 5px; }
-.sp-ready-brief h3, .sp-ready-stock h3, .sp-ready-contract h3 { margin: 0 0 4px; font-size: 11px; }
+.sp-ready-brief, .sp-ready-stock, .sp-ready-performance, .sp-ready-contract, .sp-ready-news { margin-top: 8px; border-top: 1px solid var(--sp-line); padding-top: 5px; }
+.sp-ready-brief h3, .sp-ready-stock h3, .sp-ready-contract h3, .sp-ready-news h3 { margin: 0 0 4px; font-size: 11px; }
 .sp-ready-contract h3 { color: var(--sp-amber); }
 .sp-ready-contract-facts { display: flex; flex-wrap: wrap; gap: 2px 10px; color: var(--sp-muted); font-variant-numeric: tabular-nums; }
 .sp-ready-contract-gaps { margin: 4px 0; padding-left: 18px; color: var(--sp-amber); }
@@ -1387,6 +1422,24 @@ button.sp-analysis-turn:hover, button.sp-analysis-turn:focus-visible { backgroun
 .sp-ready-brief-row { display: grid; grid-template-columns: 88px minmax(0, 1fr); gap: 6px; margin: 2px 0; }
 .sp-ready-brief-row b { color: var(--sp-muted); }
 .sp-ready-brief-row span { white-space: pre-wrap; overflow-wrap: anywhere; }
+.sp-ready-news-group { min-width: 0; margin: 0; padding: 0; border: 0; }
+.sp-ready-news-group legend { padding: 0; color: var(--sp-muted); }
+.sp-ready-news-selection, .sp-ready-news-message, .sp-ready-news-error { margin: 4px 0; }
+.sp-ready-news-selection { color: var(--sp-green); }
+.sp-ready-news-message { color: var(--sp-muted); }
+.sp-ready-news-error { color: var(--sp-amber); }
+.sp-ready-news-option {
+  display: flex; align-items: flex-start; gap: 7px; min-width: 0;
+  padding: 5px 4px; border-top: 1px solid var(--sp-line); cursor: pointer;
+}
+.sp-ready-news-option[data-selected="true"] { border-left: 2px solid var(--sp-green); padding-left: 2px; }
+.sp-ready-news-option:focus-within { outline: 2px solid var(--sp-on); outline-offset: -2px; }
+.sp-ready-news-option input { flex: 0 0 auto; margin: 2px 0 0; accent-color: var(--sp-green); }
+.sp-ready-news-copy { display: grid; gap: 2px; min-width: 0; overflow-wrap: anywhere; }
+.sp-ready-news-copy b { font-size: 11px; }
+.sp-ready-news-meta { color: var(--sp-muted); }
+.sp-ready-news-excerpt { white-space: pre-wrap; line-height: 1.35; }
+.sp-ready-news-actions { margin-top: 6px; }
 .sp-ready-performance-head { display: flex; gap: 8px; align-items: baseline; }
 .sp-ready-performance-head span { color: var(--sp-muted); overflow-wrap: anywhere; }
 .sp-ready-line { display: grid; grid-template-columns: 75px minmax(0, 1fr); gap: 6px; padding: 3px 2px; cursor: pointer; }
@@ -1412,7 +1465,7 @@ button.sp-analysis-turn:hover, button.sp-analysis-turn:focus-visible { backgroun
 .sp-sync {
   flex: 0 0 auto;
   display: flex; align-items: baseline; gap: 8px;
-  margin: -2px 0 6px;
+  margin: 0;
   padding: 3px 9px;
   border-left: 3px solid var(--sp-line, #35414c);
   border-radius: 0 4px 4px 0;
@@ -1946,23 +1999,20 @@ button.sp-analysis-turn:hover, button.sp-analysis-turn:focus-visible { backgroun
 .sp-page.sp-beside .sp-right {
   display: grid;
   grid-template-columns: 1fr minmax(200px, 38%);
-  grid-template-rows: auto auto auto auto minmax(0, 1fr) auto;
+  grid-template-rows: auto minmax(0, 1fr) auto;
   column-gap: 14px;
 }
-.sp-page.sp-beside #spScript { grid-column: 1; grid-row: 5; }
+.sp-page.sp-beside #spScript { grid-column: 1; grid-row: 2; }
 .sp-page.sp-beside #spPlan {
   grid-column: 2;
-  grid-row: 5;
+  grid-row: 2;
   overflow-y: auto;
   margin: 0;
   padding-right: 6px;
   border-left: 1px solid var(--sp-line);
   padding-left: 12px;
 }
-.sp-page.sp-beside .sp-scripthead,
-.sp-page.sp-beside .sp-now-line,
-.sp-page.sp-beside .sp-sync,
-.sp-page.sp-beside .sp-readiness { grid-column: 1 / -1; }
+.sp-page.sp-beside .sp-script-top { grid-column: 1 / -1; }
 
 /* #1294: in `below` the plan hangs off the end of the screenplay -
    measured at 60,242 px down a 62,386 px scroll, which is the whole
@@ -3311,3 +3361,8 @@ html.pine-tech-wide .sp-tech.sp-tech-wide .wc-bar,
 html.pine-tech-wide .sp-tech.sp-tech-wide .wc-strip {
   padding-right: 26px;
 }
+/* Dictation now lives inside each editable field through talk-dot.js. */
+.sp-review-mic,
+.sp-reason-dictate,
+.sp-headmenu-dictate,
+.sp-segrep-dictate { display: none !important; }

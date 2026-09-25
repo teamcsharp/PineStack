@@ -22,6 +22,7 @@ class NewsReplenishmentTests(unittest.IsolatedAsyncioTestCase):
                 "dialogue_row_viable": lambda *a: True,
                 "dialogue_row_ready": lambda *a: True,
                 "repeat_safe": lambda *a: True,
+                "content_gate_enabled": lambda gate: gate == "repetition",
                 "orch_policy": lambda key: self.policy.get(key),
                 "news_shelf_most": lambda: 2,
                 "news_want_seconds": lambda: 120,

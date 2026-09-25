@@ -460,16 +460,27 @@ class System2Runtime:
             template_id = str(slot.get("id") or f"slot-{index}")
             occurrence = "hour-" + str(int(float(hour) * 1000)) + ":" + template_id
             choice = h.script_choice(occurrence) if hasattr(h, "script_choice") else {}
+            news_choice = (h.news_story_choice(occurrence)
+                           if road == "news" and hasattr(h, "news_story_choice") else {})
             out.append({**copy.deepcopy(slot), "id": template_id,
                         "kind": road, "slot_kind": kind, "seconds": seconds,
                         "label": str(slot.get("label") or h.SCHEDULE_KIND_NAMES.get(kind) or kind),
-                        "prompt": h._schedule_clause(preset, slot, brief),
+                        "prompt": h._schedule_clause(preset, slot, brief) +
+                                  ("\nSelected news story: %s (%s). Ground this scene in that story."
+                                   % (str(news_choice.get("title") or "")[:300],
+                                      str(news_choice.get("url") or "")[:1000])
+                                   if news_choice.get("url") else ""),
                         "hour_key": key, "preset": preset,
                         "target_seconds": 0 if kind == "record" else seconds,
                         "non_dialogue": kind == "record",
-                        "preferred_candidate_id": str(choice.get("candidate") or "")})
+                        "preferred_candidate_id": str(choice.get("candidate") or ""),
+                        **({"required_news_url": str(news_choice.get("url") or "")}
+                           if road == "news" else {})})
             if road == "recap":
                 out[-1]["require_slot_binding"] = True
+            if road == "news" and hasattr(h, "news_story_choice"):
+                out[-1]["require_slot_binding"] = True
+                out[-1]["require_news_source"] = True
             if road == "track_talk":
                 out[-1].update(coverage_mode="one_performance", target_performances=1,
                                target_seconds=min(15.0, seconds), allocation_mode="current")
@@ -1226,6 +1237,12 @@ class System2Runtime:
                     work["why"] = "Recap waits for its measured observed-hour preparation window"
                     self.store.complete_job(job["id"], "system2-preparer", job["token"], success=False, retry_after=60)
                     return
+                if (kind == "news" and hasattr(h, "news_prep_ahead") and
+                        float(job["template"]["start"]) - time.time() > h.news_prep_ahead()):
+                    work["why"] = "News waits until its source remains fresh through airtime"
+                    self.store.complete_job(job["id"], "system2-preparer", job["token"],
+                                            success=False, retry_after=60)
+                    return
                 h.alt_brief_set(brief + "\nSYSTEM2 PRODUCTION: Write one complete compact scene with a clear opening, substantive exchange, and close. "
                     "This scene fills part of the named segment; additional distinct scenes may follow. "
                     "Use the source's concrete details. Do not pad with greetings, repeated slogans or unrelated rhyme words. "
@@ -1250,6 +1267,13 @@ class System2Runtime:
                     bound = entry.get("system2_slot")
                     if bound and bound != job["slot_id"] and self.binding_live(bound):
                         continue                    # #1390: a stale pin does not hold
+                    if kind == "news" and job["template"].get("require_news_source"):
+                        stories = entry.get("prep_news_stories") or []
+                        required = str(job["template"].get("required_news_url") or "")
+                        if (bound != job["slot_id"] or not stories or
+                                (required and not any(isinstance(story, dict) and
+                                 story.get("url") == required for story in stories))):
+                            continue
                     if (kind == "recap" or job["template"].get("require_slot_binding")) and bound != job["slot_id"]:
                         continue
                     if self.content_gate_enabled("tint") and not h.tint_retry_due(entry, kind):
@@ -1322,6 +1346,19 @@ class System2Runtime:
                     work["candidate_id"] = h.alt_sid(kind, row)
                     entry["system2_trace_id"] = work["trace_id"]
                     changed = bool(await h.larder_prepare(entry))
+                elif kind == "news" and hasattr(h, "dj_news"):
+                    work["action"] = "Write sourced news for this occurrence"
+                    selected = (h.news_story_choice(job["slot_id"])
+                                if hasattr(h, "news_story_choice") else {})
+                    pile = []
+                    await h.dj_news(bank_to=pile, selected=selected or None)
+                    for entry in pile:
+                        entry.update(prep_kind="news", system2_slot=job["slot_id"],
+                                     system2_trace_id=work["trace_id"])
+                        await h.larder_prepare(entry)
+                        h.shelf_put("news", {"entry": entry,
+                                             "seconds": float(entry.get("seconds") or 0)})
+                    changed = bool(pile)
                 elif kind in ("recap", "deep"):
                     pile = []
                     hour_start = h._sched_hour_epoch(job["template"].get("hour_key") or h._sched_hour_key())

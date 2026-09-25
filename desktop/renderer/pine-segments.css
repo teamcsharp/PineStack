@@ -102,7 +102,6 @@
 .pseg-plus { flex: 0 0 auto; width: 34px; font-size: 14px; padding: 0; }
 .pseg-plus.pseg-next { width: auto; min-width: 92px; padding: 0 12px; font-size: 11px; }
 .pseg-topic-sheet .pseg-kind { border-top: 0; }
-.pseg-mic,
 .pseg-topic-action {
   flex: 0 0 auto;
   display: grid;
@@ -117,10 +116,7 @@
   color: #8cd4c0;
   cursor: pointer;
 }
-.pseg-mic svg,
 .pseg-topic-action svg { width: 16px; height: 16px; fill: currentColor; }
-.pseg-mic.recording { color: #ff667a; border-color: #ff667a; }
-.pseg-mic.processing { color: #e4c35a; }
 .pseg-topic-prior-title {
   padding: 8px 2px 5px;
   color: #8b8f97;

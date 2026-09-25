@@ -321,6 +321,17 @@ class System2Store:
     def _slot_matches(candidate, slot):
         if candidate['kind'] != slot['kind']: return False
         if candidate['id'] in (slot.get('review_superseded_ids') or []): return False
+        if slot['kind'] == 'news' and (slot.get('require_news_source') or
+                                      slot.get('required_news_url')):
+            source = candidate.get('source') or {}
+            stories = source.get('prep_news_stories') or []
+            if not isinstance(stories, list) or not any(
+                    isinstance(row, dict) and row.get('url') for row in stories):
+                return False
+            selected = slot.get('required_news_url')
+            if selected and not any(isinstance(row, dict) and row.get('url') == selected
+                                    for row in stories):
+                return False
         if slot['kind'] == 'recap':
             source = candidate.get('source') or {}
             if (candidate.get('slot_id') != slot['id'] or not isinstance(source, dict)

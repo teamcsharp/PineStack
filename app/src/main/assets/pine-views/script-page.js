@@ -106,7 +106,9 @@
   var readinessPick = '';             /* upcoming slot open in the desk */
   var readinessPrint = '';            /* keep the operator's scroll/focus */
   var readinessClockAt = 0;
+  var newsChoiceState = null;
   var liveCuePrint = '';               /* repaint only when the cue changes */
+  var bandManager = null;
   var beat = 0;
   var rejectionItems = [];
   var rejectionFirstPage = [];
@@ -194,6 +196,54 @@
     if (cls) n.className = cls;
     if (text !== undefined && text !== null) n.textContent = text;
     return n;
+  }
+
+  var BAND_STORAGE_KEY = 'pine.script.bands.v1';
+  var BAND_NAMES = {
+    current: 'Current segment', sequence: 'Previous, on air and next',
+    sync: 'In step with sound', readiness: 'Upcoming preparation'
+  };
+
+  function bandLoad() {
+    var saved;
+    try { saved = JSON.parse(root.localStorage.getItem(BAND_STORAGE_KEY) || '{}'); }
+    catch (err) { saved = {}; }
+    var state = {};
+    Object.keys(BAND_NAMES).forEach(function (key) {
+      state[key] = !!(saved && saved[key] === true);
+    });
+    return state;
+  }
+
+  function bandSave(state) {
+    try { root.localStorage.setItem(BAND_STORAGE_KEY, JSON.stringify(state)); }
+    catch (err) { /* private mode: controls remain usable */ }
+  }
+
+  function bandController(bands, toolbar, items) {
+    var state = bandLoad();
+    function apply() {
+      var anyOpen = false, anyClosed = false;
+      Object.keys(BAND_NAMES).forEach(function (key) {
+        var item = items[key], closed = state[key];
+        item.wrap.hidden = closed || (key === 'sequence' && item.content.hidden);
+        item.restore.hidden = !closed;
+        item.collapse.setAttribute('aria-expanded', String(!closed));
+        item.restore.setAttribute('aria-expanded', String(!closed));
+        if (closed) anyClosed = true;
+        else if (!item.wrap.hidden) anyOpen = true;
+      });
+      bands.hidden = !anyOpen;
+      toolbar.hidden = !anyClosed;
+    }
+    function set(key, closed) {
+      if (!Object.prototype.hasOwnProperty.call(items, key)) return;
+      state[key] = !!closed;
+      apply();
+      bandSave(state);
+    }
+    apply();
+    return {set: set, refresh: apply};
   }
 
   var REJECTION_PAGE = 24;
@@ -10723,6 +10773,149 @@
     return row;
   }
 
+  function newsOptionsFor(model) {
+    var slotId = String((model.entry || {}).slot_id || '');
+    if (newsChoiceState && newsChoiceState.slotId === slotId) return newsChoiceState;
+    var state = {slotId: slotId, status: slotId ? 'loading' : 'error',
+      options: [], selectedUrl: '', draftUrl: '', error: slotId ? '' : 'This news slot has no ID.'};
+    newsChoiceState = state;
+    if (!slotId) return state;
+    Promise.resolve().then(function () {
+      return api().get('/api/news/options?slot_id=' + encodeURIComponent(slotId));
+    }).then(function (got) {
+      if (!got || !Array.isArray(got.options)) throw new Error('News choices are unavailable.');
+      if (newsChoiceState !== state) return;
+      var seen = Object.create(null);
+      state.options = got.options.filter(function (option) {
+        var url = option && String(option.url || '').trim();
+        if (!url || seen[url]) return false;
+        seen[url] = true;
+        return true;
+      });
+      state.selectedUrl = String(got.selected_url || '');
+      state.draftUrl = state.selectedUrl;
+      state.status = 'ready';
+      newsChoicesRepaint(model, state);
+    }).catch(function (err) {
+      if (newsChoiceState !== state) return;
+      state.status = 'error';
+      state.error = rejectionError(err);
+      newsChoicesRepaint(model, state);
+    });
+    return state;
+  }
+
+  function newsChoicesRepaint(model, state) {
+    var detail = el('spReadinessDetail');
+    if (newsChoiceState === state && detail && !detail.hidden
+      && detail.dataset.key === model.key) paintReadinessDetail(model);
+  }
+
+  function readinessNewsChoices(model) {
+    var state = newsOptionsFor(model);
+    var section = make('section', 'sp-ready-news');
+    section.appendChild(make('h3', '', 'News story'));
+    if (state.status === 'loading') {
+      var loading = make('p', 'sp-ready-news-message', 'Loading story choices...');
+      loading.setAttribute('role', 'status');
+      section.appendChild(loading);
+      return section;
+    }
+    if (state.status === 'error') {
+      var failed = make('p', 'sp-ready-news-error', state.error);
+      failed.setAttribute('role', 'alert');
+      section.appendChild(failed);
+      if (state.slotId) {
+        var retry = make('button', 'sp-planact', 'Retry stories');
+        retry.type = 'button';
+        retry.addEventListener('click', function () {
+          newsChoiceState = null;
+          newsChoicesRepaint(model, newsOptionsFor(model));
+        });
+        section.appendChild(retry);
+      }
+      return section;
+    }
+    if (!state.options.length) {
+      section.appendChild(make('p', 'sp-ready-news-message', 'No story choices available.'));
+      return section;
+    }
+    var group = make('fieldset', 'sp-ready-news-group');
+    group.appendChild(make('legend', '', 'Choose a story for this segment'));
+    var selected = state.options.find(function (option) {
+      return String(option.url) === state.selectedUrl;
+    });
+    var current = make('p', 'sp-ready-news-selection', selected
+      ? 'Selected: ' + String(selected.title || selected.url)
+      : (state.selectedUrl ? 'A different story is currently selected.' : 'No story selected.'));
+    current.setAttribute('role', 'status');
+    group.appendChild(current);
+    var choose = make('button', 'sp-planact sp-ready-news-choose', 'Choose story');
+    choose.type = 'button';
+    choose.disabled = !state.draftUrl || state.draftUrl === state.selectedUrl
+      || state.status === 'saving';
+    state.options.forEach(function (option) {
+      var url = String(option.url);
+      var row = make('label', 'sp-ready-news-option');
+      row.dataset.selected = url === state.selectedUrl ? 'true' : 'false';
+      var radio = make('input', '');
+      radio.type = 'radio';
+      radio.name = 'sp-ready-news-' + state.slotId;
+      radio.value = url;
+      radio.checked = url === state.draftUrl;
+      radio.disabled = state.status === 'saving';
+      radio.addEventListener('change', function () {
+        if (!radio.checked) return;
+        state.draftUrl = url;
+        choose.disabled = url === state.selectedUrl;
+      });
+      row.appendChild(radio);
+      var words = make('span', 'sp-ready-news-copy');
+      words.appendChild(make('b', '', String(option.title || url)));
+      words.appendChild(make('span', 'sp-ready-news-meta', [option.source,
+        option.availability].filter(Boolean).map(String).join(' / ')));
+      if (option.excerpt) words.appendChild(make('span', 'sp-ready-news-excerpt',
+        String(option.excerpt)));
+      row.appendChild(words);
+      group.appendChild(row);
+    });
+    section.appendChild(group);
+    var actions = make('div', 'sp-ready-news-actions');
+    choose.addEventListener('click', function () {
+      if (!state.draftUrl || state.draftUrl === state.selectedUrl
+        || state.status === 'saving') return;
+      var url = state.draftUrl;
+      state.status = 'saving';
+      state.error = '';
+      newsChoicesRepaint(model, state);
+      Promise.resolve().then(function () {
+        return api().post('/api/news/choice', {slot_id: state.slotId, url: url});
+      }).then(function (got) {
+        if (got && got.ok === false) throw new Error(String(got.detail || got.say || 'Story was not selected.'));
+        if (newsChoiceState !== state) return;
+        state.selectedUrl = url;
+        state.draftUrl = url;
+        state.status = 'ready';
+        newsChoicesRepaint(model, state);
+        loadPlan(true);
+        loadScreenplay(true);
+      }).catch(function (err) {
+        if (newsChoiceState !== state) return;
+        state.status = 'ready';
+        state.error = rejectionError(err);
+        newsChoicesRepaint(model, state);
+      });
+    });
+    actions.appendChild(choose);
+    section.appendChild(actions);
+    if (state.error) {
+      var error = make('p', 'sp-ready-news-error', state.error);
+      error.setAttribute('role', 'alert');
+      section.appendChild(error);
+    }
+    return section;
+  }
+
   function paintReadinessDetail(model) {
     var detail = el('spReadinessDetail');
     if (!detail) return;
@@ -10730,6 +10923,7 @@
     detail.replaceChildren();
     detail.hidden = !model;
     if (!model) return;
+    detail.dataset.key = model.key;
     var top = make('div', 'sp-ready-detail-head');
     var title = make('div', 'sp-ready-detail-title');
     title.appendChild(make('b', '', model.label));
@@ -10832,6 +11026,7 @@
       });
       detail.appendChild(brief);
     }
+    if (model.kind === 'news') detail.appendChild(readinessNewsChoices(model));
     if (model.bank && Array.isArray(model.bank.items) && model.bank.items.length) {
       var stock = make('section', 'sp-ready-stock');
       stock.appendChild(make('h3', '', 'Banked stock'));
@@ -11016,6 +11211,7 @@
     liveCuePrint = print;
     strip.replaceChildren();
     strip.hidden = !rows.length;
+    if (bandManager) bandManager.refresh();
     var currentCue = null;
     rows.forEach(function (item) {
       var button = make('button', 'sp-live-cue', '');
@@ -13657,6 +13853,7 @@
     left.appendChild(feed);
 
     var right = make('div', 'sp-right');     /* 7 */
+    var top = make('div', 'sp-script-top');
     var head = make('div', 'sp-scripthead');
     head.id = 'spScriptName';
     head.appendChild(make('b', '', 'The script'));
@@ -13692,7 +13889,7 @@
       if (el(HEADER_MENU_ID)) headerClose();
       else headerOpen(head);
     });
-    right.appendChild(head);
+    top.appendChild(head);
     /* One line, console-shaped, directly under the heading: what is
        happening with the line that is being said. */
     var now = make('div', 'sp-now-line');
@@ -13718,8 +13915,6 @@
     liveSequence.id = 'spLiveSequence';
     liveSequence.hidden = true;
     liveSequence.setAttribute('aria-label', 'Live scripted event sequence');
-    now.appendChild(liveSequence);
-    right.appendChild(now);
     /* THE SYNCHRONIZATION STATE, said out loud.
        A held mark and a live mark must not look the same. */
     var sync = make('div', 'sp-sync');
@@ -13727,7 +13922,6 @@
     sync.dataset.sync = 'held';
     sync.appendChild(make('b', 'sp-sync-name', ''));
     sync.appendChild(make('i', 'sp-sync-why', ''));
-    right.appendChild(sync);
 
     var readiness = make('section', 'sp-readiness');
     readiness.id = 'spReadiness';
@@ -13750,7 +13944,48 @@
     readinessDetail.id = 'spReadinessDetail';
     readinessDetail.hidden = true;
     readiness.appendChild(readinessDetail);
-    right.appendChild(readiness);
+    var bands = make('div', 'sp-bands');
+    var restore = make('div', 'sp-band-restore');
+    restore.setAttribute('role', 'toolbar');
+    restore.setAttribute('aria-label', 'Restore Script bands');
+    var bandItems = {};
+    function addBand(key, content, glyph) {
+      var label = BAND_NAMES[key];
+      var wrap = make('div', 'sp-band-row sp-band-' + key);
+      var collapse = make('button', 'sp-band-collapse');
+      collapse.type = 'button';
+      collapse.title = 'Collapse ' + label;
+      collapse.setAttribute('aria-label', 'Collapse ' + label);
+      collapse.setAttribute('aria-controls', content.id);
+      collapse.innerHTML = folderIcon('c:caret--left', label) || '&lt;';
+      collapse.addEventListener('click', function (event) {
+        event.stopPropagation();
+        bandManager.set(key, true);
+      });
+      wrap.appendChild(collapse);
+      wrap.appendChild(content);
+      bands.appendChild(wrap);
+      var reopen = make('button', 'sp-band-reopen');
+      reopen.type = 'button';
+      reopen.title = 'Restore ' + label;
+      reopen.setAttribute('aria-label', 'Restore ' + label);
+      reopen.setAttribute('aria-controls', content.id);
+      reopen.innerHTML = folderIcon(glyph, label) || label;
+      reopen.addEventListener('click', function () {
+        bandManager.set(key, false);
+      });
+      restore.appendChild(reopen);
+      bandItems[key] = {wrap: wrap, content: content,
+        collapse: collapse, restore: reopen};
+    }
+    addBand('current', now, 'c:timer');
+    addBand('sequence', liveSequence, 'c:script');
+    addBand('sync', sync, 'c:waveform');
+    addBand('readiness', readiness, 'c:calendar');
+    top.appendChild(bands);
+    top.appendChild(restore);
+    right.appendChild(top);
+    bandManager = bandController(bands, restore, bandItems);
 
     var script = make('div', 'sp-script');
     script.id = 'spScript';

@@ -39,6 +39,10 @@ from starlette.background import BackgroundTask
 import httpx
 from station_flow import FlowJournal
 from script_report_store import ScriptReportStore, REPORT_NAME as SCRIPT_REPORT_NAME
+from sfx_cue import CueCandidate, choose_due_cue
+from sfx_reaction import COMPLAINT_LINES, complaint_due
+from news_dossier import fetch_service as fetch_news_dossier, public_url as news_public_url
+from line_blacklist import Blacklist
 from line_review import LineReviewStore, ReviewConflictError
 from rejection_lab import RejectionLabStore
 from rejection_lab_runtime import LabRuntime
@@ -15594,6 +15598,11 @@ def dialogue_row_viable(kind: str, row: Any) -> bool:
         if row.get("off_brief") and content_gate_enabled("segment_brief"):
             return False
         entry = dialogue_entry(row)
+        script = str((entry or row).get("script") or (entry or row).get("text") or "")
+        if script_has_forgotten_line(script,
+                str((entry or row).get("caller_name") or ""),
+                str((entry or row).get("caller2_name") or "")):
+            return False
         if entry is None and row.get("produced") and not dialogue_audio_ready(kind, row):
             # Ordinary single-read recording skips produced spots. A lost
             # produced file needs replacement, and must not reserve all new
@@ -20578,6 +20587,11 @@ def shelf_put(kind: str, row: dict[str, Any]) -> None:
     """Shelve one prepared item. The AUDIO is already in the pantry —
     this only writes down what was prepared and how to find it."""
     try:
+        entry = row.get("entry") if isinstance(row.get("entry"), dict) else row
+        if script_has_forgotten_line(str(entry.get("script") or entry.get("text") or ""),
+                                     str(entry.get("caller_name") or ""),
+                                     str(entry.get("caller2_name") or "")):
+            return
         row = dict(row)
         row.setdefault("at", time.time())
         row["kind"] = str(kind)
@@ -29556,6 +29570,7 @@ def page_picture_append(clip: dict[str, Any], at_ms: int = 0) -> dict[str, Any]:
         "id": str(clip.get("id") or ""),
         "video": True,
         "picture_only": True,
+        **({"silent_picture": True} if clip.get("silent_picture") else {}),
         "seconds": round(seconds, 2),
         # 2026-09-15 (#1173): the clip's own measured length, when the
         # caller knows it. `seconds` above may be a reserved slot that is
@@ -30187,7 +30202,8 @@ def said_rows() -> list[dict[str, Any]]:
 
 
 def said_texts(most: int = 400) -> list[str]:
-    return [r["t"] for r in said_rows()[-max(1, most):]]
+    return [r["t"] for r in said_rows()[-max(1, most):]
+            if not line_forgotten(r["t"])]
 
 
 def said_recent(window: float = 3600.0, most: int = 36,
@@ -30239,6 +30255,25 @@ def said_forget(text: str) -> None:
                 SAID_LINES_PATH.write_text(json.dumps(kept[-400:], indent=0))
             except OSError:
                 pass
+
+
+LINE_BLACKLIST = Blacklist(data_path("line_blacklist.json"))
+
+
+def line_forgotten(text: str) -> bool:
+    try:
+        return LINE_BLACKLIST.contains(str(text or ""))
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+def script_has_forgotten_line(script: str, caller_name: str = "",
+                              caller2_name: str = "") -> bool:
+    if not LINE_BLACKLIST.has_entries:
+        return False
+    turns = banter_turns(script, caller_name, caller2_name)
+    lines = [text for _, text in turns] if turns else str(script or "").splitlines()
+    return any(line_forgotten(text) for text in lines if text.strip())
 
 
 def overused_phrases(most: int = 16) -> list[str]:
@@ -33259,6 +33294,9 @@ async def _dj_speak_floorless(kind: str, track: dict[str, Any] | None = None,
     # holding the speaker. Six of those today and none before (#206).
     if not spoken or not re.search(r"[^\W_]", spoken):
         return ""
+    if line_forgotten(spoken):
+        pipeline_log("drop", "an operator-forgotten line was withheld before recording")
+        return ""
     _floor_stage(f"a {kind} line from {who} (written)")
     # Never say the same thing twice in a row (#494): the model sometimes
     # re-emits a line it just aired — especially when a round is seeded from
@@ -33313,6 +33351,9 @@ async def _dj_speak_floorless(kind: str, track: dict[str, Any] | None = None,
             pipeline_log("crystal", f"(#1063) a {kind or 'live'} line for "
                          f"{who} went out as written - the tint did not "
                          "pass its evaluator")
+    if line_forgotten(spoken):
+        pipeline_log("drop", "an operator-forgotten line was withheld after rewrite")
+        return ""
     # #901: THE WINDOW, on the road #752 left behind.
     #
     # #494's ring of ten above is the only repeat protection this road
@@ -39889,6 +39930,11 @@ async def larder_prepare(entry: dict[str, Any],
     still `made >= len(plan)`. Nothing about the round's own bookkeeping
     changes; it simply takes more than one visit."""
     _pkind = str(entry.get("prep_kind") or "banter")
+    if script_has_forgotten_line(str(entry.get("script") or ""),
+                                 str(entry.get("caller_name") or ""),
+                                 str(entry.get("caller2_name") or "")):
+        entry["forgotten_line"] = True
+        return False
     if entry.get("preparing") or entry.get("tinting"):
         return False
     if entry.get("prepared") and dialogue_row_ready(_pkind, entry):
@@ -39961,6 +40007,9 @@ async def larder_prepare(entry: dict[str, Any],
         turns = banter_turns(str(entry.get("script") or ""),
                              str(entry.get("caller_name") or ""),
                              str(entry.get("caller2_name") or ""))
+        if any(line_forgotten(text) for _, text in turns):
+            entry["forgotten_line"] = True
+            return False
         voices = dict(await session_voices())
         # #1005: AND THE CALLER'S OWN VOICE, off the banked round.
         #
@@ -74795,6 +74844,7 @@ def _vector_access_log(query: str, hit: dict[str, Any], ms: int,
         "ts": int(time.time()),
         "query": " ".join(str(query or "").split())[:90],
         "file": hit.get("file", ""),
+        "text": str(hit.get("text") or "")[:4000],
         "score": round(float(hit.get("score") or 0), 3),
         "ms": ms,
         "searched": n,
@@ -77762,7 +77812,7 @@ SFX_PEAK = 0.35                    # of full scale, by measurement not by ear
 # it up (the user's "SFX unable to be loud and obnoxious"). Bounded boost so
 # a quiet/noisy sample is not over-amplified.
 SFX_RMS = int(os.getenv("SFX_RMS", "3000"))
-SFX_MAX_BOOST = float(os.getenv("SFX_MAX_BOOST", "4.0"))
+SFX_MAX_BOOST = float(os.getenv("SFX_MAX_BOOST", "32.0"))
 SFX_LEVELLED = VOICE_MEDIA_DIR / "sfx"
 
 
@@ -78430,7 +78480,7 @@ def _level_voice(raw: bytes) -> bytes:
     return _wav_tail_pad(levelled, int(os.getenv("BOX_TAIL_MS", "900")))
 
 
-def _as_wav(path: Path) -> Path:
+def _as_wav(path: Path, *, timeout: float = 30.0) -> Path:
     """An mp3 turned into a wav we can measure, cached beside the levelled
     ones. The stdlib cannot decode an mp3 and the sample packs are full of
     them, so without this the loudest samples in the folder are exactly the
@@ -78450,7 +78500,7 @@ def _as_wav(path: Path) -> Path:
     try:
         subprocess.run([exe, "-nostdin", "-loglevel", "error", "-y",
                         "-i", str(path), "-ac", "1", "-ar", "22050",
-                        str(out)], check=True, timeout=30)
+                        str(out)], check=True, timeout=timeout)
     except Exception:
         out.unlink(missing_ok=True)
         return path
@@ -78825,7 +78875,7 @@ def sfx_levelled_name(path: Path, vol: float | None = None) -> Path | None:
         return None
     if vol is None:
         vol = box_gain()
-    return SFX_LEVELLED / f"{sfx_id(path)}-v2-v{int(round(vol * 20))}-{stamp}.wav"
+    return SFX_LEVELLED / f"{sfx_id(path)}-v3-v{int(round(vol * 20))}-{stamp}.wav"
 
 
 def sfx_levelled(path: Path) -> Path:
@@ -78835,8 +78885,8 @@ def sfx_levelled(path: Path) -> Path:
     sting to SFX_RMS (bounded boost) and then hard-caps the peak at SFX_PEAK,
     so nothing arrives louder than the DJ who set it up.
     ponytail: stdlib audioop, which goes away in Python 3.13. This image is
-    3.12; when it moves, these are an rms/peak scan and a multiply. The '-v2'
-    in the cache name invalidates clips levelled by the old peak-only rule."""
+    3.12; when it moves, these are an rms/peak scan and a multiply. The '-v3'
+    cache name invalidates clips capped at 4x before quiet media could be heard."""
     import audioop
     import wave
 
@@ -80132,11 +80182,8 @@ def _sfx_cadence_pick() -> Path | None:
              for root in (SFX_ROOT, SFX_LOCAL_ROOT)
              for folder in (settings.get("sfx_drop_folders") or [])]
     banned, weights = sfx_bans(), sfx_weights()
-    # #1263: AUDIO ONLY on this road. Cadence punctuation is WELDED into
-    # the round's own wav by the concat graph - there is no picture in a
-    # rendered round for a video clip to be seen in, and its soundtrack
-    # alone is not what the operator asked for. Video airs through
-    # dj_sting, which can open the set.
+    # This is the audio fallback pool. Video candidates come from the
+    # indexed clip book and carry a silent picture cue at their row offset.
     pool = [Path(p) for p in _SFX_POOL_CACHE
             if any(Path(p).is_relative_to(root) for root in roots)
             and sfx_id(Path(p)) not in banned
@@ -80164,7 +80211,7 @@ def _sfx_cadence_pick() -> Path | None:
     for _ in range(min(64, len(pool))):
         path = random.choices(pool, weights=[weights.get(sfx_id(p), 1.0) for p in pool], k=1)[0]
         pool.remove(path)
-        if path.is_file() and 0 < sfx_seconds(path) <= sfx_cap_seconds():
+        if path.is_file() and 0 < sfx_seconds(path) <= min(12.0, sfx_cap_seconds()):
             # Still written: other readers report what went out last. It is
             # simply no longer the thing that decides what may go out next.
             _SFX_CADENCE_STATUS["last_sample"] = str(path)
@@ -80180,6 +80227,37 @@ def _sfx_cadence_pick() -> Path | None:
                 if _RECENT_DIRTY[0] >= RECENT_SAVE_EVERY:
                     _recent_save()
             return path
+    return None
+
+
+def _sfx_cadence_video_pick(after: str) -> tuple[Path, Path, float, str] | None:
+    """A picture whose audio can join the broadcast; all share I/O is off-loop."""
+    candidates: list[tuple[Path, float, str]] = []
+    if sfx_match_on(False):
+        matched = sfx_match_sting_pick(after, want_video=True)
+        if matched:
+            path = Path(matched[0])
+            candidates.append((path, sfx_seconds(path), str(matched[1] or "")))
+    banned, weights = sfx_bans(), sfx_weights()
+    for _ in range(min(6, SFX_CADENCE_TRIES)):
+        row = sfx_db_pick_short_video(min(12.0, sfx_cap_seconds()))
+        if not row:
+            break
+        path, seconds = row
+        key = sfx_id(path)
+        if (key in banned or weights.get(key, 1.0) <= 0.05
+                or sting_recent(str(path)) or sfx_video_on_cooldown(key)):
+            continue
+        candidates.append((path, float(seconds), ""))
+    for path, seconds, why in candidates[:2]:
+        if not 0 < seconds <= min(12.0, sfx_cap_seconds()):
+            continue
+        source = _as_wav(path, timeout=4.0)
+        if source.suffix.lower() != ".wav" or not source.is_file() or sfx_is_silent(source):
+            continue
+        audio = sfx_levelled(source)
+        if audio.suffix.lower() == ".wav" and audio.is_file():
+            return path, audio, seconds, why
     return None
 
 
@@ -80213,15 +80291,9 @@ async def _sfx_cadence_additions_inner(who: str, text: str, completed: int,
 
     if sfx_due_after(completed, int(settings.get("sfx_every_units") or 0)):
         _SFX_CADENCE_STATUS["sample_due"] += 1
-        # #1185: the cadence is the OTHER road that welds a sound effect
-        # into the round's own wav, and #1263 made it audio-only on
-        # purpose - which is exactly what makes it a second track under
-        # the endless set. While the video is the singular SFX track it
-        # is not picked at all; `sample_omitted` below counts it as the
-        # omission it is, and _SFX_SOUNDBOARD counts WHY. The SFX guy's
-        # own half of this function - his voice, his take, his quip - is
-        # three lines down and is deliberately not touched: "Continue to
-        # have the SFX guy do dialogue."
+        # Endless-video mode owns the SFX lane when active. Otherwise the
+        # normal cadence may use indexed MP4 soundtracks in the welded round;
+        # its picture is timed separately and kept silent on every surface.
         # [#1389] A CLIP THAT DOES NOT FIT SHOULD COST A DRAW, NOT THE SLOT.
         #
         # "The SFX guy needs to be playing a clip every two lines of
@@ -80242,21 +80314,72 @@ async def _sfx_cadence_additions_inner(who: str, text: str, completed: int,
         # of the two reasons it was, because "nothing was drawn" and
         # "nothing drawn was short enough" want different cures.
         sample = None
+        audio = None
         duration = 0.0
+        why = ""
         _drew = 0
+        share = sfx_video_share() / 100.0
+        direction = choose_due_cue(
+            (CueCandidate("video", 1.0, True), CueCandidate("audio", 1.0, False)),
+            max_seconds=max(1.0, sfx_cap_seconds()), random_float=random.random,
+            pick=lambda keys: keys[0], video_share=share)
+        requested_video = bool(direction and direction.video)
         if not sfx_soundboard_hold_cadence():
-            for _try in range(SFX_CADENCE_TRIES):
-                _cand = await asyncio.to_thread(_sfx_cadence_pick)
-                if _cand is None:
-                    break
-                _drew += 1
-                _secs = sfx_seconds(_cand)
-                if fits(_secs):
-                    sample, duration = _cand, _secs
+            for want_video in (requested_video, not requested_video):
+                if want_video:
+                    got = await asyncio.to_thread(_sfx_cadence_video_pick, text)
+                    if got:
+                        _drew += 1
+                        candidate, candidate_audio, secs, candidate_why = got
+                        if fits(secs):
+                            sample, audio, duration, why = (candidate, candidate_audio,
+                                                            secs, candidate_why)
+                            break
+                    continue
+                if sfx_match_on(False):
+                    matched = await asyncio.to_thread(sfx_match_sting_pick, text, False)
+                    if matched:
+                        candidate = Path(matched[0])
+                        secs = await asyncio.to_thread(sfx_seconds, candidate)
+                        _drew += 1
+                        if not sfx_is_video(candidate) and fits(secs):
+                            levelled = await asyncio.to_thread(sfx_levelled, candidate)
+                            sample, audio, duration, why = (candidate, levelled,
+                                                            secs, str(matched[1] or ""))
+                            break
+                for _try in range(SFX_CADENCE_TRIES):
+                    candidate = await asyncio.to_thread(_sfx_cadence_pick)
+                    if candidate is None:
+                        break
+                    _drew += 1
+                    secs = await asyncio.to_thread(sfx_seconds, candidate)
+                    if fits(secs):
+                        levelled = await asyncio.to_thread(sfx_levelled, candidate)
+                        sample, audio, duration = candidate, levelled, secs
+                        break
+                if sample:
                     break
         if sample:
             additions.append({"path": str(sample), "who": "board", "text": "🔊 " + sample.stem,
                               "seconds": duration, "sfx_sample_id": sfx_id(sample)})
+            additions[-1]["path"] = str(audio or sample)
+            if sfx_is_video(sample):
+                additions[-1].update({"sfx_video_id": sfx_id(sample),
+                                      "sfx_video_seconds": duration,
+                                      "sfx_match_why": why})
+            if complaint_due():
+                other = "dj" if who == "cohost" else "cohost"
+                voice = configured_radio_voice(other)
+                if voice:
+                    phrase = random.choice(COMPLAINT_LINES)
+                    take = await voice_render_any(phrase, voice, who=other)
+                    if take and take.get("path"):
+                        length = await _clip_seconds_async(take["path"])
+                        if length > 0 and fits(length):
+                            additions.append({
+                                "path": str(VOICE_MEDIA_DIR / str(take["path"]).rsplit("/", 1)[-1]),
+                                "who": other, "text": phrase, "voice": voice,
+                                "seconds": length, "sfx_reaction_for": sfx_id(sample)})
         else:
             _SFX_CADENCE_STATUS["sample_omitted"] += 1
             _SFX_CADENCE_STATUS["omit_why"] = (
@@ -80482,8 +80605,29 @@ def _sfx_cadence_audible(rows, position: float, previous: float = 0.0) -> None:
                 sfx_note_play(str(row["sfx_sample_id"]), str(row.get("text") or "").removeprefix("🔊 "), "board")
             except Exception:
                 pass  # the durable cadence receipt is already saved
+        if str(row["id"]) in added and row.get("sfx_video_id"):
+            try:
+                sfx_video_note_played(str(row["sfx_video_id"]))
+            except Exception:
+                pass
         if str(row["id"]) in added and row.get("sfxguy_reservation"):
             sfxguy_ready_commit(str(row["sfxguy_reservation"]))
+
+
+def _sfx_cadence_pictures(rows, starts_at: float) -> None:
+    """Ring a silent picture at the audible board row's measured offset."""
+    for row in rows:
+        key = str(row.get("sfx_video_id") or "")
+        if not key:
+            continue
+        page_picture_append({
+            "url": "/sfx/%s?t=%s" % (key, media_sign(key)),
+            "id": key, "sting": str(row.get("text") or "SFX")[:120],
+            "seconds": float(row.get("sfx_video_seconds") or 0),
+            "length": float(row.get("sfx_video_seconds") or 0),
+            "silent_picture": True,
+            "why": str(row.get("sfx_match_why") or ""),
+        }, at_ms=int((starts_at + float(row.get("from") or 0)) * 1000))
 
 
 
@@ -81846,18 +81990,6 @@ def sting_due(after: str = "") -> Path | None:   # [#1251] the line it follows
     return Path(names) if names else None
 
 
-# How the booth feels about the sample that just went off (#292).
-STING_REACTIONS = (
-    "Ugh. Was that necessary?",
-    "Do we need to do that every single time?",
-    "I hate that button. I hate it.",
-    "That was inappropriate and you know it.",
-    "Every time. Every time with that thing.",
-    "Warn me before you hit that. Please.",
-    "Anyway. Moving on.",
-)
-
-
 async def _sting_react(who: str) -> None:
     """The OTHER presenter groans at the sample (#292), then the show
     carries on. by_hand so a groan is never busy-dropped mid-round; the
@@ -81865,7 +81997,7 @@ async def _sting_react(who: str) -> None:
     try:
         await asyncio.sleep(0.7)
         await dj_speak("reply", None,
-                       line=unrepeated(list(STING_REACTIONS), "sting-react"),
+                       line=unrepeated(list(COMPLAINT_LINES), "sting-react"),
                        who=who, by_hand=True)
     except Exception:
         pass
@@ -83491,7 +83623,7 @@ async def dj_sting(to_box: bool, after: str = "", who: str = "",
         except Exception:  # noqa: BLE001
             pass
     # Sometimes the other presenter has FEELINGS about the sample (#292).
-    if who in ("dj", "cohost", "third") and random.random() < 0.3:
+    if played_anywhere and who in ("dj", "cohost", "third") and complaint_due():
         other = "cohost" if who != "cohost" else "dj"
         asyncio.create_task(_sting_react(other))
     return sample.name
@@ -90283,6 +90415,61 @@ async def dj_callin(topic: str, caller: str = "") -> dict[str, Any]:
 DRUDGE_URL = os.getenv("DRUDGE_URL", "https://drudgereport.com")
 _DRUDGE_CACHE: dict[str, Any] = {"at": 0.0, "headlines": []}
 DRUDGE_TTL = 600.0                     # the front page churns; ten minutes
+NEWS_STORY_CHOICES_PATH = data_path("news_story_choices.json")
+_NEWS_STORY_CHOICES_LOCK = RLock()
+_NEWS_DOSSIERS: dict[str, dict[str, Any]] = {}
+
+
+def news_story_choice(slot_id: str) -> dict[str, Any]:
+    """A future occurrence's editorial selection, not a global news setting."""
+    with _NEWS_STORY_CHOICES_LOCK:
+        try:
+            rows = json.loads(NEWS_STORY_CHOICES_PATH.read_text("utf-8"))
+            row = rows.get(str(slot_id or ""), {}) if isinstance(rows, dict) else {}
+            return dict(row) if isinstance(row, dict) else {}
+        except (OSError, ValueError, TypeError):
+            return {}
+
+
+def news_story_choose(slot_id: str, story: dict[str, str]) -> dict[str, Any]:
+    url = news_public_url(str(story.get("url") or ""))
+    if not url or not slot_id:
+        raise ValueError("Choose a current public news story")
+    row = {"url": url, "title": str(story.get("title") or "")[:300],
+           "at": time.time()}
+    with _NEWS_STORY_CHOICES_LOCK:
+        try:
+            rows = json.loads(NEWS_STORY_CHOICES_PATH.read_text("utf-8"))
+            rows = rows if isinstance(rows, dict) else {}
+        except (OSError, ValueError, TypeError):
+            rows = {}
+        rows[str(slot_id)] = row
+        rows = {key: value for key, value in rows.items()
+                if time.time() - float(value.get("at") or 0) < 7 * 86400}
+        NEWS_STORY_CHOICES_PATH.parent.mkdir(parents=True, exist_ok=True)
+        temp = NEWS_STORY_CHOICES_PATH.with_suffix(".tmp")
+        temp.write_text(json.dumps(rows, ensure_ascii=False), "utf-8")
+        temp.replace(NEWS_STORY_CHOICES_PATH)
+    return row
+
+
+async def news_story_dossier(story: dict[str, str], *, budget: float = 12.0) -> dict[str, Any]:
+    url = news_public_url(str(story.get("url") or ""))
+    if not url:
+        return {"title": str(story.get("title") or ""), "url": "",
+                "availability": "unavailable", "excerpt": "", "article_text": ""}
+    hit = _NEWS_DOSSIERS.get(url)
+    if hit and time.time() - float(hit.get("_cached_at") or 0) < DRUDGE_TTL:
+        return dict(hit)
+    row = await fetch_news_dossier(url, title=str(story.get("title") or ""),
+                                   search=search_searxng, extract=newsread_extract,
+                                   budget_seconds=budget)
+    row["_cached_at"] = time.time()
+    _NEWS_DOSSIERS[url] = row
+    if len(_NEWS_DOSSIERS) > 100:
+        for old in sorted(_NEWS_DOSSIERS, key=lambda key: _NEWS_DOSSIERS[key].get("_cached_at", 0))[:30]:
+            _NEWS_DOSSIERS.pop(old, None)
+    return dict(row)
 
 # --- #921: EVERY STORY ON EVERY PAGE ---------------------------------
 #
@@ -90670,7 +90857,8 @@ async def drudge_story(url: str) -> str:
 async def _news_once(hourly: bool = False,
                      bank_to: list[dict[str, Any]] | None = None,
                      avoid: list[str] | None = None,
-                     more: int = 0) -> list[str]:
+                     more: int = 0,
+                     selected: dict[str, str] | None = None) -> list[str]:
     """ONE stretch of news — a bulletin, or one stretch of the segment.
 
     On the hour it is a bulletin — the lead plus a sample of the page; the
@@ -90770,7 +90958,10 @@ async def _news_once(hourly: bool = False,
     # #921: the WHOLE page now, because drudge_parse's own cap no longer
     # throws two thirds of it away before anybody looks at it.
     _page = await drudge_headlines(NEWS_PAGE_MOST)
-    if hourly:
+    if selected and news_public_url(str(selected.get("url") or "")):
+        picks = [{"title": str(selected.get("title") or "Selected news story"),
+                  "url": news_public_url(str(selected["url"]))}]
+    elif hourly:
         # The bulletin on the hour is untouched: the lead still leads it,
         # spread across the bands of the page, exactly as #248 built it.
         picks = news_selection(_page, True)
@@ -90784,17 +90975,31 @@ async def _news_once(hourly: bool = False,
     # Go INTO one or two of them: the actual article, boiled down, so the
     # desk conveys real information instead of a headline said twice.
     briefs = []
+    dossier_rows = []
     for story in picks[:2]:
-        body = await drudge_story(story.get("url", ""))
+        dossier = await news_story_dossier(story)
+        dossier_rows.append(dossier)
+        body = str(dossier.get("article_text") or dossier.get("excerpt") or "")[:6000]
         if body:
-            briefs.append(f"FULL STORY — {story['title']}:\n{body}")
+            briefs.append("SOURCE DOSSIER - %s\nPublisher: %s\nAvailable as: %s via %s\n"
+                          "Evidence: %s\n%s" % (
+                              story["title"], urlparse(story.get("url", "")).hostname or "unknown",
+                              dossier.get("availability") or "metadata",
+                              dossier.get("method") or "unknown",
+                              ", ".join(dossier.get("evidence_links") or [story.get("url", "")])[:700],
+                              body))
             try:                                            # #1036 (G1)
                 await asyncio.to_thread(
                     airlog_news_summary, str(story.get("url") or ""),
                     str(story.get("title") or ""), body)
             except Exception:  # noqa: BLE001
                 pass
-    dug = ("\n\n" + "\n\n".join(briefs)) if briefs else ""
+        else:
+            briefs.append("HEADLINE ONLY - %s (%s). No verified article detail is available; "
+                          "do not invent it." % (story["title"], story.get("url") or ""))
+    dug = ("\n\nUse only facts in these dossiers. An excerpt or metadata is not a full "
+           "article; distinguish questions and opinion from verified facts. Name the "
+           "publisher naturally on air.\n\n" + "\n\n".join(briefs)) if briefs else ""
     when = time.strftime("%I:%M %p", time.localtime()).lstrip("0")
     if hourly:
         angle = (
@@ -90883,7 +91088,11 @@ async def _news_once(hourly: bool = False,
                 bank_to[-1]["prep_news_titles"] = _titles
                 bank_to[-1]["prep_news_stories"] = [        # #1036 (G1)
                     {"title": str(h.get("title") or ""),
-                     "url": str(h.get("url") or "")} for h in picks]
+                     "url": str(h.get("url") or ""),
+                     "availability": str((dossier_rows[i] if i < len(dossier_rows) else {}).get("availability") or "metadata"),
+                     "method": str((dossier_rows[i] if i < len(dossier_rows) else {}).get("method") or "headline"),
+                     "excerpt": str((dossier_rows[i] if i < len(dossier_rows) else {}).get("excerpt") or "")[:1400]}
+                    for i, h in enumerate(picks)]
         except Exception:  # noqa: BLE001
             pass
     return _said
@@ -91388,7 +91597,8 @@ def _news_slot_left_old() -> float:
 async def dj_news(hourly: bool = False,
                   bank_to: list[dict[str, Any]] | None = None,
                   avoid: list[str] | None = None,
-                  shelf_only: bool = False) -> list[str]:
+                  shelf_only: bool = False,
+                  selected: dict[str, str] | None = None) -> list[str]:
     """THE NEWS SEGMENT — for as long as the segment lasts (#921).
 
     "I'm listening to this news segment and there is no news being
@@ -91422,7 +91632,7 @@ async def dj_news(hourly: bool = False,
     avoid = avoid if avoid is not None else []
     if shelf_only or (bank_to is None and talk_is_incessant()):
         return await _ready_shelf_air("news", _RADIO.get("now"))
-    said = await _news_once(hourly, bank_to, avoid)
+    said = await _news_once(hourly, bank_to, avoid, selected=selected)
     if bank_to is not None:
         return said                     # banking one, not airing a segment
     left = news_slot_left()
@@ -99550,6 +99760,10 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
     _round_entries: list[dict[str, Any]] = []
     ready_meta = (dict(ready_takes[0].get("round") or {}) if ready_takes
                   else dict(round_meta or {}))
+    if (any(line_forgotten(str(take.get("text") or "")) for take in (ready_takes or []))
+            or any(line_forgotten(text) for _, text in turns)):
+        pipeline_log("drop", "a round carrying an operator-forgotten line was withheld")
+        return []
     if ready_takes is None and not await _system2_repeat_rows_async(
             [{"text": spoken_text(text)} for _, text in turns], ready_meta):
         return []
@@ -100919,7 +101133,9 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                         },
                     }
                     _extra_fields = {k: v for k, v in _sfx_meta.get(_row, {}).items()
-                                     if k in ("voice", "sfx_sample_id", "sfxguy_reservation")}
+                                     if k in ("voice", "sfx_sample_id", "sfxguy_reservation",
+                                              "sfx_video_id", "sfx_video_seconds",
+                                              "sfx_match_why", "sfx_reaction_for")}
                     entry.update(_extra_fields)
                     # #1201: where this line sits in its script.
                     entry.update({"sid": _round_sid, "turn": int(_ti),
@@ -101279,6 +101495,8 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                         **({"ready_round": ready_meta}
                            if ready_takes is not None else {}),
                     })
+                    if page_delivery:
+                        _sfx_cadence_pictures(rows, _pstart)
                     if ready_takes is not None and page_delivery and callable(on_handoff):
                         on_handoff()
                     for _entry in _entries:
@@ -101298,6 +101516,8 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                     nonlocal _box_dispatched
                     _box_dispatched = True
                     _stream_now_set(rows, length)
+                    if not page_delivery:
+                        _sfx_cadence_pictures(rows, time.time())
                     playout_tell(                          # [#1218]
                         "dispatched", str(_round_occurrence or "")
                         or ("box:" + str(one.get("sig") or "")),
@@ -104894,6 +105114,10 @@ async def _banter_air(entry: dict[str, Any],
                       despite_repeats: bool = False) -> list[str]:
     """Put a written round on air — fresh from the model or off the larder
     shelf (#349), the airing is the same either way."""
+    if script_has_forgotten_line(str(entry.get("script") or ""),
+                                 str(entry.get("caller_name") or ""),
+                                 str(entry.get("caller2_name") or "")):
+        return []
     _scheduled_window = None
     if ready_takes is None and entry.get("prep_kind") and not entry.get("_ready_free"):
         _scheduled_window = (entry.get("_ready_slot")
@@ -123364,10 +123588,18 @@ async def dj_provenance_api(
             return
         row: dict[str, Any] = {"file": got, "how": how_found,
                                "quoted": bool(prompt and got in prompt)}
+        own_vector = row_data.get("vec") or {}
+        if (isinstance(own_vector, dict) and
+                str(own_vector.get("file") or "") == got and own_vector.get("text")):
+            row["text"] = str(own_vector["text"])[:4000]
+            row["passage_grade"] = "measured"
+            row["passage_how"] = "the passage bound to this line's vector draw"
         for one in swaths:
-            if str(one.get("file") or "") == got:
-                row["text"] = str(one.get("text") or "")
+            if str(one.get("file") or "") == got and not row.get("text"):
+                row["text"] = str(one.get("text") or "")[:4000]
                 row["lines"] = list(one.get("lines") or [])
+                row["passage_grade"] = "measured"
+                row["passage_how"] = "the exact swath retained by the booth"
                 break
         # [#1233] "quoted" was the FILE NAME in the prompt, which no round
         # ever writes; the passage itself is what a prompt can carry.
@@ -123379,6 +123611,7 @@ async def dj_provenance_api(
             pass
         documents.append(row)
 
+    row_data = row
     _doc(row.get("source"), "the swath this line was seeded from")
     _doc((row.get("vec") or {}).get("file"),
          "the vector index handed it to this line")
@@ -123386,6 +123619,13 @@ async def dj_provenance_api(
         _doc(one.get("file"), "a booth vector search around this line")
     for one in crystal:
         _doc(one.get("file"), "crystal material staged for the booth")
+    for document in documents:
+        if document.get("text"):
+            continue
+        excerpt = await asyncio.to_thread(speakbox_excerpt, document["file"], at)
+        document["text"] = str(excerpt.get("text") or "")
+        document["passage_grade"] = str(excerpt.get("grade") or "absent")
+        document["passage_how"] = str(excerpt.get("how") or "")
 
     entry: dict[str, Any] = {}
     try:
@@ -127226,6 +127466,98 @@ async def phrase_ban_api(
                             hours, carriers, killed)
 
 
+def line_forget_carriers() -> list[tuple[str, dict[str, Any]]]:
+    """Find unpublished stock containing an operator-forgotten whole turn."""
+    out: list[tuple[str, dict[str, Any]]] = []
+    for kind, rows in [("banter", list(_LARDER))] + [
+            (str(kind), list(rows or [])) for kind, rows in list(_SHELF.items())]:
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            entry = dialogue_entry(row) or row
+            if script_has_forgotten_line(
+                    str(entry.get("script") or entry.get("text") or ""),
+                    str(entry.get("caller_name") or ""),
+                    str(entry.get("caller2_name") or "")):
+                out.append((kind, row))
+    return out
+
+
+@app.post("/api/said/forget")
+async def api_said_forget(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Remove one whole dialogue line from future writing and playout."""
+    require_auth(authorization)
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="A dialogue line is required")
+    line_id = str(body.get("line_id") or "")[:160]
+    text = str(body.get("text") or "")[:4000].strip()
+    known = await asyncio.to_thread(line_row_of, line_id) if line_id else {}
+    if known and known.get("text"):
+        text = str(known["text"])
+    if not text:
+        raise HTTPException(status_code=400, detail="That dialogue line has no text")
+    try:
+        banned = await asyncio.to_thread(LINE_BLACKLIST.add, text, line_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    await asyncio.to_thread(said_forget, text)
+    carriers = await asyncio.to_thread(line_forget_carriers)
+    removed = {"larder": 0, "shelf": 0, "gold": 0, "prepared_feed": 0}
+    for kind, row in carriers:
+        if kind == "banter":
+            if row in _LARDER:
+                _LARDER.remove(row)
+                removed["larder"] += 1
+                try:
+                    _radio_entry_rejected(row, "operator_forgot_line")
+                except Exception:  # noqa: BLE001
+                    pass
+        else:
+            rows = _SHELF.get(kind) or []
+            if row in rows:
+                rows.remove(row)
+                removed["shelf"] += 1
+    gold = _gold_rows()
+    keep = [row for row in gold if not line_forgotten(str(row.get("text") or ""))]
+    removed["gold"] = len(gold) - len(keep)
+    if removed["gold"]:
+        gold[:] = keep
+        _gold_save()
+    if removed["larder"]:
+        _larder_save()
+    if removed["shelf"]:
+        await asyncio.to_thread(_pantry_save, True)
+    prepared = [row for row in (_RADIO.get("chat") or [])
+                if isinstance(row, dict) and str(row.get("aired") or "prepared") == "prepared"
+                and line_forgotten(str(row.get("text") or ""))]
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for row in prepared:
+        sid = str(row.get("sid") or row.get("id") or "")
+        groups[sid] = [other for other in (_RADIO.get("chat") or [])
+                       if isinstance(other, dict) and
+                       str(other.get("sid") or other.get("id") or "") == sid and
+                       str(other.get("aired") or "prepared") == "prepared"]
+    for rows in groups.values():
+        removed["prepared_feed"] += len(rows)
+        _burst_withdraw(rows, "operator permanently removed a dialogue line")
+    _INVENTORY_PLAN["at"] = 0.0
+    replanned = True
+    try:
+        await _system2().refresh(force=True, want_status=False)
+    except Exception as exc:  # noqa: BLE001
+        replanned = False
+        pipeline_log("system2", "a forgotten line will leave the next plan refresh: " + str(exc)[:160])
+    pipeline_log("drop", "operator forgot a whole dialogue line; future carriers withdrawn",
+                 extra=text[:240])
+    return {"ok": True, "line_id": line_id, "text": text, "ban": banned,
+            "removed": removed, "replanned": replanned,
+            "say": "This line is barred from future speech; an already playing take may finish."}
+
+
 @app.delete("/api/phrase/ban")                                 # [#1239]
 async def phrase_unban_api(
     q: str = "",
@@ -128120,7 +128452,8 @@ def speakbox_excerpt(file: str, near: float = 0.0) -> dict[str, Any]:
         for base in (SPEAKBOX_DIR,) if "SPEAKBOX_DIR" in globals() else ():
             try:
                 cand = Path(base) / name
-                if cand.is_file():
+                if (SPEAKBOX_NAME.fullmatch(name) and
+                        cand.resolve().parent == Path(base).resolve() and cand.is_file()):
                     found = cand
                     break
             except Exception:  # noqa: BLE001
@@ -128129,7 +128462,7 @@ def speakbox_excerpt(file: str, near: float = 0.0) -> dict[str, Any]:
         try:
             body = " ".join(Path(found).read_text(
                 encoding="utf-8", errors="replace").split())
-            return {"text": body[:600], "grade": "written",
+            return {"text": body[:600], "grade": "current",
                     "how": ("the opening of %s - the station has no record "
                             "of which passage this round was handed, so "
                             "this is the document, not the seed" % name)}
@@ -158901,6 +159234,28 @@ def sfx_db_pick_row(video: bool = True,
     return got
 
 
+def sfx_db_pick_short_video(max_seconds: float) -> tuple[Path, float] | None:
+    """Uniform indexed draw only from videos that can fit a spoken-line cue."""
+    try:
+        con = sfx_db_reader()
+        ceiling = max(0.5, min(12.0, float(max_seconds)))
+        where = "playable = 1 AND video = 1 AND seconds BETWEEN 0.5 AND ?"
+        args: tuple[Any, ...] = (ceiling,)
+        pin = sfx_pin_prefix()
+        if pin:
+            where += " AND path LIKE ?"
+            args += (pin.replace("%", "%%") + "%",)
+        count = int(con.execute("SELECT COUNT(*) FROM clips WHERE " + where,
+                                args).fetchone()[0] or 0)
+        if not count:
+            return None
+        row = con.execute("SELECT path, seconds FROM clips WHERE " + where +
+                          " LIMIT 1 OFFSET ?", args + (random.randrange(count),)).fetchone()
+        return (Path(str(row[0])), float(row[1])) if row else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def sfx_db_pick_rotation_row(video: bool = True) -> tuple[Path, float] | None:
     """One uniform random row from the unspent part of the video deck.
 
@@ -183629,6 +183984,87 @@ async def api_news_read(
     dashboard; the fetch and the disk both run off the event loop."""
     require_read_auth(authorization)
     return await newsread_get(url, refresh=bool(refresh))
+
+
+def _news_planned_slot(slot_id: str) -> dict[str, Any] | None:
+    runtime = _system2()
+    for hour in runtime._plans:
+        for slot in hour.get("slots") or []:
+            if slot.get("id") == slot_id and slot.get("kind") == "news":
+                return slot
+    return None
+
+
+@app.get("/api/news/options")
+async def api_news_options(
+    slot_id: str,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_read_auth(authorization)
+    await _system2().refresh(want_status=False)
+    slot = _news_planned_slot(slot_id)
+    if not slot or float(slot.get("deadline") or 0) <= time.time():
+        raise HTTPException(status_code=404, detail="Upcoming news slot not found")
+    headlines = await drudge_headlines(NEWS_PAGE_MOST)
+    selected = news_story_choice(slot_id)
+    picked = []
+    if selected.get("url"):
+        picked.append({"title": str(selected.get("title") or "Selected story"),
+                       "url": str(selected["url"])})
+    stride = max(1, len(headlines) // 12)
+    for index in range(0, len(headlines), stride):
+        story = headlines[index]
+        if story.get("url") and not any(row["url"] == story["url"] for row in picked):
+            picked.append(story)
+        if len(picked) >= 12:
+            break
+    if picked:
+        await asyncio.gather(*(news_story_dossier(story, budget=7.0)
+                               for story in picked[:4]), return_exceptions=True)
+    options = []
+    for story in picked:
+        url = news_public_url(str(story.get("url") or ""))
+        if not url:
+            continue
+        dossier = _NEWS_DOSSIERS.get(url) or {}
+        options.append({"title": str(story.get("title") or "")[:300], "url": url,
+                        "source": urlparse(url).hostname or "",
+                        "availability": dossier.get("availability") or "headline; dossier pending",
+                        "excerpt": str(dossier.get("excerpt") or "")[:1400]})
+    return {"slot_id": slot_id, "selected_url": str(selected.get("url") or ""),
+            "options": options}
+
+
+@app.post("/api/news/choice")
+async def api_news_choice(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_auth(authorization)
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="A news story choice is required")
+    slot_id = str(body.get("slot_id") or "")[:160]
+    url = news_public_url(str(body.get("url") or ""))
+    await _system2().refresh(want_status=False)
+    slot = _news_planned_slot(slot_id)
+    if not slot:
+        raise HTTPException(status_code=404, detail="Upcoming news slot not found")
+    if float(slot.get("start") or 0) - time.time() < 90:
+        raise HTTPException(status_code=409, detail="This news segment is too close to air for a new recording")
+    headlines = await drudge_headlines(NEWS_PAGE_MOST)
+    story = next((row for row in headlines if news_public_url(str(row.get("url") or "")) == url), None)
+    if not story:
+        raise HTTPException(status_code=400, detail="Choose a story from the current news feed")
+    row = news_story_choose(slot_id, story)
+    dossier = await news_story_dossier(story)
+    await _system2().refresh(force=True, want_status=False)
+    pipeline_log("news", "Story selected for %s: %s (%s)" % (
+        slot_id, row["title"], dossier.get("availability") or "metadata"))
+    return {"ok": True, "slot_id": slot_id, "selected_url": row["url"],
+            "dossier": {key: dossier.get(key) for key in
+                        ("title", "url", "source_url", "availability", "method",
+                         "excerpt", "evidence_links")}}
 
 
 @app.post("/api/paper/{edition_id}/snapshot")
@@ -215597,7 +216033,7 @@ function djTvShow(clip) {
     try {
       video.removeAttribute("data-pine-warm");
       video.removeAttribute("style");
-      video.muted = false;
+      video.muted = !!clip.silent_picture;
       video.volume = djTvVideoLevel();                     /* [#1216] */
     } catch (e) { /* it is still the picture */ }
     /* #1147's rule: the src goes first and the node second, or a clip
@@ -215657,6 +216093,7 @@ function djTvShow(clip) {
     /* No br=: that road is an AUDIO transcode (#1210). The signature in
      * the url is what gets it past the guard, so it is passed through
      * exactly as the station wrote it. */
+    video.muted = !!clip.silent_picture;
     video.src = clip.url;
     tube.appendChild(video);
     const glass = document.createElement("div");

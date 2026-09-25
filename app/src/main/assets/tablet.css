@@ -276,4 +276,9 @@
     overflow-y: auto;
     overscroll-behavior-y: contain;
   }
+
+  /* Keep the Script segment time clear of its sticky caution control. */
+  .sp-page .sp-el.sp-scene.sp-fold {
+    padding-left: 44px !important;
+  }
 }

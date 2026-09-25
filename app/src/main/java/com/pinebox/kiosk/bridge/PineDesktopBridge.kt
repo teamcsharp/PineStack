@@ -1564,6 +1564,22 @@ class PineDesktopBridge(
     @JavascriptInterface
     fun micLevel(): Double = mic.level.toDouble()
 
+    /** Synchronous, bounded snapshot; spectral analysis stays on the capture worker. */
+    @JavascriptInterface
+    fun micMetrics(): String {
+        val frame = mic.micMetrics()
+        return JSONObject()
+            .put("rms", frame.rms.toDouble())
+            .put("peak", frame.peak.toDouble())
+            .put("speech_probability", frame.speechProbability.toDouble())
+            .put("vad_state", frame.vadState)
+            .put("silence_elapsed_ms", frame.silenceElapsedMs)
+            .put("endpoint_timeout_ms", frame.endpointTimeoutMs)
+            .put("remaining_ms", frame.remainingMs)
+            .put("threshold", frame.threshold.toDouble())
+            .put("bands", JSONArray(frame.bands)).toString()
+    }
+
     /**
      * Stop the take, hand it to the station, return the words.
      *

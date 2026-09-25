@@ -176,6 +176,8 @@ test('the script topic window is singular and queues the scenario next', async (
   assert.equal(document.body.children.length, 1);
   const input = first.querySelector('.pseg-topic-in');
   const queue = first.querySelector('.pseg-next');
+  assert.equal(first.querySelector('.pseg-mic'), null,
+    'the shared focused-field microphone is the only dictation control');
   queue.fire('click');
   assert.equal(posts.length, 0, 'empty scenarios are not sent');
   input.value = 'the station manager is secretly in the studio';
@@ -199,13 +201,15 @@ test('the Script toolbar puts the scenario control between views and video', () 
   assert.ok(bar.indexOf('bar.appendChild(topic)') < bar.indexOf('bar.appendChild(reel)'));
 });
 
-test('the tablet scenario sheet mutes dictation and exposes saved topic actions', () => {
+test('the tablet scenario sheet uses shared dictation and exposes saved topic actions', () => {
   const src = fs.readFileSync(
     path.join(__dirname, '../desktop/renderer/pine-segments.js'), 'utf8');
-  assert.match(src, /PineDuck\.hold\('pseg-topic-dictation', 0, wrap\)/);
-  assert.match(src, /addEventListener\('pointerdown', dictationTap, true\)/);
-  assert.match(src, /dot\.finish\(\)/);
-  assert.match(src, /history: true, microphone: true/);
+  const talkDot = fs.readFileSync(
+    path.join(__dirname, '../desktop/renderer/talk-dot.js'), 'utf8');
+  assert.match(src, /history: true/);
+  assert.doesNotMatch(src, /pseg-mic|pseg-topic-dictation/);
+  assert.match(talkDot, /button\.className = 'pine-field-mic'/);
+  assert.match(talkDot, /querySelectorAll\('input, textarea, \[contenteditable="true"\]'\)/);
   assert.match(src, /'\/api\/dj\/topics\/' \+ encodeURIComponent\(saved\.id\)/);
   assert.match(src, /actOn\(saved, 'queue'/);
   assert.match(src, /actOn\(saved, 'drop'/);

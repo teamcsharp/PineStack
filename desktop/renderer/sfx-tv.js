@@ -2439,6 +2439,7 @@
     /* Held locally, because every handler and timer below can fire after
      * the module's own references have moved on. */
     var screen = video;
+    if (screen) screen.muted = !!clip.silent_picture;
     var glass = tube;
     var done = false;
     var finish = function () {
@@ -5232,7 +5233,7 @@
     /* [#1212] it was muted for the warm and nothing else; [#1216] the
        level is the one that is set NOW, not the one that was set when it
        was warmed, and it is written before the element has been heard. */
-    try { el.muted = false; levelSet(el, level, false); } catch (err) { /* it plays */ }
+    try { el.muted = !!clip.silent_picture; levelSet(el, level, false); } catch (err) { /* it plays */ }
     return el;
   }
 
@@ -6688,7 +6689,7 @@
       try { if (warm && warm.el) levelSet(warm.el, level, false); } catch (err) { /* gone */ }
       if (!video) return;
       var el = video;
-      if (level > 0 && el.muted) el.muted = false;
+      if (level > 0 && el.muted && !(playing && playing.silent_picture)) el.muted = false;
       levelRamp(el, level);                                /* [#1216] */
     },
     stop: function () {

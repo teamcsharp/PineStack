@@ -24,6 +24,9 @@ class SfxStreamCadenceTests(unittest.IsolatedAsyncioTestCase):
         self.sample = self.root / 'scratch.wav'
         self.sample.write_bytes(b'existing sample')
         self.patch('_sfx_cadence_pick', mock.Mock(return_value=self.sample))
+        self.patch('_sfx_cadence_video_pick', mock.Mock(return_value=None))
+        self.patch('sfx_levelled', mock.Mock(side_effect=lambda path: path))
+        self.patch('complaint_due', mock.Mock(return_value=False))
         self.patch('sfx_seconds', mock.Mock(return_value=1.0))
         self.patch('sfx_id', mock.Mock(return_value='scratch-id'))
         self.patch('sfx_note_play', mock.Mock())
@@ -78,6 +81,27 @@ class SfxStreamCadenceTests(unittest.IsolatedAsyncioTestCase):
         app._sfx_cadence_audible(rows, 14)  # the same complete hardware copy
         self.assertEqual(app._SFX_CADENCE.state()['heard_units'], 4)
         self.assertEqual(app.sfx_note_play.call_count, 2)
+        self.assertEqual(app.sfx_levelled.call_count, 2)
+
+    async def test_video_cadence_welds_levelled_audio_and_rings_silent_picture(self):
+        app.dj_settings.return_value['sfx_video_share'] = 100
+        video = self.root / 'sample.mp4'
+        levelled = self.root / 'levelled.wav'
+        video.write_bytes(b'picture')
+        levelled.write_bytes(b'levelled audio')
+        app._sfx_cadence_video_pick.return_value = (video, levelled, 2.0, 'matched line')
+        pictures = self.patch('page_picture_append', mock.Mock(return_value={}))
+        await self.play()
+        paths = app._call_concat_blocking.call_args.args[0]
+        self.assertEqual(sum(Path(path).name == 'levelled.wav' for path in paths), 2)
+        rows = self.radio['voice_clips'][0]['stream']['rows']
+        board = [row for row in rows if row['who'] == 'board']
+        self.assertEqual(len(board), 2)
+        self.assertTrue(all(row['sfx_video_id'] == 'scratch-id' for row in board))
+        self.assertEqual(pictures.call_count, 2)
+        for call in pictures.call_args_list:
+            self.assertTrue(call.args[0]['silent_picture'])
+            self.assertGreater(call.kwargs['at_ms'], 0)
 
     async def test_prepared_guy_keeps_own_voice_and_commits_only_audible_completion(self):
         take = self.bank_take()
@@ -178,7 +202,7 @@ class SfxStreamCadenceTests(unittest.IsolatedAsyncioTestCase):
     async def test_user_muted_box_consumes_handoff_without_audible_or_source_credit(self):
         self.bank_take()
         self.radio['voice_to'] = 'box'
-        async def box(path, sig):
+        async def box(path, sig, **kwargs):
             app._LAST_PLAYOUT.update(key=app._played_out_key(path), ok=True,
                                     intentional_mute=True, audible_gain=0.0)
             return 'accepted intentional silence'
@@ -196,7 +220,7 @@ class SfxStreamCadenceTests(unittest.IsolatedAsyncioTestCase):
     async def test_audible_page_counts_once_even_when_simultaneous_box_was_muted(self):
         self.bank_take()
         self.radio.update(voice_to='both', monitor=True)
-        async def box(path, sig):
+        async def box(path, sig, **kwargs):
             app._LAST_PLAYOUT.update(key=app._played_out_key(path), ok=True,
                                     intentional_mute=True, audible_gain=0.0)
             return 'accepted intentional silence'
