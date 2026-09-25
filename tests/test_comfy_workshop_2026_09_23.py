@@ -59,7 +59,14 @@ class WorkflowTests(unittest.TestCase):
         prompt = workshop.compose_prompt(
             "A calm close-up", "This is the line.", "video", "reference")
         self.assertIn("<Video 1>", prompt)
-        self.assertIn('says exactly: "This is the line."', prompt)
+        self.assertIn("<Audio 1>", prompt)
+        self.assertIn("<Subject 1> (S1)", prompt)
+        self.assertIn("<d>[English] This is the line.</d>", prompt)
+        self.assertIn("No other spoken words", prompt)
+
+    def test_explicit_duration_never_rounds_a_dialogue_down(self):
+        self.assertEqual(workshop.duration_frames(6, duration_mode="at_least"), 169)
+        self.assertEqual(workshop.duration_frames(10.1, duration_mode="at_least"), 289)
 
     def test_quoted_copy_becomes_exact_ad_speech(self):
         self.assertEqual(

@@ -8518,7 +8518,8 @@ async def _submit_generation(
     # bookkeeping fields above with arbitrary metadata.
     for key in ("mode", "source", "source_type", "speech", "purpose", "air_it",
                 "frames", "steps", "seed", "at_share", "variant_of",
-                "source_generation", "trim_in_s", "trim_out_s"):
+                "source_generation", "duration_mode", "duration_seconds",
+                "sequence_part", "sequence_parts", "trim_in_s", "trim_out_s"):
         if metadata and key in metadata:
             rec[key] = metadata[key]
     append_generation(rec)
@@ -8664,7 +8665,74 @@ def voice_ad_spoken_copy(goal: str) -> str:
     found = re.search(r"\b(?:saying|say|yelling|shouting|announcing|"
                       r"declaring|with(?:\s+the)?\s+(?:line|words?))\s+"
                       r"[\"']?(.+?)\s*$", str(goal or ""), re.I)
-    return (found.group(1).strip(" \"'.")[:800] if found else "")
+    if found:
+        return found.group(1).strip(" \"'.")[:800]
+    # Quoted wording in an ad request is normally the desired performance,
+    # even when the operator does not preface it with "say" or "yell".
+    return comfy_workshop.quoted_speech(goal)
+
+
+H3_MAX_DURATION_S = max(comfy_workshop.FRAME_CHOICES) / 24.0
+H3_MAX_REFERENCE_S = 15.0
+H3_AD_WORDS_PER_SECOND = 2.2
+
+
+def h3_ad_speech_seconds(speech: str) -> float:
+    """Budget natural speech plus a little room for the first and last beat."""
+    words = len(str(speech or "").split())
+    return (words / H3_AD_WORDS_PER_SECOND + 1.25) if words else 0.0
+
+
+def h3_ad_speech_parts(speech: str, count: int) -> list[str]:
+    """Split long exact copy across consecutive H3 clips without word loss."""
+    words = str(speech or "").split()
+    if not words:
+        return [""] * max(1, count)
+    count = max(1, min(int(count), len(words)))
+    size = math.ceil(len(words) / count)
+    return [" ".join(words[index:index + size])
+            for index in range(0, len(words), size)]
+
+
+def h3_ad_duration_plan(clip: dict[str, Any], speech: str) -> list[dict[str, Any]]:
+    """Return serial H3 parts that cover the reference and every spoken word.
+
+    H3 safely renders at most fifteen seconds per pass. Longer references or
+    spoken copy are deliberately split into adjacent stations clips rather
+    than shortening one of them. The queue is FIFO, so a plan's parts are
+    submitted in order before later ad requests.
+    """
+    try:
+        source_s = max(0.0, float(clip.get("seconds") or 0.0))
+    except (TypeError, ValueError):
+        source_s = 0.0
+    speech_s = h3_ad_speech_seconds(speech)
+    target_s = max(3.0, source_s, speech_s)
+    count = max(1, math.ceil(speech_s / H3_MAX_DURATION_S),
+                math.ceil(source_s / H3_MAX_REFERENCE_S))
+    speech_parts = h3_ad_speech_parts(speech, count)
+    # A short sequence can have fewer text parts than visual parts. Keep the
+    # remaining visual parts silent rather than repeating a line.
+    speech_parts += [""] * (count - len(speech_parts))
+    plan: list[dict[str, Any]] = []
+    for index in range(count):
+        remaining_s = max(0.0, target_s - index * H3_MAX_DURATION_S)
+        output_s = min(H3_MAX_DURATION_S, max(3.0, remaining_s,
+                                               h3_ad_speech_seconds(speech_parts[index])))
+        part: dict[str, Any] = {"duration_seconds": output_s,
+                                "speech": speech_parts[index],
+                                "part": index + 1, "parts": count}
+        # Full references under H3's maximum can be supplied unchanged. For
+        # longer sources each H3 pass gets its own contiguous reference window.
+        if source_s > H3_MAX_REFERENCE_S:
+            end = min(source_s, (index + 1) * H3_MAX_REFERENCE_S)
+            start = min(index * H3_MAX_REFERENCE_S, max(0.0, source_s - 2.2))
+            if end - start < 2.2:
+                start = max(0.0, end - 2.2)
+            part.update({"trim_in_s": start, "trim_out_s": end,
+                         "duration_seconds": max(output_s, end - start)})
+        plan.append(part)
+    return plan
 
 
 def voice_ad_person_clip(goal: str) -> dict[str, Any]:
@@ -8738,14 +8806,25 @@ async def voice_ad_render(
     # shortage into a lost listener request: the capacity keeper will make
     # room and this FIFO submits it as soon as the engine can accept it.
     deferred_reference = not bool(clip.get("id"))
-    queued = await asyncio.to_thread(_parody_stinger_queue().add, {
-        "mode": "reference", "source": str(clip.get("id") or ""),
-        # The SFX shelf can be rebuilding while a listener asks for an ad.
-        # Preserve the request and let the worker bind a qualified MP4 later.
-        "source_type": "deferred_dialogue_clip" if deferred_reference else "clip",
-        "at_share": random.random(), "prompt": direction, "speech": copy,
-        "purpose": "voice_ad", "duration_seconds": 6, "air_it": True,
-    })
+    plan = h3_ad_duration_plan(clip, copy)
+    jobs = []
+    for part in plan:
+        continuation = (" This is part %d of %d. Keep the performance continuous "
+                        "and say only the exact dialogue provided for this part."
+                        % (part["part"], part["parts"])) if part["parts"] > 1 else ""
+        jobs.append(await asyncio.to_thread(_parody_stinger_queue().add, {
+            "mode": "reference", "source": str(clip.get("id") or ""),
+            # The SFX shelf can be rebuilding while a listener asks for an ad.
+            # Preserve the request and let the worker bind a qualified MP4 later.
+            "source_type": "deferred_dialogue_clip" if deferred_reference else "clip",
+            "at_share": random.random(), "prompt": direction + continuation,
+            "speech": part["speech"], "purpose": "voice_ad",
+            "duration_seconds": part["duration_seconds"],
+            "duration_mode": "at_least", "air_it": True,
+            "sequence_part": part["part"], "sequence_parts": part["parts"],
+            **({"trim_in_s": part["trim_in_s"], "trim_out_s": part["trim_out_s"]}
+               if "trim_in_s" in part else {}),
+        }))
     _parody_stinger_wake.set()
     if _RADIO.get("on"):
         fire_and_forget(dj_ad(
@@ -8754,8 +8833,10 @@ async def voice_ad_render(
     # The command was completed when its durable record was made. Capacity
     # work remains internal; the gallery notification marks the finished film.
     return ("Request completed.",
-            {"clip": clip, "queue_id": str(queued.get("id") or ""),
-             "status": str(queued.get("status") or "queued"), "model": "h3"})
+            {"clip": clip, "queue_id": str(jobs[0].get("id") or ""),
+             "queue_ids": [str(job.get("id") or "") for job in jobs],
+             "parts": len(jobs),
+             "status": str(jobs[0].get("status") or "queued"), "model": "h3"})
 
 
 # --- Open WebUI passthrough ------------------------------------------------
@@ -122830,6 +122911,7 @@ async def dj_video_api(
     t: str = "",                                            # [#1244]
     lag: str = "",                                          # [#1244]
     authorization: str | None = Header(default=None),
+    hls: str = "",
 ) -> dict[str, Any]:
     """#1263: the stings that have a PICTURE, and nothing else.
 
@@ -122876,9 +122958,9 @@ async def dj_video_api(
             lag_ms = 0
         # An HLS lane starts at its own live edge; the MP3 join burst is
         # not in that audio and would hold the picture back by 30 seconds.
-        hls = str(request.query_params.get("hls") or "").lower()
+        hls_listener = str(hls or "").lower()
         late = {"videos": dj_video_late(server_ms, lag_ms),
-                "burst_s": 0.0 if hls in ("1", "true", "yes")
+                "burst_s": 0.0 if hls_listener in ("1", "true", "yes")
                 else dj_video_burst_s()}
     # 2026-09-14: "allow me to use endless video mode even if the station
     # is on pause ... endless video mode as a screensaver" while the rooms
@@ -149960,7 +150042,10 @@ async def station_stream_hls_segment(
         return Response(status_code=404)
     path = enc.dir / name
     try:
-        data = await asyncio.to_thread(path.read_bytes)
+        # HLS segments are small files in the local encoder spool. Do not
+        # queue them behind the station's shared worker pool: a busy render
+        # must never delay a moving listener's next segment.
+        data = path.read_bytes()
     except Exception:  # noqa: BLE001
         # A segment that has already rolled out of the window. Saying 404
         # is correct: the player asks for a newer one.
@@ -166852,6 +166937,10 @@ async def _comfy_workshop_render_payload(payload: dict[str, Any]) -> dict[str, A
                       "air_it": bool(payload.get("air_it")),
                       "frames": frame_count, "steps": step_count,
                       "seed": noise_seed, "at_share": at_share,
+                      "duration_mode": str(payload.get("duration_mode") or "auto"),
+                      "duration_seconds": round(frame_count / 24, 2),
+                      "sequence_part": payload.get("sequence_part"),
+                      "sequence_parts": payload.get("sequence_parts"),
                       "trim_in_s": trim_in_s if trim_requested else None,
                       "trim_out_s": trim_out_s if trim_requested else None})
     except RenderRefused as exc:

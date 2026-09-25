@@ -44,6 +44,20 @@ def test_hls_personal_mix_is_a_private_lane_without_a_join_burst(tmp_path):
     assert one is not other
     assert one.mix == (62, 100, 60)
     assert one.prime == []
+    assert station_stream.HLS_LIST_SIZE >= 15
+
+
+def test_tailnet_hls_delivery_avoids_render_pool_and_video_poll_has_hls_flag():
+    source = (ROOT / "app.py").read_text(encoding="utf-8")
+    assert "async def station_stream_hls_segment(" in source
+    segment = source[source.index("async def station_stream_hls_segment("):
+                     source.index('@app.get("/stream.m3u")')]
+    assert "data = path.read_bytes()" in segment
+    assert "await asyncio.to_thread(path.read_bytes)" not in segment
+    video = source[source.index("async def dj_video_api("):
+                   source.index('@app.post("/api/dj/voice/ack")')]
+    assert 'hls: str = ""' in video
+    assert "hls_listener" in video
 
 
 def test_listener_and_h3_paths_are_durable_and_visible():

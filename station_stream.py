@@ -134,12 +134,12 @@ CATCHUP_LIMIT = float(os.getenv("STREAM_CATCHUP_LIMIT", "60"))
 # this long is only ever the GIL, and the burst covers the lateness.
 STARVE_WAIT_MAX = float(os.getenv("STREAM_STARVE_WAIT", "0.25"))
 
-# HLS. Four-second segments with eight in the playlist gives a player about
-# half a minute of runway - the same read-ahead the mp3 burst buys, but
-# handed over as separate short requests, so a dropped connection costs one
-# segment rather than the broadcast.
+# HLS. Four-second segments with fifteen in the playlist leave a one-minute
+# recovery window on a mobile tailnet route. A dropped connection still costs
+# one small segment rather than the broadcast, while Safari can stay behind
+# the moving live edge through a tower handoff or a brief box stall.
 HLS_SEGMENT_SECONDS = float(os.getenv("STREAM_HLS_SEGMENT", "4"))
-HLS_LIST_SIZE = int(os.getenv("STREAM_HLS_LIST", "8"))
+HLS_LIST_SIZE = int(os.getenv("STREAM_HLS_LIST", "15"))
 HLS_ROOT = os.getenv("STREAM_HLS_DIR", "")
 
 

@@ -63,7 +63,7 @@ def clamp_frames(value: Any) -> int:
 def duration_frames(duration_s: Any = None, *, prompt: str = "",
                     speech: str = "", reference_s: float = 0.0,
                     duration_mode: str = "auto") -> int:
-    """Choose a short default, or follow explicit/contextual length up to 15s."""
+    """Choose a short default, or meet an explicit/contextual length up to 15s."""
     if duration_s is not None and duration_s != "":
         try:
             wanted = float(duration_s)
@@ -72,7 +72,7 @@ def duration_frames(duration_s: Any = None, *, prompt: str = "",
         except (TypeError, ValueError):
             raise ValueError("Duration must be between 3 and 15 seconds") from None
     elif reference_s > 0:
-        if duration_mode not in {"auto", "reference", "double"}:
+        if duration_mode not in {"auto", "reference", "double", "at_least"}:
             raise ValueError("Unknown duration mode")
         doubled = duration_mode == "double" or (duration_mode == "auto" and bool(
             re.search(r"\b(double|twice|2x|two times)\b", prompt, re.I)))
@@ -83,6 +83,13 @@ def duration_frames(duration_s: Any = None, *, prompt: str = "",
         if re.search(r"\b(longer|extended|ten seconds|fifteen seconds)\b", prompt, re.I):
             wanted = max(wanted, 10.0)
     wanted = max(3.0, min(15.0, wanted))
+    # A parody must never end before its reference window or exact dialogue.
+    # Explicit durations are a contract, so choose the first supported H3
+    # length at or above it rather than the mathematically nearest (shorter)
+    # frame count.
+    if duration_s is not None and duration_s != "" or duration_mode == "at_least":
+        return next((item for item in FRAME_CHOICES if item / 24.0 >= wanted),
+                    FRAME_CHOICES[-1])
     return min(FRAME_CHOICES, key=lambda item: abs(item / 24.0 - wanted))
 
 
@@ -138,11 +145,57 @@ def render_seed(value: Any = None) -> int:
 
 def compose_prompt(prompt: str, speech: str = "", media_kind: str = "",
                    mode: str = "text") -> str:
-    """Add explicit H3 reference tags and an optional spoken DJ line."""
-    clean = " ".join(str(prompt or "").split())[:1800]
-    said = " ".join(str(speech or "").split())[:800]
+    """Build H3's reference-aware prompt, including an exact dialogue contract."""
+    clean = " ".join(str(prompt or "").split())[:900]
+    # Dialogue markup is model syntax, not user-authored HTML.  Strip any
+    # accidental tags before placing the source line inside H3's <d> block.
+    said = re.sub(r"<[^>]+>", "", " ".join(str(speech or "").split()))[:700]
     kind = media_kind if media_kind in MEDIA_KINDS else ""
     use_mode = mode if mode in MODES else "text"
+
+    # MiniMax H3's full-reference format makes both sides of the source
+    # explicit: the picture is <Video 1>; its paired sound is <Audio 1>.
+    # It also needs a physical speaker id and <d>[language] text</d> for
+    # speech that must be performed rather than merely described.
+    if use_mode == "reference" and kind == "video":
+        visual = clean or "A concise Pine Box FM commercial performance"
+        if said:
+            # Do not leave a second free-form copy of the line in the visual
+            # direction: it competes with the exact-dialect dialogue block.
+            visual = visual.replace(said, "the scripted commercial line")
+            visual = visual.replace('"' + said + '"', "the scripted commercial line")
+            visual = visual.replace("'" + said + "'", "the scripted commercial line")
+            dialogue = (
+                "<Subject 1> (S1) says clearly, naturally, and exactly once: "
+                f"<d>[English] {said}</d>. Ensure the sentence completes before "
+                "the end of the clip. No other spoken words, voice-over, "
+                "background speech, lyrics, or competing vocal sounds.")
+            soundscape = ("Natural quiet room tone and subtle diegetic movement only. "
+                          "The target dialogue is the only intelligible speech.")
+        else:
+            dialogue = ("<Subject 1> (S1) performs the action naturally without any "
+                        "required spoken dialogue.")
+            soundscape = "Natural diegetic sound and quiet room tone only."
+        return "\n".join((
+            "subject_definitions:",
+            "<Subject 1> is the primary visible performer in <Video 1>.",
+            "<Audio 1>: reference - the paired soundtrack of <Video 1> provides "
+            "vocal timbre, cadence, and natural room texture for <Subject 1> (S1). "
+            "Do not reuse its source words.",
+            "", "summary:",
+            "Create one continuous polished Pine Box FM commercial performance that "
+            "retains the identity, camera language, and motion of <Video 1> while "
+            "producing new synchronized speech.",
+            "", "retention_analysis:",
+            "<Subject 1>: preserve the visible person's identity, facial features, "
+            "body language, and performance energy from <Video 1>.",
+            "<Video 1>: preserve its visual identity, camera movement, and temporal rhythm.",
+            "<Audio 1>: reference only for timbre, cadence, and room character; do not copy source words.",
+            "", "detailed_description:",
+            f"[Shot 1] {visual}. {dialogue}",
+            "", "overall_soundscape:", soundscape,
+            "", "non_diegetic_music:", "No background music.",
+        ))[:2600]
 
     lead = clean or "A concise cinematic station ident"
     if use_mode == "reference":
@@ -153,7 +206,7 @@ def compose_prompt(prompt: str, speech: str = "", media_kind: str = "",
         elif kind == "audio":
             lead = f"Use <Audio 1> as the sound reference. {lead}"
     if said:
-        lead += f' The presenter says exactly: "{said}"'
+        lead += f" The presenter says exactly once: <d>[English] {said}</d>."
     return lead[:2600]
 
 

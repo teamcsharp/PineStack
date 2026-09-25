@@ -87,6 +87,7 @@ def test_h3_duration_tracks_reference_or_requested_length():
     assert comfy_workshop.duration_frames(reference_s=4.9,
                                           duration_mode="double") == 241
     assert comfy_workshop.duration_frames(15) == 361
+    assert comfy_workshop.duration_frames(6, duration_mode="at_least") == 169
     with pytest.raises(ValueError):
         comfy_workshop.duration_frames(30)
     graph = comfy_workshop.build_workflow("extended", frames=361)
@@ -132,7 +133,7 @@ def test_h3_reference_extractor_uses_requested_in_out(tmp_path):
     assert not Path(command[-1]).exists()
 
 
-def test_parody_queue_persists_fifo_and_never_replays_uncertain_submit(tmp_path):
+def test_parody_queue_recovers_uncertain_submit_without_losing_fifo(tmp_path):
     path = tmp_path / "queue.sqlite3"
     queue = ParodyQueue(path)
     first = queue.add({"purpose": "parody_stinger", "prompt": "first", "frames": 73})
@@ -143,11 +144,13 @@ def test_parody_queue_persists_fifo_and_never_replays_uncertain_submit(tmp_path)
     assert queue.claim(first["id"])["prompt"] == "first"
     assert queue.claim(second["id"]) is None
     restarted = ParodyQueue(path)
-    assert restarted.get(first["id"])["status"] == "paused"
-    assert restarted.next()["id"] == second["id"]
-    assert restarted.claim(second["id"])["prompt"] == "second"
-    restarted.update(second["id"], "running", prompt_id="h3-ticket", model="MiniMax H3")
+    assert restarted.get(first["id"])["status"] == "queued"
+    assert restarted.next()["id"] == first["id"]
+    assert restarted.claim(first["id"])["prompt"] == "first"
+    restarted.update(first["id"], "running", prompt_id="h3-ticket", model="MiniMax H3")
     assert restarted.active()["prompt_id"] == "h3-ticket"
+    restarted.update(first["id"], "done")
+    assert restarted.claim(second["id"])["prompt"] == "second"
     restarted.update(second["id"], "done")
     assert ParodyQueue(path).get(second["id"])["status"] == "done"
 
@@ -178,11 +181,10 @@ def test_parody_post_acknowledges_durable_queue_without_admission():
 
 
 def test_parody_worker_waits_busy_or_low_memory_then_runs_fifo(tmp_path):
-    node = next(node for node in app_tree().body if isinstance(node, ast.AsyncFunctionDef)
-                and node.name == "_parody_stinger_step")
-    node = ast.AsyncFunctionDef(name=node.name, args=node.args, body=node.body,
-                                decorator_list=[], returns=node.returns,
-                                type_comment=None)
+    needed = {"_parody_retry_delay", "_parody_bind_deferred_reference",
+              "_parody_stinger_step"}
+    nodes = [node for node in app_tree().body if isinstance(
+        node, (ast.AsyncFunctionDef, ast.FunctionDef)) and node.name in needed]
     queue = ParodyQueue(tmp_path / "worker.sqlite3")
     first = queue.add({"prompt": "first"})
     second = queue.add({"prompt": "second"})
@@ -200,7 +202,7 @@ def test_parody_worker_waits_busy_or_low_memory_then_runs_fifo(tmp_path):
         state["sends"].append(body["prompt"])
         return {"prompt_id": "ticket-" + body["prompt"], "model": "MiniMax H3"}
 
-    namespace = {"ParodyQueue": ParodyQueue, "asyncio": asyncio, "time": time,
+    namespace = {"ParodyQueue": ParodyQueue, "Any": object, "asyncio": asyncio, "time": time,
                  "comfy_idle_live": live, "comfy_unload": unload,
                  "VIDEO_RENDER_FLOOR_GB": 60,
                  "render_admission": lambda kind: (state["free"] >= 60,
@@ -210,7 +212,7 @@ def test_parody_worker_waits_busy_or_low_memory_then_runs_fifo(tmp_path):
                      if state["lost"] else None,
                  "_comfy_workshop_render_payload": submit,
                  "HTTPException": type("HTTPException", (Exception,), {})}
-    exec(compile(ast.fix_missing_locations(ast.Module(body=[node], type_ignores=[])),
+    exec(compile(ast.fix_missing_locations(ast.Module(body=nodes, type_ignores=[])),
                  "app.py", "exec"), namespace)
     step = namespace["_parody_stinger_step"]
     delay, freed = asyncio.run(step(queue, ""))
@@ -230,8 +232,8 @@ def test_parody_worker_waits_busy_or_low_memory_then_runs_fifo(tmp_path):
     assert state["sends"] == ["first"]
     state["lost"] = True
     asyncio.run(step(queue, freed))
-    assert queue.get(first["id"])["status"] == "failed"
-    assert "review" in queue.get(first["id"])["reason"]
+    assert queue.get(first["id"])["status"] == "queued"
+    assert "retrying" in queue.get(first["id"])["reason"]
     asyncio.run(step(queue, freed))
     assert state["sends"] == ["first", "second"]
     assert queue.get(second["id"])["status"] == "running"

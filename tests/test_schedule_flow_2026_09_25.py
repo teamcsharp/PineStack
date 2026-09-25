@@ -84,6 +84,7 @@ def test_voice_ad_command_keeps_action_and_requested_copy():
 
     assert goal == "someone jumping up and down yelling welcome to the pine box"
     assert app.voice_ad_spoken_copy(goal) == "welcome to the pine box"
+    assert app.voice_ad_spoken_copy('a neon station ident "Welcome to Pine Box"') == "Welcome to Pine Box"
     assert app.voice_ad_goal("make an ad") == ""
 
 
