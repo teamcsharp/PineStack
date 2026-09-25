@@ -188965,12 +188965,12 @@ button.danger {
   width: 28px; min-width: 28px; min-height: 28px; margin: 0; padding: 0;
   border-radius: 4px; font-size: 0; }
 .lb-editor-command:before { color: #d8e2e9; font-size: 16px; line-height: 1; }
-.lb-editor-command[data-command=back]:before { content: "\\2190"; }
-.lb-editor-command[data-command=undo]:before { content: "\\21b6"; }
-.lb-editor-command[data-command=redo]:before { content: "\\21b7"; }
-.lb-editor-command[data-command=export]:before { content: "\\21e9"; }
+.lb-editor-command[data-command=back]:before { content: "\2190"; }
+.lb-editor-command[data-command=undo]:before { content: "\21b6"; }
+.lb-editor-command[data-command=redo]:before { content: "\21b7"; }
+.lb-editor-command[data-command=export]:before { content: "\21e9"; }
 .lb-editor-command[data-command=close] { margin-left: 5px; }
-.lb-editor-command[data-command=close]:before { content: "\\00d7"; font-size: 20px; }
+.lb-editor-command[data-command=close]:before { content: "\00d7"; font-size: 20px; }
 .lb-editor-frame { width: 100%; height: 100%; min-width: 0; min-height: 0;
   display: block; border: 0; background: #080d12; }
 @media (max-width: 720px) {

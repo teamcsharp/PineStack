@@ -214,6 +214,9 @@ test('parody Edit stays inside the station and reports splice exports', () => {
   assert.match(edit, /Spliced video saved/);
   assert.match(panel, /\.lb-editor-dialog[\s\S]*resize: both/);
   assert.match(panel, /\.lb-editor-command\[data-command=close\]:before/);
+  const backGlyph = panel.match(/lb-editor-command\[data-command=back\]:before \{ content: "(\\+2190)"; \}/);
+  assert.ok(backGlyph);
+  assert.equal(backGlyph[1].length, 5, 'the CSS icon escape reaches the browser once');
 });
 
 test('decorative gallery videos use still posters and full clips open in the player', () => {
