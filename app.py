@@ -50144,6 +50144,34 @@ def entry_road_ready(kind: str) -> bool:
         got = False
     _ENTRY_READY_MEMO[road] = (now, got)
     return got
+
+
+def scheduled_ready_claim(slot: dict[str, Any]) -> bool:
+    """A measured, unstarted System2 take can still own the current entry."""
+    if slot.get("engine") != "system2":
+        return False
+    kind = str(slot.get("kind") or "")
+    now = time.time()
+    for allocation in slot.get("allocations") or []:
+        candidate = allocation.get("candidate") or {}
+        lines = candidate.get("lines") or []
+        seconds = float(candidate.get("seconds") or 0)
+        if (allocation.get("state") != "ready" or not candidate.get("ready")
+                or not candidate.get("eligible") or candidate.get("blocked_reasons")
+                or not lines or seconds <= 0):
+            continue
+        duration = (seconds + max(0, len(lines) - 1) * max(CONCAT_BEAT)
+                    + max(0.0, float(os.getenv("BOX_TAIL_MS", "900"))) / 1000.0)
+        planned_start = float(allocation.get("planned_start") or 0)
+        expires = float(candidate.get("expires_at") or 0)
+        if expires and expires < max(now, planned_start) + duration:
+            continue
+        if _ready_round_fits(kind, lines, seconds=duration,
+                             start_at=planned_start):
+            return True
+    return False
+
+
 _CLOCK_HELD: dict[str, float] = {}      # kind -> when it first deferred
 CLOCK_HOLD_MOST = 900.0                 # never defer longer than this
 
@@ -50199,6 +50227,9 @@ def clock_may_air(kind: str) -> str:
             _CLOCK_HELD.pop(kind, None)
             return "no running order"      # nothing to obey
         on = str(slot.get("kind") or "")
+        if scheduled_ready_claim(slot):
+            _CLOCK_HELD.setdefault(kind, time.time())
+            return ""
         if quiet:
             # #1163: silence still outranks the sheet - but only when the
             # sheet has nothing to answer it with. While the entry on air
@@ -54051,6 +54082,7 @@ _PANTRY_ORDER_AT = [0.0]
 _PANTRY_ORDER_LAST: dict[str, Any] = {}
 _PANTRY_ORDER_RECORD_ACTIVE: set[str] = set()
 _PANTRY_ORDER_QUALITY_ACTIVE: set[str] = set()
+_DIRECTOR_REPAIR_ACTIVE: set[str] = set()
 
 
 def pantry_order_schedule_work() -> dict[str, Any]:
@@ -54512,6 +54544,244 @@ async def pantry_order_quality(job: str, order: dict[str, Any]) -> None:
         _PANTRY_ORDER_QUALITY_ACTIVE.discard(sid)
 
 
+def director_review_repair_target(exclude_roads: set[str] | None = None) -> dict[str, Any] | None:
+    """One future bound take whose only editorial faults can be repaired."""
+    runtime = _system2()
+    if not runtime.enabled:
+        return None
+    now = time.time()
+    for hour in runtime._plans:
+        for slot in hour.get("slots") or []:
+            if (float(slot.get("start") or 0) - now < 180
+                    or slot.get("kind") not in ("banter", "caller", "news", "gallery", "manager")
+                    or slot.get("kind") in (exclude_roads or set())):
+                continue
+            allocations = list(slot.get("allocations") or [])
+            for index, allocation in enumerate(allocations):
+                if allocation.get("state") != "ready":
+                    continue
+                candidate = allocation.get("candidate") or {}
+                sid = str(candidate.get("id") or "")
+                if not sid or sid in _DIRECTOR_REPAIR_ACTIVE or sid in _PANTRY_ORDER_QUALITY_ACTIVE:
+                    continue
+                topic = dialogue_topic_review(str(candidate.get("script") or ""),
+                                              str(slot.get("prompt") or ""))
+                review = _director_contract_review(candidate,
+                    banter_turns(str(candidate.get("script") or "")), topic)
+                failed = {name for name, passed in review["checks"].items() if not passed}
+                if not failed or not failed <= {"topic_continuity", "words_match_recording"}:
+                    continue
+                live = runtime._rows.get(sid)
+                if not live or live[0] != slot.get("kind") or not dialogue_row_ready(*live):
+                    continue
+                row = live[1]
+                repair = row.get("director_repair") or {}
+                if (repair.get("slot_id") == slot["id"]
+                        and repair.get("signature") == candidate.get("signature")
+                        and int(repair.get("attempts") or 0) >= 2
+                        and not isinstance(repair.get("draft"), dict)):
+                    continue
+                if (repair.get("slot_id") == slot["id"]
+                        and int(repair.get("promotion_failures") or 0) >= 3):
+                    continue
+                return {"slot_id": slot["id"], "hour_id": slot["hour_id"],
+                        "revision": slot["revision"], "signature": candidate["signature"],
+                        "candidate_id": sid, "road": live[0], "row": row,
+                        "prompt": str(slot.get("prompt") or ""),
+                        "seconds": float(candidate.get("seconds") or 0),
+                        "max_seconds": max(0.0, float(slot.get("deadline") or 0)
+                            - float(allocation.get("planned_start") or slot["start"])
+                            - sum(float(a.get("candidate", {}).get("seconds") or 0)
+                                  for a in allocations[index + 1:])),
+                        "failures": sorted(failed)}
+    return None
+
+
+def director_review_repair_valid(order: dict[str, Any]) -> bool:
+    """The old take must still own this unstarted slot while work proceeds."""
+    runtime = _system2()
+    hour = runtime.store.get_hour(str(order.get("hour_id") or ""))
+    slot = next((s for s in (hour or {}).get("slots") or []
+                 if s.get("id") == order.get("slot_id")), None)
+    if (not slot or slot.get("revision") != order.get("revision")
+            or float(slot.get("start") or 0) - time.time() < 90):
+        return False
+    live = runtime._rows.get(order.get("candidate_id"))
+    return (bool(live and live[0] == order.get("road")
+                 and live[1] is order.get("row")
+                 and dialogue_row_ready(live[0], live[1]))
+            and any(a.get("state") == "ready"
+                    and (a.get("candidate") or {}).get("id") == order.get("candidate_id")
+                    and (a.get("candidate") or {}).get("signature") == order.get("signature")
+                    for a in slot.get("allocations") or []))
+
+
+def director_review_repair_row(road: str, draft: dict[str, Any],
+                               slot_id: str) -> dict[str, Any]:
+    """A distinct shelf identity; the bound source and its takes remain intact."""
+    sid = "%s-%s" % (road[:12], uuid.uuid4().hex[:10])
+    draft["system2_slot"] = slot_id
+    draft["prep_kind"] = road
+    draft["at"] = time.time()
+    if road == "banter":
+        row = copy.deepcopy(draft)
+        row["sid"] = sid
+        return row
+    return {"sid": sid, "at": draft["at"], "entry": draft,
+            "seconds": float(draft.get("seconds") or 0)}
+
+
+def director_review_repair_contract(candidate: dict[str, Any],
+                                    order: dict[str, Any]) -> bool:
+    review = _director_contract_review(candidate,
+        banter_turns(str(candidate.get("script") or "")),
+        dialogue_topic_review(str(candidate.get("script") or ""), order["prompt"]))
+    seconds = float(candidate.get("seconds") or 0)
+    return bool(review["ok"] and candidate.get("slot_id") == order["slot_id"]
+                and order["seconds"] <= seconds <= order.get("max_seconds", 3600))
+
+
+async def director_review_repair(job: str, order: dict[str, Any]) -> None:
+    """Write and record beside a booked take; promote only proven coverage."""
+    road = str(order["road"])
+    sid = str(order["candidate_id"])
+    source_row = order["row"]
+    try:
+        if not await asyncio.to_thread(director_review_repair_valid, order):
+            alt_job_put(job, state="refused", why="future binding moved")
+            return
+        source = dialogue_entry(source_row)
+        if not isinstance(source, dict):
+            alt_job_put(job, state="refused", why="source script disappeared")
+            return
+        repair = source_row.get("director_repair")
+        if (not isinstance(repair, dict) or repair.get("slot_id") != order["slot_id"]
+                or repair.get("signature") != order["signature"]):
+            repair = {"slot_id": order["slot_id"], "signature": order["signature"],
+                      "attempts": 0}
+            source_row["director_repair"] = repair
+        draft = repair.get("draft")
+        if not isinstance(draft, dict):
+            if int(repair.get("attempts") or 0) >= 2 or not alt_window() or prep_should_stop():
+                alt_job_put(job, state="waiting", why="writing budget or window unavailable")
+                return
+            topic = _director_topic_from_prompt(order["prompt"])
+            old_turns = banter_turns(str(source.get("script") or ""))
+            word_goal = max(30, math.ceil(float(order["seconds"]) * WORDS_PER_MINUTE / 60 * 1.12))
+            context = str(source.get("script") or "")
+            if "topic_continuity" in order["failures"]:
+                context = ("VOICE AND SPEAKER REFERENCE ONLY; its story is off-topic. "
+                           "Do not carry that story into the rewrite.\n" + context[:1800])
+            prompt = (
+                "Rewrite this complete %s radio performance as new MARKER: speech lines. "
+                "It must stay on the scheduled subject from its opening through its close, "
+                "have at least %d substantial turns and at least %d spoken words, "
+                "and preserve the speaker markers and station voice. "
+                "Output only the complete MARKER: speech script.\n\n"
+                "SCHEDULED SUBJECT: %s\nSCHEDULE BRIEF: %s\nOLD PERFORMANCE: %s"
+                % (road, max(2, len(old_turns)), word_goal, topic or "the scheduled brief",
+                   order["prompt"][:2400], context[:7000]))
+            repair["attempts"] = int(repair.get("attempts") or 0) + 1
+            pantry_order_quality_save(road)
+            alt_job_put(job, state="writing", why="rewriting the future bound take")
+            said = str(await ask_model(prompt, limit=min(6500, max(1800, word_goal * 5)),
+                                       mark={"kind": "writers room",
+                                             "why": "bound editorial repair"}) or "")
+            turns = banter_turns(said, str(source.get("caller_name") or ""),
+                                 str(source.get("caller2_name") or ""))
+            words = sum(len(re.findall(r"[^\W_]+(?:'[^\W_]+)*", text)) for _, text in turns)
+            topical = dialogue_topic_review(said, order["prompt"])
+            if (len(turns) < max(2, len(old_turns)) or words < word_goal
+                    or topical.get("checked") and not topical.get("ok")):
+                alt_job_put(job, state="refused", why="the rewrite missed length or scheduled topic")
+                return
+            draft = copy.deepcopy(source)
+            for key in ("takes", "keys", "prepared", "preparing", "frozen", "made",
+                        "seconds", "chunks", "partial", "yielded", "yielded_at",
+                        "script_plain", "script_tinted", "production", "cue_map",
+                        "missing_voice_chunks", "tint", "tint_progress",
+                        "tint_revalidation", "tint_tried", "use", "brief_plain_ok",
+                        "review_cancel_pending", "prep_turns", "off_brief",
+                        "director_repair", "quality_draft", "quality_commit_id"):
+                draft.pop(key, None)
+            draft["script"] = "\n".join("%s: %s" % turn for turn in turns)
+            draft["freshened"] = True
+            draft["prep_kind"] = road
+            draft["system2_slot"] = order["slot_id"]
+            if road == "caller":
+                draft.setdefault("call", {})["topic"] = topic
+                grade = await asyncio.to_thread(call_entry_regrade, draft, False)
+                if not grade.get("machine_ok"):
+                    alt_job_put(job, state="refused", why="caller contract rejected the rewrite")
+                    return
+            repair["draft"] = draft
+            pantry_order_quality_save(road)
+        if not pantry_window() or prep_should_stop():
+            alt_job_put(job, state="waiting for recording", why="recording room is busy")
+            return
+        alt_job_put(job, state="recording", why="cutting a separate replacement")
+        _PREP_DEADLINE[0] = time.time() + max(20.0, prep_room_left())
+        try:
+            await larder_prepare(draft)
+        finally:
+            _PREP_DEADLINE[0] = 0.0
+            pantry_order_quality_save(road)
+        if road == "caller":
+            grade = await asyncio.to_thread(call_entry_regrade, draft, False)
+            if not grade.get("machine_ok"):
+                repair.pop("draft", None)
+                pantry_order_quality_save(road)
+                alt_job_put(job, state="refused", why="recorded caller failed its contract")
+                return
+        replacement = director_review_repair_row(road, draft, order["slot_id"])
+        if draft.get("off_brief") or draft.get("review_cancel_pending"):
+            repair.pop("draft", None)
+            pantry_order_quality_save(road)
+            alt_job_put(job, state="refused", why="replacement failed production review")
+            return
+        if not dialogue_row_ready(road, replacement):
+            alt_job_put(job, state="waiting for recording", why="replacement is not fully recorded")
+            return
+        runtime = _system2()
+        preview = await asyncio.to_thread(runtime.candidate, road, replacement)
+        if not director_review_repair_contract(preview, order):
+            runtime._rows.pop(replacement["sid"], None)
+            repair.pop("draft", None)
+            pantry_order_quality_save(road)
+            alt_job_put(job, state="refused", why="recorded replacement missed topic, proof or airtime")
+            return
+        if not await asyncio.to_thread(director_review_repair_valid, order):
+            runtime._rows.pop(replacement["sid"], None)
+            alt_job_put(job, state="refused", why="future binding moved before promotion")
+            return
+        shelf = _LARDER if road == "banter" else _SHELF.setdefault(road, [])
+        def publish() -> None:
+            shelf.append(replacement)
+            pantry_order_quality_save(road)
+        def withdraw() -> None:
+            if replacement in shelf:
+                shelf.remove(replacement)
+                pantry_order_quality_save(road)
+        def validate(candidate: dict[str, Any]) -> bool:
+            return director_review_repair_contract(candidate, order)
+        try:
+            await runtime.replace_future_allocation(
+                order["slot_id"], sid, order["signature"], order["revision"],
+                road, replacement, publish, withdraw, validate)
+        except Exception:
+            repair["promotion_failures"] = int(repair.get("promotion_failures") or 0) + 1
+            pantry_order_quality_save(road)
+            raise
+        source_row.pop("director_repair", None)
+        pantry_order_quality_save(road)
+        alt_job_put(job, state="done", made=1, new=[replacement["sid"]],
+                    why="future allocation promoted after recorded editorial review")
+    except Exception as exc:  # noqa: BLE001
+        alt_job_put(job, state="failed", why="%s: %s" % (type(exc).__name__, str(exc)[:180]))
+    finally:
+        _DIRECTOR_REPAIR_ACTIVE.discard(sid)
+
+
 def pantry_orders_state() -> dict[str, Any]:
     """#1187: everything the orders desk knows, for the glass.
 
@@ -54610,6 +54880,7 @@ async def pantry_orders_tick() -> dict[str, Any]:
         order["placed"] = 0
         order["recording_dispatched"] = 0
         order["quality_dispatched"] = 0
+        order["editorial_dispatched"] = 0
         order["schedule_handoff"] = handoff
         out = order
         if mode != track_talk_segment.MODE_AIR:
@@ -54657,6 +54928,28 @@ async def pantry_orders_tick() -> dict[str, Any]:
         except Exception:  # noqa: BLE001
             window = ""
         order["window"] = window
+        if live < ALT_GEN_LIVE:
+            editorial = await asyncio.to_thread(director_review_repair_target, active_roads)
+            if editorial:
+                sid = editorial["candidate_id"]
+                job = "edr" + uuid.uuid4().hex[:9]
+                _DIRECTOR_REPAIR_ACTIVE.add(sid)
+                alt_job_put(job, kind=editorial["road"], count=1, state="queued",
+                            made=0, source=sid, slot_id=editorial["slot_id"],
+                            ordered="recorded editorial repair",
+                            why=",".join(editorial["failures"]))
+                try:
+                    fire_and_forget(director_review_repair(job, editorial))
+                except Exception:  # noqa: BLE001
+                    _DIRECTOR_REPAIR_ACTIVE.discard(sid)
+                    alt_job_put(job, state="failed", why="editorial ticket could not start")
+                else:
+                    live += 1
+                    active_roads.add(editorial["road"])
+                    order["editorial_dispatched"] = 1
+                    order["editorial_repair"] = {"slot_id": editorial["slot_id"],
+                                                 "candidate_id": sid, "job": job,
+                                                 "failures": editorial["failures"]}
         for repair in (handoff.get("quality") or []):
             road = str(repair.get("road") or "")
             sid = str(repair.get("sid") or "")
@@ -54747,7 +55040,7 @@ async def pantry_orders_tick() -> dict[str, Any]:
             order["placed"] = int(order.get("placed") or 0) + 1
         _PANTRY_ORDER_LAST.clear()
         _PANTRY_ORDER_LAST.update(order)
-        if order.get("placed") or order.get("quality_dispatched"):
+        if order.get("placed") or order.get("quality_dispatched") or order.get("editorial_dispatched"):
             note_action("the orchestrator commissioned the pantry - "
                         + str(order.get("say") or "")[:200])
         pipeline_log(
@@ -55543,6 +55836,13 @@ async def _torrent_talk() -> None:
                 # burned unheard). Back to the top, where the paused
                 # branch sleeps.
                 continue
+            # A slot may become ready, or the hour may advance, during the
+            # breath. Give the director its new occurrence before any legacy
+            # draw or switchboard choice takes a place on the floor.
+            if globals().get("_system2") and _system2().enabled:
+                served = await _system2().dispatch()
+                if served or not _system2().fallback_due():
+                    continue
             # Never two rounds at once: the per-record intro is its own
             # task and this must not talk over it. But it does NOT wait
             # for ever (#705) — an intro whose announce is stuck behind a
@@ -86470,7 +86770,8 @@ def _ready_runway_no(kind: str) -> str:                               # [#1281]
 def _ready_round_fits(kind: str, takes: list[dict[str, Any]],
                       window: dict[str, Any] | None = None, *,
                       seconds: float | None = None,
-                      start_at: float | None = None) -> bool:
+                      start_at: float | None = None,
+                      exclude_key: str = "") -> bool:
     """Keep the complete saved performance inside its reserved occurrence."""
     import math
 
@@ -86507,7 +86808,7 @@ def _ready_round_fits(kind: str, takes: list[dict[str, Any]],
                          + max(0.0, float(os.getenv("BOX_TAIL_MS", "900"))) / 1000.0)
         else:
             duration = float(seconds)
-        if not takes or not math.isfinite(duration) or duration <= 0:
+        if (seconds is None and not takes) or not math.isfinite(duration) or duration <= 0:
             return False
         # Five seconds for assembly before it has happened; an actual joined
         # stream pays only its measured length and a final publication margin.
@@ -86527,17 +86828,13 @@ def _ready_round_fits(kind: str, takes: list[dict[str, Any]],
             # appended to the feed as `prepared`, and refused when its
             # entry has closed underneath it. 1,592 such rows in 48 h.
             #
-            # ONLY on the pre-render call. Every hand-off caller passes
-            # `seconds` - its measured joined length - and has already had
-            # its own reservation excluded by _pstart's exclude_key;
-            # charging it again here would refuse a round standing at the
-            # door with its clip welded. In `off` and `shadow`
-            # playout_floor() is 0.0 and this changes nothing.
-            if seconds is None:
-                try:
-                    begins = max(begins, float(playout_floor() or 0.0))
-                except Exception:  # noqa: BLE001
-                    pass
+            # A measured-length preflight has not reserved its own place
+            # yet. At handoff, exclude that round's hold to avoid charging
+            # it for its own wait.
+            try:
+                begins = max(begins, float(playout_floor(exclude_key=exclude_key) or 0.0))
+            except Exception:  # noqa: BLE001
+                pass
         if start_at is not None:
             begins = max(begins, float(start_at))
         # #1166: a finished segment may run past the fold rather than not
@@ -86549,6 +86846,19 @@ def _ready_round_fits(kind: str, takes: list[dict[str, Any]],
                 and begins + duration + 1.0 <= deadline + grace)
     except (TypeError, ValueError, OSError):
         return False
+
+
+def _scheduled_first_handoff_fits(meta: dict[str, Any],
+                                  takes: list[dict[str, Any]] | None,
+                                  seconds: float, *, start_at: float | None = None,
+                                  exclude_key: str = "") -> bool:
+    """Check the first handoff even when a saved round renders turns live."""
+    kind = str(meta.get("prep_kind") or "")
+    if meta.get("_ready_free") or (takes is None and not kind):
+        return True
+    return _ready_round_fits(kind, takes or [], meta.get("_ready_slot"),
+                             seconds=seconds, start_at=start_at,
+                             exclude_key=exclude_key)
 
 
 def unheard_free(kind: str, row: Any) -> bool:
@@ -100940,12 +101250,11 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                     # may refuse a round that has not begun; it may not
                     # abandon a conversation the listener is already hearing -
                     # that is a caller cut off mid-sentence with no sign-off.
-                    if (not played_any) and ready_takes is not None and (
+                    if (not played_any) and (ready_takes is not None or ready_meta.get("prep_kind")) and (
                             radio_paused() or not _RADIO.get("on")
-                            or (not ready_meta.get("_ready_free")   # 2026-09-14: the free road
-                                                                and not _ready_round_fits(str(ready_meta.get("prep_kind") or ""),
-                                ready_takes, ready_meta.get("_ready_slot"),
-                                seconds=length, start_at=_pstart))
+                            or not _scheduled_first_handoff_fits(
+                                ready_meta, ready_takes, length,
+                                start_at=_pstart, exclude_key=_pl_key)
                             or (callable(can_handoff) and not can_handoff())):
                         _burst_withdraw(_entries, _burst_refusal_why(ready_meta, length, _pstart, can_handoff))   # 2026-09-14
                         _sfx_cadence_release(_sfx_meta.values())
@@ -101017,11 +101326,12 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                         _burst_withdraw(_entries, "System2 counts these lines as already aired - a repeat")   # 2026-09-14
                         _sfx_cadence_release(_sfx_meta.values())
                         return []
-                    if (not played_any and ready_takes is not None and not page_delivery
+                    if (not played_any and not page_delivery
+                            and (ready_takes is not None or ready_meta.get("prep_kind"))
                             and (radio_paused() or not _RADIO.get("on")
-                                 or (not ready_meta.get("_ready_free")   # 2026-09-14: the free road
-                                                                and not _ready_round_fits(str(ready_meta.get("prep_kind") or ""),
-                                     ready_takes, ready_meta.get("_ready_slot"), seconds=length))
+                                 or not _scheduled_first_handoff_fits(
+                                     ready_meta, ready_takes, length,
+                                     exclude_key=_pl_key)
                                   or (callable(can_handoff) and not can_handoff()))):
                         _burst_withdraw(_entries, _burst_refusal_why(ready_meta, length, None, can_handoff))   # 2026-09-14
                         _sfx_cadence_release(_sfx_meta.values())
@@ -104584,6 +104894,10 @@ async def _banter_air(entry: dict[str, Any],
                       despite_repeats: bool = False) -> list[str]:
     """Put a written round on air — fresh from the model or off the larder
     shelf (#349), the airing is the same either way."""
+    _scheduled_window = None
+    if ready_takes is None and entry.get("prep_kind") and not entry.get("_ready_free"):
+        _scheduled_window = (entry.get("_ready_slot")
+                             or _ready_slot_window(str(entry["prep_kind"])))
     if not await _system2_repeat_rows_async(ready_takes if ready_takes is not None else
             [{"text": text} for _, text in banter_turns(str(entry.get("script") or ""),
                 str(entry.get("caller_name") or ""), str(entry.get("caller2_name") or ""))], entry):
@@ -104829,7 +105143,8 @@ async def _banter_air(entry: dict[str, Any],
                                tint_report=dict(entry.get("tint") or {}),
                                 ready_takes=ready_takes, on_handoff=on_handoff,
                                 can_handoff=can_handoff,
-                                round_meta=entry)
+                                round_meta=({**entry, "_ready_slot": _scheduled_window}
+                                            if _scheduled_window else entry))
     # #1050 (P1): the round's paperwork, written down before the entry is
     # dropped. The swaths, the tint with both scripts, the writing desk and
     # the line ids - everything the screenplay's provenance tree shows, and

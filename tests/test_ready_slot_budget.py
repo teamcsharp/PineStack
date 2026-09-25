@@ -6,6 +6,8 @@ from unittest import mock
 
 import app
 
+REAL_BANTER_AIR = app._banter_air
+
 
 class ReadySlotBudgetTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
@@ -35,6 +37,7 @@ class ReadySlotBudgetTests(unittest.IsolatedAsyncioTestCase):
             "SHELF_REUSABLE": set(), "alt_took": self.took, "_pantry_save": self.save,
             "_INVENTORY_PLAN": {}, "_COMMITS": {}, "_PREPARED_KIND_MEMO": {},
             "VOICE_BROADCAST_LEAD_MS": 1000, "page_carries_live": mock.Mock(return_value=True),
+            "playout_floor": mock.Mock(return_value=0.0),
             # These tests pin the strict occurrence arithmetic. Overrun grace
             # is covered separately and would deliberately change the answer.
             "SEGMENT_OVERRUN_MOST": 0.0,
@@ -85,6 +88,49 @@ class ReadySlotBudgetTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(app._ready_round_fits("gallery", takes, window, seconds=85.0))
         self.radio["sched_slot"]["minutes"] = 2
         self.assertFalse(app._ready_round_fits("gallery", takes, window, seconds=85.0))
+
+    def test_measured_fit_charges_sold_playout_floor_but_excludes_own_hold(self):
+        window = app._ready_slot_window("gallery")
+        takes = self.rows[1]["entry"]["takes"]
+        app.playout_floor.side_effect = lambda exclude_key="": 1050.0 if exclude_key == "own" else 1100.0
+        self.assertFalse(app._ready_round_fits("gallery", takes, window, seconds=85.0))
+        self.assertTrue(app._ready_round_fits("gallery", takes, window,
+                                               seconds=85.0, exclude_key="own"))
+
+    def test_legacy_first_handoff_rejects_next_occurrence_without_ready_takes(self):
+        window = app._ready_slot_window("gallery")
+        meta = {"prep_kind": "gallery", "_ready_slot": window}
+        self.assertTrue(app._scheduled_first_handoff_fits(meta, None, 85.0))
+        self.radio["sched_pos"].update(occurrence="next-gallery", started=1020.0)
+        self.assertFalse(app._scheduled_first_handoff_fits(meta, None, 85.0))
+
+    def test_legacy_caller_cannot_first_handoff_during_gallery(self):
+        self.radio["sched_pos"].update(slot_id="caller-slot", occurrence="caller-one")
+        self.radio["sched_slot"].update(id="caller-slot", kind="caller")
+        meta = {"prep_kind": "caller", "_ready_slot": app._ready_slot_window("caller")}
+        self.radio["sched_pos"].update(slot_id="gallery-slot", occurrence="gallery-two")
+        self.radio["sched_slot"].update(id="gallery-slot", kind="gallery")
+        self.assertFalse(app._scheduled_first_handoff_fits(meta, None, 8.0))
+        self.assertFalse(app._scheduled_first_handoff_fits(
+            {"prep_kind": "caller", "_ready_slot": app._ready_slot_window("caller")}, None, 8.0))
+
+    async def test_legacy_air_pins_occurrence_before_rendering(self):
+        window = app._ready_slot_window("gallery")
+        entry = {"script": "A: Saved words.", "prep_kind": "gallery", "lines": 1,
+                 "frozen": True}
+        sentinel = RuntimeError("stop at rendering")
+        with mock.patch.object(app, "_system2_repeat_rows_async", new_callable=mock.AsyncMock,
+                               return_value=True), \
+             mock.patch.object(app, "dialogue_audio_ready", return_value=True), \
+             mock.patch.object(app, "_script_repeats", return_value=[]), \
+             mock.patch.object(app, "screenplay_round_open", return_value={}), \
+             mock.patch.object(app, "airlog_round_hint"), \
+             mock.patch.object(app, "weather_apply"), \
+             mock.patch.object(app, "speak_turns", new_callable=mock.AsyncMock,
+                               side_effect=sentinel) as speak:
+            with self.assertRaises(RuntimeError):
+                await REAL_BANTER_AIR(entry, None)
+        self.assertEqual(speak.call_args.kwargs["round_meta"]["_ready_slot"], window)
 
     def test_no_running_schedule_is_unrestricted_and_other_road_defers(self):
         oversized = self.rows[0]["entry"]["takes"]

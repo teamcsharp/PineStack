@@ -16,6 +16,7 @@ class PantryOrderHandoffTests(unittest.IsolatedAsyncioTestCase):
                             ("_PANTRY_ORDER_LAST", {}),
                             ("_PANTRY_ORDER_RECORD_ACTIVE", set()),
                             ("_PANTRY_ORDER_QUALITY_ACTIVE", set()),
+                            ("_DIRECTOR_REPAIR_ACTIVE", set()),
                             ("_ALT_JOBS", {})):
             self.stack.enter_context(mock.patch.object(app, name, value))
         for name in ("orch_used", "orch_turn", "pipeline_log", "note_action"):
@@ -243,6 +244,34 @@ class PantryOrderHandoffTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["quality_dispatched"], 1)
         self.assertEqual(result["placed"], 0)
         quality.assert_awaited_once()
+
+    async def test_bound_editorial_repair_preempts_generic_quality_ticket(self):
+        repair = {"road": "gallery", "sid": "g-1", "item_id": "g-1",
+                  "commit_id": "slot@123", "why": "structure"}
+        editorial = {"road": "banter", "candidate_id": "b-1",
+                     "slot_id": "hour:banter", "failures": ["topic_continuity"]}
+        with (mock.patch.object(app, "pantry_orders_mode", return_value="air"),
+              mock.patch.object(app, "pantry_order_schedule_work",
+                                return_value={"write": [], "record": [],
+                                              "quality": [repair]}),
+              mock.patch.object(app, "coord_work_order",
+                                return_value={"orders": [], "say": "repair"}),
+              mock.patch.object(app, "director_review_repair_target",
+                                return_value=editorial),
+              mock.patch.object(app, "director_review_repair",
+                                new_callable=mock.AsyncMock),
+              mock.patch.object(app, "pantry_order_quality",
+                                new_callable=mock.AsyncMock) as quality,
+              mock.patch.object(app, "fire_and_forget",
+                                side_effect=lambda coro: coro.close()),
+              mock.patch.object(app, "ALT_GEN_LIVE", 1),
+              mock.patch.object(app, "alt_window", return_value="break"),
+              mock.patch.object(app, "_COORD_PLAN", {"tasks": []})):
+            result = await app.pantry_orders_tick()
+        self.assertEqual(result["editorial_dispatched"], 1)
+        self.assertEqual(result["quality_dispatched"], 0)
+        self.assertIn("ticket limit", repair["held"])
+        quality.assert_not_awaited()
 
     async def test_unrepresentable_manager_role_is_held_not_retried(self):
         repair = {"road": "manager", "sid": "m-1", "item_id": "m-1",

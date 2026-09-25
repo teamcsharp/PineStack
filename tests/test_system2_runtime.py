@@ -346,6 +346,54 @@ class System2RuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.runtime.store.reservations()[0]['state'], 'released')
         self.assertEqual(self.host._READY_SHELF_BUSY, set())
 
+    async def test_unhanded_delivery_expires_and_releases_dispatch_lock(self):
+        row = self.host.add('late-unhanded')
+        reserve = self.runtime.store.reserve
+        def near_deadline(*args, **kwargs):
+            result = reserve(*args, **kwargs)
+            self.now = 10119.97
+            return result
+        cancelled = asyncio.Event()
+        async def stuck(resolved, handoff, validate, *, entry_overrides):
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.assertFalse(validate())
+                with self.assertRaises(adapter.System2Conflict):
+                    handoff()
+                cancelled.set()
+                raise
+        with mock.patch.object(self.runtime.store, 'reserve', side_effect=near_deadline), \
+             mock.patch.object(self.runtime.media, 'deliver', side_effect=stuck):
+            self.assertFalse(await asyncio.wait_for(self.runtime.dispatch(), 3))
+        self.assertTrue(cancelled.is_set())
+        self.assertFalse(self.runtime._dispatch_lock.locked())
+        self.assertEqual(self.host._READY_SHELF_BUSY, set())
+        self.assertEqual(self.runtime.store.reservations()[0]['state'], 'released')
+        self.assertNotIn('aired', row)
+
+    async def test_heard_delivery_is_not_cancelled_at_slot_deadline(self):
+        self.host.add('heard-across-deadline')
+        heard, finish = asyncio.Event(), asyncio.Event()
+        async def playing(resolved, handoff, validate, *, entry_overrides):
+            self.assertTrue(validate())
+            handoff()
+            heard.set()
+            await finish.wait()
+            return True
+        async def deadline_elapsed(tasks, timeout):
+            await heard.wait()
+            return set(), set(tasks)
+        with mock.patch.object(self.runtime.media, 'deliver', side_effect=playing), \
+             mock.patch.object(adapter.asyncio, 'wait', side_effect=deadline_elapsed):
+            dispatch = asyncio.create_task(self.runtime.dispatch())
+            await asyncio.wait_for(heard.wait(), 3)
+            self.assertFalse(dispatch.done())
+            finish.set()
+            self.assertTrue(await asyncio.wait_for(dispatch, 3))
+        self.assertFalse(self.runtime._dispatch_lock.locked())
+        self.assertEqual(self.runtime.store.reservations()[0]['state'], 'playing')
+
     async def test_transient_unpublished_failure_can_get_a_new_dispatch_intent(self):
         row = self.host.add('retry')
         self.host._banter_air.side_effect = mock.AsyncMock(return_value=False)

@@ -226,6 +226,25 @@ class ScheduleExecutionHandoffTests(unittest.IsolatedAsyncioTestCase):
               mock.patch.object(app, "_CLOCK_HELD", {})):
             self.assertEqual(app.clock_may_air("ad"), "the air is quiet")
 
+    def test_quiet_clock_defers_to_current_recorded_system2_gallery(self):
+        slot = {"engine": "system2", "kind": "gallery", "deadline": 1100,
+                "allocations": [{"state": "ready", "planned_start": 1000,
+                                 "candidate": {"ready": True, "eligible": True,
+                                               "seconds": 80, "lines": [{"text": "Recorded."}]}}]}
+        self.radio["voice_to"] = "here"
+        with (mock.patch.object(app, "schedule_take", return_value=slot),
+              mock.patch.object(app, "_TALK_ACK", {}),
+              mock.patch.object(app, "_CLOCK_HELD", {}),
+              mock.patch.object(app, "_ready_round_fits", return_value=True) as fits):
+            self.assertEqual(app.clock_may_air("caller"), "")
+            fits.assert_called_once()
+            self.assertGreaterEqual(fits.call_args.kwargs["seconds"], 80)
+        with (mock.patch.object(app, "schedule_take", return_value=slot),
+              mock.patch.object(app, "_TALK_ACK", {}),
+              mock.patch.object(app, "_CLOCK_HELD", {}),
+              mock.patch.object(app, "_ready_round_fits", return_value=False)):
+            self.assertEqual(app.clock_may_air("caller"), "the air is quiet")
+
 
 class ProducedAdHandoffTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):

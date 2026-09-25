@@ -46,7 +46,9 @@ class System2ClockTests(unittest.IsolatedAsyncioTestCase):
                        _sched_pos_restore=mock.Mock(side_effect=AssertionError('Legacy restore')),
                        _sched_pos_save=mock.Mock(side_effect=AssertionError('Legacy save')),
                        SCHED_PREP_KIND={}, _PAGE_AIR_UNTIL=[0], _BOX_DOWN={}, _BOX_HOLD=[],
-                       VOICE_BROADCAST_LEAD_MS=0, page_carries_live=lambda *args: False)
+                       VOICE_BROADCAST_LEAD_MS=0, page_carries_live=lambda *args: False,
+                       playout_floor=lambda **kwargs: 0.0,
+                       segment_overrun=lambda *args: 0.0)
 
     async def test_poll_uses_wall_clock_and_never_legacy_position_or_alias(self):
         await self.runtime.refresh()

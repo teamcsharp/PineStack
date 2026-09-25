@@ -6,6 +6,35 @@ import app
 
 
 class ScheduleFallbackAttributionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_newly_ready_system2_slot_preempts_legacy_draw_after_breath(self):
+        radio = {"on": True, "sched_pos": {"occurrence": "gallery-now"}}
+        runtime = mock.Mock(enabled=True)
+        calls = 0
+
+        async def dispatch():
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                radio["on"] = False
+                return True
+            return False
+
+        runtime.dispatch = mock.AsyncMock(side_effect=dispatch)
+        runtime.fallback_due.return_value = True
+        with (mock.patch.object(app, "_RADIO", radio),
+              mock.patch.object(app, "_system2", return_value=runtime),
+              mock.patch.object(app, "radio_paused", return_value=False),
+              mock.patch.object(app, "dj_settings", return_value={"talk_radio_mode": True}),
+              mock.patch.object(app, "torrent_breath", return_value=0),
+              mock.patch.object(app.asyncio, "sleep", new=mock.AsyncMock()),
+              mock.patch.object(app, "pipeline_log"),
+              mock.patch.object(app, "switchboard_take") as switchboard,
+              mock.patch.object(app, "schedule_take") as schedule):
+            await app._torrent_talk()
+        self.assertEqual(runtime.dispatch.await_count, 2)
+        switchboard.assert_not_called()
+        schedule.assert_not_called()
+
     async def run_round(self, kind, *, primary=False, banter=True,
                         policy_kind="", continuity=False, talk=50):
         radio = {"on": True, "now": None, "sched_pos": {

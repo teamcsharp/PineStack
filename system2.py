@@ -309,6 +309,7 @@ class System2Store:
     @staticmethod
     def _slot_matches(candidate, slot):
         if candidate['kind'] != slot['kind']: return False
+        if candidate['id'] in (slot.get('review_superseded_ids') or []): return False
         if slot['kind'] == 'recap':
             source = candidate.get('source') or {}
             if (candidate.get('slot_id') != slot['id'] or not isinstance(source, dict)
@@ -505,10 +506,13 @@ class System2Store:
             slots = []
             for i, template in enumerate(enabled):
                 identity = hour_id + ':' + template['id']
-                previous = self._get(db, 's2_slots', identity) if not changed else None
+                prior = self._get(db, 's2_slots', identity)
+                previous = prior if not changed else None
                 slots.append({**template, 'id': identity, 'template_id': template['id'], 'hour_id': hour_id,
                     'ordinal': i, 'revision': revision, 'start': hour_start + template['offset'],
                     'deadline': min(hour_start + 3600, hour_start + template['offset'] + template['seconds']),
+                    'review_replacements': dict((previous or {}).get('review_replacements') or {}),
+                    'review_superseded_ids': list((previous or {}).get('review_superseded_ids') or []),
                     'allocations': copy.deepcopy((previous or {}).get('allocations') or []),
                     'heard_seconds': float((previous or {}).get('heard_seconds') or 0),
                     'delivered_seconds': float((previous or {}).get('delivered_seconds') or 0)})
@@ -520,6 +524,11 @@ class System2Store:
                     if self._allocation_metrics(db, slot, allocation)['retain']:
                         retained.append(allocation); used.add(allocation['candidate']['id']); fingerprints.update(allocation['candidate']['fingerprints'])
                 slot['allocations'] = retained
+                retained_ids = {row['candidate']['id'] for row in retained}
+                slot['review_replacements'] = {
+                    old_id: new_id for old_id, new_id in slot['review_replacements'].items()
+                    if new_id in retained_ids}
+                slot['review_superseded_ids'] = list(slot['review_replacements'])
             # One ready candidate for each occurrence before filling earlier slots further.
             for first_only in (True, False):
                 for slot in slots:
@@ -808,6 +817,91 @@ class System2Store:
                     raise System2Conflict('Candidate is allocated to another current or future occurrence.')
             slot['allocations'] = [{'candidate': copy.deepcopy(candidate), 'planned_start': self.now()}]
             self._slot_totals(db, slot)
+            slot['status'] = 'ready' if self._slot_ready(slot) else 'needs_preparation'
+            self._save(db, 's2_slots', slot, ('hour_id', 'ordinal'))
+            self._job_for_slot(db, slot)
+            return slot
+
+    def replace_future_allocation(self, slot_id, old_id, replacement, *,
+                                  expected_revision, expected_signature,
+                                  lead_seconds=90, beat_seconds=0):
+        """Atomically exchange one unowned future performance, never its shelf media."""
+        candidate = _candidate(replacement)
+        beat_seconds = _number(beat_seconds, 'beat_seconds', 0, 10)
+        if candidate['id'] == old_id or candidate.get('slot_id') != slot_id:
+            raise System2Conflict('Replacement needs a distinct ID bound to this occurrence.')
+        lines = candidate['lines']
+        if (not lines or not candidate['ready'] or not candidate['eligible']
+                or any(not line.get('audio_hash') or float(line.get('seconds') or 0) <= 0
+                       for line in lines)
+                or abs(candidate['seconds'] - sum(line['seconds'] for line in lines)) > .5):
+            raise System2Conflict('Replacement has no complete measured recording.')
+        with self._tx() as db:
+            slot = self._get(db, 's2_slots', slot_id)
+            if not slot or slot['revision'] != expected_revision:
+                raise System2Conflict('Future slot revision changed.')
+            if slot['start'] - self.now() < lead_seconds:
+                raise System2Conflict('Future slot is inside the promotion guard.')
+            allocations = slot.get('allocations') or []
+            matches = [(i, row) for i, row in enumerate(allocations)
+                       if row['candidate']['id'] == old_id]
+            if (len(matches) != 1 or matches[0][1]['candidate']['signature'] != expected_signature
+                    or matches[0][1].get('state') not in ('ready', None, '')):
+                raise System2Conflict('The exact unowned allocation changed.')
+            for raw in db.execute("SELECT body FROM s2_reservations WHERE slot_id=? AND state IN "
+                                  "('reserved','playing','suspended','completed')", (slot_id,)):
+                held = json.loads(raw[0])
+                if held['revision'] == slot['revision'] and (held['state'] != 'reserved'
+                        or held.get('lease_until', 0) > self.now()):
+                    raise System2Conflict('The slot has an owner or a completed take.')
+            index, old = matches[0]
+            old_candidate = old['candidate']
+            if not self._allocation_metrics(db, slot, old)['retain']:
+                raise System2Conflict('The old allocation is no longer playable.')
+            if candidate['seconds'] < old_candidate['seconds']:
+                raise System2Conflict('Replacement is shorter than committed coverage.')
+            if not self._slot_matches(candidate, slot):
+                raise System2Conflict('Replacement does not match the occurrence.')
+            if self._eligible(db, candidate, old['planned_start']):
+                raise System2Conflict('Replacement is expired, repeated or reserved.')
+            for i, other in enumerate(allocations):
+                if i != index and (other['candidate']['id'] == candidate['id'] or
+                                   set(other['candidate']['fingerprints']) & set(candidate['fingerprints'])):
+                    raise System2Conflict('Replacement repeats another performance in the slot.')
+            for raw in db.execute('SELECT body FROM s2_slots WHERE id<>?', (slot_id,)):
+                other = json.loads(raw[0])
+                if other['deadline'] <= self.now():
+                    continue
+                for booked in other.get('allocations') or []:
+                    held = booked['candidate']
+                    if (held['id'] == candidate['id'] or
+                            set(held['fingerprints']) & set(candidate['fingerprints'])):
+                        if abs(booked['planned_start'] - old['planned_start']) < (
+                                REPEAT_SECONDS + max(held['seconds'], candidate['seconds'])):
+                            raise System2Conflict('Replacement is booked in another occurrence.')
+            shifted = copy.deepcopy(allocations)
+            shifted[index] = {'candidate': candidate, 'planned_start': old['planned_start'],
+                              'state': 'ready', 'reservation_id': ''}
+            end = max(slot['start'], shifted[0]['planned_start'])
+            for i, row in enumerate(shifted):
+                row['planned_start'] = max(row['planned_start'], end)
+                end = row['planned_start'] + row['candidate']['seconds']
+            new_end = shifted[index]['planned_start'] + candidate['seconds']
+            extra_beats = max(0, len(candidate['lines']) - len(old_candidate['lines'])) * beat_seconds
+            if (end + extra_beats > slot['deadline'] or candidate['expires_at']
+                    and new_end > candidate['expires_at']):
+                raise System2Conflict('Replacement and following takes do not fit the deadline.')
+            self._save(db, 's2_candidates', candidate, ('kind',))
+            slot['allocations'] = shifted
+            replacements = dict(slot.get('review_replacements') or {})
+            replacements = {source: candidate['id'] if target == old_id else target
+                            for source, target in replacements.items()}
+            replacements[old_id] = candidate['id']
+            slot['review_replacements'] = replacements
+            slot['review_superseded_ids'] = list(replacements)
+            self._slot_totals(db, slot)
+            if any(row.get('state') == 'unavailable' for row in slot['allocations']):
+                raise System2Conflict('Replacement would make the slot unavailable.')
             slot['status'] = 'ready' if self._slot_ready(slot) else 'needs_preparation'
             self._save(db, 's2_slots', slot, ('hour_id', 'ordinal'))
             self._job_for_slot(db, slot)

@@ -485,6 +485,7 @@ class System2Runtime:
                 and (entry is None or entry.get("system2_slot") == sid))
 
     REFRESH_SECONDS = 60.0   # #1070: was 15; each refresh decodes every candidate body twice
+    FUTURE_SWAP_LOCK_WAIT = 2.0
 
     async def refresh(self, force=False, want_status=True):
         # #1070: status() deep-copies every plan (about a megabyte) and the
@@ -553,6 +554,68 @@ class System2Runtime:
             self._event_plans = event_plans
             self._last_refresh = time.time()
         return await asyncio.to_thread(self.status) if want_status else None
+
+    async def replace_future_allocation(self, slot_id, old_id, old_signature,
+                                        expected_revision, kind, row, publish, withdraw,
+                                        validate):
+        """Publish a recorded shadow row and swap its future booking as one turn."""
+        try:
+            await asyncio.wait_for(self._dispatch_lock.acquire(), timeout=self.FUTURE_SWAP_LOCK_WAIT)
+        except asyncio.TimeoutError as exc:
+            raise System2Conflict('Air dispatch is busy; future repair deferred.') from exc
+        try:
+            try:
+                await asyncio.wait_for(self._refresh_lock.acquire(), timeout=self.FUTURE_SWAP_LOCK_WAIT)
+            except asyncio.TimeoutError as exc:
+                raise System2Conflict('System2 refresh is busy; future repair deferred.') from exc
+            try:
+                candidate = await asyncio.to_thread(
+                    lambda: validate_candidate(self.candidate(kind, row)))
+                if candidate['id'] == old_id:
+                    raise System2Conflict('Replacement reused the old shelf identity.')
+                if not validate(candidate):
+                    self._rows.pop(candidate['id'], None)
+                    raise System2Conflict('Replacement failed the recorded editorial contract.')
+                live = self._rows.get(old_id)
+                if (not live or live[0] != kind or
+                        await asyncio.to_thread(lambda: validate_candidate(
+                            self.candidate(kind, live[1]))['signature']) != old_signature):
+                    self._rows.pop(candidate['id'], None)
+                    raise System2Conflict('The old playable take changed before promotion.')
+                published = False
+                try:
+                    published = True
+                    publish()
+                    try:
+                        beat = max(self.host.CONCAT_BEAT)
+                    except (AttributeError, TypeError, ValueError):
+                        beat = 0.0
+                    result = await asyncio.to_thread(
+                        self.store.replace_future_allocation, slot_id, old_id,
+                        candidate, expected_revision=expected_revision,
+                        expected_signature=old_signature,
+                        beat_seconds=max(0.0, float(beat)))
+                except BaseException:
+                    if published:
+                        try:
+                            withdraw()
+                        except Exception as exc:
+                            self.error('future-replacement-withdraw', exc)
+                    self._rows.pop(candidate['id'], None)
+                    raise
+                self._rows[candidate['id']] = (kind, row)
+                self._last_refresh = 0
+                for plan in self._plans + self._event_plans:
+                    for index, slot in enumerate(plan.get('slots') or []):
+                        if slot['id'] == slot_id:
+                            plan['slots'][index] = result
+            finally:
+                self._refresh_lock.release()
+        finally:
+            self._dispatch_lock.release()
+        # The exact slot and source are visible now. The ordinary refresh
+        # reconciles the wider horizon without charging it to this air turn.
+        return result
 
     def include_drafts(self, hour):
         slots = hour.get("slots", [])
@@ -1546,6 +1609,7 @@ class System2Runtime:
                     entry["_system2_track_position"] = copy.deepcopy(track_position)
                     entry["_ready_slot"]["deadline"] = min(slot["deadline"], track_position["deadline"])
                 handed = False
+                aborted = False
 
                 def _no(why):
                     # [#1191] THE REASON, ON THE HOST'S REGISTER. app.py's
@@ -1573,6 +1637,8 @@ class System2Runtime:
                         return 0.0
 
                 def validate():
+                    if aborted:
+                        return _no("the unhanded delivery passed its slot deadline")
                     if not self.enabled:
                         return _no("System2 is switched off")
                     if h.radio_paused() or not h._RADIO.get("on"):
@@ -1645,6 +1711,8 @@ class System2Runtime:
 
                 def handoff():
                     nonlocal handed
+                    if aborted:
+                        raise System2Conflict("The unhanded delivery passed its slot deadline")
                     if handed:
                         return
                     # [#1191] the same allowance validate() was given, or
@@ -1657,11 +1725,37 @@ class System2Runtime:
 
                 h._READY_SHELF_BUSY.add(id(row))
                 failed = False
+                timed_out = False
+                delivery = asyncio.create_task(
+                    self.media.deliver(resolved, handoff, validate, entry_overrides=entry))
                 try:
-                    said = await self.media.deliver(resolved, handoff, validate, entry_overrides=entry)
+                    deadline = float(entry["_ready_slot"]["deadline"])
+                    done, _ = await asyncio.wait({delivery}, timeout=max(0.0, deadline - time.time()))
+                    if not done and not handed:
+                        aborted = True
+                        failed = True
+                        timed_out = True
+                        return False
+                    said = await delivery
                     failed = not bool(said)
                     return bool(said)
                 finally:
+                    if not handed and not delivery.done():
+                        aborted = True
+                        delivery.cancel()
+                        # A transport that suppresses cancellation must not keep
+                        # the global dispatch lock past the next scheduled entry.
+                        await asyncio.wait({delivery}, timeout=0.25)
+                        if delivery.done():
+                            try:
+                                delivery.result()
+                            except (asyncio.CancelledError, Exception):
+                                pass
+                        else:
+                            delivery.add_done_callback(
+                                lambda task: task.exception() if not task.cancelled() else None)
+                    if timed_out:
+                        self.media.last_refusal = "unhanded delivery passed its slot deadline"
                     h._READY_SHELF_BUSY.discard(id(row))
                     if not handed or failed:
                         self.refuse(slot, candidate, self.media.last_refusal or "the transport refused the recording")
