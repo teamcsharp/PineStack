@@ -5,7 +5,8 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from system2 import System2Conflict, System2Store, text_hash
+from system2 import (ALLOCATION_TRANSITION_SECONDS, System2Conflict,
+                     System2Store, _candidate, text_hash)
 
 
 def candidate(identity, kind='news', seconds=30, **kwargs):
@@ -52,7 +53,107 @@ class System2Tests(unittest.TestCase):
         self.assertEqual(after['coverage_seconds'], 90)
         self.assertEqual(after['debt_seconds'], 0)
         self.assertEqual(after['slots'][0]['heard_seconds'], 30)
-        self.assertEqual(after['slots'][0]['allocations'][1]['planned_start'], 10030)
+        self.assertEqual(after['slots'][0]['allocations'][1]['planned_start'],
+                         10030 + ALLOCATION_TRANSITION_SECONDS)
+
+    def test_air_seconds_default_keeps_existing_proof_and_rejects_understated_runway(self):
+        original = _candidate(candidate('proof', seconds=30))
+        explicit_default = _candidate(candidate('proof', seconds=30, air_seconds=30))
+        longer = _candidate(candidate('proof', seconds=30, air_seconds=34))
+        self.assertEqual(original['air_seconds'], 30)
+        self.assertEqual(original['signature'], explicit_default['signature'])
+        self.assertNotEqual(original['signature'], longer['signature'])
+        for bad in (29, float('nan'), '34'):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                _candidate(candidate('invalid', seconds=30, air_seconds=bad))
+
+    def test_air_occupancy_and_transition_prevent_false_ready_news(self):
+        template = [{'id': 'n', 'kind': 'news', 'seconds': 180}]
+        first = candidate('first', seconds=91, air_seconds=94)
+        second = candidate('second', seconds=88, air_seconds=91)
+        hour = self.plan([first, second], template)
+        slot = hour['slots'][0]
+        self.assertEqual(len(slot['allocations']), 1)
+        self.assertEqual(slot['ready_seconds'], 91)
+        self.assertEqual(slot['ready_air_seconds'], 94)
+        self.assertEqual(slot['coverage_seconds'], 91)
+        self.assertEqual(slot['allocated_air_seconds'], 94)
+        self.assertEqual(slot['debt_seconds'], 89)
+        self.assertEqual(slot['status'], 'needs_preparation')
+        why = self.store.explain_hour(hour['id'])['slots'][0]
+        self.assertGreaterEqual(why['refused'].get('too_long', 0), 1)
+        self.assertLess(why['room_seconds'], second['air_seconds'])
+
+    def test_transition_margin_is_reserved_between_default_duration_takes(self):
+        template = [{'id': 'n', 'kind': 'news', 'seconds': 180}]
+        fits = self.plan([candidate('a', seconds=90), candidate('b', seconds=87)], template)
+        self.assertEqual(len(fits['slots'][0]['allocations']), 2)
+        self.assertEqual(fits['slots'][0]['allocations'][1]['planned_start'],
+                         self.now + 90 + ALLOCATION_TRANSITION_SECONDS)
+        too_tight = self.plan([candidate('c', seconds=90), candidate('d', seconds=88)],
+                              template, start=self.now + 300)
+        self.assertEqual(len(too_tight['slots'][0]['allocations']), 1)
+        self.assertEqual(too_tight['slots'][0]['status'], 'needs_preparation')
+
+    def test_claimed_job_reports_live_air_room_separately_from_speech_debt(self):
+        template = [{'id': 'n', 'kind': 'news', 'seconds': 180}]
+        hour = self.plan([candidate('first', seconds=91, air_seconds=94)], template)
+        slot = hour['slots'][0]
+        self.assertEqual(slot['debt_seconds'], 89)
+        self.assertEqual(slot['air_room_seconds'], 83)
+        self.now += 20
+        job = self.store.claim_job('writer')
+        self.assertEqual(job['target_ready_seconds'], 89)
+        self.assertEqual(job['air_room_seconds'], 63)
+        self.assertEqual(job['template']['air_room_seconds'], 63)
+        self.assertEqual(job['template']['ready_seconds'], 91)
+
+    def test_late_start_drops_unhanded_tail_but_preserves_heard_first_take(self):
+        template = [{'id': 'n', 'kind': 'news', 'seconds': 180}]
+        first = candidate('heard-first', seconds=91, air_seconds=94)
+        second = candidate('unhanded-second', seconds=80, air_seconds=82)
+        hour = self.plan([first, second], template)
+        slot = hour['slots'][0]
+        self.assertEqual(len(slot['allocations']), 2)
+        reservation = self.store.reserve(slot['id'], first['id'], 'air')
+        self.now += 74
+        self.store.mark_dispatched(reservation['id'], 'air')
+        self.now += 91
+        self.store.ack(reservation['id'], 'air', 'heard-first', completed=True)
+        after = self.plan([first, second], template, start=10000)
+        slot = after['slots'][0]
+        self.assertEqual([a['candidate']['id'] for a in slot['allocations']], [first['id']])
+        self.assertEqual(slot['allocations'][0]['state'], 'completed')
+        self.assertEqual(slot['heard_seconds'], 91)
+        self.assertEqual(slot['coverage_seconds'], 91)
+        self.assertEqual(slot['debt_seconds'], 89)
+        self.assertEqual(self.store.get_reservation(reservation['id'])['state'], 'completed')
+
+    def test_handoff_checks_air_seconds_not_only_measured_speech(self):
+        template = [{'id': 'n', 'kind': 'news', 'seconds': 100}]
+        value = candidate('runway', seconds=90, air_seconds=100)
+        hour = self.plan([value], template)
+        reservation = self.store.reserve(hour['slots'][0]['id'], value['id'], 'air')
+        self.assertEqual(reservation['actual_seconds'], 90)
+        self.assertEqual(reservation['air_seconds'], 100)
+        self.now += 5
+        self.assertEqual(self.store.validate_reservation(reservation['id'], 'air')['reason'],
+                         'measured_duration_misses_deadline')
+        with self.assertRaises(System2Conflict):
+            self.store.mark_dispatched(reservation['id'], 'air')
+
+    def test_measured_dispatch_updates_speech_without_losing_air_overhead(self):
+        template = [{'id': 'n', 'kind': 'news', 'seconds': 120}]
+        value = candidate('measured', seconds=90, air_seconds=95)
+        hour = self.plan([value], template)
+        reservation = self.store.reserve(hour['slots'][0]['id'], value['id'], 'air')
+        self.assertTrue(self.store.validate_reservation(reservation['id'], 'air', seconds=92)['allowed'])
+        dispatched = self.store.mark_dispatched(reservation['id'], 'air', seconds=92)
+        self.assertEqual(dispatched['actual_seconds'], 92)
+        self.assertEqual(dispatched['air_seconds'], 97)
+        self.now += 24
+        self.assertEqual(self.store.validate_reservation(reservation['id'], 'air', seconds=92)['reason'],
+                         'measured_duration_misses_deadline')
 
     def test_expired_reservation_does_not_keep_invalid_candidate_ready(self):
         original = candidate('gone'); hour = self.plan([original])

@@ -75,3 +75,22 @@ test('a matching phrase from another seat and draft fragments remain visible', (
   assert.equal(draft.length, 3, 'drafts are not treated as recorded allocations');
   assert.equal(draft[2].candidate_index, 3);
 });
+
+test('heard and still-planned lines stay in separate ordered sections', () => {
+  const aired = [
+    {line: 'actual-1', text: 'The actual opening.', who: 'dj', kind: 'chat'},
+    {line: 'actual-2', text: 'The actual reply.', who: 'cohost', kind: 'chat'}
+  ];
+  const shown = view.itinConversationTurns({
+    script: {turns: [
+      {text: 'A different planned opening.', seat: 'A', candidate: 'booked'},
+      {text: 'A different planned reply.', seat: 'B', candidate: 'booked'}
+    ]}, aired
+  });
+  const sections = view.itinConversationSections(shown);
+  assert.deepEqual(sections.heard.map((turn) => turn.line),
+    ['actual-1', 'actual-2']);
+  assert.deepEqual(sections.planned.map((turn) => turn.candidate),
+    ['booked', 'booked']);
+  assert.equal(sections.heard.some((turn) => turn.candidate === 'booked'), false);
+});

@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from system2 import System2Conflict, System2Store
+from system2 import ALLOCATION_TRANSITION_SECONDS, System2Conflict, System2Store
 from system2_runtime import System2Runtime
 from tests.test_system2_runtime import Host
 
@@ -99,7 +99,7 @@ class FutureReviewSwapTests(unittest.TestCase):
         self.assertEqual([a['candidate']['id'] for a in changed['allocations']],
                          ['new', 'second'])
         self.assertEqual(changed['allocations'][1]['planned_start'],
-                         changed['allocations'][0]['planned_start'] + 60)
+                         changed['allocations'][0]['planned_start'] + 60 + ALLOCATION_TRANSITION_SECONDS)
 
     def test_shorter_or_overlong_take_cannot_replace_coverage(self):
         for length in (59, 121):

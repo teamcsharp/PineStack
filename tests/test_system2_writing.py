@@ -61,6 +61,16 @@ class SourceTests(unittest.TestCase):
         self.assertEqual(settings["system2_budget"]["seconds"], 60)
         self.assertEqual(settings["system2_budget"]["turns"], 6)
 
+    def test_follow_up_scene_budget_reserves_actual_playout_room(self):
+        token = runtime.WORK.set({"kind": "news", "generation_turns": 6,
+                                  "template": {"seconds": 180, "debt_seconds": 89,
+                                               "air_room_seconds": 74}})
+        try:
+            settings = runtime.settings_for_work({"reply_max_chars": 6500})
+        finally:
+            runtime.WORK.reset(token)
+        self.assertAlmostEqual(settings["system2_budget"]["seconds"], 56.2)
+
     def test_short_scene_requires_complete_thoughts_and_turns(self):
         turns = [(m, "The train reached the platform and we heard it.") for m in ("A", "B", "A", "B")]
         self.assertTrue(scene_complete(turns, 4))

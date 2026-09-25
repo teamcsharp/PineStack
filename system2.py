@@ -23,6 +23,7 @@ REPEAT_SECONDS = 3600.0
 ACTIVE = ('reserved', 'playing', 'suspended')
 READY_SHORTFALL_SECONDS = 8.0
 READY_SHORTFALL_RATIO = 0.15
+ALLOCATION_TRANSITION_SECONDS = 3.0
 
 
 class System2Conflict(ValueError):
@@ -64,6 +65,8 @@ def _candidate(row):
     row['id'] = _name(row.get('id'), 'candidate id')
     row['kind'] = _name(row.get('kind'), 'candidate kind')
     row['seconds'] = _number(row.get('seconds', 0), 'candidate seconds', 0, 3600)
+    row['air_seconds'] = _number(row.get('air_seconds', row['seconds']),
+                                 'candidate air_seconds', row['seconds'], 3600)
     row['expires_at'] = _number(row.get('expires_at', 0), 'expires_at')
     row['ready'] = row.get('ready') is True
     row['eligible'] = row.get('eligible') is True
@@ -108,9 +111,13 @@ def _candidate(row):
     if not row['audio_hashes']: missing.append('audio_evidence_missing')
     if row['repeat_guard'] and not row['text_hashes']: missing.append('spoken_text_missing')
     row['blocked_reasons'] = missing
-    row['signature'] = _hash(_json({k: row.get(k) for k in
+    proof = {k: row.get(k) for k in
         ('id', 'kind', 'seconds', 'script', 'lines', 'audio_hashes', 'text_hashes', 'source_id', 'repeat_guard',
-         'slot_id', 'template_id', 'hour_id')}))
+         'slot_id', 'template_id', 'hour_id')}
+    # Default occupancy keeps old proofs valid across deployment.
+    if row['air_seconds'] != row['seconds']:
+        proof['air_seconds'] = row['air_seconds']
+    row['signature'] = _hash(_json(proof))
     if len(_json(row)) > 2_000_000:
         raise ValueError('candidate evidence exceeds the bounded record size')
     return row
@@ -292,7 +299,7 @@ class System2Store:
     def _eligible(self, db, candidate, when, *, own=''):
         if candidate['blocked_reasons']:
             return candidate['blocked_reasons'][0]
-        if candidate['expires_at'] and when + candidate['seconds'] > candidate['expires_at']:
+        if candidate['expires_at'] and when + self._air_seconds(candidate) > candidate['expires_at']:
             return 'candidate_expired'
         repeat = self._repeat_reason(db, candidate, when, own)
         if repeat:
@@ -305,6 +312,10 @@ class System2Store:
                     set(reserved['candidate']['fingerprints']) & set(candidate['fingerprints'])):
                 return 'reserved_by_another_owner'
         return ''
+
+    @staticmethod
+    def _air_seconds(candidate):
+        return float(candidate.get('air_seconds', candidate['seconds']))
 
     @staticmethod
     def _slot_matches(candidate, slot):
@@ -333,30 +344,67 @@ class System2Store:
         reservation = next((row for row in held if row['state'] != 'reserved'), held[0] if held else None)
         if reservation and reservation['state'] in ('playing', 'suspended', 'completed'):
             state = reservation['state']
-            remaining = 0 if state == 'completed' else max(0, reservation['actual_seconds'] -
-                (reservation['position_seconds'] if state == 'suspended' else
-                 max(reservation['position_seconds'], self.now() - reservation.get('resumed_at', reservation['dispatched_at']) +
-                     (reservation['position_seconds'] if reservation.get('resumed_at') else 0))))
+            position = (reservation['position_seconds'] if state == 'suspended' else
+                max(reservation['position_seconds'], self.now() - reservation.get('resumed_at', reservation['dispatched_at']) +
+                    (reservation['position_seconds'] if reservation.get('resumed_at') else 0)))
+            remaining = 0 if state == 'completed' else max(0, reservation['actual_seconds'] - position)
+            air_remaining = 0 if state == 'completed' else max(0, float(reservation.get(
+                'air_seconds', self._air_seconds(reservation['candidate']))) - position)
             return {'state': state, 'coverage': reservation['actual_seconds'], 'ready': 0,
-                    'remaining': remaining, 'retain': True, 'reservation_id': reservation['id']}
+                    'remaining': remaining, 'air_remaining': air_remaining, 'ready_air': 0,
+                    'completed_at': float(reservation.get('completed_at') or 0),
+                    'retain': True, 'reservation_id': reservation['id']}
         own = reservation['id'] if reservation else ''
         valid = bool(current and current['signature'] == candidate['signature'] and self._slot_matches(current, slot)
                      and not self._eligible(db, current, max(self.now(), slot['start']), own=own)
-                     and max(self.now(), slot['start']) + current['seconds'] <= slot['deadline'])
+                     and max(self.now(), slot['start']) + self._air_seconds(current) <= slot['deadline'])
         return {'state': 'reserved' if reservation and valid else 'ready' if valid else 'unavailable',
                 'coverage': candidate['seconds'] if valid else 0, 'ready': candidate['seconds'] if valid else 0,
-                'remaining': candidate['seconds'] if valid else 0, 'retain': valid,
+                'remaining': candidate['seconds'] if valid else 0,
+                'air_remaining': self._air_seconds(candidate) if valid else 0,
+                'ready_air': self._air_seconds(candidate) if valid else 0, 'retain': valid,
                 'reservation_id': own}
 
     def _slot_totals(self, db, slot):
         metrics = [self._allocation_metrics(db, slot, a) for a in slot['allocations']]
+        cursor = max(slot['start'], self.now())
+        needs_transition = False
+        air_sequence_fits = True
+        for allocation, value in zip(slot['allocations'], metrics):
+            if value['state'] == 'completed':
+                cursor = max(cursor, value['completed_at'] + ALLOCATION_TRANSITION_SECONDS)
+                needs_transition = False
+                continue
+            if not value['retain']:
+                air_sequence_fits = False
+                continue
+            if value['state'] in ('playing', 'suspended'):
+                cursor = max(cursor, self.now()) + value['air_remaining']
+                needs_transition = True
+                continue
+            begins = max(cursor, float(allocation.get('planned_start') or 0))
+            if needs_transition:
+                begins += ALLOCATION_TRANSITION_SECONDS
+            if begins + value['air_remaining'] > slot['deadline']:
+                value.update(state='unavailable', coverage=0, ready=0, remaining=0,
+                             air_remaining=0, ready_air=0, retain=False)
+                air_sequence_fits = False
+                continue
+            cursor = begins + value['air_remaining']
+            needs_transition = True
         for allocation, value in zip(slot['allocations'], metrics):
             allocation['state'] = value['state']
             allocation['reservation_id'] = value['reservation_id']
         slot['allocated_seconds'] = round(sum(a['candidate']['seconds'] for a in slot['allocations']), 6)
+        slot['allocated_air_seconds'] = round(sum(self._air_seconds(a['candidate']) for a in slot['allocations']), 6)
         slot['ready_seconds'] = round(sum(m['ready'] for m in metrics), 6)
+        slot['ready_air_seconds'] = round(sum(m['ready_air'] for m in metrics), 6)
         slot['coverage_seconds'] = round(sum(m['coverage'] for m in metrics), 6)
         slot['in_flight_seconds'] = round(sum(m['remaining'] for m in metrics if m['state'] in ('playing', 'suspended')), 6)
+        slot['in_flight_air_seconds'] = round(sum(m['air_remaining'] for m in metrics if m['state'] in ('playing', 'suspended')), 6)
+        slot['air_sequence_fits'] = air_sequence_fits
+        slot['air_next_at'] = cursor + (ALLOCATION_TRANSITION_SECONDS if needs_transition else 0)
+        slot['air_room_seconds'] = round(max(0.0, slot['deadline'] - slot['air_next_at']), 6)
         slot['coverage_performances'] = sum(m['coverage'] > 0 for m in metrics)
         if slot.get('coverage_mode') == 'one_performance':
             slot['target_performances'] = 1
@@ -376,8 +424,14 @@ class System2Store:
         reporting that residual as debt, but stop commissioning duplicate
         conversations once at least one performance exists and the shortfall
         is within fifteen percent of target (bounded to eight to twenty seconds).
+        A speech total cannot certify a sequence that misses its air deadline.
         """
         target = float(slot.get('target_seconds') or 0)
+        if (slot.get('heard_performances', 0) >= 1 if slot.get('coverage_mode') == 'one_performance'
+                else float(slot.get('heard_seconds') or 0) >= target > 0):
+            return True
+        if not slot.get('air_sequence_fits', True):
+            return False
         if target <= .001:
             return True
         if slot.get('coverage_mode') == 'one_performance':
@@ -494,12 +548,12 @@ class System2Store:
                 for allocation in other.get('allocations') or []:
                     at = allocation['planned_start']
                     candidate = allocation['candidate']
-                    if at + candidate['seconds'] + REPEAT_SECONDS <= self.now():
+                    if at + self._air_seconds(candidate) + REPEAT_SECONDS <= self.now():
                         continue
                     # Its moment has passed and nobody heard it: the
                     # material is unspent, so it carries to this hour
                     # instead of being held against it.
-                    if (at + candidate['seconds'] < self.now()
+                    if (at + self._air_seconds(candidate) < self.now()
                             and (other['id'], candidate['id']) not in heard_pairs):
                         continue
                     bookings.append((at, candidate))
@@ -520,8 +574,9 @@ class System2Store:
             used, fingerprints = set(), set()
             for slot in slots:
                 retained = []
-                for allocation in slot['allocations']:
-                    if self._allocation_metrics(db, slot, allocation)['retain']:
+                metrics = self._slot_totals(db, slot)
+                for allocation, metric in zip(slot['allocations'], metrics):
+                    if metric['retain']:
                         retained.append(allocation); used.add(allocation['candidate']['id']); fingerprints.update(allocation['candidate']['fingerprints'])
                 slot['allocations'] = retained
                 retained_ids = {row['candidate']['id'] for row in retained}
@@ -535,23 +590,23 @@ class System2Store:
                     if slot.get('allocation_mode') == 'current': continue
                     while True:
                         metrics = self._slot_totals(db, slot)
-                        held = sum(m['remaining'] for m in metrics)
                         need = slot['debt_seconds']
-                        room = slot['deadline'] - max(slot['start'], self.now()) - held
+                        starts = slot['air_next_at']
+                        room = slot['deadline'] - starts
                         if self._slot_ready(slot) or room <= 0 or (first_only and slot['allocations']): break
                         choices = [c for c in catalogue if self._slot_matches(c, slot) and c['id'] not in used
-                            and not (set(c['fingerprints']) & fingerprints) and c['seconds'] <= room
+                            and not (set(c['fingerprints']) & fingerprints) and self._air_seconds(c) <= room
                             and not any((booked['id'] == c['id'] or set(booked['fingerprints']) & set(c['fingerprints']))
-                                and abs(max(slot['start'], self.now()) + held - at) < REPEAT_SECONDS + max(booked['seconds'], c['seconds'])
+                                and abs(starts - at) < REPEAT_SECONDS + max(self._air_seconds(booked), self._air_seconds(c))
                                 for at, booked in bookings)
-                            and not self._eligible(db, c, max(slot['start'], self.now()) + held)]
+                            and not self._eligible(db, c, starts)]
                         if not choices: break
                         # Prefer the smallest whole performance that fills the debt; otherwise the largest fit.
                         preferred = str(slot.get('preferred_candidate_id') or '')
                         candidate = min(choices, key=lambda c: (
                             bool(preferred and c['id'] != preferred),
                             c['seconds'] < need, abs(c['seconds'] - need), c['id']))
-                        slot['allocations'].append({'candidate': copy.deepcopy(candidate), 'planned_start': max(slot['start'], self.now()) + held})
+                        slot['allocations'].append({'candidate': copy.deepcopy(candidate), 'planned_start': starts})
                         used.add(candidate['id']); fingerprints.update(candidate['fingerprints'])
                         if first_only: break
             for slot in slots:
@@ -583,6 +638,7 @@ class System2Store:
             'revision': slot['revision'], 'deadline': slot['start'], 'hard_deadline': slot['deadline'],
             'target_ready_seconds': debt, 'slot_target_seconds': slot['target_seconds'],
             'slot_ready_seconds': slot['ready_seconds'],
+            'air_room_seconds': slot['air_room_seconds'],
             'coverage_missing': slot['target_seconds'] > .001 and slot['coverage_seconds'] <= .001,
             'estimated_work_seconds': debt * slot['prep_cost_per_second'] if slot.get('prep_cost_per_second') is not None else None,
             'state': ('satisfied' if self._slot_ready(slot) else
@@ -603,9 +659,12 @@ class System2Store:
         for slot in hour['slots']:
             self._slot_totals(db, slot)
         hour['ready_seconds'] = sum(s['ready_seconds'] for s in hour['slots'])
+        hour['ready_air_seconds'] = sum(s['ready_air_seconds'] for s in hour['slots'])
         hour['allocated_seconds'] = sum(s.get('allocated_seconds', s['ready_seconds']) for s in hour['slots'])
+        hour['allocated_air_seconds'] = sum(s['allocated_air_seconds'] for s in hour['slots'])
         hour['coverage_seconds'] = sum(s.get('coverage_seconds', s['ready_seconds']) for s in hour['slots'])
         hour['in_flight_seconds'] = sum(s.get('in_flight_seconds', 0) for s in hour['slots'])
+        hour['in_flight_air_seconds'] = sum(s['in_flight_air_seconds'] for s in hour['slots'])
         hour['debt_seconds'] = sum(s['debt_seconds'] for s in hour['slots'])
         hour['all_segments_present'] = all(s.get('coverage_seconds', s['ready_seconds']) > .001 or s['target_seconds'] == 0 for s in hour['slots'])
         return hour
@@ -642,7 +701,7 @@ class System2Store:
                 for allocation in other.get('allocations') or []:
                     at = allocation['planned_start']
                     candidate = allocation['candidate']
-                    if at + candidate['seconds'] + REPEAT_SECONDS > self.now():
+                    if at + self._air_seconds(candidate) + REPEAT_SECONDS > self.now():
                         bookings.append((at, candidate))
             used, fingerprints = set(), set()
             for slot in hour['slots']:
@@ -654,7 +713,8 @@ class System2Store:
                 metrics = self._slot_totals(db, slot)
                 held = sum(m['remaining'] for m in metrics)
                 need = slot['debt_seconds']
-                room = slot['deadline'] - max(slot['start'], self.now()) - held
+                starts = slot['air_next_at']
+                room = slot['deadline'] - starts
                 refused, examples = {}, {}
 
                 def refuse(reason, candidate):
@@ -670,15 +730,15 @@ class System2Store:
                         refuse('used', c); continue
                     if set(c['fingerprints']) & fingerprints:
                         refuse('fingerprint', c); continue
-                    if c['seconds'] > max(0.0, room):
+                    if self._air_seconds(c) > max(0.0, room):
                         refuse('too_long', c); continue
                     if any((booked['id'] == c['id']
                             or set(booked['fingerprints']) & set(c['fingerprints']))
-                           and abs(max(slot['start'], self.now()) + held - at)
-                               < REPEAT_SECONDS + max(booked['seconds'], c['seconds'])
+                           and abs(starts - at)
+                               < REPEAT_SECONDS + max(self._air_seconds(booked), self._air_seconds(c))
                            for at, booked in bookings):
                         refuse('booked', c); continue
-                    why = self._eligible(db, c, max(slot['start'], self.now()) + held)
+                    why = self._eligible(db, c, starts)
                     if why:
                         refuse(why, c); continue
                     refuse('WOULD FIT', c)
@@ -696,6 +756,7 @@ class System2Store:
                     'need_seconds': round(float(need), 1),
                     'room_seconds': round(float(room), 1),
                     'held_seconds': round(float(held), 1),
+                    'held_air_seconds': round(float(slot['air_next_at'] - max(slot['start'], self.now())), 1),
                     'of_this_road': sum(1 for c in catalogue
                                         if c['kind'] == slot['kind']),
                     'would_fit': refused.get('WOULD FIT', 0),
@@ -807,7 +868,7 @@ class System2Store:
                 raise System2Conflict('Candidate kind or occurrence does not match.')
             reason = self._eligible(db, candidate, self.now())
             if reason: raise System2Conflict(reason)
-            if self.now() + candidate['seconds'] > slot['deadline']:
+            if self.now() + self._air_seconds(candidate) > slot['deadline']:
                 raise System2Conflict('Complete measured performance no longer fits the slot.')
             for raw in db.execute('SELECT body FROM s2_slots WHERE id<>?', (slot_id,)):
                 other = json.loads(raw[0])
@@ -877,17 +938,19 @@ class System2Store:
                     if (held['id'] == candidate['id'] or
                             set(held['fingerprints']) & set(candidate['fingerprints'])):
                         if abs(booked['planned_start'] - old['planned_start']) < (
-                                REPEAT_SECONDS + max(held['seconds'], candidate['seconds'])):
+                                REPEAT_SECONDS + max(self._air_seconds(held), self._air_seconds(candidate))):
                             raise System2Conflict('Replacement is booked in another occurrence.')
             shifted = copy.deepcopy(allocations)
             shifted[index] = {'candidate': candidate, 'planned_start': old['planned_start'],
                               'state': 'ready', 'reservation_id': ''}
             end = max(slot['start'], shifted[0]['planned_start'])
             for i, row in enumerate(shifted):
-                row['planned_start'] = max(row['planned_start'], end)
-                end = row['planned_start'] + row['candidate']['seconds']
-            new_end = shifted[index]['planned_start'] + candidate['seconds']
-            extra_beats = max(0, len(candidate['lines']) - len(old_candidate['lines'])) * beat_seconds
+                row['planned_start'] = max(row['planned_start'], end +
+                    (ALLOCATION_TRANSITION_SECONDS if i else 0))
+                end = row['planned_start'] + self._air_seconds(row['candidate'])
+            new_end = shifted[index]['planned_start'] + self._air_seconds(candidate)
+            extra_beats = (max(0, len(candidate['lines']) - len(old_candidate['lines'])) * beat_seconds
+                           if candidate['air_seconds'] == candidate['seconds'] else 0)
             if (end + extra_beats > slot['deadline'] or candidate['expires_at']
                     and new_end > candidate['expires_at']):
                 raise System2Conflict('Replacement and following takes do not fit the deadline.')
@@ -936,6 +999,8 @@ class System2Store:
             job.update(state='working', owner=owner, token=uuid.uuid4().hex,
                        lease_until=self.now() + lease_seconds, claimed_at=self.now(), attempts=job['attempts'] + 1)
             slot = self._get(db, 's2_slots', job['slot_id'])
+            self._slot_totals(db, slot)
+            job['air_room_seconds'] = slot['air_room_seconds']
             job['template'] = {k: copy.deepcopy(v) for k, v in slot.items()
                                if k not in {'allocations', 'heard_seconds', 'delivered_seconds'}}
             job['available_until_deadline_seconds'] = max(0.0, job['deadline'] - self.now())
@@ -1070,12 +1135,22 @@ class System2Store:
                 raise System2Conflict('This allocated performance is already dispatched or complete.')
             reason = self._eligible(db, candidate, max(self.now(), slot['start']))
             if reason: raise System2Conflict(reason)
-            if max(self.now(), slot['start']) + candidate['seconds'] > slot['deadline']:
+            metrics = self._slot_totals(db, slot)
+            index = slot['allocations'].index(allocation)
+            if not metrics[index]['retain']:
+                raise System2Conflict('Complete measured performance no longer fits the slot.')
+            if any(m['state'] in ('ready', 'reserved') for m in metrics[:index]):
+                raise System2Conflict('An earlier allocated performance has not completed.')
+            completed = [m['completed_at'] for m in metrics[:index] if m['state'] == 'completed']
+            begins = max(self.now(), slot['start'], float(allocation.get('planned_start') or 0),
+                         max(completed, default=0) + (ALLOCATION_TRANSITION_SECONDS if completed else 0))
+            if begins + self._air_seconds(candidate) > slot['deadline']:
                 raise System2Conflict('Complete measured performance no longer fits the slot.')
             row = {'id': uuid.uuid4().hex, 'slot_id': slot_id, 'hour_id': slot['hour_id'], 'candidate_id': candidate_id,
                 'revision': slot['revision'], 'owner': owner, 'token': uuid.uuid4().hex, 'request_id': request_id,
                 'state': 'reserved', 'lease_until': self.now() + lease_seconds, 'reserved_at': self.now(),
-                'candidate': copy.deepcopy(candidate), 'actual_seconds': candidate['seconds'], 'position_seconds': 0,
+                'candidate': copy.deepcopy(candidate), 'actual_seconds': candidate['seconds'],
+                'air_seconds': self._air_seconds(candidate), 'position_seconds': 0,
                 'heard_lines': [], 'heard_seconds': 0.0, 'delivered_seconds': 0.0, 'receipts': []}
             self._save(db, 's2_reservations', row, ('slot_id', 'candidate_id', 'state', 'request_id'))   # #1400
             self._slot_totals(db, slot)
@@ -1107,7 +1182,8 @@ class System2Store:
         if not self._slot_matches(candidate, slot): return 'candidate_target_changed'
         reason = self._eligible(db, candidate, self.now(), own=row['id'])
         if reason: return reason
-        duration = row['actual_seconds'] if seconds is None else _number(seconds, 'actual seconds', .001, 3600)
+        speech = row['actual_seconds'] if seconds is None else _number(seconds, 'actual seconds', .001, 3600)
+        duration = speech + max(0.0, float(row.get('air_seconds', speech)) - row['actual_seconds'])
         allowance = 0.0 if not grace else _number(grace, 'grace seconds', 0.0, 300.0)   # [#1191]
         if self.now() + duration - row['position_seconds'] > slot['deadline'] + allowance: return 'measured_duration_misses_deadline'
         return ''
@@ -1170,6 +1246,8 @@ class System2Store:
             slot = self._get(db, 's2_slots', row['slot_id'])
             if self.now() < slot['start']: reason = 'slot_has_not_started'
             if reason: raise System2Conflict(reason)
+            if seconds is not None:
+                row['air_seconds'] = seconds + max(0.0, float(row.get('air_seconds', row['actual_seconds'])) - row['actual_seconds'])
             row.update(state='playing', dispatched_at=self.now(), actual_seconds=seconds if seconds is not None else row['actual_seconds'])
             # A dispatch with no receipt is uncertain, never an automatically replayable lease.
             row['lease_until'] = self.now() + row['actual_seconds'] + 120

@@ -163,6 +163,7 @@ class System2RuntimeTests(unittest.IsolatedAsyncioTestCase):
         result = self.runtime.candidate('news', row)
         self.assertTrue(result['ready'])
         self.assertEqual(result['seconds'], 7)
+        self.assertAlmostEqual(result['air_seconds'], 13.08)
         self.assertEqual(result['slot_id'], row['system2_slot'])
         self.assertEqual([x['text'] for x in result['lines']], [x['text'] for x in row['takes']])
         self.assertEqual([x['voice'] for x in result['lines']], ['voice-dj', 'voice-cohost'])
@@ -371,6 +372,32 @@ class System2RuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.host._READY_SHELF_BUSY, set())
         self.assertEqual(self.runtime.store.reservations()[0]['state'], 'released')
         self.assertNotIn('aired', row)
+
+    async def test_fallback_waits_for_exact_published_take_to_finish(self):
+        self.host._SPEAKING = [False]
+        self.host._floor_busy = mock.Mock(return_value=False)
+        slot = {'id': 'current:news', 'revision': 7, 'kind': 'news',
+                'start': self.now - 10, 'deadline': self.now + 90,
+                'allocations': [{'candidate': {'id': 'booked'}}]}
+        self.runtime._plans = [{'slots': [slot]}]
+        proof = {'reservation_id': 'receipt-1', 'owner': 'system2-air',
+                 'token': 'token', 'slot_id': slot['id'], 'candidate_id': 'booked',
+                 'revision': slot['revision'], 'awaiting_ack': True}
+        self.runtime._dispatched[(slot['id'], 'booked')] = proof
+        self.assertFalse(self.runtime.fallback_due())
+        self.runtime.store.ack = mock.Mock(return_value={'changed': True})
+        self.runtime.acknowledge({'_system2': dict(proof)})
+        self.assertFalse(proof['awaiting_ack'])
+        self.assertTrue(self.runtime.fallback_due())
+        proof['awaiting_ack'] = True
+        proof['revision'] = 6
+        self.assertTrue(self.runtime.fallback_due())
+        proof['revision'] = 7
+        self.runtime._dispatched[('other:news', 'other')] = {
+            'slot_id': 'other:news', 'revision': 7, 'awaiting_ack': True}
+        self.assertFalse(self.runtime.fallback_due())
+        self.runtime._dispatched.pop((slot['id'], 'booked'))
+        self.assertFalse(self.runtime.fallback_due(), 'a released take still needs a new dispatch')
 
     async def test_heard_delivery_is_not_cancelled_at_slot_deadline(self):
         self.host.add('heard-across-deadline')

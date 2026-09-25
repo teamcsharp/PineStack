@@ -5021,6 +5021,13 @@
     return turns;
   }
 
+  function itinConversationSections(turns) {
+    return {
+      heard: turns.filter(function (turn) { return !!turn.aired; }),
+      planned: turns.filter(function (turn) { return !turn.aired; })
+    };
+  }
+
   function itinFact(table, label, value) {
     if (value === undefined || value === null || value === '') return;
     var tr = document.createElement('tr');
@@ -5291,16 +5298,27 @@
         if (entry.prompt) stage.appendChild(make('pre', 'sp-itin-setup', String(entry.prompt)));
         return;
       }
-      if (bound.length) {
-        var coverage = make('div', 'sp-itin-performance-total',
-          performancePlan.rows.length + (performancePlan.rows.length === 1
-            ? ' performance' : ' performances') + ' / '
-          + performancePlan.seconds.toFixed(1) + 's total coverage');
-        coverage.dataset.performances = String(performancePlan.rows.length);
-        stage.appendChild(coverage);
-      }
+      var sections = itinConversationSections(turns);
+      var displayTurns = sections.heard.concat(sections.planned);
+      var heardCount = sections.heard.length;
+      var phase = '';
       var shownPerformance = null;
-      turns.forEach(function (turn, index) {
+      displayTurns.forEach(function (turn, index) {
+        var nextPhase = turn.aired ? 'heard' : 'planned';
+        if (nextPhase !== phase) {
+          phase = nextPhase;
+          stage.appendChild(make('div', 'sp-itin-conversation-phase',
+            phase === 'heard' ? 'Heard / airing'
+              : heardCount ? 'Still planned' : 'Prepared for this slot'));
+          if (phase === 'planned' && bound.length) {
+            var coverage = make('div', 'sp-itin-performance-total',
+              performancePlan.rows.length + (performancePlan.rows.length === 1
+                ? ' planned performance' : ' planned performances') + ' / '
+              + performancePlan.seconds.toFixed(1) + 's planned coverage');
+            coverage.dataset.performances = String(performancePlan.rows.length);
+            stage.appendChild(coverage);
+          }
+        }
         var performanceIndex = turnPerformanceIndex(turn);
         if (!turn.aired && !turn.planned_sfx && performanceIndex !== shownPerformance) {
           shownPerformance = performanceIndex;
@@ -5310,7 +5328,7 @@
             seconds: 0, turns: 0};
           var boundary = make('div', 'sp-itin-performance-boundary', '');
           boundary.dataset.performance = String(performanceIndex);
-          boundary.appendChild(make('b', '', 'Performance ' + (performanceIndex + 1)));
+          boundary.appendChild(make('b', '', 'Planned performance ' + (performanceIndex + 1)));
           boundary.appendChild(make('span', '', [
             performance.candidate,
             performance.turns ? performance.turns + ' turns' : '',
@@ -14039,6 +14057,7 @@
       liveScriptEvents: liveScriptEvents, feedScriptEvents: feedScriptEvents,
       liveCueWindow: liveCueWindow, turnEditBody: turnEditBody,
       itinConversationTurns: itinConversationTurns,
+      itinConversationSections: itinConversationSections,
       itinBanked: itinBanked, itinAired: itinAired,
       folderRatioControls: folderRatioControls, folderSample: folderSample,
       bankSlotText: bankSlotText, planReviewLabel: planReviewLabel,

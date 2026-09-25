@@ -142073,7 +142073,12 @@ async def api_director_pending(most: int = DIRECTOR_QUEUE_MOST
 async def api_director_script(sid: str) -> dict[str, Any]:
     """One script, turn by turn, as it stands right now."""
     def work() -> dict[str, Any]:
-        kind, row, _c = director_resolve(sid=sid)
+        try:
+            kind, row, _c = director_resolve(sid=sid)
+        except HTTPException as exc:
+            if exc.status_code != 404:
+                raise
+            return director_archived_script(sid)
         entry = dialogue_entry(row) or {}
         return {"sid": sid, "kind": kind,
                 "turns": _director_turns(entry),
@@ -142086,6 +142091,45 @@ async def api_director_script(sid: str) -> dict[str, Any]:
                 "notes": [{"id": n["id"], "text": n["text"]}
                           for n in director_notes(kind, "standing")]}
     return await asyncio.to_thread(work)
+
+
+def director_archived_script(sid: str) -> dict[str, Any]:
+    """Retired air SIDs remain reviewable from the immutable script ledger."""
+    written = [row for row in script_ledger_rows() if row.get("sid") == sid]
+    if not written:
+        raise HTTPException(404, "No retained script answers to that id")
+    block = max(int(row.get("block") or 0) for row in written)
+    written = sorted((row for row in written if int(row.get("block") or 0) == block),
+                     key=lambda row: int(row.get("ord") or 0))
+    now = time.time()
+    air = [row for row in airlog_rows(now - AIRLOG_KEEP_S, now + 1, quiet=True)
+           if row.get("sid") == sid]
+    by_line: dict[str, list[dict[str, Any]]] = {}
+    for row in air:
+        by_line.setdefault(str(row.get("id") or ""), []).append(row)
+    turns = []
+    for index, row in enumerate(written):
+        receipts = by_line.get(str(row.get("line_id") or ""), [])
+        heard = next((item for item in receipts if line_was_heard(item)), None)
+        state = ("heard" if heard else "withdrawn" if any(
+            item.get("aired") == "withdrawn" for item in receipts) else
+            "published" if receipts else "written")
+        turns.append({"index": index, "seat": str(row.get("who") or ""),
+                      "who": str(row.get("who") or "Speaker"),
+                      "kind": str(row.get("kind") or "dialogue"),
+                      "text": str(row.get("text") or ""),
+                      "seconds": float(row.get("seconds") or 0),
+                      "line": str(row.get("line_id") or ""),
+                      "air_state": state,
+                      "heard_at": line_heard_at(heard) if heard else 0.0})
+    return {"sid": sid, "kind": str(written[0].get("round") or ""),
+            "turns": turns, "kept": False,
+            "aired": int(any(turn["air_state"] == "heard" for turn in turns)),
+            "heard_lines": sum(turn["air_state"] == "heard" for turn in turns),
+            "seconds": round(sum(turn["seconds"] for turn in turns), 1),
+            "archived": True, "read_only": True,
+            "source": "script-ledger", "block": block,
+            "review": {}, "tints": [], "beats": [], "notes": []}
 
 
 @app.post("/api/director/script/{sid}/seen")
@@ -195818,11 +195862,13 @@ async function dirScriptOpen(sid) {
   catch (e) { body.textContent = "That script could not be read: " + e; return; }
   if (!dirQueue || dirQueue.script !== sid) return;
   /* Opening it is what clears the notification — and ONLY that. */
-  try {
-    await api("/api/director/script/" + encodeURIComponent(sid) + "/seen",
-      {method: "POST", body: JSON.stringify({kind: got.kind})});
-    dirQueueTick();
-  } catch (e) { /* the badge can lag */ }
+  if (!got.read_only) {
+    try {
+      await api("/api/director/script/" + encodeURIComponent(sid) + "/seen",
+        {method: "POST", body: JSON.stringify({kind: got.kind})});
+      dirQueueTick();
+    } catch (e) { /* the badge can lag */ }
+  }
   dirScreenplayCss();
   body.textContent = "";
   caption.textContent = got.kind + " · " + (got.turns || []).length
@@ -195870,7 +195916,9 @@ async function dirScriptOpen(sid) {
   backToRoom.onclick = postNote;
   note.onkeydown = (ev) => { if (ev.key === "Enter") postNote(); };
   [note, keep, backToRoom].forEach((n) => noteBar.appendChild(n));
-  body.appendChild(noteBar);
+  if (!got.read_only) body.appendChild(noteBar);
+  else body.appendChild(el("div", "dir-sub",
+    "Archived performance / " + (got.heard_lines || 0) + " lines heard"));
 
   if ((got.notes || []).length) {
     const box = el("details", "", "");
@@ -195896,6 +195944,7 @@ async function dirScriptOpen(sid) {
   page.appendChild(slug);
   (got.turns || []).forEach((t) => page.appendChild(dirTurnRow(got, t)));
   body.appendChild(page);
+  if (got.read_only) return;
 
   /* WHAT CAN BE DONE TO THE WHOLE SCRIPT. */
   const foot = el("div", "dir-add", "");
@@ -196140,6 +196189,10 @@ function dirTurnRow(got, t) {
   wrap.appendChild(el("div", "sp-cue", dirCue(t)));
   const para = el("div", "sp-para", dirWrap(t.text, 58));
   wrap.appendChild(para);
+  if (got.read_only) {
+    wrap.appendChild(el("div", "sp-paren", String(t.air_state || "written")));
+    return wrap;
+  }
   if (t.tinted) {
     wrap.appendChild(el("div", "sp-paren", "(a tinted version is stored: "
       + t.tinted.slice(0, 90) + ")"));
@@ -200306,12 +200359,40 @@ function scopeAccentNow() {
 }
 function scopeAccentForget() { scopeAccent = ""; }
 
+let musicScopeVisible = true;
+let observedMusicScope = null;
+const musicScopeObserver = PINE_TABLET && typeof IntersectionObserver === "function"
+  ? new IntersectionObserver((entries) => {
+      for (const entry of entries) {
+        if (entry.target === observedMusicScope)
+          musicScopeVisible = entry.isIntersecting;
+      }
+    })
+  : null;
+
+function musicScopeOnscreen(canvas) {
+  if (!musicScopeObserver || canvas.id !== "musicScope") return true;
+  if (observedMusicScope !== canvas) {
+    if (observedMusicScope) musicScopeObserver.unobserve(observedMusicScope);
+    observedMusicScope = canvas;
+    musicScopeVisible = true;
+    musicScopeObserver.observe(canvas);
+  }
+  return musicScopeVisible;
+}
+
 function drawScope(canvas, player) {
   if (!canvas || !player) return;
   // #745: costs nothing while it cannot be seen. The booth dock's scope
   // kept drawing at 60fps with the dock stowed.
   if (!canvas.offsetParent) return;
   const scope = audioScope(player);
+  if (scope && scope.context.state === "suspended" && !player.paused) {
+    scope.context.resume().catch(() => {});
+  }
+  // The main music scope can be mounted far below the tablet's Script pane.
+  // offsetParent stays non-null there, so let the viewport observer hold its paint.
+  if (!musicScopeOnscreen(canvas)) return;
   const ctx = canvas.getContext("2d");
   // #745: this was `canvas.width = canvas.clientWidth * dpr` EVERY FRAME —
   // the exact fault #737 fixed for the booth glass and never fixed here.
@@ -200337,9 +200418,6 @@ function drawScope(canvas, player) {
   const width = canvas.width, height = canvas.height;
   ctx.clearRect(0, 0, width, height);
   if (!scope) return;
-  if (scope.context.state === "suspended" && !player.paused) {
-    scope.context.resume().catch(() => {});
-  }
   // Nothing playing, nothing to draw — the cleared canvas is the answer.
   if (player.paused || player.ended) return;
 

@@ -80,6 +80,11 @@ def settings_for_work(settings):
         if value > 0:
             seconds = min(seconds, value)
     turns = 11 if work.get("kind") == "caller" else max(4, min(12, int(work.get("generation_turns") or 6)))
+    if "air_room_seconds" in template:
+        lead = max(0.0, float(os.getenv("VOICE_BROADCAST_LEAD_MS", "7000"))) / 1000.0
+        tail = max(0.0, float(os.getenv("BOX_TAIL_MS", "900"))) / 1000.0
+        reserve = 9.0 + lead + tail + max(0, turns - 1) * 0.18
+        seconds = min(seconds, max(0.0, float(template["air_room_seconds"]) - reserve))
     # Keep assembly/lead and one four-second board clip per host pair free.
     # 170wpm is an estimate; 25% headroom anticipates the later rhyme rewrite.
     overhead = 8 + 4 * (turns // 2)
@@ -206,6 +211,11 @@ class System2Runtime:
                and (slot["id"], a["candidate"]["id"]) not in self._dispatched
                for a in slot.get("allocations", [])):
             return False
+        if any(proof.get("slot_id") == slot["id"]
+               and proof.get("revision") == slot["revision"]
+               and proof.get("awaiting_ack")
+               for proof in self._dispatched.values()):
+            return False
         h = self.host
         try:
             if h._SPEAKING[0] or h._floor_busy():
@@ -326,7 +336,15 @@ class System2Runtime:
             # the status page showed it as ready. Say it, and say it here.
             reason.append("Past its expiry; the planner no longer offers it")
             viable = False
-        result = {"id": identity, "kind": kind, "seconds": sum(float(x.get("seconds") or 0) for x in lines),
+        speech_seconds = sum(float(x.get("seconds") or 0) for x in lines)
+        air_seconds = speech_seconds
+        if kind != "track_talk" and complete:
+            beat = max(getattr(h, "CONCAT_BEAT", (0.07, 0.18)))
+            tail = max(0.0, float(os.getenv("BOX_TAIL_MS", "900"))) / 1000.0
+            lead = max(0.0, float(getattr(h, "VOICE_BROADCAST_LEAD_MS", 0))) / 1000.0
+            air_seconds += max(0, len(lines) - 1) * beat + tail + 5.0 + lead
+        result = {"id": identity, "kind": kind, "seconds": speech_seconds,
+                  "air_seconds": air_seconds,
                   "ready": complete,
                   "eligible": viable, "expires_at": expires,
                   "repeat_guard": self.content_gate_enabled("repetition"),
@@ -1214,7 +1232,7 @@ class System2Runtime:
                     "Keep each turn to one or two short speakable sentences. Finish the thought within its own turn.")
                 budget = settings_for_work({}).get("system2_budget") or {}
                 minimum_scene = float(budget.get("reserved_seconds") or 0) + int(budget.get("turns") or 1) * 6 * 60 / 170
-                available = min(float(job["template"].get("debt_seconds") or job["template"].get("target_seconds") or 90),
+                available = min(float(budget.get("seconds") or 0),
                                 float(job["hard_deadline"]) - time.time())
                 if kind not in ("track_talk", "ad", "station_id") and available < minimum_scene:
                     work.update(state="waiting", why="Remaining time cannot fit a complete scene; no padded or truncated scene will be commissioned",
@@ -1594,7 +1612,8 @@ class System2Runtime:
                 except System2Conflict:
                     continue
                 proof = {"reservation_id": reservation["id"], "owner": "system2-air", "token": reservation["token"],
-                         "slot_id": slot["id"], "candidate_id": candidate["id"]}
+                         "slot_id": slot["id"], "candidate_id": candidate["id"],
+                         "revision": slot["revision"]}
                 if slot.get("event_id"):
                     event = self.store.claim_event("system2-air", event_id=slot["event_id"], lease_seconds=1800)
                     if not event:
@@ -1720,6 +1739,7 @@ class System2Runtime:
                     # hand-over for a deadline validate() had accepted.
                     self.store.mark_dispatched(proof["reservation_id"], proof["owner"],
                                                token=proof["token"], grace=_grace())
+                    proof["awaiting_ack"] = True
                     self._dispatched[(slot["id"], candidate["id"])] = proof
                     handed = True
 
@@ -1773,6 +1793,9 @@ class System2Runtime:
             return
         result = self.store.ack(proof["reservation_id"], proof["owner"], proof["reservation_id"] + ":complete",
                                 token=proof["token"], completed=True, audible=True)
+        dispatched = self._dispatched.get((proof.get("slot_id"), proof.get("candidate_id")))
+        if dispatched and dispatched.get("reservation_id") == proof["reservation_id"]:
+            dispatched["awaiting_ack"] = False
         if not result.get("changed"):
             return
         if proof.get("event_id"):

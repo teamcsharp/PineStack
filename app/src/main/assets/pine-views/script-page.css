@@ -2810,6 +2810,21 @@ video.sp-folder-media { height: auto; max-height: 120px; background: #000000; bo
   width: 100%; max-height: none; overflow: visible; padding: 10px 8px;
   box-sizing: border-box;
 }
+.sp-itin-conversation-phase {
+  margin: 12px 0 7px; padding-bottom: 5px;
+  border-bottom: 1px solid #34454d;
+  color: #b7c8cf; font-size: 11px; font-weight: 700;
+}
+.sp-itin-performance-total {
+  margin: 4px 0 8px; color: #80bbc5; font-size: 11px;
+}
+.sp-itin-performance-boundary {
+  display: flex; flex-wrap: wrap; gap: 4px 8px;
+  margin: 10px 0 5px; color: #b7c8cf; font-size: 11px;
+}
+.sp-itin-performance-boundary span {
+  overflow-wrap: anywhere; color: #86a5ad;
+}
 .sp-itin-message {
   width: min(88%, 680px); max-width: 100%; min-height: 42px;
   display: grid; grid-template-columns: 38px minmax(0, 1fr); gap: 8px;
