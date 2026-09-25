@@ -9662,7 +9662,11 @@
     var log = (state && state.activity_log) || [];
     for (var k = 0; k < log.length; k += 1) {
       var ev = log[k];
-      var key = 'ev' + (ev && ev.at) + String((ev && ev.stage) || '');
+      /* Several receipts can land during the same second. Include the
+         durable line id so an SFX clip and its reaction cannot hide each
+         other behind the old timestamp-and-stage key. */
+      var key = 'ev' + (ev && ev.at) + String((ev && ev.stage) || '')
+        + String((ev && ev.line) || '') + String((ev && ev.text) || '');
       if (!ev || seen[key]) continue;
       seen[key] = true;
       /* A voicing event names a line but historically carries no cast
@@ -9772,6 +9776,11 @@
       var speaker = feedSpeaker(row);
       return speaker ? speaker + ' rendering' : 'Voice rendering';
     }
+    if (stage === 'sfx') return 'The SFX Guy played a clip';
+    if (stage === 'sfxguy') return 'The SFX Guy';
+    if (stage === 'sfxreaction') {
+      return (feedSpeaker(row) || 'A host') + ' reacts to SFX';
+    }
     if (stage) return feedHuman(stage);
     if (kind === 'interject' || kind === 'image_analysis' || kind === 'sfx') {
       return feedHuman(kind);
@@ -9807,6 +9816,9 @@
     }
     if (stage === 'writing') return 'preparing dialogue for a scheduled segment';
     if (stage === 'action') return 'coordinating the broadcast and its prepared material';
+    if (stage === 'sfx') return 'confirmed by audible playout; written to the SFX rotation';
+    if (stage === 'sfxguy') return 'confirmed by audible playout; the prepared interjection landed';
+    if (stage === 'sfxreaction') return 'the one-in-three host reaction landed after the clip';
     if (String(row.kind || '').toLowerCase() === 'sfx') {
       return speaker ? 'punctuating ' + speaker + "'s segment" : 'punctuating the live segment';
     }

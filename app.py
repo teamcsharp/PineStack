@@ -80868,10 +80868,12 @@ def _sfx_cadence_audible(rows, position: float, previous: float = 0.0) -> None:
                  "sample": str(r.get("sfx_sample_id") or "")} for r in complete]
     added = set(_SFX_CADENCE.record(receipts)) if receipts else set()
     for row in complete:
-        if str(row["id"]) in added and row.get("sfx_sample_id"):
+        heard = str(row["id"]) in added
+        if heard and row.get("sfx_sample_id"):
+            sample_name = str(row.get("text") or "").removeprefix("🔊 ")
             try:
                 sample_id = str(row["sfx_sample_id"])
-                sfx_note_play(sample_id, str(row.get("text") or "").removeprefix("🔊 "), "board")
+                sfx_note_play(sample_id, sample_name, "board")
                 # A cadence clip is welded into a finished broadcast clip, not
                 # sent through dj_sting().  It still needs the same durable
                 # on-air history as a manually cued sting once its receipt is
@@ -80882,12 +80884,27 @@ def _sfx_cadence_audible(rows, position: float, previous: float = 0.0) -> None:
                     sfx_history_add(source, "board")
             except Exception:
                 pass  # the durable cadence receipt is already saved
-        if str(row["id"]) in added and row.get("sfx_video_id"):
+            # History is durable but lives in its own drawer. Make the
+            # confirmed playout visible in the live feed, never at draw time.
+            note_activity(
+                "sfx",
+                "MP4 clip heard" if row.get("sfx_video_id") else "audio clip heard",
+                line=str(row["id"]), text=sample_name,
+                speaker="The SFX Guy")
+        elif heard and row.get("sfxguy_reservation"):
+            note_activity("sfxguy", "interjection heard", line=str(row["id"]),
+                          text=str(row.get("text") or ""),
+                          speaker="The SFX Guy")
+        elif heard and row.get("sfx_reaction_for"):
+            speaker = booth_actor_name(str(row.get("who") or ""), "")
+            note_activity("sfxreaction", "reacted to the board", line=str(row["id"]),
+                          text=str(row.get("text") or ""), speaker=speaker)
+        if heard and row.get("sfx_video_id"):
             try:
                 sfx_video_note_played(str(row["sfx_video_id"]))
             except Exception:
                 pass
-        if str(row["id"]) in added and row.get("sfxguy_reservation"):
+        if heard and row.get("sfxguy_reservation"):
             sfxguy_ready_commit(str(row["sfxguy_reservation"]))
 
 
