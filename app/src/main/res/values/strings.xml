@@ -42,6 +42,10 @@
     <string name="rail_corners">Hot corners</string>
     <string name="rail_corners_switch">Hot corners</string>
     <string name="rail_corners_note">corner swipes toward the centre · the screen ring holds %1$d s</string>
+    <string name="rail_corner_zone">Activation zone</string>
+    <string name="rail_corner_zone_value">Activation zone: %1$d px</string>
+    <string name="rail_corner_sensitivity">Gesture sensitivity</string>
+    <string name="rail_corner_sensitivity_value">Gesture sensitivity: %1$d%%</string>
     <string name="rail_corner_tl">Top left</string>
     <string name="rail_corner_tr">Top right</string>
     <string name="rail_corner_bl">Bottom left</string>

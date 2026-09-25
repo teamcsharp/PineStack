@@ -17,6 +17,7 @@ import androidx.drawerlayout.widget.DrawerLayout
 import com.pinebox.kiosk.R
 import com.pinebox.kiosk.config.ConfigStore
 import com.pinebox.kiosk.config.HotCorners
+import com.pinebox.kiosk.config.HotCornerPrefs
 import com.pinebox.kiosk.replay.ScreenReplay
 import com.pinebox.kiosk.net.StationClient
 import com.pinebox.kiosk.power.PowerWatch
@@ -74,6 +75,10 @@ class RailController(
     /* ---- the hot corners - see config/HotCorners.kt ---- */
     private val cornersOn: SwitchCompat = rail.findViewById(R.id.cornersOn)
     private val cornersNote: TextView = rail.findViewById(R.id.cornersNote)
+    private val cornerZone: SeekBar = rail.findViewById(R.id.cornerZone)
+    private val cornerZoneLabel: TextView = rail.findViewById(R.id.cornerZoneLabel)
+    private val cornerSensitivity: SeekBar = rail.findViewById(R.id.cornerSensitivity)
+    private val cornerSensitivityLabel: TextView = rail.findViewById(R.id.cornerSensitivityLabel)
     private val cornerSpinners: Map<String, Spinner> = mapOf(
         "tl" to rail.findViewById(R.id.corner_tl),
         "tr" to rail.findViewById(R.id.corner_tr),
@@ -1387,6 +1392,53 @@ class RailController(
             setCorners(JSONObject().put("enabled", on),
                 if (on) "hot corners on" else "hot corners off")
         }
+        cornerZone.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(bar: SeekBar, value: Int, fromUser: Boolean) {
+                cornerZoneLabel.text = rail.resources.getString(
+                    R.string.rail_corner_zone_value,
+                    value.coerceIn(
+                        HotCornerPrefs.MIN_ACTIVATION_ZONE_PX,
+                        HotCornerPrefs.MAX_ACTIVATION_ZONE_PX,
+                    ),
+                )
+            }
+
+            override fun onStartTrackingTouch(bar: SeekBar) = Unit
+
+            override fun onStopTrackingTouch(bar: SeekBar) {
+                if (cornersSyncing) return
+                val value = bar.progress.coerceIn(
+                    HotCornerPrefs.MIN_ACTIVATION_ZONE_PX,
+                    HotCornerPrefs.MAX_ACTIVATION_ZONE_PX,
+                )
+                if (value != HotCorners.live.activationZonePx) {
+                    setCorners(JSONObject().put("activationZonePx", value),
+                        "activation zone: $value px")
+                }
+            }
+        })
+        cornerSensitivity.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(bar: SeekBar, value: Int, fromUser: Boolean) {
+                cornerSensitivityLabel.text = rail.resources.getString(
+                    R.string.rail_corner_sensitivity_value,
+                    value.coerceIn(HotCornerPrefs.MIN_SENSITIVITY, HotCornerPrefs.MAX_SENSITIVITY),
+                )
+            }
+
+            override fun onStartTrackingTouch(bar: SeekBar) = Unit
+
+            override fun onStopTrackingTouch(bar: SeekBar) {
+                if (cornersSyncing) return
+                val value = bar.progress.coerceIn(
+                    HotCornerPrefs.MIN_SENSITIVITY,
+                    HotCornerPrefs.MAX_SENSITIVITY,
+                )
+                if (value != HotCorners.live.sensitivity) {
+                    setCorners(JSONObject().put("sensitivity", value),
+                        "gesture sensitivity: $value%")
+                }
+            }
+        })
         cornersNote.text = rail.resources.getString(R.string.rail_corners_note,
             ScreenReplay.HOLD_SECONDS)
         /* From the store once, so the rows show what was saved rather than
@@ -1427,6 +1479,20 @@ class RailController(
                 spinner.isEnabled = prefs.enabled
                 spinner.alpha = if (prefs.enabled) 1f else 0.45f
             }
+            if (cornerZone.progress != prefs.activationZonePx) {
+                cornerZone.progress = prefs.activationZonePx
+            }
+            if (cornerSensitivity.progress != prefs.sensitivity) {
+                cornerSensitivity.progress = prefs.sensitivity
+            }
+            cornerZoneLabel.text = rail.resources.getString(
+                R.string.rail_corner_zone_value, prefs.activationZonePx)
+            cornerSensitivityLabel.text = rail.resources.getString(
+                R.string.rail_corner_sensitivity_value, prefs.sensitivity)
+            cornerZone.isEnabled = prefs.enabled
+            cornerSensitivity.isEnabled = prefs.enabled
+            cornerZone.alpha = if (prefs.enabled) 1f else 0.45f
+            cornerSensitivity.alpha = if (prefs.enabled) 1f else 0.45f
         } finally {
             cornersSyncing = false
         }

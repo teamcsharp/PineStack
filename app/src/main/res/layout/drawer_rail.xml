@@ -677,6 +677,42 @@
                 android:textSize="11sp"
                 tools:text="corner swipes toward the centre · the screen ring holds 1200 s" />
 
+            <TextView
+                android:id="@+id/cornerZoneLabel"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:text="@string/rail_corner_zone"
+                android:textColor="@color/pine_ink"
+                android:textSize="13sp" />
+
+            <SeekBar
+                android:id="@+id/cornerZone"
+                android:layout_width="match_parent"
+                android:layout_height="@dimen/tap"
+                android:contentDescription="@string/rail_corner_zone"
+                android:max="120"
+                android:min="20"
+                android:progress="42" />
+
+            <TextView
+                android:id="@+id/cornerSensitivityLabel"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:text="@string/rail_corner_sensitivity"
+                android:textColor="@color/pine_ink"
+                android:textSize="13sp" />
+
+            <SeekBar
+                android:id="@+id/cornerSensitivity"
+                android:layout_width="match_parent"
+                android:layout_height="@dimen/tap"
+                android:contentDescription="@string/rail_corner_sensitivity"
+                android:max="100"
+                android:min="0"
+                android:progress="50" />
+
             <!-- One row per corner: its name, then what a swipe out of it
                  toward the centre does. -->
             <LinearLayout

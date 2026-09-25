@@ -95,6 +95,8 @@ data class HotCornerPrefs(
     val tr: String = "export",
     val bl: String = "inspect",
     val br: String = "sfx",
+    val activationZonePx: Int = DEFAULT_ACTIVATION_ZONE_PX,
+    val sensitivity: Int = DEFAULT_SENSITIVITY,
 ) {
     fun of(corner: String): String = when (corner) {
         "tl" -> tl
@@ -110,6 +112,8 @@ data class HotCornerPrefs(
         .put("tr", tr)
         .put("bl", bl)
         .put("br", br)
+        .put("activationZonePx", activationZonePx)
+        .put("sensitivity", sensitivity)
 
     /** Merge a partial patch. A corner given a word not in [ACTIONS] keeps
      *  what it had, so a typo from the page cannot leave a corner in a
@@ -126,10 +130,30 @@ data class HotCornerPrefs(
             tr = corner("tr", tr),
             bl = corner("bl", bl),
             br = corner("br", br),
+            activationZonePx = bounded(
+                patch.optInt("activationZonePx", activationZonePx),
+                MIN_ACTIVATION_ZONE_PX,
+                MAX_ACTIVATION_ZONE_PX,
+            ),
+            sensitivity = bounded(
+                patch.optInt("sensitivity", sensitivity),
+                MIN_SENSITIVITY,
+                MAX_SENSITIVITY,
+            ),
         )
     }
 
     companion object {
+        const val MIN_ACTIVATION_ZONE_PX = 20
+        const val MAX_ACTIVATION_ZONE_PX = 120
+        const val DEFAULT_ACTIVATION_ZONE_PX = 42
+        const val MIN_SENSITIVITY = 0
+        const val MAX_SENSITIVITY = 100
+        const val DEFAULT_SENSITIVITY = 50
+
+        fun bounded(value: Int, minimum: Int, maximum: Int): Int =
+            value.coerceIn(minimum, maximum)
+
         /** The contract with pine-views/hot-corners.js, one word each. */
         val ACTIONS = setOf("off", "shot", "export", "inspect", "sfx", "report")
     }
