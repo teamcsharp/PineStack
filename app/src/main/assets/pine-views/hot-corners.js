@@ -2274,10 +2274,10 @@
     var send = button('hc-btn hc-primary hc-wide', 'Make H3 station stinger', 'c:play--filled');
     send.addEventListener('click', function () {
       send.disabled = true;
-      status.textContent = 'Queuing the H3 stinger and making room if needed...';
+      status.textContent = '';
       stationPost('/api/sfx/' + encodeURIComponent(key) + '/h3-stinger', {}).then(function (got) {
-        status.textContent = String((got && got.message) || 'H3 stinger queued for the station and gallery.');
-        toast('H3 stinger queued from ' + name);
+        status.textContent = String((got && got.message) || 'Request completed.');
+        toast('Request completed.');
       }, function (err) {
         send.disabled = false;
         status.textContent = String((err && err.message) || err || 'The H3 stinger could not be queued.');

@@ -21,14 +21,22 @@ class ParodyQueueContractTests(unittest.TestCase):
             queue.update(first["id"], "done")
             self.assertEqual(queue.claim(second["id"])["source"], "two")
 
-    def test_uncertain_submission_does_not_replay_after_restart(self):
+    def test_uncertain_submission_recovers_after_restart(self):
         with tempfile.TemporaryDirectory() as root:
             path = Path(root) / "jobs.sqlite3"
             queue = ParodyQueue(path)
             item = queue.add({"source": "one", "prompt": "First"})
             queue.claim(item["id"])
             queue = ParodyQueue(path)
-            self.assertEqual(queue.get(item["id"])["status"], "paused")
+            self.assertEqual(queue.get(item["id"])["status"], "queued")
+            self.assertEqual(queue.next()["id"], item["id"])
+
+    def test_retry_stays_pending_until_the_backoff_expires(self):
+        with tempfile.TemporaryDirectory() as root:
+            queue = ParodyQueue(Path(root) / "jobs.sqlite3")
+            item = queue.add({"source": "one", "prompt": "First"})
+            queue.retry(item["id"], "ComfyUI is restarting", delay_s=60)
+            self.assertEqual(queue.get(item["id"])["status"], "queued")
             self.assertIsNone(queue.next())
 
 

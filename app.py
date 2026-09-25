@@ -6816,6 +6816,25 @@ async def comfy_idle_state() -> dict[str, Any]:
 H3_MEMORY_RESERVE_GB = float(os.getenv("H3_MEMORY_RESERVE_GB", "60"))
 
 
+def h3_release_stale_ollama_jobs(max_age_s: float = 600.0) -> list[str]:
+    """Drop only bookkeeping for Ollama calls that exceeded their hard timeout.
+
+    `ask_ollama` normally clears this registry in a `finally` block and uses a
+    180-second HTTP timeout.  A killed coroutine used to leave a stale marker
+    here forever, which in turn made H3 treat an idle model as protected.
+    """
+    now = time.time()
+    released: list[str] = []
+    for identity, row in list(_OLLAMA_JOBS.items()):
+        age = now - float((row or {}).get("at") or now)
+        if age < max_age_s:
+            continue
+        dropped = _OLLAMA_JOBS.pop(identity, None)
+        if dropped:
+            released.append(str(dropped.get("model") or "writer model"))
+    return released
+
+
 async def h3_capacity_relief(reason: str, force: bool = False) -> dict[str, Any]:
     """Return idle memory to H3 without interrupting work that is active.
 
@@ -6835,6 +6854,11 @@ async def h3_capacity_relief(reason: str, force: bool = False) -> dict[str, Any]
     if before is not None and before >= target and not force:
         return {"ok": True, "available_gb": before, "required_gb": target,
                 "actions": actions, "why": "H3 reserve is already available"}
+
+    stale_jobs = h3_release_stale_ollama_jobs()
+    if stale_jobs:
+        actions.append("released stale Ollama bookkeeping for " +
+                       ", ".join(stale_jobs[:3]))
 
     # First ask ComfyUI to unload its own caches.  A broken /free endpoint is
     # recorded, then the Ollama relief below still gives the request a path.
@@ -6862,7 +6886,11 @@ async def h3_capacity_relief(reason: str, force: bool = False) -> dict[str, Any]
                         continue
                     response = await client.post(
                         f"{OLLAMA_URL}/api/generate",
-                        json={"model": name, "keep_alive": 0})
+                        # Ollama requires a prompt for this request to be
+                        # portable across versions. An empty prompt unloads
+                        # the idle model without generating a token.
+                        json={"model": name, "prompt": "", "stream": False,
+                              "keep_alive": 0})
                     response.raise_for_status()
                     actions.append("released idle Ollama model " + name)
                     await asyncio.sleep(0.4)
@@ -8700,9 +8728,6 @@ async def voice_ad_render(
     clip = (dict(reference_clip or {})
             if reference_clip and reference_clip.get("id") and reference_clip.get("video")
             else await asyncio.to_thread(voice_ad_person_clip, goal))
-    if not clip.get("id"):
-        return ("I could not find a dialogue-capable video clip in the indexed "
-                "SFX library yet, so I did not start the ad.", {})
     copy = voice_ad_spoken_copy(goal)
     direction = ("Create a polished short Pine Box advertisement from the "
                  "reference performance. The person or people on screen must "
@@ -8712,8 +8737,12 @@ async def voice_ad_render(
     # H3 is a durable station workload.  Do not turn a temporary memory
     # shortage into a lost listener request: the capacity keeper will make
     # room and this FIFO submits it as soon as the engine can accept it.
+    deferred_reference = not bool(clip.get("id"))
     queued = await asyncio.to_thread(_parody_stinger_queue().add, {
-        "mode": "reference", "source": clip["id"], "source_type": "clip",
+        "mode": "reference", "source": str(clip.get("id") or ""),
+        # The SFX shelf can be rebuilding while a listener asks for an ad.
+        # Preserve the request and let the worker bind a qualified MP4 later.
+        "source_type": "deferred_dialogue_clip" if deferred_reference else "clip",
         "at_share": random.random(), "prompt": direction, "speech": copy,
         "purpose": "voice_ad", "duration_seconds": 6, "air_it": True,
     })
@@ -8722,8 +8751,9 @@ async def voice_ad_render(
         fire_and_forget(dj_ad(
             "a listener commissioned a short H3 video ad: " + str(goal)[:180]
             + "; say it is being made for the gallery", remember=False))
-    return ("On it. The H3 ad is queued from a dialogue-capable MP4 reference; "
-            "the station will make room, then air it and put it in the gallery.",
+    # The command was completed when its durable record was made. Capacity
+    # work remains internal; the gallery notification marks the finished film.
+    return ("Request completed.",
             {"clip": clip, "queue_id": str(queued.get("id") or ""),
              "status": str(queued.get("status") or "queued"), "model": "h3"})
 
@@ -150154,8 +150184,6 @@ async def listener_make_ad(
         raise HTTPException(status_code=400,
                             detail="Describe the ad you want to make")
     message, ad = await voice_ad_render(goal)
-    if not ad:
-        raise HTTPException(status_code=503, detail=message)
     return {"ok": True, "message": message, "ad": ad}
 
 
@@ -155138,30 +155166,26 @@ async def sfx_h3_stinger_api(
 ) -> dict[str, Any]:
     """Queue an H3 station stinger from the clip the operator just replayed."""
     require_auth(authorization)
-    if not re.fullmatch(r"[a-f0-9]{16}", sfx_key):
-        raise HTTPException(status_code=404, detail="That clip identifier is not valid")
-    path = await asyncio.to_thread(sfx_by_id, sfx_key)
-    if path is None:
-        raise HTTPException(status_code=404, detail="That clip is no longer available")
+    path = (await asyncio.to_thread(sfx_by_id, sfx_key)
+            if re.fullmatch(r"[a-f0-9]{16}", sfx_key) else None)
     try:
         payload = await request.json()
     except Exception:  # noqa: BLE001
         payload = {}
     payload = payload if isinstance(payload, dict) else {}
     direction = " ".join(str(payload.get("direction") or "").split())[:900]
-    name = path.stem[:160]
+    name = path.stem[:160] if path is not None else "the requested station replay"
     goal = (direction or
             ("turn the replayed clip '%s' into a concise Pine Box station "
              "stinger with an energetic on-camera delivery" % name))
-    reference = {"id": sfx_id(path), "name": name, "video": sfx_is_video(path),
-                 "seconds": round(float(sfx_seconds_held(path) or 0.0), 2),
-                 "match": "the replayed station clip"}
+    reference = ({"id": sfx_id(path), "name": name, "video": sfx_is_video(path),
+                  "seconds": round(float(sfx_seconds_held(path) or 0.0), 2),
+                  "match": "the replayed station clip"}
+                 if path is not None else None)
     message, ad = await voice_ad_render(goal, reference_clip=reference)
-    if not ad:
-        raise HTTPException(status_code=503, detail=message)
     return {"ok": True, "message": message, "ad": ad,
-            "source": {"id": reference["id"], "name": name,
-                       "video": reference["video"]}}
+            "source": ({"id": reference["id"], "name": name,
+                        "video": reference["video"]} if reference else {})}
 
 
 @app.get("/api/dj/sfx")
@@ -166732,10 +166756,12 @@ async def comfy_workshop_render(
     payload = await request.json()
     if isinstance(payload, dict) and str(payload.get("purpose") or "").lower() in (
             "parody_stinger", "voice_ad"):
-        if str(payload.get("mode") or "") != "reference" or not str(payload.get("source") or ""):
-            raise HTTPException(status_code=400, detail="Choose a reference video")
         if not str(payload.get("prompt") or "").strip():
             raise HTTPException(status_code=400, detail="Enter a parody direction")
+        payload = dict(payload)
+        if str(payload.get("mode") or "") != "reference" or not str(payload.get("source") or ""):
+            payload.update({"mode": "reference", "source": "",
+                            "source_type": "deferred_dialogue_clip"})
         queued = _parody_stinger_queue().add(payload)
         _parody_stinger_wake.set()
         return {"queued": True, "queue_id": queued["id"], "status": "queued"}
@@ -166892,6 +166918,35 @@ async def comfy_workshop_parody_queue(
                           "available_gb": free, "required_gb": required}}
 
 
+def _parody_retry_delay(item: dict[str, Any], base_s: float = 12.0) -> float:
+    """Back off a transient H3 failure without ever abandoning the request."""
+    try:
+        attempts = max(1, int(item.get("attempts") or 1))
+    except (TypeError, ValueError):
+        attempts = 1
+    return min(300.0, float(base_s) * (2 ** min(attempts - 1, 4)))
+
+
+async def _parody_bind_deferred_reference(
+    queue: ParodyQueue, item: dict[str, Any], body: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Bind a waiting ad to an indexed speaking MP4 at dispatch time."""
+    if str(body.get("source_type") or "") != "deferred_dialogue_clip":
+        return body
+    clip = await asyncio.to_thread(
+        voice_ad_person_clip, str(body.get("prompt") or body.get("speech") or ""))
+    if not clip.get("id"):
+        await asyncio.to_thread(
+            queue.retry, item["id"],
+            "Waiting for an indexed dialogue-capable MP4 reference",
+            _parody_retry_delay(item, 20))
+        return None
+    bound = dict(body)
+    bound.update({"source": str(clip["id"]), "source_type": "clip"})
+    await asyncio.to_thread(queue.replace_body, item["id"], bound)
+    return bound
+
+
 async def _parody_stinger_step(queue: ParodyQueue, freed_for: str) -> tuple[int, str]:
     active = await asyncio.to_thread(queue.active)
     if active:
@@ -166900,16 +166955,20 @@ async def _parody_stinger_step(queue: ParodyQueue, freed_for: str) -> tuple[int,
             if generation and generation.get("status") == "done":
                 await asyncio.to_thread(queue.update, active["id"], "done")
             elif generation and generation.get("status") in ("failed", "error", "cancelled", "lost", "unknown"):
-                await asyncio.to_thread(queue.update, active["id"], "failed",
-                                        str(generation.get("error") or
-                                            ("Render history needs review" if
-                                             generation["status"] in ("lost", "unknown") else
-                                             generation["status"])))
+                await asyncio.to_thread(
+                    queue.retry, active["id"],
+                    str(generation.get("error") or
+                        ("Render history needs review; retrying" if
+                         generation["status"] in ("lost", "unknown") else
+                         generation["status"] + "; retrying")),
+                    _parody_retry_delay(active, 20))
             elif time.time() - float(active["started"] or 0) > 1800:
                 live = await comfy_idle_live()
                 if live.get("up") and live.get("observed") and not live.get("busy"):
-                    await asyncio.to_thread(queue.update, active["id"], "failed",
-                                            "Render has no completed output after 30 minutes and ComfyUI is idle")
+                    await asyncio.to_thread(
+                        queue.retry, active["id"],
+                        "Render has no completed output after 30 minutes; retrying",
+                        _parody_retry_delay(active, 30))
         return 5, freed_for
     item = await asyncio.to_thread(queue.next)
     if item is None:
@@ -166922,8 +166981,10 @@ async def _parody_stinger_step(queue: ParodyQueue, freed_for: str) -> tuple[int,
         reason = "ComfyUI is busy rendering; its active work will finish first"
     else:
         admitted, reason, _available = await asyncio.to_thread(render_admission, "video")
-        if not admitted and free is not None and free < VIDEO_RENDER_FLOOR_GB \
-                and freed_for != item["id"]:
+        # A refused H3 admission is never an H3 failure. Ask the reserve
+        # keeper to clear stale models once, then retain the same FIFO item
+        # until Comfy is genuinely able to accept it.
+        if not admitted and freed_for != item["id"]:
             freed_for = item["id"]
             await asyncio.to_thread(queue.note, item["id"],
                                     "Making room for H3: releasing idle models")
@@ -166945,21 +167006,27 @@ async def _parody_stinger_step(queue: ParodyQueue, freed_for: str) -> tuple[int,
         if admitted:
             body = await asyncio.to_thread(queue.claim, item["id"])
             if body is not None:
+                body = await _parody_bind_deferred_reference(queue, item, body)
+                if body is None:
+                    return 5, freed_for
                 try:
                     result = await _comfy_workshop_render_payload(body)
                 except HTTPException as exc:
-                    if exc.status_code == 409:
-                        await asyncio.to_thread(queue.update, item["id"], "queued",
-                                                str(exc.detail))
-                    elif exc.status_code in (502, 503):
-                        await asyncio.to_thread(queue.update, item["id"], "paused",
-                                                "Submission uncertain: %s; check gallery" % exc.detail)
-                    else:
-                        await asyncio.to_thread(queue.update, item["id"], "failed",
-                                                str(exc.detail))
+                    # A source can disappear between selection and dispatch.
+                    # Rebind it instead of making the listener repeat an ad.
+                    if exc.status_code == 400 and str(body.get("mode") or "") == "reference":
+                        replacement = dict(body)
+                        replacement.update({"source": "", "source_type": "deferred_dialogue_clip"})
+                        await asyncio.to_thread(queue.replace_body, item["id"], replacement)
+                    await asyncio.to_thread(
+                        queue.retry, item["id"],
+                        "H3 is retaining this request: %s" % str(exc.detail),
+                        _parody_retry_delay(item, 12 if exc.status_code == 409 else 20))
                 except Exception as exc:  # noqa: BLE001
-                    await asyncio.to_thread(queue.update, item["id"], "paused",
-                                            "Submission uncertain: %s; check gallery" % exc)
+                    await asyncio.to_thread(
+                        queue.retry, item["id"],
+                        "H3 is retaining this request: %s" % type(exc).__name__,
+                        _parody_retry_delay(item, 20))
                 else:
                     await asyncio.to_thread(queue.update, item["id"], "running", "",
                                             result["prompt_id"], result["model"])
@@ -247475,11 +247542,11 @@ function makeAd() {
   const prompt = ((box && box.value) || "").trim();
   if (!prompt) return;
   const note = document.getElementById("note");
-  if (note) note.textContent = "H3 ad queued; making room if the station needs it.";
+  if (note) note.textContent = "";
   api("/api/listener/ads", {method: "POST", body: JSON.stringify({prompt})})
     .then((got) => {
       if (box) box.value = "";
-      if (note) note.textContent = got.message || "H3 ad queued for the broadcast.";
+      if (note) note.textContent = got.message || "Request completed.";
     })
     .catch((err) => {
       if (note) note.textContent = err.message || "The H3 ad could not be queued.";
