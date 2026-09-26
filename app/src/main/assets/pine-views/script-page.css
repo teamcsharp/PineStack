@@ -85,12 +85,13 @@
   min-height: 0;
 }
 .sp-script-top { display: grid; gap: 6px; min-width: 0; min-height: 0; }
-.sp-script-title-row { display:flex; align-items:center; gap:8px; min-width:0; }
-.sp-script-title-row .sp-scripthead { flex:0 0 auto; }
-.sp-prompt-dock { flex:1 1 auto; min-width:0; }
-.sp-prompt-dock .ph-bar { padding:0; min-height:32px; flex-wrap:nowrap; }
+.sp-script-title-row { display:flex; align-items:center; gap:8px; min-width:0; overflow:hidden; }
+.sp-script-title-row .sp-scripthead { flex:0 1 150px; min-width:82px; overflow:hidden; white-space:nowrap; }
+.sp-script-title-row .sp-scriptwhy { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.sp-prompt-dock { flex:1 1 0; min-width:0; overflow-x:auto; scrollbar-width:thin; }
+.sp-prompt-dock .ph-bar { width:max-content; min-width:100%; padding:0; min-height:32px; flex-wrap:nowrap; }
 .sp-prompt-dock .ph-bar > b { flex:0 0 auto; white-space:nowrap; }
-.sp-prompt-dock .ph-toolbar { flex:1 1 auto; }
+.sp-prompt-dock .ph-toolbar { flex:0 0 auto; }
 .sp-bands { display: grid; gap: 6px; min-width: 0; min-height: 0; }
 .sp-band-row {
   display: grid;

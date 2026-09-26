@@ -344,6 +344,8 @@
 .sfx-tv-radial-item.examine { right: 13px; bottom: 34px; }
 .sfx-tv-radial-item.favorite { left: 50%; bottom: 2px; transform: translateX(-50%); }
 .sfx-tv-radial-item.replay { left: 13px; bottom: 34px; }
+.sfx-tv-radial-item.previous { left: 2px; top: 97px; }
+.sfx-tv-radial-item.next { right: 2px; top: 97px; }
 .sfx-tv-radial-item.delete {
   left: 19px;
   top: 47px;

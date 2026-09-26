@@ -1973,6 +1973,14 @@
         if (detail) detail.textContent = String(text || '');
       }, open);
     });
+    item('Previous video', 'c:caret--left', 'previous', function () {
+      radialClose(false, false);
+      step(clip, 'prev', function () {});
+    });
+    item('Next video', 'c:caret--right', 'next', function () {
+      radialClose(false, false);
+      step(clip, 'next', function () {});
+    });
     item('Make favorite', 'c:favorite--filled', 'favorite', function () {
       if (typeof actions.favorite === 'function') {
         Promise.resolve(actions.favorite(clip)).then(function (text) {
