@@ -124,9 +124,19 @@ object KioskController {
 
     /** Reveal Android's own controls for a deliberate device action. */
     fun showSystemBars(activity: Activity) {
+        WindowCompat.setDecorFitsSystemWindows(activity.window, true)
         val controller = WindowInsetsControllerCompat(activity.window, activity.window.decorView)
         controller.show(WindowInsetsCompat.Type.systemBars())
         controller.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_DEFAULT
+    }
+
+    /** Restore the station window after the operator explicitly re-enters fullscreen. */
+    fun enterImmersive(activity: Activity) {
+        WindowCompat.setDecorFitsSystemWindows(activity.window, false)
+        val controller = WindowInsetsControllerCompat(activity.window, activity.window.decorView)
+        controller.hide(WindowInsetsCompat.Type.systemBars())
+        controller.systemBarsBehavior =
+            WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
     }
 
     /**
@@ -166,14 +176,10 @@ object KioskController {
             WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
         activity.window.attributes = params
 
-        WindowCompat.setDecorFitsSystemWindows(activity.window, false)
-        val controller = WindowInsetsControllerCompat(activity.window, activity.window.decorView)
         /* Keep the station clear while it has focus.  Android still reveals
          * the shade or navigation transiently from an edge swipe, and fades
          * it back out after the operator has used it. */
-        controller.hide(WindowInsetsCompat.Type.systemBars())
-        controller.systemBarsBehavior =
-            WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        enterImmersive(activity)
     }
 
     /**
@@ -184,9 +190,6 @@ object KioskController {
      */
     fun reassertImmersive(activity: Activity, hasFocus: Boolean) {
         if (!hasFocus) return
-        val controller = WindowInsetsControllerCompat(activity.window, activity.window.decorView)
-        controller.hide(WindowInsetsCompat.Type.systemBars())
-        controller.systemBarsBehavior =
-            WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        enterImmersive(activity)
     }
 }

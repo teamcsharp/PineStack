@@ -35,6 +35,24 @@
             android:layout_width="match_parent"
             android:layout_height="match_parent" />
 
+        <Button
+            android:id="@+id/fullscreenToggle"
+            android:layout_width="wrap_content"
+            android:layout_height="36dp"
+            android:layout_gravity="top|end"
+            android:layout_marginTop="6dp"
+            android:layout_marginEnd="42dp"
+            android:minHeight="36dp"
+            android:minWidth="108dp"
+            android:paddingStart="10dp"
+            android:paddingEnd="10dp"
+            android:backgroundTint="@color/pine_chip"
+            android:text="@string/fullscreen_exit"
+            android:textAllCaps="false"
+            android:textColor="@color/pine_ink"
+            android:textSize="11sp"
+            android:contentDescription="@string/fullscreen_exit" />
+
         <!-- The affordance. A 14dp ribbon down the left bezel.
              DrawerLayout::onInterceptTouchEvent runs BEFORE this view sees
              anything, so a DRAG from the edge still opens the drawer; only a

@@ -4,6 +4,8 @@
     <string name="status_connecting">Reaching the station…</string>
     <string name="status_offline">The station at %1$s did not answer. Retrying…</string>
     <string name="status_retry">Retry now</string>
+    <string name="fullscreen_exit">Exit full screen</string>
+    <string name="fullscreen_enter">Enter full screen</string>
 
     <!-- The rail -->
     <string name="rail_open">Open the Pine Box rail</string>
