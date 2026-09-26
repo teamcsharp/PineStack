@@ -522,7 +522,9 @@ class MainActivity : AppCompatActivity() {
            measured at seven times in thirty-three minutes, taking the
            operator's place in the script each time. */
         app.wallpaper.reading = true
-        KioskController.enterLockTask(this)
+        /* Do not trap the operator in the station.  A prior kiosk build may
+         * still have lock task active, so release it whenever we resume. */
+        KioskController.exitLockTask(this)
 
         /* THE LOCK SCREEN. Registered here rather than in onCreate because
          * SCREEN_ON/SCREEN_OFF/USER_PRESENT are protected broadcasts that a
@@ -1427,7 +1429,12 @@ class MainActivity : AppCompatActivity() {
                     drawer.closeDrawer(railHost)
                     return
                 }
-                if (webView.canGoBack()) webView.goBack()
+                if (webView.canGoBack()) {
+                    webView.goBack()
+                    return
+                }
+                KioskController.leaveForSystem(this@MainActivity)
+                finishAndRemoveTask()
             }
         })
     }

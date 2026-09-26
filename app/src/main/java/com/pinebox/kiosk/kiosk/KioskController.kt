@@ -56,18 +56,10 @@ object KioskController {
              * terminal in it. */
             policy.setLockTaskPackages(admin, arrayOf(context.packageName))
 
-            /* Make the manifest's HOME filter STICKY. Without this the
-             * first press of Home after provisioning shows the usual
-             * "which launcher?" chooser - on a wall-mounted tablet nobody
-             * is standing at, that chooser is where the terminal stays. */
-            val home = IntentFilter(Intent.ACTION_MAIN).apply {
-                addCategory(Intent.CATEGORY_HOME)
-                addCategory(Intent.CATEGORY_DEFAULT)
-            }
-            policy.addPersistentPreferredActivity(
-                admin, home,
-                ComponentName(context, MainActivity::class.java),
-            )
+            /* This is an operator tablet, not a sealed public display.
+             * Clear the legacy HOME capture every launch so Home and Back
+             * return to Android instead of reopening this activity. */
+            policy.clearPackagePersistentPreferredActivities(admin, context.packageName)
 
             /* The station remains the only lock-task package, but the
              * operator must still be able to pull down Quick Settings to
@@ -182,13 +174,8 @@ object KioskController {
 
         WindowCompat.setDecorFitsSystemWindows(activity.window, false)
         val controller = WindowInsetsControllerCompat(activity.window, activity.window.decorView)
-        controller.hide(WindowInsetsCompat.Type.systemBars())
-        /* BEHAVIOUR_SHOW_TRANSIENT_BARS_BY_SWIPE, not the default: with the
-         * default the first swipe from an edge brings the bars back and
-         * leaves them there. Transient means they fade again on their own,
-         * so a stray touch does not permanently reveal the navigation bar. */
-        controller.systemBarsBehavior =
-            WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        controller.show(WindowInsetsCompat.Type.systemBars())
+        controller.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_DEFAULT
     }
 
     /**
@@ -200,13 +187,7 @@ object KioskController {
     fun reassertImmersive(activity: Activity, hasFocus: Boolean) {
         if (!hasFocus) return
         val controller = WindowInsetsControllerCompat(activity.window, activity.window.decorView)
-        controller.hide(WindowInsetsCompat.Type.systemBars())
-        activity.window.decorView.systemUiVisibility =
-            View.SYSTEM_UI_FLAG_LAYOUT_STABLE or
-                View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION or
-                View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN or
-                View.SYSTEM_UI_FLAG_HIDE_NAVIGATION or
-                View.SYSTEM_UI_FLAG_FULLSCREEN or
-                View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+        controller.show(WindowInsetsCompat.Type.systemBars())
+        controller.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_DEFAULT
     }
 }
