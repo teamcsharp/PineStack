@@ -52,10 +52,14 @@
       sidebarCollapsed = !sidebarCollapsed; panel.classList.toggle('ph-sidebar-collapsed', sidebarCollapsed);
       collapse.title = sidebarCollapsed ? 'Expand property sidebar' : 'Collapse property sidebar'; collapse.setAttribute('aria-label', collapse.title);
     });
-    var fullscreen = command('Fullscreen system prompt history', 'c:maximize', function () {
-      panel.classList.toggle('ph-fullscreen'); fullscreen.title = panel.classList.contains('ph-fullscreen') ? 'Exit fullscreen prompt history' : 'Fullscreen system prompt history'; fullscreen.setAttribute('aria-label', fullscreen.title);
-    });
-    toolbar.appendChild(collapse); toolbar.appendChild(fullscreen); bar.appendChild(toolbar);
+    var exitFullscreen = make('button', 'ph-exit-fullscreen', 'Exit prompt fullscreen'); exitFullscreen.type = 'button'; exitFullscreen.hidden = true;
+    var setFullscreen = function (on) {
+      panel.classList.toggle('ph-fullscreen', on); fullscreen.hidden = on; exitFullscreen.hidden = !on;
+      fullscreen.title = 'Fullscreen system prompt history'; fullscreen.setAttribute('aria-label', fullscreen.title);
+    };
+    var fullscreen = command('Fullscreen system prompt history', 'c:maximize', function () { setFullscreen(true); });
+    exitFullscreen.addEventListener('click', function () { setFullscreen(false); });
+    toolbar.appendChild(collapse); toolbar.appendChild(fullscreen); toolbar.appendChild(exitFullscreen); bar.appendChild(toolbar);
     var layout = make('div', 'ph-layout'), main = make('div', 'ph-main'), sidebar = make('aside', 'ph-sidebar');
     var notice = make('p', 'ph-notice'); notice.setAttribute('role', 'status'); var list = make('div', 'ph-calls');
     var more = make('button', 'ph-more', 'Older requests'); more.type = 'button'; more.addEventListener('click', load);

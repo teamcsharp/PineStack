@@ -85,8 +85,6 @@ class MainActivity : AppCompatActivity() {
     private lateinit var statusPanel: View
     private lateinit var statusText: TextView
     private lateinit var statusRetry: Button
-    private lateinit var fullscreenToggle: Button
-    private var immersiveEnabled = true
 
     private lateinit var bridge: PineDesktopBridge
     private var videoWall: com.pinebox.kiosk.video.PineVideoWall? = null  // #1426
@@ -148,11 +146,9 @@ class MainActivity : AppCompatActivity() {
         statusPanel = findViewById(R.id.statusPanel)
         statusText = findViewById(R.id.statusText)
         statusRetry = findViewById(R.id.statusRetry)
-        fullscreenToggle = findViewById(R.id.fullscreenToggle)
 
         KioskController.applyOwnerPolicies(this)
         KioskController.applyWindowFlags(this)
-        fullscreenToggle.setOnClickListener { setFullscreen(!immersiveEnabled) }
 
         /* Before configureWebView, because the WebViewClient it installs
          * starts answering shouldInterceptRequest the moment a load begins
@@ -632,18 +628,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
-        if (immersiveEnabled) KioskController.reassertImmersive(this, hasFocus)
-        else if (hasFocus) KioskController.showSystemBars(this)
-    }
-
-    /** A native exit is always reachable, even when a page or video surface is not. */
-    private fun setFullscreen(enabled: Boolean) {
-        immersiveEnabled = enabled
-        fullscreenToggle.setText(if (enabled) R.string.fullscreen_exit else R.string.fullscreen_enter)
-        fullscreenToggle.contentDescription = getString(
-            if (enabled) R.string.fullscreen_exit else R.string.fullscreen_enter,
-        )
-        if (enabled) KioskController.enterImmersive(this) else KioskController.showSystemBars(this)
+        KioskController.reassertImmersive(this, hasFocus)
     }
 
     /* ------------------------------------------------------------------ */
@@ -711,7 +696,7 @@ class MainActivity : AppCompatActivity() {
         webView.evaluateJavascript(WIDTH_GUARD) { got ->
             Log.i(TAG, "rotated to ${newConfig.orientation}: scale=$scale guard=$got")
         }
-        if (immersiveEnabled) KioskController.reassertImmersive(this, true)
+        KioskController.reassertImmersive(this, true)
     }
 
     /**
