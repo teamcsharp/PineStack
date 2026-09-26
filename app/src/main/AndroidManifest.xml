@@ -221,19 +221,6 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
 
-            <!-- THE KIOSK. Registering as HOME is what makes the tablet a
-                 terminal rather than a tablet running an app: the system
-                 hands HOME back here on every Back-out and every boot, with
-                 no dependency on the boot receiver (which Android 10+
-                 restricts from starting activities in the background).
-                 Until a device owner pins us with
-                 addPersistentPreferredActivity, the first press of Home
-                 shows the usual chooser. -->
-            <intent-filter>
-                <action android:name="android.intent.action.MAIN" />
-                <category android:name="android.intent.category.HOME" />
-                <category android:name="android.intent.category.DEFAULT" />
-            </intent-filter>
         </activity>
 
         <!-- THE SC STACK, AS ITS OWN APPLICATION.
