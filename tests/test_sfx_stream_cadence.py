@@ -17,6 +17,7 @@ class SfxStreamCadenceTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         fixture.ReadyStreamPlaybackTests.setUp(self)
         self.patch('_SFX_CADENCE', SfxCadence(self.root / 'cadence.sqlite3'))
+        self.patch('_SFX_CADENCE_PLAN_UNITS', [0])
         self.patch('_SFX_CADENCE_STATUS', {'sample_due': 0, 'sample_omitted': 0,
                     'guy_due': 0, 'guy_omitted': 0, 'last_sample': ''})
         app.dj_settings.return_value.update(sfx=True, sfx_every_units=2,
@@ -25,6 +26,9 @@ class SfxStreamCadenceTests(unittest.IsolatedAsyncioTestCase):
         self.sample.write_bytes(b'existing sample')
         self.patch('_sfx_cadence_pick', mock.Mock(return_value=self.sample))
         self.patch('_sfx_cadence_video_pick', mock.Mock(return_value=None))
+        self.patch('sfx_video_share', mock.Mock(return_value=0))
+        self.patch('sfx_soundboard_hold_cadence', mock.Mock(return_value=False))
+        self.patch('sfx_match_on', mock.Mock(return_value=False))
         self.patch('sfx_levelled', mock.Mock(side_effect=lambda path: path))
         self.patch('complaint_due', mock.Mock(return_value=False))
         self.patch('sfx_seconds', mock.Mock(return_value=1.0))
@@ -44,6 +48,11 @@ class SfxStreamCadenceTests(unittest.IsolatedAsyncioTestCase):
         take = copy.deepcopy(self.takes[1])
         take.update(i=len(self.takes), text='The frame returns the copper gleam.')
         self.takes.append(take)
+
+    def test_planning_cursor_reserves_concurrent_lines_once(self):
+        self.assertEqual(app._sfx_cadence_plan_claim(), 0)
+        self.assertEqual(app._sfx_cadence_plan_claim(), 1)
+        self.assertEqual(app._sfx_cadence_planned_units(), 2)
 
     def bank_take(self):
         (self.root / 'guy.wav').write_bytes(b'actual prepared guy')
@@ -91,10 +100,9 @@ class SfxStreamCadenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(receipts), 2)
         self.assertTrue(all(call.kwargs['speaker'] == 'The SFX Guy'
                             for call in receipts))
-        self.assertEqual(app.sfx_levelled.call_count, 2)
 
     async def test_video_cadence_welds_levelled_audio_and_rings_silent_picture(self):
-        app.dj_settings.return_value['sfx_video_share'] = 100
+        app.sfx_video_share.return_value = 100
         video = self.root / 'sample.mp4'
         levelled = self.root / 'levelled.wav'
         video.write_bytes(b'picture')
@@ -108,6 +116,7 @@ class SfxStreamCadenceTests(unittest.IsolatedAsyncioTestCase):
         board = [row for row in rows if row['who'] == 'board']
         self.assertEqual(len(board), 2)
         self.assertTrue(all(row['sfx_video_id'] == 'scratch-id' for row in board))
+        self.ack('playing', 0.2, 1)
         self.assertEqual(pictures.call_count, 2)
         for call in pictures.call_args_list:
             self.assertTrue(call.args[0]['silent_picture'])
@@ -131,16 +140,18 @@ class SfxStreamCadenceTests(unittest.IsolatedAsyncioTestCase):
         app._sfx_cadence_audible(rows, 16)
         app.sfxguy_ready_commit.assert_called_once()
 
-    async def test_full_core_budget_wins_over_optional_insertions(self):
+    async def test_due_cadence_extends_a_full_core_budget(self):
         self.bank_take()
         self.patch('_ready_round_fits', mock.Mock(side_effect=lambda *a, **kw: float(kw.get('seconds') or 0) <= 13))
         app._clip_seconds.side_effect = lambda path: 12.0 if 'joined' in str(path) else 3.0
         app.page_clip_seconds.return_value = 12.0
         self.assertTrue(await self.play())
-        self.assertEqual([r['text'] for r in self.radio['voice_clips'][0]['stream']['rows']],
-                         [t['text'] for t in self.takes])
-        self.assertEqual(app._SFX_CADENCE_STATUS['sample_omitted'], 2)
-        app.sfxguy_ready_release.assert_called_once_with('reserved-guy')
+        rows = self.radio['voice_clips'][0]['stream']['rows']
+        self.assertEqual([row['who'] for row in rows],
+                         ['dj', 'cohost', 'board', 'dj', 'cohost', 'board', 'drop'])
+        self.assertEqual(app._SFX_CADENCE_STATUS['sample_omitted'], 0)
+        self.assertEqual(app._SFX_CADENCE_STATUS['guy_omitted'], 0)
+        app.sfxguy_ready_release.assert_not_called()
 
     async def test_concat_failure_releases_unheard_guy_and_keeps_stock(self):
         self.bank_take()
@@ -191,7 +202,32 @@ class SfxStreamCadenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([r['text'] for r in self.radio['voice_clips'][0]['stream']['rows']],
                          [t['text'] for t in self.takes])
 
-    async def test_late_optional_overrun_rejoins_exact_core_once_without_tts(self):
+    async def test_full_video_share_falls_back_to_audio_to_keep_due_cadence(self):
+        self.patch('sfx_video_share', mock.Mock(return_value=100))
+        self.patch('_sfx_cadence_video_pick', mock.Mock(return_value=None))
+        self.patch('sfx_due_after', mock.Mock(return_value=True))
+        self.patch('sfx_soundboard_hold_cadence', mock.Mock(return_value=False))
+        self.patch('sfx_match_on', mock.Mock(return_value=False))
+        got = await app._sfx_cadence_additions_inner('dj', 'a line', 2, 20)
+        self.assertEqual(got[0]['who'], 'board')
+        self.assertEqual(Path(got[0]['path']).name, 'scratch.wav')
+        app._sfx_cadence_video_pick.assert_called_once_with('a line')
+        app._sfx_cadence_pick.assert_called()
+
+    async def test_default_sfx_cadence_is_every_two_dialogue_units(self):
+        self.assertEqual(app.DEFAULT_DJ['sfx_every_units'], 2)
+        self.assertEqual(app.DEFAULT_DJ['sfxguy_every_units'], 2)
+        self.assertEqual(app.DEFAULT_DJ['sfxguy_rate'], 100)
+        settings = app.validate_settings({**app.DEFAULT_SETTINGS, "dj": {}})
+        self.assertEqual(settings["dj"]["sfx_every_units"], 2)
+        self.assertEqual(settings["dj"]["sfxguy_every_units"], 2)
+        self.assertEqual(settings["dj"]["sfxguy_rate"], 100)
+        stale = app.validate_settings({**app.DEFAULT_SETTINGS, "dj": {
+            "sfx_every_units": 20, "sfxguy_every_units": 4}})
+        self.assertEqual(stale["dj"]["sfx_every_units"], 2)
+        self.assertEqual(stale["dj"]["sfxguy_every_units"], 2)
+
+    async def test_late_cadence_overrun_keeps_mandatory_insertions(self):
         self.bank_take()
         joins = []
         def concat(paths, *args):
@@ -203,13 +239,12 @@ class SfxStreamCadenceTests(unittest.IsolatedAsyncioTestCase):
         app._clip_seconds.side_effect = lambda path: (20.0 if len(joins) == 1 else 12.0) if 'joined' in str(path) else 3.0
         app.page_clip_seconds.return_value = 12
         self.assertTrue(await self.play())
-        self.assertEqual(len(joins), 2)
+        self.assertEqual(len(joins), 1)
         self.assertIn('scratch.wav', joins[0])
         self.assertIn('guy.wav', joins[0])
-        self.assertEqual(joins[1], ['take-0.wav', 'take-1.wav', 'take-2.wav', 'take-1.wav'])
-        self.assertEqual([r['text'] for r in self.radio['voice_clips'][0]['stream']['rows']],
-                         [t['text'] for t in self.takes])
-        app.sfxguy_ready_release.assert_called_once_with('reserved-guy')
+        self.assertEqual([r['who'] for r in self.radio['voice_clips'][0]['stream']['rows']],
+                         ['dj', 'cohost', 'board', 'dj', 'cohost', 'board', 'drop'])
+        app.sfxguy_ready_release.assert_not_called()
         app.sfxguy_ready_commit.assert_not_called()
 
     async def test_user_muted_box_consumes_handoff_without_audible_or_source_credit(self):

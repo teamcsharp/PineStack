@@ -430,6 +430,10 @@
 
   function levelSet(el, want, smooth) {
     if (!el) return;
+    if (el.dataset && el.dataset.pineSilentPicture === '1') {
+      el.muted = true;
+      want = 0;
+    }
     var value = Math.max(0, Math.min(2, Number(want)));
     if (!isFinite(value)) return;
     var stage = levelStage(el, value);
@@ -2397,6 +2401,7 @@
     floorRelease('tube');                          // [#1214] the mouth is free
     assemblyDrop();
     var going = mine || video;
+    if (going && going.__pineReceiptClose) going.__pineReceiptClose();
     /* Removing a <video> from the document does NOT stop it, so the src
      * goes first and the node second. */
     try { if (going) { going.pause(); levelDrop(going); going.removeAttribute('src'); going.load(); } }
@@ -2453,6 +2458,7 @@
    * the references got tangled. Removing a <video> does not stop it,
    * so the src goes first and the node second - #1147's rule. */
   function teardownNow() {
+    if (video && video.__pineReceiptClose) video.__pineReceiptClose();
     assemblyDrop();
     var all = document.querySelectorAll('.sfx-tv');
     for (var i = 0; i < all.length; i += 1) {
@@ -2567,6 +2573,21 @@
 
   /* ---- one clip ------------------------------------------------------ */
 
+  var receiptSequence = 0;
+  var receiptListener = 'sfx-tv-' + Math.random().toString(36).slice(2);
+  function videoReceipt(clip, event, screen, error) {
+    if (!clip || !clip.delivery_id || clip.silent_picture) return;
+    var bridge = api();
+    if (!bridge || !bridge.post) return;
+    var volume = screen ? Math.min(1, Number(screen.volume) || 0) : 0;
+    Promise.resolve(bridge.post('/api/dj/voice/ack', {
+      delivery_id: clip.delivery_id, listener_id: receiptListener, event: event,
+      sequence: ++receiptSequence, current_time: screen ? Number(screen.currentTime) || 0 : 0,
+      volume: volume, audible_volume: screen && !screen.muted ? Math.min(volume, level) : 0,
+      muted: !!(screen && screen.muted), error: String(error || '')
+    })).catch(function () { /* the next playback heartbeat retries */ });
+  }
+
   function play(clip) {
     /* #1426: an endless clip belongs to the native surface while it is
        running. Checked here as well as at the poll because a clip can
@@ -2577,7 +2598,11 @@
        with a picture went out over the wall's own soundtrack, which is
        two clips at once on the one machine. Claiming the floor also
        hushes every other page road that is sounding. */
-    if (!floorClaim('tube')) return;
+    if (!floorClaim('tube')) {
+      showing = false;
+      videoReceipt(clip, 'error', null, 'Another SFX surface owns playback');
+      return;
+    }
     /* #1184: whatever was in the tube is now the past, whichever road
        took it out - the clip ending, a seamless hand-over, the operator
        cutting, a run stepping on. One line here covers every one of
@@ -2596,7 +2621,26 @@
     /* Held locally, because every handler and timer below can fire after
      * the module's own references have moved on. */
     var screen = video;
-    if (screen) screen.muted = !!clip.silent_picture;
+    if (screen) {
+      screen.dataset.pineSilentPicture = clip.silent_picture ? '1' : '0';
+      screen.muted = !!clip.silent_picture;
+      var receiptAt = 0, receiptClosed = false;
+      function reportVideo(event, error) {
+        if (receiptClosed) return;
+        if (event === 'ended' || event === 'error') receiptClosed = true;
+        videoReceipt(clip, event, screen, error);
+      }
+      screen.addEventListener('canplay', function () { reportVideo('canplay'); });
+      screen.addEventListener('playing', function () { reportVideo('playing'); });
+      screen.addEventListener('timeupdate', function () {
+        if (!screen.paused && now() - receiptAt > 2000) {
+          receiptAt = now(); reportVideo('playing');
+        }
+      });
+      screen.addEventListener('ended', function () { reportVideo('ended'); });
+      screen.addEventListener('error', function () { reportVideo('error', 'Video decode or fetch failed'); });
+      screen.__pineReceiptClose = function () { reportVideo('error', 'Video player closed before completion'); };
+    }
     var glass = tube;
     var done = false;
     var finish = function () {
@@ -5458,6 +5502,7 @@
     if ((reportUp || reportNow()) && !endlessOn) return;
     var clip = queue.shift();
     while (clip && missed(clip)) {                         /* #1173 */
+      videoReceipt(clip, 'error', null, 'Video missed its playback window');
       clip = queue.shift();
     }
     if (!clip) return;
@@ -5535,6 +5580,26 @@
   var QUEUE_ROWS_MOST = 24;
 
   function queueTrim() {
+    /* #1463: A TIMED CUE IS A PLACE IN THE DIALOGUE, NOT RUNWAY.
+     *
+     * A long recorded round publishes all of its picture cues when the
+     * audible stream starts. Eight clips spread across two minutes can
+     * therefore be in this queue even though only the first one is due in
+     * seven seconds. Counting their MEDIA lengths as thirty seconds of
+     * runway dropped from the front until only the distant cues remained.
+     * The station ledger then correctly said every MP4 aired while the
+     * tablet never showed the cues nearest the dialogue being heard.
+     *
+     * The duration cap belongs to the back-to-back endless set. Ordinary
+     * station cues already carry exact `at` stamps and the server bounds
+     * their ring; retain those in chronological order. The hard row cap is
+     * still a final memory guard, and drops the farthest future cue rather
+     * than the next one owed. */
+    var timed = queue.some(function (clip) { return clip && !clip.endless; });
+    if (timed) {
+      while (queue.length > QUEUE_ROWS_MOST) queue.pop();
+      return;
+    }
     while (queue.length > QUEUE_ROWS_MOST) queue.shift();
     var held = 0, i;
     for (i = 0; i < queue.length; i += 1) {
@@ -5553,6 +5618,7 @@
     if (!clip || !clip.url) return;
     if (marks[String(clip.ts || '') + '|' + String(clip.url)]) return;
     markOf(clip);
+    videoReceipt(clip, 'received');
     queue.push(clip);
     queueTrim();                                           /* [#1212] */
     comingKeep(clip);                                       /* #1195 */
@@ -6040,6 +6106,15 @@
     try {
       var got = await api().get('/api/dj/video?since=' + seen);
       var serverMs = Number((got && got.server_ms) || now());
+      var updates = (got && got.reservation_updates) || {};
+      queue.forEach(function (clip) {
+        if (updates[clip.delivery_id]) {
+          clip.broadcast_ms = updates[clip.delivery_id];
+          clip.at = now() + Number(clip.broadcast_ms) - serverMs;
+        }
+      });
+      if (hold) { clearTimeout(hold); hold = null; }
+      next();
       /* #1184: the hand-over style, on the poll this set already makes -
        * no second request, and both surfaces read the one answer so the
        * desk and the tablet cannot disagree about it. A station that has
@@ -6835,6 +6910,24 @@
       });
     },
     rebase: function (url) { base = String(url || ''); },
+    repair: function (clip) {
+      if (!mounted) root.PineSfxTv.mount({baseUrl: base});
+      veiled = false;
+      if (hold) { clearTimeout(hold); hold = null; }
+      if (!clip || !clip.url) { next(); return Promise.resolve({ok: false, detail: 'No recovery clip was returned'}); }
+      if (!root.PineSfxTv.cut(clip)) return Promise.resolve({ok: false, detail: 'Video surface refused the clip'});
+      return new Promise(function (resolve) {
+        var began = now();
+        var check = setInterval(function () {
+          var seenFrame = video && playing === clip && video.videoWidth > 0
+            && !video.paused && video.currentTime > 0 && host && host.getBoundingClientRect().height > 0;
+          if (seenFrame || now() - began > 12000) {
+            clearInterval(check);
+            resolve({ok: !!seenFrame, detail: seenFrame ? 'MP4 playing on this device' : 'MP4 did not start on this device'});
+          }
+        }, 150);
+      });
+    },
     /* The shell's master volume times the booth's share, handed over by
      * applyAppVolume - this window has no mixer of its own.
      *
@@ -6876,7 +6969,7 @@
       try { if (warm && warm.el) levelSet(warm.el, level, false); } catch (err) { /* gone */ }
       if (!video) return;
       var el = video;
-      if (level > 0 && el.muted && !(playing && playing.silent_picture)) el.muted = false;
+      if (level > 0 && el.muted && el.dataset.pineSilentPicture !== '1') el.muted = false;
       levelRamp(el, level);                                /* [#1216] */
     },
     stop: function () {
