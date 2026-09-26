@@ -37,7 +37,11 @@
 
   var HOST_CLASS = 'sp-page';
   var SCREENPLAY_REST_MS = 20000;   /* the script is minutes-scale news */
-  var FEED_MAX = 240;               /* the booth ring's own size */
+  /* The feed is the live working surface, not the permanent transcript.
+     The screenplay and trace ledger retain every line; holding hundreds of
+     completed rows here makes the tablet relayout a history nobody can see. */
+  var FEED_MAX = 120;
+  var FEED_EVENT_MAX = 48;
 
   var mounted = false;
   var host = null;
@@ -45,6 +49,7 @@
   var elements = [];
   var hourKey = '';
   var scriptNodes = new Map();      /* #1273: element id -> its live node */
+  var lineNodes = new Map();        /* live line id -> mounted node */
   var paintedIn = null;             /* #1273: the box those nodes hang in */
   var chasedAt = 0;                 /* #1271: last re-read chased by a mark */
   var beforeKey = '';               /* #1276: the closed hour we hold */
@@ -102,6 +107,12 @@
   var planning = false;
   var planWay = 'below';              /* #1289: 'below' | 'beside' */
   var PLAN_REST_MS = 30000;           /* a running order is not news */
+  var readinessPick = '';             /* upcoming slot open in the desk */
+  var readinessPrint = '';            /* keep the operator's scroll/focus */
+  var readinessClockAt = 0;
+  var newsChoiceState = null;
+  var liveCuePrint = '';               /* repaint only when the cue changes */
+  var bandManager = null;
   var beat = 0;
   var rejectionItems = [];
   var rejectionFirstPage = [];
@@ -189,6 +200,56 @@
     if (cls) n.className = cls;
     if (text !== undefined && text !== null) n.textContent = text;
     return n;
+  }
+
+  var BAND_STORAGE_KEY = 'pine.script.bands.v1';
+  var BAND_NAMES = {
+    current: 'Current segment', sequence: 'Previous, on air and next',
+    sync: 'In step with sound', readiness: 'Upcoming preparation'
+  };
+
+  function bandLoad() {
+    var saved;
+    try { saved = JSON.parse(root.localStorage.getItem(BAND_STORAGE_KEY) || '{}'); }
+    catch (err) { saved = {}; }
+    var state = {};
+    Object.keys(BAND_NAMES).forEach(function (key) {
+      state[key] = !!(saved && saved[key] === true);
+    });
+    return state;
+  }
+
+  function bandSave(state) {
+    try { root.localStorage.setItem(BAND_STORAGE_KEY, JSON.stringify(state)); }
+    catch (err) { /* private mode: controls remain usable */ }
+  }
+
+  function bandController(bands, toolbar, items) {
+    var state = bandLoad();
+    function apply() {
+      var anyOpen = false, anyClosed = false;
+      Object.keys(BAND_NAMES).forEach(function (key) {
+        var item = items[key], closed = state[key];
+        item.wrap.hidden = closed || (key === 'sequence' && item.content.hidden);
+        item.restore.hidden = !closed;
+        item.collapse.setAttribute('aria-expanded', String(!closed));
+        item.restore.setAttribute('aria-expanded', String(!closed));
+        if (closed) anyClosed = true;
+        else if (!item.wrap.hidden) anyOpen = true;
+      });
+      bands.hidden = !anyOpen;
+      /* Prompt History is a permanent Script command in this toolbar. Only
+         the per-band restore buttons disappear when their bands are open. */
+      toolbar.hidden = false;
+    }
+    function set(key, closed) {
+      if (!Object.prototype.hasOwnProperty.call(items, key)) return;
+      state[key] = !!closed;
+      apply();
+      bandSave(state);
+    }
+    apply();
+    return {set: set, refresh: apply};
   }
 
   var REJECTION_PAGE = 24;
@@ -1100,6 +1161,30 @@
     loop.addEventListener('click', function () { loopToggle(loop); });
     setTimeout(function () { loopRead(loop); }, 900);
 
+    /* A real deck rebuild beside the endless switch.  This keeps the
+       current frame intact and replaces only the runway, so a variety pass
+       cannot introduce a visible or audible gap. */
+    var shuffle = make('button', 'sp-btn sp-shuffle', '');
+    shuffle.title = 'Rebuild the endless-video queue from unplayed clips';
+    shuffle.setAttribute('aria-label', 'Shuffle endless video queue');
+    try {
+      if (typeof root.pineIcon === 'function') {
+        shuffle.innerHTML = root.pineIcon('m:casino', 'Shuffle endless video') || '';
+      }
+    } catch (err) { /* the title remains the control's name */ }
+    if (!shuffle.innerHTML) shuffle.textContent = 'shuffle';
+    shuffle.addEventListener('click', function () {
+      var television = root.PineSfxTv;
+      if (!television || typeof television.shuffle !== 'function') {
+        say('the endless video deck is still connecting'); return;
+      }
+      shuffle.disabled = true; shuffle.classList.add('sp-firing');
+      Promise.resolve(television.shuffle(say)).then(function () {
+        say('endless video has a new no-repeat runway');
+      }, function () { /* shuffle already printed its diagnostic */ })
+        .then(function () { shuffle.disabled = false; shuffle.classList.remove('sp-firing'); });
+    });
+
     /* #1385 (#1110): find a word that was said on the air. */
     var find = make('input', 'sp-find', '');
     find.type = 'search';
@@ -1149,6 +1234,7 @@
     bar.appendChild(topic);
     bar.appendChild(reel);                                   /* #1303 */
     bar.appendChild(loop);                                   /* #1385 */
+    bar.appendChild(shuffle);                                /* hourly deck */
     bar.appendChild(find);                                   /* #1385 */
     bar.appendChild(report);                                 /* #1115 */
     bar.appendChild(again);
@@ -1271,26 +1357,6 @@
     return row || null;
   }
 
-  function currentFeedSaying(row, station) {
-    if (!row || !row.id || !station || station.paused || stationPaused) return false;
-    var feed = root.PineStationFeed;
-    var clock = feed && typeof feed.clock === 'function' ? Number(feed.clock()) : Date.now();
-    if (Number(station.server_ms) && clock - Number(station.server_ms) > 12000) return false;
-    var stream = station.stream_now;
-    var rows = stream && stream.rows || [];
-    if (Number(stream && stream.at) > 0 && rows.some(function (item) {
-      return String(item.id || '') === String(row.id);
-    })) {
-      var offset = clock / 1000 - Number(stream.at);
-      var active = rows.find(function (item) {
-        return Number(item.from) <= offset && offset < Number(item.until);
-      });
-      return !!active && String(active.id) === String(row.id);
-    }
-    return !!(station.speaking_now
-      && String(station.speaking_now.id || '') === String(row.id));
-  }
-
   function sayingCrawl(into, words, seconds) {
     var body = String(words || '').replace(/\s+/g, ' ').trim();
     into.textContent = body;
@@ -1310,14 +1376,9 @@
     var station = null;
     try { station = root.PineStationFeed && root.PineStationFeed.state
       ? root.PineStationFeed.state() : null; } catch (err) { station = null; }
-    /* A resolved line drives both the strip and the script mark. Feed words
-       may enrich that same id, but its clock must not replace a different
-       line selected from playback evidence. When there is no resolved line,
-       the guarded feed fallback in sayingFallbackMark() can still mark the
-       line displayed here without calling a clock guess cue-sheet proof. */
-    if (feedNow && currentFeedSaying(feedNow, station) && (!shown || !shown.id)) {
-      shown = feedNow;
-    } else if (feedNow && shown && String(feedNow.id) === String(shown.id)) {
+    /* Feed words can enrich the player-evidenced line of the same identity.
+       A clock-selected feed row never becomes the live strip's identity. */
+    if (feedNow && shown && String(feedNow.id) === String(shown.id)) {
       shown = Object.assign({}, feedNow, shown, {
         text: shown.text || feedNow.text,
         name: shown.name || feedNow.name,
@@ -1326,12 +1387,9 @@
       });
     }
     /* Feedback from a control can occupy this strip only while no evidenced
-       line is on air. Consult the station feed first: previously this early
-       return hid real speech whenever exact screenplay timing was absent. */
+       line is on air. */
     if ((!shown || !shown.id) && sayUntil && Date.now() < sayUntil) return null;
-    var node = (shown && shown.id)
-      ? document.querySelector('.sp-el[data-line="' + shown.id + '"]')
-      : null;
+    var node = shown && shown.id ? lineNode(shown.id) : null;
     var source = sayingSource(shown, node) || {};
     var body = String((shown && shown.text) || '').trim() || (node
       ? String(node.textContent || '').trim()
@@ -1361,15 +1419,18 @@
     sayingLineId = String((shown && shown.id) || '');
     var sayingBox = el('spSaying');
     if (sayingBox) {
-      if (sayingLineId) sayingBox.dataset.line = sayingLineId;
-      else delete sayingBox.dataset.line;
+      if (sayingLineId) {
+        if (sayingBox.dataset.line !== sayingLineId) sayingBox.dataset.line = sayingLineId;
+      } else if (sayingBox.dataset.line) delete sayingBox.dataset.line;
       var voice = node ? /sp-dialogue/.test(node.className || '')
         : !!(shown && !/^(sfx|music|ad|record)$/.test(String(shown.kind || ''))
           && (shown.speaker || /^(dj|host|cohost|third)$/i.test(String(shown.who || ''))));
-      sayingBox.dataset.spoken = String(!!voice);
-      sayingBox.title = sayingLineId
+      var spoken = String(!!voice);
+      if (sayingBox.dataset.spoken !== spoken) sayingBox.dataset.spoken = spoken;
+      var title = sayingLineId
         ? 'Tap to jump to this exact line in the script; hold for line actions'
         : 'What the station is playing now';
+      if (sayingBox.title !== title) sayingBox.title = title;
     }
     var print = name + '\u0001' + body;
     if (print === sayingSaid) return shown;  /* no needless repaint */
@@ -2064,6 +2125,101 @@
     });
   }
 
+  function folderH3Controls(top, bridge) {
+    var saved = {enabled: true, gallery_share: 20};
+    var draft = {enabled: true, gallery_share: 20};
+    var saving = false;
+    var pending = false;
+    var section = make('div', 'sp-folder-h3');
+    section.style.cssText = 'display:grid;gap:5px;padding:9px 0;border-top:1px solid #26343d';
+    var toggleRow = make('label', 'sp-folder-h3-toggle');
+    toggleRow.style.cssText = 'display:flex;align-items:center;gap:10px;min-height:34px;color:#dfe7ee';
+    var toggle = make('input');
+    toggle.id = 'spH3HourlyEnabled'; toggle.type = 'checkbox'; toggle.disabled = true;
+    toggle.setAttribute('aria-label', 'Hourly H3 stingers');
+    toggleRow.appendChild(toggle);
+    toggleRow.appendChild(make('span', null, 'Hourly H3 stingers'));
+    section.appendChild(toggleRow);
+    var ratioRow = make('label', 'sp-folder-ratio-row');
+    ratioRow.style.cssText = 'display:flex;align-items:center;gap:10px;min-height:40px;'
+      + 'flex-wrap:wrap;color:#dfe7ee';
+    var name = make('span', 'sp-folder-ratio-name', 'H3 gallery images vs SFX clips');
+    name.style.cssText = 'flex:0 1 190px;min-width:135px;font-size:12px';
+    var slider = make('input', 'sp-folder-ratio-dial');
+    slider.id = 'spH3GalleryShare'; slider.type = 'range'; slider.min = '0';
+    slider.max = '100'; slider.step = '1'; slider.value = '20'; slider.disabled = true;
+    slider.style.cssText = 'flex:1 1 120px;min-width:80px;min-height:36px;'
+      + 'margin:0;accent-color:#65c7da';
+    slider.setAttribute('aria-label', 'Share of hourly H3 sources from gallery images');
+    var output = make('output', 'sp-folder-ratio-value', '20%');
+    output.style.cssText = 'width:42px;text-align:right;font-variant-numeric:tabular-nums';
+    ratioRow.appendChild(name); ratioRow.appendChild(slider); ratioRow.appendChild(output);
+    section.appendChild(ratioRow);
+    var status = make('div', 'sp-folder-note', 'Loading hourly H3 controls...');
+    status.id = 'spH3HourlyStatus'; status.setAttribute('role', 'status');
+    status.style.cssText = 'padding:0;color:#8ea0ad;font-size:11px';
+    section.appendChild(status); top.appendChild(section);
+
+    function share(value) {
+      value = Number(value);
+      return Number.isFinite(value) ? Math.max(0, Math.min(100, Math.round(value))) : 20;
+    }
+    function paint(state) {
+      saved.enabled = state.enabled !== false;
+      saved.gallery_share = share(state.gallery_share);
+      draft.enabled = saved.enabled; draft.gallery_share = saved.gallery_share;
+      toggle.checked = saved.enabled; slider.value = String(saved.gallery_share);
+      output.textContent = saved.gallery_share + '%';
+      toggle.disabled = false; slider.disabled = false;
+    }
+    function save() {
+      if (saving) { pending = true; return; }
+      saving = true;
+      var sent = {enabled: draft.enabled, gallery_share: draft.gallery_share};
+      status.textContent = 'Saving hourly H3 controls...';
+      Promise.resolve(bridge.post('/api/h3/hourly', sent)).then(function (state) {
+        if (!state) throw new Error('Station did not return hourly H3 controls');
+        saved.enabled = state.enabled !== false;
+        saved.gallery_share = share(state.gallery_share);
+        if (draft.enabled === sent.enabled) toggle.checked = saved.enabled;
+        if (draft.gallery_share === sent.gallery_share) {
+          slider.value = String(saved.gallery_share);
+          output.textContent = saved.gallery_share + '%';
+        }
+        saving = false;
+        if (pending) { pending = false; save(); }
+        else status.textContent = 'Hourly source mix saved: ' + (100 - saved.gallery_share)
+          + '% SFX clips / ' + saved.gallery_share + '% gallery images';
+      }).catch(function (err) {
+        pending = false;
+        Promise.resolve(bridge.get('/api/h3/hourly')).then(paint).catch(function () {
+          toggle.checked = saved.enabled; slider.value = String(saved.gallery_share);
+          output.textContent = saved.gallery_share + '%';
+        }).finally(function () {
+          saving = false;
+          status.textContent = 'Could not save hourly H3 controls: '
+            + String((err && err.message) || err);
+        });
+      });
+    }
+    toggle.addEventListener('change', function () { draft.enabled = !!toggle.checked; save(); });
+    slider.addEventListener('input', function () {
+      draft.gallery_share = share(slider.value); output.textContent = draft.gallery_share + '%';
+      if (!saving) status.textContent = 'Release slider to save H3 source mix';
+    });
+    slider.addEventListener('change', function () { draft.gallery_share = share(slider.value); save(); });
+    return Promise.resolve(bridge.get('/api/h3/hourly')).then(function (state) {
+      paint(state || {});
+      status.textContent = 'Hourly source mix: ' + (100 - saved.gallery_share)
+        + '% SFX clips / ' + saved.gallery_share + '% gallery images';
+      return state;
+    }).catch(function (err) {
+      status.textContent = 'Could not load hourly H3 controls: '
+        + String((err && err.message) || err);
+      return null;
+    });
+  }
+
   function folderOpen() {
     if (!api() || !api().get) return;
     folderClose();
@@ -2097,6 +2253,7 @@
     hoursRow.appendChild(hours);
     top.appendChild(hoursRow);
     folderRatioControls(top, api());
+    folderH3Controls(top, api());
     var pinRow = make('div', 'sp-folder-pin-row');
     var pinLine = make('div', 'sp-folder-pin', 'asking the station\u2026');
     pinLine.id = 'spFolderPin';
@@ -3538,6 +3695,14 @@
       }
       walk = walk.nextSibling;
     }
+    if (!out.block && item) {
+      var start = scriptOrder.indexOf(node);
+      for (var i = start + 1; i >= 1 && i < scriptOrder.length; i += 1) {
+        var next = scriptOrder[i].pineItem || {};
+        if (String(next.type || '') === 'scene') break;
+        if (next.block) { out.block = String(next.block); break; }
+      }
+    }
     return out;
   }
 
@@ -4496,6 +4661,11 @@
     add.type = 'button';
     add.addEventListener('click', function () { itineraryAdd(list, sheet); });
     tools.appendChild(add);
+    var copy = make('button', 'sp-itin-add', 'Copy schedule');
+    copy.type = 'button';
+    copy.title = 'Make an editable copy of the current schedule before trying a new running order';
+    copy.addEventListener('click', function () { itineraryCopySchedule(sheet); });
+    tools.appendChild(copy);
     sheet.box.appendChild(tools);
     sheet.box.appendChild(list);
     sheet.revealLive = true;
@@ -4523,8 +4693,14 @@
       var fresh = got.filter(Boolean);
       /* #1289b's rule, for the same reason: a blip must not WIPE the
          running order this terminal already holds. */
-      if (fresh.length) { planHours = fresh; planAt = Date.now(); }
-      var hours = fresh.length ? fresh : planHours;
+      if (fresh.length) {
+        got.forEach(function (page, index) {
+          if (page) planHours[index] = page;
+        });
+        planAt = Date.now();
+        paintPlan();
+      }
+      var hours = planHours.filter(Boolean);
       list.textContent = '';
       if (!hours.length) {
         list.appendChild(make('div', 'sp-segrow-why', 'The station did not'
@@ -4678,6 +4854,42 @@
     });
   }
 
+  function itineraryCopySchedule(sheet) {
+    api().get('/api/schedule').then(function (state) {
+      var source = String((state && state.active) || 'schedule');
+      var proposed = source + ' copy ' + new Date().toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'});
+      var name = root.prompt('Name this editable schedule copy', proposed);
+      if (!name || !String(name).trim()) return;
+      return api().post('/api/schedule/preset', {name: String(name).trim(), copy_from: source})
+        .then(function (got) {
+          sheet.say('Saved ' + String((got && got.active) || name)
+            + '. Select it on Day, Week or Month when you want it on air.');
+        });
+    }, function (err) { sheet.say(String((err && err.message) || err), true); })
+      ['catch'](function (err) { sheet.say(String((err && err.message) || err), true); });
+  }
+
+  function itineraryReorder(entry, before, sheet, done) {
+    var moved = String((entry && entry.slot_id) || '');
+    var target = String((before && before.slot_id) || '');
+    var preset = String((entry && entry.schedule_preset) || '');
+    if (!moved || !target || moved === target) return;
+    api().get('/api/schedule').then(function (state) {
+      var active = preset || String((state && state.active) || '');
+      var slots = ((state && state.presets && state.presets[active]) || []).slice();
+      var from = slots.findIndex(function (slot) { return String(slot.id || '') === moved; });
+      var to = slots.findIndex(function (slot) { return String(slot.id || '') === target; });
+      if (from < 0 || to < 0) throw new Error('Those segments are not on the editable schedule.');
+      var row = slots.splice(from, 1)[0];
+      if (from < to) to -= 1;
+      slots.splice(to, 0, row);
+      return api().post('/api/schedule/slots', {preset: active, slots: slots});
+    }).then(function () {
+      sheet.say('Running order saved. The orchestrator will rebuild the affected upcoming segments.');
+      if (typeof done === 'function') done();
+    }, function (err) { sheet.say(String((err && err.message) || err), true); });
+  }
+
   function itinClock(ts) {
     var n = Number(ts) || 0;
     if (!n) return '';
@@ -4722,7 +4934,7 @@
     var sc = (entry && entry.script) || {};
     var turns = sc.turns || [];
     if (turns.length) {
-      return turns.length + (turns.length === 1 ? ' line banked' : ' lines banked')
+      return turns.length + (turns.length === 1 ? ' turn banked' : ' turns banked')
         + (segHas(sc.seconds) ? '  ·  ' + segSecs(sc.seconds) : '');
     }
     var drafts = Number(sc.drafts) || 0;
@@ -4738,7 +4950,7 @@
     var n = rows.length || 0;
     var secs = Number(entry && entry.aired_seconds) || 0;
     if (!n && !secs) return '';
-    return (n ? n + (n === 1 ? ' line aired' : ' lines aired') : 'aired')
+    return (n ? n + (n === 1 ? ' aired feed row' : ' aired feed rows') : 'aired')
       + (secs ? '  ·  ' + segSecs(secs) : '');
   }
 
@@ -4876,6 +5088,66 @@
     return avatar;
   }
 
+  function turnCandidateIndex(turn, fallback) {
+    var value = turn && turn.candidate_index;
+    if (value !== undefined && value !== null && isFinite(Number(value))) {
+      return Number(value);
+    }
+    value = turn && turn.prepared_index;
+    return value !== undefined && value !== null && isFinite(Number(value))
+      ? Number(value) : Number(fallback) || 0;
+  }
+
+  function turnPerformanceIndex(turn) {
+    var value = turn && turn.performance_index;
+    return value !== undefined && value !== null && isFinite(Number(value))
+      ? Number(value) : 0;
+  }
+
+  function scriptPerformances(script) {
+    script = script || {};
+    var bound = Array.isArray(script.turns) ? script.turns : [];
+    var turns = bound.length ? bound
+      : (Array.isArray(script.draft_turns) ? script.draft_turns : []);
+    var supplied = Array.isArray(script.performances) ? script.performances : [];
+    var byIndex = Object.create(null);
+    supplied.forEach(function (performance, index) {
+      performance = performance || {};
+      var pi = performance.performance_index;
+      if (pi === undefined || pi === null) pi = performance.index;
+      pi = pi !== undefined && pi !== null && isFinite(Number(pi)) ? Number(pi) : index;
+      byIndex[pi] = {
+        index: pi,
+        candidate: String(performance.candidate || performance.id || ''),
+        seconds: Number(performance.seconds) || 0,
+        turns: Array.isArray(performance.turns) ? performance.turns.length
+          : (Number(performance.turns || performance.lines) || 0)
+      };
+    });
+    turns.forEach(function (turn) {
+      var pi = turnPerformanceIndex(turn);
+      var group = byIndex[pi] || {index: pi, candidate: '', seconds: 0, turns: 0};
+      if (!group.candidate) group.candidate = String((turn && turn.candidate) || '');
+      if (!supplied.length) group.turns += 1;
+      byIndex[pi] = group;
+    });
+    var rows = Object.keys(byIndex).map(function (key) { return byIndex[key]; })
+      .sort(function (a, b) { return a.index - b.index; });
+    var total = Number(script.seconds) || rows.reduce(function (sum, row) {
+      return sum + (Number(row.seconds) || 0);
+    }, 0);
+    return {rows: rows, seconds: total,
+      candidates: Array.isArray(script.candidates) ? script.candidates.slice() : []};
+  }
+
+  function turnEditBody(turn, fallback, text) {
+    var local = turnCandidateIndex(turn, fallback);
+    return {index: local, candidate_index: local,
+      performance_index: turnPerformanceIndex(turn),
+      text: String(text || ''), was: String((turn && turn.text) || ''),
+      candidate: String((turn && turn.candidate) || '')};
+  }
+
   function itinConversationTurns(entry, variant) {
     var script = (entry && entry.script) || {};
     var bound = script.turns || [];
@@ -4883,8 +5155,49 @@
       : (bound.length ? bound : (script.draft_turns || []));
     var aired = (entry && entry.aired) || [];
     var turns = [];
-    var seen = Object.create(null);
+    var heard = [];
     function words(value) { return String(value || '').toLowerCase().replace(/\s+/g, ' ').trim(); }
+    function sameSeat(turn, row, requireSeat) {
+      var seats = {A: ['dj', 'host'], B: ['cohost'], C: ['caller'],
+        D: ['third'], E: ['caller2']};
+      var expected = seats[String((turn && turn.seat) || '').toUpperCase()];
+      var actual = String((row && row.who) || '').toLowerCase();
+      if (requireSeat && (!expected || !actual)) return false;
+      return !expected || !actual || expected.indexOf(actual) !== -1;
+    }
+    function speech(row) {
+      var kind = String((row && row.kind) || '').toLowerCase();
+      var who = String((row && row.who) || '').toLowerCase();
+      return kind !== 'sfx' && kind !== 'sting' && kind !== 'sfxguy'
+        && kind !== 'marker' && who !== 'board' && who !== 'drop';
+    }
+    function consume(turn, target) {
+      var i, j, phrase;
+      for (i = 0; i < heard.length; i += 1) {
+        if (heard[i].used || heard[i].text !== target || !speech(heard[i].row)
+            || !sameSeat(turn, heard[i].row, false)) continue;
+        heard[i].used = true;
+        return true;
+      }
+      if (!bound.length || variant) return false;
+      for (i = 0; i < heard.length; i += 1) {
+        if (heard[i].used || !speech(heard[i].row)
+            || !sameSeat(turn, heard[i].row, true)) continue;
+        phrase = heard[i].text;
+        if (!target.startsWith(phrase + ' ')) continue;
+        for (j = i + 1; j < Math.min(heard.length, i + 4); j += 1) {
+          if (heard[j].used || !speech(heard[j].row)
+              || !sameSeat(turn, heard[j].row, true)) break;
+          phrase += ' ' + heard[j].text;
+          if (phrase === target) {
+            for (var used = i; used <= j; used += 1) heard[used].used = true;
+            return true;
+          }
+          if (!target.startsWith(phrase + ' ')) break;
+        }
+      }
+      return false;
+    }
     aired.forEach(function (row) {
       var text = String((row || {}).text || '').trim();
       if (!text) return;
@@ -4895,16 +5208,26 @@
       else if (kind === 'sfxguy' || seat === 'drop') who = 'The SFX Guy';
       turns.push({seat: seat, who: who, text: text, kind: kind,
         line: String(row.line || ''), at: row.at, aired: true});
-      seen[words(text)] = true;
+      heard.push({row: row, text: words(text), used: false});
     });
     prepared.forEach(function (turn, index) {
       var text = String((turn || {}).text || '').trim();
-      if (!text || seen[words(text)]) return;
+      if (!text) return;
+      var fingerprint = words(text);
+      if (consume(turn, fingerprint)) return;
+      var local = turnCandidateIndex(turn, index);
+      var performance = turnPerformanceIndex(turn);
+      var previous = '';
+      for (var back = index - 1; back >= 0; back -= 1) {
+        if (turnPerformanceIndex(prepared[back]) !== performance) continue;
+        previous = String((prepared[back] || {}).text || '');
+        break;
+      }
       turns.push(Object.assign({}, turn, {text: text, prepared_index: index,
+        candidate_index: local, performance_index: performance,
         draft: !!variant || !bound.length,
         candidate: String((variant && variant.id) || turn.candidate || script.candidate || ''),
-        previous: index > 0 ? String((prepared[index - 1] || {}).text || '') : ''}));
-      seen[words(text)] = true;
+        previous: previous}));
     });
     var cues = (variant && variant.sfx_plan) || script.sfx_plan || [];
     cues.forEach(function (cue) {
@@ -4914,6 +5237,13 @@
         candidate: String((variant && variant.id) || script.candidate || '')}));
     });
     return turns;
+  }
+
+  function itinConversationSections(turns) {
+    return {
+      heard: turns.filter(function (turn) { return !!turn.aired; }),
+      planned: turns.filter(function (turn) { return !turn.aired; })
+    };
   }
 
   function itinFact(table, label, value) {
@@ -5044,6 +5374,10 @@
     itinFact(table, 'Prepared state', script.state);
     itinFact(table, 'Candidate', script.candidate);
     itinFact(table, 'Draft candidate', turn.candidate);
+    if (!aired) {
+      itinFact(table, 'Performance', turnPerformanceIndex(turn) + 1);
+      itinFact(table, 'Line in performance', turnCandidateIndex(turn, index) + 1);
+    }
     itinFact(table, 'Source', script.source);
     itinFact(table, 'Source evidence', variant.source || script.source_evidence);
     itinFact(table, 'Active topic', variant.topic || script.topic);
@@ -5076,10 +5410,8 @@
         var said = String(editor.value || '').trim();
         if (!said) { detail.say('A blank line would be a deletion.', true); return; }
         save.disabled = true;
-        api().post('/api/director/segment/' + encodeURIComponent(entry.occurrence) + '/turn', {
-          index: index, text: said, was: String(turn.text || ''),
-          candidate: String(turn.candidate || '')
-        }).then(function (got) {
+        api().post('/api/director/segment/' + encodeURIComponent(entry.occurrence) + '/turn',
+          turnEditBody(turn, index, said)).then(function (got) {
           turn.text = said;
           detail.say(String((got && got.say) || 'Saved.'));
           if (typeof refresh === 'function') refresh();
@@ -5106,7 +5438,10 @@
         });
         api().post('/api/director/segment/' + encodeURIComponent(entry.occurrence) + '/feedback', {
           action: action, kind: String(entry.kind || ''), slot_id: String(entry.slot_id || ''),
-          candidate: String(turn.candidate || script.candidate || ''), index: index,
+          candidate: String(turn.candidate || script.candidate || ''),
+          index: turnCandidateIndex(turn, index),
+          candidate_index: turnCandidateIndex(turn, index),
+          performance_index: turnPerformanceIndex(turn),
           line: String(turn.text || ''), previous: String(turn.previous || ''),
           topic: String(variant.topic || script.topic || ''), note: String(note || '')
         }).then(function (got) {
@@ -5152,9 +5487,11 @@
     var bound = script.turns || [];
     var variants = script.draft_variants || [];
     var selectedId = String(script.selected_candidate || '');
-    var variant = variants.find(function (item) { return String(item.id) === selectedId; })
-      || variants[0] || null;
+    var variant = bound.length ? null
+      : (variants.find(function (item) { return String(item.id) === selectedId; })
+        || variants[0] || null);
     var turns = itinConversationTurns(entry, variant);
+    var performancePlan = scriptPerformances(variant || script);
     var wrap = make('section', 'sp-itin-conversation');
     wrap.addEventListener('click', function (event) { event.stopPropagation(); });
     wrap.addEventListener('keydown', function (event) { event.stopPropagation(); });
@@ -5166,6 +5503,7 @@
     function selectVariant(next) {
       variant = next || null;
       turns = itinConversationTurns(entry, variant);
+      performancePlan = scriptPerformances(variant || script);
       render();
     }
 
@@ -5178,7 +5516,44 @@
         if (entry.prompt) stage.appendChild(make('pre', 'sp-itin-setup', String(entry.prompt)));
         return;
       }
-      turns.forEach(function (turn, index) {
+      var sections = itinConversationSections(turns);
+      var displayTurns = sections.heard.concat(sections.planned);
+      var heardCount = sections.heard.length;
+      var phase = '';
+      var shownPerformance = null;
+      displayTurns.forEach(function (turn, index) {
+        var nextPhase = turn.aired ? 'heard' : 'planned';
+        if (nextPhase !== phase) {
+          phase = nextPhase;
+          stage.appendChild(make('div', 'sp-itin-conversation-phase',
+            phase === 'heard' ? 'Heard / airing'
+              : heardCount ? 'Still planned' : 'Prepared for this slot'));
+          if (phase === 'planned' && bound.length) {
+            var coverage = make('div', 'sp-itin-performance-total',
+              performancePlan.rows.length + (performancePlan.rows.length === 1
+                ? ' planned performance' : ' planned performances') + ' / '
+              + performancePlan.seconds.toFixed(1) + 's planned coverage');
+            coverage.dataset.performances = String(performancePlan.rows.length);
+            stage.appendChild(coverage);
+          }
+        }
+        var performanceIndex = turnPerformanceIndex(turn);
+        if (!turn.aired && !turn.planned_sfx && performanceIndex !== shownPerformance) {
+          shownPerformance = performanceIndex;
+          var performance = performancePlan.rows.find(function (row) {
+            return row.index === performanceIndex;
+          }) || {index: performanceIndex, candidate: String(turn.candidate || ''),
+            seconds: 0, turns: 0};
+          var boundary = make('div', 'sp-itin-performance-boundary', '');
+          boundary.dataset.performance = String(performanceIndex);
+          boundary.appendChild(make('b', '', 'Planned performance ' + (performanceIndex + 1)));
+          boundary.appendChild(make('span', '', [
+            performance.candidate,
+            performance.turns ? performance.turns + ' turns' : '',
+            performance.seconds ? performance.seconds.toFixed(1) + 's' : ''
+          ].filter(Boolean).join(' / ')));
+          stage.appendChild(boundary);
+        }
         var line = make('button', 'sp-itin-message', '');
         line.type = 'button';
         var dialogueId = String(turn.line || '') || ('draft:'
@@ -5188,6 +5563,10 @@
         line.setAttribute('data-dialogue-id', dialogueId);
         if (turn.line) line.setAttribute('data-line', String(turn.line));
         line.setAttribute('data-kind', String(turn.kind || 'dialogue'));
+        if (!turn.aired) {
+          line.dataset.performance = String(performanceIndex);
+          line.dataset.candidateIndex = String(turnCandidateIndex(turn, index));
+        }
         line.classList.toggle('sp-itin-message-even', index % 2 === 0);
         line.appendChild(itinAvatar(turn));
         var bubble = make('span', 'sp-itin-message-bubble');
@@ -5306,6 +5685,843 @@
     return wrap;
   }
 
+  /* ---- #1301: the scheduled conversation-flow editor ---------------- */
+
+  /* A slot's flow is deliberately a small JSON shape. It is persisted with
+     the scheduler and compiled into the writing-room clause on the server;
+     this page only gives the operator a direct, tactile way to arrange it. */
+  var FLOW_TYPES = [
+    ['scripted_line', 'Scripted line', 12],
+    ['news_mention', 'News mention', 48],
+    ['speakerbox_quote', 'Speakerbox quote', 30],
+    ['random_topic', 'Random topic', 52],
+    ['caller', 'Caller', 82],
+    ['manager_message', 'Manager message', 42],
+    ['sfx', 'SFX', 6],
+    ['ad_drop', 'Ad drop', 32],
+    ['painting_ad', 'Painting ad', 58],
+    ['product', 'Product pitch', 48]
+  ];
+
+  function flowType(type) {
+    return FLOW_TYPES.find(function (row) { return row[0] === String(type || ''); })
+      || FLOW_TYPES[2];
+  }
+
+  function flowClip(raw) {
+    raw = raw && typeof raw === 'object' ? raw : {};
+    var id = String(raw.id || '').trim().toLowerCase();
+    if (!/^[0-9a-f]{16}$/.test(id)) return {};
+    var seconds = Number(raw.seconds);
+    return {id: id, name: String(raw.name || 'Scheduled clip').slice(0, 120),
+      seconds: isFinite(seconds) ? Math.max(0, Math.min(120, seconds)) : 0,
+      video: !!raw.video};
+  }
+
+  function flowNode(raw, index) {
+    var spec = flowType(raw && raw.type);
+    var seconds = Number(raw && raw.seconds);
+    if (!isFinite(seconds) || seconds <= 0) seconds = spec[2];
+    var source = raw && raw.line && typeof raw.line === 'object' ? raw.line : {};
+    return {id: String((raw && raw.id) || ('flow-' + Date.now() + '-' + index + '-' + Math.random().toString(36).slice(2, 7))),
+      type: spec[0], seconds: Math.max(2, Math.min(900, Math.round(seconds * 10) / 10)),
+      detail: String((raw && raw.detail) || '').slice(0, 400),
+      after: String((raw && raw.after) || '').slice(0, 96),
+      line: spec[0] === 'scripted_line' ? {
+        speaker: String(source.speaker || 'Host').slice(0, 60),
+        text: String(source.text || '').slice(0, 900),
+        source: String(source.source || 'operator').slice(0, 80)
+      } : {},
+      clip: spec[0] === 'sfx' ? flowClip(raw && raw.clip) : {}};
+  }
+
+  function flowIconButton(cls, icon, label) {
+    var button = make('button', cls, '');
+    button.type = 'button';
+    button.title = label;
+    button.setAttribute('aria-label', label);
+    button.innerHTML = folderIcon(icon, label);
+    if (!button.innerHTML) button.textContent = label;
+    return button;
+  }
+
+  function flowDictation(field, sheet) {
+    var button = flowIconButton('sp-flow-mic', 'c:microphone', 'Dictate into this field');
+    var timer = 0;
+    var pressTimer = 0;
+    var holding = false;
+    var ignoreClick = false;
+    function finish() {
+      if (timer) clearTimeout(timer);
+      timer = 0;
+      button.classList.remove('on');
+    }
+    function start() {
+      var dot = root.PineTalkDot;
+      if (!dot || typeof dot.captureNext !== 'function') {
+        sheet.say('No microphone is available on this surface.', true);
+        return;
+      }
+      button.classList.add('on');
+      try {
+        dot.captureNext(function (words) {
+          var text = String(words || '').trim();
+          if (text) {
+            field.value = String(field.value || '')
+              + (String(field.value || '').trim() ? ' ' : '') + text;
+            field.dispatchEvent(new Event('input', {bubbles: true}));
+          }
+          finish();
+        });
+        timer = setTimeout(finish, 30000);
+      } catch (err) {
+        finish();
+        sheet.say('The microphone could not start.', true);
+      }
+    }
+    button.addEventListener('click', function () {
+      if (ignoreClick) { ignoreClick = false; return; }
+      if (button.classList.contains('on') && root.PineTalkDot
+          && typeof root.PineTalkDot.finish === 'function') {
+        root.PineTalkDot.finish(); finish(); return;
+      }
+      start();
+    });
+    button.addEventListener('pointerdown', function () {
+      holding = false;
+      pressTimer = setTimeout(function () { holding = true; start(); }, 220);
+    });
+    button.addEventListener('pointerup', function () {
+      if (pressTimer) clearTimeout(pressTimer);
+      pressTimer = 0;
+      if (!holding) return;
+      ignoreClick = true;
+      if (root.PineTalkDot && typeof root.PineTalkDot.finish === 'function') root.PineTalkDot.finish();
+      finish();
+    });
+    button.addEventListener('pointercancel', function () {
+      if (pressTimer) clearTimeout(pressTimer);
+      pressTimer = 0; finish();
+    });
+    return button;
+  }
+
+  function flowField(label, field, sheet, cls, dictate) {
+    var wrap = make('label', 'sp-flow-field' + (cls ? ' ' + cls : ''));
+    wrap.appendChild(make('span', 'sp-flow-field-label', label));
+    var inner = make('div', 'sp-flow-field-inner');
+    inner.appendChild(field);
+    if (dictate !== false) inner.appendChild(flowDictation(field, sheet));
+    else wrap.classList.add('sp-flow-no-mic');
+    wrap.appendChild(inner);
+    return wrap;
+  }
+
+  function itineraryFlowOpen(entry, parentSheet, refresh) {
+    var name = String(entry.label || entry.kind || 'Scheduled segment');
+    var sheet = sheetShell('spSegmentFlow', 'sp-flowedit', 'Shape: ' + name);
+    if (root.PineDuck && typeof root.PineDuck.hold === 'function') {
+      root.PineDuck.hold('sp-spSegmentFlow', root.PineDuck.REPORT, sheet.back);
+    }
+    var flow = (Array.isArray(entry.flow) ? entry.flow : []).map(flowNode);
+    var storyline = [];
+    var selected = flow.length ? flow[0].id : '';
+    var dragId = '';
+    var preset = String(entry.schedule_preset || '');
+    var returnTarget = parentSheet && parentSheet.returnTarget
+      ? parentSheet.returnTarget : null;
+    var lineOrigin = entry && entry.flow_origin && typeof entry.flow_origin === 'object'
+      ? entry.flow_origin : null;
+    storyline = orchestratorStoryline();
+    if (lineOrigin) {
+      var originNode = storyline.find(function (node) {
+        return String(node.lineId || '') === String(lineOrigin.id || '');
+      });
+      if (originNode) selected = originNode.id;
+    }
+    if (!selected && storyline.length) selected = storyline[0].id;
+
+    var form = make('section', 'sp-flow-editor');
+    if (lineOrigin) {
+      var origin = make('section', 'sp-flow-origin');
+      origin.appendChild(make('b', '', 'Selected scripted line'));
+      origin.appendChild(make('span', '', String(lineOrigin.text || 'This line belongs to this scheduled segment.')));
+      origin.appendChild(make('i', '', String(lineOrigin.id || '')));
+      form.appendChild(origin);
+    }
+    var provenance = make('section', 'sp-flow-provenance');
+    provenance.appendChild(make('b', 'sp-flow-provenance-title', 'How this segment is assembled'));
+    var route = make('div', 'sp-flow-provenance-route');
+    route.appendChild(make('b', '', String(entry.kind || 'segment')));
+    route.appendChild(make('span', '', 'slot ' + String(entry.slot_id || 'not pinned')));
+    route.appendChild(make('span', '', 'prompt ' + String(entry.prompt_id || 'active variant')));
+    provenance.appendChild(route);
+    var systemPrompt = document.createElement('textarea');
+    systemPrompt.rows = 6; systemPrompt.maxLength = 4000;
+    systemPrompt.placeholder = 'The system prompt that guides this road...';
+    systemPrompt.value = String(entry.prompt || '');
+    systemPrompt.setAttribute('aria-label', 'Active system prompt');
+    provenance.appendChild(flowField('Active system prompt', systemPrompt, sheet));
+    var sourceNotes = document.createElement('textarea');
+    sourceNotes.rows = 3; sourceNotes.maxLength = 400;
+    sourceNotes.placeholder = 'Station inputs, constraints, or preparation notes...';
+    sourceNotes.value = String(entry.notes || '');
+    sourceNotes.setAttribute('aria-label', 'Segment input notes');
+    provenance.appendChild(flowField('Station inputs and preparation', sourceNotes, sheet));
+    var savePrompt = flowIconButton('sp-flow-prompt-save', 'c:save',
+      'Save the active system prompt for this segment kind');
+    savePrompt.appendChild(make('span', '', 'Save system prompt'));
+    provenance.appendChild(savePrompt);
+    form.appendChild(provenance);
+    var basics = make('div', 'sp-flow-basics');
+    var label = document.createElement('input');
+    label.type = 'text'; label.maxLength = 80; label.value = name;
+    label.setAttribute('aria-label', 'Segment name');
+    var minutes = document.createElement('input');
+    minutes.type = 'number'; minutes.min = '.25'; minutes.max = '600'; minutes.step = '.25';
+    minutes.value = String(Math.max(.25, Number(entry.minutes) || 3));
+    minutes.setAttribute('aria-label', 'Segment duration in minutes');
+    basics.appendChild(flowField('Segment name', label, sheet));
+    basics.appendChild(flowField('Minutes', minutes, sheet, 'sp-flow-minutes', false));
+    form.appendChild(basics);
+
+    var savedGraphs = [];
+    var selectedGraph = '';
+    var library = make('section', 'sp-flow-library');
+    library.appendChild(make('b', 'sp-flow-library-title', 'Saved segment graphs'));
+    var libraryPick = document.createElement('select');
+    libraryPick.setAttribute('aria-label', 'Saved segment graph');
+    library.appendChild(flowField('Open a saved graph', libraryPick, sheet,
+      'sp-flow-library-pick', false));
+    var cycle = make('div', 'sp-flow-library-cycle');
+    var previousGraph = flowIconButton('sp-flow-library-arrow', 'c:caret--left',
+      'Previous saved graph');
+    var nextGraph = flowIconButton('sp-flow-library-arrow', 'c:caret--right',
+      'Next saved graph');
+    cycle.appendChild(previousGraph); cycle.appendChild(nextGraph);
+    library.appendChild(cycle);
+    var graphName = document.createElement('input');
+    graphName.type = 'text'; graphName.maxLength = 80;
+    graphName.placeholder = 'Name this reusable graph'; graphName.value = name + ' graph';
+    graphName.setAttribute('aria-label', 'Saved graph name');
+    library.appendChild(flowField('Save graph as', graphName, sheet,
+      'sp-flow-library-name'));
+    var saveGraph = flowIconButton('sp-flow-library-save', 'c:save', 'Save this graph');
+    var saveGraphWords = make('span', '', 'Save graph');
+    saveGraph.appendChild(saveGraphWords);
+    var copyGraph = flowIconButton('sp-flow-library-copy', 'c:copy--to-clipboard',
+      'Save this graph as a new reusable graph');
+    copyGraph.appendChild(make('span', '', 'Save copy'));
+    library.appendChild(saveGraph); library.appendChild(copyGraph);
+    form.appendChild(library);
+
+    var direction = document.createElement('textarea');
+    direction.className = 'sp-flow-direction';
+    direction.rows = 3;
+    direction.placeholder = 'Additional system direction for this segment...';
+    direction.value = String(entry.flow_prompt || '');
+    direction.setAttribute('aria-label', 'Additional system direction for this segment');
+    form.appendChild(flowField('System direction for this segment', direction, sheet));
+
+    var timing = make('section', 'sp-flow-timing');
+    var timingHead = make('div', 'sp-flow-timing-head');
+    var timingLabel = make('b', '', 'Conversation timing');
+    var timingRead = make('span', 'sp-flow-timing-read', '');
+    timingHead.appendChild(timingLabel); timingHead.appendChild(timingRead);
+    var timingRail = make('div', 'sp-flow-timing-rail');
+    var timingFill = make('div', 'sp-flow-timing-fill');
+    timingRail.appendChild(timingFill);
+    timing.appendChild(timingHead); timing.appendChild(timingRail);
+    form.appendChild(timing);
+
+    var utility = make('div', 'sp-flow-utility');
+    var suggest = flowIconButton('sp-flow-suggest', 'c:magic-wand--filled', 'Let the orchestrator suggest a timed flow');
+    var suggestWords = make('span', '', 'Orchestrator suggests');
+    suggest.appendChild(suggestWords);
+    var speakerbox = flowIconButton('sp-flow-speakerbox', 'c:search', 'Find Speakerbox passages for this segment');
+    speakerbox.appendChild(make('span', '', 'Speakerbox suggestions'));
+    utility.appendChild(suggest); utility.appendChild(speakerbox);
+    form.appendChild(utility);
+
+    var speakResults = make('div', 'sp-flow-speakerbox-results');
+    speakResults.hidden = true;
+    form.appendChild(speakResults);
+
+    var work = make('div', 'sp-flow-work');
+    var palette = make('aside', 'sp-flow-palette');
+    palette.appendChild(make('b', 'sp-flow-section-title', 'Interject a node'));
+    FLOW_TYPES.forEach(function (spec) {
+      var button = make('button', 'sp-flow-palette-node', spec[1]);
+      button.type = 'button'; button.draggable = true;
+      button.dataset.type = spec[0];
+      button.title = 'Drag ' + spec[1] + ' into the conversation flow';
+      button.addEventListener('dragstart', function (event) {
+        dragId = ''; event.dataTransfer.setData('text/pine-flow-type', spec[0]);
+        event.dataTransfer.effectAllowed = 'copy';
+      });
+      button.addEventListener('click', function () { add(spec[0]); });
+      palette.appendChild(button);
+    });
+    var graph = make('section', 'sp-flow-graph');
+    graph.setAttribute('aria-label', 'Conversation flow graph');
+    var side = make('aside', 'sp-flow-sidebar');
+    work.appendChild(palette); work.appendChild(graph); work.appendChild(side);
+    form.appendChild(work);
+
+    var saveBar = make('div', 'sp-flow-savebar');
+    if (returnTarget) {
+      var backToOrder = flowIconButton('sp-flow-return', 'c:caret--left',
+        'Return to the running order');
+      backToOrder.addEventListener('click', function () {
+        sheet.close(); itineraryOpen(returnTarget);
+      });
+      saveBar.appendChild(backToOrder);
+    }
+    var applyKind = make('button', 'sp-flow-apply-kind', 'Apply to every ' + String(entry.kind || 'segment'));
+    applyKind.type = 'button';
+    applyKind.title = 'Use this flow for every matching segment in this saved schedule';
+    var save = make('button', 'sp-flow-save', 'Save segment flow');
+    save.type = 'button';
+    saveBar.appendChild(applyKind); saveBar.appendChild(save);
+    form.appendChild(saveBar);
+    sheet.box.appendChild(form);
+
+    function storySeconds(turn) {
+      var explicit = Number(turn && turn.seconds);
+      if (isFinite(explicit) && explicit > 0) return Math.max(2, Math.min(120, explicit));
+      if (turn && turn.planned_sfx) return 6;
+      var words = String((turn && turn.text) || '').trim().split(/\s+/).filter(Boolean).length;
+      return Math.max(2, Math.min(120, Math.round((words || 6) / 2.45)));
+    }
+    function storyId(turn, index) {
+      var key = String((turn && (turn.line || turn.line_id || turn.id || turn.candidate)) || ('turn-' + index));
+      return 'orchestrator-' + key.replace(/[^a-z0-9_-]+/ig, '-').slice(0, 64) + '-' + index;
+    }
+    function orchestratorStoryline() {
+      return itinConversationTurns(entry).map(function (turn, index) {
+        var sfx = !!turn.planned_sfx || String(turn.kind || '').toLowerCase() === 'sfx';
+        var who = String(turn.who || turn.name || turn.seat || (sfx ? 'The SFX Guy' : 'Host'));
+        return {
+          id: storyId(turn, index), type: sfx ? 'sfx' : 'scripted_line',
+          seconds: storySeconds(turn), detail: String(turn.text || '').slice(0, 400),
+          line: {speaker: who, text: String(turn.text || '').slice(0, 900),
+            source: turn.aired ? 'Aired script' : (turn.draft ? 'Orchestrator draft' : 'Orchestrator script')},
+          clip: flowClip(turn.clip), locked: true, turn: turn,
+          lineId: String(turn.line || turn.line_id || ''), planned: sfx
+        };
+      });
+    }
+    function graphNodes() {
+      var out = [], seen = {};
+      function append(node) {
+        if (!node || seen[node.id]) return;
+        seen[node.id] = true; out.push(node);
+        flow.filter(function (item) { return String(item.after || '') === String(node.id); })
+          .forEach(append);
+      }
+      flow.filter(function (item) { return String(item.after || '') === '__start'; }).forEach(append);
+      storyline.forEach(append);
+      flow.filter(function (item) { return !String(item.after || ''); }).forEach(append);
+      flow.forEach(append); // stale anchors still remain visible and editable.
+      return out;
+    }
+    function total() { return graphNodes().reduce(function (sum, node) { return sum + (Number(node.seconds) || 0); }, 0); }
+    function target() { return Math.max(15, (Number(minutes.value) || 3) * 60); }
+    function updateTiming() {
+      var used = total(), allowed = target(), ratio = Math.min(1, used / allowed);
+      timingFill.style.width = (ratio * 100).toFixed(1) + '%';
+      timing.classList.toggle('over', used > allowed);
+      timingRead.textContent = Math.round(used) + 's of ' + Math.round(allowed) + 's'
+        + (used > allowed ? ' - over by ' + Math.round(used - allowed) + 's' : ' - ' + Math.round(allowed - used) + 's open');
+    }
+    function add(type, detail, after) {
+      var spec = flowType(type);
+      var node = flowNode({type: spec[0], seconds: spec[2], detail: detail || '',
+        after: after || selected || '__start'}, flow.length);
+      flow.push(node); selected = node.id; render();
+      if (node.type === 'sfx') primeSfxNodes();
+    }
+    function selectedNode() {
+      return graphNodes().find(function (node) { return node.id === selected; }) || null;
+    }
+    function reorder(from, after) {
+      var moved = flow.find(function (node) { return node.id === from; });
+      if (!moved || moved.id === after) return;
+      moved.after = String(after || '__start'); selected = moved.id; render();
+    }
+    function sfxClipWords(clip) {
+      clip = flowClip(clip);
+      if (!clip.id) return '';
+      return (clip.video ? 'MP4' : 'audio') + ' - ' + clip.name
+        + (clip.seconds ? ' (' + clip.seconds.toFixed(1) + 's)' : '');
+    }
+    var sfxPlanBusy = false;
+    function primeSfxNodes(force) {
+      if (sfxPlanBusy || !api() || !api().post) return;
+      var nodes = graphNodes();
+      var node = nodes.find(function (item) {
+        return item.type === 'sfx' && !item.sfxPlanning
+          && (force ? item.id === force : (!flowClip(item.clip).id && !item.sfxTried));
+      });
+      if (!node) return;
+      sfxPlanBusy = true; node.sfxPlanning = true;
+      renderGraph(); renderSide();
+      var excluded = nodes.filter(function (item) { return item.id !== node.id; })
+        .map(function (item) { return flowClip(item.clip).id; }).filter(Boolean);
+      api().post('/api/schedule/flow/sfx/plan', {
+        label: label.value, notes: sourceNotes.value, prompt: direction.value,
+        detail: node.detail, seconds: node.seconds, excluded: excluded
+      }).then(function (got) {
+        node.clip = flowClip(got && got.clip);
+        node.sfxTried = true;
+        if (node.id === selected) render(); else renderGraph();
+      }, function () {
+        node.sfxTried = true;
+        if (node.id === selected) render(); else renderGraph();
+      })['finally'](function () {
+        node.sfxPlanning = false; sfxPlanBusy = false;
+        if (node.id === selected) render(); else renderGraph();
+        if (!force) primeSfxNodes();
+      });
+    }
+    function renderGraph() {
+      graph.replaceChildren();
+      var nodes = graphNodes();
+      graph.classList.toggle('empty', !nodes.length);
+      var storyHead = make('div', 'sp-flow-storyline');
+      storyHead.appendChild(make('b', '', 'Orchestrator storyline'));
+      storyHead.appendChild(make('span', '', storyline.length
+        ? storyline.length + ' scripted events from the current segment'
+        : 'No generated lines are banked for this segment yet'));
+      graph.appendChild(storyHead);
+      if (!nodes.length) {
+        graph.appendChild(make('div', 'sp-flow-empty', 'Drag a node here, or ask the orchestrator to lay one out.'));
+      }
+      nodes.forEach(function (node, index) {
+        var spec = flowType(node.type);
+        var card = make('article', 'sp-flow-node' + (node.type === 'sfx' ? ' is-sfx' : '')
+          + (node.type === 'scripted_line' ? ' is-scripted' : '')
+          + (node.locked ? ' locked' : '')
+          + (node.id === selected ? ' selected' : ''));
+        card.draggable = !node.locked; card.dataset.node = node.id;
+        card.title = node.locked ? 'Generated by the orchestrator; select to review it'
+          : 'Drag to place this node after another part of the storyline';
+        card.appendChild(make('span', 'sp-flow-node-order', String(index + 1)));
+        var words = make('div', 'sp-flow-node-words');
+        words.appendChild(make('b', '', spec[1]));
+        if (node.type === 'scripted_line') {
+          words.appendChild(make('span', 'sp-flow-node-speaker',
+            String((node.line || {}).speaker || 'Host') + ' - '
+            + String((node.line || {}).source || 'operator')));
+          words.appendChild(make('span', 'sp-flow-node-script',
+            String((node.line || {}).text || 'Write the line in the sidebar.')));
+        } else {
+          words.appendChild(make('span', '', Math.round(node.seconds) + ' seconds'));
+        }
+        if (node.type === 'sfx') {
+          var clipWords = sfxClipWords(node.clip);
+          words.appendChild(make('span', 'sp-flow-node-clip', clipWords
+            || (node.sfxPlanning ? 'Selecting a clip...' : (node.planned
+              ? 'SFX scheduled by the orchestrator' : 'No clip selected'))));
+        }
+        card.appendChild(words);
+        if (node.locked) {
+          card.appendChild(make('span', 'sp-flow-node-lock', 'Locked'));
+        } else {
+          var drop = flowIconButton('sp-flow-node-delete', 'c:trash-can', 'Remove this node');
+          drop.addEventListener('click', function (event) {
+            event.stopPropagation(); flow = flow.filter(function (item) { return item.id !== node.id; });
+            selected = (graphNodes()[Math.max(0, index - 1)] || {}).id || ''; render();
+          });
+          card.appendChild(drop);
+        }
+        card.addEventListener('click', function () { selected = node.id; render(); });
+        if (!node.locked) {
+          card.addEventListener('dragstart', function (event) {
+            dragId = node.id; event.dataTransfer.setData('text/pine-flow-node', node.id);
+            event.dataTransfer.effectAllowed = 'move'; card.classList.add('dragging');
+          });
+          card.addEventListener('dragend', function () { card.classList.remove('dragging'); });
+        }
+        card.addEventListener('dragover', function (event) { event.preventDefault(); card.classList.add('over'); });
+        card.addEventListener('dragleave', function () { card.classList.remove('over'); });
+        card.addEventListener('drop', function (event) {
+          event.preventDefault(); card.classList.remove('over');
+          var type = event.dataTransfer.getData('text/pine-flow-type');
+          var source = event.dataTransfer.getData('text/pine-flow-node') || dragId;
+          if (type) {
+            add(type, '', node.id); return;
+          }
+          if (source) reorder(source, node.id);
+        });
+        graph.appendChild(card);
+      });
+      graph.ondragover = function (event) { event.preventDefault(); graph.classList.add('drop-ready'); };
+      graph.ondragleave = function () { graph.classList.remove('drop-ready'); };
+      graph.ondrop = function (event) {
+        event.preventDefault(); graph.classList.remove('drop-ready');
+        var type = event.dataTransfer.getData('text/pine-flow-type');
+        var last = graphNodes().slice(-1)[0];
+        if (type) add(type, '', last && last.id);
+        else {
+          var source = event.dataTransfer.getData('text/pine-flow-node') || dragId;
+          if (source) reorder(source, last && last.id);
+        }
+      };
+    }
+    function renderSide() {
+      side.replaceChildren();
+      var node = selectedNode();
+      if (!node) {
+        side.appendChild(make('div', 'sp-flow-empty', 'Select a beat to adjust it.'));
+        return;
+      }
+      side.appendChild(make('b', 'sp-flow-section-title', node.locked
+        ? 'Orchestrator scripted event' : 'Selected node'));
+      if (node.locked) {
+        var generated = make('section', 'sp-flow-script-source');
+        generated.appendChild(make('b', '', node.type === 'sfx'
+          ? 'Scheduled SFX event' : String((node.line || {}).speaker || 'Host')));
+        generated.appendChild(make('span', '', node.type === 'sfx'
+          ? (sfxClipWords(node.clip) || 'The SFX Guy has this event scheduled in the broadcast.')
+          : String((node.line || {}).text || 'No text is banked for this event.')));
+        generated.appendChild(make('i', '', node.type === 'sfx'
+          ? 'This SFX event is placed by the orchestrator.'
+          : String((node.line || {}).source || 'Orchestrator script') + ' - ' + Math.round(node.seconds) + ' seconds'));
+        side.appendChild(generated);
+        side.appendChild(make('div', 'sp-flow-empty',
+          'Generated lines stay intact here. Select a line, then add or drag a node to interject after it.'));
+        return;
+      }
+      var type = document.createElement('select');
+      FLOW_TYPES.forEach(function (spec) {
+        var option = make('option', '', spec[1]); option.value = spec[0];
+        option.selected = spec[0] === node.type; type.appendChild(option);
+      });
+      type.setAttribute('aria-label', 'Beat type');
+      type.addEventListener('change', function () {
+        node.type = type.value;
+        node.clip = {};
+        node.line = node.type === 'scripted_line'
+          ? {speaker: 'Host', text: '', source: 'operator'} : {};
+        node.sfxTried = false;
+        render();
+        if (node.type === 'sfx') primeSfxNodes();
+      });
+      var seconds = document.createElement('input');
+      seconds.type = 'number'; seconds.min = '2'; seconds.max = '900'; seconds.step = '1'; seconds.value = String(node.seconds);
+      seconds.setAttribute('aria-label', 'Beat duration in seconds');
+      seconds.addEventListener('input', function () {
+        node.seconds = Math.max(2, Math.min(900, Number(seconds.value) || flowType(node.type)[2])); updateTiming(); renderGraph();
+      });
+      var detail = document.createElement('textarea');
+      detail.rows = 4; detail.maxLength = 400; detail.placeholder = 'What should this beat draw on?'; detail.value = node.detail;
+      detail.setAttribute('aria-label', 'Beat detail');
+      detail.addEventListener('input', function () { node.detail = detail.value.slice(0, 400); });
+      side.appendChild(flowField('Type', type, sheet, '', false));
+      side.appendChild(flowField('Seconds', seconds, sheet, '', false));
+      side.appendChild(flowField(node.type === 'scripted_line'
+        ? 'Direction around this line' : 'Detail', detail, sheet));
+      if (node.type === 'scripted_line') {
+        node.line = node.line || {speaker: 'Host', text: '', source: 'operator'};
+        var speaker = document.createElement('input');
+        speaker.type = 'text'; speaker.maxLength = 60;
+        speaker.value = String(node.line.speaker || 'Host');
+        speaker.setAttribute('aria-label', 'Scripted line speaker');
+        speaker.addEventListener('input', function () { node.line.speaker = speaker.value.slice(0, 60) || 'Host'; renderGraph(); });
+        var script = document.createElement('textarea');
+        script.rows = 6; script.maxLength = 900;
+        script.placeholder = 'What should this speaker say on air?';
+        script.value = String(node.line.text || '');
+        script.setAttribute('aria-label', 'Scripted line text');
+        script.addEventListener('input', function () { node.line.text = script.value.slice(0, 900); renderGraph(); });
+        side.appendChild(flowField('Speaker', speaker, sheet));
+        side.appendChild(flowField('Script', script, sheet));
+      }
+      if (node.type === 'sfx') {
+        var selectedClip = flowClip(node.clip);
+        var clip = make('section', 'sp-flow-sfx-clip');
+        clip.appendChild(make('b', '', 'Scheduled clip'));
+        clip.appendChild(make('span', '', sfxClipWords(selectedClip)
+          || (node.sfxPlanning ? 'Selecting from the indexed clip library...' : 'No eligible clip selected.')));
+        var reseat = flowIconButton('sp-flow-sfx-reseat', 'c:renew',
+          'Choose another scheduled SFX clip');
+        reseat.addEventListener('click', function () {
+          node.clip = {}; node.sfxTried = false; primeSfxNodes(node.id);
+        });
+        clip.appendChild(reseat);
+        side.appendChild(clip);
+      }
+      var remove = flowIconButton('sp-flow-sidebar-delete', 'c:trash-can', 'Remove selected beat');
+      remove.appendChild(make('span', '', 'Remove beat'));
+      remove.addEventListener('click', function () {
+        flow = flow.filter(function (item) { return item.id !== node.id; }); selected = (graphNodes()[0] || {}).id || ''; render();
+      });
+      side.appendChild(remove);
+    }
+    function render() { updateTiming(); renderGraph(); renderSide(); }
+
+    var systemPromptDirty = false;
+    systemPrompt.addEventListener('input', function () { systemPromptDirty = true; });
+    function promptSlot(book) {
+      var blob = (book && book[String(entry.kind || '')]) || {};
+      var variants = Array.isArray(blob.variants) ? blob.variants.slice() : [];
+      if (!variants.length) variants.push({id: '', name: 'Station default', text: ''});
+      var index = variants.findIndex(function (row) {
+        return String(row.id || '') === String(entry.prompt_id || '');
+      });
+      if (index < 0) index = Math.max(0, Math.min(variants.length - 1, Number(blob.active) || 0));
+      return {variants: variants, index: index};
+    }
+    function loadSystemPrompt() {
+      if (!api() || !api().get || !String(entry.kind || '')) return;
+      api().get('/api/schedule/prompts').then(function (book) {
+        var picked = promptSlot(book);
+        var text = String((picked.variants[picked.index] || {}).text || '');
+        if (!systemPromptDirty && text) systemPrompt.value = text;
+      }, function () { /* The director supplied the prompt already. */ });
+    }
+    function saveSystemPrompt() {
+      if (!api() || !api().get || !api().post || !String(entry.kind || '')) {
+        sheet.say('This segment has no writable prompt route.', true); return;
+      }
+      var text = String(systemPrompt.value || '').trim();
+      if (!text) { sheet.say('The system prompt is empty.', true); return; }
+      savePrompt.disabled = true;
+      api().get('/api/schedule/prompts').then(function (book) {
+        var picked = promptSlot(book);
+        var row = Object.assign({}, picked.variants[picked.index] || {});
+        row.id = String(row.id || entry.prompt_id || (String(entry.kind) + '-operator'));
+        row.name = String(row.name || entry.label || entry.kind || 'Station prompt').slice(0, 80);
+        row.text = text;
+        picked.variants[picked.index] = row;
+        return api().post('/api/schedule/prompts', {
+          [String(entry.kind || '')]: {active: picked.index, variants: picked.variants}
+        });
+      }).then(function () {
+        systemPromptDirty = false;
+        entry.prompt = text; entry.prompt_id = String(entry.prompt_id || '');
+        sheet.say('Saved the active system prompt for future ' + String(entry.kind || 'segment') + ' segments.');
+      }, function (err) { sheet.say(String((err && err.message) || err), true); })
+        ['finally'](function () { savePrompt.disabled = false; });
+    }
+    savePrompt.addEventListener('click', saveSystemPrompt);
+
+    function activeSavedGraph() {
+      return savedGraphs.find(function (graph) { return graph.id === selectedGraph; }) || null;
+    }
+    function refreshLibraryControls() {
+      var graph = activeSavedGraph();
+      previousGraph.disabled = savedGraphs.length < 2;
+      nextGraph.disabled = savedGraphs.length < 2;
+      saveGraphWords.textContent = graph ? 'Update graph' : 'Save graph';
+      saveGraph.title = graph ? 'Update the selected saved graph' : 'Save this graph for reuse';
+    }
+    function useSavedGraph(graph) {
+      if (!graph) return;
+      selectedGraph = String(graph.id || '');
+      libraryPick.value = selectedGraph;
+      flow = (Array.isArray(graph.flow) ? graph.flow : []).map(flowNode);
+      selected = flow.length ? flow[0].id : '';
+      direction.value = String(graph.flow_prompt || '');
+      minutes.value = String(Math.max(.25, Number(graph.minutes) || 3));
+      graphName.value = String(graph.name || 'Untitled segment graph');
+      refreshLibraryControls(); render(); primeSfxNodes();
+      sheet.say('Loaded saved graph: ' + graphName.value + '.');
+    }
+    function loadSavedGraphs(prefer) {
+      if (!api() || !api().get) return;
+      api().get('/api/schedule/flow/library').then(function (got) {
+        savedGraphs = Array.isArray(got && got.graphs) ? got.graphs : [];
+        var wanted = String(prefer || selectedGraph || '');
+        if (!savedGraphs.some(function (graph) { return String(graph.id || '') === wanted; })) wanted = '';
+        selectedGraph = wanted;
+        libraryPick.replaceChildren();
+        var current = make('option', '', 'Current segment graph');
+        current.value = ''; libraryPick.appendChild(current);
+        savedGraphs.forEach(function (graph) {
+          var option = make('option', '', String(graph.name || 'Untitled segment graph'));
+          option.value = String(graph.id || ''); libraryPick.appendChild(option);
+        });
+        libraryPick.value = selectedGraph;
+        refreshLibraryControls();
+      }, function (err) { sheet.say(String((err && err.message) || err), true); });
+    }
+    function cycleSavedGraph(step) {
+      if (!savedGraphs.length) return;
+      var index = savedGraphs.findIndex(function (graph) { return graph.id === selectedGraph; });
+      index = (index + step + savedGraphs.length) % savedGraphs.length;
+      useSavedGraph(savedGraphs[index]);
+    }
+    function saveSavedGraph(asCopy) {
+      saveGraph.disabled = true; copyGraph.disabled = true;
+      var graph = activeSavedGraph();
+      api().post('/api/schedule/flow/library', {
+        id: asCopy ? '' : String((graph && graph.id) || ''),
+        name: String(graphName.value || label.value || 'Untitled segment graph'),
+        kind: String(entry.kind || ''), minutes: Number(minutes.value) || 3,
+        flow_prompt: direction.value, flow: flow
+      }).then(function (got) {
+        var saved = got && got.graph;
+        selectedGraph = String((saved && saved.id) || '');
+        graphName.value = String((saved && saved.name) || graphName.value || 'Untitled segment graph');
+        sheet.say(String((got && got.say) || 'Saved reusable segment graph.'));
+        loadSavedGraphs(selectedGraph);
+      }, function (err) { sheet.say(String((err && err.message) || err), true); })
+        ['finally'](function () { saveGraph.disabled = false; copyGraph.disabled = false; });
+    }
+
+    libraryPick.addEventListener('change', function () {
+      var picked = savedGraphs.find(function (graph) { return graph.id === libraryPick.value; });
+      if (!picked) {
+        selectedGraph = ''; refreshLibraryControls(); return;
+      }
+      useSavedGraph(picked);
+    });
+    previousGraph.addEventListener('click', function () { cycleSavedGraph(-1); });
+    nextGraph.addEventListener('click', function () { cycleSavedGraph(1); });
+    saveGraph.addEventListener('click', function () { saveSavedGraph(false); });
+    copyGraph.addEventListener('click', function () { saveSavedGraph(true); });
+
+    function suggestFlow() {
+      suggest.disabled = true; suggestWords.textContent = 'Planning...';
+      api().post('/api/schedule/flow/suggest', {kind: String(entry.kind || 'banter'),
+        label: label.value, minutes: Number(minutes.value) || 3, notes: String(sourceNotes.value || '')})
+        .then(function (got) {
+          flow = ((got && got.nodes) || []).map(flowNode);
+          selected = flow.length ? flow[0].id : '';
+          render(); primeSfxNodes();
+          sheet.say(String((got && got.say) || 'The orchestrator proposed a flow.'));
+        }, function (err) { sheet.say(String((err && err.message) || err), true); })
+        ['finally'](function () { suggest.disabled = false; suggestWords.textContent = 'Orchestrator suggests'; });
+    }
+    suggest.addEventListener('click', suggestFlow);
+    speakerbox.addEventListener('click', function () {
+      speakerbox.disabled = true; speakResults.hidden = false;
+      speakResults.textContent = 'Searching Speakerbox...';
+      var query = [label.value, entry.notes, direction.value, entry.prompt].filter(Boolean).join(' ').slice(0, 700);
+      api().get('/api/speakbox/search?k=5&q=' + encodeURIComponent(query || String(entry.kind || 'banter')))
+        .then(function (got) {
+          var hits = (got && got.hits) || [];
+          speakResults.replaceChildren();
+          if (!hits.length) { speakResults.appendChild(make('div', 'sp-flow-empty', 'No matching Speakerbox passages were returned.')); return; }
+          hits.forEach(function (hit) {
+            var line = make('button', 'sp-flow-speak-hit', ''); line.type = 'button';
+            var source = String(hit.name || hit.doc || hit.file || 'Speakerbox passage');
+            var passage = String(hit.text || hit.passage || hit.quote || hit.preview || '').replace(/\s+/g, ' ').slice(0, 260);
+            line.appendChild(make('b', '', source)); line.appendChild(make('span', '', passage || 'Add this passage to the flow'));
+            line.addEventListener('click', function () { add('speakerbox_quote', source + (passage ? ': ' + passage : '')); sheet.say('Speakerbox quote added to the flow.'); });
+            speakResults.appendChild(line);
+          });
+        }, function (err) { speakResults.textContent = String((err && err.message) || err); })
+        ['finally'](function () { speakerbox.disabled = false; });
+    });
+    minutes.addEventListener('input', updateTiming);
+    function saveFlow(allOfKind) {
+      save.disabled = true; applyKind.disabled = true;
+      api().post('/api/schedule/flow/slot', {preset: preset, slot_id: String(entry.slot_id || ''),
+        kind: String(entry.kind || ''), label: label.value, minutes: Number(minutes.value) || 3,
+        notes: String(sourceNotes.value || ''), flow_prompt: direction.value, flow: flow,
+        apply_kind: !!allOfKind}).then(function (got) {
+          sheet.say(String((got && got.say) || 'Segment flow saved.'));
+          if (typeof refresh === 'function') setTimeout(refresh, 350);
+        }, function (err) { sheet.say(String((err && err.message) || err), true); })
+        ['finally'](function () { save.disabled = false; applyKind.disabled = false; });
+    }
+    save.addEventListener('click', function () { saveFlow(false); });
+    applyKind.addEventListener('click', function () { saveFlow(true); });
+    render();
+    primeSfxNodes();
+    loadSystemPrompt();
+    loadSavedGraphs();
+    return sheet;
+  }
+
+  function itineraryFlowSwitch(entry, sheet, refresh) {
+    var target = {occurrence: String((entry && entry.occurrence) || ''),
+      slot_id: String((entry && entry.slot_id) || '')};
+    itineraryClose();
+    return itineraryFlowOpen(entry, {returnTarget: target}, refresh);
+  }
+
+  function flowEntryHasLine(entry, lineId) {
+    var wanted = String(lineId || '');
+    if (!wanted) return false;
+    var groups = [((entry || {}).script || {}).turns, (entry || {}).aired];
+    return groups.some(function (rows) {
+      return Array.isArray(rows) && rows.some(function (row) {
+        return wanted === String((row || {}).line || '')
+          || wanted === String((row || {}).line_id || '')
+          || wanted === String((row || {}).id || '');
+      });
+    });
+  }
+
+  function flowEntryForLine(hours, line) {
+    var lineId = String((line && line.id) || '');
+    var source = elements.find(function (item) {
+      return lineId && (String((item || {}).line || '') === lineId
+        || String((item || {}).id || '') === lineId);
+    }) || {};
+    var when = Number((line && line.at) || source.air_at || source.at) || 0;
+    var kind = String((line && line.kind) || source.kind || source.round || '').toLowerCase();
+    var all = [];
+    (hours || []).forEach(function (page) {
+      ((page && page.entries) || []).forEach(function (entry) {
+        all.push(Object.assign({}, entry, {schedule_preset:
+          String(((page && page.sheet) || {}).preset || '')}));
+      });
+    });
+    var exact = all.find(function (entry) { return flowEntryHasLine(entry, lineId); });
+    if (exact) return exact;
+    var timed = all.filter(function (entry) {
+      var start = Number(entry.start) || 0, end = Number(entry.deadline) || 0;
+      return when && start && start <= when && (!end || when < end);
+    });
+    return timed.find(function (entry) { return String(entry.kind || '').toLowerCase() === kind; })
+      || timed[0] || all.find(function (entry) {
+        return kind && String(entry.kind || '').toLowerCase() === kind;
+      }) || null;
+  }
+
+  function itineraryFlowForLine(line, close) {
+    line = line || {};
+    var lineId = String(line.id || '');
+    if (!lineId || !api() || !api().get) {
+      return Promise.reject(new Error('This item has no scheduled line to trace.'));
+    }
+    return Promise.all([
+      api().get('/api/director?hour=0'), api().get('/api/director?hour=1')
+    ]).then(function (hours) {
+      var entry = flowEntryForLine(hours.filter(Boolean), line);
+      if (!entry) throw new Error('The current running order has no segment for this line.');
+      entry.flow_origin = {id: lineId, text: String(line.said || line.text || '').slice(0, 520),
+        at: Number(line.at) || 0};
+      if (typeof close === 'function') close();
+      itineraryClose();
+      itineraryFlowOpen(entry, {returnTarget: {occurrence: String(entry.occurrence || ''),
+        slot_id: String(entry.slot_id || '')}}, null);
+      return entry;
+    });
+  }
+
+  function itineraryFlowForSegment(ident, close) {
+    var block = Number((ident && ident.block) || 0);
+    if (!block) return Promise.reject(new Error('This segment has no script block to trace.'));
+    return segInspect(block).then(function (data) {
+      var first = ((data && data.lines) || []).find(function (line) {
+        return String((line || {}).line_id || '');
+      });
+      if (!first) throw new Error('The segment has no line that can be linked to its schedule.');
+      return itineraryFlowForLine({id: String(first.line_id || ''),
+        said: String(first.text || ''), text: String(first.text || ''),
+        kind: String((data && data.prompt_kind) || (ident && ident.round) || '')}, close);
+    });
+  }
+
+  root.PineSegmentFlow = {openForLine: itineraryFlowForLine,
+    openForSegment: itineraryFlowForSegment};
+
   function itineraryPaint(list, hours, sheet) {
     for (var h = 0; h < hours.length; h += 1) {
       var page = hours[h] || {};
@@ -5333,7 +6549,10 @@
       }
       for (k = 0; k < rows.length; k += 1) {
         var next = rows[k + 1] ? Number(rows[k + 1].start) || 0 : 0;
-        list.appendChild(itinRow(rows[k] || {}, next, sheet));
+        var item = Object.assign({}, rows[k] || {}, {
+          schedule_preset: String((page.sheet && page.sheet.preset) || '')
+        });
+        list.appendChild(itinRow(item, next, sheet));
       }
     }
   }
@@ -5382,6 +6601,17 @@
     mid.appendChild(make('span', 'sp-itin-hold',
       itinBanked(entry) + (said ? '  ·  ' + said : '')));
     row.appendChild(mid);
+    var graphButton = flowIconButton('sp-itin-graph', 'c:chart--network',
+      'Design this segment in the node graph');
+    graphButton.classList.toggle('has-flow', Array.isArray(entry.flow) && entry.flow.length > 0);
+    graphButton.addEventListener('click', function (ev) {
+      ev.preventDefault(); ev.stopPropagation();
+      itineraryFlowSwitch(entry, sheet, function () {
+        var list = document.querySelector('#' + ITIN_ID + ' .sp-itin-list');
+        if (list) itineraryHour(list, sheet);
+      });
+    });
+    row.appendChild(graphButton);
     row.appendChild(make('span', 'sp-itin-state', state || 'not said yet'));
 
     var found = itinFirstLine(entry, until);
@@ -5391,11 +6621,9 @@
     row.setAttribute('tabindex', '0');
     row.title = 'Open this segment’s script, prompt, provenance and broadcast controls';
     var controls = make('div', 'sp-itin-actions');
-    var node = lid ? document.querySelector('.sp-el[data-line="' + segTame(lid) + '"]') : null;
+    var node = lid ? lineNodes.get(segTame(lid)) || lineNode(segTame(lid)) : null;
     var scene = node;
-    while (scene && !/(^|\s)sp-scene(\s|$)/.test(String(scene.className || ''))) {
-      scene = scene.previousElementSibling;
-    }
+    if (scene) scene = sceneNodes.get(String(scene.dataset.seg || '')) || null;
     var ident = scene ? segIdentity(scene) : null;
     function act(label, run, disabled) {
       var button = make('button', 'sp-itin-action', label);
@@ -5432,6 +6660,7 @@
     row.appendChild(conversation);
     var go = function (ev, force) {
       if (ev) ev.preventDefault();
+      if (row.pineFlowHeld) { row.pineFlowHeld = false; return; }
       conversation.hidden = force ? false : !conversation.hidden;
       controls.hidden = conversation.hidden;
       row.setAttribute('aria-expanded', conversation.hidden ? 'false' : 'true');
@@ -5442,6 +6671,66 @@
       if (ev.key !== 'Enter' && ev.key !== ' ' && ev.key !== 'Spacebar') return;
       go(ev);
     });
+    /* Tap reviews the prepared words. Hold opens the operator's flow editor;
+       moving a finger first remains ordinary scrolling on the tablet. */
+    var hold = null;
+    row.addEventListener('pointerdown', function (ev) {
+      if (ev.button !== undefined && ev.button > 0) return;
+      if (ev.target && ev.target.closest && ev.target.closest('button,input,select,textarea')) return;
+      hold = {x: ev.clientX || 0, y: ev.clientY || 0, fired: false};
+      hold.timer = setTimeout(function () {
+        if (!hold) return;
+        hold.fired = true; row.pineFlowHeld = true;
+        itineraryFlowSwitch(entry, sheet, function () {
+          var list = document.querySelector('#' + ITIN_ID + ' .sp-itin-list');
+          if (list) itineraryHour(list, sheet);
+        });
+      }, SEG_HOLD_MS);
+    });
+    row.addEventListener('pointermove', function (ev) {
+      if (!hold) return;
+      if (Math.abs((ev.clientX || 0) - hold.x) > SEG_HOLD_SLOP
+          || Math.abs((ev.clientY || 0) - hold.y) > SEG_HOLD_SLOP) {
+        clearTimeout(hold.timer); hold = null;
+      }
+    });
+    row.addEventListener('pointerup', function () {
+      if (hold) clearTimeout(hold.timer);
+      hold = null;
+    });
+    row.addEventListener('pointercancel', function () {
+      if (hold) clearTimeout(hold.timer);
+      hold = null;
+    });
+    row.addEventListener('contextmenu', function (ev) {
+      ev.preventDefault();
+      itineraryFlowSwitch(entry, sheet, function () {
+        var list = document.querySelector('#' + ITIN_ID + ' .sp-itin-list');
+        if (list) itineraryHour(list, sheet);
+      });
+    });
+    if (entry.slot_id) {
+      row.draggable = true;
+      row.addEventListener('dragstart', function (ev) {
+        ev.dataTransfer.setData('text/pine-schedule-slot', String(entry.slot_id));
+        row.classList.add('sp-itin-dragging');
+      });
+      row.addEventListener('dragend', function () { row.classList.remove('sp-itin-dragging'); });
+      row.addEventListener('dragover', function (ev) {
+        ev.preventDefault(); row.classList.add('sp-itin-drop');
+      });
+      row.addEventListener('dragleave', function () { row.classList.remove('sp-itin-drop'); });
+      row.addEventListener('drop', function (ev) {
+        var source = ev.dataTransfer.getData('text/pine-schedule-slot');
+        if (!source || source === String(entry.slot_id || '')) return;
+        ev.preventDefault(); row.classList.remove('sp-itin-drop');
+        itineraryReorder({slot_id: source, schedule_preset: entry.schedule_preset}, entry, sheet,
+          function () {
+            var list = document.querySelector('#' + ITIN_ID + ' .sp-itin-list');
+            if (list) itineraryHour(list, sheet);
+          });
+      });
+    }
     return row;
   }
 
@@ -5452,6 +6741,7 @@
       'Segment ' + (ident.block ? ident.block : '(unnumbered)'));
     segWindowOpen(sheet, ident);   /* [#1238] a tap in this window is served out of
                                       one answer, not a fresh request each time */
+    segFlowInspectButton(sheet, ident);
     segExportButtons(sheet, ident);                         /* [#1220] */
     /* A diagnostic surface: the broadcast ducks while it is open and
        lets go by itself when the sheet leaves the page. */
@@ -7135,6 +8425,20 @@
     });
   }
 
+  function segFlowInspectButton(sheet, ident) {
+    if (!sheet || !sheet.head || !sheet.x) return;
+    var graph = flowIconButton('sp-segins-flow', 'c:chart--network',
+      'Open this inspected segment in the node graph');
+    graph.addEventListener('click', function () {
+      graph.disabled = true;
+      itineraryFlowForSegment(ident, sheet.close)['catch'](function (err) {
+        graph.disabled = false;
+        sheet.say(String((err && err.message) || err), true);
+      });
+    });
+    sheet.head.insertBefore(graph, sheet.x);
+  }
+
   /* The Segment window's own header carries the same two roads, so a
      segment being inspected can be taken away without going back to the
      menu. Inserted before the close button, which sheetShell owns. */
@@ -7867,7 +9171,7 @@
     return diagnosticRecorder;
   }
   function diagnosticDocument(box) {
-    diagnosticNodes = Array.prototype.slice.call(box.querySelectorAll('.sp-el'));
+    diagnosticNodes = scriptOrder.slice();
     diagnosticIndices = new Map();
     diagnosticLines = Object.create(null);
     diagnosticHiddenCount = 0;
@@ -7875,7 +9179,7 @@
     diagnosticNodes.forEach(function (n, i) {
       diagnosticIndices.set(n, i);
       if (n.pineItem && n.pineItem.line) diagnosticLines[String(n.pineItem.line)] = {item: n.pineItem, index: i};
-      if (n.hidden) diagnosticHiddenCount += 1;
+      if (n.hidden || n.parentNode !== box) diagnosticHiddenCount += 1;
       if (n.classList.contains('sp-fx')) diagnosticTransitionCount += 1;
     });
     if (root.PineScriptDiagnostics) diagnosticRevision = root.PineScriptDiagnostics.revision(elements);
@@ -8841,6 +10145,60 @@
    * conversation rather than a table is that rows never move once written.
    * Rebuilding the list each tick would also throw away the operator's
    * scroll position, which is the one thing an endless feed must not do. */
+  var feedCrawlResize = null;
+  var feedCrawlBox = null;
+  var feedCrawlWidth = -1;
+
+  function feedCrawlMeasure(viewport) {
+    if (!viewport) return;
+    var track = viewport.querySelector('.sp-msg-marquee-track');
+    var first = track && track.firstElementChild;
+    viewport.classList.toggle('is-moving',
+      !!first && first.scrollWidth > viewport.clientWidth - 4);
+  }
+
+  function feedCrawlResizeNow() {
+    if (!feedCrawlBox || feedCrawlBox.clientWidth === feedCrawlWidth) return;
+    feedCrawlWidth = feedCrawlBox.clientWidth;
+    feedCrawlBox.querySelectorAll('.sp-msg-marquee').forEach(feedCrawlMeasure);
+  }
+
+  function feedCrawlStart(box) {
+    feedCrawlStop();
+    feedCrawlBox = box;
+    if (typeof root.ResizeObserver === 'function') {
+      feedCrawlResize = new root.ResizeObserver(feedCrawlResizeNow);
+      feedCrawlResize.observe(box);
+    } else if (root.addEventListener) root.addEventListener('resize', feedCrawlResizeNow);
+  }
+
+  function feedCrawlStop() {
+    if (feedCrawlResize) feedCrawlResize.disconnect();
+    else if (root.removeEventListener) root.removeEventListener('resize', feedCrawlResizeNow);
+    feedCrawlResize = null;
+    feedCrawlBox = null;
+    feedCrawlWidth = -1;
+  }
+
+  function feedSetActiveMarquee(box) {
+    /* The feed can hold a long render history. Only the newest voicing
+       receipt is still live, so it is the one that earns a moving marquee.
+       Leaving every historical line on requestAnimationFrame made an idle
+       tablet do the work of a row of news tickers. */
+    var rows = box ? box.querySelectorAll('.sp-msg-ev[data-render-at]') : [];
+    var newest = null;
+    var newestAt = -1;
+    for (var index = 0; index < rows.length; index += 1) {
+      var candidate = rows[index];
+      var at = Number(candidate.dataset.renderAt) || 0;
+      if (at >= newestAt) { newest = candidate; newestAt = at; }
+    }
+    for (var item = 0; item < rows.length; item += 1) {
+      var viewport = rows[item].querySelector('.sp-msg-marquee');
+      if (viewport) viewport.classList.toggle('sp-msg-marquee-active', rows[item] === newest);
+    }
+  }
+
   function paintFeed(state) {
     var box = el('spFeed');
     if (!box) return;
@@ -8862,6 +10220,12 @@
      * drawn while `prepared` used to still read `prepared` long after
      * it had aired. */
     var rows = (state && state.chat) || [];
+    if (rows.length > FEED_MAX) {
+      rows = rows.slice().sort(function (a, b) {
+        return Number((a && (a.air_at || a.ts)) || 0)
+          - Number((b && (b.air_at || b.ts)) || 0);
+      }).slice(-FEED_MAX);
+    }
     var added = 0;
     var want = [];
     for (var i = 0; i < rows.length; i += 1) {
@@ -8916,7 +10280,11 @@
     var log = (state && state.activity_log) || [];
     for (var k = 0; k < log.length; k += 1) {
       var ev = log[k];
-      var key = 'ev' + (ev && ev.at) + String((ev && ev.stage) || '');
+      /* Several receipts can land during the same second. Include the
+         durable line id so an SFX clip and its reaction cannot hide each
+         other behind the old timestamp-and-stage key. */
+      var key = 'ev' + (ev && ev.at) + String((ev && ev.stage) || '')
+        + String((ev && ev.line) || '') + String((ev && ev.text) || '');
       if (!ev || seen[key]) continue;
       seen[key] = true;
       /* A voicing event names a line but historically carries no cast
@@ -8933,6 +10301,15 @@
       }
       box.appendChild(eventRow(Object.assign({}, subject || {}, ev)));
       added += 1;
+    }
+    /* Activity has its own stream and therefore never belongs in the chat
+       window above. Bound it separately, oldest first, so a busy booth still
+       keeps its most recent SFX, render, and orchestration receipts visible. */
+    var events = [].slice.call(box.children).filter(function (child) {
+      return /sp-msg-ev/.test(String(child.className || ''));
+    });
+    for (var eventAt = 0; eventAt < events.length - FEED_EVENT_MAX; eventAt += 1) {
+      events[eventAt].remove();
     }
     /* #1287: THE TRIM STOPS EVICTING ROWS IT STILL WANTS.
      *
@@ -8972,6 +10349,7 @@
         if (feedLive === oldId) feedLive = '';
       }
     }
+    feedSetActiveMarquee(box);
     if (!added && over <= 0) return;
     if (feedStick) box.scrollTop = box.scrollHeight;
   }
@@ -9009,6 +10387,18 @@
     var stage = String(row.stage || '').toLowerCase();
     var kind = String(row.kind || '').toLowerCase();
     var round = String(row.round || '').toLowerCase();
+    /* A renderer is not a speaker. The generic worker label made a useful
+       progress row read like infrastructure noise; name the person whose
+       words are in flight instead. */
+    if (stage === 'voicing') {
+      var speaker = feedSpeaker(row);
+      return speaker ? speaker + ' rendering' : 'Voice rendering';
+    }
+    if (stage === 'sfx') return 'The SFX Guy played a clip';
+    if (stage === 'sfxguy') return 'The SFX Guy';
+    if (stage === 'sfxreaction') {
+      return (feedSpeaker(row) || 'A host') + ' reacts to SFX';
+    }
     if (stage) return feedHuman(stage);
     if (kind === 'interject' || kind === 'image_analysis' || kind === 'sfx') {
       return feedHuman(kind);
@@ -9033,10 +10423,20 @@
     var speaker = feedSpeaker(row);
     var stage = String(row.stage || '').toLowerCase();
     if (stage === 'voicing') {
+      var total = Math.max(0, Number(row.script_total) || 0);
+      var index = Math.max(0, Math.min(total, Number(row.script_index) || 0));
+      if (total) {
+        return 'line ' + index + ' of ' + total + ' - '
+          + Math.round((1 / total) * 100) + '% of script; '
+          + Math.round((index / total) * 100) + '% queued through render';
+      }
       return speaker ? 'rendering a line for ' + speaker : 'rendering the next broadcast line';
     }
     if (stage === 'writing') return 'preparing dialogue for a scheduled segment';
     if (stage === 'action') return 'coordinating the broadcast and its prepared material';
+    if (stage === 'sfx') return 'confirmed by audible playout; written to the SFX rotation';
+    if (stage === 'sfxguy') return 'confirmed by audible playout; the prepared interjection landed';
+    if (stage === 'sfxreaction') return 'the one-in-three host reaction landed after the clip';
     if (String(row.kind || '').toLowerCase() === 'sfx') {
       return speaker ? 'punctuating ' + speaker + "'s segment" : 'punctuating the live segment';
     }
@@ -9063,33 +10463,38 @@
   function feedCrawlDress(viewport, words) {
     if (!viewport) return;
     var body = String(words || '').replace(/\s+/g, ' ').trim() || 'No details were recorded.';
+    if (viewport.dataset.words === body) return;
     var track = viewport.querySelector('.sp-msg-marquee-track');
     if (!track) {
       track = make('span', 'sp-msg-marquee-track');
       viewport.replaceChildren(track);
     }
-    if (viewport.dataset.words !== body) {
-      viewport.dataset.words = body;
-      track.replaceChildren();
-      var first = make('span', '', body);
-      first.setAttribute('data-dialogue-text', 'true');
-      track.appendChild(first);
-      var again = make('span', '', body);
-      again.setAttribute('aria-hidden', 'true');
-      track.appendChild(again);
-      viewport.setAttribute('aria-label', body);
-      track.style.setProperty('--sp-feed-crawl',
-        Math.max(12, Math.min(58, body.length / 7.5)) + 's');
-    }
+    viewport.dataset.words = body;
+    track.replaceChildren();
+    var first = make('span', '', body);
+    first.setAttribute('data-dialogue-text', 'true');
+    track.appendChild(first);
+    var again = make('span', '', body);
+    again.setAttribute('aria-hidden', 'true');
+    track.appendChild(again);
+    viewport.setAttribute('aria-label', body);
+    track.style.setProperty('--sp-feed-crawl',
+      Math.max(12, Math.min(58, body.length / 7.5)) + 's');
     /* A short line stays put. Measure after placement as well, since a
        sentence that fits on the desktop may need to move on the tablet. */
     viewport.classList.toggle('is-moving', body.length > 34);
     root.requestAnimationFrame(function () {
       if (!viewport.isConnected) return;
-      var first = track.firstElementChild;
-      viewport.classList.toggle('is-moving',
-        !!first && first.scrollWidth > viewport.clientWidth - 4);
+      feedCrawlMeasure(viewport);
     });
+  }
+
+  function feedRenderProgress(row) {
+    var total = Math.max(0, Number(row && row.script_total) || 0);
+    var index = Math.max(0, Math.min(total, Number(row && row.script_index) || 0));
+    if (String((row && row.stage) || '').toLowerCase() !== 'voicing' || !total) return null;
+    return {index: index, total: total, contribution: 100 / total,
+      complete: (index / total) * 100};
   }
 
   function feedFrame(row, extraClass) {
@@ -9098,12 +10503,23 @@
     line.setAttribute('tabindex', '0');
     line.appendChild(feedAvatar(row));
     var context = make('span', 'sp-msg-context');
-    context.appendChild(make('b', 'sp-msg-who sp-msg-operation', feedOperation(row)));
+    var operation = make('b', 'sp-msg-who sp-msg-operation', feedOperation(row));
+    context.appendChild(operation);
     var purpose = make('span', 'sp-msg-purpose');
-    purpose.appendChild(make('span', 'sp-msg-purpose-text', feedPurpose(row)));
+    var purposeText = make('span', 'sp-msg-purpose-text', feedPurpose(row));
+    purpose.appendChild(purposeText);
     context.appendChild(purpose);
     line.appendChild(context);
-    line.appendChild(feedCrawl(feedWords(row)));
+    var body = feedCrawl(feedWords(row));
+    line.appendChild(body);
+    var progress = make('span', 'sp-msg-render-progress');
+    progress.hidden = true;
+    var progressFill = make('span', 'sp-msg-render-progress-fill');
+    progress.appendChild(progressFill);
+    line.appendChild(progress);
+    line.pineFeedNodes = {operation: operation, purpose: purpose,
+      purposeText: purposeText, body: body, progress: progress,
+      progressFill: progressFill, badge: null};
     return line;
   }
 
@@ -9130,22 +10546,39 @@
      `prepared` still read `prepared` long after it had aired. */
   function feedDress(line, row) {
     line.pineRow = row;
-    var head = line.querySelector('.sp-msg-operation');
-    var purpose = line.querySelector('.sp-msg-purpose');
-    var purposeText = line.querySelector('.sp-msg-purpose-text');
-    var body = line.querySelector('.sp-msg-marquee');
+    var parts = line.pineFeedNodes;
+    var head = parts ? parts.operation : line.querySelector('.sp-msg-operation');
+    var purpose = parts ? parts.purpose : line.querySelector('.sp-msg-purpose');
+    var purposeText = parts ? parts.purposeText : line.querySelector('.sp-msg-purpose-text');
+    var body = parts ? parts.body : line.querySelector('.sp-msg-marquee');
+    var progress = parts ? parts.progress : line.querySelector('.sp-msg-render-progress');
+    var progressFill = parts ? parts.progressFill : line.querySelector('.sp-msg-render-progress-fill');
     var operation = feedOperation(row);
     var why = feedPurpose(row);
     if (head && head.textContent !== operation) head.textContent = operation;
     if (purposeText && purposeText.textContent !== why) purposeText.textContent = why;
     var orchestrated = feedOrchestrated(row);
-    var badge = purpose && purpose.querySelector('.sp-msg-orchestrator');
+    var badge = parts ? parts.badge : purpose && purpose.querySelector('.sp-msg-orchestrator');
     if (orchestrated && !badge) {
       badge = make('em', 'sp-msg-orchestrator', 'Orchestrator');
       badge.title = 'Prepared or carried out by the orchestrator';
       purpose.appendChild(badge);
-    } else if (!orchestrated && badge) badge.remove();
+      if (parts) parts.badge = badge;
+    } else if (!orchestrated && badge) {
+      badge.remove();
+      if (parts) parts.badge = null;
+    }
     feedCrawlDress(body, feedWords(row));
+    var render = feedRenderProgress(row);
+    line.classList.toggle('sp-msg-render', !!render);
+    if (progress) progress.hidden = !render;
+    if (render && progressFill) {
+      progressFill.style.width = render.complete.toFixed(1) + '%';
+      progress.title = 'Line ' + render.index + ' of ' + render.total
+        + ': this line contributes ' + render.contribution.toFixed(1)
+        + '%; render queue is ' + render.complete.toFixed(1) + '% complete.';
+      progress.setAttribute('aria-label', progress.title);
+    }
     /* [#1200] a clip deleted from the library reads as gone in the feed. */
     if (line.pineDeleted !== !!row.deleted) {
       line.pineDeleted = !!row.deleted;
@@ -9176,6 +10609,13 @@
     line.pineEvent = ev;
     if (ev.line) line.dataset.line = String(ev.line);
     var stage = String(ev.stage || 'station');
+    if (stage.toLowerCase() === 'voicing') {
+      line.dataset.renderAt = String(Number(ev.at) || 0);
+    }
+    /* Activity events carry the live render receipt. Dress them just like
+       script rows so speaker identity, line contribution, and progress are
+       visible instead of reverting to a generic infrastructure event. */
+    feedDress(line, ev);
     line.title = 'Open details for this ' + stage + ' event';
     line.addEventListener('click', function () { feedDetailOpen(line.pineEvent || ev); });
     line.addEventListener('keydown', function (key) {
@@ -9360,6 +10800,20 @@
     if (root.PineDuck && root.PineDuck.hold) {
       root.PineDuck.hold('sp-spFeedDetail', root.PineDuck.REPORT, detail.back);
     }
+    var graph = flowIconButton('sp-feed-detail-graph', 'c:chart--network',
+      'Open this line in its scheduled node graph');
+    graph.disabled = !(row.line || row.id);
+    graph.addEventListener('click', function () {
+      graph.disabled = true;
+      itineraryFlowForLine({id: String(row.line || row.id || ''), text: String(row.text || words),
+        said: String(row.text || words), at: Number(row.air_at || row.at) || 0,
+        kind: String(row.kind || row.round || '')}, detail.close)
+        ['catch'](function (err) {
+          graph.disabled = false;
+          detail.say(String((err && err.message) || err), true);
+        });
+    });
+    detail.head.insertBefore(graph, detail.x);
     if (stage === 'image_analysis') {
       feedAnalysisOpen(detail, row);
       return detail;
@@ -9481,6 +10935,9 @@
   }
 
   var scriptAsOf = 0;
+  var scriptOrder = [];
+  var sceneNodes = new Map();
+  var segmentCounts = Object.create(null);
 
   var SCENE_NAMES = {
     ad: "Sponsor's Copy", aside: 'Studio Aside', banter: 'Studio Banter',
@@ -9550,6 +11007,28 @@
   /* Hollywood layout: each element type is its own block, and the CSS does
    * the indenting the way a script does - character centred over dialogue,
    * parentheticals tucked inside it, action full width. */
+  function bindScriptOrder(order, items, asOf) {
+    scriptOrder = order;
+    elements = items;
+    scriptAsOf = asOf;
+    lineNodes.clear();
+    sceneNodes.clear();
+    segmentCounts = Object.create(null);
+    order.forEach(function (node) {
+      var item = node.pineItem || {};
+      if (item.line) lineNodes.set(String(item.line), node);
+      if (String(item.type || '') === 'scene' && item.seg) {
+        sceneNodes.set(String(item.seg), node);
+      }
+      if (String(item.type || '') === 'dialogue' && item.seg) {
+        var count = segmentCounts[String(item.seg)] || {lines: 0, seconds: 0};
+        count.lines += 1;
+        count.seconds += Number(item.seconds) || 0;
+        segmentCounts[String(item.seg)] = count;
+      }
+    });
+  }
+
   function paintScript(page, before) {
     var box = el('spScript');
     if (!box) return;
@@ -9589,6 +11068,8 @@
      * merely moved. See the patch note for the three things that move
      * it. Nodes are keyed by the server's element id and kept. */
     if (paintedIn !== box) { scriptNodes.clear(); paintedIn = box; }
+    markAuditAt = 0;
+    markAuditNode = null;
     var anchor = scriptAnchor(box);
     var order = [];
     var wanted = Object.create(null);
@@ -9638,7 +11119,7 @@
       if (held.parentNode === box) held.remove();
       scriptNodes.delete(key);
     });
-    stitchScript(box, order);
+    bindScriptOrder(order, elements, scriptAsOf);
     /* Settle the final layout before measuring the reader's anchor. New
        rows in an already-finished segment arrive visible; restoring first
        and hiding them afterward makes the pane compensate twice in opposite
@@ -9818,11 +11299,8 @@
   }
 
   /* #1285: fold a finished segment, leave the one on air open.
-   *
-   * Done by hiding members rather than nesting them: the reconciler
-   * (#1273) stitches a FLAT list, and that is the fix that stopped this
-   * page destroying a few hundred nodes a poll and losing the highlight
-   * with them. A tree would undo it. */
+   * The keyed list stays flat. Closed bodies leave the DOM but remain in
+   * scriptOrder and the line index, ready for an immediate remount. */
   /* #1300: what each segment was last left as, so a repaint that
      re-asserts the same folds does not replay their motion. */
   var segWas = Object.create(null);
@@ -9833,16 +11311,15 @@
   function segApply(motion) {
     var box = el('spScript');
     if (!box) return;
-    var all = box.querySelectorAll('.sp-el');
     var moving = [], shutting = [], opening = [];      /* #1300 */
     var sceneOrder = [], sceneSeen = Object.create(null), displaySeg = '';
-    for (var s = 0; s < all.length; s += 1) {
-      if (!/(^|\s)sp-scene(\s|$)/.test(String(all[s].className || ''))) continue;
-      var sid = all[s].getAttribute('data-seg') || '';
+    for (var s = 0; s < scriptOrder.length; s += 1) {
+      if (!/(^|\s)sp-scene(\s|$)/.test(String(scriptOrder[s].className || ''))) continue;
+      var sid = scriptOrder[s].getAttribute('data-seg') || '';
       if (!sid || sceneSeen[sid]) continue;
       sceneSeen[sid] = 1;
       sceneOrder.push(sid);
-      var sat = Number(all[s].getAttribute('data-at') || 0);
+      var sat = Number(scriptOrder[s].getAttribute('data-at') || 0);
       if (sat > 0 && sat <= scriptAsOf) displaySeg = sid;
     }
     if (liveSeg && sceneSeen[liveSeg]) displaySeg = liveSeg;
@@ -9886,15 +11363,29 @@
      * A loop must not both read and write the memo it is deciding by. */
     var segsNow = Object.create(null);
     var changed = Object.create(null);
-    for (var q = 0; q < all.length; q += 1) {
-      var qseg = all[q].getAttribute('data-seg') || '';
-      if (!qseg || segsNow[qseg] !== undefined) continue;
+    var segmentSizes = Object.create(null);
+    for (var q = 0; q < scriptOrder.length; q += 1) {
+      var qseg = scriptOrder[q].getAttribute('data-seg') || '';
+      if (!qseg) continue;
+      if (!/(^|\s)sp-scene(\s|$)/.test(String(scriptOrder[q].className || ''))) {
+        segmentSizes[qseg] = (segmentSizes[qseg] || 0) + 1;
+      }
+      if (segsNow[qseg] !== undefined) continue;
       var qshut = !!(folded[qseg] && qseg !== displaySeg);
       segsNow[qseg] = qshut;
-      if (segWas[qseg] !== undefined && segWas[qseg] !== qshut) {
-        changed[qseg] = 1;
-      }
+      if (segWas[qseg] !== undefined && segWas[qseg] !== qshut) changed[qseg] = 1;
     }
+
+    /* Keep headings mounted. Retain a small closing scene for its fold
+       transition, then detach it when the transition settles. */
+    var mounted = scriptOrder.filter(function (node) {
+      var seg = node.getAttribute('data-seg') || '';
+      if (!seg || /(^|\s)sp-scene(\s|$)/.test(String(node.className || ''))) return true;
+      return !segsNow[seg] || (motion && changed[seg]
+        && segmentSizes[seg] <= FOLD_FX_MOST);
+    });
+    stitchScript(box, mounted);
+    var all = box.querySelectorAll('.sp-el');
 
     for (var i = 0; i < all.length; i += 1) {
       var node = all[i];
@@ -9926,6 +11417,9 @@
           opening.push(node);
         }
         continue;                 /* segWas is settled after the loop */
+      }
+      if (node.classList.contains('sp-fx') || node.classList.contains('sp-gone')) {
+        node.classList.remove('sp-fx', 'sp-gone');
       }
       node.hidden = shut && !head;
       if (head) {
@@ -10011,21 +11505,13 @@
       for (var k = 0; k < opening.length; k += 1) {
         opening[k].classList.remove('sp-fx', 'sp-gone');
       }
+      segApply(false);
     }, FOLD_FX_MS + 40);
   }
 
   /* What is inside a fold, so it can be chosen without opening it. */
   function segCount(seg) {
-    var box = el('spScript');
-    if (!box || !seg) return null;
-    var all = box.querySelectorAll('.sp-el[data-seg="' + seg + '"]');
-    var lines = 0, secs = 0;
-    for (var i = 0; i < all.length; i += 1) {
-      if (!/sp-dialogue/.test(all[i].className)) continue;
-      lines += 1;
-      secs += Number(all[i].getAttribute('data-secs') || 0) || 0;
-    }
-    return {lines: lines, seconds: secs};
+    return seg ? segmentCounts[String(seg)] || null : null;
   }
 
   function segToggle(seg) {
@@ -10124,7 +11610,11 @@
          and the hour ahead vanished until the next poll. Keep what we
          have unless something better arrived. */
       if (!fresh.length && !got[2]) return;
-      if (fresh.length) planHours = fresh;
+      if (fresh.length) {
+        got.slice(0, 2).forEach(function (page, index) {
+          if (page) planHours[index] = page;
+        });
+      }
       if (got[2] && Array.isArray(got[2].slots)) {
         bankPlan = got[2];
         bankFetchedAt = Date.now();
@@ -10189,6 +11679,253 @@
     return best;
   }
 
+  function bankCoverageOf(bankSlot) {
+    var coverage = bankSlot && bankSlot.coverage;
+    return coverage && typeof coverage === 'object'
+      && typeof coverage.ready === 'boolean' ? coverage : null;
+  }
+
+  function readinessBankDetail(bankSlot) {
+    var coverage = bankCoverageOf(bankSlot);
+    if (!coverage) return null;
+    var seconds = function (value) {
+      return Math.max(0, Number(value) || 0).toFixed(1) + 's';
+    };
+    var missing = function (value) { return Array.isArray(value) ? value : []; };
+    var gaps = [];
+    if (Number(coverage.script_short_seconds) > 1) {
+      gaps.push(seconds(coverage.script_short_seconds) + ' script short');
+    }
+    if (Number(coverage.recording_short_seconds) > 1) {
+      gaps.push(seconds(coverage.recording_short_seconds) + ' recording short');
+    }
+    if (Number(coverage.duration_short_seconds) > 1) {
+      gaps.push(seconds(coverage.duration_short_seconds) + ' playable short');
+    }
+    if (missing(coverage.missing_roles).length) {
+      gaps.push('Roles: ' + missing(coverage.missing_roles).join(', '));
+    }
+    if (Number(coverage.missing_turns) > 0) {
+      gaps.push(Number(coverage.missing_turns) + ' turns missing');
+    }
+    if (Number(coverage.missing_events) > 0) {
+      gaps.push(Number(coverage.missing_events) + ' events missing');
+    }
+    if (missing(coverage.missing_bookends).length) {
+      gaps.push('Write bookends: ' + missing(coverage.missing_bookends).join(', '));
+    }
+    if (missing(coverage.missing_recorded_bookends).length) {
+      gaps.push('Record bookends: '
+        + missing(coverage.missing_recorded_bookends).join(', '));
+    }
+    var tasks = Array.isArray(bankSlot.tasks) ? bankSlot.tasks.map(function (task) {
+      task = task || {};
+      var room = String(task.room || '').trim();
+      if (!room) return null;
+      var ready = task.ready === true || task.state === 'ready';
+      return {room: room, ready: ready, wantSeconds: Math.max(0,
+        Number(task.want_seconds) || 0), dueIn: Number(task.prepare_by_in_seconds)};
+    }).filter(Boolean) : [];
+    return {ready: coverage.ready, facts: [
+      seconds(coverage.scripted_seconds) + ' scripted',
+      seconds(coverage.recorded_seconds) + ' recorded',
+      seconds(coverage.covered_seconds) + '/'
+        + seconds(coverage.target_seconds) + ' playable coverage'
+    ], gaps: gaps, tasks: tasks};
+  }
+
+  function readinessCardCoverage(model) {
+    var coverage = model.coverage;
+    if (!coverage) return model.lines + '/' + model.targetLines + ' lines / '
+      + Math.round(model.readySeconds) + '/' + Math.round(model.targetSeconds) + 's';
+    return model.lines + '/' + model.targetLines + ' lines / '
+      + Math.round(Number(coverage.covered_seconds) || 0) + '/'
+      + Math.round(Number(coverage.target_seconds) || 0) + 's measured'
+      + (Number(coverage.short_seconds) > 1
+        ? ' / ' + Math.round(Number(coverage.short_seconds)) + 's short' : '');
+  }
+
+  /* A compact, honest model for the preparation desk. The director owns
+   * the schedule and orchestration verdict; bank coverage supplies a second,
+   * measured production verdict when available. */
+  function readinessOf(entry, bankSlot, now) {
+    entry = entry || {};
+    var script = entry.script || {};
+    var orchestration = entry.orchestration || {};
+    var review = entry.review || {};
+    var suppliedStages = orchestration.stages || {};
+    var bound = Array.isArray(script.turns) ? script.turns : [];
+    var drafts = Array.isArray(script.draft_turns) ? script.draft_turns : [];
+    var variants = Array.isArray(script.draft_variants) ? script.draft_variants : [];
+    var variant = !bound.length && variants.find(function (item) {
+      return String((item || {}).id || '') === String(script.selected_candidate || '');
+    }) || (!bound.length && variants[0]) || null;
+    var turns = bound.length ? bound : (drafts.length ? drafts
+      : (variant && Array.isArray(variant.turns) ? variant.turns : []));
+    var performancePlan = scriptPerformances(bound.length || drafts.length
+      ? script : (variant || script));
+    var start = Number(entry.start) || 0;
+    var deadline = Number(entry.deadline) || 0;
+    var have = orchestration.have || {};
+    var target = orchestration.target || {};
+    var readySeconds = String(script.state || '') === 'bound'
+      ? Math.max(0, Number(have.seconds !== undefined ? have.seconds : script.seconds) || 0) : 0;
+    var targetSeconds = target.seconds !== undefined && isFinite(Number(target.seconds))
+      ? Math.max(0, Number(target.seconds))
+      : Math.max(0, (Number(entry.minutes) || 0) * 60);
+    var short = (orchestration.short || {}).seconds;
+    var shortSeconds = Math.max(0, short !== undefined && short !== null
+      ? Number(short) || 0 : targetSeconds - readySeconds);
+    var stages = {
+      written: typeof suppliedStages.written === 'boolean'
+        ? suppliedStages.written : turns.length > 0,
+      reviewed: typeof suppliedStages.reviewed === 'boolean'
+        ? suppliedStages.reviewed : review.approved === true,
+      recorded: typeof suppliedStages.recorded === 'boolean'
+        ? suppliedStages.recorded : readySeconds > 0,
+      scheduled: typeof suppliedStages.scheduled === 'boolean'
+        ? suppliedStages.scheduled : start > 0,
+      executed: typeof suppliedStages.executed === 'boolean'
+        ? suppliedStages.executed : String(entry.state || '') === 'aired'
+    };
+    var state = String(entry.state || 'planned');
+    var live = state === 'on air';
+    var status = String(orchestration.status || '');
+    var directorReady = stages.written && stages.reviewed && stages.recorded
+      && stages.scheduled && (status ? status === 'ready' : shortSeconds <= 0.5);
+    var coverage = bankCoverageOf(bankSlot);
+    var ready = directorReady && (!coverage || coverage.ready);
+    var key = String(entry.occurrence || entry.slot_id || entry.ordinal || start);
+    return {
+      key: key, entry: entry, bank: bankSlot || null, coverage: coverage,
+      turns: turns,
+      performances: performancePlan.rows, candidates: performancePlan.candidates,
+      performanceSeconds: performancePlan.seconds,
+      draftOnly: !bound.length && turns.length > 0,
+      label: String(entry.label || entry.kind || 'Segment'),
+      kind: String(entry.kind || ''), state: state, live: !!live,
+      status: !stages.reviewed && status === 'ready' ? 'awaiting-review'
+        : (directorReady && coverage && !coverage.ready ? 'contract-incomplete'
+          : (status || (ready ? 'ready' : 'needs-work'))), ready: !!ready,
+      start: start, deadline: deadline, startsIn: start ? start - now : null,
+      stages: stages, review: review, needs: Array.isArray(orchestration.needs)
+        ? orchestration.needs.slice() : [],
+      lines: have.lines !== undefined ? Number(have.lines) || 0 : turns.length,
+      targetLines: target.lines !== undefined ? Number(target.lines) || 0 : turns.length,
+      events: Number(have.events) || 0,
+      targetEvents: Number(target.events) || 0,
+      readySeconds: readySeconds, targetSeconds: targetSeconds,
+      shortSeconds: shortSeconds
+    };
+  }
+
+  function readinessQueue(hours, bank, now, limit) {
+    var rows = [], seenKeys = Object.create(null);
+    (hours || []).forEach(function (page, hourIndex) {
+      ((page && page.entries) || []).forEach(function (entry, ordinal) {
+        var state = String((entry && entry.state) || '');
+        if (state === 'aired' || state.indexOf('went by') === 0) return;
+        var key = String((entry && entry.occurrence) || [
+          String((page && page.hour) || ''), String((entry && entry.start) || ''),
+          String((entry && entry.slot_id) || ''), ordinal].join(':'));
+        if (seenKeys[key]) return;
+        seenKeys[key] = true;
+        rows.push({entry: entry || {}, hourIndex: hourIndex, ordinal: ordinal,
+          key: key});
+      });
+    });
+    rows.sort(function (a, b) {
+      var left = Number(a.entry.start) || 0;
+      var right = Number(b.entry.start) || 0;
+      if (!left && right) return 1;
+      if (left && !right) return -1;
+      return left === right
+        ? (a.hourIndex - b.hourIndex || a.ordinal - b.ordinal) : left - right;
+    });
+    var used = Object.create(null);
+    var out = rows.map(function (row) {
+      var hit = bankSlotFor(row.entry, bank, used);
+      if (hit) used[hit.index] = 1;
+      var item = readinessOf(row.entry, hit && hit.slot, now);
+      item.key = row.key;
+      return item;
+    });
+    var cap = Math.max(1, Number(limit) || 8);
+    return out.slice(0, cap);
+  }
+
+  function liveScriptEvents(list) {
+    var out = [], speaker = '', segment = '';
+    (list || []).forEach(function (item) {
+      item = item || {};
+      var nextSegment = String(item.seg || '');
+      if (nextSegment && nextSegment !== segment) {
+        segment = nextSegment;
+        speaker = '';
+      }
+      if (String(item.type || '') === 'character') {
+        speaker = String(item.text || '').trim();
+        return;
+      }
+      if (!item.line) return;
+      out.push({id: String(item.line), text: String(item.text || ''),
+        speaker: String(item.name || item.who || speaker || ''),
+        kind: String(item.kind || item.round || item.type || 'event'),
+        type: String(item.type || 'event')});
+    });
+    return out;
+  }
+
+  function feedScriptEvents(list) {
+    return (list || []).filter(function (item) { return item && item.id; })
+      .map(function (item, index) {
+        return {id: String(item.id), text: String(item.text || ''),
+          speaker: String(item.name || item.who || ''),
+          kind: String(item.kind || 'event'), type: String(item.kind || 'event'),
+          at: Number(item.air_at || item.ts) || 0, index: index};
+      }).sort(function (a, b) { return a.at - b.at || a.index - b.index; });
+  }
+
+  /* Prefer the sounding burst because it is the exact playout order and
+   * includes board/SFX events. Fall back to screenplay order when the
+   * current event is a single clip outside that burst. */
+  function liveCueWindow(row, stream, list, radius, feedRows) {
+    var id = String((row && row.id) || '');
+    if (!id) return [];
+    var streamRows = Array.isArray(stream && stream.rows) ? stream.rows : [];
+    var source = streamRows.map(function (item) {
+      return {id: String(item.id || ''), text: String(item.text || ''),
+        speaker: String(item.name || item.speaker || item.who || ''),
+        kind: String(item.kind || 'event'), type: String(item.kind || 'event')};
+    });
+    var at = source.findIndex(function (item) { return item.id === id; });
+    if (at < 0) {
+      source = feedScriptEvents(feedRows);
+      at = source.findIndex(function (item) { return item.id === id; });
+    }
+    if (at < 0) {
+      source = liveScriptEvents(list);
+      at = source.findIndex(function (item) { return item.id === id; });
+    }
+    if (at < 0) {
+      source = [{id: id, text: String((row && row.text) || ''),
+        speaker: String((row && row.speaker) || ''), kind: 'event', type: 'event'}];
+      at = 0;
+    }
+    var reach = Math.max(1, Number(radius) || 2);
+    return source.slice(Math.max(0, at - reach), at + reach + 1)
+      .map(function (item, index, windowRows) {
+        var copy = Object.assign({}, item);
+        copy.current = item.id === id;
+        copy.relative = index - windowRows.findIndex(function (one) { return one.id === id; });
+        if (copy.current) {
+          if (!copy.text && row && row.text) copy.text = String(row.text);
+          if (!copy.speaker && row && row.speaker) copy.speaker = String(row.speaker);
+        }
+        return copy;
+      });
+  }
+
   function bankSlotText(slot) {
     return 'BANK  |  ' + (Number(slot.ready_seconds) || 0).toFixed(1)
       + 's rendered  |  ' + (Number(slot.written_only_seconds) || 0).toFixed(1)
@@ -10205,6 +11942,504 @@
     if (review.approved) return 'Script approved';
     if (review.seen) return 'Seen, awaiting approval';
     return 'Script needs review';
+  }
+
+  function readinessWhen(item) {
+    if (item.live) return 'ON AIR';
+    if (item.startsIn === null || !isFinite(item.startsIn)) return '--:--';
+    if (item.startsIn <= 0) return 'DUE NOW';
+    if (item.startsIn < 60) return Math.ceil(item.startsIn) + 's';
+    if (item.startsIn < 3600) return Math.ceil(item.startsIn / 60) + 'm';
+    return itinClock(item.start) || '--:--';
+  }
+
+  function readinessStage(name, done, full) {
+    var label = {written: 'Written', reviewed: 'Reviewed', recorded: 'Recorded',
+      scheduled: 'Scheduled', executed: 'Executed'}[name] || name;
+    var node = make('span', 'sp-ready-stage', full ? label : label.charAt(0));
+    node.dataset.stage = name;
+    node.dataset.done = done ? 'true' : 'false';
+    node.title = label + ': ' + (done ? 'complete' : 'not complete');
+    node.setAttribute('aria-label', node.title);
+    return node;
+  }
+
+  function readinessLine(turn, index) {
+    var row = make('div', 'sp-ready-line');
+    row.setAttribute('role', 'button');
+    row.setAttribute('tabindex', '0');
+    row.title = 'Inspect or edit this prepared line';
+    row.dataset.performance = String(turnPerformanceIndex(turn));
+    row.dataset.candidateIndex = String(turnCandidateIndex(turn, index));
+    row.appendChild(make('b', '', String(turn.who || turn.seat || turn.kind || 'Event')));
+    row.appendChild(make('span', '', String(turn.text || '(assembly cue)')));
+    return row;
+  }
+
+  function newsOptionsFor(model) {
+    var slotId = String((model.entry || {}).slot_id || '');
+    if (newsChoiceState && newsChoiceState.slotId === slotId) return newsChoiceState;
+    var state = {slotId: slotId, status: slotId ? 'loading' : 'error',
+      options: [], selectedUrl: '', draftUrl: '', error: slotId ? '' : 'This news slot has no ID.'};
+    newsChoiceState = state;
+    if (!slotId) return state;
+    Promise.resolve().then(function () {
+      return api().get('/api/news/options?slot_id=' + encodeURIComponent(slotId));
+    }).then(function (got) {
+      if (!got || !Array.isArray(got.options)) throw new Error('News choices are unavailable.');
+      if (newsChoiceState !== state) return;
+      var seen = Object.create(null);
+      state.options = got.options.filter(function (option) {
+        var url = option && String(option.url || '').trim();
+        if (!url || seen[url]) return false;
+        seen[url] = true;
+        return true;
+      });
+      state.selectedUrl = String(got.selected_url || '');
+      state.draftUrl = state.selectedUrl;
+      state.status = 'ready';
+      newsChoicesRepaint(model, state);
+    }).catch(function (err) {
+      if (newsChoiceState !== state) return;
+      state.status = 'error';
+      state.error = rejectionError(err);
+      newsChoicesRepaint(model, state);
+    });
+    return state;
+  }
+
+  function newsChoicesRepaint(model, state) {
+    var detail = el('spReadinessDetail');
+    if (newsChoiceState === state && detail && !detail.hidden
+      && detail.dataset.key === model.key) paintReadinessDetail(model);
+  }
+
+  function readinessNewsChoices(model) {
+    var state = newsOptionsFor(model);
+    var section = make('section', 'sp-ready-news');
+    section.appendChild(make('h3', '', 'News story'));
+    if (state.status === 'loading') {
+      var loading = make('p', 'sp-ready-news-message', 'Loading story choices...');
+      loading.setAttribute('role', 'status');
+      section.appendChild(loading);
+      return section;
+    }
+    if (state.status === 'error') {
+      var failed = make('p', 'sp-ready-news-error', state.error);
+      failed.setAttribute('role', 'alert');
+      section.appendChild(failed);
+      if (state.slotId) {
+        var retry = make('button', 'sp-planact', 'Retry stories');
+        retry.type = 'button';
+        retry.addEventListener('click', function () {
+          newsChoiceState = null;
+          newsChoicesRepaint(model, newsOptionsFor(model));
+        });
+        section.appendChild(retry);
+      }
+      return section;
+    }
+    if (!state.options.length) {
+      section.appendChild(make('p', 'sp-ready-news-message', 'No story choices available.'));
+      return section;
+    }
+    var group = make('fieldset', 'sp-ready-news-group');
+    group.appendChild(make('legend', '', 'Choose a story for this segment'));
+    var selected = state.options.find(function (option) {
+      return String(option.url) === state.selectedUrl;
+    });
+    var current = make('p', 'sp-ready-news-selection', selected
+      ? 'Selected: ' + String(selected.title || selected.url)
+      : (state.selectedUrl ? 'A different story is currently selected.' : 'No story selected.'));
+    current.setAttribute('role', 'status');
+    group.appendChild(current);
+    var choose = make('button', 'sp-planact sp-ready-news-choose', 'Choose story');
+    choose.type = 'button';
+    choose.disabled = !state.draftUrl || state.draftUrl === state.selectedUrl
+      || state.status === 'saving';
+    state.options.forEach(function (option) {
+      var url = String(option.url);
+      var row = make('label', 'sp-ready-news-option');
+      row.dataset.selected = url === state.selectedUrl ? 'true' : 'false';
+      var radio = make('input', '');
+      radio.type = 'radio';
+      radio.name = 'sp-ready-news-' + state.slotId;
+      radio.value = url;
+      radio.checked = url === state.draftUrl;
+      radio.disabled = state.status === 'saving';
+      radio.addEventListener('change', function () {
+        if (!radio.checked) return;
+        state.draftUrl = url;
+        choose.disabled = url === state.selectedUrl;
+      });
+      row.appendChild(radio);
+      var words = make('span', 'sp-ready-news-copy');
+      words.appendChild(make('b', '', String(option.title || url)));
+      words.appendChild(make('span', 'sp-ready-news-meta', [option.source,
+        option.availability].filter(Boolean).map(String).join(' / ')));
+      if (option.excerpt) words.appendChild(make('span', 'sp-ready-news-excerpt',
+        String(option.excerpt)));
+      row.appendChild(words);
+      group.appendChild(row);
+    });
+    section.appendChild(group);
+    var actions = make('div', 'sp-ready-news-actions');
+    choose.addEventListener('click', function () {
+      if (!state.draftUrl || state.draftUrl === state.selectedUrl
+        || state.status === 'saving') return;
+      var url = state.draftUrl;
+      state.status = 'saving';
+      state.error = '';
+      newsChoicesRepaint(model, state);
+      Promise.resolve().then(function () {
+        return api().post('/api/news/choice', {slot_id: state.slotId, url: url});
+      }).then(function (got) {
+        if (got && got.ok === false) throw new Error(String(got.detail || got.say || 'Story was not selected.'));
+        if (newsChoiceState !== state) return;
+        state.selectedUrl = url;
+        state.draftUrl = url;
+        state.status = 'ready';
+        newsChoicesRepaint(model, state);
+        loadPlan(true);
+        loadScreenplay(true);
+      }).catch(function (err) {
+        if (newsChoiceState !== state) return;
+        state.status = 'ready';
+        state.error = rejectionError(err);
+        newsChoicesRepaint(model, state);
+      });
+    });
+    actions.appendChild(choose);
+    section.appendChild(actions);
+    if (state.error) {
+      var error = make('p', 'sp-ready-news-error', state.error);
+      error.setAttribute('role', 'alert');
+      section.appendChild(error);
+    }
+    return section;
+  }
+
+  function paintReadinessDetail(model) {
+    var detail = el('spReadinessDetail');
+    if (!detail) return;
+    var scrollTop = detail.scrollTop;
+    detail.replaceChildren();
+    detail.hidden = !model;
+    if (!model) return;
+    detail.dataset.key = model.key;
+    var top = make('div', 'sp-ready-detail-head');
+    var title = make('div', 'sp-ready-detail-title');
+    title.appendChild(make('b', '', model.label));
+    title.appendChild(make('span', '', (itinClock(model.start) || 'Unscheduled')
+      + ' / ' + String(model.status || model.state).replace(/[-_]+/g, ' ')
+      + (model.draftOnly ? ' / draft, not allocated' : '')));
+    top.appendChild(title);
+    var close = make('button', 'sp-ready-close', 'Close');
+    close.type = 'button';
+    close.addEventListener('click', function () {
+      readinessPick = ''; readinessPrint = ''; paintReadiness();
+    });
+    top.appendChild(close);
+    detail.appendChild(top);
+
+    var facts = make('div', 'sp-ready-facts');
+    facts.appendChild(make('span', '', model.lines + '/' + model.targetLines + ' lines'));
+    facts.appendChild(make('span', '', model.events + '/' + model.targetEvents + ' events'));
+    facts.appendChild(make('span', '', model.readySeconds.toFixed(1) + '/'
+      + model.targetSeconds.toFixed(1) + 's recorded'));
+    if (model.bank) facts.appendChild(make('span', '',
+      (Number(model.bank.ready_seconds) || 0).toFixed(1) + 's banked stock'));
+    facts.appendChild(make('span', '', model.performances.length
+      + (model.performances.length === 1 ? ' performance' : ' performances')));
+    detail.appendChild(facts);
+    var stages = make('div', 'sp-ready-stages');
+    Object.keys(model.stages).forEach(function (name) {
+      stages.appendChild(readinessStage(name, model.stages[name], true));
+    });
+    detail.appendChild(stages);
+    if (model.needs.length) {
+      var needs = make('ul', 'sp-ready-needs');
+      model.needs.forEach(function (need) {
+        needs.appendChild(make('li', '', String(need)));
+      });
+      detail.appendChild(needs);
+    }
+
+    var bankDetail = readinessBankDetail(model.bank);
+    if (bankDetail) {
+      var contract = make('section', 'sp-ready-contract');
+      contract.appendChild(make('h3', '', bankDetail.ready
+        ? 'Measured contract ready' : 'Measured contract incomplete'));
+      var measured = make('div', 'sp-ready-contract-facts');
+      bankDetail.facts.forEach(function (fact) {
+        measured.appendChild(make('span', '', fact));
+      });
+      contract.appendChild(measured);
+      if (bankDetail.gaps.length) {
+        var gaps = make('ul', 'sp-ready-contract-gaps');
+        bankDetail.gaps.forEach(function (gap) {
+          gaps.appendChild(make('li', '', gap));
+        });
+        contract.appendChild(gaps);
+      }
+      if (bankDetail.tasks.length) {
+        var rooms = make('div', 'sp-ready-rooms');
+        bankDetail.tasks.forEach(function (task) {
+          var row = make('div', 'sp-ready-room');
+          row.dataset.ready = task.ready ? 'true' : 'false';
+          row.appendChild(make('b', '', task.room));
+          var duty = task.ready ? 'clear' : 'owed'
+            + (task.wantSeconds > 0 ? ' / ' + task.wantSeconds.toFixed(1) + 's' : '');
+          if (!task.ready && isFinite(task.dueIn)) {
+            duty += task.dueIn <= 0 ? ' / due now'
+              : ' / due in ' + Math.ceil(task.dueIn / 60) + 'm';
+          }
+          row.appendChild(make('span', '', duty));
+          rooms.appendChild(row);
+        });
+        contract.appendChild(rooms);
+      }
+      detail.appendChild(contract);
+    }
+
+    var briefRows = [
+      ['Prompt', model.entry.prompt], ['Notes', model.entry.notes],
+      ['Topic', (model.entry.script || {}).topic]
+    ].filter(function (row) { return String(row[1] || '').trim(); });
+    var direction = model.entry.direction || {};
+    ['standing', 'next'].forEach(function (key) {
+      (Array.isArray(direction[key]) ? direction[key] : []).forEach(function (item) {
+        if (item && item.text) briefRows.push([
+          key === 'next' ? 'Next direction' : 'Standing direction', item.text]);
+      });
+    });
+    (Array.isArray(model.entry.beats) ? model.entry.beats : []).forEach(function (beat) {
+      var words = typeof beat === 'string' ? beat
+        : (beat && (beat.text || beat.label || beat.title));
+      if (words) briefRows.push(['Beat', words]);
+    });
+    if (briefRows.length) {
+      var brief = make('section', 'sp-ready-brief');
+      brief.appendChild(make('h3', '', 'Preparation brief'));
+      briefRows.forEach(function (row) {
+        var fact = make('div', 'sp-ready-brief-row');
+        fact.appendChild(make('b', '', row[0]));
+        fact.appendChild(make('span', '', String(row[1])));
+        brief.appendChild(fact);
+      });
+      detail.appendChild(brief);
+    }
+    if (model.kind === 'news') detail.appendChild(readinessNewsChoices(model));
+    if (model.bank && Array.isArray(model.bank.items) && model.bank.items.length) {
+      var stock = make('section', 'sp-ready-stock');
+      stock.appendChild(make('h3', '', 'Banked stock'));
+      model.bank.items.forEach(function (item) {
+        stock.appendChild(make('div', '', String(item.label || item.title
+          || item.text || item.sid || 'Prepared item')));
+      });
+      detail.appendChild(stock);
+    }
+
+    var script = make('div', 'sp-ready-script');
+    var grouped = Object.create(null);
+    model.turns.forEach(function (turn, index) {
+      var pi = turnPerformanceIndex(turn);
+      if (!grouped[pi]) grouped[pi] = [];
+      grouped[pi].push({turn: turn, index: index});
+    });
+    var performanceRows = model.performances.length ? model.performances
+      : Object.keys(grouped).map(function (key) {
+        return {index: Number(key), candidate: '', seconds: 0,
+          turns: grouped[key].length};
+      });
+    performanceRows.forEach(function (performance) {
+      var section = make('section', 'sp-ready-performance');
+      var head = make('div', 'sp-ready-performance-head');
+      head.appendChild(make('b', '', 'Performance ' + (performance.index + 1)));
+      head.appendChild(make('span', '', [performance.candidate,
+        performance.turns ? performance.turns + ' turns' : '',
+        performance.seconds ? Number(performance.seconds).toFixed(1) + 's' : '']
+        .filter(Boolean).join(' / ')));
+      section.appendChild(head);
+      (grouped[performance.index] || []).forEach(function (line) {
+        var node = readinessLine(line.turn, line.index);
+        function open() {
+          itinTurnOpen(model.entry, line.turn, line.index, function () { loadPlan(true); });
+        }
+        node.addEventListener('click', open);
+        node.addEventListener('keydown', function (event) {
+          if (event.key !== 'Enter' && event.key !== ' ') return;
+          event.preventDefault();
+          open();
+        });
+        section.appendChild(node);
+      });
+      script.appendChild(section);
+    });
+    if (!model.turns.length) {
+      script.appendChild(make('p', 'sp-ready-empty',
+        'No prepared lines are allocated to this segment.'));
+    }
+    detail.appendChild(script);
+
+    var actions = make('div', 'sp-ready-actions');
+    var message = make('span', 'sp-ready-result', '');
+    message.setAttribute('role', 'status');
+    if (model.entry.occurrence && model.turns.length && !model.review.approved) {
+      var approve = make('button', 'sp-planact sp-ready-approve', 'Approve script');
+      approve.type = 'button';
+      approve.addEventListener('click', function () {
+        approve.disabled = true; message.textContent = 'Approving...';
+        api().post('/api/director/segment/'
+          + encodeURIComponent(model.entry.occurrence) + '/approve',
+          {who: 'operator'}).then(function (got) {
+          model.entry.review = Object.assign({}, model.entry.review, {approved: true});
+          message.textContent = String((got && got.say) || 'Script approved.');
+          readinessPrint = ''; paintReadiness(); loadPlan(true);
+        }, function (err) {
+          approve.disabled = false;
+          message.textContent = String((err && err.message) || err);
+        });
+      });
+      actions.appendChild(approve);
+    }
+    if ((model.entry.orchestration || {}).preparable) {
+      var prepare = make('button', 'sp-planact', model.ready
+        ? 'Prepare another' : 'Prepare segment');
+      prepare.type = 'button'; prepare.dataset.kind = model.kind;
+      prepare.addEventListener('click', function () { planPrepare(prepare); });
+      actions.appendChild(prepare);
+    }
+    var air = make('button', 'sp-planact', 'Return to air');
+    air.type = 'button';
+    air.addEventListener('click', function () {
+      readinessPick = ''; readinessPrint = ''; paintReadiness();
+      resumeAirFollow('readiness desk');
+    });
+    actions.appendChild(air);
+    actions.appendChild(message);
+    detail.appendChild(actions);
+    detail.scrollTop = scrollTop;
+  }
+
+  function paintReadiness() {
+    var rail = el('spReadiness');
+    var track = el('spReadinessTrack');
+    var summary = el('spReadinessSummary');
+    if (!rail || !track || !summary) return;
+    var bank = bankPlan && Date.now() - bankFetchedAt < 180000 ? bankPlan : null;
+    var queue = readinessQueue(planHours, bank, Date.now() / 1000, 8);
+    if (readinessPick && !queue.some(function (item) { return item.key === readinessPick; })) {
+      readinessPick = '';
+    }
+    var print = JSON.stringify(queue.map(function (item) {
+      return [item.key, item.label, item.kind, item.start, item.deadline,
+        item.state, item.status, item.ready, item.review.approved,
+        item.lines, item.targetLines, item.events, item.targetEvents,
+        item.readySeconds, item.targetSeconds, item.shortSeconds,
+        item.stages, item.needs, item.entry.orchestration && item.entry.orchestration.preparable,
+        item.performances, item.entry.prompt, item.entry.notes,
+        item.entry.direction, item.entry.beats, item.bank,
+        item.turns.map(function (turn) {
+          return [turn.text, turn.who, turn.seat, turn.candidate,
+            turnCandidateIndex(turn), turnPerformanceIndex(turn)];
+        })];
+    })) + '|' + readinessPick;
+    if (print === readinessPrint) {
+      queue.forEach(function (item) {
+        var card = Array.prototype.find.call(track.children, function (node) {
+          return node.dataset.key === item.key;
+        });
+        var clock = card && card.querySelector('time');
+        if (clock) clock.textContent = readinessWhen(item);
+      });
+      return;
+    }
+    readinessPrint = print;
+    var readyCount = queue.filter(function (item) { return item.ready; }).length;
+    summary.textContent = queue.length ? readyCount + ' ready / '
+      + (queue.length - readyCount) + ' need attention' : 'No upcoming entries';
+    var trackLeft = track.scrollLeft;
+    var focused = document.activeElement && document.activeElement.dataset
+      && document.activeElement.dataset.key;
+    track.replaceChildren();
+    queue.forEach(function (item) {
+      var card = make('button', 'sp-ready-card', '');
+      card.type = 'button'; card.dataset.key = item.key;
+      card.dataset.status = item.live ? 'live' : (item.ready ? 'ready' : 'attention');
+      card.setAttribute('aria-expanded', readinessPick === item.key ? 'true' : 'false');
+      var top = make('span', 'sp-ready-card-top');
+      top.appendChild(make('time', '', readinessWhen(item)));
+      top.appendChild(make('b', '', item.label));
+      card.appendChild(top);
+      card.appendChild(make('span', 'sp-ready-card-state',
+        item.live ? 'on air' : String(item.status).replace(/[-_]+/g, ' ')));
+      card.appendChild(make('span', 'sp-ready-card-coverage',
+        readinessCardCoverage(item)));
+      var marks = make('span', 'sp-ready-card-stages');
+      Object.keys(item.stages).forEach(function (name) {
+        marks.appendChild(readinessStage(name, item.stages[name]));
+      });
+      card.appendChild(marks);
+      card.title = 'Review the script and preparation for ' + item.label;
+      card.addEventListener('click', function () {
+        readinessPick = readinessPick === item.key ? '' : item.key;
+        readinessPrint = ''; paintReadiness();
+      });
+      track.appendChild(card);
+    });
+    track.scrollLeft = trackLeft;
+    if (focused) {
+      var replacement = Array.prototype.find.call(track.children, function (node) {
+        return node.dataset.key === focused;
+      });
+      if (replacement) replacement.focus({preventScroll: true});
+    }
+    paintReadinessDetail(queue.find(function (item) { return item.key === readinessPick; }) || null);
+  }
+
+  function paintLiveCueWindow(row) {
+    var strip = el('spLiveSequence');
+    if (!strip) return;
+    var feedRows = [];
+    try {
+      feedRows = root.PineStationFeed && root.PineStationFeed.rows
+        ? root.PineStationFeed.rows() : [];
+    } catch (err) { feedRows = []; }
+    var rows = liveCueWindow(row, liveStream, elements, 2, feedRows);
+    var print = rows.map(function (item) {
+      return item.id + ':' + (item.current ? '1' : '0') + ':' + item.text;
+    }).join('|');
+    if (print === liveCuePrint) return;
+    liveCuePrint = print;
+    strip.replaceChildren();
+    strip.hidden = !rows.length;
+    if (bandManager) bandManager.refresh();
+    var currentCue = null;
+    rows.forEach(function (item) {
+      var button = make('button', 'sp-live-cue', '');
+      button.type = 'button'; button.dataset.line = item.id;
+      button.dataset.kind = item.kind || item.type;
+      if (item.current) {
+        button.setAttribute('aria-current', 'step');
+        currentCue = button;
+      }
+      var relation = item.current ? 'ON AIR' : (item.relative < 0 ? 'PREVIOUS' : 'NEXT');
+      button.appendChild(make('em', '', relation));
+      button.appendChild(make('b', '', item.speaker || item.kind || 'Event'));
+      button.appendChild(make('span', '', item.text || 'Scripted event'));
+      button.addEventListener('click', function (event) {
+        event.stopPropagation();
+        if (item.current) resumeAirFollow('live cue window', item.id);
+        else if (lineNodes.has(String(item.id)) || lineNode(item.id)) jumpToLine(item.id);
+        else loadScreenplay(true);
+      });
+      strip.appendChild(button);
+    });
+    if (currentCue) {
+      strip.scrollLeft = Math.max(0, currentCue.offsetLeft - strip.offsetLeft
+        - (strip.clientWidth - currentCue.offsetWidth) / 2);
+    }
   }
 
   function planCommand(key, label, title, run) {
@@ -10291,6 +12526,7 @@
       ? bankPlan : null;
     if (!planHours.length && !bankView) {
       if (planNodes.size) { box.replaceChildren(); planNodes.clear(); }
+      paintReadiness();
       return;
     }
     var order = [];
@@ -10516,6 +12752,7 @@
       planNodes.delete(key);
     });
     stitchScript(box, order);
+    paintReadiness();
   }
 
   /* #1289: the two layouts differ only in where the plan hangs. */
@@ -10557,7 +12794,8 @@
            away underneath its own menu. The same question the caution
            button asks of its own hold. */
         if (node.pineHeld) return;
-        segToggle(String(item.seg || item.id || ''));
+        segToggle(String((node.pineItem && (node.pineItem.seg || node.pineItem.id))
+          || item.seg || item.id || ''));
       });
       node.addEventListener('keydown', function (ev) {
         if (ev.key !== 'Enter' && ev.key !== ' ' && ev.key !== 'Spacebar') return;
@@ -11435,7 +13673,7 @@
        line id from /api/playout names the occurrence that is actually
        sounding and must drive both the strip and the highlight. */
     var verdict = playoutNow;
-    if (verdict && verdict.line_id
+    if (playoutEvidence(verdict, look, stationPaused, Date.now())
         && Date.now() - Number(verdict.at_ms || 0) <= PLAYOUT_MS * 3) {
       d = Object.assign({}, d, {
         mark: 'air',
@@ -11511,7 +13749,29 @@
   var dressed = Object.create(null);
 
   function lineNode(id) {
-    return id ? document.querySelector('.sp-el[data-line="' + id + '"]') : null;
+    if (!id) return null;
+    id = String(id);
+    var cached = lineNodes.get(id);
+    if (cached && cached.isConnected && cached.dataset.line === id) return cached;
+    return document.querySelector('.sp-el[data-line="' + id + '"]');
+  }
+
+  function revealLine(id, onAir) {
+    var node = lineNode(id);
+    if (node) return node;
+    var held = lineNodes.get(String(id || ''));
+    if (!held || !held.dataset.seg || !scriptOrder.length) return null;
+    var seg = String(held.dataset.seg);
+    if (onAir) {
+      if (liveSeg !== seg) segFollow(seg);
+      else { folded[seg] = false; segApply(false); }
+    } else {
+      folded[seg] = false;
+      byHand[seg] = true;
+      segApply(false);
+      foldSave();
+    }
+    return lineNode(id);
   }
 
   /* The CHARACTER cue above a line, for the status sentence. */
@@ -11540,38 +13800,15 @@
   }
 
   function sayingFallbackMark(row, shown) {
-    if (row && row.id) return null;
-    if (!shown || !shown.id || shown.aired !== 'airing' || stationPaused
-        || !PineScriptResolver.isLineId(shown.id)) return null;
-    var node = lineNode(String(shown.id));
-    if (!node || !node.classList.contains('sp-dialogue')) return null;
-    var feed = root.PineStationFeed;
-    var station = feed && typeof feed.state === 'function' ? feed.state() : null;
-    if (!currentFeedSaying(shown, station)) return null;
-    var head = bridgeHead();
-    var voice = !!(head && /djVoiceAudio/i.test(String(head.id || '')) && head.file);
-    if (!voice) {
-      var audios = document.querySelectorAll('audio');
-      for (var i = 0; i < audios.length; i += 1) {
-        var audio = audios[i];
-        if (/djVoiceAudio/i.test(String(audio.id || '')) && !audio.paused && !audio.ended
-            && (Number(audio.currentTime) > 0 || Number(audio.readyState) >= 2)) {
-          voice = true;
-          break;
-        }
-      }
-    }
-    return voice ? {id: String(shown.id), inferred: true} : null;
+    return null;
   }
 
   function placeMarks(d, fallback) {
     d = d || lastDecision || {};
-    var inferred = d.mark !== 'air' && fallback && fallback.id;
-    var air = d.mark === 'air' ? String(d.line_id || '')
-      : inferred ? String(fallback.id) : '';
+    var air = d.mark === 'air' ? String(d.line_id || '') : '';
     markNow(air);
     var liveNode = lineNode(air);
-    if (liveNode) liveNode.classList.toggle('sp-feed-now', !!inferred);
+    if (liveNode) liveNode.classList.remove('sp-feed-now');
     dress('sp-expect', (!air && d.expected_id && d.expected_id !== d.carried_id) ? d.expected_id : '');
     dress('sp-last', (!air && d.carried_id) ? d.carried_id : '');
   }
@@ -11588,14 +13825,14 @@
     if (!box) return false;
     var now = Date.now();
     if (now < selfScrollUntil) return false;
-    if (now - keptAt < 900) return false;
+    if (reason !== 'paint' && now - keptAt < 900) return false;
     var node = lineNode(nowLineId);
     if (!node || node.hidden) return false;
+    keptAt = now;
     var pane = box.getBoundingClientRect(), seat = node.getBoundingClientRect();
     if (!(seat.height > 0)) return false;
     var out = seat.bottom <= pane.top || seat.top >= pane.bottom;
     if (!out) return false;
-    keptAt = now;
     return moveScript('follow:' + (reason || 'drift'), function (pane) {
       seatLineNearest(pane, node);
     });
@@ -11686,6 +13923,29 @@
            ord: got.next.ord === undefined ? null : got.next.ord}
         : null,
       at_ms: Date.now()};
+  }
+
+  function playoutEvidence(receipt, read, paused, nowMs) {
+    if (!receipt || !receipt.line_id || paused
+        || !read || (read.source !== 'local' && read.source !== 'bridge')
+        || receipt.position_basis !== 'listener'
+        || !isFinite(Number(receipt.last_heard_at))
+        || Number(receipt.last_heard_at) <= 0
+        || receipt.offset_s === null || !isFinite(Number(receipt.offset_s))
+        || read.position_s === null || !isFinite(Number(read.position_s))
+        || Number(read.stalledMs || 0) >= STALL_MS) return false;
+    var age = nowMs / 1000 - Number(receipt.last_heard_at);
+    if (age < -3 || age > 3) return false;
+    var from = receipt.line_from, until = receipt.line_until;
+    if (from !== null && until !== null && (
+      Number(receipt.offset_s) < Number(from) - 0.25
+      || Number(receipt.offset_s) >= Number(until) + 0.25)) return false;
+    if (!read.file || !receipt.file
+        || PineScriptCues.key(read.file) !== receipt.file) return false;
+    if (from !== null && until !== null
+        && (Number(read.position_s) < Number(from)
+          || Number(read.position_s) >= Number(until))) return false;
+    return true;
   }
 
   function playoutPoll() {
@@ -11960,22 +14220,35 @@
     return true;
   }
 
+  var markAuditAt = 0;
+  var markAuditNode = null;
   function markNow(id) {
     if (id === nowLineId) {
       /* [#1189] RE-ASSERTED ON THE KEYED NODE. A repaint may have rebuilt
          the node without its mark; the id being unchanged is not the mark
          being present. */
-      var same = id ? lineNode(id) : null;
-      var oldMarks = document.querySelectorAll('.sp-el.sp-now');
-      for (var m = 0; m < oldMarks.length; m += 1) {
-        if (oldMarks[m] === same) continue;
-        oldMarks[m].classList.remove('sp-now');
-        oldMarks[m].classList.remove('sp-feed-now');
-        oldMarks[m].removeAttribute('aria-current');
+      var same = id ? revealLine(id, true) : null;
+      var now = Date.now();
+      var indexed = !id || (same && lineNodes.get(String(id)) === same && same.isConnected);
+      /* Repaint and identity changes get an immediate sweep; stable mounted
+         lines only need a periodic audit for out-of-band marks. */
+      if (!indexed || markAuditNode !== same || now - markAuditAt >= 1000
+          || now < markAuditAt || (same && !same.classList.contains('sp-now'))) {
+        var oldMarks = document.querySelectorAll('.sp-el.sp-now');
+        for (var m = 0; m < oldMarks.length; m += 1) {
+          if (oldMarks[m] === same) continue;
+          oldMarks[m].classList.remove('sp-now');
+          oldMarks[m].classList.remove('sp-feed-now');
+          oldMarks[m].removeAttribute('aria-current');
+        }
+        markAuditAt = now;
+        markAuditNode = same;
       }
       if (same) {
         if (!same.classList.contains('sp-now')) same.classList.add('sp-now');
-        same.setAttribute('aria-current', 'true');
+        if (same.getAttribute('aria-current') !== 'true') {
+          same.setAttribute('aria-current', 'true');
+        }
       }
       chaseStalePage(id, same);
       return;
@@ -12021,9 +14294,7 @@
      * another go, which is also what makes the view seat itself on
      * mount instead of sitting at the top of a 72,000px script.
      */
-    var node = id
-      ? document.querySelector('.sp-el[data-line="' + id + '"]')
-      : null;
+    var node = id ? revealLine(id, true) : null;
     if (id && !node) {
       /* #1271: AND THE PAGE GOES AND GETS IT.
        *
@@ -12054,6 +14325,8 @@
       return;
     }
     nowLineId = id || '';
+    markAuditAt = Date.now();
+    markAuditNode = node;
     if (!node) return;
     node.classList.add('sp-now');
     node.setAttribute('aria-current', 'true');
@@ -12366,19 +14639,28 @@
         ? 'ON AIR  ' + lineWho(String(row.id)) + String(item.text || '')
         : got.text;
       if (cueNode.textContent !== cueText) cueNode.textContent = cueText;
-      cueNode.disabled = !active;
-      cueNode.dataset.line = active ? String(row.id) : '';
-      cueNode.title = active ? 'Return to the cue currently playing' : got.text;
+      if (cueNode.disabled !== !active) cueNode.disabled = !active;
+      var cueLine = active ? String(row.id) : '';
+      if (cueNode.dataset.line !== cueLine) cueNode.dataset.line = cueLine;
+      var cueTitle = active ? 'Return to the cue currently playing' : got.text;
+      if (cueNode.title !== cueTitle) cueNode.title = cueTitle;
     }
-    line.style.setProperty('--sp-segment-run', Math.round(progress * 100) + '%');
+    var run = Math.round(progress * 100) + '%';
+    if (line.style.getPropertyValue('--sp-segment-run') !== run) {
+      line.style.setProperty('--sp-segment-run', run);
+    }
     if (scheduled || (segment && segment.heading)) {
-      line.dataset.segment = String((scheduled && (scheduled.slot_id || scheduled.ordinal))
+      var segmentId = String((scheduled && (scheduled.slot_id || scheduled.ordinal))
         || (segment && (segment.seg || segment.block)) || '');
-      line.title = 'Active segment: ' + name
+      if (line.dataset.segment !== segmentId) line.dataset.segment = segmentId;
+      var lineTitle = 'Active segment: ' + name
         + '. Tap for the hour and station calendar.';
+      if (line.title !== lineTitle) line.title = lineTitle;
     } else {
-      delete line.dataset.segment;
-      line.title = 'Tap for the hour and station calendar.';
+      if (line.dataset.segment) delete line.dataset.segment;
+      if (line.title !== 'Tap for the hour and station calendar.') {
+        line.title = 'Tap for the hour and station calendar.';
+      }
     }
     if (line.dataset.state !== got.state) line.dataset.state = got.state;
     paintOrchestratorMonitor(line, scheduled);
@@ -12398,9 +14680,7 @@
   var runNode = null;
 
   function markRun(row) {
-    var node = (row && row.id)
-      ? document.querySelector('.sp-el[data-line="' + row.id + '"]')
-      : null;
+    var node = row && row.id ? lineNode(row.id) : null;
     if (runNode && runNode !== node) {
       runNode.style.removeProperty('--sp-run');
       runNode.removeAttribute('data-left');
@@ -12462,11 +14742,15 @@
       syncRing.push(mine);
       if (syncRing.length > SYNC_RING_MAX) syncRing.shift();
     }
-    var shown = paintSaying(row);                             /* #1298 */
-    var fallback = sayingFallbackMark(row, shown);
-    placeMarks(lastDecision, fallback);                       /* [#1189] */
+    paintSaying(row);                                         /* #1298 */
+    paintLiveCueWindow(row);
+    if (Date.now() - readinessClockAt >= 1000) {
+      readinessClockAt = Date.now();
+      paintReadiness();
+    }
+    placeMarks(lastDecision);                                /* [#1189] */
     markRun(row);                                            /* #1295 */
-    markFeedLive(row ? row.id : (fallback && fallback.id) || ''); /* #1279 */
+    markFeedLive(row ? row.id : '');                          /* #1279 */
     /* #1286: say when the room is quiet, instead of leaving a page full
        of `pending` and `tinted` marks to be read as though one of them
        were live. */
@@ -12547,7 +14831,7 @@
 
   function jumpToLine(id) {
     if (!id) return;
-    var node = document.querySelector('.sp-el[data-line="' + id + '"]');
+    var node = revealLine(id, false);
     if (!node) return;
     moveScript('jump', function () {
       node.scrollIntoView({block: 'center'});
@@ -12564,7 +14848,7 @@
    * This is one command shared by the strip and the status line: stop the
    * competing crawl, reopen the live segment, center the current admitted
    * line, and leave following armed for every line after it. */
-  function resumeAirFollow(reason, preferredId) {
+  function resumeAirFollow(reason) {
     if (crawlStop) crawlStop();
     follow = true;
     adrift = 0;
@@ -12573,18 +14857,9 @@
     if (chip) chip.classList.remove('adrift');
 
     var row = activeRow();
-    var feedId = '';
-    try {
-      var feedRow = root.PineStationFeed && root.PineStationFeed.now
-        ? root.PineStationFeed.now() : null;
-      feedId = String((feedRow && feedRow.id) || '');
-    } catch (err) { feedId = ''; }
-    var id = String(preferredId || (row && row.id)
-      || feedId
-      || (lastDecision && lastDecision.mark === 'air' && lastDecision.line_id)
-      || nowLineId || '');
+    var id = String((row && row.id) || '');
     if (!id) return false;
-    var node = lineNode(id);
+    var node = revealLine(id, true);
     if (!node) {
       /* The station may have admitted a line since the last document
        * read. Collect the fresh page now; markNow will seat it on the
@@ -12774,12 +15049,14 @@
     left.appendChild(feedHead);
     var feed = make('div', 'sp-feed');       /* 6 */
     feed.id = 'spFeed';
+    feedCrawlStart(feed);
     feed.addEventListener('scroll', function () {
       feedStick = feed.scrollTop + feed.clientHeight >= feed.scrollHeight - 30;
     });
     left.appendChild(feed);
 
     var right = make('div', 'sp-right');     /* 7 */
+    var top = make('div', 'sp-script-top');
     var head = make('div', 'sp-scripthead');
     head.id = 'spScriptName';
     head.appendChild(make('b', '', 'The script'));
@@ -12815,7 +15092,11 @@
       if (el(HEADER_MENU_ID)) headerClose();
       else headerOpen(head);
     });
-    right.appendChild(head);
+    var titleRow = make('div', 'sp-script-title-row');
+    var promptDock = make('div', 'sp-prompt-dock');
+    titleRow.appendChild(head);
+    titleRow.appendChild(promptDock);
+    top.appendChild(titleRow);
     /* One line, console-shaped, directly under the heading: what is
        happening with the line that is being said. */
     var now = make('div', 'sp-now-line');
@@ -12837,7 +15118,10 @@
     orchestratorMonitor.appendChild(make('div', 'sp-now-orch-track'));
     now.appendChild(segmentMonitor);
     now.appendChild(orchestratorMonitor);
-    right.appendChild(now);
+    var liveSequence = make('div', 'sp-live-sequence');
+    liveSequence.id = 'spLiveSequence';
+    liveSequence.hidden = true;
+    liveSequence.setAttribute('aria-label', 'Live scripted event sequence');
     /* THE SYNCHRONIZATION STATE, said out loud.
        A held mark and a live mark must not look the same. */
     var sync = make('div', 'sp-sync');
@@ -12845,7 +15129,79 @@
     sync.dataset.sync = 'held';
     sync.appendChild(make('b', 'sp-sync-name', ''));
     sync.appendChild(make('i', 'sp-sync-why', ''));
-    right.appendChild(sync);
+
+    var readiness = make('section', 'sp-readiness');
+    readiness.id = 'spReadiness';
+    readiness.setAttribute('aria-label', 'Upcoming segment preparation');
+    var readinessHead = make('div', 'sp-readiness-head');
+    readinessHead.appendChild(make('b', '', 'Upcoming preparation'));
+    var readinessSummary = make('span', 'sp-readiness-summary', 'Reading the running order');
+    readinessSummary.id = 'spReadinessSummary';
+    readinessHead.appendChild(readinessSummary);
+    var runningOrder = make('button', 'sp-ready-order', 'Running order');
+    runningOrder.type = 'button';
+    runningOrder.addEventListener('click', function () { itineraryOpen(); });
+    readinessHead.appendChild(runningOrder);
+    readiness.appendChild(readinessHead);
+    var readinessTrack = make('div', 'sp-readiness-track');
+    readinessTrack.id = 'spReadinessTrack';
+    readinessTrack.setAttribute('role', 'list');
+    readiness.appendChild(readinessTrack);
+    var readinessDetail = make('div', 'sp-readiness-detail');
+    readinessDetail.id = 'spReadinessDetail';
+    readinessDetail.hidden = true;
+    readiness.appendChild(readinessDetail);
+    var bands = make('div', 'sp-bands');
+    var restore = make('div', 'sp-band-restore');
+    restore.setAttribute('role', 'toolbar');
+    restore.setAttribute('aria-label', 'Restore Script bands');
+    var bandItems = {};
+    function addBand(key, content, glyph) {
+      var label = BAND_NAMES[key];
+      var wrap = make('div', 'sp-band-row sp-band-' + key);
+      var collapse = make('button', 'sp-band-collapse');
+      collapse.type = 'button';
+      collapse.title = 'Collapse ' + label;
+      collapse.setAttribute('aria-label', 'Collapse ' + label);
+      collapse.setAttribute('aria-controls', content.id);
+      collapse.innerHTML = folderIcon('c:caret--left', label) || '&lt;';
+      collapse.addEventListener('click', function (event) {
+        event.stopPropagation();
+        bandManager.set(key, true);
+      });
+      wrap.appendChild(collapse);
+      wrap.appendChild(content);
+      bands.appendChild(wrap);
+      var reopen = make('button', 'sp-band-reopen');
+      reopen.type = 'button';
+      reopen.title = 'Restore ' + label;
+      reopen.setAttribute('aria-label', 'Restore ' + label);
+      reopen.setAttribute('aria-controls', content.id);
+      reopen.innerHTML = folderIcon(glyph, label) || label;
+      reopen.addEventListener('click', function () {
+        bandManager.set(key, false);
+      });
+      restore.appendChild(reopen);
+      bandItems[key] = {wrap: wrap, content: content,
+        collapse: collapse, restore: reopen};
+    }
+    addBand('current', now, 'c:timer');
+    addBand('sequence', liveSequence, 'c:script');
+    addBand('sync', sync, 'c:waveform');
+    addBand('readiness', readiness, 'c:calendar');
+    var promptHistory = make('button', 'sp-band-reopen');
+    promptHistory.type = 'button'; promptHistory.title = 'System prompt history';
+    promptHistory.setAttribute('aria-label', 'System prompt history');
+    promptHistory.setAttribute('aria-pressed', 'false');
+    promptHistory.innerHTML = folderIcon('c:time', 'System prompt history') || 'History';
+    promptHistory.addEventListener('click', function () {
+      if (root.PinePromptHistory) root.PinePromptHistory.toggle(right, promptHistory, promptDock);
+    });
+    restore.appendChild(promptHistory);
+    top.appendChild(bands);
+    top.appendChild(restore);
+    right.appendChild(top);
+    bandManager = bandController(bands, restore, bandItems);
 
     var script = make('div', 'sp-script');
     script.id = 'spScript';
@@ -13083,7 +15439,8 @@
 
     var feed = root.PineStationFeed;
     if (feed && typeof feed.subscribe === 'function') {
-      stop = feed.subscribe(function (payload) {
+      var paintedStation = null;
+      var onFeed = function (payload) {
         var state = (payload && payload.station) || payload || {};
         var wasAt = liveStream && liveStream.at;
         liveStream = state.stream_now || null;
@@ -13110,12 +15467,17 @@
            point the highlight at the wrong line. */
         if (state.server_ms) skewMs = Number(state.server_ms) - Date.now();
         correct();
-        paintPlayer(state);
-        paintFeed(state);
-        loadScreenplay(false);
-        loadPlan(false);                              /* #1289 */
+        if (state !== paintedStation) {
+          paintedStation = state;
+          paintPlayer(state);
+          paintFeed(state);
+          loadScreenplay(false);
+          loadPlan(false);                            /* #1289 */
+        }
         tick();
-      });
+      };
+      stop = typeof feed.subscribeView === 'function'
+        ? feed.subscribeView(host, onFeed) : feed.subscribe(onFeed);
     } else {
       loadScreenplay(true);
     }
@@ -13125,7 +15487,7 @@
        twenty-second cache that predates the line now sounding. */
     loadScreenplay(true);
     loadPlan(true);                                   /* #1289 */
-    if (!beat) beat = setInterval(tick, 250);
+    if (!beat) beat = setInterval(tick, 1000);
     return Promise.resolve(true);
   }
 
@@ -13139,7 +15501,17 @@
        test holds the real code rather than a copy of it. */
     cues: PineScriptCues,
     view: {screenplayOrder: screenplayOrder, bankSlotFor: bankSlotFor,
-      folderRatioControls: folderRatioControls, folderSample: folderSample,
+      readinessOf: readinessOf, readinessQueue: readinessQueue,
+      readinessWhen: readinessWhen, readinessBankDetail: readinessBankDetail,
+      readinessCardCoverage: readinessCardCoverage,
+      paintReadinessDetail: paintReadinessDetail,
+      liveScriptEvents: liveScriptEvents, feedScriptEvents: feedScriptEvents,
+      liveCueWindow: liveCueWindow, turnEditBody: turnEditBody,
+      itinConversationTurns: itinConversationTurns,
+      itinConversationSections: itinConversationSections,
+      itinBanked: itinBanked, itinAired: itinAired,
+      folderRatioControls: folderRatioControls, folderH3Controls: folderH3Controls,
+      folderSample: folderSample,
       bankSlotText: bankSlotText, planReviewLabel: planReviewLabel,
       rejectionLabel: rejectionLabel, rejectionGlyph: rejectionGlyph,
       rejectionPageItems: rejectionPageItems, rejectionListUrl: rejectionListUrl,
@@ -13147,7 +15519,8 @@
       rejectionPolicyBody: rejectionPolicyBody, rejectionDirectorBody: rejectionDirectorBody,
       rejectionAppendWords: rejectionAppendWords,
       rejectionTintSummary: rejectionTintSummary, rejectionProfileView: rejectionProfileView,
-      scriptVisible: scriptVisible, playoutRead: playoutRead, paintSaying: paintSaying,
+      scriptVisible: scriptVisible, playoutRead: playoutRead,
+      playoutEvidence: playoutEvidence, paintSaying: paintSaying,
       sayingFallbackMark: sayingFallbackMark, placeMarks: placeMarks,
       contentGateBody: contentGateBody, contentGateEffective: contentGateEffective},
     /* #1168: the segment menu's own roads, exported the same way and
@@ -13184,11 +15557,16 @@
     resolver: PineScriptResolver,
     marks: {place: placeMarks, keepLitInView: keepLitInView, stitch: stitchScript,
             anchor: scriptAnchor, restore: scriptRestore, nodes: scriptNodes,
+            lines: lineNodes,
             follow: resumeAirFollow,
             decision: function () { return lastDecision; },
-            reset: function () { lastDecision = null; airLast = null; lastGood = null;
-                                 resolverRing.length = 0; nowLineId = ''; dressed = Object.create(null); },
-            active: activeRow, playoutRead: playoutRead},
+             reset: function () { lastDecision = null; airLast = null; lastGood = null;
+                                  resolverRing.length = 0; nowLineId = ''; dressed = Object.create(null); },
+             active: activeRow, playoutRead: playoutRead},
+    folds: {bind: bindScriptOrder, apply: segApply, toggle: segToggle,
+            jump: jumpToLine, reveal: revealLine, count: segCount},
+    feedCrawl: {dress: feedCrawlDress, row: feedDress, measure: feedCrawlMeasure,
+                start: feedCrawlStart, stop: feedCrawlStop},
     isMounted: function () { return mounted; },
     close: function () {
       rejectionClose();
@@ -13211,6 +15589,7 @@
       segReportClose();
       segPromptClose();
       itineraryClose();                               /* [#1235] */
+      feedCrawlStop();
       if (stop) stop();
       stop = null;
       if (beat) clearInterval(beat);

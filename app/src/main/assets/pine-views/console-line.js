@@ -154,11 +154,69 @@
     bar.innerHTML = '<i class="pine-console-dot"></i>'
       + '<button class="pine-console-audit" type="button" title="Open the detailed audit log"'
       + ' aria-label="Open the detailed audit log"><em>AUDIT</em><span>waiting for the station journal</span></button>'
+      + '<div class="pine-console-shortcuts" aria-label="Quick station tools">'
+      + '<button class="pine-console-gallery" type="button"'
+      + ' title="Pine Box Gallery" aria-label="Pine Box Gallery">'
+      + (icon('c:image', 'Pine Box Gallery') || 'G') + '</button>'
+      + '<button class="pine-console-orchestrator" type="button"'
+      + ' title="Open orchestrator control" aria-label="Open orchestrator control">'
+      + (icon('c:bot', 'Open orchestrator control') || 'O') + '</button>'
+      + '<button class="pine-console-talk-dot" type="button"'
+      + ' title="Start or stop voice control" aria-label="Start or stop voice control">'
+      + (icon('c:microphone', 'Voice control') || 'V') + '</button>'
+      + '<button class="pine-console-change" type="button" title="Open Pine Box changelog"'
+      + ' aria-label="Open Pine Box changelog">i</button></div>'
       + '<div class="pine-console-viewport"><div class="pine-console-track"></div></div>'
+      + '<div class="pine-console-tools" aria-label="Station controls"></div>'
       + '<button class="pine-console-more" type="button" title="Open the last 300 audit events"'
       + ' aria-label="Open the last 300 audit events">'
       + (icon('c:terminal', 'Open audit terminal') || '&gt;_') + '</button>';
     document.body.appendChild(bar);
+
+    /* The live console superseded the old status strip visually, but the
+       Crystal, Sample and Go Live controls still lived underneath it. Keep
+       their existing ids and listeners; move the actual nodes into the one
+       visible basebar instead of duplicating either their UI or logic. */
+    var tools = bar.querySelector('.pine-console-tools');
+    ['crystalBtn', 'sampleBtn', 'sbLiveBtn'].forEach(function (id) {
+      var control = document.getElementById(id);
+      if (tools && control) tools.appendChild(control);
+    });
+    /* The tablet injects this shared bar into the station page, which has no
+       desktop statusBar to donate these nodes. Supply equivalent handles
+       there and hand every press to an existing station/view action. */
+    function tabletControl(id, label, iconRef, run) {
+      if (!tools || document.getElementById(id)) return;
+      var control = document.createElement('button');
+      control.id = id; control.type = 'button'; control.title = label;
+      control.setAttribute('aria-label', label);
+      control.innerHTML = icon(iconRef, label) || label;
+      control.addEventListener('click', function (event) {
+        event.preventDefault(); event.stopPropagation(); run(event);
+      });
+      tools.appendChild(control);
+    }
+    tabletControl('crystalBtn', 'Crystals', 'c:gem', function () {
+      try {
+        if (root.PineViewRail && root.PineViewRail.closeAll) root.PineViewRail.closeAll();
+        var output = document.getElementById('crystalsOutput');
+        var section = output && output.closest ? output.closest('section') : output;
+        if (typeof root.loadCrystals === 'function') root.loadCrystals();
+        if (section && section.scrollIntoView) section.scrollIntoView({behavior: 'smooth', block: 'start'});
+      } catch (err) { /* the basebar stays usable if the panel is rebuilding */ }
+    });
+    tabletControl('sampleBtn', 'Open sampler', 'm:movie', function () {
+      var sampler = document.getElementById('pineViewTab-sampler')
+        || document.getElementById('pineSamplerTab')
+        || document.getElementById('samplerTabBtn');
+      if (sampler) sampler.click();
+    });
+    tabletControl('sbLiveBtn', 'Open live listener and copy its link', 'c:satellite', function (event) {
+      if (typeof root.onAirLaunch === 'function') root.onAirLaunch(event);
+    });
+    var oldBar = document.getElementById('statusBar');
+    if (oldBar) oldBar.hidden = true;
+
     wireSpeed(bar);
     var track = bar.querySelector('.pine-console-track');
     if (track) track.addEventListener('animationiteration', function () {
@@ -172,6 +230,37 @@
       event.stopPropagation();
       if (Date.now() < suppressClickUntil) {
         event.preventDefault();
+        return;
+      }
+      if (event.target && event.target.closest && event.target.closest('.pine-console-change')) {
+        if (root.PineChangeLog && typeof root.PineChangeLog.open === 'function') {
+          root.PineChangeLog.open();
+        }
+        return;
+      }
+      if (event.target && event.target.closest && event.target.closest('.pine-console-gallery')) {
+        if (root.PineAdViewer && typeof root.PineAdViewer.openGallery === 'function') {
+          root.PineAdViewer.openGallery();
+        } else if (typeof root.loadGallery === 'function') {
+          Promise.resolve(root.loadGallery()).then(function () {
+            var grid = document.getElementById('galleryGrid');
+            var tile = grid && grid.querySelector('div[title], div[style]');
+            if (tile && typeof tile.click === 'function') tile.click();
+          });
+        }
+        return;
+      }
+      if (event.target && event.target.closest && event.target.closest('.pine-console-orchestrator')) {
+        if (root.PineOrchGlass && typeof root.PineOrchGlass.toggle === 'function') {
+          root.PineOrchGlass.toggle();
+        }
+        return;
+      }
+      if (event.target && event.target.closest && event.target.closest('.pine-console-talk-dot')) {
+        var talk = root.PineTalkDot;
+        if (talk && typeof talk.state === 'function' && talk.state() === 'listening'
+            && typeof talk.finish === 'function') talk.finish();
+        else if (talk && typeof talk.listen === 'function') talk.listen();
         return;
       }
       if (event.target && event.target.closest && event.target.closest('.pine-console-audit')) {

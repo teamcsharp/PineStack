@@ -44,6 +44,7 @@ object ViewAssets {
         "pine-dismiss.js",        // tap away and a panel closes - one rule
         "view-chrome.js",         // the shared bar, tree and transport
         "console-line.js",        // the one-line backend readout, all screens
+        "changelog.js",           // Git-backed task history from the audit footer
         "console-trace.js",       // tap that line: where the work came from
         "audio-law.js",           // ONE door to every level and route
         // THE SHARED DUCK, before anything that speaks over the air:
@@ -99,6 +100,8 @@ object ViewAssets {
                                   // rooms and the made-against-heard account
         "three-full.js",          // every 3JS scene, full screen on glass
         "line-deep.js",           // why a line was said, and how often
+        "ad-viewer.js",           // Pine Box Gallery carousel and signed playback
+        "prompt-history.js",      // prompt records and fullscreen controls
         "line-actions.js",        // hold a line: pad, keep, or examine
         "sfx-tv.js",              // #1306b: the SFX guy's little CRT set
         "clip-doctor.js",         // #1361b: why the video button gave nothing
@@ -124,6 +127,7 @@ object ViewAssets {
     /** Concatenated into one <style>; each keys off its own class prefix. */
     private val STYLES = listOf(
         "view-chrome.css",
+        "changelog.css",          // the Git task history panel
         "boot-splash.css",        // the startup assembly
         "console-trace.css",      // the trace popup and the strip's menu
         "script.css",
@@ -133,6 +137,7 @@ object ViewAssets {
         "lock.css",               // the locked screen
         "vote-arrows.css",        // the up and down arrows
         "line-actions.css",       // the hold sheet and the examination
+        "prompt-history.css",     // prompt history and fullscreen top bar
         "sfx-tv.css",             // #1306b: the set, its glass and its sheet
         "clip-doctor.css",        // #1361b: the doctor's sheet
         "pine-cam.css",           // #1358: the box and the flag

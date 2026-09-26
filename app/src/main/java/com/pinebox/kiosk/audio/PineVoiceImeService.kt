@@ -2,6 +2,7 @@ package com.pinebox.kiosk.audio
 
 import android.content.ComponentName
 import android.content.Intent
+import android.content.res.ColorStateList
 import android.inputmethodservice.InputMethodService
 import android.os.Bundle
 import android.speech.RecognitionListener
@@ -13,13 +14,17 @@ import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.ExtractedTextRequest
 import android.widget.Button
 import android.widget.LinearLayout
+import android.widget.ProgressBar
 import android.widget.TextView
+import java.util.Locale
 
 /** LatinIME's microphone key switches to a voice subtype, not to a recognizer. */
 class PineVoiceImeService : InputMethodService(), RecognitionListener {
     private var recognizer: SpeechRecognizer? = null
     private var status: TextView? = null
     private var action: Button? = null
+    private var inputLevel: ProgressBar? = null
+    private var inputReading: TextView? = null
     private var listening = false
 
     override fun onCreateInputView(): View {
@@ -46,7 +51,25 @@ class PineVoiceImeService : InputMethodService(), RecognitionListener {
                 } else startRecognition()
             }
         }
-        row.addView(status, LinearLayout.LayoutParams(0, dp(56), 1f))
+        val feedback = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(0, 0, dp(12), 0)
+        }
+        feedback.addView(status)
+        inputLevel = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
+            max = 100
+            progressTintList = ColorStateList.valueOf(0xff6bcedc.toInt())
+            progressBackgroundTintList = ColorStateList.valueOf(0xff344950.toInt())
+            contentDescription = "Microphone input level"
+        }
+        feedback.addView(inputLevel, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(12)))
+        inputReading = TextView(this).apply {
+            text = "Input: waiting"
+            textSize = 12f
+            setTextColor(0xffc5d9de.toInt())
+        }
+        feedback.addView(inputReading)
+        row.addView(feedback, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
         row.addView(action, LinearLayout.LayoutParams(dp(88), dp(56)))
         row.addView(Button(this).apply {
             text = "Keyboard"
@@ -60,7 +83,7 @@ class PineVoiceImeService : InputMethodService(), RecognitionListener {
 
     override fun onStartInputView(info: EditorInfo?, restarting: Boolean) {
         super.onStartInputView(info, restarting)
-        startRecognition()
+        if (!listening) startRecognition()
     }
 
     private fun startRecognition() {
@@ -120,24 +143,42 @@ class PineVoiceImeService : InputMethodService(), RecognitionListener {
     }
 
     private fun showRetry(message: String) {
+        clearInputLevel()
         status?.text = message
         action?.text = "Retry"
     }
 
     override fun onReadyForSpeech(params: Bundle?) { status?.text = "Listening..." }
     override fun onBeginningOfSpeech() { status?.text = "Hearing you..." }
-    override fun onEndOfSpeech() { status?.text = "Transcribing..." }
-    override fun onRmsChanged(rmsdB: Float) = Unit
+    override fun onEndOfSpeech() {
+        listening = false
+        clearInputLevel()
+        status?.text = "Transcribing..."
+    }
+    override fun onRmsChanged(rmsdB: Float) {
+        if (!listening || !rmsdB.isFinite()) return
+        inputLevel?.progress = ((rmsdB + 60f) / 60f * 100f).toInt().coerceIn(0, 100)
+        val reading = if (rmsdB <= -60f) "Input: < -60 dBFS"
+            else String.format(Locale.US, "Input: %.1f dBFS", rmsdB)
+        inputReading?.text = reading
+        inputLevel?.contentDescription = reading
+    }
     override fun onBufferReceived(buffer: ByteArray?) = Unit
     override fun onPartialResults(partialResults: Bundle?) = Unit
     override fun onEvent(eventType: Int, params: Bundle?) = Unit
 
     private fun disposeRecognizer() {
+        clearInputLevel()
         val current = recognizer
         recognizer = null
-        if (listening) current?.cancel()
+        current?.cancel()
         current?.destroy()
         listening = false
+    }
+
+    private fun clearInputLevel() {
+        inputLevel?.progress = 0
+        inputReading?.text = "Input: waiting"
     }
 
     private fun returnToKeyboard() {

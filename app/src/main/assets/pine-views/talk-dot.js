@@ -8,7 +8,13 @@
  * was talking to Siri, and then it sends that command through and I'm able
  * to get a notification of the command I sent through and it being executed."
  *
- * The tablet records the clip locally and the STATION hears it through
+ * THE TABLET CANNOT HEAR BY ITSELF, and this shaped the whole design.
+ * Measured on the device: `cmd package query-services -a
+ * android.speech.RecognitionService` returns "No services found", no speech
+ * package is installed, and both voice_recognition_service and
+ * speech_recognition_service read null. That is what a GApps-less LineageOS
+ * GSI is - there is no recognizer on it to ask. So the words are heard by
+ * the STATION: the clip is recorded here and posted to
  * /api/listen/transcribe, which bridges to wyoming-whisper.
  *
  * THE PARTICLES REACT TO THE REAL MICROPHONE. An animation that merely
@@ -36,6 +42,7 @@
   var SILENCE_MS = 4200;       /* quiet this long and we assume you are done */
 
   var state = IDLE;
+  var fieldCapture = null;
   var stream = null;
   var recorder = null;
   var chunks = [];
@@ -47,6 +54,7 @@
   var ctx = null;
   var analyser = null;
   var data = null;
+  var frequencies = null;
   var frame = 0;
   var ducked = [];
   var startedAt = 0;
@@ -244,6 +252,32 @@
     say.className = 'pine-talk-say';
     say.hidden = true;
     document.body.appendChild(say);
+    var telemetry = document.createElement('div');
+    telemetry.id = 'pineTalkTelemetry';
+    telemetry.className = 'pine-talk-telemetry';
+    telemetry.hidden = true;
+    telemetry.setAttribute('aria-hidden', 'true');
+    telemetry.innerHTML = '<div class="pine-talk-phase" data-talk-phase>Capturing</div>'
+      + '<div class="pine-talk-input"><span>Input</span><div class="pine-talk-input-track" role="meter" aria-label="Microphone input level" aria-valuemin="0" aria-valuemax="100"><i></i><b title="Speech threshold"></b></div><output data-talk-db>-- dBFS</output></div>'
+      + '<div class="pine-talk-spectrum" data-talk-spectrum></div>'
+      + '<div class="pine-talk-spectrum-empty" data-talk-spectrum-empty>Spectrum unavailable</div>'
+      + '<div class="pine-talk-metrics">'
+      + '<div><span>Speech est.</span><b data-talk-metric="speech_probability">--</b></div>'
+      + '<div><span>RMS</span><b data-talk-metric="rms">--</b></div>'
+      + '<div><span>Peak</span><b data-talk-metric="peak">--</b></div>'
+      + '<div><span>VAD</span><b data-talk-metric="vad_state">--</b></div>'
+      + '<div><span>Silence</span><b data-talk-metric="silence_elapsed_ms">--</b></div>'
+      + '<div><span>Timeout</span><b data-talk-metric="endpoint_timeout_ms">--</b></div>'
+      + '<div><span>Remaining</span><b data-talk-metric="remaining_ms">--</b></div>'
+      + '<div><span>Threshold</span><b data-talk-metric="threshold">--</b></div>'
+      + '</div>';
+    document.body.appendChild(telemetry);
+    for (var i = 0; i < 24; i += 1) {
+      var band = document.createElement('span');
+      band.className = 'pine-talk-band';
+      band.innerHTML = '<i></i><em></em>';
+      telemetry.querySelector('[data-talk-spectrum]').appendChild(band);
+    }
     return dot;
   }
 
@@ -277,6 +311,7 @@
   }
 
   function overlay(mode, level, force) {
+    if (fieldCapture) mode = 'off';
     var bridge = root.pineDesktop;
     if (!bridge || typeof bridge.talkOverlay !== 'function') return;
     /* The level road calls this every animation frame. ~9 a second is
@@ -406,10 +441,22 @@
   function setState(next) {
     state = next;
     overlay(overlayMode(), 0, true);                      /* [#1224] */
+    var telemetry = el('pineTalkTelemetry');
+    if (telemetry) {
+      telemetry.hidden = next === IDLE;
+      telemetry.setAttribute('aria-hidden', String(next === IDLE));
+      telemetry.classList.toggle('field-capture', !!fieldCapture && next !== IDLE);
+      telemetry.classList.toggle('transcribing', next === THINKING);
+      telemetry.querySelector('[data-talk-phase]').textContent =
+        next === LISTENING ? 'Capturing' : 'Transcribing';
+      if (next === LISTENING) resetTelemetry();
+      if (next === THINKING) drawSpectrum(null, performance.now());
+    }
     var dot = el('pineTalkDot');
     if (!dot) return;
     dot.classList.toggle('listening', next === LISTENING);
     dot.classList.toggle('thinking', next === THINKING);
+    dot.classList.toggle('field-capture', !!fieldCapture && next !== IDLE);
   }
 
   /* ---- ducking -------------------------------------------------------- */
@@ -537,16 +584,159 @@
     return !!(b && typeof b.micStart === 'function' && typeof b.micLevel === 'function');
   }
 
-  function loudness() {
-    if (native) return Number(root.pineDesktop.micLevel()) || 0;
-    if (!analyser || !data) return 0;
+  var spectrumPeaks = [];
+  var spectrumHeldAt = [];
+
+  function finite(value) {
+    return value !== null && value !== undefined && value !== ''
+      && isFinite(Number(value)) ? Number(value) : null;
+  }
+
+  function clamp01(value) {
+    return Math.max(0, Math.min(1, value));
+  }
+
+  function resetTelemetry() {
+    spectrumPeaks = [];
+    spectrumHeldAt = [];
+    var telemetry = el('pineTalkTelemetry');
+    if (!telemetry) return;
+    var values = telemetry.querySelectorAll('[data-talk-metric]');
+    for (var i = 0; i < values.length; i += 1) values[i].textContent = '--';
+    drawSpectrum(null, 0);
+  }
+
+  function drawSpectrum(bands, now) {
+    var telemetry = el('pineTalkTelemetry');
+    if (!telemetry) return;
+    var valid = bands && bands.length === 24;
+    telemetry.classList.toggle('has-spectrum', !!valid);
+    if (!valid) return;
+    var bars = telemetry.querySelectorAll('.pine-talk-band');
+    for (var i = 0; i < 24; i += 1) {
+      var value = finite(bands[i]);
+      value = value === null ? 0 : clamp01(value);
+      if (value >= (spectrumPeaks[i] || 0)) {
+        spectrumPeaks[i] = value;
+        spectrumHeldAt[i] = now;
+      } else if (now - (spectrumHeldAt[i] || 0) > 180) {
+        spectrumPeaks[i] = Math.max(value, (spectrumPeaks[i] || 0) - 0.025);
+      }
+      bars[i].firstElementChild.style.height = (value * 100) + '%';
+      bars[i].lastElementChild.style.bottom = (spectrumPeaks[i] * 100) + '%';
+    }
+  }
+
+  function showMetric(telemetry, name, value) {
+    telemetry.querySelector('[data-talk-metric="' + name + '"]').textContent = value;
+  }
+
+  function formatAmplitude(value) {
+    var n = finite(value);
+    return n === null ? '--' : n.toFixed(3);
+  }
+
+  function formatMs(value) {
+    var n = finite(value);
+    return n === null ? '--' : Math.max(0, Math.round(n)) + ' ms';
+  }
+
+  function renderTelemetry(metrics, now, bar, heardAnything) {
+    var telemetry = el('pineTalkTelemetry');
+    if (!telemetry) return;
+    var source = metrics.raw;
+    var estimated = !native;
+    var probability, vad, silence, timeout, remaining, threshold;
+    if (native) {
+      probability = source && finite(source.speech_probability);
+      vad = source && source.vad_state;
+      silence = source && source.silence_elapsed_ms;
+      timeout = source && source.endpoint_timeout_ms;
+      remaining = source && source.remaining_ms;
+      threshold = source && source.threshold;
+    } else {
+      probability = bar === null ? null
+        : clamp01((metrics.level - bar) / Math.max(bar * 2, 0.001));
+      vad = bar === null ? 'Calibrating'
+        : metrics.level > bar ? 'Speech' : heardAnything ? 'Silence' : 'Waiting';
+      silence = bar === null ? null : quietSince ? now - quietSince : 0;
+      timeout = SILENCE_MS;
+      remaining = bar === null || !heardAnything ? null
+        : Math.max(0, SILENCE_MS - silence);
+      threshold = bar;
+    }
+    showMetric(telemetry, 'speech_probability',
+      probability === null || probability === undefined ? '--'
+        : Math.round(clamp01(probability) * 100) + '%' + (estimated ? ' est.' : ''));
+    showMetric(telemetry, 'rms', formatAmplitude(metrics.rms));
+    showMetric(telemetry, 'peak', formatAmplitude(metrics.peak));
+    showMetric(telemetry, 'vad_state', vad == null || vad === '' ? '--' : String(vad));
+    showMetric(telemetry, 'silence_elapsed_ms', formatMs(silence));
+    showMetric(telemetry, 'endpoint_timeout_ms', formatMs(timeout));
+    showMetric(telemetry, 'remaining_ms', formatMs(remaining));
+    showMetric(telemetry, 'threshold', formatAmplitude(threshold));
+    var peak = finite(metrics.peak);
+    var db = peak === null ? null : 20 * Math.log10(Math.max(0.000001, peak));
+    var level = db === null ? 0 : clamp01((db + 60) / 60);
+    var meter = telemetry.querySelector('.pine-talk-input-track');
+    meter.firstElementChild.style.width = (level * 100) + '%';
+    meter.setAttribute('aria-valuenow', String(Math.round(level * 100)));
+    meter.setAttribute('aria-valuetext', db === null ? 'Input unavailable' : Math.max(-60, db).toFixed(1) + ' dBFS');
+    meter.lastElementChild.hidden = finite(threshold) === null;
+    meter.lastElementChild.style.left = (clamp01((20 * Math.log10(Math.max(0.000001, Number(threshold) || 0)) + 60) / 60) * 100) + '%';
+    telemetry.querySelector('[data-talk-db]').textContent = db === null ? '-- dBFS' : (db <= -60 ? '< -60' : db.toFixed(1)) + ' dBFS';
+    telemetry.classList.toggle('clipping', peak !== null && peak >= 0.98);
+    drawSpectrum(metrics.bands, now);
+  }
+
+  function micMetrics() {
+    if (native) {
+      var raw = null;
+      try {
+        if (typeof root.pineDesktop.micMetrics === 'function') {
+          raw = root.pineDesktop.micMetrics();
+          if (!raw || typeof raw !== 'object') raw = null;
+        }
+      } catch (err) { raw = null; }
+      var fallback = null;
+      if (!raw || finite(raw.peak) === null) {
+        try { fallback = finite(root.pineDesktop.micLevel()); }
+        catch (err) { /* the bridge may be closing */ }
+      }
+      var peak = raw && finite(raw.peak);
+      return {
+        raw: raw,
+        level: peak === null || peak === undefined ? (fallback || 0) : peak,
+        rms: raw && raw.rms,
+        peak: peak === null || peak === undefined ? fallback : peak,
+        bands: raw && raw.bands
+      };
+    }
+    if (!analyser || !data) return {level: 0, rms: null, peak: null, bands: null};
     analyser.getByteTimeDomainData(data);
-    var peak = 0;
+    var peak = 0, power = 0;
     for (var i = 0; i < data.length; i += 1) {
       var v = Math.abs(data[i] - 128) / 128;
       if (v > peak) peak = v;
+      power += v * v;
     }
-    return peak;
+    var bands = null;
+    if (frequencies && typeof analyser.getByteFrequencyData === 'function') {
+      analyser.getByteFrequencyData(frequencies);
+      bands = [];
+      for (var b = 0; b < 24; b += 1) {
+        var lo = Math.floor(Math.pow(b / 24, 1.7) * frequencies.length);
+        var hi = Math.max(lo + 1,
+          Math.floor(Math.pow((b + 1) / 24, 1.7) * frequencies.length));
+        var strongest = 0;
+        for (var j = lo; j < hi && j < frequencies.length; j += 1) {
+          if (frequencies[j] > strongest) strongest = frequencies[j];
+        }
+        bands.push(strongest / 255);
+      }
+    }
+    return {level: peak, rms: Math.sqrt(power / data.length),
+      peak: peak, bands: bands};
   }
 
   /* ---- the gesture ---------------------------------------------------- */
@@ -583,9 +773,11 @@
        * the show out of its own speaker, whether the echo canceller is
        * there is the difference between hearing the operator and hearing
        * the broadcast. */
-      announce('Listening...' + (opened.effects && opened.effects !== 'none'
-        ? ' (' + opened.effects + ')' : ''));
-      startScene();
+      if (!fieldCapture) {
+        announce('Listening...' + (opened.effects && opened.effects !== 'none'
+          ? ' (' + opened.effects + ')' : ''));
+        startScene();
+      }
       startedAt = performance.now();
       quietSince = 0;
       watch();
@@ -612,8 +804,10 @@
      * dot that is listening to a quiet room look the same, and the
      * operator can only tell them apart if the name is on screen. */
     micLabel = micName(stream);
-    announce('Listening...' + (micLabel ? ' (' + micLabel + ')' : ''));
-    startScene();
+    if (!fieldCapture) {
+      announce('Listening...' + (micLabel ? ' (' + micLabel + ')' : ''));
+      startScene();
+    }
 
     ctx = ctx || new (root.AudioContext || root.webkitAudioContext)();
     if (ctx.state === 'suspended') { try { await ctx.resume(); } catch (e) { /* later */ } }
@@ -621,6 +815,7 @@
     analyser = ctx.createAnalyser();
     analyser.fftSize = 512;
     data = new Uint8Array(analyser.fftSize);
+    frequencies = new Uint8Array(analyser.frequencyBinCount);
     /* NOT connected to the destination. Routing the microphone to the
      * speakers is a feedback loop, and on a tablet held near the speaker it
      * is an immediate one. */
@@ -687,7 +882,8 @@
       frame = requestAnimationFrame(tick);
       if (state !== LISTENING) return;
       var now = performance.now();
-      var loud = loudness();
+      var metrics = micMetrics();
+      var loud = metrics.level;
       var since = now - startedAt;
 
       /* THE CLOUD FOLLOWS THE VOICE, FROM THE FIRST FRAME.
@@ -708,6 +904,7 @@
 
       if (since < 400) {
         floor += loud; floorFrames += 1;
+        renderTelemetry(metrics, now, null, heardAnything);
         return;                      /* still listening to the room */
       }
       if (floorFrames && bar === 0.05) {
@@ -717,6 +914,7 @@
 
       if (loud > bar) { quietSince = 0; heardAnything = true; }
       else if (!quietSince) quietSince = now;
+      renderTelemetry(metrics, now, bar, heardAnything);
 
       if (since > MAX_MS) { finish(); return; }
       if (!heardAnything) {
@@ -759,7 +957,7 @@
   function finish() {
     if (state !== LISTENING) return;
     setState(THINKING);
-    announce('Sending it through...');
+    if (!fieldCapture) announce('Sending it through...');
     cancelAnimationFrame(frame);
     if (native) { sendNative(); return; }
     pcmStop();                                            /* [#1224] */
@@ -1100,7 +1298,7 @@
       var take = capture;
       capture = null;
       setState(IDLE);
-      announce('Heard: "' + text + '"');
+      if (!fieldCapture) announce('Heard: "' + text + '"');
       try { take(text); } catch (err) { /* the pad still stands */ }
       release(400);
       return;
@@ -1113,6 +1311,8 @@
       return;
     }
     setState(THINKING);
+    var telemetry = el('pineTalkTelemetry');
+    if (telemetry) telemetry.querySelector('[data-talk-phase]').textContent = 'Processing';
     /* Tell him it understood BEFORE the thinking starts. The answer can
      * take seconds; being told you were heard should not wait for it. */
     announce('Heard: "' + text + '"');
@@ -1483,6 +1683,33 @@
   } catch (err) { /* not every engine has this */ }
 
   root.PineTalkDot = {
+    monitorInput: function (source, context) {
+      mount();
+      var telemetry = el('pineTalkTelemetry');
+      telemetry.hidden = false; telemetry.setAttribute('aria-hidden', 'false');
+      telemetry.querySelector('[data-talk-phase]').textContent = 'Microphone recording';
+      telemetry.classList.remove('transcribing');
+      var tap = context.createAnalyser(); tap.fftSize = 512; source.connect(tap);
+      var samples = new Float32Array(tap.fftSize), bins = new Uint8Array(tap.frequencyBinCount), timer;
+      function update() {
+        tap.getFloatTimeDomainData(samples); tap.getByteFrequencyData(bins);
+        var peak = 0, power = 0, bands = [];
+        samples.forEach(function (sample) { peak = Math.max(peak, Math.abs(sample)); power += sample * sample; });
+        for (var i = 0; i < 24; i++) {
+          var start = Math.floor(i * bins.length / 24), end = Math.floor((i + 1) * bins.length / 24), high = 0;
+          for (var j = start; j < end; j++) high = Math.max(high, bins[j]);
+          bands.push(high / 255);
+        }
+        renderTelemetry({peak:peak, rms:Math.sqrt(power / samples.length), bands:bands, level:peak, raw:{}}, performance.now(), null, false);
+        timer = root.requestAnimationFrame(update);
+      }
+      update();
+      return function () {
+        root.cancelAnimationFrame(timer);
+        try { source.disconnect(tap); tap.disconnect(); } catch (err) { /* capture has already stopped */ }
+        telemetry.hidden = true; telemetry.setAttribute('aria-hidden', 'true');
+      };
+    },
     mics: mics,
     useMic: useMic,
     micPin: micPin,
@@ -1515,138 +1742,295 @@
     report: reportOpen,
     state: function () { return state; }
   };
-  /* One microphone follows the focused text field, including fields created
-   * later by gallery and script popups. Every take appends to the current text. */
+  /* Each field and microphone share a containing block, including in popups. */
   if (root.document && root.document.addEventListener) {
-    var dictatedField = null;
-    var fieldMic = root.document.createElement('button');
-    var holdTimer = 0;
-    var heldMic = false;
+    var fieldButtons = new Map();
+    var fieldLayer = root.document.createElement('div');
+    fieldLayer.className = 'pine-field-mics';
     var micBusy = false;
     var micMonitor = 0;
     var finishWhenReady = false;
-    fieldMic.type = 'button';
-    fieldMic.tabIndex = -1;
-    fieldMic.className = 'pine-field-mic';
-    fieldMic.title = 'Tap to dictate or stop; hold to dictate while pressed';
-    fieldMic.setAttribute('aria-label', fieldMic.title);
-    fieldMic.innerHTML = (typeof root.pineIcon === 'function'
-      ? root.pineIcon('c:microphone', 'Dictate') : '') || '&#127908;';
-    fieldMic.style.cssText = 'position:fixed;z-index:2147483646;display:none;width:36px;height:36px;padding:7px;border:1px solid #5f8b91;border-radius:4px;background:#19272d;color:#b5edf0;align-items:center;justify-content:center;cursor:pointer';
+    var scanQueued = false;
+    var placeQueued = false;
+    var placeHitTest = false;
+    var visibleFields = new Set();
+    var fieldObserver = null;
+    function nextFrame(job) {
+      if (typeof root.requestAnimationFrame === 'function') return root.requestAnimationFrame(job);
+      if (typeof root.setTimeout === 'function') return root.setTimeout(job, 0);
+      job();
+      return 0;
+    }
+    function afterDelay(job, delay) {
+      if (typeof root.setTimeout === 'function') return root.setTimeout(job, delay);
+      if (typeof setTimeout === 'function') return setTimeout(job, delay);
+      job();
+      return 0;
+    }
+    function cancelDelay(timer) {
+      if (typeof root.clearTimeout === 'function') root.clearTimeout(timer);
+      else if (typeof clearTimeout === 'function') clearTimeout(timer);
+    }
     function textField(node) {
       if (!node || node.disabled || node.readOnly) return false;
       if (node.tagName === 'TEXTAREA') return true;
-      if (node.tagName === 'INPUT') return /^(text|search|url|email|tel)$/.test(node.type || 'text');
-      return node.isContentEditable === true;
+      if (node.tagName === 'INPUT') return /^(text|search|url|email|tel|number)$/.test(node.type || 'text');
+      return node.isContentEditable === true && !node.parentElement?.isContentEditable;
     }
-    function placeMic() {
-      if (!dictatedField || !dictatedField.isConnected) {
-        fieldMic.style.display = 'none';
-        return;
+    function viewport() {
+      return root.visualViewport || {width: root.innerWidth, height: root.innerHeight,
+        offsetLeft: 0, offsetTop: 0};
+    }
+    function setMicHidden(button, hidden) {
+      if (button.hidden !== hidden) button.hidden = hidden;
+    }
+    function placeMic(field, button, hitTest) {
+      if (!field.isConnected || !textField(field)) { setMicHidden(button, true); return; }
+      var host = field.parentElement;
+      if (!host) return;
+      if (!host.classList.contains('pine-dictation-field')) {
+        var computed = root.getComputedStyle(field);
+        var typed = field.computedStyleMap ? field.computedStyleMap() : null;
+        var focused = root.document.activeElement === field;
+        var selectionStart = field.selectionStart, selectionEnd = field.selectionEnd;
+        var wrapper = root.document.createElement('span');
+        wrapper.className = 'pine-dictation-field';
+        wrapper.style.cssText = 'position:relative;display:inline-grid;vertical-align:middle;min-width:0;box-sizing:border-box';
+        // Keep percentage and flex sizing in the form's original layout slot.
+        ['width', 'min-width', 'max-width', 'flex', 'align-self', 'justify-self',
+          'grid-area', 'order', 'margin-top', 'margin-right', 'margin-bottom', 'margin-left'].forEach(function (property) {
+          var value = typed && typed.get(property);
+          wrapper.style.setProperty(property, value ? String(value) : computed.getPropertyValue(property));
+        });
+        if (computed.display === 'block' || computed.display === 'flex' || computed.display === 'grid') wrapper.style.display = 'grid';
+        host.insertBefore(wrapper, field);
+        wrapper.appendChild(field);
+        field.classList.add('pine-dictation-input');
+        field.style.setProperty('width', '100%', 'important');
+        field.style.setProperty('min-width', '0', 'important');
+        field.style.setProperty('box-sizing', 'border-box', 'important');
+        field.style.setProperty('margin', '0', 'important');
+        host = wrapper;
+        if (focused) {
+          field.focus({preventScroll: true});
+          if (field.setSelectionRange && selectionStart !== null) {
+            try { field.setSelectionRange(selectionStart, selectionEnd); } catch (err) { /* number/email fields have no selection API */ }
+          }
+        }
       }
-      var rect = dictatedField.getBoundingClientRect();
-      var width = root.visualViewport ? root.visualViewport.width : root.innerWidth;
-      var height = root.visualViewport ? root.visualViewport.height : root.innerHeight;
-      if (rect.bottom < 0 || rect.top > height) {
-        fieldMic.style.display = 'none';
-        return;
+      if (button.parentElement !== host) host.appendChild(button);
+      setMicHidden(button, field.hidden || field.getAttribute('aria-hidden') === 'true');
+    }
+    function placeTelemetry() {
+      var telemetry = el('pineTalkTelemetry');
+      if (!telemetry) return;
+      // One viewport dock stays visible above every popup and keyboard layout.
+      ['left', 'top', 'width', 'height'].forEach(function (property) { telemetry.style.removeProperty(property); });
+    }
+    function placeAll(hitTest) {
+      var fields = fieldObserver ? visibleFields : fieldButtons;
+      fields.forEach(function (value, key) {
+        var field = fieldObserver ? value : key;
+        var button = fieldObserver ? fieldButtons.get(field) : value;
+        if (!field || !button || !field.isConnected) {
+          if (button) button.remove();
+          fieldButtons.delete(field);
+          visibleFields.delete(field);
+          return;
+        }
+        placeMic(field, button, hitTest);
+      });
+      placeTelemetry();
+    }
+    function queuePlace(hitTest) {
+      placeHitTest = placeHitTest || !!hitTest;
+      if (placeQueued) return;
+      placeQueued = true;
+      nextFrame(function () {
+        var probe = placeHitTest;
+        placeQueued = false;
+        placeHitTest = false;
+        placeAll(probe);
+      });
+    }
+    function queueScan() {
+      if (scanQueued) return;
+      scanQueued = true;
+      nextFrame(function () { scanQueued = false; scan(); });
+    }
+    function scan() {
+      var fields = root.document.querySelectorAll
+        ? root.document.querySelectorAll('input, textarea, [contenteditable="true"]') : [];
+      var added = false;
+      for (var i = 0; i < fields.length; i += 1) {
+        var field = fields[i];
+        if (!textField(field) || fieldButtons.has(field)) continue;
+        var button = makeMic(field);
+        fieldButtons.set(field, button);
+        added = true;
+        if (fieldObserver) fieldObserver.observe(field);
       }
-      fieldMic.style.display = 'flex';
-      fieldMic.style.left = Math.max(0, Math.min(width - 38, rect.right - 40)) + 'px';
-      fieldMic.style.top = Math.max(0, Math.min(height - 38, rect.top + 4)) + 'px';
+      if (added && !fieldObserver) queuePlace(true);
+    }
+    function reserveSpace(field) {
+      if (!field.style || !field.style.setProperty) return;
+      var style = root.getComputedStyle ? root.getComputedStyle(field) : null;
+      var right = style ? parseFloat(style.paddingRight) || 0 : 0;
+      field.style.setProperty('padding-right', Math.max(38, right) + 'px', 'important');
     }
     function appendWords(field, words) {
       if (!field || !field.isConnected || !words) return;
+      var stillFocused = !root.document || root.document.activeElement === field;
       var old = field.isContentEditable ? field.textContent : field.value;
       var joined = old + (old && !/\s$/.test(old) ? ' ' : '') + words;
       if (field.isContentEditable) field.textContent = joined;
-      else {
-        /* A framework may watch the native setter, not a direct assignment. */
-        var kind = field.tagName === 'TEXTAREA' ? root.HTMLTextAreaElement : root.HTMLInputElement;
-        var setter = kind && Object.getOwnPropertyDescriptor(kind.prototype, 'value');
-        if (setter && setter.set) setter.set.call(field, joined);
-        else field.value = joined;
-      }
+      else field.value = joined;
       field.dispatchEvent(new Event('input', {bubbles: true}));
-      /* Do not pull focus back from a different field during transcription. */
-      if (!textField(root.document.activeElement) || root.document.activeElement === field) {
-        field.focus({preventScroll: true});
-        if (field.setSelectionRange) {
-          try { field.setSelectionRange(joined.length, joined.length); }
-          catch (err) { /* email and tel fields do not support selection ranges */ }
-        }
-      }
+      if (stillFocused) field.focus();
+      if (stillFocused && field.setSelectionRange) field.setSelectionRange(joined.length, joined.length);
     }
-    function startMic() {
-      if (micBusy || !dictatedField || !textField(dictatedField)) return;
-      var target = dictatedField;
-      micBusy = true;
+    function clearMic() {
+      root.clearInterval(micMonitor);
+      micMonitor = 0;
+      micBusy = false;
       finishWhenReady = false;
-      fieldMic.setAttribute('aria-pressed', 'true');
-      var startedAt = Date.now();
+      fieldButtons.forEach(function (button) { button.setAttribute('aria-pressed', 'false'); });
+      fieldCapture = null;
+    }
+    function startMic(field, button) {
+      if (micBusy || state !== IDLE || !textField(field)) return;
+      micBusy = true;
+      fieldCapture = field;
+      button.setAttribute('aria-pressed', 'true');
+      if (root.document && typeof root.document.getElementById === 'function') {
+        mount();
+        placeTelemetry();
+      }
+      var started = Date.now();
       root.clearInterval(micMonitor);
       micMonitor = root.setInterval(function () {
-        if (Date.now() - startedAt < 3000 || root.PineTalkDot.state() !== IDLE) return;
-        root.clearInterval(micMonitor);
-        micMonitor = 0;
-        micBusy = false;
-        fieldMic.setAttribute('aria-pressed', 'false');
+        if (Date.now() - started < 3000 || root.PineTalkDot.state() !== IDLE) return;
+        clearMic();
       }, 500);
       Promise.resolve(root.PineTalkDot.captureNext(function (words) {
-        appendWords(target, String(words || '').trim());
-        root.clearInterval(micMonitor);
-        micMonitor = 0;
-        micBusy = false;
-        fieldMic.setAttribute('aria-pressed', 'false');
+        appendWords(field, String(words || '').trim());
+        clearMic();
       })).then(function () {
-        if (finishWhenReady) {
-          finishWhenReady = false;
-          root.PineTalkDot.finish();
-        }
-      }).catch(function () {
-        finishWhenReady = false;
-        root.clearInterval(micMonitor);
-        micMonitor = 0;
-        micBusy = false;
-        fieldMic.setAttribute('aria-pressed', 'false');
-      });
+        if (finishWhenReady) root.PineTalkDot.finish();
+      }).catch(clearMic);
     }
     function stopMic() {
       if (!micBusy) return;
       if (root.PineTalkDot.state() === LISTENING) root.PineTalkDot.finish();
       else finishWhenReady = true;
     }
-    fieldMic.addEventListener('pointerdown', function (event) {
-      event.preventDefault();
-      if (textField(root.document.activeElement)) dictatedField = root.document.activeElement;
-      heldMic = false;
-      root.clearTimeout(holdTimer);
-      holdTimer = root.setTimeout(function () {
-        heldMic = true;
-        startMic();
-      }, 450);
-      if (fieldMic.setPointerCapture) fieldMic.setPointerCapture(event.pointerId);
-    });
-    fieldMic.addEventListener('mousedown', function (event) { event.preventDefault(); });
-    fieldMic.addEventListener('pointerup', function () {
-      root.clearTimeout(holdTimer);
-      if (heldMic) stopMic();
-      else if (micBusy) stopMic();
-      else startMic();
-    });
-    fieldMic.addEventListener('pointercancel', function () {
-      root.clearTimeout(holdTimer);
-      if (heldMic) stopMic();
-    });
+    function makeMic(field) {
+      reserveSpace(field);
+      var button = root.document.createElement('button');
+      var pressedAt = 0;
+      var wasListening = false;
+      var holdTimer = 0;
+      var held = false;
+      button.type = 'button';
+      button.className = 'pine-field-mic';
+      button.style.cssText = 'position:absolute;z-index:2;inset:4px 4px auto auto;box-sizing:border-box;width:28px;height:28px;max-height:calc(100% - 8px);padding:4px;border:0;border-radius:4px;background:#19272d;color:#b5edf0;cursor:pointer';
+      button.style.setProperty('min-height', '0', 'important');
+      button.style.setProperty('min-width', '0', 'important');
+      button.hidden = true;
+      button.title = 'Tap to dictate or stop; hold to talk and release to transcribe';
+      button.setAttribute('aria-label', button.title);
+      button.setAttribute('aria-pressed', 'false');
+      button.innerHTML = (typeof root.pineIcon === 'function'
+        ? root.pineIcon('c:microphone', 'Dictate') : '') || '&#127908;';
+      button.addEventListener('pointerdown', function (event) {
+        event.preventDefault();
+        pressedAt = Date.now();
+        wasListening = micBusy;
+        held = false;
+        if (micBusy) stopMic(); else startMic(field, button);
+        cancelDelay(holdTimer);
+        holdTimer = afterDelay(function () {
+          holdTimer = 0;
+          held = true;
+        }, 450);
+        try { button.setPointerCapture(event.pointerId); } catch (err) { /* released */ }
+      });
+      button.addEventListener('pointerup', function () {
+        if (holdTimer) cancelDelay(holdTimer);
+        holdTimer = 0;
+        if (pressedAt && !wasListening && (held || Date.now() - pressedAt >= 450)) stopMic();
+        pressedAt = 0;
+        held = false;
+      });
+      button.addEventListener('pointercancel', function () {
+        if (holdTimer) cancelDelay(holdTimer);
+        holdTimer = 0;
+        if (pressedAt && !wasListening) stopMic();
+        pressedAt = 0;
+        held = false;
+      });
+      button.addEventListener('click', function (event) {
+        if (event.detail !== 0) return;
+        if (micBusy) stopMic(); else startMic(field, button);
+      });
+      var host = field.parentElement || fieldLayer;
+      if (host && host.appendChild) host.appendChild(button);
+      return button;
+    }
+    (root.document.body || root.document.documentElement).appendChild(fieldLayer);
+    if (typeof root.IntersectionObserver === 'function') {
+      fieldObserver = new root.IntersectionObserver(function (entries) {
+        entries.forEach(function (entry) {
+          var field = entry.target;
+          var button = fieldButtons.get(field);
+          if (!button) return;
+          if (entry.isIntersecting) {
+            visibleFields.add(field);
+            placeMic(field, button, true);
+          } else {
+            visibleFields.delete(field);
+            setMicHidden(button, true);
+          }
+        });
+        placeTelemetry();
+      });
+    }
     root.document.addEventListener('focusin', function (event) {
-      if (!textField(event.target)) return;
-      dictatedField = event.target;
-      placeMic();
+      var field = event.target;
+      if (!textField(field)) return;
+      var button = fieldButtons.get(field);
+      if (!button) {
+        button = makeMic(field);
+        fieldButtons.set(field, button);
+        if (fieldObserver) fieldObserver.observe(field);
+      }
+      visibleFields.add(field);
+      placeMic(field, button, true);
+      queueScan();
     });
-    root.addEventListener('resize', placeMic);
-    root.addEventListener('scroll', placeMic, true);
-    if (root.visualViewport) root.visualViewport.addEventListener('resize', placeMic);
-    (root.document.body || root.document.documentElement).appendChild(fieldMic);
+    root.addEventListener('resize', queuePlace);
+    root.addEventListener('scroll', queuePlace, true);
+    if (root.visualViewport) {
+      root.visualViewport.addEventListener('resize', queuePlace);
+      root.visualViewport.addEventListener('scroll', queuePlace);
+    }
+    if (typeof MutationObserver !== 'undefined') {
+      new MutationObserver(function (records) {
+        for (var i = 0; i < records.length; i += 1) {
+          var nodes = records[i].addedNodes || [];
+          for (var j = 0; j < nodes.length; j += 1) {
+            var node = nodes[j];
+            if (node && node.nodeType === 1 && (textField(node)
+                || (node.querySelector && node.querySelector('input, textarea, [contenteditable="true"]')))) {
+              queueScan();
+              return;
+            }
+          }
+        }
+      }).observe(root.document.body || root.document.documentElement,
+        {childList: true, subtree: true});
+    }
+    scan();
   }
   if (typeof module !== 'undefined' && module.exports) module.exports = root.PineTalkDot;
 })(typeof window !== 'undefined' ? window : globalThis);

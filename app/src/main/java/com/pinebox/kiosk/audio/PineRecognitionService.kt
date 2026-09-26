@@ -67,6 +67,11 @@ class PineRecognitionService : RecognitionService() {
         }
         active = session
         session.job = scope.launch { recognize(session) }
+        // Cancellation can arrive before recognize() enters its try/finally.
+        session.job?.invokeOnCompletion {
+            MicLease.release(session)
+            if (active === session) active = null
+        }
     }
 
     override fun onStopListening(listener: Callback) {
@@ -98,6 +103,8 @@ class PineRecognitionService : RecognitionService() {
             while (!session.stopping && !session.cancelled) {
                 delay(100)
                 val now = SystemClock.elapsedRealtime()
+                val rms = mic.micMetrics().rms.coerceAtLeast(0.000001f)
+                session.deliver { it.rmsChanged((20.0 * kotlin.math.log10(rms.toDouble())).toFloat()) }
                 if (mic.level > VOICE_PEAK) {
                     lastVoice = now
                     if (!heardVoice) {

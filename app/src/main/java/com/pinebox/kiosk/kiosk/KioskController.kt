@@ -2,17 +2,12 @@ package com.pinebox.kiosk.kiosk
 
 import android.app.Activity
 import android.app.admin.DevicePolicyManager
-import android.content.ComponentName
 import android.content.Context
-import android.content.Intent
-import android.content.IntentFilter
 import android.util.Log
-import android.view.View
 import android.view.WindowManager
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
-import com.pinebox.kiosk.MainActivity
 
 /**
  * Everything that turns an activity into a terminal.
@@ -51,28 +46,11 @@ object KioskController {
         val policy = dpm(context)
         val admin = PineDeviceAdminReceiver.component(context)
         try {
-            /* Only this package may be locked into. A second package here
-             * would let a lock-task app launch another and strand the
-             * terminal in it. */
-            policy.setLockTaskPackages(admin, arrayOf(context.packageName))
-
-            /* Make the manifest's HOME filter STICKY. Without this the
-             * first press of Home after provisioning shows the usual
-             * "which launcher?" chooser - on a wall-mounted tablet nobody
-             * is standing at, that chooser is where the terminal stays. */
-            val home = IntentFilter(Intent.ACTION_MAIN).apply {
-                addCategory(Intent.CATEGORY_HOME)
-                addCategory(Intent.CATEGORY_DEFAULT)
-            }
-            policy.addPersistentPreferredActivity(
-                admin, home,
-                ComponentName(context, MainActivity::class.java),
-            )
-
-            /* The status bar cannot be pulled down at all - notifications
-             * and Quick Settings are a road off the terminal that immersive
-             * mode alone does not close. */
-            policy.setStatusBarDisabled(admin, true)
+            // Device ownership remains for privileged audio routing only. The
+            // station must always leave Home, Recents and the status bar usable.
+            policy.setStatusBarDisabled(admin, false)
+            policy.setLockTaskPackages(admin, emptyArray())
+            policy.clearPackagePersistentPreferredActivities(admin, context.packageName)
 
             /* Never sleep while plugged in. The terminal is a wall panel;
              * a black screen reads as a dead station. */
@@ -103,20 +81,9 @@ object KioskController {
      * not been provisioned yet, so it is attempted rather than skipped.
      */
     fun enterLockTask(activity: Activity) {
-        try {
-            val policy = dpm(activity)
-            if (isDeviceOwner(activity) || policy.isLockTaskPermitted(activity.packageName)) {
-                activity.startLockTask()
-            } else {
-                Log.i(TAG, "not device owner; running unpinned (see README: dpm set-device-owner)")
-            }
-        } catch (err: RuntimeException) {
-            /* IllegalArgumentException (package not permitted),
-             * IllegalStateException (activity not resumed) and
-             * SecurityException all mean the same thing here: the terminal
-             * runs unpinned. None of them may take the panel down with it. */
-            Log.w(TAG, "lock task refused", err)
-        }
+        // Kept as a compatibility call site: every resume actively clears a
+        // lock left by an older build instead of pinning this activity again.
+        exitLockTask(activity)
     }
 
     fun exitLockTask(activity: Activity) {
@@ -136,8 +103,6 @@ object KioskController {
      */
     fun applyWindowFlags(activity: Activity) {
         activity.window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        activity.window.addFlags(WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON)
-        activity.window.addFlags(WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED)
 
         /* Draw under the cutout. The M9 has none, but LineageOS reports a
          * cutout mode anyway and the default leaves a letterbox on some
@@ -150,13 +115,9 @@ object KioskController {
 
         WindowCompat.setDecorFitsSystemWindows(activity.window, false)
         val controller = WindowInsetsControllerCompat(activity.window, activity.window.decorView)
-        controller.hide(WindowInsetsCompat.Type.systemBars())
-        /* BEHAVIOUR_SHOW_TRANSIENT_BARS_BY_SWIPE, not the default: with the
-         * default the first swipe from an edge brings the bars back and
-         * leaves them there. Transient means they fade again on their own,
-         * so a stray touch does not permanently reveal the navigation bar. */
         controller.systemBarsBehavior =
             WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        controller.hide(WindowInsetsCompat.Type.systemBars())
     }
 
     /**
@@ -167,14 +128,10 @@ object KioskController {
      */
     fun reassertImmersive(activity: Activity, hasFocus: Boolean) {
         if (!hasFocus) return
+        WindowCompat.setDecorFitsSystemWindows(activity.window, false)
         val controller = WindowInsetsControllerCompat(activity.window, activity.window.decorView)
+        controller.systemBarsBehavior =
+            WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
         controller.hide(WindowInsetsCompat.Type.systemBars())
-        activity.window.decorView.systemUiVisibility =
-            View.SYSTEM_UI_FLAG_LAYOUT_STABLE or
-                View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION or
-                View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN or
-                View.SYSTEM_UI_FLAG_HIDE_NAVIGATION or
-                View.SYSTEM_UI_FLAG_FULLSCREEN or
-                View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
     }
 }

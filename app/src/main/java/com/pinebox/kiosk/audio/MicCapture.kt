@@ -9,12 +9,15 @@ import android.media.MediaRecorder
 import android.media.audiofx.AcousticEchoCanceler
 import android.media.audiofx.AutomaticGainControl
 import android.media.audiofx.NoiseSuppressor
+import android.os.SystemClock
 import android.util.Log
 import java.io.ByteArrayOutputStream
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.concurrent.thread
 import kotlin.math.abs
+import kotlin.math.cos
+import kotlin.math.pow
 import kotlin.math.sqrt
 
 /**
@@ -176,6 +179,12 @@ class MicCapture(
     @Volatile var level: Float = 0f
         private set
 
+    @Volatile private var metricFrame = MicTelemetry.idle()
+
+    /** A cheap, immutable snapshot. All PCM and spectrum work runs in the read loop. */
+    internal fun micMetrics(): MicTelemetry.Frame =
+        if (running.get()) metricFrame.at(SystemClock.elapsedRealtime()) else MicTelemetry.idle()
+
     /** RMS over the whole take, so a silent recording can be reported as
      *  silent instead of sent to whisper to come back empty. */
     @Volatile private var sumSquares: Double = 0.0
@@ -335,6 +344,7 @@ class MicCapture(
         sumSquares = 0.0
         sampleCount = 0
         level = 0f
+        metricFrame = MicTelemetry.waiting()
         startedAtMs = System.currentTimeMillis()
         recorder = record
         running.set(true)
@@ -358,6 +368,7 @@ class MicCapture(
 
         worker = thread(name = "pine-mic", isDaemon = true) {
             val buf = ShortArray(size / 2)
+            val telemetry = MicTelemetry(SystemClock.elapsedRealtime())
             while (running.get() && takeId.get() == mine) {
                 val got = try {
                     record.read(buf, 0, buf.size)
@@ -401,6 +412,7 @@ class MicCapture(
                  * halve the signal and add nothing but that pin's noise.
                  * It is not a downmix; it is a choice. */
                 val frames = if (stereo) got / 2 else got
+                if (frames == 0) continue
                 val bytes = ByteArray(frames * 2)
                 for (f in 0 until frames) {
                     val s: Int
@@ -433,6 +445,9 @@ class MicCapture(
                 /* Decay rather than jump: the dot's particles read this
                  * every frame and a raw peak makes them flicker. */
                 level = if (peak > level) peak else (level * 0.72f + peak * 0.28f)
+                val frame = telemetry.feed(buf, frames, stereo,
+                    sqrt(square / frames).toFloat(), peak, SystemClock.elapsedRealtime())
+                if (running.get() && takeId.get() == mine) metricFrame = frame
             }
         }
         return null
@@ -457,6 +472,7 @@ class MicCapture(
         recorder = null
         releaseEffects()
         level = 0f
+        metricFrame = MicTelemetry.idle()
 
         val pcm = sink.toByteArray()
         sink = ByteArrayOutputStream()
@@ -692,6 +708,112 @@ class MicCapture(
             "DEFAULT" -> MediaRecorder.AudioSource.DEFAULT
             "VOICE_RECOGNITION" -> MediaRecorder.AudioSource.VOICE_RECOGNITION
             else -> MediaRecorder.AudioSource.MIC
+        }
+    }
+}
+
+/** Worker-thread PCM measurements. Speech probability is an energy estimate,
+ * not a recognizer or ML model; the bands are windowed Goertzel magnitudes. */
+internal class MicTelemetry(private val startedAtMs: Long) {
+    data class Frame(
+        val rms: Float,
+        val peak: Float,
+        val speechProbability: Float,
+        val vadState: String,
+        val silenceElapsedMs: Long,
+        val endpointTimeoutMs: Long,
+        val remainingMs: Long,
+        val threshold: Float,
+        val bands: List<Float>,
+        private val lastSpeechAtMs: Long = 0L,
+    ) {
+        fun at(nowMs: Long): Frame {
+            if (vadState != "silence") return this
+            val elapsed = (nowMs - lastSpeechAtMs).coerceAtLeast(0L)
+            return copy(
+                vadState = if (elapsed >= endpointTimeoutMs) "endpoint" else "silence",
+                silenceElapsedMs = elapsed,
+                remainingMs = (endpointTimeoutMs - elapsed).coerceAtLeast(0L),
+            )
+        }
+    }
+
+    companion object {
+        const val ENDPOINT_MS = 4200L
+        private const val WINDOW = 512
+        private const val BAND_COUNT = 24
+        private val EMPTY_BANDS = List(BAND_COUNT) { 0f }
+
+        fun idle() = Frame(0f, 0f, 0f, "idle", 0L, ENDPOINT_MS, 0L, 0f, EMPTY_BANDS)
+        fun waiting() = Frame(0f, 0f, 0f, "waiting", 0L, ENDPOINT_MS,
+            ENDPOINT_MS, 0.01f, EMPTY_BANDS)
+    }
+
+    private val ring = ShortArray(WINDOW)
+    private var ringAt = 0
+    private var ringFilled = 0
+    private val window = DoubleArray(WINDOW) { i ->
+        0.5 - 0.5 * cos(2.0 * Math.PI * i / (WINDOW - 1))
+    }
+    private val coefficients = DoubleArray(BAND_COUNT) { i ->
+        val hz = 80.0 * (7200.0 / 80.0).pow(i / (BAND_COUNT - 1.0))
+        2.0 * cos(2.0 * Math.PI * hz / 16_000.0)
+    }
+    private var roomMin = Float.POSITIVE_INFINITY
+    private var threshold = 0.01f
+    private var heardSpeech = false
+    private var lastSpeechAtMs = 0L
+
+    fun feed(pcm: ShortArray, frames: Int, stereo: Boolean,
+             rms: Float, peak: Float, nowMs: Long): Frame {
+        for (i in 0 until frames) {
+            ring[ringAt] = pcm[if (stereo) i * 2 + 1 else i]
+            ringAt = (ringAt + 1) % WINDOW
+            if (ringFilled < WINDOW) ringFilled++
+        }
+
+        if (!heardSpeech && nowMs - startedAtMs < 400L) {
+            roomMin = minOf(roomMin, rms)
+        } else if (!heardSpeech && roomMin.isFinite()) {
+            threshold = (roomMin * 3.5f + 0.002f).coerceIn(0.003f, 0.12f)
+        }
+
+        val probability = (rms / threshold - 0.5f).coerceIn(0f, 1f)
+        val speaking = rms > threshold
+        if (speaking) {
+            heardSpeech = true
+            lastSpeechAtMs = nowMs
+        }
+        val state = when {
+            speaking -> "speech"
+            !heardSpeech -> "waiting"
+            nowMs - lastSpeechAtMs >= ENDPOINT_MS -> "endpoint"
+            else -> "silence"
+        }
+        val elapsed = if (heardSpeech && !speaking)
+            (nowMs - lastSpeechAtMs).coerceAtLeast(0L) else 0L
+        return Frame(rms, peak, probability, state, elapsed, ENDPOINT_MS,
+            if (state == "endpoint") 0L else (ENDPOINT_MS - elapsed).coerceAtLeast(0L),
+            threshold, spectrum(), lastSpeechAtMs)
+    }
+
+    private fun spectrum(): List<Float> {
+        val start = if (ringFilled == WINDOW) ringAt else 0
+        val offset = WINDOW - ringFilled
+        return List(BAND_COUNT) { band ->
+            var previous = 0.0
+            var beforePrevious = 0.0
+            val coefficient = coefficients[band]
+            for (i in 0 until WINDOW) {
+                val sample = if (i < offset) 0.0 else
+                    ring[(start + i - offset) % WINDOW].toDouble() / 32768.0
+                val current = sample * window[i] + coefficient * previous - beforePrevious
+                beforePrevious = previous
+                previous = current
+            }
+            val power = (previous * previous + beforePrevious * beforePrevious -
+                coefficient * previous * beforePrevious).coerceAtLeast(0.0)
+            (sqrt(sqrt(power) / (WINDOW / 4.0) / 0.12)).toFloat().coerceIn(0f, 1f)
         }
     }
 }

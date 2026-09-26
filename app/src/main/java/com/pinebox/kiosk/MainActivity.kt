@@ -1280,18 +1280,8 @@ class MainActivity : AppCompatActivity() {
             stream.bufferedReader().use(BufferedReader::readText)
         }
 
-    /**
-     * Open a link outside the kiosk.
-     *
-     * Refused while locked: leaving the terminal for a browser is exactly
-     * what lock task mode exists to prevent, and an ACTION_VIEW that the
-     * system blocks anyway would look to the panel like a success.
-     */
+    /** Open a link in the user's chosen external application. */
     private fun openExternal(uri: Uri): Boolean {
-        if (KioskController.isDeviceOwner(this)) {
-            Log.i(TAG, "openExternal refused while the terminal is locked: $uri")
-            return false
-        }
         return try {
             startActivity(Intent(Intent.ACTION_VIEW, uri).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
             true

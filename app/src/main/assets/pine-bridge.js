@@ -21,7 +21,8 @@
  * two, so that from the panel's point of view `await pineDesktop.get(...)`
  * behaves exactly as it does under Electron.
  *
- * THE TWO EXCEPTIONS ARE DELIBERATE. app.py:170463 reads
+ * Synchronous reads (clipboard and microphone telemetry) are deliberate.
+ * app.py:170463 reads
  *
  *     if (desk.copyImage(data) === false) return "the desktop clipboard..."
  *
@@ -211,7 +212,16 @@
      * micCancel() -> {ok}    throw the take away
      * micState()  -> {running, seconds, level, effects, error}
      * micLevel()  -> 0..1, SYNCHRONOUS: the talk dot reads it every frame
-     *                and a promise per frame would flood the settle path. */
+     *                and a promise per frame would flood the settle path.
+     * micMetrics() -> {rms, peak, speech_probability, vad_state,
+     *                  silence_elapsed_ms, endpoint_timeout_ms, remaining_ms,
+     *                  threshold, bands:[24 values 0..1]}, SYNCHRONOUS.
+     * rms, peak and threshold are normalized raw PCM amplitudes; bands run
+     * from low to high frequency (80..7200 Hz).
+     * speech_probability is an energy-based estimate, not an ML score.
+     * vad_state: idle | waiting | speech | silence | endpoint. The 4200ms
+     * endpoint clock starts after speech; remaining_ms is 4200 while waiting.
+     * Reaching endpoint does not stop the take itself. */
     /* micTake()  -> {ok, bytes, rate, seconds, wall, level, quiet}
      *   Stops the take and PARKS it instead of transcribing it - the
      *   desktop's screen recorder wants the sound, not the words.
@@ -328,6 +338,14 @@
     micLevel: function () {
       try { return Number(native.micLevel()) || 0; }
       catch (err) { return 0; }
+    },
+    micMetrics: function () {
+      try { return JSON.parse(native.micMetrics()); }
+      catch (err) {
+        return {rms: 0, peak: 0, speech_probability: 0, vad_state: "idle",
+          silence_elapsed_ms: 0, endpoint_timeout_ms: 4200, remaining_ms: 0,
+          threshold: 0, bands: Array(24).fill(0)};
+      }
     },
     /* A page can ask whether there is an ear at all before drawing a dot
      * that cannot work. On the desktop this is absent and the renderer

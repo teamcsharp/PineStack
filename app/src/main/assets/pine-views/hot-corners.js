@@ -1719,10 +1719,13 @@
   var videoEditor = null;
   var captureBusy = false;
 
-  function editorPath(sourceId) {
+  function editorPath(sourceId, secondaryId) {
     sourceId = String(sourceId || '');
     if (!/^[0-9a-f]{32}$/.test(sourceId)) throw new Error('invalid video source identity');
-    return '/video-editor/?source=' + sourceId;
+    secondaryId = String(secondaryId || '');
+    if (secondaryId && !/^[0-9a-f]{32}$/.test(secondaryId)) throw new Error('invalid secondary video source identity');
+    return '/video-editor/?source=' + sourceId
+      + (secondaryId ? '&secondary=' + secondaryId + '&parody=1' : '');
   }
 
   function editorMessage(event, frameWindow, origin) {
@@ -1764,19 +1767,20 @@
   /* Keep the station document and its player alive underneath the editor.
    * The source is an opaque station identity; returned URLs cannot navigate
    * the native bridge to another host. Export notifications never save files. */
-  function openVideoEditor(sourceId) {
-    var url = stationUrl(editorPath(sourceId));
+  function openVideoEditor(sourceId, secondaryId) {
+    var url = stationUrl(editorPath(sourceId, secondaryId));
+    var splice = !!secondaryId;
     var origin = new root.URL(url, root.location.href).origin;
     if (videoEditor) videoEditor.close();
     var box = make('section', 'hc-video-editor');
     box.setAttribute('role', 'dialog');
-    box.setAttribute('aria-label', 'Screen recording editor');
+    box.setAttribute('aria-label', splice ? 'Video splice editor' : 'Screen recording editor');
     var bar = make('div', 'hc-video-editor-bar');
-    bar.appendChild(make('span', '', 'Screen recording'));
+    bar.appendChild(make('span', '', splice ? 'Video splice editor' : 'Screen recording'));
     var back = button('hc-btn', 'Close editor');
     bar.appendChild(back);
     var frame = make('iframe', 'hc-video-editor-frame');
-    frame.title = 'Edit screen recording';
+    frame.title = splice ? 'Splice original and generated videos' : 'Edit screen recording';
     frame.setAttribute('allow', 'autoplay; fullscreen');
     frame.src = url;
     /* [#1221] "I want to be able to slide it out of the screen so that way I

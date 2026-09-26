@@ -1,0 +1,53 @@
+/* Trace modal additions; the shared sheet remains in line-actions.css. */
+.ld-head-actions { display: flex; align-items: center; gap: 6px; }
+.ld-forget {
+  width: 30px; height: 30px; padding: 0;
+  display: inline-flex; align-items: center; justify-content: center;
+  border: 1px solid var(--line, #35414c); border-radius: 7px;
+  background: var(--panel-2, #222b35); color: var(--text, #edf3f5);
+  cursor: pointer;
+}
+.ld-forget svg { width: 17px; height: 17px; fill: currentColor; }
+.ld-forget:not(:disabled):hover, .ld-forget:not(:disabled):focus-visible {
+  color: var(--red, #e46b6b); border-color: currentColor;
+}
+.ld-forget:disabled { opacity: .4; cursor: not-allowed; }
+.ld-forget-confirm, .ld-forget-feedback {
+  flex: 0 0 auto; padding: 8px 13px;
+  border-bottom: 1px solid var(--line, #35414c);
+  font-size: 12px; line-height: 1.4;
+}
+.ld-forget-confirm { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.ld-forget-confirm span { flex: 1 1 220px; }
+.ld-forget-confirm button {
+  min-height: 30px; padding: 4px 9px;
+  border: 1px solid var(--line, #35414c); border-radius: 6px;
+  background: var(--panel-2, #222b35); color: var(--text, #edf3f5);
+  font: inherit; cursor: pointer;
+}
+.ld-forget-confirm .ld-forget-yes { border-color: var(--red, #e46b6b); }
+.ld-forget-confirm button:disabled { opacity: .5; cursor: default; }
+.ld-forget-feedback { color: var(--green, #54d18b); }
+.ld-forget-feedback.bad { color: var(--red, #e46b6b); }
+.ld-forget-feedback[hidden] { display: none; }
+
+.ld-crystal-fold { border-bottom: 1px solid rgba(255, 255, 255, .06); }
+.ld-crystal-fold > summary {
+  display: flex; align-items: baseline; gap: 9px;
+  padding: 6px 0; list-style: none; overflow-wrap: anywhere;
+}
+.ld-crystal-fold > summary::-webkit-details-marker { display: none; }
+.ld-crystal-fold > summary::before {
+  content: ''; flex: 0 0 auto; width: 0; height: 0;
+  border-top: 4px solid transparent; border-bottom: 4px solid transparent;
+  border-left: 6px solid var(--muted, #8fa0ad);
+  transform-origin: 3px 4px; transition: transform .15s ease;
+}
+.ld-crystal-fold[open] > summary::before { transform: rotate(90deg); }
+.ld-crystal-fold > summary b { flex: 0 1 auto; min-width: 0; }
+.ld-crystal-fold > summary span { min-width: 0; overflow-wrap: anywhere; }
+.ld-crystal-evidence { padding: 2px 0 10px 15px; overflow-wrap: anywhere; }
+.ld-crystal-evidence p { margin: 4px 0; }
+.ld-passage-grade { color: var(--cyan, #65c7da); }
+.ld-passage-how, .ld-passage-missing { color: var(--muted, #8fa0ad); }
+.ld-crystal-meta { max-height: 170px; }

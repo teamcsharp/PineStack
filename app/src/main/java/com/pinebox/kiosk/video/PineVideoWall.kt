@@ -1089,6 +1089,7 @@ class PineVideoWall(
                 val id = row.optString("id")
                 val url = row.optString("url")
                 if (id.isBlank() || url.isBlank()) continue
+                if (row.optBoolean("silent_picture", false)) continue
                 if (rung.contains(id) || listed.any { it.id == id }) continue
                 val secs = row.optDouble("length", row.optDouble("seconds", 0.0))
                 val file = pull(base + url, id)
