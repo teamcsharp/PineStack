@@ -22,6 +22,7 @@ class SingleClipCadenceTests(unittest.IsolatedAsyncioTestCase):
         self.stack.enter_context(mock.patch.object(app, "VOICE_MEDIA_DIR", self.root))
         self.stack.enter_context(mock.patch.object(app, "_sfx_cadence_enabled", return_value=True))
         self.stack.enter_context(mock.patch.object(app, "_SFX_CADENCE", mock.Mock(state=lambda: {"heard_units": 3})))
+        self.stack.enter_context(mock.patch.object(app, "_SFX_CADENCE_PLAN_UNITS", [3]))
         self.release = self.stack.enter_context(mock.patch.object(app, "_sfx_cadence_release"))
         self.model = self.stack.enter_context(mock.patch.object(app, "ask_model", mock.AsyncMock(side_effect=AssertionError("No model"))))
         self.tts = self.stack.enter_context(mock.patch.object(app, "voice_render_any", mock.AsyncMock(side_effect=AssertionError("No TTS"))))
@@ -97,6 +98,17 @@ class SingleClipCadenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(clip, self.clip)
         self.assertEqual(stream, {})
         self.additions.assert_not_awaited()
+
+    def test_global_cadence_includes_autonomous_non_sting_lines(self):
+        with mock.patch.object(app, "_sfx_cadence_enabled", return_value=True):
+            self.assertTrue(app._sfx_single_cadence_wanted(False, False, "manager"))
+            self.assertTrue(app._sfx_single_cadence_wanted(False, False, "station_id"))
+            self.assertFalse(app._sfx_single_cadence_wanted(False, True, "manager"))
+            self.assertFalse(app._sfx_single_cadence_wanted(False, False, "reply"))
+
+        with mock.patch.object(app, "_sfx_cadence_enabled", return_value=False):
+            self.assertFalse(app._sfx_single_cadence_wanted(False, False, "manager"))
+            self.assertTrue(app._sfx_single_cadence_wanted(True, False, "manager"))
 
 
 if __name__ == "__main__":

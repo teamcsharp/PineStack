@@ -5421,6 +5421,26 @@
   var QUEUE_ROWS_MOST = 24;
 
   function queueTrim() {
+    /* #1463: A TIMED CUE IS A PLACE IN THE DIALOGUE, NOT RUNWAY.
+     *
+     * A long recorded round publishes all of its picture cues when the
+     * audible stream starts. Eight clips spread across two minutes can
+     * therefore be in this queue even though only the first one is due in
+     * seven seconds. Counting their MEDIA lengths as thirty seconds of
+     * runway dropped from the front until only the distant cues remained.
+     * The station ledger then correctly said every MP4 aired while the
+     * tablet never showed the cues nearest the dialogue being heard.
+     *
+     * The duration cap belongs to the back-to-back endless set. Ordinary
+     * station cues already carry exact `at` stamps and the server bounds
+     * their ring; retain those in chronological order. The hard row cap is
+     * still a final memory guard, and drops the farthest future cue rather
+     * than the next one owed. */
+    var timed = queue.some(function (clip) { return clip && !clip.endless; });
+    if (timed) {
+      while (queue.length > QUEUE_ROWS_MOST) queue.pop();
+      return;
+    }
     while (queue.length > QUEUE_ROWS_MOST) queue.shift();
     var held = 0, i;
     for (i = 0; i < queue.length; i += 1) {

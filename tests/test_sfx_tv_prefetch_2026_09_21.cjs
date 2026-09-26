@@ -300,3 +300,49 @@ test('the bound is on the hold, not on the join', () => {
     'the HOLD must be share-bounded: unbounded, it re-seeks a 2s clip '
     + 'every SLIP_REST for an 0.8s start delay that never closes');
 });
+
+/* ------------------------ 4. timed dialogue cues are not endless runway */
+
+function trimQueue(clips) {
+  const queue = clips.slice();
+  const body = fn('queueTrim');
+  // eslint-disable-next-line no-new-func
+  const trim = new Function('queue', 'QUEUE_ROWS_MOST', 'QUEUE_AHEAD_S',
+    body + '\nqueueTrim(); return queue;');
+  return trim(queue, 24, 30);
+}
+
+test('a long dialogue round keeps its nearest timed MP4 cues', () => {
+  const due = Array.from({length: 8}, (_, i) => ({
+    id: 'cue-' + i,
+    at: 1000 + i * 20000,
+    seconds: 10,
+    endless: false,
+  }));
+  const kept = trimQueue(due);
+  assert.deepEqual(kept.map((clip) => clip.id), due.map((clip) => clip.id),
+    'the 30-second endless runway discarded line-timed cues from the front');
+});
+
+test('the endless set still keeps only its bounded runway', () => {
+  const endless = Array.from({length: 8}, (_, i) => ({
+    id: 'wall-' + i,
+    seconds: 10,
+    endless: true,
+  }));
+  const kept = trimQueue(endless);
+  assert.deepEqual(kept.map((clip) => clip.id), ['wall-5', 'wall-6', 'wall-7']);
+});
+
+test('the timed cue row guard discards the farthest future cue', () => {
+  const due = Array.from({length: 27}, (_, i) => ({
+    id: 'cue-' + i,
+    at: 1000 + i * 20000,
+    seconds: 2,
+    endless: false,
+  }));
+  const kept = trimQueue(due);
+  assert.equal(kept.length, 24);
+  assert.equal(kept[0].id, 'cue-0');
+  assert.equal(kept[23].id, 'cue-23');
+});

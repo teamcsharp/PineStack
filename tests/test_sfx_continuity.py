@@ -52,10 +52,17 @@ class SfxContinuityTests(unittest.IsolatedAsyncioTestCase):
         for name, value in {
             'dj_settings': mock.Mock(return_value=self.settings),
             '_SFX_CADENCE': SfxCadence(self.root / 'cadence.sqlite3'),
+            '_SFX_CADENCE_PLAN_UNITS': [0],
             '_SFX_CADENCE_STATUS': {'sample_due': 0, 'sample_omitted': 0, 'guy_due': 0,
                                     'guy_omitted': 0, 'last_sample': ''},
             '_sfx_cadence_pick': mock.Mock(return_value=self.sample),
+            '_sfx_cadence_video_pick': mock.Mock(return_value=None),
+            'sfx_video_share': mock.Mock(return_value=0),
+            'sfx_soundboard_hold_cadence': mock.Mock(return_value=False),
+            'sfx_match_on': mock.Mock(return_value=False),
+            'sfx_levelled': mock.Mock(side_effect=lambda path: path),
             'sfx_seconds': mock.Mock(return_value=.5), 'sfx_id': mock.Mock(return_value='sample'),
+            'sfx_by_id': mock.Mock(return_value=None), 'sfx_history_add': mock.Mock(),
             'sfxguy_ready_pick': mock.Mock(return_value=None), 'sfxguy_ready_commit': mock.Mock(),
             'sfxguy_ready_release': mock.Mock(), 'sfx_note_play': mock.Mock(),
             '_store_media': mock.Mock(side_effect=store), '_play_on_box': mock.AsyncMock(side_effect=box),
@@ -147,16 +154,14 @@ class SfxContinuityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(kwargs['length'], 1.5)
         self.assertEqual(app._SFX_CADENCE.state()['heard_units'], 0)
 
-    async def test_long_original_pair_keeps_its_full_audio_and_omits_optional_media(self):
+    async def test_long_original_pair_keeps_due_cadence_beyond_old_budget(self):
         for who, frequency in [('dj', 220), ('cohost', 440)]:
             audio, _ = wav_bytes(frequency, 15)
             (self.root / (who + '.wav')).write_bytes(audio)
-        self.patch('_continuity_sfx_build', mock.Mock(side_effect=AssertionError('no optional assembly needed')))
         self.assertTrue(await app.continuity_air('Long original pair'))
-        self.assertEqual([r['who'] for r in self.radio['chat']], ['dj', 'cohost'])
-        self.assertEqual(self.radio['chat'][-1]['until'], 30)
-        self.assertEqual(app._SFX_CADENCE_STATUS['sample_omitted'], 1)
-        app._continuity_sfx_build.assert_not_called()
+        self.assertEqual([r['who'] for r in self.radio['chat']], ['dj', 'cohost', 'board'])
+        self.assertGreater(self.radio['chat'][-1]['until'], 30)
+        self.assertEqual(app._SFX_CADENCE_STATUS['sample_omitted'], 0)
 
     async def test_off_air_change_during_assembly_prevents_publication(self):
         original = app._continuity_sfx_build

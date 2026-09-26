@@ -241,6 +241,8 @@ _LINE_REVIEW = LineReviewStore(data_path("line_review.sqlite3"))
 _REJECTION_LAB = RejectionLabStore(data_path("rejection_lab.sqlite3"))
 _PROMPT_LEARNING = PromptLearningStore(data_path("prompt_learning.sqlite3"))
 _SFX_CADENCE = SfxCadence(data_path("sfx_cadence.sqlite3"))
+_SFX_CADENCE_PLAN_LOCK = RLock()
+_SFX_CADENCE_PLAN_UNITS = [int(_SFX_CADENCE.state()["heard_units"])]
 _CHANGELOG = ChangeLog(Path(__file__).resolve().parent, data_path("changelog_tasks.json"))
 director_path(DATA_DIR)                 # the director's book lives here too
 _SFX_CADENCE_STATUS = {"sample_due": 0, "sample_omitted": 0,
@@ -1497,7 +1499,7 @@ DEFAULT_DJ = {
     "caller_disagree": 20, "caller_offwall": 15, "caller_plain": 15,
     "caller_carefree": 12,
     # #835: how often the SFX Guy pipes up, per host statement (0-100).
-    "sfxguy_rate": 40,
+    "sfxguy_rate": 100,
     # #1366: of the clips he draws, what share should carry a PICTURE.
     #
     # "I want a slider for the SFX guy that allows me to choose between if
@@ -1535,8 +1537,8 @@ DEFAULT_DJ = {
     "sfx_match_strength": 35,
     "sfx_video_match_dialogue": False,
     "sfx_video_match_strength": 35,
-    "sfx_every_units": 0,
-    "sfxguy_every_units": 4,
+    "sfx_every_units": 2,
+    "sfxguy_every_units": 2,
     # #799: how often what he says is a freshly WARPED invention (0-100).
     "sfxguy_warp": 35,
     # Most callers should leave the station having actually won something;
@@ -2816,8 +2818,12 @@ def validate_settings(data: Any) -> dict[str, Any]:
             "paper_hourly", DEFAULT_DJ["paper_hourly"])),
         "response_bank_target": max(16, min(256, int(raw_dj.get(
             "response_bank_target", DEFAULT_DJ["response_bank_target"]) or 64))),
-        "sfx_every_units": max(0, min(20, int(raw_dj.get("sfx_every_units", 0) or 0))),
-        "sfxguy_every_units": max(0, min(40, int(raw_dj.get("sfxguy_every_units", 4) or 0))),
+        "sfx_every_units": max(0, min(2, int(
+            raw_dj.get("sfx_every_units",
+                       DEFAULT_DJ["sfx_every_units"]) or 0))),
+        "sfxguy_every_units": max(0, min(2, int(
+            raw_dj.get("sfxguy_every_units",
+                       DEFAULT_DJ["sfxguy_every_units"]) or 0))),
         "sfx_rate": max(0.0, min(1.0, float(
             raw_dj.get("sfx_rate", DEFAULT_DJ["sfx_rate"]) or 0))),
         "fx_rate": max(0.0, min(1.0, float(
@@ -33610,6 +33616,12 @@ def speak_health() -> dict[str, Any]:
     return dict(_SPEAK_LAST)
 
 
+def _sfx_single_cadence_wanted(sting: bool, by_hand: bool, kind: str) -> bool:
+    """Apply the global cadence to every autonomous dialogue line."""
+    return (not by_hand and kind != "reply"
+            and (sting or _sfx_cadence_enabled()))
+
+
 async def _sfx_single_clip(clip: dict[str, Any], text: str, who: str,
                            voice: str, kind: str, identity: str) -> tuple[dict, dict]:
     """Append optional saved punctuation; the complete original clip survives failure."""
@@ -33624,8 +33636,9 @@ async def _sfx_single_clip(clip: dict[str, Any], text: str, who: str,
     fallback = {"length": seconds, "rows": [base]}
     additions = []
     try:
-        additions = await _sfx_cadence_additions(who, text,
-            int(_SFX_CADENCE.state().get("heard_units") or 0), seconds)
+        completed = _sfx_cadence_plan_claim()
+        additions = await _sfx_cadence_additions(
+            who, text, completed, seconds)
         if not additions:
             return clip, fallback
         paths = [str(path)] + [row["path"] for row in additions]
@@ -33982,7 +33995,12 @@ async def _dj_speak_floorless(kind: str, track: dict[str, Any] | None = None,
             # Nothing is missed (#380): it waits on the hold shelf and
             # plays the moment the box frees up — and it shows in the
             # booth NOW with a clock on it (#391).
-            if sting and not by_hand and kind != "reply":
+            # A disabled per-line sting flag suppresses legacy/random
+            # punctuation, not the operator's global every-N-lines cadence.
+            # Manager, station-id and gap-filler roads deliberately pass
+            # sting=False; excluding them here let many audible host lines
+            # spend the durable counter without ever offering the due MP4.
+            if _sfx_single_cadence_wanted(sting, by_hand, kind):
                 clip, _sfx_stream = await _sfx_single_clip(
                     clip, spoken, who, forced or "", kind, line_id)
                 if _sfx_stream:
@@ -34120,7 +34138,10 @@ async def _dj_speak_floorless(kind: str, track: dict[str, Any] | None = None,
                 spoken, forced or _event_voice("default"), engine, fx=fx,
                 who=who, line=line_id, script_index=1, script_total=1)
 
-    if clip and sting and not by_hand and kind != "reply":
+    # The station-wide cadence slider owns autonomous speech even when the
+    # producer opted out of its old one-off sting. Replies and operator-fired
+    # lines remain immediate; ordinary station dialogue is never exempt.
+    if clip and _sfx_single_cadence_wanted(sting, by_hand, kind):
         clip, _sfx_stream = await _sfx_single_clip(
             clip, spoken, who, forced or "", kind, line_id)
         if _sfx_stream:
@@ -81262,11 +81283,28 @@ def _sfx_cadence_video_pick(after: str) -> tuple[Path, Path, float, str] | None:
 
 async def _sfx_cadence_additions(who: str, text: str, completed: int,
                                 seconds: float, ready_takes=None, ready_meta=None) -> list[dict]:
+    """Plan the mandatory two-line board and SFX Guy punctuation."""
     try:
         return await _sfx_cadence_additions_inner(who, text, completed, seconds, ready_takes, ready_meta)
     except Exception as exc:  # optional media must not discard accepted speech
         pipeline_log("sfx", "optional punctuation unavailable: " + str(exc)[:160])
         return []
+
+
+def _sfx_cadence_plan_claim() -> int:
+    """Reserve one host unit so concurrent queued lines keep one cadence."""
+    with _SFX_CADENCE_PLAN_LOCK:
+        heard = int(_SFX_CADENCE.state().get("heard_units") or 0)
+        _SFX_CADENCE_PLAN_UNITS[0] = max(
+            heard, int(_SFX_CADENCE_PLAN_UNITS[0] or 0))
+        completed = _SFX_CADENCE_PLAN_UNITS[0]
+        _SFX_CADENCE_PLAN_UNITS[0] += 1
+        return completed
+
+
+def _sfx_cadence_planned_units() -> int:
+    with _SFX_CADENCE_PLAN_LOCK:
+        return int(_SFX_CADENCE_PLAN_UNITS[0] or 0)
 
 
 async def _sfx_cadence_additions_inner(who: str, text: str, completed: int,
@@ -81322,11 +81360,10 @@ async def _sfx_cadence_additions_inner(who: str, text: str, completed: int,
             (CueCandidate("video", 1.0, True), CueCandidate("audio", 1.0, False)),
             max_seconds=max(1.0, sfx_cap_seconds()), random_float=random.random,
             pick=lambda keys: keys[0], video_share=share)
-        # At 100%, the operator means MP4-only, not "prefer MP4, then use
-        # audio if the video pool is temporarily dry." Preserve the due slot
-        # and skip it when no eligible MP4 fits; never send an MP3 reaction.
-        video_only = share >= 1.0
-        requested_video = video_only or bool(direction and direction.video)
+        # #1462: the two-line cadence is a promise to put a clip in the
+        # welded round. 100% picture share means "try MP4 first", but an MP4
+        # miss may not turn a due SFX slot into silence.
+        requested_video = share >= 1.0 or bool(direction and direction.video)
         # [#1461] A BANKED ROUND HONOURS THE PICTURE SHARE TOO. Banked
         # rounds are most of the air (render is slower than speech), and
         # this used to force them audio-only whenever the endless set was
@@ -81338,18 +81375,16 @@ async def _sfx_cadence_additions_inner(who: str, text: str, completed: int,
         # behind an air cursor that ignored owed clips (#1460), not the
         # banked road.
         if not sfx_soundboard_hold_cadence():
-            video_order = ((True,) if video_only else
-                           (requested_video, not requested_video))
+            video_order = (requested_video, not requested_video)
             for want_video in video_order:
                 if want_video:
                     got = await asyncio.to_thread(_sfx_cadence_video_pick, text)
                     if got:
                         _drew += 1
                         candidate, candidate_audio, secs, candidate_why = got
-                        if fits(secs):
-                            sample, audio, duration, why = (candidate, candidate_audio,
-                                                            secs, candidate_why)
-                            break
+                        sample, audio, duration, why = (candidate, candidate_audio,
+                                                        secs, candidate_why)
+                        break
                     continue
                 if ready_takes is None and sfx_match_on(False):
                     matched = await asyncio.to_thread(sfx_match_sting_pick, text, False)
@@ -81357,7 +81392,7 @@ async def _sfx_cadence_additions_inner(who: str, text: str, completed: int,
                         candidate = Path(matched[0])
                         secs = await asyncio.to_thread(sfx_seconds, candidate)
                         _drew += 1
-                        if not sfx_is_video(candidate) and fits(secs):
+                        if not sfx_is_video(candidate):
                             levelled = await asyncio.to_thread(sfx_levelled, candidate)
                             sample, audio, duration, why = (candidate, levelled,
                                                             secs, str(matched[1] or ""))
@@ -81368,11 +81403,10 @@ async def _sfx_cadence_additions_inner(who: str, text: str, completed: int,
                         break
                     _drew += 1
                     secs = await asyncio.to_thread(sfx_seconds, candidate)
-                    if fits(secs):
-                        levelled = (candidate if ready_takes is not None
-                                    else await asyncio.to_thread(sfx_levelled, candidate))
-                        sample, audio, duration = candidate, levelled, secs
-                        break
+                    levelled = (candidate if ready_takes is not None
+                                else await asyncio.to_thread(sfx_levelled, candidate))
+                    sample, audio, duration = candidate, levelled, secs
+                    break
                 if sample:
                     break
         if sample:
@@ -81401,18 +81435,15 @@ async def _sfx_cadence_additions_inner(who: str, text: str, completed: int,
             _SFX_CADENCE_STATUS["omit_why"] = (
                 "the board was held off the cadence"
                 if sfx_soundboard_hold_cadence() else
-                "MP4-only mode: no eligible video fit this slot"
-                if video_only else
-                "nothing was drawn from the book" if not _drew else
-                "none of %d draw(s) was short enough for what was left of "
-                "the round" % _drew)
-    guy_interval = int(settings.get("sfxguy_every_units", 4) or 0)
+                "nothing was drawn from the book")
+    guy_interval = int(settings.get("sfxguy_every_units",
+                                    DEFAULT_DJ["sfxguy_every_units"]) or 0)
     if (sfx_due_after(completed, guy_interval) and settings.get("drop_voice")
             and (ready_takes is not None
                  or random.random() < float(settings.get("sfxguy_rate") or 0) / 100.0)):
         _SFX_CADENCE_STATUS["guy_due"] += 1
         take = sfxguy_ready_pick(text, str(settings["drop_voice"]))
-        if take and fits(float(take.get("seconds") or 0)):
+        if take:
             additions.append({"path": str(VOICE_MEDIA_DIR / str(take["clip"]["path"]).rsplit("/", 1)[-1]),
                               "who": "drop", "text": take["text"], "voice": take["voice"],
                               "seconds": float(take["seconds"]), "sfxguy_reservation": take["id"]})
@@ -89279,8 +89310,7 @@ def _continuity_sfx_build(audio: bytes, lengths: list[float], chosen: list[dict]
     if len(counts) != len(chosen) or sum(counts) != len(original):
         raise ValueError("Continuity offsets do not cover its original recordings")
     frames, items, spans = [], [], []
-    offset, extra_seconds = 0, 0.0
-    allowance = max(30.0, sum(lengths))
+    offset = 0
     for index, (pick, count, seconds) in enumerate(zip(chosen, counts, lengths)):
         frames.append(original[offset:offset + count])
         items.append(pick)
@@ -89294,13 +89324,12 @@ def _continuity_sfx_build(audio: bytes, lengths: list[float], chosen: list[dict]
                 pcm = decoded.stdout
                 duration = len(pcm) / 48000.0
                 cap = sample_cap if extra["who"] == "board" else 12.0
-                if (decoded.returncode or not pcm or len(pcm) % 2 or not 0 < duration <= cap
-                        or sum(lengths) + extra_seconds + duration > allowance):
+                if (decoded.returncode or not pcm or len(pcm) % 2
+                        or not 0 < duration <= cap):
                     continue
                 frames.append(pcm)
                 items.append(extra)
                 spans.append(duration)
-                extra_seconds += duration
             except Exception:
                 continue  # an unavailable optional clip cannot eat either host
     output = io.BytesIO()
@@ -89439,17 +89468,15 @@ async def continuity_air(reason: str = "") -> bool:
             return False
         audio, lengths = await asyncio.to_thread(_response_audition_build, chosen, 20.0)
         core = sum(lengths)
-        completed = int(_SFX_CADENCE.state()["heard_units"])
         for index, pick in enumerate(chosen):
+            completed = (_sfx_cadence_plan_claim()
+                         if (_sfx_cadence_enabled()
+                             and pick["who"] in ("dj", "cohost", "third", "host"))
+                         else 0)
             extra = await _sfx_cadence_additions(pick["who"], pick["text"], completed,
                 core + sum(float(row["seconds"]) for row in additions))
-            completed += int(pick["who"] in ("dj", "cohost", "third", "host"))
             for row in extra:
-                if core + sum(float(r["seconds"]) for r in additions) + row["seconds"] <= max(30.0, core):
-                    additions.append({**row, "after": index})
-                else:
-                    _sfx_cadence_release([row])
-                    _SFX_CADENCE_STATUS["sample_omitted" if row.get("sfx_sample_id") else "guy_omitted"] += 1
+                additions.append({**row, "after": index})
         if additions:
             try:
                 audio, assembled, lengths = await asyncio.to_thread(
@@ -101410,7 +101437,6 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
     # #1146: the wall-clock moment the page-road audio this round has
     # already appended will finish sounding. 0.0 until the first append.
     _paged_until = 0.0
-    _sfx_units = int(_SFX_CADENCE.state()["heard_units"])
     if render_stream and playlist:
         # #760: NOT here. This used to be `await asyncio.gather(*premade)`,
         # which waits for every turn in the round before a single one can be
@@ -101707,11 +101733,13 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                     # on booth rounds; a live caller keeps the line.
                     _keep_mic = bool(ready_takes is not None or caller_name or talk_is_incessant()
                                      or _sfx_cadence_enabled())
+                    _sfx_completed = (_sfx_cadence_plan_claim()
+                                      if (_sfx_cadence_enabled()
+                                          and item["who"] in ("dj", "cohost", "third", "host"))
+                                      else 0)
                     _extras = await _sfx_cadence_additions(
-                        item["who"], item["chunk"], _sfx_units,
+                        item["who"], item["chunk"], _sfx_completed,
                         _sfx_core_seconds + _sfx_extra_seconds, ready_takes, ready_meta)
-                    if item["who"] in ("dj", "cohost", "third", "host"):
-                        _sfx_units += 1
                     for _extra in _extras:
                         seg.append(_extra["path"])
                         _sfx_meta[len(transcript)] = _extra
@@ -101907,58 +101935,11 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
             if mixed:
                 one = _store_media(mixed, "wav")
                 length = await _clip_seconds_async(one["path"]) or 0.0
-                if (ready_takes is not None and _sfx_meta
-                        and not _ready_round_fits(str(ready_meta.get("prep_kind") or ""),
-                            ready_takes, ready_meta.get("_ready_slot"), seconds=length)
-                        and _ready_round_fits(str(ready_meta.get("prep_kind") or ""),
-                            ready_takes, ready_meta.get("_ready_slot"),
-                            seconds=_sfx_core_seconds, start_at=time.time() + 5.0)):
-                    # An unexpectedly slow join may consume the optional
-                    # allowance. Try the exact original audio once, without
-                    # sacrificing accepted dialogue to an SFX opportunity.
-                    _sfx_cadence_release(_sfx_meta.values())
-                    for optional in _sfx_meta.values():
-                        _SFX_CADENCE_STATUS["sample_omitted" if optional.get("sfx_sample_id")
-                                            else "guy_omitted"] += 1
-                    excluded = {seg_ix[index] for index in _sfx_meta}
-                    kept = [index for index in range(len(seg)) if index not in excluded]
-                    mapping = {old: new for new, old in enumerate(kept)}
-                    seg = [seg[index] for index in kept]
-                    original_rows = [index for index in range(len(transcript)) if index not in _sfx_meta]
-                    transcript = [transcript[index] for index in original_rows]
-                    seg_ix = [mapping[seg_ix[index]] for index in original_rows]
-                    turn_ix = [turn_ix[index] for index in original_rows]
-                    # #1330: AND THE NAMES, which this rebuild forgot.
-                    # `line_ids` is parallel to `transcript` and is what
-                    # `rid` is read from below - so dropping an SFX row
-                    # out of the middle of the round without dropping its
-                    # name shifted every id after it by one. The ring then
-                    # carried each line under its neighbour's id, which is
-                    # the identity `speaking_now` reports and the identity
-                    # the script matches on: the panel highlighted the
-                    # wrong line and the clip behind it belonged to
-                    # someone else. Silent, because both lists stayed the
-                    # same shape and only the PAIRING was wrong.
-                    line_ids = [line_ids[index] for index in original_rows
-                                if index < len(line_ids)]
-                    _sfx_meta = {}
-                    # #1337: the SFX rows have just been taken back out, so
-                    # this re-mix is the one that can actually match an
-                    # assembled map - the round is its scripted lines and
-                    # nothing else.
-                    beats = (production_cue_beats(ready_meta, seg_ix, len(seg))
-                             or concat_beats(len(seg)))
-                    mixed = (await asyncio.to_thread(_call_concat_blocking, seg,
-                                bool(dj_settings().get("stream_texture")), beats)
-                             if len(seg) >= 2 else Path(seg[0]).read_bytes())
-                    if not mixed:
-                        _burst_withdraw(                  # [#1300]
-                            _round_entries,
-                            "the round's lines could not be welded into "
-                            "one clip - nothing of it reached a transport")
-                        return []
-                    one = _store_media(mixed, "wav")
-                    length = await _clip_seconds_async(one["path"]) or 0.0
+                # A due two-line cadence is part of the programme, not
+                # optional slack. Let the occurrence run long instead of
+                # stripping its board clip or prepared SFX Guy take after
+                # the final mix has been measured.
+                _handoff_seconds = (_sfx_core_seconds if _sfx_meta else length)
                 if length <= 0.5:
                     _sfx_cadence_release(_sfx_meta.values())
                     # #1147: a burst whose header will not measure is not
@@ -102570,10 +102551,12 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                     if (not played_any) and (ready_takes is not None or ready_meta.get("prep_kind")) and (
                             radio_paused() or not _RADIO.get("on")
                             or not _scheduled_first_handoff_fits(
-                                ready_meta, ready_takes, length,
+                                ready_meta, ready_takes, _handoff_seconds,
                                 start_at=_pstart, exclude_key=_pl_key)
                             or (callable(can_handoff) and not can_handoff())):
-                        _burst_withdraw(_entries, _burst_refusal_why(ready_meta, length, _pstart, can_handoff))   # 2026-09-14
+                        _burst_withdraw(_entries, _burst_refusal_why(
+                            ready_meta, _handoff_seconds, _pstart,
+                            can_handoff))   # 2026-09-14
                         _sfx_cadence_release(_sfx_meta.values())
                         return []
                     if not played_any and not await _system2_repeat_rows_async(rows, ready_meta):
@@ -102649,10 +102632,12 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                             and (ready_takes is not None or ready_meta.get("prep_kind"))
                             and (radio_paused() or not _RADIO.get("on")
                                  or not _scheduled_first_handoff_fits(
-                                     ready_meta, ready_takes, length,
+                                     ready_meta, ready_takes, _handoff_seconds,
                                      exclude_key=_pl_key)
                                   or (callable(can_handoff) and not can_handoff()))):
-                        _burst_withdraw(_entries, _burst_refusal_why(ready_meta, length, None, can_handoff))   # 2026-09-14
+                        _burst_withdraw(_entries, _burst_refusal_why(
+                            ready_meta, _handoff_seconds, None,
+                            can_handoff))   # 2026-09-14
                         _sfx_cadence_release(_sfx_meta.values())
                         return []
                     if ready_meta.get("_system2") and callable(on_handoff):
@@ -141365,10 +141350,10 @@ def _director_sfx_plan(turn_count: int) -> list[dict[str, Any]]:
         return []
     try:
         settings = dj_settings()
-        every = max(1, int(settings.get("sfx_every_units") or 3))
-        guy_every = max(1, int(settings.get("sfxguy_every_units") or 5))
+        every = max(1, int(settings.get("sfx_every_units") or 2))
+        guy_every = max(1, int(settings.get("sfxguy_every_units") or 2))
     except Exception:                              # noqa: BLE001
-        every, guy_every = 3, 5
+        every, guy_every = 2, 2
     cues = []
     for after in range(every - 1, turn_count, every):
         cues.append({"after": after, "seat": "board", "who": "The SFX Guy",
@@ -153204,12 +153189,15 @@ async def sfx_stats_api(
     }
     return {"samples": samples[:200], "djs": favourites,
             "cadence": {**_SFX_CADENCE.state(), **_SFX_CADENCE_STATUS,
+                        "planned_units": _sfx_cadence_planned_units(),
                         "enabled": _sfx_cadence_enabled(),
                         "every_units": int(dj_settings().get("sfx_every_units") or 0),
-                        "guy_every_units": int(dj_settings().get("sfxguy_every_units", 4) or 0),
+                        "guy_every_units": int(dj_settings().get(
+                            "sfxguy_every_units",
+                            DEFAULT_DJ["sfxguy_every_units"]) or 0),
                         "unit": "completed recorded host sentence or reply",
                         "omission_window": "current process",
-                        "constraint": "optional media omitted when unavailable or outside the programme budget"}}
+                        "constraint": "due inserts extend the round; omission means the source was unavailable or held"}}
 
 
 SFX_SPEC_DIR = data_path("sfx_specs")
@@ -163957,9 +163945,11 @@ async def _sfx_repair_run(authorization: str | None) -> None:
             settings = load_settings()
             dj = dict(settings.get("dj") or {})
             dj["sfx"] = True
-            for key, fallback in (("sfx_every_units", 2), ("sfxguy_every_units", 4),
+            for key, fallback in (("sfx_every_units", 2), ("sfxguy_every_units", 2),
                                   ("sfxguy_rate", 100), ("sfx_video_share", 80)):
-                if int(dj.get(key) or 0) <= 0:
+                if int(dj.get(key) or 0) <= 0 or (
+                        key in ("sfx_every_units", "sfxguy_every_units")
+                        and int(dj.get(key) or 0) > fallback):
                     dj[key] = fallback
             settings["dj"] = dj
             save_settings(settings)
@@ -230999,13 +230989,13 @@ async function djBanterPanel() {
     const fx = el("div", "", "");
     fx.style.marginTop = "14px";
     fx.appendChild(el("div", "", "Stingers off the end of a line"));
-    fx.appendChild(slider("sample after every", "sfx_every_units", 0, 20,
-      dj.sfx_every_units ?? 0, (v) => v ? v + " DJ units" : "random timing").wrap);
-    fx.appendChild(slider("prepared SFX Guy after every", "sfxguy_every_units", 0, 40,
-      dj.sfxguy_every_units ?? 4, (v) => v ? v + " DJ units" : "off").wrap);
+    fx.appendChild(slider("sample after every", "sfx_every_units", 0, 2,
+      dj.sfx_every_units ?? 2, (v) => v ? v + " DJ units" : "random timing").wrap);
+    fx.appendChild(slider("prepared SFX Guy after every", "sfxguy_every_units", 0, 2,
+      dj.sfxguy_every_units ?? 2, (v) => v ? v + " DJ units" : "off").wrap);
     fx.appendChild(el("div", "muted", "A unit is one completed recorded DJ sentence or reply. "
       + "A recording with no sentence boundaries stays whole. Cadence replaces random timing; "
-      + "optional samples and prepared rhymes wait when a programme has no room."));
+      + "due samples and prepared rhymes extend the round so they stay in the programme."));
     const fxOn = el("label", "toggle", "");
     fxOn.style.cssText = "display:flex;gap:8px;align-items:center;"
       + "font-size:13px;padding:2px 0";
