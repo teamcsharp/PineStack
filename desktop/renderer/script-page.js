@@ -14994,7 +14994,11 @@
       if (el(HEADER_MENU_ID)) headerClose();
       else headerOpen(head);
     });
-    top.appendChild(head);
+    var titleRow = make('div', 'sp-script-title-row');
+    var promptDock = make('div', 'sp-prompt-dock');
+    titleRow.appendChild(head);
+    titleRow.appendChild(promptDock);
+    top.appendChild(titleRow);
     /* One line, console-shaped, directly under the heading: what is
        happening with the line that is being said. */
     var now = make('div', 'sp-now-line');
@@ -15093,7 +15097,7 @@
     promptHistory.setAttribute('aria-pressed', 'false');
     promptHistory.innerHTML = folderIcon('c:time', 'System prompt history') || 'History';
     promptHistory.addEventListener('click', function () {
-      if (root.PinePromptHistory) root.PinePromptHistory.toggle(right, promptHistory);
+      if (root.PinePromptHistory) root.PinePromptHistory.toggle(right, promptHistory, promptDock);
     });
     restore.appendChild(promptHistory);
     top.appendChild(bands);

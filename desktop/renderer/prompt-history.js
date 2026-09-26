@@ -9,7 +9,16 @@
     var b = make('button', 'ph-command ' + (cls || '')); b.type = 'button';
     b.title = label; b.setAttribute('aria-label', label);
     b.innerHTML = root.pineIcon ? root.pineIcon(icon) : label;
-    b.addEventListener('click', run); return b;
+    /* A command can live inside a <summary>.  Claim the press before the
+       summary's native disclosure toggle sees it; otherwise a tablet tap
+       opens the whole request and the icon never receives its action. */
+    ['pointerdown', 'mousedown', 'touchstart'].forEach(function (name) {
+      b.addEventListener(name, function (event) { event.stopPropagation(); }, true);
+    });
+    b.addEventListener('click', function (event) {
+      event.preventDefault(); event.stopPropagation(); run(event);
+    });
+    return b;
   }
   function textValue(value) { return typeof value === 'string' ? value : JSON.stringify(value, null, 2); }
   function detail(parent, title, value, opened) {
@@ -25,7 +34,7 @@
     try { document.execCommand('copy'); } finally { area.remove(); }
     return Promise.resolve();
   }
-  function mount(host) {
+  function mount(host, toolbarHost) {
     var panel = make('section', 'ph-panel'); panel.hidden = true;
     panel.setAttribute('aria-label', 'System prompt history'); host.appendChild(panel);
     var api = root.pineDesktop, nodes = [], before = 0, loading = false, epoch = 0;
@@ -51,7 +60,9 @@
     var notice = make('p', 'ph-notice'); notice.setAttribute('role', 'status'); var list = make('div', 'ph-calls');
     var more = make('button', 'ph-more', 'Older requests'); more.type = 'button'; more.addEventListener('click', load);
     var graph = make('div', 'ph-nodes'); graph.hidden = true;
-    panel.appendChild(bar); panel.appendChild(layout); layout.appendChild(main); layout.appendChild(sidebar);
+    if (toolbarHost) toolbarHost.appendChild(bar); else panel.appendChild(bar);
+    panel.promptBar = bar;
+    panel.appendChild(layout); layout.appendChild(main); layout.appendChild(sidebar);
     main.appendChild(notice); main.appendChild(list); main.appendChild(more); main.appendChild(graph);
     var search = make('input'); search.type = 'search'; search.placeholder = 'Filter properties'; search.setAttribute('aria-label', 'Filter prompt properties');
     var group = make('select'); group.setAttribute('aria-label', 'Property group'); var choices = make('div', 'ph-properties'), editor = make('div', 'ph-editor');
@@ -137,5 +148,5 @@
     function reset() { epoch += 1; before = 0; loading = false; records = Object.create(null); list.replaceChildren(); load(); config(); }
     panel.reload = reset; return panel;
   }
-  root.PinePromptHistory = {toggle: function (host, trigger) { var panel = host.querySelector('.ph-panel') || mount(host); panel.hidden = !panel.hidden; host.classList.toggle('ph-active', !panel.hidden); trigger.setAttribute('aria-pressed', String(!panel.hidden)); if (!panel.hidden) panel.reload(); }};
+  root.PinePromptHistory = {toggle: function (host, trigger, toolbarHost) { var panel = host.querySelector('.ph-panel') || mount(host, toolbarHost); panel.hidden = !panel.hidden; if (panel.promptBar) panel.promptBar.hidden = panel.hidden; host.classList.toggle('ph-active', !panel.hidden); trigger.setAttribute('aria-pressed', String(!panel.hidden)); if (!panel.hidden) panel.reload(); }};
 }(window));
