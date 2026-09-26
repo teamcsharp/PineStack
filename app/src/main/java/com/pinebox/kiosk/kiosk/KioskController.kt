@@ -68,12 +68,6 @@ object KioskController {
              * feel trapped.  Immersive mode still keeps the bars out of the
              * programme until an intentional edge swipe. */
             policy.setStatusBarDisabled(admin, false)
-            policy.setLockTaskFeatures(
-                admin,
-                DevicePolicyManager.LOCK_TASK_FEATURE_SYSTEM_INFO or
-                    DevicePolicyManager.LOCK_TASK_FEATURE_NOTIFICATIONS or
-                    DevicePolicyManager.LOCK_TASK_FEATURE_GLOBAL_ACTIONS,
-            )
 
             /* Never sleep while plugged in. The terminal is a wall panel;
              * a black screen reads as a dead station. */
