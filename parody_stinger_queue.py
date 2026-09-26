@@ -11,7 +11,7 @@ from pathlib import Path
 
 # An H3 request is an owed production, not a best-effort submission.  Jobs
 # therefore remain retryable until a completed gallery render proves delivery.
-TERMINAL = ("done",)
+TERMINAL = ("done", "cancelled")
 
 
 class ParodyQueue:
@@ -131,8 +131,9 @@ class ParodyQueue:
                 model=CASE WHEN ?!='' THEN ? ELSE model END,updated=?,
                 started=CASE WHEN ?='running' THEN ? ELSE started END,
                 finished=CASE WHEN ?='done' THEN ? ELSE finished END
-                WHERE id=?""", (status, reason[:500], prompt_id, prompt_id, model, model,
-                                 now, status, now, status, now, identifier))
+                WHERE id=? AND status!='cancelled'""",
+                       (status, reason[:500], prompt_id, prompt_id, model, model,
+                        now, status, now, status, now, identifier))
 
     def note(self, identifier: str, reason: str):
         with self.connect() as db:
@@ -144,8 +145,17 @@ class ParodyQueue:
         now = time.time()
         with self.connect() as db:
             db.execute("""UPDATE jobs SET status='queued',reason=?,prompt_id='',model='',
-                          updated=?,retry_at=? WHERE id=?""",
-                       (reason[:500], now, now + max(1.0, float(delay_s)), identifier))
+                          updated=?,retry_at=? WHERE id=? AND status!='cancelled'""",
+                       (reason[:500], now, now + max(0.0, float(delay_s)), identifier))
+
+    def cancel(self, identifier: str, reason: str = "Cancelled by operator"):
+        """Stop a queued or stuck production without allowing a late worker to revive it."""
+        now = time.time()
+        with self.connect() as db:
+            db.execute("""UPDATE jobs SET status='cancelled',reason=?,updated=?,finished=?,
+                          retry_at=0 WHERE id=? AND status NOT IN ('done','cancelled')""",
+                       (reason[:500], now, now, identifier))
+        return self.get(identifier)
 
     def replace_body(self, identifier: str, body: dict):
         """Persist a late-bound reference clip chosen by the worker."""

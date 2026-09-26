@@ -69,10 +69,19 @@ object KioskController {
                 ComponentName(context, MainActivity::class.java),
             )
 
-            /* The status bar cannot be pulled down at all - notifications
-             * and Quick Settings are a road off the terminal that immersive
-             * mode alone does not close. */
-            policy.setStatusBarDisabled(admin, true)
+            /* The station remains the only lock-task package, but the
+             * operator must still be able to pull down Quick Settings to
+             * pair audio hardware or leave the terminal deliberately.  The
+             * old status-bar prohibition made an otherwise healthy tablet
+             * feel trapped.  Immersive mode still keeps the bars out of the
+             * programme until an intentional edge swipe. */
+            policy.setStatusBarDisabled(admin, false)
+            policy.setLockTaskFeatures(
+                admin,
+                DevicePolicyManager.LOCK_TASK_FEATURE_SYSTEM_INFO or
+                    DevicePolicyManager.LOCK_TASK_FEATURE_NOTIFICATIONS or
+                    DevicePolicyManager.LOCK_TASK_FEATURE_GLOBAL_ACTIONS,
+            )
 
             /* Never sleep while plugged in. The terminal is a wall panel;
              * a black screen reads as a dead station. */
@@ -124,6 +133,29 @@ object KioskController {
             activity.stopLockTask()
         } catch (err: Exception) {
             Log.w(TAG, "could not leave lock task", err)
+        }
+    }
+
+    /** Reveal Android's own controls for a deliberate device action. */
+    fun showSystemBars(activity: Activity) {
+        val controller = WindowInsetsControllerCompat(activity.window, activity.window.decorView)
+        controller.show(WindowInsetsCompat.Type.systemBars())
+        controller.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_DEFAULT
+    }
+
+    /**
+     * Give the device back to Android.  Clearing the persistent HOME choice
+     * is deliberately limited to this explicit operator action; launching
+     * Pine Box again re-applies the normal wall-terminal policy.
+     */
+    fun leaveForSystem(activity: Activity) {
+        exitLockTask(activity)
+        showSystemBars(activity)
+        if (isDeviceOwner(activity)) {
+            runCatching {
+                dpm(activity).clearPackagePersistentPreferredActivities(
+                    PineDeviceAdminReceiver.component(activity), activity.packageName)
+            }.onFailure { Log.w(TAG, "could not release persistent home", it) }
         }
     }
 

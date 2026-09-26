@@ -81715,7 +81715,8 @@ def sfx_cycle_slot(real: Any) -> float:
     return max(SFX_CYCLE_SHORTEST, round(got, 2))
 SFX_CYCLE_LEAD = 1.0             # hand the set the next one this early
 _SFX_CYCLE: dict[str, Any] = {"at": 0.0, "until": 0.0, "rung": 0,
-                              "clip": "", "why": "", "shuffle_epoch": 0}
+                              "clip": "", "why": "", "shuffle_epoch": 0,
+                              "hour_marker": "", "hour_rolls": 0}
 
 
 # #1395: THE PLAYLIST, RUNG AHEAD.
@@ -82145,6 +82146,35 @@ async def sfx_video_fresh_pick(tries: int = 40) -> Any:
     return None
 
 
+def sfx_video_hourly_rebuild(now: float | None = None) -> bool:
+    """Advance the endless runway at an hour boundary without unspending its deck.
+
+    The database deck, not a short in-memory shuffle, remains the source of
+    truth.  Rebuilding the runway only removes future reservations; every
+    selection already aired stays spent in the same deck generation, so an
+    hour change cannot quietly reintroduce the clip that dominated the last
+    hour.
+    """
+    now = float(now or time.time())
+    marker = time.strftime("%Y%m%d%H", time.localtime(now))
+    previous = str(_SFX_CYCLE.get("hour_marker") or "")
+    if marker == previous:
+        return False
+    _SFX_CYCLE["hour_marker"] = marker
+    if not previous:
+        return False                         # starting the set is not a rollover
+    now_ms = int(now * 1000)
+    ring = _RADIO.setdefault("voice_clips", [])
+    ring[:] = [row for row in ring if not (
+        isinstance(row, dict) and row.get("endless")
+        and int(row.get("broadcast_ms") or row.get("ts") or 0) >= now_ms)]
+    _SFX_CYCLE["shuffle_epoch"] = int(_SFX_CYCLE.get("shuffle_epoch") or 0) + 1
+    _SFX_CYCLE["hour_rolls"] = int(_SFX_CYCLE.get("hour_rolls") or 0) + 1
+    _SFX_CYCLE.update({"queued": 0, "until": now, "why": "hourly deck refresh"})
+    pipeline_log("air", "endless video: rebuilt the unique hourly runway")
+    return True
+
+
 async def sfx_video_cycle() -> None:
     """Keep the set's queue topped up for as long as the mode is on."""
     plan: list[dict[str, Any]] = []          # what has been rung, in order
@@ -82159,6 +82189,10 @@ async def sfx_video_cycle() -> None:
                 await asyncio.sleep(3.0)
                 continue
             now = time.time()
+            if sfx_video_hourly_rebuild(now):
+                # The native wall may finish the one frame it already owns,
+                # but all subsequent offers are new, database-backed picks.
+                plan = []
             epoch = int(_SFX_CYCLE.get("shuffle_epoch") or 0)
             if epoch != plan_epoch:
                 # Shuffle owns the whole upcoming runway.  Keeping this
@@ -167251,6 +167285,66 @@ async def comfy_workshop_parody_queue(
             "admission": {"ok": admitted and live.get("up") and live.get("observed")
                           and not live.get("busy"), "why": cause,
                           "available_gb": free, "required_gb": required}}
+
+
+@app.post("/api/comfy/workshop/parody-queue/{job_id}/repair")
+async def comfy_workshop_parody_queue_repair(
+    job_id: str,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Recheck a stalled H3 production and immediately return a lost one to FIFO."""
+    require_auth(authorization)
+    queue = _parody_stinger_queue()
+    item = await asyncio.to_thread(queue.get, job_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="That stinger is no longer in the queue")
+    if item["status"] in ("done", "cancelled"):
+        return {"job": item, "say": "This stinger is already " + item["status"] + "."}
+
+    recovered = False
+    reason = "Operator requested a queue health check"
+    if item["status"] == "running" and item.get("prompt_id"):
+        generation = await asyncio.to_thread(workshop_generation, item["prompt_id"])
+        state = str((generation or {}).get("status") or "").lower()
+        if state == "done":
+            await asyncio.to_thread(queue.update, item["id"], "done", "Recovered completed H3 output")
+            return {"job": await asyncio.to_thread(queue.get, item["id"]),
+                    "say": "Recovered the completed H3 output."}
+        if state in ("failed", "error", "cancelled", "lost", "unknown"):
+            reason = str((generation or {}).get("error") or
+                         "H3 render is no longer reachable; retrying from the durable request")
+            recovered = True
+        else:
+            live = await comfy_idle_live()
+            age = max(0.0, time.time() - float(item.get("started") or item.get("updated") or 0))
+            if not live.get("busy") and age >= 45:
+                reason = "H3 no longer reports this render; retrying the durable request"
+                recovered = True
+            else:
+                return {"job": item, "say": "H3 still reports this render as active; it was not duplicated."}
+    else:
+        recovered = True
+
+    if recovered:
+        await asyncio.to_thread(queue.retry, item["id"], reason, 0)
+        _parody_stinger_wake.set()
+    job = await asyncio.to_thread(queue.get, item["id"])
+    return {"job": job, "say": "Returned the stinger to the front of the verified H3 queue."}
+
+
+@app.post("/api/comfy/workshop/parody-queue/{job_id}/cancel")
+async def comfy_workshop_parody_queue_cancel(
+    job_id: str,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_auth(authorization)
+    queue = _parody_stinger_queue()
+    item = await asyncio.to_thread(queue.get, job_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="That stinger is no longer in the queue")
+    cancelled = await asyncio.to_thread(queue.cancel, job_id)
+    _parody_stinger_wake.set()
+    return {"job": cancelled, "say": "Cancelled this stinger. It cannot be revived by a late worker."}
 
 
 def _parody_retry_delay(item: dict[str, Any], base_s: float = 12.0) -> float:

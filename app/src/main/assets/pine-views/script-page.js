@@ -1159,6 +1159,30 @@
     loop.addEventListener('click', function () { loopToggle(loop); });
     setTimeout(function () { loopRead(loop); }, 900);
 
+    /* A real deck rebuild beside the endless switch.  This keeps the
+       current frame intact and replaces only the runway, so a variety pass
+       cannot introduce a visible or audible gap. */
+    var shuffle = make('button', 'sp-btn sp-shuffle', '');
+    shuffle.title = 'Rebuild the endless-video queue from unplayed clips';
+    shuffle.setAttribute('aria-label', 'Shuffle endless video queue');
+    try {
+      if (typeof root.pineIcon === 'function') {
+        shuffle.innerHTML = root.pineIcon('m:casino', 'Shuffle endless video') || '';
+      }
+    } catch (err) { /* the title remains the control's name */ }
+    if (!shuffle.innerHTML) shuffle.textContent = 'shuffle';
+    shuffle.addEventListener('click', function () {
+      var television = root.PineSfxTv;
+      if (!television || typeof television.shuffle !== 'function') {
+        say('the endless video deck is still connecting'); return;
+      }
+      shuffle.disabled = true; shuffle.classList.add('sp-firing');
+      Promise.resolve(television.shuffle(say)).then(function () {
+        say('endless video has a new no-repeat runway');
+      }, function () { /* shuffle already printed its diagnostic */ })
+        .then(function () { shuffle.disabled = false; shuffle.classList.remove('sp-firing'); });
+    });
+
     /* #1385 (#1110): find a word that was said on the air. */
     var find = make('input', 'sp-find', '');
     find.type = 'search';
@@ -1208,6 +1232,7 @@
     bar.appendChild(topic);
     bar.appendChild(reel);                                   /* #1303 */
     bar.appendChild(loop);                                   /* #1385 */
+    bar.appendChild(shuffle);                                /* hourly deck */
     bar.appendChild(find);                                   /* #1385 */
     bar.appendChild(report);                                 /* #1115 */
     bar.appendChild(again);

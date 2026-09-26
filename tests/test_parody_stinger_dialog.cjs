@@ -90,17 +90,17 @@ test('parody trims and queues without refusing; dictation appends',
           await sliders.nth(0).evaluate(el => { el.value = '4'; el.dispatchEvent(new Event('input')); });
           await sliders.nth(1).evaluate(el => { el.value = '28'; el.dispatchEvent(new Event('input')); });
           await page.waitForFunction(() => {
-            const video = document.querySelector('.sfx-tv-parody-stage video');
+            const video = document.querySelector('.sfx-tv-parody-stage video:not(.sfx-tv-parody-primer)');
             return !video.seeking && Math.abs(video.currentTime - 2.7) < .04;
           }).catch(async error => {
-            console.log(await page.locator('.sfx-tv-parody-stage video').evaluate(v=>({time:v.currentTime,duration:v.duration,ready:v.readyState,seeking:v.seeking,error:v.error?.message})));
+            console.log(await page.locator('.sfx-tv-parody-stage video:not(.sfx-tv-parody-primer)').evaluate(v=>({time:v.currentTime,duration:v.duration,ready:v.readyState,seeking:v.seeking,error:v.error?.message})));
             throw error;
           });
-          await page.locator('.sfx-tv-parody-stage video').evaluate(video => {
+          await page.locator('.sfx-tv-parody-stage video:not(.sfx-tv-parody-primer)').evaluate(video => {
             video.dispatchEvent(new Event('waiting'));
             video.dispatchEvent(new Event('seeked'));
           });
-          assert.equal(await page.locator('.sfx-tv-parody-stage video').evaluate(video => getComputedStyle(video).visibility), 'visible');
+          assert.equal(await page.locator('.sfx-tv-parody-stage video:not(.sfx-tv-parody-primer)').evaluate(video => getComputedStyle(video).visibility), 'visible');
           const relativeMic = () => page.evaluate(() => {
             const field = document.querySelector('.sfx-tv-parody-field textarea').getBoundingClientRect();
             const mic = document.querySelector('.sfx-tv-parody-field .sfx-tv-parody-mic').getBoundingClientRect();
@@ -117,7 +117,7 @@ test('parody trims and queues without refusing; dictation appends',
             item.path === '/api/comfy/workshop')?.body);
           assert.equal(body.trim_in_s, 0.4);
           assert.equal(body.trim_out_s, 2.8);
-          assert.equal(await page.locator('.sfx-tv-parody-stage video').evaluate(el =>
+          assert.equal(await page.locator('.sfx-tv-parody-stage video:not(.sfx-tv-parody-primer)').evaluate(el =>
             getComputedStyle(el).objectFit), 'contain');
           const box = await page.locator('.sfx-tv-parody').boundingBox();
           assert.ok(box.x >= 0 && box.x + box.width <= viewport.width + 1);

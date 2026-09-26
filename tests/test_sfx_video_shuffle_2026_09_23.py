@@ -1,4 +1,5 @@
 import asyncio
+from pathlib import Path
 
 import app
 
@@ -185,3 +186,33 @@ def test_shuffle_reservations_use_visible_title_family_road(monkeypatch):
     app.sfx_video_reserve_many(["a" * 16, "b" * 16, "a" * 16])
 
     assert marked == ["a" * 16, "b" * 16]
+
+
+def test_hourly_rebuild_replaces_only_future_runway_without_unspending_deck(
+        monkeypatch):
+    actions = []
+    monkeypatch.setattr(app, "pipeline_log", lambda *args: actions.append(args))
+    monkeypatch.setattr(app.time, "strftime", lambda *_args: "next-hour")
+    monkeypatch.setattr(app, "_SFX_CYCLE", {
+        "hour_marker": "prior-hour", "shuffle_epoch": 7, "hour_rolls": 2,
+        "queued": 4, "until": 999.0,
+    })
+    monkeypatch.setattr(app, "_RADIO", {"voice_clips": [
+        {"id": "current", "endless": True, "broadcast_ms": 999},
+        {"id": "future", "endless": True, "broadcast_ms": 1000},
+        {"id": "manual", "broadcast_ms": 1001},
+    ]})
+
+    assert app.sfx_video_hourly_rebuild(1.0) is True
+    assert app._SFX_CYCLE["shuffle_epoch"] == 8
+    assert app._SFX_CYCLE["hour_rolls"] == 3
+    assert [row["id"] for row in app._RADIO["voice_clips"]] == ["current", "manual"]
+    assert actions and "hourly runway" in actions[0][1]
+
+
+def test_script_base_bar_exposes_the_endless_no_repeat_dice():
+    source = (Path(__file__).resolve().parents[1] / "desktop" / "renderer"
+              / "script-page.js").read_text(encoding="utf-8")
+    assert "Shuffle endless video queue" in source
+    assert "PineSfxTv" in source
+    assert "m:casino" in source

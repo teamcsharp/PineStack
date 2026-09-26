@@ -978,6 +978,8 @@ class MainActivity : AppCompatActivity() {
                 val jack = jackWatch?.refresh() ?: "jack watch is not running"
                 "$jack; output: ${outputRoute?.current() ?: "not available"}"
             },
+            openBluetooth = ::openBluetoothSettings,
+            exitToSystem = ::exitToSystem,
         )
         rail = built
         built.bind()
@@ -1022,6 +1024,31 @@ class MainActivity : AppCompatActivity() {
             },
         ).also { it.start() }
 
+    }
+
+    /** The rail's native escape routes.  These do not depend on the page
+     * being healthy, which matters most when a bluetooth route is needed. */
+    private fun openBluetoothSettings() {
+        KioskController.exitLockTask(this)
+        KioskController.showSystemBars(this)
+        val bluetooth = Intent(android.provider.Settings.ACTION_BLUETOOTH_SETTINGS)
+        val fallback = Intent(android.provider.Settings.ACTION_SETTINGS)
+        try {
+            startActivity(bluetooth)
+        } catch (err: ActivityNotFoundException) {
+            Log.w(TAG, "bluetooth settings unavailable; opening settings", err)
+            startActivity(fallback)
+        }
+    }
+
+    private fun exitToSystem() {
+        KioskController.leaveForSystem(this)
+        try {
+            startActivity(Intent(android.provider.Settings.ACTION_SETTINGS))
+        } catch (err: ActivityNotFoundException) {
+            Log.w(TAG, "settings unavailable while leaving kiosk", err)
+        }
+        finishAndRemoveTask()
     }
 
     /**

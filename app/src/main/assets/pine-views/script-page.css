@@ -2074,6 +2074,8 @@ button.sp-analysis-turn:hover, button.sp-analysis-turn:focus-visible { backgroun
 /* #1385: the endless-video button, lit while the set is running, and the
    word search - an input in the bar and a sheet over the view. */
 .sp-btn.sp-loop.on { border-color: #e46b6b; color: #e46b6b; box-shadow: inset 0 0 0 1px #e46b6b; }
+.sp-btn.sp-shuffle { display:inline-flex; align-items:center; justify-content:center; }
+.sp-btn.sp-shuffle .pi-icon { width:18px; height:18px; }
 .sp-find {
   flex: 1 1 120px; min-width: 90px; max-width: 260px; min-height: 36px;
   padding: 6px 10px; border: 1px solid #35414c; border-radius: 9px;

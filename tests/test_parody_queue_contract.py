@@ -39,6 +39,18 @@ class ParodyQueueContractTests(unittest.TestCase):
             self.assertEqual(queue.get(item["id"])["status"], "queued")
             self.assertIsNone(queue.next())
 
+    def test_operator_cancellation_is_terminal_even_after_a_late_worker_update(self):
+        with tempfile.TemporaryDirectory() as root:
+            queue = ParodyQueue(Path(root) / "jobs.sqlite3")
+            item = queue.add({"source": "one", "prompt": "First"})
+            queue.claim(item["id"])
+            queue.update(item["id"], "running", prompt_id="h3-late")
+            cancelled = queue.cancel(item["id"])
+            self.assertEqual(cancelled["status"], "cancelled")
+            queue.update(item["id"], "done")
+            queue.retry(item["id"], "late retry", delay_s=0)
+            self.assertEqual(queue.get(item["id"])["status"], "cancelled")
+
 
 if __name__ == "__main__":
     unittest.main()

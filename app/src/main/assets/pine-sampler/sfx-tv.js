@@ -223,6 +223,7 @@
   var parodyOwnsSurface = false;
   var parodyPolling = Object.create(null);
   var parodyQueueTimer = 0;
+  var parodyCacheRelease = null;
   var radialWrap = null;            // the shared hold menu for every video surface
   var radialMedia = null;
   var radialMediaWasPlaying = false;
@@ -1014,10 +1015,13 @@
         source_type: String(row.source_type || 'recent'),
         source_generation: String(row.source_generation || '')});
     };
+    /* The picker is a replay/examination surface first.  Rows that just
+       aired belong at its front; the durable library is only the long tail. */
+    heard.slice().reverse().forEach(add);
+    stripRows().filter(function (row) { return row.when === 'played' || row.when === 'now'; })
+      .reverse().forEach(add);
+    hist.slice().reverse().forEach(add);
     (older || []).forEach(add);
-    hist.forEach(add);
-    heard.forEach(add);
-    stripRows().forEach(add);
     add(seed);
     return source;
   }
@@ -1035,6 +1039,9 @@
     try { if (parodyDictationRelease) parodyDictationRelease(); }
     catch (err1) { /* the audio restore is best effort during teardown */ }
     parodyDictationRelease = null;
+    try { if (parodyCacheRelease) parodyCacheRelease(); }
+    catch (errCache) { /* cache cleanup never prevents close */ }
+    parodyCacheRelease = null;
     try { if (parodyVideo) { parodyVideo.pause(); parodyVideo.removeAttribute('src'); parodyVideo.load(); } }
     catch (err2) { /* already gone */ }
     parodyVideo = null;
@@ -1214,6 +1221,13 @@
     var source = document.createElement('video');
     source.controls = true; source.playsInline = true; source.preload = 'auto';
     stage.appendChild(source); parodyVideo = source;
+    /* A second, muted decoder warms the tail before the operator reaches it.
+       The visible video can then move on every trim tick without waiting for a
+       remote range request.  It never owns audio or a visible frame. */
+    var tailPrimer = document.createElement('video');
+    tailPrimer.className = 'sfx-tv-parody-primer'; tailPrimer.muted = true;
+    tailPrimer.playsInline = true; tailPrimer.preload = 'auto';
+    stage.appendChild(tailPrimer);
     var retrySource = document.createElement('button'); retrySource.type = 'button';
     retrySource.className = 'sfx-tv-source-retry'; retrySource.title = 'Play or retry reference video';
     retrySource.setAttribute('aria-label', retrySource.title);
@@ -1342,7 +1356,32 @@
             + (job.frames ? ' / ' + job.frames + ' frames' : '')
             + (duration > 0 ? ' / ' + Math.round(duration) + 's' : '')
             + (job.reason ? ' / ' + job.reason : '');
-          row.appendChild(title); row.appendChild(detail); historyRows.appendChild(row);
+          row.appendChild(title); row.appendChild(detail);
+          if (!/^(done|cancelled)$/i.test(String(job.status || ''))) {
+            var actions = document.createElement('span');
+            actions.className = 'sfx-tv-parody-queue-row-actions';
+            var repair = document.createElement('button'); repair.type = 'button';
+            repair.textContent = 'Repair'; repair.title = 'Recheck this task and retry it if H3 lost it';
+            var cancel = document.createElement('button'); cancel.type = 'button';
+            cancel.textContent = 'Cancel'; cancel.title = 'Cancel this task permanently';
+            var act = function (button, action) {
+              button.disabled = true;
+              status.textContent = action === 'cancel' ? 'Cancelling stinger...' : 'Repairing stinger...';
+              post('/api/comfy/workshop/parody-queue/' + encodeURIComponent(job.id) + '/' + action, {})
+                .then(function (got) { status.textContent = String(got && got.say || 'Queue updated.'); refreshQueue(); },
+                  function (err) { status.textContent = String((err && err.message) || err); })
+                .then(function () { button.disabled = false; });
+            };
+            repair.addEventListener('click', function () { act(repair, 'repair'); });
+            cancel.addEventListener('click', function () {
+              if (cancel.dataset.confirm !== 'yes') {
+                cancel.dataset.confirm = 'yes'; cancel.textContent = 'Cancel task?'; return;
+              }
+              act(cancel, 'cancel');
+            });
+            actions.appendChild(repair); actions.appendChild(cancel); row.appendChild(actions);
+          }
+          historyRows.appendChild(row);
           if (job.status === 'running' && job.prompt_id) parodyWatch(job.prompt_id, status);
         });
       }, function (err) {
@@ -1374,6 +1413,67 @@
     var trimById = Object.create(null);
     var trimStart = 0, trimEnd = 0, trimDuration = 0;
     var trimReady = false, trimUsable = false, submitting = false;
+    var cacheAbort = null, cacheUrl = '', cacheKey = '', cacheRevision = 0;
+    var trimSeekFrame = 0;
+    var MAX_LOCAL_REFERENCE_BYTES = 32 * 1024 * 1024;
+    var releaseCache = function () {
+      cacheRevision += 1;
+      try { if (cacheAbort) cacheAbort.abort(); } catch (err) {}
+      cacheAbort = null;
+      try { if (cacheUrl) URL.revokeObjectURL(cacheUrl); } catch (err2) {}
+      cacheUrl = ''; cacheKey = '';
+      try { tailPrimer.pause(); tailPrimer.removeAttribute('src'); tailPrimer.load(); } catch (err3) {}
+    };
+    parodyCacheRelease = releaseCache;
+    var boundedBlob = function (response) {
+      var length = Number(response.headers && response.headers.get('content-length'));
+      if (isFinite(length) && length > MAX_LOCAL_REFERENCE_BYTES) return Promise.reject(new Error('reference exceeds local cache limit'));
+      if (!response.body || !response.body.getReader) return response.blob().then(function (blob) {
+        if (blob.size > MAX_LOCAL_REFERENCE_BYTES) throw new Error('reference exceeds local cache limit');
+        return blob;
+      });
+      var reader = response.body.getReader(), chunks = [], bytes = 0;
+      return new Promise(function (resolve, reject) {
+        var read = function () { reader.read().then(function (part) {
+          if (part.done) { resolve(new Blob(chunks, {type: response.headers.get('content-type') || 'video/mp4'})); return; }
+          bytes += part.value.byteLength;
+          if (bytes > MAX_LOCAL_REFERENCE_BYTES) { try { reader.cancel(); } catch (err) {} reject(new Error('reference exceeds local cache limit')); return; }
+          chunks.push(part.value); read();
+        }, reject); };
+        read();
+      });
+    };
+    var primeTail = function (at) {
+      var url = cacheUrl || source.currentSrc || source.src;
+      if (!url || !isFinite(at)) return;
+      var seek = function () { try { tailPrimer.currentTime = Math.max(0, at); } catch (err) {} };
+      if (tailPrimer.src !== url) {
+        tailPrimer.src = url; tailPrimer.load();
+        tailPrimer.addEventListener('loadedmetadata', seek, {once:true});
+      } else if (tailPrimer.readyState >= 1) seek();
+    };
+    var cacheReference = function (row) {
+      releaseCache();
+      var url = parodySourceUrl(row), revision = cacheRevision;
+      cacheKey = String(row.id || '');
+      if (!root.fetch || /^blob:|^data:/i.test(url)) return;
+      cacheAbort = root.AbortController ? new root.AbortController() : null;
+      var opts = {cache:'force-cache'};
+      if (cacheAbort) opts.signal = cacheAbort.signal;
+      root.fetch(url, opts).then(function (response) {
+        if (!response.ok) throw new Error('reference fetch failed');
+        return boundedBlob(response);
+      }).then(function (blob) {
+        if (parodyWrap !== shade || revision !== cacheRevision || cacheKey !== String(row.id || '')) return;
+        cacheUrl = URL.createObjectURL(blob);
+        /* Keep the same visual source until metadata is known.  The local
+           replacement preserves the latest scrub target, including a target
+           selected while a network seek was still happening. */
+        var resumeAt = pendingTrimSeek !== null ? pendingTrimSeek : Number(source.currentTime) || 0;
+        source.pause(); source.src = cacheUrl; source.load(); pendingTrimSeek = resumeAt;
+        primeTail(Math.max(trimStart, trimEnd - 1) / 10);
+      }).catch(function () { /* remote playback remains a valid fallback */ });
+    };
     var trimTime = function (tenths) {
       return Math.floor(tenths / 600) + ':'
         + String(Math.floor(tenths / 10) % 60).padStart(2, '0')
@@ -1412,7 +1512,11 @@
       trimReady = true;
       send.disabled = submitting;
       showTrim();
-      if (trimUsable) source.currentTime = trimStart / 10;
+      if (trimUsable) {
+        var initial = pendingTrimSeek !== null ? pendingTrimSeek : trimStart / 10;
+        seekTrim(initial);
+        primeTail(Math.max(trimStart, trimEnd - 1) / 10);
+      }
     };
     var wanted = clipId(seed);
     for (var i = 0; i < rows.length; i += 1) if (rows[i].id === wanted) index = i;
@@ -1424,7 +1528,15 @@
     var pendingTrimSeek = null;
     var seekTrim = function (at) {
       source.pause(); pendingTrimSeek = at;
-      if (source.readyState >= 1 && !source.seeking) source.currentTime = at;
+      if (trimSeekFrame) root.cancelAnimationFrame(trimSeekFrame);
+      trimSeekFrame = root.requestAnimationFrame(function () {
+        trimSeekFrame = 0;
+        /* Assigning while seeking is intentional: it replaces the stale
+           target rather than making the trim lag one interaction behind. */
+        if (source.readyState >= 1 && pendingTrimSeek !== null) {
+          try { source.currentTime = pendingTrimSeek; } catch (err) {}
+        }
+      });
     };
     var previewWaiting = function () { stage.classList.add('is-loading'); };
     var previewReady = function () {
@@ -1465,7 +1577,9 @@
       if (!trimUsable) return;
       trimEnd = Math.max(trimStart + 22,
         Math.min(Number(outControl.slider.value), trimStart + 150, trimDuration));
-      showTrim(); seekTrim(Math.max(trimStart, trimEnd - 1) / 10);
+      showTrim();
+      var tail = Math.max(trimStart, trimEnd - 1) / 10;
+      primeTail(tail); seekTrim(tail);
     });
     source.addEventListener('play', function () {
       if (trimUsable && (source.currentTime < trimStart / 10 ||
@@ -1484,6 +1598,7 @@
       prev.disabled = index <= 0; next.disabled = index >= rows.length - 1;
       trimReady = false; trimUsable = false; trim.hidden = true;
       pendingTrimSeek = null;
+      releaseCache();
       send.disabled = true;
       previewWaiting();
       try { source.pause(); } catch (err) { /* changing source */ }
@@ -1495,6 +1610,7 @@
       }
       source.removeAttribute('poster');
       source.src = parodySourceUrl(row); source.load();
+      cacheReference(row);
     };
     prev.addEventListener('click', function () { if (index > 0) { index -= 1; paint(); } });
     next.addEventListener('click', function () { if (index + 1 < rows.length) { index += 1; paint(); } });

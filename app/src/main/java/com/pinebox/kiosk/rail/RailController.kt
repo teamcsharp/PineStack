@@ -57,6 +57,8 @@ class RailController(
     private val pageLocation: () -> String,
     private val restorePage: () -> Unit,
     private val repairAudioRoute: () -> String,
+    private val openBluetooth: () -> Unit,
+    private val exitToSystem: () -> Unit,
 ) {
 
     private val conn: TextView = rail.findViewById(R.id.railConn)
@@ -93,6 +95,10 @@ class RailController(
     private val fixGo: Button = rail.findViewById(R.id.fixGo)
     private val fixNote: TextView = rail.findViewById(R.id.fixNote)
     private var fixRunning = false
+
+    /* Native system routes stay available when the WebView itself is not. */
+    private val bluetooth: Button = rail.findViewById(R.id.deviceBluetooth)
+    private val leaveApp: Button = rail.findViewById(R.id.deviceExit)
 
     /* ---- the battery card ---- */
     private val powerCard: View = rail.findViewById(R.id.powerCard)
@@ -282,6 +288,8 @@ class RailController(
         }
 
         fixGo.setOnClickListener { reinitialise() }
+        bluetooth.setOnClickListener { openBluetooth() }
+        leaveApp.setOnClickListener { exitToSystem() }
 
         airPause.setOnClickListener {
             val want = !state.paused
