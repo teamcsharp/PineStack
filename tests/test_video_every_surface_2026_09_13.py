@@ -173,6 +173,34 @@ class ThePictureDoor(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(got["clips"], [])
         self.assertTrue(got["paused"])
 
+    async def test_picture_cues_never_enter_the_voice_audio_feed(self):
+        now_ms = int(app.time.time() * 1000)
+        self.radio["voice_clips"] = [
+            {"url": "/media/voice.wav", "ts": now_ms, "broadcast_ms": now_ms,
+             "speech": True},
+            {"url": "/sfx/clip.mp4?t=sig", "ts": now_ms + 1,
+             "broadcast_ms": now_ms, "video": True, "picture_only": True},
+        ]
+        with (mock.patch.object(app, "page_reservation_repair", return_value={}),
+              mock.patch.object(app, "low_note_rate"),
+              mock.patch.object(app, "record_bound_cut_ids", return_value=[])):
+            got = await app.dj_voice_api(since=0)
+        self.assertEqual([clip["url"] for clip in got["clips"]], ["/media/voice.wav"])
+
+    def test_picture_cues_do_not_enter_audio_reservation_recovery(self):
+        cursor = [0]
+        self.radio["voice_clips"] = [{
+            "url": "/sfx/clip.mp4?t=sig", "ts": 1000, "broadcast_ms": 9000,
+            "video": True, "picture_only": True,
+        }]
+        with (mock.patch.object(app.time, "time", return_value=10),
+              mock.patch.object(app, "page_voice_audible_recent", return_value=False),
+              mock.patch.object(app, "_PAGE_AIR_UNTIL", cursor),
+              mock.patch.object(app, "_PAGE_RESERVATION_UPDATES", {})):
+            updates = app.page_reservation_repair()
+        self.assertEqual(updates, [])
+        self.assertEqual(cursor[0], 17.0)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1231,6 +1231,7 @@
     bar.appendChild(pick);
     bar.appendChild(topic);
     bar.appendChild(reel);                                   /* #1303 */
+    bar.appendChild(sfxRepairButton());
     bar.appendChild(loop);                                   /* #1385 */
     bar.appendChild(shuffle);                                /* hourly deck */
     bar.appendChild(find);                                   /* #1385 */
@@ -2123,6 +2124,145 @@
     });
   }
 
+  function folderH3Controls(top, bridge) {
+    var saved = {enabled: true, gallery_share: 20};
+    var draft = {enabled: true, gallery_share: 20};
+    var saving = false;
+    var pending = false;
+    var section = make('div', 'sp-folder-h3');
+    section.style.cssText = 'display:grid;gap:5px;padding:9px 0;border-top:1px solid #26343d';
+    var toggleRow = make('label', 'sp-folder-h3-toggle');
+    toggleRow.style.cssText = 'display:flex;align-items:center;gap:10px;min-height:34px;color:#dfe7ee';
+    var toggle = make('input');
+    toggle.id = 'spH3HourlyEnabled'; toggle.type = 'checkbox'; toggle.disabled = true;
+    toggle.setAttribute('aria-label', 'Hourly H3 stingers');
+    toggleRow.appendChild(toggle);
+    toggleRow.appendChild(make('span', null, 'Hourly H3 stingers'));
+    section.appendChild(toggleRow);
+    var ratioRow = make('label', 'sp-folder-ratio-row');
+    ratioRow.style.cssText = 'display:flex;align-items:center;gap:10px;min-height:40px;'
+      + 'flex-wrap:wrap;color:#dfe7ee';
+    var name = make('span', 'sp-folder-ratio-name', 'H3 gallery images vs SFX clips');
+    name.style.cssText = 'flex:0 1 190px;min-width:135px;font-size:12px';
+    var slider = make('input', 'sp-folder-ratio-dial');
+    slider.id = 'spH3GalleryShare'; slider.type = 'range'; slider.min = '0';
+    slider.max = '100'; slider.step = '1'; slider.value = '20'; slider.disabled = true;
+    slider.style.cssText = 'flex:1 1 120px;min-width:80px;min-height:36px;'
+      + 'margin:0;accent-color:#65c7da';
+    slider.setAttribute('aria-label', 'Share of hourly H3 sources from gallery images');
+    var output = make('output', 'sp-folder-ratio-value', '20%');
+    output.style.cssText = 'width:42px;text-align:right;font-variant-numeric:tabular-nums';
+    ratioRow.appendChild(name); ratioRow.appendChild(slider); ratioRow.appendChild(output);
+    section.appendChild(ratioRow);
+    var status = make('div', 'sp-folder-note', 'Loading hourly H3 controls...');
+    status.id = 'spH3HourlyStatus'; status.setAttribute('role', 'status');
+    status.style.cssText = 'padding:0;color:#8ea0ad;font-size:11px';
+    section.appendChild(status); top.appendChild(section);
+
+    function share(value) {
+      value = Number(value);
+      return Number.isFinite(value) ? Math.max(0, Math.min(100, Math.round(value))) : 20;
+    }
+    function paint(state) {
+      saved.enabled = state.enabled !== false;
+      saved.gallery_share = share(state.gallery_share);
+      draft.enabled = saved.enabled; draft.gallery_share = saved.gallery_share;
+      toggle.checked = saved.enabled; slider.value = String(saved.gallery_share);
+      output.textContent = saved.gallery_share + '%';
+      toggle.disabled = false; slider.disabled = false;
+    }
+    function save() {
+      if (saving) { pending = true; return; }
+      saving = true;
+      var sent = {enabled: draft.enabled, gallery_share: draft.gallery_share};
+      status.textContent = 'Saving hourly H3 controls...';
+      Promise.resolve(bridge.post('/api/h3/hourly', sent)).then(function (state) {
+        if (!state) throw new Error('Station did not return hourly H3 controls');
+        saved.enabled = state.enabled !== false;
+        saved.gallery_share = share(state.gallery_share);
+        if (draft.enabled === sent.enabled) toggle.checked = saved.enabled;
+        if (draft.gallery_share === sent.gallery_share) {
+          slider.value = String(saved.gallery_share);
+          output.textContent = saved.gallery_share + '%';
+        }
+        saving = false;
+        if (pending) { pending = false; save(); }
+        else status.textContent = 'Hourly source mix saved: ' + (100 - saved.gallery_share)
+          + '% SFX clips / ' + saved.gallery_share + '% gallery images';
+      }).catch(function (err) {
+        pending = false;
+        Promise.resolve(bridge.get('/api/h3/hourly')).then(paint).catch(function () {
+          toggle.checked = saved.enabled; slider.value = String(saved.gallery_share);
+          output.textContent = saved.gallery_share + '%';
+        }).finally(function () {
+          saving = false;
+          status.textContent = 'Could not save hourly H3 controls: '
+            + String((err && err.message) || err);
+        });
+      });
+    }
+    toggle.addEventListener('change', function () { draft.enabled = !!toggle.checked; save(); });
+    slider.addEventListener('input', function () {
+      draft.gallery_share = share(slider.value); output.textContent = draft.gallery_share + '%';
+      if (!saving) status.textContent = 'Release slider to save H3 source mix';
+    });
+    slider.addEventListener('change', function () { draft.gallery_share = share(slider.value); save(); });
+    return Promise.resolve(bridge.get('/api/h3/hourly')).then(function (state) {
+      paint(state || {});
+      status.textContent = 'Hourly source mix: ' + (100 - saved.gallery_share)
+        + '% SFX clips / ' + saved.gallery_share + '% gallery images';
+      return state;
+    }).catch(function (err) {
+      status.textContent = 'Could not load hourly H3 controls: '
+        + String((err && err.message) || err);
+      return null;
+    });
+  }
+
+  function sfxRepairButton() {
+    var button = make('button', 'sp-btn sp-sfx-repair', '');
+    button.type = 'button';
+    button.title = 'Repair SFX Guy';
+    button.setAttribute('aria-label', 'Repair SFX Guy');
+    button.innerHTML = typeof root.pineIcon === 'function' ? root.pineIcon('c:tools', 'Repair SFX Guy') : '';
+    if (!button.innerHTML) button.textContent = 'Repair SFX';
+    button.addEventListener('click', function () { repairSfx(button); });
+    return button;
+  }
+
+  var sfxRepairBusy = false;
+  async function repairSfx(button) {
+    if (sfxRepairBusy) return;
+    sfxRepairBusy = true;
+    button.disabled = true;
+    var surface = null, shown = false;
+    try {
+      var result = await api().post('/api/sfx/repair', {});
+      var deadline = Date.now() + 125000;
+      while (true) {
+        say('SFX repair: ' + String(result.say || result.phase || 'checking'));
+        if (result.clip && !shown) {
+          shown = true;
+          if (!root.PineSfxTv || !root.PineSfxTv.repair) throw new Error('The SFX player needs an app update');
+          surface = await root.PineSfxTv.repair(result.clip);
+        }
+        if (!result.busy) break;
+        if (Date.now() > deadline) throw new Error('Repair is still running; check the station connection');
+        await new Promise(function (resolve) { setTimeout(resolve, 1000); });
+        result = await api().get('/api/sfx/repair');
+      }
+      if (result.phase === 'error') throw new Error(result.say);
+      if (surface && !surface.ok) throw new Error(surface.detail);
+      say((surface ? surface.detail + '. ' : '') + String(result.say || 'SFX settings restored'));
+    } catch (error) {
+      say('SFX repair: ' + String(error.message || error));
+      button.classList.add('sp-fired-bad');
+    } finally {
+      sfxRepairBusy = false;
+      button.disabled = false;
+    }
+  }
+
   function folderOpen() {
     if (!api() || !api().get) return;
     folderClose();
@@ -2156,6 +2296,8 @@
     hoursRow.appendChild(hours);
     top.appendChild(hoursRow);
     folderRatioControls(top, api());
+    top.appendChild(sfxRepairButton());
+    folderH3Controls(top, api());
     var pinRow = make('div', 'sp-folder-pin-row');
     var pinLine = make('div', 'sp-folder-pin', 'asking the station\u2026');
     pinLine.id = 'spFolderPin';
