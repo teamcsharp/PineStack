@@ -1699,30 +1699,8 @@ class System2Runtime:
         if text:
             self.store.record_external(text, receipt_id=receipt_id, reservation_id=proof.get("reservation_id", ""))
 
-    # #1191: how much of a finished round may already have been heard
-    # before the whole thing is held back. See repeat_allowed.
-    STALE_SHARE_ALLOWED = 0.5
-
     def repeat_allowed(self, texts, entry=None):
-        """#1191: ONE STALE LINE MAY NOT VETO A WHOLE FINISHED ROUND.
-
-        `can_play` fingerprints every line and refuses the set if ANY of
-        them was heard inside the repeat window. For a round that is
-        written, tinted and RECORDED, that is a very blunt instrument: a
-        memo from upstairs opens with the booth's stock framing ("the
-        manager is paging us again..."), and the moment that one line
-        goes out anywhere - in banter, in a different memo - every
-        manager round carrying it is held back for an hour.
-
-        Measured on the live station: the manager last aired at 04:52,
-        three lines, while 26 recorded rounds sat reachable and the air's
-        own door said it would take one. Asking for one by hand produced
-        exactly this refusal.
-
-        So the question asked is how much of the round is stale rather
-        than whether any of it is. A round that is mostly fresh goes out
-        and the repeated line rides along; a round that is mostly a
-        repeat is still refused, which is the thing the gate is for."""
+        """Apply the existing receipt-backed repeat window to every line."""
         if not self.content_gate_enabled("repetition"):
             return True
         proof = (entry or {}).get("_system2") or {}
@@ -1730,29 +1708,7 @@ class System2Runtime:
         verdict = self.store.can_play(texts, reservation_id=reservation)
         if verdict["allowed"]:
             return True
-        lines = [t for t in ([texts] if isinstance(texts, str) else list(texts))
-                 if isinstance(t, str) and t.strip()]
-        if verdict["reason"] != "heard_within_one_hour" or len(lines) < 2:
-            self.host.pipeline_log("system2", "Playback waits for unique dialogue: " + verdict["reason"])
-            return False
-        stale = 0
-        for line in lines:
-            try:
-                if not self.store.can_play([line], reservation_id=reservation)["allowed"]:
-                    stale += 1
-            except Exception:
-                stale += 1
-        if stale and stale <= int(len(lines) * self.STALE_SHARE_ALLOWED):
-            self.host.pipeline_log(
-                "system2",
-                "%d of %d lines were heard recently - the rest of the round is "
-                "fresh, so it airs rather than being held back whole (#1191)"
-                % (stale, len(lines)))
-            return True
-        self.host.pipeline_log(
-            "system2",
-            "Playback waits for unique dialogue: %s (%d of %d lines already heard)"
-            % (verdict["reason"], stale, len(lines)))
+        self.host.pipeline_log("system2", "Playback waits for unique dialogue: " + verdict["reason"])
         return False
 
     def queue_event(self, payload):

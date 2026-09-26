@@ -81224,7 +81224,8 @@ def _sfx_cadence_video_pick(after: str) -> tuple[Path, Path, float, str] | None:
         matched = sfx_match_sting_pick(after, want_video=True)
         if matched:
             path = Path(matched[0])
-            candidates.append((path, sfx_seconds(path), str(matched[1] or "")))
+            if not sfx_video_folder_recent(path.parent.name):
+                candidates.append((path, sfx_seconds(path), str(matched[1] or "")))
     banned, weights = sfx_bans(), sfx_weights()
     for _ in range(min(6, SFX_CADENCE_TRIES)):
         row = sfx_db_pick_short_video(min(12.0, sfx_cap_seconds()))
@@ -81244,6 +81245,7 @@ def _sfx_cadence_video_pick(after: str) -> tuple[Path, Path, float, str] | None:
             continue
         audio = sfx_levelled(source)
         if audio.suffix.lower() == ".wav" and audio.is_file():
+            _sfx_video_rotation_mark_clip(sfx_id(path), path.parent.name)
             return path, audio, seconds, why
     return None
 
@@ -160672,22 +160674,27 @@ def sfx_db_pick_row(video: bool = True,
 
 
 def sfx_db_pick_short_video(max_seconds: float) -> tuple[Path, float] | None:
-    """Uniform indexed draw only from videos that can fit a spoken-line cue."""
+    """Draw an unspent short video, balancing folders before clips."""
     try:
         con = sfx_db_reader()
         ceiling = max(0.5, min(12.0, float(max_seconds)))
-        where = "playable = 1 AND video = 1 AND seconds BETWEEN 0.5 AND ?"
-        args: tuple[Any, ...] = (ceiling,)
+        where = "playable = 1 AND video = 1 AND seconds BETWEEN 0.5 AND ? AND deck_cycle < ?"
+        args: tuple[Any, ...] = (ceiling, sfx_video_rotation_cycle())
         pin = sfx_pin_prefix()
         if pin:
             where += " AND path LIKE ?"
             args += (pin.replace("%", "%%") + "%",)
-        count = int(con.execute("SELECT COUNT(*) FROM clips WHERE " + where,
-                                args).fetchone()[0] or 0)
-        if not count:
+        folders = con.execute("SELECT folder, COUNT(*) FROM clips WHERE " + where +
+                              " GROUP BY folder", args).fetchall()
+        if not folders:
             return None
+        recent = set(sfx_video_recent_folders())
+        fresh = [row for row in folders if str(row[0] or "") not in recent]
+        folder, count = random.choice(fresh or folders)
+        where += " AND folder = ?"
+        args += (folder,)
         row = con.execute("SELECT path, seconds FROM clips WHERE " + where +
-                          " LIMIT 1 OFFSET ?", args + (random.randrange(count),)).fetchone()
+                          " LIMIT 1 OFFSET ?", args + (random.randrange(int(count)),)).fetchone()
         return (Path(str(row[0])), float(row[1])) if row else None
     except Exception:  # noqa: BLE001
         return None
