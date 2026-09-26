@@ -1233,6 +1233,7 @@
     bar.appendChild(pick);
     bar.appendChild(topic);
     bar.appendChild(reel);                                   /* #1303 */
+    bar.appendChild(sfxRepairButton());
     bar.appendChild(loop);                                   /* #1385 */
     bar.appendChild(shuffle);                                /* hourly deck */
     bar.appendChild(find);                                   /* #1385 */
@@ -2220,6 +2221,50 @@
     });
   }
 
+  function sfxRepairButton() {
+    var button = make('button', 'sp-btn sp-sfx-repair', '');
+    button.type = 'button';
+    button.title = 'Repair SFX Guy';
+    button.setAttribute('aria-label', 'Repair SFX Guy');
+    button.innerHTML = typeof root.pineIcon === 'function' ? root.pineIcon('c:tools', 'Repair SFX Guy') : '';
+    if (!button.innerHTML) button.textContent = 'Repair SFX';
+    button.addEventListener('click', function () { repairSfx(button); });
+    return button;
+  }
+
+  var sfxRepairBusy = false;
+  async function repairSfx(button) {
+    if (sfxRepairBusy) return;
+    sfxRepairBusy = true;
+    button.disabled = true;
+    var surface = null, shown = false;
+    try {
+      var result = await api().post('/api/sfx/repair', {});
+      var deadline = Date.now() + 125000;
+      while (true) {
+        say('SFX repair: ' + String(result.say || result.phase || 'checking'));
+        if (result.clip && !shown) {
+          shown = true;
+          if (!root.PineSfxTv || !root.PineSfxTv.repair) throw new Error('The SFX player needs an app update');
+          surface = await root.PineSfxTv.repair(result.clip);
+        }
+        if (!result.busy) break;
+        if (Date.now() > deadline) throw new Error('Repair is still running; check the station connection');
+        await new Promise(function (resolve) { setTimeout(resolve, 1000); });
+        result = await api().get('/api/sfx/repair');
+      }
+      if (result.phase === 'error') throw new Error(result.say);
+      if (surface && !surface.ok) throw new Error(surface.detail);
+      say((surface ? surface.detail + '. ' : '') + String(result.say || 'SFX settings restored'));
+    } catch (error) {
+      say('SFX repair: ' + String(error.message || error));
+      button.classList.add('sp-fired-bad');
+    } finally {
+      sfxRepairBusy = false;
+      button.disabled = false;
+    }
+  }
+
   function folderOpen() {
     if (!api() || !api().get) return;
     folderClose();
@@ -2253,6 +2298,7 @@
     hoursRow.appendChild(hours);
     top.appendChild(hoursRow);
     folderRatioControls(top, api());
+    top.appendChild(sfxRepairButton());
     folderH3Controls(top, api());
     var pinRow = make('div', 'sp-folder-pin-row');
     var pinLine = make('div', 'sp-folder-pin', 'asking the station\u2026');

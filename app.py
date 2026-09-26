@@ -29650,6 +29650,11 @@ def page_reservation_repair() -> list[dict[str, Any]]:
     cut_ms = int(_RADIO.get("voice_cut_ms") or 0)
     for clip in list(_RADIO.get("voice_clips") or []):
         did = str(clip.get("delivery_id") or "")
+        # Pictures share voice_clips only as a durable since-cursor. They
+        # have no voice reservation or delivery receipt; admitting one here
+        # both double-plays its MP4 audio and breaks recovery's delivery map.
+        if clip.get("video") or clip.get("picture_only") or not did:
+            continue
         # A pause or reboot cuts the old programme. Its future reservations
         # cannot own the clock of the new programme, even when the audio row
         # remains in history for diagnostics.
@@ -30357,6 +30362,11 @@ def page_playback_ack(payload: Any, addr: str = "",
                     _stream_now_set(list(stream["rows"]),
                                     float(stream.get("length") or 0), stamp=False)
                     _STREAM_NOW["at"] = now - position
+                    if not delivery.get("sfx_pictures_rung"):
+                        pending = [row for row in stream["rows"]
+                                   if float(row.get("until") or 0) > position]
+                        _sfx_cadence_pictures(pending, now - position)
+                        delivery["sfx_pictures_rung"] = True
             except Exception:  # noqa: BLE001
                 pass
             interval = max(float(previous.get("current_time") or position),
@@ -102578,8 +102588,6 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                         **({"ready_round": ready_meta}
                            if ready_takes is not None else {}),
                     })
-                    if page_delivery:
-                        _sfx_cadence_pictures(rows, _pstart)
                     if ready_takes is not None and page_delivery and callable(on_handoff):
                         on_handoff()
                     for _entry in _entries:
@@ -123135,6 +123143,12 @@ async def dj_voice_api(
     # stamps the same cut, so a reboot cannot straddle two schedules.
     _cut_ms = int(_RADIO.get("voice_cut_ms") or 0)
     for clip in _RADIO["voice_clips"]:
+        # Pictures have their own /api/dj/video lane. page_picture_append
+        # also stores them in voice_clips so the ring has one durable cursor;
+        # offering them here makes the MP4 soundtrack play a second time as
+        # voice audio while the video surface is already playing it.
+        if clip.get("video") or clip.get("picture_only"):
+            continue
         if int(clip.get("ts") or 0) <= int(since):
             continue
         if int(clip.get("ts") or 0) <= _cut_ms:
@@ -123262,6 +123276,7 @@ async def dj_video_api(
             continue
         out.append({**clip, "broadcast_ms": broadcast})
     return {"clips": out, "server_ms": server_ms, "cut_ms": cut_ms,
+            "reservation_updates": dict(_PAGE_RESERVATION_UPDATES),
             # [#1244] `late` is the same ring held open long enough for a
             # listener who is deliberately behind live to reach it, plus
             # the burst that says how far behind that is. The tune page
@@ -162804,7 +162819,7 @@ async def sfx_video_cue_api(
         name=pick.stem, line_id=key, length=float(seconds),
         producer="sfx_video_cue_api")
     try:
-        page_feed_append(dict(clip))
+        page_feed_append(clip)
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "clip": None,
                 "say": "the set's own ring refused it: " + type(exc).__name__}
@@ -163921,6 +163936,83 @@ async def sfx_video_cut_api(
     return {"ok": True, "clip": clip,
             "say": str(clip.get("sting") or "clip") + " is on every set"}
 
+
+
+_SFX_REPAIR_STATE: dict[str, Any] = {"busy": False, "phase": "idle", "steps": []}
+_SFX_REPAIR_TASK = None
+
+
+async def _sfx_repair_run(authorization: str | None) -> None:
+    state = _SFX_REPAIR_STATE
+    try:
+        def restore() -> dict[str, Any]:
+            settings = load_settings()
+            dj = dict(settings.get("dj") or {})
+            dj["sfx"] = True
+            for key, fallback in (("sfx_every_units", 2), ("sfxguy_every_units", 4),
+                                  ("sfxguy_rate", 100), ("sfx_video_share", 80)):
+                if int(dj.get(key) or 0) <= 0:
+                    dj[key] = fallback
+            settings["dj"] = dj
+            save_settings(settings)
+            sfx_db_kick()
+            sfx_video_kick()
+            return {"video_share": sfx_video_share(), "every_units": dj["sfx_every_units"],
+                    "guy_every_units": dj["sfxguy_every_units"], "voice": dj.get("drop_voice")}
+
+        state["settings"] = await asyncio.to_thread(restore)
+        state["steps"].append("SFX cadence and MP4 selection enabled; existing positive settings preserved")
+        if not state["settings"]["voice"]:
+            raise ValueError("Choose a voice for the SFX Guy before he can speak")
+        state["phase"] = "checking voice reserve"
+        bank = await asyncio.to_thread(_sfxguy_ready_status)
+        state["speech_ready"] = int(bank.get("ready") or 0)
+        if not state["speech_ready"]:
+            await asyncio.wait_for(sfxguy_ready_prepare(1), timeout=60)
+        state["steps"].append("SFX voice reserve checked")
+        state["phase"] = "repairing playback timing"
+        repaired = await asyncio.to_thread(page_reservation_repair)
+        state["steps"].append("Playback timing checked (%d reservations adjusted)" % len(repaired))
+        if radio_paused() or not _RADIO.get("on"):
+            state.update(phase="paused", say="Settings restored; resume the station to play SFX")
+            return
+        state["phase"] = "queuing recovery MP4"
+        result = await asyncio.wait_for(
+            sfx_video_cue_api({"who": "sfx-repair"}, authorization), timeout=30)
+        # The internal cue shares the ordinary authenticated endpoint's implementation.
+        if not result.get("clip"):
+            raise ValueError(str(result.get("say") or "No playable MP4 is available"))
+        state["clip"] = result["clip"]
+        state["steps"].append("Fresh MP4 admitted through the normal broadcast queue")
+        state["phase"] = "restoring SFX speaker"
+        try:
+            spoken = await asyncio.wait_for(sfxguy_gap_talk("operator SFX repair"), timeout=15)
+            state["speaker"] = "published" if spoken else "waiting for the broadcast floor"
+        except asyncio.TimeoutError:
+            state["speaker"] = "waiting for the broadcast floor"
+        state.update(phase="ready", say="MP4 queued; SFX Guy " + state["speaker"])
+    except Exception as exc:
+        state.update(phase="error", say=str(exc)[:240])
+    finally:
+        state.update(busy=False, finished_at=time.time())
+
+
+@app.get("/api/sfx/repair")
+async def sfx_repair_state_api(authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    require_read_auth(authorization)
+    return dict(_SFX_REPAIR_STATE)
+
+
+@app.post("/api/sfx/repair")
+async def sfx_repair_api(authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    require_auth(authorization)
+    global _SFX_REPAIR_TASK
+    if _SFX_REPAIR_TASK is not None and not _SFX_REPAIR_TASK.done():
+        return dict(_SFX_REPAIR_STATE)
+    _SFX_REPAIR_STATE.clear()
+    _SFX_REPAIR_STATE.update(busy=True, phase="starting", steps=[], started_at=time.time())
+    _SFX_REPAIR_TASK = asyncio.create_task(_sfx_repair_run(authorization))
+    return dict(_SFX_REPAIR_STATE)
 
 
 @app.get("/api/sfx/ratios")
@@ -219209,6 +219301,9 @@ async function djVoicePoll(immediate) {
     }
     clips.forEach((clip) => {
       djVoiceSeen = Math.max(djVoiceSeen, clip.ts);
+      // Video cues are owned by djVideoPoll and must never enter the
+      // alternating voice-element queue, even if an older server leaks one.
+      if (clip.video || clip.picture_only) return;
       clip.broadcastAt = Date.now() + Number(clip.broadcast_ms || clip.ts) - serverMs;
       // History can expire at join; speech accepted during listening is owed
       // in full even when a render, download or earlier call makes it late.
