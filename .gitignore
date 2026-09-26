@@ -27,3 +27,21 @@ docs/*.png
 docs/*.jpg
 docs/system2-ui-images/
 airlog_tail.jsonl
+
+# Android tablet build output and private signing material.
+*.iml
+.gradle/
+local.properties
+.idea/
+build/
+.cxx/
+captures/
+.externalNativeBuild/
+app/src/main/cpp/build-arm64/
+keys/
+*.pk8
+*.jks
+*.keystore
+*.p12
+/*.png
+/tablet-anr-*.zip

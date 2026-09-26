@@ -82,9 +82,8 @@ test('reply appends dictated text and keeps a one-shot orchestrator instruction'
 test('the live mark is unique and the strip uses the same active row', () => {
   const tick = source.split('function tick() {')[1].split('/* #1286:')[0];
   assert.match(tick, /var row = activeRow\(\)/);
-  assert.match(tick, /var shown = paintSaying\(row\)/);
-  assert.match(tick, /placeMarks\(lastDecision, fallback\)/);
   assert.match(tick, /paintSaying\(row\)/);
+  assert.match(tick, /placeMarks\(lastDecision\)/);
   const mark = source.split('function markNow(id) {')[1].split('function markRun(row) {')[0];
   assert.match(mark, /oldMarks\[m\] === same/);
   assert.match(mark, /oldMarks\[m\]\.classList\.remove\('sp-now'\)/);

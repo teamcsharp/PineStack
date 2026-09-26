@@ -87,10 +87,58 @@ def test_h3_duration_tracks_reference_or_requested_length():
     assert comfy_workshop.duration_frames(reference_s=4.9,
                                           duration_mode="double") == 241
     assert comfy_workshop.duration_frames(15) == 361
+    assert comfy_workshop.duration_frames(8, duration_mode="at_least") == 241
+    assert comfy_workshop.duration_frames(10.5, duration_mode="at_least") == 289
+    with pytest.raises(ValueError):
+        comfy_workshop.duration_frames(8, duration_mode="shorter")
     with pytest.raises(ValueError):
         comfy_workshop.duration_frames(30)
     graph = comfy_workshop.build_workflow("extended", frames=361)
     assert graph["6"]["inputs"]["length"] == 361
+
+
+def test_h3_dialogue_duration_is_padded_and_never_rounded_short():
+    wanted = {"h3_ad_speech_seconds", "h3_ad_speech_parts", "h3_ad_duration_plan"}
+    selected = [node for node in app_tree().body
+                if isinstance(node, ast.FunctionDef) and node.name in wanted]
+    namespace = {"Any": object, "math": __import__("math"),
+                 "H3_AD_WORDS_PER_SECOND": 2.2,
+                 "H3_MAX_DURATION_S": 361 / 24,
+                 "H3_MAX_REFERENCE_S": 15.0,
+                 "H3_DIALOGUE_PADDING_S": 2.0}
+    exec(compile(ast.fix_missing_locations(ast.Module(body=selected, type_ignores=[])),
+                 "app.py", "exec"), namespace)
+    plan = namespace["h3_ad_duration_plan"](
+        {"seconds": 4}, "This exact line stays intact", 8.5)
+    assert len(plan) == 1
+    assert plan[0]["duration_seconds"] == pytest.approx(10.5)
+    frames = comfy_workshop.duration_frames(
+        plan[0]["duration_seconds"], duration_mode="at_least")
+    assert frames / 24 >= 10.5
+    long_plan = namespace["h3_ad_duration_plan"](
+        {"seconds": 0}, "A measured long station line", 16)
+    assert len(long_plan) == 2
+    assert sum(part["duration_seconds"] for part in long_plan) >= 18
+
+
+def test_hourly_h3_source_mix_uses_gallery_below_configured_share():
+    node = next(node for node in app_tree().body if isinstance(node, ast.FunctionDef)
+                and node.name == "h3_hourly_reference")
+    gallery = Path("gallery-still.png")
+    namespace = {
+        "Any": object,
+        "random": SimpleNamespace(random=lambda: .5, choice=lambda rows: rows[0]),
+        "gallery_files": lambda: [gallery],
+        "h3_hourly_gallery_share": lambda: 20,
+        "voice_ad_person_clip": lambda _goal: {"id": "sfx-video", "video": True},
+    }
+    exec(compile(ast.fix_missing_locations(ast.Module(body=[node], type_ignores=[])),
+                 "app.py", "exec"), namespace)
+    choose = namespace["h3_hourly_reference"]
+    image = choose("hourly", draw=.199)
+    assert image["id"] == gallery.name
+    assert image["source_type"] == "gallery"
+    assert choose("hourly", draw=.2)["id"] == "sfx-video"
 
 
 def test_reference_window_limits_and_exact_trim():
@@ -200,6 +248,9 @@ def test_parody_worker_waits_busy_or_low_memory_then_runs_fifo(tmp_path):
         state["sends"].append(body["prompt"])
         return {"prompt_id": "ticket-" + body["prompt"], "model": "MiniMax H3"}
 
+    async def bind_reference(_queue, _item, body):
+        return body
+
     namespace = {"ParodyQueue": ParodyQueue, "asyncio": asyncio, "time": time,
                  "comfy_idle_live": live, "comfy_unload": unload,
                  "VIDEO_RENDER_FLOOR_GB": 60,
@@ -208,6 +259,8 @@ def test_parody_worker_waits_busy_or_low_memory_then_runs_fifo(tmp_path):
                      state["free"]),
                  "workshop_generation": lambda _pid: {"status": "lost"}
                      if state["lost"] else None,
+                 "_parody_retry_delay": lambda _item, base=12: float(base),
+                 "_parody_bind_deferred_reference": bind_reference,
                  "_comfy_workshop_render_payload": submit,
                  "HTTPException": type("HTTPException", (Exception,), {})}
     exec(compile(ast.fix_missing_locations(ast.Module(body=[node], type_ignores=[])),
@@ -230,11 +283,45 @@ def test_parody_worker_waits_busy_or_low_memory_then_runs_fifo(tmp_path):
     assert state["sends"] == ["first"]
     state["lost"] = True
     asyncio.run(step(queue, freed))
-    assert queue.get(first["id"])["status"] == "failed"
+    assert queue.get(first["id"])["status"] == "queued"
+    assert queue.get(first["id"])["attempts"] == 1
+    assert queue.get(first["id"])["retry_at"] > time.time()
     assert "review" in queue.get(first["id"])["reason"]
     asyncio.run(step(queue, freed))
     assert state["sends"] == ["first", "second"]
     assert queue.get(second["id"])["status"] == "running"
+
+
+def test_gallery_dialogue_queues_all_parts_against_selected_image():
+    node = next(node for node in app_tree().body if isinstance(node, ast.AsyncFunctionDef)
+                and node.name == "comfy_workshop_render")
+    node = ast.AsyncFunctionDef(name=node.name, args=node.args, body=node.body,
+                               decorator_list=[], returns=node.returns, type_comment=None)
+    bodies = []
+    class Request:
+        async def json(self):
+            return {"purpose": "parody_stinger", "mode": "reference",
+                    "source": "selected.png", "source_type": "gallery",
+                    "prompt": "Animate this image", "speech": "First second",
+                    "frames": 73}
+    class Queue:
+        def add(self, payload):
+            bodies.append(payload)
+            return {"id": str(len(bodies))}
+    namespace = {"Request": Request, "Header": lambda default=None: default,
+                 "Any": object, "require_auth": lambda *_: None,
+                 "_parody_stinger_queue": lambda: Queue(),
+                 "_parody_stinger_wake": SimpleNamespace(set=lambda: None),
+                 "h3_ad_duration_plan": lambda *_: [
+                     {"speech": "First", "duration_seconds": 15, "part": 1, "parts": 2},
+                     {"speech": "second", "duration_seconds": 8, "part": 2, "parts": 2}]}
+    exec(compile(ast.fix_missing_locations(ast.Module(body=[node], type_ignores=[])),
+                 "app.py", "exec"), namespace)
+    result = asyncio.run(namespace["comfy_workshop_render"](Request()))
+    assert result["queue_ids"] == ["1", "2"]
+    assert [body["speech"] for body in bodies] == ["First", "second"]
+    assert all(body["source"] == "selected.png" and body["source_type"] == "gallery"
+               and body["duration_mode"] == "at_least" and "frames" not in body for body in bodies)
 
 
 def test_parody_import_and_splice_leave_sources_intact(editor, tmp_path):

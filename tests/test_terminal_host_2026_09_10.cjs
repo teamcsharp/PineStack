@@ -117,3 +117,38 @@ test('a network listing survives adb being unable to list USB devices', async ()
   const result = await host.discover();
   assert.equal(result.found.length, 1, 'the network result must not be lost');
 });
+
+test('glass features reattach to an online tablet before calling it absent', async () => {
+  const host = new TerminalHost({readConfig: () => ({})});
+  let reads = 0;
+  let connected = '';
+  host.terminal = () => ({
+    devices: async () => (++reads < 2 ? [] : [
+      {serial: '10.89.1.154:5555', authorized: true}
+    ])
+  });
+  host.station = async (route) => {
+    assert.equal(route, '/api/tablet/look');
+    return {host: '10.89.1.154', port: 5555, fetching: true,
+      adb_port_open: true};
+  };
+  host.wirelessConnect = async (address, port) => {
+    connected = address + ':' + port;
+    return {ok: true};
+  };
+
+  assert.equal(await host.glassSerial(), '10.89.1.154:5555');
+  assert.equal(connected, '10.89.1.154:5555');
+});
+
+test('glass auto-attach refuses a remembered tablet without a live heartbeat', async () => {
+  const host = new TerminalHost({readConfig: () => ({})});
+  let connects = 0;
+  host.terminal = () => ({devices: async () => []});
+  host.station = async () => ({host: '10.89.1.154', port: 5555,
+    fetching: false, adb_port_open: true});
+  host.wirelessConnect = async () => { connects += 1; return {ok: true}; };
+
+  assert.equal(await host.glassSerial(), '');
+  assert.equal(connects, 0);
+});

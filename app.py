@@ -39,6 +39,11 @@ from starlette.background import BackgroundTask
 import httpx
 from station_flow import FlowJournal
 from script_report_store import ScriptReportStore, REPORT_NAME as SCRIPT_REPORT_NAME
+from sfx_cue import CueCandidate, choose_due_cue
+from sfx_reaction import COMPLAINT_LINES, complaint_due
+from news_dossier import fetch_service as fetch_news_dossier, public_url as news_public_url
+from line_blacklist import Blacklist
+from changelog import ChangeLog
 from line_review import LineReviewStore, ReviewConflictError
 from rejection_lab import RejectionLabStore
 from rejection_lab_runtime import LabRuntime
@@ -66,7 +71,7 @@ try:                                              # [#1252]
     from pine_qr import qr_svg as _qr_svg
 except Exception:                                 # noqa: BLE001
     _qr_svg = None
-from segment_contract import ad_sale_evidence
+from segment_contract import WORDS_PER_MINUTE, ad_sale_evidence, normalize_role
 from store_retention import retention_sweep, store_sizes
 import station_modifiers                 # #1169/#1170: the modifier desk
 import segment_prompts                   # [#1195] the segment prompt book: alternatives, modes, - speaker box -
@@ -74,6 +79,8 @@ import paperwork_fields                  # [#1231] the inspector's editable boxe
 import track_talk_segment                # #1179: a record's talk desk
 import record_binding                    # #1237: a line bound to a record airs with it
 import phrase_trace
+import line_repeat
+import prompt_history
 import word_cause_edits
 import clip_speech
 import comfy_workshop
@@ -102,13 +109,17 @@ from caller_topic import (  # [#1240/#1249] the storyline as direction, the call
     topic_contract_clause,
     fallback_call_script as _topic_fallback_call_script,
     SKELETON_TELL as _TOPIC_SKELETON_TELL)
+from call_scenarios import (call_aired_conclusion_report, call_conclusion_report,
+                            call_path_draw,
+                            call_scenario_clause, load_scenario_catalog,
+                            save_scenario_catalog, select_call_scenario)
 from response_bank import ResponseBank, add_listening_responses
 from rap_battle import (COMBATANTS as RAP_COMBATANTS, RapBattle,
                         SEAT_NAMES as RAP_SEAT_NAMES)
 from sfx_cadence import SfxCadence, due_after as sfx_due_after
 # The broadcast stream (#1253): one URL, one socket, the mix made here.
 # station_stream.py carries why the tune page cannot do this in a car.
-from station_stream import StationStream, icy_block
+from station_stream import HLS_START_SEGMENTS, StationStream, icy_block
 import library
 import library_extract
 # What the prompts may no longer carry - see prompt_cuts.py for why a cut is
@@ -230,6 +241,7 @@ _LINE_REVIEW = LineReviewStore(data_path("line_review.sqlite3"))
 _REJECTION_LAB = RejectionLabStore(data_path("rejection_lab.sqlite3"))
 _PROMPT_LEARNING = PromptLearningStore(data_path("prompt_learning.sqlite3"))
 _SFX_CADENCE = SfxCadence(data_path("sfx_cadence.sqlite3"))
+_CHANGELOG = ChangeLog(Path(__file__).resolve().parent, data_path("changelog_tasks.json"))
 director_path(DATA_DIR)                 # the director's book lives here too
 _SFX_CADENCE_STATUS = {"sample_due": 0, "sample_omitted": 0,
                        "guy_due": 0, "guy_omitted": 0, "last_sample": ""}
@@ -1303,6 +1315,12 @@ DEFAULT_DJ = {
     # Advertise the images you have generated: "this painting of X is for
     # sale…" with a made-up price.
     "gallery_ads": True,
+    # The hourly H3 video stinger. The scheduler has its own durable
+    # once-per-hour marker below; this is only the operator's on/off switch.
+    "h3_hourly_ads": True,
+    # Automatic H3 stingers use gallery stills this often; the remainder use
+    # the SFX Guy's durable shuffled video deck.
+    "h3_gallery_share": 20,
     "ad_price_low": 40,
     "ad_price_high": 900,
     # Look up what people say about a track before introducing it.
@@ -2459,6 +2477,11 @@ def validate_settings(data: Any) -> dict[str, Any]:
             raw_dj.get("episode_minutes", DEFAULT_DJ["episode_minutes"])
             or 0))),
         "gallery_ads": bool(raw_dj.get("gallery_ads", True)),
+        "h3_hourly_ads": bool(raw_dj.get("h3_hourly_ads", True)),
+        "h3_gallery_share": max(0, min(100, int(
+            raw_dj.get("h3_gallery_share", DEFAULT_DJ["h3_gallery_share"])
+            if raw_dj.get("h3_gallery_share") is not None else
+            DEFAULT_DJ["h3_gallery_share"]))),
         "ad_price_low": max(1, int(
             raw_dj.get("ad_price_low") or DEFAULT_DJ["ad_price_low"])),
         "ad_price_high": max(2, int(
@@ -6150,6 +6173,9 @@ async def _track_generation(prompt_id: str, started_at: float | None = None,
                 aired_files=aired_files)
             if aired_files:
                 fire_and_forget(_sfx_pool_refresh())
+                for filename in aired_files:
+                    identifier = sfx_id(SFX_ADS_DIR / filename)
+                    fire_and_forget(gen_ads_broadcast(identifier, who="listener"))
             await announce_render_complete()
             # [#1285] H3 keeps ~46 GB resident. Hand it back as soon as the
             # clip lands IF the box is tight - but stay warm when there is
@@ -6214,6 +6240,10 @@ async def reconcile_generations() -> dict[str, int]:
                         aired_files=aired_files)
                     if aired_files:
                         fire_and_forget(_sfx_pool_refresh())
+                        for filename in aired_files:
+                            identifier = sfx_id(SFX_ADS_DIR / filename)
+                            fire_and_forget(gen_ads_broadcast(identifier,
+                                                               who="listener"))
                     counts["finished"] += 1
                 elif pid in queued_ids:
                     fire_and_forget(_track_generation(
@@ -6794,6 +6824,106 @@ async def comfy_idle_state() -> dict[str, Any]:
             "why": _comfy_idle.explain(doc, live),
             "log": (doc.get("log") or [])[-12:],
             "renders": (doc.get("renders") or [])[-12:]}
+
+
+H3_MEMORY_RESERVE_GB = float(os.getenv("H3_MEMORY_RESERVE_GB", "60"))
+
+
+def h3_release_stale_ollama_jobs(max_age_s: float = 600.0) -> list[str]:
+    """Drop only bookkeeping for Ollama calls that exceeded their hard timeout.
+
+    `ask_ollama` normally clears this registry in a `finally` block and uses a
+    180-second HTTP timeout.  A killed coroutine used to leave a stale marker
+    here forever, which in turn made H3 treat an idle model as protected.
+    """
+    now = time.time()
+    released: list[str] = []
+    for identity, row in list(_OLLAMA_JOBS.items()):
+        age = now - float((row or {}).get("at") or now)
+        if age < max_age_s:
+            continue
+        dropped = _OLLAMA_JOBS.pop(identity, None)
+        if dropped:
+            released.append(str(dropped.get("model") or "writer model"))
+    return released
+
+
+async def h3_capacity_relief(reason: str, force: bool = False) -> dict[str, Any]:
+    """Return idle memory to H3 without interrupting work that is active.
+
+    GB10 memory is shared between ComfyUI, Ollama and the voice engines.  A
+    video request therefore cannot be rescued by only asking ComfyUI to drop
+    a cache; an idle writer model can be the missing 10-20 GB.  This routine
+    is used both by the visible H3 queue and the background reserve keeper.
+    """
+    target = max(H3_MEMORY_RESERVE_GB, float(VIDEO_RENDER_FLOOR_GB))
+    before = comfy_host_available_gb()
+    actions: list[str] = []
+    live = await comfy_idle_live()
+    if live.get("busy"):
+        return {"ok": False, "available_gb": before, "required_gb": target,
+                "actions": actions,
+                "why": "ComfyUI is actively rendering; its work is protected"}
+    if before is not None and before >= target and not force:
+        return {"ok": True, "available_gb": before, "required_gb": target,
+                "actions": actions, "why": "H3 reserve is already available"}
+
+    stale_jobs = h3_release_stale_ollama_jobs()
+    if stale_jobs:
+        actions.append("released stale Ollama bookkeeping for " +
+                       ", ".join(stale_jobs[:3]))
+
+    # First ask ComfyUI to unload its own caches.  A broken /free endpoint is
+    # recorded, then the Ollama relief below still gives the request a path.
+    try:
+        freed = await comfy_unload("free", live.get("idle_seconds") or 0,
+                                   reason)
+        actions.append("ComfyUI cache: " + str(freed.get("why") or "checked"))
+    except Exception as exc:  # noqa: BLE001
+        actions.append("ComfyUI cache: " + type(exc).__name__)
+
+    # Never evict a model while the station is actively calling Ollama.  When
+    # the lane is quiet, H3 has priority over warm idle chat models; the
+    # station will reload one on its next turn.
+    if not _OLLAMA_JOBS:
+        try:
+            async with httpx.AsyncClient(timeout=45) as client:
+                response = await client.get(f"{OLLAMA_URL}/api/ps")
+                response.raise_for_status()
+                models = (response.json() or {}).get("models") or []
+                for row in models:
+                    name = str((row or {}).get("name") or "").strip()
+                    # The embedding model is tiny and shared with the vector
+                    # shelf, so keeping it warm buys more than it costs.
+                    if not name or name.startswith("nomic-"):
+                        continue
+                    response = await client.post(
+                        f"{OLLAMA_URL}/api/generate",
+                        # Ollama requires a prompt for this request to be
+                        # portable across versions. An empty prompt unloads
+                        # the idle model without generating a token.
+                        json={"model": name, "prompt": "", "stream": False,
+                              "keep_alive": 0})
+                    response.raise_for_status()
+                    actions.append("released idle Ollama model " + name)
+                    await asyncio.sleep(0.4)
+                    now = comfy_host_available_gb()
+                    if now is not None and now >= target:
+                        break
+        except Exception as exc:  # noqa: BLE001
+            actions.append("Ollama relief: " + type(exc).__name__)
+    else:
+        actions.append("Ollama relief deferred while the station is writing")
+
+    await asyncio.sleep(1)
+    after = comfy_host_available_gb()
+    ok = after is not None and after >= target
+    why = ("H3 reserve is ready" if ok else
+           "waiting for %.1f GB more free memory" % max(0.0, target - float(after or 0)))
+    pipeline_log("gpu", "H3 capacity relief: %s (%s)" %
+                 (why, "; ".join(actions) or "nothing idle to release"))
+    return {"ok": ok, "available_gb": after, "required_gb": target,
+            "actions": actions, "why": why}
 
 
 
@@ -8401,7 +8531,8 @@ async def _submit_generation(
     # bookkeeping fields above with arbitrary metadata.
     for key in ("mode", "source", "source_type", "speech", "purpose", "air_it",
                 "frames", "steps", "seed", "at_share", "variant_of",
-                "source_generation", "trim_in_s", "trim_out_s"):
+                "source_generation", "duration_mode", "duration_seconds",
+                "sequence_part", "sequence_parts", "trim_in_s", "trim_out_s"):
         if metadata and key in metadata:
             rec[key] = metadata[key]
     append_generation(rec)
@@ -8520,6 +8651,309 @@ async def comfyui_generate(
         "so they know exactly what was requested. It will appear in the "
         f"PineBox gallery when finished.{took}"
     )
+
+
+# A spoken "make an ad" is a distinct video production request, not merely a
+# generic image/video prompt. It keeps one short follow-up alive for the box
+# and Nabu, whose conversation transports do not always return history.
+VOICE_AD_COMMAND = re.compile(
+    r"\b(?:make|create|generate|produce|render)\b(?:\s+me)?\s+"
+    r"(?:an?\s+)?ad\b", re.IGNORECASE)
+VOICE_AD_PENDING: dict[str, float] = {"until": 0.0}
+
+
+def voice_ad_goal(text: Any) -> str | None:
+    """Return the requested ad direction, empty for an explicit bare ad."""
+    said = " ".join(str(text or "").split())[:1800]
+    found = VOICE_AD_COMMAND.search(said)
+    if not found:
+        return None
+    tail = said[found.end():].strip(" .,:;-\u2014")
+    tail = re.sub(r"^(?:about|for|of|with)\s+", "", tail, flags=re.I)
+    return tail[:1200]
+
+
+def voice_ad_spoken_copy(goal: str) -> str:
+    """Pull the actual requested copy out of an ordinary spoken direction."""
+    found = re.search(r"\b(?:saying|say|yelling|shouting|announcing|"
+                      r"declaring|with(?:\s+the)?\s+(?:line|words?))\s+"
+                      r"[\"']?(.+?)\s*$", str(goal or ""), re.I)
+    if found:
+        return found.group(1).strip(" \"'.")[:800]
+    # Quoted wording in an ad request is normally the desired performance,
+    # even when the operator does not preface it with "say" or "yell".
+    return comfy_workshop.quoted_speech(goal)
+
+
+H3_MAX_DURATION_S = max(comfy_workshop.FRAME_CHOICES) / 24.0
+H3_MAX_REFERENCE_S = 15.0
+H3_AD_WORDS_PER_SECOND = 2.2
+H3_DIALOGUE_PADDING_S = 2.0
+
+
+def h3_ad_speech_seconds(speech: str) -> float:
+    """Budget natural speech plus a little room for the first and last beat."""
+    words = len(str(speech or "").split())
+    return (words / H3_AD_WORDS_PER_SECOND + 1.25) if words else 0.0
+
+
+def h3_ad_speech_parts(speech: str, count: int) -> list[str]:
+    """Split long exact copy across consecutive H3 clips without word loss."""
+    words = str(speech or "").split()
+    if not words:
+        return [""] * max(1, count)
+    count = max(1, min(int(count), len(words)))
+    size = math.ceil(len(words) / count)
+    return [" ".join(words[index:index + size])
+            for index in range(0, len(words), size)]
+
+
+def h3_ad_duration_plan(
+    clip: dict[str, Any], speech: str, dialogue_seconds: Any = None,
+) -> list[dict[str, Any]]:
+    """Return serial H3 parts that cover the reference and every spoken word.
+
+    H3 safely renders at most fifteen seconds per pass. Longer references or
+    spoken copy are deliberately split into adjacent stations clips rather
+    than shortening one of them. The queue is FIFO, so a plan's parts are
+    submitted in order before later ad requests.
+    """
+    try:
+        source_s = max(0.0, float(clip.get("seconds") or 0.0))
+    except (TypeError, ValueError):
+        source_s = 0.0
+    try:
+        measured_s = max(0.0, float(dialogue_seconds or 0.0))
+        if not math.isfinite(measured_s):
+            measured_s = 0.0
+    except (TypeError, ValueError):
+        measured_s = 0.0
+    speech_s = h3_ad_speech_seconds(speech)
+    padded_dialogue_s = (measured_s + H3_DIALOGUE_PADDING_S
+                         if measured_s else 0.0)
+    target_s = max(3.0, source_s, speech_s, padded_dialogue_s)
+    count = max(1, math.ceil(speech_s / H3_MAX_DURATION_S),
+                math.ceil(source_s / H3_MAX_REFERENCE_S),
+                math.ceil(padded_dialogue_s / H3_MAX_DURATION_S))
+    speech_parts = h3_ad_speech_parts(speech, count)
+    # A short sequence can have fewer text parts than visual parts. Keep the
+    # remaining visual parts silent rather than repeating a line.
+    speech_parts += [""] * (count - len(speech_parts))
+    plan: list[dict[str, Any]] = []
+    for index in range(count):
+        remaining_s = max(0.0, target_s - index * H3_MAX_DURATION_S)
+        output_s = min(H3_MAX_DURATION_S, max(3.0, remaining_s,
+                                               h3_ad_speech_seconds(speech_parts[index])))
+        part: dict[str, Any] = {"duration_seconds": output_s,
+                                "speech": speech_parts[index],
+                                "part": index + 1, "parts": count}
+        # Full references under H3's maximum can be supplied unchanged. For
+        # longer sources each H3 pass gets its own contiguous reference window.
+        if source_s > H3_MAX_REFERENCE_S:
+            end = min(source_s, (index + 1) * H3_MAX_REFERENCE_S)
+            start = min(index * H3_MAX_REFERENCE_S, max(0.0, source_s - 2.2))
+            if end - start < 2.2:
+                start = max(0.0, end - 2.2)
+            part.update({"trim_in_s": start, "trim_out_s": end,
+                         "duration_seconds": max(output_s, end - start)})
+        plan.append(part)
+    return plan
+
+
+def voice_ad_person_clip(goal: str) -> dict[str, Any]:
+    """Choose a fresh MP4 through the station's durable shuffled deck.
+
+    Hourly prompts are deliberately similar, so the old eight-result semantic
+    shortlist kept circling the same source. The shared deck spends the clip,
+    its duplicate/title family and recent folder, and survives restarts.
+    Generated H3 ads are excluded so a render cannot become its own source.
+    """
+    for attempt in range(2):
+        try:
+            deck_pick = sfx_db_pick_rotation_row(
+                True, excluded_folders=("sfx_ads",))
+            if deck_pick:
+                path, seconds = deck_pick
+                if path and sfx_is_video(path) and float(seconds or 0) >= 1.0:
+                    identifier = sfx_id(path)
+                    _sfx_video_rotation_mark_clip(identifier)
+                    return {"id": identifier, "name": path.stem[:120],
+                            "seconds": round(float(seconds), 2), "video": True,
+                            "match": "durable shuffled video deck"}
+            if attempt == 0 and sfx_video_rotation_reset():
+                continue
+        except Exception:  # noqa: BLE001
+            pass
+        break
+
+    # Degraded fallback while the durable book is rebuilding. Reserve every
+    # fallback choice through the same deck before handing it to H3.
+    context = "person people human face speaking dialogue character voice commercial advertisement"
+    picked: list[tuple[Any, float, Any]] = []
+    try:
+        ranked = sfx_match_score(str(goal or ""), context, video=True,
+                                 floor=0.0, limit=48)
+        for path, seconds, candidate in sfx_match_rows(ranked, most=48):
+            if path and sfx_is_video(path) and float(seconds or 0) >= 1.0:
+                picked.append((path, float(seconds or 0), candidate))
+    except Exception:  # noqa: BLE001
+        picked = []
+    if picked:
+        path, seconds, candidate = random.choice(picked[:min(8, len(picked))])
+        identifier = sfx_id(path)
+        _sfx_video_rotation_mark_clip(identifier)
+        return {"id": identifier, "name": path.stem[:120],
+                "seconds": round(seconds, 2), "video": True,
+                "match": str(getattr(candidate, "folder", "indexed clip"))[:120]}
+    try:
+        con = sfx_db_reader()
+        with _SFX_DB_LOCK:
+            rows = con.execute(
+                "SELECT sid,name,seconds,folder FROM clips "
+                "WHERE playable=1 AND video=1 AND length(trim(COALESCE(said,''))) >= 6 "
+                "ORDER BY seen_at DESC LIMIT 240").fetchall()
+        if rows:
+            row = random.choice(rows[:min(80, len(rows))])
+            identifier = str(row[0] or "")
+            _sfx_video_rotation_mark_clip(identifier, str(row[3] or ""))
+            return {"id": identifier, "name": str(row[1] or "clip")[:120],
+                    "seconds": round(float(row[2] or 0), 2), "video": True,
+                    "match": str(row[3] or "speech-indexed clip")[:120]}
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        fallback = sfx_db_pick_short_video(12.0) or sfx_db_pick_row(True)
+        if fallback:
+            path, seconds = fallback
+            if path and sfx_is_video(path):
+                identifier = sfx_id(path)
+                _sfx_video_rotation_mark_clip(identifier)
+                return {"id": identifier, "name": path.stem[:120],
+                        "seconds": round(float(seconds or 0), 2), "video": True,
+                        "match": "short MP4 fallback while dialogue matching is unavailable"}
+    except Exception:  # noqa: BLE001
+        pass
+    return {}
+
+
+def h3_hourly_gallery_share() -> int:
+    """Share of automatic H3 sources drawn from the Comfy gallery."""
+    try:
+        value = dj_settings().get("h3_gallery_share", 20)
+        return max(0, min(100, int(value if value is not None else 20)))
+    except Exception:  # noqa: BLE001
+        return 20
+
+
+def h3_hourly_reference(goal: str, draw: float | None = None) -> dict[str, Any]:
+    """Draw an automatic H3 source from the configured gallery/SFX mix."""
+    chance = random.random() if draw is None else max(0.0, min(1.0, float(draw)))
+    if chance < h3_hourly_gallery_share() / 100.0:
+        try:
+            images = gallery_files()
+            if images:
+                path = random.choice(images)
+                return {"id": path.name, "name": path.stem[:120],
+                        "seconds": 0.0, "image": True,
+                        "source_type": "gallery",
+                        "match": "random Pine Box gallery image"}
+        except Exception:  # noqa: BLE001
+            pass
+    return voice_ad_person_clip(goal)
+
+
+async def voice_ad_render(
+    goal: str, reference_clip: dict[str, Any] | None = None,
+    spoken_copy: str = "", trim_in_s: Any = None, trim_out_s: Any = None,
+    dialogue_seconds: Any = None, automatic: bool = False,
+) -> tuple[str, dict[str, Any]]:
+    """Submit an H3 reference ad and leave a discoverable gallery record."""
+    # A replayed MP4 is an explicit creative reference, not merely another
+    # candidate in the random shelf.  Audio-only replays still use the
+    # dialogue-capable video picker because H3 needs a visible performer.
+    explicit_reference = bool(
+        reference_clip and reference_clip.get("id") and
+        (reference_clip.get("video") or reference_clip.get("image") or
+         reference_clip.get("source_type") in {"clip", "gallery", "generation"}))
+    clip = (dict(reference_clip or {}) if explicit_reference else
+            await asyncio.to_thread(h3_hourly_reference, goal) if automatic else
+            await asyncio.to_thread(voice_ad_person_clip, goal))
+    # The stinger desk can send an explicit line separately from the visual
+    # direction.  Keep it separate all the way to compose_prompt(), where H3
+    # receives it in the exact <d> dialogue contract rather than as an
+    # ambiguous sentence inside the scene direction.
+    copy = " ".join(str(spoken_copy or "").split())[:700]
+    if not copy:
+        copy = voice_ad_spoken_copy(goal)
+
+    selected_trim: tuple[float, float] | None = None
+    if trim_in_s is not None or trim_out_s is not None:
+        if not clip.get("id") or not clip.get("video"):
+            raise ValueError("A source range needs a replayed video clip")
+        try:
+            trim_start, trim_length = comfy_workshop.reference_window(
+                float(clip.get("seconds") or 0.0), trim_in_s=trim_in_s,
+                trim_out_s=trim_out_s)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(str(exc)) from exc
+        selected_trim = (trim_start, trim_start + trim_length)
+        # Duration planning must follow the piece the operator selected, not
+        # the full source that surrounds it.
+        clip["source_seconds"] = clip.get("seconds")
+        clip["seconds"] = trim_length
+    direction = ("Create a polished short Pine Box advertisement from the "
+                 "reference performance. The person or people on screen must "
+                 + str(goal or "deliver the ad")
+                 + ". Keep expressive natural motion, direct-to-camera commercial "
+                 "energy, and clean synchronized dialogue. No captions or logos.")
+    # H3 is a durable station workload.  Do not turn a temporary memory
+    # shortage into a lost listener request: the capacity keeper will make
+    # room and this FIFO submits it as soon as the engine can accept it.
+    deferred_reference = not bool(clip.get("id"))
+    plan = h3_ad_duration_plan(clip, copy, dialogue_seconds)
+    jobs = []
+    for part in plan:
+        continuation = (" This is part %d of %d. Keep the performance continuous "
+                        "and say only the exact dialogue provided for this part."
+                        % (part["part"], part["parts"])) if part["parts"] > 1 else ""
+        jobs.append(await asyncio.to_thread(_parody_stinger_queue().add, {
+            "mode": "reference", "source": str(clip.get("id") or ""),
+            # The SFX shelf can be rebuilding while a listener asks for an ad.
+            # Preserve the request and let the worker bind a qualified MP4 later.
+            "source_type": ("deferred_hourly_reference" if automatic else
+                            "deferred_dialogue_clip") if deferred_reference else
+                           str(clip.get("source_type") or "clip"),
+            "at_share": random.random(), "prompt": direction + continuation,
+            "speech": part["speech"], "purpose": "voice_ad",
+            "duration_seconds": part["duration_seconds"],
+            "duration_mode": "at_least", "air_it": True,
+            "sequence_part": part["part"], "sequence_parts": part["parts"],
+            # A hand-picked source interval wins over automatic tiling of a
+            # long source.  Multi-part spoken copy deliberately reuses the
+            # selected performance window rather than silently changing it.
+            **({"trim_in_s": selected_trim[0], "trim_out_s": selected_trim[1]}
+               if selected_trim else
+               ({"trim_in_s": part["trim_in_s"], "trim_out_s": part["trim_out_s"]}
+                if "trim_in_s" in part else {})),
+        }))
+    _parody_stinger_wake.set()
+    if _RADIO.get("on"):
+        fire_and_forget(dj_ad(
+            "a listener commissioned a short H3 video ad: " + str(goal)[:180]
+            + "; say it is being made for the gallery", remember=False))
+    # The command was completed when its durable record was made. Capacity
+    # work remains internal; the gallery notification marks the finished film.
+    return ("Request completed.",
+            {"clip": clip, "queue_id": str(jobs[0].get("id") or ""),
+             "queue_ids": [str(job.get("id") or "") for job in jobs],
+             "parts": len(jobs),
+             "status": str(jobs[0].get("status") or "queued"), "model": "h3",
+             "spoken_copy": copy,
+             "dialogue_seconds": float(dialogue_seconds or 0.0),
+             "duration_padding_seconds": H3_DIALOGUE_PADDING_S,
+             "gallery_share": h3_hourly_gallery_share() if automatic else None,
+             "trim_in_s": selected_trim[0] if selected_trim else None,
+             "trim_out_s": selected_trim[1] if selected_trim else None})
 
 
 # --- Open WebUI passthrough ------------------------------------------------
@@ -9239,7 +9673,9 @@ def _model_call_full(text: str) -> dict[str, Any]:
 
 async def voice_render_any(text: str, voice: str, engine: str = "",
                            fx: dict[str, float] | None = None,
-                           who: str = "") -> dict[str, Any] | None:
+                           who: str = "", line: str = "",
+                           script_index: int = 0,
+                           script_total: int = 0) -> dict[str, Any] | None:
     """Render this line through the assigned actor whenever possible.
 
     THE contract for #784: ordinary lines use every available engine to stay
@@ -9258,6 +9694,14 @@ async def voice_render_any(text: str, voice: str, engine: str = "",
     text = str(text or "").strip()
     if not text:
         return None
+    # A named booth role is an on-air render, even when a preparatory caller
+    # did not know its eventual line id. Give the feed one durable receipt so
+    # it never falls back to an anonymous "Voice Rendering" row. Real batches
+    # already supply their N/M position and are deliberately left untouched.
+    if who and not line:
+        line = uuid.uuid4().hex
+    if who and not script_total:
+        script_index, script_total = 1, 1
     engine = engine or voice_engine_for(voice)
     # #784: LENGTH is the other way a written line could not be rendered. The
     # box road cuts a long line into slider-sized pieces; the page road never
@@ -9311,7 +9755,9 @@ async def voice_render_any(text: str, voice: str, engine: str = "",
             secs = 0.0
             for piece in pieces:
                 part = await voice_render_any(piece, voice, engine,
-                                              fx=fx, who=who)
+                                              fx=fx, who=who, line=line,
+                                              script_index=script_index,
+                                              script_total=script_total)
                 if part and part.get("path"):
                     made.append(part["path"])
                     secs += float(part.get("seconds") or 0)
@@ -9471,8 +9917,10 @@ async def voice_render_any(text: str, voice: str, engine: str = "",
         if extra_lane:
             _ENGINE_PREP_BY[eng] = 1
         try:
-            clip = await voice_generate(text, name, eng,
-                                        fx=None if not name else fx)
+            clip = await voice_generate(
+                text, name, eng, fx=None if not name else fx, line=line,
+                speaker=booth_actor_name(who, "") if who else "",
+                script_index=script_index, script_total=script_total)
         except Exception as exc:
             # #784: WHY, not just that. "every engine refused" with no reason
             # attached is not a diagnosis, and this is the last line of
@@ -15590,6 +16038,11 @@ def dialogue_row_viable(kind: str, row: Any) -> bool:
         if row.get("off_brief") and content_gate_enabled("segment_brief"):
             return False
         entry = dialogue_entry(row)
+        script = str((entry or row).get("script") or (entry or row).get("text") or "")
+        if script_has_forgotten_line(script,
+                str((entry or row).get("caller_name") or ""),
+                str((entry or row).get("caller2_name") or "")):
+            return False
         if entry is None and row.get("produced") and not dialogue_audio_ready(kind, row):
             # Ordinary single-read recording skips produced spots. A lost
             # produced file needs replacement, and must not reserve all new
@@ -20574,6 +21027,11 @@ def shelf_put(kind: str, row: dict[str, Any]) -> None:
     """Shelve one prepared item. The AUDIO is already in the pantry —
     this only writes down what was prepared and how to find it."""
     try:
+        entry = row.get("entry") if isinstance(row.get("entry"), dict) else row
+        if script_has_forgotten_line(str(entry.get("script") or entry.get("text") or ""),
+                                     str(entry.get("caller_name") or ""),
+                                     str(entry.get("caller2_name") or "")):
+            return
         row = dict(row)
         row.setdefault("at", time.time())
         row["kind"] = str(kind)
@@ -24713,7 +25171,9 @@ def _replay_save() -> None:
 
 async def voice_generate(text: str, voice: str, engine: str,
                          fx: dict[str, float] | None = None,
-                         line: str = "") -> dict[str, Any]:
+                         line: str = "", speaker: str = "",
+                         script_index: int = 0,
+                         script_total: int = 0) -> dict[str, Any]:
     """text + voice in, a stored audio path out. Nothing is created unless
     synthesis succeeds. `fx` wets the line — echo and a room — for the callers
     that want the pair to sound like they are in a booth rather than a
@@ -24800,7 +25260,8 @@ async def voice_generate(text: str, voice: str, engine: str,
     # other callers render things that are not script lines; when it is
     # given, the feed can show the words and point at the script.
     note_activity("voicing", f"{engine} · {len(text)} chars",
-                  line=line, text=text)
+                  line=line, text=text, speaker=speaker,
+                  script_index=script_index, script_total=script_total)
     pipeline_log("voice", f"{engine} · {voice or 'default voice'} · "
                           f"{len(text)} chars in",
                  extra=(f"INPUT to {engine} "
@@ -25395,7 +25856,13 @@ def _clip_seconds(path: str) -> float:
 async def _clip_seconds_async(path: str) -> float:
     """_clip_seconds, with the file read off the event loop."""
     try:
-        return await asyncio.to_thread(_clip_seconds, path)
+        raw = str(path or "").split("?", 1)[0]
+        if raw.startswith("/ads-audio/"):
+            name = raw.rsplit("/", 1)[-1]
+            if not AD_AUDIO_SHAPE.match(name):
+                return 0.0
+            raw = str(PRODUCED_ADS_DIR / name)
+        return await asyncio.to_thread(_clip_seconds, raw)
     except Exception:  # noqa: BLE001
         # The synchronous road answers 0.0 for anything it cannot read
         # and raises nothing; a length that cannot be measured must not
@@ -25759,6 +26226,8 @@ def _admission_producer(depth: int = 2) -> str:
 def _admission_lane(path: str, kind: str = "", reply: bool = False) -> str:
     if reply or str(kind or "") == "reply":
         return "reply"
+    if str(kind or "") == "ad" or str(path or "").startswith("/ads-audio/"):
+        return "advert"
     low = (str(path or "") + " " + str(kind or "")).lower()
     for needle, lane in (("/sfx/", "sfx"), ("sting", "sfx"), ("sfx", "sfx"),
                          ("advert", "advert"), ("/ad/", "advert"),
@@ -26382,10 +26851,10 @@ PLAYOUT_ROAD_BY_KIND = {
     "banter": "banter", "manager": "manager", "rescue": "rescue",
     "unheard": "unheard", "record": "record_talk", "upstairs": "upstairs",
 }
-# The sheet is OWED these (#1261's memo from upstairs, and the advert
-# log): they ask with priority and may go in front of a HELD round, never
-# in front of a sounding one - the floor sees to that.
-PLAYOUT_PRIORITY_KINDS = frozenset({"ad", "advert", "upstairs", "manager"})
+# Paid reads may take the next boundary. Manager pages are repeatable stock;
+# allowing them to outrank a held round filled the page feed half an hour
+# ahead and left that round waiting behind dozens of memos.
+PLAYOUT_PRIORITY_KINDS = frozenset({"ad", "advert"})
 
 
 def playout_clip_road(clip: Any) -> tuple[str, bool]:
@@ -27005,7 +27474,7 @@ def _with_nabu_speech_ownership(function: Any) -> Any:
 
 @_with_nabu_speech_ownership
 async def _play_on_box(path: str, sig: str, reply: bool = False,
-                       replay: bool = False) -> str:
+                       replay: bool = False, on_dispatch: Any = None) -> str:
     """Hand a finished clip to the Pine Box speaker. Best effort — the panel
     still plays it even when Home Assistant is unreachable."""
     # #1117: OFF AIR, THE STATION DOES NOT REACH THE SPEAKER.
@@ -27143,6 +27612,7 @@ async def _play_on_box(path: str, sig: str, reply: bool = False,
     call_budget = (min(ANNOUNCE_TIMEOUT, seconds + 25.0) if seconds
                    else 18.0)
     async with _ANNOUNCE_LOCK:
+        dispatch = on_dispatch
         # The same retry the spoken path has had since #182. A bare 500 from
         # announce is usually the box having dropped its own Wyoming socket,
         # which a wait or a rebuild fixes — and without this a stinger simply
@@ -27174,6 +27644,13 @@ async def _play_on_box(path: str, sig: str, reply: bool = False,
                         _ANNOUNCE_LAST["error"] = f"Nabu speech level could not be applied: {type(exc).__name__}"
                         pipeline_log("air", _ANNOUNCE_LAST["error"])
                         return ""
+                if callable(dispatch):
+                    try:
+                        dispatch()
+                    except Exception as exc:  # noqa: BLE001
+                        pipeline_log("air", "the box dispatch clock could not be stamped",
+                                     extra=str(exc)[:160])
+                    dispatch = None
                 attempt_started = time.monotonic()
                 attempt_wall = time.time()          # #822 proof window
                 async with httpx.AsyncClient(timeout=call_budget) as client:
@@ -27385,7 +27862,7 @@ _play_on_box_admitted = _play_on_box
 
 @wraps(_play_on_box_admitted)
 async def _play_on_box(path: str, sig: str, reply: bool = False,
-                       replay: bool = False) -> str:
+                       replay: bool = False, on_dispatch: Any = None) -> str:
     ticket = admission_ticket(path, sig, route="box", reply=reply,
                               seconds=await _clip_seconds_async(path),
                               producer=_admission_producer(2))
@@ -27398,7 +27875,8 @@ async def _play_on_box(path: str, sig: str, reply: bool = False,
         return ""
     try:
         played = await _play_on_box_admitted(path, sig, reply=reply,
-                                             replay=replay)
+                                             replay=replay,
+                                             on_dispatch=on_dispatch)
     except BaseException as exc:                      # noqa: BLE001
         admission_delivery(ticket, "failed",
                            {"error": "%s: %s" % (type(exc).__name__, exc),
@@ -27568,7 +28046,8 @@ def voice_engine() -> str:
 
 async def speak(
     text: str, event: str = "default", engine: str | None = None,
-    voice: str | None = None, plain: bool = False,
+    voice: str | None = None, plain: bool = False, line: str = "",
+    speaker: str = "", script_index: int = 0, script_total: int = 0,
 ) -> dict[str, Any]:
     """Say something through whichever engine the settings panel has armed.
     Every engine answers the same shape, so callers never branch.
@@ -27623,7 +28102,8 @@ async def speak(
         }}
     result = await voice_generate(
         styled, voice if voice is not None else _event_voice(event), chosen,
-        fx=fx)
+        fx=fx, line=line, speaker=speaker,
+        script_index=script_index, script_total=script_total)
     result["spoken"] = styled
     # This is the box answering YOU, not the station broadcasting at you —
     # it keeps working with the show switched off the speaker (#647).
@@ -29032,6 +29512,11 @@ VOICE_BROADCAST_LEAD_MS = int(os.getenv("VOICE_BROADCAST_LEAD_MS", "7000"))
 # PINE_VOICE_LATE_MS moves it. The page constant VOICE_LATE_PLAY_MS is
 # its twin and the two must agree.
 VOICE_LATE_OFFER_MS = int(os.getenv("PINE_VOICE_LATE_MS", "45000"))
+# [#1460] The owning page's outer bound (#1184 VOICE_KEEP_MS, its twin in
+# the panel): a clip it has acknowledged is re-timed and played in order
+# for this long past its first moment. Until then it is air still OWED,
+# and page_reservation_repair must book it. The two must agree.
+VOICE_KEEP_OFFER_S = 600.0
 
 # #1147: how far ahead the page's air is SOLD, across every producer.
 # The paced burst road (#1146) kept this knowledge in a local variable,
@@ -29079,10 +29564,21 @@ def page_recovery_read() -> list[dict[str, Any]]:
         except Exception:  # noqa: BLE001
             return False
 
+    def _still_owed(row: dict[str, Any]) -> bool:
+        try:
+            start = float(row.get("broadcast_ms") or 0) / 1000.0
+            if start <= 0:
+                return True  # legacy recovery rows have no air reservation
+            stream = row.get("stream") if isinstance(row.get("stream"), dict) else {}
+            seconds = max(0.0, float(row.get("seconds") or stream.get("length") or 0))
+            return start + seconds >= time.time() - 120.0
+        except (TypeError, ValueError):
+            return False
+
     try:
         return [r for r in json.loads(PAGE_RECOVERY_PATH.read_text(encoding="utf-8")).get("clips", [])
                 if isinstance(r, dict) and r.get("delivery_id") and r.get("url")
-                and _still_there(r)][:120]
+                and _still_owed(r) and _still_there(r)][:120]
     except (OSError, ValueError, TypeError):
         return []
 
@@ -29181,6 +29677,19 @@ def page_reservation_repair() -> list[dict[str, Any]]:
         if start <= now and (not silent or now - start <= 20.0):
             if start + duration > now:
                 cursor = max(cursor, start + duration)
+            elif (not silent
+                  and delivery.get("state") in ("received", "canplay")
+                  and now - start <= VOICE_KEEP_OFFER_S):
+                # [#1460] OWED AIR IS STILL AIR. 2026-09-26: the PineTab
+                # owned the air, played without a break, and ran 290 s
+                # behind its stamps with 17 lines queued - while this
+                # cursor read "free in 7 s". A past-due clip the owning
+                # page acknowledged is not history: #1184 re-times it and
+                # plays it after what is sounding. It reserved nothing
+                # here, so every producer pacing on _PAGE_AIR_UNTIL kept
+                # booking on top, the backlog only grew, and whole runs
+                # of dialogue died at the page's 600 s bound unheard.
+                cursor += duration
             continue
         # A received clip that never started cannot reserve dead air. Once
         # the listener has been silent for 20 s, close gaps between pending
@@ -29192,7 +29701,10 @@ def page_reservation_repair() -> list[dict[str, Any]]:
             changed.append(did)
             start = cursor
             playout_tell("retime_unstarted", did, start)
-        cursor = max(cursor, start + duration)
+        # [#1460] the page plays unstarted clips one after another, so
+        # each occupies its own length behind the last - a clip stamped
+        # inside air already booked used to add nothing to the cursor.
+        cursor = max(cursor, start) + duration
         pending.append(clip)
     _PAGE_AIR_UNTIL[0] = cursor
     if changed:
@@ -29524,6 +30036,7 @@ def page_picture_append(clip: dict[str, Any], at_ms: int = 0) -> dict[str, Any]:
         "id": str(clip.get("id") or ""),
         "video": True,
         "picture_only": True,
+        **({"silent_picture": True} if clip.get("silent_picture") else {}),
         "seconds": round(seconds, 2),
         # 2026-09-15 (#1173): the clip's own measured length, when the
         # caller knows it. `seconds` above may be a reserved slot that is
@@ -30080,7 +30593,8 @@ def air_at_set(row: dict[str, Any], when: float,
 
 
 def note_activity(stage: str, detail: str = "",
-                  line: str = "", text: str = "") -> None:
+                  line: str = "", text: str = "", speaker: str = "",
+                  script_index: int = 0, script_total: int = 0) -> None:
     """#1277: ...and WHICH LINE it is, and what the line says.
 
     The feed used to show `voicing · xtts · 163 chars` while the station
@@ -30094,6 +30608,12 @@ def note_activity(stage: str, detail: str = "",
         now["line"] = str(line)
     if text:
         now["text"] = str(text)[:400]
+    if speaker:
+        now["speaker"] = str(speaker)[:100]
+    if script_total > 0:
+        now["script_index"] = max(0, min(int(script_index or 0),
+                                           int(script_total)))
+        now["script_total"] = int(script_total)
     _RADIO["activity"] = now
     log = _RADIO.setdefault("activity_log", [])
     # #790: the detail rides in the log too, so the Route cell's history can
@@ -30104,6 +30624,12 @@ def note_activity(stage: str, detail: str = "",
         row["line"] = str(line)
     if text:
         row["text"] = str(text)[:400]
+    if speaker:
+        row["speaker"] = str(speaker)[:100]
+    if script_total > 0:
+        row["script_index"] = max(0, min(int(script_index or 0),
+                                           int(script_total)))
+        row["script_total"] = int(script_total)
     log.append(row)
     del log[:-120]
 
@@ -30155,7 +30681,8 @@ def said_rows() -> list[dict[str, Any]]:
 
 
 def said_texts(most: int = 400) -> list[str]:
-    return [r["t"] for r in said_rows()[-max(1, most):]]
+    return [r["t"] for r in said_rows()[-max(1, most):]
+            if not line_forgotten(r["t"])]
 
 
 def said_recent(window: float = 3600.0, most: int = 36,
@@ -30207,6 +30734,38 @@ def said_forget(text: str) -> None:
                 SAID_LINES_PATH.write_text(json.dumps(kept[-400:], indent=0))
             except OSError:
                 pass
+
+
+LINE_BLACKLIST = Blacklist(data_path("line_blacklist.json"))
+PROMPT_HISTORY = prompt_history.History(data_path("prompt_history.sqlite3"))
+prompt_history.install(app, globals(), PROMPT_HISTORY)
+
+
+async def recorded_ollama_post(client: Any, url: str, *, purpose: str = "local inference", **kwargs: Any) -> Any:
+    def context() -> dict[str, Any]:
+        settings = load_settings()
+        prompts = settings.get("prompts") or []
+        active = prompts[int(settings.get("active_prompt") or 0) % len(prompts)] if prompts else {}
+        return {"dj": copy.deepcopy(dj_settings()), "agent_prompt": copy.deepcopy(active),
+                "schedule_kind": str(_RADIO.get("sched_kind") or ""),
+                "schedule_prompt": str(_RADIO.get("sched_prompt") or "")}
+    return await PROMPT_HISTORY.post(client, url, context=context, purpose=purpose, **kwargs)
+
+
+def line_forgotten(text: str) -> bool:
+    try:
+        return LINE_BLACKLIST.contains(str(text or ""))
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+def script_has_forgotten_line(script: str, caller_name: str = "",
+                              caller2_name: str = "") -> bool:
+    if not LINE_BLACKLIST.has_entries:
+        return False
+    turns = banter_turns(script, caller_name, caller2_name)
+    lines = [text for _, text in turns] if turns else str(script or "").splitlines()
+    return any(line_forgotten(text) for text in lines if text.strip())
 
 
 def overused_phrases(most: int = 16) -> list[str]:
@@ -33227,6 +33786,9 @@ async def _dj_speak_floorless(kind: str, track: dict[str, Any] | None = None,
     # holding the speaker. Six of those today and none before (#206).
     if not spoken or not re.search(r"[^\W_]", spoken):
         return ""
+    if line_forgotten(spoken):
+        pipeline_log("drop", "an operator-forgotten line was withheld before recording")
+        return ""
     _floor_stage(f"a {kind} line from {who} (written)")
     # Never say the same thing twice in a row (#494): the model sometimes
     # re-emits a line it just aired — especially when a round is seeded from
@@ -33281,6 +33843,9 @@ async def _dj_speak_floorless(kind: str, track: dict[str, Any] | None = None,
             pipeline_log("crystal", f"(#1063) a {kind or 'live'} line for "
                          f"{who} went out as written - the tint did not "
                          "pass its evaluator")
+    if line_forgotten(spoken):
+        pipeline_log("drop", "an operator-forgotten line was withheld after rewrite")
+        return ""
     # #901: THE WINDOW, on the road #752 left behind.
     #
     # #494's ring of ten above is the only repeat protection this road
@@ -33398,7 +33963,9 @@ async def _dj_speak_floorless(kind: str, track: dict[str, Any] | None = None,
             # dialogue never goes into the void, it goes on the shelf.
             try:
                 clip = await voice_generate(
-                    spoken, forced, voice_engine_for(forced), fx=fx)
+                    spoken, forced, voice_engine_for(forced), fx=fx,
+                    line=line_id, speaker=booth_actor_name(who, name),
+                    script_index=1, script_total=1)
             except Exception:
                 clip = None
         if clip:
@@ -33539,9 +34106,9 @@ async def _dj_speak_floorless(kind: str, track: dict[str, Any] | None = None,
             # precisely when it was needed and the line was lost.
             # voice_render_any cannot come back empty while any engine on
             # this box answers.
-            clip = await voice_render_any(spoken,
-                                          forced or _event_voice("default"),
-                                          engine, fx=fx, who=who)
+            clip = await voice_render_any(
+                spoken, forced or _event_voice("default"), engine, fx=fx,
+                who=who, line=line_id, script_index=1, script_total=1)
 
     if clip and sting and not by_hand and kind != "reply":
         clip, _sfx_stream = await _sfx_single_clip(
@@ -33777,8 +34344,10 @@ async def _dj_speak_floorless(kind: str, track: dict[str, Any] | None = None,
                     if _sfx_stream:
                         why = "box declined the exact finished clip"
                     else:
-                        result = await speak(spoken, event="default",
-                                             voice=forced, plain=True)
+                        result = await speak(
+                            spoken, event="default", voice=forced, plain=True,
+                            line=line_id, speaker=booth_actor_name(who, name),
+                            script_index=1, script_total=1)
                         why = _speak_why(result)
             else:
                 # A long single line (an intro can run 600 chars ≈ 40s)
@@ -33793,8 +34362,10 @@ async def _dj_speak_floorless(kind: str, track: dict[str, Any] | None = None,
                 for at, piece in enumerate(pieces):
                     if at:
                         piece = breath_for(f"{who}{at}") + piece
-                    result = await speak(piece, event="default",
-                                         voice=forced, plain=True)
+                    result = await speak(
+                        piece, event="default", voice=forced, plain=True,
+                        line=line_id, speaker=booth_actor_name(who, name),
+                        script_index=1, script_total=1)
                     # home_assistant_say declines rather than raising when
                     # the satellite is not ready, so an empty return is
                     # not success.
@@ -33890,7 +34461,9 @@ async def _dj_speak_floorless(kind: str, track: dict[str, Any] | None = None,
         # if there is a voice for it, hold it for the box and show it in the
         # backlog. Only a line with no voice at all is logged as a pure drop.
         if True:                                                   # #784
-            clip = await voice_render_any(spoken, forced, fx=fx, who=who)
+            clip = await voice_render_any(
+                spoken, forced, fx=fx, who=who, line=line_id,
+                script_index=1, script_total=1)
         if clip:
             box_hold(clip, spoken, who, line_id)                # #778
             note_drop(who, spoken,
@@ -34100,7 +34673,9 @@ async def _dj_speak_floorless(kind: str, track: dict[str, Any] | None = None,
             # routing that had just failed, so it could not rescue an
             # engine-down or a clone-id-into-Piper failure, which is every
             # one of them. The ladder ends at Piper's own default voice.
-            clip = await voice_render_any(spoken, forced, fx=fx, who=who)
+            clip = await voice_render_any(
+                spoken, forced, fx=fx, who=who, line=line_id,
+                script_index=1, script_total=1)
         if clip and clip.get("path"):
             page_delivery = page_feed_append({
                 "url": f"{clip['path']}?t={clip['sig']}",
@@ -34141,7 +34716,7 @@ async def _dj_speak_floorless(kind: str, track: dict[str, Any] | None = None,
     _DIALOGUE_AT[0] = time.time()                                # 2026-09-07
     # Capture the line into the rolling episode recording (#548).
     if clip and clip.get("path"):
-        await _episode_stage(clip["path"],
+        await _episode_stage_call(clip["path"],
                              f"{entry.get('name') or who}: {spoken}")
     # The pair remember their own reruns (#323): every aired line feeds
     # the do-not-reuse list the prompts carry. Callers are in it too now (#584)
@@ -39857,6 +40432,11 @@ async def larder_prepare(entry: dict[str, Any],
     still `made >= len(plan)`. Nothing about the round's own bookkeeping
     changes; it simply takes more than one visit."""
     _pkind = str(entry.get("prep_kind") or "banter")
+    if script_has_forgotten_line(str(entry.get("script") or ""),
+                                 str(entry.get("caller_name") or ""),
+                                 str(entry.get("caller2_name") or "")):
+        entry["forgotten_line"] = True
+        return False
     if entry.get("preparing") or entry.get("tinting"):
         return False
     if entry.get("prepared") and dialogue_row_ready(_pkind, entry):
@@ -39929,6 +40509,9 @@ async def larder_prepare(entry: dict[str, Any],
         turns = banter_turns(str(entry.get("script") or ""),
                              str(entry.get("caller_name") or ""),
                              str(entry.get("caller2_name") or ""))
+        if any(line_forgotten(text) for _, text in turns):
+            entry["forgotten_line"] = True
+            return False
         voices = dict(await session_voices())
         # #1005: AND THE CALLER'S OWN VOICE, off the banked round.
         #
@@ -42375,7 +42958,7 @@ def _track_talk_review_rewrite(source: str, candidate: str, track: dict[str, Any
             disposition="rewrite_rejected")
 
 
-async def prep_track_talk() -> bool:
+async def prep_track_talk(wanted_track_id: str = "") -> bool:
     """#869: one half of the dialogue around one upcoming record.
 
     The host's introduction BEFORE it, and the co-host's send-off AFTER
@@ -42396,6 +42979,8 @@ async def prep_track_talk() -> bool:
         for track in track_lookahead():
             if track.get("tape") or not track.get("id"):
                 continue            # the mail writes its own introduction
+            if wanted_track_id and str(track.get("id")) != wanted_track_id:
+                continue
             # #1179: THE SEND-OFF FIRST.  One part per visit, and the
             # intro is the half that already has a live fallback on the
             # air path - an expensive one, 50.4s of dead air an airing,
@@ -45295,7 +45880,14 @@ def commitment_write_needed(kind: str, hours: float = 0.0) -> bool:
     try:
         state = (commitment_inventory_plan(hours).get("roads") or {}).get(
             str(kind)) or {}
-        return float(state.get("short_seconds") or 0) > 1.0
+        if float(state.get("short_seconds") or 0) > 1.0:
+            return True
+        # The FIFO planner reserves forecast seconds for written stock. A
+        # recent bank walk also measures the actual words in that stock; a
+        # short draft must not close the writing room's obligation.
+        if _bank_module is not None:
+            return bool(_bank_module.contract_write_needed(str(kind)))
+        return False
     except Exception:  # noqa: BLE001
         return False
 
@@ -47424,7 +48016,7 @@ async def reel_open() -> None:
             _LARDER[:] = _keep
             _larder_save()
         try:
-            await _episode_stage(path, "🎙 the resume reel")
+            await _episode_stage_call(path, "🎙 the resume reel")
         except Exception:  # noqa: BLE001
             pass
         pipeline_log(
@@ -50103,6 +50695,34 @@ def entry_road_ready(kind: str) -> bool:
         got = False
     _ENTRY_READY_MEMO[road] = (now, got)
     return got
+
+
+def scheduled_ready_claim(slot: dict[str, Any]) -> bool:
+    """A measured, unstarted System2 take can still own the current entry."""
+    if slot.get("engine") != "system2":
+        return False
+    kind = str(slot.get("kind") or "")
+    now = time.time()
+    for allocation in slot.get("allocations") or []:
+        candidate = allocation.get("candidate") or {}
+        lines = candidate.get("lines") or []
+        seconds = float(candidate.get("seconds") or 0)
+        if (allocation.get("state") != "ready" or not candidate.get("ready")
+                or not candidate.get("eligible") or candidate.get("blocked_reasons")
+                or not lines or seconds <= 0):
+            continue
+        duration = (seconds + max(0, len(lines) - 1) * max(CONCAT_BEAT)
+                    + max(0.0, float(os.getenv("BOX_TAIL_MS", "900"))) / 1000.0)
+        planned_start = float(allocation.get("planned_start") or 0)
+        expires = float(candidate.get("expires_at") or 0)
+        if expires and expires < max(now, planned_start) + duration:
+            continue
+        if _ready_round_fits(kind, lines, seconds=duration,
+                             start_at=planned_start):
+            return True
+    return False
+
+
 _CLOCK_HELD: dict[str, float] = {}      # kind -> when it first deferred
 CLOCK_HOLD_MOST = 900.0                 # never defer longer than this
 
@@ -50158,6 +50778,9 @@ def clock_may_air(kind: str) -> str:
             _CLOCK_HELD.pop(kind, None)
             return "no running order"      # nothing to obey
         on = str(slot.get("kind") or "")
+        if scheduled_ready_claim(slot):
+            _CLOCK_HELD.setdefault(kind, time.time())
+            return ""
         if quiet:
             # #1163: silence still outranks the sheet - but only when the
             # sheet has nothing to answer it with. While the entry on air
@@ -51981,6 +52604,9 @@ def horizon_hour_demand(key: Any = "", hours: Any = 0) -> dict:
         "overridden": False,
         "priced": False,
         "entries": [],
+        "scheduled_seconds": 0.0,
+        "unpriced_seconds": 0.0,
+        "unpriced_entries": 0,
         "owed_seconds": 0.0,
         "held_seconds": 0.0,
         "short_seconds": 0.0,
@@ -52035,10 +52661,10 @@ def horizon_hour_demand(key: Any = "", hours: Any = 0) -> dict:
                 "cannot": cannot,
                 "priced": False,
                 "held_seconds": 0.0,
-                "short_seconds": 0.0 if cannot else round(owns, 1),
+                "short_seconds": None,
                 "expired_seconds": 0.0,
-                "covered": bool(cannot),
-                "bare": (not cannot),
+                "covered": None,
+                "bare": None,
             }
             walked = plan.get(i)
             if isinstance(walked, dict):
@@ -52051,7 +52677,13 @@ def horizon_hour_demand(key: Any = "", hours: Any = 0) -> dict:
                     if field in walked:
                         one[field] = walked[field]
             out["entries"].append(one)
-            out["owed_seconds"] += owns
+            out["scheduled_seconds"] += owns
+            if not one["priced"]:
+                out["unpriced_seconds"] += owns
+                out["unpriced_entries"] += 1
+                continue
+            priced_owns = float(one.get("owns_seconds") or 0)
+            out["owed_seconds"] += priced_owns
             out["held_seconds"] += float(one.get("held_seconds") or 0)
             out["short_seconds"] += float(one.get("short_seconds") or 0)
             out["expired_seconds"] += float(one.get("expired_seconds") or 0)
@@ -52063,13 +52695,14 @@ def horizon_hour_demand(key: Any = "", hours: Any = 0) -> dict:
                 seat = out["roads"].setdefault(
                     road, {"owed": 0.0, "held": 0.0, "short": 0.0,
                            "entries": 0, "bare": 0})
-                seat["owed"] += owns
+                seat["owed"] += priced_owns
                 seat["held"] += float(one.get("held_seconds") or 0)
                 seat["short"] += float(one.get("short_seconds") or 0)
                 seat["entries"] += 1
                 if one.get("bare"):
                     seat["bare"] += 1
-        for field in ("owed_seconds", "held_seconds", "short_seconds",
+        for field in ("scheduled_seconds", "unpriced_seconds",
+                      "owed_seconds", "held_seconds", "short_seconds",
                       "expired_seconds"):
             out[field] = round(float(out[field]), 1)
         for seat in out["roads"].values():
@@ -52077,14 +52710,16 @@ def horizon_hour_demand(key: Any = "", hours: Any = 0) -> dict:
                 seat[field] = round(float(seat[field]), 1)
         out["ok"] = True
         out["say"] = (
-            "%s runs %s: %d entries, %ds owed, %ds held, %ds short, "
+            "%s runs %s: %d entries, %ds future priced, %ds held, %ds short, "
             "%d bare" % (want, out["preset"] or "the plan", len(out["entries"]),
                          int(out["owed_seconds"]), int(out["held_seconds"]),
                          int(out["short_seconds"]), out["bare"]))
+        if out["unpriced_entries"]:
+            out["say"] += ("; %d calendar entry(s) outside the priced walk"
+                           % out["unpriced_entries"])
         if not out["priced"]:
             out["say"] += (" - demand only: that hour is beyond the walk, so "
-                           "the stock figures are what the sheet owes and not "
-                           "what is behind it")
+                           "scheduled seconds are shown without invented stock")
     except Exception:  # noqa: BLE001
         out["say"] = "the horizon desk could not read that hour"
     return out
@@ -52103,17 +52738,21 @@ def horizon_plan(hours: Any = 6.0) -> dict:
         store = schedule_read()
         out["stamp"] = horizon_stamp(store, span)
         first = _sched_hour_key()
-        owed = held = short = expired = 0.0
+        owed = held = short = expired = unpriced = scheduled = 0.0
         bare = 0
         for step in range(int(span)):
             got = horizon_hour_demand(_sched_hour_shift(first, step), span)
             out["hours"].append(got)
             owed += float(got.get("owed_seconds") or 0)
+            scheduled += float(got.get("scheduled_seconds") or 0)
+            unpriced += float(got.get("unpriced_seconds") or 0)
             held += float(got.get("held_seconds") or 0)
             short += float(got.get("short_seconds") or 0)
             expired += float(got.get("expired_seconds") or 0)
             bare += int(got.get("bare") or 0)
         out["owed_seconds"] = round(owed, 1)
+        out["scheduled_seconds"] = round(scheduled, 1)
+        out["unpriced_seconds"] = round(unpriced, 1)
         out["held_seconds"] = round(held, 1)
         out["short_seconds"] = round(short, 1)
         out["expired_seconds"] = round(expired, 1)
@@ -52121,10 +52760,11 @@ def horizon_plan(hours: Any = 6.0) -> dict:
         out["cover"] = round(held / owed, 3) if owed > 0 else 0.0
         out["ok"] = True
         out["say"] = (
-            "%d hours ahead: %ds owed, %ds held (%d%%), %ds short, %d bare "
-            "entries" % (len(out["hours"]), int(owed), int(held),
+            "%d calendar hours from this hour: %ds future priced, %ds held "
+            "(%d%%), %ds short, %d bare entries; %ds unpriced calendar time"
+            % (len(out["hours"]), int(owed), int(held),
                          int(100 * (held / owed if owed > 0 else 0)),
-                         int(short), bare))
+                         int(short), bare, int(unpriced)))
     except Exception:  # noqa: BLE001
         out["say"] = "the horizon desk could not build a plan"
     return out
@@ -53992,6 +54632,8 @@ def coord_work_order_say(order: dict[str, Any]) -> str:
 _PANTRY_ORDER_AT = [0.0]
 _PANTRY_ORDER_LAST: dict[str, Any] = {}
 _PANTRY_ORDER_RECORD_ACTIVE: set[str] = set()
+_PANTRY_ORDER_QUALITY_ACTIVE: set[str] = set()
+_DIRECTOR_REPAIR_ACTIVE: set[str] = set()
 
 
 def pantry_order_schedule_work() -> dict[str, Any]:
@@ -54043,6 +54685,10 @@ def pantry_order_record_target(order: dict[str, Any]) -> tuple[str, Any]:
     if not isinstance(item, dict) or item.get("ready"):
         return "", None
     row = item.get("row")
+    if road == "track_talk":
+        if not isinstance(row, dict) or track_talk_pair_ready(row):
+            return "", None
+        return "track_talk", row
     if not isinstance(row, dict) or dialogue_row_ready(road, row):
         return "", None
     entry = dialogue_entry(row)
@@ -54067,7 +54713,9 @@ async def pantry_order_record(order: dict[str, Any]) -> None:
         if not shape or not pantry_window() or prep_should_stop():
             order["state"] = "no longer ready for recording"
             return
-        if shape == "single":
+        if shape == "track_talk":
+            made = await prep_track_talk(ident.partition(":")[2])
+        elif shape == "single":
             made = await prep_voice_pending(str(order.get("road") or ""), ident)
         else:
             result = await recording_sitting([entry], 45.0)
@@ -54077,6 +54725,612 @@ async def pantry_order_record(order: dict[str, Any]) -> None:
         order["state"] = "recording failed (%s)" % type(exc).__name__
     finally:
         _PANTRY_ORDER_RECORD_ACTIVE.discard(ident)
+
+
+def pantry_order_quality_target(order: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    """Recheck the exact future commitment and its still-playable source."""
+    road = str(order.get("road") or "")
+    ident = str(order.get("item_id") or "")
+    commit = str(order.get("commit_id") or "")
+    if not (road and ident and commit):
+        return None
+    plan = commitment_inventory_plan(1.0, fresh=True)
+    slot = next((s for s in (plan.get("slots") or [])
+                 if s.get("commit_id") == commit and s.get("road") == road
+                 and not s.get("current") and float(s.get("in_seconds") or 0) >= 90
+                 and any(i.get("id") == ident for i in (s.get("stock") or []))), None)
+    item = next((i for i in (plan.get("selected") or [])
+                 if i.get("id") == ident and i.get("kind") == road
+                 and i.get("ready")), None)
+    if not slot or not item:
+        return None
+    row = item.get("row")
+    if (not isinstance(row, dict)
+            or alt_sid(road, row) != str(order.get("sid") or "")
+            or not isinstance(dialogue_entry(row), dict)
+            or not dialogue_row_ready(road, row)):
+        return None
+    return slot, row
+
+
+def pantry_order_quality_target_reason(order: dict[str, Any]) -> str:
+    """Explain why a bank-bound quality order lost its fresh inventory match."""
+    road = str(order.get("road") or "")
+    ident = str(order.get("item_id") or "")
+    commit = str(order.get("commit_id") or "")
+    plan = commitment_inventory_plan(1.0, fresh=True)
+    slots = [s for s in (plan.get("slots") or [])
+             if s.get("commit_id") == commit and s.get("road") == road]
+    if not slots:
+        nearby = [s for s in (plan.get("slots") or []) if s.get("road") == road]
+        return "commitment moved; next=" + str((nearby[0] if nearby else {}).get("commit_id") or "none")
+    slot = slots[0]
+    if slot.get("current") or float(slot.get("in_seconds") or 0) < 90:
+        return "the bound slot is on air or within its 90-second guard"
+    if not any(i.get("id") == ident for i in (slot.get("stock") or [])):
+        return "bound stock changed; now=" + ",".join(
+            str(i.get("id") or "") for i in (slot.get("stock") or [])[:3])
+    item = next((i for i in (plan.get("selected") or [])
+                 if i.get("id") == ident and i.get("kind") == road), None)
+    if not item:
+        return "bound stock is absent from the selected inventory"
+    if not item.get("ready"):
+        return "bound stock is no longer ready"
+    row = item.get("row")
+    if not isinstance(row, dict):
+        return "bound stock has no source row"
+    if alt_sid(road, row) != str(order.get("sid") or ""):
+        return "bound stock source ID changed"
+    if not isinstance(dialogue_entry(row), dict):
+        return "bound stock has no script entry"
+    if not dialogue_row_ready(road, row):
+        return "bound stock failed the current air-readiness gate"
+    return "the binding recovered during the second inventory read"
+
+
+def pantry_order_quality_save(road: str) -> None:
+    if road == "banter":
+        _larder_save()
+    else:
+        _pantry_save(True)
+
+
+QUALITY_REPAIR_VERSION = 5
+
+
+async def pantry_order_quality(job: str, order: dict[str, Any]) -> None:
+    """Improve one bound round in place, leaving the old take on air until ready."""
+    road = str(order.get("road") or "")
+    sid = str(order.get("sid") or "")
+    try:
+        target = await asyncio.to_thread(pantry_order_quality_target, order)
+        if not target:
+            alt_job_put(job, state="refused", why="the exact future binding changed")
+            return
+        _slot, row = target
+        source = dialogue_entry(row)
+        if not isinstance(source, dict):
+            return
+        draft = row.get("quality_draft")
+        if (isinstance(draft, dict)
+                and row.get("quality_commit_id") != str(order.get("commit_id") or "")):
+            row.pop("quality_draft", None)
+            pantry_order_quality_save(road)
+            draft = None
+        if isinstance(draft, dict):
+            draft.pop("preparing", None)
+            draft.pop("tinting", None)
+            if draft.get("quality_repair_needed"):
+                repairs = int(draft.get("quality_repair_attempts") or 0)
+                if repairs >= 2:
+                    row.pop("quality_draft", None)
+                    pantry_order_quality_save(road)
+                    alt_job_put(job, state="refused", why="two structural repairs were spent")
+                    return
+                if not alt_window() or prep_should_stop():
+                    alt_job_put(job, state="waiting for repair", why="waiting to repair the recorded structure")
+                    return
+                old = banter_turns(str(source.get("script") or ""),
+                                   str(source.get("caller_name") or ""),
+                                   str(source.get("caller2_name") or ""))
+                current = banter_turns(str(draft.get("script") or ""),
+                                       str(draft.get("caller_name") or ""),
+                                       str(draft.get("caller2_name") or ""))
+                target_turns = len(old) + max(1, int(order.get("add_turns") or 1))
+                missing = [str(role) for role in (order.get("missing_roles") or [])
+                           if normalize_role(role) not in
+                           {normalize_role(mark) for mark, _ in current}]
+                required = max(1, target_turns - len(current), len(missing))
+                need = required + 2
+                body_due = max(0.0, float(order.get("body_short_seconds") or 0.0))
+                target_seconds = float(source.get("seconds") or 0.0) + body_due
+                remaining = max(0.0, target_seconds - float(draft.get("seconds") or 0.0))
+                word_goal = (math.ceil((remaining + max(5.0, remaining * 0.25))
+                                       * WORDS_PER_MINUTE / 60.0)
+                             if body_due > 1.0 and remaining > 1.0 else 0)
+                labels = sorted({str(mark).upper() for mark, _ in old + current}
+                                | {"A", "B"})
+                prompt = (
+                    "Add at least " + str(need) + " NEW substantial speaker turns "
+                    + ("with at least " + str(word_goal) + " spoken words in total. "
+                       if word_goal else "")
+                    + "to this radio conversation. Continue its facts and current "
+                    "story; do not repeat old turns. Use only " + ", ".join(labels)
+                    + ". Include these missing roles: " + ", ".join(missing)
+                    + ". Output only new MARKER: speech lines.\n\nCONTEXT:\n"
+                    + str(draft.get("script") or "")[-7000:])
+                draft["quality_repair_attempts"] = repairs + 1
+                pantry_order_quality_save(road)
+                alt_job_put(job, state="writing", why="repairing the recorded structure")
+                said = str(await ask_model(prompt, limit=min(6500, max(1800, need * 230)),
+                                           mark={"kind": "writers room",
+                                                 "why": "bound structural repair"}) or "")
+                fresh = banter_turns(said, str(draft.get("caller_name") or ""),
+                                     str(draft.get("caller2_name") or ""))
+                offered_words = sum(len(re.findall(r"[^\W_]+(?:'[^\W_]+)*", text))
+                                    for _, text in fresh)
+                if len(fresh) < required or offered_words < word_goal or any(
+                        normalize_role(role) not in
+                        {normalize_role(mark) for mark, _ in current + fresh}
+                        for role in missing):
+                    row["quality_last_fault"] = {
+                        "repair_required_turns": required,
+                        "repair_offered_turns": len(fresh),
+                        "repair_required_words": word_goal,
+                        "repair_offered_words": offered_words,
+                        "repair_offered_chars": len(said)}
+                    pantry_order_quality_save(road)
+                    alt_job_put(job, state="waiting for repair", why="the structural repair was too short")
+                    return
+                expanded = current[:-1] + fresh + current[-1:] if current else fresh
+                _dialogue_audio_drop(draft)
+                for key in ("script_plain", "script_tinted", "tint", "tint_progress",
+                            "tint_revalidation", "tint_tried", "use", "brief_plain_ok",
+                            "brief", "off_brief", "review_cancel_pending", "production",
+                            "cue_map", "missing_voice_chunks"):
+                    draft.pop(key, None)
+                draft["script"] = "\n".join("%s: %s" % (m, t) for m, t in expanded)
+                draft["freshened"] = True
+                draft.pop("quality_repair_needed", None)
+                pantry_order_quality_save(road)
+        else:
+            if int(row.get("quality_protocol") or 0) < QUALITY_REPAIR_VERSION:
+                row["quality_attempts"] = 0
+                row["quality_offer_failures"] = 0
+                row["quality_protocol"] = QUALITY_REPAIR_VERSION
+                pantry_order_quality_save(road)
+            if int(row.get("quality_attempts") or 0) >= 2:
+                alt_job_put(job, state="refused", why="two writing attempts were spent")
+                return
+            if int(row.get("quality_offer_failures") or 0) >= 3:
+                alt_job_put(job, state="refused", why="three unusable writing offers were spent")
+                return
+            started = time.time()
+            while not alt_window() or prep_should_stop():
+                if time.time() - started > ALT_GEN_WAIT:
+                    alt_job_put(job, state="gave up", why="no quiet writing window")
+                    return
+                alt_job_put(job, state="waiting", why="waiting for a quiet writing window")
+                await asyncio.sleep(3)
+            target = await asyncio.to_thread(pantry_order_quality_target, order)
+            if not target or target[1] is not row:
+                alt_job_put(job, state="refused", why="the binding changed before writing")
+                return
+            source = dialogue_entry(row)
+            old_script = str(source.get("script") or "")
+            turns = banter_turns(old_script, str(source.get("caller_name") or ""),
+                                 str(source.get("caller2_name") or ""))
+            need = max(1, int(order.get("add_turns") or 1))
+            body_due = max(0.0, float(order.get("body_short_seconds") or 0.0))
+            word_goal = (math.ceil((body_due + max(5.0, body_due * 0.25))
+                                   * WORDS_PER_MINUTE / 60.0)
+                         if body_due > 1.0 else 0)
+            labels = {str(mark).upper() for mark, _ in turns}
+            role_markers = {"dj": "A", "cohost": "B", "caller": "C",
+                            "third": "D", "caller2": "E"}
+            labels.update(role_markers.get(normalize_role(role), "")
+                          for role in (order.get("missing_roles") or []))
+            labels.discard("")
+            prompt = (
+                "Write ONLY an additional " + str(need) + " or more substantial "
+                + ("turns with at least " + str(word_goal) + " spoken words in total. "
+                   if word_goal else "turns ")
+                + "for this " + road + " radio conversation. The "
+                "station will insert your new turns before its existing final "
+                "sign-off; do not copy, summarize, or rewrite the old turns. "
+                "Continue its specific facts, guests, caller, paintings and "
+                "narrative. Use only these speaker markers: " + ", ".join(sorted(labels))
+                + ". Missing roles to include: "
+                + ", ".join(str(x) for x in (order.get("missing_roles") or []))
+                + ". Output only new MARKER: speech lines, no stage directions "
+                  "or commentary.\n\nCONTEXT:\n" + old_script[-7000:])
+            alt_job_put(job, state="writing", why="expanding the bound round")
+            said = str(await ask_model(prompt, limit=min(6500, max(1800, need * 230)),
+                                       mark={"kind": "writers room", "why": "bound structural repair"}) or "")
+            fresh = banter_turns(said, str(source.get("caller_name") or ""),
+                                 str(source.get("caller2_name") or ""))
+            offered_words = sum(len(re.findall(r"[^\W_]+(?:'[^\W_]+)*", text))
+                                for _, text in fresh)
+            if len(fresh) < need or offered_words < word_goal:
+                row["quality_offer_failures"] = int(row.get("quality_offer_failures") or 0) + 1
+                row["quality_last_fault"] = {"wanted_turns": need,
+                                             "offered_turns": len(fresh),
+                                             "wanted_words": word_goal,
+                                             "offered_words": offered_words,
+                                             "offered_chars": len(said)}
+                pantry_order_quality_save(road)
+                alt_job_put(job, state="refused", why="the writing offer had "
+                            + str(len(fresh)) + " of " + str(need) + " turns and "
+                            + str(offered_words) + " of " + str(word_goal) + " words")
+                return
+            present_roles = {normalize_role(mark) for mark, _ in turns + fresh}
+            missing_roles = [str(role) for role in (order.get("missing_roles") or [])
+                             if normalize_role(role) not in present_roles]
+            if missing_roles:
+                row["quality_offer_failures"] = int(row.get("quality_offer_failures") or 0) + 1
+                row["quality_last_fault"] = {"missing_roles": missing_roles,
+                                             "offered_turns": len(fresh)}
+                pantry_order_quality_save(road)
+                alt_job_put(job, state="refused", why="the rewrite still lacks: "
+                            + ", ".join(missing_roles))
+                return
+            row["quality_attempts"] = int(row.get("quality_attempts") or 0) + 1
+            row["quality_offer_failures"] = 0
+            pantry_order_quality_save(road)
+            draft = copy.deepcopy(source)
+            for key in ("takes", "keys", "prepared", "preparing", "frozen",
+                        "made", "seconds", "chunks", "partial", "yielded",
+                        "yielded_at", "script_plain", "script_tinted", "production",
+                        "cue_map", "missing_voice_chunks", "quality_draft",
+                        "tint", "tint_progress", "tint_revalidation", "tint_tried",
+                        "use", "brief_plain_ok", "review_cancel_pending",
+                        "prep_turns", "off_brief"):
+                draft.pop(key, None)
+            expanded = turns[:-1] + fresh + turns[-1:] if turns else fresh
+            draft["script"] = "\n".join("%s: %s" % (m, t) for m, t in expanded)
+            draft["freshened"] = True
+            draft["prep_kind"] = road
+            draft["quality_source"] = sid
+            row["quality_draft"] = draft
+            row["quality_commit_id"] = str(order.get("commit_id") or "")
+            pantry_order_quality_save(road)
+        if not pantry_window() or prep_should_stop():
+            alt_job_put(job, state="waiting for recording", why="the recording room is busy")
+            return
+        alt_job_put(job, state="recording", why="cutting the expanded script")
+        _PREP_DEADLINE[0] = time.time() + max(20.0, prep_room_left())
+        try:
+            await larder_prepare(draft)
+        finally:
+            _PREP_DEADLINE[0] = 0.0
+            pantry_order_quality_save(road)
+        if draft.get("off_brief") or draft.get("review_cancel_pending"):
+            row.pop("quality_draft", None)
+            pantry_order_quality_save(road)
+            alt_job_put(job, state="refused", why="the expanded script failed review")
+            return
+        if not dialogue_row_ready(road, {"entry": draft}):
+            alt_job_put(job, state="waiting for recording", why="the new take is not fully playable")
+            return
+        final_turns = banter_turns(str(draft.get("script") or ""),
+                                   str(draft.get("caller_name") or ""),
+                                   str(draft.get("caller2_name") or ""))
+        original_turns = banter_turns(str(source.get("script") or ""),
+                                      str(source.get("caller_name") or ""),
+                                      str(source.get("caller2_name") or ""))
+        final_roles = {normalize_role(mark) for mark, _ in final_turns}
+        if (len(final_turns) < len(original_turns) + max(1, int(order.get("add_turns") or 1))
+                or any(normalize_role(role) not in final_roles
+                       for role in (order.get("missing_roles") or []))):
+            row["quality_last_fault"] = {
+                "source_turns": len(original_turns), "draft_turns": len(final_turns),
+                "added_turns": max(1, int(order.get("add_turns") or 1)),
+                "repair_attempts": int(draft.get("quality_repair_attempts") or 0)}
+            if int(draft.get("quality_repair_attempts") or 0) < 2:
+                draft["quality_repair_needed"] = True
+                pantry_order_quality_save(road)
+                alt_job_put(job, state="waiting for repair", why="the recorded rewrite needs a structural repair")
+                return
+            row.pop("quality_draft", None)
+            pantry_order_quality_save(road)
+            alt_job_put(job, state="refused", why="the recorded rewrite still owes structure")
+            return
+        body_due = max(0.0, float(order.get("body_short_seconds") or 0.0))
+        target_seconds = float(source.get("seconds") or 0.0) + body_due
+        if body_due > 1.0 and float(draft.get("seconds") or 0.0) + 1.0 < target_seconds:
+            row["quality_last_fault"] = {
+                "recorded_seconds": float(draft.get("seconds") or 0.0),
+                "target_seconds": target_seconds,
+                "remaining_seconds": target_seconds - float(draft.get("seconds") or 0.0)}
+            if int(draft.get("quality_repair_attempts") or 0) < 2:
+                draft["quality_repair_needed"] = True
+                pantry_order_quality_save(road)
+                alt_job_put(job, state="waiting for repair", why="the recorded rewrite still owes airtime")
+                return
+            row.pop("quality_draft", None)
+            pantry_order_quality_save(road)
+            alt_job_put(job, state="refused", why="the recorded rewrite still owes airtime")
+            return
+        floor = max(float(order.get("allocated_seconds") or 0),
+                    float(source.get("seconds") or 0))
+        if float(draft.get("seconds") or 0) + 1 < floor:
+            row.pop("quality_draft", None)
+            pantry_order_quality_save(road)
+            alt_job_put(job, state="refused", why="the new take is shorter than the bound audio")
+            return
+        target = await asyncio.to_thread(pantry_order_quality_target, order)
+        if not target or target[1] is not row or dialogue_entry(row) is not source:
+            alt_job_put(job, state="refused", why="the binding changed before replacement")
+            return
+        if road == "banter":
+            identity = {key: row.get(key) for key in (
+                "sid", "at", "priority", "quality_attempts", "quality_successes")}
+            row.clear()
+            row.update(draft)
+            row.update(identity)
+        else:
+            row["entry"] = draft
+            row["seconds"] = float(draft.get("seconds") or 0)
+        row["quality_attempts"] = 0
+        row["quality_successes"] = int(row.get("quality_successes") or 0) + 1
+        row.pop("quality_draft", None)
+        row.pop("quality_last_fault", None)
+        _INVENTORY_PLAN["at"] = 0.0
+        _COMMITS["at"] = 0.0
+        pantry_order_quality_save(road)
+        try:
+            audit = await asyncio.to_thread(commitment_inventory_plan, 1.0, True)
+            selected = any(i.get("id") == str(order.get("item_id") or "")
+                           and i.get("row") is row and i.get("ready")
+                           for i in (audit.get("selected") or []))
+        except Exception:  # noqa: BLE001
+            selected = False
+        alt_job_put(job, state="done", made=1, new=[sid], selected=selected,
+                    why="the exact bound row was upgraded"
+                    if selected else "upgraded, but the schedule moved before audit")
+        pipeline_log("lookahead", "the bound %s round %s was upgraded in place" % (road, sid))
+    except Exception as exc:  # noqa: BLE001
+        alt_job_put(job, state="failed", why="%s: %s" % (type(exc).__name__, str(exc)[:140]))
+    finally:
+        _PANTRY_ORDER_QUALITY_ACTIVE.discard(sid)
+
+
+def director_review_repair_target(exclude_roads: set[str] | None = None) -> dict[str, Any] | None:
+    """One future bound take whose only editorial faults can be repaired."""
+    runtime = _system2()
+    if not runtime.enabled:
+        return None
+    now = time.time()
+    for hour in runtime._plans:
+        for slot in hour.get("slots") or []:
+            if (float(slot.get("start") or 0) - now < 180
+                    or slot.get("kind") not in ("banter", "caller", "news", "gallery", "manager")
+                    or slot.get("kind") in (exclude_roads or set())):
+                continue
+            allocations = list(slot.get("allocations") or [])
+            for index, allocation in enumerate(allocations):
+                if allocation.get("state") != "ready":
+                    continue
+                candidate = allocation.get("candidate") or {}
+                sid = str(candidate.get("id") or "")
+                if not sid or sid in _DIRECTOR_REPAIR_ACTIVE or sid in _PANTRY_ORDER_QUALITY_ACTIVE:
+                    continue
+                topic = dialogue_topic_review(str(candidate.get("script") or ""),
+                                              str(slot.get("prompt") or ""))
+                review = _director_contract_review(candidate,
+                    banter_turns(str(candidate.get("script") or "")), topic)
+                failed = {name for name, passed in review["checks"].items() if not passed}
+                if not failed or not failed <= {"topic_continuity", "words_match_recording"}:
+                    continue
+                live = runtime._rows.get(sid)
+                if not live or live[0] != slot.get("kind") or not dialogue_row_ready(*live):
+                    continue
+                row = live[1]
+                repair = row.get("director_repair") or {}
+                if (repair.get("slot_id") == slot["id"]
+                        and repair.get("signature") == candidate.get("signature")
+                        and int(repair.get("attempts") or 0) >= 2
+                        and not isinstance(repair.get("draft"), dict)):
+                    continue
+                if (repair.get("slot_id") == slot["id"]
+                        and int(repair.get("promotion_failures") or 0) >= 3):
+                    continue
+                return {"slot_id": slot["id"], "hour_id": slot["hour_id"],
+                        "revision": slot["revision"], "signature": candidate["signature"],
+                        "candidate_id": sid, "road": live[0], "row": row,
+                        "prompt": str(slot.get("prompt") or ""),
+                        "seconds": float(candidate.get("seconds") or 0),
+                        "max_seconds": max(0.0, float(slot.get("deadline") or 0)
+                            - float(allocation.get("planned_start") or slot["start"])
+                            - sum(float(a.get("candidate", {}).get("seconds") or 0)
+                                  for a in allocations[index + 1:])),
+                        "failures": sorted(failed)}
+    return None
+
+
+def director_review_repair_valid(order: dict[str, Any]) -> bool:
+    """The old take must still own this unstarted slot while work proceeds."""
+    runtime = _system2()
+    hour = runtime.store.get_hour(str(order.get("hour_id") or ""))
+    slot = next((s for s in (hour or {}).get("slots") or []
+                 if s.get("id") == order.get("slot_id")), None)
+    if (not slot or slot.get("revision") != order.get("revision")
+            or float(slot.get("start") or 0) - time.time() < 90):
+        return False
+    live = runtime._rows.get(order.get("candidate_id"))
+    return (bool(live and live[0] == order.get("road")
+                 and live[1] is order.get("row")
+                 and dialogue_row_ready(live[0], live[1]))
+            and any(a.get("state") == "ready"
+                    and (a.get("candidate") or {}).get("id") == order.get("candidate_id")
+                    and (a.get("candidate") or {}).get("signature") == order.get("signature")
+                    for a in slot.get("allocations") or []))
+
+
+def director_review_repair_row(road: str, draft: dict[str, Any],
+                               slot_id: str) -> dict[str, Any]:
+    """A distinct shelf identity; the bound source and its takes remain intact."""
+    sid = "%s-%s" % (road[:12], uuid.uuid4().hex[:10])
+    draft["system2_slot"] = slot_id
+    draft["prep_kind"] = road
+    draft["at"] = time.time()
+    if road == "banter":
+        row = copy.deepcopy(draft)
+        row["sid"] = sid
+        return row
+    return {"sid": sid, "at": draft["at"], "entry": draft,
+            "seconds": float(draft.get("seconds") or 0)}
+
+
+def director_review_repair_contract(candidate: dict[str, Any],
+                                    order: dict[str, Any]) -> bool:
+    review = _director_contract_review(candidate,
+        banter_turns(str(candidate.get("script") or "")),
+        dialogue_topic_review(str(candidate.get("script") or ""), order["prompt"]))
+    seconds = float(candidate.get("seconds") or 0)
+    return bool(review["ok"] and candidate.get("slot_id") == order["slot_id"]
+                and order["seconds"] <= seconds <= order.get("max_seconds", 3600))
+
+
+async def director_review_repair(job: str, order: dict[str, Any]) -> None:
+    """Write and record beside a booked take; promote only proven coverage."""
+    road = str(order["road"])
+    sid = str(order["candidate_id"])
+    source_row = order["row"]
+    try:
+        if not await asyncio.to_thread(director_review_repair_valid, order):
+            alt_job_put(job, state="refused", why="future binding moved")
+            return
+        source = dialogue_entry(source_row)
+        if not isinstance(source, dict):
+            alt_job_put(job, state="refused", why="source script disappeared")
+            return
+        repair = source_row.get("director_repair")
+        if (not isinstance(repair, dict) or repair.get("slot_id") != order["slot_id"]
+                or repair.get("signature") != order["signature"]):
+            repair = {"slot_id": order["slot_id"], "signature": order["signature"],
+                      "attempts": 0}
+            source_row["director_repair"] = repair
+        draft = repair.get("draft")
+        if not isinstance(draft, dict):
+            if int(repair.get("attempts") or 0) >= 2 or not alt_window() or prep_should_stop():
+                alt_job_put(job, state="waiting", why="writing budget or window unavailable")
+                return
+            topic = _director_topic_from_prompt(order["prompt"])
+            old_turns = banter_turns(str(source.get("script") or ""))
+            word_goal = max(30, math.ceil(float(order["seconds"]) * WORDS_PER_MINUTE / 60 * 1.12))
+            context = str(source.get("script") or "")
+            if "topic_continuity" in order["failures"]:
+                context = ("VOICE AND SPEAKER REFERENCE ONLY; its story is off-topic. "
+                           "Do not carry that story into the rewrite.\n" + context[:1800])
+            prompt = (
+                "Rewrite this complete %s radio performance as new MARKER: speech lines. "
+                "It must stay on the scheduled subject from its opening through its close, "
+                "have at least %d substantial turns and at least %d spoken words, "
+                "and preserve the speaker markers and station voice. "
+                "Output only the complete MARKER: speech script.\n\n"
+                "SCHEDULED SUBJECT: %s\nSCHEDULE BRIEF: %s\nOLD PERFORMANCE: %s"
+                % (road, max(2, len(old_turns)), word_goal, topic or "the scheduled brief",
+                   order["prompt"][:2400], context[:7000]))
+            repair["attempts"] = int(repair.get("attempts") or 0) + 1
+            pantry_order_quality_save(road)
+            alt_job_put(job, state="writing", why="rewriting the future bound take")
+            said = str(await ask_model(prompt, limit=min(6500, max(1800, word_goal * 5)),
+                                       mark={"kind": "writers room",
+                                             "why": "bound editorial repair"}) or "")
+            turns = banter_turns(said, str(source.get("caller_name") or ""),
+                                 str(source.get("caller2_name") or ""))
+            words = sum(len(re.findall(r"[^\W_]+(?:'[^\W_]+)*", text)) for _, text in turns)
+            topical = dialogue_topic_review(said, order["prompt"])
+            if (len(turns) < max(2, len(old_turns)) or words < word_goal
+                    or topical.get("checked") and not topical.get("ok")):
+                alt_job_put(job, state="refused", why="the rewrite missed length or scheduled topic")
+                return
+            draft = copy.deepcopy(source)
+            for key in ("takes", "keys", "prepared", "preparing", "frozen", "made",
+                        "seconds", "chunks", "partial", "yielded", "yielded_at",
+                        "script_plain", "script_tinted", "production", "cue_map",
+                        "missing_voice_chunks", "tint", "tint_progress",
+                        "tint_revalidation", "tint_tried", "use", "brief_plain_ok",
+                        "review_cancel_pending", "prep_turns", "off_brief",
+                        "director_repair", "quality_draft", "quality_commit_id"):
+                draft.pop(key, None)
+            draft["script"] = "\n".join("%s: %s" % turn for turn in turns)
+            draft["freshened"] = True
+            draft["prep_kind"] = road
+            draft["system2_slot"] = order["slot_id"]
+            if road == "caller":
+                draft.setdefault("call", {})["topic"] = topic
+                grade = await asyncio.to_thread(call_entry_regrade, draft, False)
+                if not grade.get("machine_ok"):
+                    alt_job_put(job, state="refused", why="caller contract rejected the rewrite")
+                    return
+            repair["draft"] = draft
+            pantry_order_quality_save(road)
+        if not pantry_window() or prep_should_stop():
+            alt_job_put(job, state="waiting for recording", why="recording room is busy")
+            return
+        alt_job_put(job, state="recording", why="cutting a separate replacement")
+        _PREP_DEADLINE[0] = time.time() + max(20.0, prep_room_left())
+        try:
+            await larder_prepare(draft)
+        finally:
+            _PREP_DEADLINE[0] = 0.0
+            pantry_order_quality_save(road)
+        if road == "caller":
+            grade = await asyncio.to_thread(call_entry_regrade, draft, False)
+            if not grade.get("machine_ok"):
+                repair.pop("draft", None)
+                pantry_order_quality_save(road)
+                alt_job_put(job, state="refused", why="recorded caller failed its contract")
+                return
+        replacement = director_review_repair_row(road, draft, order["slot_id"])
+        if draft.get("off_brief") or draft.get("review_cancel_pending"):
+            repair.pop("draft", None)
+            pantry_order_quality_save(road)
+            alt_job_put(job, state="refused", why="replacement failed production review")
+            return
+        if not dialogue_row_ready(road, replacement):
+            alt_job_put(job, state="waiting for recording", why="replacement is not fully recorded")
+            return
+        runtime = _system2()
+        preview = await asyncio.to_thread(runtime.candidate, road, replacement)
+        if not director_review_repair_contract(preview, order):
+            runtime._rows.pop(replacement["sid"], None)
+            repair.pop("draft", None)
+            pantry_order_quality_save(road)
+            alt_job_put(job, state="refused", why="recorded replacement missed topic, proof or airtime")
+            return
+        if not await asyncio.to_thread(director_review_repair_valid, order):
+            runtime._rows.pop(replacement["sid"], None)
+            alt_job_put(job, state="refused", why="future binding moved before promotion")
+            return
+        shelf = _LARDER if road == "banter" else _SHELF.setdefault(road, [])
+        def publish() -> None:
+            shelf.append(replacement)
+            pantry_order_quality_save(road)
+        def withdraw() -> None:
+            if replacement in shelf:
+                shelf.remove(replacement)
+                pantry_order_quality_save(road)
+        def validate(candidate: dict[str, Any]) -> bool:
+            return director_review_repair_contract(candidate, order)
+        try:
+            await runtime.replace_future_allocation(
+                order["slot_id"], sid, order["signature"], order["revision"],
+                road, replacement, publish, withdraw, validate)
+        except Exception:
+            repair["promotion_failures"] = int(repair.get("promotion_failures") or 0) + 1
+            pantry_order_quality_save(road)
+            raise
+        source_row.pop("director_repair", None)
+        pantry_order_quality_save(road)
+        alt_job_put(job, state="done", made=1, new=[replacement["sid"]],
+                    why="future allocation promoted after recorded editorial review")
+    except Exception as exc:  # noqa: BLE001
+        alt_job_put(job, state="failed", why="%s: %s" % (type(exc).__name__, str(exc)[:180]))
+    finally:
+        _DIRECTOR_REPAIR_ACTIVE.discard(sid)
 
 
 def pantry_orders_state() -> dict[str, Any]:
@@ -54126,6 +55380,19 @@ def pantry_orders_state() -> dict[str, Any]:
     return out
 
 
+def pantry_order_clock_ready() -> bool:
+    """Do not spend the first commission pass before System2 publishes its slot."""
+    if not _RADIO.get("on"):
+        return True
+    runtime = globals().get("_system2")
+    try:
+        if not callable(runtime) or not runtime().enabled:
+            return True
+    except Exception:  # noqa: BLE001
+        return True
+    return bool((_RADIO.get("sched_pos") or {}).get("started"))
+
+
 async def pantry_orders_tick() -> dict[str, Any]:
     # 2026-09-15 (#1191): recorded as a SUMMONS against the coordinator
     # that fired it, and then as a pass of its own. See ORCH_DOORS.
@@ -54148,6 +55415,8 @@ async def pantry_orders_tick() -> dict[str, Any]:
         mode = pantry_orders_mode()
         if mode == track_talk_segment.MODE_OFF:
             return out
+        if not pantry_order_clock_ready():
+            return out
         now = time.time()
         if now - float(_PANTRY_ORDER_AT[0] or 0) < float(PANTRY_ORDER_EVERY):
             return out
@@ -54161,6 +55430,8 @@ async def pantry_orders_tick() -> dict[str, Any]:
         order["mode"] = mode
         order["placed"] = 0
         order["recording_dispatched"] = 0
+        order["quality_dispatched"] = 0
+        order["editorial_dispatched"] = 0
         order["schedule_handoff"] = handoff
         out = order
         if mode != track_talk_segment.MODE_AIR:
@@ -54197,7 +55468,7 @@ async def pantry_orders_tick() -> dict[str, Any]:
         try:
             active = [j for j in _ALT_JOBS.values()
                       if str(j.get("state") or "")
-                      in ("queued", "waiting", "writing")]
+                      in ("queued", "waiting", "writing", "recording")]
             live = len(active)
             active_roads = {str(j.get("kind") or "") for j in active}
         except Exception:  # noqa: BLE001
@@ -54208,6 +55479,79 @@ async def pantry_orders_tick() -> dict[str, Any]:
         except Exception:  # noqa: BLE001
             window = ""
         order["window"] = window
+        if live < ALT_GEN_LIVE:
+            editorial = await asyncio.to_thread(director_review_repair_target, active_roads)
+            if editorial:
+                sid = editorial["candidate_id"]
+                job = "edr" + uuid.uuid4().hex[:9]
+                _DIRECTOR_REPAIR_ACTIVE.add(sid)
+                alt_job_put(job, kind=editorial["road"], count=1, state="queued",
+                            made=0, source=sid, slot_id=editorial["slot_id"],
+                            ordered="recorded editorial repair",
+                            why=",".join(editorial["failures"]))
+                try:
+                    fire_and_forget(director_review_repair(job, editorial))
+                except Exception:  # noqa: BLE001
+                    _DIRECTOR_REPAIR_ACTIVE.discard(sid)
+                    alt_job_put(job, state="failed", why="editorial ticket could not start")
+                else:
+                    live += 1
+                    active_roads.add(editorial["road"])
+                    order["editorial_dispatched"] = 1
+                    order["editorial_repair"] = {"slot_id": editorial["slot_id"],
+                                                 "candidate_id": sid, "job": job,
+                                                 "failures": editorial["failures"]}
+        for repair in (handoff.get("quality") or []):
+            road = str(repair.get("road") or "")
+            sid = str(repair.get("sid") or "")
+            if any(normalize_role(role) not in
+                   {normalize_role(mark) for mark in "ABCDE"}
+                   for role in (repair.get("missing_roles") or [])):
+                repair["held"] = "the script marker parser cannot evidence the missing role"
+                continue
+            if live >= ALT_GEN_LIVE:
+                repair["held"] = "the writing room is at its ticket limit"
+                continue
+            if road in active_roads or sid in _PANTRY_ORDER_QUALITY_ACTIVE:
+                repair["held"] = "a ticket for this road or round is active"
+                continue
+            target = (await asyncio.to_thread(pantry_order_quality_target, repair)
+                      if sid else None)
+            if not target:
+                repair["held"] = "the exact future binding is no longer playable"
+                repair["target_check"] = await asyncio.to_thread(
+                    pantry_order_quality_target_reason, repair)
+                continue
+            bound_row = target[1]
+            if (int(bound_row.get("quality_attempts") or 0) >= 2
+                    and int(bound_row.get("quality_protocol") or 0) >= QUALITY_REPAIR_VERSION
+                    and not isinstance(bound_row.get("quality_draft"), dict)):
+                repair["held"] = "two bounded writing attempts were already spent"
+                continue
+            if (int(bound_row.get("quality_offer_failures") or 0) >= 3
+                    and int(bound_row.get("quality_protocol") or 0) >= QUALITY_REPAIR_VERSION
+                    and not isinstance(bound_row.get("quality_draft"), dict)):
+                repair["held"] = "three unusable writing offers were already spent"
+                continue
+            if isinstance(bound_row.get("quality_draft"), dict) and not pantry_window():
+                repair["held"] = "the partial replacement awaits a recording window"
+                continue
+            job = "qlt" + uuid.uuid4().hex[:9]
+            _PANTRY_ORDER_QUALITY_ACTIVE.add(sid)
+            alt_job_put(job, kind=road, count=1, state="queued", made=0,
+                        source=sid, commit_id=repair.get("commit_id"),
+                        ordered="structural quality", why=repair.get("why"))
+            try:
+                fire_and_forget(pantry_order_quality(job, repair))
+            except Exception:  # noqa: BLE001
+                _PANTRY_ORDER_QUALITY_ACTIVE.discard(sid)
+                alt_job_put(job, state="failed", why="the quality ticket could not start")
+                continue
+            repair["job"] = job
+            live += 1
+            active_roads.add(road)
+            order["quality_dispatched"] = 1
+            break
         for row in (order.get("orders") or []):
             road = str(row.get("road") or "")
             items = max(1, min(int(ALT_GEN_MOST),
@@ -54247,7 +55591,7 @@ async def pantry_orders_tick() -> dict[str, Any]:
             order["placed"] = int(order.get("placed") or 0) + 1
         _PANTRY_ORDER_LAST.clear()
         _PANTRY_ORDER_LAST.update(order)
-        if order.get("placed"):
+        if order.get("placed") or order.get("quality_dispatched") or order.get("editorial_dispatched"):
             note_action("the orchestrator commissioned the pantry - "
                         + str(order.get("say") or "")[:200])
         pipeline_log(
@@ -55043,6 +56387,13 @@ async def _torrent_talk() -> None:
                 # burned unheard). Back to the top, where the paused
                 # branch sleeps.
                 continue
+            # A slot may become ready, or the hour may advance, during the
+            # breath. Give the director its new occurrence before any legacy
+            # draw or switchboard choice takes a place on the floor.
+            if globals().get("_system2") and _system2().enabled:
+                served = await _system2().dispatch()
+                if served or not _system2().fallback_due():
+                    continue
             # Never two rounds at once: the per-record intro is its own
             # task and this must not talk over it. But it does NOT wait
             # for ever (#705) — an intro whose announce is stuck behind a
@@ -59771,6 +61122,329 @@ CANONICAL_HOUR: tuple[tuple[str, str, float, str], ...] = (
 )
 
 
+# --- #1301: THE OPERATOR'S CONVERSATION FLOW ------------------------------
+#
+# A scheduled segment is more than its road and its duration.  The operator
+# can lay out the beats that make the duration real: a news mention followed
+# by a quote and a sting, a caller reacting to the previous subject, an ad
+# drop, and so on.  Keep that plan on the SLOT (not on a candidate) because it
+# has to survive re-writes, pre-recording and an hour being copied into a new
+# schedule.
+
+SCHEDULE_FLOW_TYPES: dict[str, dict[str, Any]] = {
+    "scripted_line": {"label": "Scripted line", "seconds": 12,
+                      "instruction": "Deliver the supplied scripted line exactly as written, then let the next speaker answer it naturally on air."},
+    "news_mention": {"label": "News mention", "seconds": 48,
+                       "instruction": "Discuss the selected current news item with its dossier; name the facts you can support and then react to them."},
+    "speakerbox_quote": {"label": "Speakerbox quote", "seconds": 30,
+                          "instruction": "Bring in the selected Speakerbox passage as a quoted source, then make the cast respond to its actual point."},
+    "random_topic": {"label": "Random topic", "seconds": 52,
+                     "instruction": "Pivot through a fresh topic from the topic bank and let both hosts give it a real conversational turn."},
+    "caller": {"label": "Caller", "seconds": 82,
+               "instruction": "Put a caller on the line who is responding to the immediately preceding subject; the caller must have heard that subject."},
+    "manager_message": {"label": "Manager message", "seconds": 42,
+                        "instruction": "Have an upstairs message interrupt or steer the room, and let the cast react before continuing."},
+    "sfx": {"label": "SFX", "seconds": 6,
+            "instruction": "The SFX Guy plays an audible, normalized clip that fits the beat. Make it a real on-air event, not a note about one."},
+    "ad_drop": {"label": "Ad drop", "seconds": 32,
+                "instruction": "Run a concise produced ad drop, then give the hosts one natural reaction or transition."},
+    "painting_ad": {"label": "Painting ad", "seconds": 58,
+                    "instruction": "Pitch a painting on air with concrete, strange details and a clear call to action."},
+    "product": {"label": "Product pitch", "seconds": 48,
+                "instruction": "Pitch one random product as a live on-air product read, with the cast treating it as a real offer."},
+}
+
+
+def _schedule_flow_clip_ref(raw: Any) -> dict[str, Any]:
+    """Keep an SFX-node selection durable without exposing a media path."""
+    row = raw if isinstance(raw, dict) else {}
+    sid = str(row.get("id") or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{16}", sid):
+        return {}
+    try:
+        seconds = float(row.get("seconds") or 0)
+    except (TypeError, ValueError):
+        seconds = 0.0
+    return {
+        "id": sid,
+        "name": str(row.get("name") or "Scheduled clip").strip()[:120],
+        "seconds": round(max(0.0, min(120.0, seconds)), 2),
+        "video": bool(row.get("video")),
+    }
+
+
+def _schedule_flow_scripted_line(raw: Any) -> dict[str, str]:
+    """Keep an operator-inserted scripted line readable and bounded."""
+    row = raw if isinstance(raw, dict) else {}
+    return {
+        "speaker": str(row.get("speaker") or "Host").strip()[:60] or "Host",
+        "text": str(row.get("text") or "").strip()[:900],
+        "source": str(row.get("source") or "operator").strip()[:80] or "operator",
+    }
+
+
+def _schedule_flow_node(raw: Any, index: int = 0) -> dict[str, Any] | None:
+    """Clean one operator-authored beat before it reaches the durable sheet."""
+    row = raw if isinstance(raw, dict) else {}
+    kind = str(row.get("type") or row.get("kind") or "").strip().lower()
+    if kind not in SCHEDULE_FLOW_TYPES:
+        return None
+    default = float(SCHEDULE_FLOW_TYPES[kind]["seconds"])
+    try:
+        seconds = float(row.get("seconds") or default)
+    except (TypeError, ValueError):
+        seconds = default
+    if seconds != seconds:
+        seconds = default
+    node = {
+        "id": (str(row.get("id") or "").strip()[:48]
+               or f"flow-{index + 1}-{uuid.uuid4().hex[:8]}"),
+        "type": kind,
+        "seconds": round(max(2.0, min(900.0, seconds)), 1),
+        "detail": str(row.get("detail") or "").strip()[:400],
+    }
+    # The opaque target node id places an operator's beat between the
+    # orchestrator's read-only lines without rewriting the aired script.
+    after = str(row.get("after") or "").strip()[:96]
+    if after:
+        node["after"] = after
+    if kind == "sfx":
+        node["clip"] = _schedule_flow_clip_ref(row.get("clip"))
+    elif kind == "scripted_line":
+        node["line"] = _schedule_flow_scripted_line(row.get("line"))
+    return node
+
+
+def schedule_flow_nodes(raw: Any) -> list[dict[str, Any]]:
+    """Return a bounded, ordered, clean flow. Empty is deliberately valid."""
+    if not isinstance(raw, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for index, item in enumerate(raw[:32]):
+        node = _schedule_flow_node(item, index)
+        if node:
+            out.append(node)
+    return out
+
+
+def schedule_flow_sfx_pick(context: str = "", seconds: Any = 6,
+                           excluded: set[str] | None = None) -> dict[str, Any]:
+    """Choose one inspectable clip for a scheduled SFX beat.
+
+    This is a planning read from the indexed book.  It never plays, reserves,
+    or marks a clip as heard; the durable reference is only committed when the
+    graph itself is saved.  A video is preferred whenever the station's video
+    share is a majority, which makes the graph reflect the operator's MP4
+    policy while retaining an audio fallback for a thin video shelf.
+    """
+    try:
+        cap = max(0.5, min(12.0, float(seconds or 6)))
+    except (TypeError, ValueError):
+        cap = 6.0
+    held = set(excluded or set())
+    try:
+        prefer_video = sfx_video_share() >= 50
+    except Exception:  # noqa: BLE001
+        prefer_video = True
+    try:
+        banned, weights = sfx_bans(), sfx_weights()
+    except Exception:  # noqa: BLE001
+        banned, weights = set(), {}
+    for want_video in (prefer_video, not prefer_video):
+        for _ in range(8):
+            try:
+                picked = (sfx_db_pick_short_video(cap) if want_video
+                          else sfx_db_pick_row(False))
+            except Exception:  # noqa: BLE001
+                picked = None
+            if not picked:
+                break
+            path, length = picked
+            try:
+                length = float(length or 0)
+            except (TypeError, ValueError):
+                continue
+            if not 0 < length <= cap:
+                continue
+            sid = sfx_id(path)
+            if sid in held or sid in banned or float(weights.get(sid, 1.0) or 0) <= 0.05:
+                continue
+            return {"id": sid, "name": str(path.stem)[:120],
+                    "seconds": round(length, 2), "video": bool(want_video)}
+    return {}
+
+
+def schedule_flow_sfx_assign(nodes: Any, context: str = "") -> list[dict[str, Any]]:
+    """Fill unassigned SFX beats once, keeping chosen clips unique per graph."""
+    out = schedule_flow_nodes(nodes)
+    held = {str((node.get("clip") or {}).get("id") or "")
+            for node in out if str(node.get("type") or "") == "sfx"}
+    held.discard("")
+    for node in out:
+        if str(node.get("type") or "") != "sfx":
+            continue
+        clip = _schedule_flow_clip_ref(node.get("clip"))
+        if clip:
+            continue
+        clip = schedule_flow_sfx_pick(
+            " ".join(part for part in (context, str(node.get("detail") or "")) if part),
+            node.get("seconds"), held)
+        if clip:
+            node["clip"] = clip
+            held.add(str(clip["id"]))
+    return out
+
+
+SCHEDULE_FLOW_LIBRARY_LIMIT = 120
+
+
+def _schedule_flow_graph(raw: Any, index: int = 0,
+                         known_id: str = "") -> dict[str, Any]:
+    """Clean one reusable conversation graph before it reaches the shelf."""
+    row = raw if isinstance(raw, dict) else {}
+    graph_id = str(known_id or row.get("id") or "").strip()[:64]
+    if not graph_id:
+        graph_id = f"graph-{uuid.uuid4().hex[:12]}"
+    kind = str(row.get("kind") or "").strip().lower()[:40]
+    if kind not in SCHEDULE_KIND_NAMES:
+        kind = ""
+    name = str(row.get("name") or row.get("label") or "").strip()[:80]
+    if not name:
+        name = "Untitled segment graph"
+    try:
+        minutes = float(row.get("minutes") or 3)
+    except (TypeError, ValueError):
+        minutes = 3.0
+    if minutes != minutes:
+        minutes = 3.0
+    try:
+        created_at = float(row.get("created_at") or 0)
+    except (TypeError, ValueError):
+        created_at = 0.0
+    try:
+        updated_at = float(row.get("updated_at") or 0)
+    except (TypeError, ValueError):
+        updated_at = 0.0
+    return {
+        "id": graph_id,
+        "name": name,
+        "kind": kind,
+        "minutes": round(max(0.25, min(600.0, minutes)), 3),
+        "flow": schedule_flow_nodes(row.get("flow")),
+        "flow_prompt": str(row.get("flow_prompt") or "").strip()[:1800],
+        "created_at": round(max(0.0, created_at), 3),
+        "updated_at": round(max(0.0, updated_at), 3),
+    }
+
+
+def schedule_flow_library(raw: Any) -> list[dict[str, Any]]:
+    """Return the bounded named graph shelf in the order the operator saved it."""
+    if not isinstance(raw, list):
+        return []
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for index, item in enumerate(raw[-SCHEDULE_FLOW_LIBRARY_LIMIT:]):
+        graph = _schedule_flow_graph(item, index)
+        if graph["id"] in seen:
+            graph["id"] = f"graph-{uuid.uuid4().hex[:12]}"
+        seen.add(graph["id"])
+        out.append(graph)
+    return out
+
+
+def schedule_flow_library_upsert(raw: Any, incoming: Any) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Save one named graph without letting a browser replace the whole shelf."""
+    graphs = schedule_flow_library(raw)
+    wanted = str((incoming or {}).get("id") or "").strip()[:64] \
+        if isinstance(incoming, dict) else ""
+    found = next((item for item in graphs if item["id"] == wanted), None)
+    now = round(time.time(), 3)
+    graph = _schedule_flow_graph(incoming, len(graphs), found["id"] if found else "")
+    graph["flow"] = schedule_flow_sfx_assign(
+        graph.get("flow"), " ".join((graph["name"], graph.get("flow_prompt") or "")))
+    graph["created_at"] = float(found.get("created_at") or now) if found else now
+    graph["updated_at"] = now
+    if found:
+        index = graphs.index(found)
+        graphs[index] = graph
+    else:
+        graphs.append(graph)
+    return graphs[-SCHEDULE_FLOW_LIBRARY_LIMIT:], graph
+
+
+def schedule_flow_suggestion(kind: str, minutes: Any = 3,
+                             label: str = "", notes: str = "") -> dict[str, Any]:
+    """The orchestrator's editable, duration-aware first pass at a segment."""
+    road = str(kind or "banter").strip().lower()
+    try:
+        target = max(15.0, min(36000.0, float(minutes) * 60.0))
+    except (TypeError, ValueError):
+        target = 180.0
+    shapes: dict[str, list[str]] = {
+        "news": ["news_mention", "speakerbox_quote", "sfx", "random_topic", "sfx"],
+        "caller": ["random_topic", "caller", "sfx", "caller"],
+        "banter_caller": ["random_topic", "caller", "sfx", "random_topic"],
+        "manager": ["manager_message", "random_topic", "sfx"],
+        "gallery": ["painting_ad", "sfx", "product"],
+        "ad": ["ad_drop", "sfx", "product"],
+        "record": ["sfx", "random_topic", "sfx"],
+        "recap": ["random_topic", "speakerbox_quote", "sfx"],
+    }
+    types = list(shapes.get(road) or ["random_topic", "speakerbox_quote", "sfx", "random_topic"])
+    base = sum(float(SCHEDULE_FLOW_TYPES[item]["seconds"]) for item in types)
+    scale = target / base if base > 0 else 1.0
+    nodes = []
+    for index, item in enumerate(types):
+        default = float(SCHEDULE_FLOW_TYPES[item]["seconds"])
+        # Stings remain audible, even when the operator is making a very
+        # short segment. The non-SFX beats absorb the rest of the scaling.
+        seconds = max(4.0 if item == "sfx" else 10.0, default * scale)
+        nodes.append(_schedule_flow_node({"id": f"suggested-{index + 1}",
+                                          "type": item, "seconds": seconds}, index))
+    nodes = schedule_flow_sfx_assign(
+        [node for node in nodes if node],
+        " ".join((str(label or ""), str(notes or ""))))
+    return {
+        "kind": road, "label": str(label or "")[:80],
+        "target_seconds": round(target, 1), "nodes": nodes,
+        "say": "The orchestrator laid out %d timed beats for this segment." % len(nodes),
+        "notes": str(notes or "")[:400],
+    }
+
+
+def schedule_flow_clause(slot: dict[str, Any]) -> str:
+    """Turn an operator's graph into a writer instruction every road sees."""
+    nodes = schedule_flow_nodes((slot or {}).get("flow"))
+    extra = str((slot or {}).get("flow_prompt") or "").strip()[:1800]
+    if not nodes and not extra:
+        return ""
+    parts = ["\n\nOPERATOR CONVERSATION FLOW (#1301): Follow these beats in this exact order. Each is an on-air event, not a production note. Keep moving until the segment's scheduled duration is honestly filled."]
+    for index, node in enumerate(nodes):
+        info = SCHEDULE_FLOW_TYPES.get(str(node.get("type") or ""), {})
+        line = "%d. %s for about %ss. %s" % (
+            index + 1, str(info.get("label") or node.get("type") or "beat"),
+            int(round(float(node.get("seconds") or 0))),
+            str(info.get("instruction") or ""))
+        detail = str(node.get("detail") or "").strip()
+        if detail:
+            line += " Operator detail: " + detail
+        clip = _schedule_flow_clip_ref(node.get("clip")) if node.get("type") == "sfx" else {}
+        if clip:
+            line += (" Scheduled clip: %s (%s, %.1fs). Use this selected clip "
+                     "for the on-air SFX event rather than describing a clip."
+                     % (clip["name"], "MP4" if clip["video"] else "audio",
+                        float(clip["seconds"] or 0)))
+        scripted = (_schedule_flow_scripted_line(node.get("line"))
+                    if node.get("type") == "scripted_line" else {})
+        if scripted.get("text"):
+            line += (" Scripted line for %s: %s Preserve this exact wording."
+                     % (scripted["speaker"], scripted["text"]))
+        parts.append(line)
+    if extra:
+        parts.append("ADDITIONAL SYSTEM DIRECTION FOR THIS ONE SEGMENT: " + extra)
+    return "\n".join(parts)
+
+
 def _sched_slot(raw: Any) -> dict[str, Any]:
     """One entry off the panel, cleaned. Everything missing gets a sane
     default, so a half-written row can never take the station down."""
@@ -59800,6 +61474,7 @@ def _sched_slot(raw: Any) -> dict[str, Any]:
     # about the pitch. Named here or it does not survive a save at all.
     pin = row.get("pinned_id")
     pin = str(pin).strip()[:64] if pin not in (None, "") else None
+    flow = schedule_flow_nodes(row.get("flow"))
     return {
         "id": (str(row.get("id") or "").strip()[:48]
                or f"slot-{uuid.uuid4().hex[:10]}"),
@@ -59810,6 +61485,11 @@ def _sched_slot(raw: Any) -> dict[str, Any]:
         "prompt_id": pid or None,
         "notes": str(row.get("notes") or "")[:400],
         "pinned_id": pin or None,                              # #926
+        # #1301: a per-segment conversation score plus the small instruction
+        # that accompanies only this slot. Both travel with copied presets and
+        # hour overrides, and both are passed to the writing room below.
+        "flow": flow,
+        "flow_prompt": str(row.get("flow_prompt") or "").strip()[:1800],
         # #891: the record pinned to THIS entry, if one is. Cleaned here so
         # it rides every road a slot travels — the preset shelf, an hour's
         # own copy of the order, and the panel — without a second store.
@@ -59938,6 +61618,7 @@ def schedule_defaults() -> dict[str, Any]:
         # Empty is the normal state — an hour only appears here once the
         # operator has actually changed something about it.
         "hours": {},
+        "flow_library": [],
         "prompts": {
             k["kind"]: {
                 "active": 0,
@@ -60036,6 +61717,7 @@ def schedule_read() -> dict[str, Any]:
         # #883: the per-hour overrides. Scrubbed the same way everything
         # else here is — a half-written hour is dropped, never raised on.
         store["hours"] = _sched_hours_clean(raw.get("hours"), store)
+        store["flow_library"] = schedule_flow_library(raw.get("flow_library"))
         prompts = raw.get("prompts")
         if isinstance(prompts, dict):
             for kind, blob in prompts.items():
@@ -60778,6 +62460,11 @@ def _schedule_clause(preset: str, slot: dict[str, Any], text: str,
                                    "occurrence") or ""))
             + director_lessons_clause(str(slot.get("kind") or ""))
             + director_feedback_clause(str(slot.get("kind") or ""))
+            # #1301: the operator's timed graph is a per-SLOT contract, not
+            # another generic road preference. Put it on this shared clause
+            # path so System2 and the legacy runner both execute the same
+            # sequence of news, calls, quotes, drops and SFX.
+            + schedule_flow_clause(slot)
             # [#1240/#1249] AND THE STORY AS A STAGE DIRECTION, and the
             # phone's subject for a caller entry. Here, for the reason
             # the director's notes are here: this clause is the one choke
@@ -62022,6 +63709,147 @@ async def schedule_slots_api(
     note_action(f"🗓 schedule saved: {name} "
                 f"({len(store['presets'][name])} entries) (#843)")
     return schedule_public(store)
+
+
+@app.post("/api/schedule/flow/suggest")
+async def schedule_flow_suggest_api(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Ask the orchestrator for a timed, editable opening graph.
+
+    It intentionally does not save. The graph is a proposal until the
+    operator presses Save in the segment editor, which keeps a helpful
+    suggestion from silently changing the hour on air.
+    """
+    require_auth(authorization)
+    payload = await request.json()
+    payload = payload if isinstance(payload, dict) else {}
+    return await asyncio.to_thread(
+        schedule_flow_suggestion,
+        str(payload.get("kind") or "banter"), payload.get("minutes") or 3,
+        str(payload.get("label") or ""), str(payload.get("notes") or ""))
+
+
+@app.post("/api/schedule/flow/sfx/plan")
+async def schedule_flow_sfx_plan_api(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Pick a visible clip for one new SFX graph node without saving it."""
+    require_auth(authorization)
+    payload = await request.json()
+    payload = payload if isinstance(payload, dict) else {}
+    held = {str(item).strip().lower() for item in (payload.get("excluded") or [])
+            if re.fullmatch(r"[0-9a-fA-F]{16}", str(item).strip())}
+    context = " ".join(str(payload.get(key) or "")
+                         for key in ("label", "notes", "detail", "prompt"))[:1800]
+    clip = await asyncio.to_thread(
+        schedule_flow_sfx_pick, context, payload.get("seconds") or 6, held)
+    return {"ok": bool(clip), "clip": clip,
+            "say": ("Selected " + str(clip.get("name") or "clip")
+                    if clip else "No eligible SFX clip is indexed yet.")}
+
+
+@app.get("/api/schedule/flow/library")
+async def schedule_flow_library_api(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """The reusable segment-graph shelf, separate from any one hour."""
+    require_read_auth(authorization)
+    store = schedule_read()
+    return {"graphs": [dict(graph) for graph in store.get("flow_library") or []]}
+
+
+@app.post("/api/schedule/flow/library")
+async def schedule_flow_library_save_api(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Create or update exactly one reusable graph without replacing its shelf."""
+    require_auth(authorization)
+    payload = await request.json()
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Expected an object")
+    with _SCHEDULE_LOCK:
+        store = schedule_read()
+        graphs, graph = schedule_flow_library_upsert(store.get("flow_library"), payload)
+        store["flow_library"] = graphs
+        schedule_write(store)
+    note_action("segment graph saved: " + str(graph.get("name") or "Untitled") + " (#1306)")
+    return {"ok": True, "graph": graph, "graphs": graphs,
+            "say": "Saved the reusable segment graph: " + str(graph["name"]) + "."}
+
+
+@app.post("/api/schedule/flow/slot")
+async def schedule_flow_slot_api(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Save one graph, or deliberately apply it to matching future roads.
+
+    A separate narrow endpoint prevents a graph UI with a stale copy of the
+    entire schedule from accidentally overwriting unrelated slots. General
+    list reordering still belongs to POST /api/schedule/slots.
+    """
+    require_auth(authorization)
+    payload = await request.json()
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Expected an object")
+    slot_id = str(payload.get("slot_id") or "").strip()[:48]
+    if not slot_id:
+        raise HTTPException(status_code=400, detail="Choose a scheduled segment")
+    with _SCHEDULE_LOCK:
+        store = schedule_read()
+        preset = (str(payload.get("preset") or "").strip()[:60]
+                  or str(store.get("active") or ""))
+        rows = list((store.get("presets") or {}).get(preset) or [])
+        if not rows:
+            raise HTTPException(status_code=404, detail="No such schedule")
+        target = next((row for row in rows
+                       if str((row or {}).get("id") or "") == slot_id), None)
+        if target is None:
+            raise HTTPException(status_code=404, detail="No such segment on that schedule")
+        flow = schedule_flow_sfx_assign(
+            payload.get("flow"), " ".join(str(payload.get(key) or "")
+                                              for key in ("label", "notes", "flow_prompt")))
+        flow_prompt = str(payload.get("flow_prompt") or "").strip()[:1800]
+        apply_kind = bool(payload.get("apply_kind"))
+        changed: list[dict[str, Any]] = []
+        target_kind = str(target.get("kind") or "")
+        for index, raw in enumerate(rows):
+            if not isinstance(raw, dict):
+                continue
+            is_target = str(raw.get("id") or "") == slot_id
+            if not is_target and (not apply_kind
+                                  or str(raw.get("kind") or "") != target_kind):
+                continue
+            row = dict(raw)
+            row["flow"] = flow
+            row["flow_prompt"] = flow_prompt
+            # These are the actual segment properties the editor exposes.
+            # Missing keys preserve the existing schedule rather than asking a
+            # stale browser tab to resubmit fields it never showed.
+            for field, limit in (("label", 80), ("notes", 400)):
+                if field in payload:
+                    row[field] = str(payload.get(field) or "").strip()[:limit]
+            if "minutes" in payload:
+                try:
+                    row["minutes"] = float(payload.get("minutes"))
+                except (TypeError, ValueError):
+                    pass
+            rows[index] = _sched_slot(row)
+            changed.append(rows[index])
+        store["presets"][preset] = rows
+        schedule_write(store)
+    _RADIO["sched_prompt"] = ""
+    note_action("schedule conversation flow saved: " + preset + " ("
+                + str(len(changed)) + " segment" + ("s" if len(changed) != 1 else "")
+                + ") (#1301)")
+    return {"ok": True, "preset": preset, "slots": changed,
+            "schedule": schedule_public(store),
+            "say": "Saved the conversation flow for %d segment%s." % (
+                len(changed), "s" if len(changed) != 1 else "")}
 
 
 @app.post("/api/schedule/preset")
@@ -67968,7 +69796,7 @@ async def dj_police_outside(text: str) -> None:
         page_feed_append({              # #1147: honest broadcast stamp
             "url": f"{play['path']}?t={play['sig']}",
             "text": label, "voice": voice})
-    await _episode_stage(f"{play['path']}?t={play['sig']}", label)
+    await _episode_stage_call(f"{play['path']}?t={play['sig']}", label)
     pipeline_log("air", f"megaphone outside — {character} vocode, "
                         f"sirens behind (#636)")
     # And the pair have to deal with it.
@@ -68469,6 +70297,8 @@ def _upstairs_audio_write(wav_bytes: bytes, page_id: str) -> str | None:
 
 async def dj_upstairs_page(row: dict[str, Any] | None = None) -> bool:
     """Play the manager's recorded page, then let the pair answer it."""
+    if str(_RADIO.get("voice_to") or "box") == "here" and upstairs_page_backlogged():
+        return False
     made = row or await dj_upstairs_write()
     if not made:
         return False
@@ -68500,6 +70330,9 @@ async def dj_upstairs_page(row: dict[str, Any] | None = None) -> bool:
     delivery_id = ""
     page_clip: dict[str, Any] = {}
     if to == "here" or (to in ("box", "both") and not box_accepted):
+        if upstairs_page_backlogged():
+            admission_withdraw(occurrence, "the page already holds manager audio ahead")
+            return False
         page_clip = {
             "url": f"{path}?t={sig}", "text": spoken,
             "remember_text": spoken, "seconds": seconds,
@@ -68530,7 +70363,7 @@ async def dj_upstairs_page(row: dict[str, Any] | None = None) -> bool:
     _RADIO["chat"].append(entry)
     del _RADIO["chat"][:-RADIO_CHAT_KEEP]
     try:
-        await _episode_stage(f"{path}?t={sig}", f"{boss}: {spoken}")
+        await _episode_stage_call(f"{path}?t={sig}", f"{boss}: {spoken}")
     except Exception:  # noqa: BLE001
         pass
     upstairs_update(str(made.get("id") or ""),
@@ -68569,9 +70402,19 @@ def manager_prepared_page() -> dict[str, Any] | None:
     return None
 
 
+UPSTAIRS_PAGE_MAX_AHEAD = 60.0
+
+
+def upstairs_page_backlogged() -> bool:
+    """Keep repeatable manager pages on their shelf while the page is sold."""
+    return float(_PAGE_AIR_UNTIL[0] or 0) - time.time() > UPSTAIRS_PAGE_MAX_AHEAD
+
+
 async def dj_manager_scheduled_round(track: dict[str, Any] | None = None,
                                      *, shelf_only: bool = False) -> bool:
     """Give a scheduled memo the boss's recorded voice, then its fallback."""
+    if str(_RADIO.get("voice_to") or "box") == "here" and upstairs_page_backlogged():
+        return False
     try:
         page = await asyncio.to_thread(manager_prepared_page)
     except Exception:  # noqa: BLE001
@@ -68619,8 +70462,9 @@ async def upstairs_clock() -> None:
             continue
         pending = False
         try:
-            await dj_upstairs_page()
+            pending = not await dj_upstairs_page()
         except Exception as exc:            # noqa: BLE001
+            pending = True
             pipeline_log("drop", f"a page from upstairs died: {exc}"[:200])
 
 
@@ -68884,6 +70728,14 @@ async def _episode_stage(media_path: str, text: str,
                                 "t": time.time()})
     except Exception:
         pass
+
+
+async def _episode_stage_call(media_path: str, text: str,
+                              src_path: str | Path | None = None) -> None:
+    """Stage an episode clip even when tests or plugins supply a sync hook."""
+    result = _episode_stage(media_path, text, src_path)
+    if hasattr(result, "__await__"):
+        await result
 
 
 def _episode_finalize() -> dict[str, Any] | None:
@@ -69608,6 +71460,11 @@ async def _air_produced_ad(entry: dict[str, Any], on_handoff: Any = None) -> boo
         return False
     _air_at = time.time()                                         # #892
     path, sig = f"/ads-audio/{name}", media_sign(name)
+    seconds = await _clip_seconds_async(path)
+    if seconds <= 0:
+        pipeline_log("air", "the produced advert has no measurable audio duration",
+                     extra=name[:80])
+        return False
     label = "📣 " + (entry.get("product") or "a produced spot")
     # #731: what is being SOLD right now, so the booth can light the tile of
     # the spot actually on air. A stored rerun never set this, which is why a
@@ -69634,20 +71491,31 @@ async def _air_produced_ad(entry: dict[str, Any], on_handoff: Any = None) -> boo
     # credit a temporary label identity and then credit the row again later.
     page_delivery = ""
     box_played = False
+    box_dispatched = False
     # --- broadcast admission (#1339) ---
     # The spot is one finished audio object and it exists on disk - that
     # was checked at the top of this function - so the gate can name it
     # before either road is asked to carry it.
     _ad_occurrence = await asyncio.to_thread(
         admission_admit_line,
-        {"path": path, "sig": sig}, who="dj", kind="ad",
+        {"path": path, "sig": sig, "seconds": seconds}, who="dj", kind="ad",
         text=str(entry.get("text") or label), name=label,
         line_id=str(booth_row.get("id") or ""), producer="_air_produced_ad")
     # --- broadcast admission (#1339) --- end
+    def _ad_box_dispatch() -> None:
+        nonlocal box_dispatched
+        box_dispatched = True
+        playout_tell("dispatched", str(_ad_occurrence or "")
+                     or ("box-ad:" + str(booth_row.get("id") or "")),
+                     route="box", starts_at=time.time(), seconds=seconds,
+                     producer="_air_produced_ad", lane="advert", media=path,
+                     label=label, lines=1)
+
     try:
         if page_carries_live(ad_to, ad_to in ("box", "both"), box_down):
             page_delivery = page_feed_append({
                 "url": f"{path}?t={sig}", "text": label,
+                "seconds": seconds,
                 "voice": entry.get("voice") or "", "speech": True,
                 "who": "dj", "kind": "ad", "row_id": str(booth_row.get("id") or ""),
                 "remember_text": str(entry.get("text") or label),
@@ -69655,7 +71523,12 @@ async def _air_produced_ad(entry: dict[str, Any], on_handoff: Any = None) -> boo
             if page_delivery and callable(on_handoff):
                 on_handoff()
         if ad_to in ("box", "both"):
-            box_played = bool(await _play_on_box(path, sig))
+            box_played = bool(await _play_on_box(
+                path, sig, on_dispatch=_ad_box_dispatch))
+            if box_dispatched:
+                playout_tell("ended", str(_ad_occurrence or "")
+                             or ("box-ad:" + str(booth_row.get("id") or "")),
+                             route="box", why="the box handoff returned")
             if box_played and not page_delivery and callable(on_handoff):
                 on_handoff()
     finally:
@@ -69677,7 +71550,7 @@ async def _air_produced_ad(entry: dict[str, Any], on_handoff: Any = None) -> boo
         page_delivery_apply(booth_row, page_delivery)
     if not (box_played or page_delivery):
         return False
-    await _episode_stage(f"{path}?t={sig}", label)
+    await _episode_stage_call(f"{path}?t={sig}", label)
     # #916b: EVERY road that airs a produced spot funnels through here, so
     # this is the one place worth remembering it from. A produced spot
     # never touched dj_speak, so its words were invisible to
@@ -70402,8 +72275,8 @@ async def describe_gallery_image(want: str = "",
         _look = str(prompt or "").strip() or vision_prompt_active()
         _vt0 = time.monotonic()
         async with _OLLAMA_GATE, httpx.AsyncClient(timeout=120) as client:
-            response = await client.post(
-                f"{OLLAMA_URL}/api/chat",
+            response = await recorded_ollama_post(client,
+                f"{OLLAMA_URL}/api/chat", purpose="gallery vision",
                 json={
                     # A model that can actually SEE (#441).
                     "model": VISION_MODEL,
@@ -73958,6 +75831,7 @@ def _vector_access_log(query: str, hit: dict[str, Any], ms: int,
         "ts": int(time.time()),
         "query": " ".join(str(query or "").split())[:90],
         "file": hit.get("file", ""),
+        "text": str(hit.get("text") or "")[:4000],
         "score": round(float(hit.get("score") or 0), 3),
         "ms": ms,
         "searched": n,
@@ -76925,7 +78799,7 @@ SFX_PEAK = 0.35                    # of full scale, by measurement not by ear
 # it up (the user's "SFX unable to be loud and obnoxious"). Bounded boost so
 # a quiet/noisy sample is not over-amplified.
 SFX_RMS = int(os.getenv("SFX_RMS", "3000"))
-SFX_MAX_BOOST = float(os.getenv("SFX_MAX_BOOST", "4.0"))
+SFX_MAX_BOOST = float(os.getenv("SFX_MAX_BOOST", "32.0"))
 SFX_LEVELLED = VOICE_MEDIA_DIR / "sfx"
 
 
@@ -77593,7 +79467,7 @@ def _level_voice(raw: bytes) -> bytes:
     return _wav_tail_pad(levelled, int(os.getenv("BOX_TAIL_MS", "900")))
 
 
-def _as_wav(path: Path) -> Path:
+def _as_wav(path: Path, *, timeout: float = 30.0) -> Path:
     """An mp3 turned into a wav we can measure, cached beside the levelled
     ones. The stdlib cannot decode an mp3 and the sample packs are full of
     them, so without this the loudest samples in the folder are exactly the
@@ -77613,7 +79487,7 @@ def _as_wav(path: Path) -> Path:
     try:
         subprocess.run([exe, "-nostdin", "-loglevel", "error", "-y",
                         "-i", str(path), "-ac", "1", "-ar", "22050",
-                        str(out)], check=True, timeout=30)
+                        str(out)], check=True, timeout=timeout)
     except Exception:
         out.unlink(missing_ok=True)
         return path
@@ -77988,7 +79862,7 @@ def sfx_levelled_name(path: Path, vol: float | None = None) -> Path | None:
         return None
     if vol is None:
         vol = box_gain()
-    return SFX_LEVELLED / f"{sfx_id(path)}-v2-v{int(round(vol * 20))}-{stamp}.wav"
+    return SFX_LEVELLED / f"{sfx_id(path)}-v3-v{int(round(vol * 20))}-{stamp}.wav"
 
 
 def sfx_levelled(path: Path) -> Path:
@@ -77998,8 +79872,8 @@ def sfx_levelled(path: Path) -> Path:
     sting to SFX_RMS (bounded boost) and then hard-caps the peak at SFX_PEAK,
     so nothing arrives louder than the DJ who set it up.
     ponytail: stdlib audioop, which goes away in Python 3.13. This image is
-    3.12; when it moves, these are an rms/peak scan and a multiply. The '-v2'
-    in the cache name invalidates clips levelled by the old peak-only rule."""
+    3.12; when it moves, these are an rms/peak scan and a multiply. The '-v3'
+    cache name invalidates clips capped at 4x before quiet media could be heard."""
     import audioop
     import wave
 
@@ -79295,11 +81169,8 @@ def _sfx_cadence_pick() -> Path | None:
              for root in (SFX_ROOT, SFX_LOCAL_ROOT)
              for folder in (settings.get("sfx_drop_folders") or [])]
     banned, weights = sfx_bans(), sfx_weights()
-    # #1263: AUDIO ONLY on this road. Cadence punctuation is WELDED into
-    # the round's own wav by the concat graph - there is no picture in a
-    # rendered round for a video clip to be seen in, and its soundtrack
-    # alone is not what the operator asked for. Video airs through
-    # dj_sting, which can open the set.
+    # This is the audio fallback pool. Video candidates come from the
+    # indexed clip book and carry a silent picture cue at their row offset.
     pool = [Path(p) for p in _SFX_POOL_CACHE
             if any(Path(p).is_relative_to(root) for root in roots)
             and sfx_id(Path(p)) not in banned
@@ -79327,7 +81198,7 @@ def _sfx_cadence_pick() -> Path | None:
     for _ in range(min(64, len(pool))):
         path = random.choices(pool, weights=[weights.get(sfx_id(p), 1.0) for p in pool], k=1)[0]
         pool.remove(path)
-        if path.is_file() and 0 < sfx_seconds(path) <= sfx_cap_seconds():
+        if path.is_file() and 0 < sfx_seconds(path) <= min(12.0, sfx_cap_seconds()):
             # Still written: other readers report what went out last. It is
             # simply no longer the thing that decides what may go out next.
             _SFX_CADENCE_STATUS["last_sample"] = str(path)
@@ -79343,6 +81214,37 @@ def _sfx_cadence_pick() -> Path | None:
                 if _RECENT_DIRTY[0] >= RECENT_SAVE_EVERY:
                     _recent_save()
             return path
+    return None
+
+
+def _sfx_cadence_video_pick(after: str) -> tuple[Path, Path, float, str] | None:
+    """A picture whose audio can join the broadcast; all share I/O is off-loop."""
+    candidates: list[tuple[Path, float, str]] = []
+    if sfx_match_on(False):
+        matched = sfx_match_sting_pick(after, want_video=True)
+        if matched:
+            path = Path(matched[0])
+            candidates.append((path, sfx_seconds(path), str(matched[1] or "")))
+    banned, weights = sfx_bans(), sfx_weights()
+    for _ in range(min(6, SFX_CADENCE_TRIES)):
+        row = sfx_db_pick_short_video(min(12.0, sfx_cap_seconds()))
+        if not row:
+            break
+        path, seconds = row
+        key = sfx_id(path)
+        if (key in banned or weights.get(key, 1.0) <= 0.05
+                or sting_recent(str(path)) or sfx_video_on_cooldown(key)):
+            continue
+        candidates.append((path, float(seconds), ""))
+    for path, seconds, why in candidates[:2]:
+        if not 0 < seconds <= min(12.0, sfx_cap_seconds()):
+            continue
+        source = _as_wav(path, timeout=4.0)
+        if source.suffix.lower() != ".wav" or not source.is_file() or sfx_is_silent(source):
+            continue
+        audio = sfx_levelled(source)
+        if audio.suffix.lower() == ".wav" and audio.is_file():
+            return path, audio, seconds, why
     return None
 
 
@@ -79376,15 +81278,9 @@ async def _sfx_cadence_additions_inner(who: str, text: str, completed: int,
 
     if sfx_due_after(completed, int(settings.get("sfx_every_units") or 0)):
         _SFX_CADENCE_STATUS["sample_due"] += 1
-        # #1185: the cadence is the OTHER road that welds a sound effect
-        # into the round's own wav, and #1263 made it audio-only on
-        # purpose - which is exactly what makes it a second track under
-        # the endless set. While the video is the singular SFX track it
-        # is not picked at all; `sample_omitted` below counts it as the
-        # omission it is, and _SFX_SOUNDBOARD counts WHY. The SFX guy's
-        # own half of this function - his voice, his take, his quip - is
-        # three lines down and is deliberately not touched: "Continue to
-        # have the SFX guy do dialogue."
+        # Endless-video mode owns the SFX lane when active. Otherwise the
+        # normal cadence may use indexed MP4 soundtracks in the welded round;
+        # its picture is timed separately and kept silent on every surface.
         # [#1389] A CLIP THAT DOES NOT FIT SHOULD COST A DRAW, NOT THE SLOT.
         #
         # "The SFX guy needs to be playing a clip every two lines of
@@ -79405,21 +81301,83 @@ async def _sfx_cadence_additions_inner(who: str, text: str, completed: int,
         # of the two reasons it was, because "nothing was drawn" and
         # "nothing drawn was short enough" want different cures.
         sample = None
+        audio = None
         duration = 0.0
+        why = ""
         _drew = 0
+        share = sfx_video_share() / 100.0
+        direction = choose_due_cue(
+            (CueCandidate("video", 1.0, True), CueCandidate("audio", 1.0, False)),
+            max_seconds=max(1.0, sfx_cap_seconds()), random_float=random.random,
+            pick=lambda keys: keys[0], video_share=share)
+        requested_video = bool(direction and direction.video)
+        # [#1461] A BANKED ROUND HONOURS THE PICTURE SHARE TOO. Banked
+        # rounds are most of the air (render is slower than speech), and
+        # this used to force them audio-only whenever the endless set was
+        # off - so sfx_video_share=80 meant ~0 pictures: 21 of 22 board
+        # plays on 2026-09-26 were audio. The picture is rung by the same
+        # _sfx_cadence_pictures(rows, _pstart) on either road, and a short
+        # book clip decodes in 0.06-0.16 s off the share, measured. What
+        # made the pictures miss their line was the page running 290 s
+        # behind an air cursor that ignored owed clips (#1460), not the
+        # banked road.
         if not sfx_soundboard_hold_cadence():
-            for _try in range(SFX_CADENCE_TRIES):
-                _cand = await asyncio.to_thread(_sfx_cadence_pick)
-                if _cand is None:
-                    break
-                _drew += 1
-                _secs = sfx_seconds(_cand)
-                if fits(_secs):
-                    sample, duration = _cand, _secs
+            for want_video in (requested_video, not requested_video):
+                if want_video:
+                    got = await asyncio.to_thread(_sfx_cadence_video_pick, text)
+                    if got:
+                        _drew += 1
+                        candidate, candidate_audio, secs, candidate_why = got
+                        if fits(secs):
+                            sample, audio, duration, why = (candidate, candidate_audio,
+                                                            secs, candidate_why)
+                            break
+                    continue
+                if ready_takes is None and sfx_match_on(False):
+                    matched = await asyncio.to_thread(sfx_match_sting_pick, text, False)
+                    if matched:
+                        candidate = Path(matched[0])
+                        secs = await asyncio.to_thread(sfx_seconds, candidate)
+                        _drew += 1
+                        if not sfx_is_video(candidate) and fits(secs):
+                            levelled = await asyncio.to_thread(sfx_levelled, candidate)
+                            sample, audio, duration, why = (candidate, levelled,
+                                                            secs, str(matched[1] or ""))
+                            break
+                for _try in range(SFX_CADENCE_TRIES):
+                    candidate = await asyncio.to_thread(_sfx_cadence_pick)
+                    if candidate is None:
+                        break
+                    _drew += 1
+                    secs = await asyncio.to_thread(sfx_seconds, candidate)
+                    if fits(secs):
+                        levelled = (candidate if ready_takes is not None
+                                    else await asyncio.to_thread(sfx_levelled, candidate))
+                        sample, audio, duration = candidate, levelled, secs
+                        break
+                if sample:
                     break
         if sample:
             additions.append({"path": str(sample), "who": "board", "text": "🔊 " + sample.stem,
                               "seconds": duration, "sfx_sample_id": sfx_id(sample)})
+            additions[-1]["path"] = str(audio or sample)
+            if sfx_is_video(sample):
+                additions[-1].update({"sfx_video_id": sfx_id(sample),
+                                      "sfx_video_seconds": duration,
+                                      "sfx_match_why": why})
+            if ready_takes is None and complaint_due():
+                other = "dj" if who == "cohost" else "cohost"
+                voice = configured_radio_voice(other)
+                if voice:
+                    phrase = random.choice(COMPLAINT_LINES)
+                    take = await voice_render_any(phrase, voice, who=other)
+                    if take and take.get("path"):
+                        length = await _clip_seconds_async(take["path"])
+                        if length > 0 and fits(length):
+                            additions.append({
+                                "path": str(VOICE_MEDIA_DIR / str(take["path"]).rsplit("/", 1)[-1]),
+                                "who": other, "text": phrase, "voice": voice,
+                                "seconds": length, "sfx_reaction_for": sfx_id(sample)})
         else:
             _SFX_CADENCE_STATUS["sample_omitted"] += 1
             _SFX_CADENCE_STATUS["omit_why"] = (
@@ -79640,13 +81598,60 @@ def _sfx_cadence_audible(rows, position: float, previous: float = 0.0) -> None:
                  "sample": str(r.get("sfx_sample_id") or "")} for r in complete]
     added = set(_SFX_CADENCE.record(receipts)) if receipts else set()
     for row in complete:
-        if str(row["id"]) in added and row.get("sfx_sample_id"):
+        heard = str(row["id"]) in added
+        if heard and row.get("sfx_sample_id"):
+            sample_name = str(row.get("text") or "").removeprefix("🔊 ")
             try:
-                sfx_note_play(str(row["sfx_sample_id"]), str(row.get("text") or "").removeprefix("🔊 "), "board")
+                sample_id = str(row["sfx_sample_id"])
+                sfx_note_play(sample_id, sample_name, "board")
+                # A cadence clip is welded into a finished broadcast clip, not
+                # sent through dj_sting().  It still needs the same durable
+                # on-air history as a manually cued sting once its receipt is
+                # audible, otherwise the operator sees a silent board while
+                # the mixed programme is actually playing it.
+                source = sfx_by_id(sample_id)
+                if source:
+                    sfx_history_add(source, "board")
             except Exception:
                 pass  # the durable cadence receipt is already saved
-        if str(row["id"]) in added and row.get("sfxguy_reservation"):
+            # History is durable but lives in its own drawer. Make the
+            # confirmed playout visible in the live feed, never at draw time.
+            note_activity(
+                "sfx",
+                "MP4 clip heard" if row.get("sfx_video_id") else "audio clip heard",
+                line=str(row["id"]), text=sample_name,
+                speaker="The SFX Guy")
+        elif heard and row.get("sfxguy_reservation"):
+            note_activity("sfxguy", "interjection heard", line=str(row["id"]),
+                          text=str(row.get("text") or ""),
+                          speaker="The SFX Guy")
+        elif heard and row.get("sfx_reaction_for"):
+            speaker = booth_actor_name(str(row.get("who") or ""), "")
+            note_activity("sfxreaction", "reacted to the board", line=str(row["id"]),
+                          text=str(row.get("text") or ""), speaker=speaker)
+        if heard and row.get("sfx_video_id"):
+            try:
+                sfx_video_note_played(str(row["sfx_video_id"]))
+            except Exception:
+                pass
+        if heard and row.get("sfxguy_reservation"):
             sfxguy_ready_commit(str(row["sfxguy_reservation"]))
+
+
+def _sfx_cadence_pictures(rows, starts_at: float) -> None:
+    """Ring a silent picture at the audible board row's measured offset."""
+    for row in rows:
+        key = str(row.get("sfx_video_id") or "")
+        if not key:
+            continue
+        page_picture_append({
+            "url": "/sfx/%s?t=%s" % (key, media_sign(key)),
+            "id": key, "sting": str(row.get("text") or "SFX")[:120],
+            "seconds": float(row.get("sfx_video_seconds") or 0),
+            "length": float(row.get("sfx_video_seconds") or 0),
+            "silent_picture": True,
+            "why": str(row.get("sfx_match_why") or ""),
+        }, at_ms=int((starts_at + float(row.get("from") or 0)) * 1000))
 
 
 
@@ -79834,7 +81839,8 @@ def sfx_cycle_slot(real: Any) -> float:
     return max(SFX_CYCLE_SHORTEST, round(got, 2))
 SFX_CYCLE_LEAD = 1.0             # hand the set the next one this early
 _SFX_CYCLE: dict[str, Any] = {"at": 0.0, "until": 0.0, "rung": 0,
-                              "clip": "", "why": "", "shuffle_epoch": 0}
+                              "clip": "", "why": "", "shuffle_epoch": 0,
+                              "hour_marker": "", "hour_rolls": 0}
 
 
 # #1395: THE PLAYLIST, RUNG AHEAD.
@@ -80264,6 +82270,35 @@ async def sfx_video_fresh_pick(tries: int = 40) -> Any:
     return None
 
 
+def sfx_video_hourly_rebuild(now: float | None = None) -> bool:
+    """Advance the endless runway at an hour boundary without unspending its deck.
+
+    The database deck, not a short in-memory shuffle, remains the source of
+    truth.  Rebuilding the runway only removes future reservations; every
+    selection already aired stays spent in the same deck generation, so an
+    hour change cannot quietly reintroduce the clip that dominated the last
+    hour.
+    """
+    now = float(now or time.time())
+    marker = time.strftime("%Y%m%d%H", time.localtime(now))
+    previous = str(_SFX_CYCLE.get("hour_marker") or "")
+    if marker == previous:
+        return False
+    _SFX_CYCLE["hour_marker"] = marker
+    if not previous:
+        return False                         # starting the set is not a rollover
+    now_ms = int(now * 1000)
+    ring = _RADIO.setdefault("voice_clips", [])
+    ring[:] = [row for row in ring if not (
+        isinstance(row, dict) and row.get("endless")
+        and int(row.get("broadcast_ms") or row.get("ts") or 0) >= now_ms)]
+    _SFX_CYCLE["shuffle_epoch"] = int(_SFX_CYCLE.get("shuffle_epoch") or 0) + 1
+    _SFX_CYCLE["hour_rolls"] = int(_SFX_CYCLE.get("hour_rolls") or 0) + 1
+    _SFX_CYCLE.update({"queued": 0, "until": now, "why": "hourly deck refresh"})
+    pipeline_log("air", "endless video: rebuilt the unique hourly runway")
+    return True
+
+
 async def sfx_video_cycle() -> None:
     """Keep the set's queue topped up for as long as the mode is on."""
     plan: list[dict[str, Any]] = []          # what has been rung, in order
@@ -80278,6 +82313,10 @@ async def sfx_video_cycle() -> None:
                 await asyncio.sleep(3.0)
                 continue
             now = time.time()
+            if sfx_video_hourly_rebuild(now):
+                # The native wall may finish the one frame it already owns,
+                # but all subsequent offers are new, database-backed picks.
+                plan = []
             epoch = int(_SFX_CYCLE.get("shuffle_epoch") or 0)
             if epoch != plan_epoch:
                 # Shuffle owns the whole upcoming runway.  Keeping this
@@ -81009,18 +83048,6 @@ def sting_due(after: str = "") -> Path | None:   # [#1251] the line it follows
     return Path(names) if names else None
 
 
-# How the booth feels about the sample that just went off (#292).
-STING_REACTIONS = (
-    "Ugh. Was that necessary?",
-    "Do we need to do that every single time?",
-    "I hate that button. I hate it.",
-    "That was inappropriate and you know it.",
-    "Every time. Every time with that thing.",
-    "Warn me before you hit that. Please.",
-    "Anyway. Moving on.",
-)
-
-
 async def _sting_react(who: str) -> None:
     """The OTHER presenter groans at the sample (#292), then the show
     carries on. by_hand so a groan is never busy-dropped mid-round; the
@@ -81028,7 +83055,7 @@ async def _sting_react(who: str) -> None:
     try:
         await asyncio.sleep(0.7)
         await dj_speak("reply", None,
-                       line=unrepeated(list(STING_REACTIONS), "sting-react"),
+                       line=unrepeated(list(COMPLAINT_LINES), "sting-react"),
                        who=who, by_hand=True)
     except Exception:
         pass
@@ -82570,7 +84597,7 @@ async def dj_sting(to_box: bool, after: str = "", who: str = "",
     # too (#560) - staged from the SFX store, which lives outside /media.
     # A video is not staged: the episode concat graph maps one audio output.
     if not is_video:
-        await _episode_stage(f"/sfx/{key}", f"[sfx] {sample.stem}",
+        await _episode_stage_call(f"/sfx/{key}", f"[sfx] {sample.stem}",
                              src_path=sample)
     _sting_started = time.monotonic()
     # Only where the line itself went. Queued for a browser in box-only mode
@@ -82654,7 +84681,7 @@ async def dj_sting(to_box: bool, after: str = "", who: str = "",
         except Exception:  # noqa: BLE001
             pass
     # Sometimes the other presenter has FEELINGS about the sample (#292).
-    if who in ("dj", "cohost", "third") and random.random() < 0.3:
+    if played_anywhere and who in ("dj", "cohost", "third") and complaint_due():
         other = "cohost" if who != "cohost" else "dj"
         asyncio.create_task(_sting_react(other))
     return sample.name
@@ -83018,6 +85045,13 @@ def gold_pick(exclude_who: str = "", min_rest: float | None = None) -> dict[str,
     try:
         now = time.time()
         rest = GOLD_REST if min_rest is None else float(min_rest)
+        # Gap-fill callers used to pass their five-minute cadence straight
+        # through, bypassing the spoken-line repeat window. Keep the gold
+        # exception consistent with air_repeat_check: at most half the
+        # configured window, but never sooner than this road's own rest.
+        window = repeat_window()
+        if window > 0:
+            rest = max(rest, window / 2.0)
         # #1412: THE STAT COMES LAST. This stat'ed every gold row - 1,400
         # of them - on the event loop per pick, against a disk the vector
         # store was being written to; the pulse caught it at 6.8 s, five
@@ -85933,7 +87967,8 @@ def _ready_runway_no(kind: str) -> str:                               # [#1281]
 def _ready_round_fits(kind: str, takes: list[dict[str, Any]],
                       window: dict[str, Any] | None = None, *,
                       seconds: float | None = None,
-                      start_at: float | None = None) -> bool:
+                      start_at: float | None = None,
+                      exclude_key: str = "") -> bool:
     """Keep the complete saved performance inside its reserved occurrence."""
     import math
 
@@ -85970,7 +88005,7 @@ def _ready_round_fits(kind: str, takes: list[dict[str, Any]],
                          + max(0.0, float(os.getenv("BOX_TAIL_MS", "900"))) / 1000.0)
         else:
             duration = float(seconds)
-        if not takes or not math.isfinite(duration) or duration <= 0:
+        if (seconds is None and not takes) or not math.isfinite(duration) or duration <= 0:
             return False
         # Five seconds for assembly before it has happened; an actual joined
         # stream pays only its measured length and a final publication margin.
@@ -85990,17 +88025,13 @@ def _ready_round_fits(kind: str, takes: list[dict[str, Any]],
             # appended to the feed as `prepared`, and refused when its
             # entry has closed underneath it. 1,592 such rows in 48 h.
             #
-            # ONLY on the pre-render call. Every hand-off caller passes
-            # `seconds` - its measured joined length - and has already had
-            # its own reservation excluded by _pstart's exclude_key;
-            # charging it again here would refuse a round standing at the
-            # door with its clip welded. In `off` and `shadow`
-            # playout_floor() is 0.0 and this changes nothing.
-            if seconds is None:
-                try:
-                    begins = max(begins, float(playout_floor() or 0.0))
-                except Exception:  # noqa: BLE001
-                    pass
+            # A measured-length preflight has not reserved its own place
+            # yet. At handoff, exclude that round's hold to avoid charging
+            # it for its own wait.
+            try:
+                begins = max(begins, float(playout_floor(exclude_key=exclude_key) or 0.0))
+            except Exception:  # noqa: BLE001
+                pass
         if start_at is not None:
             begins = max(begins, float(start_at))
         # #1166: a finished segment may run past the fold rather than not
@@ -86012,6 +88043,19 @@ def _ready_round_fits(kind: str, takes: list[dict[str, Any]],
                 and begins + duration + 1.0 <= deadline + grace)
     except (TypeError, ValueError, OSError):
         return False
+
+
+def _scheduled_first_handoff_fits(meta: dict[str, Any],
+                                  takes: list[dict[str, Any]] | None,
+                                  seconds: float, *, start_at: float | None = None,
+                                  exclude_key: str = "") -> bool:
+    """Check the first handoff even when a saved round renders turns live."""
+    kind = str(meta.get("prep_kind") or "")
+    if meta.get("_ready_free") or (takes is None and not kind):
+        return True
+    return _ready_round_fits(kind, takes or [], meta.get("_ready_slot"),
+                             seconds=seconds, start_at=start_at,
+                             exclude_key=exclude_key)
 
 
 def unheard_free(kind: str, row: Any) -> bool:
@@ -89436,6 +91480,61 @@ async def dj_callin(topic: str, caller: str = "") -> dict[str, Any]:
 DRUDGE_URL = os.getenv("DRUDGE_URL", "https://drudgereport.com")
 _DRUDGE_CACHE: dict[str, Any] = {"at": 0.0, "headlines": []}
 DRUDGE_TTL = 600.0                     # the front page churns; ten minutes
+NEWS_STORY_CHOICES_PATH = data_path("news_story_choices.json")
+_NEWS_STORY_CHOICES_LOCK = RLock()
+_NEWS_DOSSIERS: dict[str, dict[str, Any]] = {}
+
+
+def news_story_choice(slot_id: str) -> dict[str, Any]:
+    """A future occurrence's editorial selection, not a global news setting."""
+    with _NEWS_STORY_CHOICES_LOCK:
+        try:
+            rows = json.loads(NEWS_STORY_CHOICES_PATH.read_text("utf-8"))
+            row = rows.get(str(slot_id or ""), {}) if isinstance(rows, dict) else {}
+            return dict(row) if isinstance(row, dict) else {}
+        except (OSError, ValueError, TypeError):
+            return {}
+
+
+def news_story_choose(slot_id: str, story: dict[str, str]) -> dict[str, Any]:
+    url = news_public_url(str(story.get("url") or ""))
+    if not url or not slot_id:
+        raise ValueError("Choose a current public news story")
+    row = {"url": url, "title": str(story.get("title") or "")[:300],
+           "at": time.time()}
+    with _NEWS_STORY_CHOICES_LOCK:
+        try:
+            rows = json.loads(NEWS_STORY_CHOICES_PATH.read_text("utf-8"))
+            rows = rows if isinstance(rows, dict) else {}
+        except (OSError, ValueError, TypeError):
+            rows = {}
+        rows[str(slot_id)] = row
+        rows = {key: value for key, value in rows.items()
+                if time.time() - float(value.get("at") or 0) < 7 * 86400}
+        NEWS_STORY_CHOICES_PATH.parent.mkdir(parents=True, exist_ok=True)
+        temp = NEWS_STORY_CHOICES_PATH.with_suffix(".tmp")
+        temp.write_text(json.dumps(rows, ensure_ascii=False), "utf-8")
+        temp.replace(NEWS_STORY_CHOICES_PATH)
+    return row
+
+
+async def news_story_dossier(story: dict[str, str], *, budget: float = 12.0) -> dict[str, Any]:
+    url = news_public_url(str(story.get("url") or ""))
+    if not url:
+        return {"title": str(story.get("title") or ""), "url": "",
+                "availability": "unavailable", "excerpt": "", "article_text": ""}
+    hit = _NEWS_DOSSIERS.get(url)
+    if hit and time.time() - float(hit.get("_cached_at") or 0) < DRUDGE_TTL:
+        return dict(hit)
+    row = await fetch_news_dossier(url, title=str(story.get("title") or ""),
+                                   search=search_searxng, extract=newsread_extract,
+                                   budget_seconds=budget)
+    row["_cached_at"] = time.time()
+    _NEWS_DOSSIERS[url] = row
+    if len(_NEWS_DOSSIERS) > 100:
+        for old in sorted(_NEWS_DOSSIERS, key=lambda key: _NEWS_DOSSIERS[key].get("_cached_at", 0))[:30]:
+            _NEWS_DOSSIERS.pop(old, None)
+    return dict(row)
 
 # --- #921: EVERY STORY ON EVERY PAGE ---------------------------------
 #
@@ -89823,7 +91922,8 @@ async def drudge_story(url: str) -> str:
 async def _news_once(hourly: bool = False,
                      bank_to: list[dict[str, Any]] | None = None,
                      avoid: list[str] | None = None,
-                     more: int = 0) -> list[str]:
+                     more: int = 0,
+                     selected: dict[str, str] | None = None) -> list[str]:
     """ONE stretch of news — a bulletin, or one stretch of the segment.
 
     On the hour it is a bulletin — the lead plus a sample of the page; the
@@ -89923,7 +92023,10 @@ async def _news_once(hourly: bool = False,
     # #921: the WHOLE page now, because drudge_parse's own cap no longer
     # throws two thirds of it away before anybody looks at it.
     _page = await drudge_headlines(NEWS_PAGE_MOST)
-    if hourly:
+    if selected and news_public_url(str(selected.get("url") or "")):
+        picks = [{"title": str(selected.get("title") or "Selected news story"),
+                  "url": news_public_url(str(selected["url"]))}]
+    elif hourly:
         # The bulletin on the hour is untouched: the lead still leads it,
         # spread across the bands of the page, exactly as #248 built it.
         picks = news_selection(_page, True)
@@ -89937,17 +92040,31 @@ async def _news_once(hourly: bool = False,
     # Go INTO one or two of them: the actual article, boiled down, so the
     # desk conveys real information instead of a headline said twice.
     briefs = []
+    dossier_rows = []
     for story in picks[:2]:
-        body = await drudge_story(story.get("url", ""))
+        dossier = await news_story_dossier(story)
+        dossier_rows.append(dossier)
+        body = str(dossier.get("article_text") or dossier.get("excerpt") or "")[:6000]
         if body:
-            briefs.append(f"FULL STORY — {story['title']}:\n{body}")
+            briefs.append("SOURCE DOSSIER - %s\nPublisher: %s\nAvailable as: %s via %s\n"
+                          "Evidence: %s\n%s" % (
+                              story["title"], urlparse(story.get("url", "")).hostname or "unknown",
+                              dossier.get("availability") or "metadata",
+                              dossier.get("method") or "unknown",
+                              ", ".join(dossier.get("evidence_links") or [story.get("url", "")])[:700],
+                              body))
             try:                                            # #1036 (G1)
                 await asyncio.to_thread(
                     airlog_news_summary, str(story.get("url") or ""),
                     str(story.get("title") or ""), body)
             except Exception:  # noqa: BLE001
                 pass
-    dug = ("\n\n" + "\n\n".join(briefs)) if briefs else ""
+        else:
+            briefs.append("HEADLINE ONLY - %s (%s). No verified article detail is available; "
+                          "do not invent it." % (story["title"], story.get("url") or ""))
+    dug = ("\n\nUse only facts in these dossiers. An excerpt or metadata is not a full "
+           "article; distinguish questions and opinion from verified facts. Name the "
+           "publisher naturally on air.\n\n" + "\n\n".join(briefs)) if briefs else ""
     when = time.strftime("%I:%M %p", time.localtime()).lstrip("0")
     if hourly:
         angle = (
@@ -90036,7 +92153,11 @@ async def _news_once(hourly: bool = False,
                 bank_to[-1]["prep_news_titles"] = _titles
                 bank_to[-1]["prep_news_stories"] = [        # #1036 (G1)
                     {"title": str(h.get("title") or ""),
-                     "url": str(h.get("url") or "")} for h in picks]
+                     "url": str(h.get("url") or ""),
+                     "availability": str((dossier_rows[i] if i < len(dossier_rows) else {}).get("availability") or "metadata"),
+                     "method": str((dossier_rows[i] if i < len(dossier_rows) else {}).get("method") or "headline"),
+                     "excerpt": str((dossier_rows[i] if i < len(dossier_rows) else {}).get("excerpt") or "")[:1400]}
+                    for i, h in enumerate(picks)]
         except Exception:  # noqa: BLE001
             pass
     return _said
@@ -90541,7 +92662,8 @@ def _news_slot_left_old() -> float:
 async def dj_news(hourly: bool = False,
                   bank_to: list[dict[str, Any]] | None = None,
                   avoid: list[str] | None = None,
-                  shelf_only: bool = False) -> list[str]:
+                  shelf_only: bool = False,
+                  selected: dict[str, str] | None = None) -> list[str]:
     """THE NEWS SEGMENT — for as long as the segment lasts (#921).
 
     "I'm listening to this news segment and there is no news being
@@ -90575,7 +92697,7 @@ async def dj_news(hourly: bool = False,
     avoid = avoid if avoid is not None else []
     if shelf_only or (bank_to is None and talk_is_incessant()):
         return await _ready_shelf_air("news", _RADIO.get("now"))
-    said = await _news_once(hourly, bank_to, avoid)
+    said = await _news_once(hourly, bank_to, avoid, selected=selected)
     if bank_to is not None:
         return said                     # banking one, not airing a segment
     left = news_slot_left()
@@ -94868,7 +96990,7 @@ async def call_rerun_take(track: dict[str, Any] | None = None) -> list[str]:
             except Exception:  # noqa: BLE001
                 pass
             try:
-                await _episode_stage(
+                await _episode_stage_call(
                     str(VOICE_MEDIA_DIR / key),
                     f"☎ {name} — back on the line (re-air)")
             except Exception:  # noqa: BLE001
@@ -98703,6 +100825,10 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
     _round_entries: list[dict[str, Any]] = []
     ready_meta = (dict(ready_takes[0].get("round") or {}) if ready_takes
                   else dict(round_meta or {}))
+    if (any(line_forgotten(str(take.get("text") or "")) for take in (ready_takes or []))
+            or any(line_forgotten(text) for _, text in turns)):
+        pipeline_log("drop", "a round carrying an operator-forgotten line was withheld")
+        return []
     if ready_takes is None and not await _system2_repeat_rows_async(
             [{"text": spoken_text(text)} for _, text in turns], ready_meta):
         return []
@@ -99127,6 +101253,13 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
     if not await _system2_repeat_rows_async(playlist, ready_meta):
         return []
 
+    # The feed receives this at render start, not after the completed clip is
+    # published. It can therefore show which person is being rendered and how
+    # far the actual script has progressed while the engine is still working.
+    for _script_index, _script_item in enumerate(playlist):
+        _script_item["script_index"] = _script_index + 1
+        _script_item["script_total"] = len(playlist)
+
     def _turn_voice(item: dict[str, Any]) -> str | None:
         if ready_takes is not None:
             return str(item.get("voice") or "")
@@ -99202,7 +101335,10 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
             try:
                 _made = await voice_render_any(
                     text, v, "" if cold else engine,
-                    fx=_turn_fx(item), who=item["who"])
+                    fx=_turn_fx(item), who=item["who"],
+                    line=str(item.get("line_id") or ""),
+                    script_index=int(item.get("script_index") or 0),
+                    script_total=int(item.get("script_total") or 0))
             finally:
                 engine_live_exit()
             take_note(item["who"], v, engine, text, _made,
@@ -99478,7 +101614,10 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                         clip = await voice_generate(
                             spoken_text(item["chunk"]), v,
                             voice_engine_for(v), fx=_turn_fx(item),
-                            line=str(item.get("line_id") or ""))   # #1277
+                            line=str(item.get("line_id") or ""),
+                            speaker=booth_actor_name(str(item.get("who") or ""), ""),
+                            script_index=int(item.get("script_index") or 0),
+                            script_total=int(item.get("script_total") or 0))   # #1277
                     except Exception:
                         clip = None
                     # A clone that fails must NOT drop the turn from the call —
@@ -99492,7 +101631,10 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                     if not clip:
                         clip = await voice_render_any(
                             spoken_text(item["chunk"]), v, fx=_turn_fx(item),
-                            who=item["who"])
+                            who=item["who"],
+                            line=str(item.get("line_id") or ""),
+                            script_index=int(item.get("script_index") or 0),
+                            script_total=int(item.get("script_total") or 0))
                 if not (clip and clip.get("path")):
                     # #767: premake missed, the re-render raised and piper
                     # raised too. This had no else — the turn vanished out of
@@ -99822,7 +101964,7 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                             / one["path"].rsplit("/", 1)[-1]))
                 # The call belongs in the rolling episode too (its per-turn chat
                 # entries bypass dj_speak's capture) (#548).
-                await _episode_stage(
+                await _episode_stage_call(
                     one["path"],
                     ("☎ " + caller_name + " — the full call")
                     if caller_name else "🎙 the booth — a full round")
@@ -100072,7 +102214,9 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                         },
                     }
                     _extra_fields = {k: v for k, v in _sfx_meta.get(_row, {}).items()
-                                     if k in ("voice", "sfx_sample_id", "sfxguy_reservation")}
+                                     if k in ("voice", "sfx_sample_id", "sfxguy_reservation",
+                                              "sfx_video_id", "sfx_video_seconds",
+                                              "sfx_match_why", "sfx_reaction_for")}
                     entry.update(_extra_fields)
                     # #1201: where this line sits in its script.
                     entry.update({"sid": _round_sid, "turn": int(_ti),
@@ -100403,12 +102547,11 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                     # may refuse a round that has not begun; it may not
                     # abandon a conversation the listener is already hearing -
                     # that is a caller cut off mid-sentence with no sign-off.
-                    if (not played_any) and ready_takes is not None and (
+                    if (not played_any) and (ready_takes is not None or ready_meta.get("prep_kind")) and (
                             radio_paused() or not _RADIO.get("on")
-                            or (not ready_meta.get("_ready_free")   # 2026-09-14: the free road
-                                                                and not _ready_round_fits(str(ready_meta.get("prep_kind") or ""),
-                                ready_takes, ready_meta.get("_ready_slot"),
-                                seconds=length, start_at=_pstart))
+                            or not _scheduled_first_handoff_fits(
+                                ready_meta, ready_takes, length,
+                                start_at=_pstart, exclude_key=_pl_key)
                             or (callable(can_handoff) and not can_handoff())):
                         _burst_withdraw(_entries, _burst_refusal_why(ready_meta, length, _pstart, can_handoff))   # 2026-09-14
                         _sfx_cadence_release(_sfx_meta.values())
@@ -100433,6 +102576,8 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                         **({"ready_round": ready_meta}
                            if ready_takes is not None else {}),
                     })
+                    if page_delivery:
+                        _sfx_cadence_pictures(rows, _pstart)
                     if ready_takes is not None and page_delivery and callable(on_handoff):
                         on_handoff()
                     for _entry in _entries:
@@ -100447,8 +102592,13 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                 # actually carrying the stream. Page-routed streams start their
                 # booth clock in djVoiceNext.onplaying, because a browser queue
                 # can lag behind the server handoff.
-                if to_box:
+                _box_dispatched = False
+                def _box_dispatch() -> None:
+                    nonlocal _box_dispatched
+                    _box_dispatched = True
                     _stream_now_set(rows, length)
+                    if not page_delivery:
+                        _sfx_cadence_pictures(rows, time.time())
                     playout_tell(                          # [#1218]
                         "dispatched", str(_round_occurrence or "")
                         or ("box:" + str(one.get("sig") or "")),
@@ -100477,18 +102627,26 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                         _burst_withdraw(_entries, "System2 counts these lines as already aired - a repeat")   # 2026-09-14
                         _sfx_cadence_release(_sfx_meta.values())
                         return []
-                    if (not played_any and ready_takes is not None and not page_delivery
+                    if (not played_any and not page_delivery
+                            and (ready_takes is not None or ready_meta.get("prep_kind"))
                             and (radio_paused() or not _RADIO.get("on")
-                                 or (not ready_meta.get("_ready_free")   # 2026-09-14: the free road
-                                                                and not _ready_round_fits(str(ready_meta.get("prep_kind") or ""),
-                                     ready_takes, ready_meta.get("_ready_slot"), seconds=length))
+                                 or not _scheduled_first_handoff_fits(
+                                     ready_meta, ready_takes, length,
+                                     exclude_key=_pl_key)
                                   or (callable(can_handoff) and not can_handoff()))):
                         _burst_withdraw(_entries, _burst_refusal_why(ready_meta, length, None, can_handoff))   # 2026-09-14
                         _sfx_cadence_release(_sfx_meta.values())
                         return []
                     if ready_meta.get("_system2") and callable(on_handoff):
                         on_handoff()  # submitted; only the audible ACK credits it
-                    played = await _play_on_box(one["path"], one["sig"])
+                    try:
+                        played = await _play_on_box(one["path"], one["sig"],
+                                                    on_dispatch=_box_dispatch)
+                    except TypeError as exc:
+                        if "on_dispatch" not in str(exc):
+                            raise
+                        _box_dispatch()
+                        played = await _play_on_box(one["path"], one["sig"])
                     # #807: _LAST_PLAYOUT is a SHARED meter — during a
                     # minutes-long burst, any concurrent ack or sting
                     # stamps it with ITS key, so the burst's verdict read
@@ -100507,6 +102665,10 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                             played_ok = bool(lp.get("ok"))
                         else:
                             played_ok = True
+                    if _box_dispatched:
+                        playout_tell("ended", str(_round_occurrence or "")
+                                     or ("box:" + str(one.get("sig") or "")),
+                                     route="box", why="the box handoff returned")
                     if not played_ok:
                         # It never went out — or came back short — so the booth
                         # must not confidently follow a call nobody can hear.
@@ -101078,6 +103240,33 @@ def _banter_beat_plan(sheet: str, lines: int,
     return out
 
 
+def _beat_words(text: Any) -> str:
+    return " ".join(re.findall(r"[a-z0-9']+", str(text or "").casefold()))
+
+
+def _beat_turn_echo(text: str, row: dict[str, Any],
+                    said: list[tuple[str, str]]) -> str:
+    """[#1462] Why a written turn is not dialogue, or "" when it is.
+
+    2026-09-26: the dice hands a beat "refuse the premise of it outright,
+    plainly" as a DIRECTION, and the writer spoke it - "I refuse the premise
+    of it outright, plainly." three times in one banked round, then "I
+    reject that notion completely." three times in the next. Nothing
+    compared a turn with its own direction (track talk has had that check,
+    direction_echo, since the tint road) or with the round's earlier lines,
+    and the aired-history repeat gate cannot see a repeat inside one round.
+    """
+    spoken = _beat_words(text)
+    if not spoken:
+        return ""
+    core = _beat_words(re.split(r"[,.;]", str(row.get("work") or ""), 1)[0])
+    if len(core) >= 12 and core in spoken:
+        return "the turn spoke its own direction"
+    if any(_beat_words(line) == spoken for _seat, line in said):
+        return "the turn repeated a line already in this round"
+    return ""
+
+
 async def _banter_beats(context: str, sheet: str, lines: int,
                         seats: list[str], seed_text: str = "",
                         trace: list[dict[str, Any]] | None = None) -> str:
@@ -101118,7 +103307,8 @@ async def _banter_beats(context: str, sheet: str, lines: int,
             + "\nEvery turn reacts to the line immediately above it before adding "
               "anything new. Output exactly one line per listed turn using only "
               "the listed A:/B:/C:/D: marker. No preface, labels, markdown, stage "
-              "directions, or lines from earlier beats."
+              "directions, or lines from earlier beats. The words after each "
+              "dash say HOW that turn behaves; they are never words to say."
         )
         raw = await ask_model(
             prompt, limit=min(2800, max(1200, 650 * len(rows))), spice=0.45,
@@ -101127,11 +103317,28 @@ async def _banter_beats(context: str, sheet: str, lines: int,
                   "until": rows[-1]["turn"], "retry": retry})
         parsed = banter_turns(raw or "")
         clean: list[tuple[str, str]] = []
+        echoed = ""
         for row, candidate in zip(rows, parsed):
             text = spoken_text(candidate[1]).strip()
-            if text:
-                clean.append((str(row["seat"]), text))
-        return raw, clean, _beat_sequence_answers(
+            if not text:
+                continue
+            # [#1462] The accepted prefix ends at the first turn that is a
+            # direction or a repeat, so the plan stays seated: the retry
+            # (or the next beat) writes that same turn again, fresh.
+            echoed = _beat_turn_echo(text, row, made + clean)
+            if echoed:
+                try:
+                    line_review_capture(
+                        "banter_beat_echo", text, reasons=[echoed],
+                        context={"kind": "banter", "stage": "beat",
+                                 "turn": row.get("turn"),
+                                 "work": str(row.get("work") or "")[:200]},
+                        technical=True, disposition="rewrite")
+                except Exception:  # noqa: BLE001
+                    pass
+                break
+            clean.append((str(row["seat"]), text))
+        return raw, clean, (not echoed) and _beat_sequence_answers(
             made[-1][1] if made else "", rows, parsed)
 
     while cursor < len(plan):
@@ -102149,6 +104356,7 @@ async def dj_banter(track: dict[str, Any] | None = None,
         # at zero, and then this is today byte for byte: the prose that
         # was here stays as the fallback.
         _beat_sheet, _dice_rolls = "", []
+        _scenario_direction = ""
         _turn_source: dict[int, str] = {}
         # [#1386] THE SUBJECT CHANGES PART WAY THROUGH.
         #
@@ -102205,6 +104413,13 @@ async def dj_banter(track: dict[str, Any] | None = None,
                     speakerbox=str(_cm.get("speakerbox_text")
                                    or (seed or {}).get("text") or ""),
                     story=bool(_cm.get("story")))
+                if isinstance(_cm.get("scenario"), dict):
+                    try:
+                        _scenario_direction = call_scenario_clause(_cm["scenario"])
+                        _beat_sheet += "\n" + _scenario_direction
+                    except ValueError as _scenario_error:
+                        pipeline_log("call", "the scenario direction was skipped: "
+                                     + str(_scenario_error)[:160])
                 _dice_rolls = []
                 raise _CallSheetDone
             _beat_sheet, _dice_rolls = banter_beat_sheet(
@@ -102691,6 +104906,7 @@ async def dj_banter(track: dict[str, Any] | None = None,
                     "final turn is one host answering that and saying thank "
                     "you or goodbye. "
                     "Do not reuse any recent premise, conflict or landing."
+                    + ("\n" + _scenario_direction if _scenario_direction else "")
                     + call_novelty_prompt(str(                      # #1157
                         ((call_meta or {}).get("plot") or {}).get("id")
                         or ""))
@@ -102768,6 +104984,15 @@ async def dj_banter(track: dict[str, Any] | None = None,
         except Exception:
             pass                    # the draft stands; bank it as written
 
+    if (bank and not caller_name and not _system2_budget
+            and _judge_lines >= 8
+            and not substantial_radio_script(script, _judge_lines)):
+        pipeline_log(
+            "model",
+            "banked draft is still too thin after repair - refusing to bank "
+            "a fragmentary conversation, so the reserve writer will try again")
+        return []
+
     # [#1240] NO ACT LABEL REACHES A SPOKEN LINE: the plot is direction, and
     # "Act 3" said aloud is the direction leaking. Every round, every road.
     try:
@@ -102810,6 +105035,15 @@ async def dj_banter(track: dict[str, Any] | None = None,
                 extra=str(_topic_tc["subject"])[:300])
         except Exception:  # noqa: BLE001
             pass
+        if isinstance(call_meta.get("scenario"), dict):
+            try:
+                call_meta["scenario_report"] = call_conclusion_report(
+                    call_meta["scenario"],
+                    banter_turns(script or "", caller_name, caller2_name),
+                    source="draft")
+            except ValueError as exc:
+                pipeline_log("call", "the scenario conclusion could not be checked: "
+                             + str(exc)[:160])
     _seed_forced = False                                    # #862
     _seed_put = ""
     if not _system2_job and not caller_name and seed.get("text"):
@@ -103956,6 +106190,64 @@ def _turn_source_map(entry: dict[str, Any]) -> dict[int, str]:
     return {k: v for k, v in out.items() if v}
 
 
+def _call_scenario_air_target(entry: dict[str, Any],
+                              mark: dict[str, Any]) -> tuple[str, list[dict[str, Any]]] | None:
+    """Identify this call's ordered feed lines before consulting hearing receipts."""
+    call = entry.get("call") if isinstance(entry, dict) else None
+    if not isinstance(call, dict) or not isinstance(call.get("scenario"), dict):
+        return None
+    had = mark.get("had") or set()
+    fresh = [row for row in (_RADIO.get("chat") or [])
+             if isinstance(row, dict) and str(row.get("id") or "") not in had]
+    caller = str(entry.get("caller_name") or "").casefold()
+    caller_rows = [row for row in fresh
+                   if row.get("who") == "caller" and row.get("sid")
+                   and str(row.get("name") or "").casefold() == caller]
+    if not caller_rows:
+        return None
+    sid = str(caller_rows[-1]["sid"])
+    expected = [{"line_id": str(row.get("id") or ""),
+                 "who": str(row.get("who") or ""), "kind": "dialogue",
+                 "turn": row.get("turn")}
+                for row in fresh if row.get("sid") == sid
+                and row.get("who") in ("dj", "cohost", "third", "caller", "caller2")]
+    return (sid, expected) if expected else None
+
+
+async def _call_scenario_air_poll(entry: dict[str, Any], sid: str,
+                                  expected: list[dict[str, Any]], since: float) -> None:
+    """Wait off the broadcast path for durable page-heard call evidence."""
+    plan = (entry.get("call") or {}).get("scenario")
+    if not isinstance(plan, dict):
+        return
+    report: dict[str, Any] = {}
+    for attempt in range(9):
+        try:
+            receipts = await airlog_rows_async(since - 5.0, time.time() + 5.0,
+                                               rounds="caller", quiet=True)
+            report = call_aired_conclusion_report(
+                plan, receipts, sid=sid, expected_lines=expected)
+            if report.get("status") in ("matched", "missed"):
+                break
+        except (TypeError, ValueError) as exc:
+            report = {"sid": sid, "status": "insufficient_evidence",
+                      "aired_verified": False,
+                      "soft_faults": [str(exc)[:200]]}
+            break
+        if attempt < 8:
+            await asyncio.sleep(30)
+    report.setdefault("sid", sid)
+    report["at"] = time.time()
+    report["caller"] = str(entry.get("caller_name") or "")[:100]
+    (entry.get("call") or {})["scenario_air_report"] = report
+    history = _RADIO.setdefault("call_scenario_reports", [])
+    history.append(report)
+    del history[:-32]
+    pipeline_log("call", "scenario conclusion after air: "
+                 + str(report.get("status") or "unknown"),
+                 extra=str(report.get("sid") or "")[:48])
+
+
 async def _banter_air(entry: dict[str, Any],
                       track: dict[str, Any] | None, *,
                       ready_takes: list[dict[str, Any]] | None = None,
@@ -103963,6 +106255,14 @@ async def _banter_air(entry: dict[str, Any],
                       despite_repeats: bool = False) -> list[str]:
     """Put a written round on air — fresh from the model or off the larder
     shelf (#349), the airing is the same either way."""
+    if script_has_forgotten_line(str(entry.get("script") or ""),
+                                 str(entry.get("caller_name") or ""),
+                                 str(entry.get("caller2_name") or "")):
+        return []
+    _scheduled_window = None
+    if ready_takes is None and entry.get("prep_kind") and not entry.get("_ready_free"):
+        _scheduled_window = (entry.get("_ready_slot")
+                             or _ready_slot_window(str(entry["prep_kind"])))
     if not await _system2_repeat_rows_async(ready_takes if ready_takes is not None else
             [{"text": text} for _, text in banter_turns(str(entry.get("script") or ""),
                 str(entry.get("caller_name") or ""), str(entry.get("caller2_name") or ""))], entry):
@@ -104208,7 +106508,8 @@ async def _banter_air(entry: dict[str, Any],
                                tint_report=dict(entry.get("tint") or {}),
                                 ready_takes=ready_takes, on_handoff=on_handoff,
                                 can_handoff=can_handoff,
-                                round_meta=entry)
+                                round_meta=({**entry, "_ready_slot": _scheduled_window}
+                                            if _scheduled_window else entry))
     # #1050 (P1): the round's paperwork, written down before the entry is
     # dropped. The swaths, the tint with both scripts, the writing desk and
     # the line ids - everything the screenplay's provenance tree shows, and
@@ -104238,6 +106539,14 @@ async def _banter_air(entry: dict[str, Any],
         round_air_mark(entry, _sp_mark, spoken)
     except Exception:  # noqa: BLE001
         pass
+    try:
+        target = _call_scenario_air_target(entry, _sp_mark)
+        if target:
+            asyncio.create_task(_call_scenario_air_poll(
+                entry, target[0], target[1], float(_sp_mark.get("at") or time.time())))
+    except Exception as exc:  # noqa: BLE001
+        pipeline_log("call", "scenario air review could not start: "
+                     + type(exc).__name__)
     if ready_takes is None and entry.get("seek_verdict") and spoken:
         asyncio.create_task(_sfx_verdict(spoken[-1]))
     if spoken:
@@ -105617,6 +107926,21 @@ async def dj_caller(track: dict[str, Any] | None = None,
         "case_id": str(_case.get("id") or ""),
         "case": str(_case.get("title") or ""),
     }
+    try:
+        _scenario_catalog = await asyncio.to_thread(
+            load_scenario_catalog, data_path("call_scenarios.json"))
+        _scenario = select_call_scenario(
+            _scenario_catalog,
+            target_heat=case_heat(_case) / 3.0 if _case else None)
+        if _scenario:
+            _call_meta["scenario"] = call_path_draw(
+                _scenario, caller_name=_cname,
+                topic=str(_call_meta.get("topic") or ""),
+                case_outcome=str(rule.get("text") or ""))
+            _call_meta["scenario_catalog"] = str(_scenario_catalog.get("source") or "")
+    except (OSError, TypeError, ValueError) as exc:
+        pipeline_log("call", "the scenario draw was skipped: "
+                     + str(exc)[:160])
     if bank_to is None and _cname:
         # #673/#703: the booth says who is on which line. The banked road
         # posts nothing — nothing is airing yet; its card goes up when the
@@ -107989,7 +110313,7 @@ async def ask_model(prompt: str, limit: int = 300,
         pass
     _MODEL_CALLS.append(_row)
     try:                                                    # #1020 (G1)
-        airlog_model_call(_row, {**_spent, "prompt_eval_count":
+        airlog_model_call({**_row, "prompt": str(prompt), "script": kept}, {**_spent, "prompt_eval_count":
                                  result.get("prompt_eval_count") or 0},
                           took)
     except Exception:  # noqa: BLE001
@@ -108117,9 +110441,10 @@ async def call_ollama(
                                                       "body": wire_body})
             if globals().get("system2_capture_model"):
                 system2_capture_model(messages, options, model, purpose)
-            response = await client.post(
+            response = await recorded_ollama_post(client,
                 f"{OLLAMA_URL}/api/chat",
                 json=wire_body,
+                purpose=purpose,
             )
             response.raise_for_status()
             result = response.json()
@@ -108164,6 +110489,7 @@ async def generate_answer(
         "system_status_used": False,
         "image_requested": False,
         "video_requested": False,
+        "ad_video_requested": False,
         "tune_requested": False,
         "openwebui_used": False,
         "memory_used": False,
@@ -108175,6 +110501,26 @@ async def generate_answer(
             settings.get("active_prompt", 0)
             % max(1, len(settings.get("prompts") or [1]))].get("name", ""),
     }
+
+    # A bare command deliberately asks once rather than guessing the copy.
+    # The short pending window also works for the Nabu's stateless turns.
+    ad_goal = voice_ad_goal(user_text)
+    pending_ad = float(VOICE_AD_PENDING.get("until") or 0) > time.time()
+    if ad_goal is not None or pending_ad:
+        if ad_goal is None:
+            ad_goal = " ".join(str(user_text or "").split())[:1200]
+        if not str(ad_goal or "").strip():
+            VOICE_AD_PENDING["until"] = time.time() + 300.0
+            return ("What do you want the person to say or do in the ad?", {
+                **feature_meta, "ad_video_requested": True,
+                "model": "h3", "prompt_tokens": 0, "completion_tokens": 0,
+            })
+        VOICE_AD_PENDING["until"] = 0.0
+        answer, ad = await voice_ad_render(str(ad_goal))
+        return answer, {**feature_meta, "video_requested": bool(ad),
+                         "ad_video_requested": True, "model": "comfy-h3",
+                         "prompt_tokens": 0, "completion_tokens": 0,
+                         "voice_ad": ad}
 
     # Explicit "open web ui ..." routes the question to Open WebUI and returns.
     if is_openwebui_request(user_text):
@@ -120837,6 +123183,7 @@ async def dj_video_api(
     t: str = "",                                            # [#1244]
     lag: str = "",                                          # [#1244]
     authorization: str | None = Header(default=None),
+    hls: str = "",
 ) -> dict[str, Any]:
     """#1263: the stings that have a PICTURE, and nothing else.
 
@@ -120881,8 +123228,12 @@ async def dj_video_api(
             lag_ms = int(max(0.0, min(180.0, float(lag or 0))) * 1000)
         except (TypeError, ValueError):
             lag_ms = 0
+        # An HLS lane starts at its own live edge; the MP3 join burst is
+        # not in that audio and would hold the picture back by 30 seconds.
+        hls_listener = str(hls or "").lower()
         late = {"videos": dj_video_late(server_ms, lag_ms),
-                "burst_s": dj_video_burst_s()}
+                "burst_s": 0.0 if hls_listener in ("1", "true", "yes")
+                else dj_video_burst_s()}
     # 2026-09-14: "allow me to use endless video mode even if the station
     # is on pause ... endless video mode as a screensaver" while the rooms
     # bank the show. The pause gate stands for the station's own stings;
@@ -120966,6 +123317,50 @@ async def station_flow_api(
         "floor_busy": _floor_busy(), "last_delivery": page_playback_state(),
     }
     return result
+
+
+@app.get("/api/changelog")
+async def changelog_api(
+    limit: int = 60,
+    before: str = "",
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """The committed station history plus task facts that were captured."""
+    require_read_auth(authorization)
+    try:
+        return await asyncio.to_thread(_CHANGELOG.page, limit, before)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/changelog/refresh")
+async def changelog_refresh_api(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Explicitly replace the durable changelog snapshot from Git."""
+    require_auth(authorization)
+    try:
+        return await asyncio.to_thread(_CHANGELOG.refresh, 200)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+@app.post("/api/changelog/task")
+async def changelog_task_api(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Attach an agent's real prompt, tokens, goal, and elapsed time to Git."""
+    require_auth(authorization)
+    body = await request.json()
+    if not isinstance(body, dict) or not str(body.get("commit") or "").strip():
+        raise HTTPException(status_code=400, detail="A Git commit is required")
+    try:
+        return await asyncio.to_thread(_CHANGELOG.record, str(body["commit"]), body)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
 @app.post("/api/dj/monitor")
@@ -122405,10 +124800,18 @@ async def dj_provenance_api(
             return
         row: dict[str, Any] = {"file": got, "how": how_found,
                                "quoted": bool(prompt and got in prompt)}
+        own_vector = row_data.get("vec") or {}
+        if (isinstance(own_vector, dict) and
+                str(own_vector.get("file") or "") == got and own_vector.get("text")):
+            row["text"] = str(own_vector["text"])[:4000]
+            row["passage_grade"] = "measured"
+            row["passage_how"] = "the passage bound to this line's vector draw"
         for one in swaths:
-            if str(one.get("file") or "") == got:
-                row["text"] = str(one.get("text") or "")
+            if str(one.get("file") or "") == got and not row.get("text"):
+                row["text"] = str(one.get("text") or "")[:4000]
                 row["lines"] = list(one.get("lines") or [])
+                row["passage_grade"] = "measured"
+                row["passage_how"] = "the exact swath retained by the booth"
                 break
         # [#1233] "quoted" was the FILE NAME in the prompt, which no round
         # ever writes; the passage itself is what a prompt can carry.
@@ -122420,6 +124823,7 @@ async def dj_provenance_api(
             pass
         documents.append(row)
 
+    row_data = row
     _doc(row.get("source"), "the swath this line was seeded from")
     _doc((row.get("vec") or {}).get("file"),
          "the vector index handed it to this line")
@@ -122427,6 +124831,13 @@ async def dj_provenance_api(
         _doc(one.get("file"), "a booth vector search around this line")
     for one in crystal:
         _doc(one.get("file"), "crystal material staged for the booth")
+    for document in documents:
+        if document.get("text"):
+            continue
+        excerpt = await asyncio.to_thread(speakbox_excerpt, document["file"], at)
+        document["text"] = str(excerpt.get("text") or "")
+        document["passage_grade"] = str(excerpt.get("grade") or "absent")
+        document["passage_how"] = str(excerpt.get("how") or "")
 
     entry: dict[str, Any] = {}
     try:
@@ -126267,6 +128678,201 @@ async def phrase_ban_api(
                             hours, carriers, killed)
 
 
+def line_forget_carriers() -> list[tuple[str, dict[str, Any]]]:
+    """Find unpublished stock containing an operator-forgotten whole turn."""
+    out: list[tuple[str, dict[str, Any]]] = []
+    for kind, rows in [("banter", list(_LARDER))] + [
+            (str(kind), list(rows or [])) for kind, rows in list(_SHELF.items())]:
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            entry = dialogue_entry(row) or row
+            if script_has_forgotten_line(
+                    str(entry.get("script") or entry.get("text") or ""),
+                    str(entry.get("caller_name") or ""),
+                    str(entry.get("caller2_name") or "")):
+                out.append((kind, row))
+    return out
+
+
+@app.post("/api/said/forget")
+async def api_said_forget(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Remove one whole dialogue line from future writing and playout."""
+    require_auth(authorization)
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="A dialogue line is required")
+    line_id = str(body.get("line_id") or "")[:160]
+    text = str(body.get("text") or "")[:4000].strip()
+    known = await asyncio.to_thread(line_row_of, line_id) if line_id else {}
+    if known and known.get("text"):
+        text = str(known["text"])
+    if not text:
+        raise HTTPException(status_code=400, detail="That dialogue line has no text")
+    try:
+        banned = await asyncio.to_thread(LINE_BLACKLIST.add, text, line_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    await asyncio.to_thread(said_forget, text)
+    carriers = await asyncio.to_thread(line_forget_carriers)
+    removed = {"larder": 0, "shelf": 0, "gold": 0, "prepared_feed": 0}
+    for kind, row in carriers:
+        if kind == "banter":
+            if row in _LARDER:
+                _LARDER.remove(row)
+                removed["larder"] += 1
+                try:
+                    _radio_entry_rejected(row, "operator_forgot_line")
+                except Exception:  # noqa: BLE001
+                    pass
+        else:
+            rows = _SHELF.get(kind) or []
+            if row in rows:
+                rows.remove(row)
+                removed["shelf"] += 1
+    gold = _gold_rows()
+    keep = [row for row in gold if not line_forgotten(str(row.get("text") or ""))]
+    removed["gold"] = len(gold) - len(keep)
+    if removed["gold"]:
+        gold[:] = keep
+        _gold_save()
+    if removed["larder"]:
+        _larder_save()
+    if removed["shelf"]:
+        await asyncio.to_thread(_pantry_save, True)
+    prepared = [row for row in (_RADIO.get("chat") or [])
+                if isinstance(row, dict) and str(row.get("aired") or "prepared") == "prepared"
+                and line_forgotten(str(row.get("text") or ""))]
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for row in prepared:
+        sid = str(row.get("sid") or row.get("id") or "")
+        groups[sid] = [other for other in (_RADIO.get("chat") or [])
+                       if isinstance(other, dict) and
+                       str(other.get("sid") or other.get("id") or "") == sid and
+                       str(other.get("aired") or "prepared") == "prepared"]
+    for rows in groups.values():
+        removed["prepared_feed"] += len(rows)
+        _burst_withdraw(rows, "operator permanently removed a dialogue line")
+    _INVENTORY_PLAN["at"] = 0.0
+    replanned = True
+    try:
+        await _system2().refresh(force=True, want_status=False)
+    except Exception as exc:  # noqa: BLE001
+        replanned = False
+        pipeline_log("system2", "a forgotten line will leave the next plan refresh: " + str(exc)[:160])
+    pipeline_log("drop", "operator forgot a whole dialogue line; future carriers withdrawn",
+                 extra=text[:240])
+    return {"ok": True, "line_id": line_id, "text": text, "ban": banned,
+            "removed": removed, "replanned": replanned,
+            "say": "This line is barred from future speech; an already playing take may finish."}
+
+
+def line_repeat_snapshot(line_id: str, text: str = "") -> dict[str, Any]:
+    """Disk reads and matching stay off the broadcast event loop."""
+    now = time.time()
+    row = line_row_of(line_id)
+    text = str(row.get("text") or text or "").strip()
+    if not line_repeat.normalize(text):
+        raise HTTPException(status_code=400, detail="A complete dialogue line is required")
+    rows = airlog_rows(now - 48 * 3600, now + 1, quiet=True)
+    rows.extend(dict(r) for r in list(_RADIO.get("chat") or []) if isinstance(r, dict))
+    calls, clipped = line_repeat.read_calls(REPEAT_CALLS_PATH, now - 48 * 3600)
+    calls.extend(dict(r) for r in list(_MODEL_CALLS) if isinstance(r, dict))
+    for r in rows:
+        written = (r.get("trace") or {}).get("written") or {}
+        if written.get("script"):
+            calls.append(dict(written))
+    report = line_repeat.analyze(text, rows, calls, now)
+    if clipped:
+        report["coverage"] += " Writing evidence is limited to the last 32 MiB of retained calls."
+    carriers = []
+    for kind, stock in [("banter", list(_LARDER))] + [
+            (str(k), list(v or [])) for k, v in list(_SHELF.items())]:
+        for candidate in stock:
+            entry = dialogue_entry(candidate) or candidate
+            if (line_repeat.script_contains(entry.get("script"), text)
+                    or any(line_repeat.normalize(t.get("text")) == line_repeat.normalize(text)
+                           for t in entry.get("takes", []) if isinstance(t, dict))):
+                carriers.append({"kind": kind, "id": alt_sid_of(kind, candidate),
+                                 "system": "prepared recordings", "at": entry.get("at"),
+                                 "aired": candidate.get("aired"), "heard": candidate.get("heard")})
+    for candidate in list(_gold_rows()):
+        if line_repeat.normalize(candidate.get("text")) == line_repeat.normalize(text):
+            carriers.append({"kind": "gold", "id": str(candidate.get("id") or ""),
+                             "system": "gold reuse bank", "at": candidate.get("at")})
+    kind, _ = round_of_line(row)
+    if not kind:
+        kind = str(row.get("round") or row.get("kind") or "")
+    if kind not in ALT_PREP_KINDS:
+        kinds = {c["kind"] for c in carriers if c["kind"] in ALT_PREP_KINDS}
+        kind = next(iter(kinds)) if len(kinds) == 1 else ""
+    prompt = schedule_segment_prompt(kind=kind) if kind else {}
+    report.update(ok=True, line_id=line_id, text=text, now=now,
+                  blocked=line_forgotten(text), resolved=bool(row), kind=kind,
+                  carriers=carriers[:60], omitted_carriers=max(0, len(carriers) - 60),
+                  current_inputs=scene_inputs(kind, str(row.get("who") or "")),
+                  current_prompt={k: prompt.get(k) for k in (
+                      "text", "source", "variant", "active", "window", "alternatives", "uses")},
+                  can_generate=kind in ALT_PREP_KINDS,
+                  generation_why="" if kind in ALT_PREP_KINDS else "No unique preparation system is linked to this line.")
+    if carriers:
+        report["causes"].append("Prepared stock still contains this line in: " + ", ".join(
+            sorted({c["system"] + " / " + c["kind"] for c in carriers})) + ".")
+    return report
+
+
+@app.get("/api/said/repeats")
+async def line_repeats_api(
+    line_id: str = "", text: str = "",
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_read_auth(authorization)
+    if len(line_id) > 160 or len(text) > 4000:
+        raise HTTPException(status_code=400, detail="Dialogue selection is too large")
+    return await asyncio.to_thread(line_repeat_snapshot, line_id, text)
+
+
+@app.post("/api/said/repeats/repair")
+async def line_repeat_repair_api(
+    request: Request, authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_auth(authorization)
+    payload = await request.json()
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Expected an object")
+    action = str(payload.get("action") or "")
+    if action not in ("generate", "refresh_plan"):
+        raise HTTPException(status_code=400, detail="Unknown repeat repair")
+    line_id = str(payload.get("line_id") or "")[:160]
+    report = await asyncio.to_thread(line_repeat_snapshot, line_id, str(payload.get("text") or "")[:4000])
+    if action == "refresh_plan":
+        _INVENTORY_PLAN["at"] = 0.0
+        await _system2().refresh(force=True, want_status=False)
+        return {"ok": True, "say": "Prepared inventory and the running plan were re-evaluated. History and prompts were preserved."}
+    kind = report["kind"]
+    if not report["can_generate"]:
+        raise HTTPException(status_code=409, detail=report["generation_why"])
+    active = [j for j in _ALT_JOBS.values() if j.get("state") in ("queued", "waiting", "writing")]
+    existing = next((j for j in active if j.get("repeat_key") == line_repeat.fingerprint(report["text"])), None)
+    if existing:
+        return {"ok": True, "job": existing["job"], "say": "Fresh material is already queued for this line."}
+    if len(active) >= ALT_GEN_LIVE:
+        raise HTTPException(status_code=409, detail="The writing queue is full; let the current jobs finish first")
+    current = await asyncio.to_thread(schedule_segment_prompt, kind=kind)
+    brief = str(current.get("clause") or current.get("text") or "") + (
+        "\nOperator requests genuinely new material, a different premise and new dialogue. "
+        "Do not repeat or paraphrase this rejected turn: " + report["text"])
+    job = "repeat_" + uuid.uuid4().hex[:10]
+    alt_job_put(job, kind=kind, count=1, state="queued", made=0, new=[], why="",
+                repeat_key=line_repeat.fingerprint(report["text"]), source=line_id)
+    asyncio.create_task(alt_generate_job(job, kind, 1, brief=brief))
+    pipeline_log("lookahead", "operator requested fresh " + kind + " material after repeat diagnosis", extra=line_id)
+    return {"ok": True, "job": job, "say": "Fresh " + kind + " material queued for the next quiet writing window."}
+
+
 @app.delete("/api/phrase/ban")                                 # [#1239]
 async def phrase_unban_api(
     q: str = "",
@@ -127161,7 +129767,8 @@ def speakbox_excerpt(file: str, near: float = 0.0) -> dict[str, Any]:
         for base in (SPEAKBOX_DIR,) if "SPEAKBOX_DIR" in globals() else ():
             try:
                 cand = Path(base) / name
-                if cand.is_file():
+                if (SPEAKBOX_NAME.fullmatch(name) and
+                        cand.resolve().parent == Path(base).resolve() and cand.is_file()):
                     found = cand
                     break
             except Exception:  # noqa: BLE001
@@ -127170,7 +129777,7 @@ def speakbox_excerpt(file: str, near: float = 0.0) -> dict[str, Any]:
         try:
             body = " ".join(Path(found).read_text(
                 encoding="utf-8", errors="replace").split())
-            return {"text": body[:600], "grade": "written",
+            return {"text": body[:600], "grade": "current",
                     "how": ("the opening of %s - the station has no record "
                             "of which passage this round was handed, so "
                             "this is the document, not the seed" % name)}
@@ -129032,7 +131639,7 @@ async def said_why_api(
     want = str(line_id or "").strip()
     prov: dict[str, Any] = {}
     try:
-        prov = await dj_provenance_api(want, authorization)
+        prov = await dj_provenance_api(want, authorization=authorization)
     except HTTPException:
         prov = {}
     except Exception:  # noqa: BLE001
@@ -130675,7 +133282,7 @@ async def script_production_api(limit: int = Query(default=12, ge=1, le=200),
         "roads disagreed about, or 'on' to carry the assembled cue map and "
         "identities to air. Add 'continuous' for the continuous-take road, "
         "'budget=90' for the seconds one round may spend, 'every=180' for "
-        "the seconds between two productions and 'lines=48' for the longest "
+        "the seconds between two productions and 'lines=72' for the longest "
         "round it will attempt. It is re-read within three seconds; no "
         "restart.")
     return payload
@@ -135460,6 +138067,39 @@ async def api_call_sheet(
     return await call_sheet(max(0.25, min(24.0, float(hours or 4.0))))
 
 
+@app.get("/api/call/scenarios")
+async def api_call_scenarios_get(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_read_auth(authorization)
+    return await asyncio.to_thread(
+        load_scenario_catalog, data_path("call_scenarios.json"))
+
+
+@app.get("/api/call/scenarios/reports")
+async def api_call_scenarios_reports(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_read_auth(authorization)
+    return {"reports": list(_RADIO.get("call_scenario_reports") or [])[-32:]}
+
+
+@app.put("/api/call/scenarios")
+async def api_call_scenarios_put(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_auth(authorization)
+    payload = await request.json()
+    try:
+        return await asyncio.to_thread(
+            save_scenario_catalog, data_path("call_scenarios.json"), payload)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except OSError as exc:
+        raise HTTPException(status_code=503, detail="scenario catalog unavailable") from exc
+
+
 @app.get("/api/schedule/brief-audit")
 async def api_brief_audit(
     authorization: str | None = Header(default=None),
@@ -137738,6 +140378,15 @@ def orch_glass_state(most: int = 48) -> dict[str, Any]:
             "left_seconds": order.get("left_seconds"),
             "say": order.get("say"),
         }
+        handoff = order.get("schedule_handoff") or {}
+        out["commission"]["quality_dispatched"] = int(order.get("quality_dispatched") or 0)
+        out["commission"]["quality"] = [{
+            **{key: repair.get(key) for key in (
+                "road", "commit_id", "item_id", "sid", "due_in", "add_turns",
+                "speech_short_seconds", "body_short_seconds", "held", "target_check", "job")},
+            "state": str((_ALT_JOBS.get(str(repair.get("job") or "")) or {}).get("state") or ""),
+        } for repair in list(handoff.get("quality") or [])[:3]
+            if isinstance(repair, dict)]
     except Exception:  # noqa: BLE001
         out["commission"] = {}
     try:
@@ -138649,12 +141298,13 @@ def _director_topic_from_prompt(prompt: str) -> str:
         r"THE TOPIC, DROPPED INTO THIS ROUND[^:]*:\s*[\"']([^\"']+)",
         r"THE SUBJECT(?: OF THIS CALL)?[^:]*:\s*([^\n]+)",
         r"THE PHONE'S SUBJECT[^:]*:\s*([^\n]+)",
-        r"ANSWER THIS[^\n]*\n\s*[\"']([^\"']+)",
     )
     for pattern in patterns:
         found = re.search(pattern, text, re.I)
         if found:
-            return topic_subject(found.group(1))[:600]
+            subject = re.split(r"\s+Whoever rings this entry\b", found.group(1),
+                               maxsplit=1, flags=re.I)[0]
+            return topic_subject(subject)[:600]
     return ""
 
 
@@ -138708,6 +141358,39 @@ def _director_sfx_plan(turn_count: int) -> list[dict[str, Any]]:
 DIRECTOR_LINE_SECONDS = 14.0
 DIRECTOR_EVENT_SECONDS = 10.0
 DIRECTOR_RECORD_BOOKEND_LINES = 2
+
+
+def _director_contract_review(candidate: dict[str, Any],
+                              turns: list[tuple[str, str]],
+                              topic_review: dict[str, Any]) -> dict[str, Any]:
+    """Review the allocated recording, not an operator's approval of it."""
+    lines = list(candidate.get("lines") or [])
+    spoken = [" ".join(str(text or "").split()) for _seat, text in turns]
+    recorded = [" ".join(str(row.get("text") or "").split())
+                for row in lines if isinstance(row, dict)]
+    proofs = bool(lines) and all(
+        isinstance(row, dict)
+        and re.fullmatch(r"[a-fA-F0-9]{64}", str(row.get("audio_hash") or ""))
+        and float(row.get("seconds") or 0) > 0 for row in lines)
+    seconds = float(candidate.get("seconds") or 0)
+    checks = {
+        "candidate_ready": candidate.get("ready") is True,
+        "candidate_eligible": candidate.get("eligible") is True
+                              and not candidate.get("blocked_reasons"),
+        "recorded_lines": proofs,
+        # A single scripted turn may be recorded as several adjacent clips.
+        "words_match_recording": bool(spoken) and " ".join(spoken) == " ".join(recorded),
+        "duration_matches_recording": proofs and seconds > 0
+                                      and abs(seconds - sum(float(row["seconds"])
+                                                          for row in lines)) <= 0.5,
+        "topic_continuity": (topic_review.get("ok") is True
+                             if topic_review.get("checked") else True),
+        "not_expired": (not float(candidate.get("expires_at") or 0)
+                        or float(candidate["expires_at"]) > time.time()),
+    }
+    return {"checked": True, "ok": all(checks.values()),
+            "basis": "recorded-contract", "checks": checks,
+            "topic_checked": bool(topic_review.get("checked"))}
 
 
 def _director_script_lines(script: dict[str, Any]) -> list[dict[str, Any]]:
@@ -138768,6 +141451,10 @@ def director_orchestration(kind: str, label: str, owns_seconds: float,
     if str(kind or "") == "record":
         line_target = DIRECTOR_RECORD_BOOKEND_LINES
         event_target = DIRECTOR_RECORD_BOOKEND_LINES
+    elif str(kind or "") == "ad":
+        # A produced spot is one complete audio event, not fourteen-second
+        # dialogue turns. Its measured duration still has to fill the slot.
+        line_target = event_target = 1
     else:
         line_target = max(1, int((owns + DIRECTOR_LINE_SECONDS - 0.001)
                                  // DIRECTOR_LINE_SECONDS)) if owns else 1
@@ -138786,18 +141473,25 @@ def director_orchestration(kind: str, label: str, owns_seconds: float,
     written = bool(spoken or script.get("drafts") or script.get("draft_head"))
     recorded = bool(str(script.get("state") or "") == "bound"
                     and float(script.get("seconds") or 0) > 0)
-    reviewed = bool(review.get("approved") or review.get("seen")
-                    or review.get("tint_approved"))
+    manual_reviewed = bool(review.get("approved") or review.get("seen")
+                           or review.get("tint_approved"))
+    automatic_review = script.get("auto_review") or {}
+    automatically_reviewed = bool(automatic_review.get("checked")
+                                  and automatic_review.get("ok"))
+    reviewed = manual_reviewed or automatically_reviewed
     scheduled = owns > 0
     executed = str(state or "").startswith("aired") or str(state or "").startswith("went by")
-    ready = bool(recorded and line_short <= 0 and event_short <= 0
-                 and seconds_short <= max(12.0, owns * 0.08))
+    content_ready = bool(recorded and line_short <= 0 and event_short <= 0
+                         and seconds_short <= max(12.0, owns * 0.08))
+    ready = reviewed and content_ready
     if not scheduled:
         status = "unscheduled"
     elif ready:
         status = "ready"
-    elif recorded:
+    elif recorded and not content_ready:
         status = "recorded-short"
+    elif recorded:
+        status = "awaiting-review"
     elif written:
         status = "written"
     elif preparable:
@@ -138839,8 +141533,12 @@ def director_orchestration(kind: str, label: str, owns_seconds: float,
                   "seconds": seconds_short},
         "coverage": coverage,
         "stages": {"written": written, "reviewed": reviewed,
+                   "manually_reviewed": manual_reviewed,
+                   "automatically_reviewed": automatically_reviewed,
                    "recorded": recorded, "scheduled": scheduled,
                    "executed": executed},
+        "review": {"manual": manual_reviewed,
+                   "automatic": automatic_review},
         "preparable": preparable,
         "status": status,
         "needs": needs[:6],
@@ -138861,6 +141559,11 @@ def _director_variant(raw: dict[str, Any], prompt: str,
               "text": str(said or "")[:900], "candidate": identity}
              for marker, said in banter_turns(script)]
     review = dialogue_topic_review(script, prompt)
+    auto_review = {"checked": bool(turns and review.get("checked")),
+                   "ok": bool(turns and review.get("checked")
+                              and review.get("ok") is True
+                              and candidate.get("eligible") is True),
+                   "basis": "topic-continuity", "recording_checked": False}
     return {"id": identity, "index": index, "turns": turns,
             "seconds": round(float(raw.get("seconds") or candidate.get("seconds") or 0), 2),
             "ready": bool(raw.get("ready", candidate.get("ready", False))),
@@ -138869,6 +141572,7 @@ def _director_variant(raw: dict[str, Any], prompt: str,
             "created_at": float(raw.get("at") or candidate.get("at") or 0),
             "source": _director_source_evidence(candidate),
             "topic": review.get("topic") or "", "topic_review": review,
+            "auto_review": auto_review,
             "sfx_plan": _director_sfx_plan(len(turns))}
 
 
@@ -138880,10 +141584,14 @@ def _director_script(slot: dict[str, Any]) -> dict[str, Any]:
     might be chosen, so it is counted and its opening quoted, never
     presented as the plan."""
     out: dict[str, Any] = {"turns": [], "seconds": 0.0, "state": "nothing",
-                           "candidate": "", "source": "", "drafts": 0,
+                           "candidate": "", "candidates": [],
+                           "performances": [], "source": "", "sources": [],
+                           "drafts": 0,
                            "draft_head": "", "draft_turns": [],
                            "draft_candidates": [], "draft_variants": [],
-                           "selected_candidate": "", "tint": {}}
+                            "selected_candidate": "", "tint": {},
+                            "auto_review": {"checked": False, "ok": False,
+                                            "basis": "none"}}
     try:
         allocations = list(slot.get("allocations") or [])
         drafts = list(slot.get("drafts") or [])
@@ -138911,6 +141619,7 @@ def _director_script(slot: dict[str, Any]) -> dict[str, Any]:
                 out["topic"] = picked_variant["topic"]
                 out["topic_review"] = picked_variant["topic_review"]
                 out["sfx_plan"] = picked_variant["sfx_plan"]
+                out["auto_review"] = picked_variant["auto_review"]
         if not allocations:
             # An edited segment is still THIS segment while it re-records
             # the line that was changed. Show its words and say why it is
@@ -138934,65 +141643,153 @@ def _director_script(slot: dict[str, Any]) -> dict[str, Any]:
                 pass
             out["state"] = "drafts waiting" if drafts else "nothing"
             return out
-        picked = (allocations[0] or {}).get("candidate") or {}
-        out["candidate"] = str(picked.get("id") or "")
-        out["seconds"] = float(picked.get("seconds") or 0)
+        # A duration slot is normally filled by several whole performances.
+        # The director used to expose allocations[0] only, although System2
+        # would dispatch every allocation in order. That made a 239-second
+        # four-performance slot look like one 45-second short script and hid
+        # three quarters of the words from advance review. Preserve the old
+        # top-level fields for callers, but make them describe the complete
+        # scheduled sequence and retain each candidate's local turn index so
+        # an edit still reaches the correct shelf row.
         out["state"] = "bound"
-        src = picked.get("source") or {}
-        if isinstance(src, dict):
-            out["source"] = str(src.get("caller_name")
-                                or src.get("prep_name") or "")
-        # 2026-09-10: THE LIVE ENTRY, NOT THE CANDIDATE'S SNAPSHOT.
-        #
-        # A candidate carries the script as it stood when the candidate was
-        # written; the row on the shelf is what actually gets rendered and
-        # dispatched. Normally identical - but the moment the operator
-        # rewrites a turn they diverge, and reading the snapshot here meant
-        # the room showed the OLD words back to the person who had just
-        # changed them, and then refused their next edit on that turn
-        # because the `was` it handed back no longer matched. Measured on
-        # the first live edit. The room is meant to be one-to-one with what
-        # is going to air, so it reads what is going to air.
-        script = str(picked.get("script") or "")
-        try:
-            live_row = director_segment_row(str(slot.get("id") or ""))
-            if live_row:
-                live_entry = dialogue_entry(live_row[1]) or {}
-                if str(live_entry.get("script") or "").strip():
-                    script = str(live_entry["script"])
-                    out["live"] = True
-                # 2026-09-10: WHAT THE CRYSTAL DID, for the second gate.
-                # "I want to perfect the script before we even get to the
-                # tinting phase, and then we start perfecting the tint as
-                # well" - so the room has to be able to say whether the
-                # words on screen are the tinted ones or the plain ones,
-                # and how much of the round the crystal actually reached.
-                tinted = str(live_entry.get("script_tinted") or "").strip()
-                report = live_entry.get("tint")
-                cov = (report or {}).get("coverage") if isinstance(
-                    report, dict) else {}
-                out["tint"] = {
-                    "is_tinted": bool(tinted and tinted == script.strip()),
-                    "has_tinted_take": bool(tinted),
-                    "covered": int((cov or {}).get("covered") or 0),
-                    "eligible": int((cov or {}).get("eligible") or 0),
-                    "target": int((cov or {}).get("target") or 0),
-                    "met": bool((cov or {}).get("met")),
-                    "must_flow": bool(tint_must_flow(str(slot.get("kind")
-                                                        or ""))),
+        prompt = str(slot.get("prompt") or "")
+        all_sfx: list[dict[str, Any]] = []
+        tint_rows: list[dict[str, Any]] = []
+        source_rows: list[dict[str, Any]] = []
+        topics: list[str] = []
+        turn_offset = 0
+        for performance_index, allocation in enumerate(allocations):
+            picked = ((allocation or {}).get("candidate") or {})
+            candidate = str(picked.get("id") or "")
+            seconds = max(0.0, float(picked.get("seconds") or 0))
+            script = str(picked.get("script") or "")
+            live_entry: dict[str, Any] = {}
+            if candidate:
+                try:
+                    _kind, live_row = alt_find(candidate)
+                    live_entry = dialogue_entry(live_row) or {} if live_row is not None else {}
+                    if str(live_entry.get("script") or "").strip():
+                        out["live"] = True
+                        # A verified allocation names immutable recorded words.
+                        # The shelf row may have been rewritten since binding;
+                        # those new words are not what its audio will say.
+                        if not (picked.get("ready") and picked.get("lines")):
+                            script = str(live_entry["script"])
+                except Exception:  # noqa: BLE001
+                    live_entry = {}
+
+            evidence = _director_source_evidence(picked)
+            source_rows.append(evidence)
+            src = picked.get("source") or {}
+            source_name = ""
+            if isinstance(src, dict):
+                source_name = str(src.get("caller_name")
+                                  or src.get("prep_name") or "")
+            if source_name and source_name not in out["sources"]:
+                out["sources"].append(source_name)
+
+            review = dialogue_topic_review(script, prompt)
+            topic = str(review.get("topic") or "")
+            if topic and topic not in topics:
+                topics.append(topic)
+            parsed_turns = banter_turns(script)
+            contract_review = _director_contract_review(
+                picked, parsed_turns, review)
+            local_turns = []
+            for candidate_index, (marker, said) in enumerate(parsed_turns):
+                turn = {
+                    "seat": str(marker or ""),
+                    "who": _director_seat(str(marker or "")),
+                    "text": str(said or "")[:900],
+                    "candidate": candidate,
+                    "candidate_index": candidate_index,
+                    "performance_index": performance_index,
+                    "performance_start": float(
+                        (allocation or {}).get("planned_start") or 0),
+                    "performance_seconds": round(seconds, 3),
                 }
-        except Exception:  # noqa: BLE001
-            pass
-        for marker, said in banter_turns(script):
-            out["turns"].append({"seat": str(marker or ""),
-                                 "who": _director_seat(str(marker or "")),
-                                 "text": str(said or "")[:900],
-                                 "candidate": out["candidate"]})
-        out["source_evidence"] = _director_source_evidence(picked)
-        out["topic_review"] = dialogue_topic_review(
-            script, str(slot.get("prompt") or ""))
-        out["topic"] = out["topic_review"].get("topic") or ""
-        out["sfx_plan"] = _director_sfx_plan(len(out["turns"]))
+                local_turns.append(turn)
+                out["turns"].append(turn)
+
+            local_sfx = _director_sfx_plan(len(local_turns))
+            for cue in local_sfx:
+                shifted = dict(cue)
+                shifted["after"] = int(cue.get("after") or 0) + turn_offset
+                shifted["candidate"] = candidate
+                shifted["performance_index"] = performance_index
+                all_sfx.append(shifted)
+
+            tinted = str(live_entry.get("script_tinted") or "").strip()
+            report = live_entry.get("tint")
+            cov = (report or {}).get("coverage") if isinstance(
+                report, dict) else {}
+            tint_row = {
+                "candidate": candidate,
+                "is_tinted": bool(tinted and tinted == script.strip()),
+                "has_tinted_take": bool(tinted),
+                "covered": int((cov or {}).get("covered") or 0),
+                "eligible": int((cov or {}).get("eligible") or 0),
+                "target": int((cov or {}).get("target") or 0),
+                "met": bool((cov or {}).get("met")),
+                "must_flow": bool(tint_must_flow(str(slot.get("kind") or ""))),
+            }
+            tint_rows.append(tint_row)
+            out["performances"].append({
+                "index": performance_index,
+                "candidate": candidate,
+                "seconds": round(seconds, 3),
+                "planned_start": float(
+                    (allocation or {}).get("planned_start") or 0),
+                "state": str((allocation or {}).get("state") or ""),
+                "turns": len(local_turns),
+                "turn_start": turn_offset,
+                "turn_end": turn_offset + len(local_turns),
+                "source": source_name,
+                "source_evidence": evidence,
+                "topic": topic,
+                "topic_review": review,
+                "auto_review": contract_review,
+                "tint": tint_row,
+                "sfx_plan": local_sfx,
+            })
+            if candidate:
+                out["candidates"].append(candidate)
+            out["seconds"] += seconds
+            turn_offset += len(local_turns)
+
+        out["candidate"] = out["candidates"][0] if out["candidates"] else ""
+        out["source"] = ", ".join(out["sources"])
+        out["source_evidence"] = source_rows[0] if source_rows else {}
+        out["sources_evidence"] = source_rows
+        out["topic"] = topics[0] if len(topics) == 1 else "; ".join(topics)
+        out["topic_review"] = (out["performances"][0]["topic_review"]
+                               if len(out["performances"]) == 1 else {
+                                   "checked": any(bool(p["topic_review"].get("checked"))
+                                                  for p in out["performances"]),
+                                   "ok": all(p["topic_review"].get("ok") is not False
+                                             for p in out["performances"]),
+                                   "topic": out["topic"],
+                                   "performances": [p["topic_review"]
+                                                    for p in out["performances"]],
+                               })
+        out["sfx_plan"] = all_sfx
+        out["tints"] = tint_rows
+        out["tint"] = (tint_rows[0] if len(tint_rows) == 1 else {
+            "performances": tint_rows,
+            "has_tinted_take": any(r["has_tinted_take"] for r in tint_rows),
+            "is_tinted": bool(tint_rows) and all(r["is_tinted"] for r in tint_rows),
+            "met": bool(tint_rows) and all(r["met"] for r in tint_rows),
+            "must_flow": any(r["must_flow"] for r in tint_rows),
+        })
+        reviews = [p["auto_review"] for p in out["performances"]]
+        out["auto_review"] = {
+            "checked": bool(reviews) and len(reviews) == len(allocations)
+                       and all(r["checked"] for r in reviews),
+            "ok": bool(reviews) and len(reviews) == len(allocations)
+                  and all(r["ok"] for r in reviews),
+            "basis": "recorded-contract", "performances": reviews,
+        }
+        out["seconds"] = round(float(out["seconds"]), 3)
     except Exception:  # noqa: BLE001
         pass
     return out
@@ -139060,7 +141857,10 @@ def director_room(which: int = 0) -> dict[str, Any]:
                     "occurrence": "", "minutes": owns / 60.0,
                     "start": 0.0, "deadline": 0.0, "state": "unplanned",
                     "notes": str(slot.get("notes") or ""),
+                    "prompt_id": str(slot.get("prompt_id") or ""),
                     "prompt": str(schedule_prompt_for(store, slot) or "")[:1200],
+                    "flow": schedule_flow_nodes(slot.get("flow")),
+                    "flow_prompt": str(slot.get("flow_prompt") or "")[:1800],
                     "script": {"turns": [], "state": "nothing", "drafts": 0},
                     "aired": [], "aired_seconds": 0.0,
                     "direction": _director_direction(
@@ -139181,7 +141981,8 @@ def director_room(which: int = 0) -> dict[str, Any]:
             state = "nothing behind it"
         if kind != "record":
             talk_seconds += max(0.0, deadline - start)
-        review = script_state(str(slot.get("id") or ""))
+        review = dict(script_state(str(slot.get("id") or "")))
+        review["automatic"] = script.get("auto_review") or {}
         beats = director_beats(kind, str(slot.get("id") or ""))
         if isinstance(script, dict):
             script.setdefault("beats", beats)
@@ -139198,7 +141999,10 @@ def director_room(which: int = 0) -> dict[str, Any]:
             "start": start, "deadline": deadline,
             "state": state,
             "notes": str(slot.get("notes") or ""),
+            "prompt_id": str(slot.get("prompt_id") or ""),
             "prompt": str(slot.get("prompt") or "")[:1600],
+            "flow": schedule_flow_nodes(slot.get("flow")),
+            "flow_prompt": str(slot.get("flow_prompt") or "")[:1800],
             "script": script,
             "aired": aired,
             "aired_seconds": round(heard, 1),
@@ -140923,7 +143727,12 @@ async def api_director_pending(most: int = DIRECTOR_QUEUE_MOST
 async def api_director_script(sid: str) -> dict[str, Any]:
     """One script, turn by turn, as it stands right now."""
     def work() -> dict[str, Any]:
-        kind, row, _c = director_resolve(sid=sid)
+        try:
+            kind, row, _c = director_resolve(sid=sid)
+        except HTTPException as exc:
+            if exc.status_code != 404:
+                raise
+            return director_archived_script(sid)
         entry = dialogue_entry(row) or {}
         return {"sid": sid, "kind": kind,
                 "turns": _director_turns(entry),
@@ -140936,6 +143745,45 @@ async def api_director_script(sid: str) -> dict[str, Any]:
                 "notes": [{"id": n["id"], "text": n["text"]}
                           for n in director_notes(kind, "standing")]}
     return await asyncio.to_thread(work)
+
+
+def director_archived_script(sid: str) -> dict[str, Any]:
+    """Retired air SIDs remain reviewable from the immutable script ledger."""
+    written = [row for row in script_ledger_rows() if row.get("sid") == sid]
+    if not written:
+        raise HTTPException(404, "No retained script answers to that id")
+    block = max(int(row.get("block") or 0) for row in written)
+    written = sorted((row for row in written if int(row.get("block") or 0) == block),
+                     key=lambda row: int(row.get("ord") or 0))
+    now = time.time()
+    air = [row for row in airlog_rows(now - AIRLOG_KEEP_S, now + 1, quiet=True)
+           if row.get("sid") == sid]
+    by_line: dict[str, list[dict[str, Any]]] = {}
+    for row in air:
+        by_line.setdefault(str(row.get("id") or ""), []).append(row)
+    turns = []
+    for index, row in enumerate(written):
+        receipts = by_line.get(str(row.get("line_id") or ""), [])
+        heard = next((item for item in receipts if line_was_heard(item)), None)
+        state = ("heard" if heard else "withdrawn" if any(
+            item.get("aired") == "withdrawn" for item in receipts) else
+            "published" if receipts else "written")
+        turns.append({"index": index, "seat": str(row.get("who") or ""),
+                      "who": str(row.get("who") or "Speaker"),
+                      "kind": str(row.get("kind") or "dialogue"),
+                      "text": str(row.get("text") or ""),
+                      "seconds": float(row.get("seconds") or 0),
+                      "line": str(row.get("line_id") or ""),
+                      "air_state": state,
+                      "heard_at": line_heard_at(heard) if heard else 0.0})
+    return {"sid": sid, "kind": str(written[0].get("round") or ""),
+            "turns": turns, "kept": False,
+            "aired": int(any(turn["air_state"] == "heard" for turn in turns)),
+            "heard_lines": sum(turn["air_state"] == "heard" for turn in turns),
+            "seconds": round(sum(turn["seconds"] for turn in turns), 1),
+            "archived": True, "read_only": True,
+            "source": "script-ledger", "block": block,
+            "review": {}, "tints": [], "beats": [], "notes": []}
 
 
 @app.post("/api/director/script/{sid}/seen")
@@ -145289,6 +148137,17 @@ async def export_courier_file_api(
     return FileResponse(row["path"], filename=str(row.get("name") or "export"))
 
 
+@app.get("/api/export/courier/status/{jid}")
+async def export_courier_status_api(jid: str, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    require_read_auth(authorization)
+    rows = await asyncio.to_thread(courier_read)
+    row = next((r for r in rows if str(r.get("id")) == jid), None)
+    if not row:
+        raise HTTPException(404, "No such archive copy")
+    return {"id": jid, "state": row.get("state"), "why": row.get("why", ""),
+            "destination": row.get("dest") or GALLERY_EXPORT_SHARE}
+
+
 @app.post("/api/export/courier/done")
 async def export_courier_done_api(
     request: Request,
@@ -147125,6 +149984,7 @@ _PUBLIC_GET_PREFIX = ("/app-icon-", "/tune/", "/media/", "/music/",
                       # first, so the fall-through is a refusal.
                       "/sfx/")
 _PUBLIC_POST = {"/api/dj/join", "/api/dj/request", "/api/dj/shout",
+                "/api/listener/ads",
                 "/api/music/vote",
                 # #1149: wake-only - the route refuses to pause anything,
                 # and it still demands a live listen token inside.
@@ -147405,12 +150265,9 @@ async def station_stream_mp3(
     # #1253: the listener chooses the quality, exactly as they have for
     # the clips since #999. One mix, several encoders - a phone on 48k
     # and a desktop on 128k share every decode behind them.
-    # #1265: `split` sends the mix UNMIXED - record left, DJs right - so
-    # the listener's own browser can balance the two instantly. A mixer
-    # that is thirty seconds ahead of the ear cannot do that job; see the
-    # note in station_stream. Plain /stream.mp3 is untouched, because a
-    # head unit opening the .m3u has no Web Audio to undo a split with.
-    sink = STATION_STREAM.attach(br, split=bool(split))
+    # `split` remains an ignored compatibility query for old links. The
+    # broadcast itself is now always the centred two-channel programme.
+    sink = STATION_STREAM.attach(br)
 
     async def body() -> Any:
         since = 0
@@ -147487,7 +150344,7 @@ async def station_stream_hls(
     request: Request,
     t: str = "",
     br: str = "",
-    split: int = 0,
+    mix: str = "",
     authorization: str | None = Header(default=None),
 ) -> Response:
     """The broadcast as HLS. This is the road an iPhone should take.
@@ -147510,11 +150367,16 @@ async def station_stream_hls(
     # exists, `ready()` is one stat and the playlist is a few hundred
     # bytes. All three cost the loop far less than a round trip through
     # a pool that 407 other call sites are hammering.
-    enc = STATION_STREAM.hls(br, split=bool(split))
-    # The first playlist takes a moment to exist; the backlog prime means
-    # it arrives with several segments already in it.
-    for _ in range(40):
-        if enc.ready():
+    # This is personal listener state, encoded into its own HLS lane. It
+    # never changes the studio, the tablet, or another listener's mix.
+    from station_stream import listener_mix
+    personal_mix = listener_mix(mix)
+    enc = STATION_STREAM.hls(br, mix=personal_mix)
+    # Wait for a modest initial HLS runway rather than handing a phone a
+    # one-segment live edge. The separate segment requests then carry it
+    # smoothly across a tower handoff or a momentary server stall.
+    for _ in range(60):
+        if enc.ready(HLS_START_SEGMENTS):
             break
         await asyncio.sleep(0.25)
     try:
@@ -147525,13 +150387,12 @@ async def station_stream_hls(
     # ffmpeg writes bare segment names. They have to come back as URLs on
     # this door, carrying the same token the playlist itself needed.
     suffix = f"?t={quote(t)}" if t else ""
-    # The split variant is its own segment folder, so a listener on one
-    # shape can never be handed a segment of the other.
-    lane = f"{enc.bitrate}s" if enc.split else str(enc.bitrate)
+    lane = "%d-%d-%d-%d" % ((enc.bitrate,) + personal_mix)
     out = []
     for line in raw.splitlines():
         if line and not line.startswith("#"):
-            out.append(f"/hls/{lane}/{line}{suffix}")
+            join = "&" if suffix else "?"
+            out.append(f"/hls/{lane}/{line}{suffix}{join}mix={','.join(map(str, personal_mix))}")
         else:
             out.append(line)
     return Response(
@@ -147546,6 +150407,7 @@ async def station_stream_hls_segment(
     rate: str,
     name: str,
     t: str = "",
+    mix: str = "",
     authorization: str | None = Header(default=None),
 ) -> Response:
     """One HLS segment. Name-checked: this reads from a directory the
@@ -147553,16 +150415,20 @@ async def station_stream_hls_segment(
     require_listen_auth(t, authorization)
     if not re.fullmatch(r"seg\d{1,8}\.(ts|aac|m4s)", name):
         return Response(status_code=404)
-    if not re.fullmatch(r"\d{2,3}s?", str(rate)):
+    parsed = re.fullmatch(r"(\d{2,3})-(\d{1,3})-(\d{1,3})-(\d{1,3})", str(rate))
+    if not parsed:
         return Response(status_code=404)
-    lane_split = str(rate).endswith("s")
-    enc = STATION_STREAM.hls_existing(
-        int(str(rate).rstrip("s")), split=lane_split)
+    from station_stream import listener_mix
+    lane_mix = listener_mix(parsed.group(2, 3, 4))
+    enc = STATION_STREAM.hls_existing(int(parsed.group(1)), mix=lane_mix)
     if enc is None:
         return Response(status_code=404)
     path = enc.dir / name
     try:
-        data = await asyncio.to_thread(path.read_bytes)
+        # HLS segments are small files in the local encoder spool. Do not
+        # queue them behind the station's shared worker pool: a busy render
+        # must never delay a moving listener's next segment.
+        data = path.read_bytes()
     except Exception:  # noqa: BLE001
         # A segment that has already rolled out of the window. Saying 404
         # is correct: the player asks for a newer one.
@@ -147726,7 +150592,12 @@ async def tune_page(token: str, request: Request) -> HTMLResponse:
     return HTMLResponse(
         page.replace("__SERVER_KEY__", json.dumps(token))
             .replace("__AWAY__", "true" if public else "false")
-            .replace("__BUILD__", str(int(_BUILD_MS))),
+            .replace("__BUILD__", str(int(_BUILD_MS)))
+            # Safari fetches a manifest while parsing HEAD, before the old
+            # JavaScript rewrite ran. Put the token in initial markup so an
+            # installed shortcut starts on its signed listener URL.
+            .replace("__PWA_MANIFEST__",
+                     "/manifest.webmanifest?t=" + quote(token)),
         headers={"Cache-Control": "no-store, no-cache, must-revalidate",
                  "Pragma": "no-cache"})
 
@@ -147765,6 +150636,23 @@ async def dj_shout(
                    f"station, live: \"{text}\" Read it out, take it "
                    "personally, and answer them by name on air.")))
     return {"heard": text, "on_air": bool(_RADIO.get("on"))}
+
+
+@app.post("/api/listener/ads")
+async def listener_make_ad(
+    request: Request,
+    t: str = "",
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Commission a short H3 ad from a signed listener page."""
+    require_listen_auth(t, authorization)
+    payload = await request.json()
+    goal = " ".join(str(payload.get("prompt") or "").split())[:1200]
+    if len(goal) < 2:
+        raise HTTPException(status_code=400,
+                            detail="Describe the ad you want to make")
+    message, ad = await voice_ad_render(goal)
+    return {"ok": True, "message": message, "ad": ad}
 
 
 # [#1244] NOT A ROUTE ANY MORE, BECAUSE IT NEVER WAS ONE.
@@ -152708,6 +155596,82 @@ async def sfx_file(
                                  status_code=206, headers=headers,
                                  media_type=media_type)
     return FileResponse(path, media_type=media_type, headers=headers)
+
+
+@app.get("/api/sfx/{sfx_key}/replay-source")
+async def sfx_replay_source_api(
+    sfx_key: str,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """The signed, levelled browser source for replaying one aired SFX clip.
+
+    Chat rows intentionally do not retain capability signatures.  A replay
+    must therefore obtain a fresh one here instead of handing an ``audio``
+    element an unsigned /sfx URL, which silently turns into an HTML refusal.
+    """
+    require_read_auth(authorization)
+    if not re.fullmatch(r"[a-f0-9]{16}", sfx_key):
+        raise HTTPException(status_code=404, detail="That clip identifier is not valid")
+    path = await asyncio.to_thread(sfx_by_id, sfx_key)
+    if path is None:
+        raise HTTPException(status_code=404, detail="That clip is no longer available")
+    sid = sfx_id(path)
+    video = sfx_is_video(path)
+    seconds = float(sfx_seconds_held(path) or 0.0)
+    # A newly indexed MP4 can be playable before its held duration reaches
+    # the shelf cache. The stinger desk still needs a real timeline now.
+    if video and seconds <= 0:
+        seconds = await asyncio.to_thread(_media_duration_probe, path)
+    return {
+        "ok": True,
+        "id": sid,
+        "name": path.stem[:160],
+        "url": "/sfx/%s?t=%s" % (sid, media_sign(sid)),
+        "video": video,
+        "seconds": round(seconds, 2),
+    }
+
+
+@app.post("/api/sfx/{sfx_key}/h3-stinger")
+async def sfx_h3_stinger_api(
+    sfx_key: str,
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Queue an H3 station stinger from the clip the operator just replayed."""
+    require_auth(authorization)
+    path = (await asyncio.to_thread(sfx_by_id, sfx_key)
+            if re.fullmatch(r"[a-f0-9]{16}", sfx_key) else None)
+    try:
+        payload = await request.json()
+    except Exception:  # noqa: BLE001
+        payload = {}
+    payload = payload if isinstance(payload, dict) else {}
+    direction = " ".join(str(payload.get("direction") or "").split())[:900]
+    spoken_copy = " ".join(str(payload.get("spoken_copy") or "").split())[:700]
+    name = path.stem[:160] if path is not None else "the requested station replay"
+    goal = (direction or
+            ("turn the replayed clip '%s' into a concise Pine Box station "
+             "stinger with an energetic on-camera delivery" % name))
+    if path is not None:
+        video = sfx_is_video(path)
+        seconds = float(sfx_seconds_held(path) or 0.0)
+        if video and seconds <= 0:
+            seconds = await asyncio.to_thread(_media_duration_probe, path)
+        reference = {"id": sfx_id(path), "name": name, "video": video,
+                     "seconds": round(seconds, 2),
+                     "match": "the replayed station clip"}
+    else:
+        reference = None
+    try:
+        message, ad = await voice_ad_render(
+            goal, reference_clip=reference, spoken_copy=spoken_copy,
+            trim_in_s=payload.get("trim_in_s"), trim_out_s=payload.get("trim_out_s"))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"ok": True, "message": message, "ad": ad,
+            "source": ({"id": reference["id"], "name": name,
+                        "video": reference["video"]} if reference else {})}
 
 
 @app.get("/api/dj/sfx")
@@ -157707,7 +160671,31 @@ def sfx_db_pick_row(video: bool = True,
     return got
 
 
-def sfx_db_pick_rotation_row(video: bool = True) -> tuple[Path, float] | None:
+def sfx_db_pick_short_video(max_seconds: float) -> tuple[Path, float] | None:
+    """Uniform indexed draw only from videos that can fit a spoken-line cue."""
+    try:
+        con = sfx_db_reader()
+        ceiling = max(0.5, min(12.0, float(max_seconds)))
+        where = "playable = 1 AND video = 1 AND seconds BETWEEN 0.5 AND ?"
+        args: tuple[Any, ...] = (ceiling,)
+        pin = sfx_pin_prefix()
+        if pin:
+            where += " AND path LIKE ?"
+            args += (pin.replace("%", "%%") + "%",)
+        count = int(con.execute("SELECT COUNT(*) FROM clips WHERE " + where,
+                                args).fetchone()[0] or 0)
+        if not count:
+            return None
+        row = con.execute("SELECT path, seconds FROM clips WHERE " + where +
+                          " LIMIT 1 OFFSET ?", args + (random.randrange(count),)).fetchone()
+        return (Path(str(row[0])), float(row[1])) if row else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def sfx_db_pick_rotation_row(
+    video: bool = True, excluded_folders: tuple[str, ...] = (),
+) -> tuple[Path, float] | None:
     """One uniform random row from the unspent part of the video deck.
 
     This is still COUNT/OFFSET over a covering local index, never
@@ -157728,6 +160716,7 @@ def sfx_db_pick_rotation_row(video: bool = True) -> tuple[Path, float] | None:
         windows = ([(aim * 0.6, aim * 1.6)] if aim > 0 else []) + [None]
         pin = sfx_pin_prefix()
         recent = sfx_video_recent_folders() if video else []
+        excluded = [str(folder) for folder in excluded_folders if folder]
         for win in windows:
             for avoid in ([recent, []] if recent else [[]]):
                 where = "playable = 1 AND video = ? AND deck_cycle < ?"
@@ -157738,10 +160727,11 @@ def sfx_db_pick_rotation_row(video: bool = True) -> tuple[Path, float] | None:
                 if pin:
                     where += " AND path LIKE ?"
                     args += (pin.replace("%", "%%") + "%",)
-                if avoid:
-                    marks = ",".join("?" for _ in avoid)
+                blocked = list(dict.fromkeys(excluded + list(avoid)))
+                if blocked:
+                    marks = ",".join("?" for _ in blocked)
                     where += " AND folder NOT IN (" + marks + ")"
-                    args += tuple(avoid)
+                    args += tuple(blocked)
                 counted = con.execute(
                     "SELECT COUNT(*) AS n FROM clips WHERE " + where,
                     args).fetchone()
@@ -158722,8 +161712,8 @@ async def sfx_vision_bite(most: int = 0) -> dict[str, Any]:
             try:
                 blob = base64.b64encode(frame).decode()
                 async with _OLLAMA_GATE, httpx.AsyncClient(timeout=90) as client:
-                    answer = await client.post(
-                        f"{OLLAMA_URL}/api/chat",
+                    answer = await recorded_ollama_post(client,
+                        f"{OLLAMA_URL}/api/chat", purpose="sound effect vision",
                         json={"model": VISION_MODEL,
                               "messages": [{"role": "user",
                                             "content": SFX_VISION_ASK,
@@ -160419,8 +163409,11 @@ async def video_editor_parody_open(
     files = row.get("files") or []
     if not isinstance(files, list):
         raise HTTPException(status_code=400, detail="Invalid generated video record")
+    selected_file = str(payload.get("file") or (files[0] if files else ""))
+    if selected_file not in files:
+        raise HTTPException(status_code=400, detail="Choose a video from this generation")
     try:
-        generated, kind = workshop_source_path("generation", str(files[0]))
+        generated, kind = workshop_source_path("generation", selected_file)
         original, original_kind = workshop_source_path(
             str(row.get("source_type") or ""), str(row.get("source") or ""))
     except (IndexError, ValueError, FileNotFoundError) as exc:
@@ -160455,6 +163448,8 @@ async def video_editor_splice_export(
                                      str(source_ids[0]))):
             raise
     try:
+        if payload.get("preview") is True:
+            return await asyncio.to_thread(sfx_edit_editor().start_splice_preview, payload)
         return await asyncio.to_thread(
             sfx_edit_editor().start_splice_export, payload, SFX_ADS_DIR,
             lambda path, seconds: sfx_db_write_row(path, seconds, 1))
@@ -160473,7 +163468,7 @@ async def video_editor_splice_status(
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     if "source_ids" not in row:
         raise HTTPException(status_code=404, detail="No such splice export")
-    if row.get("status") == "complete":
+    if row.get("status") == "complete" and not row.get("preview"):
         path = SFX_ADS_DIR / str(row["name"])
         if path.is_file():
             sid = sfx_id(path)
@@ -163202,6 +166197,37 @@ async def list_generations(
     return {"generations": rows, "sig": sig}
 
 
+def generation_history_page(before: str = "", purpose: str = "", limit: int = 30) -> dict[str, Any]:
+    records = _read_all_generations()
+    end = len(records)
+    if before:
+        end = next((i for i in range(len(records) - 1, -1, -1)
+                    if str(records[i].get("prompt_id") or "") == before), -1)
+        if end < 0:
+            raise HTTPException(409, "The gallery changed; refresh its history")
+    limit = max(1, min(60, limit))
+    rows = []
+    for i in range(end - 1, -1, -1):
+        row = records[i]
+        if row.get("status") != "done" or not row.get("files") or not row.get("prompt_id"):
+            continue
+        if purpose and row.get("purpose") != purpose:
+            continue
+        rows.append(row)
+        if len(rows) > limit:
+            break
+    page = rows[:limit]
+    return {"generations": page, "next": str(page[-1]["prompt_id"]) if len(rows) > limit else "",
+            "sig": {str(f): media_sign("gen:" + str(f)) for r in page for f in r.get("files", [])}}
+
+
+@app.get("/api/generations/history")
+async def generations_history(before: str = "", purpose: str = "", limit: int = 30,
+                              authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    require_read_auth(authorization)
+    return await asyncio.to_thread(generation_history_page, before[:200], purpose[:80], limit)
+
+
 @app.get("/api/generations/poster-url/{filename}")
 async def generation_poster_url(
     filename: str, authorization: str | None = Header(default=None),
@@ -163375,6 +166401,32 @@ async def comfy_outputs(
             status_code=502, detail=f"ComfyUI unreachable: {exc}"
         ) from exc
     return {"files": _comfy_output_files(history)[:limit]}
+
+
+@app.get("/api/generations/media/{filename}")
+async def generation_media(filename: str, request: Request, t: str = "",
+                           authorization: str | None = Header(default=None)) -> Response:
+    if not (t and hmac.compare_digest(t, media_sign("gen:" + filename))):
+        require_listen_auth(t, authorization)
+    if not re.fullmatch(r"[\w.\- ()\[\]]{1,200}", filename) or ".." in filename:
+        raise HTTPException(400, "Bad filename")
+    path = await asyncio.to_thread(comfy_output_find, filename)
+    if not path:
+        raise HTTPException(404, "The generated media file is missing from the output archive")
+    size = await asyncio.to_thread(lambda: path.stat().st_size)
+    if size <= 0:
+        raise HTTPException(409, "The generated media file is empty")
+    kind = SFX_VIDEO_TYPES.get(path.suffix.lower()) or _IMAGE_TYPES.get(path.suffix.lower(), "application/octet-stream")
+    headers = {"Accept-Ranges": "bytes", "X-Content-Type-Options": "nosniff",
+               "Cache-Control": "private, max-age=3600"}
+    window = _range_slice(str(request.headers.get("range") or ""), size)
+    if window == (-1, -1):
+        return Response(status_code=416, headers={"Content-Range": f"bytes */{size}"})
+    if window:
+        first, last = window
+        headers.update({"Content-Range": f"bytes {first}-{last}/{size}", "Content-Length": str(last - first + 1)})
+        return StreamingResponse(_range_stream(path, first, last), status_code=206, media_type=kind, headers=headers)
+    return FileResponse(path, media_type=kind, headers=headers)
 
 
 @app.get("/api/generations/image/{filename}")
@@ -163887,6 +166939,9 @@ async def gen_ads_send(
     identifier: str, authorization: str | None = Header(default=None),
 ) -> dict[str, Any]:
     require_auth(authorization)
+    # Keep this route self-contained.  It is the operator's directly
+    # inspectable broadcast handoff, and tooling exercises it separately from
+    # the background H3 completion road below.
     path = await asyncio.to_thread(gen_ad_path, identifier)
     signature = media_sign(identifier)
     occurrence = await asyncio.to_thread(
@@ -163916,6 +166971,42 @@ async def gen_ads_send(
         GEN_AD_SENDS_PATH.parent.mkdir(parents=True, exist_ok=True)
         with GEN_AD_SENDS_PATH.open("a", encoding="utf-8") as stream:
             stream.write(json.dumps({"ts": int(time.time()), "id": identifier}) + "\n")
+    return {"id": identifier, "sent": True,
+            "page_delivery": delivery, "on": played}
+
+
+async def gen_ads_broadcast(identifier: str, who: str = "operator") -> dict[str, Any]:
+    """Dispatch one generated video ad through the normal station paths."""
+    path = await asyncio.to_thread(gen_ad_path, identifier)
+    signature = media_sign(identifier)
+    occurrence = await asyncio.to_thread(
+        admission_admit_line, {"path": f"/sfx/{identifier}", "sig": signature},
+        who="board", kind="sfx", text=path.stem, name=path.stem,
+        line_id=identifier, producer="gen_ads_send")
+    delivery = ""
+    played = ""
+    try:
+        delivery = page_feed_append({"url": f"/sfx/{identifier}?t={signature}",
+                                     "text": "", "sting": path.stem})
+    except Exception:
+        pass
+    if (_RADIO.get("voice_to") or "box") in ("box", "both"):
+        try:
+            played = await _play_on_box(f"/sfx/{identifier}", signature)
+        except Exception:
+            pass
+    if not delivery and not played:
+        admission_withdraw(occurrence, "genAds send was not accepted")
+        raise HTTPException(status_code=503, detail="No broadcast output accepted the ad")
+    if played:
+        await asyncio.to_thread(sfx_history_add, path, who)
+        await asyncio.to_thread(sfx_note_play, identifier, path.name, who)
+    _STING_AT[0] = time.time()
+    with _GEN_AD_SENDS_LOCK:
+        GEN_AD_SENDS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with GEN_AD_SENDS_PATH.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps({"ts": int(time.time()), "id": identifier,
+                                     "who": who}) + "\n")
     return {"id": identifier, "sent": True,
             "page_delivery": delivery, "on": played}
 
@@ -163972,7 +167063,7 @@ def workshop_reference_view(row: dict[str, Any]) -> dict[str, Any]:
             sid = sfx_id(path) if kind == "video" else ""
             return {"available": True, "id": source, "kind": kind,
                     "name": path.stem, "source_type": source_type,
-                    "url": ("/api/generations/image/" + quote(name)
+                    "url": ("/api/generations/" + ("media/" if kind == "video" else "image/") + quote(name)
                             + "?t=" + media_sign("gen:" + name)),
                     "poster": (f"/api/sfx/poster/{sid}?t={media_sign(sid)}"
                                if sid else "")}
@@ -164142,8 +167233,8 @@ async def workshop_analyze_generation(row: dict[str, Any]) -> str:
         "across the supplied frames, text on screen, visual defects, and how "
         "faithfully it follows this generation direction: " + request_text)
     async with _OLLAMA_GATE, httpx.AsyncClient(timeout=150) as client:
-        response = await client.post(
-            f"{OLLAMA_URL}/api/chat",
+        response = await recorded_ollama_post(client,
+            f"{OLLAMA_URL}/api/chat", purpose="generated media analysis",
             json={"model": VISION_MODEL,
                   "messages": [{"role": "user", "content": look,
                                 "images": images}],
@@ -164215,15 +167306,73 @@ async def comfy_workshop_render(
 ) -> dict[str, Any]:
     require_auth(authorization)
     payload = await request.json()
-    if isinstance(payload, dict) and str(payload.get("purpose") or "").lower() == "parody_stinger":
-        if str(payload.get("mode") or "") != "reference" or not str(payload.get("source") or ""):
-            raise HTTPException(status_code=400, detail="Choose a reference video")
+    if isinstance(payload, dict) and str(payload.get("purpose") or "").lower() in (
+            "parody_stinger", "voice_ad"):
         if not str(payload.get("prompt") or "").strip():
             raise HTTPException(status_code=400, detail="Enter a parody direction")
+        payload = dict(payload)
+        if str(payload.get("mode") or "") != "reference" or not str(payload.get("source") or ""):
+            payload.update({"mode": "reference", "source": "",
+                            "source_type": "deferred_dialogue_clip"})
+        if (payload.get("source_type") == "gallery" and
+                not payload.get("sequence_parts")):
+            speech = str(payload.get("speech") or "").strip()
+            if speech:
+                plan = h3_ad_duration_plan({}, speech)
+                jobs = []
+                for part in plan:
+                    body = dict(payload, speech=part["speech"],
+                                duration_seconds=part["duration_seconds"],
+                                duration_mode="at_least",
+                                sequence_part=part["part"], sequence_parts=part["parts"])
+                    body.pop("frames", None)
+                    jobs.append(_parody_stinger_queue().add(body))
+                _parody_stinger_wake.set()
+                return {"queued": True, "queue_id": jobs[0]["id"],
+                        "queue_ids": [job["id"] for job in jobs], "status": "queued"}
         queued = _parody_stinger_queue().add(payload)
         _parody_stinger_wake.set()
         return {"queued": True, "queue_id": queued["id"], "status": "queued"}
     return await _comfy_workshop_render_payload(payload)
+
+
+@app.get("/api/h3/hourly")
+async def api_h3_hourly(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_read_auth(authorization)
+    return h3_hourly_status()
+
+
+@app.post("/api/h3/hourly")
+async def api_h3_hourly_set(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_auth(authorization)
+    try:
+        payload = await request.json()
+    except Exception:  # noqa: BLE001
+        payload = {}
+    if (not isinstance(payload, dict) or not payload or
+            set(payload) - {"enabled", "gallery_share"}):
+        raise HTTPException(status_code=400,
+                            detail="Expected enabled or gallery_share")
+    if "gallery_share" in payload:
+        share = payload["gallery_share"]
+        if isinstance(share, bool) or not isinstance(share, int) or not 0 <= share <= 100:
+            raise HTTPException(status_code=400,
+                                detail="gallery_share must be an integer from 0 to 100")
+    settings = await asyncio.to_thread(load_settings)
+    dj = dict(settings.get("dj") or {})
+    if "enabled" in payload:
+        dj["h3_hourly_ads"] = bool(payload.get("enabled"))
+    if "gallery_share" in payload:
+        dj["h3_gallery_share"] = int(payload["gallery_share"])
+    settings["dj"] = dj
+    await asyncio.to_thread(save_settings, settings)
+    note_action("you set the hourly H3 stinger controls")
+    return h3_hourly_status()
 
 
 async def _comfy_workshop_render_payload(payload: dict[str, Any]) -> dict[str, Any]:
@@ -164306,10 +167455,14 @@ async def _comfy_workshop_render_payload(payload: dict[str, Any]) -> dict[str, A
                       "source_generation": str(
                           payload.get("source_generation") or "")[:120],
                       "variant_of": str(
-                          payload.get("source_generation") or "")[:120],
+                          payload.get("variant_of") or payload.get("source_generation") or "")[:120],
                       "air_it": bool(payload.get("air_it")),
                       "frames": frame_count, "steps": step_count,
                       "seed": noise_seed, "at_share": at_share,
+                      "duration_mode": str(payload.get("duration_mode") or "auto"),
+                      "duration_seconds": round(frame_count / 24, 2),
+                      "sequence_part": payload.get("sequence_part"),
+                      "sequence_parts": payload.get("sequence_parts"),
                       "trim_in_s": trim_in_s if trim_requested else None,
                       "trim_out_s": trim_out_s if trim_requested else None})
     except RenderRefused as exc:
@@ -164376,6 +167529,99 @@ async def comfy_workshop_parody_queue(
                           "available_gb": free, "required_gb": required}}
 
 
+@app.post("/api/comfy/workshop/parody-queue/{job_id}/repair")
+async def comfy_workshop_parody_queue_repair(
+    job_id: str,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Recheck a stalled H3 production and immediately return a lost one to FIFO."""
+    require_auth(authorization)
+    queue = _parody_stinger_queue()
+    item = await asyncio.to_thread(queue.get, job_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="That stinger is no longer in the queue")
+    if item["status"] in ("done", "cancelled"):
+        return {"job": item, "say": "This stinger is already " + item["status"] + "."}
+
+    recovered = False
+    reason = "Operator requested a queue health check"
+    if item["status"] == "running" and item.get("prompt_id"):
+        generation = await asyncio.to_thread(workshop_generation, item["prompt_id"])
+        state = str((generation or {}).get("status") or "").lower()
+        if state == "done":
+            await asyncio.to_thread(queue.update, item["id"], "done", "Recovered completed H3 output")
+            return {"job": await asyncio.to_thread(queue.get, item["id"]),
+                    "say": "Recovered the completed H3 output."}
+        if state in ("failed", "error", "cancelled", "lost", "unknown"):
+            reason = str((generation or {}).get("error") or
+                         "H3 render is no longer reachable; retrying from the durable request")
+            recovered = True
+        else:
+            live = await comfy_idle_live()
+            age = max(0.0, time.time() - float(item.get("started") or item.get("updated") or 0))
+            if not live.get("busy") and age >= 45:
+                reason = "H3 no longer reports this render; retrying the durable request"
+                recovered = True
+            else:
+                return {"job": item, "say": "H3 still reports this render as active; it was not duplicated."}
+    else:
+        recovered = True
+
+    if recovered:
+        await asyncio.to_thread(queue.retry, item["id"], reason, 0)
+        _parody_stinger_wake.set()
+    job = await asyncio.to_thread(queue.get, item["id"])
+    return {"job": job, "say": "Returned the stinger to the front of the verified H3 queue."}
+
+
+@app.post("/api/comfy/workshop/parody-queue/{job_id}/cancel")
+async def comfy_workshop_parody_queue_cancel(
+    job_id: str,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_auth(authorization)
+    queue = _parody_stinger_queue()
+    item = await asyncio.to_thread(queue.get, job_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="That stinger is no longer in the queue")
+    cancelled = await asyncio.to_thread(queue.cancel, job_id)
+    _parody_stinger_wake.set()
+    return {"job": cancelled, "say": "Cancelled this stinger. It cannot be revived by a late worker."}
+
+
+def _parody_retry_delay(item: dict[str, Any], base_s: float = 12.0) -> float:
+    """Back off a transient H3 failure without ever abandoning the request."""
+    try:
+        attempts = max(1, int(item.get("attempts") or 1))
+    except (TypeError, ValueError):
+        attempts = 1
+    return min(300.0, float(base_s) * (2 ** min(attempts - 1, 4)))
+
+
+async def _parody_bind_deferred_reference(
+    queue: ParodyQueue, item: dict[str, Any], body: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Bind a waiting ad to an indexed speaking MP4 at dispatch time."""
+    deferred_type = str(body.get("source_type") or "")
+    if deferred_type not in {"deferred_dialogue_clip", "deferred_hourly_reference"}:
+        return body
+    picker = (h3_hourly_reference if deferred_type == "deferred_hourly_reference"
+              else voice_ad_person_clip)
+    clip = await asyncio.to_thread(
+        picker, str(body.get("prompt") or body.get("speech") or ""))
+    if not clip.get("id"):
+        await asyncio.to_thread(
+            queue.retry, item["id"],
+            "Waiting for an indexed dialogue-capable MP4 reference",
+            _parody_retry_delay(item, 20))
+        return None
+    bound = dict(body)
+    bound.update({"source": str(clip["id"]),
+                  "source_type": str(clip.get("source_type") or "clip")})
+    await asyncio.to_thread(queue.replace_body, item["id"], bound)
+    return bound
+
+
 async def _parody_stinger_step(queue: ParodyQueue, freed_for: str) -> tuple[int, str]:
     active = await asyncio.to_thread(queue.active)
     if active:
@@ -164384,16 +167630,20 @@ async def _parody_stinger_step(queue: ParodyQueue, freed_for: str) -> tuple[int,
             if generation and generation.get("status") == "done":
                 await asyncio.to_thread(queue.update, active["id"], "done")
             elif generation and generation.get("status") in ("failed", "error", "cancelled", "lost", "unknown"):
-                await asyncio.to_thread(queue.update, active["id"], "failed",
-                                        str(generation.get("error") or
-                                            ("Render history needs review" if
-                                             generation["status"] in ("lost", "unknown") else
-                                             generation["status"])))
+                await asyncio.to_thread(
+                    queue.retry, active["id"],
+                    str(generation.get("error") or
+                        ("Render history needs review; retrying" if
+                         generation["status"] in ("lost", "unknown") else
+                         generation["status"] + "; retrying")),
+                    _parody_retry_delay(active, 20))
             elif time.time() - float(active["started"] or 0) > 1800:
                 live = await comfy_idle_live()
                 if live.get("up") and live.get("observed") and not live.get("busy"):
-                    await asyncio.to_thread(queue.update, active["id"], "failed",
-                                            "Render has no completed output after 30 minutes and ComfyUI is idle")
+                    await asyncio.to_thread(
+                        queue.retry, active["id"],
+                        "Render has no completed output after 30 minutes; retrying",
+                        _parody_retry_delay(active, 30))
         return 5, freed_for
     item = await asyncio.to_thread(queue.next)
     if item is None:
@@ -164406,15 +167656,21 @@ async def _parody_stinger_step(queue: ParodyQueue, freed_for: str) -> tuple[int,
         reason = "ComfyUI is busy rendering; its active work will finish first"
     else:
         admitted, reason, _available = await asyncio.to_thread(render_admission, "video")
-        if not admitted and free is not None and free < VIDEO_RENDER_FLOOR_GB \
-                and freed_for != item["id"]:
+        # A refused H3 admission is never an H3 failure. Ask the reserve
+        # keeper to clear stale models once, then retain the same FIFO item
+        # until Comfy is genuinely able to accept it.
+        if not admitted and freed_for != item["id"]:
             freed_for = item["id"]
             await asyncio.to_thread(queue.note, item["id"],
-                                    "Freeing finished idle Comfy cache")
-            fresh = await comfy_idle_live()
-            if fresh.get("up") and fresh.get("observed") and not fresh.get("busy"):
-                await comfy_unload("free", fresh.get("idle_seconds") or 0,
-                                   "a queued parody stinger needs memory")
+                                    "Making room for H3: releasing idle models")
+            relief = globals().get("h3_capacity_relief")
+            if callable(relief):
+                await relief("a queued H3 stinger needs memory")
+            else:  # kept for the isolated queue contract test
+                fresh = await comfy_idle_live()
+                if fresh.get("up") and fresh.get("observed") and not fresh.get("busy"):
+                    await comfy_unload("free", fresh.get("idle_seconds") or 0,
+                                       "a queued parody stinger needs memory")
             live = await comfy_idle_live()
             if live.get("up") and live.get("observed") and not live.get("busy"):
                 admitted, reason, _available = await asyncio.to_thread(
@@ -164425,21 +167681,27 @@ async def _parody_stinger_step(queue: ParodyQueue, freed_for: str) -> tuple[int,
         if admitted:
             body = await asyncio.to_thread(queue.claim, item["id"])
             if body is not None:
+                body = await _parody_bind_deferred_reference(queue, item, body)
+                if body is None:
+                    return 5, freed_for
                 try:
                     result = await _comfy_workshop_render_payload(body)
                 except HTTPException as exc:
-                    if exc.status_code == 409:
-                        await asyncio.to_thread(queue.update, item["id"], "queued",
-                                                str(exc.detail))
-                    elif exc.status_code in (502, 503):
-                        await asyncio.to_thread(queue.update, item["id"], "paused",
-                                                "Submission uncertain: %s; check gallery" % exc.detail)
-                    else:
-                        await asyncio.to_thread(queue.update, item["id"], "failed",
-                                                str(exc.detail))
+                    # A source can disappear between selection and dispatch.
+                    # Rebind it instead of making the listener repeat an ad.
+                    if exc.status_code == 400 and str(body.get("mode") or "") == "reference":
+                        replacement = dict(body)
+                        replacement.update({"source": "", "source_type": "deferred_dialogue_clip"})
+                        await asyncio.to_thread(queue.replace_body, item["id"], replacement)
+                    await asyncio.to_thread(
+                        queue.retry, item["id"],
+                        "H3 is retaining this request: %s" % str(exc.detail),
+                        _parody_retry_delay(item, 12 if exc.status_code == 409 else 20))
                 except Exception as exc:  # noqa: BLE001
-                    await asyncio.to_thread(queue.update, item["id"], "paused",
-                                            "Submission uncertain: %s; check gallery" % exc)
+                    await asyncio.to_thread(
+                        queue.retry, item["id"],
+                        "H3 is retaining this request: %s" % type(exc).__name__,
+                        _parody_retry_delay(item, 20))
                 else:
                     await asyncio.to_thread(queue.update, item["id"], "running", "",
                                             result["prompt_id"], result["model"])
@@ -164469,11 +167731,218 @@ async def _parody_stinger_worker() -> None:
             await asyncio.sleep(10)
 
 
+H3_HOURLY_STATE_PATH = data_path("h3_hourly.json")
+H3_HOURLY_MINUTE = max(0, min(59, int(os.getenv("H3_HOURLY_MINUTE", "3") or 3)))
+_H3_HOURLY_LOCK = RLock()
+_H3_HOURLY_LAST = [""]
+
+
+def _h3_hourly_current_target(now_ts: float | None = None) -> tuple[str, float]:
+    """The marker and local timestamp for this hour's automatic H3 slot."""
+    now_ts = time.time() if now_ts is None else float(now_ts)
+    now = time.localtime(now_ts)
+    due_at = time.mktime((now.tm_year, now.tm_mon, now.tm_mday, now.tm_hour,
+                          H3_HOURLY_MINUTE, 0, now.tm_wday, now.tm_yday,
+                          now.tm_isdst))
+    return time.strftime("%Y%m%d%H", now), due_at
+
+
+def _h3_hourly_read() -> dict[str, Any]:
+    try:
+        raw = json.loads(H3_HOURLY_STATE_PATH.read_text())
+    except Exception:  # noqa: BLE001
+        raw = {}
+    if not isinstance(raw, dict):
+        raw = {}
+    last_marker = str(raw.get("last_marker") or "")
+    if last_marker:
+        _H3_HOURLY_LAST[0] = last_marker
+    return {
+        "last_marker": last_marker,
+        "last_at": float(raw.get("last_at") or 0.0),
+        "last_phase": str(raw.get("last_phase") or ""),
+        "last_message": str(raw.get("last_message") or "")[:500],
+        "last_job": bool(raw.get("last_job")),
+        "last_error": str(raw.get("last_error") or "")[:500],
+    }
+
+
+def _h3_hourly_write(state: dict[str, Any]) -> dict[str, Any]:
+    clean = {
+        "last_marker": str(state.get("last_marker") or ""),
+        "last_at": float(state.get("last_at") or 0.0),
+        "last_phase": str(state.get("last_phase") or "")[:40],
+        "last_message": str(state.get("last_message") or "")[:500],
+        "last_job": bool(state.get("last_job")),
+        "last_error": str(state.get("last_error") or "")[:500],
+    }
+    H3_HOURLY_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = H3_HOURLY_STATE_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps(clean, indent=2) + "\n")
+    tmp.replace(H3_HOURLY_STATE_PATH)
+    _H3_HOURLY_LAST[0] = clean["last_marker"]
+    return clean
+
+
+def h3_hourly_enabled() -> bool:
+    return bool(dj_settings().get("h3_hourly_ads", True))
+
+
+def h3_hourly_status(now_ts: float | None = None) -> dict[str, Any]:
+    now_ts = time.time() if now_ts is None else float(now_ts)
+    marker, due_at = _h3_hourly_current_target(now_ts)
+    with _H3_HOURLY_LOCK:
+        state = _h3_hourly_read()
+    if now_ts < due_at and state.get("last_marker") != marker:
+        next_at = due_at
+    else:
+        next_at = due_at + 3600.0
+    remaining = max(0.0, next_at - now_ts)
+    period = 3600.0
+    return {
+        "enabled": h3_hourly_enabled(),
+        "gallery_share": h3_hourly_gallery_share(),
+        "sfx_share": 100 - h3_hourly_gallery_share(),
+        "radio_on": bool(_RADIO.get("on")),
+        "minute": H3_HOURLY_MINUTE,
+        "now": now_ts,
+        "current_marker": marker,
+        "current_due_at": due_at,
+        "next_at": next_at,
+        "seconds_remaining": remaining,
+        "period_seconds": period,
+        "progress": max(0.0, min(1.0, 1.0 - (remaining / period))),
+        **state,
+    }
+
+
+def h3_hourly_claim(marker: str) -> bool:
+    """Persist the hour marker before rendering so failures cannot loop."""
+    marker = str(marker or "")
+    if not marker:
+        return False
+    with _H3_HOURLY_LOCK:
+        state = _h3_hourly_read()
+        if state.get("last_marker") == marker:
+            return False
+        state.update({"last_marker": marker, "last_at": time.time(),
+                      "last_phase": "running", "last_message": "Queued hourly H3 render",
+                      "last_job": False, "last_error": ""})
+        _h3_hourly_write(state)
+    return True
+
+
+def h3_hourly_finish(marker: str, message: str, job: dict[str, Any] | None = None,
+                     error: str = "") -> None:
+    with _H3_HOURLY_LOCK:
+        state = _h3_hourly_read()
+        state.update({"last_marker": str(marker or state.get("last_marker") or ""),
+                      "last_at": time.time(),
+                      "last_phase": "failed" if error else "finished",
+                      "last_message": str(message or "")[:500],
+                      "last_job": bool(job),
+                      "last_error": str(error or "")[:500]})
+        _h3_hourly_write(state)
+
+
+def h3_dialogue_seconds(row: dict[str, Any]) -> float:
+    """Return measured on-air seconds for a dialogue row, never an estimate."""
+    try:
+        if row.get("clip_until") is not None and row.get("clip_from") is not None:
+            seconds = (float(row["clip_until"]) - float(row["clip_from"])
+                       - float(row.get("clip_tail") or 0.0))
+            if math.isfinite(seconds) and seconds > 0:
+                return seconds
+        trace = row.get("trace") if isinstance(row.get("trace"), dict) else {}
+        render = trace.get("render") if isinstance(trace.get("render"), dict) else {}
+        seconds = float(render.get("seconds") or row.get("seconds") or 0.0)
+        return seconds if math.isfinite(seconds) and seconds > 0 else 0.0
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def h3_hourly_ad_brief() -> tuple[str, str, float]:
+    """Return direction, exact aired line, and its measured voice duration."""
+    recent = []
+    exact_line = ""
+    exact_seconds = 0.0
+    for row in reversed(list(_RADIO.get("chat") or [])):
+        text = " ".join(str((row or {}).get("text") or "").split())
+        if text and len(text) > 12:
+            recent.append(text[:180])
+            aired = str((row or {}).get("aired") or "").lower()
+            measured = h3_dialogue_seconds(row or {})
+            if (not exact_line and measured > 0 and
+                    aired not in {"held", "muted", "prepared", "withdrawn"}):
+                exact_line = text[:700]
+                exact_seconds = measured
+        if len(recent) >= 3:
+            break
+    now = _RADIO.get("now") or {}
+    record = " ".join(str(now.get(key) or "") for key in ("title", "artist"))
+    subject = " ".join(reversed(recent)) or record or "the live Pine Box FM show"
+    prompt = ("Make a short, funny but professional Pine Box FM sponsor stinger "
+              "that naturally follows this hour's conversation: " + subject[:520])
+    if exact_line:
+        prompt += '. Preserve this exact aired line as the spoken dialogue: "' + exact_line + '"'
+    return prompt, exact_line, exact_seconds
+
+
+def h3_hourly_ad_prompt() -> str:
+    """Compatibility view of the current hourly H3 direction."""
+    return h3_hourly_ad_brief()[0]
+
+
+async def h3_hourly_ad_clock() -> None:
+    """Queue one fresh, dialogue-aware video ad after each live hour begins."""
+    while True:
+        try:
+            now_ts = time.time()
+            marker, due_at = _h3_hourly_current_target(now_ts)
+            # Give the orchestrator time to establish the hour's topic.  The
+            # durable H3 queue handles the rest even when memory is tight.
+            if (now_ts >= due_at and _RADIO.get("on") and h3_hourly_enabled()
+                    and h3_hourly_claim(marker)):
+                try:
+                    prompt, spoken_copy, dialogue_seconds = h3_hourly_ad_brief()
+                    message, job = await voice_ad_render(
+                        prompt, spoken_copy=spoken_copy,
+                        dialogue_seconds=dialogue_seconds, automatic=True)
+                    h3_hourly_finish(marker, message, job)
+                    pipeline_log("ads", "hourly H3 ad: %s%s" %
+                                 (message[:180], "" if job else " (not queued)"))
+                except Exception as exc:  # noqa: BLE001
+                    h3_hourly_finish(marker, "Hourly H3 render failed", None,
+                                     type(exc).__name__)
+                    raise
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            pipeline_log("ads", "hourly H3 ad keeper: %s" % type(exc).__name__)
+        await asyncio.sleep(30)
+
+
+async def h3_capacity_keeper() -> None:
+    """Keep the H3 reserve available between requests whenever work is idle."""
+    while True:
+        try:
+            available = comfy_host_available_gb()
+            if available is not None and available < H3_MEMORY_RESERVE_GB:
+                await h3_capacity_relief("the H3 reserve keeper")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            pipeline_log("gpu", "H3 reserve keeper: %s" % type(exc).__name__)
+        await asyncio.sleep(90)
+
+
 @app.on_event("startup")
 async def _parody_stinger_start() -> None:
     global _parody_stinger_task
     _parody_stinger_queue()
     _parody_stinger_task = asyncio.create_task(_parody_stinger_worker())
+    fire_and_forget(h3_hourly_ad_clock())
+    fire_and_forget(h3_capacity_keeper())
 
 
 @app.on_event("shutdown")
@@ -164629,6 +168098,7 @@ async def comfy_workshop_variant(
 AIR_LOG_PATH = data_path("air_log.jsonl")
 NEWS_SAID_PATH = data_path("news_said.jsonl")
 MODEL_CALLS_PATH = data_path("model_calls.jsonl")
+REPEAT_CALLS_PATH = data_path("repeat_calls.jsonl")
 HEAT_RING_PATH = data_path("heat_ring.json")
 PAUSE_LOG_PATH = data_path("pause_log.jsonl")
 AIRLOG_KEEP_S = 48 * 3600.0             # every ledger here keeps two days
@@ -164875,6 +168345,7 @@ def airlog_row_from(entry: dict[str, Any]) -> dict[str, Any]:
                  or ("caller" if who in ("caller", "caller2") else "")
                  or (kind if kind in AIRLOG_TURN_ROUNDS else "banter"),
         "text": " ".join(str(entry.get("text") or "").split())[:600],
+        "repeat_text_key": line_repeat.fingerprint(entry.get("text") or ""),
         "aired": str(entry.get("aired") or ""),
         # 2026-09-15 (#1422c): AND THE HEARING STAMP, BESIDE IT.
         #
@@ -165313,6 +168784,7 @@ def airlog_compact_all() -> dict[str, int]:
     """The hourly housekeeping, all of it in one thread."""
     out = {"air_log": airlog_compact()}
     out["model_calls"] = airlog_jsonl_trim(MODEL_CALLS_PATH, AIRLOG_KEEP_S)
+    out["repeat_calls"] = airlog_jsonl_trim(REPEAT_CALLS_PATH, AIRLOG_KEEP_S)
     out["news_said"] = airlog_jsonl_trim(NEWS_SAID_PATH, 7 * 86400.0, "ts")
     out["pause_log"] = airlog_jsonl_trim(PAUSE_LOG_PATH, 30 * 86400.0)
     return out
@@ -165811,6 +169283,14 @@ def airlog_model_call(row: dict[str, Any], spent: dict[str, Any] | None,
                if isinstance(row.get("segprompt"), dict) else {}),
         }
         airlog_append_bg(MODEL_CALLS_PATH, out)
+        # Keep prompt evidence out of the frequently-polled telemetry ledger.
+        airlog_append_bg(REPEAT_CALLS_PATH, {
+            **out, "prompt": str(row.get("prompt") or "")[:32000],
+            "script": str(row.get("script") or "")[:32000],
+            "temp": row.get("temp"), "seed": row.get("seed"),
+            "repeat_truncated": any(len(str(row.get(k) or "")) > 32000
+                                    for k in ("prompt", "script")),
+        })
     except Exception:  # noqa: BLE001
         pass
 
@@ -167243,21 +170723,30 @@ def _screenplay_disk(since: float, until: float) -> dict[str, Any]:
 
 
 def screenplay_overlay_live(d: dict[str, Any],
-                            live_rows: list[dict[str, Any]]) -> None:
+                            live_rows: list[dict[str, Any]],
+                            since: float = 0.0,
+                            until: float = 0.0) -> None:
     """Bring the durable hour up to the live ring's latest line state.
 
     The air-log keeper deliberately writes off-loop, so its copy can trail
     the player by one keeper interval.  A forced screenplay read is the
     page asking about a line it can hear now; answering it from that older
     copy leaves the sounding block classified as prepared and moves the
-    document around the reader.  Overlay only matching ids already inside
-    this hour.  The durable row still owns history and the ring only lends
-    the mutable playout facts it knows more recently.
+    document around the reader. The durable row still owns history and the
+    ring lends the mutable playout facts it knows more recently. Rows that
+    have only just been prepared are not in the keeper's disk snapshot yet,
+    so add their compact air-log shape as well. That lets the live rundown
+    show an SFX cue and the SFX Guy before the playhead reaches them instead
+    of one keeper interval afterward.
     """
     by_id = {str(r.get("id") or ""): r for r in (live_rows or [])
              if isinstance(r, dict) and r.get("id")}
+    durable_ids: set[str] = set()
     for row in (d.get("air") or []):
-        live = by_id.get(str(row.get("id") or ""))
+        row_id = str(row.get("id") or "")
+        if row_id:
+            durable_ids.add(row_id)
+        live = by_id.get(row_id)
         if not live:
             continue
         for key in ("aired", "air_at", HEARD_STAMP, HEARD_STAMP_BY,
@@ -167265,6 +170754,22 @@ def screenplay_overlay_live(d: dict[str, Any],
                     "media", "clip_media", "url", "sfx"):
             if live.get(key) is not None:
                 row[key] = live[key]
+    for row_id, live in by_id.items():
+        if row_id in durable_ids:
+            continue
+        try:
+            row = airlog_row_from(live)
+            at = float(row.get("air_at") or row.get("ts") or 0)
+            if since and at < float(since):
+                continue
+            if until and at >= float(until):
+                continue
+            if not str(row.get("text") or "").strip():
+                continue
+            d.setdefault("air", []).append(row)
+            durable_ids.add(row_id)
+        except Exception:  # noqa: BLE001
+            continue
 
 
 def screenplay_parenthetical(row: dict[str, Any],
@@ -168494,7 +171999,7 @@ async def screenplay_hour(since: float, until: float,
 
     def _work() -> dict[str, Any]:
         d = _screenplay_disk(since, until)
-        screenplay_overlay_live(d, live_rows)
+        screenplay_overlay_live(d, live_rows, since, until)
         notes = list((screenplay_notes_read().get(hour_key) or []))
         script = screenplay_compose(since, until, d, notes)
         script["provenance"] = {
@@ -182437,6 +185942,87 @@ async def api_news_read(
     return await newsread_get(url, refresh=bool(refresh))
 
 
+def _news_planned_slot(slot_id: str) -> dict[str, Any] | None:
+    runtime = _system2()
+    for hour in runtime._plans:
+        for slot in hour.get("slots") or []:
+            if slot.get("id") == slot_id and slot.get("kind") == "news":
+                return slot
+    return None
+
+
+@app.get("/api/news/options")
+async def api_news_options(
+    slot_id: str,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_read_auth(authorization)
+    await _system2().refresh(want_status=False)
+    slot = _news_planned_slot(slot_id)
+    if not slot or float(slot.get("deadline") or 0) <= time.time():
+        raise HTTPException(status_code=404, detail="Upcoming news slot not found")
+    headlines = await drudge_headlines(NEWS_PAGE_MOST)
+    selected = news_story_choice(slot_id)
+    picked = []
+    if selected.get("url"):
+        picked.append({"title": str(selected.get("title") or "Selected story"),
+                       "url": str(selected["url"])})
+    stride = max(1, len(headlines) // 12)
+    for index in range(0, len(headlines), stride):
+        story = headlines[index]
+        if story.get("url") and not any(row["url"] == story["url"] for row in picked):
+            picked.append(story)
+        if len(picked) >= 12:
+            break
+    if picked:
+        await asyncio.gather(*(news_story_dossier(story, budget=7.0)
+                               for story in picked[:4]), return_exceptions=True)
+    options = []
+    for story in picked:
+        url = news_public_url(str(story.get("url") or ""))
+        if not url:
+            continue
+        dossier = _NEWS_DOSSIERS.get(url) or {}
+        options.append({"title": str(story.get("title") or "")[:300], "url": url,
+                        "source": urlparse(url).hostname or "",
+                        "availability": dossier.get("availability") or "headline; dossier pending",
+                        "excerpt": str(dossier.get("excerpt") or "")[:1400]})
+    return {"slot_id": slot_id, "selected_url": str(selected.get("url") or ""),
+            "options": options}
+
+
+@app.post("/api/news/choice")
+async def api_news_choice(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_auth(authorization)
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="A news story choice is required")
+    slot_id = str(body.get("slot_id") or "")[:160]
+    url = news_public_url(str(body.get("url") or ""))
+    await _system2().refresh(want_status=False)
+    slot = _news_planned_slot(slot_id)
+    if not slot:
+        raise HTTPException(status_code=404, detail="Upcoming news slot not found")
+    if float(slot.get("start") or 0) - time.time() < 90:
+        raise HTTPException(status_code=409, detail="This news segment is too close to air for a new recording")
+    headlines = await drudge_headlines(NEWS_PAGE_MOST)
+    story = next((row for row in headlines if news_public_url(str(row.get("url") or "")) == url), None)
+    if not story:
+        raise HTTPException(status_code=400, detail="Choose a story from the current news feed")
+    row = news_story_choose(slot_id, story)
+    dossier = await news_story_dossier(story)
+    await _system2().refresh(force=True, want_status=False)
+    pipeline_log("news", "Story selected for %s: %s (%s)" % (
+        slot_id, row["title"], dossier.get("availability") or "metadata"))
+    return {"ok": True, "slot_id": slot_id, "selected_url": row["url"],
+            "dossier": {key: dossier.get(key) for key in
+                        ("title", "url", "source_url", "availability", "method",
+                         "excerpt", "evidence_links")}}
+
+
 @app.post("/api/paper/{edition_id}/snapshot")
 async def api_paper_snapshot(
     edition_id: str,
@@ -182553,6 +186139,24 @@ async def api_comfy_idle_now(
     return out
 
 
+@app.post("/api/h3/relieve")
+async def api_h3_relieve(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Make room for queued H3 video work while preserving active renders."""
+    require_auth(authorization)
+    try:
+        payload = await request.json()
+    except Exception:  # noqa: BLE001
+        payload = {}
+    out = await h3_capacity_relief(
+        "the operator made room for queued H3 work",
+        force=bool((payload or {}).get("force")))
+    out["queue"] = await asyncio.to_thread(_parody_stinger_queue().list)
+    return out
+
+
 @app.get("/api/comfy/doctor")
 async def api_comfy_doctor_state(
     authorization: str | None = Header(default=None),
@@ -182617,8 +186221,8 @@ async def art_prompt_api(
     try:
         blob = base64.b64encode(path.read_bytes()).decode()
         async with _OLLAMA_GATE, httpx.AsyncClient(timeout=120) as client:
-            answer = await client.post(
-                f"{OLLAMA_URL}/api/chat",
+            answer = await recorded_ollama_post(client,
+                f"{OLLAMA_URL}/api/chat", purpose="image prompt recovery",
                 json={"model": VISION_MODEL,
                       # #1079: and this one too - same runner, same
                       # rebuild. (#1070: the pin rides the one options
@@ -185116,6 +188720,8 @@ async def chat_completions(
             "from_library": metadata["from_library"],
             "system_status_used": metadata["system_status_used"],
             "image_requested": metadata["image_requested"],
+            "video_requested": metadata["video_requested"],
+            "ad_video_requested": metadata.get("ad_video_requested", False),
             "openwebui_used": metadata["openwebui_used"],
             "memory_used": metadata["memory_used"],
             "memory_saved": metadata["memory_saved"],
@@ -185970,6 +189576,33 @@ button.danger {
   max-height: calc(100dvh - 24px); min-width: min(280px,100%); min-height: 160px;
   margin: 0 auto; padding-bottom: 24px; box-sizing: border-box;
   overflow: auto; resize: both; container-type: inline-size; }
+.lb-top { display: flex; align-items: center; gap: 12px; min-width: 0;
+  padding: 0 0 10px; }
+.lb-top strong { flex: 0 1 auto; min-width: 150px; color: #9eecef;
+  font-size: 17px; line-height: 1.2; }
+.lb-h3-clock { flex: 1 1 260px; min-width: 180px; display: flex;
+  align-items: center; gap: 8px; color: #b9c8d2; font-size: 12px; }
+.lb-h3-toggle { flex: 0 0 auto; display: flex; align-items: center; gap: 7px;
+  color: #dce8ee; cursor: pointer; user-select: none; }
+.lb-h3-toggle input { position: absolute; opacity: 0; pointer-events: none; }
+.lb-h3-switch { position: relative; display: inline-block; width: 36px; height: 18px;
+  border: 1px solid #40586a; border-radius: 999px; background: #111a22; }
+.lb-h3-switch::after { content: ""; position: absolute; left: 2px; top: 2px;
+  width: 12px; height: 12px; border-radius: 50%; background: #9ba6b7;
+  transition: transform .18s ease, background .18s ease; }
+.lb-h3-toggle input:checked + .lb-h3-switch { border-color: #65c7da;
+  background: #17313a; }
+.lb-h3-toggle input:checked + .lb-h3-switch::after {
+  transform: translateX(18px); background: #9eecef;
+}
+.lb-h3-meter { flex: 1 1 auto; min-width: 80px; height: 7px; overflow: hidden;
+  border-radius: 4px; background: #17202a; border: 1px solid #2f4150; }
+.lb-h3-meter > i { display: block; height: 100%; width: 0;
+  background: #65c7da; box-shadow: 0 0 8px rgba(101,199,218,.55); }
+.lb-h3-time { flex: 0 0 auto; min-width: 54px; text-align: right;
+  font-variant-numeric: tabular-nums; color: #dce8ee; }
+.lb-h3-clock.off { opacity: .65; }
+.lb-h3-clock.off .lb-h3-meter > i { background: #50606c; box-shadow: none; }
 .lb-resize-handle { position: sticky; left: 100%; bottom: 0; z-index: 12;
   display: flex; align-items: center; justify-content: center; width: 28px; height: 28px;
   margin: -28px 0 0 auto; padding: 0; border: 1px solid #5f8b91;
@@ -186055,6 +189688,9 @@ button.danger {
   color: var(--muted); }
 .lb-export select, .lb-export input { width: 100%; min-width: 0; margin: 0; }
 @container (max-width: 680px) {
+  .lb-top { flex-wrap: wrap; }
+  .lb-top strong { min-width: 0; }
+  .lb-h3-clock { flex-basis: 100%; }
   .lb-export { grid-template-columns: repeat(2,minmax(0,1fr)); }
   .lb-export label:nth-child(3) { grid-column: 1/-1; }
   .lb-export button { grid-column: 1/-1; }
@@ -186072,11 +189708,23 @@ button.danger {
   min-height: 260px; display: grid; grid-template-rows: auto minmax(0,1fr);
   overflow: hidden; resize: both; border: 1px solid #40586a; border-radius: 6px;
   background: #080d12; box-shadow: 0 22px 70px rgba(0,0,0,.72); }
-.lb-editor-bar { display: flex; align-items: center; gap: 10px; min-width: 0;
-  padding: 7px 9px; border-bottom: 1px solid #2c3a4f; background: #101820; }
+.lb-editor-bar { display: flex; align-items: center; gap: 4px; min-width: 0;
+  min-height: 32px; padding: 2px 7px; border-bottom: 1px solid #2c3a4f; background: #101820; }
 .lb-editor-bar strong { min-width: 0; overflow: hidden; text-overflow: ellipsis;
-  white-space: nowrap; }
-.lb-editor-bar button { margin-left: auto; flex: 0 0 auto; min-height: 36px; }
+  white-space: nowrap; margin-right: auto; font-size: 12px; }
+.lb-editor-export-name { width: clamp(130px,18vw,250px); min-width: 0; height: 28px;
+  box-sizing: border-box; border: 1px solid #40586a; border-radius: 4px;
+  background: #19222c; color: #f1f5f7; padding: 3px 7px; font: 12px inherit; }
+.lb-editor-bar .lb-editor-command { display: grid; place-items: center; flex: 0 0 auto;
+  width: 28px; min-width: 28px; min-height: 28px; margin: 0; padding: 0;
+  border-radius: 4px; font-size: 0; }
+.lb-editor-command:before { color: #d8e2e9; font-size: 16px; line-height: 1; }
+.lb-editor-command[data-command=back]:before { content: "\2190"; }
+.lb-editor-command[data-command=undo]:before { content: "\21b6"; }
+.lb-editor-command[data-command=redo]:before { content: "\21b7"; }
+.lb-editor-command[data-command=export]:before { content: "\21e9"; }
+.lb-editor-command[data-command=close] { margin-left: 5px; }
+.lb-editor-command[data-command=close]:before { content: "\00d7"; font-size: 20px; }
 .lb-editor-frame { width: 100%; height: 100%; min-width: 0; min-height: 0;
   display: block; border: 0; background: #080d12; }
 @media (max-width: 720px) {
@@ -187204,12 +190852,18 @@ details[open] > .pine-summary::before { transform: rotate(90deg); }
   background: var(--panel2); font-weight: 700; font-size: 13px;
   cursor: grab; user-select: none; touch-action: none;
 }
+.pine-win.max .pine-win-head {
+  position: sticky; top: 0; z-index: 30;
+  box-shadow: 0 1px 0 var(--border), 0 8px 18px rgba(0,0,0,.35);
+}
 .pine-win-head:active { cursor: grabbing; }
 .pine-win-head > b {
   flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis;
   white-space: nowrap;
 }
 .pine-win-head button { font-size: 12px; padding: 3px 8px; flex: none; }
+.pine-win-head button[data-pine-exit-full] { display: none; }
+.pine-win.max .pine-win-head button[data-pine-exit-full] { display: inline-flex; }
 .pine-win-tools {
   display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
   font-weight: 400; font-size: 12px; min-width: 0;
@@ -189547,6 +193201,18 @@ used. Right: colour by how recently — newest red/yellow, oldest white/blue.">
             background:rgba(4,8,14,0.92);padding:24px;overflow-y:auto"
      onclick="closeLightbox(event)">
   <div class="lb-card" onclick="event.stopPropagation()">
+    <div class="lb-top">
+      <strong>Pine Box Gallery</strong>
+      <div id="h3HourlyClock" class="lb-h3-clock">
+        <label class="lb-h3-toggle" title="Hourly automatic H3 render">
+          <input id="h3HourlyToggle" type="checkbox" onchange="h3HourlyToggle()">
+          <span class="lb-h3-switch" aria-hidden="true"></span>
+          <span>H3</span>
+        </label>
+        <div class="lb-h3-meter" aria-hidden="true"><i id="h3HourlyFill"></i></div>
+        <span id="h3HourlyTime" class="lb-h3-time">--:--</span>
+      </div>
+    </div>
     <div id="lbImgWrap" class="lb-imgwrap">
       <div id="lbGeneratedPane" class="lb-pane lb-generated">
         <span class="lb-pane-label">generated</span>
@@ -189969,10 +193635,15 @@ function pineWin(key, title, opts) {
   head.appendChild(name);
   const tools = el("span", "pine-win-tools", "");   // a scene's own controls
   head.appendChild(tools);
+  const exitFull = el("button", "", "Exit full screen");
+  exitFull.type = "button";
+  exitFull.dataset.pineExitFull = "1";
+  exitFull.title = "Exit full screen";
   const max = el("button", "", "⤢");
   max.title = "Fill the screen (again to come back)";
   const shut = el("button", "", "✕");
   shut.title = "Close";
+  head.appendChild(exitFull);
   head.appendChild(max);
   head.appendChild(shut);
   box.appendChild(head);
@@ -189995,6 +193666,7 @@ function pineWin(key, title, opts) {
       delete box.dataset.pineWinMax;
       box.classList.remove("max");
       if (before) pineWinApply(box, clampBoxToViewport(before));
+      max.title = "Fill the screen";
       max.textContent = "⤢";
     } else {
       before = {left: box.offsetLeft, top: box.offsetTop,
@@ -190004,10 +193676,12 @@ function pineWin(key, title, opts) {
       box.classList.add("max");
       pineWinApply(box, {left: 4, top: 4, width: window.innerWidth - 8,
                          height: window.innerHeight - 8});
+      max.title = "Exit full screen";
       max.textContent = "⤡";
     }
   };
   max.onclick = maximize;
+  exitFull.onclick = maximize;
   head.ondblclick = (e) => {
     if (!e.target.closest("button,input,select,textarea,a,label")) maximize();
   };
@@ -191759,6 +195433,89 @@ let lightboxReferenceSerial = 0;
 let lightboxGeneratedSerial = 0;
 const lightboxDuckPlaying = new Set();
 let lightboxDuckFactor = 1;
+let h3HourlyState = null;
+let h3HourlyPaintTimer = null;
+let h3HourlyPollTimer = null;
+let h3HourlyLoading = false;
+
+function h3HourlyClock(seconds) {
+  seconds = Math.max(0, Math.floor(Number(seconds) || 0));
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  const s = seconds % 60;
+  const two = (n) => String(n).padStart(2, "0");
+  return h > 0 ? h + ":" + two(m) + ":" + two(s) : m + ":" + two(s);
+}
+
+function h3HourlyPaint() {
+  const root = document.getElementById("h3HourlyClock");
+  const toggle = document.getElementById("h3HourlyToggle");
+  const fill = document.getElementById("h3HourlyFill");
+  const label = document.getElementById("h3HourlyTime");
+  if (!root || !toggle || !fill || !label) return;
+  const state = h3HourlyState || {};
+  const enabled = state.enabled !== false;
+  root.classList.toggle("off", !enabled);
+  toggle.checked = enabled;
+  if (!enabled) {
+    fill.style.width = "0%";
+    label.textContent = "off";
+    root.title = "Hourly automatic H3 render is off";
+    return;
+  }
+  const elapsed = Math.max(0, (Date.now() / 1000) - Number(state.client_at || 0));
+  const remaining = Math.max(0, Number(state.seconds_remaining || 0) - elapsed);
+  const period = Math.max(1, Number(state.period_seconds || 3600));
+  const progress = Math.max(0, Math.min(1, 1 - (remaining / period)));
+  fill.style.width = (progress * 100).toFixed(1) + "%";
+  label.textContent = h3HourlyClock(remaining);
+  root.title = state.radio_on === false
+    ? "Station is off; next H3 render waits for broadcast"
+    : "Next hourly H3 render in " + h3HourlyClock(remaining);
+}
+
+async function h3HourlyLoad() {
+  if (h3HourlyLoading) return;
+  h3HourlyLoading = true;
+  try {
+    h3HourlyState = await api("/api/h3/hourly");
+    h3HourlyState.client_at = Date.now() / 1000;
+    h3HourlyPaint();
+  } catch (e) {
+    const label = document.getElementById("h3HourlyTime");
+    if (label) label.textContent = "err";
+  } finally {
+    h3HourlyLoading = false;
+  }
+}
+
+async function h3HourlyToggle() {
+  const input = document.getElementById("h3HourlyToggle");
+  if (!input) return;
+  input.disabled = true;
+  try {
+    h3HourlyState = await api("/api/h3/hourly", {
+      method: "POST",
+      body: JSON.stringify({enabled: input.checked})
+    });
+    h3HourlyState.client_at = Date.now() / 1000;
+    h3HourlyPaint();
+  } catch (e) {
+    input.checked = !input.checked;
+    const status = document.getElementById("lbStatus");
+    if (status) status.textContent = e.message || "H3 hourly setting did not save.";
+  } finally {
+    input.disabled = false;
+  }
+}
+
+function h3HourlyOpen() {
+  h3HourlyLoad();
+  if (!h3HourlyPaintTimer)
+    h3HourlyPaintTimer = setInterval(h3HourlyPaint, 1000);
+  if (!h3HourlyPollTimer)
+    h3HourlyPollTimer = setInterval(h3HourlyLoad, 15000);
+}
 
 function lightboxDuckApply() {
   try { djApplyGain(true); } catch (e) {}
@@ -192303,6 +196060,7 @@ function closeLightboxVideoEditor() {
   lightboxVideoEditor = null;
   if (typeof overlay.__pineCleanup === "function") overlay.__pineCleanup();
   overlay.remove();
+  document.body.classList.remove("pine-splice-open");
 }
 
 function openLightboxVideoEditor(path) {
@@ -192319,19 +196077,40 @@ function openLightboxVideoEditor(path) {
   bar.className = "lb-editor-bar";
   const title = document.createElement("strong");
   title.textContent = "Video splice editor";
-  const close = document.createElement("button");
-  close.type = "button";
-  close.textContent = "Close editor";
+  const exportName = document.createElement("input");
+  exportName.className = "lb-editor-export-name";
+  exportName.type = "text";
+  exportName.value = "Parody splice";
+  exportName.maxLength = 120;
+  exportName.autocomplete = "off";
+  exportName.setAttribute("aria-label", "Export name");
+  exportName.title = "Export name";
+  const editorCommand = (command, label) => {
+    const button = document.createElement("button");
+    button.className = "lb-editor-command";
+    button.type = "button";
+    button.dataset.command = command;
+    button.setAttribute("aria-label", label);
+    button.title = label;
+    return button;
+  };
+  const back = editorCommand("back", "Back to the gallery");
+  const undo = editorCommand("undo", "Undo edit");
+  const redo = editorCommand("redo", "Redo edit");
+  const exportCopy = editorCommand("export", "Export to SFX ads");
+  const close = editorCommand("close", "Close editor");
   const frame = document.createElement("iframe");
   frame.className = "lb-editor-frame";
   frame.title = "Video splice editor";
   frame.setAttribute("allow", "autoplay; fullscreen");
-  frame.src = String(path || "");
-  bar.append(title, close);
+  const editorPath = String(path || "") + (String(path || "").includes("?") ? "&" : "?") + "embed=1";
+  const editorOrigin = new URL(editorPath, window.location.href).origin;
+  frame.src = editorPath;
+  bar.append(title, exportName, back, undo, redo, exportCopy, close);
   dialog.append(bar, frame);
   overlay.appendChild(dialog);
   const onMessage = (event) => {
-    if (event.source !== frame.contentWindow || !event.data) return;
+    if (event.source !== frame.contentWindow || event.origin !== editorOrigin || !event.data) return;
     if (event.data.type === "pine-video-editor-close") {
       closeLightboxVideoEditor();
     } else if (event.data.type === "pine-video-editor-export") {
@@ -192344,6 +196123,12 @@ function openLightboxVideoEditor(path) {
   const onKey = (event) => {
     if (event.key === "Escape") closeLightboxVideoEditor();
   };
+  const sendCommand = (command) => {
+    if (command === "close") { closeLightboxVideoEditor(); return; }
+    if (!frame.contentWindow) return;
+    frame.contentWindow.postMessage({type: "pine-video-editor-command", command: command,
+      export_name: exportName.value}, editorOrigin);
+  };
   overlay.__pineCleanup = () => {
     window.removeEventListener("message", onMessage);
     document.removeEventListener("keydown", onKey);
@@ -192352,10 +196137,13 @@ function openLightboxVideoEditor(path) {
     if (event.target === overlay) closeLightboxVideoEditor();
   });
   dialog.addEventListener("pointerdown", (event) => event.stopPropagation());
-  close.addEventListener("click", closeLightboxVideoEditor);
+  [back, undo, redo, exportCopy, close].forEach((button) => {
+    button.addEventListener("click", () => sendCommand(button.dataset.command));
+  });
   window.addEventListener("message", onMessage);
   document.addEventListener("keydown", onKey);
   document.body.appendChild(overlay);
+  document.body.classList.add("pine-splice-open");
   lightboxVideoEditor = overlay;
   close.focus();
 }
@@ -192440,6 +196228,7 @@ function showLightbox(file, fallback) {
   const openSerial = ++lightboxOpenSerial;
   const overlay = document.getElementById("lightbox");
   overlay.style.display = "block";
+  h3HourlyOpen();
   wireLightboxResize();
   if (!overlay.__pineBackdrop) {
     overlay.__pineBackdrop = true;
@@ -194668,11 +198457,13 @@ async function dirScriptOpen(sid) {
   catch (e) { body.textContent = "That script could not be read: " + e; return; }
   if (!dirQueue || dirQueue.script !== sid) return;
   /* Opening it is what clears the notification — and ONLY that. */
-  try {
-    await api("/api/director/script/" + encodeURIComponent(sid) + "/seen",
-      {method: "POST", body: JSON.stringify({kind: got.kind})});
-    dirQueueTick();
-  } catch (e) { /* the badge can lag */ }
+  if (!got.read_only) {
+    try {
+      await api("/api/director/script/" + encodeURIComponent(sid) + "/seen",
+        {method: "POST", body: JSON.stringify({kind: got.kind})});
+      dirQueueTick();
+    } catch (e) { /* the badge can lag */ }
+  }
   dirScreenplayCss();
   body.textContent = "";
   caption.textContent = got.kind + " · " + (got.turns || []).length
@@ -194720,7 +198511,9 @@ async function dirScriptOpen(sid) {
   backToRoom.onclick = postNote;
   note.onkeydown = (ev) => { if (ev.key === "Enter") postNote(); };
   [note, keep, backToRoom].forEach((n) => noteBar.appendChild(n));
-  body.appendChild(noteBar);
+  if (!got.read_only) body.appendChild(noteBar);
+  else body.appendChild(el("div", "dir-sub",
+    "Archived performance / " + (got.heard_lines || 0) + " lines heard"));
 
   if ((got.notes || []).length) {
     const box = el("details", "", "");
@@ -194746,6 +198539,7 @@ async function dirScriptOpen(sid) {
   page.appendChild(slug);
   (got.turns || []).forEach((t) => page.appendChild(dirTurnRow(got, t)));
   body.appendChild(page);
+  if (got.read_only) return;
 
   /* WHAT CAN BE DONE TO THE WHOLE SCRIPT. */
   const foot = el("div", "dir-add", "");
@@ -194990,6 +198784,10 @@ function dirTurnRow(got, t) {
   wrap.appendChild(el("div", "sp-cue", dirCue(t)));
   const para = el("div", "sp-para", dirWrap(t.text, 58));
   wrap.appendChild(para);
+  if (got.read_only) {
+    wrap.appendChild(el("div", "sp-paren", String(t.air_state || "written")));
+    return wrap;
+  }
   if (t.tinted) {
     wrap.appendChild(el("div", "sp-paren", "(a tinted version is stored: "
       + t.tinted.slice(0, 90) + ")"));
@@ -199156,12 +202954,40 @@ function scopeAccentNow() {
 }
 function scopeAccentForget() { scopeAccent = ""; }
 
+let musicScopeVisible = true;
+let observedMusicScope = null;
+const musicScopeObserver = PINE_TABLET && typeof IntersectionObserver === "function"
+  ? new IntersectionObserver((entries) => {
+      for (const entry of entries) {
+        if (entry.target === observedMusicScope)
+          musicScopeVisible = entry.isIntersecting;
+      }
+    })
+  : null;
+
+function musicScopeOnscreen(canvas) {
+  if (!musicScopeObserver || canvas.id !== "musicScope") return true;
+  if (observedMusicScope !== canvas) {
+    if (observedMusicScope) musicScopeObserver.unobserve(observedMusicScope);
+    observedMusicScope = canvas;
+    musicScopeVisible = true;
+    musicScopeObserver.observe(canvas);
+  }
+  return musicScopeVisible;
+}
+
 function drawScope(canvas, player) {
   if (!canvas || !player) return;
   // #745: costs nothing while it cannot be seen. The booth dock's scope
   // kept drawing at 60fps with the dock stowed.
   if (!canvas.offsetParent) return;
   const scope = audioScope(player);
+  if (scope && scope.context.state === "suspended" && !player.paused) {
+    scope.context.resume().catch(() => {});
+  }
+  // The main music scope can be mounted far below the tablet's Script pane.
+  // offsetParent stays non-null there, so let the viewport observer hold its paint.
+  if (!musicScopeOnscreen(canvas)) return;
   const ctx = canvas.getContext("2d");
   // #745: this was `canvas.width = canvas.clientWidth * dpr` EVERY FRAME —
   // the exact fault #737 fixed for the booth glass and never fixed here.
@@ -199187,9 +203013,6 @@ function drawScope(canvas, player) {
   const width = canvas.width, height = canvas.height;
   ctx.clearRect(0, 0, width, height);
   if (!scope) return;
-  if (scope.context.state === "suspended" && !player.paused) {
-    scope.context.resume().catch(() => {});
-  }
   // Nothing playing, nothing to draw — the cleared canvas is the answer.
   if (player.paused || player.ended) return;
 
@@ -214369,7 +218192,7 @@ function djTvShow(clip) {
     try {
       video.removeAttribute("data-pine-warm");
       video.removeAttribute("style");
-      video.muted = false;
+      video.muted = !!clip.silent_picture;
       video.volume = djTvVideoLevel();                     /* [#1216] */
     } catch (e) { /* it is still the picture */ }
     /* #1147's rule: the src goes first and the node second, or a clip
@@ -214429,6 +218252,7 @@ function djTvShow(clip) {
     /* No br=: that road is an AUDIO transcode (#1210). The signature in
      * the url is what gets it past the guard, so it is passed through
      * exactly as the station wrote it. */
+    video.muted = !!clip.silent_picture;
     video.src = clip.url;
     tube.appendChild(video);
     const glass = document.createElement("div");
@@ -219941,7 +223765,9 @@ async function djMicCall() {
   source.connect(node);
   node.connect(context.destination);
 
-  djMic = {stream, context, source, node, chunks,
+  const stopMeter = window.PineTalkDot && window.PineTalkDot.monitorInput
+    ? window.PineTalkDot.monitorInput(source, context) : () => {};
+  djMic = {stream, context, source, node, chunks, stopMeter,
            rate: context.sampleRate, started: Date.now(),
            count: () => samples};
   if (button) {
@@ -219960,6 +223786,7 @@ async function djMicStop() {
   djMic = null;
   if (!mic) return;
   clearTimeout(mic.limit);
+  if (mic.stopMeter) mic.stopMeter();
 
   const button = document.getElementById("djMicBtn");
   if (button) {
@@ -237362,10 +241189,13 @@ function studioImportMic() {
       };
       source.connect(processor);
       processor.connect(context.destination);
+      const stopMeter = window.PineTalkDot && window.PineTalkDot.monitorInput
+        ? window.PineTalkDot.monitorInput(source, context) : () => {};
       studioSay("recording — press + Mic again to stop (30s+ makes a "
         + "better clone)…");
       studioMic = {
         stop: async () => {
+          stopMeter();
           processor.disconnect(); source.disconnect();
           stream.getTracks().forEach((track) => track.stop());
           const rate = context.sampleRate;
@@ -244060,7 +247890,7 @@ RADIO_PAGE_HTML = r"""<!doctype html>
 <meta name="theme-color" content="#04060b">
 <link rel="apple-touch-icon" href="/app-icon-180.png">
 <link rel="icon" type="image/png" sizes="192x192" href="/app-icon-192.png">
-<link id="pwaManifest" rel="manifest" href="/manifest.webmanifest">
+<link id="pwaManifest" rel="manifest" href="__PWA_MANIFEST__">
 <!-- Single-colour icons, not colour emoji. The stylesheet carries the
      font inline and its unicode-range confines it to pictographs. -->
 <link rel="stylesheet" href="/icons/pineicons.css">
@@ -244336,6 +248166,13 @@ the library files untouched">📶 quality</label>
            onkeydown="if(event.key==='Enter')shout()">
     <button onclick="shout()">Say it</button>
   </div>
+  <div class="row" style="margin-top:8px">
+    <input id="adIdea" placeholder="Make an H3 ad to air..."
+           onkeydown="if(event.key==='Enter')makeAd()">
+    <button onclick="dictateAd()" title="Dictate an H3 ad prompt"
+            aria-label="Dictate an H3 ad prompt">Mic</button>
+    <button onclick="makeAd()">Make ad</button>
+  </div>
   <div class="row" style="margin-top:6px;gap:4px">
     <button aria-label="Applause" onclick="shout('👏')" title="Applause">👏</button>
     <button aria-label="This one is hot" onclick="shout('🔥')" title="This one is hot">🔥</button>
@@ -244422,9 +248259,6 @@ function applyLevels() {
   }
   /* #1416: a sting rides the voice element at the SFX level. */
   if (voice) setPlayerLevel(voice, voiceSting ? sfxLevel : voiceLevel);
-  /* #1265: on the stream road the balance lives in the gain nodes, and
-   * this is the line that makes the sliders mean anything there at all. */
-  applySplitLevels();
   /* #1416: the stage's video is a clip, not the broadcast - on the road
    * where this page is the one making the sound.
    *
@@ -244469,6 +248303,7 @@ function setLevels(save) {
     if (sfx) localStorage.pbfmSfx = sfx.value;
   } catch (e) { /* private browsing — the levels just do not persist */ }
   applyLevels();
+  refreshPersonalMix();
 }
 
 /* #999: THE LISTENER'S BITRATE.
@@ -244724,6 +248559,49 @@ function shout(react) {
     .catch((e) => {
       const note = document.getElementById("note");
       if (note) note.textContent = e.message;
+    });
+}
+
+function dictateAd() {
+  const box = document.getElementById("adIdea");
+  const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!box || !Recognition) {
+    const note = document.getElementById("note");
+    if (note) note.textContent = "Dictation is not available in this browser.";
+    return;
+  }
+  const recognition = new Recognition();
+  recognition.lang = navigator.language || "en-US";
+  recognition.interimResults = true;
+  recognition.continuous = false;
+  const initial = box.value.trim();
+  recognition.onresult = (event) => {
+    let words = "";
+    for (let i = event.resultIndex; i < event.results.length; i += 1) {
+      words += event.results[i][0].transcript;
+    }
+    box.value = (initial ? initial + " " : "") + words.trim();
+  };
+  recognition.onerror = () => {
+    const note = document.getElementById("note");
+    if (note) note.textContent = "Dictation could not hear that; type the ad instead.";
+  };
+  recognition.start();
+}
+
+function makeAd() {
+  const box = document.getElementById("adIdea");
+  const prompt = ((box && box.value) || "").trim();
+  if (!prompt) return;
+  const note = document.getElementById("note");
+  if (note) note.textContent = "";
+  api("/api/listener/ads", {method: "POST", body: JSON.stringify({prompt})})
+    .then((got) => {
+      if (box) box.value = "";
+      if (note) note.textContent = got.message || "Request completed.";
+    })
+    .catch((err) => {
+      if (note) note.textContent = err.message || "The H3 ad could not be queued.";
     });
 }
 
@@ -245172,10 +249050,11 @@ async function tvPoll() {
      * can answer with the clip that ear is INSIDE rather than the one
      * the station is airing this instant. Whole seconds, so identical
      * polls still share a flight (see api() above). */
-    data = await api("/api/dj/video?lag=" + Math.round(tvLagSeconds()));
+    data = await api("/api/dj/video?lag=" + Math.round(tvLagSeconds())
+      + (wantsHls() ? "&hls=1" : ""));
   } catch (e) { return; }
-  if (typeof data.burst_s === "number" && data.burst_s > 0) {
-    tvBurst = data.burst_s;                                /* [#1244] */
+  if (typeof data.burst_s === "number") {
+    tvBurst = Math.max(0, data.burst_s);                    /* [#1244] */
   }
   tvEndless = !!data.endless;                              /* [#1244] */
   tvSayState();                                            /* [#1244] */
@@ -245866,62 +249745,26 @@ function wantsHls() {
   } catch (e) { return false; }
 }
 
-/* #1265: THE BALANCE HAPPENS HERE, NOT ON THE BOX.
- *
- * The listener is ~30 s behind live by design - that burst is what rides
- * out the box's stalls - so anything the mixer changes is heard half a
- * minute later, which is useless for a slider you are trying to set by
- * ear while driving. So the stream is requested UNMIXED (record left,
- * DJs right) and these two gain nodes do the mixing in this browser.
- * Moving a slider is then a gain change on a live audio node: instant.
- *
- * If Web Audio cannot be established we do NOT ask for the split shape -
- * a split stream played raw is the record in one ear and the talk in the
- * other, which is a far worse failure than a slider that needs a moment.
- */
-let splitCtx = null, splitMusic = null, splitVoice = null, splitOn = false;
-
-function buildSplitGraph(el) {
-  if (splitOn) return true;
-  try {
-    const Ctx = window.AudioContext || window.webkitAudioContext;
-    if (!Ctx || !el) return false;
-    splitCtx = splitCtx || new Ctx();
-    const src = splitCtx.createMediaElementSource(el);
-    const splitter = splitCtx.createChannelSplitter(2);
-    const merger = splitCtx.createChannelMerger(2);
-    splitMusic = splitCtx.createGain();
-    splitVoice = splitCtx.createGain();
-    src.connect(splitter);
-    splitter.connect(splitMusic, 0);      /* left  = the record */
-    splitter.connect(splitVoice, 1);      /* right = the DJs   */
-    /* Both gains feed both ears, so the result is centred mono rather
-     * than the two sources sitting in opposite speakers. */
-    splitMusic.connect(merger, 0, 0); splitMusic.connect(merger, 0, 1);
-    splitVoice.connect(merger, 0, 0); splitVoice.connect(merger, 0, 1);
-    merger.connect(splitCtx.destination);
-    splitOn = true;
-    applySplitLevels();
-    return true;
-  } catch (e) {
-    splitOn = false;
-    return false;
-  }
+/* Safari's native HLS path does not reliably expose an AudioContext graph.
+ * The controls therefore travel with THIS listener's HLS URL and the station
+ * makes a private mix lane. No other receiver or the studio is changed. */
+let mixRestart = null, mixWanted = "", streamMixApplied = "";
+function personalMix() {
+  const m = document.getElementById("lvMusic");
+  const v = document.getElementById("lvVoice");
+  const s = document.getElementById("lvSfx");
+  return [m, v, s].map((el) => Math.max(0, Math.min(200, Number(el && el.value) || 0))).join(",");
 }
-
-function applySplitLevels() {
-  if (!splitOn || !splitCtx) return;
-  try {
-    const now = splitCtx.currentTime;
-    /* A short ramp rather than a step: instant to the hand, no zipper
-     * noise in the ear. */
-    splitMusic.gain.cancelScheduledValues(now);
-    splitVoice.gain.cancelScheduledValues(now);
-    splitMusic.gain.setTargetAtTime(
-      Math.max(0, Math.min(2, musicLevel)), now, 0.03);
-    splitVoice.gain.setTargetAtTime(
-      Math.max(0, Math.min(2, voiceLevel)), now, 0.03);
-  } catch (e) {}
+function refreshPersonalMix() {
+  if (!streamMode || !playing || !wantsHls()) return;
+  mixWanted = personalMix();
+  if (mixWanted === streamMixApplied) return;
+  if (mixRestart) clearTimeout(mixRestart);
+  mixRestart = setTimeout(() => {
+    mixRestart = null;
+    if (!streamMode || !playing || mixWanted === streamMixApplied) return;
+    startStream();
+  }, 180);
 }
 
 function streamUrl() {
@@ -245932,9 +249775,7 @@ function streamUrl() {
   let url = road + "?_=" + Date.now();
   if (GUEST) url += "&t=" + encodeURIComponent(KEY);
   if (rate > 0) url += "&br=" + rate;
-  /* Only ask for the unmixed shape if this browser can put it back
-   * together. See buildSplitGraph. */
-  if (splitOn) url += "&split=1";
+  if (wantsHls()) url += "&mix=" + encodeURIComponent(personalMix());
   return url;
 }
 
@@ -246024,9 +249865,6 @@ function streamElement() {
    * the same self-feeding stall #998 documents for the record element,
    * rebuilt on a new road. Only the watchdog below may give up, and only
    * after the playhead has genuinely stopped moving. */
-  /* Wire the balance BEFORE any src is set: the decision to ask for the
-   * split shape depends on whether this succeeded. */
-  buildSplitGraph(radio);
   radio.onplaying = () => {
     streamTries = 0;
     /* [#1244] the socket has started feeding this element. A fresh src
@@ -246043,6 +249881,7 @@ function streamElement() {
 function startStream() {
   const el = streamElement();
   streamTries = 0;
+  streamMixApplied = wantsHls() ? personalMix() : "";
   el.src = streamUrl();
   el.volume = 1;
   el.play().catch((e) => streamRecover("play: " + (e && e.message)));

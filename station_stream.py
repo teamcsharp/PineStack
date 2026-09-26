@@ -87,6 +87,7 @@ JOIN_BURST_SECONDS = float(os.getenv("STREAM_JOIN_BURST", "30"))
 # nearest of these, so a junk query cannot make the box spawn encoders.
 STREAM_RATES = (32, 48, 64, 96, 128, 192)
 DEFAULT_RATE = int(os.getenv("STREAM_BITRATE", "128"))
+HLS_START_SEGMENTS = max(1, int(os.getenv("HLS_START_SEGMENTS", "2") or 2))
 
 
 def snap_rate(want: Any) -> int:

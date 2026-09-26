@@ -9,6 +9,28 @@ _WORDS = re.compile(r"[^\W_]+(?:'[^\W_]+)*", re.UNICODE)
 _GENERIC = frozenset('a an the our your this that live station service services product products server running on own one of for voice cloning clone'.split())
 _SALE = re.compile(r'\b(?:sign\s+up|subscribe|place\s+(?:an|your)\s+order|order\s+now|pay\s+(?:through|at)|get\s+yours|book\s+now|purchase|enro[l]{1,2})\b', re.I)
 _NEGATIVE = re.compile(r"\b(?:not|never|avoid|cannot|can't|don't|won't|shouldn't|mustn't|without)\b", re.I)
+WORDS_PER_MINUTE = 155
+
+
+def normalize_role(role: str) -> str:
+    """Normalize screenplay labels to the station's role names."""
+    key = _normal(role).strip().strip(":")
+    aliases = {
+        "a": "dj",
+        "host": "dj",
+        "dj": "dj",
+        "b": "cohost",
+        "co-host": "cohost",
+        "cohost": "cohost",
+        "c": "caller",
+        "caller": "caller",
+        "d": "third",
+        "third": "third",
+        "e": "caller2",
+        "caller2": "caller2",
+        "caller 2": "caller2",
+    }
+    return aliases.get(key, key)
 
 
 def _normal(text):

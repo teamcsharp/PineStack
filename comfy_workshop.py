@@ -64,16 +64,17 @@ def duration_frames(duration_s: Any = None, *, prompt: str = "",
                     speech: str = "", reference_s: float = 0.0,
                     duration_mode: str = "auto") -> int:
     """Choose a short default, or follow explicit/contextual length up to 15s."""
+    if duration_mode not in {"auto", "reference", "double", "at_least"}:
+        raise ValueError("Unknown duration mode")
+    maximum_s = max(FRAME_CHOICES) / 24.0
     if duration_s is not None and duration_s != "":
         try:
             wanted = float(duration_s)
-            if not 3.0 <= wanted <= 15.0:
+            if not 3.0 <= wanted <= maximum_s:
                 raise ValueError
         except (TypeError, ValueError):
             raise ValueError("Duration must be between 3 and 15 seconds") from None
     elif reference_s > 0:
-        if duration_mode not in {"auto", "reference", "double"}:
-            raise ValueError("Unknown duration mode")
         doubled = duration_mode == "double" or (duration_mode == "auto" and bool(
             re.search(r"\b(double|twice|2x|two times)\b", prompt, re.I)))
         wanted = reference_s * (2 if doubled else 1)
@@ -82,7 +83,10 @@ def duration_frames(duration_s: Any = None, *, prompt: str = "",
         wanted = min(15.0, max(3.0, 3.0 + words / 2.5)) if words else 5.0
         if re.search(r"\b(longer|extended|ten seconds|fifteen seconds)\b", prompt, re.I):
             wanted = max(wanted, 10.0)
-    wanted = max(3.0, min(15.0, wanted))
+    wanted = max(3.0, min(maximum_s, wanted))
+    if duration_mode == "at_least":
+        return next((frames for frames in FRAME_CHOICES
+                     if frames / 24.0 >= wanted), FRAME_CHOICES[-1])
     return min(FRAME_CHOICES, key=lambda item: abs(item / 24.0 - wanted))
 
 

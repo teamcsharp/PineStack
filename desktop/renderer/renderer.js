@@ -10994,7 +10994,9 @@ async function callInStart() {
     };
     source.connect(node);
     node.connect(ctx.destination);
-    callInState = {stream, ctx, source, node, chunks};
+    const stopMeter = window.PineTalkDot && window.PineTalkDot.monitorInput
+      ? window.PineTalkDot.monitorInput(source, ctx) : () => {};
+    callInState = {stream, ctx, source, node, chunks, stopMeter};
     if (hold) { hold.textContent = "\u25cf recording\u2026 let go to send"; }
     callInSay("listening \u2014 the booth is waiting");
   } catch (err) {
@@ -11027,6 +11029,7 @@ async function callInStop(silent) {
   const hold = $("callInHold");
   if (hold) hold.textContent = "\ud83c\udf99 Hold to talk";
   if (!state) return;
+  if (state.stopMeter) state.stopMeter();
   try {
     state.node.disconnect();
     state.source.disconnect();

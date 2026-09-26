@@ -8,6 +8,8 @@ const line = fs.readFileSync(path.join(renderer, 'console-line.js'), 'utf8');
 const trace = fs.readFileSync(path.join(renderer, 'console-trace.js'), 'utf8');
 const css = fs.readFileSync(path.join(renderer, 'console-trace.css'), 'utf8');
 const chrome = fs.readFileSync(path.join(renderer, 'view-chrome.css'), 'utf8');
+const index = fs.readFileSync(path.join(renderer, 'index.html'), 'utf8');
+const viewer = fs.readFileSync(path.join(renderer, 'ad-viewer.js'), 'utf8');
 
 test('the marquee follows the durable journal incrementally and retains 300 events', () => {
   assert.match(line, /var SEEN_MAX = 300/);
@@ -39,6 +41,47 @@ test('each moving event and terminal row opens the granular trace', () => {
   assert.match(line, /history\(\)\.slice\(0, SEEN_MAX\)/);
   assert.match(trace, /this exact journal event/);
   assert.match(trace, /JSON\.stringify\(openFor\._flow, null, 2\)/);
+});
+
+test('the visible basebar owns the existing station controls', () => {
+  assert.match(line, /pine-console-tools/);
+  assert.match(line, /\['crystalBtn', 'sampleBtn', 'sbLiveBtn'\]/);
+  assert.match(line, /tools\.appendChild\(control\)/);
+  assert.match(line, /oldBar\.hidden = true/);
+  assert.match(chrome, /\.pine-console-tools/);
+  assert.match(chrome, /\.pine-console-tools > button/);
+});
+
+test('the tablet receives working basebar controls when desktop nodes are absent', () => {
+  assert.match(line, /tabletControl\('crystalBtn'/);
+  assert.match(line, /root\.PineViewRail\.closeAll/);
+  assert.match(line, /root\.loadCrystals/);
+  assert.match(line, /tabletControl\('sampleBtn'/);
+  assert.match(line, /pineViewTab-sampler/);
+  assert.match(line, /tabletControl\('sbLiveBtn'/);
+  assert.match(line, /root\.onAirLaunch/);
+});
+
+test('the four established quick tools remain visible beside the audit readout', () => {
+  assert.match(line, /pine-console-shortcuts/);
+  assert.match(line, /pine-console-gallery/);
+  assert.match(line, /pine-console-orchestrator/);
+  assert.match(line, /pine-console-talk-dot/);
+  assert.match(line, /pine-console-change/);
+  assert.match(line, /PineAdViewer\.openGallery/);
+  assert.match(line, /PineOrchGlass\.toggle/);
+  assert.match(line, /talk\.listen\(\)/);
+  assert.match(line, /PineChangeLog\.open/);
+  assert.match(chrome, /\.pine-console-shortcuts > button/);
+});
+
+test('gallery shortcut owns its carousel and hourly H3 header controls', () => {
+  assert.match(index, /<script src="\.\/ad-viewer\.js"><\/script>/);
+  assert.match(viewer, /root\.PineAdViewer = \{open: open, openGallery:/);
+  assert.match(viewer, /pav-strip/);
+  assert.match(viewer, /\/api\/h3\/hourly/);
+  assert.match(viewer, /pav-h3-meter/);
+  assert.match(chrome, /\.pav-h3-meter/);
 });
 
 test('the terminal and detail view are draggable dialogs above page video', () => {

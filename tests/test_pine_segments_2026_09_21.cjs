@@ -210,3 +210,19 @@ test('the tablet scenario sheet mutes dictation and exposes saved topic actions'
   assert.match(src, /actOn\(saved, 'queue'/);
   assert.match(src, /actOn\(saved, 'drop'/);
 });
+
+test('dictation microphones stay in their text field container', () => {
+  const src = fs.readFileSync(
+    path.join(__dirname, '../desktop/renderer/talk-dot.js'), 'utf8');
+  const start = src.indexOf('    function placeMic()');
+  const end = src.indexOf('    function appendWords(', start);
+  const placement = src.slice(start, end);
+  assert.ok(start >= 0 && end > start, 'the field microphone placement routine exists');
+  assert.match(placement, /dictatedField\.parentElement/);
+  assert.match(placement, /host\.appendChild\(fieldMic\)/);
+  assert.match(placement, /wrapper\.appendChild\(field\)/);
+  assert.match(placement, /pine-dictation-field/);
+  assert.match(placement, /computedStyleMap/);
+  assert.doesNotMatch(placement, /getBoundingClientRect|fieldMic\.style\.(?:left|top)\s*=/,
+    'the microphone is anchored inside its own field, without screen coordinates');
+});

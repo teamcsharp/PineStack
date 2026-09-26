@@ -19,7 +19,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { execFile } = require('node:child_process');
 
-const { Terminal, readiness, parseProps, parseDevices } = require('./terminal.cjs');
+const { Terminal, readiness, parseProps } = require('./terminal.cjs');
 const { Glass } = require('./terminal-glass.cjs');
 const firmware = require('./firmware.cjs');
 const gsi = require('./gsi.cjs');
@@ -116,6 +116,8 @@ class TerminalHost {
   constructor({readConfig, writeConfig} = {}) {
     this.readConfig = readConfig || (() => ({}));
     this.writeConfig = writeConfig || (() => {});
+    this.glassReconnect = null;
+    this.glassReconnectAfter = 0;
   }
 
   tools() {
@@ -137,13 +139,52 @@ class TerminalHost {
    * know which serial to address, and the first one is meant to feel like a
    * camera shutter. */
   async glassSerial() {
-    const tools = this.tools();
+    const ready = async () => {
+      const list = await this.terminal().devices();
+      const found = (list || []).find((entry) => entry.authorized);
+      return found ? found.serial : '';
+    };
     try {
-      const list = parseDevices(await runner(tools.adb, 20000)(['devices', '-l'])) || [];
-      const ready = list.find((entry) => entry.authorized);
-      return ready ? ready.serial : '';
+      const serial = await ready();
+      if (serial) return serial;
     } catch (error) {
-      return '';
+      /* A stopped adb server is allowed to take the reconnect road too. */
+    }
+
+    /* The tablet reports its own heartbeat to the station independently of
+     * adb. If it is online and its debugging port answers, an empty device
+     * list is a stale desktop transport, not an absent tablet. Reattach at
+     * this one shared gateway so screenshots, the mirror, cameras, reports
+     * and vitals all recover the same way. */
+    if (Date.now() < this.glassReconnectAfter) return '';
+    if (!this.glassReconnect) {
+      this.glassReconnect = (async () => {
+        try {
+          const look = await this.station('/api/tablet/look');
+          const host = String((look || {}).host || '').trim();
+          const port = Math.max(1, Math.min(65535,
+            Number((look || {}).port) || 5555));
+          if (!host || !look.fetching || !look.adb_port_open) return '';
+          await this.wirelessConnect(host, port);
+          for (let attempt = 0; attempt < 4; attempt += 1) {
+            if (attempt) await new Promise((resolve) => setTimeout(resolve, 400));
+            try {
+              const serial = await ready();
+              if (serial) return serial;
+            } catch (error) { /* adb may still be binding the transport */ }
+          }
+          return '';
+        } catch (error) {
+          return '';
+        }
+      })();
+    }
+    try {
+      const serial = await this.glassReconnect;
+      if (!serial) this.glassReconnectAfter = Date.now() + 5000;
+      return serial;
+    } finally {
+      this.glassReconnect = null;
     }
   }
 

@@ -89,6 +89,36 @@ test('folder ratios load, paint live values, save exact API keys and revert fail
   assert.equal(reads, 2, 'failed write refreshes station truth');
 });
 
+test('source sheet controls hourly H3 switch and gallery/SFX ratio', async (t) => {
+  withDocument(t);
+  const writes = [];
+  const top = new Node('div');
+  await view.folderH3Controls(top, {
+    get(route) {
+      assert.equal(route, '/api/h3/hourly');
+      return Promise.resolve({enabled: true, gallery_share: 20, sfx_share: 80});
+    },
+    post(route, body) {
+      writes.push({route, body});
+      return Promise.resolve({...body, sfx_share: 100 - body.gallery_share});
+    }
+  });
+  const section = top.children[0];
+  const toggle = section.children[0].children[0];
+  const slider = section.children[1].children[1];
+  const output = section.children[1].children[2];
+  assert.equal(toggle.checked, true);
+  assert.equal(slider.value, '20');
+  slider.value = '35'; slider.dispatch('input'); slider.dispatch('change');
+  await turn();
+  assert.equal(output.textContent, '35%');
+  assert.deepEqual(writes[0], {route: '/api/h3/hourly',
+    body: {enabled: true, gallery_share: 35}});
+  toggle.checked = false; toggle.dispatch('change');
+  await turn();
+  assert.deepEqual(writes[1].body, {enabled: false, gallery_share: 35});
+});
+
 test('folder video preview waits for a presented frame, not loadeddata', (t) => {
   withDocument(t);
   const item = view.folderSample({video: true, name: 'spot', url: '/spot.mp4',
@@ -165,4 +195,25 @@ test('other video surfaces gate native video behind frame-ready cover', () => {
   assert.match(renderer, /media\.requestVideoFrameCallback\(\(\) => \{/);
   assert.match(renderer, /object-fit:contain;visibility:hidden/);
   assert.match(listen, /vid\.hidden = true;\s*showPlexus\(true\);[\s\S]*vid\.src = genUrl\(pick\)/);
+});
+
+test('Pine Box gallery ducks only the broadcast to five percent', () => {
+  const source = (name) => fs.readFileSync(path.join(__dirname, '..',
+    'desktop/renderer', name), 'utf8');
+  const viewer = source('ad-viewer.js');
+  const duck = source('pine-duck.js');
+  assert.match(viewer, /hold\('pine-box-gallery', 0\.05, veil\)/);
+  assert.match(viewer, /release\('pine-box-gallery'\)/);
+  assert.match(duck, /closest\('\.pine-voice-ad-popup'\)/);
+});
+
+test('Pine Box gallery hands original and generated videos to Splice', () => {
+  const source = (name) => fs.readFileSync(path.join(__dirname, '..',
+    'desktop/renderer', name), 'utf8');
+  const viewer = source('ad-viewer.js');
+  const corners = source('hot-corners.js');
+  assert.match(viewer, /make\('button', 'pav-splice', 'Splice'\)/);
+  assert.match(viewer, /post\('\/api\/video-editor\/parody\/open', \{prompt_id: row\.prompt_id, file: mediaFile\(row\)\}\)/);
+  assert.match(viewer, /videoEditor\(got\.original_source_id, got\.generated_source_id\)/);
+  assert.match(corners, /secondary=' \+ secondaryId \+ '&parody=1'/);
 });

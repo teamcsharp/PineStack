@@ -50,6 +50,9 @@
   function isOurs(node) {
     if (!node || typeof node.volume !== 'number') return false;
     if (node.closest && node.closest('#sampler, .pb-sampler')) return false;
+    // A gallery preview is the foreground source the operator is trying to
+    // hear. Its hold lowers the station beneath it, never the preview itself.
+    if (node.closest && node.closest('.pine-voice-ad-popup')) return false;
     return true;
   }
 

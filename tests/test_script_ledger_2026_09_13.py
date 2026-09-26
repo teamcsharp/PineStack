@@ -334,6 +334,46 @@ class ScreenplayTakesTheLedgersWord(unittest.TestCase):
         self.assertEqual(row[app.HEARD_STAMP], 105.2)
         self.assertEqual(row[app.HEARD_STAMP_BY], "tablet")
 
+    def test_live_sfx_rows_join_the_rundown_before_the_disk_keeper(self):
+        """Prepared punctuation is upcoming script, not delayed history."""
+        durable = {"air": []}
+        live = [
+            {"id": "base-punct-1", "ts": 100, "air_at": 106.0,
+             "who": "board", "kind": "sfx", "round": "banter",
+             "text": "A saved clip", "aired": "prepared",
+             "clip_from": 6.0, "clip_until": 8.0},
+            {"id": "base-punct-2", "ts": 100, "air_at": 108.0,
+             "who": "drop", "kind": "sfxguy", "round": "banter",
+             "text": "Hold on, I have something for this.",
+             "aired": "prepared", "voice": "sfx-voice",
+             "clip_from": 8.0, "clip_until": 10.0},
+        ]
+
+        app.screenplay_overlay_live(durable, live, 90.0, 120.0)
+        with mock.patch.object(app, "script_ledger_order", return_value={}):
+            script = app.screenplay_compose(90.0, 120.0, {
+                **durable, "prov": {}, "rounds": [], "records": [],
+                "ads": [], "calls": [], "memos": [], "pauses": [],
+                "models": [],
+            }, [])
+
+        sting = next(e for e in script["elements"]
+                     if e.get("line") == "base-punct-1")
+        guy = next(e for e in script["elements"]
+                   if e.get("line") == "base-punct-2")
+        self.assertEqual((sting["type"], sting["tag"], sting["aired"]),
+                         ("action", "sting", "prepared"))
+        self.assertEqual((guy["type"], guy["name"], guy["kind"],
+                          guy["aired"]),
+                         ("dialogue", "The SFX Guy", "sfxguy", "prepared"))
+
+    def test_live_overlay_keeps_other_hours_and_duplicate_ids_out(self):
+        durable = {"air": [air("already", 100.0, "durable")]}
+        live = [air("already", 101.0, "new state"),
+                air("outside", 130.0, "next hour")]
+        app.screenplay_overlay_live(durable, live, 90.0, 120.0)
+        self.assertEqual([row["id"] for row in durable["air"]], ["already"])
+
 
 class TheRecordOnTheDeck(unittest.TestCase):
     """#1330: which record is turning, said on the entry itself."""

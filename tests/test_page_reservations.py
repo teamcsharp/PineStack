@@ -61,6 +61,32 @@ class PageReservationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([r["delivery_id"] for r in saved], ["first", "second"])
         self.assertEqual(saved[-1]["stream"]["rows"][-1]["text"], "The actual last line.")
 
+    async def test_owed_clips_the_owning_page_holds_still_book_the_air(self):  # [#1460]
+        # The page plays (audible), and three past-due clips never started:
+        # one it acknowledged and keeps, one it dropped, one past its bound.
+        self.wav(seconds=2)
+        owed = {"delivery_id": "owed", "url": str(self.root / "a.wav"), "broadcast_ms": 700000}
+        dropped = {"delivery_id": "dropped", "url": str(self.root / "a.wav"), "broadcast_ms": 710000}
+        ancient = {"delivery_id": "ancient", "url": str(self.root / "a.wav"), "broadcast_ms": 100000}
+        self.radio["voice_clips"] = [ancient, owed, dropped]
+        app._PAGE_DELIVERIES.update({"owed": {"state": "received"},
+                                    "dropped": {"state": "error"},
+                                    "ancient": {"state": "received"}})
+        with mock.patch.object(app.time, "time", return_value=1000),                 mock.patch.object(app, "page_voice_audible_recent", return_value=True):
+            app.page_reservation_repair()
+        self.assertEqual(app._PAGE_AIR_UNTIL[0],
+                         1000 + app.VOICE_BROADCAST_LEAD_MS / 1000 + 2)
+
+    async def test_unstarted_clips_inside_booked_air_chain_serially(self):  # [#1460]
+        self.wav(seconds=2)
+        a = {"delivery_id": "a", "url": str(self.root / "a.wav"), "broadcast_ms": 1010000}
+        b = {"delivery_id": "b", "url": str(self.root / "a.wav"), "broadcast_ms": 1010500}
+        self.radio["voice_clips"] = [a, b]
+        app._PAGE_DELIVERIES.update({"a": {"state": "received"}, "b": {"state": "received"}})
+        with mock.patch.object(app.time, "time", return_value=1000),                 mock.patch.object(app, "page_voice_audible_recent", return_value=True):
+            app.page_reservation_repair()
+        self.assertEqual(app._PAGE_AIR_UNTIL[0], 1010 + 2 + 2)
+
     async def test_correct_future_queue_is_unchanged_and_updates_ignore_since_filter(self):
         self.wav(seconds=2)
         clip = {"delivery_id": "waiting", "url": str(self.root / "a.wav"),

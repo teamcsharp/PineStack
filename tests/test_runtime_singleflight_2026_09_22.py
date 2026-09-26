@@ -226,6 +226,40 @@ class RuntimeSingleFlightTests(unittest.IsolatedAsyncioTestCase):
         body = ast.get_source_segment(SOURCE, node) or ""
         self.assertIn('and not _system2_job', body)
 
+    def test_banked_banter_fragments_are_not_accepted_after_failed_repair(self):
+        node = next(row for row in TREE.body
+                    if isinstance(row, ast.AsyncFunctionDef)
+                    and row.name == "dj_banter")
+        body = ast.get_source_segment(SOURCE, node) or ""
+        self.assertIn("bank and not caller_name", body)
+        self.assertIn("not substantial_radio_script(script, _judge_lines)", body)
+        self.assertIn("banked draft is still too thin after repair", body)
+        self.assertIn("return []", body)
+
+    def test_hourly_h3_render_is_claimed_before_rendering(self):
+        clock = next(row for row in TREE.body
+                     if isinstance(row, ast.AsyncFunctionDef)
+                     and row.name == "h3_hourly_ad_clock")
+        body = ast.get_source_segment(SOURCE, clock) or ""
+        self.assertIn("h3_hourly_enabled()", body)
+        self.assertIn("h3_hourly_claim(marker)", body)
+        self.assertLess(body.index("h3_hourly_claim(marker)"),
+                        body.index("voice_ad_render"))
+        self.assertIn("h3_hourly_finish(marker", body)
+        self.assertIn("@app.get(\"/api/h3/hourly\")", SOURCE)
+        self.assertIn("@app.post(\"/api/h3/hourly\")", SOURCE)
+
+    def test_h3_sources_use_the_durable_video_deck(self):
+        picker = next(row for row in TREE.body
+                      if isinstance(row, ast.FunctionDef)
+                      and row.name == "voice_ad_person_clip")
+        body = ast.get_source_segment(SOURCE, picker) or ""
+        self.assertIn("sfx_db_pick_rotation_row", body)
+        self.assertIn('excluded_folders=("sfx_ads",)', body)
+        self.assertIn("_sfx_video_rotation_mark_clip(identifier)", body)
+        self.assertLess(body.index("sfx_db_pick_rotation_row"),
+                        body.index("sfx_match_score"))
+
     def test_zero_output_beat_artifacts_never_enter_the_cupboard_or_gold(self):
         namespace = {"Any": Any}
         exec(function_source("larder_empty_beat_chain"), namespace)
@@ -264,7 +298,7 @@ class RuntimeSingleFlightTests(unittest.IsolatedAsyncioTestCase):
         calls = [node for node in ast.walk(TREE)
                  if isinstance(node, ast.Call)
                  and isinstance(node.func, ast.Name)
-                 and node.func.id == "_episode_stage"]
+                 and node.func.id == "_episode_stage_call"]
         self.assertGreaterEqual(len(calls), 8)
         parents = {}
         for node in ast.walk(TREE):
