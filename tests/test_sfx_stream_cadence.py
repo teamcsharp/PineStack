@@ -154,6 +154,17 @@ class SfxStreamCadenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([r['text'] for r in self.radio['voice_clips'][0]['stream']['rows']],
                          [t['text'] for t in self.takes])
 
+    async def test_full_video_share_skips_instead_of_falling_back_to_audio(self):
+        self.patch('sfx_video_share', mock.Mock(return_value=100))
+        self.patch('_sfx_cadence_video_pick', mock.Mock(return_value=None))
+        self.patch('sfx_due_after', mock.Mock(return_value=True))
+        self.patch('sfx_soundboard_hold_cadence', mock.Mock(return_value=False))
+        self.patch('sfx_match_on', mock.Mock(return_value=False))
+        got = await app._sfx_cadence_additions_inner('dj', 'a line', 2, 20)
+        self.assertEqual(got, [])
+        app._sfx_cadence_video_pick.assert_called_once_with('a line')
+        app._sfx_cadence_pick.assert_not_called()
+
     async def test_late_optional_overrun_rejoins_exact_core_once_without_tts(self):
         self.bank_take()
         joins = []

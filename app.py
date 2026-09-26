@@ -81322,7 +81322,11 @@ async def _sfx_cadence_additions_inner(who: str, text: str, completed: int,
             (CueCandidate("video", 1.0, True), CueCandidate("audio", 1.0, False)),
             max_seconds=max(1.0, sfx_cap_seconds()), random_float=random.random,
             pick=lambda keys: keys[0], video_share=share)
-        requested_video = bool(direction and direction.video)
+        # At 100%, the operator means MP4-only, not "prefer MP4, then use
+        # audio if the video pool is temporarily dry." Preserve the due slot
+        # and skip it when no eligible MP4 fits; never send an MP3 reaction.
+        video_only = share >= 1.0
+        requested_video = video_only or bool(direction and direction.video)
         # [#1461] A BANKED ROUND HONOURS THE PICTURE SHARE TOO. Banked
         # rounds are most of the air (render is slower than speech), and
         # this used to force them audio-only whenever the endless set was
@@ -81334,7 +81338,9 @@ async def _sfx_cadence_additions_inner(who: str, text: str, completed: int,
         # behind an air cursor that ignored owed clips (#1460), not the
         # banked road.
         if not sfx_soundboard_hold_cadence():
-            for want_video in (requested_video, not requested_video):
+            video_order = ((True,) if video_only else
+                           (requested_video, not requested_video))
+            for want_video in video_order:
                 if want_video:
                     got = await asyncio.to_thread(_sfx_cadence_video_pick, text)
                     if got:
@@ -81395,6 +81401,8 @@ async def _sfx_cadence_additions_inner(who: str, text: str, completed: int,
             _SFX_CADENCE_STATUS["omit_why"] = (
                 "the board was held off the cadence"
                 if sfx_soundboard_hold_cadence() else
+                "MP4-only mode: no eligible video fit this slot"
+                if video_only else
                 "nothing was drawn from the book" if not _drew else
                 "none of %d draw(s) was short enough for what was left of "
                 "the round" % _drew)
