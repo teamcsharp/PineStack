@@ -168,8 +168,12 @@ object KioskController {
 
         WindowCompat.setDecorFitsSystemWindows(activity.window, false)
         val controller = WindowInsetsControllerCompat(activity.window, activity.window.decorView)
-        controller.show(WindowInsetsCompat.Type.systemBars())
-        controller.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_DEFAULT
+        /* Keep the station clear while it has focus.  Android still reveals
+         * the shade or navigation transiently from an edge swipe, and fades
+         * it back out after the operator has used it. */
+        controller.hide(WindowInsetsCompat.Type.systemBars())
+        controller.systemBarsBehavior =
+            WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
     }
 
     /**
@@ -181,7 +185,8 @@ object KioskController {
     fun reassertImmersive(activity: Activity, hasFocus: Boolean) {
         if (!hasFocus) return
         val controller = WindowInsetsControllerCompat(activity.window, activity.window.decorView)
-        controller.show(WindowInsetsCompat.Type.systemBars())
-        controller.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_DEFAULT
+        controller.hide(WindowInsetsCompat.Type.systemBars())
+        controller.systemBarsBehavior =
+            WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
     }
 }
