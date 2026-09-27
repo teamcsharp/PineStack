@@ -8,13 +8,16 @@ two radios, so this holds the camera on the spare one (`wlx…`) while
 `wlP9s9` keeps 10.89.1.246 and the broadcast. That asymmetry is the whole
 reason the link lives here and not on the tablet.
 
-One ffmpeg, one input, two outputs:
+One ffmpeg, one input, four outputs:
 
     rtsp://192.168.1.254:554/live  (h264 848x480, the preview substream)
       ├─ HLS   → data/pinelink/live/index.m3u8   what the house watches
-      └─ mp4   → data/pinelink/clips/<stamp>.mp4  what is kept
+      ├─ mp4   → data/pinelink/clips/<stamp>.mp4  what is kept
+      ├─ jpeg  → data/pinelink/frame.jpg          the corner preview, 4 fps
+      └─ TS    → udp://127.0.0.1:18081            the picture AS IT ARRIVES,
+                 served by TsDoor at http://10.89.1.246:8098/live.ts
 
-Both are `-c copy`. The camera already hands over h264, so nothing is
+All but the still are `-c copy`. The camera already hands over h264, so nothing is
 re-encoded: no GPU, no quality loss, and a recording that is byte-identical
 to what was broadcast. The 4K H.265 never comes down this pipe - it stays
 on the camera's card and is fetched over its HTTP server afterwards. 4K
@@ -31,14 +34,19 @@ from __future__ import annotations
 
 import argparse
 import glob                  # #1359: finding the adapter on the bus
+import itertools             # TsDoor: the tail of the ring, from the right
 import json
 import os
 import re                    # #1118: the clips folder preference
 import shutil
 import signal
+import socket                # TsDoor: the UDP side
 import subprocess
 import sys
+import threading             # TsDoor: one ring, one condition, n clients
 import time
+from collections import deque
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -155,6 +163,14 @@ def say(state: str, **more) -> None:
     """One state file, written whole. The station reads this; it never
     reads the process table, so a stale file is a lie and the only defence
     is that every path through this program writes one."""
+    # The TS door's line travels with every write - where it is and
+    # whether it is being fed - and a fault in the door can never stop
+    # this file: it is the one reading the station has of this process.
+    try:
+        ts = (_TS_DOOR[0].summary() if _TS_DOOR[0] is not None
+              else {"ok": False, "port": TS_HTTP_PORT, "path": "/live.ts"})
+    except Exception:  # noqa: BLE001
+        ts = {"ok": False}
     try:
         OUT.mkdir(parents=True, exist_ok=True)
         STATE.write_text(json.dumps({
@@ -164,7 +180,8 @@ def say(state: str, **more) -> None:
             # joined yet" without being able to see a radio.
             # #1250b: how the last stream ended travels with every
             # other reading, so no surface has to ask a second door.
-            **_LAST_SEEN, "stream": dict(_STREAM), **more}, indent=2))
+            **_LAST_SEEN, "stream": dict(_STREAM), "ts": ts, **more},
+            indent=2))
     except Exception:  # noqa: BLE001
         pass
 
@@ -607,7 +624,311 @@ def ffmpeg_cmd() -> list[str]:
         # marker and hands back the last whole frame instead.
         "-map", "0:v", "-vf", "fps=4", "-q:v", "6",
         "-f", "image2", "-update", "1", "-y", str(OUT / "frame.jpg"),
+        # ...and the packets themselves, as the muxer makes them, for the
+        # TS door below. UDP to localhost, and that is the whole design:
+        # a sendto() that nobody is listening for costs nothing and waits
+        # for nobody, so a viewer that is absent, slow or gone can never
+        # hold up THIS process - the one writing the clips and the HLS.
+        # A pipe or an HTTP -listen output here would let it. pkt_size
+        # 1316 is seven TS packets a datagram, the number the door splits
+        # on; -muxdelay/-muxpreload 0 so the muxer holds nothing back;
+        # PAT/PMT every 0.1 s so a joiner is never far from its tables.
+        "-map", "0:v", "-c", "copy",
+        "-f", "mpegts", "-muxdelay", "0", "-muxpreload", "0",
+        "-mpegts_flags", "+resend_headers", "-pat_period", "0.1",
+        "udp://%s:%d?pkt_size=1316" % (TS_UDP_HOST, TS_UDP_PORT),
     ]
+
+
+# ---------------------------------------------------------------------------
+# THE TS DOOR: the picture as it arrives, over plain HTTP.
+#
+# HLS is two-second files and a playlist that lists them once they are
+# finished, so the soonest any viewer can see a frame that way is a
+# segment and a half after it happened - and the tablet, which buffers
+# on top, sits four to six seconds behind the camera. The recorder cannot
+# be made faster: a segment is a file, and a file has to be closed before
+# it can be listed. So the same ffmpeg gets a FOURTH output - the MPEG-TS
+# packets exactly as the muxer makes them, nothing re-encoded - and this
+# door hands them to whoever asks. A decoder fed from here is one keyframe
+# (0.5 s) behind the camera plus whatever it chooses to buffer itself.
+#
+# Why UDP, and why only to localhost. ffmpeg writes this output with a
+# sendto() to 127.0.0.1 and never waits for anybody: if nothing is
+# listening, or the listener is slow, the kernel drops the datagram and
+# the muxer moves on. A pipe or an HTTP `-listen` output would do the
+# opposite - one absent or stalled viewer would hold the muxer, and the
+# muxer is the same process that writes the clips and the HLS the house
+# watches. The recorder must never be at the mercy of a viewer, and UDP
+# is the transport that cannot push back. Localhost, so nothing outside
+# this machine can put packets into the ring. Nothing here goes near the
+# camera: the door reads ffmpeg, never the RTSP.
+#
+# Each datagram is seven 188-byte TS packets (pkt_size=1316). They go
+# into a ring of about three seconds. A client joining is started at the
+# last PAT/PMT before the newest keyframe, so a decoder gets its tables
+# and then a picture it can decode within half a second. A client that
+# falls behind by more than the ring is dropped, not handed a hole.
+#
+# Bound to the LAN and tailnet addresses by NAME, never 0.0.0.0: the
+# station's public door (:8097) must never be able to reach this by
+# accident, and a bind to every interface is how that would happen.
+# ---------------------------------------------------------------------------
+TS_UDP_HOST, TS_UDP_PORT = "127.0.0.1", 18081
+TS_HTTP_PORT = 8098
+TS_HTTP_ADDRS = ("10.89.1.246", "100.74.95.59")   # LAN, tailnet; never 0.0.0.0
+TS_RING_PACKETS = 7500      # ~3 s at 2,500 pkt/s; this stream is ~1,100 pkt/s
+TS_FRESH_S = 5.0            # no datagram for this long = there is no stream
+TS_KEY_WAIT_S = 3.0         # how long a new client waits for a keyframe
+_TS_DOOR: list = [None]
+
+
+def _ts_log(msg: str) -> None:
+    print("TsDoor: " + msg, flush=True)
+
+
+class TsDoor:
+    """UDP in from ffmpeg on localhost, HTTP out to the house. See above.
+
+    Started once, before the recorder's loop, and never restarted: ffmpeg
+    comes and goes underneath it and the ring simply pauses and refills.
+    """
+
+    def __init__(self, udp=(TS_UDP_HOST, TS_UDP_PORT), port=TS_HTTP_PORT,
+                 addrs=TS_HTTP_ADDRS, ring=TS_RING_PACKETS):
+        self.udp, self.port, self.addrs = tuple(udp), port, tuple(addrs)
+        self.cond = threading.Condition()   # guards everything below
+        self.ring: deque = deque(maxlen=ring)
+        self.marks: deque = deque(maxlen=ring // 4)   # (t, seq) per datagram
+        self.seq = 0            # the number the NEXT packet gets
+        self.pat_seq = None     # newest PAT packet
+        self.key_seq = None     # the PAT at or before the newest keyframe
+        self.packets = self.nbytes = self.datagrams = 0
+        self.last_rx = 0.0
+        self.clients = 0
+        self.bound: list = []
+        self.sock = None
+        _TsHandler.door = self
+
+    def start(self) -> None:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        # 4 MB asked for; the kernel caps it at net.core.rmem_max, and
+        # the size it actually gave is logged so a small one is visible.
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 << 20)
+        sock.bind(self.udp)
+        self.sock = sock
+        _ts_log("listening on udp://%s:%d (rcvbuf %d)" % (
+            self.udp[0], self.udp[1],
+            sock.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)))
+        for name, target in (("udp", self._listen), ("bind", self._bind)):
+            threading.Thread(target=target, daemon=True,
+                             name="tsdoor-" + name).start()
+
+    # -- in ----------------------------------------------------------------
+    def _listen(self) -> None:
+        while True:
+            try:
+                data = self.sock.recv(65536)
+            except OSError as err:
+                _ts_log("udp recv failed: %s" % err)
+                time.sleep(1.0)
+                continue
+            self._take(data, time.monotonic())
+
+    def _take(self, data: bytes, now: float) -> None:
+        with self.cond:
+            for i in range(0, len(data) - 187, 188):
+                p = data[i:i + 188]
+                if p[0] != 0x47:
+                    continue                # not a TS packet; never ours
+                pid = (p[1] & 0x1F) << 8 | p[2]
+                if pid == 0:
+                    self.pat_seq = self.seq
+                elif (pid >= 0x20 and p[3] & 0x20 and p[4] > 0
+                      and p[5] & 0x40):
+                    # random_access_indicator on the video PID: a
+                    # keyframe starts here. The tables that came just
+                    # before it are where a new client begins.
+                    self.key_seq = (self.pat_seq if self.pat_seq is not None
+                                    else self.seq)
+                self.ring.append(p)
+                self.seq += 1
+                self.packets += 1
+            self.nbytes += len(data)
+            self.datagrams += 1
+            self.last_rx = now
+            self.marks.append((now, self.seq))
+            self.cond.notify_all()
+
+    # -- out ---------------------------------------------------------------
+    def fresh(self, now: float | None = None) -> bool:
+        return (self.last_rx > 0
+                and (now or time.monotonic()) - self.last_rx < TS_FRESH_S)
+
+    def start_cursor(self, wait_s: float) -> int | None:
+        """Where a new client begins: the PAT/PMT just before the newest
+        keyframe - if the feed is alive and it is still in the ring."""
+        deadline = time.monotonic() + wait_s
+        with self.cond:
+            while True:
+                if (self.key_seq is not None and self.fresh()
+                        and self.key_seq >= self.seq - len(self.ring)):
+                    return self.key_seq
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    return None
+                self.cond.wait(left)
+
+    def read(self, cursor: int, wait_s: float) -> tuple[bytes, int, bool]:
+        """Every packet from `cursor` on: (data, new cursor, lost).
+        `lost` is a cursor that has fallen out of the ring - the client
+        is slower than the stream and must be dropped, not fed a hole."""
+        with self.cond:
+            if self.seq <= cursor:
+                self.cond.wait(wait_s)
+            n = self.seq - cursor
+            if n <= 0:
+                return b"", cursor, False
+            if n > len(self.ring):
+                return b"", cursor, True
+            # The last n packets, taken from the right: O(n), not O(ring).
+            parts = list(itertools.islice(reversed(self.ring), n))
+            parts.reverse()
+            return b"".join(parts), self.seq, False
+
+    def count(self, delta: int) -> int:
+        with self.cond:
+            self.clients += delta
+            return self.clients
+
+    def stats(self) -> dict:
+        with self.cond:
+            now = time.monotonic()
+            floor = self.seq - len(self.ring)
+            span = 0.0
+            for t, s in self.marks:        # the oldest datagram still held
+                if s > floor:
+                    span = self.marks[-1][0] - t
+                    break
+            return {
+                "ok": self.fresh(now), "clients": self.clients,
+                "packets": self.packets, "bytes": self.nbytes,
+                "datagrams": self.datagrams,
+                "last_rx_age_s": (round(now - self.last_rx, 2)
+                                  if self.last_rx else None),
+                "ring_packets": len(self.ring), "ring_s": round(span, 2),
+                "have_key": (self.key_seq is not None
+                             and self.key_seq >= floor),
+                "port": self.port, "bound": list(self.bound),
+            }
+
+    def summary(self) -> dict:
+        """The block say() carries: where the door is, whether it is fed."""
+        s = self.stats()
+        urls = ["http://%s:%d/live.ts" % (a, self.port) for a in self.addrs]
+        return {"port": self.port, "path": "/live.ts",
+                "url": urls[0] if urls else "",
+                "tail_url": urls[1] if len(urls) > 1 else "",
+                "ok": s["ok"], "clients": s["clients"],
+                "ring_s": s["ring_s"], "bound": s["bound"]}
+
+    # -- the http side -----------------------------------------------------
+    def _bind(self) -> None:
+        """Bind each address; one that is not there yet (the tailnet
+        after a boot) is retried every 30 s and picked up when it is."""
+        want = list(self.addrs)
+        while want:
+            for addr in list(want):
+                try:
+                    srv = _TsHTTP((addr, self.port), _TsHandler)
+                except OSError as err:
+                    _ts_log("cannot bind %s:%d (%s) - retrying every 30 s"
+                            % (addr, self.port, err))
+                    continue
+                threading.Thread(target=srv.serve_forever, daemon=True,
+                                 name="tsdoor-http-" + addr).start()
+                with self.cond:
+                    self.bound.append(addr)
+                want.remove(addr)
+                _ts_log("serving http://%s:%d/live.ts" % (addr, self.port))
+            if want:
+                time.sleep(30.0)
+
+
+class _TsHTTP(ThreadingHTTPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+    def handle_error(self, request, client_address) -> None:
+        # A client going away mid-body is not an error worth a traceback.
+        if not isinstance(sys.exc_info()[1], OSError):
+            super().handle_error(request, client_address)
+
+
+class _TsHandler(BaseHTTPRequestHandler):
+    # HTTP/1.0: no Content-Length and no chunking - the body is as long
+    # as the socket stays open, which is what a live stream is.
+    protocol_version = "HTTP/1.0"
+    timeout = 10.0          # a peer that stops reading is dropped, not held
+    door: TsDoor | None = None
+
+    def log_message(self, *_a) -> None:
+        pass                # one line per join and leave is plenty
+
+    def log_error(self, fmt, *a) -> None:
+        _ts_log("http %s: %s" % (self.client_address[0], fmt % a))
+
+    def _reply(self, code: int, body: bytes,
+               ctype: str = "text/plain") -> None:
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self) -> None:
+        door, path = self.door, self.path.split("?", 1)[0]
+        if door is None:
+            self._reply(503, b"no door\n")
+        elif path == "/live.ts":
+            self._live(door)
+        elif path == "/state":
+            self._reply(200, json.dumps(door.stats()).encode() + b"\n",
+                        "application/json")
+        elif path == "/health":
+            ok = door.fresh()
+            self._reply(200 if ok else 503, b"ok\n" if ok else b"no stream\n")
+        else:
+            self._reply(404, b"not found\n")
+
+    def _live(self, door: TsDoor) -> None:
+        cur = door.start_cursor(TS_KEY_WAIT_S)
+        if cur is None:
+            self._reply(503, b"no keyframe yet\n")
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "video/mp2t")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        who = "%s:%d" % self.client_address[:2]
+        _ts_log("client %s joined (%d watching)" % (who, door.count(+1)))
+        try:
+            while True:
+                data, cur, lost = door.read(cur, 1.0)
+                if lost:
+                    _ts_log("client %s too slow - dropped" % who)
+                    break
+                if data:
+                    self.wfile.write(data)
+                    self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass                # the viewer left; nothing to say
+        finally:
+            _ts_log("client %s left (%d watching)" % (who, door.count(-1)))
 
 
 def supervise(once: bool = False) -> None:
@@ -619,6 +940,15 @@ def supervise(once: bool = False) -> None:
         sys.exit(2)
     LIVE.mkdir(parents=True, exist_ok=True)
     CLIPS.mkdir(parents=True, exist_ok=True)
+    # The TS door opens once, here, and is never restarted: ffmpeg comes
+    # and goes underneath it. A door that cannot open must not cost the
+    # recorder anything - the clips and the HLS come first.
+    try:
+        _TS_DOOR[0] = TsDoor()
+        _TS_DOOR[0].start()
+    except Exception as err:  # noqa: BLE001
+        _TS_DOOR[0] = None
+        _ts_log("not started (%s) - the recorder runs without it" % err)
 
     while True:
         _LAST_SEEN.update(seen_on_air())

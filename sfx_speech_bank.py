@@ -235,6 +235,29 @@ class SfxSpeechBank:
                 return True
             return False
 
+    def restate(self, pick, update):
+        """[rng-topics] Change every row `pick(row)` accepts with `update(row)`
+        in ONE replaced ledger and ONE save - put() saves the whole ledger per
+        row, which is 1.5-2 MB of JSON each time. Reservation and play fields
+        are left as they are. Returns how many rows changed."""
+        with self.lock:
+            rows = dict(self._load())
+            changed = 0
+            for key, row in rows.items():
+                if not pick(row):
+                    continue
+                fresh = dict(row)
+                update(fresh)
+                for held in ("reservation", "reserved_until", "last_played", "plays",
+                             "voice", "profile", "text_plain", "who"):
+                    if held in row:
+                        fresh[held] = row[held]
+                rows[key] = fresh
+                changed += 1
+            if changed:
+                self._save(rows)
+            return changed
+
     def protected_files(self):
         return {str((row.get("clip") or {}).get("path") or "").split("?", 1)[0].rsplit("/", 1)[-1]
                 for row in self.rows() if (row.get("clip") or {}).get("path")}

@@ -1202,7 +1202,9 @@ class System2Store:
         if reason: return reason
         speech = row['actual_seconds'] if seconds is None else _number(seconds, 'actual seconds', .001, 3600)
         duration = speech + max(0.0, float(row.get('air_seconds', speech)) - row['actual_seconds'])
-        allowance = 0.0 if not grace else _number(grace, 'grace seconds', 0.0, 300.0)   # [#1191]
+        # [withdraw-parity] up to an hour: with the operator's withdraw
+        # switch off the caller's allowance is "the sheet waits for it".
+        allowance = 0.0 if not grace else _number(grace, 'grace seconds', 0.0, 3600.0)   # [#1191]
         if self.now() + duration - row['position_seconds'] > slot['deadline'] + allowance: return 'measured_duration_misses_deadline'
         return ''
 

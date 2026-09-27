@@ -268,9 +268,15 @@
     wrap.appendChild(head_);
 
     var row = el('div', 'pseg-topic-row');
-    var input = el('input', 'pseg-topic-in');
-    input.type = 'text';
-    input.placeholder = next ? 'Describe the scenario...' : 'Something for them to get into...';
+    /* [topic-exchange] Two lines. "1. This is my studio 2. Thats what you
+       think" is an exchange: line 1 opens the round word for word and
+       line 2 is the reply to it, word for word (the station splits it -
+       POST /api/dj/topics). Enter starts the next line; Ctrl/Cmd+Enter,
+       or the button, sends it. */
+    var input = el('textarea', 'pseg-topic-in');
+    input.rows = 2;
+    input.placeholder = (next ? 'Describe the scenario...' : 'Something for them to get into...')
+      + '\n1. the opening line  2. the reply - each said word for word';
     input.setAttribute('aria-label', next
       ? 'The scenario for the next banter round' : 'A new topic for the banter');
     var plus = el('button', 'pseg-plus' + (next ? ' pseg-next' : ''),
@@ -298,7 +304,7 @@
     }
     plus.addEventListener('click', add);
     input.addEventListener('keydown', function (ev) {
-      if (ev && ev.key === 'Enter') { ev.preventDefault(); add(); }
+      if (ev && ev.key === 'Enter' && (ev.ctrlKey || ev.metaKey)) { ev.preventDefault(); add(); }
     });
     row.appendChild(input);
     row.appendChild(plus);
@@ -340,12 +346,91 @@
       prior.replaceChildren();
       rows.forEach(function (saved) {
         var item = el('div', 'pseg-topic-item');
-        var words = el('button', 'pseg-topic-words', saved.text || 'Untitled scenario');
+        /* [topic-exchange] an exchange reads, and refills, as its two lines */
+        var said = saved.reply
+          ? '1. ' + String(saved.text || '') + '\n2. ' + String(saved.reply)
+          : String(saved.text || '');
+        var words = el('button', 'pseg-topic-words', said || 'Untitled scenario');
         words.type = 'button';
         words.title = 'Put this scenario in the editor';
+        var heldAt = 0;
         words.addEventListener('click', function () {
-          input.value = String(saved.text || '');
+          if (Date.now() - heldAt < 700) return;   /* [topic-edit] the hold answered */
+          input.value = said;
           input.focus();
+        });
+        /* [topic-edit] DOUBLE-CLICK OR HOLD IT TO EDIT IT WHERE IT STANDS.
+           The entry becomes its own two-line box: Ctrl/Cmd+Enter or Save
+           keeps it (POST /api/dj/topics/{id}/edit, split into topic and
+           reply as a new one is), Escape or Cancel puts it back. */
+        function editInline() {
+          if (item.classList.contains('editing')) return;
+          item.classList.add('editing');
+          var box = el('textarea', 'pseg-topic-in pseg-topic-edit');
+          box.rows = 2;
+          box.value = said;
+          box.setAttribute('aria-label', 'Edit this topic');
+          var keepIt = el('button', 'pseg-topic-save', 'Save');
+          keepIt.type = 'button';
+          var drop = el('button', 'pseg-topic-cancel', 'Cancel');
+          drop.type = 'button';
+          var bar = el('div', 'pseg-topic-editbar');
+          bar.appendChild(keepIt);
+          bar.appendChild(drop);
+          var form = el('div', 'pseg-topic-editor');
+          form.appendChild(box);
+          form.appendChild(bar);
+          item.replaceChild(form, words);
+          function done() {
+            item.classList.remove('editing');
+            if (form.parentNode === item) item.replaceChild(words, form);
+          }
+          function keep() {
+            var text = String(box.value || '').trim();
+            if (!text) { note(wrap, 'an empty topic cannot be saved'); return; }
+            if (text === said) { done(); return; }
+            keepIt.disabled = true;
+            send('POST', '/api/dj/topics/' + encodeURIComponent(saved.id) + '/edit', {text: text})
+              .then(function (got) {
+                keepIt.disabled = false;
+                if (!got) { note(wrap, 'the station refused the edit'); return; }
+                note(wrap, got.requeued ? 'saved - the queued copy says it now too' : 'saved');
+                loadHistory();
+              })['catch'](function (err) {
+                keepIt.disabled = false;
+                note(wrap, 'not saved - ' + String((err && err.message) || 'the station did not answer'));
+              });
+          }
+          keepIt.addEventListener('click', function (ev) { ev.stopPropagation(); keep(); });
+          drop.addEventListener('click', function (ev) { ev.stopPropagation(); done(); });
+          box.addEventListener('keydown', function (ev) {
+            if (ev.key === 'Escape') { ev.preventDefault(); ev.stopPropagation(); done(); }
+            else if (ev.key === 'Enter' && (ev.ctrlKey || ev.metaKey)) { ev.preventDefault(); keep(); }
+          });
+          box.focus();
+          try { box.setSelectionRange(box.value.length, box.value.length); } catch (err) { /* older views */ }
+        }
+        words.addEventListener('dblclick', function (ev) { ev.preventDefault(); editInline(); });
+        var hold = 0, holdX = 0, holdY = 0;
+        var unhold = function () { root.clearTimeout(hold); hold = 0; };
+        words.addEventListener('pointerdown', function (ev) {
+          if (ev.button) return;
+          unhold();
+          holdX = ev.clientX; holdY = ev.clientY;
+          hold = root.setTimeout(function () { hold = 0; heldAt = Date.now(); editInline(); }, 520);
+        });
+        words.addEventListener('pointermove', function (ev) {
+          if (hold && Math.abs(ev.clientX - holdX) + Math.abs(ev.clientY - holdY) > 12) unhold();
+        });
+        ['pointerup', 'pointercancel', 'pointerleave'].forEach(function (name) {
+          words.addEventListener(name, unhold);
+        });
+        /* the WebView's own long-press (and the desk's right-click) */
+        words.addEventListener('contextmenu', function (ev) {
+          ev.preventDefault();
+          unhold();
+          heldAt = Date.now();
+          editInline();
         });
         var meta = el('span', 'pseg-topic-meta', String(Number(saved.used) || 0) + ' uses');
         var queue = iconButton('pseg-topic-action', 'c:add', 'Queue this scenario next');

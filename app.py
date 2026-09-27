@@ -29449,6 +29449,11 @@ VOICE_BROADCAST_LEAD_MS = int(os.getenv("VOICE_BROADCAST_LEAD_MS", "7000"))
 # PINE_VOICE_LATE_MS moves it. The page constant VOICE_LATE_PLAY_MS is
 # its twin and the two must agree.
 VOICE_LATE_OFFER_MS = int(os.getenv("PINE_VOICE_LATE_MS", "45000"))
+# [#1460] The owning page's outer bound (#1184 VOICE_KEEP_MS, its twin in
+# the panel): a clip it has acknowledged is re-timed and played in order
+# for this long past its first moment. Until then it is air still OWED,
+# and page_reservation_repair must book it. The two must agree.
+VOICE_KEEP_OFFER_S = 600.0
 
 # #1147: how far ahead the page's air is SOLD, across every producer.
 # The paced burst road (#1146) kept this knowledge in a local variable,
@@ -29614,6 +29619,19 @@ def page_reservation_repair() -> list[dict[str, Any]]:
         if start <= now and (not silent or now - start <= 20.0):
             if start + duration > now:
                 cursor = max(cursor, start + duration)
+            elif (not silent
+                  and delivery.get("state") in ("received", "canplay")
+                  and now - start <= VOICE_KEEP_OFFER_S):
+                # [#1460] OWED AIR IS STILL AIR. 2026-09-26: the PineTab
+                # owned the air, played without a break, and ran 290 s
+                # behind its stamps with 17 lines queued - while this
+                # cursor read "free in 7 s". A past-due clip the owning
+                # page acknowledged is not history: #1184 re-times it and
+                # plays it after what is sounding. It reserved nothing
+                # here, so every producer pacing on _PAGE_AIR_UNTIL kept
+                # booking on top, the backlog only grew, and whole runs
+                # of dialogue died at the page's 600 s bound unheard.
+                cursor += duration
             continue
         # A received clip that never started cannot reserve dead air. Once
         # the listener has been silent for 20 s, close gaps between pending
@@ -29625,7 +29643,10 @@ def page_reservation_repair() -> list[dict[str, Any]]:
             changed.append(did)
             start = cursor
             playout_tell("retime_unstarted", did, start)
-        cursor = max(cursor, start + duration)
+        # [#1460] the page plays unstarted clips one after another, so
+        # each occupies its own length behind the last - a clip stamped
+        # inside air already booked used to add nothing to the cursor.
+        cursor = max(cursor, start) + duration
         pending.append(clip)
     _PAGE_AIR_UNTIL[0] = cursor
     if changed:
@@ -103781,6 +103802,21 @@ def _beat_content_words(text: str) -> set[str]:
             if len(word) >= 4 and word not in _BANTER_BEAT_STOP}
 
 
+def _beat_speaks_direction(text: str, row: dict[str, Any]) -> bool:
+    """[#1462] Whether a written turn is its own stage direction, said aloud.
+
+    2026-09-26: the dice handed a beat "refuse the premise of it outright,
+    plainly" and the writer aired "I refuse the premise of it outright,
+    plainly." - three times in one round. _beat_fresh_only catches the
+    repeats; this catches the first one, which is a direction, not a line.
+    Track talk has had the same check (direction_echo) since the tint road.
+    """
+    def words(value: Any) -> str:
+        return " ".join(re.findall(r"[a-z0-9']+", str(value or "").casefold()))
+    core = words(re.split(r"[,.;]", str(row.get("work") or ""), 1)[0])
+    return len(core) >= 12 and core in words(text)
+
+
 def _beat_fresh_only(parsed: list[tuple[str, str]],
                      made: list[tuple[str, str]]) -> list[tuple[str, str]]:
     """[s3-rounds] Drop the lines a beat handed back that were already
@@ -103903,7 +103939,8 @@ async def _banter_beats(context: str, sheet: str, lines: int,
             + "\nEvery turn reacts to the line immediately above it before adding "
               "anything new. Output exactly one line per listed turn using only "
               "the listed A:/B:/C:/D: marker. No preface, labels, markdown, stage "
-              "directions, or lines from earlier beats."
+              "directions, or lines from earlier beats. The words after each "
+              "dash say HOW that turn behaves; they are never words to say."
         )
         raw = await ask_model(
             prompt, limit=min(2800, max(1200, 650 * len(rows))), spice=0.45,
@@ -103912,11 +103949,29 @@ async def _banter_beats(context: str, sheet: str, lines: int,
                   "until": rows[-1]["turn"], "retry": retry})
         parsed = _beat_fresh_only(banter_turns(raw or ""), made)    # [s3-rounds]
         clean: list[tuple[str, str]] = []
+        spoke_direction = False
         for row, candidate in zip(rows, parsed):
             text = spoken_text(candidate[1]).strip()
-            if text:
-                clean.append((str(row["seat"]), text))
-        return raw, clean, _beat_sequence_answers(
+            if not text:
+                continue
+            # [#1462] The accepted prefix ends at a turn that is its own
+            # direction, so the plan stays seated and the retry (or the
+            # next beat) writes that same turn again.
+            if _beat_speaks_direction(text, row):
+                spoke_direction = True
+                try:
+                    line_review_capture(
+                        "banter_beat_echo", text,
+                        reasons=["the turn spoke its own direction"],
+                        context={"kind": "banter", "stage": "beat",
+                                 "turn": row.get("turn"),
+                                 "work": str(row.get("work") or "")[:200]},
+                        technical=True, disposition="rewrite")
+                except Exception:  # noqa: BLE001
+                    pass
+                break
+            clean.append((str(row["seat"]), text))
+        return raw, clean, (not spoke_direction) and _beat_sequence_answers(
             made[-1][1] if made else "", rows, parsed)
 
     while cursor < len(plan):

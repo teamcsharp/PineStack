@@ -106,6 +106,12 @@ def digest(value):
                                     default=str).encode()).hexdigest()
 
 
+# [withdraw-parity] the allowance a round is given past its entry when
+# the operator has turned the withdraw switch off: an hour, which the
+# store accepts as a caller's grace (system2.py _validate).
+OVERRUN_UNBOUNDED = 3600.0
+
+
 class System2Runtime:
     RECAP_LEAD_FLOOR_SECONDS = 420.0
     RECAP_LEAD_MAX_SECONDS = 900.0
@@ -1680,6 +1686,17 @@ class System2Runtime:
                     return False
 
                 def _grace():
+                    # [withdraw-parity] THE OPERATOR'S WITHDRAW SWITCH.
+                    # Off (orch_policy "overrun_withdraw"), app.py's own
+                    # hand-over test lets a finished round run past its
+                    # entry and the sheet waits for it; this road gives
+                    # the same answer, or it refuses what that road has
+                    # just let through.
+                    try:
+                        if h.orch_policy("overrun_withdraw", True) is False:
+                            return OVERRUN_UNBOUNDED
+                    except Exception:  # noqa: BLE001
+                        pass
                     # [#1191] THE AIR ROAD'S OWN ALLOWANCE, handed to the
                     # store. #1166: "a finished segment may run past the
                     # fold rather than not run at all" - app.py measures
@@ -1787,6 +1804,10 @@ class System2Runtime:
                     self.media.deliver(resolved, handoff, validate, entry_overrides=entry))
                 try:
                     deadline = float(entry["_ready_slot"]["deadline"])
+                    # [withdraw-parity] with the withdraw switch off the
+                    # hand-over may come after the entry has ended.
+                    if _grace() >= OVERRUN_UNBOUNDED:
+                        deadline += OVERRUN_UNBOUNDED
                     done, _ = await asyncio.wait({delivery}, timeout=max(0.0, deadline - time.time()))
                     if not done and not handed:
                         aborted = True

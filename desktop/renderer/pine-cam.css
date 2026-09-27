@@ -664,3 +664,21 @@
   min-height: 0;
   object-fit: cover;
 }
+
+/* 2026-09-27: the header folds away (the arrow in it, or a double tap on
+   the picture) and the box is just the window; a double tap brings it
+   back. Every open starts bare - the operator no longer needs the bar. */
+.pine-cam-box.pine-cam-bare .pine-cam-bar { display: none; }
+
+/* #1470b: while the native surface carries the picture, a BARE box has
+   nothing left to paint - the poster is blanked and the surface is the
+   window - so its frame goes too, or it stands behind the picture as a
+   dark ghost whenever the two are not exactly aligned (a drag in flight).
+   And while the finger slides the surface, the frame is hidden outright
+   until the surface settles and the box is moved to meet it. */
+.pine-cam-box.pine-cam-native.pine-cam-bare {
+  background: transparent;
+  border-color: transparent;
+  box-shadow: none;
+}
+.pine-cam-box.pine-cam-sliding { opacity: 0; }

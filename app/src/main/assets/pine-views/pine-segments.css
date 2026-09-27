@@ -243,3 +243,16 @@
 }
 
 .pseg-go { width: 100%; padding: 10px; font-size: 12px; }
+
+/* [topic-exchange] the box is two lines; an exchange in the bank reads as two */
+textarea.pseg-topic-in { resize: vertical; min-height: 44px; }
+.pseg-topic-words { white-space: pre-line; }
+
+/* [topic-edit] a bank entry edited where it stands */
+.pseg-topic-words { -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; }
+.pseg-topic-editor { display: grid; gap: 5px; min-width: 0; }
+.pseg-topic-editbar { display: flex; gap: 6px; }
+.pseg-topic-save, .pseg-topic-cancel { font-size: 11px; padding: 4px 12px; border-radius: 5px; border: 1px solid #2a4257;
+  background: #12202e; color: #dbe6f0; cursor: pointer; }
+.pseg-topic-save { border-color: #8cd4c0; color: #8cd4c0; }
+.pseg-topic-save:disabled { opacity: .5; }

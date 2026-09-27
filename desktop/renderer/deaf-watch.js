@@ -84,14 +84,58 @@
     });
   }
 
+  /* #1470: THE OTHER SHAPE OF DEAFNESS. On 2026-09-13 the signature was
+   * not a failed fetch at all - it was `musicPlayer net=2 ready=0`, an
+   * <audio> stuck LOADING with nothing arriving, for hours, while the
+   * bridge and even a probe fetch could still answer. A media element
+   * that has been asking for bytes for a whole round and has not got as
+   * far as its own metadata is dead, whatever the probe says: metadata is
+   * the first few kilobytes, and a station that is merely slow still
+   * hands those over in seconds. Counted per element across rounds, so a
+   * clip that is simply big and still opening does not count, and an
+   * error the engine itself reports as a network fault counts at once.
+   * Only elements with a source: an empty player is idle, not deaf. */
+  var stuckRounds = (typeof WeakMap === 'function') ? new WeakMap() : null;
+  var MEDIA_STUCK_ROUNDS = 2;
+
+  function mediaStuck() {
+    var out = {stuck: 0, errors: 0, ids: []};
+    var els;
+    try { els = document.querySelectorAll('audio, video'); }
+    catch (err) { return out; }
+    for (var i = 0; i < els.length; i += 1) {
+      var el = els[i];
+      var src = '';
+      try { src = el.currentSrc || el.getAttribute('src') || ''; } catch (err) { src = ''; }
+      if (!src) { if (stuckRounds) stuckRounds.delete(el); continue; }
+      var err = null;
+      try { err = el.error; } catch (e2) { err = null; }
+      if (err && (err.code === 2 /* MEDIA_ERR_NETWORK */)) {
+        out.errors += 1;
+        out.ids.push((el.id || el.tagName.toLowerCase()) + ':err' + err.code);
+        continue;
+      }
+      /* NETWORK_LOADING with nothing decoded yet, round after round. */
+      var loading = el.networkState === 2 && el.readyState < 1;
+      var n = loading && stuckRounds ? (Number(stuckRounds.get(el) || 0) + 1) : 0;
+      if (stuckRounds) { if (loading) stuckRounds.set(el, n); else stuckRounds.delete(el); }
+      if (n >= MEDIA_STUCK_ROUNDS) {
+        out.stuck += 1;
+        out.ids.push((el.id || el.tagName.toLowerCase()) + ':loading×' + n);
+      }
+    }
+    return out;
+  }
+
   function look() {
     if (reviving) return;
     Promise.all([viaBridge(), viaWeb()]).then(function (got) {
       var bridge = got[0].ok;
       var bridgeMs = got[0].ms;
       var web = got[1];
+      var media = mediaStuck();
       last = {at: Date.now(), bridge: bridge, bridgeMs: bridgeMs,
-              web: web, say: ''};
+              web: web, media: media, say: ''};
 
       /* The bridge being down too means the station or the network is
          away, which is not this fault and not ours to fix. */
@@ -100,7 +144,8 @@
         last.say = 'the bridge is not answering either - not deafness';
         return;
       }
-      if (web) {
+      var mediaDead = (media.stuck + media.errors) > 0;
+      if (web && !mediaDead) {
         strikes = 0;
         last.say = 'both roads answer';
         return;
@@ -116,8 +161,10 @@
       }
 
       strikes += 1;
-      last.say = 'the bridge answers and the web does not - strike '
-        + strikes + ' of ' + STRIKES;
+      last.say = (web
+        ? 'the bridge answers and the media is dead (' + media.ids.join(', ') + ')'
+        : 'the bridge answers and the web does not')
+        + ' - strike ' + strikes + ' of ' + STRIKES;
       if (strikes < STRIKES) return;
 
       var bridgeApi = api();
@@ -132,8 +179,11 @@
       try {
         Promise.resolve(bridgeApi.revive({
           now: true,
-          why: 'the WebView network is dead: the bridge answers ' + PROBE
-             + ' and fetch does not'
+          why: web
+            ? ('the WebView media is dead: the bridge answers ' + PROBE
+               + ' and ' + media.ids.join(', ') + ' never loads')
+            : ('the WebView network is dead: the bridge answers ' + PROBE
+               + ' and fetch does not')
         })).then(function (said) {
           /* An answer at all means it declined - a revival does not
              return, because the process is gone. */
@@ -165,8 +215,11 @@
     /* Numbers the operator can look at rather than a claim in a comment. */
     state: function () {
       return {at: last.at, bridge: last.bridge, bridgeMs: last.bridgeMs,
-              web: last.web, strikes: strikes, say: last.say};
+              web: last.web, media: last.media || null, strikes: strikes,
+              say: last.say};
     },
+    /* #1470: the media test on its own, for a console or a doctor. */
+    media: mediaStuck,
     /* For proving it works without waiting for the fault. */
     look: look
   };
