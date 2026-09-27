@@ -579,6 +579,93 @@
   ['brightness', 'contrast', 'saturation'].forEach(function (key) { $(key).addEventListener('pointerdown', remember); $(key).addEventListener('keydown', function (e) { if (!e.repeat && e.key.startsWith('Arrow')) remember(); }); $(key).addEventListener('input', function () { if (edit && !busy) { edit[key] = Number(this.value); changed(); } }); });
   $('resetAdjust').addEventListener('click', function () { if (!edit || busy) return; remember(); edit.brightness = edit.contrast = edit.saturation = 1; changed(); });
   $('retry').addEventListener('click', function () { if (retryAction) retryAction(); });
+  /* [one-bar] THE HOST'S CHROME IN THIS BAR.
+   *
+   * "in the screen recording edit video tab there's three top bars and there
+   *  shouldn't be. There should be only one. So I want to consolidate all of
+   *  these elements into one top bar at the top of the screen, giving more
+   *  room to the video window and allowing there to be sidebars."
+   *
+   * The tablet's hot-corner sheet used to stack its slide handle and a
+   * "Screen recording / Close editor" bar above this page's own toolbar.
+   * With ?chrome=host the sheet hides both and this toolbar carries their
+   * parts, left to right: the grip (its drag is posted to the sheet, which
+   * still owns the parking and the ink pad behind it; a tap slides), Back as
+   * an icon, the road's name, the title and file, this page's own controls,
+   * Save, "Slide away", and an X that closes the editor. */
+  var hostChrome = host !== window && new URLSearchParams(location.search).get('chrome') === 'host';
+  var GLYPH = {
+    left: '<svg viewBox="0 0 32 32" aria-hidden="true"><path d="M20 24 12 16l8-8 1.4 1.4L14.8 16l6.6 6.6z"/></svg>',
+    right: '<svg viewBox="0 0 32 32" aria-hidden="true"><path d="m12 8 8 8-8 8-1.4-1.4L17.2 16l-6.6-6.6z"/></svg>',
+    close: '<svg viewBox="0 0 32 32" aria-hidden="true"><path d="M24 9.4 22.6 8 16 14.6 9.4 8 8 9.4l6.6 6.6L8 22.6 9.4 24l6.6-6.6 6.6 6.6 1.4-1.4-6.6-6.6z"/></svg>',
+    grip: '<svg viewBox="0 0 32 32" aria-hidden="true"><path d="M6 9h20v2H6zm0 6h20v2H6zm0 6h20v2H6z"/></svg>'
+  };
+  function hostIcon(name, fallback) {
+    /* the sheet's own Carbon icons when it has them (no emoji, ever) */
+    /* the sheet's sprite lives in ITS document; a <use> of it would draw
+       nothing in this frame, so the Carbon shapes are inlined here */
+    return fallback;
+  }
+  function hostBar(bar, backId, roadWord) {
+    if (!hostChrome || !bar) return;
+    document.documentElement.classList.add('host-chrome');
+    var back = document.getElementById(backId);
+    var grip = document.createElement('button');
+    grip.type = 'button'; grip.className = 'quiet host-grip';
+    grip.title = 'drag sideways to slide the editor aside and draw on the whole screen; tap to slide it away';
+    grip.setAttribute('aria-label', grip.title);
+    grip.innerHTML = hostIcon('c:draggable', GLYPH.grip);
+    var drag = null;
+    function say(phase, dx) { notify('pine-video-editor-drag', {phase: phase, dx: Math.round(dx || 0)}); }
+    grip.addEventListener('pointerdown', function (ev) {
+      if (drag || (ev.pointerType === 'mouse' && ev.button !== 0)) return;
+      drag = {id: ev.pointerId, x: ev.clientX, dx: 0, moved: false};
+      try { grip.setPointerCapture(ev.pointerId); } catch (_) { /* older engine */ }
+      say('start', 0); ev.preventDefault();
+    }, {passive: false});
+    grip.addEventListener('pointermove', function (ev) {
+      if (!drag || ev.pointerId !== drag.id) return;
+      drag.dx = ev.clientX - drag.x;
+      if (Math.abs(drag.dx) > 4) drag.moved = true;
+      say('move', drag.dx); ev.preventDefault();
+    }, {passive: false});
+    function letGo(ev) {
+      if (!drag || ev.pointerId !== drag.id) return;
+      try { grip.releasePointerCapture(ev.pointerId); } catch (_) { /* not held */ }
+      var was = drag; drag = null;
+      say('end', was.dx);
+      if (!was.moved) notify('pine-video-editor-slide');
+    }
+    grip.addEventListener('pointerup', letGo);
+    grip.addEventListener('pointercancel', letGo);
+    var road = document.createElement('span');
+    road.className = 'host-road'; road.textContent = roadWord;
+    var slide = document.createElement('button');
+    slide.type = 'button'; slide.className = 'quiet host-slide';
+    slide.innerHTML = hostIcon('c:caret--right', GLYPH.right) + '<span>Slide away</span>';
+    slide.title = 'Slide the editor aside to draw on the whole screen';
+    slide.addEventListener('click', function () { notify('pine-video-editor-slide'); });
+    var shut = document.createElement('button');
+    shut.type = 'button'; shut.className = 'quiet host-close';
+    shut.innerHTML = hostIcon('c:close', GLYPH.close);
+    shut.title = 'Close editor'; shut.setAttribute('aria-label', 'Close editor');
+    shut.addEventListener('click', function () { notify('pine-video-editor-close'); });
+    if (back) {
+      back.classList.add('host-back');
+      back.innerHTML = hostIcon('c:caret--left', GLYPH.left);
+      back.title = 'Back'; back.setAttribute('aria-label', 'Back');
+      bar.insertBefore(grip, back);
+      bar.insertBefore(road, back.nextSibling);
+    } else {
+      bar.insertBefore(road, bar.firstChild);
+      bar.insertBefore(grip, bar.firstChild);
+    }
+    bar.appendChild(slide);
+    bar.appendChild(shut);
+  }
+  hostBar(document.getElementById('recordingTopbar'), 'back', sfxClip ? 'SFX clip' : 'Screen recording');
+  hostBar(document.querySelector('.parody-topbar'), 'parodyBack', 'Video splice editor');
+
   $('back').addEventListener('click', function () { video.pause(); if (host !== window) notify('pine-video-editor-close'); else if (history.length > 1) history.back(); else window.close(); });
   document.addEventListener('keydown', function (event) { if ($('recordingEditor').hidden || /INPUT|TEXTAREA/.test(event.target.tagName)) return; if (event.key === ' ') { event.preventDefault(); play(); } if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'z') { event.preventDefault(); event.shiftKey ? redo() : undo(); } });
   $('soundView').addEventListener('click', function () { showFrequencies = !showFrequencies; $('spectrogram').hidden = !showFrequencies; $('wave').hidden = showFrequencies; this.textContent = showFrequencies ? 'Show waveform' : 'Show frequencies'; });

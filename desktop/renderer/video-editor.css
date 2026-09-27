@@ -224,3 +224,19 @@ html.parody-embedded .parody-footer{display:none}
   #recordingEditor .frames,#recordingEditor .frames img,#recordingEditor .frames .sprite{height:33px}
   #recordingEditor footer{min-height:23px}
 }
+
+/* [one-bar] the host's chrome in this bar (the tablet sheet opens the editor with ?chrome=host and hides its own two bars) */
+html.host-chrome #recordingEditor .topbar,html.host-chrome .parody-topbar{min-height:40px;gap:4px;padding:2px 6px;flex-wrap:nowrap;overflow:hidden}
+html.host-chrome #recordingEditor .topbar button,html.host-chrome .parody-topbar button{min-height:32px;padding:4px 8px}
+html.host-chrome .host-grip{width:34px;min-width:34px;padding:4px;cursor:grab;touch-action:none;display:inline-flex;align-items:center;justify-content:center}
+html.host-chrome .host-grip:active{cursor:grabbing}
+html.host-chrome .host-back,html.host-chrome .host-close{width:36px;min-width:36px;padding:4px;display:inline-flex;align-items:center;justify-content:center}
+html.host-chrome .host-road{flex:0 0 auto;font-size:12px;color:var(--muted,#8fa0ad);white-space:nowrap;padding:0 4px}
+html.host-chrome #recordingEditor .heading{display:flex;align-items:baseline;gap:8px;min-width:0;flex:1 1 auto;overflow:hidden}
+html.host-chrome #recordingEditor .heading h1{font-size:13px;margin:0;white-space:nowrap}
+html.host-chrome #recordingEditor .heading span{font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}
+html.host-chrome .parody-heading{min-width:0;flex:1 1 auto;overflow:hidden}
+html.host-chrome .host-slide{display:inline-flex;align-items:center;gap:4px;white-space:nowrap}
+html.host-chrome .host-slide svg,html.host-chrome .host-back svg,html.host-chrome .host-close svg,html.host-chrome .host-grip svg{width:18px;height:18px;fill:currentColor}
+html.host-chrome #recordingEditor .audio-toggle{margin-left:0}
+@media(max-width:760px){html.host-chrome #recordingEditor .topbar #redo{display:inline-block}}

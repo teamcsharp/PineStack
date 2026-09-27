@@ -462,6 +462,18 @@ def window_facts(view, server_context=None):
             'element_span': [min(seats), max(seats)] if seats else []}
 
 
+# [#1309] Scroll owners that are the operator's own doing: a wheel or a
+# finger, and a jump to air asked for by a tap (the live strip, a feed
+# detail's button, the segment navigator, a cue). The pane moving under
+# those is what was asked for, never a fault. 'jump-to-air:live cue
+# window' is not here: the cue window can call it on its own.
+OPERATOR_SCROLL_OWNERS = ('user', 'wheel', 'touch', 'drag',
+                          'jump-to-air:live strip', 'jump-to-air:feed detail',
+                          'jump-to-air:segment navigator', 'jump-to-air:image analysis',
+                          'jump-to-air:readiness', 'jump-to-air:current cue',
+                          'jump-to-air:control')
+
+
 def analyze_capture(view, server_context=None):
     """Describe display/player observations, keeping suspicion separate from proof."""
     view = normalize_view(view)
@@ -539,7 +551,7 @@ def analyze_capture(view, server_context=None):
             if (same_id and before_scroll is not None and after_scroll is not None
                     and abs(after_scroll - before_scroll) >= jump_floor
                     and owner and not any(word in owner.lower()
-                                          for word in ('user', 'wheel', 'touch', 'drag'))):
+                                          for word in OPERATOR_SCROLL_OWNERS)):
                 viewport_jumps.append({
                     'index': index,
                     'delta_px': round(after_scroll - before_scroll),

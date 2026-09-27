@@ -466,3 +466,6 @@ html.hc-hushed body > *:not(.hc-ink):not(.hc-toast):not(.hc-sheet):not(#pineRepo
   .hc-ink-note { display: none; }
   .hc-grab-word { display: none; }                               /* [#1221] */
 }
+
+/* [one-bar] the editor's own toolbar is the one bar; the sheet's handle stays for the rig but is not shown */
+.hc-video-editor .hc-grab.hc-host-chrome { display: none; }

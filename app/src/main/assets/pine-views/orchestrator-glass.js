@@ -334,6 +334,10 @@
     else if (mood === 'angry') { L = '\u2573'; R = '\u2573'; M = '\u2500\u2500\u2500'; }
     else if (mood === 'anxious') { M = '\u2500o\u2500'; if (i % 6 < 3) { N = '^'; } }
     else if (mood === 'rushing') { M = '\u2500\u2500\u2500'; if (i % 4 < 2) { L = 'o'; R = 'o'; } }
+    /* [s3-glass] the dice are rolling for the line on air; and a line that
+       landed in sadness or boredom (the ES roll) pulls a long face */
+    else if (mood === 'rolling') { L = (i % 2) ? 'o' : '\u25cf'; R = (i % 2) ? '\u25cf' : 'o'; M = '~~~'; }
+    else if (mood === 'glum') { M = '/\u00af\\'; }
     else if (i % 26 === 12 || i % 26 === 13) { L = '\u2500'; R = '\u2500'; }
     return {L: L, R: R, N: N, M: M, tail: tail};
   }
@@ -354,7 +358,11 @@
     if (!box) return;
     var pre = box.querySelector('.og-face');
     if (!pre) return;
-    var mood = (last && last.face && last.face.mood) || 'watching';
+    /* [s3-glass] the dice of the line on air take his face for a moment:
+       rolling while the reels turn, then the feeling the ES roll landed on;
+       the conductor's own mood (the measurement) comes back after. */
+    var mood = (s3Face && Date.now() < s3Face.until) ? s3Face.mood
+      : ((last && last.face && last.face.mood) || 'watching');
     frame += 1;
     pre.textContent = faceRows(mood, frame);
   }
@@ -398,6 +406,143 @@
     sayAt += 1;
     if (sayAt >= Math.max(1, most)) { sayAt = 0; pull(); }
     paintSay();
+  }
+
+  /* ---------------------------------------------------------- System 3
+   *
+   * THE DICE OF THE LINE ON AIR. "I want the popup orchestrator windows
+   * showing RNG and rolodex information and I want glyphy reactive to the
+   * dice / roulette results in his indicator and I want to see him rolling
+   * dice in the popup for the currently spoken segment showing numbers for
+   * the values being obtained for the actively spoken line." (2026-09-27)
+   *
+   * /api/system3/now is the station's own record of the line going out this
+   * instant (_SPEAKING_NOW) resolved to its System 3 turn: the road, the
+   * turn's place in the round, every recorded roll with the d100 it rolled
+   * and the candidates it rolled through, the SFX Guy's node, the round's
+   * budget and its length roll. Nothing here invents a number: the reels
+   * are the recorded candidates and the die counts up to the recorded d100.
+   * A line no node made says so in words. Polled on its own short clock
+   * while the window is open, never while it is folded. */
+  var S3_MS = 1500;
+  var s3Timer = null, s3Line = '', s3Face = null, s3Spinning = null, s3Node = null;
+  var S3_FAM = {CTS: '#8ac6ac', ES: '#f0a6ca', RS: '#87bfff', IRS: '#ffb86b', FL: '#c4a1ee',
+    SPEAKERBOX: '#e7bf78', SFX: '#7fe0d6', TOPIC: '#9be15d', SFXGUY: '#ffd479', LINE: '#b8c4ff', LENGTH: '#9aa9ab'};
+
+  function s3Pane() {
+    s3Node = el('div', 'og-s3');
+    s3Node.setAttribute('role', 'status');
+    s3Node.setAttribute('aria-label', 'System 3: the dice of the line on air');
+    s3Node.hidden = true;
+    return s3Node;
+  }
+
+  function s3Pull() {
+    if (!box) return;
+    if (mini) { if (s3Node) s3Node.hidden = true; return; }
+    get('/api/system3/now').then(function (got) {
+      if (box && got) s3Paint(got);
+    })['catch'](function () { /* the next tick asks again */ });
+  }
+
+  function esMood(label, category) {
+    var w = String((label || '') + ' ' + (category || '')).toLowerCase();
+    if (/joy|pride|admir|enthus|amuse|delight|pleas|glee|warm|relief/.test(w)) return 'pleased';
+    if (/anger|fury|outrage|annoy|irrit|disgust|contempt|rage/.test(w)) return 'angry';
+    if (/fear|anxi|nervous|worr|dread|panic|alarm/.test(w)) return 'anxious';
+    if (/sad|melanch|despair|disappoint|grief|bored|boredom|low_arousal|fatigue/.test(w)) return 'glum';
+    if (/surpr|curio|bewilder|interest|skeptic|uncertain|wonder|astonish|confus/.test(w)) return 'thinking';
+    return 'watching';
+  }
+
+  function s3Roll(roll) {
+    var row = el('div', 'og-s3-roll');
+    row.style.setProperty('--fam', S3_FAM[roll.family] || '#9aa9ab');
+    row.appendChild(el('span', 'og-s3-fam', String(roll.family || '')));
+    row.appendChild(el('span', 'og-s3-reel', String(roll.label || '')));
+    row.appendChild(el('span', 'og-s3-die', roll.dice != null ? 'd' + roll.dice : ''));
+    row.s3 = roll;
+    return row;
+  }
+
+  function s3Paint(got) {
+    if (!s3Node) return;
+    s3Node.hidden = false;
+    var line = got.line, s3 = got.system3;
+    var lineId = line ? String(line.id || '') : '';
+    var changed = lineId !== s3Line;
+    s3Line = lineId;
+    while (s3Node.firstChild) s3Node.removeChild(s3Node.firstChild);
+    if (!line) { s3Node.appendChild(el('div', 'og-s3-quiet', 'nothing on air this instant')); return; }
+    var head = el('div', 'og-s3-head');
+    var reg = got.register || {};
+    if (!s3) {
+      head.appendChild(chip(String(line.name || line.who || '?'), 'og-kind'));
+      head.appendChild(el('span', 'og-s3-quiet', 'not directed by System 3 - no node made this line'));
+      s3Node.appendChild(head);
+      s3Node.appendChild(el('div', 'og-s3-words', String(line.text || '')));
+      return;
+    }
+    var t = s3.turn || {};
+    head.appendChild(chip('System 3', 'og-note'));
+    head.appendChild(chip(String(s3.road || ''), 'og-kind'));
+    head.appendChild(el('span', 'og-s3-place',
+      (t.turn ? 'turn ' + t.turn + ' of ' + (t.of || s3.turns) : 'a line of its own')
+      + (t.name ? ' \u00b7 ' + t.name : '') + (t.step ? ' \u00b7 ' + t.step : '')
+      + (t.emotion ? ' \u00b7 ' + t.emotion : '')));
+    s3Node.appendChild(head);
+    s3Node.appendChild(el('div', 'og-s3-words', String(line.text || '')));
+    var rolls = t.rolls || [];
+    var strip = el('div', 'og-s3-rolls');
+    for (var i = 0; i < rolls.length; i += 1) strip.appendChild(s3Roll(rolls[i]));
+    if (!rolls.length) strip.appendChild(el('div', 'og-s3-quiet', 'no roll behind this line: a node with nothing to draw'));
+    s3Node.appendChild(strip);
+    var b = s3.budget || {};
+    var foot = el('div', 'og-s3-foot');
+    if (b.turn_budget) foot.appendChild(chip('turn budget ' + b.turn_budget, 'og-note'));
+    if (b.estimated_seconds) foot.appendChild(chip('~' + Math.round(b.estimated_seconds) + 's planned', 'og-note'));
+    if (b.target_seconds) foot.appendChild(chip('slot ' + Math.round(b.target_seconds) + 's', 'og-note'));
+    if (b.length_roll) foot.appendChild(chip('length d' + (b.length_roll.dice != null ? b.length_roll.dice : '?') + ' \u2192 '
+      + b.length_roll.turns + ' turns of ' + b.length_roll.lo + '..' + b.length_roll.hi, 'og-count'));
+    if (t.sfx && t.sfx.play) foot.appendChild(chip('SFX clip ' + t.sfx.placement, 'og-note'));
+    if (s3.verdict) foot.appendChild(chip(String(s3.verdict), 'og-note'));
+    foot.appendChild(chip((reg.directed || 0) + ' of ' + (reg.roads || 0) + ' roads directed', 'og-note'));
+    s3Node.appendChild(foot);
+    if (changed && rolls.length) s3Spin(strip, rolls, t);
+  }
+
+  /* The roll, from the recorded reel: every label shown was a candidate in
+     the draw, the die counts up to the d100 that was rolled, and it lands on
+     what was drawn. His face rolls with it, then takes the feeling. */
+  function s3Spin(strip, rolls, turn) {
+    var rows = strip.querySelectorAll('.og-s3-roll');
+    var started = Date.now(), total = 1100, token = {};
+    s3Spinning = token;
+    s3Face = {mood: 'rolling', until: started + total + 150};
+    var tick = function () {
+      if (s3Spinning !== token || !box) return;
+      var k = Math.min(1, (Date.now() - started) / total);
+      for (var i = 0; i < rows.length; i += 1) {
+        var roll = rows[i].s3 || {};
+        var reel = rows[i].querySelector('.og-s3-reel');
+        var die = rows[i].querySelector('.og-s3-die');
+        var cands = roll.reel || [];
+        if (k < 1) {
+          rows[i].className = 'og-s3-roll rolling';
+          if (cands.length > 1 && reel) reel.textContent = String(cands[Math.floor((Date.now() / 70 + i * 3) % cands.length)]);
+          if (roll.dice != null && die) die.textContent = 'd' + Math.max(1, Math.min(100, Math.round(1 + (roll.dice - 1) * k)));
+        } else {
+          rows[i].className = 'og-s3-roll landed';
+          if (reel) reel.textContent = String(roll.label || '');
+          if (die) die.textContent = roll.dice != null ? 'd' + roll.dice : '';
+        }
+      }
+      if (k < 1) { root.setTimeout(tick, 70); return; }
+      var es = null;
+      for (var j = 0; j < (rolls || []).length; j += 1) if (rolls[j].family === 'ES') es = rolls[j];
+      s3Face = {mood: esMood(turn.emotion || (es && es.label), es && es.category), until: Date.now() + 5000};
+    };
+    tick();
   }
 
   /* ---------------------------------------------------------- the folds */
@@ -2281,6 +2426,7 @@
     mini = (typeof want === 'boolean') ? want : !mini;
     rememberMini();
     applyMini();
+    if (s3Node) s3Node.hidden = mini;             /* [s3-glass] */
     if (!mini) {
       /* opening out is an explicit ask to see the newest reading, so the
          three clocks are cleared and the held diff goes in at once. */
@@ -2757,6 +2903,7 @@
       if (waiting) paint();
     });
     node.appendChild(held);
+    node.appendChild(s3Pane());                    /* [s3-glass] */
 
     /* [#1213] and the whole head is the other way to fold him - a press on
        the strip, never a drag of it, and never the two buttons standing on it
@@ -2883,6 +3030,8 @@
     faceTimer = root.setInterval(paintFace, FACE_MS);
     pull();
     timer = root.setInterval(pull, EVERY_MS);
+    s3Timer = root.setInterval(s3Pull, S3_MS);     /* [s3-glass] */
+    s3Pull();
     /* #1220: he stopped reading - catch the view up, once. Checked often
        enough to feel prompt and doing nothing at all unless something is
        actually waiting. */
@@ -2903,6 +3052,8 @@
        panel before. */
     if (timer) { root.clearInterval(timer); timer = null; }
     if (faceTimer) { root.clearInterval(faceTimer); faceTimer = null; }
+    if (s3Timer) { root.clearInterval(s3Timer); s3Timer = null; }   /* [s3-glass] */
+    s3Spinning = null; s3Line = ''; s3Face = null; s3Node = null;
     if (restTimer) { root.clearInterval(restTimer); restTimer = null; }  /* #1220 */
     waiting = false;
     touchedAt = 0;

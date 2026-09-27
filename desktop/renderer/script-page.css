@@ -131,6 +131,15 @@
 }
 .sp-band-collapse svg, .sp-band-reopen svg { width: 16px; height: 16px; }
 .sp-band-restore { display: flex; gap: 5px; min-height: 28px; min-width: 0; }
+/* System 3's Messenger and Technical views sit in the script's own grid
+   cell, over it, so the script underneath keeps following the air. */
+.sp-right > #spScript { grid-row: 2; grid-column: 1; }
+.sp-s3 { grid-row: 2; grid-column: 1 / -1; z-index: 3; min-height: 0; overflow: hidden;
+  border: 1px solid var(--sp-line); border-radius: 10px; background: #0f171b; }
+.sp-s3[hidden] { display: none; }
+.sp-s3 > .sp-s3-host { height: 100%; }
+.sp-s3-toggle[aria-pressed="true"] { border-color: var(--sp-on); color: var(--sp-on);
+  background: #16302a; }
 .sp-band-reopen { flex: 0 0 28px; }
 
 /* ---------------------------------------------------------------- 1 2 3 */
@@ -3585,3 +3594,74 @@ html.pine-tech-wide .sp-tech.sp-tech-wide .wc-strip {
 .sp-reason-dictate,
 .sp-headmenu-dictate,
 .sp-segrep-dictate { display: none !important; }
+
+/* [s3-header] System 3's bar in this page's header: its round facts and the
+   caution button at the right of the title line, its on-air pill in the
+   middle of the toolbar and its buttons at the toolbar's right end. */
+.sp-title-tools { flex: 0 1 auto; min-width: 0; max-width: 62%; display: flex; align-items: center; gap: 6px; margin-left: auto; }
+.sp-s3-facts { flex: 0 1 auto; min-width: 0; display: flex; overflow: hidden; }
+.sp-s3-facts[hidden], .sp-s3-air[hidden], .sp-s3-tools[hidden] { display: none; }
+.sp-s3-facts > .s3-chrome { overflow: hidden; }
+.sp-s3-facts .s3-embed-facts { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sp-title-tools .sp-caution-wrap { position: static; height: auto; flex: none; overflow: visible; }
+.sp-title-tools .sp-caution { position: static; width: 30px; height: 30px; box-shadow: none; }
+.sp-s3-air { flex: 1 1 auto; min-width: 0; display: flex; justify-content: center; align-items: center; overflow: hidden; }
+.sp-s3-tools { flex: none; display: flex; align-items: center; margin-left: auto; }
+.sp-s3 .s3-embed-body { padding-top: 4px; }
+
+/* [s3-dice] THE DICE ON THE FEED: a strip at a row's top right, one die per
+   recorded roll of the turn the line came from, each a reel of numbers that
+   ends on the recorded d100 (transform only - the tablet can afford it), a
+   little after the last; a bubble under the strip names the table. */
+.sp-msg { position: relative; }
+.sp-msg.has-dice { padding-right: calc(var(--sp-dice-w, 0px) + 12px); }
+.sp-msg-dice {
+  position: absolute; top: 3px; right: 6px; z-index: 2;
+  display: flex; gap: 3px; align-items: flex-start;
+}
+.sp-die {
+  position: relative; width: 20px; height: 16px; padding: 0; margin: 0;
+  border-radius: 4px; overflow: hidden; cursor: pointer;
+  background: #0b1215; border: 1px solid var(--fam, #68ced9);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, .04), 0 0 6px -2px var(--fam, #68ced9);
+  color: #e8f1f2; font: 600 10px/16px ui-monospace, SFMono-Regular, Menlo, monospace;
+  text-align: center;
+}
+.sp-die:focus-visible { outline: 2px solid #68ced9; outline-offset: 1px; }
+.sp-die-reel {
+  position: absolute; left: 0; right: 0; top: 0; display: block;
+  transform: translateY(var(--reel-end, 0px));
+}
+.sp-die-reel > span { display: block; height: 16px; line-height: 16px; }
+.sp-die.rolling .sp-die-reel {
+  transform: translateY(0);
+  animation: sp-die-spin var(--ms, 800ms) cubic-bezier(.12, .72, .18, 1) var(--delay, 0ms) forwards;
+}
+.sp-die.rolling { animation: sp-die-tilt .22s ease-in-out var(--delay, 0ms) infinite alternate; }
+.sp-die.landed { animation: sp-die-pop .35s ease-out; }
+@keyframes sp-die-spin { from { transform: translateY(0); } to { transform: translateY(var(--reel-end, 0px)); } }
+@keyframes sp-die-tilt { from { transform: rotate(-6deg); } to { transform: rotate(6deg); } }
+@keyframes sp-die-pop { 0% { transform: scale(1.35); } 60% { transform: scale(.94); } 100% { transform: scale(1); } }
+.sp-die-more { width: auto; padding: 0 4px; border-style: dashed; color: #9fbbc8; }
+.sp-die-bubble {
+  position: absolute; right: 0; top: 19px; max-width: 260px; padding: 2px 7px;
+  border-radius: 5px; background: #0b1215; border: 1px solid #354954; color: #dfe6e4;
+  font-size: 10px; line-height: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  opacity: 0; transform: translateY(-3px); transition: opacity .22s ease, transform .22s ease;
+  pointer-events: none;
+}
+.sp-die-bubble.show { opacity: 1; transform: translateY(0); }
+@media (prefers-reduced-motion: reduce) {
+  .sp-die.rolling .sp-die-reel, .sp-die.rolling, .sp-die.landed { animation: none; }
+  .sp-die-bubble { transition: none; }
+}
+
+/* [s3-dice] size pinned: the page's touch-target rule (button min-height) blew the dice up to 38 px */
+.sp-msg-dice .sp-die, .sp-msg-dice .sp-die-more {
+  width: 26px; min-width: 26px; height: 20px; min-height: 20px; max-height: 20px;
+  padding: 0; margin: 0; line-height: 20px; font-size: 11px; border-radius: 5px;
+}
+.sp-msg-dice .sp-die-more { width: auto; padding: 0 5px; }
+.sp-msg-dice { gap: 4px; }
+.sp-msg-dice .sp-die-reel > span { height: 20px; line-height: 20px; }
+.sp-msg-dice .sp-die-bubble { top: 23px; }

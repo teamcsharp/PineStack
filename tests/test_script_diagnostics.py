@@ -81,6 +81,23 @@ class CaptureAnalysisTests(unittest.TestCase):
         self.assertNotIn('automatic_viewport_jump',
                          self.codes(view([first, user, advanced])))
 
+    def test_a_jump_to_air_from_a_tap_is_the_operators_own(self):
+        # [#1309] the live strip was tapped: follow off -> on, the lit line
+        # brought from 851px above the pane to 250px inside it. Asked for.
+        first = event('a', index=45, ord0=7)
+        first.update(scroll_top_px=6531, lit_top_px=-851, scroll_owner='fold:follow')
+        tapped = event('a', index=45, ord0=7, start=1, end=2)
+        tapped.update(scroll_top_px=5464, lit_top_px=250, scroll_owner='jump-to-air:live strip')
+        capture = view([first, tapped])
+        capture['snapshot']['viewport'] = {'height_px': 720}
+        self.assertNotIn('automatic_viewport_jump', self.codes(capture))
+        # ...but a jump the cue window made on its own is still reported
+        auto = event('a', index=45, ord0=7, start=2, end=3)
+        auto.update(scroll_top_px=6600, lit_top_px=-900, scroll_owner='jump-to-air:live cue window')
+        capture = view([tapped, auto])
+        capture['snapshot']['viewport'] = {'height_px': 720}
+        self.assertIn('automatic_viewport_jump', self.codes(capture))
+
     def test_a_row_whose_script_order_moved_is_not_a_reindex(self):
         # [#1282] the other side of the same law: if (block, ord) moved,
         # the script itself advanced and the page followed it. Not a fault.

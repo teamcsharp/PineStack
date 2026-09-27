@@ -33568,6 +33568,87 @@ async def _sfx_single_clip(clip: dict[str, Any], text: str, who: str,
         return clip, fallback
 
 
+# --- [s3-roads] THE ORIGIN OF EVERY SINGLE LINE ------------------------------
+#
+# A line that never passes through a round - a station ID, a record link,
+# a stock interjection, a produced spot - is still System 3's: its road
+# asked system3_direct_line for its node and got a stamp back. dj_speak
+# remembers the stamp by the line id it mints, and script_ledger_catch_up -
+# "the one hook that catches all twenty-five ring append sites" - writes it
+# on the ledger row, so /api/system3/line answers for it like any turn.
+_S3_LINE_BY_ID: dict[str, dict[str, Any]] = {}
+
+
+def _s3_line_remember(line_id: Any, stamp: Any) -> None:
+    if isinstance(stamp, dict) and stamp.get("conversation_id") and line_id:
+        _S3_LINE_BY_ID[str(line_id)] = dict(stamp)
+        while len(_S3_LINE_BY_ID) > 600:
+            _S3_LINE_BY_ID.pop(next(iter(_S3_LINE_BY_ID)))
+
+
+def _s3_line_stamp_of(row: Any) -> dict[str, Any] | None:
+    """The System 3 stamp for an aired ring row: the one it carries, else
+    the one dj_speak remembered for its id."""
+    got = row.get("system3") if isinstance(row, dict) else None
+    if isinstance(got, dict) and got.get("conversation_id"):
+        return dict(got)
+    return _S3_LINE_BY_ID.pop(str((row or {}).get("id") or ""), None)
+
+
+async def _s3_stock_line(road: str, options: Any, who: str = "dj", context: str = "",
+                         source: str = "") -> tuple[str, dict[str, Any] | None]:
+    """[s3-roads] A line off a fixed list is a LINE draw: System 3 rolls
+    over the list with every candidate recorded, and the words are bound
+    to the node. None (off, or a fault) is the station's own
+    random.choice(), as ever."""
+    rows = [str(x) for x in (options or []) if str(x or "").strip()]
+    if not rows:
+        return "", None
+    if globals().get("system3_direct_line"):
+        try:
+            _h = await globals()["system3_direct_line"](
+                road=road, who=who, dj=dj_settings(), context=context,
+                candidates=rows, candidates_from=source or road)
+            if _h is not None and _h.active and _h.line:
+                if globals().get("system3_bind_line"):
+                    globals()["system3_bind_line"](_h, _h.line)
+                return _h.line, dict(_h.stamp)
+        except Exception as _exc:  # noqa: BLE001
+            pipeline_log("system3", "a stock line fell back to the station's own draw",
+                         extra=("%s: %s" % (type(_exc).__name__, _exc))[:200])
+    return random.choice(rows), None
+
+
+async def _s3_ad_pick() -> dict[str, Any] | None:
+    """[s3-roads] ad_pick's rule - the reads that have run least - with the
+    draw among them System 3's, recorded with the book's candidates; the
+    row carries the stamp so the booth row and the ledger name the node."""
+    rows = [r for r in ad_list() if r.get("auto_air") is not False]
+    if not rows:
+        return None
+    fewest = min(r.get("uses", 0) for r in rows)
+    pool = [r for r in rows if r.get("uses", 0) == fewest]
+    if globals().get("system3_direct_line") and pool:
+        try:
+            _h = await globals()["system3_direct_line"](
+                road="ad_spot", who="dj", dj=dj_settings(), context="a produced spot",
+                candidates=[{"id": str(r.get("id") or i),
+                             "text": str(r.get("product") or r.get("text") or "a spot")[:200],
+                             "weight": 1.0} for i, r in enumerate(pool)],
+                candidates_from="the ad book, the reads that have run least")
+            if _h is not None and _h.active and _h.choice is not None and 0 <= _h.choice < len(pool):
+                _pick = dict(pool[_h.choice])
+                if globals().get("system3_bind_line"):
+                    globals()["system3_bind_line"](
+                        _h, str(_pick.get("text") or _pick.get("product") or ""))
+                _pick["system3"] = dict(_h.stamp)
+                return _pick
+        except Exception as _exc:  # noqa: BLE001
+            pipeline_log("system3", "the produced spot fell back to the station's own draw",
+                         extra=("%s: %s" % (type(_exc).__name__, _exc))[:200])
+    return random.choice(pool)
+
+
 async def dj_speak(kind: str, track: dict[str, Any] | None = None,
                    extra: str = "", line: str = "",
                    who: str = "dj", voice: str | None = None,
@@ -33579,6 +33660,7 @@ async def dj_speak(kind: str, track: dict[str, Any] | None = None,
                    checked: bool = False, remember_text: str = "",
                    round_as: str = "", sid: str = "",
                    bound: dict[str, Any] | None = None,   # [#1237]
+                   system3: dict[str, Any] | None = None,  # [s3-roads] the line's node
                    bound_part: str = "") -> str:
     """#1146: the floor door for single lines. A cover, a news line or an
     interjection waits for the round that has the air instead of landing
@@ -33592,7 +33674,8 @@ async def dj_speak(kind: str, track: dict[str, Any] | None = None,
             source=source, by_hand=by_hand, fx=fx, name=name,
             source_text=source_text, clip=clip, sting=sting, note=note,
             checked=checked, remember_text=remember_text, round_as=round_as,
-            sid=sid, bound=bound, bound_part=bound_part)   # [#1237]
+            sid=sid, bound=bound, bound_part=bound_part,   # [#1237]
+            system3=system3)   # [s3-roads]
     _owned = await _floor_take(f"a {kind} line from {who}")
     try:
         return await _dj_speak_floorless(
@@ -33600,7 +33683,8 @@ async def dj_speak(kind: str, track: dict[str, Any] | None = None,
             source=source, by_hand=by_hand, fx=fx, name=name,
             source_text=source_text, clip=clip, sting=sting, note=note,
             checked=checked, remember_text=remember_text, round_as=round_as,
-            sid=sid, bound=bound, bound_part=bound_part)   # [#1237]
+            sid=sid, bound=bound, bound_part=bound_part,   # [#1237]
+            system3=system3)   # [s3-roads]
     finally:
         _floor_drop(_owned)
 
@@ -33616,6 +33700,7 @@ async def _dj_speak_floorless(kind: str, track: dict[str, Any] | None = None,
                    checked: bool = False, remember_text: str = "",
                    round_as: str = "", sid: str = "",
                    bound: dict[str, Any] | None = None,   # [#1237]
+                   system3: dict[str, Any] | None = None,  # [s3-roads] the line's node
                    bound_part: str = "") -> str:
     """Say it, log it to the chat channel so the panel can show the patter.
     `who` is "dj" or "cohost" — the co-host has his own voice so the two are
@@ -33642,7 +33727,7 @@ async def _dj_speak_floorless(kind: str, track: dict[str, Any] | None = None,
     # may only go out while that record is where the line says it is;
     # a live write is a model visit, and it is not spent on a record
     # that cannot carry the words by the time they exist.
-    if bound:
+    if bound and orch_policy("record_bound", True) is not False:   # [cut-switches]
         _bound_ok, _bound_why = record_bound_check(
             bound, bound_part, live=not bool(line))
         if not _bound_ok:
@@ -33853,6 +33938,7 @@ async def _dj_speak_floorless(kind: str, track: dict[str, Any] | None = None,
         to_box = False                  # #1156: route around a dead box
         _route_around_note(f"a {kind} line")
     line_id = uuid.uuid4().hex  # durable cadence receipts must not recycle 24-bit IDs
+    _s3_line_remember(line_id, system3)                      # [s3-roads]
     page_delivery = ""
     _sfx_stream: dict[str, Any] = {}
     # A person outranks the show. The box is one speaker and an announce cuts
@@ -34054,7 +34140,7 @@ async def _dj_speak_floorless(kind: str, track: dict[str, Any] | None = None,
     # moved on; measured, that is how half the introductions came to be
     # spoken over the wrong record. A refusal here is the whole cure for
     # the photograph; the words are filed for the record's next play.
-    if bound:
+    if bound and orch_policy("record_bound", True) is not False:   # [cut-switches]
         _bound_ok, _bound_why = record_bound_check(
             bound, bound_part, float((clip or {}).get("seconds") or 0))
         if not _bound_ok:
@@ -35892,6 +35978,7 @@ def dj_state() -> dict[str, Any]:
 # by hand — so a banter round, a call or a bulletin mid-flight yields between
 # turns instead of playing out all nine lines first.
 _TALK_CUT = [0]
+_TALK_CUT_OP = [0.0]   # [cut-switches] when the operator last asked for a cut
 
 # The talk for the record currently turning (#689). Held so an overrun
 # can be seen — one round at a time — and cancelled when the show stops.
@@ -36263,7 +36350,7 @@ def record_bound_cut(track: Any, why: str) -> int:
     how many clips were cut."""
     tid = (str((track or {}).get("id") or "")
            if isinstance(track, dict) else "")
-    if not tid:
+    if not tid or orch_policy("record_bound", True) is False:   # [cut-switches]
         return 0
     try:
         ids = record_binding.cut_ids(_RECORD_BOUND_LINES, tid, time.time())
@@ -36583,6 +36670,7 @@ async def _record_talk_body(track: dict[str, Any], dj: dict[str, Any],
                            # "" off.  (RECTALK1179Z9)
                            sid=record_talk_ride(track, "intro",
                                                 _ahead_intro),
+                           system3=_ahead_intro.get("system3"),   # [s3-roads]
                            bound=record_bound_snapshot(track),   # [#1237]
                            bound_part="intro")
         except Exception:  # noqa: BLE001
@@ -36642,6 +36730,7 @@ async def _record_talk_body(track: dict[str, Any], dj: dict[str, Any],
                                # (RECTALK1179Z9)
                                sid=record_talk_ride(_gone, "outro",
                                                     _back),
+                               system3=_back.get("system3"),   # [s3-roads]
                                bound=record_bound_snapshot(_gone),   # [#1237]
                                bound_part="outro")
                 await asyncio.sleep(0.8)
@@ -40625,7 +40714,9 @@ async def larder_prepare(entry: dict[str, Any],
             fx = dict(voice_effect_pick())
             if vec_for := performance_vector(                  # [#1232]
                     who, voice,
-                    state=weather_state_for(entry.get("weather"), who)):
+                    state=((globals()["system3_perf_state"](entry, None, text, who)
+                            if globals().get("system3_perf_state") else None)
+                           or weather_state_for(entry.get("weather"), who))):
                 fx["perf"] = vec_for
             strip = str(dj.get(f"strip_{who}") or "")
             if strip:
@@ -41420,7 +41511,17 @@ async def prep_station_id() -> bool:
     if not drop_voice:
         return False                    # the drop guy does not exist here
     station = str(dj.get("station_name") or "")
-    line = await drop_liner(station)
+    # [s3-roads] the ID is System 3's: its node rolls how it is said and
+    # draws the liner off the stack with its own number; the shelf row
+    # carries the stamp to the air.
+    _s3l = None
+    if globals().get("system3_direct_line"):
+        try:
+            _s3l = await globals()["system3_direct_line"](
+                road="station_id", who="drop", dj=dj, context=station, bank=True)
+        except Exception:  # noqa: BLE001
+            _s3l = None
+    line = await drop_liner(station, director=_s3l if (_s3l is not None and _s3l.active) else None)
     if not line:
         return False
     # The same read FOR the station the live road builds (#462).
@@ -41429,7 +41530,10 @@ async def prep_station_id() -> bool:
     text = prep_air_text(line, "station_id")
     if not text:
         return False
-    _row = {"text": text, "voice": drop_voice, "seconds": 0.0}
+    if _s3l is not None and globals().get("system3_bind_line"):   # [s3-roads]
+        globals()["system3_bind_line"](_s3l, text)
+    _row = {"text": text, "voice": drop_voice, "seconds": 0.0,
+            **({"system3": dict(_s3l.stamp)} if _s3l is not None else {})}
     if not await ensure_shelf_row_tinted("station_id", _row,
                                          critical=True):
         shelf_put("station_id", _row)
@@ -42818,24 +42922,46 @@ async def track_talk_write(track: dict[str, Any], part: str) -> str:
                    "inside your observation about the record - the "
                    "record is still the subject, its title or artist is "
                    "still named, and you never explain the story.")
+    # [s3-roads] the link is System 3's: one leg, the feeling rolled, the
+    # running-order clause in the prompt, the words bound to the node.
+    _s3l = None
+    if globals().get("system3_direct_line"):
+        try:
+            _s3l = await globals()["system3_direct_line"](
+                road="track_talk", who="dj" if part == "intro" else "cohost",
+                dj=dj_settings(), context=identity + " (" + str(part) + ")", bank=True)
+        except Exception:  # noqa: BLE001
+            _s3l = None
+    if _s3l is not None and _s3l.active and _s3l.sheet:
+        prompt += _s3l.sheet
     answer = ""
     try:
         answer = prep_air_text(await ask_model(prompt, limit=620, spice=0.15),
                                "intro" if part == "intro" else "interject")
     except Exception:  # noqa: BLE001
         answer = ""
+
+    def _s3_bound(_text: str) -> str:
+        # [s3-glass] the words the road RETURNS are the ones bound to the
+        # node - the fallback link included - never the raw answer alone
+        if _s3l is not None:
+            if globals().get("system3_bind_line"):
+                globals()["system3_bind_line"](_s3l, _text)
+            if isinstance(track, dict):
+                track["_s3_line_" + str(part)] = dict(_s3l.stamp)
+        return _text
     if track_talk_text_report(answer, track, part).get("ok"):
-        return answer
+        return _s3_bound(answer)
     # A deterministic, exact fallback stops one badly behaved model response
     # from turning the paused room into an infinite reject/rewrite loop. It is
     # still passed through the active tint below and remains track-specific.
     if part == "intro":
-        return (f"{identity} is coming into focus now. Listen for the shape "
-                "of the arrangement as it opens, and let the record take the "
-                "room from here.")
-    return (f"That was {identity}, holding its character all the way through. "
-            "Keep that last turn in mind while the station moves cleanly into "
-            "what comes next.")
+        return _s3_bound(f"{identity} is coming into focus now. Listen for the shape "
+                         "of the arrangement as it opens, and let the record take the "
+                         "room from here.")
+    return _s3_bound(f"That was {identity}, holding its character all the way through. "
+                     "Keep that last turn in mind while the station moves cleanly into "
+                     "what comes next.")
 
 
 async def track_talk_tint_repair(source: str, track: dict[str, Any],
@@ -42947,6 +43073,8 @@ async def prep_track_talk(wanted_track_id: str = "") -> bool:
             # WITH the track. Unlike a banked round it may name this record,
             # and unlike dj_line it receives no live schedule/Speakerbox debt.
             text = await track_talk_write(track, part)
+            if isinstance(track.get("_s3_line_" + str(part)), dict):   # [s3-roads]
+                side["system3"] = track.pop("_s3_line_" + str(part))
         if len(text) < 20:
             short_report = track_talk_text_report(text, track, part)
             if not (text and short_report.get("ok")):
@@ -48295,6 +48423,39 @@ def orch_apply(does: str, alone: bool = False) -> str:
             said = ("a segment gives up the floor at its next turn when "
                     "the entry due has something ready" if _want else
                     "a segment keeps the floor until it is finished")
+        elif verb == "cut":
+            # [cut-switches] 2026-09-27: "We shouldn't be cutting any
+            # lines." The talk-cut and the turn cap end a round mid-flight.
+            _want = str(arg or "on") != "off"
+            _ORCH["policy"]["talk_cut"] = {"value": bool(_want), "at": time.time()}
+            said = ("a round may be cut at a turn boundary when something urgent takes "
+                    "the floor, and at the turn cap" if _want else
+                    "no round is cut mid-flight - every written turn is spoken")
+        elif verb == "withdraw":
+            # [cut-switches] a finished round that no longer fits its entry.
+            _want = str(arg or "on") != "off"
+            _ORCH["policy"]["overrun_withdraw"] = {"value": bool(_want), "at": time.time()}
+            said = ("a finished round that no longer fits its entry is withdrawn at "
+                    "hand-over" if _want else
+                    "a finished round airs even when it runs past its entry - the "
+                    "sheet waits for it")
+        elif verb == "bound":
+            # [cut-switches] #1237: a line about a record whose record moved on.
+            _want = str(arg or "on") != "off"
+            _ORCH["policy"]["record_bound"] = {"value": bool(_want), "at": time.time()}
+            said = ("a line about a record is withdrawn when its record has moved on"
+                    if _want else
+                    "a line about a record airs even when its record has moved on")
+        elif verb == "topics":
+            # [rng-topics] 2026-09-27: "Topic should be accessed via the RNG
+            # system on the roulette rolodex". rng: the board comes up only
+            # through System 3's TOPIC roll; auto: every road as it was.
+            _want = str(arg or "rng") != "auto"
+            _ORCH["policy"]["topics_by_rng"] = {"value": bool(_want), "at": time.time()}
+            said = ("the topics board comes up only when System 3's roulette draws it - "
+                    "nothing springs a topic by itself" if _want else
+                    "the station springs topics by itself again (banter, callers, the "
+                    "manager's memo, the SFX Guy)")
         elif verb == "thin":
             _ORCH["policy"]["thin_road"] = {
                 "value": str(arg), "at": time.time()}
@@ -56375,6 +56536,7 @@ async def _torrent_talk() -> None:
             # only; with nothing chosen the show runs exactly as before.
             _chosen = switchboard_take()
             _RADIO["switch_angle"] = ""
+            _RADIO["switch_exchange"] = {}   # [topic-exchange]
             # #843: the schedule's instruction is drawn fresh for each
             # round and belongs to that round only — cleared here so an
             # operator override, or the schedule going off mid-hour,
@@ -56400,6 +56562,7 @@ async def _torrent_talk() -> None:
                              str(_chosen.get("kind") or ""),
                              {}).get("round") or ""))
                 _RADIO["switch_angle"] = str(_chosen.get("premise") or "")
+                _RADIO["switch_exchange"] = dict(_chosen.get("exchange") or {})   # [topic-exchange]
                 if _want == "track":
                     # "drop the needle" is not a round — it is the end of
                     # one. Cut the talk and let the record have the air.
@@ -56425,6 +56588,7 @@ async def _torrent_talk() -> None:
                     # nothing else, so the rant road (say) still fetches its
                     # own bombshell exactly as the schedule would have.
                     _RADIO["switch_angle"] = ""
+                    _RADIO["switch_exchange"] = {}   # [topic-exchange]
                     _RADIO["interject_prompt"] = {
                         "at": time.time(),
                         "text": str(_inter.get("clause") or "")}
@@ -56830,14 +56994,19 @@ async def _torrent_talk() -> None:
                     # #884: an operator-chosen rant carries its own
                     # premise; otherwise the station picks its own.
                     angle = str(_RADIO.get("switch_angle") or "")
+                    _exch = dict(_RADIO.get("switch_exchange") or {}) if angle else {}   # [topic-exchange]
                     if not angle:
                         shell = drop_bombshell()
+                        _sreply = " ".join(str((shell or {}).get("reply") or "").split())
                         angle = (bombshell_angle(shell["text"],
-                                                 shell.get("shape") or "")
+                                                 shell.get("shape") or "", _sreply)
                                  if shell and shell.get("text") else "")
+                        if _sreply and shell and shell.get("text"):
+                            _exch = {"opener": shell["text"], "reply": _sreply}
                     aired = bool(await dj_banter(
                         track, angle=angle or None,
-                        render_stream=bool(dj.get("stream_show", True))))
+                        render_stream=bool(dj.get("stream_show", True)),
+                        exchange=_exch or None))
                 else:
                     _served_kind = "banter"
                     _fallback_cover = kind not in ("banter", "record", "track_talk")
@@ -57647,7 +57816,10 @@ async def manager_break_in() -> str:
         try:
             said_line = await dj_speak(
                 "interject", _RADIO.get("now"),
-                line=random.choice(MANAGER_BREAK_LINES),
+                line=(_mb := await _s3_stock_line(
+                    "interject", MANAGER_BREAK_LINES, "dj",
+                    source="MANAGER_BREAK_LINES"))[0],   # [s3-roads]
+                system3=_mb[1],
                 who="dj", round_as="manager", sting=False)
         except Exception:  # noqa: BLE001
             said_line = ""      # the memo still goes out, just unannounced
@@ -63002,7 +63174,7 @@ async def dj_recap_round(track: dict[str, Any] | None = None) -> list[str]:
     async def _write_recap(_lesson: str) -> list[str]:
         brief_lesson_set(_lesson)
         try:
-            return await dj_banter(track, angle=angle, lines=6,
+            return await dj_banter(track, road="recap", angle=angle, lines=6,
                                    render_stream=bool(
                                        dj_settings().get("stream_show", True)),
                                    own_material=True)    # the hour's log is the material
@@ -69367,7 +69539,7 @@ async def dj_service_ad() -> list[str]:
     stats = spoken_units("; ".join(facts) if facts
                          else "its numbers are a trade secret tonight")
     _spot_at = time.time()                                        # #892
-    _spot = await dj_banter(None, lines=4, angle=(
+    _spot = await dj_banter(None, road="ad", lines=4, angle=(
         f"A SPONSOR SPOT for tonight's sponsor: {name.upper()}, one of "
         "the actual services running on the DGX Spark this station lives "
         "on. The TWO of you sell it TOGETHER, trading it back and forth — "
@@ -69393,7 +69565,7 @@ async def dj_engineering_ad() -> list[str]:
     machine itself were the sponsor."""
     stats = spoken_units(await asyncio.to_thread(system_stats))
     _spot_at = time.time()                                        # #892
-    _spot = await dj_banter(None, lines=4, angle=(
+    _spot = await dj_banter(None, road="ad", lines=4, angle=(
         "The STATION ENGINEERING REPORT as a sponsor spot — the sponsor is "
         "the DGX Spark, the machine this very station runs on. The TWO of "
         "you deliver it TOGETHER, trading it back and forth: one reads a "
@@ -70140,6 +70312,18 @@ async def dj_upstairs_write() -> dict[str, Any]:
         # which road wrote him. Upstairs has fallen into it like the rest
         # of the town.
         + crystal_tint_note())
+    # [s3-roads] the page is System 3's: one leg in his voice, the feeling
+    # rolled and written into the prompt; the words bound to the node.
+    _s3l = None
+    if globals().get("system3_direct_line"):
+        try:
+            _s3l = await globals()["system3_direct_line"](
+                road="upstairs", who="manager", seat="C", dj=dj_settings(),
+                name=manager_call_name(), context=gripe)
+        except Exception:  # noqa: BLE001
+            _s3l = None
+    if _s3l is not None and _s3l.active and _s3l.sheet:
+        prompt += _s3l.sheet
     try:
         text = spoken_text(await ask_model(prompt, limit=700))
     except Exception:
@@ -70150,6 +70334,14 @@ async def dj_upstairs_write() -> dict[str, Any]:
     # sentence by sentence.
     text = await crystal_line(text, "the manager's own voice", 5)
     row = upstairs_save(text, gripe, context)
+    if _s3l is not None and isinstance(row, dict) and row.get("id"):   # [s3-roads]
+        if globals().get("system3_bind_line"):
+            globals()["system3_bind_line"](_s3l, text)
+        try:
+            upstairs_update(str(row.get("id") or ""), system3=dict(_s3l.stamp))
+            row["system3"] = dict(_s3l.stamp)
+        except Exception:  # noqa: BLE001
+            pass
     if seed:
         speakbox_remember(seed)
     return row
@@ -70282,6 +70474,8 @@ async def dj_upstairs_page(row: dict[str, Any] | None = None) -> bool:
         "voice": str(made.get("voice") or ""),
         "media": name, "sig": sig, "page_audio": name,
         "page_id": str(made.get("id") or ""),
+        **({"system3": dict(made["system3"])}                 # [s3-roads]
+           if isinstance(made.get("system3"), dict) else {}),
         "aired": "box" if box_accepted else "published",
     }
     if delivery_id:
@@ -70300,7 +70494,7 @@ async def dj_upstairs_page(row: dict[str, Any] | None = None) -> bool:
     if delivery_id:
         await _paged_settle(air_at + seconds)
     try:
-        await dj_banter(_RADIO.get("now"), lines=4, angle=(
+        await dj_banter(_RADIO.get("now"), road="manager", lines=4, angle=(
             "You have both just been made to listen to a page from the "
             "MANAGER UPSTAIRS over the studio intercom. What he said, word "
             f"for word, was: \"{spoken[:900]}\" "
@@ -71115,7 +71309,7 @@ async def dj_ad_break(zero_work_only: bool = False, on_handoff: Any = None) -> s
     if not zero_work_only:
         _RADIO["last_ad"] = time.time()    # live roads still share this clock
     dj = dj_settings()
-    stored = ad_pick()
+    stored = await _s3_ad_pick()                              # [s3-roads]
 
     async def handoff_produced(entry: dict[str, Any], shelf_row: Any = None) -> str:
         committed = False
@@ -71407,6 +71601,8 @@ async def _air_produced_ad(entry: dict[str, Any], on_handoff: Any = None) -> boo
         air_at=_air_at)
     # Bind the real booth ID before publishing. A fast page receipt must not
     # credit a temporary label identity and then credit the row again later.
+    if isinstance(entry.get("system3"), dict):               # [s3-roads]
+        booth_row["system3"] = dict(entry["system3"])
     page_delivery = ""
     box_played = False
     box_dispatched = False
@@ -72608,7 +72804,7 @@ async def dj_gallery_round(bank_to: list[dict[str, Any]] | None = None,
            if seed else ""))
     angle += radio_prompt_instruction("gallery")
     began = time.time()
-    lines = await dj_banter(None, angle=angle, lines=12,
+    lines = await dj_banter(None, road="gallery", angle=angle, lines=12,
                             source=(seed or {}).get("file", ""),
                             bank=bank_to is not None, bank_to=bank_to,
                             own_material=True)           # the painting is the material
@@ -72733,7 +72929,7 @@ async def dj_reanalysis_round(name: str, desc: str) -> list[str]:
            if seed else ""))
     angle += radio_prompt_instruction("gallery")
     began = time.time()
-    lines = await dj_banter(None, angle=angle, lines=8,
+    lines = await dj_banter(None, road="gallery", angle=angle, lines=8,
                             source=(seed or {}).get("file", ""),
                             own_material=True)
     gallery_line_mark([name], began)
@@ -72894,7 +73090,7 @@ async def dj_hawk_round(names: list[str], moods: list[str],
         _buyer_voice = await caller_line_voice(_buyer)
     except Exception:  # noqa: BLE001
         _buyer, _buyer_voice = "", ""
-    lines = await dj_banter(None, angle=angle, lines=12,
+    lines = await dj_banter(None, road="gallery", angle=angle, lines=12,
                             source=(seed or {}).get("file", ""),
                             caller_name=_buyer,
                             caller_voice=_buyer_voice,
@@ -73364,7 +73560,7 @@ def _recent_save() -> None:
         pass                          # a cache that will not write is a cache
 
 
-def unrepeated(pool: list[str], key: str, keep: int = 8) -> str:
+def unrepeated(pool: list[str], key: str, keep: int = 8, director: Any = None) -> str:
     """Draw from a pool without landing on what has just been used.
 
     Plain random.choice on eight angles repeats one inside three rounds often
@@ -73382,7 +73578,14 @@ def unrepeated(pool: list[str], key: str, keep: int = 8) -> str:
     keep = min(keep, max(0, len(pool) - 2))
     _recent_load()                                            # #1225
     recent = _RADIO.setdefault("recent", {}).setdefault(key, [])
-    pick = random.choice([p for p in pool if p not in recent] or pool)
+    # [s3-roads] a road that hands its System 3 line handle in gets the
+    # draw made with its recorded number; the ring is kept the same way.
+    _cands = [p for p in pool if p not in recent] or pool
+    if director is not None and hasattr(director, "pick"):
+        _at = director.pick(key, _cands)
+        pick = _cands[_at if 0 <= _at < len(_cands) else 0]
+    else:
+        pick = random.choice(_cands)
     recent.append(pick)
     if keep:
         del recent[:-keep]
@@ -77236,7 +77439,7 @@ def _sfxguy_row(row: Any) -> dict[str, Any]:
     return {"text": str(row or ""), "about": "", "at": 0.0}
 
 
-def _sfxguy_take(context: str = "") -> str:
+def _sfxguy_take(context: str = "", director: Any = None) -> str:
     """One line off the pool, PREFERRING the one written for this very
     line. Falls back to the random pop, so a pool with no reaction in
     it behaves exactly as it always has."""
@@ -77249,7 +77452,10 @@ def _sfxguy_take(context: str = "") -> str:
                    or "") == want:
                 return str(_sfxguy_row(
                     _SFXGUY_WARPED.pop(at)).get("text") or "")
-    at = random.randrange(len(_SFXGUY_WARPED))
+    # [s3-roads] System 3's number when the round is its own
+    at = (director.pick("reaction", [str(_sfxguy_row(r).get("text") or "") for r in _SFXGUY_WARPED])
+          if director is not None else random.randrange(len(_SFXGUY_WARPED)))
+    at = at if 0 <= at < len(_SFXGUY_WARPED) else 0
     return str(_sfxguy_row(_SFXGUY_WARPED.pop(at)).get("text") or "")
 _SFXGUY_FILLING = [False]
 
@@ -77376,6 +77582,45 @@ async def _sfxguy_tint_source(row: dict[str, Any], voice: str, profile: str) -> 
         _SFX_RESERVE_WRITING.reset(token)
 
 
+SFXGUY_TOPIC_REST_WHY = ("a line off the topics board - the board comes up through System 3's "
+                         "roulette now (topics:rng)")
+
+
+def _sfxguy_topics_rest(voice: str, profile: str, rest: bool = True) -> int:
+    """[rng-topics] Suspend the lines his bank took off the topics board
+    (#1233) - or, with `topics:auto`, put back the ones this suspended.
+    eligible() only offers `ready` rows, so a suspended line is never
+    picked for a hole or a cadence slot; the recording stays on disk."""
+    try:
+        board = {" ".join(str(r.get("text") or "").split())
+                 for r in (read_bombshells() or []) if isinstance(r, dict)}
+        board.discard("")
+        # [rng-topics] ONE save for all of them (SfxSpeechBank.restate): put()
+        # rewrites the whole ledger per row, and that was a 14 s stall.
+        mine = lambda row: row.get("voice") == voice and row.get("profile") == profile
+        if rest:
+            def _rest(row):
+                row.update(state="suspended", why=SFXGUY_TOPIC_REST_WHY,
+                           rested_from=str(row.get("state") or ""))
+            moved = _SFX_READY_BANK.restate(
+                lambda row: (mine(row) and row.get("state") != "suspended"
+                             and " ".join(str(row.get("text_plain") or "").split()) in board),
+                _rest)
+        else:
+            def _back(row):
+                row.update(state=str(row.pop("rested_from", "") or "waiting"), why="")
+            moved = _SFX_READY_BANK.restate(
+                lambda row: mine(row) and row.get("why") == SFXGUY_TOPIC_REST_WHY, _back)
+        if moved:
+            pipeline_log("sfxguy", ("%d line(s) off the topics board suspended in his bank - "
+                                    "topics come up through System 3's roulette" if rest else
+                                    "%d topics-board line(s) back in his bank (topics:auto)")
+                         % moved)
+        return moved
+    except Exception:  # noqa: BLE001
+        return 0
+
+
 async def sfxguy_ready_prepare(limit: int = 1) -> dict[str, Any]:
     """One bounded background job: retain paid-for tint before seeking TTS."""
     if _SFX_READY_LOCK.locked():
@@ -77398,8 +77643,16 @@ async def sfxguy_ready_prepare(limit: int = 1) -> dict[str, Any]:
         # generic=True on purpose: pick() only serves a generic row when
         # there is no line to answer, and a topic blurted into dead air
         # is not an answer to anything.
-        sources += [{"text": text, "generic": True}
-                    for text in sfx_topic_sources(SFXGUY_TOPIC_SEED)]
+        # [rng-topics] ...but not while the board comes up through System
+        # 3's roulette: "the SFX Guy randomly appears to be saying lines
+        # randomly and constantly from Topics. That is no longer needed to
+        # be automatic." The lines already recorded are rested, not deleted.
+        if orch_policy("topics_by_rng", True) is False:
+            sources += [{"text": text, "generic": True}
+                        for text in sfx_topic_sources(SFXGUY_TOPIC_SEED)]
+            await asyncio.to_thread(_sfxguy_topics_rest, voice, profile, False)   # off the loop
+        else:
+            await asyncio.to_thread(_sfxguy_topics_rest, voice, profile, True)    # off the loop
         _SFX_READY_BANK.seed(voice, profile, sources)
         for row in _SFX_READY_BANK.due(voice, profile):
             if _sfxguy_ready_valid(row, voice):
@@ -77706,7 +77959,7 @@ async def _sfxguy_warp_fill(voice: str, context: str = "") -> None:
         _SFXGUY_FILLING[0] = False
 
 
-def sfxguy_line(voice: str, context: str = "") -> str:
+def sfxguy_line(voice: str, context: str = "", director: Any = None) -> str:
     """#798/#799: what comes out of his mouth — at the invention dial's
     rate a warped never-before-said line off the shed, otherwise a shelf
     saying that has not aired inside the hour. #804: sometimes he breaks
@@ -77721,8 +77974,13 @@ def sfxguy_line(voice: str, context: str = "") -> str:
         _wstr = max(int(c.get("strength") or 50) for c in _wcrs)
         warp = max(warp, min(95, _wstr))
     line = ""
-    if (_SFXGUY_NEWS and random.random() < 0.15
-            and time.time() - _SFXGUY_NEWS_AT[0] > 600):
+    # [s3-roads] `director` is System 3's chooser for this line: the plan's
+    # kind order and its own recorded numbers stand in for the three
+    # random() calls here; None is the dial's own random, as ever.
+    _kind = "quip"
+    _news_ok = bool(_SFXGUY_NEWS) and time.time() - _SFXGUY_NEWS_AT[0] > 600
+    if (director.takes("news", _news_ok) if director is not None
+            else (_news_ok and random.random() < 0.15)):
         story = _SFXGUY_NEWS.pop(0)
         _SFXGUY_NEWS_AT[0] = time.time()
         _RADIO["sfxguy_news"] = {**story, "at": time.time()}
@@ -77730,25 +77988,35 @@ def sfxguy_line(voice: str, context: str = "") -> str:
         pipeline_log("air", "the SFX guy breaks a story: "
                      f"{story['title'][:70]} (#804)")
         fire_and_forget(_sfxguy_news_fill())
+        if director is not None:
+            director.done(story["line"], "news")
         return story["line"]
-    if _SFXGUY_WARPED and random.random() < warp / 100.0:
+    if (director.takes("reaction", bool(_SFXGUY_WARPED)) if director is not None
+            else (_SFXGUY_WARPED and random.random() < warp / 100.0)):
         # [#1386] his reaction finally lands on the line it was written
         # for, when there is one for this line.
-        line = _sfxguy_take(context)
+        line = _sfxguy_take(context, director)
+        _kind = "reaction"
     else:
         rows = sfxguy_quips(voice)
         said = _sfxguy_said()
         now = time.time()
         pool = [r for r in rows
                 if now - float(said.get(_sfxguy_key(r)) or 0) > 3600]
-        line = (random.choice(pool) if pool else
-                min(rows, key=lambda r:
-                    float(said.get(_sfxguy_key(r)) or 0)))
+        if pool and director is not None:
+            _qi = director.pick("quip", pool)
+            line = pool[_qi if 0 <= _qi < len(pool) else 0]
+        else:
+            line = (random.choice(pool) if pool else
+                    min(rows, key=lambda r:
+                        float(said.get(_sfxguy_key(r)) or 0)))
     _sfxguy_stamp(line)
     if len(_SFXGUY_WARPED) < 8:
         fire_and_forget(_sfxguy_warp_fill(voice, context))
     if not _SFXGUY_NEWS:
         fire_and_forget(_sfxguy_news_fill())
+    if director is not None:
+        director.done(line, _kind)
     return line
 
 
@@ -80538,7 +80806,7 @@ async def drop_liner_brew(want: int = 6) -> None:
             pass
 
 
-async def drop_liner(station: str) -> str:
+async def drop_liner(station: str, director: Any = None) -> str:
     """One station ID, and never the one just heard.
 
     A written line if the stack has one — consumed on use, so it is
@@ -80557,7 +80825,7 @@ async def drop_liner(station: str) -> str:
     _cool = [ln for ln in pool if not air_repeat_check(ln).get("block")]
     pool = _cool or pool
     if pool:
-        line = unrepeated(pool, "drop_liner", keep=10)
+        line = unrepeated(pool, "drop_liner", keep=10, director=director)   # [s3-roads]
         try:
             _DROP_FRESH.remove(line)
         except ValueError:
@@ -80565,7 +80833,7 @@ async def drop_liner(station: str) -> str:
         return line
     naming = [ln for ln in DROP_LINES if "{station}" in ln] or list(DROP_LINES)
     _plain = unrepeated([ln.format(station=station) for ln in naming],
-                        "drop_fallback", keep=3)
+                        "drop_fallback", keep=3, director=director)   # [s3-roads]
     # #1111: AND THE FALLBACK GETS THE CRYSTAL, WITH THE NAME HELD.
     #
     # An audit found all twenty-three liners in the cupboard were four
@@ -81213,7 +81481,11 @@ async def _sfx_cadence_additions_inner(who: str, text: str, completed: int,
         # Keep optional punctuation out of a long hardware announce's tail.
         return total <= max(150.0, float(seconds))
 
-    if sfx_due_after(completed, int(settings.get("sfx_every_units") or 0)):
+    _s3_sfx = (globals()["system3_sfx_direction"](meta, who, text)
+               if globals().get("system3_sfx_direction") else None)
+    _s3_query = " ".join(x for x in (text, (_s3_sfx or {}).get("query") or "") if x)
+    _cadence_due = sfx_due_after(completed, int(settings.get("sfx_every_units") or 0))
+    if _cadence_due or (_s3_sfx or {}).get("extra"):
         _SFX_CADENCE_STATUS["sample_due"] += 1
         # Endless-video mode owns the SFX lane when active. Otherwise the
         # normal cadence may use indexed MP4 soundtracks in the welded round;
@@ -81265,7 +81537,7 @@ async def _sfx_cadence_additions_inner(who: str, text: str, completed: int,
             video_order = (requested_video, not requested_video)
             for want_video in video_order:
                 if want_video:
-                    got = await asyncio.to_thread(_sfx_cadence_video_pick, text)
+                    got = await asyncio.to_thread(_sfx_cadence_video_pick, _s3_query)
                     if got:
                         _drew += 1
                         candidate, candidate_audio, secs, candidate_why = got
@@ -81274,7 +81546,7 @@ async def _sfx_cadence_additions_inner(who: str, text: str, completed: int,
                         break
                     continue
                 if ready_takes is None and sfx_match_on(False):
-                    matched = await asyncio.to_thread(sfx_match_sting_pick, text, False)
+                    matched = await asyncio.to_thread(sfx_match_sting_pick, _s3_query, False)
                     if matched:
                         candidate = Path(matched[0])
                         secs = await asyncio.to_thread(sfx_seconds, candidate)
@@ -81308,7 +81580,9 @@ async def _sfx_cadence_additions_inner(who: str, text: str, completed: int,
                 other = "dj" if who == "cohost" else "cohost"
                 voice = configured_radio_voice(other)
                 if voice:
-                    phrase = random.choice(COMPLAINT_LINES)
+                    phrase, _s3_c = await _s3_stock_line(      # [s3-roads]
+                        "interject", COMPLAINT_LINES, other,
+                        context=sample.stem, source="COMPLAINT_LINES")
                     take = await voice_render_any(phrase, voice, who=other)
                     if take and take.get("path"):
                         length = await _clip_seconds_async(take["path"])
@@ -81316,7 +81590,8 @@ async def _sfx_cadence_additions_inner(who: str, text: str, completed: int,
                             additions.append({
                                 "path": str(VOICE_MEDIA_DIR / str(take["path"]).rsplit("/", 1)[-1]),
                                 "who": other, "text": phrase, "voice": voice,
-                                "seconds": length, "sfx_reaction_for": sfx_id(sample)})
+                                "seconds": length, "sfx_reaction_for": sfx_id(sample),
+                                **({"system3": _s3_c} if _s3_c else {})})   # [s3-roads]
         else:
             _SFX_CADENCE_STATUS["sample_omitted"] += 1
             _SFX_CADENCE_STATUS["omit_why"] = (
@@ -81325,19 +81600,32 @@ async def _sfx_cadence_additions_inner(who: str, text: str, completed: int,
                 "nothing was drawn from the book")
     guy_interval = int(settings.get("sfxguy_every_units",
                                     DEFAULT_DJ["sfxguy_every_units"]) or 0)
+    # [s3-roads] his node on this turn (see speak_turns): System 3's number
+    # in place of the dial's random; a banked round's takes keep their floor.
+    _s3_guy = (globals()["system3_sfxguy_direction"](meta, who, text)
+               if globals().get("system3_sfxguy_direction") and settings.get("drop_voice") else None)
     if (sfx_due_after(completed, guy_interval) and settings.get("drop_voice")
             and (ready_takes is not None
-                 or random.random() < float(settings.get("sfxguy_rate") or 0) / 100.0)):
+                 or (bool(_s3_guy.get("speak")) if _s3_guy is not None
+                     else random.random() < float(settings.get("sfxguy_rate") or 0) / 100.0))):
         _SFX_CADENCE_STATUS["guy_due"] += 1
         take = sfxguy_ready_pick(text, str(settings["drop_voice"]))
         if take:
             additions.append({"path": str(VOICE_MEDIA_DIR / str(take["clip"]["path"]).rsplit("/", 1)[-1]),
                               "who": "drop", "text": take["text"], "voice": take["voice"],
                               "seconds": float(take["seconds"]), "sfxguy_reservation": take["id"]})
+            if _s3_guy is not None and globals().get("system3_sfxguy_spoke"):
+                globals()["system3_sfxguy_spoke"](
+                    _s3_guy, take["text"], "bank",
+                    how="the speech bank's own context matcher chose the take; "
+                        "System 3 rolled whether he speaks")
         else:
             if take:
                 sfxguy_ready_release(take["id"])
             _SFX_CADENCE_STATUS["guy_omitted"] += 1
+    if _s3_sfx and globals().get("system3_sfx_observe"):
+        globals()["system3_sfx_observe"](meta, _s3_sfx, _cadence_due, additions,
+                            dict(_SFX_MATCH_LAST))
     return additions
 
 
@@ -84253,7 +84541,8 @@ async def sfx_fill_gap(why: str = "", under_floor: bool = False,
             if _prep and str(_prep.get("text") or "").strip():
                 try:
                     out = await dj_speak("station_id", None, line=str(_prep["text"]),
-                                         who="drop", voice=drop_voice, name="The SFX Guy")
+                                         who="drop", voice=drop_voice, name="The SFX Guy",
+                                         system3=_prep.get("system3"))   # [s3-roads]
                     went = "liner" if out else ""
                 except Exception:  # noqa: BLE001
                     went = ""
@@ -84386,14 +84675,28 @@ async def dj_sting(to_box: bool, after: str = "", who: str = "",
             _prep_id = shelf_take("station_id", voice=drop_voice)
         except Exception:  # noqa: BLE001
             _prep_id = None
+        _s3_id = None
         if _prep_id and str(_prep_id.get("text") or ""):
             line = str(_prep_id["text"])
+            _s3_id = _prep_id.get("system3")
         else:
-            line = await drop_liner(station)
+            # [s3-roads] a live ID is System 3's node too
+            _s3l = None
+            if globals().get("system3_direct_line"):
+                try:
+                    _s3l = await globals()["system3_direct_line"](
+                        road="station_id", who="drop", dj=dj_settings(), context=station)
+                except Exception:  # noqa: BLE001
+                    _s3l = None
+            line = await drop_liner(station, director=_s3l if (_s3l is not None and _s3l.active) else None)
             if station and station.lower() not in line.lower():
                 line = f"{line} {station}."
+            if _s3l is not None:
+                if globals().get("system3_bind_line"):
+                    globals()["system3_bind_line"](_s3l, line)
+                _s3_id = dict(_s3l.stamp)
         try:
-            await dj_speak("station_id", None, line=line, who="drop",
+            await dj_speak("station_id", None, line=line, who="drop", system3=_s3_id,
                            voice=drop_voice, name="The SFX Guy")
         except Exception:
             pass
@@ -90781,8 +91084,19 @@ def topic_set_cycle() -> dict[str, Any]:
     pool = [n for n in names if n != now] or names
     return topic_sets_load(random.choice(pool))
 
+def split_exchange(text: str) -> tuple[str, str]:
+    """[topic-exchange] "1. This is my studio / 2. That's what you think" ->
+    (the line the round opens on, the answer to it). Anything else is a
+    plain topic with no answer."""
+    raw = str(text or "").strip()
+    m = re.match(r"^\s*1\s*[.)]\s*(.+?)\s*(?:\n|\s)\s*2\s*[.)]\s*(.+?)\s*$", raw, re.S)
+    if not m:
+        return raw, ""
+    return " ".join(m.group(1).split()), " ".join(m.group(2).split())
+
+
 def add_bombshell(text: str, kind: str = "topic", by: str = "operator",
-                  source: str = "") -> dict[str, Any]:
+                  source: str = "", reply: str = "") -> dict[str, Any]:
     """A line or a topic to drop on air."""
     with _BOMBSHELL_LOCK:
         rows = read_bombshells()
@@ -90801,6 +91115,8 @@ def add_bombshell(text: str, kind: str = "topic", by: str = "operator",
             # operator's unless it says otherwise.
             "by": str(by or "operator")[:16],
             **({"source": str(source)[:120]} if source else {}),
+            # [topic-exchange] the answer to it, word for word
+            **({"reply": " ".join(str(reply).split())[:400]} if str(reply or "").strip() else {}),
         }
         rows.insert(0, row)
         return row if write_bombshells(rows) else {}
@@ -90907,12 +91223,27 @@ BANTER_SWERVES: tuple[tuple[str, str], ...] = (
 TOPIC_STARTER_SHAPE = "conversation starter"     # #1244
 
 
-def bombshell_angle(text: str, shape: str = "") -> str:
+def bombshell_angle(text: str, shape: str = "", reply: str = "") -> str:
     """#1161: hand a topic to one of them, in one of twelve shapes.
 
     `shape` names a specific one; blank rolls. The roll is here rather
     than at the call site so every road that drops a topic gets the
     variety, including the ones written before this existed."""
+    if str(reply or "").strip():
+        # [topic-exchange] the operator wrote the opening exchange: A says
+        # the first line as written, B answers with the second as written,
+        # and the round grows out of that. No shape roll, no random raiser.
+        _open = " ".join(str(text).split())
+        _back = " ".join(str(reply).split())
+        return ("THE TOPIC, DROPPED INTO THIS ROUND: \"" + _open + "\"\n"
+                + "THE EXCHANGE THAT OPENS IT, WORD FOR WORD:\n"
+                + "A says: " + json.dumps(_open) + "\n"
+                + "B answers: " + json.dumps(_back) + "\n"
+                + "HOW IT GOES (" + TOPIC_STARTER_SHAPE + "): A opens the round with those exact "
+                  "words, B answers with those exact words, and the conversation comes out "
+                  "of that exchange.\n"
+                + "Never read this instruction out loud. Say both lines exactly as written - "
+                  "they are the operator's own.")
     first = random.choice(["A", "B"])
     other = "B" if first == "A" else "A"
     deck = dict(BANTER_SHAPES)
@@ -90990,12 +91321,14 @@ def queue_bombshell(row: dict[str, Any]) -> dict[str, Any]:
     if not topic_id or not text:
         return {}
     shape = bombshell_shape_for(row)
+    _reply = " ".join(str((row or {}).get("reply") or "").split())   # [topic-exchange]
     entry = {
         "id": uuid.uuid4().hex[:10],
         "kind": "rant",
         "round": "bombshell",
         "face": "the operator's scenario",
-        "premise": bombshell_angle(text, shape),
+        "premise": bombshell_angle(text, shape, _reply),
+        "exchange": ({"opener": text, "reply": _reply} if _reply else {}),
         "topic_id": topic_id,
         "topic_shape": shape,
         "at": time.time(),
@@ -91151,6 +91484,13 @@ async def topic_cooker() -> None:
 
 def drop_bombshell() -> dict[str, Any]:
     """Pick one, favouring whatever has had the least air time."""
+    # [rng-topics] THE STATION NO LONGER PICKS ONE BY ITSELF. Every caller
+    # of this is automatic - seedless banter, the surplus coin flip, the
+    # manager's memo, a "bombshell" entry nobody queued - and "nothing
+    # should be automatically wedged into conversation". The board comes
+    # up through System 3's TOPIC roll; `topics:auto` restores this pick.
+    if orch_policy("topics_by_rng", True) is not False:
+        return {}
     rows = read_bombshells()
     if not rows:
         return {}
@@ -92061,7 +92401,7 @@ async def _news_once(hourly: bool = False,
                          [str(h.get("url") or "") for h in picks])
         airlog_round_hint("news", sticky=True)
     try:
-        _said = await dj_banter(_RADIO.get("now"), angle=angle,
+        _said = await dj_banter(_RADIO.get("now"), road="news", angle=angle,
                                 lines=7 if hourly else 6,
                                 bank=bank_to is not None, bank_to=bank_to,
                                 own_material=True,       # the wire is the material
@@ -93090,7 +93430,7 @@ async def dj_mixtape_intro(tape: dict[str, Any]) -> list[str]:
         (" Work these lines in WORD FOR WORD as your own while you gush, "
          f"never saying where they came from: \"{seed['text']}\"")
         if seed else "")
-    lines = await dj_banter(None, lines=4, also_name=tape["title"], angle=(
+    lines = await dj_banter(None, road="mixtape", lines=4, also_name=tape["title"], angle=(
         "a package has arrived in the station mail: a brand-new mixtape from "
         "the mysterious Ehm Eckx — the artist known as MX. You two are his "
         "biggest, most sincere fans and you make no secret of it. Tear it "
@@ -93143,7 +93483,7 @@ async def dj_mixtape_outro(tape: dict[str, Any] | None = None) -> list[str]:
          f"your own: \"{seed['text']}\"")
         if seed else "")
     crystal = await asyncio.to_thread(tape_crystal, tape)
-    lines = await dj_banter(None, lines=4, angle=(
+    lines = await dj_banter(None, road="mixtape", lines=4, angle=(
         "the MX tape has just finished. Come back on air glowing and talk "
         "about the MUSIC itself — the signatures and styles at work: the "
         "tempo feel, the chord movement, the instrumentation and production "
@@ -98001,7 +98341,7 @@ async def caller_topic() -> tuple[str, dict[str, Any]]:
             "defend it with vivid, specific detail, they have EVIDENCE, "
             "and they escalate when doubted. The pair dig for details, "
             "try to stay reasonable, and get dragged all the way in.", {})
-    if roll < 0.84:
+    if roll < 0.84 and orch_policy("topics_by_rng", True) is False:   # [rng-topics]
         # Your Topics list gets its own share of the phone (#395): any
         # planted topic, drawn from the WHOLE bank, rung in cold.
         planted = [r.get("text") for r in read_bombshells()
@@ -98019,7 +98359,8 @@ async def caller_topic() -> tuple[str, dict[str, Any]]:
             return ("The caller is ringing about this news story and has "
                     "strong feelings: "
                     f"\"{random.choice(headlines)['title']}\"", {})
-    pool = banter_pool(6) + [r["text"] for r in read_bombshells()[:4]]
+    pool = banter_pool(6) + ([] if orch_policy("topics_by_rng", True) is not False   # [rng-topics]
+                             else [r["text"] for r in read_bombshells()[:4]])
     topic = random.choice(pool) if pool else "the state of the station"
     return (f"The caller is ringing about: \"{topic}\"", {})
 
@@ -101703,13 +102044,28 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                     # makes every repeat free). Never during a call's
                     # caller turn — he heckles the hosts, not the guests.
                     _gq_rate = int(dj_settings().get("sfxguy_rate") or 0)
+                    # [s3-roads] HIS NODE ON THIS TURN. Under System 3 the
+                    # round's plan says whether he pipes up here and what
+                    # kind of line; the number is System 3's, recorded on
+                    # the turn. None (not a System 3 round, or one planned
+                    # before he had a node) is the dial's own random.
+                    _gq_s3 = None
+                    if (not _keep_mic and _gq_rate and dj_settings().get("drop_voice")
+                            and item["who"] in ("dj", "cohost", "third")
+                            and globals().get("system3_sfxguy_direction")):
+                        _gq_s3 = globals()["system3_sfxguy_direction"](
+                            ready_meta, item["who"], spoken_text(item["chunk"]))
                     if (not _keep_mic and _gq_rate
                             and dj_settings().get("drop_voice")
                             and item["who"] in ("dj", "cohost", "third")
-                            and random.random() < _gq_rate / 100.0):
+                            and (bool(_gq_s3.get("speak")) if _gq_s3 is not None
+                                 else random.random() < _gq_rate / 100.0)):
                         _gv = str(dj_settings()["drop_voice"])
                         _qraw = sfxguy_line(
-                            _gv, spoken_text(item["chunk"])[:200])
+                            _gv, spoken_text(item["chunk"])[:200],
+                            director=(globals()["system3_sfxguy_chooser"](_gq_s3)
+                                      if _gq_s3 is not None
+                                      and globals().get("system3_sfxguy_chooser") else None))
                         # #889: his mouth is a road to air like any other,
                         # and it was the one road that never passed the
                         # English door - it rendered whatever sfxguy_line
@@ -101970,6 +102326,48 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                         if _said[:60] in _body or _body[:60] in _said:
                             return str(_d.get("file") or "")
                     return ""
+                def _s3_row_of(_row_at: int) -> dict[str, Any]:
+                    # System 3 (docs/SYSTEM3_EVENT_SCHEMA.md): the
+                    # conversation this line belongs to and, for a spoken
+                    # turn, which of its turns - active or shadow.
+                    # [s3-roads] an addition with a node of its own (a
+                    # complaint line drawn by System 3) names that node.
+                    _own = ((_sfx_meta.get(_row_at) or {}).get("system3")
+                            if isinstance(_sfx_meta.get(_row_at), dict) else None)
+                    if isinstance(_own, dict) and _own.get("conversation_id"):
+                        return {"conversation_id": str(_own.get("conversation_id") or ""),
+                                "mode": str(_own.get("mode") or ""),
+                                "turn_id": str(_own.get("turn_id") or "")}
+                    _s3m = (ready_meta.get("system3")
+                            if isinstance(ready_meta, dict) else None)
+                    if not isinstance(_s3m, dict) or not _s3m.get("conversation_id"):
+                        return {}
+                    # [s3-link] BY ITS WORDS FIRST. The number below is the
+                    # spoken-row order, which a splice at air shifts; the words
+                    # are what the bind and the air share.
+                    _w_here = str(transcript[_row_at][0]) if _row_at < len(transcript) else ""
+                    _c_here = str(transcript[_row_at][1]) if _row_at < len(transcript) else ""
+                    _tid = ""
+                    if _w_here == "drop":
+                        # the SFX Guy's row: the host turn it followed
+                        for _back in range(_row_at - 1, -1, -1):
+                            if str(transcript[_back][0]) in ("dj", "cohost", "third", "host"):
+                                _tid = str(globals()["system3_turn_id_for"](ready_meta, str(transcript[_back][1]), str(transcript[_back][0]))
+                                           if globals().get("system3_turn_id_for") else "")
+                                break
+                        return {"conversation_id": str(_s3m.get("conversation_id") or ""),
+                                "mode": str(_s3m.get("mode") or ""), "turn_id": _tid, "sfxguy": True}
+                    if globals().get("system3_turn_id_for") and _c_here:
+                        try:
+                            _tid = str(globals()["system3_turn_id_for"](ready_meta, _c_here, _w_here) or "")
+                        except Exception:  # noqa: BLE001
+                            _tid = ""
+                    if not _tid:
+                        _t = (turn_ix[_row_at] if _row_at < len(turn_ix) else -1)
+                        _tid = str((_s3m.get("turns") or {}).get(str(_t)) or "")
+                    return {"conversation_id": str(_s3m.get("conversation_id") or ""),
+                            "mode": str(_s3m.get("mode") or ""),
+                            "turn_id": _tid}
                 _script_rows = [
                          {"line_id": (line_ids[_r] if _r < len(line_ids)
                                        else ""),
@@ -101995,6 +102393,7 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                           # and the result that it got and the intensity
                           # result of what each dice value equals."
                             **({"dice": _td_of(_r)} if _td_of(_r) else {}),
+                            **({"system3": _s3_row_of(_r)} if _s3_row_of(_r) else {}),
                            **({"scenario": copy.deepcopy(ready_meta["approach"])}
                               if isinstance(ready_meta.get("approach"), dict)
                               else {})}
@@ -102437,9 +102836,10 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                     # that is a caller cut off mid-sentence with no sign-off.
                     if (not played_any) and (ready_takes is not None or ready_meta.get("prep_kind")) and (
                             radio_paused() or not _RADIO.get("on")
-                            or not _scheduled_first_handoff_fits(
+                            or (not _scheduled_first_handoff_fits(
                                 ready_meta, ready_takes, _handoff_seconds,
                                 start_at=_pstart, exclude_key=_pl_key)
+                                and orch_policy("overrun_withdraw", True) is not False)   # [cut-switches]
                             or (callable(can_handoff) and not can_handoff())):
                         _burst_withdraw(_entries, _burst_refusal_why(
                             ready_meta, _handoff_seconds, _pstart,
@@ -102518,9 +102918,10 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                     if (not played_any and not page_delivery
                             and (ready_takes is not None or ready_meta.get("prep_kind"))
                             and (radio_paused() or not _RADIO.get("on")
-                                 or not _scheduled_first_handoff_fits(
+                                 or (not _scheduled_first_handoff_fits(
                                      ready_meta, ready_takes, _handoff_seconds,
                                      exclude_key=_pl_key)
+                                     and orch_policy("overrun_withdraw", True) is not False)   # [cut-switches]
                                   or (callable(can_handoff) and not can_handoff()))):
                         _burst_withdraw(_entries, _burst_refusal_why(
                             ready_meta, _handoff_seconds, None,
@@ -102755,11 +103156,14 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
     # #859: and so does a MESSAGE — a memo from upstairs is three lines with
     # a beginning, a point and an instruction, and losing the last two makes
     # the first one nonsense. The operator watched the boss get cut off.
-    can_cut = not bool(caller_name) and not whole
+    can_cut = (not bool(caller_name) and not whole
+               and (orch_policy("talk_cut", True) is not False
+                    or time.time() - _TALK_CUT_OP[0] < 90))   # [cut-switches]
     for at in order:
         item = playlist[at]
         if (not caller_name and not whole and content_turns_spoken >= limit
-                and not item.get("listening_response")):
+                and not item.get("listening_response")
+                and orch_policy("talk_cut", True) is not False):   # [cut-switches]
             break
         reached.add(at)
         if _TALK_CUT[0] != cut_at and can_cut:
@@ -102842,7 +103246,9 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
         # discarding the caller protection from the second turn onward, so
         # a talk-cut could strand a caller mid-arc on the per-turn road.
         can_cut = (bool(item["turn_end"]) and not caller_name and not whole
-                   and not item.get("continuation_response"))
+                   and not item.get("continuation_response")
+                   and (orch_policy("talk_cut", True) is not False
+                        or time.time() - _TALK_CUT_OP[0] < 90))   # [cut-switches]
     # Is the box actually the destination right now? (#712) Recomputed here
     # rather than reused: the coalesced path's `to_box` lives in a branch that
     # returns, so it is not in scope on this one.
@@ -103126,7 +103532,8 @@ def _banter_beat_plan(sheet: str, lines: int,
 
 async def _banter_beats(context: str, sheet: str, lines: int,
                         seats: list[str], seed_text: str = "",
-                        trace: list[dict[str, Any]] | None = None) -> str:
+                        trace: list[dict[str, Any]] | None = None,
+                        director: Any = None) -> str:
     """Write a banked exchange as responsive 3-4-turn calls.
 
     Each visit receives the final two completed turns verbatim. The generated
@@ -103185,6 +103592,15 @@ async def _banter_beats(context: str, sheet: str, lines: int,
             trace.append({"beat": len(trace) + 1, "from": cursor + 1,
                           "until": len(plan), "stopped": prep_should_stop()})
             break
+        if director is not None and made:
+            # System 3 Mode B: what was written is observed and the rest
+            # of the running order is decided again from there.
+            try:
+                _fresh = await director(made, cursor, plan[cursor:])
+                if _fresh:
+                    plan[cursor:] = _fresh
+            except Exception:  # noqa: BLE001
+                pass
         rows = plan[cursor:cursor + 4]
         started = time.monotonic()
         attempts = 0
@@ -103335,6 +103751,12 @@ async def dj_banter(track: dict[str, Any] | None = None,
                     # gets it back, and was grading it with no wire
                     # evidence at all.
                     news_titles: str = "",
+                    # [topic-exchange] {opener, reply}: the operator's opening
+                    # exchange, said word for word on rows 1 and 2
+                    exchange: dict[str, Any] | None = None,
+                    # [s3-roads] which road this round is: System 3 plans it
+                    # from that road's own structure and records it as such
+                    road: str = "",
                     ) -> list[str]:
     """A short exchange between the two, spoken in their own voices.
 
@@ -103384,8 +103806,10 @@ async def dj_banter(track: dict[str, Any] | None = None,
     # genuinely arrives somewhere different, and the other speaker
     # reacts differently to it, which is the whole of the request.
     _approach = approach_pick()
+    _lines_rolled, _lines_base = False, 0     # [s3-glass] the dial's random stood here
     if lines <= 0:
         lines = random.randint(dj["banter_min_lines"], dj["banter_max_lines"])
+        _lines_rolled, _lines_base = True, int(lines)
         # Lines run twice as long since #361 and renders slowed under
         # GPU load — a drawn round stays bounded so records ever reach the
         # floor (#394). The 45-second banter clock keeps the talk constant
@@ -103407,6 +103831,7 @@ async def dj_banter(track: dict[str, Any] | None = None,
             if _budget.get("lines"):
                 lines = max(4, min(int(_budget["lines"]),
                                    int(dj.get("banter_max_lines") or 22)))
+                _lines_rolled = False          # [s3-glass] the slot decided, not the dice
         except Exception:  # noqa: BLE001
             pass
     if caller_name:
@@ -103430,6 +103855,7 @@ async def dj_banter(track: dict[str, Any] | None = None,
     _system2_job = system2_current_work() if globals().get("system2_current_work") else None
     _system2_budget = dict(dj.get("system2_budget") or {}) if _system2_job else {}
     _system2_sources: list[dict[str, Any]] = []
+    _s3 = None      # System 3's handle for this round (see _s3_direct)
 
     def _source_for_scene(row):
         if not _system2_budget or not row:
@@ -103775,7 +104201,7 @@ async def dj_banter(track: dict[str, Any] | None = None,
     # rounds. The slider decides how often a seed is drawn; nothing else
     # should.
     spread: list[dict[str, Any]] = []          # #1174: the other documents
-    if not caller_name and not seed and not own_material and (
+    if not caller_name and not seed and not own_material and not exchange and (   # [topic-exchange]
             force_seed or random.random() < box_rate_now(dj["speakbox_rate"])):
         # Best-of-two off the shelf (#418): the rounds open with the
         # more intriguing swath, same scoring the callers use (#359).
@@ -103871,8 +104297,11 @@ async def dj_banter(track: dict[str, Any] | None = None,
         # swath needs a turn of its own on top.
         lines = max(lines, min(5 if comeback else 4, dj["banter_max_lines"]))
     elif dropped:
+        _dreply = " ".join(str(dropped.get("reply") or "").split())   # [topic-exchange]
         angle = bombshell_angle(dropped["text"],
-                                dropped.get("shape") or "")
+                                dropped.get("shape") or "", _dreply)
+        if _dreply and not exchange:
+            exchange = {"opener": dropped["text"], "reply": _dreply}
     else:
         # Now and then a picture comes off the render machine and gets
         # held up on air, described from its PIXELS (#341) — the resident
@@ -104211,9 +104640,46 @@ async def dj_banter(track: dict[str, Any] | None = None,
         # Drawn BEFORE the loop that uses it: speakbox_quote walks the
         # document directory on every call, and the share it walks is
         # slow enough to have cost 6.5s against an 8s watchdog (#1250).
+        async def _s3_direct(call_sheet: str = ""):
+            # System 3 (docs/system3_blueprint.md) plans the round. ACTIVE:
+            # its running order replaces #1386's and its door rolls replace
+            # random(). SHADOW: it records what it would have done. None
+            # (off, or it failed) is this road exactly as it was.
+            if not globals().get("system3_direct_banter"):   # [s3-roads] memos too
+                return None
+            try:
+                return await globals()["system3_direct_banter"](
+                    lines=int(lines or 0), bank=bool(bank), dj=dj,
+                    seats=banter_floor_seats(dj, bool(third), caller_name),
+                    caller_name=caller_name, caller2_name=caller2_name,
+                    caller_seat=caller_seat,
+                    seed_text=str((seed or {}).get("text") or ""),
+                    seed_file=str((seed or {}).get("file") or ""),
+                    angle=str(angle or ""), own_material=bool(own_material),
+                    news_titles=str(news_titles or ""), weather=_weather,
+                    approach=_approach,
+                    gazette=bool((_paper_context or {}).get("prompt")),
+                    system2_job=_system2_job, system2_budget=_system2_budget,
+                    call_sheet=call_sheet, exchange=exchange,   # [topic-exchange]
+                    call_meta=(call_meta if isinstance(call_meta, dict) else {}),   # [s3-calls]
+                    road=str(road or ""), whole=bool(whole),   # [s3-roads]
+                    lines_rolled=bool(_lines_rolled), lines_base=int(_lines_base),   # [s3-glass]
+                    lines_min=int(dj.get("banter_min_lines") or 4),
+                    lines_max=int(dj.get("banter_max_lines") or 22))
+            except Exception as _s3_exc:  # noqa: BLE001
+                pipeline_log("system3", "the director was skipped - the legacy running order stands",
+                             extra=("%s: %s" % (type(_s3_exc).__name__, _s3_exc))[:200])
+                return None
+        if not caller_name:
+            _s3 = await _s3_direct()
+        _s3_owns = bool(_s3 is not None and _s3.active and _s3.sheet)
+        if _s3_owns and int(getattr(_s3, "turns", 0) or 0) > 0:
+            # [s3-glass] a free round's length is System 3's roll
+            lines = int(_s3.turns)
+            _judge_lines = min(int(_judge_lines), lines)
         _topic_at, _topic_new = 0, {}
         try:
-            if (banter_dice_on() > 0 and int(lines or 0) >= 8
+            if (not _s3_owns and banter_dice_on() > 0 and int(lines or 0) >= 8
                     and not caller_name and not own_material
                     and not _system2_job):
                 _topic_new = await speakbox_quote(
@@ -104259,9 +104725,16 @@ async def dj_banter(track: dict[str, Any] | None = None,
                     except ValueError as _scenario_error:
                         pipeline_log("call", "the scenario direction was skipped: "
                                      + str(_scenario_error)[:160])
+                _s3 = await _s3_direct(call_sheet=_beat_sheet)
+                if _s3 is not None and _s3.active and _s3.sheet:
+                    _beat_sheet = _s3.sheet
                 _dice_rolls = []
                 raise _CallSheetDone
-            _beat_sheet, _dice_rolls = banter_beat_sheet(
+            if _s3_owns:
+                _beat_sheet, _dice_rolls = _s3.sheet, list(_s3.rolls)
+                _topic_at, _topic_new = _s3.topic_at, dict(_s3.topic_new or {})
+            else:
+              _beat_sheet, _dice_rolls = banter_beat_sheet(
                 int(lines or 0),
                 banter_floor_seats(dj, bool(third), caller_name),
                 dj, seeded=bool(seed and seed.get("text")),
@@ -104534,7 +105007,9 @@ async def dj_banter(track: dict[str, Any] | None = None,
                 _beat_context, _beat_sheet, int(lines or 0),
                 banter_floor_seats(dj, bool(third), caller_name),
                 seed_text=str((seed or {}).get("text") or ""),
-                trace=_beat_trace)
+                trace=_beat_trace,
+                director=(globals()["system3_director"](_s3)
+                          if globals().get("system3_director") else None))
             pipeline_log("model", "banked banter written as %d responsive "
                          "beat(s), %d parsed turns" % (
                              len(_beat_trace), len(banter_turns(script or ""))))
@@ -104566,6 +105041,10 @@ async def dj_banter(track: dict[str, Any] | None = None,
                         if caller_name else ""))
         if not caller_name:
             return []
+        if _s3 is not None and getattr(_s3, "active", False):   # [s3-calls]
+            pipeline_log("call", "System 3's call for %s was not written - dropped, not replaced "
+                         "by the built-in template; the next call is rolled fresh" % caller_name)
+            return []
         script = _fallback_call_script(
             caller_name, str((call_meta or {}).get("topic") or angle)[:320],
             str((call_meta or {}).get("speakerbox_text") or ""),
@@ -104573,6 +105052,10 @@ async def dj_banter(track: dict[str, Any] | None = None,
 
     # #805: ask_model returns "" when the reply fragment-binned — not an
     # exception, and previously not a call either. Same guarantee.
+    if caller_name and not spoken_text(script or "") and _s3 is not None and getattr(_s3, "active", False):
+        pipeline_log("call", "System 3's call for %s came back empty - dropped, not replaced by "
+                     "the built-in template; the next call is rolled fresh (#805)" % caller_name)   # [s3-calls]
+        return []
     if caller_name and not spoken_text(script or ""):
         pipeline_log("call", f"fragment-binned call write — built-in "
                      f"fallback script carries {caller_name} (#805)")
@@ -104696,6 +105179,10 @@ async def dj_banter(track: dict[str, Any] | None = None,
             _call_report["ok"] = False
             _needs_rewrite = True
             _topic_regenerated = True
+    if (not _needs_rewrite and not caller_name
+            and globals().get("system3_repair_wanted")
+            and globals()["system3_repair_wanted"](_s3, script)):
+        _needs_rewrite = True
     _draft_entry = {"script": script, "prep_kind": "caller" if caller_name else "banter",
                     "caller_name": caller_name, "caller2_name": caller2_name,
                     "caller_voice": caller_voice, "caller2_voice": caller2_voice,
@@ -104749,7 +105236,10 @@ async def dj_banter(track: dict[str, Any] | None = None,
                     + call_novelty_prompt(str(                      # #1157
                         ((call_meta or {}).get("plot") or {}).get("id")
                         or ""))
-                    if caller_name else "") + "\n\n"
+                    if caller_name else "")
+                + (globals()["system3_repair_clause"](_s3)
+                   if globals().get("system3_repair_clause") else "")
+                + "\n\n"
                 + script,
                 limit=min(int(_system2_budget.get("max_chars") or dj.get("reply_max_chars") or 6000),
                           int(dj.get("reply_max_chars") or 6000),
@@ -104798,6 +105288,10 @@ async def dj_banter(track: dict[str, Any] | None = None,
             if _rw_ok:
                 script = rewritten
             else:
+                if caller_name and _s3 is not None and getattr(_s3, "active", False):   # [s3-calls]
+                    pipeline_log("call", "System 3's call for %s missed the call contract twice - "
+                                 "dropped, not replaced by the built-in template" % caller_name)
+                    return []
                 if caller_name:
                     # A phone call is not salvageable as unrelated/thin
                     # dialogue: the person on the line and the response arc
@@ -104994,10 +105488,22 @@ async def dj_banter(track: dict[str, Any] | None = None,
             rec.update(applies=False, why="held under System2: a whole reading cannot fit a scene written for 90 seconds")
         elif _system2_job and not _s2_quotes:
             rec.update(applies=False, why="held under System2 by the 'quotes under System2' switch on the speakerbox desk")
+        elif (_s3 is not None and getattr(_s3, "active", False)
+              and getattr(_s3, "sheet", "")):
+            rec.update(applies=False, why=(
+                "System 3 places the speakerbox inside its running order at "
+                "these sliders - read by one speaker and answered by the "
+                "next - rather than dealing a passage across the seats "
+                "after the writing"))
         elif rate <= 0:
             rec.update(applies=True, why="the dial is at 0%")
         if rec["applies"] and rate > 0:
-            roll = random.random()
+            roll = (globals()["system3_door_roll"](_s3, door)
+                    if globals().get("system3_door_roll") else None)
+            if roll is None:
+                roll = random.random()
+            else:
+                rec["rolled_by"] = "system3"
             rec["roll"] = round(roll, 3)
             rec["hit"] = bool(roll < min(1.0, rate + float(lift or 0)))
         _quotes[door] = rec
@@ -105198,7 +105704,13 @@ async def dj_banter(track: dict[str, Any] | None = None,
     # the whole test, and a round being written against the air keeps going
     # straight out.
     _prepared = bool(bank) or bool(_system2_job)
-    if _prepared and _dealt:
+    # [rng-topics] NOT ON A ROUND SYSTEM 3 DIRECTED. Its running order
+    # already places each passage and has the next turn answer it; this
+    # pass re-handed the whole round to the writer ("EVERYTHING ELSE IS
+    # YOURS") and rewrote the turns the dice had shaped. "Nothing should
+    # be automatically wedged into conversation." The legacy road keeps it.
+    _s3_directed = bool(_s3 is not None and getattr(_s3, "active", False))
+    if _prepared and _dealt and not _s3_directed:
         try:
             _blended = await blend_script(script,
                                           [[r[0], r[2]] for r in _dealt],
@@ -105224,7 +105736,9 @@ async def dj_banter(track: dict[str, Any] | None = None,
     # not, put fresh material in their mouths rather than letting the
     # round run out on nothing. One extra draw at most, prepared roads
     # only, and any fault at all leaves the round exactly as it was.
-    if _prepared and _dealt and not own_material:
+    # [rng-topics] ...nor the re-seed: fresh speaker-box turns appended by
+    # the station. On System 3's rounds its CTS roll changes the subject.
+    if _prepared and _dealt and not own_material and not _s3_directed:
         try:
             _now_turns = banter_turns(script, caller_name)
             if len(_now_turns) >= 6:
@@ -105326,6 +105840,7 @@ async def dj_banter(track: dict[str, Any] | None = None,
         "call": dict(call_meta or {}),
         "render_stream": render_stream,
         "whole": bool(whole),                  # #859
+        "road": str(road or ""),               # [s3-roads]
 
         "feel": feel,                                          # #750
         "weather": _weather,                                   # [#1232]
@@ -105518,6 +106033,8 @@ async def dj_banter(track: dict[str, Any] | None = None,
                 "call", "a phone call failed the final flow/novelty contract "
                 "and was refused before recording or live synthesis",
                 extra="; ".join(_final_report.get("faults") or [])[:1000])
+    if _s3 is not None and globals().get("system3_bind_entry"):
+        globals()["system3_bind_entry"](entry, _s3)
     if bank:
         # #842: a round written for a PARTICULAR segment — a memo from
         # upstairs, a call on the request line — is handed back to its
@@ -106509,7 +107026,7 @@ async def dj_open_show() -> list[str]:
     rather than one stock line and straight into the music (#194)."""
     pool = banter_pool(2)
     material = "; ".join(pool)
-    return await dj_banter(None, lines=4, angle=(
+    return await dj_banter(None, road="open_show", lines=4, angle=(
         f"you are opening the session. {show_open_when()} Welcome people to "
         "the station, mention between you what he has had the two of you "
         "doing lately"
@@ -106785,7 +107302,7 @@ async def _manager_rings_booth(track: dict[str, Any] | None,
     said: list[str] = []
     try:
         said = await dj_banter(
-            track, lines=turns, own_material=True,
+            track, road="manager", lines=turns, own_material=True,
             caller_name=boss, caller_voice=voice,
             # #1164: HIS seat, not the caller's. This is the whole patch.
             caller_seat="manager",
@@ -106901,7 +107418,10 @@ async def dj_manager_note(track: dict[str, Any] | None = None,
         if _announce:
             try:
                 await dj_speak("interject", track,
-                               line=random.choice(MANAGER_BREAK_LINES),
+                               line=(_mb := await _s3_stock_line(
+                                   "interject", MANAGER_BREAK_LINES, "dj",
+                                   source="MANAGER_BREAK_LINES"))[0],   # [s3-roads]
+                               system3=_mb[1],
                                who="dj", round_as="manager", sting=False)
             except Exception:  # noqa: BLE001
                 pass
@@ -107005,7 +107525,7 @@ async def dj_manager_note(track: dict[str, Any] | None = None,
     except Exception:  # noqa: BLE001
         pass
     if _hot_memo:
-        _hot_said = await dj_banter(track, lines=3, whole=True,   # #859
+        _hot_said = await dj_banter(track, road="memo", lines=3, whole=True,   # #859
                                     bank=bank_to is not None,
                                     bank_to=bank_to, own_material=True, angle=(
             "an urgent memo has just come down from the manager upstairs: "
@@ -107138,7 +107658,7 @@ async def dj_manager_note(track: dict[str, Any] | None = None,
     # about 42 seconds of talk plus its stings, which fits an entry that
     # has already been part spent. Better a segment that lasts and airs
     # than one that fills the sheet and is never heard.
-    _said = await dj_banter(track, lines=10, whole=True,          # #859
+    _said = await dj_banter(track, road="memo", lines=10, whole=True,   # #859
                             bank=bank_to is not None,
                             bank_to=bank_to, own_material=True,
                             angle=_angle)
@@ -107171,7 +107691,7 @@ async def dj_manager_call(text: str, doc: str = "") -> list[str]:
         voice = ""
     host = dj.get("host_name") or "the host"
     return await dj_banter(
-        _RADIO.get("now"), lines=4, source=doc, own_material=True,
+        _RADIO.get("now"), road="manager", lines=4, source=doc, own_material=True,
         caller_name=boss, caller_voice=voice,
         # One floor up, down an internal line: a little phone crush and no
         # character at all — the calm is the threat.
@@ -107190,7 +107710,7 @@ async def dj_manager_call(text: str, doc: str = "") -> list[str]:
 async def dj_fan_mail(text: str, doc: str = "") -> list[str]:
     """A listener's letter, opened on air and argued over (#636)."""
     return await dj_banter(
-        _RADIO.get("now"), lines=5, source=doc, own_material=True,
+        _RADIO.get("now"), road="fan_mail", lines=5, source=doc, own_material=True,
         angle=("A letter has arrived at the station addressed to the two of "
                "you. One of you OPENS it on air — the envelope, the paper, "
                "the handwriting, all of it described — and reads it out a "
@@ -123357,6 +123877,7 @@ async def dj_next_api(
     # before the record you asked for even starts.
     _RADIO["call_cooldown"] = time.time() + 120
     _TALK_CUT[0] += 1
+    _TALK_CUT_OP[0] = time.time()   # [cut-switches] the operator asked
     dj_skip()
     asyncio.create_task(_upstairs_react("skipped to the next record"))
     return dj_state()
@@ -123374,6 +123895,7 @@ async def dj_prev_api(
         if full:
             _RADIO["requests"].insert(0, full)
             _TALK_CUT[0] += 1
+            _TALK_CUT_OP[0] = time.time()   # [cut-switches] the operator asked
             dj_skip()
             asyncio.create_task(
                 _upstairs_react("yanked the record back to the last one"))
@@ -139971,6 +140493,24 @@ async def api_line_review_decide(
 
 _REJECTION_WORKBENCH = install_rejection_workbench(app, globals())
 _SYSTEM2_RUNTIME = install_system2(app, globals())
+# System 3 (docs/system3_blueprint.md): the conversation director. Every
+# hook it exports is reached through globals().get(), so an install that
+# fails leaves the legacy station exactly as it was.
+try:
+    from system3_runtime import install as install_system3
+    _SYSTEM3_RUNTIME = install_system3(app, globals())
+except Exception as _system3_exc:  # noqa: BLE001
+    _SYSTEM3_RUNTIME = None
+    print("system3 did not install: %s: %s" % (type(_system3_exc).__name__, _system3_exc))
+# [sfx-vectors] the SFX Guy's vector section (docs/SFX_vector_reuse.md): clips
+# and his dialogue indexed by lexical, semantic and anchored facets, kept by
+# his own keeper, queryable by outside applications, backed up as one file.
+try:
+    from sfx_vectors_runtime import install as install_sfx_vectors
+    _SFX_VECTORS_RUNTIME = install_sfx_vectors(app, globals())
+except Exception as _sfxv_exc:  # noqa: BLE001
+    _SFX_VECTORS_RUNTIME = None
+    print("sfx vectors did not install: %s: %s" % (type(_sfxv_exc).__name__, _sfxv_exc))
 
 
 # =====================================================================
@@ -145427,8 +145967,11 @@ async def dj_topics_add(
     text = str(payload.get("text") or "").strip()
     if not text:
         raise HTTPException(status_code=400, detail="Give them something")
+    # [topic-exchange] "1. ... 2. ..." is a line and the answer to it
+    text, _reply = split_exchange(text)
+    _reply = _reply or " ".join(str(payload.get("reply") or "").split())
     row = await asyncio.to_thread(
-        add_bombshell, text, str(payload.get("kind") or "topic"))
+        add_bombshell, text, str(payload.get("kind") or "topic"), "operator", "", _reply)
     if not row:
         raise HTTPException(status_code=503,
                             detail="The topic bank could not be written")
@@ -145451,6 +145994,56 @@ async def dj_topics_remove(
         raise HTTPException(status_code=404, detail="No such topic")
     write_bombshells(kept)
     return {"removed": topic_id, "left": len(kept)}
+
+
+@app.post("/api/dj/topics/{topic_id}/edit")
+async def dj_topics_edit(
+    topic_id: str,
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """[topic-edit] Reword one saved topic in place - "allow me to double
+    click or long press to edit the topic inline editing the entry". Split
+    as a new one is; the id, the uses and the date stay. A copy waiting in
+    the next-banter queue is reworded with it."""
+    require_auth(authorization)
+    payload = await request.json()
+    raw = str(payload.get("text") or "").strip()
+    if not raw:
+        raise HTTPException(status_code=400, detail="Give them something")
+    text, reply = split_exchange(raw)
+    reply = reply or " ".join(str(payload.get("reply") or "").split())
+
+    def reword() -> dict[str, Any] | None:
+        with _BOMBSHELL_LOCK:
+            rows = read_bombshells()
+            row = next((r for r in rows if r.get("id") == topic_id), None)
+            if row is None:
+                return None
+            row["text"] = text.strip()[:400]
+            if reply:
+                row["reply"] = reply[:400]
+            else:
+                row.pop("reply", None)
+            row["edited"] = int(time.time())
+            return dict(row) if write_bombshells(rows) else {}
+
+    row = await asyncio.to_thread(reword)
+    if row is None:
+        raise HTTPException(status_code=404, detail="No such topic")
+    if not row:
+        raise HTTPException(status_code=503, detail="The topic bank could not be written")
+    requeued = 0
+    with _SWITCH_LOCK:
+        for queued in _SWITCH_QUEUE:
+            if queued.get("topic_id") != topic_id:
+                continue
+            shape = queued.get("topic_shape") or bombshell_shape_for(row)
+            queued["premise"] = bombshell_angle(row["text"], shape, reply)
+            queued["exchange"] = {"opener": row["text"], "reply": reply} if reply else {}
+            requeued += 1
+    note_action("you reworded a topic in the bank: " + row["text"][:160])
+    return {"topic": row, "requeued": requeued}
 
 
 @app.post("/api/dj/topics/{topic_id}/queue")
@@ -145478,8 +146071,10 @@ async def dj_topics_drop(
     if row is None:
         raise HTTPException(status_code=404, detail="No such topic")
     _shape = bombshell_shape_for(row)
+    _reply = " ".join(str(row.get("reply") or "").split())   # [topic-exchange]
     lines = await dj_banter(_RADIO.get("now"),
-                            angle=bombshell_angle(row["text"], _shape))
+                            angle=bombshell_angle(row["text"], _shape, _reply),
+                            exchange=({"opener": row["text"], "reply": _reply} if _reply else None))
     use_bombshell(topic_id, _shape)
     return {"lines": lines, "topic": row["text"]}
 
@@ -149776,6 +150371,10 @@ PUBLIC_ENABLED = os.getenv("SPARK_PUBLIC_LISTEN", "true").lower() in (
 # Exact paths, or prefixes ending in "/". Nothing is matched loosely: a
 # regex over a public surface is how an allowlist quietly grows a hole.
 _PUBLIC_GET = {"/healthz", "/api/dj", "/api/dj/voice", "/api/dj/reacts",
+               # System 3: how each line in the listener feed was composed.
+               # A compact projection behind the tune-in token; nothing about
+               # the station's configuration (docs/SYSTEM3_UI_CONTRACT.md).
+               "/api/system3/public/lines",
                # #1263: which picture is up. Tiny, and audio-free.
                "/api/dj/video",
                # #1264: installed to a home screen, it has to be able
@@ -150703,6 +151302,7 @@ async def dj_mixtape_api(
     _RADIO["since_tape"] = 0
     _RADIO["requests"].insert(0, tape)
     _TALK_CUT[0] += 1                   # cut any round mid-flight
+    _TALK_CUT_OP[0] = time.time()   # [cut-switches] the operator asked
     dj_skip()                           # the mail does not wait
     return {"tape": tape["title"], "seconds": tape["seconds"]}
 
@@ -150822,7 +151422,7 @@ async def dj_guest_send_home(
 
     async def _farewell() -> None:
         try:
-            await dj_banter(_RADIO.get("now"), angle=angle,
+            await dj_banter(_RADIO.get("now"), road="guest", angle=angle,
                             lines=random.randint(8, 13))
         except Exception as exc:  # noqa: BLE001
             pipeline_log("drop", f"guest farewell died: {exc}"[:200])
@@ -151130,6 +151730,7 @@ async def dj_dice_api(
         readers.append("drop")
     first = random.choice(readers)
     _TALK_CUT[0] += 1                   # the stage is taken, mid-line if need be
+    _TALK_CUT_OP[0] = time.time()   # [cut-switches] the operator asked
     if first == "drop":
         # The SFX guy — who never talks — reads the passage cold in his
         # own voice. Then the booth has to deal with what he said.
@@ -152186,6 +152787,7 @@ async def speakbox_read_api(
     name: str,
     mind: str = "",
     preview: int = 0,
+    lines: int = 0,
     authorization: str | None = Header(default=None),
 ) -> dict[str, Any]:
     """One document, as it stands on disk.
@@ -152207,6 +152809,18 @@ async def speakbox_read_api(
                 break
     if not path.is_file():
         raise HTTPException(status_code=404, detail=f"No {name} in the speakbox")
+    if lines:
+        # [line-reel] THE DOCUMENT AS THE DRAW SEES IT: the lines the
+        # station harvested from it - what speakbox_quote cuts a swath
+        # from - or its sentences when no harvest is kept. The Messenger's
+        # line reel rolls through these and lands on the passage. In a
+        # thread: the gem cache is one JSON file per mind.
+        def _said_lines() -> dict[str, Any]:
+            gems = speakbox_gems(path, used)
+            if gems:
+                return {"lines": gems, "source": "harvest"}
+            return {"lines": speakbox_lines(speakbox_body(path)), "source": "sentences"}
+        return {"name": name, "mind": used, **(await asyncio.to_thread(_said_lines))}
     if preview > 0:
         want = max(200, min(20000, int(preview)))
         with path.open("r", errors="replace") as handle:
@@ -159332,6 +159946,7 @@ async def manager_breakin_now_api(
         # the floor ends at its next turn and the watchdog pass behind
         # this one carries it through.
         _TALK_CUT[0] += 1
+        _TALK_CUT_OP[0] = time.time()   # [cut-switches] the operator asked
         return {"ok": False, "asked": True, **manager_break_state(),
                 "say": "somebody has the floor - the round on it has been "
                        "asked to end at its next turn and the memo goes "
@@ -159339,7 +159954,10 @@ async def manager_breakin_now_api(
     said = ""
     try:
         said = await dj_speak("interject", _RADIO.get("now"),
-                              line=random.choice(MANAGER_BREAK_LINES),
+                              line=(_mb := await _s3_stock_line(
+                                  "interject", MANAGER_BREAK_LINES, "dj",
+                                  source="MANAGER_BREAK_LINES"))[0],   # [s3-roads]
+                              system3=_mb[1],
                               who="dj", round_as="manager", sting=False)
     except Exception:  # noqa: BLE001
         said = ""
@@ -162189,7 +162807,8 @@ def sfx_match_sting_pick(after: str = "", want_video: Any = None,
         return None
     why, score = why_by_path.get(got, ("", 0.0))
     _SFX_MATCH_LAST.update({"path": got, "why": why, "score": score,
-                            "at": time.time()})
+                            "at": time.time(), "cands": len(cands),
+                            "tied": len(tied), "eligible": len(survivors)})
     _SFX_MATCH["picks"] = int(_SFX_MATCH.get("picks") or 0) + 1
     _SFX_MATCH["matched"] = int(_SFX_MATCH.get("matched") or 0) + 1
     sfx_match_note("sting", Path(got).stem, why, score, said["line"])
@@ -167594,6 +168213,77 @@ async def _parody_stinger_worker() -> None:
 
 
 _H3_HOURLY_LAST = [""]
+_H3_HOURLY_FILE = DATA_DIR / "h3_hourly.json"
+_H3_HOURLY_STATE: dict[str, Any] = {}
+_H3_HOURLY_PERIOD_S = 3600
+_H3_HOURLY_MINUTE = 3
+
+
+def h3_hourly_load() -> dict[str, Any]:
+    """[h3-hourly] The operator's hourly-H3 switch and source mix, read
+    once from disk. Defaults: on, 20% of hours from a gallery image (the
+    rest from a speech-indexed clip) - what the clock always did, made
+    visible and switchable."""
+    if not _H3_HOURLY_STATE:
+        state: dict[str, Any] = {"enabled": True, "gallery_share": 20}
+        try:
+            got = json.loads(_H3_HOURLY_FILE.read_text(encoding="utf-8"))
+            if isinstance(got, dict):
+                state.update({k: got[k] for k in ("enabled", "gallery_share", "last_at", "last_message",
+                                                    "last_source", "last_marker") if k in got})
+        except FileNotFoundError:
+            pass
+        except Exception as exc:  # noqa: BLE001
+            pipeline_log("ads", "hourly H3 switch unreadable: %s" % type(exc).__name__)
+        _H3_HOURLY_STATE.update(state)
+    return _H3_HOURLY_STATE
+
+
+def h3_hourly_save(patch: dict[str, Any]) -> dict[str, Any]:
+    state = h3_hourly_load()
+    if "enabled" in patch:
+        state["enabled"] = bool(patch["enabled"])
+    if "gallery_share" in patch:
+        try:
+            state["gallery_share"] = max(0, min(100, int(round(float(patch["gallery_share"])))))
+        except (TypeError, ValueError):
+            pass
+    for key in ("last_at", "last_message", "last_source", "last_marker"):
+        if key in patch:
+            state[key] = patch[key]
+    try:
+        tmp = _H3_HOURLY_FILE.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(state, indent=1), encoding="utf-8")
+        os.replace(tmp, _H3_HOURLY_FILE)
+    except Exception as exc:  # noqa: BLE001
+        pipeline_log("ads", "hourly H3 switch not saved: %s" % type(exc).__name__)
+    return state
+
+
+def h3_hourly_next_at(now_ts: float, last_marker: str) -> float:
+    """When the clock next fires: minute 3 of this hour if that has not
+    happened yet, else minute 3 of the next hour."""
+    now = time.localtime(now_ts)
+    this_hour = time.mktime((now.tm_year, now.tm_mon, now.tm_mday, now.tm_hour, 0, 0, 0, 0, -1))
+    marker = time.strftime("%Y%m%d%H", now)
+    due = this_hour + _H3_HOURLY_MINUTE * 60
+    if now_ts < due and marker != last_marker:
+        return due
+    return this_hour + _H3_HOURLY_PERIOD_S + _H3_HOURLY_MINUTE * 60
+
+
+def h3_hourly_view() -> dict[str, Any]:
+    """What the gallery's meter and the Script view's controls read."""
+    state = h3_hourly_load()
+    now_ts = time.time()
+    next_at = h3_hourly_next_at(now_ts, _H3_HOURLY_LAST[0])
+    return {"enabled": state.get("enabled", True) is not False,
+            "gallery_share": int(state.get("gallery_share", 20)),
+            "period_seconds": _H3_HOURLY_PERIOD_S,
+            "seconds_remaining": max(0.0, round(next_at - now_ts, 1)),
+            "next_at": next_at, "radio_on": bool(_RADIO.get("on")),
+            "last_at": state.get("last_at"), "last_message": state.get("last_message"),
+            "last_source": state.get("last_source")}
 
 
 def h3_hourly_ad_prompt() -> str:
@@ -167618,18 +168308,85 @@ async def h3_hourly_ad_clock() -> None:
         try:
             now = time.localtime()
             marker = time.strftime("%Y%m%d%H", now)
+            if not _H3_HOURLY_LAST[0]:
+                # [h3-hourly] A restart forgot the hour it had rendered, so the
+                # "hourly" ad fired again on every boot past minute 3 - and the
+                # station restarts about every twelve minutes (#1283). The hour
+                # that rendered is on disk; take it up.
+                _H3_HOURLY_LAST[0] = str(h3_hourly_load().get("last_marker") or "")
             # Give the orchestrator time to establish the hour's topic.  The
             # durable H3 queue handles the rest even when memory is tight.
-            if now.tm_min >= 3 and marker != _H3_HOURLY_LAST[0] and _RADIO.get("on"):
+            if now.tm_min >= _H3_HOURLY_MINUTE and marker != _H3_HOURLY_LAST[0] and _RADIO.get("on"):
                 _H3_HOURLY_LAST[0] = marker
-                message, job = await voice_ad_render(h3_hourly_ad_prompt())
-                pipeline_log("ads", "hourly H3 ad: %s%s" %
-                             (message[:180], "" if job else " (not queued)"))
+                state = h3_hourly_load()
+                if state.get("enabled", True) is False:
+                    # [h3-hourly] the operator's switch (the gallery's H3
+                    # toggle). This hour is marked, so a re-enable waits for
+                    # the next one: a second H3 render in one boot is what
+                    # cooks the box (#1285).
+                    pipeline_log("ads", "hourly H3 ad: off at the operator's switch")
+                else:
+                    message, job, source = await h3_hourly_render(state)
+                    pipeline_log("ads", "hourly H3 ad (%s): %s%s" %
+                                 (source, str(message)[:180], "" if job else " (not queued)"))
+                    h3_hourly_save({"last_at": time.time(), "last_message": str(message)[:200],
+                                    "last_source": source, "last_marker": marker})
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001
             pipeline_log("ads", "hourly H3 ad keeper: %s" % type(exc).__name__)
         await asyncio.sleep(30)
+
+
+async def h3_hourly_render(state: dict[str, Any]) -> tuple[str, Any, str]:
+    """[h3-hourly] One hourly stinger: from a gallery image for gallery_share
+    percent of hours (a frame stinger through the durable parody queue, the
+    road the gallery's own "Render H3 video" takes; newspaper pages
+    excluded), else from a speech-indexed clip through voice_ad_render."""
+    goal = h3_hourly_ad_prompt()
+    try:
+        share = max(0, min(100, int(state.get("gallery_share", 20) or 0)))
+    except (TypeError, ValueError):
+        share = 20
+    if share and random.randint(1, 100) <= share:
+        try:
+            page = await asyncio.to_thread(generation_history_page, "", "", 30)
+            images = [str(f) for r in page.get("generations", []) for f in (r.get("files") or [])
+                      if re.search(r"\.(png|jpe?g|webp)$", str(f), re.I) and not gallery_paper_file(str(f))]
+        except Exception:  # noqa: BLE001
+            images = []
+        if images:
+            file = random.choice(images[:30])
+            payload = {"mode": "reference", "purpose": "parody_stinger", "source": file,
+                       "source_type": "gallery", "speech": voice_ad_spoken_copy(goal),
+                       "prompt": "Create a Pine Box FM stinger using the supplied image. Natural motion and "
+                                 "synchronized spoken dialogue. No captions or logos. " + goal,
+                       "duration_mode": "at_least", "steps": 4, "air_it": False, "hourly": True}
+            queued = _parody_stinger_queue().add(payload)
+            _parody_stinger_wake.set()
+            return ("queued a gallery-image stinger from %s" % file, queued, "gallery image")
+    message, job = await voice_ad_render(goal)
+    return (message, job, "clip")
+
+
+@app.get("/api/h3/hourly")
+async def h3_hourly_get(authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    """[h3-hourly] The gallery's H3 meter and the Script view's hourly controls
+    read this: on/off, the source mix, the seconds to the next render."""
+    require_read_auth(authorization)
+    return h3_hourly_view()
+
+
+@app.post("/api/h3/hourly")
+async def h3_hourly_set(request: Request, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    require_auth(authorization)
+    payload = await request.json()
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Expected an object")
+    state = h3_hourly_save({k: payload[k] for k in ("enabled", "gallery_share") if k in payload})
+    pipeline_log("ads", "hourly H3 switch: %s, %d%% gallery images" %
+                 ("on" if state.get("enabled", True) is not False else "off", int(state.get("gallery_share", 20))))
+    return h3_hourly_view()
 
 
 async def h3_capacity_keeper() -> None:
@@ -169421,6 +170178,8 @@ def script_ledger_commit(sid: str, rows: list[dict[str, Any]],
             # claim no dice or admission record ever existed.
             **({"dice": dict(row["dice"])}
                if isinstance(row.get("dice"), dict) else {}),
+            **({"system3": dict(row["system3"])}
+               if isinstance(row.get("system3"), dict) else {}),
             **({"admission_occurrence": str(row.get("admission_occurrence") or "")}
                if row.get("admission_occurrence") else {}),
             **({"model_call": dict(row["model_call"])}
@@ -169478,6 +170237,8 @@ def script_ledger_commit(sid: str, rows: list[dict[str, Any]],
                 _script_ledger_prune()
     except Exception:  # noqa: BLE001
         return 0
+    if globals().get("system3_observe_ledger"):
+        globals()["system3_observe_ledger"](block, sid, rows, round_kind)
     return block
 
 
@@ -169641,7 +170402,10 @@ def script_ledger_catch_up(rows: list[dict[str, Any]]) -> int:
               "scripted": False,
               # [#1237] a single line published bound to a record keeps it
               **({"bound": dict(one["bound"])}
-                 if isinstance(one.get("bound"), dict) else {})}
+                 if isinstance(one.get("bound"), dict) else {}),
+              # [s3-roads] and its System 3 node, when it has one
+              **({"system3": _s3_line_stamp_of(one)}
+                 if _s3_line_stamp_of(one) else {})}
              for one in group],
             str(row.get("round") or ""),
             # [#1386] F1: the road every gold bar, interject, SFX quip and
@@ -171162,7 +171926,16 @@ def screenplay_compose(since: float, until: float, d: dict[str, Any],
         # drop, a phone call, a sting off the board - off the render
         # estimate and onto the moment it sounded, a median of 62.6 s
         # later.
-        _raw_of[_ix] = (screenplay_when_heard(_row)
+        # [#1308c] AN UNHEARD ROW HANGS WHERE #1308 TRAILED IT. For a row
+        # nobody has heard, screenplay_when_heard() is its air_at
+        # ESTIMATE, and a banked round whose planned slot had passed was
+        # bisected into the middle of the heard spine by it: the mark
+        # stepped over eight lines nobody said (#1306, 2138 px) and, when
+        # the round aired, jumped back up to them (#1301, 18402 px). The
+        # trailed stamp keeps banked work under the live line until it
+        # is heard - and once heard, the ear's stamp is that same tail.
+        _raw_of[_ix] = ((screenplay_when_heard(_row) if screenplay_was_heard(_row)
+                         else float(_e.get("at") or 0))
                         or float(_e.get("at") or 0))
         _got = _ord_of(_ord, _row) if _ord else None          # 2026-09-14
         if _got and len(_got) > 2 and (_got[2] or _blocksize.get(int(_got[0]), 0) >= 2):
@@ -192182,6 +192955,7 @@ live and in 3D, with swappable themes">🧠 Mind</button>
         <button onclick="stationFlowOpen()"
                 title="Every content step, judgment, rewrite and playback acknowledgment">Station flow</button>
         <button onclick="system2Open()" title="System2 hourly plans, scripts and line diagnostics">System2</button>
+        <button onclick="system3Open()" title="System 3, the conversation director: the conversation, the RNG Rolodex and the final script, in sync">System 3</button>
         <button id="mindDockBtn" onclick="mindDockToggle()"
                 title="Dock the Dialogue Mind to the left as the main display
 whenever the station is playing (#472)">📺 Left</button>
@@ -228042,6 +228816,22 @@ async function system2Open() {
   } catch (error) { setStatus("System2 could not open: " + error.message, true); }
 }
 
+/* System 3 (docs/system3_blueprint.md): the conversation director's
+   instrument - conversation, RNG Rolodex and final script views. */
+let system3View = null;
+async function system3Open() {
+  if (system3View) return;
+  if (!document.getElementById("system3Style")) {
+    const style = document.createElement("link"); style.id = "system3Style"; style.rel = "stylesheet";
+    style.href = "/system3/system3.css?v=1"; document.head.append(style);
+  }
+  try {
+    const module = await import("/system3/system3.js?v=1");
+    system3View = await module.openSystem3({request: (path, options) => api(path, options),
+      onClose: () => { system3View = null; }});
+  } catch (error) { setStatus("System 3 could not open: " + error.message, true); }
+}
+
 let wordCauseView = null;                                // [#1386]
 let wordCauseOpening = false;
 let wordCauseTicket = 0;
@@ -235410,6 +236200,7 @@ function threeSheetOpen() {
       ["📰", "Gazette", "the hourly newspaper off the station's own log", () => paperOpen()],
       ["🗄", "Retirement desk", "every recording in the cupboard, its timer, and the recording room", () => window.open("/cupboard/retire" + key, "_blank")   /* #1381b: its real path */],
       ["📋", "System2", "hourly plans, scripts and line diagnostics", () => system2Open()],
+      ["🎲", "System 3", "the conversation director: every roll behind every line, and the script it made", () => system3Open()],
       ["🧵", "Station flow", "every content step, judgment, rewrite and playback acknowledgment", () => stationFlowOpen()],
       ["📘", "The guide", "the operator's manual, as a PDF", () => window.open("/api/pinebox/guide.pdf", "_blank")],
       ["🖼", "Gallery", "the pictures the station has made, on the slideshow", () => window.open("/spark?pictures=1" + (key ? "&key=" + encodeURIComponent(SERVER_KEY) : ""), "_blank")],
@@ -247529,6 +248320,24 @@ RADIO_PAGE_HTML = r"""<!doctype html>
   .said { padding: 5px 0; border-top: 1px solid #101823; line-height: 1.45; }
   .said b { color: #4bb3ff; }
   .said.me b { color: #ffd479; }
+  /* System 3: the rolls behind each line, and its card when tapped. */
+  .said.s3-has { cursor: pointer; }
+  .s3-strip { display: flex; flex-wrap: wrap; gap: 4px; margin: 3px 0 1px; }
+  .s3-d { font: 11px ui-monospace, monospace; color: #9fb0c3; border: 1px solid #1b2735;
+          border-radius: 999px; padding: 0 7px; white-space: nowrap; max-width: 100%;
+          overflow: hidden; text-overflow: ellipsis; }
+  .s3-d::before { content: ""; display: inline-block; width: 6px; height: 6px; margin-right: 5px;
+                  transform: rotate(45deg); background: var(--f, #7f8ea3); vertical-align: 1px; }
+  .s3-d.rolling { color: #4bb3ff; border-color: #2a4a66; }
+  .s3-d.pop { animation: s3pop .35s ease-out; }
+  @keyframes s3pop { 0% { transform: scale(1.18); } 100% { transform: scale(1); } }
+  .s3-card { margin: 6px 0 2px; padding: 8px 10px; background: #0b121c; border: 1px solid #1b2735;
+             border-radius: 8px; font-size: 12px; color: #c9d6e3; cursor: auto; }
+  .s3-card .r { font: 11px/1.5 ui-monospace, monospace; margin: 2px 0; }
+  .s3-card .fam { border-left: 3px solid var(--f, #7f8ea3); padding-left: 6px; }
+  .s3-card .m { color: #7f8ea3; margin: 2px 0; }
+  .s3-card .reel { font-size: 11px; padding-left: 9px; }
+  @media (prefers-reduced-motion: reduce) { .s3-d.pop { animation: none; } }
   .note { color: #7f8ea3; font-size: 12px; margin-top: 10px; }
   .gallery-stage { display:none; position:relative; aspect-ratio:16/9; overflow:hidden;
     margin:0 0 14px; background:#070b12; border:1px solid #1b2735; border-radius:10px; }
@@ -248717,19 +249526,211 @@ function tvHide() {
    * stage stays up at all. */
 }
 
+/* System 3 (docs/system3_blueprint.md): THE FEED SHOWS HOW EACH REPLY WAS MADE.
+ *
+ * "Have the feed ... showing the roulette system and rolodexing of replies
+ *  being generated in the conversational feed. Allow users to tap on
+ *  messages to expand them and see how they are composed of elements."
+ *
+ * A line System 3 directed carries its recorded rolls - the emotion, the
+ * response, the pushback, the flow, the speakerbox and SFX dice. They show
+ * as a strip that rolls ONCE through the candidates that were really in
+ * the draw and lands on what was drawn, with the d100 it rolled; nothing
+ * is invented for the effect. Tap a line to open it into its elements.
+ *
+ * Rows are keyed by the line's own id and KEPT between polls, so an open
+ * card survives the next refresh; the list only moves to the bottom when
+ * the listener was already there. One small request, only when new lines
+ * appear, for their compositions (/api/system3/public/lines). */
+const patterNodes = new Map();   /* line key -> its row */
+const s3Comp = new Map();        /* line id -> composition, or null */
+let s3Asking = false;
+let s3RetryAt = 0;
+const S3_FAMILY = {CTS: "#8ac6ac", ES: "#f0a6ca", RS: "#87bfff", IRS: "#ffb86b",
+                   FL: "#c4a1ee", SPEAKERBOX: "#e7bf78", SFX: "#7fe0d6"};
+const s3Still = () => { try { return matchMedia("(prefers-reduced-motion: reduce)").matches; }
+                        catch (e) { return false; } };
+
+function patterKey(line, i) {
+  return String(line.id || ((line.ts || "") + ":" + String(line.text || "").slice(0, 48) + ":" + i));
+}
+
 function patter(state) {
   const host = document.getElementById("patter");
-  host.textContent = "";
-  (state.chat || []).slice(-14).forEach((line) => {
-    const row = document.createElement("div");
-    row.className = "said" + (line.who === "host" ? " me" : "");
-    const who = document.createElement("b");
-    who.textContent = line.who === "dj" ? "DJ " : "Request ";
-    row.appendChild(who);
-    row.appendChild(document.createTextNode(line.text));
+  const rows = (state.chat || []).slice(-14);
+  const near = host.scrollHeight - host.scrollTop - host.clientHeight < 48;
+  const keep = new Set();
+  rows.forEach((line, i) => {
+    const key = patterKey(line, i);
+    keep.add(key);
+    const held = patterNodes.get(key);
+    if (held && held.isConnected) return;
+    const row = patterRow(line, key);
+    patterNodes.set(key, row);
     host.appendChild(row);
   });
-  host.scrollTop = host.scrollHeight;
+  Array.from(host.children).forEach((n) => {
+    if (!keep.has(n.dataset.key)) { patterNodes.delete(n.dataset.key); n.remove(); }
+  });
+  if (near) host.scrollTop = host.scrollHeight;
+  s3Ask(rows);
+}
+
+function patterRow(line, key) {
+  const row = document.createElement("div");
+  row.className = "said" + (line.who === "host" ? " me" : "");
+  row.dataset.key = key;
+  const who = document.createElement("b");
+  who.textContent = line.who === "dj" ? "DJ " : "Request ";
+  row.appendChild(who);
+  row.appendChild(document.createTextNode(line.text || ""));
+  const strip = document.createElement("div");
+  strip.className = "s3-strip";
+  row.appendChild(strip);
+  const card = document.createElement("div");
+  card.className = "s3-card";
+  card.hidden = true;
+  row.appendChild(card);
+  row.tabIndex = 0;
+  row.setAttribute("role", "button");
+  row.setAttribute("aria-expanded", "false");
+  row.addEventListener("click", () => s3Toggle(row));
+  row.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" || e.key === " ") { e.preventDefault(); s3Toggle(row); }
+  });
+  const comp = line.id ? s3Comp.get(String(line.id)) : null;
+  if (comp !== undefined) s3Dress(row, comp, false);
+  return row;
+}
+
+function s3Ask(rows) {
+  if (s3Asking || Date.now() < s3RetryAt) return;
+  const ids = rows.map((r) => String(r.id || ""))
+    .filter((id) => /^[0-9A-Za-z_-]{6,64}$/.test(id) && !s3Comp.has(id)).slice(-16);
+  if (!ids.length) return;
+  s3Asking = true;
+  api("/api/system3/public/lines?ids=" + ids.join(","))
+    .then((got) => {
+      (got.lines || []).forEach((item) => {
+        const comp = item.system3 ? item : null;
+        s3Comp.set(String(item.line_id), comp);
+        const row = patterNodes.get(String(item.line_id));
+        if (row) s3Dress(row, comp, true);
+      });
+      ids.forEach((id) => { if (!s3Comp.has(id)) s3Comp.set(id, null); });
+      if (s3Comp.size > 300) {
+        Array.from(s3Comp.keys()).slice(0, s3Comp.size - 300).forEach((k) => s3Comp.delete(k));
+      }
+    })
+    .catch(() => { s3RetryAt = Date.now() + 30000; })   /* the feed still reads */
+    .finally(() => { s3Asking = false; });
+}
+
+function s3Chip(roll) {
+  const chip = document.createElement("span");
+  chip.className = "s3-d";
+  chip.style.setProperty("--f", S3_FAMILY[roll.family] || "#7f8ea3");
+  chip.textContent = roll.family + (roll.dice ? " " + roll.dice : "") + " → " + (roll.label || "");
+  chip.title = roll.family + (roll.dice ? " rolled " + roll.dice + "/100" : " (not a draw)")
+    + (roll.of ? ", landed on " + roll.index + " of " + roll.of : "") + ": " + (roll.label || "");
+  return chip;
+}
+
+/* The roll, from the recorded reel: every label shown is a candidate that
+   was really in the draw, and it stops on the one that was drawn. */
+function s3Spin(chip, roll, delay) {
+  const reel = (roll.reel || []).filter(Boolean);
+  if (s3Still() || reel.length < 2) return;
+  const final = chip.textContent;
+  chip.classList.add("rolling");
+  let n = 0;
+  const turns = reel.length * 2;
+  setTimeout(() => {
+    const t = setInterval(() => {
+      chip.textContent = roll.family + " → " + reel[n % reel.length];
+      n += 1;
+      if (n >= turns) {
+        clearInterval(t);
+        chip.textContent = final;
+        chip.classList.remove("rolling");
+        chip.classList.add("pop");
+      }
+    }, 55);
+  }, delay);
+}
+
+function s3Dress(row, comp, animate) {
+  const strip = row.querySelector(".s3-strip");
+  if (!strip) return;
+  strip.textContent = "";
+  row.classList.toggle("s3-has", !!comp);
+  if (!comp) return;
+  const turn = comp.turn;
+  if (!turn) {
+    const chip = document.createElement("span");
+    chip.className = "s3-d";
+    chip.textContent = comp.mode === "shadow" ? "System 3 shadow round" : "System 3 round";
+    strip.appendChild(chip);
+    return;
+  }
+  (turn.rolls || []).forEach((roll, i) => {
+    const chip = s3Chip(roll);
+    strip.appendChild(chip);
+    if (animate) s3Spin(chip, roll, i * 160);
+  });
+  const card = row.querySelector(".s3-card");
+  if (card && !card.hidden) { card.hidden = true; s3Toggle(row); }   /* open: refresh it */
+}
+
+function s3Toggle(row) {
+  const card = row.querySelector(".s3-card");
+  if (!card) return;
+  const open = card.hidden;
+  card.hidden = !open;
+  row.setAttribute("aria-expanded", String(open));
+  if (!open) return;
+  const id = row.dataset.key;
+  /* a key with a colon is a row with no line id: not a System 3 line */
+  const comp = s3Comp.has(id) ? s3Comp.get(id) : (id.indexOf(":") >= 0 ? null : undefined);
+  card.textContent = "";
+  const add = (cls, text) => {
+    const d = document.createElement("div");
+    d.className = cls;
+    d.textContent = text;
+    card.appendChild(d);
+    return d;
+  };
+  if (comp === undefined) { add("m", "Reading how this line was made..."); return; }
+  if (!comp) { add("m", "This line was not directed by System 3."); return; }
+  const turn = comp.turn;
+  add("m", (comp.mode === "shadow"
+    ? "System 3's shadow plan for this seat - it recorded what it would have directed; the legacy writer wrote these words."
+    : "Directed by System 3; the model wrote the words.")
+    + (comp.topic ? " Subject: " + comp.topic : ""));
+  if (!turn) { add("m", "A board clip or interjection inside a System 3 round - not one of its turns."); return; }
+  add("r", (turn.name || turn.speaker || "") + " · " + (turn.step || "") + " · turn " + turn.turn
+    + " of " + turn.of + " · " + (turn.phase || ""));
+  if (turn.emotion) {
+    add("r", "emotion: " + turn.emotion + " (" + Number(turn.intensity || 0).toFixed(2) + ")"
+      + " · pace " + Number(turn.pace || 1).toFixed(2) + " · " + (turn.pause_style || "natural") + " pauses");
+  }
+  (turn.rolls || []).forEach((roll) => {
+    const line = add("r", roll.family + (roll.dice ? " d" + roll.dice : " (no roll)")
+      + (roll.of ? " · " + roll.index + " of " + roll.of : "")
+      + " → " + (roll.label || "") + (roll.category ? "  [" + roll.category + "]" : "")
+      + (roll.intensity != null ? " · intensity " + Number(roll.intensity).toFixed(2) : ""));
+    line.style.setProperty("--f", S3_FAMILY[roll.family] || "#7f8ea3");
+    line.classList.add("fam");
+    if ((roll.reel || []).length > 1) add("m reel", "rolled through: " + roll.reel.join(" · "));
+    if (roll.rule) add("m reel", roll.rule);
+  });
+  (turn.speakerbox || []).forEach((sb) => {
+    add("r", "speakerbox " + String(sb.mode || "").toLowerCase() + (sb.file ? ": " + sb.file : ""));
+  });
+  if (turn.sfx) {
+    add("r", "SFX guy: " + (turn.sfx.play ? "a clip " + (turn.sfx.placement || "after") + " the line" : "no clip planned")
+      + ((turn.sfx.intent || []).length ? " (" + turn.sfx.intent.slice(0, 4).join(", ") + ")" : ""));
+  }
 }
 
 /* #1146: one poll in flight at a time, and a clip enters the queue once.

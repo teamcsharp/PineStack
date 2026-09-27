@@ -837,10 +837,14 @@
        * the sixth ask, for the stepper at the top of the body. It 404s
        * for a line in neither the booth nor the air log, and that is
        * allowed to fail like the others. */
-      soft(api().get('/api/said/why/' + encodeURIComponent(line.id || '')))
+      soft(api().get('/api/said/why/' + encodeURIComponent(line.id || ''))),
+      /* [s3-link] the seventh ask: System 3's own record of the line - the
+       * round, the turn, and every roll the Rolodex made for it. 404s for a
+       * line no node made, which is an answer ("not directed") not a fault. */
+      soft(api().get('/api/system3/line?line_id=' + encodeURIComponent(line.id || '')))
     ]).then(function (got) {
       return {prov: got[0], road: got[1], worn: got[2], air: got[3], scene: got[4],
-        why: got[5]};
+        why: got[5], s3: got[6]};
     });
   }
 
@@ -910,6 +914,7 @@
     }
 
     section(body, 'how this line came to be broadcast, step by step', flowNode(line, all));
+    section(body, 'System 3 - how the dice built this line', s3Story(line, all));   /* [s3-story] */
     section(body, 'admin options - what reached this line', adminNode(all));   /* 2026-09-14 */
     section(body, 'how often it has gone out', timesNode(line, all));
     section(body, 'why it keeps coming up', whyNode(line, all));
@@ -917,6 +922,44 @@
     section(body, 'what it was shown', shownNode(all));
     section(body, 'the road, step by step', roadNode(all));
     section(body, 'if you never want to hear it again', retireNode(line, all));
+  }
+
+  /* [s3-story] SYSTEM 3'S PART OF THE STORY, drawn by System 3 itself: the
+   * station serves frontend/system3.js, whose mountLineStory rolls the
+   * line's dice again and shows the running-order row it wrote and where
+   * that row sits in the prompt (the provenance fetched above). */
+  var s3Load = null;
+  function s3Url(name) {
+    try {
+      if (/^https?:$/.test(location.protocol) && location.origin && location.origin !== 'null') {
+        return location.origin + name;
+      }
+    } catch (err) { /* no location worth having */ }
+    try {
+      if (root.pineThreeUrl) return String(root.pineThreeUrl()).replace(/\/vendor\/three\.min\.js.*$/, '') + name;
+    } catch (err) { /* older shell */ }
+    return 'http://127.0.0.1:8096' + name;
+  }
+  function s3Story(line, all) {
+    var node = make('div', 'ld-s3', 'Reading System 3...');
+    if (!document.querySelector('link[data-pine-s3]')) {
+      var link = document.createElement('link');
+      link.rel = 'stylesheet';
+      link.href = s3Url('/system3/system3.css?v=3');
+      link.setAttribute('data-pine-s3', '');
+      document.head.appendChild(link);
+    }
+    var prov = (all && all.prov) || {};
+    var prompt = String(((prov.written || {}).prompt) || prov.prompt || '');
+    (s3Load = s3Load || import(s3Url('/system3/system3.js?v=3'))).then(function (mod) {
+      if (!node.isConnected) return null;
+      return mod.mountLineStory(node, {request: function (path) { return api().get(path); },
+        lineId: String((line && line.id) || ''), prompt: prompt});
+    })['catch'](function (err) {
+      s3Load = null;
+      node.textContent = 'System 3 could not be read here: ' + String((err && err.message) || err);
+    });
+    return node;
   }
 
   /* ---------------------------------------------------------- the stepper */
@@ -1506,7 +1549,8 @@
       props: byName(why && why.properties),
       scene: (all.scene || {}).scenario || null,
       place: ledgerPlace(line, all),
-      stages: (all.road || {}).stages || []
+      stages: (all.road || {}).stages || [],
+      s3: (all.s3 && typeof all.s3 === 'object' && all.s3.line) ? all.s3 : null   /* [s3-link] */
     };
   }
 
@@ -1582,6 +1626,75 @@
       + 'what the round is for. Everything downstream is an answer to it.',
       f,
       'the schedule desk left no instruction on this line\u2019s record');
+
+    /* 1b. THE ROULETTE - System 3's dice, between the brief and the writer.
+     * [s3-link] "I don't get how this system generated this line based on
+     * how the roulette rolled. This appears to be inaccurate somewhere."
+     * Lit ONLY when a node made the line: the turn found by its words, or
+     * the SFX Guy's node on the turn he followed. A line in a System 3
+     * round that no node made (a passage dealt in front, a caller's hello)
+     * says so; a line from before System 3 says so. Every number here was
+     * recorded by the engine at plan time; nothing is re-rolled. */
+    f = [];
+    var s3 = d.s3 || {};
+    var s3turn = s3.turn || null;
+    var s3conv = s3.conversation || {};
+    var s3sg = s3.sfxguy || null;
+    var s3rolls = [];
+    var s3why = '';
+    if (s3turn) {
+      put(f, 'the round', String(s3conv.road_kind || s3conv.road || 'a')
+        + ' round ' + String(s3conv.conversation_id || '')
+        + (s3conv.mode ? ' - ' + String(s3conv.mode) : ''));
+      put(f, 'the turn', 'turn ' + (Number(s3turn.index) + 1)
+        + (s3conv.turns ? ' of ' + String(s3conv.turns) : '')
+        + ' - ' + String(s3turn.name || s3turn.speaker || '')
+        + (s3turn.step_label ? ' - ' + String(s3turn.step_label) : '')
+        + (s3turn.phase ? ' - ' + String(s3turn.phase) : ''));
+      if (s3sg) {
+        put(f, 'the SFX Guy', 'his node on this turn'
+          + (s3sg.node && s3sg.node.selected ? ': ' + String(s3sg.node.selected.label || s3sg.node.selected.id || '') : '')
+          + ((s3sg.line || {}).kind ? ' - ' + String(s3sg.line.kind) : ''));
+        ((s3sg.line || {}).draws || []).forEach(function (dr) {
+          put(f, 'his draw at air', 'the ' + String(dr.pool || '') + ' pool: d' + String(dr.dice || '')
+            + ' landed on ' + String(dr.index) + ' of ' + String(dr.of));
+        });
+      }
+      (s3.decisions || []).forEach(function (ev) {
+        var sel = ev.selected || {};
+        var rng = ev.rng || {};
+        var stages = ev.stages || [];
+        var item = null;
+        stages.forEach(function (st) { if (!item && (st.stage === 'item' || st.stage === 'mode')) item = st; });
+        var dice = (item && item.draw && item.draw.dice != null) ? item.draw.dice : rng.dice;
+        var text = String(sel.label || sel.id || sel.intent || (ev.meta && ev.meta.why) || '');
+        if (item && item.selected_index != null && item.of) text += ' (' + item.selected_index + ' of ' + item.of + ')';
+        text += (dice != null) ? ' - d100 rolled ' + dice : ' - not a draw: a rule decided it';
+        if (sel.table) text += ' - table ' + String(sel.table);
+        put(f, String(ev.family || 'roll'), text);
+        s3rolls.push(ev);
+      });
+      put(f, 'rolls on this turn', s3rolls.length ? String(s3rolls.length) : '');
+      put(f, 'planned', clock(Number(s3.planned_at || 0)) || '');
+      put(f, 'the engine', s3.engine);
+      put(f, 'how the row was linked', s3.healed);
+      s3why = '';
+    } else if (s3.line && s3conv.conversation_id) {
+      s3why = 'part of a System 3 round (' + String(s3conv.road_kind || 'a') + ' round '
+        + String(s3conv.conversation_id) + ') but not one of its planned turns - a line the '
+        + 'station put into the round at air, which no node made. Its dice are on the turns around it.';
+    } else if (all.s3 === null || !s3.line) {
+      s3why = 'not directed by System 3: no node made this line - a gold bar replayed as filler, a '
+        + 'punctuation row on a single line, or a round written before System 3 was switched on. '
+        + 'Nothing was rolled for it.';
+    }
+    stage('roulette', 'the roulette', !!s3turn,
+      'The roulette is System 3: the Rolodex of tables the conversation director rolls through '
+      + 'for every turn - what the round is about, the emotion it is spoken in, the response, '
+      + 'the frame, the speaker box, the SFX Guy - each a recorded d100 over weighted candidates. '
+      + 'The writer is handed the result as the running order.',
+      f,
+      s3why || 'System 3 rolled nothing for this line');
 
     /* 2. THE WRITING ROOM - the model that turned the brief into words. */
     f = [];

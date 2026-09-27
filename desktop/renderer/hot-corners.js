@@ -1052,11 +1052,21 @@
       dropTab();
     }
 
+    /* [one-bar] the editor's own bar carries the grip now: it posts the
+       drag here, and the rig parks or springs home exactly as if the
+       finger were on the handle. */
+    function dragStart() { if (dead) return; drag = {id: -1, x: 0, from: at}; place(at, false); }
+    function dragMove(dx) { if (!drag || drag.id !== -1) return; place(drag.from + Number(dx || 0), false); }
+    function dragEnd() { if (!drag || drag.id !== -1) return; drag = null; settle(); }
+
     return {
       handle: handle,
       away: away,
       home: home,
       toggle: toggle,
+      dragStart: dragStart,
+      dragMove: dragMove,
+      dragEnd: dragEnd,
       isAway: function () { return side; },
       destroy: destroy
     };
@@ -1795,13 +1805,14 @@
   function editorPath(sourceId) {
     sourceId = String(sourceId || '');
     if (!/^[0-9a-f]{32}$/.test(sourceId)) throw new Error('invalid video source identity');
-    return '/video-editor/?source=' + sourceId;
+    return '/video-editor/?source=' + sourceId + '&chrome=host';   /* [one-bar] */
   }
 
   function editorMessage(event, frameWindow, origin) {
     if (!event || event.source !== frameWindow || event.origin !== origin) return '';
     var kind = event.data && event.data.type;
-    return kind === 'pine-video-editor-close' || kind === 'pine-video-editor-export' ? kind : '';
+    return kind === 'pine-video-editor-close' || kind === 'pine-video-editor-export'
+      || kind === 'pine-video-editor-slide' || kind === 'pine-video-editor-drag' ? kind : '';   /* [one-bar] */
   }
 
   /* [#1242] THE EDITOR IS AN IFRAME AND CANNOT HOLD THE KEY.
@@ -1911,8 +1922,15 @@
           + String((err && err.message) || err), true);
       }
     }
+    /* [one-bar] "there's three top bars and there shouldn't be. There should
+     * be only one." The editor's own toolbar is the one bar: it carries the
+     * grip, the road's name, Slide away and the close X (video-editor.js,
+     * ?chrome=host). The rig stays - it owns the parking and the ink pad -
+     * with its handle hidden; the sheet's own bar is built (its Close is
+     * still a road out) but never shown. */
+    editorRig.handle.classList.add('hc-host-chrome');
+    bar.hidden = true;
     box.appendChild(editorRig.handle);                                /* [#1221] */
-    box.appendChild(bar);
     box.appendChild(frame);
     doc.body.appendChild(free);                                       /* [#1221] */
     doc.body.appendChild(box);
@@ -1963,6 +1981,13 @@
       var kind = editorMessage(event, frame.contentWindow, origin);
       if (kind === 'pine-video-editor-close') close();
       else if (kind === 'pine-video-editor-export') toast('Edited video is ready');
+      else if (kind === 'pine-video-editor-slide') editorRig.toggle();            /* [one-bar] */
+      else if (kind === 'pine-video-editor-drag') {                               /* [one-bar] */
+        var said = (event.data && event.data.detail) || {};
+        if (said.phase === 'start') editorRig.dragStart();
+        else if (said.phase === 'move') editorRig.dragMove(said.dx);
+        else editorRig.dragEnd();
+      }
       else editorPermitAsk(event, frame.contentWindow, origin);        /* [#1242] */
     }
     back.addEventListener('click', close);

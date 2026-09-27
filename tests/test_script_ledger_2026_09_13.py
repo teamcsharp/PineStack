@@ -234,6 +234,39 @@ class ScreenplayTakesTheLedgersWord(unittest.TestCase):
         self.assertEqual(self.ids(self.compose(rows, order)),
                          ["a0", "a1", "resc", "b0", "b1"])
 
+    def test_a_banked_row_trails_the_heard_spine_until_it_is_heard(self):
+        """[#1308c] #1306's exact failure: eight prepared lines stood between
+        two heard rows because their air_at ESTIMATE bisected them into the
+        heard spine; the mark stepped over them, and when the round aired the
+        mark jumped back up to it (#1301, 18402 px)."""
+        rows = [{**air("a0", 10.0, "one"), "aired": "stream"},
+                {**air("a1", 11.0, "two"), "aired": "stream", "turn": 1},
+                {**air("g0", 12.0, "banked"), "aired": "prepared", "sid": "s9", "turn": 0},
+                {**air("g1", 13.0, "banked too"), "aired": "prepared", "sid": "s9", "turn": 1},
+                {**air("b0", 20.0, "three"), "aired": "stream", "sid": "s2"},
+                {**air("b1", 21.0, "four"), "aired": "stream", "sid": "s2", "turn": 1}]
+        # (block, ord, scripted): the triple is what builds the spine
+        order = {"a0": (1, 0, True), "a1": (1, 1, True), "b0": (2, 0, True), "b1": (2, 1, True)}
+        self.assertEqual(self.ids(self.compose(rows, order)),
+                         ["a0", "a1", "b0", "b1", "g0", "g1"])
+        # heard at last: it sits where its hearing puts it, which is the
+        # tail it already trailed at - nothing above the reader moves
+        rows[2].update(aired="stream", heard_ack_at=22.0)
+        rows[3].update(aired="stream", heard_ack_at=23.0)
+        self.assertEqual(self.ids(self.compose(rows, order)),
+                         ["a0", "a1", "b0", "b1", "g0", "g1"])
+
+    def test_an_unaired_turn_still_trails_its_own_conversation(self):
+        """#1308 kept: a turn still to come in a conversation that HAS aired
+        trails that conversation, not the whole hour."""
+        rows = [{**air("a0", 10.0, "one"), "aired": "stream"},
+                {**air("a1", 11.0, "two"), "aired": "stream", "turn": 1},
+                {**air("a2", 12.0, "still to come"), "aired": "prepared", "turn": 2},
+                {**air("b0", 20.0, "three"), "aired": "stream", "sid": "s2"}]
+        order = {"a0": (1, 0, True), "a1": (1, 1, True), "b0": (2, 0, True)}
+        self.assertEqual(self.ids(self.compose(rows, order)),
+                         ["a0", "a1", "a2", "b0"])
+
     def test_heard_scripted_sting_anchors_later_single_line_blocks(self):
         """#1277: the last sting in a round must precede what aired after it.
 
