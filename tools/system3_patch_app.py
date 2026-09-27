@@ -213,7 +213,7 @@ PANEL = [
      '    style.href = "/system3/system3.css?v=4"; document.head.append(style);\n'
      '  }\n'
      '  try {\n'
-     '    const module = await import("/system3/system3.js?v=4");\n'
+     '    const module = await import("/system3/system3.js?v=5");\n'
      '    system3View = await module.openSystem3({request: (path, options) => api(path, options),\n'
      '      tab: typeof tab === "string" ? tab : "",\n'
      '      onClose: () => { system3View = null; }});\n'

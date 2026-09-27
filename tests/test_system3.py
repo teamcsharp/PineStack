@@ -85,7 +85,7 @@ class PlanTests(unittest.TestCase):
         # 2026-09-27 [s3-roads]: ...and one structure per road on the register
         # plus the SFX Guy's section; his node rolls on its own stream, so the
         # trajectory above is still unchanged (engine/3).
-        self.assertEqual(system3.config_hash(system3.default_config()), "77aad04d23a0cbcc")
+        self.assertEqual(system3.config_hash(system3.default_config()), "48e47262ef173867")
 
     def test_same_state_config_seed_reproduces_the_plan(self):
         a, b = plan(seed="r"), plan(seed="r")

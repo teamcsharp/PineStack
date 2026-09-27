@@ -40,3 +40,21 @@ table is still exactly true, and System 3 only records.
 - **No path is invented.** The SFX Guy produces intent words and dues. Only the station's indexed book produces files.
 - **Scheduled sources are never discarded.** Turn 0 speaks the road's own subject (`CTS OBLIGATED`), and a CTS category whose material the road does not hold is ineligible.
 - **Frozen scripts are not mutated.** Binding reads the script and writes only `turn_dice`, `dice`, `system3`, plus additions to `passage_source`/`dealt`. The words are not touched (tested).
+
+## Added 2026-09-27 (`[s3-rounds]`, `[s3-carry]`, `[s3-withhold]`)
+
+| Decision | Owner under System 3 (active) | Mechanism | Recorded as |
+|---|---|---|---|
+| The hosts' tempers for the round | **System 3** `TEMPER` (the desk's `dice_hosts` switch still gates it) | one weighted draw per host seat over `TEMPER1`, worn tempers x0.25 | `TEMPER` event per seat; the running order's head |
+| The one open reaction that turns the round ("at least once X is openly shocked") | **System 3** `SHOCK` | dice at the `shock_beat` control, the reaction, the turn | `SHOCK` event; the turn's row and `decisions` |
+| A host going on a roll and the other getting a word in edgewise | **System 3** `INTERJECT` | dice at the `interjections` control, the long turn, three phrases; two planned turns (`interject`, `carry_on`) inside the budget | `INTERJECT` event; steps `interject` / `carry_on` |
+| Whether the station's name is worked in | **System 3** `MENTION` | dice at the `mention` control, the turn | `MENTION` event; the turn's row |
+| Where a round starts emotionally, and what it picks up from | **System 3** carry (the last round's ending, aged) | `observe_ledger` hands on; `direct` hands in for live / System 2 rounds; `perf_state` blends for banked rounds | `CARRY` event (plan) and `CARRY` observations (`handed on`, `delivery`) |
+| A planned round that will not air | **System 3** says why | `system3_withhold(handle, why, stage)` from dj_banter (deferred writer, no turns); the sweep files rounds nobody bound within 30 min | `WITHHELD` / `ABANDONED` observations; `status` `withheld` / `abandoned` |
+| The writer lane: who waits for whom | station (`call_ollama`) | the transcript-repair harvest is its own category (cap 1) and yields while a round writer waits; a LIVE round waits up to 45 s for a slot instead of being refused; a document whose repair came back unpunctuated is skipped 12 h; one harvest per speakbox draw | `pipeline_log` `speakbox` / `lookahead` |
+
+The four station-side random() directives in dj_banter's one-call prompt
+(the tempers, "openly shocked", the diatribe interjections, the 30% name
+mention) and `show_memory`'s "moods right now" stand down when System 3 owns
+the round. A deferred or empty writer never leaves the seed passage standing
+in for the round: the round is withheld and recorded.

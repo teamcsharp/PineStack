@@ -457,7 +457,83 @@ FL2 = {
     ],
 }
 
-DEFAULT_TABLES = [CTS1, ES1, RS1, RS2, IRS1, IRS2, FL1, FL2]
+# --- TEMPER1 / SHOCK1 / INTERJECT1: the station's prompt randoms, as tables ---
+#
+# [s3-rounds] 2026-09-27. Four draws lived in dj_banter's one-call prompt as
+# station-side random(): the hosts' tempers for the round (dice_hosts, one
+# of HOST_TEMPERS per seat), "at least once X is openly <shocked> at what the
+# other has JUST said", the interjections forced in edgewise while one of them
+# goes on a roll (the desk's diatribe_interjections), and whether the
+# station's name is worked in (30%). Each contradicted the per-turn ES the
+# running order carried and none was in the Rolodex. They are System 3 rolls
+# now, on the round's own stream (seed|round), recorded, replayable and
+# editable here. The desk's dice_hosts switch still gates TEMPER; the odds of
+# the other three are controls (shock_beat, interjections, mention).
+TEMPER1 = {
+    "id": "TEMPER1", "family": "TEMPER", "label": "Tempers (the round's register per seat)",
+    "version": 1, "enabled": True, "weight": 1.0,
+    "description": "The temper a host is caught in tonight, rolled once per round per seat when the desk's "
+                   "dice_hosts switch is on. It colours phrasing and pacing underneath each turn's rolled feeling.",
+    "categories": [
+        {"id": "temper", "label": "Temper", "weight": 1.0,
+         "items": _items([
+             {"id": "short_fused", "label": "Short-fused", "text": "angry and short-fused, snapping at things that would normally slide"},
+             {"id": "openly_sad", "label": "Openly sad", "text": "openly sad tonight, and it keeps leaking into the jokes"},
+             {"id": "appalled", "label": "Appalled", "text": "appalled - genuinely scandalised by what they are hearing"},
+             {"id": "giddy", "label": "Giddy", "text": "giddy and overcaffeinated, talking too fast and laughing too easily"},
+             {"id": "deadly_serious", "label": "Deadly serious", "text": "deadly serious, refusing to let the other one turn it into a bit"},
+             {"id": "bored", "label": "Bored", "text": "bored to the back teeth and barely hiding it"},
+             {"id": "wounded", "label": "Wounded", "text": "wounded and a bit defensive, taking things personally"},
+             {"id": "smug", "label": "Smug", "text": "smug, insufferably pleased with themselves"},
+             {"id": "conspiratorial", "label": "Conspiratorial", "text": "conspiratorial, dropping to a mutter like the mic is off"},
+             {"id": "tender", "label": "Tender", "text": "tender and unusually gentle, which the other finds suspicious"},
+             {"id": "combative", "label": "Combative", "text": "punchy and combative, spoiling for an argument about anything"},
+             {"id": "distracted", "label": "Distracted", "text": "distracted, half-somewhere-else, coming back mid-sentence"},
+         ])},
+    ],
+}
+
+SHOCK1 = {
+    "id": "SHOCK1", "family": "SHOCK", "label": "The shock beat (one open reaction that turns the round)",
+    "version": 1, "enabled": True, "weight": 1.0,
+    "description": "Once in a round, one speaker is openly taken aback by what the other has JUST said, says so, "
+                   "and the rest of the exchange is driven by it. Whether (the shock_beat control), which reaction, "
+                   "and on which turn are three recorded draws.",
+    "categories": [
+        {"id": "reaction", "label": "Reaction", "weight": 1.0,
+         "items": _items([
+             {"id": "shocked", "label": "Shocked", "text": "shocked"},
+             {"id": "surprised", "label": "Surprised", "text": "surprised"},
+             {"id": "furious", "label": "Furious", "text": "furious"},
+             {"id": "in_disbelief", "label": "In disbelief", "text": "in disbelief"},
+             {"id": "delighted", "label": "Delighted", "text": "delighted"},
+             {"id": "appalled", "label": "Appalled", "text": "appalled"},
+         ])},
+    ],
+}
+
+INTERJECT1 = {
+    "id": "INTERJECT1", "family": "INTERJECT", "label": "Interjections forced in edgewise",
+    "version": 1, "enabled": True, "weight": 1.0,
+    "description": "When one host goes on a roll, the other gets a word in edgewise. The desk's own "
+                   "diatribe_interjections list is the Rolodex when it has entries; these are the fallback. "
+                   "Three are drawn per hit, no repeats.",
+    "categories": [
+        {"id": "edgewise", "label": "Edgewise", "weight": 1.0,
+         "items": _items([
+             {"id": "oh_come_on", "label": "Oh come on", "text": "Oh, come on."},
+             {"id": "no", "label": "No", "text": "No."},
+             {"id": "what", "label": "What", "text": "What?"},
+             {"id": "stop", "label": "Stop", "text": "Stop."},
+             {"id": "here_we_go", "label": "Here we go", "text": "Here we go."},
+             {"id": "says_you", "label": "Says you", "text": "Says you."},
+             {"id": "wow", "label": "Wow", "text": "Wow."},
+             {"id": "right", "label": "Right", "text": "Right."},
+         ])},
+    ],
+}
+
+DEFAULT_TABLES = [CTS1, ES1, RS1, RS2, IRS1, IRS2, FL1, FL2, TEMPER1, SHOCK1, INTERJECT1]
 
 # --- The banter cycle (PDF p.3) --------------------------------------------
 #

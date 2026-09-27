@@ -141,3 +141,27 @@ class WiringTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+    def test_the_rounds_edits_are_in_app_py_and_the_editor(self):
+        # [s3-rounds] the harvest yields, a deferred or empty writer withholds the
+        # round (never the seed alone), beats drop spoken lines, the four prompt
+        # randoms stand down under System 3, the panel imports v5
+        spec = importlib.util.spec_from_file_location("system3_rounds_patch", ROOT / "tools" / "system3_rounds_patch.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        text = (ROOT / "app.py").read_bytes().decode("utf-8").replace("\r\n", "\n")
+        applied, missing = mod.check(text)
+        self.assertEqual(missing, [])
+        self.assertEqual(applied, len(mod.plan(text)))
+        for marker in ('globals().get("system3_withhold")', "async def _harvest_yields(", "async def _live_round_waits(",
+                       "def _beat_fresh_only(", "def harvest_unrepaired(", 'mark={"kind": "harvest"}',
+                       'system3.js?v=5'):
+            self.assertIn(marker, text)
+        self.assertNotIn('system3.js?v=4', text)
+        src = (ROOT / "frontend" / "system3.js").read_text(encoding="utf-8")
+        for marker in ("TEMPER: ['Temper (TEMPER1)'", "CARRY: ['Carry", "WITHHELD: ['Withheld'", "const versionsCard = () =>",
+                       "const saved = (what, res) =>", "SHOCK: ['shock_beat']"):
+            self.assertIn(marker, src)
+        css = (ROOT / "frontend" / "system3.css").read_text(encoding="utf-8")
+        self.assertIn(".s3-ok", css)
+

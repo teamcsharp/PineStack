@@ -54,6 +54,11 @@ MATERIAL_TIMEOUT = 8.0          # one speakbox draw; #1250 measured 6.5 s worst
 CANDIDATE_TIMEOUT = 3.0
 WRITE_BACKLOG = 400
 RECENT = 80
+# [s3-carry] a round's ending carries into the next for this long (linear decay)
+CARRY_WINDOW = float(system3.CARRY_WINDOW)
+# [s3-withhold] a planned round nobody bound within this long is recorded as abandoned
+ABANDON_AFTER = 1800.0
+ABANDON_SWEEP = 300.0
 # The station's seat names -> the script markers banter_turns returns.
 _SEAT_OF = {"dj": "A", "host": "A", "cohost": "B", "third": "D", "caller": "C",
             "caller2": "E"}
@@ -194,7 +199,17 @@ class System3Runtime:
             "sfx_observed": 0, "lines_linked": 0, "mode_b_beats": 0, "started": time.time(),
             # [s3-roads] the SFX Guy's node at air, and single-voice lines
             "sfxguy_directed": 0, "sfxguy_spoke": 0, "lines_planned": 0, "lines_bound": 0,
+            # [s3-carry] rounds that handed their ending on / started from one / carried it in the voice only
+            "carried": 0, "carry_in": 0, "carry_delivery": 0,
+            # [s3-withhold] planned rounds that said why they never reached the air
+            "withheld": 0, "abandoned": 0,
         }
+        # [s3-carry] what the last round left on the air: {at, from, road, seats, dynamics,
+        # unresolved, landing, tempers}. Read under self.lock; written at the ledger commit.
+        self.carry = {}
+        self._carry_noted = set()
+        # [s3-withhold] active rounds planned and not yet bound: cid -> {at, road, bank}
+        self.open = {}
 
     # --- lifecycle ---------------------------------------------------------
     def load(self):
@@ -351,7 +366,148 @@ class System3Runtime:
             # [s3-roads] the SFX Guy's dials, for his node on every host turn
             "sfxguy": {"rate": _num(dj.get("sfxguy_rate")), "warp": _num(dj.get("sfxguy_warp")),
                        "voice": bool(dj.get("drop_voice")), "every_units": _num(dj.get("sfxguy_every_units"))},
+            # [s3-rounds] dj_banter's prompt randoms are the round's own rolls now: the
+            # tempers (still behind the desk's dice_hosts switch), the shock beat, the
+            # interjections forced in edgewise (the desk's own list; never on a call) and
+            # the station-name mention
+            "round_rolls": True,
+            "dice_hosts": bool(dj.get("dice_hosts")),
+            "interjections": ([] if ctx.get("caller_name") else
+                              [" ".join(str(x).split()) for x in (dj.get("diatribe_interjections") or [])
+                               if str(x or "").strip()][:60]),
+            "station_name": " ".join(str(dj.get("station_name") or "").split())[:80],
+            "live": not bool(ctx.get("bank")),
+            # [s3-carry] what the last round left on the air, for a round that airs as written
+            "carry": self._carry_for(ctx),
         }
+
+    def _carry_for(self, ctx):
+        """[s3-carry] The previous round's ending state, aged, for THIS round's
+        inputs. Only a round whose words are written for the air it will get -
+        live, or System 2's slot - takes it into the words; a banked round's
+        words are frozen long before they air, so it carries the delivery
+        only, at air (perf_state). None when nothing has aired within the
+        window."""
+        s2 = ctx.get("system2_job") if isinstance(ctx.get("system2_job"), dict) else {}
+        if ctx.get("bank") and not s2:
+            return None
+        return self.carry_now()
+
+    def carry_now(self):
+        """The carry as it stands, with its age and decay factor, or None."""
+        with self.lock:
+            carry = copy.deepcopy(self.carry) if self.carry else None
+        if not carry or not carry.get("at"):
+            return None
+        age = max(0.0, time.time() - float(carry["at"]))
+        factor = max(0.0, 1.0 - age / CARRY_WINDOW)
+        if factor <= 0:
+            return None
+        carry["age"], carry["factor"] = round(age, 1), round(factor, 3)
+        return carry
+
+    def _hand_on(self, conv, rows):
+        """[s3-carry] What a round that just reached the ledger leaves for the
+        next one: each host seat's ending emotion (the roulette's, not a
+        guess), position and energy, the dynamics, the unresolved points, the
+        line it landed on and the tempers it wore. Rounds only - a single
+        line hands nothing on."""
+        try:
+            road = str((conv.get("identity") or {}).get("road_kind") or "")
+            if road in system3_tables.LINE_ROADS or len(conv.get("turns") or []) < 2:
+                return None
+            names = ((conv.get("inputs") or {}).get("names") or {})
+            seats = {}
+            for p in conv.get("participants") or []:
+                emo = p.get("emotion") or {}
+                if p.get("actor_id") in system3.HOST_SEATS and emo.get("category"):
+                    seats[p["actor_id"]] = {"table": emo.get("table"), "category": emo["category"], "id": emo.get("id"),
+                                            "label": emo.get("label"), "intensity": emo.get("intensity"),
+                                            "dims": dict(emo.get("dims") or {}), "position": p.get("position"),
+                                            "energy": p.get("energy")}
+            landing = {}
+            for row in reversed(list(rows or [])):
+                who = str(row.get("who") or "")
+                text = " ".join(str(row.get("text") or "").split())
+                if who in ("dj", "host", "cohost", "third") and text:
+                    landing = {"who": who, "name": str(names.get(_SEAT_OF.get(who, ""), "") or who), "text": text[:400]}
+                    break
+            tempers = [str(t.get("id")) for t in (conv.get("tempers") or {}).values() if t.get("id")]
+            dyn = conv.get("dynamics") or {}
+            with self.lock:
+                worn = list(self.carry.get("tempers") or []) if self.carry else []
+                carry = {"at": time.time(), "from": conv["identity"]["conversation_id"], "road": road,
+                         "seats": seats, "dynamics": {k: dyn.get(k) for k in ("tension", "agreement", "energy") if k in dyn},
+                         "unresolved": [dict(x) for x in ((conv.get("subject") or {}).get("unresolved_points") or [])[-3:]
+                                        if isinstance(x, dict)],
+                         "landing": landing, "tempers": (worn + tempers)[-6:]}
+                self.carry = carry
+                self.metrics["carried"] += 1
+            return {"stage": "handed on", "seats": sorted(seats), "landing": landing, "tempers": tempers,
+                    "dynamics": carry["dynamics"], "unresolved": len(carry["unresolved"])}
+        except Exception as exc:  # noqa: BLE001
+            self.fail("carry", exc)
+            return None
+
+    # --- [s3-withhold] a planned round that never reaches the air says why --------
+    def withhold(self, handle, why, stage="writing"):
+        """The round was planned (its dice were rolled, the running order written)
+        and the station will not air it: the writer was deferred, came back
+        empty, the draft was refused. Recorded on the conversation as a
+        WITHHELD observation with the reason, so the Rolodex never spins for
+        a round the ledger cannot account for (247 of them in 8 h before this)."""
+        if handle is None:
+            return
+        try:
+            conv = handle.conv
+            cid = conv["identity"]["conversation_id"]
+            conv["status"] = "withheld"
+            conv["withheld"] = {"why": str(why)[:300], "stage": str(stage)[:40], "at": time.time()}
+            with self.lock:
+                self.metrics["withheld"] += 1
+                self.open.pop(cid, None)
+            self.observe_later(cid, "WITHHELD", {"stage": str(stage)[:40], "why": str(why)[:300]})
+            self.remember(conv)
+            self.persist(conv)
+            self._flow(conv, "withheld at %s: %s" % (stage, str(why)[:120]))
+        except Exception as exc:  # noqa: BLE001
+            self.fail("withhold", exc)
+
+    def sweep_open(self, now=None):
+        """Rounds planned more than ABANDON_AFTER ago and never bound or withheld
+        are recorded as abandoned - the exits dj_banter takes without telling
+        System 3 (a refused draft, a keeper that gave up). Runs in the store
+        pool; returns how many it filed."""
+        now = float(now or time.time())
+        with self.lock:
+            old = [(cid, dict(meta)) for cid, meta in self.open.items() if now - float(meta.get("at") or 0) >= ABANDON_AFTER]
+        filed = 0
+        for cid, meta in old:
+            conv = self.recent.get(cid)
+            try:
+                if conv is None:
+                    conv = self.store.conversation(cid, with_events=False)
+                if conv is None or conv.get("status") not in ("planned", None):
+                    with self.lock:
+                        self.open.pop(cid, None)
+                    continue
+                why = ("planned %.0f min ago and never bound: the writer never returned a script, or the draft "
+                       "was refused before System 3 saw it" % ((now - float(meta.get("at") or now)) / 60))
+                conv["status"] = "abandoned"
+                conv["withheld"] = {"why": why, "stage": "abandoned", "at": now}
+                self.store.add_observation(cid, "ABANDONED", {"stage": "abandoned", "why": why, "road": meta.get("road"),
+                                                              "bank": bool(meta.get("bank"))})
+                self.store.save_conversation(json.loads(json.dumps(conv, default=str)))
+                filed += 1
+            except Exception as exc:  # noqa: BLE001
+                self.fail("abandon sweep", exc)
+            with self.lock:
+                self.open.pop(cid, None)
+                if filed:
+                    self.metrics["abandoned"] = self.metrics.get("abandoned", 0)
+        with self.lock:
+            self.metrics["abandoned"] += filed
+        return filed
 
     def _call_of(self, ctx):
         """[s3-calls] Who is ringing (first name), who else is in the booth,
@@ -438,6 +594,18 @@ class System3Runtime:
             handle.plan_ms = round((time.perf_counter() - started) * 1000, 2)
             if conv.get("length_roll"):
                 handle.turns = int(conv["length_roll"].get("turns") or 0)     # [s3-glass]
+            elif handle.active and conv.get("turns"):
+                # [s3-rounds] the sheet's row count IS the round's size: a legs road
+                # whose parity mended the count by one, a round two interjection
+                # turns were planned into - dj_banter's `lines` follows the rows
+                handle.turns = len(conv["turns"])
+            if handle.active and conv.get("carry"):
+                with self.lock:
+                    self.metrics["carry_in"] += 1
+            if handle.active:
+                with self.lock:
+                    self.open[conv["identity"]["conversation_id"]] = {"at": time.time(), "road": road,
+                                                                     "bank": bool(ctx.get("bank"))}
             self._ema("plan_ms_ema", handle.plan_ms)
             with self.lock:
                 self.metrics["planned"] += 1
@@ -864,11 +1032,20 @@ class System3Runtime:
                 conv["shadow_bindings"] = [{"turn_id": t["turn_id"], "script_index": mapping.get(t["index"])}
                                            for t in conv["turns"]]
                 conv["status"] = "shadowed"
+            with self.lock:
+                self.open.pop(conv["identity"]["conversation_id"], None)
             entry["system3"] = {"conversation_id": conv["identity"]["conversation_id"],
                                 "trace_id": conv["identity"]["trace_id"], "mode": conv["mode"],
                                 "revision": conv["identity"]["revision"], "seed": conv["seed"],
                                 "config_hash": conv["config_hash"],
                                 "verdict": (conv.get("validation") or {}).get("verdict"),
+                                # [s3-rounds] how many turns the running order dealt: the air's
+                                # "incomplete conversation" gate read this and it was never set
+                                "planned_turns": len(conv["turns"]),
+                                # [s3-carry] a banked round carries the last round's state in
+                                # the voice only, at air
+                                "bank": bool((conv.get("inputs") or {}).get("bank")),
+                                "carry": (conv.get("carry") or {}).get("from") or "",
                                 # script turn index -> planned turn, which the
                                 # air copies onto every script-ledger line.
                                 "turns": {str(i): t["turn_id"] for t in conv["turns"]
@@ -947,7 +1124,29 @@ class System3Runtime:
                 return None
             with self.lock:
                 self.metrics["perf_applied"] += 1
-            return {d: float(dims.get(d) or 0) for d in system3.EMOTION_DIMS}
+            out = {d: float(dims.get(d) or 0) for d in system3.EMOTION_DIMS}
+            if (entry.get("system3") or {}).get("bank"):
+                # [s3-carry] a banked round's words were frozen before the round that
+                # just aired existed; its delivery still starts from where that round
+                # left the seat, fading over the carry window
+                carry = self.carry_now()
+                seat = _SEAT_OF.get(str(who or ""), "")
+                got = ((carry or {}).get("seats") or {}).get(seat) if carry else None
+                if isinstance(got, dict) and isinstance(got.get("dims"), dict):
+                    f = 0.4 * float(carry.get("factor") or 0)
+                    out = {d: round((1 - f) * out[d] + f * float(got["dims"].get(d) or 0), 3) for d in out}
+                    cid = str(_cid or "")
+                    if cid and cid not in self._carry_noted:
+                        self._carry_noted.add(cid)
+                        if len(self._carry_noted) > RECENT:
+                            self._carry_noted.pop()
+                        with self.lock:
+                            self.metrics["carry_delivery"] += 1
+                        self.observe_later(cid, "CARRY", {"stage": "delivery", "from": carry.get("from"),
+                                                          "factor": carry.get("factor"), "blend": round(f, 3),
+                                                          "why": "a banked round: the words were written in advance, "
+                                                                 "so only the voice starts from the last round's ending"})
+            return out
         except Exception as exc:  # noqa: BLE001
             self.fail("performance", exc)
             return None
@@ -1105,6 +1304,13 @@ class System3Runtime:
                         "stage": "script-ledger", "block": int(block), "sid": str(sid or ""),
                         "round": str(round_kind or ""), "lines": [x["line_id"] for x in lines],
                         "turns": [x["turn_id"] for x in lines]})
+                    # [s3-carry] the round is on the air in this order: what it leaves
+                    # behind is the next round's start
+                    conv = self.recent.get(cid) or self.store.conversation(cid, with_events=False)
+                    if conv:
+                        handed = self._hand_on(conv, [r for r in (rows or []) if isinstance(r, dict)])
+                        if handed:
+                            self.store.add_observation(cid, "CARRY", handed)
                 _STORE_POOL.submit(job)
         except Exception as exc:  # noqa: BLE001
             self.fail("ledger link", exc)
@@ -1339,8 +1545,17 @@ class System3Runtime:
         with self.lock:
             m = copy.deepcopy(self.metrics)
         m["pending_writes"] = self.pending
+        carry = self.carry_now()
+        with self.lock:
+            open_rounds = len(self.open)
         return {"ready": self.ready, "engine": system3.ENGINE_VERSION, "schema": system3.EVENT_SCHEMA,
                 "settings": self.settings, "config_hash": system3.config_hash(self.config),
+                # [s3-carry] what the next live round starts from
+                "carry": ({"from": carry.get("from"), "road": carry.get("road"), "age": carry.get("age"),
+                           "factor": carry.get("factor"), "seats": sorted((carry.get("seats") or {}).keys()),
+                           "landing": (carry.get("landing") or {}).get("text", "")[:120],
+                           "tempers": carry.get("tempers")} if carry else None),
+                "open_rounds": open_rounds,                                    # [s3-withhold]
                 "road_modes": {r: system3.road_mode(self.settings, r) for r in system3.ROADS},
                 "roads": self.roads(),                                           # [s3-roads]
                 "metrics": m,
@@ -1440,6 +1655,7 @@ def install(app, namespace):
     namespace["system3_direct_line"] = system3_direct_line
     namespace["system3_bind_line"] = rt.bind_line
     namespace["system3_observe_ledger"] = rt.observe_ledger
+    namespace["system3_withhold"] = rt.withhold                        # [s3-withhold]
     namespace["_system3"] = lambda: rt
 
     @app.on_event("startup")
@@ -1466,11 +1682,27 @@ def install(app, namespace):
                 await asyncio.sleep(3600)
         holder["task"] = asyncio.create_task(retention(), name="system3:retention")
 
+        async def sweep():
+            # [s3-withhold] planned rounds nobody bound are filed as abandoned
+            await asyncio.sleep(120)
+            while True:
+                try:
+                    filed = await asyncio.get_running_loop().run_in_executor(_STORE_POOL, rt.sweep_open)
+                    if filed:
+                        rt.log("System 3 filed %d planned round(s) as abandoned - never bound" % filed)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    rt.fail("abandon sweep", exc)
+                await asyncio.sleep(ABANDON_SWEEP)
+        holder["sweep"] = asyncio.create_task(sweep(), name="system3:sweep")
+
     @app.on_event("shutdown")
     async def stop_system3():
-        task = holder.get("task")
-        if task:
-            task.cancel()
+        for key in ("task", "sweep"):
+            task = holder.get(key)
+            if task:
+                task.cancel()
 
     def body_json(raw):
         try:

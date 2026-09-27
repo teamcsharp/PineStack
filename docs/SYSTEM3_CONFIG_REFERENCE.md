@@ -113,6 +113,9 @@ twice in a row: a collision trims or adds one middle turn. `act` is what the
 writer is told the turn does (`{host}`, `{cohost}`, `{first}` are filled in).
 A `line` structure has one seat and one leg per line. `topics` lets the
 TOPIC roll raise something off the board on a middle leg.
+`single_line` covers direct speech without an earlier road stamp. `reply`
+covers listener answers and draws ES and RS. Both use the same structure
+editor as the named record link, station ID, and interjection roads.
 
 The register - `/api/system3/status.roads` - lists every road with its
 writer, its hook, its mode and the label its lines carry when it stands
@@ -135,3 +138,33 @@ aside ("not directed by System 3").
 `sfx_every_units` (cadence floor), `sfxguy_rate` / `sfxguy_warp` / `drop_voice` (the SFX Guy's node), the round's weather roll (initial emotion
 dims per seat), System 2's budget (`seconds`, `words_high`), and
 `mean_turn_seconds(road)` for timing calibration from rendered audio.
+
+## The round's own rolls and the carry (2026-09-27, `[s3-rounds]`, `[s3-carry]`)
+
+Three tables joined the defaults (`tools/system3_rounds_patch.py`, engine
+`system3-engine/3`, default config hash `48e47262ef173867`):
+
+| Table | Family | Drawn | Reaches the writer as |
+|---|---|---|---|
+| `TEMPER1` | `TEMPER` | once per host seat per round, when the desk's `dice_hosts` switch is on; a temper worn in the last rounds weighs x0.25, the other seat's is excluded | the head of the running order: `TONIGHT'S TEMPERS (rolled): A (Host) is ...; B (Skip) is ...` |
+| `SHOCK1` | `SHOCK` | three stages: dice at `SHOCK_RATE_AT_FULL (1.0) x shock_beat`, the reaction, the turn (never the opener or the close, never a caller) | on that turn's row: `HERE Skip IS OPENLY APPALLED at what Host just said ...` |
+| `INTERJECT1` | `INTERJECT` | banter only, two host seats, no caller, six turns or more: dice at `INTERJECT_RATE_AT_FULL (1.0) x interjections`, the turn that runs long, three phrases (the desk's `diatribe_interjections` when it has any, else this table) | that turn's row says it goes on a roll; the running order gains two turns: the other host's `interject` (the phrases, a reaction not a reply) and the first host's `carry_on` |
+| - | `MENTION` | dice at `MENTION_RATE_AT_FULL (0.6) x mention`, then the turn | `Works the station's name, Pine Box FM, in naturally here` on that row |
+
+Controls added to `settings.controls`: `shock_beat`, `interjections`,
+`mention` (0.5 each by default, which reproduces the old odds where they were
+odds: one shock beat in two rounds, a 30% mention). They are rates, not
+weight multipliers. The rolls live on their own streams (`seed|round:<FAMILY>`),
+so the turn trajectory of a seed is unchanged and switching one family off
+never moves another's dice. They run only when the runtime asks
+(`inputs.round_rolls`): a stored conversation from before them replays as it
+was planned.
+
+**Carry** (`inputs.carry`, no table): the runtime hands a live or System 2
+round what the last round left on the air - each host seat's ending emotion,
+position and energy, the dynamics, up to three unresolved points, the line
+it landed on, the tempers it wore - decayed linearly over `CARRY_WINDOW`
+(1200 s). It is recorded as a `CARRY` event with no draw; turn 1's row picks
+up from the landing. A banked round takes it in the voice only, at air
+(`perf_state` blends 0.4 x factor of the carried dims). `GET
+/api/system3/status` shows `carry` and `open_rounds`.

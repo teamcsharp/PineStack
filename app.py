@@ -32995,7 +32995,7 @@ async def crystal_distill() -> None:
                  extra=note)
 
 
-def show_memory(own_material: bool = False) -> str:
+def show_memory(own_material: bool = False, system3: bool = False) -> str:
     """Tonight, remembered (#361): a compact, evolving digest of the
     session — time on air, what has played, the talk and the calls, the
     weather in the booth — woven into every write so the show builds on
@@ -33038,7 +33038,7 @@ def show_memory(own_material: bool = False) -> str:
         pass
     moods = {who: m for who, m
              in (_RADIO.get("speaker_macro") or {}).items() if m}
-    if moods:
+    if moods and not system3:          # [s3-rounds] under System 3 the ES rolls and the CARRY are the mood
         bits.append("moods right now: " + ", ".join(
             f"{'A' if w == 'dj' else 'B' if w == 'cohost' else w} is {m}"
             for w, m in moods.items()))
@@ -74577,6 +74577,56 @@ def _gem_is_stub(line: Any) -> bool:
     return not _cmu_knows(words[0])
 
 
+HARVEST_BAD_FOR = 12 * 3600.0     # [s3-rounds] a document whose repair came back unpunctuated waits this long
+_HARVEST_BAD: dict[str, float] = {}
+_HARVEST_BAD_PATH = data_path("speakbox_harvest_bad.json")
+
+
+def _harvest_bad_load() -> None:
+    if _HARVEST_BAD:
+        return
+    try:
+        got = json.loads(_HARVEST_BAD_PATH.read_text(encoding="utf-8"))
+        if isinstance(got, dict):
+            _HARVEST_BAD.update({str(k): float(v) for k, v in got.items()})
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def harvest_unrepaired(text: str) -> bool:
+    """[s3-rounds] A transcript repair that is still a transcript: fewer than
+    one sentence end per 300 characters over a reply long enough to judge
+    (505 of 566 replies on 2026-09-27 had none at all)."""
+    body = str(text or "").strip()
+    if len(body) < 300:
+        return not body
+    ends = len(re.findall(r"[.!?]", body))
+    return ends * 300 < len(body)
+
+
+def harvest_mark_bad(doc: Path, found: str = "") -> None:
+    _harvest_bad_load()
+    _HARVEST_BAD[doc.name] = time.time()
+    try:
+        _HARVEST_BAD_PATH.write_text(json.dumps(_HARVEST_BAD), encoding="utf-8")
+    except Exception:  # noqa: BLE001
+        pass
+    pipeline_log("speakbox", f"the transcript repair of {doc.name} came back unpunctuated - the document "
+                             f"is skipped for {int(HARVEST_BAD_FOR // 3600)} h; sentence windows stand in",
+                 extra=str(found or "")[:600])
+
+
+def harvest_skipped(doc: Path) -> bool:
+    _harvest_bad_load()
+    at = _HARVEST_BAD.get(doc.name)
+    if not at:
+        return False
+    if time.time() - float(at) > HARVEST_BAD_FOR:
+        _HARVEST_BAD.pop(doc.name, None)
+        return False
+    return True
+
+
 async def speakbox_harvest(doc: Path, rid: str = "") -> list[str]:
     """Read a passage of the document and pull the sayable lines out of it.
 
@@ -74607,8 +74657,16 @@ async def speakbox_harvest(doc: Path, rid: str = "") -> list[str]:
             "phrase you can. Do not summarise it, do not tidy up the "
             "language, do not add anything of your own and do not comment on "
             "it. Give back the repaired text and nothing else.\n\n"
-            + body, limit=5200, result_contract="transcript_repair")  # #1039
+            + body, limit=5200, result_contract="transcript_repair",
+            mark={"kind": "harvest"})  # #1039  [s3-rounds] its own lane category; yields to rounds
     except Exception:
+        return []
+    if harvest_unrepaired(found):
+        # [s3-rounds] the model handed the transcript back as it came - no
+        # sentence in it. Shelving that as gems put unpunctuated transcript in
+        # the hosts' mouths and asked for the same repair again on the next
+        # draw. The document is marked and skipped; sentence windows stand in.
+        harvest_mark_bad(doc, found)
         return []
 
     # "Here is the repaired text:" is not one of the gems.
@@ -76629,6 +76687,7 @@ async def speakbox_quote(exclude: str = "", most: int = 9, cap: int = 0,
     # single unused line ends the search, "three were mined" was almost
     # always "one was mined". Six, so an exhausted document costs a look
     # rather than the whole draw.
+    _harvested = False                  # [s3-rounds] one model repair per draw, at most
     for doc in order[:6]:               # a doc of pure headings is not fatal
         gems = speakbox_gems(doc, key)
         # 2026-09-08 (the scan): a stub the old window cut mid-word is not
@@ -76638,7 +76697,12 @@ async def speakbox_quote(exclude: str = "", most: int = 9, cap: int = 0,
         if not fresh:
             # Nothing left they have not used: read the document again at a
             # different point rather than repeat themselves.
-            gems = await speakbox_harvest(doc, key) or gems
+            # [s3-rounds] one harvest per draw, never a document whose repair
+            # came back unpunctuated: six failing repairs in one draw (25 s
+            # each) was how the harvest took over the writer lane
+            if not _harvested and not harvest_skipped(doc):
+                _harvested = True
+                gems = await speakbox_harvest(doc, key) or gems
             if not gems:                # the model is down; the show is not
                 gems = speakbox_lines(speakbox_body(doc))
             fresh = [line for line in gems
@@ -103702,6 +103766,40 @@ def _beat_content_words(text: str) -> set[str]:
             if len(word) >= 4 and word not in _BANTER_BEAT_STOP}
 
 
+def _beat_fresh_only(parsed: list[tuple[str, str]],
+                     made: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    """[s3-rounds] Drop the lines a beat handed back that were already
+    spoken. The writer re-emits the "immutable" completed transcript in
+    half its replies (163 of 302, 2026-09-27) and the zip below seated
+    those copies as the NEW turns - B's rolled "dread, takes the lead"
+    aired as B's earlier line word for word - while the fresh lines it
+    wrote after them were thrown away. A candidate that matches a made
+    line, or an earlier candidate in the same reply, is not a turn."""
+    import difflib
+
+    def key(text: str) -> str:
+        return " ".join(re.findall(r"[a-z0-9']+", str(text or "").lower()))
+    seen = [key(text) for _m, text in made if str(text or "").strip()]
+    out: list[tuple[str, str]] = []
+    for marker, text in parsed:
+        k = key(text)
+        if not k:
+            continue
+        dup = False
+        for old in seen:
+            if k == old or (len(k) >= 24 and len(old) >= 24 and (k in old or old in k)):
+                dup = True
+                break
+            if len(k) >= 24 and difflib.SequenceMatcher(None, k, old, autojunk=False).ratio() >= 0.85:
+                dup = True
+                break
+        if dup:
+            continue
+        seen.append(k)
+        out.append((marker, text))
+    return out
+
+
 def _beat_answers(previous: str, fresh: str) -> bool:
     """A free structural check before spending one optional retry."""
     new = " ".join(str(fresh or "").lower().split())
@@ -103781,7 +103879,8 @@ async def _banter_beats(context: str, sheet: str, lines: int,
             for row in rows)
         correction = (
             "\nThe prior attempt did not directly answer the last completed turn. "
-            "Use one of its concrete words in the first reply."
+            "Use one of its concrete words in the first reply. Do not repeat any line from the "
+            "completed transcript; every listed turn is a NEW line."
             if retry else "")
         prompt = (
             compact + "\n\nCOMPLETED TRANSCRIPT - these lines are immutable:\n" + recent
@@ -103796,7 +103895,7 @@ async def _banter_beats(context: str, sheet: str, lines: int,
             num_ctx=16384,
             mark={"kind": "banter beat", "from": rows[0]["turn"],
                   "until": rows[-1]["turn"], "retry": retry})
-        parsed = banter_turns(raw or "")
+        parsed = _beat_fresh_only(banter_turns(raw or ""), made)    # [s3-rounds]
         clean: list[tuple[str, str]] = []
         for row, candidate in zip(rows, parsed):
             text = spoken_text(candidate[1]).strip()
@@ -105025,10 +105124,14 @@ async def dj_banter(track: dict[str, Any] | None = None,
             + "Every line RESPONDS to the line before "
             "it: take in what was just said, react to it first — in so many "
             "words — then add your own. No line may ignore or talk past the "
-            f"previous one. At least once, {random.choice(['A', 'B'])} is "
-            f"openly {unrepeated(['shocked', 'surprised', 'furious', 'in disbelief', 'delighted', 'appalled'], 'internalize')} "
-            "at what the other has JUST said, says so, and the rest of the "
-            "conversation is driven by that. This time: "
+            "previous one. "
+            # [s3-rounds] under System 3 the SHOCK roll places this beat on a turn
+            + ("" if _s3_owns else
+               f"At least once, {random.choice(['A', 'B'])} is "
+               f"openly {unrepeated(['shocked', 'surprised', 'furious', 'in disbelief', 'delighted', 'appalled'], 'internalize')} "
+               "at what the other has JUST said, says so, and the rest of the "
+               "conversation is driven by that. ")
+            + "This time: "
             f"{angle}. Name the actual thing you are talking about. Play it "
             "straight and let the specifics be the joke — mock outrage, "
             "raised eyebrows, 'can you believe what he asked us for'. "
@@ -105048,7 +105151,8 @@ async def dj_banter(track: dict[str, Any] | None = None,
                "each, not a quip; the "
                "delivery system breathes and continues long lines "
                "automatically, so never truncate an idea to fit. ")
-            + (f"Work the station's name, {dj['station_name']}, in naturally "
+            + ("" if _s3_owns else                       # [s3-rounds] the MENTION roll
+               f"Work the station's name, {dj['station_name']}, in naturally "
                "once — the pair are proud of where they work (#459). "
                if random.random() < 0.3 else
                "Do not lean on the station's name this round — the station "
@@ -105068,7 +105172,7 @@ async def dj_banter(track: dict[str, Any] | None = None,
                 "of them chooses to react to. They are still themselves, "
                 "just caught in this mood tonight. Do not name the mood out "
                 "loud; perform it. ")
-               if dj.get("dice_hosts") else "")
+               if dj.get("dice_hosts") and not _s3_owns else "")   # [s3-rounds] TEMPER rolls it
             # #684: a long turn is a monologue with a witness unless the
             # other one is audibly still in the room. These are NOT replies
             # and they do not take the floor — they are forced in edgewise,
@@ -105088,7 +105192,7 @@ async def dj_banter(track: dict[str, Any] | None = None,
                f"reactions, NOT replies: the one on the roll does not stop, "
                f"does not answer them, and keeps going. Vary them; never use "
                f"the same one twice in a round. "
-               if dj.get("diatribe_interjections") and not caller_name else "")
+               if dj.get("diatribe_interjections") and not caller_name and not _s3_owns else "")   # [s3-rounds] INTERJECT rolls it
             + "No markdown, no emoji, no URLs, no "
             "stage directions, no asterisks. "
             # No fabricated tallies (#485): the pair kept inventing "you have
@@ -105126,7 +105230,7 @@ async def dj_banter(track: dict[str, Any] | None = None,
                if caller_name else "")
             + f".{seat_away_clause()}"           # #1034: the empty chair
             f"{playing}{only_song}{aside}"
-            f"{show_memory(own_material=own_material)}{call_flow}"
+            f"{show_memory(own_material=own_material, system3=_s3_owns)}{call_flow}"
             f"{crystal_clause(bank)}{avoid_reruns()}"
             f"{approach_clause(_approach)}"
             f"{weather_clause(_weather, caller_seat, bool(third))}\n\n"  # [#1232]
@@ -105248,13 +105352,16 @@ async def dj_banter(track: dict[str, Any] | None = None,
                 # #842: the banked one-call override keeps its wide context;
                 # live writing keeps the operator's num_ctx untouched.
                 num_ctx=(32768 if _bank_rich else 0),
-                mark=({"kind": "caller"} if caller_name else None),
+                mark=({"kind": "caller", "live": not bank} if caller_name
+                      else {"kind": "round", "live": not bank}),   # [s3-rounds]
                 result_contract=("structured_turns" if caller_name or _s3_owns
                                  else "spoken"),
             )
     except WritingDeferred as exc:
         pipeline_log("lookahead", "the banked beat chain remains owed - "
                      + str(exc)[:160])
+        if _s3 is not None and globals().get("system3_withhold"):      # [s3-rounds]
+            globals()["system3_withhold"](_s3, "the writer was deferred: " + str(exc)[:160], "writing")
         return []
     except Exception as exc:
         # #805: this `except` was SILENT, and the ledger showed what
@@ -105277,6 +105384,17 @@ async def dj_banter(track: dict[str, Any] | None = None,
             str((call_meta or {}).get("speakerbox_text") or ""),
             str((call_meta or {}).get("line") or ""))
 
+    if _s3_owns and not caller_name and not banter_turns(script or ""):
+        # [s3-rounds] NEVER THE SEED ALONE. A writer that returned nothing (a
+        # fragment-binned reply, a refused draft) fell through to the seed
+        # prepend below and aired as ONE turn of raw transcript with no reply
+        # and no close - 26 of 33 live banter rounds in 8 h, bound one second
+        # after they were planned. The round is withheld and says why.
+        if globals().get("system3_withhold"):
+            globals()["system3_withhold"](_s3, "the writer returned no turns", "writing")
+        pipeline_log("system3", "round withheld: the writer returned no turns - the seed passage does "
+                     "not stand in for a conversation", extra=str(road or "banter"))
+        return []
     # #805: ask_model returns "" when the reply fragment-binned — not an
     # exception, and previously not a call either. Same guarantee.
     if caller_name and not spoken_text(script or "") and _s3 is not None and getattr(_s3, "active", False):
@@ -110707,12 +110825,15 @@ async def ask_model(prompt: str, limit: int = 300,
         # more than the extra room was ever worth.
         num_ctx=model_ctx(),
         purpose=("sfx_tint_reserve" if _is_tint and _SFX_RESERVE_WRITING.get()
-                 else "station:" + str((mark or {}).get("kind") or "writing")),
+                 else "station:" + str((mark or {}).get("kind") or "writing")
+                 + (" live" if (mark or {}).get("live") else "")),    # [s3-rounds]
     )
     if result.get("deferred"):
         pipeline_log("lookahead", str(result.get("reason") or "writer admission deferred"))
         _mark_kind = str((mark or {}).get("kind") or "")
-        if "tint" in _mark_kind or _mark_kind == "banter beat":
+        if "tint" in _mark_kind or _mark_kind in ("banter beat", "round", "caller"):
+            # [s3-rounds] a ROUND's deferral is raised, never swallowed: "" here
+            # became a one-turn round (the seed passage alone) 26 times in 8 h
             raise WritingDeferred(str(result.get("reason") or "the writer is fully admitted"))
         return ""                       # no compute/quality failure is charged
     _retry_responses = _TINT_REPAIR_RESPONSES.get()
@@ -110927,6 +111048,10 @@ def _ollama_category(purpose: str) -> tuple[str, int]:
         return "sfx_reserve", 1
     if "tint" in purpose:
         return "tint", _ollama_category_cap("tint", purpose)
+    if purpose == "station:harvest":
+        # [s3-rounds] the transcript-repair harvest is its own category: one
+        # at a time, and it yields to every round writer (_harvest_yields)
+        return "harvest", 1
     return "station", _ollama_category_cap("station", purpose)
 
 
@@ -110951,6 +111076,55 @@ async def _tint_turn_yields(model: str, purpose: str,
                        and "tint round" in str(row.get("purpose") or "")
                        and row.get("state") in ("waiting", "active")
                        for row in list(_OLLAMA_JOBS.values())):
+                break
+            await asyncio.sleep(beat)
+    except Exception:  # noqa: BLE001
+        pass
+    return time.monotonic() - began
+
+
+LIVE_ROUND_WAIT = 45.0          # [s3-rounds] seconds a LIVE round waits for its writer slot
+HARVEST_YIELD_MOST = 180.0      # [s3-rounds] seconds the harvest yields to round writers
+
+
+async def _harvest_yields(model: str, purpose: str, most: float = HARVEST_YIELD_MOST,
+                          beat: float = 1.5) -> float:
+    """[s3-rounds] THE HARVEST WAITS FOR THE SHOW. Measured 2026-09-27: the
+    transcript-repair harvest (speakbox_harvest) held the writer lane 54% of
+    the hour - 610 calls, 25.6 s each - and every live round that arrived
+    while it did was refused admission, came back "", and aired as its seed
+    passage alone. A harvest now waits while any station round writer is
+    waiting or active on the same model, up to `most` seconds, then goes."""
+    if str(purpose or "") != "station:harvest":
+        return 0.0
+    began = time.monotonic()
+    try:
+        while time.monotonic() - began < most:
+            if not any(str(row.get("model")) == str(model)
+                       and str(row.get("category")) == "station"
+                       and row.get("state") in ("waiting", "active")
+                       for row in list(_OLLAMA_JOBS.values())):
+                break
+            await asyncio.sleep(beat)
+    except Exception:  # noqa: BLE001
+        pass
+    return time.monotonic() - began
+
+
+async def _live_round_waits(model: str, purpose: str, category: str, cap: int,
+                            most: float = LIVE_ROUND_WAIT, beat: float = 1.0) -> float:
+    """[s3-rounds] A LIVE round (its purpose ends " live") waits for a writer
+    slot rather than being refused on the spot - the refusal returned "" and
+    the round aired as its seed alone. Bounded by `most`; past it the caller
+    still sees the deferral, and System 3 withholds the round and says so."""
+    if not cap or not str(purpose or "").endswith(" live"):
+        return 0.0
+    began = time.monotonic()
+    try:
+        while time.monotonic() - began < most:
+            held = sum(row["model"] == model and row["category"] == category
+                       for row in list(_OLLAMA_JOBS.values()))
+            if held < cap:
                 break
             await asyncio.sleep(beat)
     except Exception:  # noqa: BLE001
@@ -111000,6 +111174,8 @@ async def call_ollama(
     # dict lookups beside that are unmeasurable.
     orch_used("the writing model", str(model)[:60])
     category, _cap = _ollama_category(purpose)
+    await _harvest_yields(model, purpose)                       # [s3-rounds]
+    await _live_round_waits(model, purpose, category, _cap)     # [s3-rounds]
     admitted = sum(row["model"] == model and row["category"] == category
                    for row in _OLLAMA_JOBS.values())
     if _cap and admitted >= _cap:
@@ -150637,7 +150813,12 @@ _PUBLIC_GET = {"/healthz", "/api/dj", "/api/dj/voice", "/api/dj/reacts",
                # allowed to be ASKED, and the answer for an unticked
                # listener is 403 either way.
                "/api/pinelink/mine",
-               "/api/pinelink/frame.jpg"}
+               "/api/pinelink/frame.jpg",
+               # #1471: the car diagnostics module and its
+               # throughput probe. The script is public code;
+               # the blob still demands the tune-in token.
+               "/car-diag.js",
+               "/api/car/blob"}
 # #1253: ...and the things the listener page itself asks for. The
 # gallery pictures and the icon font were never on this list, so on a
 # phone the artwork was a broken-image box and the icons fell back to
@@ -150666,7 +150847,10 @@ _PUBLIC_POST = {"/api/dj/join", "/api/dj/request", "/api/dj/shout",
                 "/api/music/vote",
                 # #1149: wake-only - the route refuses to pause anything,
                 # and it still demands a live listen token inside.
-                "/api/radio/unpause"}
+                "/api/radio/unpause",
+                # #1471: a tapped diagnostics capture from the
+                # car. Token-gated, size-capped, throttled.
+                "/api/car/report"}
 
 
 def _public_allows(method: str, path: str) -> bool:
@@ -151155,6 +151339,476 @@ async def station_stream_state(
     return STATION_STREAM.state()
 
 
+# --- #1471: CAR DIAGNOSTICS -----------------------------------------------
+# "When the stream stutters in the car, tap once." The tune page carries
+# frontend/car-diag.js: a ten-minute telemetry ring of what the PLAYER is
+# doing, and on a tap an active probe over the same road the audio takes.
+# It posts the lot here, and the station adds what IT was doing at that
+# instant - the loop, the stream sinks, the dead-air ledger, the camera
+# link, the listeners, the tailnet - then files the pair as a Pine Box
+# report so it lands in the same inbox every other fault does.
+#
+# Two rules. Every station reading is its own try: a report must never fail
+# to file because one reading could not be taken. And nothing here may
+# block the loop: the disk work (the ledger tail, the file write, the
+# listing) runs on a thread.
+CAR_REPORTS_DIR = data_path("car_reports")
+CAR_REPORT_INDEX = CAR_REPORTS_DIR / "index.jsonl"
+CAR_REPORT_MAX_BYTES = 1024 * 1024
+_CAR_REPORT_NAME_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}_[A-Za-z0-9.\-]{1,48}\.json$")
+_CAR_DIAG_JS = Path(__file__).resolve().parent / "frontend" / "car-diag.js"
+# A tap every few seconds is a stuck finger, not a diagnosis - and the route
+# is reachable by anyone holding a listen link, so it is bounded.
+_CAR_REPORT_RECENT: list[float] = []
+CAR_REPORT_MIN_GAP_S = 3.0
+CAR_REPORT_PER_HOUR = 60
+
+
+def _car_addr_safe(addr: str) -> str:
+    return (re.sub(r"[^A-Za-z0-9.\-]", "-", str(addr or "")).strip("-")
+            or "unknown")[:48]
+
+
+def _car_gap_tail(window_s: float = 900.0,
+                  max_bytes: int = 256 * 1024) -> dict[str, Any]:
+    """The dead-air ledger's last quarter hour: count, dead seconds, causes.
+
+    BLOCKING - a bounded tail read of data/gap_log.jsonl (the file is a
+    megabyte and growing; only its tail is opened). Every caller runs it
+    on a thread."""
+    now = time.time()
+    out: dict[str, Any] = {"window_s": window_s, "count": 0, "dead_s": 0.0,
+                           "worst_s": 0.0, "causes": {}, "last": []}
+    try:
+        with open(GAP_LOG_PATH, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            fh.seek(max(0, size - max_bytes))
+            raw = fh.read()
+    except FileNotFoundError:
+        out["note"] = "no gap_log.jsonl"
+        return out
+    lines = raw.split(b"\n")
+    if size > max_bytes and lines:
+        lines = lines[1:]                     # the first line is a torn one
+    rows: list[dict[str, Any]] = []
+    for ln in lines:
+        if not ln.strip():
+            continue
+        try:
+            r = json.loads(ln)
+            at = float(r.get("at") or 0)
+        except Exception:  # noqa: BLE001
+            continue
+        if now - at > window_s:
+            continue
+        try:
+            secs = float(r.get("seconds") or r.get("gap") or 0)
+        except Exception:  # noqa: BLE001
+            secs = 0.0
+        rows.append({"at": round(at, 1), "seconds": round(secs, 1),
+                     "cause": str(r.get("cause") or "")[:80],
+                     "basis": str(r.get("basis") or "")[:20]})
+    causes: dict[str, int] = {}
+    for r in rows:
+        causes[r["cause"] or "?"] = causes.get(r["cause"] or "?", 0) + 1
+    out.update({
+        "count": len(rows),
+        "dead_s": round(sum(r["seconds"] for r in rows), 1),
+        "worst_s": round(max((r["seconds"] for r in rows), default=0.0), 1),
+        "causes": dict(sorted(causes.items(), key=lambda kv: -kv[1])),
+        "last": rows[-5:],
+    })
+    return out
+
+
+def _car_tailscale() -> dict[str, Any]:
+    """The tailnet as the host last dropped it in (`tailscale status
+    --json` -> data/tailnet_peers.json): the iOS peers' online/relay/
+    lastSeen, and the snapshot's AGE beside them. BLOCKING (a file read);
+    runs on a thread. The container cannot run tailscale itself."""
+    try:
+        made = TAILNET_SNAPSHOT.stat().st_mtime
+        raw = json.loads(TAILNET_SNAPSHOT.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {"snapshot": None,
+                "note": ("no %s - drop `tailscale status --json` there from "
+                         "the host to have the phone's relay/lastSeen here"
+                         % TAILNET_SNAPSHOT.name)}
+    except Exception as exc:  # noqa: BLE001
+        return {"snapshot": None, "error": str(exc)[:200]}
+    peers: list[dict[str, Any]] = []
+    everyone = list((raw.get("Peer") or {}).values())
+    for p in everyone:
+        os_name = str(p.get("OS") or "")
+        if os_name.lower() not in ("ios", "ipados"):
+            continue
+        peers.append({
+            "name": str(p.get("HostName") or ""),
+            "os": os_name,
+            "online": bool(p.get("Online")),
+            "active": bool(p.get("Active")),
+            "relay": str(p.get("Relay") or ""),
+            "cur_addr": str(p.get("CurAddr") or ""),
+            "last_seen": str(p.get("LastSeen") or ""),
+            "rx": p.get("RxBytes"), "tx": p.get("TxBytes"),
+            "ips": [str(i) for i in (p.get("TailscaleIPs") or [])],
+        })
+    mine = raw.get("Self") or {}
+    return {
+        "snapshot_age_s": round(time.time() - made, 1),
+        "self": {"name": str(mine.get("HostName") or ""),
+                 "online": bool(mine.get("Online")),
+                 "relay": str(mine.get("Relay") or "")},
+        "ios_peers": peers,
+        "peers_total": len(everyone),
+    }
+
+
+async def _car_station_block(request: Request, token: str) -> dict[str, Any]:
+    """What the station was doing when the tap arrived. Each block is its
+    own try, and the blocking reads go to a thread."""
+    now = time.time()
+    st: dict[str, Any] = {"at": round(now, 3),
+                          "iso": time.strftime("%Y-%m-%d %H:%M:%S"),
+                          "build": int(_BUILD_MS)}
+    try:
+        st["addr"] = str(getattr(request.client, "host", "") or "")
+    except Exception:  # noqa: BLE001
+        st["addr"] = ""
+    try:
+        # Through the funnel every request arrives from the local proxy;
+        # the phone's own address, when the door passes it, is here.
+        st["xff"] = str(request.headers.get("x-forwarded-for") or "")[:120]
+        st["ua"] = str(request.headers.get("user-agent") or "")[:320]
+        st["public"] = request.headers.get("x-pinebox-public") == "1"
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        st["scope"] = token_scope(token)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        track = _RADIO.get("now") or {}
+        st["air"] = {"on": bool(_RADIO.get("on")), "paused": bool(radio_paused()),
+                     "title": str(track.get("title") or "")[:120],
+                     "artist": str(track.get("artist") or "")[:120]}
+    except Exception as exc:  # noqa: BLE001
+        st["air"] = {"error": str(exc)[:120]}
+    try:
+        # The same shape /api/stream/state serves: listener_rows (the mp3
+        # sinks, with delivered_x / behind_kb / dropped_kb), the last
+        # sessions, the HLS encoders, the mixer's counters. A sink has no
+        # address, so every row is kept rather than none matched.
+        st["stream"] = STATION_STREAM.state()
+    except Exception as exc:  # noqa: BLE001
+        st["stream"] = {"error": str(exc)[:120]}
+    try:
+        p = pulse_report(600)
+        st["pulse"] = {k: p.get(k) for k in ("stalls", "worst_s", "stalled_s",
+                                             "top", "stalling_now", "ok",
+                                             "reading", "gc")}
+    except Exception as exc:  # noqa: BLE001
+        st["pulse"] = {"error": str(exc)[:120]}
+    try:
+        st["gaps_15m"] = await asyncio.to_thread(_car_gap_tail)
+    except Exception as exc:  # noqa: BLE001
+        st["gaps_15m"] = {"error": str(exc)[:120]}
+    try:
+        pl = await asyncio.to_thread(pinelink_state)
+        pl.pop("doctor", None)
+        st["pinelink"] = pl
+    except Exception as exc:  # noqa: BLE001
+        st["pinelink"] = {"error": str(exc)[:120]}
+    try:
+        rows = listener_roster()
+        addrs = {a for a in (st.get("addr"),
+                             (st.get("xff") or "").split(",")[0].strip()) if a}
+        st["listeners"] = {
+            "rows": rows,
+            "audio_owner": audio_owner(),
+            "this_addr": [r for r in rows if str(r.get("addr") or "") in addrs],
+        }
+    except Exception as exc:  # noqa: BLE001
+        st["listeners"] = {"error": str(exc)[:120]}
+    try:
+        st["tailscale"] = await asyncio.to_thread(_car_tailscale)
+    except Exception as exc:  # noqa: BLE001
+        st["tailscale"] = {"error": str(exc)[:120]}
+    return st
+
+
+def _car_summary(rep: dict[str, Any], st: dict[str, Any], file: str) -> str:
+    """One line a person reads first: the phone's numbers, then the
+    station's, then where the whole capture is."""
+    def num(v: Any) -> float | None:
+        try:
+            f = float(v)
+            return f if f == f else None
+        except Exception:  # noqa: BLE001
+            return None
+
+    page = rep.get("page") if isinstance(rep.get("page"), dict) else {}
+    probe = rep.get("probe") if isinstance(rep.get("probe"), dict) else {}
+    now = rep.get("now") if isinstance(rep.get("now"), dict) else {}
+    five = rep.get("five") if isinstance(rep.get("five"), dict) else {}
+    pos = rep.get("pos") if isinstance(rep.get("pos"), dict) else {}
+    bits = ["road %s (%s)" % (str(page.get("road") or "?")[:12],
+                              str(page.get("mode") or "?")[:6])]
+    v = num(probe.get("rtt_med"))
+    bits.append("RTT %.0f ms" % v if v is not None else "RTT -")
+    v = num(probe.get("thru_kbps"))
+    bits.append("%.0f kbit/s" % v if v is not None else "throughput -")
+    v = num(now.get("ahead"))
+    bits.append("buffer %.1f s" % v if v is not None else "buffer -")
+    v = num(five.get("advance"))
+    bits.append("advance %.2f" % v if v is not None else "advance -")
+    try:
+        bits.append("%d stalls/5 min" % int(five.get("stalls") or 0)
+                    + (" +%d restarts" % int(five.get("resets") or 0)
+                       if five.get("resets") else ""))
+    except Exception:  # noqa: BLE001
+        pass
+    v = num(probe.get("seg_med_ms"))
+    if v is not None:
+        bits.append("HLS seg med %.0f ms" % v)
+    v = num(pos.get("kmh"))
+    if v is not None:
+        bits.append("moving %.0f km/h" % v)
+    elif pos.get("lat") is not None:
+        bits.append("position known")
+    else:
+        bits.append("no position (%s)" % str(pos.get("err") or "not asked")[:40])
+    try:
+        pulse = st.get("pulse") or {}
+        gaps = st.get("gaps_15m") or {}
+        bits.append("station: %d stalls/10 min worst %.1f s, %d gaps/15 min%s"
+                    % (int(pulse.get("stalls") or 0),
+                       float(pulse.get("worst_s") or 0),
+                       int(gaps.get("count") or 0),
+                       (" (%.0fs dead)" % float(gaps.get("dead_s") or 0)
+                        if gaps.get("count") else "")))
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        stream = st.get("stream") or {}
+        bits.append("stream %s, %d sinks" % (
+            "up" if stream.get("running") else "DOWN",
+            int(stream.get("listeners") or 0)))
+    except Exception:  # noqa: BLE001
+        pass
+    bits.append("file " + file)
+    return " · ".join(bits)
+
+
+def _car_write_report(name: str, doc: dict[str, Any], summary: str,
+                      pine_id: Any) -> str:
+    """BLOCKING: the JSON, written whole-or-not, and one index line so the
+    listing never has to open fifty megabyte-sized files."""
+    CAR_REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+    path = CAR_REPORTS_DIR / name
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(doc, default=str, ensure_ascii=False),
+                   encoding="utf-8")
+    os.replace(tmp, path)
+    with open(CAR_REPORT_INDEX, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps({"file": name, "at": doc.get("at"),
+                             "id": pine_id, "summary": summary,
+                             "addr": doc.get("station", {}).get("addr"),
+                             "xff": doc.get("station", {}).get("xff")},
+                            default=str, ensure_ascii=False) + "\n")
+    return str(path)
+
+
+def _car_reports_index(limit: int = 50) -> dict[str, Any]:
+    """BLOCKING: the index tail (bounded), newest first, each line checked
+    against the directory so a deleted file is not offered."""
+    rows: list[dict[str, Any]] = []
+    try:
+        with open(CAR_REPORT_INDEX, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            fh.seek(max(0, size - 256 * 1024))
+            raw = fh.read()
+        lines = raw.split(b"\n")
+        if size > 256 * 1024 and lines:
+            lines = lines[1:]
+        for ln in lines:
+            if not ln.strip():
+                continue
+            try:
+                rows.append(json.loads(ln))
+            except Exception:  # noqa: BLE001
+                continue
+    except FileNotFoundError:
+        pass
+    present: set[str] = set()
+    try:
+        present = {p.name for p in CAR_REPORTS_DIR.glob("*.json")}
+    except Exception:  # noqa: BLE001
+        pass
+    seen: set[str] = set()
+    out: list[dict[str, Any]] = []
+    for r in reversed(rows):
+        name = str(r.get("file") or "")
+        if not name or name in seen or name not in present:
+            continue
+        seen.add(name)
+        out.append(r)
+        if len(out) >= limit:
+            break
+    # files the index never heard of (an index lost or a hand-copied file)
+    for name in sorted(present - seen, reverse=True):
+        if len(out) >= limit:
+            break
+        if _CAR_REPORT_NAME_RE.match(name):
+            out.append({"file": name, "summary": "", "unindexed": True})
+    return {"reports": out, "count": len(present),
+            "dir": "data/car_reports"}
+
+
+@app.get("/car-diag.js")
+async def car_diag_js(t: str = "") -> Response:
+    """The diagnostics module for the tune page. Public code, like the
+    page itself; `t` is accepted and ignored so the tag can carry it."""
+    if not _CAR_DIAG_JS.is_file():
+        return Response(status_code=404)
+    return FileResponse(_CAR_DIAG_JS, media_type="application/javascript",
+                        headers={"Cache-Control": "no-store",
+                                 "X-Content-Type-Options": "nosniff"})
+
+
+@app.get("/api/car/blob")
+async def car_blob_api(
+    kb: int = 256,
+    t: str = "",
+    authorization: str | None = Header(default=None),
+) -> Response:
+    """kb of random bytes, uncacheable: the throughput probe. Random so
+    no proxy on the road can compress it into a flattering number."""
+    require_listen_auth(t, authorization)
+    n = max(1, min(1024, int(kb or 256)))
+    return Response(content=os.urandom(n * 1024),
+                    media_type="application/octet-stream",
+                    headers={"Cache-Control": "no-store",
+                             "X-Content-Type-Options": "nosniff"})
+
+
+@app.post("/api/car/report")
+async def car_report_api(
+    request: Request,
+    t: str = "",
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """The tap. Stores the phone's capture beside the station's own
+    reading of the moment under data/car_reports/, and files a Pine Box
+    report with the one-line summary so it lands in the inbox."""
+    require_listen_auth(t, authorization)
+    now = time.time()
+    _CAR_REPORT_RECENT[:] = [x for x in _CAR_REPORT_RECENT if now - x < 3600]
+    if _CAR_REPORT_RECENT and now - _CAR_REPORT_RECENT[-1] < CAR_REPORT_MIN_GAP_S:
+        raise HTTPException(status_code=429,
+                            detail="a report was filed a moment ago")
+    if len(_CAR_REPORT_RECENT) >= CAR_REPORT_PER_HOUR:
+        raise HTTPException(status_code=429,
+                            detail="that is enough reports for one hour")
+    raw = await request.body()
+    if len(raw) > CAR_REPORT_MAX_BYTES:
+        raise HTTPException(status_code=413, detail="a report is at most 1 MB")
+    try:
+        rep = await asyncio.to_thread(json.loads, raw or b"{}")
+    except Exception:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail="the report must be JSON")
+    if not isinstance(rep, dict):
+        raise HTTPException(status_code=400, detail="the report must be an object")
+    _CAR_REPORT_RECENT.append(now)
+
+    station = await _car_station_block(request, t)
+    eff = (str(station.get("xff") or "").split(",")[0].strip()
+           or str(station.get("addr") or ""))
+    name = "%s_%s.json" % (time.strftime("%Y-%m-%d_%H-%M-%S"),
+                           _car_addr_safe(eff))
+    rel = "data/car_reports/" + name
+    summary = _car_summary(rep, station, rel)
+    note = str(rep.get("note") or "").strip()[:500]
+
+    # The inbox first, so the file can carry its number.
+    text = "Car diagnostics (tap): " + summary
+    if note:
+        text += "\n\n> " + " ".join(note.split())
+    try:
+        # #1379: the station's own account rides on every report. Bounded,
+        # because it asks the ladder and the tablet on the way.
+        text += await asyncio.wait_for(pine_context_block(), 8.0)
+    except Exception:  # noqa: BLE001
+        pass
+    pine_id: Any = None
+    inbox_error = ""
+    try:
+        item = await pine_append(text)
+        pine_id = item.get("id")
+    except Exception as exc:  # noqa: BLE001
+        inbox_error = str(exc)[:200]
+
+    doc = {"v": 1, "summary": summary, "at": station.get("iso"),
+           "file": name, "pine_id": pine_id, "note": note,
+           "client": rep, "station": station}
+    file_error = ""
+    try:
+        await asyncio.to_thread(_car_write_report, name, doc, summary, pine_id)
+    except Exception as exc:  # noqa: BLE001
+        file_error = str(exc)[:200]
+    try:
+        pipeline_log("car", "car diagnostics filed%s: %s"
+                     % ((" as #%s" % pine_id) if pine_id else "", summary[:160]))
+    except Exception:  # noqa: BLE001
+        pass
+    ok = not file_error or pine_id is not None
+    return {
+        "ok": ok,
+        "id": pine_id,
+        "file": rel if not file_error else "",
+        "file_error": file_error,
+        "inbox_error": inbox_error,
+        "summary": summary,
+        "station": {
+            "pulse": (station.get("pulse") or {}).get("reading"),
+            "gaps_15m": (station.get("gaps_15m") or {}).get("count"),
+            "stream_running": (station.get("stream") or {}).get("running"),
+            "stream_listeners": (station.get("stream") or {}).get("listeners"),
+        },
+    }
+
+
+@app.get("/api/car/reports")
+async def car_reports_api(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Every capture on disk, newest first, with its one-line summary."""
+    require_read_auth(authorization)
+    return await asyncio.to_thread(_car_reports_index, 50)
+
+
+@app.get("/api/car/reports/{name}")
+async def car_report_get_api(
+    name: str,
+    authorization: str | None = Header(default=None),
+) -> Response:
+    """One capture, whole. The name is checked against the shape this
+    route writes; nothing else under data/ is reachable through it."""
+    require_read_auth(authorization)
+    if not _CAR_REPORT_NAME_RE.match(name):
+        raise HTTPException(status_code=400, detail="not a report name")
+    path = CAR_REPORTS_DIR / name
+    try:
+        data = await asyncio.to_thread(path.read_bytes)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="no such report")
+    return Response(content=data, media_type="application/json",
+                    headers={"Cache-Control": "no-store"})
+
+
 PWA_ICON_SIZES = (180, 192, 512)
 
 
@@ -151275,7 +151929,13 @@ async def tune_page(token: str, request: Request) -> HTMLResponse:
             # JavaScript rewrite ran. Put the token in initial markup so an
             # installed shortcut starts on its signed listener URL.
             .replace("__PWA_MANIFEST__",
-                     "/manifest.webmanifest?t=" + quote(token)),
+                     "/manifest.webmanifest?t=" + quote(token))
+            # #1471: the diagnostics module rides the tune-in token
+            # the same way the manifest does, and the build so a
+            # phone never runs a stale copy against a new station.
+            .replace("__CAR_DIAG_SRC__",
+                     "/car-diag.js?t=" + quote(token)
+                     + "&v=" + str(int(_BUILD_MS))),
         headers={"Cache-Control": "no-store, no-cache, must-revalidate",
                  "Pragma": "no-cache"})
 
@@ -229133,7 +229793,7 @@ async function system3Open(tab) {                       /* [s3-window] tab: tabl
     style.href = "/system3/system3.css?v=4"; document.head.append(style);
   }
   try {
-    const module = await import("/system3/system3.js?v=4");
+    const module = await import("/system3/system3.js?v=5");
     system3View = await module.openSystem3({request: (path, options) => api(path, options),
       tab: typeof tab === "string" ? tab : "",
       onClose: () => { system3View = null; }});
@@ -251167,6 +251827,10 @@ setTimeout(clockLoop, 1500);
   setTimeout(loop, 1200);
 })();
 </script>
+<!-- #1471: one tap in the car captures what the phone, the player and
+     the station were doing, and files it as a Pine Box report. Deferred
+     and last, so a script that fails to load leaves the page as it was. -->
+<script src="__CAR_DIAG_SRC__" defer></script>
 </body>
 </html>
 """

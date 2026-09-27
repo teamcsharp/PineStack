@@ -52,7 +52,8 @@ ROADS = ("banter", "caller", "recap", "ad", "news", "manager", "memo", "gallery"
          "track_talk", "station_id", "upstairs", "interject", "ad_spot",
          # [s3-lines] the single lines dj_speak still spoke outside a road
          "reply", "request", "open", "aside")
-FAMILIES = ("CTS", "ES", "RS", "IRS", "FL", "SPEAKERBOX", "SFX", "TOPIC", "SFXGUY", "LINE", "LENGTH")
+FAMILIES = ("CTS", "ES", "RS", "IRS", "FL", "SPEAKERBOX", "SFX", "TOPIC", "SFXGUY", "LINE", "LENGTH",
+            "TEMPER", "SHOCK", "INTERJECT", "MENTION", "CARRY")          # [s3-rounds] [s3-carry]
 PHASES = ("OPEN", "ESTABLISH", "DEVELOP", "ESCALATE", "EXPLORE", "WILDCARD",
           "RESOLVE", "WRAP", "SEGUE")
 SPEAKERBOX_MODES = ("NONE", "PREPEND", "APPEND", "FULL_SWATH", "REFERENCE",
@@ -81,6 +82,11 @@ DEFAULT_CONTROLS = {
     # [rng-topics] how often something off the operator's topics board
     # comes up: rate = TOPIC_RATE_AT_FULL x this (0.5 -> 40% of rounds).
     "topics": 0.5,
+    # [s3-rounds] the shock beat, the interjections forced in edgewise and the
+    # station-name mention: rate = <FAMILY>_RATE_AT_FULL x this
+    "shock_beat": 0.5,
+    "interjections": 0.5,
+    "mention": 0.5,
 }
 TAG_CONTROLS = {"disagreement": "disagreement", "escalation": "escalation",
                 "tangent": "tangent", "callback": "callback",
@@ -135,6 +141,16 @@ DEFAULT_SFXGUY = {
 }
 SECONDS_PER_WORD = 0.4          # 150 wpm; recalibrated from rendered audio
 TOPIC_RATE_AT_FULL = 0.8        # [rng-topics] the TOPIC dice at topics = 1.0
+# [s3-rounds] the round-level rolls that replaced dj_banter's prompt randoms:
+# the odds at a control of 1.0 (0.5, the default, halves them - which is the
+# legacy 30% for the station-name mention and one shock beat in two rounds).
+SHOCK_RATE_AT_FULL = 1.0
+INTERJECT_RATE_AT_FULL = 1.0
+MENTION_RATE_AT_FULL = 0.6
+HOST_SEATS = ("A", "B", "D")
+# [s3-carry] how long a round's ending state carries into the next round's
+# start (linear decay to nothing at the window)
+CARRY_WINDOW = 1200.0
 
 
 def clamp(value, low=0.0, high=1.0):
@@ -246,8 +262,8 @@ def validate_table(table):
     if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,23}", tid):
         raise ValueError("table id must be a short name such as ES2")
     family = str(table.get("family") or "")
-    if family not in ("CTS", "ES", "RS", "IRS", "FL"):
-        raise ValueError("table family must be one of CTS, ES, RS, IRS, FL")
+    if family not in ("CTS", "ES", "RS", "IRS", "FL", "TEMPER", "SHOCK", "INTERJECT"):
+        raise ValueError("table family must be one of CTS, ES, RS, IRS, FL, TEMPER, SHOCK, INTERJECT")
     cats = table.get("categories")
     if not isinstance(cats, list) or not cats:
         raise ValueError("a table needs at least one category")
@@ -356,7 +372,7 @@ def new_conversation(inputs, config, settings, seed=None, conversation_id=None):
         "revision": 1,
     }
     subject = inputs.get("subject") if isinstance(inputs.get("subject"), dict) else {}
-    return {
+    conv = {
         "schema": CONVERSATION_SCHEMA, "engine": ENGINE_VERSION,
         "identity": identity,
         "mode": road_mode(settings, identity["road_kind"]),
@@ -395,6 +411,57 @@ def new_conversation(inputs, config, settings, seed=None, conversation_id=None):
         "observed_delta": {}, "material_requests": [], "validation": None,
         "comparison": None, "bindings": [], "status": "planned",
     }
+    _apply_carry(conv, inputs.get("carry"))                             # [s3-carry]
+    return conv
+
+
+def _apply_carry(conv, carry):
+    """[s3-carry] THE LAST ROUND'S ENDING IS THIS ROUND'S START. Every
+    conversation used to begin cold - tension 0.35, every seat level,
+    position 0, nothing unresolved - so the roulette directed each segment
+    in isolation and the station heard segments that did not know each
+    other (measured 2026-09-27: initial emotions handed in on 0 of 1,308
+    rounds). The runtime hands in what the previous round left behind on
+    the air, decayed by its age; the seats present start there, the
+    unresolved points carry, and the landing line is what turn 1 picks up
+    from. Nothing here draws a number: it is state, recorded as a CARRY
+    event when the round is planned."""
+    if not isinstance(carry, dict) or not (carry.get("seats") or carry.get("landing")):
+        conv["carry"] = None
+        return
+    f = clamp(float(carry.get("factor") or 0))
+    seats = carry.get("seats") if isinstance(carry.get("seats"), dict) else {}
+    carried = []
+    for p in conv["participants"]:
+        got = seats.get(p["actor_id"])
+        if not isinstance(got, dict) or not got.get("category") or f <= 0:
+            continue
+        inten = round(clamp(float(got.get("intensity") or 0) * f), 3)
+        dims = got.get("dims") if isinstance(got.get("dims"), dict) else {}
+        p["emotion"] = {"table": str(got.get("table") or ""), "category": str(got["category"]),
+                        "id": str(got.get("id") or ""), "label": str(got.get("label") or got["category"]),
+                        "intensity": inten, "source": "carried", "since_turn": -1,
+                        "dims": {d: round(clamp(float(dims.get(d) or 0) * f), 3) for d in EMOTION_DIMS}}
+        p["intensity"] = inten
+        p["position"] = round(clamp(float(got.get("position") or 0) * f, -1, 1), 3)
+        p["energy"] = round(clamp(0.5 + (float(got.get("energy") or 0.5) - 0.5) * f), 3)
+        carried.append(p["actor_id"])
+    dyn = carry.get("dynamics") if isinstance(carry.get("dynamics"), dict) else {}
+    for k in ("tension", "agreement", "energy"):
+        if k in dyn:
+            base = float(conv["dynamics"][k])
+            conv["dynamics"][k] = round(clamp(base + (float(dyn[k]) - base) * f), 4)
+    if f > 0:
+        conv["subject"]["unresolved_points"] = [dict(x) for x in (carry.get("unresolved") or [])[-3:]
+                                               if isinstance(x, dict)]
+    landing = carry.get("landing") if isinstance(carry.get("landing"), dict) else {}
+    conv["carry"] = {"from": str(carry.get("from") or ""), "road": str(carry.get("road") or ""),
+                     "age": round(float(carry.get("age") or 0), 1), "factor": round(f, 3),
+                     "seats": carried,
+                     "landing": {"who": str(landing.get("who") or ""), "name": str(landing.get("name") or ""),
+                                 "text": " ".join(str(landing.get("text") or "").split())[:400]},
+                     "tempers": [str(x) for x in (carry.get("tempers") or [])][-6:],
+                     "unresolved": len(conv["subject"]["unresolved_points"])}
 
 
 def participant(conv, seat):
@@ -1075,6 +1142,7 @@ def _decide_turn(conv, config, settings, stream, step, speaker, want, inputs, cl
                 _ev["turn_id"], _ev["turn_index"] = turn_id, idx
     elif tp.get("id") and tp.get("reply") and tp.get("turn_index") == idx - 1:
         turn["bank_topic_reply"] = tp["reply"]
+    _attach_round_plans(conv, turn, idx, want, speaker)                      # [s3-rounds]
     draws = (config["structure"].get("closing") or {}).get("draws") if closing else step.get("draws")
     es_spec = None
     acts = []
@@ -1365,6 +1433,249 @@ def _length_decision(conv, settings, stream, inputs):
     return conv["length_roll"]
 
 
+def _round_rows(config, family, spec_filter=None):
+    """Every item of a family's enabled tables as candidate rows."""
+    rows = []
+    for table in _tables_for(config, family):
+        for cat in table.get("categories") or []:
+            if float(cat.get("weight", 1.0) or 0) <= 0:
+                continue
+            for item in cat.get("items") or []:
+                spec = _spec(table, cat, item)
+                if spec.get("enabled") is False:
+                    continue
+                w = float(item.get("weight", 1.0) or 0) * float(cat.get("weight", 1.0) or 0) * float(table.get("weight", 1.0) or 0)
+                if w <= 0:
+                    continue
+                rows.append({"id": spec["id"], "label": spec.get("label") or spec["id"], "text": spec.get("text", ""),
+                             "table": table["id"], "base": round(w, 4), "weight": round(w, 4), "why": []})
+    return rows
+
+
+def _dice_stage(rows_id, rows_label, rate, draw, why):
+    rows = [{"id": rows_id, "label": rows_label, "base": round(rate, 4), "weight": round(rate, 4), "why": [why]},
+            {"id": "NONE", "label": "not this round", "base": round(1 - rate, 4), "weight": round(1 - rate, 4), "why": []}]
+    pick = pick_index([r["weight"] for r in rows], draw["u"])
+    return _stage("dice", rows, pick, draw), (pick == 0)
+
+
+def _round_rolls(conv, config, settings, inputs, want, banter=True):
+    """[s3-rounds] THE ROUND'S OWN ROLLS, where dj_banter's prompt randoms stood.
+
+    Four station-side random() calls shaped every one-call round outside the
+    Rolodex and against the per-turn ES the running order carried: the hosts'
+    tempers (dice_hosts), "at least once X is openly shocked at what the other
+    has JUST said", the interjections forced in edgewise while one goes on a
+    roll, and whether the station's name is worked in. Each is a recorded
+    draw here, on the round's own stream (seed|round) so the turn trajectory
+    is unchanged, and each reaches the writer through the running order: the
+    tempers in its head, the rest on the turn they landed on. The CARRY the
+    runtime handed in is recorded first, so the audit shows what this round
+    started from."""
+    # one stream per family, so switching a family on or off (the desk's
+    # dice_hosts, an empty interjections list) never moves another's dice
+    streams = {f: DrawStream(str(conv["seed"]) + "|round:" + f) for f in ("TEMPER", "SHOCK", "INTERJECT", "MENTION")}
+    ctx0 = {"turn_id": "", "turn_index": -1}
+    controls = settings.get("controls") or {}
+    hosts = [p["actor_id"] for p in conv["participants"] if p["actor_id"] in HOST_SEATS]
+    if conv.get("carry"):
+        c = conv["carry"]
+        before = _snapshot(conv, conv["cursor"].get("initiator"))
+        ev = _event(conv, ctx0, "CARRY", [], {"id": "CARRIED", "label": "picks up from the last round (%s, %.0f s ago, x%.2f)"
+                                              % (c.get("road") or "a round", c.get("age") or 0, c.get("factor") or 0)},
+                    before, meta={"from": c.get("from"), "road": c.get("road"), "age": c.get("age"), "factor": c.get("factor"),
+                                  "seats": c.get("seats"), "landing": c.get("landing"), "unresolved": c.get("unresolved"),
+                                  "why": "the previous round's ending state, decayed by its age, is this round's start; "
+                                         "nothing was drawn"})
+        ev["state_after"] = before
+        c["event_id"] = ev["event_id"]
+    if not inputs.get("round_rolls"):
+        # a caller's protocol, a test plan, a conversation stored before these
+        # rolls existed: nothing is drawn and the trajectory is the old one
+        return
+    # TEMPER: one per host seat, the desk's dice_hosts switch still the gate
+    rows = _round_rows(config, "TEMPER") if inputs.get("dice_hosts") else []
+    if rows and hosts:
+        recent = set(str(x) for x in ((conv.get("carry") or {}).get("tempers") or []))
+        taken = set()
+        for seat in hosts:
+            cands = []
+            for r in rows:
+                row = dict(r, why=list(r["why"]))
+                if row["id"] in taken:
+                    row["weight"] = 0.0
+                    row["why"].append("the other seat has it tonight")
+                elif row["id"] in recent:
+                    row["weight"] = round(row["weight"] * 0.25, 4)
+                    row["why"].append("worn in the last rounds x0.25")
+                cands.append(row)
+            live = [r for r in cands if r["weight"] > 0] or cands
+            draw = streams["TEMPER"].next("TEMPER:%s" % seat)
+            k = pick_index([r["weight"] for r in live], draw["u"])
+            if k < 0:
+                continue
+            picked = live[k]
+            taken.add(picked["id"])
+            before = _snapshot(conv, seat)
+            ev = _event(conv, dict(ctx0, speaker=seat), "TEMPER", [_stage("item", live, k, draw)],
+                        {"id": picked["id"], "label": picked["label"], "text": picked["text"], "seat": seat,
+                         "table": picked["table"], "index": k + 1, "of": len(live)},
+                        before, meta={"seat": seat, "why": "the desk's dice_hosts switch is on: the temper %s is caught in "
+                                                            "tonight, colouring every turn underneath its own feeling" % seat},
+                        rng=draw)
+            ev["state_after"] = before
+            conv.setdefault("tempers", {})[seat] = {"id": picked["id"], "text": picked["text"], "event_id": ev["event_id"]}
+    # SHOCK: whether, which reaction, on which turn
+    rows = _round_rows(config, "SHOCK") if want >= 3 else []
+    if rows:
+        rate = round(clamp(SHOCK_RATE_AT_FULL * clamp(controls.get("shock_beat", DEFAULT_CONTROLS["shock_beat"]))), 4)
+        before = _snapshot(conv, conv["cursor"].get("initiator"))
+        d1 = streams["SHOCK"].next("SHOCK:dice")
+        st1, hit = _dice_stage("BEAT", "one open reaction turns the round", rate, d1,
+                               "shock_beat control %.2f x %.1f" % (clamp(controls.get("shock_beat", 0.5)), SHOCK_RATE_AT_FULL))
+        stages = [st1]
+        sel = {"id": "NONE", "label": "no shock beat this round"}
+        meta = {"rate": rate}
+        if hit:
+            d2 = streams["SHOCK"].next("SHOCK:item")
+            k = pick_index([r["weight"] for r in rows], d2["u"])
+            stages.append(_stage("item", rows, k, d2))
+            slots = list(range(1, max(2, want - 1)))
+            srows = [{"id": "t%d" % i, "label": "turn %d" % (i + 1), "base": 1.0, "weight": 1.0, "why": []} for i in slots]
+            d3 = streams["SHOCK"].next("SHOCK:turn")
+            sp = pick_index([r["weight"] for r in srows], d3["u"])
+            stages.append(_stage("turn", srows, sp, d3))
+            picked = rows[k]
+            sel = {"id": picked["id"], "label": "openly %s on turn %d" % (picked["text"], slots[sp] + 1), "text": picked["text"],
+                   "table": picked["table"], "turn_index": slots[sp]}
+            meta["turn_index"] = slots[sp]
+            conv["shock_plan"] = {"id": picked["id"], "text": picked["text"], "turn_index": slots[sp], "done": False}
+        ev = _event(conv, ctx0, "SHOCK", stages, sel, before, meta=meta, rng=d1)
+        ev["state_after"] = before
+        if conv.get("shock_plan"):
+            conv["shock_plan"]["event_id"] = ev["event_id"]
+    # INTERJECT: the banter cycle only, hosts only, a round long enough to hold it
+    phrases = [" ".join(str(x).split()) for x in (inputs.get("interjections") or []) if str(x or "").strip()]
+    table_rows = _round_rows(config, "INTERJECT")
+    if banter and want >= 6 and len(hosts) >= 2 and not any(p["actor_id"] in ("C", "E") for p in conv["participants"]) \
+            and (phrases or table_rows):
+        rate = round(clamp(INTERJECT_RATE_AT_FULL * clamp(controls.get("interjections", DEFAULT_CONTROLS["interjections"]))), 4)
+        before = _snapshot(conv, conv["cursor"].get("initiator"))
+        d1 = streams["INTERJECT"].next("INTERJECT:dice")
+        st1, hit = _dice_stage("ROLL", "one of them goes on a roll and the other gets a word in edgewise", rate, d1,
+                               "interjections control %.2f x %.1f" % (clamp(controls.get("interjections", 0.5)), INTERJECT_RATE_AT_FULL))
+        stages = [st1]
+        sel = {"id": "NONE", "label": "nobody goes on a roll this round"}
+        meta = {"rate": rate, "source": "the desk's diatribe_interjections" if phrases else "INTERJECT1"}
+        if hit:
+            slots = list(range(1, max(2, want - 3)))
+            srows = [{"id": "t%d" % i, "label": "turn %d" % (i + 1), "base": 1.0, "weight": 1.0, "why": []} for i in slots]
+            d2 = streams["INTERJECT"].next("INTERJECT:turn")
+            sp = pick_index([r["weight"] for r in srows], d2["u"])
+            stages.append(_stage("turn", srows, sp, d2))
+            pool = ([{"id": "p%d" % i, "label": t[:60], "text": t, "base": 1.0, "weight": 1.0, "why": []} for i, t in enumerate(phrases[:60])]
+                    if phrases else [dict(r) for r in table_rows])
+            chosen = []
+            for n in range(min(3, len(pool))):
+                live = [r for r in pool if r["id"] not in {c["id"] for c in chosen}]
+                d = streams["INTERJECT"].next("INTERJECT:phrase%d" % (n + 1))
+                k = pick_index([r["weight"] for r in live], d["u"])
+                if k < 0:
+                    break
+                stages.append(_stage("phrase-%d" % (n + 1), live, k, d))
+                chosen.append(live[k])
+            sel = {"id": "ROLL", "label": "turn %d runs long; %s" % (slots[sp] + 1, " / ".join(c["text"] for c in chosen)),
+                   "turn_index": slots[sp], "phrases": [c["text"] for c in chosen]}
+            meta["turn_index"] = slots[sp]
+            conv["interject_plan"] = {"turn_index": slots[sp], "phrases": [c["text"] for c in chosen], "done": False}
+        ev = _event(conv, ctx0, "INTERJECT", stages, sel, before, meta=meta, rng=d1)
+        ev["state_after"] = before
+        if conv.get("interject_plan"):
+            conv["interject_plan"]["event_id"] = ev["event_id"]
+    # MENTION: the station's name, worked in once
+    name = " ".join(str(inputs.get("station_name") or "").split())
+    if name and hosts and want >= 3:
+        rate = round(clamp(MENTION_RATE_AT_FULL * clamp(controls.get("mention", DEFAULT_CONTROLS["mention"]))), 4)
+        before = _snapshot(conv, conv["cursor"].get("initiator"))
+        d1 = streams["MENTION"].next("MENTION:dice")
+        st1, hit = _dice_stage("MENTION", "the station's name is worked in once", rate, d1,
+                               "mention control %.2f x %.1f" % (clamp(controls.get("mention", 0.5)), MENTION_RATE_AT_FULL))
+        stages = [st1]
+        sel = {"id": "NONE", "label": "the station IDs carry the name this round"}
+        meta = {"rate": rate, "name": name}
+        if hit:
+            slots = list(range(1, max(2, want - 1)))
+            srows = [{"id": "t%d" % i, "label": "turn %d" % (i + 1), "base": 1.0, "weight": 1.0, "why": []} for i in slots]
+            d2 = streams["MENTION"].next("MENTION:turn")
+            sp = pick_index([r["weight"] for r in srows], d2["u"])
+            stages.append(_stage("turn", srows, sp, d2))
+            sel = {"id": "MENTION", "label": "%s, on turn %d" % (name, slots[sp] + 1), "turn_index": slots[sp]}
+            meta["turn_index"] = slots[sp]
+            conv["mention_plan"] = {"turn_index": slots[sp], "name": name, "done": False}
+        ev = _event(conv, ctx0, "MENTION", stages, sel, before, meta=meta, rng=d1)
+        ev["state_after"] = before
+        if conv.get("mention_plan"):
+            conv["mention_plan"]["event_id"] = ev["event_id"]
+    conv["round_rolls"] = {"draws": {f: st.n for f, st in streams.items()}}
+
+
+def _attach_round_plans(conv, turn, idx, want, speaker):
+    """[s3-rounds] The shock beat and the mention land on the first host turn at
+    or after the turn they were rolled for (a caller's turn is skipped)."""
+    for key, family in (("shock_plan", "SHOCK"), ("mention_plan", "MENTION")):
+        plan = conv.get(key)
+        if (not isinstance(plan, dict) or plan.get("done") or plan.get("turn_index") is None
+                or idx < max(1, int(plan["turn_index"])) or idx >= want - 1 or speaker not in HOST_SEATS
+                or turn.get("step") in ("interject", "carry_on")):
+            continue
+        plan["done"] = True
+        plan["attached_index"] = idx
+        if family == "SHOCK":
+            turn["shock"] = {"id": plan.get("id"), "text": plan.get("text"), "event_id": plan.get("event_id")}
+            turn["decisions"].append({"family": "SHOCK", "event_id": plan.get("event_id", ""), "item": plan.get("id"),
+                                      "label": "openly %s" % plan.get("text")})
+        else:
+            turn["mention"] = plan.get("name")
+            turn["decisions"].append({"family": "MENTION", "event_id": plan.get("event_id", ""), "item": "MENTION",
+                                      "label": plan.get("name")})
+        for _ev in conv["decision_events"]:
+            if _ev["event_id"] == plan.get("event_id"):
+                _ev["turn_id"], _ev["turn_index"] = turn["turn_id"], idx
+
+
+def _interject_after(conv, config, settings, stream, want, inputs, seats):
+    """[s3-rounds] The turn just planned is the one that runs long: the other
+    host gets a word in edgewise as a turn of its own, and the first carries
+    straight on over it - two planned turns, alternating, inside the budget,
+    so the seat order the bind aligns on is exactly what the writer is told."""
+    plan = conv.get("interject_plan")
+    if not isinstance(plan, dict) or plan.get("done") or plan.get("turn_index") is None or not conv["turns"]:
+        return
+    long_turn = conv["turns"][-1]
+    if long_turn["index"] < int(plan["turn_index"]) or len(conv["turns"]) + 3 > want:
+        return
+    if long_turn["speaker"] not in HOST_SEATS or long_turn["step"] in ("interject", "carry_on"):
+        return
+    other = next((s for s in seats if s in HOST_SEATS and s != long_turn["speaker"]), None)
+    if not other:
+        return
+    plan["done"] = True
+    plan["attached_index"] = long_turn["index"]
+    long_turn["long_roll"] = True
+    t1 = _decide_turn(conv, config, settings, stream, {"id": "interject", "label": "Gets a word in edgewise",
+                                                      "draws": [{"family": "ES"}]}, other, want, inputs)
+    t1["interject"] = list(plan.get("phrases") or [])
+    # the decision rides the turn that runs long - the one the event points at
+    long_turn["decisions"].append({"family": "INTERJECT", "event_id": plan.get("event_id", ""), "item": "edgewise",
+                                   "label": " / ".join(t1["interject"])})
+    t2 = _decide_turn(conv, config, settings, stream, {"id": "carry_on", "label": "Carries on over it",
+                                                      "draws": [{"family": "ES"}]}, long_turn["speaker"], want, inputs)
+    t2["carry_on"] = True
+    for _ev in conv["decision_events"]:
+        if _ev["event_id"] == plan.get("event_id"):
+            _ev["turn_id"], _ev["turn_index"] = long_turn["turn_id"], long_turn["index"]
+
+
 def plan_more(conv, config, until=None, inputs=None):
     """Mode A: plan turns from the cursor up to `until` (the turn budget).
 
@@ -1387,6 +1698,9 @@ def plan_more(conv, config, until=None, inputs=None):
         # [rng-topics] once per round, before its first turn, against the
         # whole budget (Mode B plans a turn at a time).
         _topic_decision(conv, settings, stream, inputs, int(conv["timing"]["turn_budget"] or want))
+        # [s3-rounds] tempers, the shock beat, the interjections, the mention -
+        # and the CARRY - on the round's own stream
+        _round_rolls(conv, config, settings, inputs, int(conv["timing"]["turn_budget"] or want), banter=True)
     guard = 0
     while len(conv["turns"]) < want and guard < 400:
         guard += 1
@@ -1406,6 +1720,7 @@ def plan_more(conv, config, until=None, inputs=None):
             continue
         closing = len(conv["turns"]) == want - 1 and want >= 3
         _decide_turn(conv, config, settings, stream, step, speaker, want, inputs, closing=closing)
+        _interject_after(conv, config, settings, stream, want, inputs, seats)      # [s3-rounds]
     conv["draws"] = stream.n
     return conv
 
@@ -1592,6 +1907,8 @@ def _leg_row_add(t):
     if topic.get("text"):
         add += (" [It puts them in mind of something off the operator's topics board, and they "
                 "bring it up in their own words: %s.]" % json.dumps(sentence_cut(topic["text"], 300)))
+    if t.get("shock") or t.get("mention"):                                      # [s3-rounds]
+        add += " [" + _round_adds(t, "the other").lstrip(". ") + ".]"
     return add
 
 
@@ -1710,6 +2027,7 @@ def plan_legs(conv, config, inputs=None, road=None):
     if st.get("topics"):
         _topic_decision(conv, conv["settings"], stream, inputs, want, replies=False,
                         open_turns=[i for i, (leg, _s) in enumerate(seq) if leg.get("place") == "middle"])
+    _round_rolls(conv, config, conv["settings"], inputs, want, banter=False)      # [s3-rounds]
     seats = [p["actor_id"] for p in conv["participants"]]
     for leg, seat in seq:
         if seat not in seats:
@@ -1735,7 +2053,11 @@ def render_legs_sheet(conv):
         return ""
     rows = ["%2d  %s  - %s%s" % (t["index"] + 1, t["speaker"], t.get("protocol") or "keeps it going.",
                                  _leg_row_add(t)) for t in turns]
-    return "\n\n" + str(st.get("head") or "") + "\n" + "\n".join(rows) + "\n" + str(st.get("tail") or "")
+    who, quoted = _carry_landing(conv)                                        # [s3-carry]
+    carry_line = ("\nIt follows straight on from the last exchange, which landed on %s's words: %s - turn 1 picks up "
+                  "from there." % (who, quoted)) if quoted else ""
+    return ("\n\n" + str(st.get("head") or "") + _tempers_line(conv) + carry_line + "\n" + "\n".join(rows)
+            + "\n" + str(st.get("tail") or ""))
 
 
 def plan_line(conv, config, inputs=None):
@@ -1800,17 +2122,56 @@ def plan_line(conv, config, inputs=None):
 
 # --- the running order ----------------------------------------------------
 
+def _feel_words(turn):
+    perf = turn.get("performance") or {}
+    emo = perf.get("emotion") or ""
+    return ("%s (%s)" % (emo, _intensity_word(float(perf.get("intensity") or 0)))) if emo else ""
+
+
+def _carry_landing(conv):
+    """[s3-carry] (who, the words) the last round landed on, or ("", "")."""
+    landing = ((conv.get("carry") or {}).get("landing") or {})
+    text = " ".join(str(landing.get("text") or "").split())
+    if not text:
+        return "", ""
+    who = str(landing.get("name") or landing.get("who") or "the last voice on air")
+    return who, json.dumps(sentence_cut(text, 200))
+
+
+def _carry_lead(conv):
+    """[s3-carry] The landing of the last round, for turn 1 to pick up from."""
+    who, quoted = _carry_landing(conv)
+    if not quoted:
+        return ""
+    return "picks straight up from where the last exchange landed - %s said: %s - and" % (who, quoted)
+
+
 def _row_work(turn, conv):
     perf = turn.get("performance") or {}
     emo = perf.get("emotion") or ""
     lead = ""
     exchange = conv["subject"].get("exchange") or {}
+    prev0 = conv["turns"][turn["index"] - 1] if turn["index"] and turn["index"] - 1 < len(conv["turns"]) else None
+    prev0_name = str((prev0 or {}).get("name") or (prev0 or {}).get("speaker") or "")
+    if turn["step"] == "interject":                                           # [s3-rounds]
+        feel = _feel_words(turn)
+        phrases = ", ".join(json.dumps(x) for x in (turn.get("interject") or [])[:3])
+        return ("gets a word in edgewise while %s is still going - only a word or a handful, %s or anything in "
+                "that spirit%s. A reaction, not a reply: %s does not stop for it."
+                % (prev0_name, phrases or "a bare reaction", (", said in %s" % feel) if feel else "", prev0_name))
+    if turn["step"] == "carry_on":                                            # [s3-rounds]
+        feel = _feel_words(turn)
+        return ("carries straight on over the interruption and finishes the thought they were on - does not "
+                "answer %s, does not restart, keeps the head of steam%s." % (prev0_name, (", in %s" % feel) if feel else ""))
     if turn["index"] == 0 and exchange.get("opener"):
         lead = "opens with these exact words, as written: %s" % json.dumps(exchange["opener"])
     elif turn["index"] == 0 and conv["subject"].get("seeded"):
-        lead = "opens with the passage above, word for word, as their own speech"
+        who, quoted = _carry_landing(conv)                                   # [s3-carry]
+        lead = ("opens with the passage above, word for word, as their own speech"
+                + (" - as their answer to where the last exchange landed (%s said: %s)" % (who, quoted) if quoted else ""))
     elif turn["index"] == 0:
-        lead = "opens the subject"
+        carry = _carry_lead(conv)                                            # [s3-carry]
+        lead = (carry + " opens the subject") if carry else "opens the subject"
     elif turn.get("topic_change"):
         mat = turn.get("topic_material") or {}
         if mat.get("text"):
@@ -1869,6 +2230,7 @@ def _row_work(turn, conv):
     if replying and not answer_line:
         body += (". Picks up a word or claim from %s's line and takes it somewhere new - "
                  "never hands that line back as the whole turn" % prev_name)
+    body += _round_adds(turn, prev_name)                                      # [s3-rounds]
     topic = turn.get("bank_topic") or {}                                  # [rng-topics]
     if topic.get("reply"):
         body += (". Then, as though it has just come to mind, says these exact words, as written: %s"
@@ -1877,6 +2239,32 @@ def _row_work(turn, conv):
         body += (". It puts them in mind of something off the operator's topics board, and they "
                  "bring it up in their own words: %s" % json.dumps(sentence_cut(topic["text"], 300)))
     return body.strip().rstrip(".") + "."
+
+
+def _round_adds(turn, prev_name):
+    """[s3-rounds] What the round's rolls put on this turn: the shock beat,
+    the roll it goes on, the station's name."""
+    add = ""
+    if turn.get("shock"):
+        add += (". HERE %s IS OPENLY %s at what %s just said - says so in as many words - and everything "
+                "after this turn is driven by that" % (str(turn.get("name") or turn["speaker"]),
+                                                        str(turn["shock"].get("text") or "taken aback").upper(), prev_name or "the other"))
+    if turn.get("long_roll"):
+        add += (". Goes on a roll here: a rant, a diatribe, a story with a head of steam - well past the length of "
+                "the other turns, and it carries on over the interruption that follows")
+    if turn.get("mention"):
+        add += ". Works the station's name, %s, in naturally here - once, proud of where they work" % turn["mention"]
+    return add
+
+
+def _tempers_line(conv):
+    tempers = conv.get("tempers") or {}
+    if not tempers:
+        return ""
+    names = {p["actor_id"]: p.get("name") or p["actor_id"] for p in conv["participants"]}
+    parts = ["%s (%s) is %s" % (seat, names.get(seat, seat), t.get("text")) for seat, t in sorted(tempers.items())]
+    return ("\nTONIGHT'S TEMPERS (rolled): " + "; ".join(parts) + ". They colour the phrasing, the pacing and what "
+            "each of them chooses to react to, underneath each turn's own feeling. Never named out loud.")
 
 
 def render_sheet(conv):
@@ -1890,7 +2278,7 @@ def render_sheet(conv):
         return ""
     return ("\n\nTHE RUNNING ORDER OF THIS EXCHANGE. Write exactly these turns, in this order, one line "
             "each, and nothing else. Each line says the feeling to speak in and what the turn does - "
-            "perform both, never name them:\n" + "\n".join(rows) +
+            "perform both, never name them:" + _tempers_line(conv) + "\n" + "\n".join(rows) +
             "\nEvery numbered turn answers the turn above it by name or by quoting a word out of it, and "
             "then says something of its own: no turn repeats or echoes a line already said, "
             "not the other seat's and not its own. The feeling on a row is how that speaker feels "
@@ -1934,7 +2322,9 @@ def turn_stamp(conv, t):
             "speakerbox": [sb["mode"] for sb in t.get("speakerbox") or [] if sb["mode"] != "NONE"],
             "sfx": {k: (t.get("sfx") or {}).get(k) for k in ("play", "placement", "intent", "event_id")},
             # [s3-roads] his node: whether he speaks after this line and how
-            "sfxguy": {k: (t.get("sfxguy") or {}).get(k) for k in ("speak", "kind", "order", "event_id")}}
+            "sfxguy": {k: (t.get("sfxguy") or {}).get(k) for k in ("speak", "kind", "order", "event_id")},
+            # [s3-rounds] what the round's own rolls put on this turn
+            "round": {k: True for k in ("shock", "long_roll", "interject", "carry_on", "mention") if t.get(k)}}
 
 
 # --- validation ---------------------------------------------------------------
@@ -2174,6 +2564,11 @@ def replan(conv, config, from_index, until=None):
     conv["identity"]["revision"] += 1
     conv.setdefault("replans", []).append({"from": from_index, "dropped": dropped, "at": time.time(),
                                            "revision": conv["identity"]["revision"]})
+    for key in ("shock_plan", "mention_plan", "interject_plan"):                # [s3-rounds]
+        plan = conv.get(key)
+        if isinstance(plan, dict) and plan.get("done") and int(plan.get("attached_index", -1)) >= from_index:
+            plan["done"] = False
+            plan.pop("attached_index", None)
     return plan_more(conv, config, until=until)
 
 

@@ -10,6 +10,7 @@
  * here invents a roll for effect.
  */
 const FAM = {CTS: 'var(--cts)', ES: 'var(--es)', RS: 'var(--rs)', IRS: 'var(--irs)', FL: 'var(--fl)',
+  TEMPER: 'var(--es)', SHOCK: 'var(--rs)', INTERJECT: 'var(--fl)', MENTION: 'var(--cts)', CARRY: 'var(--es)',   /* [s3-rounds] [s3-carry] */
   SPEAKERBOX: 'var(--sb)', SFX: 'var(--sfx)', TOPIC: 'var(--topic)', SFXGUY: 'var(--sfxguy)', LINE: 'var(--line)',
   COMMIT: 'var(--obs)', REPAIR: 'var(--warn)'};
 const SIDE = {A: 'left', B: 'right', D: 'left', C: 'right', E: 'right'};
@@ -225,11 +226,25 @@ const FAMILY_WHAT = {
   TOPIC: ["Topic (the operator's board)",
     'Whether something off your topics board comes up in this round, which one, and on which turn - three draws, all recorded. The Topics dial sets the odds (0.5: 40% of rounds, 1.0: 80%, 0: never) and the least-sprung topics weigh most. The chosen turn still answers the line before it, then brings the topic up in its own words; a "1. / 2." entry is said word for word and answered word for word on the next turn. Nothing else puts a topic into a conversation.'],
   COMMIT: ['Script ledger', 'The round was frozen into the script ledger in the order it will be heard.'],
+  /* [s3-rounds] dj_banter's prompt randoms, as rolls */
+  TEMPER: ['Temper (TEMPER1)',
+    'The temper this host is caught in tonight - one draw per seat per round when the desk\'s dice_hosts switch is on. It goes into the running order\'s head and colours every turn underneath its own rolled feeling; a temper worn in the last rounds weighs a quarter.'],
+  SHOCK: ['Shock beat (SHOCK1)',
+    'Whether one speaker is openly taken aback by what the other has JUST said - says so, and the rest of the round is driven by it - which reaction, and on which turn. Three recorded draws; the shock_beat control sets the odds (0.5: one round in two).'],
+  INTERJECT: ['Interjections (INTERJECT1 or the desk\'s list)',
+    'Whether one host goes on a roll and the other gets a word in edgewise, on which turn, and which three phrases. The interjection and the carry-on are turns of their own in the running order, so the seat order the bind aligns on is exactly what the writer was told. Banter only; never on a call.'],
+  MENTION: ['Station-name mention',
+    'Whether the station\'s name is worked in once this round, and on which turn (the mention control: 0.5 is the old 30%). Otherwise the station IDs carry it.'],
+  CARRY: ['Carry (the last round\'s ending)',
+    'No draw. The round that aired last handed on each host seat\'s ending emotion, position and energy, the dynamics, its unresolved points and the line it landed on; decayed by its age over 20 minutes, that is where this round starts - and turn 1 picks up from that landing. A banked round takes it in the voice only, at air.'],
+  WITHHELD: ['Withheld', 'The round was planned and will not air: the reason is on the card (the writer was deferred, came back with no turns, or the draft was refused). Nothing stands in for it.'],
+  ABANDONED: ['Abandoned', 'Planned and never bound within half an hour - the station took an exit System 3 was not told about. Filed by the sweep so every spin of the Rolodex is accounted for.'],
   REPAIR: ['Repair', 'The written script ignored the running order badly enough that one bounded rewrite was asked for (banked rounds only).'],
 };
 const DIAL_FOR = {ES: ['emotional_volatility'], RS: ['disagreement', 'escalation', 'tangent', 'callback', 'novelty'],
   IRS: ['disagreement', 'escalation'], FL: ['tangent', 'callback', 'novelty', 'closure_aggressiveness', 'escalation'],
-  SPEAKERBOX: ['speakerbox_density'], SFX: ['sfx_aggression'], CTS: ['novelty'], TOPIC: ['topics']};
+  SPEAKERBOX: ['speakerbox_density'], SFX: ['sfx_aggression'], CTS: ['novelty'], TOPIC: ['topics'],
+  SHOCK: ['shock_beat'], INTERJECT: ['interjections'], MENTION: ['mention']};   /* [s3-rounds] */
 
 function kv(pairs) {
   return el('div', 's3-kv', ...pairs.filter(p => p && p[1] !== undefined && p[1] !== null && p[1] !== '')
@@ -3243,6 +3258,12 @@ export async function mount(root, {request, onClose, tab: startTab = '', table: 
   const message = el('div', {role: 'status', 'aria-live': 'polite'});
   const report = (error) => { message.className = 's3-error'; message.textContent = error.message || String(error); };
   const quiet = () => { message.className = ''; message.textContent = ''; };
+  /* [s3-save] a save is confirmed with the version it made - the live config's
+     hash and note - so "did that take?" is never a question (the ledger held
+     the default cycle while the operator believed the graph was saved) */
+  let noticeTimer = 0;
+  const notice = (text) => { message.className = 's3-ok'; message.textContent = text; clearTimeout(noticeTimer); noticeTimer = setTimeout(() => { if (message.className === 's3-ok') quiet(); }, 9000); };
+  const saved = (what, res) => notice('Saved ' + what + (res && res.hash ? ' - live config ' + res.hash : '') + (res && res.structure && res.structure.version ? ' (v' + res.structure.version + ')' : '') + '. The desk uses it from the next round.');
   const metrics = el('div', 's3-metrics');
   const modePill = el('span', 's3-pill');
   const tabs = el('div', 's3-tabs');
@@ -3490,7 +3511,7 @@ export async function mount(root, {request, onClose, tab: startTab = '', table: 
       editor.append(box);
     }
     editor.append(el('div', 's3-row',
-      btn('Save table', async () => { try { await send('/api/system3/tables/' + draft.id, 'PUT', draft); await loadConfig(); draft = null; paint(); } catch (e) { report(e); } }),
+      btn('Save table', async () => { try { const res = await send('/api/system3/tables/' + draft.id, 'PUT', draft); await loadConfig(); draft = null; paint(); saved('table ' + (res && res.table ? res.table.id : ''), res); } catch (e) { report(e); } }),
       btn('Add category', () => { const id = prompt('New category id'); if (id) { draft.categories.push({id, label: id.toUpperCase(), weight: 1, items: [{id: id + '.one', label: 'one', weight: 1}]}); paintTables(); } }),
       btn('Make a supplemental table from this one', async () => {
         const id = prompt('New table id (for example ES2)'); if (!id) return;
@@ -3587,7 +3608,7 @@ export async function mount(root, {request, onClose, tab: startTab = '', table: 
       el('p', {class: 's3-muted', text: 'Mark the lines that roll for a speakerbox insertion before (prepend) or after (append) them. The odds are the prepend and append sliders on the DJ desk, scaled by the Speakerbox density control.'}),
       nodes, el('div', 's3-row',
         btn('Add step', () => { steps.push({id: 'step' + (steps.length + 1), label: 'New step', speaker: 'responder_a', draws: [{family: 'ES'}, {family: 'RS'}], speakerbox: []}); paintStructure(); }),
-        btn('Save structure', async () => { try { steps.forEach((s, i) => { s.id ||= 'step' + i; }); await send('/api/system3/structure', 'PUT', {steps}); await loadConfig(); steps = null; paint(); } catch (e) { report(e); } }),
+        btn('Save structure', async () => { try { steps.forEach((s, i) => { s.id ||= 'step' + i; }); const res = await send('/api/system3/structure', 'PUT', {steps}); await loadConfig(); steps = null; paint(); saved('the banter cycle', res); } catch (e) { report(e); } }),
         btn('Discard', () => { steps = null; paintStructure(); }))));
   }
 
@@ -3718,18 +3739,19 @@ export async function mount(root, {request, onClose, tab: startTab = '', table: 
         const name = prompt('Name for the variant of ' + base + ':', (st.label || base) + ' B'); if (!name) return;
         const n = Object.keys(segStructures()).filter(k => k.startsWith(base + '~v')).length + 1;
         const key = base + '~v' + n;
-        try { await send('/api/system3/structures/' + encodeURIComponent(key), 'PUT', {...st, legs: nodes, label: name, weight: 1, enabled: true, variant_of: base});
-          await loadConfig(); segRoad = key; segNodes = null; quiet(); repaint(); } catch (e) { report(e); }
+        try { const res = await send('/api/system3/structures/' + encodeURIComponent(key), 'PUT', {...st, legs: nodes, label: name, weight: 1, enabled: true, variant_of: base});
+          await loadConfig(); segRoad = key; segNodes = null; repaint(); saved('variant ' + key, res); } catch (e) { report(e); }
       }),
       isVariant ? el('label', 's3-row', 'weight', el('input', {type: 'number', min: 0, max: 50, step: 0.1, value: st.weight == null ? 1 : st.weight, style: 'width:72px', onchange: e => { st.weight = +e.target.value; }})) : null,
       isVariant ? el('label', 's3-row', el('input', {type: 'checkbox', checked: st.enabled !== false, onchange: e => { st.enabled = e.target.checked; }}), 'runs on the station') : null,
       btn('Save segment', async () => { try {
-          if (cycle) { nodes.forEach((x, i) => { x.id = x.id || 'step' + i; }); await send('/api/system3/structure', 'PUT', {steps: nodes}); }
-          else { nodes.forEach((lg, i) => { lg.id = lg.id || 'leg' + i; }); await send('/api/system3/structures/' + encodeURIComponent(segRoad), 'PUT', {...st, legs: nodes}); }
-          await loadConfig(); segNodes = null; quiet(); repaint(); } catch (e) { report(e); } }),
+          let res;
+          if (cycle) { nodes.forEach((x, i) => { x.id = x.id || 'step' + i; }); res = await send('/api/system3/structure', 'PUT', {steps: nodes}); }
+          else { nodes.forEach((lg, i) => { lg.id = lg.id || 'leg' + i; }); res = await send('/api/system3/structures/' + encodeURIComponent(segRoad), 'PUT', {...st, legs: nodes}); }
+          await loadConfig(); segNodes = null; repaint(); saved(cycle ? 'the banter cycle' : 'the ' + segRoad + ' segment', res); } catch (e) { report(e); } }),
       btn('Discard', () => { segNodes = null; repaint(); }),
       isVariant ? btn('Delete variant', async () => { if (!confirm('Delete ' + segRoad + '?')) return;
-        try { await send('/api/system3/structures/' + encodeURIComponent(segRoad), 'DELETE'); await loadConfig(); segRoad = base; segNodes = null; repaint(); } catch (e) { report(e); } }) : null,
+        try { const res = await send('/api/system3/structures/' + encodeURIComponent(segRoad), 'DELETE'); await loadConfig(); segRoad = base; segNodes = null; repaint(); saved('- deleted variant ' + (res && res.deleted || segRoad), res); } catch (e) { report(e); } }) : null,
       el('span', {class: 's3-muted', text: cycle ? 'The banter cycle loops for the segment; each step is a node with its own draws.'
         : `Turn budget ${st.min_turns || '?'}-${st.max_turns || '?'}. ${isVariant ? 'This variant' : 'Every variant'} rolls against the base by weight (VARIANT) each time the road runs.`}));
     fill(body, el('div', 's3-seg', el('div', 's3-seg-side', el('div', 's3-card', palette), el('div', 's3-card', el('h2', {text: 'Properties'}), props)),
@@ -4083,10 +4105,23 @@ export async function mount(root, {request, onClose, tab: startTab = '', table: 
           el('td', null, el('span', {class: 's3-pill ' + (r.mode === 'active' ? 'active' : r.mode === 'shadow' ? 'shadow' : 'off'), text: r.mode + (r.label_air ? ' · ' + r.label_air : '')})),
           el('td', {text: r.what}),
           el('td', {class: 's3-muted', text: r.writer + (r.hook ? ' -> ' + r.hook : '')}))))));
+    /* [s3-save] every saved version of the tables and structures, newest first,
+       the live one marked - what the desk is actually running */
+    const versionsCard = () => {
+      const rows = ((config && config.versions) || []).slice(0, 40);
+      const live = (config && config.hash) || '';
+      return el('div', 's3-card', el('h2', {text: 'Config versions'}),
+        el('p', {class: 's3-muted', text: 'Every save of a table, the banter cycle or a segment is a version in the ledger. The live one is what the roulette plans from right now; a graph that is not in this list is not on the station.'}),
+        rows.length ? el('table', 's3-table', el('thead', null, el('tr', null, el('th', {text: 'when'}), el('th', {text: 'hash'}), el('th', {text: 'note'}))),
+          el('tbody', null, ...rows.map(r => el('tr', {class: r.hash === live ? 's3-live' : ''},
+            el('td', {text: r.created ? new Date(r.created * 1000).toLocaleString() : ''}),
+            el('td', null, el('code', {text: r.hash}), r.hash === live ? el('span', {class: 's3-pill active', text: 'live'}) : null),
+            el('td', {text: r.note || ''}))))) : para('No saved versions yet - the defaults are live.', 's3-muted'));
+    };
     const section = (name, help) => {
       const area = el('textarea', {value: json(cfg[name] || {})});
       return el('div', 's3-card', el('h2', {text: name}), el('p', {class: 's3-muted', text: help}), area,
-        btn('Save ' + name, async () => { try { await send('/api/system3/config/section/' + name, 'PUT', JSON.parse(area.value)); await loadConfig(); quiet(); } catch (e) { report(e); } }));
+        btn('Save ' + name, async () => { try { const res = await send('/api/system3/config/section/' + name, 'PUT', JSON.parse(area.value)); await loadConfig(); saved(name, res); } catch (e) { report(e); } }));
     };
     fill(body, el('div', 's3-grid2',
       el('div', 's3-card', el('h2', {text: 'Authority'}),
@@ -4101,6 +4136,7 @@ export async function mount(root, {request, onClose, tab: startTab = '', table: 
         btn('Reset controls to defaults', async () => { try { settings.settings = (await send('/api/system3/settings', 'POST', {reset: true})).settings; paint(); } catch (e) { report(e); } }),
         btn('Reset tables and structure to defaults', async () => { if (!confirm('Replace the live tables and structure with the defaults? The current version stays in the ledger.')) return; try { await send('/api/system3/config/reset', 'POST'); await loadConfig(); paint(); } catch (e) { report(e); } }))),
       roadsCard(),
+      versionsCard(),
       section('speakerbox', 'Mode weights for a hit (verbatim / reference / callback), the inline passage budget per round, and passage length.'),
       section('sfx', 'The SFX Guy: planned-clip probability at aggression 0 and 1, the first-exchange clip, and the arousal and comedy boosts. The station\'s cadence stays the floor.'),
       section('sfxguy', 'The SFX Guy\'s mouth: his node on every host turn. rate_by_dial uses the desk\'s interjections dial for whether he pipes up; reaction_by_warp uses the invention dial for how often a line is fired back at the one just said; news_share is the wire; never_over_callers keeps him off a caller\'s turn.'),

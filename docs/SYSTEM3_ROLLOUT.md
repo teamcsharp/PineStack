@@ -125,6 +125,25 @@ Engine `system3-engine/3`: the SFX Guy's numbers come off their own stream
 golden trajectory is unchanged and only the default config hash moved.
 Decision replay dispatches by road (line, call, legs, cycle).
 
+### Shared speech door and clean live start
+
+`dj_speak` now obtains an active System 3 node for every line that does not
+already carry one. Listener replies use the editable `reply` structure (ES and
+RS); other direct single-voice lines use `single_line` or their named line
+road. The node's performance vector guides the voice, its running order
+guides newly written words, and the final words are bound to the node before
+the line id is recorded. The default mode is active.
+
+`speak_turns` withholds an unstamped round while System 3 is active. The
+deep-conversation road and saved-exchange button now ask `dj_banter` for a
+new System 3-directed performance. Failed stock-line and produced-ad draws
+withhold the old item instead of selecting it with the station randomizer.
+The legacy manager cut-in prompt, random Speakerbox reaction prompts, and
+old record callback frames stand down under active direction. Speakerbox
+material remains available to the System 3 running order. Old prepared
+dialogue must be purged from the pantry, shelf and larder before expecting
+every newly aired line to carry its System 3 origin.
+
 **The Messenger keeps step with the audio.** The Rolodex used to turn when a
 round arrived; the operator watched it run ahead of the voice. Now the page
 tells the embedded view which line is on air (`live`) and where the clip has
@@ -186,8 +205,85 @@ material is fetched with a little slack and cut back. The rest of the
 mid-phrase lines are fill fragments outside System 3 (gold bars and
 punctuation rows made from a turn's last chunk) - not moved yet.
 
+## 2026-09-27 — active broadcast admission
+
+- A single spoken line receives a System 3 line plan and turn stamp before
+  synthesis. The `single_line` and `reply` roads are editable in the System 3
+  register. A missing active plan withholds the line.
+- A multi-turn round admits only script turns with matching System 3 turn IDs
+  and dice. Prepared audio is checked by spoken text because one script turn
+  can contain several clips. An incomplete conversation with fewer than half
+  its planned turns is withheld; severely short live drafts get a repair pass.
+- Active caller rounds no longer insert the stock hello, and active rounds no
+  longer swap a planned turn for unrelated shelf text or run a legacy
+  freshener after binding. The System 3 emotion vector reaches live speech.
+- Automatic SFX Guy speech requires its planned node. The Banter button now
+  lets System 3 choose its shape and does not speak a stock acknowledgment.
+- The audio encoder now invokes the system `nice` command without a Python
+  `preexec_fn`; this removes a fork deadlock seen during the live audit.
+
 ### Next (queued, in this order)
 1. `docs/SFX_vector_reuse`: the SFX Guy's vector database and crystal made
    accessible to outside applications (lexical, semantic, action, situation,
    emotional, intent, theme, metaphorical, visual), sectioned, backed up,
    redeployable.
+
+## 2026-09-27 — the rolls reach the air (`tools/system3_rounds_patch.py`, `[s3-rounds]`, `[s3-carry]`, `[s3-withhold]`)
+
+Measured over 8 h before this batch (scripts in the session scratchpad;
+read `data/system3.sqlite3` and `data/prompt_history.sqlite3` read-only):
+
+- the transcript-repair harvest (`speakbox_harvest`) held the one writer
+  lane 54% of the hour (610 calls x 25.6 s); 505 of 566 replies came back
+  with no punctuation and were shelved as gems anyway;
+- every round that arrived while it did was refused admission, `ask_model`
+  returned `""`, and dj_banter prepended the seed passage: 26 of 33 live
+  banter rounds aired as ONE turn of raw transcript, bound one second after
+  they were planned; 35 news, 12 memo and 7 gallery System 2 rounds bound
+  zero turns;
+- the banked beat writer re-emitted the "immutable" transcript in 163 of 302
+  replies and `zip()` seated the copies as the new turns;
+- four station-side `random()` directives fought the per-turn ES in ~120
+  one-call prompts; `initial_emotions` were handed in on 0 of 1,308 rounds;
+- the live config's cycle and tables were the defaults (the only save was a
+  news variant dropped 11 ms later); 247 planned rounds were never bound and
+  recorded nothing.
+
+Shipped (23 app.py edits, engine + runtime + editor, 115 tests green):
+
+1. **The lane.** `station:harvest` is its own admission category (cap 1);
+   `_harvest_yields` waits while any round writer is waiting or active;
+   `_live_round_waits` gives a LIVE round (`mark.live`, purpose `... live`)
+   up to 45 s for a slot; a document whose repair came back unpunctuated
+   is marked (`data/speakbox_harvest_bad.json`) and skipped 12 h; one
+   harvest per speakbox draw.
+2. **Never the seed alone.** A deferred ROUND raises `WritingDeferred`; a
+   writer that returned no turns withholds the round. Both are recorded
+   (`system3_withhold`), and a sweep files rounds nobody bound in 30 min as
+   `ABANDONED`.
+3. **Beats.** `_beat_fresh_only` drops the lines a beat handed back that
+   were already spoken before they are seated; the retry says so.
+4. **The prompt randoms are rolls.** `TEMPER1` / `SHOCK1` / `INTERJECT1`
+   tables, the `shock_beat` / `interjections` / `mention` controls, on
+   their own streams; the four prompt clauses and "moods right now" stand
+   down when System 3 owns the round. Default config hash
+   `48e47262ef173867`.
+5. **Carry.** The last round's ending (seats' emotion, position, energy,
+   dynamics, unresolved points, landing line, tempers) is the next live or
+   System 2 round's start, decayed over 20 minutes; turn 1 picks up from the
+   landing; banked rounds take it in the voice at air.
+6. **The editor says what it saved** (`s3-ok` notice with the live hash and
+   version) and the Controls tab lists every config version with the live
+   one marked. `system3.js?v=5`.
+
+Verify after the restart: `/api/system3/status` (`carry`, `open_rounds`,
+`metrics.withheld / abandoned / carried / carry_in`), prompt-history purposes
+`station:round live` / `station:harvest`, plan->bind seconds no longer under
+3 s for live banter, and the pipeline log's `the transcript repair of ...
+came back unpunctuated`.
+
+### Next
+- The `talk_radio / 150` force-seed (67% of rounds open on a passage) is the
+  one station-side random left in dj_banter's round shape.
+- The tablet APK carries `script-page.js` with `system3.js?v=4`; rebuild to
+  pick up v5 (the desktop and the served page already do).

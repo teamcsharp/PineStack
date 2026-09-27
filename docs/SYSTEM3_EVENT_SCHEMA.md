@@ -249,3 +249,42 @@ speakerbox, sfx), structure, budget {turn_budget, target_seconds,
 estimated_seconds, turn_seconds, length_roll}, verdict, line_choice} |
 false | null, register {roads, directed, mode}}`. `false` is a line no
 node made.
+
+## The round's rolls, the carry, withheld rounds (2026-09-27, `[s3-rounds]`, `[s3-carry]`, `[s3-withhold]`)
+
+Decision events, all with `turn_index: -1` at planning (a `SHOCK` / `MENTION`
+event is re-pointed at the turn it lands on; an `INTERJECT` event at the turn
+that runs long):
+
+- `CARRY` - no `rng`, no stages. `selected.id = CARRIED`; `meta`: `from`
+  (conversation id), `road`, `age`, `factor`, `seats`, `landing {who, name,
+  text}`, `unresolved`. Present only when the runtime handed a carry in.
+- `TEMPER` - one per host seat; `meta.seat`; one `item` stage over the
+  `TEMPER1` items (worn tempers carry `why: ["worn in the last rounds x0.25"]`);
+  `selected {id, label, text, seat, table, index, of}`.
+- `SHOCK` - stages `dice` (`BEAT` / `NONE`), then `item` and `turn` on a hit;
+  `selected.turn_index`, `meta.rate`.
+- `INTERJECT` - stages `dice` (`ROLL` / `NONE`), then `turn`, `phrase-1..3`;
+  `selected {turn_index, phrases}`, `meta.source` (`the desk's
+  diatribe_interjections` or `INTERJECT1`).
+- `MENTION` - stages `dice` (`MENTION` / `NONE`), then `turn`; `meta.name`.
+
+On a turn: `shock {id, text, event_id}`, `long_roll: true`, `interject
+[phrases]` (step `interject`), `carry_on: true` (step `carry_on`), `mention`
+(the name). The stamp that rides a script line gains `round {shock,
+long_roll, interject, carry_on, mention}` (only the true ones).
+
+On the conversation: `carry {from, road, age, factor, seats, landing,
+tempers, unresolved, event_id}`, `tempers {seat: {id, text, event_id}}`,
+`shock_plan` / `interject_plan` / `mention_plan` (`done`, `attached_index`),
+`round_rolls.draws`, `withheld {why, stage, at}`; `status` may be `withheld`
+or `abandoned`.
+
+Observations: `CARRY` `{stage: "handed on", seats, landing, tempers,
+dynamics, unresolved}` at the ledger commit; `CARRY` `{stage: "delivery",
+from, factor, blend}` once per banked round at air; `WITHHELD` `{stage, why}`;
+`ABANDONED` `{stage: "abandoned", why, road, bank}`.
+
+The round's meta on the entry (`entry["system3"]`) gains `planned_turns`
+(the air's incomplete-conversation gate read it and it was never set),
+`bank` and `carry`.

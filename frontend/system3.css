@@ -46,6 +46,8 @@
   background: var(--panel); border: 1px solid var(--line); border-radius: 8px; margin-bottom: 12px; }
 .s3-metrics b { color: var(--ink); font-weight: 600; }
 .s3-error { color: var(--warn); background: var(--warn-bg); border-radius: 7px; padding: 8px 12px; margin: 8px 0; }
+.s3-ok { color: var(--fg); background: color-mix(in srgb, var(--es) 18%, transparent); border-radius: 7px; padding: 8px 12px; margin: 8px 0; }   /* [s3-save] */
+.s3-table tr.s3-live td { font-weight: 600; }
 
 /* director layout */
 .s3-director { display: grid; grid-template-columns: 280px minmax(0, 1fr); gap: 14px; }
