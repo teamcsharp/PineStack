@@ -53,6 +53,99 @@ PRESETS = {
 QUALITY = dict(PRESETS["double"])
 SIZE_MIN, SIZE_MAX = 384, 1536
 
+# [h3-cinematic] THE BASE PATH. "How come I don't have options like sixteen
+# steps or thirty-two steps or sixty-four steps when it comes to getting very
+# cinematic fine results?" The turbo LoRA collapses the trajectory into four
+# to eight jumps; more steps on it only drift. The base model runs the whole
+# trajectory: no turbo LoRA, the res_multistep sampler, 20 to 30 steps
+# (Comfy-Org's own H3 templates run 20). It costs two and a half to three
+# times the turbo time for the same clip, so it is its own preset with its own
+# gate: clips up to five seconds, never the hourly ad, and it starts only on a
+# box at or under CINEMATIC_HEAT_C - otherwise the render steps down to the
+# double profile and says why. A step count names its path: 4-12 are the
+# turbo LoRA's, 20-30 the base model's, and the two lists never overlap.
+BASE_STEP_CHOICES = (20, 25, 30)
+CINEMATIC_HEAT_C = 80.0
+PRESETS["cinematic"] = {"preset": "cinematic", "steps": 20, "width": 1280, "height": 768, "max_frames": 124,
+                        "turbo": False, "sampler": "res_multistep", "scheduler": "simple"}
+NO_CINEMATIC_PURPOSES = ("hourly",)
+
+# [h3-budget] THE RENDER-TIME BUDGET. Measured on this box, 2026-09-27: the
+# double profile ran a 10 s reference render at ~300 s a step (ComfyUI logged
+# 00:50:29 and 00:47:24), the 640x384 / 3 s shape at ~10 s a step. The model
+# below reproduces both within about a tenth; a render whose estimate is over
+# the budget is stepped down in frame size (never in length - the line needs
+# it) until it fits. 0 means no limit.
+LOAD_S = 45.0
+STEP_S = 10.0
+REF_PX = 640 * 384 * 73
+STEP_EXP = 1.35
+BUDGET_DEFAULT_S = 900
+BUDGET_CHOICES = (300, 600, 900, 1800, 3600, 0)
+SIZE_LADDER = ((1536, 896), (1280, 768), (960, 576), (640, 384))
+QUALITY["budget_s"] = BUDGET_DEFAULT_S
+
+
+def estimate_seconds(width: Any, height: Any, frames: Any, steps: Any) -> float:
+    """[h3-budget] About how long one render of this shape takes on this box."""
+    try:
+        px = max(1.0, float(width) * float(height) * float(frames))
+        return round(LOAD_S + float(steps) * STEP_S * (px / REF_PX) ** STEP_EXP, 1)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def estimates(frames: Any = 243) -> dict[str, float]:
+    """[h3-budget] Each preset's estimate for a clip of `frames` (10 s by default)."""
+    out = {}
+    for name, pr in PRESETS.items():
+        out[name] = estimate_seconds(pr["width"], pr["height"], min(int(frames), int(pr["max_frames"])), pr["steps"])
+    return out
+
+
+def fit_budget(profile: dict[str, Any], frames: Any, budget_s: Any) -> tuple[dict[str, Any], str]:
+    """[h3-budget] The profile with its frame size stepped down until the
+    estimate fits the budget; a note when it had to."""
+    try:
+        budget = float(budget_s)
+        want = min(int(frames), int(profile.get("max_frames") or frames))
+    except (TypeError, ValueError):
+        return profile, ""
+    if budget <= 0 or want <= 0:
+        return profile, ""
+    first = estimate_seconds(profile["width"], profile["height"], want, profile["steps"])
+    if first <= budget:
+        return profile, ""
+    out = dict(profile)
+    was = "%dx%d" % (out["width"], out["height"])
+    for w, h in SIZE_LADDER:
+        if w * h >= out["width"] * out["height"]:
+            continue
+        out["width"], out["height"] = w, h
+        if estimate_seconds(w, h, want, out["steps"]) <= budget:
+            break
+    if estimate_seconds(out["width"], out["height"], want, out["steps"]) > budget and out.get("turbo", True) is not False:
+        out["steps"] = min(STEP_CHOICES, key=lambda k: abs(k - 4))       # the last rung: the turbo LoRA's own four
+    out["preset"] = "custom" if out.get("preset") != "custom" else out["preset"]
+    for name, known in PRESETS.items():
+        if (all(out.get(k) == known[k] for k in ("steps", "width", "height", "max_frames"))
+                and (out.get("turbo", True) is not False) == (known.get("turbo", True) is not False)):
+            out["preset"] = name
+    took = estimate_seconds(out["width"], out["height"], want, out["steps"])
+    return out, ("fitted to the %d-minute budget: %s about %d min, %dx%d%s about %d min"
+                 % (round(budget / 60), was, round(first / 60), out["width"], out["height"],
+                    "" if out["steps"] == profile["steps"] else " at %d steps" % out["steps"], max(1, round(took / 60))))
+
+# [h3-cast] THE HOST'S FACE. An identity LoRA trained on the Pine Box host
+# (tools/h3_cast_train.py, run by the pinebox-h3-cast service) rides a render
+# when the cast is on: LoraLoaderModelOnly after the turbo LoRA (or the base
+# model) at CAST["strength"], and the brief names the presenter by
+# CAST["trigger"] - the word the training captions used. It applies on the
+# text road, where no reference brings a face of its own to fight it, or
+# when a caller asks for it (cast=True).
+CAST_DEFAULTS = {"on": False, "lora": "", "trigger": "pinehost", "strength": 0.9, "who": "the Pine Box host"}
+CAST = dict(CAST_DEFAULTS)
+
 # [h3-free-wins] EasyCache skips sampler steps whose model output would barely
 # change; the community measures about 1.5x with it. On by default; the A/B
 # and a render that smears motion can turn it off (easycache=False).
@@ -76,6 +169,42 @@ SHOT_CHOICES = ("auto", "1", "2", "3")
 DEFAULT_CONSTRAINTS = ("No added subtitles, captions, logos or on-screen text - what the source already shows stays. "
                        "One style only.")
 DEFAULT_AUDIO = "One voice only, close and clear; natural room tone; no music; no other voices."
+
+
+def set_cast(profile: Any) -> dict[str, Any]:
+    """[h3-cast] Take the cast from the desk (or the trainer's finished run);
+    the clean profile now in force. A LoRA name is one plain file name."""
+    if not isinstance(profile, dict):
+        return dict(CAST)
+    out = dict(CAST)
+    if "on" in profile:
+        out["on"] = bool(profile.get("on"))
+    if "lora" in profile:
+        name = str(profile.get("lora") or "").strip()
+        out["lora"] = name if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._ -]{0,120}\.safetensors", name) else ""
+    if "trigger" in profile:
+        word = re.sub(r"[^A-Za-z0-9_-]", "", str(profile.get("trigger") or ""))[:24]
+        out["trigger"] = word or CAST_DEFAULTS["trigger"]
+    if "strength" in profile:
+        try:
+            out["strength"] = round(max(0.0, min(1.5, float(profile.get("strength")))), 2)
+        except (TypeError, ValueError):
+            pass
+    if "who" in profile:
+        out["who"] = " ".join(str(profile.get("who") or "").split())[:60] or CAST_DEFAULTS["who"]
+    CAST.clear()
+    CAST.update(out)
+    return dict(CAST)
+
+
+def cast_applies(mode: str = "text", wanted: Any = None) -> bool:
+    """[h3-cast] Whether the host's LoRA rides this render: the cast is on and
+    trained, and the road is the text road - or the caller said so."""
+    if not (CAST.get("on") and CAST.get("lora")):
+        return False
+    if wanted is not None:
+        return bool(wanted)
+    return (mode if mode in MODES else "text") == "text"
 
 
 def set_brief(profile: Any) -> dict[str, Any]:
@@ -196,14 +325,27 @@ def reference_window(source_s: float, at_share: float = 0.0,
     return max(0.0, (duration - length) * share), length
 
 
-def clamp_steps(value: Any) -> int:
+def clamp_steps(value: Any, turbo: Any = None) -> int:
     """The Turbo LoRA runs at four to six steps; eight and twelve are the
-    doubled profile's (quality over speed)."""
+    doubled profile's (quality over speed). [h3-cinematic] The base path
+    (turbo=False) runs 20, 25 or 30. Without `turbo` the number chooses:
+    anything from 16 up is a base-path count."""
     try:
         wanted = int(value)
     except (TypeError, ValueError):
-        wanted = STEP_CHOICES[0]
-    return min(STEP_CHOICES, key=lambda item: abs(item - wanted))
+        wanted = STEP_CHOICES[0] if turbo is not False else BASE_STEP_CHOICES[0]
+    base = (turbo is False) or (turbo is None and wanted >= 16)
+    choices = BASE_STEP_CHOICES if base else STEP_CHOICES
+    return min(choices, key=lambda item: abs(item - wanted))
+
+
+def is_turbo_steps(steps: Any) -> bool:
+    """[h3-cinematic] A step count names its path: 4-12 the turbo LoRA's,
+    20-30 the base model's."""
+    try:
+        return int(steps) < 16
+    except (TypeError, ValueError):
+        return True
 
 
 def set_quality(profile: Any) -> dict[str, Any]:
@@ -214,21 +356,35 @@ def set_quality(profile: Any) -> dict[str, Any]:
         return dict(QUALITY)
     preset = str(profile.get("preset") or "").strip().lower()
     fields = ("steps", "width", "height", "max_frames")
-    explicit = fields + ("shift", "sampler", "scheduler", "easycache")
+    explicit = fields + ("shift", "sampler", "scheduler", "easycache", "turbo")
     base = dict(PRESETS.get(preset) or QUALITY)
+    budget = QUALITY.get("budget_s", BUDGET_DEFAULT_S)                   # [h3-budget]
+    if "budget_s" in profile:
+        try:
+            budget = max(0, min(7200, int(profile.get("budget_s") or 0)))
+        except (TypeError, ValueError):
+            pass
     if preset in PRESETS and not any(k in profile for k in explicit):
         QUALITY.clear()
         QUALITY.update(base)
+        QUALITY["budget_s"] = budget
         return dict(QUALITY)
     out = dict(base)
+    out["budget_s"] = budget
     for key in ("width", "height"):
         if key in profile:
             try:
                 out[key] = max(SIZE_MIN, min(SIZE_MAX, (int(profile[key]) // 64) * 64))
             except (TypeError, ValueError):
                 pass
+    if "turbo" in profile:                                    # [h3-cinematic]
+        out["turbo"] = profile.get("turbo") is not False
     if "steps" in profile:
-        out["steps"] = clamp_steps(profile["steps"])
+        out["steps"] = clamp_steps(profile["steps"], out.get("turbo", True) is not False)
+    elif out.get("turbo", True) is False and is_turbo_steps(out.get("steps")):
+        out["steps"] = BASE_STEP_CHOICES[0]
+    elif out.get("turbo", True) is not False and not is_turbo_steps(out.get("steps")):
+        out["steps"] = 8
     if "max_frames" in profile:
         out["max_frames"] = clamp_frames(profile["max_frames"])
     # [h3-free-wins] the graph knobs the A/B compares; a preset name clears them
@@ -240,20 +396,39 @@ def set_quality(profile: Any) -> dict[str, Any]:
             out["shift"] = None
     if "sampler" in profile:
         out["sampler"] = str(profile.get("sampler") or "turbo") if str(profile.get("sampler") or "turbo") in SAMPLER_CHOICES else "turbo"
+    if out.get("turbo", True) is False and out.get("sampler", "turbo") == "turbo":
+        out["sampler"] = "res_multistep"               # [h3-cinematic] the turbo sampler is the LoRA's
     if "scheduler" in profile:
         out["scheduler"] = str(profile.get("scheduler") or "simple") if str(profile.get("scheduler") or "simple") in SCHEDULER_CHOICES else "simple"
     if "easycache" in profile:
         out["easycache"] = bool(profile.get("easycache"))
     out["preset"] = "custom"
     for name, known in PRESETS.items():
-        if all(out.get(k) == known[k] for k in fields):
+        if (all(out.get(k) == known[k] for k in fields)
+                and (out.get("turbo", True) is not False) == (known.get("turbo", True) is not False)):
             out["preset"] = name
+    if out.get("turbo", True) is not False:
+        out.pop("turbo", None)                         # a turbo profile reads as it always did
     QUALITY.clear()
     QUALITY.update(out)
     return dict(QUALITY)
 
 
-def quality_for_box(hot_c: Any, available_gb: Any, ceiling_c: Any, reserve_gb: Any) -> tuple[dict[str, Any], str]:
+def quality_for_box(hot_c: Any, available_gb: Any, ceiling_c: Any, reserve_gb: Any,
+                    purpose: str = "", frames: Any = None) -> tuple[dict[str, Any], str]:
+    """[h3-budget] With `frames`, the result is also fitted to the render-time
+    budget; the rest is quality_for_heat()'s."""
+    profile, note = quality_for_heat(hot_c, available_gb, ceiling_c, reserve_gb, purpose)
+    if frames is None:
+        return profile, note
+    fitted, why = fit_budget(profile, frames, QUALITY.get("budget_s", BUDGET_DEFAULT_S))
+    if not why:
+        return profile, note
+    return fitted, (note + "; then " + why) if note else why
+
+
+def quality_for_heat(hot_c: Any, available_gb: Any, ceiling_c: Any, reserve_gb: Any,
+                     purpose: str = "") -> tuple[dict[str, Any], str]:
     """[h3-quality] The profile THIS render may use. A profile above the
     standard one asks more of the box than render_admission's gates: eight
     degrees under the ceiling and 30 GB above the reserve. Short of either it
@@ -261,10 +436,32 @@ def quality_for_box(hot_c: Any, available_gb: Any, ceiling_c: Any, reserve_gb: A
     The render still passes render_admission afterwards; this is the extra
     margin the bigger frame needs, not a replacement for the gate."""
     profile = dict(QUALITY)
+    lead = ""
+    if profile.get("turbo", True) is False:                   # [h3-cinematic]
+        why = []
+        if str(purpose or "").strip().lower() in NO_CINEMATIC_PURPOSES:
+            why.append("the cinematic path never renders the hourly ad")
+        try:
+            if hot_c is None:
+                why.append("the box will not say how hot it is")
+            elif float(hot_c) > CINEMATIC_HEAT_C:
+                why.append("%.0f C - the cinematic path starts only at or under %.0f C"
+                           % (float(hot_c), CINEMATIC_HEAT_C))
+        except (TypeError, ValueError):
+            why.append("the box's heat reading is not a number")
+        try:
+            if available_gb is not None and reserve_gb and float(available_gb) < float(reserve_gb) + 30:
+                why.append("%.0f GB free against %.0f GB needed" % (float(available_gb), float(reserve_gb) + 30))
+        except (TypeError, ValueError):
+            pass
+        if not why:
+            return profile, ""
+        profile = dict(PRESETS["double"])
+        lead = "cinematic stepped down to double for this render: " + "; ".join(why)
     standard = PRESETS["standard"]
     heavy = profile["width"] * profile["height"] > standard["width"] * standard["height"] or profile["steps"] > 6
     if not heavy:
-        return profile, ""
+        return profile, lead
     tight = []
     try:
         if hot_c is not None and ceiling_c and float(hot_c) > float(ceiling_c) - 8:
@@ -277,12 +474,13 @@ def quality_for_box(hot_c: Any, available_gb: Any, ceiling_c: Any, reserve_gb: A
     except (TypeError, ValueError):
         pass
     if not tight:
-        return profile, ""
+        return profile, lead
     balanced = PRESETS["balanced"]
     lighter = (profile["width"] * profile["height"] > balanced["width"] * balanced["height"]
                or profile["steps"] > balanced["steps"])
     down = dict(balanced if lighter else standard)
-    return down, "stepped down to %s for this render: %s" % (down["preset"], "; ".join(tight))
+    note = "stepped down to %s for this render: %s" % (down["preset"], "; ".join(tight))
+    return down, (lead + "; then " + note) if lead else note
 
 
 def render_seed(value: Any = None) -> int:
@@ -354,7 +552,7 @@ def style_for(purpose: str = "", mode: str = "text", media_kind: str = "") -> st
 
 def compose_prompt(prompt: str, speech: str = "", media_kind: str = "",
                    mode: str = "text", seconds: float = 0.0, purpose: str = "",
-                   style: Any = None) -> str:
+                   style: Any = None, cast: Any = None) -> str:
     """Build H3's reference-aware prompt, including an exact dialogue contract.
 
     [h3-free-wins] The brief reads like production paperwork: a role for
@@ -435,10 +633,15 @@ def compose_prompt(prompt: str, speech: str = "", media_kind: str = "",
             lead = f"Keep the person and visual identity from <Video 1>. {lead}"
         elif kind == "audio":
             lead = f"Use <Audio 1> as the sound reference. {lead}"
+    # [h3-cast] the host's LoRA answers to its trigger word
+    presenter = ("%s, %s" % (CAST.get("trigger") or "pinehost", CAST.get("who") or "the Pine Box host")
+                 if cast_applies(use_mode, cast) else "")
+    if presenter:
+        lead = f"{lead} The presenter is {presenter}."
     if said:
         lead += f" The presenter says exactly once: <d>[English] {said}</d>."
     # [h3-free-wins] timed shots, sound and constraints for the text and frame roads too
-    subject = "<Picture 1>'s subject" if (use_mode == "reference" and kind == "image") or use_mode == "frame" else "the presenter"
+    subject = "<Picture 1>'s subject" if (use_mode == "reference" and kind == "image") or use_mode == "frame" else (presenter or "the presenter")
     source = "<Picture 1>" if subject.startswith("<Picture") else "the scene"
     follow_here = (source != "the scene") if follow_pref == "auto" else follow_pref == "reference"
     shots = shot_list(seconds, said, subject=subject, source=source, follow=follow_here, count=shot_count)
@@ -493,7 +696,8 @@ def build_workflow(prompt: str, mode: str = "text", upload_name: str = "",
                    media_kind: str = "", frames: Any = 73,
                    steps: Any = None, seed: Any = None, width: Any = None,
                    height: Any = None, max_frames: Any = None, easycache: Any = None,
-                   shift: Any = None, sampler: Any = None, scheduler: Any = None) -> dict[str, Any]:
+                   shift: Any = None, sampler: Any = None, scheduler: Any = None,
+                   turbo: Any = None, cast: Any = None) -> dict[str, Any]:
     """Return an API-format H3 graph for text, first-frame, or reference use.
 
     ``upload_name`` is a name already accepted by ComfyUI's input upload road.
@@ -514,7 +718,15 @@ def build_workflow(prompt: str, mode: str = "text", upload_name: str = "",
     # [h3-quality] the profile in force, unless the caller says otherwise
     cap = clamp_frames(max_frames if max_frames is not None else QUALITY.get("max_frames") or max(FRAME_CHOICES))
     frame_count = min(clamp_frames(frames), cap)
-    step_count = clamp_steps(steps if steps is not None else QUALITY.get("steps"))
+    # [h3-cinematic] the path: the caller's word, else the steps' (a count names
+    # its path), else the profile's
+    if turbo is not None:
+        use_turbo = turbo is not False
+    elif steps is not None:
+        use_turbo = is_turbo_steps(steps)
+    else:
+        use_turbo = QUALITY.get("turbo", True) is not False
+    step_count = clamp_steps(steps if steps is not None else QUALITY.get("steps"), use_turbo)
     frame_w = int(width or QUALITY.get("width") or 640)
     frame_h = int(height or QUALITY.get("height") or 384)
     noise_seed = render_seed(seed)
@@ -522,11 +734,25 @@ def build_workflow(prompt: str, mode: str = "text", upload_name: str = "",
     graph = _base_graph(prompt, frame_count, step_count, model, noise_seed)
     # [h3-free-wins] the model chain after the LoRA: shift (when asked) -> cache (on
     # by default) -> the guider and the scheduler; the sampler pairing when asked.
-    use_shift = QUALITY.get("shift") if shift is None else shift
-    use_cache = (EASYCACHE_ON if QUALITY.get("easycache") is None else bool(QUALITY.get("easycache"))) if easycache is None else bool(easycache)
-    use_sampler = str(sampler or QUALITY.get("sampler") or "turbo")
-    use_sched = str(scheduler or QUALITY.get("scheduler") or "simple")
+    # [h3-cinematic] a render on the other path than the profile's (cinematic
+    # stepped down to double) takes that path's defaults, not the profile's knobs
+    same_path = use_turbo == (QUALITY.get("turbo", True) is not False)
+    knobs = QUALITY if same_path else {}
+    use_shift = knobs.get("shift") if shift is None else shift
+    use_cache = (EASYCACHE_ON if knobs.get("easycache") is None else bool(knobs.get("easycache"))) if easycache is None else bool(easycache)
+    use_sampler = str(sampler or knobs.get("sampler") or "turbo")
+    use_sched = str(scheduler or knobs.get("scheduler") or "simple")
     tail = "5"
+    if not use_turbo:                                          # [h3-cinematic] the base path
+        graph.pop("5", None)
+        tail = "1"
+        if use_sampler == "turbo":
+            use_sampler = "res_multistep"
+    if cast_applies(use_mode, cast):                           # [h3-cast] the host's face
+        graph["20"] = {"class_type": "LoraLoaderModelOnly", "inputs": {
+            "model": [tail, 0], "lora_name": CAST["lora"],
+            "strength_model": float(CAST.get("strength") or 0.9)}}
+        tail = "20"
     if use_shift:
         graph["19"] = {"class_type": "MiniMaxH3SigmaShift", "inputs": {
             "model": [tail, 0], "shift_video": float(use_shift[0]), "shift_audio": float(use_shift[1])}}

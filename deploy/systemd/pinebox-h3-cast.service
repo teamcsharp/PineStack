@@ -1,0 +1,10 @@
+[Unit]
+Description=Pine Box - train the host's H3 identity LoRA, governed by heat, memory and ComfyUI ([h3-cast])
+
+[Service]
+Type=oneshot
+User=ehm_eckx
+WorkingDirectory=/home/ehm_eckx/pinevoice-stack/spark-agent
+ExecStart=/usr/bin/python3 /home/ehm_eckx/pinevoice-stack/spark-agent/tools/h3_cast_train.py --from-kick
+Nice=10
+TimeoutStartSec=infinity

@@ -24,7 +24,8 @@ EDITS = [
      '                                 "brief": dict(comfy_workshop.BRIEF)}            # [h3-brief-config]\n', 1),
     ("the-brief-is-read-back",
      '                                                    "last_source", "last_marker", "quality") if k in got})\n',
-     '                                                    "last_source", "last_marker", "quality", "brief") if k in got})\n', 1),
+     '                                                    "last_source", "last_marker", "quality", "brief",\n'
+     '                                                    "cast", "host_share") if k in got})   # [h3-cast]\n', 1),
     ("the-brief-is-in-force-on-load",
      '        state["quality"] = comfy_workshop.set_quality(state.get("quality"))     # [h3-quality] in force\n',
      '        state["quality"] = comfy_workshop.set_quality(state.get("quality"))     # [h3-quality] in force\n'

@@ -8467,6 +8467,12 @@ def render_admission(kind: str) -> tuple[bool, str, float | None]:
     """
     floor = VIDEO_RENDER_FLOOR_GB if kind == "video" else IMAGE_RENDER_FLOOR_GB
     if kind == "video":
+        # [h3-cast] the host's LoRA holds the box's memory while it trains
+        _cast = h3_cast_status()
+        if (str(_cast.get("state") or "") in ("caching", "training", "paused", "installing")
+                and time.time() - float(_cast.get("at") or 0) < 180):
+            return False, ("the host's H3 LoRA is training on this box and holds its memory; "
+                           "H3 waits until it finishes"), None
         # Heat first: it is the reading that tracked the freezes.
         hot = box_hottest_c()
         if hot is not None and hot >= RENDER_TEMP_CEILING_C:
@@ -8812,6 +8818,7 @@ def voice_ad_person_clip(goal: str) -> dict[str, Any]:
 async def voice_ad_render(
     goal: str, reference_clip: dict[str, Any] | None = None,
     spoken_copy: str = "", trim_in_s: Any = None, trim_out_s: Any = None,
+    hourly: bool = False,                                   # [h3-cinematic]
 ) -> tuple[str, dict[str, Any]]:
     """Submit an H3 reference ad and leave a discoverable gallery record."""
     # A replayed MP4 is an explicit creative reference, not merely another
@@ -8865,6 +8872,7 @@ async def voice_ad_render(
             "source_type": "deferred_dialogue_clip" if deferred_reference else "clip",
             "at_share": random.random(), "prompt": direction + continuation,
             "speech": part["speech"], "purpose": "voice_ad",
+            **({"hourly": True} if hourly else {}),          # [h3-cinematic] never the base path
             "duration_seconds": part["duration_seconds"],
             "duration_mode": "at_least", "air_it": True,
             "sequence_part": part["part"], "sequence_parts": part["parts"],
@@ -33644,11 +33652,19 @@ def _s3_active() -> bool:
         return False
 
 
-def _s3_line_remember(line_id: Any, stamp: Any) -> None:
+def _s3_line_remember(line_id: Any, stamp: Any, who: str = "", text: str = "") -> None:
     if isinstance(stamp, dict) and stamp.get("conversation_id") and line_id:
         _S3_LINE_BY_ID[str(line_id)] = dict(stamp)
         while len(_S3_LINE_BY_ID) > 600:
             _S3_LINE_BY_ID.pop(next(iter(_S3_LINE_BY_ID)))
+        # [s3-line-link] and linked in System 3's store now, not only when
+        # the ledger commits it - a withdrawn line never is committed
+        _link = globals().get("system3_link_line")
+        if _link:
+            try:
+                _link(str(line_id), stamp, str(who or ""), str(text or ""))
+            except Exception:  # noqa: BLE001
+                pass
 
 
 def _s3_line_stamp_of(row: Any) -> dict[str, Any] | None:
@@ -33800,7 +33816,7 @@ async def _dj_speak_floorless(kind: str, track: dict[str, Any] | None = None,
                               else "before the render", who, line)
             if line:
                 record_bound_withdraw(bound, bound_part, who, kind,
-                                      line, _bound_why)
+                                      line, _bound_why, system3=system3)
             return ""
     # Every single-line road meets the same director at the microphone.
     # Earlier writers may bring their own active node; a direct caller of
@@ -34057,7 +34073,7 @@ async def _dj_speak_floorless(kind: str, track: dict[str, Any] | None = None,
     if _s3_spoken_handle is not None:
         system3_bind_line(_s3_spoken_handle, spoken)
     line_id = uuid.uuid4().hex  # durable cadence receipts must not recycle 24-bit IDs
-    _s3_line_remember(line_id, system3)                      # [s3-roads]
+    _s3_line_remember(line_id, system3, who, spoken)         # [s3-roads][s3-line-link]
     page_delivery = ""
     _sfx_stream: dict[str, Any] = {}
     # A person outranks the show. The box is one speaker and an announce cuts
@@ -34266,7 +34282,7 @@ async def _dj_speak_floorless(kind: str, track: dict[str, Any] | None = None,
             record_bound_note(line_id, bound, bound_part, False,
                               _bound_why, "before the air", who, spoken)
             record_bound_withdraw(bound, bound_part, who, kind, spoken,
-                                  _bound_why, clip)
+                                  _bound_why, clip, system3=system3)
             _sfx_cadence_release(_sfx_stream.get("rows") or [])
             return ""
         record_bound_note(line_id, bound, bound_part, True, _bound_why,
@@ -36412,7 +36428,8 @@ def record_bound_publish(line_id: str, bound: Any, part: Any) -> None:
 
 def record_bound_withdraw(bound: Any, part: Any, who: str, kind: str,
                           text: str, why: str,
-                          clip: dict[str, Any] | None = None) -> str:
+                          clip: dict[str, Any] | None = None,
+                          system3: dict[str, Any] | None = None) -> str:   # [s3-line-link]
     """A bound line the deck refused: a `withdrawn` row in the feed with
     the reason on it (the panel, the script page and the segment
     inspector already draw that state), the words filed on the record's
@@ -36436,6 +36453,11 @@ def record_bound_withdraw(bound: Any, part: Any, who: str, kind: str,
             "bound": record_binding.snapshot(bound),
             "bound_part": str(part or ""),
         }
+        # [s3-line-link] the node the road planned for it: the feed shows its
+        # dice and the tapped-line tabs its story, withdrawn or not
+        if isinstance(system3, dict) and system3.get("conversation_id"):
+            entry["system3"] = dict(system3)
+            _s3_line_remember(rid, system3, str(who or ""), said)
         _RADIO["chat"].append(entry)
         del _RADIO["chat"][:-RADIO_CHAT_KEEP]
     except Exception:  # noqa: BLE001
@@ -151136,7 +151158,9 @@ _PUBLIC_GET = {"/healthz", "/api/dj", "/api/dj/voice", "/api/dj/reacts",
                # throughput probe. The script is public code;
                # the blob still demands the tune-in token.
                "/car-diag.js",
-               "/api/car/blob"}
+               "/api/car/blob",
+               # [listener-uploads] where a listener's upload is
+               "/api/listener/upload/status"}
 # #1253: ...and the things the listener page itself asks for. The
 # gallery pictures and the icon font were never on this list, so on a
 # phone the artwork was a broken-image box and the icons fell back to
@@ -151171,7 +151195,10 @@ _PUBLIC_POST = {"/api/dj/join", "/api/dj/request", "/api/dj/shout",
                 "/api/radio/unpause",
                 # #1471: a tapped diagnostics capture from the
                 # car. Token-gated, size-capped, throttled.
-                "/api/car/report"}
+                "/api/car/report",
+                # [listener-uploads] a listener's video, sound or picture:
+                # token-gated, capped at 20 MB and sniffed inside
+                "/api/listener/upload"}
 
 
 def _request_road(request: Any) -> str:
@@ -152317,6 +152344,128 @@ async def car_blob_api(
                     media_type="application/octet-stream",
                     headers={"Cache-Control": "no-store",
                              "X-Content-Type-Options": "nosniff"})
+
+
+# --- [listener-uploads] A LISTENER SENDS MEDIA IN -------------------------------
+#
+# "through the tail scale page allow users to submit video and upload them (as
+#  long as they are under 20mb) and they get posted to the
+#  \\10.89.1.125\QuickSwap\samples_grabbed\user ... a plus icon on the page
+#  ... and audio. Just media in general"
+#
+# The body is read with a hard cap, sniffed for what it IS (listener_uploads:
+# a video, a sound or a picture - never the name or the browser's word for
+# it), named and staged whole in data/uploads/outbox. The host courier
+# (tools/uploads_courier.py, the pinebox-uploads service) carries it to the
+# share through a read-write mount of that ONE folder and leaves a receipt;
+# the station's own view of QuickSwap stays read-only. samples_grabbed is a
+# drop folder (SFX_DROP_FOLDERS), so a playable clip is in the SFX draw a
+# couple of minutes after it lands.
+_LISTENER_UPLOADS_DIR = DATA_DIR / "uploads"
+_LISTENER_UPLOAD_LOG: list[tuple[float, str, int]] = []
+_LISTENER_UPLOAD_BUSY = [0]
+
+
+def _listener_upload_key(request: Request, t: str) -> str:
+    """Whose allowance an upload spends: the link it came in on, else the
+    address it came from."""
+    tag = token_tag(t) if t else ""
+    if tag:
+        return "link:" + tag
+    hop = ""
+    try:
+        hop = str(request.headers.get("x-forwarded-for") or "").split(",")[0].strip()
+    except Exception:  # noqa: BLE001
+        hop = ""
+    if not hop:
+        try:
+            hop = str(getattr(request.client, "host", "") or "")
+        except Exception:  # noqa: BLE001
+            hop = ""
+    return "addr:" + (hop or "unknown")
+
+
+@app.post("/api/listener/upload")
+async def listener_upload_api(
+    request: Request, t: str = "", name: str = "", who: str = "",
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """[listener-uploads] One video, sound or picture from a listener's phone
+    or computer, at most 20 MB, for QuickSwap/samples_grabbed/user."""
+    require_listen_auth(t, authorization)
+    import listener_uploads as lu
+    public = request.headers.get("x-pinebox-public") == "1"
+    person = str(who or "").strip() or (token_tag(t) if t else "") or ("listener" if t else "operator")
+    key = _listener_upload_key(request, t)
+    try:
+        declared = int(request.headers.get("content-length") or 0)
+    except ValueError:
+        declared = 0
+    if declared > lu.MAX_BYTES:
+        raise HTTPException(status_code=413, detail="That file is %.1f MB. The limit is 20 MB."
+                            % (declared / 1048576.0))
+    why = lu.throttle(_LISTENER_UPLOAD_LOG, key, declared, time.time())
+    if why:
+        raise HTTPException(status_code=429, detail=why)
+    if _LISTENER_UPLOAD_BUSY[0] >= lu.CONCURRENT:
+        raise HTTPException(status_code=429,
+                            detail="two uploads are already coming in - try again in a moment")
+    outbox = str(_LISTENER_UPLOADS_DIR / "outbox")
+    if await asyncio.to_thread(lu.outbox_bytes, outbox) > lu.OUTBOX_CAP_BYTES:
+        raise HTTPException(status_code=503,
+                            detail="the station's upload tray is full until the courier catches up")
+    _LISTENER_UPLOAD_BUSY[0] += 1
+    buf = bytearray()
+    try:
+        async for chunk in request.stream():
+            buf.extend(chunk)
+            if len(buf) > lu.MAX_BYTES:
+                raise HTTPException(status_code=413,
+                                    detail="That file is over 20 MB. The limit is 20 MB.")
+    finally:
+        _LISTENER_UPLOAD_BUSY[0] -= 1
+    if not buf:
+        raise HTTPException(status_code=400, detail="Nothing arrived - choose the file and send it again.")
+    got = lu.sniff(bytes(buf[:4096]))
+    if not got:
+        raise HTTPException(status_code=415,
+                            detail="That is not a video, a sound or a picture the station can take.")
+    kind, ext = got
+    now = time.time()
+    try:
+        path = await asyncio.to_thread(lu.stage, outbox, lu.upload_name(person, name, ext, now), bytes(buf))
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500,
+                            detail="The station could not keep it (%s)." % type(exc).__name__) from exc
+    staged = os.path.basename(path)
+    _LISTENER_UPLOAD_LOG.append((now, key, len(buf)))
+    try:
+        pipeline_log("uploads", "%s sent %s (%s, %.1f MB, %s) - on its way to QuickSwap samples_grabbed/user"
+                     % (person[:40], staged, kind, len(buf) / 1048576.0, _request_road(request)))
+    except Exception:  # noqa: BLE001
+        pass
+    out: dict[str, Any] = {"ok": True, "name": staged, "kind": kind, "bytes": len(buf), "state": "queued",
+                           "say": "Sent. It goes into the station's samples folder in a few seconds."}
+    if not public:
+        out["dest"] = lu.DEST_UNC + "\\" + staged
+    return out
+
+
+@app.get("/api/listener/upload/status")
+async def listener_upload_status_api(
+    request: Request, t: str = "", name: str = "",
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """[listener-uploads] Where an upload is: queued, delivered, waiting or
+    failed - the courier's receipt. Through the public door the share's own
+    path is left out."""
+    require_listen_auth(t, authorization)
+    import listener_uploads as lu
+    got = await asyncio.to_thread(lu.receipt, str(_LISTENER_UPLOADS_DIR / "receipts"),
+                                  str(_LISTENER_UPLOADS_DIR / "outbox"), str(name or ""))
+    if request.headers.get("x-pinebox-public") == "1":
+        got = {k: v for k, v in got.items() if k not in ("dest", "file")}
+    return got
 
 
 @app.post("/api/car/report")
@@ -169473,7 +169622,9 @@ async def _comfy_workshop_render_payload(payload: dict[str, Any]) -> dict[str, A
     # [h3-quality] the profile the box can take now; a caller's steps count
     # only as steps_override (every client hardcoded the old default of four)
     _prof, _prof_note = comfy_workshop.quality_for_box(
-        box_hottest_c(), comfy_host_available_gb(), RENDER_TEMP_CEILING_C, VIDEO_RENDER_FLOOR_GB)
+        box_hottest_c(), comfy_host_available_gb(), RENDER_TEMP_CEILING_C, VIDEO_RENDER_FLOOR_GB,
+        purpose=("hourly" if payload.get("hourly") else purpose),       # [h3-cinematic]
+        frames=frame_count)                                              # [h3-budget]
     if _prof_note:
         pipeline_log("gpu", "H3 quality " + _prof_note)
     step_count = (comfy_workshop.clamp_steps(payload.get("steps_override"))
@@ -169789,13 +169940,15 @@ def h3_hourly_load() -> dict[str, Any]:
             got = json.loads(_H3_HOURLY_FILE.read_text(encoding="utf-8"))
             if isinstance(got, dict):
                 state.update({k: got[k] for k in ("enabled", "gallery_share", "last_at", "last_message",
-                                                    "last_source", "last_marker", "quality", "brief") if k in got})
+                                                    "last_source", "last_marker", "quality", "brief",
+                                                    "cast", "host_share") if k in got})   # [h3-cast]
         except FileNotFoundError:
             pass
         except Exception as exc:  # noqa: BLE001
             pipeline_log("ads", "hourly H3 switch unreadable: %s" % type(exc).__name__)
         state["quality"] = comfy_workshop.set_quality(state.get("quality"))     # [h3-quality] in force
         state["brief"] = comfy_workshop.set_brief(state.get("brief"))           # [h3-brief-config]
+        state["cast"] = comfy_workshop.set_cast(state.get("cast"))              # [h3-cast]
         _H3_HOURLY_STATE.update(state)
     return _H3_HOURLY_STATE
 
@@ -169816,6 +169969,13 @@ def h3_hourly_save(patch: dict[str, Any]) -> dict[str, Any]:
         state["quality"] = comfy_workshop.set_quality(patch["quality"])
     if isinstance(patch.get("brief"), dict):                              # [h3-brief-config]
         state["brief"] = comfy_workshop.set_brief(patch["brief"])
+    if isinstance(patch.get("cast"), dict):                               # [h3-cast]
+        state["cast"] = comfy_workshop.set_cast(patch["cast"])
+    if "host_share" in patch:
+        try:
+            state["host_share"] = max(0, min(100, int(round(float(patch["host_share"])))))
+        except (TypeError, ValueError):
+            pass
     try:
         tmp = _H3_HOURLY_FILE.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(state, indent=1), encoding="utf-8")
@@ -169859,6 +170019,14 @@ def h3_hourly_view() -> dict[str, Any]:
             "sampler_choices": list(comfy_workshop.SAMPLER_CHOICES), "scheduler_choices": list(comfy_workshop.SCHEDULER_CHOICES),
             "default_constraints": comfy_workshop.DEFAULT_CONSTRAINTS, "default_audio": comfy_workshop.DEFAULT_AUDIO,
             "frame_choices": list(comfy_workshop.FRAME_CHOICES),
+            # [h3-cinematic] the base path's steps and heat line; [h3-cast] the host's LoRA
+            "base_step_choices": list(comfy_workshop.BASE_STEP_CHOICES),
+            "cinematic_heat_c": comfy_workshop.CINEMATIC_HEAT_C,
+            "cast": dict(comfy_workshop.CAST), "cast_status": h3_cast_status(),
+            "host_share": int(state.get("host_share", 0) or 0),
+            # [h3-budget] what each preset costs on this box for ten and five seconds
+            "estimates": comfy_workshop.estimates(243), "estimates_5s": comfy_workshop.estimates(124),
+            "budget_choices": list(comfy_workshop.BUDGET_CHOICES),
             "box": {"hottest_c": box_hottest_c(), "available_gb": comfy_host_available_gb(),
                     "ceiling_c": RENDER_TEMP_CEILING_C, "floor_gb": VIDEO_RENDER_FLOOR_GB}}
 
@@ -169925,6 +170093,22 @@ async def h3_hourly_render(state: dict[str, Any]) -> tuple[str, Any, str]:
         share = max(0, min(100, int(state.get("gallery_share", 20) or 0)))
     except (TypeError, ValueError):
         share = 20
+    # [h3-cast] the host's own hours: the text road with the cast LoRA on the
+    # presenter - host_share percent of hours, once the LoRA is trained and on
+    if comfy_workshop.cast_applies("text"):
+        try:
+            host_share = max(0, min(100, int(state.get("host_share", 0) or 0)))
+        except (TypeError, ValueError):
+            host_share = 0
+        if host_share and random.randint(1, 100) <= host_share:
+            payload = {"mode": "text", "purpose": "parody_stinger", "source": "", "source_type": "",
+                       "speech": voice_ad_spoken_copy(goal),
+                       "prompt": ("The Pine Box host presents a Pine Box FM stinger at the station's desk, "
+                                  "direct to camera, in warm late-night studio light. " + goal),
+                       "duration_mode": "at_least", "air_it": False, "hourly": True}
+            queued = _parody_stinger_queue().add(payload)
+            _parody_stinger_wake.set()
+            return ("queued a host stinger (the cast LoRA, %s)" % comfy_workshop.CAST.get("lora"), queued, "host")
     if share and random.randint(1, 100) <= share:
         try:
             page = await asyncio.to_thread(generation_history_page, "", "", 30)
@@ -169942,7 +170126,7 @@ async def h3_hourly_render(state: dict[str, Any]) -> tuple[str, Any, str]:
             queued = _parody_stinger_queue().add(payload)
             _parody_stinger_wake.set()
             return ("queued a gallery-image stinger from %s" % file, queued, "gallery image")
-    message, job = await voice_ad_render(goal)
+    message, job = await voice_ad_render(goal, hourly=True)      # [h3-cinematic]
     return (message, job, "clip")
 
 
@@ -169954,6 +170138,72 @@ async def h3_hourly_get(authorization: str | None = Header(default=None)) -> dic
     return h3_hourly_view()
 
 
+# --- [h3-cast] THE HOST'S FACE: THE TRAINER'S STATE AND ITS BUTTONS ------------
+#
+# tools/h3_cast_train.py - the pinebox-h3-cast service ON THE HOST, because the
+# trainer needs the GPU and the musubi-tuner venv the container has not - writes
+# data/h3_cast/status.json as it goes; the gallery's gear reads it through
+# /api/h3/hourly and presses train or stop here. The station only drops a
+# request file; the host's path unit starts the run, and the run's governor
+# pauses it whenever the box is hot, short of memory, or rendering.
+_H3_CAST_DIR = DATA_DIR / "h3_cast"
+_H3_CAST_BUSY = ("preparing", "portraits", "caching", "training", "paused", "installing", "testing")
+
+
+def h3_cast_status() -> dict[str, Any]:
+    """[h3-cast] Where the host's LoRA is: never trained, a run's stage and
+    step, or done with its file - and whether a request is waiting."""
+    waiting = (_H3_CAST_DIR / "kick.json").exists()
+    try:
+        got = json.loads((_H3_CAST_DIR / "status.json").read_text(encoding="utf-8"))
+        if isinstance(got, dict):
+            got["kick_waiting"] = waiting
+            return got
+    except FileNotFoundError:
+        pass
+    except Exception as exc:  # noqa: BLE001
+        return {"state": "unreadable", "why": type(exc).__name__, "kick_waiting": waiting}
+    return {"state": "never trained", "kick_waiting": waiting}
+
+
+@app.post("/api/h3/cast/train")
+async def h3_cast_train_api(request: Request, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    """[h3-cast] Ask the host to train (or retrain) the host's LoRA:
+    {look?: how the host looks, steps?: 100-2000, fresh?: new portraits}."""
+    require_auth(authorization)
+    try:
+        payload = await request.json()
+    except Exception:  # noqa: BLE001
+        payload = {}
+    payload = payload if isinstance(payload, dict) else {}
+    status = h3_cast_status()
+    if str(status.get("state") or "") in _H3_CAST_BUSY and time.time() - float(status.get("at") or 0) < 900:
+        raise HTTPException(status_code=409, detail="the host's LoRA is already training (%s)" % status.get("state"))
+    try:
+        steps = max(100, min(2000, int(payload.get("steps") or 600)))
+    except (TypeError, ValueError):
+        steps = 600
+    ask = {"at": time.time(), "look": " ".join(str(payload.get("look") or "").split())[:600],
+           "steps": steps, "fresh": bool(payload.get("fresh"))}
+    _H3_CAST_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = _H3_CAST_DIR / "kick.json.tmp"
+    tmp.write_text(json.dumps(ask), encoding="utf-8")
+    tmp.replace(_H3_CAST_DIR / "kick.json")
+    pipeline_log("gpu", "the host's H3 LoRA was asked to train (%d steps%s)"
+                 % (steps, ", fresh portraits" if ask["fresh"] else ""))
+    return {"ok": True, "asked": ask, "status": h3_cast_status()}
+
+
+@app.post("/api/h3/cast/stop")
+async def h3_cast_stop_api(authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    """[h3-cast] Stop a training run at its next step; it keeps its last save."""
+    require_auth(authorization)
+    _H3_CAST_DIR.mkdir(parents=True, exist_ok=True)
+    (_H3_CAST_DIR / "stop").write_text(str(time.time()), encoding="utf-8")
+    pipeline_log("gpu", "the host's H3 LoRA training was asked to stop")
+    return {"ok": True, "status": h3_cast_status()}
+
+
 @app.post("/api/h3/hourly")
 async def h3_hourly_set(request: Request, authorization: str | None = Header(default=None)) -> dict[str, Any]:
     require_auth(authorization)
@@ -169961,6 +170211,8 @@ async def h3_hourly_set(request: Request, authorization: str | None = Header(def
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="Expected an object")
     state = h3_hourly_save({k: payload[k] for k in ("enabled", "gallery_share", "quality", "brief") if k in payload})
+    if "cast" in payload or "host_share" in payload:                      # [h3-cast]
+        state = h3_hourly_save({k: payload[k] for k in ("cast", "host_share") if k in payload})
     pipeline_log("ads", "hourly H3 switch: %s, %d%% gallery images" %
                  ("on" if state.get("enabled", True) is not False else "off", int(state.get("gallery_share", 20))))
     return h3_hourly_view()
@@ -170075,7 +170327,8 @@ async def comfy_workshop_variant(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     _prof, _prof_note = comfy_workshop.quality_for_box(                  # [h3-quality]
-        box_hottest_c(), comfy_host_available_gb(), RENDER_TEMP_CEILING_C, VIDEO_RENDER_FLOOR_GB)
+        box_hottest_c(), comfy_host_available_gb(), RENDER_TEMP_CEILING_C, VIDEO_RENDER_FLOOR_GB,
+        frames=frames)                                                   # [h3-budget]
     if _prof_note:
         pipeline_log("gpu", "H3 quality " + _prof_note)
     steps = (comfy_workshop.clamp_steps(payload.get("steps_override"))
@@ -249879,6 +250132,38 @@ RADIO_PAGE_HTML = r"""<!doctype html>
   body.car button.big { font-size: 26px; padding: 30px 16px; }
   body.car .dial { padding: 26px; }
   body.car .times { font-size: 16px; }
+  /* [listener-uploads] the plus: bottom left, clear of the camera box at the
+     bottom right; hidden in the driving layout like every other considered tap */
+  body { padding-bottom: calc(max(24px, env(safe-area-inset-bottom)) + 76px); }
+  .up-fab { position: fixed; left: max(14px, env(safe-area-inset-left));
+    bottom: max(14px, env(safe-area-inset-bottom)); z-index: 45;
+    width: 56px; height: 56px; border-radius: 50%; padding: 0;
+    display: grid; place-items: center; background: #2f7d52;
+    border: 1px solid #3fbf7f; color: #fff; cursor: pointer;
+    box-shadow: 0 6px 20px rgba(0, 0, 0, .55); }
+  .up-fab svg { width: 28px; height: 28px; fill: currentColor; }
+  .up-fab:active { transform: scale(.96); }
+  body.car .up-fab, body.car .up-sheet { display: none; }
+  .up-sheet { position: fixed; z-index: 46;
+    left: max(14px, env(safe-area-inset-left));
+    bottom: calc(max(14px, env(safe-area-inset-bottom)) + 66px);
+    width: min(360px, calc(100vw - 28px)); padding: 12px;
+    background: #0b111b; border: 1px solid #27405a; border-radius: 12px;
+    box-shadow: 0 10px 30px rgba(0, 0, 0, .65); font-size: 14px; }
+  .up-sheet[hidden] { display: none; }
+  .up-head { display: flex; align-items: center; gap: 8px; }
+  .up-head b { flex: 1; }
+  .up-x { width: 34px; height: 34px; padding: 0; display: grid; place-items: center; }
+  .up-x svg { width: 18px; height: 18px; fill: currentColor; }
+  .up-file { margin: 8px 0 6px; color: #dce8f5; overflow-wrap: anywhere; font-size: 13px; }
+  .up-bar { height: 6px; border-radius: 3px; background: #1b2735; overflow: hidden; }
+  .up-fill { height: 100%; width: 0; background: #3fbf7f; transition: width .2s linear; }
+  .up-say { margin: 8px 0; color: #9fb0c4; font-size: 13px; overflow-wrap: anywhere; }
+  .up-say.bad { color: #ffb4a8; }
+  .up-say.good { color: #9fe0b9; }
+  .up-row { display: flex; gap: 8px; }
+  .up-row button { flex: 1; min-height: 40px; }
+  .up-row button[hidden] { display: none; }
   #carToggle { position: fixed; top: max(10px, env(safe-area-inset-top));
     right: max(10px, env(safe-area-inset-right)); z-index: 40;
     padding: 9px 13px; font-size: 15px; opacity: .75; }
@@ -250046,6 +250331,26 @@ RADIO_PAGE_HTML = r"""<!doctype html>
 </style>
 </head>
 <body>
+<!-- [listener-uploads] "a plus icon on the page that a user can click and
+     then upload a file from their phone / computer": a video, a sound or a
+     picture, up to 20 MB, into the station's samples folder. -->
+<button id="upFab" class="up-fab" type="button" onclick="upPick()"
+        aria-label="Send the station a video, a sound or a picture"
+        title="Send the station a video, a sound or a picture (up to 20 MB)"><svg
+        viewBox="0 0 32 32" aria-hidden="true" focusable="false"><path
+        d="M17 15V8h-2v7H8v2h7v7h2v-7h7v-2z"/></svg></button>
+<input id="upFile" type="file" accept="video/*,audio/*,image/*" hidden>
+<div id="upSheet" class="up-sheet" role="dialog" aria-labelledby="upTitle" hidden>
+  <div class="up-head"><b id="upTitle">Send it to the station</b>
+    <button type="button" class="up-x" onclick="upClose()" aria-label="Close"><svg
+      viewBox="0 0 32 32" aria-hidden="true" focusable="false"><path
+      d="M17.4141 16L24 9.4141 22.5859 8 16 14.5859 9.4143 8 8 9.4141 14.5859 16 8 22.5859 9.4143 24 16 17.4141 22.5859 24 24 22.5859 17.4141 16z"/></svg></button></div>
+  <div class="up-file" id="upName"></div>
+  <div class="up-bar"><div class="up-fill" id="upFill"></div></div>
+  <div class="up-say" id="upSay">A video, a sound or a picture, up to 20 MB. It goes into the station's samples folder.</div>
+  <div class="up-row"><button type="button" id="upAgain" onclick="upPick()">Choose a file</button>
+    <button type="button" id="upStop" onclick="upCancel()" hidden>Stop</button></div>
+</div>
 <button id="carToggle" onclick="toggleCar()"
         aria-label="Driving layout" title="Driving layout">Drive</button>
 <div class="set">
@@ -252165,6 +252470,97 @@ function streamUrl() {
  * it. Also switched on automatically when the page is running as an
  * installed app in landscape on a phone-sized screen, which is what a
  * dash mount looks like. */
+/* [listener-uploads] "a plus icon on the page that a user can click and then
+ * upload a file from their phone / computer" - a video, a sound or a picture,
+ * up to 20 MB, into the station's samples folder (samples_grabbed/user). The
+ * server sniffs what the bytes are; the checks here only save a wasted send. */
+const UP_MAX = 20 * 1024 * 1024;
+let upXhr = null;
+function upMB(n) { return (n / 1048576).toFixed(n < 10485760 ? 1 : 0) + " MB"; }
+function upEl(id) { return document.getElementById(id); }
+function upShow(on) { const s = upEl("upSheet"); if (s) s.hidden = !on; }
+function upSay(text, cls) {
+  const n = upEl("upSay");
+  if (n) { n.textContent = text; n.className = "up-say" + (cls ? " " + cls : ""); }
+}
+function upBusy(on) { upEl("upStop").hidden = !on; upEl("upAgain").hidden = on; }
+function upPick() { upShow(true); const i = upEl("upFile"); if (i) i.click(); }
+function upCancel() {
+  if (upXhr) { try { upXhr.abort(); } catch (e) {} upXhr = null; }
+  upBusy(false);
+  upSay("Stopped. Nothing was kept.", "bad");
+}
+function upClose() { if (upXhr) upCancel(); upShow(false); }
+function upUrl(path) {
+  return GUEST ? path + (path.indexOf("?") >= 0 ? "&" : "?") + "t=" + encodeURIComponent(KEY) : path;
+}
+function upSend(f) {
+  upShow(true);
+  upEl("upName").textContent = f.name + " - " + upMB(f.size);
+  upEl("upFill").style.width = "0%";
+  if (f.size > UP_MAX) {
+    upSay("That file is " + upMB(f.size) + ". The limit is 20 MB - trim it or send a shorter one.", "bad");
+    return;
+  }
+  if (f.type && !/^(video|audio|image)\//.test(f.type)) {
+    upSay("That is not a video, a sound or a picture.", "bad");
+    return;
+  }
+  let who = "";
+  try { who = String(localStorage.pbfmName || "").trim(); } catch (e) {}
+  const xhr = new XMLHttpRequest();
+  upXhr = xhr;
+  xhr.open("POST", upUrl("/api/listener/upload?name=" + encodeURIComponent(f.name)
+    + (who ? "&who=" + encodeURIComponent(who) : "")));
+  if (!GUEST) xhr.setRequestHeader("Authorization", "Bearer " + KEY);
+  xhr.setRequestHeader("Content-Type", f.type || "application/octet-stream");
+  xhr.upload.onprogress = (e) => {
+    if (!e.lengthComputable) return;
+    const k = Math.round(100 * e.loaded / e.total);
+    upEl("upFill").style.width = k + "%";
+    upSay("Sending... " + k + "%");
+  };
+  xhr.onload = () => {
+    upXhr = null;
+    upBusy(false);
+    let data = {};
+    try { data = JSON.parse(xhr.responseText || "{}"); } catch (e) {}
+    if (xhr.status >= 200 && xhr.status < 300) {
+      upEl("upFill").style.width = "100%";
+      upSay(data.say || "Sent.", "good");
+      if (data.name) upWatch(data.name, 0);
+    } else {
+      upSay(data.detail || ("The station did not take it (" + xhr.status + ")."), "bad");
+    }
+  };
+  xhr.onerror = () => {
+    upXhr = null;
+    upBusy(false);
+    upSay("It did not get through - check the connection and try again.", "bad");
+  };
+  upBusy(true);
+  upSay("Sending...");
+  xhr.send(f);
+}
+function upWatch(name, n) {
+  if (n > 20) return;
+  setTimeout(() => {
+    api("/api/listener/upload/status?name=" + encodeURIComponent(name)).then((r) => {
+      if (r.state === "delivered") upSay("It is in the station's samples folder now.", "good");
+      else if (r.state === "failed") upSay("The station kept it but could not file it: " + (r.why || "no reason given"), "bad");
+      else upWatch(name, n + 1);
+    }).catch(() => upWatch(name, n + 1));
+  }, 3000);
+}
+(function upInit() {
+  const i = upEl("upFile");
+  if (i) i.addEventListener("change", () => {
+    const f = i.files && i.files[0];
+    i.value = "";
+    if (f) upSend(f);
+  });
+})();
+
 function toggleCar(force) {
   const on = (force === undefined)
     ? !document.body.classList.contains("car") : !!force;

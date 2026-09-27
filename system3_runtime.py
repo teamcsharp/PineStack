@@ -817,6 +817,36 @@ class System3Runtime:
             self.fail("line planning", exc)
             return None
 
+    def link_spoken(self, line_id, stamp, who="", text=""):
+        """[s3-line-link] A line spoken with a System 3 stamp is linked in the
+        lines table the moment it is spoken - not only when the script ledger
+        commits it seconds later, and not never, as for a line the deck
+        withdrew before it aired. The ledger's own row, when it comes, replaces
+        this one with its block and order; this never overwrites it."""
+        try:
+            if not line_id or not isinstance(stamp, dict) or not stamp.get("conversation_id"):
+                return
+            row = {"line_id": str(line_id), "conversation_id": str(stamp["conversation_id"]),
+                   "turn_id": str(stamp.get("turn_id") or "") or None, "block": None, "ord": None,
+                   "sid": "", "who": str(who or ""), "text": str(text or "")[:2000], "at": time.time()}
+            with self.lock:
+                if self.pending >= WRITE_BACKLOG:
+                    self.metrics["writes_dropped"] += 1
+                    return
+                self.pending += 1
+                self.metrics["lines_linked_live"] = self.metrics.get("lines_linked_live", 0) + 1
+
+            def job():
+                try:
+                    if not self.store.line(row["line_id"]):
+                        self.store.add_lines([row])
+                finally:
+                    with self.lock:
+                        self.pending -= 1
+            _STORE_POOL.submit(job)
+        except Exception as exc:  # noqa: BLE001
+            self.fail("line link", exc)
+
     def bind_line(self, handle, text):
         """[s3-roads] The single-voice line is written (or chosen): the
         words join the conversation, and the row the road commits carries
@@ -1770,6 +1800,7 @@ def install(app, namespace):
     namespace["system3_sfxguy_spoke"] = rt.sfxguy_spoke
     namespace["system3_direct_line"] = system3_direct_line
     namespace["system3_bind_line"] = rt.bind_line
+    namespace["system3_link_line"] = rt.link_spoken                  # [s3-line-link]
     namespace["system3_observe_ledger"] = rt.observe_ledger
     namespace["system3_withhold"] = rt.withhold                        # [s3-withhold]
     namespace["_system3"] = lambda: rt

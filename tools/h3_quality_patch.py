@@ -40,13 +40,15 @@ EDITS = [
      '            got = json.loads(_H3_HOURLY_FILE.read_text(encoding="utf-8"))\n'
      '            if isinstance(got, dict):\n'
      '                state.update({k: got[k] for k in ("enabled", "gallery_share", "last_at", "last_message",\n'
-     '                                                    "last_source", "last_marker", "quality", "brief") if k in got})\n'
+     '                                                    "last_source", "last_marker", "quality", "brief",\n'
+     '                                                    "cast", "host_share") if k in got})   # [h3-cast]\n'
      '        except FileNotFoundError:\n'
      '            pass\n'
      '        except Exception as exc:  # noqa: BLE001\n'
      '            pipeline_log("ads", "hourly H3 switch unreadable: %s" % type(exc).__name__)\n'
      '        state["quality"] = comfy_workshop.set_quality(state.get("quality"))     # [h3-quality] in force\n'
      '        state["brief"] = comfy_workshop.set_brief(state.get("brief"))           # [h3-brief-config]\n'
+     '        state["cast"] = comfy_workshop.set_cast(state.get("cast"))              # [h3-cast]\n'
      '        _H3_HOURLY_STATE.update(state)\n', 1),
     ("profile-saves-with-the-switch",
      '    for key in ("last_at", "last_message", "last_source", "last_marker"):\n'
@@ -72,6 +74,14 @@ EDITS = [
      '            "sampler_choices": list(comfy_workshop.SAMPLER_CHOICES), "scheduler_choices": list(comfy_workshop.SCHEDULER_CHOICES),\n'
      '            "default_constraints": comfy_workshop.DEFAULT_CONSTRAINTS, "default_audio": comfy_workshop.DEFAULT_AUDIO,\n'
      '            "frame_choices": list(comfy_workshop.FRAME_CHOICES),\n'
+     "            # [h3-cinematic] the base path's steps and heat line; [h3-cast] the host's LoRA\n"
+     '            "base_step_choices": list(comfy_workshop.BASE_STEP_CHOICES),\n'
+     '            "cinematic_heat_c": comfy_workshop.CINEMATIC_HEAT_C,\n'
+     '            "cast": dict(comfy_workshop.CAST), "cast_status": h3_cast_status(),\n'
+     '            "host_share": int(state.get("host_share", 0) or 0),\n'
+     '            # [h3-budget] what each preset costs on this box for ten and five seconds\n'
+     '            "estimates": comfy_workshop.estimates(243), "estimates_5s": comfy_workshop.estimates(124),\n'
+     '            "budget_choices": list(comfy_workshop.BUDGET_CHOICES),\n'
      '            "box": {"hottest_c": box_hottest_c(), "available_gb": comfy_host_available_gb(),\n'
      '                    "ceiling_c": RENDER_TEMP_CEILING_C, "floor_gb": VIDEO_RENDER_FLOOR_GB}}\n', 1),
     ("the-door-takes-the-profile",
@@ -80,10 +90,12 @@ EDITS = [
     ("the-workshop-door-renders-at-the-profile",
      '    step_count = comfy_workshop.clamp_steps(payload.get("steps"))\n'
      '    noise_seed = comfy_workshop.render_seed(payload.get("seed"))\n',
-     '    # [h3-quality] the profile the box can take now; a caller\'s steps count\n'
+     "    # [h3-quality] the profile the box can take now; a caller's steps count\n"
      '    # only as steps_override (every client hardcoded the old default of four)\n'
      '    _prof, _prof_note = comfy_workshop.quality_for_box(\n'
-     '        box_hottest_c(), comfy_host_available_gb(), RENDER_TEMP_CEILING_C, VIDEO_RENDER_FLOOR_GB)\n'
+     '        box_hottest_c(), comfy_host_available_gb(), RENDER_TEMP_CEILING_C, VIDEO_RENDER_FLOOR_GB,\n'
+     '        purpose=("hourly" if payload.get("hourly") else purpose),       # [h3-cinematic]\n'
+     '        frames=frame_count)                                              # [h3-budget]\n'
      '    if _prof_note:\n'
      '        pipeline_log("gpu", "H3 quality " + _prof_note)\n'
      '    step_count = (comfy_workshop.clamp_steps(payload.get("steps_override"))\n'
@@ -104,7 +116,8 @@ EDITS = [
      '        payload.get("steps", parent.get("steps")))\n'
      '    seed = comfy_workshop.render_seed(payload.get("seed"))\n',
      '    _prof, _prof_note = comfy_workshop.quality_for_box(                  # [h3-quality]\n'
-     '        box_hottest_c(), comfy_host_available_gb(), RENDER_TEMP_CEILING_C, VIDEO_RENDER_FLOOR_GB)\n'
+     '        box_hottest_c(), comfy_host_available_gb(), RENDER_TEMP_CEILING_C, VIDEO_RENDER_FLOOR_GB,\n'
+     '        frames=frames)                                                   # [h3-budget]\n'
      '    if _prof_note:\n'
      '        pipeline_log("gpu", "H3 quality " + _prof_note)\n'
      '    steps = (comfy_workshop.clamp_steps(payload.get("steps_override"))\n'

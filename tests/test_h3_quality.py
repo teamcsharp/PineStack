@@ -17,6 +17,7 @@ class H3Quality(unittest.TestCase):
     def tearDown(self):
         cw.set_quality({"preset": "double"})
         cw.set_brief(dict(cw.BRIEF_DEFAULTS))
+        cw.set_cast(dict(cw.CAST_DEFAULTS))
 
     def test_the_default_is_double(self):
         self.assertEqual(cw.QUALITY["preset"], "double")
@@ -29,7 +30,7 @@ class H3Quality(unittest.TestCase):
         got = cw.set_quality({"preset": "custom", "steps": 6, "width": 960, "height": 576, "max_frames": 289})
         self.assertEqual(got["preset"], "balanced")
         got = cw.set_quality({"preset": "standard"})
-        self.assertEqual(got, cw.PRESETS["standard"])
+        self.assertEqual({k: v for k, v in got.items() if k != "budget_s"}, cw.PRESETS["standard"])
         got = cw.set_quality({"width": 99999, "height": 1})
         self.assertEqual((got["width"], got["height"]), (cw.SIZE_MAX, cw.SIZE_MIN))
 
@@ -59,6 +60,98 @@ class H3Quality(unittest.TestCase):
         self.assertEqual((prof["preset"], note), ("standard", ""), "the standard profile is the gate's business, not this one's")
         prof, note = cw.quality_for_box(None, None, 90.0, 60.0)
         self.assertEqual(note, "", "no reading is no reason to step down; the gate refuses a blind video render itself")
+
+    def test_the_cinematic_path_drops_the_turbo_lora(self):
+        got = cw.set_quality({"preset": "cinematic"})
+        self.assertEqual((got["steps"], got["turbo"], got["max_frames"], got["sampler"]), (20, False, 124, "res_multistep"))
+        g = cw.build_workflow("a test", mode="text", frames=243)
+        self.assertNotIn("5", g, "no turbo LoRA on the base path")
+        self.assertEqual(g["9"], {"class_type": "KSamplerSelect", "inputs": {"sampler_name": "res_multistep"}})
+        self.assertEqual(g["8"]["inputs"]["steps"], 20)
+        self.assertEqual(g["6"]["inputs"]["length"], 124, "cinematic clips are five seconds at most")
+        node, seen = g["7"]["inputs"]["model"][0], []
+        while node != "1":
+            seen.append(g[node]["class_type"])
+            node = g[node]["inputs"]["model"][0]
+        self.assertNotIn("MiniMaxH3TurboLoRA", seen)
+        g = cw.build_workflow("a test", mode="text", steps=8)
+        self.assertEqual(g["5"]["class_type"], "MiniMaxH3TurboLoRA", "a step count names its path")
+        self.assertEqual(g["9"]["class_type"], "MiniMaxH3TurboSampler")
+        self.assertEqual((cw.clamp_steps(24), cw.clamp_steps(7), cw.clamp_steps(8, False), cw.clamp_steps(30, True)), (25, 6, 20, 12))
+        got = cw.set_quality({"preset": "cinematic", "steps": 30, "width": 1280, "height": 768, "max_frames": 124, "turbo": False})
+        self.assertEqual((got["preset"], got["steps"], got["turbo"]), ("custom", 30, False))
+        got = cw.set_quality({"preset": "cinematic", "steps": 20, "width": 1280, "height": 768, "max_frames": 124, "turbo": False})
+        self.assertEqual(got["preset"], "cinematic")
+        got = cw.set_quality({"preset": "double"})
+        self.assertNotIn("turbo", got, "a turbo profile reads as it always did")
+        got = cw.set_quality({"turbo": False})
+        self.assertEqual((got["steps"], got["sampler"]), (20, "res_multistep"), "the switch alone moves the steps to the base path")
+
+    def test_the_cinematic_gate(self):
+        cw.set_quality({"preset": "cinematic"})
+        prof, note = cw.quality_for_box(79.0, 94.0, 90.0, 60.0)
+        self.assertEqual((prof["preset"], note), ("cinematic", ""))
+        prof, note = cw.quality_for_box(79.0, 94.0, 90.0, 60.0, purpose="hourly")
+        self.assertEqual(prof["preset"], "double")
+        self.assertIn("never renders the hourly ad", note)
+        prof, note = cw.quality_for_box(83.0, 94.0, 90.0, 60.0)
+        self.assertEqual(prof["preset"], "balanced", "too hot for cinematic, and too hot for the double frame too")
+        self.assertIn("80 C", note)
+        self.assertIn("then stepped down to balanced", note)
+        prof, note = cw.quality_for_box(None, 94.0, 90.0, 60.0)
+        self.assertEqual(prof["preset"], "double")
+        self.assertIn("will not say how hot", note)
+        prof, note = cw.quality_for_box(79.0, 70.0, 90.0, 60.0)
+        self.assertEqual(prof["preset"], "balanced")
+        self.assertIn("GB", note)
+
+    def test_the_cast_rides_the_text_road(self):
+        g = cw.build_workflow("a test", mode="text")
+        self.assertNotIn("20", g, "no cast until it is on and trained")
+        got = cw.set_cast({"on": True, "lora": "pinehost_h3.safetensors", "strength": 0.8, "trigger": "pine host!"})
+        self.assertEqual((got["on"], got["lora"], got["strength"], got["trigger"]), (True, "pinehost_h3.safetensors", 0.8, "pinehost"))
+        g = cw.build_workflow("a test", mode="text")
+        self.assertEqual(g["20"]["class_type"], "LoraLoaderModelOnly")
+        self.assertEqual((g["20"]["inputs"]["lora_name"], g["20"]["inputs"]["strength_model"]), ("pinehost_h3.safetensors", 0.8))
+        self.assertEqual(g["20"]["inputs"]["model"], ["5", 0], "after the turbo LoRA")
+        self.assertEqual(g["18"]["inputs"]["model"], ["20", 0], "and under the cache")
+        text = cw.compose_prompt("At the desk", "Pine Box FM.", "", "text", seconds=5.0)
+        self.assertIn("The presenter is pinehost, the Pine Box host.", text)
+        self.assertIn("pinehost, the Pine Box host (S1) says clearly", text)
+        g = cw.build_workflow("a test", mode="frame", upload_name="x.png", media_kind="image")
+        self.assertNotIn("20", g, "a picture brings its own face")
+        g = cw.build_workflow("a test", mode="frame", upload_name="x.png", media_kind="image", cast=True)
+        self.assertIn("20", g, "unless the caller asks for the host")
+        cw.set_quality({"preset": "cinematic"})
+        g = cw.build_workflow("a test", mode="text")
+        self.assertEqual(g["20"]["inputs"]["model"], ["1", 0], "on the base path it sits on the model itself")
+        self.assertEqual(cw.set_cast({"lora": "../../etc/passwd"})["lora"], "", "a LoRA is one plain file name")
+
+    def test_the_render_time_budget(self):
+        # the model against the box: ComfyUI logged 00:47:24 and 00:50:29 for 10 s at double
+        self.assertTrue(40 * 60 <= cw.estimate_seconds(1280, 768, 243, 8) <= 50 * 60)
+        self.assertTrue(60 <= cw.estimate_seconds(640, 384, 73, 8) <= 150, "the A/B's 90 s shape")
+        self.assertEqual(cw.QUALITY["budget_s"], cw.BUDGET_DEFAULT_S)
+        prof, note = cw.quality_for_box(70.0, 100.0, 90.0, 60.0, frames=243)
+        self.assertEqual((prof["width"], prof["height"], prof["max_frames"], prof["steps"]), (640, 384, 243, 8),
+                         "ten seconds at double is 45 minutes: the frame shrinks, the length and steps stay")
+        self.assertIn("15-minute budget", note)
+        prof, note = cw.quality_for_box(70.0, 100.0, 90.0, 60.0, frames=124)
+        self.assertEqual((prof["width"], prof["height"]), (960, 576))
+        prof, note = cw.quality_for_box(70.0, 100.0, 90.0, 60.0, frames=73)
+        self.assertEqual((prof["preset"], note), ("double", ""), "a short clip fits as it is")
+        got = cw.set_quality({"preset": "double", "budget_s": 0})
+        self.assertEqual(got["budget_s"], 0)
+        prof, note = cw.quality_for_box(70.0, 100.0, 90.0, 60.0, frames=243)
+        self.assertEqual((prof["preset"], note), ("double", ""), "no limit keeps the profile")
+        got = cw.set_quality({"preset": "balanced"})
+        self.assertEqual(got["budget_s"], 0, "the budget survives a change of preset")
+        cw.set_quality({"preset": "cinematic", "budget_s": 900})
+        prof, note = cw.quality_for_box(70.0, 100.0, 90.0, 60.0, frames=124)
+        self.assertEqual((prof["width"], prof["turbo"], prof["steps"]), (640, False, 20), "the base path keeps its steps")
+        est = cw.estimates(243)
+        self.assertLess(est["standard"], est["balanced"])
+        self.assertLess(est["balanced"], est["double"])
 
     def test_every_length_is_on_the_lattice(self):
         # H3 takes 17n+5 frames at 24 fps; 169/241/289/361 were snapped silently

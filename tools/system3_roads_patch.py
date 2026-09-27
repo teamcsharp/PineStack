@@ -320,7 +320,7 @@ EDITS = [
     ("speak-mint",
      '    line_id = uuid.uuid4().hex  # durable cadence receipts must not recycle 24-bit IDs\n',
      '    line_id = uuid.uuid4().hex  # durable cadence receipts must not recycle 24-bit IDs\n'
-     '    _s3_line_remember(line_id, system3)                      # [s3-roads]\n', 1),
+     '    _s3_line_remember(line_id, system3, who, spoken)         # [s3-roads][s3-line-link]\n', 1),
     ("speak-helpers",
      'async def dj_speak(kind: str, track: dict[str, Any] | None = None,\n',
      '# --- [s3-roads] THE ORIGIN OF EVERY SINGLE LINE ------------------------------\n'
@@ -344,11 +344,19 @@ EDITS = [
      '        return False\n'
      '\n'
      '\n'
-     'def _s3_line_remember(line_id: Any, stamp: Any) -> None:\n'
+     'def _s3_line_remember(line_id: Any, stamp: Any, who: str = "", text: str = "") -> None:\n'
      '    if isinstance(stamp, dict) and stamp.get("conversation_id") and line_id:\n'
      '        _S3_LINE_BY_ID[str(line_id)] = dict(stamp)\n'
      '        while len(_S3_LINE_BY_ID) > 600:\n'
      '            _S3_LINE_BY_ID.pop(next(iter(_S3_LINE_BY_ID)))\n'
+     "        # [s3-line-link] and linked in System 3's store now, not only when\n"
+     '        # the ledger commits it - a withdrawn line never is committed\n'
+     '        _link = globals().get("system3_link_line")\n'
+     '        if _link:\n'
+     '            try:\n'
+     '                _link(str(line_id), stamp, str(who or ""), str(text or ""))\n'
+     '            except Exception:  # noqa: BLE001\n'
+     '                pass\n'
      '\n'
      '\n'
      'def _s3_line_stamp_of(row: Any) -> dict[str, Any] | None:\n'
