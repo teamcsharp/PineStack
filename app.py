@@ -11622,18 +11622,34 @@ async def _startup_pulse() -> None:
     fire_and_forget(_pulse_beat())
 
 
-def pulse_report(window: float = 600.0) -> dict[str, Any]:
+def pulse_report(window: float = 600.0, since: float | None = None,
+                 until: float | None = None) -> dict[str, Any]:
     """What the loop has been stuck in lately, worst first. `ok` is
-    false once a stall reached the host watchdog's own probe timeout."""
+    false once a stall reached the host watchdog's own probe timeout.
+
+    [s3-timing] `since`/`until` (epoch seconds) answer for that span of
+    time instead of the last `window` seconds - the Timing pane asks for
+    the span a line was made in. The ring holds PULSE_KEEP stalls, so
+    `ring_from` says how far back it can see."""
     now = time.time()
     with _PULSE_LOCK:
-        recent = [r for r in (_PULSE.get("stalls") or [])
-                  if now - float(r.get("at") or 0) <= window]
+        ring = list(_PULSE.get("stalls") or [])
         by = {k: dict(v) for k, v in (_PULSE.get("by_frame") or {}).items()}
+    spanned = since is not None or until is not None
+    lo, hi = 0.0, now
+    if spanned:
+        lo = float(since) if since is not None else 0.0
+        hi = float(until) if until is not None else now
+        window = max(1.0, hi - lo)
+        recent = [r for r in ring if lo <= float(r.get("at") or 0) <= hi]
+    else:
+        recent = [r for r in ring if now - float(r.get("at") or 0) <= window]
+    ring_from = min((float(r.get("at") or 0) for r in ring), default=0.0)
     worst = max((float(r.get("seconds") or 0) for r in recent), default=0.0)
     total = round(sum(float(r.get("seconds") or 0) for r in recent), 1)
     top = sorted(((k, v) for k, v in by.items()
-                  if now - float(v.get("at") or 0) <= window),
+                  if ((lo <= float(v.get("at") or 0) <= hi) if spanned
+                      else (now - float(v.get("at") or 0) <= window))),
                  key=lambda kv: -float(kv[1].get("seconds") or 0))[:6]
     open_stall = _PULSE.get("open")
     ok = worst < 8.0
@@ -11654,6 +11670,9 @@ def pulse_report(window: float = 600.0) -> dict[str, Any]:
             reading += (" - past the host watchdog's 8s probe; this is "
                         "what restarts the station")
     return {"window_s": window, "stalls": len(recent),
+            # [s3-timing] the span asked for, and how far back the ring reaches
+            **({"since": lo, "until": hi} if spanned else {}),
+            "ring_from": ring_from,
             "gc": _gc_report(),                      # #1393
             "worst_s": round(worst, 2), "stalled_s": total,
             "recent": recent[-12:],
@@ -33863,6 +33882,21 @@ async def _dj_speak_floorless(kind: str, track: dict[str, Any] | None = None,
             dj_line(kind, track, extra, seed,
                     direct=perf_directive(vec) + weather_directive(who)
                     + note + ("\n\n" + _s3_sheet if _s3_sheet else ""))))
+        # [s3-line-fix] a line that speaks its own running-order row is not
+        # a line: written again once without the sheet (the feeling still
+        # rides perf_directive); if that echoes too, withheld and said so
+        _echoed = _sheet_speaks_direction(spoken, _s3_sheet) if _s3_sheet else ""
+        if _echoed:
+            pipeline_log("system3", "a %s line from %s spoke its running-order row - written again "
+                                    "without the sheet" % (kind, who), extra=_echoed[:200])
+            spoken = spoken_text(await _floor_lend(
+                f"a {kind} line from {who} (written again)",
+                dj_line(kind, track, extra, seed,
+                        direct=perf_directive(vec) + weather_directive(who) + note)))
+            if _sheet_speaks_direction(spoken, _s3_sheet):
+                pipeline_log("drop", "a %s line from %s spoke its running-order row twice - withheld"
+                             % (kind, who), extra=spoken[:200])
+                return ""
         if not by_hand:
             spoken = inject_disfluencies(spoken, vec, seed=who)
     # A line with no letters in it is not a line. An interruption written as
@@ -40239,7 +40273,10 @@ async def ensure_entry_tinted(entry: dict[str, Any], kind: str,
                 progress=None if _stale_progress else entry.get("tint_progress"),
                 critical=critical,
                 # #1146: a struck attempt's graded faults ride the retry.
-                lesson=str(entry.get("tint_lesson") or "")),
+                lesson=str(entry.get("tint_lesson") or ""),
+                # [s3-rewrite] the selection System 3 bound onto this entry
+                only_turns=(globals()["system3_tint_turns_entry"](entry)
+                            if globals().get("system3_tint_turns_entry") else None)),
                 {"entry": copy.deepcopy(entry), "script_plain": plain,
                  "caller_name": entry.get("caller_name"), "caller_voice": entry.get("caller_voice"),
                  "caller2_name": entry.get("caller2_name"), "caller2_voice": entry.get("caller2_voice")})
@@ -54930,6 +54967,10 @@ def pantry_order_quality_target(order: dict[str, Any]) -> tuple[dict[str, Any], 
             or not isinstance(dialogue_entry(row), dict)
             or not dialogue_row_ready(road, row)):
         return None
+    # [s3-rewrite] a round whose ROOM roll said no is left alone
+    if globals().get("system3_room_allowed") and not globals()["system3_room_allowed"](dialogue_entry(row)):
+        pipeline_log("system3", "the Writers' Room left a %s round alone - its ROOM roll said no" % road)
+        return None
     return slot, row
 
 
@@ -55306,6 +55347,9 @@ def director_review_repair_target(exclude_roads: set[str] | None = None) -> dict
                 if not live or live[0] != slot.get("kind") or not dialogue_row_ready(*live):
                     continue
                 row = live[1]
+                # [s3-rewrite] a round whose ROOM roll said no is left alone
+                if globals().get("system3_room_allowed") and not globals()["system3_room_allowed"](dialogue_entry(row)):
+                    continue
                 repair = row.get("director_repair") or {}
                 if (repair.get("slot_id") == slot["id"]
                         and repair.get("signature") == candidate.get("signature")
@@ -101520,6 +101564,16 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
     tint_required = (len(tint_eligible) * crystal_coverage_target() + 99) // 100
     tint_selected = (set(tint_eligible[:tint_required])
                      if tint_needed and not recorded else set())
+    # [s3-rewrite] a System 3 round carries its rhyme dice on turn_dice:
+    # the turns that rolled it are the selection, no other
+    try:
+        _s3_tint = {int(k): bool((((d or {}).get("s3") or {}).get("tint") or {}).get("rhyme"))
+                    for k, d in (turn_dice or {}).items()
+                    if ((((d or {}).get("s3") or {}).get("tint") or {}).get("rhyme")) is not None}
+    except Exception:  # noqa: BLE001
+        _s3_tint = {}
+    if _s3_tint and tint_needed and not recorded:
+        tint_selected = {i for i in tint_eligible if _s3_tint.get(i)}
     tint_proofs = set((tint_report or {}).get("approved_lines") or []) \
         if tint_coverage_ready(tint_report) else set()
     tint_failed = False
@@ -103818,6 +103872,25 @@ def _beat_content_words(text: str) -> set[str]:
             if len(word) >= 4 and word not in _BANTER_BEAT_STOP}
 
 
+def _sheet_speaks_direction(text: str, sheet: str) -> str:
+    """[s3-line-fix] The running-order row a single line echoed, or "".
+
+    Measured 2026-09-27: four aired station IDs read "D shouts the station's
+    name like it is the only station there is" - the node's own sheet row,
+    returned as the line. The same test as #1462's _beat_speaks_direction:
+    the row's first clause, twelve characters or more, inside the words."""
+    def words(value: Any) -> str:
+        return " ".join(re.findall(r"[a-z0-9']+", str(value or "").casefold()))
+    said = words(text)
+    if not said:
+        return ""
+    for m in re.finditer(r"(?m)^\s*\d+\s+[A-E]\s+[-\u2013\u2014]\s*(.+?)\s*$", str(sheet or "")):
+        core = words(re.split(r"[,.;\[]", m.group(1), 1)[0])
+        if len(core) >= 12 and core in said:
+            return m.group(0).strip()
+    return ""
+
+
 def _beat_speaks_direction(text: str, row: dict[str, Any]) -> bool:
     """[#1462] Whether a written turn is its own stage direction, said aloud.
 
@@ -105614,13 +105687,22 @@ async def dj_banter(track: dict[str, Any] | None = None,
             and globals().get("system3_repair_wanted")
             and globals()["system3_repair_wanted"](_s3, script)):
         _needs_rewrite = True
+    # [s3-rewrite] ON A SYSTEM 3 ROUND THE REPAIR ROLL DECIDES. True: a round
+    # that missed goes back, and the review gate below does not cancel it
+    # (with the content gates off it cancelled every repair). False: it
+    # stands as written, whatever the checks found. None: the old rules.
+    _s3_repair = (globals()["system3_repair_roll"](_s3) if globals().get("system3_repair_roll") else None)
+    if _needs_rewrite and _s3_repair is False:
+        pipeline_log("system3", "the round missed its target, and its REPAIR roll said it stands "
+                                "as written - no rewrite")
+        _needs_rewrite = False
     _draft_entry = {"script": script, "prep_kind": "caller" if caller_name else "banter",
                     "caller_name": caller_name, "caller2_name": caller2_name,
                     "caller_voice": caller_voice, "caller2_voice": caller2_voice,
                     "call": dict(call_meta or {}), "source": source or seed.get("file", ""),
                     "seed_text": seed.get("text", ""), "lines": lines,
                     "vouched": vouched, "profile": _larder_profile_signature()}
-    if _needs_rewrite and _radio_draft_review(_draft_entry,
+    if _needs_rewrite and _s3_repair is not True and _radio_draft_review(_draft_entry,   # [s3-rewrite]
             _call_report or {"ok": False, "faults": ["the draft missed its conversational richness target"]},
             "draft_rewrite", record=True):
         _needs_rewrite = False
@@ -106340,7 +106422,10 @@ async def dj_banter(track: dict[str, Any] | None = None,
                                        # the live road no longer needs
                                        # a cheaper path to run down.
                                        whole_only=False,
-                                       critical=bool(bank)),
+                                       critical=bool(bank),
+                                       # [s3-rewrite] the lines System 3 rolled a rhyme on
+                                       only_turns=(globals()["system3_tint_turns"](_s3, script)
+                                                   if globals().get("system3_tint_turns") else None)),
                 {"entry": copy.deepcopy(entry), "script_plain": script,
                  "caller_name": caller_name, "caller_voice": caller_voice,
                  "caller2_name": caller2_name, "caller2_voice": caller2_voice})
@@ -106416,7 +106501,9 @@ async def dj_banter(track: dict[str, Any] | None = None,
                     str(entry.get("script_plain") or ""),
                     str(entry.get("prep_kind") or ""),
                     entry.get("verbatim"), whole_only=False,
-                    critical=bool(bank), lesson=_lesson),
+                    critical=bool(bank), lesson=_lesson,
+                    only_turns=(globals()["system3_tint_turns"](_s3, script)     # [s3-rewrite]
+                                if globals().get("system3_tint_turns") else None)),
                     {"entry": copy.deepcopy(entry), "script_plain": entry.get("script_plain"),
                      "caller_name": caller_name, "caller_voice": caller_voice,
                      "caller2_name": caller2_name, "caller2_voice": caller2_voice})
@@ -120258,7 +120345,8 @@ async def crystal_tint(script: str, kind: str = "",
                        whole_only: bool = False,
                        progress: Any = None,
                        critical: bool = False,
-                       lesson: str = "") -> dict[str, Any]:
+                       lesson: str = "",
+                       only_turns: Any = None) -> dict[str, Any]:   # [s3-rewrite]
     """#1006: THE SECOND PASS. Take a finished, untinted conversation and
     move it into the crystal's world.
 
@@ -120408,8 +120496,17 @@ async def crystal_tint(script: str, kind: str = "",
         # never gets to make this decision. At 100 every eligible line is in.
         selected_ix = set(eligible_ix if coverage_target >= 100
                           else eligible_ix[:required])
+        if only_turns is not None:
+            # [s3-rewrite] SYSTEM 3'S RHYME DICE CHOOSE THE LINES. "the first N
+            # eligible" was the station's own selection; a System 3 round
+            # rolled TINT on every turn, and the turns that rolled it are the
+            # selection - all of them, however many, and no other.
+            _only = {int(i) for i in only_turns}
+            selected_ix = {i for i in eligible_ix if i in _only}
+            required = len(selected_ix)
         out["coverage"] = {
             "target": coverage_target, "eligible": len(eligible_ix),
+            **({"system3": sorted(selected_ix)} if only_turns is not None else {}),
             "required": required, "attempted": 0, "changed": 0,
             "met": required == 0, "version": 4,
             "strength": round(crystal_force(), 3),
@@ -124083,7 +124180,12 @@ async def dj_video_api(
         # not in that audio and would hold the picture back by 30 seconds.
         hls_listener = str(hls or "").lower()
         late = {"videos": dj_video_late(server_ms, lag_ms),
-                "burst_s": 0.0 if hls_listener in ("1", "true", "yes")
+                # #1475: the ABR lane starts a player its start offset
+                # behind live (the thirty seconds it was primed with,
+                # EXT-X-START in every variant playlist); 0.0 when the
+                # stream module has no such lane, as before.
+                "burst_s": _hls_start_offset_s()
+                if hls_listener in ("1", "true", "yes")
                 else dj_video_burst_s()}
     # 2026-09-14: "allow me to use endless video mode even if the station
     # is on pause ... endless video mode as a screensaver" while the rooms
@@ -124302,7 +124404,8 @@ async def radio_page() -> str:
     http://lilspark.local:8096/radio and everyone on the network hears the
     same session at the same point in the same track."""
     embedded = SPARK_AGENT_API_KEY if AUTOFILL_KEY else ""
-    return RADIO_PAGE_HTML.replace("__SERVER_KEY__", json.dumps(embedded))
+    return (RADIO_PAGE_HTML.replace("__SERVER_KEY__", json.dumps(embedded))
+            .replace("__ROAD__", "house"))                  # [#1475]
 
 
 @app.get("/api/dj/state")
@@ -127167,9 +127270,14 @@ async def pinebox_wire_api(
 @app.get("/api/pulse")
 async def pulse_api(
     authorization: str | None = Header(default=None),
+    since: float = 0.0,
+    until: float = 0.0,
 ) -> dict[str, Any]:
-    """#1156: what the event loop has been stuck in."""
+    """#1156: what the event loop has been stuck in. [s3-timing] `since`
+    and `until` (epoch seconds) ask for a span instead of the last 10 min."""
     require_read_auth(authorization)
+    if since or until:
+        return pulse_report(600, since=since or None, until=until or None)
     return pulse_report(600)
 
 
@@ -128044,6 +128152,18 @@ PINELINK_FRAME = PINELINK_DIR / "frame.jpg"
 # four times a second, so a read can land mid-write; rather than hand a
 # torn picture to the panel, the door below keeps the last good one.
 _PINELINK_LAST: dict[str, Any] = {"bytes": b"", "at": 0.0}
+# #1475: the small frame (424 px wide, ~10 KB, written by tools/pinelink.py
+# twice a second) and the low-bitrate H.264 HLS lane beside it, for the
+# stream road. Both are feature-detected on disk: a supervisor that has not
+# learned to write them leaves the full frame as the only picture.
+PINELINK_FRAME_SMALL = PINELINK_DIR / "frame_small.jpg"
+PINELINK_LOW = PINELINK_DIR / "low"
+PINELINK_SMALL_FRESH_S = 5.0
+_PINELINK_LAST_SMALL: dict[str, Any] = {"bytes": b"", "at": 0.0}
+# #1475: may THIS token watch the low lane - memoised a few seconds per
+# token, because a player asks for a segment every two seconds and the
+# answer (a state-file read) does not change between them.
+_PINELINK_LOW_OK: dict[str, tuple[float, bool]] = {}
 # A segment name and nothing else. The filename arrives from a URL, and
 # `..` in it would hand out any file this process can read.
 PINELINK_NAME = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
@@ -135276,8 +135396,29 @@ async def pinelink_mine_api(
         got = pinelink_state()
         show = bool(got.get("state") == "live" and got.get("fresh")
                     and pinelink_on_air())
+    # #1475: and the two cheaper roads onto the same picture, named only
+    # when they exist on disk so a page never tries a lane nobody writes.
+    low = ""
+    small = ""
+    if show:
+        try:
+            got_low = pinelink_state().get("low") or {}
+            if got_low.get("ok") and (PINELINK_LOW / "index.m3u8").is_file():
+                low = ("/api/pinelink/low/index.m3u8"
+                       + ("?t=" + t if t else ""))
+        except Exception:  # noqa: BLE001
+            low = ""
+        try:
+            if (time.time() - PINELINK_FRAME_SMALL.stat().st_mtime
+                    <= PINELINK_SMALL_FRESH_S):
+                small = ("/api/pinelink/frame.jpg?w=424"
+                         + ("&t=" + t if t else ""))
+        except Exception:  # noqa: BLE001
+            small = ""
     return {"show": bool(show),
             "frame": "/api/pinelink/frame.jpg" + ("?t=" + t if t else ""),
+            "low": low,                                     # [#1475]
+            "small": small,                                 # [#1475]
             "why": ("" if show else
                     "the camera is not being shared with you right now")}
 
@@ -135525,6 +135666,7 @@ async def pinelink_live_api(
 async def pinelink_frame_api(
     request: Request,
     t: str = "",
+    w: str = "",                                            # [#1475]
     authorization: str | None = Header(default=None),
 ) -> Response:
     """The camera, right now, as one picture.
@@ -135564,20 +135706,110 @@ async def pinelink_frame_api(
                 detail="the camera is not being shared with you")
     else:
         require_read_auth(authorization)
+    # #1475: a phone on the stream road asks for ?w=424 and gets the small
+    # frame the supervisor writes beside the full one - a tenth of the
+    # bytes - when it is there and fresh. Same EOI guard, its own memo;
+    # anything else falls through to the full frame exactly as before.
+    raw = b""
+    small = False
     try:
-        raw = PINELINK_FRAME.read_bytes()
-    except Exception:  # noqa: BLE001
-        raw = b""
-    if len(raw) > 1024 and raw[-2:] == b"\xff\xd9":
-        _PINELINK_LAST.update({"bytes": raw, "at": time.time()})
-    else:
-        raw = bytes(_PINELINK_LAST.get("bytes") or b"")
+        want_w = int(float(w or 0))
+    except (TypeError, ValueError):
+        want_w = 0
+    if 0 < want_w <= 480:
+        try:
+            if (time.time() - PINELINK_FRAME_SMALL.stat().st_mtime
+                    <= PINELINK_SMALL_FRESH_S):
+                raw = PINELINK_FRAME_SMALL.read_bytes()
+        except Exception:  # noqa: BLE001
+            raw = b""
+        if len(raw) > 512 and raw[-2:] == b"\xff\xd9":
+            _PINELINK_LAST_SMALL.update({"bytes": raw, "at": time.time()})
+            small = True
+        elif (time.time() - float(_PINELINK_LAST_SMALL.get("at") or 0)
+                <= PINELINK_SMALL_FRESH_S):
+            raw = bytes(_PINELINK_LAST_SMALL.get("bytes") or b"")
+            small = bool(raw)
+        else:
+            raw = b""
+    if not small:
+        try:
+            raw = PINELINK_FRAME.read_bytes()
+        except Exception:  # noqa: BLE001
+            raw = b""
+        if len(raw) > 1024 and raw[-2:] == b"\xff\xd9":
+            _PINELINK_LAST.update({"bytes": raw, "at": time.time()})
+        else:
+            raw = bytes(_PINELINK_LAST.get("bytes") or b"")
     if not raw:
         raise HTTPException(status_code=404,
                             detail="the camera is not linked")
     return Response(content=raw, media_type="image/jpeg", headers={
         "Cache-Control": "no-store, no-cache, must-revalidate",
         "Access-Control-Allow-Origin": "*"})
+
+
+def _pinelink_low_viewer_ok(token: str) -> bool:
+    """#1475: pinelink_viewer_ok, memoised five seconds per token - a
+    player asks for a segment every two seconds."""
+    now = time.time()
+    got = _PINELINK_LOW_OK.get(token)
+    if got and now - got[0] < 5.0:
+        return got[1]
+    ok = bool(pinelink_viewer_ok(token))
+    if len(_PINELINK_LOW_OK) > 64:
+        _PINELINK_LOW_OK.clear()
+    _PINELINK_LOW_OK[token] = (now, ok)
+    return ok
+
+
+@app.get("/api/pinelink/low/{name}")
+async def pinelink_low_api(
+    name: str,
+    request: Request,
+    t: str = "",
+    authorization: str | None = Header(default=None),
+) -> Response:
+    """#1475: the camera as a low-bitrate H.264 HLS lane (424x240, 15 fps,
+    ~350 kbit/s, two-second segments) written by tools/pinelink.py under
+    data/pinelink/low/. This is the picture a phone on the tailnet or the
+    LAN plays natively in a <video>; the JPEG road stays for everything
+    else. Same permission as frame.jpg: through the door only a token that
+    carries the camera tick may ask, in the house the read key."""
+    if request.headers.get("x-pinebox-public") == "1" and not t:
+        raise HTTPException(status_code=403,
+                            detail="a tune-in link is required here")
+    if t:
+        if not _pinelink_low_viewer_ok(t):
+            raise HTTPException(
+                status_code=403,
+                detail="the camera is not being shared with you")
+    else:
+        require_read_auth(authorization)
+    if not PINELINK_NAME.match(name or ""):
+        raise HTTPException(status_code=400, detail="bad name")
+    path = PINELINK_LOW / name
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="no such piece")
+    headers = {"Cache-Control": "no-store, no-cache, must-revalidate",
+               "Access-Control-Allow-Origin": "*",
+               "X-Content-Type-Options": "nosniff"}
+    if name.endswith(".m3u8"):
+        try:
+            raw = path.read_text()
+        except Exception:  # noqa: BLE001
+            raise HTTPException(status_code=404, detail="no such piece")
+        out = []
+        for line in raw.splitlines():
+            s = line.strip()
+            if s and not s.startswith("#") and t:
+                out.append(s + ("&" if "?" in s else "?") + "t=" + quote(t))
+            else:
+                out.append(line)
+        return Response(content="\n".join(out) + "\n",
+                        media_type="application/vnd.apple.mpegurl",
+                        headers=headers)
+    return FileResponse(path, media_type="video/mp2t", headers=headers)
 
 
 
@@ -150918,6 +151150,9 @@ _PUBLIC_GET_PREFIX = ("/app-icon-", "/tune/", "/media/", "/music/",
                       "/icons/", "/api/generations/image/",
                       # #1253: the HLS segments an iPhone asks for.
                       "/hls/",
+                      # #1475: the camera's low H.264 lane. The route
+                      # demands a ticked token itself, like frame.jpg.
+                      "/api/pinelink/low/",
                       # #1353b: and the samples themselves, because a
                       # picture with no bytes behind it is a black
                       # box on a listener's phone. This is the same
@@ -150937,6 +151172,41 @@ _PUBLIC_POST = {"/api/dj/join", "/api/dj/request", "/api/dj/shout",
                 # #1471: a tapped diagnostics capture from the
                 # car. Token-gated, size-capped, throttled.
                 "/api/car/report"}
+
+
+def _request_road(request: Any) -> str:
+    """#1475: which road a request came in on, told by the server.
+
+    The first X-Forwarded-For hop when a proxy passed one (tailscale serve
+    and the funnel both do), else the socket's own peer. A tailnet address
+    is "tailnet", a house address is "lan", and anything else is "funnel"
+    through the public door or "house" otherwise. The page shows it on the
+    glass and the car report carries it, so "which way was I connected"
+    stops being a guess from a hostname. A bare 127.0.0.1 through the door
+    (a curl on the box) therefore reads "lan"."""
+    hop = ""
+    try:
+        hop = str(request.headers.get("x-forwarded-for")
+                  or "").split(",")[0].strip()
+    except Exception:  # noqa: BLE001
+        hop = ""
+    if not hop:
+        try:
+            hop = str(getattr(request.client, "host", "") or "")
+        except Exception:  # noqa: BLE001
+            hop = ""
+    hop = hop.lower().strip("[]")
+    if hop.startswith("::ffff:"):
+        hop = hop[7:]
+    if hop.startswith(("100.", "fd7a:")):
+        return "tailnet"
+    if hop.startswith(("10.89.", "192.168.", "127.")) or hop == "::1":
+        return "lan"
+    try:
+        public = request.headers.get("x-pinebox-public") == "1"
+    except Exception:  # noqa: BLE001
+        public = False
+    return "funnel" if public else "house"
 
 
 def _public_allows(method: str, path: str) -> bool:
@@ -151188,6 +151458,149 @@ async def _startup_stream_warm() -> None:
               flush=True)
     except Exception as exc:  # noqa: BLE001
         print(f"[stream] mixer did not start: {exc}", flush=True)
+    # #1475: and the ABR HLS lane beside it, when the stream module has
+    # one - primed at boot and nudged every minute, so the first phone on
+    # the road is handed a running lane with thirty seconds behind it.
+    fire_and_forget(_hls_keep_warm_loop())
+
+
+async def _hls_keep_warm_loop() -> None:
+    """#1475: STATION_STREAM.hls_keep_warm() every minute, off the loop.
+    Feature-detected on every tick: the module may learn the lane on a
+    later restart than this file did."""
+    while True:
+        fn = getattr(STATION_STREAM, "hls_keep_warm", None)
+        if callable(fn):
+            try:
+                await asyncio.to_thread(fn)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[stream] hls keep-warm: {exc}", flush=True)
+        await asyncio.sleep(60)
+
+
+def _hls_mix_call(fn: Any, mix: Any, *args: Any) -> Any:
+    """#1475: call a stream-module HLS function for this listener's mix.
+    The finished module keys every ABR lane by mix; one that does not take
+    `mix=` only knows the default lane, so a personal mix gets None."""
+    from station_stream import listener_mix
+    want = listener_mix(mix)
+    try:
+        return fn(*args, mix=want)
+    except TypeError:
+        if want != listener_mix(None):
+            return None
+        return fn(*args)
+
+
+def _hls_query(token: str, mix: Any = None) -> str:
+    """#1475: `?t=<token>[&mix=a,b,c]` - the mix only when it is not the
+    station's own, so the default lane's URLs stay short."""
+    parts: list[str] = []
+    if token:
+        parts.append("t=" + quote(token))
+    try:
+        from station_stream import listener_mix
+        want = listener_mix(mix)
+        if want != listener_mix(None):
+            parts.append("mix=" + ",".join(map(str, want)))
+    except Exception:  # noqa: BLE001
+        pass
+    return ("?" + "&".join(parts)) if parts else ""
+
+
+def _hls_variant_rewrite(raw: str, lane: str, token: str,
+                         mix: Any = None, mix_in_query: bool = False) -> str:
+    """#1475: one ABR variant playlist, dressed for the door.
+
+    `#EXT-X-INDEPENDENT-SEGMENTS` (hlsenc writes it only for a variant that
+    carries video, and every AAC frame is a sync point) and an
+    `#EXT-X-START` that puts a joining player the lane's start offset
+    (thirty seconds: the backlog the lane was primed with) behind the live
+    edge - never further back than the playlist actually holds, which is
+    its EXTINF total minus one target duration. The tagging is the stream
+    module's own `hls_dress_playlist` when it has one, so the rule lives in
+    one place; the loop below is the fallback. Segment names come back as
+    URLs on this door in the lane's own shape, carrying the same token."""
+    lines = raw.splitlines()
+    total = 0.0
+    target = 0.0
+    for line in lines:
+        s = line.strip()
+        if s.startswith("#EXTINF:"):
+            try:
+                total += float(s[8:].split(",", 1)[0])
+            except ValueError:
+                pass
+        elif s.startswith("#EXT-X-TARGETDURATION:"):
+            try:
+                target = float(s.split(":", 1)[1])
+            except ValueError:
+                pass
+    offset = _hls_start_offset_s(mix)
+    available = max(0.0, total - target)
+    back = min(offset, available)
+    dressed = ""
+    try:
+        import station_stream as _ss
+        dress = getattr(_ss, "hls_dress_playlist", None)
+        if callable(dress):
+            dressed = str(dress(raw, start_offset_s=(back if back > 0.5
+                                                     else None)) or "")
+    except Exception:  # noqa: BLE001
+        dressed = ""
+    if dressed.strip():
+        lines = dressed.splitlines()
+    else:
+        has_independent = any(x.strip() == "#EXT-X-INDEPENDENT-SEGMENTS"
+                              for x in lines)
+        has_start = any(x.strip().startswith("#EXT-X-START:") for x in lines)
+        tagged: list[str] = []
+        for line in lines:
+            tagged.append(line)
+            if line.strip() == "#EXTM3U":
+                if not has_independent:
+                    tagged.append("#EXT-X-INDEPENDENT-SEGMENTS")
+                    has_independent = True
+                if back > 0.5 and not has_start:
+                    tagged.append("#EXT-X-START:TIME-OFFSET=-%.1f,PRECISE=NO"
+                                  % back)
+                    has_start = True
+        lines = tagged
+    suffix = _hls_query(token, mix if mix_in_query else None)
+    out: list[str] = []
+    for line in lines:
+        s = line.strip()
+        if s and not s.startswith("#"):
+            out.append(f"/hls/{lane}/{s.split('?', 1)[0]}{suffix}")
+        else:
+            out.append(line)
+    return "\n".join(out) + "\n"
+
+
+def _hls_note_safe(token: str, kind: str, rate: int, name: str,
+                   nbytes: int, t0: float, request: Any) -> None:
+    """#1475: the per-token ledger, when the stream module keeps one.
+    Cheap, called after the body is built, never allowed to fail a
+    response."""
+    fn = getattr(STATION_STREAM, "hls_note", None)
+    if not callable(fn):
+        return
+    try:
+        addr = ""
+        xff = ""
+        try:
+            addr = str(getattr(request.client, "host", "") or "")
+        except Exception:  # noqa: BLE001
+            addr = ""
+        try:
+            xff = str(request.headers.get("x-forwarded-for")
+                      or "").split(",")[0].strip()[:64]
+        except Exception:  # noqa: BLE001
+            xff = ""
+        fn(str(token or ""), str(kind), int(rate or 0), str(name or ""),
+           int(nbytes or 0), int((time.monotonic() - t0) * 1000), addr, xff)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 @app.get("/stream.mp3")
@@ -151293,6 +151706,7 @@ async def station_stream_hls(
     t: str = "",
     br: str = "",
     mix: str = "",
+    abr: str = "",                                          # [#1475]
     authorization: str | None = Header(default=None),
 ) -> Response:
     """The broadcast as HLS. This is the road an iPhone should take.
@@ -151319,6 +151733,65 @@ async def station_stream_hls(
     # never changes the studio, the tablet, or another listener's mix.
     from station_stream import listener_mix
     personal_mix = listener_mix(mix)
+    _t0 = time.monotonic()
+    # #1475: THE MASTER, WHEN THE STREAM MODULE HAS ONE. Four AAC rates
+    # with aligned segments out of this listener's own lane (keyed by mix);
+    # the player picks and switches on its own and starts thirty seconds
+    # behind live with that much runway. ?abr=0, or ?br=<rate> (one rate
+    # asked for by name - the continuity probe does), keep the single
+    # variant below exactly as before; ?abr=1 insists on the master. When
+    # the module has no master, nothing below changes.
+    _abr = str(abr or "").strip().lower()
+    _master_fn = getattr(STATION_STREAM, "hls_master", None)
+    if callable(_master_fn) and (
+            _abr in ("1", "true", "yes", "on")
+            or (_abr not in ("0", "false", "no", "off")
+                and not str(br or "").strip())):
+        # Start (or heartbeat) this listener's lane exactly as the single
+        # road always has, then wait for its master the way that road
+        # waits for runway. A live media playlist is re-read from its own
+        # URL, so this URL must not answer media now and a master later.
+        master_path = None
+        try:
+            STATION_STREAM.hls(br, mix=personal_mix)
+            for _ in range(60):
+                master_path = _hls_mix_call(_master_fn, personal_mix)
+                if master_path is not None:
+                    break
+                await asyncio.sleep(0.25)
+        except Exception:  # noqa: BLE001
+            master_path = None
+        master_raw = ""
+        if master_path is not None:
+            try:
+                master_raw = Path(master_path).read_text()
+            except Exception:  # noqa: BLE001
+                master_raw = ""
+        query = _hls_query(t, None)
+        lane_tag = "-".join(str(x) for x in personal_mix)
+        out = []
+        shaped = bool(master_raw.strip())
+        for line in master_raw.splitlines():
+            s = line.strip()
+            if s and not s.startswith("#"):
+                m_rate = re.fullmatch(r"(\d{2,3})/index\.m3u8",
+                                      s.split("?", 1)[0])
+                if not m_rate:
+                    shaped = False        # a shape this door cannot route
+                    break
+                out.append(f"/hls/{m_rate.group(1)}-{lane_tag}/index.m3u8"
+                           f"{query}")
+            else:
+                out.append(line)
+        if shaped:
+            body = "\n".join(out) + "\n"
+            _hls_note_safe(t, "master", 0, "master.m3u8", len(body), _t0,
+                           request)
+            return Response(
+                content=body,
+                media_type="application/vnd.apple.mpegurl",
+                headers={"Cache-Control": "no-store, no-cache, must-revalidate",
+                         "X-Content-Type-Options": "nosniff"})
     enc = STATION_STREAM.hls(br, mix=personal_mix)
     # Wait for a modest initial HLS runway rather than handing a phone a
     # one-segment live edge. The separate segment requests then carry it
@@ -151343,8 +151816,11 @@ async def station_stream_hls(
             out.append(f"/hls/{lane}/{line}{suffix}{join}mix={','.join(map(str, personal_mix))}")
         else:
             out.append(line)
+    body = "\n".join(out) + "\n"
+    _hls_note_safe(t, "playlist", int(getattr(enc, "bitrate", 0) or 0),
+                   "live.m3u8", len(body), _t0, request)          # [#1475]
     return Response(
-        content="\n".join(out) + "\n",
+        content=body,
         media_type="application/vnd.apple.mpegurl",
         headers={"Cache-Control": "no-store, no-cache, must-revalidate",
                  "X-Content-Type-Options": "nosniff"})
@@ -151354,21 +151830,58 @@ async def station_stream_hls(
 async def station_stream_hls_segment(
     rate: str,
     name: str,
+    request: Request,                                       # [#1475]
     t: str = "",
     mix: str = "",
     authorization: str | None = Header(default=None),
 ) -> Response:
-    """One HLS segment. Name-checked: this reads from a directory the
-    mixer owns, and nothing but a segment may ever come out of it."""
+    """One HLS segment - or, #1475, one ABR variant playlist. Name-checked:
+    this reads from a directory the mixer owns, and nothing but a segment
+    or a variant's own index may ever come out of it."""
     require_listen_auth(t, authorization)
-    if not re.fullmatch(r"seg\d{1,8}\.(ts|aac|m4s)", name):
-        return Response(status_code=404)
-    parsed = re.fullmatch(r"(\d{2,3})-(\d{1,3})-(\d{1,3})-(\d{1,3})", str(rate))
-    if not parsed:
+    _t0 = time.monotonic()
+    is_playlist = name == "index.m3u8"
+    if not is_playlist and not re.fullmatch(r"seg\d{1,8}\.(ts|aac|m4s)", name):
         return Response(status_code=404)
     from station_stream import listener_mix
-    lane_mix = listener_mix(parsed.group(2, 3, 4))
-    enc = STATION_STREAM.hls_existing(int(parsed.group(1)), mix=lane_mix)
+    # #1475: the lane's own shape, <rate>-<music>-<dj>-<sfx>, is what the
+    # master names and what the single road has always used; a bare
+    # <rate> (mix in ?mix=, default otherwise) is accepted too.
+    shape = re.fullmatch(r"(\d{2,3})(?:-(\d{1,3})-(\d{1,3})-(\d{1,3}))?",
+                         str(rate))
+    if not shape:
+        return Response(status_code=404)
+    seg_rate = int(shape.group(1))
+    in_path = shape.group(2) is not None
+    lane_mix = (listener_mix(shape.group(2, 3, 4)) if in_path
+                else listener_mix(mix))
+    if is_playlist:
+        # A variant's playlist - only of a lane that is RUNNING, like a
+        # segment: a stale player must never be able to start one.
+        variant_fn = getattr(STATION_STREAM, "hls_variant_playlist", None)
+        if not callable(variant_fn):
+            return Response(status_code=404)
+        try:
+            playlist_path = _hls_mix_call(variant_fn, lane_mix, seg_rate)
+        except Exception:  # noqa: BLE001
+            playlist_path = None
+        if playlist_path is None:
+            return Response(status_code=404)
+        try:
+            raw = Path(playlist_path).read_text()
+        except Exception:  # noqa: BLE001
+            return Response(status_code=404)
+        lane = ("%d-%d-%d-%d" % ((seg_rate,) + lane_mix) if in_path
+                else str(seg_rate))
+        body = _hls_variant_rewrite(raw, lane, t, lane_mix,
+                                    mix_in_query=not in_path)
+        _hls_note_safe(t, "playlist", seg_rate, name, len(body), _t0, request)
+        return Response(
+            content=body,
+            media_type="application/vnd.apple.mpegurl",
+            headers={"Cache-Control": "no-store, no-cache, must-revalidate",
+                     "X-Content-Type-Options": "nosniff"})
+    enc = STATION_STREAM.hls_existing(seg_rate, mix=lane_mix)
     if enc is None:
         return Response(status_code=404)
     path = enc.dir / name
@@ -151381,6 +151894,7 @@ async def station_stream_hls_segment(
         # A segment that has already rolled out of the window. Saying 404
         # is correct: the player asks for a newer one.
         return Response(status_code=404)
+    _hls_note_safe(t, "segment", seg_rate, name, len(data), _t0, request)
     return Response(
         content=data, media_type="video/mp2t",
         headers={"Cache-Control": "public, max-age=30",
@@ -151423,6 +151937,30 @@ async def station_stream_state(
     """
     require_listen_auth(t, authorization)
     return STATION_STREAM.state()
+
+
+@app.get("/api/stream/hls_ledger")
+async def station_stream_hls_ledger(
+    token_tail: str = "",
+    limit: int = 200,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1475: what one listener's player actually asked for - the master,
+    the playlists, the segments, how big and how long each took - keyed by
+    the tail of their tune-in token. House auth: the ledger names
+    addresses."""
+    require_read_auth(authorization)
+    fn = getattr(STATION_STREAM, "hls_ledger", None)
+    if not callable(fn):
+        return {"rows": [], "available": False,
+                "why": "the stream module keeps no HLS ledger yet"}
+    try:
+        rows = fn(str(token_tail or ""),
+                  limit=max(1, min(2000, int(limit or 200))))
+    except Exception as exc:  # noqa: BLE001
+        return {"rows": [], "available": True, "error": str(exc)[:200]}
+    return {"rows": list(rows or []), "available": True,
+            "token_tail": str(token_tail or "")}
 
 
 # --- #1471: CAR DIAGNOSTICS -----------------------------------------------
@@ -151854,6 +152392,7 @@ async def car_report_api(
     return {
         "ok": ok,
         "id": pine_id,
+        "road_seen": _request_road(request),                # [#1475]
         "file": rel if not file_error else "",
         "file_error": file_error,
         "inbox_error": inbox_error,
@@ -152000,6 +152539,7 @@ async def tune_page(token: str, request: Request) -> HTMLResponse:
     public = request.headers.get("x-pinebox-public") == "1"
     page = (CONTROL_PANEL_HTML if (scope == "full" and not public)
             else RADIO_PAGE_HTML)
+    road = _request_road(request)                           # [#1475]
     # #1253: the page needs to know which side of the door it came
     # through. In the house it keeps the synchronised player; on the road
     # it defaults to the stream, which is the only road that works there.
@@ -152010,6 +152550,7 @@ async def tune_page(token: str, request: Request) -> HTMLResponse:
     return HTMLResponse(
         page.replace("__SERVER_KEY__", json.dumps(token))
             .replace("__AWAY__", "true" if public else "false")
+            .replace("__ROAD__", road)                      # [#1475]
             .replace("__BUILD__", str(int(_BUILD_MS)))
             # Safari fetches a manifest while parsing HEAD, before the old
             # JavaScript rewrite ran. Put the token in initial markup so an
@@ -152157,6 +152698,18 @@ def dj_video_late(now_ms: int, lag_ms: int = 0) -> list[dict[str, Any]]:
             first = index
             break
     return out[first:first + 12]
+
+
+def _hls_start_offset_s(mix: Any = None) -> float:
+    """#1475: how far behind live the ABR HLS lane starts a player, per
+    the stream module; 0.0 when the module has no such lane."""
+    fn = getattr(STATION_STREAM, "hls_start_offset_s", None)
+    if not callable(fn):
+        return 0.0
+    try:
+        return max(0.0, float(_hls_mix_call(fn, mix) or 0.0))
+    except Exception:  # noqa: BLE001
+        return 0.0
 
 
 def dj_video_burst_s() -> float:
@@ -165486,7 +166039,11 @@ async def sfx_video_mode_get_api(
 ) -> dict[str, Any]:
     """#1366: is the endless set running, and what is the picture dial."""
     require_read_auth(authorization)
-    return sfx_video_mode_state()
+    # #1475 (R6): off the loop. The pulse named this handler - the state
+    # reads the clip book (sqlite, under its own lock) and the sting
+    # history file, 2-5 s on a busy disk, on the loop the mixer rides.
+    # Same dict, made on a thread.
+    return await asyncio.to_thread(sfx_video_mode_state)
 
 
 @app.post("/api/sfx/video/mode")
@@ -171430,9 +171987,10 @@ def script_ledger_catch_up(rows: list[dict[str, Any]]) -> int:
               # [#1237] a single line published bound to a record keeps it
               **({"bound": dict(one["bound"])}
                  if isinstance(one.get("bound"), dict) else {}),
-              # [s3-roads] and its System 3 node, when it has one
-              **({"system3": _s3_line_stamp_of(one)}
-                 if _s3_line_stamp_of(one) else {})}
+              # [s3-roads] and its System 3 node, when it has one - asked ONCE:
+              # the stamp is popped on read, so a second ask returned None and
+              # no single line ever reached the ledger stamped [s3-line-fix]
+              **({"system3": _st} if (_st := _s3_line_stamp_of(one)) else {})}
              for one in group],
             str(row.get("round") or ""),
             # [#1386] F1: the road every gold bar, interject, SFX quip and
@@ -249477,6 +250035,11 @@ RADIO_PAGE_HTML = r"""<!doctype html>
     object-fit: cover; background: #04060b;
   }
   .pinecam.folded img { display: none; }
+  .pinecam video {
+    display: block; width: 100%; aspect-ratio: 16/9;
+    object-fit: cover; background: #04060b;
+  }
+  .pinecam.folded video { display: none; }
   @media (max-width: 520px) {
     .pinecam { right: 8px; bottom: 8px; width: min(240px, 62vw); }
   }
@@ -249633,6 +250196,10 @@ const KEY = __SERVER_KEY__;
  * or in the HOUSE? The two want opposite things, and the page used
  * to do the house thing for everybody. */
 const AWAY = __AWAY__;
+/* #1475: which road this page came in on, told by the server - tailnet,
+ * lan, house or funnel - rather than guessed from a hostname. */
+const ROAD = "__ROAD__";
+window.PINE_ROAD = ROAD;
 /* #1253: which player is actually running. "Did it update" should be
  * readable off the screen, not inferred from behaviour. */
 const BUILD = "__BUILD__";
@@ -249778,7 +250345,7 @@ function setRate(save) {
    * choice means a new connection. Only when something is actually
    * playing - changing it before you tune in should not start anything. */
   if (save !== false && typeof streamMode !== "undefined"
-      && streamMode && playing) {
+      && streamMode && playing && !wantsHls()) {           /* #1475: ABR picks */
     try { startStream(); } catch (e) {}
   }
 }
@@ -250484,6 +251051,7 @@ async function tvPoll() {
    * but slowly when it is not: a page nobody is listening to has no
    * business asking every 2.5 s (see the #1000 note on this page's
    * bandwidth). */
+  if (document.hidden) return;             /* #1475: nobody is watching */
   if (!playing && Date.now() - tvStateAt < 10000) { tvHide(); return; }
   let data;
   try {
@@ -250495,6 +251063,8 @@ async function tvPoll() {
       + (wantsHls() ? "&hls=1" : ""));
   } catch (e) { return; }
   if (typeof data.burst_s === "number") {
+    /* #1475: on HLS the station's number is the ABR lane's start offset
+     * (EXT-X-START), 0 when it has no such lane. */
     tvBurst = Math.max(0, data.burst_s);                    /* [#1244] */
   }
   tvEndless = !!data.endless;                              /* [#1244] */
@@ -251562,11 +252132,14 @@ function refreshPersonalMix() {
   mixWanted = personalMix();
   if (mixWanted === streamMixApplied) return;
   if (mixRestart) clearTimeout(mixRestart);
+  /* #1475: 1500 ms on the stream road (it was 180). Every rebuild is a
+   * new lane and a new encoder on the box; a thumb on a slider must not
+   * spawn one per pixel. */
   mixRestart = setTimeout(() => {
     mixRestart = null;
     if (!streamMode || !playing || mixWanted === streamMixApplied) return;
     startStream();
-  }, 180);
+  }, 1500);
 }
 
 function streamUrl() {
@@ -251576,7 +252149,13 @@ function streamUrl() {
   const road = wantsHls() ? "/stream.m3u8" : "/stream.mp3";
   let url = road + "?_=" + Date.now();
   if (GUEST) url += "&t=" + encodeURIComponent(KEY);
-  if (rate > 0) url += "&br=" + rate;
+  /* #1475: not on HLS - the station answers a named rate with that one
+   * variant, and without one with the ABR master, where the player picks
+   * among 48-128k by what the road can carry. */
+  if (rate > 0 && !wantsHls()) url += "&br=" + rate;
+  /* #1475: the station answers this with an ABR master (four rates, the
+   * player switches on its own, thirty seconds of runway) of THIS
+   * listener's own mix, or with the single lane when it has none. */
   if (wantsHls()) url += "&mix=" + encodeURIComponent(personalMix());
   return url;
 }
@@ -251953,11 +252532,18 @@ try {
 /* #1263: the set checks often enough to catch a short sting, and cheaply
  * enough that a car does not notice - a couple of hundred bytes. */
 setInterval(() => { try { tvPoll(); } catch (e) {} }, 2500);
+/* #1475: a hidden tab asks for nothing; the moment it is looked at again
+ * the picture catches up at once (the camera has its own listener). */
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) return;
+  try { tvPoll(); } catch (e) {}
+});
 try {
   document.getElementById("build").textContent =
     "player " + BUILD.slice(-6) + " · "
     + (streamMode ? (wantsHls() ? "car stream (HLS)" : "car stream (mp3)")
-                  : "live with the house");
+                  : "live with the house")
+    + " · " + ROAD;                                       /* #1475 */
 } catch (e) {}
 poll();
 /* #1253: on the stream road these two are DISPLAY ONLY - the title, the
@@ -252003,6 +252589,61 @@ setTimeout(clockLoop, 1500);
   var frameUrl = "";
   var folded = false;
   var timer = 0;
+  /* #1475: the camera as a low H.264 HLS lane in a <video>, on the
+   * tailnet, the LAN or in the house, where the player is native and
+   * the bytes are cheap. Never on the funnel; never unmuted; an error
+   * hands the frame back to the JPEG road for five minutes. */
+  var vid = null;
+  var lowUrl = "";
+  var lowBrokenAt = 0;
+  function paceFloor() {
+    return (typeof streamMode !== "undefined" && streamMode) ? 1000 : 250;
+  }
+  function lowWanted() {
+    if (!lowUrl || !mayShow) return false;
+    if (ROAD !== "tailnet" && ROAD !== "lan" && ROAD !== "house") return false;
+    if (!wantsHls()) return false;
+    if (lowBrokenAt && Date.now() - lowBrokenAt < 300000) return false;
+    return true;
+  }
+  function showVideo() {
+    if (vid) return;
+    build();
+    vid = document.createElement("video");
+    vid.setAttribute("playsinline", "");
+    vid.setAttribute("muted", "");
+    vid.setAttribute("autoplay", "");
+    vid.playsInline = true;
+    vid.muted = true;
+    vid.defaultMuted = true;
+    vid.autoplay = true;
+    vid.controls = false;
+    vid.addEventListener("error", function () { dropVideo(true); });
+    vid.addEventListener("volumechange", function () {
+      if (vid && !vid.muted) vid.muted = true;
+    });
+    vid.src = lowUrl;
+    box.insertBefore(vid, shot);
+    if (shot) shot.style.display = "none";
+    vid.play().catch(function () {});
+  }
+  function dropVideo(broken) {
+    if (broken) lowBrokenAt = Date.now();
+    if (!vid) return;
+    try { vid.pause(); vid.removeAttribute("src"); vid.load(); } catch (e) {}
+    try { vid.remove(); } catch (e) {}
+    vid = null;
+    if (shot) shot.style.display = "";
+    try { draw(); } catch (e) {}
+  }
+  document.addEventListener("visibilitychange", function () {
+    if (document.hidden) {
+      if (vid) { try { vid.pause(); } catch (e) {} }
+      return;
+    }
+    if (vid) { try { vid.play().catch(function () {}); } catch (e) {} }
+    try { draw(); } catch (e) {}
+  });
 
   function stamp(url) {
     return url + (url.indexOf("?") >= 0 ? "&" : "?") + "_=" + Date.now();
@@ -252031,6 +252672,9 @@ setTimeout(clockLoop, 1500);
       box.classList.toggle("folded", folded);
       fold.textContent = folded ? "+" : "–";
       fold.title = folded ? "Show the picture" : "Fold the picture away";
+      if (vid) {                                             /* #1475 */
+        try { if (folded) vid.pause(); else vid.play().catch(function () {}); } catch (e) {}
+      }
     });
     bar.appendChild(dot);
     bar.appendChild(name);
@@ -252065,6 +252709,7 @@ setTimeout(clockLoop, 1500);
   var paceMs = 250;
   function draw() {
     if (!mayShow || !frameUrl || folded) return;
+    if (vid) return;                     /* #1475: the video owns the frame */
     /* A hidden tab is a tab nobody is watching, and a phone throttles
      * these timers anyway - so stop asking rather than queue up a burst
      * of stale frames to be fetched the moment it wakes. */
@@ -252076,7 +252721,9 @@ setTimeout(clockLoop, 1500);
     img.onload = function () {
       pending = false;
       var took = Date.now() - t0;
-      paceMs = Math.max(250, Math.min(4000, Math.round(paceMs * 0.5 + took * 0.8)));
+      /* #1475: one a second on the stream road (a phone on a tower shares
+       * the funnel with the audio); four a second in the house. */
+      paceMs = Math.max(paceFloor(), Math.min(4000, Math.round(paceMs * 0.5 + took * 0.8)));
       if (shot && mayShow && !folded) shot.src = img.src;
     };
     img.onerror = function () {
@@ -252095,6 +252742,13 @@ setTimeout(clockLoop, 1500);
       var got = await api("/api/pinelink/mine");
       var want = !!(got && got.show);
       frameUrl = String((got && got.frame) || "");
+      /* #1475: on the stream road ask for the small frame (424 px, a
+       * tenth of the bytes); the station serves the full one when the
+       * small one is not being written. */
+      if (frameUrl && typeof streamMode !== "undefined" && streamMode) {
+        frameUrl += (frameUrl.indexOf("?") >= 0 ? "&" : "?") + "w=424";
+      }
+      lowUrl = String((got && got.low) || "");
       if (want !== mayShow) {
         mayShow = want;
         if (want) { build(); box.classList.add("show"); draw(); }
@@ -252103,10 +252757,13 @@ setTimeout(clockLoop, 1500);
           shot.removeAttribute("src");   /* stop the fetches too */
         }
       }
+      if (want && lowWanted()) showVideo();
+      else dropVideo(false);
     } catch (e) {
       /* A station that cannot answer is a station with no camera as far
        * as this page is concerned. It never blocks the broadcast. */
       if (mayShow && box) { mayShow = false; box.classList.remove("show"); }
+      dropVideo(false);                                        /* #1475 */
     }
   }
 

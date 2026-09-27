@@ -298,3 +298,17 @@ came back unpunctuated`.
   config got TEMPER1 / SHOCK1 / INTERJECT1 through the tables API meanwhile.
 - `tools/system3_rounds_patch.py` checks and applies sequentially and knows
   an applied edit by a distinctive line it inserted (27 edits).
+
+## 2026-09-27 (evening) - rewrites as rolls, Timing/Parameters, single-line fixes (session d6037f)
+
+- `tools/system3_rewrite_rolls_patch.py` (engine + runtime), `tools/rewrite_gates_patch.py` (app.py),
+  `tools/pulse_window_patch.py`, `tools/line_tabs_more_patch.py`, `tools/single_line_fixes_patch.py`.
+  Restarts 19:37Z and ~19:50Z, both healthy. 223 System 2/3 tests green; the two `test_sfx_speech_bank`
+  failures predate today.
+- Default controls now carry tint / repair / room at 0.5. With the content gates off the tint pass is
+  inactive, so TINT records one "off" event per round until it is switched on.
+- Records refreshed in `tools/system3_patch_app.py` (tune-feed, tune-css, repair) and
+  `tools/system3_roads_patch.py` (catchup-row) so both wiring tests count every hook.
+- Known, not done: the SFX Guy's dead-air talk still picks its context with random.choice of the topics
+  board; the liner-for-sting (25%) and the verdict (35%) are station randoms; single lines get no SFX
+  direction; `system3_direct_line` / `system3_bind_line` are bare names in app.py (runtime-injected).

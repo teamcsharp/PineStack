@@ -197,3 +197,32 @@ checks on the turn. A line System 3 did not direct says so.
 **Tablet performance.** One thumbnail plays at a time, once through, only
 while on screen; the feed keeps 14 rounds; the Script page does not hit-test
 the script pane while a System 3 view covers it.
+
+## 2026-09-27 (evening): the rewrite passes are rolls; Timing and Parameters
+
+**Rewrites as rolls** (`[s3-rewrite]`). Three new families, three new controls
+(`tint`, `repair`, `room`, 0.5 each): TINT is rolled per turn - which lines the
+crystal tint may rhyme (one event per round saying the pass is off when the
+station has it off); REPAIR once per round - whether a round that misses its
+target goes back to the writer (on System 3 rounds the review gate no longer
+decides); ROOM once per round - whether the Writers' Room may add to or
+rewrite it later. The bind stamps `entry.system3.tint_turns / repair / room`;
+`crystal_tint(only_turns=)`, the richness rewrite and both Room tickets read
+them. The Messenger shows the round-level rolls as chips under each round
+head (`roundRolls`), TINT as a chip on the message.
+
+**The tapped line** has two more tabs. *Timing*: the clocks of the line from
+plan to air with each step's duration, then what the station was doing while
+it was made - loop stalls in that window (`/api/pulse?since=&until=`), the
+model calls that overlapped it and how long they held the lane, GC, System 3's
+own planning times. *Parameters*: every parameter that painted the line as a
+fold - System 3's controls (value at planning, live slider), the DJ desk dials
+it read, the speaker-box and SFX config sections, the station's switches (cut,
+withdraw, bound, floor, break-in, topics), and the round itself (generation
+mode, structure, seed, config, inputs) - each with what it pertains to and the
+door that changes it.
+
+**Single lines** (`[s3-line-fix]`): a line's node sits in the speaker's seat;
+a line that speaks its own running-order row is written again without the
+sheet, then withheld; the ledger asks for a single line's stamp once, so
+intros, interjections and station IDs now link to their node.

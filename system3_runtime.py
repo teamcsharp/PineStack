@@ -400,6 +400,9 @@ class System3Runtime:
             # interjections forced in edgewise (the desk's own list; never on a call) and
             # the station-name mention
             "round_rolls": True,
+            # [s3-rewrite] TINT per turn, REPAIR and ROOM per round
+            "rewrite_rolls": True,
+            "tint": self._tint_state(),
             "dice_hosts": bool(dj.get("dice_hosts")),
             "interjections": ([] if ctx.get("caller_name") else
                               [" ".join(str(x).split()) for x in (dj.get("diatribe_interjections") or [])
@@ -581,6 +584,67 @@ class System3Runtime:
                         "reply": " ".join(str(r.get("reply") or "").split())[:400]})
         out.sort(key=lambda r: r["used"])
         return out[:60]
+
+    def _tint_state(self):
+        """[s3-rewrite] Is the station's crystal tint pass on (dialogue_tint_wanted),
+        and at what coverage - the TINT roll only rolls when it is."""
+        wanted, coverage, why = False, None, ""
+        try:
+            fn = getattr(self.host, "dialogue_tint_wanted", None)
+            wanted = bool(fn()) if callable(fn) else False
+        except Exception as exc:  # noqa: BLE001
+            why = "%s: %s" % (type(exc).__name__, str(exc)[:80])
+        try:
+            fn = getattr(self.host, "crystal_coverage_target", None)
+            coverage = int(fn()) if callable(fn) else None
+        except Exception:  # noqa: BLE001
+            coverage = None
+        return {"wanted": wanted, "coverage": coverage, "why": why}
+
+    # --- the rewrite rolls, for the station ------------------------------------
+    def tint_turns(self, handle, script):
+        """[s3-rewrite] The script indices whose turn rolled a rhyme - the
+        lines the crystal tint may touch. None when the round is not System
+        3's or nothing was rolled (the station keeps its own selection)."""
+        if not handle or not handle.active:
+            return None
+        conv = handle.conv
+        if not any(t.get("tint") for t in conv.get("turns") or []):
+            return None
+        try:
+            turns = self.host.banter_turns(str(script or ""))
+            mapping = system3.align(conv, turns)
+        except Exception as exc:  # noqa: BLE001
+            self.fail("tint alignment", exc)
+            return None
+        out = set()
+        for t in conv["turns"]:
+            if (t.get("tint") or {}).get("rhyme") and mapping.get(t["index"]) is not None:
+                out.add(int(mapping[t["index"]]))
+        return out
+
+    def repair_roll(self, handle):
+        """[s3-rewrite] True: a round that misses its target goes back; False:
+        it stands as written; None: nothing was rolled (the old rules)."""
+        if not handle or not handle.active:
+            return None
+        got = handle.conv.get("repair_roll")
+        return bool(got.get("repair")) if isinstance(got, dict) else None
+
+    @staticmethod
+    def room_allowed(entry):
+        """[s3-rewrite] May the Writers' Room touch this stored round? False only
+        when System 3 bound a ROOM roll that said no."""
+        s3 = entry.get("system3") if isinstance(entry, dict) else None
+        return not (isinstance(s3, dict) and s3.get("room") is False)
+
+    @staticmethod
+    def tint_turns_entry(entry):
+        """[s3-rewrite] The tint selection bound onto a stored entry, for the
+        passes that run after binding (larder, retint, recovery)."""
+        s3 = entry.get("system3") if isinstance(entry, dict) else None
+        got = s3.get("tint_turns") if isinstance(s3, dict) else None
+        return set(int(i) for i in got) if isinstance(got, list) else None
 
     # --- planning --------------------------------------------------------------
     async def direct(self, ctx):
@@ -942,6 +1006,14 @@ class System3Runtime:
             turns = self.host.banter_turns(script or "")
             val = system3.validate(handle.conv, turns)
             handle.conv["pre_repair"] = {k: val[k] for k in ("score", "verdict", "seat_order", "turn_ratio")}
+            # [s3-rewrite] the REPAIR roll decides: a round that rolled "stands"
+            # is not sent back, whatever the checks say - and says so
+            roll = handle.conv.get("repair_roll")
+            if val["repair_wanted"] and isinstance(roll, dict) and roll.get("repair") is False:
+                self.observe_later(handle.id, "REPAIR", {"why": "missed: seat order %.2f, turns %.2f - but the REPAIR "
+                                                        "roll said it stands as written" % (val["seat_order"], val["turn_ratio"]),
+                                                        "validation": handle.conv["pre_repair"], "rolled": False})
+                return False
             if val["repair_wanted"]:
                 with self.lock:
                     self.metrics["repairs"] += 1
@@ -1079,6 +1151,17 @@ class System3Runtime:
                                 # air copies onto every script-ledger line.
                                 "turns": {str(i): t["turn_id"] for t in conv["turns"]
                                           for i in [mapping.get(t["index"])] if i is not None}}
+            # [s3-rewrite] the rolls the passes after the bind read (the
+            # larder / retint tint, the Writers' Room), on the same record
+            if handle.active and isinstance(entry.get("system3"), dict):
+                if any(t.get("tint") for t in conv["turns"]):
+                    entry["system3"]["tint_turns"] = sorted(
+                        int(mapping[t["index"]]) for t in conv["turns"]
+                        if (t.get("tint") or {}).get("rhyme") and mapping.get(t["index"]) is not None)
+                for key in ("repair", "room"):
+                    got = conv.get(key + "_roll")
+                    if isinstance(got, dict):
+                        entry["system3"][key] = bool(got.get(key))
             self.remember(conv)
             self.persist(conv)
             self._flow(conv, "%s: %s" % ("bound" if handle.active else "shadow compared",
@@ -1666,6 +1749,10 @@ def install(app, namespace):
     namespace["system3_direct_banter"] = system3_direct_banter
     namespace["system3_door_roll"] = rt.door_roll
     namespace["system3_repair_wanted"] = rt.repair_wanted
+    namespace["system3_tint_turns"] = rt.tint_turns              # [s3-rewrite]
+    namespace["system3_tint_turns_entry"] = rt.tint_turns_entry
+    namespace["system3_repair_roll"] = rt.repair_roll
+    namespace["system3_room_allowed"] = rt.room_allowed
     namespace["system3_repair_clause"] = rt.repair_clause
     namespace["system3_director"] = rt.director
     namespace["system3_bind_entry"] = rt.bind_entry

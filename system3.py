@@ -53,7 +53,8 @@ ROADS = ("banter", "caller", "recap", "ad", "news", "manager", "memo", "gallery"
          # [s3-lines] the single lines dj_speak still spoke outside a road
          "reply", "request", "open", "aside")
 FAMILIES = ("CTS", "ES", "RS", "IRS", "FL", "SPEAKERBOX", "SFX", "TOPIC", "SFXGUY", "LINE", "LENGTH",
-            "TEMPER", "SHOCK", "INTERJECT", "MENTION", "CARRY")          # [s3-rounds] [s3-carry]
+            "TEMPER", "SHOCK", "INTERJECT", "MENTION", "CARRY",          # [s3-rounds] [s3-carry]
+            "TINT", "REPAIR", "ROOM")                                    # [s3-rewrite]
 PHASES = ("OPEN", "ESTABLISH", "DEVELOP", "ESCALATE", "EXPLORE", "WILDCARD",
           "RESOLVE", "WRAP", "SEGUE")
 SPEAKERBOX_MODES = ("NONE", "PREPEND", "APPEND", "FULL_SWATH", "REFERENCE",
@@ -87,6 +88,12 @@ DEFAULT_CONTROLS = {
     "shock_beat": 0.5,
     "interjections": 0.5,
     "mention": 0.5,
+    # [s3-rewrite] the passes after the write, as odds: which lines the
+    # crystal tint may rhyme, whether a round that missed its target is
+    # sent back, whether the Writers' Room may touch it later
+    "tint": 0.5,
+    "repair": 0.5,
+    "room": 0.5,
 }
 TAG_CONTROLS = {"disagreement": "disagreement", "escalation": "escalation",
                 "tangent": "tangent", "callback": "callback",
@@ -147,6 +154,9 @@ TOPIC_RATE_AT_FULL = 0.8        # [rng-topics] the TOPIC dice at topics = 1.0
 SHOCK_RATE_AT_FULL = 1.0
 INTERJECT_RATE_AT_FULL = 1.0
 MENTION_RATE_AT_FULL = 0.6
+TINT_RATE_AT_FULL = 1.0          # [s3-rewrite] control 1.0 = every turn may be rhymed
+REPAIR_RATE_AT_FULL = 1.0
+ROOM_RATE_AT_FULL = 1.0
 HOST_SEATS = ("A", "B", "D")
 # [s3-carry] how long a round's ending state carries into the next round's
 # start (linear decay to nothing at the window)
@@ -1044,6 +1054,78 @@ SFXGUY_KINDS = {"news": "breaks a story off the wire", "reaction": "fires back a
                 "quip": "a saying off his shelf"}
 
 
+def _tint_decision(conv, settings, ctx, turn, inputs):
+    """[s3-rewrite] "Rhyme this line": whether the crystal tint may touch
+    this turn. Its own stream (seed|tint), so the round's other draws are
+    what they were. Nothing is rolled unless the round opted in
+    (rewrite_rolls); when the station's tint pass is off, one event on the
+    round says so and no turn rolls."""
+    if not inputs.get("rewrite_rolls"):
+        return None
+    tint = inputs.get("tint") if isinstance(inputs.get("tint"), dict) else {}
+    if not tint.get("wanted"):
+        if not conv.get("tint_off_noted"):
+            conv["tint_off_noted"] = True
+            before = _snapshot(conv, turn["speaker"])
+            ev = _event(conv, {"turn_id": "", "turn_index": -1}, "TINT", [],
+                        {"id": "OFF", "label": "the crystal tint pass is off on the station"}, before,
+                        meta={"applies": False, "why": str(tint.get("why") or "the station's crystal tint pass is off "
+                              "(crystal_tint_pass, a crystal switched on, and the tint gate are all needed)")})
+            ev["state_after"] = before
+        return None
+    controls = settings.get("controls") or {}
+    control = clamp(controls.get("tint", DEFAULT_CONTROLS["tint"]))
+    rate = round(clamp(TINT_RATE_AT_FULL * control), 4)
+    own = DrawStream(str(conv["seed"]) + "|tint", int(conv.get("tint_draws") or 0))
+    before = _snapshot(conv, turn["speaker"])
+    d = own.next("TINT:rhyme")
+    st, hit = _dice_stage("RHYME", "the crystal tint may rhyme this line", rate, d,
+                          "tint control %.2f x %.1f" % (control, TINT_RATE_AT_FULL))
+    conv["tint_draws"] = own.n
+    ev = _event(conv, dict(ctx, turn_id=turn["turn_id"], turn_index=turn["index"]), "TINT", [st],
+                {"id": "RHYME" if hit else "PLAIN", "label": "the tint may rhyme this line" if hit else "read plain, as written"},
+                before, meta={"rate": rate, "control": round(control, 3),
+                              "coverage_target": tint.get("coverage"),
+                              "why": "the station's own selection took the first N eligible lines for its coverage; "
+                                     "under System 3 the dice choose the lines"}, rng=d)
+    ev["state_after"] = before
+    turn["decisions"].append({"family": "TINT", "event_id": ev["event_id"], "item": "RHYME" if hit else "PLAIN",
+                              "label": ev["selected"]["label"], "u": d["u"]})
+    return {"rhyme": bool(hit), "event_id": ev["event_id"]}
+
+
+def _rewrite_rolls(conv, config, settings, inputs):
+    """[s3-rewrite] The round's two rolls about what may happen to it after
+    the write: REPAIR (a round that misses its target goes back to the
+    writer, or stands as written) and ROOM (the Writers' Room may add to or
+    rewrite it later, or may not). Each on its own stream, recorded once,
+    opt-in like the round rolls."""
+    if not inputs.get("rewrite_rolls") or conv.get("repair_roll") is not None:
+        return
+    controls = settings.get("controls") or {}
+    ctx0 = {"turn_id": "", "turn_index": -1}
+    for family, key, at_full, yes, no, why in (
+            ("REPAIR", "repair", REPAIR_RATE_AT_FULL, "a round that misses its target goes back to the writer",
+             "it stands as written, whatever the checks say",
+             "the richness rewrite and System 3's own repair used to run - or be cancelled by a review gate - "
+             "on their own; this roll decides, and the gates do not"),
+            ("ROOM", "room", ROOM_RATE_AT_FULL, "the Writers' Room may add to or rewrite this round later",
+             "the Writers' Room leaves this round alone",
+             "the Room's two tickets (add turns / rewrite whole) chose bound rounds by their quality debt; "
+             "this roll is asked first")):
+        control = clamp(controls.get(key, DEFAULT_CONTROLS[key]))
+        rate = round(clamp(at_full * control), 4)
+        stream = DrawStream(str(conv["seed"]) + "|round:" + family)
+        d = stream.next(family + ":dice")
+        st, hit = _dice_stage(family, yes, rate, d, "%s control %.2f x %.1f" % (key, control, at_full))
+        st["candidates"][1]["label"] = no
+        before = _snapshot(conv, conv["cursor"].get("initiator"))
+        ev = _event(conv, ctx0, family, [st], {"id": family if hit else "NONE", "label": yes if hit else no},
+                    before, meta={"rate": rate, "control": round(control, 3), "why": why}, rng=d)
+        ev["state_after"] = before
+        conv[key + "_roll"] = {key: bool(hit), "event_id": ev["event_id"], "rate": rate}
+
+
 def _sfxguy_decision(conv, config, ctx, turn, inputs):
     """[s3-roads] The SFX Guy's node on this turn: does he pipe up after it,
     and with what kind of line. His numbers come off their own stream
@@ -1215,6 +1297,7 @@ def _decide_turn(conv, config, settings, stream, step, speaker, want, inputs, cl
     turn["speakerbox"] += _speakerbox_acts(conv, config, ctx, turn, acts, inputs)
     turn["sfx"] = _sfx_decision(conv, config, settings, ctx, stream, turn, es_spec, acts)
     turn["sfxguy"] = _sfxguy_decision(conv, config, ctx, turn, inputs)      # [s3-roads]
+    turn["tint"] = _tint_decision(conv, settings, ctx, turn, inputs)         # [s3-rewrite]
     # Dynamics that are functions of history rather than of one act.
     recent = [x.get("item") for t in conv["turns"][-6:] for x in t.get("decisions", []) if x.get("family") != "ES"]
     now = [a["id"] for a in acts]
@@ -1489,6 +1572,7 @@ def _round_rolls(conv, config, settings, inputs, want, banter=True):
                                          "nothing was drawn"})
         ev["state_after"] = before
         c["event_id"] = ev["event_id"]
+    _rewrite_rolls(conv, config, settings, inputs)                         # [s3-rewrite]
     if not inputs.get("round_rolls"):
         # a caller's protocol, a test plan, a conversation stored before these
         # rolls existed: nothing is drawn and the trajectory is the old one
@@ -2081,7 +2165,11 @@ def plan_line(conv, config, inputs=None):
     stream = DrawStream(conv["seed"], conv.get("draws", 0))
     seats = [p["actor_id"] for p in conv["participants"]]
     for leg in legs[:want]:
-        seat = str(leg.get("seat") or seats[0] if seats else "A")
+        # [s3-line-fix] the speaker the door passed in is the node's seat;
+        # the leg's seat is the default for a road that names none. (This
+        # read `(leg or seats[0]) if seats else "A"`: the dj's station ID
+        # was planned as seat D and its sheet said so - on air, four times.)
+        seat = str((seats[0] if seats else "") or leg.get("seat") or "A")
         if seat not in ("A", "B", "C", "D", "E"):
             seat = seats[0] if seats else "A"
         if seat not in seats:
@@ -2324,6 +2412,8 @@ def turn_stamp(conv, t):
             "sfx": {k: (t.get("sfx") or {}).get(k) for k in ("play", "placement", "intent", "event_id")},
             # [s3-roads] his node: whether he speaks after this line and how
             "sfxguy": {k: (t.get("sfxguy") or {}).get(k) for k in ("speak", "kind", "order", "event_id")},
+            # [s3-rewrite] whether the crystal tint may rhyme this line
+            "tint": {k: (t.get("tint") or {}).get(k) for k in ("rhyme", "event_id")},
             # [s3-rounds] what the round's own rolls put on this turn
             "round": {k: True for k in ("shock", "long_roll", "interject", "carry_on", "mention") if t.get(k)}}
 

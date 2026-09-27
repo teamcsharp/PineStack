@@ -5,7 +5,7 @@
   --bg: #0f171b; --panel: #152127; --panel-2: #1b2a31; --line: #33474d; --line-2: #46605f;
   --ink: #e2e9e6; --ink-2: #a9bcbd; --ink-3: #7e9496; --accent: #90dab9; --warn: #ffbea9; --warn-bg: #3d2621;
   --ok: #a1ddb9; --ok-bg: #1d3429;
-  --cts: #8ac6ac; --es: #f0a6ca; --rs: #87bfff; --irs: #ffb86b; --fl: #c4a1ee; --sb: #e7bf78; --sfx: #7fe0d6; --topic: #9be15d; --sfxguy: #ffd479; --line: #b8c4ff; --obs: #9aa9ab;
+  --cts: #8ac6ac; --es: #f0a6ca; --rs: #87bfff; --irs: #ffb86b; --fl: #c4a1ee; --sb: #e7bf78; --sfx: #7fe0d6; --topic: #9be15d; --sfxguy: #ffd479; --line: #b8c4ff; --tint: #f7d774; --repair: #ff9f6e; --room: #b6a4ff; --obs: #9aa9ab;
   --seat-a: #2a363c; --seat-b: #2459c2; --seat-d: #2e5a46; --seat-c: #5b3c8f; --seat-e: #1f6b69;
   color: var(--ink); background: var(--bg); font: 14px/1.5 system-ui, sans-serif;
   box-sizing: border-box; padding: 18px; max-width: 1680px; margin: auto; min-height: 100%;
@@ -647,3 +647,34 @@
 .s3-pfold-layer { display: grid; gap: 6px; min-width: 0; }
 .s3-pfold-layer h4 { margin: 0; font-size: 12px; color: var(--ink-2); }
 .s3-pfold-layer textarea { min-height: 96px; font: 12px/1.5 system-ui, sans-serif; }
+
+/* [s3-timing] the clocks of a line and the profiler snapshot */
+.s3-timeline { display: grid; gap: 4px; font-size: 12px; }
+.s3-tl-row { display: grid; grid-template-columns: 7ch minmax(9ch, auto) minmax(7ch, auto) minmax(0, 1fr); gap: 8px; align-items: baseline; padding: 3px 6px; border-radius: 6px; background: var(--panel-2); }
+.s3-tl-row.mine { border-left: 3px solid var(--accent); }
+.s3-tl-when { font: 11px ui-monospace, monospace; color: var(--ink-3); }
+.s3-tl-took { font: 600 11px ui-monospace, monospace; color: var(--accent); text-align: right; }
+.s3-frames { font: 10px ui-monospace, monospace; overflow-wrap: anywhere; }
+.s3-prof { display: grid; gap: 8px; }
+@media (max-width: 720px) { .s3-tl-row { grid-template-columns: 7ch 1fr 7ch; } .s3-tl-row > .s3-muted:last-child { grid-column: 1 / -1; } }
+/* [s3-params] every parameter, folded */
+.s3-params { display: grid; gap: 4px; }
+.s3-param { border: 1px solid var(--line); border-radius: 7px; background: var(--panel-2); }
+.s3-param > summary { display: flex; gap: 10px; align-items: center; padding: 6px 10px; cursor: pointer; list-style: none; }
+.s3-param > summary::-webkit-details-marker { display: none; }
+.s3-param > summary::before { content: '▸'; color: var(--ink-3); font-size: 11px; }
+.s3-param[open] > summary::before { content: '▾'; }
+.s3-param.changed > summary .s3-param-value { color: var(--sb); }
+.s3-param-name { flex: 1 1 auto; min-width: 0; }
+.s3-param-value { font: 600 12px ui-monospace, monospace; color: var(--ink-2); overflow-wrap: anywhere; text-align: right; }
+.s3-param-body { padding: 4px 10px 10px; display: grid; gap: 6px; }
+.s3-param-body input[type=range] { flex: 1 1 120px; }
+.s3-param-body textarea { width: 100%; font: 11px/1.4 ui-monospace, monospace; }
+.s3-param-pre { white-space: pre-wrap; overflow-wrap: anywhere; font: 11px/1.4 ui-monospace, monospace; max-height: 260px; overflow: auto; margin: 0; }
+.s3-tl-row.s3-tl-ev { grid-template-columns: 7ch minmax(7ch, auto) minmax(0, 1.2fr) minmax(0, 1fr); }
+.s3-tl-row.s3-tl-ev .s3-tl-took { text-align: left; }
+@media (max-width: 720px) { .s3-tl-row.s3-tl-ev { grid-template-columns: 7ch 7ch 1fr; } }
+
+/* [s3-rewrite] the round's own rolls under its head */
+.s3-round-rolls { display: flex; flex-wrap: wrap; gap: 4px; width: 100%; padding: 2px 0 0; }
+.s3-round-rolls .s3-diamond { font-size: 10px; }

@@ -139,6 +139,38 @@ class WiringTests(unittest.TestCase):
             self.assertIn(marker, src)
 
 
+    def test_the_tapped_line_has_timing_and_parameters(self):
+        # [s3-timing] [s3-params] the clocks and a profiler snapshot of the
+        # station while the line was made; every parameter, folded, with its
+        # control - and the strip that opens them
+        src = (ROOT / "frontend" / "system3.js").read_text(encoding="utf-8")
+        for marker in ("async function paintTiming(host)", "async function paintParams(host)",
+                       "timing: paintTiming, params: paintParams", "/api/pulse?since=", "function paramFold("):
+            self.assertIn(marker, src)
+        page = (ROOT / "desktop" / "renderer" / "script-page.js").read_text(encoding="utf-8")
+        self.assertIn("['timing', 'Timing'], ['params', 'Parameters']", page)
+        app = (ROOT / "app.py").read_bytes().decode("utf-8")
+        self.assertIn("def pulse_report(window: float = 600.0, since: float | None = None,", app)
+        css = (ROOT / "frontend" / "system3.css").read_text(encoding="utf-8")
+        for rule in (".s3-timeline", ".s3-param", ".s3-prof"):
+            self.assertIn(rule, css)
+
+
+    def test_the_rewrite_passes_are_rolls(self):
+        # [s3-rewrite] TINT per turn, REPAIR and ROOM per round, read by the
+        # station's passes and shown by the Messenger
+        app = (ROOT / "app.py").read_bytes().decode("utf-8")
+        for marker in ("only_turns: Any = None) -> dict[str, Any]:   # [s3-rewrite]", "_s3_repair = (globals()[\"system3_repair_roll\"](_s3)",
+                       "system3_room_allowed", "system3_tint_turns_entry", "_s3_repair is not True and _radio_draft_review"):
+            self.assertIn(marker, app)
+        eng = (ROOT / "system3.py").read_text(encoding="utf-8")
+        for marker in ("def _tint_decision(", "def _rewrite_rolls(", '"TINT", "REPAIR", "ROOM"'):
+            self.assertIn(marker, eng)
+        src = (ROOT / "frontend" / "system3.js").read_text(encoding="utf-8")
+        for marker in ("if (fam === 'TINT' || fam === 'REPAIR' || fam === 'ROOM')", "function roundRolls(conv)", "TINT: ['tint'], REPAIR: ['repair'], ROOM: ['room']"):
+            self.assertIn(marker, src)
+
+
 if __name__ == "__main__":
     unittest.main()
 

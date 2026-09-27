@@ -343,6 +343,10 @@ class RuntimeTests(unittest.TestCase):
         live = self.run_(self.station["system3_direct_banter"](**ctx(bank=False)))
         self.assertFalse(self.station["system3_repair_wanted"](live, "A: one speech."))
         banked = self.run_(self.station["system3_direct_banter"](**ctx(bank=True)))
+        # [s3-rewrite] the REPAIR roll decides for a System 3 round: stands, or goes back
+        banked.conv["repair_roll"] = {"repair": False, "event_id": "t"}
+        self.assertFalse(self.station["system3_repair_wanted"](banked, "A: one speech."))
+        banked.conv["repair_roll"] = {"repair": True, "event_id": "t"}
         self.assertTrue(self.station["system3_repair_wanted"](banked, "A: one speech."))
         self.assertIn("RUNNING ORDER", self.station["system3_repair_clause"](banked))
 

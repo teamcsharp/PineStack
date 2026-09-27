@@ -15528,7 +15528,8 @@
      line's id once, then switch between them. The tab chosen stays chosen
      for the next line tapped, so a reader can walk the feed on one tab. */
   var lineTab = 'line', lineTabs = null, lineTabsPane = null;
-  var LINE_TABS = [['line', 'Line'], ['system3', 'System 3'], ['node', 'Node'], ['prompt', 'Prompt'], ['tables', 'Tables']];
+  var LINE_TABS = [['line', 'Line'], ['system3', 'System 3'], ['node', 'Node'], ['prompt', 'Prompt'], ['tables', 'Tables'],
+    ['timing', 'Timing'], ['params', 'Parameters']];   /* [s3-line-tabs] the clocks + profiler; every parameter, folded */
   function lineTabsDispose() {
     if (lineTabs) { try { lineTabs.dispose(); } catch (e) { /* gone */ } }
     lineTabs = null;

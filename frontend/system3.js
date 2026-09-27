@@ -11,7 +11,7 @@
  */
 const FAM = {CTS: 'var(--cts)', ES: 'var(--es)', RS: 'var(--rs)', IRS: 'var(--irs)', FL: 'var(--fl)',
   SPEAKERBOX: 'var(--sb)', SFX: 'var(--sfx)', TOPIC: 'var(--topic)', SFXGUY: 'var(--sfxguy)', LINE: 'var(--line)',
-  COMMIT: 'var(--obs)', REPAIR: 'var(--warn)'};
+  COMMIT: 'var(--obs)', REPAIR: 'var(--repair)', TINT: 'var(--tint)', ROOM: 'var(--room)'};   /* [s3-rewrite] */
 const SIDE = {A: 'left', B: 'right', D: 'left', C: 'right', E: 'right'};
 const reduced = () => window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -65,6 +65,12 @@ function eventLine(ev, conv) {
     let tail = sel.id === 'NONE' ? (dice.selected === 'PASS' ? ' → ' + (meta.why || 'NONE') : '') : ' → ' + sel.id;
     if (mat) tail += ` → ${mat.selected.file}` + (mat.selected.passage && mat.selected.passage.index ? ` → passage ${mat.selected.passage.index}/${mat.selected.passage.of}` : '');
     return {fam, dice: dice.draw.dice, text: `${meta.mark} ${dice.draw.dice}/100 (needs > ${dice.threshold}) → ${dice.selected}${tail}`};
+  }
+  if (fam === 'TINT' || fam === 'REPAIR' || fam === 'ROOM') {
+    const meta = ev.meta || {};
+    const d = stage(ev, 'dice');
+    if (meta.applies === false || !d) return {fam, dice: null, text: (sel.label || sel.id || '').toLowerCase()};
+    return {fam, dice: d.draw ? d.draw.dice : null, text: `${pct(meta.rate)} odds → ${sel.id === 'NONE' || sel.id === 'PLAIN' ? (fam === 'TINT' ? 'plain' : 'stands') : (fam === 'TINT' ? 'rhyme' : fam === 'REPAIR' ? 'goes back if it misses' : 'the Room may touch it')}`};
   }
   if (fam === 'TOPIC') {
     const meta = ev.meta || {};
@@ -225,13 +231,19 @@ const FAMILY_WHAT = {
   TOPIC: ["Topic (the operator's board)",
     'Whether something off your topics board comes up in this round, which one, and on which turn - three draws, all recorded. The Topics dial sets the odds (0.5: 40% of rounds, 1.0: 80%, 0: never) and the least-sprung topics weigh most. The chosen turn still answers the line before it, then brings the topic up in its own words; a "1. / 2." entry is said word for word and answered word for word on the next turn. Nothing else puts a topic into a conversation.'],
   COMMIT: ['Script ledger', 'The round was frozen into the script ledger in the order it will be heard.'],
-  REPAIR: ['Repair', 'The written script ignored the running order badly enough that one bounded rewrite was asked for (banked rounds only).'],
+  REPAIR: ['Sent back to the writer',
+    'Whether a round that misses its target - the running order ignored, the richness target missed, a call contract failed - goes back to the writer for one rewrite, or stands as written. Rolled once per round at the odds of the Repair control; on System 3 rounds the review gates no longer decide it.'],
+  TINT: ['Rhyme this line (the crystal tint)',
+    "Whether the crystal tint's rhyme pass may touch this line. The station used to take the first N eligible lines for its coverage; under System 3 the dice choose the lines, at the odds of the Tint control (0.5 = half the lines). When the station's tint pass is off, one event on the round says so and nothing rolls."],
+  ROOM: ["The Writers' Room",
+    "Whether the Writers' Room may add to or rewrite this round later (its two tickets: add turns to a round that owes structure, rewrite a round whose topic or words drifted). Rolled once per round at the odds of the Room control; a round that rolled no is left alone."],
   LENGTH: ['Length', 'How many turns the round runs: one roll over the segment\'s budget band - never shorter than the slot asked for, at most one and a half times it - so the round fits its hour.'],
   VARIANT: ['Structure variant', 'Which structure of the road runs this round: the road\'s own segment or one of its variants on the desk, one weighted draw among them.'],
 };
 const DIAL_FOR = {ES: ['emotional_volatility'], RS: ['disagreement', 'escalation', 'tangent', 'callback', 'novelty'],
   IRS: ['disagreement', 'escalation'], FL: ['tangent', 'callback', 'novelty', 'closure_aggressiveness', 'escalation'],
-  SPEAKERBOX: ['speakerbox_density'], SFX: ['sfx_aggression'], CTS: ['novelty'], TOPIC: ['topics']};
+  SPEAKERBOX: ['speakerbox_density'], SFX: ['sfx_aggression'], CTS: ['novelty'], TOPIC: ['topics'],
+  TINT: ['tint'], REPAIR: ['repair'], ROOM: ['room']};
 
 function kv(pairs) {
   return el('div', 's3-kv', ...pairs.filter(p => p && p[1] !== undefined && p[1] !== null && p[1] !== '')
@@ -2568,7 +2580,23 @@ export async function mountEmbedded(root, {request, view = 'conversation', onSel
       el('b', {text: conv.identity.road_kind}), el('span', {class: 's3-pill ' + conv.mode, text: conv.mode}),
       el('span', {class: 's3-muted', text: clock(convTime(conv))}),
       el('span', {class: 's3-round-state', text: state}),
-      el('span', {class: 's3-round-topic', text: String((conv.subject || {}).topic || '').replace(/\s+/g, ' ').slice(0, 150)}));
+      el('span', {class: 's3-round-topic', text: String((conv.subject || {}).topic || '').replace(/\s+/g, ' ').slice(0, 150)}),
+      roundRolls(conv));
+  }
+  /* [s3-rewrite] THE ROUND'S OWN ROLLS, on its head: every decision recorded
+     with no turn (the length, the tempers, the shock beat, the topic, the
+     variant, whether it goes back to the writer, whether the Room may touch
+     it, the tint pass being off) as a chip that opens its card. */
+  function roundRolls(conv) {
+    const pre = (conv.decision_events || []).filter(e => !e.turn_id && e.family && !e.stage && e.kind !== 'observation');
+    if (!pre.length) return null;
+    return el('div', {class: 's3-round-rolls', 'data-keep': ''}, ...pre.map(ev => {
+      const chip = chipOf(ev, conv);
+      return el('span', {class: 's3-diamond' + (chip.miss ? ' miss' : ''), style: `--fam:${FAM[ev.family] || 'var(--obs)'}`, 'data-event': ev.event_id,
+        title: chip.title, text: chip.text, role: 'button', tabindex: '0',
+        onclick: e => { e.stopPropagation(); openDecision(conv, ev, null, v.api); },
+        onkeydown: e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); e.currentTarget.click(); } }});
+    }));
   }
 
   /* A round's place in the feed: at the bottom when it is the newest (every
@@ -4915,7 +4943,204 @@ export async function mountLineTabs(root, {request, lineId = '', tab = 'system3'
     host.querySelectorAll('.s3-tstory .s3-die').forEach((d, k) => { if (d.roll) d.roll(reduced() ? 0 : 600 + k * 120); });
   }
 
-  const PAINT = {system3: paintSystem3, node: paintNode, prompt: paintPrompt, tables: paintTables};
+  /* ---- [s3-timing] TIMING AND A PROFILER SNAPSHOT --------------------------
+     "how long the command took and ... a profiler snapshot of the performance
+     of the system with that line". The clocks of this line from plan to air,
+     each step with its own duration; then what the station was doing while
+     it was made: the loop stalls in that window (/api/pulse since/until), the
+     model calls that overlapped it and how long the one writer lane was held,
+     the render, and System 3's own planning and material times. */
+  const epoch = x => { const n = Number(x); if (!isFinite(n) || n <= 0) return 0; return n > 1e12 ? n / 1000 : n; };
+  const clockOf = x => { const t = epoch(x); if (!t) return typeof x === 'string' && x ? x : ''; const d = new Date(t * 1000); const two = n => (n < 10 ? '0' : '') + n; return two(d.getHours()) + ':' + two(d.getMinutes()) + ':' + two(d.getSeconds()); };
+  const secs = x => (x == null || !isFinite(x) ? '' : x >= 100 ? Math.round(x) + ' s' : x >= 10 ? x.toFixed(1) + ' s' : x >= 1 ? x.toFixed(2) + ' s' : Math.round(x * 1000) + ' ms');
+  async function paintTiming(host) {
+    const conv = cur.conv, t = cur.turn;
+    fill(host, conv && t ? turnArrows() : null, para('Reading the clocks...', 's3-muted'));
+    const soft = pr => pr.then(x => x, () => null);
+    const id = encodeURIComponent(cur.lineId);
+    const [why, prov] = await Promise.all([soft(request('/api/said/why/' + id)), soft(request('/api/dj/provenance/' + id))]);
+    if (!host.isConnected || !cur.alive) return;
+    let w = null;
+    if (conv && t) {
+      if (!writerByTurn.has(t.turn_id)) writerByTurn.set(t.turn_id, await findWriterCall(request, conv, t, callCache));
+      w = writerByTurn.get(t.turn_id) || null;
+      if (!host.isConnected || !cur.alive) return;
+    }
+    const planned = conv ? epoch(conv.created) : 0;
+    const evAts = conv ? (conv.decision_events || []).map(e => epoch(e.at)).filter(Boolean) : [];
+    const rolledFrom = evAts.length ? Math.min(...evAts) : 0, rolledTo = evAts.length ? Math.max(...evAts) : 0;
+    const writeAt = w && w.row ? epoch(w.row.at) : 0, writeEnd = w && w.row ? epoch(w.row.finished) : 0;
+    const render = (prov && prov.render) || {};
+    const flow = (why && why.flow) || [];
+    const flowAt = step => { const f = flow.find(x => x.step === step); return f ? f.at : ''; };
+    const airAt = epoch(why && why.air_at) || 0;
+    const airClock = airAt ? clockOf(airAt) : (flowAt('published') || flowAt('handed') || '');
+    const rows = [];
+    const add = (name, when, took, what) => rows.push({name, when, took, what});
+    if (conv) add('planned by System 3', clockOf(planned), (conv.plan || {}).plan_ms != null ? secs(Number(conv.plan.plan_ms) / 1000) : '', `${(conv.decision_events || []).length} decisions recorded${rolledFrom && rolledTo ? ` over ${secs(rolledTo - rolledFrom)}` : ''}${conv.mode ? ` - ${conv.mode}` : ''}`);
+    for (const m of (conv && conv.material) || []) add('passage fetched', '', secs(Number(m.ms || 0) / 1000), `${(m.selected || {}).file || 'a document'} through the station's speakbox_quote`);
+    if (w && w.row) add('written by the model', clockOf(writeAt), writeEnd && writeAt ? secs(writeEnd - writeAt) : (w.row.state === 'running' ? 'still running' : ''), `${w.row.model || '?'} - ${w.row.purpose || ''}${w.exact ? '' : ' (nearest call by time)'}${planned && writeAt ? ` - ${secs(Math.max(0, writeAt - planned))} after the plan` : ''}`);
+    else if (conv) add('written by the model', '', '', (w && w.why) || 'no model call was found for this message');
+    if (render.ms != null || render.engine) add('rendered to voice', flowAt('rendered') || '', render.ms != null ? secs(Number(render.ms) / 1000) : '', `${render.engine || '?'}${render.voice ? ' ' + render.voice : ''}${render.seconds ? ` - ${secs(Number(render.seconds))} of audio` : ''}${render.kb ? `, ${render.kb} KB` : ''}${render.fallback ? ' - fallback: ' + render.fallback : ''}`);
+    for (const f of flow) if (!['called', 'rendered'].includes(f.step)) add(f.label || f.step, f.at ? clockOf(f.at) : '', '', f.detail || '');
+    if (airClock) add('on air', airClock, why && why.seconds ? secs(Number(why.seconds)) : '', why ? `${why.seconds ? 'spoken - ' : ''}${why.aired || ''}${why.kind ? ' - ' + why.kind : ''}${why.withdrawn_why ? ' - ' + why.withdrawn_why : ''}` : '');
+    const first = [planned, writeAt].filter(Boolean).length ? Math.min(...[planned, writeAt].filter(Boolean)) : 0;
+    const last = Math.max(airAt || 0, writeEnd || 0, rolledTo || 0) || (first ? first + 600 : 0);
+    const table = el('div', 's3-timeline', ...rows.map(r => el('div', 's3-tl-row',
+      el('span', {class: 's3-tl-when', text: r.when || '-'}), el('b', {text: r.name}),
+      el('span', {class: 's3-tl-took', text: r.took || ''}), el('span', {class: 's3-muted', text: r.what || ''}))));
+    const total = first && airAt ? para(`${secs(airAt - first)} from ${planned && planned <= writeAt ? 'the plan' : 'the write'} to the air.`, 's3-muted') : null;
+    /* the profiler snapshot: the window this line was made in */
+    const prof = el('div', 's3-prof', para('Reading the station\'s pulse for that window...', 's3-muted'));
+    fill(host, conv && t ? turnArrows() : null,
+      sectionOf('The clocks of this line', el('div', null, table, total)),
+      sectionOf('What the station was doing while it was made', prof));
+    if (!first) { fill(prof, para('No plan or model call is on record for this line, so there is no window to profile.', 's3-muted')); return; }
+    const since = first - 3, until = (last || first) + 3;
+    const [pulse, hist, status] = await Promise.all([
+      soft(request(`/api/pulse?since=${since.toFixed(0)}&until=${until.toFixed(0)}`)).then(x => x || soft(request('/api/pulse'))),
+      soft(request('/api/prompt-history?limit=150')),
+      soft(request('/api/system3/status'))]);
+    if (!prof.isConnected || !cur.alive) return;
+    const stalls = ((pulse && pulse.recent) || []).filter(r => { const a = epoch(r.at); return a >= since && a <= until; });
+    const windowed = !!(pulse && pulse.since != null);
+    const calls = ((hist && hist.rows) || []).filter(r => { const a = epoch(r.at), b = epoch(r.finished) || a; return a && b >= since && a <= until; })
+      .sort((a, b) => epoch(a.at) - epoch(b.at));
+    const busy = calls.reduce((acc, r) => acc + Math.max(0, Math.min(until, epoch(r.finished) || until) - Math.max(since, epoch(r.at))), 0);
+    const span = Math.max(1, until - since);
+    const gc = (pulse && pulse.gc) || {};
+    const m = (status && status.metrics) || {};
+    fill(prof,
+      kv([['window', `${clockOf(since)} - ${clockOf(until)} (${secs(span)})`],
+        ['loop stalls in it', windowed ? `${stalls.length}${stalls.length ? ', worst ' + secs(Math.max(...stalls.map(r => Number(r.seconds) || 0))) : ''}` : `${stalls.length} (of the last 10 min - this station cannot window its pulse yet)`],
+        ['the writer lane', `${calls.length} model call${calls.length === 1 ? '' : 's'} overlapped it, holding the lane ${Math.round(100 * Math.min(1, busy / span))}% of the window`],
+        ['gc', gc.gen2_collections != null ? `${gc.gen2_collections} gen-2 collections, ${gc.frozen != null ? gc.frozen + ' objects frozen' : ''}` : ''],
+        ['System 3 lately', m.plan_ms_ema != null ? `plans in ${secs(Number(m.plan_ms_ema) / 1000)} (ema), material in ${secs(Number(m.material_ms_ema || 0) / 1000)}; ${m.withheld || 0} withheld, ${m.failures || 0} failures` : ''],
+        ['pulse reading', (pulse && pulse.reading) || 'unavailable']]),
+      stalls.length ? el('details', {open: stalls.length <= 6}, el('summary', {text: `the ${stalls.length} stall${stalls.length === 1 ? '' : 's'} - where the loop was`}),
+        el('div', 's3-timeline', ...stalls.map(r => el('div', 's3-tl-row s3-tl-ev', el('span', {class: 's3-tl-when', text: clockOf(r.at)}), el('b', {class: 's3-tl-took', text: secs(Number(r.seconds) || 0)}),
+          el('span', {class: 's3-muted', text: String(r.top || '')}), el('span', {class: 's3-muted s3-frames', text: (r.frames || []).slice(1, 5).join(' < ')}))))) : para(windowed ? 'The loop never stalled past 1.5 s while this line was made.' : '', 's3-muted'),
+      calls.length ? el('details', {open: calls.length <= 8}, el('summary', {text: `the ${calls.length} model call${calls.length === 1 ? '' : 's'} in the window`}),
+        el('div', 's3-timeline', ...calls.map(r => el('div', 's3-tl-row s3-tl-ev' + (w && w.row && r.id === w.row.id ? ' mine' : ''), el('span', {class: 's3-tl-when', text: clockOf(r.at)}),
+          el('b', {class: 's3-tl-took', text: r.finished && r.at ? secs(epoch(r.finished) - epoch(r.at)) : (r.state || '')}), el('span', {text: `${r.model || '?'} - ${r.purpose || ''}`}),
+          el('span', {class: 's3-muted', text: w && w.row && r.id === w.row.id ? 'this line\'s write' : (r.error ? 'error: ' + String(r.error).slice(0, 60) : '')}))))) : null,
+      para('Stalls are the event loop held past 1.5 s (py-spy names the frame); the lane is the one local model slot every writer shares. A line made while the lane was full waited for it - that wait is the gap between "planned" and "written" above.', 's3-muted'));
+  }
+
+  /* ---- [s3-params] EVERY PARAMETER THAT PAINTED THIS LINE ---------------------
+     "a collapsed panel of all the parameters that painted it and their values
+     allowing me to click them and see what they pertain to and to alter /
+     change / toggle their values". Each is a fold: its name and value shut,
+     what it pertains to and its control open. Every control goes through
+     the door that already owns the value (System 3's settings and config
+     sections, the DJ desk's dials, the orchestrator's policy book). */
+  const PARAM_HELP = {
+    emotional_volatility: 'how readily a speaker leaves the emotion they are in (the ES roll)',
+    disagreement: 'weight on arguing, pushing back and refusing premises (RS / IRS rolls)',
+    escalation: 'weight on turning the heat up', tangent: 'weight on wandering off the point (FL rolls)',
+    callback: 'weight on calling back to earlier moments', speakerbox_density: 'multiplies the prepend / append / full dials: 0.5 leaves them, 1.0 doubles them',
+    sfx_aggression: 'the SFX Guy\'s odds of a clip at a turn - restrained (0) to deliberately chaotic (1); never below the two-line cadence',
+    novelty: 'weight on fresh subjects and moves', closure_aggressiveness: 'how early the scene starts landing',
+    topics: 'how often something off your topics board comes up: 0.5 = 40% of rounds, 1.0 = 80%, 0 = never',
+    shock_beat: 'the odds of one open reaction turn in a round ("openly shocked at what the other just said")',
+    interjections: 'the odds of an interjection forced in edgewise while one seat goes on a roll',
+    mention: 'the odds the station\'s own name is worked into the round',
+    tint: 'which lines the crystal tint may rhyme: 0.5 = half of them, 1.0 = every eligible line, 0 = none (the pass itself is a station switch)',
+    repair: 'whether a round that misses its target goes back to the writer for one rewrite: 0.5 = half of such rounds, 0 = never (it stands as written)',
+    room: 'whether the Writers\' Room may add to or rewrite this round later: 0.5 = half of the rounds, 0 = never'};
+  const TOPIC_ROAD = {key: 'topics_by_rng', verb: 'topics', on: 'rng', off: 'auto', name: 'Topics only through the roulette',
+    what: 'on (rng): the topics board reaches a round only through System 3\'s TOPIC roll and CTS1\'s topics database; off (auto): the station\'s own topic roads spring topics by themselves again (banter, callers, the memo, the SFX Guy).'};
+  function paramFold(name, value, help, control, cls) {
+    return el('details', {class: 's3-param ' + (cls || '')},
+      el('summary', null, el('span', {class: 's3-param-name', text: name}), el('b', {class: 's3-param-value', text: value == null || value === '' ? '-' : String(value)})),
+      el('div', 's3-param-body', help ? para(help, 's3-muted') : null, control || null));
+  }
+  async function paintParams(host) {
+    const conv = cur.conv, t = cur.turn;
+    fill(host, conv && t ? turnArrows() : null, para('Reading the parameters...', 's3-muted'));
+    const soft = pr => pr.then(x => x, () => null);
+    const [settings, dials, policy] = await Promise.all([soft(request('/api/system3/settings')), soft(v.api.dials()), soft(v.api.policy(true))]);
+    if (!host.isConnected || !cur.alive) return;
+    const live = (settings && settings.settings) || {};
+    const liveControls = live.controls || {};
+    const planControls = ((conv && conv.settings) || {}).controls || {};
+    const status = el('span', 's3-muted');
+    const say = txt => { status.textContent = txt; };
+    /* 1. System 3's behaviour controls: the value at planning, the live value, a slider */
+    const controls = Object.keys({...planControls, ...liveControls}).map(k => {
+      const was = planControls[k], now = liveControls[k];
+      const out = el('b', {text: num(now)});
+      const input = el('input', {type: 'range', min: 0, max: 1, step: 0.05, value: now == null ? 0.5 : now, 'aria-label': k,
+        oninput: e => { out.textContent = num(+e.target.value); }});
+      const save = btn('Save', async () => { save.disabled = true; say('saving ' + k + '...');
+        try { const got = await send('/api/system3/settings', 'POST', {controls: {...liveControls, [k]: +input.value}}); liveControls[k] = +input.value; Object.assign(liveControls, ((got || {}).settings || {}).controls || {}); say(k + ' saved - the next round rolls with it');
+          const fold = save.closest('.s3-param'); const val = fold && fold.querySelector('.s3-param-value'); if (val) val.textContent = `${num(was)} at planning - now ${num(liveControls[k])}`; if (fold) fold.classList.toggle('changed', was != null && Math.abs(Number(liveControls[k]) - Number(was)) > 0.001); }
+        catch (e) { say('not saved: ' + ((e && e.message) || e)); } save.disabled = false; });
+      return paramFold(k.replace(/_/g, ' '), `${num(was)} at planning${now != null && Math.abs(Number(now) - Number(was)) > 0.001 ? ` - now ${num(now)}` : ''}`,
+        (PARAM_HELP[k] || 'a System 3 behaviour control: multiplies the weight of the outcomes tagged with it by 0.5x to 2x (0.5 is neutral)') + '. Recorded on this round at planning; the slider is the live value.',
+        el('div', 's3-row', input, out, save), was != null && now != null && Math.abs(Number(now) - Number(was)) > 0.001 ? 'changed' : '');
+    });
+    /* 2. the DJ desk dials System 3 read for this round */
+    const rates = ((conv && conv.inputs) || {}).speakerbox_rates || {};
+    const dialRows = [];
+    if (dials) {
+      const vals = {...dials};
+      const dialFold = (label, key, recorded, help, max = 1, step = 0.01, fmt = pct) => {
+        const out = el('b', {text: fmt(vals[key])});
+        const input = el('input', {type: 'range', min: 0, max, step, value: vals[key], 'aria-label': label, oninput: e => { vals[key] = +e.target.value; out.textContent = fmt(vals[key]); }});
+        const save = btn('Save to the station', async () => { save.disabled = true; say('saving...');
+          try { const done = await v.api.saveDials(dials, vals); Object.assign(dials, vals); say(done.length ? `saved ${done.join(', ')}` : 'nothing changed'); }
+          catch (e) { say('not saved: ' + ((e && e.message) || e)); } save.disabled = false; });
+        return paramFold(label, recorded != null ? `${fmt(recorded)} at planning${Math.abs(Number(vals[key]) - Number(recorded)) > 0.001 ? ' - now ' + fmt(vals[key]) : ''}` : fmt(vals[key]), help, el('div', 's3-row', input, out, save));
+      };
+      dialRows.push(dialFold('Prepend dial (DJ desk)', DIAL_KEY.prepend, rates.prepend, 'the odds a speaker-box passage is read word for word BEFORE a marked line; a d100 must land above 100 - odds'));
+      dialRows.push(dialFold('Append dial (DJ desk)', DIAL_KEY.append, rates.append, 'the odds a passage is read AFTER a marked line'));
+      dialRows.push(dialFold('Full-swath dial (DJ desk)', DIAL_KEY.full, rates.full, 'the odds turn 1 opens on a speaker-box monologue'));
+      dialRows.push(dialFold('Passages per round', 'max_inline', ((cur.config && cur.config.config && cur.config.config.speakerbox) || {}).max_inline, 'a winning roll places nothing once the round holds this many passages', 8, 1, x => String(Math.round(Number(x) || 0))));
+    } else dialRows.push(para('The DJ desk\'s dials could not be read.', 's3-muted'));
+    /* 3. the config sections (speaker-box, SFX) */
+    const cfg = (cur.config && cur.config.config) || {};
+    const sectionFold = (name, help) => {
+      const area = el('textarea', {value: json(cfg[name] || {}), rows: 8, 'aria-label': name});
+      const save = btn('Save ' + name, async () => { save.disabled = true; say('saving ' + name + '...');
+        try { await send('/api/system3/config/section/' + name, 'PUT', JSON.parse(area.value)); await reloadConfig(); say(name + ' saved'); }
+        catch (e) { say('not saved: ' + ((e && e.message) || e)); } save.disabled = false; });
+      return paramFold(name + ' section', Object.keys(cfg[name] || {}).length + ' keys', help, el('div', null, area, el('div', 's3-row', save)));
+    };
+    /* 4. the station's switches */
+    const roads = [...CUT_ROADS, TOPIC_ROAD];
+    const switches = roads.map(road => {
+      const on = policy ? (policy[road.key] !== false && (road.key !== 'topics_by_rng' || policy[road.key] !== false)) : true;
+      const b = btn(on ? 'ON - turn off' : 'OFF - turn on', async () => { b.disabled = true; say('switching...');
+        try { await v.api.setPolicy(road, !on); say(road.name + (on ? ' is off' : ' is on')); await paint(); } catch (e) { say('not changed: ' + ((e && e.message) || e)); b.disabled = false; } },
+        {class: 's3-cut-toggle' + (on ? '' : ' off')});
+      return paramFold(road.name, on ? 'ON' : 'OFF', road.what, el('div', 's3-row', b));
+    });
+    /* 5. the round itself */
+    const gen = live.generation_mode || (conv && conv.generation_mode) || 'batch';
+    const genBtn = btn(gen === 'turn' ? 'turn by turn - switch to whole rounds' : 'whole rounds - switch to turn by turn', async () => { genBtn.disabled = true;
+      try { await send('/api/system3/settings', 'POST', {generation_mode: gen === 'turn' ? 'batch' : 'turn'}); say('generation mode saved'); await paint(); } catch (e) { say('not saved: ' + ((e && e.message) || e)); genBtn.disabled = false; } });
+    const rs = (conv && conv.road_structure) || (conv && conv.call_structure) || {};
+    const inputs = (conv && conv.inputs) || {};
+    const roundRows = conv ? [
+      paramFold('generation', conv.generation_mode || gen, 'whole rounds (batch): the running order is planned whole before the write; turn by turn: each reply is planned after the last one is written, so it answers it. This round was planned ' + (conv.generation_mode || 'batch') + '.', el('div', 's3-row', genBtn)),
+      paramFold('structure', rs.id ? `${rs.id} v${rs.version || 1}` : 'the banter cycle', 'the legs (nodes) this round was built from; each leg has its act, seat, place and draws. Edit them in the Segments tab of System 3.', el('div', 's3-row', btn('Open the segments editor', () => openSystem3({request, tab: 'segments'})))),
+      paramFold('mode and roads', `${live.mode || conv.mode} - ${(live.roads || []).join(', ') || 'every road'}`, 'off: the legacy station; shadow: System 3 records what it would have done; active: it directs the roads listed.', el('div', 's3-row', btn('Open the Controls tab', () => openSystem3({request, tab: 'director'})))),
+      paramFold('seed', conv.seed, 'the root of this round\'s random numbers: draw n is sha256(seed|n|label), so the same seed, config and questions give the same answers. A test seed on the Controls tab pins it.', null),
+      paramFold('config', conv.config_hash + (cur.config && cur.config.hash && cur.config.hash !== conv.config_hash ? ` - the desk now holds ${cur.config.hash}` : ''), 'the hash of the tables, structures and sections this round was planned under.', null),
+      paramFold('the inputs', `${inputs.road || ''} - ${(inputs.seats || []).join('')} - ${inputs.turns || '?'} turns - ${inputs.target_seconds ? Math.round(inputs.target_seconds) + ' s' : 'no target'}`,
+        'what the road told System 3 when it asked: the seats and names, the turn budget and target length, the material available and the subject.', el('pre', {class: 's3-param-pre', text: json({seats: inputs.seats, names: inputs.names, turns: inputs.turns, target_seconds: inputs.target_seconds, availability: inputs.availability, subject: conv.subject, seed_file: inputs.seed_file, bank: inputs.bank, approach: inputs.approach, dice_hosts: inputs.dice_hosts, round_rolls: inputs.round_rolls})})),
+    ] : [para('This line was not directed by System 3; only the station\'s live parameters are shown.', 's3-muted')];
+    fill(host, conv && t ? turnArrows() : null,
+      el('div', 's3-row', el('span', {class: 's3-muted', text: 'Each parameter is a fold: tap it for what it pertains to and its control. Every change goes through the door that owns the value.'}), status),
+      sectionOf('System 3 behaviour controls', el('div', 's3-params', ...controls)),
+      sectionOf('The DJ desk dials System 3 read', el('div', 's3-params', ...dialRows)),
+      sectionOf('Config sections', el('div', 's3-params', sectionFold('speakerbox', 'mode weights for a speaker-box hit, passages per round, passage lengths'), sectionFold('sfx', 'the SFX Guy\'s clip odds at aggression 0 and 1, the first-exchange rule, arousal and humour boosts'))),
+      sectionOf('The station\'s switches', el('div', 's3-params', ...switches)),
+      sectionOf('This round', el('div', 's3-params', ...roundRows)));
+  }
+
+  const PAINT = {system3: paintSystem3, node: paintNode, prompt: paintPrompt, tables: paintTables, timing: paintTiming, params: paintParams};
   async function paint() {
     if (!cur.alive) return;
     const which = PAINT[current] ? current : 'system3';

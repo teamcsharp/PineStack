@@ -288,3 +288,17 @@ from, factor, blend}` once per banked round at air; `WITHHELD` `{stage, why}`;
 The round's meta on the entry (`entry["system3"]`) gains `planned_turns`
 (the air's incomplete-conversation gate read it and it was never set),
 `bank` and `carry`.
+
+## TINT / REPAIR / ROOM (2026-09-27, `[s3-rewrite]`)
+
+    TINT    per turn (stream seed|tint): stages[0] dice RHYME | NONE, rate = 1.0 x controls.tint;
+            selected {id: RHYME | PLAIN}; meta {rate, control, coverage_target}; turn.tint {rhyme, event_id};
+            turn_stamp().tint carries it onto entry.turn_dice[i].s3.tint. When the station's tint pass is
+            off: ONE round-level event, selected OFF, meta.applies False, meta.why.
+    REPAIR  once per round (seed|round:REPAIR): dice REPAIR | NONE, rate = controls.repair;
+            conv.repair_roll {repair, event_id, rate}; bound as entry.system3.repair.
+    ROOM    once per round (seed|round:ROOM): dice ROOM | NONE, rate = controls.room;
+            conv.room_roll {room, event_id, rate}; bound as entry.system3.room.
+
+Opt-in through inputs.rewrite_rolls (the runtime sets it), so older plans and the golden trajectory
+are unchanged. inputs.tint = {wanted, coverage, why} is the station's tint state at planning.

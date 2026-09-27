@@ -419,13 +419,7 @@ EDITS = [
      '              **({"bound": dict(one["bound"])}\n'
      '                 if isinstance(one.get("bound"), dict) else {})}\n'
      '             for one in group],\n',
-     '              # [#1237] a single line published bound to a record keeps it\n'
-     '              **({"bound": dict(one["bound"])}\n'
-     '                 if isinstance(one.get("bound"), dict) else {}),\n'
-     '              # [s3-roads] and its System 3 node, when it has one\n'
-     '              **({"system3": _s3_line_stamp_of(one)}\n'
-     '                 if _s3_line_stamp_of(one) else {})}\n'
-     '             for one in group],\n', 1),
+     '              # [#1237] a single line published bound to a record keeps it\n              **({"bound": dict(one["bound"])}\n                 if isinstance(one.get("bound"), dict) else {}),\n              # [s3-roads] and its System 3 node, when it has one - asked ONCE:\n              # the stamp is popped on read, so a second ask returned None and\n              # no single line ever reached the ledger stamped [s3-line-fix]\n              **({"system3": _st} if (_st := _s3_line_stamp_of(one)) else {})}\n             for one in group],\n', 1),
     ("round-row-extras",
      '                def _s3_row_of(_row_at: int) -> dict[str, Any]:\n'
      '                    # System 3 (docs/SYSTEM3_EVENT_SCHEMA.md): the\n'
