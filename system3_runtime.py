@@ -215,7 +215,36 @@ class System3Runtime:
     def load(self):
         self.settings = self.store.settings()
         self.config = self.store.config()
+        added = self.add_missing_default_tables()
+        if added:
+            self.log("System 3 config gained the default tables it predates: " + ", ".join(added))
         self.ready = True
+
+    def add_missing_default_tables(self):
+        """[s3-rounds] The store is the authority and it was saved before some
+        default tables existed (TEMPER1, SHOCK1, INTERJECT1 on 2026-09-27: the
+        station restarted on the new engine and rolled nothing, because the
+        live config had eight tables). Each default table the config has
+        never held is added once and remembered in `defaults_added`, so a
+        table the operator later deletes stays deleted. Saved as a version
+        with a note, like any edit from the desk."""
+        config = self.config if isinstance(self.config, dict) else {}
+        have = {str(t.get("id")) for t in (config.get("tables") or []) if isinstance(t, dict)}
+        seen = {str(x) for x in (config.get("defaults_added") or [])}
+        missing = [t for t in system3_tables.default_tables() if t["id"] not in have and t["id"] not in seen]
+        if not missing:
+            return []
+        new = copy.deepcopy(config)
+        new.setdefault("tables", []).extend(copy.deepcopy(missing))
+        new["defaults_added"] = sorted(seen | {t["id"] for t in missing})
+        ids = [t["id"] for t in missing]
+        try:
+            self.store.save_config(new, "tables added from the defaults: " + ", ".join(ids))
+        except Exception as exc:  # noqa: BLE001
+            self.fail("default tables", exc)
+            return []
+        self.config = new
+        return ids
 
     def log(self, text, extra=""):
         try:

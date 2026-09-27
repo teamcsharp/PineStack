@@ -351,6 +351,47 @@ EDITS = [
      '            "Use one of its concrete words in the first reply. Do not repeat any line from the "\n'
      '            "completed transcript; every listed turn is a NEW line."\n'
      '            if retry else "")\n', 1),
+    ("harvest-pause-consts",
+     'HARVEST_BAD_FOR = 12 * 3600.0     # [s3-rounds] a document whose repair came back unpunctuated waits this long\n',
+     'HARVEST_BAD_FOR = 12 * 3600.0     # [s3-rounds] a document whose repair came back unpunctuated waits this long\n'
+     'HARVEST_PAUSE_AFTER = 5           # [s3-rounds] unrepaired repairs in a row before the harvest pauses...\n'
+     'HARVEST_PAUSE_FOR = 3600.0        # ...for this long: the model cannot do it tonight\n', 1),
+    ("harvest-pause-streak",
+     'def harvest_mark_bad(doc: Path, found: str = "") -> None:\n'
+     '    _harvest_bad_load()\n'
+     '    _HARVEST_BAD[doc.name] = time.time()\n',
+     'def harvest_mark_bad(doc: Path, found: str = "") -> None:\n'
+     '    _harvest_bad_load()\n'
+     '    _HARVEST_BAD[doc.name] = time.time()\n'
+     '    # [s3-rounds] five unrepaired in a row: the model cannot do this tonight;\n'
+     '    # the harvest pauses an hour rather than trying every document in turn\n'
+     '    _HARVEST_BAD["__streak__"] = float(_HARVEST_BAD.get("__streak__") or 0) + 1\n'
+     '    if _HARVEST_BAD["__streak__"] >= HARVEST_PAUSE_AFTER:\n'
+     '        _HARVEST_BAD["__pause_until__"] = time.time() + HARVEST_PAUSE_FOR\n'
+     '        _HARVEST_BAD["__streak__"] = 0.0\n'
+     '        pipeline_log("speakbox", "the transcript repair has come back unpunctuated %d times running - the "\n'
+     '                                 "harvest pauses for %d min; sentence windows stand in"\n'
+     '                     % (HARVEST_PAUSE_AFTER, int(HARVEST_PAUSE_FOR // 60)))\n', 1),
+    ("harvest-pause-skip",
+     'def harvest_skipped(doc: Path) -> bool:\n'
+     '    _harvest_bad_load()\n'
+     '    at = _HARVEST_BAD.get(doc.name)\n',
+     'def harvest_skipped(doc: Path) -> bool:\n'
+     '    _harvest_bad_load()\n'
+     '    if float(_HARVEST_BAD.get("__pause_until__") or 0) > time.time():\n'
+     '        return True                 # [s3-rounds] the harvest is paused\n'
+     '    at = _HARVEST_BAD.get(doc.name)\n', 1),
+    ("harvest-pause-reset",
+     '        harvest_mark_bad(doc, found)\n'
+     '        return []\n'
+     '\n'
+     '    # "Here is the repaired text:" is not one of the gems.\n',
+     '        harvest_mark_bad(doc, found)\n'
+     '        return []\n'
+     '    _harvest_bad_load()\n'
+     '    _HARVEST_BAD["__streak__"] = 0.0          # [s3-rounds] a real repair ends the run\n'
+     '\n'
+     '    # "Here is the repaired text:" is not one of the gems.\n', 1),
     ("panel-v5",
      '    const module = await import("/system3/system3.js?v=4");\n',
      '    const module = await import("/system3/system3.js?v=5");\n', 1),
@@ -361,23 +402,37 @@ def plan(text):
     return list(EDITS)
 
 
+def marker_of(old, new):
+    """The most distinctive line an edit inserts: the longest line of `new`
+    that is not a line of `old`. Its presence means the edit is applied, even
+    after a later edit changed the block around it (the way the harvest-pause
+    edits change the harvest helpers)."""
+    old_lines = set(old.splitlines())
+    cands = [ln for ln in new.splitlines() if ln.strip() and ln not in old_lines]
+    return max(cands, key=len) if cands else new
+
+
 def state_of(text, old, new, count):
-    n_new = text.count(new)
-    n_old = text.count(old)
-    if n_new >= 1 and n_old == new.count(old) * n_new:
+    if marker_of(old, new) in text:
         return "applied"
-    if n_new == 0 and n_old == count:
+    n_old = text.count(old)
+    if n_old == count:
         return "ready"
-    return "anchor found %d times, wanted %d; replacement found %d times" % (n_old, count, n_new)
+    return "anchor found %d times, wanted %d; not applied" % (n_old, count)
 
 
 def check(text):
+    """Sequential: an edit may anchor on text an earlier edit inserted, so the
+    later anchors are judged on the file as the earlier edits would leave it."""
     applied, missing = 0, []
+    work = text
     for name, old, new, count in plan(text):
-        state = state_of(text, old, new, count)
+        state = state_of(work, old, new, count)
         if state == "applied":
             applied += 1
-        elif state != "ready":
+        elif state == "ready":
+            work = work.replace(old, new)
+        else:
             missing.append("%s: %s" % (name, state))
     return applied, missing
 
@@ -394,16 +449,18 @@ def apply(path):
     if applied == len(plan(text)):
         print("already applied")
         return 2
+    done = 0
     for name, old, new, count in plan(text):
         if state_of(text, old, new, count) == "applied":
             continue
         assert text.count(old) == count, name
         text = text.replace(old, new)
+        done += 1
     fd, tmp = tempfile.mkstemp(dir=str(p.parent), prefix=p.name + ".", suffix=".tmp")
     with os.fdopen(fd, "wb") as fh:
         fh.write(text.encode("utf-8"))
     os.replace(tmp, str(p))
-    print("applied %d edit(s)" % (len(plan(text)) - applied))
+    print("applied %d edit(s)" % done)
     return 0
 
 

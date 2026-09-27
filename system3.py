@@ -1847,6 +1847,7 @@ def plan_call(conv, config, inputs=None):
     stream = DrawStream(conv["seed"], conv.get("draws", 0))
     _topic_decision(conv, conv["settings"], stream, inputs, want, replies=False,
                     open_turns=[i for i, (leg, _s) in enumerate(seq) if leg.get("place") == "middle"])
+    _round_rolls(conv, config, conv["settings"], inputs, want, banter=False)      # [s3-rounds] tempers, shock, mention
     seats = [p["actor_id"] for p in conv["participants"]]
     for leg, seat in seq:
         seat = str(seat or "A")
@@ -1882,7 +1883,7 @@ def render_call_sheet(conv):
         if i == material_at and call.get("speakerbox") and st.get("material"):
             rows.append(_call_words(st["material"], call, {"passage": json.dumps(sentence_cut(call["speakerbox"], 300))}))
     head = _call_words(st.get("head") or "", call, {"caller_turns": max(3, int(len(turns) * share))})
-    text = "\n\n" + head + "\n" + "\n".join(rows) + "\n" + (st.get("tail") or "")
+    text = "\n\n" + head + _tempers_line(conv) + "\n" + "\n".join(rows) + "\n" + (st.get("tail") or "")   # [s3-rounds]
     if call.get("scenario_clause"):
         text += "\n" + str(call["scenario_clause"])
     return text

@@ -2,6 +2,7 @@
 shock beat, the interjections, the mention), the carry between rounds, and
 a planned round that says why it never aired."""
 import asyncio
+import copy
 import json
 import re
 import time
@@ -131,6 +132,26 @@ class RoundRollTests(unittest.TestCase):
         self.assertEqual(rows["smug"]["weight"], 0.25)
         self.assertIn("worn in the last rounds x0.25", rows["smug"]["why"])
         self.assertEqual(rows["bored"]["weight"], 1.0)
+
+    def test_a_call_rolls_tempers_shock_and_mention_but_never_interjections(self):
+        cfg = system3.default_config()
+        inp = rolls_inputs(road="caller", seats=["A", "B", "C"], turns=11, names={"A": "Host", "B": "Skip", "C": "Fez"},
+                           call={"name": "Fez", "first": "Fez", "other": "Skip", "topic": "", "speakerbox": "", "story": False,
+                                 "scenario_clause": ""})
+        conv = system3.new_conversation(inp, cfg, system3.normalise_settings({"mode": "active", "test_seed": "c1"}), conversation_id="c1")
+        system3.plan_call(conv, cfg, inp)
+        fams = [e["family"] for e in conv["decision_events"]]
+        self.assertEqual(fams.count("TEMPER"), 2)                 # A and B, never the caller
+        self.assertEqual(fams.count("SHOCK"), 1)
+        self.assertEqual(fams.count("MENTION"), 1)
+        self.assertEqual(fams.count("INTERJECT"), 0)
+        self.assertNotIn("C", conv["tempers"])
+        sheet = system3.render_call_sheet(conv)
+        self.assertIn("TONIGHT'S TEMPERS (rolled)", sheet)
+        for tn in conv["turns"]:
+            if tn.get("shock") or tn.get("mention"):
+                self.assertIn(tn["speaker"], system3.HOST_SEATS)
+        self.assertTrue(system3.replay(json.loads(json.dumps(conv)), cfg)["ok"])
 
     def test_legs_roads_roll_tempers_shock_and_mention_but_not_interjections(self):
         cfg = system3.default_config()
@@ -308,6 +329,25 @@ class RuntimeCarryTests(unittest.TestCase):
         self.assertEqual(rt.metrics["abandoned"], 1)
         self.assertNotIn(h2.id, rt.open)
         self.assertEqual(self.client.get("/api/system3/status").json()["open_rounds"], 0)
+
+    def test_a_stored_config_gains_the_tables_it_predates_once(self):
+        rt = self.boot()
+        old = system3.default_config()
+        old["tables"] = [t for t in old["tables"] if t["family"] in ("CTS", "ES", "RS", "IRS", "FL")]
+        rt.store.save_config(old, "as saved before the round rolls existed")
+        rt.load()
+        self.assertEqual([t["id"] for t in rt.config["tables"]][-3:], ["TEMPER1", "SHOCK1", "INTERJECT1"])
+        self.assertEqual(rt.config["defaults_added"], ["INTERJECT1", "SHOCK1", "TEMPER1"])
+        # the store keys versions by content: this config IS the default, so the pointer moved to it
+        self.assertEqual(system3.config_hash(rt.store.config()), system3.config_hash(rt.config))
+        self.assertEqual(rt.add_missing_default_tables(), [])
+        # a deleted table stays deleted on the next load
+        without = copy.deepcopy(rt.config)
+        without["tables"] = [t for t in without["tables"] if t["id"] != "SHOCK1"]
+        rt.store.save_config(without, "SHOCK1 removed by the operator")
+        rt.load()
+        self.assertNotIn("SHOCK1", [t["id"] for t in rt.config["tables"]])
+        self.assertEqual(rt.add_missing_default_tables(), [])
 
     def test_a_legs_round_reports_its_row_count_as_the_rounds_size(self):
         rt = self.boot()

@@ -74578,6 +74578,8 @@ def _gem_is_stub(line: Any) -> bool:
 
 
 HARVEST_BAD_FOR = 12 * 3600.0     # [s3-rounds] a document whose repair came back unpunctuated waits this long
+HARVEST_PAUSE_AFTER = 5           # [s3-rounds] unrepaired repairs in a row before the harvest pauses...
+HARVEST_PAUSE_FOR = 3600.0        # ...for this long: the model cannot do it tonight
 _HARVEST_BAD: dict[str, float] = {}
 _HARVEST_BAD_PATH = data_path("speakbox_harvest_bad.json")
 
@@ -74607,6 +74609,15 @@ def harvest_unrepaired(text: str) -> bool:
 def harvest_mark_bad(doc: Path, found: str = "") -> None:
     _harvest_bad_load()
     _HARVEST_BAD[doc.name] = time.time()
+    # [s3-rounds] five unrepaired in a row: the model cannot do this tonight;
+    # the harvest pauses an hour rather than trying every document in turn
+    _HARVEST_BAD["__streak__"] = float(_HARVEST_BAD.get("__streak__") or 0) + 1
+    if _HARVEST_BAD["__streak__"] >= HARVEST_PAUSE_AFTER:
+        _HARVEST_BAD["__pause_until__"] = time.time() + HARVEST_PAUSE_FOR
+        _HARVEST_BAD["__streak__"] = 0.0
+        pipeline_log("speakbox", "the transcript repair has come back unpunctuated %d times running - the "
+                                 "harvest pauses for %d min; sentence windows stand in"
+                     % (HARVEST_PAUSE_AFTER, int(HARVEST_PAUSE_FOR // 60)))
     try:
         _HARVEST_BAD_PATH.write_text(json.dumps(_HARVEST_BAD), encoding="utf-8")
     except Exception:  # noqa: BLE001
@@ -74618,6 +74629,8 @@ def harvest_mark_bad(doc: Path, found: str = "") -> None:
 
 def harvest_skipped(doc: Path) -> bool:
     _harvest_bad_load()
+    if float(_HARVEST_BAD.get("__pause_until__") or 0) > time.time():
+        return True                 # [s3-rounds] the harvest is paused
     at = _HARVEST_BAD.get(doc.name)
     if not at:
         return False
@@ -74668,6 +74681,8 @@ async def speakbox_harvest(doc: Path, rid: str = "") -> list[str]:
         # draw. The document is marked and skipped; sentence windows stand in.
         harvest_mark_bad(doc, found)
         return []
+    _harvest_bad_load()
+    _HARVEST_BAD["__streak__"] = 0.0          # [s3-rounds] a real repair ends the run
 
     # "Here is the repaired text:" is not one of the gems.
     found = re.sub(r"^[^.!?\n]{0,120}:\s*", "", found.strip())
@@ -249290,22 +249305,53 @@ RADIO_PAGE_HTML = r"""<!doctype html>
   .said.me b { color: #ffd479; }
   /* System 3: the rolls behind each line, and its card when tapped. */
   .said.s3-has { cursor: pointer; }
-  .s3-strip { display: flex; flex-wrap: wrap; gap: 4px; margin: 3px 0 1px; }
+  .s3-strip { display: grid; gap: 3px; margin: 3px 0 1px; }
   .s3-d { font: 11px ui-monospace, monospace; color: #9fb0c3; border: 1px solid #1b2735;
           border-radius: 999px; padding: 0 7px; white-space: nowrap; max-width: 100%;
-          overflow: hidden; text-overflow: ellipsis; }
+          overflow: hidden; text-overflow: ellipsis; justify-self: start; }
   .s3-d::before { content: ""; display: inline-block; width: 6px; height: 6px; margin-right: 5px;
                   transform: rotate(45deg); background: var(--f, #7f8ea3); vertical-align: 1px; }
-  .s3-d.rolling { color: #4bb3ff; border-color: #2a4a66; }
-  .s3-d.pop { animation: s3pop .35s ease-out; }
-  @keyframes s3pop { 0% { transform: scale(1.18); } 100% { transform: scale(1); } }
+  /* #1472: the rolodex and the die. The drum scrolls only through the
+     recorded reel and stops on the recorded pick; the die shows nothing
+     while it tumbles and pops to the recorded d100; the words wait behind
+     them and arrive when the last one has landed. */
+  .s3-roll { display: flex; align-items: center; gap: 6px; font: 11px ui-monospace, monospace; }
+  .s3-roll .fam { flex: none; min-width: 72px; color: var(--f, #7f8ea3); font-weight: 700; letter-spacing: .04em; }
+  .s3-drum { position: relative; flex: 1 1 auto; min-width: 0; height: 20px; overflow: hidden; border-radius: 5px;
+             background: #0b121c; border: 1px solid #1b2735;
+             -webkit-mask-image: linear-gradient(transparent, #000 28%, #000 72%, transparent);
+             mask-image: linear-gradient(transparent, #000 28%, #000 72%, transparent); }
+  .s3-drum ul { list-style: none; margin: 0; padding: 0; position: absolute; left: 0; right: 0; top: 0; }
+  .s3-drum li { height: 20px; line-height: 20px; padding: 0 8px; white-space: nowrap; overflow: hidden;
+                text-overflow: ellipsis; color: #7f8ea3; }
+  .s3-drum li.hit { color: #e6eef8; font-weight: 600; }
+  .s3-die { flex: none; width: 30px; height: 22px; border-radius: 5px; display: grid; place-items: center;
+            font: 600 11px ui-monospace, monospace; background: #f4f1e8; color: #1c2624;
+            box-shadow: inset 0 -2px 0 #0003; }
+  .s3-die.none { background: #33474d; color: #9fb0c3; font-weight: 400; }
+  .s3-die.rolling { animation: s3tumble .18s linear infinite; color: transparent; }
+  .s3-die.pop { animation: s3pop .35s ease-out; }
+  @keyframes s3tumble { from { transform: rotate(0) scale(.9); } to { transform: rotate(360deg) scale(.9); } }
+  @keyframes s3pop { 0% { transform: scale(1.4); } 60% { transform: scale(.92); } 100% { transform: scale(1); } }
+  .said .words.typing { color: #7f8ea3; }
+  .said .words.typing::after { content: ""; display: inline-block; width: .5em; height: 1em; margin-left: 2px;
+        vertical-align: -2px; background: currentColor; opacity: .7; animation: s3caret .8s steps(2) infinite; }
+  @keyframes s3caret { 50% { opacity: 0; } }
+  /* #1472c: the dialogue comes together at the end, and each result's
+     line arrives as its die lands. */
+  .said .words .w { display: inline-block; opacity: 0; animation: s3in .3s ease-out forwards; }
+  .s3-card .r.arrive, .s3-card .m.arrive { animation: s3in .3s ease-out; }
+  @keyframes s3in { from { opacity: 0; transform: translateY(3px); } to { opacity: 1; transform: none; } }
   .s3-card { margin: 6px 0 2px; padding: 8px 10px; background: #0b121c; border: 1px solid #1b2735;
              border-radius: 8px; font-size: 12px; color: #c9d6e3; cursor: auto; }
   .s3-card .r { font: 11px/1.5 ui-monospace, monospace; margin: 2px 0; }
   .s3-card .fam { border-left: 3px solid var(--f, #7f8ea3); padding-left: 6px; }
   .s3-card .m { color: #7f8ea3; margin: 2px 0; }
   .s3-card .reel { font-size: 11px; padding-left: 9px; }
-  @media (prefers-reduced-motion: reduce) { .s3-d.pop { animation: none; } }
+  @media (prefers-reduced-motion: reduce) {
+    .s3-die.rolling, .s3-die.pop, .said .words.typing::after, .said .words .w, .s3-card .arrive { animation: none; }
+    .said .words .w { opacity: 1; }
+  }
   .note { color: #7f8ea3; font-size: 12px; margin-top: 10px; }
   .gallery-stage { display:none; position:relative; aspect-ratio:16/9; overflow:hidden;
     margin:0 0 14px; background:#070b12; border:1px solid #1b2735; border-radius:10px; }
@@ -249742,7 +249788,12 @@ function initLevels() {
 // looks like "<expiry>.<tag>.<signature>", so anything of that shape rides
 // as a ?t= query rather than an Authorization header — the handful of guest
 // routes accept it and nothing else will.
-const GUEST = /^\d+\.[a-f0-9]+\.[a-f0-9]+$/.test(String(KEY || ""));
+/* #1472b: a page the public door served can only ever be answered
+ * through its token - the door strips Authorization - so a full-scope
+ * link opened through it is a guest here whatever its scope. A
+ * full token via the door read 401 on every token-needing route
+ * (System 3 lines first) while the listener page looked fine. */
+const GUEST = AWAY || /^\d+\.[a-f0-9]+\.[a-f0-9]+$/.test(String(KEY || ""));
 
 /* #1324: EVERY REQUEST IS BOUNDED, AND IDENTICAL ONES SHARE A FLIGHT.
  *
@@ -250501,10 +250552,16 @@ function tvHide() {
  *  messages to expand them and see how they are composed of elements."
  *
  * A line System 3 directed carries its recorded rolls - the emotion, the
- * response, the pushback, the flow, the speakerbox and SFX dice. They show
- * as a strip that rolls ONCE through the candidates that were really in
- * the draw and lands on what was drawn, with the d100 it rolled; nothing
- * is invented for the effect. Tap a line to open it into its elements.
+ * response, the pushback, the flow, the speakerbox and SFX dice. #1472:
+ * "make sure the conversation rolodexes through the results of the node
+ * before arriving at the phrase being said ... show the dice rolling and
+ * landing on the results, resulting in the rolodex stopping and landing on
+ * that result." So each roll is a drum that scrolls ONCE through the
+ * candidates that were really in the draw while its die tumbles; the die
+ * lands on the d100 it rolled, the drum stops on what was drawn, and only
+ * then do the words appear. Nothing is invented for the effect: a line
+ * with no recorded roll shows its words at once. Tap a line to open it
+ * into its elements.
  *
  * Rows are keyed by the line's own id and KEPT between polls, so an open
  * card survives the next refresh; the list only moves to the bottom when
@@ -250551,7 +250608,10 @@ function patterRow(line, key) {
   const who = document.createElement("b");
   who.textContent = line.who === "dj" ? "DJ " : "Request ";
   row.appendChild(who);
-  row.appendChild(document.createTextNode(line.text || ""));
+  const words = document.createElement("span");
+  words.className = "words";
+  words.textContent = line.text || "";
+  row.appendChild(words);
   const strip = document.createElement("div");
   strip.className = "s3-strip";
   row.appendChild(strip);
@@ -250566,9 +250626,59 @@ function patterRow(line, key) {
   row.addEventListener("keydown", (e) => {
     if (e.key === "Enter" || e.key === " ") { e.preventDefault(); s3Toggle(row); }
   });
+  /* #1472: the words wait behind the rolls. A line whose composition
+   * is already known rolls at once; one still being asked for holds its
+   * words (a caret) until the answer lands, or for a few seconds at most
+   * - a slow station must never hide the conversation. A line no node
+   * made shows its words immediately. */
   const comp = line.id ? s3Comp.get(String(line.id)) : null;
-  if (comp !== undefined) s3Dress(row, comp, false);
+  if (comp !== undefined) s3Dress(row, comp, true);
+  else s3Hold(row);
   return row;
+}
+
+function s3Hold(row, deadline) {
+  const words = row.querySelector(".words");
+  if (!words) return;
+  if (!words.classList.contains("typing")) {
+    words.dataset.text = words.textContent;
+    words.textContent = "";
+    words.classList.add("typing");
+  }
+  if (row.__s3Hold) { clearTimeout(row.__s3Hold); row.__s3Hold = 0; }
+  const ms = deadline === undefined ? 4500 : deadline;
+  if (ms > 0) row.__s3Hold = setTimeout(() => s3Release(row), ms);
+}
+
+function s3Release(row) {
+  if (row.__s3Hold) { clearTimeout(row.__s3Hold); row.__s3Hold = 0; }
+  const words = row.querySelector(".words");
+  if (!words || !words.classList.contains("typing")) return;
+  words.classList.remove("typing");
+  words.textContent = words.dataset.text || "";
+}
+
+/* #1472c: THE DIALOGUE COMES TOGETHER. The held words arrive one by one,
+   a beat apart, once the last roll has landed. */
+function s3Words(row) {
+  const words = row.querySelector(".words");
+  if (!words) return;
+  if (row.__s3Hold) { clearTimeout(row.__s3Hold); row.__s3Hold = 0; }
+  const text = words.classList.contains("typing") ? (words.dataset.text || "") : (words.dataset.text || words.textContent || "");
+  words.classList.remove("typing");
+  if (s3Still()) { words.textContent = text; return; }
+  words.textContent = "";
+  let n = 0;
+  text.split(/(\s+)/).forEach((p) => {
+    if (!p) return;
+    if (/^\s+$/.test(p)) { words.appendChild(document.createTextNode(p)); return; }
+    const w = document.createElement("span");
+    w.className = "w";
+    w.textContent = p;
+    w.style.animationDelay = Math.min(1400, n * 45) + "ms";
+    n += 1;
+    words.appendChild(w);
+  });
 }
 
 function s3Ask(rows) {
@@ -250585,12 +250695,20 @@ function s3Ask(rows) {
         const row = patterNodes.get(String(item.line_id));
         if (row) s3Dress(row, comp, true);
       });
-      ids.forEach((id) => { if (!s3Comp.has(id)) s3Comp.set(id, null); });
+      ids.forEach((id) => {
+        if (s3Comp.has(id)) return;
+        s3Comp.set(id, null);
+        const row = patterNodes.get(id);
+        if (row) s3Dress(row, null, false);        /* #1472: nothing to roll */
+      });
       if (s3Comp.size > 300) {
         Array.from(s3Comp.keys()).slice(0, s3Comp.size - 300).forEach((k) => s3Comp.delete(k));
       }
     })
-    .catch(() => { s3RetryAt = Date.now() + 30000; })   /* the feed still reads */
+    .catch(() => {
+      s3RetryAt = Date.now() + 30000;                  /* the feed still reads */
+      ids.forEach((id) => { const row = patterNodes.get(id); if (row) s3Release(row); });
+    })
     .finally(() => { s3Asking = false; });
 }
 
@@ -250598,33 +250716,97 @@ function s3Chip(roll) {
   const chip = document.createElement("span");
   chip.className = "s3-d";
   chip.style.setProperty("--f", S3_FAMILY[roll.family] || "#7f8ea3");
-  chip.textContent = roll.family + (roll.dice ? " " + roll.dice : "") + " → " + (roll.label || "");
+  chip.textContent = roll.family + (roll.dice ? " " + roll.dice : "") + " \u2192 " + (roll.label || "");
   chip.title = roll.family + (roll.dice ? " rolled " + roll.dice + "/100" : " (not a draw)")
     + (roll.of ? ", landed on " + roll.index + " of " + roll.of : "") + ": " + (roll.label || "");
   return chip;
 }
 
-/* The roll, from the recorded reel: every label shown is a candidate that
-   was really in the draw, and it stops on the one that was drawn. */
-function s3Spin(chip, roll, delay) {
-  const reel = (roll.reel || []).filter(Boolean);
-  if (s3Still() || reel.length < 2) return;
-  const final = chip.textContent;
-  chip.classList.add("rolling");
-  let n = 0;
-  const turns = reel.length * 2;
-  setTimeout(() => {
-    const t = setInterval(() => {
-      chip.textContent = roll.family + " → " + reel[n % reel.length];
-      n += 1;
-      if (n >= turns) {
-        clearInterval(t);
-        chip.textContent = final;
-        chip.classList.remove("rolling");
-        chip.classList.add("pop");
-      }
-    }, 55);
-  }, delay);
+/* #1472: THE DRUM. Every label in it is a candidate that was really in
+   the draw (the recorded reel), and it stops on the one that was drawn.
+   Two passes through the reel, then the pick - the same honesty rule as
+   the panel's Rolodex: it never shows a roll that was not recorded. */
+function s3Drum(reel, hit) {
+  const box = document.createElement("div");
+  box.className = "s3-drum";
+  const list = document.createElement("ul");
+  box.appendChild(list);
+  const ROW = 20;
+  const render = (rows, h) => {
+    list.textContent = "";
+    rows.forEach((label, i) => {
+      const li = document.createElement("li");
+      li.textContent = label;
+      if (i === h) li.className = "hit";
+      list.appendChild(li);
+    });
+  };
+  render(reel, hit);
+  list.style.transform = "translateY(" + (-hit * ROW) + "px)";
+  box.roll = (ms) => new Promise((done) => {
+    if (reel.length < 2 || ms <= 0) { done(); return; }
+    const spun = reel.concat(reel, reel.slice(0, hit + 1));
+    render(spun, spun.length - 1);
+    list.style.transition = "none";
+    list.style.transform = "translateY(0)";
+    setTimeout(() => {
+      list.style.transition = "transform " + ms + "ms cubic-bezier(.12,.72,.18,1)";
+      list.style.transform = "translateY(" + (-(spun.length - 1) * ROW) + "px)";
+      setTimeout(() => {
+        list.style.transition = "none";
+        render(reel, hit);
+        list.style.transform = "translateY(" + (-hit * ROW) + "px)";
+        done();
+      }, ms + 30);
+    }, 20);
+  });
+  return box;
+}
+
+/* #1472: THE DIE. Blank while it tumbles; it pops to the d100 that was
+   recorded. A decision that was not a draw shows a dash and never rolls. */
+function s3Die(value) {
+  const d = document.createElement("span");
+  const v = Number(value) || 0;
+  d.className = "s3-die" + (v ? "" : " none");
+  d.textContent = v ? String(v) : "\u2014";
+  d.title = v ? "d100 landed on " + v + " (recorded)" : "not a draw";
+  d.roll = (ms) => new Promise((done) => {
+    if (!v || ms <= 0) { done(); return; }
+    d.classList.add("rolling");
+    setTimeout(() => {
+      d.classList.remove("rolling");
+      d.classList.add("pop");
+      setTimeout(() => d.classList.remove("pop"), 400);
+      done();
+    }, ms);
+  });
+  return d;
+}
+
+/* One recorded roll: its family, its drum and its die. */
+function s3RollRow(roll) {
+  let reel = (roll.reel || []).filter(Boolean).map(String);
+  const label = String(roll.label || "");
+  if (!reel.length) reel = [label || roll.family || ""];
+  let hit = reel.indexOf(label);
+  if (hit < 0) hit = Math.min(reel.length - 1, Math.max(0, (Number(roll.index) || 1) - 1));
+  const node = document.createElement("div");
+  node.className = "s3-roll";
+  node.style.setProperty("--f", S3_FAMILY[roll.family] || "#7f8ea3");
+  const fam = document.createElement("span");
+  fam.className = "fam";
+  fam.textContent = roll.family || "";
+  const drum = s3Drum(reel, hit);
+  const die = s3Die(roll.dice);
+  node.appendChild(fam);
+  node.appendChild(drum);
+  node.appendChild(die);
+  node.title = roll.family + (roll.dice ? " rolled " + roll.dice + "/100" : " (not a draw)")
+    + (roll.of ? ", landed on " + roll.index + " of " + roll.of : "") + ": " + label;
+  /* The die lands a beat before the drum settles on the result. */
+  node.roll = (ms) => Promise.all([drum.roll(ms), die.roll(Math.round(ms * 0.85))]);
+  return node;
 }
 
 function s3Dress(row, comp, animate) {
@@ -250632,27 +250814,33 @@ function s3Dress(row, comp, animate) {
   if (!strip) return;
   strip.textContent = "";
   row.classList.toggle("s3-has", !!comp);
-  if (!comp) return;
-  const turn = comp.turn;
-  if (!turn) {
+  const turn = comp ? comp.turn : null;
+  const rolls = turn ? (turn.rolls || []) : [];
+  if (comp && !turn) {
     const chip = document.createElement("span");
     chip.className = "s3-d";
     chip.textContent = comp.mode === "shadow" ? "System 3 shadow round" : "System 3 round";
     strip.appendChild(chip);
-    return;
   }
-  (turn.rolls || []).forEach((roll, i) => {
-    const chip = s3Chip(roll);
-    strip.appendChild(chip);
-    if (animate) s3Spin(chip, roll, i * 160);
-  });
   const card = row.querySelector(".s3-card");
   if (card && !card.hidden) { card.hidden = true; s3Toggle(row); }   /* open: refresh it */
+  if (!rolls.length) { s3Release(row); return; }
+  const rows = rolls.map((roll) => s3RollRow(roll));
+  rows.forEach((r) => strip.appendChild(r));
+  if (!animate || s3Still()) { s3Release(row); return; }
+  /* #1472: the rolodex and the dice first, the words after the last one
+   * has landed. Each roll starts a beat after the one before it. */
+  const spins = rows.map((r, i) => new Promise((done) => {
+    const ms = Math.min(1400, 900 + (r.querySelectorAll("li").length || 1) * 60);
+    setTimeout(() => { r.roll(ms).then(done, done); }, i * 140);
+  }));
+  Promise.all(spins).then(() => s3Words(row), () => s3Release(row));
 }
 
 function s3Toggle(row) {
   const card = row.querySelector(".s3-card");
   if (!card) return;
+  if (row.__s3Playing) return;               /* a replay in flight owns the row */
   const open = card.hidden;
   card.hidden = !open;
   row.setAttribute("aria-expanded", String(open));
@@ -250660,14 +250848,30 @@ function s3Toggle(row) {
   const id = row.dataset.key;
   /* a key with a colon is a row with no line id: not a System 3 line */
   const comp = s3Comp.has(id) ? s3Comp.get(id) : (id.indexOf(":") >= 0 ? null : undefined);
+  s3Replay(row, comp).catch(() => { s3Release(row); row.__s3Playing = false; });
+}
+
+/* #1472c: "if a message is tapped by a listener, then animate the Rolodex
+   effect and the dice roll for that, animating each result that happens
+   with the diagnostic information showing and the dialogue coming together
+   at the end." One roll at a time: its drum scrolls the recorded reel while
+   its die tumbles; the die lands, the drum stops, and that result's line
+   appears in the card; then the next roll; then the speaker-box and SFX
+   Guy readings; then the words, one by one. Nothing is invented: every
+   drum is the recorded reel, every die the recorded d100. */
+async function s3Replay(row, comp) {
+  const card = row.querySelector(".s3-card");
+  const strip = row.querySelector(".s3-strip");
+  if (!card || !strip) return;
   card.textContent = "";
-  const add = (cls, text) => {
+  const add = (cls, text, arrive) => {
     const d = document.createElement("div");
-    d.className = cls;
+    d.className = cls + (arrive && !s3Still() ? " arrive" : "");
     d.textContent = text;
     card.appendChild(d);
     return d;
   };
+  const pause = (ms) => new Promise((r) => setTimeout(r, s3Still() ? 0 : ms));
   if (comp === undefined) { add("m", "Reading how this line was made..."); return; }
   if (!comp) { add("m", "This line was not directed by System 3."); return; }
   const turn = comp.turn;
@@ -250676,28 +250880,44 @@ function s3Toggle(row) {
     : "Directed by System 3; the model wrote the words.")
     + (comp.topic ? " Subject: " + comp.topic : ""));
   if (!turn) { add("m", "A board clip or interjection inside a System 3 round - not one of its turns."); return; }
-  add("r", (turn.name || turn.speaker || "") + " · " + (turn.step || "") + " · turn " + turn.turn
-    + " of " + turn.of + " · " + (turn.phase || ""));
+  add("r", (turn.name || turn.speaker || "") + " \u00b7 " + (turn.step || "") + " \u00b7 turn " + turn.turn
+    + " of " + turn.of + " \u00b7 " + (turn.phase || ""));
   if (turn.emotion) {
     add("r", "emotion: " + turn.emotion + " (" + Number(turn.intensity || 0).toFixed(2) + ")"
-      + " · pace " + Number(turn.pace || 1).toFixed(2) + " · " + (turn.pause_style || "natural") + " pauses");
+      + " \u00b7 pace " + Number(turn.pace || 1).toFixed(2) + " \u00b7 " + (turn.pause_style || "natural") + " pauses");
   }
-  (turn.rolls || []).forEach((roll) => {
-    const line = add("r", roll.family + (roll.dice ? " d" + roll.dice : " (no roll)")
-      + (roll.of ? " · " + roll.index + " of " + roll.of : "")
-      + " → " + (roll.label || "") + (roll.category ? "  [" + roll.category + "]" : "")
-      + (roll.intensity != null ? " · intensity " + Number(roll.intensity).toFixed(2) : ""));
-    line.style.setProperty("--f", S3_FAMILY[roll.family] || "#7f8ea3");
-    line.classList.add("fam");
-    if ((roll.reel || []).length > 1) add("m reel", "rolled through: " + roll.reel.join(" · "));
-    if (roll.rule) add("m reel", roll.rule);
-  });
-  (turn.speakerbox || []).forEach((sb) => {
-    add("r", "speakerbox " + String(sb.mode || "").toLowerCase() + (sb.file ? ": " + sb.file : ""));
-  });
-  if (turn.sfx) {
-    add("r", "SFX guy: " + (turn.sfx.play ? "a clip " + (turn.sfx.placement || "after") + " the line" : "no clip planned")
-      + ((turn.sfx.intent || []).length ? " (" + turn.sfx.intent.slice(0, 4).join(", ") + ")" : ""));
+  const rolls = turn.rolls || [];
+  row.__s3Playing = true;
+  try {
+    if (rolls.length) {
+      s3Hold(row, 0);                      /* the words wait for the whole replay */
+      strip.textContent = "";
+    }
+    for (const roll of rolls) {
+      const r = s3RollRow(roll);
+      strip.appendChild(r);
+      const ms = Math.min(1400, 900 + (r.querySelectorAll("li").length || 1) * 60);
+      await r.roll(s3Still() ? 0 : ms);
+      const line = add("r", roll.family + (roll.dice ? " d" + roll.dice : " (no roll)")
+        + (roll.of ? " \u00b7 " + roll.index + " of " + roll.of : "")
+        + " \u2192 " + (roll.label || "") + (roll.category ? "  [" + roll.category + "]" : "")
+        + (roll.intensity != null ? " \u00b7 intensity " + Number(roll.intensity).toFixed(2) : ""), true);
+      line.style.setProperty("--f", S3_FAMILY[roll.family] || "#7f8ea3");
+      line.classList.add("fam");
+      if ((roll.reel || []).length > 1) add("m reel", "rolled through: " + roll.reel.join(" \u00b7 "), true);
+      if (roll.rule) add("m reel", roll.rule, true);
+      await pause(220);
+    }
+    (turn.speakerbox || []).forEach((sb) => {
+      add("r", "speakerbox " + String(sb.mode || "").toLowerCase() + (sb.file ? ": " + sb.file : ""), true);
+    });
+    if (turn.sfx) {
+      add("r", "SFX guy: " + (turn.sfx.play ? "a clip " + (turn.sfx.placement || "after") + " the line" : "no clip planned")
+        + ((turn.sfx.intent || []).length ? " (" + turn.sfx.intent.slice(0, 4).join(", ") + ")" : ""), true);
+    }
+    if (rolls.length) { await pause(160); s3Words(row); }
+  } finally {
+    row.__s3Playing = false;
   }
 }
 

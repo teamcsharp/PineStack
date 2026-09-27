@@ -287,3 +287,14 @@ came back unpunctuated`.
   one station-side random left in dj_banter's round shape.
 - The tablet APK carries `script-page.js` with `system3.js?v=4`; rebuild to
   pick up v5 (the desktop and the served page already do).
+
+### Second pass, the same day
+- The harvest pauses for an hour after five unrepaired repairs in a row
+  (`HARVEST_PAUSE_AFTER`, `HARVEST_PAUSE_FOR`); a real repair ends the run.
+- A call rolls tempers, the shock beat and the mention too (`plan_call`);
+  never interjections. The call sheet's head carries the tempers.
+- A stored config gains the default tables it predates, once, at load
+  (`add_missing_default_tables`, remembered in `defaults_added`); the live
+  config got TEMPER1 / SHOCK1 / INTERJECT1 through the tables API meanwhile.
+- `tools/system3_rounds_patch.py` checks and applies sequentially and knows
+  an applied edit by a distinctive line it inserted (27 edits).

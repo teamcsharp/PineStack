@@ -155,6 +155,7 @@ if __name__ == "__main__":
         self.assertEqual(applied, len(mod.plan(text)))
         for marker in ('globals().get("system3_withhold")', "async def _harvest_yields(", "async def _live_round_waits(",
                        "def _beat_fresh_only(", "def harvest_unrepaired(", 'mark={"kind": "harvest"}',
+                       "HARVEST_PAUSE_AFTER = 5", '_HARVEST_BAD["__pause_until__"]',
                        'system3.js?v=5'):
             self.assertIn(marker, text)
         self.assertNotIn('system3.js?v=4', text)
