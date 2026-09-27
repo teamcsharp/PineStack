@@ -107,6 +107,18 @@ class GapFillTests(unittest.IsolatedAsyncioTestCase):
         self.sting.assert_not_awaited()
         self.assertIn("air is already sold", app._SFX_GAP["gate"])
 
+    async def test_a_silent_room_does_not_outvote_air_sold_far_ahead(self):  # [#1463]
+        # The PineTab off the network: nothing audible, the room silent for a
+        # minute, and seventeen minutes already booked. A fill is stamped
+        # behind that, so it cannot reach the silence - it is refused.
+        app._PAGE_AIR_UNTIL[0] = time.time() + 1020
+        with (mock.patch.object(app, "sfx_sold_tolerance", lambda: 10),
+              mock.patch.object(app, "sfx_gap_notice", lambda: 6),
+              mock.patch.object(app, "talk_quiet_for", lambda: 60.0)):
+            self.assertEqual(await app.sfx_fill_gap("the room is silent"), "")
+        self.sting.assert_not_awaited()
+        self.assertIn("would land behind it", app._SFX_GAP["gate"])
+
 
 if __name__ == "__main__":
     unittest.main()

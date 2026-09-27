@@ -84663,11 +84663,17 @@ async def sfx_fill_gap(why: str = "", under_floor: bool = False,
             # been silent for 34. When the room says otherwise, the
             # cursor is describing audio that is not happening and it
             # does not get a vote.
-            if _ahead > sfx_sold_tolerance() and (
-                    talk_quiet_for() < sfx_gap_notice()
-                    or page_voice_audible_recent()):
+            # [#1463] ...BUT A FILL CANNOT REACH THE SILENCE EITHER.
+            # #1249 let a silent room outvote the cursor. page_feed_append
+            # stamps every fill BEHIND that cursor, so the fill it let
+            # through landed at the back of the pile, never in the hole:
+            # with the PineTab off the network it laid seventeen minutes of
+            # bars and samples ahead of the next conversation. A page that
+            # is stuck on what it holds is the ladder's (flush), not this.
+            if _ahead > sfx_sold_tolerance():
                 return _no("the air is already sold %.0fs ahead (allowing "
-                           "%.0fs)" % (_ahead, sfx_sold_tolerance()))
+                           "%.0fs) - a fill would land behind it"
+                           % (_ahead, sfx_sold_tolerance()))
             _deep = sfx_queue_deep()
             # #1315: AND A QUEUE IS NOT A SOUND EITHER.
             #
@@ -85655,7 +85661,17 @@ async def gold_fill_gap(why: str = "", floorless: bool = False,
     bars = 0
     went = ""
     last_who = ""
-    while bars < GOLD_RUN_MOST and laid < want:
+
+    def sold() -> float:
+        # [#1463] "must leave sold in front of it" counts the air ALREADY
+        # sold, not only this run's own bars. 2026-09-27: the PineTab was off
+        # the network for fifteen minutes, every pass of the watchdog laid
+        # another 45 s on top of whatever was booked, and 104 bars queued
+        # seventeen minutes ahead of the next conversation. On the box road
+        # the page cursor does not move, so this is `laid`, as before.
+        return max(laid, float(_PAGE_AIR_UNTIL[0] or 0) - time.time())
+
+    while bars < GOLD_RUN_MOST and sold() < want:
         # The FIRST bar is the caller's decision - sfx_fill_gap has already
         # tested the air, and the sting road hands this the same permission.
         # What is guarded here is the RUN: a pause landing mid-run must not
