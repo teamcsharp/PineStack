@@ -27,27 +27,12 @@
     parent.appendChild(d); return d;
   }
   function copyText(value) {
-    var text = String(value == null ? '' : value);
-    /* Prompt History lives in the desktop's file:// chrome. Its copy
-       commands must use Electron's Windows clipboard bridge first; the web
-       clipboard is unavailable in that context on Windows. */
-    try {
-      if (root.pineDesktop && typeof root.pineDesktop.copyText === 'function'
-          && root.pineDesktop.copyText(text)) return Promise.resolve(true);
-    } catch (err) { /* keep the browser roads for served/non-desktop hosts */ }
-    if (navigator.clipboard && navigator.clipboard.writeText) {
-      return navigator.clipboard.writeText(text).then(function () { return true; })
-        .catch(function () { return legacyCopy(text); });
-    }
-    return Promise.resolve(legacyCopy(text));
-  }
-  function legacyCopy(text) {
+    var text = String(value || '');
+    if (navigator.clipboard && navigator.clipboard.writeText) return navigator.clipboard.writeText(text);
     var area = document.createElement('textarea'); area.value = text; area.setAttribute('readonly', '');
     area.style.position = 'fixed'; area.style.opacity = '0'; document.body.appendChild(area); area.select();
-    var copied = false;
-    try { copied = !!document.execCommand('copy'); } catch (err) { copied = false; }
-    finally { area.remove(); }
-    return copied;
+    try { document.execCommand('copy'); } finally { area.remove(); }
+    return Promise.resolve();
   }
   function mount(host, toolbarHost) {
     var panel = make('section', 'ph-panel'); panel.hidden = true;
@@ -69,13 +54,7 @@
     });
     var exitFullscreen = make('button', 'ph-exit-fullscreen', 'Exit prompt fullscreen'); exitFullscreen.type = 'button'; exitFullscreen.hidden = true;
     var setFullscreen = function (on) {
-      on = !!on;
       panel.classList.toggle('ph-fullscreen', on); fullscreen.hidden = on; exitFullscreen.hidden = !on;
-      /* The bar normally lives in the Script header. A fixed fullscreen
-         panel sits above that header, so carry the bar into the panel while
-         expanded and put it back in its dock on exit. */
-      if (on) panel.insertBefore(bar, panel.firstChild);
-      else if (toolbarHost) toolbarHost.appendChild(bar);
       fullscreen.title = 'Fullscreen system prompt history'; fullscreen.setAttribute('aria-label', fullscreen.title);
     };
     var fullscreen = command('Fullscreen system prompt history', 'c:maximize', function () { setFullscreen(true); });
@@ -155,7 +134,7 @@
     }
     function requestBody(got) {
       var body = make('div', 'ph-call-body'), request = got.request || {}, messages = request.messages || [{role:'prompt', content:request.prompt || ''}]; if (request.system) messages = [{role:'system', content:request.system}].concat(messages);
-      messages.forEach(function (message) { var messageBox = make('section', 'ph-message'); messageBox.appendChild(make('b', '', message.role || 'message')); var actions = make('span', 'ph-message-actions'); if (message.role === 'system') actions.appendChild(command('Copy system prompt', 'c:copy--to-clipboard', function () { copyText(message.content).then(function (copied) { notice.textContent = copied ? 'System prompt copied to the Windows clipboard.' : 'The Windows clipboard refused the system prompt.'; }); })); if (typeof message.content === 'string') actions.appendChild(command('Edit future source', 'c:edit', function () { sourceEditor(message.content); })); actions.appendChild(command('Trace this prompt value', 'c:chart--network', function () { trace(message.content || message, got); })); messageBox.appendChild(actions); promptContent(messageBox, message.content || message); var hold = 0; messageBox.addEventListener('pointerdown', function (event) { if (event.button !== 0) return; hold = root.setTimeout(function () { hold = 0; trace(message.content || message, got); }, 600); }); ['pointerup', 'pointerleave', 'pointercancel'].forEach(function (name) { messageBox.addEventListener(name, function () { if (hold) root.clearTimeout(hold); hold = 0; }); }); messageBox.addEventListener('contextmenu', function (event) { event.preventDefault(); trace(message.content || message, got); }); body.appendChild(messageBox); });
+      messages.forEach(function (message) { var messageBox = make('section', 'ph-message'); messageBox.appendChild(make('b', '', message.role || 'message')); var actions = make('span', 'ph-message-actions'); if (message.role === 'system') actions.appendChild(command('Copy system prompt', 'c:copy--to-clipboard', function () { copyText(message.content).then(function () { notice.textContent = 'System prompt copied.'; }); })); if (typeof message.content === 'string') actions.appendChild(command('Edit future source', 'c:edit', function () { sourceEditor(message.content); })); actions.appendChild(command('Trace this prompt value', 'c:chart--network', function () { trace(message.content || message, got); })); messageBox.appendChild(actions); promptContent(messageBox, message.content || message); var hold = 0; messageBox.addEventListener('pointerdown', function (event) { if (event.button !== 0) return; hold = root.setTimeout(function () { hold = 0; trace(message.content || message, got); }, 600); }); ['pointerup', 'pointerleave', 'pointercancel'].forEach(function (name) { messageBox.addEventListener(name, function () { if (hold) root.clearTimeout(hold); hold = 0; }); }); messageBox.addEventListener('contextmenu', function (event) { event.preventDefault(); trace(message.content || message, got); }); body.appendChild(messageBox); });
       detail(body, 'Sampling and request options', Object.assign({}, request, {messages:undefined, prompt:undefined, system:undefined})); detail(body, 'Output / conversation', got.response, true); detail(body, 'Properties observed at dispatch', got.properties || {}); body.appendChild(make('p', 'ph-notice', got.properties_evidence || '')); if (got.error) body.appendChild(make('p', 'ph-notice', got.error)); return body;
     }
     function renderRequest(call, got) { var old = call.querySelector('.ph-call-body'); if (old) old.remove(); call.appendChild(requestBody(got)); }
@@ -171,7 +150,7 @@
       api.get('/api/prompt-history/config').then(function (got) { nodes = got.nodes || []; group.replaceChildren(); var all = make('option', '', 'All properties'); all.value = ''; group.appendChild(all); Array.from(new Set(nodes.map(function (n) { return n.group; }))).forEach(function (name) { group.appendChild(make('option', '', name)); }); graph.replaceChildren(); (got.roles || []).forEach(function (role) { var node = make('section', 'ph-node'); node.appendChild(make('h3', '', role.name)); node.appendChild(make('p', '', (role.systems || []).join(', '))); nodes.filter(function (n) { return n.path.includes(role.id) || n.path.join('.').includes(role.id + '_') || n.path[1] === (role.id === 'host' ? 'persona' : role.id + '_persona'); }).forEach(function (n) { var b = make('button', '', n.label); b.type = 'button'; b.addEventListener('click', function () { edit(n); }); node.appendChild(b); }); graph.appendChild(node); }); propertyList(); }).catch(function (err) { editor.textContent = err.message; });
     }
     function reset() { epoch += 1; before = 0; loading = false; records = Object.create(null); list.replaceChildren(); load(); config(); }
-    panel.reload = reset; panel.setFullscreen = setFullscreen; return panel;
+    panel.reload = reset; return panel;
   }
-  root.PinePromptHistory = {toggle: function (host, trigger, toolbarHost) { var panel = host.querySelector('.ph-panel') || mount(host, toolbarHost); panel.hidden = !panel.hidden; if (panel.hidden && panel.setFullscreen) panel.setFullscreen(false); if (panel.promptBar) panel.promptBar.hidden = panel.hidden; host.classList.toggle('ph-active', !panel.hidden); trigger.setAttribute('aria-pressed', String(!panel.hidden)); if (!panel.hidden) panel.reload(); }};
+  root.PinePromptHistory = {toggle: function (host, trigger, toolbarHost) { var panel = host.querySelector('.ph-panel') || mount(host, toolbarHost); panel.hidden = !panel.hidden; if (panel.promptBar) panel.promptBar.hidden = panel.hidden; host.classList.toggle('ph-active', !panel.hidden); trigger.setAttribute('aria-pressed', String(!panel.hidden)); if (!panel.hidden) panel.reload(); }};
 }(window));

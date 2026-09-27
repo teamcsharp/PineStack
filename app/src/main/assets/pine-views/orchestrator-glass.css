@@ -760,3 +760,20 @@
   border-color: rgba(120, 190, 255, 0.55);
 }
 .og-cmd-x { align-self: flex-start; }
+
+/* [s3-glass] the dice of the line on air, above the list */
+.og-s3 { padding: 6px 12px 7px; border-bottom: 1px solid #35414c; background: rgba(12, 18, 24, .9); font-size: 12px; }
+.og-s3-head { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; color: #9fb0c3; }
+.og-s3-place { color: #cfe3ea; }
+.og-s3-words { margin: 3px 0 5px; color: #edf3f5; white-space: normal; }
+.og-s3-rolls { display: flex; flex-direction: column; gap: 2px; }
+.og-s3-roll { display: flex; align-items: center; gap: 8px; font: 11px/1.5 ui-monospace, Menlo, Consolas, monospace; }
+.og-s3-roll .og-s3-fam { min-width: 66px; color: var(--fam, #9aa9ab); }
+.og-s3-roll .og-s3-reel { flex: 1; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; color: #cfe3ea; }
+.og-s3-roll .og-s3-die { min-width: 38px; text-align: right; color: #9fb0c3; }
+.og-s3-roll.rolling .og-s3-reel { color: #4bb3ff; }
+.og-s3-roll.rolling .og-s3-die { color: #4bb3ff; }
+.og-s3-roll.landed .og-s3-die { color: var(--fam, #9aa9ab); }
+.og-s3-foot { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 5px; }
+.og-s3-quiet { color: #7f8ea3; }
+.og.og-min .og-s3 { display: none; }

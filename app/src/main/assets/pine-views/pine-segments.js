@@ -259,7 +259,6 @@
     options = options || {};
     var next = !!options.next;
     var history = !!options.history;
-    var microphone = !!options.microphone;
     var wrap = el('div', 'pseg-kind pseg-topics');
     var head_ = el('div', 'pseg-kind-head pseg-static');
     head_.appendChild(el('span', 'pseg-kind-name',
@@ -269,9 +268,15 @@
     wrap.appendChild(head_);
 
     var row = el('div', 'pseg-topic-row');
-    var input = el('input', 'pseg-topic-in');
-    input.type = 'text';
-    input.placeholder = next ? 'Describe the scenario...' : 'Something for them to get into...';
+    /* [topic-exchange] Two lines. "1. This is my studio 2. Thats what you
+       think" is an exchange: line 1 opens the round word for word and
+       line 2 is the reply to it, word for word (the station splits it -
+       POST /api/dj/topics). Enter starts the next line; Ctrl/Cmd+Enter,
+       or the button, sends it. */
+    var input = el('textarea', 'pseg-topic-in');
+    input.rows = 2;
+    input.placeholder = (next ? 'Describe the scenario...' : 'Something for them to get into...')
+      + '\n1. the opening line  2. the reply - each said word for word';
     input.setAttribute('aria-label', next
       ? 'The scenario for the next banter round' : 'A new topic for the banter');
     var plus = el('button', 'pseg-plus' + (next ? ' pseg-next' : ''),
@@ -280,81 +285,6 @@
     plus.setAttribute('title', next
       ? 'Save this scenario and queue it for the next banter round'
       : 'Add this to the banter bank');
-
-    var mic = null;
-    var dictating = false;
-    var dictationTap = null;
-    var dictationSafety = 0;
-    var dictationWatch = 0;
-
-    function dictationRelease(cancel) {
-      if (!dictating) return;
-      dictating = false;
-      if (dictationTap) root.removeEventListener('pointerdown', dictationTap, true);
-      dictationTap = null;
-      root.clearTimeout(dictationSafety);
-      root.clearInterval(dictationWatch);
-      dictationSafety = 0;
-      dictationWatch = 0;
-      if (root.PineDuck) root.PineDuck.release('pseg-topic-dictation');
-      if (mic) {
-        mic.classList.remove('recording');
-        mic.classList.remove('processing');
-        mic.disabled = false;
-      }
-      if (cancel) {
-        try {
-          if (root.PineTalkDot && typeof root.PineTalkDot.cancelCapture === 'function') {
-            root.PineTalkDot.cancelCapture();
-          } else if (root.PineTalkDot && root.PineTalkDot.state() === 'listening') {
-            root.PineTalkDot.cancel();
-          }
-        } catch (err) { /* already stopped */ }
-      }
-    }
-
-    function dictate() {
-      var dot = root.PineTalkDot;
-      if (!dot || typeof dot.captureNext !== 'function') {
-        note(wrap, 'no microphone is available on this surface');
-        return;
-      }
-      dictationRelease(true);
-      dictating = true;
-      if (mic) { mic.classList.add('recording'); mic.disabled = true; }
-      if (root.PineDuck) root.PineDuck.hold('pseg-topic-dictation', 0, wrap);
-      note(wrap, 'listening - tap anywhere to finish');
-      dictationTap = function (ev) {
-        if (!dictating) return;
-        ev.preventDefault();
-        ev.stopPropagation();
-        if (mic) { mic.classList.remove('recording'); mic.classList.add('processing'); }
-        note(wrap, 'turning that into editable text...');
-        if (root.PineDuck) root.PineDuck.release('pseg-topic-dictation');
-        root.removeEventListener('pointerdown', dictationTap, true);
-        dictationTap = null;
-        try { dot.finish(); } catch (err) { dictationRelease(false); }
-      };
-      root.addEventListener('pointerdown', dictationTap, true);
-      dictationSafety = root.setTimeout(function () { dictationRelease(true); }, 45000);
-      try {
-        var pending = dot.captureNext(function (words) {
-          input.value = String(words || '').trim();
-          dictationRelease(false);
-          input.focus();
-          note(wrap, input.value ? 'ready to edit or queue' : 'no words were heard');
-        });
-        if (pending && typeof pending['catch'] === 'function') {
-          pending['catch'](function () {
-            dictationRelease(false);
-            note(wrap, 'the microphone could not start');
-          });
-        }
-      } catch (err) {
-        dictationRelease(false);
-        note(wrap, 'the microphone could not start');
-      }
-    }
 
     function add() {
       var text = String(input.value || '').trim();
@@ -374,22 +304,9 @@
     }
     plus.addEventListener('click', add);
     input.addEventListener('keydown', function (ev) {
-      if (ev && ev.key === 'Enter') { ev.preventDefault(); add(); }
+      if (ev && ev.key === 'Enter' && (ev.ctrlKey || ev.metaKey)) { ev.preventDefault(); add(); }
     });
     row.appendChild(input);
-    if (microphone) {
-      mic = el('button', 'pseg-mic');
-      mic.type = 'button';
-      mic.title = 'Dictate a scenario';
-      mic.setAttribute('aria-label', 'Dictate a scenario');
-      try {
-        mic.innerHTML = typeof root.pineIcon === 'function'
-          ? root.pineIcon('c:microphone', 'Dictate a scenario') : '';
-      } catch (err) { mic.innerHTML = ''; }
-      if (!mic.innerHTML) mic.textContent = 'mic';
-      mic.addEventListener('click', dictate);
-      row.appendChild(mic);
-    }
     row.appendChild(plus);
     wrap.appendChild(row);
 
@@ -429,12 +346,91 @@
       prior.replaceChildren();
       rows.forEach(function (saved) {
         var item = el('div', 'pseg-topic-item');
-        var words = el('button', 'pseg-topic-words', saved.text || 'Untitled scenario');
+        /* [topic-exchange] an exchange reads, and refills, as its two lines */
+        var said = saved.reply
+          ? '1. ' + String(saved.text || '') + '\n2. ' + String(saved.reply)
+          : String(saved.text || '');
+        var words = el('button', 'pseg-topic-words', said || 'Untitled scenario');
         words.type = 'button';
         words.title = 'Put this scenario in the editor';
+        var heldAt = 0;
         words.addEventListener('click', function () {
-          input.value = String(saved.text || '');
+          if (Date.now() - heldAt < 700) return;   /* [topic-edit] the hold answered */
+          input.value = said;
           input.focus();
+        });
+        /* [topic-edit] DOUBLE-CLICK OR HOLD IT TO EDIT IT WHERE IT STANDS.
+           The entry becomes its own two-line box: Ctrl/Cmd+Enter or Save
+           keeps it (POST /api/dj/topics/{id}/edit, split into topic and
+           reply as a new one is), Escape or Cancel puts it back. */
+        function editInline() {
+          if (item.classList.contains('editing')) return;
+          item.classList.add('editing');
+          var box = el('textarea', 'pseg-topic-in pseg-topic-edit');
+          box.rows = 2;
+          box.value = said;
+          box.setAttribute('aria-label', 'Edit this topic');
+          var keepIt = el('button', 'pseg-topic-save', 'Save');
+          keepIt.type = 'button';
+          var drop = el('button', 'pseg-topic-cancel', 'Cancel');
+          drop.type = 'button';
+          var bar = el('div', 'pseg-topic-editbar');
+          bar.appendChild(keepIt);
+          bar.appendChild(drop);
+          var form = el('div', 'pseg-topic-editor');
+          form.appendChild(box);
+          form.appendChild(bar);
+          item.replaceChild(form, words);
+          function done() {
+            item.classList.remove('editing');
+            if (form.parentNode === item) item.replaceChild(words, form);
+          }
+          function keep() {
+            var text = String(box.value || '').trim();
+            if (!text) { note(wrap, 'an empty topic cannot be saved'); return; }
+            if (text === said) { done(); return; }
+            keepIt.disabled = true;
+            send('POST', '/api/dj/topics/' + encodeURIComponent(saved.id) + '/edit', {text: text})
+              .then(function (got) {
+                keepIt.disabled = false;
+                if (!got) { note(wrap, 'the station refused the edit'); return; }
+                note(wrap, got.requeued ? 'saved - the queued copy says it now too' : 'saved');
+                loadHistory();
+              })['catch'](function (err) {
+                keepIt.disabled = false;
+                note(wrap, 'not saved - ' + String((err && err.message) || 'the station did not answer'));
+              });
+          }
+          keepIt.addEventListener('click', function (ev) { ev.stopPropagation(); keep(); });
+          drop.addEventListener('click', function (ev) { ev.stopPropagation(); done(); });
+          box.addEventListener('keydown', function (ev) {
+            if (ev.key === 'Escape') { ev.preventDefault(); ev.stopPropagation(); done(); }
+            else if (ev.key === 'Enter' && (ev.ctrlKey || ev.metaKey)) { ev.preventDefault(); keep(); }
+          });
+          box.focus();
+          try { box.setSelectionRange(box.value.length, box.value.length); } catch (err) { /* older views */ }
+        }
+        words.addEventListener('dblclick', function (ev) { ev.preventDefault(); editInline(); });
+        var hold = 0, holdX = 0, holdY = 0;
+        var unhold = function () { root.clearTimeout(hold); hold = 0; };
+        words.addEventListener('pointerdown', function (ev) {
+          if (ev.button) return;
+          unhold();
+          holdX = ev.clientX; holdY = ev.clientY;
+          hold = root.setTimeout(function () { hold = 0; heldAt = Date.now(); editInline(); }, 520);
+        });
+        words.addEventListener('pointermove', function (ev) {
+          if (hold && Math.abs(ev.clientX - holdX) + Math.abs(ev.clientY - holdY) > 12) unhold();
+        });
+        ['pointerup', 'pointercancel', 'pointerleave'].forEach(function (name) {
+          words.addEventListener(name, unhold);
+        });
+        /* the WebView's own long-press (and the desk's right-click) */
+        words.addEventListener('contextmenu', function (ev) {
+          ev.preventDefault();
+          unhold();
+          heldAt = Date.now();
+          editInline();
         });
         var meta = el('span', 'pseg-topic-meta', String(Number(saved.used) || 0) + ' uses');
         var queue = iconButton('pseg-topic-action', 'c:add', 'Queue this scenario next');
@@ -471,17 +467,12 @@
       })['catch'](function () { sum.textContent = 'could not be counted'; });
     }
     if (history) loadHistory(); else count();
-    wrap.__stopDictation = dictationRelease;
     return wrap;
   }
 
   var topicSheet = null;
 
   function topicShut() {
-    try {
-      var block = topicSheet && topicSheet.querySelector('.pseg-topics');
-      if (block && block.__stopDictation) block.__stopDictation(true);
-    } catch (err) { /* the sheet is already gone */ }
     if (topicSheet && topicSheet.parentNode) topicSheet.parentNode.removeChild(topicSheet);
     topicSheet = null;
     try { if (root.PineSfxTv) root.PineSfxTv.viewChanged(); } catch (err) { /* no wall */ }
@@ -502,7 +493,7 @@
     x.addEventListener('click', topicShut);
     top.appendChild(x);
     node.appendChild(top);
-    node.appendChild(topicsBlock({next: true, history: true, microphone: true}));
+    node.appendChild(topicsBlock({next: true, history: true}));
     root.document.body.appendChild(node);
     topicSheet = node;
     try { if (root.PineSfxTv) root.PineSfxTv.viewChanged(); } catch (err) { /* no wall */ }

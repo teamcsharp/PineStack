@@ -6,8 +6,16 @@ import java.io.OutputStream
 import java.net.InetAddress
 import java.net.ServerSocket
 import java.net.Socket
-import java.util.concurrent.Executors
+import org.json.JSONObject
+import java.net.InetSocketAddress
+import java.util.concurrent.RejectedExecutionException
+import java.util.concurrent.RejectedExecutionHandler
+import java.util.concurrent.SynchronousQueue
+import java.util.concurrent.ThreadFactory
+import java.util.concurrent.ThreadPoolExecutor
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * THE PANEL'S OWN FRONT DOOR, ON LOOPBACK.
@@ -72,12 +80,56 @@ object LoopDoor {
     /* #1320: the longest a finished conversation may hold a pool thread. */
     private const val JOIN_MS = 2000L
 
+    /* How long a connect to the station may take before the browser is
+     * told. Socket(host, port) connects with NO timeout, which means the
+     * kernel's: about two minutes of SYN retries on a road that has gone,
+     * during which every request the panel made simply hung - no error,
+     * no retry, indistinguishable from the WebView going deaf. */
+    private const val CONNECT_MS = 3000
+
+    /* THE POOL IS BOUNDED. A cached pool grows without limit, and a relay
+     * whose far end has stopped answering grows it fastest: every request
+     * the panel retries is two more threads waiting on a socket. Two
+     * threads per conversation, so this is twenty-four conversations at
+     * once - more than a browser opens to one origin - and a conversation
+     * that cannot get a thread is CLOSED, never queued: a queued accept is
+     * a request that hangs, which is the one thing this door must never
+     * do. Idle threads leave after thirty seconds. */
+    private const val POOL_MOST = 48
+    private const val POOL_IDLE_S = 30L
+
     private var server: ServerSocket? = null
     private var upstream: Pair<String, Int>? = null
-    private val pumps = Executors.newCachedThreadPool { runnable ->
-        Thread(runnable, "pine-loop-door").apply { isDaemon = true }
-    }
+    private val refused = AtomicInteger(0)
+    private val pumps = ThreadPoolExecutor(
+        0, POOL_MOST, POOL_IDLE_S, TimeUnit.SECONDS, SynchronousQueue<Runnable>(),
+        ThreadFactory { runnable -> Thread(runnable, "pine-loop-door").apply { isDaemon = true } },
+        RejectedExecutionHandler { runnable, _ ->
+            /* Never block the accept loop. A refused conversation has its
+             * browser socket shut here, so the page sees a reset it knows
+             * how to retry; a refused response pump is thrown back into
+             * carry(), whose catch closes both ends of that conversation. */
+            refused.incrementAndGet()
+            Log.w(TAG, "door full ($POOL_MOST threads): a conversation was refused")
+            if (runnable is Carry) quietly(runnable.from)
+            else throw RejectedExecutionException("the door is full")
+        },
+    )
     private val live = AtomicInteger(0)
+    /* The ledger behind stats(): what went through, and when it last did. */
+    private val bytesUp = AtomicLong(0L)
+    private val bytesDown = AtomicLong(0L)
+    private val connects = AtomicLong(0L)
+    private val connectFails = AtomicLong(0L)
+    @Volatile private var lastActivity = 0L
+    @Volatile private var lastConnectFail = ""
+    @Volatile private var lastFailSaid = 0L
+
+    /** One accepted browser socket on its way to a pool thread; carries
+     *  the socket so a refusal can close it. */
+    private class Carry(val from: Socket) : Runnable {
+        override fun run() = carry(from)
+    }
 
     /** Where the panel should be loaded from, once open() has answered. */
     @Volatile
@@ -118,7 +170,9 @@ object LoopDoor {
         origin = "http://127.0.0.1:" + sock.localPort
         Log.i(TAG, "door open at $origin -> ${aim.first}:${aim.second}")
 
-        pumps.execute {
+        /* THE ACCEPT LOOP HAS A THREAD OF ITS OWN, not a pool thread: a
+         * full pool must never be able to stop the door answering at all. */
+        val accepting = Runnable {
             /* #1320: ONE BAD ACCEPT MUST NOT SHUT THE DOOR FOR EVER.
              *
              * This loop used to return out of the pump on any exception.
@@ -139,7 +193,7 @@ object LoopDoor {
                     bad = 0
                     got
                 } catch (err: Exception) {
-                    if (sock.isClosed) return@execute
+                    if (sock.isClosed) return@Runnable
                     bad += 1
                     Log.w(TAG, "accept ($bad in a row): " + err.message)
                     if (bad >= ACCEPT_GIVE_UP) {
@@ -147,14 +201,15 @@ object LoopDoor {
                             "in a row. A shut door can be reopened; one " +
                             "that only looks open cannot.")
                         close()
-                        return@execute
+                        return@Runnable
                     }
                     try { Thread.sleep(ACCEPT_REST_MS) } catch (e: Exception) { }
                     continue
                 }
-                pumps.execute { carry(from) }
+                pumps.execute(Carry(from))
             }
         }
+        Thread(accepting, "pine-loop-door-accept").apply { isDaemon = true }.start()
         return origin
     }
 
@@ -182,6 +237,26 @@ object LoopDoor {
 
     /** How many conversations are in flight, for the readiness report. */
     fun busy(): Int = live.get()
+
+    /** Everything the door can say about itself, for a report. */
+    fun stats(): JSONObject {
+        val aim = upstream
+        val idle = lastActivity
+        return JSONObject()
+            .put("open", isOpen())
+            .put("origin", origin)
+            .put("aim", if (aim == null) "" else aim.first + ":" + aim.second)
+            .put("busy", live.get())
+            .put("threads", pumps.poolSize)
+            .put("threads_most", pumps.largestPoolSize)
+            .put("refused", refused.get())
+            .put("connects", connects.get())
+            .put("connect_fails", connectFails.get())
+            .put("last_connect_fail", lastConnectFail)
+            .put("bytes_up", bytesUp.get())
+            .put("bytes_down", bytesDown.get())
+            .put("idle_ms", if (idle > 0L) android.os.SystemClock.elapsedRealtime() - idle else -1L)
+    }
 
     fun isOpen(): Boolean = server?.isClosed == false
 
@@ -214,12 +289,35 @@ object LoopDoor {
         var to: Socket? = null
         try {
             from.tcpNoDelay = true
-            val out = Socket(aim.first, aim.second)
-            out.tcpNoDelay = true
+            from.keepAlive = true
+            /* A BOUNDED CONNECT, and the browser hears about a failure. See
+             * CONNECT_MS. On failure the finally below shuts the browser's
+             * socket at once, so the page gets its error in three seconds
+             * rather than at the end of the kernel's SYN retries. */
+            val out = Socket()
+            try {
+                out.tcpNoDelay = true
+                out.keepAlive = true
+                out.connect(InetSocketAddress(aim.first, aim.second), CONNECT_MS)
+            } catch (err: Exception) {
+                quietly(out)
+                connectFails.incrementAndGet()
+                lastConnectFail = "${aim.first}:${aim.second}: ${err.message}"
+                val now = android.os.SystemClock.elapsedRealtime()
+                /* Said at most every two seconds: a panel retrying every
+                 * asset it has is a hundred of these in a row. */
+                if (now - lastFailSaid > 2000L) {
+                    lastFailSaid = now
+                    Log.w(TAG, "cannot reach $lastConnectFail")
+                }
+                return
+            }
+            connects.incrementAndGet()
+            lastActivity = android.os.SystemClock.elapsedRealtime()
             to = out
 
             val up = pumps.submit {
-                pump(from.getInputStream(), out.getOutputStream())
+                pump(from.getInputStream(), out.getOutputStream(), bytesUp)
                 /* #1321: THE BROWSER STOPPED TALKING, SO THIS IS OVER TOO.
                  *
                  * Without these two closes the response pump below stays
@@ -236,7 +334,7 @@ object LoopDoor {
                 quietly(from)
                 quietly(out)
             }
-            pump(out.getInputStream(), from.getOutputStream())
+            pump(out.getInputStream(), from.getOutputStream(), bytesDown)
             /* #1320: THE RESPONSE IS DONE, SO THE CONVERSATION IS DONE.
              *
              * This used to be a bare up.get(). The request-side pump is
@@ -265,7 +363,7 @@ object LoopDoor {
         }
     }
 
-    private fun pump(input: InputStream, output: OutputStream) {
+    private fun pump(input: InputStream, output: OutputStream, tally: AtomicLong) {
         val bite = ByteArray(32 * 1024)
         try {
             while (true) {
@@ -273,6 +371,8 @@ object LoopDoor {
                 if (got < 0) break
                 output.write(bite, 0, got)
                 output.flush()
+                tally.addAndGet(got.toLong())
+                lastActivity = android.os.SystemClock.elapsedRealtime()
             }
         } catch (err: Exception) {
             /* Closed underneath us; the finally in carry() tidies both ends. */

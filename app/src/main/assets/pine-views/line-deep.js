@@ -83,6 +83,18 @@
   var box = null;
   var scene = null;
   var openFor = null;
+  var styleUrl = typeof document !== 'undefined' && document.currentScript
+    && document.currentScript.src
+    ? new URL('line-deep.css', document.currentScript.src).href : '';
+
+  function ensureStyles() {
+    if (!styleUrl || document.querySelector('link[data-pine-line-deep]')) return;
+    var link = document.createElement('link');
+    link.rel = 'stylesheet';
+    link.href = styleUrl;
+    link.setAttribute('data-pine-line-deep', '');
+    document.head.appendChild(link);
+  }
   /* #1149: which road on the strip is open. One at a time - "tapping the
    * open stage again closes it; tapping another switches". Cleared with the
    * window, because it names a road on a line that is no longer on screen. */
@@ -549,12 +561,82 @@
     return list;
   }
 
+  function putCrystal(list, name, value, record, kind) {
+    list.push({name: name, value: String(value || 'detail retained'),
+      detail: {record: record, kind: kind}});
+  }
+
+  function crystalEvidence(record, kind) {
+    var wrap = make('div', 'ld-crystal-evidence');
+    record = record && typeof record === 'object' ? record : {};
+    var grade = String(record.passage_grade || '');
+    var gradeWords = {
+      measured: 'Measured: exact swath retained from the writing prompt.',
+      written: 'Written: closest historical passage; exact prompt swath was not retained.',
+      current: 'Current: document opening as it stands now; this is not the historical prompt.',
+      absent: 'Absent: the passage was not retained.'
+    };
+    if (kind === 'document' || grade) {
+      wrap.appendChild(make('p', 'ld-passage-grade', gradeWords[grade]
+        || 'Passage grade not retained; exact historical match is unknown.'));
+    }
+    if (record.passage_how) {
+      wrap.appendChild(make('p', 'ld-passage-how', String(record.passage_how)));
+    }
+    var rest = {};
+    Object.keys(record).forEach(function (key) {
+      if (key !== 'text' && (key !== 'snippet' || !!record.text)
+          && key !== 'passage_grade'
+          && key !== 'passage_how') rest[key] = record[key];
+    });
+    if (Object.keys(rest).length) {
+      wrap.appendChild(make('pre', 'ld-pre ld-crystal-meta', JSON.stringify(rest, null, 2)));
+    }
+    if (kind === 'system') {
+      if (!Object.keys(rest).some(function (key) { return String(rest[key] || '').trim(); })) {
+        wrap.appendChild(make('p', 'ld-passage-missing',
+          'No further system detail was retained for this line.'));
+      }
+      return wrap;
+    }
+    var passage = grade === 'absent' ? ''
+      : String(record.text || (kind === 'document' ? record.snippet || '' : ''));
+    if (!passage.trim()) {
+      wrap.appendChild(make('p', 'ld-passage-missing', kind === 'vector'
+        ? 'Passage not retained for this search.'
+        : 'Passage not retained for this source.'));
+      return wrap;
+    }
+    if (!grade && kind === 'document' && !record.text) {
+      wrap.appendChild(make('p', 'ld-passage-how',
+        'Legacy excerpt; whether these exact words reached the writer is unknown.'));
+    }
+    wrap.appendChild(editable(make('pre', 'ld-pre', passage), record.file
+      ? {scope: 'passage', key: String(record.file), applies: ['future'],
+         label: 'a source passage',
+         how: 'Save asks the station to update matching words in '
+           + String(record.file) + ' for future rounds.'}
+      : {scope: '', why: 'The record names no source file for this passage.'}));
+    return wrap;
+  }
+
   /* The two shapes a fact can take, rendered: a name/value row on the
    * sheet's own list, or - for a prompt, a script, a brief - a fold over the
    * whole of it verbatim, which is the file's existing idiom. */
   function factsInto(node, facts) {
     var list = null;
     facts.forEach(function (f) {
+      if (f.detail) {
+        var detail = make('details', 'ld-fold ld-crystal-fold');
+        var summary = make('summary', '');
+        summary.appendChild(make('b', '', f.name));
+        summary.appendChild(make('span', '', f.value || 'detail retained'));
+        detail.appendChild(summary);
+        detail.appendChild(crystalEvidence(f.detail.record, f.detail.kind));
+        node.appendChild(detail);
+        list = null;
+        return;
+      }
       if (f.text) {
         var d = make('details', 'ld-fold');
         d.appendChild(make('summary', '', f.name));
@@ -603,13 +685,17 @@
      * must not throw away words that are half typed. */
     if (editsDirty()) { closeAsked(); return; }
     close();
+    ensureStyles();
     openFor = line;
     box = make('div', 'ld-box');
     box.innerHTML =
       '<div class="ld-head">'
       + '<b>How this line came to be</b>'
+      + '<div class="ld-head-actions">'
+      + '<button class="ld-forget" type="button" aria-label="Forget this line" title="Forget this line"></button>'
       + '<button class="ld-close" type="button" aria-label="close" title="close">×</button>'
-      + '</div>'
+      + '</div></div>'
+      + '<div class="ld-forget-feedback" role="status" aria-live="polite" hidden></div>'
       /* #1113 the scene row. Until the station answers, the select says
        * so; sceneRow() replaces the whole row once gather() is back. */
       + '<div class="ld-scene"><div class="ld-scene-bar">'
@@ -621,6 +707,21 @@
       + '<div class="ld-flowwhy"></div></div>'
       + '<div class="ld-body"></div>';
     document.body.appendChild(box);
+    var opened = box;
+    var forget = box.querySelector('.ld-forget');
+    var canForget = !!String(line.id || '').trim() && !!String(line.said || '').trim();
+    forget.disabled = !canForget;
+    if (!canForget) forget.title = 'A line ID and spoken text are needed to forget it';
+    if (typeof root.pineIcon === 'function') {
+      forget.innerHTML = root.pineIcon('c:trash-can', 'Forget this line');
+    } else {
+      forget.setAttribute('data-pine-icon', 'c:trash-can');
+      if (typeof root.pineIconUpgrade === 'function') root.pineIconUpgrade(forget);
+    }
+    forget.addEventListener('click', function (e) {
+      e.stopPropagation();
+      if (!forget.disabled) askForget(opened, line);
+    });
     if (root.PineDuck) root.PineDuck.hold('line-deep', root.PineDuck.REPORT, box);   /* 2026-09-14: a diagnostic ducks the broadcast */
     /* [#1231] The WHOLE line, not 300 characters of it: this box is now
      * an editor, and an editor showing a truncation would save one. The
@@ -645,14 +746,73 @@
     var body = box.querySelector('.ld-body');
     body.appendChild(make('p', 'ld-wait', 'asking the station…'));
     gather(line).then(function (all) {
-      if (!box) return;
+      if (box !== opened) return;
       paint(line, all);
     }, function (err) {
-      if (!box) return;
+      if (box !== opened) return;
       sceneRow(line, null);
       body.replaceChildren();
       body.appendChild(make('p', 'ld-wait',
         'the station could not say: ' + ((err && err.message) || err)));
+    });
+  }
+
+  function forgetFeedback(opened, words, bad) {
+    if (box !== opened) return;
+    var feedback = opened.querySelector('.ld-forget-feedback');
+    feedback.hidden = false;
+    feedback.classList.toggle('bad', !!bad);
+    feedback.textContent = words;
+  }
+
+  function askForget(opened, line) {
+    if (box !== opened || opened.querySelector('.ld-forget-confirm')) return;
+    if (editsBusy()) {
+      forgetFeedback(opened, 'Save or cancel the open edit before forgetting this line.', true);
+      return;
+    }
+    var ask = make('div', 'ld-forget-confirm');
+    ask.appendChild(make('span', '', 'Forget this line? This cannot be undone.'));
+    var yes = make('button', 'ld-forget-yes', 'Forget line');
+    yes.type = 'button';
+    var no = make('button', 'ld-forget-no', 'Keep line');
+    no.type = 'button';
+    ask.appendChild(yes);
+    ask.appendChild(no);
+    opened.querySelector('.ld-head').insertAdjacentElement('afterend', ask);
+    no.addEventListener('click', function (e) {
+      e.stopPropagation();
+      ask.remove();
+    });
+    yes.addEventListener('click', function (e) {
+      e.stopPropagation();
+      yes.disabled = true;
+      no.disabled = true;
+      forgetFeedback(opened, 'Forgetting this line...', false);
+      Promise.resolve().then(function () {
+        return api().post('/api/said/forget', {
+          line_id: String(line.id), text: String(line.said)
+        });
+      }).then(function (got) {
+        if (!got || got.ok !== true) {
+          throw new Error((got && (got.detail || got.say || got.error))
+            || 'The station did not confirm deletion.');
+        }
+        ask.remove();
+        forgetFeedback(opened, String(got.say || 'Line forgotten.')
+          + ' Refreshing...', false);
+        setTimeout(function () {
+          if (box === opened) close();
+          if (root.location && typeof root.location.reload === 'function') {
+            root.location.reload();
+          }
+        }, 1200);
+      }).catch(function (err) {
+        yes.disabled = false;
+        no.disabled = false;
+        forgetFeedback(opened, 'Could not forget this line: '
+          + ((err && err.message) || String(err)), true);
+      });
     });
   }
 
@@ -677,10 +837,14 @@
        * the sixth ask, for the stepper at the top of the body. It 404s
        * for a line in neither the booth nor the air log, and that is
        * allowed to fail like the others. */
-      soft(api().get('/api/said/why/' + encodeURIComponent(line.id || '')))
+      soft(api().get('/api/said/why/' + encodeURIComponent(line.id || ''))),
+      /* [s3-link] the seventh ask: System 3's own record of the line - the
+       * round, the turn, and every roll the Rolodex made for it. 404s for a
+       * line no node made, which is an answer ("not directed") not a fault. */
+      soft(api().get('/api/system3/line?line_id=' + encodeURIComponent(line.id || '')))
     ]).then(function (got) {
       return {prov: got[0], road: got[1], worn: got[2], air: got[3], scene: got[4],
-        why: got[5]};
+        why: got[5], s3: got[6]};
     });
   }
 
@@ -750,6 +914,7 @@
     }
 
     section(body, 'how this line came to be broadcast, step by step', flowNode(line, all));
+    section(body, 'System 3 - how the dice built this line', s3Story(line, all));   /* [s3-story] */
     section(body, 'admin options - what reached this line', adminNode(all));   /* 2026-09-14 */
     section(body, 'how often it has gone out', timesNode(line, all));
     section(body, 'why it keeps coming up', whyNode(line, all));
@@ -757,6 +922,44 @@
     section(body, 'what it was shown', shownNode(all));
     section(body, 'the road, step by step', roadNode(all));
     section(body, 'if you never want to hear it again', retireNode(line, all));
+  }
+
+  /* [s3-story] SYSTEM 3'S PART OF THE STORY, drawn by System 3 itself: the
+   * station serves frontend/system3.js, whose mountLineStory rolls the
+   * line's dice again and shows the running-order row it wrote and where
+   * that row sits in the prompt (the provenance fetched above). */
+  var s3Load = null;
+  function s3Url(name) {
+    try {
+      if (/^https?:$/.test(location.protocol) && location.origin && location.origin !== 'null') {
+        return location.origin + name;
+      }
+    } catch (err) { /* no location worth having */ }
+    try {
+      if (root.pineThreeUrl) return String(root.pineThreeUrl()).replace(/\/vendor\/three\.min\.js.*$/, '') + name;
+    } catch (err) { /* older shell */ }
+    return 'http://127.0.0.1:8096' + name;
+  }
+  function s3Story(line, all) {
+    var node = make('div', 'ld-s3', 'Reading System 3...');
+    if (!document.querySelector('link[data-pine-s3]')) {
+      var link = document.createElement('link');
+      link.rel = 'stylesheet';
+      link.href = s3Url('/system3/system3.css?v=3');
+      link.setAttribute('data-pine-s3', '');
+      document.head.appendChild(link);
+    }
+    var prov = (all && all.prov) || {};
+    var prompt = String(((prov.written || {}).prompt) || prov.prompt || '');
+    (s3Load = s3Load || import(s3Url('/system3/system3.js?v=3'))).then(function (mod) {
+      if (!node.isConnected) return null;
+      return mod.mountLineStory(node, {request: function (path) { return api().get(path); },
+        lineId: String((line && line.id) || ''), prompt: prompt});
+    })['catch'](function (err) {
+      s3Load = null;
+      node.textContent = 'System 3 could not be read here: ' + String((err && err.message) || err);
+    });
+    return node;
   }
 
   /* ---------------------------------------------------------- the stepper */
@@ -1346,7 +1549,8 @@
       props: byName(why && why.properties),
       scene: (all.scene || {}).scenario || null,
       place: ledgerPlace(line, all),
-      stages: (all.road || {}).stages || []
+      stages: (all.road || {}).stages || [],
+      s3: (all.s3 && typeof all.s3 === 'object' && all.s3.line) ? all.s3 : null   /* [s3-link] */
     };
   }
 
@@ -1423,6 +1627,75 @@
       f,
       'the schedule desk left no instruction on this line\u2019s record');
 
+    /* 1b. THE ROULETTE - System 3's dice, between the brief and the writer.
+     * [s3-link] "I don't get how this system generated this line based on
+     * how the roulette rolled. This appears to be inaccurate somewhere."
+     * Lit ONLY when a node made the line: the turn found by its words, or
+     * the SFX Guy's node on the turn he followed. A line in a System 3
+     * round that no node made (a passage dealt in front, a caller's hello)
+     * says so; a line from before System 3 says so. Every number here was
+     * recorded by the engine at plan time; nothing is re-rolled. */
+    f = [];
+    var s3 = d.s3 || {};
+    var s3turn = s3.turn || null;
+    var s3conv = s3.conversation || {};
+    var s3sg = s3.sfxguy || null;
+    var s3rolls = [];
+    var s3why = '';
+    if (s3turn) {
+      put(f, 'the round', String(s3conv.road_kind || s3conv.road || 'a')
+        + ' round ' + String(s3conv.conversation_id || '')
+        + (s3conv.mode ? ' - ' + String(s3conv.mode) : ''));
+      put(f, 'the turn', 'turn ' + (Number(s3turn.index) + 1)
+        + (s3conv.turns ? ' of ' + String(s3conv.turns) : '')
+        + ' - ' + String(s3turn.name || s3turn.speaker || '')
+        + (s3turn.step_label ? ' - ' + String(s3turn.step_label) : '')
+        + (s3turn.phase ? ' - ' + String(s3turn.phase) : ''));
+      if (s3sg) {
+        put(f, 'the SFX Guy', 'his node on this turn'
+          + (s3sg.node && s3sg.node.selected ? ': ' + String(s3sg.node.selected.label || s3sg.node.selected.id || '') : '')
+          + ((s3sg.line || {}).kind ? ' - ' + String(s3sg.line.kind) : ''));
+        ((s3sg.line || {}).draws || []).forEach(function (dr) {
+          put(f, 'his draw at air', 'the ' + String(dr.pool || '') + ' pool: d' + String(dr.dice || '')
+            + ' landed on ' + String(dr.index) + ' of ' + String(dr.of));
+        });
+      }
+      (s3.decisions || []).forEach(function (ev) {
+        var sel = ev.selected || {};
+        var rng = ev.rng || {};
+        var stages = ev.stages || [];
+        var item = null;
+        stages.forEach(function (st) { if (!item && (st.stage === 'item' || st.stage === 'mode')) item = st; });
+        var dice = (item && item.draw && item.draw.dice != null) ? item.draw.dice : rng.dice;
+        var text = String(sel.label || sel.id || sel.intent || (ev.meta && ev.meta.why) || '');
+        if (item && item.selected_index != null && item.of) text += ' (' + item.selected_index + ' of ' + item.of + ')';
+        text += (dice != null) ? ' - d100 rolled ' + dice : ' - not a draw: a rule decided it';
+        if (sel.table) text += ' - table ' + String(sel.table);
+        put(f, String(ev.family || 'roll'), text);
+        s3rolls.push(ev);
+      });
+      put(f, 'rolls on this turn', s3rolls.length ? String(s3rolls.length) : '');
+      put(f, 'planned', clock(Number(s3.planned_at || 0)) || '');
+      put(f, 'the engine', s3.engine);
+      put(f, 'how the row was linked', s3.healed);
+      s3why = '';
+    } else if (s3.line && s3conv.conversation_id) {
+      s3why = 'part of a System 3 round (' + String(s3conv.road_kind || 'a') + ' round '
+        + String(s3conv.conversation_id) + ') but not one of its planned turns - a line the '
+        + 'station put into the round at air, which no node made. Its dice are on the turns around it.';
+    } else if (all.s3 === null || !s3.line) {
+      s3why = 'not directed by System 3: no node made this line - a gold bar replayed as filler, a '
+        + 'punctuation row on a single line, or a round written before System 3 was switched on. '
+        + 'Nothing was rolled for it.';
+    }
+    stage('roulette', 'the roulette', !!s3turn,
+      'The roulette is System 3: the Rolodex of tables the conversation director rolls through '
+      + 'for every turn - what the round is about, the emotion it is spoken in, the response, '
+      + 'the frame, the speaker box, the SFX Guy - each a recorded d100 over weighted candidates. '
+      + 'The writer is handed the result as the running order.',
+      f,
+      s3why || 'System 3 rolled nothing for this line');
+
     /* 2. THE WRITING ROOM - the model that turned the brief into words. */
     f = [];
     put(f, 'the model', d.written.model || (d.why && d.why.model)
@@ -1467,23 +1740,29 @@
       put(f, 'shards staged', shards.length + ' passage'
         + (shards.length === 1 ? '' : 's') + ' put in front of the writer');
     }
-    shards.slice(0, 3).forEach(function (s) {
-      put(f, String(s.crystal || s.name || 'a passage'),
-        String(s.file || '') + (s.in_prompt ? ' - in the prompt' : ' - staged, not used'));
+    shards.forEach(function (s) {
+      putCrystal(f, String(s.crystal || s.name || s.file || 'a passage'),
+        String(s.file || '') + (s.in_prompt ? ' - in the prompt' : ' - staged, not used'),
+        s, 'shard');
     });
-    docs.slice(0, 3).forEach(function (doc) {
-      put(f, String(doc.file || doc.title || 'a document'),
-        String(doc.how || '') + (doc.quoted ? ' - quoted' : ' - read, not quoted'));
+    docs.forEach(function (doc) {
+      putCrystal(f, String(doc.file || doc.title || 'a document'),
+        String(doc.how || '') + (doc.quoted ? ' - quoted' : ' - read, not quoted'),
+        doc, 'document');
     });
-    vecs.slice(0, 3).forEach(function (v) {
-      put(f, 'it searched for', '\u201c' + String(v.query || v.q || '').slice(0, 90)
+    vecs.forEach(function (v) {
+      putCrystal(f, 'it searched for', '\u201c' + String(v.query || v.q || '').slice(0, 90)
         + '\u201d in ' + String(v.file || '')
-        + (Number(v.score) ? ' at ' + Number(v.score).toFixed(3) : ''));
+        + (Number(v.score) ? ' at ' + Number(v.score).toFixed(3) : ''),
+        v, 'vector');
     });
     put(f, 'the crystal desk is set to', propOf(d, 'crystals'));
-    if (d.sys['the crystal']) put(f, 'the station says', d.sys['the crystal'].note);
-    if (d.sys['the vector index']) put(f, 'the vector index', d.sys['the vector index'].note);
-    if (d.sys['the speakbox']) put(f, 'the speakbox', d.sys['the speakbox'].note);
+    if (d.sys['the crystal']) putCrystal(f, 'the station says',
+      d.sys['the crystal'].note, d.sys['the crystal'], 'system');
+    if (d.sys['the vector index']) putCrystal(f, 'the vector index',
+      d.sys['the vector index'].note, d.sys['the vector index'], 'system');
+    if (d.sys['the speakbox']) putCrystal(f, 'the speakbox',
+      d.sys['the speakbox'].note, d.sys['the speakbox'], 'system');
     stage('crystal', 'the crystal', !!(shards.length || docs.length || vecs.length),
       'The crystal is the station\u2019s shelf of source passages. A shard '
       + 'staged into the prompt is a passage the writer was made to look at; '
@@ -1960,52 +2239,33 @@
     if (!shards.length && !docs.length && !vectors.length) return null;
     var wrap = make('div', '');
 
-    shards.slice(0, 6).forEach(function (s) {
+    shards.forEach(function (s) {
       var d = make('details', 'ld-fold');
       var sum = make('summary', '');
       sum.appendChild(make('b', '', String(s.crystal || s.name || 'a passage')));
       sum.appendChild(make('i', '', String(s.file || '')
         + (s.in_prompt ? '  ·  in the prompt' : '  ·  not used')));
       d.appendChild(sum);
-      /* [#1231] A shard is a swath of a document on the speakbox shelf,
-       * and the row names the file it was cut from - so a rewrite goes
-       * back into that file where those words were found. */
-      d.appendChild(editable(make('pre', 'ld-pre', String(s.text || '')),
-        s.file ? {scope: 'passage', key: String(s.file),
-                  label: 'a crystal shard', applies: ['future'],
-                  how: 'these words are written back into ' + String(s.file)
-                    + ' exactly where they were found; the next round that '
-                    + 'draws on that document reads yours'}
-               : {scope: '', why: 'the record does not name the document '
-                    + 'this shard was cut from, so there is nothing to '
-                    + 'write it back into'}));
+      d.appendChild(crystalEvidence(s, 'shard'));
       wrap.appendChild(d);
     });
-    docs.slice(0, 6).forEach(function (doc) {
+    docs.forEach(function (doc) {
       var d = make('details', 'ld-fold');
       var sum = make('summary', '');
       sum.appendChild(make('b', '', String(doc.title || doc.file || 'a document')));
       sum.appendChild(make('i', '', doc.quoted ? 'quoted' : 'read, not quoted'));
       d.appendChild(sum);
-      /* [#1231] The swath the writer was handed, put back into its file. */
-      d.appendChild(editable(
-        make('pre', 'ld-pre', String(doc.text || doc.snippet || '')),
-        doc.file ? {scope: 'passage', key: String(doc.file),
-                    label: 'a speakbox passage', applies: ['future'],
-                    how: 'these words are written back into '
-                      + String(doc.file) + ' exactly where they were found'}
-                 : {scope: '', why: 'this row names no file on the '
-                      + 'speakbox shelf, so there is nothing to write into'}));
+      d.appendChild(crystalEvidence(doc, 'document'));
       wrap.appendChild(d);
     });
     if (vectors.length) {
       wrap.appendChild(make('h5', '', 'what it searched for'));
-      var list = make('ul', 'ld-facts');
-      vectors.slice(0, 6).forEach(function (v) {
-        list.appendChild(fact(String(v.query || v.q || '—'),
-          String(v.hits || v.count || '')));
+      vectors.forEach(function (v) {
+        var d = make('details', 'ld-fold ld-crystal-fold');
+        d.appendChild(make('summary', '', String(v.query || v.q || 'search')));
+        d.appendChild(crystalEvidence(v, 'vector'));
+        wrap.appendChild(d);
       });
-      wrap.appendChild(list);
     }
     return wrap;
   }
@@ -2158,5 +2418,7 @@
   root.PineLineDeep = {open: open, close: close, busy: editsBusy};
   if (typeof module !== 'undefined' && module.exports) {
     module.exports = root.PineLineDeep;
+    module.exports._test = {stageFacts: stageFacts, crystalEvidence: crystalEvidence,
+      factsInto: factsInto, shownNode: shownNode};
   }
 })(typeof window !== 'undefined' ? window : globalThis);

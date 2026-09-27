@@ -238,9 +238,7 @@
         else if (!item.wrap.hidden) anyOpen = true;
       });
       bands.hidden = !anyOpen;
-      /* Prompt History is a permanent Script command in this toolbar. Only
-         the per-band restore buttons disappear when their bands are open. */
-      toolbar.hidden = false;
+      toolbar.hidden = !anyClosed && !toolbar.querySelector('.sp-band-always');
     }
     function set(key, closed) {
       if (!Object.prototype.hasOwnProperty.call(items, key)) return;
@@ -491,7 +489,35 @@
     controls.title = 'Open all rejected lines and editorial controls';
     controls.addEventListener('click', rejectionControlsOpen);
     strip.appendChild(controls);
+    /* [s3-window] "a button icon '3' in the toolbar" - System 3's instrument:
+       Tables, Segments (the node editor), Prompts, Audit, Sys3. */
+    var three = make('button', 'sp-reject-controls sp-s3-button', '3');
+    three.type = 'button';
+    three.title = 'System 3: tables, segments, prompts, audit, Sys3';
+    three.setAttribute('aria-label', 'Open System 3');
+    three.addEventListener('click', function () { s3Window('tables'); });
+    strip.appendChild(three);
     return strip;
+  }
+
+  /* [s3-window] System 3's own instrument, opened over this page. The
+     module is the station's (served live), so the tabs need no rebuild. */
+  var s3WindowOpen = null;
+  function s3Window(tab) {
+    if (s3WindowOpen) { try { s3WindowOpen.close(); } catch (e) { /* gone */ } s3WindowOpen = null; }
+    if (!document.getElementById('spS3Style')) {
+      var style = document.createElement('link');
+      style.id = 'spS3Style';
+      style.rel = 'stylesheet';
+      style.href = techUrl('/system3/system3.css?v=6');
+      document.head.appendChild(style);
+    }
+    import(techUrl('/system3/system3.js?v=6')).then(function (mod) {
+      return mod.openSystem3({request: s3Request, tab: tab || 'tables',
+        onClose: function () { s3WindowOpen = null; }});
+    }).then(function (view) { s3WindowOpen = view; }).catch(function (err) {
+      try { console.warn('System 3 could not open', err); } catch (e) { /* no console */ }
+    });
   }
 
   function rejectionPolicyOpen() {
@@ -1250,6 +1276,27 @@
    * screenplay says it; a clip has no heading, because it is an action
    * line, so it is named as a clip instead of being given a voice it
    * does not have. */
+  /* [s3-header] THE CARD'S TAP GOES TO THE VIEW THAT IS UP. The script
+     always follows the air again - it is what the other views come back
+     to - and a System 3 view that is up scrolls to the message on air
+     too; the prompt history, when it is open and can say which request
+     wrote that line, goes to it (PinePromptHistory.jumpTo). */
+  function airJump(reason) {
+    var done = resumeAirFollow(reason);
+    if (s3Mode !== 'script' && s3View && typeof s3View.jumpToAir === 'function') {
+      /* [tablet-perf] THE LINE ON THE CARD, not the views' focus line -
+         that follows a line tapped in the script while its card is open. */
+      try { done = s3View.jumpToAir(String(sayingLineId || nowLineId || '')) || done; }
+      catch (e) { /* the view is closing */ }
+    }
+    var ph = root.PinePromptHistory;
+    var open = host && host.querySelector('.sp-right.ph-active');
+    if (open && ph && typeof ph.jumpTo === 'function') {
+      try { ph.jumpTo(open, String(sayingLineId || nowLineId || '')); } catch (e) { /* nothing to find */ }
+    }
+    return done;
+  }
+
   function buildSaying() {
     var box = make('div', 'sp-saying');
     box.id = 'spSaying';
@@ -1292,12 +1339,12 @@
     box.appendChild(strip);
     /* PineLineActions owns the hold on data-line; a tap still follows air. */
     box.addEventListener('click', function () {
-      resumeAirFollow('live strip', sayingLineId);
+      airJump('live strip');
     });
     box.addEventListener('keydown', function (ev) {
       if (ev.key === 'Enter' || ev.key === ' ') {
         ev.preventDefault();
-        resumeAirFollow('live strip', sayingLineId);
+        airJump('live strip');
       } else if ((ev.key === 'F10' && ev.shiftKey) || ev.key === 'ContextMenu') {
         var actions = root.PineLineActions;
         if (sayingLineId && actions && actions.open) {
@@ -1487,6 +1534,7 @@
   var tlSecond = -1;
   var tlHoldUntil = 0;
   var tlLast = null;
+  var tlNow = null;                 /* [s3-roads] what the strip reads this tick, for the Messenger */
   var TL_HOLD_MS = 600;            /* the beat between two lines is not silence */
   var TL_GAP_S = 0.35;             /* a hole this wide between lines is a sting slot */
 
@@ -1693,7 +1741,7 @@
       tlOn = on;
       if (host) host.classList.toggle('sp-tl-on', on);
       if (!on) {
-        tlKey = ''; tlSecond = -1; tlLast = null;
+        tlKey = ''; tlSecond = -1; tlLast = null; tlNow = null;
         var c0 = el('spSayingClock');
         if (c0) c0.textContent = '';
         fill.style.width = '0%';
@@ -1707,6 +1755,7 @@
     catch (err) { feed = []; }
     var got = timelineRows(src.file, src.total, admitMap, feed, liveStream);
     var model = timelineModel(src.at, got.total, got.rows);
+    tlNow = {src: src, rows: got.rows, model: model};                  /* [s3-roads] */
     fill.style.width = (model.fraction * 100).toFixed(2) + '%';
     var key = src.road + '|' + got.road + '|' + src.file + '|' + model.total.toFixed(1)
       + '|' + model.ticks.length + '|' + model.marks.length;
@@ -4060,6 +4109,257 @@
         'the technical view could not open: ' + String((err && err.message) || err)));
     } finally { techOpening = false; }
     return techView;
+  }
+
+  /* ------------------------------ System 3: THE MESSENGER AND THE TECHNICAL VIEW
+   *
+   * "The script view needs to be inherently connected to these systems and
+   *  be able to be an alternative view as well ... cycle between the
+   *  developing conversation view, the technical RNG generative view of the
+   *  scaffolding view and back to the script view in sync." (System 3.pdf,
+   *  p.5) - and, from the Script tab: "i need to be able to cycle to
+   *  messenger view from the script tab to the technical view and the
+   *  messenger view."
+   *
+   * Two buttons on the band toolbar swap THIS pane between the script and
+   * System 3's own views of the round the script is on: the Rolodex (every
+   * recorded roll behind every line) and the messenger (the conversation as
+   * System 3 directed it). The lit button pressed again is the way back to
+   * the script, which lands on the turn picked in either view. The views
+   * are the station's own module, imported by absolute URL exactly as the
+   * word-cause graph is (techUrl, #1386), so they reach the tablet with no
+   * APK rebuild.
+   *
+   * IN SYNC WITH WHAT IS SPOKEN, without the faults #1288-#1298 name: the
+   * line on air (or the line tapped, while its card is open) is looked up
+   * in the conversation's own line map on this page's tick - no request per
+   * line. A request is made only when the air reaches a line that belongs
+   * to no conversation on show: one GET, then one conversation fetch, once
+   * per round. The pane sits over the script in the script's own grid cell,
+   * so the script underneath keeps following the air untouched. */
+  var s3Mode = 'script';
+  var s3View = null;
+  var s3Opening = null;
+  var s3Buttons = {};
+  var s3Asked = '';
+  var s3RetryAt = 0;
+  var s3Busy = false;
+  var s3Picked = '';
+
+  function s3Request(path, options) {
+    var method = String((options && options.method) || 'GET').toUpperCase();
+    var fn = method === 'POST' ? 'post' : (method === 'PUT' ? 'put' : 'get');
+    var bridge = api();
+    if (!bridge || typeof bridge[fn] !== 'function') {
+      return Promise.reject(new Error('the station bridge cannot ' + method));
+    }
+    return Promise.resolve(bridge[fn](path,
+      options && options.body ? JSON.parse(options.body) : undefined));
+  }
+
+  function s3Reset() {
+    if (s3View) { try { s3View.dispose(); } catch (e) { /* already gone */ } }
+    s3View = null;
+    s3Opening = null;
+    s3Mode = 'script';
+    s3Buttons = {};
+    s3Asked = '';
+    s3Busy = false;
+    s3Picked = '';
+  }
+
+  function s3Mount() {
+    if (s3View) return Promise.resolve(s3View);
+    if (s3Opening) return s3Opening;
+    var pane = el('spS3');
+    if (!pane) return Promise.resolve(null);
+    s3Opening = (async function () {
+      try {
+        if (!document.getElementById('spS3Style')) {
+          var style = document.createElement('link');
+          style.id = 'spS3Style';
+          style.rel = 'stylesheet';
+          style.href = techUrl('/system3/system3.css?v=6');
+          document.head.appendChild(style);
+        }
+        var mod = await import(techUrl('/system3/system3.js?v=6'));
+        pane.textContent = '';
+        var box = make('div', 'sp-s3-host');
+        pane.appendChild(box);
+        s3View = await mod.mountEmbedded(box, {
+          request: s3Request,
+          /* [s3-header] its bar goes in this page's header */
+          chrome: {tools: el('spS3Tools'), air: el('spS3Air'), facts: el('spS3Facts')},
+          view: s3Mode === 'technical' ? 'rolodex' : 'conversation',
+          onSelect: function (pick) {
+            s3Picked = (pick && pick.lines && pick.lines[0]) || '';
+          },
+          onOpenFull: function () {
+            try {
+              if (typeof root.system3Open === 'function') { root.system3Open(); return; }
+            } catch (e) { /* not the panel's document */ }
+            try { root.open(techUrl('/system3'), '_blank'); } catch (e) { /* no opener */ }
+          }
+        });
+        return s3View;
+      } catch (err) {
+        pane.textContent = '';
+        pane.appendChild(make('div', 'sp-techbad',
+          'System 3 could not open here: ' + String((err && err.message) || err)));
+        return null;
+      } finally { s3Opening = null; }
+    })();
+    return s3Opening;
+  }
+
+  /* The line System 3's views follow: the one tapped while its card is
+     open, else the one on air, else (only when asked) the last one. */
+  function s3FocusLine(onAir, fallback) {
+    var detail = el('spDetail');
+    if (detail && !detail.hidden) {
+      var picked = document.querySelector('#spScript .sp-el.picked[data-line]');
+      if (picked) return String(picked.dataset.line || '');
+    }
+    if (onAir) return onAir;
+    if (!fallback) return '';
+    var all = document.querySelectorAll('#spScript .sp-el[data-line]');
+    return all.length ? String(all[all.length - 1].dataset.line || '') : '';
+  }
+
+  /* A sting or an interjection between two turns belongs to no turn: the
+     spoken lines just above it are asked about next. */
+  function s3Around(id) {
+    var out = id ? [id] : [];
+    var node = id ? lineNode(id) : null;
+    while (node && out.length < 3) {
+      node = node.previousElementSibling;
+      if (node && node.dataset && node.dataset.line
+          && out.indexOf(String(node.dataset.line)) < 0) {
+        out.push(String(node.dataset.line));
+      }
+    }
+    return out;
+  }
+
+  async function s3Resolve(line) {
+    s3Busy = true;
+    s3Asked = line;
+    s3RetryAt = Date.now() + 20000;
+    try {
+      var tries = s3Around(line);
+      var got = null;
+      for (var i = 0; i < tries.length && !got; i += 1) {
+        var r = null;
+        try {
+          r = await s3Request('/api/system3/line?line_id=' + encodeURIComponent(tries[i]));
+        } catch (e) { r = null; }
+        if (r && r.line && r.conversation) got = r;
+      }
+      if (!s3View) return;
+      if (got) {
+        var cid = got.conversation.conversation_id;
+        await s3View.show({
+          conversationId: cid,
+          turnId: (got.turn && got.turn.turn_id) || '',
+          refresh: s3View.conversationId === cid,
+          note: tries[0] !== got.line.line_id
+            ? 'The line in focus is a sting or an interjection; this is the turn it follows.' : ''});
+        s3View.live(got.line.line_id);
+        return;
+      }
+      if (s3View.conversationId) return;          /* keep what is on show */
+      var list = null;
+      try { list = await s3Request('/api/system3/conversations?limit=1'); } catch (e) { list = null; }
+      var last = list && list.conversations && list.conversations[0];
+      if (last) {
+        await s3View.show({conversationId: last.conversation_id,
+          note: 'The line in focus was not directed by System 3 (a record link, an advert, an ID, '
+            + 'or a round written before it was switched on). This is its latest conversation.'});
+      } else {
+        s3View.message('System 3 has not directed a conversation yet: it plans every banter '
+          + 'and call round the station writes.');
+      }
+    } catch (err) {
+      /* the script carries on underneath */
+    } finally { s3Busy = false; }
+  }
+
+  /* Once per tick, only while a System 3 view is up. Cheap when the air has
+     not moved: one Array.find over the round's own lines. */
+  function s3Tick(onAir, force) {
+    if (s3Mode === 'script' || !s3View) return;
+    var line = s3FocusLine(onAir, !!force);
+    if (!line) return;
+    if (s3View.live(line) === 'here') { s3Asked = line; return; }
+    if (!force && line === s3Asked && Date.now() < s3RetryAt) return;
+    if (s3Busy) return;
+    s3Resolve(line);
+  }
+
+  /* [s3-roads] THE MESSENGER'S BAR KEEPS STEP WITH THE AUDIO. "A loading bar
+     on the bottom as it is playing on the station in sync with the audio
+     indicating the length of the clip." The page's own strip already
+     knows where the sounding clip has got to (timelineSource) and the
+     window of each line inside a welded round (its rows); the line on
+     air gets its own position and length, else the clip's. Once per
+     tick, only while a System 3 view is up; a view without the method
+     (an older module still held by the page) is left alone. */
+  function s3Clock(row) {
+    if (s3Mode === 'script' || !s3View || typeof s3View.clock !== 'function') return;
+    var id = row ? String(row.id || '') : '';
+    var now = tlNow;
+    if (!id || !now || !now.model || !now.model.total) {
+      try { s3View.clock(id, 0, 0); } catch (e) { /* the view is closing */ }
+      return;
+    }
+    var at = now.model.at, total = now.model.total;
+    var rows = now.rows || [];
+    for (var i = 0; i < rows.length; i += 1) {
+      var r = rows[i] || {};
+      if (String(r.id || r.line_id || '') !== id) continue;
+      var from = Number(r.from), until = Number(r.until);
+      if (isFinite(from) && isFinite(until) && until > from) {
+        at = Math.max(0, Math.min(until - from, now.model.at - from));
+        total = until - from;
+      }
+      break;
+    }
+    try { s3View.clock(id, at, total); } catch (e) { /* the view is closing */ }
+  }
+
+  /* [s3-header] System 3's pieces in this page's header, shown while one
+     of its views is up. */
+  function s3Chrome(on) {
+    ['spS3Air', 'spS3Tools', 'spS3Facts'].forEach(function (id) {
+      var node = el(id);
+      if (node) node.hidden = !on;
+    });
+  }
+
+  function s3SetMode(mode) {
+    if (mode === s3Mode || (mode !== 'technical' && mode !== 'messenger')) mode = 'script';
+    s3Mode = mode;
+    s3Chrome(mode !== 'script');
+    var pane = el('spS3');
+    Object.keys(s3Buttons).forEach(function (k) {
+      s3Buttons[k].setAttribute('aria-pressed', String(k === mode));
+    });
+    if (host) host.classList.toggle('sp-s3-on', mode !== 'script');
+    if (mode === 'script') {
+      if (pane) pane.hidden = true;
+      var back = s3Picked;
+      s3Picked = '';
+      if (back) jumpToLine(back);
+      return;
+    }
+    if (pane) pane.hidden = false;
+    s3Mount().then(function (view) {
+      if (!view || s3Mode === 'script') return;
+      view.setView(s3Mode === 'technical' ? 'rolodex' : 'conversation');
+      var row = null;
+      try { row = activeRow(); } catch (e) { row = null; }
+      s3Tick(row ? String(row.id || '') : '', true);
+    });
   }
 
   /* [#1387] ACROSS THE WHOLE BOTTOM.
@@ -9325,7 +9625,9 @@
     feed.forEach(function (r) { if (r.id) byId[String(r.id)] = r; });
     var rect = pane.getBoundingClientRect(), visible = -1;
     var knownActive = diagnosticLines[String(active.id || '')];
-    if (idx < 0 && !knownActive && document.elementFromPoint) {
+    /* [tablet-perf] not while a System 3 view covers the pane: the probe
+       can only hit the view, and each call lays out the whole page. */
+    if (idx < 0 && !knownActive && document.elementFromPoint && s3Mode === 'script') {
       var hit = document.elementFromPoint(rect.left + Math.min(24, rect.width / 2), rect.top + 2);
       var visibleNode = hit && hit.closest ? hit.closest('.sp-el') : null;
       visible = diagnosticIndices.has(visibleNode) ? diagnosticIndices.get(visibleNode) : -1;
@@ -9424,10 +9726,16 @@
   }
   var reportKind = 'report';
   function ensureCaution() {
-    var pane = el('spScript');
+    /* [s3-header] At the right end of the title line. In the script
+       pane's corner it sat over the first line - and over System 3's
+       views, which cover that pane. The pane stays the fallback for a
+       page built without the title line's tools. */
+    var dock = el('spTitleTools');
+    var pane = dock || el('spScript');
     if (!pane) return;
     var wrap = document.getElementById('spCautionWrap');
-    if (wrap && wrap.parentNode === pane && pane.firstChild === wrap) return;
+    if (wrap && wrap.parentNode === pane
+        && (dock ? pane.lastChild === wrap : pane.firstChild === wrap)) return;
     if (!wrap) {
       wrap = make('div', 'sp-caution-wrap', '');
       wrap.id = 'spCautionWrap';
@@ -9450,7 +9758,8 @@
       holdOpen(b, function () { reasonOpen(b); });
       wrap.appendChild(b);
     }
-    pane.insertBefore(wrap, pane.firstChild);
+    if (dock) pane.appendChild(wrap);
+    else pane.insertBefore(wrap, pane.firstChild);
   }
 
   function reportGather(phase, incident, since) {
@@ -10395,9 +10704,213 @@
         if (feedLive === oldId) feedLive = '';
       }
     }
+    feedDiceTick();   /* [s3-dice] ask System 3 about the rows that want dice */
     feedSetActiveMarquee(box);
     if (!added && over <= 0) return;
     if (feedStick) box.scrollTop = box.scrollHeight;
+  }
+
+  /* [s3-dice] THE DICE ON THE FEED.
+   *
+   * "for these entries that are created via the roulette system, I want to
+   *  have a series of dice icons rolling and landing on their final numbers
+   *  as the entries appear on screen. I want to see a dice icon there for
+   *  each entry that has a roulette and be able to tap them to open a popup
+   *  going more into detail on what the roulette in regards and allow me to
+   *  see the adjacent tables associated with them ... The animations should
+   *  be slightly offset per dice on the row but overall it should just be a
+   *  rolling dice that stops on the number with a bubble showing the
+   *  associated roulette table referenced."
+   *
+   * Every row with a line id is asked about, in batches of up to 40, at
+   * /api/system3/dice: the turn it came from and that turn's RECORDED rolls
+   * - the d100 each landed on, the table, where in the table. Nothing here
+   * is re-rolled: the reel is a decoration that ends on the recorded number.
+   * A row no node made gets no dice, and is asked again while it is young,
+   * because the ledger links a live row a little after it is drawn. Only a
+   * row that arrived in the last half minute animates: the hundred rows a
+   * fresh pane paints at once land still, which is what the tablet's twelve
+   * frames a second can afford (tablet-frame-pipeline). */
+  var feedDiceWant = Object.create(null);   /* id -> {nodes, row, tries, at} */
+  var feedDiceBusy = false;
+  var feedDiceLast = 0;
+  var FEED_DICE_MAX = 6;
+  var FEED_DICE_FAMS = {sfx: {SFX: 1, SFXGUY: 1}, sfxguy: {SFXGUY: 1, LINE: 1}};
+  var FEED_DICE_COLOR = {CTS: '#8ac6ac', ES: '#f0a6ca', RS: '#87bfff', IRS: '#ffb86b', FL: '#c4a1ee',
+    SPEAKERBOX: '#e7bf78', SFX: '#7fe0d6', TOPIC: '#9be15d', SFXGUY: '#ffd479', LINE: '#b8c4ff', LENGTH: '#9aa9ab'};
+
+  function feedDiceNote(node, row) {
+    if (!node || !row || node.pineDice || node.pineDiceDone) return;
+    var id = String(row.line || row.id || '');
+    if (!id) return;
+    if (!node.pineBorn) node.pineBorn = Date.now();
+    var who = String(row.who || '');
+    if (who === 'analysis' || who === 'board' || /image_analysis/.test(String(row.kind || ''))) {
+      node.pineDiceDone = true;
+      return;
+    }
+    var want = feedDiceWant[id] || (feedDiceWant[id] = {nodes: [], row: row, tries: 0, at: 0});
+    if (want.nodes.indexOf(node) < 0) want.nodes.push(node);
+    want.row = row;
+    /* the row moved (prepared -> aired, or its stamp arrived): ask again now */
+    var aired = String(row.aired || '') + (row.system3 ? '+s3' : '');
+    if (want.aired !== undefined && want.aired !== aired) want.at = 0;
+    want.aired = aired;
+  }
+
+  /* A row that carries its own stamp (a line the station's line hook made)
+     tells System 3 where to look before the ledger has linked it. */
+  function feedDiceHint(row) {
+    var s3 = row && row.system3;
+    if (!s3 || !s3.conversation_id) return '';
+    var tid = String(s3.turn_id || '');
+    var tail = tid.indexOf(':') >= 0 ? tid.split(':').pop() : tid;
+    return String(row.line || row.id) + ':' + String(s3.conversation_id) + ':' + tail + ':' + String(row.who || '');
+  }
+
+  function feedDiceTick() {
+    var now = Date.now();
+    if (feedDiceBusy || now - feedDiceLast < 1500) return;
+    var ids = [], hints = [];
+    for (var id in feedDiceWant) {
+      var w = feedDiceWant[id];
+      w.nodes = w.nodes.filter(function (n) { return n.isConnected && !n.pineDice; });
+      if (!w.nodes.length) { delete feedDiceWant[id]; continue; }
+      if (w.tries >= 14) {
+        w.nodes.forEach(function (n) { n.pineDiceDone = true; });
+        delete feedDiceWant[id];
+        continue;
+      }
+      if (w.at && now - w.at < 15000 * Math.max(1, w.tries)) continue;   /* asked lately */
+      ids.push(id);
+      var h = feedDiceHint(w.row);
+      if (h) hints.push(h);
+      if (ids.length >= 40) break;
+    }
+    if (!ids.length) return;
+    feedDiceBusy = true;
+    feedDiceLast = now;
+    ids.forEach(function (one) { var w2 = feedDiceWant[one]; if (w2) { w2.at = now; w2.tries += 1; } });
+    var path = '/api/system3/dice?ids=' + encodeURIComponent(ids.join(','))
+      + (hints.length ? '&hints=' + encodeURIComponent(hints.join(',')) : '');
+    Promise.resolve().then(function () { return api().get(path); }).then(function (got) {
+      var lines = (got && got.lines) || {};
+      ids.forEach(function (one) {
+        var w3 = feedDiceWant[one];
+        var info = lines[one];
+        if (!w3 || !info || !info.system3) return;      /* asked again while the row is young */
+        w3.nodes.forEach(function (n) { feedDiceDress(n, info, one); });
+        delete feedDiceWant[one];
+      });
+    }).catch(function () { /* the next paint asks again */ }).then(function () { feedDiceBusy = false; });
+  }
+
+  /* Which of the turn's rolls a row shows: a clip event shows the SFX and
+     SFX Guy nodes; the SFX Guy's own row his node and his draw at air; a
+     spoken line every roll of its turn (the first six, and a "+N"). */
+  function feedDiceRolls(node, info) {
+    var stage = String(((node.pineEvent || node.pineRow || {}).stage) || '').toLowerCase();
+    var fams = FEED_DICE_FAMS[stage] || null;
+    var all = ((info.turn || {}).rolls || []).concat(info.air || []);
+    var drawn = all.filter(function (r) { return r && r.dice != null; });
+    var rolls = fams ? drawn.filter(function (r) { return fams[String(r.family || '')]; }) : drawn;
+    return rolls.length ? rolls : drawn;
+  }
+
+  function feedDiceLabel(r) {
+    var text = String(r.family || '');
+    if (r.label) text += ' - ' + String(r.label);
+    if (r.index != null && r.of) text += ' (' + r.index + ' of ' + r.of + ')';
+    if (r.table) text += ' - table ' + String(r.table);
+    return text;
+  }
+
+  function feedDiceDress(node, info, id) {
+    if (!node || node.pineDice) return;
+    node.pineDice = info;
+    var rolls = feedDiceRolls(node, info);
+    if (!rolls.length) return;
+    var still = false;
+    try { still = !!(root.matchMedia && root.matchMedia('(prefers-reduced-motion: reduce)').matches); } catch (e) { still = false; }
+    if (Date.now() - (node.pineBorn || 0) > 30000) still = true;          /* an old row lands still */
+    if (document.visibilityState && document.visibilityState !== 'visible') still = true;
+    var strip = make('span', 'sp-msg-dice');
+    strip.setAttribute('role', 'group');
+    strip.setAttribute('aria-label', 'System 3 dice for this line');
+    var bubble = make('span', 'sp-die-bubble');
+    bubble.setAttribute('aria-hidden', 'true');
+    var bubbleTimer = 0;
+    var say = function (text, hold) {
+      bubble.textContent = text;
+      bubble.classList.add('show');
+      clearTimeout(bubbleTimer);
+      bubbleTimer = setTimeout(function () { bubble.classList.remove('show'); }, hold || 2600);
+    };
+    var shown = rolls.slice(0, FEED_DICE_MAX);
+    shown.forEach(function (r, i) {
+      var die = make('button', 'sp-die');
+      die.type = 'button';
+      die.style.setProperty('--fam', FEED_DICE_COLOR[String(r.family || '')] || '#68ced9');
+      die.title = feedDiceLabel(r) + ' - d100 landed on ' + r.dice + ' (recorded). Tap for the roulette.';
+      die.setAttribute('aria-label', die.title);
+      var reel = make('span', 'sp-die-reel');
+      var faces = [];
+      if (!still) {
+        var n = 7 + (i % 3);
+        for (var k = 0; k < n; k += 1) faces.push(String(1 + ((Number(r.dice) * 37 + k * 53 + i * 11) % 100)));
+      }
+      faces.push(String(r.dice));
+      faces.forEach(function (f) { reel.appendChild(make('span', '', f)); });
+      reel.style.setProperty('--reel-end', (-(faces.length - 1) * 20) + 'px');
+      die.appendChild(reel);
+      die.addEventListener('click', function (ev) { ev.stopPropagation(); feedDiceOpen(info, r, id); });
+      die.addEventListener('keydown', function (ev) { if (ev.key === 'Enter' || ev.key === ' ') ev.stopPropagation(); });
+      die.addEventListener('mouseenter', function () { say(feedDiceLabel(r), 1800); });
+      die.addEventListener('focus', function () { say(feedDiceLabel(r), 1800); });
+      strip.appendChild(die);
+      if (still) { die.classList.add('landed'); return; }
+      var delay = 120 + i * 140;
+      var ms = 700 + i * 90;
+      die.style.setProperty('--delay', delay + 'ms');
+      die.style.setProperty('--ms', ms + 'ms');
+      die.classList.add('rolling');
+      setTimeout(function () {
+        die.classList.remove('rolling');
+        die.classList.add('landed');
+        if (die.isConnected) say(feedDiceLabel(r), i === shown.length - 1 ? 3200 : 1200);
+      }, delay + ms);
+    });
+    if (rolls.length > shown.length) {
+      var more = make('button', 'sp-die sp-die-more', '+' + (rolls.length - shown.length));
+      more.type = 'button';
+      more.title = (rolls.length - shown.length) + ' more rolls on this turn. Tap for the whole story.';
+      more.addEventListener('click', function (ev) { ev.stopPropagation(); feedDiceOpen(info, null, id); });
+      strip.appendChild(more);
+    }
+    strip.appendChild(bubble);
+    node.appendChild(strip);
+    node.classList.add('has-dice');
+    node.style.setProperty('--sp-dice-w', ((strip.childElementCount - 1) * 30) + 'px');
+  }
+
+  /* A die, tapped: System 3's own decision card for that roll (served by
+     the station, so it is the same card the messenger and the inspector
+     open), with the table it drew from a tap away. The "+N" chip and a
+     draw with no event of its own open the line's whole story. */
+  function feedDiceOpen(info, roll, id) {
+    if (!document.getElementById('spS3Style')) {
+      var style = document.createElement('link');
+      style.id = 'spS3Style';
+      style.rel = 'stylesheet';
+      style.href = techUrl('/system3/system3.css?v=6');
+      document.head.appendChild(style);
+    }
+    import(techUrl('/system3/system3.js?v=6')).then(function (mod) {
+      return mod.openRoll({request: s3Request, conversationId: info.conversation_id,
+        eventId: roll ? String(roll.event_id || '') : '', turnId: info.turn_id, lineId: id});
+    }).catch(function (err) {
+      try { console.warn('System 3 could not open the roll', err); } catch (e) { /* no console */ }
+    });
   }
 
   var FEED_OPERATIONS = {
@@ -10635,6 +11148,7 @@
       line.pineState = state;
       line.classList.toggle('pending', state === 'prepared');
     }
+    feedDiceNote(line, row);   /* [s3-dice] */
   }
 
   /* #1279: THE LINE THAT IS SOUNDING, marked from the live pointer and
@@ -14823,6 +15337,8 @@
     }
     keepLitInView('tick');
     playoutPoll();
+    s3Tick(row ? String(row.id || '') : '', false);          /* System 3 */
+    s3Clock(row);                                             /* [s3-roads] */
   }
   var sampledAt = 0;                              /* [#1189] */
 
@@ -14948,7 +15464,12 @@
     box.replaceChildren();
 
     box.appendChild(make('b', 'sp-detail-who', item.name || item.who || item.tag || 'the station'));
-    box.appendChild(make('p', 'sp-detail-text', item.text || ''));
+    /* [s3-line-tabs] "when i tap a message, I want this popup to have tabs":
+       Line (the words, the note, the buttons) / System 3 / Node / Prompt /
+       Tables. The four are served by the System 3 module, so they change
+       without a rebuild; the strip keeps the tab across messages. */
+    var tabs = lineTabsStrip(box, item);
+    tabs.line.appendChild(make('p', 'sp-detail-text', item.text || ''));
 
     var facts = [];
     if (item.round) facts.push(item.round);
@@ -14957,11 +15478,11 @@
     if (item.seconds) facts.push(Number(item.seconds).toFixed(1) + 's');
     if (item.tinted) facts.push('tinted');
     if (item.aired) facts.push(item.aired === 'stream' ? 'aired' : item.aired);
-    box.appendChild(make('i', 'sp-detail-facts', facts.join('  ·  ')));
+    tabs.line.appendChild(make('i', 'sp-detail-facts', facts.join('  ·  ')));
 
     var note = make('textarea', 'sp-note');
     note.placeholder = 'A note, or how this should have been said...';
-    box.appendChild(note);
+    tabs.line.appendChild(note);
 
     var row = make('div', 'sp-detail-row');
 
@@ -14996,10 +15517,76 @@
     clip.addEventListener('click', function () { hear(item, clip); });
     row.appendChild(clip);
 
-    box.appendChild(row);
+    tabs.line.appendChild(row);
     var close = make('button', 'sp-detail-close', '✕');
-    close.addEventListener('click', function () { box.hidden = true; });
-    box.appendChild(close);
+    close.addEventListener('click', function () { box.hidden = true; lineTabsDispose(); });
+    tabs.strip.appendChild(close);
+  }
+
+  /* [s3-line-tabs] The strip on the tapped line's box. The Line tab is the
+     box as it was; the other four mount the System 3 module's panes on the
+     line's id once, then switch between them. The tab chosen stays chosen
+     for the next line tapped, so a reader can walk the feed on one tab. */
+  var lineTab = 'line', lineTabs = null, lineTabsPane = null;
+  var LINE_TABS = [['line', 'Line'], ['system3', 'System 3'], ['node', 'Node'], ['prompt', 'Prompt'], ['tables', 'Tables']];
+  function lineTabsDispose() {
+    if (lineTabs) { try { lineTabs.dispose(); } catch (e) { /* gone */ } }
+    lineTabs = null;
+    lineTabsPane = null;
+  }
+  function lineTabsStrip(box, item) {
+    lineTabsDispose();
+    var strip = make('div', 'sp-detail-tabs');
+    var line = make('div', 'sp-detail-line-tab');
+    var pane = make('div', 'sp-detail-s3');
+    pane.hidden = true;
+    var buttons = {};
+    var id = String(item.line || item.id || '');
+    function show(name) {
+      lineTab = name;
+      Object.keys(buttons).forEach(function (k) { buttons[k].setAttribute('aria-pressed', String(k === name)); });
+      line.hidden = name !== 'line';
+      pane.hidden = name === 'line';
+      if (name === 'line') return;
+      if (!id) { pane.textContent = 'This row has no line id, so System 3 cannot be asked about it.'; return; }
+      if (lineTabs) { lineTabs.show(name); return; }
+      if (lineTabsPane === pane) return;                     /* mounting */
+      lineTabsPane = pane;
+      pane.textContent = 'Asking System 3...';
+      if (!document.getElementById('spS3Style')) {
+        var style = document.createElement('link');
+        style.id = 'spS3Style';
+        style.rel = 'stylesheet';
+        style.href = techUrl('/system3/system3.css?v=6');
+        document.head.appendChild(style);
+      }
+      import(techUrl('/system3/system3.js?v=6')).then(function (mod) {
+        if (lineTabsPane !== pane) return null;
+        return mod.mountLineTabs(pane, {request: s3Request, lineId: id, tab: lineTab});
+      }).then(function (view) {
+        if (!view) return;
+        if (lineTabsPane !== pane) { try { view.dispose(); } catch (e) { /* gone */ } return; }
+        lineTabs = view;
+        if (lineTab !== 'line') view.show(lineTab);
+      }).catch(function (err) {
+        if (lineTabsPane === pane) pane.textContent = 'System 3 could not open here: ' + String((err && err.message) || err);
+        lineTabsPane = null;
+      });
+    }
+    LINE_TABS.forEach(function (t) {
+      var b = make('button', 'sp-detail-tab', t[1]);
+      b.type = 'button';
+      b.setAttribute('aria-pressed', 'false');
+      b.addEventListener('click', function () { show(t[0]); });
+      buttons[t[0]] = b;
+      strip.appendChild(b);
+    });
+    box.appendChild(strip);
+    box.appendChild(line);
+    box.appendChild(pane);
+    box.classList.add('has-tabs');
+    show(lineTab);
+    return {strip: strip, line: line, pane: pane, show: show};
   }
 
   function sendNote(item, text, button) {
@@ -15142,6 +15729,15 @@
     var promptDock = make('div', 'sp-prompt-dock');
     titleRow.appendChild(head);
     titleRow.appendChild(promptDock);
+    /* [s3-header] The right of the title line: System 3's round facts
+       (while one of its views is up) and the caution button. */
+    var titleTools = make('div', 'sp-title-tools');
+    titleTools.id = 'spTitleTools';
+    var s3Facts = make('span', 'sp-s3-facts');
+    s3Facts.id = 'spS3Facts';
+    s3Facts.hidden = true;
+    titleTools.appendChild(s3Facts);
+    titleRow.appendChild(titleTools);
     top.appendChild(titleRow);
     /* One line, console-shaped, directly under the heading: what is
        happening with the line that is being said. */
@@ -15244,6 +15840,36 @@
       if (root.PinePromptHistory) root.PinePromptHistory.toggle(right, promptHistory, promptDock);
     });
     restore.appendChild(promptHistory);
+    /* System 3: this pane cycles script -> technical -> messenger and
+       back (s3SetMode). The two stay on the toolbar even when every
+       band is open: .sp-band-always keeps the toolbar showing. */
+    s3Reset();
+    ['technical', 'messenger'].forEach(function (mode) {
+      var label = mode === 'technical'
+        ? 'Technical view: the System 3 RNG Rolodex behind these lines'
+        : 'Messenger view: this conversation as System 3 directed it';
+      var b = make('button', 'sp-band-reopen sp-band-always sp-s3-toggle');
+      b.type = 'button';
+      b.title = label;
+      b.setAttribute('aria-label', label);
+      b.setAttribute('aria-pressed', 'false');
+      b.innerHTML = folderIcon(mode === 'technical' ? 'm:casino' : 'c:chat', label)
+        || (mode === 'technical' ? 'T' : 'M');
+      b.addEventListener('click', function () { s3SetMode(mode); });
+      s3Buttons[mode] = b;
+      restore.appendChild(b);
+    });
+    /* [s3-header] System 3's bar, on this toolbar: its on-air pill in the
+       middle and its buttons at the right end (mountEmbedded's chrome),
+       shown only while one of its views is up - see s3Chrome(). */
+    var s3Air = make('span', 'sp-s3-air');
+    s3Air.id = 'spS3Air';
+    s3Air.hidden = true;
+    var s3Tools = make('span', 'sp-s3-tools');
+    s3Tools.id = 'spS3Tools';
+    s3Tools.hidden = true;
+    restore.appendChild(s3Air);
+    restore.appendChild(s3Tools);
     top.appendChild(bands);
     top.appendChild(restore);
     right.appendChild(top);
@@ -15280,6 +15906,11 @@
       if (chip) chip.classList.toggle('adrift', !follow);
     });
     right.appendChild(script);
+    /* System 3's views, over the script in the script's own cell. */
+    var s3Pane = make('div', 'sp-s3');
+    s3Pane.id = 'spS3';
+    s3Pane.hidden = true;
+    right.appendChild(s3Pane);
 
     /* #1260: DOUBLE-TAP THE SCRIPT TO READ IT PROPERLY.
      *
@@ -15556,8 +16187,7 @@
       itinConversationTurns: itinConversationTurns,
       itinConversationSections: itinConversationSections,
       itinBanked: itinBanked, itinAired: itinAired,
-      folderRatioControls: folderRatioControls, folderH3Controls: folderH3Controls,
-      folderSample: folderSample,
+      folderRatioControls: folderRatioControls, folderSample: folderSample,
       bankSlotText: bankSlotText, planReviewLabel: planReviewLabel,
       rejectionLabel: rejectionLabel, rejectionGlyph: rejectionGlyph,
       rejectionPageItems: rejectionPageItems, rejectionListUrl: rejectionListUrl,

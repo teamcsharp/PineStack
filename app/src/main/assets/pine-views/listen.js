@@ -659,12 +659,36 @@
       && !!(tv && typeof tv.endless === "function" && tv.endless()
       && typeof tv.playing === "function" && onScreen());
     const clip = on ? tv.playing() : null;
+    /* The native surface is the authoritative endless picture. A normal
+       Listen page shows it as PIP; bare Listen enlarges the same surface. */
+    const native = !!(tv && typeof tv.nativeWallActive === "function"
+      && tv.nativeWallActive());
     const want = clip && clip.url ? absolute(String(clip.url)) : "";
     /* #1173: the SLOT, not the file. The station's plan can hand the same
      * clip out twice, and two turns of it are two different pictures with
      * two different start stamps - which matters now that the seek below
      * reads that stamp. Keyed on the url as before, plus the moment. */
     var slot = want ? want + "#" + String((clip && clip.at) || 0) : "";
+
+    if (native && want) {
+      if (!endlessBackdrop) {
+        endlessBackdrop = true;
+        if (still) still.style.opacity = "0";
+        const second = document.getElementById("plBack2");
+        if (second) second.style.opacity = "0";
+      }
+      endlessWaiting = false;
+      showPlexus(false);
+      if (vid) {
+        vid.pause(); vid.hidden = true; vid.classList.remove("pl-endless");
+        delete vid.dataset.endless; vid.removeAttribute("src");
+        try { vid.load(); } catch (err) { /* native video remains live */ }
+      }
+      /* The native surface is now the one picture for Listen. Keep it
+         visible as PIP instead of applying the old web-wallpaper veil. */
+      if (typeof tv.veil === "function") tv.veil(false);
+      return;
+    }
 
     if (want && vid) {
       if (!endlessBackdrop) {

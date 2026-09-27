@@ -100,6 +100,7 @@ object ViewAssets {
                                   // rooms and the made-against-heard account
         "three-full.js",          // every 3JS scene, full screen on glass
         "line-deep.js",           // why a line was said, and how often
+        "line-repeat.js",         // why a line came round again (after line-deep, as on the desk)
         "ad-viewer.js",           // Pine Box Gallery carousel and signed playback
         "prompt-history.js",      // prompt records and fullscreen controls
         "line-actions.js",        // hold a line: pad, keep, or examine
@@ -137,6 +138,7 @@ object ViewAssets {
         "lock.css",               // the locked screen
         "vote-arrows.css",        // the up and down arrows
         "line-actions.css",       // the hold sheet and the examination
+        "line-repeat.css",        // the repeat sheet; its own <link> needs a script URL the bundle has not got
         "prompt-history.css",     // prompt history and fullscreen top bar
         "sfx-tv.css",             // #1306b: the set, its glass and its sheet
         "clip-doctor.css",        // #1361b: the doctor's sheet

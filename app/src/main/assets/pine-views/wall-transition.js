@@ -574,6 +574,14 @@
 
   Plexus.prototype.dispose = function dispose() {
     this.stop();
+    var released = new Set();
+    if (this.scene && this.scene.traverse) this.scene.traverse(function (node) {
+      [node.geometry].concat(node.material || []).forEach(function (resource) {
+        if (resource && resource.dispose && !released.has(resource)) {
+          released.add(resource); resource.dispose();
+        }
+      });
+    });
     if (this.renderer) { try { this.renderer.dispose(); } catch (err) { /* gone */ } }
     this.renderer = null;
     this.points = [];

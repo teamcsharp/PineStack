@@ -76,6 +76,19 @@ class StationClient(private val configStore: ConfigStore) {
         .retryOnConnectionFailure(false)
         .build()
 
+    /* AND A QUICKER ONE FOR "THE NETWORK JUST CHANGED". When the
+     * ConnectivityManager has just said the default network came or went,
+     * the terminal already knows its road is suspect and the only question
+     * is which of three addresses answers NOW. A second and a half is
+     * twenty times the tailnet's measured round trip; a road that needs
+     * longer than that is found by the next ordinary probe, which keeps
+     * the four seconds above. */
+    private val quickProbe: OkHttpClient = probe.newBuilder()
+        .connectTimeout(1500, TimeUnit.MILLISECONDS)
+        .readTimeout(1500, TimeUnit.MILLISECONDS)
+        .callTimeout(2500, TimeUnit.MILLISECONDS)
+        .build()
+
     private val http: OkHttpClient = OkHttpClient.Builder()
         /* Short connect timeout: the station is one hop away on the LAN. If
          * it has not accepted a socket in three seconds it is not there, and
@@ -90,7 +103,13 @@ class StationClient(private val configStore: ConfigStore) {
          * of being starved by chatty clients (desktop/renderer/sampler-feed.js
          * header); a terminal that opens a fresh connection per poll is
          * exactly that kind of client. */
-        .connectionPool(okhttp3.ConnectionPool(4, 5, TimeUnit.MINUTES))
+        /* SIXTY SECONDS IDLE, NOT FIVE MINUTES. The station's keep-alive
+         * is 75 s, and the side that hangs up first must be this one: a
+         * pooled socket the server has already closed is only found out
+         * when a request is written to it, and for a POST that is a
+         * request the client will not repeat. Evicting at 60 s means the
+         * pool never holds a socket the server has given up on. */
+        .connectionPool(okhttp3.ConnectionPool(4, 60, TimeUnit.SECONDS))
         .retryOnConnectionFailure(true)
         .build()
 
@@ -400,10 +419,10 @@ class StationClient(private val configStore: ConfigStore) {
      *  about three addresses in a row, and a slow failure on the first would
      *  make the terminal feel broken while it worked its way to the one that
      *  actually works. */
-    suspend fun answers(base: String): Boolean = try {
+    suspend fun answers(base: String, quick: Boolean = false): Boolean = try {
         val (code, body) = call(
             Request.Builder().url(base.trimEnd('/') + "/healthz").get().build(),
-            using = probe)
+            using = if (quick) quickProbe else probe)
         /* THE STATION'S OWN ANSWER, not merely an answer.
          *
          * This took 200..499 first, inherited from the old reachable() where
@@ -428,10 +447,10 @@ class StationClient(private val configStore: ConfigStore) {
      *  fails, which is exactly when the tablet has moved between the LAN and
      *  the tailnet - so settling here means no second timer and no separate
      *  "the network changed" listener to get wrong. */
-    suspend fun reachable(): Boolean {
+    suspend fun reachable(quick: Boolean = false): Boolean {
         val cfg = configStore.read()
         for (road in Reach.candidates(cfg)) {
-            if (!answers(road)) continue
+            if (!answers(road, quick)) continue
             Reach.settle(cfg) { it == road }
             return true
         }

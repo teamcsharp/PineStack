@@ -223,6 +223,7 @@
   var parodyOwnsSurface = false;
   var parodyPolling = Object.create(null);
   var parodyQueueTimer = 0;
+  var parodyCacheRelease = null;
   var radialWrap = null;            // the shared hold menu for every video surface
   var radialMedia = null;
   var radialMediaWasPlaying = false;
@@ -1018,10 +1019,13 @@
         source_type: String(row.source_type || 'recent'),
         source_generation: String(row.source_generation || '')});
     };
+    /* The picker is a replay/examination surface first.  Rows that just
+       aired belong at its front; the durable library is only the long tail. */
+    heard.slice().reverse().forEach(add);
+    stripRows().filter(function (row) { return row.when === 'played' || row.when === 'now'; })
+      .reverse().forEach(add);
+    hist.slice().reverse().forEach(add);
     (older || []).forEach(add);
-    hist.forEach(add);
-    heard.forEach(add);
-    stripRows().forEach(add);
     add(seed);
     return source;
   }
@@ -1039,6 +1043,9 @@
     try { if (parodyDictationRelease) parodyDictationRelease(); }
     catch (err1) { /* the audio restore is best effort during teardown */ }
     parodyDictationRelease = null;
+    try { if (parodyCacheRelease) parodyCacheRelease(); }
+    catch (errCache) { /* cache cleanup never prevents close */ }
+    parodyCacheRelease = null;
     try { if (parodyVideo) { parodyVideo.pause(); parodyVideo.removeAttribute('src'); parodyVideo.load(); } }
     catch (err2) { /* already gone */ }
     parodyVideo = null;
@@ -1216,8 +1223,21 @@
     var stage = document.createElement('div');
     stage.className = 'sfx-tv-parody-stage is-loading';
     var source = document.createElement('video');
-    source.controls = true; source.playsInline = true; source.preload = 'metadata';
+    source.controls = true; source.playsInline = true; source.preload = 'auto';
     stage.appendChild(source); parodyVideo = source;
+    /* A second, muted decoder warms the tail before the operator reaches it.
+       The visible video can then move on every trim tick without waiting for a
+       remote range request.  It never owns audio or a visible frame. */
+    var tailPrimer = document.createElement('video');
+    tailPrimer.className = 'sfx-tv-parody-primer'; tailPrimer.muted = true;
+    tailPrimer.playsInline = true; tailPrimer.preload = 'auto';
+    stage.appendChild(tailPrimer);
+    var retrySource = document.createElement('button'); retrySource.type = 'button';
+    retrySource.className = 'sfx-tv-source-retry'; retrySource.title = 'Play or retry reference video';
+    retrySource.setAttribute('aria-label', retrySource.title);
+    var sourceLogo = document.createElement('img'); sourceLogo.alt = 'Pine Box';
+    sourceLogo.src = root.__pineLogo || base.replace(/\/+$/, '') + '/spark/asset/pinebox.png';
+    retrySource.appendChild(sourceLogo); stage.appendChild(retrySource);
     var nav = document.createElement('div'); nav.className = 'sfx-tv-parody-nav';
     var prev = document.createElement('button'); prev.type = 'button'; prev.textContent = 'Previous';
     var label = document.createElement('span');
@@ -1241,7 +1261,10 @@
     var outControl = trimRow('Out');
     trim.appendChild(trimSpan);
     var field = document.createElement('textarea');
+    field.setAttribute('data-pine-mic-owned', '');
     field.placeholder = 'Describe the Pine Box FM parody or dictate it with the microphone...';
+    var fieldWrap = document.createElement('div'); fieldWrap.className = 'sfx-tv-parody-field';
+    fieldWrap.appendChild(field);
     var controls = document.createElement('div'); controls.className = 'sfx-tv-parody-actions';
     var mic = document.createElement('button'); mic.type = 'button'; mic.className = 'sfx-tv-parody-mic';
     mic.title = 'Dictate the H3 prompt'; mic.setAttribute('aria-label', mic.title);
@@ -1258,7 +1281,7 @@
     var listeningWords = document.createElement('span');
     listeningWords.textContent = 'Listening to your dictation. Device audio is muted.';
     listening.appendChild(listeningPulse); listening.appendChild(listeningWords);
-    controls.appendChild(mic); controls.appendChild(listening); controls.appendChild(send);
+    fieldWrap.appendChild(mic); controls.appendChild(listening); controls.appendChild(send);
     var status = document.createElement('div'); status.className = 'sfx-tv-parody-status';
     status.setAttribute('role', 'status');
     var queuePanel = document.createElement('div'); queuePanel.className = 'sfx-tv-parody-queue';
@@ -1270,8 +1293,8 @@
     var queueActions = document.createElement('div');
     queueActions.className = 'sfx-tv-parody-queue-actions';
     var freeIdle = document.createElement('button'); freeIdle.type = 'button';
-    freeIdle.textContent = 'Free idle Comfy cache';
-    freeIdle.title = 'Only unloads when ComfyUI is not rendering';
+    freeIdle.textContent = 'Make room for H3';
+    freeIdle.title = 'Releases idle Comfy and Ollama models; active renders stay protected';
     var relieveOne = document.createElement('button'); relieveOne.type = 'button';
     relieveOne.textContent = 'Host cache relief';
     relieveOne.title = 'Run pressure relief tier 1; never tier 3 or active voice engines';
@@ -1286,7 +1309,7 @@
     queuePanel.appendChild(queueCause); queuePanel.appendChild(queueActions);
     queuePanel.appendChild(queueHistory);
     box.appendChild(head); box.appendChild(stage); box.appendChild(nav); box.appendChild(trim);
-    box.appendChild(field); box.appendChild(controls); box.appendChild(status);
+    box.appendChild(fieldWrap); box.appendChild(controls); box.appendChild(status);
     box.appendChild(queuePanel);
     shade.appendChild(box); document.body.appendChild(shade); parodyWrap = shade;
 
@@ -1337,7 +1360,32 @@
             + (job.frames ? ' / ' + job.frames + ' frames' : '')
             + (duration > 0 ? ' / ' + Math.round(duration) + 's' : '')
             + (job.reason ? ' / ' + job.reason : '');
-          row.appendChild(title); row.appendChild(detail); historyRows.appendChild(row);
+          row.appendChild(title); row.appendChild(detail);
+          if (!/^(done|cancelled)$/i.test(String(job.status || ''))) {
+            var actions = document.createElement('span');
+            actions.className = 'sfx-tv-parody-queue-row-actions';
+            var repair = document.createElement('button'); repair.type = 'button';
+            repair.textContent = 'Repair'; repair.title = 'Recheck this task and retry it if H3 lost it';
+            var cancel = document.createElement('button'); cancel.type = 'button';
+            cancel.textContent = 'Cancel'; cancel.title = 'Cancel this task permanently';
+            var act = function (button, action) {
+              button.disabled = true;
+              status.textContent = action === 'cancel' ? 'Cancelling stinger...' : 'Repairing stinger...';
+              post('/api/comfy/workshop/parody-queue/' + encodeURIComponent(job.id) + '/' + action, {})
+                .then(function (got) { status.textContent = String(got && got.say || 'Queue updated.'); refreshQueue(); },
+                  function (err) { status.textContent = String((err && err.message) || err); })
+                .then(function () { button.disabled = false; });
+            };
+            repair.addEventListener('click', function () { act(repair, 'repair'); });
+            cancel.addEventListener('click', function () {
+              if (cancel.dataset.confirm !== 'yes') {
+                cancel.dataset.confirm = 'yes'; cancel.textContent = 'Cancel task?'; return;
+              }
+              act(cancel, 'cancel');
+            });
+            actions.appendChild(repair); actions.appendChild(cancel); row.appendChild(actions);
+          }
+          historyRows.appendChild(row);
           if (job.status === 'running' && job.prompt_id) parodyWatch(job.prompt_id, status);
         });
       }, function (err) {
@@ -1356,7 +1404,7 @@
         .then(function () { button.disabled = false; });
     };
     freeIdle.addEventListener('click', function () {
-      relief(freeIdle, '/api/comfy/idle/now', {mode: 'free'});
+      relief(freeIdle, '/api/h3/relieve', {force: true});
     });
     relieveOne.addEventListener('click', function () {
       relief(relieveOne, '/api/orchestrator/pressure/relieve?tier=1', {});
@@ -1369,6 +1417,67 @@
     var trimById = Object.create(null);
     var trimStart = 0, trimEnd = 0, trimDuration = 0;
     var trimReady = false, trimUsable = false, submitting = false;
+    var cacheAbort = null, cacheUrl = '', cacheKey = '', cacheRevision = 0;
+    var trimSeekFrame = 0;
+    var MAX_LOCAL_REFERENCE_BYTES = 32 * 1024 * 1024;
+    var releaseCache = function () {
+      cacheRevision += 1;
+      try { if (cacheAbort) cacheAbort.abort(); } catch (err) {}
+      cacheAbort = null;
+      try { if (cacheUrl) URL.revokeObjectURL(cacheUrl); } catch (err2) {}
+      cacheUrl = ''; cacheKey = '';
+      try { tailPrimer.pause(); tailPrimer.removeAttribute('src'); tailPrimer.load(); } catch (err3) {}
+    };
+    parodyCacheRelease = releaseCache;
+    var boundedBlob = function (response) {
+      var length = Number(response.headers && response.headers.get('content-length'));
+      if (isFinite(length) && length > MAX_LOCAL_REFERENCE_BYTES) return Promise.reject(new Error('reference exceeds local cache limit'));
+      if (!response.body || !response.body.getReader) return response.blob().then(function (blob) {
+        if (blob.size > MAX_LOCAL_REFERENCE_BYTES) throw new Error('reference exceeds local cache limit');
+        return blob;
+      });
+      var reader = response.body.getReader(), chunks = [], bytes = 0;
+      return new Promise(function (resolve, reject) {
+        var read = function () { reader.read().then(function (part) {
+          if (part.done) { resolve(new Blob(chunks, {type: response.headers.get('content-type') || 'video/mp4'})); return; }
+          bytes += part.value.byteLength;
+          if (bytes > MAX_LOCAL_REFERENCE_BYTES) { try { reader.cancel(); } catch (err) {} reject(new Error('reference exceeds local cache limit')); return; }
+          chunks.push(part.value); read();
+        }, reject); };
+        read();
+      });
+    };
+    var primeTail = function (at) {
+      var url = cacheUrl || source.currentSrc || source.src;
+      if (!url || !isFinite(at)) return;
+      var seek = function () { try { tailPrimer.currentTime = Math.max(0, at); } catch (err) {} };
+      if (tailPrimer.src !== url) {
+        tailPrimer.src = url; tailPrimer.load();
+        tailPrimer.addEventListener('loadedmetadata', seek, {once:true});
+      } else if (tailPrimer.readyState >= 1) seek();
+    };
+    var cacheReference = function (row) {
+      releaseCache();
+      var url = parodySourceUrl(row), revision = cacheRevision;
+      cacheKey = String(row.id || '');
+      if (!root.fetch || /^blob:|^data:/i.test(url)) return;
+      cacheAbort = root.AbortController ? new root.AbortController() : null;
+      var opts = {cache:'force-cache'};
+      if (cacheAbort) opts.signal = cacheAbort.signal;
+      root.fetch(url, opts).then(function (response) {
+        if (!response.ok) throw new Error('reference fetch failed');
+        return boundedBlob(response);
+      }).then(function (blob) {
+        if (parodyWrap !== shade || revision !== cacheRevision || cacheKey !== String(row.id || '')) return;
+        cacheUrl = URL.createObjectURL(blob);
+        /* Keep the same visual source until metadata is known.  The local
+           replacement preserves the latest scrub target, including a target
+           selected while a network seek was still happening. */
+        var resumeAt = pendingTrimSeek !== null ? pendingTrimSeek : Number(source.currentTime) || 0;
+        source.pause(); source.src = cacheUrl; source.load(); pendingTrimSeek = resumeAt;
+        primeTail(Math.max(trimStart, trimEnd - 1) / 10);
+      }).catch(function () { /* remote playback remains a valid fallback */ });
+    };
     var trimTime = function (tenths) {
       return Math.floor(tenths / 600) + ':'
         + String(Math.floor(tenths / 10) % 60).padStart(2, '0')
@@ -1407,7 +1516,11 @@
       trimReady = true;
       send.disabled = submitting;
       showTrim();
-      if (trimUsable) source.currentTime = trimStart / 10;
+      if (trimUsable) {
+        var initial = pendingTrimSeek !== null ? pendingTrimSeek : trimStart / 10;
+        seekTrim(initial);
+        primeTail(Math.max(trimStart, trimEnd - 1) / 10);
+      }
     };
     var wanted = clipId(seed);
     for (var i = 0; i < rows.length; i += 1) if (rows[i].id === wanted) index = i;
@@ -1416,28 +1529,61 @@
        assembly cover replaces. Keep an independent CSS gate as well as the
        Three.js cover: if the cover script is late or a source errors before
        it can build, the native badge still never receives one painted frame. */
+    var pendingTrimSeek = null;
+    var seekTrim = function (at) {
+      source.pause(); pendingTrimSeek = at;
+      if (trimSeekFrame) root.cancelAnimationFrame(trimSeekFrame);
+      trimSeekFrame = root.requestAnimationFrame(function () {
+        trimSeekFrame = 0;
+        /* Assigning while seeking is intentional: it replaces the stale
+           target rather than making the trim lag one interaction behind. */
+        if (source.readyState >= 1 && pendingTrimSeek !== null) {
+          try { source.currentTime = pendingTrimSeek; } catch (err) {}
+        }
+      });
+    };
     var previewWaiting = function () { stage.classList.add('is-loading'); };
     var previewReady = function () {
       if (source.readyState >= 2 && source.videoWidth > 0) {
         stage.classList.remove('is-loading');
       } else previewWaiting();
     };
-    ['loadstart', 'emptied', 'waiting', 'stalled', 'error', 'abort']
+    ['loadstart', 'emptied', 'error', 'abort']
       .forEach(function (name) { source.addEventListener(name, previewWaiting); });
-    ['loadeddata', 'playing']
+    ['waiting', 'stalled'].forEach(function (name) {
+      source.addEventListener(name, function () { if (source.readyState < 2) previewWaiting(); });
+    });
+    ['loadeddata', 'playing', 'canplay', 'seeked']
       .forEach(function (name) { source.addEventListener(name, previewReady); });
+    source.addEventListener('seeked', function () {
+      if (pendingTrimSeek !== null && Math.abs(source.currentTime - pendingTrimSeek) > .025) {
+        source.currentTime = pendingTrimSeek; return;
+      }
+      pendingTrimSeek = null; previewReady();
+      if (parodyCover && parodyCover.reveal && source.readyState >= 2) parodyCover.reveal();
+    });
+    source.addEventListener('error', function () {
+      status.textContent = 'The reference video could not load. Tap the Pine Box logo to retry.';
+      send.disabled = true;
+    });
+    retrySource.addEventListener('click', function () {
+      if (!source.getAttribute('src') || source.error) paint();
+      source.play().catch(function (error) { status.textContent = 'Reference playback failed: ' + error.message; });
+    });
     source.addEventListener('loadedmetadata', setTrim);
     inControl.slider.addEventListener('input', function () {
       if (!trimUsable) return;
       trimStart = Math.max(0, Math.min(Number(inControl.slider.value), trimDuration - 22));
       trimEnd = Math.max(trimStart + 22, Math.min(trimEnd, trimStart + 150, trimDuration));
-      showTrim(); source.currentTime = trimStart / 10;
+      showTrim(); seekTrim(trimStart / 10);
     });
     outControl.slider.addEventListener('input', function () {
       if (!trimUsable) return;
       trimEnd = Math.max(trimStart + 22,
         Math.min(Number(outControl.slider.value), trimStart + 150, trimDuration));
-      showTrim(); source.currentTime = Math.max(trimStart, trimEnd - 1) / 10;
+      showTrim();
+      var tail = Math.max(trimStart, trimEnd - 1) / 10;
+      primeTail(tail); seekTrim(tail);
     });
     source.addEventListener('play', function () {
       if (trimUsable && (source.currentTime < trimStart / 10 ||
@@ -1455,6 +1601,8 @@
       label.textContent = (index + 1) + ' of ' + rows.length + ' - ' + row.sting;
       prev.disabled = index <= 0; next.disabled = index >= rows.length - 1;
       trimReady = false; trimUsable = false; trim.hidden = true;
+      pendingTrimSeek = null;
+      releaseCache();
       send.disabled = true;
       previewWaiting();
       try { source.pause(); } catch (err) { /* changing source */ }
@@ -1466,6 +1614,7 @@
       }
       source.removeAttribute('poster');
       source.src = parodySourceUrl(row); source.load();
+      cacheReference(row);
     };
     prev.addEventListener('click', function () { if (index > 0) { index -= 1; paint(); } });
     next.addEventListener('click', function () { if (index + 1 < rows.length) { index += 1; paint(); } });
@@ -1827,6 +1976,14 @@
       inspect(clip, function (text) {
         if (detail) detail.textContent = String(text || '');
       }, open);
+    });
+    item('Previous video', 'c:caret--left', 'previous', function () {
+      radialClose(false, false);
+      step(clip, 'prev', function () {});
+    });
+    item('Next video', 'c:caret--right', 'next', function () {
+      radialClose(false, false);
+      step(clip, 'next', function () {});
     });
     item('Make favorite', 'c:favorite--filled', 'favorite', function () {
       if (typeof actions.favorite === 'function') {
@@ -2464,24 +2621,26 @@
     /* Held locally, because every handler and timer below can fire after
      * the module's own references have moved on. */
     var screen = video;
-    screen.dataset.pineSilentPicture = clip.silent_picture ? '1' : '0';
-    screen.muted = !!clip.silent_picture;
-    var receiptAt = 0, receiptClosed = false;
-    function reportVideo(event, error) {
-      if (receiptClosed) return;
-      if (event === 'ended' || event === 'error') receiptClosed = true;
-      videoReceipt(clip, event, screen, error);
-    }
-    screen.addEventListener('canplay', function () { reportVideo('canplay'); });
-    screen.addEventListener('playing', function () { reportVideo('playing'); });
-    screen.addEventListener('timeupdate', function () {
-      if (!screen.paused && now() - receiptAt > 2000) {
-        receiptAt = now(); reportVideo('playing');
+    if (screen) {
+      screen.dataset.pineSilentPicture = clip.silent_picture ? '1' : '0';
+      screen.muted = !!clip.silent_picture;
+      var receiptAt = 0, receiptClosed = false;
+      function reportVideo(event, error) {
+        if (receiptClosed) return;
+        if (event === 'ended' || event === 'error') receiptClosed = true;
+        videoReceipt(clip, event, screen, error);
       }
-    });
-    screen.addEventListener('ended', function () { reportVideo('ended'); });
-    screen.addEventListener('error', function () { reportVideo('error', 'Video decode or fetch failed'); });
-    screen.__pineReceiptClose = function () { reportVideo('error', 'Video player closed before completion'); };
+      screen.addEventListener('canplay', function () { reportVideo('canplay'); });
+      screen.addEventListener('playing', function () { reportVideo('playing'); });
+      screen.addEventListener('timeupdate', function () {
+        if (!screen.paused && now() - receiptAt > 2000) {
+          receiptAt = now(); reportVideo('playing');
+        }
+      });
+      screen.addEventListener('ended', function () { reportVideo('ended'); });
+      screen.addEventListener('error', function () { reportVideo('error', 'Video decode or fetch failed'); });
+      screen.__pineReceiptClose = function () { reportVideo('error', 'Video player closed before completion'); };
+    }
     var glass = tube;
     var done = false;
     var finish = function () {
@@ -5275,7 +5434,7 @@
     /* [#1212] it was muted for the warm and nothing else; [#1216] the
        level is the one that is set NOW, not the one that was set when it
        was warmed, and it is written before the element has been heard. */
-    try { el.muted = false; levelSet(el, level, false); } catch (err) { /* it plays */ }
+    try { el.muted = !!clip.silent_picture; levelSet(el, level, false); } catch (err) { /* it plays */ }
     return el;
   }
 
@@ -5421,6 +5580,26 @@
   var QUEUE_ROWS_MOST = 24;
 
   function queueTrim() {
+    /* #1463: A TIMED CUE IS A PLACE IN THE DIALOGUE, NOT RUNWAY.
+     *
+     * A long recorded round publishes all of its picture cues when the
+     * audible stream starts. Eight clips spread across two minutes can
+     * therefore be in this queue even though only the first one is due in
+     * seven seconds. Counting their MEDIA lengths as thirty seconds of
+     * runway dropped from the front until only the distant cues remained.
+     * The station ledger then correctly said every MP4 aired while the
+     * tablet never showed the cues nearest the dialogue being heard.
+     *
+     * The duration cap belongs to the back-to-back endless set. Ordinary
+     * station cues already carry exact `at` stamps and the server bounds
+     * their ring; retain those in chronological order. The hard row cap is
+     * still a final memory guard, and drops the farthest future cue rather
+     * than the next one owed. */
+    var timed = queue.some(function (clip) { return clip && !clip.endless; });
+    if (timed) {
+      while (queue.length > QUEUE_ROWS_MOST) queue.pop();
+      return;
+    }
     while (queue.length > QUEUE_ROWS_MOST) queue.shift();
     var held = 0, i;
     for (i = 0; i < queue.length; i += 1) {
@@ -5591,7 +5770,7 @@
          SFX dialogs (the editor and inspector) are different nodes and must
          still retire the native surface. */
       if (el === host
-          || /sfx-tv-frame|sfx-tv-host/.test(String(el.className || ''))) continue;
+          || /sfx-tv-frame|sfx-tv-host|pine-field-mics/.test(String(el.className || ''))) continue;
       if (r.right > x1 && r.left < x2 && r.bottom > y1 && r.top < y2) return true;
     }
     return false;
@@ -5708,25 +5887,15 @@
   function wallReconcile(st) {
     var bridge = api();
     if (!bridge || typeof bridge.videoWall !== 'function') return;
-    var want, wide, panelOwns;
+    var want, wide;
     try {
-      panelOwns = listenOwnsPicture();
-      /* [#1448] full-bleed while the listen view is bare - there is no
-         panel over the picture there, so the surface may have all of it.
-         An ordinary Listen view is the opposite: its HTML backdrop owns
-         the picture even when the floating set remembered fullscreen.
-         Letting that unrelated preference win hid both renderers. */
-      wide = !panelOwns && (fullWanted() || (listenUp() && listenBare()));
-      /* [#1448b] AND BARE OUTRANKS THE VEIL. listen.js veils this module
-         so the endless clip is not on screen twice (#1184/#1434), which
-         is right while the PAGE draws the wallpaper. Bare, the page is
-         not meant to draw it at all, so the veil is answering a question
-         nobody is asking - measured, the surface stayed
-         `{"on":true,"veiled":true}` on a bare view. The "twice" it guards
-         against is honoured by pageBackdrop(false) below instead. */
-      want = (!!veiled && !wide) || panelOwns || uiOverPicture();
+      /* Normal Listen keeps the native PIP visible. Fullscreen Listen uses
+         that same hardware surface full-bleed. There is never a second
+         WebView decoder trying to follow it. */
+      wide = fullWanted() || (listenUp() && listenBare());
+      want = uiOverPicture();
     } catch (err) { return; }
-    pageBackdrop(!wide);
+    pageBackdrop(!(wallHas || (st && st.on)) || want);
     var shapeChanged = (wallWide !== wide);
     if (!shapeChanged && st && typeof st.veiled === 'boolean'
         && !!st.veiled === want) return;
@@ -5908,6 +6077,26 @@
   }
 
   function wallRunning() { return wallHas; }
+
+  function repairEndless() {
+    var bridge = api();
+    if (!bridge || typeof bridge.videoWall !== 'function') {
+      return Promise.reject(new Error('This device has no native endless-video player.'));
+    }
+    wallWant = true;
+    return bridge.videoWall('repair', nativeWallRect()).then(function (got) {
+      var state = wallState(got);
+      wallHas = !!(state && state.on);
+      if (!wallHas) throw new Error((state && state.last_error) || 'The endless player did not restart.');
+      wallTakesOver();
+      wallReconcile(state);
+      wallFollow();
+      return state;
+    }, function (error) {
+      wallWant = null; wallHas = false;
+      throw error;
+    });
+  }
 
   async function poll() {
     wireDuck();                                            /* #1167 */
@@ -6595,6 +6784,23 @@
     matchRow.appendChild(matchDial);
     matchRow.appendChild(matchSay);
     paintMatch(null);
+    var repair = document.createElement('button');
+    repair.type = 'button';
+    repair.textContent = 'Repair endless video';
+    repair.setAttribute('aria-label', 'Repair endless video playback');
+    repair.setAttribute('style', 'min-height:36px;border-radius:8px;border:1px solid #2a7180;background:#102b31;color:#dfe7ee;cursor:pointer');
+    repair.addEventListener('click', function (ev) {
+      ev.stopPropagation();
+      repair.disabled = true;
+      note.textContent = 'Checking the cached native player and restoring its video surface...';
+      repairEndless().then(function (state) {
+        var queued = Number(state.queued) || 0;
+        note.textContent = 'Restored native endless video: ' + (state.playback || 'starting')
+          + ', ' + queued + ' clip' + (queued === 1 ? '' : 's') + ' queued.';
+      }, function (err) {
+        note.textContent = 'Repair could not restore video: ' + String((err && err.message) || err).slice(0, 130);
+      }).finally(function () { repair.disabled = false; });
+    });
     var close = document.createElement('button');
     close.type = 'button';
     close.textContent = 'Close';
@@ -6620,9 +6826,10 @@
         function (v) { return v + '% of his clips carry a picture (mp4 vs mp3)'; }, 'share'), note);
       box.insertBefore(row('Clip length the endless set aims for', 0, 60, 1, Number((st && st.length) || 0),
         function (v) { return v ? ('about ' + v + ' seconds (draws between ' + Math.round(v * 0.6) + ' and ' + Math.round(v * 1.6) + ')') : 'any length in the library'; }, 'length'), note);
+      box.insertBefore(repair, note);
       box.appendChild(close);
       note.textContent = String((st && st.say) || '');
-    }, function (err) { note.textContent = 'the station did not answer: ' + String((err && err.message) || err).slice(0, 60); box.appendChild(close); });
+    }, function (err) { note.textContent = 'the station did not answer: ' + String((err && err.message) || err).slice(0, 60); box.appendChild(repair); box.appendChild(close); });
   }
 
   function endlessFlip() {
@@ -6642,6 +6849,8 @@
        hide the floating set while the view shows the clip as wallpaper. */
     timeline: function () { return tlRead(); },   /* [#1219] */
     endless: function () { return !!endlessOn; },
+    nativeWallActive: function () { return !!wallHas; },
+    repairEndless: repairEndless,
     veil: function (on) {
       veiled = !!on;
       try { if (host) host.style.visibility = veiled ? 'hidden' : ''; } catch (err) { /* no set up */ }

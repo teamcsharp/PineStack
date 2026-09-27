@@ -59,12 +59,12 @@
 
   /* ------------------------------------------------------- the constants */
 
-  var CORNER_PX = 110;      /* the square at each corner a swipe may start in */
-  var COMMIT_PX = 150;      /* how far it must travel toward the centre */
-  var COMMIT_MS = 1500;     /* and how quickly */
-  var COMMIT_DEG = 35;      /* within this many degrees of the diagonal */
-  var JUDGE_PX = 40;        /* past this the direction is judged; short of it a
-                               wobble is still a wobble */
+  var MIN_ZONE_PX = 20;
+  var MAX_ZONE_PX = 120;
+  var DEFAULT_ZONE_PX = 42;
+  var MIN_SENSITIVITY = 0;
+  var MAX_SENSITIVITY = 100;
+  var DEFAULT_SENSITIVITY = 50;
 
   /* #1166: "Make sure I can also activate hot corners by tapping on the
    * corners. or clicking."
@@ -73,7 +73,8 @@
    * same pointerdown - same corner square, same gates, same glow - and the
    * two are told apart only at the up. These are the numbers that do it.
    *
-   * TAP_PX is deliberately UNDER JUDGE_PX. Short of JUDGE_PX the judge
+   * TAP_PX is deliberately under the early direction threshold. Short of
+   * that threshold the judge
    * returns 'going' and never rules on direction, so a press that stayed
    * inside TAP_PX cannot have been thrown out as "not toward the centre"
    * along the way - a tap and a failed swipe can therefore never be
@@ -83,7 +84,7 @@
    * TAP_MS leaves the long press alone. Half a second is far longer than a
    * tap on glass and far shorter than a deliberate hold, so anything that
    * wants press-and-hold in a corner later still has it to claim. */
-  var TAP_PX = 24;
+  var TAP_PX = 12;
   var TAP_MS = 500;
 
   var STORE = 'pineHotCorners';
@@ -138,7 +139,12 @@
   };
   var CORNER_WORDS = {tl: 'Top left', tr: 'Top right', bl: 'Bottom left', br: 'Bottom right'};
   var CORNERS = ['tl', 'tr', 'bl', 'br'];
-  var DEFAULTS = {enabled: true, tl: 'shot', tr: 'export', bl: 'inspect', br: 'sfx'};
+  var DEFAULTS = {
+    enabled: true,
+    tl: 'shot', tr: 'export', bl: 'inspect', br: 'sfx',
+    activationZonePx: DEFAULT_ZONE_PX,
+    sensitivity: DEFAULT_SENSITIVITY
+  };
   /* "Heard" - the row reached an output. `airing` is what the station
    * stamps on the row that is sounding now (lcd-dialogue.js reads it the
    * same way); prepared / held / analysis were written and never heard. */
@@ -148,6 +154,12 @@
   /* ------------------------------------------------------------ helpers */
 
   function now() { return Date.now(); }
+
+  function whole(value, fallback, min, max) {
+    value = Number(value);
+    if (!isFinite(value)) value = fallback;
+    return Math.max(min, Math.min(max, Math.round(value)));
+  }
 
   function merge(into, from) {
     for (var k in from) {
@@ -204,6 +216,38 @@
   function station() {
     if (!has('get')) return Promise.reject(new Error('no station bridge on this surface'));
     return Promise.resolve(bridge().get('/api/dj'));
+  }
+
+  /* A corner replay starts with a chat row, which has an opaque SFX id but
+   * deliberately no durable media capability.  Ask the station to mint a
+   * fresh signed source instead of giving an <audio> element a protected URL
+   * and letting it report the resulting HTML 401 as an unsupported codec. */
+  function stationGet(path) {
+    if (has('get')) return Promise.resolve(bridge().get(path));
+    if (typeof root.fetch !== 'function') return Promise.reject(new Error('no station connection'));
+    return stationKey().then(function (key) {
+      var opts = key ? {headers: {Authorization: 'Bearer ' + key}} : {};
+      return root.fetch(stationUrl(path), opts).then(function (res) {
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        return res.json();
+      });
+    });
+  }
+
+  function stationPost(path, payload) {
+    if (has('post')) return Promise.resolve(bridge().post(path, payload || {}));
+    if (typeof root.fetch !== 'function') return Promise.reject(new Error('no station connection'));
+    return stationKey().then(function (key) {
+      var headers = {'Content-Type': 'application/json'};
+      if (key) headers.Authorization = 'Bearer ' + key;
+      return root.fetch(stationUrl(path), {method: 'POST', headers: headers,
+        body: JSON.stringify(payload || {})}).then(function (res) {
+        return res.json().then(function (body) {
+          if (!res.ok) throw new Error(String((body && body.detail) || ('HTTP ' + res.status)));
+          return body;
+        });
+      });
+    });
   }
 
   /* The station key the way talk-dot's serverKey() finds it: the page's
@@ -285,8 +329,9 @@
   var cfg = merge({}, DEFAULTS);
 
   /* What a patch is allowed to say. A corner is one of the six actions or
-   * it is 'off'; `enabled` is a boolean; `ring` is the native side's own
-   * number (how long the replay ring keeps) and is carried, not judged. */
+   * it is 'off'; `enabled` is a boolean; the zone and sensitivity are
+   * bounded so a stale or malformed preference cannot cover the display;
+   * `ring` is the native side's own number and is carried, not judged. */
   function clean(patch) {
     var out = {};
     if (!patch || typeof patch !== 'object') return out;
@@ -296,6 +341,14 @@
       if (patch[c] === undefined || patch[c] === null) continue;
       var v = String(patch[c]).toLowerCase();
       out[c] = ACTIONS.indexOf(v) >= 0 ? v : 'off';
+    }
+    if (patch.activationZonePx !== undefined) {
+      out.activationZonePx = whole(patch.activationZonePx, DEFAULT_ZONE_PX,
+        MIN_ZONE_PX, MAX_ZONE_PX);
+    }
+    if (patch.sensitivity !== undefined) {
+      out.sensitivity = whole(patch.sensitivity, DEFAULT_SENSITIVITY,
+        MIN_SENSITIVITY, MAX_SENSITIVITY);
     }
     if (patch.ring !== undefined) out.ring = patch.ring;
     return out;
@@ -321,10 +374,30 @@
 
   /* ---------------------------------------------------------- the judge */
 
+  function activationZonePx() {
+    return whole(cfg.activationZonePx, DEFAULT_ZONE_PX, MIN_ZONE_PX, MAX_ZONE_PX);
+  }
+
+  /* Higher sensitivity makes a valid diagonal shorter, more forgiving and
+   * a little less hurried. The activation square is deliberately separate:
+   * it says where a gesture may start, while this says how clearly it must
+   * be made once it has started. */
+  function gestureProfile() {
+    var sensitivity = whole(cfg.sensitivity, DEFAULT_SENSITIVITY,
+      MIN_SENSITIVITY, MAX_SENSITIVITY);
+    return {
+      commitPx: Math.round(220 - sensitivity * 1.1),
+      commitMs: Math.round(1100 + sensitivity * 4),
+      commitDeg: Math.round(26 + sensitivity * 0.14),
+      judgePx: 24
+    };
+  }
+
   /* Which corner a point is in, or ''. Pure, so it can be tested. */
   function cornerAt(x, y, w, h) {
-    var left = x <= CORNER_PX, right = x >= w - CORNER_PX;
-    var top = y <= CORNER_PX, bottom = y >= h - CORNER_PX;
+    var zone = activationZonePx();
+    var left = x <= zone, right = x >= w - zone;
+    var top = y <= zone, bottom = y >= h - zone;
     if (top && left) return 'tl';
     if (top && right) return 'tr';
     if (bottom && left) return 'bl';
@@ -344,21 +417,21 @@
   /* One drag, judged: {state: 'going'|'commit'|'drop', progress, why}.
    * dx/dy are the pointer's travel from where it went down; ms the time.
    *
-   * The direction is judged once the finger has gone JUDGE_PX, not at the
-   * commit distance: a press at the top-left corner dragged straight down
-   * is a scroll, and it is handed back after 40 px rather than 150, so a
-   * corner is never a dead zone for scrolling. */
+   * The direction is judged early, rather than at the commit distance: a
+   * press at the top-left corner dragged straight down is a scroll and is
+   * handed back before a corner becomes a dead zone for scrolling. */
   function judge(corner, dx, dy, ms) {
-    if (ms > COMMIT_MS) return {state: 'drop', progress: 0, why: 'too slow'};
+    var profile = gestureProfile();
+    if (ms > profile.commitMs) return {state: 'drop', progress: 0, why: 'too slow'};
     var s = signs(corner);
     var ax = dx * s.x, ay = dy * s.y;          /* positive = toward the centre */
     var dist = Math.sqrt(dx * dx + dy * dy);
-    var progress = Math.max(0, Math.min(1, dist / COMMIT_PX));
-    if (dist < JUDGE_PX) return {state: 'going', progress: progress};
+    var progress = Math.max(0, Math.min(1, dist / profile.commitPx));
+    if (dist < profile.judgePx) return {state: 'going', progress: progress};
     if (ax <= 0 || ay <= 0) return {state: 'drop', progress: 0, why: 'not toward the centre'};
     var deg = Math.abs(Math.atan2(ay, ax) * 180 / Math.PI - 45);
-    if (deg > COMMIT_DEG) return {state: 'drop', progress: 0, why: 'off the diagonal'};
-    if (dist < COMMIT_PX) return {state: 'going', progress: progress};
+    if (deg > profile.commitDeg) return {state: 'drop', progress: 0, why: 'off the diagonal'};
+    if (dist < profile.commitPx) return {state: 'going', progress: progress};
     return {state: 'commit', progress: 1};
   }
 
@@ -513,11 +586,12 @@
     var corner = cornerAt(ev.clientX, ev.clientY, w, h);
     if (!corner) return;
     if ((cfg[corner] || 'off') === 'off') return;
-    /* #1166: `onControl` is decided HERE, where the finger actually
-     * landed, and is read only by the tap at the up - see onUp and
-     * overControl. The swipe does not consult it and is unchanged. */
+    /* A corner shortcut must never turn a button drag into a shortcut. The
+     * test is done at pointerdown, while the element under the finger is
+     * still known; that also leaves scroll and drag controls passive. */
+    if (overControl(ev.target)) return;
     live = {id: ev.pointerId, corner: corner, x: ev.clientX, y: ev.clientY,
-            t: now(), onControl: overControl(ev.target)};
+            t: now()};
     glowShow(corner, 0);
   }
 
@@ -566,8 +640,7 @@
       var dist = Math.sqrt(dx * dx + dy * dy);
       var ms = now() - was.t;
       var what = cfg[was.corner] || 'off';
-      if (was.onControl                      /* somebody else's press */
-          || dist > TAP_PX                   /* it was going somewhere */
+      if (dist > TAP_PX                       /* it was going somewhere */
           || ms > TAP_MS                     /* a press, not a tap */
           || sheets.length                   /* a sheet owns the screen now */
           || !cfg.enabled
@@ -979,11 +1052,21 @@
       dropTab();
     }
 
+    /* [one-bar] the editor's own bar carries the grip now: it posts the
+       drag here, and the rig parks or springs home exactly as if the
+       finger were on the handle. */
+    function dragStart() { if (dead) return; drag = {id: -1, x: 0, from: at}; place(at, false); }
+    function dragMove(dx) { if (!drag || drag.id !== -1) return; place(drag.from + Number(dx || 0), false); }
+    function dragEnd() { if (!drag || drag.id !== -1) return; drag = null; settle(); }
+
     return {
       handle: handle,
       away: away,
       home: home,
       toggle: toggle,
+      dragStart: dragStart,
+      dragMove: dragMove,
+      dragEnd: dragEnd,
       isAway: function () { return side; },
       destroy: destroy
     };
@@ -1719,19 +1802,17 @@
   var videoEditor = null;
   var captureBusy = false;
 
-  function editorPath(sourceId, secondaryId) {
+  function editorPath(sourceId) {
     sourceId = String(sourceId || '');
     if (!/^[0-9a-f]{32}$/.test(sourceId)) throw new Error('invalid video source identity');
-    secondaryId = String(secondaryId || '');
-    if (secondaryId && !/^[0-9a-f]{32}$/.test(secondaryId)) throw new Error('invalid secondary video source identity');
-    return '/video-editor/?source=' + sourceId
-      + (secondaryId ? '&secondary=' + secondaryId + '&parody=1' : '');
+    return '/video-editor/?source=' + sourceId + '&chrome=host';   /* [one-bar] */
   }
 
   function editorMessage(event, frameWindow, origin) {
     if (!event || event.source !== frameWindow || event.origin !== origin) return '';
     var kind = event.data && event.data.type;
-    return kind === 'pine-video-editor-close' || kind === 'pine-video-editor-export' ? kind : '';
+    return kind === 'pine-video-editor-close' || kind === 'pine-video-editor-export'
+      || kind === 'pine-video-editor-slide' || kind === 'pine-video-editor-drag' ? kind : '';   /* [one-bar] */
   }
 
   /* [#1242] THE EDITOR IS AN IFRAME AND CANNOT HOLD THE KEY.
@@ -1767,20 +1848,19 @@
   /* Keep the station document and its player alive underneath the editor.
    * The source is an opaque station identity; returned URLs cannot navigate
    * the native bridge to another host. Export notifications never save files. */
-  function openVideoEditor(sourceId, secondaryId) {
-    var url = stationUrl(editorPath(sourceId, secondaryId));
-    var splice = !!secondaryId;
+  function openVideoEditor(sourceId) {
+    var url = stationUrl(editorPath(sourceId));
     var origin = new root.URL(url, root.location.href).origin;
     if (videoEditor) videoEditor.close();
     var box = make('section', 'hc-video-editor');
     box.setAttribute('role', 'dialog');
-    box.setAttribute('aria-label', splice ? 'Video splice editor' : 'Screen recording editor');
+    box.setAttribute('aria-label', 'Screen recording editor');
     var bar = make('div', 'hc-video-editor-bar');
-    bar.appendChild(make('span', '', splice ? 'Video splice editor' : 'Screen recording'));
+    bar.appendChild(make('span', '', 'Screen recording'));
     var back = button('hc-btn', 'Close editor');
     bar.appendChild(back);
     var frame = make('iframe', 'hc-video-editor-frame');
-    frame.title = splice ? 'Splice original and generated videos' : 'Edit screen recording';
+    frame.title = 'Edit screen recording';
     frame.setAttribute('allow', 'autoplay; fullscreen');
     frame.src = url;
     /* [#1221] "I want to be able to slide it out of the screen so that way I
@@ -1842,8 +1922,15 @@
           + String((err && err.message) || err), true);
       }
     }
+    /* [one-bar] "there's three top bars and there shouldn't be. There should
+     * be only one." The editor's own toolbar is the one bar: it carries the
+     * grip, the road's name, Slide away and the close X (video-editor.js,
+     * ?chrome=host). The rig stays - it owns the parking and the ink pad -
+     * with its handle hidden; the sheet's own bar is built (its Close is
+     * still a road out) but never shown. */
+    editorRig.handle.classList.add('hc-host-chrome');
+    bar.hidden = true;
     box.appendChild(editorRig.handle);                                /* [#1221] */
-    box.appendChild(bar);
     box.appendChild(frame);
     doc.body.appendChild(free);                                       /* [#1221] */
     doc.body.appendChild(box);
@@ -1894,6 +1981,13 @@
       var kind = editorMessage(event, frame.contentWindow, origin);
       if (kind === 'pine-video-editor-close') close();
       else if (kind === 'pine-video-editor-export') toast('Edited video is ready');
+      else if (kind === 'pine-video-editor-slide') editorRig.toggle();            /* [one-bar] */
+      else if (kind === 'pine-video-editor-drag') {                               /* [one-bar] */
+        var said = (event.data && event.data.detail) || {};
+        if (said.phase === 'start') editorRig.dragStart();
+        else if (said.phase === 'move') editorRig.dragMove(said.dx);
+        else editorRig.dragEnd();
+      }
       else editorPermitAsk(event, frame.contentWindow, origin);        /* [#1242] */
     }
     back.addEventListener('click', close);
@@ -2134,14 +2228,27 @@
 
   /* ------------------------------------------ "sfx": the last clip again */
 
+  /* The chat row's `sfx` field is a human label, while `sfx_sample_id` is
+   * the durable opaque identifier accepted by replay-source. Never pass a
+   * label back to that API as though it were an ID. */
+  function replaySampleId(row) {
+    var keys = [row && row.sfx_sample_id, row && row.sfx_id,
+      row && row.sample_id, row && row.sfx];
+    for (var i = 0; i < keys.length; i += 1) {
+      var candidate = String(keys[i] || '').toLowerCase();
+      if (/^[a-f0-9]{16}$/.test(candidate)) return candidate;
+    }
+    return '';
+  }
+
   /* The newest SFX row that has something to play. The desk's own cues
-   * (a hang-up, a ring) carry sfx:'' and no url - they are the station's
-   * bookkeeping, not a clip. */
+   * (a hang-up, a ring) carry no canonical source and no URL - they are
+   * station bookkeeping, not a replayable clip. */
   function lastSfx(chat) {
     for (var i = (chat || []).length - 1; i >= 0; i -= 1) {
       var r = chat[i];
       if (!r || String(r.kind || '') !== 'sfx') continue;
-      if (r.url || r.sfx || r.sfx_sample_id) return r;
+      if (r.url || replaySampleId(r)) return r;
     }
     return null;
   }
@@ -2159,7 +2266,7 @@
    * is marked as the sampler's own so the air tap does not record it
    * back into its ring, the broadcast is ducked while it plays, and every
    * road out releases the duck. */
-  function playAudio(src, name) {
+  function playAudio(src, name, onPlaying) {
     stopAudio();
     var audio = new Audio(src);
     if (root.PineAir && typeof root.PineAir.mine === 'function') root.PineAir.mine(audio);
@@ -2184,10 +2291,268 @@
     try { p = audio.play(); } catch (e) { p = Promise.reject(e); }
     Promise.resolve(p).then(function () {
       toast('replaying ' + name);
+      if (typeof onPlaying === 'function') onPlaying();
     }, function (err) {
       stopAudio();
       toast('could not replay ' + name + ': ' + String((err && err.message) || err), true);
     });
+  }
+
+  var STINGER_HISTORY_STORE = 'pineH3StingerHistory';
+  var STINGER_HISTORY_LIMIT = 24;
+
+  function stingerHistory() {
+    try {
+      var parsed = JSON.parse(root.localStorage.getItem(STINGER_HISTORY_STORE) || '[]');
+      if (!Array.isArray(parsed)) return [];
+      return parsed.filter(function (item) {
+        return item && typeof item === 'object' &&
+          (typeof item.direction === 'string' || typeof item.spoken_copy === 'string');
+      }).slice(0, STINGER_HISTORY_LIMIT);
+    } catch (e) { return []; }
+  }
+
+  function saveStingerHistory(rows) {
+    try { root.localStorage.setItem(STINGER_HISTORY_STORE,
+      JSON.stringify(rows.slice(0, STINGER_HISTORY_LIMIT))); } catch (e) { /* local only */ }
+  }
+
+  function stingerTime(value) {
+    value = Math.max(0, Number(value) || 0);
+    var minutes = Math.floor(value / 60);
+    var seconds = Math.floor(value % 60);
+    var tenths = Math.floor((value - Math.floor(value)) * 10);
+    return minutes + ':' + String(seconds).padStart(2, '0') + '.' + tenths;
+  }
+
+  function stingerField(label, hint, rows) {
+    var wrap = make('div', 'hc-stinger-field');
+    wrap.setAttribute('data-pine-mic-container', '');
+    wrap.appendChild(make('span', 'hc-stinger-label', label));
+    var field = make('textarea', 'hc-stinger-text');
+    field.rows = rows || 2;
+    field.placeholder = hint;
+    field.setAttribute('aria-label', label);
+    field.setAttribute('data-pine-mic-inline', '');
+    /* PineTalkDot mounts its shared mic inside this field wrapper, so it
+       follows the textarea while the sheet scrolls and remains inside it. */
+    wrap.appendChild(field);
+    return {wrap: wrap, field: field};
+  }
+
+  /* The replay is intentionally private to this glass.  Its follow-up is
+   * explicit: the same source now becomes a small H3 stinger desk, rather
+   * than an accidental video-generation action when an operator only wanted
+   * to hear a clip again. */
+  function offerReplayStinger(key, name, sourceInfo) {
+    if (!key) return;
+    sourceInfo = sourceInfo && typeof sourceInfo === 'object' ? sourceInfo : {};
+    var s = sheet('Make H3 station stinger', 'hc-replay-offer', {duck: false});
+    s.body.appendChild(make('p', 'hc-dim', 'Source: ' + name));
+
+    var direction = stingerField('Video direction',
+      'What should the person do on camera?', 2);
+    var spoken = stingerField('Exact spoken copy',
+      'What should they say?', 2);
+    s.body.appendChild(direction.wrap);
+    s.body.appendChild(spoken.wrap);
+
+    var remembered = stingerHistory();
+    var rememberedAt = -1;
+    var history = make('div', 'hc-stinger-history');
+    var earlier = button('hc-btn hc-stinger-icon', '', 'c:caret--left');
+    earlier.title = 'Use the previous stinger prompt';
+    earlier.setAttribute('aria-label', earlier.title);
+    var later = button('hc-btn hc-stinger-icon', '', 'c:caret--right');
+    later.title = 'Use the next stinger prompt';
+    later.setAttribute('aria-label', later.title);
+    var picker = make('select', 'hc-stinger-picker');
+    picker.setAttribute('aria-label', 'Previous stinger prompts');
+    history.appendChild(earlier); history.appendChild(picker); history.appendChild(later);
+    s.body.appendChild(history);
+
+    function paintHistory() {
+      while (picker.firstChild) picker.removeChild(picker.firstChild);
+      var fresh = make('option', '', 'Prompt history');
+      fresh.value = '-1';
+      picker.appendChild(fresh);
+      remembered.forEach(function (item, index) {
+        var words = String(item.spoken_copy || item.direction || 'Untitled prompt')
+          .replace(/\s+/g, ' ').slice(0, 96);
+        var option = make('option', '', words);
+        option.value = String(index);
+        picker.appendChild(option);
+      });
+      picker.value = String(rememberedAt);
+      earlier.disabled = rememberedAt < 0 || rememberedAt >= remembered.length - 1;
+      later.disabled = !remembered.length || rememberedAt <= 0;
+    }
+    function recall(index) {
+      if (index < 0 || index >= remembered.length) {
+        rememberedAt = -1;
+      } else {
+        rememberedAt = index;
+        direction.field.value = String(remembered[index].direction || '');
+        spoken.field.value = String(remembered[index].spoken_copy || '');
+        direction.field.dispatchEvent(new Event('input', {bubbles: true}));
+        spoken.field.dispatchEvent(new Event('input', {bubbles: true}));
+      }
+      paintHistory();
+    }
+    earlier.addEventListener('click', function () { recall(rememberedAt + 1); });
+    later.addEventListener('click', function () { recall(rememberedAt - 1); });
+    picker.addEventListener('change', function () { recall(Number(picker.value)); });
+    paintHistory();
+
+    var isVideo = !!sourceInfo.video && !!sourceInfo.url;
+    var clipSeconds = Math.max(0, Number(sourceInfo.seconds) || 0);
+    var trimIn = 0;
+    var trimOut = Math.min(clipSeconds || 15, 15);
+    var preview = null;
+    var scrub = null;
+    var inPoint = null;
+    var outPoint = null;
+    var rangeNote = null;
+    var rangeReady = false;
+    var sourceRange = null;
+
+    function updateRange() {
+      if (!rangeReady || !preview || !scrub || !inPoint || !outPoint) return;
+      var duration = Math.max(0, Number(preview.duration) || clipSeconds);
+      if (duration < 2.2) {
+        rangeNote.textContent = 'This source is too short for an H3 video reference.';
+        inPoint.disabled = true;
+        outPoint.disabled = true;
+        return;
+      }
+      trimIn = Math.max(0, Math.min(trimIn, duration - 2.2));
+      trimOut = Math.max(trimIn + 2.2, Math.min(trimOut, duration, trimIn + 15));
+      inPoint.value = String(trimIn);
+      outPoint.value = String(trimOut);
+      scrub.max = String(duration);
+      inPoint.max = String(duration);
+      outPoint.max = String(duration);
+      rangeNote.textContent = 'Looping ' + stingerTime(trimIn) + ' to ' + stingerTime(trimOut)
+        + ' (' + stingerTime(trimOut - trimIn) + ').';
+    }
+    function seek(value, play) {
+      if (!preview) return;
+      var duration = Math.max(0, Number(preview.duration) || clipSeconds);
+      var at = Math.max(0, Math.min(Number(value) || 0, duration));
+      try { preview.currentTime = at; } catch (e) { /* metadata is still arriving */ }
+      if (scrub) scrub.value = String(at);
+      if (play) {
+        try { Promise.resolve(preview.play()).catch(function () { /* gesture gate */ }); }
+        catch (e2) { /* a source can leave while closing */ }
+      }
+    }
+    if (isVideo) {
+      sourceRange = make('section', 'hc-stinger-source');
+      sourceRange.appendChild(make('b', 'hc-stinger-source-title', 'Source video'));
+      preview = make('video', 'hc-stinger-video');
+      preview.muted = true;
+      preview.playsInline = true;
+      preview.preload = 'metadata';
+      preview.src = stationUrl(sourceInfo.url);
+      sourceRange.appendChild(preview);
+      scrub = make('input', 'hc-range hc-stinger-scrub');
+      scrub.type = 'range'; scrub.min = '0'; scrub.step = '.1'; scrub.value = '0';
+      scrub.setAttribute('aria-label', 'Scrub source video');
+      sourceRange.appendChild(scrub);
+      var points = make('div', 'hc-stinger-points');
+      var makePoint = function (label, value) {
+        var row = make('label', 'hc-stinger-point');
+        row.appendChild(make('span', '', label));
+        var control = make('input', '');
+        control.type = 'range'; control.min = '0'; control.step = '.1'; control.value = String(value);
+        control.setAttribute('aria-label', label + ' point');
+        row.appendChild(control);
+        points.appendChild(row);
+        return control;
+      };
+      inPoint = makePoint('In', trimIn);
+      outPoint = makePoint('Out', trimOut);
+      sourceRange.appendChild(points);
+      rangeNote = make('p', 'hc-dim hc-stinger-range', 'Reading the source range...');
+      sourceRange.appendChild(rangeNote);
+      s.body.appendChild(sourceRange);
+      var sourceLoaded = function () {
+        clipSeconds = Math.max(0, Number(preview.duration) || clipSeconds);
+        trimIn = 0;
+        trimOut = Math.min(clipSeconds, 15);
+        rangeReady = true;
+        updateRange();
+        seek(trimIn, true);
+      };
+      preview.addEventListener('loadedmetadata', sourceLoaded);
+      preview.addEventListener('timeupdate', function () {
+        if (!rangeReady) return;
+        if (scrub && !scrub.matches(':active')) scrub.value = String(preview.currentTime || 0);
+        if (!preview.paused && preview.currentTime >= trimOut - .025) seek(trimIn, true);
+      });
+      preview.addEventListener('ended', function () { seek(trimIn, true); });
+      scrub.addEventListener('input', function () { seek(scrub.value, false); });
+      scrub.addEventListener('change', function () { seek(scrub.value, true); });
+      inPoint.addEventListener('input', function () {
+        trimIn = Math.min(Number(inPoint.value) || 0, trimOut - 2.2);
+        trimOut = Math.max(trimOut, trimIn + 2.2);
+        updateRange(); seek(trimIn, true);
+      });
+      outPoint.addEventListener('input', function () {
+        trimOut = Math.max(Number(outPoint.value) || 0, trimIn + 2.2);
+        trimIn = Math.min(trimIn, trimOut - 2.2);
+        updateRange(); seek(Math.max(trimIn, trimOut - .1), true);
+      });
+      if (clipSeconds) sourceLoaded();
+    } else {
+      s.body.appendChild(make('p', 'hc-dim',
+        'This audio source will be paired with an indexed dialogue-capable performer.'));
+    }
+
+    var status = make('p', 'hc-dim hc-stinger-status', '');
+    var send = button('hc-btn hc-primary hc-wide', 'Make H3 station stinger', 'c:play--filled');
+    send.addEventListener('click', function () {
+      var visual = String(direction.field.value || '').trim();
+      var words = String(spoken.field.value || '').trim();
+      if (!visual && !words) {
+        status.textContent = 'Add a video direction or spoken copy first.';
+        direction.field.focus();
+        return;
+      }
+      if (isVideo && (!rangeReady || clipSeconds < 2.2)) {
+        status.textContent = 'This source needs at least 2.2 seconds for an H3 video reference.';
+        return;
+      }
+      send.disabled = true;
+      status.textContent = 'Saving this stinger request...';
+      var payload = {direction: visual, spoken_copy: words};
+      if (isVideo) {
+        payload.trim_in_s = Math.round(trimIn * 10) / 10;
+        payload.trim_out_s = Math.round(trimOut * 10) / 10;
+      }
+      stationPost('/api/sfx/' + encodeURIComponent(key) + '/h3-stinger', payload).then(function (got) {
+        if (visual || words) {
+          remembered = remembered.filter(function (item) {
+            return item.direction !== visual || item.spoken_copy !== words;
+          });
+          remembered.unshift({direction: visual, spoken_copy: words, at: now()});
+          saveStingerHistory(remembered);
+          rememberedAt = 0;
+          paintHistory();
+        }
+        status.textContent = String((got && got.message) || 'Request completed.');
+        toast('Request completed.');
+      }, function (err) {
+        send.disabled = false;
+        status.textContent = String((err && err.message) || err || 'The H3 stinger could not be queued.');
+      });
+    });
+    s.body.appendChild(send);
+    s.body.appendChild(status);
+    s.onClose = function () {
+      if (!preview) return;
+      try { preview.pause(); preview.removeAttribute('src'); preview.load(); } catch (e) { /* already gone */ }
+    };
   }
 
   function replaySfx() {
@@ -2195,25 +2560,44 @@
     station().then(function (got) {
       var row = lastSfx((got && got.chat) || []);
       if (!row) { toast('no SFX clip has played yet', true); return; }
-      var key = String(row.sfx || row.sfx_sample_id || '');
+      var key = replaySampleId(row);
       /* The station prefixes a cadence sample's text with the speaker
        * glyph (U+1F50A, written as its surrogate pair here); the name is
        * what follows it. */
       var name = String(row.text || key || 'the clip').replace(/^\uD83D\uDD0A\s*/, '');
-      var url = String(row.url || ('/sfx/' + encodeURIComponent(key)));
-      /* A clip with a picture goes back on the SFX set, through the same
-       * cut() the sampler's pads use - on THIS glass only (no ring), which
-       * is what a replay is. cut() answers false where no set is mounted
-       * and the audio road below takes over. */
-      if (row.video && root.PineSfxTv && typeof root.PineSfxTv.cut === 'function') {
-        var shown = false;
-        try {
-          shown = !!root.PineSfxTv.cut({id: key, url: url, sting: name,
-            seconds: Number(row.seconds) || 0, video: true, ts: row.ts}, {ring: false});
-        } catch (e) { shown = false; }
-        if (shown) { toast('replaying ' + name + ' on the set'); return; }
-      }
-      playAudio(stationUrl(url), name);
+      /* Do not trust row.url here. It may be an old unsigned /sfx key; the
+       * replay-source road returns the same signed, levelled bytes that the
+       * station itself can play, including MP4 metadata for the SFX set. */
+      var source = key ? stationGet('/api/sfx/' + encodeURIComponent(key) + '/replay-source')
+        : Promise.resolve({url: row.url, video: !!row.video, seconds: row.seconds || 0});
+      source.then(function (gotSource) {
+        var source = gotSource || {};
+        var replayKey = String(source.id || key || '');
+        var replayName = String(source.name || name || 'the clip');
+        var url = String(source.url || row.url || '');
+        if (!url) { toast('the station has no playable source for ' + replayName, true); return; }
+        /* A clip with a picture goes back on the SFX set, through the same
+         * cut() the sampler's pads use - on THIS glass only (no ring), which
+         * is what a replay is. cut() answers false where no set is mounted
+         * and the audio road below takes over. */
+        if (source.video && root.PineSfxTv && typeof root.PineSfxTv.cut === 'function') {
+          var shown = false;
+          try {
+            shown = !!root.PineSfxTv.cut({id: replayKey, url: url, sting: replayName,
+              seconds: Number(source.seconds) || 0, video: true, ts: row.ts}, {ring: false});
+          } catch (e) { shown = false; }
+          if (shown) {
+            toast('replaying ' + replayName + ' on the set');
+            offerReplayStinger(replayKey, replayName, source);
+            return;
+          }
+        }
+        playAudio(stationUrl(url), replayName, function () {
+          offerReplayStinger(replayKey, replayName, source);
+        });
+      }, function (err) {
+        toast('could not load the replay source: ' + String((err && err.message) || err), true);
+      });
     }, function (err) {
       toast(String((err && err.message) || err), true);
     });
@@ -2371,9 +2755,11 @@
     /* [#1221] the editor window, so the slide can be proved over CDP without
      * cutting a fresh recording out of the ring first. */
     videoEditor: openVideoEditor,
-    /* #1181: the rail keeps clear of the corner squares, and it can only
-     * do that if it knows how big they are. One number, one owner. */
-    CORNER_PX: CORNER_PX,
+    /* The legacy number remains for older callers; new callers ask the
+     * function because the operator may change this live. */
+    CORNER_PX: DEFAULT_ZONE_PX,
+    activationZonePx: activationZonePx,
+    gestureProfile: gestureProfile,
     ACTIONS: ACTIONS.slice(),
     ACTION_WORDS: merge({}, ACTION_WORDS),
     STEPS: STEPS.slice(),
@@ -2386,6 +2772,7 @@
     _stepTable: stepTable,
     _heardRow: heardRow,
     _lastSfx: lastSfx,
+    _replaySampleId: replaySampleId,
     _stationUrl: stationUrl,
     _editorPath: editorPath,
     _editorMessage: editorMessage
