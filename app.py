@@ -1392,7 +1392,6 @@ DEFAULT_DJ = {
     # so the constant always won. It became a dial worth having when #1090
     # made track talk schedulable - the cheapest road on the board.
     "track_talk_ahead": 10,
-    "operator_wording_examples": False,
     # #842: how many HOURS of finished audio to keep standing by. Depth in
     # ROUNDS says nothing about whether the station can keep talking; this
     # is the number the operator actually asked in — "an hour, 2 hours or
@@ -2563,7 +2562,6 @@ def validate_settings(data: Any) -> dict[str, Any]:
         "track_talk_ahead": max(1, min(40, int(                  # #1096
             raw_dj.get("track_talk_ahead",
                        DEFAULT_DJ["track_talk_ahead"]) or 10))),
-        "operator_wording_examples": bool(raw_dj.get("operator_wording_examples", False)),
         "dialogue_reserve_target": max(1, min(12, int(
             raw_dj.get("dialogue_reserve_target",
                        DEFAULT_DJ["dialogue_reserve_target"]) or 1))),
@@ -36984,9 +36982,6 @@ async def _record_talk_body(track: dict[str, Any], dj: dict[str, Any],
             await dj_mixtape_intro(track)
         except Exception:
             pass
-    elif _s3_active() and not track.get("requested"):
-        # Record commentary is a TRACK_TALK draw inside live banter.
-        pass
     elif _ahead_intro and str(_ahead_intro.get("text") or ""):
         try:
             pipeline_log("lookahead", "this record was introduced before it "
@@ -37669,7 +37664,7 @@ async def _dj_loop() -> None:
             # Maybe say something in the middle, then wait out the rest. The
             # torrent supplies its own interruptions, so this stays out of
             # its way.
-            if not dj.get("talk_radio_mode") and not _s3_active() and length > 25 and random.random() < dj["interject_rate"]:
+            if not dj.get("talk_radio_mode")                     and length > 25 and random.random() < dj["interject_rate"]:
                 cut = length * random.uniform(0.3, 0.7)
                 skip.clear()
                 if await _hold(cut):
@@ -42811,10 +42806,8 @@ def track_talk_ahead() -> int:
 
 
 def track_talk_on() -> bool:
-    """Standalone record bookends stand down when System 3 owns dialogue."""
+    """Off by an operator switch; on by default."""
     try:
-        if _s3_active():
-            return False
         return bool(dj_settings().get("track_talk", True))
     except Exception:  # noqa: BLE001
         return True
@@ -105355,11 +105348,7 @@ async def dj_banter(track: dict[str, Any] | None = None,
                     road=str(road or ""), whole=bool(whole),   # [s3-roads]
                     lines_rolled=bool(_lines_rolled), lines_base=int(_lines_base),   # [s3-glass]
                     lines_min=int(dj.get("banter_min_lines") or 4),
-                    lines_max=int(dj.get("banter_max_lines") or 22),
-                    record=({k: str((_RADIO.get("now") or {}).get(k) or "")[:180]
-                             for k in ("id", "title", "artist")}
-                            if not bank and str(road or "banter") == "banter"
-                            and dj.get("track_talk", True) else {}))
+                    lines_max=int(dj.get("banter_max_lines") or 22))
             except Exception as _s3_exc:  # noqa: BLE001
                 pipeline_log("system3", "the director was skipped - the legacy running order stands",
                              extra=("%s: %s" % (type(_s3_exc).__name__, _s3_exc))[:200])
@@ -111178,8 +111167,7 @@ async def ask_model(prompt: str, limit: int = 300,
     _review_context = _LINE_REVIEW_CONTEXT.get()
     _review_kind = str(_review_context.get("kind") or (_review_context.get("entry") or {}).get("prep_kind") or "")
     _review_gate = "tint" if str((mark or {}).get("kind") or "").startswith("tint") else ""
-    _review_guidance = (line_review_guidance(_review_kind, _review_gate)
-                        if dj_settings().get("operator_wording_examples", False) else "")
+    _review_guidance = line_review_guidance(_review_kind, _review_gate)
     _review_messages = ([{"role": "system", "content": _review_guidance}] if _review_guidance else [])
     _review_messages.append({"role": "user", "content": prompt})
     _learning_wire = _CRYSTAL_LEARNING_WIRE.get()
@@ -141384,28 +141372,6 @@ async def api_line_review_approve_current(
         {"batch_id": result["batch_id"], "approved": result["approved"],
          "skipped": result["skipped"], "scope": "instance"})
     return result
-
-
-@app.post("/api/orchestrator/rejections/{review_id}/guidance")
-async def api_line_review_guidance_note(
-    review_id: str, request: Request,
-    authorization: str | None = Header(default=None),
-) -> dict[str, Any]:
-    """Change only the note used as a future prompt example; do not replay air effects."""
-    require_auth(authorization)
-    try:
-        body = await request.json()
-        if not isinstance(body, dict) or set(body) - {"note", "expected_revision"}:
-            raise ValueError("supply note and optional expected_revision")
-        row = await asyncio.to_thread(_LINE_REVIEW.edit_preference_note, review_id,
-                                      body.get("note"), body.get("expected_revision"))
-    except KeyError as exc:
-        raise HTTPException(status_code=404, detail="rejected line not found") from exc
-    except ReviewConflictError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-    except (ValueError, TypeError) as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return {"ok": True, "say": "Saved for future prompts. Historical calls are unchanged.", "review": row}
 
 
 @app.post("/api/orchestrator/rejections/{review_id}/note")
