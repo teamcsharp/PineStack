@@ -22,7 +22,23 @@ AUDIO_VAE = "minimax_h3_audio_vae_fp32.safetensors"
 TURBO_LORA = "minimax_h3_turbo_v4_step600_ema.safetensors"
 
 FRAME_CHOICES = (73, 124, 169, 241, 289, 361)  # about 3, 5, 7, 10, 12, 15 seconds
-STEP_CHOICES = (4, 6)
+STEP_CHOICES = (4, 6, 8, 12)
+
+# [h3-quality] THE QUALITY PROFILE. "for H3, double the quality settings ...
+# I want to double the quality and resolution at the moment unless it chokes
+# the DGX to death." The steps and the frame size the graph renders at, and
+# the longest clip that size may run to - set from the gallery's gear, kept
+# by the station in data/h3_hourly.json, honoured by every H3 render. Sizes
+# are multiples of 64 (the VAE's stride). Doubling the frame quadruples the
+# pixels the sampler holds, which is why `double` caps the length and why
+# quality_for_box() steps down when the box is hot or short of room.
+PRESETS = {
+    "standard": {"preset": "standard", "steps": 4, "width": 640, "height": 384, "max_frames": 361},
+    "balanced": {"preset": "balanced", "steps": 6, "width": 960, "height": 576, "max_frames": 289},
+    "double": {"preset": "double", "steps": 8, "width": 1280, "height": 768, "max_frames": 241},
+}
+QUALITY = dict(PRESETS["double"])
+SIZE_MIN, SIZE_MAX = 384, 1536
 MODES = frozenset({"text", "frame", "reference"})
 MEDIA_KINDS = frozenset({"", "image", "video", "audio"})
 VIDEO_RENDER_INTERVAL_MIN_S = 60.0
@@ -125,12 +141,78 @@ def reference_window(source_s: float, at_share: float = 0.0,
 
 
 def clamp_steps(value: Any) -> int:
-    """The Turbo LoRA is useful at four to six steps on this machine."""
+    """The Turbo LoRA runs at four to six steps; eight and twelve are the
+    doubled profile's (quality over speed)."""
     try:
         wanted = int(value)
     except (TypeError, ValueError):
         wanted = STEP_CHOICES[0]
     return min(STEP_CHOICES, key=lambda item: abs(item - wanted))
+
+
+def set_quality(profile: Any) -> dict[str, Any]:
+    """[h3-quality] Take a profile from the desk; the clean one now in force.
+    A preset name alone selects the preset; any explicit field makes it
+    custom (a custom equal to a preset is named as that preset)."""
+    if not isinstance(profile, dict):
+        return dict(QUALITY)
+    preset = str(profile.get("preset") or "").strip().lower()
+    fields = ("steps", "width", "height", "max_frames")
+    base = dict(PRESETS.get(preset) or QUALITY)
+    if preset in PRESETS and not any(k in profile for k in fields):
+        QUALITY.clear()
+        QUALITY.update(base)
+        return dict(QUALITY)
+    out = dict(base)
+    for key in ("width", "height"):
+        if key in profile:
+            try:
+                out[key] = max(SIZE_MIN, min(SIZE_MAX, (int(profile[key]) // 64) * 64))
+            except (TypeError, ValueError):
+                pass
+    if "steps" in profile:
+        out["steps"] = clamp_steps(profile["steps"])
+    if "max_frames" in profile:
+        out["max_frames"] = clamp_frames(profile["max_frames"])
+    out["preset"] = "custom"
+    for name, known in PRESETS.items():
+        if all(out.get(k) == known[k] for k in fields):
+            out["preset"] = name
+    QUALITY.clear()
+    QUALITY.update(out)
+    return dict(QUALITY)
+
+
+def quality_for_box(hot_c: Any, available_gb: Any, ceiling_c: Any, reserve_gb: Any) -> tuple[dict[str, Any], str]:
+    """[h3-quality] The profile THIS render may use. A profile above the
+    standard one asks more of the box than render_admission's gates: eight
+    degrees under the ceiling and 30 GB above the reserve. Short of either it
+    steps down - double to balanced, balanced to standard - and says so.
+    The render still passes render_admission afterwards; this is the extra
+    margin the bigger frame needs, not a replacement for the gate."""
+    profile = dict(QUALITY)
+    standard = PRESETS["standard"]
+    heavy = profile["width"] * profile["height"] > standard["width"] * standard["height"] or profile["steps"] > 6
+    if not heavy:
+        return profile, ""
+    tight = []
+    try:
+        if hot_c is not None and ceiling_c and float(hot_c) > float(ceiling_c) - 8:
+            tight.append("%.0f C against a %.0f C ceiling" % (float(hot_c), float(ceiling_c)))
+    except (TypeError, ValueError):
+        pass
+    try:
+        if available_gb is not None and reserve_gb and float(available_gb) < float(reserve_gb) + 30:
+            tight.append("%.0f GB free against %.0f GB needed" % (float(available_gb), float(reserve_gb) + 30))
+    except (TypeError, ValueError):
+        pass
+    if not tight:
+        return profile, ""
+    balanced = PRESETS["balanced"]
+    lighter = (profile["width"] * profile["height"] > balanced["width"] * balanced["height"]
+               or profile["steps"] > balanced["steps"])
+    down = dict(balanced if lighter else standard)
+    return down, "stepped down to %s for this render: %s" % (down["preset"], "; ".join(tight))
 
 
 def render_seed(value: Any = None) -> int:
@@ -251,7 +333,8 @@ def _base_graph(prompt: str, frames: int, steps: int,
 
 def build_workflow(prompt: str, mode: str = "text", upload_name: str = "",
                    media_kind: str = "", frames: Any = 73,
-                   steps: Any = 4, seed: Any = None) -> dict[str, Any]:
+                   steps: Any = None, seed: Any = None, width: Any = None,
+                   height: Any = None, max_frames: Any = None) -> dict[str, Any]:
     """Return an API-format H3 graph for text, first-frame, or reference use.
 
     ``upload_name`` is a name already accepted by ComfyUI's input upload road.
@@ -269,8 +352,12 @@ def build_workflow(prompt: str, mode: str = "text", upload_name: str = "",
     if use_mode == "reference" and kind not in {"image", "video", "audio"}:
         raise ValueError("Reference mode needs image, video, or audio media")
 
-    frame_count = clamp_frames(frames)
-    step_count = clamp_steps(steps)
+    # [h3-quality] the profile in force, unless the caller says otherwise
+    cap = clamp_frames(max_frames if max_frames is not None else QUALITY.get("max_frames") or max(FRAME_CHOICES))
+    frame_count = min(clamp_frames(frames), cap)
+    step_count = clamp_steps(steps if steps is not None else QUALITY.get("steps"))
+    frame_w = int(width or QUALITY.get("width") or 640)
+    frame_h = int(height or QUALITY.get("height") or 384)
     noise_seed = render_seed(seed)
     model = REF2VA_MODEL if use_mode == "reference" else FL2VA_MODEL
     graph = _base_graph(prompt, frame_count, step_count, model, noise_seed)
@@ -278,7 +365,7 @@ def build_workflow(prompt: str, mode: str = "text", upload_name: str = "",
     if use_mode in {"text", "frame"}:
         inputs: dict[str, Any] = {
             "clip": ["2", 0], "vae": ["3", 0], "prompt": prompt,
-            "width": 640, "height": 384, "length": frame_count,
+            "width": frame_w, "height": frame_h, "length": frame_count,
         }
         if use_mode == "frame":
             graph["16"] = {"class_type": "LoadImage", "inputs": {
@@ -290,7 +377,7 @@ def build_workflow(prompt: str, mode: str = "text", upload_name: str = "",
 
     inputs = {
         "clip": ["2", 0], "vae": ["3", 0], "audio_vae": ["4", 0],
-        "prompt": prompt, "width": 640, "height": 384,
+        "prompt": prompt, "width": frame_w, "height": frame_h,
         "length": frame_count, "ref_image_size": "match",
     }
     if kind == "image":

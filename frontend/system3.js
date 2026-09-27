@@ -1726,6 +1726,14 @@ function makeViews({request, onSelect} = {}) {
     paneB: el('section', {class: 's3-pane', 'aria-label': 'Technical RNG Rolodex'}),
     paneC: el('section', {class: 's3-pane', 'aria-label': 'Final script and provenance'})};
   const inspectCache = new Map();
+  /* [s3-still] "If I'm looking at something, do not reset my view or scroll
+     my view ever." The window sets `quiet`: no programmatic select, build
+     or refresh scrolls a pane - a tap on a turn still finds it in the OTHER
+     panes. `newestFirst` lists a round's turns latest first ("the latest
+     entry always at the top as the first thing listed"). */
+  v.quiet = false;
+  v.newestFirst = false;
+  v.turnsInOrder = conv => (v.newestFirst ? [...((conv && conv.turns) || [])].reverse() : ((conv && conv.turns) || []));
 
   /* Several rounds can be on show at once (the Script tab's live feed), so
      every renderer finds a turn's own conversation: turn ids are
@@ -1851,7 +1859,7 @@ function makeViews({request, onSelect} = {}) {
     for (const pane of [v.paneA, v.paneB, v.paneC]) {
       if (from && pane.contains(from)) continue;
       const target = (v.sel.event && pane.querySelector(`[data-event="${CSS.escape(v.sel.event)}"]`)) || (v.sel.turn && pane.querySelector(`[data-turn="${CSS.escape(v.sel.turn)}"]`));
-      if (target && pane.isConnected) target.scrollIntoView({block: 'nearest', behavior: reduced() ? 'auto' : 'smooth'});
+      if (target && pane.isConnected && (from || !v.quiet)) target.scrollIntoView({block: 'nearest', behavior: reduced() ? 'auto' : 'smooth'});
     }
     const c = v.convOf({turn_id: v.sel.turn});
     if (from && onSelect && c) onSelect(c, v.sel.turn, v.sel.event);
@@ -1954,7 +1962,7 @@ function makeViews({request, onSelect} = {}) {
     const s = v.sfxRows(conv, t);
     return [...s.before, v.bubble(t, {conv}), ...s.after];
   };
-  v.roundChat = (conv) => el('div', 's3-chat', ...conv.turns.flatMap(t => v.turnNodes(conv, t)));
+  v.roundChat = (conv) => el('div', 's3-chat', ...v.turnsInOrder(conv).flatMap(t => v.turnNodes(conv, t)));   /* [s3-still] newest first when asked */
 
   v.paintConversation = () => {
     const conv = v.conv;
@@ -2154,7 +2162,7 @@ function makeViews({request, onSelect} = {}) {
     if (conv.mode === 'shadow') out.push(el('p', {class: 's3-muted', text: 'Shadow: every roll below is recorded, and none of them reached air.'}));
     const pre = (conv.decision_events || []).filter(e => !e.turn_id);
     if (pre.length) out.push(el('div', 's3-turnhead', 'BEFORE THE FIRST TURN'), ...pre.map(e => v.eventCard(e)));
-    for (const t of conv.turns) {
+    for (const t of v.turnsInOrder(conv)) {
       out.push(el('div', {class: 's3-turnhead', 'data-turn': t.turn_id, text: `SYSTEM 3 — TURN ${String(t.index + 1).padStart(4, '0')} · ${t.speaker} ${t.name || ''} · ${t.step_label} · ${t.phase}`}));
       for (const ev of turnEvents(conv, t)) out.push(v.eventCard(ev, t));
       for (const o of (conv.observations_air || []).filter(o => o.turn_id === t.turn_id || ((o.family === 'SFX' || o.family === 'SFXGUY') && t.script_index != null && o.turn_index === t.script_index))) out.push(v.eventCard(o, t));
@@ -2174,13 +2182,13 @@ function makeViews({request, onSelect} = {}) {
     if (conv.mode === 'shadow') {
       paper.append(el('p', {class: 's3-muted', text: 'Shadow mode. Left: what System 3 would have directed (never aired). Right: the script the legacy writer actually produced.'}),
         el('div', 's3-cols',
-          el('div', null, ...conv.turns.map(t => el('div', {class: 's3-sline', 'data-turn': t.turn_id, onclick: e => v.select(t.turn_id, '', e.currentTarget)},
+          el('div', null, ...v.turnsInOrder(conv).map(t => el('div', {class: 's3-sline', 'data-turn': t.turn_id, onclick: e => v.select(t.turn_id, '', e.currentTarget)},
             el('b', {text: `${t.index + 1} · ${t.name || t.speaker}`}),
             el('p', {text: `${(t.performance || {}).emotion ? 'In ' + t.performance.emotion + ': ' : ''}${(t.directions || []).map(d => d.text).join('; ') || t.step_label}`})))),
           el('div', null, ...(conv.actual || []).map((a, i) => el('div', 's3-sline', el('b', {text: `${i + 1} · ${a.speaker}`}), el('p', {text: a.text}))))));
     } else {
       if (conv.mode === 'simulation') paper.append(el('p', {class: 's3-muted', text: 'Simulation: a plan with no words. It never reaches the writer or the air.'}));
-      for (const t of conv.turns) {
+      for (const t of v.turnsInOrder(conv)) {
         const st = v.turnStatus(t), perf = t.performance || {}, a = st.air || {};
         const sfxAir = (conv.observations_air || []).find(o => o.family === 'SFX' && o.turn_index === t.script_index);
         paper.append(el('div', {class: 's3-sline', 'data-turn': t.turn_id, onclick: e => v.select(t.turn_id, '', e.currentTarget)},
@@ -2214,7 +2222,7 @@ function makeViews({request, onSelect} = {}) {
     fill(v.paneA, el('h2', null, 'Conversation', el('span', {class: 's3-muted', text: 'building from the recorded rolls'})), chat);
     try {
       await v.buildRound(subject, chat, {base: 700 / v.speed, live: () => token === v.token && v.conv === subject,
-        grow: node => node.scrollIntoView({block: 'nearest'})});
+        grow: node => { if (!v.quiet) node.scrollIntoView({block: 'nearest'}); }});
     } finally {
       v.playing = false;
       if (v.onBuildState) v.onBuildState(false);
@@ -3190,10 +3198,29 @@ export async function mount(root, {request, onClose, tab: startTab = '', table: 
   request ||= defaultRequest();
   const send = (path, method, body) => request(path, {method, body: body === undefined ? undefined : JSON.stringify(body)});
   root.classList.add('s3');
-  let alive = true, tab = startTab || 'director', view = 'split', cursor = 0, follow = true;
+  let alive = true, tab = startTab || 'director', view = 'split', cursor = 0, follow = false;   /* [s3-still] follow live only when asked */
   let status = null, list = [], config = null, settings = null, lastLoaded = '';
   const timers = [];
   const v = makeViews({request});
+  v.quiet = true;                                                        /* [s3-still] */
+  try { v.newestFirst = localStorage.getItem('s3.newestFirst') !== '0'; } catch (e) { v.newestFirst = true; }
+  /* [s3-still] a refresh of the round on show keeps the reader's place: the
+     first turn on screen is found again after the repaint and the scroll is
+     moved by exactly its drift; nothing else moves. */
+  const scrollBox = () => { let n = body; while (n && n !== document.body) { if (n.scrollHeight > n.clientHeight + 4) return n; n = n.parentElement; } return root; };
+  async function keepPlace(fn) {
+    const box = scrollBox(); const top = box.scrollTop; const lip = box.getBoundingClientRect();
+    let anchor = null;
+    for (const n of body.querySelectorAll('[data-turn]')) {
+      const r = n.getBoundingClientRect();
+      if (r.height > 0 && r.bottom > lip.top) { anchor = {id: n.dataset.turn, pane: n.closest('.s3-pane'), was: r.top}; break; }
+    }
+    await fn();
+    let again = null;
+    if (anchor) { const pane = anchor.pane && anchor.pane.isConnected ? anchor.pane : body; again = pane.querySelector(`[data-turn="${CSS.escape(anchor.id)}"]`); }
+    if (again) box.scrollTop = box.scrollTop + (again.getBoundingClientRect().top - anchor.was);
+    else box.scrollTop = top;
+  }
   /* [s3-hold] "When I'm scrolling in the system3 popup, do not reset my view
      or change what I am reading. I do not like windows auto resetting while
      I am analyzing it." Any scroll, wheel, touch, key or pointer in this
@@ -3268,7 +3295,14 @@ export async function mount(root, {request, onClose, tab: startTab = '', table: 
     const filter = el('select', {onchange: e => { listFilter = e.target.value; refreshList(); }},
       ...[['', 'all modes'], ['active', 'active'], ['shadow', 'shadow'], ['simulation', 'simulations']]
         .map(([val, t]) => el('option', {value: val, text: t, selected: val === listFilter})));
-    const followBox = el('label', 's3-row', el('input', {type: 'checkbox', checked: follow, onchange: e => { follow = e.target.checked; }}), 'follow live');
+    const followBox = el('div', 's3-row',
+      el('label', 's3-row', el('input', {type: 'checkbox', checked: follow, onchange: e => { follow = e.target.checked; }}), 'follow live'),
+      /* [s3-still] "put an option to reverse the feed so that it shows the latest entry first and have that on by default" */
+      el('label', 's3-row', el('input', {type: 'checkbox', checked: v.newestFirst, onchange: e => {
+        v.newestFirst = e.target.checked;
+        try { localStorage.setItem('s3.newestFirst', v.newestFirst ? '1' : '0'); } catch (_) { /* no storage */ }
+        v.paintConversation(); v.paintRolodex(); v.paintScript();
+      }}), 'newest first'));
     const items = list.map(c => el('li', null, btn('', () => load(c.conversation_id), {
       class: c.conversation_id === (v.conv && v.conv.identity.conversation_id) ? 'sel' : ''})));
     list.forEach((c, i) => {
@@ -4103,8 +4137,8 @@ export async function mount(root, {request, onClose, tab: startTab = '', table: 
         await refreshList();
         const mine = v.conv && cids.includes(v.conv.identity.conversation_id);
         const newest = list[0] && list[0].conversation_id;
-        if (follow && newest && newest !== lastLoaded && !v.playing) await load(newest, true);
-        else if (mine && !v.playing) await load(v.conv.identity.conversation_id);
+        if (follow && newest && newest !== lastLoaded && !v.playing) await keepPlace(() => load(newest, true));
+        else if (mine && !v.playing) await keepPlace(() => load(v.conv.identity.conversation_id));   /* [s3-still] */
       }
       await refreshStatus();
     } catch (e) { report(e); }

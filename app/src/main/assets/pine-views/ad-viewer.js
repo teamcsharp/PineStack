@@ -27,9 +27,117 @@
     var head = make('header', 'pav-head'); head.appendChild(make('b', '', gallery ? 'Pine Box Gallery' : 'Your Pine Box ad is ready'));
     var position = make('span', 'pav-position'); head.appendChild(position);
     var rows = [], signatures = {}, index = 0, revision = 0, gone = false, references = {}, original = false, currentRow = '';
-    var pendingRows = [];
+    var pendingRows = [], imageDrafts = {}, imageJobs = {}, splicePending = false;
     var cursor = '', loading = false, stripStart = 0, crawl = 0, pausedUntil = 0, loadFailed = false;
-    var disposeMedia = function () {}, exportTimer = 0;
+    var disposeMedia = function () {}, exportTimer = 0, h3Timer = 0, h3State = null, duckApi = null, h3Loading = false;
+    var h3Bar = make('div', 'pav-h3');
+    var h3Label = make('label', 'pav-h3-toggle');
+    var h3Toggle = make('input'); h3Toggle.type = 'checkbox';
+    h3Toggle.setAttribute('aria-label', 'Hourly H3 stingers');
+    h3Label.appendChild(h3Toggle); h3Label.appendChild(make('span', '', 'H3'));
+    var h3Meter = make('i', 'pav-h3-meter'); var h3Fill = make('b'); h3Meter.appendChild(h3Fill);
+    var h3Time = make('output', 'pav-h3-time', '--:--');
+    h3Bar.append(h3Label, h3Meter, h3Time);
+    /* [h3-quality] "expose the quality settings for H3 in the pine box gallery
+       when i click the settings": the gear beside the H3 toggle opens the
+       profile - preset, steps, frame size, longest clip - with the box's heat
+       and free memory beside it. Apply saves it to the station; every H3
+       render from then on runs at it, stepped down while the box is hot or
+       short of room (comfy_workshop.quality_for_box). */
+    var qualityPanel = make('div', 'pav-quality'); qualityPanel.hidden = true;
+    var h3Gear = command('H3 quality settings', 'c:settings', function () {
+      qualityPanel.hidden = !qualityPanel.hidden;
+      if (!qualityPanel.hidden) { paintQuality(h3State); loadH3(); }
+    });
+    h3Bar.appendChild(h3Gear);
+    var qPreset = make('select'); qPreset.setAttribute('aria-label', 'H3 quality preset');
+    var qSteps = make('select'); qSteps.setAttribute('aria-label', 'steps');
+    var qSize = make('select'); qSize.setAttribute('aria-label', 'frame size');
+    var qSecs = make('select'); qSecs.setAttribute('aria-label', 'longest clip');
+    var qBox = make('span', 'pav-quality-box', '');
+    var qApply = make('button', '', 'Apply'); qApply.type = 'button';
+    var qNote = make('span', 'pav-quality-note', 'Doubling the frame quadruples the pixels the sampler holds: the double profile steps down by itself while the box is hot or short of room.');
+    var Q_SIZES = [[640, 384], [960, 576], [1280, 768], [1536, 896]];
+    function qOpt(sel, value, label, selected) { var o = make('option', '', label); o.value = String(value); if (selected) o.selected = true; sel.appendChild(o); return o; }
+    function paintQuality(state) {
+      var q = (state && state.quality) || {}; var presets = (state && state.presets) || {};
+      qPreset.replaceChildren();
+      Object.keys(presets).forEach(function (k) { qOpt(qPreset, k, k + ' - ' + presets[k].steps + ' steps, ' + presets[k].width + 'x' + presets[k].height, q.preset === k); });
+      qOpt(qPreset, 'custom', 'custom', q.preset === 'custom' || !presets[q.preset]);
+      qSteps.replaceChildren();
+      ((state && state.step_choices) || [4, 6, 8, 12]).forEach(function (n) { qOpt(qSteps, n, n + ' steps', Number(q.steps) === Number(n)); });
+      qSize.replaceChildren();
+      var known = false;
+      Q_SIZES.forEach(function (wh) {
+        var on = wh[0] === Number(q.width) && wh[1] === Number(q.height); known = known || on;
+        qOpt(qSize, wh[0] + 'x' + wh[1], wh[0] + ' x ' + wh[1] + (wh[0] === 640 ? ' (standard)' : wh[0] === 1280 ? ' (double)' : ''), on);
+      });
+      if (!known && q.width) qOpt(qSize, q.width + 'x' + q.height, q.width + ' x ' + q.height, true);
+      qSecs.replaceChildren();
+      ((state && state.frame_choices) || [73, 124, 169, 241, 289, 361]).forEach(function (f) { qOpt(qSecs, f, 'up to ' + Math.round(f / 24) + ' s', Number(q.max_frames) === Number(f)); });
+      var box = (state && state.box) || {};
+      qBox.textContent = 'box now: ' + (box.hottest_c != null ? Math.round(box.hottest_c) + ' C of ' + Math.round(box.ceiling_c || 90) + ' C' : 'heat unknown')
+        + ', ' + (box.available_gb != null ? Math.round(box.available_gb) + ' GB free (the double frame wants ' + Math.round((box.floor_gb || 60) + 30) + ')' : 'memory unknown');
+    }
+    qPreset.addEventListener('change', function () {
+      var p = h3State && h3State.presets && h3State.presets[qPreset.value];
+      if (p) paintQuality(Object.assign({}, h3State, {quality: p}));
+    });
+    [qSteps, qSize, qSecs].forEach(function (sel) { sel.addEventListener('change', function () { qPreset.value = 'custom'; }); });
+    qApply.addEventListener('click', function () {
+      var wh = String(qSize.value).split('x');
+      var body = {quality: {preset: qPreset.value, steps: Number(qSteps.value), width: Number(wh[0]), height: Number(wh[1]), max_frames: Number(qSecs.value)}};
+      qApply.disabled = true; qNote.textContent = 'saving...';
+      root.pineDesktop.post('/api/h3/hourly', body).then(function (state) {
+        h3State = state || {}; h3State.client_at = Date.now() / 1000; paintH3(); paintQuality(h3State);
+        var q = h3State.quality || {};
+        qNote.textContent = 'Every H3 render now runs at ' + q.steps + ' steps, ' + q.width + ' x ' + q.height + ', up to ' + Math.round((q.max_frames || 0) / 24) + ' s - stepped down while the box is hot or full.';
+      }).catch(function (err) { qNote.textContent = 'Could not save: ' + ((err && err.message) || err); })
+        .finally(function () { qApply.disabled = false; });
+    });
+    qualityPanel.append(make('b', '', 'H3 quality'), qPreset, qSteps, qSize, qSecs, qApply, qBox, qNote);
+    if (gallery) head.insertBefore(h3Bar, position);
+    function h3Clock(seconds) {
+      seconds = Math.max(0, Math.floor(Number(seconds) || 0));
+      var hours = Math.floor(seconds / 3600), minutes = Math.floor((seconds % 3600) / 60);
+      var tail = String(seconds % 60).padStart(2, '0');
+      return hours ? hours + ':' + String(minutes).padStart(2, '0') + ':' + tail : minutes + ':' + tail;
+    }
+    function paintH3() {
+      if (!gallery || !h3State) return;
+      var enabled = h3State.enabled !== false;
+      h3Toggle.checked = enabled; h3Bar.classList.toggle('off', !enabled);
+      if (!enabled) { h3Fill.style.width = '0%'; h3Time.textContent = 'off'; return; }
+      var elapsed = Date.now() / 1000 - Number(h3State.client_at || 0);
+      var remaining = Math.max(0, Number(h3State.seconds_remaining || 0) - elapsed);
+      var period = Math.max(1, Number(h3State.period_seconds || 3600));
+      h3Fill.style.width = (Math.max(0, Math.min(1, 1 - remaining / period)) * 100).toFixed(1) + '%';
+      h3Time.textContent = h3Clock(remaining);
+      h3Bar.title = h3State.radio_on === false ? 'Station is off; render waits for broadcast'
+        : 'Next hourly H3 render in ' + h3Clock(remaining);
+    }
+    function loadH3() {
+      if (!gallery || gone || h3Loading || h3Toggle.disabled) return Promise.resolve();
+      h3Loading = true;
+      return root.pineDesktop.get('/api/h3/hourly').then(function (state) {
+        if (gone) return;
+        h3State = state || {}; h3State.client_at = Date.now() / 1000; paintH3();
+        if (!qualityPanel.hidden) paintQuality(h3State);            /* [h3-quality] */
+      }).catch(function () { if (!gone) h3Time.textContent = 'err'; })
+        .finally(function () { h3Loading = false; });
+    }
+    h3Toggle.addEventListener('change', function () {
+      h3Toggle.disabled = true;
+      root.pineDesktop.post('/api/h3/hourly', {enabled: !!h3Toggle.checked}).then(function (state) {
+        h3State = state || {}; h3State.client_at = Date.now() / 1000; paintH3();
+        if (!qualityPanel.hidden) paintQuality(h3State);            /* [h3-quality] */
+      }).catch(function () { h3Toggle.checked = !h3Toggle.checked; })
+        .finally(function () { h3Toggle.disabled = false; });
+    });
+    if (gallery) { loadH3(); h3Timer = setInterval(function () {
+      paintH3();
+      if (!h3State || Date.now() / 1000 - h3State.client_at >= 15) loadH3();
+    }, 1000); }
     var more = command('Load ten more items', 'c:add', function () { loadPage(10); });
     more.disabled = true;
     if (gallery) head.insertBefore(more, position);
@@ -55,6 +163,7 @@
     });
     var next = command('Next ad', 'c:caret--right', function () { if (index > 0) { index--; paint(); } });
     head.appendChild(previous); head.appendChild(next); box.appendChild(head);
+    if (gallery) box.appendChild(qualityPanel);                         /* [h3-quality] */
     var strip = make('div', 'pav-strip'); strip.setAttribute('aria-label', 'Generated media');
     if (gallery) box.appendChild(strip);
     var motion = command('Pause gallery scrolling', 'c:pause--filled', function () {
@@ -75,6 +184,18 @@
     modes.append(generatedButton, originalButton); box.appendChild(modes);
     generatedButton.addEventListener('click', function () { if (original) { original = false; paint(true); } });
     originalButton.addEventListener('click', function () { if (!original) { original = true; paint(true); } });
+    var imageForm = make('div', 'pav-image-prompt'); imageForm.hidden = true;
+    var imageMode = make('select'); imageMode.setAttribute('aria-label', 'H3 input type');
+    ['Prompt', 'Dialogue'].forEach(function (label) {
+      var option = make('option', '', label); option.value = label.toLowerCase(); imageMode.appendChild(option);
+    });
+    var imageText = make('textarea'); imageText.rows = 2; imageText.maxLength = 800;
+    imageText.placeholder = 'Prompt or dialogue for H3...'; imageText.setAttribute('aria-label', 'H3 prompt or dialogue');
+    imageForm.append(imageMode, imageText); box.appendChild(imageForm);
+    function saveImageDraft() {
+      imageDrafts[currentRow] = {mode: imageMode.value, text: imageText.value};
+    }
+    imageText.addEventListener('input', saveImageDraft); imageMode.addEventListener('change', saveImageDraft);
     var reprompt = make('form', 'pav-reprompt'); reprompt.hidden = true;
     var directionLabel = make('label', '', 'Direction'), direction = make('textarea');
     direction.rows = 3; direction.maxLength = 1800; direction.required = true; directionLabel.appendChild(direction);
@@ -84,15 +205,56 @@
     var status = make('p', 'pav-status'); status.setAttribute('role', 'status'); box.appendChild(status);
     var actions = make('footer', 'pine-voice-ad-actions');
     var save = command('Save to PineBoxRecordings', 'c:save', saveCurrent);
+    var splice = make('button', 'pav-splice', 'Splice'); splice.type = 'button';
+    splice.title = 'Edit the generated and original videos together';
+    splice.disabled = true;
+    splice.addEventListener('click', function () {
+      var row = rows[index];
+      if (!row || !row.prompt_id || splice.disabled || splicePending) return;
+      var current = revision; splicePending = true;
+      splice.disabled = true; status.textContent = 'Preparing both videos for the splice editor...';
+      root.pineDesktop.post('/api/video-editor/parody/open', {prompt_id: row.prompt_id, file: mediaFile(row)}).then(function (got) {
+        if (gone || current !== revision) return;
+        if (!got || !got.original_source_id || !got.generated_source_id) throw new Error('The station did not return both editor sources.');
+        if (!root.PineHotCorners || typeof root.PineHotCorners.videoEditor !== 'function') throw new Error('The splice editor is unavailable on this build.');
+        root.PineHotCorners.videoEditor(got.original_source_id, got.generated_source_id);
+        close();
+      }).catch(function (err) {
+        if (!gone && current === revision) { status.textContent = 'Could not open Splice: ' + ((err && err.message) || err); splice.disabled = false; }
+      }).finally(function () { splicePending = false; });
+    });
     save.disabled = true;
-    actions.appendChild(save);
+    actions.appendChild(save); actions.appendChild(splice);
     var promptAgain = make('button', 'pav-reprompt-button', 'Prompt original again');
     promptAgain.type = 'button'; promptAgain.title = 'Send the recorded original through H3 with a new direction';
     promptAgain.addEventListener('click', function () {
+      if (!imageForm.hidden) { renderImage(); return; }
       reprompt.hidden = !reprompt.hidden; promptAgain.setAttribute('aria-expanded', String(!reprompt.hidden));
       if (!reprompt.hidden) { direction.focus(); reprompt.scrollIntoView({block:'nearest'}); }
     });
     promptAgain.disabled = true; promptAgain.setAttribute('aria-expanded', 'false'); actions.appendChild(promptAgain);
+    function renderImage() {
+      var row = rows[index], file = mediaFile(row), key = currentRow, current = revision;
+      var words = imageText.value.trim();
+      if (!words) { imageText.focus(); return; }
+      if (!row || !file || imageJobs[key]) return;
+      imageJobs[key] = true; promptAgain.disabled = true; status.textContent = 'Queuing image stinger...';
+      var dialogue = imageMode.value === 'dialogue';
+      var body = {mode: 'reference', purpose: 'parody_stinger', source: file, source_type: 'gallery',
+        prompt: dialogue ? 'Create a Pine Box FM stinger using the supplied image. Natural motion and synchronized spoken dialogue. No captions or logos.' : words,
+        speech: dialogue ? words : '', duration_mode: 'at_least', steps: 4, air_it: false,
+        source_generation: row.prompt_id, variant_of: row.prompt_id};
+      root.pineDesktop.post('/api/comfy/workshop', body).then(function (got) {
+        if (gone || current !== revision) return;
+        if (!got || !(got.queue_id || got.prompt_id)) throw new Error('No H3 job was confirmed.');
+        status.textContent = 'Image stinger queued for H3. The image is unchanged.';
+      }).catch(function (err) {
+        if (!gone && current === revision) status.textContent = 'Could not submit: ' + err.message;
+      }).finally(function () {
+        delete imageJobs[key];
+        if (!gone && currentRow === key) promptAgain.disabled = false;
+      });
+    }
     reprompt.addEventListener('submit', function (event) {
       event.preventDefault();
       var row = rows[index], ref = row && references[row.prompt_id], current = revision;
@@ -113,12 +275,16 @@
     var external = make('a', 'pine-voice-ad-open', 'Open media'); external.target = '_blank'; external.rel = 'noopener';
     actions.appendChild(external); actions.appendChild(command('Close ad viewer', 'c:close--filled', close)); box.appendChild(actions);
     veil.appendChild(box); document.body.appendChild(veil);
+    if (gallery && root.PineDuck && typeof root.PineDuck.hold === 'function') {
+      duckApi = root.PineDuck;
+      duckApi.hold('pine-box-gallery', 0.05, veil);
+    }
     veil.addEventListener('click', function (e) { if (e.target === veil) close(); });
     var focusWas = document.activeElement;
     function keys(e) {
       if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); close(); }
       if (e.key === 'Tab') {
-        var controls = Array.from(box.querySelectorAll('button:not(:disabled),a[href],textarea')).filter(function (n) { return n.getClientRects().length; });
+        var controls = Array.from(box.querySelectorAll('button:not(:disabled),a[href],textarea,input:not(:disabled),select:not(:disabled)')).filter(function (n) { return n.getClientRects().length; });
         var at = controls.indexOf(document.activeElement);
         if (controls.length && (at < 0 || (e.shiftKey ? at === 0 : at === controls.length - 1))) {
           e.preventDefault(); controls[e.shiftKey ? controls.length - 1 : 0].focus();
@@ -127,7 +293,10 @@
     }
     document.addEventListener('keydown', keys, true);
     function close() {
-      gone = true; revision++; clearInterval(crawl); clearTimeout(exportTimer); disposeMedia(); veil.remove();
+      gone = true; revision++; clearInterval(crawl); clearInterval(h3Timer);
+      clearTimeout(exportTimer); disposeMedia(); veil.remove();
+      if (duckApi && typeof duckApi.release === 'function') duckApi.release('pine-box-gallery');
+      duckApi = null;
       if (posterObserver) posterObserver.disconnect(); posterQueue = [];
       document.removeEventListener('keydown', keys, true); opened = null;
       if (focusWas && focusWas.isConnected) focusWas.focus();
@@ -224,19 +393,29 @@
       var current = ++revision;
       disposeMedia(); disposeMedia = function () {}; clearTimeout(exportTimer); stage.replaceChildren();
       var row = rows[index], file = mediaFile(row), scene = null, frame = 0, timer = 0;
-      if (currentRow !== row.prompt_id) {
-        currentRow = row.prompt_id; original = false; reprompt.hidden = true; promptAgain.setAttribute('aria-expanded','false');
+      var generatedVideo = /\.(mp4|webm|mov|m4v)$/i.test(file || '');
+      var rowKey = row.prompt_id + ':' + file;
+      if (currentRow !== rowKey) {
+        currentRow = rowKey; original = false; reprompt.hidden = true; promptAgain.setAttribute('aria-expanded','false');
         direction.value = String(row.tags || row.request || '').slice(0,1800); speech.value = row.speech || ''; submit.disabled = false;
+        var draft = imageDrafts[rowKey] || {mode: 'prompt', text: ''};
+        imageMode.value = draft.mode; imageText.value = draft.text;
       }
+      imageForm.hidden = generatedVideo || !file;
+      promptAgain.textContent = generatedVideo ? 'Prompt original again' : 'Render H3 video';
+      promptAgain.title = generatedVideo ? 'Send the recorded original through H3 with a new direction' : 'Render this image as an H3 stinger';
       var reference = references[row.prompt_id];
       generatedButton.setAttribute('aria-pressed', String(!original)); originalButton.setAttribute('aria-pressed', String(original));
       originalButton.disabled = !reference || !reference.available;
-      promptAgain.disabled = !reference || !reference.available || reference.kind !== 'video';
+      promptAgain.disabled = generatedVideo ? !reference || !reference.available || reference.kind !== 'video' : !file || !!imageJobs[rowKey];
+      splice.disabled = !generatedVideo || !reference || !reference.available || reference.kind !== 'video';
       originalButton.title = reference && !reference.available ? reference.reason || 'Original unavailable' : 'Original reference';
       if (!reference) root.pineDesktop.get('/api/comfy/workshop/reference/' + encodeURIComponent(row.prompt_id)).then(function (got) {
         references[row.prompt_id] = got;
         if (gone || current !== revision) return;
-        originalButton.disabled = !got.available; promptAgain.disabled = !got.available || got.kind !== 'video';
+        originalButton.disabled = !got.available;
+        if (generatedVideo) promptAgain.disabled = !got.available || got.kind !== 'video';
+        splice.disabled = !generatedVideo || !got.available || got.kind !== 'video';
         originalButton.title = got.available ? 'Original reference' : got.reason || 'Original unavailable';
       }).catch(function (err) { if (!gone && current === revision) originalButton.title = 'Reference lookup failed: ' + err.message; });
       if (gallery && !fromStrip && (index < stripStart || index >= stripStart + 80)) stripStart = Math.max(0, index - 10);
@@ -245,7 +424,7 @@
       position.textContent = (rows.length - index) + ' / ' + rows.length;
       description.textContent = String(row.request || row.tags || 'Pine Box ad');
       save.disabled = !file || !signatures[file]; status.textContent = '';
-      if (!file) { status.textContent = 'This ad has no playable output file.'; external.removeAttribute('href'); return; }
+      if (!file) { splice.disabled = true; status.textContent = 'This ad has no playable output file.'; external.removeAttribute('href'); return; }
       var base = sourceUrl(file, false);
       if (original && reference && reference.available) base = typeof root.desktopMusicUrl === 'function' ? root.desktopMusicUrl(reference.url) : reference.url;
       external.href = base;
@@ -253,7 +432,7 @@
       var play = make('button', 'pav-play'); play.type = 'button'; play.title = 'Play Pine Box ad'; play.setAttribute('aria-label', play.title);
       var logo = make('img', 'pav-logo'); logo.alt = 'Pine Box'; logo.src = root.__pineLogo || '/spark/asset/pinebox.png';
       play.appendChild(logo); stage.appendChild(play);
-      var isVideo = original ? reference.kind === 'video' : /\.(mp4|webm|mov|m4v)$/i.test(file), media = make(isVideo ? 'video' : 'img', 'pav-media');
+      var isVideo = original ? reference.kind === 'video' : generatedVideo, media = make(isVideo ? 'video' : 'img', 'pav-media');
       media.style.visibility = 'hidden'; stage.appendChild(media);
       var waiting = true;
       function background(on) {

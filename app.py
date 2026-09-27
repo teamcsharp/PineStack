@@ -134,9 +134,24 @@ from fastapi.responses import (FileResponse, HTMLResponse,
                                PlainTextResponse, Response,
                                StreamingResponse)
 
+# #1470: JSON ENCODING OFF THE STDLIB. /api/pulse named `iterencode` -
+# json.dumps of a large answer (/api/dj/pending is 2.2 MB) running on the
+# event loop - as one of the station's standing stalls (1.6 s measured
+# 2026-09-27). orjson is already here for the vector store (#1412) and
+# renders the same dict in a tenth of the time. jsonable_encoder still
+# runs first, so every value is already JSON-shaped when it arrives; NaN
+# becomes null instead of a 500. Falls back to the stdlib response if the
+# import ever fails, so a missing wheel cannot keep the station down.
+try:
+    from fastapi.responses import ORJSONResponse as _PineJSONResponse
+    import orjson as _orjson_present  # noqa: F401
+except Exception:  # noqa: BLE001
+    from fastapi.responses import JSONResponse as _PineJSONResponse
+
 app = FastAPI(
     title="PineBoxAgent",
     version="5.5.0",
+    default_response_class=_PineJSONResponse,
 )
 
 
@@ -73832,9 +73847,24 @@ def speakbox_scan_cache(rid: str = "") -> dict[str, Any]:
             except Exception:  # noqa: BLE001
                 held["scanning"] = False
         return held
-    got = _speakbox_scan(key)             # cold: this one pays for it
-    _SPEAKBOX_DIR[key] = got
-    return got
+    # #1470: THE COLD SCAN IS NOT PAID ON THE LOOP EITHER. "this one pays
+    # for it" was 7.0 s, twice, in one ten-minute window on 2026-09-27 -
+    # the whole station holding its breath for a folder listing. The first
+    # caller after a restart gets an honest empty folder marked scanning,
+    # the same trade the pinelink census makes, and the thread fills it in
+    # seconds; #221's promise (a dropped document is in play within a
+    # minute) is kept.
+    held = {"at": 0.0, "files": [], "mtime": {}, "size": {},
+            "scanning": True}
+    _SPEAKBOX_DIR[key] = held
+
+    def _cold() -> None:
+        try:
+            _SPEAKBOX_DIR[key] = _speakbox_scan(key)
+        except Exception:  # noqa: BLE001
+            held["scanning"] = False      # the next call tries again
+    Thread(target=_cold, name="speakbox-scan", daemon=True).start()
+    return held
 
 
 def speakbox_all(rid: str = "") -> list[Path]:
@@ -80728,9 +80758,50 @@ def sfx_plays() -> dict[str, Any]:
     return rows
 
 
+# #1470: THE LEDGER'S WRITE, OFF THE LOOP. sfx_note_play is reached from
+# the page's playout acknowledgment (dj_voice_ack_api -> page_playback_ack)
+# on the event loop, and it wrote the whole plays ledger back to disk on
+# every play - measured 1.56 s and 3.07 s stalls on 2026-09-27 while the
+# store's save was starving the disk. The count is still taken at once,
+# under the same lock, in the memo; only the write is handed to a thread.
+# The memo's mtime stamp is refreshed after the write so a re-read can
+# never replace counted plays with an older file (#1062's cache reads the
+# file whenever the stamp moves).
+_SFX_PLAYS_WRITE_LOCK = RLock()
+_SFX_PLAYS_FLUSH: dict[str, bool] = {"pending": False}
+
+
+def _sfx_plays_flush() -> None:
+    with _SFX_PLAYS_WRITE_LOCK:
+        with _SFX_PLAYS_LOCK:
+            _SFX_PLAYS_FLUSH["pending"] = False
+            text = json.dumps(_SFX_PLAYS_MEMO.get("rows") or {}, indent=1)
+        try:
+            SFX_PLAYS_PATH.parent.mkdir(parents=True, exist_ok=True)
+            SFX_PLAYS_PATH.write_text(text)
+            with _SFX_PLAYS_LOCK:
+                _SFX_PLAYS_MEMO["at"] = SFX_PLAYS_PATH.stat().st_mtime_ns
+        except OSError:
+            pass                        # an uncounted play still played
+
+
+def _sfx_plays_flush_later() -> None:
+    with _SFX_PLAYS_LOCK:
+        if _SFX_PLAYS_FLUSH["pending"]:
+            return
+        _SFX_PLAYS_FLUSH["pending"] = True
+    Thread(target=_sfx_plays_flush, name="sfx-plays-flush",
+           daemon=True).start()
+
+
 def sfx_note_play(sid: str, name: str, who: str, ms: int = 0) -> None:
     with _SFX_PLAYS_LOCK:
-        rows = sfx_plays()
+        # While a write is pending the memo is the truth: the file is
+        # older than what has been counted.
+        rows = (_SFX_PLAYS_MEMO.get("rows")
+                if _SFX_PLAYS_FLUSH["pending"] else sfx_plays())
+        if not isinstance(rows, dict):
+            rows = sfx_plays()
         row = rows.get(sid) or {"name": name, "plays": 0, "by": {}}
         row["name"] = name
         row["plays"] = int(row.get("plays") or 0) + 1
@@ -80748,11 +80819,8 @@ def sfx_note_play(sid: str, name: str, who: str, ms: int = 0) -> None:
         days[today] = int(days.get(today) or 0) + 1
         row["days"] = days
         rows[sid] = row
-        try:
-            SFX_PLAYS_PATH.parent.mkdir(parents=True, exist_ok=True)
-            SFX_PLAYS_PATH.write_text(json.dumps(rows, indent=1))
-        except OSError:
-            pass                        # an uncounted play still played
+        _SFX_PLAYS_MEMO["rows"] = rows
+        _sfx_plays_flush_later()        # #1470: the disk, on a thread
 
 
 def sfx_ban_set(sid: str, banned: bool) -> set[str]:
@@ -168099,7 +168167,14 @@ async def _comfy_workshop_render_payload(payload: dict[str, Any]) -> dict[str, A
             else comfy_workshop.clamp_frames(payload.get("frames")))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    step_count = comfy_workshop.clamp_steps(payload.get("steps"))
+    # [h3-quality] the profile the box can take now; a caller's steps count
+    # only as steps_override (every client hardcoded the old default of four)
+    _prof, _prof_note = comfy_workshop.quality_for_box(
+        box_hottest_c(), comfy_host_available_gb(), RENDER_TEMP_CEILING_C, VIDEO_RENDER_FLOOR_GB)
+    if _prof_note:
+        pipeline_log("gpu", "H3 quality " + _prof_note)
+    step_count = (comfy_workshop.clamp_steps(payload.get("steps_override"))
+                  if payload.get("steps_override") is not None else int(_prof["steps"]))
     noise_seed = comfy_workshop.render_seed(payload.get("seed"))
     final_prompt = comfy_workshop.compose_prompt(
         prompt, speech, media_kind, mode)
@@ -168107,7 +168182,8 @@ async def _comfy_workshop_render_payload(payload: dict[str, Any]) -> dict[str, A
         graph = comfy_workshop.build_workflow(
             final_prompt, mode=mode, upload_name=upload_name,
             media_kind=media_kind, frames=frame_count,
-            steps=step_count, seed=noise_seed)
+            steps=step_count, seed=noise_seed,
+            width=_prof["width"], height=_prof["height"], max_frames=_prof["max_frames"])   # [h3-quality]
         prompt_id, model = await _submit_generation(
             final_prompt, prompt or speech, "video", workflow=graph,
             metadata={"mode": mode, "source": source_id,
@@ -168119,6 +168195,7 @@ async def _comfy_workshop_render_payload(payload: dict[str, Any]) -> dict[str, A
                           payload.get("variant_of") or payload.get("source_generation") or "")[:120],
                       "air_it": bool(payload.get("air_it")),
                       "frames": frame_count, "steps": step_count,
+                      "quality": _prof["preset"], "size": "%dx%d" % (_prof["width"], _prof["height"]),   # [h3-quality]
                       "seed": noise_seed, "at_share": at_share,
                       "duration_mode": str(payload.get("duration_mode") or "auto"),
                       "duration_seconds": round(frame_count / 24, 2),
@@ -168401,16 +168478,18 @@ def h3_hourly_load() -> dict[str, Any]:
     rest from a speech-indexed clip) - what the clock always did, made
     visible and switchable."""
     if not _H3_HOURLY_STATE:
-        state: dict[str, Any] = {"enabled": True, "gallery_share": 20}
+        state: dict[str, Any] = {"enabled": True, "gallery_share": 20,
+                                 "quality": dict(comfy_workshop.QUALITY)}        # [h3-quality]
         try:
             got = json.loads(_H3_HOURLY_FILE.read_text(encoding="utf-8"))
             if isinstance(got, dict):
                 state.update({k: got[k] for k in ("enabled", "gallery_share", "last_at", "last_message",
-                                                    "last_source", "last_marker") if k in got})
+                                                    "last_source", "last_marker", "quality") if k in got})
         except FileNotFoundError:
             pass
         except Exception as exc:  # noqa: BLE001
             pipeline_log("ads", "hourly H3 switch unreadable: %s" % type(exc).__name__)
+        state["quality"] = comfy_workshop.set_quality(state.get("quality"))     # [h3-quality] in force
         _H3_HOURLY_STATE.update(state)
     return _H3_HOURLY_STATE
 
@@ -168427,6 +168506,8 @@ def h3_hourly_save(patch: dict[str, Any]) -> dict[str, Any]:
     for key in ("last_at", "last_message", "last_source", "last_marker"):
         if key in patch:
             state[key] = patch[key]
+    if isinstance(patch.get("quality"), dict):                            # [h3-quality]
+        state["quality"] = comfy_workshop.set_quality(patch["quality"])
     try:
         tmp = _H3_HOURLY_FILE.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(state, indent=1), encoding="utf-8")
@@ -168459,7 +168540,14 @@ def h3_hourly_view() -> dict[str, Any]:
             "seconds_remaining": max(0.0, round(next_at - now_ts, 1)),
             "next_at": next_at, "radio_on": bool(_RADIO.get("on")),
             "last_at": state.get("last_at"), "last_message": state.get("last_message"),
-            "last_source": state.get("last_source")}
+            "last_source": state.get("last_source"),
+            # [h3-quality] the profile in force, the presets, and what the box can take
+            "quality": dict(comfy_workshop.QUALITY),
+            "presets": {k: dict(v) for k, v in comfy_workshop.PRESETS.items()},
+            "step_choices": list(comfy_workshop.STEP_CHOICES),
+            "frame_choices": list(comfy_workshop.FRAME_CHOICES),
+            "box": {"hottest_c": box_hottest_c(), "available_gb": comfy_host_available_gb(),
+                    "ceiling_c": RENDER_TEMP_CEILING_C, "floor_gb": VIDEO_RENDER_FLOOR_GB}}
 
 
 def h3_hourly_ad_prompt() -> str:
@@ -168559,7 +168647,7 @@ async def h3_hourly_set(request: Request, authorization: str | None = Header(def
     payload = await request.json()
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="Expected an object")
-    state = h3_hourly_save({k: payload[k] for k in ("enabled", "gallery_share") if k in payload})
+    state = h3_hourly_save({k: payload[k] for k in ("enabled", "gallery_share", "quality") if k in payload})
     pipeline_log("ads", "hourly H3 switch: %s, %d%% gallery images" %
                  ("on" if state.get("enabled", True) is not False else "off", int(state.get("gallery_share", 20))))
     return h3_hourly_view()
@@ -168584,6 +168672,7 @@ async def _parody_stinger_start() -> None:
     global _parody_stinger_task
     _parody_stinger_queue()
     _parody_stinger_task = asyncio.create_task(_parody_stinger_worker())
+    h3_hourly_load()                        # [h3-quality] the profile in force before the first render
     fire_and_forget(h3_hourly_ad_clock())
     fire_and_forget(h3_capacity_keeper())
 
@@ -168672,13 +168761,18 @@ async def comfy_workshop_variant(
                 payload.get("frames", parent.get("frames"))))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    steps = comfy_workshop.clamp_steps(
-        payload.get("steps", parent.get("steps")))
+    _prof, _prof_note = comfy_workshop.quality_for_box(                  # [h3-quality]
+        box_hottest_c(), comfy_host_available_gb(), RENDER_TEMP_CEILING_C, VIDEO_RENDER_FLOOR_GB)
+    if _prof_note:
+        pipeline_log("gpu", "H3 quality " + _prof_note)
+    steps = (comfy_workshop.clamp_steps(payload.get("steps_override"))
+             if payload.get("steps_override") is not None else int(_prof["steps"]))
     seed = comfy_workshop.render_seed(payload.get("seed"))
     try:
         graph = comfy_workshop.build_workflow(
             prompt, mode=mode, upload_name=upload_name,
-            media_kind=media_kind, frames=frames, steps=steps, seed=seed)
+            media_kind=media_kind, frames=frames, steps=steps, seed=seed,
+            width=_prof["width"], height=_prof["height"], max_frames=_prof["max_frames"])   # [h3-quality]
         prompt_id, model = await _submit_generation(
             prompt, "Variant of " + str(parent.get("request") or
                                         (parent.get("files") or ["render"])[0]),
@@ -168688,6 +168782,7 @@ async def comfy_workshop_variant(
                       "speech": str(parent.get("speech") or "")[:800],
                       "air_it": bool(payload.get("air_it")),
                       "frames": frames, "steps": steps, "seed": seed,
+                      "quality": _prof["preset"], "size": "%dx%d" % (_prof["width"], _prof["height"]),   # [h3-quality]
                       "at_share": at_share,
                       "trim_in_s": trim_in_s,
                       "trim_out_s": trim_out_s,
