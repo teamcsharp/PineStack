@@ -15,6 +15,10 @@ EDITS = [
      '        prompt, speech, media_kind, mode)\n',
      '    final_prompt = comfy_workshop.compose_prompt(\n'
      '        prompt, speech, media_kind, mode, seconds=frame_count / 24.0)   # [h3-free-wins] timed shots\n', 1),
+    ("style-per-road",
+     '        prompt, speech, media_kind, mode, seconds=frame_count / 24.0)   # [h3-free-wins] timed shots\n',
+     '        prompt, speech, media_kind, mode, seconds=frame_count / 24.0,   # [h3-free-wins] timed shots\n'
+     '        purpose=purpose, style=payload.get("style"))                   # [h3-brief] one style term per road\n', 1),
 ]
 
 
@@ -32,9 +36,14 @@ def state_of(text, old, new, count):
 
 
 def check(text):
+    """The edits are a chain: later edits consume the earlier ones' text, so
+    an earlier edit counts as applied when any later edit's text is present."""
     applied, missing = 0, []
-    for name, old, new, count in plan(text):
+    edits = plan(text)
+    for i, (name, old, new, count) in enumerate(edits):
         state = state_of(text, old, new, count)
+        if state != "applied" and any(text.count(later[2]) >= 1 for later in edits[i + 1:]):
+            state = "applied"
         if state == "applied":
             applied += 1
         elif state != "ready":
@@ -52,10 +61,12 @@ def apply(path):
         for m in missing:
             print("missing:", m)
         return 1
-    for name, old, new, count in plan(text):
-        if state_of(text, old, new, count) == "applied":
+    edits = plan(text)
+    for i, (name, old, new, count) in enumerate(edits):
+        if state_of(text, old, new, count) == "applied" or any(text.count(later[2]) >= 1 for later in edits[i + 1:]):
             continue
-        text = text.replace(old, new)
+        if text.count(old) == count:
+            text = text.replace(old, new)
     fd, tmp = tempfile.mkstemp(prefix=path.name + ".", dir=str(path.parent))
     with os.fdopen(fd, "wb") as fh:
         fh.write(text.encode("utf-8"))

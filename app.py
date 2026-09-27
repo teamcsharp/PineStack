@@ -168177,7 +168177,8 @@ async def _comfy_workshop_render_payload(payload: dict[str, Any]) -> dict[str, A
                   if payload.get("steps_override") is not None else int(_prof["steps"]))
     noise_seed = comfy_workshop.render_seed(payload.get("seed"))
     final_prompt = comfy_workshop.compose_prompt(
-        prompt, speech, media_kind, mode, seconds=frame_count / 24.0)   # [h3-free-wins] timed shots
+        prompt, speech, media_kind, mode, seconds=frame_count / 24.0,   # [h3-free-wins] timed shots
+        purpose=purpose, style=payload.get("style"))                   # [h3-brief] one style term per road
     try:
         graph = comfy_workshop.build_workflow(
             final_prompt, mode=mode, upload_name=upload_name,
@@ -168479,17 +168480,19 @@ def h3_hourly_load() -> dict[str, Any]:
     visible and switchable."""
     if not _H3_HOURLY_STATE:
         state: dict[str, Any] = {"enabled": True, "gallery_share": 20,
-                                 "quality": dict(comfy_workshop.QUALITY)}        # [h3-quality]
+                                 "quality": dict(comfy_workshop.QUALITY),        # [h3-quality]
+                                 "brief": dict(comfy_workshop.BRIEF)}            # [h3-brief-config]
         try:
             got = json.loads(_H3_HOURLY_FILE.read_text(encoding="utf-8"))
             if isinstance(got, dict):
                 state.update({k: got[k] for k in ("enabled", "gallery_share", "last_at", "last_message",
-                                                    "last_source", "last_marker", "quality") if k in got})
+                                                    "last_source", "last_marker", "quality", "brief") if k in got})
         except FileNotFoundError:
             pass
         except Exception as exc:  # noqa: BLE001
             pipeline_log("ads", "hourly H3 switch unreadable: %s" % type(exc).__name__)
         state["quality"] = comfy_workshop.set_quality(state.get("quality"))     # [h3-quality] in force
+        state["brief"] = comfy_workshop.set_brief(state.get("brief"))           # [h3-brief-config]
         _H3_HOURLY_STATE.update(state)
     return _H3_HOURLY_STATE
 
@@ -168508,6 +168511,8 @@ def h3_hourly_save(patch: dict[str, Any]) -> dict[str, Any]:
             state[key] = patch[key]
     if isinstance(patch.get("quality"), dict):                            # [h3-quality]
         state["quality"] = comfy_workshop.set_quality(patch["quality"])
+    if isinstance(patch.get("brief"), dict):                              # [h3-brief-config]
+        state["brief"] = comfy_workshop.set_brief(patch["brief"])
     try:
         tmp = _H3_HOURLY_FILE.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(state, indent=1), encoding="utf-8")
@@ -168545,6 +168550,11 @@ def h3_hourly_view() -> dict[str, Any]:
             "quality": dict(comfy_workshop.QUALITY),
             "presets": {k: dict(v) for k, v in comfy_workshop.PRESETS.items()},
             "step_choices": list(comfy_workshop.STEP_CHOICES),
+            # [h3-brief-config] the brief's knobs and their choices
+            "brief": dict(comfy_workshop.BRIEF), "brief_defaults": dict(comfy_workshop.BRIEF_DEFAULTS),
+            "follow_choices": list(comfy_workshop.FOLLOW_CHOICES), "shot_choices": list(comfy_workshop.SHOT_CHOICES),
+            "sampler_choices": list(comfy_workshop.SAMPLER_CHOICES), "scheduler_choices": list(comfy_workshop.SCHEDULER_CHOICES),
+            "default_constraints": comfy_workshop.DEFAULT_CONSTRAINTS, "default_audio": comfy_workshop.DEFAULT_AUDIO,
             "frame_choices": list(comfy_workshop.FRAME_CHOICES),
             "box": {"hottest_c": box_hottest_c(), "available_gb": comfy_host_available_gb(),
                     "ceiling_c": RENDER_TEMP_CEILING_C, "floor_gb": VIDEO_RENDER_FLOOR_GB}}
@@ -168647,7 +168657,7 @@ async def h3_hourly_set(request: Request, authorization: str | None = Header(def
     payload = await request.json()
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="Expected an object")
-    state = h3_hourly_save({k: payload[k] for k in ("enabled", "gallery_share", "quality") if k in payload})
+    state = h3_hourly_save({k: payload[k] for k in ("enabled", "gallery_share", "quality", "brief") if k in payload})
     pipeline_log("ads", "hourly H3 switch: %s, %d%% gallery images" %
                  ("on" if state.get("enabled", True) is not False else "off", int(state.get("gallery_share", 20))))
     return h3_hourly_view()

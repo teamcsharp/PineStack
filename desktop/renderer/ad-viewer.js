@@ -75,6 +75,7 @@
       if (!known && q.width) qOpt(qSize, q.width + 'x' + q.height, q.width + ' x ' + q.height, true);
       qSecs.replaceChildren();
       ((state && state.frame_choices) || [73, 124, 169, 241, 289, 361]).forEach(function (f) { qOpt(qSecs, f, 'up to ' + Math.round(f / 24) + ' s', Number(q.max_frames) === Number(f)); });
+      paintKnobs(state);
       var box = (state && state.box) || {};
       qBox.textContent = 'box now: ' + (box.hottest_c != null ? Math.round(box.hottest_c) + ' C of ' + Math.round(box.ceiling_c || 90) + ' C' : 'heat unknown')
         + ', ' + (box.available_gb != null ? Math.round(box.available_gb) + ' GB free (the double frame wants ' + Math.round((box.floor_gb || 60) + 30) + ')' : 'memory unknown');
@@ -86,16 +87,57 @@
     [qSteps, qSize, qSecs].forEach(function (sel) { sel.addEventListener('change', function () { qPreset.value = 'custom'; }); });
     qApply.addEventListener('click', function () {
       var wh = String(qSize.value).split('x');
-      var body = {quality: {preset: qPreset.value, steps: Number(qSteps.value), width: Number(wh[0]), height: Number(wh[1]), max_frames: Number(qSecs.value)}};
+      var body = {quality: {preset: qPreset.value, steps: Number(qSteps.value), width: Number(wh[0]), height: Number(wh[1]), max_frames: Number(qSecs.value),
+          easycache: qCache.checked, shift: qShiftOn.checked ? [Number(qShiftV.value) || 12, Number(qShiftA.value) || 3] : null,
+          sampler: qSampler.value, scheduler: qSched.value},
+        brief: {style: bStyle.value, follow: bFollow.value, shots: bShots.value, constraints: bCons.value, audio_direction: bAudio.value}};
       qApply.disabled = true; qNote.textContent = 'saving...';
       root.pineDesktop.post('/api/h3/hourly', body).then(function (state) {
         h3State = state || {}; h3State.client_at = Date.now() / 1000; paintH3(); paintQuality(h3State);
         var q = h3State.quality || {};
-        qNote.textContent = 'Every H3 render now runs at ' + q.steps + ' steps, ' + q.width + ' x ' + q.height + ', up to ' + Math.round((q.max_frames || 0) / 24) + ' s - stepped down while the box is hot or full.';
+        var b = h3State.brief || {};
+        qNote.textContent = 'Every H3 render now runs at ' + q.steps + ' steps, ' + q.width + ' x ' + q.height + ', up to ' + Math.round((q.max_frames || 0) / 24) + ' s'
+          + (q.easycache === false ? ', no cache' : '') + (q.shift ? ', shift ' + q.shift.join('/') : '') + (q.sampler && q.sampler !== 'turbo' ? ', ' + q.sampler + '+' + q.scheduler : '')
+          + '; the brief: ' + (b.style || 'style per road') + ', ' + (FOLLOW_WORDS[b.follow] || 'auto') + ', ' + (SHOT_WORDS[b.shots] || 'by length') + '. Stepped down while the box is hot or full.';
       }).catch(function (err) { qNote.textContent = 'Could not save: ' + ((err && err.message) || err); })
         .finally(function () { qApply.disabled = false; });
     });
-    qualityPanel.append(make('b', '', 'H3 quality'), qPreset, qSteps, qSize, qSecs, qApply, qBox, qNote);
+    /* [h3-brief-config] "add the configuration for these to the H3 Pine box
+       menu so that I can utilize them in prompts": the graph knobs and the
+       brief's knobs sit under the quality row. Blank means the compiler's own
+       default, shown as the placeholder. */
+    var qCache = make('input'); qCache.type = 'checkbox'; qCache.checked = true;
+    var qCacheLabel = make('label', 'pav-q-check'); qCacheLabel.append(qCache, make('span', '', 'EasyCache'));
+    var qShiftOn = make('input'); qShiftOn.type = 'checkbox';
+    var qShiftV = make('input'); qShiftV.type = 'number'; qShiftV.min = '0.01'; qShiftV.max = '100'; qShiftV.step = '0.5'; qShiftV.value = '12'; qShiftV.setAttribute('aria-label', 'video shift');
+    var qShiftA = make('input'); qShiftA.type = 'number'; qShiftA.min = '0.01'; qShiftA.max = '100'; qShiftA.step = '0.5'; qShiftA.value = '3'; qShiftA.setAttribute('aria-label', 'audio shift');
+    var qShiftLabel = make('label', 'pav-q-check'); qShiftLabel.append(qShiftOn, make('span', '', 'sigma shift'), qShiftV, qShiftA);
+    var qSampler = make('select'); qSampler.setAttribute('aria-label', 'sampler');
+    var qSched = make('select'); qSched.setAttribute('aria-label', 'scheduler');
+    var bStyle = make('input'); bStyle.type = 'text'; bStyle.maxLength = 120; bStyle.placeholder = 'style term - blank: one per road'; bStyle.setAttribute('aria-label', 'style term');
+    var bFollow = make('select'); bFollow.setAttribute('aria-label', 'shots follow');
+    var bShots = make('select'); bShots.setAttribute('aria-label', 'shot count');
+    var bCons = make('input'); bCons.type = 'text'; bCons.maxLength = 400; bCons.setAttribute('aria-label', 'constraints');
+    var bAudio = make('input'); bAudio.type = 'text'; bAudio.maxLength = 400; bAudio.setAttribute('aria-label', 'audio direction');
+    var FOLLOW_WORDS = {auto: 'shots follow: auto (the reference on a reference road)', reference: 'shots follow the reference', presenter: 'shots: a presenter to camera'};
+    var SHOT_WORDS = {auto: 'shot count: by length', '1': 'one shot', '2': 'two shots', '3': 'three shots'};
+    var qualityRow = make('div', 'pav-quality-row'); qualityRow.append(make('b', '', 'H3 quality'), qPreset, qSteps, qSize, qSecs, qApply, qBox);
+    var graphRow = make('div', 'pav-quality-row'); graphRow.append(make('b', '', 'Graph'), qCacheLabel, qShiftLabel, qSampler, qSched);
+    var briefRow = make('div', 'pav-quality-row'); briefRow.append(make('b', '', 'Brief'), bStyle, bFollow, bShots, bCons, bAudio);
+    function paintKnobs(state) {
+      var q = (state && state.quality) || {}; var b = (state && state.brief) || {};
+      qCache.checked = q.easycache !== false;
+      qShiftOn.checked = !!(q.shift && q.shift.length === 2);
+      if (q.shift && q.shift.length === 2) { qShiftV.value = String(q.shift[0]); qShiftA.value = String(q.shift[1]); }
+      qSampler.replaceChildren(); ((state && state.sampler_choices) || ['turbo', 'euler']).forEach(function (x) { qOpt(qSampler, x, x === 'turbo' ? 'turbo sampler' : 'sampler: ' + x, (q.sampler || 'turbo') === x); });
+      qSched.replaceChildren(); ((state && state.scheduler_choices) || ['simple', 'beta']).forEach(function (x) { qOpt(qSched, x, 'scheduler: ' + x, (q.scheduler || 'simple') === x); });
+      bStyle.value = b.style || '';
+      bFollow.replaceChildren(); ((state && state.follow_choices) || ['auto', 'reference', 'presenter']).forEach(function (x) { qOpt(bFollow, x, FOLLOW_WORDS[x] || x, (b.follow || 'auto') === x); });
+      bShots.replaceChildren(); ((state && state.shot_choices) || ['auto', '1', '2', '3']).forEach(function (x) { qOpt(bShots, x, SHOT_WORDS[x] || x, (b.shots || 'auto') === x); });
+      bCons.value = b.constraints || ''; bCons.placeholder = (state && state.default_constraints) || 'constraints - blank: standard';
+      bAudio.value = b.audio_direction || ''; bAudio.placeholder = (state && state.default_audio) || 'audio direction - blank: standard';
+    }
+    qualityPanel.append(qualityRow, graphRow, briefRow, qNote);
     if (gallery) head.insertBefore(h3Bar, position);
     function h3Clock(seconds) {
       seconds = Math.max(0, Math.floor(Number(seconds) || 0));

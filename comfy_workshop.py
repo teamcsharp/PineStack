@@ -64,6 +64,37 @@ EASYCACHE = {"reuse_threshold": 0.2, "start_percent": 0.15, "end_percent": 0.95}
 # QUALITY["shift"] = [12, 3]; QUALITY["sampler"] = "euler"; QUALITY["scheduler"] = "beta".
 SAMPLER_CHOICES = ("turbo", "euler", "euler_ancestral", "dpmpp_2m", "res_multistep")
 SCHEDULER_CHOICES = ("simple", "beta", "normal", "sgm_uniform")
+
+# [h3-brief-config] THE BRIEF'S KNOBS, set from the gallery's gear and kept by the
+# station beside the quality profile. Blank means the compiler's own default:
+# the style term per road, shots following the reference on a reference road,
+# the shot count by length, the standard constraints and audio direction.
+BRIEF_DEFAULTS = {"style": "", "follow": "auto", "shots": "auto", "constraints": "", "audio_direction": ""}
+BRIEF = dict(BRIEF_DEFAULTS)
+FOLLOW_CHOICES = ("auto", "reference", "presenter")
+SHOT_CHOICES = ("auto", "1", "2", "3")
+DEFAULT_CONSTRAINTS = ("No added subtitles, captions, logos or on-screen text - what the source already shows stays. "
+                       "One style only.")
+DEFAULT_AUDIO = "One voice only, close and clear; natural room tone; no music; no other voices."
+
+
+def set_brief(profile: Any) -> dict[str, Any]:
+    """[h3-brief-config] Take the brief's knobs from the desk; the clean set now in force."""
+    if not isinstance(profile, dict):
+        return dict(BRIEF)
+    out = dict(BRIEF)
+    if "style" in profile:
+        out["style"] = " ".join(str(profile.get("style") or "").split())[:120]
+    if "follow" in profile:
+        out["follow"] = str(profile.get("follow") or "auto") if str(profile.get("follow") or "auto") in FOLLOW_CHOICES else "auto"
+    if "shots" in profile:
+        out["shots"] = str(profile.get("shots") or "auto") if str(profile.get("shots") or "auto") in SHOT_CHOICES else "auto"
+    for key in ("constraints", "audio_direction"):
+        if key in profile:
+            out[key] = " ".join(str(profile.get(key) or "").split())[:400]
+    BRIEF.clear()
+    BRIEF.update(out)
+    return dict(BRIEF)
 MODES = frozenset({"text", "frame", "reference"})
 MEDIA_KINDS = frozenset({"", "image", "video", "audio"})
 VIDEO_RENDER_INTERVAL_MIN_S = 60.0
@@ -264,33 +295,66 @@ def render_seed(value: Any = None) -> int:
         return secrets.randbits(63)
 
 
-def shot_list(seconds: float, said: str, subject: str = "<Subject 1>", source: str = "<Video 1>") -> list[str]:
-    """[h3-free-wins] Three timed shots the way H3's 32B text encoder reads a
-    brief: establishing, the performance with the spoken line, the sign-off.
-    Timecodes keep the pacing from turning into a slideshow (fal's guide);
-    without a known length the shots are still ordered, just untimed."""
+def shot_list(seconds: float, said: str, subject: str = "<Subject 1>", source: str = "<Video 1>",
+              follow: bool = True, count: Any = None) -> list[str]:
+    """[h3-brief] Timed shots the way H3's 32B text encoder reads a brief.
+    `follow`: the shots follow the reference's own action, framing and camera
+    (a reference road) instead of prescribing a presenter's moves - the brief
+    also asks to keep the motion of <Video 1>, and the two must not fight.
+    The count follows the clip: one shot under 5 s, two under 8 s, three from
+    8 s; untimed when the length is unknown. The line sits in the middle and
+    is spoken exactly once."""
     try:
         total = float(seconds or 0)
     except (TypeError, ValueError):
         total = 0.0
-    if total >= 3.0:
-        a = round(max(0.8, total * 0.25), 1)
-        b = round(max(a + 1.0, total * 0.8), 1)
-        t1, t2, t3 = f"[0 to {a:g} seconds]", f"[{a:g} to {b:g} seconds]", f"[{b:g} to {total:g} seconds]"
+    span = lambda x, y: f"[{x:g} to {y:g} seconds]"  # noqa: E731
+    line = (f"{subject} (S1) says clearly, naturally and exactly once: <d>[English] {said}</d>; "
+            "the sentence completes before the shot ends; no other intelligible speech."
+            if said else f"{subject} performs without required spoken dialogue.")
+    if follow:
+        act = f"the action, framing and camera movement of {source} continue as they are"
+        opening = f"{subject} as {source} shows them; {act}; no speech yet."
+        closing = f"{act} to the end; {subject} finishes the movement {source} was making; nothing is added on screen."
     else:
-        t1, t2, t3 = "[Shot 1]", "[Shot 2]", "[Shot 3]"
-    perform = (f"{subject} (S1), direct to camera, says clearly, naturally and exactly once: <d>[English] {said}</d>. "
-               "The sentence completes inside this shot; no other intelligible speech."
-               if said else f"{subject} performs the action naturally, direct to camera, without required spoken dialogue.")
-    return [
-        f"{t1} Establishing: {subject} in place, the camera language and motion of {source}, natural movement; no speech yet.",
-        f"{t2} The performance: {perform}",
-        f"{t3} Sign-off: {subject} lands the beat with a small, satisfied gesture and holds for the cut; no on-screen text.",
-    ]
+        act = "natural movement in the scene with one camera move"
+        opening = f"{subject} in place; {act}; no speech yet."
+        closing = f"{subject} holds the last beat for the cut; nothing is added on screen."
+    try:
+        want = int(count) if count not in (None, "", "auto") else 0
+    except (TypeError, ValueError):
+        want = 0
+    if total <= 0:
+        return [f"[Shot 1] {opening}", f"[Shot 2] {line}", f"[Shot 3] {closing}"]
+    if want == 1 or (want == 0 and total < 5.0):
+        return [f"{span(0, total)} One shot: {act}; midway, {line}"]
+    if want == 2 or (want == 0 and total < 8.0):
+        a = round(total * 0.6, 1)
+        return [f"{span(0, a)} {opening.replace('; no speech yet.', '.')} Then {line}",
+                f"{span(a, total)} {closing}"]
+    a = round(max(0.8, total * 0.25), 1)
+    b = round(max(a + 1.0, total * 0.8), 1)
+    return [f"{span(0, a)} {opening}", f"{span(a, b)} {line}", f"{span(b, total)} {closing}"]
+
+
+def style_for(purpose: str = "", mode: str = "text", media_kind: str = "") -> str:
+    """[h3-brief] ONE style term per road (two make H3 pick one at random):
+    an ad or a stinger is a polished broadcast commercial; a render off a
+    gallery picture or a clip takes that source's style; free direction gets
+    a clean default it can override by naming its own style."""
+    road = str(purpose or "").strip().lower()
+    if road in ("parody_stinger", "voice_ad", "image_ad", "ad", "stinger", "hourly"):
+        return "polished broadcast commercial"
+    if mode == "reference" and media_kind == "video":
+        return "the style of <Video 1>, as it is"
+    if (mode == "reference" and media_kind == "image") or mode == "frame":
+        return "the style of <Picture 1>, as it is"
+    return "clean cinematic realism"
 
 
 def compose_prompt(prompt: str, speech: str = "", media_kind: str = "",
-                   mode: str = "text", seconds: float = 0.0) -> str:
+                   mode: str = "text", seconds: float = 0.0, purpose: str = "",
+                   style: Any = None) -> str:
     """Build H3's reference-aware prompt, including an exact dialogue contract.
 
     [h3-free-wins] The brief reads like production paperwork: a role for
@@ -303,6 +367,12 @@ def compose_prompt(prompt: str, speech: str = "", media_kind: str = "",
     said = re.sub(r"<[^>]+>", "", " ".join(str(speech or "").split()))[:700]
     kind = media_kind if media_kind in MEDIA_KINDS else ""
     use_mode = mode if mode in MODES else "text"
+    style_term = (" ".join(str(style or "").split())[:120] or BRIEF.get("style")
+                  or style_for(purpose, use_mode, kind))                                  # [h3-brief][h3-brief-config]
+    follow_pref = BRIEF.get("follow") or "auto"
+    shot_count = BRIEF.get("shots") or "auto"
+    constraints_line = BRIEF.get("constraints") or ""
+    audio_line = BRIEF.get("audio_direction") or ""
 
     # MiniMax H3's full-reference format makes both sides of the source
     # explicit: the picture is <Video 1>; its paired sound is <Audio 1>.
@@ -327,7 +397,7 @@ def compose_prompt(prompt: str, speech: str = "", media_kind: str = "",
             dialogue = ("<Subject 1> (S1) performs the action naturally without any "
                         "required spoken dialogue.")
             soundscape = "Natural diegetic sound and quiet room tone only."
-        shots = shot_list(seconds, said)
+        shots = shot_list(seconds, said, follow=(follow_pref != "presenter"), count=shot_count)
         return "\n".join((
             "subject_definitions:",
             "<Subject 1> is the primary visible performer in <Video 1>.",
@@ -335,10 +405,9 @@ def compose_prompt(prompt: str, speech: str = "", media_kind: str = "",
             "vocal timbre, cadence, and natural room texture for <Subject 1> (S1). "
             "Do not reuse its source words.",
             "", "summary:",
-            "Create one continuous polished Pine Box FM commercial performance that "
-            "retains the identity, camera language, and motion of <Video 1> while "
-            "producing new synchronized speech.",
-            "", "style:", "polished broadcast commercial - one style only, no second style.",
+            "Create one continuous, polished performance that retains the identity, "
+            "camera language, and motion of <Video 1> while producing new synchronized speech.",
+            "", "style:", f"{style_term} - one style only, no second style.",
             "", "retention_analysis:",
             "<Subject 1>: preserve the visible person's identity, facial features, "
             "hair, clothing, body language, and performance energy from <Video 1>.",
@@ -348,13 +417,14 @@ def compose_prompt(prompt: str, speech: str = "", media_kind: str = "",
             f"Scene: {visual}.",                     # the line itself is in the performance shot, once
             *shots,
             "", "audio_direction:",
-            "Only <Subject 1>'s voice, in the timbre and cadence of <Audio 1>; the room tone of <Video 1> "
-            "under it; clothing and movement sounds where the picture shows them; no other voices.",
+            audio_line or ("Only <Subject 1>'s voice, in the timbre and cadence of <Audio 1>; the room tone of <Video 1> "
+                           "under it; clothing and movement sounds where the picture shows them; no other voices."),
             "", "overall_soundscape:", soundscape,
             "", "non_diegetic_music:", "No background music.",
             "", "constraints:",
-            "No subtitles. No captions. No logos. No on-screen text. No second style. "
-            "Preserve <Subject 1>'s identity exactly. The scripted line is spoken once and completes.",
+            (constraints_line + " " if constraints_line else
+             "No added subtitles, captions, logos or on-screen text - what <Video 1> already shows stays. One style only. ")
+            + "Preserve <Subject 1>'s identity exactly. The scripted line is spoken once and completes.",
         ))[:3400]
 
     lead = clean or "A concise cinematic station ident"
@@ -370,12 +440,13 @@ def compose_prompt(prompt: str, speech: str = "", media_kind: str = "",
     # [h3-free-wins] timed shots, sound and constraints for the text and frame roads too
     subject = "<Picture 1>'s subject" if (use_mode == "reference" and kind == "image") or use_mode == "frame" else "the presenter"
     source = "<Picture 1>" if subject.startswith("<Picture") else "the scene"
-    shots = shot_list(seconds, said, subject=subject, source=source)
+    follow_here = (source != "the scene") if follow_pref == "auto" else follow_pref == "reference"
+    shots = shot_list(seconds, said, subject=subject, source=source, follow=follow_here, count=shot_count)
     return "\n".join((
-        lead, "", "style:", "polished broadcast commercial - one style only.",
+        lead, "", "style:", f"{style_term} - one style only.",
         "", "shots:", *shots,
-        "", "audio_direction:", "One voice only, close and clear; natural room tone; no music; no other voices.",
-        "", "constraints:", "No subtitles. No captions. No logos. No on-screen text. No second style.",
+        "", "audio_direction:", audio_line or DEFAULT_AUDIO,
+        "", "constraints:", constraints_line or DEFAULT_CONSTRAINTS,
     ))[:3400]
 
 

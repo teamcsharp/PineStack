@@ -34,17 +34,19 @@ EDITS = [
      '            pipeline_log("ads", "hourly H3 switch unreadable: %s" % type(exc).__name__)\n'
      '        _H3_HOURLY_STATE.update(state)\n',
      '        state: dict[str, Any] = {"enabled": True, "gallery_share": 20,\n'
-     '                                 "quality": dict(comfy_workshop.QUALITY)}        # [h3-quality]\n'
+     '                                 "quality": dict(comfy_workshop.QUALITY),        # [h3-quality]\n'
+     '                                 "brief": dict(comfy_workshop.BRIEF)}            # [h3-brief-config]\n'
      '        try:\n'
      '            got = json.loads(_H3_HOURLY_FILE.read_text(encoding="utf-8"))\n'
      '            if isinstance(got, dict):\n'
      '                state.update({k: got[k] for k in ("enabled", "gallery_share", "last_at", "last_message",\n'
-     '                                                    "last_source", "last_marker", "quality") if k in got})\n'
+     '                                                    "last_source", "last_marker", "quality", "brief") if k in got})\n'
      '        except FileNotFoundError:\n'
      '            pass\n'
      '        except Exception as exc:  # noqa: BLE001\n'
      '            pipeline_log("ads", "hourly H3 switch unreadable: %s" % type(exc).__name__)\n'
      '        state["quality"] = comfy_workshop.set_quality(state.get("quality"))     # [h3-quality] in force\n'
+     '        state["brief"] = comfy_workshop.set_brief(state.get("brief"))           # [h3-brief-config]\n'
      '        _H3_HOURLY_STATE.update(state)\n', 1),
     ("profile-saves-with-the-switch",
      '    for key in ("last_at", "last_message", "last_source", "last_marker"):\n'
@@ -64,12 +66,17 @@ EDITS = [
      '            "quality": dict(comfy_workshop.QUALITY),\n'
      '            "presets": {k: dict(v) for k, v in comfy_workshop.PRESETS.items()},\n'
      '            "step_choices": list(comfy_workshop.STEP_CHOICES),\n'
+     "            # [h3-brief-config] the brief's knobs and their choices\n"
+     '            "brief": dict(comfy_workshop.BRIEF), "brief_defaults": dict(comfy_workshop.BRIEF_DEFAULTS),\n'
+     '            "follow_choices": list(comfy_workshop.FOLLOW_CHOICES), "shot_choices": list(comfy_workshop.SHOT_CHOICES),\n'
+     '            "sampler_choices": list(comfy_workshop.SAMPLER_CHOICES), "scheduler_choices": list(comfy_workshop.SCHEDULER_CHOICES),\n'
+     '            "default_constraints": comfy_workshop.DEFAULT_CONSTRAINTS, "default_audio": comfy_workshop.DEFAULT_AUDIO,\n'
      '            "frame_choices": list(comfy_workshop.FRAME_CHOICES),\n'
      '            "box": {"hottest_c": box_hottest_c(), "available_gb": comfy_host_available_gb(),\n'
      '                    "ceiling_c": RENDER_TEMP_CEILING_C, "floor_gb": VIDEO_RENDER_FLOOR_GB}}\n', 1),
     ("the-door-takes-the-profile",
      '    state = h3_hourly_save({k: payload[k] for k in ("enabled", "gallery_share") if k in payload})\n',
-     '    state = h3_hourly_save({k: payload[k] for k in ("enabled", "gallery_share", "quality") if k in payload})\n', 1),
+     '    state = h3_hourly_save({k: payload[k] for k in ("enabled", "gallery_share", "quality", "brief") if k in payload})\n', 1),
     ("the-workshop-door-renders-at-the-profile",
      '    step_count = comfy_workshop.clamp_steps(payload.get("steps"))\n'
      '    noise_seed = comfy_workshop.render_seed(payload.get("seed"))\n',
