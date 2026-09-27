@@ -109,7 +109,10 @@ class RuntimeTests(unittest.TestCase):
         self.assertIsNotNone(h)
         self.assertTrue(h.active)
         self.assertIn("THE RUNNING ORDER OF THIS EXCHANGE", h.sheet)
-        self.assertEqual(len(re.findall(r"(?m)^\s*\d+\s+[AB]\s+-", h.sheet)), 8)
+        # [s3-window] the slot asked 8; the length is System 3's roll in the segment band (8..12 here)
+        rows_written = len(re.findall(r"(?m)^\s*\d+\s+[AB]\s+-", h.sheet))
+        self.assertTrue(8 <= rows_written <= 12, rows_written)
+        self.assertEqual(rows_written, h.conv["length_roll"]["turns"])
         # the round-level doors stand down under System 3 (engine v2): its
         # running order carries the speakerbox, so there is no door roll
         self.assertIsNone(self.station["system3_door_roll"](h, "prepend"))
@@ -123,7 +126,7 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(entry["script"], script_before, "binding never touches the words")
         self.assertEqual(entry["system3"]["mode"], "active")
         self.assertEqual(entry["system3"]["turns"]["3"], h.conv["turns"][3]["turn_id"])
-        self.assertEqual(len(entry["turn_dice"]), 8)
+        self.assertEqual(len(entry["turn_dice"]), h.conv["length_roll"]["turns"])   # [s3-window] the rolled length
         stamp = entry["turn_dice"]["3"]["s3"]
         self.assertEqual(stamp["conversation_id"], h.id)
         self.assertEqual(set(stamp["perf"]["dims"]), set(system3.EMOTION_DIMS))
@@ -165,7 +168,7 @@ class RuntimeTests(unittest.TestCase):
         sfx = next(o for o in got["observations_air"] if o["family"] == "SFX")
         self.assertEqual(sfx["matcher"]["eligible"], 13)
         self.assertEqual(sfx["played"][0]["clip"], "clip_0298.wav")
-        self.assertEqual(len(got["lines"]), 8)
+        self.assertEqual(len(got["lines"]), h.conv["length_roll"]["turns"])   # [s3-window] the rolled length
         line = self.client.get("/api/system3/line", params={"line_id": "L3"}).json()
         self.assertEqual(line["turn"]["turn_id"], h.conv["turns"][3]["turn_id"])
         self.assertTrue(line["decisions"])
@@ -289,7 +292,7 @@ class RuntimeTests(unittest.TestCase):
         sting = self.client.get("/api/system3/line", params={"line_id": "S-sting"}).json()
         self.assertIsNone(sting["turn"], "a sting belongs to the conversation, not to a turn")
         conv = self.client.get("/api/system3/conversation/" + h.id).json()
-        self.assertEqual(len(conv["shadow_bindings"]), 6)
+        self.assertTrue(6 <= len(conv["shadow_bindings"]) <= 9, len(conv["shadow_bindings"]))   # [s3-window] the band
         self.assertEqual(conv["shadow_bindings"][2]["script_index"], 2)
 
     def test_listener_feed_shows_the_rolls_and_nothing_private(self):
@@ -352,7 +355,9 @@ class RuntimeTests(unittest.TestCase):
         self.assertIsNotNone(step)
         made = [(t["speaker"], "No! You are wrong!! Ridiculous.") for t in h.conv["turns"][:4]]
         rows = self.run_(step(made, 4, []))
-        self.assertEqual([r["turn"] for r in rows], list(range(5, 11)))
+        turns = [r["turn"] for r in rows]                       # [s3-window] up to the rolled budget
+        self.assertEqual(turns, list(range(5, 5 + len(turns))))
+        self.assertTrue(6 <= len(turns) <= 11, turns)
         self.assertEqual(h.conv["identity"]["revision"], 2)
         self.assertEqual(len(h.conv["observations"]), 4)
         self.assertEqual(rt.metrics["mode_b_beats"], 1)

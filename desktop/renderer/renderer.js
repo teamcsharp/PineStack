@@ -3030,6 +3030,10 @@ async function setFm(on) {
 // the click rides the webview bridge (pineShow3JS closes whatever scene is
 // up first).
 const THREEJS_VIEWS = [
+  { key: "sys3", icon: "3", name: "Sys3", since: "2026-09-27",
+    systems: "three.min.js · /api/system3/events · /api/system3/now",
+    what: "System 3 and the systems it directs, live",
+    desc: "The conversation director in the middle, every road it runs around it and the rooms downstream - the writer, the recording room, the ledger, the air. Circuits carry packets; a paper airplane flies each recorded decision to its road as it lands; the line on air floats above the road speaking it. Tabs: tables, segments (the node editor), prompts, audit." },
   { key: "flow", icon: "🗺", name: "Station flow", since: "the content observatory",
     systems: "three.module.js · /api/dj/flow journal",
     what: "The station in motion, every step with its evidence",

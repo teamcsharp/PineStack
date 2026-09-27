@@ -489,7 +489,35 @@
     controls.title = 'Open all rejected lines and editorial controls';
     controls.addEventListener('click', rejectionControlsOpen);
     strip.appendChild(controls);
+    /* [s3-window] "a button icon '3' in the toolbar" - System 3's instrument:
+       Tables, Segments (the node editor), Prompts, Audit, Sys3. */
+    var three = make('button', 'sp-reject-controls sp-s3-button', '3');
+    three.type = 'button';
+    three.title = 'System 3: tables, segments, prompts, audit, Sys3';
+    three.setAttribute('aria-label', 'Open System 3');
+    three.addEventListener('click', function () { s3Window('tables'); });
+    strip.appendChild(three);
     return strip;
+  }
+
+  /* [s3-window] System 3's own instrument, opened over this page. The
+     module is the station's (served live), so the tabs need no rebuild. */
+  var s3WindowOpen = null;
+  function s3Window(tab) {
+    if (s3WindowOpen) { try { s3WindowOpen.close(); } catch (e) { /* gone */ } s3WindowOpen = null; }
+    if (!document.getElementById('spS3Style')) {
+      var style = document.createElement('link');
+      style.id = 'spS3Style';
+      style.rel = 'stylesheet';
+      style.href = techUrl('/system3/system3.css?v=4');
+      document.head.appendChild(style);
+    }
+    import(techUrl('/system3/system3.js?v=4')).then(function (mod) {
+      return mod.openSystem3({request: s3Request, tab: tab || 'tables',
+        onClose: function () { s3WindowOpen = null; }});
+    }).then(function (view) { s3WindowOpen = view; }).catch(function (err) {
+      try { console.warn('System 3 could not open', err); } catch (e) { /* no console */ }
+    });
   }
 
   function rejectionPolicyOpen() {
@@ -4151,10 +4179,10 @@
           var style = document.createElement('link');
           style.id = 'spS3Style';
           style.rel = 'stylesheet';
-          style.href = techUrl('/system3/system3.css?v=3');
+          style.href = techUrl('/system3/system3.css?v=4');
           document.head.appendChild(style);
         }
-        var mod = await import(techUrl('/system3/system3.js?v=3'));
+        var mod = await import(techUrl('/system3/system3.js?v=4'));
         pane.textContent = '';
         var box = make('div', 'sp-s3-host');
         pane.appendChild(box);
@@ -10874,10 +10902,10 @@
       var style = document.createElement('link');
       style.id = 'spS3Style';
       style.rel = 'stylesheet';
-      style.href = techUrl('/system3/system3.css?v=3');
+      style.href = techUrl('/system3/system3.css?v=4');
       document.head.appendChild(style);
     }
-    import(techUrl('/system3/system3.js?v=3')).then(function (mod) {
+    import(techUrl('/system3/system3.js?v=4')).then(function (mod) {
       return mod.openRoll({request: s3Request, conversationId: info.conversation_id,
         eventId: roll ? String(roll.event_id || '') : '', turnId: info.turn_id, lineId: id});
     }).catch(function (err) {

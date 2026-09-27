@@ -3194,6 +3194,24 @@ export async function mount(root, {request, onClose, tab: startTab = '', table: 
   let status = null, list = [], config = null, settings = null, lastLoaded = '';
   const timers = [];
   const v = makeViews({request});
+  /* [s3-hold] "When I'm scrolling in the system3 popup, do not reset my view
+     or change what I am reading. I do not like windows auto resetting while
+     I am analyzing it." Any scroll, wheel, touch, key or pointer in this
+     window marks the operator as reading; for 25 s after the last one (and
+     always while a decision card is open) no poll repaints, reloads or
+     re-sorts anything on its own. A tap still acts at once. New entries
+     wait behind a "N new" pill unless the list is at its top and idle. */
+  let readingAt = 0;
+  const reading = () => Date.now() - readingAt < 25000 || !!document.querySelector('.s3-modal-back');
+  const noteReading = () => { readingAt = Date.now(); };
+  ['scroll', 'wheel', 'touchstart', 'touchmove', 'pointerdown', 'keydown'].forEach(n => root.addEventListener(n, noteReading, {capture: true, passive: true}));
+  const scrolledTop = node => { let n = node; while (n && n !== document.body) { if (n.scrollHeight > n.clientHeight + 4) return n.scrollTop <= 6; n = n.parentElement; } return true; };
+  const newPill = (listNode, count, show) => {
+    let pill = listNode.querySelector(':scope > .s3-newpill');
+    if (!count) { if (pill) pill.remove(); return; }
+    if (!pill) { pill = btn('', show, {class: 's3-newpill'}); listNode.prepend(pill); }
+    pill.textContent = count + ' new - show';
+  };
 
   const message = el('div', {role: 'status', 'aria-live': 'polite'});
   const report = (error) => { message.className = 's3-error'; message.textContent = error.message || String(error); };
@@ -3209,9 +3227,17 @@ export async function mount(root, {request, onClose, tab: startTab = '', table: 
       el('div', 's3-row', tabs, onClose ? btn('Close', () => onClose()) : null)),
     metrics, message, body);
 
-  const TABS = [['director', 'Director'], ['tables', 'Tables'], ['structure', 'Structure'], ['controls', 'Controls']];
+  /* [s3-window] "a button icon '3' ... opening a popup": Tables, Segments, Prompts, Audit, Sys3 - and the
+     director, the cycle's structure view and the controls behind them. */
+  const TABS = [['tables', 'Tables'], ['segments', 'Segments'], ['prompts', 'Prompts'], ['audit', 'Audit'], ['sys3', 'Sys3'],
+    ['director', 'Director'], ['structure', 'Structure'], ['controls', 'Controls']];
+  function stopExtras() {
+    if (sys3) { try { sys3.stop(); } catch (e) { /* gone */ } sys3 = null; }
+    clearInterval(auditTimer); clearInterval(promptsTimer);
+    if (menuNode) { menuNode.remove(); menuNode = null; }
+  }
   function paintTabs() {
-    fill(tabs, ...TABS.map(([id, label]) => btn(label, () => { tab = id; paint(); }, {'aria-pressed': String(tab === id)})));
+    fill(tabs, ...TABS.map(([id, label]) => btn(label, () => { stopExtras(); tab = id; paint(); }, {'aria-pressed': String(tab === id)})));
   }
 
   function paintStatus() {
@@ -3365,6 +3391,7 @@ export async function mount(root, {request, onClose, tab: startTab = '', table: 
 
   /* ---------------- tables ------------------------------------------------- */
   let tableId = startTable || 'ES1', draft = null;   /* [s3-dice] a card can open on its table */
+  let tableDrag = null; const foldedCats = new Set();   /* [s3-window] */
   function paintTables() {
     const tables = config.config.tables;
     if (!draft || draft.id !== tableId) draft = JSON.parse(JSON.stringify(tables.find(t => t.id === tableId) || tables[0]));
@@ -3388,15 +3415,39 @@ export async function mount(root, {request, onClose, tab: startTab = '', table: 
       el('div', 's3-slider', el('label', {text: 'table weight in the raffle'}), ...slider(draft.weight, v => { draft.weight = v; }, 10)),
       el('p', {class: 's3-muted', text: draft.description || ''}));
     for (const cat of draft.categories) {
-      const box = el('div', 's3-cat');
-      box.append(el('div', 's3-slider', el('label', null, el('b', {text: cat.label || cat.id})), ...slider(cat.weight, v => { cat.weight = v; })));
+      /* [s3-window] each category folds; it can be dropped, or consolidated into another */
+      const foldKey = draft.id + '/' + cat.id;
+      const others = draft.categories.filter(c => c !== cat);
+      const box = el('details', {class: 's3-cat', open: !foldedCats.has(foldKey),
+        ontoggle: e => { if (e.target !== box) return; if (box.open) foldedCats.delete(foldKey); else foldedCats.add(foldKey); }});
+      box.append(el('summary', null, el('b', {text: cat.label || cat.id}),
+        el('span', {class: 's3-muted', text: `${(cat.items || []).length} items · w${num(cat.weight)}`}), el('span', {style: 'flex:1'}),
+        others.length ? el('select', {'aria-label': 'consolidate into', title: 'move every item of this category into another one and drop it',
+          onclick: e => e.stopPropagation(),
+          onchange: e => { const into = draft.categories.find(c => c.id === e.target.value); if (!into) return;
+            if (!confirm(`Move ${(cat.items || []).length} items of "${cat.label || cat.id}" into "${into.label || into.id}" and drop the category?`)) { e.target.value = ''; return; }
+            into.items = (into.items || []).concat(cat.items || []); draft.categories.splice(draft.categories.indexOf(cat), 1); paintTables(); }},
+          el('option', {value: '', text: 'consolidate into...'}), ...others.map(c => el('option', {value: c.id, text: c.label || c.id}))) : null,
+        btn('remove', e => { e.preventDefault(); e.stopPropagation(); if (confirm(`Remove category "${cat.label || cat.id}" and its ${(cat.items || []).length} items?`)) { draft.categories.splice(draft.categories.indexOf(cat), 1); paintTables(); } })));
+      box.append(el('div', 's3-slider', el('label', null, el('b', {text: 'category weight'})), ...slider(cat.weight, v => { cat.weight = v; })));
       for (const item of cat.items) {
         const row = el('div', 's3-item',
           el('input', {type: 'text', value: item.label, 'aria-label': 'label', oninput: e => { item.label = e.target.value; }}),
           ...slider(item.weight ?? 1, v => { item.weight = v; }),
           el('label', 's3-row', el('input', {type: 'checkbox', checked: item.enabled !== false, onchange: e => { item.enabled = e.target.checked; }}), 'on'),
           el('input', {type: 'text', class: 'txt', value: item.text || '', placeholder: 'what the writer is told this turn does', oninput: e => { item.text = e.target.value; }}));
-        box.append(row);
+        /* [s3-window] drag to reorder inside the category; x removes */
+        const wrap = el('div', {class: 's3-item-row', draggable: true,
+          ondragstart: e => { tableDrag = {cat, item}; wrap.classList.add('s3-dragging'); try { e.dataTransfer.setData('text/plain', item.id); } catch (_) { /* older engine */ } },
+          ondragend: () => { wrap.classList.remove('s3-dragging'); tableDrag = null; },
+          ondragover: e => { if (tableDrag && tableDrag.cat === cat && tableDrag.item !== item) { e.preventDefault(); wrap.classList.add('s3-drop-before'); } },
+          ondragleave: () => wrap.classList.remove('s3-drop-before'),
+          ondrop: e => { wrap.classList.remove('s3-drop-before'); if (!tableDrag || tableDrag.cat !== cat) return; e.preventDefault();
+            const from = cat.items.indexOf(tableDrag.item); if (from < 0) return; const [moved] = cat.items.splice(from, 1);
+            const to = cat.items.indexOf(item); cat.items.splice(to < 0 ? cat.items.length : to, 0, moved); tableDrag = null; paintTables(); }},
+          el('span', {class: 's3-grip', title: 'drag to reorder', text: '\u22ee\u22ee'}), row,
+          btn('x', () => { cat.items.splice(cat.items.indexOf(item), 1); paintTables(); }, {'aria-label': 'remove item', style: 'padding:0 6px'}));
+        box.append(wrap);
       }
       const adv = el('textarea', {value: json(Object.fromEntries(Object.entries(cat).filter(([k]) => !['items', 'label', 'weight', 'id'].includes(k))))});
       box.append(btn('Add item', () => { const id = prompt('New item id'); if (id) { cat.items.push({id, label: id, weight: 1, text: ''}); paintTables(); } }),
@@ -3506,6 +3557,463 @@ export async function mount(root, {request, onClose, tab: startTab = '', table: 
         btn('Discard', () => { steps = null; paintStructure(); }))));
   }
 
+  /* ---------------- segments: the node editor ------------------------------
+   *
+   * "a vertical node editor from top to bottom, a sidebar with the categories
+   *  and nodes ... drag and drop into the segment ... remove and rearrange
+   *  inline ... properties in the sidebar ... a dice icon to lock a node to
+   *  a static value (uncheck = roulette off, dropdown sets the static prop)
+   *  ... a dropdown listing all segments ... duplicate a segment into a
+   *  variant runnable on the station with unique parameters."
+   *
+   * A segment is a road's structure: legs (or, for the banter cycle, steps),
+   * each with its draws. A pinned draw carries `fixed` - the engine records
+   * it without a roll. A variant is saved as "<road>~vN" with a weight; the
+   * engine rolls VARIANT among the base and its variants when the road runs. */
+  let segRoad = '', segNodes = null, segRoadOf = '', segSel = {node: -1, draw: -1}, segDrag = null;
+  const SEG_FAMS = ['CTS', 'ES', 'RS', 'IRS', 'FL'];
+  function segStructures() { return config.config.structures || {}; }
+  function segLoad(road) {
+    if (segNodes && segRoadOf === road) return;
+    segRoadOf = road; segSel = {node: -1, draw: -1};
+    segNodes = road === 'banter' ? JSON.parse(JSON.stringify(config.config.structure.steps || []))
+      : JSON.parse(JSON.stringify((segStructures()[road] || {}).legs || []));
+  }
+  function segTableItems(fam) {
+    return (config.config.tables || []).filter(t => t.family === fam)
+      .flatMap(t => (t.categories || []).flatMap(c => (c.items || []).map(it => ({id: it.id, label: `${t.id} · ${c.label || c.id} · ${it.label || it.id}`}))));
+  }
+  function paintSegments() {
+    const roads = ['banter', ...Object.keys(segStructures())];
+    if (!segRoad || !roads.includes(segRoad)) segRoad = roads[1] || 'banter';
+    segLoad(segRoad);
+    const cycle = segRoad === 'banter';
+    const st = cycle ? config.config.structure : (segStructures()[segRoad] || {});
+    const nodes = segNodes;
+    const sel = segSel.node >= 0 && segSel.node < nodes.length ? nodes[segSel.node] : null;
+    const repaint = () => paintSegments();
+    const chip = (label, data, fam) => el('div', {class: 's3-chip' + (fam ? ' fam' : ''), draggable: true, style: fam ? `--fam:${FAM[fam]}` : '',
+      ondragstart: e => { segDrag = data; try { e.dataTransfer.setData('text/plain', label); } catch (_) { /* older engine */ } },
+      ondragend: () => { segDrag = null; }}, label);
+    const palette = el('div', 's3-palette', el('h4', {text: 'Nodes'}), chip(cycle ? '+ step' : '+ leg', {kind: 'node'}),
+      el('h4', {text: 'Draws - the roulette'}), ...SEG_FAMS.map(f => chip(f + ' - ' + String((FAMILY_WHAT[f] || [f])[0]).split(' (')[0], {kind: 'draw', family: f}, f)),
+      cycle ? el('h4', {text: 'Speaker box'}) : null, cycle ? chip('prepend mark', {kind: 'mark', mark: 'prepend'}) : null, cycle ? chip('append mark', {kind: 'mark', mark: 'append'}) : null,
+      el('p', {class: 's3-muted', text: 'Drag a node between two nodes; drag a draw onto a node. Tap a node for its properties. Tap a draw\'s die to turn its roulette off and pin a value.'}));
+    const props = el('div', 's3-seg-props');
+    if (!sel) props.append(para('Tap a node to edit it.', 's3-muted'));
+    else {
+      const field = (label, input) => el('label', null, label, input);
+      const labelEl = () => body.querySelector('.s3-seg-node.sel b');
+      props.append(el('h4', {text: cycle ? 'Step' : 'Leg'}),
+        field('label', el('input', {type: 'text', value: sel.label || sel.id || '', oninput: e => { sel.label = e.target.value; const b = labelEl(); if (b) b.textContent = e.target.value; }})));
+      if (cycle) {
+        props.append(field('speaker', el('select', {onchange: e => { sel.speaker = e.target.value; repaint(); }},
+            ...['initiator', 'responder_a', 'responder_b', 'frame'].map(sp => el('option', {value: sp, text: sp.replace('_', ' '), selected: sel.speaker === sp})))),
+          el('label', 's3-row', el('input', {type: 'checkbox', checked: !!sel.optional, onchange: e => { sel.optional = e.target.checked; }}), 'optional'));
+      } else {
+        props.append(field('place', el('select', {onchange: e => { sel.place = e.target.value; repaint(); }},
+            ...['open', 'middle', 'close'].map(pl => el('option', {value: pl, text: pl, selected: sel.place === pl})))),
+          field('seat', el('select', {onchange: e => { sel.seat = e.target.value; repaint(); }},
+            ...['A', 'B', 'C', 'D', 'E', 'alternate'].map(x => el('option', {value: x, text: x === 'alternate' ? 'alternating' : 'seat ' + x, selected: sel.seat === x})))),
+          field('what this leg does - the act the writer is given', el('textarea', {value: sel.act || '', oninput: e => { sel.act = e.target.value; }})));
+      }
+      const d = segSel.draw >= 0 ? (sel.draws || [])[segSel.draw] : null;
+      if (d) {
+        const items = segTableItems(d.family);
+        props.append(el('h4', {text: d.family + ' draw'}),
+          el('label', 's3-row', el('input', {type: 'checkbox', checked: d.fixed === undefined,
+            onchange: e => { if (e.target.checked) delete d.fixed; else d.fixed = (items[0] || {}).id || ''; repaint(); }}), 'roulette on - roll it every time'),
+          d.fixed !== undefined ? field('pinned to (the roulette is off)', el('select', {onchange: e => { d.fixed = e.target.value; repaint(); }},
+            ...items.map(it => el('option', {value: it.id, text: it.label, selected: it.id === d.fixed})))) : null,
+          d.family === 'FL' ? el('label', 's3-row', el('input', {type: 'checkbox', checked: !!d.closes, onchange: e => { d.closes = e.target.checked; repaint(); }}), 'closing moves only') : null,
+          field('tables - blank means every table of the family', el('input', {type: 'text', value: (d.tables || []).join(', '),
+            onchange: e => { const t = e.target.value.split(',').map(x => x.trim()).filter(Boolean); if (t.length) d.tables = t; else delete d.tables; repaint(); }})));
+      }
+    }
+    const nodeCard = (n, i) => {
+      const card = el('div', {class: 's3-seg-node' + (i === segSel.node ? ' sel' : ''), draggable: true,
+        onclick: () => { if (segSel.node !== i || segSel.draw !== -1) { segSel = {node: i, draw: -1}; repaint(); } },
+        ondragstart: e => { segDrag = {kind: 'move', from: i}; e.stopPropagation(); },
+        ondragend: () => { segDrag = null; },
+        ondragover: e => { if (segDrag && (segDrag.kind === 'draw' || segDrag.kind === 'mark')) { e.preventDefault(); card.classList.add('s3-drop-into'); } },
+        ondragleave: () => card.classList.remove('s3-drop-into'),
+        ondrop: e => { card.classList.remove('s3-drop-into'); if (!segDrag) return; e.preventDefault(); e.stopPropagation();
+          if (segDrag.kind === 'draw') { n.draws = n.draws || []; n.draws.push(segDrag.family === 'FL' ? {family: 'FL', tables: ['FL2']} : {family: segDrag.family}); segSel = {node: i, draw: n.draws.length - 1}; }
+          else if (segDrag.kind === 'mark') { n.speakerbox = (n.speakerbox || []).filter(m => m !== segDrag.mark).concat([segDrag.mark]); }
+          segDrag = null; repaint(); }});
+      const head = el('div', 's3-row', el('b', {text: n.label || n.id || (cycle ? 'step' : 'leg')}),
+        cycle ? el('span', {class: 's3-pill', text: String(n.speaker || '').replace('_', ' ')}) : el('span', {class: 's3-pill', text: n.place || 'middle'}),
+        cycle ? null : el('span', {class: 's3-pill', text: n.seat === 'alternate' ? 'alternating' : 'seat ' + (n.seat || 'A')}),
+        ...(n.speakerbox || []).map(m => el('span', {class: 's3-pill', style: `border-color:${FAM.SPEAKERBOX}`, text: m,
+          onclick: e => { e.stopPropagation(); n.speakerbox = n.speakerbox.filter(x => x !== m); repaint(); }, title: 'tap to remove the mark'})),
+        el('span', {style: 'flex:1'}),
+        btn('up', e => { e.stopPropagation(); if (i) { [nodes[i - 1], nodes[i]] = [nodes[i], nodes[i - 1]]; segSel = {node: i - 1, draw: -1}; repaint(); } }),
+        btn('down', e => { e.stopPropagation(); if (i < nodes.length - 1) { [nodes[i + 1], nodes[i]] = [nodes[i], nodes[i + 1]]; segSel = {node: i + 1, draw: -1}; repaint(); } }),
+        btn('x', e => { e.stopPropagation(); nodes.splice(i, 1); segSel = {node: -1, draw: -1}; repaint(); }, {'aria-label': 'remove node'}));
+      const draws = el('div', 's3-row', ...(n.draws || []).map((d, k) => el('span', {class: 's3-draw' + (d.fixed !== undefined ? ' locked' : ''), style: `--fam:${FAM[d.family] || 'var(--obs)'}`,
+          onclick: e => { e.stopPropagation(); segSel = {node: i, draw: k}; repaint(); }},
+        el('span', {class: 's3-dice', title: d.fixed !== undefined ? 'roulette off: pinned to ' + d.fixed + ' - tap for the properties' : 'roulette on - tap to pin a value',
+          text: d.fixed !== undefined ? 'pin' : 'd100', onclick: e => { e.stopPropagation(); segSel = {node: i, draw: k}; if (d.fixed === undefined) d.fixed = (segTableItems(d.family)[0] || {}).id || ''; else delete d.fixed; repaint(); }}),
+        d.family + (d.tables ? ':' + d.tables.join('/') : '') + (d.closes ? ' closes' : '') + (d.fixed !== undefined ? ' = ' + d.fixed : ''),
+        btn('x', e => { e.stopPropagation(); n.draws.splice(k, 1); segSel = {node: i, draw: -1}; repaint(); }, {'aria-label': 'remove draw', style: 'padding:0 5px'}))),
+        (n.draws || []).length ? null : el('span', {class: 's3-muted', text: 'no draws - drop a family here'}));
+      card.append(head, cycle ? null : el('div', {class: 's3-muted', text: n.act || ''}), draws);
+      return card;
+    };
+    const gap = (i) => el('div', {class: 's3-seg-gap', text: '↓',
+      ondragover: e => { if (segDrag && (segDrag.kind === 'node' || segDrag.kind === 'move')) { e.preventDefault(); e.currentTarget.classList.add('s3-drop-here'); } },
+      ondragleave: e => e.currentTarget.classList.remove('s3-drop-here'),
+      ondrop: e => { e.currentTarget.classList.remove('s3-drop-here'); if (!segDrag) return; e.preventDefault();
+        if (segDrag.kind === 'node') {
+          nodes.splice(i, 0, cycle ? {id: 'step' + Date.now().toString(36), label: 'New step', speaker: 'responder_a', draws: [{family: 'ES'}, {family: 'RS'}], speakerbox: []}
+            : {id: 'leg' + Date.now().toString(36), label: 'New leg', place: 'middle', seat: 'alternate', act: 'answers the line before.', draws: [{family: 'ES'}, {family: 'RS'}]});
+          segSel = {node: i, draw: -1};
+        } else if (segDrag.kind === 'move') { const from = segDrag.from; const [m] = nodes.splice(from, 1); const to = i > from ? i - 1 : i; nodes.splice(to, 0, m); segSel = {node: to, draw: -1}; }
+        segDrag = null; repaint(); }});
+    const list = el('div', 's3-seg-nodes');
+    nodes.forEach((n, i) => { list.append(gap(i), nodeCard(n, i)); });
+    list.append(gap(nodes.length));
+    if (!nodes.length) list.append(para('No nodes yet - drag "+ leg" here.', 's3-muted'));
+    const isVariant = segRoad.includes('~');
+    const base = segRoad.split('~')[0];
+    const roadSel = el('select', {'aria-label': 'segment', onchange: e => { segRoad = e.target.value; segNodes = null; repaint(); }},
+      ...roads.map(r => el('option', {value: r, selected: r === segRoad,
+        text: r === 'banter' ? 'banter (the cycle)' : (r.includes('~') ? ' ' + r.split('~')[0] + ' variant: ' + ((segStructures()[r] || {}).label || r) : r + ' (' + ((segStructures()[r] || {}).kind || 'legs') + ')')})));
+    const bar = el('div', 's3-seg-bar', el('label', {class: 's3-muted', text: 'segment'}), roadSel,
+      cycle ? null : btn('Duplicate as variant', async () => {
+        const name = prompt('Name for the variant of ' + base + ':', (st.label || base) + ' B'); if (!name) return;
+        const n = Object.keys(segStructures()).filter(k => k.startsWith(base + '~v')).length + 1;
+        const key = base + '~v' + n;
+        try { await send('/api/system3/structures/' + encodeURIComponent(key), 'PUT', {...st, legs: nodes, label: name, weight: 1, enabled: true, variant_of: base});
+          await loadConfig(); segRoad = key; segNodes = null; quiet(); repaint(); } catch (e) { report(e); }
+      }),
+      isVariant ? el('label', 's3-row', 'weight', el('input', {type: 'number', min: 0, max: 50, step: 0.1, value: st.weight == null ? 1 : st.weight, style: 'width:72px', onchange: e => { st.weight = +e.target.value; }})) : null,
+      isVariant ? el('label', 's3-row', el('input', {type: 'checkbox', checked: st.enabled !== false, onchange: e => { st.enabled = e.target.checked; }}), 'runs on the station') : null,
+      btn('Save segment', async () => { try {
+          if (cycle) { nodes.forEach((x, i) => { x.id = x.id || 'step' + i; }); await send('/api/system3/structure', 'PUT', {steps: nodes}); }
+          else { nodes.forEach((lg, i) => { lg.id = lg.id || 'leg' + i; }); await send('/api/system3/structures/' + encodeURIComponent(segRoad), 'PUT', {...st, legs: nodes}); }
+          await loadConfig(); segNodes = null; quiet(); repaint(); } catch (e) { report(e); } }),
+      btn('Discard', () => { segNodes = null; repaint(); }),
+      isVariant ? btn('Delete variant', async () => { if (!confirm('Delete ' + segRoad + '?')) return;
+        try { await send('/api/system3/structures/' + encodeURIComponent(segRoad), 'DELETE'); await loadConfig(); segRoad = base; segNodes = null; repaint(); } catch (e) { report(e); } }) : null,
+      el('span', {class: 's3-muted', text: cycle ? 'The banter cycle loops for the segment; each step is a node with its own draws.'
+        : `Turn budget ${st.min_turns || '?'}-${st.max_turns || '?'}. ${isVariant ? 'This variant' : 'Every variant'} rolls against the base by weight (VARIANT) each time the road runs.`}));
+    fill(body, el('div', 's3-seg', el('div', 's3-seg-side', el('div', 's3-card', palette), el('div', 's3-card', el('h2', {text: 'Properties'}), props)),
+      el('div', 's3-seg-main', el('div', 's3-card', el('h2', {text: (st.label || segRoad) + ' - segment'}), bar), list)));
+  }
+
+  /* ---------------- prompts: every model call, as tiles --------------------- */
+  let promptRows = [], promptModels = [], promptModel = '', promptsTimer = 0;
+  const promptOpen = new Map();
+  async function loadPrompts() {
+    try { const got = await request('/api/prompt-history?limit=40' + (promptModel ? '&model=' + encodeURIComponent(promptModel) : ''));
+      promptRows = got.rows || []; if ((got.models || []).length) promptModels = got.models; } catch (e) { report(e); }
+  }
+  function promptBody(r, d) {
+    if (d.error && !d.request) return para(String(d.error), 's3-error');
+    const req = d.request || {}; const msgs = Array.isArray(req.messages) ? req.messages : [];
+    const sys = msgs.filter(m => m.role === 'system').map(m => m.content).join('\n\n') || req.system || '';
+    const user = msgs.filter(m => m.role !== 'system').map(m => (m.role ? m.role + ': ' : '') + (m.content || '')).join('\n\n') || req.prompt || '';
+    const res = d.response || {}; const text = (res.message && res.message.content) || res.response || res.text || (typeof res === 'string' ? res : '');
+    const opts = {model: req.model, ...(req.options || {}), think: req.think, keep_alive: req.keep_alive, stream: req.stream};
+    const box = (title, kid, pre = true) => el('div', 's3-tile-box', el('h4', {text: title}), pre ? el('pre', {text: kid || '(none)'}) : kid);
+    const roulette = el('div', {class: 's3-muted', text: 'finding the round this call wrote...'});
+    const grid = el('div', 's3-tile-grid', box('System prompt', sys), box('Prompt', user), box('LLM settings', json(opts)),
+      box('Result', d.error ? String(d.error) : (text || (d.state === 'running' ? 'still running' : '(empty)'))), box('Roulette results', roulette, false));
+    rouletteFor(r, roulette);
+    return grid;
+  }
+  async function rouletteFor(r, into) {
+    try {
+      const list = await request('/api/system3/conversations?limit=30');
+      const at = Number(r.at || 0);
+      const cands = (list.conversations || []).filter(c => Number(c.created || 0) <= at + 2 && at - Number(c.created || 0) < 240).sort((a, b) => Number(b.created) - Number(a.created));
+      const c = cands[0];
+      if (!c) { fill(into, para('no System 3 round was planned in the four minutes before this call: a road System 3 does not write, or not a writer call.', 's3-muted')); return; }
+      const conv = await request('/api/system3/conversation/' + encodeURIComponent(c.conversation_id));
+      const evs = (conv.decision_events || []).filter(e => e.rng);
+      fill(into, el('div', {class: 's3-muted', text: `${(conv.identity || {}).road_kind || ''} round ${c.conversation_id}, planned ${num(at - Number(c.created || 0), 1)} s before this call (matched by time) - ${evs.length} rolls`}),
+        el('div', 's3-row', ...evs.slice(0, 30).map(e => { const line = eventLine(e, conv);
+          return el('span', {class: 's3-draw', style: `--fam:${FAM[e.family] || 'var(--obs)'}`, title: line.text,
+            onclick: () => openDecision(conv, e, (conv.turns || []).find(t => t.turn_id === e.turn_id) || null, v.api)},
+            el('span', {class: 's3-dice', text: String(line.dice == null ? '-' : line.dice)}), e.family); })),
+        btn('Open this round in the Director', () => { stopExtras(); tab = 'director'; paint(); load(c.conversation_id); }));
+    } catch (e) { fill(into, para('could not read the round: ' + e.message, 's3-muted')); }
+  }
+  function promptTile(r) {
+    const open = promptOpen.has(r.id);
+    const tile = el('details', {class: 's3-tile', open});
+    tile.dataset.id = r.id;
+    let bodyNode = null;
+    const openBody = async () => {
+      if (bodyNode) bodyNode.remove();
+      bodyNode = para('Loading...', 's3-muted'); tile.append(bodyNode);
+      let d = promptOpen.get(r.id);
+      if (!d || d === 'loading') {
+        promptOpen.set(r.id, 'loading');
+        try { const got = await request('/api/prompt-history/' + encodeURIComponent(r.id)); d = got.row || got; } catch (err) { d = {error: err.message}; }
+        promptOpen.set(r.id, d);
+      }
+      if (!tile.open || !tile.isConnected) return;
+      const made = promptBody(r, d); bodyNode.replaceWith(made); bodyNode = made;   /* in place: nothing else moves */
+    };
+    tile.addEventListener('toggle', () => {
+      if (!tile.open) { promptOpen.delete(r.id); if (bodyNode) { bodyNode.remove(); bodyNode = null; } return; }
+      openBody();
+    });
+    tile.append(el('summary', null, el('b', {text: r.model || '?'}), el('span', {class: 's3-muted', text: r.purpose || ''}),
+      el('span', {class: 's3-state s3-state-' + (r.state || 'done'), text: r.state || ''}), el('span', {class: 's3-muted', text: clock(Number(r.at || 0))}),
+      el('span', {class: 's3-muted s3-took', text: r.finished && r.at ? num(Number(r.finished) - Number(r.at), 1) + ' s' : ''}),
+      el('span', {class: 's3-muted', style: 'flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap', text: r.preview || ''})));
+    if (open) openBody();
+    return tile;
+  }
+  function paintPromptsList() {
+    const listNode = body.querySelector('.s3-feed'); if (!listNode) return;
+    promptPending = [];
+    fill(listNode, ...promptRows.map(promptTile));
+  }
+  let promptPending = [];
+  /* [s3-hold] a poll never rebuilds the list: it refreshes the state of the
+     tiles on the page and adds new calls at the top only when the list is
+     at its top and nobody is reading - otherwise they wait behind the pill. */
+  function promptArrive(rows) {
+    const listNode = body.querySelector('.s3-feed'); if (!listNode) return;
+    const have = new Map([...listNode.querySelectorAll('.s3-tile')].map(t => [t.dataset.id, t]));
+    const fresh = [];
+    for (const r of rows) {
+      const t = have.get(r.id);
+      if (!t) { fresh.push(r); continue; }
+      const st = t.querySelector('.s3-state'); if (st && st.textContent !== (r.state || '')) { st.textContent = r.state || ''; st.className = 's3-state s3-state-' + (r.state || 'done'); }
+      const took = t.querySelector('.s3-took'); if (took && r.finished && r.at) took.textContent = num(Number(r.finished) - Number(r.at), 1) + ' s';
+    }
+    promptRows = rows;
+    if (!fresh.length) return;
+    const show = () => { const pill = listNode.querySelector(':scope > .s3-newpill'); if (pill) pill.remove();
+      const first = listNode.firstChild; for (const r of promptPending.slice().reverse()) listNode.insertBefore(promptTile(r), listNode.firstChild);
+      promptPending = []; if (first) { /* the reader stays where they were: nothing below moved */ } };
+    fresh.sort((a, b) => Number(a.at || 0) - Number(b.at || 0));
+    promptPending.push(...fresh.filter(r => !promptPending.some(x => x.id === r.id)));
+    if (!reading() && scrolledTop(listNode)) show(); else newPill(listNode, promptPending.length, show);
+  }
+  async function paintPrompts() {
+    fill(body, el('div', 's3-card', el('h2', {text: 'Prompts - every model call, newest first'}), el('div', 's3-row',
+        el('select', {'aria-label': 'model', onchange: async e => { promptModel = e.target.value; await loadPrompts(); paintPromptsList(); }},
+          el('option', {value: '', text: 'all models'}), ...promptModels.map(m => el('option', {value: m, text: m, selected: m === promptModel}))),
+        btn('Refresh', async () => { await loadPrompts(); paintPromptsList(); }),
+        el('span', {class: 's3-muted', text: 'Each tile opens into the system prompt, the prompt, the LLM settings, the result, and the roulette results of the round System 3 planned for it.'})),
+      el('div', 's3-feed')));
+    await loadPrompts(); paintPromptsList();
+    clearInterval(promptsTimer);
+    promptsTimer = setInterval(async () => { if (tab !== 'prompts' || document.hidden) return;
+      try { const got = await request('/api/prompt-history?limit=40' + (promptModel ? '&model=' + encodeURIComponent(promptModel) : '')); promptArrive(got.rows || []); } catch (e) { /* next tick */ } }, 6000);
+  }
+
+  /* ---------------- audit: everything System 3 does, latest first ----------- */
+  let auditEvents = [], auditHead = 0, auditTimer = 0, auditFilter = {family: '', conversation: ''}, menuNode = null;
+  const auditRoads = new Map();
+  async function auditRoadsLoad() {
+    try { const list = await request('/api/system3/conversations?limit=60'); for (const c of (list.conversations || [])) auditRoads.set(c.conversation_id, c); } catch (e) { /* the log still reads */ }
+  }
+  async function auditLoad(initial) {
+    try {
+      if (initial) {
+        const head = await request('/api/system3/events?after=0&limit=1'); const top = Number(head.head || 0);
+        const got = await request('/api/system3/events?after=' + Math.max(0, top - 400) + '&limit=400');
+        auditEvents = got.events || []; auditHead = Number(got.cursor || top); return true;
+      }
+      const got = await request('/api/system3/events?after=' + auditHead + '&limit=200');
+      if ((got.events || []).length) { auditEvents.push(...got.events); auditHead = Number(got.cursor || auditHead); if (auditEvents.length > 800) auditEvents.splice(0, auditEvents.length - 800); return got.events; }
+    } catch (e) { report(e); }
+    return false;
+  }
+  let auditPending = [];
+  /* [s3-hold] fresh events are drawn at the top only when the list is at its
+     top and nobody is reading; otherwise they wait behind the pill, and the
+     rows the operator is reading never move. */
+  function auditArrive(fresh) {
+    const listNode = body.querySelector('.s3-audit'); if (!listNode) return;
+    const rows = [];
+    for (const e of fresh) {
+      if ((auditFilter.family && e.family !== auditFilter.family) || (auditFilter.conversation && e.conversation_id !== auditFilter.conversation)) continue;
+      let prev = null; const at = auditEvents.indexOf(e);
+      for (let i = at - 1; i >= 0; i -= 1) if (auditEvents[i].conversation_id === e.conversation_id) { prev = auditEvents[i]; break; }
+      rows.push(auditRow(e, prev));
+    }
+    if (!rows.length) return;
+    auditPending.push(...rows);
+    const show = () => { const pill = listNode.querySelector(':scope > .s3-newpill'); if (pill) pill.remove();
+      for (const row of auditPending) listNode.insertBefore(row, listNode.firstChild);   /* oldest first, so the newest ends on top */
+      auditPending = []; };
+    if (!reading() && scrolledTop(listNode)) show(); else newPill(listNode, auditPending.length, show);
+  }
+  function auditLabel(e) {
+    if (e.kind === 'observation') return String(e.stage || e.family || '') + (e.line ? ': ' + String(e.line).slice(0, 80) : e.door ? ': ' + e.door : '');
+    const sel = e.selected || {}; return String(sel.label || sel.id || (e.meta && e.meta.why) || '').slice(0, 90);
+  }
+  async function auditOpen(e) {
+    try { const conv = await request('/api/system3/conversation/' + encodeURIComponent(e.conversation_id));
+      const ev = (conv.decision_events || []).find(x => x.event_id === e.event_id) || (conv.observations_air || []).find(x => x.event_id === e.event_id) || e;
+      openDecision(conv, ev, (conv.turns || []).find(t => t.turn_id === ev.turn_id) || null, v.api); } catch (err) { report(err); }
+  }
+  function auditMenu(x, y, e, prev) {
+    if (menuNode) menuNode.remove();
+    const close = () => { if (menuNode) menuNode.remove(); menuNode = null; document.removeEventListener('pointerdown', away, true); };
+    const away = ev => { if (menuNode && !menuNode.contains(ev.target)) close(); };
+    const item = (label, fn) => btn(label, () => { close(); fn(); });
+    menuNode = el('div', {class: 's3-menu', style: `left:${Math.max(4, Math.min(x, window.innerWidth - 240))}px;top:${Math.max(4, Math.min(y, window.innerHeight - 220))}px`},
+      item('Open the decision card', () => auditOpen(e)),
+      item('Open the round in the Director', () => { stopExtras(); tab = 'director'; paint(); load(e.conversation_id); }),
+      prev ? item('Open the previous command', () => auditOpen(prev)) : null,
+      item('Only this round', () => { auditFilter.conversation = e.conversation_id; paintAuditList(); }),
+      item('Only ' + (e.family || ''), () => { auditFilter.family = e.family || ''; paintAuditList(); }),
+      item('Copy the event id', () => { try { navigator.clipboard.writeText(e.event_id || ''); } catch (_) { /* no clipboard */ } }));
+    document.body.append(menuNode);
+    setTimeout(() => document.addEventListener('pointerdown', away, true), 0);
+  }
+  function auditRow(e, prev) {
+    const c = auditRoads.get(e.conversation_id) || {};
+    const fam = e.family || '';
+    const road = c.road || c.road_kind || '';
+    const row = el('details', {class: 's3-audit-row', style: `--fam:${FAM[fam] || 'var(--obs)'}`});
+    row.append(el('summary', null, el('span', {class: 's3-muted', text: clock(Number(e.at || 0))}), el('span', {class: 'fam', text: fam + (e.kind === 'observation' ? ' obs' : '')}),
+      el('span', {text: auditLabel(e)}), el('span', {class: 's3-muted', text: road + ' ' + String(e.conversation_id || '').slice(0, 8)})));
+    const took = prev ? Number(e.at || 0) - Number(prev.at || 0) : null;
+    row.append(el('div', 's3-audit-body',
+      el('div', null, el('b', {text: 'operation'}), (e.kind === 'observation' ? 'observed at air: ' : 'decided: ') + fam + ' - ' + auditLabel(e)
+        + (Number(e.turn_index) >= 0 ? ` (turn ${Number(e.turn_index) + 1})` : ' (before the first turn)')),
+      el('div', null, el('b', {text: 'originator'}), `${road || 'a'} round ${e.conversation_id || ''}` + (c.topic ? ' - ' + String(c.topic).slice(0, 80) : '') + (e.engine ? ' - ' + e.engine : '')),
+      el('div', null, el('b', {text: 'time taken'}), took == null ? 'the first recorded step of this round' : `${num(took * 1000, 0)} ms after the step before it`),
+      el('div', null, el('b', {text: 'previous connected command'}), prev ? btn((prev.family || '') + ' ' + auditLabel(prev) + ' (' + prev.event_id + ')', () => auditOpen(prev), {class: 's3-pill'}) : 'none - this round starts here'),
+      el('div', 's3-row', btn('Open decision', () => auditOpen(e)), btn('Open round in the Director', () => { stopExtras(); tab = 'director'; paint(); load(e.conversation_id); }),
+        btn('Only this round', () => { auditFilter.conversation = e.conversation_id; paintAuditList(); }), btn('Only ' + fam, () => { auditFilter.family = fam; paintAuditList(); }))));
+    row.addEventListener('contextmenu', ev => { ev.preventDefault(); auditMenu(ev.clientX, ev.clientY, e, prev); });
+    let press = 0;
+    row.addEventListener('pointerdown', ev => { if (ev.pointerType === 'mouse') return; clearTimeout(press); press = setTimeout(() => auditMenu(ev.clientX, ev.clientY, e, prev), 550); });
+    ['pointerup', 'pointercancel', 'pointermove'].forEach(n => row.addEventListener(n, () => clearTimeout(press)));
+    return row;
+  }
+  function paintAuditList() {
+    const listNode = body.querySelector('.s3-audit'); if (!listNode) return;
+    const prevOf = new Map(); const lastIn = new Map();
+    for (const e of auditEvents) { prevOf.set(e, lastIn.get(e.conversation_id) || null); lastIn.set(e.conversation_id, e); }
+    const shown = auditEvents.filter(e => (!auditFilter.family || e.family === auditFilter.family) && (!auditFilter.conversation || e.conversation_id === auditFilter.conversation)).slice(-300).reverse();
+    auditPending = [];
+    fill(listNode, ...shown.map(e => auditRow(e, prevOf.get(e))));
+    const f = body.querySelector('.s3-audit-filter'); if (f) f.textContent = (auditFilter.family || auditFilter.conversation) ? `filter: ${auditFilter.family || ''} ${auditFilter.conversation || ''}` : '';
+  }
+  async function paintAudit() {
+    fill(body, el('div', 's3-card', el('h2', {text: 'Audit - everything System 3 does, latest first'}), el('div', 's3-row',
+        btn('Clear filter', () => { auditFilter = {family: '', conversation: ''}; paintAuditList(); }), el('span', 's3-muted s3-audit-filter'),
+        el('span', {class: 's3-muted', text: 'Open an entry for the operation, its originator, the time it took and the command before it. Right-click or long-press for the menu.'})),
+      el('div', 's3-audit')));
+    await auditRoadsLoad(); await auditLoad(true); paintAuditList();
+    clearInterval(auditTimer);
+    auditTimer = setInterval(async () => { if (tab !== 'audit' || document.hidden) return;
+      const fresh = await auditLoad(false); if (fresh && fresh.length) { await auditRoadsLoad(); auditArrive(fresh); } }, 3000);
+  }
+
+  /* ---------------- Sys3: the circuit, in three.js -------------------------- */
+  let sys3 = null;
+  function threeLoad() {
+    if (window.THREE) return Promise.resolve(window.THREE);
+    if (threeLoad.p) return threeLoad.p;
+    const src = (typeof window.pineThreeUrl === 'function') ? window.pineThreeUrl() : '/vendor/three.min.js';
+    threeLoad.p = new Promise((res, rej) => { const sc = document.createElement('script'); sc.src = src; sc.onload = () => res(window.THREE);
+      sc.onerror = () => { threeLoad.p = null; rej(new Error('three.js did not load from ' + src)); }; document.head.append(sc); });
+    return threeLoad.p;
+  }
+  async function paintSys3() {
+    const host = el('div', 's3-sys3'); const canvas = el('canvas'); host.append(canvas);
+    const nowNode = el('div', 's3-sys3-now', 'waiting for the line on air...');
+    host.append(nowNode, el('div', 's3-sys3-legend', el('span', {text: 'centre: System 3'}), el('span', {text: 'ring: the roads (lit = directed by System 3)'}),
+      el('span', {text: 'right: the writer, the recording room, the ledger, the air'}), el('span', {text: 'paper airplanes: decisions landing; packets: the circuits'})));
+    fill(body, el('div', 's3-card', el('h2', {text: 'Sys3 - System 3 and the systems it directs, live'}), host));
+    if (sys3) { sys3.stop(); sys3 = null; }
+    let THREE; try { THREE = await threeLoad(); } catch (e) { report(e); return; }
+    if (tab !== 'sys3' || !canvas.isConnected) return;
+    sys3 = sys3Scene(THREE, canvas, nowNode);
+  }
+  function sys3Scene(THREE, canvas, nowNode) {
+    const renderer = new THREE.WebGLRenderer({canvas, antialias: true, alpha: true});
+    renderer.setPixelRatio(Math.min(2, window.devicePixelRatio || 1));
+    const scene = new THREE.Scene(); const camera = new THREE.PerspectiveCamera(50, 1, 0.1, 200);
+    camera.position.set(0, 9, 22); camera.lookAt(0, 0, 0);
+    scene.add(new THREE.AmbientLight(0xffffff, 0.8));
+    const light = new THREE.PointLight(0xffffff, 1.0); light.position.set(6, 12, 10); scene.add(light);
+    const colour = css => { const name = String(css).replace(/^var\(|\)$/g, ''); const got = getComputedStyle(root).getPropertyValue(name).trim(); return new THREE.Color(got || '#8ac6ac'); };
+    const label = (text, p, dy, opacity) => { const c = document.createElement('canvas'); c.width = 256; c.height = 48; const cx = c.getContext('2d');
+      cx.fillStyle = '#dfe6e4'; cx.font = '600 22px sans-serif'; cx.textAlign = 'center'; cx.fillText(text, 128, 32);
+      const sp = new THREE.Sprite(new THREE.SpriteMaterial({map: new THREE.CanvasTexture(c), transparent: true, opacity})); sp.scale.set(2.8, 0.52, 1); sp.position.copy(p).add(new THREE.Vector3(0, dy, 0)); scene.add(sp); };
+    const roads = (status && status.roads) || []; const n = Math.max(1, roads.length); const R = 8;
+    const nodes = new Map();
+    const core = new THREE.Mesh(new THREE.BoxGeometry(1.6, 1.6, 1.6), new THREE.MeshStandardMaterial({color: 0x8ac6ac, emissive: 0x1f3a33})); scene.add(core); nodes.set('system3', core);
+    const lineMat = (c, o) => new THREE.LineBasicMaterial({color: c, transparent: true, opacity: o});
+    const circuits = [];
+    roads.forEach((r, i) => { const a = (i / n) * Math.PI * 2; const p = new THREE.Vector3(Math.cos(a) * R, 0, Math.sin(a) * R * 0.55);
+      const on = r.mode === 'active';
+      const m = new THREE.Mesh(new THREE.SphereGeometry(on ? 0.42 : 0.3, 16, 12), new THREE.MeshStandardMaterial({color: on ? 0x54d18b : 0x35414c, emissive: on ? 0x10331f : 0x000000}));
+      m.position.copy(p); m.userData = {road: r.id, on}; scene.add(m); nodes.set(r.id, m);
+      scene.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0, 0, 0), p]), lineMat(on ? 0x54d18b : 0x35414c, on ? 0.45 : 0.15)));
+      circuits.push({from: new THREE.Vector3(0, 0, 0), to: p, phase: Math.random(), speed: 0.12 + Math.random() * 0.1, on});
+      label(r.id, p, -0.8, on ? 0.95 : 0.5); });
+    const rooms = [['writer', 'the writer', 0xf0a6ca], ['voice', 'recording room', 0x87bfff], ['ledger', 'script ledger', 0xe7bf78], ['air', 'on air', 0x7fe0d6]];
+    let prevRoom = null;
+    rooms.forEach(([id, text, col], i) => { const p = new THREE.Vector3(R + 4.5, 3.4 - i * 2.2, -2 + i * 0.4);
+      const m = new THREE.Mesh(new THREE.BoxGeometry(1.1, 0.7, 0.7), new THREE.MeshStandardMaterial({color: col})); m.position.copy(p); scene.add(m); nodes.set(id, m);
+      label(text, p, -0.75, 0.95);
+      const from = prevRoom ? prevRoom.position.clone() : new THREE.Vector3(0, 0, 0);
+      scene.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints([from, p]), lineMat(col, 0.5)));
+      circuits.push({from, to: p, phase: Math.random(), speed: 0.2, on: true}); prevRoom = m; });
+    const packets = circuits.map(c => { const m = new THREE.Mesh(new THREE.SphereGeometry(0.12, 8, 6), new THREE.MeshBasicMaterial({color: 0xffffff})); m.visible = c.on; scene.add(m); return m; });
+    const planes = []; const planeGeo = new THREE.ConeGeometry(0.22, 0.7, 4);
+    const roadOf = new Map(); let cursor = 0, alive = true, raf = 0, lastText = '', thumbSprite = null;
+    const fly = (target, col) => { const m = new THREE.Mesh(planeGeo, new THREE.MeshBasicMaterial({color: col, transparent: true, opacity: 0.95})); m.position.set(0, 0.9, 0); scene.add(m);
+      planes.push({m, to: target.position.clone().add(new THREE.Vector3(0, 0.6, 0)), t: 0}); if (planes.length > 40) { const old = planes.shift(); scene.remove(old.m); } };
+    const thumb = (text, dice) => { if (thumbSprite) { scene.remove(thumbSprite); thumbSprite = null; } if (!text) return;
+      const c = document.createElement('canvas'); c.width = 512; c.height = 128; const cx = c.getContext('2d');
+      cx.fillStyle = '#0b1215ee'; cx.fillRect(0, 0, 512, 128); cx.strokeStyle = '#8ac6ac'; cx.strokeRect(1, 1, 510, 126);
+      cx.fillStyle = '#dfe6e4'; cx.font = '20px sans-serif'; let line = '', y = 34;
+      for (const w of text.split(' ')) { if (cx.measureText(line + ' ' + w).width > 480) { cx.fillText(line, 16, y); line = w; y += 26; if (y > 86) break; } else line = line ? line + ' ' + w : w; }
+      if (y <= 86) cx.fillText(line, 16, y);
+      (dice || []).slice(0, 16).forEach((d, i) => { cx.fillStyle = '#87bfff'; const h = Math.max(3, (Number(d) || 0) / 100 * 28); cx.fillRect(16 + i * 30, 120 - h, 22, h); });
+      thumbSprite = new THREE.Sprite(new THREE.SpriteMaterial({map: new THREE.CanvasTexture(c), transparent: true})); thumbSprite.scale.set(8, 2, 1); thumbSprite.position.set(0, 4.2, 0); scene.add(thumbSprite); };
+    async function poll() {
+      if (!alive) return;
+      try {
+        const feed = await request('/api/system3/events?after=' + cursor + '&limit=60');
+        if (cursor && (feed.events || []).length) {
+          for (const e of feed.events) {
+            let road = roadOf.get(e.conversation_id);
+            if (road === undefined) { try { const c = await request('/api/system3/conversation/' + encodeURIComponent(e.conversation_id)); road = (c.identity || {}).road_kind || ''; } catch (_) { road = ''; } roadOf.set(e.conversation_id, road); }
+            fly(nodes.get(road) || nodes.get('writer'), e.kind === 'observation' ? 0x7fe0d6 : colour(FAM[e.family] || 'var(--obs)').getHex());
+          }
+        }
+        cursor = Number(feed.cursor || feed.head || cursor);
+        const live = await request('/api/system3/now'); const s3 = live && live.system3; const line = live && live.line;
+        const text = line ? `${line.name || line.who || ''}: ${line.text || ''}` : '';
+        if (text !== lastText) { lastText = text; thumb(text ? text.slice(0, 220) : '', s3 && s3.turn ? (s3.turn.rolls || []).map(r => r.dice).filter(x => x != null) : []);
+          nowNode.textContent = text ? (s3 ? `${s3.road} round · turn ${(s3.turn || {}).turn || '?'} of ${s3.turns} · ` : 'not directed by System 3 · ') + text.slice(0, 160) : 'nothing on air'; }
+        nodes.forEach((m, id) => { if (m.userData && m.userData.road) m.material.emissive.setHex(s3 && s3.road === id && text ? 0x2a6b3f : (m.userData.on ? 0x10331f : 0x000000)); });
+      } catch (e) { /* the scene keeps turning */ }
+      if (alive) setTimeout(poll, 2000);
+    }
+    const size = () => { const w = canvas.clientWidth || 640, h = canvas.clientHeight || 400; renderer.setSize(w, h, false); camera.aspect = w / h; camera.updateProjectionMatrix(); };
+    size(); window.addEventListener('resize', size);
+    const t0 = performance.now(); const origin = new THREE.Vector3(0, 0.9, 0);
+    function frame() {
+      if (!alive) return; raf = requestAnimationFrame(frame);
+      const t = (performance.now() - t0) / 1000; core.rotation.y = t * 0.6; core.rotation.x = Math.sin(t * 0.5) * 0.4;
+      circuits.forEach((c, i) => { if (!c.on) return; const u = (t * c.speed + c.phase) % 1; packets[i].position.lerpVectors(c.from, c.to, u); packets[i].position.y += Math.sin(u * Math.PI) * 0.5; });
+      for (let i = planes.length - 1; i >= 0; i -= 1) { const p = planes[i]; p.t += 0.016; const u = Math.min(1, p.t / 1.6);
+        p.m.position.lerpVectors(origin, p.to, u); p.m.position.y += Math.sin(u * Math.PI) * 2.2; p.m.lookAt(p.to); p.m.rotateX(Math.PI / 2);
+        if (u >= 1) { p.m.material.opacity -= 0.05; if (p.m.material.opacity <= 0) { scene.remove(p.m); planes.splice(i, 1); } } }
+      camera.position.x = Math.sin(t * 0.1) * 3; camera.lookAt(0, 0.5, 0); renderer.render(scene, camera);
+    }
+    frame(); poll();
+    return {stop() { alive = false; cancelAnimationFrame(raf); window.removeEventListener('resize', size); try { renderer.dispose(); } catch (_) { /* gone */ } }};
+  }
+
   /* ---------------- controls ---------------------------------------------- */
   const CONTROL_HELP = {
     emotional_volatility: 'how readily a speaker leaves the emotion they are in',
@@ -3574,6 +4082,10 @@ export async function mount(root, {request, onClose, tab: startTab = '', table: 
     try {
       if (tab === 'director') { fill(body, director); paintDirector(); }
       else if (tab === 'tables') paintTables();
+      else if (tab === 'segments') paintSegments();
+      else if (tab === 'prompts') paintPrompts();
+      else if (tab === 'audit') paintAudit();
+      else if (tab === 'sys3') paintSys3();
       else if (tab === 'structure') paintStructure();
       else paintControls();
     } catch (e) { report(e); }
@@ -3581,6 +4093,7 @@ export async function mount(root, {request, onClose, tab: startTab = '', table: 
 
   async function poll() {
     if (!alive || document.hidden) return;
+    if (reading()) return;                                  /* [s3-hold] */
     try {
       const feed = await request('/api/system3/events?' + new URLSearchParams({after: cursor, limit: 500}));
       const fresh = feed.events || [];
@@ -3607,7 +4120,7 @@ export async function mount(root, {request, onClose, tab: startTab = '', table: 
     else paintDirector();
   } catch (e) { report(e); paintTabs(); }
   timers.push(setInterval(poll, 2000));
-  return {dispose() { alive = false; v.alive = false; timers.forEach(clearInterval); fill(root); }};
+  return {dispose() { alive = false; v.alive = false; timers.forEach(clearInterval); stopExtras(); fill(root); }};
 }
 
 /* [s3-dice] A DIE ON THE FEED, TAPPED: the decision card of the roll it

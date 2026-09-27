@@ -114,6 +114,60 @@ class LegsTests(unittest.TestCase):
         self.assertIn("THE LEAD, sung.", system3.render_legs_sheet(conv))
 
 
+class WindowTests(unittest.TestCase):
+    """[s3-window] the segment editor's powers: variants, pins, the budget roll."""
+
+    def test_a_variant_rolls_and_is_recorded(self):
+        config = system3.default_config()
+        base = config["structures"]["news"]
+        config["structures"]["news~v1"] = {**base, "id": "news~v1", "label": "News B", "variant_of": "news",
+                                          "weight": 1e9, "enabled": True}
+        conv = system3.new_conversation(inputs("news"), config, settings(), conversation_id="newsv")
+        system3.plan_legs(conv, config, road="news")
+        self.assertEqual(conv["variant_roll"]["structure"], "news~v1")
+        ev = [e for e in conv["decision_events"] if e["family"] == "VARIANT"]
+        self.assertEqual(len(ev), 1)
+        self.assertEqual(ev[0]["selected"]["of"], 2)
+        self.assertIsNotNone(ev[0]["rng"])
+        # switched off, it is not on the table and nothing is rolled
+        config["structures"]["news~v1"]["enabled"] = False
+        conv2 = system3.new_conversation(inputs("news"), config, settings(), conversation_id="newsv2")
+        system3.plan_legs(conv2, config, road="news")
+        self.assertNotIn("variant_roll", conv2)
+        self.assertFalse([e for e in conv2["decision_events"] if e["family"] == "VARIANT"])
+
+    def test_a_pinned_draw_is_recorded_without_a_roll(self):
+        config = system3.default_config()
+        es = next(it["id"] for t in config["tables"] if t["family"] == "ES"
+                  for c in t["categories"] for it in c["items"])
+        config["structures"]["news"]["legs"][0]["draws"] = [{"family": "ES", "fixed": es}]
+        conv = system3.new_conversation(inputs("news"), config, settings(), conversation_id="newsf")
+        system3.plan_legs(conv, config, road="news")
+        first = [e for e in conv["decision_events"] if e["family"] == "ES" and e["turn_index"] == 0]
+        self.assertTrue(first)
+        self.assertIsNone(first[0]["rng"])
+        self.assertEqual(first[0]["selected"]["id"], es)
+        self.assertEqual(first[0]["meta"]["authority"], "fixed")
+        self.assertEqual(first[0]["stages"][0]["stage"], "fixed")
+
+    def test_a_slot_sized_round_rolls_its_length_in_the_segment_band(self):
+        config = system3.default_config()
+        conv = system3.new_conversation(inputs("banter", turns=8, target_seconds=200.0, turn_seconds=10.0, budget_roll=True),
+                                        config, settings(), conversation_id="len1")
+        system3.plan_more(conv, config)
+        roll = conv["length_roll"]
+        self.assertTrue(8 <= roll["turns"] <= 12, roll)          # never shorter than the slot; at most 1.5x
+        self.assertEqual(conv["timing"]["turn_budget"], roll["turns"])
+        ev = [e for e in conv["decision_events"] if e["family"] == "LENGTH"]
+        self.assertEqual(len(ev), 1)
+        self.assertIn("fills the segment", ev[0]["stages"][0]["rule"])
+        # without the runtime saying the slot gave a budget, the size is the obligation it was
+        conv2 = system3.new_conversation(inputs("banter", turns=8, target_seconds=200.0, turn_seconds=10.0),
+                                         config, settings(), conversation_id="len2")
+        system3.plan_more(conv2, config)
+        self.assertNotIn("length_roll", conv2)
+
+
 class SfxGuyNodeTests(unittest.TestCase):
     def test_his_node_rolls_on_every_host_turn_at_the_dial(self):
         config = system3.default_config()

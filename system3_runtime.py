@@ -319,6 +319,7 @@ class System3Runtime:
             "road": road, "at": time.time(), "seats": seats, "names": names, "roles": roles,
             "initial_emotions": moods, "turns": int(ctx.get("lines") or 8),
             "target_seconds": target, "turn_seconds": turn_seconds,
+            "budget_roll": bool(target > 0 and turn_seconds > 0),            # [s3-window]
             "words_per_turn": words_per_turn, "deadline": float(s2.get("deadline") or 0),
             "trace_id": str(s2.get("trace_id") or ""), "system2_slot_id": str(s2.get("slot_id") or ""),
             "system2_job_id": str(s2.get("job_id") or ""),
@@ -1597,17 +1598,49 @@ def install(app, namespace):
         draws - customised, expanded or altered from the desk."""
         host.require_auth(authorization)
         raw = body_json(await request.body())
-        problems = system3_tables.validate_structure(road, raw)
+        # [s3-window] a variant is "<road>~v<n>": a copy of the road's segment with
+        # its own legs, a weight against the base and an on/off switch; the
+        # engine rolls which one runs (VARIANT) each time the road goes to air.
+        base, sep, _tail = road.partition("~")
+        problems = system3_tables.validate_structure(base, raw)
         if problems:
             raise HTTPException(400, "; ".join(problems[:6]))
         config = copy.deepcopy(rt.config)
-        mine = dict(system3.road_structure(config, road) or {})
+        held = config.setdefault("structures", system3_tables.default_structures())
+        if sep:
+            if base not in held and base not in system3.ROADS:
+                raise HTTPException(400, "no road called %s to make a variant of" % base)
+            mine = dict(held.get(road) or system3.road_structure(config, base) or {})
+            mine.update({"id": road, "variant_of": base})
+        else:
+            mine = dict(system3.road_structure(config, road) or {})
         mine.update({k: raw[k] for k in ("legs", "label", "head", "tail", "material",
                                          "min_turns", "max_turns", "caller_share") if k in raw})
+        if "weight" in raw:
+            try:
+                mine["weight"] = max(0.0, float(raw.get("weight") or 0))
+            except (TypeError, ValueError):
+                raise HTTPException(400, "weight must be a number")
+        if "enabled" in raw:
+            mine["enabled"] = bool(raw.get("enabled"))
         mine["version"] = int(mine.get("version") or 1) + 1
-        config.setdefault("structures", system3_tables.default_structures())[road] = mine
+        held[road] = mine
         return {"hash": await save_config(config, "%s structure v%d" % (road, mine["version"])),
                 "structure": mine}
+
+    @app.delete("/api/system3/structures/{road}")
+    async def delete_road_structure(road: str, authorization: str | None = Header(default=None)):
+        """[s3-window] Drop a variant. A road's own structure cannot be deleted
+        (reset it from the defaults instead)."""
+        host.require_auth(authorization)
+        if "~" not in road:
+            raise HTTPException(400, "only a variant (road~vN) can be deleted")
+        config = copy.deepcopy(rt.config)
+        held = config.get("structures") or {}
+        if road not in held:
+            raise HTTPException(404, "no variant called %s" % road)
+        held.pop(road)
+        return {"hash": await save_config(config, "%s variant dropped" % road), "deleted": road}
 
     @app.put("/api/system3/config/section/{name}")
     async def put_section(name: str, request: Request, authorization: str | None = Header(default=None)):

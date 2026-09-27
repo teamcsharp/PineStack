@@ -23942,12 +23942,14 @@ def _low_encode_soon(source: Path, out: Path, rate: int) -> None:
             import imageio_ffmpeg
             exe = imageio_ffmpeg.get_ffmpeg_exe()
             LOW_CACHE.mkdir(parents=True, exist_ok=True)
-            extra: dict[str, Any] = {}
-            if hasattr(os, "nice"):     # Linux only; harmless elsewhere
-                extra["preexec_fn"] = lambda: os.nice(15)
+            # preexec_fn forks a multithreaded station and can deadlock the
+            # child before exec, holding the Python GIL and freezing the API.
+            # The external nice command gives the encoder the same priority
+            # without running Python between fork and exec.
+            low_priority = ["nice", "-n", "15"] if shutil.which("nice") else []
             with _LOW_GATE:
                 subprocess.run(
-                    [exe, "-nostdin", "-hide_banner", "-loglevel", "error",
+                    [*low_priority, exe, "-nostdin", "-hide_banner", "-loglevel", "error",
                      "-y", "-i", str(source),
                      # The source IS 24 kHz mono. Resampling up would only
                      # cost bytes; -ac 1 keeps a stereo clip in line too.
@@ -23956,7 +23958,7 @@ def _low_encode_soon(source: Path, out: Path, rate: int) -> None:
                      # ".part" tells ffmpeg nothing, so the format has to
                      # be named - the same trap the tape road hit.
                      "-f", "mp3", str(part)],
-                    check=True, timeout=120, capture_output=True, **extra)
+                    check=True, timeout=120, capture_output=True)
             part.replace(out)       # atomic; no reader sees a half file
             _low_sweep()
         except Exception:  # noqa: BLE001
@@ -24038,17 +24040,15 @@ def _music_low_encode_soon(source: Path, out: Path, rate: int) -> None:
             import imageio_ffmpeg
             exe = imageio_ffmpeg.get_ffmpeg_exe()
             MUSIC_LOW_DIR.mkdir(parents=True, exist_ok=True)
-            extra: dict[str, Any] = {}
-            if hasattr(os, "nice"):
-                extra["preexec_fn"] = lambda: os.nice(15)
+            low_priority = ["nice", "-n", "15"] if shutil.which("nice") else []
             with _LOW_GATE:
                 subprocess.run(
-                    [exe, "-nostdin", "-hide_banner", "-loglevel", "error",
+                    [*low_priority, exe, "-nostdin", "-hide_banner", "-loglevel", "error",
                      "-y", "-i", str(source),
                      "-vn", "-ac", "2", "-ar", "44100",
                      "-codec:a", "libmp3lame", "-b:a", f"{int(rate)}k",
                      "-f", "mp3", str(part)],
-                    check=True, timeout=300, capture_output=True, **extra)
+                    check=True, timeout=300, capture_output=True)
             part.replace(out)
             _music_low_sweep()
         except Exception:  # noqa: BLE001
@@ -33579,6 +33579,16 @@ async def _sfx_single_clip(clip: dict[str, Any], text: str, who: str,
 _S3_LINE_BY_ID: dict[str, dict[str, Any]] = {}
 
 
+def _s3_active() -> bool:
+    """Whether System 3 currently owns the station's dialogue decisions."""
+    runtime = globals().get("_system3")
+    try:
+        return bool(runtime and runtime().ready
+                    and runtime().settings.get("mode") == "active")
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _s3_line_remember(line_id: Any, stamp: Any) -> None:
     if isinstance(stamp, dict) and stamp.get("conversation_id") and line_id:
         _S3_LINE_BY_ID[str(line_id)] = dict(stamp)
@@ -33599,8 +33609,7 @@ async def _s3_stock_line(road: str, options: Any, who: str = "dj", context: str 
                          source: str = "") -> tuple[str, dict[str, Any] | None]:
     """[s3-roads] A line off a fixed list is a LINE draw: System 3 rolls
     over the list with every candidate recorded, and the words are bound
-    to the node. None (off, or a fault) is the station's own
-    random.choice(), as ever."""
+    to the node. A failed draw withholds the line; it cannot choose off-ledger."""
     rows = [str(x) for x in (options or []) if str(x or "").strip()]
     if not rows:
         return "", None
@@ -33614,9 +33623,9 @@ async def _s3_stock_line(road: str, options: Any, who: str = "dj", context: str 
                     globals()["system3_bind_line"](_h, _h.line)
                 return _h.line, dict(_h.stamp)
         except Exception as _exc:  # noqa: BLE001
-            pipeline_log("system3", "a stock line fell back to the station's own draw",
+            pipeline_log("system3", "a stock line was withheld after its draw failed",
                          extra=("%s: %s" % (type(_exc).__name__, _exc))[:200])
-    return random.choice(rows), None
+    return "", None
 
 
 async def _s3_ad_pick() -> dict[str, Any] | None:
@@ -33644,9 +33653,9 @@ async def _s3_ad_pick() -> dict[str, Any] | None:
                 _pick["system3"] = dict(_h.stamp)
                 return _pick
         except Exception as _exc:  # noqa: BLE001
-            pipeline_log("system3", "the produced spot fell back to the station's own draw",
+            pipeline_log("system3", "a produced spot was withheld after its draw failed",
                          extra=("%s: %s" % (type(_exc).__name__, _exc))[:200])
-    return random.choice(pool)
+    return None
 
 
 async def dj_speak(kind: str, track: dict[str, Any] | None = None,
@@ -33738,6 +33747,36 @@ async def _dj_speak_floorless(kind: str, track: dict[str, Any] | None = None,
                 record_bound_withdraw(bound, bound_part, who, kind,
                                       line, _bound_why)
             return ""
+    # Every single-line road meets the same director at the microphone.
+    # Earlier writers may bring their own active node; a direct caller of
+    # dj_speak gets one here. A planner fault cannot turn into unaccounted
+    # dialogue.
+    _s3_spoken_handle = None
+    if (not isinstance(system3, dict) or system3.get("mode") != "active"
+            or not system3.get("conversation_id") or not system3.get("turn_id")):
+        _s3_road = ("reply" if kind == "reply" else
+                    "station_id" if kind == "station_id" else
+                    "interject" if kind == "interject" else
+                    "track_talk" if kind in ("intro", "outro") else
+                    "single_line")
+        try:
+            _s3_spoken_handle = await system3_direct_line(
+                road=_s3_road, who=who, dj=dj_settings(),
+                context=(str(extra or line or note or
+                             (track or {}).get("title") or kind)[:400]),
+                text=str(line or "")[:600], bank=bool(clip))
+        except Exception as _s3_exc:  # noqa: BLE001
+            pipeline_log("system3", "single-line planning failed",
+                         extra=("%s: %s" % (type(_s3_exc).__name__, _s3_exc))[:200])
+        if _s3_spoken_handle is None or not _s3_spoken_handle.active:
+            pipeline_log("system3", "single line withheld without an active System 3 node",
+                         extra="%s from %s" % (kind, who))
+            return ""
+        system3 = dict(_s3_spoken_handle.stamp)
+    _s3_sheet = (_s3_spoken_handle.sheet if _s3_spoken_handle is not None else "")
+    _s3_perf = (_s3_spoken_handle.perf if _s3_spoken_handle is not None else None)
+    if _s3_perf:
+        vec = performance_vector(who, voice or "", state=_s3_perf)
     if vec and (vec.get("_macro") or random.random() < 0.2):
         # Behind the glass, the DELIVERY machinery explains itself (#402):
         # what shapes the intonation and who does the shaping.
@@ -33779,7 +33818,7 @@ async def _dj_speak_floorless(kind: str, track: dict[str, Any] | None = None,
             f"a {kind} line from {who} (back from its write)",
             dj_line(kind, track, extra, seed,
                     direct=perf_directive(vec) + weather_directive(who)
-                    + note)))                              # [#1232]
+                    + note + ("\n\n" + _s3_sheet if _s3_sheet else ""))))
         if not by_hand:
             spoken = inject_disfluencies(spoken, vec, seed=who)
     # A line with no letters in it is not a line. An interruption written as
@@ -33937,6 +33976,8 @@ async def _dj_speak_floorless(kind: str, track: dict[str, Any] | None = None,
     if to_box and box_firmware_down_now():
         to_box = False                  # #1156: route around a dead box
         _route_around_note(f"a {kind} line")
+    if _s3_spoken_handle is not None:
+        system3_bind_line(_s3_spoken_handle, spoken)
     line_id = uuid.uuid4().hex  # durable cadence receipts must not recycle 24-bit IDs
     _s3_line_remember(line_id, system3)                      # [s3-roads]
     page_delivery = ""
@@ -38782,6 +38823,8 @@ def _prep_intro_pad(turns: list[tuple[str, str]],
     place: one caller chunk, counted, never rendered. Every entry in
     CALLER_HELLOS is one sentence group well inside say_max_chars(), so
     the placeholder is the same single chunk whichever one is drawn."""
+    if _s3_active():
+        return turns
     try:
         if not caller_name or not turns:
             return turns
@@ -40510,6 +40553,10 @@ async def larder_prepare(entry: dict[str, Any],
             pipeline_log("speakbox", "a tinted round skips the freshener - "
                          "it has already been through a second pass, and "
                          "freshening has no crystal in it (#1025)")
+        if _s3_active():
+            # The bound script is the running order's final text. A legacy
+            # freshener has no turn plan and cannot replace it on the shelf.
+            entry["freshened"] = True
         if not (entry.get("freshened") or entry.get("frozen")):
             prep_note(_pkind, "writing")
             try:
@@ -42365,6 +42412,8 @@ def track_callback(track: dict[str, Any] | None, part: str
     treats it as ordinary track talk. The audio key is deliberately NOT
     carried over: the frame is new, so the line has to be rendered - one
     render against a whole model visit and a vision pass saved."""
+    if _s3_active():
+        return None   # the System 3 record-link writer supplies the new line
     try:
         tid = str((track or {}).get("id") or "")
         if not tid:
@@ -70000,6 +70049,8 @@ def manager_cut_in_clause() -> str:
 
     Never raises, and never fires while the station is paused: an
     interruption to nothing is not an interruption."""
+    if _s3_active():
+        return ""    # the manager road and RS rolls own on-air interruptions
     now = time.time()
     if now - float(_MANAGER_CUT_MEMO["at"]) < 40.0:
         return str(_MANAGER_CUT_MEMO["clause"])
@@ -76836,6 +76887,10 @@ def speakbox_spread_clause(spread: list[dict[str, Any]]) -> str:
 def speakbox_aside(quote: dict[str, str], pair: bool = True) -> str:
     """The same trick for one line rather than a whole round: the words go
     out, where they came from never does."""
+    if _s3_active():
+        return ("\n\nPassage to work into the conversation in full: \""
+                + str(quote.get("text") or "") + "\". System 3's running order "
+                "chooses the response and feeling of each speaker.")
     return (
         "\n\nYou also have lines to deliver, and they go out WORD FOR WORD, "
         "exactly as written, as your own speech — every sentence, in order, "
@@ -76969,6 +77024,14 @@ def speakbox_scene_angle(seed: dict[str, str],
     conversation coming to terms with it, through a funny struggle arc, then
     swerves it somewhere nobody saw coming with a passage of their own from
     a different document. Optionally a third lands as the last word."""
+    if _s3_active():
+        passages = [seed, pivot, jab]
+        return ("Passages for this conversation, in order: "
+                + " ".join("\"%s\"" % str(row.get("text") or "")
+                           for row in passages if isinstance(row, dict)
+                           and str(row.get("text") or "").strip())
+                + " Work the passages into the scene. System 3 chooses who "
+                  "speaks, the responses, the emotions, and the flow.")
     first = random.choice(["A", "B"])
     other = "B" if first == "A" else "A"
     angle = (
@@ -77015,6 +77078,11 @@ def speakbox_angle(quote: dict[str, str],
     separately and never twice running, so the same lines landing again are
     a different scene — and when there is a `comeback`, the other one answers
     with full lines out of a different document entirely (#233)."""
+    if _s3_active():
+        material = "Passage to work into the conversation: \"%s\"." % str(quote.get("text") or "")
+        if comeback and str(comeback.get("text") or "").strip():
+            material += " A second passage is available: \"%s\"." % str(comeback["text"])
+        return material + " System 3 chooses the speakers, responses, emotions, and flow."
     # [#1386] The seat is the CALLER's to choose when it already dealt
     # the passage into the script - otherwise the prose says B reads it
     # while the script hands it to A, and the pair answer a passage
@@ -81576,7 +81644,7 @@ async def _sfx_cadence_additions_inner(who: str, text: str, completed: int,
                 additions[-1].update({"sfx_video_id": sfx_id(sample),
                                       "sfx_video_seconds": duration,
                                       "sfx_match_why": why})
-            if complaint_due():
+            if not _s3_active() and complaint_due():
                 other = "dj" if who == "cohost" else "cohost"
                 voice = configured_radio_voice(other)
                 if voice:
@@ -81604,10 +81672,11 @@ async def _sfx_cadence_additions_inner(who: str, text: str, completed: int,
     # in place of the dial's random; a banked round's takes keep their floor.
     _s3_guy = (globals()["system3_sfxguy_direction"](meta, who, text)
                if globals().get("system3_sfxguy_direction") and settings.get("drop_voice") else None)
+    _guy_wanted = (bool(_s3_guy and _s3_guy.get("speak")) if _s3_active()
+                   else ready_takes is not None or random.random() <
+                   float(settings.get("sfxguy_rate") or 0) / 100.0)
     if (sfx_due_after(completed, guy_interval) and settings.get("drop_voice")
-            and (ready_takes is not None
-                 or (bool(_s3_guy.get("speak")) if _s3_guy is not None
-                     else random.random() < float(settings.get("sfxguy_rate") or 0) / 100.0))):
+            and _guy_wanted):
         _SFX_CADENCE_STATUS["guy_due"] += 1
         take = sfxguy_ready_pick(text, str(settings["drop_voice"]))
         if take:
@@ -84922,7 +84991,8 @@ async def dj_sting(to_box: bool, after: str = "", who: str = "",
         except Exception:  # noqa: BLE001
             pass
     # Sometimes the other presenter has FEELINGS about the sample (#292).
-    if played_anywhere and who in ("dj", "cohost", "third") and complaint_due():
+    if (not _s3_active() and played_anywhere
+            and who in ("dj", "cohost", "third") and complaint_due()):
         other = "cohost" if who != "cohost" else "dj"
         asyncio.create_task(_sting_react(other))
     return sample.name
@@ -90189,6 +90259,8 @@ def approach_pick() -> dict[str, Any]:
 def approach_clause(rule: dict[str, Any]) -> str:
     """The drawn approach as a directive. It is the FRAME, never the subject
     — a round that announces its own frame is a round about itself."""
+    if _s3_active():
+        return ""    # FL is the frame on an active System 3 round
     text = str((rule or {}).get("text") or "").strip()
     if not text:
         return ""
@@ -98400,6 +98472,10 @@ async def dj_deep_round(track: dict[str, Any] | None = None) -> list[str]:
            + "\n- ".join(swaths) + "\n\n" if swaths else "")
         + "RECENT AIR (continue naturally FROM this, never repeat it):\n"
         + ("\n".join(recent) if recent else "(top of the hour)"))
+    if _s3_active():
+        return await dj_banter(
+            track, angle=foundation + "\n\nHold a sustained conversation on this material.",
+            lines=14, own_material=True)
     prompt = (
         f"{foundation}\n\n"
         f"Write a LONG, natural conversation between A ({host}) and B "
@@ -100646,6 +100722,8 @@ def _caller_introduces(turns: list[tuple[str, str]],
     one where they sometimes do. This checks the caller's FIRST turn for
     their name and, when it is missing, puts a plain hello in front of it
     as a turn of its own — same marker, same voice, same phone rack."""
+    if _s3_active():
+        return turns
     if not caller_name or not turns:
         return turns
     # #786: a whitespace-only name is truthy but splits to nothing — this
@@ -101100,6 +101178,61 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
     _round_entries: list[dict[str, Any]] = []
     ready_meta = (dict(ready_takes[0].get("round") or {}) if ready_takes
                   else dict(round_meta or {}))
+    _round_s3 = ready_meta.get("system3")
+    if (_s3_active() and (not isinstance(_round_s3, dict)
+                         or _round_s3.get("mode") != "active")):
+        pipeline_log("system3", "round withheld without an active System 3 conversation",
+                     extra=str(ready_meta.get("prep_kind") or "banter"))
+        return []
+    if _s3_active():
+        # A writer can return more turns than the running order dealt.  The
+        # binding names only planned script positions; every other line must
+        # leave the air path, including a prepared take of that line.
+        _s3_ids = _round_s3.get("turns") or {}
+        _s3_dice = _turn_dice_map(ready_meta)
+        _s3_positions = [i for i in range(len(turns))
+                         if str(_s3_ids.get(str(i)) or "")
+                         and str((_s3_dice.get(i, {}).get("s3") or {}).get("turn_id") or "")
+                         == str(_s3_ids.get(str(i)))]
+        if not _s3_positions:
+            pipeline_log("system3", "round withheld without bound roulette turns",
+                         extra=str(ready_meta.get("prep_kind") or "banter"))
+            return []
+        _s3_planned = int(_round_s3.get("planned_turns") or len(_s3_positions))
+        if (_s3_planned > 1
+                and len(_s3_positions) < max(2, (_s3_planned + 1) // 2)):
+            pipeline_log("system3", "incomplete conversation withheld after repair",
+                         extra=f"{len(_s3_positions)} of {_s3_planned} turns")
+            return []
+        _s3_keep = set(_s3_positions)
+        if ready_takes is not None:
+            _s3_ready = []
+            _s3_turn_for = globals().get("system3_turn_id_for")
+            for _take in ready_takes:
+                # A take index counts audio chunks, whereas the binding
+                # counts script turns. Match the saved words to the bound
+                # turn so a long, planned response keeps all its chunks.
+                _take_tid = (_s3_turn_for(ready_meta, _take.get("text"),
+                                          _take.get("who"))
+                             if callable(_s3_turn_for) else "")
+                if _take_tid and str(_take_tid) in _s3_ids.values():
+                    _s3_ready.append(_take)
+            if not _s3_ready:
+                pipeline_log("system3", "prepared round withheld without planned takes")
+                return []
+            if len(_s3_ready) != len(ready_takes):
+                pipeline_log("system3", "unplanned prepared dialogue held from air",
+                             extra=str(len(ready_takes) - len(_s3_ready)))
+            _s3_ready[0]["round"] = ready_meta
+            ready_takes = _s3_ready
+        elif len(_s3_positions) != len(turns):
+            pipeline_log("system3", "unplanned written dialogue held from air",
+                         extra=str(len(turns) - len(_s3_positions)))
+        turns = [turns[i] for i in _s3_positions]
+        turn_dice = {j: _s3_dice[i] for j, i in enumerate(_s3_positions)}
+        turn_source = {j: (turn_source or {}).get(i, "")
+                       for j, i in enumerate(_s3_positions)}
+        limit = min(limit, len(turns))
     if (any(line_forgotten(str(take.get("text") or "")) for take in (ready_takes or []))
             or any(line_forgotten(text) for _, text in turns)):
         pipeline_log("drop", "a round carrying an operator-forgotten line was withheld")
@@ -101294,6 +101427,9 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
         if _rerun["block"] and not line_review_permits(
                 "repetition", text, reasons=[str(_rerun.get("why") or "repeated line")],
                 context={"who": who}):
+            if _s3_active():
+                note_drop(who, text, "System 3 turn refused as a repeat")
+                continue
             # #824: a repeat trades for MATERIAL first, silence last —
             # the same swap the phrase gate below already performs.
             _swp = (fresh_pool_take() if phrase_setup()["swap"] else {})
@@ -101345,6 +101481,9 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
             if _phrase["block"] and not line_review_permits(
                     "repetition", text, reasons=[str(_phrase.get("why") or "repeated phrase")],
                     context={"who": who}):
+                if _s3_active():
+                    note_drop(who, text, "System 3 turn refused as a repeated phrase")
+                    continue
                 _swap = (fresh_pool_take() if phrase_setup()["swap"] else {})
                 _new = spoken_text(str(_swap.get("text") or ""))
                 if not _new and phrase_setup()["swap"]:
@@ -101397,7 +101536,10 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
         vec = performance_vector(
             who, (caller_voice if who == caller_seat      # #1164
                   else caller2_voice if who == "caller2"
-                  else voices.get(who)) or "")
+                  else voices.get(who)) or "",
+            state=(globals()["system3_perf_state"](ready_meta, turns, said, who)
+                   if _s3_active() and globals().get("system3_perf_state")
+                   else None))
         first_at = len(playlist)
         # The slider is the ceiling (#423): every piece fits in one
         # announce the box can drain; the SAME voice takes a breath at
@@ -102059,7 +102201,7 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                             and dj_settings().get("drop_voice")
                             and item["who"] in ("dj", "cohost", "third")
                             and (bool(_gq_s3.get("speak")) if _gq_s3 is not None
-                                 else random.random() < _gq_rate / 100.0)):
+                                 else not _s3_active() and random.random() < _gq_rate / 100.0)):
                         _gv = str(dj_settings()["drop_voice"])
                         _qraw = sfxguy_line(
                             _gv, spoken_text(item["chunk"])[:200],
@@ -103780,7 +103922,7 @@ async def dj_banter(track: dict[str, Any] | None = None,
     # since the pair last acknowledged it, make THIS round note it once, in
     # passing ("so-and-so stepped out, say hello to X"). Only a genuine change
     # (never the first draw of the show), never on a call or a chosen angle.
-    if not angle and not caller_name:
+    if not angle and not caller_name and not _s3_active():
         try:
             _vc = await session_voices()
         except Exception:
@@ -103805,10 +103947,11 @@ async def dj_banter(track: dict[str, Any] | None = None,
     # steers which swath the speakbox hands over — so the same subject
     # genuinely arrives somewhere different, and the other speaker
     # reacts differently to it, which is the whole of the request.
-    _approach = approach_pick()
+    _approach = {} if _s3_active() else approach_pick()
     _lines_rolled, _lines_base = False, 0     # [s3-glass] the dial's random stood here
     if lines <= 0:
-        lines = random.randint(dj["banter_min_lines"], dj["banter_max_lines"])
+        lines = (int(dj["banter_min_lines"]) if _s3_active()
+                 else random.randint(dj["banter_min_lines"], dj["banter_max_lines"]))
         _lines_rolled, _lines_base = True, int(lines)
         # Lines run twice as long since #361 and renders slowed under
         # GPU load — a drawn round stays bounded so records ever reach the
@@ -104027,7 +104170,7 @@ async def dj_banter(track: dict[str, Any] | None = None,
     # Something you wrote and approved, back on air word for word. Only for a
     # round with nothing else already asked of it (#202). Never banked: the
     # larder holds written rounds, not replays.
-    if not bank and not (angle or force_seed) \
+    if not _s3_active() and not bank and not (angle or force_seed) \
             and random.random() < dj["saved_rate"]:
         keep = draw_saved_banter()
         if keep:
@@ -104673,6 +104816,10 @@ async def dj_banter(track: dict[str, Any] | None = None,
         if not caller_name:
             _s3 = await _s3_direct()
         _s3_owns = bool(_s3 is not None and _s3.active and _s3.sheet)
+        if _s3_active() and not caller_name and not _s3_owns:
+            pipeline_log("system3", "round withheld because its running order was not directed",
+                         extra=str(road or "banter"))
+            return []
         if _s3_owns and int(getattr(_s3, "turns", 0) or 0) > 0:
             # [s3-glass] a free round's length is System 3's roll
             lines = int(_s3.turns)
@@ -104728,6 +104875,10 @@ async def dj_banter(track: dict[str, Any] | None = None,
                 _s3 = await _s3_direct(call_sheet=_beat_sheet)
                 if _s3 is not None and _s3.active and _s3.sheet:
                     _beat_sheet = _s3.sheet
+                    _s3_owns = True
+                elif _s3_active():
+                    pipeline_log("system3", "call withheld because its running order was not directed")
+                    return []
                 _dice_rolls = []
                 raise _CallSheetDone
             if _s3_owns:
@@ -105022,7 +105173,7 @@ async def dj_banter(track: dict[str, Any] | None = None,
                 # live writing keeps the operator's num_ctx untouched.
                 num_ctx=(32768 if _bank_rich else 0),
                 mark=({"kind": "caller"} if caller_name else None),
-                result_contract=("structured_turns" if caller_name
+                result_contract=("structured_turns" if caller_name or _s3_owns
                                  else "spoken"),
             )
     except WritingDeferred as exc:
@@ -105207,7 +105358,8 @@ async def dj_banter(track: dict[str, Any] | None = None,
                 + ("/C" if caller_name else "/D" if _system2_budget and dj.get("third_name") else "") + ": dialogue. Keep its "
                 "subject and every verbatim quotation. "
                 + (f"Write {lines} alternating turns. " + system2_turn_instruction(_system2_budget)
-                   if _system2_budget else "Write 8 to 11 alternating turns with at least 55 words in every ordinary turn. ")
+                   if _system2_budget else f"Write {lines} alternating turns. "
+                   if _s3_owns else "Write 8 to 11 alternating turns with at least 55 words in every ordinary turn. ")
                 + "Each speaker must respond directly to the prior turn, "
                 "develop an idea with concrete detail, and finish a complete "
                 "thought. Do not use one-line reactions or stage directions."
@@ -105247,7 +105399,7 @@ async def dj_banter(track: dict[str, Any] | None = None,
                 spice=0.25,
                 num_ctx=16384,
                 mark=({"kind": "caller rewrite"} if caller_name else None),
-                result_contract=("structured_turns" if caller_name
+                result_contract=("structured_turns" if caller_name or _s3_owns
                                  else "spoken"),
             )
             if caller_name:
@@ -105280,6 +105432,8 @@ async def dj_banter(track: dict[str, Any] | None = None,
             else:
                 _rw_ok = (system2_scene_complete(banter_turns(rewritten), _judge_lines)
                           if _system2_budget else substantial_radio_script(rewritten, _judge_lines))
+                if _s3_owns and len(banter_turns(rewritten or "")) < 2:
+                    _rw_ok = False
                 _rw_report = {"ok": _rw_ok,
                               "faults": [] if _rw_ok else ["the rewrite missed its conversational richness target"]}
             if not _rw_ok:
@@ -106738,6 +106892,9 @@ async def _banter_air(entry: dict[str, Any],
             return _banter_no("the round arrived at the booth with no "
                               "takes on it")
         ready_takes[0]["round"] = copy.deepcopy(entry)
+    elif _s3_active():
+        # The air path must not rewrite a script after System 3 bound turns.
+        pass
     elif entry.get("frozen") and not _stale:
         # #886: already freshened while a record played, and the audio was
         # rendered against exactly this text. Rewriting it now would throw
@@ -146224,14 +146381,18 @@ async def dj_banter_api(
         return {"rolling": True, "format": "still mid-round — hold on",
                 "spoke_on_box": True, "why_silent": "",
                 "voice_to": _RADIO.get("voice_to") or "box"}
-    seed = await speakbox_quote(most=random.randint(2, 6),
-                                cap=random.randint(240, 520))
-    form = unrepeated(list(SUSPENSE_FORMATS), "button-format")
-    angle = form + (
-        " Somewhere inside it, one of you delivers this, word for word, "
-        f"with total conviction, as though it proves everything: "
-        f"\"{seed['text']}\"" if seed else "")
-    count = random.randint(7, 14)
+    if _s3_active():
+        seed, angle, count = {}, "", 8  # System 3 deals the format and length.
+        form = "System 3 roulette"
+    else:
+        seed = await speakbox_quote(most=random.randint(2, 6),
+                                    cap=random.randint(240, 520))
+        form = unrepeated(list(SUSPENSE_FORMATS), "button-format")
+        angle = form + (
+            " Somewhere inside it, one of you delivers this, word for word, "
+            f"with total conviction, as though it proves everything: "
+            f"\"{seed['text']}\"" if seed else "")
+        count = random.randint(7, 14)
 
     async def _round() -> None:
         try:
@@ -146244,7 +146405,8 @@ async def dj_banter_api(
             pipeline_log("drop", f"banter round died: {exc}"[:200])
 
     _BUTTON_ROUND[:] = [asyncio.create_task(_round())]
-    asyncio.create_task(_button_ack())  # the room hears the press (#422)
+    if not _s3_active():
+        asyncio.create_task(_button_ack())
     health = speak_health()
     return {
         "rolling": True,
@@ -151897,8 +152059,14 @@ async def dj_saved_play(
     row = next((r for r in read_saved_banter() if r.get("id") == saved_id), {})
     if not row:
         raise HTTPException(status_code=404, detail="No such exchange")
-    lines = await speak_turns(banter_turns(row["text"]), _RADIO.get("now"), 12,
-                              source=row.get("source", ""), by_hand=True)
+    if _s3_active():
+        lines = await dj_banter(
+            _RADIO.get("now"), lines=12, own_material=True,
+            angle="Revisit this saved exchange as material for a new conversation: "
+                  + str(row["text"])[:2400], source=row.get("source", ""))
+    else:
+        lines = await speak_turns(banter_turns(row["text"]), _RADIO.get("now"), 12,
+                                  source=row.get("source", ""), by_hand=True)
     return {"lines": lines}
 
 
@@ -194241,6 +194409,9 @@ function pineWinHostShade(key, title, shade, opts) {
 // A find() may come back empty for a moment - lazy three.min.js, a fetch
 // before the DOM - so pineShow3JS waits for it.
 const PINE_3JS = [
+  /* [s3-window] System 3 and the systems it directs, as a circuit: paper
+     airplanes fly each decision to its road; the line on air floats above it. */
+  {key: "sys3", label: "Sys3", open: () => system3Open("sys3")},
   /* [#1386] one word, followed back to what made the station say it. */
   {key: "wordcause", label: "\uD83D\uDD0E Why that word",
    open: () => wordCauseOpen(),
@@ -228819,15 +228990,16 @@ async function system2Open() {
 /* System 3 (docs/system3_blueprint.md): the conversation director's
    instrument - conversation, RNG Rolodex and final script views. */
 let system3View = null;
-async function system3Open() {
+async function system3Open(tab) {                       /* [s3-window] tab: tables, segments, prompts, audit, sys3 */
   if (system3View) return;
   if (!document.getElementById("system3Style")) {
     const style = document.createElement("link"); style.id = "system3Style"; style.rel = "stylesheet";
-    style.href = "/system3/system3.css?v=1"; document.head.append(style);
+    style.href = "/system3/system3.css?v=4"; document.head.append(style);
   }
   try {
-    const module = await import("/system3/system3.js?v=1");
+    const module = await import("/system3/system3.js?v=4");
     system3View = await module.openSystem3({request: (path, options) => api(path, options),
+      tab: typeof tab === "string" ? tab : "",
       onClose: () => { system3View = null; }});
   } catch (error) { setStatus("System 3 could not open: " + error.message, true); }
 }

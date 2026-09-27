@@ -630,17 +630,43 @@ def _stage(name, rows, pick, draw, excluded=None):
             "of": len(rows)}
 
 
-def weighted_decision(conv, config, ctx, stream, family, tables=None, closes=False):
+def weighted_decision(conv, config, ctx, stream, family, tables=None, closes=False, fixed=None):
     """Draw one outcome from a family: table -> category -> item.
 
     "When a category is initialized, a Rolodex will scroll the category
     options then land on one randomly via RNG and then cycle randomly via
     the subcategories inside." Each stage is its own recorded draw.
-    Returns (spec or None, event)."""
+    Returns (spec or None, event).
+
+    [s3-window] `fixed`: the operator turned this draw's roulette off in the
+    segment editor and pinned an item (an item id, or table:item). It is
+    recorded like any decision - one stage, one candidate, no random number
+    - so the audit still shows what stood here and why."""
     ctx = dict(ctx)
     ctx["closes"] = closes
     before = _snapshot(conv, ctx.get("speaker"))
     stages = []
+    if fixed:
+        want = str(fixed)
+        for table in _tables_for(config, family, None):
+            for cat in table.get("categories") or []:
+                for k, item in enumerate(cat.get("items") or []):
+                    if str(item.get("id")) != want and "%s:%s" % (table["id"], item.get("id")) != want:
+                        continue
+                    spec = _spec(table, cat, item)
+                    row = {"id": item["id"], "label": spec["label"], "base": 1.0, "weight": 1.0, "p": 1.0,
+                           "why": ["pinned by the operator in the segment editor - the roulette is off for this draw"]}
+                    stages.append({"stage": "fixed", "candidates": [row], "excluded": [], "total": 1.0,
+                                   "selected": item["id"], "selected_index": 1, "of": 1, "draw": None})
+                    selected = {"table": table["id"], "category": cat["id"],
+                                "category_label": cat.get("label") or cat["id"], "id": spec["id"],
+                                "label": spec["label"], "text": spec.get("text", ""), "index": k + 1,
+                                "of": len(cat.get("items") or []), "authority": "fixed"}
+                    ev = _event(conv, ctx, family, stages, selected, before,
+                                meta={"authority": "fixed", "why": "pinned to %s in the segment editor: not a draw" % want})
+                    return spec, ev
+        # a pin that names nothing on the tables falls through to the roll, and says so
+        ctx["fixed_missing"] = want
     # Every candidate's effective weight, with its reasons.
     pool = []
     for table in _tables_for(config, family, tables):
@@ -1056,7 +1082,8 @@ def _decide_turn(conv, config, settings, stream, step, speaker, want, inputs, cl
             _cts(conv, config, ctx, stream, turn, idx)
             continue
         spec, ev = weighted_decision(conv, config, ctx, stream, family,
-                                     tables=spec_draw.get("tables"), closes=bool(spec_draw.get("closes")))
+                                     tables=spec_draw.get("tables"), closes=bool(spec_draw.get("closes")),
+                                     fixed=spec_draw.get("fixed"))                     # [s3-window]
         if not spec:
             turn["decisions"].append({"family": family, "event_id": ev["event_id"], "item": None,
                                       "empty": ev["meta"].get("empty")})
@@ -1284,7 +1311,38 @@ def _length_decision(conv, settings, stream, inputs):
     top of it exactly as it rode on the random. A round the slot or System
     2 sized keeps that size: the budget is an obligation, not a roll."""
     if not inputs.get("lines_rolled"):
-        return None
+        # [s3-window] A SLOT-SIZED ROUND FILLS ITS SEGMENT. "making sure dialogue
+        # length and banter exchanges are long ... enough to encompass the time
+        # segments allocated to meet the talk radio budget goals." The slot's
+        # seconds and the road's measured seconds a turn say how many turns
+        # fill it; System 3 rolls the count in a band around that fit and the
+        # station writes that many. Only when the runtime says the slot gave a
+        # budget (budget_roll), so a round sized by hand keeps its size.
+        target = float(inputs.get("target_seconds") or 0)
+        per = float(inputs.get("turn_seconds") or 0)
+        if not (inputs.get("budget_roll") and target > 0 and per > 0):
+            return None
+        asked = max(2, int(conv["timing"]["turn_budget"]))
+        fit = max(2, int(round(target / per)))
+        # never shorter than the slot sized it; up to a quarter longer, or up to
+        # the segment's fit when the slot underfills it - at most 1.5x the slot
+        lo = min(40, asked)
+        hi = max(lo, min(40, max(asked + max(1, (asked + 3) // 4), min(fit, int(asked * 1.5)))))
+        draw = stream.next("LENGTH:turns")
+        n = lo + min(hi - lo, int(draw["u"] * (hi - lo + 1)))
+        turns = max(2, min(40, n))
+        before = _snapshot(conv, conv["cursor"].get("initiator"))
+        ev = _event(conv, {"turn_id": "", "turn_index": -1}, "LENGTH",
+                    [{"stage": "dice", "draw": draw,
+                      "rule": "fills the segment: the slot asked %d turns; %.0f s at %.1f s a turn fits %d; rolled %d..%d" % (asked, target, per, fit, lo, hi),
+                      "selected": n}],
+                    {"id": str(n), "label": "%d turns" % n, "rolled": n, "turns": turns},
+                    before, meta={"fit": fit, "asked": int(conv["timing"]["turn_budget"]), "final": turns,
+                                  "why": "the slot's budget was an obligation; the turns that fill it are now a roll"},
+                    rng=draw)
+        conv["timing"]["turn_budget"] = turns
+        conv["length_roll"] = {"rolled": n, "turns": turns, "event_id": ev["event_id"], "lo": lo, "hi": hi}
+        return conv["length_roll"]
     lo = max(2, int(inputs.get("lines_min") or 2))
     hi = max(lo, int(inputs.get("lines_max") or lo))
     base = int(inputs.get("lines_base") or 0) or int(conv["timing"]["turn_budget"])
@@ -1549,6 +1607,42 @@ def _legs_words(text, inputs):
     return out
 
 
+def _structure_roll(conv, config, road):
+    """[s3-window] WHICH STRUCTURE THIS ROAD RUNS: the road's own, or one of
+    its variants - a segment duplicated in the editor and given a weight
+    ("duplicate a segment into a variant runnable on the station with
+    unique parameters"). One recorded VARIANT draw over the weights. A road
+    with no variants draws nothing, so the default trajectory is unchanged."""
+    base = road_structure(config, road)
+    cands = [(road, base)] if isinstance(base, dict) and base.get("legs") else []
+    for key, st in sorted((config.get("structures") or {}).items()):
+        if (isinstance(st, dict) and st.get("variant_of") == road and st.get("legs")
+                and st.get("enabled", True) is not False):
+            cands.append((key, st))
+    if len(cands) <= 1:
+        return (cands[0][1] if cands else None), None
+    weights = [max(0.0, float(st.get("weight") or 1.0)) for _k, st in cands]
+    if sum(weights) <= 0:
+        weights = [1.0] * len(cands)
+    stream = DrawStream(conv["seed"], conv.get("draws", 0))
+    draw = stream.next("VARIANT:structure")
+    i = pick_index(weights, draw["u"])
+    conv["draws"] = stream.n
+    total = sum(weights)
+    rows = [{"id": k, "label": str(st.get("label") or k), "base": w, "weight": w, "p": round(w / total, 4),
+             "why": ["weight %.2f of %.2f" % (w, total)]} for (k, st), w in zip(cands, weights)]
+    before = _snapshot(conv, (conv.get("cursor") or {}).get("initiator"))
+    ev = _event(conv, {"turn_id": "", "turn_index": -1}, "VARIANT",
+                [{"stage": "item", "candidates": rows, "excluded": [], "total": total, "selected": cands[i][0],
+                  "selected_index": i + 1, "of": len(cands), "draw": draw}],
+                {"table": "structures", "category": road, "category_label": road + " structures",
+                 "id": cands[i][0], "label": rows[i]["label"], "index": i + 1, "of": len(cands)},
+                before, meta={"why": "the %s road has %d structures on the desk; one weighted draw picks the one "
+                                     "this round runs" % (road, len(cands))}, rng=draw)
+    conv["variant_roll"] = {"structure": cands[i][0], "event_id": ev["event_id"], "of": len(cands)}
+    return cands[i][1], ev
+
+
 def plan_legs(conv, config, inputs=None, road=None):
     """[s3-roads] A segment planned from its own structure: the open legs
     in order, the middle leg(s) repeated to the turn budget with the seats
@@ -1557,7 +1651,8 @@ def plan_legs(conv, config, inputs=None, road=None):
     with no legs structure falls back to the banter cycle."""
     inputs = inputs if inputs is not None else conv["inputs"]
     road = road or conv["identity"]["road_kind"]
-    st = road_structure(config, road) or {}
+    st, _variant = _structure_roll(conv, config, road)                  # [s3-window]
+    st = st or {}
     legs = [dict(x) for x in st.get("legs") or [] if isinstance(x, dict)]
     if not legs:
         return plan_more(conv, config, inputs=inputs)
