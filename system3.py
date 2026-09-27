@@ -49,7 +49,9 @@ MODES = ("off", "shadow", "active_selected_roads", "active")
 ROADS = ("banter", "caller", "recap", "ad", "news", "manager", "memo", "gallery",
          "mixtape", "open_show", "fan_mail", "guest",
          # single-voice roads planned as one-seat legs (system3_direct_line)
-         "track_talk", "station_id", "upstairs", "interject", "ad_spot")
+         "track_talk", "station_id", "upstairs", "interject", "ad_spot",
+         # [s3-lines] the single lines dj_speak still spoke outside a road
+         "reply", "request", "open", "aside")
 FAMILIES = ("CTS", "ES", "RS", "IRS", "FL", "SPEAKERBOX", "SFX", "TOPIC", "SFXGUY", "LINE", "LENGTH")
 PHASES = ("OPEN", "ESTABLISH", "DEVELOP", "ESCALATE", "EXPLORE", "WILDCARD",
           "RESOLVE", "WRAP", "SEGUE")

@@ -34,59 +34,62 @@ EDITS = [
     #    while System 3 owns the running order.
     ("direct",
      "        _topic_at, _topic_new = 0, {}\n        try:\n            if (banter_dice_on() > 0 and int(lines or 0) >= 8\n",
-     "        async def _s3_direct(call_sheet: str = \"\"):\n"
-     "            # System 3 (docs/system3_blueprint.md) plans the round. ACTIVE:\n"
+     '        async def _s3_direct(call_sheet: str = ""):\n'
+     '            # System 3 (docs/system3_blueprint.md) plans the round. ACTIVE:\n'
      "            # its running order replaces #1386's and its door rolls replace\n"
-     "            # random(). SHADOW: it records what it would have done. None\n"
-     "            # (off, or it failed) is this road exactly as it was.\n"
-     # tools/system3_roads_patch.py: memos (whole=True) are directed too.
-     "            if not globals().get(\"system3_direct_banter\"):   # [s3-roads] memos too\n"
-     "                return None\n"
-     "            try:\n"
-     "                return await globals()[\"system3_direct_banter\"](\n"
-     "                    lines=int(lines or 0), bank=bool(bank), dj=dj,\n"
-     "                    seats=banter_floor_seats(dj, bool(third), caller_name),\n"
-     "                    caller_name=caller_name, caller2_name=caller2_name,\n"
-     "                    caller_seat=caller_seat,\n"
-     "                    seed_text=str((seed or {}).get(\"text\") or \"\"),\n"
-     "                    seed_file=str((seed or {}).get(\"file\") or \"\"),\n"
-     "                    angle=str(angle or \"\"), own_material=bool(own_material),\n"
-     "                    news_titles=str(news_titles or \"\"), weather=_weather,\n"
-     "                    approach=_approach,\n"
-     "                    gazette=bool((_paper_context or {}).get(\"prompt\")),\n"
-     "                    system2_job=_system2_job, system2_budget=_system2_budget,\n"
-     # tools/topic_exchange_patch.py adds dj_banter's `exchange` (the topic
-     # desk's "1. / 2." exchange) and passes it here; apply that one first.
-     "                    call_sheet=call_sheet, exchange=exchange,   # [topic-exchange]\n"
-     # tools/system3_calls_patch.py hands System 3 the call's own facts.
-     "                    call_meta=(call_meta if isinstance(call_meta, dict) else {}),   # [s3-calls]\n"
-     # tools/system3_roads_patch.py: the road names itself; a memo is a round.
-     "                    road=str(road or \"\"), whole=bool(whole),   # [s3-roads]\n"
-     # tools/system3_glass_patch.py: the length roll rides the same call
-     "                    lines_rolled=bool(_lines_rolled), lines_base=int(_lines_base),   # [s3-glass]\n"
-     "                    lines_min=int(dj.get(\"banter_min_lines\") or 4),\n"
-     "                    lines_max=int(dj.get(\"banter_max_lines\") or 22))\n"
-     "            except Exception as _s3_exc:  # noqa: BLE001\n"
-     "                pipeline_log(\"system3\", \"the director was skipped - the legacy running order stands\",\n"
-     "                             extra=(\"%s: %s\" % (type(_s3_exc).__name__, _s3_exc))[:200])\n"
-     "                return None\n"
-     "        if not caller_name:\n"
-     "            _s3 = await _s3_direct()\n"
-     "        _s3_owns = bool(_s3 is not None and _s3.active and _s3.sheet)\n"
-     # tools/system3_glass_patch.py: a free round's length is System 3's roll
-     "        if _s3_owns and int(getattr(_s3, \"turns\", 0) or 0) > 0:\n"
+     '            # random(). SHADOW: it records what it would have done. None\n'
+     '            # (off, or it failed) is this road exactly as it was.\n'
+     '            if not globals().get("system3_direct_banter"):   # [s3-roads] memos too\n'
+     '                return None\n'
+     '            try:\n'
+     '                return await globals()["system3_direct_banter"](\n'
+     '                    lines=int(lines or 0), bank=bool(bank), dj=dj,\n'
+     '                    seats=banter_floor_seats(dj, bool(third), caller_name),\n'
+     '                    caller_name=caller_name, caller2_name=caller2_name,\n'
+     '                    caller_seat=caller_seat,\n'
+     '                    seed_text=str((seed or {}).get("text") or ""),\n'
+     '                    seed_file=str((seed or {}).get("file") or ""),\n'
+     '                    angle=str(angle or ""), own_material=bool(own_material),\n'
+     '                    news_titles=str(news_titles or ""), weather=_weather,\n'
+     '                    approach=_approach,\n'
+     '                    gazette=bool((_paper_context or {}).get("prompt")),\n'
+     '                    system2_job=_system2_job, system2_budget=_system2_budget,\n'
+     '                    call_sheet=call_sheet, exchange=exchange,   # [topic-exchange]\n'
+     '                    call_meta=(call_meta if isinstance(call_meta, dict) else {}),   # [s3-calls]\n'
+     '                    road=str(road or ""), whole=bool(whole),   # [s3-roads]\n'
+     '                    lines_rolled=bool(_lines_rolled), lines_base=int(_lines_base),   # [s3-glass]\n'
+     '                    lines_min=int(dj.get("banter_min_lines") or 4),\n'
+     '                    lines_max=int(dj.get("banter_max_lines") or 22))\n'
+     '            except Exception as _s3_exc:  # noqa: BLE001\n'
+     '                pipeline_log("system3", "the director was skipped - the legacy running order stands",\n'
+     '                             extra=("%s: %s" % (type(_s3_exc).__name__, _s3_exc))[:200])\n'
+     '                return None\n'
+     '        if not caller_name:\n'
+     '            _s3 = await _s3_direct()\n'
+     '        _s3_owns = bool(_s3 is not None and _s3.active and _s3.sheet)\n'
+     '        if _s3_active() and not caller_name and not _s3_owns:\n'
+     '            pipeline_log("system3", "round withheld because its running order was not directed",\n'
+     '                         extra=str(road or "banter"))\n'
+     '            return []\n'
+     '        if _s3_owns and int(getattr(_s3, "turns", 0) or 0) > 0:\n'
      "            # [s3-glass] a free round's length is System 3's roll\n"
-     "            lines = int(_s3.turns)\n"
-     "            _judge_lines = min(int(_judge_lines), lines)\n"
-     "        _topic_at, _topic_new = 0, {}\n        try:\n"
-     "            if (not _s3_owns and banter_dice_on() > 0 and int(lines or 0) >= 8\n"),
+     '            lines = int(_s3.turns)\n'
+     '            _judge_lines = min(int(_judge_lines), lines)\n'
+     '        _topic_at, _topic_new = 0, {}\n'
+     '        try:\n'
+     '            if (not _s3_owns and banter_dice_on() > 0 and int(lines or 0) >= 8\n'),
     # 4. The call keeps its protocol; System 3 adds the delivery per turn.
     ("call",
      "                _dice_rolls = []\n                raise _CallSheetDone\n",
-     "                _s3 = await _s3_direct(call_sheet=_beat_sheet)\n"
-     "                if _s3 is not None and _s3.active and _s3.sheet:\n"
-     "                    _beat_sheet = _s3.sheet\n"
-     "                _dice_rolls = []\n                raise _CallSheetDone\n"),
+     '                _s3 = await _s3_direct(call_sheet=_beat_sheet)\n'
+     '                if _s3 is not None and _s3.active and _s3.sheet:\n'
+     '                    _beat_sheet = _s3.sheet\n'
+     '                    _s3_owns = True\n'
+     '                elif _s3_active():\n'
+     '                    pipeline_log("system3", "call withheld because its running order was not directed")\n'
+     '                    return []\n'
+     '                _dice_rolls = []\n'
+     '                raise _CallSheetDone\n'),
     # 5. System 3's running order, when it owns the round.
     ("sheet",
      "            _beat_sheet, _dice_rolls = banter_beat_sheet(\n                int(lines or 0),\n",

@@ -625,6 +625,24 @@ ROAD_REGISTER = [
      "hook": "system3_direct_line (LINE draw over the list)",
      "what": "a fixed line off a list: the memo announcement, a complaint about a clip - the list is the "
              "Rolodex, the pick is a recorded draw"},
+    # [s3-lines] the single lines dj_speak still spoke outside any road: under the
+    # strict gate they were withheld; now each is a road with a node
+    {"id": "reply", "label": "Reply", "shape": "line",
+     "writer": "dj_speak(reply): an answer to a listener's or the operator's message",
+     "hook": "system3_direct_line (one leg, ES rolled)",
+     "what": "one voice answers the message in front of it, in the feeling rolled"},
+    {"id": "request", "label": "Request line", "shape": "line",
+     "writer": "dj_speak(request): the request line acknowledged",
+     "hook": "system3_direct_line (one leg, ES rolled)",
+     "what": "one voice takes the request and says what happens to it"},
+    {"id": "open", "label": "Show open", "shape": "line",
+     "writer": "dj_speak(open): the show opened",
+     "hook": "system3_direct_line (one leg, ES rolled)",
+     "what": "one voice opens the show: the name, the hour, what is coming"},
+    {"id": "aside", "label": "Aside", "shape": "line",
+     "writer": "dj_speak(aside): a remark between things",
+     "hook": "system3_direct_line (one leg, ES rolled)",
+     "what": "one voice, one remark between two things, in the feeling rolled"},
     {"id": "ad_spot", "label": "Produced advert", "shape": "line",
      "writer": "dj_ad_break: ad_pick", "hook": "system3_direct_line (LINE draw over the book)",
      "what": "a stored or produced spot: the ad book's rows are the Rolodex, the pick is a recorded draw"},
@@ -794,8 +812,21 @@ DEFAULT_ROAD_STRUCTURES = {
     "ad_spot": _line_structure("ad_spot", "Produced advert", [
         _leg("spot", "The produced spot", "close", "A",
              "the spot drawn off the ad book plays as recorded.", "ES")], "PRODUCED SPOT"),
+    # [s3-lines] the four single lines dj_speak still spoke outside any road
+    "reply": _line_structure("reply", "Reply", [
+        _leg("answer", "The answer", "close", "A",
+             "answers the message in front of them: what was asked, and the answer, plainly.", "ES")], "REPLY"),
+    "request": _line_structure("request", "Request line", [
+        _leg("take", "The request taken", "close", "A",
+             "takes the request off the line: names it, and says what happens to it.", "ES")], "REQUEST LINE"),
+    "open": _line_structure("open", "Show open", [
+        _leg("open", "The show opened", "close", "A",
+             "opens the show: the station's name, the hour, and what is coming.", "ES")], "SHOW OPEN"),
+    "aside": _line_structure("aside", "Aside", [
+        _leg("remark", "The remark", "close", "A",
+             "one remark between two things - short, in the feeling rolled.", "ES")], "ASIDE"),
 }
-LINE_ROADS = ("track_talk", "station_id", "upstairs", "interject", "ad_spot")
+LINE_ROADS = ("track_talk", "station_id", "upstairs", "interject", "ad_spot", "reply", "request", "open", "aside")
 PLACES = ("open", "middle", "close")
 
 

@@ -558,3 +558,20 @@
 @media (max-width: 860px) { .s3-seg { grid-template-columns: 1fr; } .s3-audit-row > summary { grid-template-columns: 80px 70px minmax(0, 1fr); } .s3-audit-row > summary > :nth-child(4) { display: none; } }
 /* [s3-hold] new entries wait behind this while the operator is reading */
 .s3-newpill { position: sticky; top: 4px; z-index: 3; justify-self: start; border-color: var(--accent); color: var(--accent); background: var(--panel); margin-bottom: 6px; }
+
+/* [#1316] fit on screen: nothing in the window may push it past the glass ---- */
+.s3-backdrop { place-items: start center; overflow: auto; }
+.s3-backdrop > .s3 { min-width: 0; max-width: 100%; box-sizing: border-box; overflow-x: hidden; overflow-y: auto; }
+.s3, .s3 * { box-sizing: border-box; }
+.s3-feed, .s3-tile, .s3-tile-grid, .s3-tile-box, .s3-audit, .s3-audit-row, .s3-seg, .s3-seg-main, .s3-seg-node, .s3-card, .s3-main, .s3-list, .s3-director { min-width: 0; max-width: 100%; }
+.s3-tile { overflow: hidden; }
+.s3-tile > summary { min-width: 0; overflow: hidden; }
+.s3-tile > summary > * { min-width: 0; }
+.s3-tile-grid { grid-template-columns: repeat(auto-fit, minmax(min(260px, 100%), 1fr)); }
+.s3-tile-box pre { overflow: auto; max-width: 100%; }
+.s3-audit-row > summary > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.s3-audit-body { overflow-wrap: anywhere; }
+.s3-metrics { flex-wrap: wrap; }
+.s3-seg-bar > * { max-width: 100%; }
+.s3-sys3 { max-width: 100%; }
+.s3 pre { max-width: 100%; overflow: auto; }

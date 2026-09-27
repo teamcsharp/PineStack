@@ -33758,7 +33758,15 @@ async def _dj_speak_floorless(kind: str, track: dict[str, Any] | None = None,
                     "station_id" if kind == "station_id" else
                     "interject" if kind == "interject" else
                     "track_talk" if kind in ("intro", "outro") else
-                    "single_line")
+                    # [s3-lines] a produced spot without its own stamp is the ad book's
+                    # node; the request line, the show open and an aside are roads of
+                    # their own; anything else is a stock interjection's node. A road
+                    # System 3 does not know would be WITHHELD below, so none is unknown.
+                    "ad_spot" if kind == "ad" else
+                    "request" if kind == "request" else
+                    "open" if kind == "open" else
+                    "aside" if kind == "aside" else
+                    "interject")
         try:
             _s3_spoken_handle = await system3_direct_line(
                 road=_s3_road, who=who, dj=dj_settings(),
@@ -171586,6 +171594,11 @@ def screenplay_when_heard(row: Any) -> float:          # [#1218]
         return 0.0
 
 
+# [#1315] the slot a heard row was first drawn at, by line id, until the ledger
+# files it (process memory: a restart re-draws, which the ledger absorbs)
+_HANGER_SLOT: dict[str, float] = {}
+
+
 def screenplay_compose(since: float, until: float, d: dict[str, Any],
                        notes: list[dict[str, Any]]) -> dict[str, Any]:
     """The hour as a script. Pure - every fact comes off `d`.
@@ -172102,9 +172115,20 @@ def screenplay_compose(since: float, until: float, d: dict[str, Any],
         # the round aired, jumped back up to them (#1301, 18402 px). The
         # trailed stamp keeps banked work under the live line until it
         # is heard - and once heard, the ear's stamp is that same tail.
-        _raw_of[_ix] = ((screenplay_when_heard(_row) if screenplay_was_heard(_row)
-                         else float(_e.get("at") or 0))
-                        or float(_e.get("at") or 0))
+        _raw = ((screenplay_when_heard(_row) if screenplay_was_heard(_row)
+                 else float(_e.get("at") or 0))
+                or float(_e.get("at") or 0))
+        # [#1315] A ROW THE EAR HAS PLACED KEEPS THAT SLOT until the ledger
+        # files it. Before the ear speaks, the estimate may still move the row
+        # (that is the region at or below the live line); a re-ack afterwards
+        # used to reindex every row above the reader. (block, ord) overrules.
+        _lid = str(_row.get("id") or "")
+        if _lid and line_heard_at(_row) > 0:            # the EAR has spoken
+            _raw = _HANGER_SLOT.setdefault(_lid, _raw)
+            if len(_HANGER_SLOT) > 6000:
+                for _k in list(_HANGER_SLOT)[:2000]:
+                    _HANGER_SLOT.pop(_k, None)
+        _raw_of[_ix] = _raw
         _got = _ord_of(_ord, _row) if _ord else None          # 2026-09-14
         if _got and len(_got) > 2 and (_got[2] or _blocksize.get(int(_got[0]), 0) >= 2):
             # [#1218] A1's P1.1: THREE TIERS, AND ONLY THE FIRST IS THE SHOW.
@@ -172128,6 +172152,13 @@ def screenplay_compose(since: float, until: float, d: dict[str, Any],
             _b0 = int(_got[0])
             _tier = (0 if _b0 in _heard_blocks else
                      2 if _b0 in _withdrawn_blocks else 1)
+            # [#1314] A ROW REFUSED AT HAND-OVER LEAVES THE SPINE. It sat at its
+            # ord inside a heard block and the mark stepped over it - two
+            # withdrawn rows were the 1317 px jump. It will never be heard,
+            # so it sits under everything, where a round that never happened
+            # belongs. The block still counts as heard for the rows around it.
+            if str(_row.get("aired") or "") == "withdrawn":
+                _tier = 2
             _spine.append((_tier, _b0, int(_got[1]), _ix))
     _spine.sort()
 

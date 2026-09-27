@@ -58,6 +58,27 @@ class WiringTests(unittest.TestCase):
         self.assertEqual(applied, len(mod.plan(text)))
         self.assertIn('globals().get("system3_turn_id_for")', text)
 
+    def test_every_single_line_has_a_road(self):
+        # [s3-lines] the strict gate withholds a line whose road System 3 does not know
+        spec = importlib.util.spec_from_file_location("system3_lines_patch", ROOT / "tools" / "system3_lines_patch.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        text = (ROOT / "app.py").read_bytes().decode("utf-8").replace("\r\n", "\n")
+        applied, missing = mod.check(text)
+        self.assertEqual(missing, [])
+        self.assertEqual(applied, len(mod.plan(text)))
+        self.assertNotIn('"single_line")', text)
+
+    def test_the_script_pin_edits_are_in_app_py(self):
+        # [#1314][#1315] a withdrawn row leaves the spine; a heard row keeps its first slot
+        spec = importlib.util.spec_from_file_location("script_pin_patch", ROOT / "tools" / "script_pin_patch.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        text = (ROOT / "app.py").read_bytes().decode("utf-8").replace("\r\n", "\n")
+        applied, missing = mod.check(text)
+        self.assertEqual(missing, [])
+        self.assertEqual(applied, len(mod.plan(text)))
+
     def test_hooks_are_guarded(self):
         text = (ROOT / "app.py").read_bytes().decode("utf-8")
         for name in ("system3_door_roll", "system3_bind_entry", "system3_perf_state",

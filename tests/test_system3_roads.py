@@ -114,6 +114,24 @@ class LegsTests(unittest.TestCase):
         self.assertIn("THE LEAD, sung.", system3.render_legs_sheet(conv))
 
 
+class SingleLineRoadTests(unittest.TestCase):
+    """[s3-lines] reply, request, open and aside are roads: one seat, one leg."""
+
+    def test_the_four_single_lines_are_roads(self):
+        config = system3.default_config()
+        for road in ("reply", "request", "open", "aside"):
+            self.assertIn(road, system3.ROADS)
+            self.assertIn(road, system3_tables.LINE_ROADS)
+            self.assertIn(road, [r["id"] for r in system3_tables.ROAD_REGISTER])
+            st = config["structures"][road]
+            self.assertEqual(st["kind"], "line")
+            self.assertEqual(len(st["legs"]), 1)
+            conv = system3.new_conversation(inputs(road, turns=1), config, settings(), conversation_id="line-" + road)
+            system3.plan_line(conv, config)
+            self.assertEqual(len(conv["turns"]), 1)
+            self.assertTrue([e for e in conv["decision_events"] if e["family"] == "ES"])
+
+
 class WindowTests(unittest.TestCase):
     """[s3-window] the segment editor's powers: variants, pins, the budget roll."""
 

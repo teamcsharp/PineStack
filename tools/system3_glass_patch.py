@@ -32,9 +32,10 @@ EDITS = [
     ("length-roll",
      '    if lines <= 0:\n'
      '        lines = random.randint(dj["banter_min_lines"], dj["banter_max_lines"])\n',
-     '    _lines_rolled, _lines_base = False, 0     # [s3-glass] the dial\'s random stood here\n'
+     "    _lines_rolled, _lines_base = False, 0     # [s3-glass] the dial's random stood here\n"
      '    if lines <= 0:\n'
-     '        lines = random.randint(dj["banter_min_lines"], dj["banter_max_lines"])\n'
+     '        lines = (int(dj["banter_min_lines"]) if _s3_active()\n'
+     '                 else random.randint(dj["banter_min_lines"], dj["banter_max_lines"]))\n'
      '        _lines_rolled, _lines_base = True, int(lines)\n', 1),
     ("length-slot",
      '            if _budget.get("lines"):\n'
@@ -53,8 +54,12 @@ EDITS = [
     ("length-owns",
      '        _s3_owns = bool(_s3 is not None and _s3.active and _s3.sheet)\n',
      '        _s3_owns = bool(_s3 is not None and _s3.active and _s3.sheet)\n'
+     '        if _s3_active() and not caller_name and not _s3_owns:\n'
+     '            pipeline_log("system3", "round withheld because its running order was not directed",\n'
+     '                         extra=str(road or "banter"))\n'
+     '            return []\n'
      '        if _s3_owns and int(getattr(_s3, "turns", 0) or 0) > 0:\n'
-     '            # [s3-glass] a free round\'s length is System 3\'s roll\n'
+     "            # [s3-glass] a free round's length is System 3's roll\n"
      '            lines = int(_s3.turns)\n'
      '            _judge_lines = min(int(_judge_lines), lines)\n', 1),
     ("link-bind",

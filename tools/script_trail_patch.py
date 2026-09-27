@@ -39,17 +39,28 @@ EDITS = {
         ("unheard-hangs-where-it-trailed",
          '        _raw_of[_ix] = (screenplay_when_heard(_row)\n'
          '                        or float(_e.get("at") or 0))\n',
-         '        # [#1308c] AN UNHEARD ROW HANGS WHERE #1308 TRAILED IT. For a row\n'
-         '        # nobody has heard, screenplay_when_heard() is its air_at\n'
-         '        # ESTIMATE, and a banked round whose planned slot had passed was\n'
-         '        # bisected into the middle of the heard spine by it: the mark\n'
-         '        # stepped over eight lines nobody said (#1306, 2138 px) and, when\n'
-         '        # the round aired, jumped back up to them (#1301, 18402 px). The\n'
-         '        # trailed stamp keeps banked work under the live line until it\n'
-         '        # is heard - and once heard, the ear\'s stamp is that same tail.\n'
-         '        _raw_of[_ix] = ((screenplay_when_heard(_row) if screenplay_was_heard(_row)\n'
-         '                         else float(_e.get("at") or 0))\n'
-         '                        or float(_e.get("at") or 0))\n', 1),
+     '        # [#1308c] AN UNHEARD ROW HANGS WHERE #1308 TRAILED IT. For a row\n'
+     '        # nobody has heard, screenplay_when_heard() is its air_at\n'
+     '        # ESTIMATE, and a banked round whose planned slot had passed was\n'
+     '        # bisected into the middle of the heard spine by it: the mark\n'
+     '        # stepped over eight lines nobody said (#1306, 2138 px) and, when\n'
+     '        # the round aired, jumped back up to them (#1301, 18402 px). The\n'
+     '        # trailed stamp keeps banked work under the live line until it\n'
+     "        # is heard - and once heard, the ear's stamp is that same tail.\n"
+     '        _raw = ((screenplay_when_heard(_row) if screenplay_was_heard(_row)\n'
+     '                 else float(_e.get("at") or 0))\n'
+     '                or float(_e.get("at") or 0))\n'
+     '        # [#1315] A ROW THE EAR HAS PLACED KEEPS THAT SLOT until the ledger\n'
+     '        # files it. Before the ear speaks, the estimate may still move the row\n'
+     '        # (that is the region at or below the live line); a re-ack afterwards\n'
+     '        # used to reindex every row above the reader. (block, ord) overrules.\n'
+     '        _lid = str(_row.get("id") or "")\n'
+     '        if _lid and line_heard_at(_row) > 0:            # the EAR has spoken\n'
+     '            _raw = _HANGER_SLOT.setdefault(_lid, _raw)\n'
+     '            if len(_HANGER_SLOT) > 6000:\n'
+     '                for _k in list(_HANGER_SLOT)[:2000]:\n'
+     '                    _HANGER_SLOT.pop(_k, None)\n'
+     '        _raw_of[_ix] = _raw\n', 1),
     ],
     "script_diagnostics.py": [
         ("a-tap-is-not-a-fault",

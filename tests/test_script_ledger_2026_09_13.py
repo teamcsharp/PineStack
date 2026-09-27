@@ -267,6 +267,40 @@ class ScreenplayTakesTheLedgersWord(unittest.TestCase):
         self.assertEqual(self.ids(self.compose(rows, order)),
                          ["a0", "a1", "a2", "b0"])
 
+    def test_a_withdrawn_row_inside_a_heard_block_sits_under_everything(self):
+        """[#1314] two withdrawn rows stood inside a heard block at their ord;
+        the mark stepped over them (1317 px). A refused row leaves the spine."""
+        app._HANGER_SLOT.clear()
+        rows = [{**air("a0", 10.0, "one"), "aired": "stream"},
+                {**air("a1", 11.0, "refused"), "aired": "withdrawn", "turn": 1},
+                {**air("a2", 12.0, "two"), "aired": "stream", "turn": 2},
+                {**air("b0", 20.0, "three"), "aired": "stream", "sid": "s2"}]
+        order = {"a0": (1, 0, True), "a1": (1, 1, True), "a2": (1, 2, True), "b0": (2, 0, True)}
+        self.assertEqual(self.ids(self.compose(rows, order)), ["a0", "a2", "b0", "a1"])
+
+    def test_a_heard_row_keeps_its_first_slot_when_the_ear_stamp_arrives(self):
+        """[#1315] a published row is placed by its estimate until the ear says
+        when it sounded; from then on a re-ack (the stamp rewritten) used to
+        move it, reindexing the rows above the reader. It stays put."""
+        app._HANGER_SLOT.clear()
+        rows = [{**air("a0", 10.0, "one"), "aired": "stream"},
+                {**air("a1", 11.0, "two"), "aired": "stream", "turn": 1},
+                {**air("h0", 15.0, "a hanger", who="board", kind="sfx"), "aired": "page", "sid": ""},
+                {**air("b0", 20.0, "three"), "aired": "stream", "sid": "s2"},
+                {**air("b1", 21.0, "four"), "aired": "stream", "sid": "s2", "turn": 1}]
+        order = {"a0": (1, 0, True), "a1": (1, 1, True), "b0": (2, 0, True), "b1": (2, 1, True)}
+        first = [e.get("line") for e in self.compose(rows, order)["elements"] if e.get("line") in order or e.get("line") == "h0"]
+        self.assertEqual(first, ["a0", "a1", "h0", "b0", "b1"])
+        rows[2]["heard_ack_at"] = 25.0                       # the ear says it sounded after b1
+        heard = [e.get("line") for e in self.compose(rows, order)["elements"] if e.get("line") in order or e.get("line") == "h0"]
+        self.assertEqual(heard, ["a0", "a1", "b0", "b1", "h0"], "the ear places it, once")
+        rows[2]["heard_ack_at"] = 12.0                       # a re-ack rewriting the stamp earlier
+        again = [e.get("line") for e in self.compose(rows, order)["elements"] if e.get("line") in order or e.get("line") == "h0"]
+        self.assertEqual(again, heard, "a row the ear has placed never moves again")
+        app._HANGER_SLOT.clear()
+        fresh = [e.get("line") for e in self.compose(rows, order)["elements"] if e.get("line") in order or e.get("line") == "h0"]
+        self.assertEqual(fresh, ["a0", "a1", "h0", "b0", "b1"], "a fresh process draws it where the latest stamp puts it")
+
     def test_heard_scripted_sting_anchors_later_single_line_blocks(self):
         """#1277: the last sting in a round must precede what aired after it.
 
