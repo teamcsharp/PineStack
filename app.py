@@ -1164,9 +1164,15 @@ VIBEVOICE_URL = os.getenv("VIBEVOICE_URL", "http://127.0.0.1:8778").rstrip("/")
 # engines route library vl_* voices (they take a reference); `preset`
 # engines carry their own built-in voices (fast, no reference — the ideal
 # stand-ins). `standin` marks the ones fast enough to cover a slow take.
+# `ref_s` (#1476) is how many seconds of reference a clone engine actually
+# listens to: the studio's "capturing for" pick sends it to the voice lab,
+# which cuts the reference to it. A clone engine without one gets the lab's
+# own length (REF_TARGET, 30 s - the XTTS number).
 ENGINE_REGISTRY: dict[str, dict[str, Any]] = {
     "xtts":      {"url": XTTS_URL, "family": "clone", "label": "XTTS v2",
-                  "speed": 34, "standin": False, "default_voice": ""},
+                  "speed": 34, "standin": False, "default_voice": "",
+                  # gpt_cond_len and max_ref_length are both 30 s.
+                  "ref_s": 30.0},
     # #1080: PIPER, which has been the live last-resort stand-in all
     # along and was reachable only through a hardcoded fallback -
     # role_engine_for and the stand-in picker both test membership
@@ -1178,13 +1184,18 @@ ENGINE_REGISTRY: dict[str, dict[str, Any]] = {
                   "speed": 1, "standin": True,
                   "default_voice": "en_US-bryce-medium"},
     "f5":        {"url": F5_URL, "family": "clone", "label": "F5-TTS",
-                  "speed": 13, "standin": False, "default_voice": ""},
+                  "speed": 13, "standin": False, "default_voice": "",
+                  # F5 hard-clips its reference at 12 s; the lab's trim can
+                  # overshoot by one 1.2 s utterance, so ask for 10.5.
+                  "ref_s": 10.5},
     "cosyvoice": {"url": COSYVOICE_URL, "family": "clone",
                   "label": "FunCosyVoice 3 0.5B", "speed": 8,
                   "standin": True, "default_voice": ""},
     "indextts":  {"url": INDEXTTS_URL, "family": "clone",
                   "label": "IndexTTS 2.5", "speed": 12,
-                  "standin": False, "default_voice": ""},
+                  "standin": False, "default_voice": "",
+                  # IndexTTS truncates its reference at 15 s.
+                  "ref_s": 13.5},
     "voxcpm":    {"url": VOXCPM_URL, "family": "clone", "label": "VoxCPM2",
                   "speed": 9, "standin": True, "default_voice": ""},
     "kokoro":    {"url": KOKORO_URL, "family": "openai", "label": "Kokoro",
@@ -7574,6 +7585,11 @@ async def one_engine_keeper() -> None:
     while True:
         await asyncio.sleep(180)
         try:
+            # #1476: the host's watchdog loads whatever data/voice_engine/
+            # mode names. Whatever road moved the cast (the Host's menu,
+            # the A/B popup, a settings PUT, the host voice's own meta),
+            # the file names the engine the cast is on.
+            voice_engine_mode_write(host_clone_engine())
             if not cast_engine_locked():
                 continue
             want = host_clone_engine()
@@ -12605,19 +12621,23 @@ async def box_triage(fix: bool = True) -> dict[str, Any]:
                     break
             except Exception:  # noqa: BLE001
                 continue
+    # #1476: one engine at a time - the one the Host's menu names. The
+    # other one being down is the design, not a fault; redeploying it only
+    # handed the host's watchdog something to close again.
+    _want = host_clone_engine()
+    _want_ok = _xtts_ok if _want == "xtts" else _f5_ok
     note("the voice engines",
-         f"xtts {'up' if _xtts_ok else 'DOWN'} · f5 "
-         f"{'up' if _f5_ok else 'DOWN'}"
+         f"xtts {'up' if _xtts_ok else ('DOWN' if _want == 'xtts' else 'closed')}"
+         f" · f5 {'up' if _f5_ok else ('DOWN' if _want == 'f5' else 'closed')}"
+         f" · the cast is on {_want}"
          + ("" if (_xtts_ok or _f5_ok) else
             (" — NOTHING can render but Piper" if _piper_ok else
              " — and PIPER IS DOWN TOO: nothing on this box can make "
              "audio at all")),
-         "" if (_xtts_ok and _f5_ok) else
-         ("redeploying the dead engine(s)" if fix else ""))
-    if fix and not (_xtts_ok and _f5_ok):
-        for _eng, _ok in (("xtts", _xtts_ok), ("f5", _f5_ok)):
-            if not _ok:
-                await _director_post(f"/director/engine/{_eng}/deploy")
+         "" if _want_ok else
+         (f"redeploying {_want}" if fix else ""))
+    if fix and not _want_ok:
+        await _director_post(f"/director/engine/{_want}/deploy")
 
     verdict = ("the station is ON AIR — " + (
         "everything is healthy" if wire == "alive" and ha_ok
@@ -12781,6 +12801,7 @@ async def pinebox_gpu_consolidate(
     settings = load_settings()
     settings.setdefault("dj", {})["clone_engine"] = engine
     save_settings(validate_settings(settings))
+    voice_engine_mode_write(engine)             # #1476: the host agrees
     freed = ""
     if bool(payload.get("unload_other", True)):
         other = "f5" if engine == "xtts" else "xtts"
@@ -12901,6 +12922,139 @@ async def pinebox_engine_api(
             ok = await _director_post("/director/engine/f5/deploy")
         pipeline_log("gpu", f"operator: {engine} deploy requested (#836)")
     return {"ok": bool(ok), "engine": engine, "act": act}
+
+
+# #1476: the Host's engine menu. ONE move puts the whole cast on an engine
+# and makes the box match: the station's router (dj.clone_engine), the
+# host's watchdog switch (data/voice_engine/mode, read every 30 s by
+# pinebox-engines.timer), and the processes themselves - the other engine
+# closes to give its memory back, then the chosen one loads. Those two
+# switches used to be set by different roads, so choosing F5 through the
+# consolidate button had the watchdog close F5 and bring XTTS back.
+VOICE_ENGINE_MODE = data_path("voice_engine", "mode")
+_ENGINE_PIN = re.compile(r"^(xtts|f5):(vl_[0-9a-f]+)\Z")
+_ENGINE_SWITCH: dict[str, Any] = {"to": "", "from": "", "at": 0.0}
+
+
+def voice_engine_mode_read() -> str:
+    try:
+        words = VOICE_ENGINE_MODE.read_text().split()
+        return words[0].lower() if words else ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def voice_engine_mode_write(engine: str) -> bool:
+    """Name `engine` in the host's switch file. True when it changed.
+    Written in place (a five-byte file) so it keeps its owner."""
+    if engine not in ("xtts", "f5") or voice_engine_mode_read() == engine:
+        return False
+    try:
+        VOICE_ENGINE_MODE.parent.mkdir(parents=True, exist_ok=True)
+        VOICE_ENGINE_MODE.write_text(engine + "\n")
+    except Exception as exc:  # noqa: BLE001
+        pipeline_log("gpu", f"could not write the host's engine switch: "
+                     f"{exc} (#1476)"[:200])
+        return False
+    pipeline_log("gpu", f"the host's engine switch now names {engine} - its "
+                 "watchdog keeps that one loaded and the other closed "
+                 "(#1476)")
+    return True
+
+
+async def _voice_engine_swap(engine: str, other: str) -> None:
+    """Close first, then load: the engine coming up needs the room the
+    other one holds (XTTS alone is ~23G and wants headroom to load)."""
+    try:
+        closed = await _director_post(f"/director/engine/{other}/terminate")
+        await asyncio.sleep(2)
+        if not (await engine_health(engine, force=True)).get("ready"):
+            if engine == "xtts":
+                _XTTS_REVIVE_AT[0] = 0.0        # the room-making road
+                _xtts_revive_maybe()
+            else:
+                _F5_REVIVE_AT[0] = 0.0
+                await _director_post("/director/engine/f5/deploy")
+        pipeline_log("gpu", f"{other} " + ("closed" if closed else
+                     "was not closed by the director - the host's watchdog "
+                     "closes it within 30 s") + f"; {engine} is loading "
+                     "(#1476)")
+    except Exception as exc:  # noqa: BLE001
+        pipeline_log("gpu", f"engine swap to {engine} stumbled: {exc} "
+                     "(#1476)"[:200])
+
+
+async def voice_engine_switch(engine: str) -> dict[str, Any]:
+    """Put the whole cast on `engine` (xtts|f5) and make the box match."""
+    other = "f5" if engine == "xtts" else "xtts"
+    was = host_clone_engine()
+    settings = load_settings()
+    dj = settings.setdefault("dj", {})
+    dj["clone_engine"] = engine
+    # A seat pinned as `xtts:vl_…` ignores the station-wide engine (the
+    # prefix outranks it in voice_render_any), so it would stay behind on
+    # the engine being closed. The voice is the same library clone either
+    # way; unpinned, it follows the switch.
+    unpinned: list[str] = []
+    for key, value in list(dj.items()):
+        if key.endswith("voice") and isinstance(value, str):
+            m = _ENGINE_PIN.match(value)
+            if m:
+                dj[key] = m.group(2)
+                unpinned.append(key)
+    pins = dj.get("role_engine")
+    if isinstance(pins, dict):
+        for role in [r for r, e in pins.items() if e in ("xtts", "f5")]:
+            pins.pop(role, None)
+            unpinned.append(f"role_engine.{role}")
+    save_settings(validate_settings(settings))
+    voice_engine_mode_write(engine)
+    _ENGINE_SWITCH.update({"to": engine, "from": was, "at": time.time()})
+    fire_and_forget(_voice_engine_swap(engine, other))
+    label = str(ENGINE_REGISTRY[engine]["label"])
+    pipeline_log("gpu", f"the Host's engine menu: the cast moves {was} -> "
+                 f"{engine}; {other} closes and {engine} loads"
+                 + (f"; unpinned {', '.join(unpinned)}" if unpinned else "")
+                 + " (#1476)")
+    note_action(f"voice engine -> {label}")
+    return {"engine": engine, "was": was, "closing": other,
+            "unpinned": unpinned}
+
+
+@app.get("/api/voice/engine-switch")
+async def voice_engine_switch_state(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1476: which engine the cast is on, and whether each is loaded."""
+    require_read_auth(authorization)
+    want = host_clone_engine()
+    xt, f5 = await asyncio.gather(xtts_health(force=True),
+                                  f5_health(force=True))
+    engines = {
+        "xtts": {"label": str(ENGINE_REGISTRY["xtts"]["label"]),
+                 "ready": bool(xt.get("ready")),
+                 "detail": str(xt.get("detail") or "")[:160]},
+        "f5": {"label": str(ENGINE_REGISTRY["f5"]["label"]),
+               "ready": bool(f5.get("ready")),
+               "detail": str(f5.get("detail") or "")[:160]},
+    }
+    return {"engine": want, "ready": engines[want]["ready"],
+            "engines": engines, "host_switch": voice_engine_mode_read(),
+            "switch": dict(_ENGINE_SWITCH), "now": time.time()}
+
+
+@app.post("/api/voice/engine-switch")
+async def voice_engine_switch_api(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1476: {"engine": "xtts"|"f5"} - the Host's engine menu."""
+    require_auth(authorization)
+    payload = await request.json()
+    engine = str(payload.get("engine") or "").strip().lower()
+    if engine not in ("xtts", "f5"):
+        raise HTTPException(status_code=400, detail="engine xtts|f5")
+    return await voice_engine_switch(engine)
 
 
 @app.post("/api/pinebox/act")
@@ -113345,6 +113499,21 @@ async def voice_engine_list(
     xtts = await xtts_health()
     voxtral = await voxtral_health()
     library = read_voices()
+    # #1476: what the studio can capture FOR - every cloning engine on the
+    # bench, running or not (a capture is audio; the engine only matters
+    # when it speaks), each with the reference length the lab will cut.
+    _clone_ids = [n for n, s in ENGINE_REGISTRY.items()
+                  if s.get("family") == "clone"]
+    try:
+        _clone_up = await asyncio.wait_for(asyncio.gather(
+            *(engine_health(n) for n in _clone_ids)), 6)
+    except Exception:  # noqa: BLE001
+        _clone_up = [{} for _ in _clone_ids]
+    capture_engines = [
+        {"id": n, "label": str(ENGINE_REGISTRY[n].get("label") or n),
+         "ref_s": ENGINE_REGISTRY[n].get("ref_s"),
+         "ready": bool((h or {}).get("ready"))}
+        for n, h in zip(_clone_ids, _clone_up)]
 
     return {
         "active": voice_engine(),
@@ -113435,6 +113604,7 @@ async def voice_engine_list(
             },
         ],
         "library": library,
+        "capture_engines": capture_engines,                     # #1476
         "voices": await voice_allowlist(),
         "voice": str((load_settings().get("voice_out") or {}).get("voice") or ""),
         "host": "lilspark · NVIDIA DGX Spark",
@@ -114583,7 +114753,10 @@ async def _voicelab_harvest(job_id: str, status: dict[str, Any]) -> None:
                     "name": str(base.get("name") or entry.get("name")
                                 or status.get("title") or job_id)[:80],
                     "kind": base.get("kind") or "clone",
-                    "engine": base.get("engine") or "xtts",
+                    # #1476: a new voice lands on the engine it was
+                    # captured for; a retarget keeps the one it had.
+                    "engine": (base.get("engine") or entry.get("engine")
+                               or "xtts"),
                     "source": base.get("source") or {
                         "type": "url" if status.get("url") else "file",
                         "url": str(status.get("url") or ""),
@@ -114628,7 +114801,8 @@ async def _voicelab_harvest(job_id: str, status: dict[str, Any]) -> None:
                                 "id": "",
                                 "name": f"{base_name} · "
                                         f"{ex.get('speaker') or 'alt'}"[:80],
-                                "kind": "clone", "engine": "xtts",
+                                "kind": "clone",
+                                "engine": entry.get("engine") or "xtts",
                                 "source": {
                                     "type": "url" if status.get("url")
                                     else "file",
@@ -114666,9 +114840,31 @@ async def _voicelab_harvest(job_id: str, status: dict[str, Any]) -> None:
                           "harvest_error": f"{exc}"[:200]})
 
 
+def capture_engine(raw: Any) -> str:
+    """#1476: the engine a capture is cut FOR - any clone engine on the
+    bench. XTTS when the ask names none, or names one that cannot clone."""
+    name = str(raw or "").strip().lower()
+    spec = ENGINE_REGISTRY.get(name) or {}
+    return name if spec.get("family") == "clone" else "xtts"
+
+
+def capture_params(engine: str) -> dict[str, Any]:
+    """#1476: what the voice lab needs to cut a reference for `engine` -
+    its name, and the seconds of reference it listens to when the registry
+    knows them."""
+    out: dict[str, Any] = {"engine": engine}
+    ref_s = (ENGINE_REGISTRY.get(engine) or {}).get("ref_s")
+    if ref_s:
+        out["ref_s"] = ref_s
+    return out
+
+
 async def _voicelab_start(body: dict[str, Any], name: str = "",
                           caller_id: str = "",
-                          update_voice: str = "") -> str:
+                          update_voice: str = "",
+                          engine: str = "") -> str:
+    if engine:
+        body = {**body, **capture_params(engine)}
     try:
         async with httpx.AsyncClient(timeout=20) as client:
             got = await client.post(f"{VOICE_LAB_URL}/ingest", json=body)
@@ -114691,6 +114887,7 @@ async def _voicelab_start(body: dict[str, Any], name: str = "",
         _VOICE_JOBS[job_id] = {
             "name": name, "caller_id": caller_id,
             "update_voice": update_voice,
+            "engine": engine,                                   # #1476
             "range": "-".join(str(x) for x in
                               (body.get("start"), body.get("end")) if x),
             "started": time.time(),
@@ -114736,7 +114933,8 @@ async def voicelab_ingest(
             detail="Paste the address of a video, a post, or an audio file.")
     job_id = await _voicelab_start(
         body, name=str(payload.get("name") or ""),
-        caller_id=str(payload.get("caller_id") or ""))
+        caller_id=str(payload.get("caller_id") or ""),
+        engine=capture_engine(payload.get("engine")))          # #1476
     return {"job_id": job_id}
 
 
@@ -122481,11 +122679,13 @@ async def voicelab_upload(
     name = str(request.query_params.get("name") or "")
     mode = str(request.query_params.get("mode") or "both")
     filename = str(request.query_params.get("filename") or "upload.bin")
+    engine = capture_engine(request.query_params.get("engine"))  # #1476
     try:
         async with httpx.AsyncClient(timeout=120) as client:
             got = await client.post(
                 f"{VOICE_LAB_URL}/ingest",
-                params={"filename": filename, "mode": mode},
+                params={"filename": filename, "mode": mode,
+                        **capture_params(engine)},
                 content=blob,
                 headers={"Content-Type": "application/octet-stream"},
             )
@@ -122501,7 +122701,8 @@ async def voicelab_upload(
     job_id = str((got.json() or {}).get("job_id") or "")
     with _VOICE_JOBS_LOCK:
         _VOICE_JOBS[job_id] = {"name": name, "caller_id": "",
-                               "range": "", "started": time.time()}
+                               "range": "", "started": time.time(),
+                               "engine": engine}                # #1476
     return {"job_id": job_id}
 
 
@@ -122609,6 +122810,7 @@ async def voicelab_job(
         # The remote job is already deleted; answer from what we kept.
         return {"stage": "done", "progress": 1.0, "harvested": True,
                 "voice_id": entry.get("voice_id") or "",
+                "engine": entry.get("engine") or "",            # #1476
                 "caller_id": entry.get("caller_id") or ""}
     try:
         async with httpx.AsyncClient(timeout=15) as client:
@@ -122638,6 +122840,7 @@ async def voicelab_job(
         "harvest_error": entry.get("harvest_error") or "",
         "voice_id": entry.get("voice_id") or "",
         "caller_id": entry.get("caller_id") or "",
+        "engine": entry.get("engine") or status.get("engine") or "",  # #1476
     }
 
 
@@ -193371,6 +193574,35 @@ details[open] > .pine-summary::before { transform: rotate(90deg); }
   background: var(--panel2); font-weight: 700; font-size: 13px;
 }
 .studio-title .muted { font-weight: 400; }
+/* #1476: "capturing for", beside the close box - never a drag handle. */
+.studio-capture {
+  margin-left: auto; display: flex; align-items: center; gap: 6px;
+  font-size: 11px; font-weight: 400; cursor: default;
+}
+.studio-capture > span { white-space: nowrap; }
+.studio-capture select {
+  font-size: 11px; max-width: 230px; padding: 4px 6px; height: auto;
+}
+/* #1476: the Host label opens the cast's engine menu. */
+.dj-host-engine-tap {
+  cursor: pointer; border-radius: 6px; padding: 1px 4px;
+  white-space: nowrap;
+}
+.dj-host-engine-tap:hover { background: var(--panel2); }
+.dj-host-engine-tag {
+  font-size: 10px; padding: 1px 6px; margin-left: 3px;
+  border: 1px solid var(--border); border-radius: 999px;
+  color: var(--accent);
+}
+.dj-host-engine-tag.warm { color: #ffb454; border-color: #ffb454; }
+.dj-engine-menu {
+  position: fixed; z-index: 200; width: 320px; max-width: calc(100vw - 16px);
+  background: var(--panel); border: 1px solid var(--border);
+  border-radius: 10px; padding: 12px; box-shadow: 0 14px 48px rgba(0,0,0,.7);
+  display: flex; flex-direction: column; gap: 8px; font-size: 12px;
+}
+.dj-engine-menu select { font-size: 13px; }
+.dj-engine-state { font-size: 11px; line-height: 1.55; }
 .studio-main { display: flex; flex: 1; min-height: 0; }
 .studio-nav {
   flex: 0 0 128px; border-right: 1px solid var(--border);
@@ -194623,7 +194855,12 @@ border-radius:4px;background:var(--panel2)"></canvas>
       <div class="row" style="flex-wrap:wrap;margin-bottom:8px">
         <label class="film-size" style="flex:1;min-width:230px"
                title="The voice the host speaks in.">
-          🎙 Host
+          <span id="djHostEngineTap" class="dj-host-engine-tap"
+                role="button" tabindex="0"
+                onclick="djHostEngineMenu(event)"
+                onkeydown="if (event.key === 'Enter' || event.key === ' ') djHostEngineMenu(event)"
+                title="The voice engine the whole cast renders on - click to switch">🎙 Host<span
+                id="djHostEngineTag" class="dj-host-engine-tag">XTTS v2</span></span>
           <select id="djVoice" onchange="djSetVoices()"></select>
           <button aria-label="Hear this voice on the Pine Box" onclick="djTestVoice('djVoice')"
                   title="Hear this voice on the Pine Box">▶</button>
@@ -203061,7 +203298,7 @@ function toggleFavouriteVoice(name) {
  * editor, the voice studio. Four lists building their own headings is how
  * they drift apart, and the request is for a SECTION, not a relabelling. */
 const CLONE_ENGINE_LABEL = {
-  xtts: "🧬 cloned voices · XTTS",
+  xtts: "🧬 cloned voices · XTTS v2",
   f5: "🌊 cloned voices · F5-TTS",
 };
 const CLONE_MARK = {xtts: "🧬 ", f5: "🌊 "};
@@ -203202,6 +203439,10 @@ async function djGpuAdvisor() {
 }
 
 function fillVoiceSelect(select, voices, current, includeBrowser) {
+  // #1476: a clone pinned as xtts:/f5: is the same library voice - the
+  // Host's engine menu decides the engine now, so it selects as itself.
+  const pinned = /^(xtts|f5):(vl_[0-9a-f]+)$/.exec(String(current || ""));
+  if (pinned) current = pinned[2];
   select.textContent = "";
   const fallback = document.createElement("option");
   fallback.value = "";
@@ -203269,7 +203510,11 @@ function fillVoiceSelect(select, voices, current, includeBrowser) {
   // we have access to. Value is always `engine:voice` and routes straight
   // to that engine.
   const libRows = window.pineCloneVoices || [];
-  (window.pineEngineVoices || []).forEach((eng) => {
+  // #1476: ...except XTTS and F5. Their library voices are the groups
+  // above; listing them again here as "XTTS v2" was the second XTTS in
+  // every picker, and its engine-pinned values ignored the Host's menu.
+  (window.pineEngineVoices || []).filter((eng) =>
+    eng.engine !== "xtts" && eng.engine !== "f5").forEach((eng) => {
     const rows = (eng.voices || []).length
       ? eng.voices.map((v) => ({value: eng.engine + ":" + v, name: v,
                                 mark: "🎧 "}))
@@ -226764,6 +227009,7 @@ async function djLoadSettings() {
     const settings = await api("/api/settings");
     const dj = settings.dj || {};
     document.getElementById("djStationName").value = dj.station_name || "";
+    djHostEngineTag();                                          // #1476
     document.getElementById("djPersona").value = dj.persona || "";
     document.getElementById("djIntros").value =
       (dj.intro_phrases || []).join("\n");
@@ -233451,6 +233697,134 @@ async function djRecastToast(left) {
 
 /* The two dropdowns at the top of the panel save on the spot — nobody wants
    to open Customize and press Save to change who is talking (#198). */
+/* #1476: the Host's engine menu. Click "Host" and pick the engine the
+ * whole cast renders on - XTTS v2 by default, F5-TTS on request, back and
+ * forth as often as you like. The station moves every seat onto it, closes
+ * the other engine to give its memory back, then loads this one; the host's
+ * own watchdog switch is kept in step so it never loads the other back. */
+const DJ_ENGINE_CHOICES = [["xtts", "XTTS v2"], ["f5", "F5-TTS"]];
+
+function djEngineName(id) {
+  const row = DJ_ENGINE_CHOICES.find((r) => r[0] === id);
+  return row ? row[1] : String(id || "").toUpperCase();
+}
+
+async function djHostEngineTag(got) {
+  const tag = document.getElementById("djHostEngineTag");
+  if (!tag) return;
+  try {
+    const state = got || await api("/api/voice/engine-switch");
+    tag.textContent = djEngineName(state.engine);
+    tag.classList.toggle("warm", !state.ready);
+    tag.title = state.ready ? "loaded"
+      : "not answering yet - it loads on demand";
+  } catch (e) { /* the tag keeps what it said */ }
+}
+
+function djHostEngineMenu(event) {
+  // The label around it would otherwise hand the click to the voice picker.
+  event.preventDefault();
+  event.stopPropagation();
+  const open = document.getElementById("djHostEngineMenu");
+  if (open) { open.remove(); return; }
+  const anchor = event.currentTarget;
+  const box = el("div", "dj-engine-menu", "");
+  box.id = "djHostEngineMenu";
+  const at = anchor.getBoundingClientRect();
+  box.style.left = Math.max(8, Math.min(at.left, innerWidth - 336)) + "px";
+  box.style.top = Math.min(at.bottom + 6, innerHeight - 220) + "px";
+  box.appendChild(el("b", "", "Voice engine for the whole cast"));
+  const pick = document.createElement("select");
+  DJ_ENGINE_CHOICES.forEach(([id, label]) => {
+    const o = document.createElement("option");
+    o.value = id;
+    o.textContent = label + (id === "xtts" ? " (default)" : "");
+    pick.appendChild(o);
+  });
+  pick.disabled = true;                   // until the state has been read
+  box.appendChild(pick);
+  const state = el("div", "muted dj-engine-state", "reading the engines…");
+  box.appendChild(state);
+  const note = el("div", "muted",
+    "Switching moves every seat onto the engine, closes the other one to "
+    + "give its memory back, then loads this one. For the minute that "
+    + "takes, lines come from the banked audio and, if that runs dry, a "
+    + "stand-in voice.");
+  note.style.cssText = "font-size:10.5px;line-height:1.45";
+  box.appendChild(note);
+  document.body.appendChild(box);
+
+  let switching = false;
+  const paint = (got) => {
+    const eng = got.engines || {};
+    const since = got.switch && got.switch.to === got.engine && got.switch.at
+      ? Math.round((got.now || Date.now() / 1000) - got.switch.at) : null;
+    state.innerHTML = "";
+    DJ_ENGINE_CHOICES.forEach(([id, label]) => {
+      const row = eng[id] || {};
+      let word;
+      if (id === got.engine) {
+        word = row.ready ? "loaded - the cast is on it"
+          : ("loading" + (since !== null && since < 600
+                          ? " · " + since + " s" : "")
+             + " - it answers when the model is up");
+      } else {
+        word = row.ready ? "closing" : "closed";
+      }
+      const line = el("div", "", label + " — " + word);
+      if (id === got.engine) line.style.color = row.ready
+        ? "var(--accent)" : "#ffb454";
+      state.appendChild(line);
+    });
+    if (got.host_switch && got.host_switch !== got.engine) {
+      state.appendChild(el("div", "",
+        "the host's watchdog still names " + djEngineName(got.host_switch)
+        + " - it catches up within three minutes"));
+    }
+  };
+  const poll = async () => {
+    if (!document.getElementById("djHostEngineMenu")) {
+      clearInterval(timer);
+      return;
+    }
+    try {
+      const got = await api("/api/voice/engine-switch");
+      if (!switching) { pick.value = got.engine; pick.disabled = false; }
+      paint(got);
+      djHostEngineTag(got);
+    } catch (e) { state.textContent = "✗ " + e.message; }
+  };
+  const timer = setInterval(poll, 3000);
+  pick.onchange = async () => {
+    const want = pick.value;
+    switching = true;
+    pick.disabled = true;
+    state.textContent = "moving the cast to " + djEngineName(want) + "…";
+    try {
+      const got = await api("/api/voice/engine-switch", {method: "POST",
+        body: JSON.stringify({engine: want})});
+      setStatus("the cast moves to " + djEngineName(want) + " — "
+        + djEngineName(got.closing) + " closes, "
+        + djEngineName(want) + " loads");
+      try { await loadCloneVoices(); } catch (e) { /* next refresh */ }
+      try { djLoadSettings(); } catch (e) { /* next refresh */ }
+    } catch (e) { state.textContent = "✗ " + e.message; }
+    switching = false;
+    pick.disabled = false;
+    poll();
+  };
+  const away = (e) => {
+    if (box.contains(e.target) || anchor.contains(e.target)) return;
+    box.remove();
+    document.removeEventListener("pointerdown", away, true);
+  };
+  setTimeout(() => document.addEventListener("pointerdown", away, true), 0);
+  box.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") box.remove();
+  });
+  poll();
+}
+
 async function djSetVoices() {
   const status = document.getElementById("djVoiceStatus");
   try {
@@ -242056,9 +242430,47 @@ function studioVoiceOptions() {
 async function studioEngines() {
   const got = await api("/api/voice/engines");
   studioState.engines = got.engines || [];
+  studioState.captureEngines = got.capture_engines || [];     // #1476
   window.studioPiperVoices = got.voices || [];
   studioState.voices = got.library || [];
+  studioCapturePaint();
   return got;
+}
+
+/* #1476: which engine the next capture is cut FOR. The voice lab trims the
+ * reference to what that engine listens to (XTTS 30 s, F5 10.5 s, IndexTTS
+ * 13.5 s) and the new voice is saved on it. Every capture road in the
+ * studio - a link, a file, the mic, the Ref Lab - reads this one pick. */
+function studioCaptureEngine() {
+  return localStorage.studioCaptureEngine || "xtts";
+}
+
+function studioEngineLabel(id) {
+  const row = (studioState.captureEngines || []).find((e) => e.id === id);
+  if (row) return row.label;
+  return id === "xtts" ? "XTTS v2" : String(id || "").toUpperCase();
+}
+
+function studioCapturePaint(node) {
+  const pick = node || document.getElementById("studioCaptureEngine");
+  if (!pick) return;
+  const want = studioCaptureEngine();
+  const loaded = (studioState.captureEngines || []).length > 0;
+  const rows = loaded ? studioState.captureEngines
+    : [{id: want, label: studioEngineLabel(want), ready: true}];
+  pick.innerHTML = "";
+  rows.forEach((row) => {
+    const o = document.createElement("option");
+    o.value = row.id;
+    o.textContent = row.label
+      + (row.ref_s ? " · " + row.ref_s + " s ref" : "")
+      + (row.ready ? "" : " · not running");
+    pick.appendChild(o);
+  });
+  pick.value = rows.some((r) => r.id === want) ? want : "xtts";
+  if (loaded && pick.value !== want) {
+    localStorage.studioCaptureEngine = pick.value;
+  }
 }
 
 /* The engine A/B: play each take in turn with its render time beside
@@ -242128,10 +242540,17 @@ async function studioEngineAB(name, got) {
   } catch (e) { /* leave it on the default */ }
   pick.onchange = async () => {
     try {
-      const st = await api("/api/settings");
-      st.dj.clone_engine = pick.value;
-      await api("/api/settings", {method: "PUT",
-                                  body: JSON.stringify(st)});
+      if (pick.value) {
+        // #1476: the same switch as the Host's engine menu - the cast
+        // moves, the other engine closes, this one loads.
+        await api("/api/voice/engine-switch", {method: "POST",
+          body: JSON.stringify({engine: pick.value})});
+      } else {
+        const st = await api("/api/settings");
+        st.dj.clone_engine = pick.value;
+        await api("/api/settings", {method: "PUT",
+                                    body: JSON.stringify(st)});
+      }
       studioSay(pick.value
         ? "the whole library now clones with " + pick.value.toUpperCase()
         : "each voice is back on its own engine");
@@ -242183,8 +242602,24 @@ function studioOpen() {
   const title = el("div", "studio-title", "");
   title.appendChild(el("span", "", "🎚 Voice Studio"));
   title.appendChild(el("span", "muted", "clone · dissect · sculpt"));
+  // #1476: the engine the next capture is cut for, beside the close box.
+  const capture = el("label", "studio-capture", "");
+  capture.appendChild(el("span", "muted", "capturing for"));
+  const capturePick = document.createElement("select");
+  capturePick.id = "studioCaptureEngine";
+  capturePick.title = "Every capture from here (a link, a file, the mic, "
+    + "the Ref Lab) is cut for this engine: the reference is trimmed to "
+    + "what it listens to, and the new voice is saved on it. The engine "
+    + "does not need to be running to capture for it.";
+  capturePick.onchange = () => {
+    localStorage.studioCaptureEngine = capturePick.value;
+    studioSay("the next capture is cut for "
+      + studioEngineLabel(capturePick.value));
+  };
+  capture.appendChild(capturePick);
+  studioCapturePaint(capturePick);
+  title.appendChild(capture);
   const close = el("button", "", "✕");
-  close.style.marginLeft = "auto";
   close.onclick = (event) => { event.stopPropagation(); studioClose(); };
   title.appendChild(close);
   win.appendChild(title);
@@ -242248,7 +242683,8 @@ function studioOpen() {
   // Drag by the title bar; geometry survives reloads (booth idiom).
   let drag = null;
   title.onpointerdown = (event) => {
-    if (event.target.tagName === "BUTTON") return;
+    // #1476: the capture pick is a control, not a handle.
+    if (event.target.closest("button, .studio-capture")) return;
     drag = {x: event.clientX - win.offsetLeft,
             y: event.clientY - win.offsetTop};
     title.setPointerCapture(event.pointerId);
@@ -242396,6 +242832,7 @@ function studioConsolePaint(live) {
         + esc(r.name || r.id) + '</span>'
         + '<span style="font-size:10px;color:#8aa;flex:1">'
         + esc(r.stage || "…")
+        + (r.engine ? " · for " + esc(studioEngineLabel(r.engine)) : "")
         + (stuck > 12000 ? " · " + secs(stuck) + " on this stage" : "")
         + '</span>'
         + '<span style="font-size:10px;color:#9fe">' + pct + '%</span>'
@@ -242510,6 +242947,7 @@ async function studioJobWatch() {
         id: jobId, name: meta.name || jobId, stage: status.stage,
         progress: status.progress || 0, started: meta.started,
         lastChange: meta.lastChange, done: status.stages_done || [],
+        engine: status.engine || meta.engine || "",           // #1476
       });
     } else {
       delete STUDIO_PERF[jobId];
@@ -242528,7 +242966,9 @@ async function studioJobWatch() {
                   true);
       } else if (status.harvested) {
         studioSay((meta.name || "voice") + " internalized"
-          + (status.voice_id ? " as " + status.voice_id : "") + " ✓");
+          + (status.voice_id ? " as " + status.voice_id : "")
+          + (status.engine ? " on " + studioEngineLabel(status.engine) : "")
+          + " ✓");
         // #620: refresh the voice lists the moment a clone lands, so the new
         // voice is pickable for the host/co-host/callers right away.
         try { loadCloneVoices(); } catch (e) {}
@@ -243233,11 +243673,12 @@ function studioImportUrl(prefill) {
       go.disabled = true;
       prog.textContent = "◐ asking…";
       try {
+        const engine = studioCaptureEngine();                  // #1476
         const got = await api("/api/voicelab/ingest", {method: "POST",
           body: JSON.stringify({url, start: start || null, end: end || null,
-                                mode: "both", name})});
+                                mode: "both", name, engine})});
         studioJobAdd(got.job_id, {kind: "quick", name: name || url,
-                                  url: url, retryable: true});
+                                  url: url, retryable: true, engine});
         prog.textContent = "◐ queued";
         delete localStorage.studioUrlDraft;
       } catch (error) {
@@ -243270,7 +243711,8 @@ async function studioIngestFile(file, name, quick) {
     // Direct fetch: api() force-sets a JSON content type on any body.
     const got = await fetch("/api/voicelab/upload?mode=both&name="
         + encodeURIComponent(name || file.name.split(".")[0] || "voice")
-        + "&filename=" + encodeURIComponent(file.name), {
+        + "&filename=" + encodeURIComponent(file.name)
+        + "&engine=" + encodeURIComponent(studioCaptureEngine()), {  // #1476
       method: "POST",
       headers: {"Authorization": "Bearer " + (key() || SERVER_KEY),
                 "Content-Type": "application/octet-stream"},
@@ -243278,7 +243720,8 @@ async function studioIngestFile(file, name, quick) {
     });
     if (!got.ok) throw new Error((await got.json()).detail || got.status);
     const data = await got.json();
-    studioJobAdd(data.job_id, {kind: quick ? "quick" : "lab", name: name});
+    studioJobAdd(data.job_id, {kind: quick ? "quick" : "lab", name: name,
+                               engine: studioCaptureEngine()});
     if (!quick) studioNav("lab");     // the quick card watches in place
     return data.job_id;
   } catch (error) {
@@ -243507,7 +243950,8 @@ function studioImportMic() {
           studioSay("uploading recording…");
           try {
             const got = await fetch("/api/voicelab/upload?mode=both&name="
-                + encodeURIComponent(name) + "&filename=mic.wav", {
+                + encodeURIComponent(name) + "&filename=mic.wav&engine="
+                + encodeURIComponent(studioCaptureEngine()), {   // #1476
               method: "POST",
               headers: {"Authorization": "Bearer " + SERVER_KEY,
                         "Content-Type": "application/octet-stream"},
@@ -243517,7 +243961,8 @@ function studioImportMic() {
               throw new Error((await got.json()).detail || got.status);
             }
             const data = await got.json();
-            studioJobAdd(data.job_id, {kind: "lab", name: name});
+            studioJobAdd(data.job_id, {kind: "lab", name: name,
+                                       engine: studioCaptureEngine()});
             studioNav("lab");
           } catch (error) { studioSay(error.message, true); }
         },
@@ -243874,12 +244319,14 @@ function studioLabStart(mode) {
   const name = prompt("Name for the extracted voice:") || "";
   api("/api/voicelab/ingest", {method: "POST", body: JSON.stringify(
     {url: url, start: start || null, end: end || null, mode: mode,
-     name: name, speaker: studioState.lab.speaker || ""})})
+     name: name, speaker: studioState.lab.speaker || "",
+     engine: studioCaptureEngine()})})                         // #1476
     .then((got) => {
       studioState.lab = {job: got.job_id, segments: [], signature: null,
                          duration: 0, speaker: "", speakers: [],
                          inAt: null, outAt: null};
-      studioJobAdd(got.job_id, {kind: "lab", name: name || url});
+      studioJobAdd(got.job_id, {kind: "lab", name: name || url,
+                                engine: studioCaptureEngine()});
       studioSay("the Spark is dissecting it — stages will tick through");
     })
     .catch((error) => studioSay(error.message, true));
