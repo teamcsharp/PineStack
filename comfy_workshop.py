@@ -65,7 +65,11 @@ SIZE_MIN, SIZE_MAX = 384, 1536
 # double profile and says why. A step count names its path: 4-12 are the
 # turbo LoRA's, 20-30 the base model's, and the two lists never overlap.
 BASE_STEP_CHOICES = (20, 25, 30)
-CINEMATIC_HEAT_C = 80.0
+# 84 C, not 80: measured 2026-09-27 the box idles at 83-88 C between jobs, so an
+# 80 C line would never open (a gate that can never pass is an off switch); 84
+# is the line the A/B and the cast trainer wait for, and the time budget caps
+# how long any cinematic render can run.
+CINEMATIC_HEAT_C = 84.0
 PRESETS["cinematic"] = {"preset": "cinematic", "steps": 20, "width": 1280, "height": 768, "max_frames": 124,
                         "turbo": False, "sampler": "res_multistep", "scheduler": "simple"}
 NO_CINEMATIC_PURPOSES = ("hourly",)

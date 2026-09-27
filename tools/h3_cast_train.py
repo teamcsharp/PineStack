@@ -77,6 +77,9 @@ HOT_C = float(os.environ.get("CAST_HOT_C", "90"))        # the station's own ren
 COOL_C = float(os.environ.get("CAST_COOL_C", "84"))      # the A/B's "ready" line
 PANIC_C = float(os.environ.get("CAST_PANIC_C", "97"))
 MEM_MIN_GB = float(os.environ.get("CAST_MEM_MIN_GB", "10"))
+# a portrait is an image render (~80 s): lighter than a training burst, so it
+# may start at up to the station's own heavy-profile line, not the cool line
+PORTRAIT_COOL_C = float(os.environ.get("CAST_PORTRAIT_COOL_C", "88"))
 START_MEM_GB = float(os.environ.get("CAST_START_MEM_GB", "45"))
 
 DEFAULT_LOOK = ("a man in his mid forties with a short salt-and-pepper beard, tousled dark hair going grey at "
@@ -180,7 +183,7 @@ def stop_asked() -> bool:
     return os.path.exists(STOP)
 
 
-def wait_ready(stage: str, need_gb: float = 0.0, comfy_ok: bool = False) -> bool:
+def wait_ready(stage: str, need_gb: float = 0.0, comfy_ok: bool = False, cool: float | None = None) -> bool:
     """Until the box is cool, idle and roomy enough. False when a stop is asked."""
     said = 0.0
     while True:
@@ -188,8 +191,9 @@ def wait_ready(stage: str, need_gb: float = 0.0, comfy_ok: bool = False) -> bool
             return False
         hot, free, busy = hottest(), mem_gb(), (False if comfy_ok else comfy_busy())
         why = []
-        if hot is not None and hot > COOL_C:
-            why.append("%.0f C, waiting for %.0f C" % (hot, COOL_C))
+        line = COOL_C if cool is None else cool
+        if hot is not None and hot > line:
+            why.append("%.0f C, waiting for %.0f C" % (hot, line))
         if busy:
             why.append("ComfyUI is rendering")
         if need_gb and free is not None and free < need_gb:
@@ -371,35 +375,44 @@ def caption(scene: str) -> str:
     return ("%s, the Pine Box host, %s. A photograph, a still picture. sound: silence, no audio." % (TRIGGER, scene))
 
 
+def portrait_path(k: int, scene: str) -> str:
+    return os.path.join(IMAGES, "%02d_%s.png" % (k, scene.split(",")[0].replace(" ", "-")[:40]))
+
+
 def make_portraits(look: str, fresh: bool) -> int:
+    """The canonical portrait and its variations. Resumable: what is already
+    made is kept and only the missing ones are rendered (--fresh starts over)."""
     os.makedirs(IMAGES, exist_ok=True)
-    have = sorted(glob.glob(os.path.join(IMAGES, "*.png")))
-    if have and not fresh:
-        say("portraits kept: %d" % len(have))
-        return len(have)
-    for old in glob.glob(os.path.join(IMAGES, "*")):
-        os.remove(old)
-    shutil.rmtree(CACHE, ignore_errors=True)
-    status(state="portraits", stage="portraits", step=0, of=len(VARIATIONS) + 1, why="the canonical portrait")
-    if not wait_ready("portraits"):
-        return -1
-    prompt = ("A photorealistic portrait photograph of %s, head and shoulders, looking at the camera, in a dim "
-              "late-night radio studio lit by a warm desk lamp, 85mm lens, natural skin texture, sharp focus." % look)
+    if fresh:
+        for old in glob.glob(os.path.join(IMAGES, "*")):
+            os.remove(old)
+        shutil.rmtree(CACHE, ignore_errors=True)
     canon = os.path.join(IMAGES, "00_canonical.png")
-    entry = comfy_wait(comfy_submit(portrait_graph(prompt, random.randint(1, 2 ** 31))))
-    if not entry:
-        raise RuntimeError("the canonical portrait did not finish")
-    comfy_image(entry, canon)
-    with open(os.path.join(IMAGES, "00_canonical.txt"), "w", encoding="utf-8") as fh:
-        fh.write(caption("head and shoulders, looking at the camera, in a dim radio studio lit by a warm desk lamp"))
-    inp = os.path.join(COMFY_HOME, "input", "h3_cast_canonical.png")
-    shutil.copyfile(canon, inp)
-    made = 1
-    for k, (scene, change) in enumerate(VARIATIONS, 1):
+    todo = [(k, scene, change) for k, (scene, change) in enumerate(VARIATIONS, 1)
+            if not os.path.exists(portrait_path(k, scene))]
+    if os.path.exists(canon) and not todo:
+        have = len(glob.glob(os.path.join(IMAGES, "*.png")))
+        say("portraits kept: %d" % have)
+        return have
+    shutil.rmtree(CACHE, ignore_errors=True)          # the set changes: the caches follow it
+    if not os.path.exists(canon):
+        status(state="portraits", stage="portraits", step=0, of=len(VARIATIONS) + 1, why="the canonical portrait")
+        if not wait_ready("portraits", cool=PORTRAIT_COOL_C):
+            return -1
+        prompt = ("A photorealistic portrait photograph of %s, head and shoulders, looking at the camera, in a dim "
+                  "late-night radio studio lit by a warm desk lamp, 85mm lens, natural skin texture, sharp focus." % look)
+        entry = comfy_wait(comfy_submit(portrait_graph(prompt, random.randint(1, 2 ** 31))))
+        if not entry:
+            raise RuntimeError("the canonical portrait did not finish")
+        comfy_image(entry, canon)
+        with open(os.path.join(IMAGES, "00_canonical.txt"), "w", encoding="utf-8") as fh:
+            fh.write(caption("head and shoulders, looking at the camera, in a dim radio studio lit by a warm desk lamp"))
+    shutil.copyfile(canon, os.path.join(COMFY_HOME, "input", "h3_cast_canonical.png"))
+    for k, scene, change in todo:
         if stop_asked():
             return -1
         status(state="portraits", stage="portraits", step=k, of=len(VARIATIONS) + 1, why=scene)
-        if not wait_ready("portraits"):
+        if not wait_ready("portraits", cool=PORTRAIT_COOL_C):
             return -1
         instruction = (change + ". Keep the exact same man - the same face, the same hair and beard, the same age "
                        "and build, the same clothes - as a photorealistic photograph.")
@@ -407,15 +420,14 @@ def make_portraits(look: str, fresh: bool) -> int:
             entry = comfy_wait(comfy_submit(kontext_graph("h3_cast_canonical.png", instruction, random.randint(1, 2 ** 31))))
             if not entry:
                 raise RuntimeError("did not finish")
-            dest = os.path.join(IMAGES, "%02d_%s.png" % (k, scene.split(",")[0].replace(" ", "-")[:40]))
+            dest = portrait_path(k, scene)
             comfy_image(entry, dest)
             with open(dest[:-4] + ".txt", "w", encoding="utf-8") as fh:
                 fh.write(caption(scene))
-            made += 1
             say("portrait %d/%d: %s" % (k, len(VARIATIONS), scene))
         except Exception as exc:  # noqa: BLE001
             say("portrait %d failed: %s" % (k, exc))
-    return made
+    return len(glob.glob(os.path.join(IMAGES, "*.png")))
 
 
 # --- musubi-tuner -----------------------------------------------------------------
