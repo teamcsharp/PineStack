@@ -46,8 +46,6 @@
   background: var(--panel); border: 1px solid var(--line); border-radius: 8px; margin-bottom: 12px; }
 .s3-metrics b { color: var(--ink); font-weight: 600; }
 .s3-error { color: var(--warn); background: var(--warn-bg); border-radius: 7px; padding: 8px 12px; margin: 8px 0; }
-.s3-ok { color: var(--fg); background: color-mix(in srgb, var(--es) 18%, transparent); border-radius: 7px; padding: 8px 12px; margin: 8px 0; }   /* [s3-save] */
-.s3-table tr.s3-live td { font-weight: 600; }
 
 /* director layout */
 .s3-director { display: grid; grid-template-columns: 280px minmax(0, 1fr); gap: 14px; }
@@ -577,3 +575,75 @@
 .s3-seg-bar > * { max-width: 100%; }
 .s3-sys3 { max-width: 100%; }
 .s3 pre { max-width: 100%; overflow: auto; }
+
+/* [s3-rolodex] the Rolodex in front of the prompt: one row per roll, the
+   die on the right, a tick that opens the row */
+.s3-rolodex-box { grid-column: 1 / -1; }
+.s3-rx-list { display: grid; gap: 4px; }
+.s3-rx { border: 1px solid var(--line); border-left: 4px solid var(--fam, var(--obs)); border-radius: 7px; padding: 3px 8px; margin: 0; background: var(--panel-2); min-width: 0; }
+.s3-rx > summary { list-style: none; display: flex; align-items: center; gap: 8px; cursor: pointer; min-height: 32px; color: var(--ink); font-size: 12px; min-width: 0; }
+.s3-rx > summary::-webkit-details-marker { display: none; }
+.s3-rx-tick { flex: none; width: 12px; color: var(--ink-3); font-size: 11px; }
+.s3-rx-tick::before { content: "\25B8"; }
+.s3-rx[open] > summary .s3-rx-tick::before { content: "\25BE"; }
+.s3-rx > summary .s3-dfam { color: var(--fam, var(--obs)); border-color: var(--fam, var(--obs)); }
+.s3-rx-what { flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; }
+.s3-rx-what b { font-weight: 600; }
+.s3-rx > summary .s3-die { margin-left: auto; flex: none; }
+.s3-rx.mine { box-shadow: 0 0 0 1px var(--accent); }
+.s3-rx.other { opacity: .72; }
+.s3-rx.other:hover, .s3-rx.other[open] { opacity: 1; }
+.s3-rx-body { display: grid; gap: 6px; padding: 4px 0 6px 20px; font-size: 12px; min-width: 0; }
+.s3-rx-body > p { margin: 0; }
+.s3-rx-told { background: #0b1215; border-radius: 6px; padding: 6px 9px; overflow-wrap: anywhere; }
+.s3-rx-cands-fold { margin: 0; }
+.s3-rx-cands { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(180px, 100%), 1fr)); gap: 4px; margin-top: 6px; }
+.s3-rx-cand { display: flex; justify-content: space-between; gap: 6px; padding: 3px 7px; border-radius: 6px; background: #0b1215; font-size: 11px; min-width: 0; }
+.s3-rx-cand b { overflow-wrap: anywhere; }
+.s3-rx-cand.hit { outline: 1px solid var(--fam, var(--accent)); }
+.s3-rx-how { font-size: 12px; padding: 3px 10px; }
+
+/* [s3-line-tabs] the tapped message's panes: System 3 / Node / Prompt / Tables */
+.s3.s3-ltabs { padding: 0; background: transparent; max-width: none; min-height: 0; margin: 0; font-size: 13px; }
+.s3-ltabs-pane { display: grid; gap: 10px; min-width: 0; }
+.s3-ltabs-pane[hidden] { display: none; }
+.s3-ltabs-nav { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.s3-ltabs-nav .s3-muted { flex: 1 1 auto; text-align: center; }
+.s3-ltabs-arrow { font-size: 12px; padding: 4px 10px; min-height: 34px; }
+.s3-ltabs-head { display: grid; gap: 4px; }
+.s3-ltabs-nodes { gap: 0; }
+.s3-ltabs .s3-seg-node { cursor: default; }
+.s3-node-other[role="button"] { cursor: pointer; opacity: .78; }
+.s3-node-other[role="button"]:hover { opacity: 1; }
+.s3-node-card .s3-draw-live { cursor: pointer; }
+.s3-draw-got { color: var(--ink-2); font-size: 11px; }
+.s3-node-act { overflow-wrap: anywhere; }
+.s3-ltabs-nodes-strip { display: flex; flex-wrap: wrap; gap: 6px; }
+.s3-ltabs-nodes-strip .s3-draw { cursor: pointer; background: transparent; padding: 4px 9px; }
+.s3-ltabs-nodes-strip .s3-draw.sel { box-shadow: 0 0 0 2px var(--fam, var(--accent)); }
+.s3-tstory { --fam: var(--obs); }
+.s3-tstory-dice { display: grid; gap: 4px; }
+.s3-tstory-die { display: flex; align-items: center; gap: 10px; font-size: 12px; }
+.s3-tstory-die .s3-muted { min-width: 70px; }
+.s3-tstory-how { justify-self: start; font-size: 12px; }
+.s3-tstory-cat.hit { border-color: var(--fam); }
+.s3-tstory-item { display: grid; gap: 4px; padding: 6px 0; border-top: 1px solid var(--line); }
+.s3-tstory-item.hit { background: #0b1215; border-radius: 7px; padding: 6px 8px; outline: 1px solid var(--fam); }
+.s3-tstory-item.off { opacity: .55; }
+.s3-tstory-item-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.s3-tstory-item .s3-slider { grid-template-columns: 110px minmax(0, 1fr) 48px; margin: 0; }
+.s3-tstory-text { font-size: 11px; }
+.s3-pill.hit { border-color: var(--fam, var(--accent)); color: var(--ink); }
+.s3-ltabs-exchange { max-height: 42vh; overflow: auto; padding: 4px 6px; border: 1px solid var(--line); border-radius: 8px; }
+.s3-ltabs .s3-tile-grid { grid-template-columns: repeat(auto-fit, minmax(min(280px, 100%), 1fr)); }
+.s3-ltabs .s3-story { padding: 0; background: transparent; max-width: none; min-height: 0; }
+
+/* [s3-prompt-fold] the prompt and the system prompt, folded under the Rolodex */
+.s3-pfold { border: 1px solid var(--line); border-radius: 8px; padding: 6px 10px; margin: 8px 0 0; }
+.s3-pfold > summary { font-weight: 600; color: var(--ink-2); font-size: 13px; }
+.s3-pfold-body { display: grid; gap: 10px; padding-top: 8px; min-width: 0; }
+.s3-pfold-call { display: grid; gap: 8px; min-width: 0; }
+.s3-pfold-layers { display: grid; gap: 10px; min-width: 0; }
+.s3-pfold-layer { display: grid; gap: 6px; min-width: 0; }
+.s3-pfold-layer h4 { margin: 0; font-size: 12px; color: var(--ink-2); }
+.s3-pfold-layer textarea { min-height: 96px; font: 12px/1.5 system-ui, sans-serif; }

@@ -509,10 +509,10 @@
       var style = document.createElement('link');
       style.id = 'spS3Style';
       style.rel = 'stylesheet';
-      style.href = techUrl('/system3/system3.css?v=4');
+      style.href = techUrl('/system3/system3.css?v=6');
       document.head.appendChild(style);
     }
-    import(techUrl('/system3/system3.js?v=4')).then(function (mod) {
+    import(techUrl('/system3/system3.js?v=6')).then(function (mod) {
       return mod.openSystem3({request: s3Request, tab: tab || 'tables',
         onClose: function () { s3WindowOpen = null; }});
     }).then(function (view) { s3WindowOpen = view; }).catch(function (err) {
@@ -4179,10 +4179,10 @@
           var style = document.createElement('link');
           style.id = 'spS3Style';
           style.rel = 'stylesheet';
-          style.href = techUrl('/system3/system3.css?v=4');
+          style.href = techUrl('/system3/system3.css?v=6');
           document.head.appendChild(style);
         }
-        var mod = await import(techUrl('/system3/system3.js?v=4'));
+        var mod = await import(techUrl('/system3/system3.js?v=6'));
         pane.textContent = '';
         var box = make('div', 'sp-s3-host');
         pane.appendChild(box);
@@ -10902,10 +10902,10 @@
       var style = document.createElement('link');
       style.id = 'spS3Style';
       style.rel = 'stylesheet';
-      style.href = techUrl('/system3/system3.css?v=4');
+      style.href = techUrl('/system3/system3.css?v=6');
       document.head.appendChild(style);
     }
-    import(techUrl('/system3/system3.js?v=4')).then(function (mod) {
+    import(techUrl('/system3/system3.js?v=6')).then(function (mod) {
       return mod.openRoll({request: s3Request, conversationId: info.conversation_id,
         eventId: roll ? String(roll.event_id || '') : '', turnId: info.turn_id, lineId: id});
     }).catch(function (err) {
@@ -15464,7 +15464,12 @@
     box.replaceChildren();
 
     box.appendChild(make('b', 'sp-detail-who', item.name || item.who || item.tag || 'the station'));
-    box.appendChild(make('p', 'sp-detail-text', item.text || ''));
+    /* [s3-line-tabs] "when i tap a message, I want this popup to have tabs":
+       Line (the words, the note, the buttons) / System 3 / Node / Prompt /
+       Tables. The four are served by the System 3 module, so they change
+       without a rebuild; the strip keeps the tab across messages. */
+    var tabs = lineTabsStrip(box, item);
+    tabs.line.appendChild(make('p', 'sp-detail-text', item.text || ''));
 
     var facts = [];
     if (item.round) facts.push(item.round);
@@ -15473,11 +15478,11 @@
     if (item.seconds) facts.push(Number(item.seconds).toFixed(1) + 's');
     if (item.tinted) facts.push('tinted');
     if (item.aired) facts.push(item.aired === 'stream' ? 'aired' : item.aired);
-    box.appendChild(make('i', 'sp-detail-facts', facts.join('  ·  ')));
+    tabs.line.appendChild(make('i', 'sp-detail-facts', facts.join('  ·  ')));
 
     var note = make('textarea', 'sp-note');
     note.placeholder = 'A note, or how this should have been said...';
-    box.appendChild(note);
+    tabs.line.appendChild(note);
 
     var row = make('div', 'sp-detail-row');
 
@@ -15512,10 +15517,76 @@
     clip.addEventListener('click', function () { hear(item, clip); });
     row.appendChild(clip);
 
-    box.appendChild(row);
+    tabs.line.appendChild(row);
     var close = make('button', 'sp-detail-close', '✕');
-    close.addEventListener('click', function () { box.hidden = true; });
-    box.appendChild(close);
+    close.addEventListener('click', function () { box.hidden = true; lineTabsDispose(); });
+    tabs.strip.appendChild(close);
+  }
+
+  /* [s3-line-tabs] The strip on the tapped line's box. The Line tab is the
+     box as it was; the other four mount the System 3 module's panes on the
+     line's id once, then switch between them. The tab chosen stays chosen
+     for the next line tapped, so a reader can walk the feed on one tab. */
+  var lineTab = 'line', lineTabs = null, lineTabsPane = null;
+  var LINE_TABS = [['line', 'Line'], ['system3', 'System 3'], ['node', 'Node'], ['prompt', 'Prompt'], ['tables', 'Tables']];
+  function lineTabsDispose() {
+    if (lineTabs) { try { lineTabs.dispose(); } catch (e) { /* gone */ } }
+    lineTabs = null;
+    lineTabsPane = null;
+  }
+  function lineTabsStrip(box, item) {
+    lineTabsDispose();
+    var strip = make('div', 'sp-detail-tabs');
+    var line = make('div', 'sp-detail-line-tab');
+    var pane = make('div', 'sp-detail-s3');
+    pane.hidden = true;
+    var buttons = {};
+    var id = String(item.line || item.id || '');
+    function show(name) {
+      lineTab = name;
+      Object.keys(buttons).forEach(function (k) { buttons[k].setAttribute('aria-pressed', String(k === name)); });
+      line.hidden = name !== 'line';
+      pane.hidden = name === 'line';
+      if (name === 'line') return;
+      if (!id) { pane.textContent = 'This row has no line id, so System 3 cannot be asked about it.'; return; }
+      if (lineTabs) { lineTabs.show(name); return; }
+      if (lineTabsPane === pane) return;                     /* mounting */
+      lineTabsPane = pane;
+      pane.textContent = 'Asking System 3...';
+      if (!document.getElementById('spS3Style')) {
+        var style = document.createElement('link');
+        style.id = 'spS3Style';
+        style.rel = 'stylesheet';
+        style.href = techUrl('/system3/system3.css?v=6');
+        document.head.appendChild(style);
+      }
+      import(techUrl('/system3/system3.js?v=6')).then(function (mod) {
+        if (lineTabsPane !== pane) return null;
+        return mod.mountLineTabs(pane, {request: s3Request, lineId: id, tab: lineTab});
+      }).then(function (view) {
+        if (!view) return;
+        if (lineTabsPane !== pane) { try { view.dispose(); } catch (e) { /* gone */ } return; }
+        lineTabs = view;
+        if (lineTab !== 'line') view.show(lineTab);
+      }).catch(function (err) {
+        if (lineTabsPane === pane) pane.textContent = 'System 3 could not open here: ' + String((err && err.message) || err);
+        lineTabsPane = null;
+      });
+    }
+    LINE_TABS.forEach(function (t) {
+      var b = make('button', 'sp-detail-tab', t[1]);
+      b.type = 'button';
+      b.setAttribute('aria-pressed', 'false');
+      b.addEventListener('click', function () { show(t[0]); });
+      buttons[t[0]] = b;
+      strip.appendChild(b);
+    });
+    box.appendChild(strip);
+    box.appendChild(line);
+    box.appendChild(pane);
+    box.classList.add('has-tabs');
+    show(lineTab);
+    return {strip: strip, line: line, pane: pane, show: show};
   }
 
   function sendNote(item, text, button) {
