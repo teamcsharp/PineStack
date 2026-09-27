@@ -101,6 +101,8 @@
       /* 2 - what is on, and the transport. */
       + '<section class="lk-now">'
       + '<img id="lkCover" class="lk-cover" alt="" hidden>'
+      /* [lock-cover] what shows while the art loads, and for a record with none */
+      + '<span id="lkCoverNone" class="lk-cover lk-cover-none" aria-hidden="true"></span>'
       + '<div class="lk-nowtext">'
       + '<b id="lkTitle">—</b><i id="lkBy"></i>'
       + '<div class="lk-barwrap"><span id="lkBar" class="lk-bar"></span></div>'
@@ -320,11 +322,7 @@
     if (by) by.textContent = String(now.artist || '');
 
     var cover = el('lkCover');
-    if (cover) {
-      var art = now.art || now.cover || '';
-      if (art) { cover.src = String(art); cover.hidden = false; }
-      else { cover.removeAttribute('src'); cover.hidden = true; }
-    }
+    if (cover) coverShow(cover, String(now.art || now.cover || ''));
 
     var length = Number(state.length || now.length || 0);
     var gone = Number(state.elapsed || 0);
@@ -339,6 +337,40 @@
         ? spell(gone) + ' / ' + spell(length)
         : (state.playing ? 'playing' : '');
     }
+  }
+
+  /* [lock-cover] The picture shows only once it has loaded. A record with no
+     art (the station answers 404 - nothing in its tags, its folder or the
+     Cover Art Archive) keeps the placeholder instead of a broken-image box,
+     and is asked again after two minutes, since the station's web lookup
+     can still find one. A new record starts clean. */
+  var coverBase = '', coverOk = false, coverAsked = 0;
+  function coverPlaceholder(on) {
+    var ph = el('lkCoverNone');
+    if (!ph) return;
+    if (!ph.firstChild && typeof root.pineIcon === 'function') ph.innerHTML = root.pineIcon('c:music');
+    ph.hidden = !on;
+  }
+  function coverShow(img, art) {
+    if (!art) {
+      coverBase = ''; coverOk = false;
+      img.removeAttribute('src'); img.hidden = true; coverPlaceholder(true);
+      return;
+    }
+    var now = Date.now();
+    if (art === coverBase && (coverOk || now - coverAsked < 120000)) return;
+    var fresh = art !== coverBase;
+    coverBase = art; coverOk = false; coverAsked = now;
+    if (fresh) { img.hidden = true; coverPlaceholder(true); }
+    img.onload = function () {
+      if (coverBase !== art || !img.naturalWidth) return;
+      coverOk = true; img.hidden = false; coverPlaceholder(false);
+    };
+    img.onerror = function () {
+      if (coverBase !== art) return;
+      img.hidden = true; coverPlaceholder(true);
+    };
+    img.src = fresh ? art : art + (art.indexOf('?') >= 0 ? '&' : '?') + 'again=' + now;
   }
 
   function spell(seconds) {

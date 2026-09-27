@@ -83,6 +83,13 @@
   object-fit: cover;
   border-radius: 8px;
 }
+/* [lock-cover] the placeholder: the record's slot, quiet, with the music glyph */
+.lk-cover-none {
+  display: grid; place-items: center;
+  background: #0d151c; border: 1px solid #22303b; color: #4d6272;
+}
+.lk-cover-none[hidden], .lk-cover[hidden] { display: none; }
+.lk-cover-none .pi-icon { width: 46%; height: 46%; }
 .lk-nowtext { flex: 1 1 auto; min-width: 0; }
 .lk-nowtext b {
   display: block;

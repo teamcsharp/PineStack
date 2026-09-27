@@ -169797,8 +169797,11 @@ async def _parody_bind_deferred_reference(
     """Bind a waiting ad to an indexed speaking MP4 at dispatch time."""
     if str(body.get("source_type") or "") != "deferred_dialogue_clip":
         return body
-    clip = await asyncio.to_thread(
-        voice_ad_person_clip, str(body.get("prompt") or body.get("speech") or ""))
+    if body.get("hourly"):                                               # [h3-fresh]
+        clip = await asyncio.to_thread(h3_hourly_fresh_clip)
+    else:
+        clip = await asyncio.to_thread(
+            voice_ad_person_clip, str(body.get("prompt") or body.get("speech") or ""))
     if not clip.get("id"):
         await asyncio.to_thread(
             queue.retry, item["id"],
@@ -169807,6 +169810,8 @@ async def _parody_bind_deferred_reference(
         return None
     bound = dict(body)
     bound.update({"source": str(clip["id"]), "source_type": "clip"})
+    if body.get("hourly") and "trim_in_s" not in bound:                 # [h3-fresh] a random window
+        bound["trim_in_s"], bound["trim_out_s"] = h3_hourly_window(clip)
     await asyncio.to_thread(queue.replace_body, item["id"], bound)
     return bound
 
@@ -170083,6 +170088,95 @@ async def h3_hourly_ad_clock() -> None:
         await asyncio.sleep(30)
 
 
+# --- [h3-fresh] THE HOURLY STINGER NEVER REUSES ITS SOURCE ---------------------
+#
+# "make sure that for the hourly H3 stingers, that it never uses the same video
+#  twice for the ad. It should always use a new randomized clip every single
+#  time." Every clip or picture an hourly stinger takes is written down here
+# and never offered to it again; the next is drawn uniformly at random from
+# what is left (10,552 dialogue clips on 2026-09-27). Should it ever run out,
+# the one used longest ago goes again and the log says so.
+_H3_FRESH_FILE = DATA_DIR / "h3_hourly_used.json"
+_H3_FRESH_LOCK = RLock()
+H3_HOURLY_WINDOW_S = 10.0
+
+
+def h3_hourly_used() -> dict[str, float]:
+    """[h3-fresh] Every source an hourly stinger has taken, and when."""
+    try:
+        got = json.loads(_H3_FRESH_FILE.read_text(encoding="utf-8"))
+        return {str(k): float(v) for k, v in got.items()} if isinstance(got, dict) else {}
+    except FileNotFoundError:
+        return {}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def h3_hourly_fresh_pick(keys: list[str], what: str) -> str:
+    """[h3-fresh] One of `keys` no hourly stinger has used, uniformly at
+    random, and written down as used before it is returned."""
+    with _H3_FRESH_LOCK:
+        used = h3_hourly_used()
+        fresh = [k for k in keys if k not in used]
+        if fresh:
+            pick = random.choice(fresh)
+        elif keys:
+            pick = min(keys, key=lambda k: used.get(k, 0.0))
+            pipeline_log("ads", "hourly H3: every one of the %d %s has been used once; the one used "
+                                "longest ago goes again" % (len(keys), what))
+        else:
+            return ""
+        used[pick] = time.time()
+        if len(used) > 60000:
+            used = dict(sorted(used.items(), key=lambda kv: kv[1])[-50000:])
+        try:
+            tmp = _H3_FRESH_FILE.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(used), encoding="utf-8")
+            tmp.replace(_H3_FRESH_FILE)
+        except Exception as exc:  # noqa: BLE001
+            pipeline_log("ads", "hourly H3: the used-sources ledger could not be written (%s)"
+                         % type(exc).__name__)
+        pipeline_log("ads", "hourly H3 source: %s - %d of %d %s still unused"
+                     % (pick, max(0, len(fresh) - 1), len(keys), what))
+        return pick
+
+
+def h3_hourly_fresh_clip() -> dict[str, Any]:
+    """[h3-fresh] A dialogue-capable MP4 no hourly stinger has used, drawn at
+    random from the whole clip book."""
+    try:
+        con = sfx_db_reader()
+        with _SFX_DB_LOCK:
+            rows = con.execute(
+                "SELECT sid,name,seconds,folder FROM clips "
+                "WHERE playable=1 AND video=1 AND seconds >= 3 "
+                "AND length(trim(COALESCE(said,''))) >= 6").fetchall()
+    except Exception as exc:  # noqa: BLE001
+        pipeline_log("ads", "hourly H3: the clip book could not be read (%s)" % type(exc).__name__)
+        return {}
+    by_key = {"clip:" + str(r[0]): r for r in rows if r[0]}
+    key = h3_hourly_fresh_pick(list(by_key), "dialogue clips")
+    if not key:
+        return {}
+    row = by_key[key]
+    return {"id": str(row[0]), "name": str(row[1] or "clip")[:120], "seconds": round(float(row[2] or 0), 2),
+            "video": True, "match": "a fresh clip for the hourly stinger (%s)" % str(row[3] or "")[:80]}
+
+
+def h3_hourly_fresh_image(images: list[str]) -> str:
+    """[h3-fresh] A gallery picture no hourly stinger has used, drawn at random."""
+    key = h3_hourly_fresh_pick(["img:" + str(f) for f in images if f], "gallery pictures")
+    return key[4:] if key else ""
+
+
+def h3_hourly_window(clip: dict[str, Any]) -> tuple[float, float]:
+    """[h3-fresh] A random ten-second window of the clip (all of a short one)."""
+    whole = float(clip.get("seconds") or 0.0)
+    span = min(H3_HOURLY_WINDOW_S, whole)
+    start = round(random.uniform(0.0, max(0.0, whole - span)), 2)
+    return start, round(min(whole, start + span), 2)
+
+
 async def h3_hourly_render(state: dict[str, Any]) -> tuple[str, Any, str]:
     """[h3-hourly] One hourly stinger: from a gallery image for gallery_share
     percent of hours (a frame stinger through the durable parody queue, the
@@ -170111,13 +170205,13 @@ async def h3_hourly_render(state: dict[str, Any]) -> tuple[str, Any, str]:
             return ("queued a host stinger (the cast LoRA, %s)" % comfy_workshop.CAST.get("lora"), queued, "host")
     if share and random.randint(1, 100) <= share:
         try:
-            page = await asyncio.to_thread(generation_history_page, "", "", 30)
-            images = [str(f) for r in page.get("generations", []) for f in (r.get("files") or [])
-                      if re.search(r"\.(png|jpe?g|webp)$", str(f), re.I) and not gallery_paper_file(str(f))]
+            # [h3-fresh] every picture on the wall, not only the last thirty renders
+            images = [p.name for p in await asyncio.to_thread(gallery_files, 600)
+                      if re.search(r"\.(png|jpe?g|webp)$", p.name, re.I) and not gallery_paper_file(p.name)]
         except Exception:  # noqa: BLE001
             images = []
-        if images:
-            file = random.choice(images[:30])
+        file = (await asyncio.to_thread(h3_hourly_fresh_image, images)) if images else ""
+        if file:
             payload = {"mode": "reference", "purpose": "parody_stinger", "source": file,
                        "source_type": "gallery", "speech": voice_ad_spoken_copy(goal),
                        "prompt": "Create a Pine Box FM stinger using the supplied image. Natural motion and "
@@ -170126,6 +170220,14 @@ async def h3_hourly_render(state: dict[str, Any]) -> tuple[str, Any, str]:
             queued = _parody_stinger_queue().add(payload)
             _parody_stinger_wake.set()
             return ("queued a gallery-image stinger from %s" % file, queued, "gallery image")
+    # [h3-fresh] a dialogue clip no hourly stinger has used, drawn at random,
+    # and a random ten-second window of it
+    fresh = await asyncio.to_thread(h3_hourly_fresh_clip)
+    if fresh.get("id"):
+        trim_in, trim_out = h3_hourly_window(fresh)
+        message, job = await voice_ad_render(goal, reference_clip=fresh, hourly=True,
+                                             trim_in_s=trim_in, trim_out_s=trim_out)
+        return (message, job, "clip")
     message, job = await voice_ad_render(goal, hourly=True)      # [h3-cinematic]
     return (message, job, "clip")
 
