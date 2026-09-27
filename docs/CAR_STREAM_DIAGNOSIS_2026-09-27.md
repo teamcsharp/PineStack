@@ -193,3 +193,30 @@ Safari does not expose AVPlayer's own segment fetches to the page (Resource Timi
 - AVPlayer's real buffer policy and start offset on this playlist (the ~12 s figure follows the HLS spec; `buffered` readings on the phone will confirm) and whether it honours `EXT-X-START` here.
 - Whether the slow regime seen from the DGX (3 of 4 runs) is the regime the phone sees at the same minute - the button's per-segment timings laid over a DGX-side funnel probe (`car-hlsloop.py`) answers that.
 - Which hop the ingress/DERP slowness lives on (DGX -> nyc DERP over Wi-Fi + AT&T vs the ingress node itself): the tailnet-direct experiment (R1) is the control.
+
+
+---
+
+# Outcome (built 2026-09-27, 13:00-14:55 CDT)
+
+**The phone's first DIAG report explains the "slow" it described.** Filed 12:54 from the iPhone on the tailnet (`xff` 100.92.208.88; the page's hostname guess called it "funnel"): RTT 7-24 ms, 19 Mbit/s throughput, HLS segment 403 ms, yet 20 s after the page loaded the playhead had never advanced and the first playlist took 4.0 s. That is the HLS cold start (12.5-13.4 s before a new lane answered), not the link. Note: "It being slow".
+
+**Built and verified live:**
+
+| Item | What changed | Measured |
+|---|---|---|
+| R2 cushion (#1473) | New HLS lanes are primed from the mixer's 30 s PCM backlog; the default lane is kept warm from boot and exempt from the reaper and the mixer's linger exit; a dead lane restarts with `#EXT-X-DISCONTINUITY` and keeps its old segments | first playlist 12.5-13.4 s -> **0.66-0.71 s**; 28 s of audio on disk in 1.3 s; `start_offset_s` 30 |
+| R3 ABR (#1473) | One ffmpeg per lane writes 48/64/96/128 kbit/s AAC-LC variants with aligned segments and a master; `/stream.m3u8` serves the master (`?abr=0` or `?br=` for one variant); variant playlists get `#EXT-X-INDEPENDENT-SEGMENTS` + `#EXT-X-START:TIME-OFFSET=-min(30, window)` | 4 variants, segment N identical start time in all four; continuity probe 60 s: 25 segments, 0 gaps, 0 errors (single variant and ABR walk) |
+| R8 ledger (#1473/#1475) | `hls_note` per playlist/segment keyed by the token's last 12 chars (never the whole token), `data/hls_ledger.jsonl` via a daemon writer, rotated at 5 MB; `state()` gains `hls`, `hls_listeners` (stalls = >6 s gap while active, dropouts = silent >=20 s), `mp3_listeners`, `hls_active`; `GET /api/stream/hls_ledger?token_tail=` | live: 53 segments, 66 playlists, 0 dropouts on the test token |
+| R4/R5 camera (#1474/#1475) | pinelink writes `frame_small.jpg` (424 px, ~10 KB, 2/s) and a 424x240 15 fps 350 kbit/s x264 HLS lane (`data/pinelink/low/`); `frame.jpg?w=424` serves the small one; new `/api/pinelink/low/{name}` (token-gated, camera tick required through the door); the tune page shows the camera as a muted inline `<video>` on the low lane on tailnet/LAN/house roads, else the small JPEG paced >= 1 s on the stream road | ffmpeg +5-7% of one core for both; segment 2.000 s, 30 frames, ~370 kbit/s |
+| R4 page diet (#1475) | HLS asks for the master (no `br`), quality changes no longer restart the stream, slider debounce 180 ms -> 1500 ms, camera fetches and the video poll stop while the tab is hidden | - |
+| Road told by the server (#1475) | `const ROAD` from the socket peer / first X-Forwarded-For hop (100./fd7a: = tailnet, 10.89./192.168./127./::1 = lan, else funnel through the door); on the glass and in the DIAG ring; `road_seen` on the report card | the 12:54 phone report now reads tailnet |
+| R6 (#1475) | `/api/sfx/video_mode` handler moved to a thread (`sfx_video_mode_state` -> `sfx_history_rows`, `sfx_db_counts`) | 2.31 s stall before; 43-75 ms after, absent from the pulse |
+| DIAG dot (#1471b) | drag to place (remembered), double-tap hides, returns only in drive mode | headless-verified |
+| Rolodex (#1472) | lines roll their recorded reels and d100s before the words appear; a tap replays roll by roll with each result's line, then the words assemble | headless-verified: 14 lines, 50 drums/dice, 5-roll replay 6.6 s |
+
+**Also found and fixed:** a full-scope link opened through the public door sent its key as a header the door strips, so every token-guarded route answered 401 on that page (`const GUEST = AWAY || ...`).
+
+**Not verified live:** the camera went off the air at 14:34 (its own Wi-Fi stopped beaconing; the same fault as 14:06-14:21), so the low lane and small still were measured during 155 s of live run but the phone's `<video>` road has not been seen on a real iPhone. Whether Safari honours `#EXT-X-START` (the lag model assumes 30 s) is the next DIAG tap's question.
+
+**Incident during the build:** `/stream.m3u8` answered 500 from 14:29:48 to 14:40:49 because the container restarted while `station_stream.py` was mid-edit; the mp3 road served throughout. Fixed by a restart once the file was complete.

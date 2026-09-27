@@ -102,6 +102,12 @@
     return '';
   }
   function road() {
+    /* #1475: the station tells the page which road it came in on
+     * (tailnet / lan / house / funnel); the hostname guess is the
+     * fallback for a page served without it. */
+    try {
+      if (typeof window.PINE_ROAD === 'string' && window.PINE_ROAD) return window.PINE_ROAD;
+    } catch (e) {}
     var h = '';
     try { h = String(location.hostname || ''); } catch (e) {}
     if (/\.ts\.net$/i.test(h)) return 'funnel';
@@ -502,7 +508,23 @@
     }
     var url = playlistUrl(el, tok);
     url += (url.indexOf('?') >= 0 ? '&' : '?') + '_p=' + Date.now();
-    return timed(url, 8000, 'text').then(function (r) {
+    /* #1475: the station answers the player's URL with an ABR MASTER now.
+     * Its entries are variant playlists, not segments - time the master,
+     * then follow one variant (64k when listed) and time ITS segments. */
+    function variantOf(r) {
+      var text = String(r.text || '');
+      if (text.indexOf('#EXT-X-STREAM-INF') < 0) return Promise.resolve(r);
+      var uris = text.split('\n').map(function (ln) { return ln.replace(/\r$/, ''); })
+        .filter(function (ln) { return ln && ln.charAt(0) !== '#'; });
+      probe.hls_master = {ms: r.ms, status: r.status, variants: uris.length, url: scrub(url)};
+      if (!uris.length) return Promise.resolve(r);
+      var pick = uris.filter(function (u) { return /\/64[-\/]/.test(u); })[0] || uris[0];
+      var vabs;
+      try { vabs = new URL(pick, location.href).href; } catch (e) { vabs = pick; }
+      url = vabs + (vabs.indexOf('?') >= 0 ? '&' : '?') + '_p=' + Date.now();
+      return timed(url, 8000, 'text');
+    }
+    return timed(url, 8000, 'text').then(variantOf).then(function (r) {
       var segs = [], target = null, seq = null;
       String(r.text || '').split('\n').forEach(function (ln) {
         ln = ln.replace(/\r$/, '');
@@ -619,6 +641,7 @@
     var p = report.probe || {}, n = report.now || {}, f = report.five || {};
     var lines = '<h2>Car diagnostics</h2>';
     lines += row('road', report.page.road + ' · ' + report.page.mode);
+    if (result && result.road_seen) lines += row('road (station saw)', esc(String(result.road_seen)));   /* #1475 */
     lines += row('round trip (median of 5)', fmt(p.rtt_med, ' ms'));
     lines += row('throughput (256 KB)', fmt(p.thru_kbps, ' kbit/s'));
     lines += row('buffer ahead', fmt(n.ahead, ' s', 1));

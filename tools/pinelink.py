@@ -8,18 +8,25 @@ two radios, so this holds the camera on the spare one (`wlx…`) while
 `wlP9s9` keeps 10.89.1.246 and the broadcast. That asymmetry is the whole
 reason the link lives here and not on the tablet.
 
-One ffmpeg, one input, four outputs:
+One ffmpeg, one input, six outputs:
 
     rtsp://192.168.1.254:554/live  (h264 848x480, the preview substream)
       ├─ HLS   → data/pinelink/live/index.m3u8   what the house watches
       ├─ mp4   → data/pinelink/clips/<stamp>.mp4  what is kept
       ├─ jpeg  → data/pinelink/frame.jpg          the corner preview, 4 fps
-      └─ TS    → udp://127.0.0.1:18081            the picture AS IT ARRIVES,
-                 served by TsDoor at http://10.89.1.246:8098/live.ts
+      ├─ TS    → udp://127.0.0.1:18081            the picture AS IT ARRIVES,
+      │          served by TsDoor at http://10.89.1.246:8098/live.ts
+      ├─ jpeg  → data/pinelink/frame_small.jpg    the phone's still: 424 wide,
+      │          2 fps, ~10 KB                    (#1474)
+      └─ HLS   → data/pinelink/low/index.m3u8    the phone's picture: h264
+                 RE-ENCODED, 424x240, 15 fps, 350 kbit/s  (#1474)
 
-All but the still are `-c copy`. The camera already hands over h264, so nothing is
-re-encoded: no GPU, no quality loss, and a recording that is byte-identical
-to what was broadcast. The 4K H.265 never comes down this pipe - it stays
+All but the stills and the low lane are `-c copy`. The camera already hands
+over h264, so what the house watches and what is kept are not re-encoded:
+no GPU, no quality loss, and a recording that is byte-identical to what was
+broadcast. The low lane is the one re-encode, for the phone, and it is
+there for a measured reason - see ffmpeg_cmd(). The 4K H.265 never comes
+down this pipe - it stays
 on the camera's card and is fetched over its HTTP server afterwards. 4K
 over a 10 m camera AP into a live broadcast would be a bad trade even if it
 worked.
@@ -52,6 +59,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 OUT = ROOT / "data" / "pinelink"
 LIVE = OUT / "live"
+LOW = OUT / "low"               # #1474: the phone's low-bitrate lane
 CLIPS = OUT / "clips"
 STATE = OUT / "state.json"
 PREF = ROOT / "data" / "pinelink_pref.json"
@@ -80,6 +88,18 @@ STATION_IF = "wlP9s9"           # holds 10.89.1.246 - never touched
 SPARE_IF = "wlx984827b6b478"
 # #1388: how long without a new frame before the link is declared gone.
 FRAME_STALL_S = 20.0
+# #1474: the phone's two outputs. One set of numbers, so the ffmpeg
+# command and the state file can never disagree about what the lane is.
+SMALL_W = 424                   # frame_small.jpg width; height follows
+LOW_SIZE = (424, 240)           # the low lane, from 848x480 halved
+LOW_FPS = 15
+LOW_KBPS = 350                  # what the tailnet road (2-5 Mbit/s) carries
+LOW_MAXRATE_K = 420
+LOW_BUFSIZE_K = 700
+# How stale each file may be before say() reads it as not being written:
+# the playlist is rewritten at every 2 s segment, the still twice a second.
+LOW_FRESH_S = 8.0
+SMALL_FRESH_S = 5.0
 # #1359: the TP-Link Archer T2U PLUS (RTL8821AU) that IS the spare
 # radio. Used only to find it on the USB bus for a reset, and matched
 # exactly - never as a prefix.
@@ -159,6 +179,32 @@ def run(cmd: list[str], timeout: float = 30.0) -> tuple[int, str]:
         return 1, str(err)
 
 
+def phone_lanes() -> dict:
+    """#1474: the two outputs the phone reads, and whether each is being
+    written NOW. The station passes every key of the state file through
+    /api/pinelink/state, so this is how a phone learns the low lane is
+    there without being able to see a directory. mtime is the reading -
+    the playlist moves at every segment, the small still twice a second.
+    A missing file reads `ok: false` and nothing else: this is called
+    from say(), and say() must never fail."""
+    now = time.time()
+
+    def fresh(path: Path, within: float) -> bool:
+        try:
+            return now - path.stat().st_mtime < within
+        except Exception:  # noqa: BLE001
+            return False
+    return {
+        "low": {"path": "/api/pinelink/low/index.m3u8",
+                "ok": fresh(LOW / "index.m3u8", LOW_FRESH_S),
+                "kbps": LOW_KBPS, "size": "%dx%d" % LOW_SIZE,
+                "fps": LOW_FPS},
+        "frame_small": {"path": "/api/pinelink/frame.jpg?w=%d" % SMALL_W,
+                        "ok": fresh(OUT / "frame_small.jpg",
+                                    SMALL_FRESH_S)},
+    }
+
+
 def say(state: str, **more) -> None:
     """One state file, written whole. The station reads this; it never
     reads the process table, so a stale file is a lie and the only defence
@@ -171,6 +217,12 @@ def say(state: str, **more) -> None:
               else {"ok": False, "port": TS_HTTP_PORT, "path": "/live.ts"})
     except Exception:  # noqa: BLE001
         ts = {"ok": False}
+    # #1474: the phone's two files travel the same way, for the same
+    # reason - and under the same rule: nothing here may stop the write.
+    try:
+        lanes = phone_lanes()
+    except Exception:  # noqa: BLE001
+        lanes = {"low": {"ok": False}, "frame_small": {"ok": False}}
     try:
         OUT.mkdir(parents=True, exist_ok=True)
         STATE.write_text(json.dumps({
@@ -180,7 +232,8 @@ def say(state: str, **more) -> None:
             # joined yet" without being able to see a radio.
             # #1250b: how the last stream ended travels with every
             # other reading, so no surface has to ask a second door.
-            **_LAST_SEEN, "stream": dict(_STREAM), "ts": ts, **more},
+            **_LAST_SEEN, "stream": dict(_STREAM), "ts": ts, **lanes,
+            **more},
             indent=2))
     except Exception:  # noqa: BLE001
         pass
@@ -518,7 +571,10 @@ def camera_awake() -> bool:
 
 
 def trim_old() -> int:
-    """Two days of clips, like every other ledger on this box."""
+    """Two days of clips, like every other ledger on this box.
+
+    Clips ONLY. live/ and low/ (#1474) are HLS windows that ffmpeg
+    trims itself with delete_segments; nothing here may touch them."""
     gone = 0
     floor = time.time() - KEEP_HOURS * 3600.0
     try:
@@ -637,6 +693,48 @@ def ffmpeg_cmd() -> list[str]:
         "-f", "mpegts", "-muxdelay", "0", "-muxpreload", "0",
         "-mpegts_flags", "+resend_headers", "-pat_period", "0.1",
         "udp://%s:%d?pkt_size=1316" % (TS_UDP_HOST, TS_UDP_PORT),
+        # #1474: THE PHONE. Measured 2026-09-27 through the Tailscale
+        # Funnel: one 40 KB frame.jpg took 4.9-6.3 s to arrive, so the
+        # phone saw the camera at 0.2 fps - and the copy lane above is
+        # 1.67 Mbit/s, which the funnel cannot carry at all. The tailnet
+        # road is 2-5 Mbit/s and CAN carry ~350 kbit/s. So the same
+        # ffmpeg gets two more outputs, both cut to the phone's size.
+        # Filters are per OUTPUT in ffmpeg: a `-vf` reaches only the
+        # file that follows it, exactly as fps=4 above reaches only
+        # frame.jpg, so the two scales below never meet.
+        #
+        # ...a small still, 424 wide and ~10 KB, twice a second - the
+        # station serves it as /api/pinelink/frame.jpg?w=424. Same
+        # in-place rewrite as frame.jpg, same end-of-image check at the
+        # door. A quarter of the bytes is what turns 0.2 fps into ~1.
+        "-map", "0:v", "-vf", "fps=2,scale=%d:-2" % SMALL_W, "-q:v", "8",
+        "-f", "image2", "-update", "1", "-y", str(OUT / "frame_small.jpg"),
+        # ...and a LOW LANE: h264 again, but RE-ENCODED at 424x240, 15
+        # fps, 350 kbit/s, as 2 s HLS. The one re-encode in this file,
+        # and it is here because no `-c copy` can be made smaller.
+        # libx264 veryfast + zerolatency costs a fraction of one of
+        # twenty cores and needs no GPU; the decode is already paid for
+        # by frame.jpg (one decoder feeds every output). Baseline 3.1 +
+        # yuv420p is what a phone decodes in hardware, and iOS plays HLS
+        # natively in a <video playsinline muted> with no library at
+        # all - the very thing the house's Chromium could not do.
+        # A keyframe every 30 frames is every 2 s is one per segment,
+        # and sc_threshold 0 so a scene cut cannot move it: every
+        # segment then opens on a keyframe and independent_segments says
+        # so. Eight entries is 16 s of list for a phone on a lossy road.
+        # ffmpeg deletes its own segments here; trim_old() never looks.
+        "-map", "0:v", "-c:v", "libx264", "-preset", "veryfast",
+        "-tune", "zerolatency", "-profile:v", "baseline", "-level", "3.1",
+        "-pix_fmt", "yuv420p", "-vf", "scale=%d:-2" % LOW_SIZE[0],
+        "-r", str(LOW_FPS), "-b:v", "%dk" % LOW_KBPS,
+        "-maxrate", "%dk" % LOW_MAXRATE_K, "-bufsize", "%dk" % LOW_BUFSIZE_K,
+        "-g", str(LOW_FPS * 2), "-keyint_min", str(LOW_FPS * 2),
+        "-sc_threshold", "0",
+        "-f", "hls", "-hls_time", "2", "-hls_list_size", "8",
+        "-hls_flags", "delete_segments+append_list+omit_endlist"
+                      "+independent_segments",
+        "-hls_segment_filename", str(LOW / "low%05d.ts"),
+        str(LOW / "index.m3u8"),
     ]
 
 
@@ -939,6 +1037,7 @@ def supervise(once: bool = False) -> None:
         print("REFUSING: the station's radio is not where it should be.")
         sys.exit(2)
     LIVE.mkdir(parents=True, exist_ok=True)
+    LOW.mkdir(parents=True, exist_ok=True)              # #1474
     CLIPS.mkdir(parents=True, exist_ok=True)
     # The TS door opens once, here, and is never restarted: ffmpeg comes
     # and goes underneath it. A door that cannot open must not cost the
