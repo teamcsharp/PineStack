@@ -168177,7 +168177,7 @@ async def _comfy_workshop_render_payload(payload: dict[str, Any]) -> dict[str, A
                   if payload.get("steps_override") is not None else int(_prof["steps"]))
     noise_seed = comfy_workshop.render_seed(payload.get("seed"))
     final_prompt = comfy_workshop.compose_prompt(
-        prompt, speech, media_kind, mode)
+        prompt, speech, media_kind, mode, seconds=frame_count / 24.0)   # [h3-free-wins] timed shots
     try:
         graph = comfy_workshop.build_workflow(
             final_prompt, mode=mode, upload_name=upload_name,

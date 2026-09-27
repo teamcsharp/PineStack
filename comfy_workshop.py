@@ -21,7 +21,20 @@ VIDEO_VAE = "minimax_h3_video_vae_fp16.safetensors"
 AUDIO_VAE = "minimax_h3_audio_vae_fp32.safetensors"
 TURBO_LORA = "minimax_h3_turbo_v4_step600_ema.safetensors"
 
-FRAME_CHOICES = (73, 124, 169, 241, 289, 361)  # about 3, 5, 7, 10, 12, 15 seconds
+# [h3-free-wins] H3 takes clip lengths on a 17n+5 lattice at 24 fps (5, 22,
+# 39, ... 73, 124, 175, 243, 294, 362). 169, 241, 289 and 361 were off it and
+# the node snapped them silently; these are exact: about 3, 5, 7, 10, 12, 15 s.
+FRAME_LATTICE = 17
+FRAME_CHOICES = (73, 124, 175, 243, 294, 362)
+
+
+def lattice_frames(value: Any) -> int:
+    """The nearest length on H3's 17n+5 lattice (never below 5)."""
+    try:
+        wanted = int(value)
+    except (TypeError, ValueError):
+        wanted = FRAME_CHOICES[0]
+    return max(5, FRAME_LATTICE * int(round((wanted - 5) / FRAME_LATTICE)) + 5)
 STEP_CHOICES = (4, 6, 8, 12)
 
 # [h3-quality] THE QUALITY PROFILE. "for H3, double the quality settings ...
@@ -33,12 +46,24 @@ STEP_CHOICES = (4, 6, 8, 12)
 # pixels the sampler holds, which is why `double` caps the length and why
 # quality_for_box() steps down when the box is hot or short of room.
 PRESETS = {
-    "standard": {"preset": "standard", "steps": 4, "width": 640, "height": 384, "max_frames": 361},
-    "balanced": {"preset": "balanced", "steps": 6, "width": 960, "height": 576, "max_frames": 289},
-    "double": {"preset": "double", "steps": 8, "width": 1280, "height": 768, "max_frames": 241},
+    "standard": {"preset": "standard", "steps": 4, "width": 640, "height": 384, "max_frames": 362},
+    "balanced": {"preset": "balanced", "steps": 6, "width": 960, "height": 576, "max_frames": 294},
+    "double": {"preset": "double", "steps": 8, "width": 1280, "height": 768, "max_frames": 243},
 }
 QUALITY = dict(PRESETS["double"])
 SIZE_MIN, SIZE_MAX = 384, 1536
+
+# [h3-free-wins] EasyCache skips sampler steps whose model output would barely
+# change; the community measures about 1.5x with it. On by default; the A/B
+# and a render that smears motion can turn it off (easycache=False).
+EASYCACHE_ON = True
+EASYCACHE = {"reuse_threshold": 0.2, "start_percent": 0.15, "end_percent": 0.95}
+# The sigma shift every published base-model graph carries (12 on video, 3 on
+# audio) and the sampler pairing the 8-step turbo guides use (euler + beta).
+# Neither is on by default until the A/B on this box says so:
+# QUALITY["shift"] = [12, 3]; QUALITY["sampler"] = "euler"; QUALITY["scheduler"] = "beta".
+SAMPLER_CHOICES = ("turbo", "euler", "euler_ancestral", "dpmpp_2m", "res_multistep")
+SCHEDULER_CHOICES = ("simple", "beta", "normal", "sgm_uniform")
 MODES = frozenset({"text", "frame", "reference"})
 MEDIA_KINDS = frozenset({"", "image", "video", "audio"})
 VIDEO_RENDER_INTERVAL_MIN_S = 60.0
@@ -158,8 +183,9 @@ def set_quality(profile: Any) -> dict[str, Any]:
         return dict(QUALITY)
     preset = str(profile.get("preset") or "").strip().lower()
     fields = ("steps", "width", "height", "max_frames")
+    explicit = fields + ("shift", "sampler", "scheduler", "easycache")
     base = dict(PRESETS.get(preset) or QUALITY)
-    if preset in PRESETS and not any(k in profile for k in fields):
+    if preset in PRESETS and not any(k in profile for k in explicit):
         QUALITY.clear()
         QUALITY.update(base)
         return dict(QUALITY)
@@ -174,6 +200,19 @@ def set_quality(profile: Any) -> dict[str, Any]:
         out["steps"] = clamp_steps(profile["steps"])
     if "max_frames" in profile:
         out["max_frames"] = clamp_frames(profile["max_frames"])
+    # [h3-free-wins] the graph knobs the A/B compares; a preset name clears them
+    if "shift" in profile:
+        shift = profile.get("shift")
+        try:
+            out["shift"] = [round(float(shift[0]), 2), round(float(shift[1]), 2)] if shift else None
+        except (TypeError, ValueError, IndexError):
+            out["shift"] = None
+    if "sampler" in profile:
+        out["sampler"] = str(profile.get("sampler") or "turbo") if str(profile.get("sampler") or "turbo") in SAMPLER_CHOICES else "turbo"
+    if "scheduler" in profile:
+        out["scheduler"] = str(profile.get("scheduler") or "simple") if str(profile.get("scheduler") or "simple") in SCHEDULER_CHOICES else "simple"
+    if "easycache" in profile:
+        out["easycache"] = bool(profile.get("easycache"))
     out["preset"] = "custom"
     for name, known in PRESETS.items():
         if all(out.get(k) == known[k] for k in fields):
@@ -225,9 +264,39 @@ def render_seed(value: Any = None) -> int:
         return secrets.randbits(63)
 
 
+def shot_list(seconds: float, said: str, subject: str = "<Subject 1>", source: str = "<Video 1>") -> list[str]:
+    """[h3-free-wins] Three timed shots the way H3's 32B text encoder reads a
+    brief: establishing, the performance with the spoken line, the sign-off.
+    Timecodes keep the pacing from turning into a slideshow (fal's guide);
+    without a known length the shots are still ordered, just untimed."""
+    try:
+        total = float(seconds or 0)
+    except (TypeError, ValueError):
+        total = 0.0
+    if total >= 3.0:
+        a = round(max(0.8, total * 0.25), 1)
+        b = round(max(a + 1.0, total * 0.8), 1)
+        t1, t2, t3 = f"[0 to {a:g} seconds]", f"[{a:g} to {b:g} seconds]", f"[{b:g} to {total:g} seconds]"
+    else:
+        t1, t2, t3 = "[Shot 1]", "[Shot 2]", "[Shot 3]"
+    perform = (f"{subject} (S1), direct to camera, says clearly, naturally and exactly once: <d>[English] {said}</d>. "
+               "The sentence completes inside this shot; no other intelligible speech."
+               if said else f"{subject} performs the action naturally, direct to camera, without required spoken dialogue.")
+    return [
+        f"{t1} Establishing: {subject} in place, the camera language and motion of {source}, natural movement; no speech yet.",
+        f"{t2} The performance: {perform}",
+        f"{t3} Sign-off: {subject} lands the beat with a small, satisfied gesture and holds for the cut; no on-screen text.",
+    ]
+
+
 def compose_prompt(prompt: str, speech: str = "", media_kind: str = "",
-                   mode: str = "text") -> str:
-    """Build H3's reference-aware prompt, including an exact dialogue contract."""
+                   mode: str = "text", seconds: float = 0.0) -> str:
+    """Build H3's reference-aware prompt, including an exact dialogue contract.
+
+    [h3-free-wins] The brief reads like production paperwork: a role for
+    every reference, timecoded shots, the sound directed as deliberately as
+    the picture, constraints, and ONE style term (two styles make H3 pick
+    one at random per generation)."""
     clean = " ".join(str(prompt or "").split())[:900]
     # Dialogue markup is model syntax, not user-authored HTML.  Strip any
     # accidental tags before placing the source line inside H3's <d> block.
@@ -258,6 +327,7 @@ def compose_prompt(prompt: str, speech: str = "", media_kind: str = "",
             dialogue = ("<Subject 1> (S1) performs the action naturally without any "
                         "required spoken dialogue.")
             soundscape = "Natural diegetic sound and quiet room tone only."
+        shots = shot_list(seconds, said)
         return "\n".join((
             "subject_definitions:",
             "<Subject 1> is the primary visible performer in <Video 1>.",
@@ -268,16 +338,24 @@ def compose_prompt(prompt: str, speech: str = "", media_kind: str = "",
             "Create one continuous polished Pine Box FM commercial performance that "
             "retains the identity, camera language, and motion of <Video 1> while "
             "producing new synchronized speech.",
+            "", "style:", "polished broadcast commercial - one style only, no second style.",
             "", "retention_analysis:",
             "<Subject 1>: preserve the visible person's identity, facial features, "
-            "body language, and performance energy from <Video 1>.",
+            "hair, clothing, body language, and performance energy from <Video 1>.",
             "<Video 1>: preserve its visual identity, camera movement, and temporal rhythm.",
             "<Audio 1>: reference only for timbre, cadence, and room character; do not copy source words.",
             "", "detailed_description:",
-            f"[Shot 1] {visual}. {dialogue}",
+            f"Scene: {visual}.",                     # the line itself is in the performance shot, once
+            *shots,
+            "", "audio_direction:",
+            "Only <Subject 1>'s voice, in the timbre and cadence of <Audio 1>; the room tone of <Video 1> "
+            "under it; clothing and movement sounds where the picture shows them; no other voices.",
             "", "overall_soundscape:", soundscape,
             "", "non_diegetic_music:", "No background music.",
-        ))[:2600]
+            "", "constraints:",
+            "No subtitles. No captions. No logos. No on-screen text. No second style. "
+            "Preserve <Subject 1>'s identity exactly. The scripted line is spoken once and completes.",
+        ))[:3400]
 
     lead = clean or "A concise cinematic station ident"
     if use_mode == "reference":
@@ -289,7 +367,16 @@ def compose_prompt(prompt: str, speech: str = "", media_kind: str = "",
             lead = f"Use <Audio 1> as the sound reference. {lead}"
     if said:
         lead += f" The presenter says exactly once: <d>[English] {said}</d>."
-    return lead[:2600]
+    # [h3-free-wins] timed shots, sound and constraints for the text and frame roads too
+    subject = "<Picture 1>'s subject" if (use_mode == "reference" and kind == "image") or use_mode == "frame" else "the presenter"
+    source = "<Picture 1>" if subject.startswith("<Picture") else "the scene"
+    shots = shot_list(seconds, said, subject=subject, source=source)
+    return "\n".join((
+        lead, "", "style:", "polished broadcast commercial - one style only.",
+        "", "shots:", *shots,
+        "", "audio_direction:", "One voice only, close and clear; natural room tone; no music; no other voices.",
+        "", "constraints:", "No subtitles. No captions. No logos. No on-screen text. No second style.",
+    ))[:3400]
 
 
 def _base_graph(prompt: str, frames: int, steps: int,
@@ -334,7 +421,8 @@ def _base_graph(prompt: str, frames: int, steps: int,
 def build_workflow(prompt: str, mode: str = "text", upload_name: str = "",
                    media_kind: str = "", frames: Any = 73,
                    steps: Any = None, seed: Any = None, width: Any = None,
-                   height: Any = None, max_frames: Any = None) -> dict[str, Any]:
+                   height: Any = None, max_frames: Any = None, easycache: Any = None,
+                   shift: Any = None, sampler: Any = None, scheduler: Any = None) -> dict[str, Any]:
     """Return an API-format H3 graph for text, first-frame, or reference use.
 
     ``upload_name`` is a name already accepted by ComfyUI's input upload road.
@@ -361,6 +449,25 @@ def build_workflow(prompt: str, mode: str = "text", upload_name: str = "",
     noise_seed = render_seed(seed)
     model = REF2VA_MODEL if use_mode == "reference" else FL2VA_MODEL
     graph = _base_graph(prompt, frame_count, step_count, model, noise_seed)
+    # [h3-free-wins] the model chain after the LoRA: shift (when asked) -> cache (on
+    # by default) -> the guider and the scheduler; the sampler pairing when asked.
+    use_shift = QUALITY.get("shift") if shift is None else shift
+    use_cache = (EASYCACHE_ON if QUALITY.get("easycache") is None else bool(QUALITY.get("easycache"))) if easycache is None else bool(easycache)
+    use_sampler = str(sampler or QUALITY.get("sampler") or "turbo")
+    use_sched = str(scheduler or QUALITY.get("scheduler") or "simple")
+    tail = "5"
+    if use_shift:
+        graph["19"] = {"class_type": "MiniMaxH3SigmaShift", "inputs": {
+            "model": [tail, 0], "shift_video": float(use_shift[0]), "shift_audio": float(use_shift[1])}}
+        tail = "19"
+    if use_cache:
+        graph["18"] = {"class_type": "EasyCache", "inputs": {"model": [tail, 0], "verbose": False, **EASYCACHE}}
+        tail = "18"
+    graph["7"]["inputs"]["model"] = [tail, 0]
+    graph["8"]["inputs"]["model"] = [tail, 0]
+    graph["8"]["inputs"]["scheduler"] = use_sched if use_sched in SCHEDULER_CHOICES else "simple"
+    if use_sampler != "turbo" and use_sampler in SAMPLER_CHOICES:
+        graph["9"] = {"class_type": "KSamplerSelect", "inputs": {"sampler_name": use_sampler}}
 
     if use_mode in {"text", "frame"}:
         inputs: dict[str, Any] = {
