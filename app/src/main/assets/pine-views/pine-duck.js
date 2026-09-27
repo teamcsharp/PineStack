@@ -47,9 +47,26 @@
   var CEILING_MS = 90000;
   var SWEEP_MS = 500;
 
+  /* [duck-popup] "a popup should never have its audio ducked. I need to hear
+     the popup." Media inside a popup is the thing being listened to: a
+     dialog, a modal, the element any hold was opened with (the gallery's
+     own video sat inside the very sheet that ducked it, at 5%), or anything
+     marked data-pine-duck="exempt". The broadcast's players are in none. */
+  var POPUP = '[role="dialog"], dialog, [aria-modal="true"], [data-pine-duck="exempt"]';
+  function inPopup(node) {
+    try { if (node.closest && node.closest(POPUP)) return true; } catch (err) { /* old engine */ }
+    for (var k in holds) {
+      var h = holds[k];
+      if (!h || !h.el || h.el === doc.body || h.el === doc.documentElement) continue;
+      try { if (h.el.contains && h.el.contains(node)) return true; } catch (err2) { /* gone */ }
+    }
+    return false;
+  }
+
   function isOurs(node) {
     if (!node || typeof node.volume !== 'number') return false;
     if (node.closest && node.closest('#sampler, .pb-sampler')) return false;
+    if (inPopup(node)) return false;                                /* [duck-popup] */
     return true;
   }
 
@@ -79,6 +96,14 @@
   /* Bring every element to `lvl`. An element already on the list keeps
    * its remembered `was`; a new one is remembered now. */
   function apply(lvl) {
+    /* [duck-popup] anything lowered earlier that now sits in a popup goes back */
+    for (var j = lowered.length - 1; j >= 0; j -= 1) {
+      var was = lowered[j];
+      if (was.node && inPopup(was.node)) {
+        try { if (Math.abs(was.node.volume - was.set) <= 0.001) was.node.volume = was.was; } catch (err) { /* gone */ }
+        lowered.splice(j, 1);
+      }
+    }
     var list = nodes();
     for (var i = 0; i < list.length; i += 1) {
       var node = list[i];
