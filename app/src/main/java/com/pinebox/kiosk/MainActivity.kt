@@ -14,7 +14,6 @@ import android.os.Bundle
 import android.os.SystemClock
 import android.util.Log
 import android.view.View
-import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.PixelCopy
 import android.os.Handler
@@ -310,39 +309,13 @@ class MainActivity : AppCompatActivity() {
         webView.postDelayed(guard, TIMER_GUARD_MS)
     }
 
-    // 2026-09-14: THE KEY CHORD. "if I press the lock button and the volume
-    // up button, I would like to take a picture of the screen and then also
-    // file a Pine report and dictate a message." Android keeps the power key
-    // for itself - an app never sees it - so the chord is volume-up pressed
-    // TWICE within 700 ms. The first press still changes the volume (it is
-    // let through); the second is taken, the window is copied with
-    // PixelCopy, and the page's PineReport.fromKey gets the picture: a flash,
-    // the pad, and the dot listening.
-    private var volumeUpAt = 0L
-
-    override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
-        if (keyCode == KeyEvent.KEYCODE_VOLUME_UP && event != null && event.repeatCount == 0) {
-            val now = SystemClock.elapsedRealtime()
-            if (now - volumeUpAt < 700L) {
-                volumeUpAt = 0L
-                reportShot()
-                return true
-            }
-            volumeUpAt = now
-        }
-        return super.onKeyDown(keyCode, event)
-    }
-
-    private fun reportShot() {
-        shootScreen { shot ->
-            /* An empty string when the copy failed, as before: the page's
-             * fromKey opens the pad without a picture rather than not at
-             * all. */
-            val js = "window.PineReport && PineReport.fromKey(" +
-                com.pinebox.kiosk.bridge.BridgeEnvelope.quote(shot?.dataUrl ?: "") + ")"
-            runOnUiThread { webView.evaluateJavascript(js, null) }
-        }
-    }
+    // 2026-09-28: THE VOLUME-UP CHORD IS GONE. It took a picture of the screen
+    // and opened a Pine report whenever volume-up was pressed twice within
+    // 700 ms (2026-09-14), and the operator asked for it removed: "get rid of
+    // the feature that makes it take screen caps whenever the volume up
+    // button is pressed." Volume-up is only volume now. The report's picture
+    // still comes from the top-left corner swipe (hot-corners.js ->
+    // bridge.screenShot -> shootScreen below), which is a separate road.
 
     /** One picture of the window, ready for a page: a data URL and its size. */
     data class Shot(val dataUrl: String, val w: Int, val h: Int)
@@ -1627,7 +1600,15 @@ class MainActivity : AppCompatActivity() {
                     drawer.closeDrawer(railHost)
                     return
                 }
-                if (webView.canGoBack()) webView.goBack()
+                // #1450's rule: an overlay on the page has its own ways out, and BACK is
+                // one of them. The page closes its topmost overlay (the line-actions
+                // sheet, the SFX TV, a dropdown, the video window) through
+                // window.pineBack(); only with nothing open does BACK walk history.
+                webView.evaluateJavascript(
+                    "(function(){try{return !!(window.pineBack&&window.pineBack());}catch(e){return false;}})()"
+                ) { closed ->
+                    if (closed != "true" && webView.canGoBack()) webView.goBack()
+                }
             }
         })
     }

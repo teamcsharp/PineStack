@@ -509,10 +509,10 @@
       var style = document.createElement('link');
       style.id = 'spS3Style';
       style.rel = 'stylesheet';
-      style.href = techUrl('/system3/system3.css?v=6');
+      style.href = techUrl('/system3/system3.css?v=7');
       document.head.appendChild(style);
     }
-    import(techUrl('/system3/system3.js?v=6')).then(function (mod) {
+    import(techUrl('/system3/system3.js?v=7')).then(function (mod) {
       return mod.openSystem3({request: s3Request, tab: tab || 'tables',
         onClose: function () { s3WindowOpen = null; }});
     }).then(function (view) { s3WindowOpen = view; }).catch(function (err) {
@@ -4179,10 +4179,10 @@
           var style = document.createElement('link');
           style.id = 'spS3Style';
           style.rel = 'stylesheet';
-          style.href = techUrl('/system3/system3.css?v=6');
+          style.href = techUrl('/system3/system3.css?v=7');
           document.head.appendChild(style);
         }
-        var mod = await import(techUrl('/system3/system3.js?v=6'));
+        var mod = await import(techUrl('/system3/system3.js?v=7'));
         pane.textContent = '';
         var box = make('div', 'sp-s3-host');
         pane.appendChild(box);
@@ -4802,6 +4802,10 @@
     Promise.resolve(api().post('/api/script/line/replay',
       {line_id: lid, block: (segShown && segShown.block) || 0})).then(function (got) {
         segReplaying = '';
+        /* [s3-script-linear] the operator put THIS line back on the air:
+           if the station names it by its old id, the mark may go back up
+           to it - that line only, for the next minute. */
+        linearAllowUp('replay', 60000, lid);
         card.classList.remove('sp-segsending');
         card.classList.add('sp-segsaid');
         setTimeout(function () { card.classList.remove('sp-segsaid'); }, 2600);
@@ -9697,6 +9701,9 @@
           occurrence_id: lastGood.occurrence_id, position: lastGood.position,
           media: lastGood.media, at_ms: lastGood.at} : null},
       scroll: {owner: scrollOwner, at_ms: scrollAt, moves: scrollLog.slice(-12)},
+      /* [s3-script-linear] where the page froze, what it relocated under
+         the mark, and every time the mark refused to go back up. */
+      linear: linearSnapshot(),
       /* [#1189] HOW THE MARK WAS PLACED, so the next capture explains
          itself: the decision that stands, the ring of decisions before it,
          what was expected and what was carried, and the station's verdict. */
@@ -10284,6 +10291,9 @@
       seek.addEventListener('input', function () {
         var p = player();
         if (!p || !isFinite(p.duration) || !p.duration) return;
+        /* [s3-script-linear] a hand on the playhead is an explicit step:
+           for a moment the ON AIR mark may follow it back up the page. */
+        linearAllowUp('seek', 15000);
         p.currentTime = (Number(seek.value) / 1000) * p.duration;
       });
     }
@@ -10295,7 +10305,10 @@
     if (dot) dot.addEventListener('click', function (ev) { ev.stopPropagation(); mixerOpen(); });
     var prev = el('spPrev');
     var next = el('spNext');
-    if (prev) prev.addEventListener('click', function () { api().post('/api/dj/prev', {}); });
+    if (prev) prev.addEventListener('click', function () {
+      linearAllowUp('back', 20000);                          /* [s3-script-linear] */
+      api().post('/api/dj/prev', {});
+    });
     if (next) next.addEventListener('click', function () { api().post('/api/dj/next', {}); });
     var art = el('spArt');
     if (art) {
@@ -10583,6 +10596,7 @@
     }
     var added = 0;
     var want = [];
+    var feedUp = Object.create(null);                        /* [s3-script-linear] */
     for (var i = 0; i < rows.length; i += 1) {
       var row = rows[i];
       var id = String((row && row.id) || '');
@@ -10597,10 +10611,24 @@
         feedDress(node, row);
       }
       node.pineAt = Number(row.air_at || row.ts || 0);
+      if (row.aired === 'prepared') feedUp[id] = 1;
       want.push(node);
     }
     if (want.length) {
       want.sort(function (a, b) { return a.pineAt - b.pineAt; });
+      /* [s3-script-linear] THE SAME RULE AS THE SCRIPT, ON THE THREAD.
+       *
+       * "one message after another like a script or a text message.
+       *  Messages never appear above the current message"
+       *
+       * #1279's `air_at` order stands BELOW the row that is airing - a
+       * burst published ahead still sorts itself - but at and above that
+       * row the pane keeps what it drew, and a row stamped earlier than
+       * the airing one arrives directly under it instead of above it.
+       * That still answers #1279: a late interjection is no longer parked
+       * under lines nobody has said yet. No rows are kept past the
+       * station's window here; the feed stays the bounded live surface. */
+      want = feedLinear(want, feedUp);
       /* #1287: an insertBefore on an attached node is a detach and an
          attach, so stitching an already-correct list still takes every
          row out of the document for an instant. Check first: with the
@@ -10704,6 +10732,7 @@
         if (feedLive === oldId) feedLive = '';
       }
     }
+    feedDrawn(over > 0 ? want.slice(over) : want);         /* [s3-script-linear] */
     feedDiceTick();   /* [s3-dice] ask System 3 about the rows that want dice */
     feedSetActiveMarquee(box);
     if (!added && over <= 0) return;
@@ -10902,10 +10931,10 @@
       var style = document.createElement('link');
       style.id = 'spS3Style';
       style.rel = 'stylesheet';
-      style.href = techUrl('/system3/system3.css?v=6');
+      style.href = techUrl('/system3/system3.css?v=7');
       document.head.appendChild(style);
     }
-    import(techUrl('/system3/system3.js?v=6')).then(function (mod) {
+    import(techUrl('/system3/system3.js?v=7')).then(function (mod) {
       return mod.openRoll({request: s3Request, conversationId: info.conversation_id,
         eventId: roll ? String(roll.event_id || '') : '', turnId: info.turn_id, lineId: id});
     }).catch(function (err) {
@@ -11157,11 +11186,59 @@
   function markFeedLive(id) {
     var want = String(id || '');
     if (want === feedLive) return;
+    /* [s3-script-linear] and it only moves down the thread: a row drawn
+       above the last one marked airing is refused, as the script's mark
+       refuses it, unless the operator stepped back (linearAllowUp). */
+    if (want && feedLit && feedSeat[want] !== undefined && feedSeat[feedLit] !== undefined
+        && feedSeat[want] < feedSeat[feedLit] && !linearLicensed(want)) return;
     var was = feedLive && feedNodes[feedLive];
     if (was) was.classList.remove('airing');
     feedLive = want;
     var node = want && feedNodes[want];
     if (node) node.classList.add('airing');
+    if (node && feedSeat[want] !== undefined) {
+      feedLit = want;
+      if (!feedHigh || feedSeat[feedHigh] === undefined || feedSeat[want] > feedSeat[feedHigh]) {
+        feedHigh = want;
+      }
+    }
+  }
+
+  /* [s3-script-linear] THE FEED'S MEMORY OF ITS OWN ORDER: the ids as
+     last drawn, where each stands, the furthest row marked airing
+     (`feedHigh`, where the thread freezes) and the last one (`feedLit`,
+     which a quiet spell does not forget). */
+  var feedOrder = [];
+  var feedSeat = Object.create(null);
+  var feedHigh = '';
+  var feedLit = '';
+
+  function feedLinear(want, up) {
+    var ids = [], byId = Object.create(null);
+    for (var i = 0; i < want.length; i += 1) {
+      var id = String(want[i].getAttribute('data-line') || '');
+      ids.push(id);
+      byId[id] = want[i];
+    }
+    var high = feedSeat[feedHigh] !== undefined ? feedHigh : '';
+    var placed = linearPlace(feedOrder, ids, high,
+      {upcoming: function (k) { return !!up[k]; }});
+    var out = [];
+    for (var j = 0; j < placed.order.length; j += 1) {
+      if (byId[placed.order[j]]) out.push(byId[placed.order[j]]);
+    }
+    return out;
+  }
+
+  function feedDrawn(list) {
+    feedOrder = [];
+    feedSeat = Object.create(null);
+    for (var i = 0; i < list.length; i += 1) {
+      var id = String(list[i].getAttribute('data-line') || '');
+      if (!id || feedSeat[id] !== undefined) continue;
+      feedSeat[id] = feedOrder.length;
+      feedOrder.push(id);
+    }
   }
 
   function eventRow(ev) {
@@ -11564,6 +11641,195 @@
     return (before || []).concat(current || []);
   }
 
+  /* [s3-script-linear] ONE MESSAGE AFTER ANOTHER.
+   *
+   * "authored then executed. But visually it means one message after
+   *  another like a script or a text message. Messages never appear above
+   *  the current message, same with scripts. I need it straightforward and
+   *  linear."
+   *
+   * The screenplay's order is the server's, and the server re-ranks for
+   * reasons this page cannot argue with: a line filed to the ledger after
+   * it aired, hangers re-binned, a call stamped at its start, a record at
+   * `began`, an advert or a memo at `ts`, a restart re-seeding, the hour
+   * turning. #1273 kept the NODES, but every paint still stitched them
+   * into the server's latest order - so a line could land ABOVE the one
+   * being said, and the reader's place moved under them.
+   *
+   * So the page keeps its OWN order at and above the furthest point the
+   * ON AIR mark has reached, and takes the server's order only below it.
+   * This is that rule as arithmetic over element keys - pure, so a test
+   * holds the real thing rather than a copy of it:
+   *
+   *   prev    keys as last drawn, top to bottom
+   *   server  keys the server lists now, in its order
+   *   high    key of the furthest line the mark has reached ('' = none)
+   *   opts.owner(k)     the line a heading/cue belongs to (sc-/sh-/ch-/pa-)
+   *   opts.hangs(k)     the line a NOTE hangs off (notes stay beside it)
+   *   opts.upcoming(k)  true while k is still to air ('prepared')
+   *   opts.keepDropped  keep frozen keys the server stopped listing
+   *   opts.keepMost     ...but at most this many of them, newest kept
+   *
+   *   1. Everything drawn at or above `high` keeps its drawn order.
+   *   2. A key the server now ranks above `high` that is not frozen - new,
+   *      or drawn below the mark before - goes directly BELOW the frozen
+   *      block: first those already drawn down there, then the new ones,
+   *      each group in the server's relative order.
+   *   3. Everything else follows the server's order after that.
+   *   4. A heading or cue whose line is frozen, and which is not frozen
+   *      itself, is not drawn: above the mark it would be a new row, below
+   *      it an orphan. A frozen heading whose line moved travels with it.
+   *   5. A frozen row still to air that the server now places after
+   *      `high` leaves the block, with its cue: upcoming rows belong below
+   *      the mark. (One the server still ranks BEFORE the mark stays put -
+   *      that is a page behind the air, not a row that has not aired.)
+   *   6. A frozen key the server stopped listing stays (keepDropped).
+   *   7. A new NOTE on a frozen line is hung beside that line. It is the
+   *      operator's own marginalia on something already heard, not a
+   *      message in the sequence, and a note parked by the mark would be
+   *      a note about nothing.
+   *
+   * Linear in the size of the lists: two index maps and three passes. */
+  function linearPlace(prev, server, high, opts) {
+    opts = opts || {};
+    prev = prev || [];
+    server = server || [];
+    var owner = typeof opts.owner === 'function' ? opts.owner : null;
+    var hangs = typeof opts.hangs === 'function' ? opts.hangs : null;
+    var upcoming = typeof opts.upcoming === 'function' ? opts.upcoming : null;
+    var out = {order: [], frozen: 0, late: [], dropped: [], skipped: [],
+      freed: [], hung: [], trimmed: 0};
+    var sIx = Object.create(null), pIx = Object.create(null), i, k;
+    for (i = 0; i < server.length; i += 1) {
+      if (sIx[server[i]] === undefined) sIx[server[i]] = i;
+    }
+    for (i = 0; i < prev.length; i += 1) {
+      if (pIx[prev[i]] === undefined) pIx[prev[i]] = i;
+    }
+    var hi = high ? pIx[high] : undefined;
+    var seen = Object.create(null);
+    if (hi === undefined) {
+      /* Nothing has been on air on this page yet: the server's order,
+         exactly as before this rule existed. */
+      for (i = 0; i < server.length; i += 1) {
+        if (seen[server[i]]) continue;
+        seen[server[i]] = 1;
+        out.order.push(server[i]);
+      }
+      return out;
+    }
+    function known(key) {
+      return !!key && (sIx[key] !== undefined || pIx[key] !== undefined);
+    }
+    function ownerOf(key) {
+      var o = owner ? owner(key) : '';
+      return (o && o !== key && known(o)) ? o : '';
+    }
+    function hangOf(key) {
+      var t = hangs ? hangs(key) : '';
+      return (t && t !== key && known(t)) ? t : '';
+    }
+    /* Where the server ranks the mark. When the mark's own row has left
+       the server's page, the nearest frozen row above it that is still
+       listed stands in for it. */
+    var bound = sIx[high];
+    if (bound === undefined) {
+      bound = -1;
+      for (i = hi - 1; i >= 0; i -= 1) {
+        if (sIx[prev[i]] !== undefined) { bound = sIx[prev[i]]; break; }
+      }
+    }
+    var frozen = Object.create(null);
+    for (i = 0; i <= hi; i += 1) frozen[prev[i]] = 1;
+    /* Rule 5: an upcoming row the server now puts after the mark. */
+    if (upcoming) {
+      for (i = 0; i < hi; i += 1) {
+        k = prev[i];
+        if (sIx[k] !== undefined && sIx[k] > bound && upcoming(k)) {
+          delete frozen[k];
+          out.freed.push(k);
+        }
+      }
+    }
+    /* Rules 4 and 5, the other way round: a frozen heading, cue or note
+       whose line is listed and NOT frozen is stranded above the mark -
+       it goes where its line goes. */
+    for (i = 0; i < hi; i += 1) {
+      k = prev[i];
+      if (!frozen[k]) continue;
+      var lead = ownerOf(k) || hangOf(k);
+      if (lead && !frozen[lead] && sIx[lead] !== undefined) {
+        delete frozen[k];
+        out.freed.push(k);
+      }
+    }
+    /* Everything below the mark, in the server's order, sorted into the
+       three places it can go. */
+    var hung = Object.create(null);
+    var late1 = [], late2 = [], rest = [];
+    for (i = 0; i < server.length; i += 1) {
+      k = server[i];
+      if (seen[k]) continue;
+      seen[k] = 1;
+      if (frozen[k]) continue;
+      var own = ownerOf(k);
+      if (own && frozen[own]) { out.skipped.push(k); continue; }       /* rule 4 */
+      var tgt = hangOf(k);
+      if (tgt && frozen[tgt]) {                                         /* rule 7 */
+        (hung[tgt] = hung[tgt] || []).push(k);
+        continue;
+      }
+      if (sIx[k] < bound) {                                             /* rule 2 */
+        var group = own || tgt || k;
+        if (pIx[group] !== undefined || pIx[k] !== undefined) late1.push(k);
+        else late2.push(k);
+      } else {
+        rest.push(k);                                                   /* rule 3 */
+      }
+    }
+    /* The frozen block, as drawn. Rows the server dropped stay (rule 6),
+       bounded from the top so an open desk does not grow for ever. */
+    var gone = 0;
+    if (opts.keepDropped) {
+      for (i = 0; i <= hi; i += 1) {
+        if (frozen[prev[i]] && sIx[prev[i]] === undefined) gone += 1;
+      }
+    }
+    var most = Number(opts.keepMost) > 0 ? Number(opts.keepMost) : Infinity;
+    var cut = gone > most ? gone - most : 0;
+    var block = [];
+    for (i = 0; i <= hi; i += 1) {
+      k = prev[i];
+      if (!frozen[k]) continue;
+      if (sIx[k] === undefined) {
+        if (!opts.keepDropped) continue;
+        if (cut > 0) { cut -= 1; out.trimmed += 1; continue; }
+        out.dropped.push(k);
+      }
+      block.push(k);
+    }
+    /* Notes hang after their line AND after the notes it already had. */
+    for (i = 0; i < block.length; i += 1) {
+      k = block[i];
+      out.order.push(k);
+      var run = hangOf(k) || k;
+      var next = block[i + 1];
+      var nextRun = next ? (hangOf(next) || '') : '';
+      if (nextRun !== run && hung[run]) {
+        for (var h = 0; h < hung[run].length; h += 1) {
+          out.order.push(hung[run][h]);
+          out.hung.push(hung[run][h]);
+        }
+        delete hung[run];
+      }
+    }
+    for (var left in hung) late2 = late2.concat(hung[left]);   /* cannot happen; never lose one */
+    out.frozen = out.order.length;
+    out.late = late1.concat(late2);
+    out.order = out.order.concat(out.late, rest);
+    return out;
+  }
+
   /* Hollywood layout: each element type is its own block, and the CSS does
    * the indenting the way a script does - character centred over dialogue,
    * parentheticals tucked inside it, action full width. */
@@ -11574,20 +11840,197 @@
     lineNodes.clear();
     sceneNodes.clear();
     segmentCounts = Object.create(null);
-    order.forEach(function (node) {
+    order.forEach(function (node, seat) {
       var item = node.pineItem || {};
+      /* [s3-script-linear] where the node stands in the page, so "is this
+         line above the mark?" is one comparison - folded bodies are out of
+         the document, so compareDocumentPosition cannot answer it. */
+      node.pineSeat = seat;
       if (item.line) lineNodes.set(String(item.line), node);
       if (String(item.type || '') === 'scene' && item.seg) {
         sceneNodes.set(String(item.seg), node);
       }
-      if (String(item.type || '') === 'dialogue' && item.seg) {
-        var count = segmentCounts[String(item.seg)] || {lines: 0, seconds: 0};
+      /* [s3-script-linear] counted under the segment the line is DRAWN
+         in; a relocated line belongs to the heading above it now. */
+      var seg = String((node.dataset && node.dataset.seg) || item.seg || '');
+      if (String(item.type || '') === 'dialogue' && seg) {
+        var count = segmentCounts[seg] || {lines: 0, seconds: 0};
         count.lines += 1;
         count.seconds += Number(item.seconds) || 0;
-        segmentCounts[String(item.seg)] = count;
+        segmentCounts[seg] = count;
       }
     });
   }
+
+  /* [s3-script-linear] A heading, subheader, CHARACTER cue or
+     parenthetical is written by the server for the line it introduces and
+     keyed by that line's id (sc-/sh-/ch-/pa-<line>, an insert's ich-<n>
+     for idl-<n>), so its owner is read straight off the key. */
+  function linearOwner(key) {
+    /* lc-<line> / lk-<line>: this page's own cue and continued heading
+       for a relocated line (linearCues). */
+    var m = /^(?:sc|sh|ch|pa|lc|lk)-(.+)$/.exec(String(key || ''));
+    if (m) return 'ln-' + m[1];
+    if (String(key || '').indexOf('ich-') === 0) return 'idl-' + String(key).slice(4);
+    return '';
+  }
+
+  function linearType(node) {
+    return String((node && node.pineItem && node.pineItem.type) || '');
+  }
+
+  function linearVoice(node) {
+    var item = (node && node.pineItem) || {};
+    return String(item.name || item.who || '').trim();
+  }
+
+  /* [s3-script-linear] A RELOCATED LINE IS STILL SAID BY SOMEBODY, IN
+   * SOME SCENE.
+   *
+   * The server writes a CHARACTER cue only where the speaker changes in
+   * ITS order (and after an action or a scene), and a scene heading only
+   * where the round changes in ITS order. A row relocated under the mark
+   * has new neighbours, so, below the mark only - nothing is ever added
+   * above it - the page writes what the server would have written for
+   * the order the page actually shows:
+   *
+   *   - a line owed a cue with none directly above it (a parenthetical or
+   *     a note between does not count) gets one, keyed lc-<line>;
+   *   - when a relocated group opened its own scene and the rows after it
+   *     go back to the scene they belong to, that scene is headed again,
+   *     "(continued)", keyed lk-<line> - or the rest of the conversation
+   *     would read as part of the scene that arrived late.
+   *
+   * Both are kept like any other row once the mark passes them, and
+   * where the server's own cue turns up the page's is not drawn. */
+  function linearCues(order, from, drawn, late) {
+    late = late || {};
+    var out = order.slice(0, from);
+    var voice = '', owed = true;
+    var heads = Object.create(null);      /* server seg -> its heading on the page */
+    var stands = '', moved = false;       /* the scene the page is in; opened by a relocated heading? */
+    var markHead = null;                  /* the heading over the mark */
+    for (var a = 0; a < from; a += 1) {
+      if (linearType(order[a]) !== 'scene') continue;
+      var aItem = order[a].pineItem || {};
+      if (aItem.seg && !aItem.derived) heads[String(aItem.seg)] = order[a];
+      stands = String(aItem.stands || aItem.seg || '');
+      markHead = order[a];
+    }
+    for (var b = from - 1; b >= 0; b -= 1) {
+      var bt = linearType(order[b]);
+      if (bt === 'parenthetical' || bt === 'note' || bt === 'character') continue;
+      if (bt === 'dialogue') { voice = linearVoice(order[b]); owed = false; }
+      break;
+    }
+    for (var i = from; i < order.length; i += 1) {
+      var node = order[i];
+      var type = linearType(node);
+      var seg = String((node.pineItem && node.pineItem.seg) || '');
+      if (type === 'scene') {
+        if (seg) heads[seg] = node;
+        stands = seg;
+        moved = !!late[node.pineKey];
+      } else if (moved && seg && seg !== stands && (heads[seg] || markHead)) {
+        /* Its own heading - or, when that was not drawn because its line
+           is already above the mark, the scene over the mark, which is
+           where the rest of this conversation is being read. */
+        var again = linearAgainNode(node, heads[seg] || markHead);
+        if (again && !drawn[again.pineKey]) {
+          drawn[again.pineKey] = 1;
+          out.push(again);
+          owed = true;
+        }
+        stands = seg;
+        moved = false;
+      }
+      if (type === 'dialogue') {
+        var said = linearVoice(node);
+        var above = '';
+        for (var u = out.length - 1; u >= 0; u -= 1) {
+          above = linearType(out[u]);
+          if (above !== 'parenthetical' && above !== 'note') break;
+        }
+        if (above !== 'character' && said && (owed || said !== voice)) {
+          var cue = linearCueNode(node.pineItem || {});
+          if (cue && !drawn[cue.pineKey]) {
+            drawn[cue.pineKey] = 1;
+            out.push(cue);
+          }
+        }
+        voice = said || voice;
+        owed = false;
+      } else if (type === 'character') {
+        owed = false;
+      } else if (type !== 'parenthetical' && type !== 'note') {
+        owed = true;                     /* a scene, an action: named again after */
+      }
+      out.push(node);
+    }
+    return out;
+  }
+
+  function linearCueNode(item) {
+    var line = String(item.line || '');
+    var name = String(item.name || item.who || '').trim().toUpperCase();
+    if (!line || !name) return null;
+    var key = 'lc-' + line;
+    var node = scriptNodes.get(key);
+    if (!node) {
+      node = scriptBlock({id: key, type: 'character', text: name});
+      node.classList.add('sp-cue-derived');
+      node.title = 'Named here by the page: this line was placed under the'
+        + ' ON AIR mark, away from the cue the station wrote for it';
+      scriptNodes.set(key, node);
+    } else if (node.textContent !== name) {
+      node.textContent = name;
+    }
+    node.pineKey = key;
+    node.pineItem = {id: key, type: 'character', text: name,
+      seg: item.seg || '', derived: true};
+    return node;
+  }
+
+  /* The scene a row belongs to, headed again where the page returns to
+     it. A scene of its own (its own seg), so folding it cannot reach the
+     part of the scene above the mark; it stands for the scene it continues. */
+  function linearAgainNode(row, head) {
+    var rowItem = row.pineItem || {};
+    var was = head.pineItem || {};
+    /* Keyed by the line it heads (a cue's own line), so it freezes and
+       travels with that line the way the server's headings do. */
+    var line = String(rowItem.line || linearOwner(row.pineKey).slice(3)
+      || row.pineKey || '');
+    var key = 'lk-' + line;
+    var item = {id: key, type: 'scene', text: String(was.text || ''),
+      round: was.round || '', at: rowItem.at || was.at || '', seg: key,
+      stands: String(was.stands || was.seg || ''), derived: true};
+    var print = item.text + SEP + String(item.at);
+    var node = scriptNodes.get(key);
+    if (!node) {
+      node = scriptBlock(item);
+      node.classList.add('sp-scene-derived');
+      node.title = 'The scene continues here: rows that arrived late were'
+        + ' placed under the ON AIR mark just above';
+      scriptNodes.set(key, node);
+    } else if (node.pinePrint !== print) {
+      dressScene(node, item);
+    }
+    if (node.pinePrint !== print) {
+      var named = node.querySelector && node.querySelector('.sp-segment-name');
+      if (named) named.textContent = named.textContent + ' (continued)';
+      node.pinePrint = print;
+    }
+    node.pineKey = key;
+    node.pineItem = item;
+    return node;
+  }
+  /* Rows kept above the mark after the server stopped listing them are
+     bounded, oldest first, so a desk left open for a day does not carry
+     every hour it has ever shown. */
+  var LINEAR_KEEP_MAX = 1500;
+  var linearDropped = Object.create(null);  /* keys drawn dimmed: no longer listed */
+  var linearPaint = null;                   /* what the last paint placed, for reports */
 
   function paintScript(page, before) {
     var box = el('spScript');
@@ -11627,16 +12070,30 @@
      * nodes over eight polls, 238 of them identical content that had
      * merely moved. See the patch note for the three things that move
      * it. Nodes are keyed by the server's element id and kept. */
-    if (paintedIn !== box) { scriptNodes.clear(); paintedIn = box; }
+    if (paintedIn !== box) {
+      scriptNodes.clear();
+      paintedIn = box;
+      linearReset();              /* [s3-script-linear] a new page starts clean */
+    }
     markAuditAt = 0;
     markAuditNode = null;
     var anchor = scriptAnchor(box);
     var order = [];
     var wanted = Object.create(null);
+    /* [s3-script-linear] the server's keys in the server's order, which
+       line each note hangs off, and which rows are still to air. */
+    var serverKeys = [];
+    var hangMap = Object.create(null);
+    var upMap = Object.create(null);
+    var lastPlain = '';
     for (var i = 0; i < elements.length; i += 1) {
       var item = elements[i];
       var key = String(item.id || '') || ('ix:' + i);
       wanted[key] = 1;
+      serverKeys.push(key);
+      if (String(item.type || '') === 'note') hangMap[key] = lastPlain;
+      else lastPlain = key;
+      if (item.aired === 'prepared') upMap[key] = 1;
       /* Everything the node's APPEARANCE depends on, so a line revised
          in place is re-dressed rather than rebuilt. */
       var print = String(item.text || '') + SEP + String(item.type || '')
@@ -11667,18 +12124,109 @@
          reading the node later - the strip's hold, for one - should get
          what this line says now. */
       node.pineItem = item;
+      node.pineKey = key;                              /* [s3-script-linear] */
       // Keep evidence attributes in step with a keyed node's current item.
-      ['line', 'seg', 'block', 'ord', 'round', 'at'].forEach(function (field) {
+      /* [s3-script-linear] `seg` is settled below, once the node's place
+         on the page is known. */
+      ['line', 'block', 'ord', 'round', 'at'].forEach(function (field) {
         if (item[field] !== undefined && item[field] !== null) node.dataset[field] = String(item[field]);
         else delete node.dataset[field];
       });
       order.push(node);
     }
+    /* [s3-script-linear] THE PAGE'S ORDER, NOT THE SERVER'S LATEST.
+     *
+     * "Messages never appear above the current message, same with
+     *  scripts."
+     *
+     * `order` above is the server's order. What is drawn is linearPlace()
+     * of it against what was drawn last time and the furthest line the ON
+     * AIR mark has reached: at and above that line nothing moves and
+     * nothing new appears; a late or re-ranked row lands directly under
+     * it, the way a text thread takes a message that arrives late. */
+    var prevKeys = [];
+    for (var p = 0; p < scriptOrder.length; p += 1) {
+      var pk = scriptOrder[p] && scriptOrder[p].pineKey;
+      if (pk && scriptNodes.get(pk) === scriptOrder[p]) prevKeys.push(pk);
+    }
+    var highKey = (linearHigh && linearHigh.pineKey
+      && scriptNodes.get(linearHigh.pineKey) === linearHigh) ? linearHigh.pineKey : '';
+    var placed = linearPlace(prevKeys, serverKeys, highKey, {
+      owner: linearOwner,
+      hangs: function (k) { return hangMap[k] || ''; },
+      upcoming: function (k) { return !!upMap[k]; },
+      keepDropped: true, keepMost: LINEAR_KEEP_MAX});
+    var drawn = Object.create(null);
+    var frozenAt = 0;
+    order = [];
+    for (var o = 0; o < placed.order.length; o += 1) {
+      var placedNode = scriptNodes.get(placed.order[o]);
+      if (!placedNode || drawn[placed.order[o]]) continue;
+      drawn[placed.order[o]] = 1;
+      order.push(placedNode);
+      if (o < placed.frozen) frozenAt = order.length;
+    }
+    var lateKeys = Object.create(null);
+    for (var lk = 0; lk < placed.late.length; lk += 1) lateKeys[placed.late[lk]] = 1;
+    order = linearCues(order, frozenAt, drawn, lateKeys);
     scriptNodes.forEach(function (held, key) {
-      if (wanted[key]) return;
+      /* [s3-script-linear] a row above the mark the server stopped
+         listing is still the row the reader read there. It stays. */
+      if (drawn[key]) return;
       if (held.parentNode === box) held.remove();
+      /* A cue whose line is already drawn above the mark is wanted but
+         not drawn: its node is kept, out of the page, in case the line
+         it names moves back below the mark and needs it again. */
+      if (wanted[key]) return;
       scriptNodes.delete(key);
     });
+    /* [s3-script-linear] THE SEGMENT A ROW IS DRAWN IN.
+       The server gives every element the scene last opened above it in
+       ITS order, which is where the page drew it - until a row is
+       relocated under the mark. Then the heading above it on the page is
+       its segment, or a fold would shut a row the reader can see beside
+       the live line, or open one far above it. Read in page order; a row
+       the server gave no segment keeps none. */
+    var curSeg = '';
+    for (var sg = 0; sg < order.length; sg += 1) {
+      var segNode = order[sg];
+      var segItem = segNode.pineItem || {};
+      var ownSeg = segItem.seg ? String(segItem.seg) : '';
+      var shownSeg = ownSeg;
+      if (String(segItem.type || '') === 'scene') curSeg = ownSeg || curSeg;
+      else if (ownSeg && curSeg) shownSeg = curSeg;
+      if (shownSeg) {
+        if (segNode.dataset.seg !== shownSeg) segNode.dataset.seg = shownSeg;
+      } else if (segNode.dataset.seg !== undefined) {
+        delete segNode.dataset.seg;
+      }
+    }
+    /* [s3-script-linear] dimmed while the server does not list it, and
+       only the rows whose state changed are touched. */
+    var nowDropped = Object.create(null);
+    for (var dk = 0; dk < placed.dropped.length; dk += 1) nowDropped[placed.dropped[dk]] = 1;
+    /* A cue this page derived is never on the server's list; it is dim
+       only when the line it names is. */
+    for (var dc in nowDropped) {
+      if ((dc.indexOf('lc-') === 0 || dc.indexOf('lk-') === 0)
+          && !nowDropped[linearOwner(dc)]) delete nowDropped[dc];
+    }
+    for (var wasKey in linearDropped) {
+      if (nowDropped[wasKey]) continue;
+      var undim = scriptNodes.get(wasKey);
+      if (undim) undim.classList.remove('sp-dropped');
+    }
+    for (var isKey in nowDropped) {
+      if (linearDropped[isKey]) continue;
+      var dim = scriptNodes.get(isKey);
+      if (dim) dim.classList.add('sp-dropped');
+    }
+    linearDropped = nowDropped;
+    linearPaint = {at: Date.now(), high: highKey, frozen: placed.frozen,
+      late: placed.late.length, dropped: placed.dropped.length,
+      skipped: placed.skipped.length, freed: placed.freed.length,
+      hung: placed.hung.length, trimmed: placed.trimmed,
+      late_keys: placed.late.slice(0, 8)};
     bindScriptOrder(order, elements, scriptAsOf);
     /* Settle the final layout before measuring the reader's anchor. New
        rows in an already-finished segment arrive visible; restoring first
@@ -14780,8 +15328,120 @@
     return true;
   }
 
+  /* [s3-script-linear] THE MARK ONLY MOVES DOWN.
+   *
+   * "Messages never appear above the current message."
+   *
+   * The resolver's own monotone guard (PineScriptResolver.resolve, (d))
+   * holds only inside one file. Across files - a line re-aired, a clip the
+   * page placed above, a restart re-seeding - it could name a line higher
+   * up the page and the mark went straight up to it. Now the mark refuses
+   * any line that PRECEDES the one it stands on, unless the operator asked
+   * to go back: "go live"/follow, a seek or a step back on the player, a
+   * replay of a line, or a reset. What was refused is recorded, and the
+   * strip says the air went back - so an audio fault is shown, not hidden
+   * (the audit's point: "Merely preventing a backward visual movement
+   * would hide an audio fault").
+   *
+   * `linearLit` is the node the mark last stood on and survives a quiet
+   * spell, so a gap in the evidence is not a door back up the page.
+   * `linearHigh` is the furthest it has reached; paintScript freezes the
+   * page at and above it. An explicit step back moves the mark, never the
+   * high-water: what was read stays where it was read. */
+  var linearLit = null;
+  var linearHigh = null;
+  var linearLicense = null;           /* {why, id, until}: the operator went back */
+  var linearRefused = null;           /* {id, held, since, at}: the last refusal */
+  var linearRefusals = 0;
+
+  function linearReset() {
+    linearLit = null;
+    linearHigh = null;
+    linearLicense = null;
+    linearRefused = null;
+    linearDropped = Object.create(null);
+  }
+
+  function linearSeat(node) {
+    if (!node) return -1;
+    var at = node.pineSeat;
+    return (typeof at === 'number' && scriptOrder[at] === node) ? at : -1;
+  }
+
+  /* Does `node` stand above `than` on the page? The seat when both have
+     one (a folded body is out of the document but still in scriptOrder);
+     the document's own answer otherwise; and "no" when neither can say,
+     so a page this cannot read is never frozen by it. */
+  function linearBefore(node, than) {
+    if (!node || !than || node === than) return false;
+    var a = linearSeat(node), b = linearSeat(than);
+    if (a >= 0 && b >= 0) return a < b;
+    if (node.isConnected && than.isConnected
+        && typeof node.compareDocumentPosition === 'function') {
+      return !!(node.compareDocumentPosition(than) & 4);   /* FOLLOWING */
+    }
+    return false;
+  }
+
+  /* An operator's explicit step back: for `ms`, the mark may go up - to
+     any line, or only to `id` when one is named (a replay). */
+  function linearAllowUp(why, ms, id) {
+    linearLicense = {why: String(why || 'operator'), id: String(id || ''),
+      until: Date.now() + (Number(ms) > 0 ? Number(ms) : 15000)};
+  }
+
+  function linearLicensed(id) {
+    var l = linearLicense;
+    if (!l) return false;
+    if (Date.now() > l.until) { linearLicense = null; return false; }
+    return !l.id || l.id === String(id || '');
+  }
+
+  function linearStood(node) {
+    if (!node) return;
+    linearLit = node;
+    if (!linearHigh || linearSeat(linearHigh) < 0 || linearBefore(linearHigh, node)) {
+      linearHigh = node;
+    }
+  }
+
+  /* The air named a line above the mark. The mark stays; the refusal is
+     kept for the strip and the incident report. Nothing is re-lit: if the
+     mark had already gone dark, a line that is not sounding is not
+     claimed as ON AIR either. */
+  function linearHold(id, want) {
+    var now = Date.now();
+    var held = String((linearLit && linearLit.dataset && linearLit.dataset.line) || '');
+    if (!linearRefused || linearRefused.id !== String(id)) {
+      linearRefusals += 1;
+      linearRefused = {id: String(id), held: held, since: now, at: now};
+    } else {
+      linearRefused.at = now;
+    }
+    if (linearLit && linearLit.classList && linearLit.classList.contains('sp-now')) {
+      if (held) nowLineId = held;
+      if (linearLit.getAttribute('data-air-back') !== '1') {
+        linearLit.setAttribute('data-air-back', '1');
+      }
+    }
+  }
+
+  function linearSnapshot() {
+    var r = linearRefused, l = linearLicense;
+    return {
+      lit: linearLit ? String((linearLit.dataset && linearLit.dataset.line) || linearLit.pineKey || '') : '',
+      high: linearHigh ? String(linearHigh.pineKey || (linearHigh.dataset && linearHigh.dataset.line) || '') : '',
+      refusals: linearRefusals,
+      refused: r ? {id: r.id, held: r.held, since_ms: r.since, at_ms: r.at} : null,
+      license: (l && Date.now() <= l.until) ? {why: l.why, id: l.id, until_ms: l.until} : null,
+      paint: linearPaint};
+  }
+
   var markAuditAt = 0;
   var markAuditNode = null;
+  /* [s3-script-linear] an operator's explicit step back reaches this as a
+     licence (linearAllowUp) rather than an argument, so every road that
+     asks - go live, the player's seek and back, a replay - is one rule. */
   function markNow(id) {
     if (id === nowLineId) {
       /* [#1189] RE-ASSERTED ON THE KEYED NODE. A repaint may have rebuilt
@@ -14809,9 +15469,22 @@
         if (same.getAttribute('aria-current') !== 'true') {
           same.setAttribute('aria-current', 'true');
         }
+        /* [s3-script-linear] the line the mark stands on, kept current */
+        if (!linearBefore(same, linearLit)) linearStood(same);
       }
       chaseStalePage(id, same);
       return;
+    }
+    /* [s3-script-linear] A LINE ABOVE THE MARK IS REFUSED, BEFORE ANYTHING
+       IS CLEARED OR UNFOLDED. Asked of the keyed node, which a fold may
+       have taken out of the document; revealLine() would open that fold
+       first, and opening a segment far up the page is itself a jump. */
+    if (id && linearLit && !linearLicensed(id)) {
+      var asked = lineNodes.get(String(id)) || lineNode(id);
+      if (asked && linearBefore(asked, linearLit)) {
+        linearHold(id, asked);
+        return;
+      }
     }
     /* #1263: CLEAR EVERY MARK, not the one we remember.
      *
@@ -14832,6 +15505,7 @@
       lit[i].classList.remove('sp-now');
       lit[i].classList.remove('sp-feed-now');
       lit[i].removeAttribute('aria-current');
+      lit[i].removeAttribute('data-air-back');               /* [s3-script-linear] */
     }
     /* #1270: A MARK THAT DID NOT HAPPEN IS NOT REMEMBERED.
      *
@@ -14890,6 +15564,8 @@
     if (!node) return;
     node.classList.add('sp-now');
     node.setAttribute('aria-current', 'true');
+    linearStood(node);                                       /* [s3-script-linear] */
+    linearRefused = null;
     chaseStalePage(id, node);
     segFollow(node.getAttribute('data-seg') || '');          /* #1285 */
     if (follow) {
@@ -15053,6 +15729,13 @@
     }
     if (admitMap && admitMap.ok && !admitMap.count && state !== 'paused') {
       why = why || admitMap.why;
+    }
+    /* [s3-script-linear] the mark refused to go back up the page. Said
+       here, where the station's sync is said, so a line re-aired above the
+       mark reads as what it is instead of as a highlight that froze. */
+    if (linearRefused && Date.now() - linearRefused.at < 2500) {
+      why = 'the air named a line above the mark - the mark holds'
+        + (why ? ' - ' + why : '');
     }
     if (node.dataset.sync !== state) node.dataset.sync = state;
     node.classList.toggle('sp-sync-carried', carried);
@@ -15439,6 +16122,10 @@
       else segApply(false);
     }
     nowLineId = '';
+    /* [s3-script-linear] the operator's own "go live": the mark may go
+       to the line that is sounding even when the page has it above where
+       the mark stands, because they asked for exactly that line. */
+    linearAllowUp('follow', 5000, id);
     markNow(id);
     moveScript('jump-to-air:' + (reason || 'control'), function (pane) {
       var lip = pane.getBoundingClientRect();
@@ -15449,6 +16136,22 @@
     node.classList.add('flash');
     setTimeout(function () { node.classList.remove('flash'); }, 1200);
     return true;
+  }
+
+  /* [line-id] a copy that works where the async clipboard does not (an
+     insecure context, a WebView without the permission). */
+  function copyByHand(text) {
+    try {
+      var box = document.createElement('textarea');
+      box.value = String(text || '');
+      box.setAttribute('readonly', '');
+      box.style.position = 'fixed';
+      box.style.opacity = '0';
+      document.body.appendChild(box);
+      box.select();
+      document.execCommand('copy');
+      document.body.removeChild(box);
+    } catch (e) { /* the id is still on the card to read */ }
   }
 
   /* Tap a line: what it is, and what can be done with it. */
@@ -15479,6 +16182,31 @@
     if (item.tinted) facts.push('tinted');
     if (item.aired) facts.push(item.aired === 'stream' ? 'aired' : item.aired);
     tabs.line.appendChild(make('i', 'sp-detail-facts', facts.join('  ·  ')));
+
+    /* [line-id] "messages might need a unique hex code or identifier that
+       shows on the popup making it easier for you to track them" (operator,
+       2026-09-28). The line's own id - the one the air log, the script
+       ledger and System 3 all key it by - short on the card; a tap copies
+       the whole id, so it can be handed over and looked up exactly. */
+    var lineId = String(item.line || String(item.id || '').replace(/^(ln|ac)-/, '') || '');
+    if (lineId) {
+      var code = make('button', 'sp-line-id', '#' + lineId.slice(0, 8));
+      code.type = 'button';
+      code.title = 'line ' + lineId
+        + (item.block ? '  ·  script block ' + item.block + ', line ' + (Number(item.ord) || 0) : '')
+        + '  -  tap to copy the whole id';
+      code.addEventListener('click', function (ev) {
+        ev.stopPropagation();
+        var done = function () {
+          code.textContent = 'copied ' + lineId;
+          setTimeout(function () { code.textContent = '#' + lineId.slice(0, 8); }, 2400);
+        };
+        try {
+          navigator.clipboard.writeText(lineId).then(done, function () { copyByHand(lineId); done(); });
+        } catch (e) { copyByHand(lineId); done(); }
+      });
+      tabs.line.appendChild(code);
+    }
 
     var note = make('textarea', 'sp-note');
     note.placeholder = 'A note, or how this should have been said...';
@@ -15558,10 +16286,10 @@
         var style = document.createElement('link');
         style.id = 'spS3Style';
         style.rel = 'stylesheet';
-        style.href = techUrl('/system3/system3.css?v=6');
+        style.href = techUrl('/system3/system3.css?v=7');
         document.head.appendChild(style);
       }
-      import(techUrl('/system3/system3.js?v=6')).then(function (mod) {
+      import(techUrl('/system3/system3.js?v=7')).then(function (mod) {
         if (lineTabsPane !== pane) return null;
         return mod.mountLineTabs(pane, {request: s3Request, lineId: id, tab: lineTab});
       }).then(function (view) {
@@ -16108,6 +16836,7 @@
        so highlight and active are read in the same breath. */
     if (mounted) return Promise.resolve(true);
     build(node);
+    linearReset();          /* [s3-script-linear] a new mount remembers no mark */
     retryReports();
     wirePlayer();
     mounted = true;
@@ -16238,8 +16967,17 @@
             follow: resumeAirFollow,
             decision: function () { return lastDecision; },
              reset: function () { lastDecision = null; airLast = null; lastGood = null;
-                                  resolverRing.length = 0; nowLineId = ''; dressed = Object.create(null); },
+                                  resolverRing.length = 0; nowLineId = ''; dressed = Object.create(null);
+                                  linearReset(); },             /* [s3-script-linear] */
              active: activeRow, playoutRead: playoutRead},
+    /* [s3-script-linear] the placement rule (pure) and the mark's memory,
+       for tests and the incident report; `reload` asks for a fresh page. */
+    linear: {place: linearPlace, owner: linearOwner, snapshot: linearSnapshot,
+             allowUp: linearAllowUp, mark: markNow,
+             order: function () {
+               return scriptOrder.map(function (n) { return String(n.pineKey || ''); });
+             },
+             reload: function () { loadScreenplay(true); }},
     folds: {bind: bindScriptOrder, apply: segApply, toggle: segToggle,
             jump: jumpToLine, reveal: revealLine, count: segCount},
     feedCrawl: {dress: feedCrawlDress, row: feedDress, measure: feedCrawlMeasure,
