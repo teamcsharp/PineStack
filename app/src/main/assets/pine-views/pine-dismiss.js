@@ -127,9 +127,105 @@
     }, opener ? [opener] : []);
   }
 
+  /* [#1450c] BACK CLOSES THE TOPMOST OVERLAY - one at a time, the one on top.
+   *
+   * "I brought that pop up up. I can't even exit it now." #1450's rule: a
+   * thing that covers a surface may never depend on that surface for its
+   * way out. BACK is the way out that no surface can take away: the kiosk
+   * evaluates window.pineBack() and walks history only when it answers
+   * false. The candidates are every panel watched here (the hold sheet
+   * among them), whatever a view registered with onBack(probe) - a probe
+   * answers {node, close} or null (System 3's Messenger: its open
+   * dropdown) - the SFX TV's menus, sheet, parody window and video window,
+   * and System 3's cards and menus. Each is closed by ITS OWN road (its
+   * close, releaseHold, a tap on its own backdrop), never by removing
+   * nodes from here. The one on top is the one with the highest stacking
+   * z-index; on a tie, the later one. */
+  var backs = [];
+
+  function onBack(probe) {
+    if (typeof probe !== 'function') return function () {};
+    backs.push(probe);
+    return function () {
+      var at = backs.indexOf(probe);
+      if (at >= 0) backs.splice(at, 1);
+    };
+  }
+
+  function zOf(node) {
+    for (var n = node; n && n.nodeType === 1; n = n.parentElement) {
+      var z = NaN;
+      try { z = parseInt(root.getComputedStyle(n).zIndex, 10); } catch (err) { z = NaN; }
+      if (isFinite(z)) return z;
+    }
+    return 0;
+  }
+
+  function onScreen(node) {
+    if (!node || !node.isConnected) return false;
+    try {
+      var cs = root.getComputedStyle(node);
+      if (cs.display === 'none' || cs.visibility === 'hidden') return false;
+      var r = node.getBoundingClientRect();
+      return r.width > 0 && r.height > 0;
+    } catch (err) { return false; }
+  }
+
+  function overlays() {
+    var out = [];
+    var add = function (node, close) {
+      if (typeof close === 'function' && onScreen(node)) out.push({node: node, close: close, n: out.length});
+    };
+    var one = function (sel) { try { return document.querySelector(sel); } catch (err) { return null; } };
+    var all = function (sel) { try { return document.querySelectorAll(sel); } catch (err) { return []; } };
+    var i;
+    for (i = 0; i < watched.length; i += 1) {
+      if (showing(watched[i])) add(watched[i].node, watched[i].close);
+    }
+    for (i = 0; i < backs.length; i += 1) {
+      var got = null;
+      try { got = backs[i](); } catch (err) { got = null; }
+      if (got && got.node) add(got.node, got.close);
+    }
+    var tv = root.PineSfxTv;
+    if (tv && typeof tv.releaseHold === 'function') {
+      var held = one('.sfx-tv-radial-shade') || one('.sfx-tv-delete-shade') || one('.sfx-tv-sheet');
+      if (held) add(held, function () { tv.releaseHold(); });
+    }
+    var parody = all('.sfx-tv-parody-shade');
+    for (i = 0; i < parody.length; i += 1) {
+      (function (shade) { add(shade, function () { shade.click(); }); })(parody[i]);
+    }
+    if (tv && typeof tv.closeWindow === 'function') {
+      var frames = all('body > .sfx-tv');
+      for (i = 0; i < frames.length; i += 1) {
+        if (frames[i].querySelector('.sfx-tv-tube')) { add(frames[i], function () { tv.closeWindow(); }); break; }
+      }
+    }
+    var cards = all('.s3-modal-back');
+    for (i = 0; i < cards.length; i += 1) {
+      (function (back) { add(back, function () { back.click(); }); })(cards[i]);
+    }
+    return out;
+  }
+
+  function back() {
+    var list = overlays();
+    var best = null, bestZ = 0;
+    for (var i = 0; i < list.length; i += 1) {
+      var z = zOf(list[i].node);
+      if (!best || z >= bestZ) { best = list[i]; bestZ = z; }
+    }
+    if (!best) return false;
+    try { best.close(); } catch (err) { return false; }
+    return true;
+  }
+
   var api = {watch: watch, simple: simple, closeAll: closeAll,
-    count: function () { return watched.length; }};
+    count: function () { return watched.length; },
+    onBack: onBack, back: back};                              /* [#1450c] */
   root.PineDismiss = api;
+  root.pineBack = function () { try { return back(); } catch (err) { return false; } };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
 })(typeof window !== 'undefined' ? window : globalThis);
 

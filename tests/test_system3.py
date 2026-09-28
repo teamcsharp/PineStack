@@ -94,7 +94,7 @@ class PlanTests(unittest.TestCase):
         # its own streams, only when a road opts in: the trajectory holds.
         # [s3-es-emoji] ...and ES1's badges (an emoji per feeling and item) - data the
         # engine stamps on the ES decision and never draws on: the trajectory holds.
-        self.assertEqual(system3.config_hash(system3.default_config()), "afae0f818f0425ae")
+        self.assertEqual(system3.config_hash(system3.default_config()), "89b5f4230658907b")
 
     def test_same_state_config_seed_reproduces_the_plan(self):
         a, b = plan(seed="r"), plan(seed="r")

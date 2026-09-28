@@ -216,6 +216,15 @@ _ES_ITEM_EMOJI = {
     "acceptance": "\U0001F642",
 }
 
+# [s3-es-dir] WHAT THE WRITER IS TOLD FOR A FEELING. 2026-09-28, the operator:
+# "By default have the writer told to "write the message with this feeling
+# reflecting the mood" for the actor". The ES roll lands on a category (by the
+# category's weight) and then on an item inside it (by the items' weights); the
+# item's `text` is what its turn's row in the running order tells the writer.
+# {feeling} is the item, {name} the seat speaking the line - filled in when the
+# turn is planned (system3.es_direction). A blank text reads as this default.
+ES_DIRECTION = "Write {name}'s message with {feeling}, reflecting the mood."
+
 ES1 = {
     "id": "ES1", "family": "ES", "label": "Emotional Set 1", "version": 1,
     "enabled": True, "weight": 1.0,
@@ -225,6 +234,7 @@ ES1 = {
          "dims": dims, "modifiers": mods, "after_lean": _ES_AFTER.get(cid, {}),
          "emoji": _ES_EMOJI[cid],                                          # [s3-es-emoji] the badge
          "items": _items([{"id": f"{cid}.{w.replace(' ', '_')}", "label": w,
+                           "text": ES_DIRECTION,                           # [s3-es-dir] what the writer is told
                            **({"arousal": _ES_AROUSAL[w]} if w in _ES_AROUSAL else {}),
                            **({"valence": _ES_VALENCE[w]} if w in _ES_VALENCE else {}),
                            # [s3-es-emoji] its own, only where it is more specific than the category's

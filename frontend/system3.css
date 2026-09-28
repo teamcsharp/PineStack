@@ -860,3 +860,111 @@
 .s3-es-badge > .s3-es-emo { display: inline-grid; place-items: center; width: 22px; height: 22px; border-radius: 6px; background: #0000002e;
   border: 1px solid #ffffff1f; font: 14px/1 "Segoe UI Emoji", "Apple Color Emoji", "Noto Color Emoji", sans-serif; font-style: normal; }
 .s3-es-row { display: flex; justify-content: flex-end; margin-top: 4px; }
+
+/* [s3-imsg] THE MESSENGER AS AN INSTANT-MESSAGE THREAD (operator, 2026-09-28).
+   Append to frontend/system3.css. Reduced motion: the sheet's own
+   `.s3 *, .s3 *::before { animation: none; transition: none }` rule already
+   stills every animation below. */
+
+/* The dice land one after another: a tumbling die hides its pick; each
+   landing flashes its chip in its family colour - the "boom". */
+.s3-rl-chip .s3-rl-pick { transition: opacity .18s ease-out; }
+.s3-rl-chip.s3-spinning .s3-rl-pick { opacity: 0; }
+.s3-rl-chip.s3-landed { animation: s3-land .6s ease-out; }
+@keyframes s3-land {
+  0% { box-shadow: 0 0 0 2px var(--fam, var(--obs)), 0 0 16px var(--fam, var(--obs)); transform: scale(1.07); }
+  45% { transform: scale(.98); }
+  100% { box-shadow: 0 0 0 0 transparent; transform: none; }
+}
+.s3-rl-chip.s3-landed .s3-die { animation: s3-slam .38s cubic-bezier(.2, .9, .3, 1.35); }
+@keyframes s3-slam { 0% { transform: scale(1.8) rotate(-14deg); } 55% { transform: scale(.9) rotate(2deg); } 100% { transform: none; } }
+
+/* The future: below the air, faded - still readable, the scaffolding. A
+   section that is all future is faded once, not twice. What has happened is
+   at full strength. */
+.s3-feed .s3-round, .s3-feed .s3-chat > * { transition: opacity .35s ease, filter .35s ease; }
+.s3-feed .s3-future { opacity: .5; filter: saturate(.55); }
+.s3-feed .s3-round.s3-future .s3-future { opacity: 1; filter: none; }
+.s3-feed .s3-msg.past { opacity: 1; }
+
+/* A round's later run: the air took another round in between. */
+.s3-round-head.s3-round-cont { font-size: 11px; padding-top: 0; }
+.s3-round-head.s3-round-cont b { color: var(--ink-2); }
+
+/* Withdrawn or cut on the air's own receipt: one quiet line where it stood,
+   opened by a tap on its tag. The header line (and its chevron) stays. */
+.s3-feed .s3-gone:not(.s3-gone-open) > :not(.who) { display: none; }
+.s3-feed .s3-gone:not(.s3-gone-open) > .who { opacity: .72; }
+.s3 .s3-gone-tag { font: italic 11px/1.5 system-ui, sans-serif; padding: 0 8px; border-radius: 999px; background: transparent;
+  border: 1px dashed var(--line-2); color: var(--ink-3); cursor: pointer; }
+.s3 .s3-gone-tag:hover { background: #223238; }
+.s3 .s3-gone-tag[aria-expanded="true"] { border-style: solid; color: var(--ink-2); }
+
+/* The sync switch - the on-air pill. Pressed: synced to the current
+   message. Not: dashed and quiet, with how many went on air since. */
+.s3 .s3-embed-air.s3-sync { gap: 5px; }
+.s3-sync .s3-sync-ico { display: inline-flex; align-items: center; width: 13px; height: 13px; flex: none; }
+.s3-sync .s3-sync-ico:empty { display: none; }
+.s3-sync .s3-sync-ico svg { width: 13px; height: 13px; fill: currentColor; }
+.s3 .s3-embed-air.s3-sync.s3-synced { border-color: #ff7b7b; color: #ffd6d6; background: #3a2328; }
+.s3 .s3-embed-air.s3-sync[aria-pressed="false"] { border-style: dashed; border-color: var(--line-2); color: var(--ink-3); background: transparent; }
+.s3 .s3-embed-air.s3-sync[aria-pressed="false"]:hover { color: var(--ink-2); border-color: var(--accent); }
+.s3-sync .s3-sync-count { font: 700 10px/1 system-ui, sans-serif; padding: 2px 5px; border-radius: 999px; background: var(--accent); color: #0b1215; }
+.s3-sync .s3-sync-count:empty { display: none; }
+
+/* One message at a time: one the air went past (or a late arrival that
+   aired) rises into place; the glide eases the view down by its room. */
+.s3-feed .s3-enter { animation: s3-enter .32s cubic-bezier(.2, .8, .2, 1); }
+@keyframes s3-enter { from { opacity: .15; transform: translateY(16px); } to { opacity: 1; transform: none; } }
+
+/* ONE SPLIT BUTTON on every message, at the end of its dice row: the play
+   half runs the compact assembly (its chips landing one by one, the hold,
+   the words), the arrow half - a Carbon caret, turned down - the long
+   version (every decision as its own card). */
+.s3 .s3-assemble { display: inline-flex; align-items: stretch; flex: none; vertical-align: middle; border: 1px solid var(--line-2);
+  border-radius: 999px; overflow: hidden; background: #0d171b; }
+.s3 .s3-assemble > button { border: 0; border-radius: 0; margin: 0; padding: 0; height: 22px; display: inline-grid; place-items: center;
+  background: transparent; color: var(--ink-2); }
+.s3 .s3-assemble > .s3-assemble-btn { width: 24px; padding-left: 2px; }
+.s3 .s3-assemble > .s3-assemble-more { width: 18px; border-left: 1px solid var(--line-2); }
+.s3 .s3-assemble > button:hover { color: var(--ink); background: #16242a; }
+.s3 .s3-assemble .pi-icon, .s3 .s3-assemble svg { width: 11px; height: 11px; fill: currentColor; }
+.s3 .s3-assemble-more.s3-caret-down svg { transform: rotate(90deg); }
+.s3 .s3-assemble-more .s3-drop-chev { width: 13px; height: 13px; transition: none; }
+.s3-rl-dice > .s3-assemble { align-self: center; }
+
+/* Coming together again: drawn in the room the message already had. */
+.s3-feed .s3-msg.s3-assembling { overflow: hidden; }
+.s3-feed .s3-msg.s3-extending { overflow: visible; }
+
+/* The emotion rolled in two: the category, and under it, indented, the item
+   in it - joined by an elbow. */
+.s3-rl-es { display: inline-flex; flex-direction: column; align-items: flex-start; gap: 3px; min-width: 0; max-width: 100%; cursor: pointer; }
+.s3-msg.right .s3-rl-es { align-items: flex-end; }
+.s3-rl-es > .s3-rl-chip { cursor: inherit; }
+.s3-rl-es > .s3-rl-es-item { position: relative; margin-left: 18px; border-left-style: dotted; }
+.s3-msg.right .s3-rl-es > .s3-rl-es-item { margin-left: 0; margin-right: 18px; }
+.s3-rl-elbow { position: absolute; left: -14px; top: -5px; width: 10px; height: 14px; border-left: 1px solid var(--fam, var(--es));
+  border-bottom: 1px solid var(--fam, var(--es)); border-bottom-left-radius: 5px; opacity: .75; pointer-events: none; }
+.s3-msg.right .s3-rl-elbow { left: auto; right: -14px; border-left: 0; border-right: 1px solid var(--fam, var(--es));
+  border-bottom-left-radius: 0; border-bottom-right-radius: 5px; }
+
+/* A sting's clip in its message: the frame, the clip muted once through; an
+   audio clip's spectrogram with its playhead. */
+.s3-sting-media { position: relative; display: block; max-width: 100%; }
+.s3-sting-media.video > .s3-sting-video { display: block; height: 84px; width: auto; max-width: 100%; aspect-ratio: 16 / 9; border-radius: 8px;
+  object-fit: cover; border: 1px solid #2c6b64; background: #000; }
+.s3-sting-wave { position: relative; width: min(260px, 100%); height: 56px; border-radius: 8px; overflow: hidden; border: 1px solid #2c6b64;
+  background: #081312; }
+.s3-sting-spec { display: block; width: 100%; height: 100%; object-fit: fill; opacity: .85; }
+.s3-sting-spec.broken { visibility: hidden; }
+.s3-playhead { position: absolute; top: 0; bottom: 0; left: calc(var(--k, 0) * 100%); width: 2px; margin-left: -1px; background: #fff;
+  box-shadow: 0 0 6px var(--sfx, #7fe0d6); opacity: 0; transition: opacity .2s ease; pointer-events: none; }
+.s3-sting-media.on .s3-playhead { opacity: 1; }
+.s3-sting-len { display: block; margin-top: 2px; font-size: 10px; color: var(--ink-3); }
+
+/* A later run of a turn the air took around a sting. */
+.s3-msg.s3-part > .who > span { font-style: italic; }
+
+/* The long version's card for a pick recorded with its row: a strip, a mark. */
+.s3-tbar.s3-pbar { margin: 2px 0; }

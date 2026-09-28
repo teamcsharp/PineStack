@@ -66,7 +66,8 @@
       '[data-dialogue-text], .sp-itin-message-text, .sp-segline-text');
     return {
       id: id,
-      said: String((words && words.textContent) || node.textContent || '').trim(),
+      said: String((node.getAttribute && node.getAttribute('data-said')) || (words && words.textContent)   /* [#1450c] */
+        || node.textContent || '').trim(),
       node: node
     };
   }
@@ -94,6 +95,8 @@
      * (see maybeSwallow for how it goes missing). Either way the flag has
      * no business eating the press that is starting now. */
     swallow = false;
+    eatClickUntil = 0;                   /* [#1450c] a new press: the shade's trailing click is not coming */
+    if (ownHold(event.target)) return;   /* [#1450c] the view opens this sheet itself */
     var line = lineAt(event.target);
     if (!line) return;
     from = line;
@@ -146,6 +149,13 @@
    * pointerup as well as click, so even a swallowed click cannot cost a
    * press - see press() below. */
   function maybeSwallow(event) {
+    /* [#1450c] The click that trails a tap on the shade arrives after the
+     * shade has gone, on whatever it was covering. It is the dismissal's. */
+    if (eatClickUntil) {
+      var eat = Date.now() < eatClickUntil;
+      eatClickUntil = 0;
+      if (eat) { event.stopPropagation(); event.preventDefault(); return; }
+    }
     if (!swallow) return;
     swallow = false;
     if (sheet && event.target && sheet.contains(event.target)) return;
@@ -163,6 +173,7 @@
     document.addEventListener('pointercancel', clear, true);
     document.addEventListener('click', maybeSwallow, true);
     document.addEventListener('contextmenu', function (event) {
+      if (ownHold(event.target)) return;   /* [#1450c] */
       var line = lineAt(event.target);
       if (!line) return;
       event.preventDefault();
@@ -178,17 +189,91 @@
 
   /* Closing the SHEET. The toast and the orb are deliberately not touched:
    * both belong to work that is still running, and taking them down with the
-   * menu would hide the answer to the very thing that was just asked for. */
-  function close() {
-    stopPlaying();
+   * menu would hide the answer to the very thing that was just asked for.
+   * [#1450c] Nor is the audition when the sheet leaves after "Play it"
+   * (`keep`): that is the work still running, and it plays to its end. */
+  function close(keep) {
+    if (keep !== true) stopPlaying();
     clearTimeout(voteSayGone);
     voteNow = '';
     if (sheet) { sheet.remove(); sheet = null; }
+    if (unwatch) { try { unwatch(); } catch (err) { /* gone */ } unwatch = null; }
+    shadeDown();
+    wallCheck();
+  }
+
+  /* [#1450c] TWO WAYS OUT, AND THE PICTURE GOES UNDER.
+   *
+   * "I brought that pop up up. I can't even exit it now. It's stuck on
+   * screen." Held on a sting in the Messenger, the sheet came up with the
+   * SFX TV's picture on the glass - on the tablet the native wall, a
+   * SurfaceView composited ABOVE the WebView that takes every touch inside
+   * its rectangle and hands it to PineSfxTv.tapPicture (#1441). The wall
+   * steps down (#1442) for what uiOverPicture() calls a pop-up: a
+   * [role=dialog] / [aria-modal] node (its observer acts at once) or a body
+   * child at z >= 2147483000 over the picture's box (on the 750 ms follow,
+   * against readBox()'s idea of the box rather than the surface itself).
+   * This sheet declared nothing and brought nothing, so a tap on Close that
+   * landed on the picture never reached the page - it opened the SFX TV's
+   * own sheet behind this one, the next closed that, and so on.
+   *
+   * The #1450 rule - a thing that covers a surface may never depend on that
+   * surface for its way out - applied here:
+   *   - the sheet says what it is (role=dialog, aria-modal), so the wall's
+   *     own observer takes the picture down the moment it opens;
+   *   - it brings its own ground: a full-screen shade one z under it, which
+   *     covers ANY picture box, so uiOverPicture() is true for exactly as
+   *     long as the sheet is up, whatever the geometry or the scale;
+   *   - it tells the wall at once (PineSfxTv.viewChanged) on the way in and
+   *     on the way out, rather than leaving either to a timer that this
+   *     WebView is known to freeze;
+   *   - a tap on the shade closes it - the second way out - and the click
+   *     trailing that tap is eaten so it cannot land on what was under it;
+   *   - window.pineBack() (pine-dismiss.js; the kiosk's BACK) closes it. */
+  var shade = null;
+  var unwatch = null;
+  var eatClickUntil = 0;
+
+  function shadeUp() {
+    shadeDown();
+    shade = make('div', 'la-shade');
+    shade.setAttribute('aria-hidden', 'true');
+    press(shade, function () {
+      eatClickUntil = Date.now() + 700;
+      close();
+    });
+    document.body.appendChild(shade);
+  }
+
+  function shadeDown() {
+    var gone = shade;
+    shade = null;
+    if (gone) { try { gone.remove(); } catch (err) { /* already gone */ } }
+  }
+
+  /* The picture's one decision (#1442), asked now rather than on its poll. */
+  function wallCheck() {
+    try {
+      var tv = root.PineSfxTv;
+      if (tv && typeof tv.viewChanged === 'function') tv.viewChanged();
+    } catch (err) { /* no set on this page */ }
+  }
+
+  /* A view that answers its own holds - the System 3 Messenger knows the
+   * sting, its clip and its turn - marks itself [data-own-hold] and opens
+   * this sheet itself. Both holds on one press opened it twice, and the
+   * second one headed it with the card's text mashed together. */
+  function ownHold(target) {
+    try { return !!(target && target.closest && target.closest('[data-own-hold]')); }
+    catch (err) { return false; }
   }
 
   function open(line) {
     close();
     sheet = make('div', 'la-sheet');
+    sheet.setAttribute('role', 'dialog');                /* [#1450c] the wall's observer knows a dialog */
+    sheet.setAttribute('aria-modal', 'true');
+    sheet.setAttribute('aria-label', 'What would you like to do with this?');
     sheet.pineLine = line.id;
     openedAt = Date.now();
 
@@ -309,8 +394,10 @@
     press(shut, function () { close(); });
     sheet.appendChild(shut);
 
+    shadeUp();                                           /* [#1450c] one z under the sheet */
     document.body.appendChild(sheet);
-    if (root.PineDismiss) root.PineDismiss.watch(sheet, close, []);
+    if (root.PineDismiss) unwatch = root.PineDismiss.watch(sheet, close, [function () { return shade; }]);
+    wallCheck();
     readVote(line);
   }
 
@@ -577,7 +664,7 @@
        * refusal is held longer because it is the only place it is said. */
       setTimeout(function () {
         acting = false;
-        close();
+        close(kind === 'sound');         /* [#1450c] what Play it started plays on */
         if (ok && typeof after === 'function') after();
       }, ok ? 900 : 2200);
     };
@@ -601,7 +688,7 @@
       orb = raiseOrb(mark, title);
       closing = true;                 /* the sheet's part is over */
       acting = false;
-      close();
+      close(kind === 'sound');        /* [#1450c] */
     }, 2500);
 
     var land = function (ok, text) {
@@ -805,6 +892,13 @@
 
   function playIt(line, say) {
     stopPlaying();
+    /* [#1450c] A STING PLAYS AS ITSELF. "If I tap and hold on a piece of
+     * media and I choose play it, play the piece of media ... it's supposed
+     * to pop up the video and play it in the window." A sound effect went
+     * down the booth clip route, which answers for spoken lines: a video
+     * came back as nothing, or as its bare soundtrack. See playSting(). */
+    var clip = sfxOf(line);
+    if (clip && /^[0-9a-f]{16}$/.test(String(clip.sfx || ''))) return playSting(clip, say);
     var sampler = root.PineSampler;
     var source = sampler && typeof sampler.sourceFor === 'function'
       ? sampler.sourceFor({id: line.id, text: line.said}) : null;
@@ -814,8 +908,14 @@
        * anyway for a line that aired. */
       source = {url: '/api/booth/clip?line=' + encodeURIComponent(line.id)};
     }
+    audition(source.url, say);
+  }
+
+  /* One element, ducked, released on every road out - a line's take or a
+   * sting's own file (#1450c). */
+  function audition(url, say) {
     say('playing…');
-    var audio = new Audio(source.url);
+    var audio = new Audio(stationHref(String(url || '')));
     if (root.PineAir && root.PineAir.mine) root.PineAir.mine(audio);
     /* EVERY ROAD OUT RELEASES, not just the happy one. `ended` is the road
      * that was wired first and it is the one that did not fire: measured,
@@ -848,6 +948,49 @@
       stopPlaying();
       say(String((err && err.message) || err), true);
     });
+  }
+
+  /* [#1450c] The clip itself is asked for - its replay source, the one the
+   * Messenger and the SFX TV already use. A video goes up in the SFX TV's
+   * window and plays there WITH its sound (an explicit play; the Messenger's
+   * own card plays it muted); an audio clip plays its own file through the
+   * audition above. */
+  function playSting(clip, say) {
+    say('finding the clip…');
+    return Promise.resolve()
+      .then(function () {
+        return api().get('/api/sfx/' + encodeURIComponent(clip.sfx) + '/replay-source');
+      })
+      .then(function (got) {
+        if (!got || !got.url) return {ok: false, why: 'the station has no file behind that clip'};
+        var name = String(got.name || clip.name || 'the clip');
+        var tv = root.PineSfxTv;
+        if (got.video && tv && typeof tv.cut === 'function') {
+          var up = false;
+          try {
+            up = tv.cut({id: clip.sfx, url: String(got.url), sting: name, text: name,
+                         seconds: Number(got.seconds) || 0, video: true}, {ring: false});
+          } catch (err) { up = false; }
+          if (up) return {then: 'playing in the video window'};
+        }
+        audition(String(got.url), say);
+        return {then: got.video ? 'playing its sound - no video window on this screen' : 'playing'};
+      }, function (err) {
+        return {ok: false, why: saidWhy(err)};
+      });
+  }
+
+  /* A path the station handed out, as an element can load it: as it is on
+   * a page the station serves (the kiosk's loopback door, any http page),
+   * against the station's base on the desk's file: page (#1399). */
+  function stationHref(u) {
+    if (!/^\//.test(u)) return u;
+    try { if (/^https?:$/.test(String(root.location.protocol))) return u; }
+    catch (err) { /* no location: a bare host */ }
+    var b = '';
+    try { b = typeof root.pineStationBase === 'function' ? String(root.pineStationBase() || '') : ''; }
+    catch (err) { b = ''; }
+    return (b || 'http://127.0.0.1:8096').replace(/\/+$/, '') + u;
   }
 
   /* THE SAMPLER'S OWN SEAM, not a second way in. sourceFor and takeable
@@ -900,7 +1043,8 @@
     var item = line.node && line.node.pineItem;
     if (item && (item.tag === 'sting' || item.sfx)) {
       return { sfx: String(item.sfx || ''), line: String(item.line || line.id),
-               name: stingName(line.said), deleted: !!item.deleted };
+               name: String(item.text || '') || stingName(line.said),   /* [#1450c] */
+               deleted: !!item.deleted };
     }
     if (/^A sting off the board:/.test(line.said)) {
       return { sfx: '', line: String(line.id), name: stingName(line.said),

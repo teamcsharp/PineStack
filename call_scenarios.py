@@ -369,6 +369,7 @@ def select_call_scenario(catalog: Mapping[str, Any], *, rng: Any = None,
 
     ``target_heat`` uses the 0..1 scale. A catalog with no compatible enabled
     row yields None, so an existing case is not forced into the wrong tone.
+    An ``rng`` with ``draw(what, labels, weights)`` makes the pick itself.
     """
     clean = _catalog_record(catalog)
     available = [row for row in clean["scenarios"] if row["enabled"]]
@@ -383,7 +384,23 @@ def select_call_scenario(catalog: Mapping[str, Any], *, rng: Any = None,
     return _draw(available, rng if rng is not None else random)
 
 
-def _draw(options: Sequence[dict[str, Any]], rng: Any) -> dict[str, Any]:
+def _option_label(option: Mapping[str, Any]) -> str:
+    """What a recorded draw shows for one option: its id and its words."""
+    words = str(option.get("cue") or option.get("text") or option.get("premise") or "")
+    return "%s: %s" % (option.get("id"), words) if words else str(option.get("id") or "")
+
+
+def _draw(options: Sequence[dict[str, Any]], rng: Any, what: str = "") -> dict[str, Any]:
+    # [s3-dice4] A source with draw(what, labels, weights) makes the pick
+    # itself, at exactly these weights (the station hands in System 3's dice,
+    # which record the candidates and where the draw landed). A plain random()
+    # source keeps the arithmetic below; so does an answer out of range.
+    draw = getattr(rng, "draw", None)
+    if callable(draw):
+        at = draw(what, [_option_label(option) for option in options],
+                  [float(option["weight"]) for option in options])
+        if isinstance(at, int) and not isinstance(at, bool) and 0 <= at < len(options):
+            return dict(options[at])
     value = rng.random()
     if not isinstance(value, (int, float)) or not math.isfinite(value) or not 0 <= value < 1:
         raise ValueError("rng.random() must return a number in [0, 1)")
@@ -403,7 +420,9 @@ def call_path_draw(scenario: Mapping[str, Any], *, caller_name: str = "",
     ``path_map`` may override any of the six default beats. The returned
     structure is JSON-safe and can be retained with a caller's other metadata.
     The caller supplies a seeded ``random.Random`` when reproducibility is
-    required; otherwise the station's usual random stream is used.
+    required; otherwise the station's usual random stream is used. A source
+    with ``draw(what, labels, weights)`` (the station's System 3 dice) makes
+    each weighted pick itself - ``what`` is the beat, or "conclusion".
     """
     clean = _scenario_record(scenario)
     subject = _text(topic_subject(topic) or topic_subject(clean["premise"]), "subject")
@@ -411,8 +430,8 @@ def call_path_draw(scenario: Mapping[str, Any], *, caller_name: str = "",
     outcome = _text(case_outcome, "case_outcome", limit=400, required=False)
     choices = {beat: _options(clean, beat) for beat in BEATS}
     source = rng if rng is not None else random
-    beats = [{"beat": beat, **_draw(choices[beat], source)} for beat in BEATS]
-    conclusion = _draw(clean["conclusion_pool"], source)
+    beats = [{"beat": beat, **_draw(choices[beat], source, beat)} for beat in BEATS]   # [s3-dice4]
+    conclusion = _draw(clean["conclusion_pool"], source, "conclusion")
     return {
         "scenario_id": clean["id"], "caller_name": name, "subject": subject,
         "premise": clean["premise"], "want": clean["want"],

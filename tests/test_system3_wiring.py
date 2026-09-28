@@ -183,9 +183,11 @@ class WiringTests(unittest.TestCase):
         self.assertEqual(applied, len(mod.plan(text)))
         for marker in ('globals().get("system3_withhold")', "async def _harvest_yields(", "async def _live_round_waits(",
                        "def _beat_fresh_only(", "def harvest_unrepaired(", 'mark={"kind": "harvest"}',
-                       "HARVEST_PAUSE_AFTER = 5", '_HARVEST_BAD["__pause_until__"]',
-                       'system3.js?v=5'):
+                       "HARVEST_PAUSE_AFTER = 5", '_HARVEST_BAD["__pause_until__"]'):
             self.assertIn(marker, text)
+        # the panel's module version moves with every batch (v5 rounds, v6 wave A);
+        # what matters is that it moved past the pre-rounds v4
+        self.assertRegex(text, r'system3\.js\?v=([5-9]|[1-9][0-9])"')
         self.assertNotIn('system3.js?v=4', text)
         src = (ROOT / "frontend" / "system3.js").read_text(encoding="utf-8")
         for marker in ("TEMPER: ['Temper (TEMPER1)'", "CARRY: ['Carry", "WITHHELD: ['Withheld'", "const versionsCard = () =>",
@@ -213,7 +215,7 @@ class WiringTests(unittest.TestCase):
         self.assertIn('globals().get("system3_favorite")', text)
         src = (ROOT / "frontend" / "system3.js").read_text(encoding="utf-8")
         for marker in ("FAV: ['Favourite (FAV1)'", "DIRECTIVE: [\"Operator's directive (DIRECTIVE1)\"", "function poolFields(item)",
-                       "const TABLE_FAMILIES = ['CTS', 'ES', 'RS', 'IRS', 'FL', 'TEMPER', 'SHOCK', 'INTERJECT', 'FAV', 'DIRECTIVE'",
+                       "const TABLE_FAMILIES = ['CTS', 'ES', 'RS', 'IRS', 'FL', 'TEMPER', 'SHOCK', 'INTERJECT', 'SPEAKERBOX', 'FAV', 'DIRECTIVE'",
                        "startTab.includes(':')"):
             self.assertIn(marker, src)
 

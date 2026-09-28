@@ -40,7 +40,7 @@ import httpx
 from station_flow import FlowJournal
 from script_report_store import ScriptReportStore, REPORT_NAME as SCRIPT_REPORT_NAME
 from sfx_cue import CueCandidate, choose_due_cue
-from sfx_reaction import COMPLAINT_LINES, complaint_due
+from sfx_reaction import COMPLAINT_LINES   # [s3-dice4] complaint_due() is System 3's roll now
 from news_dossier import fetch_service as fetch_news_dossier, public_url as news_public_url
 from line_blacklist import Blacklist
 from changelog import ChangeLog
@@ -62848,7 +62848,12 @@ def heat_reference() -> str:
     band, _c = heat_band()
     if not band:
         return ""
-    pool = list(HEAT_SEED.get(band, [])) + _heat_read().get(band, [])
+    # [s3-dice4] the seed imagery is a POOLS1 row set per band; what the model
+    # has evolved since (heat_lines.json, rewritten every ~25 minutes) stays
+    # the station's growing pile, drawn with it by System 3's dice below
+    pool = (list(s3_pool("banter.heat_seed_" + band.replace(" ", "_"), HEAT_SEED.get(band, []),
+                         "the heat asides a host lets slip, %s (#626)" % band))
+            + _heat_read().get(band, []))
     pool = [p for p in dict.fromkeys(pool) if p]     # de-dupe, keep order
     if not pool:
         return ""
@@ -75877,6 +75882,84 @@ def _sfx_roll_carry(row: dict[str, Any], sample: Path) -> None:
 
 SPEAKBOX_DIR = data_path("speakbox")
 
+
+# --- [s3-dice4] THE LAST STATION RANDOMS GO THROUGH THE DICE DOOR -------------
+# "the point of making everything go on system 3 is to have no dialogue hit the
+# station unless it is scripted via the RNG roulette system" (operator,
+# 2026-09-28). The door ([s3-dice-door]: s3_chance / s3_pool / s3_unrepeated /
+# _S3Dice) takes the station's draws; these are what the last roads needed to
+# go through it: a pure module's weighted draws (the call scenarios), the SFX
+# Guy's line when no System 3 plan chose it, #292's complaint odds, and a
+# filler for a tabled template whose words the desk may rewrite.
+_S3_FILL_SLOT = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
+
+
+def _s3_fill(template: Any, **values: Any) -> str:
+    """Fill `{name}` slots by name, in one pass. A POOLS1 row is the
+    operator's text: a brace they typed, or a slot this road does not fill,
+    stays as written - never the KeyError str.format would raise on air."""
+    return _S3_FILL_SLOT.sub(
+        lambda m: str(values[m.group(1)]) if m.group(1) in values else m.group(0),
+        str(template or ""))
+
+
+def complaint_due() -> bool:
+    """#292's one-in-three (sfx_reaction.complaint_due) as a STATION1 row:
+    the other presenter groans at the board's clip when System 3's die says
+    so. Both complaint roads - the cadence's and the sting's - roll it here."""
+    return s3_chance("sting.complaint", 1.0 / 3.0,
+                     "the other presenter groans at the board's clip (#292)")
+
+
+class _S3Weighted:
+    """A random source for a pure module that draws by its own weights (the
+    call scenarios: which scenario, one path per beat, the landing).
+    draw(what, labels, weights) is System 3's pick at exactly those weights,
+    recorded under `key.what` with what was on offer; random() is a recorded
+    roll, for a module that only knows random(). System 3 off: the station's
+    own random, at the same weights."""
+
+    def __init__(self, key: str, label: str = "") -> None:
+        self.key, self.label = str(key), str(label or key)
+
+    def draw(self, what: str, labels: list[Any], weights: list[Any]) -> int:
+        key = "%s.%s" % (self.key, what) if what else self.key
+        return s3_weighted(key, [str(x) for x in labels], [float(w or 0) for w in weights],
+                           "%s: %s" % (self.label, what) if what else self.label)
+
+    def random(self) -> float:
+        return s3_roll(self.key, self.label)
+
+
+class _S3SfxGuyDice:
+    """sfxguy_line's director when no System 3 plan chose his line: the news
+    break and the warp dial are STATION1 odds, and each pick off a pile (his
+    shelf sayings, his written warps) is a recorded draw - the three random()
+    calls and the two picks that line made on the station's own random."""
+
+    def __init__(self, warp: Any) -> None:
+        self.warp = max(0.0, min(100.0, float(warp or 0)))
+
+    def takes(self, kind: str, available: Any) -> bool:
+        if not available:
+            return False
+        if kind == "news":
+            return s3_chance("sfxguy.news_take", 0.15,
+                             "he breaks a news story with a spicy take (#804)")
+        if kind == "reaction" and self.warp > 0:
+            return s3_chance("sfxguy.warp_take", self.warp / 100.0,
+                             "he says a written warp off his pile, not a shelf saying (#799, #820)",
+                             dial="sfxguy_warp")
+        return False
+
+    def pick(self, label: str, candidates: list[Any]) -> int:
+        return _S3Dice("sfxguy." + str(label), "which %s he says off his pile" % label).pick(
+            str(label), list(candidates))
+
+    def done(self, line: str, kind: str) -> None:
+        return None
+
+
 # --- Minds (#627): a mind is a NAMED FOLDER plus its own shelf ------------
 # A second folder of documents is not a second pile — it is a second head.
 # Football facts and personal stories should not share a used-lines ring, a
@@ -79232,7 +79315,7 @@ def speakbox_aside(quote: dict[str, str], pair: bool = True) -> str:
         # answer, a single line comes back either as a rhetorical question
         # into dead air or with a literal "B:" in it, which the box then
         # reads out as "B colon" (#207).
-        + (f" Whoever hears it must {unrepeated(list(SPEAKBOX_ENGAGE), 'engage')}"
+        + (f" Whoever hears it must {s3_unrepeated('speakbox.engage', SPEAKBOX_ENGAGE, 'engage', 'what the one who hears the passage must do with it')}"   # [s3-dice4]
            " rather than let it pass." if pair else
            " You are on your own here — one voice, no second speaker, and no "
            "speaker labels of any kind in what you write.")
@@ -79373,7 +79456,7 @@ def speakbox_scene_angle(seed: dict[str, str],
         "it a quotation, never say where it came from. "
         f"{other} is blown away and spends the WHOLE conversation coming to "
         f"terms with it: first "
-        f"{unrepeated(list(SPEAKBOX_REACTIONS), 'reaction')}, refusing to "
+        f"{s3_unrepeated('speakbox.reaction', SPEAKBOX_REACTIONS, 'reaction', 'how the one who hears the passage takes it')}, refusing to "   # [s3-dice4]
         "believe what was just said; then demanding details and getting "
         "more than anyone asked for; then trying to move the show along and "
         "failing; and at last managing a real comeback that makes the "
@@ -79421,10 +79504,12 @@ def speakbox_angle(quote: dict[str, str],
     first = first if first in ("A", "B") else ("A" if s3_chance("speakbox.drop_speaker", 0.5, "the host (A) delivers the passage, not the co-host (B)") else "B")   # [s3-dice-door]
     other = "B" if first == "A" else "A"
     # A third of the time it is a speech rather than a line dropped in (#223).
-    drop = (unrepeated(list(SPEAKBOX_MONOLOGUE), "monologue")
+    drop = (s3_unrepeated("speakbox.monologue_form", SPEAKBOX_MONOLOGUE, "monologue",   # [s3-dice4]
+                          "how a passage lands as a speech (#223)")
             if s3_chance("speakbox.monologue", 0.34, "the passage lands as a speech rather than a line dropped in (#223)")   # [s3-dice-door]
-            else unrepeated(list(SPEAKBOX_DROPS), "drop"))
-    drop = drop.format(first=first, other=other)
+            else s3_unrepeated("speakbox.drop_form", SPEAKBOX_DROPS, "drop",   # [s3-dice4]
+                               "how a passage is dropped into the show (#233)"))
+    drop = _s3_fill(drop, first=first, other=other)   # [s3-dice4] a desk row is the operator's words
     # A monologue names its own speaker; the shorter drops do not.
     drop = re.sub(rf"^{first} ", "", drop)
     angle = (
@@ -79434,8 +79519,8 @@ def speakbox_angle(quote: dict[str, str],
         "into the flow of the show, not read as a list. Take as many turns "
         "as it needs. Never call them a quotation, never say where they came "
         f"from, never name whoever said them first. Then {first} {drop}. "
-        f"{other} is {unrepeated(list(SPEAKBOX_REACTIONS), 'reaction')}, and "
-        f"must {unrepeated(list(SPEAKBOX_ENGAGE), 'engage')} — in the very "
+        f"{other} is {s3_unrepeated('speakbox.reaction', SPEAKBOX_REACTIONS, 'reaction', 'how the one who hears the passage takes it')}, and "   # [s3-dice4]
+        f"must {s3_unrepeated('speakbox.engage', SPEAKBOX_ENGAGE, 'engage', 'what the one who hears the passage must do with it')} — in the very "
         f"next line, before anything else. {other} does not change the "
         "subject, does not ignore it, and does not move the show along until "
         "it has been dealt with."
@@ -80801,6 +80886,11 @@ def sfxguy_line(voice: str, context: str = "", director: Any = None) -> str:
         # outdraw the stock shelf at the crystal's own strength.
         _wstr = max(int(c.get("strength") or 50) for c in _wcrs)
         warp = max(warp, min(95, _wstr))
+    # [s3-dice4] a line no System 3 plan chose (a round it did not write)
+    # still rolls System 3's dice: the news break and the warp dial as
+    # STATION1 odds, each pick off a pile recorded - never random() here
+    if director is None:
+        director = _S3SfxGuyDice(warp)
     line = ""
     # [s3-roads] `director` is System 3's chooser for this line: the plan's
     # kind order and its own recorded numbers stand in for the three
@@ -84302,6 +84392,11 @@ async def drop_liner(station: str, director: Any = None) -> str:
             pass
         return line
     naming = [ln for ln in DROP_LINES if "{station}" in ln] or list(DROP_LINES)
+    # [s3-dice4] the shelf is a POOLS1 row set (sfxguy.id_shelf) the desk may
+    # rewrite; the draw below fills {station} with str.format, so any other
+    # brace in a row is escaped - the operator's words are never a format error
+    naming = [ln.replace("{", "{{").replace("}", "}}").replace("{{station}}", "{station}")
+              for ln in s3_pool("sfxguy.id_shelf", naming, "which shelf station ID he shouts (none written)")]
     _plain = unrepeated([ln.format(station=station) for ln in naming],
                         "drop_fallback", keep=3, director=director if director is not None else _S3Dice("sfxguy.id_shelf", "which shelf station ID he shouts (none written)"))   # [s3-roads] [s3-dice-door]
     # #1111: AND THE FALLBACK GETS THE CRYSTAL, WITH THE NAME HELD.
@@ -86810,7 +86905,8 @@ async def _sting_react(who: str) -> None:
     try:
         await asyncio.sleep(0.7)
         await dj_speak("reply", None,
-                       line=unrepeated(list(COMPLAINT_LINES), "sting-react"),
+                       line=s3_unrepeated("sting.complaint_line", COMPLAINT_LINES, "sting-react",   # [s3-dice4]
+                                          "what the other presenter groans after the board's clip (#292)"),
                        who=who, by_hand=True)
     except Exception:
         pass
@@ -95272,9 +95368,10 @@ async def dj_callin(topic: str, caller: str = "") -> dict[str, Any]:
     # on.
     line_say = call_line_say(call_line_no())
     who = caller.strip() or s3_choice("call.callin_who",   # [s3-dice-door]
-        ["a caller", "a listener", f"someone on {line_say}",
+        ["a caller", "a listener", "someone on {line}",   # [s3-dice4] a slot: a tabled row froze the first call's line
          "a caller who would not give a name"], "who the call-in is announced as")          # #673
 
+    who = _s3_fill(who, line=line_say)   # [s3-dice4] this call's line fills the desk row's slot
     angle = (
         f"{who} has just rung the station about this, and it is now on air: "
         f"\"{topic}\". Take the call seriously as a topic and actually "
@@ -100755,7 +100852,12 @@ async def call_rerun_take(track: dict[str, Any] | None = None) -> list[str]:
                 "source": str(row.get("source") or ""),
                 "voice": str(row.get("voice") or ""),
             })
-            intro = unrepeated(list(CALL_RERUN_INTROS), "rerun-intro").format(
+            # [s3-dice4] the intro is a POOLS1 row set (call.rerun_intro) drawn
+            # by System 3's dice; the desk may rewrite it, so the slots are
+            # filled by name and a stray brace is the operator's words
+            intro = _s3_fill(s3_unrepeated(
+                "call.rerun_intro", CALL_RERUN_INTROS, "rerun-intro",
+                "the host's intro to a call aired again from earlier tonight (#1033)"),
                 name=name, premise=premise or "something")
             try:
                 # #1033: the crystal tints the phones - the recording was
@@ -101977,7 +102079,7 @@ async def caller_topic() -> tuple[str, dict[str, Any]]:
             return (
                 "The caller is ringing, unprompted, about this exact "
                 f"topic and will not be moved off it: "
-                f"\"{unrepeated(planted, 'caller-topic')}\" They have "
+                f"\"{unrepeated(planted, 'caller-topic', director=_S3Dice('call.planted_topic', 'which of your Topics a caller rings about, cold (#395)'))}\" They have "   # [s3-dice4]
                 "arrived with opinions, examples and a grudge about it.",
                 {})
     if roll < 0.92:
@@ -103419,7 +103521,7 @@ async def caller_clock() -> None:
             # not there — and then the phone goes again.
             if rate >= 20 and s3_chance("call.flood_banter", 0.5, "at flood rates the pair crack on air between calls (#352)"):   # [s3-dice-door]
                 try:
-                    await dj_banter(None, lines=3, angle=unrepeated([
+                    await dj_banter(None, lines=3, angle=s3_unrepeated("call.flood_angle", [   # [s3-dice4]
                         "the phones will NOT stop today — say so on air, "
                         "half proud, half broken",
                         "one of you swears you can hear ringing even when "
@@ -103434,7 +103536,7 @@ async def caller_clock() -> None:
                         "reflex and has to play it off",
                         "argue about whose turn it is to take the next one "
                         "— neither of you can feel your ears",
-                    ], "phonetired"))
+                    ], "phonetired", "what the pair say, cracking under a phone flood (#352)"))
                 except Exception:
                     pass
 
@@ -103966,13 +104068,18 @@ def air_gate(recorded: bool, who: str, text: str, why: str) -> bool:
     return False
 
 
-def note_drop(who: str, text: str, why: str) -> None:
+def note_drop(who: str, text: str, why: str,
+              context: dict[str, Any] | None = None) -> None:
     """A line the machinery rejected, and why. The sim shows these beside the
     lines that made it, which is the 'what got chosen or rejected' half of
     #234 — until now a rejected line simply vanished."""
     gate, technical = line_review_drop_gate(why)
     line_review_capture(gate, str(text or ""), reasons=[str(why or "")],
-                        context={"who": str(who or ""),
+                        # [review-queue] what the caller knows about the line - its
+                        # System 3 turn, its line id, its round - rides the review, so
+                        # the desk finds the node that made it without guessing
+                        context={**(context if isinstance(context, dict) else {}),
+                                 "who": str(who or ""),
                                  "stage": "recording_or_air_admission"},
                         technical=technical or not str(text or "").strip())
     dropped = _RADIO.setdefault("dropped", [])
@@ -107009,11 +107116,13 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                 if shelf_ok:
                     box_hold(clip, item["chunk"], item["who"])
                     note_drop(item["who"], item["chunk"],
-                              "round cut mid-flight — held for replay")
+                              "round cut mid-flight — held for replay",
+                              context=review_cut_context(ready_meta, item, _round_sid))   # [review-queue]
                     continue
                 note_drop(item["who"], item["chunk"],
                           "round cut mid-flight — the box is not the "
-                          "destination, so nothing was shelved")
+                          "destination, so nothing was shelved",
+                          context=review_cut_context(ready_meta, item, _round_sid))   # [review-queue]
         leftover.cancel()
     return spoken
 
@@ -108210,7 +108319,7 @@ async def dj_banter(track: dict[str, Any] | None = None,
             # GPU they settled down with.
             angle = await station_weather_angle()
         _stock = (about_track + placement
-                  + domestic_angles() + callback_angles() + [
+                  + domestic_angles() + callback_angles() + s3_pool("banter.stock_angle", [   # [s3-dice4] a POOLS1 row set
             "gossip about a request he made, as though it were scandalous",
             "one of you claims to have heard someone else ask for the same "
             "thing",
@@ -108294,7 +108403,7 @@ async def dj_banter(track: dict[str, Any] | None = None,
             "one of you admits to being nervous and curious about "
             "whatever is guiding you from the back end tonight; the "
             "other pretends not to feel it too, badly",
-        ])
+        ], "which stock angle the free round takes"))
         # The art-hawking governor: outside the ~15-minute window the
         # gallery-selling angles leave the pool entirely, so the free rounds
         # stay off-the-wall speakbox territory instead of a rolling auction.
@@ -108714,8 +108823,10 @@ async def dj_banter(track: dict[str, Any] | None = None,
             # pairing came round inside a few rounds and read as the
             # repetition the request is about.
             + (("THE DICE ARE ON THIS ROUND. A is "
-                + unrepeated(list(HOST_TEMPERS), "temper-a") + "; B is "
-                + unrepeated(list(HOST_TEMPERS), "temper-b")
+                + s3_unrepeated("banter.host_temper", HOST_TEMPERS, "temper-a",   # [s3-dice4]
+                                "the temper a host is caught in when the dice are on (#676)") + "; B is "
+                + s3_unrepeated("banter.host_temper", HOST_TEMPERS, "temper-b",
+                                "the temper a host is caught in when the dice are on (#676)")
                 + ". Play those temperaments "
                 "HARD — they colour the phrasing, the pacing and what each "
                 "of them chooses to react to. They are still themselves, "
@@ -111702,7 +111813,7 @@ HEAT_SO_HOT = [
 def heat_joke_bank(most: int = 6) -> str:
     """A handful of comparatives, shuffled, plus whatever the model has
     evolved for the current band (#644)."""
-    pool = list(HEAT_SO_HOT)
+    pool = list(s3_pool("call.heat_jokes", HEAT_SO_HOT, "which heat comparatives the pair are handed"))   # [s3-dice4] a POOLS1 row set
     band, _c = heat_band()
     if band:
         pool += [line for line in _heat_read().get(band, []) if line]
@@ -112232,12 +112343,16 @@ async def dj_caller(track: dict[str, Any] | None = None,
             load_scenario_catalog, data_path("call_scenarios.json"))
         _scenario = select_call_scenario(
             _scenario_catalog,
-            target_heat=case_heat(_case) / 3.0 if _case else None)
+            target_heat=case_heat(_case) / 3.0 if _case else None,
+            # [s3-dice4] the scenario, its six beats and its landing are System
+            # 3's draws at the catalog's own weights (the catalog is the editor)
+            rng=_S3Weighted("call.scenario", "which scenario frames the call"))
         if _scenario:
             _call_meta["scenario"] = call_path_draw(
                 _scenario, caller_name=_cname,
                 topic=str(_call_meta.get("topic") or ""),
-                case_outcome=str(rule.get("text") or ""))
+                case_outcome=str(rule.get("text") or ""),
+                rng=_S3Weighted("call.scenario", "the call's path"))   # [s3-dice4]
             _call_meta["scenario_catalog"] = str(_scenario_catalog.get("source") or "")
     except (OSError, TypeError, ValueError) as exc:
         pipeline_log("call", "the scenario draw was skipped: "
@@ -143660,7 +143775,12 @@ REVIEW_QUEUE_MODES = (REVIEW_QUEUE_OFF, REVIEW_QUEUE_TRACE, REVIEW_QUEUE_SWEEP)
 # that one and has since 2026-09-08, and two arms grading the same row
 # would fight over its verdict.  These two are the 565 of 581 nothing
 # reads.
-REVIEW_QUEUE_SCAN_GATES = ("segment_brief", "call_contract")
+# [review-queue] 2026-09-28: and the timing gate - a line the talk cut
+# stopped mid-flight. Its round was ON THE AIR when it was cut, so once the
+# round is gone there is no place left to put the line back, and nothing
+# read these rows at all: the one pending row on the desk that morning had
+# waited 27.6 hours for a decision nobody could make.
+REVIEW_QUEUE_SCAN_GATES = ("segment_brief", "call_contract", "timing")
 # A row must be BOTH unmatched AND this old before its subject is called
 # gone.  The tint arm uses 1800 s; this is deliberately six times that,
 # because the grace exists only to protect a round that has been written
@@ -144563,6 +144683,913 @@ async def api_line_review_context(
     }
 
 
+# =====================================================================
+# [review-queue] 2026-09-28: EVERY ITEM ON THE DESK'S REVIEW STRIP CAN BE
+# CLOSED, AND EVERY ONE SAYS WHAT SYSTEM 3 KNOWS ABOUT IT.
+#
+# The operator, verbatim: "When I tap them, there's not options to fix them
+# or resolve them or mark them as complete or to get rid of them. So they
+# just scroll forever. I don't know what they're for. And also they don't
+# seem to be talking about any information from system three."
+#
+# MEASURED, live, before a line of this was written: one pending row in
+# 58,394 - a `timing` cut 27.6 hours old, the cohost's rendered take thrown
+# away when the talk cut stopped its round mid-flight and the box was not
+# the destination. The desktop strip showed it eight times over (a marquee
+# that recycled its first page for ever). It WAS System 3's - banter round
+# a1b134f233c04813, turn t03 (Skip, response_a2) - but only its words could
+# say so, because note_drop kept who, stage and the words and nothing else.
+# Nothing reads the timing gate: #1192's sweep reads segment_brief and
+# call_contract, the regrade reads tint. And the pane's only two decisions
+# were editorial - allow rebuilds a round from the capture (which the
+# strict System 3 gate then withholds from the air) and keep TEACHES the
+# writer "the operator agreed with this cut". Neither of them means "done".
+#
+# So: RESOLVE and DISMISS, for one row or a batch. Both move a pending row to
+# `noted` - where the machine's own closes already live and stay readable -
+# and write the operator's decision into review_decisions, which is what
+# the pane's "Review decisions" reads. Neither allows, keeps, teaches the
+# writer, touches the approved-fingerprint set or puts a word on the air.
+# A FIX is offered only where one exists: the allow road, while the row's
+# round still waits on the shelf.
+#
+# System 3 is read through a READ-ONLY door of our own onto its ledger (the
+# #1192 desk's shape): never System 3's connection, lock or executor, so a
+# review page can never queue behind its writer.
+# =====================================================================
+REVIEW_CLOSE_ACTIONS = ("resolve", "dismiss")
+REVIEW_CLOSE_WORDS = {"resolve": "Marked complete by the operator",
+                      "dismiss": "Dismissed by the operator"}
+# What the station's own desks write on a row they close (note_stale); the
+# history lists these beside the operator's decisions.
+REVIEW_STATION_CLOSES = ("round_gone", "superseded", "stale_grader", "read_plain")
+REVIEW_BULK_MOST = int(os.getenv("PINE_REVIEW_BULK_MOST", "2000"))
+REVIEW_BULK_CHUNK = 20
+REVIEW_HISTORY_SCAN = int(os.getenv("PINE_REVIEW_HISTORY_SCAN", "600"))
+# How far before a row's first cut its words are looked for in System 3's
+# ledger, and how many rounds one lookup may open.
+REVIEW_S3_BEFORE = float(os.getenv("PINE_REVIEW_S3_BEFORE", "21600"))
+REVIEW_S3_AFTER = 180.0
+REVIEW_S3_ROUNDS = int(os.getenv("PINE_REVIEW_S3_ROUNDS", "60"))
+REVIEW_S3_BUDGET = int(os.getenv("PINE_REVIEW_S3_BUDGET", "180"))
+REVIEW_S3_MEMO_TTL = 600.0
+_REVIEW_S3_MEMO: dict[str, Any] = {}
+REVIEW_S3_GATE_FAMILIES = ("WITHHELD", "ABANDONED", "WITHDRAWN", "CUT", "REFUSED", "DROPPED")
+# Gates that judge a whole round: their row is the round, not one turn.
+REVIEW_WHOLE_GATES = ("segment_brief", "call_contract", "radio_draft", "blend",
+                      "tint_structure", "draft_fragment", "draft_trimming", "freshen_structure")
+REVIEW_AGE_STEPS = (3600, 21600, 86400, 259200, 604800)
+REVIEW_GATE_WORDS = {
+    "timing": ("The talk cut stopped this line's round mid-flight - at a turn boundary, when "
+               "something urgent took the floor or the turn cap ended a long round. The line had "
+               "been rendered and was never heard."),
+    "tint": ("The crystal rewrite refused this line: its rhymed version failed the grader, so "
+             "the line left its round."),
+    "tint_structure": "The crystal rewrite changed this round's shape (its turns or speakers), so the rewrite was refused.",
+    "tint_length": "The crystal rewrite came back the wrong length for this line.",
+    "call_contract": "The phone-call contract refused this call's script before it was recorded.",
+    "segment_brief": ("The segment brief held this whole round before the recording room: the "
+                      "script never got to what its slot was for."),
+    "repetition": "The repetition gate took this line out: it was too close to something already said.",
+    "freshness": "The line expired before it could air.",
+    "recording_requirement": "The recording room could not make audio for it - a technical failure, not the words.",
+    "radio_draft": "The draft missed its conversational target and was written again.",
+    "blend": "The blend pass changed a preserved passage or the turn count, so the blended version was refused.",
+    "track_talk": "The track-talk desk refused this link about a record.",
+    "phrase_ban": "A banned phrase was found in it.",
+    "line_quality": "A general quality judgment took it out.",
+}
+
+
+def review_cut_context(meta: Any, item: Any, round_sid: str = "") -> dict[str, Any]:
+    """What a line cut at air knows about itself, for its review row: the
+    System 3 turn that made it, its line id and its round. Never raises."""
+    out: dict[str, Any] = {}
+    try:
+        meta = meta if isinstance(meta, dict) else {}
+        item = item if isinstance(item, dict) else {}
+        if item.get("line_id"):
+            out["line_id"] = str(item.get("line_id"))
+        if round_sid:
+            out["round_sid"] = str(round_sid)
+        kind = str(meta.get("prep_kind") or "")
+        if kind:
+            out["kind"] = kind
+        s3 = meta.get("system3")
+        if isinstance(s3, dict) and s3.get("conversation_id"):
+            tid = ""
+            finder = globals().get("system3_turn_id_for")
+            if callable(finder):
+                try:
+                    tid = str(finder(meta, str(item.get("turn_text") or item.get("chunk") or ""),
+                                     str(item.get("who") or "")) or "")
+                except Exception:  # noqa: BLE001
+                    tid = ""
+            out["system3"] = {"conversation_id": str(s3.get("conversation_id") or ""),
+                              "turn_id": tid, "mode": str(s3.get("mode") or "")}
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
+def _review_write_db() -> Any:
+    """Our own WRITE door onto the review store, for closes only. One short
+    BEGIN IMMEDIATE per close (or per chunk of a batch), the store's own
+    discipline, so a capture on the loop never waits long behind it. The
+    store keeps no in-memory copy of a row's status - only approvals,
+    preferences and one-time grants, none of which a close touches - so a
+    close through this door leaves the store's memory true."""
+    import sqlite3
+    db = sqlite3.connect(str(_LINE_REVIEW.path), timeout=20.0, isolation_level=None)
+    db.row_factory = sqlite3.Row
+    db.execute("PRAGMA foreign_keys=ON")
+    return db
+
+
+def _review_positive(value: Any, name: str) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(name + " must be a positive integer")
+    return value
+
+
+def _review_close_row(db: Any, review_id: str, action: str, note: str, by: str,
+                      batch: str, why: str, revision: Any = None,
+                      event_seq: Any = None) -> dict[str, Any]:
+    """Inside an open transaction: close one row, or say why not."""
+    row = db.execute("SELECT id,review_status,revision,latest_seq FROM line_reviews WHERE id=?",
+                     (str(review_id),)).fetchone()
+    if row is None:
+        raise KeyError("No such line review")
+    if event_seq is not None and event_seq != int(row["latest_seq"]):
+        raise ReviewConflictError("This cut has a newer occurrence; reload it before closing it")
+    if revision is not None and revision != int(row["revision"]):
+        raise ReviewConflictError("This review changed; reload it before closing it")
+    if row["review_status"] != "pending":
+        return {"changed": False, "status": str(row["review_status"])}
+    now = time.time()
+    decision = {"action": action, "note": note, "at": now, "by": by}
+    if batch:
+        decision["batch"] = batch
+    if why:
+        decision["why"] = why
+    effect = {"status": "resolved" if action == "resolve" else "dismissed",
+              "say": (note or REVIEW_CLOSE_WORDS[action])[:200], "at": now, "by": by}
+    db.execute("UPDATE line_reviews SET review_status='noted',revision=revision+1,effect=? WHERE id=?",
+               (json.dumps(effect, ensure_ascii=False), row["id"]))
+    db.execute("INSERT INTO review_decisions(review_id,at,body) VALUES (?,?,?)",
+               (row["id"], now, json.dumps(decision, ensure_ascii=False)))
+    return {"changed": True, "status": "noted", "effect": effect, "decision": decision}
+
+
+def review_close(review_id: str, action: str, note: Any = "", expected_revision: Any = None,
+                 expected_event_seq: Any = None, by: str = "operator") -> dict[str, Any]:
+    """Close ONE pending row as resolved or dismissed. A worker thread only.
+
+    Refused with a conflict when the operator read an older revision or an
+    older occurrence - the same guard decide() has - and a no-op on a row
+    that is already closed."""
+    if action not in REVIEW_CLOSE_ACTIONS:
+        raise ValueError("action must be resolve or dismiss")
+    note = "" if note is None else note
+    if not isinstance(note, str) or len(note) > 2000:
+        raise ValueError("note must be text of at most 2000 characters")
+    revision = _review_positive(expected_revision, "expected_revision")
+    event_seq = _review_positive(expected_event_seq, "expected_event_seq")
+    db = _review_write_db()
+    try:
+        db.execute("BEGIN IMMEDIATE")
+        try:
+            got = _review_close_row(db, review_id, action, note.strip(), str(by or "operator")[:40],
+                                    "", "", revision, event_seq)
+            db.execute("COMMIT")
+        except BaseException:
+            try:
+                db.execute("ROLLBACK")
+            except Exception:  # noqa: BLE001
+                pass
+            raise
+    finally:
+        db.close()
+    if got.get("changed"):
+        _REVIEW_QUEUE_SEEN["shape"] = {}         # the banner's count is stale by construction
+        got["say"] = REVIEW_CLOSE_WORDS[action] + ": it left the queue and stays in the history."
+    else:
+        got["say"] = "Already closed - it is " + str(got.get("status") or "closed") + "."
+    got["ok"] = True
+    return got
+
+
+async def review_close_route(review_id: str, body: dict[str, Any]) -> dict[str, Any]:
+    """POST /api/orchestrator/rejections/{id} with a resolve or dismiss."""
+    action = str(body.get("action") or "")
+    got = await asyncio.to_thread(review_close, review_id, action, body.get("note", ""),
+                                  body.get("expected_revision"), body.get("expected_event_seq"))
+    if got.get("changed"):
+        station_flow_event("repair", "operator",
+                           "Operator " + ("resolved" if action == "resolve" else "dismissed") + " a review",
+                           {"review_id": review_id, "action": action,
+                            "note": str(body.get("note") or "")[:240]}, trace_id=review_id)
+    got["row"] = await asyncio.to_thread(_LINE_REVIEW.get, review_id)
+    return got
+
+
+def review_open_rows(limit: int = 200) -> list[dict[str, Any]]:
+    """The OPEN (pending) rows, newest first, through the read-only door, with
+    only the context fields the desk reads - never the whole parent script."""
+    most = max(1, min(int(limit or 1), REVIEW_BULK_MOST))
+    out: list[dict[str, Any]] = []
+    db = _review_queue_db()
+    try:
+        cursor = db.execute(
+            "SELECT id,gate,disposition,technical,first_at,last_at,latest_seq,revision,"
+            "occurrences,reasons,substr(source,1,4000) AS source,substr(candidate,1,400) AS candidate,"
+            "json_extract(context,'$.system3') AS s3,json_extract(context,'$.entry.system3') AS entry_s3,"
+            "json_extract(context,'$.line_id') AS line_id,json_extract(context,'$.kind') AS kind,"
+            "json_extract(context,'$.who') AS who,json_extract(context,'$.speaker') AS speaker,"
+            "json_extract(context,'$.stage') AS stage "
+            "FROM line_reviews WHERE review_status='pending' ORDER BY latest_seq DESC LIMIT ?", (most,))
+        for raw in cursor:
+            ctx: dict[str, Any] = {"kind": str(raw["kind"] or ""),
+                                   "who": str(raw["who"] or raw["speaker"] or ""),
+                                   "stage": str(raw["stage"] or "")}
+            if raw["line_id"]:
+                ctx["line_id"] = str(raw["line_id"])
+            s3 = _review_queue_json(raw["s3"]) if raw["s3"] else {}
+            if isinstance(s3, dict) and s3:
+                ctx["system3"] = s3
+            entry_s3 = _review_queue_json(raw["entry_s3"]) if raw["entry_s3"] else {}
+            if isinstance(entry_s3, dict) and entry_s3:
+                ctx["entry"] = {"system3": entry_s3}
+            out.append({
+                "id": str(raw["id"]), "gate": str(raw["gate"] or ""),
+                "disposition": str(raw["disposition"] or ""), "technical": bool(raw["technical"]),
+                "first_at": float(raw["first_at"] or 0), "last_at": float(raw["last_at"] or 0),
+                "latest_seq": int(raw["latest_seq"] or 0), "event_seq": int(raw["latest_seq"] or 0),
+                "revision": int(raw["revision"] or 0), "occurrences": int(raw["occurrences"] or 1),
+                "reasons": list(_review_queue_json(raw["reasons"], []) or []),
+                "source": str(raw["source"] or ""), "candidate": str(raw["candidate"] or ""),
+                "review_status": "pending", "context": ctx})
+    finally:
+        try:
+            db.close()
+        except Exception:  # noqa: BLE001
+            pass
+    return out
+
+
+def review_s3_path() -> Path:
+    """System 3's ledger - the very file system3_runtime writes."""
+    return data_path("system3.sqlite3")
+
+
+def _review_s3_db() -> Any:
+    """A READ-ONLY door onto System 3's ledger, or None when it has none."""
+    import sqlite3
+    path = Path(review_s3_path())
+    if not path.is_file():
+        return None
+    return sqlite3.connect("file:" + path.as_posix() + "?mode=ro", uri=True, timeout=10.0)
+
+
+def _review_words(text: Any) -> str:
+    """Words as the ledger and the review can both be read: case, curly
+    quotes and spacing do not count."""
+    return " ".join(str(text or "").replace("’", "'").replace("‘", "'")
+                    .replace("“", '"').replace("”", '"').lower().split())[:4000]
+
+
+def _review_s3_round(db: Any, cid: str, cache: dict[str, Any], budget: dict[str, Any],
+                     force: bool = False) -> Any:
+    """One round out of the ledger: its body, {} when it is not held, None
+    when this lookup has spent its budget (unknown - not absent)."""
+    if cid in cache:
+        return cache[cid]
+    if not force and int(budget.get("left") or 0) <= 0:
+        return None
+    budget["left"] = int(budget.get("left") or 0) - 1
+    import zlib
+    got = db.execute("SELECT body, created FROM conversations WHERE id=?", (cid,)).fetchone()
+    conv: Any = {}
+    if got is not None:
+        try:
+            conv = json.loads(zlib.decompress(got[0]).decode("utf-8"))
+        except Exception:  # noqa: BLE001
+            conv = {}
+        if isinstance(conv, dict) and conv:
+            conv["_created"] = float(got[1] or 0)
+    cache[cid] = conv if isinstance(conv, dict) else {}
+    time.sleep(0.002)          # a thread: hand the interpreter back between rounds
+    return cache[cid]
+
+
+def _review_s3_turn(conv: Any, tid: str, words: str) -> Any:
+    """The turn a review row is about: by its id, else by its words."""
+    turns = [t for t in ((conv or {}).get("turns") or []) if isinstance(t, dict)]
+    if tid:
+        for t in turns:
+            if str(t.get("turn_id") or "") == tid:
+                return t
+    if not words:
+        return None
+    loose = None
+    for t in turns:
+        said = _review_words(t.get("text"))
+        if not said:
+            continue
+        if said == words:
+            return t
+        if loose is None and len(words) >= 16 and (words in said or (len(said) >= 16 and said in words)):
+            loose = t
+    return loose
+
+
+def _review_s3_by_words(db: Any, words: str, first_at: float, whole: bool,
+                        cache: dict[str, Any], budget: dict[str, Any]) -> tuple[str, str, str]:
+    """(conversation, turn, how) for a row that kept no link: the rounds
+    System 3 planned in the hours before the cut, newest first, whose turns
+    carry these words. A whole-round row matches a round when two of its
+    turns are inside the round's script."""
+    if len(words) < 16 or not first_at:
+        return "", "", "no_words"
+    rows = db.execute("SELECT id FROM conversations WHERE created BETWEEN ? AND ? "
+                      "ORDER BY created DESC LIMIT ?",
+                      (first_at - REVIEW_S3_BEFORE, first_at + REVIEW_S3_AFTER,
+                       REVIEW_S3_ROUNDS)).fetchall()
+    if not rows:
+        return "", "", "no_rounds"
+    for (cid,) in rows:
+        conv = _review_s3_round(db, str(cid), cache, budget)
+        if conv is None:
+            return "", "", "budget"
+        if not conv:
+            continue
+        if whole:
+            inside = [t for t in (conv.get("turns") or []) if isinstance(t, dict)
+                      and len(_review_words(t.get("text"))) >= 16
+                      and _review_words(t.get("text")) in words]
+            if len(inside) >= min(2, len(conv.get("turns") or [])):
+                return str(cid), "", "found"
+            continue
+        turn = _review_s3_turn(conv, "", words)
+        if turn:
+            return str(cid), str(turn.get("turn_id") or ""), "found"
+    return "", "", "no_match"
+
+
+def _review_s3_events(db: Any, cid: str, tid: str) -> list[dict[str, Any]]:
+    """What System 3 itself recorded about this round being held back or cut."""
+    import zlib
+    out: list[dict[str, Any]] = []
+    marks = ",".join("?" for _ in REVIEW_S3_GATE_FAMILIES)
+    for family, turn_id, body, at in db.execute(
+            "SELECT family, turn_id, body, at FROM events WHERE conversation_id=? AND kind='observation' "
+            "AND family IN (" + marks + ") ORDER BY id LIMIT 20", (cid,) + tuple(REVIEW_S3_GATE_FAMILIES)):
+        if turn_id and tid and str(turn_id) != tid:
+            continue
+        try:
+            got = json.loads(zlib.decompress(body).decode("utf-8"))
+        except Exception:  # noqa: BLE001
+            got = {}
+        out.append({"family": str(family or ""), "turn_id": str(turn_id or ""), "at": float(at or 0),
+                    "stage": str(got.get("stage") or "")[:60],
+                    "why": str(got.get("why") or got.get("reason") or "")[:300]})
+    return out
+
+
+def _review_s3_say(link: dict[str, Any], gate: str) -> str:
+    how = {"round": " (the round's own System 3 stamp)", "line": " (the script ledger's link)",
+           "words": " (found by its words: this review kept no link)"}.get(str(link.get("why") or ""), "")
+    road = str(link.get("road") or "a")
+    cid = str(link.get("conversation_id") or "")
+    turn = link.get("turn") or None
+    if str(link.get("mode") or "") == "shadow":
+        said = ("System 3 only shadowed this %s round (%s): it planned beside the old writer, "
+                "which wrote the words%s." % (road, cid, how))
+    elif turn:
+        said = ("System 3 directed this line: %s round %s, turn %d of %d - %s on the %s node%s."
+                % (road, cid, int(turn.get("number") or 0), int(turn.get("of") or 0),
+                   str(turn.get("name") or turn.get("speaker") or "a seat"),
+                   str(turn.get("node_label") or turn.get("node") or "?"), how))
+    elif link.get("whole"):
+        said = ("System 3 directed this %s round (%s, %d turns)%s; the %s gate took the whole round, "
+                "not one turn." % (road, cid, int(link.get("turns") or 0), how, gate.replace("_", " ") or "station's"))
+    else:
+        said = ("Part of System 3's %s round %s%s, but none of its planned turns carries these words: "
+                "the station put the line in at air." % (road, cid, how))
+    held = link.get("withheld")
+    if isinstance(held, dict) and held.get("why"):
+        said += " System 3 recorded the round as %s: %s" % (str(held.get("stage") or "withheld"),
+                                                            str(held.get("why"))[:200])
+    return said
+
+
+def review_system3_link(row: dict[str, Any], db: Any = None, cache: Any = None,
+                        budget: Any = None) -> dict[str, Any]:
+    """The System 3 record behind one review row, or why there is none.
+
+    In order: the row's own stamp (a line cut at air, from now on), the
+    round's stamp (a hold or a cut that kept its entry), the script ledger's
+    line link, and last the WORDS - the rounds System 3 planned in the hours
+    before the cut. A worker thread only; it opens SQLite."""
+    ctx = row.get("context") if isinstance(row.get("context"), dict) else {}
+    entry = ctx.get("entry") if isinstance(ctx.get("entry"), dict) else {}
+    gate = str(row.get("gate") or "")
+    whole = (review_queue_kind(gate, row.get("disposition"), row.get("technical")) == "hold"
+             or gate in REVIEW_WHOLE_GATES)
+    words = _review_words(row.get("source") or row.get("candidate"))
+    first_at = float(row.get("first_at") or 0)
+    cache = {} if cache is None else cache
+    budget = {"left": REVIEW_S3_BUDGET} if budget is None else budget
+    own = db is None
+    if own:
+        db = _review_s3_db()
+        if db is None:
+            return {"state": "off", "why": "no_ledger",
+                    "say": "This station keeps no System 3 ledger, so there is nothing to ask."}
+    try:
+        cid, tid, how = "", "", ""
+        stamp = ctx.get("system3")
+        if isinstance(stamp, dict) and stamp.get("conversation_id"):
+            cid, tid, how = str(stamp.get("conversation_id")), str(stamp.get("turn_id") or ""), "stamp"
+        entry_stamp = entry.get("system3")
+        if not cid and isinstance(entry_stamp, dict) and entry_stamp.get("conversation_id"):
+            cid, how = str(entry_stamp.get("conversation_id")), "round"
+        if not cid and ctx.get("line_id"):
+            got = db.execute("SELECT conversation_id, turn_id FROM lines WHERE line_id=?",
+                             (str(ctx.get("line_id")),)).fetchone()
+            if got and got[0]:
+                cid, tid, how = str(got[0]), str(got[1] or ""), "line"
+        search = ""
+        if not cid:
+            cid, tid, search = _review_s3_by_words(db, words, first_at, whole, cache, budget)
+            how = "words" if cid else ""
+        if not cid:
+            if search == "budget":
+                return {"state": "unknown", "why": "budget",
+                        "say": "Not looked up this time (too many to search at once); open it to ask System 3."}
+            oldest = db.execute("SELECT MIN(created) FROM conversations").fetchone()
+            oldest = float((oldest[0] if oldest else 0) or 0)
+            if not oldest or (first_at and first_at < oldest) or search == "no_rounds":
+                return {"state": "none", "why": "before",
+                        "say": ("No System 3 record: this is from before System 3 directed this road "
+                                "(nothing in its ledger - which keeps seven days - planned a round then).")}
+            if search == "no_words":
+                return {"state": "none", "why": "no_words",
+                        "say": "No System 3 record, and too few words were kept to look for one."}
+            return {"state": "none", "why": "unlinked",
+                    "say": ("No System 3 record: System 3 was planning rounds then, but none of its turns "
+                            "carries these words - a line from a road System 3 did not direct.")}
+        conv = _review_s3_round(db, cid, cache, budget, force=True)
+        if not conv:
+            return {"state": "gone", "why": "retention", "conversation_id": cid, "turn_id": tid,
+                    "say": ("System 3 directed it (round %s), but that round is past the seven days "
+                            "System 3's ledger keeps." % cid)}
+        turn = _review_s3_turn(conv, tid, "" if whole else words)
+        turns = [t for t in (conv.get("turns") or []) if isinstance(t, dict)]
+        ident = conv.get("identity") if isinstance(conv.get("identity"), dict) else {}
+        subject = conv.get("subject") if isinstance(conv.get("subject"), dict) else {}
+        turn_id = str((turn or {}).get("turn_id") or tid or "")
+        link: dict[str, Any] = {
+            "state": "linked", "why": how, "conversation_id": cid, "turn_id": turn_id,
+            "road": str(ident.get("road_kind") or ""), "mode": str(conv.get("mode") or ""),
+            "status": str(conv.get("status") or ""), "engine": str(conv.get("engine") or ""),
+            "created": float(conv.get("_created") or conv.get("created") or 0),
+            "topic": " ".join(str(subject.get("topic") or "").split())[:240],
+            "turns": len(turns), "whole": bool(whole and not turn),
+            "withheld": conv.get("withheld") if isinstance(conv.get("withheld"), dict) else None,
+            "events": _review_s3_events(db, cid, turn_id), "turn": None}
+        if turn:
+            index = int(turn.get("index") or 0)
+            # the rolls the turn's own story shows: its decisions, its
+            # speakerbox draws, its SFX and the SFX Guy's node (turnEvents)
+            rolled = {str(d.get("event_id")) for d in (turn.get("decisions") or [])
+                      if isinstance(d, dict) and d.get("event_id")}
+            rolled |= {str(s.get("event_id")) for s in (turn.get("speakerbox") or [])
+                       if isinstance(s, dict) and s.get("event_id")}
+            for key in ("sfx", "sfxguy"):
+                if isinstance(turn.get(key), dict) and turn[key].get("event_id"):
+                    rolled.add(str(turn[key]["event_id"]))
+            link["turn"] = {
+                "turn_id": turn_id, "index": index, "number": index + 1, "of": len(turns),
+                "speaker": str(turn.get("speaker") or ""), "name": str(turn.get("name") or ""),
+                "node": str(turn.get("step") or turn.get("leg") or ""),
+                "node_label": str(turn.get("step_label") or turn.get("leg_label")
+                                  or turn.get("step") or turn.get("leg") or ""),
+                "phase": str(turn.get("phase") or ""), "text": str(turn.get("text") or "")[:600],
+                "rolls": len(rolled)}
+        link["say"] = _review_s3_say(link, gate)
+        return link
+    finally:
+        if own:
+            try:
+                db.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+
+def review_s3_known(row: dict[str, Any], db: Any, cache: Any, budget: Any) -> dict[str, Any]:
+    """review_system3_link, remembered for ten minutes per row revision - a
+    row's System 3 record does not move under it."""
+    key = str(row.get("id") or "")
+    revision = int(row.get("revision") or 0)
+    now = time.time()
+    hit = _REVIEW_S3_MEMO.get(key)
+    if (hit and hit[0] == revision and now - hit[1] < REVIEW_S3_MEMO_TTL
+            and hit[2].get("state") != "unknown"):
+        return copy.deepcopy(hit[2])
+    got = review_system3_link(row, db=db, cache=cache, budget=budget)
+    if key:
+        _REVIEW_S3_MEMO[key] = (revision, now, copy.deepcopy(got))
+        if len(_REVIEW_S3_MEMO) > 4000:
+            for old in sorted(_REVIEW_S3_MEMO, key=lambda k: _REVIEW_S3_MEMO[k][1])[:1000]:
+                _REVIEW_S3_MEMO.pop(old, None)
+    return got
+
+
+def review_what(row: dict[str, Any]) -> dict[str, Any]:
+    """What this item is, in plain words, and whether anything reads it."""
+    gate = str(row.get("gate") or "")
+    kind = review_queue_kind(gate, row.get("disposition"), row.get("technical"))
+    reasons = [str(r) for r in (row.get("reasons") or []) if str(r or "").strip()]
+    say = REVIEW_GATE_WORDS.get(gate) or ("The %s gate took this %s out of the work."
+                                          % (gate.replace("_", " ") or "station's",
+                                             "round" if kind == "hold" else "line"))
+    first = float(row.get("first_at") or 0)
+    sweep = ""
+    if gate in ("tint", "recording_tint"):
+        sweep = "The station re-grades this gate's cuts every ten minutes and closes the ones that pass today."
+    elif gate in REVIEW_QUEUE_SCAN_GATES and review_queue_mode() == REVIEW_QUEUE_SWEEP:
+        sweep = ("The station's own sweep reads this gate every ten minutes and closes a row whose "
+                 "round has been gone for %d hours." % int(REVIEW_QUEUE_GONE_AFTER // 3600))
+    return {"gate": gate, "kind": kind, "label": str(CONTENT_GATE_INFO.get(gate) or ""),
+            "say": say, "reason": reasons[0] if reasons else "",
+            "age_s": round(max(0.0, time.time() - first), 1) if first else 0.0,
+            "first_at": first, "occurrences": int(row.get("occurrences") or 1), "sweep": sweep}
+
+
+def review_fix_plan(row: dict[str, Any]) -> dict[str, Any]:
+    """The one real fix, where there is one: the allow road, while the row's
+    round still waits on the shelf. Everywhere else, why there is none."""
+    if str(row.get("review_status") or "") != "pending":
+        return {"available": False, "why_not": "It is closed; nothing is waiting on it."}
+    if row.get("technical"):
+        return {"available": False,
+                "why_not": ("A technical failure - the engine or the audio failed, not the words. The "
+                            "station's own recovery repairs those; approval cannot make it playable.")}
+    gate = str(row.get("gate") or "")
+    if gate == "timing":
+        return {"available": False,
+                "why_not": ("Its round was on the air when the talk cut stopped it, and the take was "
+                            "not kept (or went to the hold shelf and plays by itself). There is no "
+                            "place left to put the line back.")}
+    try:
+        match = line_review_matching(row)
+    except Exception:  # noqa: BLE001
+        match = None
+    if match:
+        hold = review_queue_kind(gate, row.get("disposition"), row.get("technical")) == "hold"
+        return {"available": True, "action": "allow",
+                "label": "Fix: release the held round" if hold else "Fix: restore the words",
+                "say": (("Its round still waits on the %s shelf. Releasing it sends it to the recording "
+                         "room as written; it airs with its System 3 conversation.") if hold else
+                        ("Its round still waits on the %s shelf. These words go back into it, through the "
+                         "tint and the recording room, and air with its System 3 conversation."))
+                % str(match[0] or "dialogue")}
+    if _s3_active():
+        return {"available": False,
+                "why_not": ("Its round has aired, expired or been replaced. Rebuilding it from the "
+                            "capture would make a round System 3 never planned, and the System 3 gate "
+                            "withholds those from the air - so there is nothing left to fix.")}
+    return {"available": True, "action": "allow", "label": "Fix: rebuild from the capture",
+            "say": ("Its round is gone. Allowing rebuilds a round from the captured words (the old "
+                    "road) and sends it through the tint and the recording room.")}
+
+
+def review_closed_as(row: dict[str, Any]) -> dict[str, Any] | None:
+    """How a row that is no longer open was closed, and by whom."""
+    status = str(row.get("review_status") or "")
+    if status == "pending":
+        return None
+    effect = row.get("effect") if isinstance(row.get("effect"), dict) else {}
+    decision = next((d for d in (row.get("decisions") or [])
+                     if isinstance(d, dict) and d.get("action") in ("allow", "keep", "resolve", "dismiss")),
+                    None)
+    closed = {"status": str(effect.get("status") or status), "say": str(effect.get("say") or "")[:240],
+              "at": float(effect.get("at") or (decision or {}).get("at") or row.get("last_at") or 0),
+              "by": str(effect.get("by") or ("operator" if decision else "station"))}
+    if status in ("allowed", "kept"):
+        closed["status"] = status
+        closed["by"] = "operator"
+    if decision:
+        closed["note"] = str(decision.get("note") or "")[:400]
+    return closed
+
+
+async def review_detail_extras(row: dict[str, Any]) -> dict[str, Any]:
+    """Beside a review's evidence: what it is, what System 3 knows about it,
+    and what can be done with it now."""
+    out: dict[str, Any] = {}
+    try:
+        out["what"] = await asyncio.to_thread(review_what, row)
+    except Exception as exc:  # noqa: BLE001
+        out["what"] = {"say": "", "error": type(exc).__name__}
+    try:
+        link = await asyncio.wait_for(asyncio.to_thread(review_system3_link, row), timeout=8.0)
+        if row.get("id"):
+            _REVIEW_S3_MEMO[str(row["id"])] = (int(row.get("revision") or 0), time.time(), copy.deepcopy(link))
+        out["system3"] = link
+    except asyncio.TimeoutError:
+        out["system3"] = {"state": "unknown", "why": "timeout",
+                          "say": "System 3's ledger did not answer in time; open it again to ask."}
+    except Exception as exc:  # noqa: BLE001
+        out["system3"] = {"state": "unknown", "why": "error",
+                          "say": "System 3's ledger could not be read: " + type(exc).__name__}
+    try:
+        fix = await asyncio.to_thread(review_fix_plan, row)
+    except Exception as exc:  # noqa: BLE001
+        fix = {"available": False, "why_not": "The fix could not be worked out: " + type(exc).__name__}
+    open_now = str(row.get("review_status") or "") == "pending" and not row.get("read_only")
+    out["resolve"] = {"open": open_now, "actions": list(REVIEW_CLOSE_ACTIONS) if open_now else [],
+                      "fix": fix, "closed": review_closed_as(row)}
+    return out
+
+
+def review_queue_open(limit: int = 200) -> dict[str, Any]:
+    """The open queue for the desk: every open item once, newest first, with
+    its System 3 state; how many are older than each step; how many have no
+    System 3 record. A worker thread only."""
+    now = time.time()
+    most = max(1, min(int(limit or 1), 500))
+    rows = review_open_rows(most + 1)
+    db = _review_queue_db()
+    try:
+        firsts = [float(r[0] or 0) for r in db.execute(
+            "SELECT first_at FROM line_reviews WHERE review_status='pending'")]
+    finally:
+        try:
+            db.close()
+        except Exception:  # noqa: BLE001
+            pass
+    s3db = None
+    try:
+        s3db = _review_s3_db()
+    except Exception:  # noqa: BLE001
+        s3db = None
+    cache: dict[str, Any] = {}
+    budget = {"left": REVIEW_S3_BUDGET}
+    items: list[dict[str, Any]] = []
+    counts = {"linked": 0, "legacy": 0, "unknown": 0, "off": 0}
+    try:
+        for row in rows[:most]:
+            if s3db is None:
+                link = {"state": "off", "why": "no_ledger", "say": "This station keeps no System 3 ledger."}
+            else:
+                try:
+                    link = review_s3_known(row, s3db, cache, budget)
+                except Exception as exc:  # noqa: BLE001
+                    link = {"state": "unknown", "why": "error", "say": type(exc).__name__}
+            state = str(link.get("state") or "unknown")
+            counts["legacy" if state in ("none", "gone") else state if state in counts else "unknown"] += 1
+            ctx = row.get("context") or {}
+            items.append({
+                "id": row["id"], "gate": row["gate"], "disposition": row["disposition"],
+                "technical": row["technical"], "kind": str(ctx.get("kind") or ""),
+                "who": str(ctx.get("who") or ""), "first_at": row["first_at"], "last_at": row["last_at"],
+                "age_s": round(max(0.0, now - row["first_at"]), 1), "event_seq": row["event_seq"],
+                "seq": row["event_seq"], "revision": row["revision"], "occurrences": row["occurrences"],
+                "reasons": row["reasons"][:4], "source_preview": row["source"][:220],
+                "candidate_preview": row["candidate"][:260], "review_status": "pending",
+                "system3": {k: link.get(k) for k in ("state", "why", "conversation_id", "turn_id",
+                                                     "road", "say") if link.get(k) is not None}})
+    finally:
+        if s3db is not None:
+            try:
+                s3db.close()
+            except Exception:  # noqa: BLE001
+                pass
+    return {"at": now, "count": len(firsts), "items": items, "has_more": len(rows) > most,
+            "linked": counts["linked"], "legacy": counts["legacy"], "unknown": counts["unknown"],
+            "ages": {str(step): sum(1 for f in firsts if f and now - f >= step) for step in REVIEW_AGE_STEPS},
+            "oldest_at": min([f for f in firsts if f] or [0.0]),
+            "closes": list(REVIEW_CLOSE_ACTIONS)}
+
+
+def review_history(limit: int = 60, before: float = 0.0) -> dict[str, Any]:
+    """What left the queue, newest first: the operator's decisions (allow,
+    keep, resolve, dismiss) and the station's own closes (a round gone, a
+    newer cut, a pass under today's grader). Read-only; a worker thread."""
+    most = max(1, min(int(limit or 1), 200))
+    edge = float(before or 0)
+    out: list[dict[str, Any]] = []
+    db = _review_queue_db()
+    try:
+        decided = db.execute(
+            "SELECT d.review_id AS id, d.at AS at, d.body AS body, r.gate AS gate, r.review_status AS status,"
+            "r.disposition AS disposition, substr(r.source,1,220) AS source, r.reasons AS reasons,"
+            "r.first_at AS first_at, json_extract(r.context,'$.kind') AS kind,"
+            "json_extract(r.context,'$.who') AS who "
+            "FROM review_decisions d JOIN line_reviews r ON r.id=d.review_id "
+            "WHERE (?=0 OR d.at<?) AND COALESCE(json_extract(d.body,'$.action'),'') "
+            "IN ('allow','keep','resolve','dismiss') ORDER BY d.seq DESC LIMIT ?",
+            (edge, edge, most)).fetchall()
+        station = db.execute(
+            "SELECT id, gate, disposition, substr(source,1,220) AS source, reasons, first_at, effect,"
+            "json_extract(context,'$.kind') AS kind, json_extract(context,'$.who') AS who "
+            "FROM line_reviews WHERE review_status='noted' ORDER BY latest_seq DESC LIMIT ?",
+            (REVIEW_HISTORY_SCAN,)).fetchall()
+    finally:
+        try:
+            db.close()
+        except Exception:  # noqa: BLE001
+            pass
+    words = {"allow": "Allowed - its words were restored", "keep": "Kept rejected",
+             "resolve": "Marked complete", "dismiss": "Dismissed",
+             "round_gone": "Closed by the station: its round had aired, expired or been replaced",
+             "superseded": "Closed by the station: a newer cut replaced it",
+             "stale_grader": "Closed by the station: today's checker passes it",
+             "read_plain": "Closed by the station: the line is read plain now"}
+    for raw in decided:
+        body = _review_queue_json(raw["body"], {})
+        action = str(body.get("action") or "")
+        out.append({"id": str(raw["id"]), "gate": str(raw["gate"] or ""), "kind": str(raw["kind"] or ""),
+                    "who": str(raw["who"] or ""), "source_preview": str(raw["source"] or ""),
+                    "reasons": list(_review_queue_json(raw["reasons"], []) or [])[:2],
+                    "first_at": float(raw["first_at"] or 0), "closed_at": float(raw["at"] or 0),
+                    "closed_by": str(body.get("by") or "operator"), "action": action,
+                    "label": words.get(action, action), "note": str(body.get("note") or "")[:400],
+                    "why": str(body.get("why") or "")[:200],
+                    "batch": str(body.get("batch") or ""), "status_now": str(raw["status"] or "")})
+    for raw in station:
+        effect = _review_queue_json(raw["effect"], {})
+        status = str(effect.get("status") or "")
+        if status not in REVIEW_STATION_CLOSES or effect.get("by") == "operator":
+            continue
+        at = float(effect.get("at") or 0)
+        if edge and at and at >= edge:
+            continue
+        out.append({"id": str(raw["id"]), "gate": str(raw["gate"] or ""), "kind": str(raw["kind"] or ""),
+                    "who": str(raw["who"] or ""), "source_preview": str(raw["source"] or ""),
+                    "reasons": list(_review_queue_json(raw["reasons"], []) or [])[:2],
+                    "first_at": float(raw["first_at"] or 0), "closed_at": at, "closed_by": "station",
+                    "action": status, "label": words.get(status, status),
+                    "note": str(effect.get("say") or "")[:400], "why": "", "batch": "", "status_now": "noted"})
+    out.sort(key=lambda h: -float(h.get("closed_at") or 0))
+    out = out[:most]
+    return {"items": out, "next_before": (out[-1]["closed_at"] if len(out) >= most else None),
+            "scanned_station_rows": len(station)}
+
+
+def review_bulk_close(body: Any) -> dict[str, Any]:
+    """Close many open rows at once: by id, by age, by gate, or every one with
+    no System 3 record. At least one filter; every filter given must hold.
+    `dry_run` counts and changes nothing. A worker thread only."""
+    if not isinstance(body, dict) or set(body) - {"ids", "older_than_s", "legacy", "gate",
+                                                 "action", "note", "dry_run"}:
+        raise ValueError("supply ids, older_than_s, legacy or gate, and optional action, note, dry_run")
+    action = str(body.get("action") or "dismiss")
+    if action not in REVIEW_CLOSE_ACTIONS:
+        raise ValueError("action must be resolve or dismiss")
+    ids = body.get("ids")
+    if ids is not None and (not isinstance(ids, list) or len(ids) > REVIEW_BULK_MOST
+                            or not all(isinstance(x, str) and x for x in ids)):
+        raise ValueError("ids must be a list of review ids")
+    older = body.get("older_than_s")
+    if older is not None and (isinstance(older, bool) or not isinstance(older, (int, float)) or older < 0):
+        raise ValueError("older_than_s must be a number of seconds")
+    legacy = body.get("legacy", False)
+    if not isinstance(legacy, bool):
+        raise ValueError("legacy must be true or false")
+    gate = body.get("gate") or ""
+    if not isinstance(gate, str) or len(gate) > 200:
+        raise ValueError("gate must be a gate name")
+    note = body.get("note") or ""
+    if not isinstance(note, str) or len(note) > 2000:
+        raise ValueError("note must be text of at most 2000 characters")
+    if ids is None and older is None and not legacy and not gate:
+        raise ValueError("name what to close: ids, older_than_s, legacy or gate")
+    now = time.time()
+    wanted = set(ids or [])
+    picked = [r for r in review_open_rows(REVIEW_BULK_MOST)
+              if (ids is None or r["id"] in wanted)
+              and (older is None or now - float(r["first_at"] or now) >= float(older))
+              and (not gate or r["gate"] == gate)]
+    unknown = 0
+    if legacy:
+        kept: list[dict[str, Any]] = []
+        s3db = _review_s3_db()
+        cache: dict[str, Any] = {}
+        budget = {"left": REVIEW_S3_BUDGET * 2}
+        try:
+            for r in picked:
+                link = ({"state": "none"} if s3db is None
+                        else review_s3_known(r, s3db, cache, budget))
+                if link.get("state") in ("none", "gone"):
+                    kept.append(r)
+                elif link.get("state") == "unknown":
+                    unknown += 1
+        finally:
+            if s3db is not None:
+                try:
+                    s3db.close()
+                except Exception:  # noqa: BLE001
+                    pass
+        picked = kept
+    why = ", ".join(part for part in (
+        ("%d chosen" % len(wanted)) if ids is not None else "",
+        ("older than %s" % _review_span(float(older))) if older is not None else "",
+        "no System 3 record" if legacy else "",
+        ("gate %s" % gate) if gate else "") if part)
+    out: dict[str, Any] = {"ok": True, "action": action, "matched": len(picked), "closed": 0,
+                           "dry_run": bool(body.get("dry_run")), "skipped_unknown": unknown,
+                           "ids": [r["id"] for r in picked][:200], "why": why}
+    if out["dry_run"] or not picked:
+        out["say"] = ("%d open review(s) match (%s)." % (len(picked), why or "no filter")
+                      + (" %d could not be looked up in System 3 this time and were left." % unknown
+                         if unknown else ""))
+        return out
+    batch = uuid.uuid4().hex[:12]
+    errors = 0
+    for start in range(0, len(picked), REVIEW_BULK_CHUNK):
+        chunk = picked[start:start + REVIEW_BULK_CHUNK]
+        db = _review_write_db()
+        try:
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                for r in chunk:
+                    try:
+                        got = _review_close_row(db, r["id"], action, note.strip(), "operator",
+                                                batch, why, None, None)
+                    except KeyError:
+                        errors += 1
+                        continue
+                    if got.get("changed"):
+                        out["closed"] += 1
+                db.execute("COMMIT")
+            except BaseException:
+                try:
+                    db.execute("ROLLBACK")
+                except Exception:  # noqa: BLE001
+                    pass
+                raise
+        finally:
+            db.close()
+        time.sleep(0.05)       # a capture on the loop is never kept waiting behind the batch
+    if out["closed"]:
+        _REVIEW_QUEUE_SEEN["shape"] = {}
+    out["batch"] = batch
+    out["errors"] = errors
+    out["say"] = ("%d review(s) %s (%s); they left the queue and stay in the history."
+                  % (out["closed"], "marked complete" if action == "resolve" else "dismissed", why)
+                  + (" %d could not be looked up in System 3 this time and were left." % unknown
+                     if unknown else ""))
+    return out
+
+
+def _review_span(seconds: float) -> str:
+    seconds = max(0.0, float(seconds))
+    if seconds >= 86400:
+        return "%g day(s)" % round(seconds / 86400, 1)
+    if seconds >= 3600:
+        return "%g hour(s)" % round(seconds / 3600, 1)
+    return "%d minute(s)" % int(seconds // 60)
+
+
+@app.get("/api/orchestrator/rejections/queue")
+async def api_review_queue_open(limit: int = Query(default=200, ge=1, le=500),
+                                authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    """[review-queue] The open queue, each item's System 3 state, the ages."""
+    require_read_auth(authorization)
+    return await asyncio.to_thread(review_queue_open, limit)
+
+
+@app.get("/api/orchestrator/rejections/history")
+async def api_review_history(limit: int = Query(default=60, ge=1, le=200),
+                             before: float = Query(default=0.0, ge=0.0),
+                             authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    """[review-queue] What left the queue, and who closed it."""
+    require_read_auth(authorization)
+    return await asyncio.to_thread(review_history, limit, before)
+
+
+@app.post("/api/orchestrator/rejections/bulk-close")
+async def api_review_bulk_close(request: Request,
+                                authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    """[review-queue] Dismiss or resolve many open reviews at once."""
+    require_auth(authorization)
+    try:
+        body = await request.json()
+        got = await asyncio.to_thread(review_bulk_close, body)
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if got.get("closed"):
+        station_flow_event("repair", "operator", "Operator closed reviews in bulk",
+                           {"action": got.get("action"), "closed": got.get("closed"),
+                            "why": got.get("why"), "batch": got.get("batch")})
+    return got
+
+
 @app.get("/api/orchestrator/rejections/{review_id}")
 async def api_line_review_get(
     review_id: str, before: int = Query(default=0, ge=0),
@@ -144586,6 +145613,7 @@ async def api_line_review_get(
         "note": "This is the known workflow, not a claim that this cut reached every stage.",
         "flow_url": "/api/dj/flow", "logic_url": "/api/orchestrator/logic"}
     row["preference"] = line_review_preferences(str(row.get("context", {}).get("kind") or ""), str(row.get("gate") or ""))
+    row.update(await review_detail_extras(row))    # [review-queue] what it is, System 3, what can be done
     entry = row.get("context", {}).get("entry")
     stored = (entry.get("profile") if isinstance(entry, dict) else None)
     if stored:
@@ -144727,6 +145755,8 @@ async def api_line_review_decide(
         body = await request.json()
         if not isinstance(body, dict) or set(body) - {"action", "note", "expected_revision", "expected_event_seq"}:
             raise ValueError("supply action, note and optional expected_revision/expected_event_seq")
+        if body.get("action") in REVIEW_CLOSE_ACTIONS:        # [review-queue] resolve / dismiss
+            return await review_close_route(review_id, body)
         result = _LINE_REVIEW.decide(review_id, body.get("action"),
                                      body.get("note", ""), body.get("expected_revision"), body.get("expected_event_seq"))
     except KeyError as exc:
@@ -150496,7 +151526,8 @@ async def dj_banter_api(
         seed = await speakbox_quote(   # [s3-dice-door]
             most=2 + min(4, int(s3_roll("button.banter_most", "how many lines of the speakbox a pushed banter round is handed") * 5)),   # [s3-dice-door]
             cap=240 + min(280, int(s3_roll("button.banter_cap", "how long the passage for a pushed banter round may run") * 281)))   # [s3-dice-door]
-        form = unrepeated(list(SUSPENSE_FORMATS), "button-format")
+        form = s3_unrepeated("button.suspense_format", SUSPENSE_FORMATS, "button-format",   # [s3-dice4]
+                             "the shape of a round you push from the button (#133, #348)")
         angle = form + (
             " Somewhere inside it, one of you delivers this, word for word, "
             f"with total conviction, as though it proves everything: "
@@ -154317,7 +155348,7 @@ async def share_make(
             status_code=500,
             detail="No API key configured, so nothing can be signed.")
     payload = await request.json()
-    hours = max(1.0, min(24 * 90, float(payload.get("hours") or 168)))
+    hours = max(1.0, min(24 * 90, float(payload.get("hours") or 720)))   # [share-30d]
     label = str(payload.get("label") or "a listener")[:60]
     scope = str(payload.get("scope") or "listen").lower()
     if scope not in SHARE_SCOPES:
@@ -158196,10 +159227,17 @@ async def dj_dice_api(
             "WORD, in order, complete, across as many turns as it needs: "
             f"\"{seed['text']}\" Never call it a quotation, never say "
             f"where it came from. Nobody interrupts until it is done — "
-            f"and then {others} is "
-            f"{unrepeated(list(SPEAKBOX_REACTIONS), 'reaction')}, and must "
-            f"{unrepeated(list(SPEAKBOX_ENGAGE), 'engage')}, and the room "
-            "takes the conversation onward from there."
+            "and then "
+            # [s3-dice4] the guard speakbox_angle has: under System 3 the room's
+            # answer is its running order's; otherwise the reaction and the
+            # engagement are POOLS1 rows drawn by System 3's dice
+            + ("the room answers it - System 3 chooses who responds, the "
+               "responses, the emotions and the flow."
+               if _s3_active() else
+               f"{others} is "
+               f"{s3_unrepeated('speakbox.reaction', SPEAKBOX_REACTIONS, 'reaction', 'how the one who hears the passage takes it')}, and must "
+               f"{s3_unrepeated('speakbox.engage', SPEAKBOX_ENGAGE, 'engage', 'what the one who hears the passage must do with it')}, and the room "
+               "takes the conversation onward from there.")
         )
         lines = await dj_banter(None, angle=angle, lines=10,
                                 source=seed.get("file", ""))
@@ -162750,7 +163788,9 @@ async def pine_icons_asset(name: str) -> Response:
     return Response(
         path.read_bytes(),
         media_type=VENDOR_TYPES[path.suffix],
-        headers={"Cache-Control": "public, max-age=86400",
+        # [icons-cache] revalidate: a day-long max-age kept a broken icon
+        # font on the tablet after the file was fixed (2026-09-28).
+        headers={"Cache-Control": "no-cache",
                  "X-Content-Type-Options": "nosniff"},
     )
 
@@ -171276,7 +172316,7 @@ MANUAL_READ_HTML = """<!doctype html>
 <title>__TITLE__</title>
 <!-- Single-colour icons, not colour emoji. The stylesheet carries the
      font inline and its unicode-range confines it to pictographs. -->
-<link rel="stylesheet" href="/icons/pineicons.css">
+<link rel="stylesheet" href="/icons/pineicons.css?v=2">
 <style>
  :root{color-scheme:light dark}
  body{margin:0;font:16px/1.6 PineIcons, PineIcons, system-ui, -apple-system, Segoe UI, sans-serif}
@@ -195092,7 +196132,7 @@ RETIRE_PAGE_HTML = r"""<!doctype html>
 <title>The retirement desk · Pine Box</title>
 <!-- Single-colour icons, not colour emoji. The stylesheet carries the
      font inline and its unicode-range confines it to pictographs. -->
-<link rel="stylesheet" href="/icons/pineicons.css">
+<link rel="stylesheet" href="/icons/pineicons.css?v=2">
 <style>
   :root { color-scheme: dark; }
   * { box-sizing: border-box; }
@@ -196144,7 +197184,7 @@ CONTROL_PANEL_HTML = r"""
      The stylesheet carries the font inline, and its unicode-range confines
      it to pictographs, so PineIcons can be appended to any font stack
      below without changing how one letter of text looks. -->
-<link rel="stylesheet" href="/icons/pineicons.css">
+<link rel="stylesheet" href="/icons/pineicons.css?v=2">
 <script src="/icons/pine-icons.js"></script>
 <script src="/spark/asset/wall-transition.js"></script>
 <style>
@@ -221124,7 +222164,7 @@ async function onAirLaunch(ev) {
       url = (pub && pub.url) || best.url;
     } else {
       const made = await api("/api/share", {method: "POST",
-        body: JSON.stringify({label: "the radio", hours: 168,
+        body: JSON.stringify({label: "the radio", hours: 720,
                               scope: "listen"})});
       url = made.url;
     }
@@ -255511,7 +256551,7 @@ JOURNAL_PAGE_HTML = r"""<!doctype html>
 <title>The request book · Pine Box</title>
 <!-- Single-colour icons, not colour emoji. The stylesheet carries the
      font inline and its unicode-range confines it to pictographs. -->
-<link rel="stylesheet" href="/icons/pineicons.css">
+<link rel="stylesheet" href="/icons/pineicons.css?v=2">
 <style>
   :root { color-scheme: dark; }
   * { box-sizing: border-box; }
@@ -255910,7 +256950,7 @@ RADIO_PAGE_HTML = r"""<!doctype html>
 <link id="pwaManifest" rel="manifest" href="__PWA_MANIFEST__">
 <!-- Single-colour icons, not colour emoji. The stylesheet carries the
      font inline and its unicode-range confines it to pictographs. -->
-<link rel="stylesheet" href="/icons/pineicons.css">
+<link rel="stylesheet" href="/icons/pineicons.css?v=2">
 <!-- #1353b: the SFX guy's little CRT set. Exactly the files the app
      and the tablet load, off the same route, so a picture that airs
      is the same picture everywhere. It mounts itself three seconds
@@ -259148,7 +260188,7 @@ GUIDE_HTML = r"""<!doctype html>
 <title>Pine Box — recovery guide</title>
 <!-- Single-colour icons, not colour emoji. The stylesheet carries the
      font inline and its unicode-range confines it to pictographs. -->
-<link rel="stylesheet" href="/icons/pineicons.css">
+<link rel="stylesheet" href="/icons/pineicons.css?v=2">
 <style>
   :root { color-scheme: light; }
   * { box-sizing: border-box; }

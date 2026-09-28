@@ -6078,7 +6078,9 @@
   function wallFollow() {
     var bridge = api();
     if (!wallHas || !bridge || typeof bridge.videoWall !== 'function') return;
-    if (wallFlight) return wallFlight;
+    /* [#1450c] a flight older than 4 s never landed (the bridge has no
+       deadline): it is abandoned, not waited on for ever */
+    if (wallFlight && now() - (Number(wallFlight.__pineAt) || 0) < 4000) return wallFlight;
     var flight = bridge.videoWall('state').then(function (got) {
       var st = wallState(got);
       var id = st && st.playing;
@@ -6099,6 +6101,7 @@
       wallClip(id);
     })['catch'](function () { /* the wall will be asked again shortly */ });
     wallFlight = flight;
+    try { flight.__pineAt = now(); } catch (err) { /* then it is never stale */ }
     flight.then(function () {
       if (wallFlight === flight) wallFlight = null;
     }, function () {
@@ -7249,6 +7252,17 @@
     },
     /* The native hold watchdog uses this if a menu was abandoned. One door
        out means the shade, owed finish and playback hold are all released. */
+    /* [#1450c] BACK closes the video window (window.pineBack in
+       pine-dismiss.js; the kiosk's BACK key): a sheet held over it goes
+       first, then the set takes the polite teardown a finished clip takes -
+       the queue carries on after it as it always does. False with no page
+       window up: the native wall has none to close. */
+    closeWindow: function () {
+      if (!host) return false;
+      if (sheetHeld()) { sheetClose(); return true; }
+      teardown();
+      return true;
+    },
     releaseHold: function () {
       if (radialWrap) { radialClose(false); return true; }
       if (deleteWrap) { deleteConfirmClose(false); return true; }

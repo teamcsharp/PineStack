@@ -3868,7 +3868,7 @@ function initStationDrawer() {
     try {
       if (!djConfirmedOn()) await api.post("/api/dj/start", {});
       const made = await api.post("/api/share",
-        { hours: 168, label: "shared from the desktop", scope: "listen" });
+        { hours: 720, label: "shared from the desktop", scope: "listen" });   /* [share-30d] */
       if (made && made.url) $("pubLink").value = made.url;
       { const _n = $("pubStatus"); if (_n) _n.textContent = "on the air — hand the link to anybody"; }
     } catch (e) { { const _n = $("pubStatus"); if (_n) _n.textContent = e.message; } }

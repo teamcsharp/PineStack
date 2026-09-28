@@ -204,6 +204,19 @@
   fill: currentColor;
 }
 
+/* [#1450c] THE SHEET'S OWN GROUND. Full screen and one z under the sheet:
+ * a tap on it closes the sheet (a second way out beside Close), and while it
+ * is up it covers any picture box, so the SFX TV's native wall steps down
+ * (#1442) for exactly as long as the sheet is open. A light dim, so the
+ * sheet reads as the thing that has the screen. */
+.la-shade {
+  position: fixed;
+  inset: 0;
+  z-index: 2147483059;
+  background: rgba(2, 6, 10, .22);
+  touch-action: none;
+}
+
 /* THE WORD FROM THE WORK, after the menu has gone. Fixed to the foot of the
  * screen so it is in the same place whichever script view raised it, and
  * above everything, because it is the answer to something just asked. */

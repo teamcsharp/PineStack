@@ -192,6 +192,21 @@ function drum(candidates, selectedId) {
     list.style.transition = 'none'; render(labels, target);
     list.style.transform = `translateY(${-target * 22}px)`;
   };
+  /* [s3-imsg] the same reel in two halves: spun so it comes to rest on the
+     recorded pick in `ms`, and land() puts it there now */
+  box.spin = (ms) => {
+    if (labels.length < 2 || reduced() || !(ms > 0)) return;
+    const reel = [...labels, ...labels, ...labels.slice(0, target + 1)];
+    render(reel, reel.length - 1);
+    list.style.transition = 'none'; list.style.transform = 'translateY(0)';
+    void list.offsetHeight;                     /* from the top of the reel, not from where it stood */
+    list.style.transition = `transform ${Math.round(ms)}ms cubic-bezier(.12,.72,.18,1)`;
+    list.style.transform = `translateY(${-(reel.length - 1) * 22}px)`;
+  };
+  box.land = () => {
+    list.style.transition = 'none'; render(labels, target);
+    list.style.transform = `translateY(${-target * 22}px)`;
+  };
   return box;
 }
 
@@ -203,6 +218,21 @@ function die(value) {
     node.classList.add('rolling');
     await sleep(ms);
     node.classList.remove('rolling'); node.classList.add('pop');
+    setTimeout(() => node.classList.remove('pop'), 400);
+  };
+  /* [s3-imsg] the same roll in two halves: tumbling from spin() until
+     land() brings its number down with a pop */
+  node.rolls = value != null;
+  node.spin = () => {
+    if (!node.rolls || reduced()) return;
+    node.classList.remove('pop');
+    node.classList.add('rolling');
+  };
+  node.land = () => {
+    if (!node.classList.contains('rolling')) return;
+    node.classList.remove('rolling');
+    void node.offsetWidth;                      /* the pop plays again on a die that popped before */
+    node.classList.add('pop');
     setTimeout(() => node.classList.remove('pop'), 400);
   };
   return node;
@@ -221,6 +251,61 @@ function rollRow(ev, conv) {
     el('b', {style: `color:${FAM[ev.family]};min-width:74px`, text: ev.family}), d, face);
   row.roll = async (ms) => { await Promise.all([d.roll(ms), face.roll(ms * 0.85)]); };
   return row;
+}
+
+/* [s3-es-reel] THE ES ROLL, IN ITS TWO STAGES. "when animating the RNG roulette
+   indent the subcategory for the ES item. The intention is for categories to be
+   scrolled via RNG and then the subcategories which is fed to the LLM for
+   direction on how to write that particular line in the correspondence and also
+   is fed to the intonation engine" (the operator, 2026-09-28). One ES event holds
+   both recorded stages of the draw (weighted_decision: the category by its
+   weight, then the item inside the won category by the items' weights): the
+   category reel scrolls and lands first, with its own die and "k of N
+   categories", then the item's reel - indented under it - scrolls and lands,
+   with its die and "k of M". Nothing is re-rolled. Anything else (another
+   family, a pinned ES row with no stages) gets rollRow. The row it returns has
+   .roll(ms) like rollRow's, so any renderer can swap it in - the Messenger's
+   reels too. */
+function esTwoStageReel(ev, conv) {
+  const cat = ev && ev.family === 'ES' && !ev.stage ? stage(ev, 'category') : null;
+  const item = cat ? stage(ev, 'item') : null;
+  if (!cat || !item) return rollRow(ev, conv);
+  const fam = FAM.ES;
+  const sel = ev.selected || {};
+  const catDrum = drum((cat.candidates || []).map(c => ({id: c.id, label: String(c.label || c.id).toUpperCase()})), cat.selected);
+  const catDie = die(cat.draw ? cat.draw.dice : null);
+  const itemDrum = drum(item.candidates || [], item.selected);
+  const itemDie = die(item.draw ? item.draw.dice : null);
+  const catOf = cat.of ? `${cat.selected_index} of ${cat.of} categories` : 'the category';
+  const itemOf = (item.of ? `${item.selected_index} of ${item.of}` : 'the feeling')
+    + (sel.intensity != null ? ` · intensity .${String(Math.round(sel.intensity * 100)).padStart(2, '0')}` : '');
+  const catRow = el('div', {class: 's3-roll s3-es-cat', style: `--fam:${fam}`,
+      title: `the category: d100 ${cat.draw ? cat.draw.dice : '-'} landed on ${cat.selected} - ${catOf}, each weighted by its category weight`},
+    el('b', {style: `color:${fam};min-width:74px`, text: 'ES'}), catDrum, catDie,
+    el('span', {class: 's3-muted', style: 'flex:none;font-size:11px', text: catOf}));
+  const itemRow = el('div', {class: 's3-roll s3-es-item', style: `--fam:${fam};margin-left:26px;padding-left:10px;border-left:2px solid ${fam}`,
+      title: `the feeling inside ${cat.selected}: d100 ${item.draw ? item.draw.dice : '-'} landed on ${item.selected} - ${itemOf}`},
+    el('b', {style: `color:${fam};min-width:38px`, text: 'item'}), itemDrum, itemDie,
+    el('span', {class: 's3-muted', style: 'flex:none;font-size:11px', text: itemOf}));
+  const box = el('div', {class: 's3-roll s3-es-reel', style: `--fam:${fam};display:grid;gap:2px;align-items:stretch`}, catRow, itemRow);
+  box.roll = async (ms) => {
+    if (!(ms > 0)) return;
+    itemRow.style.opacity = '.35';
+    await Promise.all([catDrum.roll(ms), catDie.roll(ms * 0.85)]);
+    itemRow.style.opacity = '';
+    await Promise.all([itemDrum.roll(ms), itemDie.roll(ms * 0.85)]);
+  };
+  return box;
+}
+/* [s3-es-reel] the two stages in one line, for the caption under the reel ("" when not an ES draw) */
+function esStagesText(ev) {
+  const cat = ev && ev.family === 'ES' && !ev.stage ? stage(ev, 'category') : null;
+  const item = cat ? stage(ev, 'item') : null;
+  if (!cat || !item) return '';
+  const sel = ev.selected || {};
+  const inten = sel.intensity != null ? ` (.${String(Math.round(sel.intensity * 100)).padStart(2, '0')})` : '';
+  return `${String(sel.category_label || cat.selected || '').toUpperCase()} ${cat.draw ? cat.draw.dice + '/100' : ''} · ${cat.selected_index}/${cat.of}`
+    + ` → ${sel.label || item.selected} ${item.draw ? item.draw.dice + '/100' : ''} · ${item.selected_index}/${item.of}${inten}`;
 }
 
 /* --- [s3-messenger] the air, line by line ------------------------------------
@@ -288,6 +373,8 @@ const boardName = l => String((l && l.text) || '').replace(/^[^\p{L}\p{N}\s]+\s+
    what it landed on - a drum of the real candidates when there were several,
    so on air it spins through them and stops on the recorded pick. */
 function rouletteChip(ev, conv, onclick) {
+  const two = esTwoStage(ev, conv, onclick);                        /* [s3-imsg] ES: its category, then its item */
+  if (two) return two;
   const line = eventLine(ev, conv);
   const face = die(line.dice);
   const sb = sbOutcome(ev);
@@ -301,7 +388,118 @@ function rouletteChip(ev, conv, onclick) {
       onkeydown: e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); e.currentTarget.click(); } }},
     face, el('b', {text: ev.family}), reel);
   chip.roll = ms => Promise.all([face.roll(ms * 0.85), reel.roll ? reel.roll(ms) : null]);
+  chip.piece = landPiece(chip, face, reel.spin ? reel : null);      /* [s3-imsg] */
+  chip.pieces = [chip.piece];
   return chip;
+}
+/* [s3-imsg] THE EMOTION IS ROLLED IN TWO. "when animating the RNG roulette
+   indent the subcategory for the ES item. The intention is for categories
+   to be scrolled via RNG and then the subcategories which is fed to the LLM
+   ... and also is fed to the intonation engine" (operator, 2026-09-28). An
+   ES decision records a 'category' stage and an 'item' stage, each with its
+   own draw: the card shows the category as its chip (its die, the reel of
+   the categories) and the item under it, indented (its die, the reel of that
+   category's items). On air the category lands first, then the item, then
+   the card holds - the same landInOrder as every die. The shape - a parent
+   row, an indented child row joined by an elbow - is the two-stage reel the
+   line card and the Rolodex use. null when the event has not both stages. */
+function esTwoStage(ev, conv, onclick) {
+  if (!ev || ev.family !== 'ES') return null;
+  const cat = stage(ev, 'category'), item = stage(ev, 'item');
+  if (!cat || !item || !cat.draw || !item.draw) return null;
+  const sel = ev.selected || {};
+  const row = (st, cls, label, pickText) => {
+    const face = die(st.draw.dice);
+    const reel = (st.candidates || []).length > 1 && st.candidates.some(c => c.id === st.selected) ? drum(st.candidates, st.selected)
+      : el('span', {class: 's3-rl-pick', text: pickText});
+    const r = el('span', {class: 's3-rl-chip ' + cls, style: `--fam:${FAM.ES}`}, face, label ? el('b', {text: label}) : null, reel);
+    r.piece = landPiece(r, face, reel.spin ? reel : null);
+    return r;
+  };
+  const catText = String(sel.category_label || sel.category || cat.selected || '').toLowerCase();
+  const itemText = String(sel.label || sel.id || item.selected || '').replace(/^[^.]*\./, '');
+  const parent = row(cat, 's3-rl-es-cat', 'ES', catText);
+  const child = row(item, 's3-rl-es-item', '', itemText);
+  child.prepend(el('i', {class: 's3-rl-elbow', 'aria-hidden': 'true'}));
+  const chip = el('span', {class: 's3-rl-es', style: `--fam:${FAM.ES}`, 'data-event': ev.event_id, role: 'button', tabindex: '0',
+      title: `ES - the category (d${cat.draw.dice}), then the item in it (d${item.draw.dice}) - tap for how it was decided`, onclick,
+      onkeydown: e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); e.currentTarget.click(); } }},
+    parent, child);
+  chip.pieces = [parent.piece, child.piece];
+  chip.piece = parent.piece;
+  chip.roll = ms => Promise.all([...chip.querySelectorAll('.s3-die')].map(d => d.roll(ms * 0.85)));
+  return chip;
+}
+/* [s3-imsg] THE DICE COME DOWN ONE AFTER ANOTHER. "I want them sequentially
+   landing on their numbers. So it's one, two, three, four, landing on their
+   result, and then it cycles over to showing the result of what was
+   generated" (operator, 2026-09-28). A card's pieces - each chip's die and
+   its reel - all tumble from the start; the first lands one step in, the
+   next a step later, each with its pop, in the card's order; then, "sit
+   ... before transitioning to the message so that way there's an impact" -
+   and long enough to read each result: every die holds still on its number
+   for DICE_HOLD_MS (1.5 s, the operator's figure, 2026-09-28; it was half a
+   second) and only then does the promise settle. hurry() brings the rest
+   down fast, still in order, and cuts the hold: the air moved on
+   mid-sequence (nothing else shortens it). A step is DIE_STEP ms, tighter
+   when there are many, so the dice stay inside DICE_CAP. Frames AND timers
+   drive it: a tablet WebView can stall either. */
+const DIE_STEP = 400, DICE_CAP = 2000, DICE_HOLD_MS = 1500, DIE_HURRY = 90;
+function landPiece(chip, face, reel) {
+  return {
+    rolls: !!(face && face.rolls) || !!reel,
+    spin(ms) {
+      chip.classList.remove('s3-landed');
+      chip.classList.add('s3-spinning');
+      if (face && face.spin) face.spin();
+      if (reel) reel.spin(ms);
+    },
+    land() {
+      if (face && face.land) face.land();
+      if (reel) reel.land();
+      chip.classList.remove('s3-spinning');
+      chip.classList.add('s3-landed');
+      setTimeout(() => chip.classList.remove('s3-landed'), 700);
+    },
+  };
+}
+function landInOrder(pieces) {
+  const list = (pieces || []).filter(p => p && p.rolls);
+  const step = list.length ? Math.min(DIE_STEP, DICE_CAP / list.length) : 0;
+  const t0 = performance.now();
+  const at = list.map((p, i) => t0 + (i + 1) * step);
+  let next = 0, hurried = false, over = false, restAt = 0, raf = 0, timer = 0, settle = null;
+  const done = new Promise(resolve => { settle = resolve; });
+  const tick = () => {
+    if (over) return;
+    const now = performance.now();
+    while (next < list.length && now >= at[next] - 4) { list[next].land(); next += 1; }
+    if (next >= list.length) {
+      if (!restAt) restAt = list.length && !hurried ? now + DICE_HOLD_MS : now;
+      if (now >= restAt - 4) {
+        over = true;
+        cancelAnimationFrame(raf); clearTimeout(timer);
+        settle();
+        return;
+      }
+    }
+    cancelAnimationFrame(raf); clearTimeout(timer);
+    raf = requestAnimationFrame(tick);
+    timer = setTimeout(tick, Math.max(12, (next < list.length ? at[next] : restAt) - now));
+  };
+  done.count = list.length;
+  done.step = step;
+  done.hurry = () => {
+    if (hurried || over) return;
+    hurried = true;
+    const now = performance.now();
+    for (let i = next; i < list.length; i += 1) at[i] = Math.min(at[i], now + (i - next + 1) * DIE_HURRY);
+    if (restAt) restAt = Math.min(restAt, now);
+    tick();
+  };
+  list.forEach((p, i) => p.spin(at[i] - t0));
+  tick();
+  return done;
 }
 /* A wait on frames, not timers: a tablet WebView's timers can stall while its
    frames keep coming, and a roll must never hold the words back for ever. */
@@ -483,7 +681,7 @@ function decisionCard(conv, ev, turn, api) {
   // How it came to this value.
   const how = sectionOf('How it came to this');
   if ((ev.stages || []).length) {
-    const rolled = rollRow(ev, conv);
+    const rolled = esTwoStageReel(ev, conv);                /* [s3-es-reel] */
     const reels = docReels(conv, ev, turn, api);
     how.append(rolled, ...reels);
     setTimeout(() => playReels(rolled, reels, 900), 60);
@@ -1471,16 +1669,34 @@ function sfxEntry(conv, t, obs, v) {
   const due = {system3: 'scheduled by System 3', both: 'the cadence and System 3', cadence: 'the two-line cadence'}[obs.due] || 'the cadence';
   const why = [played && played.why ? `matched on "${played.why}"` : '', m.cands != null ? `${m.cands} candidates, ${m.eligible} eligible` : '',
     played && played.seconds ? `${num(played.seconds, 1)} s` : ''].filter(Boolean).join(' · ');
+  const who = el('div', 'who', sfxAvatar(), el('b', {text: castName('sfx')}), el('span', {text: `${due} · after turn ${t.index + 1}`}));   /* [cast-names] */
+  /* [s3-imsg] coming together again (its play button, a tap): no die was rolled for the clip the
+     station matched - its card holds, and then the clip plays */
+  const key = v && v.obsKey ? v.obsKey('clip', obs, t, played) : '';
+  if (v && v.replayAs && v.replayAs.get(key) === 'upcoming') {
+    const card = el('article', {class: 's3-msg left s3-sfxguy s3-upcoming', 'data-turn': t.turn_id, 'data-stage': 'upcoming'}, who,
+      el('div', 's3-bubble s3-sfx-bubble s3-roulette', el('span', {class: 's3-rl-hint', text: played ? `the clip the station matched${played.why ? ' on "' + played.why + '"' : ''}` : 'his line - no clip'})));
+    card.s3 = {conv, t, obs, played};
+    card.roll = () => landInOrder([]);
+    return card;
+  }
   const node = el('article', {class: 's3-msg left s3-sfxguy', 'data-turn': t.turn_id,
-      title: 'tap for what to do with this clip'},
-    el('div', 'who', sfxAvatar(), el('b', {text: castName('sfx')}), el('span', {text: `${due} · after turn ${t.index + 1}`})),   /* [cast-names] */
+      title: v && v.tapAssembles ? 'tap to see it come together again; tap and hold for what to do with this clip' : 'tap for what to do with this clip'},
+    who,
     el('div', 's3-bubble s3-sfx-bubble',
       quips.length ? el('div', {class: 's3-words', text: quips.join(' ')}) : null,
       played ? sfxClipCard(played, v) : el('div', {class: 's3-muted', text: 'no clip played - his line only'}),
-      why ? el('div', {class: 's3-sfx-why', text: why}) : null));
+      why ? el('div', {class: 's3-sfx-why', text: why}) : null),
+    v && v.assemble ? el('div', 's3-reacts', assembleBtn(v)) : null);
   node.s3 = {conv, t, obs, played};
   if (v && v.dropDress) v.dropDress(node, 'clip:' + (obs.cursor || obs.at || t.turn_id), 'full', () => dropClipPanel(v, conv, t, obs, played));   /* [s3-msgdrop] */
   node.addEventListener('click', e => {
+    if (v && v.tapAssembles) {                         /* [s3-imsg] the Messenger: a tap plays it coming together - never the radial */
+      if (e.target.closest(TAP_CONTROLS)) return;
+      e.stopPropagation();
+      v.tapAssembles(node, e);
+      return;
+    }
     if (e.target.closest(KEEP_OPEN + ', .s3-vthumb, .s3-aplayer')) return;
     e.stopPropagation();
     openSfxMenu(conv, t, obs, played, v, node, e);
@@ -1502,16 +1718,43 @@ function sfxGuyLineEntry(conv, t, obs, v) {
     : '';
   const how = last ? `d${last.dice} landed on ${last.index} of ${last.of} in the ${last.pool} pool` : String(obs.how || '');
   const planned = obs.planned && obs.planned !== obs.kind ? ` · his node had planned: ${SFXGUY_KIND[obs.planned] || obs.planned}` : '';
+  const who = el('div', 'who', sfxAvatar(), el('b', {text: castName('sfx')}), el('span', {text: `${kind} · after turn ${t.index + 1}`}));   /* [cast-names] */
+  /* [s3-imsg] coming together again: his line as the dice that drew it at air, landing one after
+     another, then his words */
+  const key = v && v.obsKey ? v.obsKey('guy', obs, t, null) : '';
+  if (v && v.replayAs && v.replayAs.get(key) === 'upcoming') {
+    const chips = draws.map(d => {
+      const face = die(d.dice == null || d.dice === '' ? null : Number(d.dice));
+      const chip = el('span', {class: 's3-rl-chip', style: `--fam:${FAM.SFXGUY}`}, face, el('b', {text: 'LINE'}),
+        el('span', {class: 's3-rl-pick', text: `the ${d.pool || ''} pool: ${d.index} of ${d.of}`}));
+      chip.piece = landPiece(chip, face, null);
+      return chip;
+    });
+    const card = el('article', {class: 's3-msg left s3-sfxguy s3-sfxguy-line s3-upcoming', 'data-turn': t.turn_id, 'data-stage': 'upcoming'}, who,
+      el('div', 's3-bubble s3-roulette', chips.length ? el('div', 's3-rl-dice', ...chips) : null,
+        el('span', {class: 's3-rl-hint', text: kind ? 'his line: ' + kind : 'his line'})));
+    card.s3 = {conv, t, obs};
+    card.roll = () => landInOrder(chips.map(c => c.piece));
+    return card;
+  }
   const node = el('article', {class: 's3-msg left s3-sfxguy s3-sfxguy-line', 'data-turn': t.turn_id,
       title: 'the SFX Guy\'s line: how System 3 drew it'},
-    el('div', 'who', sfxAvatar(), el('b', {text: castName('sfx')}), el('span', {text: `${kind} · after turn ${t.index + 1}`})),   /* [cast-names] */
+    who,
     el('div', 's3-bubble',
       el('span', {class: 's3-words', text: obs.line || ''}),
       el('span', {class: 'dir', text: fell + how + planned}),
       last && last.candidates && last.candidates.length > 1
-        ? el('div', {class: 's3-muted s3-reel-text', text: 'rolled through: ' + last.candidates.join(' · ')}) : null));
+        ? el('div', {class: 's3-muted s3-reel-text', text: 'rolled through: ' + last.candidates.join(' · ')}) : null),
+    v && v.assemble ? el('div', 's3-reacts', assembleBtn(v)) : null);
   node.s3 = {conv, t, obs};
   if (v && v.dropDress) v.dropDress(node, 'guy:' + (obs.cursor || obs.at || t.turn_id), 'full', () => dropGuyPanel(v, conv, t, obs));   /* [s3-msgdrop] */
+  if (v && v.tapAssembles) {                           /* [s3-imsg] a tap plays it coming together */
+    node.addEventListener('click', e => {
+      if (e.target.closest(TAP_CONTROLS)) return;
+      e.stopPropagation();
+      v.tapAssembles(node, e);
+    });
+  }
   return node;
 }
 
@@ -1534,6 +1777,10 @@ function boardLineFor(conv, t, media) {
 function sfxClipCard(played, v) {
   const name = el('b', {text: played.clip || 'clip'});
   const card = el('div', {class: 's3-clip'}, el('div', 's3-clip-name', name));
+  if (v && v.tapAssembles) {                  /* [s3-imsg] the Messenger: the clip plays in its card, one at a time */
+    card.append(stingMedia(v, stingInfo(null, played)));
+    return card;
+  }
   const stagebox = el('div', 's3-clip-stage');
   card.append(stagebox);
   Promise.resolve(v.api.sfxMedia(played)).then(media => {
@@ -1690,6 +1937,159 @@ async function sfxMedia(request, played) {
     })().catch(() => { MEDIA.delete(sid); return null; }));
   }
   return MEDIA.get(sid);
+}
+
+/* [s3-imsg] A STING'S CLIP IN ITS MESSAGE. "I want to see the video play in
+   the messenger view, but if I tap the message for the SFX in the messenger
+   view, then I want to see it animated with the assembly of the dice rolling
+   and then it transitioning into the video where it then shows the video
+   play or it shows the audio waveform for the audio that's referenced"
+   (operator, 2026-09-28).
+   A video: its own frame (the poster) until it plays; then the clip, MUTED -
+   the air carries the sound - once through, and back to its frame. An audio
+   clip: its spectrogram with a playhead that crosses it in the clip's length.
+   On air it plays with the air (face.clock: from where the clip has got to,
+   drawn back into step when it drifts); a replay plays it from the start.
+   ONE VIDEO DECODES AT A TIME, ONLY ON SCREEN, ONCE THROUGH: starting one
+   unloads the one before (THUMB, shared with the old thumbnails); one that
+   leaves the view, or the page, is unloaded at once; a clip off screen never
+   starts; nothing loops - the tablet choked on six looping muted thumbnails.
+   The file is asked for only when it plays (sfxMedia: one replay-source per
+   clip); the frame and the spectrogram ride the ledger row (_sfx_roll_media).
+   A tap on any of it is the message's tap: it plays the message coming
+   together again (the Messenger's assemble), never the SFX TV's radial. */
+const SFX_THUMB = /\/api\/sfx\/(poster|spec)\/([0-9a-f]{16})\?t=([^&#\s"]+)/;
+function stingInfo(line, played) {
+  const roll = line && line.sfx_roll && typeof line.sfx_roll === 'object' ? line.sfx_roll : {};
+  const out = {sid: '', kind: '', poster: '', spec: '', seconds: Number((played && played.seconds) || 0) || null,
+    name: boardName(line) || String((played && played.clip) || '')};
+  const take = (u, kind) => {
+    const m = SFX_THUMB.exec(String(u || ''));
+    if (m) out.sid = out.sid || m[2];
+    if (kind === 'video' || (m && m[1] === 'poster')) { out.kind = 'video'; out.poster = out.poster || String(u); }
+    else if (kind === 'audio' || (m && m[1] === 'spec')) { out.kind = out.kind || 'audio'; out.spec = out.spec || String(u); }
+  };
+  if (line && typeof line.poster === 'string' && line.poster) take(line.poster, 'video');
+  if (roll.thumb) take(roll.thumb, roll.thumb_kind === 'frame' ? 'video' : roll.thumb_kind === 'spectrogram' ? 'audio' : '');
+  if (played && /^[0-9a-f]{16}$/.test(String(played.sample_id || ''))) out.sid = out.sid || String(played.sample_id);
+  return out;
+}
+const stingSeen = typeof IntersectionObserver === 'function'
+  ? new IntersectionObserver(rows => {
+    for (const r of rows) { r.target.s3inView = r.isIntersecting; if (!r.isIntersecting && r.target.s3unload) r.target.s3unload(); }
+  }) : null;
+function stingMedia(v, info, {live = false} = {}) {
+  const box = el('div', {class: 's3-sting-media ' + (info.kind === 'audio' ? 'audio' : 'video')});
+  let media = null, vid = null, raf = 0, head = null, run = null;
+  const still = () => {
+    if (info.kind === 'audio') {
+      head = el('i', {class: 's3-playhead', 'aria-hidden': 'true'});
+      const img = el('img', {class: 's3-sting-spec', alt: 'the clip\'s spectrogram', decoding: 'async'});
+      if (info.spec) loadPoster(img, stationUrl(info.spec));
+      fill(box, el('div', 's3-sting-wave', img, head),
+        el('span', {class: 's3-sting-len', text: info.seconds ? `${num(info.seconds, 1)} s` : 'audio'}));
+      return;
+    }
+    const img = el('img', {class: 's3-sfxposter s3-sting-poster' + (live ? ' s3-popin' : ''), alt: info.name || 'the clip', decoding: 'async',
+      onerror: e => { e.currentTarget.hidden = true; }});
+    if (info.poster) img.src = stationUrl(info.poster); else img.hidden = true;
+    fill(box, img);
+  };
+  /* back to its frame: the decoder is let go (src out, load()) - a detached <video> keeps decoding */
+  const unload = () => {
+    cancelAnimationFrame(raf); raf = 0; run = null;
+    if (vid) { try { vid.pause(); vid.removeAttribute('src'); vid.load(); } catch (e) { /* gone */ } vid.remove(); vid = null; }
+    box.classList.remove('on');
+    if (THUMB.stop === unload) THUMB.stop = null;
+    if (info.kind !== 'audio' && !box.querySelector('img')) still();
+  };
+  box.s3unload = () => { if (vid || raf) unload(); };
+  const playhead = (from, seconds) => {
+    if (!head || !(seconds > 0)) return;
+    cancelAnimationFrame(raf);
+    run = {t0: performance.now() - from * 1000, seconds};
+    box.classList.add('on');
+    const step = () => {
+      raf = 0;
+      if (!run || !box.isConnected) { run = null; return; }
+      const k = Math.min(1, (performance.now() - run.t0) / 1000 / run.seconds);
+      head.style.setProperty('--k', k.toFixed(4));
+      if (k < 1) raf = requestAnimationFrame(step);
+      else { run = null; box.classList.remove('on'); }
+    };
+    step();
+  };
+  box.play = async ({from = 0, seconds = 0} = {}) => {
+    if (seconds > 0 && !info.seconds) info.seconds = seconds;          /* the air's own length for the clip */
+    if (box.s3inView === false || !box.isConnected) return false;       /* off screen: it never starts */
+    if (info.kind === 'audio' && info.seconds) { playhead(from, info.seconds); return true; }
+    if (!info.sid || !v || !v.api) return false;
+    media = media || await v.api.sfxMedia({sample_id: info.sid});
+    if (!media || !media.url || !box.isConnected || box.s3inView === false) return false;
+    if (!info.kind) info.kind = media.kind;
+    if (media.kind === 'audio') {
+      info.seconds = info.seconds || media.seconds;
+      if (!info.spec && media.spec) info.spec = media.spec;
+      if (!head) { box.className = 's3-sting-media audio'; still(); }
+      playhead(from, info.seconds || 0);
+      return true;
+    }
+    if (THUMB.stop && THUMB.stop !== unload) THUMB.stop();              /* one decoder: the last one lets go */
+    THUMB.stop = unload;
+    if (vid) unload();
+    vid = el('video', {preload: 'auto', 'aria-label': 'the clip, playing muted - the air carries its sound', class: 's3-sting-video'});
+    vid.muted = true; vid.defaultMuted = true; vid.playsInline = true; vid.loop = false;
+    vid.setAttribute('muted', ''); vid.setAttribute('playsinline', '');
+    if (media.poster || info.poster) vid.poster = media.poster || stationUrl(info.poster);
+    if (window.PineAir && typeof window.PineAir.mine === 'function') window.PineAir.mine(vid);
+    const me = vid;
+    vid.addEventListener('ended', () => { if (vid === me) unload(); });
+    vid.addEventListener('timeupdate', () => { if (vid === me && !box.isConnected) unload(); });
+    vid.addEventListener('error', () => { if (vid === me) unload(); });
+    if (from > 0.05) vid.addEventListener('loadedmetadata', () => { try { if (from < (vid.duration || 0)) vid.currentTime = from; } catch (e) { /* not seekable */ } }, {once: true});
+    vid.src = media.url;
+    fill(box, vid);
+    box.classList.add('on');
+    vid.play().catch(() => {});
+    return true;
+  };
+  /* on air: kept with the air's clock for this clip */
+  box.sync = (at) => {
+    if (!(at >= 0)) return;
+    if (vid && !vid.paused && isFinite(vid.duration) && Math.abs(vid.currentTime - at) > 0.45 && at < vid.duration - 0.2) {
+      try { vid.currentTime = at; } catch (e) { /* not seekable yet */ }
+    }
+    if (run && info.seconds) { const want = performance.now() - at * 1000; if (Math.abs(run.t0 - want) > 300) run.t0 = want; }
+  };
+  box.playing = () => !!(vid && !vid.paused) || !!run;
+  still();
+  if (stingSeen) stingSeen.observe(box);
+  return box;
+}
+/* [s3-imsg] "I want that little play button on every message so I can play it and see how the
+   message was assembled by just clicking it": at the end of the dice row of every message - a
+   spoken line, a card still to come, a sting, the SFX Guy's line and clip - ONE SPLIT BUTTON.
+   The play half runs the compact assembly (v.assemble: the chip row landing one by one, the hold,
+   the words); the arrow half runs the extended one (v.assembleExtended: every decision as its own
+   big card - the roulette strip, the dice bar with its arithmetic, the Rolodex - opening and
+   landing in the same order, then the words). The arrow is a Carbon caret from the vendored set
+   (c:caret--right, turned down: the set has no caret--down), and Carbon's chevron inline when the
+   icon set is not on the page. Neither moves the page. */
+const TAP_CONTROLS = 'button, a[href], summary, input, select, textarea, label, [role="button"], .s3-drop, .s3-compose, .s3-gone-tag';
+function assembleBtn(v) {
+  const itemOf = e => e.currentTarget.closest('[data-item]') || e.currentTarget.closest('.s3-msg');
+  const play = el('button', {type: 'button', class: 's3-assemble-btn', innerHTML: PLAY_SVG,
+    title: 'play how this message came together - its dice landing one by one, then its words',
+    'aria-label': 'play how this message came together',
+    onclick: e => { e.stopPropagation(); const n = itemOf(e); if (n && v && v.assemble) v.assemble(n); }});
+  const more = el('button', {type: 'button', class: 's3-assemble-more',
+    title: 'the long version: every decision behind this message as its own card - the roulette, the dice and the Rolodex with their arithmetic',
+    'aria-label': 'play the long version: every decision as its own card',
+    onclick: e => { e.stopPropagation(); const n = itemOf(e); if (n && v && v.assembleExtended) v.assembleExtended(n); }});
+  const caret = typeof window.pineIcon === 'function' ? window.pineIcon('c:caret--right') : '';
+  if (caret) { more.innerHTML = caret; more.classList.add('s3-caret-down'); }
+  else more.innerHTML = DROP_CHEVRON;
+  return el('span', {class: 's3-assemble', role: 'group', 'aria-label': 'replay how this message came together'}, play, more);
 }
 
 /* The operator's menu for a clip The SFX Guy played - the station's own: the
@@ -1863,6 +2263,34 @@ function replayCard(ev, conv, turn, api) {
     result.hidden = false;
     await sleep(base * 0.3);
     if (reels.length) await playReels(null, reels, base);
+  };
+  return card;
+}
+/* [s3-imsg] One pick recorded with its row rather than as an event - a
+   sting's category or clip, the SFX Guy's line - as a card of the long
+   version: its die, a strip with a mark that lands where the pick sits in
+   its pool, and what it landed on. Only recorded numbers. */
+function pickCard(fam, name, r) {
+  const face = die(r.dice == null || r.dice === '' ? null : Number(r.dice));
+  const where = [r.index != null && r.of ? `landed on ${r.index} of ${r.of}` : r.of ? 'of ' + r.of : '',
+    r.u != null ? 'u ' + num(r.u, 4) : '', r.by ? 'by ' + r.by : ''].filter(Boolean).join(' · ');
+  const mark = el('b', 's3-rbar-mark');
+  const bar = el('div', 's3-tbar s3-pbar', mark);
+  const cap = el('div', {class: 's3-rcap', text: `${r.label ? '"' + String(r.label) + '"' : 'recorded with the row'}${where ? ' - ' + where : ''}`});
+  cap.hidden = true;
+  const card = el('div', {class: 's3-rcard', style: `--fam:${FAM[fam] || 'var(--obs)'}`},
+    el('div', 's3-rcard-head', el('b', {text: fam}), el('span', {text: name}), face), bar, cap);
+  const at = r.index != null && Number(r.of) > 0 ? (Number(r.index) - 0.5) / Number(r.of) * 100 : r.u != null ? Number(r.u) * 100 : 50;
+  card.play = async (base) => {
+    if (base > 0) {
+      mark.style.transition = 'none'; mark.style.left = '0%';
+      await sleep(20);
+      mark.style.transition = `left ${Math.round(base)}ms cubic-bezier(.12,.72,.2,1)`;
+    }
+    mark.style.left = Math.max(0, Math.min(100, at)) + '%';
+    await Promise.all([face.roll(base * 0.8), sleep(base)]);
+    cap.hidden = false;
+    await sleep(base * 0.3);
   };
   return card;
 }
@@ -2412,16 +2840,52 @@ function makeViews({request, onSelect, details = false} = {}) {
      the air line by line and replaces stageOf / revealed / dressItem. */
   v.sequenced = false;
   v.wordsOf = (t, conv) => t.text || ((v.aired(t, conv) || {}).text) || '';
+  /* [s3-imsg] A TURN THE AIR TAKES IN RUNS. When a sting (or any row that is
+     not the turn's own) airs between two lines of one turn, the turn is
+     heard as runs of lines with the sting between them - so the Messenger
+     shows one message per run (the tune page's per-clip messages), each
+     released when ITS first line reaches the air: the words of a line whose
+     clip has not aired are never on screen. The first run keeps the turn's
+     key; a later one is 'part:<its first line>'. null when the turn's lines
+     run unbroken (one message, as before), or a run has no words of its own. */
+  const PARTS = new WeakMap();
+  v.partsOf = (conv, t) => {
+    if (!v.sequenced || !conv || !t) return null;
+    let memo = PARTS.get(conv);
+    if (!memo) { memo = new Map(); PARTS.set(conv, memo); }
+    if (memo.has(t.turn_id)) return memo.get(t.turn_id);
+    let out = null;
+    if (turnLines(conv, t).length > 1) {
+      const runs = [];
+      let cur = null;
+      for (const l of (conv.lines || []).filter(x => Number(x.block) > 0).slice().sort(byLedger)) {
+        if (l.turn_id === t.turn_id && isSpoken(l)) { if (!cur) runs.push(cur = []); cur.push(l); }
+        else if (cur) cur = null;
+      }
+      if (runs.length > 1 && runs.every(r => r.some(l => String(l.text || '').trim()))) {
+        out = runs.map((r, i) => ({key: i ? 'part:' + r[0].line_id : t.turn_id, index: i, of: runs.length, lines: r,
+          text: r.map(l => String(l.text || '').trim()).filter(Boolean).join(' ')}));
+      }
+    }
+    memo.set(t.turn_id, out);
+    return out;
+  };
+  /* the ledger lines an item speaks: a run's own, else the turn's */
+  v.linesOf = (key, conv, t) => {
+    const parts = v.partsOf(conv, t);
+    const p = parts && parts.find(x => x.key === key);
+    return p ? p.lines : turnLines(conv, t);
+  };
   v.airStage = (key, conv, t) => {
     if (!conv || conv.mode === 'shadow' || conv.mode === 'simulation') return 'written';
-    const lines = key.startsWith('sfx:') ? (conv.lines || []).filter(l => 'sfx:' + l.line_id === key) : turnLines(conv, t);
+    const lines = key.startsWith('sfx:') ? (conv.lines || []).filter(l => 'sfx:' + l.line_id === key) : v.linesOf(key, conv, t);
     const got = airOfLines(lines, v.air);
     if (got === 'aired') return 'written';
     if (got === 'off') return 'skipped';
     if (got === 'waiting') return 'upcoming';
     return Date.now() / 1000 - convAt(conv) > STALE_S ? 'written' : 'upcoming';
   };
-  v.stageOf = (key, conv, t) => (v.sequenced ? v.airStage(key, conv, t) : 'written');
+  v.stageOf = (key, conv, t) => (v.replayAs.has(key) ? v.replayAs.get(key) : v.sequenced ? v.airStage(key, conv, t) : 'written');
   v.revealed = (key, len) => len;
   v.dressItem = null;
   /* a line on air shows its words as the audio reaches them: nothing types them in whole over it */
@@ -2449,21 +2913,28 @@ function makeViews({request, onSelect, details = false} = {}) {
   /* A. conversation view */
   v.bubble = (t, opts = {}) => {
     const conv = opts.conv || v.convOf(t);
+    /* [s3-imsg] one run of the turn's lines, when a sting airs between them (v.partsOf) */
+    const part = opts.part || null;
+    const key = part ? part.key : t.turn_id;
+    const later = !!(part && part.index > 0);
     /* [s3-messenger] not on air yet: its roulette, never its words */
-    const stg = opts.slot ? '' : v.stageOf(t.turn_id, conv, t);
-    if (stg === 'upcoming') return v.dropDress(v.card(t, conv), t.turn_id, 'card', c => dropTurnPanel(v, conv, t, c, true));   /* [s3-msgdrop] its dice and its row, never its words */
+    const stg = opts.slot ? '' : v.stageOf(key, conv, t);
+    if (stg === 'upcoming') {
+      if (later) return v.partCard(t, conv, part);
+      return v.dropDress(v.card(t, conv), t.turn_id, 'card', c => dropTurnPanel(v, conv, t, c, true));   /* [s3-msgdrop] its dice and its row, never its words */
+    }
     const st = v.turnStatus(t, conv);
     const perf = t.performance || {};
-    const whole = v.wordsOf(t, conv);
+    const whole = part ? part.text : v.wordsOf(t, conv);
     /* on air: only as many of its words as the audio has reached */
-    const text = stg === 'live' ? whole.slice(0, Math.max(0, v.revealed(t.turn_id, whole.length))) : whole;
+    const text = stg === 'live' ? whole.slice(0, Math.max(0, v.revealed(key, whole.length))) : whole;
     const planned = !whole;
     const directions = (t.directions || []).map(d => d.text).join('; ');
     const plan = `${perf.emotion ? perf.emotion + ' · ' : ''}${directions || t.step_label}`;
     const body = el('div', {class: 's3-bubble' + (planned ? ' planned' : '')},
       planned ? `${perf.emotion ? 'in ' + perf.emotion + ': ' : ''}${directions || t.step_label}` : el('span', {class: 's3-words', text}),
       !planned ? el('span', {class: 'dir', text: (conv.mode === 'shadow' ? 'System 3 would have directed: ' : '') + plan}) : null);
-    const reacts = el('div', 's3-reacts', ...turnEvents(conv, t).map(ev => {
+    const reacts = el('div', 's3-reacts', ...(later ? [] : turnEvents(conv, t)).map(ev => {
       const chip = chipOf(ev, conv);
       return el('span', {class: 's3-diamond' + (chip.miss ? ' miss' : ''), style: `--fam:${FAM[ev.family]}`, 'data-event': ev.event_id, 'data-turn': t.turn_id,
         title: chip.title, text: chip.text,
@@ -2471,13 +2942,9 @@ function makeViews({request, onSelect, details = false} = {}) {
         onclick: e => { e.stopPropagation(); v.select(t.turn_id, ev.event_id, e.currentTarget); openDecision(conv, ev, t, v.api); },
         onkeydown: e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); e.currentTarget.click(); } }});
     }));
-    if (!opts.slot && turnEvents(conv, t).length) {
-      reacts.append(el('button', {type: 'button', class: 's3-replay-btn', innerHTML: PLAY_SVG,
-        title: 'replay how this line was decided - the Rolodex, the roulette and the dice',
-        'aria-label': 'replay how this line was decided', onclick: e => { e.stopPropagation(); v.replayTurn(node, conv, t); }}));
-    }
+    if (!opts.slot) reacts.append(assembleBtn(v));                      /* [s3-imsg] on every message */
     const sb = (t.speakerbox || []).filter(s => s.mode !== 'NONE');
-    const chips = el('div', 's3-chips',
+    const chips = later ? null : el('div', 's3-chips',
       el('span', {text: t.phase}), perf.emotion ? el('span', {text: `${perf.emotion} ${num(perf.intensity)}`}) : null,
       sb.length ? el('span', {text: 'speakerbox ' + sb.map(s => s.mode.toLowerCase()).join(', ')}) : null,
       t.sfx && t.sfx.play ? el('span', {text: 'SFX ' + t.sfx.placement}) : null,
@@ -2486,7 +2953,7 @@ function makeViews({request, onSelect, details = false} = {}) {
     /* A line a speaker-box passage went into opens, in place, into its
        parts: the passages above and below it and the setup row. A line
        whose roll lost opens to its odds and the dials behind them. */
-    const composed = !opts.slot && canCompose(conv, t);
+    const composed = !opts.slot && !later && canCompose(conv, t);
     const passages = composed && (sbWon(t) || !!dealtBy(conv, scriptIndexOf(conv, t)) || opensOnSeed(conv, t));
     const open = composed && v.open.has(t.turn_id);
     if (composed) {
@@ -2496,27 +2963,45 @@ function makeViews({request, onSelect, details = false} = {}) {
     }
     const cutWhy = st.air && (st.air.cut_why || (st.air.aired === 'withdrawn' ? st.air.withdrawn_why : ''));
     /* [s3-messenger] struck out only on the air's own word; aired, it is past */
-    const skipTitle = stg === 'skipped' ? 'not heard: ' + (offWhy(conv, turnLines(conv, t)) || 'withdrawn or cut before air') : null;
+    const skipTitle = stg === 'skipped' ? 'not heard: ' + (offWhy(conv, v.linesOf(key, conv, t)) || 'withdrawn or cut before air') : null;
     const node = el('article', {class: `s3-msg ${SIDE[t.speaker] || 'left'} seat-${t.speaker}${opts.slot ? ' building' : ''}` +
-      `${composed ? (passages ? ' has-sb' : ' sb-miss') : ''}${open ? ' open' : ''}` +
+      `${composed ? (passages ? ' has-sb' : ' sb-miss') : ''}${open ? ' open' : ''}${later ? ' s3-part' : ''}` +
       `${stg === 'live' ? ' live' : stg === 'past' ? ' past' : stg === 'skipped' ? ' skipped' : ''}`,
-      'data-turn': t.turn_id, 'data-key': opts.slot ? null : t.turn_id, 'data-stage': stg || null,
-      title: skipTitle || (composed ? (open ? 'tap to close' : passages ? 'tap to open this line with its speaker-box passages'
-        : 'tap to see why no speaker-box passage won this line, and turn the odds') : null),
+      'data-turn': t.turn_id, 'data-key': opts.slot ? null : key, 'data-stage': stg || null, 'data-part': part ? String(part.index) : null,
+      title: skipTitle || (v.tapAssembles && !opts.slot ? 'tap to see it come together again; tap and hold for what to do with it'
+        : composed ? (open ? 'tap to close' : passages ? 'tap to open this line with its speaker-box passages'
+          : 'tap to see why no speaker-box passage won this line, and turn the odds') : null),
       onclick: e => {
         v.select(t.turn_id, '', e.currentTarget);
-        if (!composed || e.target.closest(KEEP_OPEN)) return;
         const pick = window.getSelection ? window.getSelection() : null;
         if (pick && !pick.isCollapsed && node.contains(pick.anchorNode)) return;   /* selecting words, not tapping */
+        /* [s3-imsg] the Messenger: a tap plays the message coming together (its passages open by their button) */
+        if (v.tapAssembles && !opts.slot) { if (!e.target.closest(TAP_CONTROLS)) v.tapAssembles(node, e); return; }
+        if (!composed || e.target.closest(KEEP_OPEN)) return;
         v.toggle(t, node);
       }},
-      el('div', 'who', el('b', {text: t.name || t.speaker}), el('span', {text: `${t.step_label} · turn ${t.index + 1}`})),
+      el('div', 'who', el('b', {text: t.name || t.speaker}),
+        el('span', {text: `${t.step_label} · turn ${t.index + 1}` + (part ? ` · ${part.index + 1} of ${part.of}` : '')})),
       opts.slot || (open ? composeLine(conv, t, v.api) : body), opts.slot ? null : reacts, opts.slot ? null : chips,
       !opts.slot && cutWhy ? cutNote(cutWhy, v) : null);
     node.fill = () => { node.classList.remove('building'); fill(node, node.firstChild, body, reacts, chips); };
     if (!opts.slot) esDress(node, t);                                    /* [s3-msgdrop] the ES emoji, bottom right */
-    if (!opts.slot) v.dropDress(node, t.turn_id, 'full|' + turnLines(conv, t).map(l => l.line_id).join(','), c => dropTurnPanel(v, conv, t, c, false));   /* [s3-msgdrop] */
-    if (stg && v.dressItem) v.dressItem(node, t.turn_id, stg);
+    if (!opts.slot && !later) v.dropDress(node, t.turn_id, 'full|' + turnLines(conv, t).map(l => l.line_id).join(','), c => dropTurnPanel(v, conv, t, c, false));   /* [s3-msgdrop] */
+    if (stg && v.dressItem) v.dressItem(node, key, stg);
+    return node;
+  };
+
+  /* [s3-imsg] a later run of a turn before the air reaches it: no dice of its
+     own (they were rolled for the turn, on its first run) - a slim card that
+     waits its turn, never its words */
+  v.partCard = (t, conv, part) => {
+    const node = el('article', {class: `s3-msg ${SIDE[t.speaker] || 'left'} seat-${t.speaker} s3-upcoming s3-part`,
+        'data-turn': t.turn_id, 'data-key': part.key, 'data-stage': 'upcoming', 'data-part': String(part.index),
+        onclick: e => { v.select(t.turn_id, '', e.currentTarget); if (v.tapAssembles && !e.target.closest(TAP_CONTROLS)) v.tapAssembles(node, e); }},
+      el('div', 'who', el('b', {text: t.name || t.speaker}), el('span', {text: `${t.step_label} · turn ${t.index + 1} · ${part.index + 1} of ${part.of}`})),
+      el('div', 's3-bubble s3-roulette', el('span', {class: 's3-rl-hint', text: 'the same turn, after the sting - waiting its turn'})),
+      el('div', 's3-reacts', assembleBtn(v)));
+    node.roll = () => landInOrder([]);
     return node;
   };
 
@@ -2531,21 +3016,23 @@ function makeViews({request, onSelect, details = false} = {}) {
     const hint = airOfLines(lines, v.air) === 'off' ? 'withdrawn - it will not air'
       : lineText(conv, t) ? 'written - waiting its turn' : 'being written';
     const chips = evs.map(ev => rouletteChip(ev, conv, e => { e.stopPropagation(); v.select(t.turn_id, ev.event_id, e.currentTarget); openDecision(conv, ev, t, v.api); }));
+    const parts = v.partsOf(conv, t);
     const node = el('article', {class: `s3-msg ${SIDE[t.speaker] || 'left'} seat-${t.speaker} s3-upcoming`,
-        'data-turn': t.turn_id, 'data-key': t.turn_id, 'data-stage': 'upcoming',
-        onclick: e => v.select(t.turn_id, '', e.currentTarget)},
-      el('div', 'who', el('b', {text: t.name || t.speaker}), el('span', {text: `${t.step_label} · turn ${t.index + 1}`})),
+        'data-turn': t.turn_id, 'data-key': t.turn_id, 'data-stage': 'upcoming', 'data-part': parts ? '0' : null,
+        onclick: e => {
+          v.select(t.turn_id, '', e.currentTarget);
+          if (v.tapAssembles && !e.target.closest(TAP_CONTROLS)) v.tapAssembles(node, e);   /* [s3-imsg] its dice land again */
+        }},
+      el('div', 'who', el('b', {text: t.name || t.speaker}),
+        el('span', {text: `${t.step_label} · turn ${t.index + 1}` + (parts ? ` · 1 of ${parts.length}` : '')})),
       el('div', 's3-bubble s3-roulette', chips.length ? el('div', 's3-rl-dice', ...chips) : null,
         el('span', {class: 's3-rl-hint', text: hint})),
-      chips.length ? el('div', 's3-reacts', el('button', {type: 'button', class: 's3-replay-btn', innerHTML: PLAY_SVG,
-        title: 'replay how this line was decided - the Rolodex, the roulette and the dice',
-        'aria-label': 'replay how this line was decided', onclick: e => { e.stopPropagation(); v.replayTurn(node, conv, t); }})) : null);
+      el('div', 's3-reacts', assembleBtn(v)));                         /* [s3-imsg] on every message */
     /* the dice roll together, a little staggered, inside the time given */
-    node.roll = async (ms) => {
-      if (!chips.length || ms <= 0) return;
-      const each = ms * 0.7, step = chips.length > 1 ? (ms * 0.3) / (chips.length - 1) : 0;
-      await Promise.all(chips.map((c, i) => sleep(i * step).then(() => c.roll(each))));
-    };
+    /* [s3-imsg] ...and on air they land one after another, in the card's
+       order (landInOrder): the promise settles when the last one is down.
+       An ES roll brings two pieces - its category, then its item. */
+    node.roll = () => landInOrder(chips.flatMap(c => c.pieces || [c.piece]));
     return node;
   };
 
@@ -2571,35 +3058,46 @@ function makeViews({request, onSelect, details = false} = {}) {
     const played = pair && pair.played;
     const quips = pair ? ((pair.obs.sfx_guy || []).map(q => q && q.text).filter(Boolean)) : [];
     const why = played && played.why ? `matched on "${played.why}"` : '';
-    let poster = null;
-    if (!upcoming && typeof line.poster === 'string' && line.poster) {
-      poster = el('img', {class: 's3-sfxposter' + (stg === 'live' ? ' s3-popin' : ''), src: stationUrl(line.poster), alt: name || 'the clip',
-        loading: 'lazy', decoding: 'async', onerror: e => { e.currentTarget.hidden = true; }});
-    }
+    /* [s3-imsg] its clip, in the message: the frame until it plays, the clip muted once through; an
+       audio clip's spectrogram with its playhead (stingMedia) */
+    const info = stingInfo(line, played);
+    const media = !upcoming && (info.kind || info.sid) ? stingMedia(v, info, {live: stg === 'live'}) : null;
+    /* the sheet's heading, and the station's hold sheet's: one line, not the card's text run together */
+    const clipName = String((roll.clip && roll.clip.label) || name || (played && played.clip) || '');
+    const said = [`Sting after turn ${t.index + 1}`, roll.category && roll.category.label ? String(roll.category.label) : '',
+      clipName ? `clip '${clipName}'` : ''].filter(Boolean).join(' · ');
+    const rlDice = dice.length ? el('div', 's3-rl-dice', ...dice) : null;
     const node = el('article', {class: `s3-msg left s3-sfxguy s3-sfxnode${upcoming ? ' s3-upcoming' : ''}` +
         `${stg === 'live' ? ' live' : stg === 'past' ? ' past' : stg === 'skipped' ? ' skipped' : ''}`,
-        'data-turn': t.turn_id, 'data-line': line.line_id, 'data-key': key, 'data-stage': stg,
-        title: stg === 'skipped' ? 'not heard: ' + (offWhy(conv, [line]) || 'withdrawn or cut before air') : null},
+        'data-turn': t.turn_id, 'data-line': line.line_id, 'data-key': key, 'data-stage': stg, 'data-said': said,
+        title: stg === 'skipped' ? 'not heard: ' + (offWhy(conv, [line]) || 'withdrawn or cut before air')
+          : v.tapAssembles ? 'tap to see it come together again; tap and hold for what to do with it' : null},
       el('div', 'who', sfxAvatar(), el('b', {text: 'SFX'}), el('span', {text: `a sting after turn ${t.index + 1}`})),
       el('div', 's3-bubble s3-sfx-bubble' + (upcoming ? ' s3-roulette' : ''),
-        dice.length ? el('div', 's3-rl-dice', ...dice) : null,
+        rlDice,
         upcoming ? el('span', {class: 's3-rl-hint', text: dice.length ? 'picked - waiting its turn' : 'a sting - waiting its turn'}) : null,
-        poster || (!upcoming && played ? sfxClipCard(played, v) : null),
+        media || (!upcoming && played ? sfxClipCard(played, v) : null),
         !upcoming && name ? el('div', {class: 's3-clip-name', text: name}) : null,
         !upcoming && quips.length ? el('div', {class: 's3-words', text: quips.join(' ')}) : null,
         !upcoming && why ? el('div', {class: 's3-sfx-why', text: why}) : null));
+    /* [s3-imsg] the split play button at the end of its dice row (its own row with no dice) */
+    if (rlDice) rlDice.append(assembleBtn(v)); else node.append(el('div', 's3-reacts', assembleBtn(v)));
     node.s3 = {conv, t, obs: pair ? pair.obs : null, played: played || null, line};
     v.dropDress(node, key, upcoming ? 'card' : 'full' + (pair ? '|played' : ''), () => dropStingPanel(v, conv, t, line, pair, upcoming));   /* [s3-msgdrop] */
     node.addEventListener('click', e => {
+      if (v.tapAssembles) {                     /* [s3-imsg] the Messenger: a tap - on the clip too - plays it coming together */
+        if (e.target.closest(TAP_CONTROLS)) return;
+        e.stopPropagation();
+        v.tapAssembles(node, e);
+        return;
+      }
       if (e.target.closest(KEEP_OPEN + ', .s3-vthumb, .s3-aplayer')) return;
       e.stopPropagation();
       if (pair && !upcoming) openSfxMenu(conv, t, pair.obs, played, v, node, e);
     });
-    /* the category die, then the clip die */
-    node.roll = async (ms) => {
-      if (ms <= 0) return;
-      for (const f of faces) await f.roll(ms / Math.max(1, faces.length));
-    };
+    /* the category die, then the clip die - [s3-imsg] landing one after the
+       other like a card's, then the poster pops in */
+    node.roll = () => landInOrder(dice.map((chip, i) => landPiece(chip, faces[i], null)));
     if (v.dressItem) v.dressItem(node, key, stg);
     return node;
   };
@@ -2617,6 +3115,197 @@ function makeViews({request, onSelect, details = false} = {}) {
     /* [s3-messenger] in a Messenger the builder draws the stage (past, skipped); only the host's marks carry over */
     for (const c of v.sequenced ? ['sel', 'onair'] : ['sel', 'onair', 'past', 'skipped']) if (from.classList.contains(c)) to.classList.add(c);
     if (!v.sequenced && from.classList.contains('skipped')) to.title = from.title;
+  };
+
+  /* ---- [s3-imsg] ONE ASSEMBLY, EVERY ROAD ------------------------------------
+     "Whenever I click on the play button for a message, I want to see the
+      simple play of how the message was assembled. Like whenever a new
+      message appears." - "Do not bring up this radial whenever I tap on
+      videos in the messenger view. Instead animate the message coming
+      together." (operator, 2026-09-28)
+     A message comes together one way, whoever asks: it stands as its
+     roulette card, its dice land one after another (an ES roll: its
+     category, then its item under it), everything holds still DICE_HOLD_MS,
+     and it becomes its message - the words typing out, or its clip playing.
+     The Messenger's live arrival runs it on the air's clock (v.rollIn); a
+     tap on a message or on its clip, and the play half of its split button,
+     run it again from the recorded rolls (v.assemble); the arrow half runs
+     the long version, every decision as its own card (v.assembleExtended).
+     A replay is drawn where the message stands and in the room it already
+     has (its height held), so nothing around it moves, the page is not
+     scrolled and the sync is not touched; a card still to come lands its
+     dice and stays a card (never its words); the message on air is left to
+     its own reveal (the host's assembleGate). */
+  v.replayAs = new Map();          /* key -> the stage a message is drawn in while it comes together again */
+  v.assembling = new Set();        /* keys coming together again right now */
+  v.extending = 0;                 /* long versions running: the host keeps its view where it is */
+  v.assembleGate = null;           /* host: (key, node) -> false to refuse */
+  v.onPut = null;                  /* host: (key, node) - a node now stands in an item's place */
+  v.onAssembled = null;            /* host: (key, node) - done */
+  v.tapAssembles = null;           /* host: set, a tap on a message plays it coming together */
+  const REPLAY_TYPE_MS = [700, 2600];   /* the words again: ~16 ms a character, inside this */
+  /* the key of what hangs off a turn - the SFX Guy's line ('guy:'), a clip he played ('clip:') */
+  v.obsKey = (kind, obs, t, played) => kind + ':' + ((obs && (obs.cursor || obs.at)) || (((t || {}).turn_id || '') + ':' + ((played || {}).clip || '')));
+  v.itemKey = n => {
+    if (!n || !n.dataset) return '';
+    if (n.dataset.item) return n.dataset.item;
+    if (n.dataset.key) return n.dataset.key;
+    const s = n.s3;
+    return s && s.obs ? v.obsKey(n.classList.contains('s3-sfxguy-line') ? 'guy' : 'clip', s.obs, s.t, s.played) : '';
+  };
+  /* the item drawn again as it stands now - as its card while v.replayAs says so */
+  v.redrawItem = (key, node) => {
+    const s = node && node.s3;
+    const turnId = (node && node.dataset && node.dataset.turn) || (s && s.t && s.t.turn_id) || '';
+    const conv = v.convOf({turn_id: turnId});
+    const t = conv && (conv.turns || []).find(x => x.turn_id === turnId);
+    if (!conv || !t) return null;
+    if (key.startsWith('sfx:')) {
+      const id = key.slice(4);
+      const line = (conv.lines || []).find(l => l.line_id === id) || (s && s.line);
+      return line ? v.sfxNode(conv, t, line, s && s.obs ? {obs: s.obs, played: s.played} : null) : null;
+    }
+    if (key.startsWith('guy:')) return s && s.obs ? sfxGuyLineEntry(conv, t, s.obs, v) : null;
+    if (key.startsWith('clip:')) return s && s.obs ? sfxEntry(conv, t, s.obs, v) : null;
+    if (key !== t.turn_id && !key.startsWith('part:')) return null;
+    return v.bubble(t, {conv, part: (v.partsOf(conv, t) || []).find(p => p.key === key) || null});
+  };
+  /* one node put in another's place: the host's marks carried, a clip playing in the old one let
+     go, the room it had held (`h`) */
+  v.putItem = (key, old, fresh, h) => {
+    v.keepPaint(old, fresh);
+    if (old.dataset.item) fresh.dataset.item = old.dataset.item;
+    if (old.style.minHeight) fresh.style.minHeight = old.style.minHeight;   /* the host's "never shorter" stays */
+    for (const m of old.querySelectorAll('.s3-sting-media')) if (m.s3unload) m.s3unload();
+    fresh.dataset.replaying = '1';
+    fresh.classList.add('s3-assembling');
+    if (h > 0) { fresh.style.height = h + 'px'; fresh.style.overflow = 'hidden'; }
+    old.replaceWith(fresh);
+    if (typeof v.onPut === 'function') v.onPut(key, fresh);
+    return fresh;
+  };
+  const settleItem = n => {
+    if (!n) return;
+    n.style.height = ''; n.style.overflow = '';
+    delete n.dataset.replaying;
+    n.classList.remove('s3-assembling', 's3-extending');
+  };
+  /* the card pops and its dice come down one after another, then all of them hold still
+     (landInOrder); `done` settles when the message may start - a card with no dice holds too when
+     `hold` (a replay: the card is seen), not on air (a run with no dice starts at once) */
+  v.rollIn = (card, {hold = false} = {}) => {
+    card.classList.remove('s3-popin'); void card.offsetWidth; card.classList.add('s3-popin');
+    const seq = typeof card.roll === 'function' ? card.roll() : landInOrder([]);
+    const n = seq.count || 0;
+    const done = n ? Promise.race([seq, frameSleep(n * DIE_STEP + DICE_HOLD_MS + 1500)])
+      : hold ? frameSleep(DICE_HOLD_MS) : Promise.resolve();
+    return {seq, done};
+  };
+  /* the message itself, once its dice are down: its words typed out again (fast - a long line in
+     two or three seconds), its clip played from the start */
+  v.messageIn = async (node) => {
+    if (!node) return;
+    const media = node.querySelector('.s3-sting-media');
+    if (media && typeof media.play === 'function') media.play({from: 0});
+    const words = node.dataset.stage === 'live' ? null : node.querySelector(':scope > .s3-bubble > .s3-words');
+    const text = words ? words.textContent : '';
+    if (!text || reduced()) return;
+    node.classList.add('arriving');
+    setTimeout(() => node.classList.remove('arriving'), 1600);
+    await typewriter(words, text, Math.max(REPLAY_TYPE_MS[0], Math.min(REPLAY_TYPE_MS[1], text.length * 16)));
+  };
+  v.assemble = async (node) => {
+    const key = v.itemKey(node);
+    if (!node || !node.isConnected || !key || v.assembling.has(key)) return false;
+    if (typeof v.assembleGate === 'function' && !v.assembleGate(key, node)) return false;
+    v.assembling.add(key);
+    /* its layout height, to the fraction and untouched by an animation's transform: held exactly,
+       nothing under it moves by even a pixel */
+    const h = parseFloat(getComputedStyle(node).height) || node.getBoundingClientRect().height;
+    let cur = node;
+    try {
+      v.replayAs.set(key, 'upcoming');
+      let card = null;
+      try { card = v.redrawItem(key, node); } finally { v.replayAs.delete(key); }
+      if (!card) return false;
+      cur = v.putItem(key, node, card, h);
+      if (!reduced()) await v.rollIn(card, {hold: true}).done;
+      if (!card.isConnected) return false;
+      const msg = v.redrawItem(key, card);
+      if (!msg) return false;
+      cur = v.putItem(key, card, msg, h);
+      await v.messageIn(msg);
+      return true;
+    } finally {
+      v.assembling.delete(key);
+      settleItem(cur);
+      if (typeof v.onAssembled === 'function') v.onAssembled(key, cur);
+    }
+  };
+  /* the recorded decisions behind an item, in the order they were drawn, as the long version's cards */
+  v.decisionsOf = (key, node) => {
+    const s = node && node.s3;
+    const turnId = (node && node.dataset && node.dataset.turn) || (s && s.t && s.t.turn_id) || '';
+    const conv = v.convOf({turn_id: turnId});
+    const t = conv && (conv.turns || []).find(x => x.turn_id === turnId);
+    if (!conv || !t) return [];
+    const byId = id => (id ? (conv.decision_events || []).find(e => e.event_id === id) : null);
+    const card = ev => () => replayCard(ev, conv, t, v.api);
+    if (key.startsWith('sfx:')) {
+      const line = (conv.lines || []).find(l => 'sfx:' + l.line_id === key) || (s && s.line) || {};
+      const roll = line.sfx_roll && typeof line.sfx_roll === 'object' ? line.sfx_roll : {};
+      const node0 = byId((t.sfx || {}).event_id);
+      return [node0 ? card(node0) : null,
+        ...[['which category', roll.category], ['which clip', roll.clip]].filter(([, r]) => r && typeof r === 'object')
+          .map(([name, r]) => () => pickCard('SFX', name, r))].filter(Boolean);
+    }
+    if (key.startsWith('guy:')) {
+      const g = byId((t.sfxguy || {}).event_id);
+      return [g ? card(g) : null, ...((s && s.obs && s.obs.draws) || []).map(d => () => pickCard('SFXGUY', 'which line',
+        {dice: d.dice, label: `the ${d.pool || ''} pool`, index: d.index, of: d.of, u: d.u}))].filter(Boolean);
+    }
+    if (key.startsWith('clip:')) { const ev = byId((t.sfx || {}).event_id); return ev ? [card(ev)] : []; }
+    return turnEvents(conv, t).map(card);
+  };
+  /* the long version: every decision as its own card - the roulette strip, the dice bar with its
+     arithmetic, the Rolodex - opening and landing in the order they were drawn, inside the
+     message; then its words again. The message grows to hold them and shrinks back after; the
+     host keeps its view where it is while it runs (v.extending), so the page never moves. */
+  v.assembleExtended = async (node) => {
+    const key = v.itemKey(node);
+    if (!node || !node.isConnected || !key || v.assembling.has(key)) return false;
+    if (typeof v.assembleGate === 'function' && !v.assembleGate(key, node)) return false;
+    const plan = v.decisionsOf(key, node);
+    v.assembling.add(key);
+    v.extending += 1;
+    let cur = node;
+    try {
+      node.dataset.replaying = '1';
+      node.classList.add('s3-assembling', 's3-extending');
+      for (const m of node.querySelectorAll('.s3-sting-media')) if (m.s3unload) m.s3unload();
+      const body = [...node.children].find(n => n.classList.contains('s3-bubble') || n.classList.contains('s3-compose'));
+      const panel = el('div', {class: 's3-bubble s3-replay', 'data-keep': ''});
+      if (body) body.replaceWith(panel); else node.append(panel);
+      if (!plan.length) panel.append(el('div', {class: 's3-rcap', text: 'no roll was recorded behind this message'}));
+      for (const make of plan) {
+        if (!node.isConnected) break;
+        const c = make();
+        panel.append(c);
+        await c.play(reduced() ? 0 : 620 / v.speed);
+      }
+      await sleep(reduced() ? 0 : 600);
+      if (!node.isConnected) return false;
+      const msg = v.redrawItem(key, node);
+      if (!msg) return false;
+      cur = v.putItem(key, node, msg, 0);
+      await v.messageIn(msg);
+      return true;
+    } finally {
+      v.assembling.delete(key);
+      v.extending = Math.max(0, v.extending - 1);
+      settleItem(cur);
+      if (typeof v.onAssembled === 'function') v.onAssembled(key, cur);
+    }
   };
 
   /* SFX Guy in the correspondence: the clip he scheduled for this line (the
@@ -2648,7 +3337,18 @@ function makeViews({request, onSelect, details = false} = {}) {
   };
   v.turnNodes = (conv, t) => {
     const s = v.sfxRows(conv, t);
-    return [...s.before, v.bubble(t, {conv}), ...s.after];
+    const parts = v.partsOf(conv, t);
+    if (!parts) return [...s.before, v.bubble(t, {conv}), ...s.after];
+    /* [s3-imsg] each run of the turn, and the stings that air between them where they air */
+    const out = [...s.before], rest = s.after.slice();
+    parts.forEach((p, i) => {
+      for (let k = 0; i && k < rest.length;) {
+        const l = rest[k].s3 && rest[k].s3.line;
+        if (l && byLedger(l, p.lines[0]) < 0) out.push(rest.splice(k, 1)[0]); else k += 1;
+      }
+      out.push(v.bubble(t, {conv, part: p}));
+    });
+    return [...out, ...rest];
   };
   v.roundChat = (conv) => el('div', 's3-chat', ...v.turnsInOrder(conv).flatMap(t => v.turnNodes(conv, t)));   /* [s3-still] newest first when asked */
 
@@ -2733,7 +3433,7 @@ function makeViews({request, onSelect, details = false} = {}) {
       fill(slot, rolls);
       for (const ev of turnEvents(conv, t)) {
         if (!tile.isConnected) break;
-        const row = rollRow(ev, conv);
+        const row = esTwoStageReel(ev, conv);                /* [s3-es-reel] */
         rolls.append(row);
         await row.roll(reduced() ? 0 : base);
       }
@@ -2756,34 +3456,9 @@ function makeViews({request, onSelect, details = false} = {}) {
 
   /* One message replayed where it stands: each decision's roulette, dice
      and Rolodex with its arithmetic, then the words type back in. */
-  v.replayTurn = async (node, conv, t) => {
-    if (node.dataset.replaying) return;
-    node.dataset.replaying = '1';
-    const body = [...node.children].find(n => n.classList.contains('s3-bubble') || n.classList.contains('s3-compose'));
-    const panel = el('div', {class: 's3-bubble s3-replay', 'data-keep': ''});
-    if (body) body.replaceWith(panel); else node.append(panel);
-    try {
-      for (const ev of turnEvents(conv, t)) {
-        if (!node.isConnected) break;
-        const card = replayCard(ev, conv, t, v.api);
-        panel.append(card);
-        await card.play(reduced() ? 0 : 620 / v.speed);
-      }
-      await sleep(reduced() ? 0 : 600);
-    } finally {
-      if (node.isConnected) {
-        const fresh = v.bubble(t, {conv});
-        v.keepPaint(node, fresh);
-        node.replaceWith(fresh);
-        const words = typable(fresh) && fresh.querySelector('.s3-words');
-        if (words && !reduced()) {
-          fresh.classList.add('arriving');
-          typewriter(words, words.textContent);
-          setTimeout(() => fresh.classList.remove('arriving'), 2400);
-        }
-      }
-    }
-  };
+  /* [s3-imsg] the long version is the split button's arrow now (v.assembleExtended); the hold
+     menu's "Replay how this line was decided" runs the same */
+  v.replayTurn = (node) => v.assembleExtended(node);
 
   /* Words arriving for a turn that was only a direction: the direction steps
      down to its small line and the dialogue types itself in. */
@@ -2942,15 +3617,21 @@ function makeViews({request, onSelect, details = false} = {}) {
    message waits for it. [s3-messenger] A message not yet on air stands as
    its roulette card (its dice, not its words); the air turns them into
    words one at a time, in the air's order, as the audio plays (see "THE
-   AIR, ONE LINE AT A TIME" below). The view follows the line on air, kept
-   near the bottom like a text thread; scrolled up by hand it stays put and
-   offers "Back to the line on air" (scrolling back down to the air, or 20 s
-   of stillness, resumes the follow). It reads the station's event cursor (one small request every few
+   AIR, ONE LINE AT A TIME" below), in the ledger's order ("THE THREAD").
+   [s3-imsg] Synced (the on-air pill pressed), the message on air sits at
+   the bottom of the view like the newest text in a thread and each new one
+   is brought up as it comes; a hand scroll either way, or opening,
+   selecting or holding something, unsyncs it and then nothing moves the
+   view until the operator scrolls back to the latest message or presses
+   the pill. It reads the station's event cursor (one small request every few
    seconds, only while the view is on screen) and fetches a round only when
    it has news - never a request per line, never a repaint of the feed. */
 export async function mountEmbedded(root, {request, view = 'conversation', onSelect, onOpenFull, chrome, details = true} = {}) {
   request ||= defaultRequest();
   root.classList.add('s3', 's3-embed');
+  /* [s3-imsg] its holds are its own (holdMenu, with the item it knows): the station's line sheet
+     (line-actions.js) does not open a second time on the same press */
+  root.setAttribute('data-own-hold', '');
   const v = makeViews({request, details, onSelect: (conv, turnId, eventId) => {
     if (!onSelect) return;
     onSelect({conversation: conv.identity.conversation_id, turn: turnId, event: eventId,
@@ -2959,38 +3640,62 @@ export async function mountEmbedded(root, {request, view = 'conversation', onSel
   let current = view === 'rolodex' || view === 'technical' ? 'rolodex' : 'conversation';
   let cid = '', note = '';
   let liveTurn = '', liveLine = '', handAt = 0, selfUntil = 0;
-  /* [s3-messenger] THE VIEW FOLLOWS THE AIR, not the bottom of the feed: the
-     line on air stays in sight near the bottom, the way a text thread keeps
-     its newest message, with what comes next peeking under it. A hand
-     scrolling up stops the follow; scrolling back down to the air, the
-     jump button, the on-air pill or 20 s with no scrolling resumes it. */
+  /* [s3-imsg] SYNCED TO THE CURRENT MESSAGE. "Make this button the synced to
+     current message button that whenever I click it it keeps the
+     messengers synced to the current message like a instant messenger ...
+     if I scroll away from it it basically turns this off or if I toggle it
+     off it allows me to freely scroll around this without my view being
+     reset to any location." - "do not move the page for me ... unless I am
+     already looking at the latest message ... I don't like any sort of auto
+     scroll taking over when I'm already looking at something specific."
+     (operator, 2026-09-28). `follow` IS the sync, and the on-air pill is its
+     one switch (pressed = synced). Synced, the message on air sits at the
+     bottom of the view and each new one is brought up as it comes. A hand
+     scroll away (either way), a panel opened, words selected or a message
+     held turns it off, and then NOTHING moves the view - no timer, no
+     refresh, no build - until the operator scrolls back to the latest
+     message or presses the pill. It starts on; nothing is kept across
+     reloads. */
   let follow = true;
   let liveKey = '';                            /* the item the host's focus is on: a turn id, or 'sfx:<line>' */
   let hold = null;                             /* a finger held down on something */
-  let unseen = 0;                              /* lines that went on air while the view was not following */
-  const FOLLOW_AGAIN = 20000;
+  let unseen = 0;                              /* lines that went on air while the view was not synced */
   const title = el('b', 's3-embed-title');
   const facts = el('span', 's3-muted s3-embed-facts');
-  const onAir = el('button', {type: 'button', class: 's3-pill s3-embed-air', title: 'take me to the line on air',
-    onclick: () => { toAir(); }});
-  /* The line on air, in whichever of the two views is up. In the Messenger
-     the pill puts the view back on the air and it STAYS there, following
-     (it used to stop the follow - the next line was then left behind). */
+  const onAir = el('button', {type: 'button', class: 's3-pill s3-embed-air s3-sync', 'aria-pressed': 'true',
+    onclick: () => { if (follow) unsync(); else toAir(); }});
+  const syncText = el('span', 's3-sync-text');
+  const syncCount = el('b', 's3-sync-count');
+  {
+    const svg = typeof window.pineIcon === 'function' ? window.pineIcon('c:link') : '';
+    const ico = el('span', {class: 's3-sync-ico', 'aria-hidden': 'true'});
+    if (svg) ico.innerHTML = svg;
+    onAir.append(ico, syncText, syncCount);
+  }
+  /* the sync off: nothing moves the view from here on */
+  function unsync() {
+    if (!follow) return;
+    follow = false;
+    handAt = Date.now();
+    paintJump();
+  }
+  /* The pill pressed: synced, and the view goes to the current message - in
+     whichever of the two views is up. */
   function toAir() {
+    follow = true; unseen = 0;
+    paintJump();
     if (current === 'rolodex') {
       const n = nodesFor(liveTurn)[0];
       if (!n) return false;
-      selfUntil = Date.now() + 800;
+      ownScroll(true);
       n.scrollIntoView({block: 'center', behavior: reduced() ? 'auto' : 'smooth'});
       n.classList.remove('s3-flash'); void n.offsetWidth; n.classList.add('s3-flash');
       return true;
     }
-    const n = itemNode(liveKey) || nodesFor(liveTurn)[0];
+    const n = itemNode(anchorKey());
+    toAnchor(true, true);                          /* asked for: it goes now, whatever the hand did last */
     if (!n) return false;
-    follow = true; unseen = 0;
-    toAnchor(true);
     n.classList.remove('s3-flash'); void n.offsetWidth; n.classList.add('s3-flash');
-    paintJump();
     return true;
   }
   /* "jump me to the line and then animate that particular tile of dialogue
@@ -3021,8 +3726,7 @@ export async function mountEmbedded(root, {request, view = 'conversation', onSel
        line not yet on air is its roulette: only a past line is rebuilt */
     if (node && t && !entry.building && !['live', 'upcoming'].includes(node.dataset.stage)) {
       await sleep(reduced() ? 0 : 450);         /* let the scroll land first */
-      const fresh = await v.rebuildTurn(node, entry.conv, t);
-      if (fresh) dressAir();
+      if (await v.assemble(node)) dressAir();   /* [s3-imsg] the one assembly: card, dice, hold, words */
     }
     return true;
   }
@@ -3034,8 +3738,7 @@ export async function mountEmbedded(root, {request, view = 'conversation', onSel
     if (svg) b.innerHTML = svg; else { b.textContent = short || label; b.classList.add('txt'); }
     return b;
   };
-  const jumpBtn = iconBtn('c:download', 'Back to the line on air', () => { follow = true; unseen = 0; toAnchor(true); paintJump(); },
-    {class: 's3-ibtn s3-embed-follow', hidden: true}, 'On air');   /* [s3-messenger] */
+  /* [s3-imsg] "Back to the line on air" is the on-air pill now: one switch, one truth */
   const playBtn = iconBtn('c:repeat', 'Play the build again: the newest round, message by message', () => replay(), {}, 'Replay');
   const fullBtn = onOpenFull ? iconBtn('c:maximize', 'Open System 3', () => onOpenFull(cid), {}, 'Open') : null;
   /* TURN BY TURN (System 3 Mode B): "we might need System 3 turn-by-turn
@@ -3073,7 +3776,7 @@ export async function mountEmbedded(root, {request, view = 'conversation', onSel
     paintTurn();
   }
   const cutBtn = iconBtn('c:cut', 'The systems that cut lines, and their switches', () => openCutPanel(v), {}, 'Cuts');
-  const tools = el('span', 's3-bar-tools', jumpBtn, turnBtn, cutBtn, playBtn, fullBtn);
+  const tools = el('span', 's3-bar-tools', turnBtn, cutBtn, playBtn, fullBtn);
   /* THE HOST'S OWN HEADER. "The items at five and six, I want added to the
      top header ... so that way this can be consolidated and the messenger
      can just be a pure messenger view." A host that passes chrome = {tools,
@@ -3099,63 +3802,201 @@ export async function mountEmbedded(root, {request, view = 'conversation', onSel
   fill(v.paneA, emptyBox, feedBox);
   fill(root, head, noteBox, bodyBox);
 
-  /* ---- following the air ------------------------------------------------- */
-  const atBottom = () => root.scrollHeight - root.scrollTop - root.clientHeight < 90;
-  function toBottom(smooth) {
-    if (current !== 'conversation' || hold) return;
-    selfUntil = Date.now() + (smooth ? 700 : 120);
-    if (smooth && !reduced()) root.scrollTo({top: root.scrollHeight, behavior: 'smooth'});
-    else root.scrollTop = root.scrollHeight;
+  /* ---- [s3-imsg] synced to the current message ------------------------------ */
+  const EDGE = 12;         /* the message on air sits this far above the view's bottom: nothing still to come shows above the fold */
+  const TOL = 48;          /* this close to where the sync would put the view is "at the latest message" */
+  const HAND_MS = 900;     /* a scroll this soon after the operator's own wheel, drag, key or scrollbar is theirs */
+  let handInput = 0, handDown = false;
+  const handOn = () => handDown || Date.now() - handInput < HAND_MS;
+  const cover = () => (head && head.isConnected ? head.offsetHeight : 0);     /* the sticky bar over the top of the view */
+  /* The message the sync keeps at the bottom: the newest one that has
+     appeared (the one on air, or what came in under it), else (nothing on
+     air here yet) the newest one that has happened - never a card still to
+     come, never the bottom of the feed (where rounds still being written
+     grow). */
+  function anchorKey() {
+    for (const k of [shownKey, airHead]) if (k && itemNode(k)) return k;    /* the newest message that has appeared, else the one on air */
+    for (let i = thread.length - 1; i >= 0; i -= 1) {
+      const n = itemNode(thread[i]);
+      if (n && n.dataset.key && n.dataset.stage && n.dataset.stage !== 'upcoming') return thread[i];
+    }
+    return '';
   }
-  /* [s3-messenger] The line on air near the bottom of the view, a peek of
-     what comes next under it; a line taller than the view shows its head.
-     With nothing on air yet, the newest message, as before. */
-  function toAnchor(smooth) {
-    if (current !== 'conversation' || hold) return;
-    const n = itemNode(liveKey);
-    if (!n) { toBottom(smooth); return; }
+  /* Where the sync puts the view: the anchor's bottom EDGE px above the
+     view's bottom - with what hangs under it that has happened (its clip,
+     the SFX Guy's line, an arrival that came late) - or, when that is
+     taller than the view, its head under the bar. null: nothing to anchor. */
+  function anchorTop() {
+    const k = anchorKey();
+    const n = k ? itemNode(k) : null;
+    if (!n) return null;
     const box = root.getBoundingClientRect(), r = n.getBoundingClientRect();
-    if (!box.height || !r.height) return;
-    const cover = head && head.isConnected ? head.offsetHeight : 0;     /* the sticky bar over the top of the view */
-    const lip = Math.min(140, root.clientHeight * 0.22);
-    let top = root.scrollTop + (r.bottom - box.top) - (root.clientHeight - lip);
-    if (r.height > root.clientHeight - lip - cover - 16) top = root.scrollTop + (r.top - box.top) - cover - 8;
-    top = Math.max(0, Math.min(root.scrollHeight - root.clientHeight, Math.round(top)));
-    if (Math.abs(top - root.scrollTop) < 2) return;
-    selfUntil = Date.now() + (smooth && !reduced() ? 700 : 160);
+    if (!box.height || !r.height) return null;
+    let bottom = r.bottom;
+    for (let i = thread.indexOf(k) + 1; i > 0 && i < thread.length; i += 1) {
+      const m = itemNode(thread[i]);
+      if (!m) continue;
+      if (m.classList.contains('s3-future') || m.dataset.stage === 'upcoming') break;
+      const q = m.getBoundingClientRect();
+      if (q.height) bottom = Math.max(bottom, q.bottom);
+    }
+    let top = root.scrollTop + (bottom - box.top) - (root.clientHeight - EDGE);
+    if (bottom - r.top > root.clientHeight - EDGE - cover() - 16) top = root.scrollTop + (r.top - box.top) - cover() - 8;
+    return Math.max(0, Math.min(root.scrollHeight - root.clientHeight, Math.round(top)));
+  }
+  /* The one scroll the sync makes. It waits while a finger is down or the
+     operator's hand is on the scroll; `force` is the operator's own request. */
+  function toAnchor(smooth, force = false) {
+    if (current !== 'conversation' || hold || (!force && (handOn() || replaying || v.extending))) return;
+    const top = anchorTop();
+    if (top == null || Math.abs(top - root.scrollTop) < 2) return;
+    ownScroll(smooth);
     if (smooth && !reduced()) root.scrollTo({top, behavior: 'smooth'});
     else root.scrollTop = top;
   }
-  /* the line on air is in sight, at or above the bottom of the view */
-  const airInSight = () => {
-    const n = itemNode(liveKey);
+  /* a scroll of the view's own (or one the operator asked for): its scroll events are not their hand */
+  function ownScroll(smooth) {
+    selfUntil = Date.now() + (smooth && !reduced() ? 700 : 160);
+    handInput = 0;
+  }
+  /* at the latest message: where the sync would put the view, give or take */
+  const atLatest = () => {
+    const top = anchorTop();
+    if (top == null) return root.scrollHeight - root.scrollTop - root.clientHeight < TOL;
+    return Math.abs(root.scrollTop - top) <= TOL;
+  };
+  /* the Technical view's latest: the lit turn in sight */
+  const rxAtLatest = () => {
+    const n = nodesFor(liveTurn)[0];
     if (!n) return false;
     const box = root.getBoundingClientRect(), r = n.getBoundingClientRect();
-    return r.bottom <= box.bottom + 4 && r.bottom >= box.top;
+    return r.height > 0 && r.bottom > box.top + cover() + 8 && r.top < box.bottom - 8;
   };
-  function refollow() {
-    if (follow || hold || current !== 'conversation' || Date.now() - handAt < FOLLOW_AGAIN) return;
-    follow = true; unseen = 0;
-    toAnchor(true);
-    paintJump();
+  /* The operator is examining something: a finger down, a card open over
+     the page, words selected, or something opened (a panel, a fold, a line
+     opened into its passages, a replay, a withdrawn line) on screen. The
+     sync does not come back on by itself while this is so. */
+  const OPENED = '.s3-drop, details[open], .s3-msg.open, .s3-replay, .s3-gone-open';
+  function examining() {
+    if (hold || document.querySelector('.s3-modal-back')) return true;
+    const sel = window.getSelection ? window.getSelection() : null;
+    if (sel && !sel.isCollapsed && sel.anchorNode && root.contains(sel.anchorNode)) return true;
+    const box = root.getBoundingClientRect();
+    for (const n of root.querySelectorAll(OPENED)) {
+      const r = n.getBoundingClientRect();
+      if (r.height && r.bottom > box.top && r.top < box.bottom) return true;
+    }
+    return false;
   }
+  /* A panel the operator opened on the message at the bottom opens out of
+     sight: it is brought into the view, head first (their own request). */
+  function revealOpened(node) {
+    if (!node || current !== 'conversation') return;
+    requestAnimationFrame(() => {
+      if (!root.contains(node)) return;
+      const panel = node.querySelector(':scope > .s3-drop') || node;
+      const box = root.getBoundingClientRect(), r = node.getBoundingClientRect(), p = panel.getBoundingClientRect();
+      if (p.top < box.bottom - 40) return;                          /* it opened in sight: nothing moves */
+      const by = Math.min(r.bottom - (box.bottom - EDGE), r.top - (box.top + cover() + 8));
+      if (by < 2) return;
+      ownScroll(true);
+      root.scrollBy({top: by, behavior: reduced() ? 'auto' : 'smooth'});
+    });
+  }
+  /* the pill: pressed while synced, the turn on air, and how many went on air while it was not */
   function paintJump() {
-    jumpBtn.hidden = follow || current !== 'conversation';
-    jumpBtn.dataset.count = unseen ? String(unseen > 99 ? '99+' : unseen) : '';
-    jumpBtn.title = unseen ? `Back to the line on air (${unseen} went on air since)` : 'Back to the line on air';
+    const on = follow;
+    onAir.classList.toggle('s3-synced', on);
+    onAir.setAttribute('aria-pressed', String(on));
+    syncCount.textContent = !on && unseen ? (unseen > 99 ? '99+' : String(unseen)) : '';
+    const say = on ? 'Synced to the current message: each new message comes into view as it airs. Tap to scroll freely.'
+      : unseen ? `Not synced - ${unseen} went on air since. Tap to sync to the current message.`
+        : 'Not synced: the view stays where you put it. Tap to sync to the current message.';
+    onAir.title = say;
+    onAir.setAttribute('aria-label', (syncText.textContent ? syncText.textContent + '. ' : '') + say);
   }
-  let lastTop = 0;
+  /* The operator's hand: a wheel, a finger dragging, a scrolling key, the
+     scrollbar or a middle-button scroll. A scroll with none of them near it
+     is the view's own (or the browser keeping it still) and changes nothing. */
+  const markHand = () => { handInput = Date.now(); };
+  root.addEventListener('wheel', markHand, {passive: true});
+  root.addEventListener('touchmove', markHand, {passive: true});
+  root.addEventListener('pointerdown', e => {
+    const box = root.getBoundingClientRect();
+    if (e.button === 1 || (e.pointerType === 'mouse' && e.clientX >= box.left + root.clientLeft + root.clientWidth)) { handDown = true; markHand(); }
+  }, {passive: true});
+  const handUp = () => { if (handDown) { handDown = false; markHand(); } };
+  const handKey = e => {
+    if (!/^(PageUp|PageDown|ArrowUp|ArrowDown|Home|End| |Spacebar)$/.test(e.key)) return;
+    if (e.target && e.target.closest && e.target.closest('input, textarea, select, [contenteditable="true"], [contenteditable=""]')) return;
+    markHand();
+  };
+  window.addEventListener('pointerup', handUp, true);
+  window.addEventListener('pointercancel', handUp, true);
+  document.addEventListener('keydown', handKey, true);
   root.addEventListener('scroll', () => {
-    const top = root.scrollTop, up = top < lastTop - 1;
-    lastTop = top;
-    if (Date.now() < selfUntil) return;
+    if (!handOn()) return;
+    handInput = Date.now();                       /* a fling's tail is still the operator's */
     handAt = Date.now();
-    /* [s3-messenger] a hand scrolling up stops the follow; back down to the air (or the bottom), it follows again */
-    if (up) follow = false;
-    else if (atBottom() || airInSight()) follow = true;
-    if (follow) unseen = 0;
+    const latest = current === 'rolodex' ? rxAtLatest() : atLatest();
+    if (follow && !latest) follow = false;                                  /* scrolled away, either way */
+    else if (!follow && latest && !examining()) { follow = true; unseen = 0; }   /* back at the latest message */
     paintJump();
   }, {passive: true});
+  /* examining something turns the sync off: words selected, a fold or a
+     panel opened, a control in the feed used (a die's card, a replay, a
+     line's passages), a message held (holdMenu) */
+  const onSelection = () => {
+    const sel = window.getSelection ? window.getSelection() : null;
+    if (sel && !sel.isCollapsed && sel.anchorNode && root.contains(sel.anchorNode)) unsync();
+  };
+  document.addEventListener('selectionchange', onSelection);
+  root.addEventListener('toggle', e => { if (e.target && e.target.open) unsync(); }, true);
+  bodyBox.addEventListener('click', e => {
+    /* [s3-imsg] a message played again (its split button) is watched where it stands - the sync is
+       not touched; a panel's chevron is the dropHook's to judge */
+    if (!e.target.closest || e.target.closest('.s3-assemble, .s3-drop-btn')) return;
+    if (e.target.closest('button, [role="button"], summary, a[href], input, select, textarea, [data-event]')) unsync();
+  }, true);
+  const toggleLine = v.toggle;
+  v.toggle = (t, node) => { toggleLine(t, node); if (v.open.has(t.turn_id)) unsync(); dressThread(); };
+  /* "what built this message" (its panel, when the host has it): opened on anything but the
+     message on air, it is examining - the sync goes off, and the view stays where it is; opened on
+     the message on air while synced, the sync carries on. No re-sync while an open panel is in
+     sight (examining()). */
+  v.dropHook = (node, open) => {
+    if (!open || current !== 'conversation') return;
+    if (follow && node !== itemNode(liveKey)) { follow = false; handAt = Date.now(); paintJump(); }
+    revealOpened(node);
+  };
+
+  /* [s3-imsg] ONE ASSEMBLY (makeViews): here a tap on a message plays it coming together; the
+     message on air is left to its own reveal; a node that stands in an item's place is the item's
+     node; a long version holds the view still while it runs (glide) */
+  v.tapAssembles = (node) => {
+    if (Date.now() - heldAt < 700) return;                 /* the release of a hold is not a tap */
+    v.assemble(node);
+  };
+  v.assembleGate = (key) => current === 'conversation' && !replaying && !(rv && rv.key === key) &&
+    ![...feed.values()].some(e => e.building && ownerOf.get(key) === e.conv.identity.conversation_id);
+  v.onPut = (key, fresh) => { nodes.set(key, fresh); dressThread(); };
+  v.onAssembled = () => { dressThread(); if (!v.extending) glide(); };
+  /* [s3-imsg] BACK (window.pineBack in pine-dismiss.js; the kiosk's BACK key) closes the topmost
+     overlay; here that is the newest "what built this message" panel open in sight - closed by
+     its own chevron. Overlays that sit above the page (the hold sheet, a decision card, the SFX
+     TV) are above it and go first. */
+  const unBack = window.PineDismiss && typeof window.PineDismiss.onBack === 'function'
+    ? window.PineDismiss.onBack(() => {
+      if (!root.isConnected || current !== 'conversation') return null;
+      const box = root.getBoundingClientRect();
+      const open = [...root.querySelectorAll('.s3-feed .s3-drop')].filter(p => {
+        const r = p.getBoundingClientRect();
+        return r.height > 0 && r.bottom > box.top && r.top < box.bottom;
+      });
+      const panel = open[open.length - 1];
+      const chev = panel && panel.parentElement ? panel.parentElement.querySelector(':scope > .who > .s3-drop-btn') : null;
+      return chev ? {node: panel, close: () => chev.click()} : null;
+    }) : null;
 
   /* TAP AND HOLD, EVERYWHERE: "If I tap and hold on a thumbnail or a piece
      of media, then show the what do I want to do with this menu always.
@@ -3171,6 +4012,7 @@ export async function mountEmbedded(root, {request, view = 'conversation', onSel
   root.addEventListener('pointerdown', e => {
     if (e.button) return;
     cancelHold();
+    heldAt = 0;                                  /* [s3-imsg] a new press: its click is its own, not a hold's release */
     const at = {x: e.clientX, y: e.clientY, target: e.target};
     hold = {x: at.x, y: at.y, timer: setTimeout(() => { cancelHold(); heldAt = Date.now(); holdMenu(at.target, at); }, HOLD_MS)};
   }, {passive: true});
@@ -3184,6 +4026,9 @@ export async function mountEmbedded(root, {request, view = 'conversation', onSel
   root.addEventListener('contextmenu', e => {
     if (!e.target.closest('.s3-msg, .s3-sysrow, .s3-clip, .s3-round-head')) return;
     e.preventDefault();
+    /* [s3-imsg] a touch screen's long press is a contextmenu AND this hold: one press, one menu */
+    if (Date.now() - heldAt < 1000) return;
+    cancelHold();
     heldAt = Date.now();
     holdMenu(e.target, {x: e.clientX, y: e.clientY});
   });
@@ -3191,6 +4036,7 @@ export async function mountEmbedded(root, {request, view = 'conversation', onSel
   root.addEventListener('click', e => { if (Date.now() - heldAt < 700) { e.stopPropagation(); e.preventDefault(); } }, true);
 
   async function holdMenu(target, at) {
+    unsync();                                    /* [s3-imsg] a message held: the operator is examining it */
     const la = window.PineLineActions;
     const headEl = target.closest('.s3-round-head');
     if (headEl) {
@@ -3203,13 +4049,31 @@ export async function mountEmbedded(root, {request, view = 'conversation', onSel
     const sfxNode = target.closest('.s3-sfxguy');
     if (sfxNode && sfxNode.s3) {
       const {conv, t, obs, played, line} = sfxNode.s3;
-      const media = played ? await v.api.sfxMedia(played) : null;
+      /* [s3-imsg] the SFX Guy's own line is a spoken row of the ledger ('drop'): it opens as a
+         line, headed with his name and his words */
+      if (sfxNode.classList.contains('s3-sfxguy-line')) {
+        const words = normWs(obs && obs.line);
+        const drop = words ? (conv.lines || []).find(l => l.who === 'drop' && normWs(l.text).toLowerCase() === words.toLowerCase()) : null;
+        if (la && typeof la.open === 'function' && drop) {
+          try { la.open({id: drop.line_id, said: (castName('sfx') + ': ' + words).slice(0, 220), node: sfxNode}); return; }
+          catch (e) { /* System 3's menu */ }
+        }
+        turnMenu(conv, t, sfxNode);
+        return;
+      }
+      /* [s3-imsg] a sting opens at once, as itself: its clip's id off the play it pairs with or its
+         row's own frame, its name, and a one-line heading - never the card's text run together.
+         The clip itself is looked up only when "Play it" asks for it (line-actions.js). */
+      const media = !line && played ? await v.api.sfxMedia(played) : null;
       const board = line || boardLineFor(conv, t, media);          /* [s3-messenger] a sting node knows its own row */
       if (la && typeof la.open === 'function' && board) {
-        sfxNode.pineItem = {tag: 'sting', sfx: (media && media.id) || (played && played.sample_id) || '', line: board.line_id,
-          deleted: false, text: (media && media.name) || board.text};
+        const info = stingInfo(board, played);
+        const roll = board.sfx_roll && typeof board.sfx_roll === 'object' ? board.sfx_roll : {};
+        const name = String((roll.clip && roll.clip.label) || (media && media.name) || info.name || (played && played.clip) || '');
+        sfxNode.pineItem = {tag: 'sting', sfx: (media && media.id) || info.sid || '', line: board.line_id, deleted: false, text: name};
         sfxNode.dataset.line = board.line_id;
-        try { la.open({id: board.line_id, said: 'A sting off the board: ' + ((media && media.name) || board.text), node: sfxNode}); return; }
+        const said = sfxNode.dataset.said || [`Sting after turn ${t.index + 1}`, name ? `clip '${name}'` : ''].filter(Boolean).join(' · ');
+        try { la.open({id: board.line_id, said, node: sfxNode}); return; }
         catch (e) { /* the SFX TV's menu instead */ }
       }
       if (obs) openSfxMenu(conv, t, obs, played, v, sfxNode, {clientX: at.x, clientY: at.y});
@@ -3227,9 +4091,16 @@ export async function mountEmbedded(root, {request, view = 'conversation', onSel
       if (ev) openDecision(conv, ev, t, v.api);
       return;
     }
-    const line = (conv.lines || []).find(l => l.turn_id === t.turn_id);
+    /* [s3-imsg] a run of the turn opens as its own first line; the heading is the speaker and the
+       words - a card still to come says so, never its words */
+    const key = (msg && msg.dataset.key) || t.turn_id;
+    const part = key.startsWith('part:') ? (v.partsOf(conv, t) || []).find(p => p.key === key) : null;
+    const line = part ? part.lines[0] : (conv.lines || []).find(l => l.turn_id === t.turn_id);
     if (la && typeof la.open === 'function' && line) {
-      try { la.open({id: line.line_id, said: line.text || lineText(conv, t), node: msg}); return; } catch (e) { /* System 3's menu */ }
+      const who = t.name || castName(t.speaker === 'B' ? 'cohost' : 'host', t.speaker);
+      const said = msg && msg.dataset.stage === 'upcoming' ? `${who} · turn ${t.index + 1} - not on air yet`
+        : `${who}: ${normWs(part ? part.text : (lineText(conv, t) || line.text || ''))}`;
+      try { la.open({id: line.line_id, said: said.slice(0, 220), node: msg}); return; } catch (e) { /* System 3's menu */ }
     }
     turnMenu(conv, t, msg);
   }
@@ -3291,8 +4162,8 @@ export async function mountEmbedded(root, {request, view = 'conversation', onSel
      audio, a picture loading - the line on air stays where it is in the view
      while the view follows the air. [s3-messenger] */
   let replaying = false;
-  if (window.ResizeObserver) new ResizeObserver(() => { if (follow && !replaying && current === 'conversation') toAnchor(false); }).observe(feedBox);
-  const grew = () => { if (follow && !replaying) toAnchor(false); };
+  if (window.ResizeObserver) new ResizeObserver(() => { if (follow && !replaying && !v.extending && current === 'conversation') glide(); }).observe(feedBox);
+  const grew = () => { if (follow && !replaying && !v.extending) glide(); };      /* [s3-imsg] eased, never a jump; still while a long version runs */
 
   /* ---- the feed ---------------------------------------------------------- */
   const FEED_MAX = 14;             /* 40 kept 316 messages and 58k nodes on the tablet */
@@ -3346,43 +4217,223 @@ export async function mountEmbedded(root, {request, view = 'conversation', onSel
     }));
   }
 
-  /* [s3-messenger] A ROUND'S PLACE IN THE FEED IS ITS PLACE ON THE AIR. The
-     script ledger's block is the order the air takes, so a round in the
-     script sits by its first block; a round not in the script yet (being
-     written) comes after every round that is, newest last - it can only air
-     after them. A round that never reached the script and is long past
-     (written and never aired) keeps its place in time. Nothing new is ever
-     slotted in above the line on air by a later plan: a plan joins the end. */
+  /* ---- [s3-imsg] THE THREAD: ONE ORDER, KEYED ON ITEMS ----------------------
+     "The entire point of system three was to design things in a way where we
+      are fully accountable of each and every message and therefore we can
+      finally display things sequentially and follow things sequentially
+      without erratically jumping the view around inserting messages
+      willy-nilly in places that have already taken place." (operator,
+      2026-09-28)
+     Every node in the feed is an ITEM with a key (data-item): a turn (its
+     id), a sting ('sfx:<line>'), or what hangs off a turn - the SFX Guy's
+     plan ('plan:<event>'), a clip the station played ('clip:<obs>'), his
+     line ('guy:<obs>'). Its PLACE is the station's commitment order, the
+     script ledger's (block, ord) that the air executes: a turn at its first
+     line, a sting at its own row, what hangs off a turn beside it; a turn
+     not in the script yet after its round's last line; a round with no line
+     yet after everything in the script, oldest first. `thread` is the order
+     AS DRAWN, under the Script view's rule ([s3-script-linear]):
+       1. at and above the item on air (`airHead`) nothing ever moves and
+          nothing is ever put in;
+       2. an item whose place is up there but is not drawn there - it came
+          late: a round fetched after its neighbours, a re-ranked line, a
+          sting or an interject filed late - goes directly BELOW the item on
+          air, in the ledger's order;
+       3. below that, everything in the ledger's order.
+     The DOM follows the thread: each run of consecutive items of one round
+     is a section.s3-round[data-conv] - the round's first run carries its
+     head (.s3-round-head), a later run a slim one (.s3-round-cont) - so a
+     round the air interleaves with another (an ad's parts around a station
+     ID) reads in the order it airs. A round that will never air (withheld,
+     abandoned, dropped, or no line long after it was planned) is not in the
+     thread; the Technical view and the inspector still reach it. */
+  let thread = [];                             /* item keys, top to bottom, as drawn */
+  let lateSet = new Set();                     /* items put under the air by rule 2 */
+  const nodes = new Map();                     /* item key -> its node */
+  const ownerOf = new Map();                   /* item key -> its round's id */
+  const outside = new Set();                   /* rounds that will never air */
+  const NEVER = new Set(['withheld', 'abandoned', 'dropped']);
   const blockOf = c => { let b = Infinity; for (const l of c.lines || []) { const n = Number(l.block); if (n > 0 && n < b) b = n; } return b; };
   const ghost = c => blockOf(c) === Infinity && Date.now() / 1000 - convTime(c) > STALE_S;
-  function airsAfter(a, b) {
-    const x = blockOf(a), y = blockOf(b);
-    if (x !== Infinity && y !== Infinity && x !== y) return x > y;
-    if ((x === Infinity) !== (y === Infinity) && !ghost(x === Infinity ? a : b)) return x === Infinity;
-    return convTime(a) > convTime(b);
+  const inChain = c => !!c && c.mode !== 'simulation' && !NEVER.has(String(c.status || '')) && !ghost(c);
+  const chatsOf = entry => [entry.chat, ...entry.runs.map(r => r.chat)];
+  /* a node's item key: its own, or what it hangs off (a turn built again where it stands keeps its turn's) */
+  function keyOfNode(n) {
+    if (!n || n.nodeType !== 1) return '';
+    if (n.dataset.item) return n.dataset.item;
+    if (n.dataset.key) return n.dataset.key;
+    if (n.classList.contains('building') && n.dataset.turn) return n.dataset.turn;
+    if (n.classList.contains('s3-sfxplan') && n.dataset.event) return 'plan:' + n.dataset.event;
+    const s = n.s3;
+    if (s && s.obs) return v.obsKey(n.classList.contains('s3-sfxguy-line') ? 'guy' : 'clip', s.obs, s.t, s.played);   /* [s3-imsg] one key, makeViews' */
+    return '';
   }
-  function place(entry) {
-    const later = [...feedBox.children].map(n => feed.get(n.dataset.conv))
-      .find(e => e && e !== entry && airsAfter(e.conv, entry.conv));
-    if (later) { if (entry.section.nextElementSibling !== later.section) feedBox.insertBefore(entry.section, later.section); }
-    else if (feedBox.lastElementChild !== entry.section) feedBox.append(entry.section);
+  /* The ledger's place of each item of a round: [tier, a, b] - tier 0 in the
+     script ([block, ord]), tier 1 not yet ([planned at, turn]). */
+  const PLACES = new WeakMap();
+  function placesOf(conv) {
+    if (PLACES.has(conv)) return PLACES.get(conv);
+    const lines = (conv.lines || []).filter(l => Number(l.block) > 0).sort(byLedger);
+    const first = new Map(), rows = new Map();
+    for (const l of lines) {
+      const at = [0, Number(l.block), Number(l.ord) || 0];
+      if (isSpoken(l)) { if (!first.has(l.turn_id)) first.set(l.turn_id, at); }
+      else if (l.line_id) rows.set('sfx:' + l.line_id, at);
+    }
+    /* [s3-imsg] a later run of a turn stands at its own first line */
+    for (const t of conv.turns || []) {
+      for (const part of (v.partsOf(conv, t) || []).slice(1)) {
+        const l = part.lines[0];
+        rows.set(part.key, [0, Number(l.block), Number(l.ord) || 0]);
+      }
+    }
+    const end = lines[lines.length - 1];
+    const out = {first, rows, last: end ? [0, Number(end.block), Number(end.ord) || 0] : null, created: convTime(conv),
+      turns: new Map((conv.turns || []).map(t => [t.turn_id, t]))};
+    PLACES.set(conv, out);
+    return out;
+  }
+  function turnPlace(conv, turnId) {
+    const p = placesOf(conv);
+    if (p.first.has(turnId)) return p.first.get(turnId);
+    const i = Number((p.turns.get(turnId) || {}).index) || 0;
+    return p.last ? [0, p.last[1], p.last[2] + 0.5 + i / 1000] : [1, p.created, i];
+  }
+  function placeOf(entry, key, n) {
+    const conv = entry.conv, p = placesOf(conv), turnId = n.dataset.turn || '';
+    if ((key.startsWith('sfx:') || key.startsWith('part:')) && p.rows.has(key)) return p.rows.get(key);
+    if (p.turns.has(key)) return turnPlace(conv, key);
+    const host = turnPlace(conv, turnId), t = p.turns.get(turnId);
+    const before = key.startsWith('plan:') && t && t.sfx && t.sfx.placement === 'before';
+    return [host[0], host[1], host[2] + (key.startsWith('sfx:') ? 0.6 : before ? -0.3 : 0.3)];
+  }
+  const cmpPlace = (x, y) => (x[0] - y[0]) || (x[1] - y[1]) || (x[2] - y[2]);
+  /* every item of the rounds in the thread, in the ledger's order */
+  function collect() {
+    const rows = [], seen = new Set();
+    for (const entry of feed.values()) {
+      if (entry.building) continue;                /* its nodes are moving: its keys keep their places */
+      for (const chat of chatsOf(entry)) {
+        for (const n of [...chat.children]) {
+          const k = keyOfNode(n);
+          if (!k) continue;
+          if (seen.has(k)) { n.remove(); continue; }  /* one node per item */
+          seen.add(k);
+          rows.push({key: k, entry, node: n, place: placeOf(entry, k, n), i: rows.length});
+        }
+      }
+    }
+    return rows.sort((a, b) => cmpPlace(a.place, b.place) || (a.i - b.i));
+  }
+  /* The rule, over keys: the drawn order down to the item on air, then the
+     late ones, then the ledger's order. */
+  function linearThread(keys, high) {
+    const hi = high ? thread.indexOf(high) : -1;
+    if (hi < 0) return {order: keys.slice(), late: new Set()};
+    const sIx = new Map(keys.map((k, i) => [k, i]));
+    const frozen = thread.slice(0, hi + 1).filter(k => feed.has(ownerOf.get(k)));
+    let bound = sIx.has(high) ? sIx.get(high) : -1;
+    for (let i = hi - 1; bound < 0 && i >= 0; i -= 1) if (sIx.has(thread[i])) bound = sIx.get(thread[i]);
+    const fz = new Set(frozen), late = [], rest = [];
+    for (const k of keys) { if (!fz.has(k)) (sIx.get(k) < bound ? late : rest).push(k); }
+    return {order: [...frozen, ...late, ...rest], late: new Set(late)};
+  }
+  /* a round's later run: its own section with a slim head */
+  function moreRun(entry, i) {
+    while (entry.runs.length <= i) {
+      const id = entry.conv.identity.conversation_id;
+      const chat = el('div', 's3-chat');
+      const headEl = el('div', {class: 's3-round-head s3-round-cont', 'data-conv': id, title: 'tap and hold for what to do with this segment'},
+        el('b', {text: entry.conv.identity.road_kind}), el('span', {class: 's3-muted', text: 'continues'}));
+      entry.runs.push({section: el('section', {class: 's3-round s3-round-more', 'data-conv': id}, headEl, chat), chat, headEl});
+    }
+    return entry.runs[i];
+  }
+  /* The DOM brought to the thread. Only what is out of place moves, so at and
+     above the air nothing is touched. */
+  function layoutThread(rows) {
+    const byKey = new Map(rows.map(r => [r.key, r]));
+    const runs = [];
+    for (const k of thread) {
+      const r = byKey.get(k);
+      if (!r) continue;
+      const last = runs[runs.length - 1];
+      if (last && last.entry === r.entry) last.nodes.push(r.node); else runs.push({entry: r.entry, nodes: [r.node]});
+    }
+    const used = new Map();
+    let prev = null;
+    for (const run of runs) {
+      const e = run.entry, i = used.get(e) || 0;
+      used.set(e, i + 1);
+      const box = i === 0 ? {section: e.section, chat: e.chat} : moreRun(e, i - 1);
+      const want = prev ? prev.nextElementSibling : feedBox.firstElementChild;
+      if (box.section !== want) feedBox.insertBefore(box.section, want);
+      let at = box.chat.firstElementChild;
+      for (const n of run.nodes) {
+        if (n === at) { at = at.nextElementSibling; continue; }
+        box.chat.insertBefore(n, at);
+      }
+      prev = box.section;
+    }
+    for (const e of feed.values()) {
+      const n = used.get(e) || 0;
+      while (e.runs.length > Math.max(0, n - 1)) e.runs.pop().section.remove();
+    }
+  }
+  /* [s3-imsg] the edge of what has happened: the later of where the air is and the newest message shown */
+  function liveEdge() {
+    let best = '', at = -1;
+    for (const k of [airKey, shownKey, airHead]) { const i = k ? thread.indexOf(k) : -1; if (i > at) { at = i; best = k; } }
+    return best;
+  }
+  /* the thread worked out again and the DOM brought to it */
+  function relayout() {
+    if (replaying) return;                       /* a round building again where it stands: after it */
+    const rows = collect();
+    for (const r of rows) {
+      if (r.node.dataset.item !== r.key) r.node.dataset.item = r.key;
+      ownerOf.set(r.key, r.entry.conv.identity.conversation_id);
+    }
+    const got = linearThread(rows.map(r => r.key), liveEdge());
+    thread = got.order;
+    lateSet = got.late;
+    nodes.clear();
+    for (const r of rows) nodes.set(r.key, r.node);
+    layoutThread(rows);
     seqCache = null;
+    emptyBox.hidden = feed.size > 0;
   }
   function mountRound(conv) {
     const id = conv.identity.conversation_id;
     const entry = {conv, section: el('section', {class: 's3-round', 'data-conv': id}), headEl: roundHead(conv),
-      chat: el('div', 's3-chat'), building: false, dirty: false, pending: null, fetchedAt: Date.now(), airAt: Date.now(), sig: new Map()};
+      chat: el('div', 's3-chat'), runs: [], building: false, dirty: false, pending: null, fetchedAt: Date.now(), airAt: Date.now(), sig: new Map()};
     entry.section.append(entry.headEl, entry.chat);
     feed.set(id, entry);
-    place(entry);
+    feedBox.append(entry.section);                 /* [s3-imsg] its place is the thread's to give (relayout) */
     v.remember(conv);
     emptyBox.hidden = true;
     return entry;
   }
+  /* [s3-imsg] a round that will never air leaves the thread - never from at
+     or above the air (a round with anything there has aired) */
+  function dropRound(entry) {
+    const id = entry.conv.identity.conversation_id;
+    const edge = liveEdge(), h = edge ? thread.indexOf(edge) : -1;
+    if (h >= 0 && thread.some((k, i) => i <= h && ownerOf.get(k) === id)) return false;
+    for (const s of [entry.section, ...entry.runs.map(r => r.section)]) s.remove();
+    feed.delete(id);
+    v.forget(id);
+    thread = thread.filter(k => ownerOf.get(k) !== id);
+    for (const [k, c] of [...ownerOf]) if (c === id) { ownerOf.delete(k); nodes.delete(k); }
+    seqCache = null;
+    relayout();
+    return true;
+  }
 
   function paintRound(entry) {
     seqCache = null;
-    fill(entry.chat, ...entry.conv.turns.flatMap(t => v.turnNodes(entry.conv, t)));
+    for (const chat of chatsOf(entry)) for (const n of [...chat.children]) if (keyOfNode(n)) n.remove();
+    entry.chat.append(...entry.conv.turns.flatMap(t => v.turnNodes(entry.conv, t)));
     for (const t of entry.conv.turns) entry.sig.set(t.turn_id, sigOf(entry.conv, t));
   }
 
@@ -3424,12 +4475,14 @@ export async function mountEmbedded(root, {request, view = 'conversation', onSel
   }
 
   async function addRound(id, {animate = false} = {}) {
-    if (feed.has(id) || queue.some(j => j.conv.identity.conversation_id === id)) return;
+    if (feed.has(id) || outside.has(id) || queue.some(j => j.conv.identity.conversation_id === id)) return;
     const conv = await fetchRound(id);
-    if (feed.has(id) || queue.some(j => j.conv.identity.conversation_id === id) || conv.mode === 'simulation') return;
+    if (feed.has(id) || queue.some(j => j.conv.identity.conversation_id === id)) return;
+    if (!inChain(conv)) { if (NEVER.has(String(conv.status || ''))) outside.add(id); return; }   /* [s3-imsg] never to air: not in the thread */
     if (animate && !reduced()) { queue.push({conv}); pump(); return; }
     const entry = mountRound(conv);
     paintRound(entry);
+    relayout();
     trim();
     dressAir();
   }
@@ -3444,7 +4497,7 @@ export async function mountEmbedded(root, {request, view = 'conversation', onSel
     v.remember(next);
     if (cid === next.identity.conversation_id) v.conv = next;
     seqCache = null;
-    if (blockOf(before) !== blockOf(next)) place(entry);      /* [s3-messenger] it reached the script: its place on the air */
+    if (!inChain(next) && dropRound(entry)) return;          /* [s3-imsg] withheld, abandoned or long gone: out of the thread */
     if (before.turns.map(t => t.turn_id).join() !== next.turns.map(t => t.turn_id).join()) {
       paintRound(entry);
     } else {
@@ -3452,14 +4505,12 @@ export async function mountEmbedded(root, {request, view = 'conversation', onSel
         const sig = sigOf(next, t);
         const old = entry.sig.get(t.turn_id) || '';
         if (old === sig) continue;
+        const rolling = rv && rv.phase === 'roll' ? itemNode(rv.key) : null;
+        if (rolling && rolling.dataset.turn === t.turn_id) continue;     /* [s3-imsg] its dice are landing: drawn when they are down */
         const was = before.turns.find(x => x.turn_id === t.turn_id);
         const hadWords = old.startsWith('w|') || !!(was && lineText(before, was));
-        const group = [...entry.chat.children].filter(n => n.dataset && n.dataset.turn === t.turn_id);
-        const oldBubble = group.find(n => n.classList.contains('s3-msg') && !n.classList.contains('s3-sfxguy'));
-        const fresh = v.turnNodes(next, t);
-        if (group.length) { group[0].before(...fresh); group.forEach(n => n.remove()); } else entry.chat.append(...fresh);
+        const fresh = regroup(entry, t);                                   /* [s3-imsg] each item where it stands */
         const bubble = fresh.find(n => n.classList.contains('s3-msg') && !n.classList.contains('s3-sfxguy'));
-        if (oldBubble && bubble) v.keepPaint(oldBubble, bubble);
         if (!hadWords && lineText(next, t) && bubble && !v.open.has(t.turn_id) && !['upcoming', 'live'].includes(bubble.dataset.stage)) {   /* [s3-messenger] */
           const words = bubble.querySelector('.s3-words');
           bubble.classList.add('arriving');
@@ -3475,26 +4526,62 @@ export async function mountEmbedded(root, {request, view = 'conversation', onSel
     const h = roundHead(next);
     entry.headEl.replaceWith(h);
     entry.headEl = h;
+    relayout();                                                            /* [s3-imsg] the thread's order, the air's rule */
     dressAir();
+  }
+  /* [s3-imsg] One turn's items drawn again where each stands (`only`: just
+     those keys); what the turn no longer has goes, what is new is put by it
+     for the thread to place; the item whose dice are landing is left alone. */
+  function regroup(entry, t, only = null) {
+    const fresh = v.turnNodes(entry.conv, t);
+    const old = new Map();
+    for (const chat of chatsOf(entry)) {
+      for (const n of chat.children) if (n.dataset && n.dataset.turn === t.turn_id) { const k = keyOfNode(n); if (k && !old.has(k)) old.set(k, n); }
+    }
+    const rolling = rv && rv.phase === 'roll' ? rv.key : '';
+    const seen = new Set();
+    let last = null;
+    for (const f of fresh) {
+      const k = keyOfNode(f);
+      seen.add(k);
+      const was = old.get(k);
+      if (was && ((only && !only.has(k)) || k === rolling || v.assembling.has(k))) { last = was; continue; }   /* [s3-imsg] coming together again: after */
+      if (was) { v.keepPaint(was, f); holdHeight(was, f); }
+      else if (last) last.after(f);
+      else { const first = old.values().next().value; if (first) first.before(f); else entry.chat.append(f); }
+      last = f;
+    }
+    if (!only) for (const [k, n] of old) if (!seen.has(k) && k !== rolling && !v.assembling.has(k)) n.remove();
+    return fresh;
   }
 
   /* [s3-messenger] Rounds go from the top, above the air only: a round at
      or after the line on air (what is airing, what comes next) is never
-     dropped, and a round the operator holds (a pick, an open line) is kept. */
+     dropped, and a round the operator holds (a pick, an open line) is kept.
+     [s3-imsg] Only a round wholly at the top of the thread, and not while
+     the operator is looking at it. */
   function trim() {
     while (feed.size > FEED_MAX) {
-      const onAirHere = e => e.conv.turns.some(t => t.turn_id === liveTurn || t.turn_id === airHead) ||
-        (airHead.startsWith('sfx:') && (e.conv.lines || []).some(l => 'sfx:' + l.line_id === airHead));
-      const held = e => e.building || e.conv.turns.some(t => t.turn_id === v.sel.turn || v.open.has(t.turn_id));
-      const order = [...feedBox.children].map(n => feed.get(n.dataset.conv)).filter(Boolean);
-      const air = order.findIndex(onAirHere);
-      const victim = (air < 0 ? order : order.slice(0, air)).find(e => !held(e));
-      if (!victim) break;
-      const above = victim.section.getBoundingClientRect().bottom <= root.getBoundingClientRect().top + 1;
+      const edge = liveEdge(), h = edge ? thread.indexOf(edge) : thread.length;
+      const held = e => e.building || e.conv.turns.some(t => t.turn_id === v.sel.turn || v.open.has(t.turn_id) ||
+        (typeof v.dropOpen === 'function' && v.dropOpen(t.turn_id)));
+      /* the round at the very top, and only when all of it is above the air - never one out of the middle */
+      const lastAt = new Map();
+      thread.forEach((k, i) => { const e = feed.get(ownerOf.get(k)); if (e) lastAt.set(e, i); });
+      const topKey = thread.find(k => feed.has(ownerOf.get(k)));
+      const victim = topKey ? feed.get(ownerOf.get(topKey)) : null;
+      if (!victim || (lastAt.get(victim) ?? Infinity) >= h || held(victim)) break;
+      const secs = [victim.section, ...victim.runs.map(r => r.section)];
+      const box = root.getBoundingClientRect();
+      const above = secs.every(s => !s.isConnected || s.getBoundingClientRect().bottom <= box.top + 1);
+      if (!above && !follow && current === 'conversation') break;   /* in sight of an operator looking: it stays */
       const keep = root.scrollHeight - root.scrollTop;          /* dropping from above the view keeps the view still */
-      victim.section.remove();
-      feed.delete(victim.conv.identity.conversation_id);
-      v.forget(victim.conv.identity.conversation_id);
+      const id = victim.conv.identity.conversation_id;
+      for (const s of secs) s.remove();
+      feed.delete(id);
+      v.forget(id);
+      thread = thread.filter(k => ownerOf.get(k) !== id);
+      for (const [k, c] of [...ownerOf]) if (c === id) { ownerOf.delete(k); nodes.delete(k); }
       seqCache = null;
       if (above) { selfUntil = Date.now() + 120; root.scrollTop = root.scrollHeight - keep; }
     }
@@ -3504,13 +4591,12 @@ export async function mountEmbedded(root, {request, view = 'conversation', onSel
     let rows = [];
     try { rows = (await request('/api/system3/conversations?limit=4')).conversations || []; } catch (e) { rows = []; }
     for (const row of rows.slice().reverse()) {
-      if (row.mode === 'simulation') continue;
+      if (row.mode === 'simulation' || NEVER.has(String(row.status || ''))) continue;   /* [s3-imsg] never to air */
       try { await addRound(row.conversation_id); } catch (e) { /* that round is skipped */ }
     }
     if (cid && !feed.has(cid)) { try { await addRound(cid); } catch (e) { /* keep going */ } }
     paintHead();
-    follow = true;
-    toAnchor(false);
+    if (follow) toAnchor(false);                   /* [s3-imsg] synced: the latest message; not, nothing moves */
   }
 
   /* Rounds with news are fetched again (at most every 3 s each); the newest
@@ -3526,6 +4612,7 @@ export async function mountEmbedded(root, {request, view = 'conversation', onSel
       }
     }
     for (const entry of [...feed.values()]) {
+      if (!entry.building && !inChain(entry.conv) && dropRound(entry)) continue;     /* [s3-imsg] a plan long gone unbound */
       const lines = (entry.conv.lines || []).length;
       const settled = lines > 0 && entry.conv.turns.every(t => {
         const st = v.turnStatus(t, entry.conv);
@@ -3627,19 +4714,105 @@ export async function mountEmbedded(root, {request, view = 'conversation', onSel
     }
     if (mark) mark.classList.add('onair');
     const t = c && c.turns.find(x => x.turn_id === liveTurn);
-    onAir.hidden = !t;
-    onAir.textContent = !t ? '' : liveKey.startsWith('sfx:') ? 'on air: a sting after turn ' + (t.index + 1)
+    /* [s3-imsg] the pill is the sync switch: always there in the Messenger, the turn on air on it */
+    onAir.hidden = !t && current !== 'conversation';
+    syncText.textContent = !t ? 'latest message' : liveKey.startsWith('sfx:') ? 'on air: a sting after turn ' + (t.index + 1)
       : 'on air: turn ' + (t.index + 1) + ' · ' + (t.name || t.speaker);
+    if (current === 'conversation') dressThread();
+    paintJump();
   }
 
-  /* The Technical view keeps the old manners: it follows the lit turn of
-     the round on show, gently, and not for 8 s after a hand scroll. */
+  /* [s3-imsg] THE FUTURE IS BELOW AND FADED. "I almost don't even want to
+     see the entries in the future after it because that doesn't happen in a
+     text message. If I scroll down to reveal that stuff, it should show up
+     and be slightly faded out. So that way I know that this is for a future
+     that hasn't happened yet. And I'm able to see the technical scaffolding
+     of everything that's assembled for the future." (operator, 2026-09-28)
+     Everything after the item on air - its cards, what hangs off them - is
+     .s3-future; a section with nothing but future in it (a round still to
+     come) is faded whole. The item on air never is, from its first die. And
+     a line the air's own receipt says was withdrawn or cut is ONE QUIET LINE
+     where it stood (.s3-gone), opened by a tap on it. */
+  const goneOpen = new Set();                  /* withdrawn lines the operator opened */
+  function isOff(n) {
+    const key = n.dataset.key || '';
+    if (key.startsWith('sfx:')) return airOff(v.air.get(n.dataset.line || key.slice(4)));
+    const turnId = n.dataset.turn || key;
+    const conv = v.convOf({turn_id: turnId});
+    const t = conv && (conv.turns || []).find(x => x.turn_id === turnId);
+    return !!t && airOfLines(v.linesOf(key, conv, t), v.air) === 'off';     /* [s3-imsg] a run: its own lines */
+  }
+  function goneDress(n, key) {
+    const off = !!n.dataset.key && n.dataset.key !== airHead && isOff(n);      /* never the item on air */
+    const open = off && goneOpen.has(key);
+    n.classList.toggle('s3-gone', off);
+    n.classList.toggle('s3-gone-open', open);
+    const who = n.querySelector(':scope > .who');
+    let tag = who ? who.querySelector(':scope > .s3-gone-tag') : null;
+    if (!off) { if (tag) tag.remove(); return; }
+    if (!who) return;
+    if (!tag) {
+      tag = el('button', {type: 'button', class: 's3-gone-tag', onclick: e => {
+        e.stopPropagation();
+        if (goneOpen.has(key)) goneOpen.delete(key); else goneOpen.add(key);
+        dressThread();
+      }});
+      who.insertBefore(tag, who.querySelector(':scope > .s3-drop-btn'));
+    }
+    const text = n.dataset.stage === 'upcoming' ? 'withdrawn - it will not air' : 'withdrawn - never aired';
+    if (tag.textContent !== text) tag.textContent = text;
+    tag.setAttribute('aria-expanded', String(open));
+    tag.title = (open ? 'Close it' : 'Open it') + ': ' + (n.title || 'withdrawn or cut before air');
+  }
+  function dressThread() {
+    const lit = rv ? rv.key : '';
+    const pos = seqPos(), shown = shownKey && pos.has(shownKey) ? pos.get(shownKey) : null;
+    for (const sec of feedBox.children) {
+      const chat = sec.querySelector(':scope > .s3-chat');
+      let any = 0, ahead = 0;
+      for (const n of chat ? chat.children : []) {
+        const key = keyOfNode(n);
+        if (!key) continue;
+        any += 1;
+        /* after the newest message shown, it has not happened here yet; before
+           any has been shown, the receipts say (what hangs off a turn goes with it) */
+        const at = pos.get(key);
+        const host = n.dataset.key ? n : (itemNode(n.dataset.turn || '') || n);
+        const future = shown != null && at != null ? at > shown : host.dataset.stage === 'upcoming' && (host.dataset.key || '') !== lit;
+        n.classList.toggle('s3-future', future);
+        if (future) ahead += 1;
+        goneDress(n, key);
+      }
+      sec.classList.toggle('s3-future', any > 0 && ahead === any);
+    }
+  }
+  /* where the operator was looking in the Messenger: the first item in sight and how far down the view it sat */
+  function viewMark() {
+    const box = root.getBoundingClientRect(), top = box.top + cover();
+    for (const k of thread) {
+      const n = itemNode(k);
+      const r = n ? n.getBoundingClientRect() : null;
+      if (r && r.height && r.bottom > top) return {key: k, y: r.top - box.top, top: root.scrollTop};
+    }
+    return {key: '', y: 0, top: root.scrollTop};
+  }
+  function viewBack(m) {
+    if (!m) return;
+    const n = m.key ? itemNode(m.key) : null;
+    ownScroll(false);
+    if (n) root.scrollTop += n.getBoundingClientRect().top - root.getBoundingClientRect().top - m.y;
+    else root.scrollTop = m.top;
+  }
+  let msgMark = null;
+
+  /* The Technical view follows the lit turn of the round on show, gently -
+     [s3-imsg] only while synced, like the Messenger. */
   function placeRolodex(force) {
     if (current !== 'rolodex' || !liveTurn) return;
-    if (!force && Date.now() - handAt < 8000) return;
+    if (!force && (!follow || handOn())) return;
     const target = nodesFor(liveTurn)[0];
     if (!target) return;
-    selfUntil = Date.now() + 700;
+    ownScroll(true);
     target.scrollIntoView({block: 'nearest', behavior: reduced() ? 'auto' : 'smooth'});
   }
 
@@ -3654,45 +4827,41 @@ export async function mountEmbedded(root, {request, view = 'conversation', onSel
      after it everything is its roulette card. When the air reaches a new
      item (face.live) the one before it is finished at once - its words
      whole, its bar full - anything the view did not see air is drawn
-     written, and the new one pops: its dice roll for a sliver of the line
-     (15 %, at most 1.2 s) and it turns into its message, the words coming
-     in as far as the audio has got (face.clock: this line's own position
-     and length; the turn's earlier lines are already whole). With no clock
-     the words come at about 14 characters a second, so they never stall.
+     written, and the new one pops: [s3-imsg] its dice land one after
+     another (landInOrder), all hold still on their numbers for
+     DICE_HOLD_MS, and only then does it turn into its message (a sting: its
+     poster pops), the words typing from the first
+     character and catching the audio up within CATCH_MS, then keeping
+     step with it (face.clock: this line's own position and length; the
+     turn's earlier lines are already whole). The air moving on while the
+     dice come down brings them down fast; the next item waits for them.
+     With no clock the words come at about 14 characters a second, so they never stall.
      Every tick touches the one live node, nothing else. The host's focus
      can go BACK (a line tapped in the script): the ON AIR mark follows it,
      nothing is re-played and nothing already shown is hidden again. */
-  const PACE = 14, ROLL_SHARE = 0.15, ROLL_MAX = 1200, CLOCK_FRESH = 2500;
+  const PACE = 14, CLOCK_FRESH = 2500, CATCH_MS = 1600;
   let clockAt = {line: '', at: 0, total: 0, when: 0};
-  let airHead = '';                  /* the furthest item the air has reached */
+  let airHead = '';                  /* the item whose reveal ran last (the message on air) */
   let rv = null;                     /* the reveal running on the head */
   let raf = 0;
   const doneBars = new Set();        /* items that played out here: their bar stays, full */
   const mmss = x => { const n = Math.max(0, Math.floor(Number(x) || 0)); return Math.floor(n / 60) + ':' + String(n % 60).padStart(2, '0'); };
   const sfxKey = l => 'sfx:' + l.line_id;
-  /* every item on show -> its place in the air's order (rebuilt when the feed changes) */
+  /* every item on show -> its place in the air's order: [s3-imsg] its place in the thread */
   function seqPos() {
     if (seqCache) return seqCache;
-    const pos = new Map();
-    let i = 0;
-    for (const sec of feedBox.children) {
-      const entry = feed.get(sec.dataset.conv);
-      if (!entry) continue;
-      const plan = boardPlan(entry.conv);
-      for (const t of entry.conv.turns || []) {
-        const slot = plan.get(t.turn_id);
-        if (slot) for (const l of slot.before) pos.set(sfxKey(l), i++);
-        pos.set(t.turn_id, i++);
-        if (slot) for (const l of slot.after) pos.set(sfxKey(l), i++);
-      }
-    }
-    seqCache = pos;
-    return pos;
+    seqCache = new Map(thread.map((k, i) => [k, i]));
+    return seqCache;
   }
   function itemNode(key) {
     if (!key) return null;
-    return v.paneA.querySelector(key.startsWith('sfx:') ? '.s3-sfxnode[data-key="' + CSS.escape(key) + '"]'
-      : '.s3-msg[data-key="' + CSS.escape(key) + '"]:not(.s3-sfxguy)');
+    const n = nodes.get(key);
+    if (n && v.paneA.contains(n)) return n;
+    const q = CSS.escape(key);
+    const m = v.paneA.querySelector(key.startsWith('sfx:') ? '.s3-sfxnode[data-key="' + q + '"]'
+      : '.s3-msg[data-key="' + q + '"]:not(.s3-sfxguy), .s3-feed [data-item="' + q + '"]');
+    if (m) nodes.set(key, m);
+    return m;
   }
   function itemAt(key) {
     for (const entry of feed.values()) {
@@ -3703,8 +4872,15 @@ export async function mountEmbedded(root, {request, view = 'conversation', onSel
         }
         continue;
       }
+      if (key.startsWith('part:')) {                /* [s3-imsg] a later run of a turn */
+        const row = (entry.conv.lines || []).find(x => x.line_id === key.slice(5));
+        const t = row && (entry.conv.turns || []).find(x => x.turn_id === row.turn_id);
+        const part = t && (v.partsOf(entry.conv, t) || []).find(x => x.key === key);
+        if (part) return {entry, conv: entry.conv, t, line: null, part};
+        continue;
+      }
       const t = (entry.conv.turns || []).find(x => x.turn_id === key);
-      if (t) return {entry, conv: entry.conv, t, line: null};
+      if (t) return {entry, conv: entry.conv, t, line: null, part: (v.partsOf(entry.conv, t) || [])[0] || null};
     }
     return null;
   }
@@ -3715,12 +4891,15 @@ export async function mountEmbedded(root, {request, view = 'conversation', onSel
   v.stageOf = (key, conv, t) => {
     const base = v.airStage(key, conv, t);
     if (!conv || conv.mode === 'shadow' || conv.mode === 'simulation') return 'written';
+    if (v.replayAs.has(key)) return v.replayAs.get(key);       /* [s3-imsg] a message coming together again (its play button) */
     if (rv && rv.key === key) return rv.phase === 'roll' ? 'upcoming' : 'live';
-    if (!airHead) return base;
-    const pos = seqPos(), at = pos.get(key), h = pos.get(airHead);
-    if (at == null || h == null) return base;
-    if (at > h) return 'upcoming';
-    return base === 'skipped' ? 'skipped' : 'past';
+    /* [s3-imsg] what has appeared (up to the newest message shown) is past;
+       what has not is its card - still to come, or waiting its turn to appear */
+    if (!shownKey) return base;
+    const pos = seqPos(), at = pos.get(key), s = pos.get(shownKey);
+    if (at == null || s == null) return base;
+    if (at > s) return 'upcoming';
+    return base === 'skipped' ? 'skipped' : lateSet.has(key) && base === 'written' ? 'written' : 'past';
   };
   const charsOf = (r, len) => (r.k >= 1 ? len : Math.floor(r.k * len));
   v.revealed = (key, len) => (rv && rv.key === key && rv.phase === 'words' ? charsOf(rv, len) : len);
@@ -3751,10 +4930,21 @@ export async function mountEmbedded(root, {request, view = 'conversation', onSel
   const barOf = (r, now) => { const k = clockK(r, now); return k == null ? r.k : Math.max(k, r.bar || 0); };
   function stepK(r, now) {
     const k = clockK(r, now);
-    const next = k != null ? k : r.k + Math.max(0, now - r.lastT) / 1000 / r.secs;      /* no clock: paced */
+    let next = k != null ? k : r.k + Math.max(0, now - r.lastT) / 1000 / r.secs;      /* no clock: paced */
     r.lastT = now;
+    if (k != null) {
+      r.bar = Math.max(r.bar || 0, k);
+      /* [s3-imsg] behind the audio (its dice took their time): the words type
+         up to it from where they stand, easing into its pace within CATCH_MS
+         - never a jump. Reduced motion: where the audio is, at once. */
+      if (!r.chase && !reduced() && (k - r.k) * Math.max(1, r.text.length || 40) > 3) r.chase = {from: r.k, t0: now};
+      if (r.chase) {
+        const f = Math.min(1, (now - r.chase.t0) / CATCH_MS);
+        next = r.chase.from + (k - r.chase.from) * f * (1 + f - f * f);
+        if (f >= 1) r.chase = null;
+      }
+    }
     r.k = Math.max(r.k, Math.min(1, next));
-    if (k != null) r.bar = Math.max(r.bar || 0, k);
   }
   function paintReveal(now) {
     const r = rv;
@@ -3765,7 +4955,10 @@ export async function mountEmbedded(root, {request, view = 'conversation', onSel
     const words = r.text ? node.querySelector(':scope > .s3-bubble > .s3-words') : null;
     if (words) {
       const n = charsOf(r, r.text.length);
-      if (n !== r.n || words.textContent.length !== n) { words.textContent = r.text.slice(0, n); r.n = n; }
+      const tn = words.childNodes.length === 1 && words.firstChild.nodeType === 3 ? words.firstChild : null;
+      if (tn && n > tn.data.length && r.text.startsWith(tn.data)) tn.appendData(r.text.slice(tn.data.length, n));   /* [s3-imsg] added to: words selected in it stay selected */
+      else if (n !== r.n || words.textContent.length !== n) words.textContent = r.text.slice(0, n);
+      r.n = n;
       if (n >= r.text.length) words.classList.remove('typing');
     }
     const bar = node.querySelector(':scope > .s3-bubble > .s3-airbar');
@@ -3791,6 +4984,7 @@ export async function mountEmbedded(root, {request, view = 'conversation', onSel
     stepK(rv, now);
     paintReveal(now);
     if (!raf && rv.k < 1) raf = requestAnimationFrame(frame);
+    if (rv.line) liveMedia();
   }
 
   /* The item on air finished where it stands: its words whole, its bar
@@ -3820,11 +5014,12 @@ export async function mountEmbedded(root, {request, view = 'conversation', onSel
      become words, or words that must become a card, are drawn again with
      their turn. Cheap: it runs when the air moves or a round has news. */
   const WHOLE = ['written', 'past', 'skipped'];
-  function restage() {
+  function restage(again = false) {
+    let redrawn = false;
     for (const entry of feed.values()) {
       if (entry.building) continue;
-      const redo = new Set();
-      for (const n of entry.chat.querySelectorAll(':scope > [data-key]')) {
+      const redo = new Map();                      /* [s3-imsg] turn -> the items of it to draw again */
+      for (const chat of chatsOf(entry)) for (const n of chat.querySelectorAll(':scope > [data-key]')) {
         if (n.dataset.replaying) continue;
         const t = entry.conv.turns.find(x => x.turn_id === n.dataset.turn);
         if (!t) continue;
@@ -3837,18 +5032,12 @@ export async function mountEmbedded(root, {request, view = 'conversation', onSel
           if (want === 'skipped') n.title = 'not heard: withdrawn or cut before air';
           continue;
         }
-        redo.add(t);
+        if (!redo.has(t)) redo.set(t, new Set());
+        redo.get(t).add(n.dataset.key);
       }
-      for (const t of redo) regroup(entry, t);
+      for (const [t, keys] of redo) { regroup(entry, t, keys); redrawn = true; }
     }
-  }
-  /* one turn's nodes (its stings and the SFX Guy's rows with it) drawn again where they stand */
-  function regroup(entry, t) {
-    const group = [...entry.chat.children].filter(n => n.dataset && n.dataset.turn === t.turn_id);
-    const fresh = v.turnNodes(entry.conv, t);
-    const marks = new Map(group.filter(n => n.dataset.key).map(n => [n.dataset.key, n]));
-    for (const f of fresh) { const was = f.dataset && marks.get(f.dataset.key); if (was) v.keepPaint(was, f); }
-    if (group.length) { group[0].before(...fresh); group.forEach(n => n.remove()); } else entry.chat.append(...fresh);
+    if (redrawn) { relayout(); if (!again) restage(true); }   /* anything new by them takes its place, then its stage */
   }
   /* one item's node drawn again where it stands: the card that becomes its message */
   function swapItem(key) {
@@ -3856,10 +5045,12 @@ export async function mountEmbedded(root, {request, view = 'conversation', onSel
     const node = itemNode(key);
     if (!it || !it.t || !node) return null;
     const fresh = it.line ? v.sfxRows(it.conv, it.t)[it.side].find(n => n.dataset && n.dataset.key === key)
-      : v.bubble(it.t, {conv: it.conv});
+      : v.bubble(it.t, {conv: it.conv, part: it.part || null});
     if (!fresh) return null;
     v.keepPaint(node, fresh);
-    node.replaceWith(fresh);
+    fresh.dataset.item = key;                      /* [s3-imsg] the same item, in the same place, never shorter */
+    holdHeight(node, fresh);
+    nodes.set(key, fresh);
     return fresh;
   }
 
@@ -3880,7 +5071,13 @@ export async function mountEmbedded(root, {request, view = 'conversation', onSel
     if (isBoard(row)) {
       key = sfxKey(row);
       for (const [tid, slot] of boardPlan(conv)) if (slot.before.includes(row) || slot.after.includes(row)) turnId = tid;
-    } else if (isSpoken(row)) key = row.turn_id;
+    } else if (isSpoken(row)) {
+      key = row.turn_id;
+      /* [s3-imsg] a line of a turn the air takes in runs: its own run */
+      const t = (conv.turns || []).find(x => x.turn_id === row.turn_id);
+      const part = t && (v.partsOf(conv, t) || []).find(x => x.lines.some(l => l.line_id === row.line_id));
+      if (part) key = part.key;
+    }
     return {key, turnId};
   }
   let liveOwned = false, pending = '', pendingAt = 0, clockLine = '';
@@ -3892,7 +5089,7 @@ export async function mountEmbedded(root, {request, view = 'conversation', onSel
      tapped ahead while the audio plays marks ON AIR and reveals nothing.
      True when there is nothing more to decide for it. */
   function tryReach(key, lineId) {
-    const pos = seqPos(), at = pos.get(key), h = airHead ? pos.get(airHead) : null;
+    const pos = seqPos(), at = pos.get(key), h = airKey ? pos.get(airKey) : null;
     if (at == null || (h != null && at <= h)) return true;       /* reached already, or behind the air */
     const c = clockAt, sounding = c.total > 0 && performance.now() - c.when < CLOCK_FRESH;
     if (sounding ? c.line !== lineId : (h != null && at > h + 3 && performance.now() - pendingAt < 4000)) return false;
@@ -3900,52 +5097,194 @@ export async function mountEmbedded(root, {request, view = 'conversation', onSel
     return true;
   }
 
-  /* The air reached `key` (a line of it is on air). */
+  /* The air reached `key` (a line of it is on air). [s3-imsg] The
+     messages up to it appear in their rhythm (release); a card whose dice
+     are still coming down when the air moves past it brings them down fast. */
   function airReached(key) {
-    if (rv && rv.key === key) return;                        /* the next line of the same turn: its clock takes over */
     const pos = seqPos();
-    const at = pos.get(key), h = airHead ? pos.get(airHead) : null;
-    if (at == null) return;
-    if (h != null && at <= h) return;                        /* behind the air: the operator's focus, nothing re-plays */
-    finishReveal();                                          /* never two at once: the last one is finished first */
-    startReveal(key);
+    const at = pos.get(key), a = airKey && pos.has(airKey) ? pos.get(airKey) : -1;
+    if (at == null || at <= a) return;                       /* at or behind the air: the operator's focus, nothing re-plays */
+    airKey = key;
+    if (rv && rv.phase === 'roll' && rv.seq) rv.seq.hurry();  /* never two at once */
+    release();
+  }
+
+  /* ---- [s3-imsg] ONE MESSAGE AT A TIME, WITH A GRACE ---------------------------
+     "the goal for me is that the view animates message to message like a
+      messenger window. So there's a grace between one message appearing and
+      then another message appearing, then another message appearing.
+      There's no jumping up and down a message correspondence" (operator,
+      2026-09-28). Messages APPEAR in the thread's order, one at a time: the
+      one the air reaches with its dice (they land, hold, then its words
+      start); one the air went past, or a late arrival that aired, rises
+      into place (ENTER_MS). The next waits GRACE_MS after the last entrance
+      ended; when the air is ahead of the rhythm (a skip, a burst of news, a
+      catch-up after a pause) the grace shortens (never under GRACE_MIN_MS),
+      the order never changes. `shownKey` is the newest message that has
+      appeared: everything after it is drawn still to come (its card,
+      faded). Synced, the view GLIDES down by the room each one takes -
+      eased, never a jump, never up. Each entrance is announced on the
+      view's root as an 's3-appear' event {key, kind, phase, grace, t}. */
+  const GRACE_MS = 800, GRACE_MIN_MS = 240, ENTER_MS = 320;
+  let shownKey = '', airKey = '', releasing = false, enteredAt = -1e9;     /* the first one never waits */
+  const rhythm = () => current === 'conversation' && !reduced() && onScreen();
+  const announce = (key, kind, phase, grace) => {
+    try { root.dispatchEvent(new CustomEvent('s3-appear', {detail: {key, kind, phase, grace, t: performance.now()}})); } catch (e) { /* an old engine */ }
+  };
+  const wait = ms => Promise.race([frameSleep(ms), sleep(ms + 30)]);   /* frames or timers: a tablet can stall either */
+  /* the newest message shown - before any, the newest the receipts say has happened */
+  function shownIndex() {
+    const pos = seqPos();
+    if (shownKey && pos.has(shownKey)) return pos.get(shownKey);
+    for (let i = thread.length - 1; i >= 0; i -= 1) {
+      const it = itemAt(thread[i]);
+      if (it && it.t && v.airStage(thread[i], it.conv, it.t) !== 'upcoming') return i;
+    }
+    return -1;
+  }
+  /* what has to have appeared: up to the air, and any late arrival that aired right under it */
+  const airedLate = key => { const it = itemAt(key); return it && it.t ? v.airStage(key, it.conv, it.t) === 'written' : /^(clip|guy):/.test(key); };
+  function dueIndex() {
+    const pos = seqPos();
+    let i = airKey && pos.has(airKey) ? pos.get(airKey) : -1;
+    while (i >= 0 && i + 1 < thread.length && lateSet.has(thread[i + 1]) && airedLate(thread[i + 1])) i += 1;
+    return i;
+  }
+  const graceFor = waiting => (waiting > 1 ? Math.max(GRACE_MIN_MS, GRACE_MS / waiting) : GRACE_MS);
+  async function release() {
+    if (releasing) return;
+    releasing = true;
+    try {
+      for (;;) {
+        if (!v.alive) return;
+        const s = shownIndex(), due = dueIndex();
+        if (due <= s) return;
+        const key = thread[s + 1];
+        if (!itemNode(key)) { shownKey = key; continue; }        /* nothing drawn for it: nothing to show */
+        let grace = graceFor(due - s);
+        while (rhythm() && performance.now() < enteredAt + grace) {
+          await wait(Math.max(16, Math.min(60, enteredAt + grace - performance.now())));
+          if (!v.alive) return;
+          grace = graceFor(dueIndex() - shownIndex());              /* more arriving: the grace shortens */
+        }
+        if (key === airKey) await enterLive(key, grace);
+        else await enterPast(key, grace);
+        enteredAt = performance.now();
+      }
+    } finally { releasing = false; }
+  }
+  /* one the air went past (or a late arrival that aired): it rises into place, whole */
+  async function enterPast(key, grace) {
+    const pos = seqPos();
+    if (rv && (pos.get(rv.key) ?? -1) < (pos.get(key) ?? -1)) finishReveal();
+    shownKey = key;
+    if (!follow) { unseen += 1; paintJump(); }
+    announce(key, 'past', 'start', grace);
+    restage();
+    dressAir();
+    const n = itemNode(key);
+    if (n && rhythm()) { n.classList.remove('s3-enter'); void n.offsetWidth; n.classList.add('s3-enter'); setTimeout(() => n.classList.remove('s3-enter'), ENTER_MS + 80); }
+    glide();
+    if (rhythm()) await wait(ENTER_MS);
+    announce(key, 'past', 'end', grace);
+  }
+  /* the one the air is on: its dice, the hold, then its words start */
+  async function enterLive(key, grace) {
+    finishReveal();
+    shownKey = key;
+    announce(key, 'live', 'start', grace);
+    await startReveal(key);
+    announce(key, 'live', 'end', grace);
+  }
+  /* ---- [s3-imsg] the glide: synced, the view eases down to the newest message -
+     a few pixels a frame, less as it closes in, never past it, never up. It
+     yields to the operator's hand the moment it moves. */
+  let glideRaf = 0;
+  function glide() {
+    if (current !== 'conversation' || !follow) return;
+    if (reduced()) { toAnchor(false); return; }
+    if (!glideRaf) glideRaf = requestAnimationFrame(glideStep);
+  }
+  function glideStep() {
+    glideRaf = 0;
+    if (current !== 'conversation' || !follow || hold || handOn() || replaying || !v.alive) return;
+    const top = anchorTop();
+    if (top == null) return;
+    const was = root.scrollTop, gap = top - was;
+    if (gap < 1) return;
+    ownScroll(false);
+    root.scrollTop = Math.min(top, was + Math.max(1, Math.ceil(gap * 0.2)));
+    if (root.scrollTop > was) glideRaf = requestAnimationFrame(glideStep);
+  }
+  /* [s3-imsg] a message drawn again where it stands keeps its height - it may
+     grow, it never shrinks - so nothing under it moves up (and the view has
+     no reason to) */
+  function holdHeight(was, fresh) {
+    const h = was.isConnected ? was.getBoundingClientRect().height : 0;
+    was.replaceWith(fresh);
+    if (h && fresh.getBoundingClientRect().height < h - 0.5) fresh.style.minHeight = Math.ceil(h) + 'px';
   }
   async function startReveal(key) {
     const it = itemAt(key);
     if (!it || !it.t) return;
     airHead = key;
-    const lines = it.line ? [it.line] : turnLines(it.conv, it.t);
+    const lines = it.line ? [it.line] : it.part ? it.part.lines : turnLines(it.conv, it.t);   /* [s3-imsg] a run: its own lines */
     const w = lines.map(l => Math.max(1, String(l.text || '').length));
     const before = [];
     let sum = 0;
     for (const x of w) { before.push(sum); sum += x; }
-    const text = it.line ? '' : v.wordsOf(it.t, it.conv);
+    const text = it.line ? '' : it.part ? it.part.text : v.wordsOf(it.t, it.conv);
     const receipt = it.line ? v.air.get(it.line.line_id) : null;
     const secs = it.line ? Math.max(2, Number((receipt && receipt.seconds) || 5)) : Math.max(2, (text.length || 40) / PACE);
     const me = rv = {key, text, idx: new Map(lines.map((l, i) => [l.line_id, i])), w, before, sum: sum || 1, secs,
-      k: 0, bar: 0, n: -1, phase: 'roll', lastT: performance.now(), node: null};
+      k: 0, bar: 0, n: -1, phase: 'roll', lastT: performance.now(), node: null, seq: null, chase: null, line: it.line || null};
     /* everything before it drawn whole, everything after it its card - this one its card, about to pop */
     restage();
     dressAir();
-    if (follow) toAnchor(!reduced()); else { unseen += 1; paintJump(); }
+    if (follow) glide(); else { unseen += 1; paintJump(); }
     const card = itemNode(key);
-    const c = clockAt;
-    const len = c.total > 0 && me.idx.has(c.line) && performance.now() - c.when < CLOCK_FRESH ? c.total
-      : receipt && receipt.seconds ? Number(receipt.seconds) : me.secs;
-    const ms = current === 'conversation' && !reduced() && card && typeof card.roll === 'function'
-      ? Math.min(ROLL_MAX, len * 1000 * ROLL_SHARE) : 0;
-    if (ms > 0) {
-      card.classList.add('s3-popin');
-      await Promise.race([card.roll(ms), frameSleep(ms + 400)]);
+    /* [s3-imsg] its dice land one after another and hold; the words wait for that */
+    const rolls = current === 'conversation' && !reduced() && onScreen() && !!card && card.dataset.stage === 'upcoming' &&
+      typeof card.roll === 'function';
+    if (rolls) {
+      const go = v.rollIn(card);                             /* [s3-imsg] the one assembly: the same pop, dice and hold as a replay */
+      me.seq = go.seq;
+      await go.done;
     }
-    if (rv !== me) return;                                   /* the next item came first: this one was finished already */
+    if (rv !== me) return;                                   /* taken down: the view closed */
+    const at = seqPos();
+    if ((at.get(airKey) ?? -1) > (at.get(key) ?? -1)) {      /* the air moved on while they came down: history now, whole */
+      finishReveal();
+      restage();
+      dressAir();
+      return;
+    }
     me.phase = 'words';
     me.lastT = performance.now();
     const fresh = swapItem(key);
-    if (fresh && ms > 0) { fresh.classList.add('arriving'); setTimeout(() => fresh.classList.remove('arriving'), 1600); }
+    if (fresh && rolls) { fresh.classList.add('arriving'); setTimeout(() => fresh.classList.remove('arriving'), 1600); }
     dressAir();
     tickReveal();
-    if (follow) toAnchor(false);
+    liveMedia(true);                                         /* [s3-imsg] a sting's clip plays as it airs */
+    glide();
+  }
+  /* [s3-imsg] The sting on air: its clip in its message plays with the air - from where the air's
+     clock says the clip has got to, drawn back into step on each tick when it drifts - once
+     through, then rests on its frame. Drawn again while it airs (a round's news), it picks up
+     where the air is. */
+  function liveMedia(start = false) {
+    const r = rv;
+    if (!r || r.phase !== 'words' || !r.line || current !== 'conversation') return;
+    const node = itemNode(r.key);
+    const m = node && node.querySelector('.s3-sting-media');
+    if (!m || typeof m.play !== 'function') return;
+    const c = clockAt, now = performance.now();
+    const fresh = c.total > 0 && now - c.when < CLOCK_FRESH && r.idx.has(c.line);
+    const at = fresh ? Math.min(c.total, c.at + Math.min(1, (now - c.when) / 1000)) : 0;
+    if (!m.dataset.played && (start || fresh) && !m.playing()) {
+      m.dataset.played = '1';
+      m.play({from: at, seconds: fresh ? c.total : 0});
+    } else if (fresh && m.sync) m.sync(at);
   }
 
   /* ---- painting ----------------------------------------------------------- */
@@ -3986,23 +5325,34 @@ export async function mountEmbedded(root, {request, view = 'conversation', onSel
     if (!entry || entry.building) return;
     playBtn.disabled = true;
     entry.building = true;
+    for (const r of entry.runs) fill(r.chat);       /* [s3-imsg] it builds in its first run; the thread spreads it again after */
     fill(entry.chat);
-    /* [s3-messenger] the build is watched where it grows; the follow picks up the air after it */
+    /* [s3-messenger] the build is watched where it grows - [s3-imsg] only
+       while synced; the sync picks up the air after it */
     replaying = true;
-    follow = true;
     try {
       await v.buildRound(entry.conv, entry.chat, {base: 700 / v.speed, live: () => v.alive && feed.get(entry.conv.identity.conversation_id) === entry,
-        grow: n => { if (follow && n && n.isConnected && !hold) { selfUntil = Date.now() + 160; n.scrollIntoView({block: 'nearest'}); } },
+        grow: n => { if (follow && n && n.isConnected && !hold) bringIntoView(n); },
         latest: () => entry.pending || entry.conv});
     } finally {
       replaying = false;
       entry.building = false;
       if (entry.pending) { entry.conv = entry.pending; entry.pending = null; }
       paintRound(entry);
+      relayout();
       dressAir();
       if (follow) toAnchor(false);
       playBtn.disabled = false;
     }
+  }
+  /* [s3-imsg] a node brought just into the view - the view's own scroller only, never the page around it */
+  function bringIntoView(n) {
+    if (handOn()) return;                          /* the operator's hand is on the view */
+    const box = root.getBoundingClientRect(), r = n.getBoundingClientRect();
+    const by = r.bottom > box.bottom - EDGE ? r.bottom - (box.bottom - EDGE) : r.top < box.top + cover() ? r.top - (box.top + cover()) : 0;
+    if (Math.abs(by) < 2) return;
+    ownScroll(false);
+    root.scrollTop += by;
   }
 
   paintHead();
@@ -4011,9 +5361,12 @@ export async function mountEmbedded(root, {request, view = 'conversation', onSel
   schedule(50);
   const face = {
     setView(next) {
+      /* [s3-imsg] the switch does not sync: synced, each view opens on the air; not, the Messenger where it was left */
+      if (current === 'conversation' && bodyBox.contains(v.paneA)) msgMark = viewMark();
       current = next === 'rolodex' || next === 'technical' ? 'rolodex' : 'conversation';
       paintHead(); paintBody();
-      if (current === 'conversation') { follow = true; toAnchor(false); schedule(50); } else placeRolodex(true);
+      if (current === 'conversation') { if (follow) toAnchor(false, true); else viewBack(msgMark); schedule(50); }
+      else if (follow) placeRolodex(true);
     },
     get conversation() { return v.conv; },
     get conversationId() { return cid; },
@@ -4051,7 +5404,6 @@ export async function mountEmbedded(root, {request, view = 'conversation', onSel
       if (!lineId) return 'elsewhere';
       const {row, owner} = lineRow(lineId);
       if (!row) return 'elsewhere';
-      refollow();
       /* the same line again is no news - unless its round has joined the
          feed since (it was still arriving when the line was first named) */
       let news = false;
@@ -4086,7 +5438,6 @@ export async function mountEmbedded(root, {request, view = 'conversation', onSel
         if (key) airReached(key);
       }
       tickReveal();
-      refollow();
     },
     message(text) { note = text || ''; paintHead(); noteBox.hidden = !note; },
     /* "If I tap on this, jump to the active message in whatever view I have
@@ -4097,6 +5448,14 @@ export async function mountEmbedded(root, {request, view = 'conversation', onSel
       v.alive = false; v.token += 1; clearTimeout(timer);
       if (raf) { cancelAnimationFrame(raf); raf = 0; }
       rv = null;
+      if (glideRaf) { cancelAnimationFrame(glideRaf); glideRaf = 0; }
+      /* [s3-imsg] the listeners that live on the page, not on this view */
+      window.removeEventListener('pointerup', handUp, true);
+      window.removeEventListener('pointercancel', handUp, true);
+      document.removeEventListener('keydown', handKey, true);
+      document.removeEventListener('selectionchange', onSelection);
+      if (unBack) unBack();                                   /* [s3-imsg] BACK no longer asks this view */
+      for (const m of root.querySelectorAll('.s3-sting-media')) if (m.s3unload) m.s3unload();
       /* a video taken out of the page keeps decoding until it is collected */
       for (const vid of root.querySelectorAll('video, audio')) { try { vid.pause(); } catch (e) { /* gone */ } }
       for (const w of docked) w.remove();
@@ -4243,12 +5602,12 @@ export async function mountLineStory(root, {request, lineId = '', prompt = '', o
 
   const rolls = el('div', 's3-story-rolls');
   for (const ev of evs) {
-    const row = rollRow(ev, conv);
+    const row = esTwoStageReel(ev, conv);                  /* [s3-es-reel] */
     const line = eventLine(ev, conv);
     rolls.append(el('div', {class: 's3-story-roll', role: 'button', tabindex: '0', title: 'how this was decided',
         onclick: () => openDecision(conv, ev, t, v.api),
         onkeydown: e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openDecision(conv, ev, t, v.api); } }},
-      row, el('div', {class: 's3-muted s3-story-why', text: line.text})));
+      row, el('div', {class: 's3-muted s3-story-why', text: esStagesText(ev) || line.text})));   /* [s3-es-reel] */
   }
   if (!evs.length) rolls.append(para('No roll was recorded on this turn.', 's3-muted'));
 
@@ -4788,7 +6147,9 @@ export async function mount(root, {request, onClose, tab: startTab = '', table: 
             esEmoji(item, cat.emoji || '', null), labelIn) : labelIn,
           ...slider(item.weight ?? 1, v => { item.weight = v; }),
           el('label', 's3-row', el('input', {type: 'checkbox', checked: item.enabled !== false, onchange: e => { item.enabled = e.target.checked; }}), 'on'),
-          el('input', {type: 'text', class: 'txt', value: item.text || '', placeholder: draft.family === 'DIRECTIVE' ? 'the directive, as the writer is told it' : draft.family === 'FAV' ? 'the line, word for word' : 'what the writer is told this turn does', oninput: e => { item.text = e.target.value; }}),
+          el('input', {type: 'text', class: 'txt', value: item.text || '', placeholder: draft.family === 'DIRECTIVE' ? 'the directive, as the writer is told it' : draft.family === 'FAV' ? 'the line, word for word'
+            : draft.family === 'ES' ? "Write {name}'s message with {feeling}, reflecting the mood."   /* [s3-es-dir] system3_tables.ES_DIRECTION: {feeling} = this item, {name} = the speaker */
+            : 'what the writer is told this turn does', oninput: e => { item.text = e.target.value; }}),
           poolFields(item),
           /* [s3-flow] follow-on odds: after what the turn before rolled, this row weighs more (or less) */
           ['CTS', 'ES', 'RS', 'IRS', 'FL', 'EVENT'].includes(draft.family) ? el('input', {type: 'text', class: 'txt s3-after',

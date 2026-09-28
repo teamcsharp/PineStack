@@ -396,11 +396,18 @@
   }
 
   function rejectionMarker(item) {
-    var button = make('button', 'sp-reject-marker', rejectionGlyph(item));
+    /* [review-queue] a Carbon icon for its gate (never an emoji) and its age */
+    var button = make('button', 'sp-reject-marker');
     button.type = 'button';
     button.dataset.id = String(item.id);
-    button.title = rejectionLabel(item);
-    button.setAttribute('aria-label', 'Review ' + rejectionLabel(item));
+    button.dataset.gate = String(item.gate || '');
+    var said = rejectionLabel(item) + ' - waiting ' + reviewAgeText(reviewAgeOf(item));
+    button.title = said;
+    button.setAttribute('aria-label', 'Review ' + said);
+    button.innerHTML = folderIcon(reviewIconName(item), '') || '';
+    if (!button.firstChild) button.textContent = String(item.gate || 'review').slice(0, 2).toUpperCase();
+    if (rejectionSelection && rejectionSelection.item
+        && String(rejectionSelection.item.id) === String(item.id)) button.setAttribute('aria-current', 'true');
     button.addEventListener('click', function () { rejectionOpen(item, button); });
     button.addEventListener('keydown', function (event) {
       if (event.key !== 'ArrowRight' && event.key !== 'ArrowLeft') return;
@@ -410,47 +417,64 @@
     return button;
   }
 
+  /* [review-queue] THE STRIP IS STILL. Each OPEN item once, newest first, as
+     many as fit, and a "+N" tile for the rest that opens the queue. It is
+     painted only when what it shows has changed, so nothing on it moves
+     unless the queue itself changes - and never by itself. */
   function rejectionFill() {
     var track = el('spRejectTrack');
     if (!track) return;
     var viewport = el('spRejectViewport');
-    var target = Math.min(64, Math.max(18, Math.ceil(((viewport && viewport.clientWidth) || 600) / 40) + 10));
-    while (track.children.length < target && rejectionItems.length) {
-      track.appendChild(rejectionMarker(rejectionItems.shift()));
+    var items = reviewUnique(rejectionItems);
+    var fit = reviewFit(rejectionCount, items.length, (viewport && viewport.clientWidth) || 0);
+    var chosen = rejectionSelection && rejectionSelection.item ? String(rejectionSelection.item.id || '') : '';
+    var key = items.slice(0, fit.shown).map(function (item) { return String(item.id); }).join(',')
+      + '|' + fit.extra + '|' + chosen;
+    if (track.dataset.key === key) return;
+    track.dataset.key = key;
+    var focused = document.activeElement && track.contains(document.activeElement)
+      ? String(document.activeElement.dataset.id || document.activeElement.dataset.more || '') : '';
+    track.replaceChildren();
+    items.slice(0, fit.shown).forEach(function (item) { track.appendChild(rejectionMarker(item)); });
+    if (fit.extra > 0) {
+      var rest = make('button', 'sp-reject-marker sp-reject-more', '+' + fit.extra);
+      rest.type = 'button';
+      rest.dataset.more = 'more';
+      rest.title = fit.extra + ' more open review' + (fit.extra === 1 ? '' : 's') + ' - open the queue';
+      rest.setAttribute('aria-label', rest.title);
+      rest.addEventListener('click', reviewQueueOpen);
+      track.appendChild(rest);
     }
-    if (rejectionItems.length < 8 && rejectionHasMore) rejectionLoad(false);
-    if (!rejectionHasMore && !rejectionItems.length && rejectionFirstPage.length) {
-      rejectionItems = rejectionFirstPage.slice();
+    if (focused) {
+      var again = track.querySelector('[data-id="' + focused + '"]') || track.querySelector('[data-more="' + focused + '"]');
+      if (again) again.focus();
     }
   }
 
+  /* [review-queue] One page: the newest open items. The strip never pages
+     on by itself any more (it used to, to feed the marquee - and when the
+     queue ran out it started the first page again, so one item became an
+     endless row of the same tile). The rest are one tap away, in the queue. */
   function rejectionLoad(head) {
     if (rejectionLoading || !mounted || !api().get) return;
-    if (!head && !rejectionHasMore) return;
     if (!head && Date.now() < rejectionPageRetryAt) return;
     rejectionLoading = true;
-    if (head) rejectionHeadAt = Date.now();
+    rejectionHeadAt = Date.now();
     var epoch = ++rejectionLoadEpoch;
-    var url = rejectionListUrl(head ? null : rejectionCursor);
-    Promise.resolve(api().get(url)).then(function (got) {
+    Promise.resolve(api().get(rejectionListUrl(null))).then(function (got) {
       if (!mounted || epoch !== rejectionLoadEpoch) return;
-      var items = rejectionPageItems(got);
-      if (head) {
-        rejectionHeadAt = Date.now();
-        rejectionFirstPage = items.slice();
-        rejectionItems = items.slice();
-        var track = el('spRejectTrack');
-        if (track) track.replaceChildren();
-        var viewport = el('spRejectViewport');
-        if (viewport) viewport.scrollLeft = 0;
-      } else {
-        rejectionItems.push.apply(rejectionItems, items);
-      }
+      var items = reviewUnique(rejectionPageItems(got));
+      rejectionHeadAt = Date.now();
+      rejectionFirstPage = items.slice();
+      rejectionItems = items;
       rejectionCursor = got.next_before || null;
       rejectionHasMore = !!got.has_more && !!rejectionCursor && items.length > 0;
       rejectionPageRetryAt = 0;
-      rejectionCount = Number(got.unreviewed != null ? got.unreviewed : got.total) || 0;
-      rejectionSay(rejectionCount ? rejectionCount + ' to review' : 'No pending reviews');
+      rejectionCount = Math.max(items.length, Number(got.unreviewed != null ? got.unreviewed : got.total) || 0);
+      rejectionSay(rejectionCount ? rejectionCount + ' to review' : 'No open reviews');
+      var said = el('spRejectCount');
+      if (said) said.title = 'Lines or rounds a station gate took out of the work, kept for you to decide. '
+        + 'Tap one to see what it is, what System 3 knows about it, and to close it.';
       rejectionFill();
     }).catch(function (err) {
       if (mounted && epoch === rejectionLoadEpoch) {
@@ -460,30 +484,643 @@
     }).finally(function () { if (epoch === rejectionLoadEpoch) rejectionLoading = false; });
   }
 
+  /* [review-queue] NOTHING HERE MOVES THE STRIP. This was the marquee: 25 px
+     a second into scrollLeft, for ever ("no auto-scroll ever takes over the
+     view"). Once a tick it now only re-fits the row when the strip's width
+     has changed - a window resized, a drawer opened. */
   function rejectionStep() {
     var viewport = el('spRejectViewport');
-    var track = el('spRejectTrack');
-    if (!viewport || !track) return;
+    if (!viewport) return;
+    var width = viewport.clientWidth || 0;
+    if (width === reviewFitWidth) return;
+    reviewFitWidth = width;
     rejectionFill();
-    if (!track.firstElementChild || rejectionSelection
-        || (root.matchMedia && root.matchMedia('(hover: hover)').matches && viewport.matches(':hover'))
-        || viewport.contains(document.activeElement)
-        || (root.matchMedia && root.matchMedia('(prefers-reduced-motion: reduce)').matches)) {
-      rejectionLastStep = Date.now();
+  }
+
+  /* ================================================================ [review-queue]
+   * THE REVIEW QUEUE, 2026-09-28.
+   *
+   * "When I tap them, there's not options to fix them or resolve them or
+   *  mark them as complete or to get rid of them ... I don't know what
+   *  they're for. And also they don't seem to be talking about any
+   *  information from system three."
+   *
+   * An item is a line (or a whole round) one of the station's gates took out
+   * of the work - a cut or a hold - kept with its evidence in the review
+   * store so somebody can decide about it. The pane now opens on what it is
+   * in plain words, what System 3 knows about it (the round, the turn, the
+   * node and its rolls, and what cut it), and three ways out at the top:
+   * Mark complete, Dismiss, and a Fix only where one exists. "Review all /
+   * controls" opens the whole queue: every open item, bulk closes by age or
+   * for everything with no System 3 record, and the history of what left.
+   * Every icon is Carbon. */
+  var REVIEW_ICONS = {timing: 'c:timer', tint: 'c:gem', tint_structure: 'c:gem', tint_length: 'c:gem',
+    recording_tint: 'c:gem', call_contract: 'c:phone', segment_brief: 'c:document',
+    repetition: 'c:repeat', freshness: 'c:hourglass', recording_requirement: 'c:warning--alt',
+    track_talk: 'c:music', track_talk_fidelity: 'c:music', track_talk_structure: 'c:music',
+    radio_draft: 'c:script', blend: 'c:script', phrase_ban: 'c:cut', line_quality: 'c:script'};
+  var REVIEW_AGES = [[3600, '1 hour'], [21600, '6 hours'], [86400, '24 hours'],
+    [259200, '3 days'], [604800, '7 days']];
+  /* System 3's module, under the newest ?v= this file already imports it by
+     (so this pane shares the Script view's module rather than a second copy) */
+  var REVIEW_S3_VERSION = '8';
+  var reviewFitWidth = -1;
+  var reviewS3Held = null;      /* the mounted System 3 story, kept across repaints */
+  var reviewQueue = {tab: 'open', data: null, history: null, older: 86400, confirm: '',
+    busy: false, message: '', painted: ''};
+
+  function reviewIconName(item) {
+    var gate = String((item && item.gate) || '');
+    if (REVIEW_ICONS[gate]) return REVIEW_ICONS[gate];
+    var kind = String((item && item.kind) || '').toLowerCase();
+    if (kind.indexOf('call') >= 0) return 'c:phone';
+    if (kind.indexOf('music') >= 0 || kind.indexOf('track') >= 0) return 'c:music';
+    if (kind.indexOf('news') >= 0) return 'c:notebook';
+    return 'c:script';
+  }
+
+  function reviewAgeText(seconds) {
+    var s = Math.max(0, Number(seconds) || 0);
+    if (s < 90) return Math.round(s) + ' s';
+    if (s < 5400) return Math.round(s / 60) + ' min';
+    if (s < 172800) return (Math.round(s / 360) / 10) + ' h';
+    return Math.round(s / 86400) + ' days';
+  }
+
+  function reviewAgeOf(item) {
+    var at = Number(item && (item.first_at || item.at)) || 0;
+    return at ? Math.max(0, Date.now() / 1000 - at) : 0;
+  }
+
+  function reviewUnique(items) {
+    var seen = Object.create(null);
+    return (Array.isArray(items) ? items : []).filter(function (item) {
+      var id = item && item.id !== undefined && item.id !== null ? String(item.id) : '';
+      if (!id || seen[id]) return false;
+      seen[id] = true;
+      return true;
+    });
+  }
+
+  /* How many tiles fit (34 px and a 6 px gap each) and what the "+N" says. */
+  function reviewFit(total, count, width) {
+    var room = width > 0 ? Math.max(1, Math.floor((width + 6) / 40)) : count;
+    var all = Math.max(Number(total) || 0, count);
+    var shown = all > room ? Math.max(0, room - 1) : Math.min(count, room);
+    shown = Math.min(shown, count);
+    return {shown: shown, extra: Math.max(0, all - shown)};
+  }
+
+  /* The header's word: what happened to it, not the store's "noted". */
+  function reviewStatusWord(record) {
+    var status = String((record && record.review_status) || 'pending');
+    var closed = record && record.resolve && record.resolve.closed;
+    var effect = (record && record.effect) || {};
+    var word = (closed && closed.status) || (status === 'noted' ? effect.status : '') || status;
+    return String(word || status).replace(/_/g, ' ');
+  }
+
+  function reviewActSaid(action, got) {
+    if (action === 'note') return 'Note saved';
+    if (got && got.changed === false && got.say) return String(got.say);
+    if (action === 'resolve') return 'Marked complete - it left the strip and stays in the history.';
+    if (action === 'dismiss') return 'Dismissed - it left the strip and stays in the history.';
+    return (got && got.effect && got.effect.say) ? String(got.effect.say) : 'Decision saved';
+  }
+
+  var REVIEW_CLOSED_WORDS = {resolved: 'Marked complete', dismissed: 'Dismissed',
+    allowed: 'Allowed - its words were restored', kept: 'Kept rejected',
+    round_gone: 'Closed by the station: its round had aired, expired or been replaced',
+    superseded: 'Closed by the station: a newer cut of the same line replaced it',
+    stale_grader: "Closed by the station: today's checker passes it",
+    read_plain: 'Closed by the station: the line is read plain now'};
+
+  function reviewClosedText(record, closed) {
+    if (record && record.read_only) {
+      return 'An older occurrence: a newer one is open. Return to the live script and open its tile to decide on it.';
+    }
+    var c = closed || {};
+    var status = String(c.status || (record && record.review_status) || '');
+    var text = REVIEW_CLOSED_WORDS[status] || ('Closed (' + (status || 'no longer open') + ')');
+    if (c.by === 'operator' && (status === 'resolved' || status === 'dismissed')) text += ' by the operator';
+    if (c.at) {
+      var when = new Date(Number(c.at) * 1000);
+      if (!isNaN(when.getTime())) text += ' on ' + when.toLocaleString();
+    }
+    var say = String(c.note || c.say || '');
+    var lead = REVIEW_CLOSED_WORDS[status] || '';
+    if (say && !(lead && say.indexOf(lead) === 0)) text += '. ' + say;
+    return text.replace(/\.*$/, '') + '.';
+  }
+
+  function reviewActionButton(action, icon, label, title, extra) {
+    var b = make('button', 'sp-review-action sp-review-close ' + (extra || ''));
+    b.type = 'button';
+    b.dataset.action = action;
+    b.innerHTML = folderIcon(icon, '');
+    b.appendChild(make('span', '', label));
+    b.title = title;
+    b.disabled = rejectionBusy;
+    b.addEventListener('click', function () { rejectionAct(action); });
+    return b;
+  }
+
+  /* The three ways out, at the TOP of the pane where they cannot be missed. */
+  function reviewActionBar(record) {
+    reviewBackWire();
+    var bar = make('div', 'sp-review-resolve');
+    var resolve = record.resolve || null;
+    var open = record.review_status === 'pending' && !record.read_only;
+    var row = make('div', 'sp-review-resolve-row');
+    if (!open) {
+      bar.appendChild(make('p', 'sp-review-closed', reviewClosedText(record, resolve && resolve.closed)));
+    } else {
+      row.appendChild(reviewActionButton('resolve', 'c:checkmark', 'Mark complete',
+        'Done: it leaves the strip and stays in the history. Nothing airs and nothing is taught to the writer.',
+        'sp-review-close-resolve'));
+      row.appendChild(reviewActionButton('dismiss', 'c:close--filled', 'Dismiss',
+        'Nothing to decide: it leaves the strip and stays in the history. Nothing airs and nothing is taught to the writer.',
+        'sp-review-close-dismiss'));
+      var fix = resolve && resolve.fix;
+      if (fix && fix.available && !record.technical) {
+        row.appendChild(reviewActionButton(fix.action || 'allow', 'c:renew', fix.label || 'Fix',
+          fix.say || '', 'sp-review-fix'));
+      }
+    }
+    var selected = rejectionSelection;
+    if (selected && selected.fromQueue) {
+      var back = make('button', 'sp-review-action sp-review-toqueue');
+      back.type = 'button';
+      back.innerHTML = folderIcon('c:caret--left', '');
+      back.appendChild(make('span', '', 'Back to the queue'));
+      back.addEventListener('click', reviewQueueOpen);
+      row.appendChild(back);
+    } else if (!open) {
+      var current = String(record.id || '');
+      var next = reviewUnique(rejectionItems).filter(function (item) { return String(item.id) !== current; })[0];
+      if (next) {
+        var go = make('button', 'sp-review-action sp-review-next');
+        go.type = 'button';
+        go.innerHTML = folderIcon('c:caret--right', '');
+        go.appendChild(make('span', '', 'Next open review'));
+        go.addEventListener('click', function () { rejectionOpen(next, null); });
+        row.appendChild(go);
+      }
+    }
+    if (row.children.length) bar.appendChild(row);
+    if (open) {
+      var plan = resolve && resolve.fix;
+      var why = plan ? (plan.available ? plan.say : plan.why_not) : '';
+      if (!resolve) why = 'This station did not say whether a fix exists; Mark complete and Dismiss still close it.';
+      if (why) bar.appendChild(make('p', 'sp-review-muted sp-review-fixwhy',
+        (plan && plan.available ? 'The fix: ' : 'No fix: ') + why));
+    }
+    return bar;
+  }
+
+  function reviewWhatSection(record) {
+    var box = make('section', 'sp-review-section sp-review-what');
+    box.appendChild(make('h3', '', 'What this is'));
+    var what = record.what || {};
+    box.appendChild(make('p', '', String(what.say
+      || ('The ' + String(record.gate || 'station').replace(/_/g, ' ') + ' gate took this out of the work.'))));
+    var parts = [];
+    var reason = what.reason || (Array.isArray(record.reasons) && record.reasons[0]) || '';
+    if (reason) parts.push('Why: ' + reason);
+    var age = reviewAgeOf(record);
+    if (age) {
+      var since = new Date(Number(record.first_at || record.at) * 1000);
+      parts.push('Waiting ' + reviewAgeText(age) + (isNaN(since.getTime()) ? '' : ' (since ' + since.toLocaleString() + ')'));
+    }
+    if (parts.length) box.appendChild(make('p', 'sp-review-muted', parts.join(' · ')));
+    if (what.sweep) box.appendChild(make('p', 'sp-review-muted', String(what.sweep)));
+    return box;
+  }
+
+  function reviewS3Import() {
+    if (!document.getElementById('spS3Style')) {
+      var style = document.createElement('link');
+      style.id = 'spS3Style';
+      style.rel = 'stylesheet';
+      style.href = techUrl('/system3/system3.css?v=' + REVIEW_S3_VERSION);
+      document.head.appendChild(style);
+    }
+    return import(techUrl('/system3/system3.js?v=' + REVIEW_S3_VERSION));
+  }
+
+  function reviewS3Open(cid) {
+    if (s3WindowOpen) { try { s3WindowOpen.close(); } catch (e) { /* gone */ } s3WindowOpen = null; }
+    reviewS3Import().then(function (mod) {
+      return mod.openSystem3({request: s3Request, tab: 'visual', conversationId: String(cid || ''),
+        onClose: function () { s3WindowOpen = null; }});
+    }).then(function (view) { s3WindowOpen = view; }).catch(function (err) {
+      try { console.warn('System 3 could not open', err); } catch (e) { /* no console */ }
+    });
+  }
+
+  /* [#1450c] BACK closes the topmost overlay, one at a time: the review pane,
+     the queue and the content gates all live in #spRejectionDetail, so ONE
+     probe answers for them - a pane or the gates opened from the queue go
+     back to the queue, everything else back to the live script. Registered
+     the first time one of them is drawn, so the order the page's scripts
+     load in cannot matter. */
+  var reviewBackUnwire = null;
+  function reviewBack() {
+    if (rejectionSelection && rejectionSelection.fromQueue) { reviewQueueOpen(); return; }
+    rejectionClose();
+  }
+  function reviewBackWire() {
+    if (reviewBackUnwire) return;
+    var dismiss = root.PineDismiss;
+    if (!dismiss || typeof dismiss.onBack !== 'function') return;
+    reviewBackUnwire = dismiss.onBack(function () {
+      var overlay = el('spRejectionDetail');
+      if (!overlay || overlay.hidden || !overlay.isConnected || !rejectionSelection) return null;
+      return {node: overlay, close: reviewBack};
+    });
+  }
+
+  function reviewS3Drop() {
+    var held = reviewS3Held;
+    reviewS3Held = null;
+    if (held && held.view) { try { held.view.dispose(); } catch (e) { /* gone */ } }
+  }
+
+  /* The turn's own story, System 3's module drawing it (the tile, every roll
+     on the Rolodex, the row it wrote for the line, the checks): one mount
+     per item, kept while the pane repaints around it. */
+  function reviewS3StoryBox(record, link) {
+    var id = [record.id, link.conversation_id, link.turn_id].join(':');
+    if (reviewS3Held && reviewS3Held.id === id) return reviewS3Held.node;
+    reviewS3Drop();
+    var node = make('div', 'sp-review-s3-story', 'Asking System 3 for the round...');
+    var held = {id: id, node: node, view: null};
+    reviewS3Held = held;
+    Promise.all([reviewS3Import(),
+      s3Request('/api/system3/conversation/' + encodeURIComponent(link.conversation_id))]).then(function (got) {
+      if (reviewS3Held !== held) return null;
+      var mod = got[0], conv = got[1];
+      var turn = ((conv && conv.turns) || []).filter(function (t) { return t && t.turn_id === link.turn_id; })[0];
+      if (!turn) { node.textContent = 'System 3 holds the round, but not this turn any more.'; return null; }
+      var ctx = record.context || {};
+      return mod.mountLineStory(node, {request: s3Request, lineId: String(ctx.line_id || ''), conv: conv, turn: turn});
+    }).then(function (view) {
+      if (!view) return;
+      if (reviewS3Held !== held) { try { view.dispose(); } catch (e) { /* gone */ } return; }
+      held.view = view;
+    }).catch(function (err) {
+      if (reviewS3Held === held) node.textContent = 'System 3 could not show the round here: ' + rejectionError(err);
+    });
+    return node;
+  }
+
+  function reviewS3Gate(record, link) {
+    var box = make('div', 'sp-review-s3-gate');
+    var events = Array.isArray(link.events) ? link.events : [];
+    events.forEach(function (ev) {
+      box.appendChild(make('p', '', 'System 3 recorded ' + String(ev.family || 'an event').toLowerCase()
+        + (ev.stage ? ' at ' + ev.stage : '') + (ev.why ? ': ' + ev.why : '')));
+    });
+    var held = link.withheld;
+    if (!events.length && held && held.why) {
+      box.appendChild(make('p', '', 'System 3 recorded the round as ' + String(held.stage || 'withheld') + ': ' + held.why));
+    }
+    var gate = String(record.gate || 'unknown').replace(/_/g, ' ');
+    var reason = (Array.isArray(record.reasons) && record.reasons[0]) || '';
+    box.appendChild(make('p', '', 'The gate that cut it: ' + gate + (reason ? ' - ' + reason : '')
+      + (events.length || (held && held.why) ? ''
+        : ' (recorded by the station\'s review desk; System 3 recorded no withhold for this round)')));
+    return box;
+  }
+
+  function reviewS3Section(record) {
+    var box = make('section', 'sp-review-section sp-review-s3');
+    box.appendChild(make('h3', '', 'System 3'));
+    var link = record.system3;
+    if (!link) {
+      box.appendChild(make('p', 'sp-review-muted',
+        'The station did not say what System 3 knows about this item (it answered without the review desk\'s System 3 link).'));
+      return box;
+    }
+    box.dataset.state = String(link.state || '');
+    box.appendChild(make('p', 'sp-review-s3-say', String(link.say || '')));
+    if (link.state === 'linked') {
+      var facts = [];
+      if (link.road) facts.push(link.road + ' round ' + String(link.conversation_id || '').slice(0, 8));
+      var t = link.turn;
+      if (t) {
+        facts.push('turn ' + t.number + ' of ' + t.of);
+        facts.push(String(t.name || t.speaker || 'a seat') + (t.name && t.speaker ? ' (' + t.speaker + ')' : ''));
+        if (t.node_label || t.node) {
+          facts.push('node ' + (t.node_label || t.node) + (t.node && t.node_label && t.node !== t.node_label ? ' [' + t.node + ']' : ''));
+        }
+        if (t.phase) facts.push(t.phase);
+        facts.push(t.rolls + ' roll' + (t.rolls === 1 ? '' : 's'));
+      } else if (link.turns) {
+        facts.push(link.turns + ' turns');
+      }
+      if (link.mode && link.mode !== 'active') facts.push(link.mode);
+      box.appendChild(make('p', 'sp-review-s3-facts', facts.join(' · ')));
+      if (link.topic) box.appendChild(make('p', 'sp-review-muted', 'Topic: ' + link.topic));
+      box.appendChild(reviewS3Gate(record, link));
+      var tools = make('div', 'sp-review-s3-tools');
+      var open = make('button', 'sp-review-action sp-review-s3-open');
+      open.type = 'button';
+      open.innerHTML = folderIcon('c:chart--network', '');
+      open.appendChild(make('span', '', 'Open the round in System 3'));
+      open.addEventListener('click', function () { reviewS3Open(link.conversation_id); });
+      tools.appendChild(open);
+      box.appendChild(tools);
+      if (t && t.turn_id) box.appendChild(reviewS3StoryBox(record, link));
+    } else if (link.state === 'none' || link.state === 'gone') {
+      box.appendChild(make('p', 'sp-review-muted',
+        'Everything with no System 3 record can be dismissed together from Review all / controls.'));
+    }
+    return box;
+  }
+
+  /* ------------------------------------------------ REVIEW ALL: THE QUEUE */
+  function reviewQueueOpen() {
+    var overlay = el('spRejectionDetail');
+    if (!overlay) return;
+    if (rejectionSelection) rejectionClose();
+    rejectionRequest += 1;
+    var selected = {queue: true};
+    rejectionSelection = selected;
+    rejectionDetail = null;
+    overlay.hidden = false;
+    overlay.parentElement.classList.add('sp-reviewing');
+    reviewQueue.confirm = '';
+    reviewQueue.message = '';
+    reviewQueue.painted = '';
+    reviewQueuePaint();
+    reviewQueueLoad(selected);
+  }
+
+  function reviewQueueLoad(selected) {
+    var tab = reviewQueue.tab;
+    var url = tab === 'history' ? '/api/orchestrator/rejections/history?limit=80'
+      : '/api/orchestrator/rejections/queue?limit=200';
+    Promise.resolve(api().get(url)).then(function (got) {
+      if (rejectionSelection !== selected) return;
+      if (tab === 'history') reviewQueue.history = got || {items: []};
+      else reviewQueue.data = got || {items: []};
+      reviewQueuePaint();
+    }).catch(function (err) {
+      if (rejectionSelection !== selected) return null;
+      if (tab === 'history') {
+        reviewQueue.history = {items: [], error: 'The history is unavailable: ' + rejectionError(err)};
+        reviewQueuePaint();
+        return null;
+      }
+      /* an older station: the plain page of open items still lists them */
+      return Promise.resolve(api().get('/api/orchestrator/rejections?status=pending&limit=200')).then(function (page) {
+        if (rejectionSelection !== selected) return;
+        reviewQueue.data = {items: rejectionPageItems(page), count: Number(page.unreviewed || page.total) || 0,
+          legacy: null, ages: null, older_station: true};
+        reviewQueuePaint();
+      });
+    }).catch(function (err) {
+      if (rejectionSelection !== selected) return;
+      reviewQueue.message = 'The queue is unavailable: ' + rejectionError(err);
+      reviewQueuePaint();
+    });
+  }
+
+  function reviewQueueButton(icon, label, title, fn, cls) {
+    var b = make('button', 'sp-review-action ' + (cls || ''));
+    b.type = 'button';
+    b.innerHTML = folderIcon(icon, '');
+    b.appendChild(make('span', '', label));
+    if (title) b.title = title;
+    b.disabled = reviewQueue.busy;
+    b.addEventListener('click', fn);
+    return b;
+  }
+
+  function reviewQueuePaint() {
+    var overlay = el('spRejectionDetail');
+    if (!overlay || !rejectionSelection || !rejectionSelection.queue) return;
+    reviewBackWire();
+    var prior = overlay.querySelector('.sp-queue-scroll');
+    var keep = prior && reviewQueue.painted === reviewQueue.tab ? prior.scrollTop : 0;
+    overlay.replaceChildren();
+    var data = reviewQueue.data;
+    var count = data ? Number(data.count || (data.items || []).length) || 0 : rejectionCount;
+    var head = make('div', 'sp-review-head');
+    var back = make('button', 'sp-review-back', '← Live script');
+    back.type = 'button';
+    back.addEventListener('click', rejectionClose);
+    head.appendChild(back);
+    head.appendChild(make('h2', '', 'Review queue'));
+    head.appendChild(reviewQueueButton('c:settings--adjust', 'Content gates',
+      'The editorial gates that make these cuts - switch any of them off', function () {
+        rejectionPolicyOpen();
+        if (rejectionSelection) rejectionSelection.fromQueue = true;
+      }, 'sp-review-gates'));
+    overlay.appendChild(head);
+    var tabs = make('div', 'sp-review-tabs');
+    tabs.setAttribute('role', 'tablist');
+    [['open', 'Open' + (count ? ' (' + count + ')' : '')], ['history', 'History']].forEach(function (pair) {
+      var b = make('button', 'sp-review-action sp-review-tab', pair[1]);
+      b.type = 'button';
+      b.setAttribute('role', 'tab');
+      b.setAttribute('aria-selected', String(reviewQueue.tab === pair[0]));
+      b.addEventListener('click', function () {
+        if (reviewQueue.tab === pair[0]) return;
+        reviewQueue.tab = pair[0];
+        reviewQueue.confirm = '';
+        reviewQueue.message = '';
+        reviewQueuePaint();
+        reviewQueueLoad(rejectionSelection);
+      });
+      tabs.appendChild(b);
+    });
+    overlay.appendChild(tabs);
+    var feedback = make('p', 'sp-review-feedback', reviewQueue.message || '');
+    feedback.setAttribute('role', 'status');
+    overlay.appendChild(feedback);
+    var scroll = make('div', 'sp-review-scroll sp-queue-scroll');
+    if (reviewQueue.tab === 'history') reviewHistoryList(scroll);
+    else { reviewBulkBar(scroll); reviewOpenList(scroll); }
+    overlay.appendChild(scroll);
+    scroll.scrollTop = keep;               /* the reader's place, never a jump */
+    reviewQueue.painted = reviewQueue.tab;
+  }
+
+  function reviewOlderCount(data, seconds) {
+    if (data && data.ages && data.ages[String(seconds)] != null) return Number(data.ages[String(seconds)]) || 0;
+    return reviewUnique(data && data.items).filter(function (item) { return reviewAgeOf(item) >= seconds; }).length;
+  }
+
+  function reviewBulkButton(key, n, filter) {
+    var count = Number(n) || 0;
+    var confirming = reviewQueue.confirm === key;
+    var b = reviewQueueButton('c:close--filled', confirming ? 'Dismiss ' + count + '? Press again' : 'Dismiss ' + count,
+      confirming ? 'Press again to dismiss them' : 'They leave the strip and stay in the history', function () {
+        if (!confirming) { reviewQueue.confirm = key; reviewQueuePaint(); return; }
+        reviewQueue.confirm = '';
+        reviewBulkClose(filter);
+      }, 'sp-queue-bulk-go' + (confirming ? ' sp-queue-confirm' : ''));
+    b.disabled = reviewQueue.busy || !count;
+    return b;
+  }
+
+  function reviewBulkBar(parent) {
+    var data = reviewQueue.data;
+    var box = make('section', 'sp-review-section sp-queue-bulk');
+    box.appendChild(make('h3', '', 'Close many at once'));
+    if (!data) {
+      box.appendChild(make('p', 'sp-review-muted', 'Reading the queue...'));
+      parent.appendChild(box);
       return;
     }
-    var now = Date.now();
-    if (!rejectionLastStep) { rejectionLastStep = now; return; }
-    viewport.scrollLeft += Math.min(now - rejectionLastStep, 500) * 0.025;
-    rejectionLastStep = now;
-    var first = track.firstElementChild;
-    if (track.children.length > 1 && first.offsetLeft + first.offsetWidth <= viewport.scrollLeft) {
-      var width = first.offsetWidth + 6;
-      first.remove();
-      viewport.scrollLeft = Math.max(0, viewport.scrollLeft - width);
-      rejectionFill();
+    var row = make('div', 'sp-queue-bulk-row');
+    var label = make('label', '', 'Dismiss everything older than');
+    var pick = make('select', 'sp-queue-age');
+    pick.id = 'spQueueAge';
+    label.htmlFor = 'spQueueAge';
+    REVIEW_AGES.forEach(function (choice) {
+      var option = make('option', '', choice[1]);
+      option.value = String(choice[0]);
+      if (choice[0] === reviewQueue.older) option.selected = true;
+      pick.appendChild(option);
+    });
+    pick.addEventListener('change', function () {
+      reviewQueue.older = Number(pick.value) || 86400;
+      reviewQueue.confirm = '';
+      reviewQueuePaint();
+    });
+    row.appendChild(label);
+    row.appendChild(pick);
+    row.appendChild(reviewBulkButton('older', reviewOlderCount(data, reviewQueue.older),
+      {older_than_s: reviewQueue.older}));
+    box.appendChild(row);
+    var row2 = make('div', 'sp-queue-bulk-row');
+    row2.appendChild(make('span', '', 'Dismiss everything with no System 3 record (from before System 3 directed its road)'));
+    if (data.legacy == null) {
+      row2.appendChild(make('span', 'sp-review-muted', 'this station cannot tell which yet'));
+    } else {
+      row2.appendChild(reviewBulkButton('legacy', data.legacy, {legacy: true}));
     }
+    box.appendChild(row2);
+    parent.appendChild(box);
   }
+
+  function reviewBulkClose(filter) {
+    var selected = rejectionSelection;
+    reviewQueue.busy = true;
+    reviewQueue.message = 'Dismissing...';
+    reviewQueuePaint();
+    Promise.resolve(api().post('/api/orchestrator/rejections/bulk-close',
+      Object.assign({action: 'dismiss'}, filter))).then(function (got) {
+      if (!got || got.ok === false) throw new Error((got && (got.detail || got.say)) || 'The station refused');
+      reviewQueue.message = String(got.say || ((got.closed || 0) + ' dismissed.'));
+      rejectionHeadAt = 0;
+      rejectionLoad(true);
+    }).catch(function (err) {
+      reviewQueue.message = 'Nothing was dismissed: ' + rejectionError(err);
+    }).finally(function () {
+      reviewQueue.busy = false;
+      if (rejectionSelection === selected) { reviewQueuePaint(); reviewQueueLoad(selected); }
+    });
+  }
+
+  function reviewQueueCloseOne(item, action) {
+    var selected = rejectionSelection;
+    reviewQueue.busy = true;
+    reviewQueue.message = action === 'resolve' ? 'Marking complete...' : 'Dismissing...';
+    reviewQueuePaint();
+    var body = {action: action, note: ''};
+    if (item.revision) body.expected_revision = Number(item.revision);
+    if (item.event_seq || item.seq) body.expected_event_seq = Number(item.event_seq || item.seq);
+    Promise.resolve(api().post('/api/orchestrator/rejections/' + encodeURIComponent(item.id), body)).then(function (got) {
+      if (!got || got.ok === false) throw new Error((got && (got.detail || got.say)) || 'The station refused');
+      reviewQueue.message = reviewActSaid(action, got);
+      rejectionHeadAt = 0;
+      rejectionLoad(true);
+    }).catch(function (err) {
+      reviewQueue.message = 'Not closed: ' + rejectionError(err);
+    }).finally(function () {
+      reviewQueue.busy = false;
+      if (rejectionSelection === selected) { reviewQueuePaint(); reviewQueueLoad(selected); }
+    });
+  }
+
+  function reviewOpenFromQueue(item) {
+    rejectionOpen(item, null);
+    if (rejectionSelection) rejectionSelection.fromQueue = true;
+  }
+
+  function reviewQueueRow(item) {
+    var row = make('div', 'sp-queue-row');
+    row.dataset.id = String(item.id);
+    var icon = make('span', 'sp-queue-icon');
+    icon.innerHTML = folderIcon(reviewIconName(item), '');
+    row.appendChild(icon);
+    var info = make('div', 'sp-queue-info');
+    var what = String(item.gate || 'review').replace(/_/g, ' ') + ' ' + String(item.disposition || 'cut').replace(/_/g, ' ');
+    info.appendChild(make('b', '', what.charAt(0).toUpperCase() + what.slice(1)
+      + ' · waiting ' + reviewAgeText(reviewAgeOf(item))));
+    if (item.source_preview) info.appendChild(make('span', 'sp-queue-words', '“' + item.source_preview + '”'));
+    var reason = Array.isArray(item.reasons) ? item.reasons[0] : '';
+    if (reason) info.appendChild(make('small', '', reason));
+    var s3 = item.system3;
+    if (s3 && s3.state) {
+      info.appendChild(make('small', 'sp-queue-s3', s3.state === 'linked'
+        ? 'System 3: ' + (s3.road ? s3.road + ' ' : '') + 'round ' + String(s3.conversation_id || '').slice(0, 8)
+          + (/:t(\d+)$/.test(String(s3.turn_id || '')) ? ', turn ' + (Number(/:t(\d+)$/.exec(s3.turn_id)[1]) + 1) : '')
+        : (s3.state === 'none' || s3.state === 'gone') ? 'No System 3 record'
+          : 'System 3: not looked up yet'));
+    }
+    row.appendChild(info);
+    var acts = make('div', 'sp-queue-acts');
+    acts.appendChild(reviewQueueButton('c:view', 'Open', 'The whole review: its evidence and its System 3 story',
+      function () { reviewOpenFromQueue(item); }, 'sp-queue-open'));
+    acts.appendChild(reviewQueueButton('c:checkmark', 'Mark complete', 'It leaves the strip and stays in the history',
+      function () { reviewQueueCloseOne(item, 'resolve'); }, 'sp-review-close-resolve'));
+    acts.appendChild(reviewQueueButton('c:close--filled', 'Dismiss', 'It leaves the strip and stays in the history',
+      function () { reviewQueueCloseOne(item, 'dismiss'); }, 'sp-review-close-dismiss'));
+    row.appendChild(acts);
+    return row;
+  }
+
+  function reviewOpenList(parent) {
+    var data = reviewQueue.data;
+    if (!data) return;
+    var list = make('div', 'sp-queue-list');
+    var items = reviewUnique(data.items);
+    if (!items.length) list.appendChild(make('p', 'sp-review-muted', 'Nothing is waiting for you. The strip is empty.'));
+    items.forEach(function (item) { list.appendChild(reviewQueueRow(item)); });
+    if (data.has_more) list.appendChild(make('p', 'sp-review-muted',
+      'The newest ' + items.length + ' of ' + (data.count || items.length) + ' are listed; the bulk closes reach them all.'));
+    parent.appendChild(list);
+  }
+
+  function reviewHistoryList(parent) {
+    var got = reviewQueue.history;
+    if (!got) { parent.appendChild(make('p', 'sp-review-muted', 'Reading the history...')); return; }
+    if (got.error) parent.appendChild(make('p', 'sp-review-warning', got.error));
+    var items = Array.isArray(got.items) ? got.items : [];
+    if (!items.length && !got.error) parent.appendChild(make('p', 'sp-review-muted', 'Nothing has left the queue yet.'));
+    var list = make('ol', 'sp-review-list sp-queue-history');
+    items.forEach(function (h) {
+      var li = make('li', 'sp-queue-hist');
+      var when = h.closed_at ? new Date(Number(h.closed_at) * 1000) : null;
+      li.appendChild(make('b', '', [when && !isNaN(when.getTime()) ? when.toLocaleString() : '',
+        h.label || h.action].filter(Boolean).join(' · ')));
+      li.appendChild(make('span', '', String(h.gate || '').replace(/_/g, ' ')
+        + (h.source_preview ? ' · “' + h.source_preview + '”' : '')));
+      if (h.why) li.appendChild(make('small', '', 'In one close: ' + String(h.why)));
+      if (h.note) li.appendChild(make('small', '', String(h.note)));
+      li.appendChild(reviewQueueButton('c:view', 'Open', 'The whole review, as it was closed', function () {
+        reviewOpenFromQueue({id: h.id, gate: h.gate, kind: h.kind, reasons: h.reasons});
+      }, 'sp-queue-open'));
+      list.appendChild(li);
+    });
+    parent.appendChild(list);
+  }
+  /* ================================================================ [review-queue] end */
 
   function buildRejectionStrip() {
     var strip = make('div', 'sp-reject-strip');
@@ -669,7 +1306,7 @@
   }
 
   function rejectionControlsOpen() {
-    rejectionPolicyOpen();
+    reviewQueueOpen();              /* [review-queue] the queue first; the content gates one tap in */
   }
 
   function rejectionEvidence(record) {
@@ -768,6 +1405,7 @@
     rejectionSelection = null;
     rejectionDetail = null;
     rejectionPolicy = null;
+    reviewS3Drop();                                             /* [review-queue] */
     if (marker && marker.isConnected) marker.focus();
   }
 
@@ -791,14 +1429,17 @@
     back.addEventListener('click', rejectionClose);
     head.appendChild(back);
     head.appendChild(make('h2', '', 'Script review'));
-    head.appendChild(make('span', 'sp-review-status', String(record.review_status || 'pending')));
+    head.appendChild(make('span', 'sp-review-status', reviewStatusWord(record)));   /* [review-queue] */
     overlay.appendChild(head);
+    overlay.appendChild(reviewActionBar(record));                /* [review-queue] */
     var scroll = make('div', 'sp-review-scroll');
     scroll.appendChild(make('p', 'sp-review-meta', [item.kind, record.gate, record.disposition,
       record.occurrences && record.occurrences + ' occurrences'].filter(Boolean).join(' · ')));
     var tintSummary = make('p', 'sp-review-tint', rejectionTintSummary(rejectionTintState));
     tintSummary.id = 'spReviewTintSummary';
     scroll.appendChild(tintSummary);
+    scroll.appendChild(reviewWhatSection(record));               /* [review-queue] */
+    scroll.appendChild(reviewS3Section(record));
     var reasons = make('section', 'sp-review-section');
     reasons.appendChild(make('h3', '', 'Why it was held then (historical)'));
     var reasonList = make('ul', 'sp-review-list');
@@ -1046,7 +1687,7 @@
       if (!got || got.ok === false) throw new Error((got && (got.detail || got.say)) || 'Station refused review');
       if (selected !== rejectionSelection) return;
       selected.draft = '';
-      selected.message = action === 'note' ? 'Note saved' : 'Decision saved';
+      selected.message = reviewActSaid(action, got);              /* [review-queue] */
       rejectionHeadAt = 0;
       rejectionLoad(true);
       return rejectionFetch();
@@ -16955,7 +17596,10 @@
       scriptVisible: scriptVisible, playoutRead: playoutRead,
       playoutEvidence: playoutEvidence, paintSaying: paintSaying,
       sayingFallbackMark: sayingFallbackMark, placeMarks: placeMarks,
-      contentGateBody: contentGateBody, contentGateEffective: contentGateEffective},
+      contentGateBody: contentGateBody, contentGateEffective: contentGateEffective,
+      /* [review-queue] */ reviewIconName: reviewIconName, reviewAgeText: reviewAgeText,
+      reviewUnique: reviewUnique, reviewFit: reviewFit, reviewActSaid: reviewActSaid,
+      reviewClosedText: reviewClosedText, reviewStatusWord: reviewStatusWord},
     /* #1168: the segment menu's own roads, exported the same way and
        for the same reason - a stub-DOM smoke test can then hold the
        REAL hold, the real three windows and the real sidebar rather

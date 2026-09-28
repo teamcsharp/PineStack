@@ -254,6 +254,10 @@ class System3Runtime:
         if badges:
             self.log("System 3's ES tables gained their emoji badges (once): %d on %s"
                      % (len(badges), ", ".join(sorted({b.split(":", 1)[0] for b in badges}))))
+        told = self.add_missing_es_text()                                    # [s3-es-dir]
+        if told:
+            self.log("System 3's ES items gained the default writer direction (once): %d on %s"
+                     % (len(told), ", ".join(sorted({b.split(":", 1)[0] for b in told}))))
         self._cast_load()                                                   # [s3-cast]
         adopted = self.adopt_mind_notes()
         if adopted:
@@ -878,6 +882,43 @@ class System3Runtime:
                                    % (len(filled), ", ".join(tables)))
         except Exception as exc:  # noqa: BLE001
             self.fail("ES emoji", exc)
+            return []
+        self.config = new
+        return filled
+
+    ES_TEXT_MARK = "ES_TEXT"           # [s3-es-dir] in defaults_added: the directions were given once
+
+    def add_missing_es_text(self):
+        """[s3-es-dir] Once: the default writer direction ("Write {name}'s message
+        with {feeling}, reflecting the mood.") onto every ES-family item whose
+        `text` key is absent. Remembered in `defaults_added` (ES_TEXT_MARK), so
+        it never runs again: a direction the operator later clears stays
+        cleared. Saved as one version with a note. Returns what was filled."""
+        config = self.config if isinstance(self.config, dict) else {}
+        seen = {str(x) for x in (config.get("defaults_added") or [])}
+        if self.ES_TEXT_MARK in seen:
+            return []
+        new = copy.deepcopy(config)
+        filled, tables = [], []
+        for t in new.get("tables") or []:
+            if not isinstance(t, dict) or t.get("family") != "ES":
+                continue
+            before = len(filled)
+            for c in t.get("categories") or []:
+                for it in (c.get("items") or []) if isinstance(c, dict) else []:
+                    if isinstance(it, dict) and "text" not in it and it.get("id"):
+                        it["text"] = system3_tables.ES_DIRECTION
+                        filled.append("%s:%s" % (t.get("id"), it["id"]))
+            if len(filled) > before:
+                tables.append(str(t.get("id")))
+        if not filled:
+            return []
+        new["defaults_added"] = sorted(seen | {self.ES_TEXT_MARK})
+        try:
+            self.store.save_config(new, "ES writer directions added from the defaults (once): %d on %s"
+                                   % (len(filled), ", ".join(tables)))
+        except Exception as exc:  # noqa: BLE001
+            self.fail("ES directions", exc)
             return []
         self.config = new
         return filled

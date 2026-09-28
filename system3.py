@@ -318,6 +318,72 @@ def es_emoji(config, spec):
     return ([cat] if cat else []) + ([own] if own and own != cat else [])
 
 
+# [s3-es-dir] How far an item's own arousal off its category's moves the voice's
+# dims (excitement above, fatigue below), times the turn's intensity scale.
+ES_ITEM_VOICE = 1.0
+
+
+def _es_row(config, spec):
+    """[s3-es-dir] (category, item) of an ES pick, as the table holds them."""
+    for t in (config or {}).get("tables") or []:
+        if isinstance(t, dict) and t.get("id") == spec.get("table"):
+            for c in t.get("categories") or []:
+                if isinstance(c, dict) and c.get("id") == spec.get("category"):
+                    item = next((i for i in c.get("items") or []
+                                 if isinstance(i, dict) and i.get("id") == spec.get("id")), None)
+                    return c, item
+            break
+    return None, None
+
+
+def es_direction(config, spec, name=""):
+    """[s3-es-dir] What the writer is told for an ES pick: the item's own words
+    (the Tables tab's "what the writer is told this turn does"), else the
+    default (system3_tables.ES_DIRECTION), with {feeling} = the item rolled and
+    {name} = the seat speaking. Nothing is drawn."""
+    _cat, item = _es_row(config, spec)
+    text = " ".join(str((item or {}).get("text") or "").split()) or system3_tables.ES_DIRECTION
+    feeling = str(spec.get("label") or spec.get("id") or "").strip()
+    who = " ".join(str(name or "").split()) or "the speaker"
+    return text.replace("{feeling}", feeling).replace("{name}", who)[:400]
+
+
+def _es_base_arousal(config, spec):
+    """[s3-es-dir] The arousal of the category an ES pick was drawn from, or None."""
+    cat, _item = _es_row(config, spec)
+    if not cat or cat.get("arousal") is None:
+        return None
+    try:
+        return float(cat.get("arousal"))
+    except (TypeError, ValueError):
+        return None
+
+
+def _es_line(turn):
+    """[s3-es-dir] The ES item's direction stamped on this turn, or "" (a turn
+    planned before directions reached the row, or no feeling rolled)."""
+    for d in turn.get("decisions") or []:
+        if d.get("family") == "ES" and d.get("item"):
+            return " ".join(str(d.get("direction") or "").split())
+    return ""
+
+
+def _es_sentence(turn):
+    """[s3-es-dir] The direction as a closing sentence, with its leading space."""
+    got = _es_line(turn)
+    return (" " + (got if got.endswith((".", "!", "?")) else got + ".")) if got else ""
+
+
+def _speaks_direction(text, direction):
+    """[s3-es-dir] Whether written words say a direction aloud: the direction's
+    first clause (twelve characters of words or more) inside them - the same
+    test as the station's #1462 beat check."""
+    def words(value):
+        return " ".join(re.findall(r"[a-z0-9']+", str(value or "").lower()))
+    core = words(re.split(r"[,.;]", str(direction or ""), 1)[0])
+    return len(core) >= 12 and core in words(text)
+
+
 def validate_table(table):
     """Refuse a table that cannot be drawn from; returns the cleaned copy."""
     if not isinstance(table, dict):
@@ -925,7 +991,7 @@ def _intensity_word(x):
     return "hard" if x >= 0.72 else "plainly" if x >= 0.4 else "mildly"
 
 
-def performance_intent(spec, intensity, dynamics):
+def performance_intent(spec, intensity, dynamics, base_arousal=None):
     """ES -> the engine-neutral PerformanceIntent (blueprint section 12).
 
     `dims` is the station's six-dimension emotional state, which the host
@@ -936,6 +1002,15 @@ def performance_intent(spec, intensity, dynamics):
     valence = clamp(spec.get("valence", 0.0), -1.0, 1.0)
     dims = {d: round(clamp(float((spec.get("dims") or {}).get(d) or 0) * (0.35 + 0.65 * intensity)), 3)
             for d in EMOTION_DIMS}
+    # [s3-es-dir] THE ITEM REACHES THE VOICE. The dims are the category's; an item
+    # whose own arousal sits off its category's (a fury is not an annoyance) moves
+    # them: above, more excitement; below, more fatigue - what the station's
+    # performance_vector turns into pace, energy and pauses. None: unchanged.
+    shift = 0.0 if base_arousal is None else round(arousal - clamp(base_arousal), 3)
+    if shift > 0.02:
+        dims["excitement"] = round(clamp(dims["excitement"] + ES_ITEM_VOICE * shift * (0.35 + 0.65 * intensity)), 3)
+    elif shift < -0.02:
+        dims["fatigue"] = round(clamp(dims["fatigue"] - ES_ITEM_VOICE * shift * (0.35 + 0.65 * intensity)), 3)
     return {
         "emotion": spec.get("label"), "family": spec.get("category"),
         "table": spec.get("table"), "intensity": round(intensity, 3),
@@ -946,7 +1021,7 @@ def performance_intent(spec, intensity, dynamics):
         "tension": round(clamp(dynamics.get("tension", 0.35)), 3),
         "pause_style": "clipped" if arousal >= 0.7 else "spacious" if arousal <= 0.3 else "natural",
         "valence": round(valence, 3), "arousal": round(arousal, 3),
-        "dims": dims,
+        "dims": dims, "item_shift": shift,                                   # [s3-es-dir]
         "engine_hints": {"dsp": {"pace": True, "pitch_var": True, "energy": True, "pause_scale": True},
                          "native_emotion": None},
     }
@@ -1441,6 +1516,9 @@ def _decide_turn(conv, config, settings, stream, step, speaker, want, inputs, cl
             # [s3-es-emoji] the badge the message wears (the Messenger, bottom right):
             # [category, item] off the table the pick came from - nothing is drawn
             dec["emoji"] = es_emoji(config, spec)
+            # [s3-es-dir] what the writer is told for this feeling: the item's own words
+            dec["direction"] = es_direction(config, spec, turn["name"])
+            dec["text"] = ev["selected"]["text"] = dec["direction"]
             es_spec = spec
             ctx["speaker_emotion_cat"] = spec["category"]
             if who:
@@ -1452,7 +1530,8 @@ def _decide_turn(conv, config, settings, stream, step, speaker, want, inputs, cl
                                   "dims": {}}
                 who["intensity"] = round(intensity, 3)
                 who["energy"] = round(clamp(0.7 * who["energy"] + 0.3 * arousal * intensity * 2), 3)
-            turn["performance"] = performance_intent(spec, intensity, d)
+            turn["performance"] = performance_intent(spec, intensity, d,
+                                                     base_arousal=_es_base_arousal(config, spec))   # [s3-es-dir]
             if who:
                 who["emotion"]["dims"] = turn["performance"]["dims"]
             d["energy"] = round(clamp(0.8 * d["energy"] + 0.2 * turn["performance"]["energy"]), 4)
@@ -2625,6 +2704,8 @@ def annotate_protocol(conv, sheet):
             acts = [x["text"] for x in t["directions"] if x["family"] == "RS"]
             if acts:
                 add += "; while doing it, " + acts[0]
+            if _es_line(t):                                                   # [s3-es-dir]
+                add += ". " + _es_line(t).rstrip(".")
             add += ".]"
         topic = t.get("bank_topic") or {}                                 # [rng-topics]
         if topic.get("text"):
@@ -2764,6 +2845,10 @@ def _leg_row_add(t):
         flow = [x["text"] for x in t.get("directions") or [] if x["family"] == "FL"]
         if flow:
             add += "; and " + flow[-1]
+        # [s3-es-dir] the feeling's own words - not on a drawn stock line (its words are fixed)
+        _es = "" if any(x.get("family") == "LINE" for x in t.get("decisions") or []) else _es_line(t)
+        if _es:
+            add += ". " + _es.rstrip(".")
         add += ".]"
     topic = t.get("bank_topic") or {}
     if topic.get("text"):
@@ -3039,11 +3124,13 @@ def _row_work(turn, conv):
         phrases = ", ".join(json.dumps(x) for x in (turn.get("interject") or [])[:3])
         return ("gets a word in edgewise while %s is still going - only a word or a handful, %s or anything in "
                 "that spirit%s. A reaction, not a reply: %s does not stop for it."
-                % (prev0_name, phrases or "a bare reaction", (", said in %s" % feel) if feel else "", prev0_name))
+                % (prev0_name, phrases or "a bare reaction", (", said in %s" % feel) if feel else "", prev0_name)
+                + _es_sentence(turn))                                         # [s3-es-dir]
     if turn["step"] == "carry_on":                                            # [s3-rounds]
         feel = _feel_words(turn)
         return ("carries straight on over the interruption and finishes the thought they were on - does not "
-                "answer %s, does not restart, keeps the head of steam%s." % (prev0_name, (", in %s" % feel) if feel else ""))
+                "answer %s, does not restart, keeps the head of steam%s." % (prev0_name, (", in %s" % feel) if feel else "")
+                + _es_sentence(turn))                                         # [s3-es-dir]
     if turn["index"] == 0 and exchange.get("opener"):
         lead = "opens with these exact words, as written: %s" % json.dumps(exchange["opener"])
     elif turn["index"] == 0 and conv["subject"].get("seeded"):
@@ -3099,6 +3186,11 @@ def _row_work(turn, conv):
         lead = ("%s - on this subject, in their own words: %s" % (lead, json.dumps(turn["topic_override"]))
                 if lead else "brings up this subject, in their own words: %s" % json.dumps(turn["topic_override"]))
     body = " - ".join(x for x in (lead, desc) if x)
+    # [s3-es-dir] the feeling's own words for this line - not on a line whose words are fixed
+    _fixed = answer_line or (turn["index"] == 0 and bool(exchange.get("opener") or conv["subject"].get("seeded")))
+    _es = "" if _fixed else _es_line(turn)
+    if _es:
+        body = (body + ". " if body else "") + _es.rstrip(".")
     for sb in turn.get("speakerbox") or []:
         mat = sb.get("material") or {}
         if not mat.get("text"):
@@ -3355,6 +3447,9 @@ def validate(conv, final_turns, mapping=None):
         for name, pattern in _PROHIBITED.items():
             if re.search(pattern, text, re.I | re.M):
                 row["checks"].append({"what": "prohibited:%s" % name, "result": "violated"})
+        if _es_line(t) and _speaks_direction(text, _es_line(t)):              # [s3-es-dir]
+            row["checks"].append({"what": "echo:feeling direction", "result": "violated",
+                                  "how": "the line says its row's feeling direction aloud"})
         fav = t.get("favorite") or {}                                         # [s3-cast]
         if fav.get("text"):
             run = favorite_run(fav["text"], text)
