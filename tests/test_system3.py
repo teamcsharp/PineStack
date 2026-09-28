@@ -94,7 +94,7 @@ class PlanTests(unittest.TestCase):
         # its own streams, only when a road opts in: the trajectory holds.
         # [s3-es-emoji] ...and ES1's badges (an emoji per feeling and item) - data the
         # engine stamps on the ES decision and never draws on: the trajectory holds.
-        self.assertEqual(system3.config_hash(system3.default_config()), "89b5f4230658907b")
+        self.assertEqual(system3.config_hash(system3.default_config()), "e7f2cef1f46beedd")
 
     def test_same_state_config_seed_reproduces_the_plan(self):
         a, b = plan(seed="r"), plan(seed="r")
@@ -432,10 +432,11 @@ class ValidationTests(unittest.TestCase):
         conv = self.call_plan()
         legs = [t["leg"] for t in conv["turns"]]
         self.assertEqual(legs[:7], ["answer", "introduce", "greet", "detail_1", "ask_1", "detail_2", "ask_2"])
-        self.assertEqual(legs[-2:], ["lands", "sign_off"])
-        self.assertEqual(len(conv["turns"]), 12)
-        self.assertEqual(conv["turns"][-2]["speaker"], "C", "the caller lands it second to last")
-        self.assertEqual(conv["turns"][-3]["speaker"], "A", "a host speaks just before the caller lands it")
+        self.assertEqual(legs[-2:], ["rebuttal", "wrap_call"])            # [s3-callend] the call's new end
+        self.assertIn(len(conv["turns"]), (12, 13), "the open legs, then the rolled end (1 or 2 responses)")
+        self.assertEqual(conv["turns"][-2]["speaker"], "C", "the caller's rebuttal is second to last")
+        self.assertIn(conv["turns"][-3]["speaker"], ("A", "B"), "a station seat answers just before it")
+        self.assertIn(conv["turns"][-1]["speaker"], ("A", "B"), "someone on the station wraps the call")
         for t in conv["turns"]:
             self.assertTrue(any(d["family"] == "ES" for d in t["decisions"]), "every leg rolls its feeling")
             if t["leg"] == "keeps_going":
@@ -445,11 +446,12 @@ class ValidationTests(unittest.TestCase):
                       "[Say it in", "SOMEWHERE IN THE MIDDLE"):
             self.assertIn(words, sheet)
         rows = [ln for ln in sheet.splitlines() if re.match(r"^\s*\d+\s+[A-Z]\s+-", ln)]
-        self.assertEqual(len(rows), 12)
-        self.assertTrue(rows[-1].split("-", 1)[1].strip().startswith("SIGN OFF"))
+        self.assertEqual(len(rows), len(conv["turns"]))                  # [s3-callend]
+        self.assertTrue(rows[-1].split("-", 1)[1].strip().startswith("WRAP CALL"))
 
     def test_a_call_keeps_its_protocol_floor_and_replays(self):
-        self.assertEqual(len(self.call_plan(turns=3)["turns"]), 9, "the protocol's floor is nine turns")
+        self.assertIn(len(self.call_plan(turns=3)["turns"]), (12, 13),   # [s3-callend]
+                      "the protocol's floor: the seven open legs and the call's rolled end")
         a, b = self.call_plan(seed="same"), self.call_plan(seed="same")
         self.assertEqual([(t["speaker"], (t["performance"] or {}).get("emotion")) for t in a["turns"]],
                          [(t["speaker"], (t["performance"] or {}).get("emotion")) for t in b["turns"]])

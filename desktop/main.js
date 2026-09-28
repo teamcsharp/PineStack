@@ -172,6 +172,82 @@ try {
   app.setPath("userData", PINE_USER_DATA);
 } catch {}
 
+// [pine-identity] PINE BOX, BY NAME AND BY ICON, ON EVERY WINDOW.
+//
+// "Make sure that the Pine Box icon is active everywhere, including in the
+//  task manager and in the audio panel and anywhere that there's any mention
+//  of this application that it's mentioned by name and mentioned by icon."
+//
+// Every window this app opens passes through here - including the ones no
+// call site dresses (the kit-export and retirement-desk popups) and any
+// window added later. Each wears the mark and carries the name. A page's own
+// <title> ("The tablet, live") replaces the window title as it loads, so the
+// name is added at that moment too; a page with no <title> keeps the window's
+// title rather than showing its file name.
+//
+// Each window also carries the RELAUNCH details, so a pin made from the
+// running button is the Start Menu shortcut's app - named Pine Box, wearing
+// its icon - never the bare electron.exe #971 found pinned. They are read
+// from that shortcut (pine_box.exe rewrites it on every launch), so there is
+// one recipe and one versioned icon, not a second copy of them here.
+//
+// What no window can reach - Task Manager's name, the volume mixer's name
+// and icon - lives in electron.exe's own resources and is written there by
+// desktop/tools/apply_pinebox_identity.ps1 (pine_box.exe and the rebuild
+// both run it; the file keeps its path, so Windows keeps its volume).
+const PINE_ICON = path.join(__dirname, "assets", "pinebox.ico");
+function pineTitle(title) {
+  const t = String(title || "").trim();
+  if (!t) return "Pine Box";
+  return /\bpine box\b/i.test(t) ? t : "Pine Box - " + t;
+}
+let pineRelaunch;
+function pineRelaunchDetails() {
+  if (pineRelaunch !== undefined) return pineRelaunch;
+  pineRelaunch = null;
+  if (process.platform !== "win32") return pineRelaunch;
+  try {
+    const lnk = path.join(app.getPath("appData"), "Microsoft", "Windows",
+      "Start Menu", "Programs", "Pine Box.lnk");
+    const s = shell.readShortcutLink(lnk);
+    if (s && s.appUserModelId === PINE_AUMID && s.icon && fs.existsSync(s.icon)) {
+      pineRelaunch = {
+        appId: PINE_AUMID,
+        appIconPath: s.icon,
+        appIconIndex: s.iconIndex || 0,
+        // The app's absolute path, not ".": a pin made from a window has no
+        // working directory to resolve "." against - the #971 blank Electron.
+        relaunchCommand: `"${process.execPath}" "${app.getAppPath()}"`,
+        relaunchDisplayName: "Pine Box"
+      };
+    }
+  } catch { /* no shortcut yet: Windows falls back to its own lookup */ }
+  return pineRelaunch;
+}
+app.on("browser-window-created", (_event, w) => {
+  try { w.setIcon(PINE_ICON); } catch {}
+  // The constructor applies the window's own `title` option (or the app
+  // name) AFTER this event, so the name is added once it returns. Measured on
+  // Electron 37.10.3: a title set here synchronously was replaced by "Find
+  // the moment" before `new BrowserWindow` came back, and a page with no
+  // <title> raises no page-title-updated at all.
+  setImmediate(() => {
+    try {
+      if (w.isDestroyed()) return;
+      const now = w.getTitle();
+      if (pineTitle(now) !== now) w.setTitle(pineTitle(now));
+    } catch {}
+  });
+  w.on("page-title-updated", (event, title, explicitSet) => {
+    event.preventDefault();
+    try { w.setTitle(pineTitle(explicitSet ? title : w.getTitle())); } catch {}
+  });
+  try {
+    const details = pineRelaunchDetails();
+    if (details) w.setAppDetails(details);
+  } catch {}
+});
+
 // #971: one Pine Box, not one per click. A pinned taskbar button is
 // pressed to GET to the app, not to start a second copy of it — and
 // pine_box.exe is run again on every launch, so without this the shortcut
@@ -480,6 +556,17 @@ function writeWindowsRebuildScript(runnerRoot, sourceRoot, cfg) {
     ")",
     "if not exist \"%RUN_DIR%\\node_modules\\electron\\dist\\electron.exe\" goto fail",
     "> \"%RUN_DIR%\\node_modules\\electron\\path.txt\" echo electron.exe",
+    // [pine-identity] electron.exe wears the Pine Box name and icon in its
+    // own resources (Task Manager, the volume mixer), and an unpack above
+    // brings back Electron's. The same file at the same path, so the volume
+    // Windows keeps for this exe is untouched. It waits for Electron to let
+    // go of the exe (the timeout above returns at once with no console
+    // input); never fatal - pine_box.exe tries again on the next launch.
+    "if exist \"%RUN_DIR%\\desktop\\tools\\apply_pinebox_identity.ps1\" (",
+    ">> \"%LOG%\" echo [rebuild] giving electron.exe the Pine Box name and icon",
+    "  set \"PINE_STACK=%SOURCE_DIR%\\..\"",
+    "  powershell -NoProfile -ExecutionPolicy Bypass -File \"%RUN_DIR%\\desktop\\tools\\apply_pinebox_identity.ps1\" -Exe \"%RUN_DIR%\\node_modules\\electron\\dist\\electron.exe\" -NoBackup -WaitSeconds 30 -Quiet >> \"%LOG%\" 2>&1",
+    ")",
     ">> \"%LOG%\" echo [rebuild] relaunching Pine Box",
     `set "PINE_AGENT_ROOT=${cmdEscape(sourceRoot)}"`,
     "set \"PINE_DESKTOP_BASE_URL=%BASE_URL%\"",

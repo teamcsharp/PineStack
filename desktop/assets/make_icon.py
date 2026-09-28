@@ -173,11 +173,17 @@ def main(outdir):
         os.path.join(outdir, "pinebox-256.png"))
     # kept beside it so the choice can be reversed without re-deriving it
     build_ico(os.path.join(outdir, "pinebox-pb.ico"), art=pb_mark(S))
+    # [pine-identity] the same mark for electron.exe's own resources
+    # (desktop/tools/apply_pinebox_identity.ps1). 128 and 256 are PNG so no
+    # frame reaches 64 KB: rcedit writes each frame's size into a 16-bit
+    # field of the icon group, and an uncompressed 256 (270,376 bytes) would
+    # be recorded as 8,232. The pixels are the ones in pinebox.ico.
+    build_ico(os.path.join(outdir, "pinebox-exe.ico"), art=art, png_from=128)
     print("wrote %s (%d bytes)" % (ico, total))
     for n, blob in entries:
         kind = "PNG" if blob[:8] == b"\x89PNG\r\n\x1a\n" else "BMP"
         print("  %3dx%-3d %7d bytes  %s" % (n, n, len(blob), kind))
-    print("wrote pinebox.png (512), pinebox-256.png, pinebox-pb.ico")
+    print("wrote pinebox.png (512), pinebox-256.png, pinebox-pb.ico, pinebox-exe.ico")
 
 
 if __name__ == "__main__":

@@ -8669,7 +8669,8 @@ async def _submit_generation(
     for key in ("mode", "source", "source_type", "speech", "purpose", "air_it",
                 "frames", "steps", "seed", "at_share", "variant_of",
                 "source_generation", "duration_mode", "duration_seconds",
-                "sequence_part", "sequence_parts", "trim_in_s", "trim_out_s"):
+                "sequence_part", "sequence_parts", "trim_in_s", "trim_out_s",
+                "hourly", "h3_prompts"):          # [h3-prompts] the hour's words ride the row
         if metadata and key in metadata:
             rec[key] = metadata[key]
     append_generation(rec)
@@ -8985,6 +8986,15 @@ async def voice_ad_render(
     copy = " ".join(str(spoken_copy or "").split())[:700]
     if not copy:
         copy = voice_ad_spoken_copy(goal)
+    # [h3-prompts] the hourly clip road is told the hour's preset: its clip
+    # direction and its line (blank: the line pulled out of the brief, above)
+    _h3_words = None
+    if hourly:
+        _h3_hour = h3_prompts_hour_for(goal, exact=True)
+        if _h3_hour is not None:
+            _h3_words = h3_prompts_words(_h3_hour, "clip", copy)
+            copy = _h3_words["speech"]
+            h3_prompts_claim(_h3_hour)
 
     selected_trim: tuple[float, float] | None = None
     if trim_in_s is not None or trim_out_s is not None:
@@ -9006,6 +9016,8 @@ async def voice_ad_render(
                  + str(goal or "deliver the ad")
                  + ". Keep expressive natural motion, direct-to-camera commercial "
                  "energy, and clean synchronized dialogue. No captions or logos.")
+    if _h3_words is not None:
+        direction = _h3_words["direction"]                 # [h3-prompts] the preset's clip road
     # H3 is a durable station workload.  Do not turn a temporary memory
     # shortage into a lost listener request: the capacity keeper will make
     # room and this FIFO submits it as soon as the engine can accept it.
@@ -9026,6 +9038,7 @@ async def voice_ad_render(
             **({"hourly": True} if hourly else {}),          # [h3-cinematic] never the base path
             "duration_seconds": part["duration_seconds"],
             "duration_mode": "at_least", "air_it": True,
+            **h3_prompts_payload_keys(_h3_words),              # [h3-prompts] style, audio, constraints, record
             "sequence_part": part["part"], "sequence_parts": part["parts"],
             # A hand-picked source interval wins over automatic tiling of a
             # long source.  Multi-part spoken copy deliberately reuses the
@@ -34808,6 +34821,16 @@ def _show_memory_raw(own_material: bool = False, system3: bool = False) -> str: 
     itself instead of resetting with each line."""
     if not _RADIO.get("on"):
         return ""
+    # [s3-memory] A ROUND SYSTEM 3 PLANNED IS REMINDED OF WHAT ITS MEMORY ROLL
+    # DREW, AND OF NOTHING ELSE: the rules decided which memories are relevant
+    # (the clock, the last topic, the last segment, the calls against the
+    # quota, the manager's last word), the roulette drew among them, and the
+    # items drawn are this block - "" when it drew none. Only a prompt no
+    # MEMORY roll stands behind (System 3 off, a road it did not plan, the
+    # table switched off) carries the digest below, as it always did.
+    _memory = s3_memory_block()
+    if _memory is not None:
+        return _memory
     stats = _RADIO.get("session_stats") or {}
     bits: list[str] = []
     # The real clock, first and loudest (#431): the pair kept saying
@@ -34920,6 +34943,170 @@ def _show_memory_raw(own_material: bool = False, system3: bool = False) -> str: 
         return ""
     return ("\nTONIGHT SO FAR — carry this forward, refer back to it, "
             "let it change you: " + "; ".join(bits) + ".")
+
+
+# --- [s3-memory] what the writer is reminded of: System 3's MEMORY roll ---------
+#
+# The operator's guide (2026-09-28): memory context is given ONLY WHEN RELEVANT -
+# the clock, a synopsis of the last topic, the last segment and how it went, the
+# callers this hour against the quota, a synopsis of the manager's last message
+# - "rules, then roulette". System 3 asks here for the station's facts; its
+# MEMORY table's rules decide which kinds are relevant to the round being
+# planned, the roulette draws among them, and the writer is handed exactly the
+# items drawn, as one block (s3_memory_block, the "memory" node), in place of
+# the "Tonight so far" digest. Everything is read from what the station already
+# keeps in memory - never a disk walk, never a model call: this runs on the
+# planner's clock. (The last topic is System 3's own record of its last round.)
+_S3_MEMORY_SEGMENTS: dict[str, Any] = {}
+# The running order walks on exactly: the next entry starts where the one
+# before it was due to end. A longer gap means something ran in between that
+# no round was planned in - System 3 never saw it and says nothing about it.
+S3_MEMORY_GAP_S = 30.0
+
+
+def _s3_segment_went(started: float, ended: float) -> dict[str, Any]:
+    """How a segment went, from what the station logged in its window: the
+    lines heard and the lines withdrawn (the air log's live index), and the
+    calls taken (the quota ring). Counted once, when the schedule moves on."""
+    heard = pulled = 0
+    try:
+        with _AIRLOG_LOCK:
+            rows = list(_AIRLOG_INDEX.values())
+        for row in rows:
+            at = float(row.get("air_at") or row.get("at") or 0)
+            if not started <= at < ended:
+                continue
+            if str(row.get("kind") or "") in AIRLOG_QUIET_KINDS or str(row.get("who") or "") in AIRLOG_QUIET_WHO:
+                continue
+            state = str(row.get("aired") or "")
+            if state in AIRLOG_AIRED:
+                heard += 1
+            elif state in ("withdrawn", "never"):
+                pulled += 1
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        calls = sum(1 for t in _quota_ring("caller") if started <= float(t or 0) < ended)
+    except Exception:  # noqa: BLE001
+        calls = 0
+    return {"heard": heard, "withdrawn": pulled, "calls": calls}
+
+
+def system3_memory_facts(road: str, ctx: dict[str, Any]) -> dict[str, Any]:
+    """The station's facts for System 3's MEMORY roll, one per kind of memory:
+    the clock (with the segment on air), the last segment and how it went, the
+    calls over the last hour against the quota, the manager's last word from
+    upstairs - and `topic`, the last subject the station heard (the runtime
+    prefers its own record of the last round). A fact the station does not
+    hold is left out; the roll records why the kind was not eligible."""
+    out: dict[str, Any] = {}
+    now = time.time()
+    lt = time.localtime(now)
+    seg: dict[str, Any] = {}
+    try:
+        slot = _RADIO.get("sched_slot") or {}
+        pos = _RADIO.get("sched_pos") or {}
+        started = float(pos.get("started") or 0)
+        if slot and started > 0 and str(slot.get("id") or "") == str(pos.get("slot_id") or ""):
+            ends = float(pos.get("deadline") or 0) or started + max(0.25, float(slot.get("minutes") or 3)) * 60.0
+            # the occurrence survives a pause (which moves `started`); without one, the start names it
+            key = str(pos.get("occurrence") or "") or "%s|%.0f" % (slot.get("id") or "", started)
+            seg = {"key": key, "label": " ".join(str(slot.get("label") or slot.get("kind") or "").split())[:80],
+                   "kind": str(slot.get("kind") or ""), "started": started, "ends": ends}
+    except Exception:  # noqa: BLE001
+        seg = {}
+    out["clock"] = {"at": now, "hour": lt.tm_hour, "minute": lt.tm_min, "second": lt.tm_sec,
+                    "clock": time.strftime("%-I:%M %p", lt).lower(),
+                    "segment": {k: seg[k] for k in ("label", "kind", "started", "ends") if k in seg}}
+    try:
+        # the schedule moving on files the entry before as the last segment -
+        # and how it went is counted then, once
+        book = _S3_MEMORY_SEGMENTS
+        cur = book.get("current") or {}
+        if seg and cur.get("key") == seg["key"]:
+            # the same entry: a pause moves its end along; its start stays the one first seen
+            cur["ends"] = max(float(cur.get("ends") or 0), float(seg["ends"]))
+        elif seg:
+            if cur and float(seg["started"]) > float(cur.get("started") or 0):
+                ends = float(cur.get("ends") or 0)
+                ended = min(float(seg["started"]), ends) if ends > 0 else float(seg["started"])
+                if ends > 0 and float(seg["started"]) - ends > S3_MEMORY_GAP_S:
+                    book["last"] = {"label": "", "kind": "", "unseen": True, "started": ends,
+                                    "ended": float(seg["started"])}
+                else:
+                    book["last"] = dict(cur, ended=ended,
+                                        **_s3_segment_went(float(cur.get("started") or 0), ended))
+            book["current"] = dict(seg)
+        last = book.get("last")
+        if isinstance(last, dict) and last.get("ended"):
+            out["last_segment"] = {k: last.get(k) for k in ("label", "kind", "started", "ended", "heard",
+                                                            "withdrawn", "calls", "unseen") if k in last}
+            out["last_segment"]["now"] = {"label": seg.get("label", ""), "started": seg.get("started", 0)}
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        # the rolling hour's count (the station's own quota_behind reads it) and
+        # the clock hour's own - the last hour's tail never makes this one look ahead
+        ring = [float(t or 0) for t in _quota_ring("caller")]
+        top = now - (lt.tm_min * 60 + lt.tm_sec)
+        out["callers_quota"] = {"count": len(ring), "this_hour": sum(1 for t in ring if t >= top),
+                                "quota": int(quota_target("caller")),
+                                "minute": round(lt.tm_min + lt.tm_sec / 60.0, 2), "paused": bool(radio_paused())}
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        for row in reversed(list(_RADIO.get("chat") or [])):
+            if str(row.get("who") or "") == "manager" and str(row.get("text") or "").strip():
+                out["manager_note"] = {"text": " ".join(str(row["text"]).split())[:500],
+                                       "at": float(row.get("air_at") or row.get("ts") or 0),
+                                       "ref": str(row.get("id") or "")}
+                break
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        heard = list(_RADIO.get("topics") or [])
+        if heard and str((heard[-1] or {}).get("text") or "").strip():
+            out["topic"] = {"text": " ".join(str(heard[-1]["text"]).split())[:300],
+                            "at": float(heard[-1].get("at") or 0), "ref": str(heard[-1].get("file") or "")}
+    except Exception:  # noqa: BLE001
+        pass
+    # What the old digest also carried, handed in as facts so that a MEMORY
+    # category of the same name (added on the desk; its item "{synopsis}")
+    # brings it back as a rolled node: the pine box speaker's outage (#410)
+    # and the machine's real temperature (#886). No default kind rolls them.
+    try:
+        if (_RADIO.get("voice_to") or "box") in ("box", "both"):
+            out_min = (now - float(_BOX_LAST_OK[0])) / 60.0
+            if out_min >= 2:
+                out["speaker_outage"] = {"text": "the pine box speaker has carried nothing for %d minutes - "
+                                                 "their words may be going into a void" % int(out_min),
+                                         "minutes": round(out_min, 1)}
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        heat = gpu_temp_fact()
+        if heat:
+            out["machine_heat"] = {"text": heat, "at": now}
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
+def s3_memory_block() -> str | None:
+    """[s3-memory] The memory block for the prompt being written on this task:
+    the items its round's MEMORY roll drew, marked as their own node
+    ("memory"); "" when the roll drew none; None when no MEMORY roll stands
+    behind this prompt (System 3 off, a road it did not plan, the table off)."""
+    fn = globals().get("system3_memory_block")
+    if not fn:
+        return None
+    try:
+        got = fn()
+    except Exception:  # noqa: BLE001
+        return None
+    if got is None:
+        return None
+    return _pb("memory", got) if str(got).strip() else ""
 
 
 def art_sell_due() -> bool:
@@ -62690,6 +62877,182 @@ def selling_now() -> dict[str, Any] | None:
     return None
 
 
+# --- [s3-callend] HOW A CALL ENDS, AS THE STATION SEES IT ------------------------------------
+#
+# System 3 plans the call's end (system3.py [s3-callend]): the caller's wheel (RESOLVE1),
+# the response chain, the caller's rebuttal and WRAP CALL (WRAP1). The painting wheel is
+# offered only when the last segment sold a painting - read here, only from what the
+# station recorded as it aired the pitch - and what the wheel lands on acts on the
+# gallery's real state when the call airs. Nothing here draws a number.
+S3_CALLEND_PRICE = re.compile(r"\$\s?(\d[\d,]{0,8})|\b(\d[\d,]{0,8})\s*(?:dollars|bucks)\b", re.I)
+
+
+def _s3_callend_price(text: str) -> int:
+    """A price said in dollars ("298 dollars", "$298"), or 0."""
+    try:
+        m = S3_CALLEND_PRICE.search(str(text or ""))
+        return int((m.group(1) or m.group(2)).replace(",", "")) if m else 0
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def _s3_callend_terms(text: str) -> str:
+    """The pitch's terms as said on air ("first caller takes it"), or ""."""
+    return ("first caller takes it" if re.search(r"first caller|whoever (?:calls|rings)|next caller",
+                                                   str(text or ""), re.I) else "")
+
+
+def system3_painting_on_offer(within: float = 1200.0) -> dict[str, Any]:
+    """[s3-callend] The painting the station's last selling segment put on offer, for
+    the caller's wheel (RESOLVE1's painting category) - or {}.
+
+    Read ONLY from what the station recorded when it aired the pitch: the sales floor
+    (`_RADIO["hawking"]` and its asking price), a spot selling a painting
+    (`_RADIO["ad_now"]`: the price stamped on it or said in its product line), the
+    gallery press (`_RADIO["gallery_now"]`: the price said on its lines in the booth
+    log). The freshest of them, no older than `within` seconds. No walk of the wall, no
+    model, never raises."""
+    try:
+        now = time.time()
+        within = max(60.0, float(within or 1200.0))
+        rows: list[dict[str, Any]] = []
+        gal = _RADIO.get("gallery_now") or {}
+        pics = [r for r in (gal.get("images") or []) if isinstance(r, dict) and r.get("name")]
+        descs = {str(r.get("name")): str(r.get("desc") or "") for r in pics}
+        hawk = _RADIO.get("hawking") or {}
+        names = [str(x) for x in (hawk.get("images") or []) if x]
+        if names:
+            rows.append({"kind": "hawk", "at": float(hawk.get("at") or 0), "image": names[0], "title": "",
+                         "desc": descs.get(names[0], ""), "price": int(hawk.get("price") or 0), "terms": "",
+                         "why": "the pair hawked it on the sales floor"})
+        ad = _RADIO.get("ad_now") or {}
+        if ad.get("image"):
+            product = str(ad.get("product") or "")
+            said = re.search(r"in it: (.+?) [—–-] from the Pine Box gallery", product)
+            rows.append({"kind": "ad", "at": float(ad.get("at") or 0), "image": str(ad.get("image")),
+                         "title": str(ad.get("title") or ""), "desc": said.group(1) if said else "",
+                         "price": int(ad.get("price") or 0) or _s3_callend_price(product),
+                         "terms": _s3_callend_terms(product), "why": "a spot on air was selling it"})
+        if pics:
+            at = float(gal.get("at") or 0)
+            pick, price, terms = str(pics[0].get("name")), 0, ""
+            for e in reversed(_RADIO.get("chat") or []):
+                if float(e.get("ts") or 0) < at - 5:
+                    break
+                hit = [str(x) for x in (e.get("images") or []) if str(x) in descs]
+                said_price = _s3_callend_price(e.get("text")) if hit else 0
+                if said_price:
+                    pick, price, terms = hit[0], said_price, _s3_callend_terms(e.get("text"))
+                    break
+            rows.append({"kind": "gallery", "at": at, "image": pick, "title": "", "desc": descs.get(pick, ""),
+                         "price": price, "terms": terms, "why": "the gallery press had it up on air"})
+        rows = [r for r in rows if r["at"] and now - r["at"] <= within]
+        if not rows:
+            return {}
+        best = dict(max(rows, key=lambda r: r["at"]))
+        best["age"] = round(now - best["at"], 1)
+        best["desc"] = " ".join(str(best.get("desc") or "").split())[:400]
+        return best
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def system3_gallery_outcome(effect: str, painting: dict[str, Any], cid: str = "") -> dict[str, Any]:
+    """[s3-callend] What a call's rolled end does to the gallery, where the station keeps
+    state: the pile by the desk (`_RADIO["hawk_unsold"]` - offered, not gone; the pair
+    offer it to the next caller) and the wall's rest list (`gallery_shown` - pictures
+    that wait until the rest of the wall has had its turn). Sold, awarded or burnt: off
+    the pile and to the back of the wall's queue. Unsold (turned down, ignored, short of
+    the money): on the pile, still for sale. The station keeps no ledger of sold
+    paintings, so a sold or burnt one can come round again once the wall has turned
+    over - said, not invented. Never raises."""
+    out: dict[str, Any] = {"effect": str(effect or ""), "image": str((painting or {}).get("image") or ""),
+                           "applied": False}
+    try:
+        name = out["image"]
+        if not name:
+            return out
+        pile = _RADIO.setdefault("hawk_unsold", [])
+        if effect in ("sold", "awarded", "burnt"):
+            before = len(pile)
+            pile[:] = [p for p in pile if str((p or {}).get("name") or "") != name]
+            shown = _RADIO.setdefault("gallery_shown", [])
+            if name in shown:
+                shown.remove(name)
+            shown.append(name)
+            del shown[:-60]
+            out.update(applied=True, off_the_pile=before - len(pile), wall="to the back of the wall's queue")
+        elif effect == "unsold":
+            if not any(str((p or {}).get("name") or "") == name for p in pile):
+                pile.append({"name": name, "at": int(time.time()), "price": int((painting or {}).get("price") or 0),
+                             "desc": str((painting or {}).get("desc") or "")[:200]})
+                del pile[:-24]
+            out.update(applied=True, on_the_pile=True)
+        pipeline_log("gallery", "(s3-callend) a call's rolled end: %s - %s" % (effect, name), extra=str(cid or ""))
+    except Exception as exc:  # noqa: BLE001
+        out["error"] = str(exc)[:200]
+    return out
+
+
+def _s3_callend_cut(text: str, start: str, end: str, keep_end: bool) -> str:
+    """`text` with the span from `start` up to `end` taken out (the end kept, or a space)."""
+    if start in text:
+        head, _sep, rest = text.partition(start)
+        if end in rest:
+            return head + (end if keep_end else " ") + rest.split(end, 1)[1]
+    return text
+
+
+def s3_callend_angle(angle: Any, callend: Any) -> str:
+    """[s3-callend] A call whose end System 3 rolled: the angle's own ending - the ending
+    shelf's line, on each call road's wording - and, when the caller's wheel is the
+    painting's, the "still trying to shift a painting" offer give way to the running
+    order's rolled end, which is said once, plainly."""
+    a = str(angle or "")
+    ce = callend if isinstance(callend, dict) else {}
+    if not ce.get("planned"):
+        return a
+    a = _s3_callend_cut(a, " By the end, ", "Then back to the music. ", False)
+    a = _s3_callend_cut(a, " The call must END this way, arrived at honestly over the last two or three turns: ",
+                        " Then cut back to the record.", True)
+    a = _s3_callend_cut(a, " By the end of the call, ", " Format the caller's lines as", True)
+    if (ce.get("resolve") or {}).get("category") == "painting":
+        a = _s3_callend_cut(a, "THE PAIR ARE STILL TRYING TO SHIFT A PAINTING.",
+                            "One quick beat; never the whole call.", False)
+    says = " ".join(str(ce.get("says") or "").split())
+    return (" ".join(a.split()) + " HOW THIS CALL ENDS WAS ROLLED - " + (says + ". " if says else "")
+            + "The running order's last rows play it, turn by turn; whatever is said above about how the call "
+              "ends, or about a painting being offered, gives way to them.")
+
+
+def s3_callend_topic_turns(turns: Any, call_meta: Any) -> list[Any]:
+    """[s3-callend] The turns the topic contract grades: a call whose end System 3
+    rolled is graded without that end - the resolution, the chain and the rebuttal are
+    the roulette's, not the caller's subject - keeping the last turn, which the
+    contract already sets aside as the sign-off."""
+    rows = list(turns or [])
+    try:
+        ce = call_meta.get("callend") if isinstance(call_meta, dict) else None
+        k = int(ce.get("end_turns") or 0) if isinstance(ce, dict) and ce.get("planned") else 0
+        if k > 1 and len(rows) > k + 2:
+            return rows[:len(rows) - k] + rows[-1:]
+    except Exception:  # noqa: BLE001
+        pass
+    return rows
+
+
+def s3_callend_report(callend: Any, turns: Any, closed_by_words: bool) -> dict[str, Any]:
+    """[s3-callend] What call_flow_report says about a planned end, {} for any other call."""
+    wrap = (callend.get("wrap") if isinstance(callend, dict) else None) or {}
+    if not wrap.get("planned"):
+        return {}
+    last = str(turns[-1][0]) if turns else ""
+    return {"planned": True, "wrap": str(wrap.get("id") or ""), "wrap_seat": str(wrap.get("seat") or ""),
+            "closed_by": last, "seat_as_planned": bool(last and last == str(wrap.get("seat") or "")),
+            "sign_off": "spoken" if closed_by_words else "the planned WRAP CALL node",
+            "polite": bool(wrap.get("polite"))}
+
+
 def spoken_units(text: str) -> str:
     """Units the voice can SAY (#425): 'GB' comes out as letters on air;
     the pair should say gigabytes like people."""
@@ -64803,6 +65166,149 @@ def ballast_swap(slot: dict[str, Any], hour: str,
         return remember(True, "gave way to a record", made)
     except Exception:  # noqa: BLE001
         return {}                       # any doubt: the sheet stands
+
+
+# --- [s3-segment] THE SCHEDULED SEGMENT A LINE BELONGS TO ----------------------
+#
+# "every conversation should be chained as the "segment" per the station that
+# is scheduled with everything for that segment occuring within the section of
+# the messenger view" (the operator, 2026-09-28). The station's scheduled
+# segment is the running order's OCCURRENCE: the id _RADIO["sched_pos"]
+# carries, System2's slot ("hour-<ms>:<entry>") while System2 owns the clock,
+# the legacy walk's otherwise - the key the director's room is built on.
+# Nothing on the record named it (identity.schedule_occurrence_id empty on 276
+# of 276 conversations; no ledger or air-log row carried an entry), so the
+# director still attributes aired lines to its entries by their time window.
+#
+# It is taken when a line takes its PLACE in the script - its block, at commit
+# or at the page door - because that is the order the document, the Messenger
+# and the playout sequencer keep: measured over six live hours, stamped then a
+# segment never reopens walking the script in order; stamped when each line was
+# heard it would reopen 17 times (the air stepped back a block 35 times).
+_SEGMENT_SEEN: list[dict[str, Any]] = []     # the segments handed out, oldest first
+SEGMENT_SEEN_KEEP = 240
+
+
+def _segment_brief(pos: Any, slot: Any) -> dict[str, Any]:
+    """The published position as the ledger keeps it: the occurrence, its entry
+    on the sheet, the kind of segment, its name and its window."""
+    pos = pos if isinstance(pos, dict) else {}
+    slot = slot if isinstance(slot, dict) else {}
+    occ = str(pos.get("occurrence") or "")
+    if not occ:
+        return {}
+    # the entry published beside the position must be the same one
+    if slot and (str(slot.get("occurrence") or "") != occ if slot.get("occurrence")
+                 else str(slot.get("id") or "") != str(pos.get("slot_id") or "")):
+        slot = {}
+    try:
+        start = float(pos.get("started") or slot.get("start") or 0)
+    except (TypeError, ValueError):
+        start = 0.0
+    try:
+        ends = float(pos.get("deadline") or slot.get("deadline") or 0)
+        if not ends and start and slot.get("minutes"):
+            ends = start + max(0.25, float(slot.get("minutes") or 3)) * 60.0
+    except (TypeError, ValueError):
+        ends = 0.0
+    kind = str(slot.get("kind") or "")
+    try:
+        index = int(pos.get("index") or 0)
+    except (TypeError, ValueError):
+        index = 0
+    return {"id": occ[:120],
+            "template": str(pos.get("slot_id") or slot.get("template_id") or "")[:80],
+            "kind": kind[:40], "label": str(slot.get("label") or kind)[:80],
+            "start": round(start, 3), "ends": round(ends, 3),
+            "hour": str(pos.get("hour") or slot.get("hour_key") or "")[:40], "index": index,
+            "engine": ("system2" if pos.get("preset") == "system2" or slot.get("engine") == "system2"
+                       else "schedule")}
+
+
+def _segment_brief_slot(slot: Any) -> dict[str, Any]:
+    """One of System2's planned slots, as the ledger keeps a segment."""
+    if not isinstance(slot, dict) or not slot.get("id"):
+        return {}
+    try:
+        return {"id": str(slot["id"])[:120], "template": str(slot.get("template_id") or "")[:80],
+                "kind": str(slot.get("kind") or "")[:40],
+                "label": str(slot.get("label") or slot.get("kind") or "")[:80],
+                "start": round(float(slot.get("start") or 0), 3),
+                "ends": round(float(slot.get("deadline") or 0), 3),
+                "hour": str(slot.get("hour_key") or "")[:40], "index": int(slot.get("ordinal") or 0),
+                "engine": "system2"}
+    except (TypeError, ValueError):
+        return {}
+
+
+def _segment_seen_note(brief: dict[str, Any]) -> None:
+    if not brief or not brief.get("id"):
+        return
+    try:
+        if _SEGMENT_SEEN and _SEGMENT_SEEN[-1].get("id") == brief["id"]:
+            return
+        _SEGMENT_SEEN.append(dict(brief, seen=round(time.time(), 3)))
+        del _SEGMENT_SEEN[:-SEGMENT_SEEN_KEEP]
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def segment_on_air(at: float = 0.0) -> dict[str, Any]:
+    """[s3-segment] The scheduled segment that owned the air at `at` (now when
+    0): {id, template, kind, label, start, ends, hour, index, engine}, or {}
+    when the station runs no schedule or the moment cannot be answered.
+
+    Now is the engine's own published position (_RADIO["sched_pos"], which
+    System2's clock and the legacy walk write), refreshed from System2's clock
+    when its window has closed - current_slot_brief, the read made cheap for
+    exactly this (#1224). A moment already past is the segment the air was in
+    then: one this function handed out whose window holds it, else System2's
+    planned window. It never guesses a moment it cannot place. Never raises."""
+    try:
+        now = time.time()
+        t = float(at or 0.0) or now
+        runtime = globals().get("_system2")
+        try:
+            live = runtime() if runtime else None
+        except Exception:  # noqa: BLE001
+            live = None
+        s2 = live is not None and bool(getattr(live, "enabled", False))
+        if t >= now - 2.0:
+            pos = _RADIO.get("sched_pos") or {}
+            try:
+                ends = float((pos or {}).get("deadline") or 0)
+            except (TypeError, ValueError):
+                ends = 0.0
+            if s2 and (not (pos or {}).get("occurrence") or (ends and now >= ends)):
+                try:
+                    live.current_slot_brief()          # republishes sched_pos when it moved
+                except Exception:  # noqa: BLE001
+                    pass
+                pos = _RADIO.get("sched_pos") or {}
+            brief = _segment_brief(pos, _RADIO.get("sched_slot") or {})
+            _segment_seen_note(brief)
+            return brief
+        seen = list(_SEGMENT_SEEN)
+
+        def holds(row: dict[str, Any]) -> bool:
+            try:
+                return float(row.get("start") or 0) <= t < float(row.get("ends") or 0)
+            except (TypeError, ValueError):
+                return False
+        for row in reversed(seen):
+            if float(row.get("seen") or 0) <= t + 1.0 and holds(row):
+                return {k: v for k, v in row.items() if k != "seen"}
+        for row in reversed(seen):
+            if holds(row):
+                return {k: v for k, v in row.items() if k != "seen"}
+        if s2:
+            for hour in list(getattr(live, "_plans", None) or []):
+                for slot in (hour or {}).get("slots") or []:
+                    if float(slot.get("start") or 0) <= t < float(slot.get("deadline") or 0):
+                        return _segment_brief_slot(slot)
+    except Exception:  # noqa: BLE001
+        pass
+    return {}
 
 
 def _schedule_dispatch_occurrence() -> str:
@@ -98314,6 +98820,7 @@ def call_flow_report(script: Any, caller_name: str = "",
                      topic: str = "", source_script: Any = "",
                      speakerbox_text: str = "",
                      exclude_entry: Any = None,
+                     callend: Any = None,          # [s3-callend] the planned end (call_meta["callend"])
                      story: dict[str, Any] | None = None,
                      plot: dict[str, Any] | None = None,
                      soft_quality: bool = False,
@@ -98403,6 +98910,15 @@ def call_flow_report(script: Any, caller_name: str = "",
     closed = bool(turns and turns[-1][0] in ("A", "B", "D")
                   and re.search(r"\b(thank|thanks|goodbye|goodnight|"
                                 r"appreciate|take care)\b", close_text))
+    # [s3-callend] THE CALL'S END WAS ROLLED. A call System 3 planned with a WRAP CALL
+    # node ends the way its roulette said - "cuts them off", "puts them on hold forever",
+    # "that's the dial tone" - so the node, not a word list, is the sign-off: the last turn
+    # is a station seat, where the plan put the wrap. The caller's rebuttal is still the
+    # last word second to last (below). Unchanged for every call System 3 did not plan.
+    _wrap_plan = ((callend.get("wrap") if isinstance(callend, dict) else None) or {})
+    closed_by_words = closed
+    if _wrap_plan.get("planned") and turns and not closed:
+        closed = bool(turns[-1][0] in ("A", "B", "D", "S"))
     # A sign-off is not a resolution if the hosts spend the final two turns
     # talking after the caller's last contribution.  The audible arc must
     # return to the person on the line, let them land it, then close.
@@ -98593,6 +99109,7 @@ def call_flow_report(script: Any, caller_name: str = "",
         "collision_advisories": call_gate_collisions(soft),
         "story": str(_story.get("id") or ""),                     # #1039
         "plot": _plot_id,                                        # #1157
+        "callend": s3_callend_report(callend, turns, closed_by_words),   # [s3-callend]
     }
     if faults and not content_gate_enabled("call_contract"):
         content_gate_bypassed("call_contract", faults, script)
@@ -98653,6 +99170,7 @@ def call_entry_regrade(entry: dict[str, Any],
         active, caller_name, caller2_name,
         include_shelf=include_shelf,
         ended=str(meta.get("ended") or ""),                           # [s3-events]
+        callend=meta.get("callend"),                                  # [s3-callend] site-regrade
         topic=str(meta.get("topic") or ""), source_script=source,
         speakerbox_text=str(meta.get("speakerbox_text") or ""),
         exclude_entry=entry,
@@ -99776,6 +100294,7 @@ def _call_log_write_now(entry: dict[str, Any]) -> None:
         entry.setdefault("fingerprint", call_fingerprint(transcript))
         entry.setdefault("flow", call_flow_report(
             transcript, str(entry.get("name") or ""), include_shelf=False,
+            callend=entry.get("callend"),                             # [s3-callend] site-log
             topic=str(entry.get("topic") or ""),
             story=(entry.get("story")
                    if isinstance(entry.get("story"), dict) else None),
@@ -99933,6 +100452,7 @@ def call_line_transcript(turns: list[dict[str, Any]]) -> None:
             meta["flow"] = call_flow_report(
                 clean, str(_CALL_LIVE.get("who") or ""),
                 ended=str(meta.get("ended") or ""),                   # [s3-events]
+                callend=meta.get("callend"),                          # [s3-callend] site-live
                 include_shelf=False, topic=str(meta.get("topic") or ""),
                 speakerbox_text=str(meta.get("speakerbox_text") or ""),
                 story=(meta.get("story")
@@ -101134,6 +101654,12 @@ def call_ended(name: str, line_say: str, started: float,
     ran = max(0.0, ended - started)
     outcome = str(rule.get("text") or "")
     short = " ".join(outcome.split())
+    # [s3-callend] a call whose end System 3 rolled ended for THAT reason: the booth row and
+    # the call log say the roll (the ending shelf's line was cut from the call's prompt)
+    _s3_end = live["meta"].get("callend") if isinstance(live["meta"].get("callend"), dict) else {}
+    if _s3_end.get("planned") and _s3_end.get("says"):
+        outcome = "System 3: " + str(_s3_end["says"])
+        short = " ".join(outcome.split())
     if len(short) > 110:
         short = short[:107].rstrip(" ,.;—-") + "…"
     # #795: a call that produced ZERO aired turns did not happen on air —
@@ -108737,6 +109263,11 @@ async def dj_banter(track: dict[str, Any] | None = None,
             pipeline_log("drop", "the running order could not be rolled",
                          extra=("%s: %s" % (type(_exc).__name__, _exc))[:200])
             _beat_sheet, _dice_rolls = "", []
+        # [s3-callend] how this call ends was rolled: the angle's own ending gives way to the
+        # running order's (a call the roulette ended EARLY is the [s3-events] block's, below)
+        if (caller_name and isinstance(call_meta, dict) and isinstance(call_meta.get("callend"), dict)
+                and not call_meta.get("ended")):
+            angle = s3_callend_angle(angle, call_meta["callend"])
         # [s3-events] the roulette ended this call early: the angle's own ending (the
         # caller landing it, a host signing off) gives way to the running order's
         if caller_name and isinstance(call_meta, dict) and call_meta.get("ended"):
@@ -109151,6 +109682,7 @@ async def dj_banter(track: dict[str, Any] | None = None,
         _call_report = call_flow_report(
             script, caller_name, caller2_name,
             ended=str((call_meta or {}).get("ended") or ""),          # [s3-events]
+            callend=(call_meta or {}).get("callend"),                 # [s3-callend] site-banter
             topic=str((call_meta or {}).get("topic") or ""),
             speakerbox_text=str(
                 (call_meta or {}).get("speakerbox_text") or ""),
@@ -109190,8 +109722,8 @@ async def dj_banter(track: dict[str, Any] | None = None,
         # already pays for, with the contract in its prompt; the rewrite
         # itself is not refused for topic alone.
         try:
-            _topic_ad = topic_adherence(
-                _turns_seen, str((call_meta or {}).get("topic") or ""))
+            _topic_ad = topic_adherence(                              # [s3-callend] without the rolled end
+                s3_callend_topic_turns(_turns_seen, call_meta), str((call_meta or {}).get("topic") or ""))
         except Exception:  # noqa: BLE001
             _topic_ad = {}
         if _topic_ad.get("checked") and not _topic_ad.get("ok"):
@@ -109294,6 +109826,7 @@ async def dj_banter(track: dict[str, Any] | None = None,
                 _rw_report = call_flow_report(
                     rewritten, caller_name, caller2_name,
                     ended=str((call_meta or {}).get("ended") or ""),  # [s3-events]
+                    callend=(call_meta or {}).get("callend"),         # [s3-callend] site-rewrite
                     topic=str((call_meta or {}).get("topic") or ""),
                     speakerbox_text=str(
                         (call_meta or {}).get("speakerbox_text") or ""),
@@ -109363,8 +109896,8 @@ async def dj_banter(track: dict[str, Any] | None = None,
     # still show it after the shelf row has been taken and aired.
     if caller_name and isinstance(call_meta, dict):
         try:
-            _topic_final = topic_adherence(
-                banter_turns(script or "", caller_name, caller2_name),
+            _topic_final = topic_adherence(                           # [s3-callend] without the rolled end
+                s3_callend_topic_turns(banter_turns(script or "", caller_name, caller2_name), call_meta),
                 str(call_meta.get("topic") or ""))
             _topic_tc = {
                 "subject": topic_subject(str(call_meta.get("topic") or "")),
@@ -136980,6 +137513,21 @@ def segment_inspect(block: int) -> dict[str, Any]:
     except Exception as exc:  # noqa: BLE001
         out["slot"] = {"preset": "", "candidates": [], "slot_id": "",
                        "say": "the sheet could not be read: %r" % (exc,)}
+    # [s3-segment] ...AND THE ONE ENTRY IT WAS, when the ledger recorded it: a
+    # block written since the segment stamp names the scheduled segment that
+    # owned the air when it took its place in the script, so "one of these"
+    # above becomes that one.
+    try:
+        _seg = first.get("segment") if isinstance(first.get("segment"), dict) else None
+        out["segment"] = _seg
+        if _seg and isinstance(out.get("slot"), dict):
+            out["slot"]["slot_id"] = str(_seg.get("template") or out["slot"].get("slot_id") or "")
+            out["slot"]["occurrence"] = str(_seg.get("id") or "")
+            out["slot"]["say"] = ("the ledger recorded the scheduled segment on air when this "
+                                  "took its place in the script: %s (%s)"
+                                  % (_seg.get("label") or "?", _seg.get("kind") or "?"))
+    except Exception:  # noqa: BLE001
+        pass
     # THE ADMITTED PLAYBACK OCCURRENCE, when the gate saw this segment go
     # out. The gate keeps its cues, so a block is linked to an occurrence
     # by the line ids it admitted - and, for a welded round whose cue
@@ -140873,6 +141421,9 @@ _SPARK_ASSETS = {
     "sfx-tv.js": "application/javascript; charset=utf-8",
     "sfx-tv.css": "text/css; charset=utf-8",
     "wall-transition.js": "application/javascript; charset=utf-8",
+    # [autoscroll-rule] the one scroll rule: the panel - and the tablet's
+    # views, which run inside it - load the desktop's own file from here.
+    "pine-stick.js": "application/javascript; charset=utf-8",
     "pinebox.png": "image/png",
 }
 
@@ -144265,6 +144816,7 @@ def review_queue_regrade(row: dict[str, Any], match: Any = None) -> Any:
             str(ctx.get("caller2_name") or ""),
             ended=str(meta.get("ended") or ""),                       # [s3-events]
             include_shelf=True,
+            callend=meta.get("callend"),                              # [s3-callend] site-review
             topic=str(meta.get("topic") or ""),
             # The tint-fidelity leg only binds when the words that would
             # air ARE the tinted ones; otherwise there is no rewrite to be
@@ -155695,6 +156247,9 @@ _PUBLIC_GET = {"/healthz", "/api/dj", "/api/dj/voice", "/api/dj/reacts",
                "/spark/asset/sfx-tv.js",
                "/spark/asset/sfx-tv.css",
                "/spark/asset/slideshow.css",   # #1415,
+               # [autoscroll-rule] the one scroll rule the tune page's
+               # feed follows by - public client code, named exactly.
+               "/spark/asset/pine-stick.js",
                # #1354: the camera, for a listener who has been
                # ticked. Both routes decide for themselves from the
                # ?t= token; being on this list only means they are
@@ -175410,6 +175965,7 @@ async def comfy_workshop_render(
 async def _comfy_workshop_render_payload(payload: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="Expected an object")
+    payload = h3_prompts_dress(payload)        # [h3-prompts] an hourly host / gallery render: the hour's preset
     mode = str(payload.get("mode") or "text").lower()
     if mode not in comfy_workshop.MODES:
         raise HTTPException(status_code=400, detail="Unknown Workshop mode")
@@ -175481,7 +176037,7 @@ async def _comfy_workshop_render_payload(payload: dict[str, Any]) -> dict[str, A
     step_count = (comfy_workshop.clamp_steps(payload.get("steps_override"))
                   if payload.get("steps_override") is not None else int(_prof["steps"]))
     noise_seed = comfy_workshop.render_seed(payload.get("seed"))
-    final_prompt = comfy_workshop.compose_prompt(
+    final_prompt = h3_prompts_compose(payload.get("h3_brief"),     # [h3-prompts] a preset's audio / constraints
         prompt, speech, media_kind, mode, seconds=frame_count / 24.0,   # [h3-free-wins] timed shots
         purpose=purpose, style=payload.get("style"))                   # [h3-brief] one style term per road
     try:
@@ -175500,6 +176056,9 @@ async def _comfy_workshop_render_payload(payload: dict[str, Any]) -> dict[str, A
                       "variant_of": str(
                           payload.get("variant_of") or payload.get("source_generation") or "")[:120],
                       "air_it": bool(payload.get("air_it")),
+                      **({"hourly": True} if payload.get("hourly") else {}),          # [h3-prompts]
+                      **({"h3_prompts": payload["h3_prompts"]}
+                         if isinstance(payload.get("h3_prompts"), dict) else {}),
                       "frames": frame_count, "steps": step_count,
                       "quality": _prof["preset"], "size": "%dx%d" % (_prof["width"], _prof["height"]),   # [h3-quality]
                       "seed": noise_seed, "at_share": at_share,
@@ -175909,8 +176468,11 @@ def h3_hourly_ad_prompt() -> str:
     now = _RADIO.get("now") or {}
     record = " ".join(str(now.get(key) or "") for key in ("title", "artist"))
     subject = " ".join(reversed(recent)) or record or "the live Pine Box FM show"
-    return ("Make a short, funny but professional Pine Box FM sponsor stinger "
-            "that naturally follows this hour's conversation: " + subject[:520])
+    # [h3-prompts] in the words of the hour's preset: the one pinned for the
+    # next hour, else the gallery's dice (System 3 rolls a saved preset), else
+    # the active one - "Default" is the brief this always was. The roads take
+    # their directions from the same hour (h3_prompts_hour_for).
+    return h3_prompts_hour(subject[:520], " ".join(record.split()))["goal"]
 
 
 async def h3_hourly_ad_clock() -> None:
@@ -176193,6 +176755,825 @@ async def h3_capacity_keeper() -> None:
         except Exception as exc:  # noqa: BLE001
             pipeline_log("gpu", "H3 reserve keeper: %s" % type(exc).__name__)
         await asyncio.sleep(90)
+
+
+# --- [h3-prompts] THE HOURLY PROMPTS: PRESETS THE OPERATOR SAVES, CYCLES, ROLLS --
+#
+# "Put an option here of a P for prompt and whenever I click it or tap it it
+#  takes me to a screen where I'm able to modify the prompts that are used for
+#  the hourly generation. I want to be able to save and cycle through presets
+#  ... And then I also want a dice icon that if I click it, it actually
+#  shuffles between the prompts that I have saved ... I want to be able to also
+#  be able to see the prompts used with a video on the main gallery popup"
+#  (operator, 2026-09-28).
+#
+# A preset is every word the hourly H3 render is told: the brief (`goal` -
+# {conversation} is the hour's talk, {record} the record on air), a direction
+# for each road the hour can take (`clip`: a dialogue clip is the reference,
+# `gallery`: a gallery picture is, `host`: the host's LoRA presents - {goal} is
+# the brief, filled), the line spoken (blank: pulled out of the brief, as it
+# always was), one style term, and the audio direction and constraints (blank:
+# the gear's brief). Today's words are the first preset, "Default", so nothing
+# changes until the operator acts. Each hour takes the preset pinned for it
+# ("use for the next hour"), else - the gallery's dice on - the one System 3
+# rolls among the saved presets (POOLS1 row h3.hourly_preset: the desk weights
+# a preset or switches it off; the roll is recorded like every station roll),
+# else the active one. The hour lands in the store's history; the words ride
+# the video's own generation row (`h3_prompts`), shown under the video.
+#
+# Nothing here adds or moves a render - a second H3 render in one boot is what
+# cooks the box (#1285); it only changes what the one hourly render is told.
+# The store is read from memory without a lock; every write happens in a
+# worker thread under _H3_PROMPTS_LOCK and lands atomically.
+_H3_PROMPTS_FILE = DATA_DIR / "h3_prompt_presets.json"
+_H3_PROMPTS_LOCK = RLock()                      # worker threads only - never on the event loop
+_H3_PROMPTS_MEM: list[Any] = [None]             # the store as last read or written, swapped whole
+_H3_PROMPTS_HOURS: list[dict[str, Any]] = []    # the hours this process resolved, newest last
+_H3_PROMPTS_DRESSED: dict[str, list[float]] = {}   # hour -> [renders dressed, when last]
+H3_PROMPTS_FIELDS = ("goal", "clip", "gallery", "host", "speech", "style", "constraints", "audio_direction")
+H3_PROMPTS_ROADS = ("clip", "gallery", "host")
+H3_PROMPTS_LIMITS = {"name": 60, "goal": 1200, "clip": 1800, "gallery": 1800, "host": 1800,
+                     "speech": 700, "style": 120, "constraints": 400, "audio_direction": 400}
+H3_PROMPTS_DEFAULT = {
+    "goal": ("Make a short, funny but professional Pine Box FM sponsor stinger "
+             "that naturally follows this hour's conversation: {conversation}"),
+    "clip": ("Create a polished short Pine Box advertisement from the reference "
+             "performance. The person or people on screen must {goal}. Keep expressive "
+             "natural motion, direct-to-camera commercial energy, and clean synchronized "
+             "dialogue. No captions or logos."),
+    "gallery": ("Create a Pine Box FM stinger using the supplied image. Natural motion and "
+                "synchronized spoken dialogue. No captions or logos. {goal}"),
+    "host": ("The Pine Box host presents a Pine Box FM stinger at the station's desk, "
+             "direct to camera, in warm late-night studio light. {goal}"),
+    "speech": "", "style": "", "constraints": "", "audio_direction": ""}
+H3_PROMPTS_MOST = 60                  # saved presets
+H3_PROMPTS_HISTORY_KEEP = 168         # a week of hours
+H3_PROMPTS_FIND_S = 86400.0           # a queued hourly render finds its hour within a day
+H3_PROMPTS_DICE_KEY = "h3.hourly_preset"
+H3_PROMPTS_DICE_LABEL = "which saved prompt preset the hourly H3 video is told (the gallery's dice)"
+_H3_PROMPTS_ID = re.compile(r"[A-Za-z0-9_-]{1,40}")
+
+
+def _h3_prompts_text(value: Any, field: str) -> str:
+    """One field as the store keeps it: text, trimmed, within its limit. The
+    name and the one-line fields are one line; a brief or a direction keeps
+    its line breaks (compose_prompt joins them)."""
+    text = str(value if value is not None else "")
+    if field in ("name", "speech", "style", "constraints", "audio_direction"):
+        text = " ".join(text.split())
+    else:
+        text = "\n".join(" ".join(line.split()) for line in text.replace("\r", "").split("\n")).strip()
+    return text[:H3_PROMPTS_LIMITS.get(field, 600)]
+
+
+def h3_prompts_fields(preset: Any) -> dict[str, str]:
+    """[h3-prompts] A preset's words, clean. A blank brief or road direction is
+    the Default's - a road always has words; the rest may stay blank."""
+    got = preset if isinstance(preset, dict) else {}
+    out = {field: _h3_prompts_text(got.get(field, ""), field) for field in H3_PROMPTS_FIELDS}
+    for field in ("goal",) + H3_PROMPTS_ROADS:
+        if not out[field]:
+            out[field] = H3_PROMPTS_DEFAULT[field]
+    return out
+
+
+def h3_prompts_fill(template: Any, **values: Any) -> str:
+    """The template with its {placeholders} filled. Plain replacement, so a
+    brace the operator types is only ever text."""
+    out = str(template or "")
+    for key, value in values.items():
+        out = out.replace("{" + key + "}", str(value or ""))
+    return out.strip()
+
+
+def _h3_prompts_stamp(value: Any, default: float) -> float:
+    try:
+        return round(float(value), 3)
+    except (TypeError, ValueError):
+        return round(default, 3)
+
+
+def _h3_prompts_preset(raw: Any, pid: str = "") -> dict[str, Any]:
+    """One stored preset: an id, a name, its words, when made and changed."""
+    got = raw if isinstance(raw, dict) else {}
+    now = time.time()
+    want = str(pid or got.get("id") or "")
+    out: dict[str, Any] = {"id": want if _H3_PROMPTS_ID.fullmatch(want) else "p-" + uuid.uuid4().hex[:10],
+                           "name": _h3_prompts_text(got.get("name"), "name") or "Untitled"}
+    out.update(h3_prompts_fields(got))
+    out["created_at"] = _h3_prompts_stamp(got.get("created_at"), now)
+    out["updated_at"] = _h3_prompts_stamp(got.get("updated_at"), out["created_at"])
+    return out
+
+
+def _h3_prompts_seed() -> dict[str, Any]:
+    """Today's words, as the first preset: nothing changes until the operator acts."""
+    return {"version": 1, "rev": 0, "active": "default", "dice": False, "next": None,
+            "presets": [_h3_prompts_preset(dict(H3_PROMPTS_DEFAULT, name="Default"), "default")],
+            "history": []}
+
+
+def _h3_prompts_pin(raw: Any) -> dict[str, Any] | None:
+    """The words pinned for the next hour, clean - or None."""
+    if not isinstance(raw, dict) or not isinstance(raw.get("preset"), dict):
+        return None
+    pid = str(raw.get("id") or "")
+    return {"id": pid if _H3_PROMPTS_ID.fullmatch(pid) else "n-" + uuid.uuid4().hex[:10],
+            "at": _h3_prompts_stamp(raw.get("at"), time.time()),
+            "from": str(raw.get("from") or "")[:40], "prompt_id": str(raw.get("prompt_id") or "")[:120],
+            "preset_id": str(raw.get("preset_id") or "")[:40],
+            "preset": _h3_prompts_preset(raw["preset"], str(raw["preset"].get("id") or "pinned"))}
+
+
+def _h3_prompts_normalise(got: Any) -> dict[str, Any]:
+    """The store as read: every preset clean, ids and names unique, the active
+    one among them, at least one preset (the Default when none is left)."""
+    store = _h3_prompts_seed()
+    if not isinstance(got, dict):
+        return store
+    presets: list[dict[str, Any]] = []
+    ids: set[str] = set()
+    names: set[str] = set()
+    for raw in list(got.get("presets") or [])[:H3_PROMPTS_MOST]:
+        if not isinstance(raw, dict):
+            continue
+        one = _h3_prompts_preset(raw)
+        if one["id"] in ids:
+            one["id"] = "p-" + uuid.uuid4().hex[:10]
+        base, n = one["name"], 2
+        while one["name"].lower() in names:
+            one["name"] = ("%s (%d)" % (base, n))[:H3_PROMPTS_LIMITS["name"]]
+            n += 1
+        ids.add(one["id"])
+        names.add(one["name"].lower())
+        presets.append(one)
+    if presets:
+        store["presets"] = presets
+    active = str(got.get("active") or "")
+    store["active"] = active if any(p["id"] == active for p in store["presets"]) else store["presets"][0]["id"]
+    store["dice"] = bool(got.get("dice"))
+    store["next"] = _h3_prompts_pin(got.get("next"))
+    store["history"] = [h for h in list(got.get("history") or []) if isinstance(h, dict)][-H3_PROMPTS_HISTORY_KEEP:]
+    try:
+        store["rev"] = max(0, int(got.get("rev") or 0))
+    except (TypeError, ValueError):
+        store["rev"] = 0
+    return store
+
+
+def h3_prompts_load(fresh: bool = False) -> dict[str, Any]:
+    """[h3-prompts] The store, read from disk once - in a worker thread (the
+    startup hook and every door call it through asyncio.to_thread)."""
+    with _H3_PROMPTS_LOCK:
+        if isinstance(_H3_PROMPTS_MEM[0], dict) and not fresh:
+            return _H3_PROMPTS_MEM[0]
+        store = _h3_prompts_seed()
+        try:
+            store = _h3_prompts_normalise(json.loads(_H3_PROMPTS_FILE.read_text(encoding="utf-8")))
+        except FileNotFoundError:
+            pass
+        except Exception as exc:  # noqa: BLE001
+            pipeline_log("ads", "hourly H3 prompt presets unreadable (%s): the Default preset stands in; "
+                                "the file is kept beside it as .unreadable" % type(exc).__name__)
+            try:
+                shutil.copyfile(_H3_PROMPTS_FILE, _H3_PROMPTS_FILE.with_name(_H3_PROMPTS_FILE.name + ".unreadable"))
+            except OSError:
+                pass
+        _H3_PROMPTS_MEM[0] = store
+        return store
+
+
+def _h3_prompts_write(store: dict[str, Any]) -> dict[str, Any]:
+    """The whole store, atomically: a temporary file, then a rename. Under the lock."""
+    store["rev"] = int(store.get("rev") or 0) + 1
+    store["saved_at"] = round(time.time(), 3)
+    tmp = _H3_PROMPTS_FILE.with_name(_H3_PROMPTS_FILE.name + ".tmp")
+    tmp.write_text(json.dumps(store, indent=1), encoding="utf-8")
+    os.replace(tmp, _H3_PROMPTS_FILE)
+    _H3_PROMPTS_MEM[0] = store
+    return store
+
+
+def h3_prompts_change(fn: Any) -> dict[str, Any]:
+    """[h3-prompts] Change the store: `fn` edits a copy, the copy is written and
+    becomes the store (an error in `fn` writes nothing). A worker thread, under
+    the lock - never on the event loop."""
+    with _H3_PROMPTS_LOCK:
+        store = copy.deepcopy(h3_prompts_load())
+        fn(store)
+        return _h3_prompts_write(store)
+
+
+def _h3_prompts_offloop(fn: Any, *args: Any) -> None:
+    """Hand a store write to a worker thread when called on the event loop; run
+    it here when there is no loop in this thread (a worker, a test)."""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        fn(*args)
+        return
+    loop.run_in_executor(None, fn, *args)
+
+
+def h3_prompts_desk() -> dict[str, Any] | None:
+    """The POOLS1 row the dice tabled for the presets, as System 3's desk holds
+    it now (read-only) - None until the first roll has tabled it."""
+    getter = globals().get("_system3")
+    try:
+        config = getter().config if callable(getter) else {}
+    except Exception:  # noqa: BLE001
+        return None
+    for table in (config or {}).get("tables") or []:
+        if not isinstance(table, dict) or table.get("family") != "POOL" or table.get("enabled") is False:
+            continue
+        for cat in table.get("categories") or []:
+            if isinstance(cat, dict) and cat.get("id") == H3_PROMPTS_DICE_KEY:
+                return cat
+    return None
+
+
+def h3_prompts_weights(presets: list[dict[str, Any]], desk: dict[str, Any] | None) -> list[float]:
+    """Each preset's weight on the desk's row: a preset switched off there (or at
+    weight 0) sits out; one the desk has not seen - saved since the row was
+    tabled - rides at weight 1, as the dice door weighs any option it has not
+    seen."""
+    items = {" ".join(str(i.get("text") or "").split()): i
+             for i in (desk or {}).get("items") or [] if isinstance(i, dict)}
+    out = []
+    for preset in presets:
+        item = items.get(" ".join(str(preset.get("name") or "").split()))
+        if item is None:
+            out.append(1.0)
+        elif item.get("enabled") is False:
+            out.append(0.0)
+        else:
+            try:
+                out.append(max(0.0, float(item.get("weight", 1.0) or 0)))
+            except (TypeError, ValueError):
+                out.append(1.0)
+    return out
+
+
+def h3_prompts_roll(presets: list[dict[str, Any]], active: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    """[h3-prompts] The gallery's dice: System 3 rolls which saved preset this
+    hour is told. The first roll tables the presets as a POOLS1 row
+    (h3.hourly_preset); the roll is System 3's own record, in the station's
+    rolls. With System 3 off the station rolls its own, evenly."""
+    if len(presets) < 2:
+        return active, {"by": "none", "why": "one saved preset - nothing to shuffle",
+                        "picked": str(active.get("name") or ""), "index": 1, "of": 1}
+    weights = [1.0] * len(presets)
+    if _s3_dice_live():
+        s3_pool(H3_PROMPTS_DICE_KEY, [p["name"] for p in presets], H3_PROMPTS_DICE_LABEL)
+        weights = h3_prompts_weights(presets, h3_prompts_desk())
+    cands = [(p, w) for p, w in zip(presets, weights) if w > 0]
+    if not cands:
+        return active, {"by": "desk", "why": "every preset is switched off on System 3's desk - the active one",
+                        "picked": str(active.get("name") or ""), "index": 0, "of": 0}
+    labels = [str(p["name"]) for p, _w in cands]
+    k = s3_weighted(H3_PROMPTS_DICE_KEY, labels, [w for _p, w in cands], H3_PROMPTS_DICE_LABEL)
+    k = k if isinstance(k, int) and 0 <= k < len(cands) else 0
+    rec = _s3_sfx_rolled(H3_PROMPTS_DICE_KEY, labels[k], k)
+    return cands[k][0], {"by": "system3" if rec else "station", "key": H3_PROMPTS_DICE_KEY,
+                         "picked": labels[k], "index": k + 1, "of": len(cands),
+                         "dice": rec.get("dice"), "u": rec.get("u"),
+                         "candidates": labels[:24], "weights": [round(w, 3) for _p, w in cands][:24]}
+
+
+def h3_prompts_how(entry: Any) -> str:
+    """How an hour came by its preset, in words."""
+    got = entry if isinstance(entry, dict) else {}
+    roll = got.get("roll") if isinstance(got.get("roll"), dict) else {}
+    if got.get("how") == "next":
+        return "pinned for the hour"
+    if got.get("how") == "dice":
+        if roll.get("by") == "system3":
+            return "rolled by System 3: d100 %s, %s of %s" % (roll.get("dice"), roll.get("index"), roll.get("of"))
+        if roll.get("by") == "station":
+            return "rolled by the station (System 3 off): %s of %s" % (roll.get("index"), roll.get("of"))
+        return "dice on, " + str(roll.get("why") or "no roll")
+    return "the active preset"
+
+
+def h3_prompts_hour(conversation: str, record: str = "") -> dict[str, Any]:
+    """[h3-prompts] This hour's preset, and its brief filled: the one pinned for
+    the next hour, else the dice's roll (the gallery's dice on), else the active
+    one. The hourly render calls this on the event loop (h3_hourly_ad_prompt):
+    it reads the store from memory and never takes the lock; the hour's record
+    is written off the loop."""
+    store = _H3_PROMPTS_MEM[0] if isinstance(_H3_PROMPTS_MEM[0], dict) else None
+    if store is None:              # the startup load has not landed: never read the disk on the loop
+        pipeline_log("ads", "hourly H3 prompts: the presets are not loaded yet - the Default preset's words")
+        store = _h3_prompts_seed()
+    presets = list(store.get("presets") or []) or _h3_prompts_seed()["presets"]
+    active = next((p for p in presets if p.get("id") == store.get("active")), presets[0])
+    pin = store.get("next") if isinstance(store.get("next"), dict) else None
+    roll = None
+    if pin and isinstance(pin.get("preset"), dict):
+        how = "next"
+        preset = next((p for p in presets if pin.get("preset_id") and p.get("id") == pin.get("preset_id")),
+                      pin["preset"])
+    elif store.get("dice"):
+        how = "dice"
+        preset, roll = h3_prompts_roll(presets, active)
+    else:
+        how, preset = "active", active
+    fields = h3_prompts_fields(preset)
+    goal = (h3_prompts_fill(fields["goal"], conversation=conversation, record=record)
+            or h3_prompts_fill(H3_PROMPTS_DEFAULT["goal"], conversation=conversation, record=record))
+    entry = {"hour": "h3h-" + uuid.uuid4().hex[:12], "at": round(time.time(), 3),
+             "marker": time.strftime("%Y%m%d%H"), "how": how,
+             "preset": {"id": str(preset.get("id") or ""), "name": str(preset.get("name") or "")},
+             "roll": roll, "pin": str((pin or {}).get("id") or "") if how == "next" else "",
+             "fields": fields, "conversation": str(conversation or "")[:600], "record": str(record or "")[:200],
+             "goal": goal}
+    _H3_PROMPTS_HOURS.append(entry)
+    del _H3_PROMPTS_HOURS[:-24]
+    _h3_prompts_offloop(h3_prompts_commit_hour, dict(entry))
+    pipeline_log("ads", "hourly H3 prompts: %s - %s" % (entry["preset"]["name"] or "?", h3_prompts_how(entry)))
+    return entry
+
+
+def h3_prompts_commit_hour(entry: dict[str, Any]) -> None:
+    """[h3-prompts] The hour, into the store's history; a pin it used is spent.
+    A worker thread (the loop hands it over)."""
+    def fn(store: dict[str, Any]) -> None:
+        hours = [h for h in store.get("history") or [] if h.get("hour") != entry.get("hour")]
+        taken = _H3_PROMPTS_DRESSED.get(str(entry.get("hour") or ""))
+        if taken:                                    # a render took the hour before this write
+            entry["dressed"], entry["dressed_at"] = int(taken[0]), round(float(taken[1]), 6)
+        hours.append(entry)
+        store["history"] = hours[-H3_PROMPTS_HISTORY_KEEP:]
+        pin = store.get("next")
+        if entry.get("pin") and isinstance(pin, dict) and pin.get("id") == entry["pin"]:
+            store["next"] = None
+    try:
+        h3_prompts_change(fn)
+    except Exception as exc:  # noqa: BLE001
+        pipeline_log("ads", "hourly H3 prompts: the hour's record was not written (%s)" % type(exc).__name__)
+
+
+def h3_prompts_commit_dressed(hour: str, count: int, at: float) -> None:
+    """[h3-prompts] A render took the hour's words: the count survives a restart,
+    so a later render with the same brief finds its own hour. A worker thread."""
+    def fn(store: dict[str, Any]) -> None:
+        for entry in store.get("history") or []:
+            if entry.get("hour") == hour:
+                entry["dressed"], entry["dressed_at"] = int(count), round(float(at), 6)
+    try:
+        h3_prompts_change(fn)
+    except Exception as exc:  # noqa: BLE001
+        pipeline_log("ads", "hourly H3 prompts: a render's claim was not written (%s)" % type(exc).__name__)
+
+
+def h3_prompts_hour_for(text: Any, exact: bool = False) -> dict[str, Any] | None:
+    """[h3-prompts] Which hour an hourly render belongs to, by its brief: the clip
+    road hands the brief itself (exact); a queued host or gallery render's
+    direction ends with it. Of the hours within a day whose brief fits, the
+    newest for the clip road (it was resolved a moment ago); for a queued one
+    the oldest no render has taken yet - the queue is first in, first out -
+    else the one taken last (a retried render). Memory only, no lock."""
+    words = str(text or "")
+    if not words:
+        return None
+    store = _H3_PROMPTS_MEM[0] if isinstance(_H3_PROMPTS_MEM[0], dict) else {}
+    now = time.time()
+    fits: dict[str, dict[str, Any]] = {}
+    for entry in list(store.get("history") or []) + list(_H3_PROMPTS_HOURS):
+        goal = str(entry.get("goal") or "") if isinstance(entry, dict) else ""
+        if not goal or now - _h3_prompts_stamp(entry.get("at"), 0.0) > H3_PROMPTS_FIND_S:
+            continue
+        if (words == goal) if exact else words.endswith(goal):
+            fits[str(entry.get("hour") or "")] = entry
+    if not fits:
+        return None
+    ordered = sorted(fits.values(), key=lambda e: _h3_prompts_stamp(e.get("at"), 0.0))
+    if exact:
+        return ordered[-1]
+
+    def taken(entry: dict[str, Any]) -> list[float]:
+        mine = _H3_PROMPTS_DRESSED.get(str(entry.get("hour") or ""))
+        return mine or [float(entry.get("dressed") or 0), _h3_prompts_stamp(entry.get("dressed_at"), 0.0)]
+    fresh = [e for e in ordered if not taken(e)[0]]
+    return fresh[0] if fresh else max(ordered, key=lambda e: taken(e)[1])
+
+
+def h3_prompts_claim(entry: dict[str, Any]) -> None:
+    """A render took this hour's words (on the loop; the count is written off it)."""
+    hour = str(entry.get("hour") or "")
+    if not hour:
+        return
+    was = _H3_PROMPTS_DRESSED.get(hour) or [float(entry.get("dressed") or 0), 0.0]
+    _H3_PROMPTS_DRESSED[hour] = [was[0] + 1, time.time()]
+    while len(_H3_PROMPTS_DRESSED) > 96:
+        _H3_PROMPTS_DRESSED.pop(next(iter(_H3_PROMPTS_DRESSED)))
+    _h3_prompts_offloop(h3_prompts_commit_dressed, hour, int(_H3_PROMPTS_DRESSED[hour][0]),
+                        _H3_PROMPTS_DRESSED[hour][1])
+
+
+def h3_prompts_words(hour: dict[str, Any], road: str, speech: str = "") -> dict[str, Any]:
+    """[h3-prompts] What one road of the hour is told - the direction, the line,
+    the style, the audio direction and constraints - and so the record of it
+    that rides the render's generation row (`h3_prompts`)."""
+    fields = h3_prompts_fields(hour.get("fields"))
+    road = road if road in H3_PROMPTS_ROADS else "clip"
+    values = {"conversation": str(hour.get("conversation") or ""), "record": str(hour.get("record") or ""),
+              "goal": str(hour.get("goal") or "")}
+    line = h3_prompts_fill(fields["speech"], **values) if fields["speech"] else str(speech or "")
+    return {"hour": str(hour.get("hour") or ""), "marker": hour.get("marker"), "at": hour.get("at"),
+            "how": hour.get("how"), "preset": dict(hour.get("preset") or {}), "roll": hour.get("roll"),
+            "road": road, "fields": fields, "conversation": values["conversation"],
+            "record": values["record"], "goal": values["goal"],
+            "direction": h3_prompts_fill(fields[road], **values)[:1800] or values["goal"],
+            "speech": " ".join(line.split())[:700], "style": fields["style"],
+            "constraints": fields["constraints"], "audio_direction": fields["audio_direction"]}
+
+
+def h3_prompts_payload_keys(words: dict[str, Any] | None) -> dict[str, Any]:
+    """The keys a render payload carries for the hour's words: the style term,
+    the audio direction and constraints (h3_prompts_compose), and the record."""
+    if not isinstance(words, dict):
+        return {}
+    out: dict[str, Any] = {"h3_prompts": words}
+    if words.get("style"):
+        out["style"] = words["style"]
+    brief = {k: words[k] for k in ("constraints", "audio_direction") if words.get(k)}
+    if brief:
+        out["h3_brief"] = brief
+    return out
+
+
+def h3_prompts_dress(payload: Any) -> Any:
+    """[h3-prompts] A render the hourly door queued for the host's or a gallery
+    picture's road takes the hour's preset at dispatch: that road's direction,
+    the line, style, audio direction and constraints - and the record of them.
+    A payload already dressed (the clip road dresses itself in
+    voice_ad_render), or not hourly, or whose hour is not found, passes as it
+    is."""
+    if not isinstance(payload, dict) or not payload.get("hourly") or payload.get("h3_prompts"):
+        return payload
+    hour = h3_prompts_hour_for(payload.get("prompt"))
+    if hour is None:
+        return payload
+    road = ("host" if str(payload.get("mode") or "") == "text"
+            else "gallery" if str(payload.get("source_type") or "") == "gallery" else "clip")
+    words = h3_prompts_words(hour, road, str(payload.get("speech") or ""))
+    h3_prompts_claim(hour)
+    out = dict(payload)
+    out["prompt"] = words["direction"]
+    out["speech"] = words["speech"]
+    out.update(h3_prompts_payload_keys(words))
+    return out
+
+
+def h3_prompts_compose(brief: Any, *args: Any, **kwargs: Any) -> str:
+    """[h3-prompts] compose_prompt, with a preset's own audio direction and
+    constraints in place of the gear's brief for this one prompt. Synchronous,
+    on the event loop: nothing else reads the brief while it is lent."""
+    over = ({k: " ".join(str(brief.get(k) or "").split())[:400] for k in ("constraints", "audio_direction")}
+            if isinstance(brief, dict) else {})
+    over = {k: v for k, v in over.items() if v}
+    if not over:
+        return comfy_workshop.compose_prompt(*args, **kwargs)
+    kept = dict(comfy_workshop.BRIEF)
+    comfy_workshop.BRIEF.update(over)
+    try:
+        return comfy_workshop.compose_prompt(*args, **kwargs)
+    finally:
+        comfy_workshop.BRIEF.clear()
+        comfy_workshop.BRIEF.update(kept)
+
+
+def _h3_prompts_hour_view(entry: dict[str, Any]) -> dict[str, Any]:
+    return {"hour": entry.get("hour"), "at": entry.get("at"), "marker": entry.get("marker"),
+            "how": entry.get("how"), "how_words": h3_prompts_how(entry), "preset": entry.get("preset") or {},
+            "roll": entry.get("roll"), "goal": str(entry.get("goal") or "")[:1200],
+            "conversation": str(entry.get("conversation") or "")[:600],
+            "fields": entry.get("fields") if isinstance(entry.get("fields"), dict) else {}}
+
+
+def _h3_prompts_hours(store: dict[str, Any]) -> list[dict[str, Any]]:
+    """The store's hours and any this process resolved but has not written yet, oldest first."""
+    hours = [h for h in store.get("history") or [] if isinstance(h, dict)]
+    known = {h.get("hour") for h in hours}
+    return hours + [h for h in list(_H3_PROMPTS_HOURS) if h.get("hour") not in known]
+
+
+def h3_prompts_next_hour(store: dict[str, Any]) -> dict[str, Any]:
+    """What the next hour will be told, as far as it is known before its roll."""
+    presets = store["presets"]
+    active = next((p for p in presets if p["id"] == store.get("active")), presets[0])
+    pin = store.get("next")
+    if isinstance(pin, dict) and isinstance(pin.get("preset"), dict):
+        name = next((p["name"] for p in presets if pin.get("preset_id") and p["id"] == pin.get("preset_id")),
+                    str(pin["preset"].get("name") or "pinned words"))
+        return {"how": "next", "preset": {"id": pin.get("preset_id") or "", "name": name},
+                "words": '"%s", pinned for the next hour' % name}
+    if store.get("dice") and len(presets) > 1:
+        return {"how": "dice", "preset": None,
+                "words": "rolls at the hour among the %d saved presets" % len(presets)}
+    return {"how": "active", "preset": {"id": active["id"], "name": active["name"]},
+            "words": '"%s", the active preset' % active["name"]}
+
+
+def h3_prompts_view(summary: bool = False) -> dict[str, Any]:
+    """[h3-prompts] What the gallery's P and dice show, and the prompts screen:
+    the presets, the active one, the dice, the pin, the next and the last hour,
+    each preset's odds on the desk. A worker thread (it may read the disk)."""
+    store = h3_prompts_load()
+    presets = store["presets"]
+    active = next((p for p in presets if p["id"] == store["active"]), presets[0])
+    hours = _h3_prompts_hours(store)
+    pin = store.get("next")
+    out: dict[str, Any] = {
+        "rev": store.get("rev", 0), "active": active["id"], "active_name": active["name"],
+        "dice": bool(store.get("dice")), "dice_live": _s3_dice_live(), "count": len(presets),
+        "next": ({"id": pin.get("id"), "at": pin.get("at"), "from": pin.get("from"),
+                  "prompt_id": pin.get("prompt_id"), "preset_id": pin.get("preset_id"),
+                  "name": str((pin.get("preset") or {}).get("name") or "")} if isinstance(pin, dict) else None),
+        "next_hour": h3_prompts_next_hour(store),
+        "last_hour": _h3_prompts_hour_view(hours[-1]) if hours else None,
+        "dice_key": H3_PROMPTS_DICE_KEY}
+    if summary:
+        return out
+    live = out["dice_live"]
+    desk = h3_prompts_desk() if live else None
+    weights = h3_prompts_weights(presets, desk) if live else [1.0] * len(presets)
+    total = sum(weights)
+    on_desk = {" ".join(str(i.get("text") or "").split()) for i in (desk or {}).get("items") or []
+               if isinstance(i, dict)}
+    out.update({
+        "presets": presets,
+        "odds": [{"id": p["id"], "weight": round(w, 3), "share": round(100.0 * w / total, 1) if total > 0 else 0.0,
+                  "on_desk": p["name"] in on_desk, "off": w <= 0} for p, w in zip(presets, weights)],
+        "desk_tabled": desk is not None, "defaults": dict(H3_PROMPTS_DEFAULT),
+        "fields": list(H3_PROMPTS_FIELDS), "limits": dict(H3_PROMPTS_LIMITS), "most": H3_PROMPTS_MOST,
+        "placeholders": {"conversation": "the hour's talk - the last lines said on air",
+                         "record": "the record on air", "goal": "the brief, filled"},
+        "hours": [_h3_prompts_hour_view(h) for h in hours[-12:]][::-1]})
+    return out
+
+
+def h3_prompts_history(limit: int = 48) -> dict[str, Any]:
+    """[h3-prompts] What each hour used, newest first, with the video(s) it made
+    (the generation rows that carry the hour). A worker thread."""
+    store = h3_prompts_load()
+    hours = _h3_prompts_hours(store)[-max(1, min(H3_PROMPTS_HISTORY_KEEP, int(limit or 48))):]
+    made: dict[str, list[dict[str, Any]]] = {}
+    try:
+        for row in _read_all_generations():
+            rec = row.get("h3_prompts") if isinstance(row, dict) else None
+            if isinstance(rec, dict) and rec.get("hour"):
+                made.setdefault(str(rec["hour"]), []).append(
+                    {"prompt_id": row.get("prompt_id"), "files": row.get("files") or [],
+                     "status": row.get("status"), "road": rec.get("road"), "ts": row.get("ts")})
+    except Exception as exc:  # noqa: BLE001
+        pipeline_log("ads", "hourly H3 prompts: the gallery rows could not be read (%s)" % type(exc).__name__)
+    return {"hours": [dict(_h3_prompts_hour_view(h), videos=made.get(str(h.get("hour") or ""), []))
+                      for h in reversed(hours)]}
+
+
+def _h3_prompts_find(store: dict[str, Any], pid: str) -> dict[str, Any]:
+    got = next((p for p in store["presets"] if p["id"] == pid), None)
+    if got is None:
+        raise HTTPException(status_code=404, detail="No preset %s - it may have been deleted" % str(pid)[:40])
+    return got
+
+
+def _h3_prompts_name_free(store: dict[str, Any], name: str, pid: str = "") -> None:
+    if any(p["name"].lower() == name.lower() and p["id"] != pid for p in store["presets"]):
+        raise HTTPException(status_code=409, detail='A preset is already called "%s"' % name)
+
+
+def h3_prompts_from_generation(prompt_id: str) -> dict[str, Any]:
+    """[h3-prompts] The words a video was made with, as a preset's fields: the
+    preset it recorded (`h3_prompts`), else - a video from before the presets -
+    the direction and line it was sent, as every road's direction."""
+    row = workshop_generation(str(prompt_id or ""))
+    if row is None:
+        raise HTTPException(status_code=404, detail="No such video")
+    rec = row.get("h3_prompts")
+    if isinstance(rec, dict) and isinstance(rec.get("fields"), dict):
+        out: dict[str, Any] = dict(h3_prompts_fields(rec["fields"]))
+        out["name"] = str((rec.get("preset") or {}).get("name") or "")
+        return out
+    direction = _h3_prompts_text(row.get("request") or "", "clip")
+    if not direction:
+        raise HTTPException(status_code=409, detail="This video recorded no prompt to reuse")
+    out = dict(H3_PROMPTS_DEFAULT)
+    out.update({"clip": direction, "gallery": direction, "host": direction,
+                "speech": _h3_prompts_text(row.get("speech") or "", "speech")})
+    stem = Path(str((row.get("files") or [""])[0] or "")).stem
+    out["name"] = "From " + (stem or str(prompt_id)[:8])
+    return out
+
+
+def h3_prompts_create(body: dict[str, Any]) -> dict[str, Any]:
+    """[h3-prompts] A new preset from the words given - or from the words a video
+    was made with (`from_prompt_id`) - active at once when `activate`."""
+    raw = dict(body)
+    if body.get("from_prompt_id"):
+        raw = h3_prompts_from_generation(str(body["from_prompt_id"]))
+        if str(body.get("name") or "").strip():
+            raw["name"] = body["name"]
+    name = _h3_prompts_text(raw.get("name"), "name")
+    if not name:
+        raise HTTPException(status_code=400, detail="Name the preset")
+    made: dict[str, str] = {}
+
+    def fn(store: dict[str, Any]) -> None:
+        if len(store["presets"]) >= H3_PROMPTS_MOST:
+            raise HTTPException(status_code=409, detail="%d presets is the most the store keeps - delete one first"
+                                % H3_PROMPTS_MOST)
+        _h3_prompts_name_free(store, name)
+        one = _h3_prompts_preset(dict(raw, name=name, created_at=None, updated_at=None),
+                                 "p-" + uuid.uuid4().hex[:10])
+        store["presets"].append(one)
+        if body.get("activate"):
+            store["active"] = one["id"]
+        made["id"] = one["id"]
+    h3_prompts_change(fn)
+    pipeline_log("ads", 'hourly H3 prompts: preset "%s" saved' % name)
+    return dict(h3_prompts_view(), saved=made.get("id"))
+
+
+def h3_prompts_update(pid: str, body: dict[str, Any]) -> dict[str, Any]:
+    """[h3-prompts] Change a preset's name or words. `was` (the updated_at the
+    editor loaded) refuses a save over a newer one."""
+    def fn(store: dict[str, Any]) -> None:
+        one = _h3_prompts_find(store, pid)
+        if body.get("was") not in (None, ""):
+            if abs(_h3_prompts_stamp(body.get("was"), -1.0) - float(one.get("updated_at") or 0)) > 0.002:
+                raise HTTPException(status_code=409, detail="This preset was changed elsewhere since it was "
+                                                            "opened - reload it before saving")
+        if "name" in body:
+            name = _h3_prompts_text(body.get("name"), "name")
+            if not name:
+                raise HTTPException(status_code=400, detail="Name the preset")
+            _h3_prompts_name_free(store, name, pid)
+            one["name"] = name
+        merged = dict(one)
+        merged.update({f: body[f] for f in H3_PROMPTS_FIELDS if f in body})
+        one.update(h3_prompts_fields(merged))
+        one["updated_at"] = round(time.time(), 3)
+    h3_prompts_change(fn)
+    return dict(h3_prompts_view(), saved=pid)
+
+
+def h3_prompts_delete(pid: str) -> dict[str, Any]:
+    """[h3-prompts] Delete a preset - never the last: the hourly render needs
+    words. The active one moves to the first left."""
+    def fn(store: dict[str, Any]) -> None:
+        _h3_prompts_find(store, pid)
+        if len(store["presets"]) <= 1:
+            raise HTTPException(status_code=409, detail="The last preset stays - the hourly render needs words")
+        store["presets"] = [p for p in store["presets"] if p["id"] != pid]
+        if store["active"] == pid:
+            store["active"] = store["presets"][0]["id"]
+    h3_prompts_change(fn)
+    return h3_prompts_view()
+
+
+def h3_prompts_activate(pid: str) -> dict[str, Any]:
+    """[h3-prompts] The preset every hour uses while the dice are off."""
+    def fn(store: dict[str, Any]) -> None:
+        _h3_prompts_find(store, pid)
+        store["active"] = pid
+    h3_prompts_change(fn)
+    return h3_prompts_view()
+
+
+def h3_prompts_dice(on: bool) -> dict[str, Any]:
+    """[h3-prompts] The gallery's dice: on, each hour's preset is System 3's roll
+    among the saved presets; off, the active preset. Turned on, the presets are
+    put on the desk (the dice door tables the POOLS1 row) so they can be weighted
+    before the first roll."""
+    def fn(store: dict[str, Any]) -> None:
+        store["dice"] = bool(on)
+    store = h3_prompts_change(fn)
+    if on and _s3_dice_live():
+        try:
+            s3_pool(H3_PROMPTS_DICE_KEY, [p["name"] for p in store["presets"]], H3_PROMPTS_DICE_LABEL)
+        except Exception:  # noqa: BLE001 - the desk row is a convenience; the roll tables it anyway
+            pass
+    pipeline_log("ads", "hourly H3 prompts: the dice %s" % ("on" if on else "off"))
+    return h3_prompts_view()
+
+
+def h3_prompts_pin(body: dict[str, Any]) -> dict[str, Any]:
+    """[h3-prompts] The words the next hour uses, once: a saved preset
+    (`preset_id`), words from the editor (`preset`), the words a video was made
+    with (`from_prompt_id`) - or none (`clear`)."""
+    pin: dict[str, Any] | None = None
+    if not body.get("clear"):
+        now = round(time.time(), 3)
+        if body.get("from_prompt_id"):
+            words = h3_prompts_from_generation(str(body["from_prompt_id"]))
+            pin = {"from": "video", "prompt_id": str(body["from_prompt_id"])[:120],
+                   "preset": _h3_prompts_preset(dict(words, name=words.get("name") or "A video's words"), "pinned")}
+        elif isinstance(body.get("preset"), dict):
+            raw = body["preset"]
+            pin = {"from": "editor", "preset": _h3_prompts_preset(
+                dict(raw, name=_h3_prompts_text(raw.get("name"), "name") or "Pinned words"), "pinned")}
+        elif body.get("preset_id"):
+            pin = {"from": "preset", "preset_id": str(body["preset_id"])[:40]}
+        else:
+            raise HTTPException(status_code=400, detail="Pin a preset_id, a preset or a from_prompt_id - or clear")
+        pin.update({"id": "n-" + uuid.uuid4().hex[:10], "at": now})
+
+    def fn(store: dict[str, Any]) -> None:
+        if pin is not None and pin.get("preset_id"):
+            pin["preset"] = copy.deepcopy(_h3_prompts_find(store, pin["preset_id"]))
+        store["next"] = pin
+    h3_prompts_change(fn)
+    pipeline_log("ads", "hourly H3 prompts: the next hour %s" % (
+        'uses "%s"' % pin["preset"]["name"] if pin else "is unpinned"))
+    return h3_prompts_view()
+
+
+async def _h3_prompts_body(request: Request) -> dict[str, Any]:
+    try:
+        payload = await request.json()
+    except Exception:  # noqa: BLE001
+        payload = None
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Expected an object")
+    return payload
+
+
+@app.get("/api/h3/prompts")
+async def h3_prompts_get(summary: int = 0, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    """[h3-prompts] The hourly prompts: the presets, the active one, the dice,
+    the pin, the next and last hour (summary=1: only the state the gallery's
+    P and dice show)."""
+    require_read_auth(authorization)
+    return await asyncio.to_thread(h3_prompts_view, bool(summary))
+
+
+@app.get("/api/h3/prompts/history")
+async def h3_prompts_history_get(limit: int = 48, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    """[h3-prompts] What each hour used, newest first, with the video it made."""
+    require_read_auth(authorization)
+    return await asyncio.to_thread(h3_prompts_history, limit)
+
+
+@app.post("/api/h3/prompts/active")
+async def h3_prompts_active_set(request: Request, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    """[h3-prompts] {id}: the preset every hour uses while the dice are off."""
+    require_auth(authorization)
+    body = await _h3_prompts_body(request)
+    return await asyncio.to_thread(h3_prompts_activate, str(body.get("id") or ""))
+
+
+@app.post("/api/h3/prompts/dice")
+async def h3_prompts_dice_set(request: Request, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    """[h3-prompts] {on}: the gallery's dice."""
+    require_auth(authorization)
+    body = await _h3_prompts_body(request)
+    return await asyncio.to_thread(h3_prompts_dice, bool(body.get("on")))
+
+
+@app.post("/api/h3/prompts/next")
+async def h3_prompts_next_set(request: Request, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    """[h3-prompts] {preset_id} | {preset} | {from_prompt_id} | {clear}: the
+    words the next hour uses, once."""
+    require_auth(authorization)
+    body = await _h3_prompts_body(request)
+    return await asyncio.to_thread(h3_prompts_pin, body)
+
+
+@app.post("/api/h3/prompts")
+async def h3_prompts_create_api(request: Request, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    """[h3-prompts] {name, goal, clip, gallery, host, speech, style, constraints,
+    audio_direction, activate?} or {from_prompt_id, name?}: a new preset."""
+    require_auth(authorization)
+    body = await _h3_prompts_body(request)
+    return await asyncio.to_thread(h3_prompts_create, body)
+
+
+@app.post("/api/h3/prompts/{pid}")
+async def h3_prompts_update_api(pid: str, request: Request,
+                                authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    """[h3-prompts] {name?, <fields>?, was?}: change a preset."""
+    require_auth(authorization)
+    body = await _h3_prompts_body(request)
+    return await asyncio.to_thread(h3_prompts_update, pid[:40], body)
+
+
+@app.post("/api/h3/prompts/{pid}/delete")
+async def h3_prompts_delete_api(pid: str, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    """[h3-prompts] Delete a preset (never the last)."""
+    require_auth(authorization)
+    return await asyncio.to_thread(h3_prompts_delete, pid[:40])
+
+
+@app.on_event("startup")
+async def _h3_prompts_start() -> None:
+    """[h3-prompts] The store into memory before the first hour - off the loop."""
+    try:
+        await asyncio.to_thread(h3_prompts_load)
+    except Exception as exc:  # noqa: BLE001
+        pipeline_log("ads", "hourly H3 prompt presets not loaded (%s)" % type(exc).__name__)
 
 
 @app.on_event("startup")
@@ -178060,6 +179441,9 @@ def script_ledger_commit(sid: str, rows: list[dict[str, Any]],
     # [air-order] a line numbered when it entered the air queue keeps its number
     block = int(block or 0) or _script_block_next()
     at = float(at or 0.0) or time.time()
+    # [s3-segment] the scheduled segment on air when this took its place in the
+    # script: now for a round, the page door's moment for a numbered line
+    _segment = segment_on_air(at)
     try:
         _mods = modifiers_for_sid(str(sid or ""))
     except Exception:  # noqa: BLE001
@@ -178089,6 +179473,7 @@ def script_ledger_commit(sid: str, rows: list[dict[str, Any]],
     for ord_, row in enumerate(rows):
         out.append(json.dumps({
             "block": block, "ord": int(row.get("_ord", ord_)), "at": at,  # [air-order] _ord
+            **({"segment": _segment} if _segment else {}),   # [s3-segment]
             "sid": str(sid or ""), "round": str(round_kind or ""),
             "line_id": str(row.get("line_id") or ""),
             "who": str(row.get("who") or ""),
@@ -178166,6 +179551,13 @@ def script_ledger_commit(sid: str, rows: list[dict[str, Any]],
         return 0
     if globals().get("system3_observe_ledger"):
         globals()["system3_observe_ledger"](block, sid, rows, round_kind)
+    # [s3-segment] and to System 3's segment register: which scheduled segment
+    # this block of the script went out in, its lines and their conversations
+    if _segment and globals().get("system3_segment_block"):
+        try:
+            globals()["system3_segment_block"](block, at, sid, rows, _segment, round_kind)
+        except Exception:  # noqa: BLE001
+            pass
     return block
 
 
@@ -197187,6 +198579,9 @@ CONTROL_PANEL_HTML = r"""
 <link rel="stylesheet" href="/icons/pineicons.css?v=2">
 <script src="/icons/pine-icons.js"></script>
 <script src="/spark/asset/wall-transition.js"></script>
+<!-- [autoscroll-rule] one rule for every scroller that follows: it moves only
+     for a reader at its latest end who is not examining something there. -->
+<script src="/spark/asset/pine-stick.js"></script>
 <style>
 :root {
   color-scheme: dark;
@@ -209776,6 +211171,19 @@ function deckLabel(text) {
   return mark;
 }
 
+/* [autoscroll-rule] the deck scrolled off the record on air by hand = held
+   there; back on it = centred on it again as the tracks advance. */
+function deckWatch(host) {
+  if (host.__deckWatch) return;
+  host.__deckWatch = true;
+  host.addEventListener("scroll", () => {
+    const on = host.querySelector("[data-deck-now]");
+    if (!on) return;
+    const lip = host.getBoundingClientRect(), seat = on.getBoundingClientRect();
+    host.__deckHeld = !(seat.right > lip.left + 4 && seat.left < lip.right - 4);
+  }, {passive: true});
+}
+
 let deckSignature = "";
 
 function renderDeck(state) {
@@ -209814,10 +211222,22 @@ function renderDeck(state) {
       + "box-shadow:0 0 0 1px #4bb3ff55,0 6px 20px #4bb3ff22";
     frame.style.width = "138px";
     frame.style.height = "138px";
+    tile.setAttribute("data-deck-now", "1");
     host.appendChild(tile);
     // Keep the current track in view as the deck advances.
+    /* [autoscroll-rule] ...inside the deck only: scrollIntoView also moved
+       the page to the deck on every track change, wherever the operator was
+       reading. And only while they have not scrolled the deck off it. */
+    deckWatch(host);
     setTimeout(() => {
-      tile.scrollIntoView({block: "nearest", inline: "center"});
+      if (host.__deckHeld || !tile.isConnected) return;
+      const lip = host.getBoundingClientRect(), seat = tile.getBoundingClientRect();
+      if (!(lip.width > 0 && seat.width > 0)) return;
+      const left = Math.max(0, host.scrollLeft
+        + (seat.left + seat.width / 2) - (lip.left + lip.width / 2));
+      if (Math.abs(left - host.scrollLeft) < 1) return;
+      try { host.scrollTo({left: left, behavior: "instant"}); }
+      catch (e) { host.scrollLeft = left; }
     }, 60);
   }
 
@@ -210580,10 +212000,12 @@ async function boothOpen() {
 function boothLog(text) {
   const log = document.getElementById("boothChat");
   if (!log) return;
+  /* [autoscroll-rule] the booth chat follows only a reader at its end */
+  const stick = window.pineStick ? window.pineStick(log, {edge: "bottom"}) : null;
   const line = document.createElement("div");
   line.textContent = text;
   log.appendChild(line);
-  log.scrollTop = log.scrollHeight;
+  if (stick) stick.follow();
 }
 
 async function boothSend(asRequest) {
@@ -210698,6 +212120,11 @@ async function boothRefresh() {
     }
     const tr = document.getElementById("boothTranscript");
     if (tr) {
+      /* [autoscroll-rule] rebuilt every 4 s: its end is followed only by a
+         reader at it; one scrolled back keeps the line they were on */
+      const trStick = window.pineStick ? window.pineStick(tr, {edge: "bottom"}) : null;
+      const trHold = trStick ? trStick.anchor() : null;
+      const trLast = tr.lastElementChild ? tr.lastElementChild.textContent : "";
       tr.innerHTML = "";
       (state.chat || []).filter((c) => c.who && c.who !== "host"
         && c.who !== "board" && c.text).slice(-8).forEach((c) => {
@@ -210720,7 +212147,8 @@ async function boothRefresh() {
         }
         tr.appendChild(rowEl);
       });
-      tr.scrollTop = tr.scrollHeight;
+      if (trStick) trStick.restore(trHold, !!trLast   // [autoscroll-rule]
+        && (tr.lastElementChild ? tr.lastElementChild.textContent : "") !== trLast);
     }
     // The painting(s) they're hawking, held up beside the booth (#506).
     const gal = document.getElementById("boothGallery");
@@ -210767,9 +212195,13 @@ function usbLog(text, tone) {
   if (tone) line.style.color = tone;
   out.appendChild(line);
   // Only follow the tail if you are already at it.
+  /* [autoscroll-rule] ...and are not examining a line in it; what arrives
+     otherwise is counted on the jump button. */
+  const stick = window.pineStick ? window.pineStick(out, {edge: "bottom", slack: 60}) : null;
   const near = out.scrollHeight - out.scrollTop - out.clientHeight < 60;
   while (out.childElementCount > 900) out.removeChild(out.firstChild);
-  if (near) out.scrollTop = out.scrollHeight;
+  if (stick) stick.follow();
+  else if (near) out.scrollTop = out.scrollHeight;
 }
 
 let usbSeen = "";
@@ -215130,7 +216562,15 @@ function djTalkRender(state) {
     if (boothStungIds.size > 200) boothStungIds.clear();
     boothBubble(line.text, "sfx");
   });
-  const atBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 40;
+  /* [autoscroll-rule] the booth follows its end only for a reader at it who
+   * is not examining a row (text selected, a finger down, a line being
+   * edited); one reading back keeps the row they are on - measured on the
+   * row, so the #745 trim and a row replaced above them cannot slide it. */
+  const talkStick = window.pineStick
+    ? window.pineStick(log, {edge: "bottom", slack: 40, key: "data-eid", button: false}) : null;
+  const talkHold = talkStick ? talkStick.anchor() : null;
+  const atBottom = talkStick ? talkStick.following()
+    : log.scrollHeight - log.scrollTop - log.clientHeight < 40;
   // #748: remember WHERE, not just whether. The log used to be wiped every
   // poll and only restored when you were already at the bottom, so a jump
   // that landed mid-history was thrown to the top of the night within four
@@ -215242,7 +216682,7 @@ function djTalkRender(state) {
     djTalkOrderDirty = false;
     djTalkDirty.clear();
     djTalkRepaint();
-    djTalkScroll(log, atBottom, keepTop);
+    djTalkScroll(log, atBottom, keepTop, talkHold);   // [autoscroll-rule]
     return;
   }
   const _nowS = Date.now() / 1000;
@@ -215290,7 +216730,7 @@ function djTalkRender(state) {
   }
   djTalkTrim(log);
   djTalkMarkLatest();
-  djTalkScroll(log, atBottom, keepTop);
+  djTalkScroll(log, atBottom, keepTop, talkHold);   // [autoscroll-rule]
   djTalkMarkLive();
 }
 
@@ -215366,7 +216806,7 @@ function djTalkTrim(log) {
 }
 
 /* #748: put the reader back where they were, not at the top of the night. */
-function djTalkScroll(log, atBottom, keepTop) {
+function djTalkScroll(log, atBottom, keepTop, hold) {   // [autoscroll-rule]
   if (log._jumpTo) {
     const want = log.querySelector('[data-eid="' + CSS.escape(log._jumpTo)
                                    + '"]');
@@ -215378,6 +216818,9 @@ function djTalkScroll(log, atBottom, keepTop) {
       return;
     }
   }
+  /* [autoscroll-rule] the row the reader was on, put back where it was -
+     or the end, for a reader who was following and still is */
+  if (hold && window.pineStick) { window.pineStick(log).restore(hold, false); return; }
   log.scrollTop = atBottom ? log.scrollHeight : keepTop;
 }
 
@@ -217614,6 +219057,16 @@ function pvKeep(host, redraw) {
 }
 
 function pvAnchor(scroller, add) {
+  /* [autoscroll-rule] the rows land at the top of a list INSIDE this
+   * scroller; adding their height whenever it was not at its top pushed the
+   * reader's line up by that much whenever the list sat below it. The place
+   * is now measured on what is under the eye and put back there. */
+  const pvStick = scroller && window.pineStick
+    ? window.pineStick(scroller, {edge: "top", slack: 0, button: false}) : null;
+  if (pvStick) {
+    try { pvStick.keep(add, false); } catch (e) { /* one bad row must not stop the rest */ }
+    return;
+  }
   let was = 0, top = 0, ok = false;
   try {
     if (scroller) { was = scroller.scrollHeight; top = scroller.scrollTop; ok = true; }
@@ -218843,6 +220296,7 @@ function djTalkRowInner(line) {
         find.onclick = (ev) => {
           ev.stopPropagation();
           window.adStudioFocus = line.ad_id;
+          window.adStudioReveal = line.ad_id;   // [autoscroll-rule] one jump, for this click
           try { adStudioOpen(); } catch (e) {}
         };
         acts.appendChild(find);
@@ -220500,6 +221954,11 @@ function pineDeleteChip(id, row) {
 function djRenderChat(state) {
   const host = document.getElementById("djChatLog");
   if (!host || document.getElementById("djChat").style.display === "none") return;
+  /* [autoscroll-rule] rebuilt every poll: its end is followed only by a
+     reader at it; one scrolled back keeps the line they were on */
+  const chatStick = window.pineStick ? window.pineStick(host, {edge: "bottom"}) : null;
+  const chatHold = chatStick ? chatStick.anchor() : null;
+  const chatLast = host.lastElementChild ? host.lastElementChild.textContent : "";
   host.textContent = "";
   (state.chat || []).forEach((line) => {
     // A played sample gets its own row (#269): hear it, keep it, kill it,
@@ -220616,7 +222075,8 @@ function djRenderChat(state) {
     }
     host.appendChild(row);
   });
-  host.scrollTop = host.scrollHeight;
+  if (chatStick) chatStick.restore(chatHold, !!chatLast   // [autoscroll-rule]
+    && (host.lastElementChild ? host.lastElementChild.textContent : "") !== chatLast);
 }
 
 /* The hover card behind an SFX dot (#335): spectrogram, length, where it
@@ -227381,8 +228841,20 @@ function djTalkMarkLive() {
   if (found) found.classList.add("booth-live");
   // Keep it in view — the point is to be able to find and judge the line
   // that is going out right now.
-  if (found && !log._userScrolled) {
-    try { found.scrollIntoView({block: "nearest"}); } catch (e) {}
+  /* [autoscroll-rule] inside the log only - scrollIntoView also moved every
+     scroller above it, the page included, wherever the operator was - and
+     not while they are examining a row in it. */
+  if (found && !log._userScrolled && window.pineStick
+      && !window.pineStick(log, {edge: "bottom", slack: 40, key: "data-eid", button: false}).examining()) {
+    try {
+      const lip = log.getBoundingClientRect(), seat = found.getBoundingClientRect();
+      if (seat.height > 0 && lip.height > 0) {
+        if (seat.top < lip.top) log.scrollTop += seat.top - lip.top;
+        else if (seat.bottom > lip.bottom) {
+          log.scrollTop += Math.min(seat.bottom - lip.bottom, seat.top - lip.top);
+        }
+      }
+    } catch (e) {}
   }
   // #678: the dot carries the same state as the outline — red and pulsing
   // while something is genuinely sounding, grey when the booth is quiet —
@@ -228689,7 +230161,12 @@ async function adStudioOpen() {
           + (window.adStudioFocus && a.id === window.adStudioFocus
              ? ";background:#1a1508;border:1px solid #ffd479;"
                + "border-radius:7px;padding:3px 5px" : "");
-        if (window.adStudioFocus && a.id === window.adStudioFocus) {
+        /* [autoscroll-rule] the "locate" jump is ONE jump, for the click
+           that asked for it: the highlight stays, but a later refresh of
+           this list no longer drags the studio back to that ad. */
+        if (window.adStudioFocus && a.id === window.adStudioFocus
+            && window.adStudioReveal === a.id) {
+          window.adStudioReveal = "";
           setTimeout(() => {
             try { row.scrollIntoView({block: "center"}); } catch (e) {}
           }, 60);
@@ -236827,6 +238304,9 @@ function djGraphPanel() {
   }
 
   function drawFeed(g) {
+    /* [autoscroll-rule] the end follows only a reader at it */
+    const feedStick = window.pineStick ? window.pineStick(feed, {edge: "bottom"}) : null;
+    const feedCount = feed.children.length;
     const rows = [];
     (g.chat || []).forEach((c) => {
       if (c.who === "dj" || c.who === "cohost") {
@@ -236890,7 +238370,7 @@ function djGraphPanel() {
       });
       feed.appendChild(line);
     });
-    feed.scrollTop = feed.scrollHeight;
+    if (feedStick && feed.children.length !== feedCount) feedStick.follow();   // [autoscroll-rule]
   }
 
   async function pull() {
@@ -240927,6 +242407,12 @@ function glassOpen() {
     try {
       const got = await api("/api/dj/pipeline?since=" + since);
       const events = got.events || [];
+      /* [autoscroll-rule] newest at the top: a reader there sees the beat
+         arrive - unless examining a row (an opened payload, a selection, a
+         finger down); anyone else keeps the row they are on. */
+      const glassStick = window.pineStick ? window.pineStick(feed, {edge: "top", slack: 40,
+        examining: () => !!feed.querySelector("pre")}) : null;
+      const glassHold = glassStick && events.length ? glassStick.anchor() : null;
       const top = feed.scrollTop < 40;
       const vmap = glassVoiceMap();          // #608 voice → role, once per beat
       // Newest first (#312): fresh events land at the TOP of the feed.
@@ -240981,7 +242467,8 @@ function glassOpen() {
         feed.insertBefore(row, feed.firstChild);
       }
       while (feed.children.length > 320) feed.removeChild(feed.lastChild);
-      if (top) feed.scrollTop = 0;
+      if (glassHold) glassStick.restore(glassHold, true);   // [autoscroll-rule]
+      else if (top && !glassStick) feed.scrollTop = 0;
       // Feed the health meter (#313): tempo = events this beat; latency
       // ticks parsed off the completed model/voice rows.
       series.tempo.push(events.length);
@@ -242110,10 +243597,13 @@ function wedgeTermPaint() {
   if (!wedgeConsole) return;
   const term = wedgeConsole.querySelector(".pb-wedge-term");
   if (!term) return;
+  /* [autoscroll-rule] the tail follows only a reader at it */
+  const termStick = window.pineStick ? window.pineStick(term, {edge: "bottom"}) : null;
+  const termWas = term.textContent;
   term.textContent = wedgeLines.length
     ? wedgeLines.join("\n")
     : "Nothing run yet. Start with “Locate the problem” - it changes nothing.";
-  term.scrollTop = term.scrollHeight;
+  if (termStick && term.textContent !== termWas) termStick.follow();   // [autoscroll-rule]
 }
 
 async function wedgeRun(step, button) {
@@ -242307,11 +243797,16 @@ let fixState = null;
 
 function fixSay(line) {
   fixLines.push(String(line));
-  if (fixLines.length > 300) fixLines = fixLines.slice(-300);
   const term = fixDrawer && fixDrawer.querySelector(".pb-fix-term");
+  /* [autoscroll-rule] followed, and trimmed, only while the reader is at the
+     tail: one scrolled back keeps every line where it was */
+  const termStick = term && window.pineStick ? window.pineStick(term, {edge: "bottom"}) : null;
+  if (fixLines.length > 300 && (!termStick || termStick.following())) {
+    fixLines = fixLines.slice(-300);
+  }
   if (term) {
     term.textContent = fixLines.join("\n");
-    term.scrollTop = term.scrollHeight;
+    if (termStick) termStick.follow();
   }
 }
 
@@ -243382,12 +244877,14 @@ async function comfyDoctorPanel() {
         + String(w.getMinutes()).padStart(2, "0") + ":"
         + String(w.getSeconds()).padStart(2, "0");
     };
+    /* [autoscroll-rule] the tail follows only a reader at it */
+    const termStick = window.pineStick ? window.pineStick(term, {edge: "bottom"}) : null;
     term.textContent = steps.length
       ? steps.map((s) => stamp(s.at) + "  " + s.line).join("\n")
         + (d.running ? "\n▋" : "")
       : "no run yet — press Run, or just ask the box what's going on "
         + "with ComfyUI.";
-    term.scrollTop = term.scrollHeight;
+    if (termStick) termStick.follow();
   };
   let dialTick = 0;                                      /* [#1196] */
   const poll = async () => {
@@ -243788,6 +245285,10 @@ async function paperScriptLoad(quiet) {
   const showing = paperScriptHour
     ? hours.find((h) => h.hour === paperScriptHour)
     : hours[hours.length - 1];
+  /* [autoscroll-rule] re-read every 12 s while live: the air log follows
+     its end only for a reader at it; one reading back keeps their line */
+  const scrStick = window.pineStick ? window.pineStick(body, {edge: "bottom"}) : null;
+  const scrHold = scrStick && quiet ? scrStick.anchor() : null;
   body.innerHTML = "";
   if (!showing) {
     body.appendChild(el("div", "muted", "Nothing has aired in this window."));
@@ -243845,7 +245346,8 @@ async function paperScriptLoad(quiet) {
     }
     body.appendChild(paperScriptRow(row, !paperScriptHour && i === lines.length - 1));
   });
-  if (!paperScriptHour) body.scrollTop = body.scrollHeight;
+  if (scrHold) scrStick.restore(scrHold, false);   // [autoscroll-rule]
+  else if (!paperScriptHour) body.scrollTop = body.scrollHeight;
 }
 
 /* The note. It goes to the orchestrator's book against a SEGMENT KIND,
@@ -245111,7 +246613,13 @@ async function paperShow(id) {
   }
   try {
     const chip = Array.from(paperShelf.children).find((c) => c.title && c.title.startsWith((e.headline || "") + "\n"));
-    if (chip && chip.scrollIntoView) chip.scrollIntoView({inline: "nearest", block: "nearest"});
+    /* [autoscroll-rule] along the shelf only: scrollIntoView also moved
+       every scroller above it, the page included */
+    if (chip && paperShelf) {
+      const lip = paperShelf.getBoundingClientRect(), seat = chip.getBoundingClientRect();
+      if (seat.left < lip.left) paperShelf.scrollLeft += seat.left - lip.left;
+      else if (seat.right > lip.right) paperShelf.scrollLeft += seat.right - lip.right;
+    }
   } catch (err) { /* cosmetic */ }
 }
 
@@ -245140,6 +246648,9 @@ async function paperRefresh(jumpLatest) {
 
 function paperPaintConsole(d) {
   if (!paperConsole) return;
+  /* [autoscroll-rule] the maker's last lines follow only a reader at them */
+  const pcStick = window.pineStick
+    ? window.pineStick(paperConsole, {edge: "bottom", button: false}) : null;
   const steps = d.steps || [];
   const stamp = (t) => {
     const w = new Date(t * 1000);
@@ -245150,12 +246661,23 @@ function paperPaintConsole(d) {
   if (d.running) {
     paperConsole.style.display = "";
     paperConsole.textContent = steps.slice(-8).map((s) => stamp(s.at) + "  " + s.line).join("\n") + "\n▋";
-    paperConsole.scrollTop = paperConsole.scrollHeight;
+    if (pcStick) pcStick.follow();   // [autoscroll-rule]
   } else if (paperConsole.style.display !== "none") {
     paperConsole.textContent = steps.slice(-8).map((s) => stamp(s.at) + "  " + s.line).join("\n")
       + (d.verdict ? "\n— " + d.verdict : "");
-    paperConsole.scrollTop = paperConsole.scrollHeight;
+    if (pcStick) pcStick.follow();   // [autoscroll-rule]
   }
+}
+
+/* [autoscroll-rule] a reader who has started down the edition on screen. */
+function paperReadingDown() {
+  try {
+    const w = paperFrame && paperFrame.contentWindow;
+    const doc = w && w.document;
+    const top = doc && doc.scrollingElement ? doc.scrollingElement.scrollTop
+      : (w ? w.scrollY : 0);
+    return top > 40;
+  } catch (e) { return false; }
 }
 
 async function paperPoll() {
@@ -245168,7 +246690,11 @@ async function paperPoll() {
     const wasLatest = !paperCur || paperCur === (paperList[0] || {}).id;
     paperList = d.editions || [];
     paperPaintShelf();
-    if (wasLatest && !d.running && paperList[0] && paperList[0].id !== paperCur) {
+    /* [autoscroll-rule] a new edition replaces the page only for a reader
+       who has not started down the one on screen; otherwise it waits on the
+       shelf, where its chip already is, until they choose it. */
+    if (wasLatest && !d.running && paperList[0] && paperList[0].id !== paperCur
+        && !paperReadingDown()) {
       paperSeen = paperList[0].id;
       await paperShow(paperList[0].id);
     }
@@ -246071,12 +247597,14 @@ async function stewardPanel() {
         + String(w.getMinutes()).padStart(2, "0") + ":"
         + String(w.getSeconds()).padStart(2, "0");
     };
+    /* [autoscroll-rule] the tail follows only a reader at it */
+    const termStick = window.pineStick ? window.pineStick(term, {edge: "bottom"}) : null;
     term.textContent = steps.length
       ? steps.map((s) => stamp(s.at) + "  " + s.line).join("\n")
         + (d.running ? "\n▋" : "")
       : "no run yet — press Check, or just ask the box how the "
         + "services are doing.";
-    term.scrollTop = term.scrollHeight;
+    if (termStick) termStick.follow();
   };
   const poll = async () => {
     try { paint(await api("/api/steward")); }
@@ -249183,9 +250711,15 @@ function studioConsolePaint(live) {
       + '<span style="color:' + colour + '">' + esc(e.line) + '</span></div>';
   }).join("");
   html += '</div>';
+  /* [autoscroll-rule] the log is rebuilt with the body: its place is
+     carried across - the tail for a reader at it, their line otherwise */
+  const oldLog = body.lastChild && body.lastChild.nodeType === 1 ? body.lastChild : null;
+  const logHold = oldLog && window.pineStick
+    ? window.pineStick.hold(oldLog, {edge: "bottom"}) : null;
   body.innerHTML = html;
   const log = body.lastChild;
-  if (log) log.scrollTop = log.scrollHeight;
+  if (log && logHold) window.pineStick.put(log, logHold, {edge: "bottom"}, false);
+  else if (log && !oldLog) log.scrollTop = log.scrollHeight;
 }
 
 function studioJobAdd(jobId, meta) {
@@ -253278,6 +254812,14 @@ function consoleWatch(feed) {
   });
 }
 
+/* [autoscroll-rule] the console's way back to its tail is the shared jump
+   button - which also lifts the hold a hand put on the feed - not a timer. */
+function consoleJump(feed) {
+  if (!feed || !window.pineStick) return null;
+  return window.pineStick(feed, {edge: "bottom", slack: 24,
+    onJump: () => { consoleStuck = true; consoleTouched = 0; }});
+}
+
 function trimAndScrollConsole(feed) {
   try {
     consoleWatch(feed);
@@ -253285,6 +254827,8 @@ function trimAndScrollConsole(feed) {
       // Their scroll position is theirs, and a pruned first child would
       // yank it — so the trim only bites at a much deeper backlog.
       while (feed.children.length > 400) feed.removeChild(feed.firstChild);
+      const jump = consoleJump(feed);   // [autoscroll-rule]
+      if (jump) jump.note(1);
       return;
     }
     while (feed.children.length > 60) feed.removeChild(feed.firstChild);
@@ -254112,6 +255656,8 @@ async function openDocBrowser(slug, pageN, withChat) {
 function buildChatRail(getDoc, getPage) {
   const rail = el("div", "pv-chat");
   const log = el("div", "pv-chat-log");
+  /* [autoscroll-rule] made with the log, so it knows where the reader is */
+  const logStick = window.pineStick ? window.pineStick(log, {edge: "bottom"}) : null;
   const hint = el("div", "pv-msg bot",
     "Ask about the page you're viewing — I'll answer from the manual and " +
     "pull in live links and videos.");
@@ -254157,7 +255703,9 @@ function buildChatRail(getDoc, getPage) {
       wait.textContent = error.message;
     }
     pvChatBusy = false;
-    log.scrollTop = log.scrollHeight;
+    /* [autoscroll-rule] the answer lands seconds after the question: it is
+       followed only by a reader still at the end of the conversation */
+    if (logStick) logStick.follow();
   }
   send.onclick = go;
   input.onkeydown = (e) => { if (e.key === "Enter") go(); };
@@ -255015,6 +256563,8 @@ async function openDocPopup(entry) {
   const chat = el("div", "pv-chat");
   chat.style.cssText = "flex:0 0 190px;border-left:0;border-top:1px solid var(--border)";
   const log = el("div", "pv-chat-log");
+  /* [autoscroll-rule] made with the log, so it knows where the reader is */
+  const logStick = window.pineStick ? window.pineStick(log, {edge: "bottom"}) : null;
   log.appendChild(el("div", "pv-msg bot",
     "Ask me anything about this — I'll answer here and speak it out of the " +
     "Pine Box."));
@@ -255062,7 +256612,7 @@ async function openDocPopup(entry) {
       return;
     }
     wait.textContent = res.answer || "(no answer)";
-    log.scrollTop = log.scrollHeight;
+    if (logStick) logStick.follow();   /* [autoscroll-rule] as in buildChatRail */
     renderSide(res);
   }
 
@@ -256962,6 +258512,10 @@ RADIO_PAGE_HTML = r"""<!doctype html>
 <link rel="stylesheet" href="/spark/asset/sfx-tv.css">
 <link rel="stylesheet" href="/spark/asset/slideshow.css">
 <script src="/spark/asset/sfx-tv.js"></script>
+<!-- [autoscroll-rule] the feed follows only a reader at its end; its way
+     back is a Carbon jump button (pine-icons.js draws the icon). -->
+<script src="/icons/pine-icons.js"></script>
+<script src="/spark/asset/pine-stick.js"></script>
 <style>
   :root { color-scheme: dark; }
   * { box-sizing: border-box; }
@@ -258671,6 +260225,29 @@ function s3Toggle(row) {
   const comp = s3Comp.has(id) ? s3Comp.get(id) : (id.indexOf(":") >= 0 ? null : undefined);
   s3Replay(row, comp).catch(() => { s3Release(row); row.__s3Playing = false; });
 }
+
+/* [autoscroll-rule] THE FEED FOLLOWS ONLY A READER AT ITS END. patter()
+   keeps a listener at the end of the feed when they are near it; this adds
+   the rest of the one rule (desktop/renderer/pine-stick.js): a listener with
+   a line open (tapped, replaying), words selected or a finger down is
+   examining it and nothing moves; one reading back keeps the line they are
+   on while the oldest lines leave the top; what arrives meanwhile is counted
+   on the jump button. It wraps patter() from outside, because patter() is
+   System 3's own text (tools/system3_patch_app.py). No helper, no change. */
+patter = (function (plain) {
+  return function (state) {
+    const host = document.getElementById("patter");
+    const stick = host && window.pineStick ? window.pineStick(host, {edge: "bottom", slack: 48,
+      key: "data-key", examining: () => !!host.querySelector('[aria-expanded="true"]')}) : null;
+    if (!stick) return plain(state);
+    const hold = stick.anchor();
+    const had = new Set(Array.from(host.children, (n) => n.dataset.key));
+    try { return plain(state); }
+    finally {
+      stick.restore(hold, Array.from(host.children).filter((n) => !had.has(n.dataset.key)).length);
+    }
+  };
+})(patter);
 
 /* #1472c: "if a message is tapped by a listener, then animate the Rolodex
    effect and the dice roll for that, animating each result that happens

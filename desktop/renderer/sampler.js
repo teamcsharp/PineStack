@@ -2414,7 +2414,13 @@
    * terms moved underneath it. A measurement cannot be recovered from a list
    * that no longer exists; the cure was to stop destroying it. */
   function feedAnchor(list) {
-    if (!list || list.scrollTop <= 4) return { pinned: true };
+    /* [autoscroll-rule] the top follows the show only for a reader who is
+       not examining a row there; one who is is held like any other */
+    const stick = list && root.pineStick
+      ? root.pineStick(list, {edge: "top", slack: 4}) : null;
+    if (!list || (list.scrollTop <= 4 && !(stick && stick.examining()))) {
+      return { pinned: true };
+    }
     const box = list.getBoundingClientRect();
     for (const child of list.children) {
       const rect = child.getBoundingClientRect();
@@ -2436,6 +2442,11 @@
     const drift = node.getBoundingClientRect().top - anchor.was;
     if (Math.abs(drift) > 0.5) {
       list.scrollTop = Math.max(0, list.scrollTop + drift);
+    }
+    /* [autoscroll-rule] rows arrived above a reader who is elsewhere: the
+       jump button counts them, and takes the reader to the top if pressed */
+    if (drift > 0.5 && root.pineStick) {
+      root.pineStick(list, {edge: "top", slack: 4}).note(1);
     }
   }
 

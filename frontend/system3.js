@@ -14,6 +14,8 @@ const FAM = {CTS: 'var(--cts)', ES: 'var(--es)', RS: 'var(--rs)', IRS: 'var(--ir
   COMMIT: 'var(--obs)', REPAIR: 'var(--repair)', TINT: 'var(--tint)', ROOM: 'var(--room)',   /* [s3-rewrite] */
   FAV: 'var(--fav)', DIRECTIVE: 'var(--directive)', EVENT: 'var(--repair)', STATION: 'var(--obs)',   /* [s3-cast] [s3-events] [s3-dice-door] */
   TEMPER: 'var(--es)', SHOCK: 'var(--rs)', INTERJECT: 'var(--fl)', MENTION: 'var(--cts)', CARRY: 'var(--es)'};   /* [s3-rounds] [s3-carry] */
+FAM.MEMORY = 'var(--memory, #d9c9a3)';   /* [s3-memory] */
+FAM.RESOLVE = 'var(--tint)'; FAM.WRAP = 'var(--room)';   /* [s3-callend] the caller's wheel, wrap call */
 const SIDE = {A: 'left', B: 'right', D: 'left', C: 'right', E: 'right'};
 const reduced = () => window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -525,6 +527,9 @@ function frameSleep(ms) {
  * candidate's slice - is the engine's own (system3.pick_index), re-done
  * here from the recorded numbers, never estimated. */
 const FAMILY_WHAT = {
+  /* [s3-memory] rules, then roulette */
+  MEMORY: ['Memory context (MEMORY1)',
+    'What the writer is reminded of for this round, and only when it is relevant: the clock near the top of the hour or the end of a segment, the last topic when this round carries it on or turns from it, the last segment and how it went at the start of the next, the calls against the hourly quota when the booth is behind or ahead, the manager\'s last word while it is fresh. Each kind\'s rule - its numbers in Tables > MEMORY1 - decides whether it is eligible, and every verdict is on the card; then the roulette draws among the eligible kinds (at least one, at most two a round by default - how many is itself a die when those differ), and a die picks the way each is put when more than one fits. The items drawn are the round\'s memory block, word for word, landed on its first turn; nothing else of the old "Tonight so far" reaches a round a MEMORY roll stands behind. A round written now to air later is told none of it unless a rule\'s on_banked switch says so.'],
   CTS: ['Conversation / Segment Topic (CTS1)',
     'What the round is about. System 3 draws a subject only where it has the authority to: a road that arrives with its own material (a speakerbox seed, a wire story, a memo, a painting) has that as an obligation, recorded here and never drawn over. A frame that cancels the topic lets the next cycle draw a new one.'],
   ES: ['Emotional Set (ES1)',
@@ -577,6 +582,13 @@ const FAMILY_WHAT = {
   DIRECTIVE: ["Operator's directive (DIRECTIVE1)",
     'One of your directives for this seat, from System 3 > Tables > DIRECTIVE1. Each row has its own odds: 100% is a standing rule (recorded, not drawn), lower is a die. A hit lands on one of that seat\'s turns, drawn here. A row can expire by date or after a number of airings.'],
 };
+/* [s3-callend] how a call ends: the caller's wheel and the wrap call */
+Object.assign(FAMILY_WHAT, {
+  RESOLVE: ["Resolution - the caller's wheel (RESOLVE1)",
+    "How the call resolves, rolled at the end of its node tree. The caller's wheel lands on one outcome - when the last segment was selling a painting, the painting wheel (buys it, wins it in the raffle as caller number N, turns it down, turns it down in a speakerbox passage, buys it and sets it on fire, ignores it, can't afford it); otherwise the general wheel - then which station seat sets it up, how many station turns answer it (the response chain) and who. Each is its own die, every candidate and why it could or could not come up recorded. The caller then gets the last word (the rebuttal) and WRAP CALL ends it. Edited in Tables > RESOLVE1: rows, weights, offers, effects, the chain's weights."],
+  WRAP: ['Wrap call (WRAP1)',
+    "Who on the station ends the call, and how - in answer to the caller's last word. Two dice: the way (a polite goodbye, cutting them off mid-sentence, hold forever, the dial tone ... - some only after a resolution, like enjoying the ashes after a painting was set on fire; a call a happening cut short draws from the dead-line wheel) and who says it (the desk's weights by seat). The station's checker takes this node as the sign-off whatever its words. Edited in Tables > WRAP1."],
+});
 const DIAL_FOR = {ES: ['emotional_volatility'], RS: ['disagreement', 'escalation', 'tangent', 'callback', 'novelty'],
   IRS: ['disagreement', 'escalation'], FL: ['tangent', 'callback', 'novelty', 'closure_aggressiveness', 'escalation'],
   SPEAKERBOX: ['speakerbox_density'], SFX: ['sfx_aggression'], CTS: ['novelty'], TOPIC: ['topics'],
@@ -2138,6 +2150,9 @@ const PLAY_SVG = '<svg class="pi-icon" viewBox="0 0 32 32" aria-hidden="true" fo
   '<path d="M7 28a1 1 0 0 1-1-1V5a1 1 0 0 1 1.48-.88l20 11a1 1 0 0 1 0 1.76l-20 11A1 1 0 0 1 7 28Z"/></svg>';
 const STAGE_NAME = {table: 'which table', category: 'which category', item: 'which one', mode: 'which way',
   dice: 'the dice', placement: 'where', intensity: 'how strongly', door: 'the door', turn: 'which turn', topic: 'which topic'};
+
+Object.assign(STAGE_NAME, {who: 'who', number: 'the number', count: 'how many', prize: 'which prize',   /* [s3-callend] */
+  fixed: 'pinned'});
 
 function rouletteBar(st) {
   const total = st.candidates.reduce((a, c) => a + (Number(c.weight) || 0), 0) || 1;
@@ -4024,7 +4039,7 @@ export async function mountEmbedded(root, {request, view = 'conversation', onSel
      newest message does not (and waits while a finger is down) */
   root.addEventListener('scroll', () => { if (Date.now() >= selfUntil) cancelHold(); }, {passive: true});
   root.addEventListener('contextmenu', e => {
-    if (!e.target.closest('.s3-msg, .s3-sysrow, .s3-clip, .s3-round-head')) return;
+    if (!e.target.closest('.s3-msg, .s3-sysrow, .s3-clip, .s3-round-head, .s3-sgf-head')) return;   /* [s3-segment-feed] a segment's head too */
     e.preventDefault();
     /* [s3-imsg] a touch screen's long press is a contextmenu AND this hold: one press, one menu */
     if (Date.now() - heldAt < 1000) return;
@@ -4038,12 +4053,14 @@ export async function mountEmbedded(root, {request, view = 'conversation', onSel
   async function holdMenu(target, at) {
     unsync();                                    /* [s3-imsg] a message held: the operator is examining it */
     const la = window.PineLineActions;
+    const segEl = target.closest('.s3-sgf-head');         /* [s3-segment-feed] a segment's head: the segment's menu */
+    if (segEl) { segMenu(segEl.dataset.seg); return; }
     const headEl = target.closest('.s3-round-head');
     if (headEl) {
       /* by its own id: the header is redrawn whenever the round has news,
          and a hold can outlast the node it started on */
       const entry = feed.get(headEl.dataset.conv);
-      if (entry) roundMenu(entry);
+      if (entry) roundMenu(entry, (headEl.closest('.s3-round') || headEl).dataset.seg || '');   /* [s3-segment-feed] the segment this part of it went out in */
       return;
     }
     const sfxNode = target.closest('.s3-sfxguy');
@@ -4107,7 +4124,7 @@ export async function mountEmbedded(root, {request, view = 'conversation', onSel
 
   /* What to do with a segment: its node graph, how it was assembled, its
      build again, the full instrument. */
-  function roundMenu(entry) {
+  function roundMenu(entry, seg = '') {
     const conv = entry.conv;
     const block = ((conv.lines || []).find(l => l.block) || {}).block || 0;
     const flow = window.PineSegmentFlow;
@@ -4124,11 +4141,14 @@ export async function mountEmbedded(root, {request, view = 'conversation', onSel
     };
     const items = [
       btn('Inspect it - the node graph and how it was assembled', () => { close(); inspect(); }),
+      /* [s3-segment-feed] the segment it went out in, and the others */
+      btn('Inspect the segment it went out in', () => { close(); openSegmentInspector({request, segment: seg, conversation: conv.identity.conversation_id}); }),
+      btn('Inspect other segments', () => { close(); openSegmentInspector({request, segment: seg, conversation: conv.identity.conversation_id, pick: true}); }),
       btn('How System 3 assembled it', () => { close(); openAssembly(conv, v.air); }),
       btn('Replay this round\'s build, message by message', () => { close(); replay(entry); }),
       onOpenFull ? btn('Open it in System 3', () => { close(); onOpenFull(conv.identity.conversation_id); }) : null];
-    back.append(movableModal(el('section', {class: 's3-modal s3-holdmenu', role: 'dialog', 'aria-modal': 'true', 'aria-label': 'What would you like to do with this segment?'},
-      el('b', {text: 'What would you like to do with this segment?'}),
+    back.append(movableModal(el('section', {class: 's3-modal s3-holdmenu', role: 'dialog', 'aria-modal': 'true', 'aria-label': 'What would you like to do with this conversation?'},
+      el('b', {text: 'What would you like to do with this conversation?'}),
       el('p', {class: 's3-muted', text: `${conv.identity.road_kind} · ${clock(convTime(conv))} · ` + String((conv.subject || {}).topic || '').replace(/\s+/g, ' ').slice(0, 140)}),
       note, el('div', 's3-holdmenu-items', ...items.filter(Boolean)), btn('Close', close))));
     back.addEventListener('click', e => { if (e.target === back) close(); });
@@ -4171,6 +4191,230 @@ export async function mountEmbedded(root, {request, view = 'conversation', onSel
   const queue = [];                           /* rounds waiting to be added, message by message */
   let pumping = false, cursor = null, timer = 0, busy = false;
   let seqCache = null;                        /* [s3-messenger] the air's order of every item on show */
+  /* ---- [s3-segment-feed] THE SECTIONS ARE THE STATION'S SEGMENTS -------------
+     "every conversation should be chained as the "segment" per the station
+      that is scheduled with everything for that segment occuring within the
+      section of the messenger view" - "Interjection shouldn't be displayed
+      here as segments. If a thing is interjected, that should just be in the
+      instant messenger chain ... each segment is the only way these are
+      sectioned." (operator, 2026-09-28)
+     A segment is one entry of the running order as the station's clock put
+     it on air. Every line of the script names the one it took its place in
+     (the line's `segment`, System 3's register), so every item of the thread
+     has one: a turn its first line's, a run of a turn or a sting its own
+     line's, what hangs off a turn its turn's. The thread is cut where the
+     segment changes: a head (.s3-sgf-head[data-seg]), then every run of every
+     conversation in it in the thread's order - a round under its own
+     sub-head (its road, its state, its rolls, the station's dozens folded to
+     one chip), a single line (an interjection, a station ID, an ad spot) with
+     no head at all: a message in the chain. A round the air takes across two
+     segments is in both, its later part under a slim "continues". An item of
+     a round not in the script yet waits in the segment on air now; one whose
+     line carries no segment (written before the stamp, or while the station
+     runs no schedule) goes with the item before it - with no stamp anywhere
+     the feed is drawn as it always was. The head carries the segment's node
+     view (its icon) and its fold, and a hold or a right-click on it the
+     segment's menu: inspect it, inspect the others. Nothing here scrolls:
+     heads take their places under the thread's own rule, below the air like
+     any item, and their words change in place. */
+  const SEG_LINE_ROADS = new Set(['track_talk', 'station_id', 'upstairs', 'interject', 'ad_spot', 'reply', 'request', 'open', 'aside']);
+  const singleLine = c => SEG_LINE_ROADS.has(String(((c || {}).identity || {}).road_kind || '')) || ((c || {}).turns || []).length < 2;
+  const segBook = new Map();                   /* segment id -> the station's word on it (/api/system3/segments) */
+  const segHeads = new Map();                  /* 'id#n' -> the head of the segment's n-th stretch in the thread */
+  const segFold = new Set();                   /* segments the operator folded shut */
+  const segNoded = new Map();                  /* segment id -> its node chain, shown in place of its conversations */
+  const stationOpen = new Set();               /* rounds whose station rolls the operator opened */
+  let segNow = '', segsAt = 0, segsAsk = null, segsWant = false;
+  const segStart = id => Number((segBook.get(id) || {}).start) || 0;
+  const SEG_LINES = new WeakMap();
+  /* a round's lines -> their segments: by line, by turn (its first spoken line) and its last line's */
+  function segLines(conv) {
+    let p = SEG_LINES.get(conv);
+    if (p) return p;
+    const lines = (conv.lines || []).filter(l => Number(l.block) > 0).sort(byLedger);
+    const byLine = new Map(), byTurn = new Map();
+    for (const l of lines) {
+      const s = String(l.segment || '');
+      if (l.line_id) byLine.set(l.line_id, s);
+      if (isSpoken(l) && l.turn_id && !byTurn.has(l.turn_id)) byTurn.set(l.turn_id, s);
+    }
+    p = {byLine, byTurn, scripted: lines.length > 0, last: lines.length ? String(lines[lines.length - 1].segment || '') : ''};
+    SEG_LINES.set(conv, p);
+    return p;
+  }
+  /* The segment an item went out in: '' when its line carries none, null when
+     its round has no line in the script yet. */
+  function segOfItem(entry, key, n) {
+    const p = segLines(entry.conv);
+    if (!p.scripted) return null;
+    const at = key.indexOf(':');
+    if (at > 0 && /^(sfx|part)$/.test(key.slice(0, at)) && p.byLine.has(key.slice(at + 1))) return p.byLine.get(key.slice(at + 1));
+    const turnId = p.byTurn.has(key) ? key : (n && n.dataset && n.dataset.turn) || key;
+    return p.byTurn.has(turnId) ? p.byTurn.get(turnId) : p.last;     /* a turn with no line of its own stands after the round's last */
+  }
+  /* The station's word on the segments on show - their names, windows and
+     counts, and the one on air - read every 20 s, and sooner (5 s) when the
+     thread meets a segment it does not know. A station without the register
+     answers nothing and the feed is drawn as it always was. */
+  function readSegs(now = false) {
+    if (segsAsk) return segsAsk;
+    if (!now && Date.now() - segsAt < 20000) return Promise.resolve(false);
+    segsAt = Date.now();
+    segsWant = false;
+    const t = Date.now() / 1000;
+    let oldest = t;
+    for (const e of feed.values()) for (const l of e.conv.lines || []) { const a = Number(l.at) || 0; if (a && a < oldest) oldest = a; }
+    const since = Math.max(t - 6 * 3600, Math.min(oldest, t - 1800) - 600);
+    segsAsk = (async () => {
+      let moved = false;
+      try {
+        const got = await request('/api/system3/segments?' + new URLSearchParams({since: String(Math.floor(since)), limit: '60'}));
+        for (const s of (got && got.segments) || []) if (s && s.id) segBook.set(String(s.id), s);
+        const on = got && got.now && got.now.id ? String(got.now.id) : '';
+        if (on && !segBook.has(on)) segBook.set(on, got.now);
+        moved = on !== segNow;
+        segNow = on;
+      } catch (e) { segsAt = Date.now() + 40000; }   /* no register here (or it did not answer): asked again in a minute */
+      segsAsk = null;
+      if (!v.alive) return false;
+      if (moved) relayout();                     /* a round not in the script yet waits in the segment on air */
+      paintSegHeads();
+      return true;
+    })();
+    return segsAsk;
+  }
+  /* One head per stretch of a segment in the thread: the first carries its
+     fold, its kind and name, its window, the one on air marked, its counts
+     and its node view; a later stretch (the thread came back to it) is slim. */
+  function segHeadFor(id, n) {
+    const k = id + '#' + n;
+    let h = segHeads.get(k);
+    if (!h) {
+      const head = el('div', {class: 's3-sgf-head' + (n ? ' s3-sgf-cont' : ''), 'data-seg': id,
+        title: 'tap and hold (or right-click) for what to do with this segment'});
+      h = {id, n, head, kind: el('b', 's3-sgf-kind'), label: el('span', 's3-sgf-label'), when: el('span', 's3-muted s3-sgf-when'),
+        air: el('span', {class: 's3-pill s3-sgf-air', text: 'on air', hidden: true}), count: el('span', 's3-muted s3-sgf-count')};
+      if (!n) {
+        h.fold = iconBtn('c:caret--right', 'Fold this segment away', e => { e.stopPropagation(); foldSeg(id); },
+          {class: 's3-ibtn s3-sgf-fold', 'aria-expanded': 'true'}, 'Fold');
+        h.nodes = iconBtn('c:chart--network', 'Show how this segment was built, as its nodes', e => { e.stopPropagation(); toggleNodes(id); },
+          {class: 's3-ibtn s3-sgf-nodes', 'aria-pressed': 'false'}, 'Nodes');
+      }
+      head.append(...[h.fold, h.kind, h.label, h.when, h.air, h.count, h.nodes].filter(Boolean));
+      segHeads.set(k, h);
+    }
+    paintSegHead(h);
+    return h;
+  }
+  const segText = (node, text) => { if (node.textContent !== text) node.textContent = text; };
+  function paintSegHead(h) {
+    const known = segBook.get(h.id);
+    if (!known) segsWant = true;
+    const s = known || {};
+    segText(h.kind, String(s.kind || 'segment').replace(/_/g, ' '));
+    segText(h.label, h.n ? 'continues' : String(s.label || s.kind || s.template || h.id.split(':').pop()));
+    segText(h.when, h.n || !s.start ? '' : `${sgHm(s.start)} - ${sgHm(s.ends)}`);
+    h.air.hidden = h.n > 0 || h.id !== segNow;
+    const rounds = Number(s.rounds) || 0, singles = Number(s.singles) || 0, lines = Number(s.lines) || 0;
+    segText(h.count, h.n || !known ? '' : [rounds ? `${rounds} round${rounds === 1 ? '' : 's'}` : '',
+      singles ? `${singles} single line${singles === 1 ? '' : 's'}` : '', `${lines} line${lines === 1 ? '' : 's'} in the script`].filter(Boolean).join(' · '));
+    if (h.fold) {
+      const shut = segFold.has(h.id);
+      h.fold.classList.toggle('on', shut);
+      h.fold.setAttribute('aria-expanded', String(!shut));
+      const say = shut ? 'Unfold this segment' : 'Fold this segment away';
+      if (h.fold.title !== say) { h.fold.title = say; h.fold.setAttribute('aria-label', say); }
+    }
+    if (h.nodes) {
+      const on = segNoded.has(h.id);
+      h.nodes.classList.toggle('on', on);
+      h.nodes.setAttribute('aria-pressed', String(on));
+      const say = on ? 'Back to the conversation' : 'Show how this segment was built, as its nodes';
+      if (h.nodes.title !== say) { h.nodes.title = say; h.nodes.setAttribute('aria-label', say); }
+    }
+  }
+  function paintSegHeads() { for (const h of segHeads.values()) paintSegHead(h); }
+  /* a head with nothing left under it goes with it (the round at the top trimmed away) */
+  function pruneSegHeads() {
+    for (const [k, h] of [...segHeads]) {
+      const x = h.n ? null : segNoded.get(h.id);
+      let under = h.head.nextElementSibling;
+      if (x && under === x.host) under = under.nextElementSibling;
+      if (h.head.isConnected && under && under.classList.contains('s3-round') && under.dataset.seg === h.id) continue;
+      h.head.remove();
+      segHeads.delete(k);
+      if (x) { segNoded.delete(h.id); x.dispose(); }
+    }
+  }
+  /* The operator's switches on a segment - folded shut, or shown as its
+     nodes: its conversations are hidden where they stand, never removed, so
+     they come back exactly as they were. */
+  function applySeg(id) {
+    const hide = segFold.has(id) || segNoded.has(id);
+    for (const sec of feedBox.querySelectorAll(':scope > .s3-round')) if (sec.dataset.seg === id) sec.classList.toggle('s3-sgf-hide', hide);
+    const first = segHeads.get(id + '#0'), x = segNoded.get(id);
+    if (x && first && first.head.isConnected && first.head.nextElementSibling !== x.host) first.head.after(x.host);
+    if (first) paintSegHead(first);
+  }
+  function foldSeg(id) {
+    if (segFold.has(id)) segFold.delete(id); else segFold.add(id);
+    applySeg(id);
+  }
+  /* "add an icon ... for converting the convo view ... into a nodal view of
+     how the segment was constructed" (operator, 2026-09-28): the head's icon
+     turns the segment into its node chain in place, and back */
+  function toggleNodes(id) {
+    const had = segNoded.get(id);
+    if (had) { segNoded.delete(id); had.dispose(); applySeg(id); return; }
+    unsync();                                              /* [s3-imsg] the operator is examining this segment */
+    const host = el('div', {class: 's3-sgf-chain', 'data-seg': id});
+    const x = {host, view: null, gone: false, dispose() { this.gone = true; host.remove(); if (this.view) this.view.dispose(); }};
+    segNoded.set(id, x);
+    applySeg(id);
+    mountSegmentNodes(host, {request, segment: id}).then(view => { if (x.gone) view.dispose(); else x.view = view; }, () => {});
+  }
+  /* a block of the segment on show: the director's graph finds its entry from one */
+  function segBlock(id) {
+    for (const sec of feedBox.querySelectorAll(':scope > .s3-round')) {
+      if (sec.dataset.seg !== id) continue;
+      const e = feed.get(sec.dataset.conv);
+      const l = e && (e.conv.lines || []).find(x => String(x.segment || '') === id && Number(x.block) > 0);
+      if (l) return Number(l.block);
+    }
+    return 0;
+  }
+  /* "I also want to be able to expand and select and investigate and inspect
+     other segments via the right click menu" (operator, 2026-09-28): what to
+     do with a segment - inspect it (every conversation of it, node by node,
+     down to its dice), pick another to inspect, its node view here, its fold,
+     its entry on the director's running order. */
+  function segMenu(id) {
+    const s = segBook.get(id) || {id};
+    const back = el('div', {class: 's3 s3-modal-back s3-hold-back'});
+    const close = () => { back.remove(); document.removeEventListener('keydown', key, true); };
+    const key = e => { if (e.key === 'Escape') { e.stopPropagation(); close(); } };
+    const go = fn => () => { close(); fn(); };
+    const flow = window.PineSegmentFlow, block = segBlock(id);
+    const others = [...segBook.values()].filter(x => x && x.id && x.id !== id && x.start)
+      .sort((a, b) => Number(b.start) - Number(a.start)).slice(0, 8);
+    const items = [
+      btn('Inspect this segment - every conversation in it, node by node, down to its dice', go(() => openSegmentInspector({request, segment: id}))),
+      btn('Inspect other segments - pick one from the running order', go(() => openSegmentInspector({request, segment: id, pick: true}))),
+      btn(segNoded.has(id) ? 'Back to the conversation' : 'Show it here as its nodes', go(() => toggleNodes(id))),
+      btn(segFold.has(id) ? 'Unfold it' : 'Fold it away', go(() => foldSeg(id))),
+      flow && typeof flow.openForSegment === 'function' && block
+        ? btn("Its entry on the director's running order", go(() => { flow.openForSegment({block, round: String(s.kind || '')}).catch(() => {}); })) : null];
+    const list = others.length ? el('div', 's3-sgf-others', el('b', {text: 'Other segments'}),
+      ...others.map(o => btn(`${sgHm(o.start)} ${sgName(o)}${o.id === segNow ? ' - on air' : ''}`, go(() => openSegmentInspector({request, segment: o.id}))))) : null;
+    back.append(movableModal(el('section', {class: 's3-modal s3-holdmenu s3-sgf-menu', role: 'dialog', 'aria-modal': 'true', 'aria-label': 'What would you like to do with this segment?'},
+      el('b', {text: 'What would you like to do with this segment?'}),
+      el('p', {class: 's3-muted', text: [sgName(s.label || s.kind ? s : {label: id}), s.start ? `${sgHm(s.start)} - ${sgHm(s.ends)}` : '',
+        id === segNow ? 'on air now' : ''].filter(Boolean).join(' · ')}),
+      el('div', 's3-holdmenu-items', ...items.filter(Boolean)), list, btn('Close', close))));
+    back.addEventListener('click', e => { if (e.target === back) close(); });
+    document.addEventListener('keydown', key, true);
+    document.body.append(back);
+  }
   const convTime = c => Number(c.created || (c.inputs || {}).at || 0);
   const byTime = () => [...feed.values()].sort((a, b) => convTime(a.conv) - convTime(b.conv));
   const sfxCount = (conv, t) => {
@@ -4194,7 +4438,7 @@ export async function mountEmbedded(root, {request, view = 'conversation', onSel
     const state = conv.status === 'planned' ? 'planned - waiting for the writer'
       : lines ? `${lines} line${lines === 1 ? '' : 's'} in the script`
         : written ? `${written} of ${conv.turns.length} turns written` : String(conv.status || '');
-    return el('div', {class: 's3-round-head', 'data-conv': conv.identity.conversation_id, title: 'tap and hold for what to do with this segment'},
+    return el('div', {class: 's3-round-head', 'data-conv': conv.identity.conversation_id, title: 'tap and hold (or right-click) for what to do with this conversation'},
       el('b', {text: conv.identity.road_kind}), el('span', {class: 's3-pill ' + conv.mode, text: conv.mode}),
       el('span', {class: 's3-muted', text: clock(convTime(conv))}),
       el('span', {class: 's3-round-state', text: state}),
@@ -4208,14 +4452,40 @@ export async function mountEmbedded(root, {request, view = 'conversation', onSel
   function roundRolls(conv) {
     const pre = (conv.decision_events || []).filter(e => !e.turn_id && e.family && !e.stage && e.kind !== 'observation');
     if (!pre.length) return null;
-    return el('div', {class: 's3-round-rolls', 'data-keep': ''}, ...pre.map(ev => {
-      const chip = chipOf(ev, conv);
-      return el('span', {class: 's3-diamond' + (chip.miss ? ' miss' : ''), style: `--fam:${FAM[ev.family] || 'var(--obs)'}`, 'data-event': ev.event_id,
-        title: chip.title, text: chip.text, role: 'button', tabindex: '0',
+    const chip = ev => {
+      const c = chipOf(ev, conv);
+      return el('span', {class: 's3-diamond' + (c.miss ? ' miss' : ''), style: `--fam:${FAM[ev.family] || 'var(--obs)'}`, 'data-event': ev.event_id,
+        title: c.title, text: c.text, role: 'button', tabindex: '0',
         onclick: e => { e.stopPropagation(); openDecision(conv, ev, null, v.api); },
         onkeydown: e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); e.currentTarget.click(); } }});
-    }));
+    };
+    /* [s3-segment-feed] the station's own dice - dozens of them, rolled on the
+       task before the round was planned - fold to one chip that opens them
+       (and they stay open while the round is redrawn) */
+    const id = conv.identity.conversation_id;
+    const station = pre.filter(e => e.family === 'STATION');
+    const box = el('div', {class: 's3-round-rolls', 'data-keep': ''}, ...pre.filter(e => e.family !== 'STATION').map(chip));
+    if (station.length) {
+      const open = stationOpen.has(id);
+      box.append(el('span', {class: 's3-diamond s3-sgf-station' + (open ? ' open' : ''), style: `--fam:${FAM.STATION || 'var(--obs)'}`,
+        role: 'button', tabindex: '0', 'aria-expanded': String(open),
+        title: open ? "Fold the station's own rolls" : `The station rolled ${station.length} dice on this task before the round was planned - tap to open them`,
+        text: open ? `STATION ${station.length} - fold` : `STATION · ${station.length} roll${station.length === 1 ? '' : 's'}`,
+        onclick: e => { e.stopPropagation(); if (open) stationOpen.delete(id); else stationOpen.add(id); redrawHead(id); },
+        onkeydown: e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); e.currentTarget.click(); } }}));
+      if (open) box.append(...station.map(chip));
+    }
+    return box;
   }
+  /* a round's head drawn again where it stands */
+  function redrawHead(id) {
+    const entry = feed.get(id);
+    if (!entry || !entry.headEl) return;
+    const h = roundHead(entry.conv);
+    entry.headEl.replaceWith(h);
+    entry.headEl = h;
+  }
+
 
   /* ---- [s3-imsg] THE THREAD: ONE ORDER, KEYED ON ITEMS ----------------------
      "The entire point of system three was to design things in a way where we
@@ -4343,7 +4613,7 @@ export async function mountEmbedded(root, {request, view = 'conversation', onSel
     while (entry.runs.length <= i) {
       const id = entry.conv.identity.conversation_id;
       const chat = el('div', 's3-chat');
-      const headEl = el('div', {class: 's3-round-head s3-round-cont', 'data-conv': id, title: 'tap and hold for what to do with this segment'},
+      const headEl = el('div', {class: 's3-round-head s3-round-cont', 'data-conv': id, title: 'tap and hold (or right-click) for what to do with this conversation'},
         el('b', {text: entry.conv.identity.road_kind}), el('span', {class: 's3-muted', text: 'continues'}));
       entry.runs.push({section: el('section', {class: 's3-round s3-round-more', 'data-conv': id}, headEl, chat), chat, headEl});
     }
@@ -4353,33 +4623,61 @@ export async function mountEmbedded(root, {request, view = 'conversation', onSel
      above the air nothing is touched. */
   function layoutThread(rows) {
     const byKey = new Map(rows.map(r => [r.key, r]));
+    /* [s3-segment-feed] each item's segment, and the runs: one per stretch of
+       one conversation within one segment */
     const runs = [];
+    let before = '';
     for (const k of thread) {
       const r = byKey.get(k);
       if (!r) continue;
+      let seg = segOfItem(r.entry, k, r.node);
+      if (seg === null) seg = segNow && (!before || segStart(segNow) >= segStart(before)) ? segNow : before;   /* not in the script yet: the segment on air */
+      else if (!seg) seg = before;                                                                           /* no stamp: with the item before it */
+      before = seg;
       const last = runs[runs.length - 1];
-      if (last && last.entry === r.entry) last.nodes.push(r.node); else runs.push({entry: r.entry, nodes: [r.node]});
+      if (last && last.entry === r.entry && last.seg === seg) last.nodes.push(r.node); else runs.push({entry: r.entry, seg, nodes: [r.node]});
     }
-    const used = new Map();
-    let prev = null;
+    const used = new Map(), stretch = new Map(), order = [];
+    let open = null;
     for (const run of runs) {
+      if (run.seg !== open) {                      /* a segment's stretch opens with its head (and its node view) */
+        open = run.seg;
+        if (open) {
+          const n = stretch.get(open) || 0;
+          stretch.set(open, n + 1);
+          order.push(segHeadFor(open, n).head);
+          const x = n ? null : segNoded.get(open);
+          if (x) order.push(x.host);
+        }
+      }
       const e = run.entry, i = used.get(e) || 0;
       used.set(e, i + 1);
       const box = i === 0 ? {section: e.section, chat: e.chat} : moreRun(e, i - 1);
-      const want = prev ? prev.nextElementSibling : feedBox.firstElementChild;
-      if (box.section !== want) feedBox.insertBefore(box.section, want);
+      if (box.section.dataset.seg !== run.seg) box.section.dataset.seg = run.seg;
+      box.section.classList.toggle('s3-single', singleLine(e.conv));             /* an interjection is a message, never a section */
+      box.section.classList.toggle('s3-sgf-hide', !!run.seg && (segFold.has(run.seg) || segNoded.has(run.seg)));
+      order.push(box.section);
       let at = box.chat.firstElementChild;
       for (const n of run.nodes) {
         if (n === at) { at = at.nextElementSibling; continue; }
         box.chat.insertBefore(n, at);
       }
-      prev = box.section;
+    }
+    let prev = null;
+    for (const x of order) {
+      const want = prev ? prev.nextElementSibling : feedBox.firstElementChild;
+      if (x !== want) feedBox.insertBefore(x, want);
+      prev = x;
     }
     for (const e of feed.values()) {
       const n = used.get(e) || 0;
       while (e.runs.length > Math.max(0, n - 1)) e.runs.pop().section.remove();
     }
+    /* heads of stretches the thread no longer has, node views of segments no longer on show */
+    for (const [k, h] of [...segHeads]) if ((stretch.get(h.id) || 0) <= h.n) { h.head.remove(); segHeads.delete(k); }
+    for (const [id, x] of [...segNoded]) if (!stretch.has(id)) { segNoded.delete(id); x.dispose(); }
   }
+
   /* [s3-imsg] the edge of what has happened: the later of where the air is and the newest message shown */
   function liveEdge() {
     let best = '', at = -1;
@@ -4578,6 +4876,7 @@ export async function mountEmbedded(root, {request, view = 'conversation', onSel
       const keep = root.scrollHeight - root.scrollTop;          /* dropping from above the view keeps the view still */
       const id = victim.conv.identity.conversation_id;
       for (const s of secs) s.remove();
+      pruneSegHeads();                                /* [s3-segment-feed] a head with nothing left under it goes too */
       feed.delete(id);
       v.forget(id);
       thread = thread.filter(k => ownerOf.get(k) !== id);
@@ -4588,6 +4887,7 @@ export async function mountEmbedded(root, {request, view = 'conversation', onSel
   }
 
   async function seed() {
+    await Promise.race([readSegs(true), sleep(2500)]);   /* [s3-segment-feed] the segments' names before the first section */
     let rows = [];
     try { rows = (await request('/api/system3/conversations?limit=4')).conversations || []; } catch (e) { rows = []; }
     for (const row of rows.slice().reverse()) {
@@ -4673,6 +4973,7 @@ export async function mountEmbedded(root, {request, view = 'conversation', onSel
         if ((got.events || []).length >= 300) again = 250;
       }
       await refresh();
+      readSegs(segsWant && Date.now() - segsAt > 5000);   /* [s3-segment-feed] */
       paintHead();
     } catch (e) {
       again = 6000;
@@ -5458,6 +5759,7 @@ export async function mountEmbedded(root, {request, view = 'conversation', onSel
       for (const m of root.querySelectorAll('.s3-sting-media')) if (m.s3unload) m.s3unload();
       /* a video taken out of the page keeps decoding until it is collected */
       for (const vid of root.querySelectorAll('video, audio')) { try { vid.pause(); } catch (e) { /* gone */ } }
+      for (const x of segNoded.values()) x.dispose();      /* [s3-segment-feed] the node views in the feed */
       for (const w of docked) w.remove();
       fill(root);
     }
@@ -5903,7 +6205,28 @@ export async function mount(root, {request, onClose, tab: startTab = '', table: 
   let tableId = startTable || 'ES1', draft = null;   /* [s3-dice] a card can open on its table */
   let tableDrag = null; const foldedCats = new Set();   /* [s3-window] */
   /* [s3-cast] every family that keeps a table, the round rolls and the two pools included */
-  const TABLE_FAMILIES = ['CTS', 'ES', 'RS', 'IRS', 'FL', 'TEMPER', 'SHOCK', 'INTERJECT', 'SPEAKERBOX', 'FAV', 'DIRECTIVE', 'EVENT', 'CHANCE', 'POOL'];   /* [s3-sb-end] SBEND1 */
+  const TABLE_FAMILIES = ['CTS', 'ES', 'RS', 'IRS', 'FL', 'TEMPER', 'SHOCK', 'INTERJECT', 'SPEAKERBOX', 'FAV', 'DIRECTIVE', 'EVENT', 'CHANCE', 'POOL', 'RESOLVE', 'WRAP'];   /* [s3-sb-end] SBEND1 */
+  TABLE_FAMILIES.push('MEMORY');   /* [s3-memory] the kinds of memory: each a rule, then the roulette */
+  /* [s3-memory] one kind of memory: the numbers and switches its rule decides eligibility by */
+  function memoryFields(cat) {
+    cat.rule = cat.rule && typeof cat.rule === 'object' && !Array.isArray(cat.rule) ? cat.rule : {};
+    const said = k => k.replace(/_/g, ' ');
+    const rows = Object.entries(cat.rule).map(([k, v]) => typeof v === 'boolean'
+      ? el('label', 's3-row', el('input', {type: 'checkbox', checked: v, onchange: e => { cat.rule[k] = e.target.checked; }}), said(k))
+      : el('label', 's3-row', el('span', {class: 's3-muted', text: said(k)}),
+          el('input', {type: 'number', min: 0, step: 'any', value: v, style: 'width:5em', 'aria-label': said(k),
+            onchange: e => { const x = parseFloat(e.target.value); if (!Number.isNaN(x) && x >= 0) cat.rule[k] = x; }})));
+    return el('div', 's3-row s3-pool', el('span', {class: 's3-muted', text: 'its rule:'}), ...rows,
+      rows.length ? null : el('span', {class: 's3-muted', text: 'no numbers - eligible whenever the station holds this kind of memory'}));
+  }
+  /* [s3-memory] how many memories a round: at least, at most (0 to 5) */
+  function memoryKnobs(t) {
+    const n = (key, def, label) => [el('label', {class: 's3-muted', text: label}),
+      el('input', {type: 'number', min: 0, max: 5, step: 1, value: t[key] ?? def, style: 'width:4em', 'aria-label': label,
+        onchange: e => { t[key] = Math.max(0, Math.min(5, parseInt(e.target.value || '0', 10) || 0)); }})];
+    return el('div', 's3-row s3-pool', ...n('least', 1, 'at least'), ...n('most', 2, 'at most'),
+      el('span', {class: 's3-muted', text: 'memories a round, drawn among the kinds whose rule makes them relevant right now'}));
+  }
   /* [s3-events] one kind of happening: its odds, whose turn, where, whether it ends the segment */
   function eventFields(cat) {
     const pct = el('span', {text: Math.round((cat.odds ?? 0.1) * 100) + '%'});
@@ -5925,8 +6248,66 @@ export async function mount(root, {request, onClose, tab: startTab = '', table: 
   const castState = id => ((status && status.cast && status.cast.directives) || []).find(d => d.id === id);
   const dateOf = secs => { if (!secs) return ''; const d = new Date(secs * 1000); const p = n => String(n).padStart(2, '0');
     return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`; };
+  /* [s3-callend] THE CALL'S END ON THE DESK: RESOLVE's chain (how many station turns
+     answer the outcome, and who) and WRAP's who, weighted by seat; each row's own
+     fields. The seats are the booth: A the host, B the co-host, D the third seat, S the
+     SFX guy (a seat only a call that carries his has). */
+  const CALLEND_SEATS = [['A', () => castName('host') || 'the host'], ['B', () => castName('cohost') || 'the co-host'],
+    ['D', () => castName('third') || 'the third seat'], ['S', () => castName('sfx') || 'the SFX guy']];
+  function callendWeights(obj, keys, label) {
+    const row = el('div', 's3-row s3-pool', el('label', {class: 's3-muted', text: label}));
+    for (const [k, name] of keys) {
+      const out = el('span', {text: num(obj[k] ?? 0)});
+      row.append(el('label', {class: 's3-muted', text: typeof name === 'function' ? name() + ' (' + k + ')' : name}),
+        el('input', {type: 'range', min: 0, max: 5, step: 0.05, value: obj[k] ?? 0, 'aria-label': label + ' ' + k,
+          oninput: e => { obj[k] = +e.target.value; out.textContent = num(obj[k]); }}), out);
+    }
+    return row;
+  }
+  function callendTableFields(t) {
+    if (t.family === 'RESOLVE') {
+      t.responses ||= {1: 2, 2: 1}; t.responders ||= {A: 1, B: 1, D: 0.6, S: 0.8};
+      return el('div', null,
+        callendWeights(t.responses, [['1', 'one station turn'], ['2', 'two station turns']], 'the response chain:'),
+        callendWeights(t.responders, CALLEND_SEATS, 'who sets it up and answers:'));
+    }
+    t.who ||= {A: 1, B: 1, D: 0.6, S: 0.8};
+    return el('div', null, callendWeights(t.who, CALLEND_SEATS, 'who wraps the call:'));
+  }
+  function callendItemFields(item) {
+    const txt = (key, placeholder) => el('input', {type: 'text', class: 'txt', value: item[key] || '', placeholder,
+      oninput: e => { if (e.target.value.trim()) item[key] = e.target.value; else delete item[key]; }});
+    const list = (key, placeholder) => el('input', {type: 'text', class: 'txt', value: (item[key] || []).join(', '), placeholder,
+      onchange: e => { const got = e.target.value.split(',').map(x => x.trim()).filter(Boolean); if (got.length) item[key] = got; else delete item[key]; }});
+    if (draft.family === 'WRAP') {
+      return el('div', 's3-row s3-pool',
+        el('label', 's3-row', el('input', {type: 'checkbox', checked: !!item.polite, onchange: e => { item.polite = e.target.checked; }}), 'a spoken goodbye'),
+        list('only_after', 'only after (e.g. RESOLVE:buys_burns, tag:fire) - blank: any call'),
+        txt('rebuttal', "what it does to the caller's last word (e.g. they never get to finish it)"));
+    }
+    const effect = el('select', {'aria-label': 'what it does to the painting',
+      onchange: e => { if (e.target.value) item.effect = e.target.value; else delete item.effect; }},
+      ...[['', 'no effect on the gallery'], ['sold', 'sold - off the pile'], ['awarded', 'awarded - off the pile'],
+        ['burnt', 'burnt - off the pile'], ['unsold', 'unsold - on the pile, still for sale']]
+        .map(([v, t]) => el('option', {value: v, text: t, selected: (item.effect || '') === v})));
+    const raffle = !!item.raffle;
+    return el('div', 's3-row s3-pool',
+      txt('offer', "the station's setup - blank: the category's offer ({painting}, {price}, {number}, {prize})"),
+      txt('respond', 'what the response chain answers'), txt('rebuttal', "the caller's last word"),
+      effect,
+      el('label', 's3-row', el('input', {type: 'checkbox', checked: raffle,
+        onchange: e => { if (e.target.checked) item.raffle = {low: 2, high: 99}; else delete item.raffle; paintTables(); }}), 'raffle: caller number'),
+      raffle ? el('input', {type: 'number', min: 1, max: 9999, value: item.raffle.low ?? 2, style: 'width:5em', 'aria-label': 'lowest caller number',
+        onchange: e => { item.raffle.low = Math.max(1, parseInt(e.target.value || '1', 10) || 1); }}) : null,
+      raffle ? el('input', {type: 'number', min: 1, max: 9999, value: item.raffle.high ?? 99, style: 'width:5em', 'aria-label': 'highest caller number',
+        onchange: e => { item.raffle.high = Math.max(1, parseInt(e.target.value || '1', 10) || 1); }}) : null,
+      el('label', 's3-row', el('input', {type: 'checkbox', checked: !!item.speakerbox,
+        onchange: e => { if (e.target.checked) item.speakerbox = 'verbatim'; else delete item.speakerbox; }}), 'said in a speakerbox passage'),
+      list('tags', 'tags (the wrap call can follow them: tag:fire)'));
+  }
   function poolFields(item) {
     /* a directive's odds and lifetime; a favourite's origin */
+    if (draft.family === 'RESOLVE' || draft.family === 'WRAP') return callendItemFields(item);   /* [s3-callend] */
     if (draft.family === 'DIRECTIVE') {
       const pct = el('span', {text: Math.round((item.odds ?? 1) * 100) + '%'});
       const st = castState(item.id);
@@ -5951,6 +6332,14 @@ export async function mount(root, {request, onClose, tab: startTab = '', table: 
         el('input', {type: 'range', min: 0, max: 1, step: 0.01, value: item.odds ?? 0.5, 'aria-label': 'odds',
           oninput: e => { item.odds = +e.target.value; pct.textContent = Math.round(item.odds * 100) + '%'; }}), pct,
         el('span', {class: 's3-muted', text: item.id}));
+    }
+    if (draft.family === 'MEMORY') {   /* [s3-memory] the state of its kind's rule this way of putting it fits */
+      return el('div', 's3-row s3-pool', el('label', {class: 's3-muted', text: 'fits'}),
+        el('input', {type: 'text', value: Array.isArray(item.when) ? item.when.join(', ') : (item.when || ''), style: 'min-width:12em',
+          placeholder: 'the rule state it fits, e.g. top, past, segment (blank = any)', 'aria-label': 'fits',
+          onchange: e => { const got = e.target.value.split(',').map(x => x.trim()).filter(Boolean);
+            if (!got.length) delete item.when; else item.when = got.length === 1 ? got[0] : got; }}),
+        el('span', {class: 's3-muted', text: '{words} in its text are the station\'s facts'}));
     }
     if (draft.family === 'FAV') {
       const when = item.at ? new Date(item.at * 1000).toLocaleString() : '';
@@ -6120,7 +6509,9 @@ export async function mount(root, {request, onClose, tab: startTab = '', table: 
         el('input', {type: 'number', min: 0, max: 8, step: 1, value: draft.max_events ?? 2, style: 'width:4em', 'aria-label': 'most happenings per segment',
           onchange: e => { draft.max_events = Math.max(0, parseInt(e.target.value || '0', 10) || 0); }}),
         el('span', {class: 's3-muted', text: 'happenings per segment (0 = no limit)'}))] : []),
+      ...(draft.family === 'MEMORY' ? [memoryKnobs(draft)] : []),   /* [s3-memory] */
       el('p', {class: 's3-muted', text: draft.description || ''}));
+    if (draft.family === 'RESOLVE' || draft.family === 'WRAP') editor.append(callendTableFields(draft));   /* [s3-callend] */
     for (const cat of draft.categories) {
       /* [s3-window] each category folds; it can be dropped, or consolidated into another */
       const foldKey = draft.id + '/' + cat.id;
@@ -6139,6 +6530,7 @@ export async function mount(root, {request, onClose, tab: startTab = '', table: 
         btn('remove', e => { e.preventDefault(); e.stopPropagation(); if (confirm(`Remove category "${cat.label || cat.id}" and its ${(cat.items || []).length} items?`)) { draft.categories.splice(draft.categories.indexOf(cat), 1); paintTables(); } })));
       box.append(el('div', 's3-slider', el('label', null, el('b', {text: 'category weight'})), ...slider(cat.weight, v => { cat.weight = v; })));
       if (draft.family === 'EVENT') box.append(eventFields(cat));   /* [s3-events] */
+      if (draft.family === 'MEMORY') box.append(memoryFields(cat));   /* [s3-memory] */
       for (const item of cat.items) {
         const labelIn = el('input', {type: 'text', value: item.label, 'aria-label': 'label', style: draft.family === 'ES' ? 'min-width:0;flex:1' : null,
           oninput: e => { item.label = e.target.value; }});
@@ -6340,6 +6732,9 @@ export async function mount(root, {request, onClose, tab: startTab = '', table: 
       el('h4', {text: 'Draws - the roulette'}), ...SEG_FAMS.map(f => chip(f + ' - ' + String((FAMILY_WHAT[f] || [f])[0]).split(' (')[0], {kind: 'draw', family: f}, f)),
       cycle ? el('h4', {text: 'Speaker box'}) : null, cycle ? chip('prepend mark', {kind: 'mark', mark: 'prepend'}) : null, cycle ? chip('append mark', {kind: 'mark', mark: 'append'}) : null,
       el('p', {class: 's3-muted', text: 'Drag a node between two nodes; drag a draw onto a node. Tap a node for its properties. Tap a draw\'s die to turn its roulette off and pin a value.'}));
+    if (!cycle && segRoad.split('~')[0] === 'caller') palette.insertBefore(el('div', null,   /* [s3-callend] the call's end */
+      el('h4', {text: "The call's end"}), ...['RESOLVE', 'WRAP'].map(f => chip(f + ' - ' + String((FAMILY_WHAT[f] || [f])[0]).split(' (')[0],
+        {kind: 'draw', family: f}, f))), palette.lastChild);
     const props = el('div', 's3-seg-props');
     if (cycle) props.append(el('label', null, 'who opens the round ',   /* [s3-flow] */
       el('select', {onchange: e => { segInitiator = e.target.value; }},
@@ -7441,9 +7836,44 @@ export async function mount(root, {request, onClose, tab: startTab = '', table: 
   async function loadConfig() { config = await request('/api/system3/config'); }
   async function refreshStatus() { status = await request('/api/system3/status'); paintStatus(); }
 
+  /* [s3-focus] a window openSystem3Focus opened is focused on one message: its
+     lens (the block at the end of this file) paints the tabs zeroed in on it,
+     and hands a tab back to this router when the operator asks for all of
+     System 3. Null for every other window. The handles are onto this mount's
+     own state, so the lens opens the window's own editors on the right part. */
+  const focus = s3FocusLens(root, {request, send, tabs, body, controlHelp: CONTROL_HELP,
+    tab: () => tab,
+    go: id => { stopExtras(); tab = id; paint(); },
+    config: () => config,
+    settings: () => settings,
+    /* a lever saved: the live config again, and the editor's draft of that part dropped (it is the old version) */
+    loadConfig: async (kind, id) => {
+      await loadConfig();
+      if (kind === 'table' && draft && draft.id === id) draft = null;
+      if (kind === 'structure') {
+        if (segRoadOf === id) segNodes = null;
+        if (legsRoad === id) legs = null;
+        if (id === 'banter') steps = null;
+      }
+    },
+    visual: (cid, turnId) => { visualPreview = null; visualCid = cid; visualTurn = turnId || ''; },
+    director: (cid, turnId) => load(cid).then(() => { if (turnId) v.select(turnId, '', null); }),
+    table: (id, list) => {
+      if (list) { listId = list; listView.q = ''; listView.state = ''; listView.offset = 0; return; }
+      listId = '';
+      if (id) tableId = id;
+    },
+    segment: (road, index) => {
+      if (!segNodes || segRoadOf !== road) { segNodes = null; segLoad(road); }
+      segRoad = road;
+      segSel = {node: index >= 0 ? index : -1, draw: -1};
+    },
+    structure: road => { if (structRoad !== road) { structRoad = road; steps = null; legs = null; } },
+    audit: cid => { auditFilter = {family: '', conversation: cid}; }});
   function paint() {
     paintTabs();
     try {
+      if (focus && focus.paint(tab)) return;                       /* [s3-focus] */
       if (tab === 'director') { fill(body, director); paintDirector(); }
       else if (tab === 'visual') paintVisual();
       else if (tab === 'tables') paintTables();
@@ -7481,7 +7911,7 @@ export async function mount(root, {request, onClose, tab: startTab = '', table: 
     cursor = head.head || 0;
     await refreshList();
     paint();
-    if (list[0]) await load(list[0].conversation_id);
+    if (list[0] && !(focus && !focus.full())) await load(list[0].conversation_id);   /* [s3-focus] a focused window reads its own round */
     else paintDirector();
   } catch (e) { report(e); paintTabs(); }
   timers.push(setInterval(poll, 2000));
@@ -8514,4 +8944,1750 @@ export async function openSystem3({request, onClose, tab = '', table = '', conve
   view = await mount(root, {request, onClose: close, tab, table, conversationId});
   if (closed) view.dispose(); else { const b = root.querySelector('button'); b && b.focus(); }
   return {element: backdrop, close};
+}
+
+/* ======================================================================== */
+/* [s3-segment-nodes] A SCHEDULED SEGMENT, AS THE NODES THAT BUILT IT.
+ *
+ * "add an icon ... for converting the convo view ... into a nodal view of how
+ *  the segment was constructed. I want to see the nodes with RNG and roulette
+ *  results in a conversation chain representing how it was constructed with
+ *  system prompts / prompts, memory inserts, insets, gold, sponetanity systems
+ *  (if applicable), vertically." And: "expand and select and investigate and
+ *  inspect other segments via the right click menu and be able to trace the
+ *  nodes of how the segments are constructed via roulette RNG and System 3"
+ *  (the operator, 2026-09-28).
+ *
+ * A segment is one entry of the station's running order as it went on air -
+ * System2's occurrence, stamped on every line of the script when the line took
+ * its place there (GET /api/system3/segment/{id}). Every conversation that went
+ * out in it is chained inside it: a round, or a single line - an interjection,
+ * a station ID, an ad spot is a one-turn conversation IN the segment, never a
+ * segment of its own. The chain reads top to bottom in the order the segment
+ * was built: its scheduling (what the plan bound to the entry, why), then each
+ * conversation - the round's own rolls (the spontaneity systems: tempers,
+ * shocks, interjections, events, favourites, directives, the station's dice),
+ * its prompt (the system prompt, the writer's prompt and every block of it as
+ * System 3 decided it, memory inserts among them), and turn by turn the rolls
+ * with their dice and the rows they landed on, the insets (speaker-box
+ * passages, stings, the SFX Guy's line, gold and re-airs where a line carries
+ * the stamp), the words written and the air. Every die is the recorded d100;
+ * a node opens the decision card that shows how it was decided. Nothing here
+ * moves the page: a pick of another segment is the only scroll, and it is the
+ * operator's. */
+const SG_SPONTANEITY = new Set(['TEMPER', 'SHOCK', 'INTERJECT', 'MENTION', 'EVENT', 'FAV', 'DIRECTIVE', 'CARRY']);
+const SG_REWRITE = new Set(['TINT', 'REPAIR', 'ROOM']);
+const sgHm = t => (t ? new Date(Number(t) * 1000).toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'}) : '');
+const sgWindow = seg => (seg && seg.start ? `${sgHm(seg.start)} - ${sgHm(seg.ends)}` : '');
+const sgOf = x => String((x && typeof x === 'object' ? x.id : x) || '');
+function sgIcon(ref, label, onclick, extra = {}, short = '') {
+  const b = el('button', {type: 'button', class: 's3-ibtn', title: label, 'aria-label': label, onclick, ...extra});
+  const svg = typeof window.pineIcon === 'function' ? window.pineIcon(ref) : '';
+  if (svg) b.innerHTML = svg; else { b.textContent = short || label; b.classList.add('txt'); }
+  return b;
+}
+function sgName(seg) {
+  if (!seg) return 'no segment';
+  return `${seg.label || seg.kind || 'segment'}${seg.kind && seg.label && seg.label.toLowerCase() !== seg.kind ? ` (${seg.kind})` : ''}`;
+}
+async function sgTrace(request, id, {full = true, scheduling = false} = {}) {
+  return request('/api/system3/segment/' + encodeURIComponent(id) + `?full=${full ? 1 : 0}&scheduling=${scheduling ? 1 : 0}`);
+}
+/* The segment a conversation or a line went out in: its lines' own segment
+   (the block they took their place in), else the one on air when it was
+   planned. '' when neither is on the record. */
+async function sgResolve(request, {segment = '', conversation = '', lineId = ''} = {}) {
+  if (sgOf(segment)) return sgOf(segment);
+  let cid = String(conversation || '');
+  if (!cid && lineId) {
+    try {
+      const got = await request('/api/system3/line?line_id=' + encodeURIComponent(lineId));
+      if (got && got.line && got.line.segment) return String(got.line.segment);
+      cid = String((got && got.line && got.line.conversation_id) || '');
+    } catch (e) { return ''; }
+  }
+  if (!cid) return '';
+  try {
+    const conv = await cachedConversation(request, cid);
+    const lined = (conv.lines || []).find(l => l.segment);
+    return String((lined && lined.segment) || ((conv.identity || {}).segment || {}).id || '');
+  } catch (e) { return ''; }
+}
+
+/* One node on the spine: a dot in its family's colour, its die when it was a
+   draw, the family, what it landed on and the facts under it. */
+function sgNode({fam = '', dice, label = '', text = '', sub = '', cls = '', onOpen = null, title = ''} = {}, ...kids) {
+  const face = dice === undefined ? null : die(dice == null || dice === '' ? null : Number(dice));
+  const node = el('div', {class: 's3-sgn' + (cls ? ' ' + cls : '') + (onOpen ? ' s3-sgn-open' : ''), style: `--fam:${FAM[fam] || 'var(--obs)'}`,
+      role: onOpen ? 'button' : null, tabindex: onOpen ? '0' : null, title: title || (onOpen ? 'tap for how this was decided' : null),
+      onclick: onOpen ? e => {
+        /* a control inside the node keeps its own tap; a fold the node sits in does not count */
+        const hit = e.target.closest('a, button, summary, details, input, select, video, audio');
+        if (hit && hit !== e.currentTarget && e.currentTarget.contains(hit)) return;
+        e.stopPropagation(); onOpen(e);
+      } : null,
+      onkeydown: onOpen ? e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onOpen(e); } } : null},
+    el('span', {class: 's3-sgn-dot', 'aria-hidden': 'true'}),
+    el('div', 's3-sgn-body',
+      el('div', 's3-sgn-line', face, el('b', {class: 's3-sgn-fam', text: label || fam}),
+        text ? el('span', {class: 's3-sgn-text', text}) : null),
+      sub ? el('div', {class: 's3-sgn-sub s3-muted', text: sub}) : null, ...kids));
+  node.face = face;
+  return node;
+}
+
+/* A recorded decision as a node: its d100, what it landed on, where in the
+   draw, and the table it came from. */
+function sgRoll(conv, ev, t, api) {
+  const line = eventLine(ev, conv);
+  const sb = sbOutcome(ev);
+  const sel = ev.selected || {};
+  const item = stage(ev, 'item') || stage(ev, 'mode');
+  const where = item && item.of ? `${item.selected_index || '?'} of ${item.of}` : '';
+  const what = (FAMILY_WHAT[ev.family] || [ev.family])[0];
+  const node = sgNode({fam: ev.family, dice: line.dice, text: String(landedWords(ev, conv) || line.text || '').replace(/\s+/g, ' ').slice(0, 220),
+    sub: [where, sel.table ? 'table ' + sel.table : '', what !== ev.family ? what : '', sb ? sb.why : ''].filter(Boolean).join(' · '),
+    cls: 's3-sgn-roll' + (sb && !sb.won ? ' miss' : '') + (SG_SPONTANEITY.has(ev.family) ? ' s3-sgn-spont' : ''),
+    onOpen: () => openDecision(conv, ev, t, api)});
+  node.dataset.event = ev.event_id || '';
+  if (sb && !sb.won && node.face) node.face.classList.add('miss');
+  return node;
+}
+/* The same from the compact record, when the whole conversation is not held:
+   its card is fetched when it is opened. */
+function sgCompactRoll(request, cid, r, t, api) {
+  return sgNode({fam: r.family, dice: r.dice == null ? null : r.dice, text: String(r.label || '').slice(0, 220),
+    sub: [r.index && r.of ? `${r.index} of ${r.of}` : '', r.table ? 'table ' + r.table : '', r.rule || ''].filter(Boolean).join(' · '),
+    cls: 's3-sgn-roll' + (SG_SPONTANEITY.has(r.family) ? ' s3-sgn-spont' : ''),
+    onOpen: r.event_id ? async () => {
+      try {
+        const conv = await cachedConversation(request, cid);
+        const ev = (conv.decision_events || []).find(e => e.event_id === r.event_id);
+        if (ev) openDecision(conv, ev, (conv.turns || []).find(x => x.turn_id === ev.turn_id) || t || null, api);
+      } catch (e) { /* the conversation is past retention */ }
+    } : null});
+}
+
+function sgTextFold(title, text) {
+  const body = String(text || '');
+  return el('details', 's3-sgn-fold', el('summary', {text: `${title} (${body.length} characters)`}), el('pre', {text: body || '(none)'}));
+}
+/* THE PROMPT: the writer call whose prompt carries this round's running order
+   (found as the tapped line's Prompt tab finds it), folded shut until opened -
+   the system prompt as sent, the prompt, what came back, and every block of it
+   as System 3 decided it (sent, rolled, stripped). */
+function sgPrompt(request, conv, state) {
+  const body = el('div', 's3-sgn-prompt-body');
+  const fold = el('details', {class: 's3-sgn s3-sgn-prompt', style: '--fam:var(--line)'},
+    el('summary', null, el('span', {class: 's3-sgn-dot', 'aria-hidden': 'true'}), el('b', {class: 's3-sgn-fam', text: 'PROMPT'}),
+      el('span', {class: 's3-sgn-text', text: 'the system prompt, the prompt to the writer, and every block as System 3 decided it'})),
+    body);
+  let painted = false;
+  fold.addEventListener('toggle', async () => {
+    if (!fold.open || painted) return;
+    painted = true;
+    fill(body, para('Looking for the writer call that wrote it...', 's3-muted'));
+    let w;
+    try { w = await findWriterCall(request, conv, null, state.callCache); } catch (e) { w = {row: null, why: (e && e.message) || String(e)}; }
+    if (!w || !w.row) { fill(body, para('No prompt: ' + ((w && w.why) || 'the prompt history holds none for it'), 's3-muted')); return; }
+    const parts = promptParts(w.detail || {});
+    fill(body,
+      el('div', 's3-row', el('b', {text: `${w.row.model || '?'} - ${w.row.purpose || ''}`}),
+        el('span', {class: 's3-muted', text: day(Number(w.row.at || 0))}),
+        el('span', {class: 's3-pill ' + (w.exact ? 'active' : 'shadow'), text: w.exact ? 'proven by its words' : 'nearest by time'}),
+        el('span', {class: 's3-muted', text: w.why || ''})),
+      sgTextFold('The system prompt, as it was sent', parts.sys || NO_SYSTEM),
+      sgTextFold('The prompt to the writer', parts.user),
+      sgTextFold('What the writer sent back', parts.text),
+      parts.user ? promptBlocksBox(request, parts.user) : null);
+  });
+  return fold;
+}
+
+/* A sting on the ledger, as the node it was: the category die, the clip die,
+   the clip and its poster. */
+function sgSting(line) {
+  const roll = line.sfx_roll && typeof line.sfx_roll === 'object' ? line.sfx_roll : {};
+  const dice = [roll.category, roll.clip].filter(r => r && typeof r === 'object');
+  const kids = dice.map((r, i) => el('span', {class: 's3-sgn-chipdie'}, die(r.dice == null || r.dice === '' ? null : Number(r.dice)),
+    el('span', {class: 's3-muted', text: `${i ? 'clip' : 'category'}: ${String(r.label || '').slice(0, 40)}${r.of ? ' of ' + r.of : ''}`})));
+  const poster = typeof line.poster === 'string' && line.poster
+    ? el('img', {class: 's3-sgn-poster', src: stationUrl(line.poster), alt: boardName(line) || 'the clip', loading: 'lazy', decoding: 'async',
+      onerror: e => { e.currentTarget.hidden = true; }}) : null;
+  const node = sgNode({fam: 'SFX', label: 'STING', text: boardName(line) || 'a clip off the board', cls: 's3-sgn-inset'},
+    kids.length ? el('div', 's3-sgn-dice', ...kids) : null, poster);
+  node.dataset.line = line.line_id || '';
+  return node;
+}
+
+/* The air, for the lines a turn has in this segment: heard, withdrawn (and
+   why), waiting, or no receipt yet. Filled when the receipts arrive. */
+function sgAirWord(lines, air) {
+  if (!lines.length) return {word: 'no line of it in this segment', cls: ''};
+  const got = airOfLines(lines, air);
+  if (got === 'aired') {
+    const a = lines.map(l => air.get(l.line_id)).find(x => airOn(x)) || {};
+    return {word: 'heard' + (a.at ? ' ' + a.at : ''), cls: 'heard'};
+  }
+  if (got === 'off') {
+    const a = lines.map(l => air.get(l.line_id)).find(x => airOff(x)) || {};
+    return {word: 'not heard: ' + (a.cut_why || a.withdrawn_why || a.aired || 'withdrawn'), cls: 'gone'};
+  }
+  if (got === 'waiting') return {word: 'waiting its turn on the air', cls: ''};
+  return {word: 'no air receipt yet', cls: ''};
+}
+
+function sgTurn(ctx, conv, t, here, elsewhere) {
+  const lines = (conv.lines || []).filter(l => l.turn_id === t.turn_id && here.has(l.line_id));
+  const spoken = lines.filter(isSpoken);
+  const idx = scriptIndexOf(conv, t);
+  const perf = t.performance || {};
+  const away = !lines.length && elsewhere;
+  const group = el('div', {class: 's3-sgn-turn' + (away ? ' away' : ''), 'data-turn': t.turn_id});
+  group.append(sgNode({fam: 'COMMIT', label: `TURN ${t.index + 1}`,
+    text: `${t.name || t.speaker} · ${t.step_label || t.leg || t.step || ''}${t.phase ? ' · ' + t.phase : ''}`,
+    sub: [perf.emotion ? `${perf.emotion} ${num(perf.intensity)}` : '', away ? 'its line went out in another segment' : '',
+      (t.directions || []).map(d => d.text).join('; ')].filter(Boolean).join(' · '), cls: 's3-sgn-turnhead'}));
+  for (const ev of turnEvents(conv, t)) group.append(sgRoll(conv, ev, t, ctx.api));
+  /* the insets: what came into the turn from outside the writer's words */
+  for (const sb of (t.speakerbox || []).filter(s => s.mode && s.mode !== 'NONE')) {
+    const mat = sb.material || {};
+    const ev = (conv.decision_events || []).find(e => e.event_id === sb.event_id);
+    group.append(sgNode({fam: 'SPEAKERBOX', label: 'INSET', text: `${String(sb.mode).toLowerCase().replace('_', ' ')} - ${mat.file || sb.unmet || 'no passage fetched'}`,
+      sub: (SB_WORD[sb.mode] || '') + (mat.text ? ': "' + String(mat.text).replace(/\s+/g, ' ').slice(0, 260) + '"' : ''),
+      cls: 's3-sgn-inset', onOpen: ev ? () => openDecision(conv, ev, t, ctx.api) : null}));
+  }
+  if (t.topic_material && t.topic_material.text) {
+    group.append(sgNode({fam: 'TOPIC', label: 'INSET', text: 'a second subject - ' + (t.topic_material.file || ''),
+      sub: String(t.topic_material.text).replace(/\s+/g, ' ').slice(0, 260), cls: 's3-sgn-inset'}));
+  }
+  const slot = boardPlan(conv).get(t.turn_id);
+  for (const l of slot ? slot.before : []) if (here.has(l.line_id)) group.append(sgSting(l));
+  const said = idx == null ? [] : (conv.observations_air || []).filter(o => o.family === 'SFXGUY' && o.turn_index === idx);
+  /* gold bars, re-airs and anything else that carries a line into this turn with its own stamp */
+  const stamped = lines.filter(l => !isSpoken(l) && !isBoard(l) && l.who !== 'drop' &&
+    (l.gold || l.replay_of || /gold|replay|re-?air/i.test(String(l.kind || l.who || ''))));
+  const words = lineText(conv, t) || spoken.map(l => l.text).join(' ');
+  group.append(sgNode({fam: 'LINE', label: 'LINE', text: words ? String(words).replace(/\s+/g, ' ').slice(0, 600) : 'no words - ' + (t.status || 'planned'),
+    sub: spoken.length ? `${spoken.length} line${spoken.length === 1 ? '' : 's'} in the script (block ${spoken[0].block})` : '',
+    cls: 's3-sgn-words'}));
+  for (const l of slot ? slot.after : []) if (here.has(l.line_id)) group.append(sgSting(l));
+  for (const o of said) {
+    const draws = o.draws || [];
+    const last = draws[draws.length - 1] || null;
+    group.append(sgNode({fam: 'SFXGUY', label: 'SFX GUY', dice: last ? last.dice : null, text: o.line || '(no words)',
+      sub: [SFXGUY_KIND[o.kind] || o.kind || '', last ? `${last.index} of ${last.of} in the ${last.pool} pool` : String(o.how || '')].filter(Boolean).join(' · '),
+      cls: 's3-sgn-inset'}));
+  }
+  for (const l of stamped) {
+    group.append(sgNode({fam: 'TINT', label: l.replay_of ? 'RE-AIR' : 'GOLD', text: String(l.text || '').slice(0, 300),
+      sub: [l.replay_of ? 'first aired as ' + l.replay_of : '', l.gold && typeof l.gold === 'object' ? 'from ' + (l.gold.conversation_id || '') + ' ' + (l.gold.turn_id || '') : ''].filter(Boolean).join(' · '),
+      cls: 's3-sgn-inset'}));
+  }
+  const airNode = sgNode({fam: 'COMMIT', label: 'AIR', text: lines.length ? 'reading the receipts...' : sgAirWord(lines, ctx.air).word, cls: 's3-sgn-air'});
+  airNode.dataset.lines = lines.map(l => l.line_id).join(',');
+  group.append(airNode);
+  return group;
+}
+
+/* One conversation of the segment, chained in the order it was built. */
+function sgConversation(ctx, c) {
+  const conv = c.conversation || null;
+  const single = !!c.single;
+  const planned = c.planned_in || {};
+  const seg = ctx.segment || {};
+  const facts = [
+    c.created ? 'planned ' + clock(Number(c.created)) : '',
+    planned.id && planned.id !== seg.id ? `while ${sgName(planned)} was on air` : '',
+    c.bank ? 'written ahead for the bank' : (c.created ? 'written live' : ''),
+    c.prepared_for ? (c.prepared_for === seg.id ? 'System2 wrote it for this entry' : 'System2 wrote it for ' + c.prepared_for) : '',
+    c.structure && c.structure.id ? 'structure ' + c.structure.id + (c.structure.version ? ' v' + c.structure.version : '') + (c.structure.variant ? ' (variant ' + c.structure.variant + ')' : '') : '',
+    c.length ? `length ${c.length.turns} turns (band ${c.length.lo}-${c.length.hi})` : '',
+    c.verdict ? 'checker: ' + c.verdict : ''].filter(Boolean);
+  const box = el('section', {class: 's3-sgn-conv' + (single ? ' single' : ''), 'data-conv': c.conversation_id || ''});
+  box.append(sgNode({fam: single ? 'LINE' : 'CTS', label: String(c.road || 'conversation').toUpperCase().replace(/_/g, ' '),
+    text: (single ? 'a single line' : `a round of ${(c.turns || []).length} turns`) + ` · ${c.mode || ''} · ${c.lines || 0} line${c.lines === 1 ? '' : 's'} in this segment`,
+    sub: facts.join(' · '), cls: 's3-sgn-convhead'},
+    c.topic ? el('div', {class: 's3-sgn-topic', text: c.topic}) : null));
+  if (c.gone) { box.append(sgNode({fam: 'COMMIT', label: 'GONE', text: c.why || 'past retention'})); return box; }
+  const cid = c.conversation_id;
+  if (!conv) {
+    /* the compact record: the rolls and the turns, each card fetched when opened */
+    for (const r of (c.rolls || []).filter(x => x.family !== 'STATION')) box.append(sgCompactRoll(ctx.request, cid, r, null, ctx.api));
+    for (const t of c.turns || []) {
+      const g = el('div', 's3-sgn-turn');
+      g.append(sgNode({fam: 'COMMIT', label: `TURN ${Number(t.index) + 1}`, text: `${t.name || t.speaker || ''} · ${t.step || ''}`, cls: 's3-sgn-turnhead'}));
+      for (const r of t.rolls || []) g.append(sgCompactRoll(ctx.request, cid, r, null, ctx.api));
+      if (t.text) g.append(sgNode({fam: 'LINE', label: 'LINE', text: String(t.text).slice(0, 600), cls: 's3-sgn-words'}));
+      box.append(g);
+    }
+    return box;
+  }
+  const evs = (conv.decision_events || []).filter(e => !e.turn_id && !e.stage && e.kind !== 'observation');
+  const own = evs.filter(e => e.family !== 'STATION');
+  const station = evs.filter(e => e.family === 'STATION');
+  const spont = own.filter(e => SG_SPONTANEITY.has(e.family)).length;
+  if (own.length) {
+    box.append(el('div', {class: 's3-sgn-caption s3-muted', text: (single ? 'its own rolls' : "the round's own rolls") +
+      (spont ? ` - ${spont} of them its spontaneity (tempers, shocks, interjections, events, favourites, directives, the carry)` : '')}));
+    for (const ev of own) box.append(sgRoll(conv, ev, null, ctx.api));
+  }
+  if (station.length) {
+    /* the station's own dice, rolled on this task before the round was planned:
+       folded to a count, opened on a tap */
+    const list = el('div', 's3-sgn-station-list');
+    const fold = el('details', {class: 's3-sgn s3-sgn-station', style: '--fam:var(--obs)'},
+      el('summary', null, el('span', {class: 's3-sgn-dot', 'aria-hidden': 'true'}), el('b', {class: 's3-sgn-fam', text: 'STATION'}),
+        el('span', {class: 's3-sgn-text', text: `${station.length} roll${station.length === 1 ? '' : 's'} the station made before this was planned`})),
+      list);
+    fold.addEventListener('toggle', () => { if (fold.open && !list.childElementCount) fill(list, ...station.map(ev => sgRoll(conv, ev, null, ctx.api))); });
+    box.append(fold);
+  }
+  const plan = conv.plan || {};
+  if (plan.line != null && plan.choice != null) {
+    /* a line drawn off its road's own list: no writer wrote it, the LINE draw chose it */
+    box.append(sgNode({fam: 'LINE', label: 'NO WRITER', text: `the words were drawn off its list - ${Number(plan.choice) + 1} of ${((conv.inputs || {}).candidates || []).length || '?'}`,
+      sub: (conv.inputs || {}).candidates_from ? 'the list: ' + conv.inputs.candidates_from : 'the LINE roll below chose them'}));
+  } else if (!single || plan.sheet) {
+    box.append(sgPrompt(ctx.request, conv, ctx.state));
+  }
+  const here = new Set(c.line_ids || []);
+  const elsewhere = new Set((conv.lines || []).filter(l => l.turn_id && !here.has(l.line_id)).map(l => l.turn_id));
+  for (const t of conv.turns || []) box.append(sgTurn(ctx, conv, t, here, elsewhere.has(t.turn_id)));
+  const val = conv.validation || {};
+  if (val.verdict) {
+    box.append(sgNode({fam: 'REPAIR', label: 'CHECKED', text: `${val.verdict} ${num(val.score)}`,
+      sub: [val.written != null ? `${val.written} of ${val.planned} turns written` : '', val.seat_order != null ? 'seat order ' + pct(val.seat_order) : ''].filter(Boolean).join(' · ')}));
+  }
+  return box;
+}
+
+/* The segment itself: the entry the clock put on air, and why it held what it
+   held - filled when the director has answered. */
+function sgSegmentHead(tr) {
+  const seg = tr.segment || {};
+  const convs = tr.conversations || [];
+  const lines = (tr.blocks || []).reduce((a, b) => a + (Number(b.lines) || 0), 0);
+  const decision = el('div', 's3-sgn-decision', para('Asking the director how this entry was scheduled...', 's3-muted'));
+  const node = sgNode({fam: 'COMMIT', label: 'SEGMENT', text: `${sgName(seg)} · ${sgWindow(seg)}`,
+    sub: [seg.engine === 'system2' ? `System2's entry ${Number(seg.index || 0) + 1} of the hour ${seg.hour || ''}` : 'the running order',
+      tr.registered === false ? (tr.why || 'nothing of it has reached the script yet')
+        : `${tr.rounds || 0} round${tr.rounds === 1 ? '' : 's'}, ${tr.singles || 0} single line${tr.singles === 1 ? '' : 's'}, ${lines} line${lines === 1 ? '' : 's'} in the script`]
+      .filter(Boolean).join(' · '), cls: 's3-sgn-seghead'}, decision);
+  node.fillDecision = (sched, prepared) => {
+    const e = (sched && sched.entry) || null;
+    const o = (e && e.orchestration) || {};
+    const census = (sched && sched.census) || null;
+    const mine = census && (census.entries || []).find(x => x.label === (e && e.label) || x.label === seg.label);
+    const rows = [];
+    if (e) {
+      rows.push(el('div', 's3-row', el('span', {class: 's3-pill', text: e.state || '?'}),
+        el('span', {class: 's3-muted', text: `${num((Number(e.deadline) - Number(e.start)) / 60, 1)} min owned · ${num(e.own_seconds, 0)} s of its own on air of ${num(e.aired_seconds, 0)} s heard in its window`})));
+      if (o.target) rows.push(kv([['the plan asked', `${o.target.lines ?? '?'} lines, ${num(o.target.seconds, 0)} s`],
+        ['it had', `${(o.have || {}).lines ?? '?'} lines, ${num((o.have || {}).seconds, 0)} s`],
+        ['short', `${(o.short || {}).lines ?? '?'} lines, ${num((o.short || {}).seconds, 0)} s`]]));
+      const dir = e.direction || {};
+      if (dir.clause || (dir.standing || []).length) rows.push(el('div', 's3-sgn-sub', el('b', {text: 'Direction in force: '}), dir.clause || (dir.standing || []).map(x => x.text).join('; ')));
+      if (e.review && e.review.state) rows.push(el('div', {class: 's3-sgn-sub s3-muted', text: 'review: ' + e.review.state}));
+      if (e.prompt) rows.push(sgTextFold('The entry\'s standing instruction', e.prompt));
+    }
+    if (census) {
+      rows.push(el('div', 's3-sgn-sub', el('b', {text: `The ${census.kind || seg.kind} road's census now: `}), census.say || ''));
+      if (mine) rows.push(el('div', {class: 's3-sgn-sub s3-muted', text: `${mine.label}: ${mine.commit || ''} - ${mine.why || ''}`}));
+    }
+    if ((prepared || []).length) rows.push(el('div', {class: 's3-sgn-sub s3-muted', text: `System2 wrote ${prepared.length} for it: ` +
+      prepared.map(p => `${p.road} (${p.status || '?'})`).join(', ')}));
+    for (const w of (sched && sched.why) || []) rows.push(para(w, 's3-muted'));
+    if (sched && sched.note) rows.push(para(sched.note + ' (' + clock(Number(sched.read_at || 0)) + ')', 's3-muted'));
+    fill(decision, ...(rows.length ? rows : [para('The director holds nothing for this entry.', 's3-muted')]));
+  };
+  return node;
+}
+
+/* Roll the dice on show once, a little staggered, when motion is allowed. */
+function sgRollIn(root) {
+  if (reduced()) return;
+  const faces = [...root.querySelectorAll('.s3-sgn-line > .s3-die:not(.none)')].slice(0, 48);
+  faces.forEach((f, k) => { const n = f.closest('.s3-sgn'); if (n && n.face && n.face.roll) setTimeout(() => n.face.roll(420 + (k % 8) * 70), 60 + k * 35); });
+}
+
+export async function mountSegmentNodes(root, {request, segment = '', conversation = '', lineId = '', onSegment = null} = {}) {
+  request ||= defaultRequest();
+  root.classList.add('s3', 's3-sgn-root');
+  const v = makeViews({request});
+  const state = {callCache: new Map(), alive: true, id: '', trace: null, settled: Promise.resolve()};
+  fill(root, para('Finding the segment...', 's3-muted'));
+  /* The chain is drawn as soon as the segment is read; the director's answer
+     and the air's receipts fill their own nodes when they come, in place -
+     nothing above the reader grows or moves for them. */
+  async function show(id) {
+    const want = String(id || '');
+    state.id = want;
+    state.settled = Promise.resolve();
+    if (!want) { fill(root, para('This was not stamped with a scheduled segment - it went out before the segment stamp, or while the station ran no schedule.', 's3-muted')); return null; }
+    fill(root, para('Reading the segment ' + want + '...', 's3-muted'));
+    const asked = sgTrace(request, want, {full: false, scheduling: true});
+    asked.catch(() => {});
+    let tr;
+    try { tr = await sgTrace(request, want, {full: true, scheduling: false}); }
+    catch (e) {
+      if (state.alive && state.id === want) fill(root, para('The segment could not be read: ' + String((e && e.message) || e), 's3-error'));
+      return null;
+    }
+    if (!state.alive || state.id !== want) return null;
+    state.trace = tr;
+    const ctx = {request, api: v.api, air: v.air, state, segment: tr.segment};
+    const head = sgSegmentHead(tr);
+    const chain = el('div', 's3-sgn-chain', head, ...(tr.conversations || []).map(c => sgConversation(ctx, c)));
+    if (!(tr.conversations || []).length) chain.append(para(tr.registered === false ? 'Nothing of this segment is in the script yet.' : 'No System 3 conversation went out in this segment.', 's3-muted'));
+    fill(root, chain);
+    sgRollIn(chain);
+    if (onSegment) { try { onSegment(tr); } catch (e) { /* the host's own */ } }
+    const live = () => state.alive && state.id === want;
+    const decided = asked.then(got => { if (live()) head.fillDecision((got || {}).scheduling, tr.prepared_for || []); },
+      err => { if (live()) head.fillDecision({why: ['the director could not be asked: ' + String((err && err.message) || err)]}, tr.prepared_for || []); });
+    /* the air's receipts, for the blocks this segment holds: three asks at a
+       time, each block's AIR nodes filled as its answer lands */
+    const paintAir = () => {
+      for (const n of chain.querySelectorAll('.s3-sgn-air')) {
+        const ids = String(n.dataset.lines || '').split(',').filter(Boolean);
+        if (!ids.length || !ids.some(x => v.air.has(x))) continue;
+        const got = sgAirWord(ids.map(x => ({line_id: x})), v.air);
+        const t = n.querySelector('.s3-sgn-text');
+        if (t) t.textContent = got.word;
+        n.classList.toggle('heard', got.cls === 'heard');
+        n.classList.toggle('gone', got.cls === 'gone');
+      }
+    };
+    const heard = (async () => {
+      const blocks = (tr.blocks || []).slice(0, 16).map(x => x.block);
+      let next = 0;
+      const worker = async () => {
+        while (next < blocks.length && live()) {
+          const b = blocks[next++];
+          try {
+            const got = await request('/api/segment/inspect?block=' + encodeURIComponent(b));
+            for (const l of (got && got.lines) || []) v.air.set(l.line_id, l);
+          } catch (e) { /* that block's receipts stay unread */ }
+          if (live()) paintAir();
+        }
+      };
+      await Promise.all([worker(), worker(), worker()]);
+      if (!live()) return;
+      for (const n of chain.querySelectorAll('.s3-sgn-air')) {
+        const t = n.querySelector('.s3-sgn-text');
+        if (t && /reading the receipts/.test(t.textContent)) t.textContent = 'no air receipt yet';
+      }
+    })();
+    state.settled = Promise.allSettled([decided, heard]);
+    return tr;
+  }
+  const first = await sgResolve(request, {segment, conversation, lineId});
+  await show(first);
+  return {
+    show,
+    segment: () => state.id,
+    trace: () => state.trace,
+    settled: () => state.settled,             /* the director's answer and the receipts, filled */
+    dispose() { state.alive = false; v.alive = false; fill(root); }
+  };
+}
+
+/* THE INSPECTOR: the chain of one segment, and every other segment to pick -
+   the ones the script went through, in its order, and the entries still to
+   come on the director's sheet. */
+export async function mountSegmentInspector(root, {request, segment = '', conversation = '', lineId = '', hours = 6, pick: choose = false} = {}) {
+  request ||= defaultRequest();
+  root.classList.add('s3', 's3-sgi');
+  const pick = el('select', {class: 's3-sgi-pick', 'aria-label': 'the segment to inspect'});
+  const prev = sgIcon('c:caret--left', 'The segment before', () => step(-1), {}, 'Before');
+  const next = sgIcon('c:caret--right', 'The segment after', () => step(1), {}, 'After');
+  const note = el('span', {class: 's3-muted s3-sgi-note'});
+  const scroller = el('div', 's3-sgi-body');
+  const bar = el('div', 's3-sgi-bar', el('b', {text: 'Segment'}), prev, pick, next, note);
+  fill(root, bar, scroller);
+  let list = [], nodes = null, alive = true;
+  const optionOf = s => el('option', {value: s.id, text: `${sgHm(s.start)} ${sgName(s)}` + (s.rounds != null ? ` - ${s.rounds} round${s.rounds === 1 ? '' : 's'}, ${s.singles} single line${s.singles === 1 ? '' : 's'}` : '')});
+  async function readList() {
+    let got = {};
+    try { got = await request('/api/system3/segments?' + new URLSearchParams({since: String(Date.now() / 1000 - hours * 3600), limit: '120', plan: '1'})); }
+    catch (e) { note.textContent = 'the segment list could not be read: ' + e.message; }
+    const seen = new Set();
+    list = (got.segments || []).map(s => { seen.add(s.id); return s; });
+    const now = got.now && got.now.id ? got.now : null;
+    const ahead = (((got.plan || {}).entries) || []).filter(e => e.occurrence && !seen.has(e.occurrence) && Number(e.deadline) > Date.now() / 1000)
+      .map(e => ({id: e.occurrence, label: e.label, kind: e.kind, start: e.start, ends: e.deadline, state: e.state}));
+    const aired = el('optgroup', {label: 'in the script, in its order'}, ...list.map(optionOf));
+    const coming = ahead.length ? el('optgroup', {label: 'on the sheet, still to come'}, ...ahead.map(s => optionOf(s))) : null;
+    if (now && !seen.has(now.id) && !ahead.some(x => x.id === now.id)) aired.append(optionOf(now));
+    fill(pick, aired, coming);
+    list = [...list, ...(now && !seen.has(now.id) ? [now] : []), ...ahead.filter(x => !now || x.id !== now.id)];
+    return got;
+  }
+  function paintPick(id) {
+    if (![...pick.options].some(o => o.value === id) && id) pick.prepend(el('option', {value: id, text: id}));
+    pick.value = id;
+    const i = list.findIndex(s => s.id === id);
+    prev.disabled = i <= 0;
+    next.disabled = i < 0 || i >= list.length - 1;
+  }
+  /* the operator picked another segment: the one scroll here brings its chain
+     to the top of whatever scrolls the inspector */
+  function toTop() {
+    for (let p = root.parentElement; p; p = p.parentElement) {
+      const s = getComputedStyle(p);
+      if (/(auto|scroll)/.test(s.overflowY) && p.scrollHeight > p.clientHeight) {
+        p.scrollTop = Math.max(0, p.scrollTop + root.getBoundingClientRect().top - p.getBoundingClientRect().top);
+        return;
+      }
+    }
+    if (/(auto|scroll)/.test(getComputedStyle(root).overflowY)) root.scrollTop = 0;
+  }
+  async function open(id, picked = false) {
+    if (!alive) return;
+    if (picked) toTop();
+    if (nodes) nodes.dispose();
+    const host = el('div');
+    fill(scroller, host);
+    nodes = await mountSegmentNodes(host, {request, segment: id});
+    paintPick(nodes.segment());
+  }
+  function step(d) {
+    const i = list.findIndex(s => s.id === pick.value);
+    const to = list[i + d];
+    if (to) open(to.id, true);
+  }
+  /* "Inspect other segments": the picker opens out as the list of them to pick
+     from, and folds back to one line when one is picked */
+  const unfold = () => {
+    const n = pick.options.length + pick.querySelectorAll('optgroup').length;
+    pick.size = Math.max(2, Math.min(10, n));
+    pick.classList.add('open');
+    pick.focus({preventScroll: true});
+  };
+  pick.addEventListener('change', () => {
+    if (pick.size > 1) { pick.size = 1; pick.classList.remove('open'); }
+    open(pick.value, true);
+  });
+  const [, first] = await Promise.all([readList(), sgResolve(request, {segment, conversation, lineId})]);
+  await open(first || (list.length ? list[list.length - 1].id : ''));
+  if (choose && alive) unfold();
+  return {
+    open: id => open(id, true),
+    choose: unfold,
+    settled: () => (nodes ? nodes.settled() : Promise.resolve()),
+    segment: () => (nodes ? nodes.segment() : ''),
+    async refresh() { await readList(); paintPick(nodes ? nodes.segment() : ''); },
+    dispose() { alive = false; if (nodes) nodes.dispose(); fill(root); }
+  };
+}
+
+/* The inspector in a sheet over the page: Escape, the close button or a tap
+   outside it closes it; the broadcast ducks to the report level while it is
+   open. Returns the close function. */
+export function openSegmentInspector({request, segment = '', conversation = '', lineId = '', pick = false} = {}) {
+  request ||= defaultRequest();
+  const back = el('div', {class: 's3 s3-modal-back s3-sgi-back'});
+  const before = document.activeElement;
+  let view = null, closed = false;
+  const close = () => {
+    if (closed) return;
+    closed = true;
+    back.remove(); document.removeEventListener('keydown', onKey, true);
+    if (view) view.dispose();
+    if (before && before.focus) before.focus({preventScroll: true});      /* never a scroll the operator did not make */
+  };
+  const onKey = e => { if (e.key === 'Escape') { e.stopPropagation(); close(); } };
+  const shut = btn('Close', close, {class: 's3-modal-close', 'aria-label': 'Close'});
+  const host = el('div', 's3-sgi-host');
+  back.append(movableModal(el('section', {class: 's3-modal s3-sgi-modal', role: 'dialog', 'aria-modal': 'true', 'aria-label': 'How the segment was built'}, shut, host)));
+  back.addEventListener('click', e => { if (e.target === back) close(); });
+  document.addEventListener('keydown', onKey, true);
+  document.body.append(back);
+  if (window.PineDuck && typeof window.PineDuck.hold === 'function') window.PineDuck.hold('s3-segment-inspector', window.PineDuck.REPORT, back);
+  mountSegmentInspector(host, {request, segment, conversation, lineId, pick}).then(x => { view = x; if (closed) x.dispose(); }, () => {});
+  shut.focus({preventScroll: true});
+  return close;
+}
+
+/* [s3-segment-nodes] THE HEADER'S NODE TOGGLE: a Carbon icon that turns a
+   section's body into its node chain in place, and back. The section keeps its
+   height's neighbours still: the body is hidden, not removed, so the
+   conversation comes back exactly as it was. Returns the button for a header
+   to carry. */
+export function segmentNodesToggle({request, segment = '', conversation = '', body = null, onToggle = null} = {}) {
+  request ||= defaultRequest();
+  let nodes = null, host = null, on = false;
+  const b = sgIcon('c:chart--network', 'Show how this segment was built, as its nodes', async e => {
+    if (e) e.stopPropagation();
+    on = !on;
+    b.classList.toggle('on', on);
+    b.setAttribute('aria-pressed', String(on));
+    b.title = on ? 'Back to the conversation' : 'Show how this segment was built, as its nodes';
+    if (!body) return;
+    if (on) {
+      host = host || el('div', 's3-sgn-inline');
+      body.hidden = true;
+      body.after(host);
+      if (!nodes) nodes = await mountSegmentNodes(host, {request, segment, conversation});
+    } else {
+      if (host) host.remove();
+      body.hidden = false;
+    }
+    if (onToggle) onToggle(on);
+  }, {class: 's3-ibtn s3-sgn-toggle', 'aria-pressed': 'false'}, 'Nodes');
+  b.dispose = () => { if (nodes) nodes.dispose(); if (host) host.remove(); if (body) body.hidden = false; };
+  return b;
+}
+
+
+/* ======================================================================== */
+/* [s3-focus] ONE MESSAGE, ZEROED IN.
+ *
+ * "And the examinate in depth window offer a three icon at the top, just
+ *  like the one in the viewport, that when clicked switches the view over to
+ *  the system three view focused on this. I want to tab over to a system
+ *  three system that is focused on the message at hand, but encompasses all
+ *  of the views shown here, but zeroed in on the message at hand and how
+ *  these elements played into it, allowing me to edit and prevent it from
+ *  happening again and also to see what events contributed to it and what
+ *  prompts bu built it and how it came to be." (operator, 2026-09-28)
+ *
+ * openSystem3Focus({request, lineId, onBack}) opens the System 3 window -
+ * mount(), its tabs and its editors - on one line. A bar under the window's
+ * head names the message and holds the two ways out: back to the Examine
+ * window (Close, Escape and the backdrop do the same), and all of System 3.
+ * The tabs keep their names; each one zeroes in on the message:
+ *
+ *   This message   how it came to be, station by station: the road and the
+ *                  round, the round's rolls, the node, the dice on its
+ *                  turn, the row System 3 wrote, the prompt, the words,
+ *                  the air - each with its lever and a way to its tab
+ *   Visual Prompt  the window's own Visual Prompt, opened on its round and turn
+ *   Tables         every decision that built its turn - table, category,
+ *                  item, the d100 and u, the weight share, the threshold or
+ *                  rule, and why - then the round's rolls and the station's
+ *   Segments       its segment's node graph with its node lit, and the
+ *                  round as a chain of nodes, one per message
+ *   Prompts        the model call that wrote it, the prompt blocks as System
+ *                  3 decided them (the system prompt, memory, insets, the
+ *                  running order, what was rolled), the spontaneity rolls
+ *                  and gold, the prompt as sent, and the layers to edit
+ *   Audit          the ledger's events that made it, in ledger order
+ *   Sys3           the circuit it travelled, lit where it went, replayable
+ *   Director       its round, the running order with its row marked, the
+ *                  exchange around it and the script ledger around it on air
+ *   Structure      its road's structure with its leg lit
+ *   Controls       the behaviour controls its rolls answered to
+ *
+ * THE PREVENT LEVERS go through doors that already exist and are pressed
+ * by hand - nothing is written until a Save: an item or a pool option
+ * switched off or weighed down (PUT /api/system3/tables/<id>, the Tables
+ * editor's), a station roll's odds (the same, STATION1), a list row's
+ * words, switch or removal (/api/system3/lists/<id>/rows/<row>, which
+ * writes at once, as the lists editor does), a node's act or draws (PUT
+ * /api/system3/structures/<road> or /structure, the Segments editor's), a
+ * prompt block's kind (PUT /api/system3/config/section/blocks), a control
+ * (POST /api/system3/settings) and the system prompt's layers (POST
+ * /api/paperwork/field, the inspector's own door). A save is for the next
+ * round; this message keeps the version it was planned under, and says so.
+ *
+ * Nothing here scrolls on its own and nothing polls: a save updates its own
+ * lever in place, and the page stays where the reader left it.
+ *
+ * mount() reaches this through one call, s3FocusLens(root, ctx), made only
+ * for a root openSystem3Focus registered, and one line in its tab router. */
+const FOCUS_OF = new WeakMap();          /* the window's root -> the line it was opened on */
+const FX_TABS_HELP = {
+  focus: 'How this message came to be, station by station, with the lever on each part that shaped it.',
+  tables: 'Every decision that built this message - table, category, item, the dice and why - and the round\'s rolls. Switch a row off or weigh it down for next time.',
+  segments: 'The segment this message came from, node by node, with its node lit - and the round as the chain of nodes the roulette built.',
+  structure: 'The road\'s structure as the desk holds it, with the leg this message came from lit.',
+  prompts: 'The model call that wrote it, every prompt block as System 3 decided it, what was rolled, and the layers the next system prompt is built from.',
+  audit: 'The ledger\'s events that made this message, in the order the ledger holds them.',
+  sys3: 'The circuit this message travelled - System 3, its road, its node, its dice, the writer, the recording room, the ledger and the air.',
+  director: 'The round it belongs to, the running order with its row marked, the exchange around it and the script ledger around it on air.',
+  controls: 'The behaviour controls its rolls answered to - the value when it was planned, the value now, and the slider.'};
+/* the prompt blocks, by what they are to the writer ([s3-blocks] rules name them) */
+const FX_BLOCK_GROUPS = [
+  ['system', 'The system prompt and the seat', ['system_prompt', 'persona', 'cohost', 'third', 'disposition', 'desk_instruction', 'lessons', 'review_guidance', 'accent', 'perf']],
+  ['memory', 'Memory inserts', ['show_memory', 'avoid_reruns', 'brief_lesson', 'paper']],
+  ['insets', 'Insets - what was put in front of the writer', ['aside', 'flavor', 'crystal', 'context', 'playing', 'tail_lists', 'day', 'heat', 'theme', 'modifiers', 'plot', 'schedule', 'angle', 'topic_contract', 'call_flow', 'battle', 'seat_away', 'turn_rules', 'pace']],
+  ['sheet', 'System 3\'s running order', ['sheet']]];
+const FX_KINDS = [['obligation', 'always sent'], ['roll', 'rolled at odds'], ['tint', 'only with the crystal tint'], ['off', 'never sent']];
+/* the families that are chance rather than content: the "spontaneity systems" */
+const FX_SPONT = new Set(['SHOCK', 'INTERJECT', 'MENTION', 'FAV', 'EVENT', 'TOPIC', 'TEMPER', 'DIRECTIVE', 'SFXGUY', 'SFX', 'SPEAKERBOX', 'TINT', 'REPAIR', 'ROOM', 'TRACK_TALK']);
+/* a station roll's key names what it governs; these shaped the air around a line on any road */
+const FX_NEAR = /^(line|station|voice|speakbox|sting|sfx|sfxguy|writer|gold|host)\./;
+const FX_ROAD_KEYS = {ad_spot: /^ad\./, ad: /^ad\./, gallery: /^gallery\./, caller: /^call\./, banter: /^banter\./, manager: /^manager\./,
+  upstairs: /^manager\./, memo: /^manager\./, news: /^story\./};
+
+export async function openSystem3Focus({request, lineId = '', said = '', onBack = null, tab = 'focus'} = {}) {
+  request ||= defaultRequest();
+  const backdrop = el('div', 's3-backdrop s3-fx-backdrop');
+  const root = el('section', {role: 'dialog', 'aria-modal': 'true', 'aria-label': 'System 3, focused on one message'});
+  backdrop.append(root); document.body.append(backdrop);
+  const before = document.activeElement;
+  let view = null, closed = false;
+  const close = () => {
+    if (closed) return;
+    closed = true;
+    document.removeEventListener('keydown', key);
+    if (offBack) { try { offBack(); } catch (e) { /* gone */ } }
+    try { if (view) view.dispose(); } catch (e) { /* gone */ }
+    backdrop.remove();
+    try { if (typeof onBack === 'function') onBack(); } catch (e) { /* the host's own */ }
+    try { if (before && before.isConnected && before.focus) before.focus({preventScroll: true}); } catch (e) { /* gone */ }
+  };
+  /* Escape is "back": a decision card over the window takes its own Escape first */
+  const key = e => { if (e.key === 'Escape' && !document.querySelector('.s3-modal-back')) { e.stopPropagation(); close(); } };
+  document.addEventListener('keydown', key);
+  backdrop.addEventListener('click', e => { if (e.target === backdrop) close(); });
+  /* [#1450c] the tablet's BACK closes the topmost overlay: this window is one (a decision card over it sits higher) */
+  const offBack = window.PineDismiss && typeof window.PineDismiss.onBack === 'function'
+    ? window.PineDismiss.onBack(() => (closed ? null : {node: backdrop, close})) : null;
+  FOCUS_OF.set(root, {lineId: String(lineId || ''), said: String(said || ''), back: close});
+  if (window.PineDuck && typeof window.PineDuck.hold === 'function') window.PineDuck.hold('s3-focus', window.PineDuck.REPORT, backdrop);
+  view = await mount(root, {request, onClose: close, tab: tab || 'focus'});
+  if (closed) { try { view.dispose(); } catch (e) { /* gone */ } }
+  else { const b = root.querySelector('.s3-fx-back'); if (b) b.focus({preventScroll: true}); }
+  return {element: backdrop, close};
+}
+
+function s3FocusLens(root, ctx) {
+  const spec = FOCUS_OF.get(root);
+  if (!spec) return null;
+  const request = ctx.request, send = ctx.send;
+  const S = {full: false, resolved: false, got: null, conv: null, turn: null, sg: null, why: '', paintN: 0,
+    memo: new Map(), drafts: new Map(), dirty: new Set(), levers: new Map(), blocksDraft: null, structDraft: new Map(), structDirty: new Set(),
+    writerByTurn: new Map(), callCache: new Map(), events: [], mine: new Set(), where: new Map()};
+  const v = makeViews({request, details: true});
+  v.quiet = true;
+  const soft = p => Promise.resolve(p).then(x => x, () => null);
+  const once = (key, fn) => {
+    if (!S.memo.has(key)) S.memo.set(key, Promise.resolve().then(fn).catch(e => { S.memo.delete(key); throw e; }));
+    return S.memo.get(key);
+  };
+  const live = () => (((ctx.config() || {}).config) || {});
+  const cid = () => ((S.conv && S.conv.identity) || {}).conversation_id || '';
+  const road = () => String(((S.conv && S.conv.identity) || {}).road_kind || '');
+  const directed = () => !!(S.conv && S.turn);
+  const icon3 = () => {
+    const html = typeof window.pineIcon === 'function' ? window.pineIcon('c:number--3') : '';
+    return html ? el('span', {class: 's3-fx-mark', innerHTML: html}) : el('span', {class: 's3-fx-mark s3-fx-mark-t', text: '3'});
+  };
+
+  /* ---- what the station holds on the line -------------------------------- */
+  function resolve() {
+    return once('line', async () => {
+      try { S.got = await request('/api/system3/line?line_id=' + encodeURIComponent(spec.lineId)); }
+      catch (e) { S.got = null; S.why = (e && e.message) || String(e); }
+      if (S.got && S.got.conversation) {
+        try { S.conv = await request('/api/system3/conversation/' + encodeURIComponent(S.got.conversation.conversation_id)); }
+        catch (e) { S.conv = null; S.why = 'its round could not be read: ' + ((e && e.message) || e); }
+      }
+      if (S.conv) {
+        v.setConversation(S.conv);
+        const want = S.got.turn ? S.got.turn.turn_id : '';
+        S.turn = (S.conv.turns || []).find(x => x.turn_id === want) || null;
+        S.sg = S.got.sfxguy || null;
+        if (!S.turn && S.sg && S.sg.turn) S.turn = (S.conv.turns || []).find(x => x.turn_id === S.sg.turn.turn_id) || null;
+        const c = S.conv;
+        S.events = [...(c.decision_events || []).map(e => (e.kind ? e : {...e, kind: 'decision'})), ...(c.observations_air || [])]
+          .sort((a, b) => (Number(a.cursor) || 0) - (Number(b.cursor) || 0) || (Number(a.at) || 0) - (Number(b.at) || 0));
+        const own = S.turn ? turnEvents(c, S.turn) : [];
+        S.mine = new Set(own.map(e => e.event_id));
+        S.mineFams = new Set(own.map(e => e.family));
+      }
+      S.resolved = true;
+      paintBar();
+      return S;
+    });
+  }
+  const whyOf = () => once('why', () => soft(request('/api/said/why/' + encodeURIComponent(spec.lineId))));
+  async function blockNo() {
+    const ln = (S.got && S.got.line) || {};
+    if (ln.block != null && ln.block !== '') return {block: ln.block, ord: ln.ord};
+    const why = await whyOf();
+    for (const f of (why && why.flow) || []) {
+      const m = f && f.step === 'ledger' ? /block (\d+), line (\d+)/.exec(String(f.label || '')) : null;
+      if (m) return {block: Number(m[1]), ord: Number(m[2]) - 1};
+    }
+    return null;
+  }
+  const inspectOf = () => once('inspect', async () => {
+    const at = await blockNo();
+    return at ? soft(request('/api/segment/inspect?block=' + encodeURIComponent(at.block))) : null;
+  });
+  const listsOf = () => once('lists', () => soft(request('/api/system3/lists')).then(g => (g && g.lists) || []));
+  const writerOf = () => once('writer', async () => {
+    if (!directed()) return {row: null, detail: null, why: 'no System 3 turn made this line'};
+    const w = await findWriterCall(request, S.conv, S.turn, S.callCache);
+    S.writerByTurn.set(S.turn.turn_id, w);
+    return w;
+  });
+  /* the PROMPT record the writer was sent for this message: the one whose
+     beat covers its turn (a beat's mark counts turns from 1), the retry last;
+     a round with one prompt, that one; else asked by the prompt's own words */
+  const blocksOf = () => once('blocks', async () => {
+    const prompts = ((S.conv && S.conv.observations_air) || []).filter(o => o && o.family === 'PROMPT' && o.digest);
+    const n = S.turn ? S.turn.index + 1 : 0;
+    const covers = prompts.filter(o => { const m = o.mark || {}; return m.from != null && m.until != null && n >= Number(m.from) && n <= Number(m.until); });
+    let obs = covers.length ? covers[covers.length - 1] : prompts.length === 1 ? prompts[0] : null;
+    let how = covers.length ? `the prompt of the beat that wrote turns ${covers[covers.length - 1].mark.from}-${covers[covers.length - 1].mark.until}` + (covers.length > 1 ? ` (the last of ${covers.length} tries)` : '')
+      : prompts.length === 1 ? 'the round\'s one prompt' : '';
+    let got = null;
+    if (obs) got = await soft(request('/api/system3/prompt-blocks?digest=' + encodeURIComponent(obs.digest)));
+    if (!obs || !(got && got.prompt)) {
+      const w = await writerOf();
+      const parts = w && w.row ? promptParts(w.detail || {}) : null;
+      if (parts && parts.user) {
+        const byText = await soft(request('/api/system3/prompt-blocks', {method: 'POST', body: JSON.stringify({text: String(parts.user)})}));
+        if (byText && byText.prompt) { got = byText; how = 'found by the words of the prompt that wrote it'; obs = obs || byText.prompt; }
+      }
+    }
+    const rec = (got && got.prompt) || null;
+    if (got && got.rules) S.blockRules = got.rules;
+    return {rows: (rec && rec.blocks) || (obs && obs.blocks) || [], rules: (got && got.rules) || {}, digest: (rec && rec.digest) || (obs && obs.digest) || '',
+      at: Number((rec || obs || {}).at || 0), how, prompts: prompts.length};
+  });
+
+  /* ---- the events -------------------------------------------------------- */
+  /* the round's ledger - decisions and what was observed at air - in the ledger's own order (its cursor) */
+  const events = () => S.events;
+  const idxOf = turnId => { const t = ((S.conv && S.conv.turns) || []).find(x => x.turn_id === turnId); return t ? t.index : -1; };
+  function whereOf(e) {
+    if (!S.where.has(e)) S.where.set(e, whereIs(e));
+    return S.where.get(e);
+  }
+  function whereIs(e) {
+    const t = S.turn;
+    if (e.kind === 'observation') {
+      if (e.family === 'COMMIT') return (e.lines || []).includes(spec.lineId) ? 'mine-air' : 'round-air';
+      if (e.family === 'PROMPT') { const m = e.mark || {}; const n = t ? t.index + 1 : -1;
+        return (m.from == null || (n >= Number(m.from) && n <= Number(m.until))) ? 'mine-prompt' : 'round-prompt'; }
+      if (t && e.turn_index != null && Number(e.turn_index) === Number(t.script_index)) return 'mine-air';
+      if (e.family === 'CARRY' || e.family === 'REPAIR') return 'round-air';
+      return 'round-air';
+    }
+    if (t && S.mine.has(e.event_id)) return 'mine';
+    /* the same turn drawn again: a turn-by-turn round re-plans the turns ahead of the one written,
+       so an earlier draw of a family the turn now carries was replaced; a round roll that landed here (a topic, a favourite) is its own */
+    if (t && e.turn_id === t.turn_id) return S.mineFams.has(e.family) ? 'replanned' : 'mine';
+    if (!e.turn_id || Number(e.turn_index) < 0) {
+      if (e.family !== 'STATION') return 'round';
+      const k = String((e.meta || {}).key || (e.selected || {}).key || '');
+      return FX_NEAR.test(k) || (FX_ROAD_KEYS[road()] && FX_ROAD_KEYS[road()].test(k)) ? 'station' : 'station-other';
+    }
+    const i = idxOf(e.turn_id);
+    return t && i >= 0 && i < t.index ? 'before' : 'after';
+  }
+  const WHERE_WORDS = {'mine': 'this message', 'replanned': 'this turn, drawn before a re-plan replaced it', 'mine-air': 'this message, at air', 'mine-prompt': 'the prompt that wrote it',
+    'round': 'the round - every turn', 'station': 'a station roll for the air around it', 'station-other': 'a station roll for another road',
+    'before': 'an earlier turn - the state it was planned from', 'after': 'a later turn', 'round-air': 'the round, at air', 'round-prompt': 'another beat\'s prompt'};
+  const SHAPED = new Set(['mine', 'mine-air', 'mine-prompt', 'round', 'station', 'before', 'replanned']);
+
+  /* ---- the bar and the tabs ------------------------------------------------ */
+  let bar = null;
+  function paintBar() {
+    if (!bar) {
+      bar = el('div', {class: 's3-fx-bar', role: 'region', 'aria-label': 'The message System 3 is focused on'});
+      const head = root.querySelector(':scope > .s3-head');
+      if (head) head.after(bar); else root.prepend(bar);
+    }
+    const t = S.turn, conv = S.conv;
+    const ln = (S.got && S.got.line) || {};
+    const words = String(ln.text || (t && t.text) || spec.said || '').trim();
+    const where = conv ? [t ? (t.name || t.speaker) : String(ln.who || ''), `${road() || 'a'} round ${cid().slice(0, 8)}`,
+      t ? `turn ${t.index + 1} of ${(conv.turns || []).length}` : 'not one of its turns', t && t.step_label ? `node "${t.step_label}"` : '',
+      S.sg ? castName('sfx') + '\'s line after it' : ''].filter(Boolean).join(' · ')
+      : (S.resolved ? 'not directed by System 3' : 'reading the line...');
+    const back = btn('‹ Back to Examine', () => spec.back(), {class: 's3-fx-back', title: 'close System 3 and go back to the Examine window, as you left it'});
+    const all = S.full
+      ? btn('Focus on the message again', () => { S.full = false; ctx.go(ctx.tab()); }, {class: 's3-fx-refocus'})
+      : btn('Show all of System 3', () => { const at = ctx.tab() === 'focus' ? 'director' : ctx.tab();
+          goFull(at, at === 'director' && S.conv ? () => ctx.director(cid(), S.turn ? S.turn.turn_id : '') : null); },
+        {class: 's3-fx-all', title: 'every tab as it is, without the focus - the message stays held here, one tap away'});
+    fill(bar, icon3(),
+      el('div', 's3-fx-what',
+        el('div', 's3-fx-line1', el('b', {text: S.full ? 'Showing all of System 3' : 'Focused on one message'}), el('span', {class: 's3-muted', text: where})),
+        words ? el('q', {class: 's3-fx-said', text: words.length > 320 ? words.slice(0, 320) + '...' : words}) : null),
+      el('div', 's3-fx-go', back, all));
+    root.classList.toggle('s3-fx-focused', !S.full);
+  }
+  function decorate(tab) {
+    const tabs = ctx.tabs;
+    tabs.classList.toggle('s3-fx-tabs', !S.full);
+    let mine = tabs.querySelector(':scope > .s3-fx-tab');
+    if (!mine) {
+      mine = btn('This message', () => { S.full = false; ctx.go('focus'); }, {class: 's3-fx-tab', title: 'how this message came to be'});
+      tabs.prepend(mine);
+    }
+    if (tab === 'focus') S.full = false;              /* the full window has no such tab: it is the focus */
+    mine.setAttribute('aria-pressed', String(tab === 'focus'));
+  }
+  function goFull(tab, then) {
+    S.full = true;
+    if (typeof then === 'function') { try { then(); } catch (e) { /* the editor's own */ } }
+    ctx.go(tab);
+    paintBar();
+  }
+  /* the window's own editor, opened on this message's part, then lit */
+  function openEditor(tab, set, lit) {
+    goFull(tab, set);
+    if (typeof lit === 'function') setTimeout(() => { try { lit(ctx.body); } catch (e) { /* drawn differently */ } }, 120);
+  }
+  const litOnce = node => { if (!node) return; node.classList.add('s3-fx-lit'); setTimeout(() => node.classList.remove('s3-fx-lit'), 2600);
+    try { node.scrollIntoView({block: 'nearest'}); } catch (e) { /* older engine */ } };   /* a tap asked for it: it is brought into view once */
+
+  const PAINT = {focus: paintOverview, tables: paintTables, segments: h => paintNodes(h, 'segments'), structure: h => paintNodes(h, 'structure'),
+    prompts: paintPrompts, audit: paintAudit, sys3: paintCircuit, director: paintDirector, controls: paintControls};
+  function paint(tab) {
+    decorate(tab);
+    paintBar();
+    if (S.full) return false;
+    if (tab === 'visual') {                           /* the window's own Visual Prompt, on its round and turn */
+      if (!S.resolved) {
+        fill(ctx.body, para('Reading this message...', 's3-muted'));
+        resolve().then(() => { if (ctx.tab() === 'visual' && !S.full) ctx.go('visual'); });
+        return true;
+      }
+      if (S.conv) { ctx.visual(cid(), S.turn ? S.turn.turn_id : ''); return false; }
+      fill(ctx.body, el('div', 's3-fx-pane', notDirected()));
+      return true;
+    }
+    const painter = PAINT[tab];
+    if (!painter) return false;
+    const n = ++S.paintN;
+    const host = el('div', 's3-fx-pane s3-fx-' + tab);
+    fill(ctx.body, host);
+    fill(host, para('Reading this message...', 's3-muted'));
+    resolve().then(() => {
+      if (n !== S.paintN || !host.isConnected) return null;
+      fill(host);
+      if (FX_TABS_HELP[tab]) host.append(el('p', {class: 's3-fx-help', text: FX_TABS_HELP[tab]}));
+      if (!S.conv) { host.append(notDirected()); return null; }
+      return painter(host);
+    }).catch(e => { if (host.isConnected) fill(host, para('This view could not be drawn: ' + ((e && e.message) || e), 's3-error')); });
+    return true;
+  }
+
+  function notDirected() {
+    const ln = (S.got && S.got.line) || {};
+    const words = S.conv
+      ? `Part of a System 3 round (${road() || 'a'} round ${cid()}) but not one of its planned turns: `
+        + (ln.who === 'drop' ? `${castName('sfx')}'s line; its draw was not recorded on this row.` : ln.who === 'board' ? 'a board clip - the dice for the clip are on the turn it punctuates.'
+          : 'a line the station put into the round at air - a passage dealt in front, a caller\'s hello - which no node made.')
+      : 'Not directed by System 3. This line came from a road System 3 does not run yet, or from a round written before it was switched on: nothing was rolled for it and nothing in its prompt came from the Rolodex.'
+        + (S.why ? ` (the station said: ${S.why})` : '');
+    return el('div', 's3-card s3-fx-none', el('h2', {text: S.conv ? 'Not one of the round\'s turns' : 'Not directed by System 3'}), para(words),
+      el('div', 's3-row', btn('Show all of System 3', () => goFull('director', S.conv ? () => ctx.director(cid(), '') : null)), btn('‹ Back to Examine', () => spec.back()),
+        S.conv ? btn('Open its round in the Director', () => goFull('director', () => ctx.director(cid(), ''))) : null));
+  }
+
+  /* ---- reading one decision ----------------------------------------------- */
+  const pickOf = st => (st.candidates || []).find(c => String(c.id) === String(st.selected)) || null;
+  function stageRow(st, ev) {
+    const pick = pickOf(st);
+    const cands = st.candidates || [];
+    const total = st.total != null ? Number(st.total) : cands.reduce((a, c) => a + (Number(c.weight) || 0), 0);
+    const d = st.draw || null;
+    const label = st.stage === 'intensity' ? num(st.selected, 3) : String((pick && (pick.label || pick.id)) || st.selected || '');
+    const facts = [];
+    if (cands.length > 1) facts.push(`${st.selected_index || '?'} of ${st.of || cands.length}`);
+    if (pick && cands.length) facts.push(`share ${pct(pick.p)} - weight ${num(pick.weight, 2)} of ${num(total, 2)}`);
+    if (d && d.dice != null) facts.push(`d100 ${d.dice}${d.u != null ? ' · u ' + num(d.u, 6) : ''}`);
+    else if (!cands.length || cands.length === 1) facts.push(cands.length === 1 ? 'the only one eligible - no draw' : 'no random number');
+    if (st.threshold != null) facts.push(ev.family === 'SPEAKERBOX' ? `needs over ${st.threshold}` : `threshold ${num(st.threshold, st.threshold > 1 ? 0 : 2)}`);
+    const why = [...((pick && pick.why) || []), ...(Array.isArray(st.why) ? st.why : [])].filter(Boolean);
+    return el('div', 's3-fx-stage',
+      el('span', {class: 's3-fx-stname', text: STAGE_NAME[st.stage] || st.stage}),
+      die(d ? d.dice : null),
+      el('div', 's3-fx-sgbody',
+        el('div', null, el('b', {text: label}), el('span', {class: 's3-muted', text: '  ' + facts.join(' · ')})),
+        st.rule ? el('div', {class: 's3-fx-rule', text: 'rule: ' + st.rule}) : null,
+        why.length ? el('div', {class: 's3-fx-why', text: 'why: ' + why.join('; ')}) : null,
+        (st.excluded || []).length ? el('div', {class: 's3-fx-why', text: 'not eligible: ' + st.excluded.map(x => `${x.label || x.id} (${x.why})`).join('; ')}) : null,
+        cands.length > 1 ? el('details', 's3-fx-cands', el('summary', {text: `the ${cands.length} candidates and their weight shares`}),
+          el('div', 's3-rx-cands', ...cands.map(c => el('div', {class: 's3-rx-cand' + (String(c.id) === String(st.selected) ? ' hit' : '')},
+            el('b', {text: c.label || c.id}), el('span', {class: 's3-muted', text: `w ${num(c.weight)} - ${pct(c.p)}` + ((c.why || []).length ? ' - ' + c.why.join(', ') : '')}))))) : null));
+  }
+  function decisionHead(ev, extra) {
+    const line = eventLine(ev, S.conv);
+    const sb = sbOutcome(ev);
+    const face = die(line.dice);
+    if (sb && !sb.won) face.classList.add('miss');
+    return el('div', 's3-fx-dhead',
+      el('span', {class: 's3-dfam', text: ev.family}), face,
+      el('div', 's3-fx-dwhat', el('b', {text: String(landedWords(ev, S.conv) || line.text || '').replace(/\s+/g, ' ')}),
+        el('span', {class: 's3-muted', text: (FAMILY_WHAT[ev.family] || [ev.family])[0] + (extra ? ' · ' + extra : '')})),
+      btn('How it was decided', e => { e.stopPropagation(); openDecision(S.conv, ev, S.turn && ev.turn_id === S.turn.turn_id ? S.turn : ((S.conv.turns || []).find(x => x.turn_id === ev.turn_id) || null), v.api); }, {class: 's3-fx-how'}));
+  }
+  /* opts: where (a word on the head), dim, compact (the path and the lever folded, for the overview), fold (the lever folded), open (the lever open) */
+  function fxCard(ev, opts = {}) {
+    const meta = ev.meta || {}, sel = ev.selected || {};
+    const told = String(sel.text || '').trim();
+    const stages = ev.stages || [];
+    const path = el('div', 's3-fx-path', ...stages.map(st => stageRow(st, ev)),
+      !stages.length ? para('Not a draw: ' + (meta.why || (sel.authority ? sel.authority : 'decided by a rule, not a random number')) + '.', 's3-muted') : null,
+      meta.why && stages.length ? el('div', {class: 's3-fx-why', text: 'recorded: ' + meta.why}) : null,
+      told && told !== sel.label ? el('div', 's3-rx-told', el('b', {text: 'What the writer was told: '}), told) : null);
+    const card = el('div', {class: 's3-fx-dec' + (opts.dim ? ' dim' : ''), style: `--fam:${FAM[ev.family] || 'var(--obs)'}`, 'data-event': ev.event_id},
+      decisionHead(ev, opts.where),
+      opts.compact ? el('details', {class: 's3-fx-pathfold'}, el('summary', {text: `how the dice fell - ${stages.length || 'no'} stage${stages.length === 1 ? '' : 's'}`}), path) : path);
+    const lever = leverFor(ev);
+    if (lever) card.append(opts.compact || opts.fold ? el('details', {class: 's3-fx-levfold', open: !!opts.open}, el('summary', {text: 'Prevent it - change it for next time'}), lever) : lever);
+    return card;
+  }
+
+  /* ---- the levers ----------------------------------------------------------
+     A desk table is edited on a draft copy of the LIVE table (what the desk
+     holds now), shared by every lever of that table on screen; reading never
+     makes a draft, the first change does, and a Save sends the whole table
+     through the Tables editor's own door. */
+  const lnorm = s => String(s == null ? '' : s).toLowerCase().replace(/\s+/g, ' ').trim();
+  function findTable(id) { return (live().tables || []).find(t => t.id === id) || null; }
+  const peekTable = id => S.drafts.get(id) || findTable(id);
+  function draftOf(id) {
+    if (!S.drafts.has(id)) { const t = findTable(id); if (!t) return null; S.drafts.set(id, JSON.parse(JSON.stringify(t))); }
+    return S.drafts.get(id);
+  }
+  function inTable(table, catId, itemId) {
+    let cat = null, item = null;
+    for (const c of (table && table.categories) || []) {
+      const it = (c.items || []).find(i => String(i.id) === String(itemId));
+      if (it) { if (!item || c.id === catId) { cat = c; item = it; } if (c.id === catId) break; }
+    }
+    if (!cat && catId) cat = ((table && table.categories) || []).find(c => c.id === catId) || null;
+    return {cat, item};
+  }
+  /* one table's levers share its draft and its dirty flag, wherever they are drawn */
+  function leverWatch(id, fn) { if (!S.levers.has(id)) S.levers.set(id, new Set()); S.levers.get(id).add(fn); }
+  function leverTell(id, state, words) {
+    for (const fn of [...(S.levers.get(id) || [])]) { if (fn(state, words) === false) S.levers.get(id).delete(fn); }
+  }
+  const dirty = id => { S.dirty.add(id); leverTell(id, 'dirty', 'changed - not saved yet'); };
+  function saveRow(id, labelText) {
+    const note = el('span', {class: 's3-muted s3-fx-note', text: S.dirty.has(id) ? 'changed - not saved yet' : ''});
+    const save = btn('Save ' + id, async () => {
+      const d = S.drafts.get(id);
+      if (!d || !S.dirty.has(id)) return;
+      leverTell(id, 'saving', 'saving...');
+      try {
+        const res = await send('/api/system3/tables/' + encodeURIComponent(id), 'PUT', d);
+        S.drafts.delete(id); S.dirty.delete(id);
+        await ctx.loadConfig('table', id);
+        leverTell(id, 'saved', `saved ${id}${res && res.table ? ' v' + res.table.version : ''}${res && res.hash ? ' - live config ' + res.hash : ''}. The next round rolls with it; this message keeps the version it was planned under.`);
+      } catch (e) { leverTell(id, 'dirty', 'not saved: ' + ((e && e.message) || e)); }
+    }, {class: 's3-fx-save', disabled: !S.dirty.has(id)});
+    const discard = btn('Discard', () => { S.drafts.delete(id); S.dirty.delete(id); leverTell(id, 'clean', 'discarded - the desk as it is'); },
+      {class: 's3-fx-small', hidden: !S.dirty.has(id)});
+    leverWatch(id, (state, words) => {
+      if (!save.isConnected) return false;
+      save.disabled = state !== 'dirty';
+      discard.hidden = state !== 'dirty';
+      note.textContent = words;
+      note.classList.toggle('s3-fx-ok', state === 'saved');
+      return true;
+    });
+    const open = btn('Open ' + id + ' in the Tables editor', () => openEditor('tables', () => ctx.table(id),
+      body => { const inputs = [...body.querySelectorAll('.s3-item input[aria-label="label"]')];
+        const hit = inputs.find(x => lnorm(x.value) === lnorm(labelText)); litOnce(hit && hit.closest('.s3-item-row')); }), {class: 's3-fx-open'});
+    return el('div', 's3-row s3-fx-saverow', save, discard, open, note);
+  }
+  /* a control bound to one value of the table: it reads the draft (or the desk), a change writes the draft */
+  function bound(id, input, read) {
+    leverWatch(id, state => {
+      if (!input.isConnected) return false;
+      if (state === 'clean' || state === 'saved') read();
+      return true;
+    });
+    return input;
+  }
+  function weightSlider(id, peek, write, max = 5) {
+    const val = () => { const x = peek(); return x == null ? 1 : Number(x); };
+    const out = el('b', {text: num(val())});
+    const input = el('input', {type: 'range', min: 0, max, step: 0.05, value: val(), 'aria-label': 'weight',
+      oninput: e => { write(+e.target.value); out.textContent = num(+e.target.value); dirty(id); }});
+    bound(id, input, () => { input.value = val(); out.textContent = num(val()); });
+    const half = btn('halve', () => { const w = Math.round(Number(input.value) * 50) / 100; write(w); input.value = w; out.textContent = num(w); dirty(id); },
+      {class: 's3-fx-small', title: 'weigh it down: half as likely next time'});
+    return [input, out, half];
+  }
+  function oddsRow(id, peek, write) {
+    const val = () => Number(peek() || 0);
+    const out = el('b', {text: pct(val())});
+    const input = el('input', {type: 'range', min: 0, max: 1, step: 0.01, value: val(), 'aria-label': 'odds',
+      oninput: e => { write(+e.target.value); out.textContent = pct(+e.target.value); dirty(id); }});
+    bound(id, input, () => { input.value = val(); out.textContent = pct(val()); });
+    return el('div', 's3-fx-w', el('span', {class: 's3-muted', text: 'its odds'}), input, out);
+  }
+  /* an item of a desk table: ES1, RS2, TEMPER1, FAV1, DIRECTIVE1, CALLEVENT1 - a POOLS1 option - a STATION1 roll */
+  function itemLever(tableId, catId, itemId, fam, opts = {}) {
+    const t0 = peekTable(tableId);
+    if (!t0) return para(`Its table ${tableId} is no longer on the desk.`, 's3-muted');
+    const at0 = inTable(t0, catId, itemId);
+    if (!at0.item) return para(`"${itemId}" is no longer in ${tableId} on the desk - it was removed or renamed after this round was planned.`, 's3-muted');
+    const peek = () => inTable(peekTable(tableId), catId, itemId);
+    const cur = () => inTable(draftOf(tableId), catId, itemId);
+    const label = at0.item.label || at0.item.id;
+    const on = el('input', {type: 'checkbox', checked: at0.item.enabled !== false, 'aria-label': opts.chance ? 'the roll is on' : 'in the draw',
+      onchange: e => { cur().item.enabled = e.target.checked; dirty(tableId); }});
+    bound(tableId, on, () => { on.checked = (peek().item || {}).enabled !== false; });
+    const rows = [el('label', 's3-row s3-fx-on', on, el('span', null, opts.chance ? 'the roll is on (off: it never hits): ' : 'in the draw: ', el('b', {text: label})))];
+    if (!opts.chance) {
+      rows.push(el('div', 's3-fx-w', el('span', {class: 's3-muted', text: 'its weight'}),
+        ...weightSlider(tableId, () => (peek().item || {}).weight, w => { cur().item.weight = w; })));
+      if (at0.cat && at0.cat.weight != null && fam !== 'POOL') rows.push(el('div', 's3-fx-w', el('span', {class: 's3-muted', text: `its category ${at0.cat.label || at0.cat.id}`}),
+        ...weightSlider(tableId, () => (peek().cat || {}).weight, w => { cur().cat.weight = w; })));
+    }
+    if (fam !== 'ES' && !opts.chance && (at0.item.text != null || fam === 'POOL')) {
+      const text = el('input', {type: 'text', value: at0.item.text || '', 'aria-label': 'what the writer is told', oninput: e => { cur().item.text = e.target.value; dirty(tableId); }});
+      bound(tableId, text, () => { text.value = (peek().item || {}).text || ''; });
+      rows.push(el('label', 's3-fx-text', el('span', {class: 's3-muted', text: fam === 'POOL' ? 'the option, word for word' : 'what the writer is told'}), text));
+    }
+    if (at0.item.dial) rows.push(para(`Its odds follow the desk dial "${at0.item.dial}" - set them where that dial is.`, 's3-muted'));
+    else if (at0.item.odds != null) rows.push(oddsRow(tableId, () => (peek().item || {}).odds, x => { cur().item.odds = x; }));
+    return el('div', 's3-fx-lever', el('div', {class: 's3-fx-levh', text: `Next time - ${tableId} on the desk`}), ...rows, saveRow(tableId, label));
+  }
+  /* where a table lives: CHANCE items are keyed by the roll, POOL categories by the list */
+  function chanceHome(key) {
+    for (const t of live().tables || []) {
+      if (t.family !== 'CHANCE') continue;
+      for (const c of t.categories || []) if ((c.items || []).some(i => i.id === key)) return {table: t.id, cat: c.id};
+    }
+    return null;
+  }
+  function poolHome(key) {
+    for (const t of live().tables || []) if (t.family === 'POOL' && (t.categories || []).some(c => c.id === key)) return {table: t.id, cat: key};
+    return null;
+  }
+  function chanceLever(key) {
+    const home = chanceHome(key);
+    if (!home) return para('Its row is not on the desk yet: STATION1 adds a roll the first time the station makes it.', 's3-muted');
+    return itemLever(home.table, home.cat, key, 'CHANCE', {chance: true});
+  }
+  function poolLever(key, landed) {
+    const home = poolHome(key);
+    if (!home) return para('Its options are the station\'s own list, not a list on the desk: nothing here can switch one off.', 's3-muted');
+    const cat0 = ((peekTable(home.table) || {}).categories || []).find(c => c.id === key) || {items: []};
+    const opt = (cat0.items || []).find(i => lnorm(i.text) === lnorm(landed) || lnorm(i.label) === lnorm(landed));
+    if (!opt) return para(`"${landed}" is no longer among ${key}'s options on the desk.`, 's3-muted');
+    return itemLever(home.table, key, opt.id, 'POOL');
+  }
+  /* a list row: the lists doors write at once, as the lists editor does */
+  function listLever(listId, rowId, words, opts = {}) {
+    const box = el('div', 's3-fx-lever s3-fx-list', para('Reading the list...', 's3-muted'));
+    (async () => {
+      const lists = await listsOf();
+      const meta = lists.find(l => l.id === listId) || {id: listId, label: listId, can: {}};
+      const base = '/api/system3/lists/' + encodeURIComponent(listId);
+      let row = null;
+      const got = await soft(request(base + '?' + new URLSearchParams({q: String(words || rowId || '').slice(0, 80), limit: 20})));
+      const rows = (got && got.rows) || [];
+      row = rows.find(r => String(r.id) === String(rowId)) || rows.find(r => lnorm(r.text) === lnorm(words)) || (opts.loose ? rows[0] : null) || null;
+      if (!box.isConnected) return;
+      if (!row) { fill(box, para(`${meta.label || listId}: no row holds these words now - it was reworded or removed.`, 's3-muted')); return; }
+      const can = meta.can || {};
+      const note = el('span', {class: 's3-muted s3-fx-note'});
+      const say = (t, ok) => { note.textContent = t; note.classList.toggle('s3-fx-ok', !!ok); };
+      const path = base + '/rows/' + encodeURIComponent(row.id);
+      const text = el('input', {type: 'text', value: row.text || '', disabled: !can.edit, 'aria-label': 'the words'});
+      const put = async (body, done) => {
+        say('writing...');
+        try { const r = await send(path, 'PUT', body); if (r && r.id) row.id = r.id; say(done, true); }
+        catch (e) { say('not changed: ' + ((e && e.message) || e)); }
+      };
+      fill(box, el('div', {class: 's3-fx-levh', text: `Next time - the ${meta.label || listId} (a list: changes are written at once)`}),
+        el('div', 's3-fx-text', text, can.edit ? btn('Save the words', () => { const t = text.value.trim(); if (t && t !== row.text) put({text: t}, 'reworded in the store' + (meta.family === 'BANK' ? ' - it is recorded again before it can air' : '')); }, {class: 's3-fx-save'}) : null),
+        el('div', 's3-row',
+          can.switch ? el('label', 's3-row s3-fx-on', el('input', {type: 'checkbox', checked: row.on !== false, 'aria-label': 'on',
+            onchange: e => put({on: e.target.checked}, e.target.checked ? 'switched on - back in the draw' : 'switched off - kept, never picked')}), 'in the draw') : null,
+          can.remove ? btn('Remove it', async () => {
+            if (!confirm('Remove "' + String(row.text || '').slice(0, 80) + '" from ' + (meta.label || listId) + '?')) return;
+            say('removing...');
+            try { await send(path, 'DELETE'); say('removed from the store', true); text.disabled = true; } catch (e) { say('not removed: ' + ((e && e.message) || e)); }
+          }, {class: 's3-fx-small'}) : null,
+          btn('Open the list', () => openEditor('tables', () => ctx.table('', listId)), {class: 's3-fx-open'}), note),
+        row.why || row.note ? para([row.why, row.note].filter(Boolean).join(' · '), 's3-muted') : null);
+    })().catch(e => { if (box.isConnected) fill(box, para('The list could not be read: ' + ((e && e.message) || e), 's3-muted')); });
+    return box;
+  }
+  /* a prompt block's rule: the blocks section, saved whole (the Controls tab's door) */
+  function blockLever(name) {
+    const rules0 = (S.blocksDraft || live().blocks || {});
+    const rule = rules0[name] || (S.blockRules || {})[name];
+    if (!rule) return para(`"${name}" has no rule on the desk: a block no node claims is a wedge and is stripped.`, 's3-muted');
+    const cur = () => {
+      if (!S.blocksDraft) S.blocksDraft = JSON.parse(JSON.stringify(live().blocks || {}));
+      if (!S.blocksDraft[name]) S.blocksDraft[name] = JSON.parse(JSON.stringify(rule));
+      return S.blocksDraft[name];
+    };
+    const note = el('span', {class: 's3-muted s3-fx-note'});
+    const pctOut = el('b', {text: pct(rule.odds == null ? 1 : rule.odds)});
+    const odds = el('input', {type: 'range', min: 0, max: 1, step: 0.01, value: rule.odds == null ? 1 : Number(rule.odds), 'aria-label': 'odds',
+      oninput: e => { cur().odds = +e.target.value; pctOut.textContent = pct(+e.target.value); mark(); }});
+    const oddsBox = el('span', {class: 's3-row', hidden: rule.kind !== 'roll'}, odds, pctOut);
+    const kind = el('select', {'aria-label': 'what System 3 does with this block', onchange: e => { cur().kind = e.target.value; oddsBox.hidden = e.target.value !== 'roll'; mark(); }},
+      ...FX_KINDS.map(([k, w]) => el('option', {value: k, text: `${k} - ${w}`, selected: k === (rule.kind || 'obligation')})));
+    const save = btn('Save the blocks', async () => {
+      if (!S.blocksDraft) { save.disabled = true; note.textContent = 'saved with the other block changes'; return; }
+      save.disabled = true; note.textContent = 'saving...';
+      try { const res = await send('/api/system3/config/section/blocks', 'PUT', S.blocksDraft); S.blocksDraft = null; await ctx.loadConfig('blocks', '');
+        note.textContent = 'saved' + (res && res.hash ? ' - live config ' + res.hash : '') + '. The next prompt is decided with it.'; note.classList.add('s3-fx-ok'); }
+      catch (e) { note.textContent = 'not saved: ' + ((e && e.message) || e); save.disabled = false; }
+    }, {class: 's3-fx-save', disabled: true});
+    function mark() { save.disabled = false; note.textContent = 'changed - not saved yet'; note.classList.remove('s3-fx-ok'); }
+    return el('div', 's3-fx-lever s3-fx-blev', el('span', {class: 's3-muted', text: 'next time:'}), kind, oddsBox, save, note);
+  }
+  /* the operator controls a roll answered to: named in its weights' reasons, or its family's */
+  function controlsOf(ev) {
+    const out = new Set();
+    for (const st of ev.stages || []) {
+      for (const c of st.candidates || []) for (const w of c.why || []) { const m = /\b([a-z_]+) control\b/.exec(String(w)); if (m) out.add(m[1]); }
+      for (const w of Array.isArray(st.why) ? st.why : []) { if (/^aggression\b/.test(String(w))) out.add('sfx_aggression'); const m = /\b([a-z_]+) control\b/.exec(String(w)); if (m) out.add(m[1]); }
+    }
+    const planned = ((S.conv && S.conv.settings) || {}).controls || {};
+    for (const k of DIAL_FOR[ev.family] || []) if (k in planned) out.add(k);
+    return [...out];
+  }
+  function controlHint(keys) {
+    const planned = ((S.conv && S.conv.settings) || {}).controls || {};
+    const now = (((ctx.settings() || {}).settings) || {}).controls || {};
+    return el('div', 's3-fx-lever s3-fx-ctl', el('span', {class: 's3-muted', text: 'set by '}),
+      ...keys.map(k => el('span', {class: 's3-pill', text: `${k.replace(/_/g, ' ')} ${num(planned[k])}${now[k] != null && Math.abs(Number(now[k]) - Number(planned[k])) > 0.001 ? ' (now ' + num(now[k]) + ')' : ''}`})),
+      btn('Change it in Controls', () => ctx.go('controls'), {class: 's3-fx-open'}));
+  }
+  function leverFor(ev) {
+    const sel = ev.selected || {}, meta = ev.meta || {}, fam = ev.family;
+    if (fam === 'BLOCK') return blockLever(sel.block);
+    if (fam === 'STATION') {
+      const key = String(meta.key || sel.key || '');
+      if (stage(ev, 'dice')) return chanceLever(key);
+      const item = stage(ev, 'item');
+      return item ? poolLever(key, item.selected) : null;
+    }
+    if (fam === 'TOPIC' && sel.id && sel.id !== 'NONE') return el('div', null, listLever('topics.board', sel.id, sel.label), controlHint(controlsOf(ev)));
+    if (sel.table && findTable(sel.table)) return itemLever(sel.table, sel.category, sel.id, fam);
+    const tab = stage(ev, 'table');
+    if (tab && tab.selected && findTable(tab.selected)) return itemLever(tab.selected, sel.category, sel.id, fam);
+    const keys = controlsOf(ev);
+    return keys.length ? controlHint(keys) : null;
+  }
+
+  /* ---- This message: how it came to be ------------------------------------- */
+  function station(n, title, lit, body, tab, tabLabel) {
+    return el('section', {class: 's3-fx-st' + (lit ? ' lit' : ' dim')},
+      el('div', 's3-fx-sthead', el('span', {class: 's3-fx-stn', text: String(n)}), el('h3', {text: title}), el('span', {style: 'flex:1'}),
+        tab ? btn(tabLabel || 'Open', () => ctx.go(tab), {class: 's3-fx-open'}) : null),
+      el('div', 's3-fx-stbody', ...[].concat(body).filter(Boolean)));
+  }
+  async function paintOverview(host) {
+    const conv = S.conv, t = S.turn, id = conv.identity || {};
+    if (!t) { host.append(notDirected()); }
+    const roundEvs = events().filter(e => e.kind !== 'observation' && whereOf(e) === 'round' && e.family !== 'BLOCK');
+    const stationN = events().filter(e => e.family === 'STATION').length;
+    const cfgNow = (ctx.config() || {}).hash || '';
+    const chain = el('div', 's3-fx-chain');
+    host.append(chain);
+    /* 1. the road and the round */
+    chain.append(station(1, 'The road and the round', true, [
+      kv([['road', id.road_kind], ['round', id.conversation_id], ['mode', [conv.mode, conv.generation_mode].filter(Boolean).join(' · ')],
+        ['planned', day(Number(conv.created || 0))], ['engine', conv.engine], ['config', conv.config_hash + (cfgNow && cfgNow !== conv.config_hash ? ' (the desk now holds ' + cfgNow + ')' : '')],
+        ['subject', String((conv.subject || {}).topic || '').slice(0, 160)], ['verdict', conv.validation ? `${conv.validation.verdict} ${num(conv.validation.score)}` : '']])], 'director', 'The round in the Director'));
+    /* 2. the round's rolls */
+    chain.append(station(2, 'The round\'s rolls - one draw for every turn', roundEvs.length > 0,
+      roundEvs.length ? el('div', 's3-fx-mini-list', ...roundEvs.map(e => miniRoll(e)),
+        stationN ? para(`and ${stationN} station roll${stationN === 1 ? '' : 's'} recorded with the round (the air around it) - on the Tables tab`, 's3-muted') : null)
+        : para('No round roll was recorded on this round.', 's3-muted'), 'tables', 'Every roll, with its lever'));
+    if (t) {
+      /* 3. the node */
+      const info = turnNode(conv, t, ctx.config());
+      chain.append(station(3, 'The node it came from', true, [
+        nodeStrip(info, t),
+        para(info.node ? `Node "${info.node.label || info.node.id}", ${info.index + 1} of ${info.nodes.length} in ${info.cycle ? 'the banter cycle' : (info.key || 'its segment')}${info.cycle && t.cycle != null ? ` (cycle ${Number(t.cycle) + 1})` : ''} - ${t.phase || ''}.`
+          : `The turn names node "${t.step_label || t.step}", which the desk's structure no longer has.`, 's3-muted'),
+        info.moved ? el('span', {class: 's3-pill bad', text: `planned under structure v${info.version}; the desk now holds v${info.now}`}) : null], 'segments', 'The segment\'s graph'));
+      /* 4. the dice on its turn */
+      const evs = turnEvents(conv, t).filter(e => !e.stage);
+      chain.append(station(4, `The dice on its turn - ${evs.length} roll${evs.length === 1 ? '' : 's'}`, evs.length > 0,
+        evs.length ? el('div', 's3-fx-decs', ...evs.map(e => fxCard(e, {compact: true}))) : para('No roll was recorded on this turn.', 's3-muted'), 'tables', 'The tables behind them'));
+      if (S.sg) chain.append(station('4b', castName('sfx') + '\'s line', true, [sfxGuyStory(conv, S.sg, v), guyLever()], 'tables'));
+      /* 5. the row */
+      chain.append(station(5, 'What System 3 told the writer', true, dropTold(conv, t), 'director', 'The running order'));
+      /* 6. the prompt (the model call is looked up) */
+      const promptBox = el('div', null, para('Looking for the model call that wrote it...', 's3-muted'));
+      chain.append(station(6, 'The prompt that wrote it', true, promptBox, 'prompts', 'Every block, with its lever'));
+      Promise.all([writerOf(), blocksOf()]).then(([w, b]) => {
+        if (!promptBox.isConnected) return;
+        const kept = b.rows.filter(x => x.keep).length, rolled = b.rows.filter(x => x.odds != null || x.u != null).length;
+        fill(promptBox, w && w.row ? el('div', 's3-fx-line', el('b', {text: `${w.row.model || '?'} - ${w.row.purpose || ''}`}),
+          el('span', {class: 's3-muted', text: ` ${day(Number(w.row.at || 0))}${w.row.finished && w.row.at ? ' - took ' + num(Number(w.row.finished) - Number(w.row.at), 1) + ' s' : ''}`}),
+          el('span', {class: 's3-pill ' + (w.exact ? 'active' : 'shadow'), text: w.exact ? 'proven by its words' : 'nearest by time'})) : para('No model call found: ' + ((w && w.why) || 'the prompt history has no call for it'), 's3-muted'),
+          b.rows.length ? para(`${b.rows.length} prompt blocks: ${kept} sent, ${b.rows.length - kept} stripped, ${rolled} rolled${b.how ? ' - ' + b.how : ''}.`, 's3-muted')
+            : para('System 3 holds no block record for this prompt.', 's3-muted'));
+      }).catch(e => { if (promptBox.isConnected) fill(promptBox, para('The prompt could not be read: ' + ((e && e.message) || e), 's3-muted')); });
+      /* 7. the words */
+      const val = conv.validation || {};
+      const checks = (((val.turns || []).find(r => r.turn_id === t.turn_id) || {}).checks) || [];
+      chain.append(station(7, 'The words that came back', !!(t.text || (S.got.line || {}).text), [
+        el('blockquote', {class: 's3-dquote', text: String((S.got.line || {}).text || t.text || '(no words recorded)')}),
+        checks.length ? kv(checks.map(c => [c.what, `${c.result}${c.how ? ' - ' + c.how : ''}`])) : null], 'director'));
+    }
+    /* 8. the air */
+    const airBox = el('div', null, para('Reading the script ledger...', 's3-muted'));
+    chain.append(station(8, 'On the air', true, airBox, 'director', 'The ledger around it'));
+    Promise.all([whyOf(), inspectOf(), blockNo()]).then(([why, ins, at]) => {
+      if (!airBox.isConnected) return;
+      const ln = ((ins && ins.lines) || []).find(l => l.line_id === spec.lineId) || {};
+      fill(airBox, kv([['state', (why && why.aired) || ln.aired || ''], ['heard', ln.heard_at ? day(Number(ln.heard_at)) : ln.at || ''],
+        ['ledger', at ? `block ${at.block}, line ${Number(at.ord) + 1}` : 'not on the script ledger'], ['voice', (why && why.voice) || ln.voice || ''],
+        ['seconds', ln.seconds != null ? num(ln.seconds, 1) : ''], ['the hour', ins && ins.hour]]),
+        why && why.say ? para(why.say, 's3-muted') : null);
+    });
+  }
+  function miniRoll(e) {
+    const line = eventLine(e, S.conv);
+    return el('div', {class: 's3-fx-mini', style: `--fam:${FAM[e.family] || 'var(--obs)'}`, role: 'button', tabindex: '0', title: 'how it was decided',
+        onclick: () => openDecision(S.conv, e, null, v.api), onkeydown: k => { if (k.key === 'Enter' || k.key === ' ') { k.preventDefault(); openDecision(S.conv, e, null, v.api); } }},
+      die(line.dice), el('b', {text: e.family}), el('span', {text: String(landedWords(e, S.conv) || line.text || '').replace(/\s+/g, ' ').slice(0, 120)}));
+  }
+  /* his line, when it came off a list: the shelf of quips, or the speech bank */
+  function guyLever() {
+    const obs = (S.sg || {}).line || {};
+    const kind = String(obs.kind || '');
+    const words = String(obs.line || (S.got.line || {}).text || '').replace(/^[^\p{L}\p{N}]+/u, '').replace(/^\d+\s+/, '').trim();
+    if (!words) return null;
+    if (kind === 'quip') return listLever('sfxguy.quips', '', words);
+    if (kind === 'bank') return listLever('sfxguy.bank', '', words);
+    return para(kind === 'news' ? 'A story off the wire, written at air - not a row on a list. Whether he speaks is his node\'s die and the desk\'s interjections dial.'
+      : 'Written at air, fired back at the line - not a row on a list. Whether he speaks is his node\'s die and the desk\'s interjections dial.', 's3-muted');
+  }
+  function nodeStrip(info, t) {
+    const nodes = info.nodes || [];
+    if (!nodes.length) return null;
+    return el('div', 's3-fx-strip', ...nodes.flatMap((n, i) => [i ? el('span', {class: 's3-fx-arrow', text: '→'}) : null,
+      el('span', {class: 's3-fx-node' + (i === info.index ? ' on' : ''), title: i === info.index ? 'this message came from this node' : 'a node of the same segment', text: n.label || n.id})]).filter(Boolean));
+  }
+
+  /* ---- Tables: every decision -------------------------------------------- */
+  async function paintTables(host) {
+    const conv = S.conv, t = S.turn;
+    const all = events().filter(e => e.kind !== 'observation');
+    const mine = t ? turnEvents(conv, t).filter(e => !e.stage) : [];
+    const mineSet = new Set(mine.map(e => e.event_id));
+    const onTurn = t ? all.filter(e => whereOf(e) === 'mine' && !mineSet.has(e.event_id)) : [];
+    const replaced = t ? all.filter(e => whereOf(e) === 'replanned') : [];
+    const round = all.filter(e => whereOf(e) === 'round' && e.family !== 'BLOCK');
+    const near = all.filter(e => whereOf(e) === 'station');
+    const far = all.filter(e => whereOf(e) === 'station-other');
+    host.append(
+      t ? sectionOf(`The decisions that built its turn (${mine.length})`, el('div', 's3-fx-decs', ...mine.map(e => fxCard(e, {open: true}))),
+        mine.length ? null : para('No roll was recorded on this turn.', 's3-muted')) : null,
+      onTurn.length ? sectionOf(`Rolls that landed on its turn (${onTurn.length})`, para('Drawn for the round, and the draw chose this turn.', 's3-muted'),
+        el('div', 's3-fx-decs', ...onTurn.map(e => fxCard(e, {open: true})))) : null,
+      replaced.length ? el('details', 's3-fx-more', el('summary', {text: `${replaced.length} earlier draws of this turn - replaced when the round was re-planned turn by turn (they did not build it)`}),
+        el('div', 's3-fx-decs', ...replaced.map(e => fxCard(e, {fold: true, dim: true})))) : null,
+      sectionOf(`The round's rolls (${round.length}) - one draw for every turn`, round.length ? el('div', 's3-fx-decs', ...round.map(e => fxCard(e, {fold: true})))
+        : para('No round roll was recorded.', 's3-muted')),
+      near.length || far.length ? sectionOf(`The station's rolls recorded with the round (${near.length + far.length})`,
+        para('Rolled by the station for the air before this round was planned. Their key names what each one governs; these are the ones that govern the air around a line like this one.', 's3-muted'),
+        el('div', 's3-fx-decs', ...near.map(e => fxCard(e, {fold: true}))),
+        far.length ? el('details', 's3-fx-more', el('summary', {text: `${far.length} more, for other roads (recorded with the round, not shaping this line)`}),
+          el('div', 's3-fx-decs', ...far.map(e => fxCard(e, {fold: true, dim: true})))) : null) : null);
+  }
+
+  /* ---- Segments / Structure: the node graph -------------------------------- */
+  function structKey(info) { return info.cycle ? 'banter' : info.key; }
+  function structDraft(info) {
+    const key = structKey(info);
+    if (!S.structDraft.has(key)) S.structDraft.set(key, JSON.parse(JSON.stringify(info.cycle ? (live().structure || {}) : ((live().structures || {})[key] || {}))));
+    return S.structDraft.get(key);
+  }
+  async function paintNodes(host, mode) {
+    const conv = S.conv, t = S.turn;
+    if (!t) { host.append(para('This line is not one of the round\'s turns, so no node made it.', 's3-muted')); return; }
+    const info = turnNode(conv, t, ctx.config());
+    const rs = conv.road_structure || {};
+    const stName = info.cycle ? 'the banter cycle' : (rs.id || info.key || '') + (info.key && info.key.includes('~') ? ' (variant ' + info.key + ')' : '');
+    const head = el('div', 's3-card s3-fx-nodehead',
+      el('h2', {text: `${road()} round - ${stName}`}),
+      para(info.node ? `This message came from node "${info.node.label || info.node.id}" (${info.index + 1} of ${info.nodes.length}).`
+        : `The turn names node "${t.step_label || t.step}", which the desk's copy of the structure no longer has.`, 's3-muted'),
+      info.moved ? el('span', {class: 's3-pill bad', text: `planned under structure version ${info.version}; the desk now holds version ${info.now}`}) : null,
+      mode === 'structure' && info.structure && (info.structure.head || info.structure.tail) ? el('details', null, el('summary', {text: 'the structure\'s own words to the writer (head and tail)'}),
+        el('pre', {text: [info.structure.head, info.structure.tail].filter(Boolean).join('\n\n')})) : null);
+    const list = el('div', 's3-seg-nodes s3-fx-nodes');
+    if (info.nodes.length) {
+      info.nodes.forEach((n, i) => {
+        if (i === info.index) list.append(nodeCard(conv, t, info, v.api, {sel: true, where: `node ${i + 1} of ${info.nodes.length} - this message`}));
+        else {
+          const made = (conv.turns || []).filter(x => String(x.leg || x.step || '') === String(n.id || ''));
+          list.append(el('div', {class: 's3-seg-node s3-node-other', title: made.length ? 'the messages this node made in this round' : 'no message came from this node in this round'},
+            el('div', 's3-row', el('b', {text: n.label || n.id}),
+              info.cycle ? el('span', {class: 's3-pill', text: String(n.speaker || '').replace('_', ' ')}) : el('span', {class: 's3-pill', text: n.place || 'middle'}),
+              el('span', {style: 'flex:1'}),
+              el('span', {class: 's3-muted', text: made.length ? `message${made.length > 1 ? 's' : ''} ${made.map(x => x.index + 1).join(', ')}` : 'not used this round'}),
+              ...(n.draws || []).map(d => el('span', {class: 's3-draw' + (d.fixed !== undefined ? ' locked' : ''), style: `--fam:${FAM[d.family] || 'var(--obs)'}`},
+                el('span', {class: 's3-dice', text: d.fixed !== undefined ? 'pin' : 'd100'}), d.family))),
+            mode === 'structure' && n.act ? el('div', {class: 's3-muted s3-node-act', text: n.act}) : null));
+        }
+        if (i < info.nodes.length - 1) list.append(el('div', {class: 's3-seg-gap', text: '↓'}));
+      });
+    } else list.append(nodeCard(conv, t, info, v.api, {sel: true, where: 'as recorded on the turn'}));
+    /* the round, as the chain of nodes the roulette built: one per message */
+    const turns = conv.turns || [];
+    const chainBox = el('div', 's3-fx-exnodes', ...turns.map(x => {
+      const es = (x.decisions || []).find(d => d.family === 'ES');
+      return el('span', {class: 's3-fx-exnode' + (x.turn_id === t.turn_id ? ' on' : ''), title: `turn ${x.index + 1} - ${x.name || x.speaker} - ${x.step_label || x.step || ''}`},
+        el('b', {text: String(x.index + 1)}), el('span', {text: `${x.speaker} · ${x.step_label || x.step || ''}`}), es ? el('i', {text: es.label || ''}) : null);
+    }));
+    host.append(head, sectionOf(mode === 'structure' ? 'The structure, leg by leg' : 'The segment\'s node graph', list),
+      sectionOf(`The round as the roulette built it - ${turns.length} message${turns.length === 1 ? '' : 's'}, one node each`, chainBox),
+      info.node ? nodeEditor(info, t, mode) : null);
+    if (!reduced()) host.querySelectorAll('.s3-node-card .s3-draw-live .s3-dice').forEach((d, k) => {
+      d.classList.add('rolling'); setTimeout(() => { d.classList.remove('rolling'); d.classList.add('pop'); setTimeout(() => d.classList.remove('pop'), 400); }, 450 + k * 130); });
+  }
+  function nodeEditor(info, t, mode) {
+    const key = structKey(info);
+    const draft = structDraft(info);
+    const nodes = info.cycle ? (draft.steps || []) : (draft.legs || []);
+    const n = nodes[info.index];
+    if (!n) return null;
+    const note = el('span', {class: 's3-muted s3-fx-note', text: S.structDirty.has(key) ? 'changed - not saved yet' : ''});
+    const save = btn('Save the segment', async () => {
+      save.disabled = true; note.textContent = 'saving...';
+      try {
+        const res = info.cycle ? await send('/api/system3/structure', 'PUT', {steps: draft.steps, initiator: draft.initiator || ''})
+          : await send('/api/system3/structures/' + encodeURIComponent(key), 'PUT', {...draft, legs: draft.legs});
+        S.structDraft.delete(key); S.structDirty.delete(key);
+        await ctx.loadConfig('structure', key);
+        discard.hidden = true;
+        note.textContent = 'saved' + (res && res.structure && res.structure.version ? ' v' + res.structure.version : '') + (res && res.hash ? ' - live config ' + res.hash : '') + '. The next round runs it; this message keeps the one it was planned under.';
+        note.classList.add('s3-fx-ok');
+      } catch (e) { note.textContent = 'not saved: ' + ((e && e.message) || e); save.disabled = false; }
+    }, {class: 's3-fx-save', disabled: !S.structDirty.has(key)});
+    /* a discard puts the desk's copy back: the one repaint here, and the reader's own press */
+    const discard = btn('Discard', () => { S.structDraft.delete(key); S.structDirty.delete(key); ctx.go(ctx.tab()); }, {class: 's3-fx-small', hidden: !S.structDirty.has(key)});
+    const mark = () => { S.structDirty.add(key); save.disabled = false; discard.hidden = false; note.textContent = 'changed - not saved yet'; note.classList.remove('s3-fx-ok'); };
+    const evs = turnEvents(S.conv, t).filter(e => !e.stage);
+    const drawRows = (n.draws || []).map((d, k) => {
+      const ev = evs.find(e => e.family === d.family) || null;
+      const items = (live().tables || []).filter(x => x.family === d.family && (!d.tables || d.tables.includes(x.id)))
+        .flatMap(x => (x.categories || []).flatMap(c => (c.items || []).map(it => ({id: it.id, label: `${x.id} · ${c.label || c.id} · ${it.label || it.id}`}))));
+      const gone = el('span', {class: 's3-muted', text: 'off the node - Save to keep it off, Discard to put it back', hidden: true});
+      const pick = el('select', {'aria-label': d.family + ' draw', onchange: e => {
+        const val = e.target.value;
+        if (val === '__roll') delete d.fixed;
+        else if (val === '__off') { n.draws = (n.draws || []).filter(x => x !== d); e.target.disabled = true; gone.hidden = false; }
+        else d.fixed = val;
+        mark();
+      }},
+      el('option', {value: '__roll', text: 'roulette on - rolled every time', selected: d.fixed === undefined}),
+      el('option', {value: '__off', text: 'take this draw off the node'}),
+      ...items.map(it => el('option', {value: it.id, text: 'pinned to ' + it.label, selected: d.fixed === it.id})));
+      return el('div', 's3-fx-w s3-fx-drawrow', el('span', {class: 's3-draw', style: `--fam:${FAM[d.family] || 'var(--obs)'}`}, el('span', {class: 's3-dice', text: ev ? String(eventLine(ev, S.conv).dice ?? '-') : 'd100'}), d.family),
+        el('span', {class: 's3-muted', text: ev ? 'landed ' + String(landedWords(ev, S.conv) || '').replace(/\s+/g, ' ').slice(0, 60) : 'no roll recorded here'}), pick, gone);
+    });
+    return el('div', 's3-card s3-fx-lever s3-fx-nodeedit',
+      el('div', {class: 's3-fx-levh', text: `Next time - node "${n.label || n.id}" of ${info.cycle ? 'the banter cycle' : key}`}),
+      info.cycle ? null : el('label', 's3-fx-text', el('span', {class: 's3-muted', text: 'what this leg does - the act the writer is given'}),
+        el('textarea', {value: n.act || '', rows: 2, 'aria-label': 'the act', oninput: e => { n.act = e.target.value; mark(); }})),
+      drawRows.length ? para('Its draws: take one off the node, or pin it to a value (the roulette is then off for it) - "pinned to" another value is how this one never lands here again.', 's3-muted') : null,
+      ...drawRows,
+      el('div', 's3-row', save, discard,
+        btn(mode === 'structure' ? 'Open the Structure editor' : 'Open in the Segments editor', () => mode === 'structure'
+          ? openEditor('structure', () => ctx.structure(key))
+          : openEditor('segments', () => ctx.segment(key, info.index), body => litOnce(body.querySelector('.s3-seg-node.sel'))), {class: 's3-fx-open'}), note));
+  }
+
+  /* ---- Prompts ---------------------------------------------------------- */
+  async function paintPrompts(host) {
+    const conv = S.conv, t = S.turn;
+    if (!t) { host.append(para('No System 3 turn made this line, so System 3 holds no prompt for it.', 's3-muted')); return; }
+    const callBox = el('div', null, para('Looking for the model call that wrote this message...', 's3-muted'));
+    const blockBox = el('div', null, para('Reading the prompt blocks...', 's3-muted'));
+    const all = events().filter(e => e.kind !== 'observation');
+    const spont = all.filter(e => FX_SPONT.has(e.family) && ['mine', 'round'].includes(whereOf(e)));
+    const lineRolls = all.filter(e => e.family === 'STATION' && whereOf(e) === 'station' && /^(line|station|speakbox|voice|sting)\./.test(String((e.meta || {}).key || '')));
+    const gold = all.filter(e => e.family === 'STATION' && /^gold\./.test(String((e.meta || {}).key || '')));
+    const carry = (conv.observations_air || []).filter(o => o.family === 'CARRY');
+    host.append(sectionOf('The model call that wrote it', callBox),
+      sectionOf('The prompt blocks, as System 3 decided them', blockBox),
+      sectionOf(`The spontaneity systems - what was rolled for it (${spont.length + lineRolls.length})`,
+        spont.length || lineRolls.length ? el('div', 's3-fx-decs', ...[...spont, ...lineRolls].map(e => fxCard(e, {fold: true, where: WHERE_WORDS[whereOf(e)]})))
+          : para('Nothing chance-driven was rolled for it.', 's3-muted')),
+      sectionOf('Gold', gold.length ? el('div', 's3-fx-decs', ...gold.map(e => fxCard(e, {fold: true})))
+        : para('No gold roll was recorded with this round: no banked bar was in play for it.', 's3-muted')),
+      sectionOf('Memory - what was carried in', carry.length ? el('div', 's3-fx-mini-list', ...carry.map(o => el('div', 's3-fx-line',
+        el('b', {text: 'CARRY '}), el('span', {text: `${o.stage || ''}: ${o.why || ((o.landing || {}).text ? 'landed on "' + o.landing.text + '"' : '')}`}))))
+        : para('Nothing was carried from the round before.', 's3-muted'),
+        conv.carry ? el('details', null, el('summary', {text: 'the carry this round started from'}), el('pre', {text: json(conv.carry)})) : null),
+      layersBox(t));
+    const [w, b] = await Promise.all([writerOf(), blocksOf()]);
+    if (!host.isConnected) return;
+    const parts = w && w.row ? promptParts(w.detail || {}) : null;
+    if (w && w.row) {
+      const r = w.row;
+      /* its row as the writer got it - only from a call proven by its words: the nearest call by time may be another round's */
+      const inPrompt = w.exact ? sheetRowOf(promptText(w.detail || {}), t).trim() : '';
+      fill(callBox, el('div', 's3-row', el('b', {text: `${r.model || '?'} - ${r.purpose || ''}`}), el('span', {class: 's3-state s3-state-' + (r.state || 'done'), text: r.state || ''}),
+          el('span', {class: 's3-muted', text: day(Number(r.at || 0)) + (r.finished && r.at ? ` - took ${num(Number(r.finished) - Number(r.at), 1)} s` : '')}),
+          el('span', {class: 's3-pill ' + (w.exact ? 'active' : 'shadow'), text: w.exact ? 'proven by its words' : 'nearest by time'})),
+        para(w.why || '', 's3-muted'),
+        inPrompt ? el('div', 's3-story-row', el('b', {text: 'Its row, as the writer was given it: '}), inPrompt) : null,
+        el('details', {class: 's3-fx-fold'}, el('summary', {text: 'The system prompt, as it was sent'}), readablePromptText(parts.sys || (parts.user ? NO_SYSTEM : ''))),
+        el('details', {class: 's3-fx-fold'}, el('summary', {text: 'The prompt to the writer, as it was sent'}), readablePromptText(parts.user)),
+        el('details', {class: 's3-fx-fold'}, el('summary', {text: 'What came back'}), el('pre', {text: parts.text || '(empty)'})));
+    } else fill(callBox, para('No prompt for this message: ' + ((w && w.why) || 'no model call was found.'), 's3-muted'));
+    const rows = b.rows || [];
+    if (!rows.length) { fill(blockBox, para('System 3 holds no block record for this prompt - written before prompt blocks were nodes, on a road System 3 does not decide, or aged out.', 's3-muted')); return; }
+    const evs = new Map(all.filter(e => e.family === 'BLOCK').map(e => [e.event_id, e]));
+    const rules = b.rules || {};
+    const groups = FX_BLOCK_GROUPS.map(([k, title, names]) => [k, title, rows.filter(x => names.includes(x.name) && x.odds == null && x.u == null && x.kind !== 'roll')]);
+    const rolled = rows.filter(x => x.odds != null || x.u != null || x.kind === 'roll');
+    const placed = new Set([...groups.flatMap(g => g[2]), ...rolled]);
+    const rest = rows.filter(x => !placed.has(x));
+    const blockRow = x => {
+      const ev = x.event_id ? evs.get(x.event_id) : null;
+      const dice = ev && ev.rng && ev.rng.dice != null ? ev.rng.dice : x.u != null ? Math.floor(Number(x.u) * 100) + 1 : null;
+      return el('div', {class: 's3-fx-block ' + (x.keep ? 'kept' : 'stripped')},
+        el('div', 's3-row', el('span', {class: 's3-drop-state', text: x.keep ? 'sent' : 'stripped'}), (x.odds != null || x.u != null) ? die(dice) : null,
+          el('b', {text: x.label || (rules[x.name] || {}).label || x.name}), el('code', {text: x.name}),
+          el('span', {class: 's3-muted', text: [x.kind === 'wedge' ? 'a wedge - no node claims it' : x.kind, x.odds != null ? `rolled at ${pct(x.odds)}` : '', x.why].filter(Boolean).join(' - ')}),
+          ev ? btn('How', () => openDecision(S.conv, ev, null, v.api), {class: 's3-fx-small'}) : null),
+        (rules[x.name] || {}).helper ? para('built by ' + rules[x.name].helper, 's3-muted') : null,
+        !x.keep && x.text ? el('details', null, el('summary', {text: 'the text it would have sent'}), el('pre', {text: String(x.text)})) : null,
+        blockLever(x.name));
+    };
+    fill(blockBox, para(`${rows.length} blocks: ${rows.filter(x => x.keep).length} sent, ${rows.filter(x => !x.keep).length} stripped, ${rolled.length} rolled`
+        + (b.at ? ` - decided ${clock(b.at)}` : '') + (b.how ? ` - ${b.how}` : '') + '. Each block\'s kind is its rule for the next prompt.', 's3-muted'),
+      ...groups.filter(g => g[2].length).map(([k, title, list]) => el('details', {class: 's3-fx-bgroup', open: k !== 'system' || list.length <= 6},
+        el('summary', {text: `${title} (${list.length})`}), ...list.map(blockRow))),
+      rolled.length ? el('details', {class: 's3-fx-bgroup', open: true}, el('summary', {text: `Rolled - the prompt's own spontaneity (${rolled.length})`}), ...rolled.map(blockRow)) : null,
+      rest.length ? el('details', {class: 's3-fx-bgroup', open: true}, el('summary', {text: `The rest (${rest.length})`}), ...rest.map(blockRow)) : null);
+  }
+  /* the layers the next system prompt is built from: the inspector's own door */
+  function layersBox(t) {
+    const box = el('div', null, para('Reading the prompt layers...', 's3-muted'));
+    (async () => {
+      const cfg = await soft(request('/api/prompt-history/config'));
+      if (!box.isConnected) return;
+      const nodes = (cfg && cfg.nodes) || [];
+      const nodeAt = path => nodes.find(n => JSON.stringify(n.path) === JSON.stringify(path)) || null;
+      const editor = (current, title, help, scope, key) => {
+        let was = String(current || '');
+        const area = el('textarea', {value: was, rows: 5, 'aria-label': title});
+        const note = el('span', {class: 's3-muted s3-fx-note', text: help || ''});
+        const save = btn('Save for future calls', async () => {
+          save.disabled = true;
+          try { const got = await send('/api/paperwork/field', 'POST', {scope, key, value: area.value, was, line_id: spec.lineId, apply: 'future'});
+            was = area.value; note.textContent = (got && got.say) || 'saved for future calls'; note.classList.add('s3-fx-ok'); }
+          catch (e) { note.textContent = 'Not saved: ' + ((e && e.message) || e); }
+          save.disabled = false;
+        }, {class: 's3-fx-save'});
+        return el('div', 's3-pfold-layer', el('h4', {text: title}), area, el('div', 's3-row', save, note));
+      };
+      const seat = String(t.speaker || 'A');
+      const personaPath = SEAT_PERSONA[seat] || null;
+      const personaNode = personaPath ? nodeAt(personaPath) : null;
+      const stationNode = nodeAt(['dj', 'radio_prompt_overrides', 'station_system']);
+      fill(box,
+        editor(stationNode ? stationNode.value : '', 'The station\'s standing instructions (the station system prompt)', 'Folded into every writer\'s head when the station follows its prompt.', 'station', ''),
+        personaPath ? editor(personaNode ? personaNode.value : '', `The persona of ${SEAT_WORDS[seat] || 'seat ' + seat} - ${t.name || seat}`, 'The character this seat is written as.', 'persona', SEAT_KEY[seat])
+          : para(`Seat ${seat} has no persona setting on the desk.`, 's3-muted'),
+        para('Kept for future calls and receipted in the station\'s actions. This message keeps the prompt it had.', 's3-muted'));
+    })().catch(e => { if (box.isConnected) fill(box, para('The prompt layers could not be read: ' + ((e && e.message) || e), 's3-error')); });
+    return sectionOf('Edit the layers the next system prompt is built from', box);
+  }
+
+  /* ---- Audit: the ledger's events, in order -------------------------------- */
+  async function paintAudit(host) {
+    const all = events();
+    const rows = el('div', 's3-fx-arows');
+    let whole = false;
+    const toggle = el('label', 's3-row', el('input', {type: 'checkbox', onchange: e => { whole = e.target.checked; draw(); }}), 'the whole round, not only what shaped this message');
+    const count = el('span', 's3-muted');
+    function row(e) {
+      const where = whereOf(e);
+      const line = eventLine(e, S.conv);
+      const r = el('details', {class: 's3-fx-arow s3-fx-' + where, style: `--fam:${FAM[e.family] || 'var(--obs)'}`},
+        el('summary', null, el('span', {class: 's3-muted', text: e.cursor != null ? '#' + e.cursor : ''}), el('span', {class: 's3-muted', text: clock(Number(e.at || 0))}),
+          el('span', {class: 'fam', text: e.family + (e.kind === 'observation' ? ' obs' : '')}), die(line.dice),
+          el('span', {class: 's3-fx-awhat', text: e.kind === 'observation' ? line.text : String(landedWords(e, S.conv) || line.text || '').replace(/\s+/g, ' ').slice(0, 140)}),
+          el('span', {class: 's3-fx-where', text: WHERE_WORDS[where] || where})));
+      let built = false;
+      r.addEventListener('toggle', () => {
+        if (!r.open || built) return;
+        built = true;
+        r.append(e.kind === 'observation' ? el('div', 's3-fx-abody', fxObsCard(e)) : el('div', 's3-fx-abody', fxCard(e, {fold: true})));
+      });
+      return r;
+    }
+    function draw() {
+      const shown = whole ? all : all.filter(e => SHAPED.has(whereOf(e)));
+      /* the turns before it (the state it was planned from) and the station's rolls
+         for the air around it fold into one row each - opened, their events in order */
+      const out = [];
+      let group = null;
+      for (const e of shown) {
+        const w = whereOf(e);
+        const gk = whole ? '' : w === 'before' ? 'b:' + e.turn_id : w === 'station' ? 'station' : '';
+        if (gk) {
+          if (!group || group.key !== gk) {
+            const tt = w === 'before' ? ((S.conv.turns || []).find(x => x.turn_id === e.turn_id) || {}) : null;
+            group = {key: gk, box: el('div', 's3-fx-decs'), n: 0, head: el('summary', {text: ''}),
+              label: tt ? `turn ${Number(tt.index) + 1} - ${tt.name || tt.speaker || ''} (${tt.step_label || ''})` : 'the station rolls recorded with the round',
+              tail: tt ? ' before it - the state this message was planned from' : ' - the air around it; their odds and options are STATION1 / POOLS1'};
+            out.push(el('details', {class: 's3-fx-arow s3-fx-agroup s3-fx-' + w}, group.head, group.box));
+          }
+          group.n += 1;
+          group.head.textContent = `${group.label}: ${group.n} roll${group.n === 1 ? '' : 's'}${group.tail}`;
+          group.box.append(row(e));
+          continue;
+        }
+        group = null;
+        out.push(row(e));
+      }
+      fill(rows, ...out, out.length ? null : para('Nothing on the ledger shaped this message.', 's3-muted'));
+      count.textContent = `${shown.length} of ${all.length} events on this round's ledger`;
+    }
+    host.append(el('div', 's3-row', toggle, count, btn('Open the whole round in Audit', () => openEditor('audit', () => ctx.audit(cid())), {class: 's3-fx-open'})), rows);
+    draw();
+  }
+  function fxObsCard(o) {
+    const plain = Object.entries(o).filter(([k, val]) => !['kind', 'family', 'conversation_id', 'blocks', 'body'].includes(k) && (typeof val !== 'object' || val === null));
+    return el('div', 's3-fx-dec', el('div', 's3-fx-dhead', el('span', {class: 's3-dfam', text: o.family}), el('div', 's3-fx-dwhat', el('b', {text: eventLine(o, S.conv).text}))),
+      kv(plain.map(([k, val]) => [k.replace(/_/g, ' '), val])),
+      o.family === 'PROMPT' ? para(`${(o.blocks || []).length} blocks - on the Prompts tab`, 's3-muted') : null,
+      el('details', null, el('summary', {text: 'the raw record'}), el('pre', {text: json(o)})));
+  }
+
+  /* ---- Sys3: the circuit it travelled ------------------------------------- */
+  async function paintCircuit(host) {
+    const conv = S.conv, t = S.turn;
+    const [w, why, at] = await Promise.all([writerOf().catch(() => null), whyOf(), blockNo()]);
+    if (!host.isConnected) return;
+    const evs = t ? turnEvents(conv, t).filter(e => !e.stage) : [];
+    const aired = String((why && why.aired) || '');
+    const stops = [
+      ['System 3', 'the conversation director', true],
+      ['the ' + (road() || '?') + ' road', `${conv.mode || ''} · ${conv.generation_mode || ''}`, true],
+      ['node', t ? (t.step_label || t.step || '') : 'no turn', !!t],
+      ['the dice', evs.map(e => `${e.family} ${eventLine(e, conv).dice ?? '-'}`).join(' · ') || 'none', evs.length > 0],
+      ['running order', t ? `row ${t.index + 1}, seat ${t.speaker}` : '', !!t && !!sheetRowOf(String((conv.plan || {}).sheet || ''), t)],
+      ['the writer', w && w.row ? `${w.row.model || '?'}` : 'not found', !!(w && w.row)],
+      ['recording room', why && why.voice ? String(why.voice) : '', !!(why && (why.voice || why.engine))],
+      ['script ledger', at ? `block ${at.block}.${Number(at.ord) + 1}` : '', !!at],
+      ['on air', aired || '', ['stream', 'box', 'both', 'airing', 'page', 'published'].includes(aired)]];
+    const track = el('div', 's3-fx-circuit');
+    const dots = stops.map(([name, sub, lit], i) => {
+      const node = el('div', {class: 's3-fx-cstop' + (lit ? ' lit' : '')}, el('span', {class: 's3-fx-cdot', text: String(i + 1)}), el('b', {text: name}), el('span', {class: 's3-muted', text: sub}));
+      track.append(node);
+      if (i < stops.length - 1) track.append(el('span', {class: 's3-fx-cwire' + (lit && stops[i + 1][2] ? ' lit' : '')}));
+      return node;
+    });
+    const log = el('div', 's3-fx-flight', ...events().filter(e => ['mine', 'mine-air', 'mine-prompt'].includes(whereOf(e))).map(e => {
+      const line = eventLine(e, conv);
+      return el('div', {class: 's3-fx-fl', style: `--fam:${FAM[e.family] || 'var(--obs)'}`}, el('span', {class: 's3-muted', text: clock(Number(e.at || 0))}), die(line.dice),
+        el('b', {text: e.family}), el('span', {text: String(e.kind === 'observation' ? line.text : landedWords(e, conv) || line.text || '').replace(/\s+/g, ' ').slice(0, 110)}));
+    }));
+    const replay = btn('Replay how it came to be', async () => {
+      replay.disabled = true;
+      const ms = reduced() ? 0 : 420;
+      dots.forEach(d => d.classList.remove('pass'));
+      for (let i = 0; i < dots.length; i += 1) {
+        if (!dots[i].isConnected) break;
+        dots[i].classList.add('pass');
+        if (i === 3) for (const f of log.querySelectorAll('.s3-die')) if (f.roll) f.roll(ms);
+        if (ms) await sleep(ms);
+      }
+      replay.disabled = false;
+    }, {class: 's3-fx-replay'});
+    host.append(el('div', 's3-card', el('div', 's3-row', el('h2', {text: 'The circuit this message travelled'}), el('span', {style: 'flex:1'}), replay), track,
+      para('Lit: the record shows the message passed through it. The live circuit of every road is on Sys3 in all of System 3.', 's3-muted')),
+      sectionOf('Its flight log - the ledger\'s events for this message, in order', log.childNodes.length ? log : para('No event names this message.', 's3-muted')),
+      el('div', 's3-row', btn('The live circuit (all of System 3)', () => goFull('sys3'), {class: 's3-fx-open'})));
+  }
+
+  /* ---- Director: the round and the running order --------------------------- */
+  async function paintDirector(host) {
+    const conv = S.conv, t = S.turn, id = conv.identity || {};
+    const turns = conv.turns || [];
+    const cfgNow = (ctx.config() || {}).hash || '';
+    let whole = false;
+    const exBox = el('div', 's3-chat s3-fx-exchange');
+    const drawEx = () => {
+      const i = t ? t.index : 0;
+      const show = whole || !t ? turns : turns.filter(x => Math.abs(x.index - i) <= 2);
+      fill(exBox, ...show.map(x => { const b = v.bubble(x, {conv}); if (t && x.turn_id === t.turn_id) b.classList.add('sel', 's3-fx-me'); return b; }));
+    };
+    const moreBtn = btn('Show the whole round', () => { whole = !whole; moreBtn.textContent = whole ? 'Only the messages around it' : 'Show the whole round'; drawEx(); }, {class: 's3-fx-small'});
+    const airBox = el('div', null, para('Reading the script ledger...', 's3-muted'));
+    host.append(
+      el('div', 's3-card', el('div', 's3-row', el('h2', {text: String((conv.subject || {}).topic || 'Conversation ' + id.conversation_id).slice(0, 140)}),
+          el('span', {class: 's3-pill ' + conv.mode, text: conv.mode})),
+        kv([['road', id.road_kind], ['round', id.conversation_id], ['revision', id.revision], ['generation', conv.generation_mode], ['planned', day(Number(conv.created || 0))],
+          ['engine', conv.engine], ['config', conv.config_hash + (cfgNow && cfgNow !== conv.config_hash ? ' - the desk now holds ' + cfgNow : '')], ['seed', conv.seed],
+          ['schedule slot', id.system2_slot_id], ['verdict', conv.validation ? `${conv.validation.verdict} ${num(conv.validation.score)}` : ''], ['turns', turns.length]]),
+        el('div', 's3-row', btn('Open this round in the Director', () => goFull('director', () => ctx.director(cid(), t ? t.turn_id : '')), {class: 's3-fx-open'}),
+          btn('Open it in Visual Prompt', () => goFull('visual', () => ctx.visual(cid(), t ? t.turn_id : '')), {class: 's3-fx-open'}))),
+      t ? sectionOf('The running order System 3 wrote - its row marked', dropTold(conv, t)) : null,
+      sectionOf(t ? `The exchange around it - message ${t.index + 1} of ${turns.length}` : 'The exchange', el('div', 's3-row', moreBtn), exBox),
+      sectionOf('On the air - the script ledger around it', airBox));
+    drawEx();
+    const [why, ins, at] = await Promise.all([whyOf(), inspectOf(), blockNo()]);
+    if (!airBox.isConnected) return;
+    const lines = (ins && ins.lines) || [];
+    const flow = (why && why.flow) || [];
+    fill(airBox,
+      ins ? kv([['block', ins.block], ['the hour', ins.hour], ['the round', ins.round ? `${ins.round.road || ''} ${ins.round.sid || ''} - committed ${ins.round.committed || ''}` : ''],
+        ['heard', ins.timing ? `${ins.timing.heard || 0} of ${ins.timing.of || lines.length} - ${ins.timing.from || ''} to ${ins.timing.to || ''}` : ''],
+        ['the prompt', ins.prompt_say || ins.prompt_kind || ''], ['seed document', ins.seed_doc]]) : para(at ? 'The script ledger could not be read.' : 'This line is not on the script ledger.', 's3-muted'),
+      lines.length ? el('ol', 's3-fx-ledger', ...lines.map(l => el('li', {class: l.line_id === spec.lineId ? 'on' : (l.heard ? 'heard' : '')},
+        el('span', {class: 's3-muted', text: `${Number(l.ord) + 1}. ${l.at || ''}`}), el('b', {text: l.name || l.who || ''}), el('span', {text: String(l.text || '').slice(0, 180)}),
+        el('span', {class: 's3-muted', text: [l.kind, l.seconds != null ? num(l.seconds, 1) + ' s' : '', l.heard ? 'heard' : (l.aired || '')].filter(Boolean).join(' · ')})))) : null,
+      (ins && (ins.holes || []).length) ? para('Holes in the air: ' + ins.holes.map(h => `${h.from}-${h.to} (${num(h.seconds, 0)} s)`).join(', '), 's3-muted') : null,
+      flow.length ? el('div', 's3-timeline', ...flow.map(f => el('div', 's3-tl-row', el('span', {class: 's3-tl-when', text: f.at || '-'}), el('b', {text: f.label || f.step}),
+        el('span', {class: 's3-tl-took', text: ''}), el('span', {class: 's3-muted', text: f.detail || ''})))) : null,
+      (ins && (ins.modifiers || []).length) ? el('details', null, el('summary', {text: `what was in force on the desk (${ins.modifiers.length})`}),
+        el('ul', 's3-dlist', ...ins.modifiers.map(m => el('li', {text: `${m.kind}: ${m.says || m.label || m.name}`})))) : null);
+  }
+
+  /* ---- Controls: what its rolls answered to -------------------------------- */
+  async function paintControls(host) {
+    const conv = S.conv;
+    const all = events().filter(e => e.kind !== 'observation' && ['mine', 'round'].includes(whereOf(e)));
+    const moved = new Map();
+    for (const e of all) for (const k of controlsOf(e)) { if (!moved.has(k)) moved.set(k, []); moved.get(k).push(e); }
+    const planned = (conv.settings || {}).controls || {};
+    const settings = ctx.settings() || {};
+    const liveControls = {...(((settings.settings) || {}).controls || {})};
+    const help = ctx.controlHelp || {};
+    const note = el('span', 's3-muted s3-fx-note');
+    const cards = [...moved.entries()].map(([k, evs]) => {
+      const was = planned[k], now = liveControls[k];
+      const out = el('b', {text: num(now)});
+      const input = el('input', {type: 'range', min: 0, max: 1, step: 0.05, value: now == null ? 0.5 : now, 'aria-label': k, oninput: e => { out.textContent = num(+e.target.value); }});
+      const save = btn('Save', async () => {
+        save.disabled = true; note.textContent = 'saving ' + k + '...';
+        try { const got = await send('/api/system3/settings', 'POST', {controls: {...liveControls, [k]: +input.value}});
+          Object.assign(liveControls, (((got || {}).settings) || {}).controls || {[k]: +input.value});
+          if (settings.settings) settings.settings.controls = {...liveControls};
+          note.textContent = `${k} saved - the next round rolls with it`; note.classList.add('s3-fx-ok'); }
+        catch (e) { note.textContent = 'not saved: ' + ((e && e.message) || e); }
+        save.disabled = false;
+      }, {class: 's3-fx-save'});
+      return el('div', 's3-card s3-fx-ctlcard',
+        el('div', 's3-row', el('b', {text: k.replace(/_/g, ' ')}), el('span', {class: 's3-muted', text: `${num(was)} when it was planned${now != null && Math.abs(Number(now) - Number(was)) > 0.001 ? ' - ' + num(now) + ' now' : ''}`})),
+        help[k] ? para(help[k], 's3-muted') : null,
+        el('div', 's3-row', input, out, save),
+        el('div', 's3-fx-mini-list', ...evs.map(e => miniRoll(e))));
+    });
+    host.append(cards.length ? el('div', 's3-fx-ctlgrid', ...cards) : para('None of its rolls answered to a behaviour control: their weights were the tables\' own.', 's3-muted'),
+      el('div', 's3-row', note, btn('Open the Controls tab', () => goFull('controls'), {class: 's3-fx-open'})));
+  }
+
+  resolve();
+  return {paint, full: () => S.full};
 }

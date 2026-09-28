@@ -291,7 +291,7 @@
     });
   }
 
-  function select(view, index, focus) {
+  function select(view, index, focus, quiet) {   // [autoscroll-rule]
     if (index < 0 || index >= view.rows.length || view.closed) return;
     var row = view.rows[index];
     var changed = !view.selected || String(view.selected.id) !== String(row.id)
@@ -304,7 +304,8 @@
     });
     var selectedNode = view.feed.querySelectorAll('.pga-row')[index];
     if (selectedNode) {
-      selectedNode.scrollIntoView && selectedNode.scrollIntoView({block: 'nearest'});
+      /* [autoscroll-rule] only the operator's own choice scrolls to it */
+      if (!quiet && selectedNode.scrollIntoView) selectedNode.scrollIntoView({block: 'nearest'});
       if (focus) selectedNode.focus();
     }
     view.name.textContent = row.name || 'Untitled ad';
@@ -337,6 +338,11 @@
   }
 
   function renderFeed(view) {
+    /* [autoscroll-rule] a refresh rebuilds the list: the operator's place in
+       it is put back rather than thrown to the top */
+    var feedStick = root.pineStick
+      ? root.pineStick(view.feed, {edge: 'top', key: 'data-id', button: false}) : null;
+    var feedHold = feedStick ? feedStick.anchor() : null;
     view.feed.replaceChildren();
     view.count.textContent = String(view.rows.length);
     if (!view.rows.length) {
@@ -362,6 +368,7 @@
       button.setAttribute('role', 'option');
       button.setAttribute('aria-selected', 'false');
       button.tabIndex = -1;
+      button.setAttribute('data-id', String(row.id));   // [autoscroll-rule]
       button.appendChild(el('span', 'pga-row-index', String(index + 1).padStart(2, '0')));
       var copy = el('span', 'pga-row-copy');
       copy.appendChild(el('strong', '', row.name || 'Untitled ad'));
@@ -373,7 +380,8 @@
     });
     var previous = view.selected && String(view.selected.id);
     var index = view.rows.findIndex(function (row) { return String(row.id) === previous; });
-    select(view, index >= 0 ? index : 0, false);
+    select(view, index >= 0 ? index : 0, false, true);   // [autoscroll-rule]
+    if (feedStick) feedStick.restore(feedHold, false);
   }
 
   function refresh(view) {

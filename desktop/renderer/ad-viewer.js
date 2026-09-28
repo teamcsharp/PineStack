@@ -18,6 +18,78 @@
     return files.find(function (f) { return /\.(mp4|webm|mov|m4v)$/i.test(f); })
       || files.find(function (f) { return /\.(png|jpe?g|webp|gif)$/i.test(f); }) || '';
   }
+  /* [h3-prompts] The words a video was told, as the gallery shows them under
+     it: the preset, how the hour came by it, the road and each prompt - from
+     the row's own record (h3_prompts), or, for a video made before that
+     record, what the row kept (the direction it was sent, its line, the final
+     H3 prompt). Pure: the popup paints it, the tests read it. */
+  var USED_ROADS = {clip: 'clip road - a dialogue clip was the reference',
+    gallery: 'gallery road - a gallery picture was the reference', host: 'host road - the host\'s LoRA presented'};
+  function usedHow(rec) {
+    var roll = rec && rec.roll && typeof rec.roll === 'object' ? rec.roll : {};
+    if (!rec) return '';
+    if (rec.how === 'next') return 'pinned for the hour';
+    if (rec.how === 'dice') {
+      if (roll.by === 'system3') return 'rolled by System 3: d100 ' + roll.dice + ', ' + roll.index + ' of ' + roll.of;
+      if (roll.by === 'station') return 'rolled by the station (System 3 off): ' + roll.index + ' of ' + roll.of;
+      return 'dice on, ' + (roll.why || 'no roll');
+    }
+    return 'the active preset';
+  }
+  function usedWords(row) {
+    row = row || {};
+    var rec = row.h3_prompts && typeof row.h3_prompts === 'object' ? row.h3_prompts : null;
+    var items = [];
+    function add(label, text, key) {
+      text = String(text == null ? '' : text).trim();
+      if (text) items.push({label: label, text: text, key: key});
+    }
+    if (rec) {
+      add('Brief', rec.goal, 'goal');
+      add('Direction sent', rec.direction || row.request, 'direction');
+      add('Line spoken', rec.speech || row.speech, 'speech');
+      add('Style', rec.style, 'style');
+      add('Audio direction', rec.audio_direction, 'audio_direction');
+      add('Constraints', rec.constraints, 'constraints');
+      add('Final H3 prompt', row.tags, 'tags');
+      var name = rec.preset && rec.preset.name ? String(rec.preset.name) : 'a preset';
+      return {recorded: true, hourly: true, preset: name, how: usedHow(rec), road: USED_ROADS[rec.road] || '',
+        at: Number(rec.at) || 0, items: items, reusable: true, note: '',
+        summary: '"' + name + '" - ' + usedHow(rec) + (rec.road ? ' - ' + rec.road + ' road' : '')};
+    }
+    add('Direction sent', row.request, 'direction');
+    add('Line spoken', row.speech, 'speech');
+    add('Final H3 prompt', row.tags, 'tags');
+    var hourly = row.hourly === true || /The person or people on screen must Make a short, funny but professional Pine Box FM sponsor stinger/.test(String(row.request || ''));
+    return {recorded: false, hourly: hourly, preset: '', how: '', road: '', at: 0, items: items,
+      reusable: items.some(function (i) { return i.key === 'direction'; }),
+      summary: !items.length ? 'not recorded' : hourly ? 'an hourly render from before its prompts were kept' : 'what it was sent',
+      note: !items.length ? 'No prompt was recorded with this video.'
+        : hourly ? 'An hourly render made before the prompts were kept with the video: this is what it was sent - its preset and the hour\'s brief were not recorded.' : ''};
+  }
+  function usedTime(at) {
+    var d = new Date(Number(at || 0) * 1000);
+    if (!at || isNaN(d.getTime())) return '--:--';
+    return String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
+  }
+  function copyByHand(text) {
+    var area = document.createElement('textarea'); area.value = text; area.setAttribute('readonly', '');
+    area.style.position = 'fixed'; area.style.opacity = '0'; document.body.appendChild(area); area.select();
+    var ok = false;
+    try { ok = document.execCommand('copy'); } catch (e) { ok = false; } finally { area.remove(); }
+    return ok ? Promise.resolve() : Promise.reject(new Error('copy refused'));
+  }
+  function copyWords(text) {
+    text = String(text == null ? '' : text);
+    try {
+      /* the desk's window is file:// - navigator.clipboard is not there (#990) */
+      if (root.pineDesktop && typeof root.pineDesktop.copyText === 'function' && root.pineDesktop.copyText(text) !== false) return Promise.resolve();
+    } catch (e) { /* the page's own clipboard, below */ }
+    if (typeof navigator !== 'undefined' && navigator.clipboard && navigator.clipboard.writeText) {
+      return navigator.clipboard.writeText(text).catch(function () { return copyByHand(text); });
+    }
+    return copyByHand(text);
+  }
   function open(initial, gallery) {
     if (opened) opened();
     var veil = make('div', 'pine-voice-ad-popup'); veil.id = 'pineVoiceAdPopup';
@@ -50,6 +122,290 @@
       if (!qualityPanel.hidden) { paintQuality(h3State); loadH3(); }
     });
     h3Bar.appendChild(h3Gear);
+    /* [h3-prompts] "Put an option here of a P for prompt and whenever I click it
+       or tap it it takes me to a screen where I'm able to modify the prompts that
+       are used for the hourly generation ... save and cycle through presets ...
+       a dice icon that if I click it, it actually shuffles between the prompts
+       that I have saved" (operator, 2026-09-28). P opens the hourly prompts screen
+       in this card: the saved presets (previous / next / the list), their words,
+       Save, Save as new, Use next hour, Set active, Delete, and the recent hours.
+       The dice turns the hourly shuffle on and off: each hour System 3 rolls one of
+       the saved presets (its desk weights them - POOLS1 h3.hourly_preset). Nothing
+       here renders; it changes what the one hourly render is told. */
+    var pState = null, pView = null, pIndex = 0, pSelected = '', pBusy = false, pTimer = 0, pLoadedAt = 0;
+    var pDrafts = {}, pDeleteArmed = '';
+    var pButton = make('button', 'pav-p', 'P'); pButton.type = 'button';
+    pButton.title = 'Hourly prompts: edit, save and cycle the presets the hourly render is told';
+    pButton.setAttribute('aria-label', pButton.title); pButton.setAttribute('aria-expanded', 'false');
+    var pDice = command('Shuffle the hourly prompts', 'm:casino', function () { setDice(!(pState && pState.dice)); });
+    pDice.classList.add('pav-dice'); pDice.setAttribute('aria-pressed', 'false');
+    h3Bar.insertBefore(pButton, h3Gear); h3Bar.insertBefore(pDice, h3Gear);
+    function pBtn(title, icon, text, action) {
+      var b = make('button', 'pav-pr-btn'); b.type = 'button'; b.title = title; b.setAttribute('aria-label', title);
+      if (root.pineIcon) b.innerHTML = root.pineIcon(icon);
+      b.appendChild(make('span', '', text)); b.addEventListener('click', action); return b;
+    }
+    var pScreen = make('section', 'pav-prompts'); pScreen.hidden = true;
+    pScreen.setAttribute('role', 'region'); pScreen.setAttribute('aria-label', 'Hourly prompts');
+    var pTop = make('div', 'pav-pr-top');
+    var pBack = pBtn('Back to the gallery', 'c:caret--left', 'Gallery', function () { showPrompts(false); });
+    var pDiceBig = pBtn('Shuffle the hourly prompts: each hour System 3 rolls one of the saved presets', 'm:casino', 'Dice off',
+      function () { setDice(!(pState && pState.dice)); });
+    pDiceBig.classList.add('pav-pr-dice'); pDiceBig.setAttribute('aria-pressed', 'false');
+    pTop.append(pBack, make('b', '', 'Hourly prompts'), pDiceBig);
+    var pNextLine = make('div', 'pav-pr-next'), pNextWords = make('span', '', '');
+    var pClearPin = pBtn('Unpin: the next hour goes back to the dice or the active preset', 'c:close--filled', 'Unpin',
+      function () { pinNext({clear: true}); });
+    pNextLine.append(pNextWords, pClearPin);
+    var pCycle = make('div', 'pav-pr-cycle');
+    var pPrev = command('Previous preset', 'c:caret--left', function () { cycle(-1); });
+    var pPick = make('select', 'pav-pr-pick'); pPick.setAttribute('aria-label', 'Saved presets');
+    var pNextPreset = command('Next preset', 'c:caret--right', function () { cycle(1); });
+    var pCount = make('span', 'pav-pr-count', '');
+    var pActive = pBtn('Every hour uses this preset while the dice are off', 'c:checkmark--filled', 'Set active', setActive);
+    pCycle.append(pPrev, pPick, pNextPreset, pCount, pActive);
+    var pOdds = make('p', 'pav-pr-odds', '');
+    var pForm = make('form', 'pav-pr-form'); pForm.setAttribute('novalidate', '');
+    var P_FIELDS = [
+      ['name', 'Name', 'input', 'what this preset has people doing'],
+      ['goal', 'Brief', 'textarea', '{conversation} is the hour\'s talk, {record} the record on air - leave them out for the same scene every time'],
+      ['clip', 'Clip road', 'textarea', 'a dialogue clip is the reference; {goal} is the brief'],
+      ['gallery', 'Gallery road', 'textarea', 'a gallery picture is the reference; {goal} is the brief'],
+      ['host', 'Host road', 'textarea', 'the host\'s LoRA presents (only while the cast is on); {goal} is the brief'],
+      ['speech', 'Line spoken', 'input', 'blank: pulled out of the brief, as before'],
+      ['style', 'Style', 'input', 'one style term - blank: the gear\'s brief, else a polished broadcast commercial'],
+      ['audio_direction', 'Audio direction', 'input', 'blank: the gear\'s brief'],
+      ['constraints', 'Constraints', 'input', 'blank: the gear\'s brief']];
+    var pInputs = {};
+    P_FIELDS.forEach(function (f) {
+      var label = make('label', 'pav-pr-field'), input = make(f[2]);
+      if (f[2] === 'textarea') input.rows = f[0] === 'goal' ? 3 : 2; else input.type = 'text';
+      input.maxLength = f[0] === 'name' ? 60 : f[0] === 'goal' ? 1200 : f[2] === 'textarea' ? 1800 : f[0] === 'speech' ? 700 : f[0] === 'style' ? 120 : 400;
+      input.setAttribute('aria-label', f[1]); input.addEventListener('input', paintEditState);
+      label.append(make('span', '', f[1]), make('i', '', f[3]), input); pForm.appendChild(label); pInputs[f[0]] = input;
+    });
+    pForm.addEventListener('submit', function (e) { e.preventDefault(); savePreset(); });
+    var pActions = make('div', 'pav-pr-actions');
+    var pSave = pBtn('Save these words to this preset', 'c:save', 'Save', savePreset);
+    var pSaveNew = pBtn('Save these words as a new preset', 'c:add', 'Save as new', saveAsNew);
+    var pUseNext = pBtn('The next hourly render is told these words, once', 'c:time', 'Use next hour', useNextHour);
+    var pRevert = pBtn('Put back the saved words', 'c:renew', 'Revert', revertPreset);
+    var pDelete = pBtn('Delete this preset', 'c:trash-can', 'Delete', deletePreset);
+    pActions.append(pSave, pSaveNew, pUseNext, pRevert, pDelete);
+    var pNote = make('p', 'pav-pr-note'); pNote.setAttribute('role', 'status');
+    var pHoursHead = make('b', 'pav-pr-hours-head', 'Recent hours'), pHours = make('div', 'pav-pr-hours');
+    pScreen.append(pTop, pNextLine, pCycle, pOdds, pForm, pActions, pNote, pHoursHead, pHours);
+    function pCurrent() { return pView && pView.presets ? pView.presets[pIndex] || null : null; }
+    function pValues() { var out = {}; P_FIELDS.forEach(function (f) { out[f[0]] = pInputs[f[0]].value; }); return out; }
+    function pSame(a, b) { return P_FIELDS.every(function (f) { return String(a[f[0]] == null ? '' : a[f[0]]) === String(b[f[0]] == null ? '' : b[f[0]]); }); }
+    function pFill(values) { P_FIELDS.forEach(function (f) { pInputs[f[0]].value = values && values[f[0]] != null ? String(values[f[0]]) : ''; }); }
+    function pDirty() { var p = pCurrent(); return !!p && !pSame(pValues(), p); }
+    function pStash() { var p = pCurrent(); if (!p) return; if (pDirty()) pDrafts[p.id] = pValues(); else delete pDrafts[p.id]; }
+    function pFreeName(name) {
+      var taken = ((pView && pView.presets) || []).map(function (p) { return String(p.name).toLowerCase(); });
+      name = String(name || '').trim().slice(0, 60) || 'New preset';
+      if (taken.indexOf(name.toLowerCase()) < 0) return name;
+      for (var n = 2; n < 200; n++) {
+        var tried = (name.slice(0, 52) + ' (' + n + ')');
+        if (taken.indexOf(tried.toLowerCase()) < 0) return tried;
+      }
+      return name;
+    }
+    function pShow(at) {
+      if (!pView || !pView.presets || !pView.presets.length) return;
+      pIndex = (at + pView.presets.length) % pView.presets.length;
+      var p = pView.presets[pIndex]; pSelected = p.id; pDeleteArmed = '';
+      pFill(pDrafts[p.id] || p); paintScreen();
+    }
+    function cycle(step) { pStash(); pShow(pIndex + step); }
+    pPick.addEventListener('change', function () { pStash(); pShow(Number(pPick.value) || 0); });
+    function paintEditState() {
+      var dirty = pDirty(), p = pCurrent();
+      pSave.disabled = pBusy || !dirty; pRevert.disabled = !dirty; pSaveNew.disabled = pBusy;
+      pUseNext.disabled = pBusy || !p; pDelete.disabled = pBusy || !p || ((pView && pView.presets) || []).length <= 1;
+      pActive.disabled = pBusy || !p || !!(pState && p && pState.active === p.id);
+      pActive.lastChild.textContent = pState && p && pState.active === p.id ? 'Active' : 'Set active';
+      pDelete.lastChild.textContent = p && pDeleteArmed === p.id ? 'Tap again to delete' : 'Delete';
+      if (p && pPick.options[pIndex]) pPick.options[pIndex].textContent = presetLabel(p, pIndex) + (dirty ? ' - edited' : '');
+    }
+    function presetLabel(p, at) {
+      var odds = ((pView && pView.odds) || [])[at] || {};
+      return p.name + (pState && pState.active === p.id ? ' (active)' : '')
+        + (pState && pState.dice ? (odds.off ? ' - sits out' : odds.share != null ? ' - ' + odds.share + '%' : '') : '')
+        + (pDrafts[p.id] && at !== pIndex ? ' - edited' : '');
+    }
+    function paintNextLine() {
+      var s = pState || {}, nh = s.next_hour || {};
+      var left = null;
+      if (h3State && h3State.enabled !== false) left = Math.max(0, Number(h3State.seconds_remaining || 0) - (Date.now() / 1000 - Number(h3State.client_at || 0)));
+      var last = s.last_hour;
+      pNextWords.textContent = 'Next hour' + (left != null ? ' (in ' + h3Clock(left) + ')' : h3State && h3State.enabled === false ? ' (the hourly render is off)' : '')
+        + ': ' + (nh.words || '...') + (last ? '. Last hour, ' + usedTime(last.at) + ': "' + ((last.preset || {}).name || '?') + '", ' + (last.how_words || '') + '.' : '');
+      pClearPin.hidden = !s.next;
+      var on = !!s.dice;
+      pDiceBig.classList.toggle('on', on); pDiceBig.setAttribute('aria-pressed', String(on));
+      pDiceBig.lastChild.textContent = on ? 'Dice on' : 'Dice off';
+    }
+    function paintScreen() {
+      paintNextLine();
+      var presets = (pView && pView.presets) || [];
+      pPick.replaceChildren();
+      presets.forEach(function (p, at) { var o = make('option', '', presetLabel(p, at)); o.value = String(at); pPick.appendChild(o); });
+      pPick.value = String(pIndex);
+      pCount.textContent = presets.length ? (pIndex + 1) + ' of ' + presets.length : 'no presets';
+      var p = pCurrent(), s = pState || {}, odds = ((pView && pView.odds) || [])[pIndex] || {};
+      if (!s.dice) pOdds.textContent = 'Dice off: every hour uses "' + (s.active_name || 'the active preset') + '". Turn the dice on to shuffle the '
+        + presets.length + ' saved presets at each hour.';
+      else if (p) pOdds.textContent = 'Dice on: "' + p.name + '" ' + (odds.off ? 'sits out - switched off on System 3\'s desk'
+        : 'comes up ' + odds.share + '% of hours') + (!s.dice_live ? ' (System 3 is off: the station rolls, evenly)'
+        : pView.desk_tabled ? (odds.on_desk ? ' (weight ' + odds.weight + ' on System 3\'s desk, POOLS1 ' + s.dice_key + ')'
+          : ' (not on System 3\'s desk yet - weight 1; add it to POOLS1 ' + s.dice_key + ' to weight it)')
+        : ' (the first roll puts the presets on System 3\'s desk, POOLS1 ' + s.dice_key + ', to be weighted)') + '.';
+      paintHours(); paintEditState();
+    }
+    function paintHours() {
+      var hours = (pView && pView.hours) || [];
+      pHours.replaceChildren(); pHoursHead.hidden = !hours.length;
+      hours.forEach(function (h) {
+        var row = make('div', 'pav-pr-hour'), name = (h.preset && h.preset.name) || 'an hour';
+        var words = Object.assign({}, h.fields || {});
+        row.append(make('time', '', usedTime(h.at)), make('span', '', '"' + name + '" - ' + (h.how_words || h.how || '')),
+          pBtn('The next hour is told this hour\'s words again', 'c:time', 'Again', function () {
+            pinNext({preset: Object.assign({}, words, {name: name + ' again'})});
+          }),
+          pBtn('Keep this hour\'s words as a new preset', 'c:save', 'Keep', function () {
+            pPost('/api/h3/prompts', Object.assign({}, words, {name: pFreeName(name + ' (' + usedTime(h.at) + ')')}), 'Kept as a new preset.');
+          }),
+          make('i', '', String(h.goal || '').slice(0, 220)));
+        pHours.appendChild(row);
+      });
+    }
+    function paintPromptButtons() {
+      var s = pState || {}, on = !!s.dice, nh = (s.next_hour && s.next_hour.words) || '';
+      pDice.setAttribute('aria-pressed', String(on)); pDice.classList.toggle('on', on);
+      pDice.title = on ? 'Dice on - next hour: ' + nh + '. Tap to turn the shuffle off.'
+        : 'Dice off - every hour uses "' + (s.active_name || 'the active preset') + '". Tap to shuffle the saved presets each hour.';
+      pDice.setAttribute('aria-label', pDice.title);
+      pButton.title = 'Hourly prompts - next hour: ' + (nh || 'unknown');
+      pButton.setAttribute('aria-label', pButton.title); pButton.classList.toggle('pinned', !!s.next);
+    }
+    function applyPrompts(got, settled) {
+      if (!got || typeof got !== 'object') return;
+      if (got.presets) {
+        pStash();
+        if (settled) delete pDrafts[settled];        /* its words were just saved (or saved as new) */
+        var want = got.saved || pSelected;
+        pView = got;
+        Object.keys(pDrafts).forEach(function (id) {
+          var q = got.presets.find(function (x) { return x.id === id; });
+          if (!q || pSame(pDrafts[id], q)) delete pDrafts[id];
+        });
+        var at = got.presets.findIndex(function (x) { return x.id === want; });
+        if (at < 0) at = got.presets.findIndex(function (x) { return x.id === got.active; });
+        pIndex = Math.max(0, at); pSelected = (got.presets[pIndex] || {}).id || '';
+        pFill(pDrafts[pSelected] || got.presets[pIndex]);
+      }
+      pState = got; pLoadedAt = Date.now();
+      paintPromptButtons();
+      if (!pScreen.hidden) paintScreen();
+    }
+    function loadPrompts(full) {
+      if (gone || !root.pineDesktop) return Promise.resolve();
+      return root.pineDesktop.get('/api/h3/prompts' + (full ? '' : '?summary=1')).then(function (got) {
+        if (!gone) applyPrompts(got);
+      }).catch(function (err) { if (!gone && full) pNote.textContent = 'Could not load the hourly prompts: ' + ((err && err.message) || err); });
+    }
+    function pPost(route, body, done, settled) {
+      if (gone) return Promise.resolve(null);
+      if (pBusy) { pNote.textContent = 'Still saving the last change - try again in a moment.'; return Promise.resolve(null); }
+      pBusy = true; paintEditState();
+      return root.pineDesktop.post(route, body || {}).then(function (got) {
+        if (gone) return null;
+        applyPrompts(got, settled); if (done) pNote.textContent = typeof done === 'function' ? done(got) : done;
+        return got;
+      }).catch(function (err) {
+        if (!gone) pNote.textContent = 'Not saved: ' + ((err && err.message) || err);
+        return null;
+      }).finally(function () { pBusy = false; if (!gone) paintEditState(); });
+    }
+    function setDice(on) {
+      return pPost('/api/h3/prompts/dice', {on: !!on}, on ? 'Dice on: each hour System 3 rolls one of the saved presets.'
+        : 'Dice off: every hour uses the active preset.');
+    }
+    function setActive() {
+      var p = pCurrent(); if (!p) return;
+      pPost('/api/h3/prompts/active', {id: p.id}, 'Every hour now uses "' + p.name + '" while the dice are off'
+        + (pDirty() ? ' - its saved words; the edits here are not saved yet.' : '.'));
+    }
+    function savePreset() {
+      var p = pCurrent(); if (!p) return;
+      var v = pValues();
+      if (!String(v.name || '').trim()) { pNote.textContent = 'Name the preset first.'; pInputs.name.focus(); return; }
+      v.was = p.updated_at;
+      pPost('/api/h3/prompts/' + encodeURIComponent(p.id), v, 'Saved "' + String(v.name).trim() + '".', p.id);
+    }
+    function saveAsNew() {
+      var p = pCurrent(), v = pValues();
+      v.name = pFreeName(v.name || (p && p.name) || 'New preset');
+      pPost('/api/h3/prompts', v, 'Saved as a new preset, "' + v.name + '".', p ? p.id : '');
+    }
+    function useNextHour() {
+      var p = pCurrent(); if (!p) return;
+      pinNext(pDirty() ? {preset: pValues()} : {preset_id: p.id});
+    }
+    function pinNext(body) {
+      return pPost('/api/h3/prompts/next', body, function (got) {
+        var next = (got && got.next) || null;
+        return body.clear ? 'Unpinned: the next hour goes back to ' + (got && got.dice ? 'the dice.' : 'the active preset.')
+          : next ? 'The next hourly render is told "' + next.name + '", once.' : 'Pinned.';
+      });
+    }
+    function revertPreset() {
+      var p = pCurrent(); if (!p) return;
+      delete pDrafts[p.id]; pFill(p); paintEditState(); pNote.textContent = 'The saved words of "' + p.name + '" are back.';
+    }
+    function deletePreset() {
+      var p = pCurrent(); if (!p) return;
+      if (pDeleteArmed !== p.id) {       /* no window.confirm: the desk's shell has none - a second tap */
+        pDeleteArmed = p.id; paintEditState(); pNote.textContent = 'Delete "' + p.name + '"? Tap Delete again.';
+        setTimeout(function () { if (pDeleteArmed === p.id) { pDeleteArmed = ''; if (!gone) paintEditState(); } }, 4000);
+        return;
+      }
+      pDeleteArmed = ''; delete pDrafts[p.id];
+      pPost('/api/h3/prompts/' + encodeURIComponent(p.id) + '/delete', {}, 'Deleted "' + p.name + '".');
+    }
+    function showPrompts(on) {
+      if (!gallery || gone) return;
+      if (!on) pStash();
+      pScreen.hidden = !on; box.classList.toggle('pav-on-prompts', !!on);
+      pButton.setAttribute('aria-expanded', String(!!on)); pButton.classList.toggle('open', !!on);
+      if (on) {
+        var playing = stage && stage.querySelector('video');
+        if (playing && !playing.paused) { try { playing.pause(); } catch (e) { /* nothing to pause */ } }
+        qualityPanel.hidden = true; pNote.textContent = pView ? '' : 'Loading the hourly prompts...';
+        if (pView) paintScreen();
+        loadPrompts(true); box.scrollTop = 0; pBack.focus();
+      } else if (pButton.isConnected) pButton.focus();
+    }
+    pButton.addEventListener('click', function () { showPrompts(pScreen.hidden); });
+    /* [#1450c] BACK closes the topmost overlay, one at a time: this card's P screen
+       first, then the card itself - the kiosk walks history only when nothing answers */
+    var pBackOff = function () {};
+    if (root.PineDismiss && typeof root.PineDismiss.onBack === 'function') {
+      pBackOff = root.PineDismiss.onBack(function () {
+        if (gone) return null;
+        if (gallery && !pScreen.hidden) return {node: pScreen, close: function () { showPrompts(false); }};
+        return {node: box, close: close};
+      });
+    }
+    if (gallery) {
+      loadPrompts(false);
+      pTimer = setInterval(function () {
+        if (gone) return;
+        if (!pScreen.hidden) paintNextLine();
+        if (!pBusy && Date.now() - pLoadedAt > 30000) { pLoadedAt = Date.now(); loadPrompts(false); }
+      }, 1000);
+    }
     var qPreset = make('select'); qPreset.setAttribute('aria-label', 'H3 quality preset');
     var qSteps = make('select'); qSteps.setAttribute('aria-label', 'steps');
     var qSize = make('select'); qSize.setAttribute('aria-label', 'frame size');
@@ -287,6 +643,7 @@
     var next = command('Next ad', 'c:caret--right', function () { if (index > 0) { index--; paint(); } });
     head.appendChild(previous); head.appendChild(next); box.appendChild(head);
     if (gallery) box.appendChild(qualityPanel);                         /* [h3-quality] */
+    if (gallery) box.appendChild(pScreen);                              /* [h3-prompts] the P screen */
     var strip = make('div', 'pav-strip'); strip.setAttribute('aria-label', 'Generated media');
     if (gallery) box.appendChild(strip);
     var motion = command('Pause gallery scrolling', 'c:pause--filled', function () {
@@ -296,11 +653,97 @@
       if (root.pineIcon) motion.innerHTML = root.pineIcon(motion.dataset.paused ? 'c:caret--right' : 'c:pause--filled');
     });
     if (gallery) head.appendChild(motion);
+    /* [autoscroll-rule] a hand on the strip stops the crawl until the
+       operator presses play on it again - it used to take the strip back
+       five seconds later, from under whatever they were looking at. */
+    function holdCrawl() {
+      if (motion.dataset.paused === 'yes') return;
+      motion.dataset.paused = 'yes';
+      motion.title = 'Resume gallery scrolling';
+      motion.setAttribute('aria-label', motion.title);
+      if (root.pineIcon) motion.innerHTML = root.pineIcon('c:caret--right');
+    }
     ['pointerdown', 'wheel', 'focusin'].forEach(function (name) {
-      strip.addEventListener(name, function () { pausedUntil = Date.now() + 5000; }, {passive:true});
+      strip.addEventListener(name, holdCrawl, {passive:true});
     });
     var description = make('p', 'pav-description'); box.appendChild(description);
     var stage = make('div', 'pav-stage'); box.appendChild(stage);
+    /* [h3-prompts] "see the prompts used with a video on the main gallery popup
+       under the video in a section able to be expanded with a tick showing the
+       prompts used with the video and allowing them to be reused": under the
+       video's own bar, above Generated / Original. Collapsed until the tick is
+       pressed (and it stays as it was left while the gallery moves on). */
+    var used = make('section', 'pav-used'); used.setAttribute('aria-label', 'Prompts used'); used.hidden = true;
+    var usedTick = make('button', 'pav-used-tick'); usedTick.type = 'button'; usedTick.setAttribute('aria-expanded', 'false');
+    if (root.pineIcon) usedTick.innerHTML = root.pineIcon('c:caret--right');
+    var usedSum = make('span', 'pav-used-sum', '');
+    usedTick.append(make('b', '', 'Prompts used'), usedSum);
+    var usedBody = make('div', 'pav-used-body'); usedBody.hidden = true;
+    used.append(usedTick, usedBody); box.appendChild(used);
+    var usedOpen = false, usedRow = null, usedMsg = null;
+    usedTick.addEventListener('click', function () {
+      usedOpen = !usedOpen; paintUsed(usedRow);
+      if (usedOpen && used.scrollIntoView) used.scrollIntoView({block: 'nearest'});
+    });
+    function usedSay(words) { if (usedMsg) usedMsg.textContent = words; }
+    function usedName(row, w) {
+      var stem = String(mediaFile(row) || '').replace(/\.[^.]+$/, '');
+      return pFreeName(w.recorded ? w.preset + (stem ? ' (' + stem + ')' : ' again') : 'From ' + (stem || 'a video'));
+    }
+    function paintUsed(row) {
+      usedRow = row || null; used.hidden = !usedRow;
+      var w = usedWords(usedRow || {});
+      usedSum.textContent = w.summary;
+      usedTick.setAttribute('aria-expanded', String(usedOpen)); used.classList.toggle('open', usedOpen);
+      usedBody.hidden = !usedOpen; usedBody.replaceChildren(); usedMsg = null;
+      if (!usedOpen) return;
+      if (w.recorded) usedBody.appendChild(make('p', 'pav-used-meta', 'Preset "' + w.preset + '" - ' + w.how
+        + (w.road ? ' - ' + w.road : '') + (w.at ? ' - the hour of ' + usedTime(w.at) : '')));
+      if (w.note) usedBody.appendChild(make('p', 'pav-used-note', w.note));
+      w.items.forEach(function (item) {
+        var cell = make('div', 'pav-used-item'), label = make('div', 'pav-used-label');
+        var copy = command('Copy the ' + item.label.toLowerCase(), 'c:copy--to-clipboard', function () {
+          copyWords(item.text).then(function () { usedSay('Copied the ' + item.label.toLowerCase() + '.'); },
+            function () { usedSay('Could not copy - select the words instead.'); });
+        });
+        label.append(make('span', '', item.label), copy);
+        cell.append(label, make('pre', 'pav-used-text', item.text)); usedBody.appendChild(cell);
+      });
+      if (w.reusable && usedRow && usedRow.prompt_id) {
+        var pid = usedRow.prompt_id, acts = make('div', 'pav-used-actions'), naming = make('div', 'pav-used-name');
+        var nameInput = make('input'); nameInput.type = 'text'; nameInput.maxLength = 60;
+        nameInput.setAttribute('aria-label', 'Name for the new preset'); nameInput.value = usedName(usedRow, w);
+        naming.hidden = true;
+        acts.append(
+          pBtn('Copy every prompt above', 'c:copy--to-clipboard', 'Copy all', function () {
+            copyWords(w.items.map(function (i) { return i.label + ':\n' + i.text; }).join('\n\n')).then(
+              function () { usedSay('Copied every prompt.'); }, function () { usedSay('Could not copy - select the words instead.'); });
+          }),
+          pBtn('The next hourly render is told these words, once', 'c:time', 'Use for the next hour', function () {
+            pPost('/api/h3/prompts/next', {from_prompt_id: pid}).then(function (got) {
+              if (got) usedSay('The next hourly render is told "' + ((got.next || {}).name || 'these words') + '", once.');
+              else usedSay(pNote.textContent || 'Not pinned.');
+            });
+          }),
+          pBtn('Keep these words as a saved preset', 'c:save', 'Save as preset', function () {
+            naming.hidden = !naming.hidden;
+            if (naming.hidden) return;
+            var first = nameInput.value = usedName(usedRow, w); nameInput.focus();
+            /* the names already taken are in the full view; the gallery has only the summary until P opens */
+            if (!pView) loadPrompts(true).then(function () { if (!naming.hidden && nameInput.value === first) nameInput.value = usedName(usedRow, w); });
+          }));
+        naming.append(nameInput, pBtn('Save the preset', 'c:save', 'Save', function () {
+          var name = String(nameInput.value || '').trim();
+          if (!name) { nameInput.focus(); return; }
+          pPost('/api/h3/prompts', {from_prompt_id: pid, name: name}).then(function (got) {
+            if (got) { naming.hidden = true; usedSay('Saved as the preset "' + name + '" - it is in P.'); }
+            else usedSay(pNote.textContent || 'Not saved.');
+          });
+        }));
+        usedBody.append(acts, naming);
+      }
+      usedMsg = make('p', 'pav-used-msg'); usedMsg.setAttribute('role', 'status'); usedBody.appendChild(usedMsg);
+    }
     var modes = make('div', 'pav-modes'); modes.setAttribute('role', 'group'); modes.setAttribute('aria-label', 'Video source');
     var generatedButton = make('button', '', 'Generated'), originalButton = make('button', '', 'Original');
     generatedButton.type = originalButton.type = 'button'; originalButton.disabled = true;
@@ -405,7 +848,7 @@
     veil.addEventListener('click', function (e) { if (e.target === veil) close(); });
     var focusWas = document.activeElement;
     function keys(e) {
-      if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); close(); }
+      if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); if (gallery && !pScreen.hidden) showPrompts(false); else close(); }   /* [h3-prompts] the screen first */
       if (e.key === 'Tab') {
         var controls = Array.from(box.querySelectorAll('button:not(:disabled),a[href],textarea,input:not(:disabled),select:not(:disabled)')).filter(function (n) { return n.getClientRects().length; });
         var at = controls.indexOf(document.activeElement);
@@ -417,6 +860,7 @@
     document.addEventListener('keydown', keys, true);
     function close() {
       gone = true; revision++; clearInterval(crawl); clearInterval(h3Timer);
+      clearInterval(pTimer); pBackOff();                               /* [h3-prompts] */
       clearTimeout(exportTimer); disposeMedia(); veil.remove();
       if (duckApi && typeof duckApi.release === 'function') duckApi.release('pine-box-gallery');
       duckApi = null;
@@ -546,6 +990,7 @@
       previous.disabled = index + 1 >= rows.length && !cursor && !pendingRows.length; next.disabled = index === 0;
       position.textContent = (rows.length - index) + ' / ' + rows.length;
       description.textContent = String(row.request || row.tags || 'Pine Box ad');
+      paintUsed(row);                                                  /* [h3-prompts] the words it was told */
       save.disabled = !file || !signatures[file]; status.textContent = '';
       if (!file) { splice.disabled = true; status.textContent = 'This ad has no playable output file.'; external.removeAttribute('href'); return; }
       var base = sourceUrl(file, false);
@@ -649,6 +1094,7 @@
       }
     }, 40);
   }
-  root.PineAdViewer = {open: open, openGallery: function () { open(null, true); }, close: function () { if (opened) opened(); }, mediaFile: mediaFile};
+  root.PineAdViewer = {open: open, openGallery: function () { open(null, true); }, close: function () { if (opened) opened(); }, mediaFile: mediaFile,
+    usedWords: usedWords};                                             /* [h3-prompts] the words a video was told */
   if (typeof module !== 'undefined') module.exports = root.PineAdViewer;
 }(typeof window !== 'undefined' ? window : globalThis));

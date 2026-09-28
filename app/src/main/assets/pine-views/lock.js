@@ -414,6 +414,11 @@
       why.textContent = (page.title || '') +
         (page.live ? '  ·  live' : '');
     }
+    /* [autoscroll-rule] the tail follows only a reader at its end; one
+       scrolled back keeps the line they were reading */
+    var stick = root.pineStick
+      ? root.pineStick(body, {edge: 'bottom', key: 'data-line'}) : null;
+    var hold = stick ? stick.anchor() : null;
     body.replaceChildren();
     var tail = elements.slice(-14);
     tail.forEach(function (item) {
@@ -423,7 +428,11 @@
       if (item.line) node.dataset.line = String(item.line);
       body.appendChild(node);
     });
-    body.scrollTop = body.scrollHeight;
+    var last = tail.length   // [autoscroll-rule]
+      ? String(tail[tail.length - 1].line || tail[tail.length - 1].text || '') : '';
+    var fresh = !!last && body.__lkLast !== undefined && body.__lkLast !== last;
+    body.__lkLast = last;
+    if (stick) stick.restore(hold, fresh);
   }
 
   /* ------------------------------------------------------- the pictures */

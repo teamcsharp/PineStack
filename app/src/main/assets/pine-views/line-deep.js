@@ -671,6 +671,11 @@
 
   function close() {
     edits.length = 0;            // [#1231] the window is going; so are its fields
+    if (s3FocusOpen && typeof s3FocusOpen.close === 'function') {   /* [s3-focus] */
+      var focused = s3FocusOpen;
+      s3FocusOpen = null;
+      try { focused.close(); } catch (e) { /* gone */ }
+    }
     keyboardWatch(false);        // [#1231] before the box leaves the document
     markBusy();                  // [#1231]
     if (scene && scene.stop) { try { scene.stop(); } catch (e) { /* gone */ } }
@@ -691,6 +696,9 @@
     box.innerHTML =
       '<div class="ld-head">'
       + '<b>How this line came to be</b>'
+      /* [s3-focus] the "3": System 3, focused on this line */
+      + '<button class="ld-s3" type="button" aria-label="System 3, focused on this line"'
+      + ' title="System 3, focused on this line: the dice, the prompts and the events that made it, and the levers to stop it again">3</button>'
       + '<div class="ld-head-actions">'
       + '<button class="ld-forget" type="button" aria-label="Forget this line" title="Forget this line"></button>'
       + '<button class="ld-close" type="button" aria-label="close" title="close">×</button>'
@@ -722,6 +730,17 @@
       e.stopPropagation();
       if (!forget.disabled) askForget(opened, line);
     });
+    /* [s3-focus] Carbon's 3 - the glyph of the System 3 button on the Script
+     * page - once the sprite has it; the text 3 until then. */
+    var s3btn = box.querySelector('.ld-s3');
+    if (s3btn) {
+      var s3glyph = typeof root.pineIcon === 'function' ? root.pineIcon('c:number--3', 'System 3, focused on this line') : '';
+      if (s3glyph) s3btn.innerHTML = s3glyph;
+      s3btn.addEventListener('click', function (e) {
+        e.stopPropagation();
+        s3Focus(opened, line);
+      });
+    }
     if (root.PineDuck) root.PineDuck.hold('line-deep', root.PineDuck.REPORT, box);   /* 2026-09-14: a diagnostic ducks the broadcast */
     /* [#1231] The WHOLE line, not 300 characters of it: this box is now
      * an editor, and an editor showing a truncation would save one. The
@@ -945,13 +964,13 @@
     if (!document.querySelector('link[data-pine-s3]')) {
       var link = document.createElement('link');
       link.rel = 'stylesheet';
-      link.href = s3Url('/system3/system3.css?v=3');
+      link.href = s3Url('/system3/system3.css?v=4');
       link.setAttribute('data-pine-s3', '');
       document.head.appendChild(link);
     }
     var prov = (all && all.prov) || {};
     var prompt = String(((prov.written || {}).prompt) || prov.prompt || '');
-    (s3Load = s3Load || import(s3Url('/system3/system3.js?v=4'))).then(function (mod) {
+    (s3Load = s3Load || import(s3Url('/system3/system3.js?v=5'))).then(function (mod) {
       if (!node.isConnected) return null;
       return mod.mountLineStory(node, {request: function (path) { return api().get(path); },
         lineId: String((line && line.id) || ''), prompt: prompt});
@@ -960,6 +979,68 @@
       node.textContent = 'System 3 could not be read here: ' + String((err && err.message) || err);
     });
     return node;
+  }
+
+  /* [s3-focus] THE "3" IN THE HEAD: "switches the view over to the system
+   * three view focused on this". The Examine window steps aside - hidden, not
+   * closed, so an open editor keeps its words and the scroll stays where it
+   * was - and System 3's window opens on this line. Its way back brings this
+   * one back as it was left. One at a time: a second tap while it is opening
+   * does nothing. */
+  var s3FocusOpen = null;
+  function s3Request(path, options) {
+    var method = String((options && options.method) || 'GET').toUpperCase();
+    var fn = method === 'POST' ? 'post' : method === 'PUT' ? 'put' : method === 'DELETE' ? 'del' : 'get';
+    var door = api();
+    if (typeof door[fn] !== 'function') return Promise.reject(new Error('the station bridge cannot ' + method));
+    var body;
+    try { body = options && options.body ? JSON.parse(options.body) : undefined; }
+    catch (err) { return Promise.reject(err); }
+    return Promise.resolve(door[fn](path, body));
+  }
+  function s3Focus(opened, line) {
+    if (box !== opened || s3FocusOpen) return;
+    var btn = opened.querySelector('.ld-s3');
+    var loaded = false;
+    s3FocusOpen = {pending: true};
+    if (btn) btn.disabled = true;
+    if (!document.querySelector('link[data-pine-s3]')) {
+      var link = document.createElement('link');
+      link.rel = 'stylesheet';
+      link.href = s3Url('/system3/system3.css?v=4');
+      link.setAttribute('data-pine-s3', '');
+      document.head.appendChild(link);
+    }
+    (s3Load = s3Load || import(s3Url('/system3/system3.js?v=5'))).then(function (mod) {
+      loaded = true;
+      if (typeof mod.openSystem3Focus !== 'function') {
+        throw new Error('this station\u2019s System 3 has no focused view yet');
+      }
+      if (box !== opened) return null;
+      opened.hidden = true;
+      return mod.openSystem3Focus({request: s3Request, lineId: String((line && line.id) || ''),
+        said: String((line && line.said) || ''),
+        onBack: function () {
+          s3FocusOpen = null;
+          if (box !== opened) return;
+          opened.hidden = false;
+          if (btn) {
+            btn.disabled = false;
+            try { btn.focus({preventScroll: true}); } catch (err) { /* gone */ }
+          }
+        }});
+    }).then(function (view) {
+      if (view && s3FocusOpen && s3FocusOpen.pending) s3FocusOpen = view;
+      else if (!view) { s3FocusOpen = null; if (btn) btn.disabled = false; }
+    }, function (err) {
+      if (!loaded) s3Load = null;
+      s3FocusOpen = null;
+      if (box !== opened) return;
+      opened.hidden = false;
+      if (btn) btn.disabled = false;
+      forgetFeedback(opened, 'System 3 could not open here: '
+        + String((err && err.message) || err), true);
+    });
   }
 
   /* ---------------------------------------------------------- the stepper */

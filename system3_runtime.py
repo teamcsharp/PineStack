@@ -258,6 +258,9 @@ class System3Runtime:
         if told:
             self.log("System 3's ES items gained the default writer direction (once): %d on %s"
                      % (len(told), ", ".join(sorted({b.split(":", 1)[0] for b in told}))))
+        legs = self.add_missing_call_legs()                                  # [s3-callend]
+        if legs:
+            self.log("System 3: " + legs)
         self._cast_load()                                                   # [s3-cast]
         adopted = self.adopt_mind_notes()
         if adopted:
@@ -1041,6 +1044,8 @@ class System3Runtime:
         availability["topics"] = bool(topic_bank)
         # [s3-events] a call's own passage - what a caller's speakerbox tangent wanders into
         call_of = self._call_of(ctx)
+        # [s3-segment] the scheduled segment on air while this round is planned
+        segment = self.segment_now()
         availability["call_passage"] = bool(call_of.get("speakerbox"))
         return {
             "road": road, "at": time.time(), "seats": seats, "names": names, "roles": roles,
@@ -1050,7 +1055,10 @@ class System3Runtime:
             "words_per_turn": words_per_turn, "deadline": float(s2.get("deadline") or 0),
             "trace_id": str(s2.get("trace_id") or ""), "system2_slot_id": str(s2.get("slot_id") or ""),
             "system2_job_id": str(s2.get("job_id") or ""),
-            "schedule_occurrence_id": str(ctx.get("sid") or ""),
+            # [s3-segment] the occurrence on air when it was planned (the station
+            # never handed one in: this was empty on every conversation)
+            "schedule_occurrence_id": str(ctx.get("sid") or segment.get("id") or ""),
+            "segment": segment,
             "subject": {"topic": topic, "category": category, "seeded": bool(seed_text),
                         "authority": "obligated" if (seed_text or angle or news or own or s2) else "free",
                         "sources": [x for x in [str(ctx.get("seed_file") or "")] if x],
@@ -1104,6 +1112,8 @@ class System3Runtime:
             "event_rolls": True,
             # [s3-flow] what recent rounds used weighs a quarter
             "recent_items": self.recent_used(),
+            # [s3-memory] what the writer may be reminded of: the facts MEMORY rolls over
+            **self.memory_inputs(road, ctx, topic),
         }
 
     def _carry_for(self, ctx):
@@ -1234,6 +1244,125 @@ class System3Runtime:
             self.metrics["abandoned"] += filed
         return filed
 
+    # --- [s3-memory] what the writer may be reminded of -----------------------------
+    def memory_inputs(self, road, ctx, topic=""):
+        """[s3-memory] What the MEMORY roll reads, handed to the plan whole so it
+        replays: the station's facts for each kind of memory from its one hook
+        (app.py system3_memory_facts - the clock and the segment on air, the
+        last segment and how it went, the calls against the quota, the
+        manager's last word; read from what the station already keeps, never a
+        model call), and the last topic from System 3's own record of the last
+        round that reached the air. A host without the hook hands in nothing:
+        every kind is then recorded as holding nothing."""
+        try:
+            got = self.host.system3_memory_facts(road, ctx)
+        except AttributeError:
+            got = {}
+        except Exception as exc:  # noqa: BLE001
+            self.fail("memory facts", exc)
+            got = {}
+        got = got if isinstance(got, dict) else {}
+        facts = {str(k): self._memory_clean(v) for k, v in got.items()
+                 if isinstance(v, dict) and str(k) not in ("topic", "last_topic")}
+        last = self._last_topic_fact(got.get("topic"))
+        if last:
+            facts["last_topic"] = last
+        return {"memory_rolls": True, "memory": facts}
+
+    @staticmethod
+    def _memory_clean(val, depth=0):
+        """A fact as the plan keeps it: plain JSON, short words, small lists."""
+        if isinstance(val, dict):
+            return ({str(k)[:40]: System3Runtime._memory_clean(v, depth + 1) for k, v in list(val.items())[:32]}
+                    if depth < 3 else {})
+        if isinstance(val, (list, tuple)):
+            return [System3Runtime._memory_clean(v, depth + 1) for v in list(val)[:40]] if depth < 3 else []
+        if val is None or isinstance(val, bool):
+            return val
+        if isinstance(val, (int, float)):
+            return val if val == val and val not in (float("inf"), float("-inf")) else 0
+        return " ".join(str(val).split())[:600]
+
+    @staticmethod
+    def _topic_of(conv):
+        """What a round was about, in the words that best say it: a topic the
+        roulette raised in it (the later one), the operator's exchange, the
+        round's own subject when it is a subject and not a brief, else its
+        most frequent words."""
+        subj = conv.get("subject") or {}
+        for t in reversed(conv.get("turns") or []):
+            for key in ("topic_material", "bank_topic"):
+                got = t.get(key)
+                if isinstance(got, dict) and str(got.get("text") or "").strip():
+                    return " ".join(str(got["text"]).split())
+        plan = conv.get("topic_plan") if isinstance(conv.get("topic_plan"), dict) else {}
+        if str(plan.get("text") or "").strip():
+            return " ".join(str(plan["text"]).split())
+        ex = subj.get("exchange") if isinstance(subj.get("exchange"), dict) else {}
+        if str(ex.get("opener") or "").strip():
+            return " ".join(str(ex["opener"]).split())
+        topic = " ".join(str(subj.get("topic") or "").split())
+        if topic and len(topic) <= 300 and not re.search(r"[A-Z]{3,}[\s\-:]+[A-Z]{3,}", topic):
+            return topic
+        words = [str(w) for w in (subj.get("keywords") or []) if str(w).strip()][:5]
+        return ("talk of " + ", ".join(words)) if words else ""
+
+    def _last_topic_fact(self, station=None):
+        """[s3-memory] The last subject that went out: the round the carry names
+        (the one that reached the script ledger last) - the topic the roulette
+        raised in it, else its own subject - and the line it landed on. When
+        System 3 holds no such round (a restart), the last subject the station
+        heard (its heard-subjects ring, handed in by the station)."""
+        with self.lock:
+            carry = copy.deepcopy(self.carry) if self.carry else None
+        conv = self.recent.get(str(carry.get("from") or "")) if carry else None
+        if isinstance(conv, dict):
+            topic = self._topic_of(conv)
+            if topic:
+                landing = carry.get("landing") if isinstance(carry.get("landing"), dict) else {}
+                return {"topic": topic[:400], "keywords": sorted(system3._memory_keywords(topic))[:12],
+                        "at": float(carry.get("at") or 0), "road": str(carry.get("road") or ""),
+                        "from": str(carry.get("from") or ""),
+                        "landing": " ".join(str(landing.get("text") or "").split())[:400],
+                        "landing_who": str(landing.get("name") or landing.get("who") or "")[:60],
+                        "source": "System 3's record of the last round on air"}
+        st = station if isinstance(station, dict) else {}
+        text = " ".join(str(st.get("text") or "").split())
+        if text:
+            return {"topic": text[:400], "keywords": sorted(system3._memory_keywords(text))[:12],
+                    "at": float(st.get("at") or 0), "road": "", "from": "", "landing": "", "landing_who": "",
+                    "source": "the last subject the station heard"}
+        return None
+
+    def memory_block(self):
+        """[s3-memory] The words of the memory block for the prompt being written
+        on this task: exactly the items its round's MEMORY roll drew ("" when it
+        drew none), or None when no MEMORY roll stands behind this prompt -
+        System 3 off or not directing the road, no active round planned on this
+        task in the last fifteen minutes, the round withheld, no MEMORY table -
+        and the station then sends its show memory as it always did."""
+        if not self.ready:
+            return None
+        try:
+            handle = _S3_WRITE.get()
+            conv = handle.conv if handle is not None and getattr(handle, "active", False) else None
+            if not isinstance(conv, dict) or not isinstance(conv.get("memory"), dict):
+                return None
+            if time.time() - float(conv.get("created") or 0) > 900 or conv.get("status") in ("withheld", "abandoned"):
+                return None
+            if system3.road_mode(self.settings, str((conv.get("identity") or {}).get("road_kind") or "")) != "active":
+                return None
+            text = system3.memory_text(conv)
+            with self.lock:
+                self.metrics["memory_blocks"] = self.metrics.get("memory_blocks", 0) + 1
+                if text:
+                    self.metrics["memory_items"] = (self.metrics.get("memory_items", 0)
+                                                    + len(conv["memory"].get("items") or []))
+            return text
+        except Exception as exc:  # noqa: BLE001
+            self.fail("memory block", exc)
+            return None
+
     def pinned_source(self, road="banter"):
         """[s3-source] The speakbox document the operator pinned on this road's
         initiator node (its first step's `source`, else the structure's own),
@@ -1286,7 +1415,135 @@ class System3Runtime:
                 "topic": str(meta.get("topic") or "")[:400],
                 # [s3-cut] at a sentence end, never where a count fell
                 "speakerbox": system3.sentence_cut(str(meta.get("speakerbox_text") or ctx.get("seed_text") or ""), 600),
-                "story": bool(meta.get("story")), "scenario_clause": clause[:1500]}
+                "story": bool(meta.get("story")), "scenario_clause": clause[:1500],
+                "painting": self._painting_of(ctx)}                              # [s3-callend] the caller's wheel
+
+    # --- [s3-callend] how a call ends: the painting in play, the passage, the mark, the effect ---
+    CALLEND_MARK = "caller:callend"    # in defaults_added: the end legs were put on the stored structure
+
+    def _painting_of(self, ctx):
+        """[s3-callend] The painting the last segment sold, for the caller's wheel: the
+        station's own record of what it put on offer (the sales floor, a painting spot,
+        the gallery press), no older than the painting wheel's `within` - or {}."""
+        fn = getattr(self.host, "system3_painting_on_offer", None)
+        if not callable(fn):
+            return {}
+        within = system3.CALLEND_WITHIN
+        for t in (self.config or {}).get("tables") or []:
+            if not isinstance(t, dict) or t.get("family") != "RESOLVE" or t.get("enabled") is False:
+                continue
+            cat = next((c for c in t.get("categories") or []
+                        if isinstance(c, dict) and "painting" in (c.get("requires") or [])), None)
+            if cat is not None:
+                try:
+                    within = float(cat.get("within") or within)
+                except (TypeError, ValueError):
+                    pass
+                break
+        try:
+            got = fn(within)
+        except Exception as exc:  # noqa: BLE001
+            self.log("System 3 could not read the painting on offer for a call", extra=str(exc)[:300])
+            return {}
+        return dict(got) if isinstance(got, dict) and got.get("image") else {}
+
+    async def _callend_after_plan(self, handle, ctx):
+        """[s3-callend] After a call is planned: fetch the passage a speakerbox rejection is
+        said in (only that request - the station's own rotation, bounded), re-render the
+        sheet with it, and put the plan's end on the call's meta and, when the call is on
+        the line now, on the live call's record."""
+        conv = handle.conv
+        ce = conv.get("callend") if isinstance(conv.get("callend"), dict) else {}
+        if not handle.active or not ce.get("planned"):
+            return
+        mine = [r for r in conv.get("material_requests") or [] if r.get("callend") and r.get("resolved") is None]
+        if mine:
+            every = conv["material_requests"]
+            try:
+                conv["material_requests"] = mine
+                await self._resolve_material(handle, ctx)
+            finally:
+                conv["material_requests"] = every
+            handle.sheet = system3.render_call_sheet(conv)
+        mark = system3.callend_mark(conv)
+        meta = ctx.get("call_meta") if isinstance(ctx.get("call_meta"), dict) else None
+        if not mark:
+            return
+        if meta is not None:
+            meta["callend"] = mark
+        if not ctx.get("bank"):
+            fn = getattr(self.host, "call_line_context", None)
+            if callable(fn):
+                try:
+                    fn(callend=mark, **({"ended": meta["ended"]} if meta and meta.get("ended") else {}))
+                except Exception:  # noqa: BLE001
+                    pass
+        self.log("System 3 rolled how this call ends: " + str(mark.get("says") or "")[:360])
+
+    def _callend_aired(self, conv):
+        """[s3-callend] A call whose end was rolled reached the script ledger: what the
+        caller's wheel landed on acts on the gallery where the station keeps state (sold,
+        awarded or burnt: off the pile by the desk; unsold: on it, still for sale) - once
+        per conversation, and never for an outcome the line went dead before."""
+        try:
+            ce = conv.get("callend") if isinstance(conv.get("callend"), dict) else {}
+            res = ce.get("resolve") if isinstance(ce.get("resolve"), dict) else {}
+            painting = res.get("painting") if isinstance(res.get("painting"), dict) else {}
+            if not res.get("effect") or not painting.get("image") or res.get("cut"):
+                return
+            cid = str((conv.get("identity") or {}).get("conversation_id") or "")
+            done = self.__dict__.setdefault("_callend_done", collections.OrderedDict())
+            with self.lock:
+                if not cid or cid in done:
+                    return
+                done[cid] = time.time()
+                while len(done) > 400:
+                    done.popitem(last=False)
+            fn = getattr(self.host, "system3_gallery_outcome", None)
+            got = (fn(str(res["effect"]), dict(painting), cid) if callable(fn)
+                   else {"applied": False, "why": "the station has no gallery hook"})
+            self.store.add_observation(cid, "CALLEND", {"stage": "air", "effect": res["effect"],
+                                                        "outcome": res.get("id"), "painting": painting.get("image"),
+                                                        "done": got if isinstance(got, dict) else {"result": str(got)}})
+        except Exception as exc:  # noqa: BLE001
+            self.log("System 3 could not act on a call's rolled end at air", extra=str(exc)[:300])
+
+    def add_missing_call_legs(self):
+        """[s3-callend] Once: the call's end legs (resolution, reaction, response chain,
+        rebuttal, wrap call) onto a stored caller structure that predates them. One that
+        still ends on the old default's two legs (lands, sign_off) has them replaced by
+        the five; one the operator reshaped is left as it is (the legs are in the
+        Segments tab's defaults) and the log says so. Remembered in `defaults_added`
+        (CALLEND_MARK), so legs the operator later removes stay removed. Saved as one
+        version with a note. Returns the note, or ""."""
+        config = self.config if isinstance(self.config, dict) else {}
+        seen = {str(x) for x in (config.get("defaults_added") or [])}
+        if self.CALLEND_MARK in seen:
+            return ""
+        st = (config.get("structures") or {}).get("caller")
+        if not isinstance(st, dict) or not isinstance(st.get("legs"), list) or not st["legs"]:
+            return ""                 # no stored structure: the default, which ends on the legs, applies
+        legs = [leg for leg in st["legs"] if isinstance(leg, dict)]
+        if any(leg.get("end") for leg in legs):
+            return ""
+        if [str(leg.get("id")) for leg in legs[-2:]] != ["lands", "sign_off"]:
+            self.log("System 3: the caller structure was reshaped on the desk, so the call's end legs were not "
+                     "added - add them from the Segments tab (resolution, reaction, response, rebuttal, wrap call)")
+            return ""
+        new = copy.deepcopy(config)
+        nst = new["structures"]["caller"]
+        nst["legs"] = copy.deepcopy(legs[:-2]) + copy.deepcopy(system3_tables.CALLEND_LEGS)
+        nst["version"] = int(nst.get("version") or 1) + 1
+        new["defaults_added"] = sorted(seen | {self.CALLEND_MARK})
+        note = ("the call's end legs (resolution, reaction, response chain, rebuttal, wrap call) replace "
+                "lands / sign_off on the caller structure (once)")
+        try:
+            self.store.save_config(new, note)
+        except Exception as exc:  # noqa: BLE001
+            self.fail("call end legs", exc)
+            return ""
+        self.config = new
+        return note
 
     def _topic_bank(self, ctx):
         """[rng-topics] The board, least-sprung first, as System 3's TOPIC
@@ -1392,6 +1649,7 @@ class System3Runtime:
             conv = system3.new_conversation(inputs, config, self.settings)
             conv["mode"] = mode
             self._absorb_rolls(conv)                                            # [s3-dice-door]
+            conv["identity"]["segment"] = dict((conv.get("inputs") or {}).get("segment") or {})   # [s3-segment]
             handle = Handle(self, conv, config, mode == "active")
             handle.bank = bool(ctx.get("bank"))
             call = inputs.get("call") or {}
@@ -1413,6 +1671,7 @@ class System3Runtime:
                     end = next((x for x in conv.get("event_plans") or [] if x.get("ends")), {})
                     ctx["call_meta"]["ended"] = ("%s: %s" % (end.get("kind_label") or "ended",
                                                              end.get("label") or ""))[:200]
+                await self._callend_after_plan(handle, ctx)                        # [s3-callend] how it ends
             elif road == "caller":
                 rows = [(int(n), seat, work) for n, seat, work in
                         re.findall(r"(?m)^\s*(\d+)\s+([ABCDE])\s+[-–—]\s*(.+?)\s*$", ctx.get("call_sheet") or "")]
@@ -1512,10 +1771,12 @@ class System3Runtime:
                 elif isinstance(c, str) and c.strip():
                     cands.append({"id": str(i), "text": " ".join(c.split())[:400], "weight": 1.0, "why": []})
             context = " ".join(str(ctx.get("context") or ctx.get("text") or "").split())
+            segment = self.segment_now()                                   # [s3-segment]
             inputs = {
                 "road": road, "at": time.time(), "seats": [seat], "names": {seat: name}, "roles": {seat: who},
                 "turns": 1, "target_seconds": 0.0, "words_per_turn": 40.0,
-                "schedule_occurrence_id": str(ctx.get("sid") or ""),
+                "schedule_occurrence_id": str(ctx.get("sid") or segment.get("id") or ""),   # [s3-segment]
+                "segment": segment,
                 "subject": {"topic": context[:400], "category": "own_material", "seeded": False,
                             "authority": "obligated", "sources": [], "keywords": [], "angle": ""},
                 "availability": {}, "speakerbox_rates": {}, "bank": bool(ctx.get("bank")),
@@ -1523,11 +1784,13 @@ class System3Runtime:
                 "line_text": " ".join(str(ctx.get("text") or "").split())[:600],
                 "sfxguy": {"voice": False},
                 **self.cast_inputs(),                                        # [s3-cast]
+                **self.memory_inputs(road, ctx, context),                    # [s3-memory]
             }
             config = self.config
             conv = system3.new_conversation(inputs, config, self.settings)
             conv["mode"] = mode
             self._absorb_rolls(conv)                                            # [s3-dice-door]
+            conv["identity"]["segment"] = dict((conv.get("inputs") or {}).get("segment") or {})   # [s3-segment]
             system3.plan_line(conv, config, inputs)
             handle = LineHandle(self, conv, mode == "active")
             if handle.active:
@@ -2235,9 +2498,254 @@ class System3Runtime:
                         if handed:
                             self.store.add_observation(cid, "CARRY", handed)
                         self._cast_aired(conv)                                  # [s3-cast]
+                        self._callend_aired(conv)                               # [s3-callend] the gallery, at air
                 _STORE_POOL.submit(job)
         except Exception as exc:  # noqa: BLE001
             self.fail("ledger link", exc)
+
+    # --- [s3-segment] the scheduled segments the air goes through ----------------------
+    #
+    # "every conversation should be chained as the "segment" per the station that is
+    #  scheduled with everything for that segment occuring within the section of the
+    #  messenger view. I also want to be able to expand and select and investigate
+    #  and inspect other segments via the right click menu and be able to trace the
+    #  nodes of how the segments are constructed via roulette RNG and System 3"
+    #  (the operator, 2026-09-28).
+    #
+    # A segment is the running order's OCCURRENCE: one entry of the hour as the
+    # station's clock put it on air (System2's slot "hour-<ms>:<entry>", else the
+    # legacy walk's). app.py stamps it on every script-ledger row when the row takes
+    # its place in the script and hands each block here: the register keeps, per
+    # segment, its blocks in the script's order, their lines and the System 3
+    # conversations those lines belong to - a round, or a single line (an
+    # interjection, a station ID, an ad spot), which is a one-turn conversation of
+    # its own and never a segment of its own.
+    SEGMENT_KEYS = ("id", "template", "kind", "label", "start", "ends", "hour", "index", "engine")
+
+    def segment_now(self):
+        """The scheduled segment on air right now, as the station publishes it
+        (app.py segment_on_air), or {} - a station without the stamp, or running
+        no schedule. Never raises."""
+        try:
+            got = self.host.segment_on_air()
+        except Exception:  # noqa: BLE001
+            return {}
+        if not isinstance(got, dict) or not got.get("id"):
+            return {}
+        return {k: got[k] for k in self.SEGMENT_KEYS if k in got}
+
+    def segment_block(self, block, at, sid, rows, segment, round_kind=""):
+        """A block of the script was written while `segment` owned the air: file it
+        in the register with its lines and, by conversation, the lines each System 3
+        conversation has in it. On the store's own thread, bounded like every write
+        here. Never raises into the ledger."""
+        try:
+            if not isinstance(segment, dict) or not segment.get("id"):
+                return
+            line_ids, convs = [], {}
+            for row in rows or []:
+                if not isinstance(row, dict):
+                    continue
+                lid = str(row.get("line_id") or "")
+                if lid:
+                    line_ids.append(lid)
+                s3 = row.get("system3") if isinstance(row.get("system3"), dict) else {}
+                if not s3.get("conversation_id"):
+                    s3 = ((row.get("dice") or {}) if isinstance(row.get("dice"), dict) else {}).get("s3") or {}
+                cid = str(s3.get("conversation_id") or "")
+                if cid:
+                    convs.setdefault(cid, [])
+                    if lid:
+                        convs[cid].append(lid)
+            seg = {k: segment[k] for k in self.SEGMENT_KEYS if k in segment}
+            with self.lock:
+                if self.pending >= WRITE_BACKLOG:
+                    self.metrics["writes_dropped"] += 1
+                    return
+                self.pending += 1
+                self.metrics["segment_blocks"] = self.metrics.get("segment_blocks", 0) + 1
+
+            def job():
+                try:
+                    self.store.note_segment_block(seg, int(block), float(at or time.time()), str(sid or ""),
+                                                  str(round_kind or ""), line_ids, convs)
+                finally:
+                    with self.lock:
+                        self.pending -= 1
+            _STORE_POOL.submit(job)
+        except Exception as exc:  # noqa: BLE001
+            self.fail("segment register", exc)
+
+    @staticmethod
+    def _single(road):
+        return str(road or "") in system3_tables.LINE_ROADS
+
+    def segments_view(self, since=0.0, limit=40, until=0.0):
+        """The segments the script went through, in its own order, each with the
+        conversations that went out in it: their road, whether a round or a single
+        line, their times and line counts. Reader thread only."""
+        rows = self.store.segments_since(since, limit, until)
+        summ = self.store.summaries([c["conversation_id"] for r in rows for c in r["conversations"]])
+        for r in rows:
+            for c in r["conversations"]:
+                s = summ.get(c["conversation_id"]) or {}
+                c.update({"road": s.get("road"), "mode": s.get("mode"), "status": s.get("status"),
+                          "created": s.get("created"), "turns": s.get("turns"), "verdict": s.get("verdict"),
+                          "topic": str(s.get("topic") or "")[:120], "single": self._single(s.get("road")),
+                          "lines": len(c.get("line_ids") or []), "held": bool(s)})
+                c.pop("line_ids", None)
+            r["rounds"] = sum(1 for c in r["conversations"] if c.get("held") and not c["single"])
+            r["singles"] = sum(1 for c in r["conversations"] if c.get("held") and c["single"])
+        return rows
+
+    def _segment_conv(self, conv, mine, full=False):
+        """One conversation as the segment's trace needs it: what planned it and
+        when, the structure it was built from, its round-level rolls (the length,
+        the variant, the tempers, the shock beat, the events, the station's own
+        rolls...), each turn with its rolls, and the lines it has in this segment."""
+        ident = conv.get("identity") or {}
+        road = str(ident.get("road_kind") or "")
+        comp = self._compact(conv)
+        events = conv.get("decision_events") or []
+        pre = [e for e in events if not e.get("turn_id") and not e.get("stage") and e.get("kind") != "observation"]
+        st = conv.get("road_structure") or conv.get("call_structure") or {}
+        inputs = conv.get("inputs") or {}
+        length = conv.get("length_roll") or {}
+        lines_here = set(mine.get("line_ids") or [])
+        by_turn = {}
+        for ln in conv.get("lines") or []:
+            if ln.get("line_id") in lines_here and ln.get("turn_id"):
+                by_turn.setdefault(ln["turn_id"], []).append(ln["line_id"])
+        turns = []
+        for t in conv.get("turns") or []:
+            ct = dict(comp["turns"].get(t["turn_id"]) or {})
+            ct.update({"turn_id": t["turn_id"], "index": t.get("index"), "leg": t.get("leg") or t.get("step"),
+                       "text": str(t.get("text") or "")[:400], "status": t.get("status"),
+                       "lines": by_turn.get(t["turn_id"], [])})
+            turns.append(ct)
+        out = {"conversation_id": ident.get("conversation_id"), "road": road, "mode": conv.get("mode"),
+               "status": conv.get("status"), "created": conv.get("created"), "single": self._single(road),
+               "topic": str((conv.get("subject") or {}).get("topic") or "")[:240],
+               "planned_in": ident.get("segment") or {}, "prepared_for": ident.get("system2_slot_id") or "",
+               "bank": bool(inputs.get("bank")),
+               "structure": {"id": st.get("id") or ("banter_cycle" if road == "banter" else road),
+                             "version": st.get("version"), "variant": (conv.get("variant_roll") or {}).get("structure")},
+               "length": ({k: length.get(k) for k in ("turns", "lo", "hi", "rolled")} if length else None),
+               "rolls": [self._compact_roll(e) for e in pre], "events": len(events),
+               "turns": turns, "verdict": (conv.get("validation") or {}).get("verdict"),
+               "first_block": mine.get("first_block"), "blocks": mine.get("blocks") or [],
+               "line_ids": sorted(lines_here), "lines": len(lines_here),
+               "line_choice": conv.get("line_choice"), "sheet": str((conv.get("plan") or {}).get("sheet") or "")[:6000]}
+        if full:
+            out["conversation"] = self.line_media(json.loads(json.dumps(conv, default=str)))
+        return out
+
+    def segment_view(self, seg_id, full=False):
+        """Everything the register holds to trace one segment: its entry and
+        window, its blocks in the script's order, each conversation that went out
+        in it (with `full`, the whole conversation as /api/system3/conversation
+        serves it), what System2 had written for it, and the segments either side.
+        None when the register has never seen it. Reader thread only."""
+        rec = self.store.segment_record(seg_id)
+        if not rec:
+            return None
+        seg = rec["segment"]
+        convs = []
+        for mine in rec["conversations"][:60]:
+            conv = self.store.conversation(mine["conversation_id"])
+            if not conv:
+                convs.append({"conversation_id": mine["conversation_id"], "gone": True,
+                              "why": "past retention (System 3 keeps seven days)",
+                              "first_block": mine.get("first_block"), "lines": len(mine.get("line_ids") or [])})
+                continue
+            convs.append(self._segment_conv(conv, mine, full=full and len(convs) < 24))
+        prepared = []
+        if seg.get("engine") == "system2" or ":" in str(seg.get("id") or ""):
+            prepared = [{k: s.get(k) for k in ("conversation_id", "road", "mode", "status", "created", "turns",
+                                               "topic", "verdict")}
+                        for s in self.store.prepared_for(seg["id"], float(seg.get("start") or 0) - 86400)]
+        return {"segment": seg, "registered": True, "blocks": rec["blocks"], "conversations": convs,
+                "rounds": sum(1 for c in convs if not c.get("gone") and not c.get("single")),
+                "singles": sum(1 for c in convs if not c.get("gone") and c.get("single")),
+                "prepared_for": prepared, "previous": rec["previous"], "next": rec["next"]}
+
+    @staticmethod
+    def _trim_entry(e):
+        """A director's room entry, without the bulk: what the plan bound to it,
+        its state, the direction and review in force, its orchestration."""
+        if not isinstance(e, dict):
+            return None
+        out = {k: e.get(k) for k in ("ordinal", "kind", "label", "slot_id", "occurrence", "minutes", "start",
+                                     "deadline", "state", "own_seconds", "aired_seconds", "notes", "prompt_id",
+                                     "flow", "flow_prompt", "direction", "review", "orchestration")}
+        out["prompt"] = str(e.get("prompt") or "")[:1600]
+        script = e.get("script") if isinstance(e.get("script"), dict) else {}
+        out["script"] = {k: v for k, v in script.items() if k not in ("turns", "beats")}
+        out["script"]["turns"] = [{k: (str(v)[:240] if isinstance(v, str) else v) for k, v in t.items()}
+                                  for t in (script.get("turns") or [])[:40] if isinstance(t, dict)]
+        aired = e.get("aired") or []
+        out["aired"] = {"count": len(aired), "first": [
+            {k: r.get(k) for k in ("at", "who", "kind", "round", "line", "seconds")} for r in aired[:12]]}
+        out["beats"] = len(e.get("beats") or [])
+        return out
+
+    async def segment_scheduling(self, seg):
+        """The segment's own scheduling decision, as the station's director holds
+        it: the entry in the hour's room (what the plan bound to it, its state -
+        aired, went by with another road's material, planned - the direction and
+        review in force, its orchestration) and the census of its road (the first
+        test each held row fails). Both are read NOW - a room keeps the hours
+        System2 still plans, and a census is today's shelf - and the answer says
+        so. Bounded; a road that cannot answer says why, never raises."""
+        seg = seg or {}
+        out = {"entry": None, "census": None, "why": [],
+               "read_at": time.time(), "note": "the director's room and census as they stand now"}
+        room_of = getattr(self.host, "director_room", None)
+        why_of = getattr(self.host, "director_why", None)
+        occ = str(seg.get("id") or "")
+        hour = occ.split(":", 1)[0] if occ.startswith("hour-") else ""
+
+        async def read(fn, *args):
+            return await asyncio.wait_for(asyncio.to_thread(fn, *args), timeout=15.0)
+
+        if callable(room_of):
+            try:
+                room = await read(room_of, 0)
+                tried = {0}
+                if hour and str(room.get("hour") or "") != hour and str(room.get("hour") or "").startswith("hour-"):
+                    try:
+                        here = int(str(room["hour"]).split("-", 1)[1]) / 1000.0
+                        mine = int(hour.split("-", 1)[1]) / 1000.0
+                        which = int(round((mine - here) / 3600.0))
+                    except (TypeError, ValueError, IndexError):
+                        which = 0
+                    if which and which not in tried:
+                        room = await read(room_of, which)
+                for e in room.get("entries") or []:
+                    if occ and str(e.get("occurrence") or "") == occ:
+                        out["entry"] = self._trim_entry(e)
+                        break
+                    if (not occ.startswith("hour-") and seg.get("template")
+                            and str(e.get("slot_id") or "") == str(seg.get("template"))):
+                        out["entry"] = self._trim_entry(e)
+                if out["entry"] is None:
+                    out["why"].append("the director's room no longer holds this entry (it keeps the hours "
+                                      "System2 is still planning) - its hour was %s" % (room.get("hour") or "?"))
+                out["hour"] = room.get("hour")
+            except Exception as exc:  # noqa: BLE001
+                out["why"].append("the director's room could not be read: %s: %s" % (type(exc).__name__, str(exc)[:160]))
+        else:
+            out["why"].append("this station has no director's room")
+        kind = str(seg.get("kind") or "")
+        if callable(why_of) and kind:
+            try:
+                got = await read(why_of, kind)
+                if isinstance(got, dict):
+                    out["census"] = {k: got.get(k) for k in ("kind", "stock", "pool", "census", "say")}
+                    out["census"]["entries"] = list(got.get("entries") or [])[:30]
+            except Exception as exc:  # noqa: BLE001
+                out["why"].append("the %s census could not be read: %s: %s" % (kind, type(exc).__name__, str(exc)[:160]))
+        return out
 
     @staticmethod
     def line_media(conv):
@@ -2637,6 +3145,7 @@ def install(app, namespace):
     namespace["system3_bind_line"] = rt.bind_line
     namespace["system3_link_line"] = rt.link_spoken                  # [s3-line-link]
     namespace["system3_observe_ledger"] = rt.observe_ledger
+    namespace["system3_segment_block"] = rt.segment_block              # [s3-segment]
     namespace["system3_withhold"] = rt.withhold                        # [s3-withhold]
     namespace["system3_favorite"] = rt.favorite_set                    # [s3-cast]
     namespace["system3_pinned_source"] = rt.pinned_source              # [s3-source]
@@ -2648,6 +3157,7 @@ def install(app, namespace):
     namespace["system3_dice_live"] = rt._dice_live
     namespace["system3_blocks"] = rt.blocks                            # [s3-blocks]
     namespace["system3_note_prompt"] = rt.note_prompt
+    namespace["system3_memory_block"] = rt.memory_block                # [s3-memory]
     namespace["system3_writing_for"] = _S3_WRITE
     namespace["_system3"] = lambda: rt
 
@@ -3015,6 +3525,74 @@ def install(app, namespace):
                                  or (got.get("turn_id") and o.get("turn_id") == got["turn_id"])
                                  or got["line_id"] in (o.get("lines") or [])],
                 "conversation": system3.summary(conv)}
+
+    @app.get("/api/system3/segments")
+    async def segments(since: float = 0.0, limit: int = 40, until: float = 0.0, plan: int = 0,
+                       authorization: str | None = Header(default=None)):
+        """[s3-segment] The station's scheduled segments in the script's order (the
+        last three hours unless `since` says otherwise), each with the System 3
+        conversations that went out in it - rounds and single lines alike - their
+        road, times and line counts; the segment on air now; and with `plan=1` the
+        hour's entries as the director's room holds them (the ones still to come
+        included), for a picker."""
+        host.require_read_auth(authorization)
+        since = float(since or 0) or (time.time() - 3 * 3600)
+        rows = await rt.read(rt.segments_view, since, max(1, min(200, int(limit or 40))), float(until or 0))
+        out = {"segments": rows, "now": rt.segment_now(), "since": since, "at": time.time()}
+        room_of = getattr(host, "director_room", None)
+        if plan and callable(room_of):
+            try:
+                room = await asyncio.wait_for(asyncio.to_thread(room_of, 0), timeout=15.0)
+                out["plan"] = {"hour": room.get("hour"), "entries": [
+                    {k: e.get(k) for k in ("ordinal", "kind", "label", "slot_id", "occurrence", "start",
+                                           "deadline", "state")} for e in room.get("entries") or []]}
+            except Exception as exc:  # noqa: BLE001
+                out["plan"] = {"why": "the director's room could not be read: %s" % type(exc).__name__}
+        return out
+
+    @app.get("/api/system3/segment/{segment_id}")
+    async def segment_trace(segment_id: str, full: int = 0, scheduling: int = 1,
+                            authorization: str | None = Header(default=None)):
+        """[s3-segment] Everything to trace one scheduled segment: its entry and
+        window, its blocks, every conversation that went out in it (`full=1`: each
+        whole, decision events and all), what System2 had written for it, the
+        segments either side, and its own scheduling decision - the director's
+        entry and its road's census. A segment the script has not reached yet (the
+        one on air before its first line, one still to come in the director's
+        room) answers with no conversations."""
+        host.require_read_auth(authorization)
+        got = await rt.read(rt.segment_view, segment_id, bool(full))
+        if not got:
+            now = rt.segment_now()
+            seg = now if now.get("id") == segment_id else None
+            if seg is None:
+                room_of = getattr(host, "director_room", None)
+                if callable(room_of):
+                    for which in (0, 1):
+                        try:
+                            room = await asyncio.wait_for(asyncio.to_thread(room_of, which), timeout=15.0)
+                        except Exception:  # noqa: BLE001
+                            break
+                        e = next((x for x in room.get("entries") or []
+                                  if str(x.get("occurrence") or "") == segment_id), None)
+                        if e:
+                            seg = {"id": segment_id, "template": str(e.get("slot_id") or ""),
+                                   "kind": str(e.get("kind") or ""), "label": str(e.get("label") or ""),
+                                   "start": e.get("start"), "ends": e.get("deadline"),
+                                   "hour": str(room.get("hour") or ""), "index": e.get("ordinal"),
+                                   "engine": "system2"}
+                            break
+            if seg is None:
+                raise HTTPException(404, "no segment %s: System 3's register keeps the segments the script "
+                                         "went through for seven days, and the director's room holds this hour "
+                                         "and the next" % segment_id)
+            got = {"segment": seg, "registered": False, "blocks": [], "conversations": [], "rounds": 0,
+                   "singles": 0, "prepared_for": [], "previous": None, "next": None,
+                   "why": "nothing of this segment has reached the script yet"}
+        if scheduling:
+            got["scheduling"] = await rt.segment_scheduling(got["segment"])
+        body = await asyncio.get_running_loop().run_in_executor(_READ_POOL, lambda: json.dumps(got, default=str))
+        return Response(content=body, media_type="application/json")
 
     @app.get("/api/system3/public/lines")
     async def public_lines(ids: str = "", t: str = "", authorization: str | None = Header(default=None)):

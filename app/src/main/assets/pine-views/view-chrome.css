@@ -698,3 +698,55 @@ body.pine-splice-open > :not(.lb-editor-overlay) * { animation-play-state:paused
 .pav-cast input[type=range] { width: 120px; }
 .pav-cast-val { min-width: 34px; font-variant-numeric: tabular-nums; }
 .pav-cast-state { flex: 1 1 100%; font-size: 11px; opacity: .8; overflow-wrap: anywhere; }
+/* [h3-prompts] the P and the dice beside the countdown, the hourly prompts screen, and
+   the prompts a video was told (under its own bar, above Generated / Original) */
+.pine-voice-ad-card .pav-head { flex-wrap:wrap; row-gap:6px; }
+.pine-voice-ad-card .pav-head > b { flex:1 0 auto; white-space:nowrap; }
+.pine-voice-ad-card .pav-p { display:inline-grid; place-items:center; flex:0 0 38px; width:38px; height:38px; padding:0; border:1px solid #52636a; border-radius:5px; background:#273337; color:#edf5f5; font:700 17px/1 Inter, Segoe UI, system-ui, sans-serif; cursor:pointer; }
+.pine-voice-ad-card .pav-p[aria-expanded=true], .pine-voice-ad-card .pav-dice.on, .pav-pr-dice.on { background:#66c5ce; color:#081216; border-color:#8de1ed; }
+.pine-voice-ad-card .pav-p.pinned { box-shadow:inset 0 -3px 0 #e5c778; }
+.pav-p:focus-visible, .pav-pr-btn:focus-visible, .pav-used-tick:focus-visible { outline:2px solid #8de1ed; outline-offset:-3px; }
+.pine-voice-ad-card.pav-on-prompts > :not(.pav-head):not(.pav-prompts) { display:none !important; }
+.pav-prompts { display:flex; flex-direction:column; gap:10px; color:#dce9eb; font-size:12px; }
+.pav-prompts[hidden] { display:none; }
+.pav-pr-top, .pav-pr-cycle, .pav-pr-actions, .pav-pr-next { display:flex; flex-wrap:wrap; align-items:center; gap:8px; }
+.pav-pr-top > b { flex:1 1 auto; color:#8de1ed; font-size:15px; }
+.pav-pr-btn { display:inline-flex; align-items:center; gap:6px; min-height:34px; padding:0 10px; border:1px solid #36515c; border-radius:5px; background:#17252d; color:#e7f1f4; font:12px/1 Inter, Segoe UI, system-ui, sans-serif; cursor:pointer; }
+.pav-pr-btn svg { flex:0 0 auto; width:16px; height:16px; fill:currentColor; }
+.pav-pr-btn:disabled { opacity:.4; cursor:default; }
+.pav-pr-btn[hidden] { display:none; }
+.pav-pr-pick { flex:1 1 180px; min-width:0; min-height:34px; padding:0 6px; border:1px solid #43545c; border-radius:4px; background:#0c1418; color:#e3edf0; font-size:12px; }
+.pav-pr-count { color:#9fbbc8; white-space:nowrap; }
+.pav-pr-next { padding:8px 10px; border:1px solid #35414c; border-radius:5px; background:#0f171a; }
+.pav-pr-next > span { flex:1 1 220px; min-width:0; overflow-wrap:anywhere; }
+.pav-pr-odds, .pav-pr-note { margin:0; overflow-wrap:anywhere; }
+.pav-pr-odds { color:#9fbbc8; }
+.pav-pr-note { min-height:16px; color:#e5c778; }
+.pav-pr-form { display:grid; gap:8px; }
+.pav-pr-field { display:grid; gap:3px; min-width:0; }
+.pav-pr-field > span { color:#dce9eb; font-weight:600; }
+.pav-pr-field > i { color:#8fa5ae; font-size:11px; font-style:normal; }
+.pav-pr-field textarea, .pav-pr-field input { box-sizing:border-box; width:100%; min-height:32px; padding:6px 8px; border:1px solid #43545c; border-radius:4px; background:#0c1418; color:#e3edf0; font:12px/1.4 Inter, Segoe UI, system-ui, sans-serif; resize:vertical; }
+.pav-pr-hours-head { color:#8de1ed; }
+.pav-pr-hours { display:grid; gap:6px; }
+.pav-pr-hour { display:grid; grid-template-columns:auto minmax(0, 1fr) auto auto; gap:4px 8px; align-items:center; padding:6px 8px; border:1px solid #2c3a41; border-radius:5px; }
+.pav-pr-hour > time { color:#cbd8dc; font:12px/1 ui-monospace, Consolas, monospace; }
+.pav-pr-hour > span { min-width:0; overflow-wrap:anywhere; }
+.pav-pr-hour > i { grid-column:1 / -1; color:#8fa5ae; font-style:normal; overflow-wrap:anywhere; }
+.pav-used { flex:0 0 auto; border:1px solid #2c3a41; border-radius:5px; background:#10191c; scroll-margin:8px 0 56px; }
+.pav-used-tick { display:flex; align-items:center; gap:8px; box-sizing:border-box; width:100%; min-height:36px; padding:6px 10px; border:0; background:transparent; color:#dce9eb; font:12px/1.3 Inter, Segoe UI, system-ui, sans-serif; text-align:left; cursor:pointer; }
+.pav-used-tick svg { flex:0 0 auto; width:16px; height:16px; fill:currentColor; transition:transform .15s; }
+.pav-used.open .pav-used-tick svg { transform:rotate(90deg); }
+.pav-used-tick b { color:#8de1ed; white-space:nowrap; }
+.pav-used-sum { flex:1 1 auto; min-width:0; overflow:hidden; color:#9fbbc8; text-overflow:ellipsis; white-space:nowrap; }
+.pav-used-body { display:grid; gap:8px; padding:0 10px 10px; }
+.pav-used-body[hidden] { display:none; }
+.pav-used-meta, .pav-used-note, .pav-used-msg { margin:0; color:#cbd8dc; font-size:12px; overflow-wrap:anywhere; }
+.pav-used-note, .pav-used-msg { color:#e5c778; }
+.pav-used-item { display:grid; gap:4px; min-width:0; }
+.pav-used-label { display:flex; align-items:center; justify-content:space-between; gap:8px; color:#8fa5ae; font-size:11px; }
+.pine-voice-ad-card .pav-used .pav-icon { flex:0 0 30px; width:30px; height:30px; padding:6px; }
+.pav-used-text { margin:0; max-height:9.5em; overflow:auto; padding:6px 8px; border:1px solid #2c3a41; border-radius:4px; background:#0a1114; color:#e3edf0; font:12px/1.4 ui-monospace, Consolas, monospace; white-space:pre-wrap; overflow-wrap:anywhere; }
+.pav-used-actions, .pav-used-name { display:flex; flex-wrap:wrap; align-items:center; gap:8px; }
+.pav-used-name[hidden] { display:none; }
+.pav-used-name input { flex:1 1 200px; min-width:0; min-height:32px; padding:4px 8px; border:1px solid #43545c; border-radius:4px; background:#0c1418; color:#e3edf0; }

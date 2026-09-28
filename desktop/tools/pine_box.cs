@@ -8,6 +8,9 @@
 //   3. if the local Electron runtime is missing, extracts
 //      desktop-runtime\electron-win64.zip off the share — no Node, no npm,
 //      no internet needed on the PC;
+//   3b. gives electron.exe the Pine Box name and icon in its own resources
+//      (desktop\tools\apply_pinebox_identity.ps1) - the same file at the
+//      same path, so the volume Windows keeps for it is untouched;
 //   4. writes a Start Menu shortcut called "Pine Box" carrying the app's
 //      AppUserModelID and its icon, so the thing can be pinned to the
 //      taskbar and pinned correctly (#971);
@@ -17,13 +20,23 @@
 // Build (any Windows box, no SDK needed):
 //   %WINDIR%\Microsoft.NET\Framework64\v4.0.30319\csc.exe /nologo
 //     /r:System.IO.Compression.FileSystem.dll /r:System.IO.Compression.dll
-//     /out:pine_box.exe pine_box.cs
+//     /win32icon:..\assets\pinebox.ico /out:pine_box.exe pine_box.cs
+//   (run from desktop\tools; the icon is the Pine Box mark and the
+//   assembly attributes below name the exe "Pine Box")
 using System;
 using System.Diagnostics;
 using System.IO;
 using System.IO.Compression;
 using System.Runtime.InteropServices;
 using System.Text;
+
+// [pine-identity] what Windows reads for this exe's name: FileDescription
+// (Task Manager, the file's Properties) comes from AssemblyTitle.
+[assembly: System.Reflection.AssemblyTitle("Pine Box")]
+[assembly: System.Reflection.AssemblyProduct("Pine Box")]
+[assembly: System.Reflection.AssemblyDescription("Pine Box launcher: mirrors the app from the station share and starts it")]
+[assembly: System.Reflection.AssemblyVersion("1.1.0.0")]
+[assembly: System.Reflection.AssemblyFileVersion("1.1.0.0")]
 
 // #971 — the COM needed to write a shortcut that Windows will accept as
 // an application's own. WScript.Shell can set a target and an icon and
@@ -230,6 +243,90 @@ static class PineBox
     static extern void SHChangeNotify(int eventId, uint flags, IntPtr item1,
                                       IntPtr item2);
 
+    // [pine-identity] ELECTRON.EXE'S OWN NAME AND ICON.
+    //
+    // The places no window can reach - Task Manager's name for the app, and
+    // the volume mixer, whose Pine Box session has no display name of its
+    // own and so shows the exe's FileDescription and icon - read them from
+    // electron.exe itself, which says "Electron" and wears the atom. The
+    // script rewrites that file's resources IN PLACE. It is never renamed
+    // and never moved: Windows keeps each app's volume by executable path,
+    // and a new path would start at 100.
+    //
+    // Checked on every launch (one version-info read), so a PC that has
+    // never had it, a runtime just unpacked from the share and an Electron
+    // upgrade all get it with no extra step. Never fatal: while Pine Box is
+    // already running its exe is in use, and the next launch after it
+    // closes applies it.
+    static void EnsureIdentity(string runDir, string stack)
+    {
+        string electron = Path.Combine(runDir,
+            @"node_modules\electron\dist\electron.exe");
+        try
+        {
+            FileVersionInfo vi = FileVersionInfo.GetVersionInfo(electron);
+            if (vi.FileDescription == AppName && vi.ProductName == AppName)
+            {
+                return;
+            }
+        }
+        catch (Exception) { return; }
+        string script = Path.Combine(runDir,
+            @"desktop\tools\apply_pinebox_identity.ps1");
+        if (!File.Exists(script))
+        {
+            Say("electron.exe still says Electron, and " + script
+                + " is missing - the app still launches.");
+            return;
+        }
+        Say("giving electron.exe the Pine Box name and icon (same file, "
+            + "same path)...");
+        try
+        {
+            ProcessStartInfo psi = new ProcessStartInfo("powershell.exe",
+                "-NoProfile -ExecutionPolicy Bypass -File \"" + script
+                + "\" -Exe \"" + electron + "\" -NoBackup -Quiet");
+            psi.UseShellExecute = false;
+            psi.CreateNoWindow = true;
+            psi.RedirectStandardOutput = true;
+            psi.RedirectStandardError = true;
+            psi.EnvironmentVariables["PINE_STACK"] = stack;
+            psi.EnvironmentVariables.Remove("ELECTRON_RUN_AS_NODE");
+            Process p = Process.Start(psi);
+            p.ErrorDataReceived += (sender, e) =>
+            {
+                if (!string.IsNullOrEmpty(e.Data)) Console.WriteLine("  " + e.Data);
+            };
+            p.BeginErrorReadLine();
+            string line;
+            while ((line = p.StandardOutput.ReadLine()) != null)
+            {
+                Console.WriteLine("  " + line);
+            }
+            if (!p.WaitForExit(120000))
+            {
+                try { p.Kill(); } catch (Exception) { }
+                Say("the identity step timed out - the app still launches.");
+                return;
+            }
+            if (p.ExitCode == 3)
+            {
+                Say("Pine Box is already running, so electron.exe is in use; "
+                    + "its name and icon are applied at the next launch.");
+            }
+            else if (p.ExitCode != 0)
+            {
+                Say("the identity step did not apply (exit " + p.ExitCode
+                    + ") - the app still launches.");
+            }
+        }
+        catch (Exception exc)
+        {
+            Say("could not run the identity step (" + exc.Message
+                + ") - the app still launches.");
+        }
+    }
+
     static void Say(string line)
     {
         Console.WriteLine("[pinebox] " + line);
@@ -277,6 +374,8 @@ static class PineBox
 
     static int Main()
     {
+        // [pine-identity] the console says whose it is.
+        try { Console.Title = AppName; } catch (Exception) { }
         string stack = Environment.GetEnvironmentVariable("PINE_STACK");
         if (string.IsNullOrEmpty(stack)) stack = DefaultStack;
         string agent = Path.Combine(stack, "spark-agent");
@@ -359,6 +458,7 @@ static class PineBox
         // written before that could point at an electron.exe that the
         // unpack step was about to replace.
         WriteShortcut(runDir);
+        EnsureIdentity(runDir, stack);   // [pine-identity]
 
         Say("launching Pine Box → " + BaseUrl);
         ProcessStartInfo psi = new ProcessStartInfo(electron, ".");

@@ -2536,18 +2536,26 @@ async function saveConfig(patch = {}) {
 
 function appendLog(line) {
   const box = $("logBox");
+  /* [autoscroll-rule] the tail follows only a reader who is at it */
+  const stick = window.pineStick ? window.pineStick(box, {edge: "bottom"}) : null;
   box.textContent += line;
-  box.scrollTop = box.scrollHeight;
+  if (stick) stick.follow();
   if (document.body.classList.contains("rebuilding")) appendRebuildLog(line);
 }
 
 function appendRebuildLog(line) {
   const box = $("rebuildLog");
   if (!box) return;
+  /* [autoscroll-rule] trimmed and followed only while the reader is at the
+     tail: one scrolled back keeps every line where it was */
+  const stick = window.pineStick ? window.pineStick(box, {edge: "bottom"}) : null;
+  const atTail = stick ? stick.following() : true;
   box.textContent += line;
-  const lines = box.textContent.split(/\r?\n/).slice(-120);
-  box.textContent = lines.join("\n");
-  box.scrollTop = box.scrollHeight;
+  if (atTail) {
+    const lines = box.textContent.split(/\r?\n/).slice(-120);
+    box.textContent = lines.join("\n");
+  }
+  if (stick) stick.follow();
 }
 
 function setBar(id, pct) {
@@ -4093,6 +4101,12 @@ function initTriagePopup() {
   }
 
   function paintSteps(box, steps, verdict, busy) {
+    /* [autoscroll-rule] rebuilt every two seconds while a repair runs: the
+     * tail is followed only by a reader at it; one scrolled back keeps the
+     * step they were reading. */
+    const stepStick = window.pineStick
+      ? window.pineStick(box, {edge: "bottom"}) : null;
+    const stepHold = stepStick ? stepStick.anchor() : null;
     box.textContent = "";
     (steps || []).forEach((s) => {
       const row = mk("div", "tri-step");
@@ -4105,7 +4119,7 @@ function initTriagePopup() {
     if (verdict && !busy) {
       box.appendChild(mk("div", "tri-verdict", verdict));
     }
-    box.scrollTop = box.scrollHeight;
+    if (stepStick) stepStick.restore(stepHold, false);   // [autoscroll-rule]
   }
 
   async function paintEngines(scope) {
@@ -4347,6 +4361,17 @@ function initWorksPopup() {
   /* Rows arrive at the TOP. Give the scroll the pixels they took, so what
    * you are reading stays under your eye instead of sliding down. */
   const wkAnchor = (add) => {
+    /* [autoscroll-rule] the rows land at the top of a list INSIDE this
+     * popup, and adding their height to the scroll whenever the popup was
+     * not at its top pushed the reader's line up by exactly that much
+     * whenever the list sat below it. The place is measured on what is
+     * under the eye and put back there; a reader at the top stays there. */
+    const wkStick = pop && window.pineStick
+      ? window.pineStick(pop, {edge: "top", slack: 0, button: false}) : null;
+    if (wkStick) {
+      try { wkStick.keep(add, false); } catch (e) { /* the list is there either way */ }
+      return;
+    }
     let was = 0, top = 0, ok = false;
     try { if (pop) { was = pop.scrollHeight; top = pop.scrollTop; ok = true; } }
     catch (e) { ok = false; }
@@ -12777,13 +12802,18 @@ function initCrystalBtn() {
     ensureGrips();
 
     const say = (line) => {
+      /* [autoscroll-rule] the console follows only a reader at its tail,
+         and is only trimmed then - a reader scrolled back keeps the line */
+      const stick = window.pineStick
+        ? window.pineStick(consoleEl, {edge: "bottom"}) : null;
+      const atTail = stick ? stick.following() : true;
       const row = document.createElement("div");
       row.textContent = line;
       consoleEl.appendChild(row);
-      while (consoleEl.childElementCount > 40) {
+      while (consoleEl.childElementCount > (atTail ? 40 : 400)) {
         consoleEl.removeChild(consoleEl.firstChild);
       }
-      consoleEl.scrollTop = consoleEl.scrollHeight;
+      if (stick) stick.follow();
     };
 
     try { await loadThree(); } catch (err) {

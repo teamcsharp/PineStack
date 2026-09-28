@@ -256,7 +256,7 @@ class RuntimeTests(unittest.TestCase):
         self.assertTrue(h.active)
         for words in ("THE RUNNING ORDER OF THIS CALL", "MONK INTRODUCES THEMSELF", "[Say it in", "The cat kidnapped somebody."):
             self.assertIn(words, h.sheet)
-        self.assertEqual(h.conv["turns"][-1]["leg"], "sign_off")
+        self.assertEqual(h.conv["turns"][-1]["leg"], "wrap_call")        # [s3-callend] the call's new end
         bad = self.client.put("/api/system3/structures/caller", json={"legs": [{"id": "bad"}]},
                               headers={"Authorization": "Bearer k"})
         self.assertEqual(bad.status_code, 400)

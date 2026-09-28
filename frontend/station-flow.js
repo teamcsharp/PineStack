@@ -182,14 +182,15 @@ export async function openStationFlow({request, onClose=()=>{}}={}) {
   }
   function renderEvents(){
     const filtered=filterFlowEvents(allEvents,nodeSelect.value,search.value), rows=filtered.slice(-showing).reverse();
-    const scroll=log.scrollTop;log.replaceChildren();count.textContent=`${filtered.length} / ${allEvents.length}`;
+    // [autoscroll-rule] newest at the top: a reader there sees new events arrive; one reading down the log keeps the event they are on
+    const scroll=log.scrollTop,flowStick=window.pineStick?window.pineStick(log,{edge:"top",key:"data-event"}):null,flowHold=flowStick?flowStick.anchor():null,flowTop=log.querySelector("[data-event]")?.dataset.event||"";log.replaceChildren();count.textContent=`${filtered.length} / ${allEvents.length}`;
     if(!rows.length)log.append(dom("p","sf-events-note",allEvents.length?"No events match this filter.":"No events have been reported yet. The map stays still until the station reports activity."));
     for(const row of rows){
       const button=dom("button","sf-event");button.dataset.event=String(row.id);button.dataset.status=row.status;
       const label=dom("b","",nodeName(row.node));label.append(dom("i","",row.status));
       button.append(dom("time","",time(row.at)),label,dom("span","",row.summary));button.title=`Event ${row.id}: ${row.summary}`;button.onclick=()=>selectEvent(row.id);log.append(button);
     }
-    more.hidden=filtered.length<=showing;earlier.hidden=!historyMore;earlier.disabled=historyBusy;log.scrollTop=scroll;markSelection();
+    more.hidden=filtered.length<=showing;earlier.hidden=!historyMore;earlier.disabled=historyBusy;if(flowStick)flowStick.restore(flowHold,!!flowTop&&(log.querySelector("[data-event]")?.dataset.event||"")!==flowTop);else log.scrollTop=scroll;markSelection();   // [autoscroll-rule]
   }
   async function loadEarlier(){
     if(historyBusy||!allEvents.length)return;historyBusy=true;earlier.disabled=true;

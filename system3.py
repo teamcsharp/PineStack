@@ -61,6 +61,7 @@ FAMILIES = ("CTS", "ES", "RS", "IRS", "FL", "SPEAKERBOX", "SFX", "TOPIC", "SFXGU
             "EVENT",                                                     # [s3-events]
             "STATION",                                                   # [s3-dice-door]
             "BLOCK")                                                     # [s3-blocks]
+FAMILIES = FAMILIES + ("MEMORY",)                                    # [s3-memory] rules, then roulette
 PHASES = ("OPEN", "ESTABLISH", "DEVELOP", "ESCALATE", "EXPLORE", "WILDCARD",
           "RESOLVE", "WRAP", "SEGUE")
 SPEAKERBOX_MODES = ("NONE", "PREPEND", "APPEND", "FULL_SWATH", "REFERENCE",
@@ -392,10 +393,12 @@ def validate_table(table):
     if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,23}", tid):
         raise ValueError("table id must be a short name such as ES2")
     family = str(table.get("family") or "")
+    if family == "MEMORY":                                   # [s3-memory] kinds with rules, how many a round
+        return _validate_memory_table(table, tid)
     if family not in ("CTS", "ES", "RS", "IRS", "FL", "TEMPER", "SHOCK", "INTERJECT", "FAV", "DIRECTIVE", "EVENT",
-                      "CHANCE", "POOL", "SPEAKERBOX"):             # [s3-sb-end] SBEND1
+                      "CHANCE", "POOL", "SPEAKERBOX", "RESOLVE", "WRAP"):             # [s3-sb-end] SBEND1
         raise ValueError("table family must be one of CTS, ES, RS, IRS, FL, TEMPER, SHOCK, INTERJECT, FAV, DIRECTIVE, "
-                         "EVENT, CHANCE, POOL, SPEAKERBOX")
+                         "EVENT, CHANCE, POOL, SPEAKERBOX, RESOLVE, WRAP")
     pool = family in system3_tables.POOL_FAMILIES          # [s3-cast] may stand empty
     cats = table.get("categories")
     if not isinstance(cats, list) or (not cats and family not in ("CHANCE", "POOL")):   # [s3-dice-door] filled as the station rolls
@@ -2144,6 +2147,7 @@ def _cast_rolls(conv, config, settings, inputs):
     no other draw moves and adding a row never shifts another row's dice.
     Opt-in (inputs.cast_rolls): a conversation stored before replays as it
     was. A re-plan (Mode B) keeps what was rolled and lands it again."""
+    memory_rolls(conv, config, settings, inputs)          # [s3-memory] every planner rolls the memory here
     if not inputs.get("cast_rolls") or not conv["turns"]:
         return
     if conv.get("cast_rolled"):
@@ -2485,7 +2489,7 @@ def _events_attach(conv):
 def _event_emotions(conv, idx):
     """The happening planned for this turn leans its feeling (a caller who
     wins a prize is more likely delighted than bored)."""
-    out = {}
+    out = dict(_callend_emotions(conv, idx))                                  # [s3-callend] the caller's wheel
     for plan in conv.get("event_plans") or []:
         if int(plan.get("turn_index", -1)) == idx:
             for k, v in (plan.get("emotions") or {}).items():
@@ -2493,6 +2497,453 @@ def _event_emotions(conv, idx):
                     out[str(k)] = out.get(str(k), 1.0) * float(v)
                 except (TypeError, ValueError):
                     pass
+    return out
+
+
+# --- [s3-memory] what the writer is reminded of: rules, then roulette ---------------
+#
+# The operator's guide, 2026-09-28: memory context is given ONLY WHEN RELEVANT -
+# the clock, a synopsis of the last topic, the last segment and how it went, the
+# callers this hour against the quota, a synopsis of the manager's last message.
+# Asked how: "Rules, then roulette." Each MEMORY category is one kind of memory;
+# its rule (the numbers on the category, edited in Tables) decides whether it is
+# relevant to this round right now and says why either way; the roulette then
+# draws among the relevant kinds by weight - at least `least`, at most `most` a
+# round, how many itself a die when those differ - and a die picks which of a
+# drawn kind's items (the ways it can be put) when more than one fits. One
+# MEMORY event holds all of it: every kind's verdict, every candidate and its
+# weight, every die. It is drawn on the round's own stream (seed|round:MEMORY),
+# so no other draw moves; the items drawn are the only memory the writer is
+# given (memory_text -> the station's "memory" block). Opt-in
+# (inputs.memory_rolls): a conversation stored before replays as it was.
+MEMORY_KINDS = ("clock", "last_topic", "last_segment", "callers_quota", "manager_note")
+MEMORY_HEAD = ("\nWHAT THE BOOTH HAS IN MIND RIGHT NOW (drawn for this round - work each one in only where it "
+               "fits, in your own words; never recite it): ")
+_MEMORY_HOURS = ("twelve", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten", "eleven")
+
+
+def _memory_num(rule, key, default):
+    try:
+        return max(0.0, float(rule.get(key, default)))
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _memory_minutes(x):
+    n = max(0, int(round(float(x or 0))))
+    return "%d minute%s" % (n, "" if n == 1 else "s")
+
+
+def _memory_hour(h):
+    h = int(h or 0) % 24
+    return "midnight" if h == 0 else "noon" if h == 12 else "%s o'clock" % _MEMORY_HOURS[h % 12]
+
+
+def _memory_stem(word):
+    w = str(word or "").lower()
+    return w[:-1] if len(w) > 5 and w.endswith("s") and not w.endswith("ss") else w
+
+
+def _memory_keywords(text):
+    """The content words of a subject (five letters or more, not the stop
+    list), a plural's s dropped - what "carries it on" is measured in."""
+    return {_memory_stem(w) for w in re.findall(r"[a-z]{5,}", str(text or "").lower()) if w not in _STOP}
+
+
+def _memory_words(text, fill):
+    """An item's words with the station's facts filled in ({clock}, {synopsis}
+    ...); a {word} the station holds nothing for is dropped, never left in."""
+    out = re.sub(r"\{([a-z_]+)\}", lambda m: str(fill.get(m.group(1), "") or ""), str(text or ""))
+    return " ".join(out.split()).strip(" ;,-")
+
+
+def _memory_rule(cat, facts, conv, inputs):
+    """(state or None, why, fill) for one kind of memory: whether it is relevant
+    to this round right now by the numbers on its rule, why either way, and the
+    words its items fill in. A kind the engine has no rule for (a category the
+    operator added) is eligible whenever the station holds its fact - the
+    category's `fact`, else its id - and, with `within_minutes`, a fresh one."""
+    rule = cat.get("rule") if isinstance(cat.get("rule"), dict) else {}
+    kind = str(cat.get("kind") or cat.get("id") or "")
+    fact = facts.get(str(cat.get("fact") or kind))
+    fact = fact if isinstance(fact, dict) else {}
+    at = float(inputs.get("at") or conv.get("created") or 0)
+    road = str(conv["identity"].get("road_kind") or "")
+    line_road = road in system3_tables.LINE_ROADS
+
+    def num(key, default):
+        return _memory_num(rule, key, default)
+
+    def off(switch, why, fill):
+        return None, "%s - but its rule's %s switch is off" % (why, switch), fill
+
+    roads = [str(r) for r in (cat.get("roads") or []) if str(r)]
+    if roads and road not in roads:
+        return None, "not on the %s road (its roads: %s)" % (road or "this", ", ".join(roads)), {}
+    if inputs.get("bank") and not str(inputs.get("system2_job_id") or "") and rule.get("on_banked") is not True:
+        return None, ("a banked round is written now and heard later - by then this would be stale "
+                      "(its rule's on_banked switch is off)"), {}
+    if kind == "clock":
+        if fact.get("minute") is None:
+            return None, "the station handed in no clock", {}
+        minute = float(fact.get("minute") or 0) + float(fact.get("second") or 0) / 60.0
+        to_top = 60.0 - minute
+        seg = fact.get("segment") if isinstance(fact.get("segment"), dict) else {}
+        ends = float(seg.get("ends") or 0)
+        left = (ends - at) / 60.0 if ends > 0 else None
+        name = " ".join(str(seg.get("label") or "").split()) or "this segment"
+        fill = {"clock": " ".join(str(fact.get("clock") or "").split()),
+                "to_top": _memory_minutes(math.ceil(to_top)), "past_top": _memory_minutes(minute),
+                "hour": _memory_hour(fact.get("hour")), "next_hour": _memory_hour(int(fact.get("hour") or 0) + 1),
+                "segment": name, "segment_left": _memory_minutes(math.ceil(left)) if left is not None else ""}
+        before, after, seg_n = num("before_top", 5), num("after_top", 3), num("segment_left", 2)
+        if to_top <= before:
+            return "top", "%.0f min to the top of the hour (the rule: within %g)" % (to_top, before), fill
+        if minute < after:
+            return "past", "%.0f min past the hour (the rule: within %g)" % (minute, after), fill
+        if left is not None and 0 < left <= seg_n:
+            return "segment", "%s ends in %.1f min (the rule: within %g)" % (name, left, seg_n), fill
+        return None, ("%.0f min past the hour - not within %g min of the top or %g after it, %s"
+                      % (minute, before, after,
+                         ("and %s has %.0f min left (the rule: %g)" % (name, left, seg_n)) if left is not None
+                         else "and no segment end in view")), fill
+
+    if kind == "last_topic":
+        topic = " ".join(str(fact.get("topic") or fact.get("text") or "").split())
+        if not topic:
+            return None, "nothing has gone out yet that System 3 holds a subject for", {}
+        age = max(0.0, (at - float(fact.get("at") or 0)) / 60.0)
+        landing = " ".join(str(fact.get("landing") or "").split())
+        who = " ".join(str(fact.get("landing_who") or "").split()) or "the last voice"
+        synopsis = "%s (%s ago%s)" % (sentence_cut(topic, 200), _memory_minutes(age),
+                                      (", ending on %s saying %s" % (who, json.dumps(sentence_cut(landing, 140))))
+                                      if landing else "")
+        fill = {"synopsis": synopsis, "topic": sentence_cut(topic, 200), "ago": _memory_minutes(age),
+                "landing": json.dumps(sentence_cut(landing, 140)) if landing else "", "who": who}
+        within = num("within_minutes", 30)
+        if age > within:
+            return None, "the last subject went out %.0f min ago (the rule: within %g)" % (age, within), fill
+        subj = conv.get("subject") or {}
+        mine = {_memory_stem(w) for w in subj.get("keywords") or []} | _memory_keywords(subj.get("topic"))
+        theirs = {_memory_stem(w) for w in fact.get("keywords") or []} | _memory_keywords(topic)
+        shared = sorted(mine & theirs)
+        need = max(1, int(num("continues_overlap", 2)))
+        own = bool(str(subj.get("topic") or "").strip()) and subj.get("authority") != "free"
+        if not own:
+            state, why = "continues", "this round brings no subject of its own, so it carries on from the last one"
+        elif len(shared) >= need:
+            state, why = "continues", "it shares %d word%s with the last subject (%s; the rule: %d)" % (
+                len(shared), "" if len(shared) == 1 else "s", ", ".join(shared[:5]), need)
+        elif line_road:
+            return None, ("a single line on another subject has nothing to turn from (%d shared word%s; "
+                          "the rule: %d to carry it on)" % (len(shared), "" if len(shared) == 1 else "s", need)), fill
+        else:
+            state, why = "contrasts", "a different subject: %d shared word%s (the rule: %d to carry it on)" % (
+                len(shared), "" if len(shared) == 1 else "s", need)
+        why += "; it went out %.0f min ago (the rule: within %g)" % (age, within)
+        if rule.get(state) is False:
+            return off(state, why, fill)
+        return state, why, fill
+
+    if kind == "last_segment":
+        ended = float(fact.get("ended") or 0)
+        if not ended:
+            return None, "no segment has ended since the station started (the schedule has not moved on yet)", {}
+        if fact.get("unseen"):
+            return None, ("the segment before this one ran with no round planned in it - System 3 did not see "
+                          "it, so it cannot say how it went"), {}
+        name =" ".join(str(fact.get("label") or fact.get("kind") or "the last segment").split())
+        now = fact.get("now") if isinstance(fact.get("now"), dict) else {}
+        now_name = " ".join(str(now.get("label") or "").split()) or "this segment"
+        heard, pulled, calls = int(fact.get("heard") or 0), int(fact.get("withdrawn") or 0), int(fact.get("calls") or 0)
+        if heard:
+            parts = ["%d line%s heard" % (heard, "" if heard == 1 else "s")]
+            if pulled:
+                parts.append("%d withdrawn" % pulled)
+            if calls:
+                parts.append("%d call%s taken" % (calls, "" if calls == 1 else "s"))
+            went = ", ".join(parts)
+        else:
+            went = "nothing it planned was heard" + ((" (%d line%s withdrawn)" % (pulled, "" if pulled == 1 else "s"))
+                                                     if pulled else "")
+        since = max(0.0, (at - ended) / 60.0)
+        fill = {"segment": name, "went": went, "ago": _memory_minutes(since), "now": now_name}
+        if line_road:
+            return None, "a single line does not open a segment", fill
+        within, first = num("within_minutes", 15), num("first_minutes", 4)
+        if since > within:
+            return None, "%s ended %.0f min ago (the rule: within %g)" % (name, since, within), fill
+        into = (at - float(now.get("started") or 0)) / 60.0 if float(now.get("started") or 0) > 0 else None
+        if into is not None and into > first:
+            return None, ("%.0f min into %s - past the hand-over from %s (the rule: its first %g min)"
+                          % (into, now_name, name, first)), fill
+        share = pulled / float(max(1, heard + pulled))
+        state = "rough" if (not heard or share >= num("rough_share", 0.34)) else "smooth"
+        why = "%s ended %.0f min ago and %s has just begun: %s (the rule: within %g, its first %g min)" % (
+            name, since, now_name, went, within, first)
+        if rule.get(state) is False:
+            return off(state, why, fill)
+        return state, why, fill
+
+    if kind == "callers_quota":
+        if not fact:
+            return None, "the station handed in no call count", {}
+        quota, count = int(float(fact.get("quota") or 0)), int(float(fact.get("count") or 0))
+        # behind is read off the rolling hour (the station's own quota_behind: it can only
+        # under-report a deficit); ahead off the clock hour's own calls, so the last hour's
+        # tail never makes this one look ahead
+        hour_n = int(float(fact.get("this_hour", count) or 0))
+        fill = {"calls": "%d call%s" % (count, "" if count == 1 else "s"), "quota": str(quota), "count": str(count),
+                "hour_calls": "%d call%s" % (hour_n, "" if hour_n == 1 else "s")}
+        if quota <= 0:
+            return None, "the calls-per-hour dial is off: there is no quota", fill
+        if fact.get("paused"):
+            return None, "the station is off air - nobody is behind", fill
+        minute = float(fact.get("minute") or 0)
+        after = num("after_minutes", 15)
+        if minute < after:
+            return None, "%.0f min into the hour - too early to judge the pace (the rule: from minute %g)" % (
+                minute, after), fill
+        expected = quota * min(1.0, minute / 60.0)
+        margin = max(0.5, num("margin", 1))
+        fill["expected"] = "%.0f" % expected
+        why = ("%d call%s in the last hour, %d since the top of it, against %d an hour - about %.1f due by minute "
+               "%.0f (the rule: %g either way)" % (count, "" if count == 1 else "s", hour_n, quota, expected, minute,
+                                                    margin))
+        if expected - count >= margin:
+            state = "behind"
+        elif hour_n - expected >= margin or hour_n >= quota:
+            state = "ahead"
+        else:
+            return None, "on pace: " + why, fill
+        if rule.get(state) is False:
+            return off(state, why, fill)
+        return state, why, fill
+
+    if kind == "manager_note":
+        said = " ".join(str(fact.get("text") or "").split())
+        if not said:
+            return None, "the manager has said nothing from upstairs yet", {}
+        age = max(0.0, (at - float(fact.get("at") or 0)) / 60.0)
+        fill = {"said": json.dumps(sentence_cut(said, 220)), "ago": _memory_minutes(age)}
+        if road in ("manager", "memo", "upstairs"):
+            return None, "this is the manager's own road - his words are its material, not a memory", fill
+        within = num("within_minutes", 20)
+        if age > within:
+            return None, "he last spoke from upstairs %.0f min ago (the rule: within %g)" % (age, within), fill
+        return "fresh", "he spoke from upstairs %.0f min ago (the rule: within %g)" % (age, within), fill
+
+    text = " ".join(str(fact.get("text") or "").split())
+    if not text:
+        return None, "the station holds nothing for %s" % (kind or "this kind"), {}
+    fill = dict({k: v for k, v in fact.items() if isinstance(v, (str, int, float)) and not isinstance(v, bool)},
+                synopsis=text)
+    if "within_minutes" in rule and float(fact.get("at") or 0) > 0:
+        age = max(0.0, (at - float(fact["at"])) / 60.0)
+        fill["ago"] = _memory_minutes(age)
+        if age > num("within_minutes", 30):
+            return None, "%.0f min old (the rule: within %g)" % (age, num("within_minutes", 30)), fill
+    return "fresh", "the station holds it", fill
+
+
+def _memory_count(table, key, default):
+    try:
+        return max(0, min(5, int(float(table.get(key, default) if table.get(key) is not None else default))))
+    except (TypeError, ValueError):
+        return default
+
+
+def memory_rolls(conv, config, settings=None, inputs=None):
+    """[s3-memory] THE ROUND'S MEMORY: rules, then roulette. Every kind in the
+    enabled MEMORY tables is put to its rule (eligible or not, and why); the
+    roulette draws how many (between the tables' least and most, never more
+    than are eligible), which kinds (by weight, none twice) and, where more
+    than one item fits a drawn kind's state, which way it is put. One MEMORY
+    event records it all, on the round's own stream. The items drawn land on
+    the round's first turn and are the writer's memory block (memory_text).
+    A re-plan keeps what was rolled. Returns conv["memory"], or None when
+    nothing was rolled (not opted in, no MEMORY table)."""
+    inputs = inputs if inputs is not None else conv["inputs"]
+    if not inputs.get("memory_rolls"):
+        return None
+    if isinstance(conv.get("memory"), dict):
+        _memory_attach(conv)
+        return conv["memory"]
+    tables = _tables_for(config, "MEMORY")
+    if not tables:
+        return None
+    facts = inputs.get("memory") if isinstance(inputs.get("memory"), dict) else {}
+    rows = []
+    for table in tables:
+        for cat in table.get("categories") or []:
+            if not isinstance(cat, dict) or not cat.get("id") or cat.get("enabled") is False:
+                continue
+            rid = str(cat["id"]) if len(tables) == 1 else "%s:%s" % (table["id"], cat["id"])
+            weight = round(float(table.get("weight", 1.0) or 0) * float(cat.get("weight", 1.0) or 0), 4)
+            state, why, fill = _memory_rule(cat, facts, conv, inputs)
+            fits = []
+            if state:
+                for it in cat.get("items") or []:
+                    if not isinstance(it, dict) or not it.get("id") or it.get("enabled") is False \
+                            or float(it.get("weight", 1.0) or 0) <= 0 or not str(it.get("text") or "").strip():
+                        continue
+                    when = it.get("when")
+                    whens = [str(x) for x in when] if isinstance(when, list) else ([str(when)] if when else [])
+                    if not whens or state in whens:
+                        fits.append(it)
+                if not fits:
+                    why += " - but no item of it fits %s" % state
+                elif weight <= 0:
+                    why += " - but its weight is 0"
+            rows.append({"id": rid, "label": str(cat.get("label") or cat["id"]), "table": table["id"],
+                         "category": str(cat["id"]), "state": state, "why": why, "fill": fill, "fits": fits,
+                         "weight": weight, "eligible": bool(state and fits and weight > 0)})
+    least = min(_memory_count(t, "least", 1) for t in tables)
+    most = max(_memory_count(t, "most", 2) for t in tables)
+    live = [r for r in rows if r["eligible"]]
+    lo, hi = min(least, len(live)), min(max(least, most), len(live))
+    stream = DrawStream(str(conv["seed"]) + "|round:MEMORY")
+    ctx0 = {"turn_id": "", "turn_index": -1}
+    before = _snapshot(conv, conv["cursor"].get("initiator"))
+    verdicts = [{"id": r["id"], "label": r["label"], "eligible": r["eligible"], "state": r["state"], "why": r["why"]}
+                for r in rows]
+    stages = [{"stage": "rules", "draw": None, "verdicts": verdicts,
+               "selected": "%d of %d relevant" % (len(live), len(rows)),
+               "rule": "The rules, kind by kind: " + "; ".join(
+                   "%s - %s (%s)" % (r["label"], ("eligible: " + str(r["state"])) if r["eligible"] else "not eligible",
+                                     r["why"]) for r in rows) + "."}]
+    n, rng = lo, None
+    if hi > lo:
+        d = stream.next("MEMORY:count")
+        crows = [{"id": str(k), "label": "%d memor%s" % (k, "y" if k == 1 else "ies"), "base": 1.0, "weight": 1.0,
+                  "why": ["between the table's least (%d) and most (%d), no more than are relevant (%d)"
+                          % (least, most, len(live))]} for k in range(lo, hi + 1)]
+        ci = pick_index([r["weight"] for r in crows], d["u"])
+        stages.append(_stage("how many", crows, ci, d))
+        n, rng = lo + ci, d
+    pool, picked = list(live), []
+    for k in range(n):
+        d = stream.next("MEMORY:pick%d" % (k + 1))
+        cands = [{"id": r["id"], "label": r["label"], "base": r["weight"], "weight": r["weight"], "why": [r["why"]]}
+                 for r in pool]
+        excluded = ([{"id": r["id"], "label": r["label"], "why": r["why"]} for r in rows if not r["eligible"]] if k == 0
+                    else [{"id": r["id"], "label": r["label"], "why": "drawn already"} for r in picked])
+        i = pick_index([c["weight"] for c in cands], d["u"])
+        if i < 0:
+            break
+        stages.append(_stage("item" if k == 0 else "pick %d" % (k + 1), cands, i, d, excluded))
+        picked.append(pool.pop(i))
+        if k == 0:
+            rng = d
+    items = []
+    for r in picked:
+        fits, j = r["fits"], 0
+        if len(fits) > 1:
+            d = stream.next("MEMORY:way:" + r["id"])
+            wrows = [{"id": str(it["id"]), "label": str(it.get("label") or it["id"]),
+                      "base": float(it.get("weight", 1.0) or 0), "weight": float(it.get("weight", 1.0) or 0),
+                      "why": ["fits %s" % r["state"]]} for it in fits]
+            j = pick_index([x["weight"] for x in wrows], d["u"])
+            stages.append(_stage("the way: " + r["label"], wrows, j, d))
+        it = fits[max(0, j)]
+        words = _memory_words(it.get("text"), r["fill"]).rstrip(". ")
+        if words:
+            items.append({"kind": r["id"], "kind_label": r["label"], "table": r["table"], "category": r["category"],
+                          "item": str(it["id"]), "label": str(it.get("label") or it["id"]), "state": r["state"],
+                          "text": words})
+    text = (MEMORY_HEAD + "; ".join(x["text"] for x in items) + ".") if items else ""
+    tabs = sorted({x["table"] for x in items}) or [tables[0]["id"]]
+    if items:
+        sel = {"table": tabs[0] if len(tabs) == 1 else "MEMORY",
+               "category": "+".join(x["category"] for x in items),
+               "category_label": " + ".join(x["kind_label"] for x in items),
+               "id": "+".join(x["kind"] for x in items), "label": "; ".join(x["label"] for x in items),
+               "text": text.strip(), "items": [{k: x[k] for k in ("kind", "item", "state", "text")} for x in items]}
+    else:
+        sel = {"table": tabs[0], "id": "NONE", "items": [], "text": "",
+               "label": "no memory this round" if live else "nothing relevant to remind the writer of"}
+    meta = {"eligible": len(live), "kinds": len(rows), "drawn": len(items), "least": least, "most": most,
+            "verdicts": verdicts,
+            "why": ("the rules found %d of %d kinds of memory relevant; the roulette drew %d - the writer is "
+                    "given exactly those" % (len(live), len(rows), len(items))) if live else
+                   ("no kind of memory is relevant to this round right now: the writer is reminded of nothing")}
+    ev = _event(conv, ctx0, "MEMORY", stages, sel, before, meta=meta, rng=rng)
+    ev["state_after"] = before
+    conv["memory"] = {"event_id": ev["event_id"], "items": items, "text": text, "draws": stream.n}
+    _memory_attach(conv)
+    return conv["memory"]
+
+
+def _memory_attach(conv):
+    """[s3-memory] The memory drawn rides the round's first turn - the writer
+    holds it from there - so the Messenger shows it on the turn and the
+    Rolodex on the round; again after a re-plan."""
+    mem = conv.get("memory") if isinstance(conv.get("memory"), dict) else {}
+    for t in conv["turns"]:
+        t["decisions"] = [d for d in t["decisions"] if d.get("family") != "MEMORY"]
+    items = mem.get("items") or []
+    if not items or not conv["turns"]:
+        return
+    conv["turns"][0]["decisions"].append({
+        "family": "MEMORY", "event_id": mem.get("event_id", ""), "item": "+".join(str(x.get("kind")) for x in items),
+        "label": "; ".join(str(x.get("label") or x.get("kind")) for x in items)[:160]})
+
+
+def memory_text(conv):
+    """[s3-memory] The writer's memory block for this round: exactly the items
+    its MEMORY roll drew, "" when it drew none."""
+    return str(((conv or {}).get("memory") or {}).get("text") or "")
+
+
+def _validate_memory_table(table, tid):
+    """[s3-memory] A MEMORY table the desk may save: kinds of memory (categories)
+    whose rule is numbers and switches, items with words (`when` = the rule's
+    state it fits), and how many a round (`least` .. `most`, 0 to 5)."""
+    cats = table.get("categories")
+    if not isinstance(cats, list) or not cats:
+        raise ValueError("a table needs at least one category")
+    out = copy.deepcopy(table)
+    out["id"], out["family"] = tid, "MEMORY"
+    out["weight"] = max(0.0, float(table.get("weight", 1.0) or 0))
+    out["enabled"] = bool(table.get("enabled", True))
+    out["version"] = int(table.get("version") or 1)
+    out["least"] = _memory_count(table, "least", 1)
+    out["most"] = max(out["least"], _memory_count(table, "most", 2))
+    seen = set()
+    for cat in out["categories"]:
+        if not isinstance(cat, dict) or not str(cat.get("id") or "").strip():
+            raise ValueError("every category needs an id")
+        cat["weight"] = max(0.0, float(cat.get("weight", 1.0) or 0))
+        rule = cat.get("rule", {})
+        if not isinstance(rule, dict):
+            raise ValueError("memory kind %s: its rule is an object of numbers and switches" % cat["id"])
+        clean = {}
+        for key, val in rule.items():
+            if isinstance(val, bool):
+                clean[str(key)] = val
+            elif isinstance(val, (int, float)) and not math.isnan(float(val)) and not math.isinf(float(val)):
+                clean[str(key)] = max(0, val) if isinstance(val, int) else max(0.0, float(val))
+            else:
+                raise ValueError("memory kind %s: rule %s must be a number or true/false" % (cat["id"], key))
+        cat["rule"] = clean
+        if "roads" in cat:                   # optional: the roads this kind may be told on (none = every road)
+            cat["roads"] = [str(r) for r in (cat.get("roads") or []) if str(r) in ROADS]
+        items = cat.get("items")
+        if not isinstance(items, list) or not items:
+            raise ValueError("category %s has no items" % cat["id"])
+        for item in items:
+            if not isinstance(item, dict) or not str(item.get("id") or "").strip():
+                raise ValueError("every item needs an id")
+            key = (cat["id"], item["id"])
+            if key in seen:
+                raise ValueError("duplicate item %s/%s" % key)
+            seen.add(key)
+            item["weight"] = max(0.0, float(item.get("weight", 1.0) or 0))
+            item.setdefault("label", item["id"])
+            when = item.get("when")
+            if when is not None and not (isinstance(when, str) or
+                                         (isinstance(when, list) and all(isinstance(x, str) for x in when))):
+                raise ValueError("item %s/%s: `when` names the state of the rule it fits" % key)
     return out
 
 
@@ -2715,6 +3166,748 @@ def annotate_protocol(conv, sheet):
     return re.sub(r"(?m)^\s*(\d+)\s+[ABCDE]\s+[-–—].*$", row, sheet)
 
 
+# --- [s3-callend] HOW A CALL ENDS: RESOLUTION -> RESPONSE CHAIN -> REBUTTAL -> WRAP CALL --------
+#
+# The operator, 2026-09-28: "for phone calls. At the end of the node tree. I want to put a
+# resolution node with an RNG for setting up how a phone call is wrapped up so we can have
+# a roulette and table for how phone calls end and customers roll a wheel for how their call
+# is ended ... these should have a response chain that follows + a rebuttal from the caller
+# before the call ends by somone one the station ending the call in response to the customer
+# "wrap call" roulette node".
+#
+# The call's end is the caller structure's `end` legs (system3_tables.CALLEND_LEGS):
+#   resolution  a station seat (rolled) sets up the outcome the caller's wheel landed on
+#               (RESOLVE1: the offer, the raffle, the price) - the RESOLVE node
+#   reaction    the caller plays it out (buys it, turns it down, sets it on fire ...)
+#   response    the response chain: one or two station turns (how many, and who, rolled)
+#   rebuttal    the caller's last word, second to last (it replaces "lands")
+#   wrap        WRAP CALL: who on the station ends the call and how (WRAP1), the last turn
+# Every roll draws on its OWN stream (seed|callend:<what>), so no other family's dice move,
+# and is recorded as an event with every candidate, its weight and why, and why each one
+# that could not be drawn was excluded. A structure without the legs, or a config with the
+# tables switched off, plans the call it always planned (the rebuttal leg lands the story,
+# the wrap leg signs off with the words the station's checker listens for) - same dice.
+FAMILIES = FAMILIES + system3_tables.CALLEND_FAMILIES                        # [s3-callend] RESOLVE, WRAP
+CALLEND_STATION = ("A", "B", "D", "S")     # the booth: host, co-host, third seat, Sam (where a call has his seat)
+CALLEND_WITHIN = 1200.0                    # a painting on offer this recently is "the last segment"
+CALLEND_SIGN_OFF = ("a spoken sign-off - it must contain one of these words out loud: thanks, thank you, "
+                    "goodbye, goodnight, take care, appreciate")
+CALLEND_LANDS = ("the last word of their own story - what changed, what they decided, or why they are ready "
+                 "to leave it there")
+CALLEND_REBUTTAL = ("a rebuttal to what the station just said about it - pushes back, doubles down or has a "
+                    "final dig, in their own words")
+CALLEND_RESPOND = "answers what {first} just did, and what it means"
+CALLEND_TAIL = ("Every one of those is checked after you write it, and a call that misses one is thrown away "
+                "unheard - so the two questions that repeat the caller's own words, the caller's last word "
+                "second to last, and the call wrapped on the last turn exactly as the running order rolled it "
+                "(a polite goodbye only where that is what was rolled) are not style notes. They are the call.")
+CALLEND_NEEDS = {"painting": "the last segment did not sell a painting (nothing on offer in the window)",
+                 "dead_line": "the call ran its course - nothing ended it early"}
+CALLEND_UNLESS = {"painting": "the last segment was selling a painting - the painting wheel stands",
+                  "dead_line": "the line went dead - the dead-line wheel stands"}
+_CALLEND_AT = {"turn_id": "", "turn_index": -1}
+
+
+def _callend_role(leg):
+    """A leg's part in the call's end (its `end`), or ""."""
+    role = str((leg or {}).get("end") or "")
+    return role if role in system3_tables.CALLEND_ROLES else ""
+
+
+def _callend_tables(config, family):
+    """The switched-on tables of a call-end family that roll on a call."""
+    return [t for t in _tables_for(config, family)
+            if not t.get("roads") or "caller" in [str(r) for r in t.get("roads") or []]]
+
+
+def _callend_why_not(row, avail, prev_keys):
+    """Why a call-end category or item cannot come up on this call, or ""."""
+    if row.get("enabled") is False:
+        return "switched off"
+    for need in row.get("requires") or []:
+        if not avail.get(need):
+            return CALLEND_NEEDS.get(need, "needs %s" % need)
+    for bar in row.get("unless") or []:
+        if avail.get(bar):
+            return CALLEND_UNLESS.get(bar, "not while %s" % bar)
+    only = [str(x) for x in (row.get("only_after") or [])]
+    if only and not set(only) & set(prev_keys or ()):
+        return "only after %s" % " or ".join(only)
+    return ""
+
+
+def _callend_spec(table, cat, item):
+    """An item with what its category says and it does not (a default offer, `within`)."""
+    spec = {k: copy.deepcopy(v) for k, v in cat.items()
+            if k not in ("items", "id", "label", "weight", "enabled", "requires", "unless", "only_after", "emoji")}
+    spec.update(copy.deepcopy(item))
+    spec["table"], spec["category"] = table["id"], cat["id"]
+    spec["category_label"] = cat.get("label") or cat["id"]
+    spec["family"] = table["family"]
+    spec["id"] = str(item.get("id"))
+    spec["label"] = str(item.get("label") or item.get("id"))
+    spec["needs"] = sorted({str(x) for x in list(cat.get("requires") or []) + list(item.get("requires") or [])})
+    return spec
+
+
+def _callend_wheel(conv, tables, family, avail, prev_keys=(), recent=(), pin=None, key="outcome"):
+    """[s3-callend] One weighted draw over a call-end table: table -> category -> item, on
+    the family's own stream. `pin` is the leg's draw as the Segments editor left it: a
+    `fixed` item (the roulette off - recorded as a pin, no number) or a static `category`
+    (the item inside still rolls). Returns (spec, event); spec None when nothing could come
+    up - the event says why, category by category."""
+    before = _snapshot(conv, (conv.get("cursor") or {}).get("initiator"))
+    pin = pin if isinstance(pin, dict) else {}
+    fixed = str(pin.get("fixed") or "")
+    if fixed:
+        for table in tables:
+            for cat in table.get("categories") or []:
+                for k, item in enumerate(cat.get("items") or [] if isinstance(cat, dict) else []):
+                    if not isinstance(item, dict) or fixed not in (str(item.get("id")), "%s:%s" % (table["id"], item.get("id"))):
+                        continue
+                    spec = _callend_spec(table, cat, item)
+                    row = {"id": spec["id"], "label": spec["label"], "base": 1.0, "weight": 1.0, "p": 1.0,
+                           "why": ["pinned by the operator in the segment editor - the roulette is off for this draw"]}
+                    stages = [{"stage": "fixed", "candidates": [row], "excluded": [], "total": 1.0, "draw": None,
+                               "selected": spec["id"], "selected_index": 1, "of": 1}]
+                    sel = {"table": table["id"], "category": cat["id"], "category_label": spec["category_label"],
+                           "id": spec["id"], "label": spec["label"], "text": str(spec.get("text") or ""),
+                           "index": k + 1, "of": len(cat.get("items") or []), "authority": "fixed", "kind": key}
+                    ev = _event(conv, _CALLEND_AT, family, stages, sel, before,
+                                meta={"authority": "fixed", "kind": key,
+                                      "why": "pinned to %s in the segment editor: not a draw" % fixed})
+                    ev["state_after"] = before
+                    return spec, ev
+    only_cat = str(pin.get("category") or "")
+    stream = DrawStream(str(conv["seed"]) + "|callend:" + family)
+    recent = set(recent or ())
+    pool = []
+    for table in tables:
+        cats = []
+        for cat in table.get("categories") or []:
+            if not isinstance(cat, dict) or not str(cat.get("id") or "").strip():
+                continue
+            cwhy = _callend_why_not(cat, avail, prev_keys)
+            if not cwhy and only_cat and cat["id"] != only_cat:
+                cwhy = "the node is pinned to category %s" % only_cat
+            items, excl = [], []
+            for item in cat.get("items") or []:
+                if not isinstance(item, dict) or not str(item.get("id") or "").strip():
+                    continue
+                spec = _callend_spec(table, cat, item)
+                why = cwhy or _callend_why_not(item, avail, prev_keys)
+                try:
+                    base = max(0.0, float(item.get("weight", 1.0) or 0))
+                except (TypeError, ValueError):
+                    base = 0.0
+                f, reasons = 1.0, []
+                for k2, mult in (spec.get("after") if isinstance(spec.get("after"), dict) else {}).items():
+                    if k2 in prev_keys:
+                        try:
+                            m = max(0.0, float(mult))
+                        except (TypeError, ValueError):
+                            continue
+                        reasons.append("after %s x%.2f" % (k2, m))
+                        f *= m
+                if "%s:%s" % (family, spec["id"]) in recent:
+                    reasons.append("came up in a recent call x0.25")
+                    f *= 0.25
+                if why or base * f <= 0:
+                    excl.append({"id": spec["id"], "label": spec["label"], "why": why or "weight 0"})
+                    continue
+                items.append({"id": spec["id"], "label": spec["label"], "base": base, "weight": base * f,
+                              "why": reasons, "spec": spec})
+            mean = (sum(i["weight"] for i in items) / len(items)) if items else 0.0
+            try:
+                cbase = max(0.0, float(cat.get("weight", 1.0) or 0))
+            except (TypeError, ValueError):
+                cbase = 0.0
+            cats.append({"id": str(cat["id"]), "label": str(cat.get("label") or cat["id"]), "base": cbase,
+                         "weight": cbase * mean,
+                         "why": ["mean eligible item weight %.3f" % mean] if items else [cwhy or "no eligible item"],
+                         "items": items, "excluded": excl})
+        live = [c for c in cats if c["weight"] > 0]
+        try:
+            tbase = max(0.0, float(table.get("weight", 1.0) or 0))
+        except (TypeError, ValueError):
+            tbase = 0.0
+        pool.append({"id": table["id"], "label": str(table.get("label") or table["id"]), "base": tbase,
+                     "weight": tbase if live else 0.0, "why": [] if live else ["no eligible outcome"], "cats": cats})
+    live_tables = [t for t in pool if t["weight"] > 0]
+    if not live_tables:
+        why = "; ".join("%s - %s" % (c["label"], (c["why"] or ["no eligible item"])[0])
+                        for t in pool for c in t["cats"])[:500]
+        ev = _event(conv, _CALLEND_AT, family, [], {"id": "NONE", "label": "nothing on the wheel could come up",
+                                                    "kind": key}, before,
+                    meta={"empty": "no eligible outcome in any %s table" % family, "kind": key, "why": why})
+        ev["state_after"] = before
+        return None, ev
+    stages = []
+    if len(live_tables) > 1:
+        d0 = stream.next("%s:table" % family)
+        i = pick_index([t["weight"] for t in live_tables], d0["u"])
+        stages.append(_stage("table", live_tables, i, d0))
+    else:
+        i = 0
+        stages.append(_stage("table", live_tables, 0, None))
+    table = live_tables[i]
+    cats = [c for c in table["cats"] if c["weight"] > 0]
+    d1 = stream.next("%s:category" % family)
+    j = pick_index([c["weight"] for c in cats], d1["u"])
+    stages.append(_stage("category", cats, j, d1, [{"id": c["id"], "label": c["label"], "why": (c["why"] or ["-"])[0]}
+                                                   for c in table["cats"] if c["weight"] <= 0]))
+    cat = cats[j]
+    d2 = stream.next("%s:item" % family)
+    k = pick_index([x["weight"] for x in cat["items"]], d2["u"])
+    stages.append(_stage("item", cat["items"], k, d2, cat["excluded"]))
+    spec = cat["items"][k]["spec"]
+    sel = {"table": table["id"], "category": cat["id"], "category_label": cat["label"], "id": spec["id"],
+           "label": spec["label"], "text": str(spec.get("text") or ""), "index": k + 1, "of": len(cat["items"]),
+           "kind": key}
+    ev = _event(conv, _CALLEND_AT, family, stages, sel, before,
+                meta={"kind": key, "why": ("%s: the wheel over what can come up on this call - %d categor%s in "
+                                           "play, %d outcome(s) on the wheel"
+                                           % (key, len(cats), "y" if len(cats) == 1 else "ies", len(cat["items"])))},
+                rng=d2)
+    ev["state_after"] = before
+    return spec, ev
+
+
+def _callend_seat(conv, what, weights, present, exclude, names, family, label):
+    """Who on the station takes a call-end turn: a weighted draw over the booth seats on
+    this call (its own stream, seed|callend:<family>:<what>). A seat not on the call, the
+    one who spoke the turn before, or a seat at weight 0 is excluded, and says so."""
+    before = _snapshot(conv, (conv.get("cursor") or {}).get("initiator"))
+    weights = weights if isinstance(weights, dict) else {}
+    rows, excl = [], []
+    for seat in CALLEND_STATION:
+        name = str(names.get(seat) or seat)
+        lab = "%s (seat %s)" % (name, seat)
+        try:
+            w = max(0.0, float(weights.get(seat, 1.0 if seat in ("A", "B") else 0.0) or 0))
+        except (TypeError, ValueError):
+            w = 0.0
+        if seat not in present:
+            excl.append({"id": seat, "label": lab,
+                         "why": ("Sam has no seat on this call - the SFX guy speaks through his own node"
+                                 if seat == "S" else "not in the booth on this call")})
+        elif seat in exclude:
+            excl.append({"id": seat, "label": lab, "why": "spoke the turn before - nobody speaks twice in a row"})
+        elif w <= 0:
+            excl.append({"id": seat, "label": lab, "why": "weight 0 on the desk"})
+        else:
+            rows.append({"id": seat, "label": lab, "base": w, "weight": w, "why": []})
+    if not rows:
+        seat = next((s for s in CALLEND_STATION if s in present and s not in exclude),
+                    next((s for s in CALLEND_STATION if s in present), "A"))
+        ev = _event(conv, _CALLEND_AT, family,
+                    [{"stage": "who", "candidates": [], "excluded": excl, "total": 0.0, "draw": None,
+                      "selected": seat, "selected_index": 0, "of": 0,
+                      "rule": "no seat on the wheel could be drawn - %s, the first one free, takes it"
+                              % str(names.get(seat) or seat)}],
+                    {"id": seat, "label": label % str(names.get(seat) or seat), "kind": what}, before,
+                    meta={"kind": what, "why": "no seat on the wheel could be drawn; the first one free takes it"})
+        ev["state_after"] = before
+        return seat, ev
+    d = DrawStream(str(conv["seed"]) + "|callend:%s:%s" % (family, what)).next("%s:%s" % (family, what))
+    i = pick_index([r["weight"] for r in rows], d["u"])
+    seat = rows[i]["id"]
+    ev = _event(conv, _CALLEND_AT, family, [_stage("who", rows, i, d, excl)],
+                {"id": seat, "label": label % str(names.get(seat) or seat), "kind": what}, before,
+                meta={"kind": what, "why": "who on the station takes this turn: the desk's weights by seat, over "
+                                           "the seats on this call"}, rng=d)
+    ev["state_after"] = before
+    return seat, ev
+
+
+def _callend_count(conv, weights, label="the response chain"):
+    """How many station turns the response chain runs (its own stream)."""
+    before = _snapshot(conv, (conv.get("cursor") or {}).get("initiator"))
+    rows = []
+    for k, w in sorted((weights if isinstance(weights, dict) else {}).items(), key=lambda kv: str(kv[0])):
+        try:
+            n, w = int(k), max(0.0, float(w or 0))
+        except (TypeError, ValueError):
+            continue
+        if 1 <= n <= 3 and w > 0:
+            rows.append({"id": str(n), "label": "%d station turn%s" % (n, "" if n == 1 else "s"), "base": w,
+                         "weight": w, "why": []})
+    if not rows:
+        rows = [{"id": "1", "label": "1 station turn", "base": 1.0, "weight": 1.0, "why": ["no weights on the desk"]}]
+    d = DrawStream(str(conv["seed"]) + "|callend:RESOLVE:responses").next("RESOLVE:responses")
+    i = pick_index([r["weight"] for r in rows], d["u"])
+    ev = _event(conv, _CALLEND_AT, "RESOLVE", [_stage("count", rows, i, d)],
+                {"id": rows[i]["id"], "label": "%s: %s" % (label, rows[i]["label"]), "kind": "responses"}, before,
+                meta={"kind": "responses", "why": "how many station turns answer the outcome before the caller's "
+                                                  "rebuttal (the RESOLVE table's `responses`)"}, rng=d)
+    ev["state_after"] = before
+    return int(rows[i]["id"]), ev
+
+
+def _callend_number(conv, raffle):
+    """[RNG] caller: the raffle's caller number, one die over low..high (its own stream)."""
+    before = _snapshot(conv, (conv.get("cursor") or {}).get("initiator"))
+    raffle = raffle if isinstance(raffle, dict) else {}
+    try:
+        low = max(1, int(raffle.get("low") or 2))
+        high = max(low, int(raffle.get("high") or 99))
+    except (TypeError, ValueError):
+        low, high = 2, 99
+    d = DrawStream(str(conv["seed"]) + "|callend:RESOLVE:number").next("RESOLVE:caller_number")
+    n = low + min(high - low, int(d["u"] * (high - low + 1)))
+    ev = _event(conv, _CALLEND_AT, "RESOLVE",
+                [{"stage": "number", "draw": d, "selected": n,
+                  "rule": "caller number = %d + floor(u %.4f x %d) = %d" % (low, d["u"], high - low + 1, n)}],
+                {"id": str(n), "label": "caller number %d" % n, "kind": "raffle"}, before,
+                meta={"kind": "raffle", "low": low, "high": high,
+                      "why": "the raffle's number: the caller who wins it is caller number N, one die over %d to %d"
+                             % (low, high)}, rng=d)
+    ev["state_after"] = before
+    return n, ev
+
+
+def _callend_prize_pool(config, prize):
+    """The station's own prize list: the desk's POOLS1 category (e.g. call.prizes - the list
+    the station's prize roll draws from), or the list that roll starts from until tabled."""
+    prize = prize if isinstance(prize, dict) else {}
+    key = str(prize.get("pool") or "call.prizes")
+    for t in config.get("tables") or []:
+        if not isinstance(t, dict) or t.get("family") != "POOL" or t.get("enabled") is False:
+            continue
+        for c in t.get("categories") or []:
+            if isinstance(c, dict) and c.get("id") == key:
+                rows = []
+                for i, it in enumerate(c.get("items") or []):
+                    if not isinstance(it, dict) or it.get("enabled") is False or not str(it.get("text") or "").strip():
+                        continue
+                    try:
+                        w = max(0.0, float(it.get("weight", 1.0) or 0))
+                    except (TypeError, ValueError):
+                        w = 0.0
+                    if w > 0:
+                        rows.append({"id": str(it.get("id") or "o%d" % i), "label": " ".join(str(it["text"]).split()),
+                                     "base": w, "weight": w, "why": []})
+                if rows:
+                    return rows, "%s %s (the desk's list)" % (t.get("id"), key)
+    rows = [{"id": "o%d" % i, "label": " ".join(str(x).split()), "base": 1.0, "weight": 1.0, "why": []}
+            for i, x in enumerate(prize.get("defaults") or system3_tables.CALL_PRIZES) if str(x or "").strip()]
+    return rows, "the station's own prize list (%s is not on the desk yet)" % key
+
+
+def _callend_prize(conv, config, prize):
+    """Which of the station's prizes (its own stream)."""
+    before = _snapshot(conv, (conv.get("cursor") or {}).get("initiator"))
+    rows, source = _callend_prize_pool(config, prize)
+    if not rows:
+        return "", None
+    d = DrawStream(str(conv["seed"]) + "|callend:RESOLVE:prize").next("RESOLVE:prize")
+    i = pick_index([r["weight"] for r in rows], d["u"])
+    ev = _event(conv, _CALLEND_AT, "RESOLVE", [_stage("prize", rows, i, d)],
+                {"id": rows[i]["id"], "label": "wins %s" % rows[i]["label"], "kind": "prize"}, before,
+                meta={"kind": "prize", "why": "which prize: %s - no prize outside it" % source}, rng=d)
+    ev["state_after"] = before
+    return rows[i]["label"], ev
+
+
+def _callend_title(name):
+    """A gallery file's name as something a person can say ("harbour at dawn")."""
+    stem = re.sub(r"\.(png|jpe?g|webp|gif|mp4|webm)$", "", str(name or ""), flags=re.I)
+    stem = re.sub(r"[_\-]+", " ", stem)
+    stem = " ".join(re.sub(r"\b\d{3,}\b", "", stem).split())
+    return stem[:80]
+
+
+def _callend_painting_words(painting):
+    """{painting}, {price} and {terms} for the writer, from what the station put on offer."""
+    p = painting if isinstance(painting, dict) else {}
+    title = str(p.get("title") or "").strip()
+    if not title or re.search(r"\.(png|jpe?g|webp|gif)$", title, re.I) or "_" in title:
+        title = _callend_title(title or p.get("image"))
+    if re.search(r"\b(turbo|comfyui|comfy|flux|sdxl|ernie|image)\b", title, re.I):
+        title = ""                     # a generator's name is not a title
+    desc = " ".join(str(p.get("desc") or "").split())
+    words = ('"%s"' % title) if title else "the painting"
+    if desc:
+        words += " (%s)" % sentence_cut(desc, 160).rstrip(".")
+    try:
+        price = int(float(p.get("price") or 0))
+    except (TypeError, ValueError):
+        price = 0
+    return {"painting": words, "price": ("%d dollars" % price) if price > 0 else "the price it was going for",
+            "terms": " ".join(str(p.get("terms") or "").split())[:120]}
+
+
+def _call_mid_seat(leg, k, fill_n, last_mid):
+    """The seat of the k-th middle turn: alternating back from the closing, so the last
+    middle turn is `last_mid` (a host before a caller who lands it; the caller before a
+    station seat that opens the call's end)."""
+    seat = leg.get("seat")
+    if seat == "alternate":
+        seat = last_mid if (fill_n - 1 - k) % 2 == 0 else ("C" if last_mid == "A" else "A")
+    return seat
+
+
+def _callend_close(conv, config, inputs, opening, middle, closing, want):
+    """[s3-callend] The call's closing legs, rolled before its turns: the caller's wheel
+    (RESOLVE: the outcome, its caller number or prize), the response chain's length, who
+    sets the outcome up and who answers it. Returns ([(leg, seat)], last_mid) - the closing
+    in the structure's order and the seat the middle must end on. A closing with no `end`
+    legs is returned as it was, and nothing is rolled."""
+    call = inputs.get("call") or {}
+    roles = [(leg, _callend_role(leg)) for leg in closing]
+    ce = {"planned": False, "events": []}
+    conv["callend"] = ce
+    if not any(r for _leg, r in roles):
+        return [(leg, leg.get("seat")) for leg in closing], "A"
+    names = {p["actor_id"]: p.get("name") or p["actor_id"] for p in conv["participants"]}
+    seats_in = [p["actor_id"] for p in conv["participants"]]
+    present = [s for s in CALLEND_STATION if s in seats_in or (s == "B" and call.get("other"))]
+    if "B" in present and "B" not in names and call.get("other"):
+        names["B"] = str(call.get("other"))
+    ce.update(present=present, names={s: names.get(s, s) for s in present})
+    painting = call.get("painting") if isinstance(call.get("painting"), dict) and call["painting"].get("image") else None
+    avail = {"painting": bool(painting)}
+    recent = set(str(x) for x in (inputs.get("recent_items") or []))
+    spec, table = None, None
+    res_leg = next((leg for leg, r in roles if r == "resolution"), None)
+    if res_leg is not None:
+        tables = _callend_tables(config, "RESOLVE")
+        if tables:
+            pin = next((d for d in res_leg.get("draws") or [] if isinstance(d, dict) and d.get("family") == "RESOLVE"),
+                       None)
+            spec, ev = _callend_wheel(conv, tables, "RESOLVE", avail, (), recent, pin, "outcome")
+            ce["events"].append({"event_id": ev["event_id"], "role": "resolution", "family": "RESOLVE"})
+            table = next((t for t in tables if spec and t["id"] == spec["table"]), None)
+        else:
+            ce["why"] = "no RESOLVE table is switched on for calls - the caller lands it as before"
+    n_resp = 0
+    if spec:
+        res = {"table": spec["table"], "category": spec["category"], "category_label": spec["category_label"],
+               "id": spec["id"], "label": spec["label"], "tags": [str(x) for x in spec.get("tags") or []],
+               "effect": str(spec.get("effect") or "") if str(spec.get("effect") or "") in (
+                   "sold", "awarded", "burnt", "unsold") else "",
+               "offer": str(spec.get("offer") or ""), "text": str(spec.get("text") or ""),
+               "respond": str(spec.get("respond") or ""), "rebuttal": str(spec.get("rebuttal") or ""),
+               "emotions": dict(spec.get("emotions") or {}) if isinstance(spec.get("emotions"), dict) else {},
+               "event_id": ce["events"][-1]["event_id"]}
+        if painting and "painting" in (spec.get("needs") or []):
+            res["painting"] = {k: painting.get(k) for k in ("image", "title", "desc", "price", "terms", "kind",
+                                                            "at", "age", "why") if painting.get(k) not in (None, "")}
+        if isinstance(spec.get("raffle"), dict):
+            res["number"], ev = _callend_number(conv, spec["raffle"])
+            ce["events"].append({"event_id": ev["event_id"], "role": "resolution", "family": "RESOLVE"})
+        if isinstance(spec.get("prize"), dict):
+            res["prize"], ev = _callend_prize(conv, config, spec["prize"])
+            if ev is not None:
+                ce["events"].append({"event_id": ev["event_id"], "role": "resolution", "family": "RESOLVE"})
+        if spec.get("speakerbox"):
+            res["speakerbox"] = str(spec.get("speakerbox"))
+        ce["resolve"] = res
+        if any(r == "response" for _leg, r in roles):
+            n_resp, ev = _callend_count(conv, spec.get("responses") if isinstance(spec.get("responses"), dict)
+                                        else (table or {}).get("responses") or {"1": 1.0})
+            ce["events"].append({"event_id": ev["event_id"], "role": "resolution", "family": "RESOLVE"})
+    # the closing in the structure's order: no outcome, no resolution, reaction or chain
+    plan = []
+    for leg, role in roles:
+        if role in ("resolution", "reaction", "response") and not spec:
+            continue
+        plan += [(leg, role)] * (n_resp if role == "response" else 1)
+    if not plan:
+        return [], "A"
+    first = plan[0]
+    opens_station = (first[1] in ("resolution", "response", "wrap")
+                     or (not first[1] and str(first[0].get("seat") or "A") not in ("C", "E")))
+    last_mid = "C" if opens_station else "A"
+    fill_n = max(0, want - len(opening) - len(plan)) if middle else 0
+    prev = (_call_mid_seat(middle[(fill_n - 1) % len(middle)], fill_n - 1, fill_n, last_mid) if fill_n
+            else (str(opening[-1].get("seat") or "") if opening else ""))
+    weights = (spec or {}).get("responders") if isinstance((spec or {}).get("responders"), dict) \
+        else (table or {}).get("responders") or {}
+    out = []
+    n_seen = 0
+    for leg, role in plan:
+        if role == "resolution":
+            seat, ev = _callend_seat(conv, "setup", weights, present, {prev}, names, "RESOLVE",
+                                     "%s sets up the outcome")
+            ce["setup"] = {"seat": seat, "event_id": ev["event_id"]}
+            ce["events"].append({"event_id": ev["event_id"], "role": "resolution", "family": "RESOLVE"})
+        elif role == "response":
+            n_seen += 1
+            seat, ev = _callend_seat(conv, "responder%d" % n_seen, weights, present, {prev}, names, "RESOLVE",
+                                     "%s answers it (response " + str(n_seen) + ")")
+            ce.setdefault("responses", []).append({"seat": seat, "event_id": ev["event_id"]})
+            ce["events"].append({"event_id": ev["event_id"], "role": "response", "n": n_seen, "family": "RESOLVE"})
+        else:
+            seat = str(leg.get("seat") or "A")
+        out.append((leg, seat))
+        prev = seat
+    ce["planned"] = bool(spec) or ce.get("planned", False)
+    return out, last_mid
+
+
+def _callend_wrap(conv, config, inputs, seq, ends_at):
+    """[s3-callend] WRAP CALL, rolled once the call's length is known: the dead-line wheel
+    for a call a CALLEVENT1 ending cut short, the way a finished call is wrapped otherwise,
+    tilted by what the caller's wheel landed on (`only_after`, `after`); then who on the
+    station says it. Returns seq with the wrap turn's seat set. Also marks the outcome CUT
+    when the line went dead before the caller played it out, and where each end turn sits."""
+    ce = conv.get("callend")
+    if not isinstance(ce, dict):
+        return seq
+    at = {"responses": []}
+    for i, (leg, _seat) in enumerate(seq):
+        role = _callend_role(leg)
+        if role == "response":
+            at["responses"].append(i)
+        elif role:
+            at[role] = i
+    ce["at"] = at
+    res = ce.get("resolve") or {}
+    if res and ends_at is not None and not (at.get("reaction") is not None and at["reaction"] < ends_at):
+        res["cut"] = ("the line went dead on turn %d, before %s played it out"
+                      % (int(ends_at) + 1, str((conv["inputs"].get("call") or {}).get("first") or "the caller")))
+        for e in conv["decision_events"]:
+            if e["event_id"] in [x["event_id"] for x in ce.get("events") or []]:
+                e.setdefault("meta", {})["cut"] = res["cut"]
+    w = at.get("wrap")
+    if w is None or w != len(seq) - 1:
+        return seq
+    tables = _callend_tables(config, "WRAP")
+    if not tables:
+        ce["wrap"] = {"planned": False, "why": "no WRAP table is switched on for calls - a spoken sign-off"}
+        return seq
+    leg = seq[w][0]
+    pin = next((d for d in leg.get("draws") or [] if isinstance(d, dict) and d.get("family") == "WRAP"), None)
+    avail = {"dead_line": ends_at is not None}
+    prev_keys = set()
+    if res and not res.get("cut"):
+        prev_keys |= {"RESOLVE:%s" % res.get("id"), "RESOLVE:%s" % res.get("category")}
+        prev_keys |= {"tag:%s" % t for t in res.get("tags") or []}
+    recent = set(str(x) for x in (inputs.get("recent_items") or []))
+    spec, ev = _callend_wheel(conv, tables, "WRAP", avail, prev_keys, recent, pin, "how")
+    ce["events"].append({"event_id": ev["event_id"], "role": "wrap", "family": "WRAP"})
+    if not spec:
+        ce["wrap"] = {"planned": False, "why": (ev.get("meta") or {}).get("why") or "nothing on the wheel",
+                      "event_id": ev["event_id"]}
+        return seq
+    table = next((t for t in tables if t["id"] == spec["table"]), {})
+    names = dict(ce.get("names") or {})
+    before_seat = str(seq[w - 1][1]) if w > 0 else ""
+    who, wev = _callend_seat(conv, "who", table.get("who") if isinstance(table.get("who"), dict) else {},
+                             ce.get("present") or ["A"], {before_seat}, names, "WRAP", "%s wraps the call")
+    ce["events"].append({"event_id": wev["event_id"], "role": "wrap", "family": "WRAP"})
+    ce["wrap"] = {"planned": True, "table": spec["table"], "category": spec["category"], "id": spec["id"],
+                  "label": spec["label"], "text": str(spec.get("text") or ""), "polite": bool(spec.get("polite")),
+                  "rebuttal": str(spec.get("rebuttal") or ""), "seat": who, "who": str(names.get(who) or who),
+                  "dead_line": ends_at is not None, "event_id": ev["event_id"], "who_event_id": wev["event_id"]}
+    ce["planned"] = True
+    seq = list(seq)
+    seq[w] = (leg, who)
+    return seq
+
+
+def _callend_words(conv, role, seat):
+    """The words a call-end leg's act is filled with ({offer}, {outcome}, {respond},
+    {rebuttal}, {wrap}, {wrapper} ...), every one of them out of a roll - or, with
+    nothing rolled, the protocol the station's checker has always listened for."""
+    ce = conv.get("callend") or {}
+    call = (conv.get("inputs") or {}).get("call") or {}
+    res = ce.get("resolve") or {}
+    wrap = ce.get("wrap") or {}
+    pw = _callend_painting_words(res.get("painting"))
+    base = {"resolution": res.get("label") or "", "painting": pw["painting"], "price": pw["price"],
+            "terms": pw["terms"], "number": str(res.get("number") or ""), "prize": str(res.get("prize") or "")}
+
+    def fill(text):
+        return " ".join(_call_words(text, call, base).split()).rstrip(" .")
+
+    words = dict(base)
+    words["offer"] = fill(res.get("offer") or ("sets up how it ends for {first}: %s" % (res.get("label") or "")))
+    words["outcome"] = fill(res.get("text") or "{FIRST} plays it out")
+    words["respond"] = fill(res.get("respond") or CALLEND_RESPOND)
+    rebuttal = fill(res.get("rebuttal") or (CALLEND_REBUTTAL if res and not res.get("cut") else CALLEND_LANDS))
+    if wrap.get("planned") and wrap.get("rebuttal"):
+        rebuttal += " - " + fill(wrap["rebuttal"])
+    words["rebuttal"] = rebuttal
+    words["wrap"] = fill(wrap["text"]) if wrap.get("planned") and wrap.get("text") else CALLEND_SIGN_OFF
+    names = dict(ce.get("names") or {})
+    words["wrapper"] = str(names.get(seat) or ("the host" if seat == "A" else "one of the hosts"))
+    return words
+
+
+def _callend_emotions(conv, idx):
+    """[s3-callend] The caller's wheel leans the feeling the caller plays it out in."""
+    ce = conv.get("callend") or {}
+    res = ce.get("resolve") or {}
+    if res.get("emotions") and (ce.get("at") or {}).get("reaction") == idx:
+        out = {}
+        for k, v in res["emotions"].items():
+            try:
+                out[str(k)] = float(v)
+            except (TypeError, ValueError):
+                pass
+        return out
+    return {}
+
+
+def _callend_attach(conv, config):
+    """[s3-callend] Land the call-end rolls on their turns (the Rolodex pairs them with the
+    legs' draws), put the outcome and the wrap on the turns' decisions, ask for the
+    passage a speakerbox rejection is said in (on the caller's turn; the station's own
+    rotation picks the document), and write the call's end in one line (`says`)."""
+    ce = conv.get("callend")
+    if not isinstance(ce, dict) or not ce.get("events"):
+        return
+    turns = conv["turns"]
+    by_role = {}
+    for t in turns:
+        role = (t.get("callend") or {}).get("role")
+        if role:
+            by_role.setdefault(role, []).append(t)
+    events = {e["event_id"]: e for e in conv["decision_events"]}
+    for x in ce.get("events") or []:
+        pool = by_role.get(x["role"]) or []
+        t = pool[x["n"] - 1] if x.get("n") and len(pool) >= x["n"] else (pool[0] if pool else None)
+        ev = events.get(x["event_id"])
+        if t is not None and ev is not None:
+            ev["turn_id"], ev["turn_index"] = t["turn_id"], t["index"]
+    res = ce.get("resolve") or {}
+    wrap = ce.get("wrap") or {}
+    rt = (by_role.get("resolution") or [None])[0]
+    if rt is not None and res.get("event_id"):
+        rt["decisions"].append({"family": "RESOLVE", "event_id": res["event_id"], "table": res.get("table"),
+                                "category": res.get("category"), "item": res.get("id"), "label": res.get("label"),
+                                "text": res.get("text", "")})
+    wt = (by_role.get("wrap") or [None])[0]
+    if wt is not None and wrap.get("planned"):
+        wt["decisions"].append({"family": "WRAP", "event_id": wrap["event_id"], "table": wrap.get("table"),
+                                "category": wrap.get("category"), "item": wrap.get("id"), "label": wrap.get("label"),
+                                "text": wrap.get("text", "")})
+        wt["callend"]["wrap"] = {"seat": wrap.get("seat"), "polite": bool(wrap.get("polite"))}
+    reaction = (by_role.get("reaction") or [None])[0]
+    if reaction is not None and res.get("speakerbox") and not res.get("cut"):
+        before = _snapshot(conv, reaction["speaker"])
+        sb = config.get("speakerbox") or DEFAULT_SPEAKERBOX
+        ev = _event(conv, {"turn_id": reaction["turn_id"], "turn_index": reaction["index"]}, "SPEAKERBOX", [],
+                    {"id": "APPEND", "label": "the caller turns it down in a speakerbox passage, word for word",
+                     "mark": "callend"}, before,
+                    meta={"mark": "callend", "applies": True, "drawn": False,
+                          "why": "the caller's wheel landed on %s: the passage is their answer, word for word - the "
+                                 "station's own rotation picks the document" % json.dumps(res.get("label") or ""),
+                          "insertion_point": "the whole of turn %d" % (reaction["index"] + 1),
+                          "decided_by": res.get("event_id")})
+        ev["state_after"] = before
+        rec = {"mark": "callend", "mode": "APPEND", "applies": True, "event_id": ev["event_id"],
+               "request_id": "%s:sbc" % reaction["turn_id"],
+               "why": "the rejection the caller's wheel rolled is a speakerbox passage said word for word"}
+        reaction.setdefault("speakerbox", []).append(rec)
+        conv["material_requests"].append({
+            "request_id": rec["request_id"], "kind": "speakbox", "turn_id": reaction["turn_id"],
+            "turn_index": reaction["index"], "mode": "APPEND", "event_id": ev["event_id"], "callend": True,
+            "chars": int(sb.get("passage_chars", 420)), "resolved": None})
+    for t in turns:
+        if (t.get("callend") or {}).get("role"):
+            src = [x["event_id"] for x in t["decisions"]] + [x["event_id"] for x in t.get("speakerbox") or []] + \
+                  [(t.get("sfx") or {}).get("event_id")]
+            if (t.get("sfxguy") or {}).get("event_id"):
+                src.append(t["sfxguy"]["event_id"])
+            t["decision_bundle_id"] = "%s:b%s" % (t["turn_id"], digest(src, 8))
+    ce["says"] = callend_says(conv)
+
+
+def callend_says(conv):
+    """The call's end in one line, as it was rolled."""
+    ce = conv.get("callend") or {}
+    call = (conv.get("inputs") or {}).get("call") or {}
+    first = str(call.get("first") or "the caller")
+    names = dict(ce.get("names") or {})
+    res = ce.get("resolve") or {}
+    wrap = ce.get("wrap") or {}
+    bits = []
+    if res:
+        what = "the caller's wheel landed on %s" % json.dumps(res.get("label") or "")
+        extra = []
+        if res.get("painting"):
+            extra.append("the painting: %s" % _callend_painting_words(res["painting"])["painting"])
+        if res.get("number"):
+            extra.append("caller number %s" % res["number"])
+        if res.get("prize"):
+            extra.append("the prize: %s" % res["prize"])
+        if extra:
+            what += " (%s)" % "; ".join(extra)
+        if res.get("cut"):
+            what += " - but %s" % res["cut"]
+        bits.append(what)
+        chain = [str(names.get(r.get("seat")) or r.get("seat")) for r in ce.get("responses") or []]
+        if chain and not res.get("cut"):
+            bits.append("%s answer%s it" % (" then ".join(chain), "" if len(chain) > 1 else "s"))
+            bits.append("%s gets the last word" % first)
+    if wrap.get("planned"):
+        bits.append("%s wraps the call: %s" % (wrap.get("who") or wrap.get("seat") or "the host",
+                                               _call_words(wrap.get("text") or wrap.get("label") or "", call).rstrip(".")))
+    return "; ".join(bits)[:600]
+
+
+def callend_mark(conv):
+    """[s3-callend] What the station keeps of a planned call's end, on the call's meta:
+    the checker keys on it (the WRAP CALL node is the sign-off, whatever its words), the
+    booth and the call log say it, and the topic contract leaves the call's end out.
+    None when nothing was rolled."""
+    ce = conv.get("callend") or {}
+    if not ce.get("planned"):
+        return None
+    res = ce.get("resolve") or {}
+    wrap = ce.get("wrap") or {}
+    at = ce.get("at") or {}
+    turns = conv.get("turns") or []
+    start = min([i for i in [at.get("resolution"), at.get("reaction"), at.get("rebuttal"), at.get("wrap")]
+                 + list(at.get("responses") or []) if isinstance(i, int)] or [len(turns)])
+    wt = next((t for t in turns if (t.get("callend") or {}).get("role") == "wrap"), None)
+    painting = res.get("painting") or {}
+    return {
+        "planned": True, "by": "system3", "conversation_id": conv["identity"]["conversation_id"],
+        "resolve": ({"id": res.get("id"), "label": res.get("label"), "category": res.get("category"),
+                     "table": res.get("table"), "effect": res.get("effect") or "", "tags": list(res.get("tags") or []),
+                     "number": res.get("number"), "prize": res.get("prize") or "",
+                     "speakerbox": bool(res.get("speakerbox")), "cut": str(res.get("cut") or ""),
+                     "painting": ({k: painting.get(k) for k in ("image", "title", "price", "kind")
+                                   if painting.get(k) not in (None, "")} if painting else {})}
+                    if res else {}),
+        "wrap": ({"planned": True, "id": wrap.get("id"), "label": wrap.get("label"), "polite": bool(wrap.get("polite")),
+                  "seat": wrap.get("seat"), "who": wrap.get("who"), "dead_line": bool(wrap.get("dead_line")),
+                  "turn_id": (wt or {}).get("turn_id", "")}
+                 if wrap.get("planned") else {"planned": False}),
+        "turns": len(turns), "end_turns": max(0, len(turns) - start), "says": ce.get("says") or callend_says(conv),
+    }
+
+
+def _callend_row(t):
+    """What a call-end row adds on the running order: the passage a rejection is said in,
+    word for word, and a wrap that is no goodbye said as such."""
+    ce = t.get("callend") or {}
+    if not ce.get("role"):
+        return ""
+    add = ""
+    for sb in t.get("speakerbox") or []:
+        if sb.get("mark") != "callend":
+            continue
+        mat = sb.get("material") or {}
+        if mat.get("text"):
+            add += " [THE PASSAGE, said word for word as their whole answer: %s]" % json.dumps(
+                sentence_cut(mat["text"], 420))
+        else:
+            add += " [No passage came back for it: they turn it down in words of their own, flat as a quotation.]"
+    if ce.get("role") == "wrap" and (ce.get("wrap") or {}).get("seat") and not (ce.get("wrap") or {}).get("polite"):
+        add += " [It ends the way it was rolled - this need not be a polite goodbye.]"
+    return add
+
+
+def _callend_tail(conv, tail):
+    """The call sheet's closing words, when a WRAP CALL was rolled."""
+    return CALLEND_TAIL if ((conv.get("callend") or {}).get("wrap") or {}).get("planned") else tail
+
+
 def road_structure(config, road):
     """[s3-calls] The structure System 3 builds `road` from: the config's own,
     else the default (a config saved before road structures has none)."""
@@ -2753,15 +3946,14 @@ def plan_call(conv, config, inputs=None):
     closing = [x for x in legs if x.get("place") == "close"]
     lo, hi = int(st.get("min_turns") or 9), int(st.get("max_turns") or 22)
     want = max(lo, min(int(inputs.get("turns") or 0) or 10, hi))
+    # [s3-callend] the call's end is rolled first, on its own streams: how many turns it takes
+    closing, _last_mid = _callend_close(conv, config, inputs, opening, middle, closing, want)
     fill_n = max(0, want - len(opening) - len(closing)) if middle else 0
     seq = [(leg, leg.get("seat")) for leg in opening]
     for k in range(fill_n):
         leg = middle[k % len(middle)]
-        seat = leg.get("seat")
-        if seat == "alternate":
-            seat = "A" if (fill_n - 1 - k) % 2 == 0 else "C"
-        seq.append((leg, seat))
-    seq += [(leg, leg.get("seat")) for leg in closing]
+        seq.append((leg, _call_mid_seat(leg, k, fill_n, _last_mid)))
+    seq += list(closing)
     # [s3-events] what happens on this call - before its turns, so a call the
     # roulette ends (the line lost, the caller pulled away) is planned short:
     # up to the turn it ends on, then a host reacting to the dead line
@@ -2774,6 +3966,7 @@ def plan_call(conv, config, inputs=None):
         seq = seq[:_ev["ends_at"] + 1] + (_host_close[-1:] or [(
             {"id": "after_end", "label": "After the line drops", "place": "close", "seat": "A",
              "act": EVENT_AFTER, "draws": [{"family": "ES"}]}, "A")])
+    seq = _callend_wrap(conv, config, inputs, seq, _ev["ends_at"])                  # [s3-callend] WRAP CALL
     want = len(seq)
     conv["timing"]["turn_budget"] = want
     conv["call_structure"] = {"id": st.get("id"), "version": st.get("version"), "head": st.get("head", ""),
@@ -2791,14 +3984,21 @@ def plan_call(conv, config, inputs=None):
         if seat not in seats:
             conv["participants"].append(new_conversation({"seats": [seat]}, config, conv["settings"])["participants"][0])
             seats.append(seat)
-        step = {"id": leg.get("id"), "label": leg.get("label") or leg.get("id"), "draws": leg.get("draws") or [{"family": "ES"}]}
+        step = {"id": leg.get("id"), "label": leg.get("label") or leg.get("id"),
+                "draws": [d for d in (leg.get("draws") or []) if (d or {}).get("family")   # [s3-callend] own streams
+                          not in system3_tables.CALLEND_FAMILIES] or [{"family": "ES"}]}
         turn = _decide_turn(conv, config, conv["settings"], stream, step, seat, want, inputs)
-        turn["protocol"] = _call_words(leg.get("act"), call)[:400]
+        _end = _callend_role(leg)
+        turn["protocol"] = (_call_words(leg.get("act"), call, _callend_words(conv, _end, seat))[:700] if _end
+                            else _call_words(leg.get("act"), call)[:400])
+        if _end:
+            turn["callend"] = {"role": _end}
         turn["leg"] = leg.get("id")
         turn["place"] = leg.get("place")
     conv["draws"] = stream.n
     _events_attach(conv)                                                        # [s3-events]
     _cast_rolls(conv, config, conv["settings"], inputs)                         # [s3-cast]
+    _callend_attach(conv, config)                                               # [s3-callend]
     return conv
 
 
@@ -2815,12 +4015,13 @@ def render_call_sheet(conv):
     rows = []
     material_at = max([i for i, t in enumerate(turns) if t.get("place") == "open"] or [0])
     for i, t in enumerate(turns):
-        add = _leg_row_add(t)
+        add = _leg_row_add(t) + _callend_row(t)                               # [s3-callend]
         rows.append("%2d  %s  - %s%s" % (t["index"] + 1, t["speaker"], t.get("protocol") or "keeps it going.", add))
         if i == material_at and call.get("speakerbox") and st.get("material"):
             rows.append(_call_words(st["material"], call, {"passage": json.dumps(sentence_cut(call["speakerbox"], 300))}))
     head = _call_words(st.get("head") or "", call, {"caller_turns": max(3, int(len(turns) * share))})
     tail = st.get("tail") or ""
+    tail = _callend_tail(conv, tail)                                          # [s3-callend] the rolled ending
     if conv.get("event_end") is not None:                                   # [s3-events]
         tail = ("This call ENDS EARLY, on the turn the running order says: the line goes dead partway through "
                 "it, and a host reacts to that on the last turn. The caller does not land their story and nobody "

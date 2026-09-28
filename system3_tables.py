@@ -807,7 +807,16 @@ DEFAULT_BLOCKS = {
     "accent": {"kind": "obligation", "label": "The accent directive", "helper": "accent_directive"},
     "context": {"kind": "obligation", "label": "The record's facts", "helper": "dj_line context"},
     "aside": {"kind": "obligation", "label": "A speakerbox passage to work in", "helper": "speakbox_aside"},
-    "show_memory": {"kind": "obligation", "label": "Tonight so far (show memory)", "helper": "show_memory"},
+    # [s3-memory] on a round a MEMORY roll stands behind, show_memory carries only the
+    # memory block below - exactly the items the roll drew (nothing drawn: nothing sent).
+    # The old "Tonight so far" digest rides only a prompt no MEMORY roll stands behind:
+    # System 3 off, a road it did not plan, the MEMORY table switched off.
+    "show_memory": {"kind": "obligation", "label": "Tonight so far (show memory) - on a System 3 round, only the memory block",
+                    "helper": "show_memory"},
+    "memory": {"kind": "obligation", "label": "What the writer is reminded of (the MEMORY roll's items)",
+               "helper": "system3_memory_block",
+               "what": "exactly the items the MEMORY roll drew: each kind's rule decides whether it is relevant, "
+                       "the roulette which of the relevant ones are sent"},
     "avoid_reruns": {"kind": "obligation", "label": "Words and lines not to repeat", "helper": "avoid_reruns"},
     "crystal": {"kind": "tint", "label": "The crystal's lines", "helper": "crystal_tint_note / crystal_clause"},
     "paper": {"kind": "obligation", "label": "The Gazette's discussion", "helper": "paper_discussion_context"},
@@ -844,6 +853,310 @@ POOL_FAMILIES = ("FAV", "DIRECTIVE", "CHANCE", "POOL")
 
 DEFAULT_TABLES = [CTS1, ES1, RS1, RS2, IRS1, IRS2, FL1, FL2, TEMPER1, SHOCK1, INTERJECT1, FAV1, DIRECTIVE1, CALLEVENT1,
                   STATION1, POOLS1, SBEND1]
+
+# --- MEMORY1: what the writer is reminded of - rules, then roulette -------------------
+#
+# [s3-memory] 2026-09-28, the operator's guide: memory context is given ONLY WHEN
+# RELEVANT - the clock, a synopsis of the last topic, the last segment and how it
+# went, the callers this hour against the quota, a synopsis of the manager's last
+# message. Asked how: "Rules, then roulette." Each category is one kind of memory.
+# Its `rule` holds the numbers (minutes, margins) and switches that decide whether
+# it is relevant to the round being planned right now - a kind that is not is
+# recorded with why - and the roulette then draws among the relevant ones by
+# weight: at least `least`, at most `most` a round (how many is itself a die when
+# the two differ). An item is one way of putting that memory to the writer:
+# `when` names the state of the rule it fits (the top of the hour, a subject
+# carried on or turned from, behind or ahead of the quota ...) and a die picks
+# among the items that fit. {words} in its text are the station's facts. The
+# items drawn reach the writer as ONE prompt block ("memory") and nothing else of
+# the old "Tonight so far" rides a round a MEMORY roll stands behind. A round
+# written now to air later (banked) is told none of it unless a rule's
+# `on_banked` switch says otherwise: by the time it is heard, it would be stale.
+# A kind may be kept to some roads (`roads` on its category; none = every road).
+MEMORY1 = {
+    "id": "MEMORY1", "family": "MEMORY", "label": "Memory context (what the writer is reminded of)",
+    "version": 1, "enabled": True, "weight": 1.0, "least": 1, "most": 2,
+    "description": "What the writer is reminded of, only when it is relevant. Each kind's rule decides whether it "
+                   "is eligible for the round being planned (its numbers are below); the roulette then draws among "
+                   "the eligible kinds - at least `least`, at most `most` a round - and the items drawn are the "
+                   "round's memory block, word for word.",
+    "categories": [
+        {"id": "clock", "label": "The clock", "weight": 1.0,
+         "rule": {"before_top": 5, "after_top": 3, "segment_left": 2, "on_banked": False},
+         "items": _items([
+             {"id": "top", "label": "The top of the hour is near", "when": "top",
+              "text": "it is {clock}, {to_top} to the top of the hour"},
+             {"id": "past", "label": "The hour has just turned", "when": "past",
+              "text": "it is {clock} - the {hour} hour has only just begun"},
+             {"id": "segment_end", "label": "The segment is nearly up", "when": "segment",
+              "text": "it is {clock}, and {segment} has about {segment_left} left to run"},
+         ])},
+        {"id": "last_topic", "label": "The last topic", "weight": 1.0,
+         "rule": {"within_minutes": 30, "continues_overlap": 2, "continues": True, "contrasts": True,
+                  "on_banked": False},
+         "items": _items([
+             {"id": "carry_on", "label": "This round carries it on", "when": "continues",
+              "text": "this carries on from the last subject on air - {synopsis}"},
+             {"id": "turn_away", "label": "This round turns away from it", "when": "contrasts",
+              "text": "the last subject on air was {synopsis} - this round is on something else, and they can "
+                      "say as much as they turn to it"},
+         ])},
+        {"id": "last_segment", "label": "The last segment and how it went", "weight": 1.0,
+         "rule": {"within_minutes": 15, "first_minutes": 4, "rough_share": 0.34, "smooth": True, "rough": True,
+                  "on_banked": False},
+         "items": _items([
+             {"id": "went_off", "label": "It went off as planned", "when": "smooth",
+              "text": "the segment before this one, {segment}, went off as planned - {went}"},
+             {"id": "went_wrong", "label": "It did not go to plan", "when": "rough",
+              "text": "the segment before this one, {segment}, did not go to plan - {went}"},
+         ])},
+        {"id": "callers_quota", "label": "Callers this hour against the quota", "weight": 1.0,
+         "rule": {"after_minutes": 15, "margin": 1, "behind": True, "ahead": True, "on_banked": False},
+         "items": _items([
+             {"id": "behind", "label": "Behind - and it shows", "when": "behind",
+              "text": "the phones: {calls} in the last hour against {quota} an hour - they are behind on callers "
+                      "and it is starting to show"},
+             {"id": "behind_plea", "label": "Behind - the line needs ringing", "when": "behind",
+              "text": "the phones: {calls} in the last hour against {quota} an hour - the request line needs "
+                      "ringing, and they can say so"},
+             {"id": "ahead", "label": "Ahead of it", "when": "ahead",
+              "text": "the phones: {hour_calls} since the top of the hour against {quota} an hour - the callers are "
+                      "ahead of the quota tonight"},
+         ])},
+        {"id": "manager_note", "label": "The manager's last word", "weight": 1.0,
+         "rule": {"within_minutes": 20, "on_banked": False},
+         "items": _items([
+             {"id": "word", "label": "His last word", "when": "fresh",
+              "text": "the manager's last word from upstairs, {ago} ago: {said}"},
+             {"id": "hanging", "label": "Still hanging over the booth", "when": "fresh",
+              "text": "the manager's last word from upstairs ({ago} ago) is still hanging over the booth: {said}"},
+         ])},
+    ],
+}
+DEFAULT_TABLES.append(MEMORY1)          # [s3-memory] added to a stored config once (add_missing_default_tables)
+
+
+# --- [s3-callend] HOW A CALL ENDS: RESOLVE1 (the caller's wheel) and WRAP1 -----------
+#
+# 2026-09-28, the operator: "a resolution node with an RNG for setting up how a phone
+# call is wrapped up ... customers roll a wheel for how their call is ended. If the
+# last segment was selling a painting than in the roulette we want to offer options
+# for the caller ... these should have a response chain that follows + a rebuttal
+# from the caller before the call ends by somone one the station ending the call in
+# response to the customer "wrap call" roulette node".
+#
+# The call's end is five legs of the caller structure (CALLEND_LEGS, each with an
+# `end` role): the RESOLUTION (a station seat sets it up - the offer, the raffle, the
+# price - and the caller plays it out on the REACTION), the RESPONSE CHAIN (one or
+# two station turns: how many and who answers are rolled), the caller's REBUTTAL
+# (their last word, second to last) and WRAP CALL (who on the station ends the call
+# and how, rolled). Every roll draws on its own stream and is a recorded node.
+#
+# RESOLVE1 - the caller's wheel. A category is eligible by what is in play:
+# `requires` / `unless` name it ("painting" = the last segment sold a painting,
+# within the category's `within` seconds). An item's `offer` is what the station
+# seat does to set it up (a category may carry a default), `text` what the caller
+# does, `respond` what the response chain answers, `rebuttal` the caller's last
+# word; `effect` is what the outcome does to the gallery when the call airs (sold /
+# awarded / burnt take the painting off the pile; unsold leaves it for sale);
+# `raffle` rolls the caller number (low..high); `speakerbox` has the caller say a
+# passage out of the speakerbox word for word (the station's own rotation picks the
+# document); `prize` draws from the station's own prize list (POOLS1 call.prizes,
+# or the list that roll starts from until it is tabled). The table's `responses`
+# weighs the chain's length and `responders` who answers (A the host, B the
+# co-host, D the third seat, S Sam - a seat only a call that carries his has).
+# Text: {first}/{FIRST} the caller, {painting} the piece, {price}, {terms} (the
+# offer's terms, "first caller takes it"), {number} the raffle's caller number,
+# {prize} the prize.
+#
+# WRAP1 - who ends the call (`who`, weighted by seat) and how. `ends` is how a call
+# that ran its course is wrapped; `dead_line` a call a CALLEVENT1 ending cut short
+# (the line lost, the caller pulled away) - a host reacting to the dead line. An
+# item's `polite` says whether it is a spoken goodbye (the station's checker keys on
+# the planned WRAP node, not on the words); `only_after` ties it to resolutions
+# ("RESOLVE:<item>" or "tag:<tag>") and `after` weighs it by them; `rebuttal` is
+# what it does to the caller's last word (cut off mid-word).
+CALLEND_FAMILIES = ("RESOLVE", "WRAP")
+CALLEND_ROLES = ("resolution", "reaction", "response", "rebuttal", "wrap")
+# the station's own prize list - the options dj_call_generated's prize roll (the dice
+# door's call.prizes) starts from; the desk's POOLS1 call.prizes list governs once tabled
+CALL_PRIZES = (
+    "the station's second-best microphone",
+    "a year of the station's coffee, which has been cancelled",
+    "a tour of the building, conducted by whoever is free",
+    "the pick of whatever is in the prize cupboard, sight unseen",
+    "a signed photograph of the two of them, unsigned as yet",
+)
+RESOLVE1 = {
+    "id": "RESOLVE1", "family": "RESOLVE", "label": "Resolution (the caller's wheel: how the call resolves)",
+    "version": 1, "enabled": True, "weight": 1.0, "roads": ["caller"],
+    "responses": {"1": 2.0, "2": 1.0},
+    "responders": {"A": 1.0, "B": 1.0, "D": 0.6, "S": 0.8},
+    "description": "The wheel the caller rolls at the end of a call: how it resolves. The painting wheel only when "
+                   "the last segment sold a painting (within `within` seconds), the general wheel otherwise. A "
+                   "station seat sets it up (offer), the caller plays it out (text), then the response chain "
+                   "(`responses` weighs how many station turns, `responders` who), the caller's rebuttal and the "
+                   "wrap call. {first} is the caller; {painting}, {price}, {terms}, {number} and {prize} come "
+                   "from the roll.",
+    "categories": [
+        {"id": "painting", "label": "The painting the last segment was selling", "weight": 1.0,
+         "requires": ["painting"], "within": 1200,
+         "offer": "offers {first} the painting the last segment was selling - {painting} - at {price}",
+         "items": _items([
+             {"id": "buys", "label": "Buys the painting", "tags": ["sale"], "effect": "sold",
+              "text": "{FIRST} BUYS IT - takes it at {price}, and says where it is going to hang",
+              "respond": "is delighted to have sold it, and says so to the listeners",
+              "emotions": {"joy": 2.5}},
+             {"id": "raffle", "label": "Wins it in the raffle, as caller number [RNG]", "tags": ["won", "raffle"],
+              "effect": "awarded", "raffle": {"low": 2, "high": 99},
+              "offer": "announces that {first} is caller number {number} - the station's raffle number - and has "
+                       "WON the painting the last segment was selling, {painting}, outright",
+              "text": "{FIRST} reacts to winning it as caller number {number}",
+              "respond": "makes far too much of the win, and of caller number {number}",
+              "emotions": {"joy": 3.0, "surprise": 2.0}},
+             {"id": "rejects", "label": "Is offered it, and rejects it", "tags": ["refused"], "effect": "unsold",
+              "text": "{FIRST} TURNS IT DOWN - flat, and says why",
+              "respond": "takes the rejection personally, and defends the painting"},
+             {"id": "rejects_quote", "label": "Is offered it, and rejects it by saying [RNG] [speakerbox]",
+              "tags": ["refused", "quote"], "effect": "unsold", "speakerbox": "verbatim",
+              "text": "{FIRST} TURNS IT DOWN BY SAYING a passage out of the speakerbox, rolled for them, word for "
+                      "word as their whole answer",
+              "respond": "tries to work out what that answer meant, and whether it was a no"},
+             {"id": "buys_burns", "label": "Buys it, then decides to set it on fire", "tags": ["sale", "fire"],
+              "effect": "burnt",
+              "text": "{FIRST} BUYS IT at {price} - and then says they are setting it on fire, right now, while "
+                      "they are still on the line",
+              "respond": "reacts to {first} setting the painting on fire, live on the phone",
+              "emotions": {"joy": 1.5, "anger": 1.5}},
+             {"id": "ignores", "label": "Ignores it, and says they don't want it", "tags": ["refused"],
+              "effect": "unsold",
+              "offer": "tries to interest {first} in the painting the last segment was selling - {painting} - at "
+                       "{price}",
+              "text": "{FIRST} IGNORES THE PITCH ENTIRELY and just says they do not want it",
+              "respond": "cannot believe the pitch was ignored"},
+             {"id": "short", "label": "Buys it, but hasn't enough money", "tags": ["short"], "effect": "unsold",
+              "text": "{FIRST} WANTS IT and tries to buy it - and does not have the money: comes up short, and "
+                      "says exactly how short",
+              "respond": "tries to haggle, or does the sums out loud",
+              "emotions": {"sadness": 1.8}},
+         ])},
+        {"id": "general", "label": "Any call (no painting in play)", "weight": 1.0, "unless": ["painting"],
+         "items": _items([
+             {"id": "gets_it", "label": "Gets what they rang for", "tags": ["granted"],
+              "offer": "gives {first} what they rang for - the record, the answer, the thing they asked for",
+              "text": "{FIRST} takes it, and says what it means to them"},
+             {"id": "agree_to_disagree", "label": "Agrees to disagree", "tags": ["disagree"],
+              "offer": "makes one last case against {first}'s point",
+              "text": "{FIRST} AGREES TO DISAGREE - holds their ground, and says so"},
+             {"id": "look_into_it", "label": "The hosts promise to look into it", "tags": ["promise"],
+              "offer": "promises {first}, out loud and with a time attached, that the station will look into it",
+              "text": "{FIRST} holds them to it"},
+             {"id": "dedication", "label": "A song dedicated", "tags": ["dedication"],
+              "offer": "offers {first} a dedication - the next record, for whoever they like",
+              "text": "{FIRST} names who it is for, and why"},
+             {"id": "prize", "label": "Wins one of the station's prizes", "tags": ["won", "prize"],
+              "prize": {"pool": "call.prizes", "defaults": list(CALL_PRIZES)},
+              "offer": "tells {first} they have won {prize} - one of the station's prizes",
+              "text": "{FIRST} reacts to winning {prize}",
+              "emotions": {"joy": 2.0, "surprise": 1.5}},
+             {"id": "comes_round", "label": "Comes round to the hosts' view", "tags": ["agree"],
+              "offer": "makes the case to {first} one more time, properly",
+              "text": "{FIRST} COMES ROUND - admits the hosts have a point"},
+             {"id": "trivia", "label": "A trivia question before they go", "tags": ["trivia"],
+              "offer": "puts a trivia question to {first} - something absurd about this station, this town or "
+                       "the last record",
+              "text": "{FIRST} answers it, right or gloriously wrong"},
+             {"id": "honorary", "label": "Made an honorary member of the station", "tags": ["honour"],
+              "offer": "makes {first} an honorary something of the station on the spot, and invents the title",
+              "text": "{FIRST} accepts the honour extremely seriously, with a short speech"},
+         ])},
+    ],
+}
+WRAP1 = {
+    "id": "WRAP1", "family": "WRAP", "label": "Wrap call (who on the station ends it, and how)", "version": 1,
+    "enabled": True, "weight": 1.0, "roads": ["caller"],
+    "who": {"A": 1.0, "B": 1.0, "D": 0.6, "S": 0.8},
+    "description": "The last turn of a call: who on the station ends it (`who`, weighted by seat - A the host, B "
+                   "the co-host, D the third seat, S Sam where the call has his seat) and how, in answer to the "
+                   "caller's last word. It need not be a polite goodbye: the station's checker keys on this node, "
+                   "not on the words. `dead_line` is for a call a CALLEVENT1 ending cut short. `only_after` ties a "
+                   "way of ending to a resolution (RESOLVE:<item> or tag:<tag>).",
+    "categories": [
+        {"id": "ends", "label": "How the station ends the call", "weight": 1.0, "unless": ["dead_line"],
+         "items": _items([
+             {"id": "thanks_hangs_up", "label": "Thanks them and hangs up", "polite": True, "weight": 1.5,
+              "text": "thanks {first} for calling - properly, out loud - and hangs up"},
+             {"id": "goodnight", "label": "Wishes them goodnight", "polite": True,
+              "text": "wishes {first} a good night, warmly, and lets them go"},
+             {"id": "cuts_off", "label": "Cuts them off mid-sentence",
+              "rebuttal": "they never get to finish it - the next turn cuts them off mid-word",
+              "text": "cuts {first} off mid-sentence - hits the button while they are still going, and says so to "
+                      "the listeners"},
+             {"id": "hold_forever", "label": "Puts them on hold forever",
+              "text": "puts {first} on hold - forever - and goes straight on to something else; the hold music is "
+                      "the last anyone hears of them"},
+             {"id": "dial_tone", "label": "That's the dial tone",
+              "text": "hangs up on {first} mid-thought, and tells the listeners that sound was the dial tone"},
+             {"id": "next_caller", "label": "Next caller!",
+              "text": "shouts 'next caller' while {first} is still talking, and moves on"},
+             {"id": "over_the_record", "label": "Talks over them into the record",
+              "text": "talks straight over {first} into the next record"},
+             {"id": "enjoy_the_ashes", "label": "Tells them to enjoy the ashes", "weight": 3.0,
+              "only_after": ["tag:fire"],
+              "text": "tells {first} to enjoy the ashes, and hangs up"},
+             {"id": "enjoy_the_painting", "label": "Tells them to enjoy the painting", "polite": True, "weight": 2.0,
+              "only_after": ["RESOLVE:buys", "RESOLVE:raffle"],
+              "text": "tells {first} to enjoy the painting and to hang it where the light is kind to it, then "
+                      "thanks them and lets them go"},
+             {"id": "call_back_with_money", "label": "Call back when you have the money", "weight": 3.0,
+              "only_after": ["RESOLVE:short"],
+              "text": "tells {first} to call back when they have the money, and hangs up on them"},
+             {"id": "offer_stands", "label": "The offer stands", "weight": 1.5, "only_after": ["tag:refused"],
+              "text": "tells {first} the offer stands, forever, and hangs up before they can refuse it again"},
+         ])},
+        {"id": "dead_line", "label": "The line went dead (a CALLEVENT1 ending)", "weight": 1.0,
+         "requires": ["dead_line"],
+         "items": _items([
+             {"id": "hello_hello", "label": "Hello? Hello?",
+              "text": "says hello into the dead line two or three times, then gives up on {first}"},
+             {"id": "phone_company", "label": "Blames the phone company",
+              "text": "blames the phone company, the weather and the building for losing {first}"},
+             {"id": "defends_self", "label": "Defends themselves to the empty line",
+              "text": "defends themselves to the empty line, as though {first} could still hear it"},
+             {"id": "hopes_ok", "label": "Hopes they are all right",
+              "text": "wonders out loud whether {first} is all right, and means it"},
+             {"id": "moves_on", "label": "Shrugs it off",
+              "text": "shrugs it off and takes it straight back to the music"},
+         ])},
+    ],
+}
+DEFAULT_TABLES += [RESOLVE1, WRAP1]                                              # [s3-callend]
+
+# The call's end as the caller structure's closing legs (DEFAULT_CALL_STRUCTURE ends on
+# them; the runtime puts them on a stored structure that still ends on lands/sign_off,
+# once). {resolution}, {offer}, {outcome}, {respond}, {rebuttal}, {wrapper} and {wrap}
+# are filled from the rolls. With the tables switched off the resolution, reaction and
+# response legs are not planned, the rebuttal lands the caller's story and the wrap
+# call is a spoken sign-off - the call the station planned before (same dice).
+CALLEND_LEGS = [
+    {"id": "resolution", "label": "Resolution - the caller's wheel", "place": "close", "seat": "A",
+     "end": "resolution",
+     "act": "THE RESOLUTION, as the caller's wheel rolled it ({resolution}): {offer}.",
+     "draws": [{"family": "RESOLVE"}, {"family": "ES"}]},
+    {"id": "reaction", "label": "The caller plays it out", "place": "close", "seat": "C", "end": "reaction",
+     "act": "{outcome}.",
+     "draws": [{"family": "ES"}]},
+    {"id": "response", "label": "Response chain", "place": "close", "seat": "A", "end": "response",
+     "act": "RESPONDS to how it went ({resolution}): {respond}.",
+     "draws": [{"family": "ES"}, {"family": "RS"}]},
+    {"id": "rebuttal", "label": "The caller's rebuttal", "place": "close", "seat": "C", "end": "rebuttal",
+     "act": "{FIRST} GETS THE LAST WORD: {rebuttal}. This must be the SECOND TO LAST turn of the whole call.",
+     "draws": [{"family": "ES"}]},
+    {"id": "wrap_call", "label": "Wrap call", "place": "close", "seat": "A", "end": "wrap",
+     "act": "WRAP CALL - {wrapper} ENDS THE CALL, in answer to {first}'s last word: {wrap}. This is the LAST "
+            "turn of the call.",
+     "draws": [{"family": "WRAP"}, {"family": "ES"}]},
+]
 
 # --- The banter cycle (PDF p.3) --------------------------------------------
 #
@@ -919,14 +1232,8 @@ DEFAULT_CALL_STRUCTURE = {
         {"id": "keeps_going", "label": "Keeps it going", "place": "middle", "seat": "alternate",
          "act": "keeps it going; every turn answers the one before it and quotes a word from it.",
          "draws": [{"family": "ES"}, {"family": "RS"}, {"family": "FL", "tables": ["FL2"]}]},
-        {"id": "lands", "label": "The caller lands it", "place": "close", "seat": "C",
-         "act": "{FIRST} LANDS IT. The caller says the last word of their own story here. This must be "
-                "the SECOND TO LAST turn of the whole call.",
-         "draws": [{"family": "ES"}]},
-        {"id": "sign_off", "label": "Sign off", "place": "close", "seat": "A",
-         "act": "SIGN OFF. The final turn is a host, and it must contain one of these words out loud: "
-                "thanks, thank you, goodbye, goodnight, take care, appreciate.",
-         "draws": [{"family": "ES"}]},
+        # [s3-callend] the call's end: resolution, reaction, response chain, rebuttal, wrap call
+        *copy.deepcopy(CALLEND_LEGS),
     ],
     "head": "THE RUNNING ORDER OF THIS CALL. This is a request-line call and it has a protocol; write "
             "exactly these turns, in this order, one line each, nothing else. {first} has about "
@@ -1274,6 +1581,14 @@ def validate_structure(road, st):
     for key in ("min_turns", "max_turns"):
         if key in st and (not isinstance(st[key], int) or st[key] < 1 or st[key] > 60):
             out.append("%s must be a whole number from 1 to 60" % key)
+    if road == "caller":                                                    # [s3-callend] the call's end families
+        mine = {"leg %s: unknown draw %r" % (leg["id"], d) for leg in legs
+                if isinstance(leg, dict) and str(leg.get("id") or "").strip()
+                for d in leg.get("draws") or [] if isinstance(d, dict) and d.get("family") in CALLEND_FAMILIES}
+        out = [p for p in out if p not in mine]
+        for leg in legs:
+            if isinstance(leg, dict) and leg.get("end") and leg.get("end") not in CALLEND_ROLES:
+                out.append("leg %s: end must be one of %s" % (leg.get("id"), ", ".join(CALLEND_ROLES)))
     return out
 
 

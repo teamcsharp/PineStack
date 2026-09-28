@@ -113,6 +113,7 @@
   var crawlStop = null;             /* the live strip can retake the pane */
   var selfScrollUntil = 0;          /* a scroll WE started, not the operator */
   var adrift = 0;                   /* #1282: consecutive off-screen reads */
+  var handAt = 0;                   /* [autoscroll-rule] the last wheel/touch/key on it */
   var folded = Object.create(null);   /* #1285: seg id -> folded? */
   var byHand = Object.create(null);   /* #1285: the operator said so */
   var liveSeg = '';                   /* #1285: the segment on air */
@@ -11238,6 +11239,11 @@
   function paintFeed(state) {
     var box = el('spFeed');
     if (!box) return;
+    /* [autoscroll-rule] the thread follows its end only for a reader there
+       who is not examining a row; one reading back keeps the row they are
+       on, whatever the re-seat and the trim below do above it. */
+    var feedHold = root.pineStick
+      ? root.pineStick(box, {edge: 'bottom', slack: 30, key: 'data-line'}).anchor() : null;
     /* #1279: KEPT AND RE-SEATED, NOT APPENDED AND FROZEN.
      *
      * This drew each id once, in first-appearance order, and never
@@ -11403,6 +11409,10 @@
     feedDrawn(over > 0 ? want.slice(over) : want);         /* [s3-script-linear] */
     feedDiceTick();   /* [s3-dice] ask System 3 about the rows that want dice */
     feedSetActiveMarquee(box);
+    if (feedHold) {   // [autoscroll-rule]
+      root.pineStick(box).restore(feedHold, added);
+      return;
+    }
     if (!added && over <= 0) return;
     if (feedStick) box.scrollTop = box.scrollHeight;
   }
@@ -12946,9 +12956,49 @@
   var scrollAt = 0;
   var scrollLog = [];
 
+  /* [autoscroll-rule] THE PANE'S HAND AND EYE, from the shared rule
+     (pine-stick.js): what counts as examining, and the button that takes a
+     reader who has scrolled off the air back to it. The pane's "latest" is
+     the line on air, not its end, so the button's jump is airJump's. */
+  function scriptStick(box) {
+    if (!box || !root.pineStick) return null;
+    return root.pineStick(box, {
+      edge: 'bottom', autoHide: false,
+      label: 'Back to the line on air',
+      examining: function () {
+        if (Date.now() - handAt < 600) return true;       /* a hand is moving it */
+        var detail = el('spDetail');
+        if (detail && !detail.hidden) return true;
+        return !!document.querySelector('.la-sheet');
+      },
+      jump: function () { airJump('jump button'); }
+    });
+  }
+  function scriptExamining(box) {
+    var st = scriptStick(box);
+    return st ? st.examining() : false;
+  }
+  function scriptJumpNote() {
+    var st = scriptStick(el('spScript'));
+    if (st) st.note(1);
+  }
+  function scriptJumpClear() {
+    var st = scriptStick(el('spScript'));
+    if (st) st.clear();
+  }
+
   function moveScript(reason, apply) {
     var box = el('spScript');
     if (!box) return false;
+    /* [autoscroll-rule] A FOLLOW - the line on air, the end of the page, the
+       lit line brought back - never moves the pane under an operator who is
+       examining something in it. Restores, folds and the operator's own
+       jumps still run: they keep a place, or were asked for. */
+    if ((reason === 'end' || /^follow/.test(String(reason))) && scriptExamining(box)) {
+      scrollLog.push({at: Date.now(), why: 'held:' + reason, top: Math.round(box.scrollTop)});
+      if (scrollLog.length > 40) scrollLog.shift();
+      return false;
+    }
     var now = Date.now();
     /* 2026-09-15 (#1183): this is one HALF of the rule, and the other
        half is in scriptRestore. A follow is held off while a restore is
@@ -12971,6 +13021,8 @@
        feel frozen after each line. */
     selfScrollUntil = now + 180;
     try { apply(box); } catch (err) { caughtNote('scroll:' + reason, err); }
+    /* [autoscroll-rule] back on the air: the jump button has said its piece */
+    if (/^(follow|jump)/.test(String(reason))) scriptJumpClear();
     return true;
   }
 
@@ -13120,7 +13172,10 @@
      * nothing is folded. */
     if (displaySeg) {
       for (var key in phase) {
-        if (phase[key] === 'past' && !byHand[key]) folded[key] = true;
+        /* [autoscroll-rule] not while the operator reads elsewhere: a
+           segment shutting takes its lines out from under them. The folds
+           catch up once they are following the air again. */
+        if (phase[key] === 'past' && !byHand[key] && (follow || folded[key])) folded[key] = true;
       }
       folded[displaySeg] = false;
     }
@@ -13347,7 +13402,7 @@
     if (!seg || seg === liveSeg) return;
     var was = liveSeg;
     liveSeg = seg;
-    if (was && !byHand[was]) folded[was] = true;
+    if (was && !byHand[was] && follow) folded[was] = true;   /* [autoscroll-rule] */
     folded[seg] = false;
     /* #1300: the hand-off the operator asked to SEE - the finished
        script shutting and the next one opening out. */
@@ -14177,6 +14232,17 @@
   function paintLiveCueWindow(row) {
     var strip = el('spLiveSequence');
     if (!strip) return;
+    /* [autoscroll-rule] scrolled off the ON AIR cue by hand = held there;
+       back on it = centred on it again as the air moves. */
+    if (!strip.__cueWatch) {
+      strip.__cueWatch = true;
+      strip.addEventListener('scroll', function () {
+        var on = strip.querySelector('.sp-live-cue[aria-current="step"]');
+        if (!on) return;
+        var lip = strip.getBoundingClientRect(), seat = on.getBoundingClientRect();
+        strip.__cueHeld = !(seat.right > lip.left + 4 && seat.left < lip.right - 4);
+      }, {passive: true});
+    }
     var feedRows = [];
     try {
       feedRows = root.PineStationFeed && root.PineStationFeed.rows
@@ -14188,6 +14254,7 @@
     }).join('|');
     if (print === liveCuePrint) return;
     liveCuePrint = print;
+    var cueKeep = strip.scrollLeft;   // [autoscroll-rule]
     strip.replaceChildren();
     strip.hidden = !rows.length;
     if (bandManager) bandManager.refresh();
@@ -14212,7 +14279,9 @@
       });
       strip.appendChild(button);
     });
-    if (currentCue) {
+    if (strip.__cueHeld) {   // [autoscroll-rule]
+      strip.scrollLeft = cueKeep;
+    } else if (currentCue) {
       strip.scrollLeft = Math.max(0, currentCue.offsetLeft - strip.offsetLeft
         - (strip.clientWidth - currentCue.offsetWidth) / 2);
     }
@@ -16241,7 +16310,13 @@
          overlapped the next poll and made anchor restoration count their
          unfinished travel a second time; an exact nearest-edge seat has no
          in-flight state for a repaint to race. */
-      moveScript('follow', function (pane) { seatLineNearest(pane, node); });
+      if (!moveScript('follow', function (pane) { seatLineNearest(pane, node); })) {
+        scriptJumpNote();          /* [autoscroll-rule] held: they are examining */
+      }
+    } else {
+      /* [autoscroll-rule] the air moved on while the operator reads
+         elsewhere: the page stays; the button says the line on air moved. */
+      scriptJumpNote();
     }
   }
 
@@ -16766,6 +16841,7 @@
     follow = true;
     adrift = 0;
     keptAt = 0;
+    scriptJumpClear();                                       /* [autoscroll-rule] */
     var chip = el('spNow');
     if (chip) chip.classList.remove('adrift');
 
@@ -17274,8 +17350,25 @@
 
     var script = make('div', 'sp-script');
     script.id = 'spScript';
+    /* [autoscroll-rule] A HAND ON THE PANE - the wheel, a finger, the
+       scrollbar, a scrolling key. A scroll that follows one is the
+       operator's own, and ONE reading that takes the live line out of view
+       stands following down: "twice" (#1282) was for our own smooth moves,
+       which no longer exist, and it let the next tick pull a single-notch
+       scroll straight back. A move of ours is also held off while the hand
+       is moving (scriptExamining). */
+    ['wheel', 'touchstart', 'touchmove', 'pointerdown', 'keydown'].forEach(function (name) {
+      script.addEventListener(name, function () {
+        handAt = Date.now();
+        /* ...and the crawl (reading ahead at a set rate) stops for a hand:
+           it kept walking the page out from under whatever the operator
+           took hold of. Its own play button starts it again; no timer. */
+        if (crawl && crawlStop) crawlStop();
+      }, {passive: true});
+    });
     script.addEventListener('scroll', function () {
-      if (Date.now() < selfScrollUntil) return;   /* our own scroll, in flight */
+      var hand = Date.now() - handAt < 600;
+      if (Date.now() < selfScrollUntil && !hand) return;   /* our own scroll, in flight */
       stick = script.scrollTop + script.clientHeight >= script.scrollHeight - 40;
       /* Scrolling by hand means "let me read"; following would yank the
          page back every quarter second. Tapping the readout resumes it. */
@@ -17290,14 +17383,14 @@
         var box = script.getBoundingClientRect();
         var seat = node.getBoundingClientRect();
         var here = seat.bottom > box.top && seat.top < box.bottom;
-        if (here) { adrift = 0; follow = true; }
-        else if ((adrift += 1) >= 2) { follow = false; }
+        if (here) { adrift = 0; follow = true; scriptJumpClear(); }   // [autoscroll-rule]
+        else if ((adrift += 1) >= 2 || hand) { follow = false; }
       } else if (nowLineId === '') {
         /* #1270 leaves this empty while the line has not arrived. The
            old code reconsidered nothing here, so scrolling away during
            that window did not count as "let me read" and the page
            yanked back the moment the line landed. */
-        if ((adrift += 1) >= 2) { follow = false; }
+        if ((adrift += 1) >= 2 || hand) { follow = false; }   // [autoscroll-rule]
       }
       var chip = el('spNow');
       if (chip) chip.classList.toggle('adrift', !follow);
@@ -17344,19 +17437,42 @@
     var TAP_WINDOW = 300;
     var PAPER = 'sp-look-paper';
 
-    function reseat() {
+    function reseat(place) {
       /* The pane changed shape, so the line that was centred no longer
          is. Re-seat rather than leave the reader stranded. */
+      /* [autoscroll-rule] ...but only a reader who was FOLLOWING is taken
+         to the air. One reading elsewhere asked for a bigger page or a
+         paper look, not for the line on air: their row is held where it
+         was on the glass. */
+      if (place) { reseatHold(place); return; }
       follow = true;
       nowLineId = '';
       try { tick(); } catch (e) { /* the change matters more */ }
     }
-    function bigToggle() { host.classList.toggle('sp-big'); reseat(); }
+    function reseatPlace() {
+      if (follow) return null;
+      var box = el('spScript');
+      var a = box ? scriptAnchor(box) : null;
+      if (!box || !a || !a.node) return {none: true};
+      a.rel = a.was - box.getBoundingClientRect().top;
+      return a;
+    }
+    function reseatHold(a) {
+      var box = el('spScript');
+      if (!box || !a || !a.node || a.node.parentNode !== box || a.node.hidden) return;
+      var drift = (a.node.getBoundingClientRect().top - box.getBoundingClientRect().top) - a.rel;
+      if (Math.abs(drift) > 0.5) {
+        moveScript('restore', function (pane) {
+          pane.scrollTop = Math.max(0, pane.scrollTop + drift);
+        });
+      }
+    }
+    function bigToggle() { var place = reseatPlace(); host.classList.toggle('sp-big'); reseat(place); }
     /* #1272: the script-document setting - paper, Courier, the standard
        measures, and each element coloured for what it IS. One setting
        that goes on and off, not a cycle: the operator asked for a look,
        not a carousel. */
-    function paperToggle() { host.classList.toggle(PAPER); reseat(); }
+    function paperToggle() { var place = reseatPlace(); host.classList.toggle(PAPER); reseat(place); }   // [autoscroll-rule]
 
     /* A tap on a LINE still opens that line - that is what the detail
      * panel is for and it predates this. These gestures belong to the

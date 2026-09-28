@@ -175,7 +175,7 @@ export function create(options = {}) {
             paintDetail(row, note?.value);
             if (active) {
               const replacement = detail.querySelector('.prr-verdict textarea');
-              replacement.focus();
+              replacement.focus({preventScroll: true});   // [autoscroll-rule]
               if (caret) replacement.setSelectionRange(...caret);
             }
           }
@@ -292,6 +292,11 @@ export function create(options = {}) {
   function paintQueue() {
     if (!queue) return;
     const focused = queue.contains(document.activeElement) ? document.activeElement.dataset.reviewId : null;
+    // [autoscroll-rule] newest at the top: a reader there sees new lines
+    // arrive; one reading down the queue keeps the line they are on.
+    const queueStick = window.pineStick ? window.pineStick(queue, {edge: 'top', key: 'data-review-id'}) : null;
+    const queueHold = queueStick ? queueStick.anchor() : null;
+    const queueTop = queue.firstElementChild?.dataset.reviewId || '';
     queue.replaceChildren();
     const items = [...rows.values()].sort((a, b) => Number(b.seq) - Number(a.seq));
     for (const row of items) {
@@ -304,7 +309,8 @@ export function create(options = {}) {
     }
     if (!items.length) queue.append(el('p', 'No matching rejected lines.', 'prr-empty'));
     const more = panel.querySelector('.prr-more'); more.hidden = !nextBefore;
-    if (focused) [...queue.children].find(node => node.dataset.reviewId === focused)?.focus();
+    if (queueStick) queueStick.restore(queueHold, !!queueTop && (queue.firstElementChild?.dataset.reviewId || '') !== queueTop);   // [autoscroll-rule]
+    if (focused) [...queue.children].find(node => node.dataset.reviewId === focused)?.focus({preventScroll: true});
   }
   async function loadQueue(reset = true, older = false) {
     if (!dialog) return;
@@ -543,7 +549,7 @@ export function create(options = {}) {
       target.append(history);
     }
     paintMutations();
-    if(focused) target.querySelector('[data-learning="'+focused+'"]')?.focus();
+    if(focused) target.querySelector('[data-learning="'+focused+'"]')?.focus({preventScroll: true});   // [autoscroll-rule]
   }
   async function select(id, eventSeq = null) {
     selected = String(id); selectedEvent = reviewOccurrence({event_seq:eventSeq}); const token = ++selection; paintQueue();
@@ -893,7 +899,7 @@ export function create(options = {}) {
     paintMutations();
     if (focus) {
       const replacement = [...target.querySelectorAll('[data-lab-field]')].find(node => node.dataset.labField === focus);
-      replacement?.focus(); if (caret && replacement?.setSelectionRange) replacement.setSelectionRange(...caret);
+      replacement?.focus({preventScroll: true}); if (caret && replacement?.setSelectionRange) replacement.setSelectionRange(...caret);   // [autoscroll-rule]
     }
   }
   async function room() {
