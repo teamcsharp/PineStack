@@ -6700,11 +6700,13 @@ export async function mount(root, {request, onClose, tab: startTab = '', table: 
    * engine rolls VARIANT among the base and its variants when the road runs. */
   let segRoad = '', segNodes = null, segRoadOf = '', segSel = {node: -1, draw: -1}, segDrag = null;
   let segGraph = null, segGraphOf = '', segGraphSel = '', segGraphScene = null, segGraphPresets = null;
+  let segGraphViewState = {zoom: 1, panX: 0, panY: 0};
   let segInitiator = null;   /* [s3-flow] who opens the banter cycle (null: as saved) */
   const SEG_FAMS = ['CTS', 'ES', 'RS', 'IRS', 'FL'];
   function segStructures() { return config.config.structures || {}; }
   function segLoad(road) {
     if (segNodes && segRoadOf === road) return;
+    if (segGraphOf !== road) segGraphViewState = {zoom: 1, panX: 0, panY: 0};
     segRoadOf = road; segSel = {node: -1, draw: -1};
     segNodes = road === 'banter' ? JSON.parse(JSON.stringify(config.config.structure.steps || []))
       : JSON.parse(JSON.stringify((segStructures()[road] || {}).legs || []));
@@ -6830,7 +6832,12 @@ export async function mount(root, {request, onClose, tab: startTab = '', table: 
     } else props.append(para('Select a node to edit its rolls, purpose and path.', 's3-muted'));
     const list = el('div', 's3-graph-list', ...nodes.map(n => btn(n.label || n.id,
       () => { segGraphSel = n.id; refresh(); }, {'aria-pressed': String(n.id === segGraphSel)})));
-    box.append(el('div', 's3-graph-layout', el('div', 's3-graph-visual', canvas, list), props));
+    const viewControls = el('div', 's3-graph-view-controls',
+      btn('−', () => { if (segGraphScene) segGraphScene.zoomBy(1 / 1.25); }, {'aria-label': 'Zoom graph out'}),
+      btn('+', () => { if (segGraphScene) segGraphScene.zoomBy(1.25); }, {'aria-label': 'Zoom graph in'}),
+      btn('Fit', () => { if (segGraphScene) segGraphScene.fit(); }),
+      el('span', {class: 's3-muted', text: 'Pinch apart to zoom in, pinch together to zoom out. Drag to pan; tap a node to edit.'}));
+    box.append(el('div', 's3-graph-layout', el('div', 's3-graph-visual', canvas, viewControls, list), props));
     const flows = el('div', 's3-graph-flows', el('h3', {text: 'Flow lines · weights are the branch dice'}));
     edges.forEach((edge, i) => flows.append(el('div', 's3-graph-edge',
       el('span', {text: edge.from + ' → ' + edge.to + ' (' + Math.round(100 * (Number(edge.weight) || 0)
@@ -6870,7 +6877,9 @@ export async function mount(root, {request, onClose, tab: startTab = '', table: 
       const w = Math.max(320, canvas.clientWidth), h = Math.max(320, canvas.clientHeight);
       renderer.setSize(w, h, false);
       const scene = new THREE.Scene(), camera = new THREE.OrthographicCamera(-6, 6, 6 * h / w, -6 * h / w, .1, 100);
-      camera.position.z = 30; scene.add(new THREE.AmbientLight(0xffffff, 1));
+      camera.position.set(segGraphViewState.panX, segGraphViewState.panY, 30);
+      camera.zoom = segGraphViewState.zoom; camera.updateProjectionMatrix();
+      scene.add(new THREE.AmbientLight(0xffffff, 1));
       const nodes = graph.nodes || [], xs = nodes.map(n => Number(n.x) || 0), ys = nodes.map(n => Number(n.y) || 0);
       const minX = Math.min(0, ...xs), maxX = Math.max(1, ...xs), minY = Math.min(0, ...ys), maxY = Math.max(1, ...ys);
       const scale = Math.min(10 / Math.max(1, maxX - minX), 10 * h / w / Math.max(1, maxY - minY));
@@ -6905,11 +6914,60 @@ export async function mount(root, {request, onClose, tab: startTab = '', table: 
           badge.position.copy(a).lerp(b, .5).add(new THREE.Vector3(.18, .2, .04)); scene.add(badge); }
       });
       const ray = new THREE.Raycaster(), mouse = new THREE.Vector2();
-      const click = e => { const r = canvas.getBoundingClientRect(); mouse.set((e.clientX - r.left) / r.width * 2 - 1,
-        -(e.clientY - r.top) / r.height * 2 + 1); ray.setFromCamera(mouse, camera);
-        const hit = ray.intersectObjects(meshes)[0]; if (hit) choose(hit.object.userData.id); };
-      canvas.addEventListener('click', click); renderer.render(scene, camera);
-      return {stop() { canvas.removeEventListener('click', click); scene.traverse(obj => {
+      const floor = new THREE.Plane(new THREE.Vector3(0, 0, 1), 0);
+      const fingers = new Map(); let press = null, pinch = null, moved = false;
+      const render = () => renderer.render(scene, camera);
+      const pointAt = (x, y) => { const r = canvas.getBoundingClientRect();
+        mouse.set((x - r.left) / r.width * 2 - 1, -(y - r.top) / r.height * 2 + 1);
+        camera.updateMatrixWorld(); ray.setFromCamera(mouse, camera);
+        return ray.ray.intersectPlane(floor, new THREE.Vector3()); };
+      const pan = (from, to) => { const a = pointAt(from.x, from.y), b = pointAt(to.x, to.y);
+        if (!a || !b) return;
+        camera.position.x += a.x - b.x; camera.position.y += a.y - b.y;
+        segGraphViewState.panX = camera.position.x; segGraphViewState.panY = camera.position.y; render(); };
+      const zoom = (x, y, factor) => { const before = pointAt(x, y);
+        const next = Math.max(.35, Math.min(8, camera.zoom * factor));
+        if (next === camera.zoom) return;
+        camera.zoom = next; camera.updateProjectionMatrix();
+        const after = pointAt(x, y);
+        if (before && after) { camera.position.x += before.x - after.x; camera.position.y += before.y - after.y; }
+        segGraphViewState.zoom = camera.zoom;
+        segGraphViewState.panX = camera.position.x; segGraphViewState.panY = camera.position.y; render(); };
+      const pinchMeasure = () => { const [a, b] = [...fingers.values()];
+        return {x: (a.x + b.x) / 2, y: (a.y + b.y) / 2,
+          distance: Math.max(1, Math.hypot(a.x - b.x, a.y - b.y))}; };
+      const down = e => { e.preventDefault(); fingers.set(e.pointerId, {x: e.clientX, y: e.clientY});
+        canvas.setPointerCapture(e.pointerId);
+        if (fingers.size === 1) { press = {x: e.clientX, y: e.clientY}; moved = false; }
+        else if (fingers.size === 2) { pinch = pinchMeasure(); moved = true; } };
+      const move = e => { if (!fingers.has(e.pointerId)) return;
+        const last = fingers.get(e.pointerId); fingers.set(e.pointerId, {x: e.clientX, y: e.clientY});
+        if (fingers.size === 2) { const next = pinchMeasure();
+          if (pinch) { zoom(pinch.x, pinch.y, next.distance / pinch.distance); pan(pinch, next); }
+          pinch = next; moved = true;
+        } else if (fingers.size === 1 && press) {
+          if (Math.hypot(e.clientX - press.x, e.clientY - press.y) > 5) moved = true;
+          if (moved) pan(last, {x: e.clientX, y: e.clientY});
+        } };
+      const end = (e, cancelled = false) => { if (!fingers.has(e.pointerId)) return;
+        const clicked = !cancelled && fingers.size === 1 && !moved && press
+          && Math.hypot(e.clientX - press.x, e.clientY - press.y) <= 5;
+        fingers.delete(e.pointerId); pinch = null;
+        if (fingers.size === 1) { press = [...fingers.values()][0]; moved = true; }
+        else if (!fingers.size) { press = null; moved = false; }
+        if (clicked) { pointAt(e.clientX, e.clientY);
+          const hit = ray.intersectObjects(meshes)[0]; if (hit) choose(hit.object.userData.id); } };
+      const up = e => end(e), cancel = e => end(e, true);
+      const wheel = e => { e.preventDefault(); zoom(e.clientX, e.clientY, Math.exp(-e.deltaY * .001)); };
+      canvas.addEventListener('pointerdown', down); canvas.addEventListener('pointermove', move);
+      canvas.addEventListener('pointerup', up); canvas.addEventListener('pointercancel', cancel);
+      canvas.addEventListener('wheel', wheel, {passive: false}); render();
+      return {zoomBy(factor) { const r = canvas.getBoundingClientRect(); zoom(r.left + r.width / 2, r.top + r.height / 2, factor); },
+        fit() { camera.position.x = 0; camera.position.y = 0; camera.zoom = 1; camera.updateProjectionMatrix();
+          segGraphViewState = {zoom: 1, panX: 0, panY: 0}; render(); },
+        stop() { canvas.removeEventListener('pointerdown', down); canvas.removeEventListener('pointermove', move);
+          canvas.removeEventListener('pointerup', up); canvas.removeEventListener('pointercancel', cancel);
+          canvas.removeEventListener('wheel', wheel); scene.traverse(obj => {
         if (obj.geometry) obj.geometry.dispose(); if (obj.material) {
           if (obj.material.map) obj.material.map.dispose(); obj.material.dispose(); } }); renderer.dispose(); }};
     });
