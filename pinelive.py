@@ -452,6 +452,10 @@ def wav_header(data_bytes: int) -> bytes:
             + b"data" + struct.pack("<I", size))
 
 
+# [plair] the on-air test ends itself after this long (seconds).
+REHEARSE_MAX_S = 600
+
+
 def cut_names(start: float, index: int) -> tuple[str, str]:
     stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime(start))
     base = "%s_%s_c%03d" % (stamp, EVENT_SLUG, index)
@@ -1123,7 +1127,8 @@ class PineLive:
                   "device": self.device or s.get("device") or "",
                   "channel_pair": list(s["channel_pair"]),
                   "channel_mode": s["channel_mode"], "silence_db": s["silence_db"],
-                  "token": self.token, "master": True})
+                  "token": self.token,
+                  "master": not bool((self.event or {}).get("rehearse"))})   # [plair]
         c.update(extra)
         self.control = c
         try:
@@ -1198,8 +1203,12 @@ class PineLive:
     def start(self, body: dict[str, Any]) -> dict[str, Any]:
         s = self.settings
         radio = _app("_RADIO") or {}
+        # [plair] the on-air TEST rides the set's own road - the record steps
+        # aside, the DJs duck over the interface, SFX run - but it is never
+        # recorded, it is allowed with the switch off, and it ends itself.
+        rehearse = bool(body.get("rehearse"))
         with self.lock:
-            if not s.get("enabled", True):
+            if not rehearse and not s.get("enabled", True):
                 return self.refuse("disabled", "MX Live is switched off - turn the event on first")
             if self.armed():
                 return self.refuse("already_live", "MX Live is already running")
@@ -1230,7 +1239,21 @@ class PineLive:
                         pick = d
                 if pick is None and not device:
                     ready = [d for d in rows if d.get("status") == "ready"]
-                    pick = (ready or rows or [None])[0]
+                    # [plair] the instrument first, as the host ranks it ([plpick]):
+                    # card order put a keyboard dongle's 8 kHz mic ahead of the K.O. II.
+                    def _rank(d: dict[str, Any]) -> tuple[int, int, int]:
+                        te = 0 if str(d.get("usb_id") or "").startswith("2367:") else 1
+                        try:
+                            top = max(int(r) for r in (d.get("rates") or [0]))
+                        except Exception:  # noqa: BLE001
+                            top = 0
+                        real = 0 if int(d.get("channels") or 0) >= 2 and top >= 44100 else 1
+                        try:
+                            card = int(d.get("card") or 0)
+                        except Exception:  # noqa: BLE001
+                            card = 0
+                        return (te, real, card)
+                    pick = (sorted(ready, key=_rank) or sorted(rows, key=_rank) or [None])[0]
                 if pick is None:
                     return self.refuse("no_device", "no USB capture device %s- plug the "
                                        "K.O. II in, then look at Devices" %
@@ -1240,9 +1263,10 @@ class PineLive:
                 device = str(pick.get("id"))
             now = time.time()
             stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime(now))
-            self.event = {"id": "mxlive-" + stamp, "name": EVENT_NAME, "started_at": now,
+            self.event = {"id": ("mxlive-test-" if rehearse else "mxlive-") + stamp,
+                          "name": EVENT_NAME, "started_at": now,
                           "folder": "%s_%s" % (stamp, EVENT_SLUG), "armed": True,
-                          "fallbacks": 0}
+                          "fallbacks": 0, "rehearse": rehearse}
             self.source_kind = source
             self.device = device
             self.token = secrets.token_hex(16)
@@ -1251,6 +1275,13 @@ class PineLive:
             self.errors.clear()
             self.held_record = None
             self._arm_runtime(resume=False)
+        if rehearse:                                                # [plair]
+            self.note("start", "on-air test armed (%s%s) - the interface takes the broadcast "
+                      "as soon as it sounds; not recorded, %d minutes at most"
+                      % (source, (" " + device) if device else "", REHEARSE_MAX_S // 60))
+            return {"ok": True, "code": "", "say": "on-air test - the %s replaces the record "
+                    "as soon as it sounds, DJs and all; tap End test to stop" %
+                    ("K.O. II" if source == "usb" else "sender")}
         self.note("start", "MX Live armed (%s%s) - the music keeps playing until the "
                   "input is heard" % (source, (" " + device) if device else ""))
         return {"ok": True, "code": "", "say": "MX Live is armed - waiting for the "
@@ -1277,10 +1308,12 @@ class PineLive:
                 first = max(got) + 1 if got else 1
             except Exception:  # noqa: BLE001
                 first = 1
-        if self.settings.get("record", True) and self.recorder is not None:
+        rehearse = bool((self.event or {}).get("rehearse"))       # [plair] a test is not recorded
+        if self.settings.get("record", True) and self.recorder is not None and not rehearse:
             self.recorder.begin(folder, folder_name, float(self.settings["cut_seconds"]),
                                 str(self.settings["format"]), first)
-        self._tap(True)
+        if not rehearse:
+            self._tap(True)
         self._save_event()
         self.picture.ensure()
 
@@ -1307,12 +1340,14 @@ class PineLive:
             if self.event is None:
                 return {"ok": True, "code": "", "say": "MX Live was not running"}
             was_live = self.phase == "live"
+            rehearse = bool((self.event or {}).get("rehearse"))    # [plair]
             self._set_phase("stopping")
         if was_live:
             self._give_air("stop")
-        if self.recorder is not None:
+        if self.recorder is not None and not rehearse:
             self.recorder.end()
-        self._tap(False)
+        if not rehearse:
+            self._tap(False)
         with self.lock:
             ev = dict(self.event or {})
             ev["ended_at"] = time.time()
@@ -1333,6 +1368,10 @@ class PineLive:
         self.mp3.reap(force=True)
         cuts = len([c for c in (self.recorder.cuts if self.recorder else [])
                     if c.get("event") == ev.get("id")])
+        if rehearse:                                                # [plair]
+            self.note("stop", "the on-air test ended (%s): %.0f s on air" % (
+                why, ev.get("live_seconds", 0)), event_row=ev)
+            return {"ok": True, "code": "", "say": "the test is over - the music is back"}
         self.note("stop", "MX Live ended (%s): %.0f s live, %d cut pair%s" % (
             why, ev.get("live_seconds", 0), cuts, "" if cuts == 1 else "s"),
             event_row=ev)
@@ -1425,6 +1464,11 @@ class PineLive:
     # -- the supervisor (a thread: a stalled loop cannot stall the decision) --------------
     def tick(self, now: float | None = None) -> None:
         now = time.time() if now is None else now
+        _rev = self.event or {}                                     # [plair]
+        if (self.armed() and _rev.get("rehearse")
+                and now - float(_rev.get("started_at") or now) > REHEARSE_MAX_S):
+            self.stop("the on-air test ran its %d minutes" % (REHEARSE_MAX_S // 60))
+            return
         if not self.armed() or self.live is None:
             if not self.armed():
                 self.mp3.reap()
@@ -1656,6 +1700,7 @@ class PineLive:
                        "started_at": float(self.event.get("started_at") or 0),
                        "live_seconds": round(self.live_seconds(), 1),
                        "fallbacks": int(self.event.get("fallbacks") or 0),
+                       "rehearse": bool(self.event.get("rehearse")),      # [plair]
                        "folder": folder} if self.event is not None else None),
             "source": src,
             "recording": {
@@ -2073,6 +2118,36 @@ async def music_response(track_id: str, request: Any) -> Any:
         "Accept-Ranges": "none", "icy-name": EVENT_NAME})
 
 
+# [plart] the Album Art folder, through the station's read-only QuickSwap mount.
+PLART_DIR = Path(os.environ.get("PINELIVE_ART_DIR")
+                 or "/samples/PineBoxRecordings/Live Events/Album Art")
+_PLART_MEMO: dict[str, tuple[str, bytes]] = {}
+
+
+def _plart_cover(event_key: str) -> tuple[str, bytes] | None:
+    """(media type, bytes) of this event's cover, or None (then the camera)."""
+    got = _PLART_MEMO.get(event_key)
+    if got:
+        return got
+    try:
+        files = sorted(p for p in PLART_DIR.iterdir() if p.is_file()
+                       and p.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp"))
+    except OSError:
+        return None
+    if not files:
+        return None
+    import random as _random
+    pick = _random.Random(event_key).choice(files)
+    try:
+        data = pick.read_bytes()
+    except OSError:
+        return None
+    kind = {".png": "image/png", ".webp": "image/webp"}.get(pick.suffix.lower(), "image/jpeg")
+    _PLART_MEMO.clear()                  # one set at a time; keep only its cover
+    _PLART_MEMO[event_key] = (kind, data)
+    return _PLART_MEMO[event_key]
+
+
 async def art_response(track_id: str, request: Any) -> Any:
     """/music/<live id>/art: the picture as a live MJPEG. A public viewer
     (the listener door) gets it only while tailscale_video is on, and an
@@ -2083,6 +2158,12 @@ async def art_response(track_id: str, request: Any) -> Any:
     away = request.headers.get("x-pinebox-public") == "1"
     if away and not PL.settings.get("tailscale_video"):
         return Response(PLACEHOLDER_JPEG, media_type="image/jpeg",
+                        headers={"Cache-Control": "no-store"})
+    # [plart] the set's cover: one image from the Album Art folder, picked at
+    # random per event (seeded by its id, so it holds for the whole set).
+    cover = await asyncio.to_thread(_plart_cover, str(PL.event_id() or track_id))
+    if cover:
+        return Response(cover[1], media_type=cover[0],
                         headers={"Cache-Control": "no-store"})
     PL.picture.ensure()
     boundary = "pinelivepicture"
@@ -2202,9 +2283,21 @@ def install(app: Any, app_globals: dict[str, Any]) -> None:
         auth(authorization)
         body = await body_of(request)
         want = bool(body.get("enabled", True))
+        if want and PL.event is not None and PL.event.get("rehearse"):     # [plair]
+            return answer({"ok": False, "code": "testing",
+                           "say": "an on-air test has the air - end the test first"})
         if not want and PL.event is not None:
             await asyncio.to_thread(PL.stop, "MX Live was switched off")
         await asyncio.to_thread(PL.set_settings, {"enabled": want})
+        # [plair] the switch IS the set: on arms it now - the interface takes the
+        # broadcast as soon as it sounds, the records come back when it goes
+        # quiet or the switch goes off.
+        if want and PL.event is None:
+            got = await asyncio.to_thread(PL.start, {
+                "source": str(body.get("source") or "usb"),
+                "device": str(body.get("device") or ""),
+                "unpause": bool(body.get("unpause"))})
+            return answer(got)
         return answer({"ok": True, "say": "MX Live is %s" % ("on" if want else "off")})
 
     @app.post("/api/pinelive/start")

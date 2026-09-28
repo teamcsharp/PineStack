@@ -167,6 +167,10 @@
     var want = (settings && settings.device) || (st && st.source && st.source.kind === 'usb' && st.source.device) || '';
     var i;
     if (want) for (i = 0; i < list.length; i += 1) if (list[i].id === want) return list[i];
+    /* [plair] nothing chosen: the instrument by its USB descriptor, not the
+     * first ready row (a keyboard dongle's 8 kHz mic sits ahead of the K.O. II) */
+    var G = root.PineLiveGuide;
+    if (G && G.pickInstrument) { var inst = G.pickInstrument(devices); if (inst) return inst; }
     for (i = 0; i < list.length; i += 1) if (list[i].capture && list[i].status === 'ready') return list[i];
     return list[0] || null;
   }
@@ -671,6 +675,19 @@
     return act('/api/pinelive/stop', {}, ui.goBtn);
   }
 
+  /* [plair] "If I tap this, stop the current track on the broadcast and play
+   * the interface in its place ... mixed with the DJ's ducking and sound
+   * effects": the ON-AIR test - the set's own road, never recorded, ended by
+   * a second tap or by itself after ten minutes. */
+  function airTest() {
+    var st = model.state || {};
+    if (st.armed && st.event && st.event.rehearse) return act('/api/pinelive/stop', {}, null);
+    var road = ui.prefs.road || (st.source && st.source.kind) || 'usb';
+    var body = {source: road, rehearse: true};
+    if (road === 'usb' && model.settings && model.settings.device) body.device = model.settings.device;
+    return act('/api/pinelive/start', body, null);
+  }
+
   function runTest() {
     var dev = troubleDevice() || ((model.settings && model.settings.device) || '');
     model.testing = Date.now();
@@ -1153,8 +1170,8 @@
     if (root.PineLiveScope) ui.scope = root.PineLiveScope.mount(host);
     else host.appendChild(make('p', 'pl-muted', 'The audiograph did not load on this screen (pinelive-scope.js).'));
     var row = make('div', 'pl-actions');
-    var test = btn('', 'Test 4 s', 'c:timer', 'Open the capture for four seconds without going on air, and draw it here');
-    test.addEventListener('click', function (e) { e.stopPropagation(); runTest(); });
+    var test = btn('', 'Test on air', 'c:timer', 'Put the interface on the broadcast in place of the record - DJs, ducking and SFX as usual - until you tap again (ten minutes at most, never recorded)');
+    test.addEventListener('click', function (e) { e.stopPropagation(); airTest(); });   /* [plair] */
     row.appendChild(test);
     var listen = btn('pl-listen', 'Listen here', 'c:headphones', 'Hear the live input alone on this screen (a headphone check)');
     listen.addEventListener('click', function (e) { e.stopPropagation(); toggleMonitor(); });
@@ -1168,8 +1185,13 @@
   function paintScope(p) {
     var st = model.state || {};
     var testing = model.testing && Date.now() - model.testing < 5000;
-    setText(p.parts.test.querySelector('.pl-btn-words'), testing ? 'Testing...' : 'Test 4 s');
-    p.parts.test.disabled = !!testing || !model.state;
+    /* [plair] the on-air test's own words; a running SET holds the air */
+    var rehearsing = !!(st.armed && st.event && st.event.rehearse);
+    var setArmed = !!st.armed && !rehearsing;
+    setText(p.parts.test.querySelector('.pl-btn-words'),
+      rehearsing ? 'End test' : (setArmed ? 'The set is on air' : (testing ? 'Testing...' : 'Test on air')));
+    setClass(p.parts.test, 'on', rehearsing);
+    p.parts.test.disabled = !model.state || setArmed;
     var canListen = !!st.monitor_url;
     setHidden(p.parts.listen, !canListen);
     setClass(p.parts.listen, 'on', !!ui.monitor);
@@ -1310,7 +1332,12 @@
         });
         return;
       }
-      act('/api/pinelive/event', {enabled: next}, node);
+      /* [plair] the switch IS the set: on arms it now, on the chosen road */
+      var st0 = model.state || {};
+      var road0 = ui.prefs.road || (st0.source && st0.source.kind) || 'usb';
+      var body0 = {enabled: next, source: road0};
+      if (road0 === 'usb' && model.settings && model.settings.device) body0.device = model.settings.device;
+      act('/api/pinelive/event', body0, node);
     });
     b.appendChild(sw.root);
 
@@ -1389,9 +1416,13 @@
     var st = model.state || {};
     var s = model.settings || {};
     var parts = p.parts;
-    parts.sw.set(st.enabled !== false && s.enabled !== false);
+    /* [plair] the switch shows the SET, not a permission: on = a set is armed */
+    var setOn = !!st.armed && !(st.event && st.event.rehearse);
+    parts.sw.set(setOn);
     parts.sw.sw.disabled = !model.state;
-    var sub = st.enabled === false ? 'MX Live is off: nothing can start.' : 'Off: nothing can start. Switching it off during a set ends the set first.';
+    var sub = setOn
+      ? 'On: the interface has the broadcast whenever it sounds - the record steps aside, the DJs talk over you, and the records come back when it goes quiet. Switch off to end the set.'
+      : 'Off: the station plays its records. Switch on and the interface takes the broadcast as soon as it sounds.';
     if (ui.confirmUntil.disable && Date.now() < ui.confirmUntil.disable) sub = 'Tap the switch again to end the set and switch MX Live off.';
     setText(parts.sw.caption, sub);
 
