@@ -546,6 +546,7 @@
       paint();
       syncLevels();
       try { paintCountdown(); } catch (err) { /* [plcount] never breaks the poll */ }
+      try { djDuckSync(); } catch (err) { /* [plduck] never breaks the poll */ }
       schedulePoll(nextDelay());
     }, function (err) {
       ui.polling = false;
@@ -1261,6 +1262,37 @@
    * when live is enabled": over the Script view's player, full while the
    * interface sounds, draining as it stays quiet; empty = the records take
    * the air back. Gone when no set is armed. */
+  /* [plduck] while a set holds the air and a DJ line plays, the set's own
+   * player drops to LIVE_DUCK (-10.8 dB, the station mix's duck) - the
+   * terminal that owns the air plays the set directly, so the mix's duck
+   * never reached it and the DJs were buried under the K.O. II. */
+  var LIVE_DUCK = 0.29;
+  function djDuckSync() {
+    var st = model.state || {};
+    var music = document.getElementById('musicPlayer');
+    if (!music) return;
+    var voices = document.querySelectorAll('audio[id^="djVoiceAudio"]');
+    var talking = false, i;
+    for (i = 0; i < voices.length; i += 1) {
+      var v = voices[i];
+      if (!v.__plduck) {
+        v.__plduck = true;
+        ['playing', 'pause', 'ended', 'emptied'].forEach(function (ev) {
+          v.addEventListener(ev, function () { try { djDuckSync(); } catch (err) { /* never throws out */ } });
+        });
+      }
+      if (!v.paused && !v.ended) talking = true;
+    }
+    var want = !!(st.live && talking);
+    if (want && !ui.djDucked) {
+      ui.djDucked = {was: music.volume, set: Math.max(0, music.volume * LIVE_DUCK)};
+      music.volume = ui.djDucked.set;
+    } else if (!want && ui.djDucked) {
+      if (Math.abs(music.volume - ui.djDucked.set) < 0.01) music.volume = ui.djDucked.was;
+      ui.djDucked = null;
+    }
+  }
+
   function paintCountdown() {
     var st = model.state || {};
     var host = document.querySelector('.sp-player');
