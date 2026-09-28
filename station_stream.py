@@ -50,6 +50,7 @@ import asyncio
 import json
 import os
 import queue
+import re
 import shutil
 import statistics
 import subprocess
@@ -146,12 +147,93 @@ HLS_SEGMENT_SECONDS = float(os.getenv("STREAM_HLS_SEGMENT", "4"))
 # start offset). It stays 15: tests/test_listener_h3_2026_09_25.py pins
 # `>= 15`, and 60 s holds the 30 s offset with a whole extra tower
 # handoff of room. The cost is 3 more segments x 4 variants on /tmp.
-HLS_LIST_SIZE = int(os.getenv("STREAM_HLS_LIST", "15"))
+# #1476: now 20 (an 80 s window). An away listener starts 45 s behind
+# (HLS_START_OFFSET_AWAY_S), and a station restart takes 8-30 s before
+# segments flow again - 45 + 30 is 75, so the window has to hold both
+# or a player that rides through a restart finds its position already
+# rolled off the head of the playlist.
+HLS_LIST_SIZE = int(os.getenv("STREAM_HLS_LIST", "20"))
 # A phone should not begin its first moving-car session on a single segment.
 # Three completed four-second chunks are enough for a tower handoff while
 # keeping the initial tune-in delay bounded.
 HLS_START_SEGMENTS = int(os.getenv("STREAM_HLS_START_SEGMENTS", "3"))
 HLS_ROOT = os.getenv("STREAM_HLS_DIR", "")
+
+# #1476: A SPOOL THAT OUTLIVES THE PROCESS.
+#
+# MEASURED on a real drive, 2026-09-27: every station restart broke the
+# car. The phone plays HLS natively (Safari/AVPlayer) and, locked, runs
+# no page JavaScript that could re-tune it - so the phone's own player
+# has to walk through a restart unaided. It could not: the spool was a
+# fresh mkdtemp per process and a new lane rmtree'd its folder, so the
+# same URL came back with MEDIA-SEQUENCE restarted from 0, and AVPlayer
+# reads a sequence that goes BACKWARDS as a broken stream, for good.
+#
+# So the spool is a fixed folder on the data bind mount (the host's local
+# NVMe - it survives `docker restart` and a container recreate alike),
+# the lane folders keep their deterministic names, and a lane that
+# starts over a folder with recent segments RESUMES it: same numbering,
+# the old segments still listed, a DISCONTINUITY at the join. Nothing
+# ever rmtree's the whole spool at boot.
+HLS_SPOOL_DIR = (os.getenv("PINEBOX_HLS_SPOOL", "") or HLS_ROOT
+                 or "/app/data/hls_spool")
+# A folder whose newest segment is younger than this is RESUMED: a player
+# can still be walking it (a restart, a tunnel, a locked phone that kept
+# its buffer). Older than this and nobody is - the lane starts fresh, but
+# its numbering still continues ABOVE the old maximum, never below it.
+HLS_RESUME_S = 15 * 60.0
+# The sweep keeps this much audio behind a lane's NEWEST segment: the
+# whole window plus two minutes of slack for a player that is behind it.
+# Anything older is on no playlist any player can hold.
+HLS_SWEEP_KEEP_S = HLS_LIST_SIZE * HLS_SEGMENT_SECONDS + 120.0
+# A lane folder nobody has written for this long is removed outright by
+# the sweep (never the default lane's): a slider-happy listener leaves a
+# folder per mix, and 201^3 mixes is not a bound.
+HLS_LANE_DIR_KEEP_S = 6 * 3600.0
+# A pre-#1476 spool in /tmp (a mkdtemp per boot, 38 of them measured in
+# the container on 2026-09-27) is adopted if fresh and removed once it
+# has been silent this long.
+HLS_LEGACY_KEEP_S = 3600.0
+
+# #1476: REWARM THE LANES LISTENERS WERE ON. A personal-mix lane is only
+# started by /stream.m3u8, which AVPlayer never re-requests - it reloads
+# the VARIANT playlist - so after a restart that URL 404'd until the
+# buffer drained and the car went quiet. The lanes that served a segment
+# in the last ten minutes are written to data/hls_lanes.json (at most
+# every 30 s, atomically) and started again at boot; each is then held
+# until ten minutes after its last segment request.
+HLS_REWARM_S = 10 * 60.0
+HLS_LANES_SAVE_S = 30.0
+# At most this many lanes at once besides the default (which never counts
+# and is never evicted): one ffmpeg with four AAC encoders each. When full,
+# the least recently asked IDLE lane gives way; a lane asked about in the
+# last HLS_LANE_BUSY_S is somebody's car, and is never taken - the new one
+# is refused with a reason instead.
+HLS_MAX_LANES = int(os.getenv("STREAM_HLS_MAX_LANES", "6"))
+HLS_LANE_BUSY_S = 60.0
+
+# #1476: where a joining player starts, behind the live edge. At home 30 s
+# (the backlog a lane is primed with). AWAY - a phone on a cellular road -
+# 45 s: Safari honours #EXT-X-START and, measured, began 22-25 s behind the
+# newest segment, while a restart takes 8-30 s before segments flow again.
+# The extra fifteen seconds is what carries a car through one.
+HLS_START_OFFSET_S = float(os.getenv("STREAM_HLS_START_OFFSET", "30"))
+HLS_START_OFFSET_AWAY_S = float(os.getenv("STREAM_HLS_START_OFFSET_AWAY", "45"))
+
+# #1476: who this process is. A player (and the car diagnostics) can tell
+# a restart from a stall by the boot id changing under it.
+_BOOTED_AT = time.time()
+_BOOT_ID = "%x-%x" % (int(_BOOTED_AT), os.getpid())
+
+
+def boot_id() -> str:
+    """A short string fixed for the life of this process (#1476)."""
+    return _BOOT_ID
+
+
+def booted_at() -> float:
+    """When this process imported the stream module (#1476)."""
+    return _BOOTED_AT
 
 # #1473: ADAPTIVE VARIANTS IN ONE ENCODER.
 #
@@ -211,8 +293,22 @@ def hls_ffmpeg_argv(lane_dir: Path | str,
                     rates: tuple[int, ...] = HLS_VARIANT_RATES,
                     start_number: int = 0,
                     exe: str | None = None,
-                    discontinuity: bool = False) -> list[str]:
+                    discontinuity: bool = False,
+                    append: bool = False) -> list[str]:
     """The one ffmpeg that writes every variant of one lane.
+
+    #1476 `append`: RESUME the folder's playlists instead of starting
+    them. MEASURED on the host's 6.1.1 and the container's 7.0.2: with
+    `append_list` and var_stream_map, hlsenc reads EACH variant's
+    index.m3u8 at start, keeps its entries (and any DISCONTINUITY in
+    them), numbers the next segment one past the last listed, and writes
+    #EXT-X-DISCONTINUITY in front of it - exactly the playlist a player
+    that was thirty seconds behind needs to keep walking. `start_number`
+    must then be the playlist's own MEDIA-SEQUENCE (hlsenc counts the
+    appended entries up from it); _HlsEncoder._resume_prepare() makes the
+    four playlists agree first. `discont_start` is left off when
+    appending: it would print a second DISCONTINUITY at the HEAD, in
+    front of the old segments, on the first rewrite only.
 
     #1473: FOUR VARIANTS, ONE PROCESS, ONE CLOCK. Each `-map 0:a` is the
     same PCM again; the aac encoder cuts every variant into 1024-sample
@@ -249,21 +345,27 @@ def hls_ffmpeg_argv(lane_dir: Path | str,
              "-hls_list_size", str(HLS_LIST_SIZE),
              # delete_segments bounds the folder; omit_endlist keeps the
              # playlist LIVE so a player never decides the show is over;
-             # program_date_time lets a player place itself in time;
              # independent_segments is kept for the day a video variant
              # joins the lane - for audio-only hlsenc ignores it, and
              # hls_dress_playlist() supplies the tag instead; temp_file
              # means a reader never meets a half-written playlist or a
              # segment still being written - the seg*.ts glob in ready()
              # therefore counts only finished ones.
+             # #1476: program_date_time is GONE. hlsenc stamps the first
+             # segment with the wall clock at spawn, so the 30 s prime
+             # made every date half a minute in the future, and a resumed
+             # lane's new dates stepped BACKWARDS behind the old ones it
+             # still lists - a date that runs backwards inside one live
+             # playlist is a stall risk for AVPlayer and nothing on this
+             # box reads the dates.
              "-hls_flags",
-             "independent_segments+program_date_time+delete_segments"
-             "+omit_endlist+temp_file"
+             "independent_segments+delete_segments+omit_endlist+temp_file"
              # A RESTARTED process begins its timestamps again; the
              # first segment it writes says so, or a player that
              # carries on across the seam decodes it against the old
-             # clock and drops it.
-             + ("+discont_start" if discontinuity else ""),
+             # clock and drops it. append_list writes that tag itself.
+             + ("+append_list" if append else "")
+             + ("+discont_start" if discontinuity and not append else ""),
              "-hls_segment_type", "mpegts",
              "-hls_allow_cache", "0",
              # After an ffmpeg restart the sequence CONTINUES from where
@@ -314,6 +416,123 @@ def hls_dress_playlist(text: str,
         at = 2
     out = lines[:at] + add + lines[at:]
     return "\n".join(out) + "\n"
+
+
+_MIX_PART = re.compile(r"\d{1,3}")
+_SEG_NAME = re.compile(r"seg(\d+)\.ts")
+
+
+def hls_parse_mix(raw: Any) -> tuple[int, int, int] | None:
+    """#1476: a STRICT reading of a listener's mix, for a road that may
+    START a lane. listener_mix() forgives - junk becomes the station's
+    own mix, 250 becomes 200 - which is right for shaping a frame and
+    wrong for spending an ffmpeg: a malformed ?mix= must not start a lane
+    nobody asked for. None or "" is the default mix; anything that is not
+    exactly three whole numbers 0..200 is None."""
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return HLS_DEFAULT_MIX
+    if isinstance(raw, (tuple, list)):
+        parts = [str(p).strip() for p in raw]
+    else:
+        parts = [p.strip() for p in str(raw).split(",")]
+    if len(parts) != 3 or not all(_MIX_PART.fullmatch(p) for p in parts):
+        return None
+    mix = tuple(int(p) for p in parts)
+    if any(v > 200 for v in mix):
+        return None
+    return mix  # type: ignore[return-value]
+
+
+def _hls_read_playlist(path: Path) -> tuple[int, list[dict[str, Any]]] | None:
+    """(MEDIA-SEQUENCE, entries) of a variant playlist, or None.
+
+    #1476: what a resume is built from. Each entry is
+    {"n": number, "uri": name, "dur": seconds, "discont": bool}, the
+    number read from the NAME (seg00346.ts) because that is what is on
+    disk and what the next process continues from. hlsenc writes
+    #EXTINF before any other per-segment tag, so every tag between one
+    URI and the next belongs to the next; the program dates of a pre-#1476
+    playlist are dropped here (see hls_ffmpeg_argv)."""
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    lines = text.splitlines()
+    if not lines or not lines[0].startswith("#EXTM3U"):
+        return None
+    seq = 0
+    dur: float | None = None
+    discont = False
+    out: list[dict[str, Any]] = []
+    for raw in lines[1:]:
+        s = raw.strip()
+        if s.startswith("#EXT-X-MEDIA-SEQUENCE:"):
+            try:
+                seq = int(s.split(":", 1)[1])
+            except ValueError:
+                return None
+        elif s == "#EXT-X-DISCONTINUITY":
+            discont = True
+        elif s.startswith("#EXTINF:"):
+            try:
+                dur = float(s[8:].split(",", 1)[0])
+            except ValueError:
+                dur = None
+        elif s and not s.startswith("#"):
+            name = s.split("?", 1)[0]
+            m = _SEG_NAME.fullmatch(name)
+            if m and dur is not None and dur > 0:
+                out.append({"n": int(m.group(1)), "uri": name, "dur": dur,
+                            "discont": discont})
+            dur, discont = None, False
+    return seq, out
+
+
+def _hls_playlist_text(entries: list[dict[str, Any]], version: int = 6) -> str:
+    """A live variant playlist listing `entries` in hlsenc's own shape.
+
+    #1476: MEDIA-SEQUENCE is the first entry's number, so a segment's
+    position and its name agree - the invariant hlsenc itself keeps and
+    the one a player walks by. No ENDLIST: the lane is live."""
+    target = max(1, int(round(max(e["dur"] for e in entries))))
+    lines = ["#EXTM3U", "#EXT-X-VERSION:%d" % int(version),
+             "#EXT-X-ALLOW-CACHE:NO",
+             "#EXT-X-TARGETDURATION:%d" % target,
+             "#EXT-X-MEDIA-SEQUENCE:%d" % int(entries[0]["n"])]
+    for e in entries:
+        if e.get("discont"):
+            lines.append("#EXT-X-DISCONTINUITY")
+        lines.append("#EXTINF:%.6f," % float(e["dur"]))
+        lines.append(str(e["uri"]))
+    return "\n".join(lines) + "\n"
+
+
+def _atomic_write(path: Path, text: str) -> None:
+    """Write-then-rename in the same folder: a reader (app.py serving the
+    playlist, or the next boot reading hls_lanes.json) meets the old file
+    or the new one, never half of either. #1476 - a half-written module
+    is how the last outage happened, and a half-written playlist is the
+    same outage for one car."""
+    tmp = path.with_name(".%s.%d.%d.tmp" % (path.name, os.getpid(),
+                                             threading.get_ident()))
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, path)
+    finally:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+
+def _newest_mtime(paths: Any) -> float:
+    newest = 0.0
+    for path in paths:
+        try:
+            newest = max(newest, path.stat().st_mtime)
+        except OSError:
+            pass
+    return newest
 
 
 def _client_ip(addr: Any, xff: Any) -> str:
@@ -805,6 +1024,16 @@ class _HlsEncoder:
     heartbeat), whether it is WARM (kept by policy rather than by a
     player), and what it was primed with, so `hls_start_offset_s()` can
     tell a player how far behind live it may safely begin.
+
+    #1476: the folder is no longer this object's to wipe. `start()`
+    RESUMES whatever recent segments it finds there - left by this
+    lane's previous ffmpeg, by the previous PROCESS, or (once, at the
+    first boot of #1476) by a pre-#1476 spool in /tmp - so the playlist
+    a player was walking before a restart is still the playlist after
+    it, one DISCONTINUITY longer. `hold_until` keeps a lane a listener
+    was on alive for ten minutes after its last segment request, and
+    `retired` marks one the stream has let go of, so a mixer holding a
+    stale list of lanes cannot bring it back to life.
     """
 
     def __init__(self, root: Path,
@@ -840,6 +1069,15 @@ class _HlsEncoder:
         self._handles: dict[int, _HlsVariant] = {}
         self._disk_at = 0.0
         self._disk: tuple[int, float] = (0, 0.0)
+        # #1476: the rewarm and the cap.
+        self.retired = False
+        self.hold_until = 0.0
+        self.segment_at = 0.0
+        # What the last start() found and did - resume or fresh, from
+        # which number - for the car diagnostics.
+        self.start_info: dict[str, Any] = {}
+        self._listed_at = 0.0
+        self._listed: float = 0.0
 
     # -- the folder tree ---------------------------------------------------
     def variant_dir(self, rate: Any) -> Path:
@@ -938,36 +1176,274 @@ class _HlsEncoder:
         return int((max(0.0, time.time() - newest) + 0.5)
                    * 1000.0 / FRAME_MS) + 1
 
+    # -- #1476: resume, numbering, sweep -----------------------------------
+    @property
+    def _seq_path(self) -> Path:
+        return self.dir / ".seq"
+
+    def _seq_floor(self) -> int:
+        """The lowest number the next segment may carry. The segments
+        themselves say it while they exist; this file says it after a
+        sweep or a fresh start has emptied the folder, so the numbering
+        can never go backwards under a player (#1476)."""
+        try:
+            return max(0, int(self._seq_path.read_text().strip() or 0))
+        except (OSError, ValueError):
+            return 0
+
+    def _seq_write(self, number: int) -> None:
+        try:
+            _atomic_write(self._seq_path, "%d\n" % max(0, int(number)))
+        except OSError:
+            pass
+
+    def _adopt_legacy(self, now: float) -> str:
+        """#1476, the first boot only: carry a pre-#1476 lane across.
+
+        Before #1476 the spool was a fresh mkdtemp in /tmp per process.
+        The process that dies at the deploy restart leaves its lane there,
+        fresh, with the playlist a car is walking; copying that folder's
+        LISTED segments and playlists into the persistent spool lets the
+        resume below carry the car through the deploy itself. copy2 keeps
+        the mtimes, which is what the fifteen-minute rule reads. Never
+        from inside a /tmp spool (that IS the legacy road) and never after
+        the first fifteen minutes of a boot, when nothing there is fresh."""
+        if now - _BOOTED_AT > HLS_RESUME_S:
+            return ""
+        if self.dir.parent.name.startswith("pinebox-hls-"):
+            return ""
+        best: tuple[float, Path] | None = None
+        try:
+            roots = list(Path(tempfile.gettempdir()).glob("pinebox-hls-*"))
+        except OSError:
+            return ""
+        for root in roots:
+            cand = root / self.dir.name
+            if not cand.is_dir():
+                continue
+            newest = _newest_mtime(cand.glob("*/seg*.ts"))
+            if newest and now - newest < HLS_RESUME_S and (
+                    best is None or newest > best[0]):
+                best = (newest, cand)
+        if best is None:
+            return ""
+        src = best[1]
+        copied = 0
+        for r in self.rates:
+            pl = src / str(r) / "index.m3u8"
+            got = _hls_read_playlist(pl)
+            if not got or not got[1]:
+                continue
+            dst = self.variant_dir(r)
+            for e in got[1]:
+                seg = src / str(r) / e["uri"]
+                if seg.is_file():
+                    shutil.copy2(seg, dst / e["uri"])
+                    copied += 1
+            shutil.copy2(pl, dst / "index.m3u8")
+        if (src / "master.m3u8").is_file():
+            shutil.copy2(src / "master.m3u8", self.master)
+        return f"{src} ({copied} segments)" if copied else ""
+
+    def _resume_prepare(self) -> tuple[int, int, int] | None:
+        """Make the four variant playlists agree, ready for append_list.
+
+        #1476: an ffmpeg killed mid-write (a container restart is a hard
+        kill) can leave one variant's playlist a segment ahead of the
+        others, or a segment finished on disk that no playlist names yet.
+        append_list would faithfully carry that disagreement forward and
+        the four folders would number the same audio differently - a
+        player stepping between rates would skip or repeat four seconds.
+        So: every number any playlist lists AND every variant has on disk,
+        the contiguous run of them ending at the newest (positions are
+        numbers, so a hole would make the sequence lie), at most one
+        window of it, written back to all four playlists identically.
+        Returns (first, last, count), or None when nothing is resumable."""
+        by_n: dict[int, dict[str, Any]] = {}
+        version = 6
+        for r in self.rates:
+            path = self.variant_playlist(r)
+            got = _hls_read_playlist(path)
+            if not got:
+                continue
+            try:
+                head = path.read_text(encoding="utf-8", errors="replace")
+                m = re.search(r"#EXT-X-VERSION:(\d+)", head)
+                if m:
+                    version = max(version, int(m.group(1)))
+            except OSError:
+                pass
+            for e in got[1]:
+                row = by_n.setdefault(e["n"], {"uri": e["uri"], "dur": {},
+                                               "discont": False})
+                row["dur"][r] = e["dur"]
+                row["discont"] = row["discont"] or e["discont"]
+
+        def everywhere(uri: str) -> bool:
+            for rate in self.rates:
+                try:
+                    if (self.variant_dir(rate) / uri).stat().st_size <= 0:
+                        return False
+                except OSError:
+                    return False
+            return True
+
+        keep = sorted(n for n, row in by_n.items() if everywhere(row["uri"]))
+        if not keep:
+            return None
+        run = [keep[-1]]
+        for n in reversed(keep[:-1]):
+            if n != run[-1] - 1:
+                break
+            run.append(n)
+        run = list(reversed(run))[-max(1, HLS_LIST_SIZE):]
+        for r in self.rates:
+            entries = []
+            for n in run:
+                row = by_n[n]
+                dur = row["dur"].get(r) or next(iter(row["dur"].values()))
+                entries.append({"n": n, "uri": row["uri"], "dur": dur,
+                                "discont": row["discont"]})
+            _atomic_write(self.variant_playlist(r),
+                          _hls_playlist_text(entries, version))
+        return run[0], run[-1], len(run)
+
+    def _clear_files(self) -> None:
+        """Segments, playlists and ffmpeg's temp files - never `.seq`,
+        which is what keeps the numbering climbing."""
+        for r in self.rates:
+            vdir = self.variant_dir(r)
+            for pattern in ("seg*.ts", "*.tmp", ".*.tmp", "index.m3u8"):
+                for path in vdir.glob(pattern):
+                    try:
+                        path.unlink()
+                    except OSError:
+                        pass
+        for path in (self.master, self.dir / "master.m3u8.tmp"):
+            try:
+                path.unlink()
+            except OSError:
+                pass
+
+    def _prepare_spool(self, now: float) -> tuple[int, bool, dict[str, Any]]:
+        """(start_number, append, what happened) for the ffmpeg about to
+        start over this folder. See the class note and HLS_RESUME_S."""
+        for r in self.rates:
+            self.variant_dir(r).mkdir(parents=True, exist_ok=True)
+        info: dict[str, Any] = {"at": round(now, 3), "boot_id": _BOOT_ID}
+        segs = list(self.dir.glob("*/seg*.ts"))
+        plan: tuple[int, int, int] | None = None
+        try:
+            if not segs:
+                adopted = self._adopt_legacy(now)
+                if adopted:
+                    info["adopted"] = adopted
+                    segs = list(self.dir.glob("*/seg*.ts"))
+            newest = _newest_mtime(segs)
+            if segs and now - newest < HLS_RESUME_S:
+                plan = self._resume_prepare()
+        except Exception as exc:  # noqa: BLE001
+            # A folder this code cannot make sense of must never keep a
+            # lane off the air: say so, and start fresh above it.
+            info["resume_error"] = str(exc)[:160]
+            plan = None
+            newest = _newest_mtime(self.dir.glob("*/seg*.ts"))
+        top = self._highest_segment()
+        floor = max(self.next_number, self._seq_floor(), top + 1)
+        if plan is not None:
+            first, last, count = plan
+            # hlsenc numbers the next segment one past the last one it
+            # appended. Orphans above `last` (finished on disk, named by
+            # no playlist) are overwritten in place - no player was ever
+            # told about them.
+            self.next_number = last + 1
+            self._seq_write(max(self.next_number, self._seq_floor()))
+            info.update({"how": "resume", "first": first, "last": last,
+                         "listed": count, "next": self.next_number,
+                         "newest_age_s": round(now - newest, 1)})
+            return first, True, info
+        # Nothing a player could still be walking: start clean, but ABOVE
+        # everything this folder ever numbered.
+        self._clear_files()
+        self.next_number = floor
+        self._seq_write(floor)
+        info.update({"how": "fresh", "first": floor, "next": floor,
+                     "newest_age_s": (round(now - newest, 1)
+                                      if newest else None)})
+        return floor, False, info
+
+    def listed_seconds(self) -> float:
+        """Audio the lane's playlist lists right now (cached a second):
+        after a resume that is the old segments too, which a joining
+        player can start in (#1476)."""
+        now = time.time()
+        if now - self._listed_at < 1.0:
+            return self._listed
+        got = _hls_read_playlist(self.playlist)
+        self._listed = (sum(e["dur"] for e in got[1]) if got else 0.0)
+        self._listed_at = now
+        return self._listed
+
+    def sweep(self, now: float | None = None) -> int:
+        """Drop what no playlist can name any more; returns files removed.
+
+        #1476: hlsenc deletes the segments IT rolls off (including the
+        resumed ones - measured), but not the orphans a hard kill leaves:
+        a finished segment no playlist got to name, a `.tmp` it was
+        writing. Anything unlisted and older than the window plus two
+        minutes behind this lane's newest segment goes; a listed segment
+        is never touched. Called under the lane lock, so it cannot meet
+        a restart's resume halfway."""
+        now = time.time() if now is None else now
+        removed = 0
+        segs = list(self.dir.glob("*/seg*.ts"))
+        newest = _newest_mtime(segs)
+        listed: set[str] = set()
+        for r in self.rates:
+            got = _hls_read_playlist(self.variant_playlist(r))
+            for e in (got[1] if got else []):
+                listed.add(f"{r}/{e['uri']}")
+        for path in segs:
+            if f"{path.parent.name}/{path.name}" in listed:
+                continue
+            try:
+                if path.stat().st_mtime < newest - HLS_SWEEP_KEEP_S:
+                    path.unlink()
+                    removed += 1
+            except OSError:
+                pass
+        for path in list(self.dir.glob("*/*.tmp")) + list(
+                self.dir.glob("*.tmp")):
+            try:
+                if now - path.stat().st_mtime > 60.0:
+                    path.unlink()
+                    removed += 1
+            except OSError:
+                pass
+        return removed
+
     # -- lifecycle ---------------------------------------------------------
     def start(self) -> bool:
         now = time.time()
-        if now < self._retry_at:
+        if self.retired or now < self._retry_at:
             return False
         restart = bool(self.started_at)
         try:
-            # The sequence CONTINUES from what the folder held: a player
-            # that sees the media sequence go backwards reads a broken
-            # stream, one that sees it step forward carries on.
-            top = self._highest_segment()
-            self.next_number = max(self.next_number, top + 1)
-            if restart and top >= 0:
-                # A restart KEEPS the dead process's segments. A player
-                # thirty seconds behind live has them listed and has not
-                # fetched them all yet; deleting them turns one dead
-                # ffmpeg into a 404 run and a hole in the car.
-                self._sweep_below(self.next_number - 2 * HLS_LIST_SIZE)
-            elif self.dir.exists():
-                # A NEW lane starts fresh: a stale playlist from a
-                # previous run names segments that belong to nobody.
-                shutil.rmtree(self.dir, ignore_errors=True)
-            for r in self.rates:
-                self.variant_dir(r).mkdir(parents=True, exist_ok=True)
+            # #1476: the sequence CONTINUES from what the folder held -
+            # a player that sees the media sequence go backwards reads a
+            # broken stream, one that sees it step forward carries on -
+            # and recent segments stay LISTED, not merely on disk: a
+            # player thirty seconds behind live has not fetched them yet.
+            start_number, append, info = self._prepare_spool(now)
         except OSError as exc:
             self.last_error = f"spool: {exc}"
             self._retry_at = now + HLS_RESTART_BACKOFF_S
             return False
-        cmd = hls_ffmpeg_argv(self.dir, self.rates, self.next_number,
-                              discontinuity=restart and top >= 0)
+        info["restart"] = restart
+        self.start_info = info
+        self._listed_at = 0.0
+        cmd = hls_ffmpeg_argv(self.dir, self.rates, start_number,
+                              append=append)
         try:
             self.proc = subprocess.Popen(
                 cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
@@ -1011,8 +1487,18 @@ class _HlsEncoder:
         which a listener hears as a skip. A dead ffmpeg is restarted here
         and re-primed from `backlog()` for the same reason - a lane that
         comes back without its cushion is the 12-second cold start this
-        batch (#1473) exists to remove."""
+        batch (#1473) exists to remove.
+
+        #1476: a RETIRED lane (reaped, evicted, or the mixer's own exit)
+        is never restarted here. The mixer feeds a copy of the lane list
+        taken a moment earlier; without this, the frame after an eviction
+        would find the ffmpeg gone, restart it, and put the lane the cap
+        just took back on the box, orphaned from every table."""
+        if self.retired:
+            return False
         with self.lock:
+            if self.retired:
+                return False
             proc = self.proc
             if proc is None or proc.poll() is not None or proc.stdin is None:
                 self.stop()
@@ -1020,6 +1506,8 @@ class _HlsEncoder:
                     return False
                 was_started = bool(self.started_at)
                 # Measured BEFORE start(), which may sweep the folder.
+                # #1476: start() now RESUMES the folder, so these are
+                # exactly the frames the old segments do not already hold.
                 lost = self.lost_frames() if was_started else None
                 if not self.start():
                     return False
@@ -1269,6 +1757,34 @@ class _HlsLedger:
                 self.last_write_error = str(exc)[:160]
 
 
+_DEFAULT_LANE = (False, HLS_DEFAULT_MIX)
+
+
+def _lane_name(key: tuple[bool, tuple[int, int, int]]) -> str:
+    """The folder name of lane `key` - the same one _HlsEncoder uses."""
+    split, mix = key
+    return "hlsabr-m%d-%d-%d" % tuple(mix) + ("-split" if split else "")
+
+
+def _hls_spool_root() -> tuple[Path, str]:
+    """(spool folder, "" or why the persistent one could not be used).
+
+    #1476: HLS_SPOOL_DIR is created if missing and NEVER emptied here -
+    the whole point is what the previous process left in it. When it
+    cannot be made (a test on the host, where /app does not exist) the
+    stream falls back to a private tempdir, which still works, merely
+    without surviving a restart; the note says so in hls_state()."""
+    want = Path(HLS_SPOOL_DIR).expanduser()
+    try:
+        want.mkdir(parents=True, exist_ok=True)
+        if not os.access(want, os.W_OK | os.X_OK):
+            raise PermissionError(f"not writable: {want}")
+        return want, ""
+    except OSError as exc:
+        return (Path(tempfile.mkdtemp(prefix="pinebox-hls-")),
+                f"{want}: {exc}"[:200])
+
+
 class StationStream:
     """The mixer, the encoder and the fan-out, behind one URL.
 
@@ -1296,8 +1812,30 @@ class StationStream:
         # #1473: HLS lanes are keyed by (split, mix), one ABR lane each,
         # every rate inside. The default lane is (False, HLS_DEFAULT_MIX).
         self._hls: dict[tuple[bool, tuple[int, int, int]], _HlsEncoder] = {}
-        self._hls_root = Path(HLS_ROOT) if HLS_ROOT else Path(
-            tempfile.mkdtemp(prefix="pinebox-hls-"))
+        # #1476: the persistent spool (HLS_SPOOL_DIR), or - only when it
+        # cannot be made, as on the host outside the container - the old
+        # per-process tempdir, with the reason kept for hls_state().
+        self._hls_root, self._hls_spool_note = _hls_spool_root()
+        explicit = os.getenv("STREAM_HLS_LANES", "")
+        if explicit:
+            self._lanes_path = Path(explicit).expanduser()
+        elif self._hls_spool_note:
+            self._lanes_path = self._hls_root / "hls_lanes.json"
+        else:
+            self._lanes_path = self._hls_root.parent / "hls_lanes.json"
+        # (split, mix) -> when that lane last served a segment. Loaded
+        # from _lanes_path on first use, written back by _lanes_loop.
+        self._hls_seen: dict[tuple[bool, tuple[int, int, int]], float] | None = None
+        self._lanes_wake = threading.Event()
+        self._lanes_thread: threading.Thread | None = None
+        self._lanes_saved_at = 0.0
+        self._lanes_last: list[dict[str, Any]] | None = None
+        self._lanes_error = ""
+        self._swept_at = 0.0
+        self._swept_last: dict[str, Any] = {}
+        self._hls_refused: dict[str, Any] = {}
+        self._hls_evicted: deque = deque(maxlen=20)
+        self._hls_ensured: dict[str, Any] = {}
         self._ledger = _HlsLedger()
         self._next_id = 1
 
@@ -1429,35 +1967,348 @@ class StationStream:
         programme mix: a personal-mix or split lane hears its own balance
         from the first live frame, not through the primed half-minute,
         which is the price of starting at once rather than in silence.
+
+        #1476: a new lane counts against HLS_MAX_LANES (see _hls_admit).
+        When every lane is somebody's car the new one is REFUSED: what
+        comes back is an unregistered, never-started lane whose folder
+        does not exist, so the caller's ready() stays False and its
+        playlist read fails the way a cold lane's always has (app.py
+        answers 503), and hls_state()['refused'] says why.
         """
         key = self._hls_key(split, mix)
         now = time.time()
         with self._lock:
             lane = self._hls.get(key)
             if lane is None:
-                lane = _HlsEncoder(self._hls_root, key[1], key[0], bitrate)
-                lane.backlog = self._burst_copy
-                # Started here so the first playlist poll finds a folder;
-                # primed here, under the stream lock, so the mixer cannot
-                # see this lane before its prime is in place (it takes
-                # the lane list under the same lock). A DEAD lane is not
-                # restarted here: the mixer's feed() does that within a
-                # frame and re-primes it in the right order, and a
-                # restart racing it from the event loop could not.
-                if lane.start():
-                    lane.prime = self._burst_copy()
-                    lane.primed_frames = len(lane.prime)
-                else:
-                    self.stats["last_error"] = (
-                        f"hls lane {lane.dir.name} would not start: "
-                        f"{lane.last_error or 'no reason given'}")
-                self._hls[key] = lane
-            lane.asked_at = now
+                lane = self._hls_lane_create(key, bitrate, now)
+            if not lane.retired:
+                lane.asked_at = now
             self._last_listener_at = now
         # A warm lane's mixer may have exited (an exception, or stop());
         # this is what brings it back, and with it a dead lane's restart.
         self.ensure_running()
         return lane
+
+    # -- #1476: the cap, the rewarm, the safe starter ----------------------
+    def _hls_admit(self, key: tuple[bool, tuple[int, int, int]], now: float,
+                   evict: bool = True) -> str:
+        """Under self._lock. "" when a lane at `key` may start, else why not.
+
+        The default lane never counts and is never taken. Past the cap, the
+        least recently asked IDLE lane (nobody asked in HLS_LANE_BUSY_S)
+        gives way - if `evict`; the rewarm never evicts, or a boot would
+        fight the listeners who are actually here for room."""
+        if key == _DEFAULT_LANE:
+            return ""
+        others = [(k, lane) for k, lane in self._hls.items()
+                  if k != _DEFAULT_LANE]
+        if len(others) < HLS_MAX_LANES:
+            return ""
+        idle = sorted(((lane.asked_at, k, lane) for k, lane in others
+                       if now - lane.asked_at >= HLS_LANE_BUSY_S),
+                      key=lambda row: row[0])
+        if not idle:
+            return (f"all {HLS_MAX_LANES} listener lanes are busy (each "
+                    f"asked for within {HLS_LANE_BUSY_S:.0f} s)")
+        if not evict:
+            return f"{HLS_MAX_LANES} listener lanes already running"
+        _, old_key, old = idle[0]
+        self._hls_retire(old_key, old, now,
+                         "evicted for %s" % _lane_name(key))
+        return ""
+
+    def _hls_retire(self, key: tuple[bool, tuple[int, int, int]],
+                    lane: "_HlsEncoder", now: float, why: str) -> None:
+        """Under self._lock. Stop a lane and forget it, for good: `retired`
+        is what stops a mixer holding an older lane list from feeding it
+        back to life. Its folder stays - a lane that comes back within
+        fifteen minutes resumes it."""
+        lane.retired = True
+        lane.stop()
+        if self._hls.get(key) is lane:
+            self._hls.pop(key, None)
+        if why.startswith("evicted"):
+            self._hls_evicted.append({
+                "at": round(now, 1), "lane": lane.dir.name, "why": why,
+                "idle_s": round(now - lane.asked_at, 1)})
+
+    def _hls_lane_create(self, key: tuple[bool, tuple[int, int, int]],
+                         bitrate: Any, now: float, evict: bool = True,
+                         asked_at: float | None = None) -> "_HlsEncoder":
+        """Under self._lock: admit, start, prime and register a lane - or
+        hand back a refused one (retired, unregistered, folder absent)."""
+        refused = self._hls_admit(key, now, evict)
+        if refused:
+            lane = _HlsEncoder(self._hls_root / ".refused", key[1], key[0],
+                               bitrate)
+            lane.retired = True
+            lane.last_error = refused
+            self._hls_refused = {"at": round(now, 1),
+                                 "lane": _lane_name(key), "why": refused}
+            self.stats["last_error"] = (
+                f"hls lane {_lane_name(key)} refused: {refused}")
+            return lane
+        lane = _HlsEncoder(self._hls_root, key[1], key[0], bitrate)
+        lane.backlog = self._burst_copy
+        if asked_at is not None:
+            lane.asked_at = float(asked_at)
+        # Measured BEFORE start(): the frames since this folder's newest
+        # segment. A lane that RESUMES is primed with only those - the
+        # rest of the backlog is already in the segments it still lists,
+        # and handing it over again would play a returning car the same
+        # half-minute twice. None (an empty folder) means all of it.
+        lost = lane.lost_frames()
+        # Started here so the first playlist poll finds a folder;
+        # primed here, under the stream lock, so the mixer cannot
+        # see this lane before its prime is in place (it takes
+        # the lane list under the same lock). A DEAD lane is not
+        # restarted here: the mixer's feed() does that within a
+        # frame and re-primes it in the right order, and a
+        # restart racing it from the event loop could not.
+        if lane.start():
+            backlog = self._burst_copy()
+            if lost is not None and lane.start_info.get("how") == "resume":
+                backlog = backlog[-lost:] if lost > 0 else []
+            lane.prime = backlog
+            lane.primed_frames = len(lane.prime)
+        else:
+            self.stats["last_error"] = (
+                f"hls lane {lane.dir.name} would not start: "
+                f"{lane.last_error or 'no reason given'}")
+        self._hls[key] = lane
+        return lane
+
+    def _hls_seen_map(self) -> dict[tuple[bool, tuple[int, int, int]], float]:
+        """Under self._lock. The rewarm set, read from disk the first
+        time: a lane survives in it for HLS_REWARM_S after its last
+        segment, across as many restarts as happen inside that."""
+        if self._hls_seen is None:
+            self._hls_seen = {}
+            now = time.time()
+            try:
+                data = json.loads(self._lanes_path.read_text(encoding="utf-8"))
+                rows = data.get("lanes") if isinstance(data, dict) else []
+            except (OSError, ValueError):
+                rows = []
+            for row in rows or []:
+                if not isinstance(row, dict):
+                    continue
+                mix = hls_parse_mix(row.get("mix"))
+                try:
+                    at = float(row.get("last_segment_at") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if mix is None or now - at >= HLS_REWARM_S:
+                    continue
+                self._hls_seen[(bool(row.get("split")), mix)] = at
+        return self._hls_seen
+
+    def _lanes_rows(self, now: float) -> list[dict[str, Any]]:
+        """Under self._lock: the rewarm set as it would be written."""
+        seen = self._hls_seen_map()
+        for key in [k for k, at in seen.items() if now - at >= HLS_REWARM_S]:
+            seen.pop(key, None)
+        return [{"split": key[0], "mix": list(key[1]),
+                 "lane": _lane_name(key), "last_segment_at": round(at, 1)}
+                for key, at in sorted(seen.items(), key=lambda kv: -kv[1])]
+
+    def _lanes_save(self) -> bool:
+        """Write data/hls_lanes.json if it changed. Atomic: the next boot
+        reads the old set or the new one, never half."""
+        now = time.time()
+        with self._lock:
+            rows = self._lanes_rows(now)
+        if rows == self._lanes_last:
+            return False
+        payload = {"boot_id": _BOOT_ID, "saved_at": round(now, 1),
+                   "rewarm_s": HLS_REWARM_S, "lanes": rows}
+        try:
+            self._lanes_path.parent.mkdir(parents=True, exist_ok=True)
+            _atomic_write(self._lanes_path, json.dumps(payload, indent=1))
+            self._lanes_last = rows
+            self._lanes_saved_at = now
+            self._lanes_error = ""
+            return True
+        except OSError as exc:
+            self._lanes_error = str(exc)[:160]
+            return False
+
+    def _lanes_loop(self) -> None:
+        """The one writer of hls_lanes.json. Wakes every HLS_LANES_SAVE_S,
+        or sooner when a lane joins the set - but never writes twice
+        inside HLS_LANES_SAVE_S. Off the event loop by construction: the
+        segment road only sets a timestamp and, rarely, an Event."""
+        while True:
+            self._lanes_wake.wait(HLS_LANES_SAVE_S)
+            self._lanes_wake.clear()
+            gap = HLS_LANES_SAVE_S - (time.time() - self._lanes_saved_at)
+            if gap > 0:
+                time.sleep(gap)
+            try:
+                self._lanes_save()
+            except Exception as exc:  # noqa: BLE001
+                self._lanes_error = f"save: {exc}"[:160]
+
+    def _lanes_thread_ensure(self) -> None:
+        th = self._lanes_thread
+        if th is not None and th.is_alive():
+            return
+        with self._lock:
+            th = self._lanes_thread
+            if th is not None and th.is_alive():
+                return
+            self._lanes_thread = threading.Thread(
+                target=self._lanes_loop, name="hls-lanes", daemon=True)
+            self._lanes_thread.start()
+
+    def _hls_rewarm(self) -> list[str]:
+        """Start every remembered lane that is not running, most recently
+        heard first, within the cap and without evicting anyone; hold each
+        until HLS_REWARM_S after its last segment. Returns what started."""
+        now = time.time()
+        started: list[str] = []
+        with self._lock:
+            seen = sorted(self._hls_seen_map().items(), key=lambda kv: -kv[1])
+            for key, at in seen:
+                if now - at >= HLS_REWARM_S:
+                    continue
+                lane = self._hls.get(key)
+                if lane is None:
+                    # asked_at is the last SEGMENT time, not now: a lane
+                    # nobody has come back to is idle for the cap's
+                    # purposes, and the first to give way to a new car.
+                    lane = self._hls_lane_create(key, None, now, evict=False,
+                                                 asked_at=at)
+                    if lane.retired:
+                        continue
+                    started.append(lane.dir.name)
+                lane.segment_at = max(lane.segment_at, at)
+                lane.hold_until = max(lane.hold_until, at + HLS_REWARM_S)
+        if started:
+            self.ensure_running()
+        return started
+
+    def _hls_sweep(self, force: bool = False) -> dict[str, Any]:
+        """The spool's housekeeping, at most once a minute (keep-warm's
+        thread, never the event loop). Running lanes lose only unlisted
+        orphans (_HlsEncoder.sweep). A folder no lane is running: past
+        HLS_RESUME_S nothing can resume it, so its segments and playlists
+        go (its `.seq` stays, so its numbering still only climbs); past
+        HLS_LANE_DIR_KEEP_S the folder goes. Pre-#1476 /tmp spools go once
+        silent HLS_LEGACY_KEEP_S. Never the whole spool, never the
+        default lane's folder."""
+        now = time.time()
+        if not force and now - self._swept_at < 60.0:
+            return self._swept_last
+        self._swept_at = now
+        out = {"at": round(now, 1), "orphans": 0, "idle_cleared": 0,
+               "dirs_removed": 0, "legacy_removed": 0}
+        with self._lock:
+            running = list(self._hls.values())
+        for lane in running:
+            with lane.lock:
+                if not lane.retired:
+                    out["orphans"] += lane.sweep(now)
+        try:
+            dirs = [p for p in self._hls_root.glob("hlsabr-*") if p.is_dir()]
+        except OSError:
+            dirs = []
+        default_dir = self._hls_root / _lane_name(_DEFAULT_LANE)
+        for d in dirs:
+            if d == default_dir:
+                continue
+            with self._lock:
+                if any(lane.dir == d for lane in self._hls.values()):
+                    continue
+                newest = _newest_mtime(
+                    list(d.glob("*/seg*.ts")) + list(d.glob("*/index.m3u8"))
+                    + [d / ".seq"])
+                age = now - newest if newest else float("inf")
+                if age > HLS_LANE_DIR_KEEP_S:
+                    shutil.rmtree(d, ignore_errors=True)
+                    out["dirs_removed"] += 1
+                elif age > HLS_RESUME_S:
+                    for path in list(d.glob("*/seg*.ts")) + list(
+                            d.glob("*/*.tmp")):
+                        try:
+                            path.unlink()
+                            out["idle_cleared"] += 1
+                        except OSError:
+                            pass
+        if not self._hls_root.name.startswith("pinebox-hls-"):
+            try:
+                legacy = list(Path(tempfile.gettempdir()).glob("pinebox-hls-*"))
+            except OSError:
+                legacy = []
+            for root in legacy:
+                try:
+                    if not root.is_dir() or root.is_symlink():
+                        continue
+                    newest = _newest_mtime(root.rglob("*")) or \
+                        root.stat().st_mtime
+                except OSError:
+                    continue
+                if now - newest > HLS_LEGACY_KEEP_S:
+                    shutil.rmtree(root, ignore_errors=True)
+                    out["legacy_removed"] += 1
+        self._swept_last = out
+        return out
+
+    def hls_ensure(self, rate: int, mix: Any = None, split: bool = False,
+                   wait_s: float = 8.0) -> Path | None:
+        """#1476: the safe way for the VARIANT-playlist road to bring a
+        lane back. Returns that variant's playlist once it exists and
+        lists at least one segment, or None (a malformed mix, the cap
+        refused it, or nothing within `wait_s`). BLOCKS up to `wait_s`:
+        call it through asyncio.to_thread, never on the event loop.
+
+        Why a starter on that road at all: AVPlayer re-reads the VARIANT
+        playlist and never /stream.m3u8, so after a restart a personal
+        lane nobody rewarmed was a 404 until the car's buffer ran dry. The
+        mix is validated strictly (hls_parse_mix) and the cap applies, so
+        a stale or forged URL can at worst take an idle lane's place. It
+        must never be called for a SEGMENT - a segment of a lane that is
+        not running is a stale playlist, and hls_existing() is its road.
+        A resumed lane answers at once: its folder already lists the
+        segments the car was walking."""
+        t0 = time.monotonic()
+        want = hls_parse_mix(mix)
+        if want is None:
+            self._hls_ensured = {"at": round(time.time(), 1),
+                                 "lane": str(mix)[:40], "ok": False,
+                                 "why": "malformed mix"}
+            return None
+        key = (bool(split), want)
+        now = time.time()
+        with self._lock:
+            lane = self._hls.get(key)
+            if lane is None:
+                lane = self._hls_lane_create(key, rate, now)
+            if not lane.retired:
+                lane.asked_at = now
+            self._last_listener_at = now
+        if lane.retired:
+            self._hls_ensured = {"at": round(now, 1), "lane": _lane_name(key),
+                                 "ok": False, "why": lane.last_error}
+            return None
+        self.ensure_running()
+        path = lane.variant_playlist(rate)
+        deadline = t0 + max(0.0, float(wait_s or 0))
+        while True:
+            got = _hls_read_playlist(path)
+            if got and got[1] and not lane.retired:
+                self._hls_ensured = {
+                    "at": round(now, 1), "lane": _lane_name(key), "ok": True,
+                    "waited_s": round(time.monotonic() - t0, 2)}
+                return path
+            if lane.retired or time.monotonic() >= deadline:
+                self._hls_ensured = {
+                    "at": round(now, 1), "lane": _lane_name(key), "ok": False,
+                    "why": ("evicted while waiting" if lane.retired else
+                            f"no segment within {float(wait_s or 0):.1f} s: "
+                            f"{lane.last_error or 'still starting'}")}
+                return None
+            time.sleep(0.1)
 
     def hls(self, bitrate: Any = None, mix: Any = None,
             split: bool = False) -> "_HlsVariant":
@@ -1474,12 +2325,29 @@ class StationStream:
         Segment requests must never be able to SPAWN a lane: a player
         asking for a segment of a stream nobody is listening to is a
         stale playlist, and answering it by starting an encoder is how
-        one abandoned tab keeps the box busy for ever."""
+        one abandoned tab keeps the box busy for ever.
+
+        #1476: this is the SEGMENT road (app.py's only caller serves
+        segments through it), so it is also the rewarm's heartbeat: the
+        lane is held for HLS_REWARM_S from now and remembered in
+        data/hls_lanes.json. A dict write and, for a lane new to the set,
+        an Event - the file itself is written by _lanes_loop, never
+        here, because this runs on the event loop."""
+        key = self._hls_key(split, mix)
+        now = time.time()
         with self._lock:
-            lane = self._hls.get(self._hls_key(split, mix))
+            lane = self._hls.get(key)
             if lane is None:
                 return None
-            lane.asked_at = time.time()
+            lane.asked_at = now
+            lane.segment_at = now
+            lane.hold_until = now + HLS_REWARM_S
+            seen = self._hls_seen_map()
+            new = key not in seen
+            seen[key] = now
+        if new:
+            self._lanes_wake.set()
+        self._lanes_thread_ensure()
         return lane.handle(bitrate)
 
     def _hls_lane_if_running(self, split: bool,
@@ -1512,25 +2380,37 @@ class StationStream:
     def hls_rates() -> list[int]:
         return list(HLS_VARIANT_RATES)
 
-    def hls_start_offset_s(self, split: bool = False, mix: Any = None) -> float:
+    def hls_start_offset_s(self, split: bool = False, mix: Any = None,
+                           away: bool = False) -> float:
         """How far behind the live edge a joining player should start.
 
-        JOIN_BURST_SECONDS (30) once the backlog was banked and primed;
+        HLS_START_OFFSET_S (30) once the backlog was banked and primed;
         before that, what was actually primed plus what the lane has
         encoded since, so a player is never pointed at audio that does
         not exist. A lane that is not running reports what one started
         now would be primed with. Capped inside the playlist window; a
         player clamps to the playlist head if a segment is still being
-        cut, which is the right thing for it to do."""
+        cut, which is the right thing for it to do.
+
+        #1476: `away` (a phone on a cellular road) asks for
+        HLS_START_OFFSET_AWAY_S (45) - the cushion that carries a car
+        through a station restart - still never more than exists. What
+        exists now includes a RESUMED lane's old segments: they are on
+        its playlist and a player can start in them."""
+        cap = HLS_START_OFFSET_AWAY_S if away else HLS_START_OFFSET_S
         with self._lock:
             lane = self._hls.get(self._hls_key(split, mix))
             if lane is not None and lane.alive:
                 have = (lane.primed_frames + lane.fed_frames) * FRAME_MS / 1000.0
             else:
                 have = len(self._pcm_burst) * FRAME_MS / 1000.0
+                lane = None
+        if lane is not None:
+            # Outside the stream lock: a (cached) read of a small file.
+            have = max(have, lane.listed_seconds())
         window = max(HLS_SEGMENT_SECONDS,
                      (HLS_LIST_SIZE - 2) * HLS_SEGMENT_SECONDS)
-        return round(max(0.0, min(JOIN_BURST_SECONDS, have, window)), 1)
+        return round(max(0.0, min(cap, have, window)), 1)
 
     def hls_keep_warm(self) -> dict[str, Any]:
         """Start the default lane if it is not running and keep it.
@@ -1540,15 +2420,42 @@ class StationStream:
         thirty-second cushion rather than a cold ffmpeg. Safe to call
         every minute: a live lane costs one poll() and two timestamps.
         A lane whose ffmpeg has died is restarted and re-primed here
-        (and, sooner, by the mixer's next frame)."""
+        (and, sooner, by the mixer's next frame).
+
+        #1476: and the lanes listeners were on. At boot (app.py calls this
+        from its startup hook, then every minute) every lane in
+        data/hls_lanes.json that served a segment in the last ten minutes
+        is started again - resuming its folder - and held until ten
+        minutes after that last segment; then the reaper takes it. The
+        spool is swept here too, off the event loop."""
         lane = self.hls_lane(False, None, None)
         with self._lock:
             lane.warm = True
+        try:
+            self._hls_rewarm()
+        except Exception as exc:  # noqa: BLE001
+            self.stats["last_error"] = f"hls rewarm: {exc}"
+        try:
+            self._hls_sweep()
+        except Exception as exc:  # noqa: BLE001
+            self.stats["last_error"] = f"hls sweep: {exc}"
+        self._lanes_thread_ensure()
         return self.hls_state()
 
     def _any_warm(self) -> bool:
+        now = time.time()
         with self._lock:
-            return any(lane.warm for lane in self._hls.values())
+            return any(lane.warm or now < lane.hold_until
+                       for lane in self._hls.values())
+
+    @staticmethod
+    def boot_id() -> str:
+        """#1476: this process's identity; see the module's boot_id()."""
+        return _BOOT_ID
+
+    @staticmethod
+    def booted_at() -> float:
+        return _BOOTED_AT
 
     def hls_note(self, token: str, kind: str, rate: int, name: str,
                  nbytes: int, served_ms: float, addr: str, xff: str,
@@ -1572,6 +2479,7 @@ class StationStream:
         """The `hls` block of state(): what the car diagnostics read."""
         with self._lock:
             lanes = list(self._hls.items())
+            rewarm = self._lanes_rows(time.time())
         default = next((lane for key, lane in lanes
                         if key == (False, HLS_DEFAULT_MIX)), None)
         segs, newest = default.disk() if default is not None else (0, 0.0)
@@ -1598,9 +2506,32 @@ class StationStream:
                        "primed_s": round(
                            lane.primed_frames * FRAME_MS / 1000.0, 1),
                        "asked_ago_s": round(now - lane.asked_at, 1),
+                       # #1476
+                       "held_s": (round(lane.hold_until - now, 1)
+                                  if lane.hold_until > now else 0.0),
+                       "segment_ago_s": (round(now - lane.segment_at, 1)
+                                         if lane.segment_at else None),
+                       "start": lane.start_info,
                        "error": lane.last_error}
                       for _, lane in lanes],
             "ledger": self._ledger.status(),
+            # #1476: a restart is visible as boot_id changing; the rest is
+            # what the resume, the rewarm and the cap did about it.
+            "boot_id": _BOOT_ID,
+            "booted_at": round(_BOOTED_AT, 3),
+            "spool": str(self._hls_root),
+            "spool_persistent": not self._hls_spool_note,
+            "spool_note": self._hls_spool_note,
+            "start_offset_away_s": self.hls_start_offset_s(away=True),
+            "max_lanes": HLS_MAX_LANES,
+            "lanes_file": str(self._lanes_path),
+            "lanes_saved_at": round(self._lanes_saved_at, 1),
+            "lanes_error": self._lanes_error,
+            "rewarm": rewarm,
+            "refused": self._hls_refused,
+            "evicted": list(self._hls_evicted)[-5:],
+            "ensured": self._hls_ensured,
+            "swept": self._swept_last,
         }
 
     def detach(self, sink: "_Sink") -> None:
@@ -1673,11 +2604,14 @@ class StationStream:
                             self._encoders.pop(ekey, None)
                     for hkey, hls in list(self._hls.items()):
                         # A warm lane is kept by policy, not by a player.
-                        if hls.warm:
+                        # #1476: and a lane a listener was on is HELD
+                        # for ten minutes after its last segment - a
+                        # tunnel, a locked phone, a restart - so the car
+                        # comes back to the same numbering, not a new lane.
+                        if hls.warm or now < hls.hold_until:
                             continue
                         if now - hls.asked_at > LINGER_SECONDS:
-                            hls.stop()
-                            self._hls.pop(hkey, None)
+                            self._hls_retire(hkey, hls, now, "reaped")
 
                 # Station state, four times a second. Cheap on the host
                 # side by contract, and never on the event loop.
@@ -1974,11 +2908,13 @@ class StationStream:
                 # left running (it just sees no input until the next
                 # mixer starts), and hls_keep_warm() restarts the mixer
                 # through hls_lane(). Everything else goes, as before.
+                # #1476: a HELD lane (a listener's, inside its ten
+                # minutes) outlives it the same way.
+                _now = time.time()
                 for hkey, hls in list(self._hls.items()):
-                    if hls.warm:
+                    if hls.warm or _now < hls.hold_until:
                         continue
-                    hls.stop()
-                    self._hls.pop(hkey, None)
+                    self._hls_retire(hkey, hls, _now, "mixer exit")
 
     def _remember(self, key: str) -> None:
         if len(self._aired) == self._aired.maxlen and self._aired:

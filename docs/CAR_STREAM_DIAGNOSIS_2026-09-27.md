@@ -220,3 +220,34 @@ Safari does not expose AVPlayer's own segment fetches to the page (Resource Timi
 **Not verified live:** the camera went off the air at 14:34 (its own Wi-Fi stopped beaconing; the same fault as 14:06-14:21), so the low lane and small still were measured during 155 s of live run but the phone's `<video>` road has not been seen on a real iPhone. Whether Safari honours `#EXT-X-START` (the lag model assumes 30 s) is the next DIAG tap's question.
 
 **Incident during the build:** `/stream.m3u8` answered 500 from 14:29:48 to 14:40:49 because the container restarted while `station_stream.py` was mid-edit; the mp3 road served throughout. Fixed by a restart once the file was complete.
+
+
+---
+
+# Evening: the first drive, the black box, and the blast (2026-09-27, 16:45-20:30 CDT)
+
+## What the first real drive showed (read from three DIAG taps and the HLS ledger)
+- The only failure was 15:39-15:40: the phone opened the station inside the 11-minute outage caused by the afternoon build, retried six times, and was then locked; iOS suspends a page whose audio is not playing, so nothing retried for 20 minutes.
+- From the 16:00 reload the stream was seamless: playhead at exactly real time in every 5 s sample, 20-25 s buffered, the adaptive stream at 128 kbit/s, segments served in 0-8 ms and fetched in 75-125 ms.
+- At 16:02:52 Tailscale dropped on the phone and it continued on the Funnel via T-Mobile without a gap.
+- Safari honours `#EXT-X-START`: it started ~22-25 s behind the newest segment.
+- The DIAG summaries were wrong: iOS fires `stalled` about once per 5 s while its buffer is full (not audible), and the 5-minute window included samples restored from the failed session.
+
+## Built (#1476-#1478), all live
+| Item | What it does | Verified |
+|---|---|---|
+| Restart-proof HLS (#1476, `station_stream.py`) | persistent spool `data/hls_spool`; a lane resumes across process restarts with its media sequence continuing and a discontinuity at the join; the lanes listeners were on are rewarmed at boot; `hls_ensure` lets the player's own variant reload restart a lane; 45 s start offset for away listeners, 80 s window | 34/34 restart simulations on both ffmpeg builds; a player asking for a missing lane gets it in 0.26 s |
+| Black box (#1476, `frontend/car-diag.js` 1476.1) | continuous telemetry every 30 s and on trouble, offline queue, beacon on pagehide; corrected stall/freeze accounting; station-told road with a TAILNET/FUNNEL badge; RTT and position timeline; hands-free 8 s voice note on the DIAG tap in drive mode | headless: queue, road changes, restored rows excluded, voice note posted |
+| Station intake (#1476, `app.py`) | `POST /api/car/telemetry` -> `data/car_sessions/<date>_<sid>.jsonl` with the station's view; automatic Pine report on real trouble (1 per 10 min); `POST /api/car/voice` -> whisper transcript onto the report and the inbox item; `data/boot_log.jsonl`; `/api/car/sessions`, `/api/car/boots`; `tools/car_timeline.py latest` | live: batches, auto-report, a real spoken sentence transcribed, timeline, boots |
+| The page keeps listening (#1476, tune page) | reconnect backoff capped at 8 s and never stops; wake-recover on online/visible/pageshow; a failed tune-in call can never stop the stream; every attempt and steering-wheel press marked | served page parses |
+| No spike on reload (#1477, panel) | a level gate per AudioContext born at 0; gain nodes born at the stored level; sliders restored before any playback; elements started early play at 0 and ramp | headless: old panel peaked +10.7 dB over the stored music level on reload, new never exceeds it; on the tablet the gate held 4 s then faded in |
+| Even SFX and video (#1477) | EBU R128 integrated loudness to -20 LUFS, true peak <= -6 dBTP, picture copied; levelled when picked for air, never served raw unless levelling fails within 3 s | same 30 clips: spread 20.6 LU -> 0.9 LU, 27 -> 0 outside +/-1.5 LU, 9 -> 0 peaks over -6 dBTP; `raw_served` 0 |
+| Drag (#1478, `sfx-tv.js`/`.css`) | the SFX TV set declares `touch-action: none` (the browser was cancelling the drag as a scroll 22 ms in, caught by a passive probe on the operator's own drag) and keeps a drag across clip hand-overs; a `wallBox` name clash that threw on every touch is fixed | headless: old stops after 3 moves, new follows through hand-overs; installed on the tablet |
+
+## The blast
+The operator (headphones on the PineTab) was blasted at restarts: a panel reload played through a direct analyser -> speakers connection and a GainNode born at 1.0, with slider defaults 100/160 read before the stored 29/47 were restored. Separately the SFX board served unlevelled clips raw at up to -10.8 LUFS every 20-30 s. Both fixed above. The operator's levels (music 29, voice 47, SFX 100, video 100) are deliberate and unchanged. Restarts and tablet installs now lower the tablet to 6 first (volume-down key presses; `cmd media_session volume --set` does nothing on this GSI) and restore 20 after the panel settles.
+
+## Open
+- One live survival test (a player walking HLS through a real container restart) rides on the next restart.
+- The tune page (`RADIO_PAGE_HTML`) and the kiosk's `sfx-tv.js`/`pine-meters.js` audio graphs are not behind the new level gate; the tablet's gate opens by its 4 s fallback because the kiosk's audio law does not signal it.
+- Real iPhone checks still to do on a drive: MediaRecorder voice notes, the audio-session resume after a note, the TAILNET/FUNNEL badge.

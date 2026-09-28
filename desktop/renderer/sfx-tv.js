@@ -552,7 +552,7 @@
    * CSS reaches across that, and the first two attempts here were both
    * arguing in the wrong layer.
    */
-  var wallBox = null;
+  var wallMenuRect = null;         /* device px; NOT wallBox() - see onWallAt */
 
   function wallAsk(cmd, arg) {
     try {
@@ -590,7 +590,7 @@
        logical veil and `free` restores it, so Listen still owns its backdrop
        after an inspection closes. */
     wallAsk(on ? 'menu' : 'free');
-    if (!on) wallBox = null;
+    if (!on) wallMenuRect = null;
   }
 
   function wallCssRect(st) {
@@ -616,7 +616,7 @@
                  h: Number(st.h || st.height || 0)};
       var box = wallCssRect(st);
       if (!box) return;                            /* no measured wall */
-      wallBox = raw;                               /* bridge wants device px */
+      wallMenuRect = raw;                          /* bridge wants device px */
       var W = root.innerWidth || 1280;
       var H = root.innerHeight || 800;
       var wide = Math.max(260, Math.min(box.w, W - 16));
@@ -736,15 +736,20 @@
     return {left: left, top: top, width: w, height: h};
   }
 
-  function writeBox() {
-    if (!host) return;
+  function writeBox(given) {
+    /* #1478: `given` is a drag's own box - a finger released between two
+       clips, when there is no set on screen to measure. */
+    if (!host && !given) return;
     /* #1122: NEVER THE FULL-SCREEN GEOMETRY. The set fills the window
        while `full` is on, and a finish or a drop writing 0,0 x the whole
        screen would make that the windowed size for ever after - the
        toggle off would have nowhere to go back to. */
-    if (full) return;
-    var box = {left: host.offsetLeft, top: host.offsetTop,
-               width: host.offsetWidth, height: host.offsetHeight};
+    if (full && !given) return;
+    var box = given
+      ? {left: Math.round(given.left), top: Math.round(given.top),
+         width: Math.round(given.width), height: Math.round(given.height)}
+      : {left: host.offsetLeft, top: host.offsetTop,
+         width: host.offsetWidth, height: host.offsetHeight};
     if (box.width < MIN.w || box.height < MIN.h) return;
     try { root.localStorage.setItem(KEY, JSON.stringify(box)); }
     catch (err) { /* a locked store is not a reason to stop the show */ }
@@ -777,31 +782,162 @@
 
   /* ---- the frame ----------------------------------------------------- */
 
+  /* #1478: THE DRAG BELONGS TO THE FINGER, NOT TO THE SET IT BEGAN ON.
+   *
+   * "whenever I tap and drag the video window around, it is just losing
+   *  the ability to move whenever I'm tapping to drag it. It just stops."
+   *
+   * Two things ended a drag the finger had not ended. The first was
+   * measured on the tablet with a passive pointer probe (2026-09-27): a
+   * press on .sfx-tv-screen, gotpointercapture on the host, ONE
+   * pointermove, and 22 ms later pointercancel - while the finger went on
+   * for another 1.07 s with the set standing still.
+   *
+   *   1. THE WEBVIEW TOOK THE GESTURE. Since #1309b the window itself is
+   *      the handle, and the only `touch-action: none` in sfx-tv.css was
+   *      on .sfx-tv-head - the title bar #1309b removed. The host was
+   *      `auto`, so past the touch slop the browser began a pan of its
+   *      own and cancelled the pointer. preventDefault() on pointerdown
+   *      cannot stop that; only touch-action can. So every handle given
+   *      to drag() or grip() says `none` itself, inline: a stale or
+   *      missing stylesheet can no longer turn the drag back into a pan.
+   *
+   *   2. THE SET WAS REPLACED UNDER THE FINGER. build() makes a new host
+   *      for every clip (the board fires one every 20-30 s and each set
+   *      is up for ~7 s) and teardown()/teardownNow() remove the old one.
+   *      The move/up listeners and the pointer capture lived ON that
+   *      host, so a drag that crossed a hand-over was left talking to a
+   *      detached element and the new set sat where the box was saved.
+   *
+   * So the gesture is held HERE, once, at module level. Its move, up and
+   * cancel are heard on the window (capture phase) for as long as that
+   * pointer is down, as well as on the handle; each move is applied to
+   * whichever set is on screen NOW; and a set built mid-drag takes the
+   * finger's live geometry and the pointer capture (gestureAdopt, called
+   * from build()) instead of the saved box. Every move is absolute - the
+   * start plus the finger's travel - so hearing one event twice (handle
+   * and window) paints the same place twice, never twice as far.
+   *
+   * lostpointercapture deliberately does NOT end it: losing the capture
+   * is exactly what a removed host does, and the finger is still down. */
+  var gesture = null;   // {id, kind: 'move'|'size', x, y, from, box, handle}
+
+  function gestureHear(on, target, type, fn) {
+    try {
+      if (on) target.addEventListener(type, fn, true);
+      else target.removeEventListener(type, fn, true);
+    } catch (err) { /* a surface with no window events: the handle still hears */ }
+  }
+
+  function gestureWire(on, handle) {
+    ['pointermove', 'pointerup', 'pointercancel'].forEach(function (type) {
+      var fn = type === 'pointermove' ? gestureMove : gestureEnd;
+      gestureHear(on, root, type, fn);
+      if (handle) gestureHear(on, handle, type, fn);
+    });
+  }
+
+  /* This gesture's pointer, or an event that does not say which pointer. */
+  function gestureMine(e) {
+    if (!gesture || !e) return true;
+    var id = e.pointerId;
+    return id === undefined || id === null || gesture.id === undefined
+      || id === gesture.id;
+  }
+
+  /* The finger's box on whichever set is up now. Nothing to paint between
+     clips, and nothing while the set fills the screen (#1122). */
+  function gesturePaint(all) {
+    var g = gesture;
+    if (!g || !host || full) return;
+    var b = g.box;
+    if (all || g.kind === 'move') {
+      host.style.left = Math.round(b.left) + 'px';
+      host.style.top = Math.round(b.top) + 'px';
+    }
+    if (all || g.kind === 'size') {
+      host.style.width = Math.round(b.width) + 'px';
+      host.style.height = Math.round(b.height) + 'px';
+    }
+  }
+
+  function gestureMove(e) {
+    var g = gesture;
+    if (!g || !e || !gestureMine(e)) return;
+    /* A move with nothing pressed is a release this page never heard -
+       it went to a set that was already gone. The drag is over. */
+    if (typeof e.buttons === 'number' && e.buttons === 0) { gestureEnd(e); return; }
+    var W = root.innerWidth || 0;
+    var H = root.innerHeight || 0;
+    var dx = (Number(e.clientX) || 0) - g.x;
+    var dy = (Number(e.clientY) || 0) - g.y;
+    if (g.kind === 'size') {
+      g.box.width = Math.max(MIN.w, Math.min(W - g.box.left - 4, g.from.width + dx));
+      g.box.height = Math.max(MIN.h, Math.min(H - g.box.top - 4, g.from.height + dy));
+    } else {
+      /* Clamped so the title bar can never leave the window: a set
+       * dragged off the top edge is one nothing can bring back. */
+      g.box.left = Math.max(0, Math.min(W - 60, g.from.left + dx));
+      g.box.top = Math.max(0, Math.min(H - 30, g.from.top + dy));
+    }
+    gesturePaint(false);
+  }
+
+  function gestureEnd(e) {
+    var g = gesture;
+    if (!g || !gestureMine(e)) return;
+    gesture = null;
+    gestureWire(false, g.handle);
+    try { if (g.handle.releasePointerCapture) g.handle.releasePointerCapture(g.id); }
+    catch (err) { /* already released, or the handle has gone */ }
+    /* The preference is written on release - from the set on screen, or,
+       when the finger let go between two clips, from the finger's own box
+       so the next set opens where it was left. */
+    if (host && !full) writeBox();
+    else if (!host) writeBox(g.box);
+  }
+
+  function gestureBegin(kind, event, handle, node) {
+    if (gesture) gestureEnd(null);           // a release this page never heard
+    gesture = {
+      id: event.pointerId, kind: kind, handle: handle,
+      x: Number(event.clientX) || 0, y: Number(event.clientY) || 0,
+      from: {left: node.offsetLeft, top: node.offsetTop,
+             width: node.offsetWidth, height: node.offsetHeight},
+      box: {left: node.offsetLeft, top: node.offsetTop,
+            width: node.offsetWidth, height: node.offsetHeight}
+    };
+    try { handle.setPointerCapture(event.pointerId); } catch (err) {}
+    gestureWire(true, handle);
+  }
+
+  /* build() calls this for the set it has just put in the body. A set
+     built while a finger is still down on the last one comes up under
+     that finger, takes the capture, and goes on following it. */
+  function gestureAdopt() {
+    var g = gesture;
+    if (!g || !host) return;
+    try { if (host.setPointerCapture && g.id !== undefined) host.setPointerCapture(g.id); }
+    catch (err) {
+      /* NotFoundError: that pointer is not down any more. Its release
+         went to the set that was taken away, so the drag is already over
+         and this set belongs where the box was saved. */
+      if (err && err.name === 'NotFoundError') {
+        gesture = null;
+        gestureWire(false, g.handle);
+        return;
+      }
+    }
+    gesturePaint(true);
+  }
+
   function drag(node, handle) {
+    handle.style.touchAction = 'none';       /* #1478: never a pan */
     handle.addEventListener('pointerdown', function (event) {
       if (event.button !== 0) return;
       if (event.target.closest('button')) return;
       if (full) return;              /* #1122: a full screen has nowhere to go */
-      var from = {x: event.clientX, y: event.clientY,
-                  left: node.offsetLeft, top: node.offsetTop};
-      try { handle.setPointerCapture(event.pointerId); } catch (err) {}
-      var move = function (e) {
-        /* Clamped so the title bar can never leave the window: a set
-         * dragged off the top edge is one nothing can bring back. */
-        node.style.left = Math.max(0, Math.min((root.innerWidth || 0) - 60,
-          from.left + e.clientX - from.x)) + 'px';
-        node.style.top = Math.max(0, Math.min((root.innerHeight || 0) - 30,
-          from.top + e.clientY - from.y)) + 'px';
-      };
-      var drop = function () {
-        handle.removeEventListener('pointermove', move);
-        handle.removeEventListener('pointerup', drop);
-        handle.removeEventListener('pointercancel', drop);
-        writeBox();                  // the preference is written on release
-      };
-      handle.addEventListener('pointermove', move);
-      handle.addEventListener('pointerup', drop);
-      handle.addEventListener('pointercancel', drop);
+      gestureBegin('move', event, handle, node);
       event.preventDefault();
     });
   }
@@ -810,29 +946,11 @@
     var handle = document.createElement('div');
     handle.className = 'sfx-tv-grip';
     handle.title = 'Drag to resize';
+    handle.style.touchAction = 'none';       /* #1478 */
     handle.addEventListener('pointerdown', function (event) {
       if (event.button !== 0) return;
       if (full) return;              /* #1122 */
-      var from = {x: event.clientX, y: event.clientY,
-                  w: node.offsetWidth, h: node.offsetHeight};
-      try { handle.setPointerCapture(event.pointerId); } catch (err) {}
-      var move = function (e) {
-        node.style.width = Math.max(MIN.w, Math.min(
-          (root.innerWidth || 0) - node.offsetLeft - 4,
-          from.w + e.clientX - from.x)) + 'px';
-        node.style.height = Math.max(MIN.h, Math.min(
-          (root.innerHeight || 0) - node.offsetTop - 4,
-          from.h + e.clientY - from.y)) + 'px';
-      };
-      var drop = function () {
-        handle.removeEventListener('pointermove', move);
-        handle.removeEventListener('pointerup', drop);
-        handle.removeEventListener('pointercancel', drop);
-        writeBox();
-      };
-      handle.addEventListener('pointermove', move);
-      handle.addEventListener('pointerup', drop);
-      handle.addEventListener('pointercancel', drop);
+      gestureBegin('size', event, handle, node);
       event.preventDefault();
       event.stopPropagation();
     });
@@ -2346,6 +2464,9 @@
        moment the pointer wanders - so a small press opens the sheet
        and a real drag moves the set. */
     drag(host, host);
+    /* #1478: and a set built while a finger is still dragging the one
+       before it comes up under that finger and goes on following it. */
+    gestureAdopt();
     /* [#1212] The slot needs them again on the next seam, and building a
        second set to get at them is the whole thing being avoided. */
     host.__parts = {shut: shut, flash: flash};
