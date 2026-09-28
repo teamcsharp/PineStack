@@ -1420,10 +1420,23 @@ class PineLive:
             held = ""
             if now_track.get("id") and not now_track.get("pinelive"):
                 self.held_record = {k: now_track.get(k) for k in ("id", "title", "artist")}
-                held = str(now_track.get("title") or "the record")
-                q = radio.setdefault("queue", [])
-                if not q or (q[0] or {}).get("id") != now_track.get("id"):
-                    q.insert(0, now_track)
+                # [plhold] a cut record comes back only if it had barely started
+                # (it restarts from the top) and never twice in an hour: every
+                # handoff used to re-queue it, so a flapping input or two tests
+                # aired the same record from the top again and again.
+                _t = time.time()
+                _in = _t - float(now_track.get("started") or _t)
+                _memo = {k: v for k, v in getattr(self, "_held_memo", {}).items()
+                         if _t - v < 3600.0}
+                if _in < 60.0 and str(now_track.get("id")) not in _memo:
+                    _memo[str(now_track.get("id"))] = _t
+                    held = str(now_track.get("title") or "the record")
+                    q = radio.setdefault("queue", [])
+                    if not q or (q[0] or {}).get("id") != now_track.get("id"):
+                        q.insert(0, now_track)
+                else:
+                    self.held_record = None
+                self._held_memo = _memo
             radio["fast_skip"] = True
             skip = _app("dj_skip")
             if callable(skip):
@@ -1636,6 +1649,20 @@ class PineLive:
     def public_video_blocked(self) -> bool:
         return self.armed() and not bool(self.settings.get("tailscale_video"))
 
+    def _failover(self) -> dict[str, Any] | None:
+        """[plcount] How close a live set is to handing the air back."""
+        live = self.live
+        if not self.armed() or live is None or self.phase != "live":
+            return None
+        now = time.time()
+        s = self.settings
+        quiet = (now - live.signal_at) if getattr(live, "signal_at", 0) else None
+        rx = (now - live.rx_at) if getattr(live, "rx_at", 0) else None
+        return {"quiet_s": None if quiet is None else round(quiet, 2),
+                "after_s": float(s["silence_seconds"]),
+                "rx_s": None if rx is None else round(rx, 2),
+                "dropout_s": float(s["dropout_seconds"])}
+
     def state(self) -> dict[str, Any]:
         s = self.settings
         h = self.host()
@@ -1696,6 +1723,7 @@ class PineLive:
             "v": CONTRACT_VERSION,
             "enabled": bool(s.get("enabled", True)),
             "phase": self.phase, "live": self.phase == "live", "armed": armed,
+            "failover": self._failover(),                          # [plcount]
             "event": ({"id": self.event_id(), "name": EVENT_NAME,
                        "started_at": float(self.event.get("started_at") or 0),
                        "live_seconds": round(self.live_seconds(), 1),

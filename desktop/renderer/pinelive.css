@@ -486,3 +486,14 @@
   min-width: 0; flex: 0 1 auto; margin-left: auto; margin-right: auto;
 }
 .pl-pop .pl-head-mid:empty { display: none; }
+
+/* [plcount] the failover countdown over the Script view's player */
+.pl-countdown { position: relative; height: 18px; margin: 0 0 6px; border-radius: 6px;
+  background: rgba(255, 255, 255, 0.07); overflow: hidden; box-sizing: border-box; }
+.pl-countdown-fill { position: absolute; left: 0; top: 0; bottom: 0; width: 100%;
+  background: #2f9e7a; transition: width 1s linear, background-color 0.3s; }
+.pl-countdown.warn .pl-countdown-fill { background: #d39a2f; }
+.pl-countdown.down .pl-countdown-fill { background: #b8473e; }
+.pl-countdown-words { position: relative; display: block; padding: 0 8px; font-size: 11px;
+  line-height: 18px; color: #fff; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.7); }
