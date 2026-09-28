@@ -402,7 +402,9 @@ EDITS = [
 # [integration 2026-09-28] system3_module_v6_patch.py edited inside this tool's 'panel-v5' text
 # (panel-v6): "applied" is that text with those edits folded in. The anchor is
 # unchanged, so a fresh file is patched exactly as before.
-_RECONCILED_PANEL_V5 = '    const module = await import("/system3/system3.js?v=6");\n'
+# [s3-banks-roll 2026-09-28] system3_banks_roll_patch.py (s3js-vbump) bumped the
+# import to ?v=7 inside that same text; folded forward again.
+_RECONCILED_PANEL_V5 = '    const module = await import("/system3/system3.js?v=7");   // [s3-banks-roll] replay / gold / listening chips on the turn\n'
 EDITS = [(e[0], e[1], _RECONCILED_PANEL_V5, e[3]) if e[0] == 'panel-v5' else e for e in EDITS]
 
 def plan(text):

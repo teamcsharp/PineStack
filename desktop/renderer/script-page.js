@@ -524,7 +524,7 @@
     [259200, '3 days'], [604800, '7 days']];
   /* System 3's module, under the newest ?v= this file already imports it by
      (so this pane shares the Script view's module rather than a second copy) */
-  var REVIEW_S3_VERSION = '8';
+  var REVIEW_S3_VERSION = '9';   /* [pine-graph] */
   var reviewFitWidth = -1;
   var reviewS3Held = null;      /* the mounted System 3 story, kept across repaints */
   var reviewQueue = {tab: 'open', data: null, history: null, older: 86400, confirm: '',
@@ -1166,7 +1166,7 @@
       style.href = techUrl('/system3/system3.css?v=7');
       document.head.appendChild(style);
     }
-    import(techUrl('/system3/system3.js?v=8')).then(function (mod) {
+    import(techUrl('/system3/system3.js?v=9')).then(function (mod) {
       return mod.openSystem3({request: s3Request, tab: tab || 'tables',
         onClose: function () { s3WindowOpen = null; }});
     }).then(function (view) { s3WindowOpen = view; }).catch(function (err) {
@@ -4850,7 +4850,7 @@
           style.href = techUrl('/system3/system3.css?v=7');
           document.head.appendChild(style);
         }
-        var mod = await import(techUrl('/system3/system3.js?v=8'));
+        var mod = await import(techUrl('/system3/system3.js?v=9'));
         pane.textContent = '';
         var box = make('div', 'sp-s3-host');
         pane.appendChild(box);
@@ -11612,7 +11612,7 @@
       style.href = techUrl('/system3/system3.css?v=7');
       document.head.appendChild(style);
     }
-    import(techUrl('/system3/system3.js?v=8')).then(function (mod) {
+    import(techUrl('/system3/system3.js?v=9')).then(function (mod) {
       return mod.openRoll({request: s3Request, conversationId: info.conversation_id,
         eventId: roll ? String(roll.event_id || '') : '', turnId: info.turn_id, lineId: id});
     }).catch(function (err) {
@@ -17033,7 +17033,7 @@
         style.href = techUrl('/system3/system3.css?v=7');
         document.head.appendChild(style);
       }
-      import(techUrl('/system3/system3.js?v=8')).then(function (mod) {
+      import(techUrl('/system3/system3.js?v=9')).then(function (mod) {
         if (lineTabsPane !== pane) return null;
         return mod.mountLineTabs(pane, {request: s3Request, lineId: id, tab: lineTab});
       }).then(function (view) {

@@ -75,6 +75,23 @@
   var tapAt = 0;
   var tapTimer = 0;
 
+  /* [pincrop] THE CROP: hold -> radial -> draw -> the station -> the
+   * supervisor's encode (tools/pinelink.py). This page never cuts a pixel:
+   * it draws the box and posts fractions, and every road - the TS door,
+   * the HLS, the stills, the clips - shows only what the encode kept. */
+  var HOLD_MS = 550;           /* the SFX wall's hold: same finger, same wait */
+  var HOLD_SLOP = 8;
+  var CROP_RAW_MS = 500;       /* frame_raw.jpg is written twice a second */
+  var holdMute = 0;            /* a hold happened: its release is not a tap */
+  var cropOn = false;          /* state.json's crop.on, as last polled */
+  var cropShade = null;        /* the radial */
+  var cropEl = null;           /* the draw overlay */
+  var cropRawTimer = 0;
+  var cropUnwatch = null;      /* PineDismiss registrations, undone on close */
+  var cropDrawUnwatch = null;
+  var cropView = null;         /* GET /api/pinelink/crop as last read */
+  var cropWatch = 0;           /* the after-apply poll */
+
   /* #1358: AND IT HAD NO ANSWER AT ALL OFF THE DESKTOP.
    *
    * pineStationBase is defined by the Electron renderer. Anywhere else -
@@ -282,6 +299,17 @@
       } catch (e) { /* no observer: the load hook and the drag still send it */ }
     }
     root.addEventListener('resize', nativeBoxSoon);
+    /* [pincrop] a HOLD on the page's own picture - the desktop, or the
+     * tablet's JPEG road - opens the radial; the native surface catches
+     * its own hold and calls PineCam.holdPicture in device pixels. A
+     * right-click is the desktop's second road, like the SFX TV's. */
+    wireHold(box);
+    box.addEventListener('contextmenu', function (ev) {
+      if (box.classList.contains('pine-cam-round')) return;
+      ev.preventDefault();
+      ev.stopPropagation();
+      holdAt(ev.clientX, ev.clientY);
+    });
     try { if (localStorage.getItem(ROUND_KEY) === '1') setRound(true); } catch (e) { /* stays open */ }
     return box;
   }
@@ -375,6 +403,8 @@
   }
 
   function close() {
+    cropRadialClose(false);                /* [pincrop] no menu over a closed box */
+    cropDrawClose(false);
     nativeStop();                          /* #1470: before the box goes */
     shown = false;
     if (box) box.hidden = true;
@@ -472,6 +502,7 @@
    * handle's tap) arrive here, so the two roads behave the same. */
   function pictureTapped(single) {
     var now = Date.now();
+    if (now < holdMute) return;    /* [pincrop] that press was a hold */
     if (tapAt && now - tapAt < 350) {
       tapAt = 0;
       if (tapTimer) { clearTimeout(tapTimer); tapTimer = 0; }
@@ -596,6 +627,386 @@
     nativeAsk((locked || hidden) ? 'hide' : 'show');
   }
 
+  /* ============================================================ [pincrop]
+   * THE CROP. "tap and drag to draw a crop window that basically reduces
+   * the webcam to be that size of window Cropping out everything around
+   * it ... if I tap and hold, it shows a radio pod menu and from there
+   * there's a crop option ... and then it allows me to tap and draw a box
+   * that determines my crop area for the camera."
+   *
+   * The box is CUT AT THE CAMERA - tools/pinelink.py re-encodes with the
+   * crop, so the TS door, the HLS, the stills, the clips and anything
+   * leaving full screen all carry only the box; nothing here is a mask.
+   * This page owns three things:
+   *
+   *   THE HOLD. 550 ms without moving, on the picture. The desktop's is
+   *   wired in build() (wireHold, plus right-click); the tablet's native
+   *   surface swallows touches, so PineCamWall catches the hold itself
+   *   and calls PineCam.holdPicture(x, y) in DEVICE pixels - divided here
+   *   by camScale(), the true glass factor, never devicePixelRatio.
+   *
+   *   THE RADIAL, in the SFX TV's shape (its classes are this page's own,
+   *   pine-cam-radial-*, so the two skins can drift apart on purpose):
+   *   Crop draws a new box, Adjust redraws from the current one, Reset
+   *   puts the whole picture back. The shade closes it; so do Escape and
+   *   the kiosk's BACK, through PineDismiss.
+   *
+   *   THE DRAW. A full-screen overlay over /api/pinelink/crop/frame.jpg -
+   *   the WHOLE frame, 2 fps, house-only - because a new box must be
+   *   aimed at everything the camera sees, not at the already-cropped
+   *   stream. A drag is the rubber band; the box is kept as FRACTIONS of
+   *   the picture, so a resize or the next frame repaints it in place.
+   *   Confirm posts the fractions and the supervisor restarts only its
+   *   ffmpeg (a few seconds, said in so many words); Cancel and BACK
+   *   leave the crop as it was. While the overlay or the radial is up the
+   *   native surface is retired (nativeMenu), so the same HTML works the
+   *   desktop and the tablet - and the surface comes back cropped.
+   * ==================================================================== */
+
+  function cropAsk() {
+    return Promise.resolve(ask('/api/pinelink/crop')).then(function (v) {
+      if (v) cropView = v;
+      return v;
+    }, function () { return null; });
+  }
+
+  function cropSay(text) {
+    var why = document.getElementById('pineCamWhy');
+    if (why) why.textContent = String(text || '');
+  }
+
+  /* After an apply: relay the station's sentence - "starting again with
+   * the new box", then "cropped: only the box goes out" - until settled. */
+  function cropFollow() {
+    var tries = 10;
+    if (cropWatch) { clearTimeout(cropWatch); cropWatch = 0; }
+    (function again() {
+      cropWatch = setTimeout(function () {
+        cropWatch = 0;
+        cropAsk().then(function (v) {
+          if (!v) return;
+          cropSay(v.say || '');
+          if (v.pending && (tries -= 1) > 0) again();
+        });
+      }, 2000);
+    }());
+  }
+
+  /* The page road's hold: a press that stays put for HOLD_MS. A press on
+   * a control is the control's; a move is a drag of the box. */
+  function wireHold(el) {
+    var held = null;
+    var timer = 0;
+    var forget = function () {
+      if (timer) { clearTimeout(timer); timer = 0; }
+      held = null;
+    };
+    el.addEventListener('pointerdown', function (ev) {
+      if (ev.button !== 0 && ev.pointerType === 'mouse') return;
+      if (ev.target && ev.target.closest && ev.target.closest('button, input, select, textarea, a')) return;
+      if (el.classList.contains('pine-cam-round')) return;
+      held = {x: ev.clientX || 0, y: ev.clientY || 0};
+      timer = setTimeout(function () {
+        timer = 0;
+        var at = held;
+        held = null;
+        holdMute = Date.now() + 900;   /* the release is not a tap */
+        holdAt(at.x, at.y);
+      }, HOLD_MS);
+    });
+    el.addEventListener('pointermove', function (ev) {
+      if (!held) return;
+      if (Math.abs((ev.clientX || 0) - held.x) > HOLD_SLOP
+          || Math.abs((ev.clientY || 0) - held.y) > HOLD_SLOP) forget();
+    });
+    el.addEventListener('pointerup', forget);
+    el.addEventListener('pointercancel', forget);
+  }
+
+  /* Native -> page: the surface's hold, in device pixels (the same trap
+   * as camRect, the other way: divide by the true factor). */
+  function holdPicture(x, y) {
+    var s = camScale();
+    holdAt((Number(x) || 0) / s.x, (Number(y) || 0) / s.y);
+  }
+
+  function holdAt(cx, cy) {
+    if (!shown) return;                  /* no picture, no crop menu */
+    cropRadial(cx, cy);
+  }
+
+  function cropRadialClose(free) {
+    var shade = cropShade;
+    cropShade = null;
+    if (cropUnwatch) { try { cropUnwatch(); } catch (e) { } cropUnwatch = null; }
+    if (shade && shade.parentNode) shade.parentNode.removeChild(shade);
+    if (free !== false && !cropEl) nativeMenu(false);
+  }
+
+  function cropRadial(cx, cy) {
+    cropRadialClose(false);
+    nativeMenu(true);                    /* HTML must own the glass while a menu is up */
+    var shade = document.createElement('div');
+    shade.className = 'pine-cam-radial-shade';
+    var menu = document.createElement('div');
+    menu.className = 'pine-cam-radial';
+    menu.setAttribute('role', 'menu');
+    var W = root.innerWidth || 800;
+    var H = root.innerHeight || 600;
+    menu.style.left = Math.max(112, Math.min(W - 112, Number(cx) || W / 2)) + 'px';
+    menu.style.top = Math.max(112, Math.min(H - 112, Number(cy) || H / 2)) + 'px';
+    var note = document.createElement('span');
+    note.className = 'pine-cam-radial-note';
+    note.textContent = 'PINE CAM';
+    menu.appendChild(note);
+    var item = function (label, ref, cls, word, go) {
+      var b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'pine-cam-radial-item ' + cls;
+      b.title = label;
+      b.setAttribute('aria-label', label);
+      b.innerHTML = icon(ref, label, word);
+      b.addEventListener('click', function (ev) { ev.stopPropagation(); go(); });
+      menu.appendChild(b);
+      return b;
+    };
+    item('Crop: draw the box the stream keeps', 'c:cut', 'crop', 'crop', function () {
+      cropRadialClose(false);
+      cropDrawOpen(false);
+    });
+    var adj = item('Adjust the crop: redraw it from the whole picture', 'c:edit', 'adjust', 'adjust', function () {
+      cropRadialClose(false);
+      cropDrawOpen(true);
+    });
+    var res = item('Reset: the whole picture goes out again', 'c:maximize', 'reset', 'reset', function () {
+      if (!(cropView && (cropView.want || cropView.applied))) {
+        note.textContent = 'no crop is set - the whole picture already goes out';
+        return;
+      }
+      note.textContent = 'resetting…';
+      Promise.resolve(post('/api/pinelink/crop', {reset: true})).then(function (r) {
+        cropRadialClose();
+        cropSay((r && r.say) || 'the station did not answer');
+        if (r && r.ok) cropFollow();
+      }, function () {
+        cropRadialClose();
+        cropSay('the station did not answer');
+      });
+    });
+    adj.classList.add('off');
+    res.classList.add('off');
+    shade.appendChild(menu);
+    shade.addEventListener('click', function (ev) {
+      if (ev.target === shade) cropRadialClose();
+    });
+    document.body.appendChild(shade);
+    cropShade = shade;
+    /* Escape and the kiosk's BACK close it - its own ways out, never the
+     * surface underneath (#1450). */
+    if (root.PineDismiss && root.PineDismiss.watch) {
+      cropUnwatch = root.PineDismiss.watch(shade, function () { cropRadialClose(); });
+    }
+    cropAsk().then(function (v) {
+      if (!v || cropShade !== shade) return;
+      var have = !!(v.want || v.applied);
+      adj.classList.toggle('off', !have);
+      res.classList.toggle('off', !have);
+      if (v.say) note.textContent = String(v.say);
+    });
+  }
+
+  function cropDrawClose(free) {
+    var el = cropEl;
+    cropEl = null;
+    if (cropRawTimer) { clearInterval(cropRawTimer); cropRawTimer = 0; }
+    if (cropDrawUnwatch) { try { cropDrawUnwatch(); } catch (e) { } cropDrawUnwatch = null; }
+    if (el) {
+      if (el.__pincropResize) root.removeEventListener('resize', el.__pincropResize);
+      if (el.parentNode) el.parentNode.removeChild(el);
+    }
+    if (free !== false && !cropShade) nativeMenu(false);
+  }
+
+  function cropDrawOpen(adjust) {
+    cropDrawClose(false);
+    nativeMenu(true);
+    var el = document.createElement('div');
+    el.id = 'pineCamCrop';
+    el.className = 'pine-cam-crop';
+    el.innerHTML =
+      '<div class="pine-cam-crop-stage">'
+      + '<img class="pine-cam-crop-img" alt="The whole Pine Cam picture" draggable="false">'
+      + '<div class="pine-cam-crop-band" hidden></div>'
+      + '</div>'
+      + '<div class="pine-cam-crop-bar">'
+      + '<b>CROP THE PINE CAM</b>'
+      + '<span class="pine-cam-crop-note">this is the WHOLE picture - drag a box over '
+      + 'what the stream may show; everything outside it is cut at the camera</span>'
+      + '<button type="button" class="pine-cam-crop-ok" disabled '
+      + 'title="Keep only the box: every road shows just this from now on">'
+      + icon('c:checkmark--filled', '', '') + '<span>Keep only the box</span></button>'
+      + '<button type="button" class="pine-cam-crop-no" '
+      + 'title="Leave the crop exactly as it is">'
+      + icon('c:close--filled', '', '') + '<span>Cancel</span></button>'
+      + '</div>';
+    document.body.appendChild(el);
+    cropEl = el;
+    var stage = el.querySelector('.pine-cam-crop-stage');
+    var img = el.querySelector('.pine-cam-crop-img');
+    var band = el.querySelector('.pine-cam-crop-band');
+    var tell = el.querySelector('.pine-cam-crop-note');
+    var keep = el.querySelector('.pine-cam-crop-ok');
+    var frac = null;                     /* the drawn box, fractions of the picture */
+    var pen = null;                      /* the drag in flight, client px */
+
+    /* Where the picture actually is: the img sits contain-fit in the
+     * stage, so the letterbox is derived from its natural size. Before
+     * the first frame the camera's own 848x480 stands in. */
+    function pictureRect() {
+      var r = stage.getBoundingClientRect();
+      var nw = img.naturalWidth || 848;
+      var nh = img.naturalHeight || 480;
+      var k = Math.min(r.width / Math.max(1, nw), r.height / Math.max(1, nh));
+      var w = Math.max(1, nw * k);
+      var h = Math.max(1, nh * k);
+      return {x: r.left + (r.width - w) / 2, y: r.top + (r.height - h) / 2, w: w, h: h};
+    }
+
+    function paintBand(b) {
+      if (!b) {
+        band.hidden = true;
+        keep.disabled = true;
+        return;
+      }
+      var s = stage.getBoundingClientRect();
+      band.hidden = false;
+      band.style.left = Math.round(b.x - s.left) + 'px';
+      band.style.top = Math.round(b.y - s.top) + 'px';
+      band.style.width = Math.round(b.w) + 'px';
+      band.style.height = Math.round(b.h) + 'px';
+      keep.disabled = false;
+    }
+
+    /* The committed box is FRACTIONS, so the next frame, a rotation or a
+     * resize repaints it on the same part of the picture. */
+    function bandFromFrac() {
+      if (pen) return;                   /* a drag in flight owns the band */
+      if (!frac) { paintBand(null); return; }
+      var p = pictureRect();
+      paintBand({x: p.x + frac.x * p.w, y: p.y + frac.y * p.h,
+        w: frac.w * p.w, h: frac.h * p.h});
+    }
+    el.__pincropResize = bandFromFrac;
+    root.addEventListener('resize', bandFromFrac);
+
+    function pin(ev, p) {
+      return {x: Math.max(p.x, Math.min(p.x + p.w, Number(ev.clientX) || 0)),
+        y: Math.max(p.y, Math.min(p.y + p.h, Number(ev.clientY) || 0))};
+    }
+    stage.addEventListener('pointerdown', function (ev) {
+      if (ev.button !== 0 && ev.pointerType === 'mouse') return;
+      var at = pin(ev, pictureRect());
+      pen = {id: ev.pointerId, x: at.x, y: at.y};
+      paintBand({x: at.x, y: at.y, w: 0, h: 0});
+      keep.disabled = true;
+      try { stage.setPointerCapture(ev.pointerId); } catch (e) { /* older engine */ }
+      ev.preventDefault();
+    });
+    stage.addEventListener('pointermove', function (ev) {
+      if (!pen || ev.pointerId !== pen.id) return;
+      var at = pin(ev, pictureRect());
+      paintBand({x: Math.min(pen.x, at.x), y: Math.min(pen.y, at.y),
+        w: Math.abs(at.x - pen.x), h: Math.abs(at.y - pen.y)});
+      keep.disabled = true;
+      ev.preventDefault();
+    });
+    stage.addEventListener('pointerup', function (ev) {
+      if (!pen || ev.pointerId !== pen.id) return;
+      try { stage.releasePointerCapture(pen.id); } catch (e) { /* not held */ }
+      var p = pictureRect();
+      var at = pin(ev, p);
+      var b = {x: Math.min(pen.x, at.x), y: Math.min(pen.y, at.y),
+        w: Math.abs(at.x - pen.x), h: Math.abs(at.y - pen.y)};
+      pen = null;
+      if (b.w < 6 || b.h < 6) {
+        frac = null;
+        paintBand(null);
+        tell.textContent = 'a tap is not a box - drag corner to corner over what may be seen';
+        return;
+      }
+      frac = {x: (b.x - p.x) / p.w, y: (b.y - p.y) / p.h,
+        w: b.w / p.w, h: b.h / p.h};
+      bandFromFrac();
+      tell.textContent = Math.round(frac.w * 100) + '% × '
+        + Math.round(frac.h * 100)
+        + '% of the picture - press "Keep only the box", or drag again';
+    });
+    stage.addEventListener('pointercancel', function () { pen = null; bandFromFrac(); });
+
+    keep.addEventListener('click', function () {
+      if (!frac) return;
+      keep.disabled = true;
+      tell.textContent = 'sending the box to the camera…';
+      Promise.resolve(post('/api/pinelink/crop', {crop: frac})).then(function (r) {
+        if (!r) { keep.disabled = false; tell.textContent = 'the station did not answer'; return; }
+        if (!r.ok) {
+          /* Refused with a sentence - a slip of a box, a station that
+           * cannot write - and the overlay stays for another drag. */
+          keep.disabled = false;
+          tell.textContent = String(r.say || 'the station did not keep it');
+          return;
+        }
+        cropDrawClose();
+        cropSay(r.say || 'cropped - the camera starts again with only the box');
+        cropFollow();
+      }, function () {
+        keep.disabled = false;
+        tell.textContent = 'the station did not answer';
+      });
+    });
+    el.querySelector('.pine-cam-crop-no').addEventListener('click', function () {
+      cropDrawClose();
+    });
+
+    /* Adjusting: the box being kept is drawn first, so "adjust" reads as
+     * move-this, not start-from-nothing. */
+    function primeAdjust() {
+      if (frac || pen || cropEl !== el) return;
+      var b = cropView && (cropView.want || cropView.applied);
+      if (b && typeof b.x === 'number') {
+        frac = {x: b.x, y: b.y, w: b.w, h: b.h};
+        bandFromFrac();
+        tell.textContent = 'this is the box being kept - drag a new one, '
+          + 'keep this one, or Cancel';
+      }
+    }
+
+    var seen = false;
+    img.addEventListener('load', function () {
+      if (!seen) {
+        seen = true;
+        if (adjust) primeAdjust();
+      }
+      bandFromFrac();                    /* the letterbox moves with the frame size */
+    });
+    img.addEventListener('error', function () {
+      tell.textContent = 'the camera is not sending the whole picture right '
+        + 'now - it joins again in a moment';
+    });
+    function paintRaw() {
+      img.src = base() + '/api/pinelink/crop/frame.jpg?c=' + Date.now();
+    }
+    paintRaw();
+    cropRawTimer = setInterval(paintRaw, CROP_RAW_MS);
+    if (adjust) cropAsk().then(function () { primeAdjust(); });
+
+    /* Cancel is on the bar; Escape and BACK are PineDismiss's - the
+     * overlay covers everything, so an outside tap cannot exist. */
+    if (root.PineDismiss && root.PineDismiss.watch) {
+      cropDrawUnwatch = root.PineDismiss.watch(el, function () { cropDrawClose(); });
+    }
+  }
+
   /* ---------------------------------------------------------- the ask */
 
   function look() {
@@ -605,6 +1016,7 @@
        * and a stale one claiming "live" is exactly the lie this has to
        * avoid. Both, or it is not there. */
       live = !!(got && got.state === 'live' && got.fresh);
+      cropOn = !!(got && got.crop && got.crop.on);    /* [pincrop] */
       showButton(live);
       /* #1470: the supervisor's TS door, when it is up. `ok` is its own
        * heartbeat (a datagram in the last five seconds); a door that has
@@ -619,7 +1031,7 @@
           if (!st || !why || !live || boxRecFrom) return;
           if (st.on === false) { nativeOn = false; lastBoxKey = ''; nativeStart(); return; }
           var lag = Number(st.lag_ms || 0);
-          why.textContent = 'live · native'
+          why.textContent = 'live · native' + (cropOn ? ' · cropped' : '')   /* [pincrop] */
             + (lag > 0 ? ' · ' + (lag / 1000).toFixed(1) + 's' : '')
             + (Number(st.reconnects) ? ' · ' + st.reconnects + ' rejoin' : '');
         });
@@ -664,7 +1076,7 @@
       }
       var why = document.getElementById('pineCamWhy');
       if (why && got) {
-        why.textContent = live ? 'live'
+        why.textContent = live ? ('live' + (cropOn ? ' · cropped' : ''))   /* [pincrop] */
           : (got.state === 'live' && !got.fresh) ? 'stale' : String(got.state || '');   /* #1387 */
       }
       paintRow(got, live);
@@ -2064,10 +2476,11 @@
     toggle: toggle, isLive: function () { return live; },
     /* #1470: the native picture's callbacks and a reading of it. */
     tapPicture: tapPicture, wallBoxChanged: wallBoxChanged, bare: setBare,
-    dragPicture: dragPicture,
+    dragPicture: dragPicture, holdPicture: holdPicture,   /* [pincrop] */
     native: function () { return {on: nativeOn, full: nativeFull, bare: bare, ts: tsInfo}; },
     /* #1118: the sheets, reachable from a console or another view. */
     ladder: openLadder, prefs: openPrefs, folder: showFolder,
+    crop: cropDrawOpen, cropMenu: holdAt,                 /* [pincrop] */
     announce: function () { return post('/api/pinelink/announce', {}); }};
 
   if (document.readyState === 'loading') {

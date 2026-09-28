@@ -342,6 +342,19 @@ class System2Runtime:
             # the status page showed it as ready. Say it, and say it here.
             reason.append("Past its expiry; the planner no longer offers it")
             viable = False
+        # [s3-banks-roll] THE RE-AIR GATE: a banked round that has aired before
+        # and that the gate retired - copied turns, an echo loop, a
+        # non_compliant verdict, the copy gate's flags, the sweep's mark - is
+        # never offered to a slot again (app.py bank_reair_refusal).
+        _gate = getattr(h, "bank_reair_refusal", None)
+        if _gate is not None and float(row.get("aired_at") or entry.get("aired_at") or 0):
+            try:
+                _gate_why = str(_gate(kind, row) or "")
+            except Exception:  # noqa: BLE001
+                _gate_why = ""
+            if _gate_why:
+                reason.append("Never goes out again - the re-air gate: " + _gate_why[:160])
+                viable = False
         speech_seconds = sum(float(x.get("seconds") or 0) for x in lines)
         air_seconds = speech_seconds
         if kind != "track_talk" and complete:
@@ -1638,6 +1651,21 @@ class System2Runtime:
                         self.refuse(slot, candidate, "the complete recording (%.0fs) no longer fits the running occurrence before %s"
                                     % (length, time.strftime("%H:%M:%S", time.localtime(slot["deadline"]))))
                         continue
+                # [s3-banks-roll] A BANKED ROUND THAT HAS AIRED BEFORE GOES OUT
+                # AGAIN ONLY ON THE ROULETTE - this slot is one more road that
+                # re-airs the bank. The re-air gate first (a round it retired
+                # never goes), then bank.reair (app.py bank_reair_pick); the
+                # airing is stamped a replay on its ledger rows.
+                _s3_replay = None
+                _reair_pick = getattr(h, "bank_reair_pick", None)
+                if (_reair_pick is not None and kind != "track_talk"
+                        and float(row.get("aired_at") or 0)):
+                    _again, _s3_replay = _reair_pick(
+                        kind, [row], "System2's %s entry" % (slot.get("label") or kind))
+                    if _again is None:
+                        self.refuse(slot, candidate, "a replay goes out again only on the roulette - "
+                                                     "bank.reair or the re-air gate kept it off")
+                        continue
                 # Admission is checked again after assembly and immediately
                 # before publication by can_handoff below.
                 try:
@@ -1667,6 +1695,8 @@ class System2Runtime:
                 entry.update(prep_kind=kind, _system2=proof,
                              _ready_slot={"occurrence": slot["id"], "slot_id": slot["template_id"],
                                           "kind": kind, "deadline": slot["deadline"]})
+                if _s3_replay:
+                    entry["_s3_replay"] = _s3_replay          # [s3-banks-roll] rides its ledger rows
                 if kind == "track_talk":
                     entry["_system2_track_position"] = copy.deepcopy(track_position)
                     entry["_ready_slot"]["deadline"] = min(slot["deadline"], track_position["deadline"])

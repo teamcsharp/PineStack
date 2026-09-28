@@ -21,6 +21,11 @@ One ffmpeg, one input, six outputs:
       └─ HLS   → data/pinelink/low/index.m3u8    the phone's picture: h264
                  RE-ENCODED, 424x240, 15 fps, 350 kbit/s  (#1474)
 
+[pincrop] With a crop set (data/pinelink_crop.json) the same outputs are cut
+from the operator's box instead of the whole frame, and a seventh -
+frame_raw.jpg, the whole picture at 2 fps - is what the box is drawn on. See
+ffmpeg_cmd_cropped(): the copy outputs become one encode while a box is set.
+
 All but the stills and the low lane are `-c copy`. The camera already hands
 over h264, so what the house watches and what is kept are not re-encoded:
 no GPU, no quality loss, and a recording that is byte-identical to what was
@@ -43,6 +48,7 @@ import argparse
 import glob                  # #1359: finding the adapter on the bus
 import itertools             # TsDoor: the tail of the ring, from the right
 import json
+import math                  # [pincrop] the crop's edges, rounded inward
 import os
 import re                    # #1118: the clips folder preference
 import shutil
@@ -223,6 +229,12 @@ def say(state: str, **more) -> None:
         lanes = phone_lanes()
     except Exception:  # noqa: BLE001
         lanes = {"low": {"ok": False}, "frame_small": {"ok": False}}
+    # [pincrop] the cut the running ffmpeg makes travels the same way, so
+    # the station can tell "applied" from "asked for" without a new door.
+    try:
+        crop = dict(_CROP)
+    except Exception:  # noqa: BLE001
+        crop = {"on": False}
     try:
         OUT.mkdir(parents=True, exist_ok=True)
         STATE.write_text(json.dumps({
@@ -233,6 +245,7 @@ def say(state: str, **more) -> None:
             # #1250b: how the last stream ended travels with every
             # other reading, so no surface has to ask a second door.
             **_LAST_SEEN, "stream": dict(_STREAM), "ts": ts, **lanes,
+            "crop": crop,                                   # [pincrop]
             **more},
             indent=2))
     except Exception:  # noqa: BLE001
@@ -565,8 +578,10 @@ def camera_awake() -> bool:
     """Does the camera answer? Asked of RTSP, not of ping: these cameras
     answer ICMP while their streamer is still coming up, so a ping is a
     reading that is true too early."""
-    code, _ = run(["ffprobe", "-v", "error", "-rtsp_transport", "tcp",
-                   "-timeout", "4000000", "-show_streams", RTSP], 15)
+    code, out = run(["ffprobe", "-v", "error", "-rtsp_transport", "tcp",
+                     "-timeout", "4000000", "-show_streams", RTSP], 15)
+    if code == 0:
+        source_size(out)        # [pincrop] the frame the crop is cut from
     return code == 0
 
 
@@ -637,7 +652,312 @@ def stream_fault(err: str, life_s: float, stalled: bool) -> dict:
             "life_s": round(life_s, 1)}
 
 
-def ffmpeg_cmd() -> list[str]:
+# ---------------------------------------------------------------------------
+# [pincrop] THE CROP, CUT WHERE THE PICTURE IS MADE.
+#
+# "tap and draw a box that determines my crop area for the camera. So that
+#  way if any event I need to crop things outside of the camera from
+#  showing on the stream that is possible." (the operator, 2026-09-28)
+#
+# The box is cut HERE, in the one ffmpeg every road reads, so nothing outside
+# it is in any file or packet this process writes: not the TS door the
+# tablet plays, not the HLS the house and the phone watch, not the stills the
+# tune page polls, not the clips that are kept. A crop in a viewer would only
+# hide what every other road still carried.
+#
+# WHY IT RE-ENCODES. The copy outputs are the camera's own H.264, and a
+# bitstream cannot be cut without decoding it. H.264 does have a crop window
+# in its SPS (h264_metadata sets it for free), but that only asks a decoder
+# not to SHOW the edge: the pixels are still in every frame, one flag away
+# from anyone who looks. For "must not be on the stream" that is not a crop.
+# So while a box is set, the three copy outputs become ONE libx264 encode
+# handed to three muxers through `tee`; with no box the command is exactly
+# what it always was - copy, nothing encoded, a recording byte-identical to
+# what the camera sent.
+#
+# HOW IT KEEPS ITS SHAPE. The box is cut, scaled up to fit inside the source
+# frame with its aspect kept, and padded with black to the source size
+# (848x480). Every road goes on receiving the frame it always did - the
+# tablet's surface stretches whatever it is fed to its rectangle, the low
+# lane is 424 wide - so no reader sees a new shape. The edges are rounded
+# INWARD to even pixels, so the cut never holds a pixel from outside the box.
+#
+# WHERE IT LIVES. data/pinelink_crop.json, written whole (through a rename)
+# by the station's /api/pinelink/crop and by nothing else. pinelink_pref.json
+# has four writers that rewrite it whole, one of them from a five-second
+# memo, and a privacy setting must not depend on all four merging right.
+# Fractions of the source frame: {"crop": {"x", "y", "w", "h"}} or
+# {"crop": null}.
+#
+# FAIL CLOSED. A file that cannot be read keeps the cut that is running, and
+# with none running the camera stays off the air until it can be read: an
+# unreadable crop must never turn into the whole picture.
+# ---------------------------------------------------------------------------
+CROP_FILE = ROOT / "data" / "pinelink_crop.json"
+RAW = OUT / "frame_raw.jpg"     # the WHOLE frame, 2 fps, to draw the box on
+RAW_FPS = 2
+CROP_MIN = 0.05                 # a side below 5% of the frame is a slip, not a box
+# The one encode: the camera's own GOP (a keyframe every half second - the TS
+# door starts every client on one) and about the camera's own 1.64 Mbit/s.
+CROP_GOP = 15
+CROP_CRF = 22
+CROP_MAXRATE_K = 1800
+CROP_BUFSIZE_K = 900
+CROP_STOP_WAIT_S = 8.0          # SIGINT, then this long, then SIGKILL
+_SOURCE = [848, 480]            # read by camera_awake(); 848x480 until then
+_CROP: dict = {"on": False, "box": None, "error": "", "at": 0.0}
+
+
+def source_size(probe: str) -> None:
+    """[pincrop] The camera's frame size from camera_awake()'s ffprobe: the
+    size the box is cut from and the size every road is fed. The first
+    width/height pair; anything unreadable keeps the last good answer."""
+    try:
+        w = re.search(r"(?m)^width=(\d+)\s*$", probe or "")
+        h = re.search(r"(?m)^height=(\d+)\s*$", probe or "")
+        if w and h:
+            ww, hh = int(w.group(1)), int(h.group(1))
+            if 64 <= ww <= 8192 and 64 <= hh <= 8192:
+                _SOURCE[:] = [ww, hh]
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def crop_clean(raw) -> dict | None:
+    """[pincrop] The box as it will be cut: fractions of the source frame
+    from its top-left corner, clamped into the frame, five places. None is
+    no crop; anything that is neither raises ValueError."""
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ValueError("the crop is not an object")
+    try:
+        x, y, w, h = (float(raw[k]) for k in ("x", "y", "w", "h"))
+    except (KeyError, TypeError, ValueError):
+        raise ValueError("the crop needs numbers x, y, w and h") from None
+    if not all(math.isfinite(v) for v in (x, y, w, h)):
+        raise ValueError("the crop has a number that is not finite")
+    x, y = min(max(x, 0.0), 1.0), min(max(y, 0.0), 1.0)
+    w, h = min(w, 1.0 - x), min(h, 1.0 - y)
+    if w < CROP_MIN or h < CROP_MIN:
+        raise ValueError("the crop box is under %d%% of the picture on a side"
+                         % round(CROP_MIN * 100))
+    return {"x": round(x, 5), "y": round(y, 5),
+            "w": round(w, 5), "h": round(h, 5)}
+
+
+def crop_wanted() -> tuple:
+    """[pincrop] (box or None, error) from data/pinelink_crop.json. No file
+    is no crop. A non-empty error means the file is there and cannot be
+    read as a crop - and then the caller KEEPS the cut that is running (or,
+    with none running, keeps the camera off the air)."""
+    try:
+        text = CROP_FILE.read_text()
+    except FileNotFoundError:
+        return None, ""
+    except Exception as err:  # noqa: BLE001
+        return None, "the crop file cannot be read (%s)" % str(err)[:160]
+    try:
+        got = json.loads(text)
+        if not isinstance(got, dict):
+            raise ValueError("it is not an object")
+        return crop_clean(got.get("crop")), ""
+    except Exception as err:  # noqa: BLE001
+        return None, "the crop file is not a crop (%s)" % str(err)[:160]
+
+
+def crop_moved(running) -> bool:
+    """[pincrop] Does the file name a different box than the one being cut?
+    Only a file that can be READ moves the crop."""
+    want, bad = crop_wanted()
+    return (not bad) and want != running
+
+
+def crop_plan(box: dict, src=None) -> dict:
+    """[pincrop] The box in pixels and what it becomes: `cut` (x, y, w, h)
+    of the source, scaled to `out` inside the source frame with its aspect
+    kept, placed at `pad` on black. Every edge is rounded INWARD to an even
+    pixel - even for 4:2:0 chroma, inward so the cut never holds a pixel
+    from outside the box that was drawn."""
+    W, H = (int(v) for v in (src or _SOURCE))
+    W, H = W - W % 2, H - H % 2
+
+    def edges(a: float, b: float, n: int) -> tuple:
+        lo = int(math.ceil(a * n - 1e-6))
+        lo += lo % 2
+        hi = min(int(math.floor(b * n + 1e-6)), n)
+        hi -= hi % 2
+        if hi - lo < 2:                   # only for a box far below CROP_MIN
+            lo = min(lo, n - 2)
+            hi = lo + 2
+        return lo, hi - lo
+
+    cx, cw = edges(box["x"], box["x"] + box["w"], W)
+    cy, ch = edges(box["y"], box["y"] + box["h"], H)
+    k = min(W / cw, H / ch)
+    ow = min(W, max(2, int(round(cw * k / 2.0)) * 2))
+    oh = min(H, max(2, int(round(ch * k / 2.0)) * 2))
+    px, py = (W - ow) // 2, (H - oh) // 2
+    return {"src": [W, H], "cut": [cx, cy, cw, ch], "out": [ow, oh],
+            "pad": [px - px % 2, py - py % 2]}
+
+
+def crop_arm(box, error: str = "") -> None:
+    """[pincrop] Record the cut this run makes (say() carries it) - and when
+    it is not the cut the last run made, empty the TS door: the packets in
+    its ring are a picture that may no longer be shown."""
+    was = _CROP.get("box")
+    plan = crop_plan(box) if box else {}
+    _CROP.clear()
+    _CROP.update({"on": bool(box), "box": box, "error": error,
+                  "at": time.time(), "src": list(_SOURCE),
+                  "raw": RAW.name if box else "", **plan})
+    if box != was and _TS_DOOR[0] is not None:
+        try:
+            _TS_DOOR[0].flush("the crop changed")
+        except Exception as err:  # noqa: BLE001
+            _ts_log("flush failed: %s" % err)
+
+
+def stop_gently(proc, wait_s: float = CROP_STOP_WAIT_S) -> None:
+    """[pincrop] SIGINT first: ffmpeg then closes every output properly, so
+    the five-minute clip it was writing keeps its index. SIGKILL only if it
+    has not gone in `wait_s`."""
+    try:
+        proc.send_signal(signal.SIGINT)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        proc.wait(timeout=wait_s)
+        return
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        proc.kill()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def crop_graph(plan: dict) -> str:
+    """[pincrop] One cut, split to every output; the whole frame beside it,
+    only for the still the box is drawn on."""
+    cx, cy, cw, ch = plan["cut"]
+    W, H = plan["src"]
+    ow, oh = plan["out"]
+    px, py = plan["pad"]
+    return ";".join([
+        "[0:v]split=2[pl_cut][pl_whole]",
+        ("[pl_cut]crop=%d:%d:%d:%d,scale=%d:%d:flags=lanczos,"
+         "pad=%d:%d:%d:%d:color=black,setsar=1,"
+         "split=4[pl_main][pl_j][pl_s][pl_l]"
+         % (cw, ch, cx, cy, ow, oh, W, H, px, py)),
+        "[pl_j]fps=4[pl_jpg]",
+        "[pl_s]fps=2,scale=%d:-2[pl_small]" % SMALL_W,
+        "[pl_l]scale=%d:-2[pl_low]" % LOW_SIZE[0],
+        "[pl_whole]fps=%d[pl_raw]" % RAW_FPS,
+    ])
+
+
+def _tee_name(s: str) -> str:
+    """[pincrop] A tee slave's file name: the tee splits on | and unescapes
+    once."""
+    return "".join("\\" + c if c in "\\|'" else c for c in s)
+
+
+def _tee_value(s: str) -> str:
+    """[pincrop] A tee slave OPTION value is unescaped twice - once with the
+    slave, once as a key=value between : and ] - so it is escaped for both."""
+    return _tee_name("".join("\\" + c if c in "\\:[]|'" else c for c in s))
+
+
+def ffmpeg_cmd_cropped(box: dict) -> list[str]:
+    """[pincrop] ffmpeg_cmd() with the operator's box cut out of every road.
+
+    The input is ffmpeg_cmd()'s, option for option. The house HLS, the kept
+    clips and the TS door - the three copies - are ONE libx264 encode
+    written by `tee` (one encode, three muxers; separate outputs would be
+    three encodes). veryfast + zerolatency: no B-frames and no lookahead,
+    so the door stays half a second behind the camera. A keyframe every 15
+    frames, as the camera sends. SPS/PPS in the extradata for the mp4 AND in
+    band for a TS client joining mid-stream. passthrough keeps the camera's
+    wallclock timestamps exactly as the copy did (the camera claims 60 fps
+    and sends 30: a constant-rate mode would double every frame).
+
+    The stills and the low lane are the same outputs as ffmpeg_cmd()'s, fed
+    from the cut instead of the whole frame - keep the two in step.
+    frame_raw.jpg is the whole frame at 2 fps for the operator's draw mode
+    only; the station serves it to the house and never to a listener."""
+    plan = crop_plan(box)
+    tport = rtsp_transport()
+    tee = "|".join([
+        ("[f=hls:hls_time=2:hls_list_size=6"
+         ":hls_flags=delete_segments+append_list+omit_endlist"
+         ":hls_segment_filename=%s]%s"
+         % (_tee_value(str(LIVE / "seg%05d.ts")),
+            _tee_name(str(LIVE / "index.m3u8")))),
+        ("[f=segment:segment_time=%d:reset_timestamps=1:strftime=1]%s"
+         % (SEGMENT_SECONDS,
+            _tee_name(str(CLIPS / "%Y-%m-%d_%H-%M-%S.mp4")))),
+        ("[f=mpegts:mpegts_flags=+resend_headers:pat_period=0.1:max_delay=0"
+         ":onfail=ignore]udp://%s:%d?pkt_size=1316"
+         % (TS_UDP_HOST, TS_UDP_PORT)),
+    ])
+    return [
+        "ffmpeg", "-hide_banner", "-loglevel", "warning",
+        "-rtsp_transport", tport,
+        "-timeout", str(int(FRAME_STALL_S * 1_000_000)),
+        "-use_wallclock_as_timestamps", "1",
+        "-i", RTSP,
+        "-filter_complex", crop_graph(plan),
+        # the house, the kept clips, the TS door: one encode, three muxers
+        "-map", "[pl_main]", "-c:v", "libx264", "-preset", "veryfast",
+        "-tune", "zerolatency", "-pix_fmt", "yuv420p",
+        "-crf", str(CROP_CRF), "-maxrate", "%dk" % CROP_MAXRATE_K,
+        "-bufsize", "%dk" % CROP_BUFSIZE_K,
+        "-g", str(CROP_GOP), "-keyint_min", str(CROP_GOP), "-sc_threshold", "0",
+        "-flags", "+global_header", "-x264-params", "repeat-headers=1",
+        "-fps_mode", "passthrough", "-enc_time_base", "1:90000",
+        "-f", "tee", tee,
+        # the corner still, four a second
+        "-map", "[pl_jpg]", "-q:v", "6",
+        "-f", "image2", "-update", "1", "-y", str(OUT / "frame.jpg"),
+        # the phone's still (#1474)
+        "-map", "[pl_small]", "-q:v", "8",
+        "-f", "image2", "-update", "1", "-y", str(OUT / "frame_small.jpg"),
+        # the phone's low lane (#1474), from the cut
+        "-map", "[pl_low]", "-c:v", "libx264", "-preset", "veryfast",
+        "-tune", "zerolatency", "-profile:v", "baseline", "-level", "3.1",
+        "-pix_fmt", "yuv420p",
+        "-r", str(LOW_FPS), "-b:v", "%dk" % LOW_KBPS,
+        "-maxrate", "%dk" % LOW_MAXRATE_K, "-bufsize", "%dk" % LOW_BUFSIZE_K,
+        "-g", str(LOW_FPS * 2), "-keyint_min", str(LOW_FPS * 2),
+        "-sc_threshold", "0",
+        "-f", "hls", "-hls_time", "2", "-hls_list_size", "8",
+        "-hls_flags", "delete_segments+append_list+omit_endlist"
+                      "+independent_segments",
+        "-hls_segment_filename", str(LOW / "low%05d.ts"),
+        str(LOW / "index.m3u8"),
+        # the WHOLE frame, twice a second, for drawing the box - no road
+        "-map", "[pl_raw]", "-q:v", "6",
+        "-f", "image2", "-update", "1", "-y", str(RAW),
+    ]
+
+
+def crop_report() -> dict:
+    """[pincrop] --crop: the box, the plan and the command the next start
+    would run, without running anything."""
+    want, bad = crop_wanted()
+    out = {"file": str(CROP_FILE), "want": want, "error": bad,
+           "source": list(_SOURCE), "running": dict(_CROP)}
+    if want:
+        out["plan"] = crop_plan(want)
+    out["cmd"] = ffmpeg_cmd(want)
+    return out
+
+
+def ffmpeg_cmd(crop: dict | None = None) -> list[str]:
+    if crop:                    # [pincrop] a box: the cut, one encode
+        return ffmpeg_cmd_cropped(crop)
     # #1250b: udp first, and which one is in force is the rotating
     # measurement above rather than a constant typed in here.
     tport = rtsp_transport()
@@ -804,6 +1124,7 @@ class TsDoor:
         self.packets = self.nbytes = self.datagrams = 0
         self.last_rx = 0.0
         self.clients = 0
+        self.gen = 0            # [pincrop] flush() moves it; clients of an older one leave
         self.bound: list = []
         self.sock = None
         _TsHandler.door = self
@@ -898,6 +1219,20 @@ class TsDoor:
         with self.cond:
             self.clients += delta
             return self.clients
+
+    def flush(self, why: str = "") -> None:
+        """[pincrop] Forget every packet held, and release every client:
+        the picture they carry may no longer be shown (the crop changed).
+        A client leaves at its next read and rejoins on the next
+        ffmpeg's first keyframe - start_cursor() waits for one."""
+        with self.cond:
+            self.ring.clear()
+            self.marks.clear()
+            self.key_seq = None
+            self.pat_seq = None
+            self.gen += 1
+            self.cond.notify_all()
+        _ts_log("ring flushed, clients released (%s)" % (why or "asked"))
 
     def stats(self) -> dict:
         with self.cond:
@@ -1014,9 +1349,13 @@ class _TsHandler(BaseHTTPRequestHandler):
         self.end_headers()
         who = "%s:%d" % self.client_address[:2]
         _ts_log("client %s joined (%d watching)" % (who, door.count(+1)))
+        gen = door.gen                  # [pincrop]
         try:
             while True:
                 data, cur, lost = door.read(cur, 1.0)
+                if door.gen != gen:     # [pincrop] flushed: not one more packet
+                    _ts_log("client %s released - the picture changed" % who)
+                    break
                 if lost:
                     _ts_log("client %s too slow - dropped" % who)
                     break
@@ -1049,8 +1388,11 @@ def supervise(once: bool = False) -> None:
         _TS_DOOR[0] = None
         _ts_log("not started (%s) - the recorder runs without it" % err)
 
+    reframe = False             # [pincrop] a new crop restarts ffmpeg, not the radio
     while True:
-        _LAST_SEEN.update(seen_on_air())
+        quick, reframe = reframe, False
+        if not quick:
+            _LAST_SEEN.update(seen_on_air())
         # #1349: and why not, when it is not. Cheap - the scan above
         # has already been paid for - and it is the difference between
         # a surface that says 'not found' and one that says which of
@@ -1062,7 +1404,8 @@ def supervise(once: bool = False) -> None:
         # minute on top, to answer a question nobody had asked (we
         # were already joined). Scan when there is a reason to, or
         # every five minutes.
-        if (not linked()) or (time.time() - _DOCTOR[0] > DOCTOR_EVERY_S):
+        if (not quick) and ((not linked())                    # [pincrop]
+                            or (time.time() - _DOCTOR[0] > DOCTOR_EVERY_S)):
             try:
                 doc = doctor()
                 doc['at'] = time.time()
@@ -1085,6 +1428,25 @@ def supervise(once: bool = False) -> None:
             time.sleep(8)
             continue
 
+        # [pincrop] THE BOX THIS RUN CUTS, read now like the folder below:
+        # the command is fixed at start. Unreadable keeps the running cut;
+        # with none running the camera stays off the air (fail closed).
+        box, bad = crop_wanted()
+        if bad and _CROP.get("on"):
+            box = _CROP.get("box")
+        elif bad:
+            _CROP.update({"on": False, "box": None, "error": bad})
+            say("crop-unreadable", why=bad + " - the camera stays off the "
+                "air until the crop can be read, so a crop that was set "
+                "can never turn into the whole picture; set or reset the "
+                "crop again")
+            print("PineLink: " + bad)
+            if once:
+                return
+            time.sleep(5)
+            reframe = True
+            continue
+        crop_arm(box, bad)
         # #1118: the folder may have been moved since the last start.
         CLIPS = clips_dir()
         CLIPS.mkdir(parents=True, exist_ok=True)
@@ -1093,7 +1455,7 @@ def supervise(once: bool = False) -> None:
             hls="data/pinelink/live/index.m3u8")
         print("PineLink live: %s -> %s" % (RTSP, LIVE))
         began = time.time()                                   # #1250b
-        proc = subprocess.Popen(ffmpeg_cmd(), stdout=subprocess.DEVNULL,
+        proc = subprocess.Popen(ffmpeg_cmd(box), stdout=subprocess.DEVNULL,  # [pincrop]
                                 stderr=subprocess.PIPE, text=True)
         _STREAM["transport"] = rtsp_transport()               # #1250b
         say("live", pid=proc.pid, hls="data/pinelink/live/index.m3u8")
@@ -1128,6 +1490,12 @@ def supervise(once: bool = False) -> None:
                     stalled = True
                     proc.kill()
                     break
+                # [pincrop] the operator moved the box: this ffmpeg stops
+                # cleanly and the next starts with the new cut.
+                if crop_moved(box):
+                    reframe = True
+                    stop_gently(proc)
+                    break
                 say("live", pid=proc.pid, hls="data/pinelink/live/index.m3u8",
                     frame_age=round(time.time() - last_frame, 1))
             try:
@@ -1138,6 +1506,14 @@ def supervise(once: bool = False) -> None:
             proc.terminate()
             say("stopped", why="asked to stop")
             return
+        if reframe:             # [pincrop] asked for, not a fault: nothing to classify
+            say("reframing", why="the crop changed - the camera starts "
+                "again with the new box")
+            print("PineLink: the crop changed after %.0fs; starting again "
+                  "with it" % (time.time() - began))
+            if once:
+                return
+            continue
         if stalled:
             err = (err or "") + "\nno new frame for %ds - the link is gone; ffmpeg killed (#1388)" % int(FRAME_STALL_S)
         # #1250b: THE LAST LINE IS THE ANSWER, and it was the one
@@ -1184,7 +1560,12 @@ def main() -> None:
     # inside the container, so the station shells out to this.
     ap.add_argument("--doctor", action="store_true")
     ap.add_argument("--reset-radio", action="store_true")
+    ap.add_argument("--crop", action="store_true",          # [pincrop]
+                    help="print the crop, its plan and the next command")
     args = ap.parse_args()
+    if args.crop:
+        print(json.dumps(crop_report(), indent=2))
+        return
     if args.doctor:
         print(json.dumps(doctor()))
         return

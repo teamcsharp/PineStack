@@ -21493,7 +21493,9 @@ def shelf_put(kind: str, row: dict[str, Any]) -> None:
 
 def shelf_take(kind: str, voice: str = "",
                fresh_only: bool = False, *, peek: bool = False,
-               predicate: Any = None) -> dict[str, Any] | None:
+               predicate: Any = None,
+               reair_out: list[Any] | None = None,            # [s3-banks-roll]
+               _reair_grant: Any = None) -> dict[str, Any] | None:
     """The oldest prepared item of this kind that is still good.
 
     #1033: for the phone road the order is UNAIRED first (strict FIFO,
@@ -21555,6 +21557,13 @@ def shelf_take(kind: str, voice: str = "",
         # the ghosting rows go to the BACK, so a road whose every row is
         # ghosting behaves exactly as it does today. `legacy` is a no-op.
         _order = airings_ghost_last(str(kind), _order)
+        # [s3-banks-roll] A ROUND THAT HAS AIRED BEFORE IS NOT TAKEN ON THE WALK.
+        # While System 3's dice are live every rested replay the walk passes is
+        # set aside instead, so a first airing anywhere on the shelf always goes
+        # first; only when none stood ready does the roulette decide, after the
+        # walk, whether one goes out again and which (bank_reair_pick).
+        _reair: list[dict[str, Any]] | None = (
+            [] if (reair_out is not None or _s3_dice_live()) else None)
         for row in _order:
             if id(row) in globals().get("_READY_SHELF_BUSY", set()):
                 continue
@@ -21625,6 +21634,12 @@ def shelf_take(kind: str, voice: str = "",
             if isinstance(entry, dict) and not _larder_current(entry):
                 _why.append("contract moved")
                 continue            # written against a contract that moved
+            if _out_at and bank_reair_refusal(str(kind), row):
+                _why.append("retired by the re-air gate")   # [s3-banks-roll] never goes out again
+                continue
+            if _reair is not None and _out_at and row is not _reair_grant:
+                _reair.append(row)          # [s3-banks-roll] a replay waits for the roulette
+                continue
             if peek:
                 return row
             try:
@@ -21690,6 +21705,24 @@ def shelf_take(kind: str, voice: str = "",
             except Exception:  # noqa: BLE001
                 pass
             return row
+        # [s3-banks-roll] nothing heard for the first time stood ready: a replay,
+        # if the roulette brings one up. A peek names the first without rolling
+        # (its question is whether the door could); a take rolls, then walks
+        # again for the row it landed on - granted, so every test still holds.
+        if _reair and _reair_grant is None:
+            if reair_out is not None:
+                reair_out.extend(_reair)
+            if peek:
+                return _reair[0]
+            _again, _replay = bank_reair_pick(str(kind), _reair, "the %s shelf"
+                                              % SHELF_LABEL.get(str(kind), str(kind)))
+            if _again is not None:
+                _got = shelf_take(kind, voice, fresh_only, predicate=predicate,
+                                  _reair_grant=_again)
+                if _got is not None:
+                    bank_replay_attach(_got, _replay)
+                    return _got
+            _why.append("the roulette kept the replay off")
         if peek:
             return None
         # #1003: SAY WHY. A road that has prepared rounds standing by and
@@ -35891,16 +35924,202 @@ async def dj_speak(kind: str, track: dict[str, Any] | None = None,
             sid=sid, bound=bound, bound_part=bound_part,   # [#1237]
             system3=system3)   # [s3-roads]
     _owned = await _floor_take(f"a {kind} line from {who}")
+    _s3_box: dict[str, Any] = {"parts": [], "claimed": False,                  # [s3-split] the parts after the first
+                               "task": asyncio.current_task()}
+    _s3_tok = _S3_SPLIT_TAIL.set(_s3_box)
     try:
-        return await _dj_speak_floorless(
+        said = await _dj_speak_floorless(
             kind, track, extra=extra, line=line, who=who, voice=voice,
             source=source, by_hand=by_hand, fx=fx, name=name,
             source_text=source_text, clip=clip, sting=sting, note=note,
             checked=checked, remember_text=remember_text, round_as=round_as,
             sid=sid, bound=bound, bound_part=bound_part,   # [#1237]
             system3=system3)   # [s3-roads]
+        if said and _s3_box["parts"]:
+            # [s3-split] THE READ GOES ON in the voices the roulette picked: each part a
+            # line of its own, in order, under this same floor
+            await _s3_split_speak(kind, track, _s3_box["parts"], sid=sid, round_as=round_as,
+                                  bound=bound, bound_part=bound_part, sting=sting)
+            said = str(_s3_box["parts"][0].get("whole") or said)
+        elif _s3_box["parts"]:
+            pipeline_log("drop", "[s3-split] the first part of a split %s read did not go out - "
+                                 "the parts after it go with it" % kind)
+        return said
     finally:
+        _S3_SPLIT_TAIL.reset(_s3_tok)                                           # [s3-split]
         _floor_drop(_owned)
+
+
+# --- [s3-split] THE SPLIT NODE AT THE MICROPHONE --------------------------------
+#
+# The operator, 2026-09-28: "for a message like this that exceeds a certain
+# amount of characters, we need to introduce the roulette of a split node,
+# which basically allows a particular message to be split and who says it ...
+# ad spots ... monologues ... if the person's about to say something that's
+# going to exceed a minute or approach forty-five seconds, then that should be
+# split with another person in the studio who's also able to say it insert
+# themselves and continue it."
+#
+# Every single line reaches the air through dj_speak -> _dj_speak_floorless.
+# There - its words final (written, scrubbed, tinted, checked), the box not
+# holding it back, nothing rendered yet - the line's own System 3 node is
+# asked (system3_split_line). A node whose splits box is ticked and whose read
+# runs past the threshold at the voice's pace comes back in parts, each with
+# the studio member the roulette picked, the way the Insertion list drew and
+# the stamp its own ledger row carries. The later parts are made (rendered)
+# before the first part airs - the read starts no later than the whole of it
+# would have - and dj_speak speaks them straight after it, in order, under
+# the same floor, each a message of its own. The SFX cadence welds after the
+# last part only: a split read counts as one line. A whole take made ahead
+# (the pantry) is not a reason to read it whole - the parts are voiced now.
+# The manager's page is split the same way when it is written: his recording
+# keeps the first part and a booth voice reads on.
+#
+# _S3_SPLIT_TAIL: dj_speak's box for the parts after the first - set around
+# its one call, claimed by the first split on that same task.
+# _S3_SPLIT_HOLD: set while a part that is not the last one is spoken.
+_S3_SPLIT_TAIL: ContextVar[dict[str, Any] | None] = ContextVar("s3_split_tail", default=None)
+_S3_SPLIT_HOLD: ContextVar[bool] = ContextVar("s3_split_hold", default=False)
+
+
+async def _s3_split_render(text: str, who: str, voice: str) -> dict[str, Any] | None:
+    """[s3-split] A later part's take, made before the first part airs, so the
+    parts follow one another with no render between them: the seat's voice,
+    its engine, the booth's usual effects and delivery. None when it could not
+    be made (the part then renders when its turn comes)."""
+    try:
+        engine = voice_engine_for(voice or "")
+        if engine == "voxtral" and not (await voxtral_health())["ready"]:
+            engine = ""
+        fx = dict(voice_effect_pick() or {})
+        vec = performance_vector(who, voice or "")
+        if vec:
+            fx["perf"] = vec
+        strip = (str(dj_settings().get(f"strip_{who}") or "")
+                 if who in ("dj", "cohost", "caller", "third") else "")
+        if strip:
+            fx["strip"] = strip
+        clip = await voice_render_any(text, voice or _event_voice("default"), engine, fx=fx,
+                                      who=who, script_index=1, script_total=1)
+        return clip if (clip or {}).get("path") else None
+    except Exception as exc:  # noqa: BLE001
+        pipeline_log("system3", "[s3-split] a part could not be made ahead - it renders when it airs",
+                     extra=("%s: %s" % (type(exc).__name__, exc))[:200])
+        return None
+
+
+async def _s3_split_line(kind: str, spoken: str, who: str, forced: Any, stamp: Any,
+                         handle: Any) -> tuple[str, dict[str, Any], list[dict[str, Any]]] | None:
+    """[s3-split] Ask the line's node whether the read is shared out. Returns
+    (the first part's words, its stamp, the later parts - each with its
+    reader, voice, words, stamp and its take made ahead) or None: the read
+    airs whole (the node does not split, the read is under the threshold, it
+    has no sentence end to cut at, nobody else is in the studio, a fault)."""
+    ask = globals().get("system3_split_line")
+    if not ask or not isinstance(stamp, dict) or not stamp.get("conversation_id"):
+        return None
+    prepared = False
+    try:
+        _pv = forced or _event_voice("default")
+        prepared = _pantry_key_ready(pantry_key(spoken, _pv, voice_engine_for(forced or "") or voice_engine_for(_pv)))
+    except Exception:  # noqa: BLE001
+        prepared = False
+    try:
+        got = ask(stamp, spoken, who=who, dj=dj_settings(), handle=handle, kind=kind,
+                  away=seat_away_who(), prepared=prepared)
+    except Exception as exc:  # noqa: BLE001
+        pipeline_log("system3", "[s3-split] the split node could not be asked - the read airs whole",
+                     extra=("%s: %s" % (type(exc).__name__, exc))[:200])
+        return None
+    parts = (got or {}).get("parts") or []
+    if not (got or {}).get("split") or len(parts) < 2:
+        return None
+    voices = await session_voices()
+    rest: list[dict[str, Any]] = []
+    for p in parts[1:]:
+        pwho = str(p.get("who") or "dj")
+        pvoice = str(p.get("voice") or "") or configured_radio_voice(pwho, voices.get(pwho) or "")
+        words = spoken_text(str(p.get("text") or ""))
+        if kind not in ("station_id", "reply"):
+            words = station_name_scrub(words)
+        rest.append(dict(p, text=words, voice=pvoice, clip=await _s3_split_render(words, pwho, pvoice),
+                         whole=str(got.get("whole") or spoken)))
+    pipeline_log("system3", "[s3-split] a %s read is shared out: %s" % (
+                     kind, " / ".join(str(p.get("name") or p.get("who")) for p in parts)),
+                 extra=" | ".join("%s: %s" % (p.get("name"), str(p.get("text") or "")[:90]) for p in parts))
+    return str(parts[0].get("text") or spoken), dict(parts[0].get("stamp") or stamp), rest
+
+
+async def _s3_split_speak(kind: str, track: dict[str, Any] | None, parts: list[dict[str, Any]],
+                          sid: str = "", round_as: str = "", bound: dict[str, Any] | None = None,
+                          bound_part: str = "", sting: bool = True) -> list[str]:
+    """[s3-split] The parts after the first, in order, each in its reader's
+    own voice and each a line of its own - under one floor, so nothing is
+    spoken between them. A part that cannot be voiced stops the read there,
+    and says so (a part is never voiced twice, nor out of its order)."""
+    said: list[str] = []
+    owned = await _floor_take(f"a long {kind} read, shared out")
+    try:
+        for n, p in enumerate(parts):
+            words = str(p.get("text") or "").strip()
+            if not words:
+                continue
+            if radio_paused():
+                pipeline_log("drop", "[s3-split] the station paused mid-read: %d part(s) left unsaid"
+                             % (len(parts) - n))
+                break
+            got = ""
+            _hold = _S3_SPLIT_HOLD.set(n < len(parts) - 1)
+            try:
+                got = await _dj_speak_floorless(
+                    kind, track, line=words, who=str(p.get("who") or "dj"),
+                    voice=(str(p.get("voice") or "") or None), name=str(p.get("name") or ""),
+                    clip=p.get("clip"), checked=True, remember_text=words, sting=sting, sid=sid,
+                    round_as=round_as, bound=bound, bound_part=bound_part,
+                    system3=(dict(p.get("stamp") or {}) or None))
+            except Exception as exc:  # noqa: BLE001
+                pipeline_log("drop", "[s3-split] part %s of a split read failed" % p.get("part"),
+                             extra=("%s: %s" % (type(exc).__name__, exc))[:200])
+            finally:
+                _S3_SPLIT_HOLD.reset(_hold)
+            if not got:
+                pipeline_log("drop", "[s3-split] part %s of %s (%s) was not voiced - the read stops there"
+                             % (p.get("part"), p.get("of"), p.get("name") or p.get("who")), extra=words[:300])
+                break
+            said.append(got)
+    finally:
+        _floor_drop(owned)
+    return said
+
+
+async def _s3_split_page(row: dict[str, Any], handle: Any, text: str) -> None:
+    """[s3-split] The manager's page on its node, as it is written: past the
+    threshold at his pace, his recording keeps the first part and the rest is
+    read on by the booth - each part with its reader, their words and the
+    stamp its line carries, kept on the page's row, so a page recorded now and
+    aired later still reads on."""
+    ask = globals().get("system3_split_line")
+    if not ask or handle is None or not getattr(handle, "stamp", None):
+        return
+    try:
+        got = ask(dict(handle.stamp), text, who="manager", dj=dj_settings(), handle=handle, kind="manager",
+                  away=seat_away_who())
+    except Exception as exc:  # noqa: BLE001
+        pipeline_log("system3", "[s3-split] the page's split node could not be asked - it airs whole",
+                     extra=("%s: %s" % (type(exc).__name__, exc))[:200])
+        return
+    parts = (got or {}).get("parts") or []
+    if not (got or {}).get("split") or len(parts) < 2:
+        return
+    rest = [{k: p.get(k) for k in ("part", "of", "who", "seat", "name", "voice", "text", "body",
+                                   "lead_in", "how", "stamp")} for p in parts[1:]]
+    split = {"whole": str(got.get("whole") or text), "parts": rest}
+    first = str(parts[0].get("body") or text)
+    stamp = dict(parts[0].get("stamp") or handle.stamp)
+    upstairs_update(str(row.get("id") or ""), text=first, split=split, system3=stamp)
+    row.update(text=first, split=split, system3=stamp)
+    pipeline_log("system3", "[s3-split] a page from upstairs is shared out: the manager, then "
+                 + " / ".join(str(p.get("name") or p.get("who")) for p in rest))
 
 
 async def _dj_speak_floorless(kind: str, track: dict[str, Any] | None = None,
@@ -36084,7 +36303,7 @@ async def _dj_speak_floorless(kind: str, track: dict[str, Any] | None = None,
     # Never say the same thing twice in a row (#494): the model sometimes
     # re-emits a line it just aired — especially when a round is seeded from
     # the same swath. A near-duplicate of a recent line is dropped, not aired.
-    if not by_hand and kind != "station_id":
+    if not by_hand and kind != "station_id" and not (system3 or {}).get("split"):   # [s3-split] a part of a read checked whole
         _norm = " ".join(re.sub(r"[^a-z0-9 ]+", "", spoken.lower()).split())
         for _prev in _RECENT_SPOKEN:
             if _norm == _prev or (len(_norm) > 30
@@ -36326,6 +36545,22 @@ async def _dj_speak_floorless(kind: str, track: dict[str, Any] | None = None,
     # retired lines that never aired.
     if seed:
         speakbox_remember(seed)
+    # [s3-split] THE SPLIT NODE, at the one door every single line passes: the
+    # words are final, the box is not holding the line back (a held line is
+    # replayed whole) and nothing is rendered yet. A long read on a node whose
+    # splits box is ticked is shared out here - this call speaks the first part,
+    # dj_speak the rest, straight after it, each in its reader's own voice.
+    _s3_hold_sting = bool(_S3_SPLIT_HOLD.get())
+    _s3_box = _S3_SPLIT_TAIL.get()
+    if (isinstance(_s3_box, dict) and not _s3_box.get("claimed") and clip is None and not by_hand
+            and _s3_box.get("task") is asyncio.current_task() and isinstance(system3, dict)):
+        _s3_box["claimed"] = True
+        _s3_split = await _s3_split_line(kind, spoken, who, forced, system3, _s3_spoken_handle)
+        if _s3_split:
+            spoken, system3 = _s3_split[0], _s3_split[1]
+            _s3_box["parts"] = list(_s3_split[2])
+            _s3_hold_sting = True                   # the SFX cadence welds after the last part
+            _s3_line_remember(line_id, system3, who, spoken)   # part 1: its own stamp, its own words
     # Now and then the line goes out wet — echo, a bit of room (#222). Home
     # Assistant synthesises its own audio for an announce, so a wet line has
     # to be made here and handed over as a finished clip; the same clip then
@@ -36412,7 +36647,7 @@ async def _dj_speak_floorless(kind: str, track: dict[str, Any] | None = None,
     # The station-wide cadence slider owns autonomous speech even when the
     # producer opted out of its old one-off sting. Replies and operator-fired
     # lines remain immediate; ordinary station dialogue is never exempt.
-    if clip and _sfx_single_cadence_wanted(sting, by_hand, kind):
+    if clip and _sfx_single_cadence_wanted(sting, by_hand, kind) and not _s3_hold_sting:   # [s3-split] not mid-read
         clip, _sfx_stream = await _sfx_single_clip(
             clip, spoken, who, forced or "", kind, line_id)
         if _sfx_stream:
@@ -50209,6 +50444,14 @@ async def reel_tick() -> None:
                     continue
                 if not row_unaired(entry):
                     continue
+                # [s3-banks-roll] the reel is cut from System 3's banked rounds:
+                # a round no node scripted is stock made outside the roulette
+                if _s3_active() and not bank_s3_of(entry):
+                    continue
+                # ...and never one the re-air gate retired: welded, it would
+                # pass by the copy gate at the turn
+                if bank_reair_refusal("banter", entry):
+                    continue
                 picked = entry
                 break                   # _LARDER is in order: oldest first
             if picked is None:
@@ -50281,6 +50524,9 @@ async def reel_tick() -> None:
                              "turns": len(lines),
                              "from": round(offset, 2),
                              "until": round(offset + real, 2)})
+                _reel_s3 = bank_line_stamp(picked, ln["text"], ln["who"])   # [s3-banks-roll]
+                if _reel_s3:
+                    rows[-1]["system3"] = _reel_s3
                 offset += real
             if offset > 0:
                 scale = length / offset
@@ -50362,6 +50608,9 @@ async def reel_open() -> None:
                               "published" if page_delivery else "held"),
                     "source": "reel",
                     "round": "banter", "replay": True,       # #1023 (G1)
+                    # [s3-banks-roll] the node each reel line was scripted as
+                    **({"system3": dict(r["system3"])}
+                       if isinstance(r.get("system3"), dict) else {}),
                     "clip_media": media, "clip_sig": sig,
                     "clip_from": r.get("from"), "clip_until": r.get("until"),
                 }
@@ -62331,7 +62580,7 @@ def ad_save(product: str, text: str, kind: str = "sponsor",
         entry = {
             "id": uuid.uuid4().hex[:12],
             "product": product[:200],
-            "text": text[:1200],
+            "text": text,                                                    # [s3-split] whole: a rerun reads these words aloud
             "kind": kind,
             "ts": int(time.time()),
             "uses": 0,
@@ -62360,7 +62609,7 @@ def ad_update(ad_id: str, **fields: Any) -> dict[str, Any] | None:
                     # — which may be an hour after it was cut.
                     if key in ("product", "text", "kind", "audio", "voice",
                                "bed", "seed_file", "seed_text", "seed_mind"):
-                        row[key] = str(value)[:1200]
+                        row[key] = str(value) if key == "text" else str(value)[:1200]   # [s3-split] a read's words whole
                     elif key == "uses":
                         row["uses"] = int(value)
                 _ads_write(rows)
@@ -63425,7 +63674,10 @@ def heat_reference() -> str:
     if len(pool) < 6 and _RADIO.get("on"):
         asyncio.create_task(heat_evolve(band))
     return unrepeated(pool, f"heat-{band}",   # [s3-dice-door]
-                      director=_S3Dice("banter.heat_line", "which heat aside is let slip"))   # [s3-dice-door]
+                      # [s3-lists2] picked under the band's POOLS1 key, so the seed rows'
+                      # desk weights reach the draw (an evolved line weighs 1)
+                      director=_S3Dice("banter.heat_seed_" + band.replace(" ", "_"),
+                                       "which heat aside is let slip"))   # [s3-dice-door]
 
 
 def _heat_split(out: str) -> list[str]:
@@ -72741,7 +72993,7 @@ def upstairs_save(text: str, gripe: str, context: str) -> dict[str, Any]:
     with _UPSTAIRS_LOCK:
         rows = upstairs_list()
         entry = {"id": uuid.uuid4().hex[:12], "ts": int(time.time()),
-                 "text": str(text)[:2000], "gripe": str(gripe)[:200],
+                 "text": str(text), "gripe": str(gripe)[:200],               # [s3-split] a page's words whole
                  "context": str(context)[:400], "voice": "", "vocode": "",
                  "audio": "", "uses": 0, "last": 0}
         rows.append(entry)
@@ -72758,9 +73010,11 @@ def upstairs_update(page_id: str, **fields: Any) -> dict[str, Any] | None:
             for key, value in fields.items():
                 if key in ("text", "gripe", "context", "voice", "vocode",
                            "audio"):
-                    row[key] = str(value)[:2000]
+                    row[key] = str(value) if key == "text" else str(value)[:2000]   # [s3-split] a page's words whole
                 elif key in ("uses", "last"):
                     row[key] = int(value)
+                elif key in ("system3", "split") and isinstance(value, (dict, list)):   # [s3-split] its node, its parts
+                    row[key] = copy.deepcopy(value)
             _upstairs_write(rows)
             return row
     return None
@@ -73016,6 +73270,8 @@ async def dj_upstairs_write() -> dict[str, Any]:
             row["system3"] = dict(_s3l.stamp)
         except Exception:  # noqa: BLE001
             pass
+    if _s3l is not None and _s3l.active and isinstance(row, dict) and row.get("id"):   # [s3-split] the page, shared out
+        await _s3_split_page(row, _s3l, text)
     if seed:
         speakbox_remember(seed)
     return row
@@ -73165,6 +73421,20 @@ async def dj_upstairs_page(row: dict[str, Any] | None = None) -> bool:
                     last=int(time.time()))
     pipeline_log("air", "a page from upstairs went out - "
                         f"{made.get('vocode') or 'vocoded'} (#749)")
+    if globals().get("system3_note_pace"):                                    # [s3-split] his pace, for the rule
+        globals()["system3_note_pace"]("manager", len(" ".join(spoken.split())), seconds)
+    # [s3-split] A PAGE THE SPLIT NODE SHARED OUT: his recording carried the first
+    # part; a booth voice picks the rest up and reads it on, in order, before the
+    # pair react to the whole of it
+    _page_split = made.get("split") if isinstance(made.get("split"), dict) else {}
+    if _page_split.get("parts"):
+        try:
+            await _s3_split_speak("interject", _RADIO.get("now"), list(_page_split["parts"]),
+                                  round_as="manager", sting=False)
+        except Exception as _exc:  # noqa: BLE001
+            pipeline_log("drop", "[s3-split] the rest of a split page could not be read on",
+                         extra=("%s: %s" % (type(_exc).__name__, _exc))[:200])
+        spoken = str(_page_split.get("whole") or spoken)
     if delivery_id:
         await _paged_settle(air_at + seconds)
     try:
@@ -81363,6 +81633,193 @@ async def system3_list_remove_api(list_id: str, row_id: str, request: Request,
     require_auth(authorization)
     who = _s3_list_who(request)
     return await _s3_list_call(list_id, lambda: _S3_LISTS.remove(list_id, row_id, who))
+
+
+# --- [s3-lists2] THE DJ-SETTINGS LISTS AND THE EVOLVED HEAT LINES ARE DESK LISTS
+# "Any list to do with conversation or the roulette needs to be listed here as
+# an editable table" (operator, 2026-09-28). [s3-lists] put the banks and the
+# book stores on the desk; these are the DJ settings' own lists and the heat
+# asides the model grows, registered the same way - against the store that
+# owns each, never copied onto POOLS1, so the desk and the DJ settings editor
+# write one list and neither overrides the other:
+#   the DJ settings document (settings.json "dj"), read-modify-written under
+#   _WORD_DIAL_LOCK as the word-cause doors write it, through save_settings,
+#   which validates it exactly as the DJ settings editor's save does;
+#   heat_lines.json, under _HEAT_LOCK as heat_evolve writes it.
+# The registry calls every door off the loop; a lock is held only for its
+# store's read-modify-write.
+_S3_DJ_LISTS = (
+    # (list id, the DJ-settings key, label, most rows, most characters,
+    #  fewest rows kept, what the desk says about it)
+    ("dj.intro_phrases", "intro_phrases", "DJ · Between tracks", 40, 300, 1,
+     "Stock phrases for introducing a record ({station}, {title} and {by} are filled in). When a line "
+     "falls back to a stock phrase, and as the example the writer riffs on, System 3 picks one of these "
+     "(line.stock_phrase); a kind of line with no list of its own uses this one. The DJ settings' "
+     "'Between tracks' box is this same list. Empty, the station's built-in phrases come back, so the "
+     "last row stays."),
+    ("dj.station_ids", "station_ids", "DJ · Station identifications", 40, 300, 1,
+     "Stock station idents ({station} is filled in): System 3's pick when an ident falls back to a stock "
+     "phrase (line.stock_phrase). The DJ settings' 'Station identifications' box is this same list. "
+     "Empty, the built-in idents come back, so the last row stays."),
+    ("dj.request_phrases", "request_phrases", "DJ · When a request comes in", 40, 300, 1,
+     "Stock phrases for a listener's request ({title} and {by} are filled in): System 3's pick when the "
+     "line falls back to a stock phrase (line.stock_phrase). The DJ settings' 'When a request comes in' "
+     "box is this same list. Empty, the built-in phrases come back, so the last row stays."),
+    ("dj.interject_phrases", "interject_phrases", "DJ · Said in the middle of a track", 40, 300, 1,
+     "Stock things said over a record, and in reply to something shown: System 3's pick when the line "
+     "falls back to a stock phrase (line.stock_phrase). The DJ settings' 'Said in the middle of a track' "
+     "box is this same list. Empty, the built-in phrases come back, so the last row stays."),
+    ("dj.open_phrases", "open_phrases", "DJ · Opening the session", 40, 300, 1,
+     "The first thing said when the station comes on air, as a stock phrase: System 3's pick "
+     "(line.stock_phrase). The DJ desk's 'Opening the session' card is this same list. Empty, the "
+     "built-in phrases come back, so the last row stays."),
+    ("dj.sponsors", "sponsors", "DJ · Products to place", 20, 200, 0,
+     "Who the station sells, one per line with as much detail as you like. A produced advert's product "
+     "(ad.sponsor) and a live break's sponsor (ad.break_sponsor) are System 3's picks among these, and "
+     "the first three can be worked into the banter as product placement. The DJ settings' 'Products to "
+     "place' box is this same list; empty, nothing is placed."),
+    ("dj.diatribe_interjections", "diatribe_interjections", "DJ · Diatribe interjections", 40, 300, 1,
+     "What the other one forces in edgewise while somebody is on a roll. Under System 3 its INTERJECT "
+     "roll draws from this list; otherwise the writer is offered up to eleven of them, sampled by "
+     "System 3's dice (banter.interjections). Empty, the built-in list comes back, so the last row "
+     "stays."),
+)
+_S3_DJ_LIST_BY_KEY = {row[1]: row for row in _S3_DJ_LISTS}
+
+
+def _s3_row_ids(rows: list[str]) -> list[str]:
+    """A bare-words list's row ids: the words' digest, and '-2', '-3'... on a
+    repeat of the same words (the DJ settings' boxes allow one), so every
+    row can be reached."""
+    seen: dict[str, int] = {}
+    out = []
+    for text in rows:
+        base = _s3_list_id(text)
+        seen[base] = seen.get(base, 0) + 1
+        out.append(base if seen[base] == 1 else "%s-%d" % (base, seen[base]))
+    return out
+
+
+def _s3_words_change(rows: list[str], rid: str, text: Any, add: bool, most: int,
+                     chars: int, fewest: int) -> tuple[list[str], str]:
+    """One desk change to a bare-words list: (its new rows, the row's id).
+    New words that are already on the list (however spaced or cased) are
+    refused; so is an add past `most` - the store's own validation would
+    drop the newest row without a word - and a removal below `fewest`."""
+    rows = list(rows)
+    ids = _s3_row_ids(rows)
+    words = _s3_list_words(text, chars) if (add or text is not None) else ""
+    if words and _s3_list_id(words) in {_s3_list_id(r) for r, i in zip(rows, ids) if i != rid}:
+        raise ValueError("those words are already on the list")
+    if add:
+        if len(rows) >= most:
+            raise ValueError("the list holds %d at most - remove one first" % most)
+        rows.append(words)
+        return rows, _s3_list_id(words)
+    if rid not in ids:
+        raise KeyError(rid)
+    at = ids.index(rid)
+    if words:
+        rows[at] = words
+        return rows, _s3_row_ids(rows)[at]
+    if len(rows) <= fewest:
+        raise ValueError("the last row stays: empty, the station's built-in list comes back - "
+                         "rewrite it instead")
+    rows.pop(at)
+    return rows, rid
+
+
+def _s3_dj_rows(key: str) -> list[dict[str, Any]]:
+    """The list as the DJ settings hold it - what the air draws from."""
+    rows = [str(t) for t in ((load_settings().get("dj") or {}).get(key) or []) if str(t or "").strip()]
+    return [{"id": rid, "text": text} for rid, text in zip(_s3_row_ids(rows), rows)]
+
+
+def _s3_dj_change(key: str, rid: str = "", text: Any = None, add: bool = False) -> str:
+    _lid, _key, _label, most, chars, fewest, _what = _S3_DJ_LIST_BY_KEY[key]
+    with _WORD_DIAL_LOCK:
+        settings = load_settings()
+        dj = dict(settings.get("dj") or {})
+        rows, got = _s3_words_change(
+            [str(t) for t in (dj.get(key) or []) if str(t or "").strip()],
+            rid, text, add, most, chars, fewest)
+        dj[key] = rows
+        save_settings({**settings, "dj": dj})
+    return got
+
+
+def _s3_heat_store() -> dict[str, list[str]]:
+    """heat_lines.json as heat_evolve keeps it. A file that is there but will
+    not parse is refused: _heat_read answers {} for it, and one band written
+    over that would drop every other band's lines."""
+    try:
+        raw = HEAT_LINES_PATH.read_text()
+    except FileNotFoundError:
+        return {}
+    try:
+        got = json.loads(raw)
+    except ValueError as exc:
+        raise OSError("heat_lines.json will not parse (%s) - nothing written" % exc) from exc
+    if not isinstance(got, dict):
+        raise OSError("heat_lines.json is not a table of bands - nothing written")
+    return {str(k): [str(x) for x in v] for k, v in got.items() if isinstance(v, list)}
+
+
+def _s3_heat_rows(band: str) -> list[dict[str, Any]]:
+    rows = [str(t) for t in _heat_read().get(band, []) if str(t or "").strip()]
+    return [{"id": rid, "text": text} for rid, text in zip(_s3_row_ids(rows), rows)]
+
+
+def _s3_heat_change(band: str, rid: str = "", text: Any = None, add: bool = False) -> str:
+    """As heat_evolve grows a band: an add goes on the end and the band keeps
+    its newest _HEAT_MAX_PER_BAND, so a full band drops its oldest line."""
+    with _HEAT_LOCK:
+        data = _s3_heat_store()
+        rows, got = _s3_words_change(
+            [str(t) for t in data.get(band, []) if str(t or "").strip()],
+            rid, text, add, 10 ** 6, 200, 0)
+        data[band] = rows[-_HEAT_MAX_PER_BAND:]
+        _heat_write(data)
+    return got
+
+
+def _s3_lists2_register() -> None:
+    for lid, key, label, _most, chars, _fewest, what in _S3_DJ_LISTS:
+        _S3_LISTS.register({
+            "id": lid, "label": label, "family": "LIST", "store": "data/settings.json (dj.%s)" % key,
+            "what": what,
+            "schema": [{"key": "text", "kind": "text", "label": "one line, %d characters at most" % chars}],
+            "rows": lambda key=key: _s3_dj_rows(key),
+            "add": lambda body, key=key: _s3_dj_change(key, text=body.get("text"), add=True),
+            "edit": lambda rid, body, key=key: _s3_dj_change(
+                key, rid, body.get("text") if body.get("text") is not None else ""),
+            "remove": lambda rid, key=key: _s3_dj_change(key, rid),
+        })
+    low = None
+    for ceiling, band in HEAT_BANDS:
+        key = band.replace(" ", "_")
+        span = ("under %d C" % ceiling if low is None else "from %d C" % low if ceiling >= 999
+                else "%d to %d C" % (low, ceiling))
+        low = ceiling
+        _S3_LISTS.register({
+            "id": "heat." + key, "label": "Heat asides · " + band, "family": "LIST",
+            "store": "data/heat_lines.json (%s)" % band,
+            "what": ("Asides about how hot the machine is running while it is %s (%s). The model writes "
+                     "these as it runs (heat_evolve, about every 25 minutes) and the band keeps its newest "
+                     "%d - an add here past that drops the oldest too. A host lets one slip mid-round and "
+                     "callers reach for them in heat jokes: System 3 picks among these and the seed "
+                     "imagery, which is in Tables (POOLS1 banter.heat_seed_%s)."
+                     % (band, span, _HEAT_MAX_PER_BAND, key)),
+            "schema": [{"key": "text", "kind": "text", "label": "one aside, 200 characters at most"}],
+            "rows": lambda band=band: _s3_heat_rows(band),
+            "add": lambda body, band=band: _s3_heat_change(band, text=body.get("text"), add=True),
+            "edit": lambda rid, body, band=band: _s3_heat_change(
+                band, rid, body.get("text") if body.get("text") is not None else ""),
+            "remove": lambda rid, band=band: _s3_heat_change(band, rid),
+        })
+
+
+_s3_lists2_register()
 
 
 def _sfxguy_key(line: str) -> str:
@@ -89585,6 +90042,704 @@ GOLD_TEXT_MAX = int(os.getenv("GOLD_TEXT_MAX", "20000"))
 GOLD_FIRE_RATE = 0.5                 # share of sting moments that fire a bar
 
 
+# --- [s3-banks-roll] WHAT THE BANKS PUT ON THE AIR IS THE ROULETTE'S ----------
+# "the point of making everything go on system 3 is to have no dialogue hit the
+# station unless it is scripted via the RNG roulette system"; "i dont want
+# these banked lines unless they come up in a roulette" (operator, 2026-09-28).
+# Three roads put stock on the air without a roll. Each is now a decision on
+# the desk, through the dice door above (STATION1 / POOLS1):
+#
+#   bank.reair      a banked round that has ALREADY aired goes out again only
+#                   when this row says so - the larder's serve, every shelf
+#                   take, the cupboard's door (dead-air rescue, the torrent's
+#                   floor, a road asking before it writes, the memo breaking
+#                   in), a call re-air and the emergency host's recorded pairs.
+#                   bank.reair_pick rolls among the rested, eligible replays
+#                   (POOLS1: weight a class of replay, or switch one off), and
+#                   the airing is stamped on its ledger rows as a replay -
+#                   "replay, first aired <time>, airing N". The caps are the
+#                   station's own and unchanged: shelf_rest_now() (reuse_rest,
+#                   3 h - the 1 h floor under repeats_hard) and row_innings()
+#                   (3, calls 2, evergreen/rhymed 12, + innings_bonus).
+#   gold.run        a run of gold bars fills a gap only when this row says so;
+#                   gold.pick rolls every bar of the order (the tier's order is
+#                   no longer a shuffle), only bars minted from System 3 turns
+#                   are eligible, and each bar that airs is stamped with the
+#                   conversation/turn it was minted from - a node on the air.
+#   listen.seam     each seam where a listening response could go rolls on the
+#                   round's node; listen.pick rolls the response among the
+#                   eligible ones (not the least-recently-used), and it is
+#                   stamped to the turn it answers.
+#
+# THE RE-AIR GATE comes before all of it (reair_gate.py, bank_reair_refusal):
+# a round with copied turns, an echo loop, a non_compliant verdict or turns
+# the copy gate flagged - or one the one-time sweep (tools/reair_sweep.py)
+# marked - never goes out again, dice on or off, on any road; no roll is made
+# for it. Measured 2026-09-28: banter round ef39853f9fa54974 (turns copying
+# each other, one with a slur) aired seven times in 17 h off the larder serve.
+#
+# A FIRST airing of a banked System 3 round is the bank doing its job and is
+# never rolled. A roll that shapes a round already planned is recorded on
+# THAT round (a STATION observation under its turn, system3_roll_to) instead
+# of waiting in the task's buffer for the next plan to absorb as its own. The
+# odds ship at 1.0 - what each road did before, every time - so this alone
+# moves nothing on the air; the desk walks them down. System 3's dice off:
+# every road exactly as it was.
+BANK_REAIR_ODDS = float(os.getenv("BANK_REAIR_ODDS", "1.0"))
+GOLD_RUN_ODDS = float(os.getenv("GOLD_RUN_ODDS", "1.0"))
+LISTEN_SEAM_ODDS = float(os.getenv("LISTEN_SEAM_ODDS", "1.0"))
+# A road the roulette just refused asks again after this long, not on its next
+# five-second pass: one decision per window, or the odds would only decide how
+# many seconds a replay waits.
+BANK_REAIR_MISS_REST = float(os.getenv("BANK_REAIR_MISS_REST", "120"))
+GOLD_RUN_MISS_REST = float(os.getenv("GOLD_RUN_MISS_REST", "60"))
+BANK_REAIR_LABEL = ("a banked round that has already aired goes out again "
+                    "(otherwise something heard for the first time, or the next rung)")
+# The classes the replay pick weighs (POOLS1 bank.reair_pick) - by the meter
+# the station counts its stock in, airings. They start even; the desk may
+# weight one, or switch it off.
+BANK_REAIR_CLASSES = ("a replay heard once before", "a replay heard twice before",
+                      "a replay heard three or more times before")
+_BANK_REAIR_MISS: dict[str, float] = {}
+# line id -> the node a line the AIR spliced in by a roll belongs to (a
+# listening response: the turn it answers; a gold bar in a round: the turn it
+# was minted from). Read when the round's rows are committed.
+_S3_AIR_OWN: dict[str, dict[str, Any]] = {}
+_RERUN_S3: dict[str, dict[str, Any]] = {}
+_RERUN_S3_INDEX: dict[str, Any] = {"at": 0.0, "index": {}}
+# the one-time sweep's marks (tools/reair_sweep.py --apply): {mark key: why}
+REAIR_MARKS_PATH = data_path("reair_ineligible.json")
+_REAIR_MARKS: dict[str, Any] = {"at": 0.0, "mtime": -1.0, "marks": {}}
+_REAIR_GATE_SAID: dict[str, float] = {}
+
+
+def _reair_marks() -> dict[str, Any]:
+    """The sweep's marks, read again when the file changes (its mtime is
+    looked at twice a minute at most)."""
+    now = time.time()
+    if now - float(_REAIR_MARKS["at"]) < 30:
+        return _REAIR_MARKS["marks"]
+    _REAIR_MARKS["at"] = now
+    try:
+        mtime = REAIR_MARKS_PATH.stat().st_mtime
+    except OSError:
+        _REAIR_MARKS.update(mtime=-1.0, marks={})
+        return _REAIR_MARKS["marks"]
+    if mtime != _REAIR_MARKS["mtime"]:
+        try:
+            import reair_gate
+            _REAIR_MARKS.update(mtime=mtime, marks=reair_gate.load_marks(REAIR_MARKS_PATH))
+        except Exception:  # noqa: BLE001
+            _REAIR_MARKS.update(mtime=mtime, marks={})
+    return _REAIR_MARKS["marks"]
+
+
+def bank_reair_refusal(road: str, row: Any, cid: str = "") -> str:
+    """THE RE-AIR GATE: why this banked round may NEVER go out again, or ""
+    when it may (the roulette then decides whether it does). reair_gate.py's
+    rule - copied turns, an echo loop, a non_compliant verdict, the copy
+    gate's flags, the sweep's mark - asked of every replay before any roll,
+    dice on or off. `cid`: a finished call's System 3 round, found by its
+    words. A gate whose module is missing refuses nothing, and says so once."""
+    try:
+        import reair_gate
+    except Exception as exc:  # noqa: BLE001
+        if not _REAIR_GATE_SAID.get("__missing__"):
+            _REAIR_GATE_SAID["__missing__"] = time.time()
+            pipeline_log("air", "the re-air gate is not installed (reair_gate.py) - replays go "
+                                "to the roulette unchecked", extra="%s: %s" % (type(exc).__name__, exc))
+        return ""
+    try:
+        why = str(reair_gate.refusal(row, _reair_marks(), cid) or "")
+    except Exception:  # noqa: BLE001
+        return ""
+    if why:
+        try:
+            key = (reair_gate.mark_keys(row, cid) or [str(id(row))])[0]
+        except Exception:  # noqa: BLE001
+            key = str(id(row))
+        if time.time() - float(_REAIR_GATE_SAID.get(key) or 0) > 3600:
+            _REAIR_GATE_SAID[key] = time.time()
+            while len(_REAIR_GATE_SAID) > 500:
+                _REAIR_GATE_SAID.pop(next(iter(_REAIR_GATE_SAID)))
+            pipeline_log("air", ("a banked %s round never goes out again - the re-air gate: %s"
+                                 % (road, why))[:200], extra=key)
+    return why
+
+
+def _s3_roll_on(key: str, cid: str = "", turn_id: str = "", stage: str = "",
+                since: float = 0.0) -> dict[str, Any]:
+    """The roll the dice door just made under `key`, as a line's stamp carries
+    it. With `cid` it is also recorded on the round it shaped - a STATION
+    observation under `turn_id`, in the Rolodex - and taken out of this task's
+    buffer, so the next plan does not absorb it as its own. {} when System 3
+    did not roll it (its dice off: the station's own random)."""
+    fn = globals().get("system3_last_roll")
+    try:
+        rec = fn(key) if fn else None
+    except Exception:  # noqa: BLE001
+        rec = None
+    if (not isinstance(rec, dict) or time.time() - float(rec.get("at") or 0) > 60
+            or float(rec.get("at") or 0) < float(since or 0)):
+        return {}
+    out = {k: rec.get(k) for k in ("kind", "key", "label", "odds", "hit", "dice", "u",
+                                   "index", "of", "picked") if rec.get(k) is not None}
+    words = str(stage or "")
+    if "{" in words:
+        try:
+            words = words.format(dice=rec.get("dice"), odds=int(round(float(rec.get("odds") or 0) * 100)),
+                                 index=rec.get("index"), of=rec.get("of"),
+                                 picked=str(rec.get("picked") or "")[:80],
+                                 hit="yes" if rec.get("hit") else "no")
+        except Exception:  # noqa: BLE001
+            pass
+    claim = globals().get("system3_roll_to")
+    if cid and claim:
+        try:
+            got = claim(key, str(cid), str(turn_id or ""), words)
+            if isinstance(got, dict) and got:
+                out = dict(got)
+        except Exception:  # noqa: BLE001
+            pass
+    return out
+
+
+def _s3_air_own(line_id: Any, stamp: Any) -> None:
+    """Name the node of a line the air spliced into a round (see _S3_AIR_OWN)."""
+    if line_id and isinstance(stamp, dict) and stamp.get("conversation_id"):
+        _S3_AIR_OWN[str(line_id)] = dict(stamp)
+        while len(_S3_AIR_OWN) > 600:
+            _S3_AIR_OWN.pop(next(iter(_S3_AIR_OWN)))
+
+
+def _s3_air_rows(rows: Any, meta: Any) -> None:
+    """A round's ledger rows, the moment before they are committed: a line the
+    air spliced in by a roll names its own node, and every spoken line of a
+    banked round going out again carries its replay stamp."""
+    rep = meta.get("_s3_replay") if isinstance(meta, dict) else None
+    if not (isinstance(rep, dict) and time.time() - float(rep.get("at") or 0) < 1800):
+        rep = None
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        own = _S3_AIR_OWN.get(str(row.get("line_id") or ""))
+        if isinstance(own, dict) and own.get("conversation_id"):
+            row["system3"] = dict(own)
+            row.pop("dice", None)           # the round's turn dice are not its
+            continue
+        st = row.get("system3")
+        if (rep and isinstance(st, dict) and st.get("conversation_id")
+                and str(row.get("who") or "") not in ("board", "drop")):
+            row["system3"] = dict(st, replay=dict(rep))
+
+
+def bank_s3_of(entry: Any) -> dict[str, Any]:
+    """The System 3 conversation a banked round (or its shelf row) was scripted
+    as - its stamp, active and with a conversation - else {}."""
+    try:
+        got = entry.get("system3") if isinstance(entry, dict) else None
+        if not isinstance(got, dict) and isinstance(entry, dict) and isinstance(entry.get("entry"), dict):
+            got = entry["entry"].get("system3")
+        if isinstance(got, dict) and got.get("conversation_id") and got.get("mode") == "active":
+            return got
+    except Exception:  # noqa: BLE001
+        pass
+    return {}
+
+
+def _s3_turn_of_words(meta: Any, text: str) -> str:
+    """The planned turn whose words hold most of `text` (a chunk the air
+    injected stumbles into), by share of words - "" under 60%."""
+    try:
+        s3 = bank_s3_of(meta)
+        ids = s3.get("turns") if isinstance(s3.get("turns"), dict) else {}
+        words = re.findall(r"[a-z']+", str(text or "").lower())
+        if not ids or len(words) < 3:
+            return ""
+        best, at = 0.0, None
+        for i, (_m, said) in enumerate(banter_turns(str(meta.get("script") or ""),
+                                                     str(meta.get("caller_name") or ""),
+                                                     str(meta.get("caller2_name") or ""))):
+            have = set(re.findall(r"[a-z']+", str(said or "").lower()))
+            if not have:
+                continue
+            share = sum(1 for w in words if w in have) / len(words)
+            if share > best:
+                best, at = share, i
+        return str(ids.get(str(at)) or "") if at is not None and best >= 0.6 else ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def bank_line_stamp(entry: Any, text: str, who: str = "") -> dict[str, Any]:
+    """The node one banked line belongs to: its round's conversation and the
+    turn whose words it is ({} when the round is not System 3's, or the words
+    are not one of its turns)."""
+    s3 = bank_s3_of(entry)
+    if not s3:
+        return {}
+    tid = ""
+    fn = globals().get("system3_turn_id_for")
+    if fn:
+        try:
+            tid = str(fn(entry, str(text or ""), str(who or "")) or "")
+        except Exception:  # noqa: BLE001
+            tid = ""
+    tid = tid or _s3_turn_of_words(entry, text)
+    if not tid:
+        return {}
+    return {"conversation_id": str(s3["conversation_id"]), "mode": "active", "turn_id": tid}
+
+
+def _bank_clock(at: Any) -> str:
+    try:
+        return time.strftime("%H:%M", time.localtime(float(at)))
+    except Exception:  # noqa: BLE001
+        return "?"
+
+
+def bank_replay_stamp(road: str, row: Any, chance: Any = None, pick: Any = None,
+                      decided_by: str = "") -> dict[str, Any]:
+    """What a banked round's lines carry the time it goes out again: when it
+    was first heard, which airing this is, and the rolls that let it out."""
+    row = row if isinstance(row, dict) else {}
+    try:
+        before = int(round_airings_now(str(road), row))
+    except Exception:  # noqa: BLE001
+        before = int(row.get("aired") or 0)
+    last = float(row.get("aired_at") or 0)
+    first = float(row.get("first_aired_at") or 0)
+    if not first and last and before <= 1:
+        first = last                    # one airing before this: that WAS the first
+        try:
+            row["first_aired_at"] = first
+        except Exception:  # noqa: BLE001
+            pass
+    airing = max(2, before + 1)
+    if first:
+        label = "replay, first aired %s, airing %d" % (_bank_clock(first), airing)
+    elif last:
+        label = "replay, first aired at or before %s, airing %d" % (_bank_clock(last), airing)
+    else:
+        label = "replay, airing %d" % airing
+    out: dict[str, Any] = {"at": time.time(), "road": str(road), "airing": airing, "label": label,
+                           "first_aired": first or None, "last_aired": last or None}
+    if chance:
+        out["chance"] = dict(chance)
+    if pick:
+        out["pick"] = dict(pick)
+    if decided_by:
+        out["decided_by"] = str(decided_by)[:160]
+    return out
+
+
+def bank_replay_attach(row: Any, stamp: Any) -> None:
+    """A replay taken off a shelf carries its stamp to the air: on the round's
+    entry (its ledger rows read it) or on a single line's own node."""
+    if not isinstance(row, dict) or not isinstance(stamp, dict):
+        return
+    entry = row.get("entry")
+    if isinstance(entry, dict):
+        entry["_s3_replay"] = dict(stamp)
+    elif isinstance(row.get("system3"), dict) and row["system3"].get("conversation_id"):
+        row["system3"] = dict(row["system3"], replay=dict(stamp))
+
+
+def _bank_reair_class(road: str, row: Any) -> str:
+    try:
+        heard = int(round_airings_now(str(road), row))
+    except Exception:  # noqa: BLE001
+        heard = 1
+    return BANK_REAIR_CLASSES[max(0, min(len(BANK_REAIR_CLASSES) - 1, heard - 1))]
+
+
+def bank_reair_pick(road: str, rows: Any, where: str = "") -> tuple[Any, dict[str, Any] | None]:
+    """Whether a banked round that has already aired goes out again, and which:
+    (row, replay stamp), or (None, None) when the roulette keeps the replays
+    off. `rows` are the rested replays in the order the road would have taken
+    them; the re-air gate strikes out any it retired before a die is cast.
+    System 3's dice off: the first the gate lets through, as before."""
+    road = str(road or "")
+    # the re-air gate first: a round it retired is never rolled for
+    rows = [r for r in (rows or []) if isinstance(r, dict) and not bank_reair_refusal(road, r)]
+    if not rows:
+        return None, None
+    if not _s3_dice_live():
+        return rows[0], None
+    if time.time() - float(_BANK_REAIR_MISS.get(road) or 0) < BANK_REAIR_MISS_REST:
+        return None, None               # the roulette said no a moment ago
+    t0 = time.time()
+    if not s3_chance("bank.reair", BANK_REAIR_ODDS, BANK_REAIR_LABEL):
+        _BANK_REAIR_MISS[road] = time.time()
+        pipeline_log("air", "the roulette kept the %s replays off (bank.reair) - %s"
+                     % (road, where or "nothing heard for the first time was ready"))
+        return None, None
+    _BANK_REAIR_MISS.pop(road, None)
+    live = set(s3_pool("bank.reair_pick", list(BANK_REAIR_CLASSES),
+                       "which replay goes out - weight a class, or switch it off"))
+    cands = [(r, _bank_reair_class(road, r)) for r in rows]
+    cands = [(r, c) for r, c in cands if c in live]
+    if not cands:
+        pipeline_log("air", "every %s replay standing by is in a class the desk "
+                            "switched off (bank.reair_pick)" % road)
+        return None, None
+    t1 = time.time()
+    k = _S3Dice("bank.reair_pick", "which replay goes out").pick(
+        "bank.reair_pick", [c for _r, c in cands])
+    row = cands[k if 0 <= k < len(cands) else 0][0]
+    cid = str(bank_s3_of(row).get("conversation_id") or "")
+    chance = _s3_roll_on("bank.reair", cid, "",
+                         "a banked round goes out again: rolled {dice} under {odds}% - {hit}", since=t0)
+    pick = _s3_roll_on("bank.reair_pick", cid, "",
+                       "which replay: {index} of {of} ({picked})", since=t1)
+    return row, bank_replay_stamp(road, row, chance, pick, where)
+
+
+def larder_reair_gate(at: int) -> tuple[int, dict[str, Any] | None]:
+    """dj_banter's larder serve chose _LARDER[at]. A first airing stands (no
+    roll). A replay the re-air gate retired never goes out again - dice on or
+    off, the serve passes on to the next round it could take in its own order,
+    or writes fresh. Otherwise, under System 3's dice, a replay goes to the
+    roulette - after any first airing the larder could serve instead, which
+    always goes first: (index, replay stamp), or (-1, None) when nothing may
+    go. Nothing is stamped or moved here; the serve does that, as before."""
+    try:
+        entry = _LARDER[at]
+    except Exception:  # noqa: BLE001
+        return -1, None
+    if not isinstance(entry, dict) or not entry.get("aired_at"):
+        return at, None                     # heard for the first time: the bank's job
+    now = time.time()
+
+    def _servable(e: Any) -> bool:
+        try:
+            return bool(isinstance(e, dict) and dialogue_row_ready("banter", e) and _larder_current(e))
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _first_airing(e: Any) -> bool:
+        return (_servable(e) and not e.get("aired_at")
+                and now - float(e.get("at") or 0) < larder_fresh())
+
+    def _replay(e: Any) -> bool:
+        return (_servable(e) and bool(e.get("aired_at")) and shelf_repeat_ready("banter", e)
+                and (now - float(e.get("at") or 0) < larder_fresh()
+                     or (shelf_is_repeat("banter", e)
+                         and now - float(e.get("at") or 0) <= REPEAT_KEEP_SECONDS)))
+
+    if not _s3_dice_live():
+        if not bank_reair_refusal("banter", entry):
+            return at, None                 # the station's own order, as before
+        for i, e in enumerate(_LARDER):
+            if _first_airing(e) or (_replay(e) and not bank_reair_refusal("banter", e)):
+                return i, None
+        return -1, None
+    for i, e in enumerate(_LARDER):
+        if _first_airing(e):
+            return i, None                  # heard for the first time: the bank's job
+    rows = [e for e in _LARDER if _replay(e)]
+    if not rows:
+        # the serve's own tests decide, as before - they will not air a
+        # replay that is neither fresh nor kept; one the gate retired, never
+        return (-1, None) if bank_reair_refusal("banter", entry) else (at, None)
+    got, stamp = bank_reair_pick("banter", rows, "the larder's serve")
+    if got is None:
+        return -1, None
+    for i, e in enumerate(_LARDER):
+        if e is got:
+            return i, stamp
+    return -1, None
+
+
+def listening_seam_take(listener: str, context: str, used: Any, voices: Any,
+                        meta: Any) -> dict[str, Any] | None:
+    """add_listening_responses' chooser at one seam of a round. The seam rolls
+    on the round's node (listen.seam) and the response is a roll among the
+    eligible ones (listen.pick) - both recorded on the round under the turn
+    being answered - and the response is stamped to that turn. System 3's
+    dice off: the bank's own least-recently-used take, as before."""
+    voice = str((voices or {}).get(listener) or "")
+    engine = voice_engine_for(voice)
+    crystal = continuity_crystal()
+    if not _s3_dice_live():
+        return _RESPONSES.take(voice, engine, context, used, crystal=crystal)
+    s3 = bank_s3_of(meta)
+    cid = str(s3.get("conversation_id") or "")
+    tid = ""
+    fn = globals().get("system3_turn_id_for")
+    if cid and fn:
+        try:
+            tid = str(fn(meta, str(context or ""), "") or "")
+        except Exception:  # noqa: BLE001
+            tid = ""
+    if cid and not tid:
+        tid = _s3_turn_of_words(meta, context)
+    rolled: dict[str, Any] = {}
+
+    def chooser(rows: list[dict[str, Any]]) -> int:
+        t0 = time.time()
+        hit = s3_chance("listen.seam", LISTEN_SEAM_ODDS,
+                        "a listening response at a seam in a long turn (otherwise the turn runs on)")
+        rolled["seam"] = _s3_roll_on("listen.seam", cid, tid,
+                                     "a listening response at this seam: rolled {dice} under {odds}% - {hit}",
+                                     since=t0)
+        if not hit:
+            return -1
+        t1 = time.time()
+        k = _S3Dice("listen.pick", "which listening response (the eligible ones)").pick(
+            "listen.pick", [str(r.get("said") or r.get("text") or "")[:80] for r in rows])
+        rolled["pick"] = _s3_roll_on("listen.pick", cid, tid,
+                                     "which listening response: {index} of {of} ({picked})", since=t1)
+        return k
+
+    try:
+        got = _RESPONSES.take(voice, engine, context, used, crystal=crystal, chooser=chooser)
+    except TypeError:
+        return None                         # a bank that cannot take the roll airs none
+    if not got:
+        return None
+    out = dict(got)
+    if cid:
+        stamp = {"conversation_id": cid, "mode": "active", "turn_id": tid,
+                 "listening": dict({"who": str(listener or ""),
+                                    "text": str(got.get("said") or got.get("text") or "")[:120],
+                                    "label": "a listening response at a seam of this turn, rolled"},
+                                   **{k: v for k, v in rolled.items() if v})}
+        out["line_id"] = uuid.uuid4().hex
+        out["system3"] = stamp              # the item's own node: named at the round's door
+        _s3_air_own(out["line_id"], stamp)
+    return out
+
+
+def gold_source(row: Any) -> dict[str, Any]:
+    """The System 3 turn a gold bar was minted from ({} for a bar minted before
+    bars carried one, or off a round no node made)."""
+    src = row.get("source") if isinstance(row, dict) else None
+    if isinstance(src, dict) and src.get("conversation_id") and src.get("turn_id"):
+        return {"conversation_id": str(src["conversation_id"]), "turn_id": str(src["turn_id"]),
+                "mode": "active"}
+    return {}
+
+
+def gold_tier_pick(tier: Any) -> dict[str, Any] | None:
+    """The whole order of a least-fired tier is the dice door's: each next bar
+    is one more roll among the ones left, made only when the bar before it has
+    lost its take - one file checked per roll (#1412)."""
+    left = [r for r in (tier or []) if isinstance(r, dict)]
+    while left:
+        k = _S3Dice("gold.pick", "which banked gold bar fires (the least-fired tier)").pick(
+            "gold", [str(r.get("text") or "")[:160] for r in left])
+        r = left.pop(k if 0 <= k < len(left) else 0)
+        if (VOICE_MEDIA_DIR / str(r.get("path") or "")).is_file():
+            return r
+    return None
+
+
+def gold_run_ready(exclude_who: str = "", min_rest: float | None = None) -> bool:
+    """Could gold_pick fire a bar at all (by its rest and eligibility rules -
+    the takes are checked when one is picked)? A run is rolled only then."""
+    try:
+        now = time.time()
+        rest = GOLD_REST if min_rest is None else float(min_rest)
+        window = repeat_window()
+        if window > 0:
+            rest = max(rest, window / 2.0)
+        return any(str(r.get("who") or "") != str(exclude_who or "")
+                   and now - float(r.get("last") or 0) >= rest
+                   and not cast_names_line_stale(r)
+                   and (not _s3_active() or bool(gold_source(r)))
+                   for r in _gold_rows())
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def gold_air_stamp(bar: Any, run_key: str = "", run_since: float = 0.0,
+                   pick_since: float = 0.0) -> dict[str, Any] | None:
+    """A gold bar on the air is a node: the System 3 turn it was minted from,
+    with the rolls that let it out (the run - or the round's in-round roll -
+    and the bar) recorded on that conversation, under that turn. None for a
+    bar with no System 3 turn behind it."""
+    src = gold_source(bar)
+    if not src:
+        return None
+    cid, tid = src["conversation_id"], src["turn_id"]
+    firing = int((bar or {}).get("fired") or 0) + 1
+    gold: dict[str, Any] = {"bar": str((bar or {}).get("key") or ""), "minted": (bar or {}).get("at"),
+                            "firing": firing,
+                            "label": "gold bar minted %s from this turn, firing %d"
+                                     % (_bank_clock((bar or {}).get("at") or 0), firing)}
+    if run_key:
+        run = _s3_roll_on(run_key, cid, tid,
+                          ("a gold run fills the gap: rolled {dice} under {odds}% - {hit}"
+                           if run_key == "gold.run" else
+                           "a gold bar fires inside the round: rolled {dice} under {odds}% - {hit}"),
+                          since=run_since)
+        if run:
+            gold["run"] = run
+    pick = _s3_roll_on("gold.pick", cid, tid, "which gold bar: {index} of {of} ({picked})",
+                       since=pick_since)
+    if pick:
+        gold["pick"] = pick
+    return {"conversation_id": cid, "turn_id": tid, "mode": "active", "gold": gold}
+
+
+def _rerun_norm(text: Any) -> str:
+    return " ".join(re.sub(r"[^a-z0-9 ]+", " ", str(text or "").lower()).split())[:60]
+
+
+def _rerun_text_index() -> dict[str, list[tuple[str, str]]]:
+    """The script ledger's System 3 lines of the last day and a bit, by their
+    words: {words: [(conversation, turn)]}. Rebuilt at most once a minute, in
+    the rerun's pick thread - one walk for every candidate call."""
+    now = time.time()
+    if now - float(_RERUN_S3_INDEX.get("at") or 0) < 60:
+        return _RERUN_S3_INDEX["index"]
+    index: dict[str, list[tuple[str, str]]] = {}
+    for led in reversed(script_ledger_rows()):
+        at = float(led.get("at") or 0)
+        if at and at < now - 26 * 3600:
+            break
+        s3 = led.get("system3")
+        if (not isinstance(s3, dict) or not s3.get("conversation_id")
+                or not s3.get("turn_id") or s3.get("replay")):
+            continue
+        n = _rerun_norm(led.get("text"))
+        if len(n) >= 12:
+            index.setdefault(n, []).append((str(s3["conversation_id"]), str(s3["turn_id"])))
+    _RERUN_S3_INDEX.update(at=now, index=index)
+    return index
+
+
+def rerun_s3_source(row: Any) -> dict[str, Any]:
+    """The System 3 round a finished call was, found by its words in the script
+    ledger (the call log keeps no conversation id): {"conversation_id", "turns":
+    {words: turn_id}} or {}. The round most of the call's lines belong to (a
+    stock greeting belongs to every call). Cached per call."""
+    key = str((row or {}).get("id") or "")
+    if not key:
+        return {}
+    if key in _RERUN_S3:
+        return _RERUN_S3[key]
+    want = {_rerun_norm(t.get("text")) for t in (row.get("transcript") or [])
+            if isinstance(t, dict) and len(_rerun_norm(t.get("text"))) >= 12}
+    got: dict[str, Any] = {}
+    if want:
+        index = _rerun_text_index()
+        votes: collections.Counter = collections.Counter()
+        turns: dict[str, dict[str, str]] = {}
+        for n in want:
+            for cid, tid in index.get(n) or []:
+                votes[cid] += 1
+                turns.setdefault(cid, {}).setdefault(n, tid)
+        if votes:
+            cid, n = votes.most_common(1)[0]
+            if n >= min(3, len(want)):
+                got = {"conversation_id": cid, "turns": dict(turns.get(cid) or {})}
+    _RERUN_S3[key] = got
+    while len(_RERUN_S3) > 200:
+        _RERUN_S3.pop(next(iter(_RERUN_S3)))
+    return got
+
+
+def rerun_replay_s3(row: Any) -> dict[str, Any] | None:
+    """A finished call going out again: the roulette's word (bank.reair) and the
+    stamp its rows carry - the round it replays, and the replay. None when the
+    roulette keeps it off; {} when no System 3 round is behind it."""
+    road = "caller"
+    if time.time() - float(_BANK_REAIR_MISS.get("rerun") or 0) < BANK_REAIR_MISS_REST:
+        return None
+    t0 = time.time()
+    if not s3_chance("bank.reair", BANK_REAIR_ODDS, BANK_REAIR_LABEL):
+        _BANK_REAIR_MISS["rerun"] = time.time()
+        pipeline_log("call", "the roulette kept a call re-air off (bank.reair)")
+        return None
+    src = rerun_s3_source(row) if isinstance(row, dict) else {}
+    cid = str(src.get("conversation_id") or "")
+    chance = _s3_roll_on("bank.reair", cid, "",
+                         "a finished call goes out again: rolled {dice} under {odds}% - {hit}", since=t0)
+    if not cid:
+        return {}
+    try:
+        uses = int((_rerun_ledger_rows().get(str(row.get("id") or "")) or {}).get("uses") or 0)
+    except Exception:  # noqa: BLE001
+        uses = 0
+    first = float(row.get("ts") or 0)
+    replay = {"at": time.time(), "road": road, "airing": uses + 2,
+              "label": "replay, first aired %s, airing %d" % (_bank_clock(first), uses + 2),
+              "first_aired": first or None, "decided_by": "a call re-air (the pick: call.rerun_take)",
+              **({"chance": chance} if chance else {})}
+    return {"conversation_id": cid, "mode": "active", "turns": dict(src.get("turns") or {}),
+            "replay": replay}
+
+
+def rerun_row_s3(base: Any, row: Any) -> dict[str, Any]:
+    """One re-aired call line's node: the round it replays, its turn by words."""
+    if not isinstance(base, dict) or not base.get("conversation_id"):
+        return {}
+    return {"conversation_id": str(base["conversation_id"]), "mode": "active",
+            "turn_id": str((base.get("turns") or {}).get(_rerun_norm((row or {}).get("text"))) or ""),
+            "replay": dict(base.get("replay") or {})}
+
+
+async def continuity_roulette(voices: Any, said_at: Any) -> tuple[list[Any], int, dict[str, Any] | None]:
+    """The emergency host's recorded pairs under System 3's dice: every one has
+    aired before, so a pair goes out again only on the roulette (bank.reair),
+    and which rested pair is a LINE draw on a node of its own, which also takes
+    the chance roll in as its STATION event. (picks, resting, stamp)."""
+    rested: list[tuple[int, list[Any], Any]] = []
+    resting = 0
+    now = time.time()
+    for number, pair in enumerate(CONTINUITY_PAIRS):
+        if any(now - float((said_at or {}).get(text) or 0) < CONTINUITY_REST_SECONDS for text in pair):
+            resting += 1
+            continue
+        picks = [continuity_pick(who, str((voices or {}).get(who) or ""), text)
+                 for who, text in zip(("dj", "cohost"), pair)]
+        if all(picks):
+            rested.append((number, picks, pair))
+    if not rested:
+        return [], resting, None
+    if time.time() - float(_BANK_REAIR_MISS.get("continuity") or 0) < BANK_REAIR_MISS_REST:
+        return [], resting, None
+    t0 = time.time()
+    if not s3_chance("bank.reair", BANK_REAIR_ODDS, BANK_REAIR_LABEL):
+        _BANK_REAIR_MISS["continuity"] = time.time()
+        pipeline_log("air", "the roulette kept the emergency host's recorded pairs off (bank.reair)")
+        return [], resting, None
+    chance = _s3_roll_on("bank.reair", "", "", "", since=t0)
+    direct = globals().get("system3_direct_line")
+    handle = None
+    if direct:
+        try:
+            handle = await direct(road="interject", who="dj", dj=dj_settings(),
+                                  context="the emergency host's continuity - a recorded pair goes out again",
+                                  candidates=[" / ".join(p) for _n, _p, p in rested],
+                                  candidates_from="the emergency host's recorded pairs (the rested ones)",
+                                  bank=True)
+        except Exception as exc:  # noqa: BLE001
+            pipeline_log("system3", "the emergency host's pair was withheld after its draw failed",
+                         extra=("%s: %s" % (type(exc).__name__, exc))[:200])
+            handle = None
+    if handle is None or not handle.active or handle.choice is None or not 0 <= handle.choice < len(rested):
+        return [], resting, None
+    number, picks, pair = rested[handle.choice]
+    bind = globals().get("system3_bind_line")
+    if bind:
+        try:
+            bind(handle, " / ".join(pair))
+        except Exception:  # noqa: BLE001
+            pass
+    _CONTINUITY_STATE["next_pair"] = number + 1
+    last = max(float((said_at or {}).get(text) or 0) for text in pair)
+    replay = {"at": time.time(), "road": "continuity",
+              "label": ("replay, the emergency host's recorded pair, last aired %s" % _bank_clock(last)
+                        if last else "replay, the emergency host's recorded pair"),
+              "last_aired": last or None, "decided_by": "the emergency host's reserve",
+              **({"chance": chance} if chance else {}),
+              "pick": {"kind": "line", "index": handle.choice + 1, "of": len(rested)}}
+    return picks, resting, dict(handle.stamp, replay=replay)
+
+
 # --- [#1386] GOLD IS A RESERVE, NOT PROGRAMMING --------------------------
 #
 # Gold fires from three places and they are not the same thing:
@@ -89637,12 +90792,39 @@ GOLD_REST = 1200.0                   # the same bar rests twenty minutes
 _GOLD: dict[str, Any] = {"loaded": False, "rows": []}
 
 
+def _gold_take_holds(item: dict[str, Any]) -> bool:
+    """[s3-split] Whether one chunk's take holds its whole turn. The air notes a
+    gold bar on a turn's LAST chunk, under the whole turn's words - so a turn
+    the render cut into pieces was banked as its tail's audio under all of its
+    words, and fired later as a fragment (measured 2026-09-28: 162 characters
+    in a 2.4 s take, aired five times). Only a take that holds the turn is a bar."""
+    turn = _gold_norm(item.get("turn_text") or "").split()
+    if not turn:
+        return True
+    chunk = set(_gold_norm(item.get("chunk") or "").split())
+    return sum(1 for w in turn if w in chunk) >= 0.9 * len(turn)
+
+
+def _gold_take_fits(row: dict[str, Any]) -> bool:
+    """[s3-split] A banked bar whose take is far too short for its words (over 40
+    characters a second; speech measured on air runs 13 to 36) is a turn's tail
+    filed under the whole turn."""
+    try:
+        secs = float(row.get("seconds") or 0)
+    except (TypeError, ValueError):
+        return True
+    return secs <= 0 or len(" ".join(str(row.get("text") or "").split())) <= 40 * secs + 10
+
+
 def _gold_rows() -> list[dict[str, Any]]:
     if not _GOLD["loaded"]:
         rows: list[dict[str, Any]] = []
         try:
             got = json.loads(GOLD_PATH.read_text())
             rows = [r for r in got if isinstance(r, dict)] if isinstance(got, list) else []
+            for _r in rows:                                     # [s3-split] a take that cannot hold its words
+                if _r.get("path") and not _gold_take_fits(_r):
+                    _r["path"] = ""                             # the take goes, the line stays (as gold_trim)
         except Exception:  # noqa: BLE001
             rows = []
         _GOLD.update({"loaded": True, "rows": rows})
@@ -89659,8 +90841,13 @@ def _gold_save() -> None:
         pass
 
 
-def gold_note(who: str, text: str, path: str, seconds: float) -> bool:
-    """A rhymed line that just aired with its take - kept as gold."""
+def gold_note(who: str, text: str, path: str, seconds: float,
+              source: dict[str, Any] | None = None) -> bool:
+    """A rhymed line that just aired with its take - kept as gold.
+
+    [s3-banks-roll] `source` is the System 3 turn it was minted from
+    ({conversation_id, turn_id}); only such a bar fires while System 3 owns
+    the station's dialogue, and it airs stamped with that turn."""
     try:
         text = " ".join(str(text or "").split())
         name = str(path or "").rsplit("/", 1)[-1].split("?")[0]
@@ -89674,11 +90861,15 @@ def gold_note(who: str, text: str, path: str, seconds: float) -> bool:
             if row.get("key") == key:
                 row.update({"path": name, "seconds": float(seconds or 0), "who": who,
                             "at": time.time()})
+                if gold_source({"source": source}):                  # [s3-banks-roll]
+                    row["source"] = gold_source({"source": source})
                 _gold_save()
                 return True
         rows.append({"key": key, "who": str(who or "dj"), "text": text[:400], "path": name,
                      "seconds": float(seconds or 0), "at": time.time(), "fired": 0,
-                     "last": 0.0})
+                     "last": 0.0,
+                     **({"source": gold_source({"source": source})}     # [s3-banks-roll]
+                        if gold_source({"source": source}) else {})})
         gold_trim()
         _gold_save()
         return True
@@ -89753,9 +90944,25 @@ def gold_pick(exclude_who: str = "", min_rest: float | None = None) -> dict[str,
                 if str(r.get("who") or "") != str(exclude_who or "")
                 and now - float(r.get("last") or 0) >= rest
                 and not cast_names_line_stale(r)]   # [cast-names] no gone names
+        # [s3-banks-roll] ONLY BARS MINTED FROM SYSTEM 3 TURNS: while System 3
+        # owns the dialogue a bar with no turn behind it is stock made outside
+        # the roulette, and it stays in the bank (gold_source)
+        if _s3_active():
+            pool = [r for r in pool if gold_source(r)]
         while pool:
             least = min(int(r.get("fired") or 0) for r in pool)
             tier = [r for r in pool if int(r.get("fired") or 0) == least]
+            # [s3-banks-roll] THE WHOLE ORDER IS THE DICE DOOR'S. The first bar
+            # was System 3's and the rest a bare shuffle; now each next bar is
+            # one more roll among the ones left, made only when the bar before
+            # it lost its take (one file checked per roll, #1412). The shuffle
+            # below is the station's own order with System 3's dice off.
+            if _s3_dice_live():
+                _bar = gold_tier_pick(tier)
+                if _bar is not None:
+                    return _bar
+                pool = [r for r in pool if int(r.get("fired") or 0) != least]
+                continue
             # [s3-dice-door] System 3 picks the bar that goes first; the
             # shuffle only orders the rest, for a first whose take is gone.
             _first = tier.pop(_S3Dice("gold.pick", "which banked gold bar fires (the least-fired tier)").pick(   # [s3-dice-door]
@@ -89827,7 +91034,8 @@ def gold_harvest_entry(entry: Any, why: str = "") -> int:
                 seconds = float(clip.get("seconds") or 0) or _clip_seconds(path)
             except Exception:  # noqa: BLE001
                 seconds = 0.0
-            if gold_note(who, text, path, seconds):
+            if gold_note(who, text, path, seconds,
+                         source=bank_line_stamp(entry, text, who)):   # [s3-banks-roll]
                 kept += 1
         if kept:
             pipeline_log("air", f"{kept} rhymed bar(s) of a round let go ({why or 'replaced'}) "
@@ -89875,6 +91083,22 @@ async def gold_fill_gap(why: str = "", floorless: bool = False,
         # the page cursor does not move, so this is `laid`, as before.
         return max(laid, float(_PAGE_AIR_UNTIL[0] or 0) - time.time())
 
+    # [s3-banks-roll] GOLD IS A ROULETTE FOR THE RUN. The run goes only when
+    # the desk's row says so (gold.run) - rolled once per run and only when a
+    # bar could go (an empty bank rolls nothing); a refused run rests this
+    # road GOLD_RUN_MISS_REST and leaves the gap to the next rung. Every bar
+    # airs stamped with the System 3 turn it was minted from (gold_air_stamp).
+    _t_run = time.time()
+    if _s3_dice_live() and sold() < want:
+        if (time.time() - float(_BANK_REAIR_MISS.get("gold") or 0) < GOLD_RUN_MISS_REST
+                or not gold_run_ready(min_rest=GOLD_GAP_REST)):
+            return ""
+        if not s3_chance("gold.run", GOLD_RUN_ODDS,
+                         "a run of banked gold bars fills the gap (otherwise the next rung does)"):
+            _BANK_REAIR_MISS["gold"] = time.time()
+            pipeline_log("air", "the roulette kept the gold bank off the air (gold.run) - "
+                         + (why or "dead air"))
+            return ""
     while bars < GOLD_RUN_MOST and sold() < want:
         # The FIRST bar is the caller's decision - sfx_fill_gap has already
         # tested the air, and the sting road hands this the same permission.
@@ -89883,6 +91107,7 @@ async def gold_fill_gap(why: str = "", floorless: bool = False,
         # class - stock burned unheard).
         if bars and (radio_paused() or not _RADIO.get("on")):
             break
+        _t_pick = time.time()                                   # [s3-banks-roll]
         try:
             bar = gold_pick(exclude_who=last_who, min_rest=GOLD_GAP_REST)
         except Exception:  # noqa: BLE001
@@ -89902,7 +91127,11 @@ async def gold_fill_gap(why: str = "", floorless: bool = False,
             out = await _door("interject", None, line=text,
                               who=str(bar.get("who") or "dj"),
                               checked=True, sting=False, clip=clip,
-                              round_as="gold")
+                              round_as="gold",
+                              # [s3-banks-roll] the bar is its source turn's node on the air
+                              system3=(gold_air_stamp(bar, "" if bars else "gold.run",
+                                                      _t_run, _t_pick)
+                                       if _s3_dice_live() else None))
         except Exception as exc:  # noqa: BLE001
             pipeline_log("air", "a gold bar could not fill the air: "
                          f"{type(exc).__name__}: {exc}"[:160])
@@ -92790,7 +94019,8 @@ def unheard_free(kind: str, row: Any) -> bool:
 
 
 def _ready_shelf_row(kind: str, rescue: bool = False,
-                     pick: dict[str, Any] | None = None
+                     pick: dict[str, Any] | None = None,
+                     reair_out: list[Any] | None = None   # [s3-banks-roll]
                      ) -> dict[str, Any] | None:
     """#1168: `rescue` is DEAD AIR, and it selects out of turn.
 
@@ -92848,6 +94078,15 @@ def _ready_shelf_row(kind: str, rescue: bool = False,
         return (rescue or unheard_free(kind, row)
                 or _ready_round_fits(kind, takes, window))
 
+    # [s3-banks-roll] every replay this door could air (the re-air gate's
+    # rejects struck out), for the roulette to choose among - the plot
+    # preference below is a first airing's question - and back, the first
+    # airing it could air instead (None when none stood ready)
+    if reair_out is not None:
+        shelf_take(kind, peek=True, reair_out=reair_out,
+                   predicate=lambda r: bool(eligible(r) and float(r.get("aired_at") or 0)))
+        _first = shelf_take(kind, peek=True, predicate=eligible)
+        return _first if (_first is not None and not float(_first.get("aired_at") or 0)) else None
     # #1260: a named row answers for itself. It is still checked against
     # the shelf by IDENTITY, so a row that has since been aired, trimmed
     # or recast cannot be resurrected by holding a reference to it.
@@ -92904,7 +94143,8 @@ async def _ready_shelf_air(kind: str, track: dict[str, Any] | None = None,
                            rescue: bool = False,
                            pick: dict[str, Any] | None = None,
                            force: bool = False,
-                           on_handoff: Any = None) -> list[str]:
+                           on_handoff: Any = None,
+                           named: bool = False) -> list[str]:    # [s3-banks-roll] the operator's Play now
     """Reserve one exact finished round; only its transport can commit it.
 
     2026-09-10: `rescue` is DEAD AIR, and it is the one caller allowed to
@@ -92921,6 +94161,42 @@ async def _ready_shelf_air(kind: str, track: dict[str, Any] | None = None,
     if row is None:
         return _shelf_no(kind, "the shelf would not give up the row that "
                                "was picked")                      # #1304
+    # [s3-banks-roll] A ROUND THAT HAS AIRED BEFORE GOES OUT AGAIN ONLY ON THE
+    # ROULETTE - and never once the re-air gate has retired it. Every road
+    # that reaches the cupboard through this door - the dead-air rescue, the
+    # torrent's floor, a road asking before it writes, the memo breaking in -
+    # rolls bank.reair here, and bank.reair_pick among every rested replay the
+    # door could air; refused, the first airing the plot preference passed
+    # over goes instead, when one stood ready. A round another road named
+    # rolls on its own. The operator's Play now (`named`) is his decision:
+    # never rolled, stamped as a replay - but refused if the gate retired it.
+    _s3_replay_now = None
+    if not row_unaired(row):
+        if named:
+            _gate_why = bank_reair_refusal(kind, row)
+            if _gate_why:
+                return _shelf_no(kind, "the re-air gate retired this round - " + _gate_why)
+            _s3_replay_now = bank_replay_stamp(kind, row, None, None,
+                                               "the operator named this round (Play now)")
+        elif pick is not None:
+            row, _s3_replay_now = bank_reair_pick(
+                kind, [row], "a round named at the %s cupboard" % SHELF_LABEL.get(kind, kind))
+            if row is None:
+                return _shelf_no(kind, "a replay goes out again only on the roulette - the "
+                                       "re-air gate or bank.reair kept this one off")
+        elif _s3_dice_live():
+            _again_rows: list[Any] = []
+            _first_airing = _ready_shelf_row(kind, rescue, None, reair_out=_again_rows)
+            _again, _s3_replay_now = bank_reair_pick(
+                kind, _again_rows or [row],
+                "the %s cupboard" % SHELF_LABEL.get(kind, kind))
+            if _again is not None:
+                row = _again
+            elif _first_airing is not None:
+                row = _first_airing     # heard for the first time: the bank's job, no roll
+            else:
+                return _shelf_no(kind, "the roulette did not bring a replay up (bank.reair) "
+                                       "and nothing heard for the first time was ready")
     takes = _ready_round_takes(kind, row)
     # #1260: `free` is "this may air out of turn" - the dead-air rescue
     # as before, or an unheard round past the dial. Everything below that
@@ -93063,6 +94339,8 @@ async def _ready_shelf_air(kind: str, track: dict[str, Any] | None = None,
         # withdrawn, every one "the sheet is on the news entry, not gallery".
         # The cupboard was answering silence and being turned away inside.
         entry["_ready_free"] = bool(free)
+        if _s3_replay_now:
+            entry["_s3_replay"] = _s3_replay_now    # [s3-banks-roll] rides its ledger rows
         # #1322: `force` IS the silence rescue (#1313) - it is set only
         # under talk_quiet_for() >= SILENCE_LOSES_AFTER - so it, and
         # nothing broader, is what lets the booth air a repeat. `rescue`
@@ -94092,7 +95370,15 @@ async def continuity_air(reason: str = "") -> bool:
     first = int(_CONTINUITY_STATE.get("next_pair") or 0) % len(CONTINUITY_PAIRS)
     said_at = _CONTINUITY_STATE.setdefault("said", {})
     resting = 0
-    for step in range(len(CONTINUITY_PAIRS)):
+    # [s3-banks-roll] the emergency host's recorded pairs have all aired before:
+    # under System 3's dice a pair goes out again only on the roulette
+    # (bank.reair), and which rested pair is a LINE draw on a node of its own
+    # (continuity_roulette) - never the rotation below.
+    _cont_rolled = _s3_dice_live()
+    _cont_s3 = None
+    if _cont_rolled:
+        chosen, resting, _cont_s3 = await continuity_roulette(voices, said_at)
+    for step in (range(len(CONTINUITY_PAIRS)) if not _cont_rolled else ()):
         number = (first + step) % len(CONTINUITY_PAIRS)
         pair = CONTINUITY_PAIRS[number]
         # #1068: no continuity line twice inside an hour. A pair that went
@@ -94171,6 +95457,10 @@ async def continuity_air(reason: str = "") -> bool:
                 "aired": "prepared", "clip_media": clip["path"].rsplit("/", 1)[-1],
                 "clip_sig": clip["sig"], "clip_from": offset, "clip_until": offset + seconds})
             offset += seconds
+        if _cont_s3:                        # [s3-banks-roll] the pair's node, and the replay
+            for _cont_row in rows:
+                if _cont_row.get("who") in ("dj", "cohost"):
+                    _cont_row["system3"] = dict(_cont_s3)
         _RADIO.setdefault("chat", []).extend(rows)
         del _RADIO["chat"][:-RADIO_CHAT_KEEP]
         _CONTINUITY_STATE.update(last_air=time.time(), why=reason or "Emergency host continuity")
@@ -101555,6 +102845,11 @@ def _call_rerun_pick_blocking(low: float, high: float) -> dict[str, Any]:
                 continue
             if _hold_rerun and not _rerun_rhymes(r):
                 continue                # a plain take may not re-air (#1064)
+            if _s3_active() and not rerun_s3_source(r):
+                continue                # [s3-banks-roll] a replay names the System 3 round it replays
+            if bank_reair_refusal("caller", r, str((rerun_s3_source(r) if _s3_active() else {})
+                                                  .get("conversation_id") or "")):
+                continue                # [s3-banks-roll] the re-air gate retired this call
             cid = str(r.get("id") or "")
             led = ledger.get(cid) or {}
             if int(led.get("uses") or 0) >= CALL_RERUN_MOST:
@@ -101633,6 +102928,14 @@ async def call_rerun_take(track: dict[str, Any] | None = None) -> list[str]:
         pick = await asyncio.to_thread(_call_rerun_pick_blocking, low, high)
         if not pick:
             return []
+        # [s3-banks-roll] a call that already aired goes out again only on the
+        # roulette (bank.reair); the pick among the rested calls was the pick
+        # thread's roll (call.rerun_take). Its rows carry the round it replays.
+        _rerun_s3 = None
+        if _s3_dice_live():
+            _rerun_s3 = rerun_replay_s3(dict(pick.get("row") or {}))
+            if _rerun_s3 is None:
+                return []
         row = dict(pick.get("row") or {})
         media = dict(pick.get("media") or {})
         length = float(pick.get("seconds") or 0)
@@ -101759,6 +103062,8 @@ async def call_rerun_take(track: dict[str, Any] | None = None) -> list[str]:
                         "aired": ("box" if box_played else
                                   "published" if page_delivery else "held"),
                         "source": "rerun",
+                        **({"system3": rerun_row_s3(_rerun_s3, r)}      # [s3-banks-roll]
+                           if _rerun_s3 else {}),
                         "clip_media": key, "clip_sig": sig,
                         "clip_from": r.get("from"),
                         "clip_until": r.get("until"),
@@ -103532,8 +104837,12 @@ async def dj_call_generated(caller: dict[str, Any] | None = None,
     duo_name, duo_grab = "", {}
     if not story and s3_chance("call.duo", 0.28, "MORE THAN ONE person is on the line"):   # #1039 [s3-dice-door]
         duo_name = s3_choice("call.duo_name",
-            [n for n in NEW_VOICE_NAMES if n != caller.get("name")]
-            or list(NEW_VOICE_NAMES), "the second person's name", tabled=False)
+            # [s3-lists2] the whole name list is a POOLS1 row set the desk may edit;
+            # this call's filter - never the caller's own name - runs on the desk's rows
+            [n for n in s3_pool("call.duo_name", NEW_VOICE_NAMES, "the second person's name")
+             if n.casefold() != str(caller.get("name") or "").casefold()]
+            or s3_pool("call.duo_name", NEW_VOICE_NAMES, "the second person's name"),
+            "the second person's name", tabled=False)
         try:
             duo_grab = await speakbox_quote(most=3, cap=260) or {}
         except Exception:
@@ -106266,9 +107575,11 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
     if ready_takes is None and not by_hand and not whole:
         playlist = add_listening_responses(
             playlist, voices,
-            lambda who, context, used: _RESPONSES.take(
-                voices.get(who, ""), voice_engine_for(voices.get(who, "")),
-                context, used, crystal=continuity_crystal()), away=seat_away_who())
+            # [s3-banks-roll] each seam rolls on the round's node (listen.seam),
+            # the response is a roll among the eligible ones (listen.pick), and
+            # it is stamped to the turn it answers. System 3's dice off: as before.
+            lambda who, context, used: listening_seam_take(
+                who, context, used, voices, ready_meta), away=seat_away_who())
 
     # Includes raw fallback, recorded/manual exchanges, and prepared responses.
     # None may bypass the persistent exact-hour rule through a legacy waiver.
@@ -106691,10 +108002,14 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                     aired_items.append(item)                          # #no-repeats
                     _DIALOGUE_AT[0] = time.time()                     # 2026-09-07
                     # Gold: a rhymed turn with its take is kept to fire again.
-                    if ready_takes is None and item.get("turn_end") and item["who"] in ("dj", "cohost", "third"):
+                    if (ready_takes is None and item.get("turn_end") and item["who"] in ("dj", "cohost", "third")
+                            and _gold_take_holds(item)):                   # [s3-split] a take that holds its turn
                         try:
                             gold_note(item["who"], str(item.get("turn_text") or item["chunk"]),
-                                      str(clip.get("path") or key), await _clip_seconds_async(clip["path"]))
+                                      str(clip.get("path") or key), await _clip_seconds_async(clip["path"]),
+                                      source=bank_line_stamp(                    # [s3-banks-roll]
+                                          ready_meta, str(item.get("turn_text") or item["chunk"]),
+                                          item["who"]))
                         except Exception:  # noqa: BLE001
                             pass
                     # #833: sting_due() existed, had a dial, had TESTS —
@@ -106769,6 +108084,8 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                             seg_ix.append(len(seg) - 1)
                             turn_ix.append(-1)
                             line_ids.append(uuid.uuid4().hex)           # #1277
+                            _s3_air_own(line_ids[-1], gold_air_stamp(   # [s3-banks-roll]
+                                _gold, "gold.in_round"))
                             gold_fired(_gold)
                             pipeline_log("air", "a gold bar fires again, sting to "
                                          f"follow: {str(_gold.get('text') or '')[:70]}")
@@ -107479,6 +108796,7 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                             _sr["model_call"] = _written
                         if _system2_record:
                             _sr["system2"] = _system2_record
+                    _s3_air_rows(_script_rows, ready_meta)          # [s3-banks-roll]
                     _pl_block = await asyncio.to_thread(
                         script_ledger_commit,
                         _round_sid, _script_rows, _script_round_kind,
@@ -108851,7 +110169,19 @@ async def dj_banter(track: dict[str, Any] | None = None,
                             and (not e.get("aired_at")
                                  or shelf_repeat_ready("banter", e)))
         entry = _LARDER[_take_at]
-        if repeat_safe("banter", entry):
+        # [s3-banks-roll] a first airing stands; a banked round that has aired
+        # before goes out again only on the roulette (larder_reair_gate). A
+        # refused replay leaves the larder as it was and the road writes fresh.
+        _take_at, _larder_replay = larder_reair_gate(_take_at)
+        entry = _LARDER[_take_at] if _take_at >= 0 else None
+        if isinstance(entry, dict):
+            if _larder_replay:
+                entry["_s3_replay"] = _larder_replay
+            else:
+                entry.pop("_s3_replay", None)
+        if entry is None:
+            pass
+        elif repeat_safe("banter", entry):
             entry["aired_at"] = time.time()
             entry["aired"] = int(entry.get("aired") or 0) + 1
             entry["used_by"] = stock_used_by()                            # #1068
@@ -108881,7 +110211,7 @@ async def dj_banter(track: dict[str, Any] | None = None,
         except Exception:  # noqa: BLE001
             pass
         _larder_save()
-        if ((time.time() - float(entry["at"]) < larder_fresh()
+        if (entry is not None and (time.time() - float(entry["at"]) < larder_fresh()   # [s3-banks-roll]
              or (shelf_is_repeat("banter", entry)
                  and time.time() - float(entry["at"])
                  <= REPEAT_KEEP_SECONDS))
@@ -140783,6 +142113,237 @@ async def pinelink_announce_api(
     return {"ok": True, "at": _PINELINK_ANNOUNCE["at"]}
 
 
+# --- [pincrop] THE PINE CAM'S CROP: the box the operator draws --------------
+#
+# "tap and drag to draw a crop window that basically reduces the webcam to be
+#  that size of window Cropping out everything around it ... So that way if
+#  any event I need to crop things outside of the camera from showing on the
+#  stream that is possible." (the operator, 2026-09-28)
+#
+# The crop is CUT BY THE SUPERVISOR (tools/pinelink.py), in the encode every
+# road reads - the TS door, the house HLS, the stills the tune page polls,
+# the phone's lane, the kept clips - so nothing here filters a picture. This
+# keeps the box: data/pinelink_crop.json, written whole through a rename (the
+# supervisor re-reads it every 2.5 s and must never meet half a file), and
+# written by nothing else - pinelink_pref.json has four writers, one of them
+# working from a five-second memo, and a privacy setting must not depend on
+# all four merging right.
+#
+# Fractions of the camera frame from its top-left corner, or null. "Saved"
+# and "applied" are different claims: `applied` is what the running ffmpeg
+# cuts (state.json's `crop`, written by the supervisor), and the page says
+# which one is true. The draw mode's picture is the WHOLE frame, served to
+# the house only - it is exactly what the crop keeps off the stream.
+PINELINK_CROP_PATH = data_path("pinelink_crop.json")
+PINELINK_FRAME_RAW = PINELINK_DIR / "frame_raw.jpg"
+PINELINK_CROP_MIN = 0.05            # tools/pinelink.py CROP_MIN: a slip, not a box
+PINELINK_CROP_FULL = 0.995          # a box this close to the whole frame is no crop
+PINELINK_RAW_FRESH_S = 5.0
+_PINELINK_LAST_RAW: dict[str, Any] = {"bytes": b"", "at": 0.0, "which": ""}
+
+
+def pinelink_crop_clean(raw: Any) -> dict[str, float] | None:
+    """[pincrop] The box as tools/pinelink.py crop_clean() will read it - the
+    same clamp into the frame, the same floor, five places. None is no crop
+    (and so is a box that covers the whole frame). ValueError otherwise."""
+    import math
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ValueError("the crop is not an object")
+    try:
+        x, y, w, h = (float(raw[k]) for k in ("x", "y", "w", "h"))
+    except (KeyError, TypeError, ValueError):
+        raise ValueError("the crop needs numbers x, y, w and h") from None
+    if not all(math.isfinite(v) for v in (x, y, w, h)):
+        raise ValueError("the crop has a number that is not finite")
+    x, y = min(max(x, 0.0), 1.0), min(max(y, 0.0), 1.0)
+    w, h = min(w, 1.0 - x), min(h, 1.0 - y)
+    if w < PINELINK_CROP_MIN or h < PINELINK_CROP_MIN:
+        raise ValueError("that box is under %d%% of the picture on a side - "
+                         "draw a bigger one" % round(PINELINK_CROP_MIN * 100))
+    if w >= PINELINK_CROP_FULL and h >= PINELINK_CROP_FULL:
+        return None
+    return {"x": round(x, 5), "y": round(y, 5),
+            "w": round(w, 5), "h": round(h, 5)}
+
+
+def pinelink_crop_read() -> tuple[dict[str, float] | None, str]:
+    """[pincrop] (box or None, error): the file as the supervisor reads it."""
+    try:
+        got = json.loads(PINELINK_CROP_PATH.read_text())
+    except FileNotFoundError:
+        return None, ""
+    except Exception as err:  # noqa: BLE001
+        return None, "the crop file cannot be read (%s)" % str(err)[:120]
+    try:
+        return pinelink_crop_clean(got.get("crop") if isinstance(got, dict)
+                                   else "not an object"), ""
+    except ValueError as err:
+        return None, "the crop file is not a crop (%s)" % err
+
+
+def pinelink_crop_write(box: dict[str, float] | None, who: str = "") -> None:
+    """[pincrop] Whole, through a rename: the supervisor polls this file, and
+    an unreadable one keeps the camera on its old cut (or off the air)."""
+    PINELINK_CROP_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = PINELINK_CROP_PATH.with_name(PINELINK_CROP_PATH.name + ".tmp")
+    tmp.write_text(json.dumps({"crop": box, "at": time.time(),
+                               "by": str(who or "")[:60]}))
+    os.replace(tmp, PINELINK_CROP_PATH)
+
+
+def _pinelink_crop_same(a: Any, b: Any) -> bool:
+    if not a or not b:
+        return not a and not b
+    try:
+        return all(abs(float(a[k]) - float(b[k])) < 1e-4
+                   for k in ("x", "y", "w", "h"))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def pinelink_crop_view(say: str = "") -> dict[str, Any]:
+    """[pincrop] What is asked for, what is cut, and the sentence between."""
+    want, bad = pinelink_crop_read()
+    st = pinelink_state()
+    cut = st.get("crop") if isinstance(st.get("crop"), dict) else None
+    knows = cut is not None
+    applied = (cut or {}).get("box") if (cut or {}).get("on") else None
+    live = bool(st.get("state") == "live" and st.get("fresh"))
+    pending = not _pinelink_crop_same(want, applied)
+    err = bad or str((cut or {}).get("error") or "")
+    if not say:
+        if bad:
+            say = (bad + " - the camera keeps the cut it has, or stays off the "
+                   "air; set or reset the crop to write it again")
+        elif want and not knows:
+            say = ("the crop is saved, but the camera link on the host "
+                   "(tools/pinelink.py) does not cut crops yet - NOTHING is "
+                   "cropped until it is updated and restarted")
+        elif pending and live:
+            say = "the camera is starting again with the new box - a few seconds"
+        elif pending:
+            say = "saved - the camera cuts it when it next joins"
+        elif applied:
+            say = ("cropped: only the box goes out (%d%% x %d%% of the picture)"
+                   % (round(applied["w"] * 100), round(applied["h"] * 100)))
+        else:
+            say = "no crop: the whole picture goes out"
+    return {"ok": not bad, "want": want, "applied": applied,
+            "pending": pending, "live": live, "supervisor_cuts": knows,
+            "state": st.get("state"),
+            "source": (cut or {}).get("src") or [848, 480],
+            "cut": (cut or {}).get("cut"), "out": (cut or {}).get("out"),
+            "pad": (cut or {}).get("pad"), "error": err, "say": say}
+
+
+@app.get("/api/pinelink/crop")
+async def pinelink_crop_api(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """[pincrop] The box asked for, the box being cut, and whether they differ."""
+    if request.headers.get("x-pinebox-public") == "1":
+        raise HTTPException(status_code=403, detail="the crop is the house's")
+    require_read_auth(authorization)
+    return await asyncio.to_thread(pinelink_crop_view)
+
+
+@app.post("/api/pinelink/crop")
+async def pinelink_crop_set_api(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """[pincrop] Set the box - {x, y, w, h} as fractions of the frame, or
+    {"crop": {...}} - or take it away with {"reset": true} / {"crop": null}.
+    No kick: the supervisor sees the file within 2.5 s and restarts only its
+    ffmpeg, with the new cut."""
+    if request.headers.get("x-pinebox-public") == "1":
+        raise HTTPException(status_code=403, detail="the crop is the house's")
+    require_auth(authorization)
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        body = {}
+    body = body if isinstance(body, dict) else {}
+    try:
+        if body.get("reset") or ("crop" in body and body.get("crop") is None):
+            box = None
+        else:
+            box = pinelink_crop_clean(body["crop"] if isinstance(body.get("crop"), dict)
+                                      else body)
+    except ValueError as err:
+        view = await asyncio.to_thread(pinelink_crop_view)
+        return {**view, "ok": False, "say": str(err)}
+    try:
+        await asyncio.to_thread(pinelink_crop_write, box, str(body.get("who") or ""))
+    except Exception as err:  # noqa: BLE001
+        view = await asyncio.to_thread(pinelink_crop_view)
+        return {**view, "ok": False,
+                "say": "could not keep the crop: " + str(err)[:160]}
+    pipeline_log("air", "pine cam crop: %s ([pincrop])" % (
+        ("x %.3f y %.3f w %.3f h %.3f" % (box["x"], box["y"], box["w"], box["h"]))
+        if box else "none - the whole picture"))
+    view = await asyncio.to_thread(pinelink_crop_view)
+    if view.get("supervisor_cuts"):
+        view["say"] = ("cropped at the camera - it starts again with only the "
+                       "box in a few seconds" if box else
+                       "the whole picture again - the camera starts again in "
+                       "a few seconds")
+    return {**view, "ok": True}
+
+
+def _pinelink_raw_bytes() -> bytes:
+    """[pincrop] The whole frame, or b"". While a crop is cut the supervisor
+    writes it as frame_raw.jpg; with none, frame.jpg IS the whole frame. Only
+    a whole JPEG written since the current cut began is served - a frame
+    left over from the previous cut would put the box on the wrong picture."""
+    st = pinelink_state()
+    cut = st.get("crop") if isinstance(st.get("crop"), dict) else {}
+    which = "raw" if cut.get("on") else "frame"
+    path = PINELINK_FRAME_RAW if which == "raw" else PINELINK_FRAME
+    since = float(cut.get("at") or 0)
+    now = time.time()
+    raw = b""
+    try:
+        m = path.stat().st_mtime
+        if now - m <= PINELINK_RAW_FRESH_S and m >= since - 1.0:
+            raw = path.read_bytes()
+    except Exception:  # noqa: BLE001
+        raw = b""
+    if len(raw) > 1024 and raw[-2:] == b"\xff\xd9":
+        _PINELINK_LAST_RAW.update({"bytes": raw, "at": now, "which": which})
+        return raw
+    if (_PINELINK_LAST_RAW.get("which") == which
+            and now - float(_PINELINK_LAST_RAW.get("at") or 0) <= PINELINK_RAW_FRESH_S):
+        return bytes(_PINELINK_LAST_RAW.get("bytes") or b"")
+    return b""
+
+
+@app.get("/api/pinelink/crop/frame.jpg")
+async def pinelink_crop_frame_api(
+    request: Request,
+    t: str = "",
+    authorization: str | None = Header(default=None),
+) -> Response:
+    """[pincrop] The WHOLE picture, for drawing the box on. The house only:
+    never through the public door, never on a tune-in token - it is the very
+    picture the crop keeps off the stream."""
+    if request.headers.get("x-pinebox-public") == "1" or t:
+        raise HTTPException(status_code=403,
+                            detail="the whole picture is for the house only")
+    require_read_auth(authorization)
+    raw = await asyncio.to_thread(_pinelink_raw_bytes)
+    if not raw:
+        raise HTTPException(status_code=404,
+                            detail="the camera is not sending the whole picture "
+                                   "right now")
+    return Response(content=raw, media_type="image/jpeg", headers={
+        "Cache-Control": "no-store, no-cache, must-revalidate",
+        "Access-Control-Allow-Origin": "*"})
+
+
 def pinelink_ladder() -> dict[str, Any]:
     """Every rung of 'find, connect, show', graded from what is on disk."""
     now = time.time()
@@ -147458,7 +149019,8 @@ async def orch_command_run(text: str) -> dict[str, Any]:       # [#1211]
         else:
             said = await _ready_shelf_air(
                 kind, _RADIO.get("now"), rescue=True, pick=row,
-                force=talk_quiet_for() >= SILENCE_LOSES_AFTER)
+                force=talk_quiet_for() >= SILENCE_LOSES_AFTER,
+                named=True)             # [s3-banks-roll] the operator named it (Play now)
             ok = bool(said)
             say = (("%d line(s) of that %s round went out" % (len(said), kind))
                    if said else
@@ -169155,7 +170717,8 @@ async def cupboard_act_api(
                                 detail="the station is not on air")
         try:
             said = await _ready_shelf_air(kind, _RADIO.get("now"),
-                                          rescue=True, pick=row)
+                                          rescue=True, pick=row,
+                                          named=True)   # [s3-banks-roll] the operator named it (Play now)
         except Exception as exc:  # noqa: BLE001
             raise HTTPException(status_code=500,
                                 detail="%s: %s" % (type(exc).__name__,
@@ -180166,7 +181729,7 @@ def script_ledger_commit(sid: str, rows: list[dict[str, Any]],
             "line_id": str(row.get("line_id") or ""),
             "who": str(row.get("who") or ""),
             "kind": str(row.get("kind") or ""),
-            "text": str(row.get("text") or "")[:2000],
+            "text": str(row.get("text") or ""),                              # [s3-split] whole: a 2,000 cap cut station IDs mid-word
             "seconds": round(float(row.get("seconds") or 0), 2),
             "turn": row.get("turn"),
             # The immutable line-level decisions. These arrive on the final
@@ -230112,23 +231675,10 @@ async function djVoicePoll(immediate) {
           djVoiceQueue.splice(i, 1);
         }
       }
-      if (djVoiceNow && cutIds.indexOf(String(djVoiceNow.row_id || "")) >= 0) {
-        djVoiceEpoch += 1;
-        (djVoiceEls || []).forEach((a) => {
-          if (a && a.src) {
-            try { a.pause(); a.removeAttribute("src"); a.load(); } catch (e) {}
-          }
-        });
-        djVoiceBusy = false;
-        djVoiceLive = 0;
-        djVoiceNow = null;
-        djStreamNow = null;
-        djStreamLiveId = "";
-        djSpeaking = false;
-        djApplyGain();
-        djTalkMarkLive();
-        setTimeout(djVoiceNext, 50);
-      }
+      /* [s3-split] the clip already SOUNDING plays to its end: "Don't want any
+       * messages getting cut off when they're being spoken on the air" (the
+       * operator, 2026-09-28). Only the clips still queued behind it go with
+       * their record. */
     }
     clips.forEach((clip) => {
       djVoiceSeen = Math.max(djVoiceSeen, clip.ts);
@@ -239444,10 +240994,10 @@ async function system3Open(tab) {                       /* [s3-window] tab: tabl
   if (system3View) return;
   if (!document.getElementById("system3Style")) {
     const style = document.createElement("link"); style.id = "system3Style"; style.rel = "stylesheet";
-    style.href = "/system3/system3.css?v=4"; document.head.append(style);
+    style.href = "/system3/system3.css?v=5"; document.head.append(style);   /* [pine-graph] */
   }
   try {
-    const module = await import("/system3/system3.js?v=6");
+    const module = await import("/system3/system3.js?v=7");   // [s3-banks-roll] replay / gold / listening chips on the turn
     system3View = await module.openSystem3({request: (path, options) => api(path, options),
       tab: typeof tab === "string" ? tab : "",
       onClose: () => { system3View = null; }});
@@ -261307,16 +262857,8 @@ async function pollOnce() {
           voiceQueue.splice(i, 1);
         }
       }
-      if (voiceNowTs && voiceCurrentClip
-          && cutIds.indexOf(String(voiceCurrentClip.row_id || "")) >= 0) {
-        voiceAck(voiceCurrentClip, "error", "cut with its record (#1237)");
-        voiceEpoch += 1;
-        try { voice.pause(); voice.removeAttribute("src"); voice.load(); } catch (e) {}
-        voiceBusy = false;
-        voiceNowTs = 0;
-        if (ducking) { ducking = false; applyLevels(); }
-        voiceNext();
-      }
+      /* [s3-split] a clip already sounding plays to its end - a message is
+       * never cut off while it is spoken; the queued ones go with their record */
     }
     (data.clips || []).forEach((clip) => {
       voiceSeen = Math.max(voiceSeen, clip.ts);

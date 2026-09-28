@@ -58,6 +58,12 @@ import java.util.concurrent.atomic.AtomicBoolean
  * AND IT DOES NOT EAT TOUCHES beyond its own rectangle. The page owns
  * everything around the picture; a press ON it is a tap or a drag of
  * the box, handed back to the page as such, like the set's.
+ *
+ * [pincrop] A press that stays put for HOLD_MS is a HOLD, the tablet's
+ * right button: the page is told (onHold, device pixels) and opens its
+ * crop radial - it retires this surface (`menu`) so the HTML menu can
+ * paint where the picture was. The rest of that gesture is consumed
+ * here, so the release is never also a tap.
  */
 @UnstableApi
 class PineCamWall(context: Context) : FrameLayout(context) {
@@ -78,6 +84,10 @@ class PineCamWall(context: Context) : FrameLayout(context) {
 
     /** Where the operator's press landed, as a screen point. */
     @Volatile var onTap: ((Float, Float) -> Unit)? = null
+
+    /** [pincrop] The press stayed put for HOLD_MS: the crop radial's hold,
+     *  handed to the page as a screen point like the tap. */
+    @Volatile var onHold: ((Float, Float) -> Unit)? = null
 
     /** Final native geometry after a drag/resize, in device pixels. */
     @Volatile var onBoxChanged: ((Int, Int, Int, Int) -> Unit)? = null
@@ -136,17 +146,46 @@ class PineCamWall(context: Context) : FrameLayout(context) {
     private var moving = false
     private var resizing = false
     private var gestureStart = WallRect(0, 0, 0, 0)
+    private var holdWaiter: Runnable? = null   // [pincrop] the armed hold
+    private var heldFired = false              // [pincrop] eat the rest of the gesture
+
+    /** [pincrop] The hold: HOLD_MS after a DOWN that has not moved and has
+     *  not been released, tell the page and consume the rest of the
+     *  gesture. Runs on the main thread (postDelayed on this view). */
+    private fun armHold() {
+        cancelHold()
+        val waiter = Runnable {
+            holdWaiter = null
+            if (!trackingTap || moving) return@Runnable
+            heldFired = true
+            trackingTap = false
+            moving = false
+            Log.i(TAG, "hold at ${downX.toInt()},${downY.toInt()}")
+            try { onHold?.invoke(downX, downY) }
+            catch (err: Throwable) { Log.w(TAG, "hold: ${err.message}") }
+        }
+        holdWaiter = waiter
+        postDelayed(waiter, HOLD_MS)
+    }
+
+    private fun cancelHold() {
+        holdWaiter?.let { removeCallbacks(it) }
+        holdWaiter = null
+    }
 
     /**
      * A press and a release inside the slop is a tap; a press that
      * travels is a drag of the box (or a resize from its bottom-right
-     * corner). Consumed either way: this surface IS the picture, and a
-     * press on it was never meant for whatever the box lies over.
+     * corner); a press that stays put for HOLD_MS is a hold ([pincrop]).
+     * Consumed either way: this surface IS the picture, and a press on
+     * it was never meant for whatever the box lies over.
      */
     fun observeTouch(press: MotionEvent): Boolean {
         if (!running.get() || hidden || menuHidden || visibility != View.VISIBLE) {
             trackingTap = false
             moving = false
+            cancelHold()                       // [pincrop] the surface went away mid-press
+            heldFired = false
             return false
         }
         val here = IntArray(2)
@@ -155,6 +194,8 @@ class PineCamWall(context: Context) : FrameLayout(context) {
             press.rawY >= here[1] && press.rawY < here[1] + height
         when (press.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
+                cancelHold()                   // [pincrop] a new gesture
+                heldFired = false
                 /* The left bezel stays the native drawer's, even full-screen. */
                 if (press.rawX <= EDGE_PASS_PX * resources.displayMetrics.density) {
                     trackingTap = false
@@ -173,13 +214,16 @@ class PineCamWall(context: Context) : FrameLayout(context) {
                 resizing = !fullScreen &&
                     press.rawX >= here[0] + width - RESIZE_HANDLE_PX * resources.displayMetrics.density &&
                     press.rawY >= here[1] + height - RESIZE_HANDLE_PX * resources.displayMetrics.density
+                armHold()                      // [pincrop] still here in HOLD_MS = the radial
                 return true
             }
             MotionEvent.ACTION_MOVE -> {
+                if (heldFired) return true     // [pincrop] the gesture ended at the hold
                 if (!trackingTap) return false
                 val dx = (press.rawX - downX).toInt()
                 val dy = (press.rawY - downY).toInt()
                 if (!moving && Math.hypot(dx.toDouble(), dy.toDouble()) > TAP_SLOP_PX) {
+                    cancelHold()               // [pincrop] a travelled press is a drag
                     moving = true
                     try { onDragging?.invoke(true) }
                     catch (err: Throwable) { Log.w(TAG, "dragging: ${err.message}") }
@@ -205,6 +249,8 @@ class PineCamWall(context: Context) : FrameLayout(context) {
                 return true
             }
             MotionEvent.ACTION_UP -> {
+                cancelHold()                   // [pincrop]
+                if (heldFired) { heldFired = false; return true }
                 if (!trackingTap) return false
                 val moved = Math.hypot(
                     (press.rawX - downX).toDouble(), (press.rawY - downY).toDouble())
@@ -236,6 +282,8 @@ class PineCamWall(context: Context) : FrameLayout(context) {
                 return true
             }
             MotionEvent.ACTION_CANCEL -> {
+                cancelHold()                   // [pincrop]
+                heldFired = false
                 val was = trackingTap
                 val wasMoving = moving
                 trackingTap = false
@@ -654,6 +702,9 @@ class PineCamWall(context: Context) : FrameLayout(context) {
         private const val MIN_HEIGHT_DP = 90f
         private const val TAP_SLOP_PX = 24.0
         private const val TAP_HOLD_MS = 700L
+        /** [pincrop] The crop radial's hold - the SFX wall's 550 ms, the
+         *  same wait the page uses on its own picture. */
+        private const val HOLD_MS = 550L
         /* The connection. */
         private const val CONNECT_MS = 4_000
         private const val READ_MS = 8_000

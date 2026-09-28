@@ -65,6 +65,20 @@ def normalize(raw: Any) -> dict[str, Any]:
                       ("CTS", "ES", "RS", "IRS", "FL")],
             "speakerbox": [mark for mark in items(item.get("speakerbox"), 2)
                            if mark in ("prepend", "append")],
+            # [nodeplan] a nested call chain's shape: the RESOLVE wheel rolls at
+            # "open", its words land at "close" (plan_graph). The keys exist only
+            # when set, so a graph without them normalizes byte-identically to
+            # the engine before these fields (the enabled-graph hash stands).
+            **({"call_leg": _text(item.get("call_leg"), 8).lower()}
+               if _text(item.get("call_leg"), 8).lower() in ("open", "middle", "close") else {}),
+            # [s3-split] the SPLIT switch rides the node (conditional keys: an
+            # untouched graph still normalizes byte-identically)
+            **({"splits": True} if item.get("splits") in (True, 1) else {}),
+            **({"max_splits": int(_number(item.get("max_splits"), 0, 0, 12))}
+               if item.get("max_splits") not in (None, "", 0, False) else {}),
+            # [nodeplan] [s3-booth] a rebuttal that takes on ONE answer: the
+            # roulette over the chain's repliers, a spicier answer weighed up
+            **({"target": "rolled"} if _text(item.get("target"), 8).lower() == "rolled" else {}),
             "seconds": _number(item.get("seconds"), 12, 0, 300),
             "chance": _number(item.get("chance"), 1, 0, 1),
             "moods": [_text(x, 60) for x in items(item.get("moods") or DEFAULT_MOODS, 12)
@@ -131,6 +145,11 @@ def default_graph(topic: str = "") -> dict[str, Any]:
     for node in nodes:
         if node["id"] == "start":
             node["speakerbox"] = ["prepend"]
+            # [s3-split] the chapter's opening-monologue node ships with the
+            # SPLIT switch on, exactly like the cycle's `initial` step after
+            # the split defaults - so add_split_defaults has nothing to tick
+            # on a config built from these defaults
+            node["splits"] = True
         if node["id"] == "end":
             node["speakerbox"] = ["append"]
         if node["id"] in ("answer_a", "answer_b"):
@@ -206,3 +225,127 @@ def validate(raw: Any) -> list[str]:
     if dead:
         problems.append("nodes without an outgoing flow: " + ", ".join(dead[:5]))
     return problems
+
+
+def road_graph(road, structure=None):
+    """[nodeplan] The talk chapter derived from a road's current structure.
+
+    Every segment is a variant of the operator's node graph (nodeplan.md):
+    the road's own opening act is the initiator statement (a single-voice
+    road keeps its door seat, its act and its LINE draw over the handed-in
+    candidates), the studio's replies are raffled per the chain dice, the
+    50% expansion is rolled twice, the initiator rebuts the chain, each
+    replier gets the 1:2 answer to the rebuttal, and the 1:3 exit diamond
+    either pads with another chapter (topic change - on a specific segment
+    a chance-gated roll on changing the discussion points) or lands the
+    segment on the road's own closing act. Returned DISABLED: the road's
+    existing planner stays in charge until the operator turns it on."""
+    road = str(road or "").partition("~")[0]
+    st = structure if isinstance(structure, dict) else {}
+    legs = [x for x in st.get("legs") or [] if isinstance(x, dict)]
+    opening = [x for x in legs if x.get("place") == "open"]
+    middle = [x for x in legs if x.get("place") == "middle"]
+    closing = [x for x in legs if x.get("place") == "close"]
+    line_road = not opening and not middle
+    lead = opening[0] if opening else (legs[0] if legs else {})
+    mid = middle[0] if middle else {}
+    close = closing[-1] if closing else {}
+
+    def act(leg, fallback):
+        return " ".join(str(leg.get("act") or fallback).split())[:600]
+
+    open_prompt = act(lead, "Opens this chapter with a concrete point.")
+    reply_prompt = act(mid, "")
+    if line_road:
+        # No one-line segments: the studio answers the line as its own chapter.
+        rows = [
+            ("start", "initiator", open_prompt, 10, 1, ""),
+            ("reply_a", "reply", "Reacts to the line just aired: a real reaction in their own voice.", 8, 1, ""),
+            ("more_gate", "decision", "", 0, 1, ""),
+            ("reply_b", "reply", "Answers the reaction before it and keeps the exchange alive.", 8, 1, ""),
+            ("rebuttal", "rebuttal", "", 10, 1, ""),
+            ("answer_a", "reply", "", 7, .5, "reply_a"),
+            ("answer_b", "reply", "", 7, .5, "reply_b"),
+            ("end", "end", "Lands it in one line and hands back to the show.", 6, 1, ""),
+        ]
+        links = [("start", "reply_a", 1), ("reply_a", "more_gate", 1),
+                 ("more_gate", "reply_b", .6), ("more_gate", "rebuttal", .4),
+                 ("reply_b", "rebuttal", 1), ("rebuttal", "answer_a", 1),
+                 ("answer_a", "answer_b", 1), ("answer_b", "end", 1)]
+    else:
+        rows = [
+            ("start", "initiator", open_prompt, 14, 1, ""),
+            ("reply_gate", "decision", "", 0, 1, ""),
+            ("reply_a", "reply", reply_prompt, 12, 1, ""),
+            ("reply_b", "reply", reply_prompt, 12, 1, ""),
+            ("call_gate", "decision", "", 0, 1, ""),
+            ("call", "call", "", 30, 1, ""),
+            ("call_reply", "reply", "Answers the caller's actual point and shows they heard this discussion.",
+             12, 1, ""),
+            ("call_close", "call", "Comes back on the answer and lets the cast take the discussion home.",
+             16, 1, ""),
+            ("expand_one", "decision", "", 0, 1, ""),
+            ("reply_c", "reply", reply_prompt, 12, 1, ""),
+            ("expand_two", "decision", "", 0, 1, ""),
+            ("reply_d", "reply", reply_prompt, 12, 1, ""),
+            ("rebuttal", "rebuttal", "", 14, 1, ""),
+            ("answer_a", "reply", "", 10, .5, "reply_a"),
+            ("answer_b", "reply", "", 10, .5, "reply_b"),
+            ("answer_c", "reply", "", 10, .5, "reply_c"),
+            ("answer_d", "reply", "", 10, .5, "reply_d"),
+            ("exit_gate", "decision", "", 0, 1, ""),
+            ("topic_change", "topic_change", "", 8, .5, ""),
+            ("end", "end", act(close, "Closes the segment with an amiable ending."), 8, 1, ""),
+        ]
+        links = [("start", "reply_gate", 1),
+                 ("reply_gate", "reply_a", .85), ("reply_gate", "exit_gate", .15),
+                 ("reply_a", "reply_b", 1), ("reply_b", "call_gate", 1),
+                 ("call_gate", "call", .12), ("call_gate", "expand_one", .88),
+                 ("call", "call_reply", 1), ("call_reply", "call_close", 1),
+                 ("call_close", "expand_one", 1),
+                 ("expand_one", "reply_c", .5), ("expand_one", "rebuttal", .5),
+                 ("reply_c", "expand_two", 1),
+                 ("expand_two", "reply_d", .5), ("expand_two", "rebuttal", .5),
+                 ("reply_d", "rebuttal", 1),
+                 ("rebuttal", "answer_a", 1), ("answer_a", "answer_b", 1),
+                 ("answer_b", "answer_c", 1), ("answer_c", "answer_d", 1),
+                 ("answer_d", "exit_gate", 1),
+                 ("exit_gate", "topic_change", .67), ("exit_gate", "end", .33),
+                 ("topic_change", "start", 1)]
+    draws = {"initiator": ([{"family": "ES"}] if line_road else [{"family": "CTS"}, {"family": "ES"}]),
+             "reply": [{"family": "ES"}, {"family": "RS"}],
+             "rebuttal": [{"family": "ES"}, {"family": "IRS"}],
+             "topic_change": [{"family": "ES"}, {"family": "FL"}],
+             "call": [{"family": "ES"}, {"family": "RS"}],
+             "end": [{"family": "ES"}, {"family": "FL", "closes": True}]}
+    nodes = []
+    for index, (ident, kind, prompt, seconds, chance, respond_to) in enumerate(rows):
+        node = {"id": ident, "type": kind, "label": ident.replace("_", " ").title(),
+                "prompt": prompt, "seconds": seconds, "chance": chance,
+                "respond_to": respond_to, "draws": draws.get(kind, []),
+                "x": (-140 if kind in ("reply", "call") else 60), "y": index * 100}
+        if kind == "initiator":
+            if line_road:
+                # the road's own voice opens: the door seat wins at plan time
+                node["protocol_road"] = road
+                node["speaker"] = str(lead.get("seat") or "")
+            else:
+                node["speakerbox"] = ["prepend"]
+            if lead.get("splits") in (True, 1):
+                # [s3-split] the chapter keeps the road's split switch
+                node["splits"] = True
+                if lead.get("max_splits"):
+                    node["max_splits"] = lead.get("max_splits")
+        if ident == "call":
+            node["call_leg"] = "open"
+        if ident == "call_close":
+            node["call_leg"] = "close"
+        if kind == "rebuttal":
+            # [s3-booth] the lead comes back on ONE answer: rolled, spice-weighed
+            node["target"] = "rolled"
+        if kind == "end" and not line_road:
+            node["speakerbox"] = ["append"]
+        nodes.append(node)
+    return normalize({"enabled": False, "nodes": nodes,
+                      "edges": [{"from": a, "to": b, "weight": w} for a, b, w in links],
+                      "start": "start", "max_steps": 48})

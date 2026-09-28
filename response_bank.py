@@ -450,7 +450,7 @@ class ResponseBank:
                 self._retry_save()
         return True
 
-    def take(self, voice, engine, context="", excluded=(), crystal=""):
+    def take(self, voice, engine, context="", excluded=(), crystal="", chooser=None):
         with self.lock:
             surprise = bool(re.search(r"\b(?:unbelievable|surprised|amazing|incredible)\b", context, re.I))
             terms = response_terms(context)
@@ -476,7 +476,23 @@ class ResponseBank:
                         or (r.get("intent") == "surprise" and surprise)]
             if not rows:
                 return None
-            chosen = min(rows, key=lambda r: self.last.get(self.key(voice, engine, r["text"]), 0))
+            if chooser is not None:
+                # [s3-banks-roll] the pick is the roulette's among the eligible:
+                # a response heard in the last three minutes waits while another
+                # stands by (the rule decides eligibility, the roll decides), and
+                # a chooser answering -1 (the seam's roll missed) takes nothing
+                now = time.monotonic()
+                rested = [r for r in rows if now - self.last.get(
+                    self.key(voice, engine, r["text"]), -1e12) > 180] or rows
+                try:
+                    at = int(chooser(rested))
+                except Exception:
+                    at = -1
+                if not 0 <= at < len(rested):
+                    return None
+                chosen = rested[at]
+            else:
+                chosen = min(rows, key=lambda r: self.last.get(self.key(voice, engine, r["text"]), 0))
             self.last[self.key(voice, engine, chosen["text"])] = time.monotonic()
             return chosen
 
@@ -527,7 +543,10 @@ def add_listening_responses(playlist, voices, choose, away="", max_responses=3):
         result.append({"who": listener, "chunk": text, "turn_text": text,
                        "turn_end": True, "big": False, "vec": {},
                        "response_clip": dict(response["clip"]), "listening_response": True,
-                       "continuation_response": continues and not item.get("turn_end")})
+                       "continuation_response": continues and not item.get("turn_end"),
+                       # [s3-banks-roll] the roll's own line id and its node (the turn it answers):
+                       # a line carrying a node of its own is named at the round's door
+                       **{key: response[key] for key in ("line_id", "system3") if response.get(key)}})
         used.add(response["text"])
         chars, inserted = 0, inserted + 1
     return result

@@ -232,7 +232,11 @@ def default_config():
     structure["graph"] = conversation_graph.default_graph()
     structures = system3_tables.default_structures()
     for road, item in structures.items():
-        item["graph"] = conversation_graph.protocol_graph(road)
+        # [nodeplan] every road carries its own talk chapter, off until the
+        # operator enables it; the caller keeps its protocol macro (plan_call
+        # owns the call machinery). A disabled graph is pruned from the hash.
+        item["graph"] = (conversation_graph.protocol_graph(road) if road == "caller"
+                         else conversation_graph.road_graph(road, item))
     return {"schema": CONFIG_SCHEMA,
             "tables": system3_tables.default_tables(),
             "structure": structure,
@@ -244,6 +248,8 @@ def default_config():
             "sfxguy": copy.deepcopy(DEFAULT_SFXGUY),
             # [s3-blocks] every block a writer prompt may carry, and what it is
             "blocks": system3_tables.default_blocks(),
+            # [s3-split] the SPLIT node: the threshold, the pace, who may take over
+            "split": copy.deepcopy(DEFAULT_SPLIT),
             "personalities": {}}
 
 
@@ -256,6 +262,8 @@ def config_hash(config):
         keys += ("sfxguy",)
     if "blocks" in config:                       # [s3-blocks]
         keys += ("blocks",)
+    if "split" in config:                        # [s3-split]
+        keys += ("split",)
     payload = {k: copy.deepcopy(config.get(k)) for k in keys}
     # Dormant editing surfaces do not alter the decision contract. Old
     # conversations keep their original config hash until a graph is enabled.
@@ -470,9 +478,9 @@ def validate_table(table):
     if family == "MEMORY":                                   # [s3-memory] kinds with rules, how many a round
         return _validate_memory_table(table, tid)
     if family not in ("CTS", "ES", "RS", "IRS", "FL", "TEMPER", "SHOCK", "INTERJECT", "FAV", "DIRECTIVE", "EVENT",
-                      "CHANCE", "POOL", "SPEAKERBOX", "RESOLVE", "WRAP"):             # [s3-sb-end] SBEND1
+                      "CHANCE", "POOL", "SPEAKERBOX", "RESOLVE", "WRAP", "IL"):             # [s3-sb-end] SBEND1
         raise ValueError("table family must be one of CTS, ES, RS, IRS, FL, TEMPER, SHOCK, INTERJECT, FAV, DIRECTIVE, "
-                         "EVENT, CHANCE, POOL, SPEAKERBOX, RESOLVE, WRAP")
+                         "EVENT, CHANCE, POOL, SPEAKERBOX, RESOLVE, WRAP, IL")
     pool = family in system3_tables.POOL_FAMILIES          # [s3-cast] may stand empty
     cats = table.get("categories")
     if not isinstance(cats, list) or (not cats and family not in ("CHANCE", "POOL")):   # [s3-dice-door] filled as the station rolls
@@ -3133,7 +3141,12 @@ def plan_graph(conv, config, graph_raw, until=None, inputs=None, road="banter"):
     by_id = {node["id"]: node for node in graph["nodes"]}
     stream = DrawStream(conv["seed"], conv.get("draws", 0))
     want = int(until or conv["timing"]["turn_budget"])
-    seats = [p["actor_id"] for p in conv["participants"] if p["actor_id"] in HOST_SEATS]
+    # [s3-booth] "anyone from the booth can initiate": when the round hands
+    # the booth in (chapter_seats - Sam's seat, a guest on the wheel), the
+    # raffles draw from it; without it, the host seats as before.
+    booth_pool = [str(s) for s in (inputs.get("chapter_seats") or []) if str(s)]
+    seats = [p["actor_id"] for p in conv["participants"]
+             if p["actor_id"] in (booth_pool or HOST_SEATS)]
     if not seats:
         seats = [p["actor_id"] for p in conv["participants"]]
     cur = conv["cursor"]
@@ -3190,7 +3203,13 @@ def plan_graph(conv, config, graph_raw, until=None, inputs=None, road="banter"):
             speaker = node["speaker"]
             if kind == "initiator":
                 cur["graph_reply_speakers"] = {}
-                if speaker in seats:
+                if node.get("protocol_road"):
+                    # [nodeplan] a single-voice road's own voice opens: the
+                    # door's seat, no raffle - the LINE draw stays the Rolodex
+                    speaker = str(inputs.get("line_seat") or node["speaker"]
+                                  or (seats[0] if seats else "A"))
+                    cur["initiator"] = speaker
+                elif speaker in seats:
                     cur["initiator"] = speaker
                 elif pinned_initiator in seats:
                     cur["initiator"] = pinned_initiator
@@ -3255,6 +3274,10 @@ def plan_graph(conv, config, graph_raw, until=None, inputs=None, road="banter"):
                 turn["graph_node"] = current
                 turn["graph_type"] = kind
                 turn["planned_seconds"] = node["seconds"]
+                if inputs.get("candidates") and not conv.get("line_choice"):
+                    # [nodeplan] the stock line is still System 3's recorded
+                    # Rolodex draw when the chapter plans the exchange around it
+                    _line_draw(conv, stream, inputs, road, turn)
                 if kind == "initiator" and visits[current] > 1 and not node["topic"] and cur.get("graph_topic"):
                     turn["topic_override"] = cur["graph_topic"]
                 if kind == "rebuttal" or (kind == "reply" and node.get("respond_to")):
@@ -3270,14 +3293,51 @@ def plan_graph(conv, config, graph_raw, until=None, inputs=None, road="banter"):
                         turn["graph_" + field] = choices[pick]
                 if kind == "reply":
                     cur.setdefault("graph_reply_speakers", {})[current] = speaker
-                turn["protocol"] = node["prompt"] or {
+                turn["protocol"] = (_legs_words(node["prompt"], inputs)[:600] if node["prompt"] else {
                     "initiator": "Opens this chapter with a concrete point.",
                     "reply": "Answers the preceding point and the replies already made in this chain.",
                     "rebuttal": "Answers the replies to their opening point, including each speaker's argument.",
                     "topic_change": "Segues from this exchange into the next discussion point.",
                     "call": "A caller who heard this conversation joins with its context and gets a direct response.",
                     "end": "Closes the segment with an amiable ending.",
-                }.get(kind, "")
+                }.get(kind, ""))
+                prev = conv["turns"][-2] if len(conv["turns"]) > 1 else None
+                if kind in ("reply", "call") and prev is not None and not node.get("respond_to"):
+                    # [nodeplan] the writer is told BY NAME what this turn answers
+                    turn["protocol"] += (" It answers what %s just said."
+                                         % str(prev.get("name") or prev.get("speaker") or "the last voice"))
+                if kind == "rebuttal":
+                    repliers = list(dict.fromkeys((cur.get("graph_reply_speakers") or {}).values()))
+                    named = []
+                    for s in repliers:
+                        p = participant(conv, s)
+                        named.append(str((p or {}).get("name") or s))
+                    if named:
+                        # [nodeplan] "replying to each other and to the replies
+                        # inside of the chain" - the repliers, by name
+                        turn["protocol"] += (" The repliers were %s: answer each of them by argument, and "
+                                             "the way they answered each other inside the chain."
+                                             % ", ".join(named))
+                    if node.get("target") == "rolled" and len(repliers) > 1:
+                        # [s3-booth] the lead comes back on ONE answer: the
+                        # roulette over the chain's repliers, and a spicier
+                        # answer (the intensity its ES roll landed) draws the
+                        # rebuttal more often
+                        spice = []
+                        for s in repliers:
+                            answered = next((t for t in reversed(conv["turns"][:-1])
+                                             if t["speaker"] == s and t.get("graph_type") == "reply"), None)
+                            perf = (answered or {}).get("performance") or {}
+                            spice.append(1.0 + clamp(float(perf.get("intensity") or 0)))
+                        draw = stream.next("GRAPH:%s:target:%d" % (current, visits[current]))
+                        pick = pick_index(spice, draw["u"])
+                        rows = [{"id": s, "label": named[i], "base": 1.0, "weight": spice[i],
+                                 "why": ["base 1 + the answer's rolled intensity %.2f" % (spice[i] - 1)]}
+                                for i, s in enumerate(repliers)]
+                        record("target", rows, pick, draw, {"node": current})
+                        turn["graph_target"] = repliers[pick]
+                        turn["protocol"] += (" Take on %s's answer first and come back on it directly."
+                                             % named[pick])
                 if kind == "reply" and node.get("respond_to"):
                     original = next((old for old in reversed(conv["turns"][:-1])
                                      if old.get("graph_node") == node["respond_to"]), None)
@@ -3312,6 +3372,37 @@ def plan_graph(conv, config, graph_raw, until=None, inputs=None, road="banter"):
                     turn["protocol"] += (" The caller joins a live discussion of %s after hearing %s."
                                          " Their point must connect to that discussion."
                                          % (json.dumps(topic), ", ".join(heard) or "the hosts"))
+                    if node.get("call_leg") == "open" and not conv.get("callend"):
+                        # [nodeplan] a call nested at a diamond ends like a real
+                        # call: the caller's wheel (RESOLVE), its own stream,
+                        # every candidate and the winner recorded
+                        ce = {"planned": False, "events": [],
+                              "names": {p["actor_id"]: p.get("name") or p["actor_id"]
+                                        for p in conv["participants"]}}
+                        conv["callend"] = ce
+                        tables = _callend_tables(config, "RESOLVE")
+                        recent = set(str(x) for x in (inputs.get("recent_items") or []))
+                        if tables:
+                            spec, ev = _callend_wheel(conv, tables, "RESOLVE", {"painting": False},
+                                                      (), recent, None, "outcome")
+                            ce["events"].append({"event_id": ev["event_id"], "role": "resolution",
+                                                 "family": "RESOLVE"})
+                            if spec:
+                                ce["resolve"] = {"table": spec["table"], "category": spec["category"],
+                                                 "category_label": spec["category_label"], "id": spec["id"],
+                                                 "label": spec["label"],
+                                                 "tags": [str(x) for x in spec.get("tags") or []],
+                                                 "effect": "", "offer": str(spec.get("offer") or ""),
+                                                 "text": str(spec.get("text") or ""),
+                                                 "respond": str(spec.get("respond") or ""),
+                                                 "rebuttal": str(spec.get("rebuttal") or ""),
+                                                 "emotions": {}, "event_id": ev["event_id"]}
+                                ce["planned"] = True
+                    if node.get("call_leg") == "close" and (conv.get("callend") or {}).get("planned"):
+                        w = _callend_words(conv, "rebuttal", speaker)
+                        turn["protocol"] += (" The call ends the way the wheel rolled it - %s. Their last "
+                                             "word is %s." % (w["outcome"], w["rebuttal"]))
+                        turn["callend"] = {"role": "resolution"}
                 if last_turn and kind != "end":
                     turn["protocol"] += " Land this segment with a brief, amiable ending."
                 _interject_after(conv, config, conv["settings"], stream, want, inputs, seats)
@@ -3347,16 +3438,36 @@ def plan_graph(conv, config, graph_raw, until=None, inputs=None, road="banter"):
     raw_seconds = sum(float(by_id.get(t.get("graph_node"), {}).get("seconds") or 0)
                       for t in conv["turns"] if t.get("graph_node"))
     target_seconds = float(conv["timing"].get("target_duration") or 0)
-    scale = min(1.5, max(.6, target_seconds / raw_seconds)) if raw_seconds and target_seconds else 1.0
+    # [nodeplan] the station's own measured pace (mean_turn_seconds, handed in
+    # as timing.turn_seconds) calibrates the absolute per-turn estimate; the
+    # node seconds keep the designed shape. Nothing here draws a number.
+    graph_turns = [t for t in conv["turns"] if t.get("graph_node")]
+    pace = float(conv["timing"].get("turn_seconds") or 0)
+    unit = (pace * len(graph_turns) / raw_seconds) if pace > 0 and raw_seconds else 1.0
+    fitted = raw_seconds * unit
+    scale = min(1.5, max(.6, target_seconds / fitted)) if fitted and target_seconds else 1.0
     for turn in conv["turns"]:
         if turn.get("graph_node"):
-            turn["planned_seconds"] = round(float(by_id.get(turn["graph_node"], {}).get("seconds") or 0) * scale, 1)
+            turn["planned_seconds"] = round(float(by_id.get(turn["graph_node"], {}).get("seconds") or 0)
+                                            * unit * scale, 1)
     conv["graph_profile"] = {"estimated_seconds": round(sum(float(t.get("planned_seconds") or 0)
                                                              for t in conv["turns"]), 1),
                              "raw_seconds": round(raw_seconds, 1), "budget_seconds": target_seconds,
-                             "turns": len(conv["turns"])}
+                             "turns": len(conv["turns"]),
+                             # [nodeplan] the recorded fit: what the clock asked,
+                             # what the chapters cost, how the walk padded/closed
+                             "pace_seconds_per_turn": round(pace, 2),
+                             "chapters": sum(1 for t in graph_turns if t.get("graph_type") == "initiator"),
+                             "replies": sum(1 for t in graph_turns if t.get("graph_type") == "reply"),
+                             "closed": bool(graph_turns and graph_turns[-1].get("graph_type") == "end"),
+                             "fit": (round(sum(float(t.get("planned_seconds") or 0) for t in graph_turns)
+                                           / target_seconds, 3) if target_seconds else None)}
     _events_attach(conv)
-    _cast_rolls(conv, config, conv["settings"], inputs)
+    if not (inputs.get("candidates") or []):
+        # [nodeplan] a drawn stock line is fixed words (plan_line's own rule)
+        _cast_rolls(conv, config, conv["settings"], inputs)
+    if isinstance(conv.get("callend"), dict) and conv["callend"].get("events"):
+        _callend_attach(conv, config)              # [nodeplan] the wheel lands on its turn
     return conv
 
 
@@ -4442,7 +4553,7 @@ def _structure_roll(conv, config, road):
     return cands[i][1], ev
 
 
-def plan_legs(conv, config, inputs=None, road=None):
+def plan_legs(conv, config, inputs=None, road=None, structure=None):
     """[s3-roads] A segment planned from its own structure: the open legs
     in order, the middle leg(s) repeated to the turn budget with the seats
     alternating, then the landing - every leg a turn with its own rolls.
@@ -4450,7 +4561,10 @@ def plan_legs(conv, config, inputs=None, road=None):
     with no legs structure falls back to the banter cycle."""
     inputs = inputs if inputs is not None else conv["inputs"]
     road = road or conv["identity"]["road_kind"]
-    st, _variant = _structure_roll(conv, config, road)                  # [s3-window]
+    if isinstance(structure, dict) and structure.get("legs"):
+        st, _variant = structure, None   # [nodeplan] elected by the caller: one VARIANT draw, not two
+    else:
+        st, _variant = _structure_roll(conv, config, road)              # [s3-window]
     st = st or {}
     legs = [dict(x) for x in st.get("legs") or [] if isinstance(x, dict)]
     if not legs:
@@ -4552,6 +4666,37 @@ def render_legs_sheet(conv):
             + "\n" + str(st.get("tail") or ""))
 
 
+def _line_draw(conv, stream, inputs, road, turn):
+    """[nodeplan] The LINE draw among the road's candidate lines, every
+    candidate and its weight recorded - the Rolodex where the station used
+    to call random.choice(). Attached to `turn`. Returns the candidates."""
+    cands = [c for c in (inputs.get("candidates") or []) if isinstance(c, dict) and c.get("text")]
+    if not cands or turn is None:
+        return cands
+    rows = []
+    for i, c in enumerate(cands[:200]):
+        w = float(c.get("weight", 1.0) or 0)
+        rows.append({"id": str(c.get("id") or i), "label": str(c.get("text") or "")[:90], "base": w,
+                     "weight": max(0.0, w), "why": list(c.get("why") or [])})
+    live = [r for r in rows if r["weight"] > 0] or rows
+    draw = stream.next("LINE:item")
+    k = pick_index([r["weight"] for r in live], draw["u"])
+    stage = _stage("item", live, k, draw, [{"id": r["id"], "label": r["label"], "why": "weight 0"}
+                                          for r in rows if r["weight"] <= 0])
+    picked = live[k] if k >= 0 else None
+    ev = _event(conv, {"turn_id": turn["turn_id"], "turn_index": turn["index"], "speaker": turn["speaker"]},
+                "LINE", [stage], {"id": picked["id"] if picked else None,
+                                  "label": picked["label"] if picked else "", "index": k + 1, "of": len(live)},
+                _snapshot(conv, turn["speaker"]),
+                meta={"road": road, "source": str(inputs.get("candidates_from") or "the road's own list")},
+                rng=draw)
+    conv["line_choice"] = {"index": (k if k >= 0 else None), "id": picked["id"] if picked else None,
+                           "event_id": ev["event_id"], "of": len(live)}
+    turn["decisions"].append({"family": "LINE", "event_id": ev["event_id"], "item": conv["line_choice"]["id"],
+                              "label": picked["label"] if picked else "", "u": draw["u"]})
+    return cands
+
+
 def plan_line(conv, config, inputs=None):
     """[s3-roads] A single-voice road (a record link, a station ID, the
     manager's own page, a stock interjection, a produced spot) as System 3
@@ -4588,30 +4733,7 @@ def plan_line(conv, config, inputs=None):
         turn["protocol"] = _legs_words(leg.get("act"), inputs)[:400]
         turn["leg"] = leg.get("id")
         turn["place"] = leg.get("place")
-    cands = [c for c in (inputs.get("candidates") or []) if isinstance(c, dict) and c.get("text")]
-    if cands:
-        rows = []
-        for i, c in enumerate(cands[:200]):
-            w = float(c.get("weight", 1.0) or 0)
-            rows.append({"id": str(c.get("id") or i), "label": str(c.get("text") or "")[:90], "base": w,
-                         "weight": max(0.0, w), "why": list(c.get("why") or [])})
-        live = [r for r in rows if r["weight"] > 0] or rows
-        draw = stream.next("LINE:item")
-        k = pick_index([r["weight"] for r in live], draw["u"])
-        stage = _stage("item", live, k, draw, [{"id": r["id"], "label": r["label"], "why": "weight 0"}
-                                              for r in rows if r["weight"] <= 0])
-        t0 = conv["turns"][-1]
-        picked = live[k] if k >= 0 else None
-        ev = _event(conv, {"turn_id": t0["turn_id"], "turn_index": t0["index"], "speaker": t0["speaker"]},
-                    "LINE", [stage], {"id": picked["id"] if picked else None,
-                                      "label": picked["label"] if picked else "", "index": k + 1, "of": len(live)},
-                    _snapshot(conv, t0["speaker"]),
-                    meta={"road": road, "source": str(inputs.get("candidates_from") or "the road's own list")},
-                    rng=draw)
-        conv["line_choice"] = {"index": (k if k >= 0 else None), "id": picked["id"] if picked else None,
-                               "event_id": ev["event_id"], "of": len(live)}
-        t0["decisions"].append({"family": "LINE", "event_id": ev["event_id"], "item": conv["line_choice"]["id"],
-                                "label": picked["label"] if picked else "", "u": draw["u"]})
+    cands = _line_draw(conv, stream, inputs, road, conv["turns"][-1] if conv["turns"] else None)
     conv["draws"] = stream.n
     if not cands:
         # [s3-cast] a line whose words the writer writes; a drawn stock line is fixed words
@@ -4646,6 +4768,8 @@ def _carry_lead(conv):
 
 
 def _row_work(turn, conv):
+    if turn.get("split_of"):                                                  # [s3-split] a part taken over
+        return _split_row_work(turn, conv)
     perf = turn.get("performance") or {}
     emo = perf.get("emotion") or ""
     lead = ""
@@ -4738,8 +4862,11 @@ def _row_work(turn, conv):
             continue
         quoted = json.dumps(sentence_cut(mat["text"], 420))            # [s3-cut]
         if sb["mode"] == "FULL_SWATH":
+            # [s3-split] the passage whole - it is already cut to the monologue budget
+            # at a sentence end; a second cap here stopped the monologue short
             body += (". Opens with a speaker-box monologue, reading this out word for word as their "
-                     "own words: %s" % json.dumps(sentence_cut(mat["text"], 720)))
+                     "own words: %s" % json.dumps(" ".join(str(mat["text"]).split())))
+            body += _split_hand_on(turn, conv)                                # [s3-split]
         elif sb["mode"] == "PREPEND":
             body += ". Begins by reading this out word for word as their own words: %s" % quoted
         elif sb["mode"] == "APPEND":
@@ -5154,6 +5281,506 @@ def turn_stamp(conv, t):
                                         "favorite", "directives", "events", "ends_here", "after_end") if t.get(k)}}
 
 
+# --- [s3-split] THE SPLIT NODE ----------------------------------------------------
+#
+# The operator, 2026-09-28: "for a message like this that exceeds a certain
+# amount of characters, we need to introduce the roulette of a split node,
+# which basically allows a particular message to be split and who says it,
+# and it rolls a roulette with an R and G deciding between what other person
+# in the studio says the rest of the message ... ad spots ... monologues ...
+# if the person's about to say something that's going to exceed a minute or
+# approach forty-five seconds, then that should be split with another person
+# in the studio ... an [IL] "insertion list" table ... to dictate how the
+# person who takes over for the long message takes over to finish the
+# statement. A long statement or ad read or manager read can have up to 3
+# splits with splits being a checkbox we can enable to a particular message
+# node."
+#
+# A node (a step of the banter cycle, a leg of a road) opts in with
+# `splits: true` and `max_splits` (1-3); the runtime marks the planned turn
+# (turn["split_node"]). Once the words of the read are known - a single line
+# after its writer, a speaker-box monologue once its passage is fetched - one
+# RULE decides, with no draw: the read's spoken length is its characters over
+# the voice's pace; past the threshold it is cut into the fewest parts that
+# keep each under it (at most max_splits + 1), at the sentence ends nearest
+# an even division - never inside a sentence, and never so near an end that
+# a part is a scrap. For each part after the first, two draws: WHO takes over
+# (the studio as it is now, never the one reading, nor - on the last part -
+# the one who speaks next; the split section's weights) and HOW (the
+# Insertion list, IL1: the way they take over and the words they say doing
+# it). WHO rolls on seed|split and HOW on seed|split:IL, so no other family's
+# dice move; every call's inputs are kept (conv["splits"]) so decision replay
+# rolls them again. Each part after the first is a turn of its own, placed
+# right after the one it continues, so the Messenger shows it as a message of
+# its own and the ledger links its line to it.
+FAMILIES = FAMILIES + ("SPLIT", "IL")                                        # [s3-split]
+SPLIT_MAX = int(getattr(system3_tables, "SPLIT_MAX_SPLITS", 3))
+DEFAULT_SPLIT = {
+    # a read longer than this many seconds is split ("exceed a minute or
+    # approach forty-five seconds")
+    "threshold_seconds": 45.0,
+    # characters a second when the voice has no measured pace (the median of
+    # 5,541 rendered lines, 2026-09-28)
+    "pace": 18.9,
+    # the operator's own pace for a voice, by role (dj, cohost, third, drop,
+    # manager ...): outranks the pace the station measured
+    "paces": {},
+    # the most any node may ask for
+    "max_splits": SPLIT_MAX,
+    # the roulette's weight for each member of the studio, by role
+    "who": {"dj": 1.0, "cohost": 1.0, "third": 1.0, "drop": 1.0},
+    # someone who already read a part of this read weighs this much again
+    "again": 0.5,
+    # a cut must leave at least this share of an even part on each side
+    "min_share": 0.25,
+}
+
+
+def validate_split(raw):
+    """[s3-split] The split section as the desk may save it (raises
+    ValueError); keys it does not know are dropped."""
+    if not isinstance(raw, dict):
+        raise ValueError("the split section is an object")
+    out = copy.deepcopy(DEFAULT_SPLIT)
+
+    def number(key, low, high):
+        if key not in raw:
+            return
+        try:
+            val = float(raw[key])
+        except (TypeError, ValueError):
+            raise ValueError("%s must be a number" % key)
+        if isinstance(raw[key], bool) or math.isnan(val) or not low <= val <= high:
+            raise ValueError("%s must be between %s and %s" % (key, low, high))
+        out[key] = round(val, 3)
+
+    number("threshold_seconds", 10, 600)
+    number("pace", 5, 40)
+    number("again", 0, 1)
+    number("min_share", 0, 0.5)
+    if "max_splits" in raw:
+        n = raw["max_splits"]
+        if isinstance(n, bool) or not isinstance(n, (int, float)) or int(n) != n or not 1 <= int(n) <= SPLIT_MAX:
+            raise ValueError("max_splits must be a whole number from 1 to %d" % SPLIT_MAX)
+        out["max_splits"] = int(n)
+    for key, low, high in (("paces", 5, 40), ("who", 0, 10)):
+        if key not in raw:
+            continue
+        got = raw[key]
+        if not isinstance(got, dict):
+            raise ValueError("%s is an object of role: number" % key)
+        clean = {} if key == "paces" else dict(out[key])
+        for role, val in got.items():
+            role = str(role).strip()
+            if not re.fullmatch(r"[a-z0-9_]{1,24}", role):
+                raise ValueError("%s: %r is not a role (dj, cohost, third, drop, manager ...)" % (key, role))
+            try:
+                v = float(val)
+            except (TypeError, ValueError):
+                raise ValueError("%s.%s must be a number" % (key, role))
+            if isinstance(val, bool) or math.isnan(v) or not low <= v <= high:
+                raise ValueError("%s.%s must be between %s and %s" % (key, role, low, high))
+            clean[role] = round(v, 3)
+        out[key] = clean
+    return out
+
+
+def split_config(config):
+    """[s3-split] The split section in force: the config's own, else the
+    defaults (a config saved before [s3-split] has none)."""
+    raw = config.get("split") if isinstance(config, dict) else None
+    if isinstance(raw, dict):
+        try:
+            return validate_split(raw)
+        except ValueError:
+            pass
+    return copy.deepcopy(DEFAULT_SPLIT)
+
+
+def split_node(node):
+    """[s3-split] {"max": n} when a step or leg has its splits box ticked."""
+    if not isinstance(node, dict) or node.get("splits") not in (True, 1):
+        return None
+    try:
+        n = int(node.get("max_splits") or SPLIT_MAX)
+    except (TypeError, ValueError):
+        n = SPLIT_MAX
+    return {"max": max(1, min(SPLIT_MAX, n))}
+
+
+# a sentence ends at . ! ? or an ellipsis, with any closing quote or bracket,
+# followed by a space - never at a dash (an interruption is mid-sentence),
+# and never at the stop after a title or a lone initial ("Mr. Pine", "a.m.")
+_SPLIT_END = re.compile(r"[.!?…][\"”’')\]]*(?=\s)")
+_SPLIT_NOT_END = re.compile(r"(?:^|\s)(?:mr|mrs|ms|dr|st|jr|sr|vs|mt|ft|no)\.$|(?:^|[\s.])[a-z]\.$", re.I)
+
+
+def sentence_ends(text):
+    """Offsets just past each sentence end inside `text` (its own end is not a cut)."""
+    out = []
+    for m in _SPLIT_END.finditer(text):
+        end = m.end()
+        if not 0 < end < len(text):
+            continue
+        if text[m.start()] == "." and _SPLIT_NOT_END.search(text[max(0, m.start() - 4):m.start() + 1]):
+            continue
+        out.append(end)
+    return out
+
+
+def split_cuts(text, parts, min_share=0.25, floor=None):
+    """[s3-split] Where a read is cut into `parts`: at the sentence ends
+    nearest each even division, in order - never inside a sentence, so a
+    sentence longer than a part stays whole. A cut that would leave less than
+    `floor` characters (default: `min_share` of an even part) on either side
+    is not made. May return fewer than parts - 1 cuts (then the read has
+    fewer parts)."""
+    size = len(text)
+    if parts < 2 or size <= 0:
+        return []
+    ends = sentence_ends(text)
+    even = size / float(parts)
+    floor = even * max(0.0, float(min_share)) if floor is None else float(floor)
+    cuts, prev = [], 0
+    for k in range(1, parts):
+        target = even * k
+        options = [e for e in ends if e > prev and e - prev >= floor and size - e >= floor]
+        if not options:
+            break
+        best = min(options, key=lambda e: (abs(e - target), e))
+        cuts.append(best)
+        prev = best
+    return cuts
+
+
+def _split_pieces(words, cuts):
+    bounds = [0] + list(cuts) + [len(words)]
+    return [p for p in (words[bounds[i]:bounds[i + 1]].strip() for i in range(len(bounds) - 1)) if p]
+
+
+def split_rule(text, pace, threshold, max_splits, min_share=0.25):
+    """[s3-split] The rule alone - no draw: {words, seconds, want, cuts}.
+    Under (or at) the threshold a read is never split. Over it: the fewest
+    parts that keep every part under the threshold, cut at the sentence ends
+    nearest an even division, at most max_splits + 1 parts. When no count
+    can keep every part under it (a sentence longer than a part stays
+    whole), the count whose longest part is the shortest - the fewer parts
+    on a tie. No cut leaves a scrap: min_share of the first even part."""
+    words = " ".join(str(text or "").split())
+    pace = float(pace or 0) or DEFAULT_SPLIT["pace"]
+    threshold = float(threshold)
+    seconds = len(words) / pace
+    if seconds <= threshold:
+        return {"words": words, "seconds": seconds, "want": 1, "cuts": []}
+    most = max(2, int(max_splits) + 1)
+    first = max(2, min(most, int(math.ceil(seconds / threshold))))
+    floor = len(words) / float(first) * max(0.0, float(min_share))
+    best = None
+    for want in range(first, most + 1):
+        cuts = split_cuts(words, want, min_share, floor=floor)
+        if not cuts:
+            continue
+        longest = max(len(p) for p in _split_pieces(words, cuts)) / pace
+        if best is None or longest < best[0] - 1e-9:
+            best = (longest, want, cuts)
+        if longest <= threshold:
+            break
+    if best is None:
+        return {"words": words, "seconds": seconds, "want": first, "cuts": []}
+    return {"words": words, "seconds": seconds, "want": best[1], "cuts": list(best[2])}
+
+
+def _il_words(text, prev_name, name):
+    out = " ".join(str(text or "").split())
+    return out.replace("{prev}", prev_name or "them").replace("{name}", name or "")
+
+
+def _il_direction(config, spec):
+    """The delivery the IL category asks for (its `direction`), if it has one."""
+    if not spec:
+        return ""
+    if spec.get("direction"):
+        return str(spec["direction"])
+    for table in config.get("tables") or []:
+        if table.get("id") != spec.get("table"):
+            continue
+        for cat in table.get("categories") or []:
+            if cat.get("id") == spec.get("category"):
+                return str(cat.get("direction") or "")
+    return ""
+
+
+def _split_participant(conv, person):
+    """The seat taking over, as a participant, if the conversation had none."""
+    seat = str(person.get("seat") or "")
+    if not seat or participant(conv, seat):
+        return
+    conv["participants"].append({
+        "actor_id": seat, "role": str(person.get("who") or ""), "name": str(person.get("name") or seat),
+        "position": 0.0, "emotion": {"table": "", "category": "", "id": "", "label": "level", "intensity": 0.0,
+                                     "source": "initial", "dims": {d: 0.0 for d in EMOTION_DIMS}},
+        "intensity": 0.0, "energy": 0.5, "recent_actions": [], "callbacks": []})
+
+
+def split_turn(conv, config, turn, text, candidates, speaker_who="", pace=None, pace_why="",
+               next_who="", recent=None, mode="line", node=None, prepared=False, replaying=False):
+    """[s3-split] The SPLIT node on one read. `text` is the read (a written
+    line, or a monologue's passage when mode is "passage"); `candidates` the
+    studio now ([{who, seat, name, voice}]); `speaker_who` the one reading it;
+    `next_who` the one who speaks straight after it (a round: the last part is
+    never theirs). Records the RULE (one SPLIT event on the turn, no draw)
+    and, when it splits, for each part after the first a WHO draw (SPLIT) and
+    a HOW draw (IL). Each later part becomes a turn of its own, right after
+    `turn` (the turns after it are renumbered; their ids stand). Line mode:
+    the turn's words become part 1 and each new turn's words are its lead-in
+    and its part. Passage mode: the parts are recorded on the turns
+    (split.passage) for the running order. Returns {split, parts, why,
+    event_id, whole}; nothing is recorded when the node does not split."""
+    node = node or (turn.get("split_node") if isinstance(turn, dict) else None)
+    if not isinstance(node, dict) or not node.get("max"):
+        return {"split": False, "why": "this node does not split (its splits box is not ticked)"}
+    cfg = split_config(config)
+    max_splits = max(1, min(int(node.get("max") or SPLIT_MAX), int(cfg["max_splits"])))
+    threshold = float(cfg["threshold_seconds"])
+    who0 = str(speaker_who or "")
+    if not pace or float(pace) <= 0:
+        pace = float(cfg["paces"].get(who0) or cfg["pace"])
+        pace_why = pace_why or ("the split section's pace for %s" % who0 if who0 in cfg["paces"] else "the default pace")
+    pace = float(pace)
+    rule = split_rule(text, pace, threshold, max_splits, cfg.get("min_share", 0.25))
+    words, seconds = rule["words"], rule["seconds"]
+    src_seat = str(turn.get("speaker") or "")
+    src_name = str(turn.get("name") or src_seat or who0)
+    people, seen_who = [], set()
+    for c in candidates or []:
+        w = str((c or {}).get("who") or "") if isinstance(c, dict) else ""
+        if w and w not in seen_who:
+            seen_who.add(w)
+            people.append(dict(c))
+    if not replaying:
+        conv.setdefault("splits", []).append({
+            "turn_id": turn["turn_id"], "text": words, "candidates": people, "speaker_who": who0,
+            "pace": round(pace, 3), "pace_why": str(pace_why or ""), "next_who": str(next_who or ""),
+            "recent": sorted(str(x) for x in (recent or ())), "mode": mode, "node": dict(node),
+            "prepared": bool(prepared), "at": time.time()})
+    facts = {"chars": len(words), "pace": round(pace, 2), "pace_why": str(pace_why or ""),
+             "seconds": round(seconds, 1), "threshold": threshold, "max_splits": max_splits,
+             "wanted": rule["want"], "sentences": len(sentence_ends(words)) + (1 if words else 0),
+             "mode": mode, "reader": who0, "prepared": bool(prepared)}
+    pieces, why = [], ""
+    if rule["want"] <= 1:
+        why = ("%.0f s at %.1f characters a second is not over the %.0f s threshold: read whole"
+               % (seconds, pace, threshold))
+    elif not rule["cuts"]:
+        why = ("%.0f s is over the %.0f s threshold, but no sentence ends far enough from both ends to cut at "
+               "- a sentence is never split: read whole" % (seconds, threshold))
+    else:
+        pieces = _split_pieces(words, rule["cuts"])
+    rule_text = ("%d characters at %.1f a second (%s) is %.0f s against the %.0f s threshold; this node may split "
+                 "%d time%s" % (len(words), pace, pace_why or "pace", seconds, threshold, max_splits,
+                                "" if max_splits == 1 else "s"))
+    if prepared and pieces:
+        # a whole take made ahead is not a reason to read it whole: the parts are voiced now
+        rule_text += "; a whole take had been made ahead - the parts are voiced now, each in its reader's voice"
+    before = _snapshot(conv, src_seat)
+    rule_ev = _event(conv, {"turn_id": turn["turn_id"], "turn_index": turn["index"], "speaker": src_seat}, "SPLIT",
+                     [{"stage": "rule", "draw": None, "rule": rule_text, "selected": 1, "cuts": list(rule["cuts"])}],
+                     {"id": "WHOLE", "label": "read whole", "parts": 1},
+                     before, meta=dict(facts, why=why or "", rule=rule_text))
+    rule_ev["state_after"] = before
+    turn["decisions"].append({"family": "SPLIT", "event_id": rule_ev["event_id"], "item": "WHOLE",
+                              "label": "read whole"})
+    if len(pieces) < 2:
+        rule_ev["selected"]["label"] = "read whole: " + why
+        turn["split"] = {"part": 1, "of": 1, "event_id": rule_ev["event_id"], "why": why}
+        return {"split": False, "why": why, "event_id": rule_ev["event_id"], "whole": words}
+    stream = DrawStream(str(conv["seed"]) + "|split", int(conv.get("split_draws") or 0))
+    il_stream = DrawStream(str(conv["seed"]) + "|split:IL", int(conv.get("il_draws") or 0))
+    names = {str(c.get("who")): str(c.get("name") or c.get("who")) for c in people}
+    readers = [who0]
+    made = [pieces[0]]
+    parts_out = [{"part": 1, "turn_id": turn["turn_id"], "who": who0, "seat": src_seat, "name": src_name,
+                  "voice": "", "lead_in": "", "body": pieces[0], "event_id": rule_ev["event_id"]}]
+    stopped = ""
+    used_il = set()
+    at = conv["turns"].index(turn)
+    perf = copy.deepcopy(turn.get("performance")) if turn.get("performance") else None
+    for k in range(1, len(pieces)):
+        prev_who = readers[-1]
+        last = k == len(pieces) - 1
+        rows, excl = [], []
+        for c in people:
+            w = str(c["who"])
+            label = "%s (%s)" % (c.get("name") or w, c.get("seat") or w)
+            if w == prev_who:
+                excl.append({"id": w, "label": label, "why": "reading now - a part never goes back to the one reading it"})
+                continue
+            if last and next_who and w == str(next_who):
+                excl.append({"id": w, "label": label, "why": "speaks the very next line - nobody speaks twice in a row"})
+                continue
+            base = float(cfg["who"].get(w, 1.0))
+            weight = base
+            reasons = ["the split section's weight for %s: %.2f" % (w, base)]
+            if w in readers:
+                weight *= float(cfg["again"])
+                reasons.append("already read part %d x%.2f" % (readers.index(w) + 1, float(cfg["again"])))
+            if weight <= 0:
+                excl.append({"id": w, "label": label, "why": "weight 0"})
+                continue
+            rows.append({"id": w, "label": label, "base": base, "weight": weight, "why": reasons, "c": c})
+        if not rows:
+            stopped = ("nobody else in the studio could take part %d over (%s), so %s reads on to the end"
+                       % (k + 1, "; ".join("%s: %s" % (x["label"], x["why"]) for x in excl) or "nobody else is in",
+                          names.get(prev_who) or (src_name if prev_who == who0 else prev_who)))
+            made[-1] = (made[-1] + " " + " ".join(pieces[k:])).strip()
+            parts_out[-1]["body"] = made[-1]
+            break
+        draw = stream.next("SPLIT:who%d" % (k + 1))
+        i = pick_index([r["weight"] for r in rows], draw["u"])
+        c = rows[i]["c"]
+        seat, w, name = str(c.get("seat") or c["who"]), str(c["who"]), str(c.get("name") or c["who"])
+        prev_name = names.get(prev_who) or (src_name if prev_who == who0 else prev_who)
+        tid = "%ss%d" % (turn["turn_id"], k + 1)
+        new = {"turn_id": tid, "index": at + k, "speaker": seat, "name": name, "who": w,
+               "step": "split", "step_label": "%s takes over" % name,
+               "cycle": turn.get("cycle", 0), "phase": turn.get("phase", "OPEN"), "decisions": [], "directions": [],
+               "speakerbox": [], "sfx": None, "sfxguy": None, "tint": None, "performance": copy.deepcopy(perf),
+               "text": "", "script_index": None, "status": "planned" if mode == "passage" else "generated",
+               "cursor_before": turn.get("cursor_before"), "state_before": turn.get("state_before"),
+               "state_after": turn.get("state_after"), "split_of": turn["turn_id"],
+               "estimated_seconds": round(len(pieces[k]) / pace, 2)}
+        for key in ("leg", "place", "protocol"):
+            if key in turn:
+                new[key] = turn[key]
+        conv["turns"].insert(at + k, new)
+        for j, t in enumerate(conv["turns"]):
+            t["index"] = j
+        _split_participant(conv, c)
+        who_ev = _event(conv, {"turn_id": tid, "turn_index": new["index"], "speaker": seat}, "SPLIT",
+                        [_stage("item", rows, i, draw, excl)],
+                        {"id": w, "label": "%s takes over" % name, "who": w, "seat": seat, "name": name,
+                         "part": k + 1, "index": i + 1, "of": len(rows)},
+                        before, meta={"part": k + 1, "from": prev_who, "rule": "who takes part %d over: the studio "
+                                      "but the one reading%s, at the split section's weights"
+                                      % (k + 1, " and the next voice" if last and next_who else "")},
+                        rng=draw)
+        who_ev["state_after"] = before
+        # a way in used on this read already weighs a quarter again (as a recent round's does)
+        il_ctx = {"conv": conv, "turn_id": tid, "turn_index": new["index"], "speaker": seat,
+                  "phase": turn.get("phase") or "OPEN", "prev_keys": set(),
+                  "recent_rounds": set(str(x) for x in (recent or ())) | {"IL:%s" % x for x in used_il},
+                  "turns_left": 0,
+                  "controls": (conv.get("settings") or {}).get("controls") or {}, "availability": {},
+                  "personalities": config.get("personalities") or {}, "speaker_emotion_cat": "",
+                  "prev_lean": None, "event_emotions": {}}
+        spec, il_ev = weighted_decision(conv, config, il_ctx, il_stream, "IL")
+        if spec:
+            used_il.add(str(spec.get("id")))
+        lead = _il_words(spec.get("text"), prev_name, name) if spec else ""
+        how = str((spec or {}).get("category_label") or "")
+        direction = _il_direction(config, spec)
+        new["decisions"] = [{"family": "SPLIT", "event_id": who_ev["event_id"], "item": w,
+                             "label": "%s takes over" % name, "u": draw["u"]}]
+        if spec:
+            new["decisions"].append({"family": "IL", "event_id": il_ev["event_id"], "table": spec["table"],
+                                     "category": spec["category"], "item": spec["id"], "label": spec["label"],
+                                     "text": lead, "u": (il_ev.get("rng") or {}).get("u")})
+            new["directions"].append({"family": "IL", "text": direction or how.lower(), "label": how})
+            new["step_label"] = "%s takes over - %s" % (name, how.lower())
+        else:
+            new["decisions"].append({"family": "IL", "event_id": il_ev["event_id"], "item": None,
+                                     "empty": (il_ev.get("meta") or {}).get("empty")})
+        new["split"] = {"part": k + 1, "of_turn": turn["turn_id"], "who": w, "from": prev_who,
+                        "event_id": who_ev["event_id"], "il_event": il_ev["event_id"], "lead_in": lead,
+                        "how": how, "direction": direction}
+        new["decision_bundle_id"] = "%s:b%s" % (tid, digest([who_ev["event_id"], il_ev["event_id"]], 8))
+        readers.append(w)
+        made.append(pieces[k])
+        parts_out.append({"part": k + 1, "turn_id": tid, "who": w, "seat": seat, "name": name,
+                          "voice": str(c.get("voice") or ""), "lead_in": lead, "body": pieces[k],
+                          "how": how, "direction": direction, "event_id": who_ev["event_id"],
+                          "il_event": il_ev["event_id"]})
+    conv["split_draws"] = stream.n
+    conv["il_draws"] = il_stream.n
+    n = len(parts_out)
+    for p in parts_out:
+        p["of"] = n
+        p["text"] = ((p["lead_in"] + " " + p["body"]).strip() if p["lead_in"] else p["body"])
+    turn["split"] = {"part": 1, "of": n, "event_id": rule_ev["event_id"],
+                     "parts": [p["turn_id"] for p in parts_out], "why": stopped}
+    for p in parts_out[1:]:
+        t = next((x for x in conv["turns"] if x["turn_id"] == p["turn_id"]), None)
+        if t is None:
+            continue
+        t["split"]["of"] = n
+        t["estimated_seconds"] = round(len(p["body"]) / pace, 2)
+        if mode == "passage":
+            t["split"]["passage"] = p["body"]
+        else:
+            t["text"] = p["text"]
+    if mode == "passage":
+        turn["split"]["passage"] = made[0]
+    else:
+        turn["text"] = made[0]
+    label = ("split into %d parts: %.0f s at %.1f characters a second is over the %.0f s threshold"
+             % (n, seconds, pace, threshold)) if n > 1 else "read whole: " + stopped
+    rule_ev["selected"] = {"id": "SPLIT" if n > 1 else "WHOLE", "label": label, "parts": n}
+    rule_ev["stages"][0]["selected"] = n
+    rule_ev["meta"]["why"] = stopped or rule_ev["meta"].get("why") or ""
+    rule_ev["meta"]["parts"] = [len(p["body"]) for p in parts_out]
+    for d in turn["decisions"]:
+        if d.get("event_id") == rule_ev["event_id"]:
+            d["item"], d["label"] = rule_ev["selected"]["id"], label
+    return {"split": n > 1, "parts": parts_out, "why": stopped, "event_id": rule_ev["event_id"], "whole": words}
+
+
+def _replay_split(conv, config, sp):
+    """[s3-split] Decision replay: a split decided after the words were
+    known, rolled again from the inputs it kept."""
+    t = next((x for x in conv["turns"] if x.get("turn_id") == sp.get("turn_id")), None)
+    if t is None:
+        return
+    split_turn(conv, config, t, sp.get("text") or "", sp.get("candidates") or [],
+               speaker_who=sp.get("speaker_who") or "", pace=sp.get("pace"), pace_why=sp.get("pace_why") or "",
+               next_who=sp.get("next_who") or "", recent=sp.get("recent") or [], mode=sp.get("mode") or "line",
+               node=sp.get("node"), prepared=bool(sp.get("prepared")), replaying=True)
+
+
+def _split_hand_on(turn, conv):
+    """[s3-split] The monologue's first reader stops where the next takes over."""
+    sp = turn.get("split") or {}
+    if sp.get("part") != 1 or int(sp.get("of") or 1) < 2:
+        return ""
+    nxt = next((t for t in conv["turns"] if t.get("split_of") == turn["turn_id"]), None)
+    return (" - and stops there, mid-read: %s takes the passage over on the next line"
+            % str((nxt or {}).get("name") or (nxt or {}).get("speaker") or "the next voice"))
+
+
+def _split_row_work(turn, conv):
+    """[s3-split] The running-order row of a part taken over: who it comes
+    from, how they take it (IL), the words on the way in, and the part of the
+    passage they carry on with, word for word."""
+    sp = turn.get("split") or {}
+    prev = conv["turns"][turn["index"] - 1] if turn["index"] and turn["index"] - 1 < len(conv["turns"]) else None
+    prev_name = str((prev or {}).get("name") or (prev or {}).get("speaker") or "the one reading")
+    feel = _feel_words(turn)
+    out = "TAKES THE PASSAGE OVER from %s mid-read" % prev_name
+    if sp.get("direction") or sp.get("how"):
+        out += " - %s" % (sp.get("direction") or str(sp.get("how")).lower())
+    if sp.get("lead_in"):
+        out += ". Says first, in their own voice: %s" % json.dumps(sp["lead_in"])
+    passage = " ".join(str(sp.get("passage") or "").split())
+    if passage:
+        out += (". Then reads this out word for word as their own words, carrying straight on from where %s "
+                "stopped: %s" % (prev_name, json.dumps(passage)))
+    if feel:
+        out += " - in %s" % feel
+    part_of = next((t for t in conv["turns"] if t["turn_id"] == sp.get("of_turn")), None)
+    if part_of and (part_of.get("split") or {}).get("of") == sp.get("part"):
+        out += ". The passage ends there; the next line answers it"
+    return out.rstrip(".") + "."
+
+
 # --- validation ---------------------------------------------------------------
 
 CUES = {
@@ -5345,7 +5972,7 @@ def bind(conv, final_turns):
         at = mapping.get(t["index"])
         t["script_index"] = at
         if at is not None:
-            t["text"] = str(final_turns[at][1] or "")[:2000]
+            t["text"] = str(final_turns[at][1] or "")                   # [s3-split] whole, never cut mid-word
             t["status"] = "generated"
         else:
             t["status"] = "dropped"
@@ -5883,7 +6510,7 @@ def observe(conv, turn_index, text, seconds=None):
     if not (0 <= turn_index < len(conv["turns"])):
         raise IndexError("no planned turn %d" % turn_index)
     t = conv["turns"][turn_index]
-    t["text"] = str(text or "")[:2000]
+    t["text"] = str(text or "")                                              # [s3-split] whole
     t["status"] = "generated"
     checks = []
     for dec in t["decisions"]:
@@ -5976,7 +6603,7 @@ def replay(stored, config):
     road = str(stored["identity"].get("road_kind") or "banter")
     # [s3-roads] the same planner the road was planned by: a single-voice
     # line, a call from its structure, a segment from its legs, or the cycle
-    if road in system3_tables.LINE_ROADS:
+    if road in system3_tables.LINE_ROADS and not stored.get("graph_structure"):
         plan_line(conv, config)
     elif stored.get("graph_structure"):
         graph = ((config.get("structure") or {}).get("graph") if road == "banter"
@@ -6003,6 +6630,8 @@ def replay(stored, config):
                 if o["turn_index"] < rp["from"] and not any(x["turn_index"] == o["turn_index"] for x in conv["observations"]):
                     observe(conv, o["turn_index"], o["text"], o.get("seconds"))
             replan(conv, config, rp["from"], until=until)
+    for _sp in stored.get("splits") or []:                                     # [s3-split] after the words
+        _replay_split(conv, config, _sp)
     a = [(e["family"], (e.get("selected") or {}).get("id"), (e.get("rng") or {}).get("u")) for e in stored["decision_events"]
          if e["family"] != "STATION"]          # [s3-dice-door] drawn by the road before the plan: recorded, not replayed
     b = [(e["family"], (e.get("selected") or {}).get("id"), (e.get("rng") or {}).get("u")) for e in conv["decision_events"]]

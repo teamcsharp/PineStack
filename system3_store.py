@@ -193,7 +193,7 @@ class System3Store:
         with self.lock, self.db:
             self.db.executemany("INSERT OR REPLACE INTO lines VALUES(?,?,?,?,?,?,?,?,?)",
                                 [(r["line_id"], r["conversation_id"], r.get("turn_id"), r.get("block"),
-                                  r.get("ord"), r.get("sid"), r.get("who"), str(r.get("text") or "")[:2000],
+                                  r.get("ord"), r.get("sid"), r.get("who"), str(r.get("text") or ""),   # [s3-split] whole
                                   float(r.get("at") or time.time())) for r in rows if r.get("line_id")])
 
     def conversations(self, limit=50, road="", before=0.0, mode=""):

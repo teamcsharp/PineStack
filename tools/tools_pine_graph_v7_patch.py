@@ -1,34 +1,30 @@
-"""[s3-module-v6] The panel imports System 3's module at ?v=6.
+"""[pine-graph] The panel's System 3 window imports system3.js?v=7 and
+system3.css?v=5: the module gained the hand-drawn conversation graph
+editor, and the old cached copies must fall away. ON THE HOST, after
+tools/system3_module_v6_patch.py (this tool owns the ?v= lines now;
+the v6 tool's --check will report its literal moved, as each bump
+before it did to the one before).
 
-Batch 7 changes frontend/system3.js (lists, the prepend-or-append roulette, the
-"what built this message" dropdown, cast names, ES badges); the panel's
-import URL is bumped so no browser runs yesterday's module against today's
-station. The desktop script page (v=8) and the line card (v=4) are bumped in
-their own files. Older tools that stored the v=5 line are reconciled
-(system3_rounds_patch panel-v5, system3_patch_app panel-open).
-
---check exits 0 ready / 2 applied / 1 missing. ON THE HOST.
+--check exits 0 ready / 2 applied / 1 missing. --apply is idempotent and
+atomic, LF only.
 """
+# TARGET: app.py
 import os
+import shutil
 import sys
 import tempfile
 from pathlib import Path
 
+TARGET_DEFAULT = "app.py"
+
 EDITS = [
-    ("panel-v6",
-     '    const module = await import("/system3/system3.js?v=5");\n',
-     '    const module = await import("/system3/system3.js?v=6");\n', 1),
+    ('pg-panel-js-v7',
+     '    const module = await import("/system3/system3.js?v=6");\n',
+     '    const module = await import("/system3/system3.js?v=7");   // [s3-banks-roll] replay / gold / listening chips on the turn\n', 1),
+    ('pg-panel-css-v5',
+     '    style.href = "/system3/system3.css?v=4"; document.head.append(style);\n',
+     '    style.href = "/system3/system3.css?v=5"; document.head.append(style);   /* [pine-graph] */\n', 1),
 ]
-
-
-# [s3-banks-roll 2026-09-28] system3_banks_roll_patch.py (s3js-vbump) bumped the
-# panel import to ?v=7 inside this tool's 'panel-v6' text: "applied" is that
-# line as it now stands. The anchor is unchanged, so a fresh file is patched
-# straight to the current module version, the way panel-v5 was folded before.
-_RECONCILED_PANEL_V6 = '    const module = await import("/system3/system3.js?v=7");   // [s3-banks-roll] replay / gold / listening chips on the turn\n'
-EDITS = [(e[0], e[1], _RECONCILED_PANEL_V6, e[3]) if e[0] == 'panel-v6' else e
-         for e in EDITS]
-
 
 def plan(text):
     return list(EDITS)
@@ -75,13 +71,17 @@ def apply(path):
     fd, tmp = tempfile.mkstemp(prefix=path.name + ".", dir=str(path.parent))
     with os.fdopen(fd, "wb") as fh:
         fh.write(text.encode("utf-8"))
+    try:
+        shutil.copymode(str(path), tmp)
+    except OSError:
+        pass
     os.replace(tmp, path)
     return 0
 
 
 def main(argv):
     do_apply = "--apply" in argv
-    target = next((a for a in argv if not a.startswith("--")), "app.py")
+    target = next((a for a in argv if not a.startswith("--")), TARGET_DEFAULT)
     if do_apply:
         code = apply(target)
         print({0: "APPLIED", 1: "ANCHORS MISSING - nothing written", 2: "already applied"}[code])

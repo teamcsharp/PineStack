@@ -1271,6 +1271,69 @@ CALLEND_LEGS = [
      "draws": [{"family": "WRAP"}, {"family": "ES"}]},
 ]
 
+# --- IL1: the Insertion list - how the next voice takes over a long read -------
+#
+# [s3-split] 2026-09-28. When a long read on a node with `splits` ticked (the
+# produced advert, the manager's page, a speaker-box monologue) is shared out
+# by the SPLIT node's roulette, each voice that takes over draws here HOW:
+# the category is the way they take over (its `direction` is how it is
+# played), the item is what they say on the way in - short, spoken, then the
+# read carries straight on. {prev} is the name of the one who was reading,
+# {name} the one taking over. Editable in the Tables tab like any table.
+IL1 = {
+    "id": "IL1", "family": "IL", "label": "Insertion list (how the next voice takes over a long read)",
+    "version": 1, "enabled": True, "weight": 1.0,
+    "description": "When a long read is split, whoever the roulette picks to carry it on draws here how they take "
+                   "over: the way (the category, with how it is played) and the few words they say on the way in "
+                   "before the read continues. {prev} is the one who was reading, {name} the one taking over.",
+    "categories": [
+        {"id": "grabs_sheet", "label": "Grabs the sheet and reads on", "weight": 1.2,
+         "direction": "takes the page out of the other's hands and carries straight on without missing a beat",
+         "items": _items([
+             {"id": "give_me_that", "label": "Give me that", "text": "Give me that."},
+             {"id": "hand_it_over", "label": "Hand it over", "text": "Hand it over, {prev}."},
+             {"id": "my_turn", "label": "My turn", "text": "My turn."},
+             {"id": "let_me_have_it", "label": "Let me have it", "text": "Here, let me have it."},
+         ])},
+        {"id": "finishes_sentence", "label": "Finishes their sentence for them", "weight": 1.0,
+         "direction": "jumps in on the other's breath, as if they were always going to say the next bit",
+         "items": _items([
+             {"id": "and_what", "label": "What they mean is", "text": "What {prev} is trying to say is this."},
+             {"id": "as_they_were_saying", "label": "As they were about to say", "text": "As {prev} was about to say:"},
+             {"id": "which_brings_us", "label": "Which brings us to", "text": "Which brings us to this."},
+         ])},
+        {"id": "cuts_in", "label": "Cuts in, impatient", "weight": 0.9,
+         "direction": "impatient, talking over the tail of the last line to get on with it",
+         "items": _items([
+             {"id": "just_let_me", "label": "Just let me read it", "text": "Oh, just let me read it."},
+             {"id": "all_night", "label": "We'll be here all night", "text": "We'll be here all night. Faster."},
+             {"id": "come_on", "label": "Come on", "text": "Come on, come on."},
+         ])},
+        {"id": "picks_up", "label": "Picks up where they trailed off", "weight": 1.0,
+         "direction": "gently picks up the thread where the other voice trailed off",
+         "items": _items([
+             {"id": "picking_up", "label": "Picking it up from there", "text": "Picking it up from there."},
+             {"id": "where_were_we", "label": "Where were we", "text": "Where were we? Right."},
+             {"id": "carrying_on", "label": "Carrying on", "text": "Carrying on."},
+         ])},
+        {"id": "polite", "label": "Takes over politely", "weight": 1.0,
+         "direction": "a polite relay handover, warm and unhurried",
+         "items": _items([
+             {"id": "if_i_may", "label": "If I may", "text": "If I may."},
+             {"id": "allow_me", "label": "Allow me", "text": "Allow me."},
+             {"id": "from_here", "label": "I'll take it from here", "text": "Thank you, {prev}. I'll take it from here."},
+         ])},
+        {"id": "heckles", "label": "Heckles, then continues", "weight": 0.7,
+         "direction": "a jab at the one who was reading, then reads on straight-faced",
+         "items": _items([
+             {"id": "mumbling", "label": "You're mumbling", "text": "You're mumbling, {prev}. Give it here."},
+             {"id": "nobody_hears", "label": "Nobody can hear you", "text": "Nobody can hear you. Listen."},
+             {"id": "my_voice", "label": "Better in my voice", "text": "Sounds better in my voice anyway."},
+         ])},
+    ],
+}
+DEFAULT_TABLES.append(IL1)                                                   # [s3-split]
+
 # --- The banter cycle (PDF p.3) --------------------------------------------
 #
 # Initial Statement [CTS1] -> Response A [ES1, RS1] -> Response B [ES1, RS1]
@@ -1284,7 +1347,9 @@ DEFAULT_STRUCTURE = {
     "id": "banter_cycle", "label": "[Banter]", "version": 1,
     "steps": [
         {"id": "initial", "label": "Initial Statement", "speaker": "initiator",
-         "draws": [{"family": "CTS"}, {"family": "ES"}], "speakerbox": ["prepend", "append"]},
+         "draws": [{"family": "CTS"}, {"family": "ES"}], "speakerbox": ["prepend", "append"],
+         # [s3-split] a speaker-box monologue read on this step is shared out when it runs long
+         "splits": True, "max_splits": 3},
         {"id": "response_a", "label": "Response A", "speaker": "responder_a",
          "draws": [{"family": "ES"}, {"family": "RS"}, {"family": "FL", "tables": ["FL2"]}]},
         {"id": "response_b", "label": "Response B", "speaker": "responder_b", "optional": True,
@@ -1609,15 +1674,16 @@ DEFAULT_ROAD_STRUCTURES = {
         _leg("id", "The station ID", "close", "D",
              "shouts the station's name like it is the only station there is.", "ES")], "STATION ID"),
     "upstairs": _line_structure("upstairs", "The manager's own page", [
-        _leg("page", "The page from upstairs", "close", "C",
-             "pages the booth over the intercom: the grievance, the threat out of all proportion.",
-             "ES")], "PAGE FROM UPSTAIRS"),
+        dict(_leg("page", "The page from upstairs", "close", "C",
+                  "pages the booth over the intercom: the grievance, the threat out of all proportion.",
+                  "ES"), splits=True, max_splits=3)], "PAGE FROM UPSTAIRS"),   # [s3-split] a booth voice reads on
     "interject": _line_structure("interject", "Stock interjection", [
         _leg("line", "The stock line", "close", "A",
              "says the line drawn off the list, as written.", "ES")], "INTERJECTION"),
     "ad_spot": _line_structure("ad_spot", "Produced advert", [
-        _leg("spot", "The produced spot", "close", "A",
-             "the spot drawn off the ad book plays as recorded.", "ES")], "PRODUCED SPOT"),
+        dict(_leg("spot", "The produced spot", "close", "A",
+                  "the spot drawn off the ad book plays as recorded.", "ES"),
+             splits=True, max_splits=3)], "PRODUCED SPOT"),                   # [s3-split] a long read is shared out
     # [s3-lines] the four single lines dj_speak still spoke outside any road
     "reply": _line_structure("reply", "Reply", [
         _leg("answer", "The answer", "close", "A",
@@ -1663,6 +1729,30 @@ def road_register():
     return copy.deepcopy(ROAD_REGISTER)
 
 
+# [s3-split] THE SPLIT NODE'S SWITCH on a step or a leg: `splits` (the
+# checkbox) and `max_splits` - how many times one read may be split, 1 to 3.
+# It is on by default where the long reads are: the produced advert, the
+# manager's own page, and the banter cycle's opening step (the speaker-box
+# monologue). The runtime switches it on once for a config saved before it
+# existed (split_defaults_added); a box the operator unticks stays unticked.
+SPLIT_MAX_SPLITS = 3
+SPLIT_DEFAULT_NODES = (("banter", "initial"), ("ad_spot", "spot"), ("upstairs", "page"))
+
+
+def split_problems(node, where):
+    """[s3-split] What is wrong with a node's split switch, as a list."""
+    out = []
+    if not isinstance(node, dict):
+        return out
+    if "splits" in node and not isinstance(node.get("splits"), bool):
+        out.append("%s: splits is a checkbox (true or false)" % where)
+    if "max_splits" in node:
+        n = node.get("max_splits")
+        if isinstance(n, bool) or not isinstance(n, int) or not 1 <= n <= SPLIT_MAX_SPLITS:
+            out.append("%s: max_splits must be a whole number from 1 to %d" % (where, SPLIT_MAX_SPLITS))
+    return out
+
+
 def validate_structure(road, st):
     """A road structure an operator may save: legs with ids, a place, a seat
     and draws of known families. Returns the list of problems."""
@@ -1685,6 +1775,7 @@ def validate_structure(road, st):
         for d in leg.get("draws") or []:
             if not isinstance(d, dict) or d.get("family") not in ("ES", "RS", "IRS", "FL", "CTS"):
                 out.append("leg %s: unknown draw %r" % (leg["id"], d))
+        out.extend(split_problems(leg, "leg %s" % leg["id"]))                  # [s3-split]
     if not [leg for leg in legs if isinstance(leg, dict) and leg.get("place") == "close"]:
         out.append("the %s structure needs a closing leg" % road)
     alt = st.get("alternate_seats")

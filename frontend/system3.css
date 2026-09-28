@@ -559,6 +559,31 @@
 .s3-graph-preview { max-height: 340px; overflow: auto; white-space: pre-wrap; font-size: 11px; }
 @media (max-width: 900px) { .s3-graph-layout { grid-template-columns: 1fr; } }
 
+/* [pine-graph] the paper and the ink - the hand-drawn conversation graph */
+.s3-graph-canvas { background:
+    radial-gradient(1100px 520px at 30% 0%, #16242c, #0b141a 72%), #0b141a;
+  cursor: default; }
+.s3-pg-palette { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; margin: 0 0 8px; }
+.s3-pg-chip { display: inline-flex; align-items: center; gap: 7px; font-size: 12px; padding: 5px 11px;
+  border: 1.5px dashed var(--line-2); border-radius: 13px; background: transparent; cursor: grab; touch-action: none; }
+.s3-pg-chip:active { cursor: grabbing; }
+.s3-pg-chip[aria-pressed="true"] { border-style: solid; border-color: var(--accent); background: #22352f; }
+.s3-pg-chip-shape { width: 15px; height: 11px; border: 2px solid var(--ink-2); border-radius: 5px; display: inline-block; }
+.pgk-decision .s3-pg-chip-shape { width: 11px; height: 11px; border-radius: 2px; transform: rotate(45deg); }
+.pgk-initiator .s3-pg-chip-shape { border-color: #65c7da; }
+.pgk-reply .s3-pg-chip-shape { border-color: #8ccf9d; }
+.pgk-rebuttal .s3-pg-chip-shape { border-color: #e9af70; }
+.pgk-decision .s3-pg-chip-shape { border-color: #f0d274; }
+.pgk-call .s3-pg-chip-shape { border-color: #e68db4; }
+.pgk-topic_change .s3-pg-chip-shape { border-color: #b49ced; }
+.pgk-end .s3-pg-chip-shape { border-color: var(--ink); }
+.s3-pg-ghost { position: fixed; z-index: 80; transform: translate(-50%, -60%); pointer-events: none;
+  font: 13px 'Segoe Print', 'Comic Sans MS', cursive; color: var(--ink); padding: 6px 14px;
+  border: 2px solid var(--ink-2); border-radius: 13px; background: rgba(11,20,26,.93); }
+.s3-pg-ghost.pgk-decision { border-color: #f0d274; }
+@media (min-height: 860px) { .s3-graph-canvas { height: 580px; } }
+@media (max-height: 760px) { .s3-graph-canvas { height: 420px; } }
+
 .s3-feed { display: grid; gap: 8px; }
 .s3-tile { border: 1px solid var(--line); border-radius: 10px; background: var(--panel); padding: 8px 10px; }
 .s3-tile > summary { cursor: pointer; list-style: none; display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; }

@@ -78,6 +78,10 @@ _S3_WRITE = contextvars.ContextVar("system3_writing_for", default=None)
 ROLLS_KEPT = 60              # a road that rolls and never plans keeps only the last ones
 ROLLS_FRESH = 600.0          # ...and only the last ten minutes' of them reach a plan
 DICE_FLUSH_AFTER = 12.0      # rows first seen are written as one config version
+# [s3-sfx-roll] [s3-banks-roll] what a line's stamp carries past the lines table,
+# on the COMMIT and back onto the conversation's lines: a board line's rolls and
+# poster, a banked line's replay, a gold bar's source and a listening response
+_LINE_KEEPS = ("sfx_roll", "poster", "replay", "gold", "listening")
 
 # The station's seat names -> the script markers banter_turns returns.
 _SEAT_OF = {"dj": "A", "host": "A", "cohost": "B", "third": "D", "caller": "C",
@@ -257,6 +261,9 @@ class System3Runtime:
         added = self.add_missing_default_tables()
         if added:
             self.log("System 3 config gained the default tables it predates: " + ", ".join(added))
+        split_on = self.add_split_defaults()                                   # [s3-split]
+        if split_on:
+            self.log("System 3's SPLIT node is switched on by default on: " + ", ".join(split_on))
         badges = self.add_missing_es_emoji()                                 # [s3-es-emoji]
         if badges:
             self.log("System 3's ES tables gained their emoji badges (once): %d on %s"
@@ -295,8 +302,20 @@ class System3Runtime:
             structure["graph"]["enabled"] = True
             changed = True
         for road, item in (config.get("structures") or {}).items():
-            if isinstance(item, dict) and not (item.get("graph") or {}).get("nodes"):
-                item["graph"] = conversation_graph.protocol_graph(road)
+            if not isinstance(item, dict):
+                continue
+            got = item.get("graph") or {}
+            base_road = str(road).partition("~")[0]
+            if not got.get("nodes"):
+                item["graph"] = (conversation_graph.protocol_graph(road) if base_road == "caller"
+                                 else conversation_graph.road_graph(base_road, item))
+                changed = True
+            elif (base_road != "caller" and len(got.get("nodes") or []) == 1
+                    and (got["nodes"][0] or {}).get("type") == "protocol"):
+                # [nodeplan] the untouched protocol macro becomes the road's own
+                # talk chapter, OFF until the operator enables it: the config
+                # hash prunes a disabled graph, so this fill moves nothing
+                item["graph"] = conversation_graph.road_graph(base_road, item)
                 changed = True
         if changed:
             self._save_config_now(config, "conversation graphs added to existing System 3 structures")
@@ -554,6 +573,39 @@ class System3Runtime:
         them - to carry them to the line it makes."""
         rec = (getattr(_S3_LAST, "by_key", None) or {}).get(str(key)[:60])
         return dict(rec) if isinstance(rec, dict) else None
+
+    def roll_to(self, key, cid, turn_id="", stage=""):
+        """[s3-banks-roll] The roll this thread just made under `key` shaped a
+        round that is ALREADY planned (a listening response at one of its seams,
+        a banked round or a gold bar going out again). It is taken out of this
+        task's buffer - the next plan must not absorb it as its own - and
+        recorded on that round, conversation `cid`, as a STATION observation
+        under `turn_id` (the Rolodex shows it there). Returns the roll as a
+        line's stamp carries it, or {} (no fresh roll under `key`)."""
+        try:
+            key = str(key)[:60]
+            rec = (getattr(_S3_LAST, "by_key", None) or {}).get(key)
+            if not isinstance(rec, dict) or time.time() - float(rec.get("at") or 0) > 60:
+                return {}
+            buf = _S3_ROLLS.get()
+            if buf and buf.get("rolls"):
+                buf["rolls"] = [r for r in buf["rolls"] if r is not rec]
+            out = {k: rec[k] for k in ("kind", "key", "label", "odds", "hit", "dice", "u",
+                                       "index", "of", "picked", "at") if rec.get(k) is not None}
+            if cid:
+                # the turn rides the body too: the Rolodex files an observation
+                # under the turn whose id it carries
+                body = dict(out, stage=str(stage or "a station roll at air")[:240],
+                            turn_id=str(turn_id or "") or None,
+                            why=str(rec.get("why") or "")[:200] or None,
+                            candidates=list(rec.get("candidates") or [])[:12] or None)
+                self.observe_later(str(cid), "STATION", {k: v for k, v in body.items() if v is not None},
+                                   turn_id=str(turn_id or ""))
+                out["recorded_on"] = str(cid)
+            return out
+        except Exception as exc:  # noqa: BLE001
+            self.fail("station roll on a round", exc)
+            return {}
 
     def _absorb_rolls(self, conv):
         """The rolls the road made before asking for this round become its first
@@ -1743,12 +1795,18 @@ class System3Runtime:
             # station hands a sequel today - is built from System 3's call legs
             _story_protocol = bool(call.get("story")) and bool(
                 re.search(r"(?m)^\s*\d+\s+[ABCDE]\s+[-–—]", ctx.get("call_sheet") or ""))
-            if (road != "banter" and (system3.road_structure(config, road) or {}).get("graph", {}).get("enabled")
-                    and (system3.road_structure(config, road) or {}).get("graph", {}).get("nodes")
-                    and not any(node.get("type") == "protocol" for node in
-                                system3.road_structure(config, road)["graph"]["nodes"])):
-                system3.plan_graph(conv, config, system3.road_structure(config, road)["graph"],
-                                   inputs=inputs, road=road)
+            _st = system3.road_structure(config, road)
+            if road not in ("banter", "caller"):
+                # [nodeplan] the airing elects its structure first (base or a
+                # variant, one recorded VARIANT draw - the same draw plan_legs
+                # made, moved before the planner choice) so a variant's own
+                # graph, a segment's override, runs for the round that
+                # elected it. With no variants nothing is drawn.
+                _st, _stev = system3._structure_roll(conv, config, road)
+            _graph = (_st or {}).get("graph") or {}
+            if (road != "banter" and _graph.get("enabled") and _graph.get("nodes")
+                    and not any(node.get("type") == "protocol" for node in _graph["nodes"])):
+                system3.plan_graph(conv, config, _graph, inputs=inputs, road=road)
             elif road == "caller" and call.get("first") and not _story_protocol:
                 # [s3-calls] the call is built by System 3's own call structure
                 system3.plan_call(conv, config, inputs)
@@ -1768,11 +1826,11 @@ class System3Runtime:
                         re.findall(r"(?m)^\s*(\d+)\s+([ABCDE])\s+[-–—]\s*(.+?)\s*$", ctx.get("call_sheet") or "")]
                 system3.plan_protocol(conv, config, rows)
                 handle.sheet = system3.annotate_protocol(conv, ctx.get("call_sheet") or "") if handle.active else ""
-            elif road != "banter" and (system3.road_structure(config, road) or {}).get("legs"):
+            elif road != "banter" and (_st or {}).get("legs"):
                 # [s3-roads] a segment built from its own legs (recap, ad,
                 # news, manager, memo, gallery, mixtape, open_show, fan_mail,
                 # guest - and any road the operator gives a structure)
-                system3.plan_legs(conv, config, inputs, road)
+                system3.plan_legs(conv, config, inputs, road, structure=_st)
             else:
                 system3.plan_more(conv, config)
             handle.plan_ms = round((time.perf_counter() - started) * 1000, 2)
@@ -1800,6 +1858,7 @@ class System3Runtime:
                 self.metrics["plan_ms_max"] = max(self.metrics["plan_ms_max"], handle.plan_ms)
             if handle.active and road != "caller":
                 await self._resolve_material(handle, ctx)
+                self._split_passages(handle)                                    # [s3-split] a long monologue shared out
                 handle.sheet = (system3.render_legs_sheet(conv) if conv.get("road_structure")
                                 else system3.render_sheet(conv))
                 handle.rolls = system3.legacy_rolls(conv)
@@ -1878,11 +1937,29 @@ class System3Runtime:
                 **self.memory_inputs(road, ctx, context),                    # [s3-memory]
             }
             config = self.config
+            _graph = ((system3.road_structure(config, road) or {}).get("graph") or {})   # [nodeplan]
+            _chapter = bool(_graph.get("enabled") and _graph.get("nodes")
+                            and not any(n.get("type") == "protocol" for n in _graph["nodes"]))
+            if _chapter:
+                # [nodeplan] no one-line segments: the studio answers the line,
+                # the chapter graph plans the exchange (the operator turned it on)
+                inputs["line_seat"] = seat
+                for s, n in (("A", dj.get("host_name") or "Host"), ("B", dj.get("cohost_name") or "Co-host"),
+                             ("D", dj.get("third_name") or "Third seat")):
+                    if s not in inputs["seats"]:
+                        inputs["seats"].append(s)
+                        inputs["names"][s] = str(n)
+                        inputs["roles"][s] = {"A": "dj", "B": "cohost", "D": "third"}[s]
+                inputs["turns"] = max(4, min(12, int(ctx.get("lines") or 0) or 7))
             conv = system3.new_conversation(inputs, config, self.settings)
             conv["mode"] = mode
             self._absorb_rolls(conv)                                            # [s3-dice-door]
             conv["identity"]["segment"] = dict((conv.get("inputs") or {}).get("segment") or {})   # [s3-segment]
-            system3.plan_line(conv, config, inputs)
+            if _chapter:
+                system3.plan_graph(conv, config, _graph, inputs=inputs, road=road)   # [nodeplan]
+            else:
+                system3.plan_line(conv, config, inputs)
+            self._mark_split_nodes(conv, config, road)                          # [s3-split]
             handle = LineHandle(self, conv, mode == "active")
             if handle.active:
                 self._cast_note(conv)                                          # [s3-cast]
@@ -1963,12 +2040,14 @@ class System3Runtime:
             conv = handle.conv
             words = " ".join(str(text or "").split())
             if conv["turns"]:
-                t = conv["turns"][-1]
-                t["text"] = words[:1500]
+                # [s3-split] the read's own turn (never a part split off it), with its words whole:
+                # 1,500 characters stood here, and the Messenger showed "There's a certai"
+                t = next((x for x in reversed(conv["turns"]) if not x.get("split_of")), conv["turns"][-1])
+                t["text"] = words
                 t["script_index"] = 0 if words else None
                 t["status"] = "generated" if words else "dropped"
             conv["actual"] = [{"speaker": (conv["turns"][-1]["speaker"] if conv["turns"] else "A"),
-                               "text": words[:600]}]
+                               "text": words}]                                  # [s3-split] whole
             conv["identity"]["script_digest"] = hashlib.sha256(words.encode("utf-8")).hexdigest()[:16]
             conv["bindings"] = [{"turn_id": t["turn_id"], "script_index": 0} for t in conv["turns"][-1:]]
             conv["status"] = ("bound" if handle.active else "shadowed") if words else "dropped"
@@ -1986,6 +2065,264 @@ class System3Runtime:
             self.persist(conv)
         except Exception as exc:  # noqa: BLE001
             self.fail("line bind", exc)
+
+    # --- [s3-split] THE SPLIT NODE AT THE STATION'S DOORS ---------------------------
+    @staticmethod
+    def _studio(dj, away=""):
+        """[s3-split] Who is in the studio now, as the split's roulette sees
+        them: the host, the co-host, the third seat when someone is seated in
+        it, and the SFX guy - a full booth member - when his voice is set;
+        less whoever has stepped out."""
+        dj = dj if isinstance(dj, dict) else {}
+        people = [{"who": "dj", "seat": "A", "name": str(dj.get("host_name") or "Dill"), "voice": ""},
+                  {"who": "cohost", "seat": "B", "name": str(dj.get("cohost_name") or "Skip"), "voice": ""}]
+        if str(dj.get("third_name") or "").strip():
+            people.append({"who": "third", "seat": "D", "name": str(dj.get("third_name")), "voice": ""})
+        if str(dj.get("drop_voice") or "").strip():
+            people.append({"who": "drop", "seat": "S", "name": str(dj.get("sfxguy_name") or "Sam"),
+                           "voice": str(dj.get("drop_voice"))})
+        return [p for p in people if p["who"] != str(away or "")]
+
+    def _pace_book(self):
+        """[s3-split] Each voice's measured pace: {who: {cps, n}} (memory only)."""
+        book = self.__dict__.get("paces")
+        if book is None:
+            book = self.__dict__.setdefault("paces", {})
+        return book
+
+    def note_pace(self, who, chars, seconds):
+        """[s3-split] A rendered line's length and its words: the voice's pace,
+        a running average the split's rule reads once it has eight lines. A
+        take far from speech (under 8 or over 30 characters a second) teaches
+        nothing and is not counted."""
+        try:
+            chars, seconds = int(chars or 0), float(seconds or 0)
+            if chars < 40 or seconds < 2.0:
+                return
+            cps = chars / seconds
+            if not 8.0 <= cps <= 30.0:
+                return
+            with self.lock:
+                got = self._pace_book().setdefault(str(who or ""), {"cps": round(cps, 3), "n": 0})
+                if got["n"]:
+                    got["cps"] = round(0.9 * float(got["cps"]) + 0.1 * cps, 3)
+                got["n"] = int(got["n"]) + 1
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _paces_from(self, rows):
+        """[s3-split] The ledger's own rows, where a round's lines carry their
+        rendered seconds, measure each voice's pace."""
+        for row in rows or []:
+            try:
+                if isinstance(row, dict) and row.get("who") != "board" and float(row.get("seconds") or 0) > 0:
+                    self.note_pace(row.get("who"), len(" ".join(str(row.get("text") or "").split())),
+                                   row.get("seconds"))
+            except (TypeError, ValueError):
+                continue
+
+    def _pace_for(self, who):
+        """[s3-split] (characters a second, why) for a voice."""
+        cfg = system3.split_config(self.config)
+        if who in cfg["paces"]:
+            return float(cfg["paces"][who]), "the split section's pace for %s" % who
+        with self.lock:
+            got = dict(self._pace_book().get(str(who or "")) or {})
+        if int(got.get("n") or 0) >= 8:
+            return round(float(got["cps"]), 2), "measured over %s's last %d lines" % (who, int(got["n"]))
+        return float(cfg["pace"]), "the default pace (no measured pace for %s yet)" % (who or "this voice")
+
+    def _mark_split_nodes(self, conv, config, road):
+        """[s3-split] Each planned turn learns whether its node splits, from
+        the structure it was planned from: a line road's leg, the banter
+        cycle's step."""
+        try:
+            if road in system3_tables.LINE_ROADS:
+                nodes = {str(x.get("id")): x for x in (system3.road_structure(config, road) or {}).get("legs") or []
+                         if isinstance(x, dict)}
+                key = "leg"
+            elif road == "banter":
+                nodes = {str(x.get("id")): x for x in (config.get("structure") or {}).get("steps") or []
+                         if isinstance(x, dict)}
+                key = "step"
+            else:
+                return
+            graph_nodes = {}
+            if conv.get("graph_structure"):
+                # [nodeplan] a chapter-planned round: its turns carry the graph's
+                # node ids, so the split switch is read off the graph's nodes
+                graph = (((config.get("structure") or {}).get("graph") if road == "banter"
+                          else (system3.road_structure(config, road) or {}).get("graph")) or {})
+                graph_nodes = {str(n.get("id")): n for n in graph.get("nodes") or []
+                               if isinstance(n, dict)}
+            for t in conv.get("turns") or []:
+                node = graph_nodes.get(str(t.get("graph_node") or "")) if graph_nodes else None
+                got = system3.split_node(node if node is not None else nodes.get(str(t.get(key) or "")))
+                if got:
+                    t["split_node"] = got
+        except Exception as exc:  # noqa: BLE001
+            self.fail("split nodes", exc)
+
+    def _note_split_used(self, conv, turn_id):
+        """[s3-split] The ways in (IL) a split read drew rest for the next reads:
+        a way used lately weighs a quarter at the next split's IL draw."""
+        keys = ["IL:%s" % d.get("item") for t in conv.get("turns") or [] if t.get("split_of") == turn_id
+                for d in t.get("decisions") or [] if d.get("family") == "IL" and d.get("item")]
+        with self.lock:
+            for k in keys:
+                if k in self.recent_items:
+                    self.recent_items.remove(k)
+                self.recent_items.append(k)
+
+    def split_line(self, stamp, text, who="dj", dj=None, handle=None, kind="", away="", prepared=False):
+        """[s3-split] A single-voice line's words are final (dj_speak, after
+        every rewrite, before the render; the manager's page, before its
+        recording). When its node splits and the read runs past the
+        threshold, the parts come back in order - each with who reads it,
+        their voice when it is not a seat's own (the SFX guy's), the words to
+        say (the lead-in, then the part) and the stamp its ledger row
+        carries: the node's conversation, and the part's own turn. None when
+        there is nothing to split (the node does not split, System 3 is not
+        active for it, a fault); {"split": False, ...} when the rule read it
+        whole - recorded on the node as a SPLIT event that says why."""
+        try:
+            if not self.ready or not isinstance(stamp, dict) or not stamp.get("conversation_id"):
+                return None
+            conv = handle.conv if isinstance(handle, LineHandle) else None
+            if conv is None or conv["identity"]["conversation_id"] != str(stamp["conversation_id"]):
+                conv = self.recent.get(str(stamp["conversation_id"]))
+            if not conv or conv.get("mode") != "active":
+                return None
+            tid = str(stamp.get("turn_id") or "")
+            turn = next((t for t in conv.get("turns") or [] if t.get("turn_id") == tid), None) if tid else None
+            if turn is None or not turn.get("split_node") or turn.get("split") or turn.get("split_of"):
+                return None
+            speaker_who = str(who or "dj")
+            pace, why = self._pace_for(speaker_who)
+            got = system3.split_turn(conv, self.config, turn, text, self._studio(dj, away), speaker_who=speaker_who,
+                                     pace=pace, pace_why=why, recent=self.recent_used(), mode="line",
+                                     prepared=bool(prepared))
+            self.remember(conv)
+            self.persist(conv)
+            if not got.get("split"):
+                return {"split": False, "why": got.get("why", ""), "event_id": got.get("event_id")}
+            self._note_split_used(conv, turn["turn_id"])
+            base = {k: v for k, v in stamp.items() if k != "split"}
+            parts = []
+            for p in got["parts"]:
+                parts.append(dict(p, stamp=dict(base, turn_id=p["turn_id"], split={
+                    "part": p["part"], "of": p["of"], "of_turn": turn["turn_id"], "who": p["who"],
+                    "event_id": p.get("event_id"), **({"il_event": p["il_event"]} if p.get("il_event") else {})})))
+            with self.lock:
+                self.metrics["splits"] = self.metrics.get("splits", 0) + 1
+                self.metrics["split_parts"] = self.metrics.get("split_parts", 0) + len(parts)
+            self.log("System 3 split a %s read in %d: %s" % (kind or conv["identity"].get("road_kind") or "long",
+                                                              len(parts), " / ".join(p["name"] for p in parts)))
+            self._flow(conv, "split a %s read into %d parts" % (conv["identity"].get("road_kind") or "", len(parts)))
+            return {"split": True, "parts": parts, "whole": got.get("whole") or "", "event_id": got.get("event_id")}
+        except Exception as exc:  # noqa: BLE001
+            self.fail("split", exc)
+            return None
+
+    def _split_passages(self, handle):
+        """[s3-split] A round's speaker-box monologue on a node that splits: its
+        passage is known now (fetched, cut to the monologue budget) and the
+        running order is not yet written. Past the threshold the passage is
+        shared out - part 1 stays with the one who opens, each later part is a
+        turn of its own right after it (who and how rolled), reading its part
+        word for word - and the round grows by those turns. Only the round's
+        own booth seats take a part over: the script names A, B and D."""
+        try:
+            conv = handle.conv
+            self._mark_split_nodes(conv, handle.config, conv["identity"].get("road_kind") or "")
+            roles = (conv.get("inputs") or {}).get("roles") or {}
+            names = (conv.get("inputs") or {}).get("names") or {}
+            added = 0
+            for turn in list(conv.get("turns") or []):
+                if not turn.get("split_node") or turn.get("split") or turn.get("split_of"):
+                    continue
+                sb = next((x for x in turn.get("speakerbox") or []
+                           if x.get("mode") == "FULL_SWATH" and (x.get("material") or {}).get("text")), None)
+                if sb is None:
+                    continue
+                people = [{"who": str(roles.get(p["actor_id"]) or p["actor_id"]), "seat": p["actor_id"],
+                           "name": str(names.get(p["actor_id"]) or p.get("name") or p["actor_id"]), "voice": ""}
+                          for p in conv.get("participants") or [] if p.get("actor_id") in ("A", "B", "D")]
+                speaker_who = str(roles.get(turn["speaker"]) or turn["speaker"])
+                nxt = next((t for t in conv["turns"] if t["index"] == turn["index"] + 1), None)
+                next_who = str(roles.get(nxt["speaker"]) or nxt["speaker"]) if nxt else ""
+                pace, why = self._pace_for(speaker_who)
+                got = system3.split_turn(conv, handle.config, turn, sb["material"]["text"], people,
+                                         speaker_who=speaker_who, pace=pace, pace_why=why, next_who=next_who,
+                                         recent=self.recent_used(), mode="passage")
+                if not got.get("split"):
+                    continue
+                parts = got["parts"]
+                self._note_split_used(conv, turn["turn_id"])
+                sb["material"] = dict(sb["material"], text=parts[0]["body"])
+                for p in parts[1:]:
+                    t = next((x for x in conv["turns"] if x["turn_id"] == p["turn_id"]), None)
+                    if t is not None:
+                        t["speakerbox"] = [{"mark": "split", "mode": "FULL_SWATH", "applies": True,
+                                            "rate": sb.get("rate"), "request_id": "%s:split" % t["turn_id"],
+                                            "why": "part %d of %d of the monologue %s opened" % (p["part"], p["of"], turn["name"]),
+                                            "material": dict(sb["material"], text=p["body"])}]
+                added += len(parts) - 1
+                with self.lock:
+                    self.metrics["splits"] = self.metrics.get("splits", 0) + 1
+                    self.metrics["split_parts"] = self.metrics.get("split_parts", 0) + len(parts)
+            if added:
+                conv["timing"]["turn_budget"] = int(conv["timing"].get("turn_budget") or 0) + added
+                if handle.turns:
+                    handle.turns = int(handle.turns) + added
+                self._flow(conv, "shared a speaker-box monologue out over %d more turn(s)" % added)
+        except Exception as exc:  # noqa: BLE001
+            self.fail("split passages", exc)
+
+    SPLIT_MARK = "SPLIT_NODES"       # [s3-split] in defaults_added: the switch was put on once
+
+    def add_split_defaults(self):
+        """[s3-split] The SPLIT node's switch on its default nodes - the
+        produced advert, the manager's own page, the banter cycle's opening
+        step (the speaker-box monologue) - for a config saved before the switch
+        existed. Only a node that has no `splits` key is switched on, and once
+        it has been done the mark in `defaults_added` stops it for good, so a
+        box the operator unticks stays unticked. Saved as a version with a note."""
+        config = self.config if isinstance(self.config, dict) else {}
+        seen = {str(x) for x in (config.get("defaults_added") or [])}
+        if self.SPLIT_MARK in seen:
+            return []
+        new = copy.deepcopy(config)
+        done = []
+        for road, node_id in system3_tables.SPLIT_DEFAULT_NODES:
+            if road == "banter":
+                holder = new.get("structure") if isinstance(new.get("structure"), dict) else None
+                nodes = list((holder or {}).get("steps") or [])
+                # [nodeplan] the chapter plans banter now: its start node is the
+                # same opening-monologue node the cycle's `initial` step is
+                nodes += [n for n in ((holder or {}).get("graph") or {}).get("nodes") or []
+                          if isinstance(n, dict) and n.get("id") == "start"]
+            else:
+                holder = (new.get("structures") or {}).get(road)
+                nodes = holder.get("legs") if isinstance(holder, dict) else None
+            for n in nodes or []:
+                if (isinstance(n, dict) and "splits" not in n
+                        and n.get("id") in ((node_id, "start") if road == "banter" else (node_id,))):
+                    n["splits"] = True
+                    n.setdefault("max_splits", system3_tables.SPLIT_MAX_SPLITS)
+                    holder["version"] = int(holder.get("version") or 1) + 1
+                    if "%s/%s" % (road, node_id) not in done:
+                        done.append("%s/%s" % (road, node_id))
+        if not done:
+            return []
+        new["defaults_added"] = sorted(seen | {self.SPLIT_MARK})
+        try:
+            self.store.save_config(new, "the SPLIT node's switch on by default (once): " + ", ".join(done))
+        except Exception as exc:  # noqa: BLE001
+            self.fail("split defaults", exc)
+            return []
+        self.config = new
+        return done
 
     def _flow(self, conv, summary):
         try:
@@ -2835,6 +3172,7 @@ class System3Runtime:
                 for row in rows or []:
                     if isinstance(row, dict) and len(str(row.get("text") or "")) > 30:
                         self.recent_air.append(" ".join(str(row["text"]).split())[:600])
+            self._paces_from(rows)                                             # [s3-split] each voice's pace
             links = {}
             for ord_, row in enumerate(rows or []):
                 s3 = row.get("system3") if isinstance(row.get("system3"), dict) else {}
@@ -2847,7 +3185,7 @@ class System3Runtime:
                     "line_id": str(row["line_id"]), "conversation_id": cid, "turn_id": s3.get("turn_id") or None,
                     "block": int(block), "ord": ord_, "sid": str(sid or ""), "who": str(row.get("who") or ""),
                     "text": str(row.get("text") or ""), "at": time.time()},
-                    **{k: s3[k] for k in ("sfx_roll", "poster") if s3.get(k)}))        # [s3-sfx-roll]
+                    **{k: s3[k] for k in _LINE_KEEPS if s3.get(k)}))        # [s3-sfx-roll] [s3-banks-roll]
             if not links:
                 return
             for cid, lines in links.items():
@@ -2858,8 +3196,8 @@ class System3Runtime:
                     self.store.add_lines(lines)
                     # [s3-sfx-roll] the lines table keeps words and order; a board
                     # line's rolls and poster ride the COMMIT, keyed by line id
-                    media = {x["line_id"]: {k: x[k] for k in ("sfx_roll", "poster") if x.get(k)}
-                             for x in lines if x.get("sfx_roll") or x.get("poster")}
+                    media = {x["line_id"]: {k: x[k] for k in _LINE_KEEPS if x.get(k)}
+                             for x in lines if any(x.get(k) for k in _LINE_KEEPS)}   # [s3-banks-roll]
                     self.store.add_observation(cid, "COMMIT", dict({
                         "stage": "script-ledger", "block": int(block), "sid": str(sid or ""),
                         "round": str(round_kind or ""), "lines": [x["line_id"] for x in lines],
@@ -2867,6 +3205,10 @@ class System3Runtime:
                     # [s3-carry] the round is on the air in this order: what it leaves
                     # behind is the next round's start
                     conv = self.recent.get(cid) or self.store.conversation(cid, with_events=False)
+                    # [s3-banks-roll] a gold bar replayed off an older round is not
+                    # that round airing: its ending is not the next round's start
+                    if conv and all(x.get("gold") for x in lines):
+                        conv = None
                     if conv:
                         handed = self._hand_on(conv, [r for r in (rows or []) if isinstance(r, dict)])
                         if handed:
@@ -3134,7 +3476,7 @@ class System3Runtime:
         for ln in conv["lines"]:
             got = media.get(ln.get("line_id"))
             if isinstance(got, dict):
-                ln.update({k: got[k] for k in ("sfx_roll", "poster") if got.get(k)})
+                ln.update({k: got[k] for k in _LINE_KEEPS if got.get(k)})   # [s3-banks-roll]
         return conv
 
     # --- the listener's feed ------------------------------------------------------
@@ -3473,6 +3815,7 @@ class System3Runtime:
         structures.update({k: v for k, v in (view.get("structures") or {}).items() if isinstance(v, dict)})
         view["structures"] = structures
         view.setdefault("sfxguy", copy.deepcopy(system3.DEFAULT_SFXGUY))
+        view["split"] = system3.split_config(self.config)                        # [s3-split] the section in force
         view["blocks"] = system3.block_rules(self.config)                  # [s3-blocks] every rule, defaults included
         return view
 
@@ -3584,11 +3927,14 @@ def install(app, namespace):
     namespace["system3_pick"] = rt.pick
     namespace["system3_roll"] = rt.roll
     namespace["system3_last_roll"] = rt.last_roll                      # [s3-sfx-roll]
+    namespace["system3_roll_to"] = rt.roll_to                          # [s3-banks-roll]
     namespace["system3_dice_live"] = rt._dice_live
     namespace["system3_blocks"] = rt.blocks                            # [s3-blocks]
     namespace["system3_note_prompt"] = rt.note_prompt
     namespace["system3_memory_block"] = rt.memory_block                # [s3-memory]
     namespace["system3_writing_for"] = _S3_WRITE
+    namespace["system3_split_line"] = rt.split_line                    # [s3-split]
+    namespace["system3_note_pace"] = rt.note_pace
     namespace["_system3"] = lambda: rt
 
     @app.on_event("startup")
@@ -3764,9 +4110,16 @@ def install(app, namespace):
         return {"hash": await save_config(config, "removed table %s" % table_id)}
 
     @app.get("/api/system3/graph/template")
-    async def conversation_graph_template(authorization: str | None = Header(default=None)):
+    async def conversation_graph_template(road: str = "", authorization: str | None = Header(default=None)):
         host.require_read_auth(authorization)
         import conversation_graph
+        if road:
+            # [nodeplan] "start from this road's own segment": the chapter
+            # derived from the road's CURRENT structure, never the stored graph
+            st = system3.road_structure(rt.config, str(road).partition("~")[0])
+            if not st:
+                raise HTTPException(404, "no road called %s" % road)
+            return {"graph": conversation_graph.road_graph(road, st)}
         return {"graph": conversation_graph.default_graph()}
 
     @app.get("/api/system3/graph/presets")
@@ -3854,6 +4207,9 @@ def install(app, namespace):
         for st in steps:
             if not isinstance(st, dict) or not st.get("id") or not isinstance(st.get("draws"), list):
                 raise HTTPException(400, "every step needs an id and a list of draws")
+            _split_bad = system3_tables.split_problems(st, "step %s" % st.get("id"))   # [s3-split]
+            if _split_bad:
+                raise HTTPException(400, "; ".join(_split_bad))
             st["speakerbox"] = [m for m in (st.get("speakerbox") or []) if m in ("prepend", "append")]
             for d in st["draws"]:
                 if d.get("family") not in ("CTS", "ES", "RS", "IRS", "FL"):
@@ -3934,6 +4290,14 @@ def install(app, namespace):
     @app.put("/api/system3/config/section/{name}")
     async def put_section(name: str, request: Request, authorization: str | None = Header(default=None)):
         host.require_auth(authorization)
+        if name == "split":                                                    # [s3-split] the split section
+            try:
+                split = system3.validate_split(body_json(await request.body()))
+            except (ValueError, TypeError) as exc:
+                raise HTTPException(400, str(exc)) from exc
+            config = copy.deepcopy(rt.config)
+            config["split"] = split
+            return {"hash": await save_config(config, "split section"), "split": split}
         if name not in ("speakerbox", "sfx", "personalities", "sfxguy", "blocks"):   # [s3-blocks]
             raise HTTPException(404, "no section %s" % name)
         raw = body_json(await request.body())

@@ -17,6 +17,7 @@ const FAM = {CTS: 'var(--cts)', ES: 'var(--es)', RS: 'var(--rs)', IRS: 'var(--ir
 FAM.MEMORY = 'var(--memory, #d9c9a3)';   /* [s3-memory] */
 FAM.RESOLVE = 'var(--tint)'; FAM.WRAP = 'var(--room)';   /* [s3-callend] the caller's wheel, wrap call */
 FAM.GRAPH = 'var(--topic)';
+Object.assign(FAM, {SPLIT: 'var(--line)', IL: 'var(--irs)'});   /* [s3-split] the split roll and the insertion list */
 const SIDE = {A: 'left', B: 'right', D: 'left', C: 'right', E: 'right'};
 const reduced = () => window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -79,6 +80,7 @@ function eventLine(ev, conv) {
   const fam = ev.family, sel = ev.selected || {};
   if (ev.kind === 'observation' || ev.stage) return observationLine(ev);
   if (fam === 'CTS' && !ev.rng) return {fam, dice: null, text: (sel.id || '').toLowerCase() + ' → ' + (sel.label || '')};
+  if (fam === 'SPLIT' && !ev.rng) return {fam, dice: null, text: String(sel.label || sel.id || '').toLowerCase()};   /* [s3-split] the rule: no draw */
   if (fam === 'SPEAKERBOX') {
     const meta = ev.meta || {};
     if (meta.door) return {fam, dice: ev.rng ? ev.rng.dice : null, text: `door ${meta.door} rolled u=${num(ev.rng && ev.rng.u, 3)} → decided by the station at bind`};
@@ -332,6 +334,26 @@ const airOn = a => !!a && (!!a.heard || AIRED.has(a.aired));
 const airOff = a => !!a && (a.aired === 'withdrawn' || a.aired === 'never' || !!a.cut_why);
 function turnLines(conv, t) {
   return ((conv && conv.lines) || []).filter(l => l.turn_id === t.turn_id && isSpoken(l)).sort(byLedger);
+}
+/* [s3-banks-roll] what a turn's ledger lines carry past their words: a banked
+   round going out again, a gold bar fired off this turn, a listening response
+   rolled at its seam - each a chip on the message, in the stamp's own words */
+const BANK_TAG_WHY = {
+  replay: 'went out again on the roulette (bank.reair, bank.reair_pick)',
+  gold: 'a gold bar minted from this turn, fired on the roulette (gold.run / gold.pick)',
+  listening: 'a listening response rolled at this seam (listen.seam, listen.pick)'};
+function bankTags(conv, t) {
+  const seen = new Set(), out = [];
+  for (const l of turnLines(conv, t)) {
+    for (const k of Object.keys(BANK_TAG_WHY)) {
+      const s = l && l[k];
+      const label = s && typeof s === 'object' ? String(s.label || '') : '';
+      if (!label || seen.has(label)) continue;
+      seen.add(label);
+      out.push(el('span', {class: 's3-bank-tag s3-bank-' + k, text: label, title: BANK_TAG_WHY[k]}));
+    }
+  }
+  return out;
 }
 /* 'aired' | 'off' (every line withdrawn or cut) | 'waiting' (receipts, none aired) | 'unknown' (no receipt) */
 function airOfLines(lines, air) {
@@ -590,11 +612,34 @@ Object.assign(FAMILY_WHAT, {
   WRAP: ['Wrap call (WRAP1)',
     "Who on the station ends the call, and how - in answer to the caller's last word. Two dice: the way (a polite goodbye, cutting them off mid-sentence, hold forever, the dial tone ... - some only after a resolution, like enjoying the ashes after a painting was set on fire; a call a happening cut short draws from the dead-line wheel) and who says it (the desk's weights by seat). The station's checker takes this node as the sign-off whatever its words. Edited in Tables > WRAP1."],
 });
+Object.assign(FAMILY_WHAT, {   /* [s3-split] */
+  SPLIT: ['Split (a long read shared out)',
+    'Whether a long read on a node whose split box is ticked is shared out among the studio. The rule decides it with no dice: the read\'s characters over the voice\'s pace, against the threshold in Config > split (45 s), cut at sentence ends into the fewest parts that fit - up to the node\'s 1 to 3 splits, never inside a sentence. Then one roll per part after the first picks who carries it on: the studio as it is now, never the one reading, never the same voice twice in a row, at the split section\'s weights.'],
+  IL: ['Insertion list (IL1)',
+    'How the voice the split roll picked takes the read over: the way (grabs the sheet, finishes the sentence, cuts in, picks up where they trailed off, politely, heckles) and the few words said on the way in, before the read carries straight on. Edited in Tables > IL1; a way already used on this read weighs a quarter.']});
 const DIAL_FOR = {ES: ['emotional_volatility'], RS: ['disagreement', 'escalation', 'tangent', 'callback', 'novelty'],
   IRS: ['disagreement', 'escalation'], FL: ['tangent', 'callback', 'novelty', 'closure_aggressiveness', 'escalation'],
   SPEAKERBOX: ['speakerbox_density'], SFX: ['sfx_aggression'], CTS: ['novelty'], TOPIC: ['topics'],
   TINT: ['tint'], REPAIR: ['repair'], ROOM: ['room'], FAV: ['favorites'],
   SHOCK: ['shock_beat'], INTERJECT: ['interjections'], MENTION: ['mention'], TRACK_TALK: ['track_talk']};   /* [s3-rounds] */
+
+/* [s3-split] THE SPLIT NODE'S SWITCH on a step or a leg: "splits being a checkbox we
+   can enable to a particular message node" (the operator, 2026-09-28) - and how many
+   times one read may be split, 1 to 3. A read past the threshold in Config > split is
+   shared out among the studio: SPLIT rolls who carries it on, IL1 how they take over. */
+function splitBox(node, redraw, where) {
+  const on = node.splits === true;
+  const most = el('select', {'aria-label': 'most splits', disabled: !on,
+    onchange: e => { node.max_splits = +e.target.value; if (redraw) redraw(); }},
+    ...[1, 2, 3].map(n => el('option', {value: String(n), text: 'up to ' + n + (n === 1 ? ' split' : ' splits'), selected: (node.max_splits || 3) === n})));
+  return el('div', 's3-row s3-split-box',
+    el('label', {class: 's3-row', title: where === 'step'
+      ? 'a speaker-box monologue read on this step is shared out when it runs past the split threshold'
+      : 'a read on this node that runs past the split threshold is shared out: the roulette picks who carries it on (SPLIT) and how they take over (IL1)'},
+      el('input', {type: 'checkbox', checked: on, onchange: e => {
+        node.splits = e.target.checked; if (e.target.checked && !node.max_splits) node.max_splits = 3; if (redraw) redraw(); }}),
+      'split a long read'), most);
+}
 
 function kv(pairs) {
   return el('div', 's3-kv', ...pairs.filter(p => p && p[1] !== undefined && p[1] !== null && p[1] !== '')
@@ -2965,6 +3010,7 @@ function makeViews({request, onSelect, details = false} = {}) {
       sb.length ? el('span', {text: 'speakerbox ' + sb.map(s => s.mode.toLowerCase()).join(', ')}) : null,
       t.sfx && t.sfx.play ? el('span', {text: 'SFX ' + t.sfx.placement}) : null,
       t.sfxguy && t.sfxguy.speak ? el('span', {text: castName('sfx') + ': ' + (t.sfxguy.kind || 'speaks')})   /* [cast-names] */ : null,
+      bankTags(conv, t),                                   /* [s3-banks-roll] */
       el('span', {text: '~' + num(t.estimated_seconds, 0) + 's'}), el('span', {class: st.cls, text: st.word}));
     /* A line a speaker-box passage went into opens, in place, into its
        parts: the passages above and below it and the setup row. A line
@@ -4142,6 +4188,7 @@ export async function mountEmbedded(root, {request, view = 'conversation', onSel
     };
     const items = [
       btn('Inspect it - the node graph and how it was assembled', () => { close(); inspect(); }),
+      btn('Open its pine-graph - the conversation graph editor on this road', () => { close(); openSystem3({request, tab: 'segments:' + ((conv.identity || {}).road_kind || '')}); }),   /* [pine-graph] */
       /* [s3-segment-feed] the segment it went out in, and the others */
       btn('Inspect the segment it went out in', () => { close(); openSegmentInspector({request, segment: seg, conversation: conv.identity.conversation_id}); }),
       btn('Inspect other segments', () => { close(); openSegmentInspector({request, segment: seg, conversation: conv.identity.conversation_id, pick: true}); }),
@@ -6207,7 +6254,7 @@ export async function mount(root, {request, onClose, tab: startTab = '', table: 
   let tableId = startTable || 'ES1', draft = null;   /* [s3-dice] a card can open on its table */
   let tableDrag = null; const foldedCats = new Set();   /* [s3-window] */
   /* [s3-cast] every family that keeps a table, the round rolls and the two pools included */
-  const TABLE_FAMILIES = ['CTS', 'ES', 'RS', 'IRS', 'FL', 'TEMPER', 'SHOCK', 'INTERJECT', 'SPEAKERBOX', 'FAV', 'DIRECTIVE', 'EVENT', 'CHANCE', 'POOL', 'RESOLVE', 'WRAP'];   /* [s3-sb-end] SBEND1 */
+  const TABLE_FAMILIES = ['CTS', 'ES', 'RS', 'IRS', 'FL', 'TEMPER', 'SHOCK', 'INTERJECT', 'SPEAKERBOX', 'FAV', 'DIRECTIVE', 'EVENT', 'CHANCE', 'POOL', 'RESOLVE', 'WRAP', 'IL'];   /* [s3-sb-end] SBEND1 */
   TABLE_FAMILIES.push('MEMORY');   /* [s3-memory] the kinds of memory: each a rule, then the roulette */
   /* [s3-memory] one kind of memory: the numbers and switches its rule decides eligibility by */
   function memoryFields(cat) {
@@ -6543,6 +6590,7 @@ export async function mount(root, {request, onClose, tab: startTab = '', table: 
           el('label', 's3-row', el('input', {type: 'checkbox', checked: item.enabled !== false, onchange: e => { item.enabled = e.target.checked; }}), 'on'),
           el('input', {type: 'text', class: 'txt', value: item.text || '', placeholder: draft.family === 'DIRECTIVE' ? 'the directive, as the writer is told it' : draft.family === 'FAV' ? 'the line, word for word'
             : draft.family === 'ES' ? "Write {name}'s message with {feeling}, reflecting the mood."   /* [s3-es-dir] system3_tables.ES_DIRECTION: {feeling} = this item, {name} = the speaker */
+            : draft.family === 'IL' ? 'the words said on the way in - {prev} is the one who was reading, {name} the one taking over'   /* [s3-split] */
             : 'what the writer is told this turn does', oninput: e => { item.text = e.target.value; }}),
           poolFields(item),
           /* [s3-flow] follow-on odds: after what the turn before rolled, this row weighs more (or less) */
@@ -6629,7 +6677,8 @@ export async function mount(root, {request, onClose, tab: startTab = '', table: 
           el('select', {'aria-label': 'seat', onchange: e => { lg.seat = e.target.value; }},
             ...['A', 'B', 'C', 'D', 'E', 'alternate'].map(p => el('option', {value: p, text: p === 'alternate' ? 'alternating' : 'seat ' + p, selected: lg.seat === p})))),
         el('textarea', {class: 's3-leg-act', 'aria-label': 'what this leg does', value: lg.act || '', oninput: e => { lg.act = e.target.value; }}),
-        draws, el('div', 's3-row',
+        draws, st.kind === 'line' ? splitBox(lg, paintStructure, 'leg') : null,   /* [s3-split] a line road's read */
+        el('div', 's3-row',
           btn('up', () => { if (i) { [legs[i - 1], legs[i]] = [legs[i], legs[i - 1]]; paintStructure(); } }),
           btn('down', () => { if (i < legs.length - 1) { [legs[i + 1], legs[i]] = [legs[i], legs[i + 1]]; paintStructure(); } }),
           btn('remove', () => { legs.splice(i, 1); paintStructure(); }))));
@@ -6668,7 +6717,8 @@ export async function mount(root, {request, onClose, tab: startTab = '', table: 
           el('select', {onchange: e => { st.speaker = e.target.value; }},
             ...['initiator', 'responder_a', 'responder_b', 'frame'].map(s => el('option', {value: s, text: s.replace('_', ' '), selected: st.speaker === s}))),
           el('label', 's3-row s3-muted', el('input', {type: 'checkbox', checked: !!st.optional, onchange: e => { st.optional = e.target.checked; }}), 'optional')),
-        draws, el('div', 's3-row', mark('prepend'), mark('append'),
+        draws, splitBox(st, paintStructure, 'step'),   /* [s3-split] a speaker-box monologue on this step */
+        el('div', 's3-row', mark('prepend'), mark('append'),
           btn('up', () => { if (i) { [steps[i - 1], steps[i]] = [steps[i], steps[i - 1]]; paintStructure(); } }),
           btn('down', () => { if (i < steps.length - 1) { [steps[i + 1], steps[i]] = [steps[i], steps[i + 1]]; paintStructure(); } }),
           btn('remove', () => { steps.splice(i, 1); paintStructure(); }))));
@@ -6698,8 +6748,9 @@ export async function mount(root, {request, onClose, tab: startTab = '', table: 
    * each with its draws. A pinned draw carries `fixed` - the engine records
    * it without a roll. A variant is saved as "<road>~vN" with a weight; the
    * engine rolls VARIANT among the base and its variants when the road runs. */
-  let segRoad = '', segNodes = null, segRoadOf = '', segSel = {node: -1, draw: -1}, segDrag = null;
+  let segRoad = (startTab === 'segments' && startTable) ? startTable : '', segNodes = null, segRoadOf = '', segSel = {node: -1, draw: -1}, segDrag = null;   /* [pine-graph] segments:<road> lands on that road */
   let segGraph = null, segGraphOf = '', segGraphSel = '', segGraphScene = null, segGraphPresets = null;
+  let segGraphEdgeSel = -1, segGraphArm = null;   /* [pine-graph] the tapped flow line; the palette chip armed to drop */
   let segGraphViewState = {zoom: 1, panX: 0, panY: 0};
   let segInitiator = null;   /* [s3-flow] who opens the banter cycle (null: as saved) */
   const SEG_FAMS = ['CTS', 'ES', 'RS', 'IRS', 'FL'];
@@ -6753,6 +6804,10 @@ export async function mount(root, {request, onClose, tab: startTab = '', table: 
         segGraph = JSON.parse(JSON.stringify(got.graph)); segGraph.enabled = true;
         segGraphSel = (segGraph.nodes[0] || {}).id || ''; refresh(); }
         catch (e) { report(e); } }),
+      segRoad !== 'banter' ? btn("Start from this road's own segment", async () => { try {   /* [pine-graph] road_graph */
+        const got = await request('/api/system3/graph/template?road=' + encodeURIComponent(segRoad.split('~')[0]));
+        segGraph = JSON.parse(JSON.stringify(got.graph)); segGraph.enabled = true;
+        segGraphSel = (segGraph.nodes[0] || {}).id || ''; refresh(); } catch (e) { report(e); } }) : null,
       segRoad !== 'banter' ? btn('Wrap existing protocol', () => { segGraph = {enabled: true, start: 'protocol',
         nodes: [{id: 'protocol', type: 'protocol', label: segRoad + ' protocol', protocol_road: segRoad,
           x: 0, y: 0, seconds: 60, chance: 1, draws: []}], edges: [], topic_options: [], max_steps: 48};
@@ -6779,7 +6834,7 @@ export async function mount(root, {request, onClose, tab: startTab = '', table: 
           caller_available: previewCaller.checked, seed: 'editor-preview'});
         preview.textContent = (got.protocol ? `${got.protocol} runs its existing internal protocol nodes below.` : '')
           + (got.protocol ? '\n' : `Planned ${got.estimated_seconds || 0}s inside ${got.budget_seconds || seconds}s.\n`)
-          + (got.turns || []).map((t, i) => `${i + 1}. ${t.name || t.speaker} / ${t.node}: ${t.work || ''}`).join('\n')
+        + (got.turns || []).map((t, i) => `${i + 1}. ${t.name || t.speaker} / ${t.node}: ${t.work || t.protocol || ''}${t.feeling ? ' [' + t.feeling + (t.intonation ? ', ' + t.intonation : '') + ']' : ''}`).join('\n')   /* [pine-graph] the contract's preview fields */
           + '\n\n' + (got.rolls || []).map(r => `${r.node} ${r.kind}: d${r.dice || '?'} → ${r.selected}`).join('\n');
         preview.hidden = false; } catch (e) { report(e); } })));
     const props = el('aside', 's3-graph-properties');
@@ -6793,7 +6848,7 @@ export async function mount(root, {request, onClose, tab: startTab = '', table: 
         ['Reply as the speaker from node ID', 'respond_to', selected.type === 'reply' ? 0 : -1],
         ['Specific topic', 'topic', selected.type === 'protocol' ? -1 : 2],
         ['Writer direction', 'prompt', selected.type === 'protocol' ? -1 : 3],
-        ['Protocol road', 'protocol_road', selected.type === 'protocol' ? 0 : -1]]) {
+        ['Protocol road (a call node: caller = rob the caller road; an initiator on a LINE road: its leg is the opening)', 'protocol_road', (selected.type === 'protocol' || selected.type === 'initiator' || selected.type === 'call') ? 0 : -1]]) {   /* [pine-graph] contract rev 2 */
         if (lines === -1) continue;
         const control = lines ? el('textarea', {rows: lines, value: selected[key] || '', onchange: e => { selected[key] = e.target.value; }})
           : el('input', {value: selected[key] || '', onchange: e => { selected[key] = e.target.value; refresh(); }});
@@ -6812,6 +6867,9 @@ export async function mount(root, {request, onClose, tab: startTab = '', table: 
             placeholder: 'Blank uses the System 3 defaults', onchange: e => {
               selected[key] = e.target.value.split('\n').map(s => s.trim()).filter(Boolean); }}));
       }
+      if (selected.type === 'call') field('Call chain leg (where this turn sits in the nested call; close carries the rolled RESOLVE)',   /* [pine-graph] */
+        el('select', {onchange: e => { if (e.target.value) selected.call_leg = e.target.value; else delete selected.call_leg; refresh(); }},
+          ...['', 'open', 'middle', 'close'].map(lg => el('option', {value: lg, text: lg || 'unmarked', selected: (selected.call_leg || '') === lg}))));
       props.append(el('h4', {text: 'System 3 table rolls'}));
       for (const family of ['CTS', 'ES', 'RS', 'IRS', 'FL']) {
         const draw = (selected.draws || []).find(d => d.family === family);
@@ -6829,15 +6887,130 @@ export async function mount(root, {request, onClose, tab: startTab = '', table: 
         graph.edges = edges.filter(e => e.from !== selected.id && e.to !== selected.id);
         if (graph.start === selected.id) graph.start = (graph.nodes[0] || {}).id || '';
         segGraphSel = (graph.nodes[0] || {}).id || ''; refresh(); }));
-    } else props.append(para('Select a node to edit its rolls, purpose and path.', 's3-muted'));
+      props.append(el('div', 's3-row',   /* [pine-graph] */
+        btn('Duplicate', () => { const copy = JSON.parse(JSON.stringify(selected));
+          copy.id = 'node-' + Date.now().toString(36);
+          copy.x = (Number(copy.x) || 0) + 40; copy.y = (Number(copy.y) || 0) + 70;
+          nodes.push(copy); segGraphSel = copy.id; segGraphEdgeSel = -1; refresh(); }),
+        graph.start === selected.id ? null
+          : btn('Make this the start', () => { graph.start = selected.id; refresh(); })));
+    } else if (segGraphEdgeSel >= 0 && edges[segGraphEdgeSel]) {   /* [pine-graph] a flow line's own card */
+      const edge = edges[segGraphEdgeSel];
+      const among = edges.filter(e2 => e2.from === edge.from);
+      const total = among.reduce((s, e2) => s + Math.max(0, Number(e2.weight) || 0), 0);
+      const share = total > 0 ? Math.max(0, Number(edge.weight) || 0) / total : 0;
+      props.append(el('h3', {text: 'Flow line'}),
+        para(edge.from + ' -> ' + edge.to + (among.length > 1 && share > 0
+          ? '  -  ' + Math.round(share * 100) + '% (' + pgOdds(share) + ')' : ''), 's3-muted'));
+      field('Weight - the branch dice against its brothers from the same node',
+        el('input', {type: 'number', min: 0, max: 100, step: .01, value: edge.weight == null ? 1 : edge.weight,
+          onchange: e => { edge.weight = Number(e.target.value); refresh(); }}));
+      field('Label written on the line, in your own hand - say (1:2) Reply',
+        el('input', {value: edge.label || '', onchange: e => {
+          if (e.target.value.trim()) edge.label = e.target.value.trim().slice(0, 60); else delete edge.label;
+          refresh(); }}));
+      props.append(btn('Cut this flow line', () => { edges.splice(segGraphEdgeSel, 1); segGraphEdgeSel = -1; refresh(); }));
+    } else props.append(para('Tap a node or a flow line for its card. Drag a chip onto the paper for a new node; '
+      + 'drag a node by its body to move it; drag the pip under a node onto another node to ink a flow line.', 's3-muted'));
     const list = el('div', 's3-graph-list', ...nodes.map(n => btn(n.label || n.id,
       () => { segGraphSel = n.id; refresh(); }, {'aria-pressed': String(n.id === segGraphSel)})));
     const viewControls = el('div', 's3-graph-view-controls',
       btn('−', () => { if (segGraphScene) segGraphScene.zoomBy(1 / 1.25); }, {'aria-label': 'Zoom graph out'}),
       btn('+', () => { if (segGraphScene) segGraphScene.zoomBy(1.25); }, {'aria-label': 'Zoom graph in'}),
       btn('Fit', () => { if (segGraphScene) segGraphScene.fit(); }),
-      el('span', {class: 's3-muted', text: 'Pinch apart to zoom in, pinch together to zoom out. Drag to pan; tap a node to edit.'}));
-    box.append(el('div', 's3-graph-layout', el('div', 's3-graph-visual', canvas, viewControls, list), props));
+      btn('Tidy', () => pgTidy(), {'aria-label': 'Lay the chain out top to bottom'}),   /* [pine-graph] */
+      el('span', {class: 's3-muted', text: 'Pinch or roll to zoom. Drag the paper to pan; drag a node to move it; drag the pip under a node onto another node to ink a flow line; tap a line for its dice.'}));   /* [pine-graph] */
+    /* [pine-graph] the drawing's parts, dragged onto the paper. A chip rides
+       the pointer as an ink ghost and lands as a new node where it is let go;
+       a plain tap arms the chip so the next tap on the paper places it - the
+       tablet's two-tap road. pgPlace is also the scene's own place() hook. */
+    function pgPlace(kind, gx, gy) {
+      if (!kind) return;
+      segGraphArm = null;
+      const names = {initiator: 'Initiator', reply: 'Reply', rebuttal: 'Rebuttal', decision: 'Dice gate',
+        call: 'Phone call', topic_change: 'Topic Change', end: 'End'};
+      const id = 'node-' + Date.now().toString(36);
+      graph.enabled = true;
+      nodes.push({id, type: kind, label: names[kind] || kind,
+        x: Math.round(Math.max(-2000, Math.min(2000, gx))), y: Math.round(Math.max(-2000, Math.min(2000, gy))),
+        seconds: kind === 'decision' ? 0 : 15, chance: 1,
+        draws: kind === 'decision' || kind === 'end' ? [] : kind === 'rebuttal'
+          ? [{family: 'ES'}, {family: 'IRS'}] : [{family: 'ES'}, {family: 'RS'}]});
+      if (!graph.start) graph.start = id;
+      segGraphSel = id; segGraphEdgeSel = -1; refresh();
+    }
+    function pgOdds(p) { return p >= 1 ? 'sure' : p <= 0 ? 'never' : '1:' + Math.max(2, Math.round(1 / p)); }
+    function pgTidy() {   /* [pine-graph] the chain laid top to bottom, staggered like the sketch */
+      const out = new Map(nodes.map(n => [n.id, []]));
+      edges.forEach(e2 => { if (out.has(e2.from) && out.has(e2.to)) out.get(e2.from).push(e2.to); });
+      const depth = new Map(); const queue = [[graph.start || (nodes[0] || {}).id, 0]];
+      while (queue.length) { const [id, d] = queue.shift();
+        if (!id || depth.has(id)) continue;
+        depth.set(id, d); (out.get(id) || []).forEach(to => queue.push([to, d + 1])); }
+      let stray = 0;
+      const most = Math.max(0, ...depth.values());
+      const rows = new Map();
+      nodes.forEach(n => { const d = depth.has(n.id) ? depth.get(n.id) : most + (++stray);
+        if (!rows.has(d)) rows.set(d, []); rows.get(d).push(n); });
+      [...rows.keys()].sort((d1, d2) => d1 - d2).forEach((d, ri) => { const row = rows.get(d);
+        row.forEach((n, ci) => { n.y = ri * 130; n.x = (ci - (row.length - 1) / 2) * 270 + ((ri % 2) ? 70 : -70); }); });
+      segGraphViewState = {zoom: 1, panX: 0, panY: 0};
+      refresh();
+    }
+    function pgProblems(g) {   /* [pine-graph] the engine's validate(), read before the save */
+      const ns = g.nodes || []; if (!ns.length) return [];
+      if (ns.some(n => n.type === 'protocol'))
+        return (ns.length !== 1 || (g.edges || []).length) ? ['a protocol node stands alone: one node, no flow lines'] : [];
+      const problems = [];
+      if (!ns.some(n => n.type === 'end')) problems.push('no end node, so the segment cannot close');
+      const replyIds = new Set(ns.filter(n => n.type === 'reply').map(n => n.id));
+      const badRef = ns.filter(n => n.respond_to && !replyIds.has(n.respond_to)).map(n => n.label || n.id);
+      if (badRef.length) problems.push('reply source must name a reply node: ' + badRef.slice(0, 3).join(', '));
+      const out = new Map(ns.map(n => [n.id, []]));
+      (g.edges || []).forEach(e2 => { if ((Number(e2.weight) || 0) > 0 && out.has(e2.from)) out.get(e2.from).push(e2.to); });
+      const seen = new Set(); const pending = [g.start];
+      while (pending.length) { const id = pending.pop(); if (!id || seen.has(id)) continue;
+        seen.add(id); (out.get(id) || []).forEach(t2 => pending.push(t2)); }
+      if (!ns.some(n => n.type === 'end' && seen.has(n.id))) problems.push('the start cannot reach an end');
+      const lost = ns.filter(n => !seen.has(n.id)).map(n => n.label || n.id);
+      if (lost.length) problems.push('unreachable: ' + lost.slice(0, 3).join(', '));
+      const dead = ns.filter(n => n.type !== 'end' && !(out.get(n.id) || []).length).map(n => n.label || n.id);
+      if (dead.length) problems.push('no way onward from: ' + dead.slice(0, 3).join(', '));
+      return problems;
+    }
+    const PG_KINDS = [['initiator', 'Initiator'], ['reply', 'Reply'], ['rebuttal', 'Rebuttal'],
+      ['decision', 'Dice gate'], ['call', 'Phone call'], ['topic_change', 'Topic change'], ['end', 'End']];
+    const palette = el('div', 's3-pg-palette', el('span', {class: 's3-muted', text: 'drag onto the paper:'}));
+    for (const [kind, kindName] of PG_KINDS) {
+      const chip = el('button', {type: 'button', class: 's3-pg-chip pgk-' + kind,
+        'aria-pressed': String(segGraphArm === kind)}, el('span', 's3-pg-chip-shape'), kindName);
+      chip.addEventListener('pointerdown', ev => {
+        ev.preventDefault(); let ghost = null; const pid = ev.pointerId;
+        try { chip.setPointerCapture(pid); } catch (err) { /* a synthetic pointer */ }
+        const unhook = () => { chip.removeEventListener('pointermove', onMove);
+          chip.removeEventListener('pointerup', onUp); chip.removeEventListener('pointercancel', onCancel); };
+        const onMove = m => { if (m.pointerId !== pid) return;
+          if (!ghost && Math.hypot(m.clientX - ev.clientX, m.clientY - ev.clientY) > 6) {
+            ghost = el('div', {class: 's3-pg-ghost pgk-' + kind, text: kindName});
+            document.body.append(ghost); }
+          if (ghost) { ghost.style.left = m.clientX + 'px'; ghost.style.top = m.clientY + 'px'; } };
+        const onUp = m => { unhook();
+          if (!ghost) { segGraphArm = segGraphArm === kind ? null : kind; refresh(); return; }
+          ghost.remove(); ghost = null;
+          const r = canvas.getBoundingClientRect();
+          if (m.clientX >= r.left && m.clientX <= r.right && m.clientY >= r.top && m.clientY <= r.bottom
+              && segGraphScene && segGraphScene.graphPointAt) {
+            const g = segGraphScene.graphPointAt(m.clientX, m.clientY);
+            if (g) pgPlace(kind, g.x, g.y); } };
+        const onCancel = () => { unhook(); if (ghost) { ghost.remove(); ghost = null; } };
+        chip.addEventListener('pointermove', onMove); chip.addEventListener('pointerup', onUp);
+        chip.addEventListener('pointercancel', onCancel);
+      });
+      palette.append(chip);
+    }
+    box.append(el('div', 's3-graph-layout', el('div', 's3-graph-visual', palette, canvas, viewControls, list), props));
+    const pgTrouble = pgProblems(graph);
+    if (pgTrouble.length) box.append(para('The path has holes the engine will refuse: ' + pgTrouble.join(' - '), 's3-error'));
     const flows = el('div', 's3-graph-flows', el('h3', {text: 'Flow lines · weights are the branch dice'}));
     edges.forEach((edge, i) => flows.append(el('div', 's3-graph-edge',
       el('span', {text: edge.from + ' → ' + edge.to + ' (' + Math.round(100 * (Number(edge.weight) || 0)
@@ -6863,83 +7036,256 @@ export async function mount(root, {request, onClose, tab: startTab = '', table: 
       value: (graph.topic_options || []).join('\n'), onchange: e => {
         graph.topic_options = e.target.value.split('\n').map(s => s.trim()).filter(Boolean); }})));
     box.append(flows, preview);
-    if (nodes.length) setTimeout(() => segGraph3D(canvas, graph, segGraphSel, id => { segGraphSel = id; refresh(); })
+    /* [pine-graph] the scene IS the editor: taps choose, drags move, the pip
+       inks a new flow line, an armed chip lands where the paper is tapped */
+    setTimeout(() => segGraph3D(canvas, graph, segGraphSel, {
+      choose: id => { if (segGraphSel === id && segGraphEdgeSel === -1) return;
+        segGraphSel = id; segGraphEdgeSel = -1; refresh(); },
+      edge: i => { segGraphEdgeSel = i; segGraphSel = ''; refresh(); },
+      move: (id, gx, gy) => { const n = nodes.find(n2 => n2.id === id); if (!n) return;
+        n.x = Math.round(Math.max(-2000, Math.min(2000, gx)));
+        n.y = Math.round(Math.max(-2000, Math.min(2000, gy))); refresh(); },
+      link: (from, to) => { if (from === to || edges.some(e2 => e2.from === from && e2.to === to)) { refresh(); return; }
+        edges.push({from, to, weight: 1}); segGraphEdgeSel = edges.length - 1; segGraphSel = ''; refresh(); },
+      armed: () => segGraphArm,
+      place: (gx, gy) => pgPlace(segGraphArm, gx, gy)})
       .then(scene => { if (canvas.isConnected) segGraphScene = scene; else if (scene) scene.stop(); })
       .catch(e => { canvas.replaceWith(para('3D view unavailable: ' + e.message, 's3-muted')); }), 0);
     return box;
   }
 
-  function segGraph3D(canvas, graph, active, choose) {
+  function segGraph3D(canvas, graph, active, hooks) {
+    /* [pine-graph] The paper. The conversation graph drawn the way the operator
+       drew it (docs/NodePlan/NODE_img.png): wobbly ink boxes for statements,
+       diamonds for the dice, a circle-and-diamond badge where the speaker is
+       raffled from the cast, DASHED boxes for replies that only happen on a
+       roll, and curved ink flow lines with their odds written beside them in
+       the drawing's own voice - (1:2), (1:3). three.js on an orthographic
+       camera: the paper is flat, the GPU pans it.
+       Every part is edited by hand, on the desk's mouse or the tablet's
+       finger: drag a node by its body to move it, drag the pip under a node
+       onto another node to ink a new flow line, tap a node or a line for its
+       card, drag the paper to pan, pinch or roll to zoom, tap empty paper to
+       put down an armed palette chip (or to put the cards away).
+       hooks: choose(id), edge(i), move(id, gx, gy), link(from, to),
+       armed() -> a palette chip kind or null, place(gx, gy). */
     return threeLoad().then(THREE => {
       if (!canvas.isConnected) return null;
       const renderer = new THREE.WebGLRenderer({canvas, antialias: true, alpha: true});
       renderer.setPixelRatio(Math.min(2, window.devicePixelRatio || 1));
-      const w = Math.max(320, canvas.clientWidth), h = Math.max(320, canvas.clientHeight);
+      const w = Math.max(320, canvas.clientWidth), h = Math.max(280, canvas.clientHeight);
       renderer.setSize(w, h, false);
-      const scene = new THREE.Scene(), camera = new THREE.OrthographicCamera(-6, 6, 6 * h / w, -6 * h / w, .1, 100);
+      const scene = new THREE.Scene();
+      const camera = new THREE.OrthographicCamera(-6, 6, 6 * h / w, -6 * h / w, .1, 100);
+      const nodes = graph.nodes || [], edges = graph.edges || [];
+      /* the paper's own units: 80 graph units to a world unit, y down like the sketch */
+      const G = 80;
+      const point = n => new THREE.Vector3((Number(n.x) || 0) / G, -(Number(n.y) || 0) / G, 0);
+      const toGraph = v => ({x: v.x * G, y: -v.y * G});
+      const css = getComputedStyle(canvas);
+      const themed = (name, fallback) => (css.getPropertyValue(name) || '').trim() || fallback;
+      const INK = themed('--ink', '#e2e9e6'), INK2 = themed('--ink-3', '#7e9496'), SEL = themed('--accent', '#90dab9');
+      const TINT = {initiator: '#65c7da', reply: '#8ccf9d', rebuttal: '#e9af70', topic_change: '#b49ced',
+        call: '#e68db4', decision: '#f0d274', end: '#e2e9e6', protocol: '#95a8ed'};
+      const FONT = "'Segoe Print','Bradley Hand','Comic Sans MS','Chalkboard SE',cursive";
+      /* seeded wobble: the ink shakes, but the same way every repaint */
+      const seeded = str => { let a = 2166136261 >>> 0;
+        for (let i = 0; i < str.length; i++) { a ^= str.charCodeAt(i); a = Math.imul(a, 16777619); }
+        return () => { a = Math.imul(a ^ (a >>> 15), 2246822507); a = Math.imul(a ^ (a >>> 13), 3266489909);
+          return ((a ^= a >>> 16) >>> 0) / 4294967296; }; };
+      const odds = p => p >= 1 ? '' : p <= 0 ? 'never' : '1:' + Math.max(2, Math.round(1 / p));
+      const wobbly = (cx, pts, rnd, amp, open) => { cx.beginPath();
+        pts.forEach(([px, py], i) => { const dx = (rnd() - .5) * amp, dy = (rnd() - .5) * amp;
+          if (i === 0) cx.moveTo(px + dx, py + dy); else cx.lineTo(px + dx, py + dy); });
+        if (!open) cx.closePath(); };
+      const rectOutline = (x, y, wd, ht, r) => { const pts = [];
+        const seg = (x1, y1, x2, y2) => { const n = Math.max(2, Math.round(Math.hypot(x2 - x1, y2 - y1) / 12));
+          for (let i = 0; i < n; i++) pts.push([x1 + (x2 - x1) * i / n, y1 + (y2 - y1) * i / n]); };
+        const arc = (ax, ay, a0, a1) => { for (let i = 0; i <= 3; i++) { const a = a0 + (a1 - a0) * i / 3;
+          pts.push([ax + Math.cos(a) * r, ay + Math.sin(a) * r]); } };
+        seg(x + r, y, x + wd - r, y); arc(x + wd - r, y + r, -Math.PI / 2, 0);
+        seg(x + wd, y + r, x + wd, y + ht - r); arc(x + wd - r, y + ht - r, 0, Math.PI / 2);
+        seg(x + wd - r, y + ht, x + r, y + ht); arc(x + r, y + ht - r, Math.PI / 2, Math.PI);
+        seg(x, y + ht - r, x, y + r); arc(x + r, y + r, Math.PI, Math.PI * 1.5);
+        return pts; };
+      const diamondOutline = (ax, ay, rx, ry) => { const pts = [];
+        const corners = [[ax, ay - ry], [ax + rx, ay], [ax, ay + ry], [ax - rx, ay]];
+        for (let k = 0; k < 4; k++) { const [x1, y1] = corners[k], [x2, y2] = corners[(k + 1) % 4];
+          for (let i = 0; i < 5; i++) pts.push([x1 + (x2 - x1) * i / 5, y1 + (y2 - y1) * i / 5]); }
+        return pts; };
+      const nodeCanvas = n => {
+        const dia = n.type === 'decision';
+        const cw = dia ? 288 : 512, ch = dia ? 288 : 224;
+        const c = document.createElement('canvas'); c.width = cw; c.height = ch;
+        const cx = c.getContext('2d'); const rnd = seeded(n.id + '|' + (n.label || '') + '|' + n.type);
+        const tint = TINT[n.type] || INK; const isSel = n.id === active;
+        /* dashed = conditional, as in the drawing: it speaks only on a won roll */
+        const conditional = !dia && (Number(n.chance) < 1 || n.respond_to);
+        cx.lineJoin = 'round'; cx.lineCap = 'round';
+        const stroke = (pts, width, color, dashed) => { cx.save();
+          if (dashed) cx.setLineDash([15, 11]);
+          cx.strokeStyle = color; cx.lineWidth = width; wobbly(cx, pts, rnd, 5); cx.stroke(); cx.restore(); };
+        if (dia) {
+          const pts = diamondOutline(cw / 2, ch / 2 - 8, 100, 88);
+          cx.fillStyle = 'rgba(16,29,38,.94)'; wobbly(cx, pts, rnd, 4); cx.fill();
+          stroke(pts, isSel ? 11 : 8, isSel ? SEL : tint, false);
+          stroke(diamondOutline(cw / 2, ch / 2 - 8, 100, 88), 3, INK, false);
+          const out = edges.filter(e2 => e2.from === n.id);
+          const tot = out.reduce((s, e2) => s + Math.max(0, Number(e2.weight) || 0), 0);
+          const low = out.length > 1 && tot > 0 ? Math.min(...out.map(e2 => Math.max(0, Number(e2.weight) || 0))) / tot : 0;
+          cx.fillStyle = INK; cx.font = '44px ' + FONT; cx.textAlign = 'center'; cx.textBaseline = 'middle';
+          cx.fillText(low > 0 ? odds(low) : 'roll', cw / 2, ch / 2 - 26);
+          cx.font = '26px ' + FONT; cx.fillStyle = INK2;
+          cx.fillText(String(n.label || 'dice').slice(0, 13), cw / 2, ch / 2 + 22);
+          cx.fillStyle = INK; cx.beginPath(); cx.arc(cw / 2, ch - 14, 9, 0, Math.PI * 2); cx.fill();
+        } else {
+          const pts = rectOutline(26, 30, cw - 52, ch - 64, 26);
+          cx.fillStyle = 'rgba(16,29,38,.94)'; wobbly(cx, pts, rnd, 4); cx.fill();
+          stroke(pts, isSel ? 11 : 7.5, isSel ? SEL : tint, conditional);
+          if (!conditional) stroke(rectOutline(30, 34, cw - 60, ch - 72, 23), 3, INK, false);
+          cx.fillStyle = INK; cx.font = '46px ' + FONT; cx.textAlign = 'center'; cx.textBaseline = 'middle';
+          cx.fillText(String(n.label || n.id).slice(0, 16), cw / 2, ch / 2 - 20);
+          const bits = [];
+          const chance = Number(n.chance);
+          if (chance >= 0 && chance < 1) bits.push('(' + odds(chance) + ')');
+          if (Number(n.seconds) > 0) bits.push(Math.round(n.seconds) + 's');
+          if (n.speaker) bits.push(String(n.speaker).slice(0, 12));
+          if ((n.draws || []).length) bits.push((n.draws || []).map(d => d.family).join('+'));
+          cx.font = '25px ' + FONT; cx.fillStyle = INK2;
+          cx.fillText(bits.join('  ').slice(0, 36), cw / 2, ch / 2 + 30);
+          if (graph.start === n.id) { cx.font = '26px ' + FONT; cx.fillStyle = SEL; cx.textAlign = 'left';
+            cx.fillText('start', 36, 18); }
+          /* the raffle badge: circle and diamond - anyone from the cast can win the seat */
+          if (!n.speaker && (n.type === 'initiator' || n.type === 'reply' || n.type === 'rebuttal' || n.type === 'call')) {
+            const bx = cw - 46, by = 34; cx.save(); cx.strokeStyle = INK; cx.lineWidth = 4.5;
+            const ring = []; for (let i = 0; i <= 14; i++) { const a = i / 14 * Math.PI * 2;
+              ring.push([bx + Math.cos(a) * 27, by + Math.sin(a) * 24]); }
+            wobbly(cx, ring, rnd, 3); cx.stroke();
+            cx.fillStyle = INK; cx.beginPath(); cx.arc(bx - 10, by - 2, 4.5, 0, Math.PI * 2); cx.fill();
+            cx.beginPath(); cx.moveTo(bx + 9, by - 11); cx.lineTo(bx + 17, by - 1); cx.lineTo(bx + 9, by + 9);
+            cx.lineTo(bx + 1, by - 1); cx.closePath(); cx.stroke(); cx.restore();
+          }
+          /* the out-pip: a new flow line is picked up here and dropped on another node */
+          cx.fillStyle = INK; cx.beginPath(); cx.arc(cw / 2, ch - 18, 9, 0, Math.PI * 2); cx.fill();
+          cx.strokeStyle = tint; cx.lineWidth = 3; cx.beginPath(); cx.arc(cw / 2, ch - 18, 14, 0, Math.PI * 2); cx.stroke();
+        }
+        return c;
+      };
+      const meshes = [], byId = new Map();
+      nodes.forEach(n => {
+        const size = n.type === 'decision' ? [1.2, 1.2] : [2.35, 1.03];
+        const tex = new THREE.CanvasTexture(nodeCanvas(n)); tex.anisotropy = 4;
+        const mesh = new THREE.Mesh(new THREE.PlaneGeometry(size[0], size[1]),
+          new THREE.MeshBasicMaterial({map: tex, transparent: true}));
+        mesh.position.copy(point(n)); mesh.userData.id = n.id; mesh.userData.node = n; mesh.userData.size = size;
+        scene.add(mesh); meshes.push(mesh); byId.set(n.id, mesh);
+      });
+      const textSprite = (said, color) => { const c = document.createElement('canvas'); c.width = 256; c.height = 64;
+        const cx = c.getContext('2d'); cx.font = '34px ' + FONT; cx.textAlign = 'center'; cx.textBaseline = 'middle';
+        cx.fillStyle = color; cx.fillText(String(said).slice(0, 16), 128, 34);
+        const sp = new THREE.Sprite(new THREE.SpriteMaterial({map: new THREE.CanvasTexture(c), transparent: true}));
+        sp.scale.set(1.7, .42, 1); return sp; };
+      const edgeObjs = [];
+      edges.forEach((edge, i) => {
+        const a = byId.get(edge.from), b = byId.get(edge.to); if (!a || !b) return;
+        const rnd = seeded('edge|' + edge.from + '|' + edge.to + '|' + i);
+        const start = a.position.clone().add(new THREE.Vector3(0, -a.userData.size[1] / 2 + .04, 0));
+        const stop = b.position.clone().add(new THREE.Vector3(0, b.userData.size[1] / 2 + .02, 0));
+        const dx = stop.x - start.x, dy = stop.y - start.y;
+        const bow = Math.abs(dx) < .6 ? ((i % 2) ? -.55 : .55) : dx * .18;
+        const curve = new THREE.CubicBezierCurve3(start,
+          new THREE.Vector3(start.x + bow, start.y + dy * .3, 0),
+          new THREE.Vector3(stop.x - bow * .4, start.y + dy * .75, 0), stop);
+        const pts = curve.getPoints(26).map(v => new THREE.Vector3(v.x + (rnd() - .5) * .05, v.y + (rnd() - .5) * .05, -.05));
+        const isSel = i === segGraphEdgeSel;
+        const mat = new THREE.LineBasicMaterial({color: isSel ? SEL : INK, transparent: true, opacity: isSel ? 1 : .62});
+        const line = new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts), mat);
+        scene.add(line); edgeObjs.push({index: i, pts});
+        const tip = pts[pts.length - 2], back = pts[pts.length - 5] || pts[0];
+        const dir = tip.clone().sub(back).normalize(); const side = new THREE.Vector3(-dir.y, dir.x, 0);
+        scene.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints([
+          tip.clone().addScaledVector(dir, -.2).addScaledVector(side, .11), tip.clone(),
+          tip.clone().addScaledVector(dir, -.2).addScaledVector(side, -.11)]), mat.clone()));
+        const among = edges.filter(e2 => e2.from === edge.from);
+        const tot = among.reduce((s, e2) => s + Math.max(0, Number(e2.weight) || 0), 0);
+        const share = tot > 0 ? Math.max(0, Number(edge.weight) || 0) / tot : 0;
+        const auto = among.length > 1 && share > 0 && share < 1 ? '(' + odds(share) + ')' : '';
+        const said = edge.label || auto;
+        if (said) { const mid = pts[13];
+          const sprite = textSprite(said, isSel ? SEL : INK2);
+          sprite.position.set(mid.x + .58, mid.y + .1, .1); scene.add(sprite); }
+      });
+      const render = () => renderer.render(scene, camera);
       camera.position.set(segGraphViewState.panX, segGraphViewState.panY, 30);
       camera.zoom = segGraphViewState.zoom; camera.updateProjectionMatrix();
-      scene.add(new THREE.AmbientLight(0xffffff, 1));
-      const nodes = graph.nodes || [], xs = nodes.map(n => Number(n.x) || 0), ys = nodes.map(n => Number(n.y) || 0);
-      const minX = Math.min(0, ...xs), maxX = Math.max(1, ...xs), minY = Math.min(0, ...ys), maxY = Math.max(1, ...ys);
-      const scale = Math.min(10 / Math.max(1, maxX - minX), 10 * h / w / Math.max(1, maxY - minY));
-      const point = n => new THREE.Vector3(((Number(n.x) || 0) - (minX + maxX) / 2) * scale,
-        ((minY + maxY) / 2 - (Number(n.y) || 0)) * scale, 0);
-      const positions = new Map(), meshes = [];
-      const colors = {initiator: 0x65c7da, reply: 0x8ccf9d, rebuttal: 0xe9af70,
-        topic_change: 0xb49ced, call: 0xe68db4, decision: 0xf0d274, end: 0xffffff, protocol: 0x95a8ed};
-      const labelSprite = (caption, size = 22) => { const c = document.createElement('canvas'); c.width = 320; c.height = 56;
-        const cx = c.getContext('2d'); cx.fillStyle = '#e6eff0'; cx.font = `600 ${size}px sans-serif`;
-        cx.textAlign = 'center'; cx.fillText(caption, 160, 34);
-        return new THREE.Sprite(new THREE.SpriteMaterial({map: new THREE.CanvasTexture(c), transparent: true})); };
-      nodes.forEach(n => { const p = point(n); positions.set(n.id, p);
-        const geo = n.type === 'decision' ? new THREE.OctahedronGeometry(.25) : new THREE.BoxGeometry(.52, .34, .16);
-        const mesh = new THREE.Mesh(geo, new THREE.MeshLambertMaterial({color: colors[n.type] || 0x88aabb}));
-        if (n.id === active) mesh.scale.setScalar(1.4);
-        mesh.position.copy(p); mesh.userData.id = n.id; scene.add(mesh); meshes.push(mesh);
-        const chance = Number(n.chance);
-        const caption = String(n.label || n.id).slice(0, 22) + (chance >= 0 && chance < 1 ? ` ${Math.round(chance * 100)}%` : '');
-        const sprite = labelSprite(caption);
-        sprite.scale.set(2.2, .38, 1); sprite.position.copy(p).add(new THREE.Vector3(0, -.48, 0)); scene.add(sprite); });
-      (graph.edges || []).forEach(edge => { const a = positions.get(edge.from), b = positions.get(edge.to); if (!a || !b) return;
-        scene.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints([a, b]),
-          new THREE.LineBasicMaterial({color: 0x9bb5bd, transparent: true, opacity: .8})));
-        const d = b.clone().sub(a).normalize(); const arrow = new THREE.Mesh(new THREE.ConeGeometry(.08, .18, 6),
-          new THREE.MeshBasicMaterial({color: 0xe6eff0})); arrow.position.copy(b).addScaledVector(d, -.4);
-        arrow.rotation.z = Math.atan2(d.y, d.x) - Math.PI / 2; scene.add(arrow);
-        const total = (graph.edges || []).filter(other => other.from === edge.from)
-          .reduce((sum, other) => sum + Math.max(0, Number(other.weight) || 0), 0);
-        if (total > 0) { const percent = Math.round(100 * (Number(edge.weight) || 0) / total);
-          const badge = labelSprite(`${percent}%`, 18); badge.scale.set(.7, .22, 1);
-          badge.position.copy(a).lerp(b, .5).add(new THREE.Vector3(.18, .2, .04)); scene.add(badge); }
-      });
+      /* all=true frames the whole chain (the Fit button); all=false fits its
+         WIDTH and starts at the top, the way the drawing is read */
+      const contentFit = all => { if (!meshes.length) { camera.position.set(0, 0, 30); camera.zoom = 1; }
+        else { const bb = new THREE.Box3(); meshes.forEach(m => bb.expandByPoint(m.position)); bb.expandByScalar(1.7);
+          const fitW = 12 / Math.max(1, bb.max.x - bb.min.x), fitH = 12 * h / w / Math.max(1, bb.max.y - bb.min.y);
+          camera.zoom = Math.max(.16, Math.min(2.4, all ? Math.min(fitW, fitH) : Math.min(1.3, fitW)));
+          camera.position.x = (bb.min.x + bb.max.x) / 2;
+          camera.position.y = all ? (bb.min.y + bb.max.y) / 2
+            : bb.max.y + .4 - (6 * h / w) / camera.zoom; }
+        camera.updateProjectionMatrix();
+        segGraphViewState = {zoom: camera.zoom, panX: camera.position.x, panY: camera.position.y}; };
+      if (segGraphViewState.zoom === 1 && !segGraphViewState.panX && !segGraphViewState.panY) contentFit(false);
       const ray = new THREE.Raycaster(), mouse = new THREE.Vector2();
       const floor = new THREE.Plane(new THREE.Vector3(0, 0, 1), 0);
-      const fingers = new Map(); let press = null, pinch = null, moved = false;
-      const render = () => renderer.render(scene, camera);
       const pointAt = (x, y) => { const r = canvas.getBoundingClientRect();
         mouse.set((x - r.left) / r.width * 2 - 1, -(y - r.top) / r.height * 2 + 1);
         camera.updateMatrixWorld(); ray.setFromCamera(mouse, camera);
         return ray.ray.intersectPlane(floor, new THREE.Vector3()); };
+      const screenAt = v => { const sv = v.clone().project(camera); const r = canvas.getBoundingClientRect();
+        return {x: r.left + (sv.x + 1) / 2 * r.width, y: r.top + (1 - (sv.y + 1) / 2) * r.height}; };
+      const nodeHit = (x, y) => { const r = canvas.getBoundingClientRect();
+        mouse.set((x - r.left) / r.width * 2 - 1, -(y - r.top) / r.height * 2 + 1);
+        camera.updateMatrixWorld(); ray.setFromCamera(mouse, camera);
+        const hit = ray.intersectObjects(meshes)[0];
+        return hit ? {id: hit.object.userData.id, mesh: hit.object, uv: hit.uv, point: hit.point} : null; };
+      const distToSeg = (x, y, a2, b2) => { const vx = b2.x - a2.x, vy = b2.y - a2.y;
+        const t = Math.max(0, Math.min(1, ((x - a2.x) * vx + (y - a2.y) * vy) / Math.max(1e-6, vx * vx + vy * vy)));
+        return Math.hypot(x - (a2.x + vx * t), y - (a2.y + vy * t)); };
+      const edgeHitAt = (x, y) => { let best = null;
+        for (const eo of edgeObjs) for (let i = 0; i < eo.pts.length - 1; i++) {
+          const d = distToSeg(x, y, screenAt(eo.pts[i]), screenAt(eo.pts[i + 1]));
+          if (d < 9 && (!best || d < best.d)) best = {d, index: eo.index}; }
+        return best; };
+      let band = null;
+      const bandTo = (from, v) => {
+        if (band) { scene.remove(band); band.geometry.dispose(); band.material.dispose(); band = null; }
+        if (from && v) { band = new THREE.Line(new THREE.BufferGeometry().setFromPoints(
+            [from, new THREE.Vector3(v.x, v.y, .2)]),
+          new THREE.LineDashedMaterial({color: SEL, dashSize: .16, gapSize: .1}));
+          band.computeLineDistances(); scene.add(band); }
+        render(); };
       const pan = (from, to) => { const a = pointAt(from.x, from.y), b = pointAt(to.x, to.y);
         if (!a || !b) return;
         camera.position.x += a.x - b.x; camera.position.y += a.y - b.y;
         segGraphViewState.panX = camera.position.x; segGraphViewState.panY = camera.position.y; render(); };
       const zoom = (x, y, factor) => { const before = pointAt(x, y);
-        const next = Math.max(.35, Math.min(8, camera.zoom * factor));
+        const next = Math.max(.16, Math.min(8, camera.zoom * factor));
         if (next === camera.zoom) return;
         camera.zoom = next; camera.updateProjectionMatrix();
         const after = pointAt(x, y);
         if (before && after) { camera.position.x += before.x - after.x; camera.position.y += before.y - after.y; }
         segGraphViewState.zoom = camera.zoom;
         segGraphViewState.panX = camera.position.x; segGraphViewState.panY = camera.position.y; render(); };
+      const fingers = new Map(); let press = null, pinch = null, moved = false, grab = null;
       const pinchMeasure = () => { const [a, b] = [...fingers.values()];
         return {x: (a.x + b.x) / 2, y: (a.y + b.y) / 2,
           distance: Math.max(1, Math.hypot(a.x - b.x, a.y - b.y))}; };
       const down = e => { e.preventDefault(); fingers.set(e.pointerId, {x: e.clientX, y: e.clientY});
-        canvas.setPointerCapture(e.pointerId);
-        if (fingers.size === 1) { press = {x: e.clientX, y: e.clientY}; moved = false; }
-        else if (fingers.size === 2) { pinch = pinchMeasure(); moved = true; } };
+        try { canvas.setPointerCapture(e.pointerId); } catch (err) { /* a synthetic pointer */ }
+        if (fingers.size === 1) { press = {x: e.clientX, y: e.clientY}; moved = false;
+          const hit = nodeHit(e.clientX, e.clientY);
+          if (hit) { const port = hit.uv && hit.uv.y < .22 && Math.abs(hit.uv.x - .5) < .24;
+            grab = port ? {kind: 'connect', id: hit.id,
+                fromWorld: hit.mesh.position.clone().add(new THREE.Vector3(0, -hit.mesh.userData.size[1] / 2, 0))}
+              : {kind: 'node', id: hit.id, mesh: hit.mesh, offset: hit.mesh.position.clone().sub(hit.point)};
+          } else { const eh = edgeHitAt(e.clientX, e.clientY);
+            grab = eh ? {kind: 'edge', edgeIndex: eh.index} : {kind: 'pan'}; }
+        } else if (fingers.size === 2) { pinch = pinchMeasure(); moved = true; grab = null; bandTo(null, null); } };
       const move = e => { if (!fingers.has(e.pointerId)) return;
         const last = fingers.get(e.pointerId); fingers.set(e.pointerId, {x: e.clientX, y: e.clientY});
         if (fingers.size === 2) { const next = pinchMeasure();
@@ -6947,29 +7293,56 @@ export async function mount(root, {request, onClose, tab: startTab = '', table: 
           pinch = next; moved = true;
         } else if (fingers.size === 1 && press) {
           if (Math.hypot(e.clientX - press.x, e.clientY - press.y) > 5) moved = true;
-          if (moved) pan(last, {x: e.clientX, y: e.clientY});
+          if (!moved) return;
+          if (grab && grab.kind === 'node') { const p2 = pointAt(e.clientX, e.clientY);
+            if (p2) { grab.mesh.position.set(p2.x + grab.offset.x, p2.y + grab.offset.y, 0); render(); } }
+          else if (grab && grab.kind === 'connect') bandTo(grab.fromWorld, pointAt(e.clientX, e.clientY));
+          else pan(last, {x: e.clientX, y: e.clientY});
         } };
       const end = (e, cancelled = false) => { if (!fingers.has(e.pointerId)) return;
-        const clicked = !cancelled && fingers.size === 1 && !moved && press
+        const tapped = !cancelled && fingers.size === 1 && !moved && press
           && Math.hypot(e.clientX - press.x, e.clientY - press.y) <= 5;
         fingers.delete(e.pointerId); pinch = null;
-        if (fingers.size === 1) { press = [...fingers.values()][0]; moved = true; }
-        else if (!fingers.size) { press = null; moved = false; }
-        if (clicked) { pointAt(e.clientX, e.clientY);
-          const hit = ray.intersectObjects(meshes)[0]; if (hit) choose(hit.object.userData.id); } };
+        if (fingers.size === 1) { press = [...fingers.values()][0]; moved = true; grab = null; bandTo(null, null); return; }
+        press = null; const g = grab; grab = null;
+        if (cancelled) { bandTo(null, null); moved = false;
+          if (g && g.kind === 'node' && g.mesh) { g.mesh.position.copy(point(g.mesh.userData.node)); render(); }
+          return; }
+        if (tapped) { bandTo(null, null); moved = false;
+          if (g && (g.kind === 'node' || g.kind === 'connect')) hooks.choose(g.id);
+          else if (g && g.kind === 'edge') hooks.edge(g.edgeIndex);
+          else if (hooks.armed && hooks.armed()) { const p2 = pointAt(e.clientX, e.clientY);
+            if (p2) { const gp = toGraph(p2); hooks.place(gp.x, gp.y); } }
+          else hooks.choose('');
+          return; }
+        moved = false;
+        if (g && g.kind === 'node' && g.mesh) { const gp = toGraph(g.mesh.position); hooks.move(g.id, gp.x, gp.y); }
+        else if (g && g.kind === 'connect') { bandTo(null, null);
+          const hit = nodeHit(e.clientX, e.clientY);
+          if (hit && hit.id !== g.id) hooks.link(g.id, hit.id); } };
       const up = e => end(e), cancel = e => end(e, true);
       const wheel = e => { e.preventDefault(); zoom(e.clientX, e.clientY, Math.exp(-e.deltaY * .001)); };
       canvas.addEventListener('pointerdown', down); canvas.addEventListener('pointermove', move);
       canvas.addEventListener('pointerup', up); canvas.addEventListener('pointercancel', cancel);
       canvas.addEventListener('wheel', wheel, {passive: false}); render();
-      return {zoomBy(factor) { const r = canvas.getBoundingClientRect(); zoom(r.left + r.width / 2, r.top + r.height / 2, factor); },
-        fit() { camera.position.x = 0; camera.position.y = 0; camera.zoom = 1; camera.updateProjectionMatrix();
-          segGraphViewState = {zoom: 1, panX: 0, panY: 0}; render(); },
+      const api = {zoomBy(factor) { const r = canvas.getBoundingClientRect();
+          zoom(r.left + r.width / 2, r.top + r.height / 2, factor); },
+        fit() { contentFit(true); render(); },
+        graphPointAt(x, y) { const p2 = pointAt(x, y); return p2 ? toGraph(p2) : null; },
+        screenOf(id) { const m = byId.get(id); if (!m) return null;
+          const c2 = screenAt(m.position);
+          const tl = screenAt(m.position.clone().add(new THREE.Vector3(-m.userData.size[0] / 2, m.userData.size[1] / 2, 0)));
+          return {x: c2.x, y: c2.y, w: (c2.x - tl.x) * 2, h: (c2.y - tl.y) * 2}; },
         stop() { canvas.removeEventListener('pointerdown', down); canvas.removeEventListener('pointermove', move);
           canvas.removeEventListener('pointerup', up); canvas.removeEventListener('pointercancel', cancel);
           canvas.removeEventListener('wheel', wheel); scene.traverse(obj => {
-        if (obj.geometry) obj.geometry.dispose(); if (obj.material) {
-          if (obj.material.map) obj.material.map.dispose(); obj.material.dispose(); } }); renderer.dispose(); }};
+            if (obj.geometry) obj.geometry.dispose(); if (obj.material) {
+              if (obj.material.map) obj.material.map.dispose(); obj.material.dispose(); } });
+          renderer.dispose();
+          try { if (renderer.forceContextLoss) renderer.forceContextLoss(); } catch (err) { /* already lost */ } }};
+      try { const dbg = window.__pineGraphDebug = window.__pineGraphDebug || {};
+        dbg.scene = api; dbg.graph = graph; } catch (err) { /* sealed window */ }
+      return api;
     });
   }
 
@@ -7030,6 +7403,7 @@ export async function mount(root, {request, onClose, tab: startTab = '', table: 
             ...['A', 'B', 'C', 'D', 'E', 'alternate'].map(x => el('option', {value: x, text: x === 'alternate' ? 'alternating' : 'seat ' + x, selected: sel.seat === x})))),
           field('what this leg does - the act the writer is given', el('textarea', {value: sel.act || '', oninput: e => { sel.act = e.target.value; }})));
       }
+      if (cycle || st.kind === 'line') props.append(el('h4', {text: 'Split'}), splitBox(sel, repaint, cycle ? 'step' : 'leg'));   /* [s3-split] */
       const d = segSel.draw >= 0 ? (sel.draws || [])[segSel.draw] : null;
       if (d) {
         const items = segTableItems(d.family);
@@ -7061,6 +7435,8 @@ export async function mount(root, {request, onClose, tab: startTab = '', table: 
       const head = el('div', 's3-row', el('b', {text: n.label || n.id || (cycle ? 'step' : 'leg')}),
         cycle ? el('span', {class: 's3-pill', text: String(n.speaker || '').replace('_', ' ')}) : el('span', {class: 's3-pill', text: n.place || 'middle'}),
         cycle ? null : el('span', {class: 's3-pill', text: n.seat === 'alternate' ? 'alternating' : 'seat ' + (n.seat || 'A')}),
+        n.splits === true ? el('span', {class: 's3-pill', style: `border-color:${FAM.SPLIT}`, text: 'split x' + (n.max_splits || 3),   /* [s3-split] */
+          title: 'a long read on this node is shared out, up to ' + (n.max_splits || 3) + ' split(s)'}) : null,
         ...(n.speakerbox || []).map(m => el('span', {class: 's3-pill', style: `border-color:${FAM.SPEAKERBOX}`, text: m,
           onclick: e => { e.stopPropagation(); n.speakerbox = n.speakerbox.filter(x => x !== m); repaint(); }, title: 'tap to remove the mark'})),
         el('span', {style: 'flex:1'}),
@@ -8085,6 +8461,7 @@ export async function mount(root, {request, onClose, tab: startTab = '', table: 
       section('speakerbox', 'Mode weights for a hit (verbatim / reference / callback), the inline passage budget per round, and passage length.'),
       section('sfx', 'The SFX Guy: planned-clip probability at aggression 0 and 1, the first-exchange clip, and the arousal and comedy boosts. The station\'s cadence stays the floor.'),
       section('sfxguy', 'The SFX Guy\'s mouth: his node on every host turn. rate_by_dial uses the desk\'s interjections dial for whether he pipes up; reaction_by_warp uses the invention dial for how often a line is fired back at the one just said; news_share is the wire; never_over_callers keeps him off a caller\'s turn.'),
+      section('split', 'The SPLIT node: a read past threshold_seconds at its voice\'s pace (pace, or paces by role; else the pace the station measured) is shared out on a node whose split box is ticked, into at most max_splits + 1 parts. who weighs each member of the studio (dj, cohost, third, drop) for the roll that picks who carries it on; again is the weight for someone who already read a part; min_share keeps a cut from leaving a scrap.'),   /* [s3-split] */
       section('personalities', 'Per seat tag multipliers, e.g. {"A": {"disagreement": 1.4}, "B": {"humor": 1.3}}.'),
       /* [s3-blocks] */
       section('blocks', 'Every block a writer prompt may carry, and what System 3 does with it: kind "obligation" (always sent, recorded), "roll" (a die at odds, or the desk dial named in odds_from), "tint" (only while a crystal is on and the tint pass is wanted) or "off". A block whose name is not here is a wedge and is stripped. The Prompt tab shows each prompt’s blocks as decided.')));
@@ -8366,7 +8743,8 @@ function turnNode(conv, t, config) {
   const key = variant || road;
   const st = cycle ? (cfg.structure || {}) : ((cfg.structures || {})[key] || null);
   const nodes = cycle ? (st.steps || []) : ((st && st.legs) || []);
-  const wanted = String((t || {}).leg || (t || {}).step || '');
+  const src = (t && t.split_of && ((conv || {}).turns || []).find(x => x.turn_id === t.split_of)) || t;   /* [s3-split] a part taken over is its read's node */
+  const wanted = String((src || {}).leg || (src || {}).step || '');
   let index = nodes.findIndex(n => String(n.id || '') === wanted);
   if (index < 0 && nodes.length) index = nodes.findIndex(n => String(n.label || '') === String((t || {}).step_label || ''));
   return {cycle, key, structure: st, nodes, index, node: index >= 0 ? nodes[index] : null,

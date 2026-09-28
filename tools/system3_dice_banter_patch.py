@@ -316,6 +316,12 @@ EDITS = [
 ]
 
 
+# [integration 2026-09-28] system3_lists2_patch.py edited inside this tool's 'heat-line' text
+# ([s3-lists2] picked under the band's POOLS1 key, so the seed rows' weights reach it): "applied" is that text with that edit folded in. The anchor is
+# unchanged, so a fresh file is patched exactly as before.
+_RECONCILED_HEAT_LINE = '    return unrepeated(pool, f"heat-{band}",   # [s3-dice-door]\n                      # [s3-lists2] picked under the band\'s POOLS1 key, so the seed rows\'\n                      # desk weights reach the draw (an evolved line weighs 1)\n                      director=_S3Dice("banter.heat_seed_" + band.replace(" ", "_"),\n                                       "which heat aside is let slip"))   # [s3-dice-door]\n'
+EDITS = [(e[0], e[1], _RECONCILED_HEAT_LINE, e[3]) if e[0] == 'heat-line' else e for e in EDITS]
+
 def plan(text):
     return list(EDITS)
 

@@ -682,3 +682,143 @@
   box-shadow: none;
 }
 .pine-cam-box.pine-cam-sliding { opacity: 0; }
+/* ------------------------------------------------------------- [pincrop]
+   THE CROP. The radial menu a hold opens (the SFX TV's shape, this page's
+   classes) and the full-screen draw overlay. The shade sits over every
+   sheet this page owns; the draw overlay sits over the shade. */
+.pine-cam-radial-shade {
+  position: fixed;
+  z-index: 2147483055;
+  inset: 0;
+  background: rgba(2, 6, 10, .42);
+  touch-action: none;
+}
+.pine-cam-radial {
+  position: absolute;
+  width: 248px;
+  height: 248px;
+  transform: translate(-50%, -50%);
+  border: 1px solid rgba(101, 199, 218, .34);
+  border-radius: 50%;
+  background: rgba(11, 17, 23, .82);
+  box-shadow: inset 0 0 0 72px rgba(11, 17, 23, .35), 0 18px 60px rgba(0, 0, 0, .68);
+  font: 12px/1.3 system-ui, sans-serif;
+}
+.pine-cam-radial-item {
+  position: absolute;
+  display: grid;
+  place-items: center;
+  width: 54px;
+  height: 54px;
+  padding: 0;
+  border: 1px solid #426174;
+  border-radius: 50%;
+  background: #17212b;
+  color: #e5f3f7;
+  box-shadow: 0 7px 20px rgba(0, 0, 0, .45);
+  cursor: pointer;
+  touch-action: manipulation;
+}
+.pine-cam-radial-item:hover, .pine-cam-radial-item:focus-visible {
+  border-color: #65c7da;
+  background: #20303d;
+  outline: none;
+}
+.pine-cam-radial-item .pi-icon { width: 24px; height: 24px; }
+.pine-cam-radial-item .pine-cam-word { font-size: 10px; }
+/* three seats on the dial: draw at the top, adjust and reset below */
+.pine-cam-radial-item.crop { left: 50%; top: 4px; transform: translateX(-50%); }
+.pine-cam-radial-item.adjust { right: 13px; bottom: 34px; }
+.pine-cam-radial-item.reset { left: 13px; bottom: 34px; }
+/* no crop set: adjust and reset are present but plainly asleep */
+.pine-cam-radial-item.off { opacity: .45; }
+.pine-cam-radial-note {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 116px;
+  max-height: 60px;
+  transform: translate(-50%, -50%);
+  overflow: hidden;
+  text-align: center;
+  color: #b8c4ce;
+  pointer-events: none;
+}
+
+/* the draw overlay: the whole picture, the band, and the bar */
+.pine-cam-crop {
+  position: fixed;
+  z-index: 2147483056;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  background: #05080b;
+  font: 12px/1.4 system-ui, sans-serif;
+}
+.pine-cam-crop-stage {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+  touch-action: none;              /* the drag draws; nothing scrolls */
+  cursor: crosshair;
+}
+.pine-cam-crop-img {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  user-select: none;
+  -webkit-user-drag: none;
+  pointer-events: none;            /* the stage owns the pointer */
+}
+.pine-cam-crop-band {
+  position: absolute;
+  border: 2px solid #65c7da;
+  /* the dimming IS the explanation: everything under the shadow is what
+     the stream loses */
+  box-shadow: 0 0 0 4000px rgba(2, 6, 10, .58);
+  pointer-events: none;
+}
+.pine-cam-crop-band::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border: 1px dashed rgba(229, 243, 247, .5);
+}
+.pine-cam-crop-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 14px;
+  background: #0b1117;
+  border-top: 1px solid #26343f;
+  color: #b8c4ce;
+}
+.pine-cam-crop-bar b { color: #e5f3f7; letter-spacing: .06em; }
+.pine-cam-crop-note { flex: 1; min-width: 0; }
+.pine-cam-crop-bar button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 38px;
+  padding: 0 14px;
+  border: 1px solid #426174;
+  border-radius: 6px;
+  background: #17212b;
+  color: #e5f3f7;
+  cursor: pointer;
+  touch-action: manipulation;
+  white-space: nowrap;
+}
+.pine-cam-crop-bar button .pi-icon { width: 16px; height: 16px; }
+.pine-cam-crop-ok { border-color: #65c7da; }
+.pine-cam-crop-ok:disabled { opacity: .45; cursor: default; }
+.pine-cam-crop-no { border-color: #85483f; color: #efb6ad; }
+@media (max-width: 700px) {
+  .pine-cam-radial { width: 224px; height: 224px; }
+  .pine-cam-radial-item { width: 50px; height: 50px; }
+  .pine-cam-crop-bar { flex-wrap: wrap; }
+  .pine-cam-crop-note { flex-basis: 100%; order: -1; }
+}
