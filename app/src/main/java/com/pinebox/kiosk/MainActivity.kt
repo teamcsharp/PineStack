@@ -91,6 +91,7 @@ class MainActivity : AppCompatActivity() {
 
     private lateinit var bridge: PineDesktopBridge
     private var videoWall: com.pinebox.kiosk.video.PineVideoWall? = null  // #1426
+    private var splicePreview: com.pinebox.kiosk.video.PineSplicePreview? = null
     /** The Pine Cam on its own native surface - see video/PineCamWall.kt. */
     private var pineCam: com.pinebox.kiosk.video.PineCamWall? = null
 
@@ -505,7 +506,9 @@ class MainActivity : AppCompatActivity() {
            measured at seven times in thirty-three minutes, taking the
            operator's place in the script each time. */
         app.wallpaper.reading = true
-        KioskController.enterLockTask(this)
+        /* Do not trap the operator in the station.  A prior kiosk build may
+         * still have lock task active, so release it whenever we resume. */
+        KioskController.exitLockTask(this)
 
         /* THE LOCK SCREEN. Registered here rather than in onCreate because
          * SCREEN_ON/SCREEN_OFF/USER_PRESENT are protected broadcasts that a
@@ -880,6 +883,8 @@ class MainActivity : AppCompatActivity() {
         timerGuard?.let { webView.removeCallbacks(it) }      // #1241
         timerGuard = null
         videoWall?.stop()
+        splicePreview?.stop()
+        splicePreview = null
         videoWall?.onTap = null
         videoWall?.onLongPress = null
         videoWall?.onClipChanged = null
@@ -892,6 +897,7 @@ class MainActivity : AppCompatActivity() {
         pineCam = null
         if (::bridge.isInitialized) {
             bridge.videoWall = null
+            bridge.splicePreview = null
             bridge.pineCam = null
             bridge.liveActivity = null
         }
@@ -1134,6 +1140,8 @@ class MainActivity : AppCompatActivity() {
                 val jack = jackWatch?.refresh() ?: "jack watch is not running"
                 "$jack; output: ${outputRoute?.current() ?: "not available"}"
             },
+            openBluetooth = ::openBluetoothSettings,
+            exitToSystem = ::exitToSystem,
         )
         rail = built
         built.bind()
@@ -1178,6 +1186,31 @@ class MainActivity : AppCompatActivity() {
             },
         ).also { it.start() }
 
+    }
+
+    /** The rail's native escape routes.  These do not depend on the page
+     * being healthy, which matters most when a bluetooth route is needed. */
+    private fun openBluetoothSettings() {
+        KioskController.exitLockTask(this)
+        KioskController.showSystemBars(this)
+        val bluetooth = Intent(android.provider.Settings.ACTION_BLUETOOTH_SETTINGS)
+        val fallback = Intent(android.provider.Settings.ACTION_SETTINGS)
+        try {
+            startActivity(bluetooth)
+        } catch (err: ActivityNotFoundException) {
+            Log.w(TAG, "bluetooth settings unavailable; opening settings", err)
+            startActivity(fallback)
+        }
+    }
+
+    private fun exitToSystem() {
+        KioskController.leaveForSystem(this)
+        try {
+            startActivity(Intent(android.provider.Settings.ACTION_SETTINGS))
+        } catch (err: ActivityNotFoundException) {
+            Log.w(TAG, "settings unavailable while leaving kiosk", err)
+        }
+        finishAndRemoveTask()
     }
 
     /**
@@ -1278,6 +1311,10 @@ class MainActivity : AppCompatActivity() {
         }
         videoWall = wall
         bridge.videoWall = wall
+        val preview = com.pinebox.kiosk.video.PineSplicePreview(this, app.client, lifecycleScope)
+        root.addView(preview, android.widget.FrameLayout.LayoutParams(1, 1))
+        splicePreview = preview
+        bridge.splicePreview = preview
         android.util.Log.i("PineVideoWall", "install: wall handed to the bridge")
     }
 
@@ -1767,6 +1804,21 @@ class MainActivity : AppCompatActivity() {
     }
 
     private inner class PanelChrome : WebChromeClient() {
+        private val brandedVideoPoster: Bitmap by lazy {
+            val poster = Bitmap.createBitmap(512, 288, Bitmap.Config.ARGB_8888)
+            val canvas = android.graphics.Canvas(poster)
+            canvas.drawColor(android.graphics.Color.rgb(6, 12, 14))
+            assets.open("pinebox-256.png").use { input ->
+                android.graphics.BitmapFactory.decodeStream(input)?.let { logo ->
+                    val bounds = android.graphics.Rect(200, 88, 312, 200)
+                    canvas.drawBitmap(logo, null, bounds, android.graphics.Paint(android.graphics.Paint.FILTER_BITMAP_FLAG))
+                    logo.recycle()
+                }
+            }
+            poster
+        }
+
+        override fun getDefaultVideoPoster(): Bitmap = brandedVideoPoster
 
         /**
          * The panel's console, in logcat. This is how a bridge fault is

@@ -148,6 +148,7 @@
     /* #1426: the native endless-video surface. A build without it
        answers {on:false} and the page keeps its own <video>. */
     videoWall: promised("videoWall"),
+    splicePreview: promised("splicePreview"),
     /* The Pine Cam on a native surface, same contract shape: a build
        without it answers {ok:false,on:false} and the page keeps its poll. */
     pineCam: promised("pineCam"),

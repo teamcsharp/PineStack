@@ -94,6 +94,29 @@ object KioskController {
         }
     }
 
+    /** Reveal Android's own controls for a deliberate device action. */
+    fun showSystemBars(activity: Activity) {
+        val controller = WindowInsetsControllerCompat(activity.window, activity.window.decorView)
+        controller.show(WindowInsetsCompat.Type.systemBars())
+        controller.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_DEFAULT
+    }
+
+    /**
+     * Give the device back to Android.  Clearing the persistent HOME choice
+     * is deliberately limited to this explicit operator action; launching
+     * Pine Box again re-applies the normal wall-terminal policy.
+     */
+    fun leaveForSystem(activity: Activity) {
+        exitLockTask(activity)
+        showSystemBars(activity)
+        if (isDeviceOwner(activity)) {
+            runCatching {
+                dpm(activity).clearPackagePersistentPreferredActivities(
+                    PineDeviceAdminReceiver.component(activity), activity.packageName)
+            }.onFailure { Log.w(TAG, "could not release persistent home", it) }
+        }
+    }
+
     /**
      * Screen on, bars gone, and gone again after every focus change.
      *
@@ -113,6 +136,9 @@ object KioskController {
             WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
         activity.window.attributes = params
 
+        /* Keep the station clear while it has focus.  Android still reveals
+         * the shade or navigation transiently from an edge swipe, and fades
+         * it back out after the operator has used it. */
         WindowCompat.setDecorFitsSystemWindows(activity.window, false)
         val controller = WindowInsetsControllerCompat(activity.window, activity.window.decorView)
         controller.systemBarsBehavior =

@@ -19,6 +19,9 @@
     <string name="rail_fix">Reinitialise</string>
     <string name="rail_fix_go">↻   Get the broadcast back</string>
     <string name="rail_fix_idle">one tap runs every fix we know</string>
+    <string name="rail_device">Device</string>
+    <string name="rail_bluetooth">Bluetooth</string>
+    <string name="rail_exit">Exit app</string>
     <string name="rail_power">Power</string>
     <string name="rail_power_saver">Open battery settings</string>
     <string name="rail_air">Air</string>

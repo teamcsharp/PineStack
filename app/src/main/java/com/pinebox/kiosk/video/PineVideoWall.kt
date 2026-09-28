@@ -170,6 +170,8 @@ class PineVideoWall(
     @Volatile private var kicks: Int = 0
     @Volatile private var lastKick: String = ""
     @Volatile private var lastError: String = ""
+    @Volatile private var repairs: Int = 0
+    @Volatile private var lastRepair: String = ""
     private val watchdog = object : Runnable {
         override fun run() {
             try { watch() } catch (err: Throwable) { Log.w(TAG, "watch: ${err.message}") }
@@ -518,6 +520,8 @@ class PineVideoWall(
         .put("kicks", kicks)
         .put("last_kick", lastKick)
         .put("last_error", lastError)
+        .put("repairs", repairs)
+        .put("last_repair", lastRepair)
 
     // ------------------------------------------------------- the watchdog
 
@@ -567,6 +571,48 @@ class PineVideoWall(
                 lastError = "${stamp()} replay: ${err.message}"
                 Log.w(TAG, "replay: ${err.message}")
             }
+        }
+    }
+
+    /** Rebuild the hardware player from its existing local runway. */
+    fun repair() {
+        onMain {
+            repairs += 1
+            lastRepair = "${stamp()} operator repair"
+            lastError = ""
+            menuHidden = false
+            held = false
+            holdUntil = 0L
+            veiled = false
+            if (!running.get()) {
+                running.set(true)
+                refreshVisibility()
+                build()
+                pump = scope.launch { feed() }
+                return@onMain
+            }
+            val old = player
+            val from = old?.currentMediaItemIndex?.coerceAtLeast(0) ?: 0
+            val position = old?.currentPosition?.coerceAtLeast(0L) ?: 0L
+            val keep = ArrayList(listed.drop(from))
+            releaseWallBoost()
+            try { old?.release() } catch (_: Throwable) { }
+            player = null
+            listed.clear()
+            showing = ""
+            build()
+            val fresh = player ?: return@onMain
+            for (clip in keep) {
+                fresh.addMediaItem(MediaItem.fromUri(Uri.fromFile(clip.file)))
+                listed.add(clip)
+            }
+            if (listed.isNotEmpty()) {
+                showing = listed.first().id
+                fresh.seekTo(0, position)
+            }
+            fresh.prepare()
+            fresh.playWhenReady = true
+            refreshVisibility()
         }
     }
 

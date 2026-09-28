@@ -95,7 +95,9 @@ data class HotCornerPrefs(
     val tr: String = "export",
     val bl: String = "inspect",
     val br: String = "sfx",
+    /** The square at a display corner in which a gesture may begin. */
     val activationZonePx: Int = DEFAULT_ACTIVATION_ZONE_PX,
+    /** How forgiving the diagonal gesture is, from 0 to 100. */
     val sensitivity: Int = DEFAULT_SENSITIVITY,
 ) {
     fun of(corner: String): String = when (corner) {

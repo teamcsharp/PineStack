@@ -214,8 +214,268 @@
 
   /* ---- the furniture -------------------------------------------------- */
 
+  /* The talk dot is deliberately above every operating surface, which also
+     means the default corner can cover a command in a dense tablet sheet.
+     A short drag moves it; an ordinary tap still starts dictation. The point
+     is stored as viewport coordinates so it follows every station view but
+     never survives outside a rotated or resized screen. */
+  var DOT_POSITION_KEY = 'pineTalkDotPositionV1';
+  var DOT_ENABLED_KEY = 'pineTalkDotEnabledV1';
+  var DOT_COLLAPSED_KEY = 'pineTalkDotCollapsedV1';
+  var DOT_EDGE = 8;
+
+  function dotEnabled() {
+    try { return !root.localStorage || root.localStorage.getItem(DOT_ENABLED_KEY) !== '0'; }
+    catch (err) { return true; }
+  }
+
+  function dotCollapsed() {
+    try { return !!(root.localStorage && root.localStorage.getItem(DOT_COLLAPSED_KEY) === '1'); }
+    catch (err) { return false; }
+  }
+
+  function dotEvent(enabled) {
+    try {
+      if (root.dispatchEvent && typeof root.CustomEvent === 'function') {
+        root.dispatchEvent(new root.CustomEvent('pine-talk-dot-change', {
+          detail: {enabled: !!enabled, collapsed: dotCollapsed()}}));
+      }
+    } catch (err) { /* the control still works without custom events */ }
+  }
+
+  function syncCollapseButton(dot) {
+    var button = el('pineTalkCollapse');
+    if (!button || !dot) return;
+    var visible = dotEnabled() && !dotCollapsed() && state === IDLE && !dot.hidden;
+    button.hidden = !visible;
+    if (!visible) return;
+    var box = null;
+    try { box = dot.getBoundingClientRect(); } catch (err) { box = null; }
+    if (!box) return;
+    var size = 24;
+    var left = Math.max(DOT_EDGE, Math.min(box.right - size + 5,
+      (Number(root.innerWidth) || box.right) - size - DOT_EDGE));
+    var top = Math.max(DOT_EDGE, Math.min(box.top - 7,
+      (Number(root.innerHeight) || box.bottom) - size - DOT_EDGE));
+    button.style.left = Math.round(left) + 'px';
+    button.style.top = Math.round(top) + 'px';
+  }
+
+  function ensureCollapseButton(dot) {
+    var button = el('pineTalkCollapse');
+    if (!button) {
+      button = document.createElement('button');
+      button.type = 'button';
+      button.id = 'pineTalkCollapse';
+      button.className = 'pine-talk-collapse';
+      button.title = 'Collapse voice control to the bottom bar';
+      button.setAttribute('aria-label', button.title);
+      button.innerHTML = '<svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 7.5 10 13l6-5.5"/></svg>';
+      button.addEventListener('click', function (event) {
+        event.preventDefault();
+        event.stopPropagation();
+        setCollapsed(true);
+      });
+      document.body.appendChild(button);
+    }
+    syncCollapseButton(dot);
+    return button;
+  }
+
+  function setCollapsed(collapsed) {
+    collapsed = !!collapsed;
+    if (collapsed && state !== IDLE) return false;
+    try { if (root.localStorage) root.localStorage.setItem(DOT_COLLAPSED_KEY, collapsed ? '1' : '0'); }
+    catch (err) { /* storage is optional */ }
+    var dot = el('pineTalkDot');
+    if (!dot && !collapsed && dotEnabled()) dot = mount();
+    if (dot) {
+      dot.hidden = !dotEnabled() || collapsed;
+      dot.setAttribute('aria-hidden', dot.hidden ? 'true' : 'false');
+      syncCollapseButton(dot);
+    }
+    dotEvent(dotEnabled());
+    return true;
+  }
+
+  function restoreFromBar() { return setCollapsed(false); }
+
+  function setEnabled(enabled) {
+    enabled = !!enabled;
+    try { if (root.localStorage) root.localStorage.setItem(DOT_ENABLED_KEY, enabled ? '1' : '0'); }
+    catch (err) { /* storage is optional */ }
+    var dot = el('pineTalkDot');
+    if (enabled && !dot) dot = mount();
+    if (dot) {
+      dot.hidden = !enabled || dotCollapsed();
+      dot.setAttribute('aria-hidden', dot.hidden ? 'true' : 'false');
+      syncCollapseButton(dot);
+    }
+    ['pineTalkSay', 'pineTalkTelemetry'].forEach(function (id) {
+      var node = el(id); if (!enabled && node) node.hidden = true;
+    });
+    if (!enabled && state === LISTENING) cancel();
+    dotEvent(enabled);
+    return enabled;
+  }
+
+  function toggleEnabled() { return setEnabled(!dotEnabled()); }
+
+  function dotStoredPosition() {
+    try {
+      var raw = root.localStorage && root.localStorage.getItem(DOT_POSITION_KEY);
+      var value = raw && JSON.parse(raw);
+      if (value && isFinite(Number(value.left)) && isFinite(Number(value.top))) {
+        return {left: Number(value.left), top: Number(value.top)};
+      }
+    } catch (err) { /* storage is optional on an embedded surface */ }
+    return null;
+  }
+
+  function dotSize(dot) {
+    var box = null;
+    try { box = dot && dot.getBoundingClientRect && dot.getBoundingClientRect(); }
+    catch (err) { box = null; }
+    return {width: Math.max(1, Number(box && box.width) || 56),
+      height: Math.max(1, Number(box && box.height) || 56)};
+  }
+
+  function dotClamp(dot, left, top) {
+    var size = dotSize(dot);
+    var wide = Number(root.innerWidth) || size.width + DOT_EDGE * 2;
+    var high = Number(root.innerHeight) || size.height + DOT_EDGE * 2;
+    return {
+      left: Math.max(DOT_EDGE, Math.min(Number(left) || 0,
+        Math.max(DOT_EDGE, wide - size.width - DOT_EDGE))),
+      top: Math.max(DOT_EDGE, Math.min(Number(top) || 0,
+        Math.max(DOT_EDGE, high - size.height - DOT_EDGE)))
+    };
+  }
+
+  function dotPlace(dot, left, top, save) {
+    if (!dot) return null;
+    var point = dotClamp(dot, left, top);
+    dot.classList.toggle('pine-talk-moved', true);
+    dot.style.left = Math.round(point.left) + 'px';
+    dot.style.top = Math.round(point.top) + 'px';
+    dot.style.right = 'auto';
+    dot.style.bottom = 'auto';
+    try {
+      if (document.documentElement && document.documentElement.style) {
+        document.documentElement.style.setProperty('--pine-talk-left', dot.style.left);
+        document.documentElement.style.setProperty('--pine-talk-top', dot.style.top);
+      }
+      if (save && root.localStorage) {
+        root.localStorage.setItem(DOT_POSITION_KEY, JSON.stringify(point));
+      }
+    } catch (err) { /* moving the dot must still work without storage */ }
+    syncCollapseButton(dot);
+    return point;
+  }
+
+  function dotRestore(dot) {
+    var point = dotStoredPosition();
+    if (point) dotPlace(dot, point.left, point.top, false);
+  }
+
+  function dotKeepVisible(dot) {
+    if (!dot) return;
+    if (!dot.classList.contains('pine-talk-moved')) {
+      syncCollapseButton(dot);
+      return;
+    }
+    var box = null;
+    try { box = dot.getBoundingClientRect(); } catch (err) { box = null; }
+    if (!box) return;
+    dotPlace(dot, box.left, box.top, true);
+  }
+
+  function dotDrag(dot) {
+    var active = null;
+    var moved = false;
+    function finish(ev) {
+      if (!active || (ev && ev.pointerId !== active.id)) return;
+      try { if (dot.releasePointerCapture) dot.releasePointerCapture(active.id); }
+      catch (err) { /* the pointer may already be gone */ }
+      if (moved) {
+        dotPlace(dot, active.left + active.dx, active.top + active.dy, true);
+        /* The click that follows a drag must not start a recording. */
+        dot.__pineDragged = true;
+      }
+      dot.classList.toggle('pine-talk-moving', false);
+      active = null;
+    }
+    dot.addEventListener('pointerdown', function (ev) {
+      if (ev.button != null && ev.button !== 0) return;
+      var box = null;
+      try { box = dot.getBoundingClientRect(); } catch (err) { box = null; }
+      active = {id: ev.pointerId, x: Number(ev.clientX) || 0, y: Number(ev.clientY) || 0,
+        left: Number(box && box.left) || 0, top: Number(box && box.top) || 0, dx: 0, dy: 0};
+      moved = false;
+      try { if (dot.setPointerCapture) dot.setPointerCapture(ev.pointerId); }
+      catch (err) { /* capture is a convenience, not a requirement */ }
+    });
+    dot.addEventListener('pointermove', function (ev) {
+      if (!active || ev.pointerId !== active.id) return;
+      active.dx = (Number(ev.clientX) || 0) - active.x;
+      active.dy = (Number(ev.clientY) || 0) - active.y;
+      if (!moved && Math.hypot(active.dx, active.dy) < 8) return;
+      moved = true;
+      dot.classList.toggle('pine-talk-moving', true);
+      dotPlace(dot, active.left + active.dx, active.top + active.dy, false);
+      ev.preventDefault();
+    });
+    dot.addEventListener('pointerup', finish);
+    dot.addEventListener('pointercancel', finish);
+  }
+
+  var voiceAdWatcher = 0;
+  var voiceAdKnown = {};
+  var voiceAdPrimed = false;
+  function adNode(tag, cls, words) {
+    var node = document.createElement(tag);
+    node.className = cls || '';
+    node.textContent = words || '';
+    return node;
+  }
+  function voiceAdPopup(row) {
+    if (!row || el('pineVoiceAdPopup') || !root.PineAdViewer) return;
+    root.PineAdViewer.open(row);
+  }
+  function pollVoiceAds() {
+    if (!root.fetch && !(root.pineDesktop && root.pineDesktop.get)) return;
+    var read = root.pineDesktop && root.pineDesktop.get
+      ? root.pineDesktop.get('/api/generations?limit=40')
+      : root.fetch(where() + '/api/generations?limit=40').then(function (response) {
+      if (!response.ok) throw new Error('gallery unavailable');
+      return response.json();
+    });
+    read.then(function (payload) {
+      var ready = [];
+      (Array.isArray(payload && payload.generations) ? payload.generations : []).forEach(function (row) {
+        if (!row || String(row.purpose || '') !== 'voice_ad') return;
+        var id = String(row.prompt_id || ''); if (!id) return;
+        var was = voiceAdKnown[id];
+        voiceAdKnown[id] = String(row.status || '');
+        if (voiceAdPrimed && String(row.status || '') === 'done' && was !== 'done') ready.push(row);
+      });
+      voiceAdPrimed = true;
+      if (ready.length) voiceAdPopup(ready[0]);
+    }, function () { /* transient gallery trouble never blocks dictation */ });
+  }
+  function watchVoiceAds() {
+    if (voiceAdWatcher) return;
+    pollVoiceAds();
+    voiceAdWatcher = root.setInterval ? root.setInterval(pollVoiceAds, 7000) : 1;
+  }
+
   function mount() {
-    if (el('pineTalkDot')) return el('pineTalkDot');
+    if (el('pineTalkDot')) {
+      el('pineTalkDot').hidden = !dotEnabled() || dotCollapsed();
+      el('pineTalkDot').setAttribute('aria-hidden', el('pineTalkDot').hidden ? 'true' : 'false');
+      ensureCollapseButton(el('pineTalkDot'));
+      return el('pineTalkDot');
+    }
     /* Before anything else: put back whatever a previous life of this page
      * left ducked. See duck() for the measurement that made this needed. */
     try { unstick(); } catch (err) { /* never block the mount */ }
@@ -225,7 +485,15 @@
     dot.title = 'Hold a moment and speak - the station will hear you';
     dot.innerHTML = '<canvas id="pineTalkFx" class="pine-talk-fx"></canvas>'
       + '<i class="pine-talk-core"></i>';
-    dot.addEventListener('click', toggle);
+    dot.addEventListener('click', function (ev) {
+      if (dot.__pineDragged) {
+        dot.__pineDragged = false;
+        ev.preventDefault();
+        ev.stopPropagation();
+        return;
+      }
+      toggle(ev);
+    });
     /* 2026-09-14: the canvas is the voice window; a tap on it while
        listening cancels rather than sends (see cancel()). */
     var fx = dot.querySelector('#pineTalkFx');
@@ -242,9 +510,16 @@
       ev.preventDefault();
       micMenu();
     });
-    dot.title = 'Click and speak - the station will hear you. '
-      + 'Right-click to choose which microphone.';
+    dot.title = 'Tap to speak. Drag to move this control. Right-click to choose a microphone.';
     document.body.appendChild(dot);
+    dot.hidden = !dotEnabled() || dotCollapsed();
+    dot.setAttribute('aria-hidden', dot.hidden ? 'true' : 'false');
+    dotRestore(dot);
+    dotDrag(dot);
+    ensureCollapseButton(dot);
+    if (root.addEventListener) {
+      root.addEventListener('resize', function () { dotKeepVisible(dot); });
+    }
 
     var say = document.createElement('div');
     say.id = 'pineTalkSay';
@@ -258,7 +533,6 @@
     telemetry.hidden = true;
     telemetry.setAttribute('aria-hidden', 'true');
     telemetry.innerHTML = '<div class="pine-talk-phase" data-talk-phase>Capturing</div>'
-      + '<div class="pine-talk-input"><span>Input</span><div class="pine-talk-input-track" role="meter" aria-label="Microphone input level" aria-valuemin="0" aria-valuemax="100"><i></i><b title="Speech threshold"></b></div><output data-talk-db>-- dBFS</output></div>'
       + '<div class="pine-talk-spectrum" data-talk-spectrum></div>'
       + '<div class="pine-talk-spectrum-empty" data-talk-spectrum-empty>Spectrum unavailable</div>'
       + '<div class="pine-talk-metrics">'
@@ -278,6 +552,7 @@
       band.innerHTML = '<i></i><em></em>';
       telemetry.querySelector('[data-talk-spectrum]').appendChild(band);
     }
+    watchVoiceAds();
     return dot;
   }
 
@@ -444,7 +719,6 @@
     var telemetry = el('pineTalkTelemetry');
     if (telemetry) {
       telemetry.hidden = next === IDLE;
-      telemetry.setAttribute('aria-hidden', String(next === IDLE));
       telemetry.classList.toggle('field-capture', !!fieldCapture && next !== IDLE);
       telemetry.classList.toggle('transcribing', next === THINKING);
       telemetry.querySelector('[data-talk-phase]').textContent =
@@ -457,6 +731,15 @@
     dot.classList.toggle('listening', next === LISTENING);
     dot.classList.toggle('thinking', next === THINKING);
     dot.classList.toggle('field-capture', !!fieldCapture && next !== IDLE);
+    /* A small dot can safely sit near an edge; its capture surface cannot.
+       Re-clamp after the state class has changed and the browser knows its
+       expanded dimensions. */
+    if (dot.classList.contains('pine-talk-moved')) {
+      var settleDot = function () { dotKeepVisible(dot); };
+      if (root.requestAnimationFrame) root.requestAnimationFrame(settleDot);
+      else if (root.setTimeout) root.setTimeout(settleDot, 0);
+    }
+    syncCollapseButton(dot);
   }
 
   /* ---- ducking -------------------------------------------------------- */
@@ -675,17 +958,6 @@
     showMetric(telemetry, 'endpoint_timeout_ms', formatMs(timeout));
     showMetric(telemetry, 'remaining_ms', formatMs(remaining));
     showMetric(telemetry, 'threshold', formatAmplitude(threshold));
-    var peak = finite(metrics.peak);
-    var db = peak === null ? null : 20 * Math.log10(Math.max(0.000001, peak));
-    var level = db === null ? 0 : clamp01((db + 60) / 60);
-    var meter = telemetry.querySelector('.pine-talk-input-track');
-    meter.firstElementChild.style.width = (level * 100) + '%';
-    meter.setAttribute('aria-valuenow', String(Math.round(level * 100)));
-    meter.setAttribute('aria-valuetext', db === null ? 'Input unavailable' : Math.max(-60, db).toFixed(1) + ' dBFS');
-    meter.lastElementChild.hidden = finite(threshold) === null;
-    meter.lastElementChild.style.left = (clamp01((20 * Math.log10(Math.max(0.000001, Number(threshold) || 0)) + 60) / 60) * 100) + '%';
-    telemetry.querySelector('[data-talk-db]').textContent = db === null ? '-- dBFS' : (db <= -60 ? '< -60' : db.toFixed(1)) + ' dBFS';
-    telemetry.classList.toggle('clipping', peak !== null && peak >= 0.98);
     drawSpectrum(metrics.bands, now);
   }
 
@@ -1683,37 +1955,12 @@
   } catch (err) { /* not every engine has this */ }
 
   root.PineTalkDot = {
-    monitorInput: function (source, context) {
-      mount();
-      var telemetry = el('pineTalkTelemetry');
-      telemetry.hidden = false; telemetry.setAttribute('aria-hidden', 'false');
-      telemetry.querySelector('[data-talk-phase]').textContent = 'Microphone recording';
-      telemetry.classList.remove('transcribing');
-      var tap = context.createAnalyser(); tap.fftSize = 512; source.connect(tap);
-      var samples = new Float32Array(tap.fftSize), bins = new Uint8Array(tap.frequencyBinCount), timer;
-      function update() {
-        tap.getFloatTimeDomainData(samples); tap.getByteFrequencyData(bins);
-        var peak = 0, power = 0, bands = [];
-        samples.forEach(function (sample) { peak = Math.max(peak, Math.abs(sample)); power += sample * sample; });
-        for (var i = 0; i < 24; i++) {
-          var start = Math.floor(i * bins.length / 24), end = Math.floor((i + 1) * bins.length / 24), high = 0;
-          for (var j = start; j < end; j++) high = Math.max(high, bins[j]);
-          bands.push(high / 255);
-        }
-        renderTelemetry({peak:peak, rms:Math.sqrt(power / samples.length), bands:bands, level:peak, raw:{}}, performance.now(), null, false);
-        timer = root.requestAnimationFrame(update);
-      }
-      update();
-      return function () {
-        root.cancelAnimationFrame(timer);
-        try { source.disconnect(tap); tap.disconnect(); } catch (err) { /* capture has already stopped */ }
-        telemetry.hidden = true; telemetry.setAttribute('aria-hidden', 'true');
-      };
-    },
     mics: mics,
     useMic: useMic,
     micPin: micPin,
     mount: mount, listen: listen, finish: finish, duck: duck,
+    enabled: dotEnabled, setEnabled: setEnabled, toggle: toggleEnabled,
+    collapsed: dotCollapsed, setCollapsed: setCollapsed, restoreFromBar: restoreFromBar,
     /* `act` is the door for a sentence that arrived some other way - a
      * wake word, a typed command, or a test - and it deliberately does
      * everything the spoken road does from the transcript onwards:
@@ -1742,7 +1989,8 @@
     report: reportOpen,
     state: function () { return state; }
   };
-  /* Each field and microphone share a containing block, including in popups. */
+  /* Field dictation follows each field through nested scrolling. Established
+   * forms use a fixed overlay; popups may opt into a local inline mount. */
   if (root.document && root.document.addEventListener) {
     var fieldButtons = new Map();
     var fieldLayer = root.document.createElement('div');
@@ -1773,6 +2021,7 @@
     }
     function textField(node) {
       if (!node || node.disabled || node.readOnly) return false;
+      if (node.hasAttribute && node.hasAttribute('data-pine-mic-owned')) return false;
       if (node.tagName === 'TEXTAREA') return true;
       if (node.tagName === 'INPUT') return /^(text|search|url|email|tel|number)$/.test(node.type || 'text');
       return node.isContentEditable === true && !node.parentElement?.isContentEditable;
@@ -1786,46 +2035,52 @@
     }
     function placeMic(field, button, hitTest) {
       if (!field.isConnected || !textField(field)) { setMicHidden(button, true); return; }
-      var host = field.parentElement;
-      if (!host) return;
-      if (!host.classList.contains('pine-dictation-field')) {
-        var computed = root.getComputedStyle(field);
-        var typed = field.computedStyleMap ? field.computedStyleMap() : null;
-        var focused = root.document.activeElement === field;
-        var selectionStart = field.selectionStart, selectionEnd = field.selectionEnd;
-        var wrapper = root.document.createElement('span');
-        wrapper.className = 'pine-dictation-field';
-        wrapper.style.cssText = 'position:relative;display:inline-grid;vertical-align:middle;min-width:0;box-sizing:border-box';
-        // Keep percentage and flex sizing in the form's original layout slot.
-        ['width', 'min-width', 'max-width', 'flex', 'align-self', 'justify-self',
-          'grid-area', 'order', 'margin-top', 'margin-right', 'margin-bottom', 'margin-left'].forEach(function (property) {
-          var value = typed && typed.get(property);
-          wrapper.style.setProperty(property, value ? String(value) : computed.getPropertyValue(property));
-        });
-        if (computed.display === 'block' || computed.display === 'flex' || computed.display === 'grid') wrapper.style.display = 'grid';
-        host.insertBefore(wrapper, field);
-        wrapper.appendChild(field);
-        field.classList.add('pine-dictation-input');
-        field.style.setProperty('width', '100%', 'important');
-        field.style.setProperty('min-width', '0', 'important');
-        field.style.setProperty('box-sizing', 'border-box', 'important');
-        field.style.setProperty('margin', '0', 'important');
-        host = wrapper;
-        if (focused) {
-          field.focus({preventScroll: true});
-          if (field.setSelectionRange && selectionStart !== null) {
-            try { field.setSelectionRange(selectionStart, selectionEnd); } catch (err) { /* number/email fields have no selection API */ }
-          }
-        }
+      var rect = field.getBoundingClientRect();
+      var view = viewport();
+      var size = Math.min(32, Math.max(0, rect.height - 4), Math.max(0, rect.width - 4));
+      var inline = button.classList.contains('pine-field-mic-inline');
+      var x = rect.right - size - 3;
+      var y = rect.top + Math.max(2, (rect.height - size) / 2);
+      setMicHidden(button, size < 22 || rect.width < 48 || rect.right <= 0
+        || rect.left >= view.width || rect.bottom <= 0 || rect.top >= view.height
+        || !!(field.closest && field.closest('[hidden], [aria-hidden="true"]')));
+      if (inline) {
+        button.style.width = size + 'px';
+        button.style.height = size + 'px';
+        return;
       }
-      if (button.parentElement !== host) host.appendChild(button);
-      setMicHidden(button, field.hidden || field.getAttribute('aria-hidden') === 'true');
+      /* An elementFromPoint walks the whole document. Do it on first reveal
+         and focus, not after every live-feed DOM change. The observer below
+         keeps the ordinary placement set to fields that are actually visible. */
+      if (hitTest && !button.hidden && root.document.elementFromPoint) {
+        button.style.pointerEvents = 'none';
+        var hit = root.document.elementFromPoint(
+          Math.max(rect.left + 2, Math.min(rect.right - 2, rect.left + rect.width / 2)),
+          Math.max(rect.top + 2, Math.min(rect.bottom - 2, rect.top + rect.height / 2)));
+        button.style.pointerEvents = '';
+        if (hit !== field && !(field.contains && field.contains(hit))) button.hidden = true;
+      }
+      if (button.hidden) return;
+      button.style.width = size + 'px';
+      button.style.height = size + 'px';
+      button.style.left = x + 'px';
+      button.style.top = y + 'px';
     }
     function placeTelemetry() {
       var telemetry = el('pineTalkTelemetry');
-      if (!telemetry) return;
-      // One viewport dock stays visible above every popup and keyboard layout.
-      ['left', 'top', 'width', 'height'].forEach(function (property) { telemetry.style.removeProperty(property); });
+      if (!telemetry || !fieldCapture || !fieldCapture.isConnected) return;
+      var rect = fieldCapture.getBoundingClientRect();
+      var view = viewport();
+      var width = Math.min(540, Math.max(230, view.width - 16));
+      var belowSpace = Math.max(0, view.height - rect.bottom - 5);
+      var aboveSpace = Math.max(0, rect.top - 5);
+      var below = belowSpace >= 58 || belowSpace >= aboveSpace;
+      var height = Math.min(72, Math.max(50, below ? belowSpace : aboveSpace));
+      var top = below ? rect.bottom + 2 : Math.max(2, rect.top - height - 2);
+      telemetry.style.left = Math.max(8, Math.min(view.width - width - 8, rect.left)) + 'px';
+      telemetry.style.top = top + 'px';
+      telemetry.style.width = width + 'px';
+      telemetry.style.height = height + 'px';
     }
     function placeAll(hitTest) {
       var fields = fieldObserver ? visibleFields : fieldButtons;
@@ -1876,7 +2131,7 @@
       if (!field.style || !field.style.setProperty) return;
       var style = root.getComputedStyle ? root.getComputedStyle(field) : null;
       var right = style ? parseFloat(style.paddingRight) || 0 : 0;
-      field.style.setProperty('padding-right', Math.max(38, right) + 'px', 'important');
+      field.style.setProperty('padding-right', (right + 36) + 'px', 'important');
     }
     function appendWords(field, words) {
       if (!field || !field.isConnected || !words) return;
@@ -1925,7 +2180,9 @@
       else finishWhenReady = true;
     }
     function makeMic(field) {
-      reserveSpace(field);
+      var inlineContainer = field.hasAttribute('data-pine-mic-inline')
+        && field.closest && field.closest('[data-pine-mic-container]');
+      if (!inlineContainer) reserveSpace(field);
       var button = root.document.createElement('button');
       var pressedAt = 0;
       var wasListening = false;
@@ -1933,9 +2190,7 @@
       var held = false;
       button.type = 'button';
       button.className = 'pine-field-mic';
-      button.style.cssText = 'position:absolute;z-index:2;inset:4px 4px auto auto;box-sizing:border-box;width:28px;height:28px;max-height:calc(100% - 8px);padding:4px;border:0;border-radius:4px;background:#19272d;color:#b5edf0;cursor:pointer';
-      button.style.setProperty('min-height', '0', 'important');
-      button.style.setProperty('min-width', '0', 'important');
+      if (inlineContainer) button.classList.add('pine-field-mic-inline');
       button.hidden = true;
       button.title = 'Tap to dictate or stop; hold to talk and release to transcribe';
       button.setAttribute('aria-label', button.title);
@@ -1973,8 +2228,8 @@
         if (event.detail !== 0) return;
         if (micBusy) stopMic(); else startMic(field, button);
       });
-      var host = field.parentElement || fieldLayer;
-      if (host && host.appendChild) host.appendChild(button);
+      if (inlineContainer) inlineContainer.appendChild(button);
+      else if (fieldLayer.appendChild) fieldLayer.appendChild(button);
       return button;
     }
     (root.document.body || root.document.documentElement).appendChild(fieldLayer);

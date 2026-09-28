@@ -1229,7 +1229,7 @@
       /* Ready: the panel's document is up, every fact that was going to land
          has landed and been released, and the scene has had its floor ON
          SCREEN rather than merely in memory.
-         
+
          And then the GRACE, which is the answer to a measurement. Waiting for
          all ten facts pushed the handover to first paint + 3.5 s on a run
          where /api/dj took its time, and every millisecond past the floor is
