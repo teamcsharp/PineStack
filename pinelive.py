@@ -43,6 +43,17 @@ call_soon_threadsafe.
 """
 from __future__ import annotations
 
+# [pinelive-req] With string annotations (the future import above), FastAPI
+# resolves 'Request'/'Header' against THIS module's globals - so the names
+# must live here, not only inside install(). Guarded: the pure tests
+# import this module without fastapi installed.
+try:
+    from fastapi import Header, HTTPException, Request
+    from fastapi.responses import HTMLResponse, StreamingResponse
+except ImportError:                                       # pragma: no cover
+    Header = HTTPException = Request = None  # type: ignore[assignment]
+    HTMLResponse = StreamingResponse = None  # type: ignore[assignment]
+
 import asyncio
 import base64
 import hashlib
