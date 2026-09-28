@@ -1568,11 +1568,15 @@
     var node = nodeFor({id: id});
     var pre = node.querySelector('.pcl-console');
     var line = '[' + clock() + '] ' + String(text || '');
+    /* [autoscroll-rule] followed, and trimmed, only while the reader is at
+       the tail; one scrolled back keeps the line they were reading */
+    var stick = root.pineStick ? root.pineStick(pre, {edge: 'bottom'}) : null;
+    var atTail = stick ? stick.following() : true;
     var lines = pre.textContent ? pre.textContent.split(nl()) : [];
     lines.push(line);
-    if (lines.length > 200) lines = lines.slice(lines.length - 200);
+    if (atTail && lines.length > 200) lines = lines.slice(lines.length - 200);
     pre.textContent = lines.join(nl());
-    pre.scrollTop = pre.scrollHeight;
+    if (stick) stick.follow();
     node.classList.add('pcl-spoke');
   }
 

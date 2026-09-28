@@ -483,6 +483,33 @@
 
   let scriptPrint = "";
 
+  /* [autoscroll-rule] the reader scrolled this pane off the live line (or,
+     with nothing live, off the end): held until they come back to it. */
+  let scriptHeld = false;
+  function scriptWatch(box) {
+    if (box.__pvScriptWatch) return;
+    box.__pvScriptWatch = true;
+    box.addEventListener("scroll", () => {
+      const live = box.querySelector(".pv-line.live");
+      if (!live) {
+        scriptHeld = box.scrollHeight - box.scrollTop - box.clientHeight > 24;
+        return;
+      }
+      const lip = box.getBoundingClientRect();
+      const seat = live.getBoundingClientRect();
+      scriptHeld = !(seat.bottom > lip.top && seat.top < lip.bottom);
+    }, {passive: true});
+  }
+  /* Inside this pane only - never an ancestor, never the page - and in one
+     exact assignment, so no animation is in flight for the next paint. */
+  function scriptCentre(box, line) {
+    const lip = box.getBoundingClientRect();
+    const seat = line.getBoundingClientRect();
+    if (!(lip.height > 0 && seat.height > 0)) return;
+    const delta = (seat.top + seat.height / 2) - (lip.top + lip.height / 2);
+    if (Math.abs(delta) >= 1) box.scrollTop = Math.max(0, box.scrollTop + delta);
+  }
+
   function paintScript() {
     const box = el("pvScript");
     if (!box) return;
@@ -494,6 +521,11 @@
     if (print === scriptPrint) return;
     scriptPrint = print;
 
+    scriptWatch(box);   // [autoscroll-rule]
+    const stick = root.pineStick
+      ? root.pineStick(box, {key: "data-line", button: false}) : null;
+    const hold = stick && (scriptHeld || stick.examining()) ? stick.anchor(true) : null;
+    let liveLine = null;
     box.replaceChildren();
     for (const row of shown) {
       const line = document.createElement("p");
@@ -513,8 +545,10 @@
       line.appendChild(who);
       line.appendChild(text);
       box.appendChild(line);
-      if (live) line.scrollIntoView({ block: "center", behavior: "smooth" });
+      if (live) liveLine = line;   // [autoscroll-rule]
     }
+    if (hold) stick.restore(hold, false);
+    else if (liveLine) scriptCentre(box, liveLine);
   }
 
   /* --------------------------------------------------------------- feed */
@@ -621,6 +655,10 @@
      * screen are left alone. The station caps its own ring at 240
      * (app.py:25061), and the list is trimmed from the TOP to match - the
      * end is where the conversation is. */
+    /* [autoscroll-rule] the end is followed only by a reader at it who is
+       not examining a row; what arrives otherwise is counted on the button */
+    const feedStick = root.pineStick
+      ? root.pineStick(list, {edge: "bottom", slack: 40}) : null;
     const atEnd = list.scrollTop + list.clientHeight >= list.scrollHeight - 40;
     const drawn = feedDrawn;
     const fresh = rows.filter((row) => row && row.id && !drawn[row.id]);
@@ -659,7 +697,8 @@
     }
     /* Follow the conversation only for a reader who was already at the end.
      * Someone who scrolled up to read something is not dragged back down. */
-    if (atEnd) list.scrollTop = list.scrollHeight;
+    if (feedStick) feedStick.follow();   // [autoscroll-rule]
+    else if (atEnd) list.scrollTop = list.scrollHeight;
   }
 
   function paintFeedTally() {

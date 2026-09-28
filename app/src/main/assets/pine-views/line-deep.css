@@ -51,3 +51,19 @@
 .ld-passage-grade { color: var(--cyan, #65c7da); }
 .ld-passage-how, .ld-passage-missing { color: var(--muted, #8fa0ad); }
 .ld-crystal-meta { max-height: 170px; }
+
+/* [s3-focus] the "3": System 3, focused on this line - in the head's empty middle. */
+.ld-head > .ld-s3 {
+  flex: 0 0 auto; min-width: 46px; height: 36px; padding: 0 10px;
+  display: inline-flex; align-items: center; justify-content: center;
+  border: 1px solid var(--cyan, #65c7da); border-radius: 8px;
+  background: var(--panel-2, #222b35); color: var(--cyan, #65c7da);
+  font: 700 17px/1 system-ui, sans-serif; cursor: pointer;
+}
+.ld-head > .ld-s3 svg { width: 30px; height: 30px; fill: currentColor; }
+.ld-head > .ld-s3:not(:disabled):hover, .ld-head > .ld-s3:focus-visible {
+  background: #1d3a37; outline: 2px solid var(--cyan, #65c7da); outline-offset: 1px;
+}
+.ld-head > .ld-s3:disabled { opacity: .5; cursor: wait; }
+/* while System 3 is focused on its line the window steps aside, as it was left (its flex display would beat [hidden]) */
+.ld-box[hidden] { display: none !important; }
