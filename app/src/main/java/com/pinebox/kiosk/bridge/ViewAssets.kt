@@ -44,6 +44,13 @@ object ViewAssets {
         "pine-dismiss.js",        // tap away and a panel closes - one rule
         "view-chrome.js",         // the shared bar, tree and transport
         "console-line.js",        // the one-line backend readout, all screens
+        // PineLive: the mic badge in that same bottom line, and the popup
+        // behind it. scope (the waterfall) and guide (the troubleshooter)
+        // before pinelive.js, which mounts into #pineConsoleLine when
+        // console-line.js has built it - same order as the desktop chrome.
+        "pinelive-scope.js",
+        "pinelive-guide.js",
+        "pinelive.js",
         "changelog.js",           // Git-backed task history from the audit footer
         "console-trace.js",       // tap that line: where the work came from
         "audio-law.js",           // ONE door to every level and route
@@ -143,6 +150,7 @@ object ViewAssets {
         "sfx-tv.css",             // #1306b: the set, its glass and its sheet
         "clip-doctor.css",        // #1361b: the doctor's sheet
         "pine-cam.css",           // #1358: the box and the flag
+        "pinelive.css",           // the mic badge and the MX Live popup
         // #1191/#1202: the glass, its triangles and its headline number. Same
         // finding as the script above - the file was in assets and in no
         // list, so on the tablet the pop-up would have opened unstyled if
