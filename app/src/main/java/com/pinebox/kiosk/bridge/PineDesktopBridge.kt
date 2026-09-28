@@ -63,6 +63,9 @@ class PineDesktopBridge(
     companion object {
         const val NAME = "__pineNative"
         private const val TAG = "PineBridge"
+        /* The Pine Cam relay's door on the station host - see camUrl(). */
+        private const val CAM_PORT = 8098
+        private const val CAM_PATH = "/live.ts"
 
         /* Why the LCD and the provisioner are refused here rather than
          * forwarded. Both drive hardware attached to the BOX: the LCD is a
@@ -115,6 +118,9 @@ class PineDesktopBridge(
             /* #1426: the native endless-video surface. */
             "videoWall",
             "splicePreview",
+            /* The Pine Cam, played natively off the host's live TS - see
+             * video/PineCamWall.kt. */
+            "pineCam",
             /* #1148: "Whenever I access the screen capture to follow
              * report, I also want to be able to scrub between the last
              * five seconds of the broadcast to find the right frame." */
@@ -557,6 +563,10 @@ class PineDesktopBridge(
                     .put("rested", com.pinebox.kiosk.net.Revive.rested(context))
                     .put("sinceMs", com.pinebox.kiosk.net.Revive.sinceMs(context))
                     .put("inARow", com.pinebox.kiosk.net.Revive.inARow(context))
+                    /* And the loopback door's own ledger, because "the
+                     * WebView is deaf" and "the door is wedged" look the
+                     * same from the page and are cured differently. */
+                    .put("door", com.pinebox.kiosk.net.LoopDoor.stats())
                     .toString())
             }
         }
@@ -1400,6 +1410,56 @@ class PineDesktopBridge(
             }
         }
 
+        /* THE PINE CAM ON A NATIVE SURFACE. The dashcam used to reach the
+         * page as a 4 fps JPEG poll painted at 6 fps; the host now offers a
+         * 30 fps progressive MPEG-TS and only a SurfaceView can show it at
+         * that rate - see video/PineCamWall.kt. Same shape as `videoWall`:
+         * the page says WHERE and WHETHER, the answer is always the wall's
+         * own state, and a build with no wall answers on:false so the page
+         * keeps its poll. */
+        "pineCam" -> {
+            val cam = pineCam
+            val want = args.optString(0, "state")
+            val arg = args.optJSONObject(1)
+            if (cam == null) {
+                BridgeEnvelope.ok(id, JSONObject().put("ok", false).put("on", false)
+                    .put("say", "no cam wall on this build").toString())
+            } else {
+                /* A rect rides along with `on` and `box`, in device pixels;
+                 * 0x0 means the whole glass, as the set's setBox reads it. */
+                fun boxOf(o: JSONObject?) {
+                    if (o != null && (o.has("w") || o.has("h"))) {
+                        cam.setBox(o.optInt("x"), o.optInt("y"), o.optInt("w"), o.optInt("h"))
+                    }
+                }
+                var known = true
+                when (want) {
+                    "on" -> {
+                        boxOf(arg)
+                        val url = arg?.optString("url", "")?.trim().orEmpty()
+                            .ifEmpty { camUrl(arg) }
+                        cam.play(url)
+                    }
+                    "box" -> boxOf(arg)
+                    "off" -> cam.stop()
+                    "hide" -> cam.hide()
+                    "show" -> cam.show()
+                    "menu" -> cam.menu(arg?.optBoolean("on", true) ?: true)
+                    "free" -> cam.free()
+                    "full" -> cam.showFullScreen()
+                    "window" -> cam.showWindowed()
+                    "state" -> Unit
+                    else -> known = false
+                }
+                if (!known) {
+                    BridgeEnvelope.ok(id, JSONObject().put("ok", false)
+                        .put("say", "no such pineCam verb: $want").toString())
+                } else {
+                    BridgeEnvelope.ok(id, cam.state().put("ok", true).toString())
+                }
+            }
+        }
+
         "hotCorners" -> BridgeEnvelope.ok(id, HotCorners.read(configStore).toString())
 
         "hotCornersSet" -> BridgeEnvelope.ok(id,
@@ -1562,6 +1622,27 @@ class PineDesktopBridge(
      * the numbers. The page's job is now only to say WHERE and WHETHER. */
     @Volatile var videoWall: com.pinebox.kiosk.video.PineVideoWall? = null
     @Volatile var splicePreview: com.pinebox.kiosk.video.PineSplicePreview? = null
+
+    /* THE PINE CAM, on its own native surface, for the same reason. Installed
+     * by MainActivity beside the wall; null on a build with no root view. */
+    @Volatile var pineCam: com.pinebox.kiosk.video.PineCamWall? = null
+
+    /**
+     * WHERE THE CAMERA'S STREAM IS: the HOST of the station base the
+     * kiosk is actually talking to (LAN or tailnet, whichever Reach
+     * settled on), on the relay's own port. Not the loopback door - the
+     * door is for the WebView's origin, and this player is not in the
+     * WebView; and not 127.0.0.1 for the same reason.
+     */
+    private suspend fun camUrl(arg: JSONObject?): String {
+        val base = com.pinebox.kiosk.net.Reach.base(configStore.read())
+        val host = Uri.parse(base).host?.takeIf { it.isNotBlank() }
+            ?: base.removePrefix("http://").removePrefix("https://")
+                .substringBefore('/').substringBefore(':')
+        val port = arg?.optInt("port", 0)?.takeIf { it > 0 } ?: CAM_PORT
+        val path = arg?.optString("path", "")?.trim().orEmpty().ifEmpty { CAM_PATH }
+        return "http://" + host + ":" + port + (if (path.startsWith("/")) path else "/$path")
+    }
 
     /**
      * HOW LOUD IT IS RIGHT NOW, 0..1.

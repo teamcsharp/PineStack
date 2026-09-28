@@ -18,6 +18,13 @@
  * the desktop and the tablet, and for a corner-of-the-screen preview is
  * indistinguishable. The recordings keep the full stream.
  *
+ * #1470: ...FOR A PREVIEW. Watched as a monitor it was four stills a
+ * second in a page that paints six frames a second, with one still in
+ * five thrown away because the next request cancelled it. On the tablet
+ * the picture now leaves the page: the kiosk plays the supervisor's
+ * MPEG-TS door natively on a SurfaceView (pineDesktop.pineCam), and this
+ * file only tells it where the box is. See "the native picture" below.
+ *
  * It is deliberately the same shape as the SFX TV set (#1263): body-level,
  * draggable, remembers where you left it.
  */
@@ -36,6 +43,37 @@
   var busy = false;
   var shown = false;
   var live = false;
+
+  /* #1470: THE NATIVE PICTURE. On the tablet the kiosk offers
+   * pineDesktop.pineCam(verb, arg): an ExoPlayer on a SurfaceView above
+   * the WebView, playing the supervisor's MPEG-TS door (state.ts) at the
+   * camera's full 30 fps about half a second behind live. The WebView
+   * itself paints at 6 fps whatever it holds - measured 2026-09-27 with
+   * this box open and closed alike - so no <img> or <video> in this page
+   * can ever be smooth; the picture has to leave the page. The <img>
+   * stays underneath as the poster and the fallback, slowed to one a
+   * second while the surface is up. The desktop has no pineCam and keeps
+   * the JPEG road exactly as it was. */
+  var NATIVE_POSTER_MS = 1000;
+  var tsInfo = null;           /* state.ts while the door is up, else null */
+  var nativeOn = false;
+  var nativeFull = false;
+  var nativeAsked = false;     /* an 'on' is in flight */
+  var boxMoveRaf = 0;
+  var lastBoxKey = '';
+
+  /* 2026-09-27: "put a small arrow that if I tap it it collapses the
+   * header ... making the pop-up just a window. And then if I double tap
+   * the PineCam video, then show the header again ... and by default hide
+   * the header because I don't need it anymore." The bar folds away (the
+   * arrow, or a double tap on the picture) and comes back on a double tap;
+   * every open starts bare. A single tap keeps its meaning (full screen on
+   * the native picture) and waits a third of a second first, so a double
+   * tap is never read as two of them. */
+  var BARE_DEFAULT = true;
+  var bare = false;
+  var tapAt = 0;
+  var tapTimer = 0;
 
   /* #1358: AND IT HAD NO ANSWER AT ALL OFF THE DESKTOP.
    *
@@ -185,6 +223,7 @@
       moved = true;
       el.style.left = Math.max(0, Math.min(window.innerWidth - 60, from.left + dx)) + 'px';
       el.style.top = Math.max(0, Math.min(window.innerHeight - 40, from.top + dy)) + 'px';
+      if (el === box) nativeBoxSoon();     /* #1470: the surface follows the finger */
     });
     var drop = function (ev) {
       if (!from || (ev && ev.pointerId !== from.id)) return;
@@ -209,6 +248,9 @@
       /* 2026-09-14: record from the box itself, into the record location;
        * fold the box to a live circle; close. Carbon through pineIcon with
        * a word behind each, never an emoji. */
+      + '<button type="button" class="pine-cam-fold pine-cam-hdr" id="pineCamHdr" '
+      + 'aria-label="Hide the header" title="Fold the header away - double-tap the picture to bring it back">'
+      + icon('c:arrow--up', 'Hide header', '^') + '</button>'
       + '<button type="button" class="pine-cam-rec" id="pineCamBoxRec" '
       + 'aria-label="Record" title="Record: mark the start, press again to end the clip and keep it in the record location">'
       + icon('c:recording--filled', 'Record', 'REC') + '</button>'
@@ -222,10 +264,24 @@
     document.body.appendChild(box);
     place(box);
     /* The whole box is the handle; a tap on the folded circle unfolds it. */
-    drag(box, box, null, function () { if (box.classList.contains('pine-cam-round')) setRound(false); });
+    drag(box, box, null, function () {
+      if (box.classList.contains('pine-cam-round')) { setRound(false); return; }
+      pictureTapped(null);                 /* a double tap toggles the header */
+    });
     box.querySelector('.pine-cam-x').addEventListener('click', function (ev) { ev.stopPropagation(); close(); });
     box.querySelector('#pineCamFold').addEventListener('click', function (ev) { ev.stopPropagation(); setRound(true); });
+    box.querySelector('#pineCamHdr').addEventListener('click', function (ev) { ev.stopPropagation(); setBare(true); });
     box.querySelector('#pineCamBoxRec').addEventListener('click', function (ev) { ev.stopPropagation(); boxRecord(); });
+    /* #1470: the first JPEG sets the picture's height, and only then is
+     * there a rectangle to hand the surface; a resize or a drag moves it. */
+    var img0 = box.querySelector('#pineCamImg');
+    if (img0) {
+      img0.addEventListener('load', function () { if (nativeOn) nativeBoxSoon(); else nativeStart(); });
+      try {
+        if (root.ResizeObserver) new ResizeObserver(function () { nativeBoxSoon(); }).observe(img0);
+      } catch (e) { /* no observer: the load hook and the drag still send it */ }
+    }
+    root.addEventListener('resize', nativeBoxSoon);
     try { if (localStorage.getItem(ROUND_KEY) === '1') setRound(true); } catch (e) { /* stays open */ }
     return box;
   }
@@ -241,6 +297,10 @@
     box.classList.toggle('pine-cam-round', !!on);
     try { localStorage.setItem(ROUND_KEY, on ? '1' : '0'); } catch (e) { /* forgotten */ }
     if (!on) place(box);                   /* back to the remembered size */
+    /* #1470: the circle is a CSS clip, which a SurfaceView cannot follow.
+     * The round window stays on the JPEG road; the rectangle brings the
+     * surface back. */
+    if (on) nativeStop(); else nativeStart();
   }
 
   /* 2026-09-14: THE RECORD BUTTON ON THE BOX. "offer a recording button
@@ -307,12 +367,15 @@
     build();
     shown = true;
     box.hidden = false;
+    setBare(BARE_DEFAULT);                 /* just the window, until asked */
     paintFrame();
     if (!frameTimer) frameTimer = setInterval(paintFrame, FRAME_MS);
+    nativeStart();                         /* #1470: the surface, where there is one */
     repaintPicture();                      /* #1118: the ladder's last rung is this box */
   }
 
   function close() {
+    nativeStop();                          /* #1470: before the box goes */
     shown = false;
     if (box) box.hidden = true;
     if (frameTimer) { clearInterval(frameTimer); frameTimer = 0; }
@@ -320,6 +383,218 @@
   }
 
   function toggle() { if (shown) { close(); } else { open(); } }
+
+  /* ------------------------------------------------ the native picture */
+
+  function nativeBridge() {
+    try {
+      var b = root.pineDesktop;
+      return (b && typeof b.pineCam === 'function') ? b : null;
+    } catch (e) { return null; }
+  }
+
+  function nativeAsk(verb, arg) {
+    var b = nativeBridge();
+    if (!b) return Promise.resolve(null);
+    try { return Promise.resolve(b.pineCam(verb, arg || {})); }
+    catch (e) { return Promise.resolve(null); }
+  }
+
+  /* The picture's rectangle in DEVICE pixels - the SurfaceView is laid
+   * out by Android, not by CSS. NOT devicePixelRatio: on this tablet that
+   * reads 1.25 while the glass is 1340 px across a 1154 px viewport, so
+   * the true factor is 1.161 and the ratio put the surface 41 px right
+   * and 16 px low, clamped into the corner (measured 2026-09-27; the same
+   * trap the tap notes record). `screen.width` is the glass in CSS px at
+   * scale 1, so glass = screen.width x ratio, and the factor is glass
+   * over viewport - one for each axis. */
+  function camScale() {
+    var d = Number(root.devicePixelRatio) || 1;
+    var sx = d, sy = d;
+    try {
+      var gw = Number(root.screen && root.screen.width) * d;
+      var gh = Number(root.screen && root.screen.height) * d;
+      if (gw > 0 && root.innerWidth > 0) sx = gw / root.innerWidth;
+      if (gh > 0 && root.innerHeight > 0) sy = gh / root.innerHeight;
+      if (!(sx > 0.2 && sx < 8)) sx = d;
+      if (!(sy > 0.2 && sy < 8)) sy = d;
+    } catch (e) { sx = d; sy = d; }
+    return {x: sx, y: sy};
+  }
+
+  function camRect() {
+    var img = document.getElementById('pineCamImg');
+    if (!img || !box || box.hidden) return null;
+    var r = img.getBoundingClientRect();
+    if (!(r.width > 0) || !(r.height > 0)) return null;
+    var s = camScale();
+    return {x: Math.round(r.left * s.x), y: Math.round(r.top * s.y),
+            w: Math.round(r.width * s.x), h: Math.round(r.height * s.y)};
+  }
+
+  function nativeWanted() {
+    return !!(nativeBridge() && tsInfo && shown && box
+              && !box.classList.contains('pine-cam-round'));
+  }
+
+  function setFrameTimer(ms) {
+    if (frameTimer) { clearInterval(frameTimer); frameTimer = 0; }
+    if (shown) frameTimer = setInterval(paintFrame, ms);
+  }
+
+  /* While the surface is up the poster underneath is blanked, not just
+   * covered: the two are laid out by different engines, and any moment
+   * they disagree - a drag in flight, a scale off by a few px - would
+   * otherwise show the camera twice. It comes back for a sheet (`menu`)
+   * and when the surface goes. The <img> keeps loading at one a second
+   * so what comes back is recent. */
+  function posterShown(on) {
+    var img = document.getElementById('pineCamImg');
+    if (!img) return;
+    img.style.opacity = on ? '' : '0';
+  }
+
+  /* The header, folded away or back. The picture moves up or down by one
+   * bar, so the surface is told again. */
+  function setBare(on) {
+    if (!box) return;
+    bare = !!on;
+    box.classList.toggle('pine-cam-bare', bare);
+    var b = document.getElementById('pineCamHdr');
+    if (b) b.setAttribute('aria-expanded', bare ? 'false' : 'true');
+    lastBoxKey = '';
+    nativeBoxSoon();
+  }
+
+  /* One tap or two. A second tap inside 350 ms is a double tap and toggles
+   * the header; a lone tap does `single` once the window has passed. Both
+   * the native surface (tapPicture) and the page's own box (the drag
+   * handle's tap) arrive here, so the two roads behave the same. */
+  function pictureTapped(single) {
+    var now = Date.now();
+    if (tapAt && now - tapAt < 350) {
+      tapAt = 0;
+      if (tapTimer) { clearTimeout(tapTimer); tapTimer = 0; }
+      setBare(!bare);
+      return;
+    }
+    tapAt = now;
+    if (tapTimer) clearTimeout(tapTimer);
+    tapTimer = setTimeout(function () {
+      tapTimer = 0;
+      tapAt = 0;
+      if (single) { try { single(); } catch (e) { /* a tap is a courtesy */ } }
+    }, 350);
+  }
+
+  function nativeStart() {
+    if (nativeOn || nativeAsked || !nativeWanted()) return;
+    var r = camRect();
+    if (!r) return;                        /* the first JPEG sets the height; the load hook retries */
+    nativeAsked = true;
+    lastBoxKey = '';
+    nativeAsk('on', {port: tsInfo.port, path: tsInfo.path, url: tsInfo.url,
+                     x: r.x, y: r.y, w: r.w, h: r.h}).then(function (st) {
+      nativeAsked = false;
+      if (!st || st.ok === false) return;  /* the JPEG road stands */
+      if (!shown || !nativeWanted()) { nativeAsk('off'); return; }
+      nativeOn = true;
+      nativeFull = !!st.full;
+      if (box) box.classList.add('pine-cam-native');
+      setFrameTimer(NATIVE_POSTER_MS);
+      posterShown(false);
+      nativeBox();                         /* the box may have moved while asked */
+    }, function () { nativeAsked = false; });
+  }
+
+  function nativeStop() {
+    nativeFull = false;
+    posterShown(true);
+    if (box) box.classList.remove('pine-cam-native', 'pine-cam-sliding');
+    if (!nativeOn && !nativeAsked) return;
+    nativeOn = false;
+    lastBoxKey = '';
+    nativeAsk('off');
+    if (shown) setFrameTimer(FRAME_MS);
+  }
+
+  /* Native -> page: the finger is sliding the surface. The frame this page
+   * draws around the picture would otherwise stand where the box WAS until
+   * the release - a ghost of the window - so it goes with the drag and
+   * comes back where the surface settles (wallBoxChanged lands first). */
+  function dragPicture(on) {
+    if (!box) return;
+    box.classList.toggle('pine-cam-sliding', !!on);
+  }
+
+  function nativeBox() {
+    if (!nativeOn || nativeFull) return;
+    var r = camRect();
+    if (!r) return;
+    var key = r.x + ',' + r.y + ',' + r.w + ',' + r.h;
+    if (key === lastBoxKey) return;        /* the poster's load fires every second */
+    lastBoxKey = key;
+    nativeAsk('box', r);
+  }
+
+  function nativeBoxSoon() {
+    if (!nativeOn || boxMoveRaf) return;
+    boxMoveRaf = requestAnimationFrame(function () { boxMoveRaf = 0; nativeBox(); });
+  }
+
+  /* Sheets cannot paint over a SurfaceView, so while one is up the
+   * surface is retired (`menu`) and the poster underneath, one a second,
+   * stands in; `free` puts it back. Same contract as the SFX set's wall. */
+  function nativeMenu(on) {
+    if (!nativeOn) return;
+    posterShown(!!on);
+    nativeAsk(on ? 'menu' : 'free');
+  }
+
+  /* Native -> page. A tap on the picture toggles full screen; a drag on
+   * the surface moves the box here to match, so the two never disagree
+   * about where the camera is. Both arrive in device pixels. */
+  function tapPicture() {
+    if (!nativeOn) return;
+    pictureTapped(toggleFull);
+  }
+
+  function toggleFull() {
+    if (!nativeOn) return;
+    if (nativeFull) {
+      nativeFull = false;
+      lastBoxKey = '';
+      nativeAsk('window').then(function () { nativeBox(); });
+    } else {
+      nativeFull = true;
+      nativeAsk('full');
+    }
+  }
+
+  function wallBoxChanged(x, y, w, h) {
+    if (!nativeOn || nativeFull || !box) return;
+    var img = document.getElementById('pineCamImg');
+    if (!img) return;
+    var s = camScale();
+    var br = box.getBoundingClientRect();
+    var ir = img.getBoundingClientRect();
+    var left = Number(x) / s.x - (ir.left - br.left);
+    var top = Number(y) / s.y - (ir.top - br.top);
+    box.style.left = Math.max(0, Math.round(left)) + 'px';
+    box.style.top = Math.max(0, Math.round(top)) + 'px';
+    if (Number(w) > 0) box.style.width = Math.max(240, Math.round(Number(w) / s.x)) + 'px';
+    lastBoxKey = [x, y, w, h].map(function (v) { return Math.round(Number(v) || 0); }).join(',');
+    remember(box);
+  }
+
+  /* The lock screen and a hidden document must cover the camera too, and
+   * no z-index reaches a SurfaceView - so it is hidden by name. */
+  function nativeCover() {
+    if (!nativeOn) return;
+    var locked = !!(document.body && document.body.classList.contains('pine-locked'));
+    var hidden = document.visibilityState === 'hidden';
+    nativeAsk((locked || hidden) ? 'hide' : 'show');
+  }
 
   /* ---------------------------------------------------------- the ask */
 
@@ -331,6 +606,24 @@
        * avoid. Both, or it is not there. */
       live = !!(got && got.state === 'live' && got.fresh);
       showButton(live);
+      /* #1470: the supervisor's TS door, when it is up. `ok` is its own
+       * heartbeat (a datagram in the last five seconds); a door that has
+       * gone quiet takes the surface down and the JPEG road stands in. */
+      tsInfo = (live && got && got.ts && got.ts.ok && got.ts.port) ? got.ts : null;
+      if (shown) {
+        if (tsInfo) nativeStart(); else nativeStop();
+      }
+      if (nativeOn) {
+        nativeAsk('state').then(function (st) {
+          var why = document.getElementById('pineCamWhy');
+          if (!st || !why || !live || boxRecFrom) return;
+          if (st.on === false) { nativeOn = false; lastBoxKey = ''; nativeStart(); return; }
+          var lag = Number(st.lag_ms || 0);
+          why.textContent = 'live · native'
+            + (lag > 0 ? ' · ' + (lag / 1000).toFixed(1) + 's' : '')
+            + (Number(st.reconnects) ? ' · ' + st.reconnects + ' rejoin' : '');
+        });
+      }
       /* #1118: THE CARD IN THE MIDDLE OF THE TABLET'S SCREEN.
        *
        * Two things put it up: the link coming live (false -> true, and
@@ -1143,6 +1436,7 @@
   function openPrefs() {
     buildPrefs();
     prefsEl.hidden = false;
+    nativeMenu(true);                      /* #1470: a sheet over the surface */
     psay('reading…');
     readPrefs().then(function (p) {
       if (!p) { psay('the station did not answer'); return; }
@@ -1151,7 +1445,7 @@
     });
   }
 
-  function closePrefs() { if (prefsEl) prefsEl.hidden = true; }
+  function closePrefs() { if (prefsEl) prefsEl.hidden = true; nativeMenu(false); }
 
   /* ------------------------------------------------ the ladder sheet */
 
@@ -1510,6 +1804,7 @@
     buildLadder();
     ladderEl.hidden = false;
     ladderOpen = true;
+    nativeMenu(true);                      /* #1470: a sheet over the surface */
     readLadder();
     if (!ladderTimer) {
       ladderTimer = setInterval(function () {
@@ -1524,6 +1819,7 @@
     ladderOpen = false;
     if (ladderEl) ladderEl.hidden = true;
     if (ladderTimer) { clearInterval(ladderTimer); ladderTimer = 0; }
+    nativeMenu(false);
   }
 
   /* The radio icon: tell the tablet, open the sheet, climb. */
@@ -1747,6 +2043,14 @@
       b.__pineCamWired = true;
       b.addEventListener('click', toggle);
     }
+    /* #1470: the lock screen and a backgrounded document must cover the
+     * native picture, which no z-index can reach. */
+    document.addEventListener('visibilitychange', nativeCover);
+    try {
+      if (document.body && root.MutationObserver) {
+        new MutationObserver(nativeCover).observe(document.body, {attributes: true, attributeFilter: ['class']});
+      }
+    } catch (e) { /* no observer: the surface simply stays */ }
     look();
     viewers();
     if (!timer) timer = setInterval(look, POLL_MS);
@@ -1754,6 +2058,10 @@
 
   root.PineCam = {start: start, open: open, close: close,
     toggle: toggle, isLive: function () { return live; },
+    /* #1470: the native picture's callbacks and a reading of it. */
+    tapPicture: tapPicture, wallBoxChanged: wallBoxChanged, bare: setBare,
+    dragPicture: dragPicture,
+    native: function () { return {on: nativeOn, full: nativeFull, bare: bare, ts: tsInfo}; },
     /* #1118: the sheets, reachable from a console or another view. */
     ladder: openLadder, prefs: openPrefs, folder: showFolder,
     announce: function () { return post('/api/pinelink/announce', {}); }};

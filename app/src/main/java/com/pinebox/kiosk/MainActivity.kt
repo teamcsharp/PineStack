@@ -5,12 +5,15 @@ import android.content.ActivityNotFoundException
 import android.content.Intent
 import android.content.res.Configuration
 import android.graphics.Bitmap
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
 import android.net.Uri
+import android.net.wifi.WifiManager
 import android.os.Bundle
 import android.os.SystemClock
 import android.util.Log
 import android.view.View
-import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.PixelCopy
 import android.os.Handler
@@ -89,6 +92,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var bridge: PineDesktopBridge
     private var videoWall: com.pinebox.kiosk.video.PineVideoWall? = null  // #1426
     private var splicePreview: com.pinebox.kiosk.video.PineSplicePreview? = null
+    /** The Pine Cam on its own native surface - see video/PineCamWall.kt. */
+    private var pineCam: com.pinebox.kiosk.video.PineCamWall? = null
 
     /** Null until the deferred build has run. */
     private var rail: RailController? = null
@@ -305,39 +310,13 @@ class MainActivity : AppCompatActivity() {
         webView.postDelayed(guard, TIMER_GUARD_MS)
     }
 
-    // 2026-09-14: THE KEY CHORD. "if I press the lock button and the volume
-    // up button, I would like to take a picture of the screen and then also
-    // file a Pine report and dictate a message." Android keeps the power key
-    // for itself - an app never sees it - so the chord is volume-up pressed
-    // TWICE within 700 ms. The first press still changes the volume (it is
-    // let through); the second is taken, the window is copied with
-    // PixelCopy, and the page's PineReport.fromKey gets the picture: a flash,
-    // the pad, and the dot listening.
-    private var volumeUpAt = 0L
-
-    override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
-        if (keyCode == KeyEvent.KEYCODE_VOLUME_UP && event != null && event.repeatCount == 0) {
-            val now = SystemClock.elapsedRealtime()
-            if (now - volumeUpAt < 700L) {
-                volumeUpAt = 0L
-                reportShot()
-                return true
-            }
-            volumeUpAt = now
-        }
-        return super.onKeyDown(keyCode, event)
-    }
-
-    private fun reportShot() {
-        shootScreen { shot ->
-            /* An empty string when the copy failed, as before: the page's
-             * fromKey opens the pad without a picture rather than not at
-             * all. */
-            val js = "window.PineReport && PineReport.fromKey(" +
-                com.pinebox.kiosk.bridge.BridgeEnvelope.quote(shot?.dataUrl ?: "") + ")"
-            runOnUiThread { webView.evaluateJavascript(js, null) }
-        }
-    }
+    // 2026-09-28: THE VOLUME-UP CHORD IS GONE. It took a picture of the screen
+    // and opened a Pine report whenever volume-up was pressed twice within
+    // 700 ms (2026-09-14), and the operator asked for it removed: "get rid of
+    // the feature that makes it take screen caps whenever the volume up
+    // button is pressed." Volume-up is only volume now. The report's picture
+    // still comes from the top-left corner swipe (hot-corners.js ->
+    // bridge.screenShot -> shootScreen below), which is a separate road.
 
     /** One picture of the window, ready for a page: a data URL and its size. */
     data class Shot(val dataUrl: String, val w: Int, val h: Int)
@@ -448,7 +427,9 @@ class MainActivity : AppCompatActivity() {
             }
         }
         val wallHandled = if (cornerLockWas < 0) {
-            videoWall?.observeTouch(ev) ?: false
+            /* The cam sits above the set in the view order, so it is offered
+             * the press first; each only follows a press it took on DOWN. */
+            (pineCam?.observeTouch(ev) ?: false) || (videoWall?.observeTouch(ev) ?: false)
         } else {
             false
         }
@@ -505,6 +486,9 @@ class MainActivity : AppCompatActivity() {
          * service standing all day - see PineCameraDoor. */
         com.pinebox.kiosk.camera.PineCameraDoor.open(this)
         super.onResume()
+        /* Wi-Fi in low-latency mode while the terminal is in front - the
+         * live camera and the broadcast both ride it. See holdWifi. */
+        holdWifi(true)
 
         /* #1182T: THE TERMINAL IS VISIBLE, SO IT IS NOT IN STANDBY.
          *
@@ -714,6 +698,7 @@ class MainActivity : AppCompatActivity() {
          * Tailscale is exactly the activity they may want to look back at.
          * Only the screen going dark stops it - see onStop. */
         super.onPause()
+        holdWifi(false)
         /* #1296: and now there is nothing to tear down, so whatever the
            gallery chose while the view was up goes on the wall. */
         app.wallpaper.released()
@@ -721,6 +706,176 @@ class MainActivity : AppCompatActivity() {
         /* Give the speaker back when something else is in front. A kiosk is
          * almost never backgrounded, which is why this is easy to forget. */
         mediaFocus?.release()
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* The network underneath: the Wi-Fi lock and the road-change kick     */
+    /* ------------------------------------------------------------------ */
+
+    /* WI-FI IN LOW-LATENCY MODE while the terminal is in front. The
+     * framework is free to put the radio into power-save between frames,
+     * and on this tablet that is tens of milliseconds of jitter on a live
+     * picture and a broadcast that must not gap. The lock is not
+     * reference-counted so a missed release can never pin it twice; it is
+     * held from onResume to onPause, which is exactly "in front". */
+    private var wifiLock: WifiManager.WifiLock? = null
+    private var wifiSaid = false
+
+    private fun holdWifi(on: Boolean) {
+        try {
+            if (on) {
+                val lock = wifiLock ?: run {
+                    val wifi = applicationContext.getSystemService(WIFI_SERVICE) as WifiManager
+                    wifi.createWifiLock(WifiManager.WIFI_MODE_FULL_LOW_LATENCY, "pinebox")
+                        .apply { setReferenceCounted(false) }
+                        .also { wifiLock = it }
+                }
+                if (!lock.isHeld) lock.acquire()
+                if (!wifiSaid) { wifiSaid = true; Log.i(TAG, "wi-fi held in low-latency mode") }
+            } else {
+                wifiLock?.let { if (it.isHeld) it.release() }
+            }
+        } catch (err: Throwable) {
+            if (!wifiSaid) { wifiSaid = true; Log.w(TAG, "wi-fi lock: " + err.message) }
+        }
+    }
+
+    /* THE ROAD CHANGING UNDERNEATH, HEARD RATHER THAN WAITED FOR. Until
+     * now a tablet that walked off the LAN found out when a load failed
+     * and the banner's RETRY_MS retry re-probed; a WebView that had
+     * merely gone quiet found out when PineDeafWatch noticed. The
+     * default-network callback says so the moment it happens, and the
+     * terminal re-chooses its road then - with the quick probe, since
+     * the road is already known to be suspect. Registered in onStart
+     * and dropped in onStop; it never throws out of the framework's
+     * thread and never acts more than once per NET_KICK_MS. */
+    private var netWatch: ConnectivityManager.NetworkCallback? = null
+    /** The registration's own report of the network already in hand is
+     *  not a change and must not cost a probe on every start. */
+    private var netFirstReported = false
+    private var netValidated: Boolean? = null
+    private var netKickedAt = 0L
+    private var netKickPending: Runnable? = null
+
+    override fun onStart() {
+        super.onStart()
+        watchNetwork(true)
+    }
+
+    override fun onStop() {
+        watchNetwork(false)
+        super.onStop()
+    }
+
+    private fun watchNetwork(on: Boolean) {
+        val manager = try {
+            getSystemService(CONNECTIVITY_SERVICE) as? ConnectivityManager
+        } catch (err: Throwable) { null } ?: return
+        if (on) {
+            if (netWatch != null) return
+            netFirstReported = false
+            netValidated = null
+            val watch = object : ConnectivityManager.NetworkCallback() {
+                override fun onAvailable(network: Network) {
+                    if (!netFirstReported) { netFirstReported = true; return }
+                    netKick("network available")
+                }
+
+                override fun onLost(network: Network) {
+                    netValidated = null
+                    netKick("network lost")
+                }
+
+                override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) {
+                    /* Only a flip of VALIDATED/INTERNET is a change of
+                     * road; signal strength and bandwidth arrive here too
+                     * and are nobody's business. */
+                    val ok = caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED) &&
+                        caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                    val was = netValidated
+                    netValidated = ok
+                    if (was == null || was == ok) return
+                    netKick(if (ok) "network validated" else "network lost validation")
+                }
+            }
+            try {
+                manager.registerDefaultNetworkCallback(watch)
+                netWatch = watch
+            } catch (err: Throwable) {
+                Log.w(TAG, "network watch: " + err.message)
+            }
+        } else {
+            val watch = netWatch ?: return
+            netWatch = null
+            try { manager.unregisterNetworkCallback(watch) } catch (err: Throwable) { }
+            netKickPending?.let { webView.removeCallbacks(it) }
+            netKickPending = null
+        }
+    }
+
+    /** Off the framework's thread, onto ours, at most once per NET_KICK_MS. */
+    private fun netKick(why: String) {
+        try {
+            runOnUiThread {
+                if (isFinishing || isDestroyed) return@runOnUiThread
+                val now = SystemClock.uptimeMillis()
+                val wait = NET_KICK_MS - (now - netKickedAt)
+                if (wait <= 0L) {
+                    netKickedAt = now
+                    roadChanged(why)
+                    return@runOnUiThread
+                }
+                /* Inside the window: folded into one trailing kick, so a
+                 * lost-then-available pair costs one probe rather than
+                 * losing the one that mattered. */
+                if (netKickPending != null) return@runOnUiThread
+                val run = Runnable {
+                    netKickPending = null
+                    netKickedAt = SystemClock.uptimeMillis()
+                    if (!isFinishing && !isDestroyed) roadChanged("$why (coalesced)")
+                }
+                netKickPending = run
+                webView.postDelayed(run, wait)
+            }
+        } catch (err: Throwable) {
+            Log.w(TAG, "network kick: " + err.message)
+        }
+    }
+
+    /** Main thread. Forget the road, choose again, and act on where the page stands. */
+    private fun roadChanged(why: String) {
+        Log.i(TAG, "$why - re-probing the station's roads")
+        Reach.forget()
+        if (mainFrameFailed) {
+            /* The banner is up and a retry is waiting out RETRY_MS. The
+             * network just moved, so it goes now; load() probes and
+             * re-aims the door itself. */
+            cancelRetry()
+            load()
+            return
+        }
+        lifecycleScope.launch {
+            try {
+                val found = app.client.reachable(quick = true)
+                val base = Reach.base(app.configStore.read())
+                LoopDoor.aim(base)
+                Log.i(TAG, if (found) "road after change: " + Reach.said
+                           else "no road answered after the change: " + Reach.said)
+                /* The page's own deaf watch looks now rather than on its
+                 * next timer - and WebView timers are exactly what stall
+                 * when the tablet is under load. */
+                webView.evaluateJavascript(
+                    "window.PineDeafWatch&&PineDeafWatch.look&&PineDeafWatch.look();", null)
+            } catch (err: Throwable) {
+                Log.w(TAG, "road re-probe: " + err.message)
+            }
+        }
+    }
+
+    private fun cancelRetry() {
+        retryRun?.let { webView.removeCallbacks(it) }
+        retryRun = null
+        retryScheduled = false
     }
 
     override fun onDestroy() {
@@ -736,9 +891,14 @@ class MainActivity : AppCompatActivity() {
         videoWall?.onBoxChanged = null
         videoWall?.onHoldExpired = null
         videoWall = null
+        pineCam?.stop()
+        pineCam?.onTap = null
+        pineCam?.onBoxChanged = null
+        pineCam = null
         if (::bridge.isInitialized) {
             bridge.videoWall = null
             bridge.splicePreview = null
+            bridge.pineCam = null
             bridge.liveActivity = null
         }
         jackWatch?.stop()
@@ -1158,6 +1318,59 @@ class MainActivity : AppCompatActivity() {
         android.util.Log.i("PineVideoWall", "install: wall handed to the bridge")
     }
 
+    /**
+     * THE PINE CAM'S SURFACE, beside the set's and above it in the view
+     * order: same root, same media-overlay z-order, same lifecycle points.
+     * GONE and without a player until the page asks, so a page that never
+     * asks pays nothing. See video/PineCamWall.kt for why it is native.
+     */
+    private fun installPineCam() {
+        val root = findViewById<android.view.View>(R.id.root) as? android.widget.FrameLayout
+        if (root == null) {
+            android.util.Log.w("PineCamWall", "install: no FrameLayout at R.id.root - no cam")
+            return
+        }
+        val cam = try {
+            com.pinebox.kiosk.video.PineCamWall(this)
+        } catch (err: Throwable) {
+            android.util.Log.e("PineCamWall", "install: build failed", err)
+            return
+        }
+        root.addView(
+            cam,
+            android.widget.FrameLayout.LayoutParams(
+                android.widget.FrameLayout.LayoutParams.MATCH_PARENT,
+                android.widget.FrameLayout.LayoutParams.MATCH_PARENT,
+            ),
+        )
+        /* The picture is native, so the tap on it is native too - handed
+         * to the page in screen pixels, which divides by its own
+         * devicePixelRatio, where that number actually lives. */
+        cam.onTap = { x, y ->
+            val js = ("try{window.PineCam&&PineCam.tapPicture&&"
+                + "PineCam.tapPicture(" + x.toInt() + "," + y.toInt() + ")}catch(e){}")
+            webView.post { webView.evaluateJavascript(js, null) }
+        }
+        /* Only the settled rectangle crosses into JavaScript, not the
+         * gesture - one call per drag, not one per MotionEvent. */
+        cam.onBoxChanged = { x, y, w, h ->
+            val js = ("try{window.PineCam&&PineCam.wallBoxChanged&&"
+                + "PineCam.wallBoxChanged($x,$y,$w,$h)}catch(e){}")
+            webView.post { webView.evaluateJavascript(js, null) }
+        }
+        /* #1470b: while the finger slides the surface, the page hides the
+         * frame it draws around the picture - otherwise that frame stands
+         * where the box WAS until the release, a ghost of the window. */
+        cam.onDragging = { on ->
+            val js = ("try{window.PineCam&&PineCam.dragPicture&&"
+                + "PineCam.dragPicture(" + (if (on) "true" else "false") + ")}catch(e){}")
+            webView.post { webView.evaluateJavascript(js, null) }
+        }
+        pineCam = cam
+        bridge.pineCam = cam
+        android.util.Log.i("PineCamWall", "install: cam handed to the bridge")
+    }
+
     private fun installBridge() {
         bridge = PineDesktopBridge(
             context = applicationContext,
@@ -1191,6 +1404,7 @@ class MainActivity : AppCompatActivity() {
          * is the whole point here, so it goes. */
         webView.addJavascriptInterface(bridge, PineDesktopBridge.NAME)
         installVideoWall()                                    // #1426
+        installPineCam()
         /* THE FIRST RESUME HAS ALREADY HAPPENED. This runs from
          * standUpTheRest, posted after the first frame - which is after
          * onResume, whose `bridge.liveActivity = this` is guarded on the
@@ -1307,6 +1521,10 @@ class MainActivity : AppCompatActivity() {
     /** One reload in flight at a time - see onReceivedError. */
     private var retryScheduled = false
 
+    /** The retry itself, so a network coming back can run it NOW - see
+     *  roadChanged - rather than wait out the rest of RETRY_MS. */
+    private var retryRun: Runnable? = null
+
     /* onReceivedError fires BEFORE onPageFinished for the same navigation,
      * so without this the banner is raised and then immediately hidden
      * again by the finish of the very page that failed. */
@@ -1419,12 +1637,15 @@ class MainActivity : AppCompatActivity() {
                     drawer.closeDrawer(railHost)
                     return
                 }
-                if (webView.canGoBack()) {
-                    webView.goBack()
-                    return
+                // #1450's rule: an overlay on the page has its own ways out, and BACK is
+                // one of them. The page closes its topmost overlay (the line-actions
+                // sheet, the SFX TV, a dropdown, the video window) through
+                // window.pineBack(); only with nothing open does BACK walk history.
+                webView.evaluateJavascript(
+                    "(function(){try{return !!(window.pineBack&&window.pineBack());}catch(e){return false;}})()"
+                ) { closed ->
+                    if (closed != "true" && webView.canGoBack()) webView.goBack()
                 }
-                KioskController.leaveForSystem(this@MainActivity)
-                finishAndRemoveTask()
             }
         })
     }
@@ -1479,11 +1700,14 @@ class MainActivity : AppCompatActivity() {
                 showStatus("Reconnecting to the station...", retry = false)
                 if (!retryScheduled) {
                     retryScheduled = true
-                    view.postDelayed({
+                    val run = Runnable {
                         retryScheduled = false
+                        retryRun = null
                         if (!isFinishing && !isDestroyed &&
                             webView.url.orEmpty().startsWith("about:blank")) load()
-                    }, RETRY_MS)
+                    }
+                    retryRun = run
+                    view.postDelayed(run, RETRY_MS)
                 }
                 return
             }
@@ -1568,10 +1792,13 @@ class MainActivity : AppCompatActivity() {
              * queueing several reloads. */
             if (!retryScheduled) {
                 retryScheduled = true
-                webView.postDelayed({
+                val run = Runnable {
                     retryScheduled = false
+                    retryRun = null
                     if (!isFinishing) load()
-                }, RETRY_MS)
+                }
+                retryRun = run
+                webView.postDelayed(run, RETRY_MS)
             }
         }
     }
@@ -1762,6 +1989,9 @@ class MainActivity : AppCompatActivity() {
         private const val EDGE_DP = 40f
 
         private const val RETRY_MS = 4_000L
+
+        /** A road change is acted on at most this often - see netKick. */
+        private const val NET_KICK_MS = 2_000L
 
         private const val DEFAULT_UA =
             "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) " +

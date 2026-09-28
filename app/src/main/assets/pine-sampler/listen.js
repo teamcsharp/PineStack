@@ -659,10 +659,8 @@
       && !!(tv && typeof tv.endless === "function" && tv.endless()
       && typeof tv.playing === "function" && onScreen());
     const clip = on ? tv.playing() : null;
-    /* The tablet's SurfaceView is the authoritative endless picture. On a
-       normal Listen page it remains a movable PIP; on bare Listen it fills
-       the view. Do not start a second WebView decoder and then try to keep
-       two unrelated media clocks aligned. */
+    /* The native surface is the authoritative endless picture. A normal
+       Listen page shows it as PIP; bare Listen enlarges the same surface. */
     const native = !!(tv && typeof tv.nativeWallActive === "function"
       && tv.nativeWallActive());
     const want = clip && clip.url ? absolute(String(clip.url)) : "";
@@ -684,9 +682,11 @@
       if (vid) {
         vid.pause(); vid.hidden = true; vid.classList.remove("pl-endless");
         delete vid.dataset.endless; vid.removeAttribute("src");
-        try { vid.load(); } catch (err) { /* the native player remains live */ }
+        try { vid.load(); } catch (err) { /* native video remains live */ }
       }
-      if (typeof tv.veil === "function") tv.veil(true);
+      /* The native surface is now the one picture for Listen. Keep it
+         visible as PIP instead of applying the old web-wallpaper veil. */
+      if (typeof tv.veil === "function") tv.veil(false);
       return;
     }
 
