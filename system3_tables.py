@@ -262,7 +262,7 @@ RS2 = {
               "text": "demands evidence for it"},
              {"id": "disbelief", "label": "Disbelief", "cue": "question", "text": "cannot believe it and says so"},
          ])},
-        {"id": "playful", "label": "Playful", "weight": 1.0, "lean": 0, "tags": ["humor"],
+        {"id": "playful", "label": "Playful", "weight": 1.0, "after": {'IRS:comedic': 1.3}, "lean": 0, "tags": ["humor"],
          "emotions": {"joy": 1.7, "surprise": 1.2},
          "effects": {"novelty": 0.05},
          "items": _items([
@@ -299,7 +299,7 @@ IRS1 = {
          "effects": {"tension": 0.1, "agreement": -0.12}, "keeps_unresolved": True,
          "items": _items([{"id": "maintain", "label": "Push back against the responses maintaining the argument position",
                            "cue": "disagree", "text": "pushes back against the responses and holds the argument position"}])},
-        {"id": "comedic", "label": "Comedic (making fun of the response)", "weight": 1.0, "lean": -1,
+        {"id": "comedic", "label": "Comedic (making fun of the response)", "weight": 1.0, "after": {'RS:playful': 1.5}, "lean": -1,
          "tags": ["humor"], "emotions": {"joy": 1.6, "disgust": 1.2},
          "effects": {"tension": 0.06}, "keeps_unresolved": True,
          "items": _items([
@@ -333,7 +333,7 @@ IRS1 = {
              {"id": "detail", "label": "Going into detail on original point",
               "text": "goes into detail on the original point"},
          ])},
-        {"id": "confrontational", "label": "Confrontational", "weight": 1.0, "lean": -1,
+        {"id": "confrontational", "label": "Confrontational", "weight": 1.0, "after": {'RS:argue': 1.6, 'RS:oppositional': 1.4}, "lean": -1,
          "tags": ["disagreement", "escalation"], "emotions": {"anger": 1.8, "disgust": 1.3, "joy": 0.5},
          "modifiers": {"tension": 0.7}, "effects": {"tension": 0.18, "agreement": -0.15},
          "keeps_unresolved": True,
@@ -357,7 +357,7 @@ IRS2 = {
              {"id": "escalate", "label": "Escalate", "cue": "disagree", "tags": ["escalation"],
               "effects": {"tension": 0.2}, "text": "escalates, treating the objection as proof of the point"},
          ])},
-        {"id": "yield", "label": "Yield", "weight": 0.8, "lean": 1, "tags": ["agreement"],
+        {"id": "yield", "label": "Yield", "weight": 0.8, "after": {'RS:supportive': 1.4, 'RS:argue': 0.6}, "lean": 1, "tags": ["agreement"],
          "modifiers": {"closure_pressure": 0.8, "tension": -0.3},
          "effects": {"tension": -0.15, "agreement": 0.2}, "resolves": True,
          "items": _items([
@@ -395,13 +395,13 @@ FL1 = {
          "effects": {"tension": -0.2, "agreement": 0.25},
          "items": _items([{"id": "concede_move_on", "label": "Give up on topic and concede to the instigator",
                            "cue": "concede", "text": "gives up on the topic, concedes the instigator is right and asks to move on"}])},
-        {"id": "anger", "label": "Anger", "weight": 0.7, "speaker": "any", "new_topic": True,
+        {"id": "anger", "label": "Anger", "weight": 0.7, "after": {'IRS:confrontational': 1.6, 'IRS:hold': 1.2}, "speaker": "any", "new_topic": True,
          "min_turns_left": 4, "not_phases": ["SEGUE"], "tags": ["escalation"],
          "emotions": {"anger": 2.0, "disgust": 1.4, "joy": 0.4},
          "effects": {"tension": 0.25, "energy": 0.15},
          "items": _items([{"id": "parking_lot", "label": "Request to fight outside",
                            "text": "decides the topic is not worth discussing and invites them out to the parking lot for a battle"}])},
-        {"id": "enjoyment", "label": "Enjoyment", "weight": 1.0, "speaker": "initiator",
+        {"id": "enjoyment", "label": "Enjoyment", "weight": 1.0, "after": {'RS:playful': 1.3, 'IRS:comedic': 1.3}, "speaker": "initiator",
          "keep_initiator": True, "effects": {"agreement": 0.1, "energy": 0.1},
          "items": _items([{"id": "go_deeper", "label": "Request to continue in more depth",
                            "cue": "question", "text": "asks to keep going deeper with a follow-up question about the original point"}])},
@@ -533,7 +533,233 @@ INTERJECT1 = {
     ],
 }
 
-DEFAULT_TABLES = [CTS1, ES1, RS1, RS2, IRS1, IRS2, FL1, FL2, TEMPER1, SHOCK1, INTERJECT1]
+# --- FAV1 / DIRECTIVE1: the cast's favourites and the operator's directives ---
+#
+# [s3-cast] 2026-09-27. Two things reached every host prompt as a wedge -
+# "LIVE MIND ADJUSTMENTS FOR THIS CHARACTER" (app.py mind_adjustment_prompt):
+# the Mind desk's hand-written notes, and every line the operator thumbed up,
+# stapled on with "say things like it, and you may repeat it". No roll, no
+# odds, no Rolodex record, and an invitation to repeat. They are tables now.
+#
+# FAV1 is the whole cast's liked lines in one pool (a thumbs-up adds a row, a
+# thumbs-down removes it). One roll per round or single line at the
+# `favorites` control decides whether one comes up; a second draws which (a
+# line that just came up weighs a quarter); a third lands it on one host turn,
+# where the writer is told to say something NEW in its spirit - never to
+# repeat or quote it. A written turn that copies it fails validation.
+#
+# DIRECTIVE1 holds the operator's directives, one category per seat (and
+# "cast" for every host seat). Each row carries its own odds: 1.0 is a
+# standing rule (recorded, not drawn), 0.3 comes up three rounds in ten. A
+# hit lands on ONE of that seat's turns. A row may expire: `until` (epoch
+# seconds, 0 = never) or `airings` (hits on air, 0 = unlimited).
+FAV1 = {
+    "id": "FAV1", "family": "FAV", "label": "Favourites (lines the operator liked)", "version": 1,
+    "enabled": True, "weight": 1.0,
+    "description": "Every line the operator thumbed up, from any seat. The favorites control sets how often one "
+                   "comes up; the writer is told to say something new in its spirit, never to repeat it.",
+    "categories": [{"id": "liked", "label": "Liked lines", "weight": 1.0, "items": []}],
+}
+
+DIRECTIVE1 = {
+    "id": "DIRECTIVE1", "family": "DIRECTIVE", "label": "Directives (the operator's, per seat)", "version": 1,
+    "enabled": True, "weight": 1.0,
+    "description": "The operator's directives for the cast. Each row has its own odds (100% is a standing rule) "
+                   "and lands on one of its seat's turns; a row may expire by date or by airings.",
+    "categories": [
+        {"id": "host", "label": "Host", "seat": "A", "weight": 1.0, "items": []},
+        {"id": "cohost", "label": "Co-host", "seat": "B", "weight": 1.0, "items": []},
+        {"id": "third", "label": "Third seat", "seat": "D", "weight": 1.0, "items": []},
+        {"id": "cast", "label": "Whole cast", "seat": "*", "weight": 1.0, "items": []},
+    ],
+}
+
+# --- CALLEVENT1: what can happen on a call ----------------------------------
+#
+# [s3-events] 2026-09-27, the operator: "I want to see people get emotional
+# randomly, excited, win prizes, get angry, deal with messages from upstairs,
+# lose the call, go on a tangent from the speakerbox ... customers get
+# interrupted by random background activities and I want that ... as a thing
+# that can happen to end the call." Each category is one KIND of happening:
+# its own odds per call (a die), the seat it happens to (the caller, a host,
+# anyone), where in the call it may land, and whether it ENDS the call - the
+# plan is then cut on that turn and a host reacts to the dead line. A hit
+# draws one of its items (the variant) and a turn. At most `max_events`
+# land on one call. Text: {caller}/{first} the caller's first name, {host},
+# {cohost}. Prizes and the hostile turn are the station's own call rolls
+# (richer: paintings, tickets, a seven-beat arc) - tabled through the dice
+# door, not repeated here.
+CALLEVENT1 = {
+    "id": "CALLEVENT1", "family": "EVENT", "label": "Call events (what can happen on a call)", "version": 1,
+    "enabled": True, "weight": 1.0, "roads": ["caller"], "max_events": 2,
+    "description": "Things that happen on a request-line call. Each kind has its own odds per call; a hit lands "
+                   "on one turn of its seat, and an ending cuts the call there.",
+    "categories": [
+        {"id": "outburst", "label": "The caller gets emotional", "odds": 0.3, "seat": "caller", "place": "any",
+         "items": _items([
+             {"id": "tears", "label": "Breaks down",
+              "text": "{first} breaks down partway through - voice cracking - it matters far more to them than they let on",
+              "emotions": {"sadness": 4.0}},
+             {"id": "temper", "label": "Loses their temper",
+              "text": "{first} suddenly loses their temper over something small the hosts just said",
+              "emotions": {"anger": 4.0}},
+             {"id": "giddy", "label": "Giddy",
+              "text": "{first} gets giddy and overexcited, talking over the hosts and laughing at their own story",
+              "emotions": {"joy": 4.0}},
+             {"id": "panic", "label": "Panics",
+              "text": "{first} gets flustered and frightened, as though someone might be listening in on the call",
+              "emotions": {"fear": 3.5}},
+         ])},
+        {"id": "upstairs", "label": "A message from upstairs", "odds": 0.15, "seat": "host", "place": "any",
+         "items": _items([
+             {"id": "intercom", "label": "The intercom",
+              "text": "is interrupted by the manager upstairs coming over the intercom with an opinion about this very call, and has to relay it to {first}",
+              "emotions": {"surprise": 2.0, "social": 1.5}},
+             {"id": "note", "label": "A note under the door",
+              "text": "reads out a note just slid under the booth door from the manager upstairs, about this caller",
+              "emotions": {"surprise": 2.0}},
+         ])},
+        {"id": "tangent", "label": "The caller goes off on a tangent", "odds": 0.15, "seat": "caller", "place": "any",
+         "requires": ["call_passage"],
+         "items": _items([
+             {"id": "passage", "label": "Into the speakerbox passage",
+              "text": "{first} wanders off onto the speakerbox passage this call carries, as if it were their own life, and has to be dragged back",
+              "emotions": {"interest": 2.5}},
+         ])},
+        {"id": "background", "label": "Something happens in the background", "odds": 0.2, "seat": "caller",
+         "place": "any",
+         "items": _items([
+             {"id": "dog", "label": "The dog", "text": "a dog starts going off behind {first}; they shout at it and carry on"},
+             {"id": "kettle", "label": "The kettle", "text": "a kettle screams behind {first}, and they talk over it"},
+             {"id": "someone", "label": "Someone in the room",
+              "text": "someone in the room with {first} keeps chiming in, and {first} answers them as well as the hosts"},
+         ])},
+        {"id": "pulled_away", "label": "Pulled away by the background (ends the call)", "odds": 0.1, "seat": "caller",
+         "place": "any", "min_turn": 6, "ends": True,
+         "items": _items([
+             {"id": "baby", "label": "The baby",
+              "text": "a baby starts screaming behind {first}; they say they have to go and the line drops mid-sentence"},
+             {"id": "door", "label": "Someone at the door",
+              "text": "someone starts hammering on {first}'s door; they panic, say they have to go, and the line cuts out"},
+             {"id": "boss", "label": "The boss walks in",
+              "text": "{first}'s boss walks in on them; they hang up in a hurry, mid-word"},
+             {"id": "pot", "label": "Something boiling over",
+              "text": "something boils over on {first}'s stove, there is a crash, and the line goes dead"},
+             {"id": "fire_alarm", "label": "The smoke alarm",
+              "text": "a smoke alarm goes off behind {first}; they yell and the call drops"},
+         ])},
+        {"id": "lost", "label": "The call is lost", "odds": 0.07, "seat": "caller", "place": "any", "min_turn": 6, "ends": True,
+         "items": _items([
+             {"id": "tunnel", "label": "Into a tunnel", "text": "{first} drives into a tunnel and breaks up, then the line goes dead"},
+             {"id": "battery", "label": "The battery dies", "text": "{first}'s phone battery dies in the middle of a sentence"},
+             {"id": "crossed", "label": "A crossed line",
+              "text": "the line crosses with a stranger's call for a moment, then {first} is gone"},
+         ])},
+        {"id": "hangs_up", "label": "The caller hangs up", "odds": 0.05, "seat": "caller", "place": "any", "min_turn": 6, "ends": True,
+         "items": _items([
+             {"id": "huff", "label": "In a huff", "text": "{first} takes offence at the last thing said and hangs up on them",
+              "emotions": {"anger": 3.0}},
+         ])},
+    ],
+}
+
+# --- STATION1 / POOLS1: the station's own rolls, tabled ------------------------
+#
+# [s3-dice-door] 2026-09-27, the operator: "all of the requests for randomness
+# on the station to be broken down and tabled and made into a roulette rolodex
+# entry that dice is rolling a chance of hitting". Every `random()` the station
+# rolls on the air's behalf goes through System 3's dice door: a CHANCE row
+# (STATION1, one per roll: its odds - or the desk dial it follows - and what it
+# does) and, where it picks among options, a POOL category (POOLS1: the options
+# themselves, weighted and editable). Rows are added the first time the station
+# makes the roll, carrying the station's own odds and options, so nothing starts
+# anywhere but where it was; from then on the desk's numbers are rolled.
+STATION1 = {
+    "id": "STATION1", "family": "CHANCE", "label": "Station rolls (every chance the station takes)", "version": 1,
+    "enabled": True, "weight": 1.0,
+    "description": "Each row is one roll a station road makes - a caller preferring a host, a prize, a hostile turn, "
+                   "a second person on the line ... Its odds are the dice's; a row that follows a desk dial says so.",
+    "categories": [],
+}
+POOLS1 = {
+    "id": "POOLS1", "family": "POOL", "label": "Station pools (the options those rolls draw from)", "version": 1,
+    "enabled": True, "weight": 1.0,
+    "description": "Each category is one list a station roll draws from - a caller's state, the prizes, how a call "
+                   "turns. Add, remove, re-weight or switch off options; the roll draws from what is here.",
+    "categories": [],
+}
+
+# --- BLOCKS: every block a writer prompt may carry ---------------------------------
+#
+# [s3-blocks] 2026-09-27, the operator: every block in every prompt is a node -
+# "fixed context (persona, day, schedule, show memory, avoid-reruns) OBLIGATIONS,
+# always sent, each switchable"; the station's randoms ROLLS; a block no node
+# claims STRIPPED and logged. The station marks each block of a prompt with its
+# name; System 3 decides it at the writer's door by the rule here (the config's
+# `blocks` section overrides any of them). kind:
+#   obligation  always sent, recorded; switch it off with kind "off"
+#   roll        a die at `odds` (or the desk dial named in `odds_from`)
+#   tint        only while a crystal is on and the tint pass is wanted
+#   off         never sent (recorded as stripped)
+# A block whose name is not here is a wedge and is stripped.
+DEFAULT_BLOCKS = {
+    "system_prompt": {"kind": "obligation", "label": "The station's system prompt", "helper": "active_system"},
+    "persona": {"kind": "obligation", "label": "The seat's persona", "helper": "radio_persona"},
+    "desk_instruction": {"kind": "obligation", "label": "The desk's instruction for this slot",
+                         "helper": "radio_prompt_instruction"},
+    "schedule": {"kind": "obligation", "label": "SCHEDULE (#843): the entry on air", "helper": "_schedule_clause"},
+    "plot": {"kind": "obligation", "label": "The storyline's act", "helper": "plot_clause"},
+    "modifiers": {"kind": "obligation", "label": "Standing guest / topic / event", "helper": "modifiers_clause"},
+    "lessons": {"kind": "obligation", "label": "The operator's standing orders", "helper": "operator_lesson_clause"},
+    "manager_cut_in": {"kind": "off", "label": "The manager cutting in (the station's old roll)",
+                       "helper": "manager_cut_in_clause",
+                       "what": "System 3's EVENT tables and the station rolls carry upstairs now"},
+    "battle": {"kind": "tint", "label": "THE BATTLE (#1090)", "helper": "rap_battle_clause"},
+    # its gate is the station roll banter.personality / line.personality (STATION1, at
+    # the personality dial) - the block itself is not rolled a second time
+    "disposition": {"kind": "obligation", "label": "The station's disposition", "helper": "dj_disposition"},
+    "flavor": {"kind": "obligation", "label": "Loose in your mind (a stray speakerbox swath)", "helper": "speakbox_flavor"},
+    "day": {"kind": "obligation", "label": "The day, the date, the part of the day", "helper": "day_context"},
+    "accent": {"kind": "obligation", "label": "The accent directive", "helper": "accent_directive"},
+    "context": {"kind": "obligation", "label": "The record's facts", "helper": "dj_line context"},
+    "aside": {"kind": "obligation", "label": "A speakerbox passage to work in", "helper": "speakbox_aside"},
+    "show_memory": {"kind": "obligation", "label": "Tonight so far (show memory)", "helper": "show_memory"},
+    "avoid_reruns": {"kind": "obligation", "label": "Words and lines not to repeat", "helper": "avoid_reruns"},
+    "crystal": {"kind": "tint", "label": "The crystal's lines", "helper": "crystal_tint_note / crystal_clause"},
+    "paper": {"kind": "obligation", "label": "The Gazette's discussion", "helper": "paper_discussion_context"},
+    "cohost": {"kind": "obligation", "label": "The co-host's persona", "helper": "radio_persona('cohost')"},
+    "third": {"kind": "obligation", "label": "The third seat's persona", "helper": "radio_persona('third')"},
+    "turn_rules": {"kind": "obligation", "label": "How long a turn is (System 2's slot)", "helper": "system2_turn_instruction"},
+    "pace": {"kind": "obligation", "label": "Overlap and pace", "helper": "banter_pace"},
+    "seat_away": {"kind": "obligation", "label": "The empty chair", "helper": "seat_away_clause"},
+    "playing": {"kind": "obligation", "label": "What is playing", "helper": "playing / only_song"},
+    "call_flow": {"kind": "obligation", "label": "The call's flow and novelty", "helper": "call_flow"},
+    "approach": {"kind": "off", "label": "The station's approach roll (#752)", "helper": "approach_clause",
+                 "what": "FL frames the round under System 3"},
+    "weather": {"kind": "off", "label": "The station's emotional weather roll", "helper": "weather_clause",
+                "what": "ES rolls the feeling of every turn under System 3"},
+    "tail_lists": {"kind": "obligation", "label": "Requests and pictures on the desk", "helper": "tail_lists_clause"},
+    "sheet": {"kind": "obligation", "label": "System 3's running order", "helper": "the S3 sheet"},
+    "angle": {"kind": "obligation", "label": "The round's own subject and material (its angle)", "helper": "dj_banter angle"},
+    "theme": {"kind": "obligation", "label": "The operator's theme", "helper": "theme_air_clause"},
+    "brief_lesson": {"kind": "obligation", "label": "The lesson from the last attempt", "helper": "brief_lesson_clause"},
+    "heat": {"kind": "obligation", "label": "A machine-heat aside", "helper": "heat_reference"},
+    "topic_contract": {"kind": "obligation", "label": "The subject the caller rang about", "helper": "topic_contract_clause"},
+    "perf": {"kind": "obligation", "label": "How to say it (performance)", "helper": "perf_directive"},
+    "review_guidance": {"kind": "obligation", "label": "Operator wording preferences", "helper": "line_review_guidance"},
+}
+
+
+def default_blocks():
+    return copy.deepcopy(DEFAULT_BLOCKS)
+
+
+# families whose tables may stand empty: their rows are added from the desk,
+# by the operator's votes or by the station's first roll; an empty pool draws nothing
+POOL_FAMILIES = ("FAV", "DIRECTIVE", "CHANCE", "POOL")
+
+DEFAULT_TABLES = [CTS1, ES1, RS1, RS2, IRS1, IRS2, FL1, FL2, TEMPER1, SHOCK1, INTERJECT1, FAV1, DIRECTIVE1, CALLEVENT1,
+                  STATION1, POOLS1]
 
 # --- The banter cycle (PDF p.3) --------------------------------------------
 #

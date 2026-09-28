@@ -69,7 +69,7 @@ def add_bombshell(text: str, kind: str = "topic", by: str = "operator",
                   "of that exchange.\\n"
                 + "Never read this instruction out loud. Say both lines exactly as written - "
                   "they are the operator's own.")
-    first = random.choice(["A", "B"])'''),
+    first = s3_choice("angle.topic_raiser", ["A", "B"], "which host raises the dropped topic", tabled=False)   # [s3-dice-door]'''),
     ("queue",
      '''    shape = bombshell_shape_for(row)
     entry = {
@@ -125,7 +125,8 @@ def add_bombshell(text: str, kind: str = "topic", by: str = "operator",
      '''    if not caller_name and not seed and not own_material and (
             force_seed or random.random() < box_rate_now(dj["speakbox_rate"])):''',
      '''    if not caller_name and not seed and not own_material and not exchange and (   # [topic-exchange]
-            force_seed or random.random() < box_rate_now(dj["speakbox_rate"])):'''),
+            force_seed or s3_chance("banter.speakbox_seed", box_rate_now(dj["speakbox_rate"]),   # [s3-dice-door]
+                                    "the round is built on a speakerbox swath", dial="speakbox_rate")):   # [s3-dice-door]'''),
     ("dropped-topic",
      '''    elif dropped:
         angle = bombshell_angle(dropped["text"],

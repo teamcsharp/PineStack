@@ -30,6 +30,7 @@ from __future__ import annotations
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import collections
+import contextvars
 import copy
 import hashlib
 import json
@@ -59,6 +60,19 @@ CARRY_WINDOW = float(system3.CARRY_WINDOW)
 # [s3-withhold] a planned round nobody bound within this long is recorded as abandoned
 ABANDON_AFTER = 1800.0
 ABANDON_SWEEP = 300.0
+# [s3-dice-door] the station's rolls made on this task since its last planned
+# round: {"seed", "stream", "rolls": [...]}. A road rolls its dice (a caller's
+# prize, their state) and then asks System 3 to plan the round; the plan takes
+# these in as STATION events, so the round shows every roll that shaped it.
+_S3_ROLLS = contextvars.ContextVar("system3_station_rolls", default=None)
+# [s3-blocks] the System 3 handle of the round (or line) whose words are being
+# written on this task right now - the station sets it around its writer call,
+# so the prompt's block decisions are recorded on that conversation
+_S3_WRITE = contextvars.ContextVar("system3_writing_for", default=None)
+ROLLS_KEPT = 60              # a road that rolls and never plans keeps only the last ones
+ROLLS_FRESH = 600.0          # ...and only the last ten minutes' of them reach a plan
+DICE_FLUSH_AFTER = 12.0      # rows first seen are written as one config version
+
 # The station's seat names -> the script markers banter_turns returns.
 _SEAT_OF = {"dj": "A", "host": "A", "cohost": "B", "third": "D", "caller": "C",
             "caller2": "E"}
@@ -210,6 +224,18 @@ class System3Runtime:
         self._carry_noted = set()
         # [s3-withhold] active rounds planned and not yet bound: cid -> {at, road, bank}
         self.open = {}
+        # [s3-dice-door] rows the station rolled before the desk had them, and the ring
+        self.dice_pending = {"chance": {}, "pool": {}}
+        self._dice_timer = None
+        self.station_rolls = collections.deque(maxlen=400)
+        # [s3-blocks] each prompt's block decisions, by the digest of the words sent
+        self.prompt_blocks = collections.OrderedDict()
+        # [s3-flow] the items recent rounds used (FAMILY:item), and what went to air lately
+        self.recent_items = collections.deque(maxlen=80)
+        self.recent_air = collections.deque(maxlen=300)
+        # [s3-cast] the favourites that came up lately (they weigh a quarter at the
+        # next draw) and each directive's airings; kept in data/system3_cast.json
+        self.cast = {"fav_recent": [], "directive_spent": {}, "counted": []}
 
     # --- lifecycle ---------------------------------------------------------
     def load(self):
@@ -218,7 +244,532 @@ class System3Runtime:
         added = self.add_missing_default_tables()
         if added:
             self.log("System 3 config gained the default tables it predates: " + ", ".join(added))
+        self._cast_load()                                                   # [s3-cast]
+        adopted = self.adopt_mind_notes()
+        if adopted:
+            self.log("System 3 adopted the Mind desk's notes as table rows: " + "; ".join(adopted)[:380])
         self.ready = True
+
+    # --- [s3-cast] favourites and directives ----------------------------------
+    def _cast_path(self):
+        return self.host.data_path("system3_cast.json")
+
+    def _cast_load(self):
+        try:
+            got = json.loads(Path(self._cast_path()).read_text(encoding="utf-8"))
+            if isinstance(got, dict):
+                self.cast = {"fav_recent": [str(x) for x in (got.get("fav_recent") or [])][-8:],
+                             "directive_spent": {str(k): int(v) for k, v in (got.get("directive_spent") or {}).items()},
+                             "counted": [str(x) for x in (got.get("counted") or [])][-400:]}
+        except (OSError, ValueError, TypeError, AttributeError):
+            pass
+
+    def _cast_save(self):
+        """Written on the store's own thread (a caller already on it writes inline)."""
+        with self.lock:
+            snap = json.loads(json.dumps(self.cast))
+
+        def job():
+            try:
+                path = Path(self._cast_path())
+                tmp = path.with_suffix(".json.tmp")
+                tmp.write_text(json.dumps(snap), encoding="utf-8")
+                tmp.replace(path)
+            except Exception as exc:  # noqa: BLE001
+                self.fail("cast state", exc)
+        if threading.current_thread().name.startswith("system3-store"):
+            job()
+        else:
+            _STORE_POOL.submit(job)
+
+    # --- [s3-dice-door] the station's own rolls ---------------------------------
+    def _dice_live(self):
+        return bool(self.ready and self.settings.get("mode") in ("active", "active_selected_roads"))
+
+    @staticmethod
+    def _roll_buffer():
+        buf = _S3_ROLLS.get()
+        if buf is None:
+            seed = hashlib.sha1(("%s|%s" % (time.time(), id(asyncio))).encode("utf-8")).hexdigest()[:16]
+            buf = {"seed": seed, "stream": system3.DrawStream("station|" + seed), "rolls": []}
+            _S3_ROLLS.set(buf)
+        return buf
+
+    def _find(self, family, key):
+        """CHANCE: the item whose id is `key`; POOL: the category whose id is `key`."""
+        for t in (self.config.get("tables") or []):
+            if not isinstance(t, dict) or t.get("family") != family or t.get("enabled") is False:
+                continue
+            for c in t.get("categories") or []:
+                if family == "POOL" and c.get("id") == key:
+                    return c
+                if family == "CHANCE":
+                    for it in c.get("items") or []:
+                        if isinstance(it, dict) and it.get("id") == key:
+                            return it
+        return None
+
+    def _queue_row(self, kind, key, row):
+        with self.lock:
+            if key in self.dice_pending[kind]:
+                return
+            self.dice_pending[kind][key] = row
+            if self._dice_timer is None:
+                self._dice_timer = threading.Timer(DICE_FLUSH_AFTER, lambda: _STORE_POOL.submit(self.dice_flush))
+                self._dice_timer.daemon = True
+                self._dice_timer.start()
+
+    def dice_flush(self):
+        """Write the rows the station rolled before the desk had them, as one
+        config version ("station rolls tabled: ..."). On the store's thread."""
+        with self.lock:
+            pend = {"chance": dict(self.dice_pending["chance"]), "pool": dict(self.dice_pending["pool"])}
+            self.dice_pending = {"chance": {}, "pool": {}}
+            self._dice_timer = None
+        if not pend["chance"] and not pend["pool"]:
+            return []
+        config = copy.deepcopy(self.config)
+        added = []
+        st = self._pool_table(config, "STATION1", system3_tables.STATION1)
+        for key, row in pend["chance"].items():
+            if self._find_in(config, "CHANCE", key) is not None:
+                continue
+            dom = key.split(".", 1)[0] or "station"
+            cat = next((c for c in st.setdefault("categories", []) if c.get("id") == dom), None)
+            if cat is None:
+                cat = {"id": dom, "label": dom.capitalize(), "weight": 1.0, "items": []}
+                st["categories"].append(cat)
+            cat.setdefault("items", []).append(row)
+            added.append(key)
+        pl = self._pool_table(config, "POOLS1", system3_tables.POOLS1)
+        for key, cat in pend["pool"].items():
+            if self._find_in(config, "POOL", key) is not None:
+                continue
+            pl.setdefault("categories", []).append(cat)
+            added.append(key)
+        if not added:
+            return []
+        try:
+            self._save_config_now(config, "station rolls tabled: " + ", ".join(added)[:300])
+        except Exception as exc:  # noqa: BLE001
+            self.fail("dice rows", exc)
+            return []
+        return added
+
+    @staticmethod
+    def _find_in(config, family, key):
+        for t in (config.get("tables") or []):
+            if not isinstance(t, dict) or t.get("family") != family:
+                continue
+            for c in t.get("categories") or []:
+                if family == "POOL" and c.get("id") == key:
+                    return c
+                if family == "CHANCE":
+                    for it in c.get("items") or []:
+                        if isinstance(it, dict) and it.get("id") == key:
+                            return it
+        return None
+
+    def _record_roll(self, rec):
+        rec["at"] = time.time()
+        buf = self._roll_buffer()
+        buf["rolls"] = (buf["rolls"] + [rec])[-ROLLS_KEPT:]
+        self.station_rolls.append(rec)
+        self.observe_later("station:" + time.strftime("%Y%m%d%H", time.gmtime()), "STATION", rec)
+
+    def chance(self, key, odds, label="", dial=""):
+        """[s3-dice-door] One of the station's `random() < odds` rolls, as System 3's
+        die. A row that follows a desk dial rolls at the dial's value (the dial is
+        where the operator sets it); otherwise the row's own odds. None when System
+        3 is off: the station rolls its own."""
+        if not self._dice_live():
+            return None
+        try:
+            key = str(key)[:60]
+            station_odds = round(system3.clamp(odds), 4)
+            row = self._find("CHANCE", key)
+            if row is None:
+                self._queue_row("chance", key, {"id": key, "label": str(label or key)[:90], "text": str(label or key)[:300],
+                                                "odds": station_odds, "dial": str(dial or ""), "weight": 1.0})
+                use, why = station_odds, "the station's own odds (the row is being added to STATION1)"
+            elif row.get("enabled") is False:
+                use, why = 0.0, "switched off on the desk (STATION1)"
+            elif row.get("dial"):
+                use, why = station_odds, "follows the desk dial %s" % row.get("dial")
+            else:
+                use, why = round(system3.clamp(row.get("odds", station_odds)), 4), "the desk's odds (STATION1)"
+            d = self._roll_buffer()["stream"].next("CHANCE:" + key)
+            hit = bool(d["u"] < use)
+            self._record_roll({"kind": "chance", "key": key, "label": str((row or {}).get("label") or label or key)[:90],
+                               "odds": use, "u": d["u"], "dice": d["dice"], "hit": hit, "why": why})
+            return hit
+        except Exception as exc:  # noqa: BLE001
+            self.fail("station chance", exc)
+            return None
+
+    def pool(self, key, defaults, label=""):
+        """[s3-dice-door] The options a station roll draws from: the desk's POOLS1
+        category (enabled, weighted), or the station's own list - which becomes
+        that category the first time it is drawn. None when System 3 is off."""
+        if not self._dice_live():
+            return None
+        try:
+            key = str(key)[:60]
+            opts = [" ".join(str(x).split()) for x in (defaults or []) if str(x or "").strip()]
+            cat = self._find("POOL", key)
+            if cat is None:
+                if opts:
+                    self._queue_row("pool", key, {"id": key, "label": str(label or key)[:90], "weight": 1.0,
+                                                  "items": [{"id": "o%d" % i, "label": o[:60], "text": o, "weight": 1.0}
+                                                            for i, o in enumerate(opts[:200])]})
+                return opts
+            live = [str(i.get("text")) for i in cat.get("items") or []
+                    if isinstance(i, dict) and i.get("enabled") is not False and float(i.get("weight", 1.0) or 0) > 0
+                    and str(i.get("text") or "").strip()]
+            return live or opts
+        except Exception as exc:  # noqa: BLE001
+            self.fail("station pool", exc)
+            return None
+
+    def pick(self, key, candidates, label="", weights=None):
+        """[s3-dice-door] Which of `candidates` (the options still eligible - a
+        no-repeat ring may have held some back): a weighted draw, the weights
+        the desk gave those options in POOLS1 - or, for a list the station
+        keeps its own weights for (the ending shelf, the behaviour deck), the
+        `weights` it hands in. Returns the index, or None."""
+        if not self._dice_live():
+            return None
+        try:
+            cands = [" ".join(str(c).split()) for c in (candidates or [])]
+            if not cands:
+                return None
+            key = str(key)[:60]
+            cat = self._find("POOL", key) or {}
+            if weights is not None and len(list(weights)) == len(cands):
+                w = [max(0.0, float(x or 0)) for x in weights]
+            else:
+                desk = {" ".join(str(i.get("text") or "").split()): float(i.get("weight", 1.0) or 0)
+                        for i in cat.get("items") or [] if isinstance(i, dict)}
+                w = [max(0.0, desk.get(c, 1.0)) for c in cands]
+            if sum(w) <= 0:
+                w = [1.0] * len(cands)
+            d = self._roll_buffer()["stream"].next("PICK:" + key)
+            k = system3.pick_index(w, d["u"])
+            k = k if 0 <= k < len(cands) else 0
+            self._record_roll({"kind": "pick", "key": key, "label": str(cat.get("label") or label or key)[:90],
+                               "of": len(cands), "index": k + 1, "picked": cands[k][:160], "u": d["u"], "dice": d["dice"],
+                               "candidates": [c[:80] for c in cands[:12]]})
+            return k
+        except Exception as exc:  # noqa: BLE001
+            self.fail("station pick", exc)
+            return None
+
+    def roll(self, key, label=""):
+        """[s3-dice-door] A plain number in [0, 1) off System 3's dice, recorded -
+        for a station draw that is a band or a scale rather than a yes/no or a
+        pick (which kind of subject a caller rings about, a pitch nudge)."""
+        if not self._dice_live():
+            return None
+        try:
+            key = str(key)[:60]
+            d = self._roll_buffer()["stream"].next("ROLL:" + key)
+            self._record_roll({"kind": "roll", "key": key, "label": str(label or key)[:90], "u": d["u"], "dice": d["dice"]})
+            return float(d["u"])
+        except Exception as exc:  # noqa: BLE001
+            self.fail("station roll", exc)
+            return None
+
+    def _absorb_rolls(self, conv):
+        """The rolls the road made before asking for this round become its first
+        events (STATION): recorded with their odds and dice, not replayed."""
+        buf = _S3_ROLLS.get()
+        if not buf or not buf.get("rolls"):
+            return 0
+        now = time.time()
+        rolls = [r for r in buf["rolls"] if now - float(r.get("at") or 0) <= ROLLS_FRESH]
+        buf["rolls"] = []
+        ctx0 = {"turn_id": "", "turn_index": -1}
+        for r in rolls:
+            before = system3._snapshot(conv, (conv.get("cursor") or {}).get("initiator"))
+            if r.get("kind") == "roll":
+                stages = [{"stage": "roll", "draw": {"u": r["u"], "dice": r["dice"]}, "selected": r["u"],
+                           "rule": "a number in [0, 1) the road reads against its own bands"}]
+                sel = {"id": str(r["dice"]), "label": "%s: %.3f" % (r["label"], r["u"]), "key": r["key"]}
+            elif r.get("kind") == "chance":
+                stages = [{"stage": "dice", "draw": {"u": r["u"], "dice": r["dice"]}, "threshold": r["odds"],
+                           "rule": "a hit when the die lands under %.0f%% (%s)" % (r["odds"] * 100, r.get("why", "")),
+                           "selected": "HIT" if r["hit"] else "MISS"}]
+                sel = {"id": "HIT" if r["hit"] else "MISS", "label": "%s: %s" % (r["label"], "yes" if r["hit"] else "no"),
+                       "key": r["key"]}
+            else:
+                stages = [{"stage": "item", "draw": {"u": r["u"], "dice": r["dice"]}, "selected": r.get("picked"),
+                           "selected_index": r.get("index"), "of": r.get("of"), "candidates": [
+                               {"id": str(i), "label": c, "base": 1.0, "weight": 1.0, "p": round(1.0 / max(1, r.get("of") or 1), 4),
+                                "why": []} for i, c in enumerate(r.get("candidates") or [])]}]
+                sel = {"id": str(r.get("index")), "label": "%s: %s" % (r["label"], str(r.get("picked") or "")[:90]),
+                       "key": r["key"], "index": r.get("index"), "of": r.get("of")}
+            ev = system3._event(conv, ctx0, "STATION", stages, sel, before,
+                                meta={"key": r["key"], "road_roll": True,
+                                      "why": "the station road rolled this before the round was planned; "
+                                             "its odds and options are on the desk (STATION1 / POOLS1)"},
+                                rng={"u": r["u"], "dice": r["dice"], "label": r["key"]})
+            ev["state_after"] = before
+        return len(rolls)
+
+    def station_view(self, limit=120):
+        return list(self.station_rolls)[-int(limit):]
+
+    # --- [s3-blocks] every block of a writer prompt is a node --------------------
+    def blocks(self, names, mark=None, tint=False, dial=None):
+        """Decide each marked block of one prompt (in order). Recorded as BLOCK
+        events on the conversation the station is writing for (_S3_WRITE), and
+        returned for the prompt's own record. None when System 3 is off: the
+        station sends every block, as it always did."""
+        if not self._dice_live():
+            return None
+        try:
+            handle = _S3_WRITE.get()
+            conv = handle.conv if handle is not None and getattr(handle, "active", False) else None
+            if conv is not None and time.time() - float(conv.get("created") or 0) > 900:
+                conv = None                # a handle left over from a round long written: not this prompt's
+            if conv is not None:
+                conv["prompts"] = int(conv.get("prompts") or 0) + 1
+                seed = "%s|prompt%d" % (conv["seed"], conv["prompts"])
+            else:
+                seed = "prompt|" + hashlib.sha1(("%s|%s" % (time.time(), id(names))).encode("utf-8")).hexdigest()[:16]
+            out = system3.decide_blocks(list(names or []), self.config, seed, conv=conv, tint_on=bool(tint), dial=dial)
+            with self.lock:
+                self.metrics["blocks_decided"] = self.metrics.get("blocks_decided", 0) + len(out)
+                self.metrics["blocks_stripped"] = self.metrics.get("blocks_stripped", 0) + sum(1 for x in out if not x["keep"])
+            return out
+        except Exception as exc:  # noqa: BLE001
+            self.fail("prompt blocks", exc)
+            return None
+
+    def note_prompt(self, digest, decisions, mark=None):
+        """What System 3 decided for the prompt whose words hash to `digest` -
+        the Prompt tab asks for it by the same digest of the request it holds."""
+        try:
+            handle = _S3_WRITE.get()
+            rec = {"digest": str(digest), "at": time.time(), "mark": dict(mark or {}),
+                   "conversation_id": (handle.conv["identity"]["conversation_id"]
+                                       if handle is not None and getattr(handle, "conv", None) else ""),
+                   "blocks": list(decisions or [])}
+            with self.lock:
+                self.prompt_blocks[str(digest)] = rec
+                self.prompt_blocks.move_to_end(str(digest))
+                while len(self.prompt_blocks) > 600:
+                    self.prompt_blocks.popitem(last=False)
+            self.observe_later(rec["conversation_id"] or ("station:" + time.strftime("%Y%m%d%H", time.gmtime())),
+                               "PROMPT", {"digest": rec["digest"], "mark": rec["mark"],
+                                          "stripped": [b.get("name") for b in rec["blocks"] if not b.get("keep")],
+                                          "blocks": [{k: b.get(k) for k in ("name", "kind", "keep", "why", "odds", "u", "chars")}
+                                                     for b in rec["blocks"]]})
+        except Exception as exc:  # noqa: BLE001
+            self.fail("prompt note", exc)
+
+    # --- [s3-flow] uniqueness ------------------------------------------------------
+    def recent_used(self):
+        with self.lock:
+            return list(dict.fromkeys(self.recent_items))
+
+    def _note_used(self, conv):
+        """The items an active round rolled (CTS/RS/IRS/FL/EVENT) rest for the next rounds."""
+        keys = [("%s:%s" % (d.get("family"), d.get("item")))
+                for t in conv.get("turns") or [] for d in t.get("decisions") or []
+                if d.get("family") in ("CTS", "RS", "IRS", "FL", "EVENT") and d.get("item")
+                and d.get("item") not in ("OBLIGATED", "CONTINUE")]
+        with self.lock:
+            for k in keys:
+                if k in self.recent_items:
+                    self.recent_items.remove(k)
+                self.recent_items.append(k)
+
+    @staticmethod
+    def _words(text):
+        return re.findall(r"[a-z0-9']+", str(text or "").lower())
+
+    def near_repeats(self, turns):
+        """Script indices whose words nearly repeat a line already on air: ten
+        words running in common, or 85% the same line."""
+        import difflib
+        with self.lock:
+            aired = [self._words(x) for x in self.recent_air]
+        out = []
+        for i, (_who, text) in enumerate(turns or []):
+            w = self._words(text)
+            if len(w) < 8:
+                continue
+            for a in aired:
+                if len(a) < 8:
+                    continue
+                sm = difflib.SequenceMatcher(None, w, a, autojunk=False)
+                run = sm.find_longest_match(0, len(w), 0, len(a)).size
+                if run >= 10 or (min(len(w), len(a)) >= 8 and sm.ratio() >= 0.85):
+                    out.append(i)
+                    break
+        return out
+
+    def cast_inputs(self):
+        """What the FAV and DIRECTIVE rolls read beyond the tables."""
+        with self.lock:
+            return {"cast_rolls": True, "fav_recent": list(self.cast.get("fav_recent") or []),
+                    "directive_spent": dict(self.cast.get("directive_spent") or {})}
+
+    def _cast_note(self, conv):
+        """An active plan that surfaced a favourite: it rests for the next draws."""
+        fav = conv.get("fav_plan")
+        if not isinstance(fav, dict) or not fav.get("id"):
+            return
+        with self.lock:
+            recent = [x for x in self.cast.get("fav_recent") or [] if x != fav["id"]] + [str(fav["id"])]
+            self.cast["fav_recent"] = recent[-6:]
+        self._cast_save()
+
+    def _cast_aired(self, conv):
+        """A round reached the script ledger: each directive it carried aired once."""
+        cid = str((conv.get("identity") or {}).get("conversation_id") or "")
+        plans = [p for p in (conv.get("directive_plans") or []) if isinstance(p, dict) and p.get("id")]
+        if not cid or not plans:
+            return
+        with self.lock:
+            if cid in self.cast["counted"]:
+                return
+            self.cast["counted"] = (self.cast["counted"] + [cid])[-400:]
+            for p in plans:
+                self.cast["directive_spent"][str(p["id"])] = int(self.cast["directive_spent"].get(str(p["id"])) or 0) + 1
+        self._cast_save()
+
+    def _save_config_now(self, config, note):
+        """Save a config version from any thread: inline on the store's own
+        thread, through it from anywhere else."""
+        if threading.current_thread().name.startswith("system3-store"):
+            h = self.store.save_config(config, note)
+        else:
+            h = _STORE_POOL.submit(self.store.save_config, config, note).result(timeout=20)
+        self.config = config
+        self.log("System 3 config is now %s (%s)" % (h, note))
+        return h
+
+    @staticmethod
+    def _norm_words(text):
+        return " ".join(re.findall(r"[a-z0-9']+", str(text or "").lower()))
+
+    @staticmethod
+    def _pool_table(config, table_id, default):
+        tables = config.setdefault("tables", [])
+        got = next((t for t in tables if isinstance(t, dict) and t.get("id") == table_id), None)
+        if got is None:
+            got = copy.deepcopy(default)
+            tables.append(got)
+            config["defaults_added"] = sorted({str(x) for x in (config.get("defaults_added") or [])} | {table_id})
+        return got
+
+    def favorite_set(self, line_id, text, who="", name="", liked=True):
+        """[s3-cast] A thumbs-up puts the line in FAV1 - the whole cast's
+        favourites, drawn by the FAV roll, never stapled to a prompt; a
+        thumbs-down (or a cleared vote) takes it out. Saved as a config
+        version with a note, like any edit from the desk."""
+        words = " ".join(str(text or "").split())[:400]
+        lid = str(line_id or "")
+        key = self._norm_words(words)
+        config = copy.deepcopy(self.config)
+        has = any(isinstance(t, dict) and t.get("id") == "FAV1" for t in config.get("tables") or [])
+        if not liked and not has:
+            return {"changed": False}
+        fav = self._pool_table(config, "FAV1", system3_tables.FAV1)
+        cat = next((c for c in fav.setdefault("categories", []) if c.get("id") == "liked"), None)
+        if cat is None:
+            cat = {"id": "liked", "label": "Liked lines", "weight": 1.0, "items": []}
+            fav["categories"].append(cat)
+        items = cat.setdefault("items", [])
+
+        def same(it):
+            return bool((lid and str(it.get("line_id") or "") == lid) or (key and self._norm_words(it.get("text")) == key))
+        if liked:
+            if not key:
+                return {"changed": False, "why": "the line has no words"}
+            if any(same(it) for it in items):
+                return {"changed": False, "why": "already one of the favourites"}
+            iid = "fav_" + hashlib.sha1((lid or key).encode("utf-8")).hexdigest()[:10]
+            items.append({"id": iid, "label": words[:60], "text": words, "weight": 1.0,
+                          "seat": _SEAT_OF.get(str(who or ""), ""), "who": str(who or ""), "name": str(name or ""),
+                          "line_id": lid, "at": round(time.time(), 1)})
+            note = "favourite added (%s): %s" % (name or who or "the cast", words[:60])
+        else:
+            keep = [it for it in items if not same(it)]
+            if len(keep) == len(items):
+                return {"changed": False}
+            cat["items"] = keep
+            iid = ""
+            note = "favourite removed: %s" % words[:60]
+        fav["version"] = int(fav.get("version") or 1) + 1
+        try:
+            h = self._save_config_now(config, note)
+        except Exception as exc:  # noqa: BLE001
+            self.fail("favourite", exc)
+            return {"changed": False, "why": "%s: %s" % (type(exc).__name__, str(exc)[:80])}
+        return {"changed": True, "hash": h, "table": "FAV1", "id": iid, "count": len(cat["items"])}
+
+    _LIKED_NOTE = re.compile(r'^The operator liked this line of yours: "(?P<line>.+)" - say things like it', re.S)
+
+    def adopt_mind_notes(self):
+        """[s3-cast] Once: the Mind desk's note book (settings.dj.mind_adjustments,
+        which reached every host prompt as "LIVE MIND ADJUSTMENTS") becomes table
+        rows - a liked line a FAV1 favourite, anything the operator wrote a
+        DIRECTIVE1 row for its seat at odds 100%, exactly as it stood. Marked
+        `mind_notes_adopted`, so nothing is adopted twice."""
+        config = self.config if isinstance(self.config, dict) else {}
+        if config.get("mind_notes_adopted"):
+            return []
+        try:
+            dj = self.host.dj_settings() or {}
+        except Exception:  # noqa: BLE001
+            return []                       # a host with no desk (tests): nothing to adopt
+        notes = dj.get("mind_adjustments") if isinstance(dj.get("mind_adjustments"), dict) else {}
+        new = copy.deepcopy(config)
+        fav = self._pool_table(new, "FAV1", system3_tables.FAV1)
+        liked = next((c for c in fav.setdefault("categories", []) if c.get("id") == "liked"), None)
+        if liked is None:
+            liked = {"id": "liked", "label": "Liked lines", "weight": 1.0, "items": []}
+            fav["categories"].append(liked)
+        drt = self._pool_table(new, "DIRECTIVE1", system3_tables.DIRECTIVE1)
+        cats = {c.get("id"): c for c in drt.setdefault("categories", []) if isinstance(c, dict)}
+        names = {"dj": dj.get("host_name"), "cohost": dj.get("cohost_name"), "third": dj.get("third_name")}
+        seat_cat = {"dj": "host", "cohost": "cohost", "third": "third"}
+        done = []
+        for who, rows in notes.items():
+            for row in rows if isinstance(rows, list) else []:
+                text = " ".join(str((row or {}).get("text") or "").split()) if isinstance(row, dict) else ""
+                if not text:
+                    continue
+                m = self._LIKED_NOTE.match(text)
+                if m:
+                    line = " ".join(m.group("line").split())[:400]
+                    if any(self._norm_words(it.get("text")) == self._norm_words(line) for it in liked["items"]):
+                        continue
+                    liked["items"].append({"id": "fav_" + hashlib.sha1(self._norm_words(line).encode("utf-8")).hexdigest()[:10],
+                                           "label": line[:60], "text": line, "weight": 1.0,
+                                           "seat": _SEAT_OF.get(who, ""), "who": who, "name": str(names.get(who) or ""),
+                                           "line_id": str(row.get("liked_line") or ""), "at": float(row.get("at") or 0),
+                                           "source": "the Mind desk's note book"})
+                    done.append("favourite (%s): %s" % (who, line[:40]))
+                elif who in seat_cat and seat_cat[who] in cats:
+                    cat = cats[seat_cat[who]]
+                    cat.setdefault("items", []).append({
+                        "id": "dir_" + hashlib.sha1((who + text).encode("utf-8")).hexdigest()[:10],
+                        "label": text[:60], "text": text[:500], "weight": 1.0, "odds": 1.0, "until": 0, "airings": 0,
+                        "source": "the Mind desk's note book"})
+                    done.append("directive (%s): %s" % (who, text[:40]))
+                else:
+                    done.append("left on the Mind desk (%s is not a host seat): %s" % (who, text[:40]))
+        new["mind_notes_adopted"] = True
+        try:
+            self._save_config_now(new, "the Mind desk's notes adopted: %d row(s)" % len(done))
+        except Exception as exc:  # noqa: BLE001
+            self.fail("adopt mind notes", exc)
+            return []
+        return done
 
     def add_missing_default_tables(self):
         """[s3-rounds] The store is the authority and it was saved before some
@@ -359,6 +910,9 @@ class System3Runtime:
         # [rng-topics] the operator's topics board, for the TOPIC roll
         topic_bank = self._topic_bank(ctx)
         availability["topics"] = bool(topic_bank)
+        # [s3-events] a call's own passage - what a caller's speakerbox tangent wanders into
+        call_of = self._call_of(ctx)
+        availability["call_passage"] = bool(call_of.get("speakerbox"))
         return {
             "road": road, "at": time.time(), "seats": seats, "names": names, "roles": roles,
             "initial_emotions": moods, "turns": int(ctx.get("lines") or 8),
@@ -384,7 +938,7 @@ class System3Runtime:
             "seed_text": " ".join(seed_text.split())[:1500],
             "topic_bank": topic_bank,
             # [s3-calls] what a call needs to be built from System 3's structure
-            "call": self._call_of(ctx),
+            "call": call_of,
             # [s3-roads] a message, not a conversation (never cut on the air)
             "whole": bool(ctx.get("whole")),
             # [s3-glass] the round's length: the dial's random stood here (a
@@ -407,10 +961,19 @@ class System3Runtime:
             "interjections": ([] if ctx.get("caller_name") else
                               [" ".join(str(x).split()) for x in (dj.get("diatribe_interjections") or [])
                                if str(x or "").strip()][:60]),
+            "record": ({k: str((ctx.get("record") or {}).get(k) or "")[:180]
+                        for k in ("id", "title", "artist")}
+                       if road == "banter" and not ctx.get("bank") and isinstance(ctx.get("record"), dict) else {}),
             "station_name": " ".join(str(dj.get("station_name") or "").split())[:80],
             "live": not bool(ctx.get("bank")),
             # [s3-carry] what the last round left on the air, for a round that airs as written
             "carry": self._carry_for(ctx),
+            # [s3-cast] the favourites and directives rolls
+            **self.cast_inputs(),
+            # [s3-events] what can happen in the segment (EVENT tables)
+            "event_rolls": True,
+            # [s3-flow] what recent rounds used weighs a quarter
+            "recent_items": self.recent_used(),
         }
 
     def _carry_for(self, ctx):
@@ -665,6 +1228,7 @@ class System3Runtime:
             started = time.perf_counter()
             conv = system3.new_conversation(inputs, config, self.settings)
             conv["mode"] = mode
+            self._absorb_rolls(conv)                                            # [s3-dice-door]
             handle = Handle(self, conv, config, mode == "active")
             handle.bank = bool(ctx.get("bank"))
             call = inputs.get("call") or {}
@@ -672,6 +1236,15 @@ class System3Runtime:
                 # [s3-calls] the call is built by System 3's own call structure
                 system3.plan_call(conv, config, inputs)
                 handle.sheet = system3.render_call_sheet(conv) if handle.active else ""
+                # [s3-events] the roulette ended this call early (the line lost, the
+                # caller pulled away): the station's call contract waives its
+                # sign-off and landing (call_flow_report ended=). dj_banter hands
+                # System 3 its own call_meta dict and the entry copies it, so every
+                # later regrade sees the mark.
+                if handle.active and conv.get("event_end") is not None and isinstance(ctx.get("call_meta"), dict):
+                    end = next((x for x in conv.get("event_plans") or [] if x.get("ends")), {})
+                    ctx["call_meta"]["ended"] = ("%s: %s" % (end.get("kind_label") or "ended",
+                                                             end.get("label") or ""))[:200]
             elif road == "caller":
                 rows = [(int(n), seat, work) for n, seat, work in
                         re.findall(r"(?m)^\s*(\d+)\s+([ABCDE])\s+[-–—]\s*(.+?)\s*$", ctx.get("call_sheet") or "")]
@@ -695,6 +1268,9 @@ class System3Runtime:
             if handle.active and conv.get("carry"):
                 with self.lock:
                     self.metrics["carry_in"] += 1
+            if handle.active:
+                self._cast_note(conv)                                          # [s3-cast]
+                self._note_used(conv)                                          # [s3-flow]
             if handle.active:
                 with self.lock:
                     self.open[conv["identity"]["conversation_id"]] = {"at": time.time(), "road": road,
@@ -728,6 +1304,7 @@ class System3Runtime:
             self.persist(conv)
             self._flow(conv, "planned %d turns, %d decisions (%s, %.1f ms)"
                        % (len(conv["turns"]), len(conv["decision_events"]), mode, handle.plan_ms))
+            _S3_WRITE.set(handle)          # [s3-blocks] the writer call that follows on this task writes for it
             return handle
         except Exception as exc:  # noqa: BLE001
             self.fail("planning", exc)
@@ -777,12 +1354,16 @@ class System3Runtime:
                 "candidates": cands, "candidates_from": str(ctx.get("candidates_from") or ""),
                 "line_text": " ".join(str(ctx.get("text") or "").split())[:600],
                 "sfxguy": {"voice": False},
+                **self.cast_inputs(),                                        # [s3-cast]
             }
             config = self.config
             conv = system3.new_conversation(inputs, config, self.settings)
             conv["mode"] = mode
+            self._absorb_rolls(conv)                                            # [s3-dice-door]
             system3.plan_line(conv, config, inputs)
             handle = LineHandle(self, conv, mode == "active")
+            if handle.active:
+                self._cast_note(conv)                                          # [s3-cast]
             handle.plan_ms = round((time.perf_counter() - started) * 1000, 2)
             choice = conv.get("line_choice") or {}
             if cands and choice.get("id") is not None:
@@ -812,6 +1393,7 @@ class System3Runtime:
             self._flow(conv, "planned a %s line: %d decisions (%s, %.1f ms)%s"
                        % (road, len(conv["decision_events"]), mode, handle.plan_ms,
                           (", drew %d of %d" % (handle.choice + 1, len(cands))) if handle.choice is not None else ""))
+            _S3_WRITE.set(handle)          # [s3-blocks]
             return handle
         except Exception as exc:  # noqa: BLE001
             self.fail("line planning", exc)
@@ -866,6 +1448,14 @@ class System3Runtime:
             conv["identity"]["script_digest"] = hashlib.sha256(words.encode("utf-8")).hexdigest()[:16]
             conv["bindings"] = [{"turn_id": t["turn_id"], "script_index": 0} for t in conv["turns"][-1:]]
             conv["status"] = ("bound" if handle.active else "shadowed") if words else "dropped"
+            fav = (conv["turns"][-1].get("favorite") or {}) if conv["turns"] else {}      # [s3-cast]
+            if words and fav.get("text"):
+                copied = bool(system3.favorite_copied(fav["text"], words))
+                conv["validation"] = {"method": "deterministic/lexical", "favorite_copies": int(copied),
+                                      "verdict": "non_compliant" if copied else "compliant"}
+                self.observe_later(conv["identity"]["conversation_id"], "FAV", {
+                    "stage": "copied" if copied else "in its spirit", "favorite": fav.get("id"),
+                    "run": system3.favorite_run(fav["text"], words)})
             with self.lock:
                 self.metrics["lines_bound"] += 1
             self.remember(conv)
@@ -1035,6 +1625,14 @@ class System3Runtime:
         try:
             turns = self.host.banter_turns(script or "")
             val = system3.validate(handle.conv, turns)
+            # [s3-flow] UNIQUENESS: a written turn that nearly repeats a line already
+            # on air sends the round to the REPAIR roll - a rewrite, not a rerun
+            _rep = self.near_repeats(turns)
+            if _rep:
+                val["repair_wanted"] = True
+                val["near_repeats"] = _rep
+                self.observe_later(handle.id, "REPEAT", {"turns": _rep, "why": "these written turns nearly repeat "
+                                                         "lines already on air"})
             handle.conv["pre_repair"] = {k: val[k] for k in ("score", "verdict", "seat_order", "turn_ratio")}
             # [s3-rewrite] the REPAIR roll decides: a round that rolled "stands"
             # is not sent back, whatever the checks say - and says so
@@ -1422,6 +2020,10 @@ class System3Runtime:
         """A round was committed to the script ledger - the script is frozen
         and ordered. Record which ledger line each planned turn became."""
         try:
+            with self.lock:                                                    # [s3-flow]
+                for row in rows or []:
+                    if isinstance(row, dict) and len(str(row.get("text") or "")) > 30:
+                        self.recent_air.append(" ".join(str(row["text"]).split())[:600])
             links = {}
             for ord_, row in enumerate(rows or []):
                 s3 = row.get("system3") if isinstance(row.get("system3"), dict) else {}
@@ -1453,6 +2055,7 @@ class System3Runtime:
                         handed = self._hand_on(conv, [r for r in (rows or []) if isinstance(r, dict)])
                         if handed:
                             self.store.add_observation(cid, "CARRY", handed)
+                        self._cast_aired(conv)                                  # [s3-cast]
                 _STORE_POOL.submit(job)
         except Exception as exc:  # noqa: BLE001
             self.fail("ledger link", exc)
@@ -1698,6 +2301,7 @@ class System3Runtime:
                            "landing": (carry.get("landing") or {}).get("text", "")[:120],
                            "tempers": carry.get("tempers")} if carry else None),
                 "open_rounds": open_rounds,                                    # [s3-withhold]
+                "cast": self.cast_view(),                                       # [s3-cast]
                 "road_modes": {r: system3.road_mode(self.settings, r) for r in system3.ROADS},
                 "roads": self.roads(),                                           # [s3-roads]
                 "metrics": m,
@@ -1711,6 +2315,32 @@ class System3Runtime:
                     "speakerbox": "passages are drawn by the station's speakbox_quote (locks, themes, "
                                   "cooldowns, rotation); System 3 rolls the doors and marks."}}
 
+    def cast_view(self):
+        """[s3-cast] The two pools as the desk reads them: how many favourites
+        and directives, which rest, which directives are spent or expired."""
+        now = time.time()
+        favs, dirs = 0, []
+        for t in (self.config.get("tables") or []):
+            if not isinstance(t, dict):
+                continue
+            for c in t.get("categories") or []:
+                for it in c.get("items") or []:
+                    if not isinstance(it, dict):
+                        continue
+                    if t.get("family") == "FAV":
+                        favs += 1
+                    elif t.get("family") == "DIRECTIVE":
+                        with self.lock:
+                            aired = int(self.cast["directive_spent"].get(str(it.get("id"))) or 0)
+                        until, budget = float(it.get("until") or 0), int(float(it.get("airings") or 0))
+                        state = ("expired" if until and until < now else "spent" if budget and aired >= budget
+                                 else "off" if it.get("enabled") is False else "live")
+                        dirs.append({"id": it.get("id"), "table": t.get("id"), "category": c.get("id"),
+                                     "odds": it.get("odds", 1.0), "aired": aired, "state": state})
+        with self.lock:
+            recent = list(self.cast.get("fav_recent") or [])
+        return {"favorites": favs, "fav_recent": recent, "directives": dirs}
+
     def config_view(self):
         """[s3-roads] The config as the desk sees it: every road's structure
         present (the saved one, else the default), his section defaulted.
@@ -1720,6 +2350,7 @@ class System3Runtime:
         structures.update({k: v for k, v in (view.get("structures") or {}).items() if isinstance(v, dict)})
         view["structures"] = structures
         view.setdefault("sfxguy", copy.deepcopy(system3.DEFAULT_SFXGUY))
+        view["blocks"] = system3.block_rules(self.config)                  # [s3-blocks] every rule, defaults included
         return view
 
     def roads(self):
@@ -1803,6 +2434,14 @@ def install(app, namespace):
     namespace["system3_link_line"] = rt.link_spoken                  # [s3-line-link]
     namespace["system3_observe_ledger"] = rt.observe_ledger
     namespace["system3_withhold"] = rt.withhold                        # [s3-withhold]
+    namespace["system3_favorite"] = rt.favorite_set                    # [s3-cast]
+    namespace["system3_chance"] = rt.chance                            # [s3-dice-door]
+    namespace["system3_pool"] = rt.pool
+    namespace["system3_pick"] = rt.pick
+    namespace["system3_roll"] = rt.roll
+    namespace["system3_blocks"] = rt.blocks                            # [s3-blocks]
+    namespace["system3_note_prompt"] = rt.note_prompt
+    namespace["system3_writing_for"] = _S3_WRITE
     namespace["_system3"] = lambda: rt
 
     @app.on_event("startup")
@@ -1863,6 +2502,35 @@ def install(app, namespace):
         out = rt.status()
         out["store"] = await rt.read(rt.store.counts)
         return out
+
+    @app.get("/api/system3/prompt-blocks")
+    async def prompt_blocks(digest: str = "", authorization: str | None = Header(default=None)):
+        """[s3-blocks] What System 3 decided for each block of one prompt (by the
+        digest of the words sent), and the rules every block is decided by."""
+        host.require_read_auth(authorization)
+        with rt.lock:
+            got = rt.prompt_blocks.get(str(digest)) if digest else None
+        return {"prompt": got, "rules": system3.block_rules(rt.config)}
+
+    @app.post("/api/system3/prompt-blocks")
+    async def prompt_blocks_for_text(request: Request, authorization: str | None = Header(default=None)):
+        """[s3-blocks] The same, found by the words of the prompt itself (the page
+        holds the request; the digest is taken here, as the writer's door took it)."""
+        host.require_read_auth(authorization)
+        raw = body_json(await request.body())
+        text = str((raw or {}).get("text") or "")
+        digest = hashlib.sha1(text.encode("utf-8")).hexdigest()[:16] if text else ""
+        with rt.lock:
+            got = rt.prompt_blocks.get(digest) if digest else None
+        return {"digest": digest, "prompt": got, "rules": system3.block_rules(rt.config)}
+
+    @app.get("/api/system3/station")
+    async def station_rolls(limit: int = 120, authorization: str | None = Header(default=None)):
+        """[s3-dice-door] the station's own rolls, newest last, and the rows still being added."""
+        host.require_read_auth(authorization)
+        with rt.lock:
+            pending = {k: sorted(v) for k, v in rt.dice_pending.items()}
+        return {"rolls": rt.station_view(max(1, min(400, int(limit)))), "pending": pending}
 
     @app.get("/api/system3/now")
     async def now(authorization: str | None = Header(default=None)):
@@ -1965,7 +2633,7 @@ def install(app, namespace):
                     raise HTTPException(400, "unknown family %r" % d.get("family"))
         config = copy.deepcopy(rt.config)
         structure = dict(config["structure"])
-        structure.update({k: raw[k] for k in ("steps", "closing", "handoff", "label") if k in raw})
+        structure.update({k: raw[k] for k in ("steps", "closing", "handoff", "label", "initiator") if k in raw})   # [s3-flow]
         structure["version"] = int(structure.get("version") or 1) + 1
         config["structure"] = structure
         return {"hash": await save_config(config, "structure v%d" % structure["version"]),
@@ -2024,11 +2692,16 @@ def install(app, namespace):
     @app.put("/api/system3/config/section/{name}")
     async def put_section(name: str, request: Request, authorization: str | None = Header(default=None)):
         host.require_auth(authorization)
-        if name not in ("speakerbox", "sfx", "personalities"):
+        if name not in ("speakerbox", "sfx", "personalities", "sfxguy", "blocks"):   # [s3-blocks]
             raise HTTPException(404, "no section %s" % name)
         raw = body_json(await request.body())
         if not isinstance(raw, dict):
             raise HTTPException(400, "a section is an object")
+        if name == "blocks":
+            try:
+                raw = system3.validate_blocks(raw)
+            except ValueError as exc:
+                raise HTTPException(400, str(exc)) from exc
         config = copy.deepcopy(rt.config)
         config[name] = raw
         return {"hash": await save_config(config, "%s section" % name)}
@@ -2174,6 +2847,80 @@ def install(app, namespace):
         if raw.get("keep"):
             rt.persist(conv)
         return conv
+
+    @app.post("/api/system3/preview")
+    async def preview_conversation(request: Request, authorization: str | None = Header(default=None)):
+        """Replan a recorded banter round with current settings and draft it off air.
+
+        The result is returned to the operator only. It never binds a line,
+        enters the script ledger, or joins the broadcast queue.
+        """
+        host.require_auth(authorization)
+        raw = body_json(await request.body())
+        cid = str(raw.get("conversation_id") or "")[:100]
+        source = await rt.read(rt.store.conversation, cid) if cid else None
+        if not source:
+            raise HTTPException(404, "the source conversation is not in the System 3 ledger")
+        if (source.get("identity") or {}).get("road_kind") != "banter":
+            raise HTTPException(400, "dialogue preview currently supports banter rounds")
+        if not callable(namespace.get("ask_model")):
+            raise HTTPException(503, "the station writer is unavailable")
+        settings = system3.normalise_settings(dict(rt.settings, mode="active"))
+        inputs = copy.deepcopy(source.get("inputs") or {})
+        plan = await asyncio.get_running_loop().run_in_executor(
+            _READ_POOL, lambda: system3.plan_scene(inputs, rt.config, settings, seed=source.get("seed")))
+        plan["mode"] = "simulation"
+        plan["status"] = "preview"
+        plan["preview_source"] = cid
+        plan["plan"] = {"sheet": system3.render_sheet(plan), "active": False}
+        dj = namespace["dj_settings"]() if callable(namespace.get("dj_settings")) else {}
+        station = namespace["dj_disposition"]() if callable(namespace.get("dj_disposition")) else ""
+        persona_fields = {"A": ("host", "persona"), "B": ("cohost", "cohost_persona"),
+                          "D": ("third", "third_persona")}
+        personas = []
+        for seat in inputs.get("seats") or []:
+            if seat not in persona_fields:
+                continue
+            slot, field = persona_fields[seat]
+            value = str(dj.get(field) or "").strip()
+            if callable(namespace.get("radio_persona")):
+                value = namespace["radio_persona"](slot, value)
+            if value:
+                personas.append("%s persona: %s" % (seat, value[:4000]))
+        subject = str((plan.get("subject") or {}).get("topic") or "")[:400]
+        prompt = ("Write a draft radio conversation about: %s\n" % subject
+                  + "Use the A:/B:/D: speaker labels in the running order. "
+                    "Write only the dialogue lines. Each reply must respond to the preceding line.\n"
+                  + ("\nStation instructions:\n%s\n" % station if station else "")
+                  + ("\n".join(personas) + "\n" if personas else "")
+                  + plan["plan"]["sheet"])
+        try:
+            draft = await asyncio.wait_for(namespace["ask_model"](
+                prompt, limit=min(6500, max(1200, len(plan["turns"]) * 320)),
+                spice=0.3, mark={"kind": "system3 visual preview"},
+                result_contract="structured_turns"), timeout=210)
+        except asyncio.TimeoutError as exc:
+            raise HTTPException(504, "the preview writer timed out") from exc
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(503, "the preview writer could not complete: %s" % exc) from exc
+        rows = namespace["banter_turns"](draft) if callable(namespace.get("banter_turns")) else []
+        matched = 0
+        for turn, row in zip(plan["turns"], rows):
+            if str(row[0]) != str(turn["speaker"]):
+                break
+            turn["text"] = str(row[1])[:1500]
+            turn["status"] = "preview"
+            matched += 1
+        model_settings = namespace["load_settings"]() if callable(namespace.get("load_settings")) else {}
+        plan["preview_call"] = {
+            "at": time.time(), "model": str(model_settings.get("model") or ""),
+            "purpose": "system3 visual preview", "state": "done", "wire_exact": False,
+            "layers": {"station": station, "personas": personas},
+            "request": {"model": str(model_settings.get("model") or ""),
+                        "messages": [{"role": "user", "content": prompt}]},
+            "response": {"message": {"content": str(draft or "")}},
+            "matched_turns": matched, "planned_turns": len(plan["turns"])}
+        return plan
 
     @app.post("/api/system3/replay/{cid}")
     async def replay(cid: str, authorization: str | None = Header(default=None)):

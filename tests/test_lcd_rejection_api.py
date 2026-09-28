@@ -61,6 +61,34 @@ class LcdRejectionTests(unittest.IsolatedAsyncioTestCase):
             return await client.request(method, path, json=body,
                 headers={'Authorization': 'Bearer lcd-review-test'} if authenticated else {})
 
+    async def test_prompt_guidance_note_edit_preserves_review_and_air_effect(self):
+        row = self.cut()
+        endpoint = '/api/orchestrator/rejections/' + row['id']
+        decided = await self.request('POST', endpoint, {'action': 'keep', 'note': 'old note'})
+        self.assertEqual(decided.status_code, 200, decided.text)
+        before = self.store.get(row['id'])
+        app.line_review_keep.reset_mock()
+        changed = await self.request('POST', endpoint + '/guidance',
+                                     {'note': 'Prefer a shorter image.', 'expected_revision': before['revision']})
+        self.assertEqual(changed.status_code, 200, changed.text)
+        after = self.store.get(row['id'])
+        self.assertEqual(after['decision']['note'], 'Prefer a shorter image.')
+        self.assertEqual(after['decision']['action'], 'keep')
+        self.assertEqual(after['effect'], before['effect'])
+        self.assertEqual(self.store.preference_examples(kind='banter', gate='tint')[0]['note'],
+                         'Prefer a shorter image.')
+        app.line_review_keep.assert_not_called()
+        excluded = await self.request('POST', endpoint + '/guidance',
+                                      {'excluded': True, 'expected_revision': after['revision']})
+        self.assertEqual(excluded.status_code, 200, excluded.text)
+        self.assertTrue((await self.request('GET', endpoint)).json()['prompt_excluded'])
+        self.assertEqual(self.store.preference_examples(kind='banter', gate='tint'), [])
+        self.assertEqual(self.store.get(row['id'])['effect'], before['effect'])
+        app.line_review_keep.assert_not_called()
+        conflict = await self.request('POST', endpoint + '/guidance',
+                                      {'note': 'stale', 'expected_revision': before['revision']})
+        self.assertEqual(conflict.status_code, 409)
+
     async def test_exact_occurrence_full_evidence_and_authenticated_decisions(self):
         self.source *= 120; self.candidate *= 120
         row = self.cut()
@@ -169,6 +197,7 @@ class LcdRejectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('accepted the wording', guide)
         self.assertIn('Do not recite', guide)
         self.assertIn(first['id'], guide)
+        self.assertNotIn(self.source, guide)
         self.assertFalse(self.store.evaluate('tint', 'Future original', 'Future candidate', ['style'])['allowed'])
         self.assertFalse(self.store.evaluate('tint', self.source, self.candidate, ['missing'], technical=True)['allowed'])
 
@@ -176,7 +205,7 @@ class LcdRejectionTests(unittest.IsolatedAsyncioTestCase):
         self.store.decide(self.cut()['id'], 'allow', 'Keep that meaning.')
         settings = {'model': 'test', 'max_tokens': 50, 'temperature': .5, 'top_p': .9, 'num_ctx': 2048}
         with ExitStack() as stack:
-            for name, value in {'load_settings': lambda: settings, 'dj_settings': lambda: {'reply_max_chars': 6000},
+            for name, value in {'load_settings': lambda: settings, 'dj_settings': lambda: {'reply_max_chars': 6000, 'operator_wording_examples': True},
                 'writing_profile': lambda: {}, 'box_depth': lambda: 0., 'model_ctx': lambda: 2048,
                 'round_mark': mock.Mock(), 'pipeline_log': mock.Mock(), '_ROUND_MARK': {}}.items():
                 stack.enter_context(mock.patch.object(app, name, value))

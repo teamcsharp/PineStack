@@ -9,9 +9,11 @@
  * die shows no number until it lands on the one that was rolled. Nothing
  * here invents a roll for effect.
  */
-const FAM = {CTS: 'var(--cts)', ES: 'var(--es)', RS: 'var(--rs)', IRS: 'var(--irs)', FL: 'var(--fl)',
+const FAM = {CTS: 'var(--cts)', ES: 'var(--es)', RS: 'var(--rs)', IRS: 'var(--irs)', FL: 'var(--fl)', TRACK_TALK: 'var(--topic)',
   SPEAKERBOX: 'var(--sb)', SFX: 'var(--sfx)', TOPIC: 'var(--topic)', SFXGUY: 'var(--sfxguy)', LINE: 'var(--line)',
-  COMMIT: 'var(--obs)', REPAIR: 'var(--repair)', TINT: 'var(--tint)', ROOM: 'var(--room)'};   /* [s3-rewrite] */
+  COMMIT: 'var(--obs)', REPAIR: 'var(--repair)', TINT: 'var(--tint)', ROOM: 'var(--room)',   /* [s3-rewrite] */
+  FAV: 'var(--fav)', DIRECTIVE: 'var(--directive)', EVENT: 'var(--repair)', STATION: 'var(--obs)',   /* [s3-cast] [s3-events] [s3-dice-door] */
+  TEMPER: 'var(--es)', SHOCK: 'var(--rs)', INTERJECT: 'var(--fl)', MENTION: 'var(--cts)', CARRY: 'var(--es)'};   /* [s3-rounds] [s3-carry] */
 const SIDE = {A: 'left', B: 'right', D: 'left', C: 'right', E: 'right'};
 const reduced = () => window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -79,6 +81,12 @@ function eventLine(ev, conv) {
     return {fam, dice: d && d.draw ? d.draw.dice : null,
       text: sel.id === 'NONE' ? `${pct(meta.rate)} odds → nothing off the board`
         : `${pct(meta.rate)} odds → "${sel.label}" → turn ${Number(meta.turn_index) + 1}`};
+  }
+  if (fam === 'TRACK_TALK') {
+    const meta = ev.meta || {}, d = stage(ev, 'dice');
+    return {fam, dice: d && d.draw ? d.draw.dice : null,
+      text: sel.id === 'TRACK_TALK' ? `${pct(meta.rate)} odds → ${sel.label}`
+        : `${pct(meta.rate)} odds → no record comment in this banter round`};
   }
   if (fam === 'SFX') {
     const d = stage(ev, 'dice'), p = stage(ev, 'placement');
@@ -230,7 +238,21 @@ const FAMILY_WHAT = {
     "Whether the SFX guy wants a clip at this line, before or after it, and what it should be about. The station's matcher and rotation choose the real file from the indexed book; the two-line cadence is never reduced."],
   TOPIC: ["Topic (the operator's board)",
     'Whether something off your topics board comes up in this round, which one, and on which turn - three draws, all recorded. The Topics dial sets the odds (0.5: 40% of rounds, 1.0: 80%, 0: never) and the least-sprung topics weigh most. The chosen turn still answers the line before it, then brings the topic up in its own words; a "1. / 2." entry is said word for word and answered word for word on the next turn. Nothing else puts a topic into a conversation.'],
+  TRACK_TALK: ['Live record comment', 'A recorded roulette draw decides whether one turn of live banter briefly connects to the record playing under it. Banked rounds never name a record that may have changed before air.'],
   COMMIT: ['Script ledger', 'The round was frozen into the script ledger in the order it will be heard.'],
+  /* [s3-rounds] dj_banter's prompt randoms, as rolls */
+  TEMPER: ['Temper (TEMPER1)',
+    'The temper this host is caught in tonight - one draw per seat per round when the desk\'s dice_hosts switch is on. It goes into the running order\'s head and colours every turn underneath its own rolled feeling; a temper worn in the last rounds weighs a quarter.'],
+  SHOCK: ['Shock beat (SHOCK1)',
+    'Whether one speaker is openly taken aback by what the other has JUST said - says so, and the rest of the round is driven by it - which reaction, and on which turn. Three recorded draws; the shock_beat control sets the odds (0.5: one round in two).'],
+  INTERJECT: ['Interjections (INTERJECT1 or the desk\'s list)',
+    'Whether one host goes on a roll and the other gets a word in edgewise, on which turn, and which three phrases. The interjection and the carry-on are turns of their own in the running order, so the seat order the bind aligns on is exactly what the writer was told. Banter only; never on a call.'],
+  MENTION: ['Station-name mention',
+    'Whether the station\'s name is worked in once this round, and on which turn (the mention control: 0.5 is the old 30%). Otherwise the station IDs carry it.'],
+  CARRY: ['Carry (the last round\'s ending)',
+    'No draw. The round that aired last handed on each host seat\'s ending emotion, position and energy, the dynamics, its unresolved points and the line it landed on; decayed by its age over 20 minutes, that is where this round starts - and turn 1 picks up from that landing. A banked round takes it in the voice only, at air.'],
+  WITHHELD: ['Withheld', 'The round was planned and will not air: the reason is on the card (the writer was deferred, came back with no turns, or the draft was refused). Nothing stands in for it.'],
+  ABANDONED: ['Abandoned', 'Planned and never bound within half an hour - the station took an exit System 3 was not told about. Filed by the sweep so every spin of the Rolodex is accounted for.'],
   REPAIR: ['Sent back to the writer',
     'Whether a round that misses its target - the running order ignored, the richness target missed, a call contract failed - goes back to the writer for one rewrite, or stands as written. Rolled once per round at the odds of the Repair control; on System 3 rounds the review gates no longer decide it.'],
   TINT: ['Rhyme this line (the crystal tint)',
@@ -239,11 +261,20 @@ const FAMILY_WHAT = {
     "Whether the Writers' Room may add to or rewrite this round later (its two tickets: add turns to a round that owes structure, rewrite a round whose topic or words drifted). Rolled once per round at the odds of the Room control; a round that rolled no is left alone."],
   LENGTH: ['Length', 'How many turns the round runs: one roll over the segment\'s budget band - never shorter than the slot asked for, at most one and a half times it - so the round fits its hour.'],
   VARIANT: ['Structure variant', 'Which structure of the road runs this round: the road\'s own segment or one of its variants on the desk, one weighted draw among them.'],
+  FAV: ['Favourite (FAV1)',
+    'Whether a line the operator liked comes up in this round or line, which one, and on which turn - three draws, all recorded. The pool is every thumbs-up from the whole cast; the Favorites control is the odds (0.25: one in four). A favourite that came up lately weighs a quarter. The writer is told to say something NEW in its spirit and attitude - never to repeat or quote it - and a turn that copies it fails validation.'],
+  STATION: ['Station roll (STATION1 / POOLS1)',
+    'A roll a station road made for the air before this round was planned - a caller preferring a host, a prize, a hostile turn, which state they ring in, how the call ends. System 3 rolled it: the odds are its STATION1 row (or the desk dial the row follows), and the options of a pick are its POOLS1 list - both edited in Tables. Recorded here, not re-planned.'],
+  EVENT: ['Happening (CALLEVENT1 and any EVENT table)',
+    'Something that happens in the segment - a caller who gets emotional, wins a prize, turns on the hosts, hears from upstairs, goes off on a tangent, gets interrupted by what is going on around them, or loses the line. Each kind has its own odds per segment (a die); a hit draws which variant and which turn of its seat. An ending cuts the segment on that turn and a host reacts to the dead line. Edited in Tables: odds, seat, place, ends, earliest turn.'],
+  DIRECTIVE: ["Operator's directive (DIRECTIVE1)",
+    'One of your directives for this seat, from System 3 > Tables > DIRECTIVE1. Each row has its own odds: 100% is a standing rule (recorded, not drawn), lower is a die. A hit lands on one of that seat\'s turns, drawn here. A row can expire by date or after a number of airings.'],
 };
 const DIAL_FOR = {ES: ['emotional_volatility'], RS: ['disagreement', 'escalation', 'tangent', 'callback', 'novelty'],
   IRS: ['disagreement', 'escalation'], FL: ['tangent', 'callback', 'novelty', 'closure_aggressiveness', 'escalation'],
   SPEAKERBOX: ['speakerbox_density'], SFX: ['sfx_aggression'], CTS: ['novelty'], TOPIC: ['topics'],
-  TINT: ['tint'], REPAIR: ['repair'], ROOM: ['room']};
+  TINT: ['tint'], REPAIR: ['repair'], ROOM: ['room'], FAV: ['favorites'],
+  SHOCK: ['shock_beat'], INTERJECT: ['interjections'], MENTION: ['mention'], TRACK_TALK: ['track_talk']};   /* [s3-rounds] */
 
 function kv(pairs) {
   return el('div', 's3-kv', ...pairs.filter(p => p && p[1] !== undefined && p[1] !== null && p[1] !== '')
@@ -687,6 +718,15 @@ async function playReels(rolled, reels, ms) {
 
 function drumAnimated2(cands, selected) { const d = drum(cands, selected); setTimeout(() => d.roll(reduced() ? 0 : 1100), 80); return d; }
 
+function movableModal(panel) {
+  panel.setAttribute('data-pine-drag', '');
+  const handle = el('div', {class: 's3-modal-drag', 'data-pine-drag-handle': '', text: 'Drag to move'});
+  const close = panel.querySelector('.s3-modal-close');
+  if (close && close.parentNode === panel) close.after(handle);
+  else panel.prepend(handle);
+  return panel;
+}
+
 function openDecision(conv, ev, turn, api) {
   if (!conv || !ev) return null;
   const back = el('div', {class: 's3 s3-modal-back'});
@@ -696,7 +736,7 @@ function openDecision(conv, ev, turn, api) {
   const shut = btn('Close', close, {class: 's3-modal-close', 'aria-label': 'Close'});
   const panel = el('section', {class: 's3-modal', role: 'dialog', 'aria-modal': 'true', 'aria-label': 'How this was decided'},
     shut, decisionCard(conv, ev, turn, api));
-  back.append(panel);
+  back.append(movableModal(panel));
   back.addEventListener('click', e => { if (e.target === back) close(); });
   document.addEventListener('keydown', onKey, true);
   document.body.append(back);
@@ -773,8 +813,8 @@ function openAssembly(conv, air) {
   const close = () => { back.remove(); document.removeEventListener('keydown', onKey, true); if (before && before.focus) before.focus(); };
   const onKey = e => { if (e.key === 'Escape') { e.stopPropagation(); close(); } };
   const shut = btn('Close', close, {class: 's3-modal-close', 'aria-label': 'Close'});
-  back.append(el('section', {class: 's3-modal', role: 'dialog', 'aria-modal': 'true', 'aria-label': 'How this segment was assembled'},
-    shut, assemblyCard(conv, air || new Map())));
+  back.append(movableModal(el('section', {class: 's3-modal', role: 'dialog', 'aria-modal': 'true', 'aria-label': 'How this segment was assembled'},
+    shut, assemblyCard(conv, air || new Map()))));
   back.addEventListener('click', e => { if (e.target === back) close(); });
   document.addEventListener('keydown', onKey, true);
   document.body.append(back);
@@ -1232,12 +1272,12 @@ async function openCutPanel(v) {
   const close = () => { back.remove(); document.removeEventListener('keydown', onKey, true); };
   const onKey = e => { if (e.key === 'Escape') { e.stopPropagation(); close(); } };
   const list = el('div', 's3-cutlist', para('Reading the switches...', 's3-muted'));
-  back.append(el('section', {class: 's3-modal', role: 'dialog', 'aria-modal': 'true', 'aria-label': 'The systems that cut lines'},
+  back.append(movableModal(el('section', {class: 's3-modal', role: 'dialog', 'aria-modal': 'true', 'aria-label': 'The systems that cut lines'},
     btn('Close', close, {class: 's3-modal-close'}),
     el('div', 's3-dcard',
       el('div', 's3-dhead', el('div', null, el('b', {text: 'The systems that cut lines'}),
         el('div', {class: 's3-muted', text: 'Each one is a switch in the station\'s policy book. A line one of them cut shows why on its message, with this same switch.'}))),
-      list)));
+      list))));
   back.addEventListener('click', e => { if (e.target === back) close(); });
   document.addEventListener('keydown', onKey, true);
   document.body.append(back);
@@ -2521,10 +2561,10 @@ export async function mountEmbedded(root, {request, view = 'conversation', onSel
       btn('How System 3 assembled it', () => { close(); openAssembly(conv, v.air); }),
       btn('Replay this round\'s build, message by message', () => { close(); replay(entry); }),
       onOpenFull ? btn('Open it in System 3', () => { close(); onOpenFull(conv.identity.conversation_id); }) : null];
-    back.append(el('section', {class: 's3-modal s3-holdmenu', role: 'dialog', 'aria-modal': 'true', 'aria-label': 'What would you like to do with this segment?'},
+    back.append(movableModal(el('section', {class: 's3-modal s3-holdmenu', role: 'dialog', 'aria-modal': 'true', 'aria-label': 'What would you like to do with this segment?'},
       el('b', {text: 'What would you like to do with this segment?'}),
       el('p', {class: 's3-muted', text: `${conv.identity.road_kind} · ${clock(convTime(conv))} · ` + String((conv.subject || {}).topic || '').replace(/\s+/g, ' ').slice(0, 140)}),
-      note, el('div', 's3-holdmenu-items', ...items.filter(Boolean)), btn('Close', close)));
+      note, el('div', 's3-holdmenu-items', ...items.filter(Boolean)), btn('Close', close))));
     back.addEventListener('click', e => { if (e.target === back) close(); });
     document.addEventListener('keydown', key, true);
     document.body.append(back);
@@ -2542,11 +2582,11 @@ export async function mountEmbedded(root, {request, view = 'conversation', onSel
       canCompose(conv, t) ? btn(v.open.has(t.turn_id) ? 'Close its speaker-box view' : 'Open its speaker-box passages and odds',
         go(() => { const n = node(); if (n) v.toggle(t, n); })) : null,
       ...turnEvents(conv, t).map(ev => btn('How ' + ev.family + ' was decided: ' + chipOf(ev, conv).text, go(() => openDecision(conv, ev, t, v.api))))];
-    back.append(el('section', {class: 's3-modal s3-holdmenu', role: 'dialog', 'aria-modal': 'true', 'aria-label': 'What would you like to do with this line?'},
+    back.append(movableModal(el('section', {class: 's3-modal s3-holdmenu', role: 'dialog', 'aria-modal': 'true', 'aria-label': 'What would you like to do with this line?'},
       el('b', {text: 'What would you like to do with this?'}),
       el('p', {class: 's3-muted', text: (t.name || t.speaker) + ', turn ' + (t.index + 1) + ': ' +
         (lineText(conv, t) || 'no words yet - ' + ((t.directions || []).map(d => d.text).join('; ') || t.step_label))}),
-      el('div', 's3-holdmenu-items', ...items.filter(Boolean)), btn('Close', close)));
+      el('div', 's3-holdmenu-items', ...items.filter(Boolean)), btn('Close', close))));
     back.addEventListener('click', e => { if (e.target === back) close(); });
     document.addEventListener('keydown', key, true);
     document.body.append(back);
@@ -3231,8 +3271,10 @@ export async function mountLineStory(root, {request, lineId = '', prompt = '', o
 }
 
 /* ======================================================================== */
-export async function mount(root, {request, onClose, tab: startTab = '', table: startTable = ''} = {}) {
+export async function mount(root, {request, onClose, tab: startTab = '', table: startTable = '', conversationId = ''} = {}) {
   request ||= defaultRequest();
+  /* [s3-cast] 'tables:DIRECTIVE1' opens a tab on a table - the Mind desk's buttons use it */
+  if (typeof startTab === 'string' && startTab.includes(':') && !startTable) [startTab, startTable] = startTab.split(':', 2);
   const send = (path, method, body) => request(path, {method, body: body === undefined ? undefined : JSON.stringify(body)});
   root.classList.add('s3');
   let alive = true, tab = startTab || 'director', view = 'split', cursor = 0, follow = false;   /* [s3-still] follow live only when asked */
@@ -3280,6 +3322,12 @@ export async function mount(root, {request, onClose, tab: startTab = '', table: 
   const message = el('div', {role: 'status', 'aria-live': 'polite'});
   const report = (error) => { message.className = 's3-error'; message.textContent = error.message || String(error); };
   const quiet = () => { message.className = ''; message.textContent = ''; };
+  /* [s3-save] a save is confirmed with the version it made - the live config's
+     hash and note - so "did that take?" is never a question (the ledger held
+     the default cycle while the operator believed the graph was saved) */
+  let noticeTimer = 0;
+  const notice = (text) => { message.className = 's3-ok'; message.textContent = text; clearTimeout(noticeTimer); noticeTimer = setTimeout(() => { if (message.className === 's3-ok') quiet(); }, 9000); };
+  const saved = (what, res) => notice('Saved ' + what + (res && res.hash ? ' - live config ' + res.hash : '') + (res && res.structure && res.structure.version ? ' (v' + res.structure.version + ')' : '') + '. The desk uses it from the next round.');
   const metrics = el('div', 's3-metrics');
   const modePill = el('span', 's3-pill');
   const tabs = el('div', 's3-tabs');
@@ -3293,10 +3341,11 @@ export async function mount(root, {request, onClose, tab: startTab = '', table: 
 
   /* [s3-window] "a button icon '3' ... opening a popup": Tables, Segments, Prompts, Audit, Sys3 - and the
      director, the cycle's structure view and the controls behind them. */
-  const TABS = [['tables', 'Tables'], ['segments', 'Segments'], ['prompts', 'Prompts'], ['audit', 'Audit'], ['sys3', 'Sys3'],
+  const TABS = [['visual', 'Visual Prompt'], ['tables', 'Tables'], ['segments', 'Segments'], ['prompts', 'Prompts'], ['audit', 'Audit'], ['sys3', 'Sys3'],
     ['director', 'Director'], ['structure', 'Structure'], ['controls', 'Controls']];
   function stopExtras() {
     if (sys3) { try { sys3.stop(); } catch (e) { /* gone */ } sys3 = null; }
+    if (visualScene) { visualScene.stop(); visualScene = null; }
     clearInterval(auditTimer); clearInterval(promptsTimer);
     if (menuNode) { menuNode.remove(); menuNode = null; }
   }
@@ -3463,14 +3512,72 @@ export async function mount(root, {request, onClose, tab: startTab = '', table: 
   /* ---------------- tables ------------------------------------------------- */
   let tableId = startTable || 'ES1', draft = null;   /* [s3-dice] a card can open on its table */
   let tableDrag = null; const foldedCats = new Set();   /* [s3-window] */
+  /* [s3-cast] every family that keeps a table, the round rolls and the two pools included */
+  const TABLE_FAMILIES = ['CTS', 'ES', 'RS', 'IRS', 'FL', 'TEMPER', 'SHOCK', 'INTERJECT', 'FAV', 'DIRECTIVE', 'EVENT', 'CHANCE', 'POOL'];
+  /* [s3-events] one kind of happening: its odds, whose turn, where, whether it ends the segment */
+  function eventFields(cat) {
+    const pct = el('span', {text: Math.round((cat.odds ?? 0.1) * 100) + '%'});
+    const pick = (value, options, set, label) => el('select', {'aria-label': label, onchange: e => set(e.target.value)},
+      ...options.map(([v, t]) => el('option', {value: v, text: t, selected: v === value})));
+    return el('div', 's3-row s3-pool',
+      el('label', {class: 's3-muted', text: 'odds per segment'}),
+      el('input', {type: 'range', min: 0, max: 1, step: 0.01, value: cat.odds ?? 0.1, 'aria-label': 'odds',
+        oninput: e => { cat.odds = +e.target.value; pct.textContent = Math.round(cat.odds * 100) + '%'; }}), pct,
+      el('label', {class: 's3-muted', text: 'happens to'}),
+      pick(cat.seat || 'any', [['caller', 'the caller'], ['host', 'a host'], ['any', 'anyone']], v => { cat.seat = v; }, 'seat'),
+      el('label', {class: 's3-muted', text: 'where'}),
+      pick(cat.place || 'middle', [['any', 'anywhere'], ['open', 'the opening'], ['middle', 'the middle'], ['close', 'the close']], v => { cat.place = v; }, 'place'),
+      el('label', 's3-row', el('input', {type: 'checkbox', checked: !!cat.ends, onchange: e => { cat.ends = e.target.checked; }}), 'ends the segment'),
+      el('label', {class: 's3-muted', text: 'not before turn'}),
+      el('input', {type: 'number', min: 1, max: 40, step: 1, value: (cat.min_turn || 1), style: 'width:4.5em', 'aria-label': 'earliest turn',
+        onchange: e => { cat.min_turn = Math.max(1, parseInt(e.target.value || '1', 10) || 1); }}));
+  }
+  const castState = id => ((status && status.cast && status.cast.directives) || []).find(d => d.id === id);
+  const dateOf = secs => { if (!secs) return ''; const d = new Date(secs * 1000); const p = n => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`; };
+  function poolFields(item) {
+    /* a directive's odds and lifetime; a favourite's origin */
+    if (draft.family === 'DIRECTIVE') {
+      const pct = el('span', {text: Math.round((item.odds ?? 1) * 100) + '%'});
+      const st = castState(item.id);
+      return el('div', 's3-row s3-pool',
+        el('label', {class: 's3-muted', text: 'odds'}),
+        el('input', {type: 'range', min: 0, max: 1, step: 0.05, value: item.odds ?? 1, 'aria-label': 'odds',
+          oninput: e => { item.odds = +e.target.value; pct.textContent = Math.round(item.odds * 100) + '%' + (item.odds >= 1 ? ' (standing)' : ''); }}), pct,
+        el('label', {class: 's3-muted', text: 'until'}),
+        el('input', {type: 'datetime-local', value: dateOf(item.until), 'aria-label': 'expires',
+          onchange: e => { item.until = e.target.value ? Math.round(new Date(e.target.value).getTime() / 1000) : 0; }}),
+        el('label', {class: 's3-muted', text: 'airings'}),
+        el('input', {type: 'number', min: 0, step: 1, value: item.airings || 0, style: 'width:5em', 'aria-label': 'airings (0 = unlimited)',
+          onchange: e => { item.airings = Math.max(0, parseInt(e.target.value || '0', 10) || 0); }}),
+        el('span', {class: 's3-muted', text: st ? `${st.state} · aired ${st.aired}` : 'not rolled yet'}));
+    }
+    if (draft.family === 'CHANCE') {   /* [s3-dice-door] one station roll: its odds, or the dial it follows */
+      if (item.dial) return el('div', 's3-row s3-pool', el('span', {class: 's3-muted',
+        text: `follows the station's own value "${item.dial}" (a desk dial or a live figure) - its odds are set there, not here. ${item.text && item.text !== item.label ? item.text : ''}`}));
+      const pct = el('span', {text: Math.round((item.odds ?? 0.5) * 100) + '%'});
+      return el('div', 's3-row s3-pool',
+        el('label', {class: 's3-muted', text: 'odds'}),
+        el('input', {type: 'range', min: 0, max: 1, step: 0.01, value: item.odds ?? 0.5, 'aria-label': 'odds',
+          oninput: e => { item.odds = +e.target.value; pct.textContent = Math.round(item.odds * 100) + '%'; }}), pct,
+        el('span', {class: 's3-muted', text: item.id}));
+    }
+    if (draft.family === 'FAV') {
+      const when = item.at ? new Date(item.at * 1000).toLocaleString() : '';
+      return el('div', 's3-row s3-pool', el('span', {class: 's3-muted',
+        text: `said by ${item.name || item.who || 'the cast'}${when ? ' · liked ' + when : ''}${item.line_id ? ' · line ' + item.line_id : ''}${item.source ? ' · ' + item.source : ''}`}));
+    }
+    return null;
+  }
+
   function paintTables() {
     const tables = config.config.tables;
     if (!draft || draft.id !== tableId) draft = JSON.parse(JSON.stringify(tables.find(t => t.id === tableId) || tables[0]));
     const listNode = el('div', 's3-tlist', el('h2', {text: 'Tables'}),
-      ...['CTS', 'ES', 'RS', 'IRS', 'FL'].flatMap(f => [el('h3', {text: f}), ...tables.filter(t => t.family === f).map(t =>
+      ...TABLE_FAMILIES.filter(f => tables.some(t => t.family === f)).flatMap(f => [el('h3', {text: f}), ...tables.filter(t => t.family === f).map(t =>
         btn('', () => { tableId = t.id; draft = null; paintTables(); }, {'aria-pressed': String(t.id === draft.id)}))]));
     let i = 0;
-    for (const f of ['CTS', 'ES', 'RS', 'IRS', 'FL']) for (const t of tables.filter(x => x.family === f)) {
+    for (const f of TABLE_FAMILIES) for (const t of tables.filter(x => x.family === f)) {
       const b = listNode.querySelectorAll('button')[i++];
       b.append(el('span', {text: `${t.id} · ${t.label}`}), el('span', {class: 's3-muted', text: t.enabled === false ? 'off' : 'w' + t.weight}));
     }
@@ -3484,6 +3591,14 @@ export async function mount(root, {request, onClose, tab: startTab = '', table: 
       el('label', 's3-row', el('input', {type: 'checkbox', checked: draft.enabled !== false, onchange: e => { draft.enabled = e.target.checked; }}), 'enabled'),
       el('span', {class: 's3-muted', text: `version ${draft.version}`})),
       el('div', 's3-slider', el('label', {text: 'table weight in the raffle'}), ...slider(draft.weight, v => { draft.weight = v; }, 10)),
+      ...(draft.family === 'EVENT' ? [el('div', 's3-row s3-pool',   /* [s3-events] */
+        el('label', {class: 's3-muted', text: 'rolls on roads'}),
+        el('input', {type: 'text', value: (draft.roads || []).join(', '), placeholder: 'caller, banter, news ... (blank = every road)', style: 'min-width:18em',
+          onchange: e => { draft.roads = e.target.value.split(',').map(x => x.trim()).filter(Boolean); }}),
+        el('label', {class: 's3-muted', text: 'at most'}),
+        el('input', {type: 'number', min: 0, max: 8, step: 1, value: draft.max_events ?? 2, style: 'width:4em', 'aria-label': 'most happenings per segment',
+          onchange: e => { draft.max_events = Math.max(0, parseInt(e.target.value || '0', 10) || 0); }}),
+        el('span', {class: 's3-muted', text: 'happenings per segment (0 = no limit)'}))] : []),
       el('p', {class: 's3-muted', text: draft.description || ''}));
     for (const cat of draft.categories) {
       /* [s3-window] each category folds; it can be dropped, or consolidated into another */
@@ -3501,12 +3616,20 @@ export async function mount(root, {request, onClose, tab: startTab = '', table: 
           el('option', {value: '', text: 'consolidate into...'}), ...others.map(c => el('option', {value: c.id, text: c.label || c.id}))) : null,
         btn('remove', e => { e.preventDefault(); e.stopPropagation(); if (confirm(`Remove category "${cat.label || cat.id}" and its ${(cat.items || []).length} items?`)) { draft.categories.splice(draft.categories.indexOf(cat), 1); paintTables(); } })));
       box.append(el('div', 's3-slider', el('label', null, el('b', {text: 'category weight'})), ...slider(cat.weight, v => { cat.weight = v; })));
+      if (draft.family === 'EVENT') box.append(eventFields(cat));   /* [s3-events] */
       for (const item of cat.items) {
         const row = el('div', 's3-item',
           el('input', {type: 'text', value: item.label, 'aria-label': 'label', oninput: e => { item.label = e.target.value; }}),
           ...slider(item.weight ?? 1, v => { item.weight = v; }),
           el('label', 's3-row', el('input', {type: 'checkbox', checked: item.enabled !== false, onchange: e => { item.enabled = e.target.checked; }}), 'on'),
-          el('input', {type: 'text', class: 'txt', value: item.text || '', placeholder: 'what the writer is told this turn does', oninput: e => { item.text = e.target.value; }}));
+          el('input', {type: 'text', class: 'txt', value: item.text || '', placeholder: draft.family === 'DIRECTIVE' ? 'the directive, as the writer is told it' : draft.family === 'FAV' ? 'the line, word for word' : 'what the writer is told this turn does', oninput: e => { item.text = e.target.value; }}),
+          poolFields(item),
+          /* [s3-flow] follow-on odds: after what the turn before rolled, this row weighs more (or less) */
+          ['CTS', 'ES', 'RS', 'IRS', 'FL', 'EVENT'].includes(draft.family) ? el('input', {type: 'text', class: 'txt s3-after',
+            value: Object.entries(item.after || {}).map(([k, m]) => `${k}=${m}`).join(', '),
+            placeholder: 'follow-on odds, e.g. RS:argue=1.6, ES:anger=0.5 (after the turn before rolled it)',
+            onchange: e => { const got = {}; for (const part of e.target.value.split(',')) { const [k, m] = part.split('=').map(x => (x || '').trim()); if (k && m && !isNaN(+m)) got[k] = +m; }
+              if (Object.keys(got).length) item.after = got; else delete item.after; }}) : null);
         /* [s3-window] drag to reorder inside the category; x removes */
         const wrap = el('div', {class: 's3-item-row', draggable: true,
           ondragstart: e => { tableDrag = {cat, item}; wrap.classList.add('s3-dragging'); try { e.dataTransfer.setData('text/plain', item.id); } catch (_) { /* older engine */ } },
@@ -3521,13 +3644,25 @@ export async function mount(root, {request, onClose, tab: startTab = '', table: 
         box.append(wrap);
       }
       const adv = el('textarea', {value: json(Object.fromEntries(Object.entries(cat).filter(([k]) => !['items', 'label', 'weight', 'id'].includes(k))))});
-      box.append(btn('Add item', () => { const id = prompt('New item id'); if (id) { cat.items.push({id, label: id, weight: 1, text: ''}); paintTables(); } }),
+      box.append(btn(draft.family === 'DIRECTIVE' ? 'Add directive' : draft.family === 'FAV' ? 'Add favourite' : 'Add item', () => {
+          if (draft.family === 'EVENT') {   /* [s3-events] a variant of the happening is what the writer is told happens */
+            const text = prompt('What happens (the writer is told this on the turn it lands on; {first} is the caller)'); if (!text || !text.trim()) return;
+            cat.items.push({id: 'ev_' + Date.now().toString(36), label: text.slice(0, 60), text: text.trim(), weight: 1}); paintTables(); return;
+          }
+          if (draft.family === 'DIRECTIVE' || draft.family === 'FAV') {   /* [s3-cast] a pool row is its words */
+            const text = prompt(draft.family === 'DIRECTIVE' ? 'The directive (what the writer is told on the turn it lands on)' : 'The line, word for word'); if (!text || !text.trim()) return;
+            const id = (draft.family === 'DIRECTIVE' ? 'dir_' : 'fav_') + Date.now().toString(36);
+            cat.items.push(draft.family === 'DIRECTIVE' ? {id, label: text.slice(0, 60), text: text.trim(), weight: 1, odds: 1, until: 0, airings: 0, source: 'the System 3 desk'}
+              : {id, label: text.slice(0, 60), text: text.trim(), weight: 1, source: 'the System 3 desk', at: Math.round(Date.now() / 1000)});
+            paintTables(); return;
+          }
+          const id = prompt('New item id'); if (id) { cat.items.push({id, label: id, weight: 1, text: ''}); paintTables(); } }),
         el('details', null, el('summary', {text: 'rules for this category (requires, phases, modifiers, emotions, effects, tags ...)'}), adv,
           btn('Apply rules', () => { try { Object.assign(cat, JSON.parse(adv.value)); quiet(); } catch (e) { report(e); } })));
       editor.append(box);
     }
     editor.append(el('div', 's3-row',
-      btn('Save table', async () => { try { await send('/api/system3/tables/' + draft.id, 'PUT', draft); await loadConfig(); draft = null; paint(); } catch (e) { report(e); } }),
+      btn('Save table', async () => { try { const res = await send('/api/system3/tables/' + draft.id, 'PUT', draft); await loadConfig(); draft = null; paint(); saved('table ' + (res && res.table ? res.table.id : ''), res); } catch (e) { report(e); } }),
       btn('Add category', () => { const id = prompt('New category id'); if (id) { draft.categories.push({id, label: id.toUpperCase(), weight: 1, items: [{id: id + '.one', label: 'one', weight: 1}]}); paintTables(); } }),
       btn('Make a supplemental table from this one', async () => {
         const id = prompt('New table id (for example ES2)'); if (!id) return;
@@ -3624,7 +3759,7 @@ export async function mount(root, {request, onClose, tab: startTab = '', table: 
       el('p', {class: 's3-muted', text: 'Mark the lines that roll for a speakerbox insertion before (prepend) or after (append) them. The odds are the prepend and append sliders on the DJ desk, scaled by the Speakerbox density control.'}),
       nodes, el('div', 's3-row',
         btn('Add step', () => { steps.push({id: 'step' + (steps.length + 1), label: 'New step', speaker: 'responder_a', draws: [{family: 'ES'}, {family: 'RS'}], speakerbox: []}); paintStructure(); }),
-        btn('Save structure', async () => { try { steps.forEach((s, i) => { s.id ||= 'step' + i; }); await send('/api/system3/structure', 'PUT', {steps}); await loadConfig(); steps = null; paint(); } catch (e) { report(e); } }),
+        btn('Save structure', async () => { try { steps.forEach((s, i) => { s.id ||= 'step' + i; }); const res = await send('/api/system3/structure', 'PUT', {steps}); await loadConfig(); steps = null; paint(); saved('the banter cycle', res); } catch (e) { report(e); } }),
         btn('Discard', () => { steps = null; paintStructure(); }))));
   }
 
@@ -3642,6 +3777,7 @@ export async function mount(root, {request, onClose, tab: startTab = '', table: 
    * it without a roll. A variant is saved as "<road>~vN" with a weight; the
    * engine rolls VARIANT among the base and its variants when the road runs. */
   let segRoad = '', segNodes = null, segRoadOf = '', segSel = {node: -1, draw: -1}, segDrag = null;
+  let segInitiator = null;   /* [s3-flow] who opens the banter cycle (null: as saved) */
   const SEG_FAMS = ['CTS', 'ES', 'RS', 'IRS', 'FL'];
   function segStructures() { return config.config.structures || {}; }
   function segLoad(road) {
@@ -3649,6 +3785,12 @@ export async function mount(root, {request, onClose, tab: startTab = '', table: 
     segRoadOf = road; segSel = {node: -1, draw: -1};
     segNodes = road === 'banter' ? JSON.parse(JSON.stringify(config.config.structure.steps || []))
       : JSON.parse(JSON.stringify((segStructures()[road] || {}).legs || []));
+  }
+  function segTableCats(fam) {   /* [s3-flow] */
+    const seen = new Map();
+    for (const t of (config.config.tables || []).filter(x => x.family === fam))
+      for (const c of t.categories || []) if (!seen.has(c.id)) seen.set(c.id, {id: c.id, label: `${t.id} · ${c.label || c.id}`});
+    return [...seen.values()];
   }
   function segTableItems(fam) {
     return (config.config.tables || []).filter(t => t.family === fam)
@@ -3671,12 +3813,19 @@ export async function mount(root, {request, onClose, tab: startTab = '', table: 
       cycle ? el('h4', {text: 'Speaker box'}) : null, cycle ? chip('prepend mark', {kind: 'mark', mark: 'prepend'}) : null, cycle ? chip('append mark', {kind: 'mark', mark: 'append'}) : null,
       el('p', {class: 's3-muted', text: 'Drag a node between two nodes; drag a draw onto a node. Tap a node for its properties. Tap a draw\'s die to turn its roulette off and pin a value.'}));
     const props = el('div', 's3-seg-props');
+    if (cycle) props.append(el('label', null, 'who opens the round ',   /* [s3-flow] */
+      el('select', {onchange: e => { segInitiator = e.target.value; }},
+        ...[['', 'the first seat (as always)'], ['A', 'seat A (the host)'], ['B', 'seat B (the co-host)'], ['D', 'seat D (the third seat)']]
+          .map(([v, t]) => el('option', {value: v, text: t, selected: v === (segInitiator ?? (st.initiator || ''))})))));
     if (!sel) props.append(para('Tap a node to edit it.', 's3-muted'));
     else {
       const field = (label, input) => el('label', null, label, input);
       const labelEl = () => body.querySelector('.s3-seg-node.sel b');
       props.append(el('h4', {text: cycle ? 'Step' : 'Leg'}),
         field('label', el('input', {type: 'text', value: sel.label || sel.id || '', oninput: e => { sel.label = e.target.value; const b = labelEl(); if (b) b.textContent = e.target.value; }})));
+      /* [s3-flow] the operator's own topic on this node - everything else still rolls */
+      props.append(field('topic in your own words (blank: the roulette and the road decide)', el('textarea', {value: sel.topic || '', rows: 2,
+        oninput: e => { if (e.target.value.trim()) sel.topic = e.target.value; else delete sel.topic; }})));
       if (cycle) {
         props.append(field('speaker', el('select', {onchange: e => { sel.speaker = e.target.value; repaint(); }},
             ...['initiator', 'responder_a', 'responder_b', 'frame'].map(sp => el('option', {value: sp, text: sp.replace('_', ' '), selected: sel.speaker === sp})))),
@@ -3696,6 +3845,10 @@ export async function mount(root, {request, onClose, tab: startTab = '', table: 
             onchange: e => { if (e.target.checked) delete d.fixed; else d.fixed = (items[0] || {}).id || ''; repaint(); }}), 'roulette on - roll it every time'),
           d.fixed !== undefined ? field('pinned to (the roulette is off)', el('select', {onchange: e => { d.fixed = e.target.value; repaint(); }},
             ...items.map(it => el('option', {value: it.id, text: it.label, selected: it.id === d.fixed})))) : null,
+          /* [s3-flow] a static node: its category pinned, the item inside it still rolled */
+          d.fixed === undefined ? field('static category - the item inside it still rolls', el('select', {onchange: e => { if (e.target.value) d.category = e.target.value; else delete d.category; repaint(); }},
+            el('option', {value: '', text: 'any category (the roulette picks)'}),
+            ...segTableCats(d.family).map(c => el('option', {value: c.id, text: c.label, selected: c.id === d.category})))) : null,
           d.family === 'FL' ? el('label', 's3-row', el('input', {type: 'checkbox', checked: !!d.closes, onchange: e => { d.closes = e.target.checked; repaint(); }}), 'closing moves only') : null,
           field('tables - blank means every table of the family', el('input', {type: 'text', value: (d.tables || []).join(', '),
             onchange: e => { const t = e.target.value.split(',').map(x => x.trim()).filter(Boolean); if (t.length) d.tables = t; else delete d.tables; repaint(); }})));
@@ -3723,9 +3876,9 @@ export async function mount(root, {request, onClose, tab: startTab = '', table: 
         btn('x', e => { e.stopPropagation(); nodes.splice(i, 1); segSel = {node: -1, draw: -1}; repaint(); }, {'aria-label': 'remove node'}));
       const draws = el('div', 's3-row', ...(n.draws || []).map((d, k) => el('span', {class: 's3-draw' + (d.fixed !== undefined ? ' locked' : ''), style: `--fam:${FAM[d.family] || 'var(--obs)'}`,
           onclick: e => { e.stopPropagation(); segSel = {node: i, draw: k}; repaint(); }},
-        el('span', {class: 's3-dice', title: d.fixed !== undefined ? 'roulette off: pinned to ' + d.fixed + ' - tap for the properties' : 'roulette on - tap to pin a value',
+        el('span', {class: 's3-dice', title: d.fixed !== undefined ? 'roulette off: pinned to ' + d.fixed + ' - tap for the properties' : d.category ? 'static category ' + d.category + ' - the item still rolls' : 'roulette on - tap to pin a value',
           text: d.fixed !== undefined ? 'pin' : 'd100', onclick: e => { e.stopPropagation(); segSel = {node: i, draw: k}; if (d.fixed === undefined) d.fixed = (segTableItems(d.family)[0] || {}).id || ''; else delete d.fixed; repaint(); }}),
-        d.family + (d.tables ? ':' + d.tables.join('/') : '') + (d.closes ? ' closes' : '') + (d.fixed !== undefined ? ' = ' + d.fixed : ''),
+        d.family + (d.tables ? ':' + d.tables.join('/') : '') + (d.closes ? ' closes' : '') + (d.fixed !== undefined ? ' = ' + d.fixed : d.category ? ' in ' + d.category : ''),
         btn('x', e => { e.stopPropagation(); n.draws.splice(k, 1); segSel = {node: i, draw: -1}; repaint(); }, {'aria-label': 'remove draw', style: 'padding:0 5px'}))),
         (n.draws || []).length ? null : el('span', {class: 's3-muted', text: 'no draws - drop a family here'}));
       card.append(head, cycle ? null : el('div', {class: 's3-muted', text: n.act || ''}), draws);
@@ -3755,18 +3908,19 @@ export async function mount(root, {request, onClose, tab: startTab = '', table: 
         const name = prompt('Name for the variant of ' + base + ':', (st.label || base) + ' B'); if (!name) return;
         const n = Object.keys(segStructures()).filter(k => k.startsWith(base + '~v')).length + 1;
         const key = base + '~v' + n;
-        try { await send('/api/system3/structures/' + encodeURIComponent(key), 'PUT', {...st, legs: nodes, label: name, weight: 1, enabled: true, variant_of: base});
-          await loadConfig(); segRoad = key; segNodes = null; quiet(); repaint(); } catch (e) { report(e); }
+        try { const res = await send('/api/system3/structures/' + encodeURIComponent(key), 'PUT', {...st, legs: nodes, label: name, weight: 1, enabled: true, variant_of: base});
+          await loadConfig(); segRoad = key; segNodes = null; repaint(); saved('variant ' + key, res); } catch (e) { report(e); }
       }),
       isVariant ? el('label', 's3-row', 'weight', el('input', {type: 'number', min: 0, max: 50, step: 0.1, value: st.weight == null ? 1 : st.weight, style: 'width:72px', onchange: e => { st.weight = +e.target.value; }})) : null,
       isVariant ? el('label', 's3-row', el('input', {type: 'checkbox', checked: st.enabled !== false, onchange: e => { st.enabled = e.target.checked; }}), 'runs on the station') : null,
       btn('Save segment', async () => { try {
-          if (cycle) { nodes.forEach((x, i) => { x.id = x.id || 'step' + i; }); await send('/api/system3/structure', 'PUT', {steps: nodes}); }
-          else { nodes.forEach((lg, i) => { lg.id = lg.id || 'leg' + i; }); await send('/api/system3/structures/' + encodeURIComponent(segRoad), 'PUT', {...st, legs: nodes}); }
-          await loadConfig(); segNodes = null; quiet(); repaint(); } catch (e) { report(e); } }),
+          let res;
+          if (cycle) { nodes.forEach((x, i) => { x.id = x.id || 'step' + i; }); res = await send('/api/system3/structure', 'PUT', {steps: nodes, initiator: segInitiator ?? (st.initiator || '')}); }   /* [s3-flow] */
+          else { nodes.forEach((lg, i) => { lg.id = lg.id || 'leg' + i; }); res = await send('/api/system3/structures/' + encodeURIComponent(segRoad), 'PUT', {...st, legs: nodes}); }
+          await loadConfig(); segNodes = null; repaint(); saved(cycle ? 'the banter cycle' : 'the ' + segRoad + ' segment', res); } catch (e) { report(e); } }),
       btn('Discard', () => { segNodes = null; repaint(); }),
       isVariant ? btn('Delete variant', async () => { if (!confirm('Delete ' + segRoad + '?')) return;
-        try { await send('/api/system3/structures/' + encodeURIComponent(segRoad), 'DELETE'); await loadConfig(); segRoad = base; segNodes = null; repaint(); } catch (e) { report(e); } }) : null,
+        try { const res = await send('/api/system3/structures/' + encodeURIComponent(segRoad), 'DELETE'); await loadConfig(); segRoad = base; segNodes = null; repaint(); saved('- deleted variant ' + (res && res.deleted || segRoad), res); } catch (e) { report(e); } }) : null,
       el('span', {class: 's3-muted', text: cycle ? 'The banter cycle loops for the segment; each step is a node with its own draws.'
         : `Turn budget ${st.min_turns || '?'}-${st.max_turns || '?'}. ${isVariant ? 'This variant' : 'Every variant'} rolls against the base by weight (VARIANT) each time the road runs.`}));
     fill(body, el('div', 's3-seg', el('div', 's3-seg-side', el('div', 's3-card', palette), el('div', 's3-card', el('h2', {text: 'Properties'}), props)),
@@ -3789,7 +3943,7 @@ export async function mount(root, {request, onClose, tab: startTab = '', table: 
        being made" - first in the grid, the full width. */
     const rolodex = el('div', {class: 's3-muted', text: 'finding the round this call wrote...'});
     const grid = el('div', 's3-tile-grid', el('div', 's3-tile-box s3-rolodex-box', el('h4', {text: 'Rolodex'}), rolodex),
-      box('System prompt', parts.sys || (parts.user ? NO_SYSTEM : '')), box('Prompt', parts.user), box('LLM settings', json(parts.opts)),
+      box('System prompt', readablePromptText(parts.sys || (parts.user ? NO_SYSTEM : '')), false), box('Prompt', readablePromptText(parts.user), false), box('LLM settings', json(parts.opts)),
       box('Result', d.error ? String(d.error) : (parts.text || (d.state === 'running' ? 'still running' : '(empty)'))));
     rolodexFor(r, d, rolodex);
     return grid;
@@ -4002,6 +4156,569 @@ export async function mount(root, {request, onClose, tab: startTab = '', table: 
       const fresh = await auditLoad(false); if (fresh && fresh.length) { await auditRoadsLoad(); auditArrive(fresh); } }, 3000);
   }
 
+  /* The visual prompt follows one recorded turn into the actual writer call.
+     Nodes are evidence from the conversation and prompt history, never new draws. */
+  let visualScene = null, visualCid = conversationId, visualTurn = '', visualToken = 0, visualPreview = null;
+  let visualBanterRows = null, visualPromptConfig = null;
+  let visualSidebarOpen = true;
+  try { visualSidebarOpen = localStorage.getItem('s3.visualSidebarOpen') !== '0'; } catch (_) { /* optional */ }
+  const visualCalls = new Map(), visualCallDetails = new Map();
+  const readablePrompt = readablePromptText;
+  function visualGraph(conv, turn, writer, promptConfig = {}) {
+    const nodes = [], edges = [];
+    const add = (id, label, kind, detail, x, y, z = 0, data = null) => nodes.push({id, label, kind, detail, x, y, z, data});
+    const link = (a, b, kind = 'flow') => edges.push({a, b, kind});
+    const subject = conv.subject || {}, carry = conv.carry || null;
+    const landing = carry && carry.landing || {};
+    add('prior', 'Previous knowledge', 'source', carry ? `Carried from the prior round: ${landing.text || 'conversation state and emotion'}` : 'No previous round was carried into this one.', -13.5, 4, -1, carry);
+    add('topic', 'Topic / initial tile', 'source', subject.topic || '(no subject)', -13.5, 1, -1, subject);
+    const databaseInputs = conv.inputs || {};
+    add('database', 'Database / road inputs', 'source', 'The recorded source files, topic bank, schedule and availability supplied to this round.', -13.5, -5, -1, databaseInputs);
+    const previous = (conv.turns || []).find(t => t.index === turn.index - 1);
+    const promptHasPrevious = previous && previous.text && writer.detail && promptText(writer.detail).includes(previous.text);
+    add('previous', promptHasPrevious ? 'Previous reply in prompt' : 'Previous turn / state', 'source',
+      previous ? (previous.text || 'Previous turn is planned; words are not recorded.') +
+        (promptHasPrevious ? ' Its words appear in this model request.' : ' Its exact words were not found in this model request; System 3 still planned this turn from earlier state.')
+        : 'This is the first turn of the round.', -13.5, -2, -1, previous);
+    add('state', 'Conversation state', 'assembly', 'The phase, tension, speaker emotions, unresolved points, and prior turns that condition the next System 3 decisions.', -9.5, .4, -.3,
+      (turn.decisions || []).length ? ((conv.decision_events || []).find(e => e.event_id === turn.decisions[0].event_id) || {}).state_before : conv.dynamics);
+    const events = (conv.decision_events || []).filter(e => !e.stage && (e.turn_id === turn.turn_id || (!e.turn_id && turn.index === 0)));
+    // Cards are 1.23 units tall. Keep adjacent draws apart so their
+    // coplanar faces never overlap and flicker while the graph moves.
+    const eventStep = 1.6;
+    const eventTop = Math.max(3, (events.length - 1) * eventStep / 2);
+    events.forEach((ev, i) => {
+      const id = 'event-' + ev.event_id;
+      const drawn = !!(ev.rng || (ev.stages || []).some(s => s.draw));
+      add(id, `${ev.family}  ${landedWords(ev, conv)}`, drawn ? 'roll' : 'decision', `${eventLine(ev, conv).text}`, -5.2, eventTop - i * eventStep, .4, ev);
+      link('state', id, 'input'); link(id, 'assembly', drawn ? 'roll' : 'state');
+    });
+    const material = (conv.material || []).filter(m => events.some(e => e.event_id === m.decided_by));
+    const eventBottom = eventTop - (events.length - 1) * eventStep;
+    add('material', 'Speakerbox / sources', 'source', material.length ? material.map(m => (m.selected || {}).file || 'selected passage').join(', ') : 'No passage selected for this turn.', -5.2, Math.min(-3, eventBottom - eventStep), -.5, material);
+    add('assembly', 'Turn instructions', 'assembly', sheetRowOf((conv.plan || {}).sheet || '', turn) || 'No running-order row recorded.', -.5, 1, 1, turn);
+    add('system', 'System prompt', 'prompt', writer.parts ? (writer.parts.sys || NO_SYSTEM) : 'No writer call found.', 4, 3.2, .5, 'system');
+    add('prompt', 'Prompt / conversation', 'prompt', writer.parts ? writer.parts.user : 'No writer call found.', 4, -.6, .5, 'user');
+    const previewLayers = ((writer.detail || {}).layers) || {};
+    if (previewLayers.station) {
+      add('standing', 'Standing instructions', 'source', previewLayers.station, -.5, 4.8, .4);
+      link('standing', 'prompt', 'input');
+    }
+    if ((previewLayers.personas || []).length) {
+      add('personas', 'Speaker personas', 'source', previewLayers.personas.join('\n'), -.5, -2.5, .4);
+      link('personas', 'prompt', 'input');
+    }
+    add('model', writer.sharedTurns > 1 ? `LLM call · ${writer.sharedTurns} turns` : 'LLM call', 'model', writer.row ? `${writer.row.model || 'model'} · ${writer.row.purpose || 'writer'}` : 'No matched model call.', 8.5, 1.3, 1, writer);
+    add('reply', `${turn.name || turn.speaker} replies`, 'reply', turn.text || (writer.parts ? 'The model returned a draft, but no reply matched this turn and speaker.' : 'No reply text recorded.'), 12.7, 1.3, .5, turn);
+    if (carry) link('prior', 'state', 'input');
+    link('topic', 'state', 'input');
+    if (Object.keys(databaseInputs).length) link('database', 'state', 'input');
+    if (previous) link('previous', 'state', 'input');
+    link('state', 'assembly', 'input');
+    if (material.length) link('material', 'assembly', 'input');
+    link('assembly', 'prompt'); link('system', 'model'); link('prompt', 'model'); link('model', 'reply');
+    if ((conv.turns || []).some(t => t.index === turn.index + 1)) {
+      add('next', writer.sharedTurns > 1 ? 'Next planned turn' : 'Next turn', 'next',
+        writer.sharedTurns > 1 ? 'These turns were in one model request. The next turn was planned from conversation state; this reply was not separately sent back before that call.'
+          : 'The next turn can receive this reply as prior conversation when written in a later model call.', 16.8, 1.3, -.6);
+      link('reply', 'next');
+    }
+    const dispatch = (writer.detail || {}).properties || {};
+    const sourceSettings = (promptConfig.nodes || []).map(n => {
+      let saved = dispatch;
+      for (const part of n.path || []) saved = saved && saved[part];
+      return {...n, capturedValue: typeof saved === 'string' ? saved : n.value,
+        capturedFromDispatch: typeof saved === 'string'};
+    }).filter(n => typeof n.capturedValue === 'string' && n.capturedValue.length >= 40);
+    for (const [key, label] of [['agent_prompt', 'Agent prompt at dispatch'],
+                                ['schedule_prompt', 'Schedule prompt at dispatch']]) {
+      const value = key === 'agent_prompt' ? (dispatch.agent_prompt || {}).prompt : dispatch.schedule_prompt;
+      if (typeof value === 'string' && value.length >= 40 && !sourceSettings.some(n => n.capturedValue === value))
+        sourceSettings.push({path: ['dispatch', key], label, capturedValue: value,
+          capturedFromDispatch: true, origin: 'snapshot'});
+    }
+    const sysMessages = (((writer.detail || {}).request || {}).messages || []).filter(m => m && m.role === 'system');
+    const captured = sysMessages.length ? sysMessages.map(m => String(m.content || '')) :
+      (writer.parts && writer.parts.sys ? [writer.parts.sys] : []);
+    let sourceIndex = 0;
+    const origin = (label, detail, data, parent = 'system') => {
+      const id = `system-origin-${sourceIndex}`;
+      add(id, label, 'source', detail, 4, 6.5 + sourceIndex * 1.65, -.5, data);
+      link(id, parent, 'input'); sourceIndex += 1;
+      return id;
+    };
+    captured.forEach((content, messageIndex) => {
+      if (content.startsWith('OPERATOR WORDING PREFERENCES')) {
+        const split = content.indexOf('\n');
+        const intro = split >= 0 ? content.slice(0, split) : content;
+        const builder = origin('Operator wording policy', intro,
+          {origin: 'compiled', path: 'app.py · line_review_guidance()', value: intro,
+            control_path: ['dj', 'operator_wording_examples']});
+        let examples = null;
+        try { examples = JSON.parse(content.slice(split + 1)); } catch (_) { /* show unparsed evidence below */ }
+        if (Array.isArray(examples)) {
+          examples.forEach((example, i) => origin(`Review ${i + 1} · ${example.gate || 'gate'} · ${example.action || 'decision'}`,
+            json(example), {origin: 'review', review_id: example.review_id, captured: example,
+              path: `data/line_review.sqlite3 · line_reviews.id=${example.review_id}`}, builder));
+        } else if (split >= 0) origin('Review evidence · captured text', content.slice(split + 1),
+          {origin: 'unresolved', path: 'line-review database · exact record not parsed'} , builder);
+        return;
+      }
+      let remainder = content;
+      for (const setting of [...sourceSettings].sort((a, b) => b.capturedValue.length - a.capturedValue.length)) {
+        if (!remainder.includes(setting.capturedValue)) continue;
+        origin(setting.label || setting.path.join(' / '), setting.capturedValue,
+          {origin: setting.origin || 'setting', path: setting.path, setting});
+        remainder = remainder.replace(setting.capturedValue, '');
+      }
+      const sections = remainder.split(/\n\s*\n/).map(s => s.trim()).filter(Boolean);
+      sections.forEach((section, i) => origin(`Captured system text ${messageIndex + 1}.${i + 1}`, section,
+        {origin: 'unresolved', path: 'Captured model request · origin not recorded'}));
+    });
+    const userContent = writer.parts && writer.parts.user || '';
+    for (const [marker, label, path, control] of [
+      ['your own show-notes', 'Distilled show notes', 'data/crystal_notes.json · latest two notes', ['dj', 'system3_crystal_notes']],
+      ['the conversation so far', 'Recent aired dialogue', 'live _RADIO.chat · last eight speaker lines', null]]) {
+      const at = userContent.indexOf(marker);
+      if (at < 0) continue;
+      const end = userContent.indexOf('\n', at);
+      origin(label, userContent.slice(at, end < 0 ? at + 650 : Math.min(end, at + 650)),
+        {origin: control ? 'memory' : 'live-memory', path, control_path: control}, 'prompt');
+    }
+    // Keep every card's face clear, even if a future source or draw adds
+    // another node to a lane. Depth does not exempt a card from this check:
+    // two faces at different z positions can still obscure each other.
+    const cardWidth = 3.7, cardHeight = 1.23, gap = .3;
+    nodes.forEach((node, index) => {
+      let clash;
+      do {
+        clash = nodes.slice(0, index).find(other =>
+          Math.abs(node.x - other.x) < cardWidth + gap &&
+          Math.abs(node.y - other.y) < cardHeight + gap);
+        if (clash) node.y = clash.y - cardHeight - gap - .01;
+      } while (clash);
+    });
+    return {nodes, edges, events};
+  }
+  function visualThree(THREE, canvas, graph, onSelect) {
+    const renderer = new THREE.WebGLRenderer({canvas, antialias: true, alpha: true});
+    renderer.setPixelRatio(Math.min(2, window.devicePixelRatio || 1));
+    const scene = new THREE.Scene();
+    const camera = new THREE.PerspectiveCamera(45, 1, .1, 200);
+    const cameraRise = 1.75;
+    camera.position.set(-1, cameraRise, 25); camera.lookAt(-1, 0, 0);
+    scene.add(new THREE.AmbientLight(0xffffff, 1.25));
+    const colors = {source: 0x86bfab, roll: 0xf2c77f, decision: 0xc7b693, assembly: 0xbba2e9, prompt: 0x8dbdff, model: 0xf5a6c8, reply: 0x91dfa9, next: 0x98aaa9};
+    const pick = [], positions = new Map(), packets = [];
+    function cardTexture(node) {
+      const c = document.createElement('canvas'); c.width = 512; c.height = 170;
+      const g = c.getContext('2d'); g.fillStyle = '#17252c'; g.fillRect(0, 0, 512, 170);
+      g.strokeStyle = '#' + colors[node.kind].toString(16).padStart(6, '0'); g.lineWidth = 7; g.strokeRect(4, 4, 504, 162);
+      g.fillStyle = '#f0f5f1'; g.font = 'bold 29px system-ui';
+      const words = node.label.split(' '); let line = '', y = 70;
+      for (const word of words) {
+        if (g.measureText(line + ' ' + word).width > 465 && line) { g.fillText(line, 22, y); y += 37; line = word; }
+        else line = line ? line + ' ' + word : word;
+      }
+      g.fillText(line, 22, y);
+      g.font = '20px system-ui'; g.fillStyle = '#a9bcbd'; g.fillText(node.kind === 'roll' ? 'recorded draw · click to inspect' : 'click to inspect', 22, 145);
+      return new THREE.CanvasTexture(c);
+    }
+    graph.nodes.forEach(n => {
+      const p = new THREE.Vector3(n.x, n.y, n.z); positions.set(n.id, p);
+      const mat = new THREE.MeshBasicMaterial({map: cardTexture(n), transparent: true, side: THREE.DoubleSide});
+      const mesh = new THREE.Mesh(new THREE.PlaneGeometry(3.7, 1.23), mat);
+      mesh.position.copy(p); mesh.userData.node = n; scene.add(mesh); pick.push(mesh);
+    });
+    graph.edges.forEach(e => {
+      const a = positions.get(e.a), b = positions.get(e.b); if (!a || !b) return;
+      const start = a.clone().add(new THREE.Vector3(1.86, 0, -.35));
+      const end = b.clone().add(new THREE.Vector3(-1.86, 0, -.35));
+      const curve = new THREE.CubicBezierCurve3(start,
+        start.clone().add(new THREE.Vector3(Math.max(1, (end.x - start.x) * .4), 0, -.3)),
+        end.clone().add(new THREE.Vector3(-Math.max(1, (end.x - start.x) * .4), 0, -.3)), end);
+      const color = e.kind === 'roll' ? 0xf2c77f : e.kind === 'input' ? 0x6fae99 : 0x9ac7e6;
+      const line = new THREE.Line(new THREE.BufferGeometry().setFromPoints(curve.getPoints(24)),
+        new THREE.LineBasicMaterial({color, transparent: true, opacity: .56})); scene.add(line);
+      if (e.kind === 'roll' || e.kind === 'flow') {
+        const dot = new THREE.Mesh(new THREE.SphereGeometry(.075, 9, 7), new THREE.MeshBasicMaterial({color}));
+        scene.add(dot); packets.push({dot, curve, phase: packets.length * .137});
+      }
+    });
+    const ray = new THREE.Raycaster(), pointer = new THREE.Vector2();
+    const floor = new THREE.Plane(new THREE.Vector3(0, 0, 1), 0);
+    const fingers = new Map();
+    let press = null, pinch = null, moved = false, alive = true, raf = 0;
+    const pointAt = (x, y) => {
+      const rect = canvas.getBoundingClientRect();
+      pointer.set((x - rect.left) / rect.width * 2 - 1, -(y - rect.top) / rect.height * 2 + 1);
+      camera.updateMatrixWorld(); ray.setFromCamera(pointer, camera);
+      return ray.ray.intersectPlane(floor, new THREE.Vector3());
+    };
+    const pan = (from, to) => {
+      const a = pointAt(from.x, from.y), b = pointAt(to.x, to.y);
+      if (!a || !b) return;
+      camera.position.x += a.x - b.x; camera.position.y += a.y - b.y;
+      camera.lookAt(camera.position.x, camera.position.y - cameraRise, 0);
+    };
+    const zoom = (x, y, scale) => {
+      const before = pointAt(x, y);
+      camera.position.z = Math.max(5, Math.min(100, camera.position.z * scale));
+      camera.lookAt(camera.position.x, camera.position.y - cameraRise, 0);
+      const after = pointAt(x, y);
+      if (before && after) {
+        camera.position.x += before.x - after.x; camera.position.y += before.y - after.y;
+        camera.lookAt(camera.position.x, camera.position.y - cameraRise, 0);
+      }
+    };
+    const pinchMeasure = () => {
+      const [a, b] = [...fingers.values()];
+      return {x: (a.x + b.x) / 2, y: (a.y + b.y) / 2,
+        distance: Math.max(1, Math.hypot(a.x - b.x, a.y - b.y))};
+    };
+    const down = e => {
+      e.preventDefault(); fingers.set(e.pointerId, {x: e.clientX, y: e.clientY});
+      canvas.setPointerCapture(e.pointerId);
+      if (fingers.size === 1) { press = {x: e.clientX, y: e.clientY, last: {x: e.clientX, y: e.clientY}}; moved = false; }
+      else if (fingers.size === 2) { pinch = pinchMeasure(); moved = true; }
+    };
+    const move = e => {
+      if (!fingers.has(e.pointerId)) return;
+      const last = fingers.get(e.pointerId);
+      fingers.set(e.pointerId, {x: e.clientX, y: e.clientY});
+      if (fingers.size === 2) {
+        const next = pinchMeasure();
+        if (pinch) {
+          zoom(next.x, next.y, pinch.distance / next.distance);
+          pan({x: pinch.x, y: pinch.y}, {x: next.x, y: next.y});
+        }
+        pinch = next; moved = true;
+      } else if (fingers.size === 1 && press) {
+        if (Math.hypot(e.clientX - press.x, e.clientY - press.y) > 4) moved = true;
+        if (moved) pan(last, {x: e.clientX, y: e.clientY});
+        press.last = {x: e.clientX, y: e.clientY};
+      }
+    };
+    const end = (e, cancelled = false) => {
+      if (!fingers.has(e.pointerId)) return;
+      const clicked = !cancelled && fingers.size === 1 && !moved;
+      fingers.delete(e.pointerId); pinch = null;
+      if (fingers.size === 1) {
+        const remaining = [...fingers.values()][0];
+        press = {x: remaining.x, y: remaining.y, last: remaining}; moved = true;
+      } else if (!fingers.size) { press = null; moved = false; }
+      if (clicked) {
+        pointAt(e.clientX, e.clientY);
+        const hit = ray.intersectObjects(pick)[0]; if (hit) onSelect(hit.object.userData.node);
+      }
+    };
+    const up = e => end(e);
+    const cancel = e => end(e, true);
+    const wheel = e => { e.preventDefault(); zoom(e.clientX, e.clientY, Math.exp(e.deltaY * .001)); };
+    canvas.addEventListener('pointerdown', down); canvas.addEventListener('pointermove', move); canvas.addEventListener('pointerup', up);
+    canvas.addEventListener('pointercancel', cancel);
+    canvas.addEventListener('wheel', wheel, {passive: false});
+    const resize = () => { const w = Math.max(1, canvas.clientWidth), h = Math.max(1, canvas.clientHeight);
+      renderer.setSize(w, h, false); camera.aspect = w / h; camera.updateProjectionMatrix(); };
+    const observer = new ResizeObserver(resize); observer.observe(canvas); resize();
+    const animate = (time) => { if (!alive) return;
+      if (!reduced()) packets.forEach(p => p.dot.position.copy(p.curve.getPoint((time * .00009 + p.phase) % 1)));
+      renderer.render(scene, camera); raf = requestAnimationFrame(animate); };
+    animate(0);
+    return {
+      focus(id) { const p = positions.get(id); if (!p) return;
+        camera.position.set(p.x, p.y + cameraRise, 18); camera.lookAt(p.x, p.y, 0); },
+      fit() { camera.position.set(1, cameraRise, 34); camera.lookAt(1, 0, 0); },
+      stop() { alive = false; cancelAnimationFrame(raf); observer.disconnect();
+      canvas.removeEventListener('pointerdown', down); canvas.removeEventListener('pointermove', move); canvas.removeEventListener('pointerup', up);
+      canvas.removeEventListener('pointercancel', cancel); canvas.removeEventListener('wheel', wheel);
+      scene.traverse(o => { if (o.geometry) o.geometry.dispose(); if (o.material) { if (o.material.map) o.material.map.dispose(); o.material.dispose(); } }); renderer.dispose(); }};
+  }
+  async function paintVisual() {
+    const token = ++visualToken;
+    if (visualScene) { visualScene.stop(); visualScene = null; }
+    if (!visualBanterRows) {
+      try { visualBanterRows = (await request('/api/system3/conversations?limit=60&road=banter')).conversations || []; }
+      catch (_) { visualBanterRows = []; }
+    }
+    if (token !== visualToken || tab !== 'visual') return;
+    const cid = visualCid || (visualBanterRows[0] && visualBanterRows[0].conversation_id) ||
+      (v.conv && v.conv.identity && v.conv.identity.conversation_id) || (list[0] && list[0].conversation_id);
+    if (!cid) { fill(body, el('div', 's3-card', el('h2', {text: 'Visual Prompt'}), para('No recorded conversations yet. Plan a round in the Director to see its prompt flow.', 's3-muted'))); return; }
+    const shell = el('div', 's3-vp');
+    fill(body, shell, para('Loading the recorded conversation...', 's3-muted'));
+    try {
+      const conv = visualPreview && cid === visualPreview.identity.conversation_id ? visualPreview : await cachedConversation(request, cid);
+      if (token !== visualToken || tab !== 'visual') return;
+      visualCid = cid;
+      const turns = conv.turns || [];
+      const turn = turns.find(t => t.turn_id === visualTurn) || turns[0];
+      if (!turn) { fill(body, para('This round has no planned turns.', 's3-muted')); return; }
+      visualTurn = turn.turn_id;
+      const key = cid + ':' + turn.turn_id;
+      if (!visualCalls.has(key)) visualCalls.set(key, conv.preview_call
+        ? {row: conv.preview_call, detail: conv.preview_call, exact: true, why: 'Off-air preview call using the newly assembled prompt.'}
+        : conv.mode === 'simulation'
+        ? {row: null, detail: null, why: 'Decision preview only: this plan was not sent to an LLM.'}
+        : await findWriterCall(request, conv, turn, visualCallDetails));
+      if (token !== visualToken || tab !== 'visual') return;
+      const writer = visualCalls.get(key) || {};
+      writer.parts = writer.row ? promptParts(writer.detail || {}) : null;
+      writer.sharedTurnNumbers = writer.parts ? turns.filter(t => {
+        const text = normWs(promptText(writer.detail));
+        return (rowHead(conv, t) && text.includes(rowHead(conv, t))) || turnRowIn(text, conv, t);
+      }).map(t => t.index + 1) : [];
+      writer.sharedTurns = writer.sharedTurnNumbers.length;
+      if (writer.parts && writer.parts.sys && !visualPromptConfig) {
+        try { visualPromptConfig = await request('/api/prompt-history/config'); }
+        catch (_) { visualPromptConfig = {nodes: []}; }
+      }
+      if (token !== visualToken || tab !== 'visual') return;
+      const graph = visualGraph(conv, turn, writer, visualPromptConfig || {});
+      const otherRoads = list.filter(c => c.road !== 'banter');
+      const conversationSelect = el('select', {onchange: e => { visualCid = e.target.value; visualTurn = ''; paintVisual(); }, 'aria-label': 'Conversation'},
+        ...(visualPreview ? [el('option', {value: visualPreview.identity.conversation_id, selected: visualPreview.identity.conversation_id === cid,
+          text: `Preview · ${visualPreview.subject.topic}`})] : []),
+        ...(visualBanterRows.some(c => c.conversation_id === cid) || otherRoads.some(c => c.conversation_id === cid) || visualPreview && visualPreview.identity.conversation_id === cid ? []
+          : [el('option', {value: cid, selected: true, text: `${(conv.identity || {}).road_kind || 'round'} · ${(conv.subject || {}).topic || cid}`})]),
+        el('optgroup', {label: 'Banter rounds · roulette inside the exchange'},
+          ...visualBanterRows.map(c => el('option', {value: c.conversation_id, selected: c.conversation_id === cid,
+            text: `${c.topic || '(no topic)'} · ${day(c.created)}`}))),
+        el('optgroup', {label: 'Separate lines and record talk'},
+          ...otherRoads.map(c => el('option', {value: c.conversation_id, selected: c.conversation_id === cid,
+            text: `${c.road || 'line'} · ${c.topic || '(no topic)'} · ${day(c.created)}`}))));
+      const turnSelect = el('select', {onchange: e => { visualTurn = e.target.value; paintVisual(); }, 'aria-label': 'Turn'},
+        ...turns.map(t => el('option', {value: t.turn_id, selected: t.turn_id === turn.turn_id,
+          text: `${t.index + 1}. ${t.name || t.speaker} · ${t.step_label || 'turn'}`})));
+      const canvas = el('canvas', {class: 's3-vp-canvas', 'aria-label': '3D prompt assembly graph'});
+      const detail = el('div', 's3-vp-detail');
+      const selected = {id: 'system'};
+      const nodeSelect = el('select', {'aria-label': 'Prompt node', onchange: e => {
+        const node = graph.nodes.find(n => n.id === e.target.value);
+        if (node) { inspect(node); if (visualScene) visualScene.focus(node.id); }
+      }}, ...graph.nodes.map(n => el('option', {value: n.id, selected: n.id === selected.id, text: n.label})));
+      const phraseTools = () => {
+        const phrase = el('input', {type: 'text', placeholder: 'e.g. feeding the beast', 'aria-label': 'Recurring phrase'});
+        const results = el('div', 's3-vp-phrase-results');
+        const trace = btn('Trace phrase', async () => {
+          const q = phrase.value.trim();
+          if (q.length < 2) { fill(results, para('Enter at least two characters.', 's3-muted')); return; }
+          fill(results, para('Tracing saved prompts, memory, scripts and code...', 's3-muted'));
+          try {
+            const got = await request('/api/phrase/trace?q=' + encodeURIComponent(q));
+            const capturedReviews = graph.nodes.filter(n => n.data && n.data.origin === 'review' &&
+              json(n.data.captured || {}).toLowerCase().includes(q.toLowerCase()));
+            fill(results, para(got.say || 'Trace complete.'),
+              ...capturedReviews.map(n => el('div', 's3-vp-phrase-source',
+                el('b', {text: n.data.path}),
+                para('This exact review example was in the captured system message. Select its graph node to inspect or exclude it.', 's3-muted'))),
+              ...((got.layers || []).filter(layer => layer.count).map(layer =>
+                el('details', {open: layer.layer === 'prompts'},
+                  el('summary', {text: `${layer.label}: ${layer.count} source(s)`}),
+                  ...layer.sources.map(source => el('div', 's3-vp-phrase-source',
+                    el('b', {text: `${source.store} · ${source.file || source.key || ''}`}),
+                    para(source.snippet || '', 's3-muted')))))),
+              btn(got.banned ? 'Phrase already blocked' : 'Stop this phrase from airing', async e => {
+                if (got.banned) return;
+                e.target.disabled = true;
+                try {
+                  const saved = await request('/api/phrase/ban', {method: 'POST',
+                    body: JSON.stringify({phrase: q, scope: 'everywhere', reason: 'Stopped from Visual Prompt source trace'})});
+                  e.target.textContent = 'Phrase blocked';
+                  fill(results, para(saved.say || 'The phrase is blocked in future prompts and at air.'));
+                } catch (error) { e.target.disabled = false; results.append(para('Could not block phrase: ' + (error.message || error), 's3-error')); }
+              }, {disabled: !!got.banned}));
+          } catch (error) { fill(results, para('Trace failed: ' + (error.message || error), 's3-error')); }
+        });
+        return el('details', 's3-vp-phrase-tools', el('summary', {text: 'Trace or stop a recurring phrase'}),
+          el('div', 's3-row', phrase, trace), results);
+      };
+      const inspect = node => {
+        selected.id = node.id;
+        nodeSelect.value = node.id;
+        const extras = [];
+        if (node.kind === 'roll' || node.kind === 'decision') {
+          const ev = node.data, stages = ev.stages || [];
+          const reel = rollRow(ev, conv);
+          extras.push(reel);
+          extras.push(el('p', {text: `Recorded result: ${landedWords(ev, conv)}. ${eventLine(ev, conv).text}`}));
+          for (const s of stages) {
+            extras.push(el('details', {class: 's3-vp-stage', open: s.stage === 'item' || s.stage === 'dice'},
+              el('summary', {text: `${s.stage}: ${s.selected || 'none'}${s.draw && s.draw.dice != null ? ' · d100 ' + s.draw.dice : ''}`}),
+              (s.candidates || []).length ? el('div', 's3-vp-candidates', ...s.candidates.map(c => el('div', {class: c.id === s.selected ? 'hit' : ''},
+                el('b', {text: c.label || c.id}), el('span', {text: `${pct(c.p)} · weight ${num(c.weight)}`})))) : para(s.rule || s.threshold != null ? `Threshold ${s.threshold}` : 'No candidate list recorded.', 's3-muted')));
+          }
+          extras.push(btn('Open this decision and its weight table', () => openDecision(conv, ev, turn, v.api)));
+          setTimeout(() => { if (reel.isConnected) reel.roll(800); }, 50);
+        } else if (node.id.startsWith('system-origin-')) {
+          const source = node.data || {};
+          extras.push(el('p', {text: `Origin: ${Array.isArray(source.path) ? source.path.join(' / ') : source.path || 'unknown'}`}));
+          extras.push(el('h4', {text: 'Value in the captured request'}), readablePrompt(node.detail));
+          if (source.origin === 'setting' && source.setting) {
+            let was = source.setting.value;
+            const area = el('textarea', {value: was, rows: 7, 'aria-label': 'Future value of ' + node.label});
+            const status = para(source.setting.capturedFromDispatch
+              ? 'The captured value came from the configuration saved at dispatch. Editing the current value affects future calls only.'
+              : 'Changes affect future writer calls. This captured prompt stays unchanged.', 's3-muted');
+            extras.push(el('h4', {text: 'Current saved value'}), area,
+              btn('Save future value', async e => {
+                e.target.disabled = true;
+                try {
+                  const got = await request('/api/prompt-history/config', {method: 'POST',
+                    body: JSON.stringify({path: source.path, value: area.value, was})});
+                  was = area.value; source.setting.value = was; visualPromptConfig = null;
+                  status.textContent = got.say || 'Saved for future calls.';
+                } catch (error) { status.textContent = 'Not saved: ' + (error.message || error); }
+                e.target.disabled = false;
+              }), status);
+          } else if (source.origin === 'snapshot') {
+            extras.push(para('This value was captured in the writer call’s dispatch snapshot. The current configuration may have changed since then.', 's3-muted'));
+          } else if (source.origin === 'review' && source.review_id) {
+            const reviewHost = el('div', 's3-vp-review', para('Loading the current review record...', 's3-muted'));
+            extras.push(reviewHost);
+            request('/api/orchestrator/rejections/' + encodeURIComponent(source.review_id)).then(review => {
+              if (!reviewHost.isConnected) return;
+              const decision = review.decision || {};
+              const status = para('Only the operator note is editable here. The source, candidate, decision and aired effect remain recorded evidence.', 's3-muted');
+              const area = el('textarea', {value: decision.note || '', rows: 5, maxLength: 320, 'aria-label': 'Operator guidance note'});
+              let revision = review.revision;
+              const exclude = el('input', {type: 'checkbox', checked: review.prompt_excluded === true,
+                onchange: async e => {
+                  const excluded = !!e.target.checked;
+                  e.target.disabled = true;
+                  try {
+                    const got = await request('/api/orchestrator/rejections/' + encodeURIComponent(source.review_id) + '/guidance',
+                      {method: 'POST', body: JSON.stringify({excluded, expected_revision: revision})});
+                    revision = got.review.revision;
+                    status.textContent = excluded ? 'Excluded from future prompt examples. The recorded review is retained.'
+                      : 'Eligible for future prompt examples again.';
+                  } catch (error) { e.target.checked = !excluded; status.textContent = 'Not saved: ' + (error.message || error); }
+                  e.target.disabled = false;
+                }});
+              fill(reviewHost,
+                el('h4', {text: 'Current database record'}),
+                readablePrompt(json({review_id: review.id, gate: review.gate, kind: (review.context || {}).kind,
+                  source: review.source, candidate: review.candidate, reasons: review.reasons,
+                  decision: review.decision, revision: review.revision})),
+                el('label', 's3-vp-edit-label', exclude, ' Exclude this review from future prompt examples'),
+                el('label', 's3-vp-edit-label', 'Operator guidance note', area),
+                btn('Save guidance for future prompts', async e => {
+                  e.target.disabled = true;
+                  try {
+                    const got = await request('/api/orchestrator/rejections/' + encodeURIComponent(source.review_id) + '/guidance',
+                      {method: 'POST', body: JSON.stringify({note: area.value, expected_revision: revision})});
+                    revision = got.review.revision;
+                    status.textContent = got.say || 'Saved for future prompts.';
+                  } catch (error) { status.textContent = 'Not saved: ' + (error.message || error); }
+                  e.target.disabled = false;
+                }), status);
+            }).catch(error => { if (reviewHost.isConnected) fill(reviewHost,
+              para('Could not load source record: ' + (error.message || error), 's3-error')); });
+          } else if (source.origin === 'compiled' || source.origin === 'memory') {
+            extras.push(para(source.origin === 'memory'
+              ? 'These notes come from the data crystal. System 3 carries its own prior state; this switch controls whether its future prompts also receive the distilled notes.'
+              : 'This policy text is assembled by application code from the review examples linked below. Open a review node to edit its future guidance note.', 's3-muted'));
+            const control = (visualPromptConfig && visualPromptConfig.nodes || []).find(n =>
+              json(n.path) === json(source.control_path));
+            if (control) {
+              let was = control.value;
+              const status = para('This switch controls whether future calls receive these examples.', 's3-muted');
+              const box = el('input', {type: 'checkbox', checked: was === true, onchange: async e => {
+                const value = !!e.target.checked;
+                try {
+                  const got = await request('/api/prompt-history/config', {method: 'POST',
+                    body: JSON.stringify({path: control.path, value, was})});
+                  was = value; control.value = value; status.textContent = got.say || 'Saved.';
+                } catch (error) { e.target.checked = was; status.textContent = 'Not saved: ' + (error.message || error); }
+              }});
+              extras.push(el('label', 's3-vp-edit-label', box,
+                source.origin === 'memory' ? ' Include distilled notes in future System 3 prompts'
+                  : ' Include operator wording examples in future system prompts'), status);
+            }
+          } else if (source.origin === 'live-memory') {
+            extras.push(para('These lines were already aired when this request was captured. New rounds receive the latest live conversation; System 3 also records its own carry between rounds.', 's3-muted'));
+          } else {
+            extras.push(para('The captured request contains these bytes, but its writer history does not identify a stored property for them.', 's3-muted'));
+          }
+        } else if (node.id === 'system' || node.id === 'prompt') {
+          extras.push(readablePrompt(node.detail));
+        } else if (node.id === 'assembly') {
+          extras.push(readablePrompt(node.detail), block('Whole running order', (conv.plan || {}).sheet || '(none)'));
+        } else if (node.id === 'model') {
+          extras.push(el('p', {text: writer.why || 'No recorded call.'}), writer.row ? el('p', {text: `${writer.row.model || '?'} · ${writer.row.purpose || ''} · ${day(Number(writer.row.at || 0))}`}) : null,
+            writer.sharedTurns ? el('p', {text: `This captured request carries the running-order rows for turns ${writer.sharedTurnNumbers.join(', ')}.`}) : null);
+        } else if (node.id === 'reply') {
+          extras.push(el('p', {text: node.detail}));
+        } else if (node.data && typeof node.data === 'object') extras.push(readablePrompt(json(node.data)));
+        else extras.push(el('p', {text: node.detail}));
+        if (['system', 'standing', 'personas', 'prompt'].includes(node.id)) extras.push(
+          btn('Edit standing instructions and personas', () => {
+            const fold = shell.querySelector('.s3-pfold');
+            if (fold) { fold.open = true; fold.scrollIntoView({block: 'nearest'}); }
+          }));
+        if (['assembly', 'prompt'].includes(node.id)) extras.push(
+          btn('Edit turn instruction nodes', () => { stopExtras(); tab = 'segments'; paint(); }));
+        if (['database', 'material'].includes(node.id)) extras.push(
+          btn('Edit source controls', () => { stopExtras(); tab = 'controls'; paint(); }));
+        if (['system', 'prompt', 'reply'].includes(node.id) || node.id.startsWith('system-origin-'))
+          extras.push(phraseTools());
+        fill(detail, el('h3', {text: node.label}), el('p', {class: 's3-muted', text: node.id.startsWith('system-origin-') ? 'A seed found in this captured system prompt.' : node.kind === 'roll' ? 'An actual recorded draw from this turn.' : node.kind === 'decision' ? 'A recorded decision without an RNG draw.' : node.kind === 'prompt' ? (conv.preview_call ? 'Prompt submitted to the preview writer; it may add runtime guidance and model options.' : 'Captured model request, if a writer call was found.') : 'Recorded input or output for this turn.'}), ...extras);
+      };
+      const confidence = conv.preview_call ? `Off-air LLM preview · ${(conv.preview_call || {}).matched_turns} of ${(conv.preview_call || {}).planned_turns} turns matched their speaker slots`
+        : writer.row ? (writer.exact ? 'Writer call matched by this turn’s words' : 'Writer call inferred: ' + writer.why) : writer.why;
+      const stage = el('div', 's3-vp-stage-wrap',
+        el('div', 's3-vp-toolbar', nodeSelect,
+          btn('Focus node', () => visualScene && visualScene.focus(selected.id)),
+          btn('Fit all', () => visualScene && visualScene.fit())), canvas,
+        el('div', 's3-vp-key', 'Previous knowledge + topic + previous reply → recorded draws → turn instructions → system prompt + conversation prompt → LLM → reply'));
+      const visualLayout = el('div', 's3-vp-layout', stage);
+      const toggleSidebar = btn('', () => {
+        visualSidebarOpen = !visualSidebarOpen;
+        syncSidebar();
+        try { localStorage.setItem('s3.visualSidebarOpen', visualSidebarOpen ? '1' : '0'); } catch (_) { /* optional */ }
+      }, {class: 's3-vp-collapse'});
+      const sidebar = el('aside', 's3-vp-sidebar', toggleSidebar, detail);
+      visualLayout.append(sidebar);
+      const syncSidebar = () => {
+        visualLayout.classList.toggle('collapsed', !visualSidebarOpen);
+        sidebar.classList.toggle('collapsed', !visualSidebarOpen);
+        detail.hidden = !visualSidebarOpen;
+        toggleSidebar.textContent = visualSidebarOpen ? '›' : '‹';
+        toggleSidebar.title = visualSidebarOpen ? 'Collapse details' : 'Show details';
+        toggleSidebar.setAttribute('aria-label', toggleSidebar.title);
+        toggleSidebar.setAttribute('aria-expanded', String(visualSidebarOpen));
+      };
+      syncSidebar();
+      fill(shell,
+        el('div', 's3-card', el('h2', {text: 'Visual Prompt · System 3 assembly'}),
+          el('p', {class: 's3-muted', text: 'Choose a turn, then click any node. Gold nodes had recorded RNG draws; gray decisions had no roll. Drag to pan; pinch or scroll to zoom.'}),
+          el('div', 's3-row', conversationSelect, turnSelect),
+          el('p', {class: 's3-vp-evidence', text: confidence || 'No writer call recorded for this round.'})),
+        visualLayout,
+        el('div', 's3-card', el('h3', {text: 'Change what future prompts receive'}),
+          el('div', 's3-row',
+            btn('Edit node order', () => { stopExtras(); tab = 'segments'; paint(); }),
+            btn('Edit Rolodex weights', () => { stopExtras(); tab = 'tables'; paint(); }),
+            btn('Edit controls and sources', () => { stopExtras(); tab = 'controls'; paint(); }),
+            btn('Preview updated dialogue', async e => {
+              e.target.disabled = true;
+              try {
+                const next = await send('/api/system3/preview', 'POST', {
+                  conversation_id: conv.preview_source || cid});
+                visualPreview = next; visualCid = next.identity.conversation_id; visualTurn = '';
+                visualCalls.clear(); paintVisual();
+              } catch (err) { report(err); e.target.disabled = false; }
+            }, {disabled: (conv.identity || {}).road_kind !== 'banter',
+              title: 'Dialogue preview currently supports banter rounds.'})),
+          para('Preview replans this banter round with the saved settings, then asks the station writer for a fresh draft. The draft stays off air.', 's3-muted'),
+          promptFold(request, {writerByTurn: new Map([[turn.turn_id, writer]]), callCache: new Map()}, conv, turn)));
+      inspect(graph.nodes.find(n => n.id === selected.id));
+      try { const THREE = await threeLoad(); if (token === visualToken && canvas.isConnected) visualScene = visualThree(THREE, canvas, graph, inspect); }
+      catch (e) { fill(canvas.parentElement, para('3D view unavailable: ' + e.message, 's3-error'),
+        el('div', 's3-vp-fallback', ...graph.nodes.map(n => btn(n.label, () => inspect(n))))); }
+    } catch (e) { if (token === visualToken) fill(body, para('Visual prompt could not load: ' + e.message, 's3-error')); }
+  }
+
   /* ---------------- Sys3: the circuit, in three.js -------------------------- */
   let sys3 = null;
   function threeLoad() {
@@ -4110,7 +4827,8 @@ export async function mount(root, {request, onClose, tab: startTab = '', table: 
     escalation: 'weight on turning the heat up', tangent: 'weight on wandering off the point',
     callback: 'weight on calling back to earlier moments', speakerbox_density: 'scales the prepend/append odds',
     sfx_aggression: 'restrained (0) to deliberately chaotic (1) - never below the two-line cadence',
-    novelty: 'weight on fresh subjects and moves', closure_aggressiveness: 'how early the scene starts landing'};
+    novelty: 'weight on fresh subjects and moves', closure_aggressiveness: 'how early the scene starts landing',
+    favorites: 'the odds a line the operator liked comes up in a round or single line (0.25 = one in four)'};   /* [s3-cast] */
   function paintControls() {
     const s = JSON.parse(JSON.stringify(settings.settings));
     const cfg = JSON.parse(JSON.stringify(config.config));
@@ -4138,10 +4856,23 @@ export async function mount(root, {request, onClose, tab: startTab = '', table: 
           el('td', null, el('span', {class: 's3-pill ' + (r.mode === 'active' ? 'active' : r.mode === 'shadow' ? 'shadow' : 'off'), text: r.mode + (r.label_air ? ' · ' + r.label_air : '')})),
           el('td', {text: r.what}),
           el('td', {class: 's3-muted', text: r.writer + (r.hook ? ' -> ' + r.hook : '')}))))));
+    /* [s3-save] every saved version of the tables and structures, newest first,
+       the live one marked - what the desk is actually running */
+    const versionsCard = () => {
+      const rows = ((config && config.versions) || []).slice(0, 40);
+      const live = (config && config.hash) || '';
+      return el('div', 's3-card', el('h2', {text: 'Config versions'}),
+        el('p', {class: 's3-muted', text: 'Every save of a table, the banter cycle or a segment is a version in the ledger. The live one is what the roulette plans from right now; a graph that is not in this list is not on the station.'}),
+        rows.length ? el('table', 's3-table', el('thead', null, el('tr', null, el('th', {text: 'when'}), el('th', {text: 'hash'}), el('th', {text: 'note'}))),
+          el('tbody', null, ...rows.map(r => el('tr', {class: r.hash === live ? 's3-live' : ''},
+            el('td', {text: r.created ? new Date(r.created * 1000).toLocaleString() : ''}),
+            el('td', null, el('code', {text: r.hash}), r.hash === live ? el('span', {class: 's3-pill active', text: 'live'}) : null),
+            el('td', {text: r.note || ''}))))) : para('No saved versions yet - the defaults are live.', 's3-muted'));
+    };
     const section = (name, help) => {
       const area = el('textarea', {value: json(cfg[name] || {})});
       return el('div', 's3-card', el('h2', {text: name}), el('p', {class: 's3-muted', text: help}), area,
-        btn('Save ' + name, async () => { try { await send('/api/system3/config/section/' + name, 'PUT', JSON.parse(area.value)); await loadConfig(); quiet(); } catch (e) { report(e); } }));
+        btn('Save ' + name, async () => { try { const res = await send('/api/system3/config/section/' + name, 'PUT', JSON.parse(area.value)); await loadConfig(); saved(name, res); } catch (e) { report(e); } }));
     };
     fill(body, el('div', 's3-grid2',
       el('div', 's3-card', el('h2', {text: 'Authority'}),
@@ -4156,10 +4887,13 @@ export async function mount(root, {request, onClose, tab: startTab = '', table: 
         btn('Reset controls to defaults', async () => { try { settings.settings = (await send('/api/system3/settings', 'POST', {reset: true})).settings; paint(); } catch (e) { report(e); } }),
         btn('Reset tables and structure to defaults', async () => { if (!confirm('Replace the live tables and structure with the defaults? The current version stays in the ledger.')) return; try { await send('/api/system3/config/reset', 'POST'); await loadConfig(); paint(); } catch (e) { report(e); } }))),
       roadsCard(),
+      versionsCard(),
       section('speakerbox', 'Mode weights for a hit (verbatim / reference / callback), the inline passage budget per round, and passage length.'),
       section('sfx', 'The SFX Guy: planned-clip probability at aggression 0 and 1, the first-exchange clip, and the arousal and comedy boosts. The station\'s cadence stays the floor.'),
       section('sfxguy', 'The SFX Guy\'s mouth: his node on every host turn. rate_by_dial uses the desk\'s interjections dial for whether he pipes up; reaction_by_warp uses the invention dial for how often a line is fired back at the one just said; news_share is the wire; never_over_callers keeps him off a caller\'s turn.'),
-      section('personalities', 'Per seat tag multipliers, e.g. {"A": {"disagreement": 1.4}, "B": {"humor": 1.3}}.')));
+      section('personalities', 'Per seat tag multipliers, e.g. {"A": {"disagreement": 1.4}, "B": {"humor": 1.3}}.'),
+      /* [s3-blocks] */
+      section('blocks', 'Every block a writer prompt may carry, and what System 3 does with it: kind "obligation" (always sent, recorded), "roll" (a die at odds, or the desk dial named in odds_from), "tint" (only while a crystal is on and the tint pass is wanted) or "off". A block whose name is not here is a wedge and is stripped. The Prompt tab shows each prompt’s blocks as decided.')));
   }
 
   /* ---------------- plumbing ---------------------------------------------- */
@@ -4170,6 +4904,7 @@ export async function mount(root, {request, onClose, tab: startTab = '', table: 
     paintTabs();
     try {
       if (tab === 'director') { fill(body, director); paintDirector(); }
+      else if (tab === 'visual') paintVisual();
       else if (tab === 'tables') paintTables();
       else if (tab === 'segments') paintSegments();
       else if (tab === 'prompts') paintPrompts();
@@ -4243,7 +4978,7 @@ export function openLineStory({request, lineId = ''} = {}) {
   const onKey = e => { if (e.key === 'Escape') { e.stopPropagation(); close(); } };
   const shut = btn('Close', close, {class: 's3-modal-close', 'aria-label': 'Close'});
   const host = el('div', 's3-story-modal');
-  back.append(el('section', {class: 's3-modal', role: 'dialog', 'aria-modal': 'true', 'aria-label': 'How System 3 built this line'}, shut, host));
+  back.append(movableModal(el('section', {class: 's3-modal', role: 'dialog', 'aria-modal': 'true', 'aria-label': 'How System 3 built this line'}, shut, host)));
   back.addEventListener('click', e => { if (e.target === back) close(); });
   document.addEventListener('keydown', onKey, true);
   document.body.append(back);
@@ -4544,6 +5279,43 @@ function promptParts(d) {
   const opts = {model: req.model, ...(req.options || {}), think: req.think, keep_alive: req.keep_alive, stream: req.stream};
   return {sys, user, text, opts};
 }
+/* Human-readable display only. The original request remains available below
+   every rendering, and this never changes the bytes sent to the model. */
+function readablePromptText(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return para('(none)', 's3-muted');
+  const out = el('div', 's3-vp-readable');
+  const field = (name, val, depth = 0) => {
+    if (val && typeof val === 'object' && depth < 8) {
+      const pairs = Object.entries(val);
+      return el('details', {class: 's3-vp-json', open: depth < 2},
+        el('summary', {text: `${name} · ${pairs.length} ${Array.isArray(val) ? 'items' : 'fields'}`}),
+        el('div', 's3-vp-json-in', ...pairs.map(([k, v]) => field(k, v, depth + 1))));
+    }
+    return el('div', 's3-vp-field', el('b', {text: name}), el('span', {text: val == null ? '(empty)' : String(val)}));
+  };
+  const parse = text => { try { return JSON.parse(text); } catch (_) { return null; } };
+  const entire = parse(raw);
+  if (entire && typeof entire === 'object') out.append(field('Prompt data', entire));
+  else {
+    const chunks = raw.split(/(```(?:json)?\s*[\s\S]*?```)/g).filter(Boolean);
+    for (const chunk of chunks) {
+      const fenced = chunk.startsWith('```');
+      const data = parse(fenced ? chunk.replace(/^```(?:json)?\s*|\s*```$/g, '') : chunk.trim());
+      if (data && typeof data === 'object') { out.append(field('Prompt data', data)); continue; }
+      if (fenced) { out.append(el('pre', {text: chunk})); continue; }
+      for (const part of chunk.split(/\n\s*\n/).filter(Boolean)) {
+        const lines = part.split('\n').map(s => s.trim()).filter(Boolean);
+        if (!lines.length) continue;
+        const heading = lines.length > 1 && lines[0].length < 110 && (/:$/.test(lines[0]) || /^[A-Z][A-Z\s\/–—-]{5,}$/.test(lines[0]));
+        out.append(el('section', 's3-vp-prose', heading ? el('h4', {text: lines.shift()}) : null,
+          el('div', {text: lines.join('\n')})));
+      }
+    }
+  }
+  out.append(el('details', 's3-vp-raw', el('summary', {text: 'Original captured text'}), el('pre', {text: raw})));
+  return out;
+}
 const NO_SYSTEM = '(none - this call sends everything as one user message; the station builds no system message for it)';
 const normWs = text => String(text || '').replace(/\s+/g, ' ').trim();
 /* The message's own row of the running order, as a prompt would carry it:
@@ -4663,6 +5435,34 @@ async function findWriterCall(request, conv, turn = null, cache = null) {
 const SEAT_PERSONA = {A: ['dj', 'persona'], B: ['dj', 'cohost_persona'], D: ['dj', 'third_persona']};
 const SEAT_KEY = {A: 'dj', B: 'cohost', D: 'third'};
 const SEAT_WORDS = {A: 'the host', B: 'the co-host', D: 'the third seat'};
+/* [s3-blocks] every block of a prompt, as System 3 decided it: sent (an
+   obligation, a roll that hit, a tint block while the tint is on) or stripped
+   (switched off, a roll that missed, a wedge no node claims) - with its reason */
+function promptBlocksBox(request, userText) {
+  const box = el('div', 's3-tile-box s3-blocks', el('h4', {text: 'Every block of this prompt, as System 3 decided it'}),
+    para('Asking System 3...', 's3-muted'));
+  (async () => {
+    let got;
+    try { got = await request('/api/system3/prompt-blocks', {method: 'POST', body: JSON.stringify({text: String(userText || '')})}); }
+    catch (e) { fill(box, el('h4', {text: 'Every block of this prompt'}), para('System 3 could not be asked: ' + ((e && e.message) || e), 's3-error')); return; }
+    const rows = ((got && got.prompt && got.prompt.blocks) || []);
+    if (!rows.length) {
+      fill(box, el('h4', {text: 'Every block of this prompt'}), para(got && got.prompt ? 'This prompt carried no marked blocks.'
+        : 'System 3 holds no block record for this prompt - it was written before prompt blocks were nodes, or on a road System 3 does not decide.', 's3-muted'));
+      return;
+    }
+    const rules = (got && got.rules) || {};
+    fill(box, el('h4', {text: `Every block of this prompt, as System 3 decided it (${rows.filter(b => b.keep).length} sent, ${rows.filter(b => !b.keep).length} stripped)`}),
+      ...rows.map(b => el('div', 's3-block ' + (b.keep ? 's3-block-kept' : 's3-block-stripped'),
+        el('div', 's3-row', el('b', {text: b.label || b.name}),
+          el('span', {class: 's3-pill', text: b.kind === 'wedge' ? 'wedge - no node' : b.kind}),
+          el('span', {class: 's3-muted', text: (b.keep ? 'sent' : 'stripped') + ' - ' + (b.why || '')}),
+          el('span', {class: 's3-muted', text: (rules[b.name] && rules[b.name].helper) ? 'from ' + rules[b.name].helper : 'helper: ' + b.name})),
+        !b.keep && b.text ? el('div', 's3-block-text', b.text) : null)));
+  })();
+  return box;
+}
+
 function promptFold(request, state, conv, t, opts = {}) {
   const send = (path, method, body) => request(path, {method, body: body === undefined ? undefined : JSON.stringify(body)});
   const body = el('div', 's3-pfold-body');
@@ -4678,19 +5478,16 @@ function promptFold(request, state, conv, t, opts = {}) {
     const w = state.writerByTurn.get(t.turn_id) || {};
     const parts = w.row ? promptParts(w.detail || {}) : null;
     const inPrompt = w.row ? sheetRowOf(promptText(w.detail || {}), t).trim() : '';
-    const mark = (text, hit) => {
-      const hits = [hit, hit ? hit.slice(0, 60) : '', hit ? hit.slice(0, 40) : ''].filter(Boolean);
-      const found = text ? hits.find(h => text.includes(h)) : '';
-      return el('pre', null, ...(found ? markIn(text, found) : [text || '(none)']));
-    };
     const call = w.row ? el('div', 's3-pfold-call',
       el('div', 's3-row', el('b', {text: `${w.row.model || '?'} - ${w.row.purpose || ''}`}), el('span', {class: 's3-state s3-state-' + (w.row.state || 'done'), text: w.row.state || ''}),
         el('span', {class: 's3-muted', text: day(Number(w.row.at || 0)) + (w.row.finished && w.row.at ? ` - took ${num(Number(w.row.finished) - Number(w.row.at), 1)} s` : '')}),
         el('span', {class: 's3-pill ' + (w.exact ? 'active' : 'shadow'), text: w.exact ? 'proven by its words' : 'nearest by time'}),
         el('span', {class: 's3-muted', text: w.why || ''})),
+      inPrompt ? el('div', 's3-story-row', el('b', {text: 'This turn in the captured prompt: '}), inPrompt) : null,
       el('div', 's3-tile-grid',
-        el('div', 's3-tile-box', el('h4', {text: 'The prompt to the writer'}), mark(parts.user, inPrompt)),
-        el('div', 's3-tile-box', el('h4', {text: 'The system prompt, as it was sent'}), el('pre', {text: parts.sys || (parts.user ? NO_SYSTEM : '(none)')}))))
+        el('div', 's3-tile-box', el('h4', {text: 'The prompt to the writer'}), readablePromptText(parts.user)),
+        el('div', 's3-tile-box', el('h4', {text: 'The system prompt, as it was sent'}), readablePromptText(parts.sys || (parts.user ? NO_SYSTEM : '(none)')))),
+      parts.user ? promptBlocksBox(request, parts.user) : null)   /* [s3-blocks] */
       : para((w.why ? 'No prompt for this message: ' + w.why : 'No prompt for this message.') + ' The layers below still build the system prompt of the next call.', 's3-muted');
     /* the editable layers, from the desk's own door */
     const layers = el('div', 's3-pfold-layers', para('Reading the prompt layers...', 's3-muted'));
@@ -4885,7 +5682,8 @@ export async function mountLineTabs(root, {request, lineId = '', tab = 'system3'
     const promptBox = el('div', {class: 's3-muted', text: 'Looking for the model call that wrote this round...'});
     fill(host, turnArrows(), sectionOf('The exchange - tap a message to move to it', exchange),
       sectionOf('Rolodex - every roll behind this prompt; this message\'s rows are lit', rolodex),
-      sectionOf('The prompt that created this message', promptBox));
+      sectionOf('The prompt that created this message', promptBox),
+      el('div', 's3-row', btn('Open this round in Visual Prompt', () => openSystem3({request, tab: 'visual', conversationId: conv.identity.conversation_id}))));
     rolodex.roll();
     const mine = exchange.querySelector('.s3-msg.sel');
     if (mine && mine.scrollIntoView) { try { mine.scrollIntoView({block: 'nearest'}); } catch (e) { /* older engine */ } }
@@ -4912,7 +5710,8 @@ export async function mountLineTabs(root, {request, lineId = '', tab = 'system3'
         el('span', {class: 's3-pill ' + (w.exact ? 'active' : 'shadow'), text: w.exact ? 'proven by its words' : 'nearest by time'}),
         el('span', {class: 's3-muted', text: w.why})),
       row ? el('div', 's3-story-row', el('b', {text: inPrompt ? 'The row the writer was given for this message: ' : 'This message\'s row in the running order (the prompt does not carry it word for word): '}), row) : null,
-      el('div', 's3-tile-grid', box('System prompt', parts.sys || (parts.user ? NO_SYSTEM : '')), box('Prompt', parts.user, row), box('LLM settings', json(parts.opts)),
+      el('div', 's3-tile-grid', el('div', 's3-tile-box', el('h4', {text: 'System prompt'}), readablePromptText(parts.sys || (parts.user ? NO_SYSTEM : ''))),
+        el('div', 's3-tile-box', el('h4', {text: 'Prompt'}), readablePromptText(parts.user)), box('LLM settings', json(parts.opts)),
         box('Result - what came back', parts.text || (r.state === 'running' ? 'still running' : '(empty)'), String(t.text || '').trim().slice(0, 60))),
       el('div', 's3-row', btn('Open every call in the Prompts tab', () => openSystem3({request, tab: 'prompts'}))),
       promptFold(request, foldState, conv, t, {lineId: cur.lineId}));
@@ -5044,6 +5843,7 @@ export async function mountLineTabs(root, {request, lineId = '', tab = 'system3'
     topics: 'how often something off your topics board comes up: 0.5 = 40% of rounds, 1.0 = 80%, 0 = never',
     shock_beat: 'the odds of one open reaction turn in a round ("openly shocked at what the other just said")',
     interjections: 'the odds of an interjection forced in edgewise while one seat goes on a roll',
+    track_talk: 'the odds that a live banter round includes one brief comment tied to the record currently playing; banked rounds do not use a record title',
     mention: 'the odds the station\'s own name is worked into the round',
     tint: 'which lines the crystal tint may rhyme: 0.5 = half of them, 1.0 = every eligible line, 0 = none (the pass itself is a station switch)',
     repair: 'whether a round that misses its target goes back to the writer for one rewrite: 0.5 = half of such rounds, 0 = never (it stands as written)',
@@ -5161,7 +5961,7 @@ export async function mountLineTabs(root, {request, lineId = '', tab = 'system3'
   };
 }
 
-export async function openSystem3({request, onClose, tab = '', table = ''} = {}) {
+export async function openSystem3({request, onClose, tab = '', table = '', conversationId = ''} = {}) {
   const backdrop = el('div', 's3-backdrop');
   const root = el('section', {role: 'dialog', 'aria-modal': 'true', 'aria-label': 'System 3 conversation director'});
   backdrop.append(root); document.body.append(backdrop);
@@ -5170,7 +5970,7 @@ export async function openSystem3({request, onClose, tab = '', table = ''} = {})
   const key = event => { if (event.key === 'Escape') close(); };
   document.addEventListener('keydown', key);
   backdrop.addEventListener('click', event => { if (event.target === backdrop) close(); });
-  view = await mount(root, {request, onClose: close, tab, table});
+  view = await mount(root, {request, onClose: close, tab, table, conversationId});
   if (closed) view.dispose(); else { const b = root.querySelector('button'); b && b.focus(); }
   return {element: backdrop, close};
 }

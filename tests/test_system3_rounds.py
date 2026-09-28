@@ -44,9 +44,30 @@ def plan(seed, **over):
 
 
 class RoundRollTests(unittest.TestCase):
+    def test_live_record_talk_is_a_roulette_event_inside_banter(self):
+        record = {"id": "record-17", "title": "Blue Hour", "artist": "The Harbor"}
+        settings = system3.normalise_settings(
+            {"mode": "active", "test_seed": "record-talk", "controls": {"track_talk": 1.0}})
+        conv = system3.plan_scene(rolls_inputs(record=record), system3.default_config(), settings)
+        events = [e for e in conv["decision_events"] if e["family"] == "TRACK_TALK"]
+        self.assertEqual(len(events), 1)
+        self.assertIsNotNone(events[0]["rng"])
+        turns = [t for t in conv["turns"] if t.get("track_talk")]
+        self.assertEqual(len(turns), 1)
+        self.assertEqual(turns[0]["track_talk"], record)
+        self.assertEqual(events[0]["turn_id"], turns[0]["turn_id"])
+        self.assertIn("Blue Hour", system3.render_sheet(conv))
+        self.assertIn("The Harbor", system3.render_sheet(conv))
+        self.assertTrue(system3.replay(json.loads(json.dumps(conv)), system3.default_config())["ok"])
+        for missing in (rolls_inputs(), rolls_inputs(record=record, bank=True)):
+            absent = system3.plan_scene(missing, system3.default_config(), settings)
+            self.assertFalse(any(e["family"] == "TRACK_TALK" for e in absent["decision_events"]))
+
     def test_default_config_carries_the_three_new_tables_and_controls(self):
         cfg = system3.default_config()
-        self.assertEqual([t["id"] for t in cfg["tables"]][-3:], ["TEMPER1", "SHOCK1", "INTERJECT1"])
+        # [s3-cast] [s3-events] later default tables come after them
+        ids = [t["id"] for t in cfg["tables"]]
+        self.assertEqual(ids[ids.index("TEMPER1"):ids.index("TEMPER1") + 3], ["TEMPER1", "SHOCK1", "INTERJECT1"])
         for key in ("shock_beat", "interjections", "mention"):
             self.assertEqual(system3.DEFAULT_CONTROLS[key], 0.5)
         # the new families validate as tables the desk can edit
@@ -336,8 +357,10 @@ class RuntimeCarryTests(unittest.TestCase):
         old["tables"] = [t for t in old["tables"] if t["family"] in ("CTS", "ES", "RS", "IRS", "FL")]
         rt.store.save_config(old, "as saved before the round rolls existed")
         rt.load()
-        self.assertEqual([t["id"] for t in rt.config["tables"]][-3:], ["TEMPER1", "SHOCK1", "INTERJECT1"])
-        self.assertEqual(rt.config["defaults_added"], ["INTERJECT1", "SHOCK1", "TEMPER1"])
+        ids = [t["id"] for t in rt.config["tables"]]
+        added = [t["id"] for t in system3_tables.default_tables() if t["family"] not in ("CTS", "ES", "RS", "IRS", "FL")]
+        self.assertEqual(ids[-len(added):], added)
+        self.assertEqual(rt.config["defaults_added"], sorted(added))
         # the store keys versions by content: this config IS the default, so the pointer moved to it
         self.assertEqual(system3.config_hash(rt.store.config()), system3.config_hash(rt.config))
         self.assertEqual(rt.add_missing_default_tables(), [])

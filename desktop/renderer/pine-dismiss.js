@@ -215,6 +215,10 @@
     if (ev.pointerType === 'mouse' && ev.button !== 0) return;
     var t = ev.target;
     if (!t || !t.closest) return;
+    /* The System 3 director is a full-screen workspace. Its inner dialog
+       has a header, but moving that dialog would strand the graph and its
+       controls. Small windows above it keep their own drag handlers. */
+    if (t.closest('.s3-backdrop')) return;
     var popup = t.closest('[data-pine-drag], [role="dialog"], [aria-modal="true"], .modal, .dialog, .popover');
     if (popup) raise(popup);
     if (t.closest(CONTROLS)) return;

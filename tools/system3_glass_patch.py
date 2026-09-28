@@ -50,7 +50,11 @@ EDITS = [
      '                    road=str(road or ""), whole=bool(whole),   # [s3-roads]\n'
      '                    lines_rolled=bool(_lines_rolled), lines_base=int(_lines_base),   # [s3-glass]\n'
      '                    lines_min=int(dj.get("banter_min_lines") or 4),\n'
-     '                    lines_max=int(dj.get("banter_max_lines") or 22))\n', 1),
+     '                    lines_max=int(dj.get("banter_max_lines") or 22),\n'
+     '                    record=({k: str((_RADIO.get("now") or {}).get(k) or "")[:180]\n'
+     '                             for k in ("id", "title", "artist")}\n'
+     '                            if not bank and str(road or "banter") == "banter"\n'
+     '                            and dj.get("track_talk", True) else {}))\n', 1),
     ("length-owns",
      '        _s3_owns = bool(_s3 is not None and _s3.active and _s3.sheet)\n',
      '        _s3_owns = bool(_s3 is not None and _s3.active and _s3.sheet)\n'

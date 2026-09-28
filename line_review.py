@@ -143,6 +143,9 @@ class LineReviewStore:
                     id TEXT PRIMARY KEY, review_id TEXT NOT NULL, body TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS review_replacements (
                     request_id TEXT PRIMARY KEY, payload_hash TEXT NOT NULL, body TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS review_prompt_exclusions (
+                    review_id TEXT PRIMARY KEY, excluded INTEGER NOT NULL,
+                    FOREIGN KEY(review_id) REFERENCES line_reviews(id));
             """)
             default = {"enabled": True, "max_faults": 0, "disabled_gates": [],
                        "revision": 1, "version": 1, "updated_at": time.time()}
@@ -188,6 +191,7 @@ class LineReviewStore:
             # written - the strongest example a writer can be shown.
             rows = db.execute("""SELECT * FROM line_reviews WHERE technical=0
                 AND review_status IN ('allowed','kept')
+                AND id NOT IN (SELECT review_id FROM review_prompt_exclusions WHERE excluded=1)
                 AND (COALESCE(json_extract(decision,'$.scope'),'') != 'instance'
                      OR json_extract(decision,'$.basis') = 'accepted_as_written')
                 ORDER BY json_extract(decision,'$.at') DESC LIMIT 24""").fetchall()
@@ -234,6 +238,69 @@ class LineReviewStore:
         examples = [row for row in rows
                     if (not kind or row['kind'] == kind) and (not gate or row['gate'] == gate)]
         return [copy.deepcopy(row) for row in examples[:limit]]
+
+    def edit_preference_note(self, review_id, note, expected_revision=None):
+        """Edit a prompt example's operator note without replaying its air effect."""
+        if not isinstance(note, str) or len(note) > 320:
+            raise ValueError('note must be text of at most 320 characters')
+        with self._lock:
+            with self._write() as db:
+                item = self._row(db.execute('SELECT * FROM line_reviews WHERE id=?',
+                                            (str(review_id),)).fetchone())
+                if item is None:
+                    raise KeyError('No such line review')
+                if expected_revision is not None and expected_revision != item['revision']:
+                    raise ReviewConflictError('This review changed; reload it before editing')
+                decision = item['decision']
+                if item['technical'] or item['review_status'] not in ('allowed', 'kept') or decision.get('action') not in ('allow', 'keep'):
+                    raise ValueError('This review is not a prompt preference example')
+                if decision.get('note', '') == note:
+                    return item
+                decision['note'] = note
+                db.execute('UPDATE line_reviews SET decision=?,revision=revision+1 WHERE id=?',
+                           (_json(decision), item['id']))
+                db.execute('INSERT INTO review_decisions(review_id,at,body) VALUES (?,?,?)',
+                           (item['id'], time.time(), _json({**decision, 'edit': 'prompt_note'})))
+                item = self._row(db.execute('SELECT * FROM line_reviews WHERE id=?',
+                                            (item['id'],)).fetchone())
+            self._refresh_preferences()
+            return item
+
+    def preference_excluded(self, review_id):
+        with closing(self._connect()) as db:
+            row = db.execute('SELECT excluded FROM review_prompt_exclusions WHERE review_id=?',
+                             (str(review_id),)).fetchone()
+            return bool(row and row['excluded'])
+
+    def set_preference_excluded(self, review_id, excluded, expected_revision=None):
+        """Keep the review verdict but remove or restore its prompt example."""
+        if not isinstance(excluded, bool):
+            raise ValueError('excluded must be a boolean')
+        with self._lock:
+            with self._write() as db:
+                item = self._row(db.execute('SELECT * FROM line_reviews WHERE id=?',
+                                            (str(review_id),)).fetchone())
+                if item is None:
+                    raise KeyError('No such line review')
+                if expected_revision is not None and expected_revision != item['revision']:
+                    raise ReviewConflictError('This review changed; reload it before editing')
+                if item['technical'] or item['review_status'] not in ('allowed', 'kept'):
+                    raise ValueError('This review is not a prompt preference example')
+                current = db.execute('SELECT excluded FROM review_prompt_exclusions WHERE review_id=?',
+                                     (item['id'],)).fetchone()
+                if bool(current and current['excluded']) == excluded:
+                    item['prompt_excluded'] = excluded
+                    return item
+                db.execute('INSERT OR REPLACE INTO review_prompt_exclusions(review_id, excluded) VALUES (?,?)',
+                           (item['id'], int(excluded)))
+                db.execute('UPDATE line_reviews SET revision=revision+1 WHERE id=?', (item['id'],))
+                db.execute('INSERT INTO review_decisions(review_id,at,body) VALUES (?,?,?)',
+                           (item['id'], time.time(), _json({'edit': 'prompt_excluded', 'excluded': excluded})))
+                item = self._row(db.execute('SELECT * FROM line_reviews WHERE id=?',
+                                            (item['id'],)).fetchone())
+            self._refresh_preferences()
+            item['prompt_excluded'] = excluded
+            return item
 
     def supersede(self, gate, source, note='a later rewrite of this line was accepted'):
         """A pending cut of a line that has since passed is moot: it leaves

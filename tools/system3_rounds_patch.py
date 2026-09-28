@@ -202,7 +202,7 @@ EDITS = [
      '               if dj.get("diatribe_interjections") and not caller_name and not _s3_owns else "")   # [s3-rounds] INTERJECT rolls it\n', 1),
     ("show-memory-call",
      '            f"{show_memory(own_material=own_material)}{call_flow}"\n',
-     '            f"{show_memory(own_material=own_material, system3=_s3_owns)}{call_flow}"\n', 1),
+     '            f"{show_memory(own_material=own_material, system3=_s3_active())}{call_flow}"\n', 1),
     ("show-memory-def",
      'def show_memory(own_material: bool = False) -> str:\n',
      'def show_memory(own_material: bool = False, system3: bool = False) -> str:\n', 1),

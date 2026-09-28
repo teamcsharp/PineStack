@@ -789,6 +789,16 @@ class LinearSequencer:
             row = min(self._held.values(), key=self._rank)
             return dict(row)
 
+    def held_keys(self) -> list[str]:
+        """[air-order] Every committed round waiting its turn, by key, in the
+        order they go. A line that arrives while these wait goes on the air
+        after every one of them (the page door parks it). A round wedged past
+        `held_stale_s` is evicted first, so nothing waits behind a dead maker."""
+        with self.lock:
+            self.evict_stale()
+            return [key for key, _row in
+                    sorted(self._held.items(), key=lambda kv: self._rank(kv[1]))]
+
     @staticmethod
     def _rank(row: dict[str, Any]) -> tuple:
         block = int(row.get("block") or 0)

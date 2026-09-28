@@ -52,9 +52,13 @@ ROADS = ("banter", "caller", "recap", "ad", "news", "manager", "memo", "gallery"
          "track_talk", "station_id", "upstairs", "interject", "ad_spot",
          # [s3-lines] the single lines dj_speak still spoke outside a road
          "reply", "request", "open", "aside")
-FAMILIES = ("CTS", "ES", "RS", "IRS", "FL", "SPEAKERBOX", "SFX", "TOPIC", "SFXGUY", "LINE", "LENGTH",
+FAMILIES = ("CTS", "ES", "RS", "IRS", "FL", "SPEAKERBOX", "SFX", "TOPIC", "SFXGUY", "LINE", "LENGTH", "TRACK_TALK",
             "TEMPER", "SHOCK", "INTERJECT", "MENTION", "CARRY",          # [s3-rounds] [s3-carry]
-            "TINT", "REPAIR", "ROOM")                                    # [s3-rewrite]
+            "TINT", "REPAIR", "ROOM",                                    # [s3-rewrite]
+            "FAV", "DIRECTIVE",                                          # [s3-cast]
+            "EVENT",                                                     # [s3-events]
+            "STATION",                                                   # [s3-dice-door]
+            "BLOCK")                                                     # [s3-blocks]
 PHASES = ("OPEN", "ESTABLISH", "DEVELOP", "ESCALATE", "EXPLORE", "WILDCARD",
           "RESOLVE", "WRAP", "SEGUE")
 SPEAKERBOX_MODES = ("NONE", "PREPEND", "APPEND", "FULL_SWATH", "REFERENCE",
@@ -87,6 +91,7 @@ DEFAULT_CONTROLS = {
     # station-name mention: rate = <FAMILY>_RATE_AT_FULL x this
     "shock_beat": 0.5,
     "interjections": 0.5,
+    "track_talk": 0.5,
     "mention": 0.5,
     # [s3-rewrite] the passes after the write, as odds: which lines the
     # crystal tint may rhyme, whether a round that missed its target is
@@ -94,6 +99,9 @@ DEFAULT_CONTROLS = {
     "tint": 0.5,
     "repair": 0.5,
     "room": 0.5,
+    # [s3-cast] how often a line the operator liked comes up (FAV1): the
+    # dice's own odds, per round and per single line - 0.25 is one in four
+    "favorites": 0.25,
 }
 TAG_CONTROLS = {"disagreement": "disagreement", "escalation": "escalation",
                 "tangent": "tangent", "callback": "callback",
@@ -211,6 +219,9 @@ def digest(value, size=16):
 
 # --- configuration ---------------------------------------------------------
 
+BLOCK_KINDS = ("obligation", "roll", "tint", "off")
+
+
 def default_config():
     return {"schema": CONFIG_SCHEMA,
             "tables": system3_tables.default_tables(),
@@ -221,6 +232,8 @@ def default_config():
             "sfx": copy.deepcopy(DEFAULT_SFX),
             # [s3-roads] the SFX Guy's mouth
             "sfxguy": copy.deepcopy(DEFAULT_SFXGUY),
+            # [s3-blocks] every block a writer prompt may carry, and what it is
+            "blocks": system3_tables.default_blocks(),
             "personalities": {}}
 
 
@@ -231,6 +244,8 @@ def config_hash(config):
         keys += ("structures",)
     if "sfxguy" in config:                       # [s3-roads]
         keys += ("sfxguy",)
+    if "blocks" in config:                       # [s3-blocks]
+        keys += ("blocks",)
     return digest({k: config.get(k) for k in keys})
 
 
@@ -272,10 +287,13 @@ def validate_table(table):
     if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,23}", tid):
         raise ValueError("table id must be a short name such as ES2")
     family = str(table.get("family") or "")
-    if family not in ("CTS", "ES", "RS", "IRS", "FL", "TEMPER", "SHOCK", "INTERJECT"):
-        raise ValueError("table family must be one of CTS, ES, RS, IRS, FL, TEMPER, SHOCK, INTERJECT")
+    if family not in ("CTS", "ES", "RS", "IRS", "FL", "TEMPER", "SHOCK", "INTERJECT", "FAV", "DIRECTIVE", "EVENT",
+                      "CHANCE", "POOL"):
+        raise ValueError("table family must be one of CTS, ES, RS, IRS, FL, TEMPER, SHOCK, INTERJECT, FAV, DIRECTIVE, "
+                         "EVENT, CHANCE, POOL")
+    pool = family in system3_tables.POOL_FAMILIES          # [s3-cast] may stand empty
     cats = table.get("categories")
-    if not isinstance(cats, list) or not cats:
+    if not isinstance(cats, list) or (not cats and family not in ("CHANCE", "POOL")):   # [s3-dice-door] filled as the station rolls
         raise ValueError("a table needs at least one category")
     seen = set()
     out = copy.deepcopy(table)
@@ -283,12 +301,20 @@ def validate_table(table):
     out["weight"] = max(0.0, float(table.get("weight", 1.0) or 0))
     out["enabled"] = bool(table.get("enabled", True))
     out["version"] = int(table.get("version") or 1)
+    if family == "EVENT":                                    # [s3-events] where it rolls, how many at most
+        out["roads"] = [str(r) for r in (table.get("roads") or []) if str(r) in ROADS]
+        out["max_events"] = max(0, min(8, int(float(table.get("max_events", 2) or 0))))
     for cat in out["categories"]:
         if not isinstance(cat, dict) or not str(cat.get("id") or "").strip():
             raise ValueError("every category needs an id")
         cat["weight"] = max(0.0, float(cat.get("weight", 1.0) or 0))
+        if family == "EVENT":                                # [s3-events] one kind of happening
+            cat["odds"] = round(clamp(cat.get("odds", 0.1)), 4)
+            cat["seat"] = str(cat.get("seat") or "any") if str(cat.get("seat") or "any") in EVENT_SEATS else "any"
+            cat["place"] = str(cat.get("place") or "middle") if str(cat.get("place") or "middle") in EVENT_PLACES else "middle"
+            cat["ends"] = bool(cat.get("ends", False))
         items = cat.get("items")
-        if not isinstance(items, list) or not items:
+        if not isinstance(items, list) or (not items and not pool):
             raise ValueError("category %s has no items" % cat["id"])
         for item in items:
             if not isinstance(item, dict) or not str(item.get("id") or "").strip():
@@ -299,6 +325,18 @@ def validate_table(table):
             seen.add(key)
             item["weight"] = max(0.0, float(item.get("weight", 1.0) or 0))
             item.setdefault("label", item["id"])
+            if family == "DIRECTIVE":                       # [s3-cast] the row's own odds and lifetime
+                item["odds"] = round(clamp(item.get("odds", 1.0)), 4)
+                item["until"] = max(0.0, float(item.get("until") or 0))
+                item["airings"] = max(0, int(float(item.get("airings") or 0)))
+                if not str(item.get("text") or "").strip():
+                    raise ValueError("directive %s says nothing" % item["id"])
+            if family == "FAV" and not str(item.get("text") or "").strip():
+                raise ValueError("favourite %s has no words" % item["id"])
+            if family == "CHANCE":                           # [s3-dice-door] a station roll's odds
+                item["odds"] = round(clamp(item.get("odds", 0.5)), 4)
+            if family == "POOL" and not str(item.get("text") or "").strip():
+                raise ValueError("option %s of pool %s says nothing" % (item["id"], cat["id"]))
     return out
 
 
@@ -528,7 +566,8 @@ _INHERIT = ("requires", "requires_state", "phases", "not_phases", "min_turns_lef
             "max_turns_left", "modifiers", "emotions", "tags", "lean", "effects",
             "cue", "speaker", "new_topic", "keep_initiator", "closes", "resolves",
             "keeps_unresolved", "resolver", "valence", "arousal", "dims",
-            "speakerbox", "cooldown_turns", "after_lean", "callback_source")
+            "speakerbox", "cooldown_turns", "after_lean", "callback_source",
+            "after")                                                       # [s3-flow] follow-on odds
 
 
 def _spec(table, cat, item):
@@ -626,6 +665,11 @@ def _item_factor(spec, ctx):
             m = max(0.0, float(person[tag]))
             reasons.append("%s's %s x%.2f" % (ctx.get("speaker"), tag, m))
             f *= m
+    ev_emo = ctx.get("event_emotions") or {}                                 # [s3-events]
+    if spec["family"] == "ES" and spec.get("category") in ev_emo:
+        m = float(ev_emo[spec["category"]])
+        reasons.append("what happens on this turn x%.2f" % m)
+        f *= m
     if spec["family"] == "ES":
         # Emotion is state: the speaker's current category is stickier the
         # lower the volatility dial (blueprint: persistence/decay).
@@ -648,10 +692,25 @@ def _item_factor(spec, ctx):
             reasons.append("said by the %s, preferred %s x0.35" % (
                 "initiator" if is_init else "responder", spec["speaker"]))
             f *= 0.35
+    # [s3-flow] FOLLOW-ON ODDS: what the turn before rolled tilts this wheel
+    after = spec.get("after") if isinstance(spec.get("after"), dict) else {}
+    prev_keys = ctx.get("prev_keys") or ()
+    for key, mult in after.items():
+        if key in prev_keys:
+            try:
+                m = max(0.0, float(mult))
+            except (TypeError, ValueError):
+                continue
+            reasons.append("after %s x%.2f" % (key, m))
+            f *= m
     recent = _recent_items(conv, spec["family"], 6)
     if spec.get("id") in recent:
         reasons.append("used recently x0.4")
         f *= 0.4
+    # [s3-flow] UNIQUENESS: an item a recent round used weighs a quarter
+    if spec.get("id") and ("%s:%s" % (spec["family"], spec["id"])) in (ctx.get("recent_rounds") or ()):
+        reasons.append("used in a recent round x0.25")
+        f *= 0.25
     return f, reasons, ""
 
 
@@ -709,7 +768,7 @@ def _stage(name, rows, pick, draw, excluded=None):
             "of": len(rows)}
 
 
-def weighted_decision(conv, config, ctx, stream, family, tables=None, closes=False, fixed=None):
+def weighted_decision(conv, config, ctx, stream, family, tables=None, closes=False, fixed=None, category=None):
     """Draw one outcome from a family: table -> category -> item.
 
     "When a category is initialized, a Rolodex will scroll the category
@@ -746,11 +805,18 @@ def weighted_decision(conv, config, ctx, stream, family, tables=None, closes=Fal
                     return spec, ev
         # a pin that names nothing on the tables falls through to the roll, and says so
         ctx["fixed_missing"] = want
+    # [s3-flow] a category pin: the node is static, the item inside still rolls
+    if category and not any(c.get("id") == category for t in _tables_for(config, family, tables)
+                            for c in t.get("categories") or []):
+        ctx["category_missing"] = category
+        category = None
     # Every candidate's effective weight, with its reasons.
     pool = []
     for table in _tables_for(config, family, tables):
         cats = []
         for cat in table.get("categories") or []:
+            if category and cat.get("id") != category:
+                continue
             items, excl = [], []
             for item in cat.get("items") or []:
                 spec = _spec(table, cat, item)
@@ -799,7 +865,14 @@ def weighted_decision(conv, config, ctx, stream, family, tables=None, closes=Fal
     selected = {"table": table["id"], "category": cat["id"], "category_label": cat["label"],
                 "id": spec["id"], "label": spec["label"], "text": spec.get("text", ""),
                 "index": k + 1, "of": len(cat["items"])}
-    ev = _event(conv, ctx, family, stages, selected, before, rng=draw)
+    meta = {}
+    if category:
+        meta = {"authority": "category", "why": "the node is pinned to %s in the segment editor: "
+                                                "the category is static, the item rolled" % category}
+    elif ctx.get("category_missing"):
+        meta = {"why": "pinned to category %s, which no table holds - rolled over the whole family"
+                       % ctx.pop("category_missing")}
+    ev = _event(conv, ctx, family, stages, selected, before, meta=meta or None, rng=draw)
     return spec, ev
 
 
@@ -1208,12 +1281,20 @@ def _decide_turn(conv, config, settings, stream, step, speaker, want, inputs, cl
             "cycle": conv["cursor"]["cycle"], "phase": phase, "decisions": [], "directions": [],
             "speakerbox": [], "sfx": None, "sfxguy": None, "performance": None, "text": "", "script_index": None,
             "status": "planned", "cursor_before": cursor_before, "state_before": state_before}
+    prev_keys = set()                                                         # [s3-flow]
+    for _d in (prev or {}).get("decisions") or []:
+        if _d.get("family") and _d.get("item"):
+            prev_keys.add("%s:%s" % (_d["family"], _d["item"]))
+        if _d.get("family") and _d.get("category"):
+            prev_keys.add("%s:%s" % (_d["family"], _d["category"]))
     ctx = {"conv": conv, "turn_id": turn_id, "turn_index": idx, "speaker": speaker, "phase": phase,
+           "prev_keys": prev_keys, "recent_rounds": set(str(x) for x in (inputs.get("recent_items") or [])),
            "turns_left": want - idx - 1, "controls": settings["controls"],
            "availability": inputs.get("availability") or {},
            "personalities": config.get("personalities") or {},
            "speaker_emotion_cat": (who["emotion"].get("category") if who else ""),
-           "prev_lean": prev_lean}
+           "prev_lean": prev_lean,
+           "event_emotions": _event_emotions(conv, idx)}                     # [s3-events]
     tp = conv.get("topic_plan") or {}                                    # [rng-topics]
     if tp.get("id") and tp.get("turn_index") == idx:
         turn["bank_topic"] = {"id": tp["id"], "text": tp.get("text", ""), "reply": tp.get("reply", "")}
@@ -1225,6 +1306,11 @@ def _decide_turn(conv, config, settings, stream, step, speaker, want, inputs, cl
     elif tp.get("id") and tp.get("reply") and tp.get("turn_index") == idx - 1:
         turn["bank_topic_reply"] = tp["reply"]
     _attach_round_plans(conv, turn, idx, want, speaker)                      # [s3-rounds]
+    if str(step.get("topic") or "").strip():                                  # [s3-flow] the operator's own topic
+        turn["topic_override"] = " ".join(str(step["topic"]).split())[:400]
+        if idx == 0:
+            conv["subject"]["topic"] = turn["topic_override"]
+            conv["subject"]["authority"] = "operator"
     draws = (config["structure"].get("closing") or {}).get("draws") if closing else step.get("draws")
     es_spec = None
     acts = []
@@ -1235,7 +1321,8 @@ def _decide_turn(conv, config, settings, stream, step, speaker, want, inputs, cl
             continue
         spec, ev = weighted_decision(conv, config, ctx, stream, family,
                                      tables=spec_draw.get("tables"), closes=bool(spec_draw.get("closes")),
-                                     fixed=spec_draw.get("fixed"))                     # [s3-window]
+                                     fixed=spec_draw.get("fixed"),                     # [s3-window]
+                                     category=spec_draw.get("category"))               # [s3-flow]
         if not spec:
             turn["decisions"].append({"family": family, "event_id": ev["event_id"], "item": None,
                                       "empty": ev["meta"].get("empty")})
@@ -1557,7 +1644,7 @@ def _round_rolls(conv, config, settings, inputs, want, banter=True):
     started from."""
     # one stream per family, so switching a family on or off (the desk's
     # dice_hosts, an empty interjections list) never moves another's dice
-    streams = {f: DrawStream(str(conv["seed"]) + "|round:" + f) for f in ("TEMPER", "SHOCK", "INTERJECT", "MENTION")}
+    streams = {f: DrawStream(str(conv["seed"]) + "|round:" + f) for f in ("TEMPER", "SHOCK", "INTERJECT", "MENTION", "TRACK_TALK")}
     ctx0 = {"turn_id": "", "turn_index": -1}
     controls = settings.get("controls") or {}
     hosts = [p["actor_id"] for p in conv["participants"] if p["actor_id"] in HOST_SEATS]
@@ -1676,6 +1763,35 @@ def _round_rolls(conv, config, settings, inputs, want, banter=True):
         ev["state_after"] = before
         if conv.get("interject_plan"):
             conv["interject_plan"]["event_id"] = ev["event_id"]
+    # A live banter round may briefly talk about the record actually playing.
+    # Banked rounds have no reliable record identity and never take this draw.
+    record = inputs.get("record") if isinstance(inputs.get("record"), dict) else {}
+    if banter and conv["identity"]["road_kind"] == "banter" and not inputs.get("bank") \
+            and record.get("id") and record.get("title") and want >= 3 and hosts:
+        rate = round(clamp(controls.get("track_talk", DEFAULT_CONTROLS["track_talk"])), 4)
+        before = _snapshot(conv, conv["cursor"].get("initiator"))
+        d1 = streams["TRACK_TALK"].next("TRACK_TALK:dice")
+        st1, hit = _dice_stage("TRACK_TALK", "a passing comment on the record under the banter", rate, d1,
+                               "track_talk control %.2f" % rate)
+        stages = [st1]
+        sel = {"id": "NONE", "label": "no record comment in this round"}
+        meta = {"rate": rate, "record": {k: record.get(k) for k in ("id", "title", "artist")}}
+        if hit:
+            slots = list(range(1, max(2, want - 1)))
+            srows = [{"id": "t%d" % i, "label": "turn %d" % (i + 1), "base": 1.0,
+                      "weight": 1.0, "why": []} for i in slots]
+            d2 = streams["TRACK_TALK"].next("TRACK_TALK:turn")
+            sp = pick_index([r["weight"] for r in srows], d2["u"])
+            stages.append(_stage("turn", srows, sp, d2))
+            sel = {"id": "TRACK_TALK", "label": "%s by %s on turn %d" %
+                   (record["title"], record.get("artist") or "unknown artist", slots[sp] + 1),
+                   "turn_index": slots[sp], "record": meta["record"]}
+            meta["turn_index"] = slots[sp]
+            conv["track_talk_plan"] = {"turn_index": slots[sp], "record": meta["record"], "done": False}
+        ev = _event(conv, ctx0, "TRACK_TALK", stages, sel, before, meta=meta, rng=d1)
+        ev["state_after"] = before
+        if conv.get("track_talk_plan"):
+            conv["track_talk_plan"]["event_id"] = ev["event_id"]
     # MENTION: the station's name, worked in once
     name = " ".join(str(inputs.get("station_name") or "").split())
     if name and hosts and want >= 3:
@@ -1706,7 +1822,8 @@ def _round_rolls(conv, config, settings, inputs, want, banter=True):
 def _attach_round_plans(conv, turn, idx, want, speaker):
     """[s3-rounds] The shock beat and the mention land on the first host turn at
     or after the turn they were rolled for (a caller's turn is skipped)."""
-    for key, family in (("shock_plan", "SHOCK"), ("mention_plan", "MENTION")):
+    for key, family in (("shock_plan", "SHOCK"), ("mention_plan", "MENTION"),
+                        ("track_talk_plan", "TRACK_TALK")):
         plan = conv.get(key)
         if (not isinstance(plan, dict) or plan.get("done") or plan.get("turn_index") is None
                 or idx < max(1, int(plan["turn_index"])) or idx >= want - 1 or speaker not in HOST_SEATS
@@ -1718,10 +1835,14 @@ def _attach_round_plans(conv, turn, idx, want, speaker):
             turn["shock"] = {"id": plan.get("id"), "text": plan.get("text"), "event_id": plan.get("event_id")}
             turn["decisions"].append({"family": "SHOCK", "event_id": plan.get("event_id", ""), "item": plan.get("id"),
                                       "label": "openly %s" % plan.get("text")})
-        else:
+        elif family == "MENTION":
             turn["mention"] = plan.get("name")
             turn["decisions"].append({"family": "MENTION", "event_id": plan.get("event_id", ""), "item": "MENTION",
                                       "label": plan.get("name")})
+        else:
+            turn["track_talk"] = dict(plan.get("record") or {})
+            turn["decisions"].append({"family": "TRACK_TALK", "event_id": plan.get("event_id", ""),
+                                      "item": "TRACK_TALK", "label": str((plan.get("record") or {}).get("title") or "record")})
         for _ev in conv["decision_events"]:
             if _ev["event_id"] == plan.get("event_id"):
                 _ev["turn_id"], _ev["turn_index"] = turn["turn_id"], idx
@@ -1760,6 +1881,487 @@ def _interject_after(conv, config, settings, stream, want, inputs, seats):
             _ev["turn_id"], _ev["turn_index"] = long_turn["turn_id"], long_turn["index"]
 
 
+# --- [s3-cast] the cast's favourites and the operator's directives ----------
+
+FAV_REST = 0.25          # a favourite that came up lately weighs a quarter
+FAV_COPY_RUN = 6         # six words running out of the favourite = it was copied
+
+
+def _cast_turns(conv):
+    """The turns a favourite or a directive may land on: a host seat's own
+    turn - never a caller's, never the word in edgewise or the carry-on over
+    it, never the SFX Guy's."""
+    roles = (conv.get("inputs") or {}).get("roles") or {}
+    return [t for t in conv["turns"] if t["speaker"] in HOST_SEATS
+            and t.get("step") not in ("interject", "carry_on") and roles.get(t["speaker"]) != "drop"]
+
+
+def _pool_rows(config, family):
+    """Every enabled row with words in a pool family's enabled tables."""
+    out = []
+    for table in _tables_for(config, family):
+        for cat in table.get("categories") or []:
+            if float(cat.get("weight", 1.0) or 0) <= 0:
+                continue
+            for item in cat.get("items") or []:
+                if not isinstance(item, dict) or item.get("enabled") is False or not item.get("id"):
+                    continue
+                text = " ".join(str(item.get("text") or "").split())
+                if not text:
+                    continue
+                w = (float(item.get("weight", 1.0) or 0) * float(cat.get("weight", 1.0) or 0)
+                     * float(table.get("weight", 1.0) or 0))
+                if w <= 0:
+                    continue
+                out.append({"item": item, "cat": cat, "table": table["id"], "text": text, "weight": round(w, 4)})
+    return out
+
+
+def _cast_rolls(conv, config, settings, inputs):
+    """[s3-cast] Once the turns are planned: does a line the operator liked
+    come up (FAV), and which of the operator's directives land, on which turn
+    (DIRECTIVE). Everything that used to be stapled to every host prompt as
+    "LIVE MIND ADJUSTMENTS" - with no odds and no record - is a recorded
+    draw here. Each family on its own stream (each directive on its own), so
+    no other draw moves and adding a row never shifts another row's dice.
+    Opt-in (inputs.cast_rolls): a conversation stored before replays as it
+    was. A re-plan (Mode B) keeps what was rolled and lands it again."""
+    if not inputs.get("cast_rolls") or not conv["turns"]:
+        return
+    if conv.get("cast_rolled"):
+        _cast_attach(conv)
+        return
+    conv["cast_rolled"] = True
+    turns = _cast_turns(conv)
+    if not turns:
+        return
+    ctx0 = {"turn_id": "", "turn_index": -1}
+    controls = settings.get("controls") or {}
+    names = {p["actor_id"]: p.get("name") or p["actor_id"] for p in conv["participants"]}
+    at = float(inputs.get("at") or conv.get("created") or 0)
+
+    def turn_rows(ts):
+        return [{"id": t["turn_id"], "label": "turn %d (%s)" % (t["index"] + 1, names.get(t["speaker"], t["speaker"])),
+                 "base": 1.0, "weight": 1.0, "why": []} for t in ts]
+
+    # FAV: whether one comes up, which, and on which turn
+    rows = _pool_rows(config, "FAV")
+    if rows:
+        stream = DrawStream(str(conv["seed"]) + "|round:FAV")
+        rate = round(clamp(controls.get("favorites", DEFAULT_CONTROLS["favorites"])), 4)
+        before = _snapshot(conv, conv["cursor"].get("initiator"))
+        d1 = stream.next("FAV:dice")
+        st1, hit = _dice_stage("FAV", "a line the operator liked comes up", rate, d1, "favorites control %.2f" % rate)
+        stages = [st1]
+        sel = {"id": "NONE", "label": "no favourite this time"}
+        meta = {"rate": rate, "pool": len(rows)}
+        if hit:
+            recent = set(str(x) for x in (inputs.get("fav_recent") or []))
+            cands = []
+            for r in rows:
+                rid = str(r["item"]["id"])
+                w, why = r["weight"], []
+                if rid in recent:
+                    w = round(w * FAV_REST, 4)
+                    why.append("came up lately x%.2f" % FAV_REST)
+                cands.append({"id": rid, "label": r["text"][:90], "base": r["weight"], "weight": w, "why": why, "row": r})
+            d2 = stream.next("FAV:item")
+            k = pick_index([c["weight"] for c in cands], d2["u"])
+            if k >= 0:
+                stages.append(_stage("item", cands, k, d2))
+                trows = turn_rows(turns)
+                d3 = stream.next("FAV:turn")
+                j = pick_index([r["weight"] for r in trows], d3["u"])
+                stages.append(_stage("turn", trows, j, d3))
+                row, t = cands[k]["row"], turns[j]
+                said = str(row["item"].get("seat") or "")
+                plan = {"id": cands[k]["id"], "text": row["text"][:400], "table": row["table"], "seat": said,
+                        "said_by": str(row["item"].get("name") or names.get(said) or row["item"].get("who") or ""),
+                        "line_id": str(row["item"].get("line_id") or ""), "turn_index": t["index"]}
+                conv["fav_plan"] = plan
+                sel = {"id": plan["id"], "label": plan["text"][:90], "table": plan["table"], "turn_index": t["index"],
+                       "said_by": plan["said_by"], "index": k + 1, "of": len(cands)}
+                meta["turn_index"] = t["index"]
+        ev = _event(conv, ctx0, "FAV", stages, sel, before, meta=meta, rng=d1)
+        ev["state_after"] = before
+        if conv.get("fav_plan"):
+            conv["fav_plan"]["event_id"] = ev["event_id"]
+    # DIRECTIVE: every row its own odds; a hit lands on one of its seat's turns
+    spent = inputs.get("directive_spent") if isinstance(inputs.get("directive_spent"), dict) else {}
+    plans = []
+    for r in _pool_rows(config, "DIRECTIVE"):
+        item, cat = r["item"], r["cat"]
+        seat = str(item.get("seat") or cat.get("seat") or "*")
+        mine = [t for t in turns if seat == "*" or t["speaker"] == seat]
+        if not mine:
+            continue                   # that seat has no turn here: nothing to roll
+        rid = str(item["id"])
+        until = float(item.get("until") or 0)
+        budget = int(float(item.get("airings") or 0))
+        used = int(float(spent.get(rid) or 0))
+        if (until and at and until < at) or (budget and used >= budget):
+            continue                   # its lifetime is over; the Tables tab shows it expired
+        odds = round(clamp(item.get("odds", 1.0)), 4)
+        who = "the whole cast" if seat == "*" else names.get(seat, seat)
+        before = _snapshot(conv, mine[0]["speaker"])
+        stream = DrawStream(str(conv["seed"]) + "|round:DIRECTIVE:" + rid)
+        rng, stages = None, []
+        if odds >= 1.0:
+            hit = True
+            stages.append({"stage": "standing", "draw": None, "selected": "IN",
+                           "rule": "odds 100%: a standing directive - recorded, not drawn"})
+        elif odds <= 0:
+            hit = False
+            stages.append({"stage": "off", "draw": None, "selected": "OUT", "rule": "odds 0%: never"})
+        else:
+            rng = stream.next("DIRECTIVE:dice")
+            st, hit = _dice_stage("IN", "the directive comes up", odds, rng, "its own odds, %.0f%%" % (odds * 100))
+            stages.append(st)
+        sel = {"id": "NONE", "label": "not this time: " + r["text"][:80], "row": rid, "seat": seat}
+        plan = None
+        if hit:
+            j = 0
+            if len(mine) > 1:
+                trows = turn_rows(mine)
+                d = stream.next("DIRECTIVE:turn")
+                j = pick_index([x["weight"] for x in trows], d["u"])
+                stages.append(_stage("turn", trows, j, d))
+            t = mine[j]
+            plan = {"id": rid, "text": r["text"][:400], "table": r["table"], "seat": seat, "for": who,
+                    "turn_index": t["index"]}
+            sel = {"id": rid, "label": r["text"][:90], "table": r["table"], "turn_index": t["index"], "seat": seat}
+            plans.append(plan)
+        ev = _event(conv, ctx0, "DIRECTIVE", stages, sel, before,
+                    meta={"seat": seat, "for": who, "odds": odds, "until": until, "airings": budget, "aired": used},
+                    rng=rng)
+        ev["state_after"] = before
+        if plan:
+            plan["event_id"] = ev["event_id"]
+    if plans:
+        conv["directive_plans"] = plans
+    _cast_attach(conv)
+
+
+def _cast_landing(turns, idx, seat=None):
+    mine = [t for t in turns if seat in (None, "*") or t["speaker"] == seat]
+    if not mine:
+        return None
+    return next((t for t in mine if t["index"] >= int(idx)), mine[-1])
+
+
+def _cast_attach(conv):
+    """[s3-cast] Land the FAV and DIRECTIVE plans on their turns - again,
+    after a re-plan, on the turn now standing at the rolled place."""
+    turns = _cast_turns(conv)
+    events = {e["event_id"]: e for e in conv["decision_events"]}
+    for t in conv["turns"]:
+        t.pop("favorite", None)
+        t.pop("directives", None)
+        t["decisions"] = [d for d in t["decisions"] if d.get("family") not in ("FAV", "DIRECTIVE")]
+    fav = conv.get("fav_plan")
+    if isinstance(fav, dict):
+        t = _cast_landing(turns, fav.get("turn_index", 0))
+        if t:
+            t["favorite"] = {k: fav.get(k) for k in ("id", "text", "seat", "said_by", "line_id", "event_id")}
+            t["decisions"].append({"family": "FAV", "event_id": fav.get("event_id", ""), "item": fav.get("id"),
+                                   "label": str(fav.get("text") or "")[:90]})
+            ev = events.get(fav.get("event_id"))
+            if ev:
+                ev["turn_id"], ev["turn_index"] = t["turn_id"], t["index"]
+    for plan in conv.get("directive_plans") or []:
+        t = _cast_landing(turns, plan.get("turn_index", 0), plan.get("seat"))
+        if not t:
+            continue
+        t.setdefault("directives", []).append({k: plan.get(k) for k in ("id", "text", "seat", "event_id")})
+        t["decisions"].append({"family": "DIRECTIVE", "event_id": plan.get("event_id", ""), "item": plan.get("id"),
+                               "label": str(plan.get("text") or "")[:90]})
+        ev = events.get(plan.get("event_id"))
+        if ev:
+            ev["turn_id"], ev["turn_index"] = t["turn_id"], t["index"]
+
+
+def _words(text):
+    return re.findall(r"[a-z0-9']+", str(text or "").lower())
+
+
+def favorite_run(favorite, text):
+    """[s3-cast] The longest run of the favourite's words said word for word."""
+    a, b = _words(favorite), _words(text)
+    if not a or not b:
+        return 0
+    m = difflib.SequenceMatcher(None, a, b, autojunk=False).find_longest_match(0, len(a), 0, len(b))
+    return int(m.size)
+
+
+def favorite_copied(favorite, text):
+    """[s3-cast] Did the written line repeat its favourite instead of
+    answering in its spirit? Six words running, or most of a short one."""
+    run = favorite_run(favorite, text)
+    n = len(_words(favorite))
+    return run >= FAV_COPY_RUN or (n and run >= 3 and run >= 0.8 * n)
+
+
+# --- [s3-events] what can happen in a segment --------------------------------
+
+EVENT_SEATS = ("caller", "host", "any")
+EVENT_PLACES = ("open", "middle", "close", "any")
+# call legs the station's contract grades word for word: nothing happens on them
+EVENT_FIXED_LEGS = ("answer", "introduce", "greet")
+EVENT_AFTER = ("reacts to what just happened on the line - it has gone dead - and takes it back to the "
+               "music, in a line or two")
+
+
+def _event_slot_ok(cat, seat, place, index, want):
+    """May a happening of this kind land on this turn? Its seat (the caller,
+    a host, anyone), its place in the segment, never the very first turn,
+    and an ending never on the last one (someone has to react to it)."""
+    kind = str(cat.get("seat") or "any")
+    if kind == "caller" and seat not in ("C", "E"):
+        return False
+    if kind == "host" and seat not in HOST_SEATS:
+        return False
+    if index <= 0 or place == "fixed":
+        return False                  # never the opening, never a leg the call contract checks word by word
+    if index < int(cat.get("min_turn") or 1):
+        return False
+    if cat.get("ends") and index >= want - 1:
+        return False
+    where = str(cat.get("place") or "middle")
+    if where == "any":
+        return True
+    if place in ("open", "middle", "close"):
+        return place == where
+    frac = index / float(max(1, want - 1))                  # a cycle round: by position
+    return (frac < 0.3) if where == "open" else (frac > 0.75) if where == "close" else (0.2 <= frac <= 0.85)
+
+
+def _event_rolls(conv, config, settings, inputs, road, slots, allow_end=True):
+    """[s3-events] THE SEGMENT'S HAPPENINGS. Every EVENT table that rolls on
+    this road offers its kinds of happening (a caller who gets emotional,
+    wins a prize, loses the line, is pulled away by what is going on around
+    them ...). Each kind is a die at its own odds; a hit draws which variant
+    and on which turn (its seat and place allow). At most the table's
+    `max_events` land; at most one ENDS the segment, and the plan is cut
+    there. Every kind on its own stream, so adding one never moves another.
+    `slots` = [(index, seat, place)] of the planned turns (or the turns the
+    plan will have). Opt-in (inputs.event_rolls): an older conversation
+    replays as it was. Returns {"plans": [...], "ends_at": index or None}."""
+    out = {"plans": [], "ends_at": None}
+    if not inputs.get("event_rolls") or not slots:
+        return out
+    want = len(slots)
+    ctx0 = {"turn_id": "", "turn_index": -1}
+    names = {p["actor_id"]: p.get("name") or p["actor_id"] for p in conv["participants"]}
+    avail = inputs.get("availability") or {}
+    for table in _tables_for(config, "EVENT"):
+        roads = [str(r) for r in (table.get("roads") or [])]
+        if roads and road not in roads:
+            continue
+        cap = int(table.get("max_events", 2) if table.get("max_events") is not None else 2)
+        landed = 0
+        for cat in table.get("categories") or []:
+            if not isinstance(cat, dict) or cat.get("enabled") is False:
+                continue
+            items = [i for i in (cat.get("items") or []) if isinstance(i, dict) and i.get("enabled") is not False
+                     and str(i.get("text") or "").strip() and float(i.get("weight", 1.0) or 0) > 0]
+            if not items:
+                continue
+            key = "%s:%s" % (table["id"], cat["id"])
+            odds = round(clamp(cat.get("odds", 0.1)), 4)
+            before = _snapshot(conv, conv["cursor"].get("initiator"))
+            meta = {"table": table["id"], "kind": cat["id"], "odds": odds, "seat": cat.get("seat", "any"),
+                    "place": cat.get("place", "middle"), "ends": bool(cat.get("ends"))}
+            missing = [n for n in (cat.get("requires") or []) if not avail.get(n)]
+            why = ("no %s material on this road" % missing[0] if missing
+                   else "the segment already holds %d happening(s)" % landed if cap and landed >= cap
+                   else "the segment already ends on an earlier happening" if cat.get("ends") and out["ends_at"] is not None
+                   else "an ending cannot be rolled here" if cat.get("ends") and not allow_end
+                   else "")
+            if why or odds <= 0:
+                ev = _event(conv, ctx0, "EVENT", [], {"id": "NONE", "label": "%s: not rolled" % (cat.get("label") or cat["id"])},
+                            before, meta=dict(meta, applies=False, why=why or "odds 0%"))
+                ev["state_after"] = before
+                continue
+            stream = DrawStream(str(conv["seed"]) + "|round:EVENT:" + key)
+            d1 = stream.next("EVENT:dice")
+            st1, hit = _dice_stage("HAPPENS", "%s happens" % (cat.get("label") or cat["id"]), odds, d1,
+                                   "its own odds, %.0f%%" % (odds * 100))
+            stages = [st1]
+            sel = {"id": "NONE", "label": "%s: not this time" % (cat.get("label") or cat["id"])}
+            plan = None
+            if hit:
+                limit = out["ends_at"] if out["ends_at"] is not None else want
+                ok = [(i, seat, place) for (i, seat, place) in slots
+                      if i < limit and _event_slot_ok(cat, seat, place, i, want)]
+                if not ok:
+                    meta["why"] = "it came up, but no turn here is its seat's in its place"
+                else:
+                    rows = [{"id": str(i.get("id")), "label": str(i.get("label") or i.get("id")),
+                             "base": float(i.get("weight", 1.0) or 0), "weight": float(i.get("weight", 1.0) or 0),
+                             "why": []} for i in items]
+                    d2 = stream.next("EVENT:item")
+                    k = pick_index([r["weight"] for r in rows], d2["u"])
+                    stages.append(_stage("item", rows, k, d2))
+                    trows = [{"id": "t%d" % i, "label": "turn %d (%s)" % (i + 1, names.get(seat, seat)), "base": 1.0,
+                              "weight": 1.0, "why": []} for (i, seat, place) in ok]
+                    d3 = stream.next("EVENT:turn")
+                    j = pick_index([r["weight"] for r in trows], d3["u"])
+                    stages.append(_stage("turn", trows, j, d3))
+                    item = items[k]
+                    at, seat, _place = ok[j]
+                    plan = {"table": table["id"], "kind": cat["id"], "kind_label": str(cat.get("label") or cat["id"]),
+                            "id": str(item.get("id")), "label": str(item.get("label") or item.get("id")),
+                            "text": _legs_words(item.get("text"), inputs)[:400],
+                            "after": _legs_words(item.get("after") or cat.get("after") or "", inputs)[:300],
+                            "ends": bool(cat.get("ends")), "turn_index": at, "seat": seat,
+                            "emotions": dict(item.get("emotions") or cat.get("emotions") or {}),
+                            "effects": dict(item.get("effects") or cat.get("effects") or {})}
+                    sel = {"id": plan["id"], "label": "%s - %s, turn %d" % (plan["kind_label"], plan["label"], at + 1),
+                           "table": table["id"], "category": cat["id"], "turn_index": at, "ends": plan["ends"]}
+                    landed += 1
+                    if plan["ends"]:
+                        out["ends_at"] = at
+            ev = _event(conv, ctx0, "EVENT", stages, sel, before, meta=meta, rng=d1)
+            ev["state_after"] = before
+            if plan:
+                plan["event_id"] = ev["event_id"]
+                out["plans"].append(plan)
+    if out["ends_at"] is not None:
+        # a happening rolled for after the line went dead never happens; say so
+        for plan in [x for x in out["plans"] if x["turn_index"] > out["ends_at"]]:
+            out["plans"].remove(plan)
+            for ev in conv["decision_events"]:
+                if ev["event_id"] == plan.get("event_id"):
+                    ev["meta"]["cut"] = "the segment ended on turn %d, before this could happen" % (out["ends_at"] + 1)
+    conv["event_plans"] = out["plans"]
+    conv["event_end"] = out["ends_at"]
+    return out
+
+
+def _events_attach(conv):
+    """[s3-events] Land the happenings on their turns (again, after a re-plan)."""
+    plans = conv.get("event_plans") or []
+    events = {e["event_id"]: e for e in conv["decision_events"]}
+    by_index = {t["index"]: t for t in conv["turns"]}
+    for t in conv["turns"]:
+        t.pop("events", None)
+        t["decisions"] = [d for d in t["decisions"] if d.get("family") != "EVENT"]
+    for plan in plans:
+        t = by_index.get(int(plan.get("turn_index", -1)))
+        if not t:
+            continue
+        t.setdefault("events", []).append({k: plan.get(k) for k in ("table", "kind", "kind_label", "id", "label",
+                                                                    "text", "ends", "event_id")})
+        t["decisions"].append({"family": "EVENT", "event_id": plan.get("event_id", ""), "item": plan.get("id"),
+                               "label": "%s - %s" % (plan.get("kind_label"), plan.get("label"))})
+        ev = events.get(plan.get("event_id"))
+        if ev:
+            ev["turn_id"], ev["turn_index"] = t["turn_id"], t["index"]
+        if plan.get("ends"):
+            t["ends_here"] = True
+            nxt = by_index.get(t["index"] + 1)
+            if nxt is not None:
+                nxt["after_end"] = str(plan.get("after") or EVENT_AFTER)
+
+
+def _event_emotions(conv, idx):
+    """The happening planned for this turn leans its feeling (a caller who
+    wins a prize is more likely delighted than bored)."""
+    out = {}
+    for plan in conv.get("event_plans") or []:
+        if int(plan.get("turn_index", -1)) == idx:
+            for k, v in (plan.get("emotions") or {}).items():
+                try:
+                    out[str(k)] = out.get(str(k), 1.0) * float(v)
+                except (TypeError, ValueError):
+                    pass
+    return out
+
+
+# --- [s3-blocks] every block of a writer prompt is a node ------------------------
+
+def block_rules(config):
+    """The config's block section over the defaults (a block the operator
+    has never touched keeps its default node)."""
+    rules = system3_tables.default_blocks()
+    for name, rule in ((config or {}).get("blocks") or {}).items():
+        if isinstance(rule, dict):
+            rules[str(name)] = dict(rules.get(str(name)) or {}, **rule)
+    return rules
+
+
+def validate_blocks(raw):
+    """Refuse a block section that cannot be decided; returns the cleaned copy."""
+    if not isinstance(raw, dict):
+        raise ValueError("the blocks section is an object: block name -> rule")
+    out = {}
+    for name, rule in raw.items():
+        name = str(name)
+        if not re.fullmatch(r"[a-z][a-z0-9_]{0,40}", name):
+            raise ValueError("block name %r must be lower_snake_case" % name)
+        if not isinstance(rule, dict):
+            raise ValueError("block %s: the rule is an object" % name)
+        kind = str(rule.get("kind") or "obligation")
+        if kind not in BLOCK_KINDS:
+            raise ValueError("block %s: kind must be one of %s" % (name, ", ".join(BLOCK_KINDS)))
+        clean = dict(rule, kind=kind)
+        clean["odds"] = round(clamp(rule.get("odds", 1.0)), 4)
+        out[name] = clean
+    return out
+
+
+def decide_blocks(names, config, seed, conv=None, tint_on=False, dial=None, at=None):
+    """[s3-blocks] System 3's decision on each marked block of one prompt, in
+    order: [{"name", "kind", "keep", "why", "u"?, "event_id"?}]. A roll's die
+    is on the prompt's own stream (seed|block), so it never moves a round's
+    other draws. With `conv`, each decision is a recorded BLOCK event on the
+    conversation; without one (a road System 3 does not plan), the list is the
+    record and rides the prompt's history. `dial` may carry a station dial for
+    a roll whose odds follow it (rule odds_from: "personality" -> dial value)."""
+    rules = block_rules(config)
+    stream = DrawStream(str(seed) + "|block")
+    out = []
+    seen = {}
+    for name in names:
+        name = str(name)
+        seen[name] = seen.get(name, 0) + 1
+        rule = rules.get(name)
+        rec = {"name": name, "label": str((rule or {}).get("label") or name)}
+        if rule is None:
+            rec.update(kind="wedge", keep=False, why="no System 3 node claims this block - stripped (a wedge)")
+        else:
+            kind = str(rule.get("kind") or "obligation")
+            rec["kind"] = kind
+            if kind == "off":
+                rec.update(keep=False, why="switched off in System 3's blocks")
+            elif kind == "tint":
+                rec.update(keep=bool(tint_on), why=("the crystal tint pass is on" if tint_on
+                                                   else "only while a crystal is on and the tint pass is wanted"))
+            elif kind == "roll":
+                odds = rule.get("odds", 1.0)
+                src = str(rule.get("odds_from") or "")
+                if src and isinstance(dial, dict) and src in dial:
+                    odds = dial[src]
+                odds = round(clamp(odds), 4)
+                d = stream.next("BLOCK:%s:%d" % (name, seen[name]))
+                rec.update(keep=bool(d["u"] < odds), odds=odds, u=d["u"], dice=d["dice"],
+                           why="rolled %d against %.0f%%%s" % (d["dice"], odds * 100,
+                                                                (" (the %s dial)" % src) if src else ""))
+            else:
+                rec.update(keep=True, why="an obligation: always sent, recorded, switchable in System 3")
+        if conv is not None:
+            before = _snapshot(conv, (conv.get("cursor") or {}).get("initiator"))
+            ev = _event(conv, {"turn_id": "", "turn_index": -1}, "BLOCK", [],
+                        {"id": "KEEP" if rec["keep"] else "STRIP", "label": "%s: %s" % (rec["label"], "sent" if rec["keep"] else "stripped"),
+                         "block": name, "kind": rec["kind"]},
+                        before, meta={"why": rec["why"], "odds": rec.get("odds"), "u": rec.get("u")},
+                        rng=({"u": rec["u"], "dice": rec["dice"], "label": "BLOCK:" + name} if "u" in rec else None))
+            ev["state_after"] = before
+            rec["event_id"] = ev["event_id"]
+        out.append(rec)
+    return out
+
+
 def plan_more(conv, config, until=None, inputs=None):
     """Mode A: plan turns from the cursor up to `until` (the turn budget).
 
@@ -1776,6 +2378,10 @@ def plan_more(conv, config, until=None, inputs=None):
     if not steps:
         raise ValueError("the structure has no steps")
     if not conv["turns"]:
+        # [s3-flow] the structure (or the road) may name who opens
+        _init = str(config["structure"].get("initiator") or inputs.get("initiator") or "")
+        if _init in seats:
+            conv["cursor"]["initiator"] = _init
         # [s3-glass] the length first: a free round's turn count is a roll
         if until is None and _length_decision(conv, settings, stream, inputs):
             want = int(conv["timing"]["turn_budget"])
@@ -1806,6 +2412,12 @@ def plan_more(conv, config, until=None, inputs=None):
         _decide_turn(conv, config, settings, stream, step, speaker, want, inputs, closing=closing)
         _interject_after(conv, config, settings, stream, want, inputs, seats)      # [s3-rounds]
     conv["draws"] = stream.n
+    if not conv.get("event_rolled") and conv["turns"] and inputs.get("event_rolls"):       # [s3-events]
+        conv["event_rolled"] = True
+        _event_rolls(conv, config, settings, inputs, conv["identity"]["road_kind"],
+                     [(t["index"], t["speaker"], "") for t in conv["turns"]], allow_end=False)
+    _events_attach(conv)
+    _cast_rolls(conv, config, settings, inputs)                                 # [s3-cast]
     return conv
 
 
@@ -1855,6 +2467,7 @@ def plan_protocol(conv, config, rows, inputs=None):
         turn = _decide_turn(conv, config, conv["settings"], stream, step, seat, want, inputs)
         turn["protocol"] = str(work or "")[:300]
     conv["draws"] = stream.n
+    _cast_rolls(conv, config, conv["settings"], inputs)                         # [s3-cast]
     return conv
 
 
@@ -1923,6 +2536,18 @@ def plan_call(conv, config, inputs=None):
             seat = "A" if (fill_n - 1 - k) % 2 == 0 else "C"
         seq.append((leg, seat))
     seq += [(leg, leg.get("seat")) for leg in closing]
+    # [s3-events] what happens on this call - before its turns, so a call the
+    # roulette ends (the line lost, the caller pulled away) is planned short:
+    # up to the turn it ends on, then a host reacting to the dead line
+    _ev = _event_rolls(conv, config, conv["settings"], inputs, "caller",
+                       [(i, str(seat or "A"), "fixed" if (leg.get("fixed") or leg.get("id") in EVENT_FIXED_LEGS)
+                         else str(leg.get("place") or "")) for i, (leg, seat) in enumerate(seq)])
+    if _ev["ends_at"] is not None:
+        _host_close = [(leg, seat) for leg, seat in seq[_ev["ends_at"] + 1:]
+                       if str(seat or "A") in HOST_SEATS and leg.get("place") == "close"]
+        seq = seq[:_ev["ends_at"] + 1] + (_host_close[-1:] or [(
+            {"id": "after_end", "label": "After the line drops", "place": "close", "seat": "A",
+             "act": EVENT_AFTER, "draws": [{"family": "ES"}]}, "A")])
     want = len(seq)
     conv["timing"]["turn_budget"] = want
     conv["call_structure"] = {"id": st.get("id"), "version": st.get("version"), "head": st.get("head", ""),
@@ -1946,6 +2571,8 @@ def plan_call(conv, config, inputs=None):
         turn["leg"] = leg.get("id")
         turn["place"] = leg.get("place")
     conv["draws"] = stream.n
+    _events_attach(conv)                                                        # [s3-events]
+    _cast_rolls(conv, config, conv["settings"], inputs)                         # [s3-cast]
     return conv
 
 
@@ -1967,7 +2594,12 @@ def render_call_sheet(conv):
         if i == material_at and call.get("speakerbox") and st.get("material"):
             rows.append(_call_words(st["material"], call, {"passage": json.dumps(sentence_cut(call["speakerbox"], 300))}))
     head = _call_words(st.get("head") or "", call, {"caller_turns": max(3, int(len(turns) * share))})
-    text = "\n\n" + head + _tempers_line(conv) + "\n" + "\n".join(rows) + "\n" + (st.get("tail") or "")   # [s3-rounds]
+    tail = st.get("tail") or ""
+    if conv.get("event_end") is not None:                                   # [s3-events]
+        tail = ("This call ENDS EARLY, on the turn the running order says: the line goes dead partway through "
+                "it, and a host reacts to that on the last turn. The caller does not land their story and nobody "
+                "signs them off - they are gone.")
+    text = "\n\n" + head + _tempers_line(conv) + "\n" + "\n".join(rows) + "\n" + tail   # [s3-rounds] [s3-events]
     if call.get("scenario_clause"):
         text += "\n" + str(call["scenario_clause"])
     return text
@@ -1992,7 +2624,7 @@ def _leg_row_add(t):
     if topic.get("text"):
         add += (" [It puts them in mind of something off the operator's topics board, and they "
                 "bring it up in their own words: %s.]" % json.dumps(sentence_cut(topic["text"], 300)))
-    if t.get("shock") or t.get("mention"):                                      # [s3-rounds]
+    if any(t.get(k) for k in ("shock", "mention", "favorite", "directives", "events", "after_end")):   # [s3-rounds] [s3-cast] [s3-events]
         add += " [" + _round_adds(t, "the other").lstrip(". ") + ".]"
     return add
 
@@ -2104,6 +2736,16 @@ def plan_legs(conv, config, inputs=None, road=None):
             seq = build(fill_n - 1)
         elif len(seq) + 1 <= hi:
             seq = build(fill_n + 1)
+    # [s3-events] what happens in this segment, before its turns
+    _ev = _event_rolls(conv, config, conv["settings"], inputs, road,
+                       [(i, str(seat or "A"), "fixed" if leg.get("fixed") else str(leg.get("place") or ""))
+                        for i, (leg, seat) in enumerate(seq)])
+    if _ev["ends_at"] is not None:
+        _host_close = [(leg, seat) for leg, seat in seq[_ev["ends_at"] + 1:]
+                       if str(seat or "A") in HOST_SEATS and leg.get("place") == "close"]
+        seq = seq[:_ev["ends_at"] + 1] + (_host_close[-1:] or [(
+            {"id": "after_end", "label": "After it ends", "place": "close", "seat": "A",
+             "act": EVENT_AFTER, "draws": [{"family": "ES"}]}, "A")])
     want = len(seq)
     conv["timing"]["turn_budget"] = want
     conv["road_structure"] = {"id": st.get("id"), "version": st.get("version"), "road": road,
@@ -2125,6 +2767,8 @@ def plan_legs(conv, config, inputs=None, road=None):
         turn["leg"] = leg.get("id")
         turn["place"] = leg.get("place")
     conv["draws"] = stream.n
+    _events_attach(conv)                                                        # [s3-events]
+    _cast_rolls(conv, config, conv["settings"], inputs)                         # [s3-cast]
     return conv
 
 
@@ -2206,6 +2850,9 @@ def plan_line(conv, config, inputs=None):
         t0["decisions"].append({"family": "LINE", "event_id": ev["event_id"], "item": conv["line_choice"]["id"],
                                 "label": picked["label"] if picked else "", "u": draw["u"]})
     conv["draws"] = stream.n
+    if not cands:
+        # [s3-cast] a line whose words the writer writes; a drawn stock line is fixed words
+        _cast_rolls(conv, config, conv["settings"], inputs)
     return conv
 
 
@@ -2290,7 +2937,11 @@ def _row_work(turn, conv):
         desc = ("answers %s with these exact words, as written: %s" % (prev_name, json.dumps(answer_text))
                 + (" - feeling %s about it" % feel if feel else ""))
     elif replying:
-        desc = "answers what %s just said" % prev_name + (", feeling %s about it" % feel if feel else "")
+        # [s3-flow] told what it answers: the act the turn before rolled, and its feeling
+        _pa = next((x.get("text") for x in (prev or {}).get("directions") or [] if x.get("family") in ("RS", "IRS")), "")
+        _pe = ((prev or {}).get("performance") or {}).get("emotion") or ""
+        _what = (" (%s %s%s)" % (prev_name, _pa, (", in %s" % _pe) if _pe else "")) if _pa else ""
+        desc = "answers what %s just said%s" % (prev_name, _what) + (", feeling %s about it" % feel if feel else "")
     else:
         desc = ("in %s" % feel) if feel else ""
     acts = "; then ".join(x["text"] for x in turn["directions"] if x["family"] in ("RS", "IRS"))
@@ -2299,6 +2950,9 @@ def _row_work(turn, conv):
     flow = [x["text"] for x in turn["directions"] if x["family"] == "FL"]
     if flow and not answer_line:
         desc = (desc + ", and " if desc else "") + flow[-1]
+    if turn.get("topic_override"):                                            # [s3-flow]
+        lead = ("%s - on this subject, in their own words: %s" % (lead, json.dumps(turn["topic_override"]))
+                if lead else "brings up this subject, in their own words: %s" % json.dumps(turn["topic_override"]))
     body = " - ".join(x for x in (lead, desc) if x)
     for sb in turn.get("speakerbox") or []:
         mat = sb.get("material") or {}
@@ -2343,6 +2997,31 @@ def _round_adds(turn, prev_name):
                 "the other turns, and it carries on over the interruption that follows")
     if turn.get("mention"):
         add += ". Works the station's name, %s, in naturally here - once, proud of where they work" % turn["mention"]
+    for e in turn.get("events") or []:                                        # [s3-events]
+        if e.get("ends"):
+            add += (". THIS IS WHERE IT ENDS - %s: %s. The line goes dead partway through this turn; "
+                    "nothing more is heard from them" % (str(e.get("kind_label") or "it happens").upper(),
+                                                         str(e.get("text") or "").strip().rstrip(".")))
+        else:
+            add += ". WHAT HAPPENS ON THIS TURN (%s): %s" % (str(e.get("kind_label") or "the roulette"),
+                                                             str(e.get("text") or "").strip().rstrip("."))
+    if turn.get("after_end"):
+        add += ". The line has just gone dead: %s" % str(turn["after_end"]).strip().rstrip(".")
+    fav = turn.get("favorite") or {}                                          # [s3-cast]
+    if fav.get("text"):
+        said = ("A LINE OF YOURS" if fav.get("seat") == turn.get("speaker")
+                else "A LINE %s SAID" % str(fav.get("said_by") or "ONE OF THE CAST").upper())
+        add += (". %s THAT THE OPERATOR LIKED, for its spirit and attitude only: %s - here they say something "
+                "NEW in that spirit; they never repeat it and never quote it" % (said, json.dumps(sentence_cut(fav["text"], 300))))
+    for d in turn.get("directives") or []:                                    # [s3-cast]
+        add += (". THE OPERATOR'S DIRECTIVE FOR %s ON THIS TURN: %s"
+                % (str(turn.get("name") or turn.get("speaker") or "").upper(), str(d.get("text") or "").strip().rstrip(".")))
+    if turn.get("track_talk"):
+        record = turn["track_talk"]
+        add += (". Briefly connects the thought just exchanged to the record playing underneath, %s by %s. "
+                "This is one passing moment inside the conversation, not a separate introduction or send-off" %
+                (json.dumps(str(record.get("title") or "the record")),
+                 json.dumps(str(record.get("artist") or "the artist"))))
     return add
 
 
@@ -2415,7 +3094,8 @@ def turn_stamp(conv, t):
             # [s3-rewrite] whether the crystal tint may rhyme this line
             "tint": {k: (t.get("tint") or {}).get(k) for k in ("rhyme", "event_id")},
             # [s3-rounds] what the round's own rolls put on this turn
-            "round": {k: True for k in ("shock", "long_roll", "interject", "carry_on", "mention") if t.get(k)}}
+            "round": {k: True for k in ("shock", "long_roll", "interject", "carry_on", "mention", "track_talk",
+                                        "favorite", "directives", "events", "ends_here", "after_end") if t.get(k)}}
 
 
 # --- validation ---------------------------------------------------------------
@@ -2490,6 +3170,7 @@ def validate(conv, final_turns, mapping=None):
     n_plan = len(conv["turns"])
     rows = []
     met = missed = unchecked = 0
+    fav_copies = 0                                                            # [s3-cast]
     for t in conv["turns"]:
         at = mapping.get(t["index"])
         row = {"turn_id": t["turn_id"], "planned": t["index"], "script_index": at,
@@ -2529,6 +3210,13 @@ def validate(conv, final_turns, mapping=None):
         for name, pattern in _PROHIBITED.items():
             if re.search(pattern, text, re.I | re.M):
                 row["checks"].append({"what": "prohibited:%s" % name, "result": "violated"})
+        fav = t.get("favorite") or {}                                         # [s3-cast]
+        if fav.get("text"):
+            run = favorite_run(fav["text"], text)
+            copied = favorite_copied(fav["text"], text)
+            fav_copies += bool(copied)
+            row["checks"].append({"what": "FAV %s" % fav.get("id"), "result": "violated" if copied else "met",
+                                  "how": "the favourite's longest run said word for word: %d words" % run})
         rows.append(row)
     matched = len(mapping)
     turn_ratio = len(final_turns) / float(max(1, n_plan))
@@ -2547,16 +3235,17 @@ def validate(conv, final_turns, mapping=None):
              0.1 * (1.0 if closing_ok in (True, None) else 0.0))
     score -= min(0.3, 0.05 * violations)
     verdict = "compliant" if score >= 0.7 else "partial" if score >= 0.45 else "non_compliant"
-    if loop:
-        verdict = "non_compliant"          # an echo loop is not a conversation at any score
+    if loop or fav_copies:
+        verdict = "non_compliant"          # an echo loop is not a conversation at any score;
+                                           # [s3-cast] a favourite repeated is not its spirit
     return {"at": time.time(), "method": "deterministic/lexical", "planned": n_plan,
             "written": len(final_turns), "matched": matched,
             "turn_ratio": round(turn_ratio, 3), "seat_order": round(seat_order, 3),
             "acts": {"met": met, "missed": missed, "unchecked": unchecked,
                      "rate": None if act_rate is None else round(act_rate, 3)},
             "closing": closing_ok, "violations": violations, "score": round(score, 3),
-            "verdict": verdict, "repair_wanted": bool(seat_order < 0.5 or turn_ratio < 0.5 or loop),
-            "echo": {"turns": echo, "loop": loop},
+            "verdict": verdict, "repair_wanted": bool(seat_order < 0.5 or turn_ratio < 0.5 or loop or fav_copies),
+            "echo": {"turns": echo, "loop": loop}, "favorite_copies": fav_copies,
             "turns": rows}
 
 
@@ -2703,7 +3392,8 @@ def replay(stored, config):
                 if o["turn_index"] < rp["from"] and not any(x["turn_index"] == o["turn_index"] for x in conv["observations"]):
                     observe(conv, o["turn_index"], o["text"], o.get("seconds"))
             replan(conv, config, rp["from"], until=until)
-    a = [(e["family"], (e.get("selected") or {}).get("id"), (e.get("rng") or {}).get("u")) for e in stored["decision_events"]]
+    a = [(e["family"], (e.get("selected") or {}).get("id"), (e.get("rng") or {}).get("u")) for e in stored["decision_events"]
+         if e["family"] != "STATION"]          # [s3-dice-door] drawn by the road before the plan: recorded, not replayed
     b = [(e["family"], (e.get("selected") or {}).get("id"), (e.get("rng") or {}).get("u")) for e in conv["decision_events"]]
     first = next((i for i, (x, y) in enumerate(zip(a, b)) if x != y), None)
     same = a == b

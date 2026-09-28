@@ -85,7 +85,12 @@ class PlanTests(unittest.TestCase):
         # 2026-09-27 [s3-roads]: ...and one structure per road on the register
         # plus the SFX Guy's section; his node rolls on its own stream, so the
         # trajectory above is still unchanged (engine/3).
-        self.assertEqual(system3.config_hash(system3.default_config()), "48e47262ef173867")
+        # 2026-09-27 [s3-cast]: FAV1 and DIRECTIVE1 joined the defaults (empty
+        # pools) - they roll after the turns on their own streams, and only
+        # when a round opts in, so the trajectory above is still unchanged.
+        # [s3-events] ...and CALLEVENT1 (what can happen on a call) - rolled on
+        # its own streams, only when a road opts in: the trajectory holds.
+        self.assertEqual(system3.config_hash(system3.default_config()), "0e5c64b54da0d08b")
 
     def test_same_state_config_seed_reproduces_the_plan(self):
         a, b = plan(seed="r"), plan(seed="r")

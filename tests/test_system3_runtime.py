@@ -103,6 +103,37 @@ class RuntimeTests(unittest.TestCase):
     def run_(self, coro):
         return asyncio.new_event_loop().run_until_complete(coro)
 
+    def test_visual_preview_replans_and_writes_without_binding_to_air(self):
+        self.boot()
+        handle = self.run_(self.station["system3_direct_banter"](**ctx()))
+        settle()
+        calls = []
+
+        async def draft(prompt, **options):
+            calls.append((prompt, options))
+            rows = re.findall(r"(?m)^\s*\d+\s+([AB])\s+-", prompt)
+            return "\n".join("%s: This is a fresh off-air draft." % seat for seat in rows)
+
+        self.station.update(ask_model=draft,
+                            dj_settings=lambda: {"persona": "A curious host"},
+                            dj_disposition=lambda: "Keep the exchange moving.",
+                            radio_persona=lambda _slot, text: text,
+                            load_settings=lambda: {"model": "preview-model"})
+        response = self.client.post("/api/system3/preview",
+                                    json={"conversation_id": handle.id},
+                                    headers={"Authorization": "Bearer k"})
+        self.assertEqual(response.status_code, 200, response.text)
+        preview = response.json()
+        self.assertEqual(preview["mode"], "simulation")
+        self.assertEqual(preview["preview_source"], handle.id)
+        self.assertEqual(preview["preview_call"]["matched_turns"], len(preview["turns"]))
+        self.assertEqual(preview["preview_call"]["model"], "preview-model")
+        self.assertIn("THE RUNNING ORDER OF THIS EXCHANGE", calls[0][0])
+        self.assertIn("Keep the exchange moving.", calls[0][0])
+        self.assertIn("A curious host", calls[0][0])
+        self.assertEqual(calls[0][1]["result_contract"], "structured_turns")
+        self.assertIsNone(self.rt.store.conversation(preview["identity"]["conversation_id"]))
+
     def test_active_round_end_to_end(self):
         rt = self.boot()
         h = self.run_(self.station["system3_direct_banter"](**ctx()))

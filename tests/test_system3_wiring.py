@@ -170,10 +170,6 @@ class WiringTests(unittest.TestCase):
         for marker in ("if (fam === 'TINT' || fam === 'REPAIR' || fam === 'ROOM')", "function roundRolls(conv)", "TINT: ['tint'], REPAIR: ['repair'], ROOM: ['room']"):
             self.assertIn(marker, src)
 
-
-if __name__ == "__main__":
-    unittest.main()
-
     def test_the_rounds_edits_are_in_app_py_and_the_editor(self):
         # [s3-rounds] the harvest yields, a deferred or empty writer withholds the
         # round (never the seed alone), beats drop spoken lines, the four prompt
@@ -198,3 +194,82 @@ if __name__ == "__main__":
         css = (ROOT / "frontend" / "system3.css").read_text(encoding="utf-8")
         self.assertIn(".s3-ok", css)
 
+    def test_the_cast_and_hygiene_edits_are_in_app_py(self):
+        # [s3-cast] the Mind desk's notes and the thumbs-up are System 3 tables
+        # (FAV1, DIRECTIVE1) - nothing is stapled to a prompt any more;
+        # [s3-hygiene] the record-talk and prompt-hygiene hunks another session
+        # left uncommitted, assimilated and recorded
+        text = (ROOT / "app.py").read_bytes().decode("utf-8").replace("\r\n", "\n")
+        for tool in ("system3_cast_patch", "system3_hygiene_patch"):
+            spec = importlib.util.spec_from_file_location(tool, ROOT / "tools" / (tool + ".py"))
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            applied, missing = mod.check(text)
+            self.assertEqual(missing, [], tool)
+            self.assertEqual(applied, len(mod.plan(text)), tool)
+        self.assertNotIn("mind_adjustment_prompt(", text)
+        self.assertNotIn("LIVE MIND ADJUSTMENTS", text)
+        self.assertNotIn('"it, and you may repeat it."', text)
+        self.assertIn('globals().get("system3_favorite")', text)
+        src = (ROOT / "frontend" / "system3.js").read_text(encoding="utf-8")
+        for marker in ("FAV: ['Favourite (FAV1)'", "DIRECTIVE: [\"Operator's directive (DIRECTIVE1)\"", "function poolFields(item)",
+                       "const TABLE_FAMILIES = ['CTS', 'ES', 'RS', 'IRS', 'FL', 'TEMPER', 'SHOCK', 'INTERJECT', 'FAV', 'DIRECTIVE'",
+                       "startTab.includes(':')"):
+            self.assertIn(marker, src)
+
+    def test_a_call_the_roulette_ends_keeps_its_ending(self):
+        # [s3-events] the call contract waives the sign-off and the landing for a
+        # call System 3's EVENT roll ended, at every gate that grades a call
+        spec = importlib.util.spec_from_file_location("system3_events_patch", ROOT / "tools" / "system3_events_patch.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        text = (ROOT / "app.py").read_bytes().decode("utf-8").replace("\r\n", "\n")
+        applied, missing = mod.check(text)
+        self.assertEqual(missing, [])
+        self.assertEqual(applied, len(mod.plan(text)))
+        self.assertEqual(text.count('ended=str('), 5)
+        src = (ROOT / "frontend" / "system3.js").read_text(encoding="utf-8")
+        for marker in ("function eventFields(cat)", "EVENT: ['Happening (CALLEVENT1", "'EVENT'"):
+            self.assertIn(marker, src)
+
+    def test_every_road_rolls_system3s_dice_and_every_prompt_block_is_a_node(self):
+        # [s3-dice-door] the banter, speakbox, SFX Guy and segment roads' rolls;
+        # [s3-blocks] the writer's door and the marks on every prompt block
+        text = (ROOT / "app.py").read_bytes().decode("utf-8").replace("\r\n", "\n")
+        for tool in ("system3_dice_banter_patch", "system3_dice_speakbox_patch", "system3_dice_sfx_patch",
+                     "system3_dice_segments_patch", "system3_blocks_patch"):
+            spec = importlib.util.spec_from_file_location(tool, ROOT / "tools" / (tool + ".py"))
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            applied, missing = mod.check(text)
+            self.assertEqual(missing, [], tool)
+            self.assertEqual(applied, len(mod.plan(text)), tool)
+        import re
+        import system3_tables
+        marked = set(re.findall(r"""_pb\(\s*['"]([a-z_]+)['"]""", text)) | {"persona", "cohost", "third"}
+        self.assertEqual(sorted(n for n in marked if n not in system3_tables.DEFAULT_BLOCKS), [],
+                         "every block the station marks has a node (else it is stripped as a wedge)")
+        src = (ROOT / "frontend" / "system3.js").read_text(encoding="utf-8")
+        for marker in ("function promptBlocksBox(request, userText)", "section('blocks',",
+                       "function segTableCats(fam)", "class: 'txt s3-after'", "who opens the round "):   # [s3-flow]
+            self.assertIn(marker, src)
+
+    def test_the_stations_own_dice_are_system3s(self):
+        # [s3-dice-door] the call, manager and ad roads roll through System 3's
+        # dice door; every roll a desk row (STATION1 / POOLS1)
+        spec = importlib.util.spec_from_file_location("system3_dice_patch", ROOT / "tools" / "system3_dice_patch.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        text = (ROOT / "app.py").read_bytes().decode("utf-8").replace("\r\n", "\n")
+        applied, missing = mod.check(text)
+        self.assertEqual(missing, [])
+        self.assertEqual(applied, len(mod.plan(text)))
+        for marker in ("def s3_chance(", "def s3_pool(", "class _S3Dice:", "def s3_weighted(", "def s3_roll("):
+            self.assertIn(marker, text)
+        src = (ROOT / "frontend" / "system3.js").read_text(encoding="utf-8")
+        for marker in ("STATION: ['Station roll (STATION1 / POOLS1)'", "'CHANCE', 'POOL'", "follows the station's own value"):
+            self.assertIn(marker, src)
+
+
+if __name__ == "__main__":
+    unittest.main()
