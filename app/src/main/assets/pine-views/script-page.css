@@ -2612,6 +2612,45 @@ video.sp-folder-media { height: auto; max-height: 120px; background: #000000; bo
    filed from a heading answers the way the caution button does. */
 .sp-scene.sp-firing { opacity: .55; }
 .sp-scene.sp-fired-bad { color: #ff5d5d; }
+/* ---- [secflip] the section flips to its assembly chart ----------- */
+/* The band grows a middle column for the flip icon; stacked (<=720px)
+   the count is display:none, so the icon takes the third seat. */
+.sp-el.sp-scene.sp-fold {
+  grid-template-columns: minmax(58px, 76px) minmax(0, 1fr) auto
+    minmax(68px, auto) minmax(58px, auto);
+}
+@media (max-width: 720px) {
+  .sp-el.sp-scene.sp-fold { grid-template-columns: 58px minmax(0, 1fr) auto auto; }
+}
+.sp-secflip-btn {
+  display: inline-flex; align-items: center; justify-content: center;
+  justify-self: end; min-width: 34px; min-height: 34px; padding: 0;
+  border: 1px solid rgba(142, 160, 173, .28); border-radius: 7px;
+  background: rgba(16, 26, 34, .6); color: #8ea0ad; cursor: pointer;
+}
+.sp-secflip-btn svg { width: 16px; height: 16px; fill: currentColor; }
+.sp-secflip-btn:hover, .sp-secflip-btn:focus-visible {
+  border-color: #65c7da; color: #65c7da;
+  outline: 2px solid #65c7da; outline-offset: -2px;
+}
+.sp-secflip-btn.on { color: #65c7da; border-color: #3f7781; background: #0e2530; }
+/* the chart's pane: the height the text held (inline, measured at the
+   flip), its own scroll for the rest - the page never moves for it */
+.sp-secflip-pane {
+  overflow-y: auto; overflow-x: hidden; margin: 2px 0 10px;
+  padding: 8px 10px; box-sizing: border-box;
+  border: 1px solid #24323a; border-left: 3px solid #3f7781;
+  border-radius: 6px; background: #0b1116;
+  font-family: Inter, Segoe UI, system-ui, sans-serif;
+  overscroll-behavior: contain;
+}
+.sp-secflip-pane[hidden] { display: none; }
+.sp-secflip-host { min-height: 100%; }
+.sp-secflip-note {
+  padding: 10px 2px; color: #8ea0ad;
+  font: italic 12px/1.5 Inter, Segoe UI, system-ui, sans-serif;
+}
+/* ---- [secflip] end ----------------------------------------------- */
 
 .sp-segmenu {
   position: fixed; z-index: 2147483007;

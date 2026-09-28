@@ -147,6 +147,113 @@
     return null;
   }
 
+  /* -------------------------------------------- [pldetect] detection */
+
+  /** The instrument on the USB list. The USB descriptor decides: only a
+   *  row whose usb_name (or a 2367: Teenage Engineering usb_id) matches a
+   *  known profile can BE the instrument - a headset dongle, alone on the
+   *  bus, is still not it. Among matching rows, ready beats busy, and
+   *  more channels at a higher rate win. Null when no such row can
+   *  capture: "found nothing" is the honest answer, never the best
+   *  stranger. */
+  function pickInstrument(devices) {
+    var list = (devices && devices.usb) || [];
+    var best = null, bestScore = -1;
+    for (var i = 0; i < list.length; i += 1) {
+      var d = list[i];
+      if (!d || !d.capture) continue;
+      var byUsb = profileFor(String(d.usb_name || ''))
+        || (/^2367:/i.test(String(d.usb_id || '')) ? DEFAULT_PROFILE : null);
+      if (!byUsb) continue;
+      var rate = 0;
+      if (Array.isArray(d.rates)) {
+        for (var j = 0; j < d.rates.length; j += 1) rate = Math.max(rate, Number(d.rates[j]) || 0);
+      }
+      var score = (d.status === 'ready' ? 10000 : 0)
+        + (Number(d.channels) || 0) * 100 + Math.min(99, Math.round(rate / 1000));
+      if (score > bestScore) { bestScore = score; best = d; }
+    }
+    return best;
+  }
+
+  /** Every other capture on the bus - the rows to name honestly as
+   *  not-the-instrument (the Nordic dongle, a webcam's mic). */
+  function notInstrument(devices, pick) {
+    var list = (devices && devices.usb) || [];
+    var out = [];
+    for (var i = 0; i < list.length; i += 1) {
+      var d = list[i];
+      if (!d || !d.capture) continue;
+      if (pick && d.id === pick.id) continue;
+      out.push(d);
+    }
+    return out;
+  }
+
+  /** The station's friendly label and the USB descriptor can disagree (the
+   *  host labels 2367:9420 "EP-133 K.O. II"; the descriptor says
+   *  "Teenage Engineering EP-136"). One honest paragraph; '' when there is
+   *  nothing to say. `shownProfile` is the profile whose pages are on
+   *  screen. */
+  function mismatchNote(dev, shownProfile) {
+    if (!dev) return '';
+    var byUsb = dev.usb_name ? profileFor(String(dev.usb_name)) : null;
+    var byName = (dev.name || dev.label) ? profileFor(String(dev.name || dev.label)) : null;
+    if (!byUsb) return '';
+    var parts = [];
+    if (byName && byName !== byUsb) {
+      parts.push('The station labels this device "' + (dev.name || dev.label) + '" (the ' + PROFILES[byName].short
+        + ') but its USB descriptor says "' + dev.usb_name + '"' + (dev.usb_id ? ' (USB ' + dev.usb_id + ')' : '')
+        + (dev.channels ? ', delivering ' + dev.channels + ' channels' : '') + '.');
+      parts.push(PROFILES[byUsb].name + ' is '
+        + (byUsb === 'ep-136' ? 'the K.O.-sidekick, which its guide calls an 8 in / 4 out USB audio interface'
+          : 'the K.O. II, which its notebook calls a 2-in/2-out USB audio interface')
+        + '; the descriptor is what the hardware says it is.');
+    }
+    if (PROFILES[shownProfile] && shownProfile !== byUsb) {
+      parts.push('The manual pages shown here are the ' + PROFILES[shownProfile].name + '\'s; if the '
+        + PROFILES[byUsb].short + ' is what is plugged into the DGX, its pages are the ones to follow.');
+    }
+    return parts.join(' ');
+  }
+
+  /* What the maker's own pages say to SET on the device for USB audio into
+   * a computer - and, just as loudly, what they do NOT say. Nothing below
+   * is manual text: `quotes` rows are page numbers and find-phrases, and
+   * the words on screen are read from the station's manual routes at the
+   * moment they are shown. The `absences` lines are the station's own
+   * honest statements about what those routes nowhere document. */
+  var DEVICE_SETTINGS = {
+    'ep-136': {
+      summary: 'Nothing to set on the device. Its guide documents no USB-audio setting at all: plugged into the DGX with a data cable and switched on, the K.O.-sidekick IS the 8 in / 4 out interface.',
+      quotes: [
+        {guide: 50, find: 'usb-c port allows', why: 'The USB-C port is the interface'},
+        {guide: 78, find: 'usb audio 2.0', why: 'Class compliant - nothing to install'},
+        {guide: 64, image: '097-usb.svg', find: 'usb-c cable', why: 'Cable and power (USB-IF, 5 V / 1 A)'},
+        {guide: 62, image: '095-switch-on.svg', find: 'power-switch', why: 'Switch it on'},
+        {guide: 73, find: 'system button under the battery lid', why: 'The system menu - no USB-audio entry is documented in it'}
+      ],
+      absences: [
+        'No device-side USB-audio setting exists in its guide: no on/off, no mode, no routing choice. There is nothing to hunt for.',
+        'The guide nowhere says which of the 8 USB channels carry the main mix. Finding the pair is the level meter\'s job (Input, Channel pair), not the manual\'s.',
+        'No sample rate or bit depth for USB audio is documented on the device. (The DGX observes it as 8 ch at 48 kHz - ALSA\'s observation, not a manual fact.)'
+      ]
+    },
+    'ep-133': {
+      summary: 'Nothing to set for USB audio OUT of the K.O. II: plug it in and choose it on the computer. The one documented USB setting on the device - the REC/MON input route - governs the other direction, computer audio INTO the K.O. II.',
+      quotes: [
+        {guide: 209, find: 'class compliant USB audio host', why: 'Plug in; the selecting happens on the computer'},
+        {lib: 188, find: "'EP-133 2In/2Out'", why: 'The computer side of the selection'},
+        {lib: 108, find: 'usb audio input route', why: 'REC / MON (quick codes 510 / 511) - the computer-into-K.O. II direction only'},
+        {lib: 107, find: 'feedback loops', why: 'Both directions share one cable'}
+      ],
+      absences: [
+        'For USB audio OUT the notebook documents no device-side setting: "just plug KO2 into your phone or computer and select it as an input or output" is the whole procedure.',
+        'The SMP > USB choice (REC, the default, or MON; quick codes 510 / 511) only decides where COMPUTER audio is heard on the K.O. II - the send direction has no setting.'
+      ]
+    }
+  };
+
   /* The station's own steps, per check. These are about the STATION (the
    * host service, the capture, the air, the cuts, the courier) - never
    * about the instrument, which is the manual's job. `ctx` carries the
@@ -687,7 +794,9 @@
   var api = {PROFILES: PROFILES, DEFAULT_PROFILE: DEFAULT_PROFILE, profileFor: profileFor,
     stepsFor: stepsFor, manualRefs: manualRefs, excerpt: excerpt, printedPage: printedPage,
     libraryDoc: libraryDoc, guidePage: guidePage, flowLayout: flowLayout, flowchart: flowchart,
-    connection: connection, resultOf: resultOf, worst: worst, fmtCut: fmtCut, COLORS: COLORS};
+    connection: connection, resultOf: resultOf, worst: worst, fmtCut: fmtCut, COLORS: COLORS,
+    pickInstrument: pickInstrument, notInstrument: notInstrument,
+    mismatchNote: mismatchNote, DEVICE_SETTINGS: DEVICE_SETTINGS};
   root.PineLiveGuide = api;
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
 })(typeof window !== 'undefined' ? window : globalThis);

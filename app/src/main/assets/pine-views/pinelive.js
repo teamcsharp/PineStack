@@ -572,8 +572,17 @@
   }
 
   function troubleDevice() {
+    if (ui.prefs.troubleDevice) return ui.prefs.troubleDevice;
+    /* [pldetect] with nothing chosen, grade the PROFILE-MATCHING instrument,
+     * not the first capture row (today that row is a mono 8 kHz headset
+     * dongle, and grading it would print the wrong device's numbers) */
+    var G = root.PineLiveGuide;
+    if (!(model.settings && model.settings.device) && G && G.pickInstrument) {
+      var inst = G.pickInstrument(model.devices);
+      if (inst) return inst.id;
+    }
     var dev = chosenDevice(model.devices, model.settings, model.state);
-    return ui.prefs.troubleDevice || (dev && dev.id) || '';
+    return (dev && dev.id) || '';
   }
 
   function refreshTrouble() {
@@ -782,9 +791,22 @@
     head.appendChild(ui.phasePill);
     ui.headClock = make('span', 'pl-head-clock', '');
     head.appendChild(ui.headClock);
+    /* [plpopup] the centred middle slot: the detection wizard's door
+     * lands here later; empty it takes no room at all (display:none). */
+    ui.headMid = make('span', 'pl-head-mid');
+    head.appendChild(ui.headMid);
     ui.headWarn = make('span', 'pl-head-warn', '');
     ui.headWarn.hidden = true;
     head.appendChild(ui.headWarn);
+    /* [pldetect] the exclamation-in-a-box: the detection wizard's door.
+     * The stylesheet sits it in the middle of the header; while a warning
+     * is showing on a wide screen the warn line keeps the middle and the
+     * box steps in beside the close X - the warning wins. */
+    var detect = btn('pl-detect-btn', '', 'c:warning-square', 'Find the instrument and get it on the air');
+    detect.setAttribute('aria-haspopup', 'dialog');
+    detect.addEventListener('click', function (e) { e.stopPropagation(); openDetect(); });
+    head.appendChild(detect);
+    ui.detectBtn = detect;
     var close = btn('pl-close', '', 'c:close--filled', 'Close PineLive');
     close.addEventListener('click', function (e) { e.stopPropagation(); closePopup(); });
     head.appendChild(close);
@@ -816,7 +838,32 @@
     pop.appendChild(lb);
     ui.lightbox = {root: lb, body: lbBody};
 
+    /* [pldetect] the detection wizard, an overlay like the lightbox: its
+     * own X, a tap on its own backdrop, Escape and BACK all close it. Not
+     * role=dialog - PineDrag raises any dialog under a tap, and a raised
+     * wizard would bury the manual lightbox that opens above it. */
+    var dz = make('div', 'pl-detect');
+    dz.hidden = true;
+    dz.setAttribute('role', 'region');
+    dz.setAttribute('aria-label', 'Find the instrument and get it on the air');
+    var dzTop = make('div', 'pl-dz-top');
+    var dzTitles = make('div', 'pl-dz-titles');
+    dzTitles.appendChild(make('b', '', 'Find the instrument'));
+    dzTitles.appendChild(make('small', '', 'Every step probes the station\'s own roads; the run re-walks itself while this is open.'));
+    dzTop.appendChild(dzTitles);
+    var dzClose = btn('pl-close', '', 'c:close--filled', 'Close the detection wizard');
+    dzClose.addEventListener('click', function (e) { e.stopPropagation(); closeDetect(); });
+    dzTop.appendChild(dzClose);
+    var dzBody = make('div', 'pl-detect-body');
+    dz.appendChild(dzTop);
+    dz.appendChild(dzBody);
+    dz.addEventListener('click', function (e) { if (e.target === dz) { e.stopPropagation(); closeDetect(); } });
+    pop.appendChild(dz);
+    ui.detect = {root: dz, body: dzBody, open: false, timer: 0, beat: 0,
+      skelRoad: '', rows: {}, roadSeg: null, again: null, banner: null, bannerSig: '', pick: null};
+
     document.body.appendChild(pop);
+    installDrag(pop, head);        /* [plpopup] the header is the handle */
 
     /* Its ways out. PineDismiss: a tap off it and Escape. BACK: the probe
      * answers this popup's node with ITS topmost closer - the lightbox,
@@ -824,11 +871,21 @@
     var dismiss = root.PineDismiss;
     if (dismiss && typeof dismiss.watch === 'function') {
       ui.unwatch = dismiss.watch(pop, closePopup, [function () { return ui.badge; }], function () { return ui.visible; });
+      /* [pldetect] registered before the lightbox's watch, so Escape peels
+       * the lightbox first, then the wizard, then the popup. The lightbox
+       * is spared: a tap on the manual page floating above the wizard must
+       * not fell the wizard underneath it. */
+      ui.unwatchDz = dismiss.watch(dz, closeDetect, [function () { return ui.lightbox && ui.lightbox.root; }], function () { return !dz.hidden; });
       ui.unwatchLb = dismiss.watch(lb, closeLightbox, [], function () { return !lb.hidden; });
     }
     var probe = function () {
       if (!ui.visible) return null;
-      return {node: pop, close: function () { if (ui.lightbox && !ui.lightbox.root.hidden) closeLightbox(); else closePopup(); }};
+      /* [pldetect] BACK unwinds one layer at a time: lightbox, wizard, popup */
+      return {node: pop, close: function () {
+        if (ui.lightbox && !ui.lightbox.root.hidden) closeLightbox();
+        else if (ui.detect && !ui.detect.root.hidden) closeDetect();
+        else closePopup();
+      }};
     };
     if (dismiss && typeof dismiss.onBack === 'function') {
       ui.unback = dismiss.onBack(probe);
@@ -853,11 +910,124 @@
     document.addEventListener('visibilitychange', function () { syncLevels(); });
   }
 
+  /* ================================================== [plpopup] drag
+   *
+   * The stylesheet keeps the popup fixed, centred and viewport-sized
+   * (left/right/top/bottom insets), so the drag never touches those: it
+   * moves a TRANSLATE on top of the base spot, clamped so the whole
+   * popup stays on the glass, and remembers the offset per surface in
+   * localStorage. Reopened - even on a screen that shrank meanwhile -
+   * the popup returns to the operator's spot, pulled fully on-screen.
+   * Nothing here scrolls anything, and a press that starts on a control
+   * is never a drag. */
+  var POS_KEY = 'pineLive.pos.v1';
+
+  function posSurface() { return httpPage() ? 'panel' : 'desktop'; }
+
+  /** Clamp a wanted translate so base+delta keeps the whole box visible.
+   *  Pure: base is {left, top, width, height} BEFORE any translate;
+   *  a box wider or taller than the glass pins its left/top edge. */
+  function clampDelta(dx, dy, base, vw, vh) {
+    dx = num(dx) || 0; dy = num(dy) || 0;
+    var loX = -base.left, hiX = vw - base.width - base.left;
+    var loY = -base.top, hiY = vh - base.height - base.top;
+    dx = Math.max(loX, Math.min(dx, Math.max(loX, hiX)));
+    dy = Math.max(loY, Math.min(dy, Math.max(loY, hiY)));
+    return {dx: Math.round(dx), dy: Math.round(dy)};
+  }
+
+  function readPos() {
+    try {
+      var s = storage();
+      var raw = s && s.getItem(POS_KEY);
+      var all = raw ? JSON.parse(raw) : null;
+      var p = all && all[posSurface()];
+      var dx = p && Number(p.dx), dy = p && Number(p.dy);
+      if (isFinite(dx) && isFinite(dy)) return {dx: dx, dy: dy};
+    } catch (err) { /* a locked profile: the popup opens at its base spot */ }
+    return null;
+  }
+
+  function writePos(dx, dy) {
+    try {
+      var s = storage();
+      if (!s) return;
+      var all = null;
+      try { all = JSON.parse(s.getItem(POS_KEY)); } catch (err2) { all = null; }
+      if (!all || typeof all !== 'object' || Array.isArray(all)) all = {};
+      all[posSurface()] = {dx: Math.round(num(dx) || 0), dy: Math.round(num(dy) || 0)};
+      s.setItem(POS_KEY, JSON.stringify(all));
+    } catch (err) { /* a locked profile: the spot lives until the close */ }
+  }
+
+  function rootWidth() { return root.innerWidth || (document.documentElement && document.documentElement.clientWidth) || 0; }
+  function rootHeight() { return root.innerHeight || (document.documentElement && document.documentElement.clientHeight) || 0; }
+
+  function applyDelta(d) {
+    ui.dragApplied = d;
+    ui.pop.style.transform = (d.dx || d.dy) ? 'translate(' + d.dx + 'px, ' + d.dy + 'px)' : '';
+  }
+
+  /** The popup's rect with the current translate backed out. */
+  function baseRect() {
+    var r = ui.pop.getBoundingClientRect();
+    var a = ui.dragApplied || {dx: 0, dy: 0};
+    return {left: r.left - a.dx, top: r.top - a.dy, width: r.width, height: r.height};
+  }
+
+  /** Put the popup where this surface last had it - clamped to the glass
+   *  it is opening on NOW, which may be smaller than the one it left. */
+  function restoreDragPos() {
+    if (!ui.pop || ui.pop.hidden) return;
+    var want = ui.dragDelta || readPos();
+    if (!want) { ui.dragDelta = {dx: 0, dy: 0}; ui.dragApplied = {dx: 0, dy: 0}; return; }
+    var d = clampDelta(want.dx, want.dy, baseRect(), rootWidth(), rootHeight());
+    ui.dragDelta = d;
+    applyDelta(d);
+  }
+
+  function installDrag(pop, head) {
+    head.addEventListener('pointerdown', function (e) {
+      if (e.button !== undefined && e.button !== null && e.button > 0) return;
+      var t = e.target;
+      if (t && t.closest && t.closest('button, a, input, select, textarea, [role="button"], [role="switch"]')) return;
+      var base = baseRect();
+      var from = ui.dragApplied || {dx: 0, dy: 0};
+      var sx = e.clientX, sy = e.clientY;
+      var moved = false;
+      var move = function (ev) {
+        if (!moved && Math.abs(ev.clientX - sx) < 3 && Math.abs(ev.clientY - sy) < 3) return;
+        moved = true;
+        setClass(pop, 'pl-dragging', true);
+        var d = clampDelta(from.dx + (ev.clientX - sx), from.dy + (ev.clientY - sy), base, rootWidth(), rootHeight());
+        ui.dragDelta = d;
+        applyDelta(d);
+        if (ev.cancelable) ev.preventDefault();
+      };
+      var done = function (ev) {
+        head.removeEventListener('pointermove', move);
+        head.removeEventListener('pointerup', done);
+        head.removeEventListener('pointercancel', done);
+        setClass(pop, 'pl-dragging', false);
+        if (moved && ui.dragDelta) writePos(ui.dragDelta.dx, ui.dragDelta.dy);
+        if (ev && ev.pointerId !== undefined && head.hasPointerCapture && head.hasPointerCapture(ev.pointerId)) {
+          try { head.releasePointerCapture(ev.pointerId); } catch (err) { /* released already */ }
+        }
+      };
+      try { if (e.pointerId !== undefined && head.setPointerCapture) head.setPointerCapture(e.pointerId); } catch (err) { /* a mouse without capture still drags */ }
+      head.addEventListener('pointermove', move);
+      head.addEventListener('pointerup', done);
+      head.addEventListener('pointercancel', done);
+    });
+    root.addEventListener('resize', function () { if (ui.visible) restoreDragPos(); });
+  }
+
   function openPopup() {
     buildPopup();
     if (ui.visible) return;
     ui.visible = true;
     ui.pop.hidden = false;
+    restoreDragPos();              /* [plpopup] the saved spot, clamped to THIS screen */
     ui.picked = '';
     ui.levelsRefused = false;       /* every opening tries the stream again */
     ui.levelsFailed = 0;
@@ -875,6 +1045,7 @@
   function closePopup() {
     if (!ui.visible) return;
     closeLightbox();
+    closeDetect();            /* [pldetect] no timer may outlive the popup */
     ui.visible = false;
     if (ui.pop) ui.pop.hidden = true;
     stopMonitor();
@@ -947,6 +1118,14 @@
     var warn = info.state === 'problem' || info.state === 'absent' || (model.failure && !model.failure.absent) ? info.why : '';
     setText(ui.headWarn, warn);
     setHidden(ui.headWarn, !warn);
+    paintDetectBtn();         /* [pldetect] the box's tint follows the state */
+    if (ui.detect && ui.detect.open) {
+      try { paintDetect(); }
+      catch (err) {
+        /* the wizard's fault must not blank the panels (one-subscriber rule) */
+        if (root.console) root.console.error('[pinelive] detect paint failed:', err);
+      }
+    }
     PANEL_ORDER.forEach(function (id) {
       var p = ui.panels[id];
       var open = !!ui.open[id];
@@ -1358,6 +1537,17 @@
     senderRow.appendChild(openSender);
     net.body.appendChild(senderRow);
     net.body.appendChild(make('p', 'pl-note', 'A browser can capture only from a secure page; where it cannot, the sender page shows an ffmpeg line to run instead.'));
+    /* [plsender] This PC's interfaces. The desk's chrome IS a secure
+     * page with a proven microphone road (#1355), so the desk itself can
+     * be the sender: pick a Windows input, watch its level, pipe it to
+     * the station's ingest. The module mounts only where it can capture;
+     * anywhere else (the tablet's plain-http panel) this call mounts
+     * nothing and the sender-page words above stay the whole story. */
+    try {
+      if (root.PineLiveSender && typeof root.PineLiveSender.mountInput === 'function') {
+        root.PineLiveSender.mountInput(net.body, {request: request, say: say});
+      }
+    } catch (err) { /* the sender-page road above stands on its own */ }
     b.appendChild(net.root);
 
     p.parts = {scanned: scanned, devList: devList, devSig: '', pairRow: pairRow, pairBox: pairBox, pairSeg: null, pairSig: '',
@@ -2247,6 +2437,617 @@
     return passed + ' of ' + t.checks.length + ' checks pass';
   }
 
+  /* ==================================== [pldetect] the detection wizard
+   *
+   * "whenever I tap on it do a detection process of attempting to identify
+   *  and connect to and ... locate the device on the network that is the
+   *  interface that we're sending music through" - the operator.
+   *
+   * Every step is an ACTIVE probe through roads that already exist:
+   *   GET devices?fresh=1        the live rescan - the host re-reads lsusb
+   *                              and /proc/asound within half a second
+   *   GET troubleshoot?device=   re-grades the host's half-second state
+   *   POST test                  opens the capture four seconds OFF AIR
+   * Nothing here starts a set, changes a level, or touches the air on its
+   * own: Go live stays behind the operator's own double tap, and the one
+   * setting the wizard offers to write (the device id) moves no volume.
+   * The manual step quotes the maker's pages fetched at view time, and
+   * says plainly where those pages are silent. */
+
+  var DETECT_EVERY_MS = 4000;
+  var DETECT_ROADS = {
+    usb: ['host', 'find', 'device', 'choose', 'capture', 'signal', 'level', 'routed', 'recording', 'courier'],
+    network: ['host', 'network', 'sender', 'signal', 'level', 'routed', 'recording', 'courier']
+  };
+  var DETECT_TITLES = {
+    host: 'The station road on the DGX',
+    find: 'Find the interface on USB',
+    device: 'On the instrument itself (the manual)',
+    choose: 'Point the station at it',
+    capture: 'Open the capture',
+    signal: 'Hear a signal',
+    level: 'A sane level',
+    routed: 'The station head audio (on the air)',
+    recording: 'Recording in tandem',
+    courier: 'The pairs reach QuickSwap',
+    network: 'The network door (port 8095)',
+    sender: 'The sender is connected'
+  };
+  /* the checks on the road BEFORE the air - a fail here is amber; the same
+   * fail while the set is on the air is red */
+  var DETECT_PRE_AIR = ['host', 'usb', 'alsa', 'class', 'free', 'capture', 'signal', 'level', 'network', 'sender'];
+
+  /** grey ok / amber for a fault on the road to the air (or no instrument
+   *  on the bus at all) / red when the set is on the air with a fault -
+   *  pure, exported for the tests. */
+  function detectTintOf(st, failure, trouble, noInstrument) {
+    var info = badgeOf(st, failure);
+    var fail = (trouble && !trouble.error && trouble.first_fail) ? String(trouble.first_fail) : '';
+    var phase = st && st.enabled !== false ? String(st.phase || 'idle') : 'idle';
+    if (phase === 'live' || phase === 'fallback') {
+      return (fail || info.state === 'problem' || phase === 'fallback') ? 'bad' : 'ok';
+    }
+    var preAir = !!fail && DETECT_PRE_AIR.indexOf(fail) >= 0;
+    return (preAir || noInstrument || info.state === 'problem') ? 'warn' : 'ok';
+  }
+
+  function paintDetectBtn() {
+    var b = ui.detectBtn;
+    if (!b || !b.isConnected) return;
+    var G = root.PineLiveGuide;
+    /* an amber box when USB is scanned and the instrument is not on it -
+     * the checks may all pass (a dongle IS a working capture) and still
+     * nothing on the bus is the thing the music comes from */
+    var noInst = !!(detectRoad() === 'usb' && model.devices && !model.devices.error
+      && G && G.pickInstrument && !G.pickInstrument(model.devices));
+    var tint = detectTintOf(model.state, model.failure, model.trouble, noInst);
+    var cls = 'pl-btn pl-detect-btn pl-detect-' + tint + (ui.detect && ui.detect.open ? ' on' : '');
+    if (b.className !== cls) b.className = cls;
+    var ico = b.querySelector('.pl-ico');
+    if (ico && !ico.firstElementChild) {
+      /* the sprite may not carry the glyph yet: the box with a '!' IS the
+       * exclamation point in a box, so nothing is lost while it waits */
+      var mark = icon('c:warning-square', '');
+      if (mark) { ico.innerHTML = mark; ico.classList.remove('pl-detect-fallback'); }
+      else if (ico.textContent !== '!') { ico.textContent = '!'; ico.classList.add('pl-detect-fallback'); }
+    }
+    var why = {ok: 'every check that can run is clean',
+      warn: 'something on the road to the air needs a look',
+      bad: 'the set is on the air with a fault'}[tint];
+    var title = 'Find the instrument - ' + why;
+    if (b.title !== title) { b.title = title; b.setAttribute('aria-label', title); }
+  }
+
+  function detectRoad() {
+    var road = ui.prefs.road || (model.state && model.state.source && model.state.source.kind) || 'usb';
+    return road === 'network' ? 'network' : 'usb';
+  }
+
+  function detectProfile(pick) {
+    var G = root.PineLiveGuide;
+    if (!G) return 'ep-133';
+    /* the USB descriptor first: the host's friendly label can disagree
+     * with what the hardware says it is */
+    var p = pick ? (G.profileFor(String(pick.usb_name || '')) || G.profileFor(pick)) : null;
+    return p || currentProfile();
+  }
+
+  function troubleById() {
+    var out = {};
+    var t = model.trouble;
+    if (t && Array.isArray(t.checks)) t.checks.forEach(function (c) { if (c && c.id) out[c.id] = c; });
+    return out;
+  }
+
+  function rateWords(devRow) {
+    var rate = 0;
+    if (devRow && Array.isArray(devRow.rates)) {
+      for (var i = 0; i < devRow.rates.length; i += 1) rate = Math.max(rate, Number(devRow.rates[i]) || 0);
+    }
+    return rate ? ' at ' + (Math.round(rate / 100) / 10) + ' kHz' : '';
+  }
+
+  /* A test aimed at the instrument the wizard found, not the first row. */
+  function runDetectTest() {
+    var G = root.PineLiveGuide;
+    var pick = G && G.pickInstrument ? G.pickInstrument(model.devices) : null;
+    var dev = (model.settings && model.settings.device) || (pick && pick.id) || troubleDevice();
+    model.testing = Date.now();
+    paint();
+    return act('/api/pinelive/test', dev ? {device: dev} : {}).then(function () {
+      root.setTimeout(function () {
+        model.testing = 0;
+        refreshTrouble();
+      }, 4600);
+    });
+  }
+
+  /** Every step of the run, graded from what is on hand right now. */
+  function detectSteps() {
+    var G = root.PineLiveGuide;
+    var st = model.state || {};
+    var src = st.source || {};
+    var s = model.settings || {};
+    var d = model.devices;
+    var by = troubleById();
+    var road = detectRoad();
+    var testing = model.testing && Date.now() - model.testing < 5000;
+    var pick = G.pickInstrument ? G.pickInstrument(d) : chosenDevice(d, s, st);
+    var profile = detectProfile(pick);
+    var P = G.PROFILES[profile] || G.PROFILES[G.DEFAULT_PROFILE];
+    var rec = st.recording || {};
+    var cour = rec.courier || {};
+    var ev = st.event || null;
+    var steps = [];
+    var chooseFail = false;
+
+    function fromCheck(id) {
+      var step = {id: id, status: 'wait', found: '', next: '', acts: {}};
+      var t = model.trouble;
+      if (!t || t.error) {
+        if (t && t.error) { step.status = 'fail'; step.found = 'The station did not answer the checks: ' + t.error; step.next = 'Tap "Detect again".'; }
+        else step.status = 'probing';
+        return step;
+      }
+      var c = by[id];
+      if (!c) { step.next = 'The station did not grade this on the ' + road + ' road.'; return step; }
+      var r = String(c.result || 'unknown');
+      step.status = r === 'pass' ? 'pass' : r === 'fail' ? 'fail' : 'wait';
+      if (testing && ['capture', 'signal', 'level'].indexOf(id) >= 0) step.status = 'probing';
+      if (c.evidence) step.found = 'The station saw: ' + c.evidence;
+      if (r === 'fail' && c.fix) step.next = c.fix;
+      return step;
+    }
+
+    steps.push(fromCheck('host'));
+
+    if (road === 'usb') {
+      var find = {id: 'find', status: 'probing', found: '', next: '', acts: {scan: 1}};
+      if (!d) find.next = 'Asking the DGX for its USB scan...';
+      else if (d.error) { find.status = 'fail'; find.found = 'The scan did not answer: ' + d.error; find.next = 'Tap "Scan USB now".'; }
+      else if (!pick || !pick.capture) {
+        find.status = 'fail';
+        var seen = (d.usb || []).map(function (x) { return x.usb_name || x.name || x.id; });
+        find.found = seen.length ? 'On USB the DGX sees only: ' + seen.join('; ') + ' - and none of it is the instrument.'
+          : 'No USB audio device is on the DGX at all.';
+        find.next = 'Plug the instrument\'s USB-C port straight into the DGX Spark with a DATA cable (a charge-only lead powers it but the DGX never sees it), switch it on, then tap "Scan USB now".';
+      } else {
+        find.status = 'pass';
+        find.found = 'Found ' + (pick.name || pick.id) + ' - USB says "' + (pick.usb_name || '?') + '"' + (pick.usb_id ? ' (' + pick.usb_id + ')' : '')
+          + (pick.channels ? ' - ' + pick.channels + ' ch in' : '') + rateWords(pick)
+          + (pick.status === 'ready' ? ' - ready.' : ' - ' + String(pick.status || '') + '.');
+        var others = G.notInstrument ? G.notInstrument(d, pick) : [];
+        if (others.length) {
+          find.next = 'Also on USB, and NOT the instrument: ' + others.map(function (o) {
+            return (o.usb_name || o.name || o.id) + (o.usb_id ? ' (' + o.usb_id + ')' : '') + (o.channels ? ', ' + o.channels + ' ch' : '') + rateWords(o);
+          }).join('; ') + '. The wizard keeps the station off ' + (others.length === 1 ? 'it' : 'them') + '.';
+        }
+      }
+      var note = pick && G.mismatchNote ? G.mismatchNote(pick, profile) : '';
+      find.extraSig = note;
+      if (note) find.extra = function () { return make('p', 'pl-hw-note', note); };
+      steps.push(find);
+
+      var man = {id: 'device', status: 'info', found: '', next: '', acts: {}};
+      var spec = G.DEVICE_SETTINGS && G.DEVICE_SETTINGS[profile];
+      man.found = spec ? spec.summary : 'No manual pages are mapped for this hardware.';
+      man.extraSig = profile + '|' + (model.manualSig || 0);
+      man.extra = function () { return detectManualExtra(profile); };
+      steps.push(man);
+
+      var choose = {id: 'choose', status: 'wait', found: '', next: '', acts: {}};
+      if (!pick || !pick.capture) choose.next = 'Waits on the instrument being found above.';
+      else {
+        var wrote = String(s.device || '');
+        var def = chosenDevice(d, null, null);
+        if (wrote === pick.id) {
+          choose.status = 'pass';
+          choose.found = 'The station is set to open ' + (pick.name || 'it') + ' (' + pick.id + ').';
+        } else if (wrote) {
+          choose.status = 'fail'; choose.acts.use = 1;
+          choose.found = 'The written setting points at "' + wrote + '", not the instrument the wizard found.';
+          choose.next = 'Tap "Use the ' + P.short + '" to point the station at ' + pick.id + '.';
+        } else if (def && def.id === pick.id) {
+          choose.status = 'pass'; choose.acts.use = 1;
+          choose.found = 'Nothing is written, but the instrument is the first capture the station would take anyway.';
+          choose.next = 'Tap "Use the ' + P.short + '" to pin it, so a stray dongle can never steal the slot.';
+        } else {
+          choose.status = 'fail'; choose.acts.use = 1;
+          choose.found = 'Nothing is written, so the station would open the FIRST capture it sees - today '
+            + (def ? (def.name || def.id) + ' ("' + (def.usb_name || '') + '"' + (def.channels ? ', ' + def.channels + ' ch' : '') + rateWords(def) + ')' : 'nothing')
+            + ' - not the instrument.';
+          choose.next = 'Tap "Use the ' + P.short + '" to write the device setting (it changes no level).';
+        }
+      }
+      chooseFail = choose.status === 'fail';
+      steps.push(choose);
+
+      var cap = fromCheck('capture');
+      cap.acts.test = 1;
+      if (cap.status === 'wait') cap.next = 'Tap "Test 4 s" - the station opens the ' + P.short + ' for four seconds, OFF the air, and grades capture, signal and level.';
+      steps.push(cap);
+    } else {
+      var net = fromCheck('network');
+      var nd = (d && d.network) || null;
+      if (nd) {
+        var urls = [nd.url, nd.tailnet_url].filter(function (u) { return u; });
+        if (urls.length) net.found = (net.found ? net.found + ' - ' : '') + 'listening on ' + urls.join(' and ');
+      }
+      steps.push(net);
+
+      var snd = fromCheck('sender');
+      snd.acts.sender = 1;
+      if (snd.status === 'pass' && nd && nd.sender) {
+        snd.found = (snd.found ? snd.found + ' - ' : '')
+          + (nd.sender.label || nd.sender.addr || 'a sender')
+          + (nd.sender.rate ? ' at ' + Math.round(nd.sender.rate / 100) / 10 + ' kHz' : '');
+      } else if (snd.status !== 'pass') {
+        snd.next = 'Open the sender page on the machine the music comes from. The host only lets a sender in while MX Live is armed on the Network road; its refusals are honest - not_armed, not_network, ingest_busy (one sender at a time) - and the token rotates each event.';
+      }
+      steps.push(snd);
+    }
+
+    var sig = fromCheck('signal');
+    if (road === 'usb') sig.acts.test = 1;
+    if (sig.status === 'wait' && !sig.next) sig.next = 'Graded while sound flows (Test, or the set itself). Play the instrument - pads, a pattern - and watch the meter.';
+    if (sig.status === 'fail' && pick && Number(pick.channels) > 2) {
+      var pairNow = Array.isArray(src.channel_pair) ? src.channel_pair.join('+')
+        : (Array.isArray(s.channel_pair) ? s.channel_pair.join('+') : '1+2');
+      sig.next = (sig.next ? sig.next + ' ' : '') + 'The manual never says which of the ' + pick.channels
+        + ' USB channels carry the main mix - try another pair (Input, Channel pair; the station listens to ' + pairNow + ' now) and Test again.';
+    }
+    steps.push(sig);
+
+    var lvl = fromCheck('level');
+    if (road === 'usb') lvl.acts.test = 1;
+    if (lvl.status === 'wait' && !lvl.next) lvl.next = 'Graded while sound flows: aim for peaks around -6 dBFS - in the gold, never the red.';
+    steps.push(lvl);
+
+    var air = fromCheck('routed');
+    var phase = String(st.phase || 'idle');
+    if (st.live) {
+      air.status = 'pass';
+      var duck = st.duck || {};
+      var airTo = st.air || {};
+      var roadsOn = [];
+      if (airTo.stream) roadsOn.push('the stream');
+      if (airTo.pages) roadsOn.push('the pages');
+      if (airTo.box) roadsOn.push('the box');
+      air.found = 'LIVE - the set is the broadcast bed, ducked ' + (isFinite(num(duck.db)) ? num(duck.db).toFixed(1) : '-10.8')
+        + ' dB under the DJ lines' + (ev ? ' - on air ' + fmtDur(ev.live_seconds) : '')
+        + (roadsOn.length ? ' - heard on ' + roadsOn.join(', ') : '') + '.';
+    } else if (phase === 'arming') {
+      air.status = 'probing';
+      air.found = 'Armed - the station plays on until the first real sound arrives, then the set takes the air.';
+    } else if (phase === 'fallback') {
+      air.status = 'fail';
+      var latest = Array.isArray(st.errors) && st.errors[0];
+      air.found = 'The input dropped out and the station took the air back' + (latest && latest.say ? ' - ' + latest.say : '.');
+      air.next = 'Bring the signal back; after ' + (s.return_seconds || 2) + ' s of sound the set retakes the air by itself.';
+    } else if (air.status === 'wait') {
+      air.next = 'Go live is your own tap (it asks twice). The station keeps playing until the first sound is heard; then the set becomes the station head audio, ducked under the DJ lines like a record.';
+    }
+    if (ui.refused && !st.armed) {
+      air.status = 'fail';
+      air.found = 'The station refused to start: ' + (ui.refused.say || ui.refused.code || 'no reason given');
+    }
+    if (!st.armed && st.enabled !== false) {
+      air.acts.golive = 1;
+      /* going live with the station pointed at the wrong capture would put
+       * the dongle on the air - the choose step above is the way through */
+      if (road === 'usb' && chooseFail) air.goliveBlock = 'Point the station at the instrument first (the step above), then go live.';
+    }
+    steps.push(air);
+
+    var recS = fromCheck('recording');
+    var recOn = s.record !== undefined ? !!s.record : rec.on !== false;
+    if (st.armed && rec.cut_index) {
+      recS.status = 'pass';
+      recS.found = 'Cut ' + rec.cut_index + ' is writing - ' + fmtDur(rec.cut_elapsed) + ' of ' + fmtDur(rec.cut_seconds || 210)
+        + ' - ' + (rec.cuts || 0) + ' pair' + (rec.cuts === 1 ? '' : 's') + ' closed this event.'
+        + (rec.last_cut ? ' Last: #' + rec.last_cut.index + ' (' + (rec.last_cut.input || '') + ' + ' + (rec.last_cut.mix || '') + ').' : '')
+        + (rec.dir ? ' On the DGX at ' + rec.dir + '.' : '');
+    } else if (st.armed && !recOn) {
+      recS.status = 'fail';
+      recS.found = '"Write the cuts" is off, so the set is airing UNRECORDED.';
+      recS.next = 'Recording panel, Write the cuts.';
+    } else if (!st.armed && recS.status === 'wait') {
+      recS.found = 'The cuts run in tandem with the set - the station keeps its own duties while every '
+        + G.fmtCut(rec.cut_seconds || 210) + ' TWO files close: the live input alone, and the full broadcast mix.';
+      recS.next = '"Write the cuts" is ' + (recOn ? 'on - nothing to do' : 'OFF (Recording panel)') + '. Cuts begin the moment the set takes the air.';
+    }
+    steps.push(recS);
+
+    var courS = fromCheck('courier');
+    var deskAgo = cour.desk_seen_ago;
+    var deskLine = deskAgo === null || deskAgo === undefined
+      ? 'no desk has EVER taken a job - open Pine Box Desktop on the PC'
+      : 'a desk last took a job ' + fmtAgo(deskAgo);
+    courS.found = (courS.found ? courS.found + ' - ' : '') + (cour.pending || 0) + ' waiting - ' + (cour.carried || 0) + ' carried'
+      + (cour.failed ? ' - ' + cour.failed + ' failed' : '') + ' - ' + deskLine + '.';
+    if (cour.pending && (deskAgo === null || deskAgo === undefined || num(deskAgo) > 120)) {
+      courS.status = 'fail';
+      courS.next = 'The pairs wait on the DGX until Pine Box Desktop is open; its courier carries each pair to ' + (s.dest || rec.dest || DEFAULT_DEST) + '.';
+    } else if (courS.status === 'wait') {
+      courS.next = 'Each closed pair is handed to the desk\'s courier for ' + (s.dest || rec.dest || DEFAULT_DEST) + '; unclaimed pairs are re-offered every minute.';
+    }
+    steps.push(courS);
+
+    var anyFail = false;
+    for (var i = 0; i < steps.length; i += 1) if (steps[i].status === 'fail') anyFail = true;
+    var banner = null;
+    if (st.live && !anyFail) {
+      var duck2 = st.duck || {};
+      banner = {title: recOn ? 'You are live and recording' : 'You are live - but NOT recording', facts: [
+        ['On air for', ev ? fmtDur(ev.live_seconds) : '--'],
+        ['The bed under the DJs', isFinite(num(duck2.db)) ? 'ducked ' + num(duck2.db).toFixed(1) + ' dB per line' : '--'],
+        ['Cut running', rec.cut_index ? '#' + rec.cut_index + ' - ' + fmtDur(rec.cut_elapsed) + ' of ' + fmtDur(rec.cut_seconds || 210) : (recOn ? 'starting' : 'recording is OFF')],
+        ['Pairs closed', String(rec.cuts || 0)],
+        ['Carried to QuickSwap', (cour.carried || 0) + ' carried - ' + (cour.pending || 0) + ' waiting'],
+        ['Every pair is', 'the live input alone + the full mix']
+      ]};
+    }
+    return {steps: steps, banner: banner, pick: pick && pick.capture ? pick : null, profile: profile};
+  }
+
+  /* The manual step's body: the maker's pages, fetched at view time by the
+   * same figure()/quote() the troubleshooter uses (page numbers and all),
+   * then the honest list of what those pages nowhere say. */
+  function detectManualExtra(profile) {
+    var G = root.PineLiveGuide;
+    var spec = G.DEVICE_SETTINGS && G.DEVICE_SETTINGS[profile];
+    var box = make('div', 'pl-dz-manual');
+    if (!spec) {
+      box.appendChild(make('p', 'pl-note', 'No manual pages are mapped for this hardware.'));
+      return box;
+    }
+    var figs = make('div', 'pl-figs');
+    spec.quotes.forEach(function (ref) {
+      var cell = make('div', 'pl-dz-quote');
+      if (ref.why) cell.appendChild(make('small', 'pl-dz-why', ref.why));
+      cell.appendChild(ref.image ? figure(ref, profile, false) : quote(ref, profile));
+      figs.appendChild(cell);
+    });
+    box.appendChild(figs);
+    var ah = make('div', 'pl-steps-head');
+    ah.appendChild(iconNode('c:warning--alt'));
+    ah.appendChild(make('b', '', 'What the manual does NOT say'));
+    box.appendChild(ah);
+    var ul = make('ul', 'pl-dz-absent');
+    spec.absences.forEach(function (a) { ul.appendChild(make('li', '', a)); });
+    box.appendChild(ul);
+    return box;
+  }
+
+  function buildDetectActs(id, host) {
+    var btns = {};
+    if (id === 'find') {
+      btns.scan = btn('pl-mini', 'Scan USB now', 'c:search', 'Ask the host to rescan lsusb and ALSA now');
+      btns.scan.addEventListener('click', function (e) {
+        e.stopPropagation();
+        btns.scan.disabled = true;
+        refreshDevices(true).then(function () { btns.scan.disabled = false; refreshTrouble(); });
+      });
+      host.appendChild(btns.scan);
+    }
+    if (id === 'choose') {
+      btns.use = btn('pl-mini', 'Use it', null, 'Write the device setting - it changes no level');
+      btns.use.addEventListener('click', function (e) {
+        e.stopPropagation();
+        var dz = ui.detect;
+        if (!dz || !dz.pick) return;
+        saveSetting('device', dz.pick.id);
+        paint();
+        root.setTimeout(function () { refreshTrouble(); }, 400);
+      });
+      host.appendChild(btns.use);
+    }
+    if (id === 'capture' || id === 'signal' || id === 'level') {
+      btns.test = btn('pl-mini', 'Test 4 s (off air)', 'c:timer', 'Open the capture for four seconds without going on air');
+      btns.test.addEventListener('click', function (e) { e.stopPropagation(); runDetectTest(); });
+      host.appendChild(btns.test);
+    }
+    if (id === 'routed') {
+      btns.golive = btn('pl-mini', 'Go live (tap twice)', 'c:microphone--filled', 'Start MX Live - a second tap within three seconds confirms');
+      btns.golive.addEventListener('click', function (e) {
+        e.stopPropagation();
+        if (btns.golive.disabled) return;
+        confirmTap('detect-go', btns.golive, 'Tap again to go live', function () { goLive(false); });
+      });
+      host.appendChild(btns.golive);
+    }
+    if (id === 'sender') {
+      btns.sender = btn('pl-mini', 'Open the sender page', 'c:laptop', 'Open the sender page - use it on the machine the music comes from');
+      btns.sender.addEventListener('click', function (e) {
+        e.stopPropagation();
+        var st = model.state || {};
+        if (st.sender_url) openOutside(st.sender_url);
+        else say('The station has not handed out a sender page.', 'bad');
+      });
+      host.appendChild(btns.sender);
+    }
+    return btns;
+  }
+
+  function buildDetectSkeleton() {
+    var dz = ui.detect;
+    var road = detectRoad();
+    if (dz.skelRoad === road) return;
+    dz.skelRoad = road;
+    dz.rows = {};
+    dz.bannerSig = '';
+    var body = dz.body;
+    body.replaceChildren();
+
+    var bar = make('div', 'pl-dz-bar');
+    dz.roadSeg = segmented([
+      {value: 'usb', label: 'USB into the DGX', title: 'The instrument on a USB cable into the DGX Spark - the road in use now'},
+      {value: 'network', label: 'Network / desktop app', title: 'A sender on another machine, over Wi-Fi or the tailnet'}
+    ], function (v) {
+      ui.prefs.road = v; writePrefs();
+      buildDetectSkeleton(); paintDetect(); detectProbe();
+    }, 'Which road the music takes');
+    dz.roadSeg.set(road);
+    bar.appendChild(dz.roadSeg.root);
+    dz.again = btn('', 'Detect again', 'c:renew', 'Rescan the USB bus and run every check now');
+    dz.again.addEventListener('click', function (e) { e.stopPropagation(); detectProbe(); });
+    bar.appendChild(dz.again);
+    body.appendChild(bar);
+
+    dz.banner = make('div', 'pl-dz-banner');
+    dz.banner.hidden = true;
+    body.appendChild(dz.banner);
+
+    var list = make('ol', 'pl-dz-steps');
+    DETECT_ROADS[road].forEach(function (id) {
+      var li = make('li', 'pl-dz-step');
+      li.setAttribute('data-step', id);
+      var dot = make('span', 'pl-dz-dot');
+      dot.setAttribute('aria-hidden', 'true');
+      li.appendChild(dot);
+      var text = make('div', 'pl-dz-text');
+      var tt = make('div', 'pl-dz-title');
+      tt.appendChild(make('b', '', DETECT_TITLES[id] || id));
+      var chip = make('span', 'pl-chip', '');
+      tt.appendChild(chip);
+      text.appendChild(tt);
+      var found = make('small', 'pl-dz-found', '');
+      text.appendChild(found);
+      var next = make('small', 'pl-dz-next', '');
+      text.appendChild(next);
+      var extra = make('div', 'pl-dz-extra');
+      extra.hidden = true;
+      text.appendChild(extra);
+      var acts = make('div', 'pl-actions pl-dz-acts');
+      acts.hidden = true;
+      text.appendChild(acts);
+      li.appendChild(text);
+      list.appendChild(li);
+      dz.rows[id] = {root: li, dot: dot, chip: chip, found: found, next: next,
+        extra: extra, extraSig: '\u0000unset', acts: acts, btns: buildDetectActs(id, acts)};
+    });
+    body.appendChild(list);
+  }
+
+  /* A repaint writes into the nodes already on screen; the pane's scroll
+   * stays where the operator put it (the house rule). */
+  function paintDetect() {
+    var dz = ui.detect;
+    if (!dz || !dz.open) return;
+    var G = root.PineLiveGuide;
+    if (!G) { setText(dz.body, 'The wizard needs pinelive-guide.js on this screen.'); return; }
+    buildDetectSkeleton();
+    var comp = detectSteps();
+    dz.pick = comp.pick;
+
+    var bSig = JSON.stringify(comp.banner);
+    if (bSig !== dz.bannerSig) {
+      dz.bannerSig = bSig;
+      dz.banner.replaceChildren();
+      if (comp.banner) {
+        dz.banner.appendChild(make('b', '', comp.banner.title));
+        var grid = make('div', 'pl-facts');
+        comp.banner.facts.forEach(function (f) { setText(fact(grid, f[0]), f[1]); });
+        dz.banner.appendChild(grid);
+      }
+      setHidden(dz.banner, !comp.banner);
+    }
+
+    comp.steps.forEach(function (stp) {
+      var row = dz.rows[stp.id];
+      if (!row) return;
+      var cls = 'pl-dz-step pl-dz-' + stp.status;
+      if (row.root.className !== cls) row.root.className = cls;
+      setText(row.chip, {pass: 'yes', fail: 'no - fix this', probing: 'probing', wait: 'waits', info: 'read'}[stp.status] || stp.status);
+      row.chip.className = 'pl-chip pl-chip-' + ({pass: 'ok', fail: 'bad', probing: 'live', wait: 'mute', info: 'mute'}[stp.status] || 'mute');
+      setText(row.found, stp.found);
+      setHidden(row.found, !stp.found);
+      setText(row.next, stp.next);
+      setHidden(row.next, !stp.next);
+      if ((stp.extraSig || '') !== row.extraSig) {
+        row.extraSig = stp.extraSig || '';
+        row.extra.replaceChildren();
+        if (stp.extra) {
+          var node = stp.extra();
+          if (node) row.extra.appendChild(node);
+        }
+        setHidden(row.extra, !row.extra.firstChild);
+      }
+      var acts = stp.acts || {};
+      var any = false;
+      for (var k in row.btns) {
+        if (!Object.prototype.hasOwnProperty.call(row.btns, k)) continue;
+        setHidden(row.btns[k], !acts[k]);
+        if (acts[k]) any = true;
+      }
+      setHidden(row.acts, !any);
+      if (row.btns.golive) {
+        var block = String(stp.goliveBlock || '');
+        row.btns.golive.disabled = !!block;
+        row.btns.golive.title = block || 'Start MX Live - a second tap within three seconds confirms';
+      }
+    });
+
+    if (dz.rows.choose && dz.rows.choose.btns.use) {
+      setText(dz.rows.choose.btns.use.querySelector('.pl-btn-words'),
+        'Use the ' + ((G.PROFILES[comp.profile] || {}).short || 'instrument'));
+    }
+    if (dz.rows.routed && dz.rows.routed.btns.golive) {
+      var confirming = ui.confirmUntil['detect-go'] && Date.now() < ui.confirmUntil['detect-go'];
+      setText(dz.rows.routed.btns.golive.querySelector('.pl-btn-words'), confirming ? 'Tap again to go live' : 'Go live (tap twice)');
+      setClass(dz.rows.routed.btns.golive, 'confirm', !!confirming);
+    }
+    if (dz.again) setClass(dz.again, 'busy', !!model.troubleBusy);
+  }
+
+  /* Tap = detect NOW: devices?fresh=1 makes the host re-read lsusb and
+   * /proc/asound (its 0.2 s control loop sees scan_at), then the checks
+   * re-grade against the fresh scan. */
+  function detectProbe() {
+    if (!ui.detect || !ui.detect.open) return;
+    refreshDevices(true).then(function () { refreshTrouble(); });
+  }
+
+  /* The run re-walks itself while the wizard is open: the same cadence as
+   * "Keep checking" (4 s), through the same guarded refreshTrouble - one
+   * chain, no parallel loops, nothing the tablet's socket pool feels. */
+  function scheduleDetect() {
+    var dz = ui.detect;
+    if (!dz) return;
+    if (dz.timer) { root.clearTimeout(dz.timer); dz.timer = 0; }
+    if (!dz.open || !ui.visible) return;
+    dz.timer = root.setTimeout(function () {
+      dz.timer = 0;
+      dz.beat = (dz.beat || 0) + 1;
+      var again = function () { scheduleDetect(); };
+      if (dz.beat % 3 === 0) refreshDevices(false).then(function () { refreshTrouble().then(again, again); }, again);
+      else refreshTrouble().then(again, again);
+    }, DETECT_EVERY_MS);
+  }
+
+  function openDetect() {
+    buildPopup();
+    var dz = ui.detect;
+    if (!dz || dz.open) return;
+    dz.open = true;
+    dz.root.hidden = false;
+    dz.beat = 0;
+    buildDetectSkeleton();
+    paintDetect();
+    paintDetectBtn();
+    detectProbe();
+    scheduleDetect();
+  }
+
+  function closeDetect() {
+    var dz = ui.detect;
+    if (!dz || !dz.open) return;
+    dz.open = false;
+    dz.root.hidden = true;
+    if (dz.timer) { root.clearTimeout(dz.timer); dz.timer = 0; }
+    paintDetectBtn();
+  }
+
   /* ================================================== start */
 
   function start() {
@@ -2265,10 +3066,15 @@
     isOpen: function () { return ui.visible; },
     state: function () { return model.state; },
     refresh: function () { schedulePoll(0); },
+    /* [plpopup] drag, the pure pieces, for the tests */
+    dragClamp: clampDelta, dragPosKey: POS_KEY, dragSurface: posSurface,
     /* pure helpers, for the tests */
     badgeOf: badgeOf, phaseWord: phaseWord, fmtDur: fmtDur, fmtAgo: fmtAgo, readPanels: readPanels,
     writePanels: writePanels, refusal: refusal, pairsFor: pairsFor, chosenDevice: chosenDevice,
-    stationUrl: stationUrl, PANEL_ORDER: PANEL_ORDER, DEFAULT_OPEN: DEFAULT_OPEN, PANELS_KEY: PANELS_KEY
+    stationUrl: stationUrl, PANEL_ORDER: PANEL_ORDER, DEFAULT_OPEN: DEFAULT_OPEN, PANELS_KEY: PANELS_KEY,
+    /* [pldetect] the wizard's doors and its pure grader, for the tests */
+    detectTintOf: detectTintOf, openDetect: openDetect, closeDetect: closeDetect,
+    detectOpen: function () { return !!(ui.detect && ui.detect.open); }
   };
   root.PineLive = api;
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
