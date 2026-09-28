@@ -57,7 +57,11 @@ function cover(words, bad) {
 async function begin() {
   let open = null;
   try {
-    open = await api.mirrorOpen({});
+    /* [mirror-pip-full] Every open starts at FULL detail: "bring it up in
+     * a hundred percent detail". Asked for in the open itself so the pipe
+     * starts full rather than opening at half and rebuilding. The Detail
+     * buttons and Auto still lower it afterwards, exactly as before. */
+    open = await api.mirrorOpen({ size: "full" });
   } catch (error) {
     return cover('the tablet mirror would not start: ' + error.message, true);
   }
@@ -151,7 +155,13 @@ for (const button of document.querySelectorAll('.zoom')) {
  * ZOOM is a magnifier over what has arrived - and because a magnifier over a
  * third-detail stream only enlarges blur, zooming in asks the tablet for
  * more pixels. See sharpenSoon(). */
-const MOST = 8;
+/* [mirror-pip-fit] THE MAGNIFIER IS RETIRED. "Instead of zooming into the
+ * window, just have the window one hundred percent zoomed out" - the whole
+ * tablet always fits the glass, and scale is chosen by sizing the WINDOW.
+ * Clamping the ceiling to 1 retires the wheel while keeping every shared
+ * piece of arithmetic: place(), rein(), whereOnTablet() and deserved() all
+ * read zoom = 1 and pan = 0. */
+const MOST = 1;
 const ORDER = ['quarter', 'third', 'half', 'full'];
 const PART = { quarter: 1 / 4, third: 1 / 3, half: 1 / 2, full: 1 };
 
@@ -159,14 +169,26 @@ let zoom = 1;
 let ox = 0;                 /* pan, in displayed pixels from the centre */
 let oy = 0;
 let panning = null;
-let auto = true;
+let auto = false;  /* [mirror-pip-auto] full detail holds until asked */
 let sharpenAt = 0;
 
 function frame() {
-  /* The picture's laid-out size at zoom 1 - the browser has already fitted
-   * it inside the glass, so this is what everything scales from. */
-  return { wide: live.clientWidth, tall: live.clientHeight,
-    boxWide: glass.clientWidth, boxTall: glass.clientHeight };
+  /* [mirror-pip-frame] The picture's DRAWN size. The <img> fills the glass
+   * and object-fit letterboxes INSIDE the element, so the element's own box
+   * no longer says where the picture is - the contain rectangle is
+   * recomputed here from the tablet's shape. Pan clamping, touch mapping
+   * and Auto's arithmetic all read this one answer. */
+  const boxWide = glass.clientWidth;
+  const boxTall = glass.clientHeight;
+  let wide = live.clientWidth;
+  let tall = live.clientHeight;
+  const real = shown && shown.real;
+  if (real && real.width > 0 && real.height > 0 && wide > 0 && tall > 0) {
+    const scale = Math.min(wide / real.width, tall / real.height);
+    wide = real.width * scale;
+    tall = real.height * scale;
+  }
+  return { wide: wide, tall: tall, boxWide: boxWide, boxTall: boxTall };
 }
 
 /* KEEP THE PICTURE ON SCREEN. Panned far enough, an unclamped viewer loses

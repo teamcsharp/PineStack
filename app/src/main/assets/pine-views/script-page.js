@@ -4590,6 +4590,11 @@
   var segShownAt = null;          /* and the heading it was opened from */
   var segSaying = null;           /* that window's own say() line */
   var segReplaying = '';          /* a replay in flight, by line id */
+  var segFlowTab = 'tech';        /* [segflow-tabs] which flow-column tab is up */
+  var segFlowPick = null;         /* [segflow-tabs] {lid, seat}: the last selection served */
+  var segFlowS3 = null;           /* [segflow-tabs] the mounted System 3 chain, one per window */
+  var segFlowTabsApi = null;      /* [segflow-tabs] the open window's tab strip */
+  var segFlowBackWired = false;   /* [segflow-tabs] the BACK probe, registered once */
   var SEG_HOLD_MS = 600;          /* the same hold line-actions.js uses */
   var SEG_HOLD_SLOP = 12;         /* a scroll is not a hold */
 
@@ -4600,6 +4605,10 @@
     segShownAt = ident || null;
     segSaying = (sheet && sheet.say) || null;
     segReplaying = '';
+    segFlowTab = 'tech';          /* [segflow-tabs] a fresh window starts on Technical */
+    segFlowPick = null;
+    segFlowTabsApi = null;
+    segFlowS3Dispose();
   }
 
   function segSay(text, hold) {
@@ -5283,6 +5292,8 @@
   }, true);
 
   function segReveal(lineId, seat) {
+    /* [segflow-tabs] the selection the Technical tab comes back to */
+    segFlowPick = {lid: String(lineId || ''), seat: String(seat || '')};
     var card = segCardFor(lineId) || (seat ? segCardForSeat(seat) : null);
     if (!card) {
       segSay(lineId
@@ -5308,6 +5319,9 @@
   function segFlowTap(node, seat, tie) {
     if (!node || !node.addEventListener) return;
     var lid = String((tie && tie.line_id) || '');
+    /* [segflow-tabs] found again when the Technical tab comes back */
+    node.setAttribute('data-flow-line', lid);
+    node.setAttribute('data-flow-seat', String(seat || ''));
     node.classList.add('sp-segflow-tap');
     node.setAttribute('role', 'button');
     node.setAttribute('tabindex', '0');
@@ -7003,6 +7017,7 @@
     saveBar.appendChild(applyKind); saveBar.appendChild(save);
     form.appendChild(saveBar);
     sheet.box.appendChild(form);
+    flowNodesTabs(sheet, form, lineOrigin, storyline);   /* [nodetab] Assembly | Nodes */
 
     function storySeconds(turn) {
       var explicit = Number(turn && turn.seconds);
@@ -7538,8 +7553,106 @@
     });
   }
 
+  /* [nodetab] "Offer a tab for showing the vertical node view of the
+     selected piece of dialogue." The Shape window's strip under the title:
+     Assembly is the window as it was; Nodes mounts the System 3 module's
+     own per-line vertical node chain (mountLineTabs, tab 'node') on the
+     selected scripted line - the line's node lit, every recorded die
+     tappable for how that draw was decided, other nodes tappable to walk
+     the round. The module is imported and asks the station only on the
+     first switch to Nodes, so opening the window costs nothing new, and a
+     line System 3 did not direct gets the module's own honest words, never
+     a blank. BACK unwinds one surface at a time: a decision card first
+     (PineDismiss already closes .s3-modal-back, and the cards stack
+     higher), then Nodes back to Assembly, then the window itself. */
+  var flowNodesState = null;
+  var flowNodesBackUnwire = null;
+  function flowNodesDrop() {
+    var state = flowNodesState;
+    flowNodesState = null;
+    if (state && state.view) { try { state.view.dispose(); } catch (e) { /* gone */ } }
+  }
+  function flowNodesBackWire() {
+    if (flowNodesBackUnwire) return;
+    var dismiss = root.PineDismiss;
+    if (!dismiss || typeof dismiss.onBack !== 'function') return;
+    flowNodesBackUnwire = dismiss.onBack(function () {
+      var state = flowNodesState;
+      var node = el('spSegmentFlow');
+      if (!state || !node || node !== state.sheet.back || !node.isConnected) return null;
+      return {node: node, close: function () {
+        if (state.tab === 'nodes') { state.show('assembly'); return; }
+        state.sheet.close();
+        flowNodesDrop();
+      }};
+    });
+  }
+  function flowNodesTabs(sheet, form, lineOrigin, storyline) {
+    flowNodesDrop();
+    var lineId = String((lineOrigin && lineOrigin.id) || '');
+    if (!lineId) {
+      var carried = (storyline || []).filter(function (node) {
+        return node && node.lineId;
+      })[0];
+      if (carried) lineId = String(carried.lineId);
+    }
+    var strip = make('div', 'sp-detail-tabs sp-flow-tabs');
+    var pane = make('div', 'sp-detail-s3 sp-flow-nodes');
+    pane.hidden = true;
+    var buttons = {};
+    var state = {sheet: sheet, tab: 'assembly', view: null, mounting: false, show: show};
+    function show(name) {
+      state.tab = name;
+      Object.keys(buttons).forEach(function (k) {
+        buttons[k].setAttribute('aria-pressed', String(k === name));
+      });
+      form.hidden = name !== 'assembly';
+      form.style.display = name === 'assembly' ? '' : 'none';
+      pane.hidden = name !== 'nodes';
+      if (name !== 'nodes' || state.view || state.mounting) return;
+      if (!lineId) {
+        pane.textContent = 'This window was opened for the whole segment and its '
+          + 'script holds no line id yet, so there is no single line to trace.';
+        return;
+      }
+      state.mounting = true;
+      pane.textContent = 'Asking System 3 how this line was accomplished...';
+      reviewS3Import().then(function (mod) {
+        if (flowNodesState !== state) return null;
+        return mod.mountLineTabs(pane, {request: s3Request, lineId: lineId, tab: 'node'});
+      }).then(function (view) {
+        if (!view) return;
+        if (flowNodesState !== state) { try { view.dispose(); } catch (e) { /* gone */ } return; }
+        state.view = view;
+      }).catch(function (err) {
+        if (flowNodesState === state) {
+          pane.textContent = 'System 3 could not open here: '
+            + String((err && err.message) || err);
+        }
+      })['finally'](function () { state.mounting = false; });
+    }
+    [['assembly', 'Assembly'], ['nodes', 'Nodes']].forEach(function (t) {
+      var b = make('button', 'sp-detail-tab', t[1]);
+      b.type = 'button';
+      b.setAttribute('aria-pressed', 'false');
+      b.addEventListener('click', function () { show(t[0]); });
+      buttons[t[0]] = b;
+      strip.appendChild(b);
+    });
+    sheet.box.insertBefore(strip, form);
+    sheet.box.appendChild(pane);
+    sheet.x.addEventListener('click', flowNodesDrop);
+    sheet.back.addEventListener('click', function (ev) {
+      if (ev.target === sheet.back) flowNodesDrop();
+    });
+    flowNodesState = state;
+    flowNodesBackWire();
+    show('assembly');
+  }
+
   root.PineSegmentFlow = {openForLine: itineraryFlowForLine,
     openForSegment: itineraryFlowForSegment};
+  root.PineSegmentFlow.inspect = segInspectOpen;   /* [segflow-tabs] the Segment window, by road */
 
   function itineraryPaint(list, hours, sheet) {
     for (var h = 0; h < hours.length; h += 1) {
@@ -7753,6 +7866,357 @@
     return row;
   }
 
+  /* ================================================== [segflow-tabs] ==
+   * TWO TABS OVER THE FLOW COLUMN.
+   *
+   * "At the top of this window, offer two tabs for changing how this
+   * vertical flow chart is shown. Technical and System 3. For the system
+   * 3 tab, show it as the system 3 flow chart view allowing me to select
+   * each node to examine where it is in line. If i change it back to the
+   * technical tab, focus on the selected text item once more."
+   * (operator, 2026-09-28)
+   *
+   * Technical is the passed-around chain exactly as it was. System 3 is
+   * the module's own vertical node chain for this segment
+   * (mountSegmentNodes, imported by the road the review pane already
+   * uses), mounted once per window on the FIRST tap - its trace answer is
+   * measured in megabytes, so it is never fetched for a window nobody
+   * switched - and disposed when the window leaves the page. A tap on a
+   * node marks it, answers WHERE IT IS IN LINE out of the answer this
+   * window already holds (segShown - never a fresh request), and the
+   * module's own cards keep opening for the rolls. Switching back to
+   * Technical replays segReveal on the last selection and brings its chip
+   * back on screen inside the column's own scroller - an explicit,
+   * operator-made focus, once; nothing follows by itself afterwards
+   * (the no-autoscroll rule). BACK unwinds detail -> tab -> window: the
+   * module's cards are .s3-modal-back, which pine-dismiss already
+   * answers for; the probe below does the other two. */
+
+  function segFlowS3Dispose() {
+    var held = segFlowS3;
+    segFlowS3 = null;
+    if (held && held.view) { try { held.view.dispose(); } catch (err) { /* gone */ } }
+  }
+
+  function segFlowPlaceOf(lid) {
+    var lines = (segShown && segShown.lines) || [];
+    var want = String(lid || '');
+    for (var i = 0; i < lines.length; i += 1) {
+      if (String((lines[i] || {}).line_id || '') === want) {
+        return {line: lines[i] || {}, at: i + 1, of: lines.length};
+      }
+    }
+    return null;
+  }
+
+  /* WHERE IT IS IN LINE, out of the inspect answer already on screen: its
+     place in this block's aired order, who says it, how long, when, and
+     whether it was heard. A node that made no line inside this block is
+     said so, plainly - segment_inspect recorded the block, and this
+     window has never been allowed to invent a field. */
+  function segFlowPlacePaint(place, lid, fresh) {
+    place.textContent = '';
+    place.appendChild(make('div', 'sp-segflow-h', 'Where it is in line'));
+    if (fresh) {
+      place.appendChild(make('div', 'sp-segflow-note',
+        'Tap a node in the chain below to see its place in this'
+        + ' block’s aired order.'));
+      return;
+    }
+    if (!segHas(lid)) {
+      place.appendChild(make('div', 'sp-segflow-note', 'System 3 recorded'
+        + ' no aired line for this node inside this block - it was a'
+        + ' decision on the way, or its line went out in another block.'));
+      return;
+    }
+    var got = segFlowPlaceOf(lid);
+    if (!got) {
+      place.appendChild(make('div', 'sp-segflow-note',
+        'The station holds no line by that id inside this block.'));
+      return;
+    }
+    var l = got.line;
+    place.appendChild(make('div', 'sp-segplace-row',
+      'line ' + got.at + ' of ' + got.of + ' in this block'));
+    place.appendChild(make('div', 'sp-segplace-row',
+      String(l.name || segSeatLook(l.who).label)
+      + (segHas(l.kind) ? '  ·  ' + String(l.kind) : '')));
+    var bits = [];
+    if (segHas(l.seconds)) bits.push(segSecs(l.seconds));
+    if (segHas(l.at)) bits.push('at ' + String(l.at));
+    if (l.heard === false) bits.push('never heard');
+    if (bits.length) {
+      place.appendChild(make('div', 'sp-segplace-row', bits.join('  ·  ')));
+    }
+    if (segHas(l.text)) {
+      place.appendChild(make('div', 'sp-segplace-text', String(l.text).slice(0, 160)));
+    }
+  }
+
+  /* The chain node the operator tapped -> the line it stands for: a sting
+     carries its line on itself, a turn's AIR node carries the block's own
+     line ids, and a turn outside this block is looked up in the trace the
+     mounted view already holds. '' when the node made no line at all. */
+  function segFlowS3LineFor(chain, node) {
+    var lid = '';
+    var sting = node.closest ? node.closest('[data-line]') : null;
+    if (sting && chain.contains(sting)) lid = String(sting.getAttribute('data-line') || '');
+    var turnBox = !lid && node.closest ? node.closest('.s3-sgn-turn') : null;
+    if (turnBox && chain.contains(turnBox)) {
+      var air = turnBox.querySelector('.s3-sgn-air');
+      var ids = air ? String(air.getAttribute('data-lines') || '') : '';
+      var arr = ids ? ids.split(',') : [];
+      for (var a = 0; a < arr.length; a += 1) {
+        if (segLineOf(arr[a])) { lid = arr[a]; break; }
+      }
+      if (!lid && arr.length) lid = String(arr[0] || '');
+      if (!lid) {
+        var tid = String(turnBox.getAttribute('data-turn') || '');
+        var view = segFlowS3 && segFlowS3.view;
+        var tr = (view && typeof view.trace === 'function' && view.trace()) || null;
+        var convs = (tr && tr.conversations) || [];
+        for (var i = 0; i < convs.length && tid && !lid; i += 1) {
+          var whole = (convs[i] || {}).conversation || {};
+          var lines = whole.lines || [];
+          for (var k = 0; k < lines.length; k += 1) {
+            if (String((lines[k] || {}).turn_id || '') === tid) {
+              lid = String(lines[k].line_id || '');
+              break;
+            }
+          }
+        }
+      }
+    }
+    return lid;
+  }
+
+  function segFlowS3Pick(chain, place, node) {
+    var old = chain.querySelectorAll('.sp-segpicked');
+    for (var i = 0; i < old.length; i += 1) old[i].classList.remove('sp-segpicked');
+    node.classList.add('sp-segpicked');
+    var lid = segFlowS3LineFor(chain, node);
+    var line = lid ? segLineOf(lid) : null;
+    if (line) {
+      /* only a line of THIS block becomes the selection the Technical
+         tab comes back to - a turn whose line aired in another block has
+         no card in this window to focus, and is said so instead */
+      segFlowPick = {lid: lid, seat: String(line.who || '')};
+      segFlowPlacePaint(place, lid, false);
+      return;
+    }
+    segFlowPlacePaint(place, '', false);
+  }
+
+  /* Mounted once per window, kept, and disposed with it: the chain asks
+     the station for a trace and up to sixteen blocks of receipts, and
+     this file's traffic rule is not decorative - 38 concurrent requests
+     were measured starving this tablet's audio for 46 seconds. */
+  function segFlowS3Mount(chain, place) {
+    if (segFlowS3) return;
+    var d = segShown;
+    if (!d) {
+      chain.textContent = '';
+      chain.appendChild(make('div', 'sp-segflow-note',
+        'Still asking the station about this segment - the chain will be'
+        + ' drawn when it answers.'));
+      return;
+    }
+    if (d.available === false) {
+      chain.textContent = '';
+      chain.appendChild(make('div', 'sp-segflow-note',
+        'System 3 cannot be asked about this segment: '
+        + String(d.why || 'the station has no record of it')));
+      return;
+    }
+    var held = {view: null};
+    segFlowS3 = held;
+    segFlowPlacePaint(place, (segFlowPick && segFlowPick.lid) || '', true);
+    var host = make('div', 'sp-segs3-host');
+    chain.textContent = '';
+    chain.appendChild(host);
+    host.appendChild(make('div', 'sp-segflow-note', 'asking System 3…'));
+    var seg = String((d.segment || {}).id || '');
+    var sid = String((d.round || {}).sid || '');
+    var lid = (segFlowPick && segFlowPick.lid)
+      || String(((d.lines || [])[0] || {}).line_id || '');
+    reviewS3Import().then(function (mod) {
+      if (segFlowS3 !== held || !el('spSegInspect')) return null;
+      if (!mod || typeof mod.mountSegmentNodes !== 'function') {
+        throw new Error('this station’s System 3 module has no segment chain yet');
+      }
+      host.textContent = '';
+      return mod.mountSegmentNodes(host, {request: s3Request,
+        segment: seg, conversation: sid, lineId: lid});
+    }).then(function (view) {
+      if (!view) return;
+      if (segFlowS3 !== held) { try { view.dispose(); } catch (err) { /* gone */ } return; }
+      held.view = view;
+    })['catch'](function (err) {
+      if (segFlowS3 === held) segFlowS3 = null;   /* a later tap tries again */
+      host.textContent = '';
+      host.appendChild(make('div', 'sp-segflow-note',
+        'System 3 could not draw this segment: '
+        + String((err && err.message) || err).slice(0, 160)));
+    });
+    if (typeof MutationObserver === 'function') {
+      var watching = new MutationObserver(function () {
+        if (el('spSegInspect')) return;
+        watching.disconnect();
+        if (segFlowS3 === held) segFlowS3Dispose();
+        else if (held.view) { try { held.view.dispose(); } catch (err) { /* gone */ } }
+      });
+      watching.observe(document.body, {childList: true});
+    }
+  }
+
+  /* The nearest scroller INSIDE the window - the chip is brought back on
+     screen by scrolling the column's own container, never the page. */
+  function segFlowColScroll(node) {
+    var win = el('spSegInspect');
+    if (!win) return null;
+    for (var p = node.parentElement; p && win.contains(p); p = p.parentElement) {
+      var style = null;
+      try { style = root.getComputedStyle(p); } catch (err) { return null; }
+      if (style && /(auto|scroll)/.test(style.overflowY)
+          && p.scrollHeight > p.clientHeight + 1) return p;
+    }
+    return null;
+  }
+
+  function segFlowChipShow(side, pick) {
+    var want = String((pick && pick.lid) || '');
+    var seat = String((pick && pick.seat) || '');
+    var taps = side.querySelectorAll('.sp-segflow-tap');
+    var chip = null, i;
+    for (i = 0; i < taps.length && want && !chip; i += 1) {
+      if (String(taps[i].getAttribute('data-flow-line') || '') === want
+          && taps[i].classList.contains('sp-segflow-node')) chip = taps[i];
+    }
+    for (i = 0; i < taps.length && want && !chip; i += 1) {
+      if (String(taps[i].getAttribute('data-flow-line') || '') === want) chip = taps[i];
+    }
+    for (i = 0; i < taps.length && seat && !chip; i += 1) {
+      if (String(taps[i].getAttribute('data-flow-seat') || '') === seat
+          && taps[i].classList.contains('sp-segflow-node')) chip = taps[i];
+    }
+    if (!chip) return false;
+    var roll = segFlowColScroll(chip);
+    if (roll) {
+      var a = chip.getBoundingClientRect();
+      var b = roll.getBoundingClientRect();
+      roll.scrollTop += (a.top - b.top) - Math.max(0, (roll.clientHeight - a.height) / 2);
+    }
+    chip.classList.remove('sp-segflash');
+    try { void chip.offsetWidth; } catch (err) { /* headless */ }
+    chip.classList.add('sp-segflash');
+    setTimeout(function () { chip.classList.remove('sp-segflash'); }, 1300);
+    return true;
+  }
+
+  /* The strip and the two panes, inside the side column's own scroller.
+     segFlowPaint keeps painting the Technical pane; the strip sits above
+     both and survives the repaint. */
+  function segFlowColumn(side) {
+    var strip = make('div', 'sp-segtabs');
+    strip.setAttribute('role', 'tablist');
+    strip.setAttribute('aria-label', 'How to show this flow chart');
+    var tech = make('div', 'sp-segtab-pane');
+    var s3 = make('div', 'sp-segtab-pane');
+    s3.hidden = true;
+    var place = make('div', 'sp-segplace');
+    var chain = make('div', 'sp-segs3-chain');
+    s3.appendChild(place);
+    s3.appendChild(chain);
+    var kept = {tech: 0, s3: 0};
+    var buttons = {};
+    function tab(id, label) {
+      var b = make('button', 'sp-segtab', label);
+      b.type = 'button';
+      b.setAttribute('role', 'tab');
+      b.setAttribute('data-tab', id);
+      b.addEventListener('click', function () { show(id); });
+      buttons[id] = b;
+      strip.appendChild(b);
+    }
+    tab('tech', 'Technical');
+    tab('s3', 'System 3');
+    function paint() {
+      var on = segFlowTab === 's3' ? 's3' : 'tech';
+      buttons.tech.classList.toggle('on', on === 'tech');
+      buttons.s3.classList.toggle('on', on === 's3');
+      buttons.tech.setAttribute('aria-selected', on === 'tech' ? 'true' : 'false');
+      buttons.s3.setAttribute('aria-selected', on === 's3' ? 'true' : 'false');
+      tech.hidden = on !== 'tech';
+      s3.hidden = on !== 's3';
+      side.classList.toggle('sp-segside-s3', on === 's3');
+    }
+    function show(id) {
+      id = id === 's3' ? 's3' : 'tech';
+      if (segFlowTab === id) {
+        paint();
+        if (id === 's3') segFlowS3Mount(chain, place);
+        return;
+      }
+      kept[segFlowTab] = side.scrollTop;
+      segFlowTab = id;
+      paint();
+      side.scrollTop = kept[id] || 0;
+      if (id === 's3') { segFlowS3Mount(chain, place); return; }
+      /* Back on Technical: the operator's own switch is the one focus
+         allowed here - the last selected node's line, else the text item
+         this window had already revealed. Once; nothing moves after it. */
+      var pick = segFlowPick;
+      if (!pick) {
+        var win = el('spSegInspect');
+        var opened = win ? win.querySelector('.sp-segline.sp-segopen') : null;
+        if (opened) {
+          pick = {lid: String(opened.getAttribute('data-line-id') || ''),
+            seat: String(opened.getAttribute('data-seat') || '')};
+        }
+      }
+      if (pick && (pick.lid || pick.seat)) {
+        segReveal(pick.lid, pick.seat);
+        segFlowChipShow(side, pick);
+      }
+    }
+    chain.addEventListener('click', function (ev) {
+      var t = ev.target;
+      if (!t || !t.closest) return;
+      var node = t.closest('.s3-sgn');
+      if (!node || !chain.contains(node)) return;
+      segFlowS3Pick(chain, place, node);
+    }, true);
+    side.appendChild(strip);
+    side.appendChild(tech);
+    side.appendChild(s3);
+    segFlowTabsApi = {show: show};
+    paint();
+    return {tech: tech, landed: function () {
+      if (segFlowTab === 's3' && !segFlowS3) segFlowS3Mount(chain, place);
+    }};
+  }
+
+  /* BACK unwinds detail -> tab -> window. The module's node-detail cards
+     are .s3-modal-back and sit higher (z 2147483600 against the sheet's
+     2147483006), so pine-dismiss picks them first on its own; this probe
+     answers for the window underneath. Registered once; it reads the
+     live DOM, so the order windows open in cannot matter. */
+  function segFlowBackWire() {
+    if (segFlowBackWired) return;
+    var dismiss = root.PineDismiss;
+    if (!dismiss || typeof dismiss.onBack !== 'function') return;
+    segFlowBackWired = true;
+    dismiss.onBack(function () {
+      var win = el('spSegInspect');
+      if (!win || !win.isConnected) return null;
+      return {node: win, close: function () {
+        if (segFlowTab === 's3' && segFlowTabsApi) { segFlowTabsApi.show('tech'); return; }
+        segInspectClose();
+      }};
+    });
+  }
+  /* ================================================ [segflow-tabs] end */
+
   function segInspectClose() { var n = el('spSegInspect'); if (n) n.remove(); }
 
   function segInspectOpen(ident) {
@@ -7767,9 +8231,11 @@
     if (root.PineDuck && typeof root.PineDuck.hold === 'function') {
       root.PineDuck.hold('sp-spSegInspect', root.PineDuck.REPORT, sheet.back);
     }
+    segFlowBackWire();                       /* [segflow-tabs] BACK unwinds */
     var split = make('div', 'sp-segins-split');
     var body = make('div', 'sp-segins-body');
     var side = make('div', 'sp-segins-side');
+    var flow = segFlowColumn(side);          /* [segflow-tabs] the strip + panes */
     split.appendChild(body);
     split.appendChild(side);
     sheet.box.appendChild(split);
@@ -7781,15 +8247,16 @@
     segRow(head, 'segment id', ident.seg);
 
     body.appendChild(make('div', 'sp-segins-wait', 'asking the station…'));
-    side.appendChild(make('div', 'sp-segflow-note', 'the hand-offs will be drawn here'));
+    flow.tech.appendChild(make('div', 'sp-segflow-note', 'the hand-offs will be drawn here'));
 
     segInspect(ident.block).then(function (d) {
       if (!el('spSegInspect')) return;          /* closed while asking */
       var wait = body.querySelector('.sp-segins-wait');
       if (wait) wait.remove();
       segFactsPaint(body, d, ident);
-      side.textContent = '';
-      segFlowPaint(side, d);
+      flow.tech.textContent = '';            /* [segflow-tabs] the pane, not the column */
+      segFlowPaint(flow.tech, d);
+      flow.landed();
       if (d && d.available === false) {
         sheet.say(String(d.why || 'the station has no record of this segment'), true);
       }

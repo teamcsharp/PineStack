@@ -51,8 +51,9 @@
                 title="Half of the tablet's pixels - the everyday setting">&frac12;</button>
         <button class="res" data-size="full" type="button"
                 title="Every pixel the tablet has. Costs it the most work.">Full</button>
-        <button id="autoRes" class="toggle on" type="button"
-                title="Raise the detail on its own when you zoom in, and lower it again when you zoom out">Auto</button>
+        <!-- [mirror-pip-auto-off] Auto rests OFF: every open is full detail. -->
+        <button id="autoRes" class="toggle" type="button"
+                title="Match the tablet's detail to the window size on its own. Off by default: the tablet sends full detail until asked.">Auto</button>
       </div>
 
       <div class="group" role="group" aria-label="How big this window is">
@@ -96,7 +97,8 @@
       <div class="group right">
         <button id="touch" type="button" class="toggle"
                 data-pine-icon="m:front_hand" aria-label="Touch the tablet"
-                title="Click and drag on the picture to touch the tablet.&#10;The wheel still zooms and the middle button still pans."></button>
+                title="Click and drag on the picture to touch the tablet."></button>
+        <!-- [mirror-pip-touch] the wheel magnifier is retired -->
         <button id="stats" type="button" class="toggle on"
                 data-pine-icon="c:chart--line"
                 title="Show the tablet's battery, heartbeat and load over the picture"
@@ -104,7 +106,7 @@
         <button id="ontop" type="button" class="toggle on"
                 data-pine-icon="c:pin--filled"
                 title="Keep this window above the others" aria-label="Keep on top"></button>
-        <span id="zoomAt" class="dim" title="Wheel to zoom, middle button to pan, 0 to reset"></span>
+        <span id="zoomAt" class="dim" title="Always 100%: the picture scales with the window"></span>
         <span id="how" class="dim"></span>
       </div>
     </div>

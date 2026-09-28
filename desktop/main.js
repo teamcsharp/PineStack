@@ -1782,6 +1782,90 @@ ipcMain.handle("tablet:vitals", () => tabletVitals());
 let mirror = null;
 let mirrorWindow = null;
 
+/* [mirror-pip] THE WINDOW IS THE ZOOM.
+ *
+ * "Inherently the application is at a hundred percent zoom level at all
+ * times and I'm able to just scale it to just adjust the amount of scale
+ * that I want" - so the mirror carries no magnifier any more. The picture
+ * always FITS the window, and making it bigger is done by making the window
+ * bigger. Three helpers, kept pure so they can be tested without a window:
+ *
+ *   mirrorAspectBounds  the aspect-locked bounds for a drag, so resizing
+ *                       scales the picture instead of growing letterbox.
+ *                       Exact about the control strip, a fixed band that
+ *                       setAspectRatio's single ratio cannot express on
+ *                       Windows (its extraSize argument is macOS-only).
+ *   mirrorOpenBounds    where the window opens: the remembered size and
+ *                       place when it still lands on a desk that exists,
+ *                       otherwise half the tablet - the original default.
+ *   mirrorPresetSize    the 50/75/100% buttons, clamped to the desk so
+ *                       "100%" on a small screen means "as big as fits"
+ *                       rather than a window hanging off the desk. */
+const MIRROR_STRIP = 34;            /* the control strip under the picture */
+
+function mirrorAspectBounds(wants, real, edge, frame) {
+  if (!wants || !real || !(real.width > 0) || !(real.height > 0)) return null;
+  const fx = frame && Number.isFinite(frame.x) ? frame.x : 0;
+  const fy = frame && Number.isFinite(frame.y) ? frame.y : 0;
+  const ratio = real.width / real.height;
+  /* Dragging the top or bottom edge says the HEIGHT is the intent; every
+   * other handle follows the width. */
+  const byHeight = edge === "top" || edge === "bottom";
+  let pictureW, pictureH;
+  if (byHeight) {
+    pictureH = Math.max(1, wants.height - fy - MIRROR_STRIP);
+    pictureW = Math.round(pictureH * ratio);
+  } else {
+    pictureW = Math.max(1, wants.width - fx);
+    pictureH = Math.round(pictureW / ratio);
+  }
+  const width = Math.max(240, pictureW + fx);
+  const height = Math.max(200, pictureH + MIRROR_STRIP + fy);
+  if (width === wants.width && height === wants.height) return null;
+  return { x: wants.x, y: wants.y, width: width, height: height };
+}
+
+function mirrorOpenBounds(saved, screen_, real, strip) {
+  const fallback = {
+    width: Math.round(real.width / 2),
+    height: Math.round(real.height / 2) + strip
+  };
+  if (!saved || !Number.isFinite(saved.width) || !Number.isFinite(saved.height)
+    || saved.width < 240 || saved.height < 200) return fallback;
+  const out = { width: Math.round(saved.width), height: Math.round(saved.height) };
+  if (screen_ && Number.isFinite(saved.x) && Number.isFinite(saved.y)) {
+    try {
+      /* The nearest display's work area: a place remembered on a monitor
+       * that has since been unplugged is CLAMPED back onto a desk that
+       * exists, never opened invisibly. */
+      const area = screen_.getDisplayMatching(saved).workArea;
+      out.width = Math.min(out.width, area.width);
+      out.height = Math.min(out.height, area.height);
+      out.x = Math.round(Math.min(Math.max(saved.x, area.x),
+        area.x + area.width - out.width));
+      out.y = Math.round(Math.min(Math.max(saved.y, area.y),
+        area.y + area.height - out.height));
+    } catch (error) { /* no display to ask: the size still counts */ }
+  }
+  return out;
+}
+
+function mirrorPresetSize(shape, area, frame) {
+  const fx = frame && Number.isFinite(frame.x) ? frame.x : 0;
+  const fy = frame && Number.isFinite(frame.y) ? frame.y : 0;
+  let pictureW = Math.max(240, Math.round(Number(shape && shape.width) || 0));
+  let pictureH = Math.max(200 - MIRROR_STRIP,
+    Math.round(Number(shape && shape.height) || 0));
+  const roomW = area && area.width > 0 ? area.width - fx : Infinity;
+  const roomH = area && area.height > 0 ? area.height - fy - MIRROR_STRIP : Infinity;
+  const squeeze = Math.min(1, roomW / pictureW, roomH / pictureH);
+  if (squeeze < 1) {
+    pictureW = Math.max(240, Math.floor(pictureW * squeeze));
+    pictureH = Math.max(2, Math.floor(pictureH * squeeze));
+  }
+  return { width: pictureW, height: pictureH + MIRROR_STRIP };
+}
+
 async function openTabletMirror(options) {
   const { Mirror } = require("./tablet-mirror.cjs");
 
@@ -1842,11 +1926,19 @@ async function openTabletMirror(options) {
   }));
 
   const real = mirror.real;
-  /* Opens at half the tablet's size on this desk - big enough to read, small
-   * enough to sit beside the panel, and the window is resizable from there. */
+  /* [mirror-pip-open] Opens where the operator last left it - remembered
+   * size and place, the way the panel window is (#786) - or at half the
+   * tablet's size on a first run. The window is CREATED at those bounds,
+   * so it pops back up where it was with no flash at a default size first.
+   * However big it is, the picture opens FITTED: the whole tablet visible
+   * at 100% zoom, and the scale chosen by sizing the window. */
+  const cfgAt = readConfig() || {};
+  const openAt = mirrorOpenBounds(cfgAt.mirrorBounds,
+    require("electron").screen, real, MIRROR_STRIP);
   mirrorWindow = new BrowserWindow({
-    width: Math.round(real.width / 2),
-    height: Math.round(real.height / 2) + 34,
+    width: openAt.width,
+    height: openAt.height,
+    ...(Number.isFinite(openAt.x) ? { x: openAt.x, y: openAt.y } : {}),
     minWidth: 240,
     minHeight: 200,
     title: "The tablet, live",
@@ -1863,6 +1955,74 @@ async function openTabletMirror(options) {
     }
   });
   mirrorWindow.setMenuBarVisibility(false);
+  /* [mirror-pip-lock] THE FRAME KEEPS THE TABLET'S SHAPE. Dragging any edge
+   * scales the whole picture; without this, most of a drag grows letterbox
+   * instead. setAspectRatio is the native guide where Electron has one, but
+   * on Windows it cannot carve out the fixed control strip (extraSize is
+   * macOS-only), so the exact bounds are written here on every proposed
+   * drag, and the native ratio is re-tuned to the shape it settled at.
+   * Suspended in fullscreen, where the strip is hidden and the OS owns the
+   * window's shape. */
+  const mirrorFrameEdge = () => {
+    try {
+      const outer = mirrorWindow.getSize();
+      const inner = mirrorWindow.getContentSize();
+      return { x: outer[0] - inner[0], y: outer[1] - inner[1] };
+    } catch (error) { return { x: 0, y: 0 }; }
+  };
+  const mirrorHoldRatio = () => {
+    if (typeof mirrorWindow.setAspectRatio !== "function") return;
+    try {
+      if (mirrorWindow.isFullScreen()) return mirrorWindow.setAspectRatio(0);
+      const now = mirrorWindow.getBounds();
+      if (now.width > 0 && now.height > 0) {
+        mirrorWindow.setAspectRatio(now.width / now.height);
+      }
+    } catch (error) { /* a missing guide only softens the drag */ }
+  };
+  mirrorWindow.on("will-resize", (event, wants, details) => {
+    if (mirrorWindow.isFullScreen()) return;
+    const locked = mirrorAspectBounds(wants, mirror ? mirror.real : real,
+      details && details.edge, mirrorFrameEdge());
+    if (!locked) return;
+    event.preventDefault();
+    mirrorWindow.setBounds(locked);
+  });
+  mirrorWindow.on("resized", mirrorHoldRatio);
+  mirrorWindow.on("enter-full-screen", mirrorHoldRatio);
+  mirrorWindow.on("leave-full-screen", mirrorHoldRatio);
+  mirrorWindow.once("ready-to-show", mirrorHoldRatio);
+  /* The operator's last size and place, written down the way the panel's
+   * is: debounced while it moves, once more as it closes. Fullscreen and
+   * minimised are moments, not sizes, and are never written. */
+  let mirrorBoundsAt = null;
+  const mirrorRemember = () => {
+    clearTimeout(mirrorBoundsAt);
+    mirrorBoundsAt = setTimeout(() => {
+      try {
+        if (!mirrorWindow || mirrorWindow.isDestroyed()
+          || mirrorWindow.isMinimized() || mirrorWindow.isFullScreen()) return;
+        writeConfig({ mirrorBounds: mirrorWindow.getBounds(), mirrorFull: false });
+      } catch (error) { /* a forgotten size only costs the next open */ }
+    }, 600);
+  };
+  mirrorWindow.on("resize", mirrorRemember);
+  mirrorWindow.on("move", mirrorRemember);
+  mirrorWindow.on("close", () => {
+    clearTimeout(mirrorBoundsAt);
+    try {
+      if (mirrorWindow.isMinimized()) return;
+      if (mirrorWindow.isFullScreen()) {
+        /* Closed fullscreen: the windowed bounds underneath are already
+         * remembered - fullscreen never overwrote them - so only the flag
+         * is written, and the next open comes back fullscreen with the
+         * same window waiting behind it. */
+        writeConfig({ mirrorFull: true });
+      } else {
+        writeConfig({ mirrorBounds: mirrorWindow.getBounds(), mirrorFull: false });
+      }
+    } catch (error) { /* fine */ }
+  });
   mirrorWindow.on("closed", () => {
     mirrorWindow = null;
     /* The held input shell belongs to this window. Leaving it open would
@@ -1874,7 +2034,11 @@ async function openTabletMirror(options) {
     if (mirror) { mirror.close(); mirror = null; }
   });
   mirrorWindow.loadFile(path.join(__dirname, "renderer", "tablet-mirror.html"));
-  if (options && options.full) {
+  /* [mirror-pip-refull] A mirror closed fullscreen comes BACK fullscreen,
+   * with the remembered windowed bounds waiting underneath - leaving
+   * fullscreen lands exactly where it used to. options.full (the
+   * double-click open) still asks for it directly. */
+  if ((options && options.full) || cfgAt.mirrorFull === true) {
     mirrorWindow.once("ready-to-show", () => mirrorWindow.setFullScreen(true));
   }
   return { ok: true };
@@ -2235,10 +2399,23 @@ ipcMain.handle("mirror:window", (event, shape) => {
   const window_ = BrowserWindow.fromWebContents(event.sender);
   if (!window_ || window_.isDestroyed()) return { ok: false };
   if (window_.isFullScreen()) window_.setFullScreen(false);
-  /* The strip under the picture is part of the window but not part of the
-   * tablet, so it is added on top of the asked-for picture size. */
-  window_.setSize(Math.max(240, Math.round(shape.width)),
-    Math.max(200, Math.round(shape.height) + 34));
+  /* [mirror-pip-preset] The strip under the picture is part of the window
+   * but not part of the tablet, so it rides on top of the asked-for picture
+   * size - and the size is set on the CONTENT, so "100%" is one tablet
+   * pixel per screen pixel whatever the OS frame adds. Clamped to the desk
+   * this window is on, shrinking both sides together so the picture keeps
+   * the tablet's shape. */
+  let area = null;
+  let frame = null;
+  try {
+    const { screen } = require("electron");
+    area = screen.getDisplayMatching(window_.getBounds()).workArea;
+    const outer = window_.getSize();
+    const inner = window_.getContentSize();
+    frame = { x: outer[0] - inner[0], y: outer[1] - inner[1] };
+  } catch (error) { /* no screen to ask: set it unclamped */ }
+  const fit = mirrorPresetSize(shape, area, frame);
+  window_.setContentSize(fit.width, fit.height);
   return { ok: true };
 });
 

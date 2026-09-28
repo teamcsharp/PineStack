@@ -22,6 +22,11 @@ html, body {
   /* minmax(0,1fr): an auto-sized track will not shrink below the picture's
    * own width, and the strip then falls off the bottom of the window. */
   grid-template-rows: minmax(0, 1fr) auto;
+  /* [mirror-pip-column] The same rule sideways: the strip's min-content is
+   * about 1020px of buttons, and an auto column would grow to hold it and
+   * carry the glass - and the centred picture - past a narrower window's
+   * right edge. The column is the window; the strip clips instead. */
+  grid-template-columns: minmax(0, 1fr);
 }
 
 #glass {
@@ -37,10 +42,14 @@ html, body {
 /* The browser does the scaling. contain rather than cover, because a mirror
  * that crops is a mirror that hides the thing you were looking for. */
 #live {
-  max-width: 100%;
-  max-height: 100%;
-  width: auto;
-  height: auto;
+  /* [mirror-pip-scale] The picture SCALES WITH THE WINDOW, both ways. The
+   * old max-width fit could only shrink: below full detail, or past the
+   * frames' own size, dragging the window bigger only grew letterbox.
+   * Filling the glass and letterboxing inside the element scales the whole
+   * picture to every window size at every detail. */
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
   display: block;
   /* The magnifier. Origin at the centre because that is what the pan
    * arithmetic in place() assumes. */
@@ -78,6 +87,10 @@ html, body {
 #bar {
   display: flex;
   align-items: center;
+  /* [mirror-pip-clip] In a narrow window the strip runs out of room; it
+   * loses its own right-hand end rather than pushing the picture over. */
+  min-width: 0;
+  overflow: hidden;
   gap: 14px;
   padding: 6px 10px;
   background: #0d1217;
