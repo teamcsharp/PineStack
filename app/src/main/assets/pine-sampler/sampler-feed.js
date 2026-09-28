@@ -250,6 +250,35 @@
     };
   }
 
+  /* [cast-names] WHO THE CAST ARE, FOR EVERY LABEL.
+   *
+   * "I want to see the naming reflected everywhere so it makes more sense
+   * than seeing host, co-host and other impersonal names." The station
+   * answers each character's name on /api/dj as dj_names - Dill, Skip and
+   * Sam unless the DJ options say otherwise (the operator's own names, or
+   * names rolled once a day) - and this one poll already carries it. So a
+   * view asks castName('host' | 'cohost' | 'sfx' | 'third'), or a seat word
+   * (dj, drop, sfxguy, guest), instead of printing "Host" or "The SFX Guy".
+   * Before the first poll lands: `fallback` if given, else the station's
+   * own names. */
+  const CAST_DEFAULT = { host: "Dill", cohost: "Skip", sfx: "Sam" };
+  const CAST_KEY = { dj: "host", host: "host", a: "host", cohost: "cohost",
+    "co-host": "cohost", b: "cohost", sfxguy: "sfx", sfx: "sfx", drop: "sfx",
+    third: "third", guest: "guest", d: "third" };
+
+  function castName(role, fallback) {
+    const raw = String(role || "").toLowerCase();
+    const key = CAST_KEY[raw] || raw;
+    const names = (station && station.dj_names) || {};
+    let got = String(names[key] || "").trim();
+    if (!got && key === "third") got = String(names.guest || "").trim();
+    if (got) return got;
+    if (fallback !== undefined) return fallback;
+    return CAST_DEFAULT[key] || "";
+  }
+
+  root.pineCastName = castName;
+
   root.PineStationFeed = {
     subscribe(fn) {
       if (typeof fn !== "function") return () => {};
@@ -271,6 +300,7 @@
     state() { return station; },
     rows() { return rows; },
     now() { return speakingNow(); },
+    castName,                          /* [cast-names] */
     clock,
     subscribers() { return listeners.size; }
   };

@@ -9,6 +9,7 @@
   var pageState = {entries: [], total: 0, has_more: false};
   var threeLoad = null;
   var refreshTimer = 0;
+  var lastGood = null;  // [changelog-cache] the last history this panel received
 
   function make(tag, cls, text) {
     var node = document.createElement(tag);
@@ -213,7 +214,8 @@
     var heading = make('div', 'cl-entry-heading');
     heading.appendChild(make('time', '', value(entry.completed_label)));
     heading.appendChild(make('b', '', value(entry.task_name)));
-    heading.appendChild(make('span', '', entry.file_count + ' file' + (Number(entry.file_count) === 1 ? '' : 's')
+    heading.appendChild(make('span', '', (entry.files_pending ? 'files still being counted'
+      : entry.file_count + ' file' + (Number(entry.file_count) === 1 ? '' : 's'))
       + ' / ' + value(entry.short_commit)));
     summary.appendChild(heading);
     var state = make('span', 'cl-entry-state', isMajor(entry) ? 'major' : 'task');
@@ -258,16 +260,35 @@
     return details;
   }
 
+  // [changelog-cache] The history is a saved cache, so the header always
+  // says how current it is: "839 committed changes \u00b7 as of <time>".
+  function countLine(state) {
+    var parts = [];
+    if (state && state.total) parts.push(state.total + ' committed changes');
+    if (state && state.as_of_label) parts.push('as of ' + state.as_of_label);
+    return parts.join(' \u00b7 ');
+  }
+
   function render() {
     if (!panel) return;
     var body = panel.querySelector('.cl-body');
     var count = panel.querySelector('.cl-count');
     body.replaceChildren();
-    if (count) count.textContent = pageState.total ? pageState.total + ' committed changes' : '';
+    if (count) {
+      count.textContent = countLine(pageState);
+      count.title = pageState.refresh_error ? 'Last refresh: ' + pageState.refresh_error : '';
+    }
     if (pageState.stale) body.appendChild(make('p', 'cl-refreshing', pageState.entries.length
-      ? 'Showing the saved station history while Git refreshes.'
-      : 'Building the station history from Git...'));
-    if (!pageState.entries.length && !loading && !pageState.stale) {
+      ? 'Showing the saved station history while it refreshes.'
+      : 'Building the station history...'));
+    if (pageState.offline) {
+      var away = make('p', 'cl-refreshing', pageState.entries.length
+        ? 'Showing the last history this panel received; the station has not answered yet.'
+        : 'The history will appear when the station answers.');
+      away.title = pageState.offline_reason || '';
+      body.appendChild(away);
+    }
+    if (!pageState.entries.length && !loading && !pageState.stale && !pageState.offline) {
       body.appendChild(make('p', 'cl-empty', 'No committed changes are available.'));
     }
     pageState.entries.forEach(function (entry) { body.appendChild(entryNode(entry)); });
@@ -292,8 +313,12 @@
       pageState.has_more = !!(result && result.has_more);
       pageState.stale = !!(result && result.stale);
       pageState.warming = !!(result && result.warming);
+      pageState.as_of_label = String(result && result.as_of_label || '');
+      pageState.refresh_error = String(result && result.refresh_error || '');
+      pageState.offline = false;
       cursor = String(result && result.next_before || '');
       loading = false;
+      lastGood = Object.assign({}, pageState, {entries: pageState.entries.slice()});
       render();
       if (pageState.stale && !before && !refreshTimer) {
         refreshTimer = root.setTimeout(function () {
@@ -303,11 +328,21 @@
       }
       return result;
     }, function (error) {
+      // [changelog-cache] A missed answer is not an empty history: keep what
+      // this panel last received on screen and ask again shortly.
       loading = false;
-      pageState.has_more = false;
-      if (panel) {
-        var body = panel.querySelector('.cl-body');
-        body.replaceChildren(make('p', 'cl-error', 'Changelog unavailable: ' + String(error && error.message || error)));
+      if (!pageState.entries.length && lastGood) {
+        pageState = Object.assign({}, lastGood, {entries: lastGood.entries.slice()});
+      }
+      pageState.stale = false;
+      pageState.offline = true;
+      pageState.offline_reason = String(error && error.message || error);
+      render();
+      if (!refreshTimer) {
+        refreshTimer = root.setTimeout(function () {
+          refreshTimer = 0;
+          if (panel && !panel.hidden) load('');
+        }, 5000);
       }
       return null;
     });
@@ -352,12 +387,15 @@
     build();
     if (!panel.hidden) { close(); return; }
     panel.hidden = false;
-    pageState = {entries: [], total: 0, has_more: false, stale: false, warming: false};
+    pageState = lastGood
+      ? Object.assign({}, lastGood, {entries: lastGood.entries.slice(), stale: true})
+      : {entries: [], total: 0, has_more: false, stale: false, warming: false};
     cursor = '';
     load('');
     try { if (root.PineSfxTv) root.PineSfxTv.viewChanged(); } catch (err) { /* no video wall */ }
   }
 
-  root.PineChangeLog = {open: open, close: close, isMajor: isMajor, elapsed: elapsed};
+  root.PineChangeLog = {open: open, close: close, isMajor: isMajor, elapsed: elapsed,
+    countLine: countLine};
   if (typeof module !== 'undefined' && module.exports) module.exports = root.PineChangeLog;
 })(typeof window !== 'undefined' ? window : globalThis);

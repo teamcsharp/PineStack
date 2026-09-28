@@ -6943,7 +6943,9 @@
       /* [#1251] sfx_video_mode_state carries the matcher, so the row
          paints off the request the sheet already makes. */
       paintMatch((st && st.match) || null);
-      box.insertBefore(row('Pictures among the SFX guy\'s clips', 0, 100, 1, Number((st && st.dial) || 0),
+      box.insertBefore(row('Pictures among ' + (typeof root.pineCastName === 'function'   /* [cast-names] */
+        ? root.pineCastName('sfx') : typeof root.castName === 'function'
+          ? root.castName('sfx') : 'Sam') + '\'s clips', 0, 100, 1, Number((st && st.dial) || 0),
         function (v) { return v + '% of his clips carry a picture (mp4 vs mp3)'; }, 'share'), note);
       box.insertBefore(row('Clip length the endless set aims for', 0, 60, 1, Number((st && st.length) || 0),
         function (v) { return v ? ('about ' + v + ' seconds (draws between ' + Math.round(v * 0.6) + ' and ' + Math.round(v * 1.6) + ')') : 'any length in the library'; }, 'length'), note);
