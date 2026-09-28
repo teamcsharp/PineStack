@@ -15,6 +15,7 @@
        Both files are built by tools/icons_build.py - do not hand-edit. -->
   <link rel="stylesheet" href="./pineicons.css">
   <link rel="stylesheet" href="./styles.css">
+  <link rel="stylesheet" href="./tech-drawer.css">
   <link rel="stylesheet" href="./pine-vitals.css">
   <link rel="stylesheet" href="./sampler.css">
   <link rel="stylesheet" href="./script.css">
@@ -64,7 +65,7 @@
      rail's mark ring is the only state indicator, and it must not open green
      while the backend is still being reached. -->
 <body class="agent-down">
-  <aside class="rail">
+  <aside id="techRail" class="rail" aria-label="Pine Box Tech controls">
     <div class="brand">
       <button id="panicBtn" class="mark" title="Deploy the newest app.py to the box, then collapse, rebuild and relaunch this app on the newest source (#1044)"><img src="../assets/pinebox.png" alt="Pine Box"></button>
       <div>
@@ -436,6 +437,10 @@
     <div id="wakePopup" class="wake-popup" style="display:none"></div>
     <div id="routeHistory" class="route-history" style="display:none"></div>
   </aside>
+  <div id="techDrawerBackdrop" class="tech-drawer-backdrop" hidden aria-hidden="true"></div>
+  <button id="techDrawerTab" class="tech-drawer-tab" type="button"
+          aria-controls="techRail" aria-expanded="false" aria-label="Open Tech controls"
+          title="Slide out Pine Box Tech controls">TECH</button>
   <style>
     /* Sits with the Pine Box mark, hard right of the brand block, so it
        reads as part of the station's identity rather than as one more
@@ -893,6 +898,7 @@
        whatever is showing. -->
   <script src="./sfx-tv.js"></script>
   <script src="./rail.js"></script>
+  <script src="./tech-drawer.js"></script>
   <!-- 2026-09-14: the hot corners. After rail.js: it adds its own tab to
        the rail when the rail is already up, and rail.js calls it when the
        rail is built later. -->

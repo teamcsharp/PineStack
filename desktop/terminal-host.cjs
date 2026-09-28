@@ -140,8 +140,21 @@ class TerminalHost {
     const tools = this.tools();
     try {
       const list = parseDevices(await runner(tools.adb, 20000)(['devices', '-l'])) || [];
-      const ready = list.find((entry) => entry.authorized);
-      return ready ? ready.serial : '';
+      const saved = String((this.readConfig() || {}).tabletSerial || '');
+      const ready = list.find((entry) => entry.authorized && entry.serial === saved);
+      if (ready) return ready.serial;
+      /* Once a tablet has been selected, losing the local ADB transport
+       * must not make the mirror impossible to open again. */
+      if (/^[^\s:]+:\d+$/.test(saved)) {
+        try {
+          await runner(tools.adb, 6000)(['connect', saved]);
+          const again = parseDevices(await runner(tools.adb, 6000)(['devices', '-l'])) || [];
+          if (again.some((entry) => entry.authorized && entry.serial === saved)) return saved;
+        } catch (error) { /* let the caller consult the station's current address */ }
+        return '';
+      }
+      const other = list.find((entry) => entry.authorized);
+      return other ? other.serial : '';
     } catch (error) {
       return '';
     }

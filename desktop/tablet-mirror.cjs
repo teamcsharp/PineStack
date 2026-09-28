@@ -33,7 +33,7 @@
 'use strict';
 
 const http = require('node:http');
-const { spawn } = require('node:child_process');
+const { spawn, execFile } = require('node:child_process');
 
 /* JPEG frame boundaries. The MJPEG that comes out of ffmpeg is just these
  * concatenated, so the split is a scan for the markers rather than anything
@@ -70,6 +70,7 @@ const DEFAULTS = { size: 'half', fps: 15 };
 const FIRST_FRAME_TIMEOUT_MS = 12000;
 const STALLED_FRAME_TIMEOUT_MS = 5000;
 const WATCH_EVERY_MS = 1000;
+const ADB_CONNECT_TIMEOUT_MS = 6000;
 
 /* THE CAMERA'S KNOWN DOOR.
  *
@@ -80,10 +81,11 @@ const WATCH_EVERY_MS = 1000;
 const KNOWN_CAMERA_PORT = 8791;
 
 class Mirror {
-  constructor({ adb, serial, ffmpeg } = {}) {
+  constructor({ adb, serial, ffmpeg, execFile: runFile } = {}) {
     this.adb = adb || 'adb';
     this.serial = serial || '';
     this.ffmpeg = ffmpeg || 'ffmpeg';
+    this.execFile = runFile || execFile;
     this.shape = Object.assign({}, DEFAULTS);
     /* The tablet's real screen, filled in by measure() on the first open. */
     this.real = Object.assign({}, ASSUMED);
@@ -110,6 +112,8 @@ class Mirror {
     this.watchdog = null;
     this.failedStarts = 0;
     this.lastRestartReason = '';
+    this.connecting = false;
+    this.epoch = 0;
   }
 
   target(args) {
@@ -313,10 +317,44 @@ class Mirror {
 
   /* ----------------------------------------------------------- the pipe */
 
-  pipe() {
+  /* A wireless ADB transport can disappear while the tablet and its TCP
+   * port remain healthy. Spawning `adb -s ... exec-out` does not reconnect
+   * it; it exits immediately with "device not found" forever. */
+  connect() {
+    if (!/^[^\s:]+:\d+$/.test(this.serial)) return Promise.resolve();
+    return new Promise((resolve, reject) => {
+      this.execFile(this.adb, ['connect', this.serial],
+        { timeout: ADB_CONNECT_TIMEOUT_MS, windowsHide: true },
+        (error, stdout, stderr) => {
+          const answer = (String(stdout || '') + String(stderr || '')).trim();
+          if (error || !/\b(?:already )?connected to\b/i.test(answer)
+              || /failed|refused|unable|offline|unauthorized/i.test(answer)) {
+            reject(new Error(answer || (error && error.message) || 'adb connect failed'));
+          } else resolve();
+        });
+    });
+  }
+
+  async pipe() {
     if (!this.running) return;
-    this.pipeAt = Date.now();
+    const epoch = ++this.epoch;
+    this.connecting = true;
+    this.pipeAt = 0;
     this.pipeFrames = this.frames;
+    try {
+      await this.connect();
+    } catch (error) {
+      if (this.running && epoch === this.epoch) {
+        this.connecting = false;
+        this.lastError = 'tablet ADB reconnect: ' + error.message;
+        this.rebuild(this.lastError);
+      }
+      return;
+    }
+    if (!this.running || epoch !== this.epoch) return;
+    this.connecting = false;
+    this.pipeAt = Date.now();
+    this.lastError = '';
     const { width, height, bitrate } = this.shapeFor(this.shape.size);
     const fps = this.shape.fps;
 
@@ -367,13 +405,23 @@ class Mirror {
 
     /* Whichever end dies, both are replaced - a half-built pipe produces no
      * pictures and holds a process open. */
-    this.record.on('exit', () => this.rebuild('tablet encoder ended'));
-    this.convert.on('exit', () => this.rebuild('desktop decoder ended'));
+    this.record.on('exit', (code, signal) => {
+      if (epoch === this.epoch) this.rebuild('tablet encoder ended'
+        + (code !== null ? ' (exit ' + code + ')' : signal ? ' (' + signal + ')' : '')
+        + (this.lastError ? ': ' + this.lastError : ''));
+    });
+    this.convert.on('exit', (code, signal) => {
+      if (epoch === this.epoch) this.rebuild('desktop decoder ended'
+        + (code !== null ? ' (exit ' + code + ')' : signal ? ' (' + signal + ')' : '')
+        + (this.lastError ? ': ' + this.lastError : ''));
+    });
     this.record.on('error', (error) => {
+      if (epoch !== this.epoch) return;
       this.lastError = error.message;
       this.rebuild('tablet encoder error');
     });
     this.convert.on('error', (error) => {
+      if (epoch !== this.epoch) return;
       this.lastError = error.message;
       this.rebuild('desktop decoder error');
     });
@@ -449,6 +497,9 @@ class Mirror {
   }
 
   kill() {
+    this.epoch += 1;
+    this.connecting = false;
+    this.pipeAt = 0;
     for (const child of [this.record, this.convert]) {
       if (!child) continue;
       try { child.stdout && child.stdout.removeAllListeners(); } catch (error) { /* gone */ }
@@ -488,6 +539,7 @@ class Mirror {
       watchers: this.watchers.size,
       restarts: this.restarts,
       rebuilding: this.rebuilding,
+      connecting: this.connecting,
       restartReason: this.lastRestartReason,
       sinceFrameMs: still,
       size: this.shape.size,

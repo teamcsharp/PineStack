@@ -1,0 +1,101 @@
+/* The desktop's existing Tech rail can be reached over every full-screen
+   view. Its controls stay in their original DOM, with their original state. */
+body {
+  --tech-drawer-width: min(360px, calc(100vw - 42px));
+}
+
+.tech-drawer-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 2147483050;
+  background: rgba(3, 8, 12, .56);
+}
+
+.tech-drawer-tab {
+  position: fixed;
+  z-index: 2147483150;
+  top: 50%;
+  left: 0;
+  transform: translateY(-50%);
+  width: 30px;
+  height: 108px;
+  padding: 9px 6px;
+  border: 1px solid #477386;
+  border-left: 0;
+  border-radius: 0 9px 9px 0;
+  background: #1c303b;
+  color: #bce8ef;
+  font: 700 10px/1 Inter, Segoe UI, system-ui, sans-serif;
+  letter-spacing: .08em;
+  writing-mode: vertical-rl;
+  text-orientation: mixed;
+  box-shadow: 3px 0 14px rgba(0, 0, 0, .4);
+  transition: left .24s ease, background .24s ease;
+}
+.tech-drawer-tab:hover,
+.tech-drawer-tab:focus-visible { background: #285165; border-color: #65c7da; }
+body.tech-drawer-open .tech-drawer-tab {
+  left: var(--tech-drawer-width);
+  background: #285165;
+}
+
+/* A full-screen view covers the ordinary grid rail. Park that same rail
+   just outside the left edge until the handle asks for it. */
+body:has(> .pine-view-host.open) .rail,
+body.tech-drawer-open .rail {
+  position: fixed;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  z-index: 2147483100;
+  width: var(--tech-drawer-width);
+  max-width: none;
+  padding: 18px 14px;
+  transform: translateX(-105%);
+  transition: transform .24s ease;
+  box-shadow: 18px 0 48px rgba(0, 0, 0, .48);
+}
+body.tech-drawer-open:has(> .pine-view-host.open) .rail,
+body.tech-drawer-open .rail { transform: translateX(0); }
+body.immersive.tech-drawer-open .rail { display: flex; }
+
+/* A narrow window normally compresses the permanent rail to icons. The
+   slide-out is wide enough for the full settings, so restore those labels. */
+body.tech-drawer-open.rail-compact .brand { justify-content: flex-start; }
+body.tech-drawer-open.rail-compact .brand > div,
+body.tech-drawer-open.rail-compact .route-panel > label:not(.fm-row),
+body.tech-drawer-open.rail-compact .route-panel p { display: block; }
+body.tech-drawer-open.rail-compact .volume-row,
+body.tech-drawer-open.rail-compact .monitor-row { display: flex; }
+body.tech-drawer-open.rail-compact .fm-row {
+  grid-template-columns: 1fr auto auto;
+  justify-content: stretch;
+}
+body.tech-drawer-open.rail-compact .fm-row span,
+body.tech-drawer-open.rail-compact .tab span,
+body.tech-drawer-open.rail-compact .threejs-list button span { display: inline; }
+body.tech-drawer-open.rail-compact .tab {
+  grid-template-columns: 28px 1fr;
+  text-align: left;
+  padding: 0 12px;
+}
+body.tech-drawer-open.rail-compact .rail-actions {
+  grid-template-columns: auto 1fr 1fr;
+}
+body.tech-drawer-open.rail-compact .stream-routes { display: grid; }
+body.tech-drawer-open.rail-narrow .desktop-radio { display: block; }
+body.tech-drawer-open.rail-compact .threejs-list { padding-left: 10px; }
+body.tech-drawer-open.rail-compact .threejs-list button {
+  text-align: left;
+  padding: 0 8px;
+}
+
+/* The Station sheet is launched from a Tech control and must appear above
+   the full-screen view and the Tech drawer itself. */
+.station-drawer.open { z-index: 2147483200; }
+
+@media (prefers-reduced-motion: reduce) {
+  .tech-drawer-tab,
+  body:has(> .pine-view-host.open) .rail,
+  body.tech-drawer-open .rail { transition: none; }
+}

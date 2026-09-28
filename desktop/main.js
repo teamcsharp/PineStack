@@ -1,5 +1,5 @@
 const { app, BrowserWindow, ipcMain, session, shell } = require("electron");
-const { spawn } = require("node:child_process");
+const { spawn, execFile } = require("node:child_process");
 const fs = require("node:fs");
 const path = require("node:path");
 const { LcdAgent, deviceRequest } = require("./lcd-agent.cjs");
@@ -1706,8 +1706,35 @@ async function openTabletMirror(options) {
   }
 
   const tools = terminalHost.tools();
-  const serial = await terminalHost.glassSerial();
+  let serial = await terminalHost.glassSerial();
+  if (!serial) {
+    /* On a first run there may be no remembered serial yet. The station's
+     * tablet doctor already knows the current LAN address; use that same
+     * source to restore the ADB transport without a manual tools detour. */
+    try {
+      const look = await fetchJson(readConfig().baseUrl + "/api/tablet/look",
+        { signal: AbortSignal.timeout(4000) });
+      if (/^(?:\d{1,3}\.){3}\d{1,3}$/.test(String(look.host || ""))) {
+        const candidate = look.host + ':5555';
+        const attached = await new Promise((resolve) => execFile(tools.adb,
+          ['connect', candidate], { timeout: 6000, windowsHide: true },
+          (error, stdout, stderr) => resolve(!error
+            && /\b(?:already )?connected to\b/i.test(
+              String(stdout || '') + String(stderr || '')))));
+        if (attached) {
+          /* Replace a stale remembered IP before glassSerial checks it. */
+          if (readConfig().tabletSerial !== candidate) writeConfig({ tabletSerial: candidate });
+          serial = await terminalHost.glassSerial();
+        }
+      }
+    } catch (error) { /* the regular unreachable answer below is enough */ }
+  }
   if (!serial) return { ok: false, why: "no tablet is reachable over adb" };
+  /* Remember the selected wireless transport so the next open can restore
+   * it after adb loses its local device list. */
+  if (/^[^\s:]+:\d+$/.test(serial) && readConfig().tabletSerial !== serial) {
+    writeConfig({ tabletSerial: serial });
+  }
 
   /* WHAT THE TABLET WAS DRAWING BEFORE THIS OPENED, so the panel can say
    * what watching costs rather than only what the tablet costs. Taken
