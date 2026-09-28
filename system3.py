@@ -478,9 +478,10 @@ def validate_table(table):
     if family == "MEMORY":                                   # [s3-memory] kinds with rules, how many a round
         return _validate_memory_table(table, tid)
     if family not in ("CTS", "ES", "RS", "IRS", "FL", "TEMPER", "SHOCK", "INTERJECT", "FAV", "DIRECTIVE", "EVENT",
-                      "CHANCE", "POOL", "SPEAKERBOX", "RESOLVE", "WRAP", "IL"):             # [s3-sb-end] SBEND1
+                      "CHANCE", "POOL", "SPEAKERBOX", "RESOLVE", "WRAP", "IL",
+                      "TRACK_TALK", "ANGLE"):     # [s3-live-event] event-row families
         raise ValueError("table family must be one of CTS, ES, RS, IRS, FL, TEMPER, SHOCK, INTERJECT, FAV, DIRECTIVE, "
-                         "EVENT, CHANCE, POOL, SPEAKERBOX, RESOLVE, WRAP, IL")
+                         "EVENT, CHANCE, POOL, SPEAKERBOX, RESOLVE, WRAP, IL, TRACK_TALK, ANGLE")
     pool = family in system3_tables.POOL_FAMILIES          # [s3-cast] may stand empty
     cats = table.get("categories")
     if not isinstance(cats, list) or (not cats and family not in ("CHANCE", "POOL")):   # [s3-dice-door] filled as the station rolls
@@ -790,6 +791,8 @@ def _spec(table, cat, item):
     spec["table"], spec["category"] = table["id"], cat["id"]
     spec["category_label"] = cat.get("label") or cat["id"]
     spec["family"] = table["family"]
+    if table.get("event"):                                   # [s3-live-event]
+        spec["event"] = str(table["event"])
     spec.setdefault("label", item.get("id"))
     spec.setdefault("text", str(spec.get("label") or "").lower())
     return spec
@@ -1071,6 +1074,8 @@ def weighted_decision(conv, config, ctx, stream, family, tables=None, closes=Fal
     selected = {"table": table["id"], "category": cat["id"], "category_label": cat["label"],
                 "id": spec["id"], "label": spec["label"], "text": spec.get("text", ""),
                 "index": k + 1, "of": len(cat["items"])}
+    if spec.get("event"):                                    # [s3-live-event]
+        selected["event"] = str(spec["event"])
     meta = {}
     if category:
         meta = {"authority": "category", "why": "the node is pinned to %s in the segment editor: "
@@ -1758,6 +1763,8 @@ def _cts(conv, config, ctx, stream, turn, idx):
     dec = {"family": "CTS", "event_id": ev["event_id"], "table": spec["table"], "category": spec["category"],
            "item": spec["id"], "label": spec["label"], "text": spec.get("text", ""),
            "resolver": spec.get("resolver", "direction"), "topic_change": True}
+    if spec.get("event"):                                    # [s3-live-event]
+        dec["event"] = str(spec["event"])
     turn["decisions"].append(dec)
     _material_mark(ev, spec, conv["inputs"])                                  # [s3-material]
     turn["directions"].append({"family": "CTS", "text": _direction_text(spec, conv["inputs"]), "label": spec["label"]})
@@ -2106,6 +2113,33 @@ def _round_rolls(conv, config, settings, inputs, want, banter=True):
                    "turn_index": slots[sp], "record": meta["record"]}
             meta["turn_index"] = slots[sp]
             conv["track_talk_plan"] = {"turn_index": slots[sp], "record": meta["record"], "done": False}
+            # [s3-live-event] while the record on air IS a station event's
+            # live set, the comment's direction is one of the event's own
+            # rows, drawn on its own stream - the die above is untouched.
+            _ev_id = str(inputs.get("record_event") or "")
+            _erows = ([(t, c, i) for t in _tables_for(config, "TRACK_TALK")
+                       if str(t.get("event") or "") == _ev_id
+                       for c in t.get("categories") or [] if isinstance(c, dict) and c.get("enabled") is not False
+                       for i in c.get("items") or [] if isinstance(i, dict) and i.get("enabled") is not False
+                       and str(i.get("text") or "").strip() and float(i.get("weight", 1.0) or 0) > 0]
+                      if _ev_id else [])
+            if _erows:
+                _estream = DrawStream(str(conv["seed"]) + "|round:TRACK_TALK:event")
+                _ed = _estream.next("TRACK_TALK:event")
+                _ecands = [{"id": "%s:%s" % (c["id"], i.get("id")), "label": str(i.get("label") or i.get("id")),
+                            "base": float(i.get("weight", 1.0) or 0),
+                            "weight": float(i.get("weight", 1.0) or 0) * float(c.get("weight", 1.0) or 0),
+                            "why": []} for (t, c, i) in _erows]
+                _ek = pick_index([r["weight"] for r in _ecands], _ed["u"])
+                if _ek >= 0:
+                    _et, _ec, _ei = _erows[_ek]
+                    stages.append(_stage("event-row", _ecands, _ek, _ed))
+                    conv["track_talk_plan"]["record"] = dict(
+                        meta["record"], event=_ev_id, table=str(_et["id"]), category=str(_ec["id"]),
+                        item=str(_ei.get("id")), direction=str(_ei.get("text") or "")[:400])
+                    meta["event"] = _ev_id
+                    sel["event"] = _ev_id
+                    sel["label"] += " - about the live set (%s)" % _et["id"]
         ev = _event(conv, ctx0, "TRACK_TALK", stages, sel, before, meta=meta, rng=d1)
         ev["state_after"] = before
         if conv.get("track_talk_plan"):
@@ -2490,6 +2524,8 @@ def _event_rolls(conv, config, settings, inputs, road, slots, allow_end=True):
             before = _snapshot(conv, conv["cursor"].get("initiator"))
             meta = {"table": table["id"], "kind": cat["id"], "odds": odds, "seat": cat.get("seat", "any"),
                     "place": cat.get("place", "middle"), "ends": bool(cat.get("ends"))}
+            if table.get("event"):                            # [s3-live-event]
+                meta["event"] = str(table["event"])
             missing = [n for n in (cat.get("requires") or []) if not avail.get(n)]
             why = ("no %s material on this road" % missing[0] if missing
                    else "the segment already holds %d happening(s)" % landed if cap and landed >= cap
@@ -2529,6 +2565,7 @@ def _event_rolls(conv, config, settings, inputs, road, slots, allow_end=True):
                     item = items[k]
                     at, seat, _place = ok[j]
                     plan = {"table": table["id"], "kind": cat["id"], "kind_label": str(cat.get("label") or cat["id"]),
+                            "event": str(table.get("event") or ""),      # [s3-live-event]
                             "id": str(item.get("id")), "label": str(item.get("label") or item.get("id")),
                             "text": _legs_words(item.get("text"), inputs)[:400],
                             "after": _legs_words(item.get("after") or cat.get("after") or "", inputs)[:300],
@@ -2570,8 +2607,10 @@ def _events_attach(conv):
         if not t:
             continue
         t.setdefault("events", []).append({k: plan.get(k) for k in ("table", "kind", "kind_label", "id", "label",
-                                                                    "text", "ends", "event_id")})
+                                                                    "text", "ends", "event_id",
+                                                                    "event")})   # [s3-live-event]
         t["decisions"].append({"family": "EVENT", "event_id": plan.get("event_id", ""), "item": plan.get("id"),
+                               "table": plan.get("table"), "event": plan.get("event", ""),   # [s3-live-event]
                                "label": "%s - %s" % (plan.get("kind_label"), plan.get("label"))})
         ev = events.get(plan.get("event_id"))
         if ev:
@@ -2861,6 +2900,7 @@ def memory_rolls(conv, config, settings=None, inputs=None):
     A re-plan keeps what was rolled. Returns conv["memory"], or None when
     nothing was rolled (not opted in, no MEMORY table)."""
     inputs = inputs if inputs is not None else conv["inputs"]
+    config = event_view(config, inputs)                          # [s3-live-event]
     if not inputs.get("memory_rolls"):
         return None
     if isinstance(conv.get("memory"), dict):
@@ -3103,6 +3143,11 @@ def decide_blocks(names, config, seed, conv=None, tint_on=False, dial=None, at=N
             elif kind == "tint":
                 rec.update(keep=bool(tint_on), why=("the crystal tint pass is on" if tint_on
                                                    else "only while a crystal is on and the tint pass is wanted"))
+            elif kind == "claimed":                              # [s3-live-event]
+                _claims = event_claims(conv) if isinstance(conv, dict) else []
+                rec.update(keep=bool(_claims),
+                           why=("claimed by " + ", ".join(_claims[:4]) if _claims
+                                else "no roll in this round landed on a station event's row - never sent"))
             elif kind == "roll":
                 odds = rule.get("odds", 1.0)
                 src = str(rule.get("odds_from") or "")
@@ -3138,6 +3183,7 @@ def plan_graph(conv, config, graph_raw, until=None, inputs=None, road="banter"):
     if not graph["nodes"]:
         raise ValueError("the conversation graph has no nodes")
     inputs = inputs if inputs is not None else conv["inputs"]
+    config = event_view(config, inputs)                          # [s3-live-event]
     by_id = {node["id"]: node for node in graph["nodes"]}
     stream = DrawStream(conv["seed"], conv.get("draws", 0))
     want = int(until or conv["timing"]["turn_budget"])
@@ -3479,6 +3525,7 @@ def plan_more(conv, config, until=None, inputs=None):
     Frame -> hand the initiator role on. The last turn draws a closing
     move. Resumable: Mode B truncates and calls this again."""
     inputs = inputs if inputs is not None else conv["inputs"]
+    config = event_view(config, inputs)                          # [s3-live-event]
     if (config.get("structure") or {}).get("graph", {}).get("enabled") and (config.get("structure") or {}).get("graph", {}).get("nodes"):
         return plan_graph(conv, config, config["structure"]["graph"], until=until,
                           inputs=inputs, road="banter")
@@ -3561,6 +3608,7 @@ def plan_protocol(conv, config, rows, inputs=None):
     act only to the turns the protocol leaves open, never touching a leg
     call_flow_report checks. `rows` are (number, seat, work)."""
     inputs = inputs if inputs is not None else conv["inputs"]
+    config = event_view(config, inputs)                          # [s3-live-event]
     stream = DrawStream(conv["seed"], conv.get("draws", 0))
     want = len(rows)
     # [rng-topics] a call keeps its legs: only a turn the protocol leaves
@@ -3687,6 +3735,8 @@ def _callend_spec(table, cat, item):
     spec["table"], spec["category"] = table["id"], cat["id"]
     spec["category_label"] = cat.get("label") or cat["id"]
     spec["family"] = table["family"]
+    if table.get("event"):                                   # [s3-live-event]
+        spec["event"] = str(table["event"])
     spec["id"] = str(item.get("id"))
     spec["label"] = str(item.get("label") or item.get("id"))
     spec["needs"] = sorted({str(x) for x in list(cat.get("requires") or []) + list(item.get("requires") or [])})
@@ -4375,6 +4425,7 @@ def plan_call(conv, config, inputs=None):
     before it), then the closing legs - every leg a turn with its own rolls.
     The TOPIC roll may raise something off the board on a middle leg."""
     inputs = inputs if inputs is not None else conv["inputs"]
+    config = event_view(config, inputs)                          # [s3-live-event]
     call = inputs.get("call") or {}
     st = road_structure(config, "caller") or {}
     legs = [dict(x) for x in st.get("legs") or [] if isinstance(x, dict)]
@@ -4560,6 +4611,7 @@ def plan_legs(conv, config, inputs=None, road=None, structure=None):
     The road's subject stays the road's (CTS OBLIGATED at turn 0). A road
     with no legs structure falls back to the banter cycle."""
     inputs = inputs if inputs is not None else conv["inputs"]
+    config = event_view(config, inputs)                          # [s3-live-event]
     road = road or conv["identity"]["road_kind"]
     if isinstance(structure, dict) and structure.get("legs"):
         st, _variant = structure, None   # [nodeplan] elected by the caller: one VARIANT draw, not two
@@ -4705,6 +4757,7 @@ def plan_line(conv, config, inputs=None):
     them with every candidate and its weight recorded. That draw is the
     Rolodex where the station used to call random.choice()."""
     inputs = inputs if inputs is not None else conv["inputs"]
+    config = event_view(config, inputs)                          # [s3-live-event]
     road = conv["identity"]["road_kind"]
     st = road_structure(config, road) or {}
     legs = [dict(x) for x in st.get("legs") or [] if isinstance(x, dict)] or [
@@ -4923,10 +4976,17 @@ def _round_adds(turn, prev_name):
                 % (str(turn.get("name") or turn.get("speaker") or "").upper(), str(d.get("text") or "").strip().rstrip(".")))
     if turn.get("track_talk"):
         record = turn["track_talk"]
-        add += (". Briefly connects the thought just exchanged to the record playing underneath, %s by %s. "
-                "This is one passing moment inside the conversation, not a separate introduction or send-off" %
-                (json.dumps(str(record.get("title") or "the record")),
-                 json.dumps(str(record.get("artist") or "the artist"))))
+        if record.get("direction"):                                   # [s3-live-event]
+            add += (". Briefly connects the thought just exchanged to what is playing underneath - not a "
+                    "record but %s, LIVE: %s. One passing moment inside the conversation; never invent a "
+                    "title or an artist for a live set" %
+                    (json.dumps(str(record.get("title") or "the live set")),
+                     str(record["direction"]).strip().rstrip(".")))
+        else:
+            add += (". Briefly connects the thought just exchanged to the record playing underneath, %s by %s. "
+                    "This is one passing moment inside the conversation, not a separate introduction or send-off" %
+                    (json.dumps(str(record.get("title") or "the record")),
+                     json.dumps(str(record.get("artist") or "the artist"))))
     return add
 
 
@@ -6551,6 +6611,7 @@ def replan(conv, config, from_index, until=None):
     from the state the written turns actually left behind. The RNG stream
     carries on (it is never rewound), so the new draws are new and
     recorded; decision replay re-applies the same observations."""
+    config = event_view(config, conv.get("inputs") or {})        # [s3-live-event]
     if from_index >= len(conv["turns"]):
         return conv
     anchor = conv["turns"][from_index]
@@ -6656,3 +6717,78 @@ def summary(conv):
             "system2_slot_id": conv["identity"]["system2_slot_id"],
             "generation_mode": conv.get("generation_mode"),
             "gate": gate_counts(conv)}                                           # [s3-turnchain]
+
+
+# --- [s3-live-event] THE EVENT VIEW -----------------------------------------------
+#
+# A station event (MX Live) is a register entry the runtime keeps in
+# config["events"]; its rows are ordinary table rows tagged "event". The
+# planners see the config through event_view: while the event is off (or on a
+# banked round, or the category's stage does not match) the tagged rows are
+# taken out BEFORE any weight is computed, so no draw moves. inputs["events"]
+# is {"<id>": {"stage": upcoming|live|fallback|after, ...}}, decided by the
+# runtime at plan time and stored on the conversation's inputs - replay sees
+# the same view the plan did.
+
+
+def event_view(config, inputs):
+    """The config as this plan may see it. The same object back when nothing
+    is tagged (the common case costs one scan and no copy)."""
+    tables = (config.get("tables") or []) if isinstance(config, dict) else []
+    if not any(isinstance(t, dict) and t.get("event") for t in tables):
+        return config
+    events = (inputs or {}).get("events") or {}
+    banked = bool((inputs or {}).get("bank"))
+    out = []
+    changed = False
+    for t in tables:
+        eid = t.get("event") if isinstance(t, dict) else None
+        if not eid:
+            out.append(t)
+            continue
+        ev = events.get(str(eid)) if isinstance(events, dict) else None
+        stage = str((ev or {}).get("stage") or "")
+        if not stage or (banked and not t.get("event_banked")):
+            changed = True
+            continue
+        cats, cut = [], False
+        for c in t.get("categories") or []:
+            stages = [str(s) for s in ((c or {}).get("event_stages") or [])]
+            if stages and stage not in stages:
+                cut = True
+                continue
+            cats.append(c)
+        if not cats:
+            changed = True
+            continue
+        if cut:
+            t = dict(t)
+            t["categories"] = cats
+            changed = True
+        out.append(t)
+    if not changed:
+        return config
+    view = dict(config)
+    view["tables"] = out
+    return view
+
+
+def event_claims(conv):
+    """The event rows this round's rolls landed on, as "table:item" - what
+    claims the event_facts block (decide_blocks kind "claimed")."""
+    out = []
+
+    def _add(tag, tid, item):
+        if tag:
+            key = "%s:%s" % (tid, item)
+            if key not in out:
+                out.append(key)
+
+    for p in conv.get("event_plans") or []:
+        _add(p.get("event"), p.get("table"), p.get("id"))
+    for t in conv.get("turns") or []:
+        for d in t.get("decisions") or []:
+            _add(d.get("event"), d.get("table"), d.get("item"))
+        tt = t.get("track_talk") or {}
+        _add(tt.get("event"), tt.get("table"), tt.get("item"))
+    return out

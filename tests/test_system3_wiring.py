@@ -249,7 +249,9 @@ class WiringTests(unittest.TestCase):
         import re
         import system3_tables
         marked = set(re.findall(r"""_pb\(\s*['"]([a-z_]+)['"]""", text)) | {"persona", "cohost", "third"}
-        self.assertEqual(sorted(n for n in marked if n not in system3_tables.DEFAULT_BLOCKS), [],
+        registry = dict(system3_tables.DEFAULT_BLOCKS)
+        registry.update(system3_tables.EVENT_BLOCKS)   # [s3-live-event] event blocks are claimed nodes too
+        self.assertEqual(sorted(n for n in marked if n not in registry), [],
                          "every block the station marks has a node (else it is stripped as a wedge)")
         src = (ROOT / "frontend" / "system3.js").read_text(encoding="utf-8")
         for marker in ("function promptBlocksBox(request, userText)", "section('blocks',",

@@ -1,0 +1,26 @@
+[Unit]
+Description=PineLive host - the live input (K.O. II / network sender), held on the host for MX Live
+After=sound.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# root, like pinelink.service: the capture must open /dev/snd whatever group
+# holds it (PipeWire may), and data/pinelive/ is written by the container as
+# root - the host side must be able to write beside it (host_state.json, the
+# safety master). It binds 127.0.0.1:18095 (the station's door) and the
+# LAN/tailnet ingest on 8095, nothing else.
+User=root
+WorkingDirectory=/home/ehm_eckx/pinevoice-stack/spark-agent
+ExecStart=/usr/bin/python3 tools/pinelive_host.py
+StandardOutput=append:/home/ehm_eckx/pinelive-host.log
+StandardError=append:/home/ehm_eckx/pinelive-host.log
+# The instrument is unplugged, replugged, switched off mid-set; the ingest
+# sender walks out of Wi-Fi range. None of that is a failure of this
+# process, and a real fault (the door would not bind: exit 2) should retry
+# quietly until the operator looks.
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

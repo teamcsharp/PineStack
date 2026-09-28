@@ -816,6 +816,45 @@ def _split_program(bed: np.ndarray, voice: np.ndarray | None,
     return out.astype("<i2").tobytes()
 
 
+def _live_bed(raw: bytes, src: Any, talking: bool,
+              level: float) -> tuple[np.ndarray, float]:
+    """[pinelive] One frame of the live input as the programme bed.
+
+    Kept STEREO (it is a known two-channel source; the centring exists for
+    legacy one-sided files), trimmed by the operator's gain, and ducked
+    under a line or a sting with its own depth and attack/release, ramped
+    per sample across the frame so the dip never clicks. `level` is the
+    duck carried from the last frame (0 = up, 1 = fully ducked); the new
+    one is returned and published on the source as `duck_now`."""
+    values = _pcm(raw)
+    try:
+        gain = float(getattr(src, "gain", 1.0))
+        depth = float(getattr(src, "duck_gain", MUSIC_DUCK / MUSIC_LEVEL))
+        attack = float(getattr(src, "duck_attack_ms", DUCK_RAMP_MS))
+        release = float(getattr(src, "duck_release_ms", DUCK_RAMP_MS))
+    except Exception:  # noqa: BLE001
+        gain, depth = 1.0, MUSIC_DUCK / MUSIC_LEVEL
+        attack = release = float(DUCK_RAMP_MS)
+    depth = min(1.0, max(0.0, depth))
+    target = 1.0 if talking else 0.0
+    if target > level:
+        new = min(target, level + FRAME_MS / max(1.0, attack))
+    else:
+        new = max(target, level - FRAME_MS / max(1.0, release))
+    g0 = gain * (1.0 + (depth - 1.0) * level)
+    g1 = gain * (1.0 + (depth - 1.0) * new)
+    n = values.size // CHANNELS
+    ramp = np.repeat(np.linspace(g0, g1, n, endpoint=False), CHANNELS)
+    bed = values[:n * CHANNELS] * ramp
+    if bed.size < FRAME_SAMPLES * CHANNELS:
+        bed = np.concatenate([bed, np.zeros(FRAME_SAMPLES * CHANNELS - bed.size)])
+    try:
+        src.duck_now = new
+    except Exception:  # noqa: BLE001
+        pass
+    return bed, new
+
+
 class _Voice:
     """A DJ clip waiting for, or sitting on, its air moment."""
 
@@ -1871,6 +1910,8 @@ class StationStream:
         }
         self._aired: "deque[str]" = deque(maxlen=512)
         self._aired_set: set[str] = set()
+        # [pinelive] the recorder's taps: fn(frame, live, info) per frame.
+        self._taps: list[Callable[..., Any]] = []
 
     # -- listeners ---------------------------------------------------------
     @property
@@ -2552,6 +2593,22 @@ class StationStream:
             self._last_listener_at = time.time()
         sink.close()
 
+    # -- [pinelive] the recorder's tap ------------------------------------
+    def add_tap(self, fn: Callable[..., Any]) -> None:
+        """Hear every frame the mixer makes, on or off air, as
+        fn(frame_bytes, live_bytes_or_None, info). Called on the mixer
+        thread: it must only hand the bytes on, never block. A mixer with
+        a tap never lingers out."""
+        with self._lock:
+            if fn not in self._taps:
+                self._taps.append(fn)
+        self.ensure_running()
+
+    def remove_tap(self, fn: Callable[..., Any]) -> None:
+        with self._lock:
+            if fn in self._taps:
+                self._taps.remove(fn)
+
     # -- the engine --------------------------------------------------------
     def ensure_running(self) -> None:
         with self._lock:
@@ -2572,6 +2629,7 @@ class StationStream:
         pending: list[_Voice] = []
         airing: _Voice | None = None
         duck = 0.0                      # 0 = bed up, 1 = fully ducked
+        lduck = 0.0                     # [pinelive] the live set's own duck
         duck_step = FRAME_MS / max(1.0, DUCK_RAMP_MS)
 
         self.stats["started_at"] = time.time()
@@ -2590,7 +2648,8 @@ class StationStream:
                 if (not self.listeners
                         and now - self._last_listener_at > LINGER_SECONDS
                         and self._last_listener_at
-                        and not self._any_warm()):
+                        and not self._any_warm()
+                        and not self._taps):            # [pinelive]
                     break
 
                 # An encoder nobody is listening at is a lame process for
@@ -2703,6 +2762,14 @@ class StationStream:
 
                 paused = bool(state.get("paused"))
                 on_air = bool(state.get("on", True)) and not paused
+                # [pinelive] MX Live: the input, when the host hands it over,
+                # and whether it has the air. While it has, the record is
+                # closed rather than left decoding underneath the set.
+                live_src = state.get("live")
+                live_on = bool(live_src is not None and state.get("live_on_air"))
+                if live_on and music is not None:
+                    music.close()
+                    music, music_id = None, ""
                 # #1253: DO NOT OUTRUN THE DECODERS.
                 #
                 # Catch-up after a stall is only free when the audio is
@@ -2755,6 +2822,16 @@ class StationStream:
                                if now - v.air_at <= CLIP_GRACE_SECONDS
                                or not self._forget(v)]
 
+                # [pinelive] read the input EVERY frame it is there - arming
+                # and fallback included - so it keeps flowing into the
+                # recorder whether or not it has the air.
+                live_raw = None
+                if live_src is not None:
+                    try:
+                        live_raw, _live_ok = live_src.read_frame()
+                    except Exception as exc:  # noqa: BLE001
+                        live_raw = None
+                        self.stats["last_error"] = f"live: {exc}"
                 # -- assemble ----------------------------------------------
                 made_sound = False
                 # #1473: what a split lane needs to re-mix this frame.
@@ -2809,6 +2886,12 @@ class StationStream:
                     # Preserve the existing ducking curve, then apply the
                     # listener's own controls to the centred stereo buses.
                     bed = bed * (bed_gain / max(MUSIC_LEVEL, 0.0001))
+                    # [pinelive] the set IS the bed while it has the air,
+                    # ducked under every line and sting like a record.
+                    if live_on and live_raw is not None:
+                        bed, lduck = _live_bed(live_raw, live_src,
+                                               voice_pcm is not None, lduck)
+                        made_sound = True
                     frame = _mixed_program(bed, voice_pcm,
                                            bool(airing is not None and airing.sfx))
 
@@ -2824,6 +2907,16 @@ class StationStream:
                 # no record open yet, simply does not go in the bank.
                 if made_sound:
                     self._pcm_burst.append(frame)
+                # [pinelive] the recorder's tap: every frame, on air or
+                # off, with the input frame that went into it.
+                if self._taps:
+                    _tap_info = {"on_air": on_air, "live_on": live_on,
+                                 "made_sound": made_sound, "t": now}
+                    for _tap in list(self._taps):
+                        try:
+                            _tap(frame, live_raw, _tap_info)
+                        except Exception as exc:  # noqa: BLE001
+                            self.stats["last_error"] = f"tap: {exc}"
                 with self._lock:
                     encoders = list(self._encoders.values())
                     hlses = list(self._hls.values())
@@ -2958,6 +3051,7 @@ class StationStream:
             "listener_rows": self.listener_rows(),
             "recent_sessions": list(self.sessions)[-12:],
             "join_burst_s": JOIN_BURST_SECONDS,
+            "taps": len(self._taps),                    # [pinelive]
             "title": self.now_title,
             "artist": self.now_artist,
             "up_seconds": round(up, 1),

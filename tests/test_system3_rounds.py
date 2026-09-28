@@ -359,8 +359,10 @@ class RuntimeCarryTests(unittest.TestCase):
         rt.load()
         ids = [t["id"] for t in rt.config["tables"]]
         added = [t["id"] for t in system3_tables.default_tables() if t["family"] not in ("CTS", "ES", "RS", "IRS", "FL")]
+        added = added + [t["id"] for t in system3_tables.default_event_tables()]   # [s3-live-event]
         self.assertEqual(ids[-len(added):], added)
-        self.assertEqual(rt.config["defaults_added"], sorted(added))
+        self.assertEqual(rt.config["defaults_added"],
+                         sorted(added + [rt.EVENTS_MARK]))          # [s3-live-event]
         # the store keys versions by content: this config IS the default, so the pointer moved to it
         self.assertEqual(system3.config_hash(rt.store.config()), system3.config_hash(rt.config))
         self.assertEqual(rt.add_missing_default_tables(), [])

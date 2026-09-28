@@ -3549,6 +3549,9 @@ function makeViews({request, onSelect, details = false} = {}) {
     const poster = [(ev.meta || {}).poster, (ev.selected || {}).poster].find(p => typeof p === 'string' && p);
     if (poster) card.append(el('img', {class: 's3-evposter', src: stationUrl(poster), alt: 'the clip it picked', loading: 'lazy',
       decoding: 'async', onerror: e => { e.currentTarget.hidden = true; }}));
+    /* [s3-live-event] a roll that landed on a station event's row says so */
+    const evTag = (ev.meta || {}).event || (ev.selected || {}).event;
+    if (evTag) card.append(el('div', {class: 's3-muted', text: 'landed on a station-event row (' + evTag + ') - in the wheel only while that event is on'}));
     const details = el('details', {onclick: e => e.stopPropagation()}, el('summary', {text: 'candidates, weights and state'}));
     details.addEventListener('toggle', () => {
       if (!details.open || details.dataset.filled) return;
@@ -8415,6 +8418,18 @@ export async function mount(root, {request, onClose, tab: startTab = '', table: 
     const seed = el('input', {type: 'text', value: s.test_seed, placeholder: 'blank: a fresh seed per conversation', oninput: e => { s.test_seed = e.target.value; }});
     const repair = el('label', 's3-row', el('input', {type: 'checkbox', checked: s.repair, onchange: e => { s.repair = e.target.checked; }}), 'repair banked rounds that ignored the running order');
     const verb = el('select', {onchange: e => { s.debug_verbosity = e.target.value; }}, ...['quiet', 'normal', 'full'].map(v => el('option', {value: v, text: v, selected: v === s.debug_verbosity})));
+    /* [s3-live-event] the station's activatable events: while one is on, its
+       rows join the wheels; off, they are invisible to the dice. */
+    const eventsCard = () => el('div', 's3-card', el('h2', {text: 'Station events'}),
+      el('p', {class: 's3-muted', text: 'An activatable event (MX Live) whose rows sit in the tables tagged with it (Tables tab: MXLIVE1, MXLIVECTS1, MXLIVETRACK1, MXLIVEID1, MXLIVEANGLE1, MXLIVECALL1). While the event is on, those rows are eligible in their wheels at their own weights; while it is off they are filtered out before any weight is computed, so no draw moves. A pinelive event follows the PineLive switch (the mic on the status bar); a roll that lands on one of its rows says so in the Rolodex.'}),
+      ((status && status.events) || []).length ? el('table', 's3-table',
+        el('thead', null, el('tr', null, ...['event', 'source', 'now', 'tables'].map(h => el('th', {text: h})))),
+        el('tbody', null, ...((status && status.events) || []).map(ev => el('tr', null,
+          el('td', null, el('b', {text: ev.name}), el('div', {class: 's3-muted', text: ev.id + (ev.what ? ' - ' + ev.what : '')})),
+          el('td', {text: ev.source}),
+          el('td', null, el('span', {class: 's3-pill ' + (ev.on ? 'active' : 'off'), text: ev.on ? (ev.stage || 'on') : 'off'})),
+          el('td', {class: 's3-muted', text: (ev.tables || []).join(', ') || 'no tables carry it'})))))
+        : para('No station events are registered.', 's3-muted'));
     /* [s3-roads] every road that puts words on air, and what System 3 is for it now */
     const roadsCard = () => el('div', 's3-card s3-roads', el('h2', {text: 'Roads'}),
       el('p', {class: 's3-muted', text: 'Every road that puts words on air, and what System 3 is for it right now: its structure is on the Structure tab. A road standing aside is labelled "not directed by System 3" wherever its lines show.'}),
@@ -8456,6 +8471,7 @@ export async function mount(root, {request, onClose, tab: startTab = '', table: 
         btn('Save settings', async () => { try { settings.settings = (await send('/api/system3/settings', 'POST', s)).settings; await refreshStatus(); paint(); quiet(); } catch (e) { report(e); } }),
         btn('Reset controls to defaults', async () => { try { settings.settings = (await send('/api/system3/settings', 'POST', {reset: true})).settings; paint(); } catch (e) { report(e); } }),
         btn('Reset tables and structure to defaults', async () => { if (!confirm('Replace the live tables and structure with the defaults? The current version stays in the ledger.')) return; try { await send('/api/system3/config/reset', 'POST'); await loadConfig(); paint(); } catch (e) { report(e); } }))),
+      eventsCard(),                                   /* [s3-live-event] */
       roadsCard(),
       versionsCard(),
       section('speakerbox', 'Mode weights for a hit (verbatim / reference / callback), the inline passage budget per round, and passage length.'),

@@ -121,6 +121,7 @@ from sfx_cadence import SfxCadence, due_after as sfx_due_after
 # The broadcast stream (#1253): one URL, one socket, the mix made here.
 # station_stream.py carries why the tune page cannot do this in a car.
 from station_stream import HLS_START_SEGMENTS, StationStream, icy_block
+import pinelive                         # [pinelive] MX Live: the event, its roads, its doors
 import library
 import library_extract
 # What the prompts may no longer carry - see prompt_cuts.py for why a cut is
@@ -36206,6 +36207,8 @@ async def _dj_speak_floorless(kind: str, track: dict[str, Any] | None = None,
             return ""
         system3 = dict(_s3_spoken_handle.stamp)
     _s3_sheet = _pb("sheet", _s3_spoken_handle.sheet if _s3_spoken_handle is not None else "")   # [s3-blocks]
+    _s3_sheet += _pb("event_facts",                             # [s3-live-event]
+                     (globals().get("system3_event_facts") or (lambda: ""))())
     _s3_perf = (_s3_spoken_handle.perf if _s3_spoken_handle is not None else None)
     _s3_voice = getattr(_s3_spoken_handle, "voice", None)   # [s3-es-voice] how the feeling sounds
     if _s3_perf or isinstance(_s3_voice, dict):
@@ -38610,6 +38613,10 @@ def dj_next_track() -> dict[str, Any] | None:
     then the box started the same track again from zero. Hence "they are
     talking about songs that are not playing" (#176, #178). The track goes on
     air in dj_on_air, when the audio actually starts."""
+    # [pinelive] MX Live: while the set has the air, it IS the record.
+    _live_set = pinelive.live_track()
+    if _live_set:
+        return _live_set
     dj = dj_settings()
     # Paused air still carries music, but it must not spend a record whose
     # exact intro/outro is being banked for the booth. If the pause landed
@@ -111277,6 +111284,8 @@ async def dj_banter(track: dict[str, Any] | None = None,
             # The material says what to talk about; the running order is
             # the shape of the answer, and the shape must be the thing
             # the model is holding when it starts to write.
+            + _pb("event_facts",                                # [s3-live-event]
+                  (globals().get("system3_event_facts") or (lambda: ""))())
             + (_pb("sheet", "\n\n" + _beat_sheet) if _beat_sheet else "")   # [s3-blocks]
         )
         # [s3-blocks] the blocks that ride INSIDE the round's angle - the
@@ -129360,6 +129369,9 @@ async def radio_clock_api(
         # old behaviour exactly. A listener id means only that one plays
         # and every other page mutes itself.
         "audio_owner": "" if _away else audio_owner(),
+        # [pinelive] `live` = play the url, never seek it; the picture, and
+        # through the door no art while Tailscale video is off.
+        **pinelive.clock_extra(track, _away),
     }
 
 
@@ -141379,6 +141391,8 @@ def pinelink_viewer_ok(token: str) -> bool:
     What it IS tied to is the camera being linked - there is no point
     telling a viewer they may watch a thing that is not running.
     """
+    if pinelive.public_video_blocked():       # [pinelive] Tailscale video OFF
+        return False
     mode = pinelink_public_mode()
     if mode == "off":
         return False
@@ -141871,6 +141885,8 @@ async def pinelink_frame_api(
 def _pinelink_low_viewer_ok(token: str) -> bool:
     """#1475: pinelink_viewer_ok, memoised five seconds per token - a
     player asks for a segment every two seconds."""
+    if pinelive.public_video_blocked():       # [pinelive] before the memo: at once
+        return False
     now = time.time()
     got = _PINELINK_LOW_OK.get(token)
     if got and now - got[0] < 5.0:
@@ -158789,7 +158805,8 @@ def _stream_snapshot() -> dict[str, Any]:
                           "sfx": _u.startswith("/sfx/")})
 
         return {"on": bool(_RADIO.get("on")), "paused": radio_paused(),
-                "music": music, "clips": clips}
+                "music": music, "clips": clips,
+                **pinelive.snapshot_extra()}     # [pinelive] the set, as the bed
     except Exception:  # noqa: BLE001
         # A broken snapshot must degrade to silence-on-a-held-socket,
         # never to an exception that ends the broadcast.
@@ -158797,6 +158814,9 @@ def _stream_snapshot() -> dict[str, Any]:
 
 
 STATION_STREAM = StationStream(_stream_snapshot, bitrate=STREAM_BITRATE)
+# [pinelive] the /api/pinelive routes and the event's boot. Everything the
+# module needs from this file it looks up in globals() when it needs it.
+pinelive.install(app, globals())
 
 
 STREAM_KEEP_WARM = os.getenv("STREAM_KEEP_WARM", "true").lower() in (
@@ -166118,6 +166138,8 @@ async def music_art(
     if not (signature and hmac.compare_digest(
             str(request.query_params.get("t") or ""), signature)):
         require_auth(authorization)
+    if pinelive.is_live_id(track_id):         # [pinelive] the picture, live
+        return await pinelive.art_response(track_id, request)
 
     # Off the loop: reading tags and listing the album folder are CIFS round
     # trips, and every route in this app is async, so doing it here stops the
@@ -166157,6 +166179,9 @@ async def music_file(
     if not (signature and hmac.compare_digest(
             str(request.query_params.get("t") or ""), signature)):
         require_auth(authorization)
+
+    if pinelive.is_live_id(track_id):         # [pinelive] the live record
+        return await pinelive.music_response(track_id, request)
 
     track = music_track(track_id)
     if not track:
@@ -228939,6 +228964,25 @@ function djResync(clock) {
     radioFollowing = true;
     return;
   }
+  /* [pinelive] MX LIVE: the record is the live set - an endless stream
+   * with no position to keep. Load it once, keep it playing, never seek
+   * it (a seek on an endless stream re-requests it every poll). */
+  if (clock.live) {
+    if (clock.id !== djLastTrack || player.error) {
+      djLastTrack = clock.id;
+      djLastClockId = clock.id;
+      musicRadioOn = false;
+      radioFollowing = true;
+      player.src = clock.url;
+      player.playbackRate = 1;
+      playOrPrompt(player);
+      return;
+    }
+    radioFollowing = true;
+    if (player.paused && !player.ended) playOrPrompt(player);
+    if (player.playbackRate !== 1) player.playbackRate = 1;
+    return;
+  }
   const age = djStateAt ? (Date.now() - djStateAt) / 1000 : 0;
   let target = (clock.server_ms - clock.started_ms) / 1000 + age;
   if (!isFinite(target) || target < 0) target = 0;
@@ -261909,6 +261953,20 @@ function retime(now, serverMs, startedMs, seconds) {
   if (streamMode) return;      // #1253: no clock to chase on the stream
   if (!audio || !now || !now.url || !serverMs) return;
   if (stationPaused) return;   // #1149: NO road restarts a paused record
+  /* [pinelive] MX LIVE: a live record is played, never seeked. */
+  if (now.live) {
+    if (now.id !== trackId || audio.error) {
+      trackId = now.id;
+      trackUrl = now.url;
+      audio.src = now.url;
+      audio.playbackRate = 1;
+      audio.play().catch(() => {});
+      return;
+    }
+    if (audio.paused && !audio.ended) audio.play().catch(() => {});
+    if (audio.playbackRate !== 1) audio.playbackRate = 1;
+    return;
+  }
   const key = String(now.id || "") + "|" + String(startedMs || 0);
   if (key !== anchorKey) { anchorKey = key; anchors = []; }
   anchors.push((stateAt || Date.now()) - (serverMs - startedMs));
@@ -262032,7 +262090,8 @@ async function clockPoll() {
       if (!stationPaused) { try { voiceNext(); } catch (e) {} }
     } else if (c.playing && c.url) {
       if (!stationPaused) { try { voiceNext(); } catch (e) {} }
-      retime({id: c.id, url: c.url}, c.server_ms, c.started_ms, c.seconds);
+      retime({id: c.id, url: c.url, live: !!c.live},   /* [pinelive] */
+             c.server_ms, c.started_ms, c.seconds);
     }
   } catch (error) { /* the show goes on */ }
   finally { if (mine === clockSeq) clockLive = 0; }

@@ -92,7 +92,8 @@ class EveryBlockIsMarkedTests(unittest.TestCase):
         marked = _marked_names(text) | {"persona", "cohost", "third"}
         self.assertEqual(sorted(n for n in system3_tables.DEFAULT_BLOCKS if n not in marked), [],
                          "a block the table names that no prompt marks is sent but never decided")
-        self.assertEqual(sorted(n for n in marked if n not in system3_tables.DEFAULT_BLOCKS), [],
+        _known = set(system3_tables.DEFAULT_BLOCKS) | set(system3_tables.EVENT_BLOCKS)   # [s3-live-event]
+        self.assertEqual(sorted(n for n in marked if n not in _known), [],
                          "a block the station marks with no node is stripped as a wedge")
 
     def test_the_angle_itself_is_never_marked(self):
