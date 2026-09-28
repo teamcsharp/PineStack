@@ -894,6 +894,7 @@ class MainActivity : AppCompatActivity() {
         pineCam?.stop()
         pineCam?.onTap = null
         pineCam?.onBoxChanged = null
+        pineCam?.onHold = null                 // [pincrop]
         pineCam = null
         if (::bridge.isInitialized) {
             bridge.videoWall = null
@@ -1364,6 +1365,15 @@ class MainActivity : AppCompatActivity() {
         cam.onDragging = { on ->
             val js = ("try{window.PineCam&&PineCam.dragPicture&&"
                 + "PineCam.dragPicture(" + (if (on) "true" else "false") + ")}catch(e){}")
+            webView.post { webView.evaluateJavascript(js, null) }
+        }
+        /* [pincrop] the surface swallows the press, so the HOLD that opens
+         * the page's crop radial is caught natively and handed over in
+         * device pixels, like the tap - the page divides by the true glass
+         * factor (camScale, not devicePixelRatio; the 1.161 trap). */
+        cam.onHold = { x, y ->
+            val js = ("try{window.PineCam&&PineCam.holdPicture&&"
+                + "PineCam.holdPicture(" + x.toInt() + "," + y.toInt() + ")}catch(e){}")
             webView.post { webView.evaluateJavascript(js, null) }
         }
         pineCam = cam
