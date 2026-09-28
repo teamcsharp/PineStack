@@ -11489,7 +11489,9 @@
       var meters = root.PineMeters;
       if (meters) {
         meters.attach(['musicPlayer', 'djVoiceAudio0', 'djVoiceAudio1']);
-        meters.draw(spectrum, meters.read('musicPlayer', 'music'), '#54d18b');
+        /* [plbars] a live set draws its real input, not the page's element */
+        var liveRead = root.PineLive && root.PineLive.liveBars ? root.PineLive.liveBars() : null;
+        meters.draw(spectrum, liveRead || meters.read('musicPlayer', 'music'), '#54d18b');
         meters.draw(el('spVoice'),
           meters.readLoudest(['djVoiceAudio0', 'djVoiceAudio1'], 'voice'), '#e3be63');
         levelMark(spectrum, 'music');                             /* [#1198] */

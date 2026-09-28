@@ -1228,6 +1228,12 @@
   }
 
   function wantLevels() {
+    /* [plbars] a live set keeps the feed open for the player's strip */
+    if (model.state && model.state.live && model.state.levels_url) {
+      var hid = false;
+      try { hid = !!document.hidden; } catch (err) { hid = false; }
+      if (!hid) return true;
+    }
     if (!ui.visible || !ui.open.scope || !ui.scope || !ui.scopeSeen) return false;
     var hidden = false;
     try { hidden = !!document.hidden; } catch (err) { hidden = false; }
@@ -1346,6 +1352,7 @@
     es.addEventListener('frame', function (e) {
       var f = null;
       try { f = JSON.parse(e.data); } catch (err) { f = null; }
+      if (f) { ui.lastFrame = f; ui.lastFrameAt = Date.now(); }   /* [plbars] */
       if (!f || !ui.scope) return;
       if (!ui.levelsGotAny) { ui.levelsGotAny = true; ui.levelsFailed = 0; }
       ui.scope.push(f);
@@ -3186,7 +3193,29 @@
     else document.addEventListener('DOMContentLoaded', go, {once: true});
   }
 
+  /* [plbars] the live set's 48 input bands as PineMeters bars (64, 0..1),
+   * or null when no set holds the air or the feed is stale. */
+  function liveBars() {
+    var st = model.state || {};
+    var f = ui.lastFrame;
+    if (!st.live || !f || !f.bands || Date.now() - (ui.lastFrameAt || 0) > 1500) return null;
+    var raw;
+    try { raw = root.atob(f.bands); } catch (err) { return null; }
+    var n = raw.length;
+    if (!n) return null;
+    var bars = [], peak = 0;
+    for (var i = 0; i < 64; i += 1) {
+      var p = i * (n - 1) / 63, a = Math.floor(p), b = Math.min(n - 1, a + 1), t = p - a;
+      var byte = raw.charCodeAt(a) * (1 - t) + raw.charCodeAt(b) * t;
+      var v = Math.max(0, Math.min(1, (byte - 10) / 86));
+      bars.push(v);
+      if (v > peak) peak = v;
+    }
+    return {bars: bars, peak: peak};
+  }
+
   var api = {
+    liveBars: liveBars,                                        /* [plbars] */
     start: start, open: openPopup, close: closePopup, toggle: toggleOpen,
     isOpen: function () { return ui.visible; },
     state: function () { return model.state; },
