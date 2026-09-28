@@ -35,7 +35,19 @@ import unittest
 from contextlib import ExitStack
 from unittest import mock
 
+from starlette.requests import Request
+
 import app
+
+
+def a_request():
+    """#1476 (30a1191): dj_video_api reads WHICH ROAD a listener came in on
+    (tailnet, funnel or house) to start an HLS listener's picture as far
+    back as its variant playlists start the sound, so FastAPI hands it the
+    Request. This is a house caller on the socket - the sets' own poll."""
+    return Request({"type": "http", "method": "GET", "path": "/api/dj/video",
+                    "headers": [], "query_string": b"",
+                    "client": ("127.0.0.1", 50000)})
 
 
 class ThePictureDoor(unittest.IsolatedAsyncioTestCase):
@@ -128,7 +140,7 @@ class ThePictureDoor(unittest.IsolatedAsyncioTestCase):
         """The door the sets actually poll - not the one we hope they do."""
         with mock.patch.object(app.time, "time", return_value=1000):
             rung = app.page_picture_append(self.pad())
-            got = await app.dj_video_api(since=0)
+            got = await app.dj_video_api(a_request(), since=0)
         urls = [c["url"] for c in got["clips"]]
         self.assertEqual(urls, ["/sfx/pad.mp4?t=sig"])
         self.assertTrue(got["clips"][0]["video"])
@@ -140,7 +152,7 @@ class ThePictureDoor(unittest.IsolatedAsyncioTestCase):
         """`since` is how a set says "I have that one"."""
         with mock.patch.object(app.time, "time", return_value=1000):
             rung = app.page_picture_append(self.pad())
-            again = await app.dj_video_api(since=rung["ts"])
+            again = await app.dj_video_api(a_request(), since=rung["ts"])
         self.assertEqual(again["clips"], [])
 
     # -------------------------------------------------------------- door
@@ -169,7 +181,7 @@ class ThePictureDoor(unittest.IsolatedAsyncioTestCase):
         with mock.patch.object(app.time, "time", return_value=1000):
             app.page_picture_append(self.pad())
         with mock.patch.object(app, "radio_paused", return_value=True):
-            got = await app.dj_video_api(since=0)
+            got = await app.dj_video_api(a_request(), since=0)
         self.assertEqual(got["clips"], [])
         self.assertTrue(got["paused"])
 

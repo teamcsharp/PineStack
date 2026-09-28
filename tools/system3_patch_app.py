@@ -104,16 +104,11 @@ EDITS = [
      "              _beat_sheet, _dice_rolls = banter_beat_sheet(\n                int(lines or 0),\n"),
     # 6. Mode B: the banked beat chain asks the director before each beat.
     ("beats-call",
-     "                seed_text=str((seed or {}).get(\"text\") or \"\"),\n                trace=_beat_trace)\n",
-     "                seed_text=str((seed or {}).get(\"text\") or \"\"),\n                trace=_beat_trace,\n"
-     "                director=(globals()[\"system3_director\"](_s3)\n"
-     "                          if globals().get(\"system3_director\") else None))\n"),
+     '                seed_text=str((seed or {}).get("text") or ""),\n                trace=_beat_trace)\n',
+     '                seed_text=str((seed or {}).get("text") or ""),\n                trace=_beat_trace,\n                director=(globals()["system3_director"](_s3)\n                          if globals().get("system3_director") else None),\n                gate=(globals()["system3_beat_gate"](_s3)                     # [s3-turnchain]\n                      if globals().get("system3_beat_gate") else None))\n'),
     ("beats-sig",
-     "                        trace: list[dict[str, Any]] | None = None) -> str:\n"
-     "    \"\"\"Write a banked exchange as responsive 3-4-turn calls.\n",
-     "                        trace: list[dict[str, Any]] | None = None,\n"
-     "                        director: Any = None) -> str:\n"
-     "    \"\"\"Write a banked exchange as responsive 3-4-turn calls.\n"),
+     '                        trace: list[dict[str, Any]] | None = None) -> str:\n    """Write a banked exchange as responsive 3-4-turn calls.\n',
+     '                        trace: list[dict[str, Any]] | None = None,\n                        director: Any = None, gate: Any = None) -> str:\n    """Write a banked exchange as responsive 3-4-turn calls.\n'),
     ("beats-loop",
      "        rows = plan[cursor:cursor + 4]\n        started = time.monotonic()\n",
      "        if director is not None and made:\n"

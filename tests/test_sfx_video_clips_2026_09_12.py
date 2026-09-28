@@ -26,12 +26,25 @@ These are the tests worth having because each one fails SILENTLY:
 """
 import asyncio
 import tempfile
+from contextlib import ExitStack
 import time
 import unittest
 from pathlib import Path
 from unittest import mock
 
+from starlette.requests import Request
+
 import app
+
+
+def a_request():
+    """#1476 (30a1191): dj_video_api reads WHICH ROAD a listener came in on
+    (tailnet, funnel or house) to start an HLS listener's picture as far
+    back as its variant playlists start the sound, so FastAPI hands it the
+    Request. This is a house caller on the socket - the sets' own poll."""
+    return Request({"type": "http", "method": "GET", "path": "/api/dj/video",
+                    "headers": [], "query_string": b"",
+                    "client": ("127.0.0.1", 50000)})
 
 
 class VideoIsASample(unittest.TestCase):
@@ -183,13 +196,52 @@ class TheRoadsThatMustStayAudible(unittest.TestCase):
     def test_the_dead_air_road_never_draws_a_picture(self):
         """sfx_fill_gap goes through _sfx_any, and its whole job is that
         silence gets ANSWERED - on the box, in the car, wherever the hole
-        is actually being heard. A popup on the panel answers none of it."""
-        with (mock.patch.object(app, "sfx_all",
-                                return_value=[self.video, self.audio]),
-              mock.patch.object(app, "sfx_short", return_value=True),
-              mock.patch.object(app, "sfx_bans", return_value=set()),
-              mock.patch.object(app, "unrepeated",
-                                side_effect=lambda rows, *a, **k: rows[0])):
+        is actually being heard. A popup on the panel answers none of it.
+
+        #1386 (a9e474e) put two roads in front of the walked pool: the
+        matcher (what is being said, asked for SOUND) and the clip book
+        (the whole library, one random row). Every road is held to the
+        rule here, and none of them is the station's own: asked unpatched,
+        the book answered with whatever the live library held."""
+        def steady(stack):
+            for patch in (mock.patch.object(app, "sfx_short", return_value=True),
+                          mock.patch.object(app, "sfx_bans", return_value=set()),
+                          mock.patch.object(app, "sting_recent", return_value=False)):
+                stack.enter_context(patch)
+
+        # The matcher is asked for sound, never for a picture.
+        with ExitStack() as stack:
+            steady(stack)
+            stack.enter_context(mock.patch.object(app, "sfx_match_on", return_value=True))
+            stack.enter_context(mock.patch.object(app, "sfx_match_ready", return_value=True))
+            asked = stack.enter_context(mock.patch.object(
+                app, "sfx_match_sting_pick", return_value=None))
+            stack.enter_context(mock.patch.object(
+                app, "sfx_db_pick", side_effect=[self.video, self.audio]))
+            self.assertEqual(app._sfx_any(), self.audio)
+            self.assertIs(asked.call_args.kwargs.get("want_video"), False)
+
+        # The book: a picture it deals is passed over for the sound, and a
+        # book that answers never sends the road walking the share.
+        with ExitStack() as stack:
+            steady(stack)
+            stack.enter_context(mock.patch.object(app, "sfx_match_on", return_value=False))
+            stack.enter_context(mock.patch.object(
+                app, "sfx_db_pick", side_effect=[self.video, self.audio] * 8))
+            stack.enter_context(mock.patch.object(
+                app, "sfx_all", side_effect=AssertionError("walked the share")))
+            for _ in range(8):
+                self.assertEqual(app._sfx_any(), self.audio)
+
+        # The walked pool, for a box whose book has nothing to give.
+        with ExitStack() as stack:
+            steady(stack)
+            stack.enter_context(mock.patch.object(app, "sfx_match_on", return_value=False))
+            stack.enter_context(mock.patch.object(app, "sfx_db_pick", return_value=None))
+            stack.enter_context(mock.patch.object(
+                app, "sfx_all", return_value=[self.video, self.audio]))
+            stack.enter_context(mock.patch.object(
+                app, "unrepeated", side_effect=lambda rows, *a, **k: rows[0]))
             for _ in range(8):
                 self.assertEqual(app._sfx_any(), self.audio)
 
@@ -385,7 +437,7 @@ class TheSetsOwnDoor(unittest.IsolatedAsyncioTestCase):
     async def test_only_the_clips_with_a_picture_come_back(self):
         self.clip()
         self.clip(video=False, sting="scratch")
-        got = await app.dj_video_api(since=0)
+        got = await app.dj_video_api(a_request(), since=0)
         self.assertEqual(len(got["clips"]), 1)
         self.assertEqual(got["clips"][0]["sting"], "Gee")
 
@@ -394,23 +446,23 @@ class TheSetsOwnDoor(unittest.IsolatedAsyncioTestCase):
         the clip being missed - the same rule the voice feed keeps."""
         now = int(app.time.time() * 1000)
         self.clip(ts=now - 60000, broadcast_ms=now - 60000, seconds=2.0)
-        self.assertEqual((await app.dj_video_api(since=0))["clips"], [])
+        self.assertEqual((await app.dj_video_api(a_request(), since=0))["clips"], [])
 
     async def test_the_since_marker_is_honoured_so_a_set_plays_once(self):
         row = self.clip()
-        self.assertEqual((await app.dj_video_api(since=row["ts"]))["clips"], [])
+        self.assertEqual((await app.dj_video_api(a_request(), since=row["ts"]))["clips"], [])
 
     async def test_a_paused_station_shows_nothing(self):
         self.clip()
         with mock.patch.object(app, "radio_paused", return_value=True):
-            got = await app.dj_video_api(since=0)
+            got = await app.dj_video_api(a_request(), since=0)
         self.assertEqual(got["clips"], [])
         self.assertTrue(got["paused"])
 
     async def test_the_feed_epoch_cuts_a_dead_processs_clips(self):
         row = self.clip()
         self.radio["voice_cut_ms"] = row["ts"] + 1
-        self.assertEqual((await app.dj_video_api(since=0))["clips"], [])
+        self.assertEqual((await app.dj_video_api(a_request(), since=0))["clips"], [])
 
 
 class ThePageContract(unittest.TestCase):

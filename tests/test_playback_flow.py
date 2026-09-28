@@ -37,7 +37,16 @@ class ConversationParsingTests(unittest.TestCase):
 
 class PlaybackAcknowledgmentTests(unittest.TestCase):
     def setUp(self):
+        # page_reservation_repair WRITES the recovery FIFO whenever it
+        # retimes a clip. Unpatched, that is the station's own file
+        # (data/page_delivery_recovery.json) - the one page_recovery_start
+        # replays after a restart - so a test that retimes must never
+        # reach it.
+        self.recovery = tempfile.TemporaryDirectory()
+        self.addCleanup(self.recovery.cleanup)
         self.patches = [
+            mock.patch.object(app, "PAGE_RECOVERY_PATH",
+                              Path(self.recovery.name) / "recovery.json"),
             mock.patch.object(app, "_PAGE_DELIVERIES", {}),
             mock.patch.object(app, "_PAGE_ACK_EVENTS", []),
             mock.patch.object(app, "_PAGE_ACKED_LINES", set()),
@@ -128,16 +137,47 @@ class PlaybackAcknowledgmentTests(unittest.TestCase):
         self.ack("playing", 1)
         self.assertEqual(app._LAST_SAID[0], 0)
 
-    def test_explicit_stream_reserves_full_duration_before_next_line(self):
+    def fresh_page(self):
+        """No clip ahead. setUp's clip is stamped on the REAL clock, which
+        is decades after the mocked one below, and the repair would move it
+        in front of everything - a scenario of its own, not this one."""
+        app._RADIO["voice_clips"].clear()
+        app._PAGE_DELIVERIES.clear()
         app._PAGE_AIR_UNTIL[0] = 0
+
+    def test_explicit_stream_reserves_full_duration_before_next_line(self):
+        """A burst that arrives with its own moment keeps it, and holds the
+        air for its WHOLE length: the next plain line goes after its end,
+        never inside it. Now = 100 s, lead 7 s: a stream stamped at 110 s
+        sits inside the repair's window, so the stamp stands."""
+        self.fresh_page()
+        first = {"broadcast_ms": 110000, "stream": {"length": 90},
+                 "speech": True, "text": "A complete conversation"}
+        with mock.patch.object(app.time, "time", return_value=100):
+            app.page_feed_append(first)
+            next_line = {"text": "The next line", "seconds": 12}
+            app.page_feed_append(next_line)
+        self.assertEqual(first["broadcast_ms"], 110000)
+        self.assertEqual(next_line["broadcast_ms"], 200000)
+        self.assertEqual(app._PAGE_AIR_UNTIL[0], 212)
+
+    def test_a_stream_stamped_into_dead_air_is_pulled_forward_whole(self):
+        """e09f6a3: a received clip that never started cannot reserve dead
+        air. On a silent page the repair closes any gap over 20 s (45 s
+        while a listener is heard) - it used to leave 300 s alone, which is
+        the window the old 290 s figure here assumed. A stream stamped 93 s
+        into silence is brought up to the lead, and STILL reserves its full
+        90 s: the next line waits for its end."""
+        self.fresh_page()
         first = {"broadcast_ms": 200000, "stream": {"length": 90},
                  "speech": True, "text": "A complete conversation"}
         with mock.patch.object(app.time, "time", return_value=100):
             app.page_feed_append(first)
             next_line = {"text": "The next line", "seconds": 12}
             app.page_feed_append(next_line)
-        self.assertEqual(next_line["broadcast_ms"], 290000)
-        self.assertEqual(app._PAGE_AIR_UNTIL[0], 302)
+        self.assertEqual(first["broadcast_ms"], 107000)
+        self.assertEqual(next_line["broadcast_ms"], first["broadcast_ms"] + 90000)
+        self.assertEqual(app._PAGE_AIR_UNTIL[0], 209)
 
     def test_audit_distinguishes_unheard_rows_from_completed_delivery(self):
         audit = app.page_playback_state()["line_audit"][0]

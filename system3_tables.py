@@ -225,6 +225,117 @@ _ES_ITEM_EMOJI = {
 # turn is planned (system3.es_direction). A blank text reads as this default.
 ES_DIRECTION = "Write {name}'s message with {feeling}, reflecting the mood."
 
+# [s3-es-voice] HOW A FEELING SOUNDS. 2026-09-28, the operator: the roll "is fed
+# to the intonation engine to take place affecting the way the recording is made
+# so they emotionally reflect the dialogue". Each category's `voice`, at FULL
+# intensity (the turn's intensity scales it: system3.voice_intent):
+#   tempo   x   how fast the line is spoken            (1.08 = 8% faster)
+#   pitch   st  where the voice's middle sits          (formants kept)
+#   range   x   how far the melody swings around it    (1.3 = wider)
+#   energy  +-  vocal effort: brighter/pressed (+), softer/darker (-); heard as
+#               colour, never as volume - every clip is still levelled
+#   pause   x   the gaps between phrases               (1.3 = longer)
+#   temp    +-  XTTS sampling temperature (livelier + / steadier -)
+# An item listed in _ES_ITEM_VOICE sounds unlike its category (a fury is not an
+# annoyance); its block names only what differs. Keyed by the word, or by
+# "category.word" where the word sits in two categories (disgust). The station holds every value
+# inside ES_VOICE_BOUNDS whatever the table says (es_voice.py).
+ES_VOICE_KEYS = ("tempo", "pitch", "range", "energy", "pause", "temp")
+ES_VOICE_BOUNDS = {"tempo": (0.85, 1.15), "pitch": (-2.0, 2.0), "range": (0.6, 1.5),
+                   "energy": (-0.8, 0.8), "pause": (0.7, 1.5), "temp": (-0.1, 0.1)}
+_ES_VOICE = {
+    #               tempo          pitch          range          energy          pause          temp
+    "surprise":    {"tempo": 1.05, "pitch": 1.6,  "range": 1.40, "energy": 0.30,  "pause": 0.85, "temp": 0.06},
+    "anger":       {"tempo": 1.08, "pitch": 0.8,  "range": 1.30, "energy": 0.60,  "pause": 0.78, "temp": 0.05},
+    "fear":        {"tempo": 1.10, "pitch": 1.2,  "range": 0.90, "energy": 0.25,  "pause": 0.88, "temp": 0.05},
+    "sadness":     {"tempo": 0.88, "pitch": -1.0, "range": 0.70, "energy": -0.50, "pause": 1.35, "temp": -0.05},
+    "joy":         {"tempo": 1.06, "pitch": 1.2,  "range": 1.35, "energy": 0.40,  "pause": 0.90, "temp": 0.05},
+    "disgust":     {"tempo": 0.92, "pitch": -0.8, "range": 1.15, "energy": 0.10,  "pause": 1.15, "temp": -0.02},
+    "interest":    {"tempo": 1.03, "pitch": 0.6,  "range": 1.20, "energy": 0.15,  "pause": 0.95, "temp": 0.03},
+    "social":      {"tempo": 0.96, "pitch": 0.3,  "range": 0.85, "energy": -0.20, "pause": 1.15, "temp": 0.0},
+    "low_arousal": {"tempo": 0.88, "pitch": -0.8, "range": 0.65, "energy": -0.55, "pause": 1.35, "temp": -0.07},
+}
+_ES_ITEM_VOICE = {
+    # surprise
+    "shock":          {"tempo": 1.08, "pitch": 1.8, "range": 1.45, "energy": 0.45, "pause": 0.80},
+    "astonishment":   {"pitch": 1.8, "range": 1.45},
+    "amazement":      {"pitch": 1.4, "energy": 0.35},
+    "disbelief":      {"tempo": 0.98, "pitch": 1.0, "pause": 1.05},
+    "bewilderment":   {"tempo": 0.95, "pitch": 0.6, "range": 1.20, "energy": 0.05, "pause": 1.15},
+    "confusion":      {"tempo": 0.94, "pitch": 0.4, "range": 1.15, "energy": 0.0, "pause": 1.20, "temp": 0.02},
+    "curiosity":      {"tempo": 1.0, "pitch": 0.6, "range": 1.20, "energy": 0.10, "pause": 0.95, "temp": 0.03},
+    "intrigue":       {"tempo": 0.98, "pitch": 0.4, "range": 1.15, "energy": 0.05, "pause": 1.0, "temp": 0.02},
+    # anger
+    "annoyance":      {"tempo": 1.02, "pitch": 0.2, "range": 1.10, "energy": 0.25, "pause": 0.95, "temp": 0.02},
+    "irritation":     {"tempo": 1.04, "pitch": 0.3, "range": 1.15, "energy": 0.35, "pause": 0.90},
+    "frustration":    {"tempo": 1.04, "pitch": 0.5, "range": 1.20, "energy": 0.40, "pause": 0.92},
+    "indignation":    {"range": 1.30, "energy": 0.50},
+    "outrage":        {"tempo": 1.10, "pitch": 1.2, "range": 1.40, "energy": 0.70, "pause": 0.75, "temp": 0.06},
+    "fury":           {"tempo": 1.12, "pitch": 1.4, "range": 1.45, "energy": 0.80, "pause": 0.72, "temp": 0.07},
+    "resentment":     {"tempo": 0.96, "pitch": -0.3, "range": 1.05, "energy": 0.30, "pause": 1.05, "temp": 0.0},
+    "contempt":       {"tempo": 0.94, "pitch": -0.6, "range": 1.20, "energy": 0.20, "pause": 1.10, "temp": 0.0},
+    "anger.disgust":  {"tempo": 0.95, "pitch": -0.5, "range": 1.15, "energy": 0.25, "pause": 1.05},
+    # fear
+    "unease":         {"tempo": 1.02, "pitch": 0.4, "energy": 0.0, "pause": 1.05, "temp": 0.02},
+    "apprehension":   {"tempo": 1.04, "pitch": 0.6, "energy": 0.10, "pause": 1.0},
+    "anxiety":        {"tempo": 1.08, "pitch": 0.9, "range": 0.85, "energy": 0.15, "pause": 0.92},
+    "alarm":          {"pitch": 1.4, "range": 1.25, "energy": 0.40, "pause": 0.85},
+    "dread":          {"tempo": 0.92, "pitch": -0.3, "range": 0.75, "energy": -0.20, "pause": 1.25, "temp": -0.02},
+    "panic":          {"tempo": 1.14, "pitch": 1.8, "range": 1.30, "energy": 0.50, "pause": 0.75, "temp": 0.07},
+    "horror":         {"tempo": 1.0, "pitch": 1.2, "range": 1.30, "energy": 0.35, "pause": 1.0},
+    # sadness
+    "disappointment": {"tempo": 0.92, "pitch": -0.6, "range": 0.80, "energy": -0.30, "pause": 1.20},
+    "discouragement": {"tempo": 0.90, "pitch": -0.8, "range": 0.75, "energy": -0.40, "pause": 1.25},
+    "grief":          {"tempo": 0.86, "pitch": -0.6, "range": 0.85, "energy": -0.40, "pause": 1.45, "temp": 0.02},
+    "despair":        {"tempo": 0.85, "pitch": -1.2, "range": 0.65, "energy": -0.60, "pause": 1.45},
+    "melancholy":     {"pitch": -0.8, "energy": -0.45},
+    "sympathy":       {"tempo": 0.94, "pitch": -0.3, "range": 0.90, "energy": -0.30, "pause": 1.15, "temp": -0.02},
+    "pity":           {"tempo": 0.94, "pitch": -0.2, "range": 0.95, "energy": -0.25, "pause": 1.15},
+    # joy
+    "pleasure":       {"tempo": 1.02, "pitch": 0.6, "range": 1.20, "energy": 0.20, "pause": 0.95},
+    "delight":        {"pitch": 1.4, "range": 1.40, "energy": 0.45},
+    "excitement":     {"tempo": 1.10, "pitch": 1.6, "range": 1.40, "energy": 0.60, "pause": 0.82, "temp": 0.06},
+    "enthusiasm":     {"tempo": 1.08, "range": 1.35, "energy": 0.55, "pause": 0.85},
+    "amusement":      {"tempo": 1.04, "pitch": 1.0, "range": 1.40, "energy": 0.30, "pause": 0.95},
+    "relief":         {"tempo": 0.94, "pitch": -0.2, "range": 1.10, "energy": -0.10, "pause": 1.15, "temp": 0.0},
+    "satisfaction":   {"tempo": 0.96, "pitch": 0.0, "range": 1.05, "energy": 0.0, "pause": 1.10, "temp": 0.0},
+    # disgust
+    "distaste":       {"tempo": 0.95, "pitch": -0.5, "range": 1.05, "energy": 0.0, "pause": 1.10},
+    "revulsion":      {"tempo": 0.90, "pitch": -1.0, "range": 1.25, "energy": 0.25, "pause": 1.20},
+    "repulsion":      {"tempo": 0.91, "pitch": -0.9, "range": 1.20, "energy": 0.20, "pause": 1.18},
+    "moral disgust":  {"tempo": 0.94, "pitch": -0.6, "range": 1.20, "energy": 0.30, "pause": 1.10},
+    # interest (curiosity and intrigue as under surprise)
+    "fascination":    {"tempo": 1.0, "pitch": 0.8, "range": 1.30, "energy": 0.20},
+    "attentiveness":  {"tempo": 1.0, "pitch": 0.2, "range": 1.05, "energy": 0.05, "pause": 1.0},
+    "skepticism":     {"tempo": 0.96, "pitch": -0.2, "range": 1.25, "energy": 0.05, "pause": 1.10, "temp": 0.0},
+    "suspicion":      {"tempo": 0.95, "pitch": -0.4, "range": 1.10, "energy": 0.0, "pause": 1.15, "temp": 0.0},
+    "uncertainty":    {"tempo": 0.95, "pitch": 0.2, "range": 0.95, "energy": -0.10, "pause": 1.20, "temp": 0.0},
+    # social / self-conscious
+    "awkwardness":    {"tempo": 0.98, "pitch": 0.4, "range": 0.95, "energy": -0.10, "pause": 1.20, "temp": 0.02},
+    "shame":          {"tempo": 0.90, "pitch": -0.6, "range": 0.75, "energy": -0.40, "pause": 1.25},
+    "guilt":          {"tempo": 0.92, "pitch": -0.5, "range": 0.80, "energy": -0.30, "pause": 1.20},
+    "pride":          {"tempo": 0.98, "pitch": -0.2, "range": 1.15, "energy": 0.30, "pause": 1.05, "temp": 0.01},
+    "admiration":     {"tempo": 1.0, "pitch": 0.6, "range": 1.20, "energy": 0.15, "pause": 1.0, "temp": 0.02},
+    "envy":           {"pitch": -0.2, "range": 1.0, "energy": 0.10, "pause": 1.10},
+    "jealousy":       {"tempo": 1.02, "pitch": 0.2, "range": 1.10, "energy": 0.25, "pause": 1.0, "temp": 0.02},
+    "defensiveness":  {"tempo": 1.06, "pitch": 0.6, "range": 1.15, "energy": 0.40, "pause": 0.88, "temp": 0.03},
+    # low arousal / detached
+    "indifference":   {"tempo": 0.92, "pitch": -0.6, "energy": -0.45, "pause": 1.20},
+    "boredom":        {"range": 0.60},
+    "apathy":         {"pitch": -1.0, "range": 0.60, "energy": -0.60},
+    "resignation":    {"tempo": 0.90, "range": 0.70, "energy": -0.45, "pause": 1.30},
+    "exhaustion":     {"tempo": 0.85, "pitch": -1.0, "energy": -0.65, "pause": 1.45, "temp": -0.08},
+    "calm":           {"tempo": 0.94, "pitch": -0.4, "range": 0.85, "energy": -0.30, "pause": 1.15, "temp": -0.05},
+    "acceptance":     {"tempo": 0.95, "pitch": -0.2, "range": 0.90, "energy": -0.20, "pause": 1.10, "temp": -0.03},
+}
+
+
+def _es_item_voice(cid, word):
+    """[s3-es-voice] An item's own voice block: "category.word" first (the same
+    word can sit in two categories), then the word; None when it has none."""
+    got = _ES_ITEM_VOICE.get("%s.%s" % (cid, word), _ES_ITEM_VOICE.get(word))
+    return dict(got) if got else None
+
 ES1 = {
     "id": "ES1", "family": "ES", "label": "Emotional Set 1", "version": 1,
     "enabled": True, "weight": 1.0,
@@ -233,10 +344,12 @@ ES1 = {
         {"id": cid, "label": label, "weight": 1.0, "valence": val, "arousal": ar,
          "dims": dims, "modifiers": mods, "after_lean": _ES_AFTER.get(cid, {}),
          "emoji": _ES_EMOJI[cid],                                          # [s3-es-emoji] the badge
+         "voice": dict(_ES_VOICE[cid]),                                    # [s3-es-voice] how it sounds
          "items": _items([{"id": f"{cid}.{w.replace(' ', '_')}", "label": w,
                            "text": ES_DIRECTION,                           # [s3-es-dir] what the writer is told
                            **({"arousal": _ES_AROUSAL[w]} if w in _ES_AROUSAL else {}),
                            **({"valence": _ES_VALENCE[w]} if w in _ES_VALENCE else {}),
+                           **({"voice": _es_item_voice(cid, w)} if _es_item_voice(cid, w) else {}),   # [s3-es-voice]
                            # [s3-es-emoji] its own, only where it is more specific than the category's
                            **({"emoji": _ES_ITEM_EMOJI[w]}
                               if _ES_ITEM_EMOJI.get(w, _ES_EMOJI[cid]) != _ES_EMOJI[cid] else {})}

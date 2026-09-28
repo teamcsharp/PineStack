@@ -87,6 +87,7 @@ import comfy_workshop
 from parody_stinger_queue import ParodyQueue
 import clip_senses                      # [#1241] where a phrase comes from, and the ban
 import recast_desk                        # [#1215]: the cupboard recast desk
+import es_voice as _es_voice              # [s3-es-voice] how a feeling sounds: the DSP + the engines' own controls
 from director import (director_add, director_beats, director_beats_clause,
                       director_beats_set, director_clause, director_graph,
                       director_feedback_clause, director_lessons_clause,
@@ -9862,6 +9863,7 @@ async def voice_render_any(text: str, voice: str, engine: str = "",
             # ~60. Every road that writes long lost every long line.
             made: list[str] = []
             secs = 0.0
+            _es_made = None                        # [s3-es-voice] what the pieces carry
             for piece in pieces:
                 part = await voice_render_any(piece, voice, engine,
                                               fx=fx, who=who, line=line,
@@ -9869,6 +9871,7 @@ async def voice_render_any(text: str, voice: str, engine: str = "",
                                               script_total=script_total)
                 if part and part.get("path"):
                     made.append(part["path"])
+                    _es_made = part.get("es") or _es_made       # [s3-es-voice]
                     secs += float(part.get("seconds") or 0)
             files = [str(f) for f in (_media_file(m) for m in made) if f]
             if len(files) == len(pieces):
@@ -9890,6 +9893,8 @@ async def voice_render_any(text: str, voice: str, engine: str = "",
                     # saying it was zero seconds long and every shelf that
                     # banked one reported nothing on it.
                     out.setdefault("seconds", round(secs, 2))
+                    if _es_made:                               # [s3-es-voice]
+                        out["es"] = _es_made
                     pipeline_log("voice",
                                  f"a {len(text)}-character line was too "
                                  f"long to render in one piece - spoken in "
@@ -13856,6 +13861,16 @@ def _xtts_sanitize(text: str) -> str:
     return t
 
 
+# [s3-es-voice] THE ENGINE'S OWN CONTROLS for the line being rendered: set by
+# voice_generate around synthesize() from the line's ES block
+# (es_voice.engine_opts) and merged into the clone server's `opts` - XTTS: speed
+# and temperature, F5: speed. {} for every other line, which is what it was.
+_ES_ENGINE_OPTS: ContextVar[dict] = ContextVar("es_engine_opts", default={})
+# The XTTS server samples at 0.70 unless told otherwise (REACHY_XTTS_TEMP is not
+# set where the voice director launches it); the ES temp moves around this.
+XTTS_TEMP_BASE = float(os.getenv("XTTS_TEMP_BASE", "0.70") or 0.70)
+
+
 async def _xtts_synthesize(text: str, voice: str) -> bytes:
     """Zero-shot clone via the host's XTTS server. `voice` is a library id;
     its reference.wav rides along base64 on every call."""
@@ -13877,6 +13892,8 @@ async def _xtts_synthesize(text: str, voice: str) -> bytes:
     }
     if abs(rate - 1.0) > 0.01:
         payload["opts"] = {"speed": max(0.75, min(1.25, rate))}
+    if _ES_ENGINE_OPTS.get():                             # [s3-es-voice] the feeling's speed + temperature
+        payload["opts"] = dict(payload.get("opts") or {}, **_ES_ENGINE_OPTS.get())
     async with httpx.AsyncClient(timeout=120) as client:
         resp = await client.post(f"{XTTS_URL}/synthesize", json=payload)
         resp.raise_for_status()
@@ -14113,6 +14130,8 @@ async def _f5_synthesize(text: str, voice: str) -> bytes:
                 "opts": {"nfe_step": 16,
                          "speed": max(0.75, min(1.25, rate))},
             }
+            if _ES_ENGINE_OPTS.get().get("speed"):                # [s3-es-voice] the feeling's speed
+                payload["opts"]["speed"] = _ES_ENGINE_OPTS.get()["speed"]
             resp = await client.post(f"{F5_URL}/synthesize", json=payload)
             resp.raise_for_status()
             # Same trap as XTTS: failures come back as HTTP 200 with a
@@ -15797,6 +15816,69 @@ def pantry_get(key: str) -> dict[str, Any] | None:
         return None
     row["used"] = int(row.get("used") or 0) + 1
     return dict(clip)
+
+
+# --- [s3-es-voice] A SHELF TAKE IS PERFORMED FOR THE LINE THAT AIRS IT (gap 3) -
+# The pantry is keyed on the words, the voice and the engine, never on the
+# performance, and that key is a render ADDRESS twenty roads recompute from those
+# three (reconcile_round_takes, the recast desk, the cupboard's readiness,
+# script production): a performance in it would make every banked round miss its
+# own takes. So a take says what it carries instead (clip["es"], stamped by
+# voice_generate), and the two roads that hand a shelf take to a line with an ES
+# roll of its own (dj_speak #842, speak_turns #886) re-perform it when the two
+# differ: the remaining tempo, melody, effort and pauses on the finished take, no
+# engine visit, levelled, its tail pad kept, as a new file. A banked round's own
+# takes were cut for its own turns and air as they are; a line with no ES of its
+# own airs the take as it is. The temperature cannot be redone after the fact.
+ES_SHELF_TOLERANCE = {"tempo": 0.01, "pitch": 0.1, "range": 0.02, "energy": 0.03, "pause": 0.02}
+
+
+def _es_reperform_blocking(clip: dict[str, Any], want: dict[str, Any]) -> dict[str, Any] | None:
+    name = _take_media_name(clip)
+    path = (VOICE_MEDIA_DIR / name) if name else None
+    if path is None or not path.is_file():
+        return None
+    delta = _es_voice.ratio(want, clip.get("es") or {})
+    if all(abs(delta[k] - _es_voice.NEUTRAL[k]) < tol for k, tol in ES_SHELF_TOLERANCE.items()):
+        return None
+    body, pad_ms = _es_voice.split_tail(path.read_bytes())
+    out = perf_apply(body, {"pace": delta["tempo"], "range": delta["range"],
+                            "energy": delta["energy"], "pause_scale": delta["pause"],
+                            "es": {"pitch": delta["pitch"]}})
+    out = _wav_tail_pad(_level_rms(out, target=int(5200 * box_gain())), pad_ms)
+    stored = _store_media(out, "wav")
+    try:
+        with wave.open(io.BytesIO(out), "rb") as probe:
+            seconds = round(probe.getnframes() / float(probe.getframerate() or 1), 2)
+    except Exception:  # noqa: BLE001
+        seconds = float(clip.get("seconds") or 0)
+    return {**clip, **stored, "seconds": seconds,
+            "es": dict(_es_voice.clean(want), reperformed=delta),
+            "from_take": str(clip.get("path") or "")}
+
+
+async def _es_pantry_perform(clip: dict[str, Any] | None, vec: dict[str, Any] | None,
+                             who: str = "") -> dict[str, Any] | None:
+    """[s3-es-voice] `clip` off the shelf, performed for this line's ES (the
+    vector's `es`), or the clip as it is: no ES on the line, the same one
+    already in the take, or anything at all going wrong - the take airs."""
+    want = (vec or {}).get("es") if isinstance(vec, dict) else None
+    if not clip or not isinstance(want, dict):
+        return clip
+    try:
+        got = await asyncio.to_thread(_es_reperform_blocking, clip, want)
+    except Exception as exc:  # noqa: BLE001
+        pipeline_log("perf", "(s3-es-voice) a shelf take could not be re-performed - it airs as made",
+                     extra=("%s: %s" % (type(exc).__name__, exc))[:300])
+        return clip
+    if not got:
+        return clip
+    pipeline_log("perf", "(s3-es-voice) a shelf take was re-performed for its line's feeling"
+                 + (" - " + str(who) if who else ""),
+                 extra=json.dumps({"want": want, "baked": clip.get("es") or {},
+                                   "delta": (got.get("es") or {}).get("reperformed")},
+                                  default=str)[:800])
+    return got
 
 
 def _pantry_bytes_of(row: dict[str, Any]) -> int:
@@ -20909,7 +20991,7 @@ def gallery_turns(script: str) -> list[str]:
         return [text.strip()] if text.strip() else []
     turns: list[str] = []
     for i in range(1, len(parts) - 1, 2):
-        body = str(parts[i + 1] or "").strip()
+        body = writer_turn_clean(parts[i + 1])     # [s3-rownum] a row number is not a price
         if body:
             turns.append(body)
     return turns
@@ -25545,7 +25627,18 @@ async def voice_generate(text: str, voice: str, engine: str,
                  extra=(f"INPUT to {engine} "
                         f"({voice or 'default voice'}), #397:\n{text}"))
     try:
-        audio, ext = await synthesize(text, voice, engine)
+        # [s3-es-voice] the line's ES block asks the engine first (its own speed
+        # and temperature); what it did natively is not done again by the DSP
+        _es_block = ((fx or {}).get("perf") or {}).get("es") if isinstance((fx or {}).get("perf"), dict) else None
+        _es_opts, _es_native = ({}, {})
+        if isinstance(_es_block, dict):
+            _es_opts, _es_native = _es_voice.engine_opts(
+                _es_block, engine, float(dj_settings().get("speech_rate") or 1.0), XTTS_TEMP_BASE)
+        _es_scope = _ES_ENGINE_OPTS.set(_es_opts)
+        try:
+            audio, ext = await synthesize(text, voice, engine)
+        finally:
+            _ES_ENGINE_OPTS.reset(_es_scope)
     except HTTPException:
         voice_refund(len(text))
         raise
@@ -25575,6 +25668,8 @@ async def voice_generate(text: str, voice: str, engine: str,
             status_code=502, detail="Synthesis returned silence"
         )
 
+    if fx and _es_native.get("tempo"):                        # [s3-es-voice] the engine's share, done
+        fx = dict(fx, perf=dict(fx["perf"], es_native_tempo=float(_es_native["tempo"])))
     if fx:
         audio = await asyncio.to_thread(voice_effect_apply, audio, ext, fx)
     elif ext == "wav":
@@ -25641,6 +25736,10 @@ async def voice_generate(text: str, voice: str, engine: str,
         # able to say "this took three times longer to make than to play".
         "seconds": round(float(length or 0.0), 2),
         "service": service,
+        # [s3-es-voice] what performance this take carries - a shelf road that
+        # hands it to a line with another feeling re-performs it (_es_pantry_perform)
+        **({"es": dict(_es_voice.clean(_es_block), native=_es_native)}
+           if isinstance(_es_block, dict) else {}),
     }
     if _rk:
         _replay_cache()[_rk] = {**_clip_out, "at": int(time.time()),
@@ -32543,7 +32642,8 @@ def _compose_signature(sig: dict[str, Any],
 
 
 def performance_vector(who: str, voice: str = "",
-                       state: dict[str, float] | None = None
+                       state: dict[str, float] | None = None,
+                       es: dict[str, Any] | None = None      # [s3-es-voice] the ES row's voice
                        ) -> dict[str, float]:                # [#1232]
     """Signature baseline + emotional state + macro + master strength.
     Identity (or near it) comes back as {} so the plain path stays exactly
@@ -32596,28 +32696,40 @@ def performance_vector(who: str, voice: str = "",
         state = speaker_state(who)  # the roll it was written under
     else:
         state = {d: float(state.get(d) or 0.0) for d in EMOTION_DIMS}
-    vec["pace"] *= 1 + 0.12 * state["excitement"] - 0.10 * state["fatigue"]
-    vec["pitch_var"] *= 1 + 0.2 * state["excitement"]
+    # [s3-es-voice] A line whose ES roll carries a voice (System 3's ES table)
+    # is voiced by that table: the dims' share of pace, pitch swing, energy and
+    # pauses steps aside (their share of the stumbles stays) and the table's
+    # block goes on after the strength dial, below. `_range` is the
+    # performance's own share of pitch_var - never the signature's, which the
+    # clone engine already speaks - and it is what perf_apply moves (gap 1).
+    _es_on = isinstance(es, dict)
+    _sv = 0.0 if _es_on else 1.0
+    _range = 1.0
+    vec["pace"] *= 1 + _sv * (0.12 * state["excitement"] - 0.10 * state["fatigue"])
+    _range *= 1 + _sv * 0.2 * state["excitement"]
     vec["filler"] += 0.3 * state["confusion"] + 0.2 * state["nervousness"]
     vec["restart"] += 0.25 * state["confusion"] \
         + 0.15 * state["nervousness"]
     vec["repeat"] += 0.15 * state["nervousness"]
-    vec["energy"] += (0.25 * state["excitement"]
-                      + 0.2 * state["irritation"] - 0.2 * state["fatigue"])
-    vec["pause_scale"] *= 1 + 0.25 * state["fatigue"] \
-        - 0.1 * state["irritation"]
+    vec["energy"] += _sv * (0.25 * state["excitement"]
+                            + 0.2 * state["irritation"] - 0.2 * state["fatigue"])
+    vec["pause_scale"] *= 1 + _sv * (0.25 * state["fatigue"]
+                                     - 0.1 * state["irritation"])
     # #750: amusement has been in EMOTION_DIMS since the director was
     # written and read by NOTHING, so a room that ends up laughing
     # sounded exactly like a room that did not. The arc lands on
     # everyone being friends again; that has to be hearable.
-    vec["pitch_var"] *= 1 + 0.22 * state["amusement"]
-    vec["energy"] += 0.16 * state["amusement"]
+    _range *= 1 + _sv * 0.22 * state["amusement"]            # [s3-es-voice]
+    vec["energy"] += _sv * 0.16 * state["amusement"]
+    vec["pitch_var"] *= _range
     macro = str((_RADIO.get("speaker_macro") or {}).get(who) or "")
     for key, amount in (MACRO_STATES.get(macro) or {}).items():
         if key in _MACRO_MULT:
             vec[key] *= amount
         else:
             vec[key] += amount
+        if key == "pitch_var":                              # [s3-es-voice] a mood's swing is a performance
+            _range *= amount
     strength = dj["perf_strength"]
     for key in _PERF_IDENTITY:
         vec[key] = _PERF_IDENTITY[key] \
@@ -32627,10 +32739,22 @@ def performance_vector(who: str, voice: str = "",
     for key in ("filler", "restart", "repeat", "cutoff"):
         vec[key] = max(0.0, min(0.9,
                                 vec[key] * dj["disfluency_rate"] / 0.3))
-    if not macro and not trim             and all(abs(vec[key] - _PERF_IDENTITY[key]) < 0.03
+    # [s3-es-voice] the ES table, literal, after the strength dial (the perf
+    # switch still turns it off with the rest, above)
+    _range = 1 + (_range - 1) * strength
+    _es = _es_voice.clean(es) if _es_on else {}
+    if _es_on:
+        vec["pace"] *= _es.get("tempo", 1.0)
+        vec["energy"] += _es.get("energy", 0.0)
+        vec["pause_scale"] *= _es.get("pause", 1.0)
+        _range *= _es.get("range", 1.0)
+    if not macro and not trim and not _es_on             and all(abs(vec[key] - _PERF_IDENTITY[key]) < 0.03
                     for key in _PERF_IDENTITY):
         return {}
     out = {key: round(vec[key], 3) for key in _PERF_IDENTITY}
+    out["range"] = round(_range, 3)                         # [s3-es-voice] the swing perf_apply moves
+    if _es_on:
+        out["es"] = _es                                     # [s3-es-voice] the engines' share + the melody's middle
     # #756: the trims ride OUT as well as in. They are not part of the
     # performance and the identity rebuild above would otherwise drop them
     # on the floor, which is the whole feature quietly doing nothing.
@@ -35382,6 +35506,12 @@ async def dj_line(kind: str, track: dict[str, Any] | None = None,
                 spice=0.2)
             if answer and not looks_english(answer):
                 answer = ""
+        # [s3-rownum] [s3-heading] THE WRITER'S LINE IS PARSED LIKE A ROUND'S TURNS:
+        # a running-order row number, an echoed prompt header and the segment's
+        # name printed as a heading ("Call with banter A man's cat ..." - a station
+        # ID, 2026-09-28) never reach the voice, on every line this writer returns
+        if answer:
+            answer = writer_turn_clean(answer, writer_headings(kind))
         if answer:
             # #1038: THE SECOND PASS, on the road that writes most of the
             # station. The note above puts the crystal in the prompt; a
@@ -35517,6 +35647,9 @@ def spoken_text(line: str) -> str:
     # wrote it anyway (#642). The prompt does the real work; this is the mouth.
     clean = strip_banned(clean)
     clean = re.sub(r"\s{2,}", " ", clean).strip()
+    # [s3-rownum] belt and braces: a running-order row number left after the last
+    # sentence ("...in here. 11") is never said, whichever road wrote the line
+    clean = re.sub(r"(?<=[.!?\u2026\"\u201d'\u2019)\]])\s+\d{1,2}\s*$", "", clean).strip()
     # #870: the English rule, at the one door every spoken line uses.
     return english_only(clean)
 
@@ -35606,6 +35739,51 @@ def _s3_active() -> bool:
                     and runtime().settings.get("mode") == "active")
     except Exception:  # noqa: BLE001
         return False
+
+
+# [s3-turnchain] THE LINE JUST SAID IS NOT SAID AGAIN, ON ANY ROAD. 2026-09-28 07:04:
+# a TURNTABLE segment aired Dill's "Lines are open at the station. Waiting on our
+# first caller." twice in a row - two single-line "open" nodes (b3e7f516, e331d73e)
+# that each fell back to the stock phrase and drew the same one of its two, ten
+# seconds apart. #494's near-duplicate ring saw it and asked air_gate, which the
+# content-gate switch answers, and the switch is off. This is System 3's rule, not
+# an editorial gate: while System 3 is active, a line that copies one said in the
+# last few minutes at the station's mouths (dj_speak's single lines, speak_turns'
+# unrecorded turns) is not said, and the refusal is a GATE observation on its node.
+# Recorded rounds are gated before they are recorded (the copy gate at the bind).
+S3_SAID_KEEP = 4                # the lines just said that a line may not copy
+S3_SAID_WINDOW = 240.0          # ...said within this many seconds (a segment)
+_S3_SAID: list[dict[str, Any]] = []
+
+
+def _s3_said_copy(text: str, who: str = "", kind: str = "", ref: Any = None) -> str:
+    """"" when `text` is a new line (it is then remembered as said); else why it
+    copies a line just said - the caller does not say it."""
+    copies = globals().get("system3_line_copies")
+    if not callable(copies) or not str(text or "").strip() or not _s3_active():
+        return ""
+    now = time.time()
+    recent = [r for r in _S3_SAID if now - float(r.get("at") or 0) <= S3_SAID_WINDOW][-S3_SAID_KEEP:]
+    try:
+        got = copies(str(text), [str(r.get("text") or "") for r in recent]) if recent else None
+    except Exception:  # noqa: BLE001
+        got = None
+    if got:
+        prev = recent[int(got.get("of") or 0)]
+        why = ("it repeats the line %s said %d s ago (%s)"
+               % (prev.get("who") or "the last voice", int(now - float(prev.get("at") or now)),
+                  got.get("how") or "word for word"))
+        note_drop(who, text, "System 3 copy gate: " + why)
+        gate = globals().get("system3_line_gate")
+        if callable(gate) and ref is not None:
+            try:
+                gate(ref, text, dict(got, why=why, kind=str(kind or "")))
+            except Exception:  # noqa: BLE001
+                pass
+        return why
+    _S3_SAID.append({"at": now, "text": str(text)[:600], "who": str(who or ""), "kind": str(kind or "")})
+    del _S3_SAID[:-16]
+    return ""
 
 
 def _s3_line_remember(line_id: Any, stamp: Any, who: str = "", text: str = "") -> None:
@@ -35810,8 +35988,10 @@ async def _dj_speak_floorless(kind: str, track: dict[str, Any] | None = None,
         system3 = dict(_s3_spoken_handle.stamp)
     _s3_sheet = _pb("sheet", _s3_spoken_handle.sheet if _s3_spoken_handle is not None else "")   # [s3-blocks]
     _s3_perf = (_s3_spoken_handle.perf if _s3_spoken_handle is not None else None)
-    if _s3_perf:
-        vec = performance_vector(who, voice or "", state=_s3_perf)
+    _s3_voice = getattr(_s3_spoken_handle, "voice", None)   # [s3-es-voice] how the feeling sounds
+    if _s3_perf or isinstance(_s3_voice, dict):
+        vec = performance_vector(who, voice or "", state=_s3_perf,
+                                 es=_s3_voice if isinstance(_s3_voice, dict) else None)
     if vec and (vec.get("_macro") or random.random() < 0.2):
         # Behind the glass, the DELIVERY machinery explains itself (#402):
         # what shapes the intonation and who does the shaping.
@@ -35878,10 +36058,29 @@ async def _dj_speak_floorless(kind: str, track: dict[str, Any] | None = None,
     # holding the speaker. Six of those today and none before (#206).
     if not spoken or not re.search(r"[^\W_]", spoken):
         return ""
+    # [s3-echo] A LINE THAT SAYS A DIRECTION OF ITS SHEET NEVER AIRS. The check above
+    # (s3-line-fix) reads each row's FIRST clause and buys one rewrite; a line can
+    # say any other clause - its act, its flow, its feeling. Every clause of the
+    # sheet's rows, contractions folded, a stumble read once: the line is withheld,
+    # System 3 records why, and the drop log says so.
+    if not line and _s3_sheet and callable(globals().get("system3_direction_echo")):
+        _echo_said = globals()["system3_direction_echo"](spoken, _s3_sheet)
+        if _echo_said:
+            pipeline_log("drop", "a %s line from %s said its running-order direction - withheld"
+                         % (kind, who), extra=("%s | %s" % (_echo_said, spoken))[:300])
+            if _s3_spoken_handle is not None and globals().get("system3_withhold"):
+                globals()["system3_withhold"](_s3_spoken_handle, "the line said its running-order "
+                                              "direction: " + _echo_said[:120], "writing")
+            return ""
     if line_forgotten(spoken):
         pipeline_log("drop", "an operator-forgotten line was withheld before recording")
         return ""
     _floor_stage(f"a {kind} line from {who} (written)")
+    # [s3-turnchain] not a line just said, on any road (a round's own chunks come in
+    # `checked`: speak_turns gated the whole turn upstream)
+    if not by_hand and not checked and kind != "reply" and _s3_said_copy(
+            spoken, who, kind, _s3_spoken_handle if _s3_spoken_handle is not None else system3):
+        return ""
     # Never say the same thing twice in a row (#494): the model sometimes
     # re-emits a line it just aired — especially when a round is seeded from
     # the same swath. A near-duplicate of a recent line is dropped, not aired.
@@ -36196,7 +36395,7 @@ async def _dj_speak_floorless(kind: str, track: dict[str, Any] | None = None,
             if _prep_ready:
                 pipeline_log("lookahead", "off the pantry shelf - no render "
                              f"needed - {kind} (#842)")
-                clip = _prep_ready
+                clip = await _es_pantry_perform(_prep_ready, vec, who)   # [s3-es-voice]
                 engine = str(_prep_ready.get("engine") or engine)
         if want_clip and clip is None:
             # #784: ONE ladder, and it tests the OUTCOME rather than the
@@ -42823,6 +43022,8 @@ async def larder_prepare(entry: dict[str, Any],
             fx = dict(voice_effect_pick())
             if vec_for := performance_vector(                  # [#1232]
                     who, voice,
+                    es=(globals()["system3_perf_voice"](entry, None, text, who)   # [s3-es-voice]
+                        if globals().get("system3_perf_voice") else None),
                     state=((globals()["system3_perf_state"](entry, None, text, who)
                             if globals().get("system3_perf_state") else None)
                            or weather_state_for(entry.get("weather"), who))):
@@ -82688,7 +82889,10 @@ def perf_dsp_chain(vec: dict[str, Any], rate: int) -> str:
     parts: list[str] = []
     pace = max(0.6, min(1.6, float(vec.get("pace") or 1.0)
                         * float(vec.get("speed_trim") or 1.0)))
-    if abs(pace - 1.0) > 0.02:
+    # [s3-es-voice] what the engine already did natively is not done twice;
+    # and a 1% tempo is a performance now (was 2%)
+    pace = max(0.6, min(1.6, pace / max(0.5, float(vec.get("es_native_tempo") or 1.0))))
+    if abs(pace - 1.0) > 0.01:
         parts.append(f"atempo={pace:.3f}")
     st = int(round(float(vec.get("pitch_st") or 0)
                    + float(vec.get("pitch_trim") or 0)))     # #756
@@ -82699,6 +82903,15 @@ def perf_dsp_chain(vec: dict[str, Any], rate: int) -> str:
     if st:
         parts.append(_pitch_chain(st, rate))
     energy = float(vec.get("energy") or 0.0)
+    # [s3-es-voice] ENERGY IS COLOUR, NOT VOLUME (gap 2). The volume below was
+    # levelled straight back out by _level_voice and nothing under 0.1 either
+    # way did anything: vocal effort is a brighter, pressed voice or a softer,
+    # darker one (es_voice.energy_chain: headroom, the station's compressor
+    # for real effort, a high shelf); the leveller keeps the last word.
+    _effort = _es_voice.energy_chain(energy)
+    if _effort:
+        parts.append(_effort)
+        energy = 0.0
     if energy > 0.1:
         parts.append(f"volume={1 + 0.5 * min(energy, 1.0):.2f},"
                      "acompressor=threshold=-18dB:ratio=3:makeup=4dB")
@@ -82771,11 +82984,19 @@ def perf_apply(raw: bytes, vec: dict[str, Any]) -> bytes:
         import wave
         with wave.open(io.BytesIO(raw), "rb") as probe:
             rate = probe.getframerate()
+        # [s3-es-voice] THE MELODY FIRST (gap 1: pitch_var reached nothing): the
+        # middle by the ES pitch, the swing by `range`, on the take's own
+        # pulses (es_voice.intonate: TD-PSOLA, duration and formants kept)
+        _es = vec.get("es") if isinstance(vec.get("es"), dict) else {}
+        _mid = float(_es.get("pitch") or 0.0)
+        _swing = float(vec.get("range") or 1.0)
+        if abs(_mid) >= 0.05 or abs(_swing - 1.0) >= 0.02:
+            raw, _how = _es_voice.intonate(raw, _mid, _swing)
         chain = perf_dsp_chain(vec, rate)
         if chain:
             raw = _ffmpeg_af(raw, chain)
         scale = float(vec.get("pause_scale") or 1.0)
-        if abs(scale - 1.0) > 0.15:
+        if abs(scale - 1.0) > 0.03:                     # [s3-es-voice] was 0.15 (gap 2)
             raw = perf_pause_stretch(raw, scale)
     except Exception:
         pass
@@ -83080,6 +83301,28 @@ def _level_voice(raw: bytes) -> bytes:
     return _wav_tail_pad(levelled, int(os.getenv("BOX_TAIL_MS", "900")))
 
 
+def sfx_src_wav_name(path: Path, stamp: int) -> Path:
+    """[sfx-nosound] Where _as_wav keeps `path` decoded to a wav - one
+    spelling for the maker and for sfx_soundless (#1338's rule: a name
+    spelled twice drifts). Its `.nosound` sibling is the note that ffmpeg
+    found no sound track in the file of that mtime."""
+    return SFX_LEVELLED / f"{sfx_id(path)}-{stamp}-src.wav"
+
+
+def sfx_soundless(path: Path) -> bool:
+    """[sfx-nosound] ffmpeg looked for a sound track in this clip and found
+    none - noted once by _as_wav. A road that needs the clip's SOUND (the
+    cadence welds it into a round) passes it over; a road that shows the
+    PICTURE does not ask. Blocking: the share stamp (memoised) and one stat
+    on local disk."""
+    try:
+        stamp = sfx_stamp(path)
+        return bool(stamp) and sfx_src_wav_name(path, stamp).with_suffix(
+            ".nosound").exists()
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _as_wav(path: Path, *, timeout: float = 30.0) -> Path:
     """An mp3 turned into a wav we can measure, cached beside the levelled
     ones. The stdlib cannot decode an mp3 and the sample packs are full of
@@ -83093,16 +83336,40 @@ def _as_wav(path: Path, *, timeout: float = 30.0) -> Path:
         exe = imageio_ffmpeg.get_ffmpeg_exe()
     except Exception:
         return path                      # no decoder; play it as it is
-    out = SFX_LEVELLED / f"{sfx_id(path)}-{path.stat().st_mtime_ns}-src.wav"
+    out = sfx_src_wav_name(path, path.stat().st_mtime_ns)   # [sfx-nosound]
     if out.exists():
         return out
+    # [sfx-nosound] A file with no sound track has nothing to decode, and
+    # asking again cannot change that: the note is read before any ffmpeg.
+    # Measured: one picture-only .MP4 decoded 123 times, every half hour.
+    silent_note = out.with_suffix(".nosound")
+    if silent_note.exists():
+        return path
     SFX_LEVELLED.mkdir(parents=True, exist_ok=True)
     try:
         subprocess.run([exe, "-nostdin", "-loglevel", "error", "-y",
                         "-i", str(path), "-ac", "1", "-ar", "22050",
-                        str(out)], check=True, timeout=timeout)
-    except Exception:
+                        str(out)], check=True, timeout=timeout,
+                       capture_output=True, text=True, errors="replace")
+    except Exception as exc:  # noqa: BLE001
         out.unlink(missing_ok=True)
+        said = getattr(exc, "stderr", "") or ""
+        if isinstance(said, bytes):
+            said = said.decode("utf-8", "replace")
+        said = str(said)
+        if "does not contain any stream" in said or "matches no streams" in said:
+            try:
+                silent_note.write_text("no sound track - ffmpeg: %s\n"
+                                       % " / ".join(said.split("\n"))[:400])
+            except OSError:
+                pass
+            print("[sfx] %s has no sound track - noted (%s), never decoded "
+                  "again" % (path.name, silent_note.name), flush=True)
+        else:
+            # Anything else may answer next time, and is retried as before.
+            print("[sfx] could not decode %s to a wav: %s" % (
+                path.name, (" / ".join(said.strip().split("\n")[-2:])
+                            or type(exc).__name__)[:300]), flush=True)
         return path
     return out
 
@@ -85460,6 +85727,27 @@ def _sfx_cadence_pick() -> Path | None:
     recent = _RADIO.setdefault("recent", {}).setdefault("sfx-cadence", [])
     keep = sting_keep(len(pool))
     fresh = [p for p in pool if str(p) not in recent]
+    if 0 < len(fresh) <= 16:
+        # [cadence-no-repeat] A handful left outside the ring: only the ones
+        # that can go out count. A remainder of clips over the cap (or of no
+        # length at all) would otherwise BE the pool, every roll below would
+        # refuse it, and the draw would answer None for as long as the ring
+        # (durable, #1225) holds the rest - no sting at all.
+        _cap = min(12.0, sfx_cap_seconds())
+
+        def _fits(p: Path) -> bool:
+            try:
+                return 0 < sfx_seconds(p) <= _cap
+            except Exception:  # noqa: BLE001
+                return False
+        fresh = [p for p in fresh if _fits(p)]
+    if not fresh and len(pool) > 1:
+        # [cadence-no-repeat] A family no bigger than the ring: every clip
+        # of it is "recent", and the full pool would include the one that
+        # just went out. Never back to back - the pool minus its last.
+        _in_pool = {str(p) for p in pool}
+        _last = next((r for r in reversed(recent) if r in _in_pool), "")
+        fresh = [p for p in pool if str(p) != _last]
     if fresh:
         pool = fresh
     # Never walk the share or probe its entire catalogue on the microphone.
@@ -85536,6 +85824,17 @@ def _sfx_cadence_video_pick(after: str) -> tuple[Path, Path, float, str] | None:
         if not 0 < seconds <= min(12.0, sfx_cap_seconds()):
             continue
         source = _as_wav(path, timeout=4.0)
+        if source == path and sfx_soundless(path):
+            # [sfx-nosound] a picture with no sound track has nothing to weld
+            # into the round: spent for this deck pass, so the book stops
+            # dealing it here (it was the only unspent clip in its folder, so
+            # it came up every time the folder did). The picture roads still
+            # show it.
+            try:
+                _sfx_video_rotation_mark([sfx_id(path)])
+            except Exception:  # noqa: BLE001
+                pass
+            continue
         if source.suffix.lower() != ".wav" or not source.is_file() or sfx_is_silent(source):
             continue
         audio = sfx_levelled(source)
@@ -89367,6 +89666,8 @@ def gold_note(who: str, text: str, path: str, seconds: float) -> bool:
         name = str(path or "").rsplit("/", 1)[-1].split("?")[0]
         if not text or not name or not rap_rhyme_evidence(text).get("ok"):
             return False
+        if writer_turn_clean(text) != text:
+            return False    # [s3-rownum] its take says a row number or a prompt header
         key = hashlib.sha1(text.lower().encode("utf-8", "ignore")).hexdigest()[:16]
         rows = _gold_rows()
         for row in rows:
@@ -104621,6 +104922,94 @@ def note_drop(who: str, text: str, why: str,
                              "was written."))
 
 
+# [s3-rownum] WHAT THE WRITER RETURNS IS NOT ALL WORDS. The running order numbers
+# its rows and the writer sometimes keeps the number: "10 A: ... 11 B: ..." left
+# each row's number on the END of the turn before it, and the station said it - 394
+# of 11,023 ledger lines in a day (3.57%), 362 of them heard ("...It's nothing to
+# worry about. 5", "Cat. 6", "...in here. 11"). A bare 1-2 digit number after the
+# last sentence is that row number; a line that is only a number is never
+# dialogue; and a writer prompt's own header echoed into the words ("TONIGHT'S
+# TEMPERS : 1") is cut by System 3's scaffold door, which knows every label it
+# writes into a prompt. A number the sentence holds ("gate 7 is open", "Ocean's
+# 11", "call 911", "How many? 12.") is never bare after a finished sentence, and stays.
+_ROW_NUMBER_TAIL = re.compile(r"(?<=[.!?\u2026\"\u201d'\u2019)\]])\s+\d{1,2}\s*$")
+_ROW_NUMBER_LINE = re.compile(r"(?m)^[ \t]*\d{1,3}[.)]?[ \t]*$")
+# [s3-heading] A SEGMENT'S NAME PRINTED AS A HEADING IS NOT A WORD. 2026-09-28, a
+# station ID aired "Call with banter A man's cat dragged someone into the sewer, ..."
+# - its brief (SCHEDULE #843) said THE SEGMENT IS CALLED "Call with banter", the
+# writer printed the name as a heading and the line joined it (4 single lines in 48
+# h, all heard). A leading heading that is one of the round's names - any case,
+# ':' '-' a dash or a new line after it - goes when a new sentence starts right
+# after it; a one-word name only with that separator ("News: The ..." goes, "Call
+# Dill now" stays). "Welcome back to Call with banter!" does not start with it.
+_HEADING_OPEN = r"^[ \t*_#>\"\u201c'\u2018]*"
+_HEADING_CLOSE = r"[*_\"\u201d'\u2019]*"
+_HEADING_SEP = r"(?:[ \t]*[:\-\u2013\u2014][ \t\n]*|[ \t]*\n[ \t\n]*)"
+_HEADING_NEXT = r"(?=[\"\u201c\u2018'*_]*[A-Z0-9])"
+_HEADING_NOT = {"caller", "host", "the host", "co-host", "cohost", "the co-host", "dj", "third", "guest"}
+_HEADING_RX: dict[tuple[str, ...], Any] = {}
+
+
+def writer_headings(*labels: Any) -> tuple[str, ...]:
+    """[s3-heading] The names the writer of the round being written now could
+    print as a heading: what the brief on air called the segment and its entry,
+    and the road / round labels handed in. Longest first."""
+    names: list[str] = []
+    try:
+        brief = str(_schedule_prompt_clause() or "")
+        names += re.findall(r'THE SEGMENT IS CALLED "([^"\n]{2,80})"', brief)
+        names += re.findall(r'THIS ROUND IS THE "([^"\n]{2,80})" ENTRY', brief)
+    except Exception:  # noqa: BLE001
+        pass
+    for lab in labels:
+        names.append(str(lab or "").replace("_", " "))
+    out: list[str] = []
+    for name in names:
+        name = " ".join(str(name).split()).strip(" .:-")
+        if (len(name) >= 3 and name.casefold() not in _HEADING_NOT
+                and name.casefold() not in {x.casefold() for x in out}):
+            out.append(name)
+    return tuple(sorted(out, key=len, reverse=True))
+
+
+def _heading_cut(text: str, names: Any) -> str:
+    key = tuple(str(n) for n in (names or ()) if str(n or "").strip())
+    if not key:
+        return text
+    rx = _HEADING_RX.get(key)
+    if rx is None:
+        alts = []
+        for name in key:
+            words = name.split()
+            core = r"[ \t]+".join(re.escape(w) for w in words)
+            sep = _HEADING_SEP if len(words) < 2 else r"(?:%s|[ \t]+)" % _HEADING_SEP
+            alts.append(r"(?i:%s)%s%s" % (core, _HEADING_CLOSE, sep))
+        rx = re.compile(_HEADING_OPEN + r"(?:%s)" % "|".join(alts) + _HEADING_NEXT)
+        if len(_HEADING_RX) > 32:
+            _HEADING_RX.clear()
+        _HEADING_RX[key] = rx
+    return rx.sub("", text, count=1)
+
+
+def writer_turn_clean(text: Any, headings: Any = ()) -> str:
+    """One turn (or one single line) of the writer's output, as it may be said.
+    `headings`: the names a leading heading could be (writer_headings())."""
+    out = str(text or "")
+    cut = globals().get("system3_scaffold_strip")
+    if callable(cut) and out.strip():
+        try:
+            out = str(cut(out))
+        except Exception:  # noqa: BLE001
+            pass
+    if headings:
+        try:
+            out = _heading_cut(out, headings)
+        except Exception:  # noqa: BLE001
+            pass
+    out = _ROW_NUMBER_LINE.sub("", out).strip()
+    return _ROW_NUMBER_TAIL.sub("", out).strip()
+
+
 def banter_turns(script: str, caller_name: str = "",
                  caller2_name: str = "") -> list[tuple[str, str]]:
     """Split "A: … B: …" into speaker turns.
@@ -104665,7 +105054,7 @@ def banter_turns(script: str, caller_name: str = "",
     script = re.sub(r"(^|\s)([ABCDE])\s*-\s*", r"\1\2: ", script)
     parts = re.split(r"(?:^|\s)([ABCDE])\s*:\s*", " " + script,
                      flags=re.I)
-    turns = [(parts[i].upper(), parts[i + 1].strip())
+    turns = [(parts[i].upper(), writer_turn_clean(parts[i + 1]))   # [s3-rownum]
              for i in range(1, len(parts) - 1, 2)]
     # A model's repeated A is still A's text. Responses are explicit separate
     # turns, and an absent actor or unfinished draft belongs to planning and
@@ -105626,6 +106015,11 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
         #
         # Inside a call every seat is exempt. A repeat is let through or
         # dropped; it is never answered with something off the shelf.
+        # [s3-turnchain] not a line just said - this round's or the one before it
+        _s3_td = (turn_dice or {}).get(turn_index) or (turn_dice or {}).get(str(turn_index)) or {}
+        if not by_hand and not allow_repeat and _s3_said_copy(
+                text, who, "turn", _s3_td.get("s3") if isinstance(_s3_td, dict) else None):
+            continue
         _rerun = rerun_check(text, who,
                              kind="call" if caller_name else "",
                              # #1063: a recorded line is never swapped or
@@ -105747,7 +106141,10 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                   else voices.get(who)) or "",
             state=(globals()["system3_perf_state"](ready_meta, turns, said, who)
                    if _s3_active() and globals().get("system3_perf_state")
-                   else None))
+                   else None),
+            es=(globals()["system3_perf_voice"](ready_meta, turns, said, who)   # [s3-es-voice]
+                if _s3_active() and globals().get("system3_perf_voice")
+                else None))
         first_at = len(playlist)
         # The slider is the ceiling (#423): every piece fits in one
         # announce the box can drain; the SAME voice takes a breath at
@@ -105932,7 +106329,7 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                 pipeline_log("lookahead", "off the pantry shelf - no render "
                              f"needed - {item['who']} (#886)")
                 take_note(item["who"], v, engine, text, _ready, 0, "shelf")
-                return _ready
+                return await _es_pantry_perform(_ready, item.get("vec"), item["who"])   # [s3-es-voice]
             # #746: BOTH cloning engines. This probed XTTS only, so an
             # F5 voice with :8772 down raised out of voice_generate
             # instead of falling back to Piper like everything else.
@@ -107877,7 +108274,14 @@ def _beat_speaks_direction(text: str, row: dict[str, Any]) -> bool:
     def words(value: Any) -> str:
         return " ".join(re.findall(r"[a-z0-9']+", str(value or "").casefold()))
     core = words(re.split(r"[,.;]", str(row.get("work") or ""), 1)[0])
-    return len(core) >= 12 and core in words(text)
+    if len(core) >= 12 and core in words(text):
+        return True
+    # [s3-echo] ...and ANY other clause of the row: its act, its flow, its feeling.
+    # "I can't believe it and says so, and widens it out to the bigger picture."
+    # AIRED (2026-09-28) - the row's RS2 and FL2 directions, not its first clause.
+    # System 3's matcher, when it is installed.
+    _echo = globals().get("system3_direction_echo")
+    return bool(callable(_echo) and _echo(text, str(row.get("work") or "")))
 
 
 def _beat_fresh_only(parsed: list[tuple[str, str]],
@@ -107960,10 +108364,64 @@ def _banter_beat_plan(sheet: str, lines: int,
     return out
 
 
+async def _s3_copy_gate(script: str, handle: Any, caller_name: str = "",
+                        caller2_name: str = "", prepared: bool = False) -> tuple[str, str]:
+    """[s3-turnchain] System 3's copy gate over a written round: (the round as it
+    airs, why it is held or ""). Each caught turn System 3 rolled is written again -
+    one line, one model visit, told the line it answers and its own dice - while its
+    tries and the round's visits last (prepared rounds only); what still copies is
+    dropped with the round's shape kept. Any fault: the round goes on as written,
+    and the log says so."""
+    begin = globals().get("system3_turn_gate")
+    if handle is None or not callable(begin) or not str(script or "").strip():
+        return script, ""
+    try:
+        turns = banter_turns(script, caller_name, caller2_name)
+        if not turns or not begin(handle, turns, [spoken_text(t) for _m, t in turns], bool(prepared)):
+            return script, ""
+        ask_next = globals()["system3_turn_gate_next"]
+        reply = globals()["system3_turn_gate_reply"]
+        clean = globals().get("writer_turn_clean")          # the booth's cleaner, when it is in
+        for _visit in range(64):
+            ask = ask_next(handle)
+            if not ask:
+                break
+            raw = ""
+            try:
+                raw = await ask_model(
+                    str(ask["prompt"]), limit=int(ask.get("limit") or 700), spice=0.5,
+                    mark={"kind": "turn rewrite", "live": not prepared,
+                          "turn": ask.get("turn"), "attempt": ask.get("attempt")})
+            except Exception as exc:  # noqa: BLE001 - a full lane is a failed try, not a wait
+                pipeline_log("system3", "a copied turn's re-write was not written: "
+                             + type(exc).__name__, extra=str(exc)[:200])
+            got = banter_turns(raw or "", caller_name, caller2_name)
+            mine = [t for m, t in got if m == str(ask.get("seat") or "")]
+            said = str((mine or [t for _m, t in got] or [raw or ""])[0])
+            if callable(clean):
+                said = str(clean(said))
+            reply(handle, said, spoken_text(said))
+        done = globals()["system3_turn_gate_done"](handle) or {}
+    except Exception as exc:  # noqa: BLE001
+        pipeline_log("system3", "the copy gate failed - the round goes on as written",
+                     extra=("%s: %s" % (type(exc).__name__, exc))[:300])
+        return script, ""
+    if not done:
+        return script, ""
+    c = done.get("counts") or {}
+    if done.get("changed") or done.get("held"):
+        pipeline_log("system3", "copy gate: %d caught, %d re-written, %d dropped%s%s" % (
+            int(c.get("caught") or 0), int(c.get("rewritten") or 0), int(c.get("dropped") or 0),
+            (", %d written past the end" % int(c.get("trimmed") or 0)) if c.get("trimmed") else "",
+            (" - HELD: " + str(done.get("held"))[:160]) if done.get("held") else ""))
+    out = (str(done.get("script") or "") or script) if done.get("changed") else script
+    return out, str(done.get("held") or "")
+
+
 async def _banter_beats(context: str, sheet: str, lines: int,
                         seats: list[str], seed_text: str = "",
                         trace: list[dict[str, Any]] | None = None,
-                        director: Any = None) -> str:
+                        director: Any = None, gate: Any = None) -> str:
     """Write a banked exchange as responsive 3-4-turn calls.
 
     Each visit receives the final two completed turns verbatim. The generated
@@ -107983,6 +108441,9 @@ async def _banter_beats(context: str, sheet: str, lines: int,
     if len(compact) > 14000:
         compact = compact[:9000].rstrip() + "\n\n[context middle elided]\n\n" + compact[-4500:].lstrip()
 
+    # [s3-turnchain] Mode B: what each caught draft repeated, for the retry to be told
+    _beat_repeated: list[str] = []
+
     async def write(rows: list[dict[str, Any]], retry: bool = False
                     ) -> tuple[str, list[tuple[str, str]], bool]:
         recent = "\n".join(
@@ -107996,6 +108457,9 @@ async def _banter_beats(context: str, sheet: str, lines: int,
             "Use one of its concrete words in the first reply. Do not repeat any line from the "
             "completed transcript; every listed turn is a NEW line."
             if retry else "")
+        if retry and _beat_repeated:                                          # [s3-turnchain]
+            correction += ("\nIts draft of the first listed turn repeated " + _beat_repeated[-1]
+                           + ". Write that turn as a NEW line that answers the line immediately above it.")
         prompt = (
             compact + "\n\nCOMPLETED TRANSCRIPT - these lines are immutable:\n" + recent
             + "\n\nWRITE ONLY THIS NEXT BEAT:\n" + order + correction
@@ -108016,6 +108480,12 @@ async def _banter_beats(context: str, sheet: str, lines: int,
         for row, candidate in zip(rows, parsed):
             text = spoken_text(candidate[1]).strip()
             if not text:
+                if gate is not None:
+                    # [s3-turnchain] empty once cleaned: the prefix ends here and the
+                    # turn is written again - skipping it slid every row after it a seat
+                    _beat_repeated.append("nothing (it was empty once cleaned)")
+                    spoke_direction = True
+                    break
                 continue
             # [#1462] The accepted prefix ends at a turn that is its own
             # direction, so the plan stays seated and the retry (or the
@@ -108033,6 +108503,15 @@ async def _banter_beats(context: str, sheet: str, lines: int,
                 except Exception:  # noqa: BLE001
                     pass
                 break
+            if gate is not None:
+                # [s3-turnchain] a copy of a line already said (or the subject, a topic
+                # row, a passage read back) ends the prefix too: the plan stays seated
+                # and the retry - or the next beat - writes this turn again
+                _copied = gate(made + clean, row, text)
+                if _copied:
+                    _beat_repeated.append(_copied)
+                    spoke_direction = True
+                    break
             clean.append((str(row["seat"]), text))
         return raw, clean, (not spoke_direction) and _beat_sequence_answers(
             made[-1][1] if made else "", rows, parsed)
@@ -109547,7 +110026,9 @@ async def dj_banter(track: dict[str, Any] | None = None,
                 seed_text=str((seed or {}).get("text") or ""),
                 trace=_beat_trace,
                 director=(globals()["system3_director"](_s3)
-                          if globals().get("system3_director") else None))
+                          if globals().get("system3_director") else None),
+                gate=(globals()["system3_beat_gate"](_s3)                     # [s3-turnchain]
+                      if globals().get("system3_beat_gate") else None))
             pipeline_log("model", "banked banter written as %d responsive "
                          "beat(s), %d parsed turns" % (
                              len(_beat_trace), len(banter_turns(script or ""))))
@@ -109891,6 +110372,20 @@ async def dj_banter(track: dict[str, Any] | None = None,
         script = plot_label_scrub(script)
     except Exception:  # noqa: BLE001
         pass
+    # [s3-turnchain] THE COPY GATE, where the written lines are bound to the plan's
+    # turns: every road written here, the one-call writer and the beat chain alike,
+    # after the booth's cleaning (banter_turns). A copied turn is written again -
+    # told the line it answers and its own dice - or dropped with the round's shape
+    # kept; a round whose protocol leg cannot be written without copying is held.
+    if _s3 is not None and getattr(_s3, "active", False):
+        script, _s3_held = await _s3_copy_gate(script, _s3, caller_name, caller2_name,
+                                               bool(bank) or bool(_system2_job))
+        if _s3_held:
+            if globals().get("system3_withhold"):
+                globals()["system3_withhold"](_s3, "the copy gate held it: " + _s3_held[:200], "gate")
+            pipeline_log("system3", "round withheld by the copy gate - " + _s3_held[:200],
+                         extra=str(road or ("caller" if caller_name else "banter")))
+            return []
     # [#1249] the round's topic contract, graded on the words that will air,
     # carried on the call meta and kept in a small ring so the paperwork can
     # still show it after the shelf row has been taken and aired.
@@ -128517,14 +129012,134 @@ def dj_state_lean(state: dict[str, Any]) -> dict[str, Any]:
     return lean
 
 
+# --- [public-door] WHAT THE LISTENER DOOR MAY SEE OF THE STATE --------------
+# "right now, anyone on the Tailscale Funnel can GET /api/dj through the
+#  public listener door without a token. It returns the full dj_state():
+#  476 KB, including standing orders, personas, prompts and traces. ...
+#  find every field they read, allow exactly those, and nothing else."
+#  (2026-09-28)
+#
+# The lean cut above is a DENY list on purpose: the house page must never be
+# starved of a key it starts reading. The door is the other way round - a
+# key added upstairs must NOT reach the open internet until somebody decides
+# it should. So this is an ALLOW list of exactly what the listener page reads
+# off /api/dj. RADIO_PAGE_HTML is the only public page that asks for it (one
+# call, pollOnce); car-diag.js reads page globals and the DOM, sfx-tv.js does
+# not mount on a page with a gallery stage, the slideshow is slideshow.css
+# only, and tune-messenger.js reads voiceCurrentClip - none of them reads it.
+#
+#   build                    pineBuildWatch     reload when the code changed
+#   reload_at                pineReloadWatch    an asked-for reload
+#   on, paused               sync, paintPaused  the dot, the title, the wake
+#   elapsed                  sync               the clock and the bar
+#   listeners, station       sync               "N listeners · <station>"
+#   server_ms, started_ms    sync -> retime     the record's anchor
+#   now.id title artist art seconds url
+#                            sync, retime, paintMediaSession
+#   gallery_now.images       renderGallery
+#   chat[-20:]  id ts text who
+#                            patter, patterKey, patterRow, s3Ask
+#
+# Every value is a leaf (a string, a number, a bool or null), so a structure
+# grown under an allowed name upstairs still stays in the house. A new read
+# on the page is a new name here, deliberately
+# (tests/test_public_door_projection.py fails until it is).
+DJ_PUBLIC_KEYS = ("build", "reload_at", "on", "paused", "elapsed", "listeners",
+                  "station", "server_ms", "started_ms")
+DJ_PUBLIC_NOW = ("id", "title", "artist", "art", "seconds", "url")
+DJ_PUBLIC_CHAT = ("id", "ts", "text", "who")
+# /api/stream/state through the door (no public page reads it; a repair rung
+# only asks whether the door answers): whether the stream is up and how many
+# are on it. Never hls_listeners (every listener's address and token tail),
+# listener_rows, recent_sessions, the spool paths or the lanes' errors.
+STREAM_PUBLIC_KEYS = ("running", "listeners", "mp3_listeners", "hls_active",
+                      "bitrate", "join_burst_s", "title", "artist",
+                      "up_seconds", "produced_seconds")
+
+
+def dj_public_leaf(value: Any) -> Any:
+    """[public-door] A value the door may pass: a leaf, never a structure."""
+    return value if value is None or isinstance(value, (str, int, float, bool)) else None
+
+
+def dj_state_public(state: dict[str, Any]) -> dict[str, Any]:
+    """[public-door] dj_state() as the listener door answers it: the allow
+    list above and nothing else, lean or not."""
+    out: dict[str, Any] = {k: dj_public_leaf(state.get(k))
+                           for k in DJ_PUBLIC_KEYS if k in state}
+    now = state.get("now")
+    out["now"] = ({k: dj_public_leaf(now[k]) for k in DJ_PUBLIC_NOW if k in now}
+                  if isinstance(now, dict) else None)
+    shown = state.get("gallery_now")
+    names = shown.get("images") if isinstance(shown, dict) else None
+    out["gallery_now"] = ({"images": [n for n in names if isinstance(n, str) and n]}
+                          if isinstance(names, list) else None)
+    chat = state.get("chat")
+    out["chat"] = [{k: dj_public_leaf(row[k]) for k in DJ_PUBLIC_CHAT if k in row}
+                   for row in (chat[-DJ_LEAN_CHAT:] if isinstance(chat, list) else [])
+                   if isinstance(row, dict)]
+    return out
+
+
+# --- [public-door] A LINK THAT RAN OUT ---------------------------------------
+# 2026-09-28, a remote listener "can't hear": every share link but three had
+# expired (/api/share mints 168 h), and what a listener holding one got was a
+# raw JSON 403 on /tune/, a 401 on the stream, and - on a page left open past
+# the expiry - silence with no word at all. One sentence now, the same
+# wherever a listener meets it: the page /tune/ draws for a dead link
+# (LINK_GONE_HTML, still a 403), and the tune page's own notice when a road
+# stops honouring its link (listen_link_api says whether it is dead).
+# Expired and revoked are one answer: the page says nothing else about it.
+LINK_GONE_SAY = "This link has expired - ask the station for a new one."
+LINK_GONE_HTML = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="robots" content="noindex">
+<title>Pine Box FM</title>
+<style>
+  :root { color-scheme: dark; }
+  html, body { margin: 0; min-height: 100%; background: #04060b; color: #e8eef2;
+    font: 16px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  main { min-height: 100vh; box-sizing: border-box; padding: 24px 16px;
+    display: flex; flex-direction: column; align-items: center;
+    justify-content: center; text-align: center; }
+  h1 { margin: 0 0 14px; font-size: 18px; letter-spacing: .16em;
+    text-transform: uppercase; color: #65c7da; }
+  p { margin: 0 0 8px; max-width: 26em; }
+  .muted { color: #8fa0ad; font-size: 14px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Pine Box FM</h1>
+  <p id="linkGone">__SAY__</p>
+  <p class="muted">Whoever sent it to you can make you a fresh one.</p>
+</main>
+</body>
+</html>
+""".replace("__SAY__", LINK_GONE_SAY)
+
+
 @app.get("/api/dj")
 async def dj_status(
     request: Request,
     listener: str = "",
     lean: str = "",
+    t: str = "",
     authorization: str | None = Header(default=None),
 ) -> dict[str, Any]:
-    require_read_auth(authorization)
+    # [public-door] Through the listener door this is a LISTENER's road:
+    # the tune-in token, as every other road of the page asks (the door
+    # strips Authorization, so require_read_auth there was open to anyone
+    # while reads are unlocked; the page's api() sends ?t= on every call),
+    # and the door's own cut of the state below. The house is unchanged.
+    public = request.headers.get("x-pinebox-public") == "1"
+    if public:
+        require_listen_auth(t, authorization)
+    else:
+        require_read_auth(authorization)
     # #1367: every surface polls this, continuously, including the tablet.
     # One dict write here is how the station learns that the tablet is
     # alive - see seen_note() for why this is not middleware.
@@ -128532,6 +129147,8 @@ async def dj_status(
     if listener:
         _radio_listeners(listener[:64])
     state = dj_state()
+    if public:                                            # [public-door]
+        return dj_state_public(state)
     # A string, not a bool: FastAPI would 422 a listener who sent
     # anything unexpected, and this is the page's only status route.
     if str(lean or "").strip() not in ("", "0", "false", "no"):
@@ -130473,6 +131090,10 @@ async def dj_join_api(
             f"page, and keep it short.{playing}"
         ),
     )
+    if request.headers.get("x-pinebox-public") == "1":   # [public-door]
+        # The page reads `welcome` off this answer. The rest is the house
+        # panel's dj_state() - the booth's prompts, personas and traces.
+        return {"welcome": line, "listeners": _radio_listeners()}
     return {"welcome": line, "listeners": _radio_listeners(), **dj_state()}
 
 
@@ -155836,9 +156457,20 @@ async def share_list(
     net = await asyncio.to_thread(remote_access)
     now = time.time()
     out = []
+    gone = []                                             # [public-door]
     for tag, row in (rows.get("links") or {}).items():
         left = float(row.get("expires") or 0) - now
         if left <= 0:
+            # [public-door] ...listed apart, and marked. A link that stopped
+            # opening used to leave this list without a word: on 2026-09-28
+            # "a listener", "the radio" and "the car" had run out 6-35 days
+            # earlier and nothing here said so. No url: it opens nothing.
+            gone.append({"tag": tag, "label": row.get("label") or "",
+                         "expires": int(row.get("expires") or 0),
+                         "expired": True,
+                         "hours_ago": round(-left / 3600, 1),
+                         "scope": row.get("scope") or "listen",
+                         "for": str(row.get("for") or "")})
             continue
         url = row.get("url") or ""
         # The token is not tied to a host — only the prefix differs — so the
@@ -155878,7 +156510,11 @@ async def share_list(
                     "best": best,
                     "for": str(row.get("for") or ""),
                     "alts": alts})
-    return {"links": sorted(out, key=lambda r: -r["expires"])}
+    return {"links": sorted(out, key=lambda r: -r["expires"]),
+            # [public-door] the ones that ran out, newest first - apart from
+            # `links`, which every reader takes as live (the desk's public
+            # link, the "open the station" button's pick, the header dot).
+            "expired": sorted(gone, key=lambda r: -r["expires"])[:40]}
 
 
 @app.post("/api/share")
@@ -156372,6 +157008,11 @@ def _public_allows(method: str, path: str) -> bool:
     return False
 
 
+# [public-door] the tune page's own question - is my link still honoured?
+# (listen_link_api). GET only; it answers about the caller's link alone.
+_PUBLIC_GET |= {"/api/listen/link"}
+
+
 class PublicListenerGate:
     """Wraps the whole app and lets almost nothing through.
 
@@ -156393,8 +157034,15 @@ class PublicListenerGate:
             return
         # Strip Authorization, and mark the request so /tune can refuse to
         # serve the control panel through here.
+        # [public-door] ...and any x-pinebox-public the CALLER sent. The mark
+        # below is appended LAST and Starlette's headers.get() answers with
+        # the FIRST header of a name, so a caller who sent
+        # "x-pinebox-public: 0" was the house to every `== "1"` check behind
+        # this door - measured 2026-09-28: GET :8097/api/pinelink/frame.jpg
+        # with that one header and no token answered 200 with the studio
+        # camera. The door's own mark is the only one a handler can see.
         headers = [(k, v) for (k, v) in scope.get("headers") or []
-                   if k.lower() != b"authorization"]
+                   if k.lower() not in (b"authorization", b"x-pinebox-public")]
         headers.append((b"x-pinebox-public", b"1"))
         await self.inner(dict(scope, headers=headers), receive, send)
 
@@ -157090,6 +157738,7 @@ async def station_stream_playlist(
 
 @app.get("/api/stream/state")
 async def station_stream_state(
+    request: Request,
     t: str = "",
     authorization: str | None = Header(default=None),
 ) -> dict[str, Any]:
@@ -157101,7 +157750,14 @@ async def station_stream_state(
     on its own thread.
     """
     require_listen_auth(t, authorization)
-    return STATION_STREAM.state()
+    state = STATION_STREAM.state()
+    if request.headers.get("x-pinebox-public") == "1":   # [public-door]
+        # A tune-in link is anybody's: through the door, whether the stream
+        # is up and how many are on it - never hls_listeners (each
+        # listener's address and token tail), the sessions, the spool paths
+        # or the lanes' errors (STREAM_PUBLIC_KEYS).
+        return {k: dj_public_leaf(state[k]) for k in STREAM_PUBLIC_KEYS if k in state}
+    return state
 
 
 @app.get("/api/stream/hls_ledger")
@@ -158997,9 +159653,12 @@ async def tune_page(token: str, request: Request) -> HTMLResponse:
     without disturbing the key or anybody else's link."""
     scope = token_scope(token)
     if not scope:
-        raise HTTPException(
-            status_code=403,
-            detail="That tune-in link has expired or been revoked.")
+        # [public-door] a person holding a dead link gets a page that says
+        # so in one sentence (LINK_GONE_HTML), not raw JSON: the same 403,
+        # and nothing about the link - expired and revoked read alike.
+        return HTMLResponse(LINK_GONE_HTML, status_code=403,
+                            headers={"Cache-Control": "no-store",
+                                     "Pragma": "no-cache"})
     # #687: through the public listener door it is ALWAYS the radio page,
     # whatever the token is worth. A full-scope pass is for a machine you
     # trust on your own network; it is not a thing to honour from the open
@@ -159033,6 +159692,30 @@ async def tune_page(token: str, request: Request) -> HTMLResponse:
                      + "&v=" + str(int(_BUILD_MS))),
         headers={"Cache-Control": "no-store, no-cache, must-revalidate",
                  "Pragma": "no-cache"})
+
+
+@app.get("/api/listen/link")
+async def listen_link_api(t: str = "") -> Response:
+    """[public-door] Is the tune-in link this page holds still honoured?
+
+    The tune page asks when a road it uses answers 401 or 403 (the stream,
+    the clock, the state, the next line, the picture) and puts
+    LINK_GONE_SAY in place of the player only on a no from here: one road
+    refusing for its own reasons - the camera for an unticked listener, a
+    lock on reads - is not a dead link. It answers about the caller's own
+    link and nothing else: live and when it runs out (the first field of
+    the pass the caller already holds), or 403."""
+    if not (t and token_scope(t)):
+        return Response(content=json.dumps({"live": False, "say": LINK_GONE_SAY}),
+                        status_code=403, media_type="application/json",
+                        headers={"Cache-Control": "no-store"})
+    try:
+        expires = int(str(t).split(".", 1)[0])
+    except ValueError:
+        expires = 0
+    return Response(content=json.dumps({"live": True, "expires": expires}),
+                    media_type="application/json",
+                    headers={"Cache-Control": "no-store"})
 
 
 @app.post("/api/dj/shout")
@@ -159085,6 +159768,11 @@ async def listener_make_ad(
         raise HTTPException(status_code=400,
                             detail="Describe the ad you want to make")
     message, ad = await voice_ad_render(goal)
+    if request.headers.get("x-pinebox-public") == "1":   # [public-door]
+        # The page shows `message`. `ad` is the gallery's record - the
+        # reference clip's sample name and folder, the queue ids, the
+        # written copy - and stays in the house.
+        return {"ok": True, "message": message}
     return {"ok": True, "message": message, "ad": ad}
 
 
@@ -224660,6 +225348,38 @@ async function remotePanel() {
       live.appendChild(el("div", "muted", "No links out."));
       live.lastChild.style.fontSize = "11px";
     }
+    /* [public-door] AND THE LINKS THAT RAN OUT, MARKED SO. They used to
+     * leave this list without a word, so a link that had quietly expired
+     * looked like one never made - while the person holding it heard
+     * nothing. The cross clears one for good. */
+    (got.expired || []).forEach((l) => {
+      const line = el("div", "phrase-row", "");
+      line.dataset.expired = "1";
+      line.style.cssText = "align-items:baseline;gap:8px;opacity:.72";
+      const hours = Number(l.hours_ago || 0);
+      const days = Math.floor(hours / 24);
+      const ago = days >= 1 ? days + (days === 1 ? " day" : " days") + " ago"
+        : Math.max(1, Math.round(hours)) + "h ago";
+      const mark = el("span", "", "EXPIRED");
+      mark.style.cssText = "font-size:9px;font-weight:700;letter-spacing:.08em;"
+        + "color:#ffb27a;border:1px solid #6b4a2c;border-radius:4px;padding:0 4px";
+      const name = el("span", "", (l.label || "a link") + " \u00b7 expired " + ago
+        + (l.scope === "full" ? " \u00b7 full access" : ""));
+      name.style.cssText = "flex:1;font-size:11px;text-decoration:line-through";
+      name.title = "This link no longer opens. Make a new one for whoever had it.";
+      const kill = el("button", "", "\u2715");
+      kill.style.fontSize = "11px";
+      kill.title = "Clear this expired link from the list";
+      kill.onclick = async () => {
+        try {
+          await api("/api/share/revoke", {method: "POST",
+            body: JSON.stringify({tag: l.tag})});
+          drawLinks();
+        } catch (e) {}
+      };
+      line.appendChild(mark); line.appendChild(name); line.appendChild(kill);
+      live.appendChild(line);
+    });
   };
   await drawLinks();
 
@@ -259243,6 +259963,10 @@ function _apiCopy(value) {
 }
 
 async function api(path, options = {}) {
+  /* [public-door] once the station has said this page's link is dead,
+   * nothing more is asked of it: the loops tick on, the network is left
+   * alone (linkGoneShow). */
+  if (linkGone) throw new Error(LINK_GONE_SAY);
   let url = path;
   if (GUEST) {
     url += (path.indexOf("?") >= 0 ? "&" : "?")
@@ -259268,6 +259992,12 @@ async function api(path, options = {}) {
                         : options;
   const _run = (async () => {
     const response = await fetch(url, _sent);
+    /* [public-door] a road that no longer honours this page's link: ask
+     * the station whether the link itself is dead (linkSuspect) rather
+     * than fail on in silence. The camera answers 403 to a live link it
+     * was not shared with, so its answers are not a question. */
+    if (GUEST && (response.status === 401 || response.status === 403)
+        && String(path).indexOf("/api/pinelink/") !== 0) linkSuspect(path);
     const data = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(data.detail || "Request failed");
     return data;
@@ -259280,6 +260010,106 @@ async function api(path, options = {}) {
   }
   return _run;
 }
+
+/* [public-door] THE LINK THAT RAN OUT.
+ *
+ * "a tune page left open past its link's expiry just goes SILENT, with no
+ *  message" (2026-09-28). A tune-in link carries its own expiry (the first
+ * field of the pass) and the station stops honouring it then - or at once,
+ * when it is revoked. So:
+ *   - a few days before, the page says so, gently (linkNotice);
+ *   - when a road the page uses answers 401 or 403 - the stream, the clock,
+ *     the state, the next line, the picture - it asks the station whether
+ *     the link itself is dead (GET /api/listen/link, at most every 15 s),
+ *     and only a no from there takes the player off the page and puts the
+ *     station's own sentence in its place (linkGoneShow);
+ *   - when the pass runs out by its own clock the station is asked too, so
+ *     a page nobody is touching still says it.
+ * `var` on purpose: api() reads linkGone, and code that runs before this
+ * block calls api(). */
+var LINK_GONE_SAY = "This link has expired - ask the station for a new one.";
+var LINK_WARN_DAYS = 3;
+var linkGone = false;
+var linkAskedAt = 0;
+
+function linkExpiresMs() {
+  if (!GUEST) return 0;
+  const m = /^(\d{9,11})\./.exec(String(KEY || ""));
+  return m ? Number(m[1]) * 1000 : 0;
+}
+
+function linkSuspect(why) {
+  if (!GUEST || linkGone) return;
+  const now = Date.now();
+  if (now - Number(linkAskedAt || 0) < 15000) return;
+  linkAskedAt = now;
+  fetch("/api/listen/link?t=" + encodeURIComponent(KEY), {cache: "no-store"})
+    .then((r) => { if (r.status === 401 || r.status === 403) linkGoneShow(why); })
+    .catch(() => { /* no answer is not a dead link */ });
+}
+
+function linkGoneShow(why) {
+  if (linkGone) return;
+  linkGone = true;
+  try { if (playing) tune(); } catch (e) {}
+  try { stopEverything(); } catch (e) {}
+  try { carMark("link_gone", {why: String(why || "").slice(0, 80)}); } catch (e) {}
+  const set = document.querySelector(".set");
+  if (set) {
+    Array.from(set.children).forEach((n) => {
+      if (n.tagName !== "H1") n.style.setProperty("display", "none", "important");
+    });
+    const box = document.createElement("div");
+    box.id = "linkGone";
+    box.setAttribute("role", "alert");
+    box.style.cssText = "margin:28px 0 12px;font-size:17px;line-height:1.5";
+    box.textContent = LINK_GONE_SAY;
+    const more = document.createElement("div");
+    more.style.cssText = "margin-top:8px;font-size:13px;opacity:.7";
+    more.textContent = "Whoever sent it to you can make you a fresh one.";
+    box.appendChild(more);
+    set.appendChild(box);
+  }
+  ["upFab", "upSheet", "carToggle"].forEach((id) => {
+    const n = document.getElementById(id);
+    if (n) n.style.setProperty("display", "none", "important");
+  });
+  try { if ("mediaSession" in navigator) navigator.mediaSession.playbackState = "none"; } catch (e) {}
+}
+
+function linkNotice() {
+  const at = linkExpiresMs();
+  let box = document.getElementById("linkSoon");
+  const left = at - Date.now();
+  if (!at || linkGone || left <= 0 || left > LINK_WARN_DAYS * 86400000) {
+    if (box) box.remove();
+    return;
+  }
+  if (!box) {
+    const sub = document.getElementById("sub");
+    if (!sub || !sub.parentNode) return;
+    box = document.createElement("div");
+    box.id = "linkSoon";
+    box.setAttribute("role", "status");
+    box.style.cssText = "margin:4px 0 10px;font-size:13px;line-height:1.45;color:#e8c27a";
+    sub.parentNode.insertBefore(box, sub.nextSibling);
+  }
+  const days = Math.floor(left / 86400000);
+  const hours = Math.floor(left / 3600000);
+  const when = days >= 1 ? days + (days === 1 ? " day" : " days")
+    : hours >= 1 ? hours + (hours === 1 ? " hour" : " hours") : "less than an hour";
+  box.textContent = "This link stops working in " + when
+    + " - ask the station for a new one before then.";
+}
+
+try {
+  linkNotice();
+  setInterval(() => { try { linkNotice(); } catch (e) {} }, 600000);
+  const due = linkExpiresMs() - Date.now();
+  if (due > 0 && due < 2147000000) {
+    setTimeout(() => { try { linkAskedAt = 0; linkSuspect("expired"); } catch (e) {} }, due + 2000);
+  }
+} catch (e) { /* the page plays on */ }
 
 /* #632: the room can shout back. A reaction is a mood the show can feel; a
  * line is read out on air and answered by name. */
@@ -261206,6 +262036,9 @@ function streamProbe(why) {
     clearTimeout(timer);
     carMark("stream_probe", {why: why, status: r.status, ms: Date.now() - now,
                              online: navigator.onLine, road: currentRoad()});
+    /* [public-door] the stream refusing the link is the loudest sign it
+     * has run out - and an <audio> error never says so by itself. */
+    if (r.status === 401 || r.status === 403) linkSuspect("stream");
     try { if (ctl) ctl.abort(); } catch (e) {}
   }).catch((e) => {
     clearTimeout(timer);

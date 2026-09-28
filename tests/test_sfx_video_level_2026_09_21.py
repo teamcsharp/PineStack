@@ -58,9 +58,20 @@ import symtable
 import sys
 import tempfile
 import time
+import unittest
 import uuid
 from pathlib import Path
 from typing import Any
+
+# Run as a script (the two command lines above) this exits with its verdict.
+# IMPORTED - `python -m unittest test_sfx_video_level_2026_09_21`, which is
+# how the station's runners call every module - the checks below still run
+# at import, and SfxVideoLevelContract at the end hands their verdict to the
+# runner. Before it existed the runner reported "Ran 0 tests" whatever the
+# checks found. A box with no encoder is then a SKIP, and a stop is an
+# error, rather than an exit that takes the whole runner down with it; and
+# the runner's own argv (the module name) is never read as a path to app.py.
+AS_SCRIPT = __name__ == "__main__"
 
 # Before app.py is even read: a box with no encoder has nothing to say
 # about levelling, and a SKIP must not depend on its parser either.
@@ -68,9 +79,10 @@ try:
     import imageio_ffmpeg
     FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
 except Exception as exc:                                     # noqa: BLE001
-    raise SystemExit("SKIP: no ffmpeg on this box (%s)" % exc)
+    raise (SystemExit if AS_SCRIPT else unittest.SkipTest)(
+        "SKIP: no ffmpeg on this box (%s)" % exc)
 
-_arg = Path(sys.argv[1]) if len(sys.argv) > 1 else None
+_arg = Path(sys.argv[1]) if AS_SCRIPT and len(sys.argv) > 1 else None
 SRC = str(_arg if _arg and _arg.is_file()
           else Path(__file__).resolve().parents[1] / "app.py")
 s = io.open(SRC, encoding="utf-8").read()
@@ -98,7 +110,8 @@ def shipped(name):
         if isinstance(named, ast.Name) and named.id == name:
             found = node
     if found is None:
-        raise SystemExit("no %s in %s" % (name, SRC))
+        raise (SystemExit if AS_SCRIPT else RuntimeError)(
+            "no %s in %s" % (name, SRC))
     return found
 
 
@@ -161,6 +174,10 @@ FUNCTIONS = (
     "_sfx_loud_encode", "_sfx_lu_remember", "_sfx_loud_make",
     "sfx_video_levelled_name", "sfx_level_cached", "_sfx_video_level_say",
     "sfx_levelled_name", "sfx_levelled", "_as_wav")
+# [sfx-nosound] _as_wav names its wav (and the no-sound note beside it)
+# through sfx_src_wav_name, where tools/sfx_nosound_patch.py is in.
+if "\ndef sfx_src_wav_name(" in s:
+    FUNCTIONS += ("sfx_src_wav_name",)
 # In the order app.py runs them, which is the dependency order by
 # definition: SFX_VIDEO_MEAN_DB is written as SFX_TARGET_LUFS, and a
 # constant is evaluated where it is written. Compiled from the node under
@@ -278,7 +295,8 @@ def clip_at(name, want_lufs, source="pink", seconds=2.0):
     base = measured(probe)["i"]
     probe.unlink()
     if base is None:
-        raise SystemExit("cannot measure this build's %s source" % source)
+        raise (SystemExit if AS_SCRIPT else RuntimeError)(
+            "cannot measure this build's %s source" % source)
     return clip(name, want_lufs - base, source=source, seconds=seconds)
 
 
@@ -733,5 +751,18 @@ finally:
 print("\n%d checks failed" % len(fails))
 for line in fails:
     print("  " + line)
+
+
+class SfxVideoLevelContract(unittest.TestCase):
+    """The loudness contract above, as a runner sees it.
+
+    Every check has already run - at import - by the time the runner
+    collects this; this is their verdict, every failed check named."""
+
+    def test_every_check_of_the_loudness_contract_passes(self):
+        self.assertEqual(fails, [], "%d checks failed:\n  %s"
+                         % (len(fails), "\n  ".join(fails)))
+
+
 if __name__ == "__main__":
     raise SystemExit(1 if fails else 0)

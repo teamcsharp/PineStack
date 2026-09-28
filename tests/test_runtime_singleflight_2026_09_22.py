@@ -1,7 +1,9 @@
 """Regression coverage for live-loop work that must never multiply or block."""
 import ast
 import asyncio
+import builtins
 import re
+import symtable
 import threading
 import time
 import unittest
@@ -19,12 +21,35 @@ def function_source(name):
     return compile(ast.Module(body=[node], type_ignores=[]), "app.py:runtime-performance", "exec")
 
 
+# What the beat chain is compiled from. [s3-rounds] (31fdf09) added
+# _beat_fresh_only - a beat drops the lines it re-emitted from the completed
+# transcript before seating - and #1462 (dcadcaf) _beat_speaks_direction. A
+# name missing here is a NameError inside write(), which the chain catches
+# as a failed writer: the test then reads the two-line emergency fallback
+# ("2 != 10") instead of the chain. The harness test below names the gap.
+BEAT_NAMES = {"_BANTER_BEAT_ROW", "_BANTER_BEAT_STOCK", "_BANTER_BEAT_STOP",
+              "WritingDeferred",
+              "_beat_content_words", "_beat_answers", "_beat_sequence_answers",
+              "_beat_fresh_only", "_beat_speaks_direction",
+              "_banter_beat_plan",
+              "_banter_beats"}
+# ...and what every test hands it instead of the station.
+BEAT_STUBS = {"asyncio", "re", "time", "Any", "ask_model", "banter_turns",
+              "spoken_text", "prep_should_stop", "_verbatim_turn_text",
+              "line_review_capture"}
+
+
+def beat_namespace(ask_model, parse):
+    return {"asyncio": asyncio, "re": re, "time": time, "Any": Any,
+            "ask_model": ask_model, "banter_turns": parse,
+            "spoken_text": lambda value: value,
+            "prep_should_stop": lambda: "",
+            "_verbatim_turn_text": lambda value: str(value),
+            "line_review_capture": lambda *_a, **_k: None}
+
+
 def banter_beat_source():
-    names = {"_BANTER_BEAT_ROW", "_BANTER_BEAT_STOCK", "_BANTER_BEAT_STOP",
-             "WritingDeferred",
-             "_beat_content_words", "_beat_answers", "_beat_sequence_answers",
-             "_banter_beat_plan",
-             "_banter_beats"}
+    names = BEAT_NAMES
     nodes = []
     for node in TREE.body:
         name = getattr(node, "name", "")
@@ -126,22 +151,34 @@ class RuntimeSingleFlightTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_banked_beat_chain_carries_completed_lines_forward(self):
         prompts = []
+        # Ten DIFFERENT lines, each answering the one before it through
+        # "signal". [s3-rounds] (31fdf09) drops a line that is 85% the same
+        # as one already made - "signal answer for turn 3." against "...turn
+        # 2." is 96% - because the writer re-emitted the transcript in 163 of
+        # 302 replies. Lines that differ by one digit are that copy.
+        said = {
+            2: "That signal sounds like a harbor bell at midnight.",
+            3: "No, the signal is a kettle whistling in the back room.",
+            4: "Kettles do not hum in minor keys; this signal does.",
+            5: "Then the signal belongs to the choir practising upstairs.",
+            6: "Upstairs is empty since Tuesday, so blame the signal tower.",
+            7: "The tower crew swears their signal went dark an hour ago.",
+            8: "Dark or not, something keeps the signal pulsing every ten seconds.",
+            9: "Ten seconds is how long my toaster takes; check the signal there.",
+            10: "Your toaster explains the crumbs, not the signal on channel four.",
+        }
 
         async def ask_model(prompt, **_kwargs):
             prompts.append(prompt)
             rows = re.findall(r"(?m)^(\d+)  ([ABCD])  -", prompt)
-            return "\n".join("%s: signal answer for turn %s." % (seat, turn)
+            return "\n".join("%s: %s" % (seat, said[int(turn)])
                               for turn, seat in rows)
 
         def parse(script, *_args):
             return [(marker, text.strip()) for marker, text in
                     re.findall(r"(?m)^([ABCD]):\s*(.+)$", script)]
 
-        namespace = {"asyncio": asyncio, "re": re, "time": time, "Any": Any,
-                     "ask_model": ask_model, "banter_turns": parse,
-                     "spoken_text": lambda value: value,
-                     "prep_should_stop": lambda: "",
-                     "_verbatim_turn_text": lambda value: str(value)}
+        namespace = beat_namespace(ask_model, parse)
         exec(banter_beat_source(), namespace)
         trace = []
         sheet = "\n".join("%2d  %s  - answers the prior turn" %
@@ -153,6 +190,8 @@ class RuntimeSingleFlightTests(unittest.IsolatedAsyncioTestCase):
         turns = parse(script)
         self.assertEqual(len(turns), 10)
         self.assertEqual(turns[0], ("A", "The signal begins here."))
+        self.assertEqual([text for _seat, text in turns[1:]],
+                         [said[turn] for turn in range(2, 11)])
         self.assertEqual(len(prompts), 3)
         self.assertIn("A has just said - The signal begins here.", prompts[0])
         self.assertIn("COMPLETED TRANSCRIPT", prompts[1])
@@ -173,11 +212,7 @@ class RuntimeSingleFlightTests(unittest.IsolatedAsyncioTestCase):
             return [(marker, text.strip()) for marker, text in
                     re.findall(r"(?m)^([ABCD]):\s*(.+)$", script)]
 
-        namespace = {"asyncio": asyncio, "re": re, "time": time, "Any": Any,
-                     "ask_model": off_topic, "banter_turns": parse,
-                     "spoken_text": lambda value: value,
-                     "prep_should_stop": lambda: "",
-                     "_verbatim_turn_text": lambda value: str(value)}
+        namespace = beat_namespace(off_topic, parse)
         exec(banter_beat_source(), namespace)
         trace = []
         sheet = "\n".join("%2d  %s  - answers the prior turn" %
@@ -213,11 +248,42 @@ class RuntimeSingleFlightTests(unittest.IsolatedAsyncioTestCase):
                 "SUBJECT AND DIRECTION: discuss the signal.",
                 sheet, 5, ["A", "B"], trace=[])
 
+        # ...and ask_model is what raises it for a banter beat. [s3-rounds]
+        # (31fdf09) widened the one kind to every round writer:
+        # `_mark_kind in ("banter beat", "round", "caller")`.
         ask = next(row for row in TREE.body
                    if isinstance(row, ast.AsyncFunctionDef)
                    and row.name == "ask_model")
         ask_body = ast.get_source_segment(SOURCE, ask) or ""
-        self.assertIn('_mark_kind == "banter beat"', ask_body)
+        self.assertRegex(
+            ask_body,
+            r'if [^\n]*_mark_kind[^\n]*"banter beat"[^\n]*:\n'
+            r'(?:[ \t]*#[^\n]*\n)*[ \t]*raise WritingDeferred\(')
+
+    def test_the_beat_harness_holds_every_name_the_chain_reads(self):
+        """The chain above is run from its SHIPPED source in a namespace of
+        its own. Every module-level name it reads - its own helpers
+        included - is either compiled in (BEAT_NAMES) or stubbed
+        (BEAT_STUBS); a helper added to the chain and not here fails HERE,
+        by name, rather than as a writer outage two tests away."""
+        reads = set()
+        for node in TREE.body:
+            if (isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and node.name in BEAT_NAMES):
+                todo = [symtable.symtable(
+                    ast.get_source_segment(SOURCE, node), "app.py", "exec")]
+                while todo:
+                    table = todo.pop()
+                    todo.extend(table.get_children())
+                    for sym in table.get_symbols():
+                        if table.get_type() == "module":
+                            if sym.is_referenced() and not sym.is_assigned() \
+                                    and not sym.is_imported():
+                                reads.add(sym.get_name())
+                        elif sym.is_global() and sym.is_referenced():
+                            reads.add(sym.get_name())
+        missing = reads - BEAT_NAMES - BEAT_STUBS - set(dir(builtins))
+        self.assertEqual(missing, set())
 
     def test_system2_keeps_its_exact_budget_out_of_the_beat_chain(self):
         node = next(row for row in TREE.body

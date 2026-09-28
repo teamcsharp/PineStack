@@ -405,6 +405,60 @@ def _speaks_direction(text, direction):
     return len(core) >= 12 and core in words(text)
 
 
+# [s3-es-voice] HOW A FEELING SOUNDS. The roll "is fed to the intonation engine to
+# take place affecting the way the recording is made so they emotionally reflect
+# the dialogue" (the operator, 2026-09-28). An ES row's `voice` (the Tables tab;
+# defaults in system3_tables._ES_VOICE / _ES_ITEM_VOICE) is the full send; the
+# turn's intensity scales it; the station makes it sound (es_voice.py).
+ES_VOICE_MULT = ("tempo", "range", "pause")
+
+
+def clean_es_voice(block):
+    """[s3-es-voice] A row's `voice`: numbers only, inside ES_VOICE_BOUNDS,
+    unknown keys dropped. None when it is not a block at all."""
+    if not isinstance(block, dict):
+        return None
+    out = {}
+    for k in system3_tables.ES_VOICE_KEYS:
+        if k not in block:
+            continue
+        try:
+            v = float(block[k])
+        except (TypeError, ValueError):
+            continue
+        if v != v or v in (float("inf"), float("-inf")):
+            continue
+        lo, hi = system3_tables.ES_VOICE_BOUNDS[k]
+        out[k] = round(min(hi, max(lo, v)), 3)
+    return out
+
+
+def es_voice(config, spec):
+    """[s3-es-voice] The voice of an ES pick, as the table it came from holds it:
+    the category's block with the item's own keys over it. None when neither
+    row carries one - the station then reads the feeling's dims alone, as it
+    always did. Nothing is drawn."""
+    cat, item = _es_row(config, spec)
+    base = clean_es_voice((cat or {}).get("voice"))
+    own = clean_es_voice((item or {}).get("voice"))
+    if base is None and own is None:
+        return None
+    out = dict(base or {})
+    out.update(own or {})
+    return out
+
+
+def voice_intent(block, intensity):
+    """[s3-es-voice] A voice block at a turn's intensity. The table is the full
+    send; intensity i gets s = 0.35 + 0.65 i of it (the dims' own curve):
+    tempo, range and pause as v ** s, pitch, energy and temp as v * s."""
+    s = 0.35 + 0.65 * clamp(float(intensity or 0.0))
+    out = {}
+    for k, v in (clean_es_voice(block) or {}).items():
+        out[k] = round(v ** s if k in ES_VOICE_MULT else v * s, 4)
+    return out
+
+
 def validate_table(table):
     """Refuse a table that cannot be drawn from; returns the cleaned copy."""
     if not isinstance(table, dict):
@@ -438,6 +492,12 @@ def validate_table(table):
         cat["weight"] = max(0.0, float(cat.get("weight", 1.0) or 0))
         if "emoji" in cat:                                   # [s3-es-emoji] the badge, trimmed
             cat["emoji"] = clean_emoji(cat["emoji"])
+        if family == "ES" and "voice" in cat:                # [s3-es-voice] how it sounds, in bounds
+            _v = clean_es_voice(cat["voice"])
+            if _v is None:
+                cat.pop("voice")
+            else:
+                cat["voice"] = _v
         if family == "EVENT":                                # [s3-events] one kind of happening
             cat["odds"] = round(clamp(cat.get("odds", 0.1)), 4)
             cat["seat"] = str(cat.get("seat") or "any") if str(cat.get("seat") or "any") in EVENT_SEATS else "any"
@@ -457,6 +517,12 @@ def validate_table(table):
             item.setdefault("label", item["id"])
             if "emoji" in item:                              # [s3-es-emoji] its own badge, trimmed
                 item["emoji"] = clean_emoji(item["emoji"])
+            if family == "ES" and "voice" in item:           # [s3-es-voice] its own sound, in bounds
+                _v = clean_es_voice(item["voice"])
+                if _v is None:
+                    item.pop("voice")
+                else:
+                    item["voice"] = _v
             if family == "DIRECTIVE":                       # [s3-cast] the row's own odds and lifetime
                 item["odds"] = round(clamp(item.get("odds", 1.0)), 4)
                 item["until"] = max(0.0, float(item.get("until") or 0))
@@ -1555,6 +1621,9 @@ def _decide_turn(conv, config, settings, stream, step, speaker, want, inputs, cl
                 who["energy"] = round(clamp(0.7 * who["energy"] + 0.3 * arousal * intensity * 2), 3)
             turn["performance"] = performance_intent(spec, intensity, d,
                                                      base_arousal=_es_base_arousal(config, spec))   # [s3-es-dir]
+            _voice = es_voice(config, spec)                                  # [s3-es-voice] how it sounds
+            if _voice is not None:
+                turn["performance"]["voice"] = voice_intent(_voice, intensity)
             if who:
                 who["emotion"]["dims"] = turn["performance"]["dims"]
             d["energy"] = round(clamp(0.8 * d["energy"] + 0.2 * turn["performance"]["energy"]), 4)
@@ -4734,13 +4803,290 @@ def _round_adds(turn, prev_name):
     return add
 
 
+# --- [s3-scaffold] a prompt's own headers never reach the air --------------------
+#
+# 2026-09-28: lines AIRED ending "... TONIGHT'S TEMPERS : 1" and "... TONIGHT'S TEMPERS
+# : A is deadly serious, ...; B is bored to the back teeth and barely hiding it." -
+# the writer echoed the running order's own header into the last turn - and others
+# opening on a row's own label: "The subject changes here: I was in the kitchen.",
+# "LANDS IT: back to the station, glowing. ...", "BACK TO THE MUSIC: one line that
+# closes the bulletin and hands over." (the ledger since 2026-09-27: 2 + 5 + 4). The
+# labels are the ones System 3 writes into a writer's prompt, read off its own texts:
+#   sections  its sheets' headers, every structure's head, tail and material, every
+#             prompt block's name and label. What follows one is prompt, not speech:
+#             cut to the end of its paragraph. Two words or more match in any case
+#             before a colon and in capitals before a full stop; one word only in
+#             capitals, before a colon.
+#   rows      a running-order row's own label - every leg's act opens on one ("LANDS
+#             IT: ...") - and the sheet's THE SUBJECT CHANGES HERE, TAKES OVER THE LEAD
+#             (from ...) and WHAT HAPPENS ON THIS TURN (...). The line may follow
+#             one, so only the label goes, with the row's own direction words when
+#             they were echoed after it. In capitals (the subject change in any case).
+# A header starts a line or a sentence. find_scaffold is the validator's check.
+TEMPERS_LABEL = "TONIGHT'S TEMPERS"
+BOOTH_LABEL = "IN THE BOOTH"
+EXCHANGE_LABEL = "THE RUNNING ORDER OF THIS EXCHANGE"
+SUBJECT_LABEL = "THE SUBJECT CHANGES HERE"
+LEAD_LABEL = "TAKES OVER THE LEAD"                  # [s3-booth] a row where the lead changes hands
+LEAD_WHY = "their take won the room, so from here they drive the conversation and the others answer them"
+EVENT_LABEL = "WHAT HAPPENS ON THIS TURN"          # [s3-events] a row's happening
+SHEET_LABELS = (EXCHANGE_LABEL, TEMPERS_LABEL, BOOTH_LABEL)
+_CAPS_HEAD = re.compile(r"^[^A-Za-z{]*([A-Z][A-Z'\u2019-]*(?:[ \t]+[A-Z][A-Z'\u2019-]*)*)(?![a-z])")
+_PARAGRAPH_END = re.compile(r"\n[ \t]*\n")
+_HEAD_AT = r"(?:^|(?<=\n)|(?<=[.!?\u2026\"\u201d')\]])[ \t]+)[ \t]*"
+_PAREN = r"[ \t]*(?:\([^)\n]{0,40}\))?[ \t]*"
+_SCAFFOLD_RX = {}
+
+
+def _caps_label(text, words=1):
+    m = _CAPS_HEAD.match(str(text or ""))
+    lab = " ".join(m.group(1).split()).strip(" -'") if m else ""
+    return lab if len(lab.replace(" ", "")) >= 3 and len(lab.split()) >= words else ""
+
+
+def scaffold_kit(config=None, conv=None):
+    """(sections, rows): every label System 3 writes into a writer's prompt,
+    longest first; rows carry the direction words that follow them."""
+    cfg = config if isinstance(config, dict) else {}
+    sts = list(system3_tables.default_structures().values()) + [system3_tables.default_structure()]
+    sts += [v for v in (cfg.get("structures") or {}).values() if isinstance(v, dict)]
+    if isinstance(cfg.get("structure"), dict):
+        sts.append(cfg["structure"])
+    if isinstance(conv, dict):
+        sts += [conv.get("road_structure") or {}, conv.get("call_structure") or {}]
+    sections = list(SHEET_LABELS)
+    rows = {SUBJECT_LABEL: set(), LEAD_LABEL: {LEAD_WHY}, EVENT_LABEL: set()}
+    for st in sts:
+        for key in ("head", "tail", "material"):
+            sections.append(_caps_label(st.get(key)))
+        for leg in st.get("legs") or []:
+            act = str((leg or {}).get("act") or "") if isinstance(leg, dict) else ""
+            lab = _caps_label(act, words=2)
+            if lab:
+                rest = act[act.find(lab.split()[-1]) + len(lab.split()[-1]):].lstrip(" :.-")
+                rows.setdefault(lab, set()).add(" ".join(rest.split())[:300])
+    for name, rule in block_rules(cfg).items():
+        sections.append(str(name).replace("_", " ").upper())
+        sections.append(_caps_label((rule or {}).get("label")))
+    keep = sorted({x for x in sections if x and x == x.upper() and x not in rows}, key=lambda x: (-len(x), x))
+    return (tuple(keep), tuple(sorted(((k, tuple(sorted(v))) for k, v in rows.items()),
+                                      key=lambda kv: (-len(kv[0]), kv[0]))))
+
+
+def scaffold_labels(config=None, conv=None):
+    """Every label on the kit, sections and rows, longest first."""
+    sections, rows = scaffold_kit(config, conv)
+    return tuple(sorted(set(sections) | {k for k, _v in rows}, key=lambda x: (-len(x), x)))
+
+
+def _label_rx(label):
+    return r"\s+".join(re.escape(w) for w in label.split()).replace("'", "['\u2019]")
+
+
+def _scaffold_rx(kit):
+    got = _SCAFFOLD_RX.get(kit)
+    if got is not None:
+        return got
+    sections, rows = kit
+    multi = "|".join(_label_rx(x) for x in sections if " " in x)
+    single = "|".join(_label_rx(x) for x in sections if " " not in x)
+    alts = []
+    if multi:
+        alts += [r"(?i:%s)%s:" % (multi, _PAREN), r"(?:%s)%s[:.]" % (multi, _PAREN)]
+    if single:
+        alts.append(r"(?:%s)%s:" % (single, _PAREN))
+    sec = re.compile(_HEAD_AT + r"(%s)" % "|".join(alts)) if alts else None
+    caps = "|".join(_label_rx(k) for k, _v in rows if k != SUBJECT_LABEL)
+    row_alts = [r"(?i:%s)%s:" % (_label_rx(SUBJECT_LABEL), _PAREN)]
+    if caps:
+        row_alts.append(r"(?:%s)%s[:.]" % (caps, _PAREN))
+    row = re.compile(_HEAD_AT + r"(%s)" % "|".join(row_alts))
+    tails = {k: [re.compile(r"[ \t]*" + r"\W*".join(re.escape(w) for w in c.split()) + r"[^\w\s]*", re.I)
+                 for c in sorted(v, key=len, reverse=True) if c.split()] for k, v in rows}
+    if len(_SCAFFOLD_RX) > 16:
+        _SCAFFOLD_RX.clear()
+    _SCAFFOLD_RX[kit] = got = (sec, row, tails)
+    return got
+
+
+def _row_label_of(found, rows):
+    words = " ".join(re.sub(r"\([^)]*\)", " ", found).replace("\u2019", "'").strip(" :.").split()).upper()
+    return next((k for k, _v in rows if " ".join(k.split()) == words), SUBJECT_LABEL)
+
+
+def find_scaffold(text, kit=None):
+    """The prompt header or row label echoed in `text`, or ""."""
+    sec, row, _t = _scaffold_rx(kit if kit is not None else scaffold_kit())
+    s = str(text or "")
+    for rx in (sec, row):
+        m = rx.search(s) if rx is not None else None
+        if m:
+            return " ".join(m.group(1).split())
+    return ""
+
+
+def strip_scaffold(text, kit=None):
+    """`text` with every echoed prompt header cut to the end of its paragraph,
+    and every echoed row label cut with its own direction words."""
+    kit = kit if kit is not None else scaffold_kit()
+    sec, row, tails = _scaffold_rx(kit)
+    s = str(text or "")
+    cut = False
+    for _guard in range(64):
+        ms = [m for m in ((sec.search(s) if sec is not None else None), row.search(s)) if m]
+        if not ms:
+            break
+        m = min(ms, key=lambda x: x.start())
+        if m.re is sec:
+            end = _PARAGRAPH_END.search(s, m.end())
+            s = s[:m.start()] + (s[end.start():] if end else "")
+        else:
+            stop = m.end()
+            for rx in tails.get(_row_label_of(m.group(1), kit[1])) or []:
+                t = rx.match(s, stop)
+                if t:
+                    stop = t.end()
+                    break
+            s = s[:m.start()] + (" " if m.start() and not s[m.start() - 1].isspace() else "") + s[stop:].lstrip(" \t")
+        cut = True
+    if cut:
+        # the row number that rode in with it is not a word either
+        s = re.sub(r"(?m)^[ \t]*\d{1,3}[.)]?[ \t]*$", "", s)
+    return s.strip() if cut else s
+
+
+# --- [s3-echo] a running-order direction said as dialogue never airs --------------
+#
+# 2026-09-28, AIRED (line cb38bcc8, a banter round): "I can't believe it and says so,
+# and widens it out to the bigger picture." - its sheet's row read "... feeling
+# repulsion (plainly) about it: cannot believe it and says so, and widens it out to
+# the bigger picture.", an RS2 and an FL2 row's own words. The beat writer's check
+# (#1462) and the single line's (s3-line-fix) read a row's FIRST clause only
+# ("answers what Skip just said (...") and neither saw it. Here a direction is read
+# at the row grammar's joints (": ", "; then ", ", and ", " - ", "(...)", "[...]",
+# "while doing it,"), the words meant to be said left out (a quoted passage, "exact
+# words", the operator's directive); a clause of ECHO_MIN_WORDS words or more inside
+# a line - contractions folded, a stumble read once - is the direction said aloud,
+# and so is a row's own feeling read out as one ("In distaste, plainly: ..."). An
+# item keeps its own commas: "tells them flatly that no, bro, that isn't gonna work"
+# is one direction, and "No, bro, that isn't gonna work." is that direction
+# PERFORMED, not said. find: direction_echo(); the validator flags it on every
+# written turn; the runtime cuts a turn that still carries one before the bind.
+ECHO_MIN_WORDS = 4
+ECHO_MIN_CHARS = 16
+_ECHO_ROW = re.compile(r"(?m)^\s*\d+\s+[A-ES]\s+[-\u2013\u2014]\s*(.+?)\s*$")
+_ECHO_QUOTED = re.compile(r'"(?:[^"\\\n]|\\.)*"|\u201c[^\u201d\n]*\u201d')
+_ECHO_DIRECTIVE = re.compile(r"THE OPERATOR['\u2019]S DIRECTIVE FOR [^:\n]{0,60}:.*?(?=\.\s+[A-Z]|\.?\s*$)", re.S)
+_ECHO_PAREN = re.compile(r"\(([^()]*)\)")
+_ECHO_JOINT = re.compile(r"\s*(?:[:;]\s+(?:then\s+|and\s+)?|\s[-\u2013\u2014]+\s|\u2014|(?<=[a-z0-9])\.\s+|[\[\]]"
+                         r"|,\s+(?:and|then)\s+|,\s+(?=(?:feeling|in|while)\b)|\bwhile doing it,\s*)\s*", re.I)
+_ECHO_FEEL = re.compile(r"\b(?:in|feeling)\s+([a-z]+)\s*[(,]\s*(mildly|plainly|hard)\b", re.I)
+_ECHO_FOLD = ((re.compile(r"\bcan['\u2019]?t\b|\bcan not\b"), "cannot"), (re.compile(r"\bwon['\u2019]t\b"), "will not"),
+              (re.compile(r"n['\u2019]t\b"), " not"), (re.compile(r"['\u2019]re\b"), " are"),
+              (re.compile(r"['\u2019]ve\b"), " have"), (re.compile(r"['\u2019]ll\b"), " will"),
+              (re.compile(r"\bi['\u2019]m\b"), "i am"),
+              (re.compile(r"\b(it|that|what|there|here|he|she|who)['\u2019]s\b"), r"\1 is"),
+              (re.compile(r"['\u2019]"), ""))
+_ECHO_FILLERS = frozenset(("uh", "um", "er", "erm", "uhh", "umm", "hmm", "ah", "mm"))
+# a clause holding a label in capitals ("BACK TO THE MUSIC", "HERE SKIP IS OPENLY
+# SHOCKED") is the scaffold's to cut, and its words are often the ones performed
+# ("Back to the music."); a short clause that only names a thing ("the next story
+# off the page") is how a line may well begin - neither is a direction's echo
+_ECHO_CAPS = re.compile(r"\b[A-Z][A-Z'\u2019]+(?:[ \t]+[A-Z][A-Z'\u2019]+)+\b")
+_ECHO_NAMING = frozenset(("the", "a", "an", "one", "this", "that", "these", "those", "his", "her", "their", "its",
+                          "some"))
+_ECHO_KITS = {}
+
+
+def _echo_tokens(text):
+    """The words of `text` as the matcher compares them: contractions folded, the
+    fillers and a restart or a doubled word ("I- I know", "So what I- So what I
+    mean") read once, so a stumble dropped into a line cannot hide an echo."""
+    s = str(text or "").casefold()
+    for rx, sub in _ECHO_FOLD:
+        s = rx.sub(sub, s)
+    out = []
+    for tok in re.findall(r"[a-z0-9]+", s):
+        if tok in _ECHO_FILLERS:
+            continue
+        out.append(tok)
+        for n in (3, 2, 1):
+            if len(out) >= 2 * n and out[-n:] == out[-2 * n:-n]:
+                del out[-n:]
+                break
+    return out
+
+
+def direction_kit(*sources):
+    """(phrases, feelings): the directions in `sources` as the matcher reads them.
+    A source is running-order text - a whole sheet (its numbered rows) or one
+    row's work - or a plain direction. Longest phrase first."""
+    key = tuple(re.sub(r"[\ue000-\uf8ff]", " ", str(s or "")) for s in sources)
+    got = _ECHO_KITS.get(key)
+    if got is not None:
+        return got
+    phrases, feels = set(), set()
+    for src in key:
+        for row in (_ECHO_ROW.findall(src) or ([src] if src.strip() else [])):
+            row = _ECHO_DIRECTIVE.sub(" ", _ECHO_QUOTED.sub(" ", row))
+            feels.update((m.group(1).lower(), m.group(2).lower()) for m in _ECHO_FEEL.finditer(row))
+            for piece in [_ECHO_PAREN.sub(" ", row)] + _ECHO_PAREN.findall(row):
+                for clause in _ECHO_JOINT.split(piece):
+                    if _ECHO_CAPS.search(clause):
+                        continue
+                    toks = _echo_tokens(clause)
+                    phrase = " ".join(toks)
+                    if (len(toks) >= ECHO_MIN_WORDS and len(phrase) >= ECHO_MIN_CHARS
+                            and not (toks[0] in _ECHO_NAMING and len(toks) < 7)):
+                        phrases.add(phrase)
+    got = (tuple(sorted(phrases, key=lambda p: (-len(p), p))), tuple(sorted(feels)))
+    if len(_ECHO_KITS) > 64:
+        _ECHO_KITS.clear()
+    _ECHO_KITS[key] = got
+    return got
+
+
+def conv_direction_kit(conv):
+    """The directions a conversation's writer was handed: the sheet it was given,
+    the rows as they stand now (Mode B writes the rest again) and the tempers."""
+    sources = [str((conv.get("plan") or {}).get("sheet") or "")]
+    for t in conv.get("turns") or []:
+        try:
+            sources.append("%2d  %s  - %s" % (t["index"] + 1, t["speaker"], _row_work(t, conv)))
+        except Exception:  # noqa: BLE001 - a row that cannot be rendered has no words to echo
+            pass
+    sources += [str((x or {}).get("text") or "") for x in (conv.get("tempers") or {}).values()]
+    return direction_kit(*sources)
+
+
+def direction_echo(text, kit):
+    """The direction `text` says aloud, or "": one of the kit's phrases inside its
+    words, or a row's own feeling read out as one ("In distaste, plainly:"). `kit`
+    is a direction_kit(), or running-order text to make one from."""
+    if not (isinstance(kit, tuple) and len(kit) == 2 and isinstance(kit[0], tuple)):
+        kit = direction_kit(kit)
+    phrases, feels = kit
+    said = " %s " % " ".join(_echo_tokens(text))
+    if len(said) <= 2:
+        return ""
+    for phrase in phrases:
+        if " %s " % phrase in said:
+            return phrase
+    low = str(text or "").casefold()
+    for emo, inten in feels:
+        if re.search(r"(?:^|[.!?:;\"\u201c\[(]\s*|\s[-\u2013\u2014]\s*)(?:say it\s+)?in\s+%s\s*[,(]\s*%s\b"
+                     % (re.escape(emo), inten), low):
+            return "in %s, %s" % (emo, inten)
+    return ""
+
+
 def _tempers_line(conv):
     tempers = conv.get("tempers") or {}
     if not tempers:
         return ""
     names = {p["actor_id"]: p.get("name") or p["actor_id"] for p in conv["participants"]}
     parts = ["%s (%s) is %s" % (seat, names.get(seat, seat), t.get("text")) for seat, t in sorted(tempers.items())]
-    return ("\nTONIGHT'S TEMPERS (rolled): " + "; ".join(parts) + ". They colour the phrasing, the pacing and what "
+    return ("\n" + TEMPERS_LABEL + " (rolled): " + "; ".join(parts) + ". They colour the phrasing, the pacing and what "
             "each of them chooses to react to, underneath each turn's own feeling. Never named out loud.")
 
 
@@ -4795,7 +5141,8 @@ def turn_stamp(conv, t):
             "acts": [{"family": d["family"], "id": d["item"], "label": d.get("label")} for d in acts
                      if d["family"] != "ES"],
             "perf": {"dims": perf.get("dims") or {}, "pace": perf.get("pace"),
-                     "pause_style": perf.get("pause_style")},
+                     "pause_style": perf.get("pause_style"),
+                     **({"voice": perf["voice"]} if perf.get("voice") is not None else {})},   # [s3-es-voice]
             "speakerbox": [sb["mode"] for sb in t.get("speakerbox") or [] if sb["mode"] != "NONE"],
             "sfx": {k: (t.get("sfx") or {}).get(k) for k in ("play", "placement", "intent", "event_id")},
             # [s3-roads] his node: whether he speaks after this line and how
@@ -4877,6 +5224,25 @@ def validate(conv, final_turns, mapping=None):
     as a model's opinion, and an act with no cue is "unchecked"."""
     mapping = align(conv, final_turns) if mapping is None else mapping
     n_plan = len(conv["turns"])
+    # [s3-scaffold] [s3-echo] what no written turn may carry - checked on EVERY one, an
+    # unplanned turn airs too: a prompt's own header, or a direction said as dialogue
+    _heads, _dirs = scaffold_kit(None, conv), conv_direction_kit(conv)
+    _said = {}
+    scaffolds = echoes = 0
+    for _i, (_m, _words) in enumerate(final_turns):
+        _got = []
+        _lab = find_scaffold(_words, _heads)
+        if _lab:
+            scaffolds += 1
+            _got.append({"what": "scaffold:%s" % _lab, "result": "violated",
+                         "how": "a prompt header echoed into the spoken words"})
+        _dir = direction_echo(_words, _dirs)
+        if _dir:
+            echoes += 1
+            _got.append({"what": "direction:%s" % _dir[:80], "result": "violated",
+                         "how": "a running-order direction said as dialogue"})
+        if _got:
+            _said[_i] = _got
     rows = []
     met = missed = unchecked = 0
     fav_copies = 0                                                            # [s3-cast]
@@ -4919,6 +5285,7 @@ def validate(conv, final_turns, mapping=None):
         for name, pattern in _PROHIBITED.items():
             if re.search(pattern, text, re.I | re.M):
                 row["checks"].append({"what": "prohibited:%s" % name, "result": "violated"})
+        row["checks"].extend(_said.get(at) or [])                              # [s3-scaffold] [s3-echo]
         if _es_line(t) and _speaks_direction(text, _es_line(t)):              # [s3-es-dir]
             row["checks"].append({"what": "echo:feeling direction", "result": "violated",
                                   "how": "the line says its row's feeling direction aloud"})
@@ -4938,6 +5305,9 @@ def validate(conv, final_turns, mapping=None):
     if conv["turns"] and any(d.get("family") == "FL" for d in conv["turns"][-1]["decisions"]) and final_turns:
         closing_ok = bool(re.search(CUES["close"], str(final_turns[-1][1] or ""), re.I))
     violations = sum(1 for r in rows for c in r["checks"] if c["result"] == "violated")
+    _held = set(mapping.values())                                             # [s3-scaffold] [s3-echo]
+    unplanned = [{"script_index": i, "checks": c} for i, c in sorted(_said.items()) if i not in _held]
+    violations += sum(len(u["checks"]) for u in unplanned)
     echo = _echoes(final_turns)
     loop = len(echo) >= 3 and len(echo) >= 0.25 * max(1, len(final_turns))
     if loop:
@@ -4947,16 +5317,20 @@ def validate(conv, final_turns, mapping=None):
              0.1 * (1.0 if closing_ok in (True, None) else 0.0))
     score -= min(0.3, 0.05 * violations)
     verdict = "compliant" if score >= 0.7 else "partial" if score >= 0.45 else "non_compliant"
-    if loop or fav_copies:
+    if loop or fav_copies or scaffolds or echoes:
         verdict = "non_compliant"          # an echo loop is not a conversation at any score;
-                                           # [s3-cast] a favourite repeated is not its spirit
+                                           # [s3-cast] a favourite repeated is not its spirit;
+                                           # [s3-scaffold] [s3-echo] nor a prompt's header or a
+                                           # row's direction said out loud
     return {"at": time.time(), "method": "deterministic/lexical", "planned": n_plan,
             "written": len(final_turns), "matched": matched,
             "turn_ratio": round(turn_ratio, 3), "seat_order": round(seat_order, 3),
             "acts": {"met": met, "missed": missed, "unchecked": unchecked,
                      "rate": None if act_rate is None else round(act_rate, 3)},
             "closing": closing_ok, "violations": violations, "score": round(score, 3),
-            "verdict": verdict, "repair_wanted": bool(seat_order < 0.5 or turn_ratio < 0.5 or loop or fav_copies),
+            "verdict": verdict, "repair_wanted": bool(seat_order < 0.5 or turn_ratio < 0.5 or loop or fav_copies
+                                                      or scaffolds or echoes),
+            "scaffold": scaffolds, "direction_echo": echoes, "unplanned": unplanned,   # [s3-scaffold] [s3-echo]
             "echo": {"turns": echo, "loop": loop}, "favorite_copies": fav_copies,
             "turns": rows}
 
@@ -4992,6 +5366,510 @@ def compare_shadow(conv, final_turns):
             "seat_similarity": round(difflib.SequenceMatcher(None, plan_seats, got_seats).ratio(), 3),
             "actual_met_planned_acts": val["acts"], "score_if_planned": val["score"],
             "verdict_if_planned": val["verdict"]}
+
+
+# --- [s3-turnchain] every message answers the one before it; no copy airs ---------
+#
+# The operator, 2026-09-28: "the dialogue is duplicate ... they're not responding
+# to each other with this dialogue" and "in my eyes every message is rolling dice
+# against the next message." Measured that morning (data/system3.sqlite3): 7.4% of
+# the turns written in 24 h copied an earlier turn of their own round; a request-
+# line call (cc672e24) aired its caller's subject sentence four times and the
+# host's question five. The writer (gemma4:e2b) had run past the running order and
+# looped until its token budget ran out - 43 turns for 15 rows - and validate()
+# saw the loop (non_compliant, repair_wanted) and nothing stopped it airing.
+#
+# THE GATE reads a written round turn by turn, in order, after the station's own
+# cleaning, where its lines are bound to the plan's turns. A turn that copies a
+# line already said in the round, reads the round's subject, theme or a topic row
+# back word for word, reads a speaker-box passage off the turn whose door placed
+# it, or is empty once cleaned is CAUGHT. A caught turn the plan rolled is written
+# again - once or twice, one line at a time, told the line it answers and its own
+# dice ("answer <previous line> by <RS>, <ES>, <FL/IRS>"; "your draft repeated
+# <X>; write a new line"). Still a copy - or a turn the writer added that no node
+# rolled - and it is DROPPED with the round's shape kept: nobody speaks twice in a
+# row where a drop would make them (the turn that answered the dropped line goes
+# with it), turns written past a closing leg go, and a protocol leg (a call's or a
+# segment's open and close legs) is never dropped out from under its round: the
+# round is held instead. Nothing here draws a number. Every catch, re-write and
+# drop is an observation on its node (family GATE).
+
+GATE_FAMILY = "GATE"
+GATE_SIMILAR = 0.9          # difflib ratio: this close to a line already said is that line again
+GATE_ECHO_RUN = 12          # ...or this many of its words in a row (a question that repeats the
+                            # caller's detail back - the call's ask legs - quotes about ten)
+GATE_ECHO_SHARE = 0.6       # ...or a run of six or more that is this much of the turn
+GATE_SHORT = 12             # two short lines of nearly the same words are one line
+GATE_MIN_WORDS = 3          # shorter than this, a repeat is an interjection ("Yeah.")
+GATE_SOURCE_RUN = 14        # words in a row out of the subject or a topic row: read out
+GATE_SOURCE_MIN = 8         # ...or a run of eight that is most of the turn or of the row
+GATE_SOURCE_SHARE = 0.6
+GATE_PASSAGE_RUN = 8        # words in a row out of a speaker-box passage, off its door
+GATE_REWRITES = 2           # new tries a caught planned turn gets before it is dropped
+GATE_VISITS = 10            # re-write visits one round may spend; protocol legs are served first
+GATE_CONTEXT = 6            # lines of the conversation so far a re-write is shown
+GATE_FIXED_PLACES = ("open", "close")
+_GATE_ROW_TAIL = re.compile(r"\s+\d{1,3}[.)]?\s*$")
+
+
+def gate_words(text):
+    """A line's words as the gate compares them: lower case, with a running-order
+    row number left on its end ("... in here. 11") cut."""
+    s = _GATE_ROW_TAIL.sub("", str(text or "").replace("’", "'"))
+    return re.findall(r"[a-z0-9']+", s.lower())
+
+
+def _gate_run(a, b):
+    """The longest run of words `a` and `b` say in the same order."""
+    if not a or not b:
+        return 0
+    return difflib.SequenceMatcher(None, a, b, autojunk=False).find_longest_match(0, len(a), 0, len(b)).size
+
+
+def _gate_excerpt(text, cap=160):
+    s = " ".join(str(text or "").split())
+    return s if len(s) <= cap else s[:cap - 1].rstrip() + "…"
+
+
+def gate_copies(a, b):
+    """How the words `a` (a turn) copy the words `b` (a line already said), or ""."""
+    if len(a) < GATE_MIN_WORDS or len(b) < GATE_MIN_WORDS:
+        return ""
+    ka, kb = " ".join(a), " ".join(b)
+    if ka == kb:
+        return "word for word"
+    sm = difflib.SequenceMatcher(None, ka, kb, autojunk=False)
+    if sm.real_quick_ratio() >= GATE_SIMILAR and sm.quick_ratio() >= GATE_SIMILAR and sm.ratio() >= GATE_SIMILAR:
+        return "nearly word for word"
+    run = _gate_run(a, b)
+    if run >= GATE_ECHO_RUN:
+        return "%d of its words in a row" % run
+    if run >= 6 and run >= GATE_ECHO_SHARE * len(a):
+        return "%d of this line's %d words in a row" % (run, len(a))
+    if len(a) <= GATE_SHORT and len(b) <= GATE_SHORT:
+        sa, sb = set(a), set(b)
+        if len(sa & sb) >= 0.8 * max(len(sa), len(sb)):
+            return "the same words"
+    return ""
+
+
+def gate_sources(conv):
+    """What a turn may not read back word for word, and the planned turns whose
+    door places it there: [{kind, label, text, words, door}]. `kind` is subject
+    (the caller's subject - the #1249 theme - the round's subject and angle, the
+    operator's exchange), topic (a topics-board row, a new subject) or passage
+    (the opening passage, the call's speaker-box passage, a passage a turn's mark
+    carries)."""
+    inputs = conv.get("inputs") or {}
+    call = inputs.get("call") if isinstance(inputs.get("call"), dict) else {}
+    subject = conv.get("subject") or {}
+    out, seen = [], set()
+
+    def add(kind, label, text, door=()):
+        words = gate_words(text)
+        key = " ".join(words)
+        if len(words) < GATE_SOURCE_MIN or key in seen:
+            return
+        seen.add(key)
+        out.append({"kind": kind, "label": label, "text": _gate_excerpt(text, 240), "words": words,
+                    "door": sorted({int(i) for i in door})})
+
+    seeded = [0] if subject.get("seeded") else []
+    # the round's own subject is stated where the plan opens on it - the caller telling
+    # why they rang (the #1249 contract wants it said), the memo read out, the lead off
+    # the wire, the painting named: a legs road's opening legs. Anywhere else, and a
+    # second time anywhere, it is read back.
+    opening = [int(t.get("index") or 0) for t in conv.get("turns") or [] if t.get("place") == "open"]
+    add("passage", "the opening passage", inputs.get("seed_text"), seeded)
+    add("subject", "the caller's subject", call.get("topic"), opening)
+    add("passage", "the call's speaker-box passage", call.get("speakerbox"))
+    exchange = subject.get("exchange") or {}
+    add("subject", "the operator's opening line", exchange.get("opener"), [0])
+    add("subject", "the operator's answer line", exchange.get("reply"), [1])
+    add("subject", "the round's subject", subject.get("topic"), seeded + opening)
+    add("subject", "the round's angle", subject.get("active_angle"), seeded + opening)
+    for t in conv.get("turns") or []:
+        i = int(t.get("index") or 0)
+        for sb in t.get("speakerbox") or []:
+            mat = sb.get("material") or {}
+            if mat.get("text"):
+                add("passage", "the passage marked on turn %d" % (i + 1), mat["text"],
+                    [i] if sb.get("mode") in ("PREPEND", "APPEND", "FULL_SWATH") else [])
+        mat = t.get("topic_material") or {}
+        if mat.get("text"):
+            add("topic", "the subject brought up on turn %d" % (i + 1), mat["text"])
+        bank = t.get("bank_topic") or {}
+        if bank.get("text"):
+            add("topic", "the topics-board row on turn %d" % (i + 1), bank["text"], [i] if bank.get("reply") else [])
+        if t.get("topic_override"):
+            add("topic", "the subject handed to turn %d" % (i + 1), t["topic_override"])
+    plan = conv.get("topic_plan") or {}
+    if plan.get("text"):
+        add("topic", "the topics-board row", plan["text"],
+            [int(plan.get("turn_index") or 0)] if plan.get("reply") else [])
+    return out
+
+
+def gate_check(conv, index, text, earlier=(), sources=None, spoken=None):
+    """Why a written turn is not a new line, or None. `index` is the planned turn
+    it stands for (None: a turn the writer added), `earlier` the lines already
+    said in this round as (label, text), `spoken` the words the station will say
+    (the turn after its cleaning; the text itself when not given)."""
+    words = gate_words(text if spoken is None else spoken)
+    if not words:
+        return {"rule": "empty", "what": "nothing", "text": "", "how": "",
+                "why": "nothing is left of it once it is cleaned"}
+    for label, other in earlier or ():
+        how = gate_copies(words, gate_words(other))
+        if how:
+            return {"rule": "copy", "what": label, "text": _gate_excerpt(other), "how": how,
+                    "why": "it repeats %s - %s" % (label, how)}
+    for src in (gate_sources(conv) if sources is None else sources):
+        if index is not None and index in src["door"]:
+            continue
+        run = _gate_run(words, src["words"])
+        if src["kind"] == "passage":
+            hit = run >= GATE_PASSAGE_RUN
+        else:
+            hit = run >= GATE_SOURCE_RUN or (run >= GATE_SOURCE_MIN and (
+                run >= GATE_SOURCE_SHARE * len(words) or run >= GATE_SOURCE_SHARE * len(src["words"])))
+        if hit:
+            return {"rule": src["kind"], "what": src["label"], "text": src["text"],
+                    "how": "%d of its words in a row" % run,
+                    "why": "it reads %s back word for word (%d words in a row)%s" % (
+                        src["label"], run, ", off the turn whose door places it" if src["kind"] == "passage" else "")}
+    return None
+
+
+def gate_map(conv, markers):
+    """Planned turn -> index in the written script, IN ORDER: the writer was told
+    to write the rows in order, one line each, so planned turn k is the first line
+    of its seat after planned turn k-1's. A seat-sequence match (align) can pair
+    the plan with a looped second pass and leave the first unmatched; this does
+    not. A planned turn whose seat never comes again is not written."""
+    out, j = {}, 0
+    for t in conv.get("turns") or []:
+        k = j
+        while k < len(markers) and markers[k] != t["speaker"]:
+            k += 1
+        if k < len(markers):
+            out[t["index"]] = k
+            j = k + 1
+    return out
+
+
+def gate_dice(conv, index):
+    """The dice a planned turn rolled, as its re-write is told them."""
+    t = conv["turns"][index]
+    perf = t.get("performance") or {}
+    es = next((d for d in t.get("decisions") or [] if d.get("family") == "ES" and d.get("item")), {})
+    out = {"turn": index, "seat": t.get("speaker"), "name": str(t.get("name") or t.get("speaker") or ""),
+           "leg": t.get("leg") or t.get("step"), "place": t.get("place"),
+           "es": {"id": es.get("item"), "label": es.get("label") or perf.get("emotion") or "",
+                  "strength": _intensity_word(float(perf.get("intensity") or 0)),
+                  "direction": str(es.get("direction") or "")},
+           "acts": [], "flow": []}
+    for x in t.get("directions") or []:
+        if x.get("family") in ("RS", "IRS"):
+            out["acts"].append({"family": x["family"], "label": str(x.get("label") or ""), "text": str(x.get("text") or "")})
+        elif x.get("family") == "FL":
+            out["flow"].append({"label": str(x.get("label") or ""), "text": str(x.get("text") or "")})
+    return out
+
+
+def gate_answer(conv, index, previous=None, quote=True):
+    """The turn's dice against the line it answers, in one sentence:
+    "answer <previous line> by <RS act>, <ES item>, <FL/IRS>"."""
+    d = gate_dice(conv, index)
+    parts = ["%s (%s %s)" % (a["text"], a["family"], a["label"]) for a in d["acts"] if a["text"]]
+    if d["es"]["label"]:
+        parts.append("feeling %s, %s (ES %s)" % (d["es"]["label"], d["es"]["strength"], d["es"]["id"] or d["es"]["label"]))
+    parts += ["%s (FL %s)" % (f["text"], f["label"]) for f in d["flow"] if f["text"]]
+    how = ", ".join(parts) or "in your own words"
+    if previous and str(previous[1] or "").strip():
+        said = json.dumps(_gate_excerpt(previous[1], 300), ensure_ascii=False) if quote else "line"
+        return "answer %s's %s by: %s" % (previous[0], said, how)
+    return "open the conversation: %s" % how
+
+
+def gate_row(conv, index):
+    """What the running order told the writer this turn does."""
+    t = conv["turns"][index]
+    if conv.get("call_structure") or conv.get("road_structure") or t.get("protocol"):
+        return (str(t.get("protocol") or "keeps it going.").strip() + _leg_row_add(t)).strip()
+    return _row_work(t, conv)
+
+
+def gate_ask(conv, index, previous, context, catch, tries=()):
+    """The one-line re-write prompt for planned turn `index`: the cast, the
+    conversation so far, the line it answers and its dice, what its row does,
+    and what its draft repeated. Plain text; the station sends it as a writer
+    call and reads the first line back."""
+    t = conv["turns"][index]
+    seat = str(t["speaker"])
+    name = str(t.get("name") or seat)
+    cast = "; ".join("%s is %s%s" % (p["actor_id"], p.get("name") or p["actor_id"],
+                                     (" (%s)" % p["role"]) if p.get("role") else "")
+                     for p in conv.get("participants") or [])
+    said = ["%s: %s" % (m, _gate_excerpt(x, 400)) for m, x in list(context)[-GATE_CONTEXT:]]
+    lines = ["You are writing ONE line of a conversation on the radio: the next thing %s says. %s." % (name, cast),
+             "", "THE CONVERSATION SO FAR, in order:"] + (said or ["(nothing has been said yet)"]) + [
+             "", "WRITE TURN %d - %s (%s)." % (index + 1, seat, name)]
+    if previous and str(previous[1] or "").strip():
+        lines.append("THE LINE YOU ANSWER - %s just said: %s" % (
+            previous[0], json.dumps(_gate_excerpt(previous[1], 400), ensure_ascii=False)))
+    lines.append("YOUR DICE FOR THIS LINE: " + gate_answer(conv, index, previous, quote=False) + ".")
+    lines.append("WHAT THIS TURN DOES: " + gate_row(conv, index))
+    if catch:
+        lines.append("YOUR DRAFT REPEATED %s: %s. Write a NEW line." % (
+            str(catch.get("what") or "a line already said").upper(),
+            json.dumps(_gate_excerpt(catch.get("text") or catch.get("draft") or "", 240), ensure_ascii=False)))
+    for tr in tries or ():
+        c = tr.get("catch") or {}
+        lines.append("YOUR NEXT TRY REPEATED %s TOO: %s." % (str(c.get("what") or "it").upper(),
+                                                             json.dumps(_gate_excerpt(tr.get("text"), 200),
+                                                                        ensure_ascii=False)))
+    lines += ["Say something nobody has said yet in this conversation. Never read the subject, a topic or a "
+              "passage back word for word, and never say these directions out loud.",
+              "Output exactly one line and nothing else: %s: <the words>" % seat]
+    return "\n".join(lines)
+
+
+def _gate_name(conv, seat):
+    for p in conv.get("participants") or []:
+        if p.get("actor_id") == seat:
+            return str(p.get("name") or seat)
+    return str(((conv.get("inputs") or {}).get("names") or {}).get(seat) or seat)
+
+
+def _gate_label(conv, row):
+    return "%s's line (turn %d)" % (_gate_name(conv, row["seat"]), row["at"] + 1)
+
+
+def gate_open(conv, turns, spoken=None, rewrites=GATE_REWRITES, visits=GATE_VISITS):
+    """Start the gate over a written round: `turns` [(marker, text)] as the station
+    parsed and cleaned them, `spoken` their words as they will be said. Returns
+    the run - a plain dict the station drives with gate_next / gate_take and
+    closes with gate_close."""
+    markers = [str(m or "")[:1].upper() for m, _x in turns]
+    mapping = gate_map(conv, markers)
+    of = {s: p for p, s in mapping.items()}
+    legs = bool(conv.get("call_structure") or conv.get("road_structure"))
+    rows = []
+    for i, (m, x) in enumerate(turns):
+        p = of.get(i)
+        t = conv["turns"][p] if p is not None else None
+        rows.append({"at": i, "seat": markers[i], "turn": p, "turn_id": t["turn_id"] if t else "",
+                     "leg": (t.get("leg") or t.get("step")) if t else "", "place": (t or {}).get("place") or "",
+                     "fixed": bool(t is not None and legs and t.get("place") in GATE_FIXED_PLACES),
+                     "orig": str(x or ""), "text": str(x or ""),
+                     "spoken": (str(spoken[i]) if spoken is not None and i < len(spoken) else None),
+                     "state": "open", "catch": None, "tries": [], "why": ""})
+    run = {"rows": rows, "cursor": 0, "rewrites": max(0, int(rewrites)), "visits": max(0, int(visits)),
+           "spent": 0, "ask": None, "sources": gate_sources(conv), "events": [], "held": "",
+           "counts": {"caught": 0, "rewritten": 0, "dropped": 0, "trimmed": 0}, "reserve": set()}
+    # turns written past the running order's closing leg are not the round's
+    last = max(mapping) if mapping else None
+    if last is not None and last == len(conv["turns"]) - 1 and conv["turns"][last].get("place") == "close":
+        for r in rows[mapping[last] + 1:]:
+            r["state"], r["why"] = "dropped", "written past the running order's last turn (%s)" % (
+                conv["turns"][last].get("leg") or "the close")
+            run["counts"]["trimmed"] += 1
+            _gate_event(conv, run, r, "trimmed", why=r["why"])
+    # the protocol legs are served first: a dry pass over the draft as written
+    for r in rows:
+        if r["fixed"] and r["state"] == "open" and gate_check(
+                conv, r["turn"], r["orig"], [(_gate_label(conv, q), q["orig"]) for q in rows[:r["at"]]],
+                run["sources"], r["spoken"]):
+            run["reserve"].add(r["at"])
+    return run
+
+
+def _gate_event(conv, run, row, stage, **extra):
+    t = conv["turns"][row["turn"]] if row.get("turn") is not None else None
+    body = {"stage": stage, "turn_index": row.get("turn") if row.get("turn") is not None else -1,
+            "script_index": row["at"], "seat": row["seat"], "leg": row.get("leg") or "",
+            "planned": row.get("turn") is not None, "line": _gate_excerpt(row.get("text"), 200),
+            "at": time.time()}
+    if t is not None:
+        body["turn_id"] = t["turn_id"]
+        body["dice"] = gate_dice(conv, row["turn"])
+    body.update(extra)
+    run["events"].append(body)
+    return body
+
+
+def _gate_earlier(conv, run, row):
+    """The lines a turn may not repeat: every line said before it (as written and
+    as re-written) - and, for a re-write, its own draft and the lines the writer
+    already put after it."""
+    out = []
+    for q in run["rows"][:row["at"]]:
+        out.append((_gate_label(conv, q), q["orig"]))
+        if q["text"] != q["orig"] and q["state"] in ("kept", "rewritten"):
+            out.append((_gate_label(conv, q), q["text"]))
+    if row["tries"]:
+        out.append(("its own draft", row["orig"]))
+        out += [(_gate_label(conv, q), q["orig"]) for q in run["rows"][row["at"] + 1:] if q["state"] == "open"]
+    return out
+
+
+def _gate_kept_before(run, row):
+    return [q for q in run["rows"][:row["at"]] if q["state"] in ("kept", "rewritten")]
+
+
+def _gate_budget(run, row):
+    left = run["visits"] - run["spent"]
+    if left <= 0 or row["turn"] is None or len(row["tries"]) >= run["rewrites"]:
+        return False
+    if row["fixed"]:
+        return True
+    owed = sum(1 for q in run["rows"][row["at"] + 1:] if q["at"] in run["reserve"] and not q["tries"])
+    return left - owed > 0
+
+
+def _gate_drop(conv, run, row, why):
+    row["state"], row["why"] = "dropped", why
+    run["counts"]["dropped"] += 1
+    if row["fixed"] and not run["held"]:
+        run["held"] = "turn %d (%s) could not be written without copying: %s" % (
+            (row["turn"] or 0) + 1, row["leg"] or "a protocol leg", (row.get("catch") or {}).get("why") or why)
+    _gate_event(conv, run, row, "dropped", why=why, rule=(row.get("catch") or {}).get("rule"),
+                tries=len(row["tries"]))
+    # THE SHAPE: nobody speaks twice in a row where the drop would make them. The
+    # later of the pair answered the dropped line and goes with it; a protocol leg
+    # stays, and then the earlier one goes (when it may).
+    kept = _gate_kept_before(run, row)
+    nxt = next((q for q in run["rows"][row["at"] + 1:] if q["state"] == "open"), None)
+    if not kept or nxt is None or kept[-1]["seat"] != nxt["seat"]:
+        return
+    for pair in (nxt, kept[-1]):
+        if not pair["fixed"]:
+            was = pair["state"]
+            pair["state"] = "dropped"
+            pair["why"] = ("it answered a dropped line, and %s would speak twice in a row"
+                           % _gate_name(conv, pair["seat"]))
+            if was == "rewritten":
+                run["counts"]["rewritten"] -= 1
+            run["counts"]["dropped"] += 1
+            _gate_event(conv, run, pair, "dropped with its pair", why=pair["why"])
+            return
+
+
+def gate_next(conv, run):
+    """The next re-write the station should ask for, or None when the walk is over.
+    From the cursor on: a turn that passes is kept (or counted re-written); a
+    caught turn the plan rolled is asked for again while its tries and the
+    round's visits last, protocol legs first; any other catch is dropped."""
+    if run.get("ask"):
+        return run["ask"]
+    rows = run["rows"]
+    while run["cursor"] < len(rows):
+        r = rows[run["cursor"]]
+        if r["state"] != "open":
+            run["cursor"] += 1
+            continue
+        catch = gate_check(conv, r["turn"], r["text"], _gate_earlier(conv, run, r), run["sources"], r["spoken"])
+        if catch is None:
+            if r["tries"]:
+                r["state"] = "rewritten"
+                run["counts"]["rewritten"] += 1
+                _gate_event(conv, run, r, "re-written", attempt=len(r["tries"]), was=_gate_excerpt(r["orig"], 200),
+                            prompt=r["tries"][-1].get("prompt", ""))
+            else:
+                r["state"] = "kept"
+            run["cursor"] += 1
+            continue
+        if not r["tries"]:
+            r["catch"] = catch
+            run["counts"]["caught"] += 1
+            _gate_event(conv, run, r, "caught", rule=catch["rule"], why=catch["why"], of=catch["what"],
+                        copied=catch.get("text", ""), how=catch.get("how", ""))
+        else:
+            r["tries"][-1]["catch"] = catch
+            _gate_event(conv, run, r, "re-write still copies", attempt=len(r["tries"]), rule=catch["rule"],
+                        why=catch["why"], of=catch["what"], prompt=r["tries"][-1].get("prompt", ""))
+        if _gate_budget(run, r):
+            kept = _gate_kept_before(run, r)
+            prev = (_gate_name(conv, kept[-1]["seat"]), kept[-1]["text"]) if kept else None
+            context = [(q["seat"], q["text"]) for q in kept]
+            first = dict(r["catch"], draft=r["orig"])
+            prompt = gate_ask(conv, r["turn"], prev, context, first, r["tries"])
+            run["spent"] += 1
+            run["ask"] = {"at": r["at"], "turn": r["turn"], "turn_id": r["turn_id"], "seat": r["seat"],
+                          "attempt": len(r["tries"]) + 1, "prompt": prompt,
+                          "limit": 700 if r["seat"] not in ("A", "B", "D") else 900}
+            return run["ask"]
+        why = (catch["why"] if r["turn"] is not None else
+               "%s - and no node rolled it (the writer added it), so there are no dice to write it again with"
+               % catch["why"])
+        if r["turn"] is not None and r["tries"]:
+            why = "still a copy after %d re-write(s): %s" % (len(r["tries"]), catch["why"])
+        elif r["turn"] is not None and not run["rewrites"]:
+            why = "%s - this round is not re-written (a live round, or repair is off)" % catch["why"]
+        elif r["turn"] is not None:
+            why = "%s - the round's re-write visits are spent" % catch["why"]
+        _gate_drop(conv, run, r, why)
+        run["cursor"] += 1
+    return None
+
+
+def gate_take(conv, run, text, spoken=None):
+    """The writer's answer to the ask outstanding: it becomes the turn's words,
+    checked on the walk's next step."""
+    ask = run.get("ask")
+    if not ask:
+        return None
+    r = run["rows"][ask["at"]]
+    r["tries"].append({"attempt": ask["attempt"], "text": _gate_excerpt(text, 600),
+                       "prompt": ask["prompt"][-4000:]})
+    r["text"] = " ".join(str(text or "").split())
+    r["spoken"] = None if spoken is None else str(spoken)
+    run["ask"] = None
+    return r
+
+
+def gate_close(conv, run):
+    """The walk is over: the round as it airs, and its record on the aggregate
+    (conv["turn_gate"]: caught / re-written / dropped / trimmed / visits / held)."""
+    rows = run["rows"]
+    while gate_next(conv, run) is not None:     # an unanswered ask counts as a failed try
+        gate_take(conv, run, "")
+    kept = [r for r in rows if r["state"] in ("kept", "rewritten")]
+    if len(kept) < 2 and not run["held"]:
+        run["held"] = "fewer than two turns are left once the copies are out"
+    changed = any(r["state"] in ("dropped", "rewritten") for r in rows)
+    record = {"at": time.time(), "written": len(rows), "kept": len(kept),
+              "caught": run["counts"]["caught"], "rewritten": run["counts"]["rewritten"],
+              "dropped": run["counts"]["dropped"], "trimmed": run["counts"]["trimmed"],
+              "visits": run["spent"], "held": run["held"],
+              "turns": [{"at": r["at"], "turn": r["turn"], "turn_id": r["turn_id"], "seat": r["seat"],
+                         "leg": r["leg"], "state": r["state"], "rule": (r.get("catch") or {}).get("rule"),
+                         "of": (r.get("catch") or {}).get("what"), "tries": len(r["tries"]), "why": r["why"]}
+                        for r in rows if r["state"] in ("dropped", "rewritten") or r.get("catch")]}
+    prior = conv.get("turn_gate") or {}
+    if prior.get("in_chain"):
+        record["in_chain"] = prior["in_chain"]
+    conv["turn_gate"] = record
+    body = {"stage": "gate", "turn_index": -1, "caught": record["caught"], "rewritten": record["rewritten"],
+            "dropped": record["dropped"], "trimmed": record["trimmed"], "visits": record["visits"],
+            "held": record["held"], "line": "%d caught, %d re-written, %d dropped%s" % (
+                record["caught"], record["rewritten"], record["dropped"],
+                (", %d past the end" % record["trimmed"]) if record["trimmed"] else ""), "at": time.time()}
+    run["events"].append(body)
+    return {"script": "\n".join("%s: %s" % (r["seat"], r["text"]) for r in kept), "changed": changed,
+            "held": run["held"], "counts": dict(run["counts"], visits=run["spent"], kept=len(kept)),
+            "record": record}
+
+
+def gate_counts(conv):
+    """The round's gate record, for the list row: caught / re-written / dropped."""
+    g = conv.get("turn_gate") or {}
+    if not g:
+        return None
+    out = {k: g.get(k) for k in ("caught", "rewritten", "dropped", "trimmed", "visits", "held")}
+    out["in_chain"] = (g.get("in_chain") or {}).get("caught", 0)
+    return out
 
 
 # --- Mode B: turn by turn --------------------------------------------------
@@ -5030,6 +5908,13 @@ def observe(conv, turn_index, text, seconds=None):
         conv["observed_delta"][k] = round(conv["observed_delta"].get(k, 0) + v, 4)
     rec = {"turn_index": turn_index, "turn_id": t["turn_id"], "text": t["text"], "seconds": seconds,
            "words": words, "checks": checks, "delta": delta, "at": time.time()}
+    # [s3-turnchain] a turn that is not a new line says so on its observation (the
+    # state still moves by what was said: a replay re-applies the same deltas)
+    _copy = gate_check(conv, turn_index, t["text"],
+                       [("turn %d" % (x["index"] + 1), x["text"]) for x in conv["turns"][:turn_index]
+                        if x.get("text")])
+    if _copy:
+        rec["copy"] = _copy
     conv["observations"].append(rec)
     return rec
 
@@ -5140,4 +6025,5 @@ def summary(conv):
             "verdict": val.get("verdict"), "score": val.get("score"),
             "shadow": (conv.get("comparison") or {}).get("seat_similarity"),
             "system2_slot_id": conv["identity"]["system2_slot_id"],
-            "generation_mode": conv.get("generation_mode")}
+            "generation_mode": conv.get("generation_mode"),
+            "gate": gate_counts(conv)}                                           # [s3-turnchain]

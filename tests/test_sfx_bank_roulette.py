@@ -17,6 +17,10 @@ class ChooserTests(unittest.TestCase):
         bank._load = lambda: bank._rows
         bank._save = lambda rows: bank._rows.update(rows)
         bank.eligible = lambda *a, **k: list(bank._rows.values())
+        # [bank-media-at-pick] pick() looks at the disk for the one take it
+        # reserves (edit_sfx_speech_bank_media.py). These rows are about the
+        # roulette, not the files; every recording is there.
+        bank.media_ready = lambda row, fresh=False: True
         return bank
 
     def rows(self):

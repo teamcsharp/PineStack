@@ -9,9 +9,17 @@ import app
 
 
 class ManagerPreparedPageTests(unittest.IsolatedAsyncioTestCase):
-    def test_manager_clip_keeps_upstairs_playout_priority(self):
+    def test_manager_clip_keeps_its_road_but_no_priority_bypass(self):
+        """9dd659d: "Manager pages are repeatable stock; allowing them to
+        outrank a held round filled the page feed half an hour ahead and
+        left that round waiting behind dozens of memos." The page keeps its
+        own road name - the census still counts it - and waits its turn;
+        only paid reads take the next boundary. The same contract as
+        test_manager_page_backpressure, which that commit added."""
         self.assertEqual(app.playout_clip_road({"kind": "manager"}),
-                         ("manager", True))
+                         ("manager", False))
+        self.assertEqual(app.playout_clip_road({"kind": "ad"}),
+                         ("advert", True))
 
     def test_selector_requires_recorded_file_and_prefers_unplayed_page(self):
         with tempfile.TemporaryDirectory() as root:

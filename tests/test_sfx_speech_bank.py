@@ -3,6 +3,7 @@ from contextlib import ExitStack
 import copy
 from pathlib import Path
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -46,9 +47,35 @@ class SfxSpeechBankTests(unittest.TestCase):
         self.assertIsNone(self.bank.pick("", "other", "crystal-one", lambda row: True))
         self.assertIsNone(self.bank.pick("", "drop-one", "new-crystal", lambda row: True))
         self.assertIsNone(self.bank.pick("", "drop-one", "crystal-one", lambda row: False))
+        # The sweep above has just seen this file (#1394 memoises that for
+        # MEDIA_MEMO_S, and this bank's clock never moves) - the take about
+        # to be RESERVED is still looked at on the disk itself.
         (self.root / Path(row["clip"]["path"]).name).unlink()
         self.assertIsNone(self.bank.pick("", "drop-one", "crystal-one", lambda row: True))
         self.assertEqual(len(self.bank.rows()), 1)
+
+    def test_a_vanished_winner_gives_way_to_the_next_take(self):
+        """[bank-media-at-pick] The file that went is left out and the choice
+        is made again among the rest - by the roulette, when it chooses."""
+        gone = self.ready()
+        kept = self.ready("Keep that thought, I heard a lot.")
+        self.assertEqual(len(self.bank.eligible("", "drop-one", "crystal-one",
+                                                lambda row: True)), 2)
+        (self.root / Path(gone["clip"]["path"]).name).unlink()
+        offered = []
+
+        def roulette(takes):
+            offered.append([take["text"] for take in takes])
+            return next(i for i, take in enumerate(takes) if take["text"] == gone["text"]) \
+                if len(takes) > 1 else 0
+
+        picked = self.bank.pick("", "drop-one", "crystal-one", lambda row: True,
+                                chooser=roulette)
+        self.assertEqual(picked["entry_id"], kept["id"])
+        self.assertEqual(len(offered), 2)
+        self.assertEqual(sorted(offered[0]), sorted([gone["text"], kept["text"]]))
+        self.assertEqual(offered[1], [kept["text"]])
+        self.assertNotIn("reservation", next(r for r in self.bank.rows() if r["id"] == gone["id"]))
 
     def test_topical_takes_need_context_and_generic_remains_fallback(self):
         topical = self.ready("The carburetor rattles loud, the engine draws a crowd.", generic=False)
@@ -121,7 +148,11 @@ class SfxSpeechPreparationTests(unittest.IsolatedAsyncioTestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
-        self.bank = SfxSpeechBank(self.root / "bank.json", self.root)
+        # The bank keeps the wall clock; `later` moves it on, for the one
+        # thing here that runs on the bank's own time (#1394's media memo).
+        self.later = [0.0]
+        self.bank = SfxSpeechBank(self.root / "bank.json", self.root,
+                                  clock=lambda: time.time() + self.later[0])
         self.stack = ExitStack()
         self.addCleanup(self.stack.close)
         self.settings = {"drop_voice": "vl_31d384e6", "sfxguy_rate": 40}
@@ -220,6 +251,12 @@ class SfxSpeechPreparationTests(unittest.IsolatedAsyncioTestCase):
         self.app.sfxguy_ready_commit(pick["id"])
         self.assertEqual(self.app._sfxguy_ready_status()["heard"], 1)
         (self.root / Path(pick["clip"]["path"]).name).unlink()
+        # #1394 (93e6a63): readiness is read through a memo of one stat per
+        # file per MEDIA_MEMO_S, so the desk's COUNT catches up within that
+        # window - by design; it was 7.4 s of stats on the loop. What may
+        # never lag is the take reserved for the air: pick() looks at the
+        # disk for the one it reserves (test_missing_media_... above).
+        self.later[0] = SfxSpeechBank.MEDIA_MEMO_S + 1
         self.assertEqual(self.app._sfxguy_ready_status()["ready"], 0)
         self.assertEqual(self.app.crystal_tint.await_count, calls)
         self.assertEqual(self.app.prep_render_line.await_count, 1)

@@ -35,6 +35,17 @@ PRODUCERS = {
 
 TRANSPORTS = ("page_feed_append(", "_play_on_box(")
 
+# HOW A PRODUCER COMMITS. Directly - `admission_admit_line(...)` - or, since
+# 8252333 ("Stabilize perpetual broadcast"), off the event loop:
+# `await asyncio.to_thread(admission_admit_line, ...)`. The gate's ledger
+# write is disk work, so every named producer moved its commit into a worker
+# thread (test_runtime_singleflight's admission test pins that half). A
+# to_thread that is not AWAITED would be a commit that never runs, so the
+# await is part of the pattern, not decoration.
+COMMIT = re.compile(
+    r"admission_admit_(?:line|round)\(|"
+    r"await\s+asyncio\.to_thread\(\s*admission_admit_(?:line|round)\s*,")
+
 
 def body_of(text, opener):
     """The source of one top-level function, from its `def` to the next."""
@@ -48,6 +59,11 @@ def body_of(text, opener):
 def first(text, needles):
     found = [text.index(n) for n in needles if n in text]
     return min(found) if found else -1
+
+
+def first_commit(text):
+    got = COMMIT.search(text)
+    return got.start() if got else -1
 
 
 class EarlySubmitTests(unittest.TestCase):
@@ -64,8 +80,7 @@ class EarlySubmitTests(unittest.TestCase):
         for producer, opener in PRODUCERS.items():
             with self.subTest(producer=producer):
                 body = body_of(self.text, opener)
-                admit = first(body, ("admission_admit_line(",
-                                     "admission_admit_round("))
+                admit = first_commit(body)
                 sends = first(body, TRANSPORTS)
                 self.assertNotEqual(admit, -1,
                                     "%s never commits anything" % producer)
@@ -86,21 +101,33 @@ class EarlySubmitTests(unittest.TestCase):
                 self.assertIn("admission_withdraw(", body)
 
     def test_a_live_burst_nobody_carried_gives_its_commitment_back(self):
-        """#1341. The feed's own withdrawal is limited to PREPARED rounds
-        on purpose; the gate does not care which kind it was. Measured: one
-        live burst of 20 lines stood admitted for thirteen minutes with all
-        twenty feed rows still reading `prepared`, and every out-of-order
-        refusal in that window named it."""
+        """#1341. A live burst of 20 lines stood admitted for thirteen
+        minutes with all twenty feed rows still reading `prepared`, and
+        every out-of-order refusal in that window named it: the commitment
+        comes back whichever kind of round it was.
+
+        #1300 (c3b22e0) then took the `ready_takes is not None` gate off the
+        FEED withdrawal as well - a live round's rows are appended `prepared`
+        exactly like a prepared round's, so the gate was abandoning them, not
+        protecting them. What stays gated is the `return []`, so a live
+        conversation still runs into its next burst (#767)."""
         burst = body_of(self.text, "async def _speak_turns_floorless(")
-        guarded = ("if ready_takes is not None and not (page_delivery or "
-                   "(to_box and played_ok)):")
         plain = "if not (page_delivery or (to_box and played_ok)):"
-        self.assertIn(guarded, burst)
-        self.assertIn(plain, burst)
-        # the ungated one has to come FIRST, or it is the same rule twice
-        self.assertLess(burst.index(plain), burst.index(guarded))
-        after = burst[burst.index(plain):burst.index(guarded)]
-        self.assertIn("admission_withdraw(", after)
+        gated = ("if ready_takes is not None and not (page_delivery or "
+                 "(to_box and played_ok)):")
+        # #1300: the prepared-only gate on the feed rows must not come back.
+        self.assertNotIn(gated, burst)
+        first = burst.index(plain)
+        second = burst.index(plain, first + len(plain))
+        # the commitment, for every kind of round (#1341)
+        self.assertIn("admission_withdraw(", burst[first:second])
+        # ...and the feed rows, for every kind of round (#1300), with only
+        # the early return still reserved to a prepared round
+        door = burst[second:second + 700]
+        rows = door.index("_burst_withdraw(")
+        gate = door.index("if ready_takes is not None:")
+        self.assertLess(rows, gate)
+        self.assertLess(gate, door.index("return []"))
 
     def test_a_refused_burst_is_withdrawn_from_the_committed_sequence(self):
         """#1340. The burst road commits the whole round and then has five
@@ -153,12 +180,20 @@ class EarlySubmitTests(unittest.TestCase):
 
     def test_committing_never_stops_the_air(self):
         """`admission_admit_line` returns "" on every refusal, and no caller
-        may treat that as a reason not to broadcast."""
+        may treat that as a reason not to broadcast. The statement that
+        commits is read whichever way it is written - a direct call, or the
+        line that opens `await asyncio.to_thread(admission_admit_line, ...)`
+        - and every producer has at least one, so this cannot pass by
+        finding nothing to read."""
+        statement = re.compile(
+            r"^([^\n]*)(?:admission_admit_line\(|"
+            r"asyncio\.to_thread\(\s*admission_admit_line\s*,)", re.M)
         for producer, opener in PRODUCERS.items():
             body = body_of(self.text, opener)
-            for call in re.findall(
-                    r"^[^\n]*admission_admit_line\(", body, re.M):
-                bare = call.strip()
+            opened = [m.group(1) for m in statement.finditer(body)]
+            self.assertTrue(opened, "%s: no commit statement found" % producer)
+            for line in opened:
+                bare = line.strip()
                 self.assertFalse(
                     bare.startswith(("if ", "while ", "assert ",
                                      "return ", "raise ")),

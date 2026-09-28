@@ -3184,54 +3184,10 @@ class System3Runtime:
                 "road": conv["identity"].get("road_kind"), "topic": str(conv["subject"].get("topic") or "")[:160],
                 "turns": turns}
 
-    # [public-door] THE LISTENER DOOR'S CUT OF A ROUND. /api/system3/public/lines
-    # answers anybody holding a tune-in link, and _compact() is the DESK's
-    # reading (feed_lines, the glass). Measured 2026-09-28, it carried the
-    # round's `topic` - for most roads the road's own prompt ("A news moment
-    # between records, and it runs like a late-night podcast: ...", the
-    # SCHEDULE (#843) entry, the memo's brief, the caller's scene) - an
-    # obligated CTS step's label, which is the running order's direction to
-    # the writer, a FAV pick's label and reel, which are the operator's own
-    # favourites, the speaker box's material file names and the SFX node's
-    # intent words. The listener keeps the dice - family, d100, where it
-    # landed, the reel it rolled through, the rule - and the turn's shape, cut
-    # the way tune_messenger.py cuts the same record for the Messenger.
-    LISTENER_FAMILIES = frozenset({"CTS", "ES", "RS", "IRS", "FL", "SPEAKERBOX", "SFX", "SFXGUY",
-                                   "TOPIC", "TRACK_TALK", "FAV", "TEMPER", "INTERJECT", "MENTION",
-                                   "SHOCK", "LINE"})
-
-    def _listener_compact(self, conv):
-        """[public-door] _compact() as the listener door may carry it."""
-        comp = self._compact(conv)
-        events = {e.get("event_id"): e for e in conv.get("decision_events") or [] if isinstance(e, dict)}
-        turns = {}
-        for tid, turn in (comp.get("turns") or {}).items():
-            rolls = []
-            for roll in turn.get("rolls") or []:
-                fam = str(roll.get("family") or "")
-                if fam not in self.LISTENER_FAMILIES:
-                    continue
-                ev = events.get(roll.get("event_id")) or {}
-                sel = ev.get("selected") if isinstance(ev.get("selected"), dict) else {}
-                roll = dict(roll)
-                if fam == "FAV" and str(sel.get("id") or "") not in ("", "NONE"):
-                    roll.update(label="a favourite", category="", reel=[])
-                elif fam == "CTS" and not any(isinstance(st, dict) and st.get("stage") in ("item", "mode")
-                                              for st in ev.get("stages") or []):
-                    roll.update(label="the step as planned", category="", reel=[])
-                rolls.append(roll)
-            turns[tid] = dict(turn, rolls=rolls,
-                              speakerbox=[{"mode": sb.get("mode")} for sb in turn.get("speakerbox") or []],
-                              sfx={k: (turn.get("sfx") or {}).get(k) for k in ("play", "placement")})
-        return {"conversation_id": comp.get("conversation_id"), "mode": comp.get("mode"),
-                "road": comp.get("road"), "turns": turns}
-
     def public_lines(self, ids):
         """[{line_id, system3, ...}] for the tune page's feed. Runs on the
-        reader thread only; the cache is that thread's alone. [public-door]
-        Its own cache: _compact_cached() keeps the desk's reading in
-        _public_cache, and a listener must never be answered out of it."""
-        cache = self.__dict__.setdefault("_listener_cache", collections.OrderedDict())
+        reader thread only; the cache is that thread's alone."""
+        cache = self.__dict__.setdefault("_public_cache", collections.OrderedDict())
         out = []
         for lid in ids:
             got = self.store.line(lid)
@@ -3242,7 +3198,7 @@ class System3Runtime:
             hit = cache.get(cid)
             if not hit or time.time() - hit[0] > self.PUBLIC_TTL:
                 conv = self.store.conversation(cid)
-                hit = (time.time(), self._listener_compact(conv) if conv else None)   # [public-door]
+                hit = (time.time(), self._compact(conv) if conv else None)
                 cache[cid] = hit
                 cache.move_to_end(cid)
                 while len(cache) > 40:
@@ -3252,7 +3208,7 @@ class System3Runtime:
                 out.append({"line_id": lid, "system3": False})
                 continue
             out.append({"line_id": lid, "system3": True, "conversation_id": cid, "mode": comp["mode"],
-                        "road": comp["road"],   # [public-door] no topic: the road's prompt
+                        "road": comp["road"], "topic": comp["topic"],
                         "turn": comp["turns"].get(str(got.get("turn_id") or ""))})
         return out
 

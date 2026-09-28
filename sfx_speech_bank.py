@@ -145,7 +145,7 @@ class SfxSpeechBank:
 
     MEDIA_MEMO_S = 20.0
 
-    def media_ready(self, row):
+    def media_ready(self, row, fresh=False):
         clip = row.get("clip") or {}
         name = str(clip.get("path") or "").split("?", 1)[0].rsplit("/", 1)[-1]
         try:
@@ -161,9 +161,14 @@ class SfxSpeechBank:
             # stats, 7.4 s measured. A render file does not come and go
             # within twenty seconds; when it does appear, twenty seconds is
             # sooner than the next cadence window anyway.
+            #
+            # [bank-media-at-pick] `fresh`: the memo is for the SWEEP. The one
+            # take pick() is about to reserve is looked at on the disk itself,
+            # and what it finds replaces the memo's answer.
             now = self.clock()
             held = self._media_memo.get(name)
-            if held is not None and now - held[1] < self.MEDIA_MEMO_S:
+            if (not fresh and held is not None
+                    and now - held[1] < self.MEDIA_MEMO_S):
                 return held[0]
             try:
                 st = (self.media_dir / name).stat()
@@ -222,22 +227,31 @@ class SfxSpeechBank:
             # deep-copy 33 rows of tint paperwork in order to sort them.
             pool = self.eligible(context, voice, profile, validate,
                                  cooldown=cooldown, deep=False)
-            if not pool:
-                return None
             picked = None
-            if chooser is not None:
-                try:
-                    k = chooser([{"text": str(row.get("text") or ""),
-                                  "overlap": len(terms & response_terms(row.get("text_plain", ""))),
-                                  "plays": int(row.get("plays") or 0),
-                                  "last_played": float(row.get("last_played") or 0)} for row in pool])
-                    if k is not None and 0 <= int(k) < len(pool):
-                        picked = pool[int(k)]
-                except Exception:
+            # [bank-media-at-pick] the winner's recording is looked at on the
+            # disk before it is reserved (#1394's memo answers the sweep). A
+            # take whose file is gone is left out and the choice made again
+            # among the rest - the roulette's, when it was handed in - so
+            # nothing vanished is ever reserved. One stat per pick.
+            while pool and picked is None:
+                if chooser is not None:
+                    try:
+                        k = chooser([{"text": str(row.get("text") or ""),
+                                      "overlap": len(terms & response_terms(row.get("text_plain", ""))),
+                                      "plays": int(row.get("plays") or 0),
+                                      "last_played": float(row.get("last_played") or 0)} for row in pool])
+                        if k is not None and 0 <= int(k) < len(pool):
+                            picked = pool[int(k)]
+                    except Exception:
+                        picked = None
+                if picked is None:
+                    picked = min(pool, key=lambda row: (-len(terms & response_terms(row.get("text_plain", ""))),
+                                                        float(row.get("last_played") or 0), row["id"]))
+                if not self.media_ready(picked, fresh=True):
+                    pool = [row for row in pool if row is not picked]
                     picked = None
             if picked is None:
-                picked = min(pool, key=lambda row: (-len(terms & response_terms(row.get("text_plain", ""))),
-                                                    float(row.get("last_played") or 0), row["id"]))
+                return None
             # #1236: a shallow ledger and ONE replaced row, not a deep
             # copy of 1.45 MB to write two fields. The atomicity the
             # deep copy bought is kept exactly: the stored row is
