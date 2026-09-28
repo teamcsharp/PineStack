@@ -3203,11 +3203,16 @@
     try { raw = root.atob(f.bands); } catch (err) { return null; }
     var n = raw.length;
     if (!n) return null;
+    /* [pllevel] after this terminal's Music level and the DJ duck, in dB */
+    var g = 1;
+    try { var mx = root.pineMixer && root.pineMixer.get ? root.pineMixer.get() : null; if (mx && isFinite(mx.music)) g *= Number(mx.music); } catch (err) { g = 1; }
+    try { var mp = document.getElementById('musicPlayer'); if (mp) g *= mp.volume; } catch (err) { /* keep g */ }
+    var shift = 20 * Math.log(Math.max(0.001, g)) / Math.LN10;
     var bars = [], peak = 0;
     for (var i = 0; i < 64; i += 1) {
       var p = i * (n - 1) / 63, a = Math.floor(p), b = Math.min(n - 1, a + 1), t = p - a;
       var byte = raw.charCodeAt(a) * (1 - t) + raw.charCodeAt(b) * t;
-      var v = Math.max(0, Math.min(1, (byte - 10) / 86));
+      var v = Math.max(0, Math.min(1, (byte + shift - 10) / 86));
       bars.push(v);
       if (v > peak) peak = v;
     }
