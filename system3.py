@@ -37,6 +37,7 @@ import time
 import uuid
 
 import system3_tables
+import conversation_graph
 
 # /4 (2026-09-28, [s3-sb-end]): the prepend-or-append roulette withdraws one of two
 # winning passages, so rounds where both win draw differently from /3.
@@ -62,6 +63,7 @@ FAMILIES = ("CTS", "ES", "RS", "IRS", "FL", "SPEAKERBOX", "SFX", "TOPIC", "SFXGU
             "STATION",                                                   # [s3-dice-door]
             "BLOCK")                                                     # [s3-blocks]
 FAMILIES = FAMILIES + ("MEMORY",)                                    # [s3-memory] rules, then roulette
+FAMILIES = FAMILIES + ("GRAPH",)
 PHASES = ("OPEN", "ESTABLISH", "DEVELOP", "ESCALATE", "EXPLORE", "WILDCARD",
           "RESOLVE", "WRAP", "SEGUE")
 SPEAKERBOX_MODES = ("NONE", "PREPEND", "APPEND", "FULL_SWATH", "REFERENCE",
@@ -226,11 +228,16 @@ BLOCK_KINDS = ("obligation", "roll", "tint", "off")
 
 
 def default_config():
+    structure = system3_tables.default_structure()
+    structure["graph"] = conversation_graph.default_graph()
+    structures = system3_tables.default_structures()
+    for road, item in structures.items():
+        item["graph"] = conversation_graph.protocol_graph(road)
     return {"schema": CONFIG_SCHEMA,
             "tables": system3_tables.default_tables(),
-            "structure": system3_tables.default_structure(),
+            "structure": structure,
             # [s3-calls] one structure per road System 3 builds from its own nodes
-            "structures": system3_tables.default_structures(),
+            "structures": structures,
             "speakerbox": copy.deepcopy(DEFAULT_SPEAKERBOX),
             "sfx": copy.deepcopy(DEFAULT_SFX),
             # [s3-roads] the SFX Guy's mouth
@@ -249,7 +256,20 @@ def config_hash(config):
         keys += ("sfxguy",)
     if "blocks" in config:                       # [s3-blocks]
         keys += ("blocks",)
-    return digest({k: config.get(k) for k in keys})
+    payload = {k: copy.deepcopy(config.get(k)) for k in keys}
+    # Dormant editing surfaces do not alter the decision contract. Old
+    # conversations keep their original config hash until a graph is enabled.
+    structure = payload.get("structure")
+    if isinstance(structure, dict) and not (structure.get("graph") or {}).get("enabled"):
+        structure.pop("graph", None)
+    for item in (payload.get("structures") or {}).values():
+        if not isinstance(item, dict):
+            continue
+        graph = item.get("graph") or {}
+        if not graph.get("enabled") or (len(graph.get("nodes") or []) == 1
+                                        and (graph["nodes"][0] or {}).get("type") == "protocol"):
+            item.pop("graph", None)
+    return digest(payload)
 
 
 def normalise_settings(raw):
@@ -3031,6 +3051,246 @@ def decide_blocks(names, config, seed, conv=None, tint_on=False, dial=None, at=N
     return out
 
 
+def plan_graph(conv, config, graph_raw, until=None, inputs=None, road="banter"):
+    """Follow an editable conversation graph through System 3's own dice ledger.
+
+    Nodes decide who gets a turn and how they answer.  The existing table
+    engine still makes every CTS/ES/RS/IRS/FL decision on that turn.
+    """
+    graph = conversation_graph.normalize(graph_raw)
+    if not graph["nodes"]:
+        raise ValueError("the conversation graph has no nodes")
+    inputs = inputs if inputs is not None else conv["inputs"]
+    by_id = {node["id"]: node for node in graph["nodes"]}
+    stream = DrawStream(conv["seed"], conv.get("draws", 0))
+    want = int(until or conv["timing"]["turn_budget"])
+    seats = [p["actor_id"] for p in conv["participants"] if p["actor_id"] in HOST_SEATS]
+    if not seats:
+        seats = [p["actor_id"] for p in conv["participants"]]
+    cur = conv["cursor"]
+    pinned_initiator = (str(graph_raw.get("initiator") or inputs.get("initiator") or "")
+                        if isinstance(graph_raw, dict) else str(inputs.get("initiator") or ""))
+    if not conv["turns"]:
+        if pinned_initiator in seats:
+            cur["initiator"] = pinned_initiator
+        if until is None and _length_decision(conv, conv["settings"], stream, inputs):
+            want = int(conv["timing"]["turn_budget"])
+        _topic_decision(conv, conv["settings"], stream, inputs, want)
+        _round_rolls(conv, config, conv["settings"], inputs, want, banter=road == "banter")
+        cur["graph_node"] = graph["start"]
+        cur["graph_visits"] = {}
+        cur["graph_topic"] = str(conv.get("subject", {}).get("topic") or "")
+        conv["graph_structure"] = {"road": road, "start": graph["start"],
+                                   "nodes": len(graph["nodes"]), "edges": len(graph["edges"])}
+    current = str(cur.get("graph_node") or graph["start"])
+
+    def record(label, rows, selected, draw, meta=None):
+        before = _snapshot(conv, cur.get("initiator"))
+        ev = _event(conv, {"turn_id": "", "turn_index": len(conv["turns"])}, "GRAPH",
+                    [_stage(label, rows, selected, draw)],
+                    {"id": rows[selected]["id"], "label": rows[selected]["label"]},
+                    before, meta=meta or {}, rng=draw)
+        ev["state_after"] = _snapshot(conv, cur.get("initiator"))
+        return ev
+
+    guard = 0
+    while len(conv["turns"]) < want and guard < min(240, graph["max_steps"] * 4):
+        guard += 1
+        node = by_id.get(current)
+        if not node:
+            break
+        visits = cur.setdefault("graph_visits", {})
+        visits[current] = visits.get(current, 0) + 1
+        if visits[current] > max(4, graph["max_steps"] // 4):
+            break
+        kind = node["type"]
+        if kind == "end":
+            # End is a real closing turn.  A chapter may end early by design.
+            if len(conv["turns"]) >= want:
+                break
+        execute = kind != "call" or bool(inputs.get("graph_caller_available"))
+        if execute and node["chance"] < 1:
+            draw = stream.next("GRAPH:%s:chance:%d" % (current, visits[current]))
+            choices = [{"id": "speak", "label": "speak", "base": node["chance"],
+                        "weight": node["chance"], "why": ["node probability"]},
+                       {"id": "skip", "label": "skip", "base": 1 - node["chance"],
+                        "weight": 1 - node["chance"], "why": ["node probability"]}]
+            execute = execute and draw["u"] < node["chance"]
+            record("chance", choices, 0 if execute else 1, draw, {"node": current})
+        if execute and kind != "decision":
+            speaker = node["speaker"]
+            if kind == "initiator":
+                cur["graph_reply_speakers"] = {}
+                if speaker in seats:
+                    cur["initiator"] = speaker
+                elif pinned_initiator in seats:
+                    cur["initiator"] = pinned_initiator
+                else:
+                    candidates = [s for s in seats if s != cur.get("initiator") or visits[current] == 1]
+                    if len(candidates) > 1:
+                        candidates = [s for s in candidates if s != cur.get("last")] or candidates
+                    if not candidates:
+                        candidates = seats
+                    draw = stream.next("GRAPH:%s:initiator:%d" % (current, visits[current]))
+                    pick = min(int(draw["u"] * len(candidates)), len(candidates) - 1)
+                    rows = [{"id": s, "label": participant(conv, s)["name"] if participant(conv, s) else s,
+                             "base": 1, "weight": 1, "why": ["cast initiator election"]} for s in candidates]
+                    event = record("initiator", rows, pick, draw, {"node": current})
+                    cur["initiator"] = candidates[pick]
+                    event["state_after"] = _snapshot(conv, cur["initiator"])
+            if kind == "reply" and node.get("respond_to"):
+                speaker = (cur.get("graph_reply_speakers") or {}).get(node["respond_to"])
+                if not speaker:
+                    execute = False
+            if execute and speaker not in seats and speaker != "C":
+                if kind in ("initiator", "rebuttal"):
+                    speaker = cur["initiator"]
+                elif kind == "call":
+                    speaker = "C"
+                elif kind == "reply":
+                    eligible = [s for s in seats if s != cur["initiator"] and s != cur.get("last")]
+                    if eligible:
+                        draw = stream.next("GRAPH:%s:speaker:%d" % (current, visits[current]))
+                        pick = min(int(draw["u"] * len(eligible)), len(eligible) - 1)
+                        rows = [{"id": s, "label": participant(conv, s)["name"] if participant(conv, s) else s,
+                                 "base": 1, "weight": 1, "why": ["cast member; not the initiator or previous speaker"]}
+                                for s in eligible]
+                        record("speaker", rows, pick, draw, {"node": current})
+                        speaker = eligible[pick]
+                    else:
+                        speaker = None
+                else:
+                    speaker = next((s for s in seats if s != cur.get("last")), None)
+            if speaker == "C" and not participant(conv, "C"):
+                caller_name = str((inputs.get("names") or {}).get("C") or "Caller")[:80]
+                conv["participants"].append(new_conversation({"seats": ["C"], "names": {"C": caller_name}},
+                                                             config, conv["settings"])["participants"][0])
+            if speaker and (speaker != cur.get("last") or kind == "initiator"):
+                draws = node["draws"] or {
+                    "initiator": [{"family": "CTS"}, {"family": "ES"}],
+                    "reply": [{"family": "ES"}, {"family": "RS"}],
+                    "rebuttal": [{"family": "ES"}, {"family": "IRS"}],
+                    "topic_change": [{"family": "ES"}, {"family": "FL"}],
+                    "call": [{"family": "ES"}, {"family": "RS"}],
+                    "end": [{"family": "ES"}, {"family": "FL", "closes": True}],
+                }.get(kind, [{"family": "ES"}])
+                last_turn = len(conv["turns"]) == want - 1
+                if last_turn or kind == "end":
+                    draws = list(draws)
+                    if not any(d.get("family") == "FL" and d.get("closes") for d in draws):
+                        draws.append({"family": "FL", "tables": ["FL2"], "closes": True})
+                step = {"id": current, "label": node["label"], "draws": draws,
+                        "speakerbox": node["speakerbox"], "topic": node["topic"]}
+                turn = _decide_turn(conv, config, conv["settings"], stream, step, speaker,
+                                    want, inputs, closing=False)
+                turn["graph_node"] = current
+                turn["graph_type"] = kind
+                turn["planned_seconds"] = node["seconds"]
+                if kind == "initiator" and visits[current] > 1 and not node["topic"] and cur.get("graph_topic"):
+                    turn["topic_override"] = cur["graph_topic"]
+                if kind == "rebuttal" or (kind == "reply" and node.get("respond_to")):
+                    for field, choices in (("handling", node["moods"]),
+                                           ("intonation", node["intonations"])):
+                        if not choices:
+                            continue
+                        draw = stream.next("GRAPH:%s:%s:%d" % (current, field, visits[current]))
+                        pick = min(int(draw["u"] * len(choices)), len(choices) - 1)
+                        rows = [{"id": str(i), "label": choice, "base": 1, "weight": 1,
+                                 "why": ["node delivery table"]} for i, choice in enumerate(choices)]
+                        record(field, rows, pick, draw, {"node": current})
+                        turn["graph_" + field] = choices[pick]
+                if kind == "reply":
+                    cur.setdefault("graph_reply_speakers", {})[current] = speaker
+                turn["protocol"] = node["prompt"] or {
+                    "initiator": "Opens this chapter with a concrete point.",
+                    "reply": "Answers the preceding point and the replies already made in this chain.",
+                    "rebuttal": "Answers the replies to their opening point, including each speaker's argument.",
+                    "topic_change": "Segues from this exchange into the next discussion point.",
+                    "call": "A caller who heard this conversation joins with its context and gets a direct response.",
+                    "end": "Closes the segment with an amiable ending.",
+                }.get(kind, "")
+                if kind == "reply" and node.get("respond_to"):
+                    original = next((old for old in reversed(conv["turns"][:-1])
+                                     if old.get("graph_node") == node["respond_to"]), None)
+                    rebuttal = next((old for old in reversed(conv["turns"][:-1])
+                                     if old.get("graph_type") == "rebuttal"), None)
+                    if original and rebuttal:
+                        turn["protocol"] += (" Return to your point in turn %d and answer the initiator's"
+                                             " rebuttal in turn %d directly."
+                                             % (original["index"] + 1, rebuttal["index"] + 1))
+                if kind == "topic_change":
+                    turn["topic_change"] = True
+                    if node["topic"]:
+                        cur["graph_topic"] = node["topic"]
+                    options = graph["topic_options"] or [str(item.get("text") or "")[:120]
+                        for item in (inputs.get("topic_bank") or []) if isinstance(item, dict) and item.get("text")]
+                    if options and not node["topic"]:
+                        draw = stream.next("GRAPH:%s:topic:%d" % (current, visits[current]))
+                        weights = ([1 / (1 + max(0, int(item.get("used") or 0)))
+                                    for item in (inputs.get("topic_bank") or []) if isinstance(item, dict) and item.get("text")]
+                                   if not graph["topic_options"] else [1] * len(options))
+                        choice = pick_index(weights, draw["u"])
+                        rows = [{"id": str(i), "label": text, "base": weights[i], "weight": weights[i],
+                                 "why": ["operator topic option"]} for i, text in enumerate(options)]
+                        record("topic", rows, choice, draw, {"node": current})
+                        turn["topic_override"] = options[choice]
+                        cur["graph_topic"] = options[choice]
+                if kind == "call":
+                    topic = str(cur.get("graph_topic") or conv.get("subject", {}).get("topic")
+                                or "the current subject")[:200]
+                    heard = [str(old.get("name") or old.get("speaker") or "")
+                             for old in conv["turns"][:-1] if old.get("speaker") != "C"][-3:]
+                    turn["protocol"] += (" The caller joins a live discussion of %s after hearing %s."
+                                         " Their point must connect to that discussion."
+                                         % (json.dumps(topic), ", ".join(heard) or "the hosts"))
+                if last_turn and kind != "end":
+                    turn["protocol"] += " Land this segment with a brief, amiable ending."
+                _interject_after(conv, config, conv["settings"], stream, want, inputs, seats)
+                if kind == "end":
+                    break
+        outgoing = [edge for edge in graph["edges"] if edge["from"] == current and edge["weight"] > 0
+                    and (by_id[edge["to"]]["type"] != "call" or inputs.get("graph_caller_available"))]
+        if not outgoing:
+            break
+        ending = next((edge for edge in outgoing if by_id[edge["to"]]["type"] == "end"), None)
+        if ending and len(conv["turns"]) >= want - 1:
+            chosen = ending
+        elif len(outgoing) == 1:
+            chosen = outgoing[0]
+        else:
+            # The segment clock keeps a chapter open until there is room for
+            # the closing turn. An early wrap would waste the allocated slot.
+            if ending:
+                outgoing = [edge for edge in outgoing if edge is not ending]
+            draw = stream.next("GRAPH:%s:branch:%d" % (current, visits[current]))
+            weights = [edge["weight"] for edge in outgoing]
+            pick = pick_index(weights, draw["u"])
+            rows = [{"id": edge["to"], "label": edge["label"] or by_id[edge["to"]]["label"],
+                     "base": edge["weight"], "weight": edge["weight"], "why": ["outgoing flow weight"]}
+                    for edge in outgoing]
+            record("branch", rows, pick, draw, {"node": current})
+            chosen = outgoing[pick]
+        current = chosen["to"]
+        cur["graph_node"] = current
+    conv["draws"] = stream.n
+    # Replanning may call this function repeatedly. Always scale the node's
+    # original estimate so repeated calls cannot compound an earlier scale.
+    raw_seconds = sum(float(by_id.get(t.get("graph_node"), {}).get("seconds") or 0)
+                      for t in conv["turns"] if t.get("graph_node"))
+    target_seconds = float(conv["timing"].get("target_duration") or 0)
+    scale = min(1.5, max(.6, target_seconds / raw_seconds)) if raw_seconds and target_seconds else 1.0
+    for turn in conv["turns"]:
+        if turn.get("graph_node"):
+            turn["planned_seconds"] = round(float(by_id.get(turn["graph_node"], {}).get("seconds") or 0) * scale, 1)
+    conv["graph_profile"] = {"estimated_seconds": round(sum(float(t.get("planned_seconds") or 0)
+                                                             for t in conv["turns"]), 1),
+                             "raw_seconds": round(raw_seconds, 1), "budget_seconds": target_seconds,
+                             "turns": len(conv["turns"])}
+    _events_attach(conv)
+    _cast_rolls(conv, config, conv["settings"], inputs)
+    return conv
+
+
 def plan_more(conv, config, until=None, inputs=None):
     """Mode A: plan turns from the cursor up to `until` (the turn budget).
 
@@ -3039,6 +3299,9 @@ def plan_more(conv, config, until=None, inputs=None):
     Frame -> hand the initiator role on. The last turn draws a closing
     move. Resumable: Mode B truncates and calls this again."""
     inputs = inputs if inputs is not None else conv["inputs"]
+    if (config.get("structure") or {}).get("graph", {}).get("enabled") and (config.get("structure") or {}).get("graph", {}).get("nodes"):
+        return plan_graph(conv, config, config["structure"]["graph"], until=until,
+                          inputs=inputs, road="banter")
     settings = conv["settings"]
     stream = DrawStream(conv["seed"], conv.get("draws", 0))
     want = int(until or conv["timing"]["turn_budget"])
@@ -4387,6 +4650,14 @@ def _row_work(turn, conv):
         lead = ("%s - on this subject, in their own words: %s" % (lead, json.dumps(turn["topic_override"]))
                 if lead else "brings up this subject, in their own words: %s" % json.dumps(turn["topic_override"]))
     body = " - ".join(x for x in (lead, desc) if x)
+    if turn.get("graph_node") and turn.get("protocol"):
+        body += (". " if body else "") + str(turn["protocol"])
+    if turn.get("graph_handling"):
+        body += (". " if body else "") + "Internally %s" % turn["graph_handling"]
+    if turn.get("graph_intonation"):
+        body += (". " if body else "") + "Deliver this in a %s intonation" % turn["graph_intonation"]
+    if turn.get("graph_node") and turn.get("planned_seconds"):
+        body += ". Allow about %d seconds for this turn" % round(float(turn["planned_seconds"]))
     # [s3-es-dir] the feeling's own words for this line - not on a line whose words are fixed
     _fixed = answer_line or (turn["index"] == 0 and bool(exchange.get("opener") or conv["subject"].get("seeded")))
     _es = "" if _fixed else _es_line(turn)
@@ -4790,6 +5061,10 @@ def replan(conv, config, from_index, until=None):
         if isinstance(plan, dict) and plan.get("done") and int(plan.get("attached_index", -1)) >= from_index:
             plan["done"] = False
             plan.pop("attached_index", None)
+    graph_road = str((conv.get("graph_structure") or {}).get("road") or "")
+    if graph_road and graph_road != "banter":
+        return plan_graph(conv, config, (road_structure(config, graph_road) or {}).get("graph"),
+                          until=until, road=graph_road)
     return plan_more(conv, config, until=until)
 
 
@@ -4818,6 +5093,16 @@ def replay(stored, config):
     # line, a call from its structure, a segment from its legs, or the cycle
     if road in system3_tables.LINE_ROADS:
         plan_line(conv, config)
+    elif stored.get("graph_structure"):
+        graph = ((config.get("structure") or {}).get("graph") if road == "banter"
+                 else (road_structure(config, road) or {}).get("graph"))
+        plan_graph(conv, config, graph, road=road)
+        for rp in replans:
+            for o in obs:
+                if o["turn_index"] < rp["from"] and not any(x["turn_index"] == o["turn_index"]
+                                                            for x in conv["observations"]):
+                    observe(conv, o["turn_index"], o["text"], o.get("seconds"))
+            replan(conv, config, rp["from"], until=stored["timing"]["turn_budget"])
     elif road == "caller" and stored.get("call_structure"):
         conv["inputs"]["call"] = dict((stored.get("inputs") or {}).get("call") or {})
         plan_call(conv, config)

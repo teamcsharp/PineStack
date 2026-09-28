@@ -540,6 +540,21 @@
 .s3-seg-props { display: grid; gap: 6px; }
 .s3-seg-props label { display: grid; gap: 3px; font-size: 12px; color: var(--ink-2); }
 .s3-seg-props textarea { min-height: 70px; }
+.s3-graph-editor { display: grid; gap: 12px; }
+.s3-graph-layout { display: grid; grid-template-columns: minmax(0, 1fr) minmax(220px, 300px); gap: 12px; }
+.s3-graph-visual { min-width: 0; }
+.s3-graph-canvas { display: block; width: 100%; height: 460px; border: 1px solid var(--line); border-radius: 10px; background: radial-gradient(circle at center, #172833, #0a141b); }
+.s3-graph-list { display: flex; flex-wrap: wrap; gap: 5px; padding-top: 8px; }
+.s3-graph-list button[aria-pressed="true"] { border-color: var(--accent); }
+.s3-graph-properties { display: grid; gap: 7px; align-content: start; min-width: 0; }
+.s3-graph-properties label, .s3-graph-flows label { display: grid; gap: 4px; color: var(--ink-2); font-size: 12px; }
+.s3-graph-properties .s3-row { display: flex; }
+.s3-graph-properties textarea, .s3-graph-flows textarea { min-height: 56px; }
+.s3-graph-flows { display: grid; gap: 7px; }
+.s3-graph-edge { display: grid; grid-template-columns: minmax(0, 1fr) 80px 35px; align-items: center; gap: 6px; font-size: 12px; }
+.s3-graph-edge input { width: 80px; }
+.s3-graph-preview { max-height: 340px; overflow: auto; white-space: pre-wrap; font-size: 11px; }
+@media (max-width: 900px) { .s3-graph-layout { grid-template-columns: 1fr; } }
 
 .s3-feed { display: grid; gap: 8px; }
 .s3-tile { border: 1px solid var(--line); border-radius: 10px; background: var(--panel); padding: 8px 10px; }

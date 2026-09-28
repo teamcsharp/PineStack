@@ -54,6 +54,7 @@ class System3Store:
             self.db.executescript("""
             CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL, at REAL NOT NULL);
             CREATE TABLE IF NOT EXISTS configs(hash TEXT PRIMARY KEY, created REAL NOT NULL, note TEXT, body BLOB NOT NULL);
+            CREATE TABLE IF NOT EXISTS graph_presets(name TEXT PRIMARY KEY, updated REAL NOT NULL, body BLOB NOT NULL);
             CREATE TABLE IF NOT EXISTS conversations(
                 id TEXT PRIMARY KEY, created REAL NOT NULL, updated REAL NOT NULL,
                 road TEXT, mode TEXT, status TEXT, trace_id TEXT, slot_id TEXT,
@@ -105,6 +106,9 @@ class System3Store:
                 if got:
                     return _unpack(got[0])
         cfg = system3.default_config()
+        # New stations begin with the editable talk graph live. The pure
+        # default_config() fixture stays legacy-compatible for recorded plans.
+        cfg["structure"]["graph"]["enabled"] = True
         self.save_config(cfg, note="default")
         return cfg
 
@@ -126,6 +130,21 @@ class System3Store:
             rows = self.db.execute("SELECT hash, created, note FROM configs ORDER BY created DESC LIMIT ?",
                                    (int(limit),)).fetchall()
         return [{"hash": h, "created": c, "note": n} for h, c, n in rows]
+
+    def graph_presets(self):
+        with self.lock:
+            rows = self.db.execute("SELECT name, body FROM graph_presets ORDER BY name").fetchall()
+        return {name: _unpack(body) for name, body in rows}
+
+    def save_graph_preset(self, name, graph):
+        with self.lock, self.db:
+            self.db.execute("INSERT OR REPLACE INTO graph_presets VALUES(?,?,?)",
+                            (name, time.time(), _pack(graph)))
+
+    def delete_graph_preset(self, name):
+        with self.lock, self.db:
+            cursor = self.db.execute("DELETE FROM graph_presets WHERE name=?", (name,))
+        return cursor.rowcount > 0
 
     # --- conversations ----------------------------------------------------------
     def save_conversation(self, conv):

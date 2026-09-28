@@ -247,6 +247,7 @@ class System3Runtime:
     def load(self):
         self.settings = self.store.settings()
         self.config = self.store.config()
+        self.add_missing_conversation_graphs()
         added = self.add_missing_default_tables()
         if added:
             self.log("System 3 config gained the default tables it predates: " + ", ".join(added))
@@ -266,6 +267,30 @@ class System3Runtime:
         if adopted:
             self.log("System 3 adopted the Mind desk's notes as table rows: " + "; ".join(adopted)[:380])
         self.ready = True
+
+    def add_missing_conversation_graphs(self):
+        """Version older System 3 books into visible graph surfaces.
+
+        A custom banter cycle keeps its existing steps until its operator
+        chooses the talk template. Protocol wrappers keep their existing
+        internal planners intact.
+        """
+        import conversation_graph
+        config = copy.deepcopy(self.config)
+        changed = False
+        structure = config.get("structure") or {}
+        baseline = system3_tables.default_structure()
+        if not (structure.get("graph") or {}).get("nodes") and structure.get("steps") == baseline.get("steps"):
+            structure["graph"] = conversation_graph.default_graph()
+            structure["graph"]["enabled"] = True
+            changed = True
+        for road, item in (config.get("structures") or {}).items():
+            if isinstance(item, dict) and not (item.get("graph") or {}).get("nodes"):
+                item["graph"] = conversation_graph.protocol_graph(road)
+                changed = True
+        if changed:
+            self._save_config_now(config, "conversation graphs added to existing System 3 structures")
+        return changed
 
     # --- [s3-cast] favourites and directives ----------------------------------
     def _cast_path(self):
@@ -1077,6 +1102,8 @@ class System3Runtime:
             "topic_bank": topic_bank,
             # [s3-calls] what a call needs to be built from System 3's structure
             "call": call_of,
+            "graph_caller_available": bool(ctx.get("caller_name") or ctx.get("graph_caller_available")
+                                           or ctx.get("call_interjection")),
             # [s3-roads] a message, not a conversation (never cut on the air)
             "whole": bool(ctx.get("whole")),
             # [s3-glass] the round's length: the dial's random stood here (a
@@ -1658,7 +1685,13 @@ class System3Runtime:
             # station hands a sequel today - is built from System 3's call legs
             _story_protocol = bool(call.get("story")) and bool(
                 re.search(r"(?m)^\s*\d+\s+[ABCDE]\s+[-–—]", ctx.get("call_sheet") or ""))
-            if road == "caller" and call.get("first") and not _story_protocol:
+            if (road != "banter" and (system3.road_structure(config, road) or {}).get("graph", {}).get("enabled")
+                    and (system3.road_structure(config, road) or {}).get("graph", {}).get("nodes")
+                    and not any(node.get("type") == "protocol" for node in
+                                system3.road_structure(config, road)["graph"]["nodes"])):
+                system3.plan_graph(conv, config, system3.road_structure(config, road)["graph"],
+                                   inputs=inputs, road=road)
+            elif road == "caller" and call.get("first") and not _story_protocol:
                 # [s3-calls] the call is built by System 3's own call structure
                 system3.plan_call(conv, config, inputs)
                 handle.sheet = system3.render_call_sheet(conv) if handle.active else ""
@@ -3049,7 +3082,7 @@ class System3Runtime:
         present (the saved one, else the default), his section defaulted.
         Nothing here is written back until the desk saves it."""
         view = copy.deepcopy(self.config)
-        structures = dict(system3_tables.default_structures())
+        structures = system3.default_config()["structures"]
         structures.update({k: v for k, v in (view.get("structures") or {}).items() if isinstance(v, dict)})
         view["structures"] = structures
         view.setdefault("sfxguy", copy.deepcopy(system3.DEFAULT_SFXGUY))
@@ -3333,6 +3366,86 @@ def install(app, namespace):
             raise HTTPException(400, "that would leave no enabled table for " + ", ".join(missing))
         return {"hash": await save_config(config, "removed table %s" % table_id)}
 
+    @app.get("/api/system3/graph/template")
+    async def conversation_graph_template(authorization: str | None = Header(default=None)):
+        host.require_read_auth(authorization)
+        import conversation_graph
+        return {"graph": conversation_graph.default_graph()}
+
+    @app.get("/api/system3/graph/presets")
+    async def conversation_graph_presets(authorization: str | None = Header(default=None)):
+        host.require_read_auth(authorization)
+        return {"presets": await rt.read(rt.store.graph_presets)}
+
+    @app.put("/api/system3/graph/presets/{name}")
+    async def save_conversation_graph_preset(name: str, request: Request,
+                                             authorization: str | None = Header(default=None)):
+        host.require_auth(authorization)
+        import conversation_graph
+        name = " ".join(name.split())[:64]
+        if not name:
+            raise HTTPException(400, "the preset needs a name")
+        raw = body_json(await request.body())
+        graph = conversation_graph.normalize(raw.get("graph"))
+        if not graph["nodes"]:
+            raise HTTPException(400, "the preset needs nodes")
+        problems = conversation_graph.validate(graph)
+        if problems:
+            raise HTTPException(400, "; ".join(problems))
+        await asyncio.get_running_loop().run_in_executor(_STORE_POOL, rt.store.save_graph_preset, name, graph)
+        return {"name": name, "graph": graph}
+
+    @app.delete("/api/system3/graph/presets/{name}")
+    async def delete_conversation_graph_preset(name: str,
+                                               authorization: str | None = Header(default=None)):
+        host.require_auth(authorization)
+        deleted = await asyncio.get_running_loop().run_in_executor(_STORE_POOL, rt.store.delete_graph_preset, name)
+        if not deleted:
+            raise HTTPException(404, "no graph preset %s" % name)
+        return {"deleted": name}
+
+    @app.post("/api/system3/graph/preview")
+    async def conversation_graph_preview(request: Request, authorization: str | None = Header(default=None)):
+        """Dry run a graph with System 3's real decision tables and dice."""
+        host.require_auth(authorization)
+        import conversation_graph
+        raw = body_json(await request.body())
+        graph = conversation_graph.normalize(raw.get("graph"))
+        if not graph["nodes"]:
+            raise HTTPException(400, "the graph needs at least one node")
+        problems = conversation_graph.validate(graph)
+        if problems:
+            raise HTTPException(400, "; ".join(problems))
+        if graph["nodes"][0]["type"] == "protocol":
+            return {"turns": [], "rolls": [], "protocol": graph["nodes"][0].get("protocol_road") or raw.get("road"),
+                    "estimated_seconds": 0, "budget_seconds": raw.get("seconds") or 180}
+        seconds = max(20, min(3600, float(raw.get("seconds") or 180)))
+        turns = max(2, min(60, int(raw.get("turns") or round(seconds / 15))))
+        road = str(raw.get("road") or "banter")
+        config = copy.deepcopy(rt.config)
+        config["structure"]["graph"] = graph
+        inputs = {"road": road, "seats": ["A", "B", "D"],
+                  "names": {"A": "Host", "B": "Co-host", "D": "Third chair", "C": "Caller"},
+                  "turns": turns, "target_seconds": seconds,
+                  "subject": {"topic": str(raw.get("topic") or "")[:300]},
+                  "availability": {}, "speakerbox_rates": {}, "sfxguy": {"voice": False},
+                  "graph_caller_available": bool(raw.get("caller_available"))}
+        conv = system3.new_conversation(inputs, config, rt.settings,
+                                        seed=str(raw.get("seed") or "graph-preview")[:80])
+        system3.plan_graph(conv, config, graph, until=turns, road=road)
+        return {"turns": [{"node": t.get("graph_node"), "type": t.get("graph_type"),
+                           "speaker": t.get("speaker"), "name": t.get("name"),
+                           "work": t.get("protocol"), "emotion": (t.get("performance") or {}).get("emotion")}
+                          for t in conv["turns"]],
+                "rolls": [{"node": (e.get("meta") or {}).get("node"),
+                           "kind": (e.get("stages") or [{}])[0].get("stage"),
+                           "selected": (e.get("selected") or {}).get("id"),
+                           "dice": (e.get("rng") or {}).get("dice"),
+                           "candidates": (e.get("stages") or [{}])[0].get("candidates")}
+                          for e in conv["decision_events"] if e.get("family") == "GRAPH"],
+                "estimated_seconds": conv.get("graph_profile", {}).get("estimated_seconds", 0),
+                "budget_seconds": seconds}
+
     @app.put("/api/system3/structure")
     async def put_structure(request: Request, authorization: str | None = Header(default=None)):
         """The banter cycle and its prepend/append marks (the node view)."""
@@ -3352,6 +3465,14 @@ def install(app, namespace):
         structure = dict(config["structure"])
         structure.update({k: raw[k] for k in ("steps", "closing", "handoff", "label", "initiator", "source")   # [s3-flow] [s3-source]
                           if k in raw})
+        if "graph" in raw:
+            import conversation_graph
+            structure["graph"] = conversation_graph.normalize(raw["graph"])
+            problems = conversation_graph.validate(structure["graph"])
+            if any(n["type"] == "protocol" for n in structure["graph"]["nodes"]):
+                problems.append("the banter cycle needs dialogue nodes, not a protocol wrapper")
+            if problems:
+                raise HTTPException(400, "; ".join(problems))
         structure["version"] = int(structure.get("version") or 1) + 1
         config["structure"] = structure
         return {"hash": await save_config(config, "structure v%d" % structure["version"]),
@@ -3381,6 +3502,12 @@ def install(app, namespace):
             mine = dict(system3.road_structure(config, road) or {})
         mine.update({k: raw[k] for k in ("legs", "label", "head", "tail", "material",
                                          "min_turns", "max_turns", "caller_share") if k in raw})
+        if "graph" in raw:
+            import conversation_graph
+            mine["graph"] = conversation_graph.normalize(raw["graph"])
+            problems = conversation_graph.validate(mine["graph"])
+            if problems:
+                raise HTTPException(400, "; ".join(problems))
         if "weight" in raw:
             try:
                 mine["weight"] = max(0.0, float(raw.get("weight") or 0))

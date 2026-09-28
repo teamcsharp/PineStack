@@ -16,6 +16,7 @@ const FAM = {CTS: 'var(--cts)', ES: 'var(--es)', RS: 'var(--rs)', IRS: 'var(--ir
   TEMPER: 'var(--es)', SHOCK: 'var(--rs)', INTERJECT: 'var(--fl)', MENTION: 'var(--cts)', CARRY: 'var(--es)'};   /* [s3-rounds] [s3-carry] */
 FAM.MEMORY = 'var(--memory, #d9c9a3)';   /* [s3-memory] */
 FAM.RESOLVE = 'var(--tint)'; FAM.WRAP = 'var(--room)';   /* [s3-callend] the caller's wheel, wrap call */
+FAM.GRAPH = 'var(--topic)';
 const SIDE = {A: 'left', B: 'right', D: 'left', C: 'right', E: 'right'};
 const reduced = () => window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -6038,6 +6039,7 @@ export async function mount(root, {request, onClose, tab: startTab = '', table: 
   function stopExtras() {
     if (sys3) { try { sys3.stop(); } catch (e) { /* gone */ } sys3 = null; }
     if (visualScene) { visualScene.stop(); visualScene = null; }
+    if (segGraphScene) { segGraphScene.stop(); segGraphScene = null; }
     clearInterval(auditTimer); clearInterval(promptsTimer);
     if (menuNode) { menuNode.remove(); menuNode = null; }
   }
@@ -6697,6 +6699,7 @@ export async function mount(root, {request, onClose, tab: startTab = '', table: 
    * it without a roll. A variant is saved as "<road>~vN" with a weight; the
    * engine rolls VARIANT among the base and its variants when the road runs. */
   let segRoad = '', segNodes = null, segRoadOf = '', segSel = {node: -1, draw: -1}, segDrag = null;
+  let segGraph = null, segGraphOf = '', segGraphSel = '', segGraphScene = null, segGraphPresets = null;
   let segInitiator = null;   /* [s3-flow] who opens the banter cycle (null: as saved) */
   const SEG_FAMS = ['CTS', 'ES', 'RS', 'IRS', 'FL'];
   function segStructures() { return config.config.structures || {}; }
@@ -6705,6 +6708,14 @@ export async function mount(root, {request, onClose, tab: startTab = '', table: 
     segRoadOf = road; segSel = {node: -1, draw: -1};
     segNodes = road === 'banter' ? JSON.parse(JSON.stringify(config.config.structure.steps || []))
       : JSON.parse(JSON.stringify((segStructures()[road] || {}).legs || []));
+    segGraphOf = road;
+    const saved = road === 'banter' ? config.config.structure.graph : (segStructures()[road] || {}).graph;
+    const fallback = road === 'banter' ? {nodes: [], edges: [], start: '', topic_options: [], max_steps: 48}
+      : {enabled: true, start: 'protocol', nodes: [{id: 'protocol', type: 'protocol', label: road + ' protocol',
+          protocol_road: road, x: 0, y: 0, seconds: 60, chance: 1, draws: []}],
+        edges: [], topic_options: [], max_steps: 48};
+    segGraph = JSON.parse(JSON.stringify(saved || fallback));
+    segGraphSel = (segGraph.nodes[0] || {}).id || '';
   }
   function segTableCats(fam) {   /* [s3-flow] */
     const seen = new Map();
@@ -6716,6 +6727,194 @@ export async function mount(root, {request, onClose, tab: startTab = '', table: 
     return (config.config.tables || []).filter(t => t.family === fam)
       .flatMap(t => (t.categories || []).flatMap(c => (c.items || []).map(it => ({id: it.id, label: `${t.id} · ${c.label || c.id} · ${it.label || it.id}`}))));
   }
+  function segGraphView(repaint) {
+    const graph = segGraph, nodes = graph.nodes || (graph.nodes = []), edges = graph.edges || (graph.edges = []);
+    const selected = nodes.find(n => n.id === segGraphSel);
+    const box = el('section', 's3-card s3-graph-editor', el('h2', {text: 'Conversation graph'}));
+    if (segGraphPresets === null) request('/api/system3/graph/presets').then(got => {
+      segGraphPresets = got.presets || {}; if (tab === 'segments') repaint();
+    }).catch(() => { segGraphPresets = {}; });
+    const presetNames = Object.keys(segGraphPresets || {}).sort();
+    const presetPick = el('select', {'aria-label': 'Conversation graph preset'},
+      el('option', {value: '', text: 'Choose a saved preset'}),
+      ...presetNames.map(name => el('option', {value: name, text: name})));
+    const canvas = el('canvas', {class: 's3-graph-canvas', 'aria-label': 'Three dimensional conversation flowchart'});
+    const preview = el('pre', 's3-graph-preview'); preview.hidden = true;
+    const previewMinutes = el('input', {type: 'number', min: .5, max: 60, step: .5, value: 3,
+      'aria-label': 'Preview segment minutes', style: 'width:70px'});
+    const previewCaller = el('input', {type: 'checkbox', 'aria-label': 'Caller available in preview'});
+    const refresh = () => { if (segGraphScene) { segGraphScene.stop(); segGraphScene = null; } repaint(); };
+    box.append(el('div', 's3-seg-bar',
+      el('label', 's3-row', el('input', {type: 'checkbox', checked: !!graph.enabled,
+        onchange: e => { graph.enabled = e.target.checked; }}), 'Run this graph when System 3 writes this road'),
+      btn('Start from talk template', async () => { try { const got = await request('/api/system3/graph/template');
+        segGraph = JSON.parse(JSON.stringify(got.graph)); segGraph.enabled = true;
+        segGraphSel = (segGraph.nodes[0] || {}).id || ''; refresh(); }
+        catch (e) { report(e); } }),
+      segRoad !== 'banter' ? btn('Wrap existing protocol', () => { segGraph = {enabled: true, start: 'protocol',
+        nodes: [{id: 'protocol', type: 'protocol', label: segRoad + ' protocol', protocol_road: segRoad,
+          x: 0, y: 0, seconds: 60, chance: 1, draws: []}], edges: [], topic_options: [], max_steps: 48};
+        segGraphSel = 'protocol'; refresh(); }) : null,
+      btn('Save as preset', async () => { const name = prompt('Preset name:', 'Talk chapter'); if (!name) return;
+        try { const got = await send('/api/system3/graph/presets/' + encodeURIComponent(name), 'PUT', {graph});
+          segGraphPresets = segGraphPresets || {}; segGraphPresets[got.name] = got.graph;
+          refresh(); saved('graph preset ' + got.name, got); } catch (e) { report(e); } }),
+      presetPick,
+      btn('Load preset', () => { const copy = (segGraphPresets || {})[presetPick.value]; if (!copy) return;
+        segGraph = JSON.parse(JSON.stringify(copy)); segGraphSel = (segGraph.nodes[0] || {}).id || ''; refresh(); }),
+      btn('Delete preset', async () => { if (!presetPick.value) return; const name = presetPick.value;
+        try { await send('/api/system3/graph/presets/' + encodeURIComponent(name), 'DELETE');
+          delete segGraphPresets[name]; refresh(); } catch (e) { report(e); } }),
+      btn('Add node', () => { const id = 'node-' + Date.now().toString(36); graph.enabled = true;
+        nodes.push({id, label: 'Reply', type: 'reply', x: 0, y: nodes.length * 100, seconds: 15, chance: 1,
+          draws: [{family: 'ES'}, {family: 'RS'}]}); if (!graph.start) graph.start = id;
+        segGraphSel = id; refresh(); }),
+      el('label', 's3-row', 'Preview minutes', previewMinutes),
+      el('label', 's3-row', previewCaller, 'Caller available'),
+      btn('Preview dice', async () => { try { const seconds = Math.max(30, Math.min(3600, Number(previewMinutes.value) * 60 || 180));
+        const got = await send('/api/system3/graph/preview', 'POST',
+        {road: segRoad, graph, seconds, turns: Math.max(2, Math.round(seconds / 15)),
+          caller_available: previewCaller.checked, seed: 'editor-preview'});
+        preview.textContent = (got.protocol ? `${got.protocol} runs its existing internal protocol nodes below.` : '')
+          + (got.protocol ? '\n' : `Planned ${got.estimated_seconds || 0}s inside ${got.budget_seconds || seconds}s.\n`)
+          + (got.turns || []).map((t, i) => `${i + 1}. ${t.name || t.speaker} / ${t.node}: ${t.work || ''}`).join('\n')
+          + '\n\n' + (got.rolls || []).map(r => `${r.node} ${r.kind}: d${r.dice || '?'} → ${r.selected}`).join('\n');
+        preview.hidden = false; } catch (e) { report(e); } })));
+    const props = el('aside', 's3-graph-properties');
+    const field = (label, control) => props.append(el('label', null, label, control));
+    if (selected) {
+      props.append(el('h3', {text: selected.label || selected.id}));
+      field('Type', el('select', {onchange: e => { selected.type = e.target.value; refresh(); }},
+        ...(selected.type === 'protocol' ? ['protocol'] : ['initiator', 'reply', 'rebuttal', 'decision', 'topic_change', 'call', 'end'])
+          .map(type => el('option', {value: type, text: type.replace('_', ' '), selected: selected.type === type}))));
+      for (const [label, key, lines] of [['Label', 'label', 0], ['Speaker / seat (blank: cast raffle)', 'speaker', selected.type === 'protocol' ? -1 : 0],
+        ['Reply as the speaker from node ID', 'respond_to', selected.type === 'reply' ? 0 : -1],
+        ['Specific topic', 'topic', selected.type === 'protocol' ? -1 : 2],
+        ['Writer direction', 'prompt', selected.type === 'protocol' ? -1 : 3],
+        ['Protocol road', 'protocol_road', selected.type === 'protocol' ? 0 : -1]]) {
+        if (lines === -1) continue;
+        const control = lines ? el('textarea', {rows: lines, value: selected[key] || '', onchange: e => { selected[key] = e.target.value; }})
+          : el('input', {value: selected[key] || '', onchange: e => { selected[key] = e.target.value; refresh(); }});
+        field(label, control);
+      }
+      if (selected.type === 'protocol') props.append(para('This node runs the existing road protocol. Its individual turns and table rolls are edited in the leg list below.', 's3-muted'));
+      else {
+      for (const [label, key, min, max, step] of [['Chance to speak', 'chance', 0, 1, .01],
+        ['Estimated seconds', 'seconds', 0, 300, 1], ['X position', 'x', -2000, 2000, 10], ['Y position', 'y', -2000, 2000, 10]])
+        field(label, el('input', {type: 'number', min, max, step, value: selected[key] == null ? 0 : selected[key],
+          onchange: e => { selected[key] = Number(e.target.value); refresh(); }}));
+      if (selected.type === 'rebuttal' || (selected.type === 'reply' && selected.respond_to)) {
+        for (const [label, key] of [['How this argument lands (one option per line)', 'moods'],
+          ['Intonation (one option per line)', 'intonations']])
+          field(label, el('textarea', {rows: 3, value: (selected[key] || []).join('\n'),
+            placeholder: 'Blank uses the System 3 defaults', onchange: e => {
+              selected[key] = e.target.value.split('\n').map(s => s.trim()).filter(Boolean); }}));
+      }
+      props.append(el('h4', {text: 'System 3 table rolls'}));
+      for (const family of ['CTS', 'ES', 'RS', 'IRS', 'FL']) {
+        const draw = (selected.draws || []).find(d => d.family === family);
+        props.append(el('label', 's3-row', el('input', {type: 'checkbox', checked: !!draw,
+          onchange: e => { selected.draws = (selected.draws || []).filter(d => d.family !== family);
+            if (e.target.checked) selected.draws.push({family}); refresh(); }}), family));
+        if (draw) props.append(el('select', {'aria-label': family + ' table',
+          onchange: e => { draw.tables = e.target.value ? [e.target.value] : []; }},
+          el('option', {value: '', text: 'all ' + family + ' tables'}),
+          ...(config.config.tables || []).filter(t => t.family === family)
+            .map(t => el('option', {value: t.id, text: t.label || t.id, selected: (draw.tables || []).includes(t.id)}))));
+      }
+      }
+      props.append(btn('Remove node', () => { graph.nodes = nodes.filter(n => n.id !== selected.id);
+        graph.edges = edges.filter(e => e.from !== selected.id && e.to !== selected.id);
+        if (graph.start === selected.id) graph.start = (graph.nodes[0] || {}).id || '';
+        segGraphSel = (graph.nodes[0] || {}).id || ''; refresh(); }));
+    } else props.append(para('Select a node to edit its rolls, purpose and path.', 's3-muted'));
+    const list = el('div', 's3-graph-list', ...nodes.map(n => btn(n.label || n.id,
+      () => { segGraphSel = n.id; refresh(); }, {'aria-pressed': String(n.id === segGraphSel)})));
+    box.append(el('div', 's3-graph-layout', el('div', 's3-graph-visual', canvas, list), props));
+    const flows = el('div', 's3-graph-flows', el('h3', {text: 'Flow lines · weights are the branch dice'}));
+    edges.forEach((edge, i) => flows.append(el('div', 's3-graph-edge',
+      el('span', {text: edge.from + ' → ' + edge.to + ' (' + Math.round(100 * (Number(edge.weight) || 0)
+        / Math.max(.001, edges.filter(e => e.from === edge.from).reduce((sum, e) => sum + (Number(e.weight) || 0), 0))) + '%)'}),
+      el('input', {type: 'number', min: 0, max: 100, step: .01, value: edge.weight == null ? 1 : edge.weight,
+        'aria-label': 'Flow weight', onchange: e => { edge.weight = Number(e.target.value); refresh(); }}),
+      btn('×', () => { edges.splice(i, 1); refresh(); }, {'aria-label': 'Remove flow line'}))));
+    const from = el('select', {'aria-label': 'Flow from'}, ...nodes.map(n => el('option', {value: n.id, text: n.label || n.id, selected: n.id === segGraphSel})));
+    const to = el('select', {'aria-label': 'Flow to'}, ...nodes.map(n => el('option', {value: n.id, text: n.label || n.id})));
+    flows.append(el('div', 's3-row', from, to, btn('Connect', () => { if (from.value && to.value) {
+      edges.push({from: from.value, to: to.value, weight: 1}); refresh(); } })));
+    if (selected && edges.length) {
+      const split = el('select', {'aria-label': 'Flow line to insert into'}, ...edges.map((e, i) =>
+        el('option', {value: String(i), text: e.from + ' → ' + e.to})));
+      flows.append(el('div', 's3-row', split, btn('Insert selected node into flow', () => {
+        const i = Number(split.value), edge = edges[i];
+        if (!edge || edge.from === selected.id || edge.to === selected.id) return;
+        edges.splice(i, 1, {from: edge.from, to: selected.id, weight: edge.weight},
+          {from: selected.id, to: edge.to, weight: 1}); refresh();
+      })));
+    }
+    flows.append(el('label', null, 'Topic change options, one per line', el('textarea', {rows: 2,
+      value: (graph.topic_options || []).join('\n'), onchange: e => {
+        graph.topic_options = e.target.value.split('\n').map(s => s.trim()).filter(Boolean); }})));
+    box.append(flows, preview);
+    if (nodes.length) setTimeout(() => segGraph3D(canvas, graph, segGraphSel, id => { segGraphSel = id; refresh(); })
+      .then(scene => { if (canvas.isConnected) segGraphScene = scene; else if (scene) scene.stop(); })
+      .catch(e => { canvas.replaceWith(para('3D view unavailable: ' + e.message, 's3-muted')); }), 0);
+    return box;
+  }
+
+  function segGraph3D(canvas, graph, active, choose) {
+    return threeLoad().then(THREE => {
+      if (!canvas.isConnected) return null;
+      const renderer = new THREE.WebGLRenderer({canvas, antialias: true, alpha: true});
+      renderer.setPixelRatio(Math.min(2, window.devicePixelRatio || 1));
+      const w = Math.max(320, canvas.clientWidth), h = Math.max(320, canvas.clientHeight);
+      renderer.setSize(w, h, false);
+      const scene = new THREE.Scene(), camera = new THREE.OrthographicCamera(-6, 6, 6 * h / w, -6 * h / w, .1, 100);
+      camera.position.z = 30; scene.add(new THREE.AmbientLight(0xffffff, 1));
+      const nodes = graph.nodes || [], xs = nodes.map(n => Number(n.x) || 0), ys = nodes.map(n => Number(n.y) || 0);
+      const minX = Math.min(0, ...xs), maxX = Math.max(1, ...xs), minY = Math.min(0, ...ys), maxY = Math.max(1, ...ys);
+      const scale = Math.min(10 / Math.max(1, maxX - minX), 10 * h / w / Math.max(1, maxY - minY));
+      const point = n => new THREE.Vector3(((Number(n.x) || 0) - (minX + maxX) / 2) * scale,
+        ((minY + maxY) / 2 - (Number(n.y) || 0)) * scale, 0);
+      const positions = new Map(), meshes = [];
+      const colors = {initiator: 0x65c7da, reply: 0x8ccf9d, rebuttal: 0xe9af70,
+        topic_change: 0xb49ced, call: 0xe68db4, decision: 0xf0d274, end: 0xffffff, protocol: 0x95a8ed};
+      const labelSprite = (caption, size = 22) => { const c = document.createElement('canvas'); c.width = 320; c.height = 56;
+        const cx = c.getContext('2d'); cx.fillStyle = '#e6eff0'; cx.font = `600 ${size}px sans-serif`;
+        cx.textAlign = 'center'; cx.fillText(caption, 160, 34);
+        return new THREE.Sprite(new THREE.SpriteMaterial({map: new THREE.CanvasTexture(c), transparent: true})); };
+      nodes.forEach(n => { const p = point(n); positions.set(n.id, p);
+        const geo = n.type === 'decision' ? new THREE.OctahedronGeometry(.25) : new THREE.BoxGeometry(.52, .34, .16);
+        const mesh = new THREE.Mesh(geo, new THREE.MeshLambertMaterial({color: colors[n.type] || 0x88aabb}));
+        if (n.id === active) mesh.scale.setScalar(1.4);
+        mesh.position.copy(p); mesh.userData.id = n.id; scene.add(mesh); meshes.push(mesh);
+        const chance = Number(n.chance);
+        const caption = String(n.label || n.id).slice(0, 22) + (chance >= 0 && chance < 1 ? ` ${Math.round(chance * 100)}%` : '');
+        const sprite = labelSprite(caption);
+        sprite.scale.set(2.2, .38, 1); sprite.position.copy(p).add(new THREE.Vector3(0, -.48, 0)); scene.add(sprite); });
+      (graph.edges || []).forEach(edge => { const a = positions.get(edge.from), b = positions.get(edge.to); if (!a || !b) return;
+        scene.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints([a, b]),
+          new THREE.LineBasicMaterial({color: 0x9bb5bd, transparent: true, opacity: .8})));
+        const d = b.clone().sub(a).normalize(); const arrow = new THREE.Mesh(new THREE.ConeGeometry(.08, .18, 6),
+          new THREE.MeshBasicMaterial({color: 0xe6eff0})); arrow.position.copy(b).addScaledVector(d, -.4);
+        arrow.rotation.z = Math.atan2(d.y, d.x) - Math.PI / 2; scene.add(arrow);
+        const total = (graph.edges || []).filter(other => other.from === edge.from)
+          .reduce((sum, other) => sum + Math.max(0, Number(other.weight) || 0), 0);
+        if (total > 0) { const percent = Math.round(100 * (Number(edge.weight) || 0) / total);
+          const badge = labelSprite(`${percent}%`, 18); badge.scale.set(.7, .22, 1);
+          badge.position.copy(a).lerp(b, .5).add(new THREE.Vector3(.18, .2, .04)); scene.add(badge); }
+      });
+      const ray = new THREE.Raycaster(), mouse = new THREE.Vector2();
+      const click = e => { const r = canvas.getBoundingClientRect(); mouse.set((e.clientX - r.left) / r.width * 2 - 1,
+        -(e.clientY - r.top) / r.height * 2 + 1); ray.setFromCamera(mouse, camera);
+        const hit = ray.intersectObjects(meshes)[0]; if (hit) choose(hit.object.userData.id); };
+      canvas.addEventListener('click', click); renderer.render(scene, camera);
+      return {stop() { canvas.removeEventListener('click', click); scene.traverse(obj => {
+        if (obj.geometry) obj.geometry.dispose(); if (obj.material) {
+          if (obj.material.map) obj.material.map.dispose(); obj.material.dispose(); } }); renderer.dispose(); }};
+    });
+  }
+
   function paintSegments() {
     const roads = ['banter', ...Object.keys(segStructures())];
     if (!segRoad || !roads.includes(segRoad)) segRoad = roads[1] || 'banter';
@@ -6844,15 +7043,15 @@ export async function mount(root, {request, onClose, tab: startTab = '', table: 
         const name = prompt('Name for the variant of ' + base + ':', (st.label || base) + ' B'); if (!name) return;
         const n = Object.keys(segStructures()).filter(k => k.startsWith(base + '~v')).length + 1;
         const key = base + '~v' + n;
-        try { const res = await send('/api/system3/structures/' + encodeURIComponent(key), 'PUT', {...st, legs: nodes, label: name, weight: 1, enabled: true, variant_of: base});
+        try { const res = await send('/api/system3/structures/' + encodeURIComponent(key), 'PUT', {...st, legs: nodes, graph: segGraph, label: name, weight: 1, enabled: true, variant_of: base});
           await loadConfig(); segRoad = key; segNodes = null; repaint(); saved('variant ' + key, res); } catch (e) { report(e); }
       }),
       isVariant ? el('label', 's3-row', 'weight', el('input', {type: 'number', min: 0, max: 50, step: 0.1, value: st.weight == null ? 1 : st.weight, style: 'width:72px', onchange: e => { st.weight = +e.target.value; }})) : null,
       isVariant ? el('label', 's3-row', el('input', {type: 'checkbox', checked: st.enabled !== false, onchange: e => { st.enabled = e.target.checked; }}), 'runs on the station') : null,
       btn('Save segment', async () => { try {
           let res;
-          if (cycle) { nodes.forEach((x, i) => { x.id = x.id || 'step' + i; }); res = await send('/api/system3/structure', 'PUT', {steps: nodes, initiator: segInitiator ?? (st.initiator || '')}); }   /* [s3-flow] */
-          else { nodes.forEach((lg, i) => { lg.id = lg.id || 'leg' + i; }); res = await send('/api/system3/structures/' + encodeURIComponent(segRoad), 'PUT', {...st, legs: nodes}); }
+          if (cycle) { nodes.forEach((x, i) => { x.id = x.id || 'step' + i; }); res = await send('/api/system3/structure', 'PUT', {steps: nodes, initiator: segInitiator ?? (st.initiator || ''), graph: segGraph}); }   /* [s3-flow] */
+          else { nodes.forEach((lg, i) => { lg.id = lg.id || 'leg' + i; }); res = await send('/api/system3/structures/' + encodeURIComponent(segRoad), 'PUT', {...st, legs: nodes, graph: segGraph}); }
           await loadConfig(); segNodes = null; repaint(); saved(cycle ? 'the banter cycle' : 'the ' + segRoad + ' segment', res); } catch (e) { report(e); } }),
       btn('Discard', () => { segNodes = null; repaint(); }),
       isVariant ? btn('Delete variant', async () => { if (!confirm('Delete ' + segRoad + '?')) return;
@@ -6860,7 +7059,8 @@ export async function mount(root, {request, onClose, tab: startTab = '', table: 
       el('span', {class: 's3-muted', text: cycle ? 'The banter cycle loops for the segment; each step is a node with its own draws.'
         : `Turn budget ${st.min_turns || '?'}-${st.max_turns || '?'}. ${isVariant ? 'This variant' : 'Every variant'} rolls against the base by weight (VARIANT) each time the road runs.`}));
     fill(body, el('div', 's3-seg', el('div', 's3-seg-side', el('div', 's3-card', palette), el('div', 's3-card', el('h2', {text: 'Properties'}), props)),
-      el('div', 's3-seg-main', el('div', 's3-card', el('h2', {text: (st.label || segRoad) + ' - segment'}), bar), list)));
+      el('div', 's3-seg-main', el('div', 's3-card', el('h2', {text: (st.label || segRoad) + ' - segment'}), bar),
+        segGraphView(repaint), list)));
   }
 
   /* ---------------- prompts: every model call, as tiles --------------------- */
