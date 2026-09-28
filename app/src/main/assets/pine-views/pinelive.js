@@ -528,7 +528,7 @@
   function nextDelay() {
     if (model.failure && model.failure.absent) return POLL_ABSENT_MS;
     if (model.failure) return ui.visible ? 4000 : POLL_ERROR_MS;
-    return ui.visible ? POLL_OPEN_MS : POLL_CLOSED_MS;
+    return (ui.visible || (model.state && model.state.armed)) ? POLL_OPEN_MS : POLL_CLOSED_MS;   /* [plcount] */
   }
 
   function pollState() {
@@ -545,6 +545,7 @@
       model.stateAt = Date.now();
       paint();
       syncLevels();
+      try { paintCountdown(); } catch (err) { /* [plcount] never breaks the poll */ }
       schedulePoll(nextDelay());
     }, function (err) {
       ui.polling = false;
@@ -1256,6 +1257,46 @@
   /* One EventSource while the audiograph is on screen; none otherwise. It
    * holds one of the page's sockets, which on the tablet is one of six
    * (#1324) - so it is closed the moment nobody can see it. */
+  /* [plcount] "a loading bar representing the fail over countdown ... for
+   * when live is enabled": over the Script view's player, full while the
+   * interface sounds, draining as it stays quiet; empty = the records take
+   * the air back. Gone when no set is armed. */
+  function paintCountdown() {
+    var st = model.state || {};
+    var host = document.querySelector('.sp-player');
+    var bar = document.getElementById('plCountdown');
+    if (!st.armed || !host || !host.parentNode) {
+      if (bar && bar.parentNode) bar.parentNode.removeChild(bar);
+      return;
+    }
+    if (!bar || bar.nextSibling !== host) {
+      if (bar && bar.parentNode) bar.parentNode.removeChild(bar);
+      bar = make('div', 'pl-countdown');
+      bar.id = 'plCountdown';
+      bar.appendChild(make('div', 'pl-countdown-fill'));
+      bar.appendChild(make('span', 'pl-countdown-words', ''));
+      host.parentNode.insertBefore(bar, host);
+    }
+    var f = st.failover, frac = 1, text = '';
+    var test = st.event && st.event.rehearse ? 'On-air test' : 'Live';
+    if (st.phase === 'live' && f && f.after_s) {
+      var quiet = Math.max(0, Number(f.quiet_s) || 0);
+      frac = Math.max(0, 1 - quiet / f.after_s);
+      text = quiet < 1 ? test + ' - the interface has the air'
+        : test + ' - quiet ' + Math.round(quiet) + ' s: the records take the air back in '
+          + Math.max(0, Math.ceil(f.after_s - quiet)) + ' s';
+    } else if (st.phase === 'fallback') {
+      frac = 0;
+      text = test + ' - the records have the air; the set takes it back the moment the interface sounds';
+    } else {
+      text = test + ' - armed, waiting for the first sound';
+    }
+    bar.firstChild.style.width = (frac * 100).toFixed(1) + '%';
+    setClass(bar, 'warn', frac > 0 && frac < 0.67);
+    setClass(bar, 'down', frac <= 0);
+    setText(bar.lastChild, text);
+  }
+
   function syncLevels() {
     var want = wantLevels();
     if (ui.scope) { if (ui.visible && ui.open.scope && ui.scopeSeen) ui.scope.resume(); else ui.scope.pause(); }
