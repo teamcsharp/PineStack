@@ -43,6 +43,22 @@
   var FEED_MAX = 120;
   var FEED_EVENT_MAX = 48;
 
+  /* [cast-names] A character's name as the station answers it (dj_names on
+     /api/dj, through the one shared poll in sampler-feed.js - or, injected
+     into the station's own page on the tablet, the panel's castName off its
+     own poll): Dill, Skip and Sam unless the DJ options say otherwise.
+     Never "Host" or "The SFX Guy". */
+  var CAST_FALLBACK = {host: 'Dill', dj: 'Dill', cohost: 'Skip', sfx: 'Sam',
+    sfxguy: 'Sam', drop: 'Sam'};
+  function castName(role, fallback) {
+    var ask = typeof root.pineCastName === 'function' ? root.pineCastName : root.castName;
+    if (typeof ask === 'function') {
+      try { return ask(role, fallback); } catch (err) { /* the station's own, below */ }
+    }
+    if (fallback !== undefined) return fallback;
+    return CAST_FALLBACK[String(role || '').toLowerCase()] || '';
+  }
+
   var mounted = false;
   var host = null;
   var stop = null;
@@ -512,7 +528,7 @@
       style.href = techUrl('/system3/system3.css?v=7');
       document.head.appendChild(style);
     }
-    import(techUrl('/system3/system3.js?v=7')).then(function (mod) {
+    import(techUrl('/system3/system3.js?v=8')).then(function (mod) {
       return mod.openSystem3({request: s3Request, tab: tab || 'tables',
         onClose: function () { s3WindowOpen = null; }});
     }).then(function (view) { s3WindowOpen = view; }).catch(function (err) {
@@ -1139,7 +1155,7 @@
      * and reports what the air actually did with it: a button that
      * cues the broadcast must not be silent about whether it took. */
     var reel = make('button', 'sp-btn sp-reel', '');
-    reel.title = 'Cue the SFX guy to play a random video on the broadcast';
+    reel.title = 'Cue ' + castName('sfx') + ' (the SFX guy) to play a random video on the broadcast';   /* [cast-names] */
     reel.setAttribute('aria-label', 'Play a random video clip');
     try {
       if (typeof root.pineIcon === 'function') {
@@ -1176,7 +1192,7 @@
      * a held setting, so this button only reports and flips it; the set
      * keeps running through a restart and this view coming and going. */
     var loop = make('button', 'sp-btn sp-loop', '');
-    loop.title = 'Endless video: the SFX guy plays clips one after another, at random';
+    loop.title = 'Endless video: ' + castName('sfx') + ' plays clips one after another, at random';   /* [cast-names] */
     loop.setAttribute('aria-label', 'Endless video on or off');
     try {
       if (typeof root.pineIcon === 'function') {
@@ -1882,7 +1898,7 @@
     btn.classList.toggle('on', !!loopOn);
     btn.title = loopOn
       ? 'Endless video is ON - tap to stop after the clip on the tube'
-      : 'Endless video: the SFX guy plays clips one after another, at random';
+      : 'Endless video: ' + castName('sfx') + ' plays clips one after another, at random';   /* [cast-names] */
   }
 
   function loopRead(btn) {
@@ -2273,9 +2289,10 @@
   function sfxRepairButton() {
     var button = make('button', 'sp-btn sp-sfx-repair', '');
     button.type = 'button';
-    button.title = 'Repair SFX Guy';
-    button.setAttribute('aria-label', 'Repair SFX Guy');
-    button.innerHTML = typeof root.pineIcon === 'function' ? root.pineIcon('c:tools', 'Repair SFX Guy') : '';
+    var repairWords = 'Repair ' + castName('sfx') + "'s player (the SFX guy)";   /* [cast-names] */
+    button.title = repairWords;
+    button.setAttribute('aria-label', repairWords);
+    button.innerHTML = typeof root.pineIcon === 'function' ? root.pineIcon('c:tools', repairWords) : '';
     if (!button.innerHTML) button.textContent = 'Repair SFX';
     button.addEventListener('click', function () { repairSfx(button); });
     return button;
@@ -3696,15 +3713,20 @@
      so `host` is a real ninth seat and belongs in the table rather than
      falling through to "someone else", and `manager` is here waiting
      for its road to be switched on. */
+  /* [cast-names] A seat that is a character carries `cast`: its label is
+     that character's name as the station answers it now (Dill, Skip, Sam
+     or the operator's), read each time rather than frozen here. `host` is
+     the operator's desk (requests, calls landing, news breaks), not the
+     host in the booth. */
   var SEG_SEATS = [
-    {seat: 'dj', label: 'DJ', colour: '#65c7da'},
-    {seat: 'cohost', label: 'Co-host', colour: '#54d18b'},
-    {seat: 'host', label: 'Host', colour: '#4fb0a6'},
-    {seat: 'third', label: 'Third seat', colour: '#b98cf0'},
+    {seat: 'dj', label: 'DJ', cast: 'host', colour: '#65c7da'},
+    {seat: 'cohost', label: 'Co-host', cast: 'cohost', colour: '#54d18b'},
+    {seat: 'host', label: 'The desk', colour: '#4fb0a6'},
+    {seat: 'third', label: 'Third seat', cast: 'third', colour: '#b98cf0'},
     {seat: 'caller', label: 'Caller', colour: '#e3be63'},
     {seat: 'caller2', label: 'Second caller', colour: '#ef8f5e'},
     {seat: 'board', label: 'The board', colour: '#8fa0ad'},
-    {seat: 'drop', label: 'Drop', colour: '#e06c9f'},
+    {seat: 'drop', label: 'Drop', cast: 'sfx', colour: '#e06c9f'},
     {seat: 'manager', label: 'The manager', colour: '#e05c5c'}
   ];
   var SEG_SEAT_ELSE = {seat: '', label: 'someone else', colour: '#6f8291'};
@@ -3716,7 +3738,11 @@
   function segSeatLook(seat) {
     var want = String(seat || '').toLowerCase();
     for (var i = 0; i < SEG_SEATS.length; i += 1) {
-      if (SEG_SEATS[i].seat === want) return SEG_SEATS[i];
+      var s = SEG_SEATS[i];
+      if (s.seat !== want) continue;
+      if (!s.cast) return s;
+      return {seat: s.seat, label: castName(s.cast) || s.label,   /* [cast-names] */
+        colour: s.colour};
     }
     return {seat: want, label: want || SEG_SEAT_ELSE.label,
       colour: SEG_SEAT_ELSE.colour};
@@ -4182,7 +4208,7 @@
           style.href = techUrl('/system3/system3.css?v=7');
           document.head.appendChild(style);
         }
-        var mod = await import(techUrl('/system3/system3.js?v=7'));
+        var mod = await import(techUrl('/system3/system3.js?v=8'));
         pane.textContent = '';
         var box = make('div', 'sp-s3-host');
         pane.appendChild(box);
@@ -5554,8 +5580,8 @@
       var kind = String(row.kind || '').toLowerCase();
       var seat = String(row.who || '');
       var who = String(row.name || seat || 'speaker');
-      if (kind === 'sfx') who = 'The SFX Guy - stinger';
-      else if (kind === 'sfxguy' || seat === 'drop') who = 'The SFX Guy';
+      if (kind === 'sfx') who = castName('sfx') + ' - stinger';      /* [cast-names] */
+      else if (kind === 'sfxguy' || seat === 'drop') who = castName('sfx');
       turns.push({seat: seat, who: who, text: text, kind: kind,
         line: String(row.line || ''), at: row.at, aired: true});
       heard.push({row: row, text: words(text), used: false});
@@ -6350,7 +6376,8 @@
     function orchestratorStoryline() {
       return itinConversationTurns(entry).map(function (turn, index) {
         var sfx = !!turn.planned_sfx || String(turn.kind || '').toLowerCase() === 'sfx';
-        var who = String(turn.who || turn.name || turn.seat || (sfx ? 'The SFX Guy' : 'Host'));
+        var who = String(turn.who || turn.name || turn.seat
+          || (sfx ? castName('sfx') : castName('host')));      /* [cast-names] */
         return {
           id: storyId(turn, index), type: sfx ? 'sfx' : 'scripted_line',
           seconds: storySeconds(turn), detail: String(turn.text || '').slice(0, 400),
@@ -6533,7 +6560,7 @@
         generated.appendChild(make('b', '', node.type === 'sfx'
           ? 'Scheduled SFX event' : String((node.line || {}).speaker || 'Host')));
         generated.appendChild(make('span', '', node.type === 'sfx'
-          ? (sfxClipWords(node.clip) || 'The SFX Guy has this event scheduled in the broadcast.')
+          ? (sfxClipWords(node.clip) || castName('sfx') + ' has this event scheduled in the broadcast.')   /* [cast-names] */
           : String((node.line || {}).text || 'No text is banked for this event.')));
         generated.appendChild(make('i', '', node.type === 'sfx'
           ? 'This SFX event is placed by the orchestrator.'
@@ -10934,7 +10961,7 @@
       style.href = techUrl('/system3/system3.css?v=7');
       document.head.appendChild(style);
     }
-    import(techUrl('/system3/system3.js?v=7')).then(function (mod) {
+    import(techUrl('/system3/system3.js?v=8')).then(function (mod) {
       return mod.openRoll({request: s3Request, conversationId: info.conversation_id,
         eventId: roll ? String(roll.event_id || '') : '', turnId: info.turn_id, lineId: id});
     }).catch(function (err) {
@@ -10982,8 +11009,8 @@
       var speaker = feedSpeaker(row);
       return speaker ? speaker + ' rendering' : 'Voice rendering';
     }
-    if (stage === 'sfx') return 'The SFX Guy played a clip';
-    if (stage === 'sfxguy') return 'The SFX Guy';
+    if (stage === 'sfx') return castName('sfx') + ' played a clip';   /* [cast-names] */
+    if (stage === 'sfxguy') return castName('sfx');
     if (stage === 'sfxreaction') {
       return (feedSpeaker(row) || 'A host') + ' reacts to SFX';
     }
@@ -16289,7 +16316,7 @@
         style.href = techUrl('/system3/system3.css?v=7');
         document.head.appendChild(style);
       }
-      import(techUrl('/system3/system3.js?v=7')).then(function (mod) {
+      import(techUrl('/system3/system3.js?v=8')).then(function (mod) {
         if (lineTabsPane !== pane) return null;
         return mod.mountLineTabs(pane, {request: s3Request, lineId: id, tab: lineTab});
       }).then(function (view) {

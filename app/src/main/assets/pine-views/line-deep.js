@@ -951,7 +951,7 @@
     }
     var prov = (all && all.prov) || {};
     var prompt = String(((prov.written || {}).prompt) || prov.prompt || '');
-    (s3Load = s3Load || import(s3Url('/system3/system3.js?v=3'))).then(function (mod) {
+    (s3Load = s3Load || import(s3Url('/system3/system3.js?v=4'))).then(function (mod) {
       if (!node.isConnected) return null;
       return mod.mountLineStory(node, {request: function (path) { return api().get(path); },
         lineId: String((line && line.id) || ''), prompt: prompt});
@@ -1652,7 +1652,9 @@
         + (s3turn.step_label ? ' - ' + String(s3turn.step_label) : '')
         + (s3turn.phase ? ' - ' + String(s3turn.phase) : ''));
       if (s3sg) {
-        put(f, 'the SFX Guy', 'his node on this turn'
+        put(f, (typeof root.pineCastName === 'function'                   /* [cast-names] */
+          ? root.pineCastName('sfx') : typeof root.castName === 'function'
+            ? root.castName('sfx') : 'Sam') + ' (the SFX guy)', 'his node on this turn'
           + (s3sg.node && s3sg.node.selected ? ': ' + String(s3sg.node.selected.label || s3sg.node.selected.id || '') : '')
           + ((s3sg.line || {}).kind ? ' - ' + String(s3sg.line.kind) : ''));
         ((s3sg.line || {}).draws || []).forEach(function (dr) {
