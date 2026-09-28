@@ -43,6 +43,18 @@
   var CLIP_HOLD_MS = 2500;
   var READOUT_MS = 250;
   var STALE_MS = 1200;
+  /* [plviz] the visualizer's styles, cycled by a tap (PLVIZ_QUEUE.md holds
+   * the rest of the operator's sheet) */
+  var VIZ_STYLES = [
+    {name: 'Bars', kind: 'bars', color: '#ff9a1f'},
+    {name: 'Neon mirror', kind: 'mirror', color: '#29b6ff'},
+    {name: 'LED', kind: 'led', color: '#39e36b'},
+    {name: 'LED mirror', kind: 'ledmirror', color: '#ff2e7a'},
+    {name: 'Glow wave', kind: 'wave', color: '#2ee6e6'}
+  ];
+  var VIZ_HOLD_MS = 700;           /* a peak cap holds this long ... */
+  var VIZ_FALL_PER_S = 0.55;       /* ... then falls this much of the height a second */
+  var VIZ_BAR_FALL_PER_S = 2.2;    /* the bars themselves ease down */
 
   /* ------------------------------------------------------------ pure parts */
 
@@ -209,6 +221,26 @@
     });
     meterBox.appendChild(scale);
 
+    /* [plviz] the visualizer takes the big area; the waterfall steps into the
+     * narrow box beside the meter. A tap cycles the style (kept per screen). */
+    var vizBox = make('div', 'pl-viz');
+    var viz = make('canvas', 'pl-viz-canvas');
+    viz.setAttribute('role', 'img');
+    viz.setAttribute('aria-label', 'Spectrum of the live input - tap to change the style');
+    vizBox.appendChild(viz);
+    var vizName = make('span', 'pl-viz-name', '');
+    vizBox.appendChild(vizName);
+    var vctx = viz.getContext('2d');
+    var vz = {style: 0, level: [], hold: [], holdAt: [], at: 0, named: 0};
+    try { vz.style = (parseInt(root.localStorage.getItem('pineLive.viz') || '0', 10) || 0) % VIZ_STYLES.length; } catch (err) { vz.style = 0; }
+    vizBox.addEventListener('click', function (e) {
+      e.stopPropagation();
+      vz.style = (vz.style + 1) % VIZ_STYLES.length;
+      vz.named = Date.now();
+      try { root.localStorage.setItem('pineLive.viz', String(vz.style)); } catch (err) { /* per screen only */ }
+      if (state.lastFrame) drawViz(state.lastFrame.__bands, Date.now());
+    });
+    wrap.appendChild(vizBox);
     wrap.appendChild(fall);
     wrap.appendChild(meterBox);
     host.appendChild(wrap);
@@ -254,11 +286,93 @@
       ro.observe(meterBox);
     }
 
+    /* [plviz] one frame of the visualizer: bars ease down, each band's peak
+     * cap holds VIZ_HOLD_MS then falls at VIZ_FALL_PER_S. */
+    function drawViz(bands, now) {
+      if (!vctx || !bands || !bands.length) return;
+      var cw = Math.max(1, Math.round(vizBox.clientWidth * dpr));
+      var ch = Math.max(1, Math.round(vizBox.clientHeight * dpr));
+      if (viz.width !== cw || viz.height !== ch) { viz.width = cw; viz.height = ch; }
+      var st = VIZ_STYLES[vz.style] || VIZ_STYLES[0];
+      var n = bands.length, i, c, v, h, x;
+      var dt = vz.at ? Math.min(0.25, (now - vz.at) / 1000) : 0;
+      vz.at = now;
+      for (i = 0; i < n; i += 1) {
+        v = clamp((bands[i] - FLOOR) / (CEIL - FLOOR), 0, 1);
+        vz.level[i] = Math.max(v, (vz.level[i] || 0) - dt * VIZ_BAR_FALL_PER_S);
+        if (v >= (vz.hold[i] || 0)) { vz.hold[i] = v; vz.holdAt[i] = now; }
+        else if (now - (vz.holdAt[i] || 0) > VIZ_HOLD_MS) vz.hold[i] = Math.max(v, vz.hold[i] - dt * VIZ_FALL_PER_S);
+      }
+      vctx.globalAlpha = 1;
+      vctx.fillStyle = '#05080b';
+      vctx.fillRect(0, 0, cw, ch);
+      var slot = cw / n, bw = Math.max(1, slot * 0.62), mid = ch / 2, cap = Math.max(2, Math.round(2 * dpr));
+      vctx.fillStyle = st.color;
+      vctx.strokeStyle = st.color;
+      if (st.kind === 'wave') {
+        for (var pass = 0; pass < 2; pass += 1) {
+          vctx.globalAlpha = pass ? 0.9 : 0.28;
+          vctx.beginPath();
+          vctx.moveTo(0, mid);
+          for (i = 0; i < n; i += 1) vctx.lineTo((i + 0.5) * slot, mid - vz.level[i] * (mid - 2));
+          vctx.lineTo(cw, mid);
+          for (i = n - 1; i >= 0; i -= 1) vctx.lineTo((i + 0.5) * slot, mid + vz.level[i] * (mid - 2));
+          vctx.closePath();
+          if (pass) { vctx.lineWidth = Math.max(1, dpr * 1.5); vctx.stroke(); } else vctx.fill();
+        }
+        vctx.globalAlpha = 1;
+        for (i = 0; i < n; i += 1) {
+          vctx.fillRect((i + 0.5) * slot - cap / 2, mid - vz.hold[i] * (mid - 2) - cap, cap, cap);
+          vctx.fillRect((i + 0.5) * slot - cap / 2, mid + vz.hold[i] * (mid - 2), cap, cap);
+        }
+      } else {
+        var cells = st.kind === 'led' ? 18 : 9;
+        for (var glow = 0; glow < 2; glow += 1) {
+          vctx.globalAlpha = glow ? 1 : 0.22;
+          var gw = glow ? bw : Math.min(slot, bw * 1.7);
+          for (i = 0; i < n; i += 1) {
+            x = i * slot + (slot - gw) / 2;
+            if (st.kind === 'bars') {
+              h = vz.level[i] * (ch - cap - 2);
+              vctx.fillRect(x, ch - h, gw, h);
+            } else if (st.kind === 'mirror') {
+              h = vz.level[i] * (mid - cap - 1);
+              vctx.fillRect(x, mid - h, gw, Math.max(1, 2 * h));
+            } else {
+              var ledH = (st.kind === 'led' ? ch : mid) / cells;
+              var on = Math.round(vz.level[i] * cells);
+              for (c = 0; c < on; c += 1) {
+                if (st.kind === 'led') vctx.fillRect(x, ch - (c + 1) * ledH + 1, gw, ledH - 2);
+                else {
+                  vctx.fillRect(x, mid - (c + 1) * ledH + 1, gw, ledH - 2);
+                  vctx.fillRect(x, mid + c * ledH + 1, gw, ledH - 2);
+                }
+              }
+            }
+          }
+        }
+        vctx.globalAlpha = 1;
+        vctx.fillStyle = '#ffffff';
+        for (i = 0; i < n; i += 1) {
+          x = i * slot + (slot - bw) / 2;
+          if (st.kind === 'bars' || st.kind === 'led') vctx.fillRect(x, ch - vz.hold[i] * (ch - cap - 2) - cap, bw, cap);
+          else {
+            h = vz.hold[i] * (mid - cap - 1);
+            vctx.fillRect(x, mid - h - cap, bw, cap);
+            vctx.fillRect(x, mid + h, bw, cap);
+          }
+        }
+      }
+      if (vizName.textContent !== st.name) vizName.textContent = st.name;
+      vizName.style.opacity = now - vz.named < 1500 ? '1' : '0';
+    }
+
     function drawRows() {
       state.raf = 0;
       if (!state.running || !ctx) { state.pending.length = 0; return; }
       var list = state.pending;
       state.pending = [];
+      if (list.length) drawViz(list[list.length - 1].__bands, Date.now());   /* [plviz] */
       /* A stall (a hidden tab, a busy WebView) can deliver a burst. Draw
        * at most a second's worth; older rows would scroll straight off. */
       if (list.length > 24) { state.dropped += list.length - 24; list = list.slice(-24); }
