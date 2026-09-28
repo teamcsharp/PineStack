@@ -38240,6 +38240,11 @@ def dj_state() -> dict[str, Any]:
         now["url"] = (track["url"] if track.get("tape")
                       else f"/music/{track['id']}?t={media_sign(track['id'])}")
         now["art"] = f"/music/{track['id']}/art?t={media_sign(track['id'])}"
+        if track.get("pinelive"):                                # [pltrack2]
+            try:
+                now["art"] += "&n=%d" % int((pinelive.PL.event or {}).get("track") or 1)
+            except Exception:  # noqa: BLE001
+                pass
     # What the pair are introducing but have not started yet, so the panel can
     # say so instead of leaving the previous track up as though it were on
     # air (#176, #178).
