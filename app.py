@@ -80790,9 +80790,47 @@ def _sfx_video_default_target() -> float:
     return 20.0 * math.log10(SFX_RMS / 32767.0)
 
 
-SFX_VIDEO_MEAN_DB = float(os.getenv("SFX_VIDEO_MEAN_DB",
-                                    "%.2f" % _sfx_video_default_target()))
-SFX_VIDEO_PEAK_DB = float(os.getenv("SFX_VIDEO_PEAK_DB", "-1.0"))
+# [#1477-const] EVENLY LOUD, BY THE EAR'S OWN MEASURE. The target is EBU
+# R128 integrated loudness (LUFS) now, not volumedetect's mean, and the
+# ceiling is a TRUE peak (dBTP), not a sample peak at -1 dBFS - see the
+# #1477 note above _sfx_loud_make. One target for a clip with a picture
+# and for a sting on the voice road alike. SFX_VIDEO_MEAN_DB and
+# SFX_VIDEO_PEAK_DB keep the names #1420 wrote, because the gain rule
+# (sfx_video_gain_db), the say line and /api/sfx/video/mode read them;
+# they simply mean loudness now.
+SFX_TARGET_LUFS = float(os.getenv("SFX_TARGET_LUFS", "-20"))
+SFX_TP_DB = float(os.getenv("SFX_TP_DB", "-6"))
+# The limiter reads SAMPLES and the ceiling is a TRUE peak, and AAC can
+# overshoot a peak it was handed - so the limiter sits this far under the
+# ceiling, and the written file is measured and corrected if it still
+# crosses it.
+SFX_TP_MARGIN_DB = float(os.getenv("SFX_TP_MARGIN_DB", "1.0"))
+# A pass that lands within this of the target is final; one that does not
+# (a limiter caught something and took loudness with it) is corrected, at
+# most SFX_LEVEL_PASSES encodes in all.
+SFX_LU_SLACK = float(os.getenv("SFX_LU_SLACK", "0.5"))
+SFX_LEVEL_PASSES = 3
+# A clip the peak rule still leaves this far under the target after its
+# passes - a bang in a quiet clip, whose own crest no limiter brings inside
+# the ceiling - is offered one pass of loudnorm's dynamic mode, kept only
+# if it lands nearer. 0 turns that off and keeps #1420's peak rule
+# absolute, at the price of those clips arriving quieter than the rest.
+SFX_LEVEL_DYNAMIC = os.getenv("SFX_LEVEL_DYNAMIC", "1").strip() not in ("0", "", "off", "false")
+SFX_LEVEL_DYNAMIC_LU = float(os.getenv("SFX_LEVEL_DYNAMIC_LU", "1.0"))
+# The transient pass (see _sfx_loud_make) counts only when the limiter cost
+# the clip's loudness no more than this - it caught clicks, not the body.
+SFX_LEVEL_TRANSIENT_LU = float(os.getenv("SFX_LEVEL_TRANSIENT_LU", "1.5"))
+# How long anything that is about to put a clip on the air may wait for
+# its levelled copy - the request path, a sting, the set. Clips are
+# seconds long and a remux is well under one; the job goes on after the
+# wait, so the next airing has it either way.
+SFX_LEVEL_WAIT = float(os.getenv("SFX_LEVEL_WAIT", "3.0"))
+SFX_LEVEL_WORKERS = max(1, int(os.getenv("SFX_LEVEL_WORKERS", "2")))
+# A clip that began going out raw finishes raw: the rest of its byte
+# ranges must come from the same file, not a copy made halfway through.
+SFX_RAW_PIN_S = 120.0
+SFX_VIDEO_MEAN_DB = SFX_TARGET_LUFS
+SFX_VIDEO_PEAK_DB = SFX_TP_DB
 # A rail, not the working bound — the peak guard below is what actually
 # decides how far a quiet clip may be lifted. Measured: the clips the
 # operator could not hear sit 30-35 dB under the target, so a bound of 15
@@ -80802,7 +80840,14 @@ SFX_VIDEO_CUT_DB = float(os.getenv("SFX_VIDEO_CUT_DB", "-20.0"))
 # How far a boost may push the PEAK past the ceiling before the limiter
 # stops catching transients and starts flattening the clip. Six decibels
 # of limiting is inaudible on speech; twenty is a different recording.
-SFX_VIDEO_SQUASH_DB = float(os.getenv("SFX_VIDEO_SQUASH_DB", "6.0"))
+#
+# [#1477-squash] 6 -> 10. The ceiling moved from -1 dBFS to -6 dBTP, so a
+# clip with the crest of ordinary speech (true peak 10-18 dB over its
+# loudness, measured on 28 pool clips 2026-09-27) needs up to 4 dB of
+# limiting to sit at -20 LUFS, and one with a slammed door in it more.
+# Past ten, the clip is left quieter rather than flattened - the bound
+# still comes from the PEAK (#1420).
+SFX_VIDEO_SQUASH_DB = float(os.getenv("SFX_VIDEO_SQUASH_DB", "10.0"))
 # Below this the clip is already where we want it and re-encoding it buys
 # a tenth of a decibel nobody can hear, at the price of a second copy of
 # every clip in the library.
@@ -80812,11 +80857,18 @@ SFX_VIDEO_LEVEL_KEEP = int(os.getenv("SFX_VIDEO_LEVEL_KEEP", "400"))
 SFX_VIDEO_LEVEL_MB = float(os.getenv("SFX_VIDEO_LEVEL_MB", "4096"))
 # Bump this to invalidate every levelled copy at once — the same job the
 # "-v2" in the audio cache name does.
-SFX_VIDEO_LEVEL_MARK = "lvl1"
+SFX_VIDEO_LEVEL_MARK = "lu1"    # [#1477-mark] "lvl1" was the #1420 mean
+# Copies made under a mark that is no longer current are never served
+# again; the prune clears them (and their .asis flags) on its next pass.
+SFX_VIDEO_LEVEL_OLD_MARKS = ("lvl1",)
 SFX_VIDEO_ASIS_KEEP = 5000
 
 _SFX_VIDEO_LEVEL: dict[str, Any] = {"made": 0, "as_is": 0, "failed": 0,
-                                    "want": [], "why": ""}
+                                    "want": [], "why": "",
+                                    # [#1477-counters] a clip that went
+                                    # out before its copy could be made
+                                    "raw_served": 0, "limited": 0,
+                                    "dynamic": 0, "stings": 0}
 
 
 def sfx_video_gain_db(mean_db: Any, peak_db: Any = None) -> float:
@@ -80899,8 +80951,19 @@ def _sfx_video_level_prune() -> None:
         made, flags = [], []
         with os.scandir(SFX_LEVELLED) as listing:
             for entry in listing:
+                # [#1477-prune] a copy levelled under an old mark is never
+                # served again - the copy, its flag and its note all go.
+                if any(("-%s-" % _old) in entry.name
+                       for _old in SFX_VIDEO_LEVEL_OLD_MARKS):
+                    try:
+                        os.unlink(entry.path)
+                    except OSError:
+                        pass
+                    continue
                 if ("-%s-" % SFX_VIDEO_LEVEL_MARK) not in entry.name:
                     continue
+                if entry.name.endswith(".lu"):
+                    continue            # a copy's measurement; it goes with it
                 try:
                     stat = entry.stat()
                 except OSError:
@@ -80933,6 +80996,10 @@ def _sfx_video_level_prune() -> None:
             os.unlink(where)
         except OSError:
             kept += 1
+        try:
+            os.unlink(where + ".lu")            # [#1477-prune-lu]
+        except OSError:
+            pass
     for _when, _size, where in flags[SFX_VIDEO_ASIS_KEEP:]:
         try:
             os.unlink(where)
@@ -80950,13 +81017,9 @@ def sfx_video_levelled(path: Path, make: bool = False) -> Path:
     and the keeper, both of which have lead time to spend."""
     if not sfx_is_video(path):
         return path
-    try:
-        stamp = path.stat().st_mtime_ns
-    except OSError:
+    out = sfx_video_levelled_name(path)         # [#1477-name]
+    if out is None:
         return path
-    suffix = path.suffix.lower()
-    out = SFX_LEVELLED / ("%s-%s-%s%s" % (sfx_id(path), SFX_VIDEO_LEVEL_MARK,
-                                          stamp, suffix))
     if out.exists():
         return out
     flat = out.with_name(out.name + ".asis")    # looked at, left alone
@@ -80966,81 +81029,600 @@ def sfx_video_levelled(path: Path, make: bool = False) -> Path:
         _sfx_video_level_want(path)
         return path
 
-    mean = sfx_mean_db(path, measure=True)
-    if mean is None:
-        # No audio track at all, or nothing on this box could measure it.
-        # Either way there is no gain to apply; record that so the next
-        # airing does not pay for the same answer.
-        _sfx_video_level_flag(flat, "no measurable sound in it")
-        _SFX_VIDEO_LEVEL["as_is"] = int(_SFX_VIDEO_LEVEL.get("as_is") or 0) + 1
+    # [#1477-make] LOUDNESS, AND THE WRITTEN FILE MEASURED - see
+    # _sfx_loud_make. What it decided is written down beside the copy that
+    # was not made (.asis), exactly as #1420 did, so the next airing does
+    # not pay for the same answer and a human can read why.
+    made = _sfx_loud_make(path, out, video=True)
+    if made.get("ok"):
+        _SFX_VIDEO_LEVEL["made"] = int(_SFX_VIDEO_LEVEL.get("made") or 0) + 1
+        if made.get("limited"):
+            _SFX_VIDEO_LEVEL["limited"] = int(
+                _SFX_VIDEO_LEVEL.get("limited") or 0) + 1
+        if made.get("how") in ("dynamic", "squeezed", "transient"):
+            _SFX_VIDEO_LEVEL["dynamic"] = int(
+                _SFX_VIDEO_LEVEL.get("dynamic") or 0) + 1
+        _sfx_video_level_prune()
+        return out
+    why = str(made.get("why") or "not levelled")
+    if made.get("retry"):
+        return path                 # no answer this time; nothing written
+    if made.get("failed"):
+        _SFX_VIDEO_LEVEL["failed"] = int(_SFX_VIDEO_LEVEL.get("failed") or 0) + 1
+        _SFX_VIDEO_LEVEL["why"] = "%s — %s" % (path.name, why)
+        # Flagged so one bad container does not spawn an ffmpeg per airing
+        # for the rest of the evening. Delete the .asis file to try again.
+        _sfx_video_level_flag(flat, "could not be levelled — %s" % why)
         return path
-    # The peak is in the cache already — sfx_mean_db has just measured
-    # both of them off the one volumedetect run.
-    peak = sfx_level(path, measure=False)
-    gain = sfx_video_gain_db(mean, peak)
-    if abs(gain) < SFX_VIDEO_DEADBAND_DB:
-        # WHICH rule refused it. Two very different clips arrive here with
-        # a gain of zero — one that is already where we want it, and one
-        # that has nothing in it to lift — and writing the first
-        # sentence for the second case reports the opposite of what
-        # happened to the one clip whose operator most wants to know.
-        if peak is not None and float(peak) <= SFX_SILENT_DB:
-            why = ("nothing in it rises above the station's silence line "
-                   "(#1199): peak %.1f dB, mean %.1f dB" % (peak, mean))
-        else:
-            why = ("already at level: mean %.1f dB, %+.1f dB from target"
-                   % (mean, gain))
-        _sfx_video_level_flag(flat, why)
-        _SFX_VIDEO_LEVEL["as_is"] = int(_SFX_VIDEO_LEVEL.get("as_is") or 0) + 1
-        return path
+    _sfx_video_level_flag(flat, why)
+    _SFX_VIDEO_LEVEL["as_is"] = int(_SFX_VIDEO_LEVEL.get("as_is") or 0) + 1
+    return path
+
+
+# --- #1477: EVENLY LOUD, BY THE EAR'S OWN MEASURE -------------------------
+#
+# "i want videos and sfx volumes normalized so they come out evenly"
+#
+# MEASURED, 2026-09-27, on the last eleven clips /sfx/{key} handed out:
+# integrated loudness from -10.8 to -29.4 LUFS - an 18.6 LU swing from one
+# clip to the next - and true peaks up to -0.4 dBTP. #1420 had levelled
+# them, and three things let that through:
+#
+#   1. THE REQUEST PATH SERVED RAW. /sfx/{key} asked cache-only
+#      (`make=False`), so a clip whose copy was not made yet went out
+#      exactly as shot, and the keeper drained two a round: `made 67,
+#      waiting 54` that evening.
+#   2. THE TARGET WAS A MEAN. volumedetect's mean_volume counts the silent
+#      gaps between the words, so a clip with pauses in it read quiet and
+#      was lifted past the rest. EBU R128 integrated loudness gates the
+#      silence out and weights the spectrum the way an ear does - it is
+#      the number "evenly" means.
+#   3. THE CEILING WAS -1 dBFS, a SAMPLE peak. A lifted clip rode right up
+#      to it, and between the samples it went over.
+#
+# So: measure (ffmpeg's ebur128 - integrated LUFS, true peak, sample
+# peak), apply ONE linear gain to SFX_TARGET_LUFS, and hold the true peak
+# under SFX_TP_DB with a limiter that is only in the chain when the linear
+# gain would have crossed it. Then MEASURE THE FILE WRITTEN - a limiter
+# that caught something took loudness with it, and AAC overshoots - and
+# correct it if it is out by more than SFX_LU_SLACK. #1420's rules stand:
+# the picture is copied, never re-encoded; box_gain() is never baked into
+# a video; the lift is bounded by the PEAK (sfx_video_gain_db, in loudness
+# units now); a clip whose loudest moment is under SFX_SILENT_DB is
+# empty, not quiet.
+#
+# AND NO RAW CLIP ON THE AIR. A clip is levelled at the moment it is
+# PICKED - dj_sting, the endless set, the operator's cue and play buttons
+# - on the leveller's own threads, before the event that tells a surface
+# to play it, bounded by SFX_LEVEL_WAIT. /sfx/{key} does the same for
+# anything that reaches it unlevelled, and only when that runs out does a
+# clip go out as shot, counted as `raw_served`. One job per clip however
+# many roads ask for it, so a set, a page and a tablet fetching the same
+# clip at once make one copy, not three half-written ones.
+_SFX_LU_MEMO: dict[str, Any] = {}
+_SFX_SERVED: collections.deque = collections.deque(maxlen=50)
+_SFX_RAW_PIN: dict[str, float] = {}
+_SFX_LEVEL_POOL: list[Any] = [None]
+_SFX_LEVEL_JOBS: dict[str, Any] = {}
+_SFX_LEVEL_JOBS_LOCK = RLock()
+
+
+def _sfx_ffmpeg() -> str:
+    """The encoder this box has, or "" - never raises."""
     try:
         import imageio_ffmpeg
-        exe = imageio_ffmpeg.get_ffmpeg_exe()
+        return str(imageio_ffmpeg.get_ffmpeg_exe() or "")
     except Exception:  # noqa: BLE001
-        return path                          # no encoder; play it as it is
-    limit = min(1.0, 10.0 ** (SFX_VIDEO_PEAK_DB / 20.0))
-    chain = ("volume=%.2fdB,alimiter=limit=%.4f:attack=5:release=50"
-             ":level=disabled" % (gain, limit))
-    # webm and ogv cannot carry AAC. The second name is a fallback, not a
-    # preference: if this ffmpeg build was compiled without libopus the
-    # encode fails, and a clip served raw is better than a clip refused.
-    codecs = (["libopus", "libvorbis"] if suffix in (".webm", ".ogv")
-              else ["aac"])
-    SFX_LEVELLED.mkdir(parents=True, exist_ok=True)
-    # The half-written file KEEPS THE EXTENSION. ffmpeg picks its muxer
-    # from the output name, so "...-lvl1-123.mp4.part47" is not a
-    # half-written mp4 to it, it is a container it has never heard of,
-    # and every single clip failed to level with the road's tidy "serve
-    # the original and flag it" catching every one. The station would
-    # have gone on sounding exactly as it did.
-    tmp = out.with_name("%s-part%d%s" % (out.stem, os.getpid(), suffix))
+        return ""
+
+
+def sfx_loudness_parse(text: str) -> dict[str, Any] | None:
+    """ebur128's summary -> {"i": LUFS, "tp": dBTP, "peak": dBFS}.
+
+    Read from the LAST "Summary:" in the log, so a line of a clip's own
+    metadata that happens to say "I:" cannot answer for it. -inf (a peak
+    in digital silence) parses as -inf; None = no summary at all."""
+    text = str(text or "")
+    at = text.rfind("Summary:")
+    if at < 0:
+        return None
+    tail = text[at:]
+
+    def grab(pattern: str) -> float | None:
+        got = re.search(pattern, tail)
+        if not got:
+            return None
+        try:
+            return float(got.group(1))
+        except ValueError:
+            return None
+
+    level = grab(r"I:\s*(-?(?:inf|[\d.]+))\s*LUFS")
+    if level is None:
+        return None
+    true_peak = grab(r"True peak:\s*Peak:\s*(-?(?:inf|[\d.]+))")
+    sample_peak = grab(r"Sample peak:\s*Peak:\s*(-?(?:inf|[\d.]+))")
+    if true_peak is None:
+        true_peak = sample_peak
+    if sample_peak is None:
+        sample_peak = true_peak
+    heard: dict[str, Any] = {"i": level, "tp": true_peak, "peak": sample_peak}
+    rate = re.search(r"Audio: [^\n]*?(\d{4,6}) Hz", text)
+    if rate:
+        heard["rate"] = int(rate.group(1))
+    return heard
+
+
+def sfx_loudness(path: Path, timeout: float = 30.0) -> dict[str, Any] | None:
+    """#1477: EBU R128 integrated loudness (LUFS), true peak (dBTP) and
+    sample peak (dBFS) of a file's first sound track.
+
+    None = no answer this time (no ffmpeg; the share did not hand the file
+    over). {"none": True} = the file has no sound track at all. The apad
+    lets a clip shorter than one 400 ms gating block be measured at all
+    rather than answer -70. Blocking - a worker thread only."""
+    exe = _sfx_ffmpeg()
+    if not exe:
+        return None
+    try:
+        run = subprocess.run(
+            [exe, "-nostdin", "-hide_banner", "-nostats", "-i", str(path),
+             "-map", "0:a:0", "-af",
+             "apad=whole_dur=0.5,ebur128=peak=sample+true:framelog=quiet",
+             "-f", "null", "-"],
+            capture_output=True, timeout=timeout, text=True, errors="replace")
+    except Exception:  # noqa: BLE001
+        return None
+    log = run.stderr or ""
+    if run.returncode != 0:
+        if "matches no streams" in log:
+            return {"none": True}
+        return None
+    return sfx_loudness_parse(log)
+
+
+def _sfx_loud_chain(gain_db: float, limit_db: float | None) -> str:
+    """The linear road: one gain, and a limiter only when this pass needs
+    one (the peak the gain would push past the ceiling)."""
+    chain = "volume=%.2fdB" % gain_db
+    if limit_db is not None:
+        chain += (",alimiter=limit=%.4f:attack=5:release=50:level=disabled"
+                  ":latency=1" % max(0.0625, min(1.0, 10.0 ** (limit_db / 20.0))))
+    return chain
+
+
+def _sfx_loud_encode(exe: str, src: Path, dst: Path, chain: str,
+                     video: bool, codec: str) -> None:
+    """One pass through `chain`. A clip with a picture keeps it (`-c:v
+    copy`, #1420); a sting is PCM. Raises on any failure."""
+    args = [exe, "-nostdin", "-loglevel", "error", "-y", "-i", str(src)]
+    if video:
+        args += ["-map", "0:v:0?", "-map", "0:a:0", "-c:v", "copy",
+                 "-af", chain, "-c:a", codec or "aac", "-b:a", "160k"]
+        if dst.suffix.lower() in (".mp4", ".m4v", ".mov"):
+            args += ["-movflags", "+faststart"]
+    else:
+        args += ["-map", "0:a:0", "-af", chain, "-c:a", "pcm_s16le"]
+    args.append(str(dst))
+    subprocess.run(args, check=True, timeout=SFX_VIDEO_LEVEL_SECS,
+                   capture_output=True)
+
+
+def _sfx_lu_remember(key: str, row: dict[str, Any]) -> None:
+    if len(_SFX_LU_MEMO) >= 4000:
+        _SFX_LU_MEMO.clear()
+    _SFX_LU_MEMO[key] = row
+
+
+def _sfx_loud_make(src: Path, out: Path, *, video: bool,
+                   vol: float = 1.0) -> dict[str, Any]:
+    """#1477: write `out` - `src` with its sound at SFX_TARGET_LUFS and no
+    true peak over SFX_TP_DB - and say what happened.
+
+      {"ok": True, ...}             written, and measured: the numbers of
+                                    the FILE WRITTEN are beside it as .lu
+      {"asis": True, "why": ...}    looked at and rightly left alone
+      {"failed": True, "why": ...}  ffmpeg would not write it
+      {"retry": True, "why": ...}   no answer this time - nothing written
+
+    `vol` is the box level (#573), which a sting on the voice road has
+    always carried; a clip with a picture is always made at 1.0 (#1420:
+    the element's own volume carries the slider, live). Blocking - the
+    leveller's own threads, the keeper, the cadence's worker thread.
+
+    THE ROADS, in order. (1) One linear gain to the target; the limiter
+    only when that gain would cross the ceiling, and the lift bounded by
+    the PEAK (sfx_video_gain_db). (2) The written file is measured, and a
+    pass that missed - a limiter that caught something took loudness with
+    it; AAC put some peak back - is corrected, SFX_LEVEL_PASSES in all,
+    and the BEST pass is kept (under the ceiling first, then nearest the
+    target). (3) Only a clip the peak rule still leaves more than
+    SFX_LEVEL_DYNAMIC_LU short is offered two more: (a) the whole gain
+    with the limiter, kept only if the limiter cost it less than
+    SFX_LEVEL_TRANSIENT_LU - it caught clicks, not the body; then (b) one
+    pass of ffmpeg's loudnorm in its dynamic mode - a bang in a quiet
+    clip, whose own crest no limiter brings inside the ceiling. Each is
+    kept only if it is better. SFX_LEVEL_DYNAMIC=0 keeps #1420's peak
+    rule absolute."""
+    import math
+    began = time.monotonic()
+    shift = 20.0 * math.log10(max(0.05, float(vol or 1.0)))
+    target, ceiling = SFX_TARGET_LUFS + shift, SFX_TP_DB + shift
+    got: dict[str, Any] = {"ok": False, "why": "", "passes": 0,
+                           "target": round(target, 2),
+                           "ceiling": round(ceiling, 2)}
+    heard = sfx_loudness(src)
+    if heard is None:
+        got.update(retry=True, why="nothing could measure it this time")
+        return got
+    if heard.get("none"):
+        got.update(asis=True, why="no measurable sound in it")
+        return got
+    got["src"] = heard
+    _sfx_lu_remember("src:%s" % src, heard)
+    level, true_peak, peak = heard.get("i"), heard.get("tp"), heard.get("peak")
+    if peak is None or peak <= SFX_SILENT_DB:
+        got.update(asis=True, empty=True,
+                   why=("nothing in it rises above the station's silence "
+                        "line (#1199): peak %s dB, %s LUFS" % (peak, level)))
+        return got
+    if level is None or level <= -69.5 or true_peak is None:
+        got.update(asis=True,
+                   why="too short or too sparse for a loudness reading "
+                       "(%s LUFS)" % (level,))
+        return got
+    gain = sfx_video_gain_db(level - shift, true_peak - shift)
+    if video and abs(gain) < SFX_VIDEO_DEADBAND_DB and true_peak <= ceiling:
+        got.update(asis=True, i=level, tp=true_peak,
+                   why="already at level: %.1f LUFS, true peak %.1f dBTP"
+                       % (level, true_peak))
+        return got
+    exe = _sfx_ffmpeg()
+    if not exe:
+        got.update(retry=True, why="no encoder on this box")
+        return got
+    suffix = out.suffix.lower()
+    # webm and ogv cannot carry AAC; the second name is a fallback for an
+    # ffmpeg built without libopus, not a preference (#1420).
+    codecs = (["libopus", "libvorbis"] if video and suffix in (".webm", ".ogv")
+              else ["aac"] if video else [""])
+    # The most a lift may take, from the PEAK (#1420): the limiter may
+    # catch no more than SFX_VIDEO_SQUASH_DB of it.
+    room = (ceiling + SFX_VIDEO_SQUASH_DB) - true_peak
+    rate = int(heard.get("rate") or 0) or (48000 if video else 22050)
+    try:
+        out.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
     trouble = ""
     for codec in codecs:
-        args = [exe, "-nostdin", "-loglevel", "error", "-y", "-i", str(path),
-                "-map", "0:v:0", "-map", "0:a:0", "-c:v", "copy",
-                "-af", chain, "-c:a", codec, "-b:a", "160k"]
-        if suffix in (".mp4", ".m4v", ".mov"):
-            args += ["-movflags", "+faststart"]
-        args.append(str(tmp))
+        best: list[Any] = []            # [score, part, measured, gain, how]
+
+        def one_pass(chain: str, now_gain: float, how: str,
+                     keep: Any = None) -> tuple[float, float]:
+            """Write, measure, keep it if it is the best so far (and `keep`
+            allows it). -> (miss, over)."""
+            # The half-written file KEEPS THE EXTENSION - ffmpeg picks its
+            # muxer from the name (#1420) - and carries a per-pass tag, so
+            # the keeper and a job for the same clip never share one.
+            part = out.with_name("%s-part%d-%s%s" % (
+                out.stem, os.getpid(), uuid.uuid4().hex[:6], suffix))
+            try:
+                _sfx_loud_encode(exe, src, part, chain, video, codec)
+                wrote = sfx_loudness(part)
+                if not wrote or wrote.get("none") or wrote.get("i") is None:
+                    raise RuntimeError("the written copy could not be measured")
+            except Exception:
+                part.unlink(missing_ok=True)
+                raise
+            got["passes"] = int(got.get("passes") or 0) + 1
+            miss = target - float(wrote["i"])
+            top = wrote.get("tp")
+            over = float(top if top is not None else wrote["peak"]) - ceiling
+            score = (over > 0.0, round(abs(miss), 2))
+            if keep is not None and not keep(wrote):
+                part.unlink(missing_ok=True)
+            elif not best or score < best[0]:
+                if best:
+                    best[1].unlink(missing_ok=True)
+                best[:] = [score, part, wrote, now_gain, how]
+            else:
+                part.unlink(missing_ok=True)
+            return miss, over
+
         try:
-            subprocess.run(args, check=True, timeout=SFX_VIDEO_LEVEL_SECS,
-                           capture_output=True)
-            os.replace(tmp, out)
-            _SFX_VIDEO_LEVEL["made"] = int(_SFX_VIDEO_LEVEL.get("made") or 0) + 1
-            _sfx_video_level_prune()
-            return out
+            margin, now_gain = SFX_TP_MARGIN_DB, gain
+            for attempt in range(SFX_LEVEL_PASSES):
+                limit_db = (ceiling - margin
+                            if true_peak + now_gain > ceiling - margin else None)
+                miss, over = one_pass(_sfx_loud_chain(now_gain, limit_db),
+                                      now_gain, "limited" if limit_db is not None
+                                      else "linear")
+                if (abs(miss) <= SFX_LU_SLACK and over <= 0.0) or (
+                        attempt + 1 >= SFX_LEVEL_PASSES):
+                    break
+                again = now_gain
+                if over > 0.0:
+                    margin += over + 0.2
+                if abs(miss) > SFX_LU_SLACK:
+                    again = now_gain + miss
+                    if again > 0.0:
+                        again = min(again, room)        # still the peak's call
+                    again = max(SFX_VIDEO_CUT_DB, min(SFX_VIDEO_BOOST_DB, again))
+                if abs(again - now_gain) < 0.05 and over <= 0.0:
+                    break           # the peak allows no more: this IS the level
+                now_gain = again
+            short = target - float(best[2]["i"]) if best else 0.0
+            if SFX_LEVEL_DYNAMIC and best and (best[0][0]
+                                               or short > SFX_LEVEL_DYNAMIC_LU):
+                # (3a) THE TRANSIENT PASS. #1420 drew its line between a
+                # limiter "catching the odd transient" and one "flattening
+                # the clip", and bounded the lift by the peak because it
+                # could not tell them apart in advance. It can be told
+                # AFTER: the whole gain, the limiter at the ceiling, and
+                # the pass counts only if the limiter cost the loudness
+                # almost nothing - i.e. it caught clicks, not the body.
+                full = max(SFX_VIDEO_CUT_DB, min(SFX_VIDEO_BOOST_DB, target - level))
+                if full > float(best[3]) + 0.5:
+                    one_pass(_sfx_loud_chain(full, ceiling - margin), full,
+                             "transient",
+                             keep=lambda wrote: (level + full) - float(wrote["i"])
+                             <= SFX_LEVEL_TRANSIENT_LU)
+                short = target - float(best[2]["i"])
+            if SFX_LEVEL_DYNAMIC and best and (best[0][0]
+                                               or short > SFX_LEVEL_DYNAMIC_LU):
+                # (3b) and only then loudnorm's dynamic mode.
+                dyn_tp = max(-9.0, min(0.0, ceiling - SFX_TP_MARGIN_DB))
+                dyn = ("loudnorm=I=%.1f:TP=%.1f:LRA=11,aresample=%d"
+                       % (max(-70.0, min(-5.0, target)), dyn_tp, rate))
+                one_pass(dyn, 0.0, "dynamic")
+                # (3c) A body that sits 25-30 dB under a crackle that runs
+                # all through it (measured on two pool clips) defeats both:
+                # a compressor keyed just over the clip's own loudness
+                # first, then the same loudnorm.
+                if best[0][0] or target - float(best[2]["i"]) > SFX_LEVEL_DYNAMIC_LU:
+                    one_pass("acompressor=threshold=%.1fdB:ratio=8:attack=2"
+                             ":release=80:makeup=1,%s"
+                             % (max(-60.0, min(-6.0, level + 6.0)), dyn),
+                             0.0, "squeezed")
+            if not best:
+                raise RuntimeError("no pass was written")
+            os.replace(best[1], out)
         except Exception as exc:  # noqa: BLE001
             trouble = "%s: %s" % (type(exc).__name__, str(exc)[:80])
+            if best:
+                try:
+                    best[1].unlink(missing_ok=True)
+                except OSError:
+                    pass
+            continue
+        _score, _part, wrote, used_gain, how = best
+        row = {"i": wrote.get("i"), "tp": wrote.get("tp"),
+               "gain": round(used_gain, 2), "how": how,
+               "limited": how != "linear",
+               "passes": got["passes"], "target": got["target"],
+               "ceiling": got["ceiling"], "src_i": level, "src_tp": true_peak,
+               "ms": int((time.monotonic() - began) * 1000)}
+        _sfx_lu_remember(out.name, row)
+        try:
+            out.with_name(out.name + ".lu").write_text(json.dumps(row))
+        except OSError:
+            pass
+        got.update(ok=True, **row)
+        return got
+    got.update(failed=True, why=trouble or "ffmpeg would not write it")
+    return got
+
+
+def sfx_video_levelled_name(path: Path) -> Path | None:
+    """#1477: WHERE a clip with a picture's levelled copy lives - the one
+    spelling of it, for the maker and the request path's check alike
+    (#1338's rule: a name spelled twice drifts). None = the clip is not on
+    the share any more. Blocking: one stat on the share."""
+    try:
+        stamp = path.stat().st_mtime_ns
+    except OSError:
+        return None
+    return SFX_LEVELLED / ("%s-%s-%s%s" % (sfx_id(path), SFX_VIDEO_LEVEL_MARK,
+                                          stamp, path.suffix.lower()))
+
+
+def sfx_level_cached(path: Path) -> Path | None:
+    """#1477: what goes out for this clip if its levelling is SETTLED - the
+    levelled copy, or the clip itself when it was looked at and left alone.
+    None = not levelled YET. Never makes or asks for anything. Blocking."""
+    if sfx_is_video(path):
+        out = sfx_video_levelled_name(path)
+        if out is None:
+            return path
+        if out.exists():
+            return out
+        if out.with_name(out.name + ".asis").exists():
+            return path
+        return None
+    out = sfx_levelled_name(path)
+    if out is None:
+        return path
+    return out if out.exists() else None
+
+
+def _sfx_level_job(path: Path) -> Path:
+    """One clip, either kind, made now. Never raises."""
+    try:
+        if sfx_is_video(path):
+            return sfx_video_levelled(path, make=True)
+        return sfx_levelled(path)
+    except Exception:  # noqa: BLE001
+        return path
+
+
+def sfx_level_submit(path: Path) -> Any:
+    """#1477: make this clip's levelled copy on the leveller's own threads -
+    ONE job per clip, however many roads ask. Returns the job (a
+    concurrent.futures.Future). Safe on the loop: a lock and a submit."""
+    key = str(path)
+    with _SFX_LEVEL_JOBS_LOCK:
+        job = _SFX_LEVEL_JOBS.get(key)
+        if job is not None and not job.done():
+            return job
+        if _SFX_LEVEL_POOL[0] is None:
+            from concurrent.futures import ThreadPoolExecutor
+            _SFX_LEVEL_POOL[0] = ThreadPoolExecutor(
+                max_workers=SFX_LEVEL_WORKERS, thread_name_prefix="sfx-level")
+        job = _SFX_LEVEL_POOL[0].submit(_sfx_level_job, path)
+        _SFX_LEVEL_JOBS[key] = job
+        if len(_SFX_LEVEL_JOBS) > 256:
+            for done_key in [k for k, j in _SFX_LEVEL_JOBS.items() if j.done()]:
+                _SFX_LEVEL_JOBS.pop(done_key, None)
+    return job
+
+
+async def sfx_level_for_air(path: Path,
+                            wait: float | None = None) -> tuple[Path, str]:
+    """#1477: NO RAW CLIP ON THE AIR. The file to send for `path` and how it
+    was got: "ready" (settled before anyone asked), "made" (levelled now,
+    inside the wait), "raw" (not in time - the job goes on for the next
+    airing). Called where a clip is PICKED, before the event that tells a
+    surface to play it, and by /sfx/{key}. The stat and the ffmpeg are
+    never on the loop; the wait is bounded."""
+    wait = SFX_LEVEL_WAIT if wait is None else max(0.0, float(wait))
+    try:
+        have = await asyncio.to_thread(sfx_level_cached, path)
+    except Exception:  # noqa: BLE001
+        have = None
+    if have is not None:
+        return have, "ready"
+    try:
+        job = sfx_level_submit(path)
+        await asyncio.wait_for(asyncio.shield(asyncio.wrap_future(job)),
+                               timeout=wait)
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001
+        pass                            # not in time: it finishes anyway
+    try:
+        have = await asyncio.to_thread(sfx_level_cached, path)
+    except Exception:  # noqa: BLE001
+        have = None
+    return (have, "made") if have is not None else (path, "raw")
+
+
+def _sfx_served_level(raw: Path, sent: Path, how: str) -> dict[str, Any] | None:
+    """The loudness of what was actually handed out, if it is known."""
+    if sent != raw:
+        row = _SFX_LU_MEMO.get(sent.name)
+        if row is None:
             try:
-                tmp.unlink(missing_ok=True)
+                row = json.loads(sent.with_name(sent.name + ".lu").read_text())
+            except Exception:  # noqa: BLE001
+                row = None
+            if isinstance(row, dict):
+                _sfx_lu_remember(sent.name, row)
+        return row if isinstance(row, dict) else None
+    src = _SFX_LU_MEMO.get("src:%s" % raw)
+    if isinstance(src, dict):
+        return src
+    if how == "ready" and sfx_is_video(raw):
+        out = sfx_video_levelled_name(raw)
+        if out is not None:
+            try:
+                note = out.with_name(out.name + ".asis").read_text()
             except OSError:
-                pass
-    _SFX_VIDEO_LEVEL["failed"] = int(_SFX_VIDEO_LEVEL.get("failed") or 0) + 1
-    _SFX_VIDEO_LEVEL["why"] = "%s — %s" % (path.name, trouble)
-    # Flagged so one bad container does not spawn an ffmpeg per airing
-    # for the rest of the evening. Delete the .asis file to try again.
-    _sfx_video_level_flag(flat, "could not be levelled — %s" % trouble)
-    return path
+                note = ""
+            found = re.search(r"(-?\d+(?:\.\d+)?) LUFS, true peak "
+                              r"(-?\d+(?:\.\d+)?) dBTP", note)
+            if found:
+                return {"i": float(found.group(1)), "tp": float(found.group(2))}
+    return None
+
+
+def sfx_served_note(sid: str, raw: Path, sent: Path, how: str) -> None:
+    """#1477: one clip handed out, for the `spread` the mode endpoint reads.
+    One airing asks in several byte ranges; it is written down once."""
+    now = time.time()
+    for row in list(_SFX_SERVED)[-12:]:
+        if row.get("id") == sid and now - float(row.get("at") or 0) < 20.0:
+            return
+    if how == "raw":
+        _SFX_VIDEO_LEVEL["raw_served"] = int(
+            _SFX_VIDEO_LEVEL.get("raw_served") or 0) + 1
+    try:
+        level = _sfx_served_level(raw, sent, how) or {}
+    except Exception:  # noqa: BLE001
+        level = {}
+    _SFX_SERVED.append({"id": sid, "at": now, "how": how, "raw": str(raw),
+                        "video": sfx_is_video(raw),
+                        "i": level.get("i"), "tp": level.get("tp")})
+
+
+def sfx_level_readout() -> dict[str, Any]:
+    """#1477: the new half of /api/sfx/video/mode's `levelled` block - the
+    target, the ceiling, how many went out raw, and how even the last
+    fifty clips handed out really were. No I/O: memo and ring only."""
+    rows = list(_SFX_SERVED)
+    levels, peaks = [], []
+    for row in rows:
+        level, top = row.get("i"), row.get("tp")
+        if level is None and row.get("how") == "raw":
+            src = _SFX_LU_MEMO.get("src:%s" % row.get("raw")) or {}
+            level, top = src.get("i"), src.get("tp")
+        if isinstance(level, (int, float)) and level > -69.5:
+            levels.append(float(level))
+        if isinstance(top, (int, float)) and top > -200:
+            peaks.append(float(top))
+    with _SFX_LEVEL_JOBS_LOCK:
+        busy = sum(1 for job in _SFX_LEVEL_JOBS.values() if not job.done())
+    return {"target_lufs": SFX_TARGET_LUFS, "tp_db": SFX_TP_DB,
+            "raw_served": int(_SFX_VIDEO_LEVEL.get("raw_served") or 0),
+            "limited": int(_SFX_VIDEO_LEVEL.get("limited") or 0),
+            "dynamic": int(_SFX_VIDEO_LEVEL.get("dynamic") or 0),
+            "stings": int(_SFX_VIDEO_LEVEL.get("stings") or 0),
+            "in_flight": busy,
+            "spread": (round(max(levels) - min(levels), 1)
+                       if len(levels) >= 2 else None),
+            "served": {"n": len(rows), "measured": len(levels),
+                       "raw": sum(1 for r in rows if r.get("how") == "raw"),
+                       "made_now": sum(1 for r in rows if r.get("how") == "made"),
+                       "min_lufs": round(min(levels), 1) if levels else None,
+                       "max_lufs": round(max(levels), 1) if levels else None,
+                       "worst_tp": round(max(peaks), 1) if peaks else None}}
+
+
+def sfx_level_prewarm(most: int = 3) -> int:
+    """#1477: level what is about to air before anything asks for it - the
+    clips the SFX guy has handed the set (#1417), then the most-played.
+    Resolved through the id map (#1307), never a walk of the share.
+    Blocking - the keeper's thread. Returns how many it made."""
+    picks: list[Path] = []
+    try:
+        for request in list(_SFX_CYCLE.get("requests") or []):
+            picks.append(Path(request[0]))
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        ranked = sorted((sfx_plays() or {}).items(),
+                        key=lambda kv: -int((kv[1] or {}).get("plays") or 0))
+        for sid, _row in ranked[:30]:
+            known = _SFX_ID_REVERSE.get(str(sid))
+            if known:
+                picks.append(Path(known))
+    except Exception:  # noqa: BLE001
+        pass
+    done, seen = 0, set()
+    for path in picks:
+        if done >= most:
+            break
+        if str(path) in seen:
+            continue
+        seen.add(str(path))
+        try:
+            if sfx_level_cached(path) is not None:
+                continue
+            sfx_level_submit(path).result(timeout=SFX_VIDEO_LEVEL_SECS)
+            done += 1
+        except Exception:  # noqa: BLE001
+            continue
+    return done
 
 
 def _sfx_video_level_say() -> str:
@@ -81051,8 +81633,8 @@ def _sfx_video_level_say() -> str:
     failed = int(_SFX_VIDEO_LEVEL.get("failed") or 0)
     waiting = len(_SFX_VIDEO_LEVEL.get("want") or [])
     if not (made or as_is or failed or waiting):
-        return " — sound levelled to %.0f dB: nothing measured yet" % (
-            SFX_VIDEO_MEAN_DB,)
+        return " — sound levelled to %.0f dB LUFS: nothing measured yet" % (
+            SFX_VIDEO_MEAN_DB,)                  # [#1477-say]
     bits = ["%d levelled" % made]
     if as_is:
         bits.append("%d already at level" % as_is)
@@ -81061,8 +81643,10 @@ def _sfx_video_level_say() -> str:
     if failed:
         bits.append("%d refused (%s)" % (failed, _SFX_VIDEO_LEVEL.get("why")
                                          or "no reason recorded"))
-    return " — sound levelled to %.0f dB: %s" % (SFX_VIDEO_MEAN_DB,
-                                                 ", ".join(bits))
+    if int(_SFX_VIDEO_LEVEL.get("raw_served") or 0):          # [#1477-say2]
+        bits.append("%d went out raw" % int(_SFX_VIDEO_LEVEL["raw_served"]))
+    return " — sound levelled to %.0f dB LUFS: %s" % (SFX_VIDEO_MEAN_DB,
+                                                      ", ".join(bits))
 
 
 def sfx_levelled_name(path: Path, vol: float | None = None) -> Path | None:
@@ -81088,7 +81672,8 @@ def sfx_levelled_name(path: Path, vol: float | None = None) -> Path | None:
         return None
     if vol is None:
         vol = box_gain()
-    return SFX_LEVELLED / f"{sfx_id(path)}-v3-v{int(round(vol * 20))}-{stamp}.wav"
+    # [#1477-v4] v4: levelled by loudness (LUFS + a true-peak ceiling).
+    return SFX_LEVELLED / f"{sfx_id(path)}-v4-v{int(round(vol * 20))}-{stamp}.wav"
 
 
 def sfx_levelled(path: Path) -> Path:
@@ -81119,6 +81704,22 @@ def sfx_levelled(path: Path) -> Path:
     if out.exists():
         return out
     source = _as_wav(path)
+    # [#1477-sting] BY LOUDNESS, THE SAME TARGET AS A CLIP WITH A PICTURE.
+    # This is also the road the cadence welds an mp4's sound into the round
+    # through (_sfx_cadence_video_pick), which is most of what the board
+    # plays. RMS-then-peak-cap below was the other half of the unevenness:
+    # a cap at SFX_PEAK held any clip with the crest of speech well under
+    # its RMS target. It stays as the fallback for what ebur128 cannot
+    # read (no ffmpeg, a click too short or too sparse to gate, silence).
+    if source.suffix.lower() == ".wav":
+        try:
+            SFX_LEVELLED.mkdir(parents=True, exist_ok=True)
+            if _sfx_loud_make(source, out, video=False, vol=vol).get("ok"):
+                _SFX_VIDEO_LEVEL["stings"] = int(
+                    _SFX_VIDEO_LEVEL.get("stings") or 0) + 1
+                return out
+        except Exception:  # noqa: BLE001
+            pass
     try:
         with wave.open(str(source), "rb") as src:
             params = src.getparams()
@@ -82097,16 +82698,27 @@ async def sfx_levels_keeper() -> None:
                 # levelled copy existed — a sting down the voice feed, a
                 # sampler pad, anything the cycle never picked. One
                 # ffmpeg each, so two a round and no more.
-                for raw in list(_SFX_VIDEO_LEVEL.get("want") or [])[:2]:
+                for raw in list(_SFX_VIDEO_LEVEL.get("want") or [])[:4]:
                     try:
                         _SFX_VIDEO_LEVEL["want"].remove(raw)
                     except ValueError:
                         pass
                     try:
-                        sfx_video_levelled(Path(raw), make=True)
+                        # [#1477-keeper] through the leveller's own door, so
+                        # a clip a request is already making is joined, not
+                        # made a second time into the same name.
+                        sfx_level_submit(Path(raw)).result(
+                            timeout=SFX_VIDEO_LEVEL_SECS)
                         done += 1
                     except Exception:  # noqa: BLE001
                         continue
+                # #1477: and AHEAD of the air - what the SFX guy has handed
+                # the set, then the most-played - so the pick-time wait is
+                # a cache hit.
+                try:
+                    done += sfx_level_prewarm(3)
+                except Exception:  # noqa: BLE001
+                    pass
                 if done:
                     _sfx_level_save()
                 return done
@@ -82510,6 +83122,13 @@ def _sfx_cadence_video_pick(after: str) -> tuple[Path, Path, float, str] | None:
         audio = sfx_levelled(source)
         if audio.suffix.lower() == ".wav" and audio.is_file():
             _sfx_video_rotation_mark_clip(sfx_id(path), path.parent.name)
+            # [#1477-picture] its picture rides silent, but it is fetched
+            # through /sfx/{key} like any clip: have the copy made before
+            # the page asks, not while it waits.
+            try:
+                sfx_level_submit(path)
+            except Exception:  # noqa: BLE001
+                pass
             return path, audio, seconds, why
     return None
 
@@ -83762,13 +84381,19 @@ async def sfx_video_cycle() -> None:
             # runway less a second; never so little that a clip which
             # would have levelled in time is rung raw anyway.
             room = max(0.0, last_end - time.time()) - 1.0
+            # [#1477-cycle] through the leveller's own door, so the page
+            # that fetches this clip a moment later joins the same job
+            # instead of racing it with a second ffmpeg; bounded as #1423
+            # says and by SFX_LEVEL_WAIT, and the job finishes regardless.
+            _lv_how = "raw"
             try:
-                await asyncio.wait_for(
-                    asyncio.to_thread(sfx_video_levelled, pick, True),
-                    timeout=max(1.5, min(SFX_CYCLE_AHEAD, room)))
+                _lv_how = (await sfx_level_for_air(
+                    pick, max(1.5, min(SFX_LEVEL_WAIT, room))))[1]
             except asyncio.CancelledError:
                 raise
             except Exception:  # noqa: BLE001
+                _lv_how = "raw"
+            if _lv_how == "raw":
                 _sfx_video_level_want(pick)
             key = sfx_id(pick)
             start = max(now, last_end + SFX_CYCLE_GAP)
@@ -83837,7 +84462,10 @@ def sfx_video_mode_state() -> dict[str, Any]:
                          "failed": int(_SFX_VIDEO_LEVEL.get("failed") or 0),
                          "kept": int(_SFX_VIDEO_LEVEL.get("kept") or 0),
                          "waiting": len(_SFX_VIDEO_LEVEL.get("want") or []),
-                         "why": str(_SFX_VIDEO_LEVEL.get("why") or "")},
+                         "why": str(_SFX_VIDEO_LEVEL.get("why") or ""),
+                         # [#1477-mode] target_lufs, tp_db, raw_served,
+                         # spread (LU, the last 50 clips handed out)
+                         **sfx_level_readout()},
             "soundboard": sfx_soundboard_state(),          # #1185: the singular-track rule
             "ahead_s": max(0.0, round(float(cycle.get("until") or 0) - time.time(), 1)),
             # 2026-09-15 (#1184): AND WHAT SEAMLESS IS DOING, in the same
@@ -85858,6 +86486,16 @@ async def dj_sting(to_box: bool, after: str = "", who: str = "",
     # the event loop. The latter was an observed eight-second station stall.
     _sample_seconds = await sfx_db_seconds_async(sample)
     _sample_seconds = max(0.0, float(_sample_seconds or 0.0))
+    # [#1477-pick] NO RAW CLIP ON THE AIR: levelled HERE, the moment it is
+    # picked, before the row and the page feed tell anything to play it
+    # (and before admission, which reads the length off the levelled
+    # copy). Off the loop, bounded by SFX_LEVEL_WAIT.
+    try:
+        await sfx_level_for_air(sample)
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001
+        pass
     # On the record like any spoken line (#269): which sample, from which
     # folder, with enough identity for the panel to vote it off the air.
     # #903 (#848): this row was written BEFORE any attempt to play, and
@@ -125022,6 +125660,7 @@ async def dj_voice_api(
 
 @app.get("/api/dj/video")
 async def dj_video_api(
+    request: Request,                                       # [#1476]
     since: int = 0,
     t: str = "",                                            # [#1244]
     lag: str = "",                                          # [#1244]
@@ -125079,7 +125718,11 @@ async def dj_video_api(
                 # behind live (the thirty seconds it was primed with,
                 # EXT-X-START in every variant playlist); 0.0 when the
                 # stream module has no such lane, as before.
-                "burst_s": _hls_start_offset_s()
+                # #1476: and further back for a phone on the tailnet
+                # or the funnel, exactly as its variant playlists
+                # start it - or the picture runs ahead of the sound.
+                "burst_s": _hls_start_offset_s(
+                    away=_request_road(request) in ("tailnet", "funnel"))
                 if hls_listener in ("1", "true", "yes")
                 else dj_video_burst_s()}
     # 2026-09-14: "allow me to use endless video mode even if the station
@@ -152102,6 +152745,10 @@ _PUBLIC_POST = {"/api/dj/join", "/api/dj/request", "/api/dj/shout",
                 # #1471: a tapped diagnostics capture from the
                 # car. Token-gated, size-capped, throttled.
                 "/api/car/report",
+                # #1476: the drive's continuous telemetry and its spoken
+                # notes. Token-gated, size-capped, rate-limited per drive.
+                "/api/car/telemetry",
+                "/api/car/voice",
                 # [listener-uploads] a listener's video, sound or picture:
                 # token-gated, capped at 20 MB and sniffed inside
                 "/api/listener/upload"}
@@ -152442,7 +153089,8 @@ def _hls_query(token: str, mix: Any = None) -> str:
 
 
 def _hls_variant_rewrite(raw: str, lane: str, token: str,
-                         mix: Any = None, mix_in_query: bool = False) -> str:
+                         mix: Any = None, mix_in_query: bool = False,
+                         away: bool = False) -> str:
     """#1475: one ABR variant playlist, dressed for the door.
 
     `#EXT-X-INDEPENDENT-SEGMENTS` (hlsenc writes it only for a variant that
@@ -152469,7 +153117,7 @@ def _hls_variant_rewrite(raw: str, lane: str, token: str,
                 target = float(s.split(":", 1)[1])
             except ValueError:
                 pass
-    offset = _hls_start_offset_s(mix)
+    offset = _hls_start_offset_s(mix, away=away)            # [#1476]
     available = max(0.0, total - target)
     back = min(offset, available)
     dressed = ""
@@ -152789,8 +153437,11 @@ async def station_stream_hls_segment(
     lane_mix = (listener_mix(shape.group(2, 3, 4)) if in_path
                 else listener_mix(mix))
     if is_playlist:
-        # A variant's playlist - only of a lane that is RUNNING, like a
-        # segment: a stale player must never be able to start one.
+        # A variant's playlist - of a lane that is RUNNING, or (#1476) of
+        # one started for a player that holds a live tune-in token: after
+        # a station restart a locked phone's native player only ever
+        # re-reads the variant it was handed, and a 404 there ends the
+        # drive. Without a live token it is still a 404.
         variant_fn = getattr(STATION_STREAM, "hls_variant_playlist", None)
         if not callable(variant_fn):
             return Response(status_code=404)
@@ -152799,6 +153450,11 @@ async def station_stream_hls_segment(
         except Exception:  # noqa: BLE001
             playlist_path = None
         if playlist_path is None:
+            # #1476: A PLAYER THAT ASKS GETS A LANE (see
+            # _hls_ensure_for_player). Segments below still never start one.
+            playlist_path = await _hls_ensure_for_player(
+                seg_rate, shape.group(2, 3, 4) if in_path else mix, t)
+        if playlist_path is None:
             return Response(status_code=404)
         try:
             raw = Path(playlist_path).read_text()
@@ -152806,8 +153462,9 @@ async def station_stream_hls_segment(
             return Response(status_code=404)
         lane = ("%d-%d-%d-%d" % ((seg_rate,) + lane_mix) if in_path
                 else str(seg_rate))
-        body = _hls_variant_rewrite(raw, lane, t, lane_mix,
-                                    mix_in_query=not in_path)
+        body = _hls_variant_rewrite(
+            raw, lane, t, lane_mix, mix_in_query=not in_path,
+            away=_request_road(request) in ("tailnet", "funnel"))  # [#1476]
         _hls_note_safe(t, "playlist", seg_rate, name, len(body), _t0, request)
         return Response(
             content=body,
@@ -153433,6 +154090,24 @@ async def car_report_api(
     doc = {"v": 1, "summary": summary, "at": station.get("iso"),
            "file": name, "pine_id": pine_id, "note": note,
            "client": rep, "station": station}
+    # #1476: the drive this tap belongs to and the page's own event log
+    # (reconnects, wake recoveries, wheel presses), at the top of the file
+    # where a reader looks first - and the tap goes into the drive's own
+    # record, so the timeline shows where in the drive it was made.
+    doc["road_seen"] = _request_road(request)
+    _sid = str(rep.get("sid") or "")
+    if _CAR_SID_RE.match(_sid):
+        doc["sid"] = _sid
+    if isinstance(rep.get("events"), list):
+        doc["events"] = rep.get("events")
+    if doc.get("sid"):
+        try:
+            await _car_session_note(_sid, t, doc["road_seen"], {
+                "kind": "report", "at": round(now, 3),
+                "file": "data/car_reports/" + name, "id": pine_id,
+                "summary": summary[:400]})
+        except Exception:  # noqa: BLE001
+            pass
     file_error = ""
     try:
         await asyncio.to_thread(_car_write_report, name, doc, summary, pine_id)
@@ -153487,6 +154162,1067 @@ async def car_report_get_api(
         raise HTTPException(status_code=404, detail="no such report")
     return Response(content=data, media_type="application/json",
                     headers={"Cache-Control": "no-store"})
+
+
+# --- #1476: THE DRIVE KEEPS ITS OWN RECORD ---------------------------------
+# The first real drive (2026-09-27): the phone opened the station during an
+# eleven-minute outage, retried, was locked - and iOS suspends a page whose
+# audio is not playing, so nothing retried for twenty minutes. After a reload
+# the stream was seamless until Tailscale dropped at 16:02:52 and the phone
+# carried on over the public Funnel. All of that was pieced together
+# afterwards from three ledgers in two clocks. So the tune page now posts its
+# telemetry continuously (frontend/car-diag.js, batch v2) and the station
+# files each batch beside what IT was doing at the time - the loop's stalls,
+# the HLS requests this token made, the dead-air gaps, the restarts - one
+# jsonl per drive under data/car_sessions/. A batch that carries trouble
+# files a Pine report by itself, because a driver cannot tap anything, and a
+# spoken note is transcribed onto the report it belongs to.
+#
+# The #1471 rules hold: every reading is its own try, and no disk work runs
+# on the event loop. It runs on two threads of the car's own - the shared
+# executor is the one the station's stalls queue on, and a car's record must
+# neither wait behind them nor add to them. tools/car_timeline.py merges one
+# drive with the station's ledgers; GET /api/car/sessions/{sid} serves the
+# same merge.
+CAR_SESSIONS_DIR = data_path("car_sessions")
+CAR_SESSION_INDEX = CAR_SESSIONS_DIR / "index.jsonl"
+CAR_VOICE_DIR = CAR_REPORTS_DIR / "voice"
+BOOT_LOG_PATH = data_path("boot_log.jsonl")
+CAR_TELEMETRY_MAX_BYTES = 256 * 1024
+CAR_TELEMETRY_MIN_GAP_S = 4.0
+CAR_VOICE_MAX_B64 = 700 * 1024
+CAR_AUTO_SAME_S = 600.0         # one auto-report per drive per ten minutes
+CAR_AUTO_OTHER_S = 180.0        # ...a different kind of trouble after three
+CAR_AUTO_KINDS = ("stall", "freeze", "error", "reconnect", "road_change",
+                  "station_restart", "offline")
+_CAR_SID_RE = re.compile(r"^[A-Za-z0-9_-]{6,40}$")
+_CAR_SESSION_FILE_RE = re.compile(
+    r"^(\d{4}-\d{2}-\d{2})_([A-Za-z0-9_-]{6,40})\.jsonl$")
+_CAR_SESS: dict[str, dict[str, Any]] = {}
+_CAR_LAST_POST: dict[str, float] = {}
+_CAR_SESS_MAX = 400
+_CAR_VOICE_RECENT: list[float] = []
+_CAR_BOOTS: list[dict[str, Any]] = []
+_CAR_SUMMARY_CACHE: dict[str, tuple[int, float, dict[str, Any]]] = {}
+# THIS process's id in the restart log when the stream module has none of
+# its own (station_stream boot_id(), #1476 S). Unique per boot is all a
+# phone needs to notice that the station it talks to was restarted.
+_CAR_BOOT_ID_FALLBACK = "%x-%s" % (int(_BUILD_MS), os.urandom(3).hex())
+_CAR_POOL_BOX: list[Any] = []
+_HLS_ENSURE_BOX: list[Any] = []
+
+
+def _car_pool() -> Any:
+    if not _CAR_POOL_BOX:
+        from concurrent.futures import ThreadPoolExecutor
+        _CAR_POOL_BOX.append(ThreadPoolExecutor(
+            max_workers=2, thread_name_prefix="car-io"))
+    return _CAR_POOL_BOX[0]
+
+
+async def _car_io(fn: Any, *args: Any) -> Any:
+    """#1476: one blocking step of the car's record, on the car's threads."""
+    return await asyncio.get_running_loop().run_in_executor(
+        _car_pool(), lambda: fn(*args))
+
+
+def _car_boot_id() -> str:
+    fn = getattr(STATION_STREAM, "boot_id", None)
+    if callable(fn):
+        try:
+            got = str(fn() or "")
+            if got:
+                return got
+        except Exception:  # noqa: BLE001
+            pass
+    return _CAR_BOOT_ID_FALLBACK
+
+
+def _car_epoch(v: Any) -> float | None:
+    """Seconds from a phone's seconds or milliseconds; None if neither."""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    if f != f or f <= 0:
+        return None
+    return f / 1000.0 if f > 1e12 else f
+
+
+def _car_jsonl_tail(path: Path,
+                    max_bytes: int = 256 * 1024) -> list[dict[str, Any]]:
+    """BLOCKING: the rows in the last max_bytes of a jsonl file."""
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            fh.seek(max(0, size - max_bytes))
+            raw = fh.read()
+    except FileNotFoundError:
+        return []
+    lines = raw.split(b"\n")
+    if size > max_bytes and lines:
+        lines = lines[1:]                     # the first line is a torn one
+    out: list[dict[str, Any]] = []
+    for ln in lines:
+        if not ln.strip():
+            continue
+        try:
+            r = json.loads(ln)
+        except Exception:  # noqa: BLE001
+            continue
+        if isinstance(r, dict):
+            out.append(r)
+    return out
+
+
+def _boot_log_append(row: dict[str, Any]) -> list[dict[str, Any]]:
+    """BLOCKING: one line for this boot, then the last fifty."""
+    BOOT_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(BOOT_LOG_PATH, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(row, default=str, ensure_ascii=False) + "\n")
+    return _car_jsonl_tail(BOOT_LOG_PATH, 64 * 1024)[-50:]
+
+
+@app.on_event("startup")
+async def _startup_boot_log() -> None:
+    """#1476: THE RESTART LOG. A drive's record has to be read against the
+    station's own restarts - "it went quiet at 16:40" and "the station came
+    back up at 16:40:31" are one fact only if both are written down. One
+    line per boot in data/boot_log.jsonl; GET /api/car/boots reads it."""
+    row: dict[str, Any] = {"kind": "boot", "at": round(time.time(), 3),
+                           "iso": time.strftime("%Y-%m-%d %H:%M:%S"),
+                           "build": int(_BUILD_MS), "pid": os.getpid(),
+                           "boot_id": _car_boot_id()}
+    fn = getattr(STATION_STREAM, "booted_at", None)
+    if callable(fn):
+        try:
+            row["stream_booted_at"] = round(float(fn() or 0), 3)
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        _CAR_BOOTS[:] = list(await _car_io(_boot_log_append, row))
+    except Exception as exc:  # noqa: BLE001
+        _CAR_BOOTS[:] = [row]
+        print("[car] the boot log was not written: %s" % exc, flush=True)
+
+
+@app.on_event("shutdown")
+async def _shutdown_boot_log() -> None:
+    """#1476: ...and the end of this boot, when it is a clean stop. A hard
+    kill writes nothing, which is its own reading: a boot with no stop
+    before it."""
+    try:
+        with open(BOOT_LOG_PATH, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps({
+                "kind": "stop", "at": round(time.time(), 3),
+                "iso": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "build": int(_BUILD_MS), "pid": os.getpid(),
+                "boot_id": _car_boot_id()}) + "\n")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _car_restarts_since(since: float) -> int:
+    n = 0
+    for r in list(_CAR_BOOTS):
+        try:
+            if str(r.get("kind") or "boot") != "stop" \
+                    and float(r.get("at") or 0) >= since:
+                n += 1
+        except Exception:  # noqa: BLE001
+            continue
+    return n
+
+
+def _car_session_load(sid: str, now: float, tail: str,
+                      road: str) -> dict[str, Any]:
+    """BLOCKING: this drive's file and where it left off.
+
+    A drive outlives a station restart - that is the point of it - so a sid
+    this process has not seen is looked for on disk before it is taken for
+    a new one, and its last batch and last auto-report are read back from
+    the file's tail: the ten-minute rule and the since-last windows carry
+    across the restart instead of starting again at it."""
+    CAR_SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+    name = ""
+    with os.scandir(CAR_SESSIONS_DIR) as it:
+        for ent in it:
+            m = _CAR_SESSION_FILE_RE.match(ent.name)
+            if m and m.group(2) == sid and ent.name > name:
+                name = ent.name
+    st: dict[str, Any] = {"sid": sid, "file": name, "last_at": 0.0,
+                          "auto_at": 0.0, "auto_kind": "", "road": "",
+                          "boot_id": "", "road_change": None, "batches": 0}
+    if name:
+        for r in _car_jsonl_tail(CAR_SESSIONS_DIR / name, 512 * 1024):
+            kind = r.get("kind")
+            try:
+                at = float(r.get("at") or 0)
+            except (TypeError, ValueError):
+                at = 0.0
+            if kind == "batch":
+                st["last_at"] = max(st["last_at"], at)
+                st["batches"] += 1
+                rd = str(r.get("road_seen") or "")
+                if rd and st["road"] and rd != st["road"]:
+                    st["road_change"] = {"at": at, "from": st["road"],
+                                         "to": rd}
+                st["road"] = rd or st["road"]
+                st["boot_id"] = str(r.get("boot_id") or st["boot_id"])
+            elif kind == "auto_report":
+                st["auto_at"] = max(st["auto_at"], at)
+                st["auto_kind"] = str(r.get("trouble") or "")
+        return st
+    name = "%s_%s.jsonl" % (time.strftime("%Y-%m-%d", time.localtime(now)),
+                            sid)
+    st["file"] = name
+    with open(CAR_SESSION_INDEX, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps({
+            "sid": sid, "file": name, "first": round(now, 3),
+            "iso": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now)),
+            "token_tail": tail, "road": road}, ensure_ascii=False) + "\n")
+    return st
+
+
+async def _car_session_get(sid: str, token: str, road: str,
+                           now: float) -> dict[str, Any]:
+    sess = _CAR_SESS.get(sid)
+    if sess is not None:
+        return sess
+    loaded = await _car_io(_car_session_load, sid, now,
+                           str(token or "")[-12:] or "-", road)
+    sess = _CAR_SESS.get(sid)           # loaded by another request meanwhile
+    if sess is not None:
+        return sess
+    if len(_CAR_SESS) >= _CAR_SESS_MAX:
+        for old in sorted(_CAR_SESS, key=lambda k: float(
+                _CAR_SESS[k].get("last_at") or 0))[:len(_CAR_SESS) // 4 + 1]:
+            _CAR_SESS.pop(old, None)
+    _CAR_SESS[sid] = loaded
+    return loaded
+
+
+def _car_session_append(name: str, rows: list[dict[str, Any]]) -> None:
+    """BLOCKING: whole lines onto one drive's file."""
+    CAR_SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+    with open(CAR_SESSIONS_DIR / name, "a", encoding="utf-8") as fh:
+        for row in rows:
+            fh.write(json.dumps(row, default=str, ensure_ascii=False,
+                                separators=(",", ":")) + "\n")
+
+
+async def _car_session_note(sid: str, token: str, road: str,
+                            row: dict[str, Any]) -> None:
+    """One non-batch row (a tap, a spoken note) into the drive's record."""
+    sess = await _car_session_get(sid, token, road, time.time())
+    await _car_io(_car_session_append, sess["file"], [row])
+
+
+def _car_gap_rows(since: float, until: float) -> list[dict[str, Any]]:
+    """BLOCKING: the dead-air gaps that ENDED in (since, until], compact. A
+    gap is stamped with its start and written at its end, so its end is
+    what places it after the previous batch."""
+    out: list[dict[str, Any]] = []
+    for r in _car_jsonl_tail(GAP_LOG_PATH, 256 * 1024):
+        try:
+            at = float(r.get("at") or 0)
+            end = float(r.get("until") or at)
+        except (TypeError, ValueError):
+            continue
+        if end <= since or end > until:
+            continue
+        try:
+            secs = float(r.get("seconds") or r.get("gap") or 0)
+        except (TypeError, ValueError):
+            secs = 0.0
+        out.append({"at": round(at, 2), "s": round(secs, 1),
+                    "cause": str(r.get("cause") or "")[:80],
+                    "basis": str(r.get("basis") or "")[:12]})
+    return out[-60:]
+
+
+def _car_batch_store(name: str, row: dict[str, Any], since: float,
+                     until: float) -> None:
+    """BLOCKING: the gap-log reading the batch carries, then the batch."""
+    try:
+        row["station"]["gaps_since_last"] = _car_gap_rows(since, until)
+    except Exception as exc:  # noqa: BLE001
+        row["station"]["gaps_since_last"] = {"error": str(exc)[:120]}
+    _car_session_append(name, [row])
+
+
+def _car_ledger_compact(rows: Any, since: float) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for r in rows or []:
+        try:
+            ts = float(r.get("ts") or 0)
+        except (TypeError, ValueError, AttributeError):
+            continue
+        if ts <= since:
+            continue
+        c: dict[str, Any] = {"ts": round(ts, 3),
+                             "k": str(r.get("kind") or "")[:8],
+                             "r": r.get("rate"), "n": str(r.get("name")
+                                                          or "")[:32],
+                             "b": r.get("bytes"), "ms": r.get("ms"),
+                             "road": str(r.get("road") or "")[:8]}
+        if r.get("stall"):
+            c["stall"] = True
+        if r.get("dropout"):
+            c["dropout"] = True
+        out.append(c)
+    return out[-120:]
+
+
+def _car_listener_row(tail: str) -> dict[str, Any] | None:
+    fn = getattr(STATION_STREAM, "hls_listeners", None)
+    if not callable(fn):
+        return None
+    for r in fn() or []:
+        if str(r.get("token_tail") or "") == tail:
+            return dict(r)
+    return None
+
+
+def _car_pulse_compact(window: float) -> dict[str, Any]:
+    p = pulse_report(window)
+    return {"window_s": round(window, 1), "stalls": p.get("stalls"),
+            "worst_s": p.get("worst_s"), "stalled_s": p.get("stalled_s"),
+            "top": [{"frame": str(x.get("frame") or "")[:80],
+                     "n": x.get("n"), "s": x.get("seconds")}
+                    for x in (p.get("top") or [])[:3]]}
+
+
+def _car_trouble_kind(body: dict[str, Any]) -> str:
+    """The kind of trouble a batch may file for, or "". `idle_stalled` (a
+    player that is not meant to be playing) and a row restored from before a
+    reload never file: the first is not a fault, the second was filed (or
+    not) by the page that saw it."""
+    tr = body.get("trouble")
+    if not isinstance(tr, dict):
+        return ""
+    kind = str(tr.get("kind") or "").strip().lower()
+    if kind not in CAR_AUTO_KINDS:
+        return ""
+    det = tr.get("detail") if isinstance(tr.get("detail"), dict) else {}
+    if tr.get("restored") or det.get("restored") or body.get("restored"):
+        return ""
+    return kind
+
+
+def _car_auto_due(sess: dict[str, Any], kind: str, now: float) -> bool:
+    last = float(sess.get("auto_at") or 0)
+    if not last:
+        return True
+    gap = now - last
+    if gap >= CAR_AUTO_SAME_S:
+        return True
+    return kind != str(sess.get("auto_kind") or "") \
+        and gap >= CAR_AUTO_OTHER_S
+
+
+def _car_note_road(sess: dict[str, Any], events: list[Any],
+                   trouble: Any, road_seen: str, now: float) -> None:
+    """The drive's latest change of road: as the station saw it (road_seen
+    moved between batches) or, when the phone reported it, at the phone's
+    own time - which is when it actually happened."""
+    prev = str(sess.get("road") or "")
+    if prev and road_seen and prev != road_seen:
+        sess["road_change"] = {"at": now, "from": prev, "to": road_seen}
+    cands = list(events or [])
+    if isinstance(trouble, dict):
+        cands.append(trouble)
+    for e in cands:
+        if not isinstance(e, dict):
+            continue
+        if str(e.get("kind") or e.get("k") or "") != "road_change":
+            continue
+        det = e.get("detail") if isinstance(e.get("detail"), dict) else e
+        at = _car_epoch(e.get("t") or e.get("at")) or now
+        cur = sess.get("road_change") or {}
+        if at >= float(cur.get("at") or 0) - 120.0:
+            sess["road_change"] = {
+                "at": at, "from": str(det.get("from") or "")[:12],
+                "to": str(det.get("to") or det.get("road") or road_seen)[:12]}
+
+
+def _car_auto_summary(body: dict[str, Any], sess: dict[str, Any], kind: str,
+                      road_seen: str, now: float) -> str:
+    """One line a person reads first, in the #1471 report's order: what the
+    phone suffered, which road it was on, what the station was doing, and
+    where the whole drive is."""
+    tr = body.get("trouble") if isinstance(body.get("trouble"), dict) else {}
+    det = tr.get("detail") if isinstance(tr.get("detail"), dict) else {}
+
+    def first_num(src: Any, keys: tuple[str, ...]) -> float | None:
+        if not isinstance(src, dict):
+            return None
+        for k in keys:
+            try:
+                v = float(src.get(k))
+            except (TypeError, ValueError):
+                continue
+            if v == v:
+                return v
+        return None
+
+    head = kind.replace("_", " ")
+    secs = first_num(det, ("seconds", "s", "dur_s", "duration_s",
+                           "stalled_s", "for_s", "secs"))
+    if secs is None:
+        ms = first_num(det, ("ms", "dur_ms", "duration_ms"))
+        secs = ms / 1000.0 if ms is not None else None
+    if secs is not None:
+        head += " %.1f s" % secs
+    if kind == "error":
+        code = det.get("status") or det.get("code") or det.get("http")
+        msg = det.get("msg") or det.get("message") or det.get("error")
+        if code:
+            head += " (%s)" % str(code)[:20]
+        if msg:
+            head += " " + " ".join(str(msg).split())[:80]
+    elif kind == "reconnect":
+        if det.get("n") or det.get("tries"):
+            head += " x%s" % str(det.get("n") or det.get("tries"))[:6]
+        if det.get("why"):
+            head += " (%s)" % " ".join(str(det.get("why")).split())[:60]
+    elif kind == "road_change" and (det.get("from") or det.get("to")):
+        head += " %s -> %s" % (str(det.get("from") or "?")[:12],
+                               str(det.get("to") or road_seen)[:12])
+    elif kind == "station_restart" and (det.get("from") or det.get("to")):
+        head += " boot %s -> %s" % (str(det.get("from") or "?")[:14],
+                                    str(det.get("to") or "?")[:14])
+    kmh = first_num(det, ("kmh", "speed_kmh"))
+    if kmh is None:
+        for s in reversed(body.get("samples") or []):
+            kmh = first_num(s.get("pos") if isinstance(s, dict) else None,
+                            ("kmh",))
+            if kmh is not None:
+                break
+    if kmh is not None:
+        head += " at %.0f km/h" % kmh
+    at = _car_epoch(tr.get("at"))
+    if at:
+        head += " (%s)" % time.strftime("%H:%M:%S", time.localtime(at))
+    page = body.get("page") if isinstance(body.get("page"), dict) else {}
+    road = "road %s" % road_seen
+    if page.get("mode"):
+        road += "/" + str(page.get("mode"))[:6]
+    rc = sess.get("road_change")
+    if isinstance(rc, dict) and rc.get("to"):
+        when = time.strftime("%H:%M:%S",
+                             time.localtime(float(rc.get("at") or now)))
+        if rc.get("from") == "tailnet" and rc.get("to") == "funnel":
+            road += " (Tailscale dropped %s)" % when
+        else:
+            road += " (%s -> %s at %s)" % (rc.get("from") or "?",
+                                           rc.get("to"), when)
+    try:
+        p = pulse_report(600)
+        station = "station: %d stalls/10 min worst %.1f s" % (
+            int(p.get("stalls") or 0), float(p.get("worst_s") or 0))
+    except Exception:  # noqa: BLE001
+        station = "station: pulse unread"
+    station += ", restarted %dx in 15 min" % _car_restarts_since(now - 900)
+    return " · ".join(["Car auto-report: " + head, road, station,
+                       "session data/car_sessions/" + str(sess.get("file"))])
+
+
+async def _car_auto_file(sess: dict[str, Any], body: dict[str, Any],
+                         kind: str, road_seen: str,
+                         now: float) -> dict[str, Any]:
+    """File the inbox item by the #1471 road: the summary, then the #1379
+    station block (bounded), through pine_append."""
+    rel = "data/car_sessions/" + str(sess.get("file") or "")
+    try:
+        summary = _car_auto_summary(body, sess, kind, road_seen, now)
+    except Exception as exc:  # noqa: BLE001
+        summary = ("Car auto-report: %s · road %s · session %s (the summary "
+                   "failed: %s)" % (kind, road_seen, rel, str(exc)[:80]))
+    text = summary
+    try:
+        text += await asyncio.wait_for(pine_context_block(), 8.0)
+    except Exception:  # noqa: BLE001
+        pass
+    pine_id: Any = None
+    err = ""
+    try:
+        item = await pine_append(text)
+        pine_id = item.get("id")
+    except Exception as exc:  # noqa: BLE001
+        err = str(exc)[:200]
+    note: dict[str, Any] = {"kind": "auto_report", "at": round(now, 3),
+                            "id": pine_id, "trouble": kind,
+                            "summary": summary}
+    if err:
+        note["error"] = err
+    try:
+        await _car_io(_car_session_append, sess["file"], [note])
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        pipeline_log("car", "car auto-report%s: %s" % (
+            (" filed as #%s" % pine_id) if pine_id else " NOT filed",
+            summary[:160]))
+    except Exception:  # noqa: BLE001
+        pass
+    out: dict[str, Any] = {"id": pine_id, "file": rel}
+    if err:
+        out["error"] = err
+    return out
+
+
+async def _car_read_body(request: Request, cap: int, what: str) -> bytes:
+    try:
+        declared = int(request.headers.get("content-length") or 0)
+    except ValueError:
+        declared = 0
+    if declared > cap:
+        raise HTTPException(status_code=413, detail="%s is at most %d KB"
+                            % (what, cap // 1024))
+    buf = bytearray()
+    async for chunk in request.stream():
+        buf.extend(chunk)
+        if len(buf) > cap:
+            raise HTTPException(status_code=413, detail="%s is at most %d KB"
+                                % (what, cap // 1024))
+    return bytes(buf)
+
+
+@app.post("/api/car/telemetry")
+async def car_telemetry_api(
+    request: Request,
+    t: str = "",
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1476: one batch of the drive's telemetry, filed beside the station's
+    own view of the same minutes, in data/car_sessions/<date>_<sid>.jsonl.
+    A batch carrying trouble files a Pine report by itself (one per drive
+    per ten minutes; a different kind of trouble after three)."""
+    require_listen_auth(t, authorization)
+    raw = await _car_read_body(request, CAR_TELEMETRY_MAX_BYTES,
+                               "a telemetry batch")
+    try:
+        body = await _car_io(json.loads, raw or b"{}")
+    except Exception:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail="the batch must be JSON")
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400,
+                            detail="the batch must be an object")
+    sid = str(body.get("sid") or "")
+    if not _CAR_SID_RE.match(sid):
+        raise HTTPException(status_code=400,
+                            detail="sid must be 6-40 of A-Z a-z 0-9 _ -")
+    now = time.time()
+    # Claimed before any await, so two batches in flight cannot both pass.
+    if now - _CAR_LAST_POST.get(sid, 0.0) < CAR_TELEMETRY_MIN_GAP_S:
+        raise HTTPException(status_code=429,
+                            detail="one batch per %.0f s per drive"
+                            % CAR_TELEMETRY_MIN_GAP_S,
+                            headers={"Retry-After": "4"})
+    _CAR_LAST_POST[sid] = now
+    if len(_CAR_LAST_POST) > 2 * _CAR_SESS_MAX:
+        for k in [k for k, v in _CAR_LAST_POST.items() if now - v > 3600]:
+            _CAR_LAST_POST.pop(k, None)
+    road_seen = _request_road(request)
+    try:
+        addr = str(getattr(request.client, "host", "") or "")
+    except Exception:  # noqa: BLE001
+        addr = ""
+    try:
+        xff = str(request.headers.get("x-forwarded-for")
+                  or "").split(",")[0].strip()[:64]
+    except Exception:  # noqa: BLE001
+        xff = ""
+    tail = str(t or "")[-12:] or "-"
+    boot_id = _car_boot_id()
+    sess = await _car_session_get(sid, t, road_seen, now)
+    since = float(sess.get("last_at") or 0.0)
+    if not since:
+        since = now - 60.0
+    since = max(since, now - 900.0)
+
+    station: dict[str, Any] = {}
+    try:
+        station["pulse"] = _car_pulse_compact(max(5.0, min(600.0,
+                                                           now - since)))
+    except Exception as exc:  # noqa: BLE001
+        station["pulse"] = {"error": str(exc)[:120]}
+    try:
+        fn = getattr(STATION_STREAM, "hls_ledger", None)
+        station["hls_since_last"] = (_car_ledger_compact(
+            fn(tail, limit=200), since) if callable(fn) else [])
+    except Exception as exc:  # noqa: BLE001
+        station["hls_since_last"] = {"error": str(exc)[:120]}
+    try:
+        station["listener"] = _car_listener_row(tail)
+    except Exception as exc:  # noqa: BLE001
+        station["listener"] = {"error": str(exc)[:120]}
+    trouble = body.get("trouble") if isinstance(body.get("trouble"),
+                                                dict) else None
+    events = body.get("events") if isinstance(body.get("events"),
+                                              list) else []
+    row: dict[str, Any] = {
+        "kind": "batch", "at": round(now, 3), "seq": body.get("seq"),
+        "v": body.get("v"), "sid": sid, "tail": tail,
+        "road_seen": road_seen, "addr": addr, "xff": xff, "boot_id": boot_id,
+        "page": body.get("page") if isinstance(body.get("page"), dict) else {},
+        "samples": (body.get("samples") if isinstance(body.get("samples"),
+                                                      list) else []),
+        "events": events, "trouble": trouble,
+        "queued_s": body.get("queued_s"), "station": station}
+    prev_road = str(sess.get("road") or "")
+    if prev_road and prev_road != road_seen:
+        row["road_changed_from"] = prev_road
+    _car_note_road(sess, events, trouble, road_seen, now)
+    sess.update({"last_at": now, "road": road_seen, "boot_id": boot_id,
+                 "batches": int(sess.get("batches") or 0) + 1})
+    store_error = ""
+    try:
+        await _car_io(_car_batch_store, sess["file"], row, since, now)
+    except Exception as exc:  # noqa: BLE001
+        store_error = str(exc)[:200]
+    auto: dict[str, Any] | None = None
+    kind = _car_trouble_kind(body)
+    if kind and _car_auto_due(sess, kind, now):
+        sess["auto_at"] = now             # claimed before the filing awaits
+        sess["auto_kind"] = kind
+        auto = await _car_auto_file(sess, body, kind, road_seen, now)
+    out: dict[str, Any] = {
+        "ok": not store_error, "road_seen": road_seen,
+        "addr_seen": xff or addr, "boot_id": boot_id,
+        "server_ms": int(time.time() * 1000), "auto_report": auto,
+        "file": "data/car_sessions/" + str(sess.get("file") or "")}
+    if store_error:
+        out["error"] = store_error
+    return out
+
+
+def _car_voice_save(path: Path, data: bytes) -> None:
+    """BLOCKING: the note, whole-or-not."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_bytes(data)
+    os.replace(tmp, path)
+
+
+def _car_voice_transcode(path: str) -> bytes:
+    """BLOCKING: the phone's note (AAC in MP4 from Safari, Opus in WebM
+    elsewhere) as 16 kHz mono 16-bit WAV - the one shape whisper hears words
+    in (see whisper_transcribe). Raw PCM out of ffmpeg and the header written
+    here: ffmpeg writing WAV into a pipe cannot seek back to fill the sizes
+    in. No preexec_fn: it forces fork() under the GIL (2026-09-27)."""
+    try:
+        import imageio_ffmpeg
+        exe = imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:  # noqa: BLE001
+        exe = shutil.which("ffmpeg") or "ffmpeg"
+    proc = subprocess.run(
+        [exe, "-hide_banner", "-loglevel", "error", "-nostdin", "-i", path,
+         "-ac", "1", "-ar", "16000", "-f", "s16le", "-"],
+        capture_output=True, timeout=20)
+    if proc.returncode != 0 or not proc.stdout:
+        why = (proc.stderr or b"").decode("utf-8", "replace").strip()
+        raise RuntimeError("ffmpeg could not read the note: %s"
+                           % (why[-200:] or "no audio in it"))
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(16000)
+        w.writeframes(proc.stdout)
+    return buf.getvalue()
+
+
+def _car_report_attach_voice(name: str, voice: dict[str, Any]) -> bool:
+    """BLOCKING: the transcript onto the car report it belongs to, the file
+    rewritten whole-or-not. `voice` is the latest; `voices` keeps them all."""
+    path = CAR_REPORTS_DIR / name
+    if not path.is_file():
+        return False
+    doc = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(doc, dict):
+        return False
+    doc["voice"] = voice
+    kept = doc.get("voices") if isinstance(doc.get("voices"), list) else []
+    doc["voices"] = kept + [voice]
+    tmp = path.with_name(path.name + ".voice.tmp")
+    tmp.write_text(json.dumps(doc, default=str, ensure_ascii=False),
+                   encoding="utf-8")
+    os.replace(tmp, path)
+    return True
+
+
+async def _pine_append_spoken(pine_id: int, text: str, file_rel: str) -> bool:
+    """#1476: '> spoken: <words>' onto an inbox item - pine_edit's road
+    without the HTTP: the same lock, the same guarded write. The line goes
+    above the station block and the attachments, so the gist and the
+    attachment reader still find them where they expect."""
+    words = " ".join(str(text or "").split())
+    line = "> spoken: %s (audio %s)" % (words or "(no words made out)",
+                                        file_rel)
+    async with _pine_lock:
+        items = pine_read()
+        it = next((r for r in items
+                   if int(r.get("id") or 0) == int(pine_id)), None)
+        if it is None:
+            return False
+        body = str(it.get("text") or "")
+        cut = len(body)
+        i = body.find(PINE_CONTEXT_MARK)
+        if i >= 0:
+            cut = min(cut, i)
+        att = _PINE_ATTACH_RE.search(body)
+        if att:
+            cut = min(cut, att.start())
+        new = body[:cut].rstrip() + "\n\n" + line + body[cut:]
+        new = "\n".join(("​" + ln) if ln.startswith("## #") else ln
+                        for ln in new.strip().split("\n"))
+        it["text"] = new
+        ok = pine_write(items, "a spoken car note")          # [#1255]
+    return bool(ok)
+
+
+@app.post("/api/car/voice")
+async def car_voice_api(
+    request: Request,
+    t: str = "",
+    authorization: str | None = Header(default=None),
+) -> Any:
+    """#1476: a spoken note from the car. A driver cannot type, so the note
+    is kept as audio (data/car_reports/voice/), transcribed by the house
+    whisper, and the words go onto the report it was spoken for and onto
+    its inbox item. When whisper fails the audio is still kept and still
+    referenced; the answer is then 503 with the file."""
+    require_listen_auth(t, authorization)
+    raw = await _car_read_body(request, CAR_VOICE_MAX_B64 + 16 * 1024,
+                               "a voice note")
+    try:
+        body = await _car_io(json.loads, raw or b"{}")
+    except Exception:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail="the note must be JSON")
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400,
+                            detail="the note must be an object")
+    b64 = str(body.get("b64") or "")
+    if b64.startswith("data:") and "," in b64[:120]:
+        b64 = b64.split(",", 1)[1]
+    if not b64:
+        raise HTTPException(status_code=400, detail="no audio in the note")
+    if len(b64) > CAR_VOICE_MAX_B64:
+        raise HTTPException(status_code=413,
+                            detail="a voice note is at most 700 KB of base64")
+    now = time.time()
+    _CAR_VOICE_RECENT[:] = [x for x in _CAR_VOICE_RECENT if now - x < 3600]
+    if len(_CAR_VOICE_RECENT) >= 120 or (
+            _CAR_VOICE_RECENT and now - _CAR_VOICE_RECENT[-1] < 2.0):
+        raise HTTPException(status_code=429,
+                            detail="too many voice notes just now")
+    _CAR_VOICE_RECENT.append(now)
+    try:
+        data = await _car_io(base64.b64decode, b64)
+    except Exception:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail="the audio is not base64")
+    if len(data) < 200:
+        raise HTTPException(status_code=400, detail="too little audio")
+    sid = str(body.get("sid") or "")
+    sid_ok = bool(_CAR_SID_RE.match(sid))
+    mime = str(body.get("mime") or "").lower()[:80]
+    if data[4:8] == b"ftyp":
+        ext = "m4a"
+    elif data[:4] == b"\x1a\x45\xdf\xa3":
+        ext = "webm"
+    else:
+        ext = "webm" if ("webm" in mime or "ogg" in mime) else "m4a"
+    name = "%s_%s.%s" % (time.strftime("%Y-%m-%d_%H-%M-%S",
+                                       time.localtime(now)),
+                         sid if sid_ok else "nosid", ext)
+    rel = "data/car_reports/voice/" + name
+    try:
+        await _car_io(_car_voice_save, CAR_VOICE_DIR / name, data)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail="the note could not be "
+                            "kept (%s)" % str(exc)[:120])
+    text = ""
+    detail = ""
+    error = ""
+    transcode_ms = whisper_ms = 0
+    t0 = time.monotonic()
+    wav = b""
+    try:
+        wav = await _car_io(_car_voice_transcode, str(CAR_VOICE_DIR / name))
+    except Exception as exc:  # noqa: BLE001
+        error = "transcode: " + str(exc)[:200]
+    transcode_ms = int((time.monotonic() - t0) * 1000)
+    if not error:
+        t1 = time.monotonic()
+        try:
+            got = await whisper_transcribe(wav, timeout=30.0)
+            if got.get("ok"):
+                text = str(got.get("text") or "").strip()
+                detail = str(got.get("detail") or "")
+            else:
+                error = "whisper: " + str(got.get("detail")
+                                          or "no transcript")[:200]
+        except Exception as exc:  # noqa: BLE001
+            error = "whisper: %s" % (str(exc)[:200] or type(exc).__name__)
+        whisper_ms = int((time.monotonic() - t1) * 1000)
+    voice = {"file": rel, "text": text, "at": round(now, 3),
+             "seconds": body.get("seconds")}
+    if error:
+        voice["error"] = error
+    attached: dict[str, Any] = {}
+    report_file = str(body.get("report_file") or "").strip().rsplit("/", 1)[-1]
+    if report_file and _CAR_REPORT_NAME_RE.match(report_file):
+        try:
+            attached["report"] = await _car_io(_car_report_attach_voice,
+                                               report_file, voice)
+        except Exception as exc:  # noqa: BLE001
+            attached["report_error"] = str(exc)[:160]
+    try:
+        pid = (int(body.get("pine_id"))
+               if body.get("pine_id") not in (None, "") else None)
+    except (TypeError, ValueError):
+        pid = None
+    if pid is not None:
+        try:
+            attached["pine"] = await _pine_append_spoken(
+                pid, text if not error else "(not transcribed: %s)"
+                % error[:80], rel)
+        except Exception as exc:  # noqa: BLE001
+            attached["pine_error"] = str(exc)[:160]
+    if sid_ok:
+        try:
+            await _car_session_note(sid, t, _request_road(request), {
+                "kind": "voice", "at": round(now, 3), "sid": sid,
+                "file": rel, "text": text, "seconds": body.get("seconds"),
+                "mime": mime, "bytes": len(data),
+                "report_file": report_file or None, "pine_id": pid,
+                "transcode_ms": transcode_ms, "whisper_ms": whisper_ms,
+                **({"error": error} if error else {})})
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        pipeline_log("car", "car voice note %s: %s" % (
+            rel, (error or text or "(no words)")[:160]))
+    except Exception:  # noqa: BLE001
+        pass
+    if error:
+        return Response(content=json.dumps({"ok": False, "file": rel,
+                                            "error": error, "text": "",
+                                            "attached": attached}),
+                        status_code=503, media_type="application/json")
+    out: dict[str, Any] = {"ok": True, "text": text, "file": rel,
+                           "attached": attached,
+                           "transcode_ms": transcode_ms,
+                           "whisper_ms": whisper_ms}
+    if not text and detail:
+        out["detail"] = detail
+    return out
+
+
+@app.get("/api/car/boots")
+async def car_boots_api(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1476: the restart log, newest first (the last fifty lines)."""
+    require_read_auth(authorization)
+    rows = await _car_io(_car_jsonl_tail, BOOT_LOG_PATH, 64 * 1024)
+    return {"boots": list(reversed(rows[-50:])), "boot_id": _car_boot_id(),
+            "file": "data/boot_log.jsonl"}
+
+
+def _car_session_summary(path: Path) -> dict[str, Any]:
+    """BLOCKING: one drive in a line, cached on (size, mtime)."""
+    st = path.stat()
+    hit = _CAR_SUMMARY_CACHE.get(path.name)
+    if hit and hit[0] == st.st_size and hit[1] == st.st_mtime:
+        return hit[2]
+    m = _CAR_SESSION_FILE_RE.match(path.name)
+    out: dict[str, Any] = {
+        "sid": m.group(2) if m else "", "file": "data/car_sessions/"
+        + path.name, "first": None, "last": None, "batches": 0,
+        "samples": 0, "events": 0, "troubles": {}, "roads": [],
+        "token_tail": "", "voice": 0, "auto_reports": 0, "reports": 0,
+        "bytes": st.st_size}
+    with open(path, "rb") as fh:
+        for ln in fh:
+            try:
+                r = json.loads(ln)
+            except Exception:  # noqa: BLE001
+                continue
+            if not isinstance(r, dict):
+                continue
+            at = _car_epoch(r.get("at"))
+            if at:
+                out["first"] = at if out["first"] is None else min(
+                    out["first"], at)
+                out["last"] = at if out["last"] is None else max(
+                    out["last"], at)
+            kind = r.get("kind")
+            if kind == "batch":
+                out["batches"] += 1
+                out["samples"] += len(r.get("samples") or [])
+                out["events"] += len(r.get("events") or [])
+                tr = r.get("trouble")
+                if isinstance(tr, dict) and tr.get("kind"):
+                    k = str(tr.get("kind"))[:24]
+                    out["troubles"][k] = out["troubles"].get(k, 0) + 1
+                rd = str(r.get("road_seen") or "")
+                if rd and (not out["roads"] or out["roads"][-1] != rd):
+                    out["roads"].append(rd)
+                out["token_tail"] = str(r.get("tail") or out["token_tail"])
+            elif kind == "voice":
+                out["voice"] += 1
+            elif kind == "auto_report":
+                out["auto_reports"] += 1
+            elif kind == "report":
+                out["reports"] += 1
+    if len(_CAR_SUMMARY_CACHE) > 500:
+        _CAR_SUMMARY_CACHE.clear()
+    _CAR_SUMMARY_CACHE[path.name] = (st.st_size, st.st_mtime, out)
+    return out
+
+
+def _car_sessions_list(limit: int = 50) -> dict[str, Any]:
+    """BLOCKING: the newest drives first."""
+    try:
+        files = [p for p in CAR_SESSIONS_DIR.iterdir()
+                 if _CAR_SESSION_FILE_RE.match(p.name)]
+    except FileNotFoundError:
+        files = []
+    files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    out: list[dict[str, Any]] = []
+    for p in files[:limit]:
+        try:
+            out.append(_car_session_summary(p))
+        except Exception as exc:  # noqa: BLE001
+            out.append({"file": "data/car_sessions/" + p.name,
+                        "error": str(exc)[:160]})
+    return {"sessions": out, "count": len(files), "dir": "data/car_sessions"}
+
+
+@app.get("/api/car/sessions")
+async def car_sessions_api(
+    limit: int = 50,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1476: every recorded drive, newest first, one line each."""
+    require_read_auth(authorization)
+    return await _car_io(_car_sessions_list, max(1, min(200, int(limit or 50))))
+
+
+def _car_timeline_mod() -> Any:
+    """BLOCKING: tools/car_timeline.py, loaded from disk on each call - the
+    one merge, shared with the terminal tool, so the two cannot disagree
+    and an edit to it is live without a restart."""
+    import importlib.util
+    path = Path(__file__).resolve().parent / "tools" / "car_timeline.py"
+    spec = importlib.util.spec_from_file_location("pine_car_timeline", path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError("tools/car_timeline.py is missing")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _car_session_timeline(sid: str, with_rows: bool) -> dict[str, Any] | None:
+    """BLOCKING: one drive, merged with the station's ledgers."""
+    ct = _car_timeline_mod()
+    path = None
+    try:
+        for p in CAR_SESSIONS_DIR.iterdir():
+            m = _CAR_SESSION_FILE_RE.match(p.name)
+            if m and m.group(2) == sid and (path is None or p.name > path.name):
+                path = p
+    except FileNotFoundError:
+        return None
+    if path is None:
+        return None
+    rows = ct.load_session(path)
+    tl = ct.build_timeline(rows, DATA_DIR)
+    sm = ct.summarize(rows, tl)
+    out: dict[str, Any] = {
+        "sid": sid, "file": "data/car_sessions/" + path.name,
+        "header": ct.header_lines("data/car_sessions/" + path.name, rows, tl,
+                                  sm),
+        "summary": sm, "from": tl.get("from"), "to": tl.get("to"),
+        "tails": tl.get("tails"), "timeline": tl.get("entries") or []}
+    if with_rows:
+        out["rows"] = rows
+    return out
+
+
+@app.get("/api/car/sessions/{sid}")
+async def car_session_get_api(
+    sid: str,
+    rows: int = 1,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1476: one drive - its rows (?rows=0 leaves them out) and the merged
+    timeline: phone samples and events, each batch's station view, the HLS
+    ledger for the drive's token, dead-air gaps and restarts, by time."""
+    require_read_auth(authorization)
+    if not _CAR_SID_RE.match(sid):
+        raise HTTPException(status_code=400, detail="not a drive id")
+    got = await _car_io(_car_session_timeline, sid, bool(rows))
+    if got is None:
+        raise HTTPException(status_code=404, detail="no such drive")
+    return got
+
+
+async def _hls_ensure_for_player(rate: int, mix: Any,
+                                 token: str) -> Path | None:
+    """#1476: A PLAYER THAT ASKS GETS A LANE.
+
+    A locked iPhone's native player keeps re-reading the variant playlist it
+    was handed, and after a station restart that lane is not running. The
+    old answer, 404, is terminal for it: it gives up on the stream, and with
+    the screen locked no page script is awake to hand it a new one - the
+    first real drive went quiet for twenty minutes that way. So a variant
+    request carrying a LIVE tune-in token starts the lane (the stream module
+    caps and validates, and waits up to eight seconds for the playlist) and
+    is answered with it. On a pool of its own: this waits, and the shared
+    executor is where the station's own stalls queue.
+
+    The mix goes through RAW (the path's three numbers, or ?mix=): the
+    stream module reads it strictly (hls_parse_mix), where listener_mix()
+    would forgive junk into the station's own lane - right for shaping a
+    frame, wrong for spending an ffmpeg on a forged URL."""
+    if not listen_ok(token):
+        return None
+    fn = getattr(STATION_STREAM, "hls_ensure", None)
+    if not callable(fn):
+        return None
+    want = mix
+    try:
+        import inspect
+        if inspect.iscoroutinefunction(fn):
+            got = await asyncio.wait_for(
+                fn(rate, want, split=False, wait_s=8.0), 10.0)
+        else:
+            if not _HLS_ENSURE_BOX:
+                from concurrent.futures import ThreadPoolExecutor
+                _HLS_ENSURE_BOX.append(ThreadPoolExecutor(
+                    max_workers=4, thread_name_prefix="hls-ensure"))
+            got = await asyncio.wait_for(
+                asyncio.get_running_loop().run_in_executor(
+                    _HLS_ENSURE_BOX[0],
+                    lambda: fn(rate, want, split=False, wait_s=8.0)), 10.0)
+    except Exception as exc:  # noqa: BLE001
+        print("[stream] #1476 lane for a player (%sk %s) failed: %s"
+              % (rate, mix, str(exc)[:160]), flush=True)
+        return None
+    if not got:
+        return None
+    path = Path(got)
+    if not path.is_file():
+        return None
+    print("[stream] #1476 lane %sk %s answered for a player (..%s)"
+          % (rate, want if isinstance(want, str) else "-".join(
+              str(x) for x in (want or ())), str(token)[-6:]), flush=True)
+    return path
 
 
 PWA_ICON_SIZES = (180, 192, 512)
@@ -153755,16 +155491,37 @@ def dj_video_late(now_ms: int, lag_ms: int = 0) -> list[dict[str, Any]]:
     return out[first:first + 12]
 
 
-def _hls_start_offset_s(mix: Any = None) -> float:
+def _hls_start_offset_s(mix: Any = None, away: bool = False) -> float:
     """#1475: how far behind live the ABR HLS lane starts a player, per
-    the stream module; 0.0 when the module has no such lane."""
+    the stream module; 0.0 when the module has no such lane.
+
+    #1476: `away` - a player on the tailnet or the funnel (a phone in a
+    car) is started further back, by as much as the stream module says
+    (45 s against 30): those roads drop for longer than the house Wi-Fi
+    ever does, and the cushion is the whole defence. Passed only to a
+    module whose function takes it."""
     fn = getattr(STATION_STREAM, "hls_start_offset_s", None)
     if not callable(fn):
         return 0.0
+    call = fn
+    if away and _hls_takes_kwarg(fn, "away"):
+        call = (lambda *a, **k: fn(*a, away=True, **k))
     try:
-        return max(0.0, float(_hls_mix_call(fn, mix) or 0.0))
+        return max(0.0, float(_hls_mix_call(call, mix) or 0.0))
     except Exception:  # noqa: BLE001
         return 0.0
+
+
+def _hls_takes_kwarg(fn: Any, name: str) -> bool:
+    """#1476: feature detection by signature, not by catching TypeError -
+    a TypeError raised INSIDE the callee must not read as 'old module'."""
+    try:
+        import inspect
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+    return name in params or any(
+        p.kind == p.VAR_KEYWORD for p in params.values())
 
 
 def dj_video_burst_s() -> float:
@@ -158604,7 +160361,29 @@ async def sfx_file(
     # Levelled on the way out, so a hot sample does not out-shout the DJ who
     # set it up (#220). Both outputs fetch through here, so both get it.
     raw = path
-    path = await asyncio.to_thread(sfx_levelled, path)
+    # [#1477-route] A MISS IS LEVELLED NOW, not served raw and queued: the
+    # clip's job is started (or joined) and waited on for SFX_LEVEL_WAIT,
+    # off the loop. Only if that runs out does it go out as shot - counted
+    # - and the rest of THAT airing's byte ranges come from the same raw
+    # file, never from a copy that appeared halfway through it.
+    _from = re.match(r"\s*bytes=(\d+)-",
+                     str(request.headers.get("range") or ""))
+    _later = bool(_from and int(_from.group(1)) > 0)
+    if _later and _SFX_RAW_PIN.get(sfx_key, 0.0) > time.time():
+        _how = "raw"
+    else:
+        path, _how = await sfx_level_for_air(raw, SFX_LEVEL_WAIT)
+        if _how == "raw":
+            if len(_SFX_RAW_PIN) > 500:
+                _now_pin = time.time()
+                for _k in [k for k, v in _SFX_RAW_PIN.items() if v < _now_pin]:
+                    _SFX_RAW_PIN.pop(_k, None)
+            _SFX_RAW_PIN[sfx_key] = time.time() + SFX_RAW_PIN_S
+    if not _later:
+        try:
+            await asyncio.to_thread(sfx_served_note, sfx_key, raw, path, _how)
+        except Exception:  # noqa: BLE001
+            pass
     # #1263: SFX_TYPES, not MUSIC_TYPES - a video served as
     # application/octet-stream under the nosniff header below is a clip
     # the browser refuses to decode.
@@ -158778,6 +160557,7 @@ async def dj_sfx_play(
         raise HTTPException(status_code=404, detail="No such sample")
     key = sfx_id(path)
     signature = media_sign(key)
+    await sfx_level_for_air(path)           # [#1477-play] levelled first
     # #1339: the button that proves the wiring proves this part of it too.
     await asyncio.to_thread(
         admission_admit_line, {"path": f"/sfx/{key}", "sig": signature},
@@ -165836,6 +167616,7 @@ async def sfx_video_cue_api(
                        "enough, unbanned and carrying sound"}
     key = sfx_id(pick)
     signature = media_sign(key)
+    await sfx_level_for_air(pick)           # [#1477-cue] levelled first
     # #1362e: a book pick already knows its length; only the old road
     # has to go and look, and only the old road may touch the share.
     seconds = (round(_book_secs, 2) if (_book is not None and _book_secs > 0)
@@ -196774,6 +198555,305 @@ used. Right: colour by how recently — newest red/yellow, oldest white/blue.">
 </div>
 
 <script>
+/* #1477: A RESTART MUST NOT BLAST THE LISTENER.
+ *
+ * Measured 2026-09-27: a container restart reloads this page on the tablet
+ * (and the desk), and for the first seconds of the new page every stage of
+ * the audio chain sat at a DEFAULT instead of at the operator's level:
+ *
+ *   - audioScope() wired source -> analyser -> speakers at full level,
+ *     until gainFor() re-routed it through a GainNode;
+ *   - that GainNode was born at the Web Audio default, 1.0;
+ *   - djLevels() read sliders whose HTML defaults are 100% and 160%, and
+ *     the stored levels (music 29%, voice 47%) were put back only at the
+ *     very end of this script - and on the tablet the canonical level bus
+ *     (audio-law.js, window.pineLevels) arrives later still, at
+ *     onPageFinished.
+ *
+ * About eleven decibels over his setting, in his headphones, on every
+ * restart. Fixed by construction rather than by timing:
+ *
+ *   1. ONE GATE PER AUDIO CONTEXT between the graph and the speakers. It is
+ *      born at 0 and ramps to 1 (setTargetAtTime, 0.4 s) only once the
+ *      stored levels are known to be applied: window.pineLevelsReady.
+ *   2. A GainNode is BORN at the stored level for its kind, never at 1.0.
+ *   3. The sliders are restored from storage HERE, before anything below
+ *      can read them, so djLevels() never answers 100/160 while a stored
+ *      level exists. djLoadLevels() still restores them later, as before.
+ *   4. An <audio>/<video> that starts before then starts at volume 0 and
+ *      ramps to the volume it was given once the levels are in; a volume
+ *      written to it meanwhile is remembered, not heard.
+ *
+ * READY = sliders restored, the first djApplyGain() done, and - where a
+ * level owner outside this script is on its way (the kiosk's audio law,
+ * the desk shell's volume script) - that owner has spoken. Four seconds is
+ * the hard fallback: a gate that can stay shut is a silent radio. Nothing
+ * here moves a level after READY; the audio law owns them from then on. */
+const PINE_LEVEL_T0 = Date.now();
+const PINE_LEVEL_FALLBACK_MS = 4000;
+const PINE_LEVEL_OPEN_TC = 0.4;
+const PINE_LEVEL_RAMP_MS = 900;
+const PINE_LEVEL_GATE = {restore: false, gain: false, open: false, why: "",
+                         at: 0, held: [], pending: [], gates: new WeakMap()};
+const PINE_LEVEL_RAF = typeof window.requestAnimationFrame === "function"
+  ? window.requestAnimationFrame.bind(window) : null;
+const PINE_LEVEL_VOLUME = (window.HTMLMediaElement
+  && Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, "volume")) || null;
+const PINE_LEVEL_PLAY = window.HTMLMediaElement
+  ? HTMLMediaElement.prototype.play : null;
+let pineLevelsReadyResolve = null;
+window.pineLevelsReady = new Promise((resolve) => { pineLevelsReadyResolve = resolve; });
+window.pineLevelsReadyNow = () => PINE_LEVEL_GATE.open;
+window.pineLevelGateState = () => ({
+  open: PINE_LEVEL_GATE.open, why: PINE_LEVEL_GATE.why, at_ms: PINE_LEVEL_GATE.at,
+  restore: PINE_LEVEL_GATE.restore, gain: PINE_LEVEL_GATE.gain,
+  held: PINE_LEVEL_GATE.held.length, waiting: PINE_LEVEL_GATE.pending.length});
+
+/* A timer that still fires on the tablet, whose WebView can suspend JS
+ * timers while rAF keeps running: whichever of the two comes first. */
+function pineLevelTick(fn, ms) {
+  let done = false;
+  const due = Date.now() + (ms || 0);
+  const go = () => { if (done) return; done = true; fn(); };
+  try { setTimeout(go, ms || 0); } catch (e) { /* the frame below */ }
+  if (PINE_LEVEL_RAF) {
+    const frame = () => {
+      if (done) return;
+      if (Date.now() >= due) go(); else PINE_LEVEL_RAF(frame);
+    };
+    try { PINE_LEVEL_RAF(frame); } catch (e) { /* the timer above */ }
+  }
+}
+
+/* The operator's stored sliders, back BEFORE anything reads them.
+ * Idempotent; djLevels() calls it too, so no road can get in first. */
+function pineLevelSlidersRestore() {
+  if (PINE_LEVEL_GATE.restore) return true;
+  const music = document.getElementById("djGainMusic");
+  const voice = document.getElementById("djGainVoice");
+  const duck = document.getElementById("djDuck");
+  if (!music || !voice || !duck) return false;   /* not parsed yet */
+  let saved = null;
+  try { saved = JSON.parse(localStorage.getItem("djLevels") || "null"); } catch (e) { saved = null; }
+  if (!saved || typeof saved !== "object") {
+    /* a browser that only ever had the canonical store */
+    try {
+      const law = JSON.parse(localStorage.getItem("pineListenerLevels") || "null");
+      saved = law && typeof law === "object" ? {music: law.music, voice: law.voice} : null;
+    } catch (e) { saved = null; }
+  }
+  const put = (input, value, top) => {
+    const n = Number(value);
+    if (value === undefined || value === null || !Number.isFinite(n)) return;
+    input.value = String(Math.round(Math.max(0, Math.min(top, n)) * 100));
+    const shown = document.getElementById(input.id + "Val");
+    if (shown) shown.textContent = input.value + "%";
+  };
+  if (saved) {
+    put(music, saved.music, 2);
+    put(voice, saved.voice, 2);
+    put(duck, saved.duck, 0.9);
+  }
+  PINE_LEVEL_GATE.restore = true;
+  return true;
+}
+
+/* THE STORED LEVEL for one kind, the way it is actually applied: the bus
+ * when it is here, the canonical store when it is not yet, and otherwise
+ * this panel's own slider times its mixer - never an HTML default while
+ * anything is stored. Self-contained: it may run before the rest of this
+ * script has defined its constants. */
+function pineLevelStored(kind) {
+  const clamp = (v) => Math.max(0, Math.min(2, v));
+  try {
+    const bus = window.pineLevels;
+    if (bus && typeof bus.get === "function") {
+      const v = Number((bus.get() || {})[kind]);
+      if (Number.isFinite(v)) return clamp(v);
+    }
+  } catch (e) { /* the store below */ }
+  try {
+    const law = JSON.parse(localStorage.getItem("pineListenerLevels") || "null");
+    const v = law ? Number(law[kind]) : NaN;
+    if (Number.isFinite(v)) return clamp(v);
+  } catch (e) { /* the panel's own pair below */ }
+  let mix = {};
+  try { mix = JSON.parse(localStorage.getItem("pineMixer") || "{}") || {}; } catch (e) { mix = {}; }
+  if (window.__pineDesktopVolume !== undefined) mix = {};
+  const cut = (k) => { const n = Number(mix[k]); return Number.isFinite(n) ? clamp(n) : 1; };
+  pineLevelSlidersRestore();
+  const slider = (id, fallback) => {
+    const input = document.getElementById(id);
+    const n = input ? Number(input.value) / 100 : NaN;
+    return Number.isFinite(n) ? n : fallback;
+  };
+  if (kind === "music") return clamp(slider("djGainMusic", 1) * cut("music"));
+  if (kind === "voice") return clamp(slider("djGainVoice", 1.6) * cut("voice"));
+  if (kind === "sfx") return clamp(slider("djGainVoice", 1.6) * cut("sfx"));
+  return cut("video");
+}
+
+/* What a new GainNode for `which` is born at (gainFor). */
+function pineLevelStart(which, player) {
+  let kind = "music";
+  if (String(which || "").indexOf("voice") === 0) {
+    kind = player && player.dataset && player.dataset.pineSting === "1" ? "sfx" : "voice";
+  }
+  const v = pineLevelStored(kind);
+  return Number.isFinite(v) ? v : 0;
+}
+
+/* THE GATE: one per AudioContext, the last node before the speakers. */
+function pineLevelGate(context) {
+  if (!context) return null;
+  const known = PINE_LEVEL_GATE.gates.get(context);
+  if (known) return known;
+  try {
+    const node = context.createGain();
+    node.gain.value = PINE_LEVEL_GATE.open ? 1 : 0;
+    node.connect(context.destination);
+    PINE_LEVEL_GATE.gates.set(context, node);
+    if (!PINE_LEVEL_GATE.open) PINE_LEVEL_GATE.pending.push(node);
+    return node;
+  } catch (e) {
+    return null;
+  }
+}
+
+function pineLevelGatesOpen() {
+  PINE_LEVEL_GATE.pending.splice(0).forEach((node) => {
+    try {
+      const at = node.context.currentTime;
+      node.gain.cancelScheduledValues(at);
+      node.gain.setValueAtTime(node.gain.value, at);
+      node.gain.setTargetAtTime(1, at, PINE_LEVEL_OPEN_TC);
+      node.gain.setValueAtTime(1, at + PINE_LEVEL_OPEN_TC * 10);
+    } catch (e) {
+      try { node.gain.value = 1; } catch (e2) { /* a closed context */ }
+    }
+  });
+}
+
+/* An element that starts before READY: silent, and every volume written
+ * to it meanwhile is remembered as the one to ramp to. */
+function pineLevelHold(media) {
+  if (PINE_LEVEL_GATE.open || !media || media.__pineLevelHeld) return;
+  if (!PINE_LEVEL_VOLUME || !PINE_LEVEL_VOLUME.get || !PINE_LEVEL_VOLUME.set) return;
+  if (!(window.HTMLMediaElement && media instanceof HTMLMediaElement)) return;
+  let want = 1;
+  try { want = PINE_LEVEL_VOLUME.get.call(media); } catch (e) { return; }
+  try {
+    Object.defineProperty(media, "volume", {
+      configurable: true, enumerable: true,
+      get() { return want; },
+      set(value) {
+        const n = Number(value);
+        if (Number.isFinite(n)) want = Math.max(0, Math.min(1, n));
+      },
+    });
+  } catch (e) { return; }
+  media.__pineLevelHeld = {want: () => want};
+  try { PINE_LEVEL_VOLUME.set.call(media, 0); } catch (e) { /* its gate still holds it */ }
+  PINE_LEVEL_GATE.held.push(media);
+}
+
+function pineLevelRelease() {
+  PINE_LEVEL_GATE.held.splice(0).forEach((media) => {
+    const held = media.__pineLevelHeld;
+    if (!held) return;
+    const target = held.want();
+    try { delete media.volume; } catch (e) { /* it keeps the instance property */ }
+    media.__pineLevelHeld = null;
+    const began = Date.now();
+    let wrote = 0;
+    const step = () => {
+      let now = 0;
+      try { now = PINE_LEVEL_VOLUME.get.call(media); } catch (e) { return; }
+      if (Math.abs(now - wrote) > 0.004) return;   /* someone else set it: theirs */
+      const k = Math.min(1, (Date.now() - began) / PINE_LEVEL_RAMP_MS);
+      wrote = target * k;
+      try { PINE_LEVEL_VOLUME.set.call(media, wrote); } catch (e) { return; }
+      if (k < 1) pineLevelTick(step, 30);
+    };
+    step();
+  });
+}
+
+function pineLevelPlay() {
+  try { if (!PINE_LEVEL_GATE.open) pineLevelHold(this); } catch (e) { /* play regardless */ }
+  return PINE_LEVEL_PLAY.apply(this, arguments);
+}
+
+/* Has the owner of this document's levels spoken? The tablet's audio law
+ * is evaluated at onPageFinished; the desk shell injects its volume script
+ * after load. A plain browser owns its own levels. */
+function pineLevelOwnerSpoke() {
+  const desk = window.pineDesktop;
+  if (desk && desk.__pineKiosk) {
+    return !!(window.pineLevels && typeof window.pineLevels.get === "function");
+  }
+  if (desk && typeof desk.clipboardReady === "function") {
+    return window.__pineDesktopVolume !== undefined;
+  }
+  return true;
+}
+
+function pineLevelMark(step) {
+  if (step) PINE_LEVEL_GATE[step] = true;
+  return pineLevelTry(step);
+}
+
+function pineLevelTry(why) {
+  if (PINE_LEVEL_GATE.open) return true;
+  const late = Date.now() - PINE_LEVEL_T0 >= PINE_LEVEL_FALLBACK_MS;
+  if (!late && !(PINE_LEVEL_GATE.restore && PINE_LEVEL_GATE.gain && pineLevelOwnerSpoke())) {
+    return false;
+  }
+  PINE_LEVEL_GATE.open = true;
+  PINE_LEVEL_GATE.why = late ? "fallback" : String(why || "ready");
+  PINE_LEVEL_GATE.at = Date.now() - PINE_LEVEL_T0;
+  /* the stored levels, applied once more with everything present - still
+     behind the gate and the hold, so this is not heard until they are */
+  try {
+    const bus = window.pineLevels;
+    if (bus && typeof bus.refresh === "function") bus.refresh();
+    else if (bus && typeof bus.applyAll === "function" && typeof bus.get === "function") {
+      bus.applyAll(bus.get());
+    }
+  } catch (e) { /* the panel's own apply below still runs */ }
+  try { djApplyGain(); } catch (e) { /* not built: the gate opens regardless */ }
+  pineLevelGatesOpen();
+  pineLevelRelease();
+  try {
+    if (PINE_LEVEL_PLAY && HTMLMediaElement.prototype.play === pineLevelPlay) {
+      HTMLMediaElement.prototype.play = PINE_LEVEL_PLAY;
+    }
+  } catch (e) { /* the wrapper is inert once open */ }
+  try {
+    if (pineLevelsReadyResolve) {
+      pineLevelsReadyResolve({why: PINE_LEVEL_GATE.why, at_ms: PINE_LEVEL_GATE.at});
+    }
+  } catch (e) { /* nobody waiting */ }
+  return true;
+}
+
+pineLevelSlidersRestore();
+try {
+  if (PINE_LEVEL_PLAY) HTMLMediaElement.prototype.play = pineLevelPlay;
+} catch (e) { /* the gate on the graph still holds */ }
+try {
+  document.addEventListener("play", (event) => {
+    if (!PINE_LEVEL_GATE.open) pineLevelHold(event.target);
+  }, true);
+  document.querySelectorAll("audio,video").forEach((media) => {
+    if (!media.paused) pineLevelHold(media);
+  });
+} catch (e) { /* nothing is playing yet */ }
+(function pineLevelWatch() {
+  const look = () => { if (!pineLevelTry("owner")) pineLevelTick(look, 100); };
+  pineLevelTick(look, 100);
+})();
+
 // #1413d: THE TABLET'S PACE, FOR EVERY ANIMATION AT ONCE.
 //
 // Profiled on the PineTab 2026-09-14 (devtools over adb, per-thread
@@ -206325,7 +208405,9 @@ function audioScope(player) {
     analyser.fftSize = 512;
     analyser.smoothingTimeConstant = 0.78;
     source.connect(analyser);
-    analyser.connect(context.destination);
+    /* #1477: through the level gate, never straight to the speakers - shut
+       until the stored levels are applied (the top of this script). */
+    analyser.connect(pineLevelGate(context) || context.destination);
     const scope = {context, analyser, bins: new Uint8Array(analyser.frequencyBinCount)};
     scopes.set(player, scope);
     return scope;
@@ -214290,10 +216372,14 @@ function gainFor(player, which) {
   if (!scope) return null;
   try {
     const node = scope.context.createGain();
-    // Re-route: analyser -> gain -> speakers, instead of analyser -> speakers.
+    /* #1477: BORN AT THE STORED LEVEL for its kind. A GainNode's own
+       default is 1.0 - the operator's music at 100% until the first
+       djApplyGain ramp got there. */
+    node.gain.value = pineLevelStart(which, player);
+    // Re-route: analyser -> gain -> gate -> speakers, not analyser -> speakers.
     try { scope.analyser.disconnect(); } catch (error) { /* first time */ }
     scope.analyser.connect(node);
-    node.connect(scope.context.destination);
+    node.connect(pineLevelGate(scope.context) || scope.context.destination);
     gains[which] = {node, player, context: scope.context};
     return gains[which];
   } catch (error) {
@@ -214302,14 +216388,24 @@ function gainFor(player, which) {
 }
 
 function djLevels() {
-  const read = (id, fallback) => {
+  /* #1477: the stored level, never the HTML's 100/160 while one exists -
+     the sliders are put back before the first read, and a slider that is
+     not there answers from storage. */
+  pineLevelSlidersRestore();
+  let stored;
+  const read = (id, key, fallback) => {
     const el_ = document.getElementById(id);
-    return el_ ? Number(el_.value) : fallback;
+    if (el_) return Number(el_.value);
+    if (stored === undefined) {
+      try { stored = JSON.parse(localStorage.getItem("djLevels") || "null"); } catch (e) { stored = null; }
+    }
+    const v = stored ? Number(stored[key]) : NaN;
+    return Number.isFinite(v) ? v * 100 : fallback;
   };
   return {
-    music: read("djGainMusic", 100) / 100,
-    voice: read("djGainVoice", 160) / 100,
-    duck: read("djDuck", 70) / 100,
+    music: read("djGainMusic", "music", 100) / 100,
+    voice: read("djGainVoice", "voice", 160) / 100,
+    duck: read("djDuck", "duck", 70) / 100,
   };
 }
 
@@ -214529,6 +216625,7 @@ function djApplyGain(transientOnly) {
       }
     });   /* #1419 */
   }
+  pineLevelMark("gain");   /* #1477: the stored levels are applied */
 }
 
 /* PINE MEDIA settings (#405): the playback controls, WinAmp-framed —
@@ -235702,7 +237799,8 @@ async function backlogPlay(url, canvas, btn) {
     const src = ctx.createMediaElementSource(audio);
     const analyser = ctx.createAnalyser();
     analyser.fftSize = 256;
-    src.connect(analyser); analyser.connect(ctx.destination);
+    src.connect(analyser);
+    analyser.connect(pineLevelGate(ctx) || ctx.destination);   /* #1477 */
     const bins = new Uint8Array(analyser.frequencyBinCount);
     const c2 = canvas.getContext("2d");
     let x = 0;
@@ -251918,6 +254016,22 @@ const AWAY = __AWAY__;
  * lan, house or funnel - rather than guessed from a hostname. */
 const ROAD = "__ROAD__";
 window.PINE_ROAD = ROAD;
+/* #1476: the road as it is NOW. ROAD is what the page was served over;
+ * the car diagnostics re-read it from every telemetry answer and set
+ * window.PINE_ROAD (firing "pine-road") when a drive moves from the
+ * tailnet to the funnel and back. The camera follows it; nothing else. */
+function currentRoad() {
+  try { return String(window.PINE_ROAD || ROAD); } catch (e) { return ROAD; }
+}
+/* #1476: what the player does to keep the stream up goes into the drive's
+ * record (frontend/car-diag.js), so "why did it go quiet" has an answer
+ * that does not depend on anybody remembering. Never throws. */
+function carMark(kind, detail) {
+  try {
+    const d = window.PineCarDiag;
+    if (d && typeof d.mark === "function") d.mark(kind, detail || {});
+  } catch (e) { /* the record never interrupts the show */ }
+}
 /* #1253: which player is actually running. "Did it update" should be
  * readable off the screen, not inferred from behaviour. */
 const BUILD = "__BUILD__";
@@ -253815,6 +255929,8 @@ let streamMode = AWAY;          /* on the road, this is the default */
 let radio = null;
 let streamTries = 0;
 let streamTimer = null;
+let streamSrcAt = 0;            /* #1476: when a src was last handed over */
+let streamProbeAt = 0;          /* #1476: the last error probe */
 
 /* #1253: HLS WHERE IT IS NATIVE, mp3 everywhere else.
  *
@@ -254072,6 +256188,7 @@ function startStream() {
   const el = streamElement();
   streamTries = 0;
   streamMixApplied = wantsHls() ? personalMix() : "";
+  streamSrcAt = Date.now();                                /* #1476 */
   el.src = streamUrl();
   el.volume = 1;
   el.play().catch((e) => streamRecover("play: " + (e && e.message)));
@@ -254123,7 +256240,16 @@ function streamRecover(why) {
   if (!playing || !streamMode) return;
   if (streamTimer) return;
   streamTries = Math.min(8, streamTries + 1);
-  const wait = Math.min(15000, 500 * Math.pow(2, streamTries - 1));
+  /* #1476: capped at 8 s (it was 15), and it never gives up - only Stop
+   * ends it. A locked phone does not run this timer at all (the first
+   * real drive went quiet for twenty minutes that way; the wake handlers
+   * below are the cure for that), so the wait only matters while the
+   * page is awake, and awake a listener would rather have the station
+   * back in eight seconds than in fifteen. */
+  const wait = Math.min(8000, 500 * Math.pow(2, streamTries - 1));
+  carMark("reconnect", {n: streamTries, why: String(why || "").slice(0, 160),
+                        wait: wait});
+  if (String(why || "") === "error") streamProbe("error");
   const note = document.getElementById("note");
   if (note) note.textContent = "reconnecting… (" + why + ")";
   streamTimer = setTimeout(() => {
@@ -254131,10 +256257,84 @@ function streamRecover(why) {
     if (!playing || !streamMode) return;
     const el = streamElement();
     try { el.pause(); } catch (e) {}
+    streamSrcAt = Date.now();
     el.src = streamUrl();
     el.play().catch(() => streamRecover("retry"));
   }, wait);
 }
+
+/* #1476: WHAT THE ERROR WAS. An <audio> error says "it failed" and
+ * nothing more; a report has to say 500, 404, 502 or offline. One
+ * no-store fetch of the same URL, abandoned the moment its headers are
+ * in (the mp3 road never ends), at most once every five seconds. */
+function streamProbe(why) {
+  const now = Date.now();
+  if (now - streamProbeAt < 5000) return;
+  streamProbeAt = now;
+  let url = "";
+  try { url = streamUrl(); } catch (e) { url = ""; }
+  if (!url) return;
+  let ctl = null;
+  try { ctl = new AbortController(); } catch (e) { ctl = null; }
+  const timer = setTimeout(() => { try { if (ctl) ctl.abort(); } catch (e) {} }, 10000);
+  fetch(url, {cache: "no-store", signal: ctl ? ctl.signal : undefined}).then((r) => {
+    clearTimeout(timer);
+    carMark("stream_probe", {why: why, status: r.status, ms: Date.now() - now,
+                             online: navigator.onLine, road: currentRoad()});
+    try { if (ctl) ctl.abort(); } catch (e) {}
+  }).catch((e) => {
+    clearTimeout(timer);
+    carMark("stream_probe", {why: why, status: 0, ms: Date.now() - now,
+                             error: String((e && (e.name + ": " + e.message)) || e).slice(0, 160),
+                             online: navigator.onLine, road: currentRoad()});
+  });
+}
+
+/* #1476: THE PAGE WAKES UP LISTENING. iOS stops this page's timers while
+ * the phone is locked and its audio is not playing, so a reconnect that
+ * was waiting simply never happens - twenty minutes of nothing on the
+ * first real drive, until a reload. The moment the page is alive again
+ * (unlocked, back online, restored from the back-forward cache) the
+ * player is looked at, and a stream that is errored, paused under us,
+ * not loaded, or whose playhead has not moved in ten seconds is retried
+ * NOW, not after whatever backoff was pending. */
+function streamWake(why) {
+  if (!playing || !streamMode) return;
+  if (Date.now() - streamSrcAt < 3000) return;        /* a src just went in */
+  let reason = "";
+  const el = radio;
+  if (!el) reason = "no player";
+  else {
+    try {
+      if (el.error) reason = "errored (" + el.error.code + ")";
+      else if (el.paused) reason = "paused";
+      else if (Number(el.readyState || 0) < 2) reason = "readyState " + el.readyState;
+      else if (Date.now() - streamAtSince > 10000
+               && Number(el.currentTime || 0) <= Math.max(0, streamAt) + 0.05) {
+        reason = "playhead still";
+      }
+    } catch (e) { reason = "unreadable"; }
+  }
+  if (!reason) return;
+  if (streamTimer) { clearTimeout(streamTimer); streamTimer = null; }
+  streamTries = 0;
+  carMark("wake_recover", {why: why, reason: reason, road: currentRoad(),
+                           online: navigator.onLine});
+  const note = document.getElementById("note");
+  if (note) note.textContent = "reconnecting… (" + why + ": " + reason + ")";
+  const p = streamElement();
+  try { p.pause(); } catch (e) {}
+  streamSrcAt = Date.now();
+  p.src = streamUrl();
+  p.play().catch((e) => streamRecover("wake: " + (e && e.message)));
+  armStreamWatch();
+}
+window.addEventListener("online", () => { try { streamWake("online"); } catch (e) {} });
+window.addEventListener("pageshow", () => { try { streamWake("pageshow"); } catch (e) {} });
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) return;
+  try { streamWake("visible"); } catch (e) {}
+});
 
 /* The lock screen, the steering wheel and the dashboard. Without this a
  * phone treats the tab as a page that happens to make noise, and both
@@ -254159,13 +256359,18 @@ function paintMediaSession(state) {
            {src: "/app-icon-192.png", sizes: "192x192", type: "image/png"}]),
     });
     navigator.mediaSession.playbackState = playing ? "playing" : "paused";
+    /* #1476: the wheel's presses go into the drive's record - "it
+     * stopped" and "I pressed pause on the wheel" must be told apart. */
     navigator.mediaSession.setActionHandler("play", () => {
+      carMark("wheel_play", {playing: playing});
       if (!playing) tune();
     });
     navigator.mediaSession.setActionHandler("pause", () => {
+      carMark("wheel_pause", {playing: playing});
       if (playing) tune();
     });
     navigator.mediaSession.setActionHandler("stop", () => {
+      carMark("wheel_stop", {playing: playing});
       if (playing) tune();
     });
     /* A live stream cannot be scrubbed, and offering it is how a car
@@ -254211,6 +256416,8 @@ function tune() {
   }
   playing = !playing;
   document.getElementById("tune").textContent = playing ? "Stop" : "Tune in";
+  carMark(playing ? "tune_in" : "tune_out",
+          {road: currentRoad(), mode: streamMode ? "stream" : "live"}); /* #1476 */
   if (!playing) {
     if (voiceCurrentClip) {
       voiceAck(voiceCurrentClip, "error", new Error("listener stopped playback"));
@@ -254227,10 +256434,16 @@ function tune() {
     }
     return;
   }
-  startListening();
-  poll();
-  signIn();
-  paintMediaSession(null);
+  /* #1476: THE TUNE-IN PATH CANNOT STOP THE STREAM. Only the button
+   * above flips `playing`; a sign-in or a poll that fails (the station
+   * mid-restart, the funnel down) is caught here and inside, and the
+   * stream road carries on retrying whatever they said. */
+  try { startListening(); } catch (e) {
+    if (streamMode) streamRecover("start: " + (e && e.message));
+  }
+  try { Promise.resolve(poll()).catch(() => {}); } catch (e) {}
+  try { Promise.resolve(signIn()).catch(() => {}); } catch (e) {}
+  try { paintMediaSession(null); } catch (e) {}
 }
 
 function burst(anchor, up) {
@@ -254410,7 +256623,8 @@ setTimeout(clockLoop, 1500);
   }
   function lowWanted() {
     if (!lowUrl || !mayShow) return false;
-    if (ROAD !== "tailnet" && ROAD !== "lan" && ROAD !== "house") return false;
+    var road = currentRoad();                              /* #1476 */
+    if (road !== "tailnet" && road !== "lan" && road !== "house") return false;
     if (!wantsHls()) return false;
     if (lowBrokenAt && Date.now() - lowBrokenAt < 300000) return false;
     return true;
@@ -254554,7 +256768,8 @@ setTimeout(clockLoop, 1500);
       /* #1475: on the stream road ask for the small frame (424 px, a
        * tenth of the bytes); the station serves the full one when the
        * small one is not being written. */
-      if (frameUrl && typeof streamMode !== "undefined" && streamMode) {
+      if (frameUrl && ((typeof streamMode !== "undefined" && streamMode)
+                       || currentRoad() === "funnel")) {       /* #1476 */
         frameUrl += (frameUrl.indexOf("?") >= 0 ? "&" : "?") + "w=424";
       }
       lowUrl = String((got && got.low) || "");
@@ -254580,6 +256795,24 @@ setTimeout(clockLoop, 1500);
     try { ask(); } catch (e) {}
     setTimeout(loop, 15000);
   }
+  /* #1476: THE CAMERA FOLLOWS THE ROAD. The page is served once, but a
+   * drive moves between roads: Tailscale drops and the phone carries on
+   * over the public Funnel, where the H.264 lane is the wrong thing to
+   * pull beside the audio. car-diag.js learns the road from each
+   * telemetry answer and fires "pine-road": on the funnel the <video>
+   * goes and the small JPEG comes back; back on the tailnet the video is
+   * offered again (a break it took on the way out is not held against
+   * it). Deferred a tick so the new window.PINE_ROAD is in place. */
+  window.addEventListener("pine-road", function () {
+    setTimeout(function () {
+      try {
+        var road = currentRoad();
+        if (road === "tailnet" || road === "lan" || road === "house") lowBrokenAt = 0;
+        if (vid && !lowWanted()) dropVideo(false);
+        ask();
+      } catch (e) {}
+    }, 0);
+  });
   drawLoop();                              /* 2026-09-14: paced, not fixed */
   setTimeout(loop, 1200);
 })();
@@ -255737,7 +257970,9 @@ if __name__ == "__main__":
         with _wave.open(str(_levelled)) as _m:
             _mp = audioop.max(_m.readframes(_m.getnframes()),
                               _m.getsampwidth()) / 32767
-        assert 0.0 < _mp <= SFX_PEAK + 0.02, _mp
+        # [#1477-selfcheck] by loudness now: under the true-peak ceiling
+        # (at the box level it was made for), not SFX_PEAK's sample cap.
+        assert 0.0 < _mp <= 10.0 ** (SFX_TP_DB / 20.0) * box_gain() + 0.02, _mp
     assert sfx_levelled(Path("/tmp/not-a-wav-at-all.mp3")) == Path(
         "/tmp/not-a-wav-at-all.mp3")            # unreadable plays as it is
 
