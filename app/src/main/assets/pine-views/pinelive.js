@@ -1211,12 +1211,33 @@
     return !!(model.state && model.state.levels_url);
   }
 
+  /* [plmonitor] The waterfall falls only while the host captures, and the
+   * host captures only while armed or for four seconds after Test. So while
+   * the audiograph is on screen, not armed, on the USB road, the station's
+   * own off-air test is renewed every 2.5 s (its lease is 4 s). Never on
+   * the network road - each test there mints a new sender token. Silent:
+   * post(), not act(). */
+  function monitorLease() {
+    var st = model.state || {};
+    var src = st.source || {};
+    var road = (ui.prefs && ui.prefs.road) || src.kind || 'usb';
+    if (!(ui.visible && ui.open.scope && ui.scopeSeen)) return;
+    if (road !== 'usb' || st.armed || model.testing) return;
+    var now = Date.now();
+    if (ui.monitorAt && now - ui.monitorAt < 2500) return;
+    ui.monitorAt = now;
+    var dev = (model.settings && model.settings.device) || '';
+    post('/api/pinelive/test', dev ? {source: 'usb', device: dev} : {source: 'usb'})
+      .then(function () {}, function () {});
+  }
+
   /* One EventSource while the audiograph is on screen; none otherwise. It
    * holds one of the page's sockets, which on the tablet is one of six
    * (#1324) - so it is closed the moment nobody can see it. */
   function syncLevels() {
     var want = wantLevels();
     if (ui.scope) { if (ui.visible && ui.open.scope && ui.scopeSeen) ui.scope.resume(); else ui.scope.pause(); }
+    monitorLease();                      /* [plmonitor] */
     if (!want || ui.levelsRefused) { closeLevels(); return; }
     var url = stationUrl(model.state.levels_url);
     if (ui.levels && ui.levels.__url === url) return;
