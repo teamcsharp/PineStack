@@ -906,7 +906,26 @@ class Host:
                     return d
             return None
         ready = [d for d in rows if d.get("status") == "ready"]
-        return (ready or rows or [None])[0]
+        # [plpick] Card order is enumeration luck: the operator's K.O. II
+        # sat at card 2 behind a keyboard dongle's 8 kHz mono endpoint at
+        # card 1, and first-ready-card armed the dongle. Rank instead:
+        # the known interface (KNOWN_NAMES) first, then real audio
+        # (stereo, >=44.1 kHz), then the rest; ties keep card order.
+        def _rank(d: dict) -> tuple:
+            known = 0 if str(d.get("usb_id") or "") in KNOWN_NAMES else 1
+            try:
+                top = max(int(r) for r in (d.get("rates") or [0]))
+            except Exception:  # noqa: BLE001
+                top = 0
+            real = 0 if (int(d.get("channels") or 0) >= 2
+                         and top >= 44100) else 1
+            try:
+                card = int(d.get("card") or 0)
+            except Exception:  # noqa: BLE001
+                card = 0
+            return (known, real, card)
+        return (sorted(ready, key=_rank) or sorted(rows, key=_rank)
+                or [None])[0]
 
     def own_pids(self) -> tuple[int, ...]:
         r = self.runner
