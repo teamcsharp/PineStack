@@ -55,6 +55,10 @@
     var qSize = make('select'); qSize.setAttribute('aria-label', 'frame size');
     var qSecs = make('select'); qSecs.setAttribute('aria-label', 'longest clip');
     var qBox = make('span', 'pav-quality-box', '');
+    /* [h3-budget] measured on this box: double ran a 10 s render in 45-50 min.
+       Every render is fitted to this budget (the frame shrinks, never the length). */
+    var qBudget = make('select'); qBudget.setAttribute('aria-label', 'render-time budget');
+    function qMin(s) { return s >= 60 ? Math.round(s / 60) + ' min' : Math.round(s) + ' s'; }
     var qApply = make('button', '', 'Apply'); qApply.type = 'button';
     var qNote = make('span', 'pav-quality-note', 'Doubling the frame quadruples the pixels the sampler holds: the double profile steps down by itself while the box is hot or short of room.');
     var Q_SIZES = [[640, 384], [960, 576], [1280, 768], [1536, 896]];
@@ -62,10 +66,20 @@
     function paintQuality(state) {
       var q = (state && state.quality) || {}; var presets = (state && state.presets) || {};
       qPreset.replaceChildren();
-      Object.keys(presets).forEach(function (k) { qOpt(qPreset, k, k + ' - ' + presets[k].steps + ' steps, ' + presets[k].width + 'x' + presets[k].height, q.preset === k); });
+      var est = (state && state.estimates) || {};
+      Object.keys(presets).forEach(function (k) { qOpt(qPreset, k, k + ' - ' + presets[k].steps + ' steps, ' + presets[k].width + 'x' + presets[k].height
+        + (est[k] ? ' (~' + qMin(est[k]) + ' for 10 s)' : ''), q.preset === k); });
+      qBudget.replaceChildren();
+      ((state && state.budget_choices) || [300, 600, 900, 1800, 3600, 0]).forEach(function (n) {
+        qOpt(qBudget, n, n ? 'fit each render to ' + qMin(n) : 'no time limit', Number(q.budget_s == null ? 900 : q.budget_s) === Number(n));
+      });
       qOpt(qPreset, 'custom', 'custom', q.preset === 'custom' || !presets[q.preset]);
       qSteps.replaceChildren();
-      ((state && state.step_choices) || [4, 6, 8, 12]).forEach(function (n) { qOpt(qSteps, n, n + ' steps', Number(q.steps) === Number(n)); });
+      /* [h3-cinematic] a step count names its path: the turbo LoRA's 4-12, the
+         base model's 20-30 (the cinematic preset) - the lists never overlap */
+      var baseSteps = q.turbo === false || Number(q.steps) >= 16;
+      (baseSteps ? ((state && state.base_step_choices) || [20, 25, 30]) : ((state && state.step_choices) || [4, 6, 8, 12]))
+        .forEach(function (n) { qOpt(qSteps, n, n + ' steps' + (baseSteps ? ' (base model)' : ''), Number(q.steps) === Number(n)); });
       qSize.replaceChildren();
       var known = false;
       Q_SIZES.forEach(function (wh) {
@@ -76,6 +90,7 @@
       qSecs.replaceChildren();
       ((state && state.frame_choices) || [73, 124, 169, 241, 289, 361]).forEach(function (f) { qOpt(qSecs, f, 'up to ' + Math.round(f / 24) + ' s', Number(q.max_frames) === Number(f)); });
       paintKnobs(state);
+      paintCast(state);                                          /* [h3-cast] */
       var box = (state && state.box) || {};
       qBox.textContent = 'box now: ' + (box.hottest_c != null ? Math.round(box.hottest_c) + ' C of ' + Math.round(box.ceiling_c || 90) + ' C' : 'heat unknown')
         + ', ' + (box.available_gb != null ? Math.round(box.available_gb) + ' GB free (the double frame wants ' + Math.round((box.floor_gb || 60) + 30) + ')' : 'memory unknown');
@@ -83,13 +98,19 @@
     qPreset.addEventListener('change', function () {
       var p = h3State && h3State.presets && h3State.presets[qPreset.value];
       if (p) paintQuality(Object.assign({}, h3State, {quality: p}));
+      if (qPreset.value === 'cinematic') {
+        qNote.textContent = 'Cinematic runs the base model without the turbo LoRA: ' + ((p && p.steps) || 20) + ' steps, clips up to 5 s, '
+          + 'about three times the render time. It starts only at or under ' + Math.round((h3State && h3State.cinematic_heat_c) || 80)
+          + ' C and never renders the hourly ad - otherwise that render steps down to double and says why.';
+      }
     });
     [qSteps, qSize, qSecs].forEach(function (sel) { sel.addEventListener('change', function () { qPreset.value = 'custom'; }); });
     qApply.addEventListener('click', function () {
       var wh = String(qSize.value).split('x');
       var body = {quality: {preset: qPreset.value, steps: Number(qSteps.value), width: Number(wh[0]), height: Number(wh[1]), max_frames: Number(qSecs.value),
           easycache: qCache.checked, shift: qShiftOn.checked ? [Number(qShiftV.value) || 12, Number(qShiftA.value) || 3] : null,
-          sampler: qSampler.value, scheduler: qSched.value},
+          sampler: qSampler.value, scheduler: qSched.value, turbo: Number(qSteps.value) < 16,   /* [h3-cinematic] */
+          budget_s: Number(qBudget.value)},                                                     /* [h3-budget] */
         brief: {style: bStyle.value, follow: bFollow.value, shots: bShots.value, constraints: bCons.value, audio_direction: bAudio.value}};
       qApply.disabled = true; qNote.textContent = 'saving...';
       root.pineDesktop.post('/api/h3/hourly', body).then(function (state) {
@@ -121,7 +142,7 @@
     var bAudio = make('input'); bAudio.type = 'text'; bAudio.maxLength = 400; bAudio.setAttribute('aria-label', 'audio direction');
     var FOLLOW_WORDS = {auto: 'shots follow: auto (the reference on a reference road)', reference: 'shots follow the reference', presenter: 'shots: a presenter to camera'};
     var SHOT_WORDS = {auto: 'shot count: by length', '1': 'one shot', '2': 'two shots', '3': 'three shots'};
-    var qualityRow = make('div', 'pav-quality-row'); qualityRow.append(make('b', '', 'H3 quality'), qPreset, qSteps, qSize, qSecs, qApply, qBox);
+    var qualityRow = make('div', 'pav-quality-row'); qualityRow.append(make('b', '', 'H3 quality'), qPreset, qSteps, qSize, qSecs, qBudget, qApply, qBox);
     var graphRow = make('div', 'pav-quality-row'); graphRow.append(make('b', '', 'Graph'), qCacheLabel, qShiftLabel, qSampler, qSched);
     var briefRow = make('div', 'pav-quality-row'); briefRow.append(make('b', '', 'Brief'), bStyle, bFollow, bShots, bCons, bAudio);
     function paintKnobs(state) {
@@ -137,7 +158,67 @@
       bCons.value = b.constraints || ''; bCons.placeholder = (state && state.default_constraints) || 'constraints - blank: standard';
       bAudio.value = b.audio_direction || ''; bAudio.placeholder = (state && state.default_audio) || 'audio direction - blank: standard';
     }
-    qualityPanel.append(qualityRow, graphRow, briefRow, qNote);
+    /* [h3-cast] the host's face: an identity LoRA trained on the host (on the
+       box, by the pinebox-h3-cast service), riding the text road's renders and
+       the host's share of the hourly stingers. Train asks the box to make or
+       remake it; the run pauses itself while the box is hot, full or
+       rendering, and this row shows where it is. */
+    var cOn = make('input'); cOn.type = 'checkbox';
+    var cOnLabel = make('label', 'pav-q-check'); cOnLabel.append(cOn, make('span', '', 'host LoRA'));
+    var cStrength = make('input'); cStrength.type = 'range'; cStrength.min = '0'; cStrength.max = '1.5'; cStrength.step = '0.05'; cStrength.value = '0.9';
+    cStrength.setAttribute('aria-label', 'host LoRA strength');
+    var cStrengthVal = make('span', 'pav-cast-val', '0.90');
+    cStrength.addEventListener('input', function () { cStrengthVal.textContent = Number(cStrength.value).toFixed(2); });
+    var cShare = make('select'); cShare.setAttribute('aria-label', 'hourly stingers the host presents');
+    [0, 10, 20, 30, 50, 100].forEach(function (n) { qOpt(cShare, n, n ? 'host presents ' + n + '% of hours' : 'host presents no hours', false); });
+    var cApply = make('button', '', 'Save cast'); cApply.type = 'button';
+    var cTrain = make('button', '', 'Train'); cTrain.type = 'button';
+    var cStop = make('button', '', 'Stop'); cStop.type = 'button'; cStop.hidden = true;
+    var cLook = make('input'); cLook.type = 'text'; cLook.maxLength = 600;
+    cLook.placeholder = 'how the host looks - blank keeps the last look'; cLook.setAttribute('aria-label', 'how the host looks');
+    var cState = make('span', 'pav-cast-state', '');
+    var castRow = make('div', 'pav-quality-row pav-cast'); castRow.append(make('b', '', 'Cast'), cOnLabel, cStrength, cStrengthVal, cShare, cApply, cLook, cTrain, cStop, cState);
+    var CAST_BUSY = {preparing: 1, portraits: 1, caching: 1, training: 1, paused: 1, installing: 1, testing: 1};
+    function paintCast(state) {
+      var c = (state && state.cast) || {}; var st = (state && state.cast_status) || {};
+      cOn.checked = !!c.on;
+      cStrength.value = String(c.strength != null ? c.strength : 0.9); cStrengthVal.textContent = Number(cStrength.value).toFixed(2);
+      var share = Number((state && state.host_share) || 0);
+      Array.prototype.forEach.call(cShare.options, function (o) { o.selected = Number(o.value) === share; });
+      var lora = c.lora || st.lora || '';
+      cOn.disabled = !lora;
+      var busy = !!CAST_BUSY[st.state];
+      cTrain.hidden = busy; cStop.hidden = !busy;
+      cTrain.textContent = lora ? 'Retrain' : 'Train';
+      var line = st.state === 'never trained' ? 'not trained yet - Train makes the host\'s portraits and trains the LoRA on the box (hours; it pauses whenever the box is hot or rendering)'
+        : (st.state || 'unknown') + (st.step != null && st.of ? ' - step ' + st.step + ' of ' + st.of : '')
+          + (st.why ? ' - ' + st.why : '') + (st.temp_c != null ? ' - box ' + Math.round(st.temp_c) + ' C' : '');
+      cState.textContent = (lora ? lora + ' (trigger "' + (c.trigger || 'pinehost') + '") - ' : '') + line + (st.kick_waiting ? ' - a request is waiting for the box' : '');
+    }
+    cApply.addEventListener('click', function () {
+      var st = (h3State && h3State.cast_status) || {}; var c = (h3State && h3State.cast) || {};
+      var body = {cast: {on: cOn.checked, strength: Number(cStrength.value), lora: c.lora || st.lora || ''}, host_share: Number(cShare.value)};
+      cApply.disabled = true;
+      root.pineDesktop.post('/api/h3/hourly', body).then(function (state) {
+        h3State = state || {}; h3State.client_at = Date.now() / 1000; paintCast(h3State);
+      }).catch(function (err) { cState.textContent = 'Could not save: ' + ((err && err.message) || err); })
+        .finally(function () { cApply.disabled = false; });
+    });
+    cTrain.addEventListener('click', function () {
+      var look = String(cLook.value || '').trim();   /* no window.prompt: the desk's shell has none */
+      cTrain.disabled = true;
+      root.pineDesktop.post('/api/h3/cast/train', {look: look, fresh: !!look, steps: 600}).then(function (got) {
+        if (h3State) h3State.cast_status = (got && got.status) || h3State.cast_status;
+        paintCast(h3State); loadH3();
+      }).catch(function (err) { cState.textContent = 'Could not ask: ' + ((err && err.message) || err); })
+        .finally(function () { cTrain.disabled = false; });
+    });
+    cStop.addEventListener('click', function () {
+      cStop.disabled = true;
+      root.pineDesktop.post('/api/h3/cast/stop', {}).then(function () { loadH3(); })
+        .finally(function () { cStop.disabled = false; });
+    });
+    qualityPanel.append(qualityRow, graphRow, briefRow, castRow, qNote);
     if (gallery) head.insertBefore(h3Bar, position);
     function h3Clock(seconds) {
       seconds = Math.max(0, Math.floor(Number(seconds) || 0));

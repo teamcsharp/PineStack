@@ -694,3 +694,7 @@ body.pine-splice-open > :not(.lb-editor-overlay) * { animation-play-state:paused
 .pav-q-check { display:inline-flex; align-items:center; gap:4px; white-space:nowrap; }
 .pav-quality input[type=text] { flex:1 1 220px; min-width:160px; min-height:32px; font-size:12px; }
 .pav-quality input[type=number] { width:64px; min-height:32px; font-size:12px; }
+/* [h3-cast] the gear's Cast row */
+.pav-cast input[type=range] { width: 120px; }
+.pav-cast-val { min-width: 34px; font-variant-numeric: tabular-nums; }
+.pav-cast-state { flex: 1 1 100%; font-size: 11px; opacity: .8; overflow-wrap: anywhere; }
