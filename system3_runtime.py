@@ -4711,6 +4711,13 @@ def install(app, namespace):
         room) answers with no conversations."""
         host.require_read_auth(authorization)
         got = await rt.read(rt.segment_view, segment_id, bool(full))
+        if not got and segment_id[:3] in ("sc-", "sh-"):
+            # [s3-scene-seg] A script band's id is its SCENE, `sc-<opening
+            # line_id>` (#1281/#1284): answer for the segment holding that line.
+            _ln = await rt.read(rt.store.line, segment_id[3:])
+            if _ln and _ln.get("segment"):
+                segment_id = str(_ln["segment"])
+                got = await rt.read(rt.segment_view, segment_id, bool(full))
         if not got:
             now = rt.segment_now()
             seg = now if now.get("id") == segment_id else None
