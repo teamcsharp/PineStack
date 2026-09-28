@@ -98,7 +98,8 @@ class SfxStreamCadenceTests(unittest.IsolatedAsyncioTestCase):
         receipts = [call for call in app.note_activity.call_args_list
                     if call.args and call.args[0] == 'sfx']
         self.assertEqual(len(receipts), 2)
-        self.assertTrue(all(call.kwargs['speaker'] == 'The SFX Guy'
+        # [cast-names] the receipt names him: Sam, or whatever the DJ options say
+        self.assertTrue(all(call.kwargs['speaker'] == app.cast_name('sfxguy')
                             for call in receipts))
 
     async def test_video_cadence_welds_levelled_audio_and_rings_silent_picture(self):
@@ -136,7 +137,7 @@ class SfxStreamCadenceTests(unittest.IsolatedAsyncioTestCase):
         app.sfxguy_ready_commit.assert_called_once_with('reserved-guy')
         app.note_activity.assert_any_call(
             'sfxguy', 'interjection heard', line=mock.ANY,
-            text=take['text'], speaker='The SFX Guy')
+            text=take['text'], speaker=app.cast_name('sfxguy'))   # [cast-names]
         app._sfx_cadence_audible(rows, 16)
         app.sfxguy_ready_commit.assert_called_once()
 

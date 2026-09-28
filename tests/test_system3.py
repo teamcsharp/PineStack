@@ -35,19 +35,21 @@ def plan(seed="golden-1", cid="golden", config=None, **over):
                               settings(test_seed=seed), conversation_id=cid)
 
 
+# Re-recorded 2026-09-28 from engine system3-engine/4 ([s3-sb-end]: the
+# prepend-or-append roulette moves the draws after a line where both win).
 # Recorded 2026-09-26 from engine system3-engine/2 and the default tables
 # (config 1f82ec0b14f3cdac). A change here is a change in behaviour and must be
 # deliberate: bump the tables' version or the engine's.
 GOLDEN = [["A", "initial", "OBLIGATED", "sadness.despair"],
           ["B", "response_a", "sadness.sadness", "qualify", "deepen"],
-          ["A", "initiator_response", "sadness.disappointment", "misunderstand", "more_speakerbox"],
-          ["B", "response_a2", "low_arousal.boredom", "make_fun", "tangent"],
-          ["A", "frame", "surprise.bewilderment", "go_deeper"],
-          ["B", "response_a", "social.pride", "disparage", "anecdotal_reframe"],
-          ["A", "initiator_response", "sadness.melancholy", "disagree", "detail"],
-          ["B", "response_a2", "interest.uncertainty", "llm_rebuttal", "de_escalation"],
-          ["A", "frame", "sadness.despair", "concede_move_on"],
-          ["B", "initial", "interest.skepticism", "final_callback"]]
+          ["A", "initiator_response", "sadness.sympathy", "debunk", "dispute"],
+          ["B", "response_a2", "social.shame", "disbelief", "contradiction"],
+          ["A", "frame", "social.guilt", "go_deeper"],
+          ["B", "response_a", "social.embarrassment", "deflect", "escalation"],
+          ["A", "initiator_response", "fear.dread", "no_bro", "reframe"],
+          ["B", "response_a2", "low_arousal.acceptance", "disparage", "unresolved_return"],
+          ["A", "frame", "social.jealousy", "concede_move_on"],
+          ["B", "initial", "surprise.shock", "segue"]]
 
 
 class RngTests(unittest.TestCase):
@@ -90,7 +92,9 @@ class PlanTests(unittest.TestCase):
         # when a round opts in, so the trajectory above is still unchanged.
         # [s3-events] ...and CALLEVENT1 (what can happen on a call) - rolled on
         # its own streams, only when a road opts in: the trajectory holds.
-        self.assertEqual(system3.config_hash(system3.default_config()), "0e5c64b54da0d08b")
+        # [s3-es-emoji] ...and ES1's badges (an emoji per feeling and item) - data the
+        # engine stamps on the ES decision and never draws on: the trajectory holds.
+        self.assertEqual(system3.config_hash(system3.default_config()), "afae0f818f0425ae")
 
     def test_same_state_config_seed_reproduces_the_plan(self):
         a, b = plan(seed="r"), plan(seed="r")

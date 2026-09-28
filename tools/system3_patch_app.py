@@ -201,23 +201,7 @@ PANEL = [
      '        <button onclick="system3Open()" title="System 3, the conversation director: the conversation, the RNG Rolodex and the final script, in sync">System 3</button>\n'),
     ("panel-open",
      '  } catch (error) { setStatus("System2 could not open: " + error.message, true); }\n}\n',
-     '  } catch (error) { setStatus("System2 could not open: " + error.message, true); }\n}\n'
-     '\n'
-     '/* System 3 (docs/system3_blueprint.md): the conversation director\'s\n'
-     '   instrument - conversation, RNG Rolodex and final script views. */\n'
-     'let system3View = null;\n'
-     'async function system3Open(tab) {                       /* [s3-window] tab: tables, segments, prompts, audit, sys3 */\n'
-     '  if (system3View) return;\n'
-     '  if (!document.getElementById("system3Style")) {\n'
-     '    const style = document.createElement("link"); style.id = "system3Style"; style.rel = "stylesheet";\n'
-     '    style.href = "/system3/system3.css?v=4"; document.head.append(style);\n'
-     '  }\n'
-     '  try {\n'
-     '    const module = await import("/system3/system3.js?v=5");\n'
-     '    system3View = await module.openSystem3({request: (path, options) => api(path, options),\n'
-     '      tab: typeof tab === "string" ? tab : "",\n'
-     '      onClose: () => { system3View = null; }});\n'
-     '  } catch (error) { setStatus("System 3 could not open: " + error.message, true); }\n'
+     '  } catch (error) { setStatus("System2 could not open: " + error.message, true); }\n'
      '}\n'),
     ("panel-palette",
      '      ["\U0001F4CB", "System2", "hourly plans, scripts and line diagnostics", () => system2Open()],\n',

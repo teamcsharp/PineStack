@@ -77,7 +77,7 @@ test('each calendar segment expands into three conversation readers and editable
   assert.match(css, /\.sp-itin-turn-table/);
   assert.match(script, /function itinConversationTurns\(entry, variant\)/);
   assert.match(script, /var aired = \(entry && entry\.aired\) \|\| \[\]/);
-  assert.match(script, /The SFX Guy - stinger/);
+  assert.match(script, /castName\('sfx'\) \+ ' - stinger'/);   // [cast-names] his name, not "The SFX Guy"
   assert.match(script, /Inspect full provenance/);
   assert.match(script, /\/api\/slideshow\?limit=200/);
   assert.match(script, /\/api\/sfx\/video\/profiles\?limit=12/);

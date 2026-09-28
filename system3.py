@@ -38,7 +38,9 @@ import uuid
 
 import system3_tables
 
-ENGINE_VERSION = "system3-engine/3"
+# /4 (2026-09-28, [s3-sb-end]): the prepend-or-append roulette withdraws one of two
+# winning passages, so rounds where both win draw differently from /3.
+ENGINE_VERSION = "system3-engine/4"
 EVENT_SCHEMA = "system3.decision-event/1"
 CONVERSATION_SCHEMA = "system3.conversation/1"
 CONFIG_SCHEMA = "system3.config/1"
@@ -279,6 +281,43 @@ def road_mode(settings, road):
     return "shadow"
 
 
+# [s3-es-emoji] THE BADGE A MESSAGE WEARS for the emotion it was rolled in (the
+# Messenger shows it at the bubble's bottom right): the ES category's emoji, and
+# the item's own where it has a more specific one (system3_tables._ES_EMOJI).
+# Real colour emoji - the one exception to the station's Carbon-icons-only rule.
+EMOJI_MAX_POINTS = 8             # code points: a ZWJ sequence or two emoji fit
+EMOJI_MAX_UNITS = 16             # UTF-16 units: what the desk's input counts
+
+
+def clean_emoji(value):
+    """[s3-es-emoji] A row's `emoji`, trimmed. Not a string, or longer than
+    EMOJI_MAX_POINTS code points / EMOJI_MAX_UNITS UTF-16 units: dropped to ""
+    (no badge) - kept as "", so the once-only fill never puts it back."""
+    if not isinstance(value, str):
+        return ""
+    got = value.strip()
+    if len(got) > EMOJI_MAX_POINTS or len(got.encode("utf-16-le")) // 2 > EMOJI_MAX_UNITS:
+        return ""
+    return got
+
+
+def es_emoji(config, spec):
+    """[s3-es-emoji] [category emoji, item emoji] for an ES pick: the item's
+    only when it has its own and it differs from its category's; [] when
+    neither has one. Read off the table the pick was drawn from - nothing is
+    drawn here, so no draw moves."""
+    cat = ""
+    for t in (config or {}).get("tables") or []:
+        if isinstance(t, dict) and t.get("id") == spec.get("table"):
+            for c in t.get("categories") or []:
+                if isinstance(c, dict) and c.get("id") == spec.get("category"):
+                    cat = clean_emoji(c.get("emoji"))
+                    break
+            break
+    own = clean_emoji(spec.get("emoji"))
+    return ([cat] if cat else []) + ([own] if own and own != cat else [])
+
+
 def validate_table(table):
     """Refuse a table that cannot be drawn from; returns the cleaned copy."""
     if not isinstance(table, dict):
@@ -288,9 +327,9 @@ def validate_table(table):
         raise ValueError("table id must be a short name such as ES2")
     family = str(table.get("family") or "")
     if family not in ("CTS", "ES", "RS", "IRS", "FL", "TEMPER", "SHOCK", "INTERJECT", "FAV", "DIRECTIVE", "EVENT",
-                      "CHANCE", "POOL"):
+                      "CHANCE", "POOL", "SPEAKERBOX"):             # [s3-sb-end] SBEND1
         raise ValueError("table family must be one of CTS, ES, RS, IRS, FL, TEMPER, SHOCK, INTERJECT, FAV, DIRECTIVE, "
-                         "EVENT, CHANCE, POOL")
+                         "EVENT, CHANCE, POOL, SPEAKERBOX")
     pool = family in system3_tables.POOL_FAMILIES          # [s3-cast] may stand empty
     cats = table.get("categories")
     if not isinstance(cats, list) or (not cats and family not in ("CHANCE", "POOL")):   # [s3-dice-door] filled as the station rolls
@@ -308,6 +347,8 @@ def validate_table(table):
         if not isinstance(cat, dict) or not str(cat.get("id") or "").strip():
             raise ValueError("every category needs an id")
         cat["weight"] = max(0.0, float(cat.get("weight", 1.0) or 0))
+        if "emoji" in cat:                                   # [s3-es-emoji] the badge, trimmed
+            cat["emoji"] = clean_emoji(cat["emoji"])
         if family == "EVENT":                                # [s3-events] one kind of happening
             cat["odds"] = round(clamp(cat.get("odds", 0.1)), 4)
             cat["seat"] = str(cat.get("seat") or "any") if str(cat.get("seat") or "any") in EVENT_SEATS else "any"
@@ -325,6 +366,8 @@ def validate_table(table):
             seen.add(key)
             item["weight"] = max(0.0, float(item.get("weight", 1.0) or 0))
             item.setdefault("label", item["id"])
+            if "emoji" in item:                              # [s3-es-emoji] its own badge, trimmed
+                item["emoji"] = clean_emoji(item["emoji"])
             if family == "DIRECTIVE":                       # [s3-cast] the row's own odds and lifetime
                 item["odds"] = round(clamp(item.get("odds", 1.0)), 4)
                 item["until"] = max(0.0, float(item.get("until") or 0))
@@ -961,6 +1004,14 @@ def _speakerbox_marks(conv, config, settings, ctx, stream, step, turn, inputs):
     used = sum(1 for t in conv["turns"] for x in t.get("speakerbox", []) if x.get("mode") != "NONE")
     prior = [x for t in conv["turns"] for x in t.get("speakerbox", [])
              if x.get("mode") in ("PREPEND", "APPEND", "FULL_SWATH")]
+    # [s3-sb-end] PREPEND OR APPEND. "Instead of both winning together, they
+    # now have a roulette that is part of the system" (operator, 2026-09-28).
+    # Each mark still throws its own d100 against its slider; when the
+    # prepend AND the append both win on one line, the SPEAKERBOX table
+    # (SBEND1) picks the one that is read and the other is withdrawn, saying
+    # why. A config without the table (switched off, deleted, or planned
+    # before it existed) reads both, as before - so its replay holds.
+    ends = [r for r in _round_rows(config, "SPEAKERBOX") if r["id"] in ("prepend", "append")]
     opened = False
     for mark in marks:
         if mark == "prepend" and opened:
@@ -982,16 +1033,57 @@ def _speakerbox_marks(conv, config, settings, ctx, stream, step, turn, inputs):
             stages.append({"stage": "dice", "draw": rng, "threshold": threshold,
                            "rule": "hit when the d100 lands above %d (%.0f%% slider)" % (threshold, rate * 100),
                            "selected": "PASS" if hit else "MISS"})
-            if hit and used >= int(sb.get("max_inline", 2)):
+            place = hit
+            won = (next((x for x in out if x.get("mark") == "prepend" and x.get("mode") not in (None, "NONE")), None)
+                   if hit and mark == "append" and ends else None)
+            if won is not None:                                           # [s3-sb-end]
+                # its own stream (like the tint's and the SFX Guy's), so the
+                # roulette never moves another family's dice
+                own = DrawStream(str(conv["seed"]) + "|sbend", int(conv.get("sbend_draws") or 0))
+                edraw = own.next("SPEAKERBOX:end")
+                conv["sbend_draws"] = own.n
+                erows = [dict(r, why=[]) for r in ends]
+                ek = pick_index([r["weight"] for r in erows], edraw["u"])
+                if ek >= 0:
+                    chose = erows[ek]["id"]
+                    estage = _stage("end", erows, ek, edraw)
+                    estage["rule"] = ("both the prepend and the append won their dice on this line; the prepend-or-append "
+                                      "roulette (%s) picks the one that is read" % erows[ek]["table"])
+                    stages.append(estage)
+                    rec["end"] = {"chose": chose, "dice": edraw["dice"], "table": erows[ek]["table"]}
+                    if chose == "prepend":
+                        place = False
+                        rec.update(lost_to="prepend", why="won its dice, but the prepend-or-append roulette chose the "
+                                                          "prepend (d100 %d)" % edraw["dice"])
+                    else:
+                        was = won["mode"]
+                        won.update(mode="NONE", lost_to="append", end=dict(rec["end"]),
+                                   why="won its dice, but the prepend-or-append roulette chose the append (d100 %d)"
+                                       % edraw["dice"])
+                        conv["material_requests"][:] = [m for m in conv["material_requests"]
+                                                        if m.get("request_id") != won.get("request_id")]
+                        won.pop("request_id", None)
+                        used -= 1
+                        pev = next((e for e in conv["decision_events"] if e["event_id"] == won.get("event_id")), None)
+                        if pev is not None:
+                            pev["stages"].append({"stage": "end", "draw": None, "selected": "APPEND",
+                                                  "rule": "withdrawn: this line's append won its dice too, and the "
+                                                          "prepend-or-append roulette (%s, d100 %d) chose the append"
+                                                          % (erows[ek]["table"], edraw["dice"])})
+                            pev["selected"] = {"id": "NONE", "label": "withdrawn: the roulette chose the append",
+                                               "mark": "prepend", "was": was}
+                            pev.setdefault("meta", {})["why"] = won["why"]
+                        rec["_withdrew"] = pev
+            if place and used >= int(sb.get("max_inline", 2)):
                 rec.update(why="a hit, but this round already carries %d inline passages" % used)
-            elif hit and mark == "full":
+            elif place and mark == "full":
                 rec["mode"] = "FULL_SWATH"
                 used += 1
                 opened = True
                 stages.append({"stage": "mode", "draw": None, "selected": "FULL_SWATH",
                                "rule": "the full-swath dial opens the round with a speaker-box monologue the "
                                        "initiator reads out; the next turn answers it"})
-            elif hit:
+            elif place:
                 modes = dict(sb.get("modes") or {})
                 rows = [{"id": "PREPEND" if mark == "prepend" else "APPEND",
                          "label": "word for word " + ("before" if mark == "prepend" else "after") + " the line",
@@ -1011,12 +1103,18 @@ def _speakerbox_marks(conv, config, settings, ctx, stream, step, turn, inputs):
                     if rec["mode"] == "CALLBACK_TO_PRIOR":
                         rec["callback_to"] = prior[-1].get("request_id", "")
         sel = {"id": rec["mode"], "label": rec["mode"].replace("_", " ").lower(), "mark": mark}
+        if rec.get("lost_to"):                                            # [s3-sb-end]
+            sel["label"] = "withdrawn: the roulette chose the %s" % rec["lost_to"]
         ev = _event(conv, dict(ctx, turn_id=turn["turn_id"], turn_index=turn["index"]),
                     "SPEAKERBOX", stages, sel, before,
                     meta={"mark": mark, "rate": rec["rate"], "applies": rec["applies"],
-                          "why": rec["why"], "insertion_point": "%s turn %d" % (mark, turn["index"] + 1)},
+                          "why": rec["why"], "insertion_point": "%s turn %d" % (mark, turn["index"] + 1),
+                          **({"end": rec["end"]} if rec.get("end") else {})},
                     rng=rng)
         rec["event_id"] = ev["event_id"]
+        _pev = rec.pop("_withdrew", None)                                 # [s3-sb-end]
+        if _pev is not None:
+            _pev["stages"][-1]["decided_in"] = ev["event_id"]
         if rec["mode"] in ("PREPEND", "APPEND", "REFERENCE", "FULL_SWATH"):
             rec["request_id"] = "%s:sb%d" % (turn["turn_id"], len(out))
             conv["material_requests"].append({
@@ -1340,6 +1438,9 @@ def _decide_turn(conv, config, settings, stream, step, speaker, want, inputs, cl
                                  "selected": round(intensity, 3)})
             ev["selected"]["intensity"] = round(intensity, 3)
             dec["intensity"] = round(intensity, 3)
+            # [s3-es-emoji] the badge the message wears (the Messenger, bottom right):
+            # [category, item] off the table the pick came from - nothing is drawn
+            dec["emoji"] = es_emoji(config, spec)
             es_spec = spec
             ctx["speaker_emotion_cat"] = spec["category"]
             if who:

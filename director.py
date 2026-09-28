@@ -644,6 +644,28 @@ def director_lessons_clause(kind: str) -> str:
 # override for one occurrence, exactly like the notes - the same two scopes,
 # because they answer the same question at two different distances.
 
+# [cast-names] who the SFX guy is. app.py hands this module its cast_name
+# (director.CAST_NAME = cast_name); until it has - or if it fails - he is
+# Sam. Read when a clause is written, so a rename reaches the next one.
+CAST_NAME: Any = None
+
+
+def _cast(role: str, default: str) -> str:
+    fn = CAST_NAME
+    try:
+        got = fn(role) if callable(fn) else ""
+    except Exception:  # noqa: BLE001 - a name is never worth a clause
+        got = ""
+    return str(got or default)
+
+
+def director_beat_words(what: str) -> str:
+    """[cast-names] A beat as the writing room reads it: the SFX guy by
+    his name."""
+    words = DIRECTOR_BEAT_TYPES.get(what, what)
+    return words.replace("{sfx}", _cast("sfxguy", "Sam")) if "{sfx}" in words else words
+
+
 DIRECTOR_BEAT_TYPES = {
     "seed": "the speakerbox is opened and a passage of the station's own "
             "documents goes into somebody's mouth, which the others then "
@@ -655,7 +677,7 @@ DIRECTOR_BEAT_TYPES = {
                "a wrong number, somebody at the door",
     "caller": "the person on the line says their piece and the room "
               "answers them",
-    "sfx": "the SFX guy puts something over the top of it",
+    "sfx": "{sfx}, the SFX guy, puts something over the top of it",   # [cast-names]
     # 2026-09-10: "also in the script, also script the songs being played
     # and the dialogue around the tracks." A record is part of the running
     # of a segment, not an absence of one, so the shape can say where it
@@ -730,7 +752,7 @@ def director_beats_clause(kind: str, occurrence: str = "") -> str:
         for at, row in enumerate(rows, 1):
             what = str(row.get("type") or "")
             out.append("\n  %d. %s%s" % (
-                at, DIRECTOR_BEAT_TYPES.get(what, what),
+                at, director_beat_words(what),   # [cast-names] the SFX guy by name
                 (" - " + str(row["note"])) if row.get("note") else ""))
         return "".join(out)
     except Exception:                              # noqa: BLE001
@@ -750,7 +772,7 @@ def director_graph() -> dict[str, Any]:
         elif str(key).startswith("occ:"):
             occurrences[str(key)[4:]] = [dict(b) for b in rows]
     return {"kinds": kinds, "occurrences": occurrences,
-            "types": dict(DIRECTOR_BEAT_TYPES),
+            "types": {k: director_beat_words(k) for k in DIRECTOR_BEAT_TYPES},   # [cast-names]
             "most": DIRECTOR_BEATS_MOST}
 
 

@@ -782,3 +782,81 @@
   border: 1px solid var(--line); background: #081312; }
 .s3-sfxposter[hidden], .s3-evposter[hidden] { display: none; }
 .s3-sfxnode .s3-clip-name { color: var(--ink-2); }
+
+/* [s3-msgdrop] WHAT BUILT THIS MESSAGE: the chevron at the right end of a
+   message's header line, and the panel it opens under the message, inside
+   it. The panel is the operator's reading ground: selectable text, its own
+   cursor, full strength even on a past (dimmed) message. */
+.s3-msg .who .s3-drop-btn { order: 9; margin-left: auto; flex: none; display: inline-grid; place-items: center; width: 30px; height: 24px;
+  padding: 0; border-radius: 7px; border: 1px solid transparent; background: transparent; color: var(--ink-3); cursor: pointer; }
+.s3-msg .who .s3-drop-btn:hover { background: var(--panel-2); color: var(--ink); border-color: var(--line-2); }
+.s3-msg .who .s3-drop-btn[aria-expanded="true"] { color: var(--accent); background: #0c1519; border-color: var(--line-2); }
+.s3-drop-chev { width: 16px; height: 16px; fill: currentColor; transition: transform .18s ease; }
+.s3-drop-btn[aria-expanded="true"] .s3-drop-chev { transform: rotate(180deg); }
+.s3-msg.s3-drop-open:not(.open) { width: 88%; }
+.s3-msg.past.s3-drop-open { opacity: 1; }
+.s3-msg.past.s3-drop-open > :not(.s3-drop) { opacity: .8; }
+.s3-drop { display: grid; gap: 10px; min-width: 0; margin-top: 2px; padding: 9px 11px 11px; border-radius: 12px; background: #0c1519;
+  border: 1px solid var(--line-2); font-size: 12px; line-height: 1.45; color: var(--ink-2); cursor: auto; white-space: normal;
+  text-align: left; font-style: normal; text-decoration: none; -webkit-user-select: text; user-select: text; -webkit-touch-callout: default; }
+.s3-drop-head { display: flex; flex-wrap: wrap; gap: 2px 10px; align-items: baseline; }
+.s3-drop-head b { color: var(--ink); font-size: 13px; }
+.s3-drop-note { margin: -4px 0 0; font-style: italic; }
+.s3-drop-sec { display: grid; gap: 5px; min-width: 0; }
+.s3-drop-sec > h4 { margin: 0; font-size: 10px; letter-spacing: .07em; text-transform: uppercase; color: var(--ink-3); font-weight: 600; }
+.s3-drop p { margin: 0; }
+.s3-drop-told { display: grid; gap: 5px; min-width: 0; }
+.s3-drop-rowtext { padding: 6px 9px; border-left: 3px solid var(--accent); background: var(--panel-2); border-radius: 0 7px 7px 0;
+  color: var(--ink); white-space: pre-wrap; overflow-wrap: anywhere; }
+.s3-drop-line { overflow-wrap: anywhere; }
+.s3-drop-line b { color: var(--ink-3); font-weight: 600; }
+.s3-drop mark.s3-hit { background: rgba(144, 218, 185, .28); color: var(--ink); border-radius: 3px; }
+.s3-drop-dice { display: grid; gap: 3px; min-width: 0; }
+.s3-drop-roll { display: grid; grid-template-columns: auto minmax(34px, max-content) minmax(0, 1fr); gap: 1px 8px; align-items: center;
+  padding: 4px 7px; border-radius: 7px; background: #0a1215; border-left: 3px solid var(--fam, var(--obs)); min-width: 0; }
+.s3-drop-roll[role="button"] { cursor: pointer; }
+.s3-drop-roll[role="button"]:hover, .s3-drop-roll[role="button"]:focus-visible { background: var(--panel-2); }
+.s3-drop-roll .s3-die { width: 32px; height: 24px; font-size: 11px; grid-row: span 2; }
+.s3-drop-roll > b { color: var(--fam, var(--ink-2)); font-size: 10px; letter-spacing: .05em; }
+.s3-drop-item { color: var(--ink); overflow-wrap: anywhere; min-width: 0; }
+.s3-drop-why { grid-column: 2 / -1; color: var(--ink-3); font: 11px/1.4 ui-monospace, monospace; overflow-wrap: anywhere; min-width: 0; }
+.s3-drop-why:empty { display: none; }
+.s3-drop-blocks { display: grid; gap: 2px; margin-top: 4px; }
+.s3-drop-block { display: grid; grid-template-columns: auto auto minmax(0, 1fr); gap: 1px 8px; align-items: center; padding: 4px 7px;
+  border-radius: 6px; background: #0a1215; min-width: 0; }
+.s3-drop-block[role="button"] { cursor: pointer; }
+.s3-drop-block[role="button"]:hover, .s3-drop-block[role="button"]:focus-visible { background: var(--panel-2); }
+.s3-drop-block .s3-die { width: 30px; height: 20px; font-size: 10px; }
+.s3-drop-nodie { width: 30px; }
+.s3-drop-state { font: 600 9.5px/1 system-ui, sans-serif; letter-spacing: .06em; text-transform: uppercase; padding: 3px 6px; border-radius: 999px;
+  border: 1px solid var(--line-2); color: var(--ink-3); text-align: center; min-width: 62px; }
+.s3-drop-block.kept .s3-drop-state { color: var(--ok); border-color: #3c7a5c; }
+.s3-drop-block.stripped .s3-drop-state { color: var(--warn); border-color: #8a5446; }
+.s3-drop-block.rolled .s3-drop-state { box-shadow: inset 0 0 0 1px #f4f1e855; }
+.s3-drop-bname { min-width: 0; overflow-wrap: anywhere; color: var(--ink); }
+.s3-drop-bname code { font: 10.5px ui-monospace, monospace; color: var(--ink-3); }
+.s3-drop-block.stripped .s3-drop-bname b { text-decoration: line-through; color: var(--warn); }
+.s3-drop-block > .s3-drop-why { grid-column: 3 / -1; }
+.s3-drop-block > details { grid-column: 1 / -1; }
+.s3 .s3-drop-fold { margin: 0; padding: 4px 9px; border: 1px solid var(--line-2); border-radius: 8px; background: #0a1215; min-width: 0; }
+.s3 .s3-drop-fold > summary { color: var(--ink); font-size: 12px; line-height: 26px; }
+.s3 .s3-drop-fold > summary .s3-muted { font-size: 11px; }
+.s3 .s3-drop-copy { float: right; margin: 1px 0 0 8px; padding: 1px 10px; font-size: 11px; line-height: 20px; border-radius: 6px; }
+.s3 .s3-drop-pre { margin: 6px 0 4px; max-height: 44vh; overflow: auto; font: 11.5px/1.5 ui-monospace, Consolas, monospace; white-space: pre-wrap;
+  overflow-wrap: anywhere; background: #070d10; border: 1px solid #1d2b30; color: var(--ink); cursor: text; }
+.s3-drop-prompt { display: grid; gap: 6px; min-width: 0; }
+.s3-drop-ids { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 3px 12px; align-items: baseline; min-width: 0; }
+.s3-drop-ids > span { color: var(--ink-3); font-size: 11px; }
+.s3-drop-ids > code { font: 11px/1.45 ui-monospace, Consolas, monospace; color: var(--ink); overflow-wrap: anywhere; min-width: 0; }
+@media (max-width: 520px) { .s3-msg.s3-drop-open:not(.open) { width: 100%; max-width: 100%; } }
+@media (prefers-reduced-motion: reduce) { .s3-drop-chev { transition: none; } }
+
+/* [s3-msgdrop] THE FEELING, AT A GLANCE: the ES category's emoji (and the
+   item's own) at the bottom right of a written message, on its direction
+   line. Real colour emoji in an emoji face - never PineIcons, whose cmap
+   draws emoji codepoints as Carbon outlines. */
+.s3-bubble .dir.s3-has-es { display: flex; align-items: flex-end; gap: 8px; }
+.s3-es-badge { flex: none; margin-left: auto; display: inline-flex; gap: 3px; font-style: normal; line-height: 1; }
+.s3-es-badge > .s3-es-emo { display: inline-grid; place-items: center; width: 22px; height: 22px; border-radius: 6px; background: #0000002e;
+  border: 1px solid #ffffff1f; font: 14px/1 "Segoe UI Emoji", "Apple Color Emoji", "Noto Color Emoji", sans-serif; font-style: normal; }
+.s3-es-row { display: flex; justify-content: flex-end; margin-top: 4px; }

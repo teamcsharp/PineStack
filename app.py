@@ -1254,6 +1254,89 @@ RADIO_PROMPT_SLOTS = (
 )
 
 
+# --- [cast-names] THE CAST'S NAMES, AS THE SETTINGS KEEP THEM -----------------
+# Dill (host), Skip (co-host), Sam (the SFX guy): the operator's cast
+# (2026-09-28). Each name has a mode in the DJ options - fixed, custom or
+# random - and validate_settings() keeps all of it through its wholesale
+# rebuild. cast_name() and the rolls sit beside dj_settings(), further down.
+CAST_ROLES = ("host", "cohost", "sfxguy")
+CAST_MODES = ("fixed", "custom", "random")
+CAST_DEFAULT_NAMES = {"host": "Dill", "cohost": "Skip", "sfxguy": "Sam"}
+CAST_NAME_MOST = 30
+CAST_POOL_MOST = 60
+# The random pool when the operator has not written one. None of the caller
+# name book's seed names (CALLER_NAME_SEED has a Gus and a Grandma Lou).
+CAST_NAME_POOL = (
+    "Dill", "Skip", "Sam", "Rex", "Moe", "Vic", "Ray", "Hank", "Otis", "Mick",
+    "Fitz", "Nell", "Dot", "Roz", "Mae", "Tess", "Bea", "Jo", "Cal", "Wes",
+)
+
+
+def cast_name_clean(raw: Any) -> str:
+    """[cast-names] A name as the station says and prints it, or "" when it
+    will not do: 1-30 printable characters, letters and digits with spaces,
+    apostrophes, hyphens, full stops and ampersands between them. Nothing
+    that breaks a transcript ("Name: line"), a template ({station}) or a
+    tag, and no emoji."""
+    name = " ".join(str(raw or "").split())
+    if not 1 <= len(name) <= CAST_NAME_MOST or not name.isprintable():
+        return ""
+    if not any(ch.isalnum() for ch in name):
+        return ""
+    if any(not (ch.isalnum() or ch in " '.-&") for ch in name):
+        return ""
+    return name
+
+
+def cast_pool_clean(raw: Any) -> list[str]:
+    """[cast-names] A random pool - a list, or one string with the names
+    separated by commas, semicolons or new lines - as valid names, each once
+    whatever its case, sixty at most."""
+    items = (raw if isinstance(raw, (list, tuple))
+             else re.split(r"[,;\n]", str(raw or "")))
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        name = cast_name_clean(item)
+        if name and name.lower() not in seen:
+            seen.add(name.lower())
+            out.append(name)
+            if len(out) >= CAST_POOL_MOST:
+                break
+    return out
+
+
+def cast_mode_of(raw_dj: Any, role: str) -> str:
+    """[cast-names] How `role`'s name is chosen in these DJ settings: the
+    stored mode - or, for settings from before the modes (or a dict that
+    never went through validate_settings), custom when a name other than the
+    station's own is written there, fixed otherwise."""
+    raw = raw_dj if isinstance(raw_dj, dict) else {}
+    key = role + "_name"
+    mode = str(raw.get(key + "_mode") or "").strip().lower()
+    if mode in CAST_MODES:
+        return mode
+    name = cast_name_clean(raw.get(key))
+    return "custom" if name and name != CAST_DEFAULT_NAMES[role] else "fixed"
+
+
+def cast_settings_clean(raw_dj: Any) -> dict[str, Any]:
+    """[cast-names] The cast's keys of the DJ settings, validated: for host,
+    cohost and sfxguy, <role>_name (the operator's text for custom - the
+    station's name when it is empty or will not do), <role>_name_mode and
+    <role>_name_pool; and cast_reroll_daily."""
+    raw = raw_dj if isinstance(raw_dj, dict) else {}
+    out: dict[str, Any] = {}
+    for role in CAST_ROLES:
+        key = role + "_name"
+        out[key] = cast_name_clean(raw.get(key)) or CAST_DEFAULT_NAMES[role]
+        out[key + "_mode"] = cast_mode_of(raw, role)
+        out[key + "_pool"] = (cast_pool_clean(raw.get(key + "_pool"))
+                              or list(CAST_NAME_POOL))
+    out["cast_reroll_daily"] = bool(raw.get("cast_reroll_daily", True))
+    return out
+
+
 DEFAULT_DJ = {
     "station_name": PINE_BOX_FM,
     "persona": (
@@ -1370,7 +1453,19 @@ DEFAULT_DJ = {
         "music": True, "workplace": True,
     },
     "radio_prompt_presets": {},
+    # [cast-names] the cast: a name, how it is chosen (fixed / custom /
+    # random) and the pool a random one is rolled from. Skip was already
+    # here; the host's name was a dead key (#750) and the SFX guy had none.
+    "host_name": "Dill",
+    "host_name_mode": "fixed",
+    "host_name_pool": list(CAST_NAME_POOL),
     "cohost_name": "Skip",
+    "cohost_name_mode": "fixed",
+    "cohost_name_pool": list(CAST_NAME_POOL),
+    "sfxguy_name": "Sam",
+    "sfxguy_name_mode": "fixed",
+    "sfxguy_name_pool": list(CAST_NAME_POOL),
+    "cast_reroll_daily": True,
     "cohost_persona": (
         "You are Skip, the co-host on Pine Box FM. Deadpan, quick, fond of "
         "the host but merciless about his habits. You have been doing this "
@@ -2543,8 +2638,9 @@ def validate_settings(data: Any) -> dict[str, Any]:
                   if isinstance(item, dict) and str(item.get("text") or "").strip()][:40]
             for key in RADIO_PROMPT_SLOTS
         },
-        "cohost_name": str(
-            raw_dj.get("cohost_name") or DEFAULT_DJ["cohost_name"])[:40],
+        # [cast-names] host_name, cohost_name, sfxguy_name, their modes and
+        # pools, cast_reroll_daily: validated names, never a dropped key.
+        **cast_settings_clean(raw_dj),
         "cohost_persona": str(
             raw_dj.get("cohost_persona") or DEFAULT_DJ["cohost_persona"])[:2000],
         "cohost_voice": str(raw_dj.get("cohost_voice") or "")[:100],
@@ -16156,6 +16252,12 @@ def dialogue_row_ready(kind: str, row: Any) -> bool:
         if (content_gate_enabled("phrase_ban") and callable(_phrase_gate)
                 and _phrase_gate(kind, row)):
             return False
+        # [cast-names] ...and a round whose recorded words say a name the
+        # cast no longer goes by waits for the rename desk to re-record
+        # those lines. The same callable lookup, for the same reason.
+        _cast_gate = globals().get("cast_names_row_blocked")
+        if callable(_cast_gate) and _cast_gate(kind, row):
+            return False
         entry = dialogue_entry(row)
         if entry is not None:
             if entry.get("review_cancel_pending"):
@@ -21211,6 +21313,12 @@ def shelf_put(kind: str, row: dict[str, Any]) -> None:
         # and nothing in the station checked.
         try:
             row.setdefault("cast", cast_signature())
+        except Exception:  # noqa: BLE001
+            pass
+        # [cast-names] ...and WHAT THEY WERE CALLED: the names the words
+        # were written under, so a rename later is an exact check.
+        try:
+            cast_names_stamp_row(row)
         except Exception:  # noqa: BLE001
             pass
         # #968: judged as it is shelved, while the script is right here.
@@ -31264,7 +31372,8 @@ def overdwelt_subjects(most: int = 4) -> list[str]:
     # The pair's own names and the station recur by nature — never flag them.
     dj = dj_settings()
     exempt = {w.lower() for field in ("station_name", "cohost_name",
-                                      "third_name", "manager_name")
+                                      "third_name", "manager_name",
+                                      "host_name", "sfxguy_name")   # [cast-names]
               for w in str(dj.get(field) or "").split()}
     exempt |= {"pine", "box", "boxes", "the", "and", "you", "well", "look",
                "yeah", "okay", "right", "listen", "folks", "tonight"}
@@ -33099,9 +33208,998 @@ _RADIO.update({
 _DJ_SKIP: list[Any] = []          # an asyncio.Event, created on the loop
 
 
+# --- [cast-names] THE CAST HAVE NAMES ------------------------------------------
+# "In the system let's establish these as the following characters. Dill
+# (Host) / Skip (Co-Host) / Sam (SFX guy)." ... "Connect it to the props in
+# the DJ options so i can change the names if needed or the user can set it
+# to custom names or have them be custom names or even random names if
+# desired." (operator, 2026-09-28)
+#
+# cast_name(role) answers every name, by the mode the DJ options set:
+#   fixed   the station's own - Dill, Skip, Sam
+#   custom  the operator's text (host_name / cohost_name / sfxguy_name)
+#   random  a name rolled off the character's pool (<role>_name_pool)
+#           through System 3's dice door - once a station day (unless
+#           cast_reroll_daily is off) or when the operator presses "roll
+#           new names" - and kept in data/cast_names.json, so a restart
+#           keeps it.
+# dj_settings() carries the answers under host_name / cohost_name /
+# sfxguy_name, so every road that already read those keys - the writing
+# prompts, System 3's seats, the booth glass, the script - says the same
+# name without knowing any of this exists. load_settings()["dj"] keeps what
+# the operator stored (the custom text, the mode, the pool).
+CAST_NAMES_PATH = data_path("cast_names.json")
+CAST_ROLE_OF = {"host": "host", "dj": "host", "a": "host",
+                "cohost": "cohost", "co-host": "cohost", "b": "cohost",
+                "sfxguy": "sfxguy", "sfx": "sfxguy", "drop": "sfxguy",
+                "third": "third", "guest": "third", "d": "third",
+                "manager": "manager"}
+CAST_WHO = {"host": "the host", "cohost": "the co-host",
+            "sfxguy": "the SFX guy"}
+# What the code called him before he had a name. A road that still hands
+# one of these in for his line gets the name he goes by now.
+CAST_LEGACY_SFX = ("the sfx guy", "sfx guy")
+_CAST_LOCK = RLock()          # a roll (never waited on from the loop)
+_CAST_LOAD_LOCK = RLock()     # the first read of the file, and nothing else
+_CAST_SAVE_LOCK = RLock()     # the keeper's write
+_CAST_STATE: dict[str, Any] = {"loaded": False, "rolled": {},
+                               "rolling": False, "version": 0}
+_CAST_MEMO: dict[int, tuple[Any, ...]] = {}   # id -> (dict, day, version, names)
+_CAST_OVERLAY: list[Any] = [None]             # (settings dict, names, the copy)
+
+
+# The show day a rolled name holds for turns at five in the morning - where
+# the booth's own clock ends "the small hours" - not at midnight, in the
+# middle of the late show.
+CAST_DAY_TURNS = 5
+
+
+def cast_day(now: float | None = None) -> str:
+    """[cast-names] The station's show day a rolled name holds for: the local
+    date, turning at CAST_DAY_TURNS o'clock."""
+    at = time.time() if now is None else float(now)
+    return time.strftime("%Y-%m-%d", time.localtime(at - CAST_DAY_TURNS * 3600))
+
+
+def _cast_state() -> dict[str, Any]:
+    """The rolled names, read off data/cast_names.json the first time they
+    are asked for. A missing or broken file is no rolls yet, never an error."""
+    if _CAST_STATE["loaded"]:
+        return _CAST_STATE
+    with _CAST_LOAD_LOCK:
+        if _CAST_STATE["loaded"]:
+            return _CAST_STATE
+        rolled: dict[str, dict[str, Any]] = {}
+        try:
+            got = json.loads(CAST_NAMES_PATH.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            got = {}
+        book = got.get("rolled") if isinstance(got, dict) else None
+        for role, row in (book.items() if isinstance(book, dict) else ()):
+            if role not in CAST_ROLES or not isinstance(row, dict):
+                continue
+            name = cast_name_clean(row.get("name"))
+            if not name:
+                continue
+            try:
+                at = float(row.get("at") or 0)
+            except (TypeError, ValueError):
+                at = 0.0
+            rolled[role] = {"name": name, "day": str(row.get("day") or "")[:10],
+                            "at": at, "pool": str(row.get("pool") or "")[:16]}
+        _CAST_STATE["rolled"] = rolled
+        _CAST_STATE["loaded"] = True
+    return _CAST_STATE
+
+
+def _cast_save(wait: bool = False) -> None:
+    """Keep the rolled names (a temp file, then a rename) - off the caller's
+    thread unless `wait`: a roll can be asked for from the event loop, and
+    data/ is a network share."""
+    def write() -> None:
+        with _CAST_SAVE_LOCK:
+            book = dict(_CAST_STATE["rolled"])
+            try:
+                CAST_NAMES_PATH.parent.mkdir(parents=True, exist_ok=True)
+                tmp = CAST_NAMES_PATH.with_suffix(".tmp")
+                tmp.write_text(json.dumps(
+                    {"rolled": book, "saved_at": round(time.time(), 3)},
+                    indent=1) + "\n", encoding="utf-8")
+                tmp.replace(CAST_NAMES_PATH)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[cast-names] the rolled names were not kept: {exc}",
+                      flush=True)
+    if wait:
+        write()
+    else:
+        Thread(target=write, name="cast-names-keep", daemon=True).start()
+
+
+def _cast_pool(dj: dict[str, Any], role: str) -> list[str]:
+    return cast_pool_clean(dj.get(role + "_name_pool")) or list(CAST_NAME_POOL)
+
+
+def _cast_pool_sig(pool: list[str]) -> str:
+    return hashlib.sha1("\n".join(pool).encode("utf-8")).hexdigest()[:8]
+
+
+def _cast_fresh(got: dict[str, Any], dj: dict[str, Any], role: str,
+                day: str) -> bool:
+    """Whether a rolled name still stands: rolled today (or the daily roll
+    is off), off the pool in the DJ options - or that pool still holds it."""
+    name = str((got or {}).get("name") or "")
+    if not name:
+        return False
+    if dj.get("cast_reroll_daily", True) and got.get("day") != day:
+        return False
+    pool = _cast_pool(dj, role)
+    return (got.get("pool") == _cast_pool_sig(pool)
+            or name.lower() in {n.lower() for n in pool})
+
+
+def _cast_roll(role: str, dj: dict[str, Any],
+               avoid: set[str]) -> tuple[str, str]:
+    """One random name for `role`, through System 3's dice door: the pool goes
+    on the operator's desk (POOLS1) under a key made of the pool itself - so
+    the pool in the DJ options is always the one drawn from - and the roll is
+    recorded. `avoid` (the rest of the cast, and a name being replaced) is
+    held back while the pool has anybody else. System 3 off: the station's
+    own random. Returns (the name, the pool's signature)."""
+    pool = _cast_pool(dj, role)
+    sig = _cast_pool_sig(pool)
+    key = "cast.%s.%s" % (role, sig)
+    label = "a random name for " + CAST_WHO[role]
+    name = ""
+    try:
+        desk = [n for n in (cast_name_clean(x)
+                            for x in s3_pool(key, pool, label)) if n] or pool
+        left = [n for n in desk if n.lower() not in avoid] or desk
+        name = cast_name_clean(s3_choice(key, left, label, tabled=False))
+    except Exception:  # noqa: BLE001 - the dice never cost him his name
+        name = ""
+    if not name:
+        name = random.choice([n for n in pool if n.lower() not in avoid] or pool)
+    return name, sig
+
+
+def _cast_roll_roles(dj: dict[str, Any], roles: list[str],
+                     names: dict[str, str], force: bool = False,
+                     wait: float = 0.0) -> dict[str, str]:
+    """Roll `roles` - the stale ones, or every one the operator asked for -
+    and keep the result. The caller is never held on the lock unless `wait`
+    says so: a busy roll hands the names back as they were, and the next ask
+    rolls. A roll that asks for the cast's names on its way through the dice
+    gets them as they are (the `rolling` flag)."""
+    locked = (_CAST_LOCK.acquire(timeout=wait) if wait > 0
+              else _CAST_LOCK.acquire(blocking=False))
+    if not locked:
+        return names
+    try:
+        st = _cast_state()
+        if st["rolling"]:
+            return names
+        st["rolling"] = True
+        try:
+            out = dict(names)
+            day = cast_day()
+            said = []
+            for role in roles:
+                prev = st["rolled"].get(role) or {}
+                if not force and _cast_fresh(prev, dj, role, day):
+                    out[role] = prev["name"]
+                    continue
+                avoid = {str(n).lower() for r, n in out.items() if r != role}
+                if force and prev.get("name"):
+                    avoid.add(str(prev["name"]).lower())
+                name, sig = _cast_roll(role, dj, avoid)
+                st["rolled"] = dict(st["rolled"], **{role: {
+                    "name": name, "day": day, "at": round(time.time(), 3),
+                    "pool": sig}})
+                out[role] = name
+                said.append("%s is %s" % (CAST_WHO[role], name))
+            if said:
+                st["version"] += 1
+                _CAST_MEMO.clear()
+                _cast_save(wait=wait > 0)
+                try:
+                    pipeline_log("air", "[cast-names] rolled: " + ", ".join(said))
+                except Exception:  # noqa: BLE001
+                    pass
+            return out
+        finally:
+            st["rolling"] = False
+    finally:
+        _CAST_LOCK.release()
+
+
+def _cast_settings(dj: Any = None) -> dict[str, Any]:
+    """The DJ settings a name is read from: `dj` when it is one, else the
+    stored settings - never anything that is not a dict."""
+    if isinstance(dj, dict):
+        return dj
+    got = load_settings()
+    raw = got.get("dj") if isinstance(got, dict) else None
+    return raw if isinstance(raw, dict) else DEFAULT_DJ
+
+
+def cast_names(dj: dict[str, Any] | None = None) -> dict[str, str]:
+    """[cast-names] {"host", "cohost", "sfxguy"} -> the name each goes by right
+    now. A random name whose day has turned (or whose pool no longer holds
+    it) is rolled here, once. Memoised on the settings dict, the day and the
+    rolls, so the hot road through dj_settings() is a dictionary read. Never
+    raises: a name is never worth a road its line."""
+    try:
+        return _cast_names(_cast_settings(dj))
+    except Exception:  # noqa: BLE001
+        return dict(CAST_DEFAULT_NAMES)
+
+
+def _cast_names(raw: dict[str, Any]) -> dict[str, str]:
+    st = _cast_state()
+    day = cast_day()
+    memo = _CAST_MEMO.get(id(raw))
+    if (memo is not None and memo[0] is raw and memo[1] == day
+            and memo[2] == st["version"]):
+        return dict(memo[3])
+    out: dict[str, str] = {}
+    stale: list[str] = []
+    for role in CAST_ROLES:
+        key = role + "_name"
+        mode = cast_mode_of(raw, role)
+        if mode == "custom":
+            out[role] = cast_name_clean(raw.get(key)) or CAST_DEFAULT_NAMES[role]
+        elif mode == "random":
+            prev = st["rolled"].get(role) or {}
+            out[role] = str(prev.get("name") or "") or CAST_DEFAULT_NAMES[role]
+            if not _cast_fresh(prev, raw, role, day):
+                stale.append(role)
+        else:
+            out[role] = CAST_DEFAULT_NAMES[role]
+    if stale:
+        out = _cast_roll_roles(raw, stale, out)
+        if any(not _cast_fresh(st["rolled"].get(r) or {}, raw, r, day)
+               for r in stale):
+            return out                  # the dice were busy: ask again next time
+    if len(_CAST_MEMO) > 8:
+        _CAST_MEMO.clear()
+    _CAST_MEMO[id(raw)] = (raw, day, st["version"], dict(out))
+    return out
+
+
+def cast_name(role: str, dj: dict[str, Any] | None = None) -> str:
+    """[cast-names] The name one character goes by right now: host (Dill),
+    cohost (Skip) and sfxguy (Sam) by their modes; third - the guest or the
+    third presenter, "" for a two-hander; manager - "" when unnamed. Seat
+    words are understood too (dj, drop, sfx, guest, A, B, D)."""
+    r = CAST_ROLE_OF.get(str(role or "").strip().lower(), "")
+    if r in CAST_ROLES:
+        return cast_names(dj)[r]
+    if r in ("third", "manager"):
+        try:
+            d = dj if isinstance(dj, dict) else dj_settings()
+            return str(d.get(r + "_name") or "").strip() if isinstance(d, dict) else ""
+        except Exception:  # noqa: BLE001
+            return ""
+    return ""
+
+
+def cast_names_overlay(dj: dict[str, Any]) -> dict[str, Any]:
+    """[cast-names] The DJ settings with host_name / cohost_name / sfxguy_name
+    set to the names the characters go by right now: the same dict when they
+    already are, one cached copy per settings dict and cast otherwise."""
+    try:
+        names = cast_names(dj)
+    except Exception:  # noqa: BLE001 - a name is never worth the settings
+        return dj
+    want = {role + "_name": name for role, name in names.items()}
+    if all(dj.get(k) == v for k, v in want.items()):
+        return dj
+    memo = _CAST_OVERLAY[0]
+    if memo is not None and memo[0] is dj and memo[1] == want:
+        return memo[2]
+    out = dict(dj)
+    out.update(want)
+    _CAST_OVERLAY[0] = (dj, want, out)
+    return out
+
+
+def cast_names_state() -> dict[str, Any]:
+    """[cast-names] GET /api/cast/names: each character's name now, its mode,
+    the operator's custom text, the pool and the last roll."""
+    raw = _cast_settings()
+    names = cast_names(raw)
+    st = _cast_state()
+    return {
+        "names": dict(names), "day": cast_day(),
+        "daily": bool(raw.get("cast_reroll_daily", True)),
+        "defaults": dict(CAST_DEFAULT_NAMES),
+        "keys": {role: role + "_name" for role in CAST_ROLES},
+        "cast": {role: {"name": names[role],
+                        "mode": cast_mode_of(raw, role),
+                        "custom": str(raw.get(role + "_name") or ""),
+                        "pool": _cast_pool(raw, role),
+                        "rolled": dict(st["rolled"].get(role) or {})}
+                 for role in CAST_ROLES},
+        "third": str(raw.get("third_name") or ""),
+    }
+
+
+def cast_roll_now(roles: Any = None) -> dict[str, Any]:
+    """[cast-names] The DJ options' "roll new names": everybody set to random
+    (or those of them named in `roles`) gets a fresh name off the pool now -
+    a different one from the name they had, while the pool has another."""
+    raw = _cast_settings()
+    asked = roles if isinstance(roles, list) and roles else list(CAST_ROLES)
+    want = [r for r in CAST_ROLES if r in asked and cast_mode_of(raw, r) == "random"]
+    if not want:
+        out = cast_names_state()
+        out.update(rolled=[], said=(
+            "Nobody is set to a random name - set the host, the co-host or "
+            "the SFX guy to random in the DJ options first."))
+        return out
+    version = _cast_state()["version"]
+    after = _cast_roll_roles(raw, want, cast_names(raw), force=True, wait=5.0)
+    out = cast_names_state()
+    if _cast_state()["version"] == version:
+        out.update(rolled=[], said="The dice were busy - roll again.")
+        return out
+    out.update(rolled=want, said="Rolled: " + ", ".join(
+        "%s is %s" % (CAST_WHO[r], after[r]) for r in want) + ".")
+    return out
+
+
+@app.get("/api/cast/names")
+async def cast_names_api(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """[cast-names] Who the cast are right now, and how each name is chosen."""
+    require_read_auth(authorization)
+    return await asyncio.to_thread(cast_names_state)
+
+
+@app.post("/api/cast/names/roll")
+async def cast_names_roll_api(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """[cast-names] Roll new names for everybody set to random - the button in
+    the DJ options. Body, optional: {"roles": ["host", "cohost", "sfxguy"]}."""
+    require_auth(authorization)
+    try:
+        payload = await request.json()
+    except Exception:  # noqa: BLE001 - no body is "everybody"
+        payload = {}
+    roles = payload.get("roles") if isinstance(payload, dict) else None
+    return await asyncio.to_thread(cast_roll_now, roles)
+
+
 def dj_settings() -> dict[str, Any]:
-    settings = load_settings().get("dj") or dict(DEFAULT_DJ)
+    # [cast-names] with each character's name as the air uses it right now.
+    settings = cast_names_overlay(load_settings().get("dj") or dict(DEFAULT_DJ))
+    settings = cast_personas_follow(settings)   # [cast-names] the personas speak the names
     return system2_settings_for_work(settings) if globals().get("system2_settings_for_work") else settings
+
+
+# --- [cast-names] THE PERSONAS SPEAK THE NAMES ------------------------------------
+# "any persona/prompt that names a cast member by their default name must speak
+# the EFFECTIVE name" (2026-09-28). The co-host's persona opens "You are Skip,
+# the co-host on ..." - so while the co-host is Rex, every prompt that carries
+# it has to say Rex. It is done where every writer reads its persona, in
+# dj_settings(): the role's own default name, whole word and capitalised, is
+# spoken as the name it goes by now - in that role's persona only, and only
+# when the two differ. The operator's stored text is never rewritten
+# (load_settings()["dj"] keeps it and the persona editor reads that), and "the
+# host" - the owner, in the station's own personas - is not a name and is left
+# alone.
+CAST_PERSONA_OF = {"host": "persona", "cohost": "cohost_persona"}
+_CAST_PERSONA_MEMO: list[Any] = [None]        # (settings dict, the copy)
+
+
+def cast_rename_text(text: Any, mapping: dict[str, str] | None) -> str:
+    """[cast-names] `text` with each old name in `mapping` - whole word, as
+    written (capitalised) - replaced by its new one. One pass, so two names
+    that trade places trade cleanly."""
+    said = str(text or "")
+    pairs = {str(o): str(n) for o, n in (mapping or {}).items()
+             if str(o or "") and str(n or "") and str(o) != str(n)}
+    if not said or not pairs:
+        return said
+    rx = re.compile(r"\b(" + "|".join(re.escape(o) for o in sorted(pairs, key=len, reverse=True)) + r")\b")
+    return rx.sub(lambda m: pairs[m.group(1)], said)
+
+
+def cast_persona(role: str, text: Any, name: str = "") -> str:
+    """[cast-names] A role's persona as a prompt reads it: the role's default
+    name spoken as the name the character goes by now."""
+    default = CAST_DEFAULT_NAMES.get(str(role or ""), "")
+    now = str(name or "") or cast_name(role)
+    if not default or not now or now == default:
+        return str(text or "")
+    return cast_rename_text(text, {default: now})
+
+
+def cast_personas_follow(dj: dict[str, Any]) -> dict[str, Any]:
+    """[cast-names] The DJ settings with each cast persona following its
+    name (above). The same dict when nothing changes; one cached copy per
+    settings dict otherwise."""
+    memo = _CAST_PERSONA_MEMO[0]
+    if memo is not None and memo[0] is dj:
+        return memo[1]
+    out = dj
+    try:
+        for role, key in CAST_PERSONA_OF.items():
+            text = dj.get(key)
+            if not isinstance(text, str) or not text:
+                continue
+            said = cast_persona(role, text, str(dj.get(role + "_name") or ""))
+            if said != text:
+                if out is dj:
+                    out = dict(dj)
+                out[key] = said
+    except Exception:  # noqa: BLE001 - a persona is never worth the settings
+        out = dj
+    _CAST_PERSONA_MEMO[0] = (dj, out)
+    return out
+
+
+# --- [cast-names] A CALLER IS NEVER A CAST MEMBER ----------------------------------
+def cast_taken_names() -> frozenset[str]:
+    """[cast-names] The names a caller may not ring in under, lower-cased: the
+    host's, the co-host's, the SFX guy's - and the third seat's while it is
+    filled."""
+    try:
+        taken = {str(n).strip().lower() for n in cast_names().values() if str(n).strip()}
+        third = str(cast_name("third") or "").strip().lower()
+        if third:
+            taken.add(third)
+        return frozenset(taken)
+    except Exception:  # noqa: BLE001
+        return frozenset()
+
+
+def cast_name_taken(name: Any, taken: Any = None) -> bool:
+    """[cast-names] Whether `name` is a cast member's - the whole name, or its
+    first word: a stranger called Skip, or Skip Johnson, on the line with Skip
+    in the booth is two people nobody listening can tell apart."""
+    said = " ".join(str(name or "").split()).lower()
+    if not said:
+        return False
+    names = cast_taken_names() if taken is None else taken
+    return said in names or said.split(" ", 1)[0] in names
+
+
+# --- [cast-names] THE MODULES THAT WRITE ABOUT THE CAST ASK FOR THEIR NAMES ---
+try:
+    import director as _cast_director
+    _cast_director.CAST_NAME = cast_name       # its "sfx" beat names him
+except Exception:  # noqa: BLE001 - the director says Sam on its own
+    pass
+
+
+# --- [cast-names] STALE NAMES IN THE BANK -----------------------------------------
+# With names rolled once a show day, a round banked under yesterday's names
+# says yesterday's names. So a bank remembers the names it was written under
+# (row["cast_names"]: shelf_put stamps it; the rename desk stamps any row it
+# finds without one, with the names in force when it first sees it), and a
+# banked row whose recorded words say a name the cast no longer goes by does
+# not air as it is: dialogue_row_ready holds it (cast_names_row_blocked, beside
+# #1239's phrase gate), the row says why (row["cast_stale"]), and the rename
+# desk re-records just the lines that say it, with the names changed, then
+# swaps words and takes in one dict operation - after which it airs again.
+#
+# Why not through the recast desk (#1215) itself: its shadow is keyed to each
+# take's OWN text (open_round -> key_fn(take["text"], new voice)),
+# stale_takes() only ever compares voices, and swap_round()/swap_read() never
+# touch the words - a rename through it would put new-name audio under
+# old-name words, and its next sweep would cancel a shadow whose voices had not
+# moved. So this desk keeps its own shadow (entry["cast_rename"]) beside the
+# recast desk's and rides the same road: prep_render_line, the same rest, the
+# same line budget, prep_should_stop() between every line, the keeper's clock.
+# A swap here drops an open voice shadow on the same row (the recast desk
+# reopens it from the new words on its next sweep), and a voice swap there
+# makes this desk reopen in the new voice - they never fight over one take.
+#
+# The line banks that are not rounds or reads - the gold bars, the SFX guy's
+# banked lines - have no road that re-records changed words; one that says a
+# gone name is held back (cast_names_line_stale) and ages out as it would.
+CAST_STAMP_KEY = "cast_names"
+CAST_STALE_KEY = "cast_stale"
+CAST_RENAME_KEY = "cast_rename"
+CAST_RENAME_DONE_KEY = "cast_rename_done"
+CAST_RENAME_REST = 4.0
+CAST_RENAME_LINES_PER_TICK = 2
+CAST_RENAME_KEEP_OLD_S = 3600.0      # the old clips stay protected this long
+CAST_HISTORY_PATH = data_path("cast_names_history.json")
+CAST_HISTORY_MOST = 40
+CAST_READ_SEAT = {"ad": "dj", "station_id": "drop"}
+_CAST_HISTORY: dict[str, Any] = {"loaded": False, "seen": {}}
+_CAST_HISTORY_LOCK = RLock()
+_CAST_GONE_MEMO: list[Any] = [None]  # (names key, history size, {role: [gone]})
+_CAST_RENAME_TICK: dict[str, Any] = {"at": 0.0, "stamped": 0, "opened": 0,
+                                     "lines": 0, "swaps": 0, "held": 0, "why": ""}
+
+
+def _cast_key(names: Any) -> str:
+    got = names if isinstance(names, dict) else {}
+    return "|".join("%s=%s" % (r, str(got.get(r) or "")) for r in CAST_ROLES)
+
+
+def _cast_history() -> dict[str, list[str]]:
+    """Every name each character has gone by (data/cast_names_history.json),
+    read once. The guess for a line bank row that carries no stamp."""
+    if not _CAST_HISTORY["loaded"]:
+        with _CAST_HISTORY_LOCK:
+            if not _CAST_HISTORY["loaded"]:
+                seen: dict[str, list[str]] = {}
+                try:
+                    got = json.loads(CAST_HISTORY_PATH.read_text(encoding="utf-8"))
+                except Exception:  # noqa: BLE001 - no file is no names gone by
+                    got = {}
+                book = got.get("seen") if isinstance(got, dict) else None
+                for role in CAST_ROLES:
+                    rows = (book or {}).get(role) if isinstance(book, dict) else None
+                    seen[role] = [n for n in (cast_name_clean(x) for x in (rows or [])
+                                              if isinstance(rows, list)) if n][-CAST_HISTORY_MOST:]
+                _CAST_HISTORY["seen"] = seen
+                _CAST_HISTORY["loaded"] = True
+    return _CAST_HISTORY["seen"]
+
+
+def cast_history_note(names: dict[str, str] | None = None) -> bool:
+    """Remember the names in force (the keeper's clock calls this). True
+    when one was new - and then the book is written, off the caller's thread."""
+    now = names or cast_names()
+    seen = _cast_history()
+    changed = False
+    with _CAST_HISTORY_LOCK:
+        for role in CAST_ROLES:
+            name = str(now.get(role) or "")
+            rows = seen.setdefault(role, [])
+            if name and name not in rows:
+                rows.append(name)
+                del rows[:-CAST_HISTORY_MOST]
+                changed = True
+        snap = {r: list(v) for r, v in seen.items()}
+    if changed:
+        def write() -> None:
+            try:
+                CAST_HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
+                tmp = CAST_HISTORY_PATH.with_suffix(".tmp")
+                tmp.write_text(json.dumps({"seen": snap, "saved_at": round(time.time(), 3)},
+                                          indent=1) + "\n", encoding="utf-8")
+                tmp.replace(CAST_HISTORY_PATH)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[cast-names] the names book was not kept: {exc}", flush=True)
+        Thread(target=write, name="cast-names-history", daemon=True).start()
+    return changed
+
+
+def _cast_gone(now: dict[str, str]) -> dict[str, list[str]]:
+    """Per role, the names it has gone by that nobody goes by now (its
+    default and its history). Memoised on the names and the book's size."""
+    seen = _cast_history()
+    size = sum(len(v) for v in seen.values())
+    key = _cast_key(now)
+    memo = _CAST_GONE_MEMO[0]
+    if memo is not None and memo[0] == key and memo[1] == size:
+        return memo[2]
+    current = {str(n) for n in now.values() if n}
+    out: dict[str, list[str]] = {}
+    for role in CAST_ROLES:
+        gone: list[str] = []
+        for old in [CAST_DEFAULT_NAMES[role]] + list(seen.get(role) or []):
+            if old and old not in current and old not in gone:
+                gone.append(old)
+        out[role] = gone
+    _CAST_GONE_MEMO[0] = (key, size, out)
+    return out
+
+
+def cast_names_stamp_row(row: Any, names: dict[str, str] | None = None) -> bool:
+    """[cast-names] Write down, once, the names a banked row was written
+    under - on the conversation it carries (a shelf round's entry), or on the
+    row itself (a read, a larder round). True when it stamped."""
+    if not isinstance(row, dict):
+        return False
+    canonical = dialogue_entry(row) or row
+    if isinstance(canonical.get(CAST_STAMP_KEY), dict):
+        return False
+    canonical[CAST_STAMP_KEY] = dict(names or cast_names())
+    return True
+
+
+def cast_rename_map(canonical: Any, now: dict[str, str] | None = None) -> dict[str, str]:
+    """[cast-names] {old name: new name} for this row: the names it was
+    written under that the cast no longer goes by. Exact when the row carries
+    its stamp; for a row made before stamps, every name a character has gone
+    by that nobody goes by now (its default and the names book)."""
+    now = now or cast_names()
+    if not isinstance(canonical, dict):
+        return {}
+    was = canonical.get(CAST_STAMP_KEY)
+    out: dict[str, str] = {}
+    if isinstance(was, dict):
+        for role in CAST_ROLES:
+            old = cast_name_clean(was.get(role))
+            new = str(now.get(role) or "")
+            if old and new and old != new:
+                out[old] = new
+        return out
+    gone = _cast_gone(now)
+    for role in CAST_ROLES:
+        new = str(now.get(role) or "")
+        for old in gone.get(role) or []:
+            if new and old != new:
+                out.setdefault(old, new)
+    return out
+
+
+def _cast_says(text: str, name: str) -> bool:
+    return bool(name) and re.search(r"\b%s\b" % re.escape(name), text) is not None
+
+
+def _cast_spoken(canonical: dict[str, Any]) -> str:
+    """Everything the row would SAY: #1239's reading of it, and its takes."""
+    said = [phrase_row_spoken(canonical)]
+    for take in (canonical.get("takes") or [])[:200]:
+        if isinstance(take, dict) and take.get("text"):
+            said.append(str(take["text"]))
+    return "\n".join(said)
+
+
+def cast_names_row_blocked(kind: str, row: Any) -> bool:
+    """[cast-names] A banked round or read whose recorded words say a name the
+    cast no longer goes by is NOT ready: re-recording the lines is the rename
+    desk's (cast_rename_tick), and until it has swapped them in the row stays
+    on the shelf. The verdict is written on the row against the names and its
+    stamp, so the polls re-read paperwork instead of re-scanning the words;
+    with nobody renamed - the normal state - it costs one memoised read."""
+    try:
+        if not isinstance(row, dict):
+            return False
+        canonical = dialogue_entry(row) or row
+        now = cast_names()
+        rename = cast_rename_map(canonical, now)
+        if not rename:
+            if CAST_STALE_KEY in canonical:
+                canonical.pop(CAST_STALE_KEY, None)
+            return False
+        key = "%s#%s#%d" % (_cast_key(now), _cast_key(canonical.get(CAST_STAMP_KEY)),
+                            len(str(canonical.get("script") or canonical.get("text") or "")))
+        got = canonical.get(CAST_STALE_KEY)
+        if isinstance(got, dict) and str(got.get("key") or "") == key:
+            return bool(got.get("hit"))
+        spoken = _cast_spoken(canonical)
+        hit = [old for old in rename if _cast_says(spoken, old)]
+        why = ""
+        if hit:
+            said = ", ".join("%s (%s now)" % (old, rename[old]) for old in hit)
+            why = ("held off the air: its recorded words say %s - " % said
+                   + ("a produced spot has no road to re-record it, so it stays off"
+                      if (canonical is row and row.get("produced")) else
+                      "the rename desk re-records those lines with the new name, "
+                      "then it airs again") + " [cast-names]")
+        canonical[CAST_STALE_KEY] = {"key": key, "hit": hit,
+                                     "map": {old: rename[old] for old in hit},
+                                     "at": round(time.time()), "why": why}
+        return bool(hit)
+    except Exception:  # noqa: BLE001 - a name is never worth a row
+        return False
+
+
+def cast_names_line_stale(row: Any) -> bool:
+    """[cast-names] A banked LINE - a gold bar, one of the SFX guy's banked
+    lines - whose words say a name the cast no longer goes by. No road
+    re-records these; they are held back and age out as they would."""
+    try:
+        if not isinstance(row, dict):
+            return False
+        now = cast_names()
+        if (not isinstance(row.get(CAST_STAMP_KEY), dict)
+                and not any(_cast_gone(now).values())):
+            return False            # nobody has ever gone by another name
+        text = str(row.get("text") or "")
+        return bool(text) and any(_cast_says(text, old)
+                                  for old in cast_rename_map(row, now))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _cast_rename_open(kind: str, row: dict[str, Any], entry: dict[str, Any] | None,
+                      names: dict[str, str]) -> bool:
+    """Open (or refresh) the rename shadow on a held row: the lines whose
+    words change, with their new words, in the voice each line has now."""
+    canonical = entry if entry is not None else row
+    stale = canonical.get(CAST_STALE_KEY) or {}
+    mapping = {str(o): str(n) for o, n in (stale.get("map") or {}).items()}
+    if not mapping:
+        return False
+    held = canonical.get(CAST_RENAME_KEY)
+    if (isinstance(held, dict) and held.get("names") == names
+            and held.get("map") == mapping):
+        return False                    # already open for this cast
+    now = round(time.time(), 3)
+    if entry is not None:
+        if not recast_desk.round_whole(entry):
+            return False                # the recording room is still on it
+        lines = []
+        for take in (entry.get("takes") or []):
+            if not isinstance(take, dict):
+                continue
+            was = str(take.get("text") or "")
+            said = cast_rename_text(was, mapping)
+            if said == was:
+                continue
+            voice = str(take.get("voice") or "")
+            key = _recast_key_fn(said, voice)
+            have = _recast_have_fn(key) if key else None
+            lines.append({"i": int(take.get("i", -1)), "who": str(take.get("who") or ""),
+                          "text": said, "was": was, "voice": voice, "was_voice": voice,
+                          "key": key if have else "", "made": bool(have),
+                          "seconds": float((have or {}).get("seconds") or 0)})
+        if not lines:
+            # the name is in the script's paperwork but in no recorded line:
+            # nothing to record, the words are renamed where they stand
+            for field in ("script", "script_plain", "script_tinted"):
+                if isinstance(entry.get(field), str):
+                    entry[field] = cast_rename_text(entry[field], mapping)
+            entry[CAST_STAMP_KEY] = dict(names)
+            entry.pop(CAST_STALE_KEY, None)
+            entry.pop(CAST_RENAME_KEY, None)
+            return False
+        canonical[CAST_RENAME_KEY] = {"at": now, "names": dict(names), "map": mapping,
+                                      "takes": lines, "want": len(lines),
+                                      "made": sum(1 for t in lines if t["made"]),
+                                      "keys": [t["key"] for t in lines if t["key"]]}
+        return True
+    if row.get("produced"):
+        return False                    # a finished mp3: no road re-records it
+    was = str(row.get("text") or "")
+    said = cast_rename_text(was, mapping)
+    if not said or said == was:
+        return False
+    voice = str(row.get("voice") or "")
+    key = _recast_key_fn(said, voice)
+    have = _recast_have_fn(key) if key else None
+    row[CAST_RENAME_KEY] = {"at": now, "names": dict(names), "map": mapping,
+                            "text": said, "was": was, "voice": voice, "was_voice": voice,
+                            "who": str(row.get("who") or CAST_READ_SEAT.get(str(kind), "dj")),
+                            "key": key if have else "", "made": bool(have),
+                            "seconds": float((have or {}).get("seconds") or 0),
+                            "keys": [key] if have else []}
+    return True
+
+
+def _cast_rename_swap(kind: str, row: dict[str, Any],
+                      entry: dict[str, Any] | None) -> bool:
+    """Every renamed line has audio: put the new words and takes in the old
+    ones' places, in one dict operation - a round changes between airings,
+    never during one. A row that moved under the shadow (its words edited, a
+    voice swapped by the recast desk) drops it, to be reopened next pass."""
+    canonical = entry if entry is not None else row
+    shadow = canonical.get(CAST_RENAME_KEY)
+    if not isinstance(shadow, dict):
+        return False
+    mapping = {str(o): str(n) for o, n in (shadow.get("map") or {}).items()}
+    old_keys: list[str] = []
+    if entry is not None:
+        lines = [t for t in (shadow.get("takes") or []) if isinstance(t, dict)]
+        if not lines or not all(t.get("made") and t.get("key") for t in lines):
+            return False
+        by_i = {int(t.get("i", -1)): t for t in lines}
+        takes = [t for t in (entry.get("takes") or []) if isinstance(t, dict)]
+        for take in takes:
+            new = by_i.get(int(take.get("i", -1)))
+            if new is not None and (str(take.get("text") or "") != str(new.get("was") or "")
+                                    or str(take.get("voice") or "") != str(new.get("was_voice") or "")):
+                entry.pop(CAST_RENAME_KEY, None)
+                return False
+        for take in takes:
+            new = by_i.get(int(take.get("i", -1)))
+            if new is None:
+                continue
+            if take.get("key"):
+                old_keys.append(str(take["key"]))
+            take["text"] = str(new.get("text") or "")
+            take["key"] = str(new.get("key") or "")
+            if new.get("voice"):
+                take["voice"] = str(new["voice"])
+            if float(new.get("seconds") or 0) > 0:
+                take["seconds"] = float(new["seconds"])
+        entry["takes"] = takes
+        entry["keys"] = list(dict.fromkeys(str(t.get("key")) for t in takes if t.get("key")))
+        entry["seconds"] = round(sum(float(t.get("seconds") or 0) for t in takes), 2)
+        for field in ("script", "script_plain", "script_tinted"):
+            if isinstance(entry.get(field), str):
+                entry[field] = cast_rename_text(entry[field], mapping)
+        if row is not entry:
+            row["seconds"] = float(entry.get("seconds") or row.get("seconds") or 0)
+    else:
+        if not shadow.get("made") or not shadow.get("key"):
+            return False
+        if (str(row.get("text") or "") != str(shadow.get("was") or "")
+                or str(row.get("voice") or "") != str(shadow.get("was_voice") or "")):
+            row.pop(CAST_RENAME_KEY, None)
+            return False
+        if row.get("key"):
+            old_keys.append(str(row["key"]))
+        row["text"] = str(shadow.get("text") or "")
+        row["key"] = str(shadow.get("key") or "")
+        if shadow.get("voice"):
+            row["voice"] = str(shadow["voice"])
+        if shadow.get("engine"):
+            row["engine"] = str(shadow["engine"])
+        if float(shadow.get("seconds") or 0) > 0:
+            row["seconds"] = float(shadow["seconds"])
+        if isinstance(row.get("text_plain"), str):
+            row["text_plain"] = cast_rename_text(row["text_plain"], mapping)
+    # The recast desk's shadow was cut from the old words: dropped, and its
+    # next sweep reopens it from these ones if a voice still needs to move.
+    if isinstance(canonical.get(recast_desk.SHADOW), dict):
+        canonical.pop(recast_desk.SHADOW, None)
+        for gone in ("recast_needed", "recast_seats", "recast_at"):
+            canonical.pop(gone, None)
+        row.pop("recast_needed", None)
+    canonical[CAST_STAMP_KEY] = dict(shadow.get("names") or {})
+    canonical[CAST_RENAME_DONE_KEY] = {"at": time.time(), "map": mapping, "keys": old_keys}
+    canonical.pop(CAST_RENAME_KEY, None)
+    canonical.pop(CAST_STALE_KEY, None)
+    return True
+
+
+def _cast_rename_rank(kind: str, row: dict[str, Any], entry: dict[str, Any] | None,
+                      first: set[str]) -> tuple[int, int, float]:
+    try:
+        sid = str(alt_sid(str(kind), row) or "")
+    except Exception:  # noqa: BLE001
+        sid = ""
+    target = entry if entry is not None else row
+    heard = bool(float(row.get("aired_at") or 0) or int(row.get("aired") or 0))
+    return (0 if sid and sid in first else 1, 1 if heard else 0,
+            float(row.get("at") or target.get("at") or 0))
+
+
+async def cast_rename_tick(budget: int = 0, force: bool = False) -> dict[str, Any]:
+    """[cast-names] THE RENAME DESK, on the keeper's clock: stamp what is
+    unstamped, hold and open every banked row whose words say a gone name,
+    swap in what is whole, and record the renamed lines - a couple a pass,
+    behind the live road, with the same yields as the recast desk."""
+    out: dict[str, Any] = {"stamped": 0, "opened": 0, "lines": 0, "swaps": 0,
+                           "held": 0, "why": ""}
+    at = time.time()
+    if not force and at - float(_CAST_RENAME_TICK.get("at") or 0) < CAST_RENAME_REST:
+        out["why"] = "resting"
+        return out
+    _CAST_RENAME_TICK["at"] = at
+    try:
+        names = cast_names()
+        cast_history_note(names)
+        piles = _recast_piles()
+        work: list[tuple[str, dict[str, Any], dict[str, Any] | None]] = []
+        for kind, row, entry in piles:
+            canonical = entry if entry is not None else row
+            if not isinstance(canonical, dict) or canonical.get("preparing"):
+                continue
+            done = canonical.get(CAST_RENAME_DONE_KEY)
+            if (isinstance(done, dict) and done.get("keys")
+                    and at - float(done.get("at") or 0) > CAST_RENAME_KEEP_OLD_S):
+                done["keys"] = []
+            if cast_names_stamp_row(row, names):
+                out["stamped"] += 1
+                continue
+            if cast_names_row_blocked(kind, row):
+                out["held"] += 1
+                if _cast_rename_open(kind, row, entry, names):
+                    out["opened"] += 1
+            elif isinstance(canonical.get(CAST_RENAME_KEY), dict):
+                canonical.pop(CAST_RENAME_KEY, None)   # the names went back
+            if isinstance(canonical.get(CAST_RENAME_KEY), dict):
+                if _cast_rename_swap(kind, row, entry):
+                    out["swaps"] += 1
+                else:
+                    work.append((kind, row, entry))
+        out["why"] = ("the live road has the engine" if render_relief()
+                      else prep_should_stop())
+        if work and not out["why"]:
+            want = int(budget or CAST_RENAME_LINES_PER_TICK)
+            first = _recast_first_ids()
+            work.sort(key=lambda item: _cast_rename_rank(item[0], item[1], item[2], first))
+            for kind, row, entry in work:
+                if out["lines"] >= want:
+                    break
+                canonical = entry if entry is not None else row
+                shadow = canonical.get(CAST_RENAME_KEY)
+                if not isinstance(shadow, dict):
+                    continue
+                todo = ([t for t in (shadow.get("takes") or []) if isinstance(t, dict)
+                         and not t.get("made")] if entry is not None
+                        else ([] if shadow.get("made") else [shadow]))
+                for line in todo:
+                    stop = prep_should_stop()
+                    if out["lines"] >= want or stop:
+                        out["why"] = out["why"] or stop
+                        break
+                    made = await prep_render_line(
+                        str(line.get("text") or ""), str(line.get("who") or ""),
+                        str(line.get("voice") or ""), kind=str(kind))
+                    if not made or not made.get("key"):
+                        break           # the engine said no; next pass
+                    line["key"] = str(made["key"])
+                    if made.get("voice"):
+                        line["voice"] = str(made["voice"])
+                    if made.get("engine"):
+                        line["engine"] = str(made["engine"])
+                    line["seconds"] = float(made.get("seconds") or 0) or float(line.get("seconds") or 0)
+                    line["made"] = True
+                    out["lines"] += 1
+                if entry is not None:
+                    got = [t for t in (shadow.get("takes") or []) if isinstance(t, dict)]
+                    shadow["made"] = sum(1 for t in got if t.get("made"))
+                    shadow["keys"] = [str(t.get("key")) for t in got if t.get("made") and t.get("key")]
+                else:
+                    shadow["keys"] = [str(shadow["key"])] if shadow.get("made") and shadow.get("key") else []
+                if _cast_rename_swap(kind, row, entry):
+                    out["swaps"] += 1
+        if out["stamped"] or out["opened"] or out["lines"] or out["swaps"]:
+            try:
+                _larder_save()
+                _pantry_save(True)
+            except Exception:  # noqa: BLE001
+                pass
+        if out["swaps"]:
+            pipeline_log("voice", "the rename desk swapped %d banked row(s) over to the "
+                                  "cast's names now - they were off the air only while "
+                                  "the lines were re-recorded [cast-names]" % int(out["swaps"]))
+            note_action("banked rounds re-recorded with the cast's new names",
+                        "%d row(s) swapped, %d line(s) recorded"
+                        % (int(out["swaps"]), int(out["lines"])))
+    except Exception:  # noqa: BLE001
+        out["why"] = out["why"] or "the rename desk stumbled"
+    _CAST_RENAME_TICK.update({k: out[k] for k in ("stamped", "opened", "lines",
+                                                   "swaps", "held", "why")})
+    return out
+
+
+def cast_rename_state() -> dict[str, Any]:
+    """[cast-names] What the rename desk is holding and re-recording."""
+    held: list[dict[str, Any]] = []
+    open_rows = want = made = 0
+    for kind, row, entry in _recast_piles():
+        canonical = entry if entry is not None else row
+        if not isinstance(canonical, dict):
+            continue
+        stale = canonical.get(CAST_STALE_KEY)
+        shadow = canonical.get(CAST_RENAME_KEY)
+        if isinstance(stale, dict) and stale.get("hit"):
+            try:
+                sid = str(alt_sid(str(kind), row) or "")
+            except Exception:  # noqa: BLE001
+                sid = ""
+            held.append({"kind": str(kind), "sid": sid, "names": dict(stale.get("map") or {}),
+                         "why": str(stale.get("why") or ""), "open": isinstance(shadow, dict)})
+        if isinstance(shadow, dict):
+            open_rows += 1
+            if entry is not None:
+                lines = [t for t in (shadow.get("takes") or []) if isinstance(t, dict)]
+                want += len(lines)
+                made += sum(1 for t in lines if t.get("made"))
+            else:
+                want += 1
+                made += 1 if shadow.get("made") else 0
+    return {"at": time.time(), "names": cast_names(), "held": len(held),
+            "rows": held[:80], "open": open_rows, "lines_want": want,
+            "lines_made": made, "tick": dict(_CAST_RENAME_TICK),
+            "gone_by": {r: list(v) for r, v in _cast_gone(cast_names()).items()}}
+
+
+@app.get("/api/cast/rename")
+async def cast_rename_api(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """[cast-names] The rename desk: banked rows held for saying a name the
+    cast no longer goes by, and how far their re-recording has got."""
+    require_read_auth(authorization)
+    return await asyncio.to_thread(cast_rename_state)
 
 
 def configured_radio_voice(who: str, voice: str = "") -> str:
@@ -44851,6 +45949,12 @@ async def pantry_keeper() -> None:
                 pass
             try:
                 await recast_sweep()
+            except Exception:  # noqa: BLE001
+                pass
+            # [cast-names] and the rename desk: banked words that say a
+            # name the cast no longer goes by go back in, same clock.
+            try:
+                await cast_rename_tick()
             except Exception:  # noqa: BLE001
                 pass
             # #872: no task is running, so nothing is on the clock. A
@@ -62366,7 +63470,8 @@ def schedule_flow_clause(slot: dict[str, Any]) -> str:
         line = "%d. %s for about %ss. %s" % (
             index + 1, str(info.get("label") or node.get("type") or "beat"),
             int(round(float(node.get("seconds") or 0))),
-            str(info.get("instruction") or ""))
+            str(info.get("instruction") or "").replace(   # [cast-names] he has a name
+                "The SFX Guy", cast_name("sfxguy") + ", the SFX guy,"))
         detail = str(node.get("detail") or "").strip()
         if detail:
             line += " Operator detail: " + detail
@@ -78700,6 +79805,11 @@ def sfxguy_quips(voice: str = "") -> list[str]:
     return list(SFXGUY_SEED_QUIPS)
 
 
+# [s3-lists] the quip shelf's one lock: the desk's table, the quips doors and
+# the line votes all read-modify-write the same file.
+_SFXGUY_QUIPS_LOCK = RLock()
+
+
 def sfxguy_quips_save(rows: list[str], voice: str = "") -> None:
     v = _sfxguy_voice(voice)
     SFXGUY_QUIPS_DIR.mkdir(parents=True, exist_ok=True)
@@ -78796,6 +79906,8 @@ def _sfxguy_ready_valid(row: dict[str, Any], voice: str = "",
             or row.get("key") != pantry_key(text, voice, engine)
             or row.get("review_cancel_pending") or row.get("off_brief")
             or not _SFX_READY_BANK.media_ready(row)):
+        return False
+    if cast_names_line_stale(row):          # [cast-names] a gone name: held back
         return False
     if dialogue_tint_wanted():
         if (not row.get("tint_ok") or not tint_coverage_ready(row.get("tint"))
@@ -79068,6 +80180,399 @@ async def _sfxguy_ready_start() -> None:
     fire_and_forget(_sfxguy_ready_clock())
 
 
+
+# --- [s3-lists] EVERY LIST THAT FEEDS THE AIR IS A TABLE ON THE DESK ----------
+# Operator (2026-09-28), pointing under POOL in System 3's Tables tab: "the
+# system that made the 'I sold the tapes to Sawyer.'. I need to be able to
+# access that list of items in that database and be able to edit them and
+# remove them / add to it. Any list to do with conversation or the roulette
+# needs to be listed here as an editable table." The machinery is
+# system3_lists.py; each list is registered here against the store that owns
+# it - its own load, save and lock - and nothing writes around them. The
+# lists that are NOT here (the response bank, the continuity pairs, the
+# liners, call scenarios, caller themes, guests, plots, the hard-coded line
+# tuples) are named in the [s3-lists] hand-off with why.
+from system3_lists import (ListError as _S3ListError, ListRegistry as _S3ListRegistry,
+                           clean_words as _s3_list_words, text_id as _s3_list_id,
+                           who_of as _s3_list_who_of)
+
+_S3_LISTS = _S3ListRegistry(data_path("system3_list_edits.jsonl"))
+
+
+def _s3_list_air() -> tuple[str, str]:
+    """The SFX speaker's voice and Crystal profile on air now ('' when he is off)."""
+    voice = str(dj_settings().get("drop_voice") or "")
+    return voice, (_sfxguy_ready_profile() if voice else "")
+
+
+# --- the SFX Guy's speech bank: whole lines recorded in his voice ------------
+def _s3_bank_add(body: dict[str, Any]) -> str:
+    voice, profile = _s3_list_air()
+    return _SFX_READY_BANK.desk_add(body.get("text"), voice, profile,
+                                    generic=body.get("generic", True) is not False)
+
+
+_S3_LISTS.register({
+    "id": "sfxguy.bank", "label": "SFX Guy's speech bank", "family": "BANK",
+    "store": "data/sfxguy_speech.json",
+    "what": ("Whole lines recorded in the SFX Guy's voice ('I sold the tapes to Sawyer.'). While System 3's "
+             "dice are live a banked line airs only when the roulette brings one up (sfxguy.bank_line) and "
+             "which one is System 3's roll among the rested takes (sfxguy.bank_take). One row is one line - "
+             "every take of those words. Rewriting a line drops its recording and it is recorded again before "
+             "it can air; a removed line never comes back from his sources; off keeps it, never picked."),
+    "schema": [{"key": "text", "kind": "text", "label": "what he says, word for word"}],
+    "rows": lambda: _SFX_READY_BANK.desk_rows(*_s3_list_air()),
+    "add": _s3_bank_add,
+    "edit": lambda rid, body: _SFX_READY_BANK.desk_edit(rid, body.get("text")),
+    "switch": lambda rid, on: _SFX_READY_BANK.desk_switch(rid, on),
+    "remove": lambda rid: _SFX_READY_BANK.desk_remove(rid),
+})
+
+
+# --- his quip shelf (the voice on air) ---------------------------------------
+def _s3_quips_rows() -> list[dict[str, Any]]:
+    said, now = _sfxguy_said(), time.time()
+    out = []
+    for at, q in enumerate(sfxguy_quips()):
+        last = float(said.get(_sfxguy_key(q)) or 0)
+        out.append({"id": _s3_list_id(q), "text": q,
+                    "state": "resting" if now - last < 3600 else "ready",
+                    "last_played": last,
+                    "note": "also a source of his speech bank" if at < 16 else ""})
+    return out
+
+
+def _s3_quips_change(rid: str, text: Any = None, add: bool = False) -> str:
+    with _SFXGUY_QUIPS_LOCK:
+        rows = sfxguy_quips()
+        ids = [_s3_list_id(q) for q in rows]
+        words = _s3_list_words(text, 200) if (add or text is not None) else ""
+        if words and _s3_list_id(words) in ids and _s3_list_id(words) != rid:
+            raise ValueError("that line is already on his shelf")
+        if add:
+            rows.append(words)
+        else:
+            if rid not in ids:
+                raise KeyError(rid)
+            if text is None:
+                rows.pop(ids.index(rid))
+            else:
+                rows[ids.index(rid)] = words
+        sfxguy_quips_save(rows)
+        return _s3_list_id(words) if words else rid
+
+
+_S3_LISTS.register({
+    "id": "sfxguy.quips", "label": "SFX Guy's quips", "family": "LIST",
+    "store": "data/sfxguy_quips/<voice on air>.json",
+    "what": ("His shelf of sayings for the voice on air. Under a System 3 round the line is System 3's pick "
+             "among the ones that have rested an hour (director.pick 'quip'); the first 16 are also sources of "
+             "his speech bank (removing one here does not take its recording out of the bank - do that there)."),
+    "schema": [{"key": "text", "kind": "text", "label": "the saying, 200 characters at most"}],
+    "rows": _s3_quips_rows,
+    "add": lambda body: _s3_quips_change("", body.get("text"), add=True),
+    "edit": lambda rid, body: _s3_quips_change(rid, body.get("text") if body.get("text") is not None else ""),
+    "remove": lambda rid: _s3_quips_change(rid),
+})
+
+
+# --- the topics board ---------------------------------------------------------
+def _s3_topics_rows() -> list[dict[str, Any]]:
+    out = []
+    for r in read_bombshells():
+        if not isinstance(r, dict) or not r.get("id"):
+            continue
+        out.append({"id": str(r["id"]), "text": str(r.get("text") or ""),
+                    "state": str(r.get("kind") or "topic"), "plays": int(r.get("used") or 0),
+                    "last_played": float(r.get("last") or 0),
+                    "note": " · ".join(x for x in (
+                        ("answered with: " + str(r["reply"])) if r.get("reply") else "",
+                        "by " + str(r.get("by") or "operator"),
+                        time.strftime("added %Y-%m-%d", time.localtime(int(r.get("added") or 0)))
+                        if r.get("added") else "") if x)})
+    return out
+
+
+def _s3_topics_add(body: dict[str, Any]) -> str:
+    text, reply = split_exchange(_s3_list_words(body.get("text")))
+    reply = reply or " ".join(str(body.get("reply") or "").split())
+    row = add_bombshell(text, str(body.get("kind") or "topic"), "operator", "", reply)
+    if not row:
+        raise OSError("the topic bank could not be written")
+    return str(row["id"])
+
+
+def _s3_topics_edit(rid: str, body: dict[str, Any]) -> str:
+    """As the board's own edit door ([topic-edit]): the id, the uses and the
+    date stay; a copy waiting in the next-banter queue is reworded with it.
+    An answer is kept unless new words carry one ("1. ... 2. ...")."""
+    text, reply = split_exchange(_s3_list_words(body.get("text")))
+    with _BOMBSHELL_LOCK:
+        rows = read_bombshells()
+        row = next((r for r in rows if isinstance(r, dict) and r.get("id") == rid), None)
+        if row is None:
+            raise KeyError(rid)
+        reply = reply or (" ".join(str(body.get("reply") or "").split()) if "reply" in body
+                          else str(row.get("reply") or ""))
+        row["text"] = text[:400]
+        if reply:
+            row["reply"] = reply[:400]
+        else:
+            row.pop("reply", None)
+        row["edited"] = int(time.time())
+        if not write_bombshells(rows):
+            raise OSError("the topic bank could not be written")
+        done = dict(row)
+    with _SWITCH_LOCK:
+        for queued in _SWITCH_QUEUE:
+            if queued.get("topic_id") != rid:
+                continue
+            shape = queued.get("topic_shape") or bombshell_shape_for(done)
+            queued["premise"] = bombshell_angle(done["text"], shape, reply)
+            queued["exchange"] = {"opener": done["text"], "reply": reply} if reply else {}
+    return rid
+
+
+def _s3_topics_remove(rid: str) -> str:
+    """Out of the bank and into the bin - nothing here is really thrown away."""
+    with _BOMBSHELL_LOCK:
+        rows = read_bombshells()
+        gone = [r for r in rows if isinstance(r, dict) and r.get("id") == rid]
+        if not gone:
+            raise KeyError(rid)
+        for r in gone:
+            r["binned_at"] = int(time.time())
+            r["binned_why"] = "removed on the System 3 desk"
+        _json_write(TOPIC_TRASH_PATH, (gone + _json_rows(TOPIC_TRASH_PATH))[:3000])
+        if not write_bombshells([r for r in rows if not (isinstance(r, dict) and r.get("id") == rid)]):
+            raise OSError("the topic bank could not be written")
+    return rid
+
+
+_S3_LISTS.register({
+    "id": "topics.board", "label": "Topics board", "family": "LIST",
+    "store": "data/banter_topics.json",
+    "what": ("The things to spring on them. System 3's TOPIC roll draws one (weight 1/(1+uses)); '1. line "
+             "2. answer' is a line and the answer to it. A removed topic goes to the bin "
+             "(banter_topics.trash.json)."),
+    "schema": [{"key": "text", "kind": "text", "label": "the topic, or '1. line 2. answer'"}],
+    "rows": _s3_topics_rows, "add": _s3_topics_add, "edit": _s3_topics_edit, "remove": _s3_topics_remove,
+})
+
+
+# --- the ad book --------------------------------------------------------------
+def _s3_ads_rows() -> list[dict[str, Any]]:
+    last: dict[str, float] = {}
+    for a in ad_airings():
+        last[str(a.get("id") or "")] = max(last.get(str(a.get("id") or ""), 0.0), float(a.get("ts") or 0))
+    return [{"id": str(r["id"]), "text": str(r.get("text") or ""), "on": r.get("auto_air") is not False,
+             "state": "produced" if r.get("audio") else "read", "plays": int(r.get("uses") or 0),
+             "last_played": last.get(str(r["id"]), 0.0),
+             "note": " · ".join(x for x in (str(r.get("product") or ""), str(r.get("kind") or "")) if x)}
+            for r in sorted(ad_list(), key=lambda r: -int(r.get("ts") or 0)) if r.get("id")]
+
+
+def _s3_ads_edit(rid: str, body: dict[str, Any]) -> str:
+    """New words for a read. A produced spot's recording is of the old words:
+    it is dropped (recut it on the ads desk to produce it again)."""
+    text = _s3_list_words(body.get("text"), 1200)
+    with _ADS_LOCK:
+        row = next((r for r in ad_list() if r.get("id") == rid), None)
+        if row is None:
+            raise KeyError(rid)
+        fields: dict[str, Any] = {"text": text}
+        if body.get("product"):
+            fields["product"] = str(body["product"])[:200]
+        if row.get("audio") and text != str(row.get("text") or ""):
+            try:
+                (PRODUCED_ADS_DIR / str(row["audio"])).unlink(missing_ok=True)
+            except OSError:
+                pass
+            fields["audio"] = ""
+        ad_update(rid, **fields)
+    return rid
+
+
+def _s3_ads_switch(rid: str, on: bool) -> str:
+    """auto_air: every ad pick (the book, the cupboard, System 3's ad road) skips a read that is off."""
+    with _ADS_LOCK:
+        rows = ad_list()
+        row = next((r for r in rows if r.get("id") == rid), None)
+        if row is None:
+            raise KeyError(rid)
+        row["auto_air"] = bool(on)
+        _ads_write(rows)
+    return rid
+
+
+def _s3_ads_remove(rid: str) -> str:
+    with _ADS_LOCK:
+        if not any(r.get("id") == rid for r in ad_list()):
+            raise KeyError(rid)
+        ad_delete(rid)
+    return rid
+
+
+_S3_LISTS.register({
+    "id": "ads.book", "label": "Ad book", "family": "LIST",
+    "store": "data/ad_reads.json",
+    "what": ("Every ad read the station keeps. System 3 draws which spot airs among the reads that have run "
+             "least (road ad_spot; ad.read_pick, ad.cupboard_spot). Off keeps a read out of every draw; "
+             "rewriting a produced spot drops its recording."),
+    "schema": [{"key": "text", "kind": "text", "label": "the read, word for word"}],
+    "rows": _s3_ads_rows,
+    "add": lambda body: str(ad_save(str(body.get("product") or "house ad")[:200],
+                                    _s3_list_words(body.get("text"), 1200), kind="written")["id"]),
+    "edit": _s3_ads_edit, "switch": _s3_ads_switch, "remove": _s3_ads_remove,
+})
+
+
+# --- the manager's intercom pages ---------------------------------------------
+def _s3_upstairs_edit(rid: str, body: dict[str, Any]) -> str:
+    """New words for a page. Its recording is of the old words and a page airs
+    only recorded, so the recording is dropped - recut it on the recordings desk."""
+    text = _s3_list_words(body.get("text"), 2000)
+    with _UPSTAIRS_LOCK:
+        row = next((r for r in upstairs_list() if r.get("id") == rid), None)
+        if row is None:
+            raise KeyError(rid)
+        fields: dict[str, Any] = {"text": text}
+        if row.get("audio") and text != str(row.get("text") or ""):
+            try:
+                (UPSTAIRS_AUDIO_DIR / str(row["audio"])).unlink(missing_ok=True)
+            except OSError:
+                pass
+            fields["audio"] = ""
+        upstairs_update(rid, **fields)
+    return rid
+
+
+def _s3_upstairs_remove(rid: str) -> str:
+    with _UPSTAIRS_LOCK:
+        if not any(r.get("id") == rid for r in upstairs_list()):
+            raise KeyError(rid)
+        upstairs_delete(rid)
+    return rid
+
+
+_S3_LISTS.register({
+    "id": "upstairs.pages", "label": "Upstairs pages", "family": "LIST",
+    "store": "data/upstairs_pages.json",
+    "what": ("The manager's intercom pages. A recorded page is replayed least-recently-aired first; a page "
+             "without a recording does not air (recut it on the recordings desk). Rewriting a page drops "
+             "its recording."),
+    "schema": [{"key": "text", "kind": "text", "label": "the page, word for word"}],
+    "rows": lambda: [{"id": str(r["id"]), "text": str(r.get("text") or ""),
+                      "state": "recorded" if r.get("audio") else "not recorded",
+                      "plays": int(r.get("uses") or 0), "last_played": float(r.get("last") or 0),
+                      "note": str(r.get("gripe") or "")}
+                     for r in upstairs_list() if r.get("id")],
+    "add": lambda body: str(upstairs_save(_s3_list_words(body.get("text"), 2000), "", "the System 3 desk")["id"]),
+    "edit": _s3_upstairs_edit, "remove": _s3_upstairs_remove,
+})
+
+
+# --- the gold bank: rhymed bars that aired with a finished take ---------------
+def _s3_gold_burn(rid: str) -> str:
+    """As /api/gold/burn: into the bin (data/gold_burnt.json), restorable."""
+    with _WORD_DIAL_LOCK:
+        rows = _gold_rows()
+        take = [b for b in rows if str(b.get("key")) == rid]
+        if not take:
+            raise KeyError(rid)
+        for b in take:
+            b["burnt_at"] = int(time.time())
+            b["burnt_why"] = "removed on the System 3 desk"
+        word_edit_note("/api/system3/lists/gold.bars", key=rid, was={"keys": [rid]}, now=None,
+                       node_type="gold", word="", say="burnt 1 bar(s)")
+        _json_write(GOLD_BURNT_PATH, (take + gold_burnt_rows())[:4000])
+        rows[:] = [b for b in rows if str(b.get("key")) != rid]
+        _gold_save()
+    return rid
+
+
+_S3_LISTS.register({
+    "id": "gold.bars", "label": "Gold bars", "family": "BANK", "loop": True,
+    "store": "data/gold_bars.json",
+    "what": ("Rhymed lines that aired with a finished take, kept to fire again: in dead air, and inside a "
+             "round when gold.in_round comes up; which bar is System 3's roll (gold.pick). A bar is its "
+             "recording, so it can only be burnt here (to the bin; /api/gold/restore puts it back)."),
+    "schema": [{"key": "text", "kind": "text", "label": "the bar (its recording - not editable)"}],
+    "rows": lambda: [{"id": str(b.get("key")), "text": str(b.get("text") or ""), "state": "banked",
+                      "plays": int(b.get("fired") or 0), "last_played": float(b.get("last") or 0),
+                      "note": " · ".join(x for x in (str(b.get("who") or ""),
+                                                     ("%.1f s" % float(b["seconds"])) if b.get("seconds") else "") if x)}
+                     for b in list(_gold_rows()) if b.get("key")],
+    "remove": _s3_gold_burn,
+})
+
+
+def _s3_list_who(request: Request) -> dict[str, Any]:
+    return _s3_list_who_of(str(getattr(request.client, "host", "") or ""),
+                           str(request.headers.get("user-agent") or ""))
+
+
+async def _s3_list_call(list_id: str, fn: Any) -> Any:
+    """A store's own doors, off the loop - except a store whose writers all
+    live on the loop (the gold bank), which is called where they are."""
+    try:
+        spec = _S3_LISTS.lists.get(str(list_id)) or {}
+        return fn() if spec.get("loop") else await asyncio.to_thread(fn)
+    except _S3ListError as exc:
+        raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+
+
+async def _s3_list_body(request: Request) -> dict[str, Any]:
+    try:
+        got = await request.json() if await request.body() else {}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="not JSON: %s" % exc) from exc
+    if not isinstance(got, dict):
+        raise HTTPException(status_code=400, detail="a JSON object, please")
+    return got
+
+
+@app.get("/api/system3/lists")
+async def system3_lists_api(authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    """[s3-lists] every list that feeds the air, with its count and the doors it has."""
+    require_read_auth(authorization)
+    return {"lists": await asyncio.to_thread(_S3_LISTS.catalog)}
+
+
+@app.get("/api/system3/lists/{list_id}")
+async def system3_list_rows_api(list_id: str, offset: int = 0, limit: int = 50, q: str = "", state: str = "",
+                                authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    """[s3-lists] one list's rows, paged and searchable, and its newest desk edits."""
+    require_read_auth(authorization)
+    return await _s3_list_call(list_id, lambda: _S3_LISTS.page(list_id, offset=offset, limit=limit,
+                                                                q=q, state=state))
+
+
+@app.post("/api/system3/lists/{list_id}/rows")
+async def system3_list_add_api(list_id: str, request: Request,
+                               authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    require_auth(authorization)
+    body, who = await _s3_list_body(request), _s3_list_who(request)
+    return await _s3_list_call(list_id, lambda: _S3_LISTS.add(list_id, body, who))
+
+
+@app.put("/api/system3/lists/{list_id}/rows/{row_id}")
+async def system3_list_edit_api(list_id: str, row_id: str, request: Request,
+                                authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    """{text} rewrites the row, {on} switches it (a list that has a switch), both at once may."""
+    require_auth(authorization)
+    body, who = await _s3_list_body(request), _s3_list_who(request)
+    return await _s3_list_call(list_id, lambda: _S3_LISTS.edit(list_id, row_id, body, who))
+
+
+@app.delete("/api/system3/lists/{list_id}/rows/{row_id}")
+async def system3_list_remove_api(list_id: str, row_id: str, request: Request,
+                                  authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    require_auth(authorization)
+    who = _s3_list_who(request)
+    return await _s3_list_call(list_id, lambda: _S3_LISTS.remove(list_id, row_id, who))
+
+
 def _sfxguy_key(line: str) -> str:
     return hashlib.sha1(line.strip().lower().encode()).hexdigest()[:12]
 
@@ -79118,7 +80623,7 @@ async def _sfxguy_news_fill() -> None:
             if _ncrs:
                 _ntint = crystal_tint_note(s3_choice("sfxguy.news_crystal", _ncrs, "which lit crystal tints his news take", tabled=False))   # [s3-dice-door]
             take = await ask_model(
-                "You are a thick-accented, NASCAR-loving country boy in "
+                f"You are {cast_name('sfxguy')}, the SFX guy — a thick-accented, NASCAR-loving country boy in "   # [cast-names]
                 f"a radio booth. Headline: {story.get('title')}. Give ONE "
                 f"spicy, funny take on it, under {_news_words} words, no "
                 f"quotes, no explanation.{_ntint}",               # #1066
@@ -79217,7 +80722,7 @@ async def _sfxguy_warp_fill(voice: str, context: str = "") -> None:
         _story = plotline_line_clause(220)
         if context and s3_chance("sfxguy.warp_react", 0.5, "his brew reacts to the line that just aired (otherwise he warps a saying)"):   # [s3-dice-door]
             out = await ask_model(
-                "You are a thick-accented country boy in a radio booth. "
+                f"You are {cast_name('sfxguy')}, the SFX guy — a thick-accented country boy in a radio booth. "   # [cast-names]
                 f"Someone on air just said: \"{context}\". Fire back ONE "
                 "short reaction that actually engages with what was said "
                 "— heckle it, one-up it, or agree way too hard — in your "
@@ -79254,7 +80759,7 @@ async def _sfxguy_warp_fill(voice: str, context: str = "") -> None:
             "listening",
         ), "how he warps the sayings")   # [s3-dice-door]
         out = await ask_model(
-            "You are a thick-accented country boy in a radio booth. "
+            f"You are {cast_name('sfxguy')}, the SFX guy — a thick-accented country boy in a radio booth. "   # [cast-names]
             f"Take these sayings: {' / '.join(picks)} — and {recipe}."
             f"{_tinted}{_shard}{_story} Answer with the ONE new saying only, "
             f"under {_warp_words} words, no quotes, no explanation.",
@@ -79373,9 +80878,10 @@ async def sfxguy_quips_add(
             str(t).strip()]
     if not adds:
         raise HTTPException(status_code=400, detail="say something")
-    rows = sfxguy_quips(v)
-    rows.extend(a for a in adds if a not in rows)
-    sfxguy_quips_save(rows, v)
+    with _SFXGUY_QUIPS_LOCK:                                   # [s3-lists]
+        rows = sfxguy_quips(v)
+        rows.extend(a for a in adds if a not in rows)
+        sfxguy_quips_save(rows, v)
     note_action(f"🤠 the SFX guy ({v}) learned {len(adds)} new line(s)")
     return {"voice": v, "quips": rows}
 
@@ -79389,8 +80895,9 @@ async def sfxguy_quips_del(
     payload = await request.json()
     v = _sfxguy_voice(str(payload.get("voice") or ""))
     kill = str(payload.get("text") or "").strip()
-    rows = [r for r in sfxguy_quips(v) if r != kill]
-    sfxguy_quips_save(rows, v)
+    with _SFXGUY_QUIPS_LOCK:                                   # [s3-lists]
+        rows = [r for r in sfxguy_quips(v) if r != kill]
+        sfxguy_quips_save(rows, v)
     return {"voice": v, "quips": rows}
 
 
@@ -82715,7 +84222,7 @@ async def drop_liner_brew(want: int = 6) -> None:
     except Exception:  # noqa: BLE001
         seed = ""
     ask = (
-        "You are the sting voice on a radio station — the guy who says "
+        f"You are {cast_name('sfxguy')}, the SFX guy: the sting voice on a radio station — the guy who says "   # [cast-names]
         "one hard line over a stab of sound and gets out. Write "
         f"{want} DIFFERENT station IDs for a station called "
         f"\"{station}\". Rules: one line each, under twelve words, "
@@ -83859,11 +85366,11 @@ def _sfx_cadence_audible(rows, position: float, previous: float = 0.0) -> None:
                 "sfx",
                 "MP4 clip heard" if row.get("sfx_video_id") else "audio clip heard",
                 line=str(row["id"]), text=sample_name,
-                speaker="The SFX Guy")
+                speaker=cast_name("sfxguy"))   # [cast-names]
         elif heard and row.get("sfxguy_reservation"):
             note_activity("sfxguy", "interjection heard", line=str(row["id"]),
                           text=str(row.get("text") or ""),
-                          speaker="The SFX Guy")
+                          speaker=cast_name("sfxguy"))   # [cast-names]
         elif heard and row.get("sfx_reaction_for"):
             speaker = booth_actor_name(str(row.get("who") or ""), "")
             note_activity("sfxreaction", "reacted to the board", line=str(row["id"]),
@@ -85319,7 +86826,7 @@ async def _sfx_verdict(about: str) -> None:
         if not dj["drop_voice"]:
             return
         line = await ask_model(
-            "You are the SFX guy in the corner booth of a radio studio — "
+            f"You are {cast_name('sfxguy')}, the SFX guy in the corner booth of a radio studio — "   # [cast-names]
             "a man of VERY few words who almost never speaks. The "
             "presenters just appealed to you for approval about this: "
             f"\"{about[:300]}\" Write your ONE short deadpan line — firm "
@@ -85333,7 +86840,7 @@ async def _sfx_verdict(about: str) -> None:
         if line:
             await asyncio.sleep(0.6)
             await dj_speak("reply", None, line=line, who="drop",
-                           voice=dj["drop_voice"], name="The SFX Guy",
+                           voice=dj["drop_voice"], name=cast_name("sfxguy"),   # [cast-names]
                            by_hand=True)
     except Exception:
         pass
@@ -87341,7 +88848,8 @@ def gold_pick(exclude_who: str = "", min_rest: float | None = None) -> dict[str,
         # looked at, one file at a time, until one is there.
         pool = [r for r in _gold_rows()
                 if str(r.get("who") or "") != str(exclude_who or "")
-                and now - float(r.get("last") or 0) >= rest]
+                and now - float(r.get("last") or 0) >= rest
+                and not cast_names_line_stale(r)]   # [cast-names] no gone names
         while pool:
             least = min(int(r.get("fired") or 0) for r in pool)
             tier = [r for r in pool if int(r.get("fired") or 0) == least]
@@ -93253,7 +94761,7 @@ BANTER_SHAPES: tuple[tuple[str, str], ...] = (
      "Do NOT invent a call as having aired; they are talking about the "
      "phones the way people in an office talk about a customer."),
     ("the board joins in",
-     "{a} raises it and the SFX GUY behind the glass has an opinion and "
+     "{a} raises it and {guy}, the SFX guy behind the glass, has an opinion and "   # [cast-names]
      "will not keep it to himself. It becomes three-handed and the pair "
      "half-regret letting him in."),
     # #1244: THE ONE SHAPE THAT SAYS IT OUT LOUD. Every shape above is
@@ -93337,7 +94845,7 @@ def bombshell_angle(text: str, shape: str = "", reply: str = "") -> str:
     return (
         "THE TOPIC, DROPPED INTO THIS ROUND: \"" + text + "\"\n"
         + "HOW IT GOES (" + name + "): "
-        + deck[name].format(a=first, b=other) + " "
+        + deck[name].format(a=first, b=other, guy=cast_name("sfxguy")) + " "   # [cast-names]
         + how_far + "\n"
         + close
     )
@@ -99668,19 +101176,29 @@ def booth_actor_name(who: str, name: str = "") -> str:
     transcript.  Keep that translation in one place so a coalesced stream
     cannot accidentally publish "Co-host" when the configured actor is Skip.
     """
-    if str(name or "").strip():
-        return str(name).strip()
     seat = str(who or "").strip().lower()
+    given = str(name or "").strip()
+    # [cast-names] "The SFX Guy" was what the code called him, not a name
+    # anybody gave him: a road that still hands it in gets the name he goes
+    # by now (cast_name - Sam, or the operator's).
+    if given and not (seat in ("drop", "sfx", "sfxguy")
+                      and given.lower() in CAST_LEGACY_SFX):
+        return given
     dj = dj_settings()
-    if seat in ("dj", "host"):
-        return str(dj.get("host_name") or "Host")
+    if seat == "host":
+        # [cast-names] who="host" is the operator's own desk row - a request,
+        # a call landing, a news break, what he typed to the DJ - never the
+        # host in the booth, so it does not take the host's name.
+        return "The desk"
+    if seat == "dj":
+        return str(dj.get("host_name") or "") or cast_name("host")
     if seat == "cohost":
-        return str(dj.get("cohost_name") or "Co-host")
+        return str(dj.get("cohost_name") or "") or cast_name("cohost")
     if seat in ("third", "guest"):
         guest = active_guest()
         return str(guest.get("name") or dj.get("third_name") or "Guest")
-    if seat in ("drop", "sfx"):
-        return "The SFX Guy"
+    if seat in ("drop", "sfx", "sfxguy"):
+        return str(dj.get("sfxguy_name") or "") or cast_name("sfxguy")
     if seat == "manager":
         return str(dj.get("manager_name") or "Manager")
     if seat in ("caller", "caller2"):
@@ -99710,13 +101228,24 @@ def set_guest(guest: dict[str, Any] | None) -> None:
         pass
 
 
-def caller_names() -> list[str]:
+def caller_names_raw() -> list[str]:
+    """[cast-names] The caller-name dictionary as the operator keeps it -
+    what the names editor reads and writes."""
     try:
         data = json.loads(CALLER_NAMES_PATH.read_text())
         names = [str(n).strip() for n in data if str(n).strip()]
         return names or list(CALLER_NAME_SEED)
     except Exception:
         return list(CALLER_NAME_SEED)
+
+
+def caller_names() -> list[str]:
+    """The names a stranger can ring in under - [cast-names] never one
+    somebody in the booth goes by."""
+    taken = cast_taken_names()
+    return ([n for n in caller_names_raw() if not cast_name_taken(n, taken)]
+            or [n for n in CALLER_NAME_SEED if not cast_name_taken(n, taken)]
+            or list(CALLER_NAME_SEED))
 
 
 def add_caller(name: str, persona: str = "", goal: str = "") -> dict[str, Any]:
@@ -99790,6 +101319,8 @@ def name_draw() -> tuple[str, str]:
         return s3_choice("call.name_plain", caller_names(), "a caller's name off the plain list (no name pools on)", tabled=False), ""   # [s3-dice-door]
     taken = {str(n).lower() for n in (_RADIO.get("names_used") or [])}
     taken |= {str(r.get("name") or "").lower() for r in read_callers()}
+    _cast_taken = cast_taken_names()     # [cast-names] never a booth name
+    taken |= _cast_taken
     live = list(pools)
     for _ in range(3):
         if not live:
@@ -99797,7 +101328,8 @@ def name_draw() -> tuple[str, str]:
         weights = [float(p.get("weight") or 1) for _, p in live]
         pid, pool = live[s3_weighted("call.name_pool", [str(q) for q, _p in live], weights,   # [s3-dice-door]
                                      "which name pool a caller's name comes from (the book's weights)")]   # [s3-dice-door]
-        free = [n for n in pool["names"] if str(n).lower() not in taken]
+        free = [n for n in pool["names"] if str(n).lower() not in taken
+                and not cast_name_taken(n, _cast_taken)]   # [cast-names]
         if free:
             return unrepeated(free, f"caller-name-{pid}",
                               keep=min(24, max(0, len(free) - 1)),   # [s3-dice-door]
@@ -99824,6 +101356,12 @@ def conjure_caller() -> dict[str, Any]:
     """A one-off out of the book: a name, and whatever the dice say they are
     like tonight. Not saved — strangers stay strangers."""
     name, pool = name_draw()
+    # [cast-names] the spent-book fallback draws blind: a cast member's
+    # name is drawn again rather than put on the line.
+    for _ in range(4):
+        if not cast_name_taken(name):
+            break
+        name, pool = name_draw()
     return {"id": "", "name": name, "name_pool": pool,
             "persona": "", "goal": "", "calls": 0}
 
@@ -100645,7 +102183,8 @@ async def dj_call_generated(caller: dict[str, Any] | None = None,
         # regulars are all cooling down a fresh stranger is conjured instead.
         now = time.time()
         fresh = [r for r in rows if now - float(r.get("last") or 0) > 1500
-                 and not story_open_for(str(r.get("name") or ""))]   # #1039
+                 and not story_open_for(str(r.get("name") or ""))   # #1039
+                 and not cast_name_taken(r.get("name"))]            # [cast-names]
         if fresh and s3_chance("call.regular", 0.6, "a regular rings rather than a stranger"):   # [s3-dice-door]
             fresh.sort(key=lambda r: float(r.get("last") or 0))   # stalest first
             pool = fresh[:max(1, len(fresh) // 2 + 1)]            # the older half
@@ -106833,7 +108372,7 @@ async def dj_banter(track: dict[str, Any] | None = None,
         # to his heckles now and then — laugh, groan, wave him off —
         # and occasionally set him up on purpose the way a straight man
         # feeds a punchline.
-        angle += (" The SFX guy in the corner booth is a faded-NASCAR-"
+        angle += (f" {cast_name('sfxguy')}, the SFX guy in the corner booth, is a faded-NASCAR-"   # [cast-names]
                   "shirt country boy who heckles between your lines and "
                   "one-ups every story anybody tells. Now and then REACT "
                   "to something he just hollered — laugh, groan, tell "
@@ -106842,15 +108381,15 @@ async def dj_banter(track: dict[str, Any] | None = None,
         _gnews = _RADIO.get("sfxguy_news") or {}
         if _gnews and time.time() - float(_gnews.get("at") or 0) < 600 \
                 and not caller_name:
-            angle += (" The SFX guy just slapped the desk and broke a "
+            angle += (f" {cast_name('sfxguy')}, the SFX guy, just slapped the desk and broke a "   # [cast-names]
                       f"news story on air: \"{_gnews.get('title')}\" — "
                       f"with the take: \"{_gnews.get('take')}\". Make "
                       "THAT the topic now: run with it, argue with his "
                       "take, credit him for bringing it (#804).")
             _RADIO.pop("sfxguy_news", None)
     if seek_verdict:
-        angle += (" At some point one of you turns to the SFX guy in his "
-                  "booth and appeals for backup OUT LOUD — 'back me up "
+        angle += (f" At some point one of you turns to {cast_name('sfxguy')}, the SFX guy in his "   # [cast-names]
+                  "booth, and appeals for backup OUT LOUD — 'back me up "
                   "here' — even though he mostly talks in heckles. Do not "
                   "write his reply; he answers for himself.")
     # #626: buried in passing — a reference to how hot the machine is running
@@ -107978,7 +109517,26 @@ async def dj_banter(track: dict[str, Any] | None = None,
     # cancelled by a third. "If the sliders are up for the speaker box
     # rhetoric, there is nothing that can stop it." The budget is what
     # gets expanded to fit, not the material that gets dropped.
-    if _quote_door("prepend", "speakbox_prepend_rate", lift=_lift):    # [#1233]
+    # [s3-sb-end] PREPEND OR APPEND. "Instead of both winning together, they
+    # now have a roulette that is part of the system" (operator, 2026-09-28).
+    # Both doors roll first; when both win, the prepend-or-append roulette
+    # (System 3's dice door: POOLS1 `speakbox.quote_end`) picks the one that
+    # is read, and the other is recorded as withdrawn on the round's quote
+    # ledger. Under a System 3 running order these doors stand aside and the
+    # engine's own roulette (SBEND1) decides instead.
+    _pre_hit = _quote_door("prepend", "speakbox_prepend_rate", lift=_lift)
+    _app_hit = _quote_door("append", "speakbox_append_rate", lift=_lift)
+    if _pre_hit and _app_hit:
+        _end = s3_choice("speakbox.quote_end", ["prepend", "append"],
+                         "a round's prepended and appended passages both won their rolls: "
+                         "which one is read (the other is withdrawn)")
+        _lost = "append" if _end == "prepend" else "prepend"
+        _quotes[_lost].update(hit=False, lost_to=_end,
+                              why="won its roll, but the prepend-or-append roulette chose the %s" % _end)
+        pipeline_log("speakbox", "the prepend and the append both won their rolls; "
+                                 "the prepend-or-append roulette chose the %s" % _end)
+        _pre_hit, _app_hit = _end == "prepend", _end == "append"
+    if _pre_hit:    # [#1233] [s3-sb-end]
         head = await _fresh_swath()
         if head.get("text"):
             _head_text = _s2_bound(" ".join(str(head["text"]).split()))   # [#1233]
@@ -107989,7 +109547,7 @@ async def dj_banter(track: dict[str, Any] | None = None,
                 speakbox_remember(head)
                 _quote_note("prepend", head, _head_text, _block.count("\n"))   # [#1233]
     tail: dict[str, Any] = {}
-    if _quote_door("append", "speakbox_append_rate", lift=_lift):   # #867 [#1233]
+    if _app_hit:   # #867 [#1233] [s3-sb-end] rolled above, with the prepend
         tail = await _fresh_swath()
         if tail.get("text"):
             # #786: terminal punctuation, or the #168 truncation gate reads
@@ -124224,9 +125782,10 @@ async def crystals_influence_api(
         "active": [{"id": cid, **{k: c.get(k) for k in
                                   ("name", "strength", "minds", "on")}}
                    for cid, c in crystals_read().items()],
-        "cast": {"host": dj.get("dj_name") or "Host",
-                 "cohost": dj.get("cohost_name") or "Skip",
-                 "sfxguy": dj.get("sfx_name") or "The SFX Guy",
+        # [cast-names] dj_name and sfx_name were never keys: the cast's names
+        "cast": {"host": cast_name("host", dj),
+                 "cohost": cast_name("cohost", dj),
+                 "sfxguy": cast_name("sfxguy", dj),
                  "caller": "the phone line"},
     }
 
@@ -126214,28 +127773,27 @@ async def changelog_api(
     before: str = "",
     authorization: str | None = Header(default=None),
 ) -> dict[str, Any]:
-    """The committed station history plus task facts that were captured."""
+    """The committed station history plus task facts that were captured.
+
+    [changelog-cache] Served from data/changelog_cache.json only. Git - or
+    the pure-Python reader, since this container has no git binary - is
+    read by the background refresher and the host's commit hooks, never on
+    this path. A cache behind HEAD is served with its "as of" time; this
+    endpoint does not answer 503.
+    """
     require_read_auth(authorization)
     try:
-        # A fresh process can need a long Git walk to rebuild its durable
-        # changelog cache. Serve that snapshot promptly instead of allowing
-        # the panel transport to time out while the refresh completes.
         return await asyncio.wait_for(
             asyncio.to_thread(_CHANGELOG.page, limit, before), timeout=1.5)
-    except TimeoutError:
-        try:
-            cached = await asyncio.to_thread(_CHANGELOG.cached_page, limit, before)
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-        if cached is not None:
-            return cached
-        return {"entries": [], "total": 0, "head": "", "has_more": False,
-                "next_before": "", "retroactive": True,
-                "timezone": "America/Chicago", "stale": True, "warming": True}
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except RuntimeError as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except Exception:  # noqa: BLE001 - the changelog always answers
+        return _CHANGELOG.memory_page(limit, before)
+
+
+@app.on_event("startup")
+async def _startup_changelog_cache() -> None:
+    """[changelog-cache] Bring the changelog cache up to HEAD in the background
+    (a daemon thread; the refresh itself runs in a child process)."""
+    _CHANGELOG.start()
 
 
 @app.post("/api/changelog/task")
@@ -132201,6 +133759,14 @@ def speakbox_quote_paperwork(row: dict[str, Any], dj: dict[str, Any],
             if not rec.get("applies"):
                 value = pct + " · does not apply"
                 how = str(rec.get("why") or note or "no passage is stapled to this round")
+            elif rec.get("lost_to"):
+                # [s3-sb-end] it won its roll; the prepend-or-append roulette
+                # chose the other door - not "the dice said no"
+                applied = False
+                roll = rec.get("roll")
+                value = "%s · rolled %s → yes, then the roulette chose the %s" % (
+                    pct, ("%.2f" % float(roll)) if isinstance(roll, (int, float)) else "-", rec.get("lost_to"))
+                how = str(rec.get("why") or "")
             elif rec.get("hit"):
                 applied = True
                 roll = rec.get("roll")
@@ -133883,9 +135449,10 @@ def line_vote_apply(line_id: str, vote: str) -> dict[str, Any]:
         if text:
             if seat == "sfxguy":
                 try:
-                    quips = sfxguy_quips()
-                    if text not in quips:
-                        sfxguy_quips_save([text] + quips)
+                    with _SFXGUY_QUIPS_LOCK:                   # [s3-lists]
+                        quips = sfxguy_quips()
+                        if text not in quips:
+                            sfxguy_quips_save([text] + quips)
                     said.append("added to the SFX guy's catchphrases")
                 except Exception as exc:  # noqa: BLE001
                     said.append("his catchphrases would not take it: %s" % str(exc)[:60])
@@ -133919,9 +135486,10 @@ def line_vote_apply(line_id: str, vote: str) -> dict[str, Any]:
                 said.append("the round could not be marked: %s" % str(exc)[:80])
         if text and seat == "sfxguy":
             try:
-                quips = sfxguy_quips()
-                if text in quips:
-                    sfxguy_quips_save([q for q in quips if q != text])
+                with _SFXGUY_QUIPS_LOCK:                       # [s3-lists]
+                    quips = sfxguy_quips()
+                    if text in quips:
+                        sfxguy_quips_save([q for q in quips if q != text])
                     said.append("taken out of his catchphrases")
             except Exception:  # noqa: BLE001
                 pass
@@ -144421,13 +145989,14 @@ def _director_sfx_plan(turn_count: int) -> list[dict[str, Any]]:
     except Exception:                              # noqa: BLE001
         every, guy_every = 2, 2
     cues = []
+    guy = cast_name("sfxguy")                   # [cast-names] his name on his cues
     for after in range(every - 1, turn_count, every):
-        cues.append({"after": after, "seat": "board", "who": "The SFX Guy",
+        cues.append({"after": after, "seat": "board", "who": guy,
                      "kind": "sfx", "text": "A stinger is scheduled here; the board chooses the clip at assembly."})
     if turn_count >= guy_every:
         cues.append({"after": min(turn_count - 1, guy_every - 1), "seat": "drop",
-                     "who": "The SFX Guy", "kind": "sfxguy",
-                     "text": "The SFX Guy has a voiced drop scheduled at this beat."})
+                     "who": guy, "kind": "sfxguy",
+                     "text": guy + " has a voiced drop scheduled at this beat."})
     return cues[:6]
 
 
@@ -153188,6 +154757,27 @@ def _request_road(request: Any) -> str:
     return "funnel" if public else "house"
 
 
+# [tune-messenger] System 3's Messenger on the tune page (tune_messenger.py,
+# frontend/tune-messenger.js). Named exactly, GET only:
+#   /api/system3/public/messenger   ONE trimmed, read-only snapshot behind the
+#                                   tune-in token - the words of a turn only
+#                                   once it is on the air, never a prompt,
+#                                   sheet, direction, setting or seed;
+#   /tune-messenger/<three files>   the page's module and System 3's own
+#                                   system3.js / system3.css, revalidated and
+#                                   compressed (the route serves those names
+#                                   and nothing else);
+#   /api/system3/public/poster/     a board clip's first frame: the route
+#                                   demands the clip's HMAC and, unlike
+#                                   /api/sfx/poster, never falls through to a
+#                                   read that is open while reads are unlocked.
+_PUBLIC_GET |= {"/api/system3/public/messenger",
+                "/tune-messenger/tune-messenger.js",
+                "/tune-messenger/system3.js",
+                "/tune-messenger/system3.css"}
+_PUBLIC_GET_PREFIX = _PUBLIC_GET_PREFIX + ("/api/system3/public/poster/",)
+
+
 def _public_allows(method: str, path: str) -> bool:
     if method in ("GET", "HEAD"):
         return path in _PUBLIC_GET or path.startswith(_PUBLIC_GET_PREFIX)
@@ -154290,6 +155880,108 @@ async def car_diag_js(t: str = "") -> Response:
     return FileResponse(_CAR_DIAG_JS, media_type="application/javascript",
                         headers={"Cache-Control": "no-store",
                                  "X-Content-Type-Options": "nosniff"})
+
+
+# --- [tune-messenger] THE MESSENGER ON THE LISTENER DOOR ---------------------
+# "on the tailscale radio station, I want the conversation feed animation like
+#  we have the messenger tab ... users on the tailscale using the same version
+#  with the most current line assembling the same way" (operator, 2026-09-28)
+#
+# The tune page mounts System 3's own Messenger (frontend/system3.js
+# mountEmbedded) through frontend/tune-messenger.js, which answers every path
+# the Messenger asks for out of ONE snapshot polled from here. What a listener
+# may see, the per-round cache and the single flight are tune_messenger.py
+# (tested without this file); this is the wiring: the tune-in token, the rings
+# read on the loop, System 3's store read on its own reader thread.
+try:
+    import tune_messenger as _tune_messenger
+    _TUNE_MSG = _tune_messenger.PublicMessenger()
+    _TUNE_MSG_FILES = _tune_messenger.StaticFiles({
+        "tune-messenger.js": Path(__file__).resolve().parent / "frontend" / "tune-messenger.js",
+        "system3.js": Path(__file__).resolve().parent / "frontend" / "system3.js",
+        "system3.css": Path(__file__).resolve().parent / "frontend" / "system3.css"})
+except Exception as _tune_msg_exc:  # noqa: BLE001
+    _tune_messenger = None
+    _TUNE_MSG = None
+    _TUNE_MSG_FILES = None
+    print("[tune-messenger] not installed: %s: %s"
+          % (type(_tune_msg_exc).__name__, _tune_msg_exc), flush=True)
+
+
+def _tune_msg_gzip(request: Request) -> bool:
+    return "gzip" in str(request.headers.get("accept-encoding") or "").lower()
+
+
+@app.get("/api/system3/public/messenger")
+async def tune_messenger_api(
+    request: Request,
+    t: str = "",
+    have: str = "",
+    authorization: str | None = Header(default=None),
+) -> Response:
+    """[tune-messenger] The listener's Messenger: the rounds the air is on
+    and the ones planned after them, trimmed by tune_messenger.py. Tune-in
+    token only. At most one build every 2.5 s however many listeners ask,
+    and each answer carries only the rounds whose revision the page does
+    not already hold (`have` = "cid:rev,...")."""
+    require_listen_auth(t, authorization)
+    if _TUNE_MSG is None:
+        raise HTTPException(status_code=404, detail="the Messenger is not installed")
+    gz = _tune_msg_gzip(request)
+    runtime = globals().get("_system3")
+    try:
+        rt = runtime() if callable(runtime) else None
+    except Exception:  # noqa: BLE001
+        rt = None
+    if rt is None or not getattr(rt, "ready", False) or getattr(rt, "store", None) is None:
+        body, headers = _TUNE_MSG.answer(have, gz, off=True)
+        return Response(content=body, media_type="application/json", headers=headers)
+    if _TUNE_MSG.stale():
+        try:
+            # Copied here, on the loop, so the reader thread never walks a
+            # ring the station is appending to.
+            air = _tune_messenger.air_index(list(_RADIO.get("voice_clips") or [])[-400:],
+                                            VOICE_BROADCAST_LEAD_MS)
+            chat = _tune_messenger.chat_index(list(_RADIO.get("chat") or [])[-400:],
+                                              AIR_PUBLICATION_STATES, line_heard_at)
+            stamps = {k: dict(v) for k, v in list(_S3_LINE_BY_ID.items())[-600:]
+                      if isinstance(v, dict)}
+            await _TUNE_MSG.refresh(rt.read, rt.store, air, chat, stamps, media_sign)
+        except Exception as exc:  # noqa: BLE001
+            # The last good snapshot still answers; the page asks again.
+            print("[tune-messenger] the snapshot was not rebuilt: %s: %s"
+                  % (type(exc).__name__, exc), flush=True)
+    body, headers = _TUNE_MSG.answer(have, gz)
+    return Response(content=body, media_type="application/json", headers=headers)
+
+
+@app.get("/api/system3/public/poster/{sid}")
+async def tune_messenger_poster(sid: str, request: Request, t: str = "") -> Response:
+    """[tune-messenger] A board clip's first frame for the listener's
+    Messenger. /api/sfx/poster falls through to require_read_auth - open
+    while reads are unlocked - so it is not on the door; this road answers
+    only the clip's own HMAC, and then draws the same poster."""
+    want = media_sign(sid) if re.fullmatch(r"[a-f0-9]{16}", str(sid or "")) else ""
+    if not (want and t and hmac.compare_digest(str(t), want)):
+        return Response(status_code=404)
+    return await sfx_poster_api(sid, request, authorization=None)
+
+
+@app.get("/tune-messenger/{name}")
+async def tune_messenger_file(name: str, request: Request) -> Response:
+    """[tune-messenger] The tune page's module and System 3's own
+    system3.js / system3.css, the three names and nothing else: an ETag and
+    a 304 (FileResponse has neither - /system3/system3.js is 441 kB on every
+    load) and gzip when the phone takes it (130 kB). Public code, like the
+    page."""
+    if _TUNE_MSG_FILES is None:
+        return Response(status_code=404)
+    status, body, headers = await asyncio.to_thread(
+        _TUNE_MSG_FILES.respond, str(name or ""),
+        str(request.headers.get("if-none-match") or ""), _tune_msg_gzip(request))
+    if status == 404:
+        return Response(status_code=404)
+    return Response(content=body, status_code=status, headers=headers)
 
 
 @app.get("/api/car/blob")
@@ -156237,7 +157929,7 @@ async def dj_callers_list(
     """The roster, the name dictionary, and the clock rate (#236)."""
     require_read_auth(authorization)
     dj = dj_settings()
-    return {"callers": read_callers(), "names": caller_names(),
+    return {"callers": read_callers(), "names": caller_names_raw(),   # [cast-names] as kept
             "per_hour": dj["callin_per_hour"],
             "success_rate": dj["caller_success_rate"],
             "insanity": dj["caller_insanity"],
@@ -156483,10 +158175,10 @@ async def dj_dice_api(
         # The SFX guy — who never talks — reads the passage cold in his
         # own voice. Then the booth has to deal with what he said.
         await dj_speak("interject", None, line=seed["text"], who="drop",
-                       voice=dj["drop_voice"], name="The SFX Guy",
+                       voice=dj["drop_voice"], name=cast_name("sfxguy"),   # [cast-names]
                        by_hand=True, source=seed.get("file", ""))
         angle = (
-            "The SFX guy — who NEVER talks — just read a whole passage "
+            f"{cast_name('sfxguy')}, the SFX guy — who NEVER talks — just read a whole passage "   # [cast-names]
             "over the air, cold, and put the microphone down: "
             f"\"{seed['text'][:600]}\" React to THAT: what it was, why "
             "HIM of all people, what it means — everyone weighs in, and "
@@ -159016,7 +160708,7 @@ async def dj_crystal_api(
     labels = {"dj": dj.get("host_name") or "Host",
               "cohost": dj.get("cohost_name") or "Co-host",
               "third": dj.get("third_name") or "Third",
-              "drop": "The SFX Guy", "caller": "Callers"}
+              "drop": cast_name("sfxguy", dj), "caller": "Callers"}   # [cast-names]
     by_who: dict[str, dict[str, Any]] = {}
     for line in (_RADIO.get("chat") or []):
         who = line.get("who") or ""
@@ -160372,7 +162064,7 @@ async def dj_selection_api(
                 status_code=400,
                 detail="No SFX guy voice assigned — set one in the DJ panel")
         said = await dj_speak("station_id", None, line=text, who="drop",
-                              voice=dj["drop_voice"], name="The SFX Guy",
+                              voice=dj["drop_voice"], name=cast_name("sfxguy"),   # [cast-names]
                               by_hand=True, source=doc)
         # He shouts it and then hits a button, which is the whole character.
         asyncio.create_task(dj_sting(
@@ -179874,7 +181566,7 @@ async def paper_material(since: float, until: float) -> dict[str, Any]:
         "host": m["host"], "cohost": m["cohost"],
         "third": str(dj.get("third_name") or ""),
         "manager": str(dj.get("manager_name") or "the manager upstairs"),
-        "sfx": "The SFX Guy"}
+        "sfx": cast_name("sfxguy")}                 # [cast-names]
     m["sponsors"] = [str(x) for x in (dj.get("sponsors") or []) if str(x).strip()]
     # --- P2 additions (#1049): the whole wall, and what the last editions
     # printed. Both are disk, both in one thread, like every other read here.
@@ -197946,7 +199638,7 @@ border-radius:4px;background:var(--panel2)"></canvas>
                 role="button" tabindex="0"
                 onclick="djHostEngineMenu(event)"
                 onkeydown="if (event.key === 'Enter' || event.key === ' ') djHostEngineMenu(event)"
-                title="The voice engine the whole cast renders on - click to switch">🎙 Host<span
+                title="The voice engine the whole cast renders on - click to switch">🎙 <span id="djHostLabel">Host</span><span
                 id="djHostEngineTag" class="dj-host-engine-tag">XTTS v2</span></span>
           <select id="djVoice" onchange="djSetVoices()"></select>
           <button aria-label="Hear this voice on the Pine Box" onclick="djTestVoice('djVoice')"
@@ -197956,7 +199648,7 @@ border-radius:4px;background:var(--panel2)"></canvas>
         </label>
         <label class="film-size" style="flex:1;min-width:230px"
                title="The voice the co-host speaks in.">
-          🎙 Co-host
+          🎙 <span id="djCohostLabel">Co-host</span>
           <select id="djCohostVoice" onchange="djSetVoices()"></select>
           <button aria-label="Hear this voice on the Pine Box" onclick="djTestVoice('djCohostVoice')"
                   title="Hear this voice on the Pine Box">▶</button>
@@ -198420,13 +200112,83 @@ both">🚫 Drop it</button>
         <label>Station name</label>
         <input id="djStationName" placeholder="Pine Box FM">
 
+        <!-- [cast-names] THE CAST. What the station calls each of them - on
+             the air, in the script and on every screen: the station's own
+             name, the operator's, or one rolled off a pool (System 3's dice,
+             once a day or on the button). -->
+        <div id="djCast" style="border:1px solid #2a2f3a;border-radius:8px;
+                    padding:8px;margin:10px 0">
+          <div style="font-weight:600;margin-bottom:2px">
+            <span data-pine-icon="c:group"></span> The cast</div>
+          <div class="muted" style="font-size:11px;margin-bottom:6px">
+            What the station calls each of them - on the air, in the script
+            and on every screen. Fixed keeps the station's name, custom is the
+            name you type, random rolls one off the names you list.</div>
+          <div class="row" style="flex-wrap:wrap;gap:6px;align-items:center">
+            <label for="djHostName" style="flex:0 0 72px;margin:0">Host</label>
+            <select id="djHostNameMode" onchange="castModeShow()"
+                    aria-label="How the host's name is chosen">
+              <option value="fixed">fixed - Dill</option>
+              <option value="custom">custom</option>
+              <option value="random">random</option>
+            </select>
+            <input id="djHostName" maxlength="30" placeholder="Dill"
+                   style="flex:1;min-width:110px">
+            <span id="djHostNameNow" class="muted" style="font-size:11px"></span>
+            <input id="djHostNamePool" style="flex:1 1 100%"
+                   placeholder="names to roll from, separated by commas"
+                   aria-label="The names the host's random name is rolled from">
+          </div>
+          <div class="row" style="flex-wrap:wrap;gap:6px;align-items:center">
+            <label for="djCohostName" style="flex:0 0 72px;margin:0">Co-host</label>
+            <select id="djCohostNameMode" onchange="castModeShow()"
+                    aria-label="How the co-host's name is chosen">
+              <option value="fixed">fixed - Skip</option>
+              <option value="custom">custom</option>
+              <option value="random">random</option>
+            </select>
+            <input id="djCohostName" maxlength="30" placeholder="Skip"
+                   style="flex:1;min-width:110px">
+            <span id="djCohostNameNow" class="muted" style="font-size:11px"></span>
+            <input id="djCohostNamePool" style="flex:1 1 100%"
+                   placeholder="names to roll from, separated by commas"
+                   aria-label="The names the co-host's random name is rolled from">
+          </div>
+          <div class="row" style="flex-wrap:wrap;gap:6px;align-items:center">
+            <label for="djSfxguyName" style="flex:0 0 72px;margin:0">SFX guy</label>
+            <select id="djSfxguyNameMode" onchange="castModeShow()"
+                    aria-label="How the SFX guy's name is chosen">
+              <option value="fixed">fixed - Sam</option>
+              <option value="custom">custom</option>
+              <option value="random">random</option>
+            </select>
+            <input id="djSfxguyName" maxlength="30" placeholder="Sam"
+                   style="flex:1;min-width:110px">
+            <span id="djSfxguyNameNow" class="muted" style="font-size:11px"></span>
+            <input id="djSfxguyNamePool" style="flex:1 1 100%"
+                   placeholder="names to roll from, separated by commas"
+                   aria-label="The names the SFX guy's random name is rolled from">
+          </div>
+          <label class="toggle" title="On: a random name holds for the show day
+and a new one is rolled the first time the station asks after five in the
+morning. Off: it holds until you press Roll new names.">
+            <input id="djCastRerollDaily" type="checkbox">
+            Roll random names again every day
+          </label>
+          <div class="row" style="gap:6px;align-items:center;margin-top:4px">
+            <button id="djCastRoll" type="button" onclick="castRollNames()"
+                    title="Save the cast and give everybody set to random a new name now">
+              <span data-pine-icon="c:shuffle"></span> Roll new names</button>
+            <span id="djCastStatus" class="muted" style="font-size:11px"></span>
+          </div>
+        </div>
+
         <label>Personality — who is behind the mic</label>
         <textarea id="djPersona" style="min-height:80px"></textarea>
 
         <!-- Both voices live at the top of this panel now (#198). -->
 
-        <label>Co-host name</label>
-        <input id="djCohostName" placeholder="Skip">
+        <!-- [cast-names] the co-host's name lives in the cast box above -->
         <label>Co-host personality</label>
         <textarea id="djCohostPersona" style="min-height:70px"></textarea>
         <label class="toggle">
@@ -210582,8 +212344,8 @@ function boothRoomPaint(state, live) {
   if (!room) return;
   const dj = (state && state.dj_names) || {};
   const cast = [
-    {who: "dj", name: dj.host || "host"},
-    {who: "cohost", name: dj.cohost || "cohost"},
+    {who: "dj", name: dj.host || castName("host")},          // [cast-names]
+    {who: "cohost", name: dj.cohost || castName("cohost")},
   ];
   if (dj.guest) cast.push({who: "guest", name: dj.guest});
   else if (dj.third) cast.push({who: "third", name: dj.third});
@@ -210591,7 +212353,7 @@ function boothRoomPaint(state, live) {
   const recent = (state.chat || []).slice(-14)
     .filter((l) => l.who === "caller").pop();
   if (recent) cast.push({who: "caller", name: recent.name || "on line one"});
-  cast.push({who: "sfx", name: dj.sfx || "The SFX Guy"});
+  cast.push({who: "sfx", name: dj.sfx || castName("sfx")});   // [cast-names]
   const key = cast.map((c) => c.who + c.name).join("|")
     + "@" + ((live && live.who) || "");
   if (room.dataset.key === key) return;
@@ -216213,7 +217975,8 @@ function djTalkRowInner(line) {
     const TINT = {dj: "#7fd1ff", cohost: "#b48cff", caller: "#9ee493",
                   third: "#f2a65a", drop: "#8fe388"};
     const tint = TINT[line.who] || "#7fd1ff";
-    const who = el("b", "", (line.name || ROLE[line.who] || "Booth") + " ");
+    const who = el("b", "", (line.name || castName(line.who, "")         // [cast-names]
+                             || ROLE[line.who] || "Booth") + " ");
     who.style.color = tint;
     // …and it is outlined, so at a glance you can see the phone line is a
     // different person from the pair without reading the name.
@@ -216482,7 +218245,8 @@ function djTalkRowInner(line) {
           ? "The caller's phone voice — theirs, not the booth's"
           : line.voice
             ? "Lock " + voiceLabel(line.voice) + " in as the "
-              + (line.who === "cohost" ? "co-host" : "host") + " voice"
+              + (line.who === "cohost" ? "co-host" : "host") + " voice ("   // [cast-names]
+              + castName(line.who === "cohost" ? "cohost" : "host") + ")"
             : "No voice recorded for this line";
         tag.style.cssText = bubble
           + "background:rgba(127,209,255,.10);color:#9fb4c9";
@@ -217755,7 +219519,7 @@ function djRenderChat(state) {
     const row = el("div", "", "");
     row.style.cssText = "padding:3px 0;line-height:1.4";
     const label = line.who === "host" ? "You "
-      : (line.name ? line.name + " " : "DJ ");
+      : ((line.name || castName(line.who, "") || "DJ") + " ");   // [cast-names]
     const who = el("b", "", label);
     who.style.color = line.who === "host" ? "#ffd479"
       : line.who === "cohost" ? "#b48cff"
@@ -220862,7 +222626,8 @@ function selectionTools(container, docName) {
     const note = el("span", "muted", "");
     note.style.cssText = "font-size:10px;width:100%;padding:0 2px";
     SELECTION_TARGETS.forEach(([icon, label, target]) => {
-      const send = el("button", "", icon + " " + label);
+      const send = el("button", "", icon + " " + (({host: castName("host"),      // [cast-names]
+        cohost: castName("cohost"), drop: castName("sfx")})[target] || label));
       send.style.cssText = "font-size:11px;padding:2px 7px";
       // Do not let the button take the selection away before we read it.
       send.onmousedown = (event) => event.preventDefault();
@@ -230438,6 +232203,7 @@ async function djLoadSettings() {
       dj.speakbox_system !== false;
     document.getElementById("djResearch").checked = dj.research !== false;
     document.getElementById("djCohostName").value = dj.cohost_name || "";
+    castFill(dj);                                          // [cast-names]
     document.getElementById("djCohostPersona").value = dj.cohost_persona || "";
     document.getElementById("djBanter").checked = dj.banter !== false;
     document.getElementById("djBanterEvery").value = dj.banter_every ?? 1;
@@ -234044,7 +235810,7 @@ function djGraphPanel() {
         + (r.ok ? "#43d17c" : "#ef6461");
       const body = el("span", "", "");
       body.style.cssText = "flex:1;min-width:0;cursor:pointer";
-      const who = el("b", "", (r.who === "cohost" ? "Skip " : "DJ "));
+      const who = el("b", "", castName(r.who === "cohost" ? "cohost" : "host") + " ");   // [cast-names]
       who.style.color = r.who === "cohost" ? "#b48cff" : "#7fd1ff";
       body.appendChild(who);
       body.appendChild(document.createTextNode(r.text));
@@ -234441,7 +236207,7 @@ async function system3Open(tab) {                       /* [s3-window] tab: tabl
     style.href = "/system3/system3.css?v=4"; document.head.append(style);
   }
   try {
-    const module = await import("/system3/system3.js?v=5");
+    const module = await import("/system3/system3.js?v=6");
     system3View = await module.openSystem3({request: (path, options) => api(path, options),
       tab: typeof tab === "string" ? tab : "",
       onClose: () => { system3View = null; }});
@@ -235315,6 +237081,7 @@ function mindOpen(opts) {
     const st = (typeof djLastState !== "undefined" && djLastState) || {};
     const names = st.dj_names || {};
     const label = {dj: names.host, cohost: names.cohost, third: names.third,
+                   sfx: names.sfx,                              // [cast-names]
                    guest: names.guest};
     cast.forEach((c) => {
       // Somebody who is not in the building is not drawn.
@@ -237243,6 +239010,102 @@ async function djSetVoices() {
   } catch (error) { status.textContent = error.message; }
 }
 
+/* [cast-names] THE CAST, IN THE DJ OPTIONS AND IN EVERY LABEL.
+   Each character has a name, a way it is chosen - fixed (the station's own:
+   Dill, Skip, Sam), custom (the text typed here) or random (rolled off the
+   pool through System 3's dice, once a day or on the button) - and a pool.
+   castName() is what the panel's labels print: the name the station
+   answers on /api/dj (dj_names), else the station's own. */
+const CAST_FIELDS = [
+  {role: "host", id: "djHostName", def: "Dill"},
+  {role: "cohost", id: "djCohostName", def: "Skip"},
+  {role: "sfxguy", id: "djSfxguyName", def: "Sam"},
+];
+const CAST_KEY = {dj: "host", host: "host", a: "host", cohost: "cohost",
+  "co-host": "cohost", b: "cohost", sfxguy: "sfx", sfx: "sfx", drop: "sfx",
+  third: "third", guest: "guest", d: "third"};
+function castName(role, fallback) {
+  const key = CAST_KEY[String(role || "").toLowerCase()] || String(role || "");
+  const state = (typeof djLastState !== "undefined" && djLastState) || {};
+  const names = state.dj_names || {};
+  let got = String(names[key] || "").trim();
+  if (!got && key === "third") got = String(names.guest || "").trim();
+  if (got) return got;
+  if (fallback !== undefined) return fallback;
+  return ({host: "Dill", cohost: "Skip", sfx: "Sam"})[key] || "";
+}
+function castFill(dj) {
+  for (const f of CAST_FIELDS) {
+    const key = f.role + "_name";
+    const mode = document.getElementById(f.id + "Mode");
+    const name = document.getElementById(f.id);
+    const pool = document.getElementById(f.id + "Pool");
+    if (mode) mode.value = ["fixed", "custom", "random"].includes(dj[key + "_mode"])
+      ? dj[key + "_mode"] : "fixed";
+    if (name) name.value = dj[key] || "";
+    if (pool) pool.value = (dj[key + "_pool"] || []).join(", ");
+  }
+  const daily = document.getElementById("djCastRerollDaily");
+  if (daily) daily.checked = dj.cast_reroll_daily !== false;
+  castModeShow();
+  castNamesPaint();
+}
+function castCollect() {
+  const out = {};
+  for (const f of CAST_FIELDS) {
+    const key = f.role + "_name";
+    const mode = document.getElementById(f.id + "Mode");
+    const name = document.getElementById(f.id);
+    const pool = document.getElementById(f.id + "Pool");
+    if (mode) out[key + "_mode"] = mode.value || "fixed";
+    if (name) out[key] = name.value.trim() || f.def;
+    if (pool) out[key + "_pool"] = pool.value.split(/[,;\n]/)
+      .map((s) => s.trim()).filter(Boolean);
+  }
+  const daily = document.getElementById("djCastRerollDaily");
+  if (daily) out.cast_reroll_daily = daily.checked;
+  return out;
+}
+function castModeShow() {
+  for (const f of CAST_FIELDS) {
+    const mode = (document.getElementById(f.id + "Mode") || {}).value || "fixed";
+    const name = document.getElementById(f.id);
+    const pool = document.getElementById(f.id + "Pool");
+    if (name) name.disabled = mode !== "custom";
+    if (pool) pool.style.display = mode === "random" ? "" : "none";
+  }
+}
+async function castNamesPaint(got) {
+  try { got = got || await api("/api/cast/names"); } catch (err) { return; }
+  const cast = (got && got.cast) || {};
+  for (const f of CAST_FIELDS) {
+    const c = cast[f.role] || {};
+    const now = document.getElementById(f.id + "Now");
+    if (now) now.textContent = c.name ? "on air as " + c.name
+      + (c.mode === "random" && c.rolled && c.rolled.day
+         ? " (rolled " + c.rolled.day + ")" : "") : "";
+  }
+  const host = document.getElementById("djHostLabel");
+  if (host && cast.host && cast.host.name) host.textContent = cast.host.name;
+  const cohost = document.getElementById("djCohostLabel");
+  if (cohost && cast.cohost && cast.cohost.name) cohost.textContent = cast.cohost.name;
+}
+async function castRollNames() {
+  const status = document.getElementById("djCastStatus");
+  if (status) status.textContent = "rolling...";
+  try {
+    // The form's modes and pools are what the operator is looking at, so
+    // they are saved first - the roll reads the stored settings.
+    const settings = await api("/api/settings");
+    if (settings.voice_out) delete settings.voice_out.ha_token;
+    settings.dj = Object.assign({}, settings.dj, castCollect());
+    await api("/api/settings", {method: "PUT", body: JSON.stringify(settings)});
+    const got = await api("/api/cast/names/roll", {method: "POST", body: "{}"});
+    if (status) status.textContent = got.said || "";
+    castNamesPaint(got);
+  } catch (error) { if (status) status.textContent = error.message; }
+}
+
 async function djSaveSettings() {
   const status = document.getElementById("djSaveStatus");
   try {
@@ -237272,6 +239135,7 @@ async function djSaveSettings() {
       speakbox_system: document.getElementById("djSpeakboxSystem").checked,
       research: document.getElementById("djResearch").checked,
       cohost_name: document.getElementById("djCohostName").value.trim(),
+      ...castCollect(),                                    // [cast-names]
       cohost_persona: document.getElementById("djCohostPersona").value.trim(),
       cohost_voice: document.getElementById("djCohostVoice").value || "",
       banter: document.getElementById("djBanter").checked,
@@ -237848,10 +239712,10 @@ async function voiceDeskOpen() {
   card.appendChild(el("div", "", "The radio pair"));
   card.lastChild.style.cssText = "margin-top:8px;font-weight:700;"
     + "font-size:12px";
-  deskRow("host (DJ)", settings.dj.voice,
+  deskRow(castName("host") + " (host)", settings.dj.voice,        // [cast-names]
           (value) => { settings.dj.voice = value; },
           "Intros, station IDs, ads, news — the host's own voice");
-  deskRow("co-host", settings.dj.cohost_voice,
+  deskRow(castName("cohost") + " (co-host)", settings.dj.cohost_voice,   // [cast-names]
           (value) => { settings.dj.cohost_voice = value; },
           "The other half of every exchange");
   // The third chair (#281): name them and they join every round.
@@ -237876,7 +239740,7 @@ async function voiceDeskOpen() {
   deskRow("third's voice", settings.dj.third_voice,
           (value) => { settings.dj.third_voice = value; },
           "Their own voice — never the pair's");
-  deskRow("the SFX guy", settings.dj.drop_voice,
+  deskRow(castName("sfx") + " (SFX guy)", settings.dj.drop_voice,  // [cast-names]
           (value) => { settings.dj.drop_voice = value; },
           "Occasionally shouts a station liner where a sample sting "
           + "would have gone — pick a voice to turn him on");
@@ -238045,7 +239909,8 @@ function glassOpen() {
         row.appendChild(chip);
         const gwho = glassWho(event, vmap);    // #608: who is this task for
         if (gwho) {
-          const wb = el("span", "", GLASS_WHO_LABEL[gwho] || gwho);
+          const wb = el("span", "", castName(gwho === "board" ? "sfx" : gwho, "")   // [cast-names]
+            || GLASS_WHO_LABEL[gwho] || gwho);
           wb.title = "for the " + (GLASS_WHO_LABEL[gwho] || gwho);
           wb.style.cssText = "flex:0 0 auto;font-size:9px;padding:0 6px;"
             + "border-radius:9px;line-height:15px;color:#0a0e14;"
@@ -240762,8 +242627,9 @@ function paperScriptWho(row) {
   const name = String(row.name || "").trim();
   const who = String(row.who || "").trim();
   if (name) return name.toUpperCase();
-  const book = {dj: "HOST", cohost: "CO-HOST", caller: "CALLER",
-                board: "SFX", drop: "SFX GUY", third: "GUEST"};
+  const book = {dj: castName("host"), cohost: castName("cohost"),   // [cast-names]
+                caller: "CALLER", board: "SFX", drop: castName("sfx"),
+                third: castName("third", "GUEST")};
   return (book[who] || who || "VOICE").toUpperCase();
 }
 
@@ -257263,6 +259129,12 @@ setTimeout(clockLoop, 1500);
      the station were doing, and files it as a Pine Box report. Deferred
      and last, so a script that fails to load leaves the page as it was. -->
 <script src="__CAR_DIAG_SRC__" defer></script>
+<!-- [tune-messenger] System 3's Messenger in place of the feed below the
+     controls (a switch keeps the feed): the conversation assembling message
+     by message, in step with the line this page is sounding. Deferred and
+     last, like the diagnostics: a module that fails leaves the page and its
+     feed exactly as they were. -->
+<script src="/tune-messenger/tune-messenger.js" defer></script>
 </body>
 </html>
 """

@@ -22,6 +22,25 @@ const clock = t => t ? new Date(t * 1000).toLocaleTimeString([], {hour: '2-digit
 const day = t => t ? new Date(t * 1000).toLocaleString([], {month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit'}) : '';
 const pct = x => (x == null ? '-' : Math.round(x * 100) + '%');
 const num = (x, d = 2) => (x == null || Number.isNaN(+x) ? '-' : (+x).toFixed(d));
+/* [cast-names] A character's name as the station answers it now - Dill,
+   Skip and Sam unless the DJ options say otherwise - for the labels that
+   used to say "The SFX Guy" or "the host". The host page's own poll
+   carries it: window.pineCastName on the desktop and the tablet
+   (sampler-feed.js), djLastState.dj_names on the control panel. */
+const CAST_NAME_KEY = {dj: 'host', host: 'host', a: 'host', cohost: 'cohost', b: 'cohost',
+  sfxguy: 'sfx', sfx: 'sfx', drop: 'sfx', third: 'third', d: 'third', guest: 'guest'};
+const CAST_NAME_DEFAULT = {host: 'Dill', cohost: 'Skip', sfx: 'Sam'};
+function castName(role, fallback) {
+  const key = CAST_NAME_KEY[String(role || '').toLowerCase()] || String(role || '');
+  try {
+    if (typeof window.pineCastName === 'function') return window.pineCastName(key, fallback);
+  } catch (e) { /* the panel's poll, below */ }
+  let names = {};
+  try { names = ((typeof djLastState !== 'undefined' && djLastState) || {}).dj_names || {}; } catch (e) { names = {}; }
+  const got = String(names[key] || (key === 'third' ? names.guest : '') || '').trim();
+  if (got) return got;
+  return fallback !== undefined ? fallback : (CAST_NAME_DEFAULT[key] || '');
+}
 
 function el(tag, props, ...kids) {
   const node = document.createElement(tag);
@@ -105,7 +124,7 @@ function observationLine(o) {
   if (fam === 'SFX') {
     const m = o.matcher || {}, clip = (o.played || [])[0];
     const cand = m.cands != null ? `candidates ${m.cands} / eligible ${m.eligible} → ` : '';
-    return {fam, dice: null, text: `at air (${o.due}) ${cand}${clip ? clip.clip : 'nothing played'}${(o.sfx_guy || []).length ? ' + SFX Guy' : ''}`};
+    return {fam, dice: null, text: `at air (${o.due}) ${cand}${clip ? clip.clip : 'nothing played'}${(o.sfx_guy || []).length ? ' + ' + castName('sfx') : ''}`};   /* [cast-names] */
   }
   if (fam === 'SPEAKERBOX') return {fam, dice: null,
     text: `door ${o.door}: ${o.applies === false ? 'did not apply' : `roll ${num(o.roll, 3)} vs ${num((o.rate || 0) + (o.lift || 0), 2)} → ${o.hit ? 'HIT ' + (o.file || '') : 'miss'}`} (${o.rolled_by})`};
@@ -318,14 +337,14 @@ const FAMILY_WHAT = {
     'How the one who started the exchange answers the responses - hold the line, double down, counter, concede, laugh it off. Conceding is one outcome among many, not the default.'],
   FL: ['Flow (FL1 frames, FL2 moves)',
     'Where the conversation goes next: the frame at the end of a cycle (reframe, cancel the topic, acquiesce, anger, enjoyment) or the move a response makes. Weighted by the radio clock: tangents fade and closing moves rise as the time runs out.'],
-  SFXGUY: ["The SFX Guy's mouth",
-    "Whether the SFX Guy pipes up after this line, at the desk's own interjections dial, and what kind of line: a story off the wire, a reaction fired back at this very line, or a saying off his shelf. The line itself is drawn at air from the first kind that has something to say, and that draw - every candidate and the die - is recorded under his line."],
+  get SFXGUY() { return [castName('sfx') + "'s mouth",   /* [cast-names] his name, read when shown */
+    "Whether " + castName('sfx') + " (the SFX guy) pipes up after this line, at the desk's own interjections dial, and what kind of line: a story off the wire, a reaction fired back at this very line, or a saying off his shelf. The line itself is drawn at air from the first kind that has something to say, and that draw - every candidate and the die - is recorded under his line."]; },
   LINE: ['Line draw',
     'A single-voice road handed System 3 its list - the stock lines, the ad book - and one entry was drawn here, every candidate and its weight recorded. This is the Rolodex where the station used to call random.choice().'],
   SPEAKERBOX: ['Speaker-box',
-    "Whether a passage from your speakerbox documents is read with this line - before it (prepend), after it (append), worked in, or as an opening monologue. A d100 against your slider decides whether; the station's own rotation (locks, themes, cooldowns) decides which document."],
-  SFX: ['SFX Guy',
-    "Whether the SFX guy wants a clip at this line, before or after it, and what it should be about. The station's matcher and rotation choose the real file from the indexed book; the two-line cadence is never reduced."],
+    "Whether a passage from your speakerbox documents is read with this line - before it (prepend), after it (append), worked in, or as an opening monologue. A d100 against your slider decides whether; the station's own rotation (locks, themes, cooldowns) decides which document. When a line's prepend and append both win, the prepend-or-append roulette (SBEND1 in Tables) picks the one that is read and the other is withdrawn."],   /* [s3-sb-end] */
+  get SFX() { return [castName('sfx') + "'s clips",   /* [cast-names] */
+    "Whether " + castName('sfx') + " (the SFX guy) wants a clip at this line, before or after it, and what it should be about. The station's matcher and rotation choose the real file from the indexed book; the two-line cadence is never reduced."]; },
   TOPIC: ["Topic (the operator's board)",
     'Whether something off your topics board comes up in this round, which one, and on which turn - three draws, all recorded. The Topics dial sets the odds (0.5: 40% of rounds, 1.0: 80%, 0: never) and the least-sprung topics weigh most. The chosen turn still answers the line before it, then brings the topic up in its own words; a "1. / 2." entry is said word for word and answered word for word on the next turn. Nothing else puts a topic into a conversation.'],
   TRACK_TALK: ['Live record comment', 'A recorded roulette draw decides whether one turn of live banter briefly connects to the record playing under it. Banked rounds never name a record that may have changed before air.'],
@@ -414,7 +433,7 @@ function stageStory(st, ev, conv, turn) {
   // A weighted draw: the candidates, their effective weights, and where u landed.
   const total = st.candidates.reduce((a, c) => a + (c.weight || 0), 0);
   const named = (ev.family === 'TOPIC' && st.stage === 'item') || st.stage === 'topic' ? 'Which topic'
-    : ({table: 'Which table', category: 'Which category', item: 'Which outcome', mode: 'Which way', dice: 'Whether', turn: 'Which turn'}[st.stage] || st.stage);
+    : ({table: 'Which table', category: 'Which category', item: 'Which outcome', mode: 'Which way', dice: 'Whether', turn: 'Which turn', end: 'Prepend or append (both won)'}[st.stage] || st.stage);   /* [s3-sb-end] */
   if (!d) {
     out.push(para(`${named}: ${st.candidates.length === 1 ? 'only one was eligible, so nothing was drawn' : 'decided without a random number'} - ${st.selected}.`));
     return out;
@@ -872,7 +891,7 @@ function assemblyCard(conv, air) {
       val.verdict === 'non_compliant' ? 'bad' : ''),
     node('Script', `${spoken.length} spoken lines`, `${lines.length - spoken.length} board / drop rows`),
     node('Air', `${heard} heard`, gone ? `${gone} withdrawn` : '', gone ? 'bad' : ''),
-    node('SFX Guy', `${sfxAired} played`, `${sfxPlanned} scheduled`));
+    node(castName('sfx'), `${sfxAired} played`, `${sfxPlanned} scheduled`));   /* [cast-names] */
   const card = el('div', 's3-dcard s3-acard',
     el('div', 's3-dhead', el('span', {class: 's3-dfam', text: String(conv.identity.road_kind || '').toUpperCase()}),
       el('div', null, el('b', {text: String((conv.subject || {}).topic || '').replace(/\s+/g, ' ').slice(0, 160)}),
@@ -1432,11 +1451,11 @@ function sfxPlanRow(conv, t, ev, aired, v) {
   const plan = t.sfx || {};
   const intent = (plan.intent || []).slice(0, 4).join(', ');
   return el('div', {class: 's3-sysrow s3-sfxplan' + (aired ? ' aired' : ''), 'data-event': ev.event_id, 'data-turn': t.turn_id,
-      role: 'button', tabindex: '0', title: 'how The SFX Guy came to schedule this clip',
+      role: 'button', tabindex: '0', title: 'how ' + castName('sfx') + ' came to schedule this clip',   /* [cast-names] */
       onclick: e => { e.stopPropagation(); v.select(t.turn_id, ev.event_id, e.currentTarget); openDecision(conv, ev, t, v.api); },
       onkeydown: e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); e.currentTarget.click(); } }},
     sfxAvatar(),
-    el('span', 's3-sysrow-text', el('b', {text: 'The SFX Guy'}),
+    el('span', 's3-sysrow-text', el('b', {text: castName('sfx')}),   /* [cast-names] */
       ` schedules a clip ${plan.placement === 'before' ? 'before' : 'after'} ${t.name || t.speaker}'s line` + (intent ? `, about ${intent}` : '')),
     die(d && d.draw ? d.draw.dice : null),
     el('span', {class: 's3-muted', text: aired ? 'played' : 'waiting for air'}));
@@ -1454,12 +1473,13 @@ function sfxEntry(conv, t, obs, v) {
     played && played.seconds ? `${num(played.seconds, 1)} s` : ''].filter(Boolean).join(' · ');
   const node = el('article', {class: 's3-msg left s3-sfxguy', 'data-turn': t.turn_id,
       title: 'tap for what to do with this clip'},
-    el('div', 'who', sfxAvatar(), el('b', {text: 'The SFX Guy'}), el('span', {text: `${due} · after turn ${t.index + 1}`})),
+    el('div', 'who', sfxAvatar(), el('b', {text: castName('sfx')}), el('span', {text: `${due} · after turn ${t.index + 1}`})),   /* [cast-names] */
     el('div', 's3-bubble s3-sfx-bubble',
       quips.length ? el('div', {class: 's3-words', text: quips.join(' ')}) : null,
       played ? sfxClipCard(played, v) : el('div', {class: 's3-muted', text: 'no clip played - his line only'}),
       why ? el('div', {class: 's3-sfx-why', text: why}) : null));
   node.s3 = {conv, t, obs, played};
+  if (v && v.dropDress) v.dropDress(node, 'clip:' + (obs.cursor || obs.at || t.turn_id), 'full', () => dropClipPanel(v, conv, t, obs, played));   /* [s3-msgdrop] */
   node.addEventListener('click', e => {
     if (e.target.closest(KEEP_OPEN + ', .s3-vthumb, .s3-aplayer')) return;
     e.stopPropagation();
@@ -1484,13 +1504,14 @@ function sfxGuyLineEntry(conv, t, obs, v) {
   const planned = obs.planned && obs.planned !== obs.kind ? ` · his node had planned: ${SFXGUY_KIND[obs.planned] || obs.planned}` : '';
   const node = el('article', {class: 's3-msg left s3-sfxguy s3-sfxguy-line', 'data-turn': t.turn_id,
       title: 'the SFX Guy\'s line: how System 3 drew it'},
-    el('div', 'who', sfxAvatar(), el('b', {text: 'The SFX Guy'}), el('span', {text: `${kind} · after turn ${t.index + 1}`})),
+    el('div', 'who', sfxAvatar(), el('b', {text: castName('sfx')}), el('span', {text: `${kind} · after turn ${t.index + 1}`})),   /* [cast-names] */
     el('div', 's3-bubble',
       el('span', {class: 's3-words', text: obs.line || ''}),
       el('span', {class: 'dir', text: fell + how + planned}),
       last && last.candidates && last.candidates.length > 1
         ? el('div', {class: 's3-muted s3-reel-text', text: 'rolled through: ' + last.candidates.join(' · ')}) : null));
   node.s3 = {conv, t, obs};
+  if (v && v.dropDress) v.dropDress(node, 'guy:' + (obs.cursor || obs.at || t.turn_id), 'full', () => dropGuyPanel(v, conv, t, obs));   /* [s3-msgdrop] */
   return node;
 }
 
@@ -1550,7 +1571,7 @@ const thumbSeen = typeof IntersectionObserver === 'function'
 function videoThumb(media) {
   const box = el('div', {class: 's3-vthumb', title: 'tap to watch it here, muted'});
   const still = () => {
-    const img = el('img', {alt: 'the clip The SFX Guy played'});
+    const img = el('img', {alt: 'the clip ' + castName('sfx') + ' played'});   /* [cast-names] */
     if (media.poster) loadPoster(img, media.poster);
     fill(box, media.poster ? img : el('span', 's3-vthumb-blank'), el('span', {class: 's3-play', 'aria-hidden': 'true'}),
       el('span', {class: 's3-vthumb-tag', text: media.seconds ? `${num(media.seconds, 1)} s` : 'video'}));
@@ -1860,16 +1881,402 @@ function defaultRequest() {
 }
 
 /* ======================================================================== */
+/* [s3-msgdrop] WHAT BUILT THIS MESSAGE.
+
+   "on the right side of each message, put a dropdown arrow that expands to
+    drop down showing the prompt / system prompt and connected values that
+    made this conversational piece happen. I need to be able to see what
+    built this message" (operator, 2026-09-28)
+
+   A chevron at the right of each message's header line opens a panel under
+   the message, inside it: the row System 3 wrote into the running order for
+   the line (its protocol, its directions), every roll on it with its d100 (a
+   tap opens the decision card), the prompt blocks System 3 sent, stripped or
+   rolled for the writer's prompt, the prompt and the system prompt the writer
+   was sent (folded, monospace, a copy button), and the ids that tie the line
+   to its round, its ledger rows and its model call. Nothing is fetched until
+   a panel is first opened; what was fetched is kept, and an open panel
+   travels with its message when the message is drawn again (the air turning
+   a card into words, a receipt, a refresh) - it never costs the live line a
+   word. The same data calls as the line tabs: the round the Messenger holds
+   (/api/system3/conversation/<id>), the model call found by findWriterCall
+   (/api/prompt-history), the block decisions by the prompt's digest
+   (/api/system3/prompt-blocks).
+
+   A message not on air yet opens to its dice and the row planned for it -
+   never its words, never its prompt (a writer's prompt can carry the words
+   before it). A sting opens to its two dice and the SFX node behind it; the
+   SFX Guy's line to his node and the draw at air.
+
+   The prompts are operator data: makeViews / mountEmbedded / mount take
+   `details` (mountEmbedded and mount: true). The public tune page mounts the
+   Messenger with `details: false` and no chevron is drawn at all. */
+const DROP_CHEVRON = '<svg class="s3-drop-chev" viewBox="0 0 32 32" aria-hidden="true" focusable="false">' +
+  '<path d="M16 22 6 12l1.4-1.4 8.6 8.6 8.6-8.6L26 12z"/></svg>';
+const dropSec = (title, ...kids) => el('section', 's3-drop-sec', el('h4', {text: title}), ...kids);
+function dropPanel(...kids) {
+  const panel = el('div', {class: 's3-drop', role: 'region', 'aria-label': 'What built this message', 'data-keep': ''}, ...kids);
+  /* its own ground: a tap, a hold or a right-click in it is for the panel (selecting, copying), not the message */
+  for (const type of ['click', 'pointerdown', 'contextmenu']) panel.addEventListener(type, e => e.stopPropagation());
+  return panel;
+}
+function dropIds(pairs) {
+  const rows = pairs.filter(p => p && p[1] != null && p[1] !== '');
+  return el('div', 's3-drop-ids', ...rows.flatMap(([k, val]) => [el('span', {text: k}), el('code', {text: String(val)})]));
+}
+function dropCopy(text) {
+  const b = el('button', {type: 'button', class: 's3-drop-copy', text: 'Copy', title: 'copy the whole text'});
+  b.addEventListener('click', async e => {
+    e.preventDefault(); e.stopPropagation();                /* in a summary: copy, do not fold */
+    let ok = false;
+    try { await navigator.clipboard.writeText(String(text)); ok = true; } catch (err) { ok = false; }
+    if (!ok) {
+      const area = el('textarea', {value: String(text), readonly: true, style: 'position:fixed;left:-9999px;top:0;opacity:0'});
+      document.body.append(area);
+      try { area.select(); ok = document.execCommand('copy'); } catch (err) { ok = false; }
+      area.remove();
+    }
+    b.textContent = ok ? 'Copied' : 'Select it and copy by hand';
+    setTimeout(() => { b.textContent = 'Copy'; }, 1800);
+  });
+  return b;
+}
+function dropText(title, text) {
+  const raw = String(text || '');
+  return el('details', 's3-drop-fold',
+    el('summary', null, el('span', {text: title}), el('span', {class: 's3-muted', text: ` · ${raw.length.toLocaleString()} characters`}), dropCopy(raw)),
+    el('pre', {class: 's3-drop-pre', text: raw || '(empty)'}));
+}
+/* one recorded decision: its d100, its family, what it landed on and why - a tap opens its card */
+function dropRoll(ev, conv, t, api) {
+  const line = eventLine(ev, conv);
+  const face = die(line.dice);
+  const sb = sbOutcome(ev);
+  if (sb && !sb.won) { face.classList.add('miss'); face.title = sb.why; }
+  const open = () => openDecision(conv, ev, t, api);
+  return el('div', {class: 's3-drop-roll', style: `--fam:${FAM[ev.family] || 'var(--obs)'}`, role: 'button', tabindex: '0',
+      title: `${ev.family} - tap for how it was decided`,
+      onclick: e => { e.stopPropagation(); open(); },
+      onkeydown: e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); e.stopPropagation(); open(); } }},
+    face, el('b', {text: ev.family}), el('span', {class: 's3-drop-item', text: String(landedWords(ev, conv) || '').replace(/\s+/g, ' ')}),
+    el('span', {class: 's3-drop-why', text: sb ? sb.why : line.text}));
+}
+function dropDice(conv, evs, t, api) {
+  return evs.length ? el('div', 's3-drop-dice', ...evs.map(ev => dropRoll(ev, conv, t, api))) : para('No roll was recorded on this message.', 's3-muted');
+}
+/* the row System 3 wrote for the line, its node's protocol, its directions; the whole running order folded */
+function dropTold(conv, t) {
+  const sheet = String((conv.plan || {}).sheet || '');
+  const row = sheetRowOf(sheet, t).trim();
+  const protocol = String(t.protocol || '').trim();
+  const dirs = (t.directions || []).map(d => d && d.text).filter(Boolean);
+  const perf = t.performance || {};
+  const facts = [t.step_label ? 'node: ' + t.step_label : '', t.phase ? 'phase: ' + t.phase : '',
+    perf.emotion ? `feeling: ${perf.emotion}${perf.intensity != null ? ' ' + num(perf.intensity) : ''}` : ''].filter(Boolean).join(' · ');
+  return el('div', 's3-drop-told',
+    row ? el('div', {class: 's3-drop-rowtext', text: row}) : para('The running order kept for this round has no row for this turn.', 's3-muted'),
+    protocol && !normWs(row).toLowerCase().includes(normWs(protocol).toLowerCase())
+      ? el('div', 's3-drop-line', el('b', {text: 'Its protocol: '}), protocol) : null,
+    dirs.length ? el('div', 's3-drop-line', el('b', {text: 'Directions: '}), dirs.join('; ')) : null,
+    facts ? el('div', {class: 's3-drop-line s3-muted', text: facts}) : null,
+    sheet.trim() ? el('details', 's3-drop-fold', el('summary', {text: 'the whole running order System 3 wrote for the round'}),
+      el('pre', {class: 's3-drop-pre'}, ...markIn(sheet.replace(/^\n+/, ''), row))) : null);
+}
+function dropTurnIds(conv, t) {
+  const id = conv.identity || {};
+  const lines = turnLines(conv, t);
+  return [['conversation', id.conversation_id], ['turn', `${t.turn_id} · turn ${t.index + 1} of ${(conv.turns || []).length}`],
+    ...(lines.length ? lines.map((l, i) => [lines.length > 1 ? `line ${i + 1}` : 'line', `${l.line_id} · block ${l.block}, line ${l.ord}`])
+      : [['line', 'not in the script ledger yet']]),
+    ['road', id.road_kind], ['mode', [conv.mode, conv.generation_mode].filter(Boolean).join(' · ')],
+    ['seat', `${t.speaker}${t.name ? ' - ' + t.name : ''}`], ['node', [t.step, t.leg && t.leg !== t.step ? 'leg ' + t.leg : ''].filter(Boolean).join(' · ')],
+    ['script index', t.script_index], ['planned', day(Number(conv.created || 0))], ['engine', conv.engine], ['config', conv.config_hash],
+    ['schedule slot', id.system2_slot_id], ['trace', id.trace_id]];
+}
+/* The blocks System 3 decided for the writer's prompt: the round's PROMPT
+   record (by its digest; the one decided last before this message's call
+   when the round sent several), else asked by the prompt's own words. */
+async function dropBlocks(box, v, conv, w, parts, cache, onDigest) {
+  const request = v.api.request;
+  const prompts = (conv.observations_air || []).filter(o => o && o.family === 'PROMPT' && o.digest);
+  const callAt = w && w.row ? Number(w.row.at || 0) : 0;
+  let obs = null, note = '';
+  if (prompts.length === 1) obs = prompts[0];
+  else if (prompts.length > 1) {
+    const before = callAt ? prompts.filter(o => Number(o.at || 0) <= callAt + 5) : [];
+    obs = before.length ? before.reduce((a, b) => (Number(b.at || 0) > Number(a.at || 0) ? b : a)) : prompts[0];
+    note = `${prompts.length} prompts were decided for this round; ` + (before.length ? 'this is the last one decided before this message\'s model call.'
+      : 'this message\'s call could not be placed among them, so this is the first.');
+  }
+  let got = null;
+  try {
+    if (obs) {
+      got = cache.blocks.get(obs.digest);
+      if (!got) { got = await request('/api/system3/prompt-blocks?digest=' + encodeURIComponent(obs.digest)); cache.blocks.set(obs.digest, got); }
+    } else if (parts && parts.user) {
+      const key = 'call:' + (w.row && w.row.id);
+      got = cache.blocks.get(key);
+      if (!got) {
+        got = await request('/api/system3/prompt-blocks', {method: 'POST', body: JSON.stringify({text: String(parts.user)})});
+        cache.blocks.set(key, got);
+      }
+    }
+  } catch (e) { got = {error: (e && e.message) || String(e)}; }
+  const rec = (got && got.prompt) || null;
+  const rows = (rec && rec.blocks) || (obs && obs.blocks) || [];
+  const digest = (rec && rec.digest) || (obs && obs.digest) || (got && got.digest) || '';
+  if (digest && onDigest) onDigest(digest, rec ? Number(rec.at || 0) : obs ? Number(obs.at || 0) : 0);
+  if (!rows.length) {
+    fill(box, el('h4', {text: 'The prompt blocks'}), para(got && got.error ? 'System 3 could not be asked: ' + got.error
+      : 'System 3 holds no block record for this prompt - it was written before prompt blocks were nodes, on a road System 3 does not decide, or the record has aged out.', 's3-muted'));
+    return;
+  }
+  const rules = (got && got.rules) || {};
+  const evs = new Map((conv.decision_events || []).filter(e => e.family === 'BLOCK').map(e => [e.event_id, e]));
+  const rolledOf = b => b.odds != null || b.u != null;
+  const kept = rows.filter(b => b.keep).length, rolled = rows.filter(rolledOf).length;
+  const list = el('div', 's3-drop-blocks', ...rows.map(b => {
+    const ev = b.event_id ? evs.get(b.event_id) : null;
+    const roll = rolledOf(b);
+    const dice = ev && ev.rng && ev.rng.dice != null ? ev.rng.dice : b.u != null ? Math.floor(Number(b.u) * 100) + 1 : null;
+    const open = ev ? () => openDecision(conv, ev, null, v.api) : null;
+    return el('div', {class: 's3-drop-block ' + (b.keep ? 'kept' : 'stripped') + (roll ? ' rolled' : ''), role: open ? 'button' : null, tabindex: open ? '0' : null,
+        title: open ? 'tap for how System 3 decided this block' : null,
+        onclick: open ? e => { e.stopPropagation(); open(); } : null,
+        onkeydown: open ? e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); e.stopPropagation(); open(); } } : null},
+      el('span', {class: 's3-drop-state', text: b.keep ? 'sent' : 'stripped'}),
+      roll ? die(dice) : el('span', 's3-drop-nodie'),
+      el('span', 's3-drop-bname', el('b', {text: b.label || (rules[b.name] || {}).label || b.name}), ' ', el('code', {text: b.name})),
+      el('span', {class: 's3-drop-why', text: [b.kind === 'wedge' ? 'a wedge - no node claims it' : b.kind, roll ? `rolled at ${pct(b.odds)} odds` : '',
+        b.why].filter(Boolean).join(' - ')}),
+      !b.keep && b.text ? el('details', 's3-drop-fold', el('summary', {text: 'the text it would have sent'}), el('pre', {class: 's3-drop-pre', text: String(b.text)})) : null);
+  }));
+  fill(box, el('h4', {text: 'The prompt blocks - what System 3 sent, stripped or rolled'}),
+    para(`${rows.length} block${rows.length === 1 ? '' : 's'}: ${kept} sent, ${rows.length - kept} stripped, ${rolled} rolled` +
+      ((rec || obs) && (rec || obs).at ? ` - decided ${clock(Number((rec || obs).at))}` : '') + (note ? '. ' + note : ''), 's3-muted'),
+    el('details', {class: 's3-drop-fold', open: rows.length <= 10 || rows.length !== kept || rolled > 0},
+      el('summary', {text: 'every block, in the order the prompt carries them'}), list));
+}
+/* A spoken message: what System 3 told the writer, the dice, and - once it
+   has aired - the blocks, the prompt and the system prompt, and the model call. */
+function dropTurnPanel(v, conv, t, cache, card) {
+  const id = conv.identity || {};
+  const evs = turnEvents(conv, t);
+  const head = el('div', 's3-drop-head', el('b', {text: card ? 'What will build this message' : 'What built this message'}),
+    el('span', {class: 's3-muted', text: `${id.road_kind || 'a'} round · turn ${t.index + 1} of ${(conv.turns || []).length} · ${t.name || t.speaker}`}));
+  const told = dropSec('What System 3 told the writer for this line', dropTold(conv, t));
+  const dice = dropSec(`The dice - ${evs.length} roll${evs.length === 1 ? '' : 's'} on this line`, dropDice(conv, evs, t, v.api));
+  const base = dropTurnIds(conv, t), extra = [];
+  const idsBox = el('div', null, dropIds(base));
+  const paintIds = () => fill(idsBox, dropIds([...base, ...extra]));
+  const ids = dropSec('Connected values', idsBox);
+  if (card) {
+    return dropPanel(head, para('Not on air yet: its dice and the row planned for it. Its words, and the prompt that writes them, open here once the air reaches it.',
+      's3-muted s3-drop-note'), told, dice, ids);
+  }
+  const blocks = el('section', 's3-drop-sec', el('h4', {text: 'The prompt blocks'}), para('Waiting for the model call...', 's3-muted'));
+  const promptBox = el('div', 's3-drop-prompt', para('Looking for the model call that wrote this message...', 's3-muted'));
+  const panel = dropPanel(head, told, dice, blocks, dropSec('The prompt to the writer, and the system prompt', promptBox), ids);
+  const load = async (fresh = false) => {
+    if (fresh) cache.writer.delete(t.turn_id);
+    let w = cache.writer.get(t.turn_id);
+    if (!w) {
+      try { w = await findWriterCall(v.api.request, conv, t, cache.calls); }
+      catch (e) { w = {row: null, detail: null, why: 'the prompt history could not be read: ' + ((e && e.message) || e)}; }
+      cache.writer.set(t.turn_id, w);
+    }
+    extra.length = 0;
+    const parts = w.row ? promptParts(w.detail || {}) : null;
+    if (w.row) {
+      const r = w.row, at = Number(r.at || 0), end = Number(r.finished || 0);
+      const took = end && at ? ` · took ${num(end - at, 1)} s` : '';
+      fill(promptBox,
+        el('div', 's3-drop-line', el('b', {text: 'The model call: '}), `${r.model || '?'} - ${r.purpose || ''} - ${day(at)}${took}`),
+        para((w.exact ? 'Proven by its words: ' : 'Nearest by time: ') + (w.why || ''), 's3-muted'),
+        dropText('The prompt to the writer', parts.user),
+        parts.sys ? dropText('The system prompt, as it was sent', parts.sys)
+          : el('div', 's3-drop-line', el('b', {text: 'The system prompt: '}), parts.user ? NO_SYSTEM : '(none)'));
+      extra.push(['model call', `${r.model || '?'} · ${r.purpose || ''}`], ['call id', r.id], ['called', day(at) + took],
+        ['found', w.exact ? 'proven by its words' : 'nearest by time'], ['model settings', JSON.stringify(parts.opts)]);
+    } else {
+      fill(promptBox, para('No prompt for this message: ' + (w.why || 'no model call was found.'), 's3-muted'),
+        el('div', 's3-row', btn('Look again', () => { fill(promptBox, para('Looking again...', 's3-muted')); load(true); }, {class: 's3-drop-again'})));
+    }
+    paintIds();
+    await dropBlocks(blocks, v, conv, w, parts, cache, (digest, at) => { extra.push(['prompt digest', digest + (at ? ' · ' + clock(at) : '')]); paintIds(); });
+  };
+  load();
+  return panel;
+}
+/* what the station played at a turn's air: the clip, why it matched, the SFX Guy's words with it */
+function dropPlayed(obs, played) {
+  const m = (obs && obs.matcher) || {};
+  const quips = obs ? (obs.sfx_guy || []).map(q => q && q.text).filter(Boolean) : [];
+  if (!played && !quips.length && m.cands == null) return null;
+  return dropSec('What the station played',
+    dropIds([['clip', played && played.clip], ['matched on', played && played.why], ['length', played && played.seconds ? num(played.seconds, 1) + ' s' : ''],
+      ['candidates', m.cands != null ? `${m.cands} (${m.eligible} eligible)` : ''], ['sample', played && played.sample_id],
+      ['due', obs && obs.due], ['the SFX Guy said', quips.join(' ')]]));
+}
+/* the SFX node on the turn: its die and the plan it made */
+function dropSfxNode(v, conv, t) {
+  const plan = t.sfx || {};
+  const ev = plan.event_id ? (conv.decision_events || []).find(e => e.event_id === plan.event_id) : null;
+  const said = [plan.play ? ('play ' + (plan.placement || '')).trim() : plan.play === false ? 'no clip planned' : '',
+    plan.p != null ? 'odds ' + pct(plan.p) : '', plan.reason ? 'why: ' + plan.reason : '',
+    (plan.intent || []).length ? 'about: ' + plan.intent.slice(0, 5).join(', ') : '', plan.gain ? 'gain: ' + plan.gain : ''].filter(Boolean).join(' · ');
+  return dropSec(`The SFX node on turn ${t.index + 1}`, ev ? el('div', 's3-drop-dice', dropRoll(ev, conv, t, v.api)) : null,
+    said ? el('div', {class: 's3-drop-line', text: said}) : ev ? null : para('No SFX node was recorded on this turn.', 's3-muted'));
+}
+/* A sting on the ledger: its two dice, the SFX node behind it, and - once it aired - what played */
+function dropStingPanel(v, conv, t, line, pair, card) {
+  const roll = line.sfx_roll && typeof line.sfx_roll === 'object' ? line.sfx_roll : {};
+  const rows = [['category', roll.category], ['clip', roll.clip]].filter(([, r]) => r && typeof r === 'object').map(([name, r]) =>
+    el('div', {class: 's3-drop-roll', style: '--fam:var(--sfx)'}, die(r.dice == null || r.dice === '' ? null : Number(r.dice)), el('b', {text: name.toUpperCase()}),
+      el('span', {class: 's3-drop-item', text: String(r.label || '')}),
+      el('span', {class: 's3-drop-why', text: [r.index != null && r.of ? `landed on ${r.index} of ${r.of}` : r.of ? 'of ' + r.of : '', r.by ? 'by ' + r.by : '',
+        r.u != null ? 'u = ' + num(r.u, 6) : '', r.tries > 1 ? r.tries + ' tries' : ''].filter(Boolean).join(' · ') || 'recorded with the row'})));
+  const id = conv.identity || {};
+  return dropPanel(
+    el('div', 's3-drop-head', el('b', {text: card ? 'What will play here' : 'What built this sting'}),
+      el('span', {class: 's3-muted', text: `a sting after turn ${t.index + 1}`})),
+    card ? para('Not on air yet: its dice and the node that asked for it. What the station plays opens here once the air reaches it.', 's3-muted s3-drop-note') : null,
+    dropSec('Its dice' + (roll.road ? ' - the ' + roll.road + ' road' : ''), rows.length ? el('div', 's3-drop-dice', ...rows) : para('No roll was recorded with this row.', 's3-muted')),
+    dropSfxNode(v, conv, t),
+    card ? null : dropPlayed(pair && pair.obs, pair && pair.played),
+    dropSec('Connected values', dropIds([['line', `${line.line_id} · block ${line.block}, line ${line.ord}`], ['row', line.who || line.kind],
+      ['conversation', id.conversation_id], ['after turn', `${t.turn_id} · turn ${t.index + 1}`], ['road', id.road_kind],
+      card ? null : ['poster', typeof line.poster === 'string' ? line.poster : '']])));
+}
+/* The SFX Guy's clip at a turn with no ledger row of its own */
+function dropClipPanel(v, conv, t, obs, played) {
+  const id = conv.identity || {};
+  return dropPanel(
+    el('div', 's3-drop-head', el('b', {text: 'What built this clip'}), el('span', {class: 's3-muted', text: `the SFX Guy after turn ${t.index + 1}`})),
+    dropSfxNode(v, conv, t), dropPlayed(obs, played),
+    dropSec('Connected values', dropIds([['conversation', id.conversation_id], ['after turn', `${t.turn_id} · turn ${t.index + 1}`],
+      ['script index', obs.turn_index], ['at', obs.at ? clock(Number(obs.at)) : ''], ['cursor', obs.cursor]])));
+}
+/* The SFX Guy's line: his node on the turn, the draw at air, the ledger row it aired as */
+function dropGuyPanel(v, conv, t, obs) {
+  const id = conv.identity || {};
+  const g = t.sfxguy || {};
+  const node = g.event_id ? (conv.decision_events || []).find(e => e.event_id === g.event_id) : null;
+  const draws = (obs.draws || []).map(d => el('div', {class: 's3-drop-roll', style: `--fam:${FAM.SFXGUY}`}, die(d.dice), el('b', {text: 'LINE'}),
+    el('span', {class: 's3-drop-item', text: `the ${d.pool || ''} pool: ${d.index} of ${d.of}`}),
+    el('span', {class: 's3-drop-why', text: (d.candidates || []).length ? 'rolled through: ' + d.candidates.join(' · ') : ''})));
+  const said = normWs(obs.line).toLowerCase();
+  const row = said ? (conv.lines || []).find(l => l.who === 'drop' && normWs(l.text).toLowerCase() === said) : null;
+  return dropPanel(
+    el('div', 's3-drop-head', el('b', {text: 'What built this line'}), el('span', {class: 's3-muted', text: `the SFX Guy after turn ${t.index + 1}`})),
+    dropSec(`His node on turn ${t.index + 1}`, node ? el('div', 's3-drop-dice', dropRoll(node, conv, t, v.api)) : para('His node on this turn was not recorded.', 's3-muted'),
+      el('div', {class: 's3-drop-line', text: [g.speak ? 'speaks' : g.speak === false ? 'passes' : '', g.kind ? 'planned: ' + g.kind : '',
+        (g.order || []).length ? 'order: ' + g.order.join(', ') : '', g.p != null ? 'odds ' + pct(g.p) : ''].filter(Boolean).join(' · ')})),
+    dropSec('The draw at air', draws.length ? el('div', 's3-drop-dice', ...draws) : para(obs.how || 'No draw was recorded with his line.', 's3-muted'),
+      (obs.fell_through || []).length ? el('div', {class: 's3-drop-line', text: 'nothing to ' + obs.fell_through.join(' or ') + ' first'}) : null),
+    dropSec('Connected values', dropIds([['line', row ? `${row.line_id} · block ${row.block}, line ${row.ord}` : ''], ['kind', obs.kind], ['planned', obs.planned],
+      ['conversation', id.conversation_id], ['after turn', `${t.turn_id} · turn ${t.index + 1}`], ['at', obs.at ? clock(Number(obs.at)) : ''], ['cursor', obs.cursor]])));
+}
+
+/* [s3-msgdrop] THE FEELING, AT A GLANCE. "for messages that get an ES result
+   from the roulette, have them display relevant emojis for each category in
+   the bottom right of each message" (operator, 2026-09-28). A written
+   message whose turn rolled an ES shows, at the right end of its direction
+   line, the ES category's emoji and then the item's own when it has a
+   different one. The engine stamps them on the turn's ES decision
+   (`t.decisions` family 'ES': `emoji: [category, item]`); a round written
+   before that falls back to the category's own, ES_EMOJI_FALLBACK. Real
+   colour emoji - the operator's exception to the Carbon-only rule - drawn in
+   an emoji face, never through PineIcons (whose cmap turns emoji codepoints
+   into Carbon outlines). Not operator data: it shows wherever the message
+   does, `details` or not. Never on a roulette card - that one shows its ES
+   die. */
+const ES_EMOJI_FALLBACK = {surprise: '\u{1F62E}', anger: '\u{1F620}', fear: '\u{1F628}', sadness: '\u{1F622}', joy: '\u{1F604}',
+  disgust: '\u{1F922}', interest: '\u{1F914}', social: '\u{1F633}', low_arousal: '\u{1F610}'};   /* [es-emoji-contract] = system3_tables._ES_EMOJI */
+function esEmojiOf(t) {
+  const dec = (t.decisions || []).find(d => d && d.family === 'ES') || null;
+  if (!dec) return {list: [], words: ''};
+  const item = String(dec.item || '');
+  const cat = String(dec.category || item.split('.')[0] || '');
+  const word = String(dec.label || item.split('.').slice(1).join('.') || '');
+  /* [es-emoji-contract] the key present (even []) is the table's word - [] is cleared, nothing shows;
+     absent is a turn planned before the badges: its category's default */
+  let list = Array.isArray(dec.emoji) ? dec.emoji.map(x => String(x || '').trim()).filter(x => x && x.length <= 16)
+    : (dec.item && ES_EMOJI_FALLBACK[cat] ? [ES_EMOJI_FALLBACK[cat]] : []);
+  list = list.slice(0, 2).filter((x, i, all) => all.indexOf(x) === i);
+  return {list, words: [cat.replace('_', ' '), word].filter(Boolean).join(' · ')};
+}
+function esDress(node, t) {
+  const got = esEmojiOf(t);
+  const bubble = got.list.length ? node.querySelector(':scope > .s3-bubble') : null;
+  if (!bubble) return;
+  const say = 'ES: ' + (got.words || 'the feeling it was rolled');
+  const badge = el('span', {class: 's3-es-badge', role: 'img', 'aria-label': say, title: say},
+    ...got.list.map(x => el('span', {class: 's3-es-emo', text: x})));
+  const dir = bubble.querySelector(':scope > .dir');
+  if (dir) { dir.classList.add('s3-has-es'); dir.append(badge); }
+  else bubble.append(el('span', 's3-es-row', badge));
+}
+
+/* ======================================================================== */
 /* The three views, shared by the full instrument (mount) and the Script
    tab's embedded Messenger / Technical views (mountEmbedded). One renderer,
    so the two hosts can never disagree about what a roll looked like. */
-function makeViews({request, onSelect} = {}) {
+function makeViews({request, onSelect, details = false} = {}) {
   const v = {conv: null, convs: new Map(), air: new Map(), sel: {turn: '', event: ''}, speed: 1, playing: false, open: new Set(),
     token: 0, alive: true, onBuildState: null,
     paneA: el('section', {class: 's3-pane', 'aria-label': 'Conversation view'}),
     paneB: el('section', {class: 's3-pane', 'aria-label': 'Technical RNG Rolodex'}),
     paneC: el('section', {class: 's3-pane', 'aria-label': 'Final script and provenance'})};
   const inspectCache = new Map();
+  /* [s3-msgdrop] "what built this message": a chevron on each message's
+     header, its panel under the message (dropTurnPanel). Off unless the host
+     asks (mountEmbedded and mount do; the tune page passes details: false).
+     The open set and the built panels are kept by key, so a message drawn
+     again comes back with its panel open where it was, fetched once. */
+  v.details = !!details;
+  v.dropHook = null;                              /* the host's word when a panel opens or closes */
+  const drop = {open: new Set(), panels: new Map(), writer: new Map(), calls: new Map(), blocks: new Map()};
+  v.dropOpen = key => drop.open.has(key);
+  v.dropDress = (node, key, mode, make) => {
+    const who = v.details && node && key ? node.querySelector(':scope > .who') : null;
+    if (!who) return node;
+    const id = key + '|' + mode;
+    const dom = 's3drop-' + String(key).replace(/[^\w-]+/g, '-');
+    const chev = el('button', {type: 'button', class: 's3-drop-btn', innerHTML: DROP_CHEVRON, 'aria-controls': dom});
+    const paint = open => {
+      chev.setAttribute('aria-expanded', String(open));
+      chev.title = open ? 'Close what built this message' : 'What built this message: the prompt, the system prompt, the dice and the values behind it';
+      chev.setAttribute('aria-label', chev.title);
+      node.classList.toggle('s3-drop-open', open);
+    };
+    const attach = () => {
+      let panel = drop.panels.get(id);
+      if (!panel) {
+        panel = make(drop);
+        panel.id = dom;
+        drop.panels.set(id, panel);
+        for (const k of drop.panels.keys()) {       /* the oldest closed ones go first */
+          if (drop.panels.size <= 60) break;
+          if (!drop.open.has(k.split('|')[0])) drop.panels.delete(k);
+        }
+      }
+      node.append(panel);
+    };
+    chev.addEventListener('pointerdown', e => e.stopPropagation());     /* a tap, not the start of a hold */
+    chev.addEventListener('click', e => {
+      e.stopPropagation();
+      const open = !drop.open.has(key);
+      if (open) { drop.open.add(key); attach(); }
+      else { drop.open.delete(key); const p = node.querySelector(':scope > .s3-drop'); if (p) p.remove(); }
+      paint(open);
+      if (typeof v.dropHook === 'function') v.dropHook(node, open, key);
+    });
+    who.append(chev);
+    paint(drop.open.has(key));
+    if (drop.open.has(key)) attach();
+    return node;
+  };
   /* [s3-still] "If I'm looking at something, do not reset my view or scroll
      my view ever." The window sets `quiet`: no programmatic select, build
      or refresh scrolls a pane - a tap on a turn still finds it in the OTHER
@@ -2044,7 +2451,7 @@ function makeViews({request, onSelect} = {}) {
     const conv = opts.conv || v.convOf(t);
     /* [s3-messenger] not on air yet: its roulette, never its words */
     const stg = opts.slot ? '' : v.stageOf(t.turn_id, conv, t);
-    if (stg === 'upcoming') return v.card(t, conv);
+    if (stg === 'upcoming') return v.dropDress(v.card(t, conv), t.turn_id, 'card', c => dropTurnPanel(v, conv, t, c, true));   /* [s3-msgdrop] its dice and its row, never its words */
     const st = v.turnStatus(t, conv);
     const perf = t.performance || {};
     const whole = v.wordsOf(t, conv);
@@ -2074,7 +2481,7 @@ function makeViews({request, onSelect} = {}) {
       el('span', {text: t.phase}), perf.emotion ? el('span', {text: `${perf.emotion} ${num(perf.intensity)}`}) : null,
       sb.length ? el('span', {text: 'speakerbox ' + sb.map(s => s.mode.toLowerCase()).join(', ')}) : null,
       t.sfx && t.sfx.play ? el('span', {text: 'SFX ' + t.sfx.placement}) : null,
-      t.sfxguy && t.sfxguy.speak ? el('span', {text: 'SFX Guy: ' + (t.sfxguy.kind || 'speaks')}) : null,
+      t.sfxguy && t.sfxguy.speak ? el('span', {text: castName('sfx') + ': ' + (t.sfxguy.kind || 'speaks')})   /* [cast-names] */ : null,
       el('span', {text: '~' + num(t.estimated_seconds, 0) + 's'}), el('span', {class: st.cls, text: st.word}));
     /* A line a speaker-box passage went into opens, in place, into its
        parts: the passages above and below it and the setup row. A line
@@ -2107,6 +2514,8 @@ function makeViews({request, onSelect} = {}) {
       opts.slot || (open ? composeLine(conv, t, v.api) : body), opts.slot ? null : reacts, opts.slot ? null : chips,
       !opts.slot && cutWhy ? cutNote(cutWhy, v) : null);
     node.fill = () => { node.classList.remove('building'); fill(node, node.firstChild, body, reacts, chips); };
+    if (!opts.slot) esDress(node, t);                                    /* [s3-msgdrop] the ES emoji, bottom right */
+    if (!opts.slot) v.dropDress(node, t.turn_id, 'full|' + turnLines(conv, t).map(l => l.line_id).join(','), c => dropTurnPanel(v, conv, t, c, false));   /* [s3-msgdrop] */
     if (stg && v.dressItem) v.dressItem(node, t.turn_id, stg);
     return node;
   };
@@ -2180,6 +2589,7 @@ function makeViews({request, onSelect} = {}) {
         !upcoming && quips.length ? el('div', {class: 's3-words', text: quips.join(' ')}) : null,
         !upcoming && why ? el('div', {class: 's3-sfx-why', text: why}) : null));
     node.s3 = {conv, t, obs: pair ? pair.obs : null, played: played || null, line};
+    v.dropDress(node, key, upcoming ? 'card' : 'full' + (pair ? '|played' : ''), () => dropStingPanel(v, conv, t, line, pair, upcoming));   /* [s3-msgdrop] */
     node.addEventListener('click', e => {
       if (e.target.closest(KEEP_OPEN + ', .s3-vthumb, .s3-aplayer')) return;
       e.stopPropagation();
@@ -2538,10 +2948,10 @@ function makeViews({request, onSelect} = {}) {
    of stillness, resumes the follow). It reads the station's event cursor (one small request every few
    seconds, only while the view is on screen) and fetches a round only when
    it has news - never a request per line, never a repaint of the feed. */
-export async function mountEmbedded(root, {request, view = 'conversation', onSelect, onOpenFull, chrome} = {}) {
+export async function mountEmbedded(root, {request, view = 'conversation', onSelect, onOpenFull, chrome, details = true} = {}) {
   request ||= defaultRequest();
   root.classList.add('s3', 's3-embed');
-  const v = makeViews({request, onSelect: (conv, turnId, eventId) => {
+  const v = makeViews({request, details, onSelect: (conv, turnId, eventId) => {
     if (!onSelect) return;
     onSelect({conversation: conv.identity.conversation_id, turn: turnId, event: eventId,
       lines: (conv.lines || []).filter(l => l.turn_id === turnId).map(l => l.line_id)});
@@ -3737,7 +4147,7 @@ function sfxGuyStory(conv, sg, v) {
   const node = sg.node, obs = sg.line || {}, t = sg.turn;
   const box = el('div', 's3-story-sfxguy');
   box.append(el('div', 's3-story-head',
-    el('b', {text: "The SFX Guy's line" + (t ? ` - after turn ${t.index + 1} (${t.name || t.speaker})` : '')}),
+    el('b', {text: castName('sfx') + "'s line" + (t ?   /* [cast-names] */ ` - after turn ${t.index + 1} (${t.name || t.speaker})` : '')}),
     el('span', {class: 's3-muted', text: (obs.kind ? {news: 'broke a story off the wire', reaction: 'fired back at the line',
       quip: 'a saying off his shelf', bank: 'a take off his speech bank'}[obs.kind] || obs.kind : '')})));
   if (node) {
@@ -3802,7 +4212,7 @@ export async function mountLineStory(root, {request, lineId = '', prompt = '', o
   if (conv && !t) {
     const cid = (conv.identity || {}).conversation_id || '';
     const who = String((got.line || {}).who || '');
-    const old = conv.engine && conv.engine !== 'system3-engine/3';
+    const old = conv.engine && Number(String(conv.engine).split('/').pop()) < 3;   /* engine /4+ is not old */
     say(`Part of a System 3 round (${(conv.identity || {}).road_kind || 'a'} round ${cid}) but not one of its planned turns: `
       + (who === 'drop' ? (old ? 'the SFX Guy spoke here before he had a node (this round was planned by ' + conv.engine + '), so the dial\'s own random chose the line.'
           : 'the SFX Guy\'s line; its draw was not recorded on this row.')
@@ -3891,7 +4301,7 @@ export async function mountLineStory(root, {request, lineId = '', prompt = '', o
 }
 
 /* ======================================================================== */
-export async function mount(root, {request, onClose, tab: startTab = '', table: startTable = '', conversationId = ''} = {}) {
+export async function mount(root, {request, onClose, tab: startTab = '', table: startTable = '', conversationId = '', details = true} = {}) {
   request ||= defaultRequest();
   /* [s3-cast] 'tables:DIRECTIVE1' opens a tab on a table - the Mind desk's buttons use it */
   if (typeof startTab === 'string' && startTab.includes(':') && !startTable) [startTab, startTable] = startTab.split(':', 2);
@@ -3900,7 +4310,7 @@ export async function mount(root, {request, onClose, tab: startTab = '', table: 
   let alive = true, tab = startTab || 'director', view = 'split', cursor = 0, follow = false;   /* [s3-still] follow live only when asked */
   let status = null, list = [], config = null, settings = null, lastLoaded = '';
   const timers = [];
-  const v = makeViews({request});
+  const v = makeViews({request, details});                                /* [s3-msgdrop] */
   v.quiet = true;                                                        /* [s3-still] */
   v.sequenced = true;          /* [s3-messenger] the conversation pane is a Messenger: a line not on air yet is its roulette */
   try { v.newestFirst = localStorage.getItem('s3.newestFirst') !== '0'; } catch (e) { v.newestFirst = true; }
@@ -4134,7 +4544,7 @@ export async function mount(root, {request, onClose, tab: startTab = '', table: 
   let tableId = startTable || 'ES1', draft = null;   /* [s3-dice] a card can open on its table */
   let tableDrag = null; const foldedCats = new Set();   /* [s3-window] */
   /* [s3-cast] every family that keeps a table, the round rolls and the two pools included */
-  const TABLE_FAMILIES = ['CTS', 'ES', 'RS', 'IRS', 'FL', 'TEMPER', 'SHOCK', 'INTERJECT', 'FAV', 'DIRECTIVE', 'EVENT', 'CHANCE', 'POOL'];
+  const TABLE_FAMILIES = ['CTS', 'ES', 'RS', 'IRS', 'FL', 'TEMPER', 'SHOCK', 'INTERJECT', 'SPEAKERBOX', 'FAV', 'DIRECTIVE', 'EVENT', 'CHANCE', 'POOL'];   /* [s3-sb-end] SBEND1 */
   /* [s3-events] one kind of happening: its odds, whose turn, where, whether it ends the segment */
   function eventFields(cat) {
     const pct = el('span', {text: Math.round((cat.odds ?? 0.1) * 100) + '%'});
@@ -4191,6 +4601,120 @@ export async function mount(root, {request, onClose, tab: startTab = '', table: 
     return null;
   }
 
+  /* ---------------- [s3-lists] banks & lists --------------------------------
+     "Any list to do with conversation or the roulette needs to be listed here
+     as an editable table" (operator). Each list is its store's own rows,
+     served by /api/system3/lists: a change is written to the store at once
+     and recorded (who, when, what) - there is no draft to save. A table id
+     never has a dot and a list id always does, so 'tables:sfxguy.bank' opens
+     the Tables tab on the SFX Guy's speech bank. */
+  let listId = String(startTable || '').includes('.') ? String(startTable) : '';
+  let listReg = null, listRegAsked = false, listRegError = '';
+  const listView = {q: '', state: '', offset: 0, limit: 50};
+  const LIST_STATES = {ready: 'ready', waiting: 'waiting to record', queued: 'queued - not in the bank yet',
+    suspended: 'suspended', off: 'off', dormant: 'dormant - another voice or profile', on: 'on',
+    resting: 'resting - aired inside the hour', produced: 'produced spot', read: 'read live', banked: 'banked'};
+  async function loadListReg() {
+    try { listReg = (await request('/api/system3/lists')).lists || []; listRegError = ''; }
+    catch (e) { listReg = []; listRegError = e.message || String(e); }   /* an older station has no such door: say so in the nav, quietly */
+  }
+  function paintListNav(listNode) {
+    if (listReg === null) {
+      if (!listRegAsked) { listRegAsked = true; loadListReg().then(() => { if (tab === 'tables') paintTables(); }); }
+      return;
+    }
+    /* a table button clears the list selection before its own handler repaints */
+    listNode.addEventListener('click', e => { const b = e.target.closest('button'); if (b && !b.closest('.s3-lists-nav')) listId = ''; }, true);
+    if (listId) for (const b of listNode.querySelectorAll('button[aria-pressed="true"]')) b.setAttribute('aria-pressed', 'false');
+    const nav = el('div', {class: 's3-lists-nav', style: 'display:grid;gap:6px'}, el('h3', {text: 'BANKS & LISTS'}));
+    for (const l of listReg) {
+      const b = btn('', () => { listId = l.id; listView.q = ''; listView.state = ''; listView.offset = 0; paintTables(); },
+        {'aria-pressed': String(l.id === listId), title: l.what || ''});
+      b.append(el('span', {text: l.label || l.id}), el('span', {class: 's3-muted', text: l.error ? 'unreadable' : l.count == null ? '' : String(l.count)}));
+      nav.append(b);
+    }
+    if (!listReg.length) nav.append(el('span', {class: 's3-muted', text: listRegError ? 'the station did not answer: ' + listRegError : 'none registered on this station'}));
+    listNode.append(nav);
+  }
+  function listEditor() {
+    const meta = (listReg || []).find(l => l.id === listId) || {id: listId, label: listId, family: 'LIST', what: '', can: {}};
+    const can = meta.can || {}, bank = meta.family === 'BANK';
+    const base = '/api/system3/lists/' + encodeURIComponent(meta.id);
+    const card = el('div', 's3-card');
+    const rowsBox = el('div'), pager = el('div', 's3-row'), log = el('div');
+    const stateSel = el('select', {'aria-label': 'show', onchange: e => { listView.state = e.target.value; listView.offset = 0; loadRows(); }});
+    let searchTimer = 0;
+    const search = el('input', {type: 'search', value: listView.q, placeholder: 'search the words', 'aria-label': 'search', style: 'min-width:16em',
+      oninput: e => { clearTimeout(searchTimer); searchTimer = setTimeout(() => { listView.q = e.target.value; listView.offset = 0; loadRows(); }, 300); }});
+    async function write(call, said) {
+      try { await call(); notice(said + ' - written to the store and recorded on the desk log.'); } catch (e) { report(e); }
+      await loadRows();
+    }
+    const rowPath = r => base + '/rows/' + encodeURIComponent(r.id);
+    function rowOf(r) {
+      const words = el('input', {type: 'text', value: r.text || '', 'aria-label': 'the words', style: 'width:100%', disabled: !can.edit,
+        onchange: e => { const t = e.target.value.trim(); if (!t || t === (r.text || '')) { e.target.value = r.text || ''; return; }
+          write(() => send(rowPath(r), 'PUT', {text: t}), bank ? 'Saved - the old recording is dropped; the line is recorded in the new words before it can air' : 'Saved'); }});
+      const facts = [LIST_STATES[r.state] || r.state || '', r.plays > 0 ? 'played ' + r.plays : r.plays === 0 ? 'never played' : '', r.last_played ? 'last ' + day(r.last_played) : '',
+        r.takes > 1 ? r.takes + ' takes' : '', r.reserved ? 'on air now' : '', r.origin && r.origin !== 'station' ? 'from the ' + r.origin : '', r.note || ''].filter(Boolean).join(' · ');
+      return el('div', {class: 's3-list-row', 'data-row': r.id, style: 'display:grid;grid-template-columns:3.2em minmax(0,1fr) auto;gap:8px;align-items:center;padding:5px 0;border-bottom:1px solid var(--line)'},
+        can.switch ? el('label', 's3-row', el('input', {type: 'checkbox', checked: r.on !== false, 'aria-label': 'on',
+          onchange: e => write(() => send(rowPath(r), 'PUT', {on: e.target.checked}), e.target.checked ? 'Switched on - back in the draw' : 'Switched off - kept, never picked')}), 'on') : el('span'),
+        el('div', {style: 'display:grid;gap:2px;min-width:0'}, words,
+          el('span', {class: 's3-muted', text: facts}),
+          r.airs_as ? el('span', {class: 's3-muted', text: 'airs as: ' + r.airs_as}) : null,
+          r.why ? el('span', {class: 's3-muted', text: r.why}) : null),
+        can.remove ? btn('x', () => {
+          if (!confirm('Remove "' + String(r.text || '').slice(0, 80) + '" from ' + (meta.label || meta.id) + '?' +
+            (bank ? ' Every recording of it goes too, and the station will not bring the words back.' : ''))) return;
+          write(() => send(rowPath(r), 'DELETE'), 'Removed');
+        }, {'aria-label': 'remove item', style: 'padding:0 6px'}) : el('span'));
+    }
+    function paintRows(got) {
+      const rows = got.rows || [], total = got.total || 0, states = got.states || {};
+      const all = Object.values(states).reduce((a, n) => a + n, 0);
+      fill(stateSel, el('option', {value: '', text: 'every row (' + all + ')', selected: !listView.state}),
+        ...Object.entries(states).map(([k, n]) => el('option', {value: k, text: (LIST_STATES[k] || k) + ' (' + n + ')', selected: k === listView.state})),
+        listView.state && !(listView.state in states) ? el('option', {value: listView.state, text: LIST_STATES[listView.state] || listView.state, selected: true}) : null);
+      fill(rowsBox, ...rows.map(rowOf), rows.length ? null : el('p', {class: 's3-muted', text: listView.q || listView.state ? 'nothing matches' : 'this list is empty'}));
+      const from = total ? got.offset + 1 : 0, to = got.offset + rows.length;
+      fill(pager,
+        btn('previous', () => { listView.offset = Math.max(0, listView.offset - listView.limit); loadRows(); }, {disabled: got.offset <= 0}),
+        el('span', {class: 's3-muted', text: 'rows ' + from + '-' + to + ' of ' + total}),
+        btn('next', () => { listView.offset += listView.limit; loadRows(); }, {disabled: to >= total}));
+      const edits = got.edits || [];
+      fill(log, edits.length ? el('details', null, el('summary', {text: 'desk edits on this list (' + edits.length + ' newest)'}),
+        ...edits.map(e => el('div', {class: 's3-muted', text: [day(e.at), (e.who && (e.who.what + ' ' + e.who.addr)) || '', e.op,
+          e.before && e.before.text ? '"' + String(e.before.text).slice(0, 60) + '"' : '',
+          e.asked && e.asked.text ? '-> "' + String(e.asked.text).slice(0, 60) + '"' : e.asked && 'on' in e.asked ? '-> ' + (e.asked.on ? 'on' : 'off') : '',
+          e.failed ? 'FAILED: ' + e.failed : ''].filter(Boolean).join(' · ')}))) : null);
+    }
+    async function loadRows() {
+      let got;
+      try { got = await request(base + '?' + new URLSearchParams({offset: listView.offset, limit: listView.limit, q: listView.q, state: listView.state})); }
+      catch (e) { report(e); fill(rowsBox, el('p', {class: 's3-muted', text: 'could not read this list'})); return; }
+      if (got.total && listView.offset >= got.total) { listView.offset = Math.max(0, Math.floor((got.total - 1) / listView.limit) * listView.limit); return loadRows(); }
+      paintRows(got);
+    }
+    let addInput = null;
+    const addRow = can.add ? el('div', 's3-row',
+      addInput = el('input', {type: 'text', placeholder: bank ? 'a new line, word for word (recorded in his voice before it can air)' : 'a new row, word for word',
+        style: 'flex:1;min-width:16em', 'aria-label': 'new item', onkeydown: e => { if (e.key === 'Enter') e.target.nextSibling.click(); }}),
+      btn('Add item', () => { const t = addInput.value.trim(); if (!t) return;
+        write(async () => { await send(base + '/rows', 'POST', {text: t}); addInput.value = ''; listView.q = ''; search.value = ''; },
+          bank ? 'Added - queued to be recorded' : 'Added'); })) : null;
+    card.append(
+      el('div', 's3-row', el('h2', {text: (meta.label || meta.id) + ' · ' + (meta.family || 'LIST')}),
+        el('span', {class: 's3-muted', text: meta.store ? 'store ' + meta.store : ''})),
+      el('p', {class: 's3-muted', text: meta.what || ''}),
+      el('div', 's3-row', search, stateSel, pager),
+      addRow, rowsBox, log,
+      el('p', {class: 's3-muted', text: 'Changes here go to the store at once - there is nothing to save.' +
+        (can.switch ? ' Off keeps a row but it is never picked.' : '') + (bank ? ' A rewritten line airs only once it is recorded again.' : '')}));
+    loadRows();
+    return card;
+  }
+
   function paintTables() {
     const tables = config.config.tables;
     if (!draft || draft.id !== tableId) draft = JSON.parse(JSON.stringify(tables.find(t => t.id === tableId) || tables[0]));
@@ -4203,6 +4727,23 @@ export async function mount(root, {request, onClose, tab: startTab = '', table: 
       b.append(el('span', {text: `${t.id} · ${t.label}`}), el('span', {class: 's3-muted', text: t.enabled === false ? 'off' : 'w' + t.weight}));
     }
     const editor = el('div', 's3-card');
+    /* [s3-es-emoji] AN ES ROW'S BADGE. "For messages that get an ES result from the
+       roulette, have them display relevant emojis for each category in the bottom
+       right of each message" (the operator, 2026-09-28): real colour emoji, the one
+       exception to the Carbon-only rule, so the input names an emoji font first. A
+       category's emoji sits beside its name; an item's beside its label - blank, it
+       wears its category's (the placeholder). A cleared one is kept as "" and stays
+       cleared. Space and Enter are held back: in a category's summary they fold it. */
+    const esEmoji = (row, inherit, box) => el('input', {type: 'text', class: box ? 's3-emoji' : 's3-emoji s3-emoji-item',
+      value: row.emoji || '', placeholder: inherit, maxlength: 16,
+      'aria-label': box ? 'emoji for this feeling' : "emoji for this item (blank: its category's)",
+      title: box ? 'the badge a message rolled in this feeling wears, at the bottom right of its bubble (blank: none)'
+        : "this item's own badge (blank: it wears its category's)",
+      style: "width:3em;flex:none;text-align:center;font-size:1.15em;font-family:'Apple Color Emoji','Segoe UI Emoji','Noto Color Emoji',sans-serif",
+      onclick: e => e.stopPropagation(),
+      onkeydown: e => { if (e.key === ' ' || e.key === 'Enter') e.preventDefault(); },
+      oninput: e => { row.emoji = e.target.value.trim();
+        if (box) for (const x of box.querySelectorAll('input.s3-emoji-item')) x.placeholder = row.emoji; }});
     const slider = (value, set, max = 5) => {
       const out = el('span', {text: num(value)});
       return [el('input', {type: 'range', min: 0, max, step: 0.05, value, oninput: e => { set(+e.target.value); out.textContent = num(+e.target.value); }}), out];
@@ -4228,6 +4769,7 @@ export async function mount(root, {request, onClose, tab: startTab = '', table: 
       const box = el('details', {class: 's3-cat', open: !foldedCats.has(foldKey),
         ontoggle: e => { if (e.target !== box) return; if (box.open) foldedCats.delete(foldKey); else foldedCats.add(foldKey); }});
       box.append(el('summary', null, el('b', {text: cat.label || cat.id}),
+        draft.family === 'ES' ? esEmoji(cat, 'none', box) : null,   /* [s3-es-emoji] the feeling's badge, beside its name */
         el('span', {class: 's3-muted', text: `${(cat.items || []).length} items · w${num(cat.weight)}`}), el('span', {style: 'flex:1'}),
         others.length ? el('select', {'aria-label': 'consolidate into', title: 'move every item of this category into another one and drop it',
           onclick: e => e.stopPropagation(),
@@ -4239,8 +4781,11 @@ export async function mount(root, {request, onClose, tab: startTab = '', table: 
       box.append(el('div', 's3-slider', el('label', null, el('b', {text: 'category weight'})), ...slider(cat.weight, v => { cat.weight = v; })));
       if (draft.family === 'EVENT') box.append(eventFields(cat));   /* [s3-events] */
       for (const item of cat.items) {
+        const labelIn = el('input', {type: 'text', value: item.label, 'aria-label': 'label', style: draft.family === 'ES' ? 'min-width:0;flex:1' : null,
+          oninput: e => { item.label = e.target.value; }});
         const row = el('div', 's3-item',
-          el('input', {type: 'text', value: item.label, 'aria-label': 'label', oninput: e => { item.label = e.target.value; }}),
+          draft.family === 'ES' ? el('span', {style: 'display:flex;gap:6px;align-items:center;min-width:0'},   /* [s3-es-emoji] its own badge */
+            esEmoji(item, cat.emoji || '', null), labelIn) : labelIn,
           ...slider(item.weight ?? 1, v => { item.weight = v; }),
           el('label', 's3-row', el('input', {type: 'checkbox', checked: item.enabled !== false, onchange: e => { item.enabled = e.target.checked; }}), 'on'),
           el('input', {type: 'text', class: 'txt', value: item.text || '', placeholder: draft.family === 'DIRECTIVE' ? 'the directive, as the writer is told it' : draft.family === 'FAV' ? 'the line, word for word' : 'what the writer is told this turn does', oninput: e => { item.text = e.target.value; }}),
@@ -4264,7 +4809,7 @@ export async function mount(root, {request, onClose, tab: startTab = '', table: 
           btn('x', () => { cat.items.splice(cat.items.indexOf(item), 1); paintTables(); }, {'aria-label': 'remove item', style: 'padding:0 6px'}));
         box.append(wrap);
       }
-      const adv = el('textarea', {value: json(Object.fromEntries(Object.entries(cat).filter(([k]) => !['items', 'label', 'weight', 'id'].includes(k))))});
+      const adv = el('textarea', {value: json(Object.fromEntries(Object.entries(cat).filter(([k]) => !['items', 'label', 'weight', 'id', 'emoji'].includes(k))))});   /* [s3-es-emoji] */
       box.append(btn(draft.family === 'DIRECTIVE' ? 'Add directive' : draft.family === 'FAV' ? 'Add favourite' : 'Add item', () => {
           if (draft.family === 'EVENT') {   /* [s3-events] a variant of the happening is what the writer is told happens */
             const text = prompt('What happens (the writer is told this on the turn it lands on; {first} is the caller)'); if (!text || !text.trim()) return;
@@ -4293,7 +4838,8 @@ export async function mount(root, {request, onClose, tab: startTab = '', table: 
       btn('Delete table', async () => { if (!confirm('Delete ' + draft.id + '?')) return; try { await send('/api/system3/tables/' + draft.id, 'DELETE'); await loadConfig(); tableId = 'ES1'; draft = null; paint(); } catch (e) { report(e); } }),
       btn('Discard changes', () => { draft = null; paintTables(); }),
       el('span', {class: 's3-muted', text: 'Every save is a new config version; conversations keep the version they were planned under.'})));
-    fill(body, el('div', 's3-edit', listNode, editor));
+    fill(body, el('div', 's3-edit', listNode, listId ? listEditor() : editor));   /* [s3-lists] */
+    paintListNav(listNode);
   }
 
   /* ---------------- structure: the node view -------------------------------- */
@@ -4377,7 +4923,7 @@ export async function mount(root, {request, onClose, tab: startTab = '', table: 
       'The last turn of every scene draws: ' + structure.closing.draws.map(d => d.family + (d.closes ? ' (closing moves only)' : '')).join(', '))),
       el('div', 's3-loop', 'Handoff initiator role to the other party → loop the cycle for the segment duration. The structure loops, not the dialogue.'));
     fill(body, el('div', 's3-card', el('h2', {text: structure.label + ' structure'}), roadPicker(),
-      el('p', {class: 's3-muted', text: 'Mark the lines that roll for a speakerbox insertion before (prepend) or after (append) them. The odds are the prepend and append sliders on the DJ desk, scaled by the Speakerbox density control.'}),
+      el('p', {class: 's3-muted', text: 'Mark the lines that roll for a speakerbox insertion before (prepend) or after (append) them. The odds are the prepend and append sliders on the DJ desk, scaled by the Speakerbox density control. When both win on one line, the prepend-or-append roulette (SBEND1 in Tables) picks one.'}),   /* [s3-sb-end] */
       nodes, el('div', 's3-row',
         btn('Add step', () => { steps.push({id: 'step' + (steps.length + 1), label: 'New step', speaker: 'responder_a', draws: [{family: 'ES'}, {family: 'RS'}], speakerbox: []}); paintStructure(); }),
         btn('Save structure', async () => { try { steps.forEach((s, i) => { s.id ||= 'step' + i; }); const res = await send('/api/system3/structure', 'PUT', {steps}); await loadConfig(); steps = null; paint(); saved('the banter cycle', res); } catch (e) { report(e); } }),
@@ -4436,7 +4982,7 @@ export async function mount(root, {request, onClose, tab: startTab = '', table: 
     const props = el('div', 's3-seg-props');
     if (cycle) props.append(el('label', null, 'who opens the round ',   /* [s3-flow] */
       el('select', {onchange: e => { segInitiator = e.target.value; }},
-        ...[['', 'the first seat (as always)'], ['A', 'seat A (the host)'], ['B', 'seat B (the co-host)'], ['D', 'seat D (the third seat)']]
+        ...[['', 'the first seat (as always)'], ['A', 'seat A (' + castName('host') + ', the host)'], ['B', 'seat B (' + castName('cohost') + ', the co-host)'], ['D', 'seat D (the third seat)']]   /* [cast-names] */
           .map(([v, t]) => el('option', {value: v, text: t, selected: v === (segInitiator ?? (st.initiator || ''))})))));
     if (!sel) props.append(para('Tap a node to edit it.', 's3-muted'));
     else {

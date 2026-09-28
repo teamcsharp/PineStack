@@ -20,6 +20,18 @@ window.pineStationBase = function () {
       || "http://127.0.0.1:8096").replace(/\/$/, "");
   } catch (err) { return "http://127.0.0.1:8096"; }
 };
+/* [cast-names] A character's name as the station answers it (dj_names on
+ * /api/dj, through sampler-feed.js's one poll): Dill, Skip and Sam unless
+ * the DJ options say otherwise - never "Host" or "The SFX Guy". */
+function rendererCastName(role, fallback) {
+  const ask = window.pineCastName;
+  if (typeof ask === "function") {
+    try { return ask(role, fallback); } catch (err) { /* the station's own */ }
+  }
+  if (fallback !== undefined) return fallback;
+  return ({host: "Dill", dj: "Dill", cohost: "Skip", sfx: "Sam", sfxguy: "Sam",
+           drop: "Sam"})[String(role || "").toLowerCase()] || "";
+}
 let currentView = "control";
 let railResize = null;
 let defaultBroadcastApplied = false;
@@ -4806,7 +4818,10 @@ function initWorksPopup() {
       box.appendChild(none);
       return box;
     }
-    const SEAT = {dj: "Host", cohost: "Co-host", third: "Third",
+    const SEAT = {dj: rendererCastName("host"),              /* [cast-names] */
+                  cohost: rendererCastName("cohost"),
+                  third: rendererCastName("third", "Third"),
+                  drop: rendererCastName("sfx"),
                   caller: "Caller", caller2: "Second caller"};
     order.forEach((who) => {
       const one = by[who];
@@ -12843,8 +12858,11 @@ function initCrystalBtn() {
       sp.scale.set(30, 7.5, 1);
       return sp;
     }
-    let castNames = { host: "Host", cohost: "Skip",
-                      sfxguy: "The SFX Guy", caller: "the phone line" };
+    /* [cast-names] the pillars are labelled once, so they start with the
+     * cast's names rather than "Host" and "The SFX Guy". */
+    let castNames = { host: rendererCastName("host"),
+                      cohost: rendererCastName("cohost"),
+                      sfxguy: rendererCastName("sfx"), caller: "the phone line" };
     const castPos = { host: [-96, 0, -34], cohost: [96, 0, -34],
                       sfxguy: [-96, 0, 58], caller: [96, 0, 58] };
     const pillars = {};

@@ -250,6 +250,10 @@ class System3Runtime:
         added = self.add_missing_default_tables()
         if added:
             self.log("System 3 config gained the default tables it predates: " + ", ".join(added))
+        badges = self.add_missing_es_emoji()                                 # [s3-es-emoji]
+        if badges:
+            self.log("System 3's ES tables gained their emoji badges (once): %d on %s"
+                     % (len(badges), ", ".join(sorted({b.split(":", 1)[0] for b in badges}))))
         self._cast_load()                                                   # [s3-cast]
         adopted = self.adopt_mind_notes()
         if adopted:
@@ -830,6 +834,53 @@ class System3Runtime:
             return []
         self.config = new
         return ids
+
+    ES_EMOJI_MARK = "ES_EMOJI"         # [s3-es-emoji] in defaults_added: the badges were given once
+
+    def add_missing_es_emoji(self):
+        """[s3-es-emoji] Once: the ES badges (an emoji per category and per
+        item, system3_tables.ES1) onto the stored config, which predates them.
+        On every ES-family table, a category or item whose id matches the
+        defaults gets the default emoji ONLY where it has no `emoji` key at
+        all. Remembered in `defaults_added` (ES_EMOJI_MARK), so it never runs
+        again: an emoji the operator later clears ("") stays cleared. Saved as
+        one version with a note. Returns what was filled ("ES1:anger", ...)."""
+        config = self.config if isinstance(self.config, dict) else {}
+        seen = {str(x) for x in (config.get("defaults_added") or [])}
+        if self.ES_EMOJI_MARK in seen:
+            return []
+        es1 = system3_tables.ES1
+        cat_emoji = {c["id"]: c["emoji"] for c in es1["categories"] if c.get("emoji")}
+        item_emoji = {i["id"]: i["emoji"] for c in es1["categories"] for i in c["items"] if i.get("emoji")}
+        new = copy.deepcopy(config)
+        filled, tables = [], []
+        for t in new.get("tables") or []:
+            if not isinstance(t, dict) or t.get("family") != "ES":
+                continue
+            before = len(filled)
+            for c in t.get("categories") or []:
+                if not isinstance(c, dict):
+                    continue
+                if "emoji" not in c and cat_emoji.get(str(c.get("id") or "")):
+                    c["emoji"] = cat_emoji[str(c["id"])]
+                    filled.append("%s:%s" % (t.get("id"), c["id"]))
+                for it in c.get("items") or []:
+                    if isinstance(it, dict) and "emoji" not in it and item_emoji.get(str(it.get("id") or "")):
+                        it["emoji"] = item_emoji[str(it["id"])]
+                        filled.append("%s:%s" % (t.get("id"), it["id"]))
+            if len(filled) > before:
+                tables.append(str(t.get("id")))
+        if not filled:
+            return []
+        new["defaults_added"] = sorted(seen | {self.ES_EMOJI_MARK})
+        try:
+            self.store.save_config(new, "ES emoji badges added from the defaults (once): %d on %s"
+                                   % (len(filled), ", ".join(tables)))
+        except Exception as exc:  # noqa: BLE001
+            self.fail("ES emoji", exc)
+            return []
+        self.config = new
+        return filled
 
     def log(self, text, extra=""):
         try:

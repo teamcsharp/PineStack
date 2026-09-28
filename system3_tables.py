@@ -167,6 +167,55 @@ _ES_AFTER = {"anger": {"-1": 1.5, "1": 0.7}, "disgust": {"-1": 1.25},
              "surprise": {"-1": 1.1, "0": 1.1}, "interest": {"0": 1.2},
              "low_arousal": {"1": 1.2}}
 
+# [s3-es-emoji] THE BADGE A MESSAGE WEARS. 2026-09-28, the operator: "for
+# messages that get an ES result from the roulette, have them display relevant
+# emojis for each category in the bottom right of each message." Real colour
+# emoji - the one exception to the station's Carbon-icons-only rule, and only
+# for this badge. One per category; an item carries its own only where a more
+# specific one exists (fury, panic, grief ...) - a word unlisted here, or one
+# whose emoji is its category's, wears the category's. The engine stamps the
+# pair on the turn's ES decision as `emoji`: [category, item] (system3.es_emoji).
+# Edited per row in the Tables tab; the live config was given these once
+# (System3Runtime.add_missing_es_emoji), so a badge the operator clears stays clear.
+_ES_EMOJI = {"surprise": "\U0001F62E", "anger": "\U0001F620", "fear": "\U0001F628",   # 😮 😠 😨
+             "sadness": "\U0001F622", "joy": "\U0001F604", "disgust": "\U0001F922",  # 😢 😄 🤢
+             "interest": "\U0001F914", "social": "\U0001F633",                       # 🤔 😳
+             "low_arousal": "\U0001F610"}                                            # 😐
+_ES_ITEM_EMOJI = {
+    # surprise: ⚡ 😲 🤯 ⁉️ 😵‍💫 😕 🧐 👀
+    "shock": "\U000026A1", "astonishment": "\U0001F632", "amazement": "\U0001F92F",
+    "disbelief": "\U00002049\U0000FE0F", "bewilderment": "\U0001F635\U0000200D\U0001F4AB",
+    "confusion": "\U0001F615", "curiosity": "\U0001F9D0", "intrigue": "\U0001F440",
+    # anger: 🙄 💢 😖 😤 🤬 😡 😒 😏 🤢
+    "annoyance": "\U0001F644", "irritation": "\U0001F4A2", "frustration": "\U0001F616",
+    "indignation": "\U0001F624", "outrage": "\U0001F92C", "fury": "\U0001F621",
+    "resentment": "\U0001F612", "contempt": "\U0001F60F", "disgust": "\U0001F922",
+    # fear: 😟 😬 😰 🚨 😧 😱 💀
+    "unease": "\U0001F61F", "apprehension": "\U0001F62C", "anxiety": "\U0001F630",
+    "alarm": "\U0001F6A8", "dread": "\U0001F627", "panic": "\U0001F631", "horror": "\U0001F480",
+    # sadness: 😞 😔 😭 😩 🥀 🫂 🥺
+    "disappointment": "\U0001F61E", "discouragement": "\U0001F614", "grief": "\U0001F62D",
+    "despair": "\U0001F629", "melancholy": "\U0001F940", "sympathy": "\U0001FAC2", "pity": "\U0001F97A",
+    # joy: 😊 😁 🎉 🙌 😂 😌 👌
+    "pleasure": "\U0001F60A", "delight": "\U0001F601", "excitement": "\U0001F389",
+    "enthusiasm": "\U0001F64C", "amusement": "\U0001F602", "relief": "\U0001F60C",
+    "satisfaction": "\U0001F44C",
+    # disgust: 🙁 🙅 🤮 ✋ 👎
+    "distaste": "\U0001F641", "aversion": "\U0001F645", "revulsion": "\U0001F92E",
+    "repulsion": "\U0000270B", "moral disgust": "\U0001F44E",
+    # interest: 🤩 👂 🤨 🕵️ 🤷 (curiosity and intrigue as under surprise)
+    "fascination": "\U0001F929", "attentiveness": "\U0001F442", "skepticism": "\U0001F928",
+    "suspicion": "\U0001F575\U0000FE0F", "uncertainty": "\U0001F937",
+    # social: 😅 🙈 😓 😎 😍 💚 😾 🛡️
+    "awkwardness": "\U0001F605", "shame": "\U0001F648", "guilt": "\U0001F613", "pride": "\U0001F60E",
+    "admiration": "\U0001F60D", "envy": "\U0001F49A", "jealousy": "\U0001F63E",
+    "defensiveness": "\U0001F6E1\U0000FE0F",
+    # low_arousal: 😑 🥱 😶 😮‍💨 😫 🧘 🙂
+    "indifference": "\U0001F611", "boredom": "\U0001F971", "apathy": "\U0001F636",
+    "resignation": "\U0001F62E\U0000200D\U0001F4A8", "exhaustion": "\U0001F62B", "calm": "\U0001F9D8",
+    "acceptance": "\U0001F642",
+}
+
 ES1 = {
     "id": "ES1", "family": "ES", "label": "Emotional Set 1", "version": 1,
     "enabled": True, "weight": 1.0,
@@ -174,9 +223,13 @@ ES1 = {
     "categories": [
         {"id": cid, "label": label, "weight": 1.0, "valence": val, "arousal": ar,
          "dims": dims, "modifiers": mods, "after_lean": _ES_AFTER.get(cid, {}),
+         "emoji": _ES_EMOJI[cid],                                          # [s3-es-emoji] the badge
          "items": _items([{"id": f"{cid}.{w.replace(' ', '_')}", "label": w,
                            **({"arousal": _ES_AROUSAL[w]} if w in _ES_AROUSAL else {}),
-                           **({"valence": _ES_VALENCE[w]} if w in _ES_VALENCE else {})}
+                           **({"valence": _ES_VALENCE[w]} if w in _ES_VALENCE else {}),
+                           # [s3-es-emoji] its own, only where it is more specific than the category's
+                           **({"emoji": _ES_ITEM_EMOJI[w]}
+                              if _ES_ITEM_EMOJI.get(w, _ES_EMOJI[cid]) != _ES_EMOJI[cid] else {})}
                           for w in words])}
         for cid, label, val, ar, dims, mods, words in _ES_CATS
     ],
@@ -663,6 +716,27 @@ CALLEVENT1 = {
     ],
 }
 
+# --- SBEND1: prepend or append, when both win --------------------------------
+#
+# [s3-sb-end] 2026-09-28, the operator: "a roulette between either append or
+# prepend if they both happen to have won in the roulette. So instead of both
+# winning together, they now have a roulette that is part of the system. A
+# speakerbox 'prepend/append' roulette." A marked line still rolls its own dice
+# against the prepend and the append sliders; only when BOTH win does this table
+# pick the one that is read, by these weights, and the other is withdrawn. With
+# the table switched off (or deleted) both are read, as before.
+SBEND1 = {
+    "id": "SBEND1", "family": "SPEAKERBOX", "label": "Speakerbox: prepend or append (when both win)", "version": 1,
+    "enabled": True, "weight": 1.0,
+    "description": "When a line's prepend and append both win their dice, this roulette picks the one that is read; "
+                   "the other is withdrawn and the Rolodex says why. Re-weight a row to favour it; switch the table "
+                   "off and both are read.",
+    "categories": [{"id": "end", "label": "Where the passage goes", "weight": 1.0, "items": _items([
+        {"id": "prepend", "label": "Prepend", "text": "the passage is read before the line"},
+        {"id": "append", "label": "Append", "text": "the passage is read after the line"},
+    ])}],
+}
+
 # --- STATION1 / POOLS1: the station's own rolls, tabled ------------------------
 #
 # [s3-dice-door] 2026-09-27, the operator: "all of the requests for randomness
@@ -759,7 +833,7 @@ def default_blocks():
 POOL_FAMILIES = ("FAV", "DIRECTIVE", "CHANCE", "POOL")
 
 DEFAULT_TABLES = [CTS1, ES1, RS1, RS2, IRS1, IRS2, FL1, FL2, TEMPER1, SHOCK1, INTERJECT1, FAV1, DIRECTIVE1, CALLEVENT1,
-                  STATION1, POOLS1]
+                  STATION1, POOLS1, SBEND1]
 
 # --- The banter cycle (PDF p.3) --------------------------------------------
 #
