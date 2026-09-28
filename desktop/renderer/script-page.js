@@ -13603,6 +13603,248 @@
   var FOLD_FX_MOST = 140;        /* beyond this a segment snaps */
   var FOLD_FX_MS = 260;
 
+  /* ==================================================== [secflip] ==
+   * THE SECTION FLIPS TO ITS ASSEMBLY CHART.
+   *
+   * "offer an icon here that can be clicked that converts the script
+   * view for this segment from text to a subelelemtn of the visual
+   * vertical graph of how this flowchart conversation was scheduled
+   * and put together. I want to be able to convert the visual of a
+   * section in the script view to see a top down flowchart in that
+   * section of how that segment was assembled." (operator, 2026-09-28)
+   *
+   * The icon is the Messenger's own section-flip glyph
+   * (c:chart--network), one per segment band, ON AIR and UP NEXT
+   * alike. The chart is the System 3 module's own vertical segment
+   * chain (mountSegmentNodes, by the reviewS3Import road), mounted
+   * once per flip and KEPT - its trace answer is measured in
+   * megabytes, so a fold, a repaint or a second look never asks the
+   * station again - and disposed when the segment leaves the page or
+   * the whole script view does. The screenplay body is hidden, never
+   * removed: the same `hidden` the folds already use, which every
+   * scroll guard in this file (scriptAnchor, keepLitInView,
+   * seatLineNearest, the fold guards) already respects, so a flipped
+   * section cannot move the page. The stitcher takes the pane out on
+   * every repaint because it is not an element of the screenplay
+   * (#1289's rule); secFlipApply() at the tail of segApply() - the
+   * pass every paint already ends in - puts it back in the same
+   * synchronous breath, so the reader never sees it gone. */
+
+  var secFlip = Object.create(null);  /* seg -> {on, seg, headKey, pane, host, view, held, h, lineId} */
+  var secFlipWatcher = null;          /* one observer: the whole view left */
+
+  function secFlipState(seg) { return secFlip[String(seg || '')] || null; }
+
+  function secFlipDrop(seg) {
+    var state = secFlip[seg];
+    if (!state) return;
+    delete secFlip[seg];
+    if (state.view) { try { state.view.dispose(); } catch (err) { /* gone */ } }
+    state.view = null;
+    state.held = null;
+    if (state.pane && state.pane.parentNode) state.pane.remove();
+  }
+
+  /* The disposal probe, wired on the first mount: when the script view
+     itself leaves the page, every held chain is let go. A segment that
+     leaves on its own (the hour rolling off) is swept by secFlipApply. */
+  function secFlipWatch() {
+    if (secFlipWatcher || typeof MutationObserver !== 'function') return;
+    secFlipWatcher = new MutationObserver(function () {
+      if (el('spScript')) return;
+      for (var seg in secFlip) secFlipDrop(seg);
+    });
+    secFlipWatcher.observe(document.body, {childList: true, subtree: true});
+  }
+
+  /* The section's body: every element drawn under this segment that is
+     not a heading, in page order. */
+  function secFlipMembers(seg) {
+    var out = [];
+    for (var i = 0; i < scriptOrder.length; i += 1) {
+      var node = scriptOrder[i];
+      if (String((node.dataset && node.dataset.seg) || '') !== seg) continue;
+      if (/(^|\s)sp-scene(\s|$)/.test(String(node.className || ''))) continue;
+      out.push(node);
+    }
+    return out;
+  }
+
+  /* The band the pane seats under: the one that was tapped while it
+     still stands, else the segment's own heading. */
+  function secFlipHeadOf(seg, state) {
+    var held = state && state.headKey ? scriptNodes.get(state.headKey) : null;
+    if (held && held.isConnected && String((held.dataset && held.dataset.seg) || '') === seg
+        && /(^|\s)sp-scene(\s|$)/.test(String(held.className || ''))) return held;
+    var own = sceneNodes.get(seg);
+    if (own && own.isConnected) return own;
+    for (var i = 0; i < scriptOrder.length; i += 1) {
+      var node = scriptOrder[i];
+      if (String((node.dataset && node.dataset.seg) || '') === seg && node.isConnected
+          && /(^|\s)sp-scene(\s|$)/.test(String(node.className || ''))) return node;
+    }
+    return null;
+  }
+
+  /* Mounted once per flip and kept; the module speaks for itself when
+     System 3 holds nothing (an unstamped segment, a segment not in the
+     script yet), and a failure says why instead of leaving a blank. */
+  function secFlipMount(state) {
+    if (state.held) return;
+    var held = {view: null};
+    state.held = held;
+    var host = state.host;
+    var seg = state.seg;
+    host.textContent = '';
+    host.appendChild(make('div', 'sp-secflip-note',
+      'asking System 3 how this segment was put together...'));
+    reviewS3Import().then(function (mod) {
+      if (secFlip[seg] !== state || state.held !== held) return null;
+      if (!mod || typeof mod.mountSegmentNodes !== 'function') {
+        throw new Error('this station has no System 3 segment chain module yet');
+      }
+      host.textContent = '';
+      return mod.mountSegmentNodes(host, {request: s3Request,
+        segment: seg, lineId: state.lineId || ''});
+    }).then(function (view) {
+      if (!view) return;
+      if (secFlip[seg] !== state || state.held !== held) {
+        try { view.dispose(); } catch (err) { /* gone */ }
+        return;
+      }
+      state.view = view;
+    }).then(null, function (err) {          /* the mount's own failures */
+      if (secFlip[seg] === state && state.held === held) state.held = null;
+      host.textContent = '';
+      host.appendChild(make('div', 'sp-secflip-note',
+        'System 3 could not draw this segment: '
+        + String((err && err.message) || err).slice(0, 160)));
+    });
+    secFlipWatch();
+  }
+
+  function secFlipToggle(head) {
+    var seg = String((head && head.dataset && head.dataset.seg) || '');
+    if (!seg) return;
+    var state = secFlip[seg];
+    if (state && state.on) {
+      state.on = false;
+      if (state.pane && state.pane.parentNode) state.pane.remove();
+      segApply(false);      /* the owner of `hidden` restores the text */
+      return;
+    }
+    /* Flipping a shut fold open first, by the fold's own road - the
+       operator asked to SEE this section. */
+    if (head.classList && head.classList.contains('sp-shut')) segToggle(seg);
+    if (!state) {
+      state = secFlip[seg] = {on: false, seg: seg, headKey: '', pane: null,
+        host: null, view: null, held: null, h: 0, lineId: ''};
+    }
+    state.on = true;
+    state.headKey = String(head.pineKey || '');
+    if (!state.pane) {
+      state.pane = make('div', 'sp-secflip-pane');
+      state.pane.setAttribute('data-secflip', seg);
+      state.host = make('div', 'sp-secflip-host');
+      state.pane.appendChild(state.host);
+    }
+    /* Sized to the section: the pane takes the height the text held, so
+       nothing below the section moves on the flip; its own scroll holds
+       whatever the chain needs beyond it. Measured once, at the flip. */
+    var members = secFlipMembers(seg);
+    var top = null, bottom = null;
+    for (var i = 0; i < members.length; i += 1) {
+      if (members[i].hidden || !members[i].isConnected) continue;
+      var seat = members[i].getBoundingClientRect();
+      if (!(seat.height > 0)) continue;
+      if (!top) top = seat;
+      bottom = seat;
+    }
+    var held = top && bottom ? Math.round(bottom.bottom - top.top) : 0;
+    var box = el('spScript');
+    var most = box ? Math.max(220, Math.round(box.clientHeight * 0.8)) : 480;
+    state.h = Math.max(200, Math.min(held || 200, most));
+    state.pane.style.height = state.h + 'px';
+    segApply(false);        /* seats the pane, hides the text, mounts */
+  }
+
+  /* The icon, in the band's empty middle, before the count: the
+     Messenger's own section-flip glyph, by the file's own icon button.
+     dressScene() rebuilds a band's children when its print changes, so
+     this is re-asked after every apply and puts the icon back. */
+  function secFlipDress(head) {
+    var seg = String((head && head.dataset && head.dataset.seg) || '');
+    var btn = head.querySelector ? head.querySelector('.sp-secflip-btn') : null;
+    if (!seg) { if (btn) btn.remove(); return; }
+    /* #1285's fold handle: a re-dressed band (a scene whose print
+       changed) has its className rewritten without `sp-fold`, which
+       drops the whole band grid on the floor. Re-assert the contract
+       the heading was built with, the same way this pass re-asserts
+       everything else. */
+    if (!head.classList.contains('sp-fold')) head.classList.add('sp-fold');
+    if (!btn) {
+      btn = flowIconButton('sp-secflip-btn', 'c:chart--network',
+        'Show how this segment was assembled');
+      btn.addEventListener('click', function (ev) {
+        ev.stopPropagation();               /* not the fold's tap */
+        if (head.pineHeld) return;          /* the hold has just answered */
+        secFlipToggle(head);
+      });
+      btn.addEventListener('keydown', function (ev) {
+        if (ev.key !== 'Enter' && ev.key !== ' ' && ev.key !== 'Spacebar') return;
+        ev.stopPropagation();               /* the button answers, not the fold */
+      });
+      head.insertBefore(btn, head.querySelector('.sp-segment-count'));
+    }
+    var state = secFlip[seg];
+    var on = !!(state && state.on);
+    btn.classList.toggle('on', on);
+    btn.setAttribute('aria-pressed', on ? 'true' : 'false');
+    btn.title = on ? 'Show this segment as its script again'
+      : 'Show how this segment was assembled';
+    btn.setAttribute('aria-label', btn.title);
+  }
+
+  /* Called at the tail of segApply(), which every paint ends in: the
+     icons are re-dressed, the flipped sections re-hide their text, and
+     the panes are seated back where the stitcher took them out. All in
+     the same synchronous pass - nothing is ever seen missing, and
+     nothing here moves any scroller. */
+  function secFlipApply() {
+    var box = el('spScript');
+    if (!box) return;
+    for (var i = 0; i < scriptOrder.length; i += 1) {
+      var node = scriptOrder[i];
+      if (!/(^|\s)sp-scene(\s|$)/.test(String(node.className || ''))) continue;
+      secFlipDress(node);
+    }
+    for (var seg in secFlip) {
+      var state = secFlip[seg];
+      var head = secFlipHeadOf(seg, state);
+      if (!head) { secFlipDrop(seg); continue; }
+      if (!state.on) {
+        if (state.pane && state.pane.parentNode) state.pane.remove();
+        continue;
+      }
+      var members = secFlipMembers(seg);
+      var firstLine = '';
+      for (var m = 0; m < members.length; m += 1) {
+        members[m].hidden = true;
+        if (!firstLine && members[m].dataset && members[m].dataset.line) {
+          firstLine = String(members[m].dataset.line);
+        }
+      }
+      if (!state.lineId) state.lineId = firstLine;
+      var shut = head.classList.contains('sp-shut');
+      state.pane.hidden = shut;             /* a shut fold hides the chart too */
+      if (head.parentNode === box && head.nextSibling !== state.pane) {
+        box.insertBefore(state.pane, head.nextSibling);
+      }
+      if (!shut && !state.held) secFlipMount(state);
+    }
+  }
+  /* ================================================== [secflip] end */
+
   function segApply(motion) {
     var box = el('spScript');
     if (!box) return;
@@ -13763,6 +14005,7 @@
     /* #1300b: and only now, once every element has been able to read
        the old value. */
     for (var done in segsNow) segWas[done] = segsNow[done];
+    secFlipApply();                     /* [secflip] flipped sections re-assert */
     segSettle(shutting, opening);                            /* #1300 */
   }
 
@@ -18234,6 +18477,9 @@
              reload: function () { loadScreenplay(true); }},
     folds: {bind: bindScriptOrder, apply: segApply, toggle: segToggle,
             jump: jumpToLine, reveal: revealLine, count: segCount},
+    /* [secflip] the section flip, by road */
+    secflip: {toggle: secFlipToggle, apply: secFlipApply,
+              dress: secFlipDress, state: secFlipState},
     feedCrawl: {dress: feedCrawlDress, row: feedDress, measure: feedCrawlMeasure,
                 start: feedCrawlStart, stop: feedCrawlStop},
     isMounted: function () { return mounted; },

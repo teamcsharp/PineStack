@@ -2018,6 +2018,30 @@ function syncDesktopRadio(clock) {
   // would otherwise have wiped the music slider a second after it moved.
   player.volume = desktopMusicGain();
   player.muted = desktopMusicGain() <= 0;
+  /* [plsender] MX LIVE: the record on air is the live set - an endless
+   * stream with no position to keep. Load it once, keep it playing,
+   * never seek it and never bend its rate: a seek on an endless stream
+   * re-requests it every poll. The panel and the tune page carry this
+   * same guard (their [pinelive] blocks); this is the desk's copy. */
+  if (clock.live) {
+    if (clock.id !== desktopTrackId || player.src !== nextUrl || player.error) {
+      desktopTrackId = clock.id || "";
+      player.src = nextUrl;
+      player.playbackRate = 1;
+      player.play().then(() => { pendingPlayGesture = false; })
+        .catch(() => {
+          pendingPlayGesture = true;
+          noteRouteError("Click anywhere once to allow app audio");
+        });
+      return;
+    }
+    if (player.paused && !player.ended) {
+      player.play().then(() => { pendingPlayGesture = false; })
+        .catch(() => { pendingPlayGesture = true; });
+    }
+    if (player.playbackRate !== 1) player.playbackRate = 1;
+    return;
+  }
   if (clock.id !== desktopTrackId || player.src !== nextUrl) {
     desktopTrackId = clock.id || "";
     player.src = nextUrl;
