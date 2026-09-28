@@ -3682,3 +3682,36 @@ html.pine-tech-wide .sp-tech.sp-tech-wide .wc-strip {
 .sp-detail-tabs .sp-detail-close { position: static; margin-left: auto; flex: none; }
 .sp-detail-line-tab[hidden], .sp-detail-s3[hidden] { display: none; }
 .sp-detail-s3 { min-width: 0; color: var(--sp-text); }
+
+/* [s3-script-linear] Proposed additions to desktop/renderer/script-page.css
+   (the JS works without them; these only make the new states visible).
+
+   A row above the ON AIR mark that the station stopped listing (hour
+   rollover, cache) is KEPT where it was read - dimmed, so it reads as
+   "no longer on the station's page" rather than vanishing under the eye. */
+.sp-el.sp-dropped { opacity: .42; }
+
+/* The page's own CHARACTER cue / "(continued)" heading for a row that was
+   relocated under the mark - written by the page, not the station. */
+.sp-el.sp-cue-derived { font-style: italic; }
+.sp-el.sp-scene-derived .sp-segment-name { font-style: italic; }
+
+/* The air named a line ABOVE the mark; the mark holds and says so. */
+.sp-el.sp-now[data-air-back="1"]::before {
+  content: "ON AIR\A held";
+  color: var(--sp-amber, #d8a657);
+}
+.sp-el.sp-now[data-air-back="1"] {
+  border-left-color: var(--sp-amber, #d8a657);
+  box-shadow: -4px 0 0 0 var(--sp-amber, #d8a657),
+              0 0 0 1px rgba(216, 166, 87, .45) inset;
+}
+
+/* [line-id] the line's own id on the tapped card: short, monospace, copyable */
+.sp-line-id {
+  display: inline-block; margin: 4px 0 2px; padding: 1px 7px;
+  font: 12px/1.6 ui-monospace, "Cascadia Mono", Consolas, monospace;
+  color: var(--sp-muted, #9aa4ad); background: transparent;
+  border: 1px solid rgba(154, 164, 173, .35); border-radius: 6px; cursor: copy;
+}
+.sp-line-id:hover { color: var(--sp-ink, #e6e6e6); border-color: rgba(230, 230, 230, .55); }

@@ -271,6 +271,13 @@ def page_waiting_park(clip: dict[str, Any], ask: dict[str, Any] | None = None,
     clip["air_waiting"] = {"since": time.time(), "ahead": ahead,
                            "producer": str(producer or "")[:80], "why": why[:200]}
     _PAGE_WAITING.append(clip)
+    # [air-order-park] THE WAITING LINE IS THE AIR QUEUE. The line's place in
+    # the script is taken now, where it joined the queue - behind the rounds it
+    # waits for, in front of any round committed after it. Numbered when it
+    # LEFT the line, a station ID that arrived before a banter round was
+    # written read, in the script, as having come after it (the one late block
+    # of the first 29 heard, 2026-09-28).
+    script_ledger_reserve([str(r.get("id") or "") for r in _page_delivery_rows(clip)])
     # A delivery that exists, waiting: whatever looks it up by id (the render
     # backlog's "its tail cannot overtake an uncompleted head") sees a line in
     # flight rather than one that was never published and publishes it twice.

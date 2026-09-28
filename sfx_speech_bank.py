@@ -190,8 +190,13 @@ class SfxSpeechBank:
                 pool.append(copy.deepcopy(row) if deep else row)
             return pool
 
-    def pick(self, context, voice, profile, validate, *, cooldown=180, lease_seconds=900):
-        """Reserve a complete take; only a later audible ACK counts as heard."""
+    def pick(self, context, voice, profile, validate, *, cooldown=180, lease_seconds=900,
+             chooser=None):
+        """Reserve a complete take; only a later audible ACK counts as heard.
+
+        [s3-bank] `chooser`, when given, is the roulette: it is handed each
+        eligible take as {text, overlap, plays, last_played} and answers the
+        index it landed on (None: the bank's own ranking decides, as before)."""
         with self.lock:
             now, terms = self.clock(), response_terms(context)
             # #1236: pick reads three fields off each row to choose a
@@ -201,8 +206,20 @@ class SfxSpeechBank:
                                  cooldown=cooldown, deep=False)
             if not pool:
                 return None
-            picked = min(pool, key=lambda row: (-len(terms & response_terms(row.get("text_plain", ""))),
-                                                float(row.get("last_played") or 0), row["id"]))
+            picked = None
+            if chooser is not None:
+                try:
+                    k = chooser([{"text": str(row.get("text") or ""),
+                                  "overlap": len(terms & response_terms(row.get("text_plain", ""))),
+                                  "plays": int(row.get("plays") or 0),
+                                  "last_played": float(row.get("last_played") or 0)} for row in pool])
+                    if k is not None and 0 <= int(k) < len(pool):
+                        picked = pool[int(k)]
+                except Exception:
+                    picked = None
+            if picked is None:
+                picked = min(pool, key=lambda row: (-len(terms & response_terms(row.get("text_plain", ""))),
+                                                    float(row.get("last_played") or 0), row["id"]))
             # #1236: a shallow ledger and ONE replaced row, not a deep
             # copy of 1.45 MB to write two fields. The atomicity the
             # deep copy bought is kept exactly: the stored row is

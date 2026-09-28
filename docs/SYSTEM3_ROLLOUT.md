@@ -312,3 +312,50 @@ came back unpunctuated`.
 - Known, not done: the SFX Guy's dead-air talk still picks its context with random.choice of the topics
   board; the liner-for-sting (25%) and the verdict (35%) are station randoms; single lines get no SFX
   direction; `system3_direct_line` / `system3_bind_line` are bare names in app.py (runtime-injected).
+
+## 2026-09-28 - batch 6, the wrap-up (session 26c39aab)
+
+Restart 01:14 local (1790579674), healthy: System 3 0 failures, both served pages parse, #1477 and car1476
+still applied. 299 of 302 tests green in the container; the three failures (`test_sfx_speech_bank` x2,
+`test_sfx_reserve_admission` x1) fail identically on the pre-batch code.
+
+- **Air order** `tools/air_order_patch.py`, `tools/air_order_park_patch.py`: measured over 14 h, 200 of 210
+  "late" script blocks were NUMBERING (a round numbered when written, a single line only when heard) and the
+  rest real (65 lines the sequencer queued were heard before the round they waited for). A line is numbered
+  where it joins the air queue (`script_ledger_reserve`, `data/script_ledger_reserved.jsonl`) - at the page
+  door, or when it joins the waiting line - and a line that arrives while committed rounds wait is parked
+  off the page and published the moment they have gone; a stale one is withdrawn and recorded.
+- **CTS material** `tools/system3_material_patch.py` + engine/runtime `[s3-material]`: "Manager Message",
+  the gallery pitches and the "online search" rebuttal carry the real material (the manager's last words
+  under 3 h, an analysed gallery piece rolled by `s3.gallery_piece`, searxng results fetched in the
+  background and cached per subject); ineligible without it, as before.
+- **Story call-backs** `[s3-story]`: a sequel's protocol sheet is empty, so it used to be withheld; it is
+  built from System 3's call legs with call-back acts (`system3_tables.STORY_ACTS`, or a structure's
+  `story_acts`). A story call handed its own protocol keeps it, annotated.
+- **Pinned source** `tools/system3_source_patch.py` + `[s3-source]`: the initiator node's `source` (a
+  speakbox document, picked from GET /api/speakbox in the Segments editor) becomes the banter seed.
+- **SFX: family then clip** `tools/system3_sfx_roll_patch.py` + runtime `[s3-sfx-roll]`: `sfx.category`
+  then `sfx.clip` (the pool), the clip book's folder then clip, the matcher's tied peers (`sfx.match`); the
+  rolls and the poster ride the board line to the ledger and the conversation's `lines`.
+- **Every prompt block marked** `tools/system3_blocks2_patch.py` (21 edits); markers never reach a voice
+  (`tools/system3_unmark_patch.py`: `spoken_text` unmarks) nor System 3's subject (`[s3-unmark]`).
+- **The station's own dice, third pass** `tools/system3_dice3_part{1,2,3}_patch.py` (34 + 36 + 18 edits);
+  technical randomness left as it was (listed in each tool).
+- **The SFX Guy's bank** `tools/system3_bank_roll_patch.py` + `sfx_speech_bank.py` `chooser`: 165 stock
+  lines had aired 3,613 times (top 50-69x) through the bank's own keyword rank and a 3-MINUTE rest. While
+  System 3's dice are live a banked line airs only when the roulette brings one up (`sfxguy.bank_line`,
+  STATION1, SFXGUY_BANK_ODDS 0.2), the take is `sfxguy.bank_take`, and a line rests SFXGUY_BANK_REST_S (6 h).
+- **Messenger** (frontend/system3.js `[s3-messenger]`): upcoming turns are roulette cards (dice, no words);
+  the live one pops, rolls, and its words arrive with the audio, a bar across the bubble; strictly one at a
+  time. **Script view** (script-page.js `[s3-script-linear]`): append-only above ON AIR; the mark only moves
+  down except on the operator's own seek/replay/go-live. **Line id** on the tapped card (`#` + 8 hex, tap
+  copies the whole id). The tablet APK was rebuilt, and its volume-up screenshot chord removed.
+- Older tools reconciled where a newer edit landed inside their text: `system3_dice_patch` (helpers),
+  `system3_roads_patch` (round-row-extras), `system3_patch_app` (ledger-row-helper), `system3_dice3_part3`
+  (short-video-folder anchors on the SFX roll's version).
+- **Cupboard cleared of stock System 3 did not script** (backup `~/pinevoice-stack/legacy-backup-20260928-012248`):
+  145 shelf ads retired, 585 gold bars burnt (restorable), 300 legacy upstairs pages and 280 ad-book entries
+  deleted. The System 3 banked rounds and lines (198) stayed.
+- Next: the operator's guide (Dill / Skip / Sam; Sam a full booth seat; the lead earned by spice; the
+  roulette picks responders; memory by rules then roulette), names in the DJ options, the changelog served
+  from a cache, and the list of roads still forcing dialogue onto the air, for discussion.

@@ -36,7 +36,7 @@ table is still exactly true, and System 3 only records.
 ## Decisions explicitly not taken over
 
 - **Live rounds are never repaired.** A second model visit in front of the listener is dead-air risk (blueprint §8, §17).
-- **Callers keep their protocol** as legs of System 3's call structure (`[s3-calls]`); a story call-back keeps the station's sheet, annotated.
+- **Callers keep their protocol** as legs of System 3's call structure (`[s3-calls]`); a story call-back handed its own protocol keeps it, annotated; one handed none (the station's case today) is built from System 3's call legs with call-back acts (2026-09-28).
 - **No path is invented.** The SFX Guy produces intent words and dues. Only the station's indexed book produces files.
 - **Scheduled sources are never discarded.** Turn 0 speaks the road's own subject (`CTS OBLIGATED`), and a CTS category whose material the road does not hold is ineligible.
 - **Frozen scripts are not mutated.** Binding reads the script and writes only `turn_dice`, `dice`, `system3`, plus additions to `passage_source`/`dealt`. The words are not touched (tested).
@@ -58,3 +58,19 @@ The four station-side random() directives in dj_banter's one-call prompt
 mention) and `show_memory`'s "moods right now" stand down when System 3 owns
 the round. A deferred or empty writer never leaves the seed passage standing
 in for the round: the round is withheld and recorded.
+
+## Added 2026-09-28 (`[air-order]`, `[s3-material]`, `[s3-story]`, `[s3-source]`, `[s3-sfx-roll]`, `[s3-bank]`)
+
+The principle, from the operator: "no dialogue hit the station unless it is scripted via the RNG roulette
+system" - and banks are welcome when they are made from System 3's node-scripted conversations.
+
+| Decision | Owner under System 3 (active) | Mechanism | Recorded as |
+|---|---|---|---|
+| When a single line may reach the page | the page door, behind the committed rounds | parked off the page while held rounds wait; published after them; stale ones withdrawn (orch policy `air_order_strict`) | `/api/playout` `waiting_line`; feed row `withdrawn` + why |
+| A line's place in the script | where it joins the air queue | `script_ledger_reserve` | ledger `(block, ord)` |
+| The manager's words / a gallery piece / what people online say, on a row that names them | **System 3** row + the station's material (`system3_cts_material`) | eligible only when present; the gallery piece is a roll | the event's `selected.material` |
+| A story call-back's shape | **System 3** call legs | `plan_call` with `STORY_ACTS` | the call's turns |
+| The document a round opens from, when pinned | the operator, on the initiator node | `system3_pinned_source` -> `speakbox_quote(only=)` | pipeline log `system3` |
+| The board's clip | **System 3**: family then clip | `sfx.category`, `sfx.clip`, `sfxtv.*`, `sfx.match` | STATION events; `sfx_roll` + `poster` on the line |
+| Whether one of the SFX Guy's banked lines airs, and which | **System 3** | `sfxguy.bank_line` (chance), `sfxguy.bank_take` (pick); 6 h rest | STATION events |
+| Every prompt block | **System 3** blocks table | every DEFAULT_BLOCKS name now has a marked site | BLOCK events; the Prompt tab |

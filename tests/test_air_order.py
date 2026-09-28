@@ -89,6 +89,21 @@ class NumberingTests(unittest.TestCase):
             self.assertEqual(app.script_ledger_catch_up([heard("x1", "said by the box", at=time.time())]), 1)
             self.assertEqual([r["line_id"] for r in box.rows()], ["x1"])
 
+    def test_a_line_parked_before_a_round_was_written_reads_before_it(self):
+        with LedgerSandbox(), ExitStack() as stack:
+            for name, value in (("air_order_strict", lambda: True),
+                                ("playout_held_keys", lambda: ["sid:earlier"]),
+                                ("_PAGE_WAITING", []), ("_PAGE_DELIVERIES", {}),
+                                ("_AIR_ORDER", {"parked": 0, "flushed": 0, "dropped": 0, "exempt": 0,
+                                                "last_park": "", "last_drop": ""})):
+                stack.enter_context(mock.patch.object(app, name, value))
+            self.assertTrue(app.page_waiting_park({"row_id": "id1", "kind": "station_id", "text": "an ident"}))
+            later = app.script_ledger_commit("sidB", [{"line_id": "b1", "text": "a round written after"}], "banter")
+            app.script_ledger_catch_up([heard("id1", "an ident")])
+            order = app.script_ledger_order()
+            self.assertTrue(later)
+            self.assertLess(order["id1"], order["b1"], "it joined the air queue before the round was written")
+
     def test_the_memo_stays_in_script_order(self):
         with LedgerSandbox():
             line = app.script_ledger_reserve(["early"])
@@ -110,8 +125,13 @@ class Recorder:
 
 
 class WaitingLineTests(unittest.TestCase):
+    def reserve(self, ids, at=0.0):
+        self.reserved.append(list(ids))
+        return len(self.reserved)
+
     def setUp(self):
         self.held = ["sid:r1"]
+        self.reserved = []
         self.pub = Recorder()
         self.stack = ExitStack()
         for name, value in (("air_order_strict", lambda: True),
@@ -125,7 +145,9 @@ class WaitingLineTests(unittest.TestCase):
                             ("_RECORD_BOUND_LINES", {}),
                             ("_PAGE_DELIVERIES", {}),
                             ("_RENDER_BACKLOG", []),
-                            ("render_backlog_save", lambda: None)):
+                            ("render_backlog_save", lambda: None),
+                            # never the live ledger's numbers from a test
+                            ("script_ledger_reserve", self.reserve)):
             self.stack.enter_context(mock.patch.object(app, name, value))
         self.radio = {"chat": [], "dropped": [], "voice_cut_ms": 0}
         self.stack.enter_context(mock.patch.object(app, "_RADIO", self.radio))
@@ -161,6 +183,11 @@ class WaitingLineTests(unittest.TestCase):
             self.assertTrue(app.page_waiting_park(self.clip("j2")))
         app.page_waiting_flush()
         self.assertEqual([c["row_id"] for c in self.pub.sent], ["j1", "j2"])
+
+    def test_a_line_is_numbered_where_it_joined_the_line(self):
+        app.page_waiting_park(self.clip("j1", stream={"rows": [{"id": "j1"}, {"id": "j1-punct-1"}]}))
+        self.assertEqual(self.reserved, [["j1", "j1-punct-1"]],
+                         "numbered at park time, before the round it waits for goes")
 
     def test_a_parked_line_is_a_delivery_in_flight(self):
         did = app.page_waiting_park(self.clip("j1"))

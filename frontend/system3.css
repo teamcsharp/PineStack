@@ -483,12 +483,19 @@
   background: #0b1215; border: 1px solid var(--line); border-radius: 6px; padding: 8px; margin: 6px 0 0; }
 .s3-story mark.s3-hit { background: rgba(144, 218, 185, .28); color: var(--ink); border-radius: 3px; }
 
-/* [s3-roads] the bar under the message on air: the page's clock for the line */
-.s3-msg .s3-airbar { position: relative; height: 4px; margin: 8px 0 2px; border-radius: 2px; background: #1b2735; overflow: visible; }
-.s3-msg .s3-airbar i { display: block; height: 100%; width: calc(var(--k, 0) * 100%); border-radius: 2px;
-  background: var(--sfx); transition: width .25s linear; }
-.s3-msg .s3-airbar b { position: absolute; right: 0; top: -15px; font: 10px/1 ui-monospace, monospace; color: #7f8ea3; }
-.s3-msg.onair .s3-airbar i { box-shadow: 0 0 6px var(--sfx); }
+/* [s3-roads] [s3-messenger] the bar ACROSS the message on air: inside the
+   bubble, along its bottom edge, the page's clock for the line; played out,
+   it stays thin and quiet. Its m:ss sits small in the header line. */
+.s3-bubble.has-bar { padding-bottom: 16px; min-width: min(100%, 240px); }   /* room for the bar from the first word */
+.s3-msg .s3-bubble > .s3-airbar { position: absolute; left: 12px; right: 12px; bottom: 6px; height: 4px; margin: 0;
+  border-radius: 2px; background: #00000059; overflow: hidden; }
+.s3-msg .s3-bubble > .s3-airbar i { display: block; height: 100%; width: calc(var(--k, 0) * 100%); border-radius: 2px;
+  background: var(--sfx); transition: width .2s linear; }
+.s3-msg.onair .s3-bubble > .s3-airbar i { box-shadow: 0 0 6px var(--sfx); }
+.s3-msg .s3-bubble > .s3-airbar.done { height: 2px; bottom: 6px; opacity: .55; }
+.s3-msg .s3-bubble > .s3-airbar.done i { background: var(--ink-3); box-shadow: none; transition: none; }
+.s3-msg .who .s3-airclock { font: 10px/1 ui-monospace, monospace; color: #9fb0bd; }
+.s3-msg .who .s3-airclock:empty { display: none; }
 /* the SFX Guy's own line, drawn at air */
 .s3-sfxguy-line .s3-words { color: var(--sfxguy); }
 .s3-reel-text { font-size: 11px; margin-top: 4px; }
@@ -736,3 +743,42 @@
 .s3-blocks .s3-block { border-top: 1px solid var(--line); padding: 5px 0; }
 .s3-block-stripped b, .s3-block-stripped .s3-block-text { color: var(--warn); text-decoration: line-through; }
 .s3-block-text { font-size: 12px; opacity: .85; white-space: pre-wrap; max-height: 7em; overflow: auto; }
+
+/* [s3-messenger] A LINE NOT YET ON AIR IS ITS ROULETTE: a compact card of
+   the rolls that made it - each decision's d100, family and pick - dashed,
+   dark, in its seat's colour, with no words. On air it pops, its dice roll,
+   and it becomes the message. */
+.s3-msg.s3-upcoming { cursor: default; }
+.s3-msg .s3-bubble.s3-roulette { background: #0c1519; border: 1px dashed var(--line-2); padding: 6px 8px 5px; font-size: 12px;
+  white-space: normal; display: grid; gap: 5px; border-radius: 12px; }
+.s3-msg.seat-B .s3-bubble.s3-roulette { border-color: #4a7fe0; }
+.s3-msg.seat-C .s3-bubble.s3-roulette { border-color: #8a64c8; }
+.s3-msg.seat-D .s3-bubble.s3-roulette { border-color: #4f8f72; }
+.s3-msg.seat-E .s3-bubble.s3-roulette { border-color: #3a9a96; }
+.s3-sfxnode .s3-sfx-bubble.s3-roulette { background: #0a1a1a !important; border: 1px dashed #2c6b64; }
+.s3-rl-dice { display: flex; flex-wrap: wrap; gap: 4px 5px; min-width: 0; }
+.s3-msg.right .s3-rl-dice { justify-content: flex-end; }
+.s3-rl-chip { display: inline-flex; align-items: center; gap: 5px; min-width: 0; max-width: 100%; padding: 1px 6px 1px 1px;
+  border-radius: 7px; background: #0a1215; border: 1px solid var(--line); border-left: 3px solid var(--fam, var(--obs));
+  font-size: 11px; color: var(--ink-2); cursor: pointer; }
+.s3-rl-chip:hover, .s3-rl-chip:focus-visible { border-color: var(--fam, var(--obs)); }
+.s3-rl-chip b { color: var(--fam, var(--ink-2)); font-size: 10px; letter-spacing: .04em; flex: none; }
+.s3-rl-chip .s3-die { width: 28px; height: 20px; font-size: 11px; }
+.s3-rl-chip .s3-drum { flex: none; width: 118px; min-width: 0; height: 22px; background: transparent; border: 0; }
+.s3-rl-chip .s3-drum li { padding: 0 2px; font-size: 11px; }
+.s3-rl-chip.miss { border-left-style: dashed; opacity: .78; }
+.s3-rl-pick { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 20ch; color: var(--ink); }
+.s3-rl-hint { font-size: 11px; font-style: italic; color: var(--ink-3); }
+.s3-msg.right .s3-rl-hint { text-align: right; }
+/* the pop: the card that just went on air */
+.s3-msg.s3-popin { animation: s3-popin .42s cubic-bezier(.2, .9, .3, 1.25); transform-origin: left bottom; }
+.s3-msg.right.s3-popin { transform-origin: right bottom; }
+@keyframes s3-popin { 0% { transform: scale(.9) translateY(10px); opacity: .35; } 60% { transform: scale(1.03); opacity: 1; } 100% { transform: none; } }
+/* a sting's poster, popped in when it airs; the SFX pick's poster on its Rolodex node */
+.s3-sfxposter { display: block; height: 84px; width: auto; max-width: 100%; border-radius: 8px; object-fit: cover;
+  border: 1px solid #2c6b64; background: #081312; }
+.s3-sfxposter.s3-popin { animation: s3-popin .42s cubic-bezier(.2, .9, .3, 1.25); transform-origin: left center; }
+.s3-evposter { display: block; height: 64px; width: auto; max-width: 100%; margin: 6px 0 2px; border-radius: 6px; object-fit: cover;
+  border: 1px solid var(--line); background: #081312; }
+.s3-sfxposter[hidden], .s3-evposter[hidden] { display: none; }
+.s3-sfxnode .s3-clip-name { color: var(--ink-2); }

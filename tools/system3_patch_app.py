@@ -231,51 +231,15 @@ ROWS = [
     # decisions behind it with no guessing.
     ("ledger-row-helper",
      "                _script_rows = [\n",
-     "                def _s3_row_of(_row_at: int) -> dict[str, Any]:\n"
-     "                    # System 3 (docs/SYSTEM3_EVENT_SCHEMA.md): the\n"
-     "                    # conversation this line belongs to and, for a spoken\n"
-     "                    # turn, which of its turns - active or shadow.\n"
-     # tools/system3_roads_patch.py: an addition with a node of its own
-     "                    # [s3-roads] an addition with a node of its own (a\n"
-     "                    # complaint line drawn by System 3) names that node.\n"
-     "                    _own = ((_sfx_meta.get(_row_at) or {}).get(\"system3\")\n"
-     "                            if isinstance(_sfx_meta.get(_row_at), dict) else None)\n"
-     "                    if isinstance(_own, dict) and _own.get(\"conversation_id\"):\n"
-     "                        return {\"conversation_id\": str(_own.get(\"conversation_id\") or \"\"),\n"
-     "                                \"mode\": str(_own.get(\"mode\") or \"\"),\n"
-     "                                \"turn_id\": str(_own.get(\"turn_id\") or \"\")}\n"
-     "                    _s3m = (ready_meta.get(\"system3\")\n"
-     "                            if isinstance(ready_meta, dict) else None)\n"
-     "                    if not isinstance(_s3m, dict) or not _s3m.get(\"conversation_id\"):\n"
-     "                        return {}\n"
-     # tools/system3_link_patch.py: the row finds its turn by its words
-     "                    # [s3-link] BY ITS WORDS FIRST. The number below is the\n"
-     "                    # spoken-row order, which a splice at air shifts; the words\n"
-     "                    # are what the bind and the air share.\n"
-     "                    _w_here = str(transcript[_row_at][0]) if _row_at < len(transcript) else \"\"\n"
-     "                    _c_here = str(transcript[_row_at][1]) if _row_at < len(transcript) else \"\"\n"
-     "                    _tid = \"\"\n"
-     "                    if _w_here == \"drop\":\n"
-     "                        # the SFX Guy's row: the host turn it followed\n"
-     "                        for _back in range(_row_at - 1, -1, -1):\n"
-     "                            if str(transcript[_back][0]) in (\"dj\", \"cohost\", \"third\", \"host\"):\n"
-     "                                _tid = str(globals()[\"system3_turn_id_for\"](ready_meta, str(transcript[_back][1]), str(transcript[_back][0]))\n"
-     "                                           if globals().get(\"system3_turn_id_for\") else \"\")\n"
-     "                                break\n"
-     "                        return {\"conversation_id\": str(_s3m.get(\"conversation_id\") or \"\"),\n"
-     "                                \"mode\": str(_s3m.get(\"mode\") or \"\"), \"turn_id\": _tid, \"sfxguy\": True}\n"
-     "                    if globals().get(\"system3_turn_id_for\") and _c_here:\n"
-     "                        try:\n"
-     "                            _tid = str(globals()[\"system3_turn_id_for\"](ready_meta, _c_here, _w_here) or \"\")\n"
-     "                        except Exception:  # noqa: BLE001\n"
-     "                            _tid = \"\"\n"
-     "                    if not _tid:\n"
-     "                        _t = (turn_ix[_row_at] if _row_at < len(turn_ix) else -1)\n"
-     "                        _tid = str((_s3m.get(\"turns\") or {}).get(str(_t)) or \"\")\n"
-     "                    return {\"conversation_id\": str(_s3m.get(\"conversation_id\") or \"\"),\n"
-     "                            \"mode\": str(_s3m.get(\"mode\") or \"\"),\n"
-     "                            \"turn_id\": _tid}\n"
-     "                _script_rows = [\n"),
+     '                def _s3_row_of(_row_at: int) -> dict[str, Any]:\n'
+     "                    # [s3-sfx-roll] the board's clip: the rolls that chose it\n"
+     '                    # and its picture ride its stamp, to the ledger and the node\n'
+     '                    _st = _s3_row_bare(_row_at)\n'
+     '                    _mx = _sfx_meta.get(_row_at)\n'
+     '                    if _st and isinstance(_mx, dict) and (_mx.get("sfx_roll") or _mx.get("poster")):\n'
+     '                        _st = dict(_st, **{k: _mx[k] for k in ("sfx_roll", "poster") if _mx.get(k)})\n'
+     '                    return _st\n'
+     '                _script_rows = [\n'),
     ("ledger-row-stamp",
      "                            **({\"dice\": _td_of(_r)} if _td_of(_r) else {}),\n",
      "                            **({\"dice\": _td_of(_r)} if _td_of(_r) else {}),\n"

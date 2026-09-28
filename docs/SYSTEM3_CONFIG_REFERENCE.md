@@ -168,3 +168,15 @@ it landed on, the tempers it wore - decayed linearly over `CARRY_WINDOW`
 up from the landing. A banked round takes it in the voice only, at air
 (`perf_state` blends 0.4 x factor of the carried dims). `GET
 /api/system3/status` shows `carry` and `open_rounds`.
+
+## 2026-09-28 additions
+
+| where | key | meaning |
+|---|---|---|
+| structure (banter) / a road's structure | `source` (on the structure or its first step) | the speakbox document the round opens from (exact file name); blank: the dice |
+| `structures.caller` | `story_acts` `{leg_id: act}` | a story call-back's acts for those legs (default `system3_tables.STORY_ACTS`: introduce, detail_1) |
+| inputs (from the station) | `material` `{manager, gallery, research}`, each `{text, label, ref}` | the rows that `require` them are eligible only when present, and carry the text |
+| orch policy | `air_order_strict` (default on) | lines wait behind committed rounds; only while the sequencer is `linear` |
+| env | `PAGE_WAIT_MAX_S` (900) | the longest a parked line may wait before it is withdrawn |
+| env | `SFXGUY_BANK_ODDS` (0.2), `SFXGUY_BANK_REST_S` (21600) | the station's odds for `sfxguy.bank_line` (the desk's STATION1 row rules once it exists) and a banked line's rest |
+| STATION1 / POOLS1 | rows appear as the roads first roll them | `sfx.*`, `sfxtv.*`, `sfxguy.bank_*`, `s3.gallery_piece`, and the keys listed in each `tools/system3_dice3_part*_patch.py` |

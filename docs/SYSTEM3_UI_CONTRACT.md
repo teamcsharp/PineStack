@@ -226,3 +226,17 @@ door that changes it.
 a line that speaks its own running-order row is written again without the
 sheet, then withheld; the ledger asks for a single line's stamp once, so
 intros, interjections and station IDs now link to their node.
+
+## 2026-09-28: roulette cards, an append-only script, and the line's id
+
+- **Messenger** (`[s3-messenger]`): a turn not yet on air is a roulette card - its speaker, step and dice,
+  never its words (not in text, titles or hidden nodes). When it goes live the card pops, its dice roll
+  (at most 1.2 s, none under reduced motion), and the words arrive in step with `clock(at, total)` for the
+  live line (a paced 14 chars/s if clocks stop); a bar runs across the inside of the bubble and stays, thin
+  and full, when the turn ends. One item at a time: the next finishes the current instantly. A sting's card
+  rolls its family, then its clip, then its poster pops in. "Skipped" only with a receipt that says so.
+- **Script view** (`[s3-script-linear]`, `linearPlace`): nothing at or above ON AIR moves or is inserted;
+  late or re-ranked rows land directly under the mark; the mark only moves down, except on the operator's
+  own go-live / seek / back / replay (a short licence each). A row the server stops listing stays, dimmed.
+- **The line's id** on the tapped card: `#` + the first 8 hex of the line id (the air log, ledger and
+  System 3 key); a tap copies the whole id.

@@ -1378,8 +1378,9 @@ def _decide_turn(conv, config, settings, stream, step, speaker, want, inputs, cl
         _apply_effects(conv, spec)
         ev["state_after"] = _snapshot(conv, speaker)
         turn["decisions"].append(dec)
+        _material_mark(ev, spec, inputs)                                      # [s3-material]
         if family != "ES":
-            turn["directions"].append({"family": family, "text": spec.get("text", ""), "label": spec["label"]})
+            turn["directions"].append({"family": family, "text": _direction_text(spec, inputs), "label": spec["label"]})
     turn["speakerbox"] = _speakerbox_marks(conv, config, settings, ctx, stream, step, turn, inputs)
     turn["speakerbox"] += _speakerbox_acts(conv, config, ctx, turn, acts, inputs)
     turn["sfx"] = _sfx_decision(conv, config, settings, ctx, stream, turn, es_spec, acts)
@@ -1408,6 +1409,42 @@ def _decide_turn(conv, config, settings, stream, step, speaker, want, inputs, cl
     conv["cursor"]["last"] = speaker
     conv["draws"] = stream.n
     return turn
+
+
+# [s3-material] The rows that name something the station holds - the last
+# thing the manager said from upstairs, a piece off the gallery wall, what
+# people online are saying - were switched off for good (availability False)
+# because a bare direction ("brings up the last thing the manager said")
+# made the writer invent it. The runtime hands the material in now; a row
+# that needs it is eligible only when it is there, and carries it.
+MATERIAL_KINDS = ("manager", "gallery", "research")
+
+
+def _material_for(spec, inputs):
+    """(kind, material) the row needs and the road holds, else (None, None)."""
+    mat = (inputs or {}).get("material") or {}
+    for need in spec.get("requires") or []:
+        got = mat.get(need)
+        if need in MATERIAL_KINDS and isinstance(got, dict) and str(got.get("text") or "").strip():
+            return need, got
+    return None, None
+
+
+def _direction_text(spec, inputs):
+    """The row's direction, with the material it names when it names one."""
+    text = spec.get("text", "")
+    kind, got = _material_for(spec, inputs)
+    if got:
+        text = "%s - %s: %s" % (text, got.get("label") or kind,
+                                json.dumps(sentence_cut(str(got["text"]), 320)))
+    return text
+
+
+def _material_mark(ev, spec, inputs):
+    kind, got = _material_for(spec, inputs)
+    if got:
+        ev["selected"]["material"] = {"kind": kind, "label": str(got.get("label") or kind)[:80],
+                                      "text": str(got["text"])[:200], "ref": str(got.get("ref") or "")[:120]}
 
 
 def _cts(conv, config, ctx, stream, turn, idx):
@@ -1442,7 +1479,8 @@ def _cts(conv, config, ctx, stream, turn, idx):
            "item": spec["id"], "label": spec["label"], "text": spec.get("text", ""),
            "resolver": spec.get("resolver", "direction"), "topic_change": True}
     turn["decisions"].append(dec)
-    turn["directions"].append({"family": "CTS", "text": spec.get("text", ""), "label": spec["label"]})
+    _material_mark(ev, spec, conv["inputs"])                                  # [s3-material]
+    turn["directions"].append({"family": "CTS", "text": _direction_text(spec, conv["inputs"]), "label": spec["label"]})
     turn["topic_change"] = True
     if spec.get("category") == "topic":
         # [rng-topics] THE TOPICS DATABASE, RESOLVED. CTS1's "From Topics
@@ -2522,6 +2560,12 @@ def plan_call(conv, config, inputs=None):
     call = inputs.get("call") or {}
     st = road_structure(config, "caller") or {}
     legs = [dict(x) for x in st.get("legs") or [] if isinstance(x, dict)]
+    if call.get("story"):                                                       # [s3-story]
+        swap = dict(st.get("story_acts") or system3_tables.STORY_ACTS)
+        for leg in legs:
+            if leg.get("id") in swap:
+                leg["act"] = swap[leg["id"]]
+                leg["label"] = "%s (a call-back)" % (leg.get("label") or leg["id"])
     opening = [x for x in legs if x.get("place") == "open"]
     middle = [x for x in legs if x.get("place") == "middle"]
     closing = [x for x in legs if x.get("place") == "close"]

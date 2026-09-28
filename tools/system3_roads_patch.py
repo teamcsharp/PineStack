@@ -704,6 +704,13 @@ EDITS = [
 ]
 
 
+
+# [integration 2026-09-28] air_order_park_patch.py, system3_material_patch.py, system3_source_patch.py, system3_sfx_roll_patch.py, system3_blocks2_patch.py, system3_dice3_part1_patch.py, system3_dice3_part2_patch.py, system3_dice3_part3_patch.py, system3_unmark_patch.py edited inside this tool's 'round-row-extras' text
+# (stamp-rename): "applied" is that text with those edits folded in. The anchor is
+# unchanged, so a fresh file is patched exactly as before.
+_RECONCILED_ROUND_ROW_EXTRAS = '                def _s3_row_bare(_row_at: int) -> dict[str, Any]:\n                    # System 3 (docs/SYSTEM3_EVENT_SCHEMA.md): the\n                    # conversation this line belongs to and, for a spoken\n                    # turn, which of its turns - active or shadow.\n                    # [s3-roads] an addition with a node of its own (a\n                    # complaint line drawn by System 3) names that node.\n                    _own = ((_sfx_meta.get(_row_at) or {}).get("system3")\n                            if isinstance(_sfx_meta.get(_row_at), dict) else None)\n                    if isinstance(_own, dict) and _own.get("conversation_id"):\n                        return {"conversation_id": str(_own.get("conversation_id") or ""),\n                                "mode": str(_own.get("mode") or ""),\n                                "turn_id": str(_own.get("turn_id") or "")}\n                    _s3m = (ready_meta.get("system3")\n'
+EDITS = [(e[0], e[1], _RECONCILED_ROUND_ROW_EXTRAS, e[3]) if e[0] == 'round-row-extras' else e for e in EDITS]
+
 def plan(text):
     """Every edit, in order. Kept as a function for the wiring test."""
     return list(EDITS)

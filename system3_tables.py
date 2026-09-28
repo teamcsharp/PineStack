@@ -1132,6 +1132,17 @@ LINE_ROADS = ("track_talk", "station_id", "upstairs", "interject", "ad_spot", "r
 PLACES = ("open", "middle", "close")
 
 
+# [s3-story] A caller ringing back to carry on their story (#1039): the two legs
+# that would introduce them from scratch and start a fresh story say where the
+# story left off instead. A structure may carry its own `story_acts`.
+STORY_ACTS = {
+    "introduce": ("{FIRST} says who they are and that they have rung before - one line reminding the pair "
+                  "where their story left off. Under thirty words."),
+    "detail_1": ("picks the story up where it left off and gives the next CONCRETE thing that happened - "
+                 "a thing, a place, a number, a name."),
+}
+
+
 def default_structures():
     """[s3-calls] One structure per road System 3 builds from its own nodes.
     [s3-roads] Every road on the register has one: the call protocol, the

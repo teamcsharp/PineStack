@@ -7670,7 +7670,7 @@ async def announce_render_complete() -> None:
     try:
         replies = load_settings().get("render_replies") or []
         if replies and _ha_creds()[0]:
-            await speak(random.choice(replies), event="render")
+            await speak(s3_choice("render.reply", replies, "which of the render replies the box speaks when an image lands", tabled=False), event="render")   # [s3-dice-door]
     except Exception:
         pass
 
@@ -8925,7 +8925,7 @@ async def voice_ad_render(
             # The SFX shelf can be rebuilding while a listener asks for an ad.
             # Preserve the request and let the worker bind a qualified MP4 later.
             "source_type": "deferred_dialogue_clip" if deferred_reference else "clip",
-            "at_share": random.random(), "prompt": direction + continuation,
+            "at_share": s3_roll("ad.voice_at_share", "where in its source clip a voice ad's performance is taken (a share of the clip)"), "prompt": direction + continuation,   # [s3-dice-door]
             "speech": part["speech"], "purpose": "voice_ad",
             **({"hourly": True} if hourly else {}),          # [h3-cinematic] never the base path
             "duration_seconds": part["duration_seconds"],
@@ -11907,7 +11907,7 @@ def _hot_shelf_pick() -> dict[str, Any] | None:
             track = music_track(tid)
             if track:
                 picks.append(track)
-        return random.choice(picks) if picks else None
+        return s3_choice("records.hot_shelf", picks, "which record already on the local shelf airs while the share crawls (#1156)", tabled=False) if picks else None   # [s3-dice-door]
     except Exception:  # noqa: BLE001
         return None
 
@@ -28258,11 +28258,11 @@ async def speak(
     fx: dict[str, Any] | None = None
     if dj_settings()["perf"]:
         fx = {"perf": {
-            "pace": round(random.uniform(0.95, 1.08), 3),
-            "pitch_st": random.choice([0, 0, 0, 1, -1, 2]),
-            "pitch_var": round(random.uniform(0.9, 1.25), 3),
-            "energy": round(random.uniform(-0.15, 0.3), 3),
-            "pause_scale": round(random.uniform(0.9, 1.2), 3),
+            "pace": round(0.95 + (1.08 - 0.95) * s3_roll("voice.reply_pace", "how fast the box speaks a reply (#297)"), 3),   # [s3-dice-door]
+            "pitch_st": s3_choice("voice.reply_pitch", [0, 0, 0, 1, -1, 2], "the pitch step, in semitones, of the box's reply (#297)", tabled=False),   # [s3-dice-door]
+            "pitch_var": round(0.9 + (1.25 - 0.9) * s3_roll("voice.reply_pitch_var", "how far the box's pitch wanders in a reply (#297)"), 3),   # [s3-dice-door]
+            "energy": round(-0.15 + (0.3 + 0.15) * s3_roll("voice.reply_energy", "how much energy the box puts into a reply (#297)"), 3),   # [s3-dice-door]
+            "pause_scale": round(0.9 + (1.2 - 0.9) * s3_roll("voice.reply_pauses", "how long the box's pauses run in a reply (#297)"), 3),   # [s3-dice-door]
         }}
     result = await voice_generate(
         styled, voice if voice is not None else _event_voice(event), chosen,
@@ -30131,6 +30131,13 @@ def page_waiting_park(clip: dict[str, Any], ask: dict[str, Any] | None = None,
     clip["air_waiting"] = {"since": time.time(), "ahead": ahead,
                            "producer": str(producer or "")[:80], "why": why[:200]}
     _PAGE_WAITING.append(clip)
+    # [air-order-park] THE WAITING LINE IS THE AIR QUEUE. The line's place in
+    # the script is taken now, where it joined the queue - behind the rounds it
+    # waits for, in front of any round committed after it. Numbered when it
+    # LEFT the line, a station ID that arrived before a banter round was
+    # written read, in the script, as having come after it (the one late block
+    # of the first 29 heard, 2026-09-28).
+    script_ledger_reserve([str(r.get("id") or "") for r in _page_delivery_rows(clip)])
     # A delivery that exists, waiting: whatever looks it up by id (the render
     # backlog's "its tail cannot overtake an uncompleted head") sees a line in
     # flight rather than one that was never published and publishes it twice.
@@ -31427,7 +31434,7 @@ def strip_banned(text: str) -> str:
     return out.strip()
 
 
-def avoid_reruns() -> str:
+def _avoid_reruns_raw() -> str:         # [s3-blocks] avoid_reruns() marks it
     out = banned_words_clause()
     if not content_gate_enabled("repetition"):
         return out
@@ -32511,7 +32518,7 @@ def performance_vector(who: str, voice: str = "",
     return out
 
 
-def perf_directive(vec: dict[str, float]) -> str:
+def _perf_directive_raw(vec: dict[str, float]) -> str:   # [s3-blocks] perf_directive() marks it
     """The vector as writing instructions — the channel the language model
     (and through its text, the TTS prosody) actually hears."""
     if not vec:
@@ -32788,13 +32795,14 @@ def radio_fill(station: str) -> list[dict[str, Any]]:
             pipeline_log("drop", f"nothing on this station matches "
                          f"{_focus.get('value')} - the focus is ignored for "
                          "now rather than taking the air off (#984)")
-    random.shuffle(tracks)
+    _deal = random.Random(int(s3_roll("records.rotation_deal", "the order the rotation is dealt in (one roll deals the whole shuffle, #984)") * (1 << 53)))   # [s3-dice-door]
+    _deal.shuffle(tracks)
     if loved:
         # Scaling a random sort key biases a loved track toward the front of
         # the queue, so it comes round often without ever being queued twice.
         # ponytail: a bias, not a weighted rotation — swap in a real weighted
         # shuffle if you want a guaranteed ratio.
-        tracks.sort(key=lambda t: random.random()
+        tracks.sort(key=lambda t: _deal.random()   # [s3-dice-door] the same deal
                     * (0.3 if t["id"] in loved else 1.0))
     return tracks
 
@@ -33110,6 +33118,32 @@ def radio_prompt_enabled(slot: str) -> bool:
     return bool(enabled.get(slot, DEFAULT_DJ["radio_prompt_enabled"].get(slot, True)))
 
 
+# --- [s3-blocks] THE REST OF THE WRITER'S BLOCKS (system3_blocks2_patch) ------------
+# Every block System 3's table names is marked somewhere. _pb_within marks a
+# block whose words ride inside a string that also travels elsewhere (the
+# round's angle, the host layer), on the prompt's copy only.
+def _pb_within(name: str, text: Any, part: Any, after: str = "") -> str:
+    """[s3-blocks] `text` with the last occurrence of `part` (just after
+    `after`, when given) marked as block `name`. Unchanged when `part` is
+    empty or not in it - the words still go, unmarked."""
+    t, p, lead = str(text or ""), str(part or ""), str(after or "")
+    if not p.strip():
+        return t
+    i = t.rfind(lead + p)
+    if i < 0:
+        return t
+    i += len(lead)
+    return t[:i] + _pb(name, p) + t[i + len(p):]
+
+
+def avoid_reruns(*a: Any, **k: Any) -> str:
+    return _pb("avoid_reruns", _avoid_reruns_raw(*a, **k))
+
+
+def perf_directive(*a: Any, **k: Any) -> str:
+    return _pb("perf", _perf_directive_raw(*a, **k))
+
+
 def radio_prompt_instruction(slot: str) -> str:
     """Operator-authored instruction for one radio-writing path.
 
@@ -33148,6 +33182,12 @@ def radio_prompt_instruction(slot: str) -> str:
             lead += modifiers_clause()
         except Exception:  # noqa: BLE001
             pass            # colour never silences the booth either
+        # [s3-blocks] #1169's standing modifiers, marked as their node where
+        # they sit in `lead` (the line above is patch_modifiers_1169's own)
+        try:
+            lead = _pb_within("modifiers", lead, modifiers_clause())
+        except Exception:  # noqa: BLE001
+            pass
         # #1162: and, one round in five, the manager cutting into it. On
         # this layer for the reason above - "every round the station
         # writes assembles that one" - so a memo may land in the booth
@@ -33575,11 +33615,11 @@ def _dj_disposition_raw() -> str:       # [s3-blocks] dj_disposition() marks it
     text = station_disposition_text()
     if not text:
         return ""
-    return (
+    return _pb("system_prompt", (   # [s3-blocks] the station's system prompt (#983)
         "\n\nThe station is running under these standing instructions "
         "tonight. Let them colour your mood and your opinions — you are "
         f"still a radio DJ and this is still a music show:\n{text}"
-    )
+    ))
 
 
 # Blocks an en_US voice cannot pronounce: CJK, kana, hangul, Cyrillic,
@@ -33980,6 +34020,7 @@ async def dj_line(kind: str, track: dict[str, Any] | None = None,
             "Mention that reception naturally, as something people say, not "
             "as fact."
         )
+    context = _pb("context", context)   # [s3-blocks] the record's facts
 
     # An advert, a track intro, a passing remark — all of them get built
     # around something out of his documents rather than out of nothing (#207).
@@ -34001,7 +34042,7 @@ async def dj_line(kind: str, track: dict[str, Any] | None = None,
     if seed is not None and s3_chance("line.speakbox_seed", box_rate_now(   # [s3-dice-door]
             dj["speakbox_rate"]), "a speakerbox line is worked into the host's line", dial="speakbox_rate"):   # [s3-dice-door]
         seed.update(await speakbox_quote())
-        aside = speakbox_aside(seed, pair=False) if seed else ""
+        aside = _pb("aside", speakbox_aside(seed, pair=False)) if seed else ""   # [s3-blocks]
 
     try:
         _flavor = await speakbox_flavor()   # on-the-fly randomness toggle
@@ -34159,7 +34200,10 @@ def spoken_text(line: str) -> str:
     #870: and it is where the ENGLISH rule lives, because it is the one
     place every spoken line passes through no matter who wrote it.
     Two of anything stays, as emphasis; the rest is dropped."""
-    clean = SPOKEN_NOISE.sub(" ", str(line or ""))
+    # [s3-blocks] a prompt block's marker must never reach a voice: a round's
+    # angle carries marked blocks, and a fallback that airs the angle as
+    # written would hand the TTS private-use characters and a block's name
+    clean = SPOKEN_NOISE.sub(" ", _pb_unmark(str(line or "")))
     clean = re.sub(r"https?://\S+", "", clean)
     # Strip the breathy filler OPENERS the model keeps writing (#598): "Whew…",
     # "Haah…", "Hmm…", "Mm—", "Ah…", "Ooh", "Ugh" and friends read out as
@@ -34479,7 +34523,7 @@ async def _dj_speak_floorless(kind: str, track: dict[str, Any] | None = None,
                          extra="%s from %s" % (kind, who))
             return ""
         system3 = dict(_s3_spoken_handle.stamp)
-    _s3_sheet = (_s3_spoken_handle.sheet if _s3_spoken_handle is not None else "")
+    _s3_sheet = _pb("sheet", _s3_spoken_handle.sheet if _s3_spoken_handle is not None else "")   # [s3-blocks]
     _s3_perf = (_s3_spoken_handle.perf if _s3_spoken_handle is not None else None)
     if _s3_perf:
         vec = performance_vector(who, voice or "", state=_s3_perf)
@@ -41856,14 +41900,16 @@ def response_bank_sources(count: int = 4) -> list[dict[str, Any]]:
              for row in _RESPONSES.catalog()[-24:]}
     fresh = [doc for doc in files if doc.name not in prior]
     old = [doc for doc in files if doc.name in prior]
-    random.shuffle(fresh)
-    random.shuffle(old)
+    fresh = s3_sample("speakbox.response_docs", fresh, min(len(fresh), max(8, count * 3)),
+                      "which Speakerbox documents the response bank drafts from", tabled=False)   # [s3-dice-door]
+    old = s3_sample("speakbox.response_docs_old", old, min(len(old), max(0, max(8, count * 3) - len(fresh))),
+                    "which already-drafted Speakerbox documents fill the rest", tabled=False)   # [s3-dice-door]
     seeds = []
     for doc in (fresh + old)[:max(8, count * 3)]:
         words = speakbox_body(doc).split()
         if len(words) < 12:
             continue
-        start = random.randint(0, max(0, len(words) - 75))
+        start = min(max(0, len(words) - 75), int(s3_roll("speakbox.response_swath", "where in a document the response bank's swath starts") * (max(0, len(words) - 75) + 1)))   # [s3-dice-door]
         excerpt = " ".join(words[start:start + 75])[:650]
         if not looks_english(excerpt):
             continue
@@ -43153,12 +43199,12 @@ def track_callback(track: dict[str, Any] | None, part: str
             return None
         seat = (track_reads_load().get(tid) or {})
         title = str(seat.get("title") or (track or {}).get("title") or "")
-        if random.random() > track_callback_rate():
+        if not s3_chance("records.callback", track_callback_rate(), "a record talked about before gets the callback, not a fresh look (#1062)", dial="callback_rate"):   # [s3-dice-door]
             return None
         if str(part) == "outro":
             # A send-off out of what was said the first time round.
             held = seat.get("intro") or seat.get("ad") or {}
-            frame = random.choice(TRACK_CALLBACK_AFTER)
+            frame = s3_choice("records.callback_after", TRACK_CALLBACK_AFTER, "the send-off a record's callback is framed with (#1062)")   # [s3-dice-door]
         elif str(part) == "intro":
             # The advert that was written about this record, and then
             # the record - which is the joke, and only works because
@@ -43171,7 +43217,7 @@ def track_callback(track: dict[str, Any] | None, part: str
         if len(said) < 24:
             return None
         if str(part) == "intro":
-            body = said + " " + random.choice(TRACK_CALLBACK_BEFORE)
+            body = said + " " + s3_choice("records.callback_before", TRACK_CALLBACK_BEFORE, "the line that hands an advert's callback over to its record (#1062)")   # [s3-dice-door]
         else:
             body = frame.format(title=title or "that one") + " " + said
         return {"text": body[:2400],
@@ -48569,9 +48615,9 @@ def directive_draw_kind(choices: list[str]) -> str:
             factor = coord_judgment_factor(dial.get(c, c))
             w *= max(0.7, min(1.3, 1.0 + 0.3 * (factor - 1.0)))
             weights.append(w)
-        return random.choices(list(choices), weights=weights, k=1)[0]
+        return list(choices)[s3_weighted("torrent.round_kind", [str(c) for c in choices], weights, "which kind of round the torrent draws next (#1027)")]   # [s3-dice-door]
     except Exception:  # noqa: BLE001
-        return random.choice(list(choices))
+        return s3_choice("torrent.round_kind", list(choices), "which kind of round the torrent draws next (#1027)", tabled=False)   # [s3-dice-door]
 
 
 # --- THE PAUSE WORKSHOP (#1150) ---------------------------------------
@@ -49008,11 +49054,11 @@ def orch_routine_questions() -> list[dict[str, Any]]:
                        _opt("Yes - keep it at the front", "drive:" + _pin),
                    ]}
         try:
-            return [_pinned] + random.sample(bank, min(2, len(bank)))
+            return [_pinned] + s3_sample("orch.routine_questions", bank, min(2, len(bank)), "which questions the six-hourly check asks (#1056)", tabled=False)   # [s3-dice-door]
         except Exception:  # noqa: BLE001
             return [_pinned] + bank[:2]
     try:
-        return random.sample(bank, min(3, len(bank)))
+        return s3_sample("orch.routine_questions", bank, min(3, len(bank)), "which questions the six-hourly check asks (#1056)", tabled=False)   # [s3-dice-door]
     except Exception:  # noqa: BLE001
         return bank[:3]
 
@@ -55030,8 +55076,9 @@ def coord_spot_ready() -> dict[str, Any] | None:
         if not pool:
             return None
         fewest = min(int(r.get("uses") or 0) for r in pool)
-        return random.choice([r for r in pool
-                              if int(r.get("uses") or 0) == fewest])
+        return s3_choice("ad.gap_spot", [r for r in pool
+                                         if int(r.get("uses") or 0) == fewest],
+                         "which least-run produced spot fills a hole in the air (#916d)", tabled=False)   # [s3-dice-door]
     except Exception:  # noqa: BLE001
         return None
 
@@ -57130,7 +57177,7 @@ def torrent_breath(dj: dict[str, Any]) -> float:
     # previous paced stream is still paying out while the next shelf row is
     # handed over.
     if talk >= 100 and dj.get("talk_radio_mode"):
-        return random.uniform(0.12, 0.35)
+        return 0.12 + (0.35 - 0.12) * s3_roll("torrent.breath", "how long a breath of music between rounds (#700)")   # [s3-dice-door]
     voice_to = _RADIO.get("voice_to") or "box"
     music_to = _RADIO.get("music_to") or "here"
     box_alone = (box_talk_ok() and voice_to in ("box", "both")
@@ -57157,10 +57204,10 @@ def torrent_breath(dj: dict[str, Any]) -> float:
         # Silence on a speaker with nothing under it. Keep a beat so the
         # pair do not trample their own tails, and no more.
         middle = min(middle, 3.2)
-        return max(1.5, random.uniform(middle * 0.45, middle * 0.95))
+        return max(1.5, middle * 0.45 + (middle * 0.95 - middle * 0.45) * s3_roll("torrent.breath", "how long a breath of music between rounds (#700)"))   # [s3-dice-door]
     # #769: the floor was 10.0, which swallowed the whole top of the dial.
     # Now 2.0 — on a stream the gap between rounds should be a beat.
-    return max(2.0, random.uniform(middle * 0.65, middle * 1.45))
+    return max(2.0, middle * 0.65 + (middle * 1.45 - middle * 0.65) * s3_roll("torrent.breath", "how long a breath of music between rounds (#700)"))   # [s3-dice-door]
 
 
 async def torrent_force_banter(track: dict[str, Any] | None,
@@ -60287,7 +60334,7 @@ def set_vote(track_id: str, vote: int, track: dict[str, Any] | None = None,
         return votes.get(track_id, {"vote": 0})
 
 
-def loved_moment(track_id: str) -> float | None:
+def loved_moment(track_id: str, roll: bool = True) -> float | None:   # [s3-dice-door] roll=False only asks
     """The spot in a track he thumbed up (#683), or None if the like
     predates the stamp. Several marks means several good parts — draw one
     of them, so a run of ads bedded on the same song is not the same
@@ -60298,7 +60345,8 @@ def loved_moment(track_id: str) -> float | None:
     marks = [float(m) for m in (row.get("marks") or [])
              if isinstance(m, (int, float))]
     if marks:
-        return random.choice(marks)
+        return (s3_choice("ad.bed_moment", marks, "which of the moments he liked an ad bed opens on (#683)", tabled=False)
+                if roll else marks[0])   # [s3-dice-door]
     spot = row.get("at")
     return float(spot) if isinstance(spot, (int, float)) else None
 
@@ -60847,7 +60895,7 @@ def ad_pick() -> dict[str, Any] | None:
     if not rows:
         return None
     fewest = min(r.get("uses", 0) for r in rows)
-    return random.choice([r for r in rows if r.get("uses", 0) == fewest])
+    return s3_choice("ad.read_pick", [r for r in rows if r.get("uses", 0) == fewest], "which of the least-run ad reads airs", tabled=False)   # [s3-dice-door]
 
 
 # --- #916: THE ADS DESK -----------------------------------------------
@@ -61134,7 +61182,7 @@ async def ad_write_fresh(product: str, tries: int = AD_STUDIO_TRIES
             seed = {}
         direct = ""
         if seed.get("text"):
-            direct += speakbox_aside(seed, pair=False)
+            direct += _pb("aside", speakbox_aside(seed, pair=False))   # [s3-blocks]
         direct += ad_avoid_note() + _lesson
         try:
             raw = await dj_line("ad", None, extra=product, direct=direct,
@@ -63325,7 +63373,7 @@ def _schedule_clause(preset: str, slot: dict[str, Any], text: str,
             # scheduled round comes through this clause - System2 builds
             # its per-slot prompt from it, and the legacy chain reads the
             # same string back off sched_prompt.
-            + "\n" + rap_battle_clause()
+            + "\n" + _pb("battle", rap_battle_clause())   # [s3-blocks] a tint node
             # 2026-09-10: AND THE DIRECTOR'S NOTES, for the same reason
             # and in the same place. This clause is the one choke point
             # every scheduled round already passes through, so a note
@@ -70592,7 +70640,7 @@ def _siren_sample() -> str | None:
         pool = [p for p in sfx_all() if want.search(p.stem)]
     except Exception:
         pool = []
-    return str(random.choice(pool)) if pool else None
+    return str(s3_choice("police.siren", pool, "which siren off the sample shelf wails behind the megaphone (#636)", tabled=False)) if pool else None   # [s3-dice-door]
 
 
 def _police_mix_blocking(voice_path: Path, seconds: float,
@@ -70660,7 +70708,7 @@ async def dj_police_outside(text: str) -> None:
     voices = await session_voices()
     names = [c for c in sorted(VOCODER_CHARACTERS)
              if c not in ("plain", "autotune", "choir")]
-    character = random.choice(names) if names else "plain"
+    character = s3_choice("police.character", names, "which vocoder character the officer outside speaks in (#636)") if names else "plain"   # [s3-dice-door]
     try:
         voice = caller_voice_for(
             "the officer outside",
@@ -70680,8 +70728,8 @@ async def dj_police_outside(text: str) -> None:
         clip = await voice_generate(
             spoken_text(text), voice, engine,
             fx={"vocode": character,
-                "pitch": VOCODER_DEFAULT_PITCH.get(
-                    character, random.randint(-4, 4))})
+                "pitch": (VOCODER_DEFAULT_PITCH[character] if character in VOCODER_DEFAULT_PITCH else
+                          -4 + min(8, int(s3_roll("police.pitch", "the officer's pitch, in semitones, when his character has none set (#636)") * 9)))})   # [s3-dice-door]
     except Exception:
         clip = None
     if not clip:
@@ -70815,7 +70863,7 @@ def manager_cut_in_clause() -> str:
     try:
         pct = int(dj_settings().get("manager_cut_in_pct",
                                     MANAGER_CUT_IN_PCT) or 0)
-        if pct > 0 and not radio_paused() and random.randint(1, 100) <= pct:
+        if pct > 0 and not radio_paused() and s3_chance("manager.cut_in", pct / 100.0, "a memo from upstairs cuts into this round (#1162)", dial="manager_cut_in_pct"):   # [s3-dice-door]
             rows = [r for r in upstairs_list()
                     if str(r.get("gripe") or "").strip()]
             if rows:
@@ -70823,8 +70871,9 @@ def manager_cut_in_clause() -> str:
                 # pages and a plain random draw would still play the same
                 # dozen.
                 fewest = min(int(r.get("uses") or 0) for r in rows)
-                row = random.choice(
-                    [r for r in rows if int(r.get("uses") or 0) == fewest])
+                row = s3_choice(   # [s3-dice-door]
+                    "manager.cut_in_gripe", [r for r in rows if int(r.get("uses") or 0) == fewest],
+                    "which gripe (the least aired) upstairs cuts in with (#1162)", tabled=False)
                 try:
                     upstairs_update(str(row.get("id") or ""),
                                     uses=int(row.get("uses") or 0) + 1,
@@ -70835,10 +70884,10 @@ def manager_cut_in_clause() -> str:
                     "\n\nUPSTAIRS CUTS IN, PART-WAY THROUGH THIS ROUND. "
                     "Not at the top and not at the end - somewhere in the "
                     "middle, while they are in the middle of something "
-                    "else. " + random.choice(MANAGER_CUT_INS).capitalize()
+                    "else. " + s3_choice("manager.cut_in_manner", MANAGER_CUT_INS, "how upstairs cuts in on the pair (#1162)").capitalize()   # [s3-dice-door]
                     + ", and what management wants them to know is this: "
                     + str(row.get("gripe") or "").strip()[:200]
-                    + ". " + random.choice(MANAGER_CUT_REACTS)
+                    + ". " + s3_choice("manager.cut_in_react", MANAGER_CUT_REACTS, "how the pair take the interruption from upstairs (#1162)")   # [s3-dice-door]
                     + " Whatever this round was about, it does NOT stop "
                     "being about that - the interruption happens, they "
                     "deal with it on air, and they get back to it. The "
@@ -71371,8 +71420,9 @@ async def upstairs_clock() -> None:
             gap = max(120.0, 3600.0 / rate)
             # The first page of a fresh show comes early, so the feature is
             # visible without waiting twenty minutes for it.
-            wait = random.uniform(90.0, 200.0) if first else \
-                random.uniform(gap * 0.6, gap * 1.4)
+            wait = (90.0 + (200.0 - 90.0) * s3_roll("manager.page_first_wait", "how soon the first page from upstairs comes in a fresh show")
+                    if first else
+                    gap * 0.6 + (gap * 1.4 - gap * 0.6) * s3_roll("manager.page_wait", "how long until the next page from upstairs (its hourly rate, jittered)"))   # [s3-dice-door]
             first = False
         await asyncio.sleep(wait)
         if not _RADIO.get("on"):
@@ -71878,14 +71928,14 @@ def _music_bed_track() -> dict[str, Any] | None:
     # instead of twenty seconds in from the top.
     try:
         marked = [t for t in faves
-                  if loved_moment(str(t.get("id") or "")) is not None]
+                  if loved_moment(str(t.get("id") or ""), roll=False) is not None]   # [s3-dice-door] a question, not a roll
     except Exception:
         marked = []
-    if marked and random.random() < 0.85:
-        return random.choice(marked)
-    if faves and random.random() < 0.8:
-        return random.choice(faves)
-    return random.choice(pool)
+    if marked and s3_chance("ad.bed_marked", 0.85, "an advert is bedded on a favourite whose liked moment is marked (#683)"):   # [s3-dice-door]
+        return s3_choice("ad.bed_marked_pick", marked, "which marked favourite beds the advert", tabled=False)   # [s3-dice-door]
+    if faves and s3_chance("ad.bed_fave", 0.8, "an advert is bedded on one of his favourites (#526)"):   # [s3-dice-door]
+        return s3_choice("ad.bed_fave_pick", faves, "which favourite beds the advert", tabled=False)   # [s3-dice-door]
+    return pool[min(len(pool) - 1, int(s3_roll("ad.bed_any", "which long track beds the advert when no favourite does (#463)") * len(pool)))]   # [s3-dice-door]
 
 
 def _ad_bed_share() -> float:
@@ -72048,8 +72098,8 @@ async def dj_music_ad(product: str, remember: bool = True) -> dict[str, Any]:
                 f"{int(loved // 60)}:{int(loved % 60):02d} into "
                 f"{track.get('title') or 'a track'} (#683)")
         else:
-            start = random.uniform(20.0, max(21.0, min(70.0, secs - 25.0))) \
-                if secs > 50 else 15.0
+            start = 20.0 + (max(21.0, min(70.0, secs - 25.0)) - 20.0) * s3_roll("ad.bed_start", "where in the record an advert's swell drops in, with no liked moment marked") \
+                if secs > 50 else 15.0   # [s3-dice-door]
         voice_key = clip["path"].rsplit("/", 1)[-1]
         # A sound effect punched into the opening swell (#618) — mixed IN, not
         # announced after. Best effort: no sample to hand → the ad airs without.
@@ -72586,8 +72636,8 @@ async def ad_produce(product: str, script: str, voice: str,
             if secs > 10:
                 start = min(start, max(0.0, secs - 12.0))
         else:
-            start = (random.uniform(20.0, max(21.0, min(70.0, secs - 25.0)))
-                     if secs > 50 else 15.0)
+            start = (20.0 + (max(21.0, min(70.0, secs - 25.0)) - 20.0) * s3_roll("ad.bed_start", "where in the record an advert's swell drops in, with no liked moment marked")
+                     if secs > 50 else 15.0)   # [s3-dice-door]
         voice_key = clip["path"].rsplit("/", 1)[-1]
         sfx = await asyncio.to_thread(_sfx_any)
         if sfx:
@@ -73431,6 +73481,94 @@ def _analysis_text_match(left: Any, right: Any) -> bool:
         return False
     shorter = min(len(a), len(b))
     return shorter >= 48 and (a.startswith(b) or b.startswith(a))
+
+
+# --- [s3-material] what the manager / gallery / research rows bring up -------
+#
+# System 3's "Manager Message" (CTS1), the gallery pitches in "Ad Pitch" and
+# the "online search" rebuttal (RS) were switched off for good - availability
+# False in the runtime - because each reached the writer as a bare direction
+# ("brings up the last thing the manager said from upstairs") and the writer
+# made the thing up. The runtime asks here for the real thing instead; a row
+# that needs it is eligible exactly when it is here, and the writer is handed
+# it word for word.
+S3_MANAGER_FRESH_S = 3 * 3600.0
+S3_RESEARCH_KEEP_S = 3600.0
+_S3_RESEARCH: dict[str, dict[str, Any]] = {}
+_S3_RESEARCH_BUSY: set[str] = set()
+
+
+def _s3_research_key(topic: str) -> str:
+    return " ".join(re.findall(r"[a-z0-9]+", str(topic or "").lower()))[:120]
+
+
+async def _s3_research_fetch(key: str, query: str) -> None:
+    """What people online are saying about a subject: searched once, in the
+    background - never on the planner's clock - and kept for the next round
+    on the same subject."""
+    got: list[dict[str, str]] = []
+    try:
+        got = await asyncio.wait_for(search_searxng(query), timeout=20.0)
+    except Exception:  # noqa: BLE001
+        got = []
+    finally:
+        _S3_RESEARCH_BUSY.discard(key)
+    lines = []
+    for row in got or []:
+        said = " ".join(str(row.get("snippet") or row.get("title") or "").split())
+        if said:
+            lines.append(said[:260])
+        if len(lines) >= 3:
+            break
+    _S3_RESEARCH[key] = {"at": time.time(), "text": " / ".join(lines),
+                         "ref": str((got[0] if got else {}).get("url") or "")[:160]}
+    while len(_S3_RESEARCH) > 200:
+        _S3_RESEARCH.pop(next(iter(_S3_RESEARCH)))
+
+
+def system3_cts_material(road: str, ctx: dict[str, Any], topic: str = "") -> dict[str, Any]:
+    """The material System 3's material rows can name, each {text, label, ref}:
+    the manager's last words from upstairs while they are still news, a gallery
+    piece the station has actually looked at (which one is System 3's roll),
+    and what people online are saying about the subject (from the cache; a
+    subject not searched yet is searched in the background for next time)."""
+    out: dict[str, Any] = {}
+    now = time.time()
+    try:
+        for row in reversed(list(_RADIO.get("chat") or [])):
+            if str(row.get("who") or "") != "manager" or not str(row.get("text") or "").strip():
+                continue
+            if now - float(row.get("air_at") or row.get("ts") or 0) <= S3_MANAGER_FRESH_S:
+                out["manager"] = {"text": " ".join(str(row["text"]).split())[:600],
+                                  "label": "what the manager said from upstairs",
+                                  "ref": str(row.get("id") or "")}
+            break
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        seen = dict(_RADIO.get("image_analysis_by_image") or {})
+        names = [n for n, v in seen.items() if str((v or {}).get("analysis") or "").strip()]
+        if names:
+            name = s3_choice("s3.gallery_piece", names[-40:], "which gallery piece a pitch is about",
+                             tabled=False)
+            out["gallery"] = {"text": "%s - %s" % (name, " ".join(str(seen[name]["analysis"]).split())[:500]),
+                              "label": "the piece, as the station saw it", "ref": str(name)}
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        key = _s3_research_key(topic)
+        if key and settings_web_search():
+            held = _S3_RESEARCH.get(key)
+            if held and now - float(held.get("at") or 0) <= S3_RESEARCH_KEEP_S:
+                if held.get("text"):
+                    out["research"] = {"text": held["text"], "label": "what people online are saying",
+                                       "ref": str(held.get("ref") or "")}
+            elif key not in _S3_RESEARCH_BUSY:
+                _S3_RESEARCH_BUSY.add(key)
+                fire_and_forget(_s3_research_fetch(key, clean_search_query(str(topic))[:200]))
+    except Exception:  # noqa: BLE001
+        pass
+    return out
 
 
 def image_analysis_identity(name: str, analysis: str = "") -> str:
@@ -74467,14 +74605,16 @@ class _S3Dice:
     """A director for unrepeated() and the picks below: System 3 draws among
     the options still eligible, with the desk's weights."""
 
-    def __init__(self, key: str, label: str = "", weights: Any = None) -> None:
+    def __init__(self, key: str, label: str = "", weights: Any = None, media: Any = None) -> None:
         self.key, self.label, self.weights = key, label, weights
+        self.media = media          # [s3-sfx-roll] the picture of what it lands on (a list, or a callable of the index)
 
     def pick(self, _label: str, candidates: list[Any]) -> int:
         fn = globals().get("system3_pick")
         if fn and candidates:
             try:
-                got = fn(self.key, [str(c) for c in candidates], self.label, self.weights)
+                got = fn(self.key, [str(c) for c in candidates], self.label, self.weights,
+                         **({"media": self.media} if self.media is not None else {}))   # [s3-sfx-roll]
             except Exception:  # noqa: BLE001
                 got = None
             if isinstance(got, int) and 0 <= got < len(candidates):
@@ -74506,10 +74646,122 @@ def s3_sample(key: str, options: Any, k: int, label: str = "", tabled: bool = Tr
     return out
 
 
-def s3_weighted(key: str, labels: list[str], weights: list[float], label: str = "") -> int:
+def s3_weighted(key: str, labels: list[str], weights: list[float], label: str = "",
+                media: Any = None) -> int:
     """A draw by weights the station keeps itself (the ending shelf, the
-    behaviour deck): System 3's number, those weights, recorded."""
-    return _S3Dice(key, label, list(weights)).pick(key, list(labels))
+    behaviour deck): System 3's number, those weights, recorded.
+    [s3-sfx-roll] `media`: the picture of what it lands on, for the record."""
+    return _S3Dice(key, label, list(weights), media).pick(key, list(labels))
+
+
+# --- [s3-sfx-roll] THE BOARD'S CLIP IS TWO OF SYSTEM 3'S ROLLS ----------------
+# "For SFX it would roll the roulette to the SFX effect and then roll the
+# roulette for the sfx that is to be played then pop in the thumbnail for the
+# result on the node" (operator). The pick roads (_sfx_cadence_pick, the clip
+# book's sfx_db_pick_short_video, the matcher's sfx_match_sting_pick) roll
+# through the door above and note what they rolled against the clip; the
+# cadence takes the note onto the board's addition row, whose stamp carries
+# it to the script ledger and to the conversation's line - the node.
+_SFX_ROLLED: dict[str, dict[str, Any]] = {}
+_SFX_ROLLED_LOCK = RLock()
+
+
+class _S3ClipDice(_S3Dice):
+    """A director over clip paths (the matcher's tied peers): the roll is
+    recorded by the clips' names, with the picture of the one it lands on."""
+
+    def pick(self, _label: str, candidates: list[Any]) -> int:
+        paths = [Path(str(c)) for c in candidates]
+        self.media = lambda k: _sfx_roll_media(paths[k])
+        return super().pick(_label, [p.stem for p in paths])
+
+
+def _s3_dice_live() -> bool:
+    """Whether System 3's dice answer the station's rolls right now (off, or
+    not loaded yet: the station rolls its own)."""
+    fn = globals().get("system3_dice_live")
+    try:
+        return bool(fn and fn())
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _sfx_roll_media(path: Path) -> dict[str, Any]:
+    """The picture a clip has, the way the history strip draws it (#1199): a
+    video's own frame (/api/sfx/poster), an audio clip's spectrogram
+    (/api/sfx/spec - the poster route answers 404 for audio, honestly)."""
+    sid = sfx_id(path)
+    sig = media_sign(sid)
+    video = sfx_is_video(path)
+    out = {"id": sid, "kind": "video" if video else "audio",
+           "thumb": ("/api/sfx/poster/%s?t=%s" if video else "/api/sfx/spec/%s?t=%s") % (sid, sig),
+           "thumb_kind": "frame" if video else "spectrogram"}
+    if video:
+        out["poster"] = out["thumb"]
+    return out
+
+
+def _s3_sfx_rolled(key: str, label: str, index: int | None = None) -> dict[str, Any]:
+    """The roll System 3 just recorded for this draw, as the node shows it:
+    what it landed on, the d100, of how many. Read back off the runtime's
+    record, never re-derived - and only when it is this draw's ({} when the
+    station rolled its own)."""
+    fn = globals().get("system3_last_roll")
+    try:
+        rec = fn(key) if fn else None
+    except Exception:  # noqa: BLE001
+        rec = None
+    if (not isinstance(rec, dict) or time.time() - float(rec.get("at") or 0) > 30
+            or rec.get("picked") != " ".join(str(label).split())[:160]
+            or (index is not None and rec.get("index") != index + 1)):
+        return {}
+    return {"label": str(label)[:160], "dice": rec.get("dice"), "u": rec.get("u"),
+            "of": rec.get("of"), "index": rec.get("index")}
+
+
+def _s3_sfx_roll(key: str, labels: list[str], weights: list[float], question: str,
+                 media: Any = None) -> tuple[int, dict[str, Any]]:
+    """One of the board's rolls through the door: the index, and its record."""
+    k = s3_weighted(key, labels, weights, question, media=media)
+    return k, _s3_sfx_rolled(key, labels[k], k)
+
+
+def _sfx_roll_note(path: Any, road: str, category: dict[str, Any],
+                   clip: dict[str, Any], tries: int) -> None:
+    """Keep the rolls that chose `path` for the line it is about to make: the
+    pick roads return a path, and their caller writes the row."""
+    if not clip:
+        return                  # the station's own draw: no System 3 dice to show
+    got = {"at": time.time(), "road": str(road),
+           "category": dict(category or {}) or {"label": Path(str(path)).parent.name},
+           "clip": dict(clip, tries=int(tries))}
+    with _SFX_ROLLED_LOCK:
+        _SFX_ROLLED.pop(str(path), None)
+        _SFX_ROLLED[str(path)] = got
+        while len(_SFX_ROLLED) > 32:
+            _SFX_ROLLED.pop(next(iter(_SFX_ROLLED)))
+
+
+def _sfx_roll_take(path: Any) -> dict[str, Any]:
+    with _SFX_ROLLED_LOCK:
+        got = _SFX_ROLLED.pop(str(path), None)
+    if not got or time.time() - float(got.pop("at", 0) or 0) > 120:
+        return {}
+    return got
+
+
+def _sfx_roll_carry(row: dict[str, Any], sample: Path) -> None:
+    """The board's addition row takes its clip's picture and the rolls that
+    chose it - the node's thumbnail and dice. Never costs the clip."""
+    try:
+        pic = _sfx_roll_media(sample)
+        if pic.get("poster"):
+            row["poster"] = pic["poster"]
+        roll = _sfx_roll_take(sample)
+        if roll:
+            row["sfx_roll"] = dict(roll, thumb=pic["thumb"], thumb_kind=pic["thumb_kind"])
+    except Exception:  # noqa: BLE001
+        pass
 
 
 # --- The speakbox: other people's words -------------------------------------
@@ -75489,7 +75741,9 @@ async def speakbox_harvest(doc: Path, rid: str = "") -> list[str]:
     if len(body) < 200:
         return []
     if len(body) > SPEAKBOX_GEM_WINDOW:
-        at = random.randrange(0, len(body) - SPEAKBOX_GEM_WINDOW)
+        at = min(len(body) - SPEAKBOX_GEM_WINDOW - 1, int(   # [s3-dice-door]
+            s3_roll("speakbox.harvest_window", "where in the document the harvest reads")   # [s3-dice-door]
+            * (len(body) - SPEAKBOX_GEM_WINDOW)))   # [s3-dice-door]
         at = _harvest_window_start(body, at)          # 2026-09-08: never mid-word
         body = body[at:at + SPEAKBOX_GEM_WINDOW]
     # Asked for "the eight best lines" it repairs the passage and hands back
@@ -75951,7 +76205,7 @@ async def switchboard_fill(want: int = 4) -> None:
         pool = list(zip(kinds, weights))
         while pool and len(picked) < max(2, min(int(want), len(kinds))):
             total = sum(w for _k, w in pool) or 1.0
-            roll = random.random() * total
+            roll = s3_roll("switchboard.kind", "which road the switchboard offers next (weighted by what the operator takes)") * total   # [s3-dice-door]
             run = 0.0
             for i, (k, w) in enumerate(pool):
                 run += w
@@ -78004,7 +78258,7 @@ def speakbox_scene_angle(seed: dict[str, str],
                            and str(row.get("text") or "").strip())
                 + " Work the passages into the scene. System 3 chooses who "
                   "speaks, the responses, the emotions, and the flow.")
-    first = random.choice(["A", "B"])
+    first = "A" if s3_chance("speakbox.scene_performer", 0.5, "the host (A) performs the whole passage, not the co-host (B)") else "B"   # [s3-dice-door]
     other = "B" if first == "A" else "A"
     angle = (
         f"{first} recreates an entire moment on air, WHOLE CLOTH: the "
@@ -78028,10 +78282,10 @@ def speakbox_scene_angle(seed: dict[str, str],
             f"which now blindsides {first} in turn.")
     if jab and jab.get("text"):
         angle += (
-            f" And just before the end, {random.choice([first, other])} "
+            f" And just before the end, {first if s3_chance('speakbox.scene_jab', 0.5, 'the performer (not the one reacting) lands the last-word passage') else other} "   # [s3-dice-door]
             "lands this, word for word, as the last word: "
             f"\"{jab['text']}\"")
-    if random.random() < 0.35:               # #577: caught quoting a document
+    if s3_chance("speakbox.caught_quoting", 0.35, "the other one recognises the document the passage came from (#577)"):   # [s3-dice-door]
         angle += doc_recognition(other, seed.get("file", ""))
     return angle + (
         " Beyond the quoted passages, everything said this round is soaked "
@@ -78059,11 +78313,11 @@ def speakbox_angle(quote: dict[str, str],
     # the passage into the script - otherwise the prose says B reads it
     # while the script hands it to A, and the pair answer a passage
     # nobody read. Unset is the old behaviour, drawn here.
-    first = first if first in ("A", "B") else random.choice(["A", "B"])
+    first = first if first in ("A", "B") else ("A" if s3_chance("speakbox.drop_speaker", 0.5, "the host (A) delivers the passage, not the co-host (B)") else "B")   # [s3-dice-door]
     other = "B" if first == "A" else "A"
     # A third of the time it is a speech rather than a line dropped in (#223).
     drop = (unrepeated(list(SPEAKBOX_MONOLOGUE), "monologue")
-            if random.random() < 0.34
+            if s3_chance("speakbox.monologue", 0.34, "the passage lands as a speech rather than a line dropped in (#223)")   # [s3-dice-door]
             else unrepeated(list(SPEAKBOX_DROPS), "drop"))
     drop = drop.format(first=first, other=other)
     # A monologue names its own speaker; the shorter drops do not.
@@ -78088,7 +78342,7 @@ def speakbox_angle(quote: dict[str, str],
             f"\"{comeback['text']}\" — from somewhere else entirely, never "
             "explained, delivered as though it settled the matter."
         )
-    if random.random() < 0.35:               # #577: caught quoting a document
+    if s3_chance("speakbox.caught_quoting", 0.35, "the other one recognises the document the passage came from (#577)"):   # [s3-dice-door]
         angle += doc_recognition(other, quote.get("file", ""))
     return angle + (
         " Beyond the quoted lines, let the WHOLE round be soaked in that "
@@ -78127,7 +78381,9 @@ async def banter_voices() -> tuple[str, str]:
     picked = {}
     for gender, names in BANTER_VOICES.items():
         have = [n for n in names if n in catalogue]
-        picked[gender] = random.choice(have) if have else ""
+        picked[gender] = (s3_choice("cast.female_voice" if gender == "female" else "cast.male_voice", have,   # [s3-dice-door]
+                                    "which Piper voice plays the %s seat (drawn once per session)" % gender,   # [s3-dice-door]
+                                    tabled=False) if have else "")   # [s3-dice-door]
     return picked["female"], picked["male"]
 
 
@@ -78211,7 +78467,7 @@ async def session_voices() -> dict[str, str]:
             fixed = {}
     if not fixed:
         female, male = await banter_voices()
-        fixed = ({"dj": female, "cohost": male} if random.random() < 0.5
+        fixed = ({"dj": female, "cohost": male} if s3_chance("cast.host_is_woman", 0.5, "the host's seat gets the woman's voice (drawn once, kept)")   # [s3-dice-door]
                  else {"dj": male, "cohost": female})
         _RADIO["voices"] = fixed
         try:
@@ -78549,15 +78805,42 @@ def _sfxguy_ready_valid(row: dict[str, Any], voice: str = "",
     return True
 
 
+# [s3-bank] "i dont want these banked lines unless they come up in a roulette"
+# - "the point of making everything go on system 3 is to have no dialogue hit
+# the station unless it is scripted via the RNG roulette system" (operator,
+# 2026-09-28). The SFX Guy's speech bank is stock, not a System 3
+# conversation, and its own ranking (best keyword match, then least recent,
+# resting a line three MINUTES) put 165 distinct lines on air 3,613 times - the
+# top ones 50 to 69 times each. While System 3's dice are live a banked line
+# airs only when the roulette brings one up, the take is the roulette's pick
+# among the rested ones, and a line rests hours, not minutes.
+SFXGUY_BANK_ODDS = float(os.getenv("SFXGUY_BANK_ODDS", "0.2"))
+SFXGUY_BANK_REST_S = float(os.getenv("SFXGUY_BANK_REST_S", "21600"))
+
+
+def _sfxguy_bank_roll(takes: list[dict[str, Any]]) -> int:
+    """Which of his rested banked lines: System 3's roll, the ones that answer
+    the moment weighing more."""
+    return s3_weighted("sfxguy.bank_take", [str(t.get("text") or "")[:80] for t in takes],
+                       [1.0 + 2.0 * float(t.get("overlap") or 0) for t in takes],
+                       "which of the SFX Guy's banked lines")
+
+
 def sfxguy_ready_pick(context: str = "", voice: str = "") -> dict[str, Any] | None:
     """Reserve one already recorded whole line for the strict saved-take path."""
     current = str(dj_settings().get("drop_voice") or "")
     if not current or (voice and voice != current):
         return None
+    _rolled = _s3_dice_live()                                          # [s3-bank]
+    if _rolled and not s3_chance("sfxguy.bank_line", SFXGUY_BANK_ODDS,
+                                 "one of the SFX Guy's banked lines comes up (otherwise nothing banked airs)"):
+        return None
     try:
         _profile = _sfxguy_ready_profile()               # #1394: once
         row = _SFX_READY_BANK.pick(context, current, _profile,
-                                  lambda item: _sfxguy_ready_valid(item, current, _profile))
+                                  lambda item: _sfxguy_ready_valid(item, current, _profile),
+                                  **({"cooldown": SFXGUY_BANK_REST_S, "chooser": _sfxguy_bank_roll}
+                                     if _rolled else {}))
         if row:
             row["seconds"] = float(row["clip"]["seconds"])
         return row
@@ -80399,9 +80682,10 @@ def perf_apply(raw: bytes, vec: dict[str, Any]) -> bytes:
 def voice_effect_pick() -> dict[str, float]:
     """How wet this line is, if at all. Empty means say it dry."""
     dj = dj_settings()
-    if random.random() >= dj["fx_rate"]:
+    if dj["fx_rate"] <= 0 or not s3_chance("voice.fx_wet", dj["fx_rate"], "a line goes out wet (echo and room on the voice)", dial="fx_rate"):   # [s3-dice-door]
         return {}
-    depth = random.uniform(dj["fx_min"], dj["fx_max"]) / 100.0
+    depth = (dj["fx_min"] + (dj["fx_max"] - dj["fx_min"])   # [s3-dice-door]
+             * s3_roll("voice.fx_depth", "how wet a wet line is (between the effect minimum and maximum)")) / 100.0   # [s3-dice-door]
     if depth <= 0.01:
         return {}
     return {
@@ -83071,10 +83355,26 @@ def _sfx_cadence_pick() -> Path | None:
     if fresh:
         pool = fresh
     # Never walk the share or probe its entire catalogue on the microphone.
-    for _ in range(min(64, len(pool))):
-        path = random.choices(pool, weights=[weights.get(sfx_id(p), 1.0) for p in pool], k=1)[0]
-        pool.remove(path)
+    # [s3-sfx-roll] THE FAMILY, THEN THE CLIP: each draw is two of System 3's
+    # rolls among what the filters above left - the drop folder, weighed as
+    # the sum of its clips' weights (so a clip's odds are exactly what the one
+    # weighted draw gave it), then the clip in it. A clip that fails the file
+    # check is rolled again among the rest, every roll recorded. System 3
+    # off: the same two draws off the station's random.
+    _fam: dict[str, list[tuple[Path, float]]] = {}
+    for p in pool:
+        _fam.setdefault(p.parent.name, []).append((p, weights.get(sfx_id(p), 1.0)))
+    for _try in range(min(64, len(pool))):
+        _names = [name for name, clips in _fam.items() if clips]
+        _k, _cat = _s3_sfx_roll("sfx.category", _names, [sum(w for _p, w in _fam[n]) for n in _names],
+                                "which effect family the board reaches into")
+        _in = _fam[_names[_k]]
+        _j, _clip = _s3_sfx_roll("sfx.clip", [p.stem for p, _w in _in], [w for _p, w in _in],
+                                 "which clip in " + _names[_k],
+                                 media=lambda j, _in=_in: _sfx_roll_media(_in[j][0]))
+        path = _in.pop(_j)[0]
         if path.is_file() and 0 < sfx_seconds(path) <= min(12.0, sfx_cap_seconds()):
+            _sfx_roll_note(path, "pool", _cat, _clip, _try + 1)              # [s3-sfx-roll]
             # Still written: other readers report what went out last. It is
             # simply no longer the thing that decides what may go out next.
             _SFX_CADENCE_STATUS["last_sample"] = str(path)
@@ -83103,8 +83403,15 @@ def _sfx_cadence_video_pick(after: str) -> tuple[Path, Path, float, str] | None:
             if not sfx_video_folder_recent(path.parent.name):
                 candidates.append((path, sfx_seconds(path), str(matched[1] or "")))
     banned, weights = sfx_bans(), sfx_weights()
-    for _ in range(min(6, SFX_CADENCE_TRIES)):
-        row = sfx_db_pick_short_video(min(12.0, sfx_cap_seconds()))
+    # [s3-sfx-roll] under System 3 each draw from the book is two of its
+    # rolls (the folder, then the clip in it), recorded; one the filters
+    # refuse is rolled again, and the draws stop at the two this road tries -
+    # a roll nobody would try is not one to put on the record.
+    _live, _rolls = _s3_dice_live(), {}
+    for _draw in range(min(6, SFX_CADENCE_TRIES)):
+        _rolled: dict[str, Any] | None = {} if _live else None
+        row = (sfx_db_pick_short_video(min(12.0, sfx_cap_seconds())) if _rolled is None
+               else sfx_db_pick_short_video(min(12.0, sfx_cap_seconds()), rolled=_rolled))
         if not row:
             break
         path, seconds = row
@@ -83113,6 +83420,10 @@ def _sfx_cadence_video_pick(after: str) -> tuple[Path, Path, float, str] | None:
                 or sting_recent(str(path)) or sfx_video_on_cooldown(key)):
             continue
         candidates.append((path, float(seconds), ""))
+        if _rolled:                                                         # [s3-sfx-roll]
+            _rolls[str(path)] = (_rolled, _draw + 1)
+        if _live and len(candidates) >= 2:
+            break
     for path, seconds, why in candidates[:2]:
         if not 0 < seconds <= min(12.0, sfx_cap_seconds()):
             continue
@@ -83122,6 +83433,9 @@ def _sfx_cadence_video_pick(after: str) -> tuple[Path, Path, float, str] | None:
         audio = sfx_levelled(source)
         if audio.suffix.lower() == ".wav" and audio.is_file():
             _sfx_video_rotation_mark_clip(sfx_id(path), path.parent.name)
+            if str(path) in _rolls:                                         # [s3-sfx-roll]
+                _r, _n = _rolls[str(path)]
+                _sfx_roll_note(path, "book", _r.get("category") or {}, _r.get("clip") or {}, _n)
             # [#1477-picture] its picture rides silent, but it is fetched
             # through /sfx/{key} like any clip: have the copy made before
             # the page asks, not while it waits.
@@ -83273,6 +83587,7 @@ async def _sfx_cadence_additions_inner(who: str, text: str, completed: int,
                 additions[-1].update({"sfx_video_id": sfx_id(sample),
                                       "sfx_video_seconds": duration,
                                       "sfx_match_why": why})
+            _sfx_roll_carry(additions[-1], sample)                              # [s3-sfx-roll]
             if not _s3_active() and complaint_due():
                 other = "dj" if who == "cohost" else "cohost"
                 voice = configured_radio_voice(other)
@@ -84948,7 +85263,7 @@ def sting_due(after: str = "") -> Path | None:   # [#1251] the line it follows
     # first" and the two only disagree while there are still clips that
     # have never been drawn at all.
     _unheard = _STING_DRAW_MEMO.get("unheard") or set()
-    if _unheard and len(_unheard) >= STING_SUBPOOL_MIN and random.random() < SFX_UNHEARD_SHARE:   # [#1188]
+    if _unheard and len(_unheard) >= STING_SUBPOOL_MIN and s3_chance("sting.unheard_first", SFX_UNHEARD_SHARE, "the sting is one nobody has heard yet (#1251)"):   # [#1188] [s3-dice-door]
         _pool = [n for n in names_pool if n in _unheard]
         _pick = (unrepeated(_pool, "sting",
                             keep=sting_keep(len(set(_pool))))
@@ -84962,7 +85277,7 @@ def sting_due(after: str = "") -> Path | None:   # [#1251] the line it follows
                          "(%d of %d in the pool still unheard)"
                          % (Path(_pick).name, len(_unheard), len(pool)))
             return Path(_pick)
-    if fresh and len(fresh) >= STING_SUBPOOL_MIN and random.random() < SFX_FRESH_SHARE:   # [#1188]
+    if fresh and len(fresh) >= STING_SUBPOOL_MIN and s3_chance("sting.fresh_first", SFX_FRESH_SHARE, "the sting is a newly added sample, ahead of the rotation (#1062)"):   # [#1188] [s3-dice-door]
         fresh_pool = [n for n in names_pool if n in fresh] or sorted(fresh)
         names = unrepeated(fresh_pool, "sting",
                            keep=sting_keep(len(set(fresh_pool))))  # #1223
@@ -85425,7 +85740,7 @@ def _sfx_deck_fill() -> None:
         tries = 0
         while len(_SFX_VIDEO_DECK) < SFX_DECK_DEEP and tries < 12:
             tries += 1
-            pick = random.choice(pool)
+            pick = s3_choice("sfx.deck_video", pool, "which video clip waits on the deck for the next tap", tabled=False)   # [s3-dice-door]
             if str(pick) in have:
                 continue
             if not _sfx_deck_warm(pick):
@@ -85483,7 +85798,7 @@ async def _sting_over_record(track: dict[str, Any] | None) -> None:
     roll on the record itself, at the same dial and gap, never over a
     voice and never while paused."""
     try:
-        await asyncio.sleep(random.uniform(8.0, 25.0))
+        await asyncio.sleep(8.0 + 17.0 * s3_roll("sting.over_record_at", "how far into the record a sting over it lands (8 to 25 seconds)"))   # [s3-dice-door]
         why = ""
         for _try in range(5):
             if radio_paused() or not _RADIO.get("on"):
@@ -88360,21 +88675,26 @@ def _seat_away_clause_raw() -> str:     # [s3-blocks] seat_away_clause() marks i
 def seat_line(reason: str, which: str) -> str:
     """A fresh line from the book - never the one this reason used last."""
     book = SEAT_AWAY_BOOK.get(reason) or SEAT_AWAY_BOOK["coffee"]
-    lines = list(book.get(which) or ())
+    # [s3-dice-door] each reason's leaving / coming-back lines are a desk pool (POOLS1)
+    _sk = "seat.%s_%s" % (reason if reason in SEAT_AWAY_BOOK else "coffee", which)   # [s3-dice-door]
+    lines = s3_pool(_sk, list(book.get(which) or ()), "what a host says %s %s" % (   # [s3-dice-door]
+        "coming back from" if which == "back" else "leaving for", book.get("label") or "a break"))   # [s3-dice-door]
     if not lines:
         return ""
     used = _SEAT_STATE.setdefault("used", {})
     last = str(used.get(f"{reason}:{which}") or "")
     pool = [ln for ln in lines if ln != last] or lines
-    pick = random.choice(pool)
+    pick = s3_choice(_sk, pool, "what a host says leaving or coming back", tabled=False)   # [s3-dice-door]
     used[f"{reason}:{which}"] = pick
     return pick
 
 
 def seat_reason_draw() -> str:
     """One of the five, never the one just used."""
-    pool = [r for r in SEAT_AWAY_BOOK if r != _SEAT_STATE.get("last_reason")]
-    pick = random.choice(pool or list(SEAT_AWAY_BOOK))
+    _reasons = [r for r in s3_pool("seat.reason", list(SEAT_AWAY_BOOK), "why a host steps out of the studio")   # [s3-dice-door]
+                if r in SEAT_AWAY_BOOK] or list(SEAT_AWAY_BOOK)   # [s3-dice-door]
+    pool = [r for r in _reasons if r != _SEAT_STATE.get("last_reason")]   # [s3-dice-door]
+    pick = s3_choice("seat.reason", pool or _reasons, "why a host steps out of the studio", tabled=False)   # [s3-dice-door]
     _SEAT_STATE["last_reason"] = pick
     return pick
 
@@ -88469,7 +88789,7 @@ def _seat_door_sample_blocking(reason: str) -> Path | None:
         pool = [p for p in sfx_all()
                 if any(w in p.stem.lower() for w in words)
                 and sfx_short(p) and sfx_id(p) not in banned]
-        return random.choice(pool) if pool else None
+        return s3_choice("seat.door_sample", pool, "which door / footsteps sample follows a host out", tabled=False) if pool else None   # [s3-dice-door]
     except Exception:  # noqa: BLE001
         return None
 
@@ -88501,7 +88821,8 @@ async def seat_go_away(seat: str, reason: str, why: str) -> bool:
     try:
         dj = dj_settings()
         mins = max(2, min(6, int(dj.get("seat_away_minutes") or 4)))
-        span = max(120.0, min(360.0, mins * 60.0 * random.uniform(0.75, 1.25)))
+        span = max(120.0, min(360.0, mins * 60.0 * (0.75 + 0.5 * s3_roll(   # [s3-dice-door]
+            "seat.away_span", "how long a host stays out of the studio (0.75x to 1.25x the minutes setting)"))))   # [s3-dice-door]
         line = seat_line(reason, "leave")
         now = time.time()
         _AWAY.clear()
@@ -91902,7 +92223,8 @@ def approach_pick() -> dict[str, Any]:
     rows = [r for r in approach_rules() if r.get("enabled", True)
             and float(r.get("weight") or 0) > 0]
     if not rows:
-        return {"id": "", "text": random.choice(DIALOGUE_APPROACHES)}
+        return {"id": "", "text": s3_choice("approach.builtin", list(DIALOGUE_APPROACHES),   # [s3-dice-door]
+                                            "the frame the round is played in (the built-in list, when the approach book is empty)")}   # [s3-dice-door]
     now = time.time()
     last = str(_RADIO.get("last_approach") or "")
 
@@ -91912,9 +92234,9 @@ def approach_pick() -> dict[str, Any]:
     pool = [r for r in rows if r.get("id") != last
             and now - float(r.get("last") or 0) > gate(r)]
     pool = pool or [r for r in rows if r.get("id") != last] or rows
-    pick = random.choices(pool,
-                          weights=[float(r.get("weight") or 1) for r in pool],
-                          k=1)[0]
+    pick = pool[s3_weighted("approach.frame", [str(r.get("text") or r.get("id") or "") for r in pool],   # [s3-dice-door]
+                            [float(r.get("weight") or 1) for r in pool],   # [s3-dice-door]
+                            "which approach frames the round (the approach book's own weights)")]   # [s3-dice-door]
     _RADIO["last_approach"] = pick.get("id") or ""
     with _APPROACH_LOCK:
         stored = approach_rules()
@@ -92066,7 +92388,8 @@ def banter_dice_roll(axis: str = "") -> float:
     low, high = banter_dice_range(axis)
     if high <= low:
         return round(low, 3)
-    return round(low + random.random() * (high - low), 3)
+    return round(low + s3_roll("banter.dice_roll", "where the banter dice land on the %s axis (inside its locked band)"   # [s3-dice-door]
+                               % (axis or "any")) * (high - low), 3)   # [s3-dice-door]
 
 
 def banter_dice_pick(axis: str, roll: float | None = None,
@@ -92097,8 +92420,9 @@ def banter_dice_pick(axis: str, roll: float | None = None,
     pool = [x for x in half if x.get("id") != last_id
             and now - float(x.get("last") or 0) > gate(x)]
     pool = pool or [x for x in half if x.get("id") != last_id] or half
-    pick = dict(random.choices(
-        pool, weights=[float(x.get("weight") or 1) for x in pool], k=1)[0])
+    pick = dict(pool[s3_weighted("banter.dice_card", [str(x.get("text") or x.get("id") or "") for x in pool],   # [s3-dice-door]
+                                 [float(x.get("weight") or 1) for x in pool],   # [s3-dice-door]
+                                 "which card the banter dice deal on that half of the axis (the book's weights)")])   # [s3-dice-door]
     with _BANTER_DICE_LOCK:
         stored = banter_dice_rules()
         for row in stored:
@@ -92294,7 +92618,7 @@ def banter_beat_sheet(lines: int, seats: list[str], dj: dict[str, Any],
         # row"), and _swath_deal's docstring measured what happens when one
         # mouth takes the round: 81.9% of six hours against 4.4%.
         pool = [x for x in seats if x != last_seat] or seats
-        seat = "A" if turn == 1 else random.choice(pool)
+        seat = "A" if turn == 1 else s3_choice("banter.sheet_seat", pool, "who holds the floor on a turn of the running order", tabled=False)   # [s3-dice-door]
         if turn == 1 and seeded:
             out.append("%2d  A  - opens with the passage above, word for "
                        "word, as their own speech." % turn)
@@ -92312,7 +92636,7 @@ def banter_beat_sheet(lines: int, seats: list[str], dj: dict[str, Any],
                        "else." % (turn, seat))
             last_seat = seat
             continue
-        if random.random() > rate:
+        if not s3_chance("banter.sheet_dice_turn", rate, "a turn of the running order takes a rolled stance", dial="banter_dice_rate"):   # [s3-dice-door]
             out.append("%2d  %s  - answers the turn before it." % (turn, seat))
             last_seat = seat
             continue
@@ -92372,15 +92696,18 @@ def banter_due(dj: dict[str, Any], played: int) -> bool:
     if dj["banter_max_minutes"] <= 0:
         return bool(dj["banter_every"]) and played % dj["banter_every"] == 0
 
-    gap = random.uniform(dj["banter_min_minutes"],
-                         dj["banter_max_minutes"]) * 60
+    # [s3-dice-door] the minutes between the two settings are rolled below,
+    # only when the clock resets - a roll on every record would be noise
+    gap = 60.0   # [s3-dice-door]
     # The talk↔music dial (#304) squeezes the clock: at 100 the drawn gap
     # collapses to seconds and the pair barely stop; at 0 it stretches to
     # double — records first, remarks occasionally.
     gap *= 2.0 - 1.95 * (dj["talk_radio"] / 100.0)
     due = _RADIO.get("banter_due")
     if due is None or time.time() >= due:
-        _RADIO["banter_due"] = time.time() + gap
+        _RADIO["banter_due"] = time.time() + gap * (   # [s3-dice-door]
+            dj["banter_min_minutes"] + (dj["banter_max_minutes"] - dj["banter_min_minutes"])   # [s3-dice-door]
+            * s3_roll("banter.clock_gap", "how long the records run before the pair talk again (between the minute settings)"))   # [s3-dice-door]
         return True
     return False
 
@@ -98497,7 +98824,8 @@ async def story_open_async(name: str, live: dict[str, Any], ran: float,
             "twist": got["twist"],
             "status": "open",
             "parts_planned": STORY_PARTS_MIN + int(s3_roll("story.part_count", "how many parts a caller's story runs") * (STORY_PARTS_MAX - STORY_PARTS_MIN + 1)),   # [s3-dice-door]
-            "next_due": now + random.uniform(STORY_DUE_MIN_S, STORY_DUE_MAX_S),
+            "next_due": now + STORY_DUE_MIN_S + (STORY_DUE_MAX_S - STORY_DUE_MIN_S) * s3_roll(   # [s3-dice-door]
+                "story.next_part_due", "how long until a caller's story rings back with its next part"),   # [s3-dice-door]
             "other_calls_since": 0,
             "calls": 1,
             "opened": now,
@@ -98557,8 +98885,8 @@ async def story_beat_async(sid: str, name: str, live: dict[str, Any],
                 story["closed_at"] = now
                 story["next_due"] = 0
             else:
-                story["next_due"] = now + random.uniform(STORY_DUE_MIN_S,
-                                                         STORY_DUE_MAX_S)
+                story["next_due"] = now + STORY_DUE_MIN_S + (STORY_DUE_MAX_S - STORY_DUE_MIN_S) * s3_roll(   # [s3-dice-door]
+                    "story.next_part_due", "how long until a caller's story rings back with its next part")   # [s3-dice-door]
         await story_save()
         pipeline_log("call", (f"{name}'s story CLOSED after {part} parts: "
                               f"{got['cliffhanger'][:120]} (#1039)")
@@ -98820,7 +99148,8 @@ def _call_rerun_pick_blocking(low: float, high: float) -> dict[str, Any]:
             continue
     if not cands:
         return {}
-    pick = random.choice(cands)
+    pick = cands[_S3Dice("call.rerun_take", "which past call airs again as a rerun").pick(   # [s3-dice-door]
+        "rerun", [c["path"].name for c in cands])]   # [s3-dice-door]
     row, path = pick["row"], pick["path"]
     try:
         seconds = float(_clip_seconds(str(path)) or 0)
@@ -99649,7 +99978,7 @@ def caller_face(name: str) -> str:
         # One nobody else on the switchboard is already wearing.
         spoken_for = set(book.values())
         free = [f for f in found if f not in spoken_for] or found
-        pick = random.choice(free)
+        pick = s3_choice("call.face_picture", free, "which gallery picture a new caller wears", tabled=False)   # [s3-dice-door]
         book[name[:80]] = pick
         if len(book) > 400:
             book = dict(list(book.items())[-300:])
@@ -99765,13 +100094,15 @@ def caller_voice_for(name: str, taken: set[str],
                 if isinstance(v, str))
         except Exception:  # noqa: BLE001
             _held = {}
-        fresh = sorted(
-            usable,
-            key=lambda v: (int(_held.get(v, 0)),
-                           int((air.get(v) or {}).get("airings") or 0),
-                           int((air.get(v) or {}).get("last") or 0),
-                           random.random()))
-        pick = fresh[0]
+        # [s3-dice-door] the least-held, least-aired, longest-rested voices
+        # tie; System 3 draws among the tie (it was a random sort key)
+        def _vrank(v: str) -> tuple[int, int, int]:
+            return (int(_held.get(v, 0)),
+                    int((air.get(v) or {}).get("airings") or 0),
+                    int((air.get(v) or {}).get("last") or 0))
+        _vbest = min(_vrank(v) for v in usable)   # [s3-dice-door]
+        pick = s3_choice("call.library_voice", [v for v in usable if _vrank(v) == _vbest],   # [s3-dice-door]
+                         "which of the least-used library voices a new caller gets", tabled=False)   # [s3-dice-door]
         _caller_voice_remember(name, pick)
         return pick
     banks = ([BANTER_VOICES[gender]] if gender in BANTER_VOICES
@@ -100190,6 +100521,7 @@ async def dj_deep_round(track: dict[str, Any] | None = None) -> list[str]:
         # #1027: the long-form round is never banked, so the second pass
         # can never reach it. This is its only chance to be tinted.
         + crystal_tint_note())
+    prompt = _pb_within("playing", prompt, playing, after="THE ROOM RIGHT NOW: ")   # [s3-blocks]
     try:
         script = await ask_model(
             prompt,
@@ -101416,7 +101748,7 @@ async def ad_clock() -> None:
             continue
         _RADIO["last_ad"] = time.time()
         try:
-            roll = random.random()
+            roll = s3_roll("station.clock_ad_kind", "which advert the ad clock runs (engineering < 0.10 < service < 0.22 < a produced spot or a break)")   # [s3-dice-door]
             banked = len([r for r in ad_list() if r.get("audio")])
             if roll < 0.10:
                 await dj_engineering_ad()
@@ -101464,7 +101796,7 @@ async def caller_clock() -> None:
         # FIRST ring of a show comes inside a minute and a half (#365):
         # restarts kept resetting the clock and the user sat through
         # whole quiet stretches waiting for a phone that never rang.
-        wait = (3600.0 / rate) * random.uniform(0.6, 1.4)
+        wait = (3600.0 / rate) * (0.6 + 0.8 * s3_roll("call.clock_wait", "how long until the phone rings again (0.6x to 1.4x the calls-an-hour spacing)"))   # [s3-dice-door]
         if first:
             wait = min(wait, 90.0)
             first = False
@@ -101546,7 +101878,7 @@ async def caller_clock() -> None:
             # calls the pair are heard cracking under it — proud of the
             # numbers, begging the town to stop, hearing rings that are
             # not there — and then the phone goes again.
-            if rate >= 20 and random.random() < 0.5:
+            if rate >= 20 and s3_chance("call.flood_banter", 0.5, "at flood rates the pair crack on air between calls (#352)"):   # [s3-dice-door]
                 try:
                     await dj_banter(None, lines=3, angle=unrepeated([
                         "the phones will NOT stop today — say so on air, "
@@ -104172,7 +104504,7 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                         if _said[:60] in _body or _body[:60] in _said:
                             return str(_d.get("file") or "")
                     return ""
-                def _s3_row_of(_row_at: int) -> dict[str, Any]:
+                def _s3_row_bare(_row_at: int) -> dict[str, Any]:
                     # System 3 (docs/SYSTEM3_EVENT_SCHEMA.md): the
                     # conversation this line belongs to and, for a spoken
                     # turn, which of its turns - active or shadow.
@@ -104214,6 +104546,15 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                     return {"conversation_id": str(_s3m.get("conversation_id") or ""),
                             "mode": str(_s3m.get("mode") or ""),
                             "turn_id": _tid}
+
+                def _s3_row_of(_row_at: int) -> dict[str, Any]:
+                    # [s3-sfx-roll] the board's clip: the rolls that chose it
+                    # and its picture ride its stamp, to the ledger and the node
+                    _st = _s3_row_bare(_row_at)
+                    _mx = _sfx_meta.get(_row_at)
+                    if _st and isinstance(_mx, dict) and (_mx.get("sfx_roll") or _mx.get("poster")):
+                        _st = dict(_st, **{k: _mx[k] for k in ("sfx_roll", "poster") if _mx.get(k)})
+                    return _st
                 _script_rows = [
                          {"line_id": (line_ids[_r] if _r < len(line_ids)
                                        else ""),
@@ -105965,7 +106306,8 @@ async def dj_banter(track: dict[str, Any] | None = None,
     # round with nothing else already asked of it (#202). Never banked: the
     # larder holds written rounds, not replays.
     if not _s3_active() and not bank and not (angle or force_seed) \
-            and random.random() < dj["saved_rate"]:
+            and s3_chance("banter.saved_replay", dj["saved_rate"],   # [s3-dice-door]
+                          "a kept exchange comes back word for word (#202)", dial="saved_rate"):   # [s3-dice-door]
         keep = draw_saved_banter()
         if keep:
             # #752: allow_repeat — the bank exists to bring a line BACK,
@@ -106156,6 +106498,26 @@ async def dj_banter(track: dict[str, Any] | None = None,
             for _lost in picks:
                 if _lost is not seed and str(_lost.get("text") or "").strip():
                     spread.append(_lost)
+    # [s3-source] THE OPERATOR PINNED THIS ROUND'S SOURCE on System 3's initiator
+    # node: the round opens from that speakbox document, whatever the dice
+    # above drew (a seed they drew still rides along as spread material).
+    _s3_src = ""
+    if globals().get("system3_pinned_source") and not caller_name and not own_material and not exchange:
+        try:
+            _s3_src = str(globals()["system3_pinned_source"](str(road or "banter")) or "")
+        except Exception:  # noqa: BLE001
+            _s3_src = ""
+    if _s3_src:
+        _pinned = await speakbox_quote(most=6, cap=700, only=_s3_src)
+        if _pinned and str(_pinned.get("text") or "").strip():
+            if seed and str(seed.get("text") or "").strip():
+                spread.append(seed)
+            seed = _pinned
+            pipeline_log("system3", "the round opens from the source pinned on its initiator node",
+                         extra=_s3_src[:160])
+        else:
+            pipeline_log("system3", "the source pinned on the initiator node gave no passage - the dice's draw stands",
+                         extra=_s3_src[:160])
     dropped = {} if (angle or seed) else (
         drop_bombshell() if s3_chance("banter.bombshell", 0.6, "a bombshell topic is dropped on a round with nothing else") else {})   # [s3-dice-door]
     seed = _source_for_scene(seed)
@@ -106172,6 +106534,7 @@ async def dj_banter(track: dict[str, Any] | None = None,
         dropped = surplus_topic()
     comeback: dict[str, Any] = {}
     jab: dict[str, Any] = {}
+    _angle_aside = _theme_said = _hot_said = ""   # [s3-blocks] blocks riding inside the angle
     if angle and seed and str(seed.get("text") or ""):
         # #1078: ...BUT THE SEED STILL GOES IN. An angle is what a round
         # is ABOUT; a seed is what it is built OUT OF, and choosing the
@@ -106188,7 +106551,8 @@ async def dj_banter(track: dict[str, Any] | None = None,
         # #1039 fixed this same confusion at the DRAW. This is the same
         # mistake at the delivery.
         try:
-            angle = str(angle) + speakbox_aside(seed, pair=True)
+            _angle_aside = speakbox_aside(seed, pair=True)   # [s3-blocks] marked on the prompt's copy
+            angle = str(angle) + _angle_aside
         except Exception:  # noqa: BLE001
             pass
     elif angle:
@@ -106447,6 +106811,11 @@ async def dj_banter(track: dict[str, Any] | None = None,
             # A line worked in needs somewhere to be answered. Two lines is
             # one each with nothing left over, and the answer is the point.
             lines = max(lines, min(3, dj["banter_max_lines"]))
+    # [s3-blocks] what is playing (the record; the only records that may be
+    # named) and the speakerbox line worked in - each marked as its node;
+    # they reach nothing but this round's writer prompts (one call, beats)
+    playing, only_song = _pb("playing", playing), _pb("playing", only_song)
+    aside = _pb("aside", aside)
 
     # Now and then the pair go LOOKING for approval (#322) — and the SFX
     # guy, who never talks, gives his verdict from the corner booth right
@@ -106494,7 +106863,8 @@ async def dj_banter(track: dict[str, Any] | None = None,
     # heat, which is what the operator kept hearing instead of their subject.
     _air_theme = theme_owns_air()
     if _air_theme and not caller_name:
-        angle += theme_air_clause(_air_theme, own_material=own_material)
+        _theme_said = theme_air_clause(_air_theme, own_material=own_material)   # [s3-blocks]
+        angle += _theme_said
     # 2026-09-15 (#1197): and, on a SECOND attempt only, what the first
     # one got wrong - the #1134 lesson, hung on this task by
     # brief_written_twice and read exactly here.  "" on every round that
@@ -106510,10 +106880,11 @@ async def dj_banter(track: dict[str, Any] | None = None,
                           "a buried aside about how hot the machine is running", dial="heat_rate"):   # [s3-dice-door]
         _hot = heat_reference()
         if _hot:
-            angle += (" BURIED, IN PASSING: somewhere mid-conversation one of "
-                      "you lets slip, as a throwaway aside and NOT the topic, a "
-                      f"reference to how hot the machine is running — \"{_hot}\" "
-                      "— a single glancing mention, then straight on.")
+            _hot_said = (" BURIED, IN PASSING: somewhere mid-conversation one of "   # [s3-blocks]
+                         "you lets slip, as a throwaway aside and NOT the topic, a "
+                         f"reference to how hot the machine is running — \"{_hot}\" "
+                         "— a single glancing mention, then straight on.")
+            angle += _hot_said
     try:
         third = (f"\nAlso in the booth, a third presenter, "
                  f"{dj['third_name']}: {radio_persona('third', dj['third_persona']) or 'game for anything'}"
@@ -106756,10 +107127,10 @@ async def dj_banter(track: dict[str, Any] | None = None,
                 "their next move. Nobody conducts a questionnaire and nobody "
                 "delivers an unrelated speech. " if caller_name
                else "strictly alternating. "))
-            + (system2_turn_instruction(_system2_budget) if _system2_budget else
-               "Each primary turn must be a developed four-to-seven-sentence "
-               "thought, usually 60 to 100 words: specific, surprising, and "
-               "responsive, never a one-sentence quip. ")
+            + _pb("turn_rules", system2_turn_instruction(_system2_budget) if _system2_budget else   # [s3-blocks]
+                  "Each primary turn must be a developed four-to-seven-sentence "
+                  "thought, usually 60 to 100 words: specific, surprising, and "
+                  "responsive, never a one-sentence quip. ")
             + "Every line RESPONDS to the line before "
             "it: take in what was just said, react to it first — in so many "
             "words — then add your own. No line may ignore or talk past the "
@@ -106826,7 +107197,7 @@ async def dj_banter(track: dict[str, Any] | None = None,
                # #no-repeats: SAMPLED, not the first eleven. A fixed slice of a list
                # the operator may have written thirty of is a fixed paragraph
                # in a prompt that is already mostly fixed.
-               f"{', '.join(repr(p) for p in random.sample(list(dj['diatribe_interjections']), min(11, len(dj['diatribe_interjections']))))}"
+               f"{', '.join(repr(p) for p in s3_sample('banter.interjections', list(dj['diatribe_interjections']), min(11, len(dj['diatribe_interjections'])), 'which edgewise interjections the writer is offered for a diatribe', tabled=False))}"   # [s3-dice-door]
                f" — or anything in that spirit, in their own voice. They are "
                f"reactions, NOT replies: the one on the roll does not stop, "
                f"does not answer them, and keeps going. Vary them; never use "
@@ -106916,8 +107287,24 @@ async def dj_banter(track: dict[str, Any] | None = None,
             # The material says what to talk about; the running order is
             # the shape of the answer, and the shape must be the thing
             # the model is holding when it starts to write.
-            + ("\n\n" + _beat_sheet if _beat_sheet else "")
+            + (_pb("sheet", "\n\n" + _beat_sheet) if _beat_sheet else "")   # [s3-blocks]
         )
+        # [s3-blocks] the blocks that ride INSIDE the round's angle - the
+        # speakerbox passage worked into it, the operator's theme, the
+        # machine-heat aside, a call's theme and topic contract - marked as
+        # their own nodes on this prompt's copy only: `angle` travels on
+        # unmarked (System 3's director, the call gates, the fallback script)
+        _angle_parts: list[tuple[str, str]] = [("aside", _angle_aside), ("theme", _theme_said),
+                                               ("heat", _hot_said)]
+        try:
+            if caller_name:
+                _angle_parts.append(("theme", theme_air_clause(active_theme())))
+                _angle_parts.append(("topic_contract", topic_contract_clause(
+                    str((call_meta or {}).get("topic") or ""), caller_name)))
+        except Exception:  # noqa: BLE001
+            pass
+        for _pb_name, _pb_part in _angle_parts:
+            _one_call_prompt = _pb_within(_pb_name, _one_call_prompt, _pb_part)
         # Room for the whole swath to come back out (#210): a long passage
         # worked in needs more turns than a one-line remark. The same ceiling
         # governs the one-call road; each beat has its own smaller bound.
@@ -107200,7 +107587,7 @@ async def dj_banter(track: dict[str, Any] | None = None,
                 + "Return only A:/B"
                 + ("/C" if caller_name else "/D" if _system2_budget and dj.get("third_name") else "") + ": dialogue. Keep its "
                 "subject and every verbatim quotation. "
-                + (f"Write {lines} alternating turns. " + system2_turn_instruction(_system2_budget)
+                + (f"Write {lines} alternating turns. " + _pb("turn_rules", system2_turn_instruction(_system2_budget))   # [s3-blocks]
                    if _system2_budget else f"Write {lines} alternating turns. "
                    if _s3_owns else "Write 8 to 11 alternating turns with at least 55 words in every ordinary turn. ")
                 + "Each speaker must respond directly to the prior turn, "
@@ -107212,8 +107599,8 @@ async def dj_banter(track: dict[str, Any] | None = None,
                     "details C just revealed; C answers each. Build one earned "
                     "rapport callback, carry the database theme throughout, "
                     "and end with C finishing and a host clearly signing off. "
-                    + topic_contract_clause(                          # [#1249]
-                        str((call_meta or {}).get("topic") or ""), caller_name)
+                    + _pb("topic_contract", topic_contract_clause(    # [#1249] [s3-blocks]
+                        str((call_meta or {}).get("topic") or ""), caller_name))
                     + ("Mid-call C introduces this new Speakerbox subject in "
                        "their own rhetoric, preserving at least two concrete "
                        "anchor words; the next host repeats an anchor and "
@@ -112405,9 +112792,10 @@ async def ask_model(prompt: str, limit: int = 300,
     temperature = min(1.35, float(settings["temperature"])
                       + (random.uniform(0.0, spice) if spice
                          else random.uniform(0.0, 0.06))
-                      + (random.uniform(0.0, _hot) if _hot > 0.02 else 0.0)
-                      + (random.uniform(0.0, 0.35 * _heat)
-                         if _heat > 0.02 else 0.0))
+                      + (_hot * s3_roll("writer.shelf_heat", "how far past the dial the writer runs hot on a deep shelf (#895)")   # [s3-dice-door]
+                         if _hot > 0.02 and not _is_tint else 0.0)   # [s3-dice-door] a tint's temperature is set below
+                      + (0.35 * _heat * s3_roll("writer.call_heat", "how hot a stacked caller is written, inside the road's heat band (#941)")   # [s3-dice-door]
+                         if _heat > 0.02 and not _is_tint else 0.0))   # [s3-dice-door]
     if _is_tint:
         # Rewriting has a fixed factual contract. It must not inherit the
         # original writer's temperature, stocked-shelf heat and heat jitter.
@@ -112450,6 +112838,15 @@ async def ask_model(prompt: str, limit: int = 300,
     _review_messages = ([{"role": "system", "content": _review_guidance}] if _review_guidance else [])
     _review_messages.append({"role": "user", "content": prompt})
     prompt_blocks_note(prompt, _s3_blocks, mark)                              # [s3-blocks]
+    # [s3-blocks] the operator's wording examples ride as the system message:
+    # a node too (review_guidance), decided beside this prompt's own blocks
+    # and noted with them under the digest of the words sent
+    if _review_guidance:
+        _rg_text, _rg_blocks = prompt_blocks_resolve(_pb("review_guidance", _review_guidance), mark)
+        if _rg_blocks:
+            _review_messages = ([{"role": "system", "content": _rg_text}] if _rg_text.strip() else []) \
+                + [_m for _m in _review_messages if _m.get("role") != "system"]
+            prompt_blocks_note(prompt, list(_s3_blocks or []) + list(_rg_blocks), mark)
     _learning_wire = _CRYSTAL_LEARNING_WIRE.get()
     if _learning_wire is not None:
         _learning_wire["model"] = str(settings["model"])
@@ -119569,7 +119966,7 @@ def _swath_deal(text: Any, seats: list[str] | None = None,
     if lead and lead in pool:
         at = pool.index(lead)
     else:
-        at = random.randrange(len(pool))
+        at = _S3Dice("speakbox.deal_lead", "which seat reads the first piece of a dealt passage").pick("deal", pool)   # [s3-dice-door]
     rows: list[list[str]] = []
     for piece in pieces:
         rows.append([pool[at % len(pool)], piece])
@@ -146874,7 +147271,8 @@ async def api_director_script_reseed(sid: str,
             continue
         # Somewhere inside the round, never before the first turn or after
         # the last: the open and the close are the round's own job.
-        at = random.randint(1, max(1, len(turns) - 1))
+        _at_span = max(1, len(turns) - 1)   # [s3-dice-door] was randint(1, _at_span)
+        at = min(_at_span, 1 + int(s3_roll("director.reseed_at", "where in the script a reseeded passage is dealt in") * _at_span))   # [s3-dice-door]
         turns[at:at] = [[m, p] for m, p in dealt]
         added += len(dealt)
         files.append(str(drawn.get("file") or ""))
@@ -148526,14 +148924,15 @@ async def dj_banter_api(
         seed, angle, count = {}, "", 8  # System 3 deals the format and length.
         form = "System 3 roulette"
     else:
-        seed = await speakbox_quote(most=random.randint(2, 6),
-                                    cap=random.randint(240, 520))
+        seed = await speakbox_quote(   # [s3-dice-door]
+            most=2 + min(4, int(s3_roll("button.banter_most", "how many lines of the speakbox a pushed banter round is handed") * 5)),   # [s3-dice-door]
+            cap=240 + min(280, int(s3_roll("button.banter_cap", "how long the passage for a pushed banter round may run") * 281)))   # [s3-dice-door]
         form = unrepeated(list(SUSPENSE_FORMATS), "button-format")
         angle = form + (
             " Somewhere inside it, one of you delivers this, word for word, "
             f"with total conviction, as though it proves everything: "
             f"\"{seed['text']}\"" if seed else "")
-        count = random.randint(7, 14)
+        count = 7 + min(7, int(s3_roll("button.banter_lines", "how many lines a pushed banter round runs") * 8))   # [s3-dice-door]
 
     async def _round() -> None:
         try:
@@ -148611,7 +149010,7 @@ async def dj_converse_api(
     async def _round() -> None:
         try:
             await dj_banter(_RADIO.get("now"), angle=angle,
-                            lines=random.randint(6, 12))
+                            lines=6 + min(6, int(s3_roll("button.converse_lines", "how many lines a typed conversation starter runs") * 7)))   # [s3-dice-door]
         except Exception as exc:
             pipeline_log("drop", f"converse round died: {exc}"[:200])
 
@@ -156077,7 +156476,7 @@ async def dj_dice_api(
         readers.append("D")
     if dj["drop_voice"]:
         readers.append("drop")
-    first = random.choice(readers)
+    first = s3_choice("dice.reader", readers, "who reads the rolled passage as a monologue (#244, #315)", tabled=False)   # [s3-dice-door]
     _TALK_CUT[0] += 1                   # the stage is taken, mid-line if need be
     _TALK_CUT_OP[0] = time.time()   # [cut-switches] the operator asked
     if first == "drop":
@@ -157341,7 +157740,7 @@ async def _replay_volley(line: str, who: str) -> None:
         await asyncio.sleep(banter_gap(dj_settings()["overlap"]))
         reply = await dj_speak("reply", _RADIO.get("now"), extra=line,
                                who=other, by_hand=True)
-        if reply and random.random() < 0.5:
+        if reply and s3_chance("replay.last_word", 0.5, "the first speaker gets the last word on a replayed line (#266)"):   # [s3-dice-door]
             await asyncio.sleep(banter_gap(dj_settings()["overlap"]))
             await dj_speak("reply", _RADIO.get("now"), extra=reply,
                            who=who, by_hand=True)
@@ -165511,8 +165910,14 @@ def sfx_db_pick_row(video: bool = True,
     return got
 
 
-def sfx_db_pick_short_video(max_seconds: float) -> tuple[Path, float] | None:
-    """Draw an unspent short video, balancing folders before clips."""
+def sfx_db_pick_short_video(max_seconds: float,
+                            rolled: dict | None = None) -> tuple[Path, float] | None:
+    """Draw an unspent short video, balancing folders before clips.
+
+    [s3-sfx-roll] Handed a `rolled` dict (the cadence, under System 3), both
+    draws are System 3's rolls - the folder (the family), then the clip in
+    it, each at even odds as the station's own - and what they landed on is
+    written into it ("category", "clip") for the line the clip makes."""
     try:
         con = sfx_db_reader()
         ceiling = max(0.5, min(12.0, float(max_seconds)))
@@ -165528,11 +165933,31 @@ def sfx_db_pick_short_video(max_seconds: float) -> tuple[Path, float] | None:
             return None
         recent = set(sfx_video_recent_folders())
         fresh = [row for row in folders if str(row[0] or "") not in recent]
-        folder, count = random.choice(fresh or folders)
+        if rolled is None:
+            _fl = fresh or folders   # [s3-dice-door]
+            folder, count = _fl[_S3Dice("sfxtv.short_folder", "which folder a short SFX video comes from (unspent folders first)").pick(   # [s3-dice-door]
+                "folder", [str(r[0] or "") for r in _fl])]   # [s3-dice-door]
+        else:                                                               # [s3-sfx-roll]
+            _fams = fresh or folders
+            _k, rolled["category"] = _s3_sfx_roll(
+                "sfx.category", [str(r[0] or "") for r in _fams], [1.0] * len(_fams),
+                "which effect family the board reaches into (the clip book)")
+            folder, count = _fams[_k]
         where += " AND folder = ?"
         args += (folder,)
+        if rolled is not None:                                              # [s3-sfx-roll]
+            # the whole family is the wheel (one indexed read, ~18k names in
+            # the biggest today), so the roll lands on a name, not an offset
+            rows = con.execute("SELECT path, seconds FROM clips WHERE " + where, args).fetchall()
+            if not rows:
+                return None
+            _k, rolled["clip"] = _s3_sfx_roll(
+                "sfx.clip", [str(r[0]).rsplit("/", 1)[-1].rsplit(".", 1)[0] for r in rows],
+                [1.0] * len(rows), "which clip in " + str(folder),
+                media=lambda k: _sfx_roll_media(Path(str(rows[k][0]))))
+            return Path(str(rows[_k][0])), float(rows[_k][1])
         row = con.execute("SELECT path, seconds FROM clips WHERE " + where +
-                          " LIMIT 1 OFFSET ?", args + (random.randrange(int(count)),)).fetchone()
+                          " LIMIT 1 OFFSET ?", args + (min(int(count) - 1, int(s3_roll("sfxtv.short_clip", "which clip in that folder") * int(count))),)).fetchone()   # [s3-dice-door]
         return (Path(str(row[0])), float(row[1])) if row else None
     except Exception:  # noqa: BLE001
         return None
@@ -165582,7 +166007,7 @@ def sfx_db_pick_rotation_row(video: bool = True) -> tuple[Path, float] | None:
                 row = con.execute(
                     "SELECT path, seconds FROM clips WHERE " + where
                     + " LIMIT 1 OFFSET ?",
-                    args + (random.randrange(count),)).fetchone()
+                    args + (min(count - 1, int(s3_roll("sfxtv.deck_clip", "which unspent clip of the video deck comes next") * count)),)).fetchone()   # [s3-dice-door]
                 if row is None:
                     continue
                 with _SFX_VIDEO_ROTATION_LOCK:
@@ -165727,7 +166152,7 @@ def _sfx_db_pick_any(video: bool = True,
                     break                       # the next window, if any
                 row = con.execute(
                     "SELECT path, seconds FROM clips WHERE " + where
-                    + " LIMIT 1 OFFSET ?", args + (random.randrange(count),)
+                    + " LIMIT 1 OFFSET ?", args + (min(count - 1, int(s3_roll("sfxtv.any_clip", "which clip out of the SFX book (the length dial's window)") * count)),)   # [s3-dice-door]
                 ).fetchone()
                 if row is None:
                     return None
@@ -167179,11 +167604,18 @@ def sfx_match_sting_pick(after: str = "", want_video: Any = None,
     # sized it and #1225 made it survive a restart; a matcher with a
     # rotation of its own would be a fifth road fighting those four.
     got = unrepeated(survivors, "sting",
-                     keep=sting_keep(len(set(survivors))))         # #1223
+                     keep=sting_keep(len(set(survivors))),         # #1223
+                     director=_S3ClipDice("sfx.match", "which of the clips matched to the line plays "
+                                          "(the tied peers over the floor)"))   # [s3-sfx-roll]
     if not got:
         _SFX_MATCH["fell_back"] = int(_SFX_MATCH.get("fell_back") or 0) + 1
         return None
     why, score = why_by_path.get(got, ("", 0.0))
+    # [s3-sfx-roll] the matcher's score chose the peers, not a roll; which
+    # of them plays was System 3's - kept for the line the clip makes
+    _sfx_roll_note(got, "match", {"label": Path(got).parent.name, "dice": None, "of": None,
+                                  "by": "the matcher's score (#1251)"},
+                   _s3_sfx_rolled("sfx.match", Path(got).stem), 1)
     _SFX_MATCH_LAST.update({"path": got, "why": why, "score": score,
                             "at": time.time(), "cands": len(cands),
                             "tied": len(tied), "eligible": len(survivors)})
@@ -180386,10 +180818,19 @@ def _paper_seed_draw(n: int) -> list[dict[str, Any]]:
     """Bounded random local passages; no model or exhausted gem shelf wait."""
     mind = mind_id()
     files = list(speakbox_files(mind))
-    random.shuffle(files)
     seen = _PAPER_PRESS.setdefault("seed_hashes", set())
     used_files = _PAPER_PRESS.setdefault("seed_files", set())
-    files.sort(key=lambda path: path.name in used_files)
+    # [s3-dice-door] Was: shuffle, then the unprinted first. The loop below reads
+    # at most max(12, 3n) documents, so System 3 draws exactly those, in order -
+    # unprinted first, then printed - and the unread rest follows as it lies.
+    _read = max(12, n * 3)   # [s3-dice-door]
+    _new = [p for p in files if p.name not in used_files]   # [s3-dice-door]
+    _old = [p for p in files if p.name in used_files]   # [s3-dice-door]
+    _a = s3_sample("paper.seed_docs", _new, min(len(_new), _read),   # [s3-dice-door]
+                   "which documents the Gazette's local passages are drawn from", tabled=False)   # [s3-dice-door]
+    _b = s3_sample("paper.seed_docs_again", _old, min(len(_old), _read - len(_a)),   # [s3-dice-door]
+                   "which already-printed documents the Gazette reads again", tabled=False)   # [s3-dice-door]
+    files = _a + [p for p in _new if p not in _a] + _b + [p for p in _old if p not in _b]   # [s3-dice-door]
     out: list[dict[str, Any]] = []
     candidates = files * max(1, (n + max(1, len(files)) - 1) // max(1, len(files)))
     for path in candidates[:max(12, n * 3)]:
@@ -180398,7 +180839,8 @@ def _paper_seed_draw(n: int) -> list[dict[str, Any]]:
             if len(words) < 12:
                 continue
             for _ in range(4):
-                start = random.randrange(max(1, len(words) - 55 + 1))
+                _starts = max(1, len(words) - 55 + 1)   # [s3-dice-door] was randrange(_starts)
+                start = min(_starts - 1, int(s3_roll("paper.seed_start", "where in the document a Gazette passage starts") * _starts))   # [s3-dice-door]
                 text = " ".join(words[start:start + 55])[:400]
                 sig = hashlib.sha256(text.encode()).hexdigest()[:20]
                 if sig not in seen:
@@ -192773,8 +193215,8 @@ async def pine_submit(
     # Speak "your reply has been submitted" (customizable; silent w/o HA_TOKEN).
     try:
         pc = load_settings()["pine_chat"]
-        phrase = random.choice(
-            pc.get("submit_phrases") or [pc["submit_phrase"]])
+        phrase = s3_choice("pine.submit_phrase", pc.get("submit_phrases") or [pc["submit_phrase"]],   # [s3-dice-door]
+                           "which acknowledgement is spoken when a request is submitted", tabled=False)   # [s3-dice-door]
         if phrase and _ha_creds()[0]:
             # Speak back what was actually asked, not just a fixed chime.
             fire_and_forget_speech(pine_speak_ack(text, phrase))
@@ -192884,8 +193326,8 @@ async def pine_resolve(
         pass
     try:
         pc = load_settings()["pine_chat"]
-        phrase = random.choice(
-            pc.get("complete_phrases") or [pc["complete_phrase"]])
+        phrase = s3_choice("pine.complete_phrase", pc.get("complete_phrases") or [pc["complete_phrase"]],   # [s3-dice-door]
+                           "which acknowledgement is spoken when a request is resolved", tabled=False)   # [s3-dice-door]
         if phrase and _ha_creds()[0]:
             fire_and_forget_speech(
                 speak(phrase, event="complete"))

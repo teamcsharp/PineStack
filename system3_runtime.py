@@ -65,6 +65,12 @@ ABANDON_SWEEP = 300.0
 # prize, their state) and then asks System 3 to plan the round; the plan takes
 # these in as STATION events, so the round shows every roll that shaped it.
 _S3_ROLLS = contextvars.ContextVar("system3_station_rolls", default=None)
+# [s3-sfx-roll] the last roll recorded on this thread, by key: a road reads
+# back the dice it has just rolled (the board's clip carries its d100 to the
+# line it makes). Per thread and not on the roll buffer: the pick and the
+# read are one call apart on the same thread, while the buffer is the task's
+# and a plan on it absorbs (and empties) it.
+_S3_LAST = threading.local()
 # [s3-blocks] the System 3 handle of the round (or line) whose words are being
 # written on this task right now - the station sets it around its writer call,
 # so the prompt's block decisions are recorded on that conversation
@@ -375,6 +381,10 @@ class System3Runtime:
         buf = self._roll_buffer()
         buf["rolls"] = (buf["rolls"] + [rec])[-ROLLS_KEPT:]
         self.station_rolls.append(rec)
+        by_key = getattr(_S3_LAST, "by_key", None)                          # [s3-sfx-roll]
+        if by_key is None:
+            by_key = _S3_LAST.by_key = {}
+        by_key[str(rec.get("key") or "")] = rec
         self.observe_later("station:" + time.strftime("%Y%m%d%H", time.gmtime()), "STATION", rec)
 
     def chance(self, key, odds, label="", dial=""):
@@ -431,12 +441,15 @@ class System3Runtime:
             self.fail("station pool", exc)
             return None
 
-    def pick(self, key, candidates, label="", weights=None):
+    def pick(self, key, candidates, label="", weights=None, media=None):
         """[s3-dice-door] Which of `candidates` (the options still eligible - a
         no-repeat ring may have held some back): a weighted draw, the weights
         the desk gave those options in POOLS1 - or, for a list the station
         keeps its own weights for (the ending shelf, the behaviour deck), the
-        `weights` it hands in. Returns the index, or None."""
+        `weights` it hands in. Returns the index, or None.
+        [s3-sfx-roll] `media` - a list by candidate, or a callable of the
+        index - is the picture of what it lands on ({"poster", "thumb", ...});
+        only the picked one is asked for and it rides the record."""
         if not self._dice_live():
             return None
         try:
@@ -456,9 +469,19 @@ class System3Runtime:
             d = self._roll_buffer()["stream"].next("PICK:" + key)
             k = system3.pick_index(w, d["u"])
             k = k if 0 <= k < len(cands) else 0
-            self._record_roll({"kind": "pick", "key": key, "label": str(cat.get("label") or label or key)[:90],
-                               "of": len(cands), "index": k + 1, "picked": cands[k][:160], "u": d["u"], "dice": d["dice"],
-                               "candidates": [c[:80] for c in cands[:12]]})
+            rec = {"kind": "pick", "key": key, "label": str(cat.get("label") or label or key)[:90],
+                   "of": len(cands), "index": k + 1, "picked": cands[k][:160], "u": d["u"], "dice": d["dice"],
+                   "candidates": [c[:80] for c in cands[:12]]}
+            if media is not None:                                                # [s3-sfx-roll]
+                try:
+                    m = media(k) if callable(media) else list(media)[k]
+                except Exception:  # noqa: BLE001 - a picture never costs the roll
+                    m = None
+                if isinstance(m, dict) and m:
+                    rec["media"] = {str(a): b for a, b in m.items()}
+                    if m.get("poster"):
+                        rec["poster"] = str(m["poster"])
+            self._record_roll(rec)
             return k
         except Exception as exc:  # noqa: BLE001
             self.fail("station pick", exc)
@@ -478,6 +501,13 @@ class System3Runtime:
         except Exception as exc:  # noqa: BLE001
             self.fail("station roll", exc)
             return None
+
+    def last_roll(self, key):
+        """[s3-sfx-roll] The roll this thread last recorded under `key` (a copy),
+        or None. The road that rolled reads its own dice back - never re-derives
+        them - to carry them to the line it makes."""
+        rec = (getattr(_S3_LAST, "by_key", None) or {}).get(str(key)[:60])
+        return dict(rec) if isinstance(rec, dict) else None
 
     def _absorb_rolls(self, conv):
         """The rolls the road made before asking for this round become its first
@@ -508,10 +538,14 @@ class System3Runtime:
                                 "why": []} for i, c in enumerate(r.get("candidates") or [])]}]
                 sel = {"id": str(r.get("index")), "label": "%s: %s" % (r["label"], str(r.get("picked") or "")[:90]),
                        "key": r["key"], "index": r.get("index"), "of": r.get("of")}
-            ev = system3._event(conv, ctx0, "STATION", stages, sel, before,
-                                meta={"key": r["key"], "road_roll": True,
-                                      "why": "the station road rolled this before the round was planned; "
-                                             "its odds and options are on the desk (STATION1 / POOLS1)"},
+            meta = {"key": r["key"], "road_roll": True,
+                    "why": "the station road rolled this before the round was planned; "
+                           "its odds and options are on the desk (STATION1 / POOLS1)"}
+            if r.get("media"):                                                   # [s3-sfx-roll]
+                meta["media"] = r["media"]
+            if r.get("poster"):
+                meta["poster"] = r["poster"]
+            ev = system3._event(conv, ctx0, "STATION", stages, sel, before, meta=meta,
                                 rng={"u": r["u"], "dice": r["dice"], "label": r["key"]})
             ev["state_after"] = before
         return len(rolls)
@@ -878,9 +912,9 @@ class System3Runtime:
             dims = (weather.get("seats") or {}).get(role)
             if isinstance(dims, dict):
                 moods[seat] = dims
-        seed_text = str(ctx.get("seed_text") or "")
-        angle = str(ctx.get("angle") or "")
-        news = str(ctx.get("news_titles") or "")
+        seed_text = _unmark(ctx.get("seed_text"))                               # [s3-unmark]
+        angle = _unmark(ctx.get("angle"))
+        news = _unmark(ctx.get("news_titles"))
         own = bool(ctx.get("own_material"))
         category = ("speakerbox" if seed_text else "internet_news" if news else
                     "own_material" if own else "angle" if angle else "free")
@@ -901,11 +935,14 @@ class System3Runtime:
         except Exception:  # noqa: BLE001
             turn_seconds = 0.0
         words_per_turn = float(budget.get("words_high") or (85 if ctx.get("bank") else 70))
+        # [s3-material] what the manager/gallery/research rows would bring up
+        material = self._cts_material(road, ctx, topic)
         availability = {
             "speakbox": not own and road == "banter",
             "news": bool(news),
             "gazette": bool(ctx.get("gazette")),
-            "manager": False, "gallery": False, "research": False,
+            "manager": bool(material.get("manager")), "gallery": bool(material.get("gallery")),
+            "research": bool(material.get("research")),
         }
         # [rng-topics] the operator's topics board, for the TOPIC roll
         topic_bank = self._topic_bank(ctx)
@@ -928,6 +965,7 @@ class System3Runtime:
                         "keywords": keywords, "angle": angle[:300],
                         "exchange": _exchange_of(ctx)},
             "availability": availability,
+            "material": material,                                             # [s3-material]
             "speakerbox_rates": {"full": float(dj.get("speakbox_full_swath_rate") or 0),
                                  "prepend": float(dj.get("speakbox_prepend_rate") or 0),
                                  "append": float(dj.get("speakbox_append_rate") or 0)},
@@ -1104,6 +1142,39 @@ class System3Runtime:
             self.metrics["abandoned"] += filed
         return filed
 
+    def pinned_source(self, road="banter"):
+        """[s3-source] The speakbox document the operator pinned on this road's
+        initiator node (its first step's `source`, else the structure's own),
+        or "" - nothing pinned, System 3 not active on the road, not loaded."""
+        try:
+            if not self.ready or system3.road_mode(self.settings, road) != "active":
+                return ""
+            config = self.config if isinstance(self.config, dict) else {}
+            st = (config.get("structure") or {}) if road == "banter" else (system3.road_structure(config, road) or {})
+            first = ((st.get("steps") or st.get("legs") or [{}])[0]) or {}
+            return " ".join(str(first.get("source") or st.get("source") or "").split())[:200]
+        except Exception as exc:  # noqa: BLE001
+            self.fail("pinned source", exc)
+            return ""
+
+    def _cts_material(self, road, ctx, topic):
+        """[s3-material] The host's material for the rows that name it: each a
+        {"text", "label", "ref"}. Nothing (and those rows stay ineligible) on a
+        host without the hook, or when it fails."""
+        try:
+            got = self.host.system3_cts_material(road, ctx, topic)
+        except AttributeError:
+            return {}
+        except Exception as exc:  # noqa: BLE001
+            self.fail("cts material", exc)
+            return {}
+        out = {}
+        for kind, val in (got or {}).items():
+            if isinstance(val, dict) and str(val.get("text") or "").strip():
+                out[str(kind)] = {"text": str(val["text"])[:1200], "label": str(val.get("label") or kind)[:80],
+                                  "ref": str(val.get("ref") or "")[:160]}
+        return out
+
     def _call_of(self, ctx):
         """[s3-calls] Who is ringing (first name), who else is in the booth,
         the call's own passage (the one call_speakerbox_report looks for),
@@ -1232,7 +1303,12 @@ class System3Runtime:
             handle = Handle(self, conv, config, mode == "active")
             handle.bank = bool(ctx.get("bank"))
             call = inputs.get("call") or {}
-            if road == "caller" and call.get("first") and not call.get("story"):
+            # [s3-story] a story call-back the station hands its own protocol keeps
+            # it (annotated); one handed none - an EMPTY sheet, which is what the
+            # station hands a sequel today - is built from System 3's call legs
+            _story_protocol = bool(call.get("story")) and bool(
+                re.search(r"(?m)^\s*\d+\s+[ABCDE]\s+[-–—]", ctx.get("call_sheet") or ""))
+            if road == "caller" and call.get("first") and not _story_protocol:
                 # [s3-calls] the call is built by System 3's own call structure
                 system3.plan_call(conv, config, inputs)
                 handle.sheet = system3.render_call_sheet(conv) if handle.active else ""
@@ -2008,11 +2084,17 @@ class System3Runtime:
                        "system3" if direction.get("extra") and not due_cadence else
                        "both" if due_cadence else "none",
                 "decided_by": direction.get("decided_by"), "intent": direction.get("intent"),
-                "played": [{"clip": Path(str(a.get("path") or "")).name,
-                            "sample_id": a.get("sfx_sample_id") or a.get("sfx_video_id"),
-                            "seconds": a.get("seconds"), "why": a.get("sfx_match_why") or ""} for a in board],
+                "played": [dict({"clip": Path(str(a.get("path") or "")).name,
+                                 "sample_id": a.get("sfx_sample_id") or a.get("sfx_video_id"),
+                                 "seconds": a.get("seconds"), "why": a.get("sfx_match_why") or ""},
+                                **{k: a[k] for k in ("sfx_roll", "poster") if a.get(k)})   # [s3-sfx-roll]
+                           for a in board],
                 "sfx_guy": [{"text": a.get("text"), "voice": a.get("voice")} for a in guy],
-                "matcher": stats, "chosen_by": "the station's matcher, bans, weights and rotation"})
+                "matcher": stats,
+                "chosen_by": ("System 3's rolls - the family, then the clip - among the survivors of the "
+                              "station's matcher, bans, weights and rotation"
+                              if any(a.get("sfx_roll") for a in board)                 # [s3-sfx-roll]
+                              else "the station's matcher, bans, weights and rotation")})
         except Exception as exc:  # noqa: BLE001
             self.fail("sfx observe", exc)
 
@@ -2032,10 +2114,11 @@ class System3Runtime:
                 cid = s3.get("conversation_id")
                 if not cid or not row.get("line_id"):
                     continue
-                links.setdefault(cid, []).append({
+                links.setdefault(cid, []).append(dict({
                     "line_id": str(row["line_id"]), "conversation_id": cid, "turn_id": s3.get("turn_id") or None,
                     "block": int(block), "ord": ord_, "sid": str(sid or ""), "who": str(row.get("who") or ""),
-                    "text": str(row.get("text") or ""), "at": time.time()})
+                    "text": str(row.get("text") or ""), "at": time.time()},
+                    **{k: s3[k] for k in ("sfx_roll", "poster") if s3.get(k)}))        # [s3-sfx-roll]
             if not links:
                 return
             for cid, lines in links.items():
@@ -2044,10 +2127,14 @@ class System3Runtime:
 
                 def job(lines=lines, cid=cid):
                     self.store.add_lines(lines)
-                    self.store.add_observation(cid, "COMMIT", {
+                    # [s3-sfx-roll] the lines table keeps words and order; a board
+                    # line's rolls and poster ride the COMMIT, keyed by line id
+                    media = {x["line_id"]: {k: x[k] for k in ("sfx_roll", "poster") if x.get(k)}
+                             for x in lines if x.get("sfx_roll") or x.get("poster")}
+                    self.store.add_observation(cid, "COMMIT", dict({
                         "stage": "script-ledger", "block": int(block), "sid": str(sid or ""),
                         "round": str(round_kind or ""), "lines": [x["line_id"] for x in lines],
-                        "turns": [x["turn_id"] for x in lines]})
+                        "turns": [x["turn_id"] for x in lines]}, **({"media": media} if media else {})))
                     # [s3-carry] the round is on the air in this order: what it leaves
                     # behind is the next round's start
                     conv = self.recent.get(cid) or self.store.conversation(cid, with_events=False)
@@ -2059,6 +2146,22 @@ class System3Runtime:
                 _STORE_POOL.submit(job)
         except Exception as exc:  # noqa: BLE001
             self.fail("ledger link", exc)
+
+    @staticmethod
+    def line_media(conv):
+        """[s3-sfx-roll] The conversation's lines with each board line's rolls
+        and poster put back on it (from the COMMIT observations)."""
+        if not isinstance(conv, dict) or not conv.get("lines"):
+            return conv
+        media = {}
+        for o in conv.get("observations_air") or []:
+            if o.get("family") == "COMMIT" and isinstance(o.get("media"), dict):
+                media.update(o["media"])
+        for ln in conv["lines"]:
+            got = media.get(ln.get("line_id"))
+            if isinstance(got, dict):
+                ln.update({k: got[k] for k in ("sfx_roll", "poster") if got.get(k)})
+        return conv
 
     # --- the listener's feed ------------------------------------------------------
     PUBLIC_TTL = 20.0
@@ -2382,6 +2485,15 @@ class System3Runtime:
         return system3.normalise_settings(merged)
 
 
+# [s3-unmark] the station's prompt-block markers (app.py _pb): a block's name
+# between U+E000 and U+E001, and U+E002 closing it
+_MARKS = re.compile("\ue000[a-z0-9_]{1,40}\ue001|\ue002")
+
+
+def _unmark(text):
+    return _MARKS.sub("", str(text or ""))
+
+
 class _Host:
     def __init__(self, namespace):
         object.__setattr__(self, "namespace", namespace)
@@ -2435,10 +2547,13 @@ def install(app, namespace):
     namespace["system3_observe_ledger"] = rt.observe_ledger
     namespace["system3_withhold"] = rt.withhold                        # [s3-withhold]
     namespace["system3_favorite"] = rt.favorite_set                    # [s3-cast]
+    namespace["system3_pinned_source"] = rt.pinned_source              # [s3-source]
     namespace["system3_chance"] = rt.chance                            # [s3-dice-door]
     namespace["system3_pool"] = rt.pool
     namespace["system3_pick"] = rt.pick
     namespace["system3_roll"] = rt.roll
+    namespace["system3_last_roll"] = rt.last_roll                      # [s3-sfx-roll]
+    namespace["system3_dice_live"] = rt._dice_live
     namespace["system3_blocks"] = rt.blocks                            # [s3-blocks]
     namespace["system3_note_prompt"] = rt.note_prompt
     namespace["system3_writing_for"] = _S3_WRITE
@@ -2633,7 +2748,8 @@ def install(app, namespace):
                     raise HTTPException(400, "unknown family %r" % d.get("family"))
         config = copy.deepcopy(rt.config)
         structure = dict(config["structure"])
-        structure.update({k: raw[k] for k in ("steps", "closing", "handoff", "label", "initiator") if k in raw})   # [s3-flow]
+        structure.update({k: raw[k] for k in ("steps", "closing", "handoff", "label", "initiator", "source")   # [s3-flow] [s3-source]
+                          if k in raw})
         structure["version"] = int(structure.get("version") or 1) + 1
         config["structure"] = structure
         return {"hash": await save_config(config, "structure v%d" % structure["version"]),
@@ -2728,7 +2844,7 @@ def install(app, namespace):
             got = json.loads(json.dumps(live, default=str))
             got["observations_air"], got["lines"] = [], []
         body = await asyncio.get_running_loop().run_in_executor(
-            _READ_POOL, lambda: json.dumps(got, default=str))
+            _READ_POOL, lambda: json.dumps(rt.line_media(got), default=str))   # [s3-sfx-roll]
         return Response(content=body, media_type="application/json")
 
     @app.get("/api/system3/events")
