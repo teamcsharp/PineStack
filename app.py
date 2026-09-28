@@ -130566,6 +130566,13 @@ async def dj_next_api(
     authorization: str | None = Header(default=None),
 ) -> dict[str, Any]:
     require_auth(authorization)
+    # [pltrack] during a live set, next = a new track OF the set (a new cut
+    # pair, a new cover), not a skip off the air.
+    _pl_next = getattr(globals().get("pinelive"), "next_track_if_live", None)
+    if callable(_pl_next):
+        _got = await asyncio.to_thread(_pl_next)
+        if _got:
+            return dj_state()
     # NOW means now (#332, #394): the cut takes the floor from a running
     # round too, not just from the record — and the NEXT record starts
     # immediately, no research, no intro write, no segments in the way.

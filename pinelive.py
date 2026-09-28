@@ -532,6 +532,10 @@ class Recorder:
         self.q.put(("end", done))
         done.wait(20.0)
 
+    def next_track(self) -> None:
+        """[pltrack] Close the running cut pair now; the next frame opens a new one."""
+        self.q.put(("next",))
+
     def set_cut_seconds(self, seconds: float) -> None:
         self.q.put(("cut_seconds", seconds))
 
@@ -553,6 +557,9 @@ class Recorder:
                 if item and item[0] == "end":
                     self._close_pair(final=True)
                     item[1].set()
+                    continue
+                if item and item[0] == "next":               # [pltrack] cut here
+                    self._close_pair(final=False)
                     continue
                 if item and item[0] == "cut_seconds":
                     self.frames_per_cut = max(10, int(round(float(item[1]) * 1000 / FRAME_MS)))
@@ -1377,6 +1384,21 @@ class PineLive:
             event_row=ev)
         return {"ok": True, "code": "", "say": "MX Live ended - the music is back"}
 
+    def next_track(self) -> dict[str, Any]:
+        """[pltrack] The operator's next-track during a set: the recording
+        cuts here into a new pair and the set's cover re-rolls."""
+        with self.lock:
+            if not self.armed() or self.event is None:
+                return self.refuse("not_live", "no set is running")
+            n = int(self.event.get("track") or 1) + 1
+            self.event["track"] = n
+            rehearse = bool(self.event.get("rehearse"))
+        if self.recorder is not None and not rehearse:
+            self.recorder.next_track()
+        self._save_event()
+        self.note("track", "track %d begins - a new cut pair and a new cover" % n)
+        return {"ok": True, "code": "", "say": "track %d - a new recording and a new cover" % n}
+
     def test(self, body: dict[str, Any]) -> dict[str, Any]:
         if self.armed():
             return self.refuse("already_live", "MX Live is running - the test is for before the set")
@@ -1700,7 +1722,8 @@ class PineLive:
         last = rec.cuts[-1] if rec is not None and rec.cuts else None
         folder = str((self.event or {}).get("folder") or "")
         lid = self.live_id()
-        art = ("/music/%s/art?t=%s" % (lid, self.sign(lid))) if lid else ""
+        art = ("/music/%s/art?t=%s&n=%d" % (lid, self.sign(lid),                  # [pltrack]
+                                             int((self.event or {}).get("track") or 1))) if lid else ""
         radio = _app("_RADIO") or {}
         pl_state = _app("pinelink_state")
         cam_live = False
@@ -1802,15 +1825,15 @@ class PineLive:
             return {}
         show = (not away) or bool(self.settings.get("tailscale_video"))
         lid = self.live_id()
-        art = ("/music/%s/art?t=%s" % (lid, self.sign(lid))) if lid else ""
+        art = ("/music/%s/art?t=%s&n=%d" % (lid, self.sign(lid),                  # [pltrack]
+                                             int((self.event or {}).get("track") or 1))) if lid else ""
         out: dict[str, Any] = {"pinelive": {
             "phase": self.phase, "event": EVENT_NAME,
             "picture": {"kind": (self.picture.kind if show else "none"),
                         "art": art if show else ""}}}
         if (track or {}).get("pinelive"):
             out["live"] = True
-            if not show:
-                out["art"] = ""
+            out["art"] = art if show else ""            # [pltrack] the cover follows the track
         return out
 
 
@@ -2087,6 +2110,14 @@ def on_change(fn: Callable[[dict, dict], Any]) -> None:
         PL.listeners.append(fn)
 
 
+def next_track_if_live() -> dict[str, Any] | None:
+    """[pltrack] /api/dj/next while a set holds the air: a new track OF the
+    set, not a skip. None = not live, the button skips as it always has."""
+    if not PL.armed() or PL.phase != "live":
+        return None
+    return PL.next_track()
+
+
 def live_track() -> dict[str, Any] | None:
     return PL.live_track()
 
@@ -2150,6 +2181,7 @@ async def music_response(track_id: str, request: Any) -> Any:
 PLART_DIR = Path(os.environ.get("PINELIVE_ART_DIR")
                  or "/samples/PineBoxRecordings/Live Events/Album Art")
 _PLART_MEMO: dict[str, tuple[str, bytes]] = {}
+_PLART_LAST: list[Any] = [None]          # [pltrack] the cover just shown
 
 
 def _plart_cover(event_key: str) -> tuple[str, bytes] | None:
@@ -2165,7 +2197,9 @@ def _plart_cover(event_key: str) -> tuple[str, bytes] | None:
     if not files:
         return None
     import random as _random
-    pick = _random.Random(event_key).choice(files)
+    pool = [p for p in files if p != _PLART_LAST[0]] or files   # [pltrack] never the same twice
+    pick = _random.Random(event_key).choice(pool)
+    _PLART_LAST[0] = pick
     try:
         data = pick.read_bytes()
     except OSError:
@@ -2189,7 +2223,8 @@ async def art_response(track_id: str, request: Any) -> Any:
                         headers={"Cache-Control": "no-store"})
     # [plart] the set's cover: one image from the Album Art folder, picked at
     # random per event (seeded by its id, so it holds for the whole set).
-    cover = await asyncio.to_thread(_plart_cover, str(PL.event_id() or track_id))
+    cover = await asyncio.to_thread(_plart_cover, "%s:%d" % (                    # [pltrack]
+        PL.event_id() or track_id, int((PL.event or {}).get("track") or 1)))
     if cover:
         return Response(cover[1], media_type=cover[0],
                         headers={"Cache-Control": "no-store"})
