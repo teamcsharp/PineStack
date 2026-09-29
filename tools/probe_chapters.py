@@ -22,6 +22,13 @@ Per ROUND (banter, caller, news ...): A, B, C, D (bound turns), E, I.
 FRAGMENTS: every spoken row outside a passing chapter/round, by kind - the
 forced injectors (emergency_host continuity pairs, gold bars) are listed apart.
 SHELF: states; pending older than 30 min; expired/stale (recorded, never silent).
+IN FLIGHT: a chapter whose rows were handed to the page/box but are not all in the
+ledger yet (the ledger writes a row when it is HEARD; the page can run minutes
+behind) is reported INFLIGHT, not FAIL - when its shelf state is airing /
+published / partial, or its newest published row is under 10 minutes old.
+THROUGHPUT: shelf entries created in the window by state (aired, published,
+pending, superseded, expired, unheard), median source->aired seconds, and the
+forced fillers that carried the air meanwhile.
 Exit 0 when every chapter and round passes and no unforced fragment aired.
 """
 import collections
@@ -157,6 +164,17 @@ def main(argv):
     heard = {str(r.get("id")): float(r.get("air_at") or 0)
              for r in tail_jsonl(os.path.join(ROOT, "air_log.jsonl"), since - 600, "ts")
              if r.get("aired") == "stream"}
+    published = {}
+    for r in tail_jsonl(os.path.join(ROOT, "air_log.jsonl"), since - 600, "ts"):
+        if r.get("aired") in ("published", "box", "stream") and r.get("sid"):
+            published[str(r["sid"])] = max(published.get(str(r["sid"]), 0.0), float(r.get("ts") or 0))
+    try:
+        shelf = json.load(open(os.path.join(ROOT, "system3_chapter_shelf.json"), encoding="utf-8"))
+    except Exception:
+        shelf = {}
+    shelf_state = {str((e.get("stamp") or {}).get("conversation_id") or ""): str(e.get("state") or "")
+                   for e in shelf.values()}
+    inflight = collections.Counter()
     db = sqlite3.connect("file:" + os.path.join(ROOT, "system3.sqlite3") + "?mode=ro", uri=True)
     by_conv = collections.OrderedDict()
     loose = []
@@ -194,6 +212,14 @@ def main(argv):
         v = check(conv, rows, heard, ledger, chapter)
         kind = "chapter" if chapter else "round"
         ok = not v["fails"]
+        sid = next((str(r.get("sid")) for r in spoken if r.get("sid")), "")
+        if (chapter and not ok and (shelf_state.get(cid) in ("airing", "published", "partial")
+                                    or time.time() - published.get(sid, 0) < 600)):
+            inflight[road] += 1
+            if not quiet:
+                print("INFLIGHT chapter %-10s %s rows=%d of %d planned (shelf %s; rows are ledgered when heard)"
+                      % (road, cid, v["rows"], v["planned"], shelf_state.get(cid) or "?"))
+            continue
         tally[(kind, road, ok)] += 1
         state = (conv.get("chapter_state") or {}).get("state", "")
         if not ok:
@@ -210,13 +236,17 @@ def main(argv):
     print("\nSUMMARY")
     for (kind, road, ok), n in sorted(tally.items()):
         print("  %-7s %-11s %s x%d" % (kind, road, "PASS" if ok else "FAIL", n))
+    print("  in flight (handed over, not all heard yet): %s" % (dict(inflight) or "none"))
     print("  unforced fragments (spoken rows outside a chapter/round): %s" % (dict(fragments) or "none"))
     print("  forced injectors (operator's never-quiet / gold decisions): %s" % (dict(forced) or "none"))
-    try:
-        shelf = json.load(open(os.path.join(ROOT, "system3_chapter_shelf.json"), encoding="utf-8"))
-    except Exception:
-        shelf = {}
     states = collections.Counter(str(e.get("state")) for e in shelf.values())
+    made = [e for e in shelf.values() if float(e.get("created") or 0) >= since]
+    got = collections.Counter(str(e.get("state")) for e in made)
+    lag = sorted(float(e.get("aired_at") or e.get("updated") or 0) - float(e.get("created") or 0)
+                 for e in made if e.get("state") == "aired")
+    print("  THROUGHPUT since: %d exchange(s) - %s; median source->aired %s; fillers %d"
+          % (len(made), dict(got) or "none", ("%.0f s" % lag[len(lag) // 2]) if lag else "n/a",
+             sum(forced.values())))
     old = [k for k, e in shelf.items() if e.get("state") == "pending" and time.time() - float(e.get("created") or 0) > 1800]
     print("  prepared shelf: %s%s" % (dict(states) or "empty", ("; pending > 30 min: %s" % old[:6]) if old else ""))
     for k, e in list(shelf.items())[-8:]:

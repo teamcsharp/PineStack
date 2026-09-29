@@ -16,6 +16,7 @@ import asyncio
 import importlib.util
 import inspect
 import json
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -97,6 +98,9 @@ class Harness(unittest.TestCase):
         self.floor = {"held": 0, "takes": 0}
         self.radio = {"on": True, "voice_to": "here", "reply_to": "here", "chat": [], "now": None}
         self.renders = 0
+        self.heard = set()           # line ids with a heard receipt
+        self.repair_ok = True        # the repair writer answers properly
+        self.prompts = []
         patches = {
             "system3_line_chapter": self.chapter, "system3_line_chapter_state": self.chapter.state,
             "system3_direct_line": self.direct, "_banter_beats": self.beats,
@@ -111,7 +115,7 @@ class Harness(unittest.TestCase):
             "_clip_seconds_async": mock.AsyncMock(return_value=0.0), "_RENDER_BACKLOG": [],
             "render_backlog_save": lambda: None, "_RECENT_SPOKEN": [],
             "_S3_CHAPTER_SHELF": {}, "_S3_CHAPTER_STATE": {"loaded": True, "task": None},
-            "_s3_active": lambda: True,
+            "_s3_active": lambda: True, "ask_model": self.ask, "_PAGE_ACKED_LINES": self.heard,
         }
         for name, value in patches.items():
             p = mock.patch.object(app, name, value, create=True)
@@ -131,6 +135,13 @@ class Harness(unittest.TestCase):
         rows = [r.split(":", 1) for r in self.replies[:lines - 1]]
         body = ["%s:%s" % (seats[i + 1], t) for i, (_m, t) in enumerate(rows)]
         return "\n".join(["%s: %s" % (seats[0], " ".join(seed_text.split()))] + body)
+
+    async def ask(self, prompt, **kw):
+        """The writer's repair visit: one line per listed turn."""
+        self.prompts.append(prompt)
+        rows = re.findall(r"(?m)^(\d+)  ([ABCD])  - ", prompt.split("WRITE ONLY THESE NEXT TURNS:")[-1])
+        pool = GOOD if self.repair_ok else STOCK
+        return "\n".join("%s:%s" % (seat, pool[(int(n) - 2) % len(pool)].split(":", 1)[1]) for n, seat in rows)
 
     async def render(self, text, who, voice):
         self.renders += 1
@@ -163,12 +174,16 @@ class Harness(unittest.TestCase):
         st = kw.get("system3") or {}
         self.aired.append((kw.get("who"), kw.get("line"), kw.get("sid"), st.get("turn_id"),
                            st.get("chapter_turn"), bool(kw.get("clip"))))
+        lid = "L%03d" % len(self.aired)
+        self.radio["chat"].append({"id": lid, "who": kw.get("who"), "text": kw.get("line")})
+        self.heard.add(lid)                      # the listener hears it at once, unless a test says not
         return kw.get("line") or ""
 
 
 class ToolAndChecks(unittest.TestCase):
     def test_both_tools_are_applied(self):
         for name, target in (("system3_exchange_chain_patch", "app.py"),
+                             ("system3_exchange_chain2_patch", "app.py"),
                              ("system3_chain_runtime_patch", "system3_runtime.py")):
             mod = load_tool(name)
             text = (ROOT / target).read_text(encoding="utf-8")
@@ -183,10 +198,24 @@ class ToolAndChecks(unittest.TestCase):
         self.assertIn("direction", app._s3_chapter_reply_fault(
             ["This one, right here on the station."],
             "No, bro, that isn't gonna work. Skip's message with discouragement, reflecting the mood.", work))
-        # 129b7bfa t01/t04
-        self.assertEqual(app._s3_chapter_reply_fault([OPENER_AD], "I don't know if that's right.", work),
-                         "answers nothing that was said before it")
-        self.assertTrue(app._s3_chapter_reply_fault([OPENER_AD], "That's just how it is.", ""))
+        # 129b7bfa t01/t04: stock frames
+        self.assertIn("stock", app._s3_chapter_reply_fault([OPENER_AD], "I don't know if that's right.", work))
+        self.assertIn("stock", app._s3_chapter_reply_fault([OPENER_AD], "That's just how it is.", ""))
+        # 2026-09-29 03:00-03:40 shelf rejections, re-judged
+        act = ("Reacts to the line just aired. [Say it in discouragement, mildly; while doing it, tells them "
+               "flatly that no, bro, that isn't gonna work. Write Skip's message with discouragement, "
+               "reflecting the mood.]")
+        self.assertEqual(app._s3_chapter_reply_fault([OPENER_AD], "No, bro, that isn't gonna work.", act), "")
+        self.assertEqual(app._s3_chapter_reply_fault([OPENER_AD], "Are you sure about that?", work), "")
+        self.assertIn("direction", app._s3_chapter_reply_fault(
+            [OPENER_AD], "Well, it is fixed source material, Dill, it airs exactly as recorded.", work))
+        self.assertIn("too short", app._s3_chapter_reply_fault([OPENER_AD], "Right, there.", work))
+        self.assertIn("stock", app._s3_chapter_reply_fault(
+            [OPENER_AD], "Oh, well, I suppose it is what it is, just some noise in the booth.", work))
+        self.assertEqual(app._s3_chapter_reply_fault(
+            [OPENER_AD], "Skip, you would sell your own grandmother for less.", work, ["Skip"]), "")
+        self.assertIn("answers nothing", app._s3_chapter_reply_fault(
+            [OPENER_AD], "My uncle keeps pigeons on the roof of the old cinema downtown all summer.", work))
         self.assertEqual(app._s3_chapter_reply_fault(
             [OPENER_AD], "Ninety dollars for the harbour oil? That canvas is worth twice that.", work), "")
 
@@ -199,6 +228,7 @@ class ProducedSpot(Harness):
         (self.dir / "ads").mkdir()
         (self.dir / "ads" / "spot1.mp3").write_bytes(b"ID3")
         (self.dir / "ads" / "spot2.mp3").write_bytes(b"ID3")
+        (self.dir / "ads" / "spot3.mp3").write_bytes(b"ID3")
         self.published = []
         inner = app._air_produced_ad_floorless
         names = {n.id for n in ast.walk(ast.parse(inspect.getsource(inner))) if isinstance(n, ast.Name)}
@@ -211,7 +241,7 @@ class ProducedSpot(Harness):
                 p = mock.patch.object(app, name, cls(return_value=""))
                 p.start()
                 self.addCleanup(p.stop)
-        for name, value in {"PRODUCED_ADS_DIR": self.dir / "ads", "_PAGE_ACKED_LINES": set(),
+        for name, value in {"PRODUCED_ADS_DIR": self.dir / "ads", "_PAGE_ACKED_LINES": self.heard,
                             "_PAGE_DELIVERIES": {}, "_BOX_DOWN": {}, "_BOX_HOLD": [],
                             "_dj_speak_floorless": self.speak,
                             "_clip_seconds_async": mock.AsyncMock(return_value=166.0)}.items():
@@ -260,14 +290,17 @@ class ProducedSpot(Harness):
 
     def test_a_writer_that_does_not_answer_makes_it_wait_then_the_keeper_airs_it_whole(self):
         self.replies = list(STOCK)
+        self.repair_ok = False
         self.assertFalse(asyncio.run(app._air_produced_ad(self.spot())))
         self.assertEqual(self.aired, [])                                       # nothing aired, not dropped
         entry = app._S3_CHAPTER_SHELF["ad:ad1"]
         self.assertEqual(entry["state"], "pending")
-        self.assertIn("answers nothing", entry["why"])
+        self.assertIn("stock frame", entry["why"])
+        self.assertIn("YOUR LAST DRAFT FAILED: turn 2 is a stock frame", self.prompts[0])   # told why
         saved = json.loads((self.dir / "shelf.json").read_text())
         self.assertEqual(saved["ad:ad1"]["state"], "pending")                   # durable
         self.replies = list(GOOD)
+        self.repair_ok = True
         entry["next_try"] = 0
         asyncio.run(app._s3_chapter_keep_once())                                # the keeper writes it
         self.assertEqual(entry["state"], "prepared")
@@ -275,6 +308,66 @@ class ProducedSpot(Harness):
         self.assertEqual(entry["state"], "aired")
         self.assertEqual(len(self.aired), 5)
         self.assertTrue(any(s[1] == "pending" for s in self.chapter.states))
+
+    def test_only_the_failing_turn_is_written_again_and_told_why(self):
+        self.replies = [GOOD[0], STOCK[1], GOOD[2], GOOD[3]]
+        self.assertTrue(asyncio.run(app._air_produced_ad(self.spot())))
+        self.assertEqual(len(self.prompts), 1)                                  # one repair visit
+        self.assertIn("YOUR LAST DRAFT FAILED: turn 3 is a stock frame", self.prompts[0])
+        written = self.prompts[0].split("WRITE ONLY THESE NEXT TURNS:")[1]
+        self.assertNotIn("\n2  B", written)                                     # turn 2 was kept, not rewritten
+        self.assertIn(GOOD[0].split(":", 1)[1].strip(), self.prompts[0])        # ...and handed on as said
+        self.assertEqual(self.aired[1][1], GOOD[0].split(":", 1)[1].strip())
+        self.assertEqual(len(self.aired), 5)
+
+    def test_a_full_writers_lane_is_a_short_wait_not_an_attempt(self):
+        async def full(*a, **k):
+            raise app.WritingDeferred("full")
+        with mock.patch.object(app, "_banter_beats", full):
+            self.assertFalse(asyncio.run(app._air_produced_ad(self.spot())))
+        entry = app._S3_CHAPTER_SHELF["ad:ad1"]
+        self.assertEqual((entry["state"], entry["attempts"], entry["lane_waits"]), ("pending", 0, 1))
+        self.assertLessEqual(entry["next_try"] - app.time.time(), app.S3_CHAPTER_LANE_RETRY + 1)
+        self.assertEqual(app.S3_CHAPTER_BACKOFF[-1], 120.0)
+
+    def test_published_is_not_aired_until_every_reply_is_heard(self):
+        real = self.speak
+
+        async def speak(kind, track=None, **kw):
+            got = await real(kind, track, **kw)
+            if (kw.get("system3") or {}).get("chapter_turn") == 4:
+                self.heard.discard(self.radio["chat"][-1]["id"])                 # still queued on the page
+            return got
+        with mock.patch.object(app, "_dj_speak_floorless", speak):
+            self.assertTrue(asyncio.run(app._air_produced_ad(self.spot())))
+        entry = app._S3_CHAPTER_SHELF["ad:ad1"]
+        self.assertEqual(entry["state"], "published")                          # handed over, not heard
+        asyncio.run(app._s3_chapter_keep_once())
+        self.assertEqual(entry["state"], "published")
+        self.heard.add(entry["line_ids"]["4"])                                  # the listener reaches it
+        asyncio.run(app._s3_chapter_keep_once())
+        self.assertEqual(entry["state"], "aired")
+        # one that is never heard is recorded as such, never called aired
+        e2 = app._s3_chapter_new("ad:y", stamp=self.chapter.plan(), opening="y", kind="ad")
+        e2.update(state="published", published_at=app.time.time() - app.S3_CHAPTER_HEARD_WAIT - 1,
+                  line_ids={"1": "nope"})
+        asyncio.run(app._s3_chapter_keep_once())
+        self.assertEqual(e2["state"], "unheard")
+        self.assertIn("1", e2["why"])
+
+    def test_one_waiting_exchange_per_road_a_newer_source_is_superseded_and_recorded(self):
+        self.replies = list(STOCK)
+        self.repair_ok = False
+        self.assertFalse(asyncio.run(app._air_produced_ad(self.spot(1))))
+        self.assertFalse(asyncio.run(app._air_produced_ad(self.spot(2))))
+        first, second = app._S3_CHAPTER_SHELF["ad:ad1"], app._S3_CHAPTER_SHELF["ad:ad2"]
+        self.assertEqual((first["state"], second["state"]), ("pending", "superseded"))
+        self.assertEqual(second["superseded_by"], "ad:ad1")
+        # an earlier one that has failed three times gives way instead
+        first["attempts"] = 3
+        self.assertFalse(asyncio.run(app._air_produced_ad(self.spot(3))))
+        self.assertEqual(first["state"], "expired")
+        self.assertEqual(app._S3_CHAPTER_SHELF["ad:ad3"]["state"], "pending")
 
     def test_an_exchange_longer_than_its_entry_waits_for_room_then_airs_and_says_so(self):
         now = app.time.time()
@@ -480,7 +573,8 @@ class RealMicrophone(Harness):
                                         system3=stamp, sting=False))
         self.assertEqual(said, "This is Pine Box FM.")
         entry = app._S3_CHAPTER_SHELF["conv:" + stamp["conversation_id"]]
-        self.assertEqual(entry["state"], "aired")
+        self.assertIn(entry["state"], ("published", "aired"))                  # aired once heard
+        self.assertEqual(entry["done"], 4)
         self.assertEqual(len(self.played), 4)                   # opener + 3 replies, all on the box
         self.assertEqual(self.played, [c["path"] for c in entry["clips"]])   # the made takes, in order
         app.box_hold.assert_not_called()                        # a busy box never shelves a chapter row

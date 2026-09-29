@@ -305,7 +305,7 @@ test('the bound is on the hold, not on the join', () => {
 
 function trimQueue(clips) {
   const queue = clips.slice();
-  const body = fn('queueTrim');
+  const body = fn('queueOrder') + '\n' + fn('queueTrim');   // [vidmiss] queueTrim orders first
   // eslint-disable-next-line no-new-func
   const trim = new Function('queue', 'QUEUE_ROWS_MOST', 'QUEUE_AHEAD_S',
     body + '\nqueueTrim(); return queue;');

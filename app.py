@@ -36151,7 +36151,10 @@ async def _s3_split_line(kind: str, spoken: str, who: str, forced: Any, stamp: A
 S3_CHAPTER_TRIES_NOW = int(os.getenv("PINE_S3_CHAPTER_TRIES_NOW", "1"))
 S3_CHAPTER_WAIT = float(os.getenv("PINE_S3_CHAPTER_WAIT", "5400"))
 S3_CHAPTER_FIT_WAIT = float(os.getenv("PINE_S3_CHAPTER_FIT_WAIT", "1200"))
-S3_CHAPTER_BACKOFF = (20.0, 45.0, 90.0, 180.0, 300.0)
+S3_CHAPTER_BACKOFF = (15.0, 30.0, 60.0, 90.0, 120.0)       # [s3-chain2] capped at two minutes
+S3_CHAPTER_LANE_RETRY = 20.0                                # a full writers' lane is not a failed attempt
+S3_CHAPTER_HEARD_WAIT = float(os.getenv("PINE_S3_CHAPTER_HEARD_WAIT", "900"))
+S3_CHAPTER_REPAIR_VISITS = 3
 S3_CHAPTER_WORDS_PER_SECOND = 2.5
 _S3_CHAPTER_SHELF: dict[str, dict[str, Any]] = {}
 _S3_CHAPTER_STATE: dict[str, Any] = {"loaded": False, "task": None}
@@ -36186,6 +36189,8 @@ def _s3_chapter_shelf() -> dict[str, dict[str, Any]]:
             if e.get("state") == "airing":
                 e["state"] = "partial" if int(e.get("done") or 0) >= 1 else "prepared"
                 e["why"] = "the process restarted while it was on the air"
+            if e.get("state") == "published":                    # [s3-chain2] receipts died with the process
+                e["state"], e["why"] = "unheard", "the process restarted before every reply was heard"
             _S3_CHAPTER_SHELF[str(key)] = e
     return _S3_CHAPTER_SHELF
 
@@ -36224,7 +36229,8 @@ def _s3_chapter_new(key: str, **fields: Any) -> dict[str, Any]:
     e.update(fields)
     shelf = _s3_chapter_shelf()
     for old in [k for k, x in shelf.items()                     # the done ones, after six hours
-                if x.get("state") not in _S3_CHAPTER_LIVE and now - float(x.get("updated") or 0) > 6 * 3600]:
+                if x.get("state") not in _S3_CHAPTER_LIVE + ("published",)
+                and now - float(x.get("updated") or 0) > 6 * 3600]:
         shelf.pop(old, None)
     shelf[key] = e
     _s3_chapter_save()
@@ -36269,27 +36275,50 @@ def _s3_chapter_unshelve(who: str, text: str) -> None:
         render_backlog_save()
 
 
-def _s3_chapter_reply_fault(before: list[str], text: str, work: str) -> str:
-    """[s3-chain] Why a written reply is not an answer: empty, a stock frame,
-    its own direction said aloud, or no word of what was said before it."""
+# [s3-chain2] the sheet's own scaffolding and this writer's instructions, never words to say
+_S3_CHAPTER_SCAFFOLD = re.compile(
+    r"message with|reflecting the mood|\bsay it in\b|while doing it|fixed source material|"
+    r"airs exactly as recorded|source road|numbered system three|after each dash|\bturn \d+\b", re.I)
+_S3_CHAPTER_GENERIC = ("it is what it is", "just how it is", "if that's right", "if that is right")
+_S3_CHAPTER_POINTS_BACK = re.compile(
+    r"\b(that|this|it|those|these|there|you|your|yours|so|why|how|what|who|really|sure)\b", re.I)
+
+
+def _s3_chapter_reply_fault(before: list[str], text: str, work: str, names: Any = ()) -> str:
+    """[s3-chain2] Why a written reply is not an answer: empty, a stock frame, the
+    sheet's scaffolding (or this writer's instructions) said aloud, its leg's
+    direction read out, or nothing that points back at what was said. The
+    rolled ACT is allowed to be spoken ("no, bro, that isn't gonna work" is the
+    RS roll done, not read); a short reply that points back ("Are you sure
+    about that?") answers the turn before it."""
     words = " ".join(str(text or "").split())
     if not re.search(r"[^\W_]", words):
         return "is empty"
     low = words.lower()
-    if any(frame in low for frame in _BANTER_BEAT_STOCK):
+    if any(frame in low for frame in _BANTER_BEAT_STOCK) or any(g in low for g in _S3_CHAPTER_GENERIC):
         return "is a stock frame, not an answer"
-    if _beat_speaks_direction(words, {"work": work}):
+    hit = _S3_CHAPTER_SCAFFOLD.search(words)
+    if hit:
+        return "speaks its direction (%s)" % hit.group(0).lower()
+    # the leg's own direction, without the rolled act ("while doing it, <act>")
+    leg = re.sub(r"(?i)while doing it,[^.;\]]*", "", str(work or ""))
+    if _beat_speaks_direction(words, {"work": leg}):
         return "speaks its own direction"
-    said = " %s " % " ".join(re.findall(r"[a-z0-9']+", low))
-    ww = re.findall(r"[a-z0-9']+", str(work or "").lower())
-    for k in range(max(0, len(ww) - 4)):
-        run = " ".join(ww[k:k + 5])            # five words of its direction, in order
-        if " %s " % run in said:
-            return "speaks its direction (%s)" % run
+    n = len(re.findall(r"[a-z0-9']+", low))
+    if n < 3:
+        return "is too short to answer anything"
     mine = _beat_content_words(words)
-    if not any(_beat_content_words(b) & mine for b in before if b):
-        return "answers nothing that was said before it"
-    return ""
+    if any(_beat_content_words(b) & mine for b in before if b):
+        return ""
+    if any(str(nm).lower() in low for nm in (names or ()) if len(str(nm)) >= 3):
+        return ""                                  # it answers someone by name
+    if n <= 16 and _S3_CHAPTER_POINTS_BACK.search(low):
+        return ""                                  # a short reply that points back
+    return "answers nothing that was said before it"
+
+
+def _s3_chapter_links(before: list[str], text: str) -> bool:
+    return bool(_beat_content_words(text) & set().union(*[_beat_content_words(b) for b in before if b] or [set()]))
 
 
 def _s3_chapter_fit(e: dict[str, Any]) -> dict[str, Any]:
@@ -36342,6 +36371,7 @@ async def _s3_chapter_plan(e: dict[str, Any]) -> str:
         return "no active System 3 node for the %s road" % kw["road"]
     old = e.get("stamp")
     e["stamp"] = dict(handle.stamp)
+    e["draft"], e["draft_why"] = [], ""                      # [s3-chain2] a new plan, a new draft
     if isinstance(old, dict) and old.get("conversation_id") and callable(globals().get("system3_line_chapter_state")):
         globals()["system3_line_chapter_state"](old, "replanned", "planned again as " + str(handle.stamp.get("conversation_id")))
     if not e.get("sid"):
@@ -36375,10 +36405,16 @@ async def _s3_chapter_prepare(e: dict[str, Any]) -> bool:
             why = await _s3_chapter_voice(e)
     except WritingDeferred:
         why = "the writers' lane is full"
+        e["attempts"] = max(0, int(e["attempts"]) - 1)             # [s3-chain2] not a failed attempt
+        e["lane_waits"] = int(e.get("lane_waits") or 0) + 1
+        e["next_try"] = time.time() + S3_CHAPTER_LANE_RETRY
+        _s3_chapter_note(e, "pending", "the writers' lane is full - asked again in %ds (the draft is kept)"
+                         % int(S3_CHAPTER_LANE_RETRY))
+        return False
     except Exception as exc:  # noqa: BLE001
         why = ("%s: %s" % (type(exc).__name__, exc))[:200]
     if why:
-        step = S3_CHAPTER_BACKOFF[min(len(S3_CHAPTER_BACKOFF), int(e["attempts"])) - 1]
+        step = S3_CHAPTER_BACKOFF[min(len(S3_CHAPTER_BACKOFF), max(1, int(e["attempts"]))) - 1]
         e["next_try"] = time.time() + step
         _s3_chapter_note(e, "pending", "attempt %d: %s - tried again in %ds" % (e["attempts"], why, int(step)))
         return False
@@ -36388,8 +36424,11 @@ async def _s3_chapter_prepare(e: dict[str, Any]) -> bool:
 
 
 async def _s3_chapter_write(e: dict[str, Any], plan: dict[str, Any]) -> tuple[list[dict[str, Any]] | None, str]:
-    """[s3-chain] The chapter's words: the source verbatim as turn one, every
-    later turn a new line that answers what was said, on its planned seat."""
+    """[s3-chain2] The chapter's words: the source verbatim as turn one, every
+    later turn a new line that answers what was said, on its planned seat.
+    Turns that pass are KEPT (on the shelf entry, across attempts); only the
+    first failing turn onward is written again, and the writer is told exactly
+    what failed. Nothing is loosened: every reply still passes the gate."""
     seats = list(plan.get("seats") or [])
     names = dict(plan.get("names") or {})
     roles = dict(plan.get("roles") or {})
@@ -36397,41 +36436,88 @@ async def _s3_chapter_write(e: dict[str, Any], plan: dict[str, Any]) -> tuple[li
                      for s in dict.fromkeys(seats))
     budget = _s3_chapter_budget(e, plan)
     opening = " ".join(str(e.get("opening") or "").split())
-    context = ("SOURCE ROAD: %s. Turn 1 is fixed source material that airs exactly as recorded: %s.\n"
+    sheet = str(plan.get("sheet") or "")
+    context = ("A %s is on the air: %s. What it said is the first line of the transcript below and "
+               "it airs exactly as it is; you write only the later turns.\n"
                "Every later turn is a NEW spoken line in its speaker's own voice that answers what was "
-               "actually said - name something concrete from the line it answers - following its "
-               "numbered System Three roll. The words after each dash, and in brackets, say HOW a "
-               "turn behaves; they are never words to say.\n"
+               "actually said - name something concrete from the line it answers, or put a pointed "
+               "question back - following its numbered System Three roll. The words after each dash, "
+               "and in brackets, say HOW a turn behaves and are never read out; when a roll gives a "
+               "phrase to say, say it in that speaker's own words.\n"
                "WHO IS SPEAKING: %s.\n"
                "TIME: the replies together run about %d seconds on air (about %d words in all).\n"
                "WHAT IT IS ABOUT: %s"
                % (e.get("kind") or "line", str(e.get("source_is") or "a line"), cast, int(budget),
                   int(budget * S3_CHAPTER_WORDS_PER_SECOND), str(e.get("context") or opening)[:600]))
-    script = await _banter_beats(context, str(plan.get("sheet") or ""), len(seats), seats,
-                                 seed_text=opening, verbatim_seed=True)
-    # The source is turn one exactly as recorded - never re-parsed (a "Skip:" or
-    # "host:" inside an advert's own words would split it): only the replies are.
-    head, _nl, rest = str(script or "").partition("\n")
+    beats = _banter_beat_plan(sheet, len(seats), seats)
+    known = [n for n in names.values() if n]
 
     def key(text: str) -> str:
         return " ".join(re.findall(r"[a-z0-9']+", str(text or "").lower()))
-    if key(head.split(":", 1)[-1]) != key(opening):
-        return None, "the writer changed the source"
-    written = [(seats[0] if seats else "A", opening)] + list(banter_turns(rest))
-    if len(written) != len(seats) or [m for m, _s in written] != seats:
-        return None, "the writer missed the graph (%d of %d turns on their seats)" % (
-            sum(1 for (m, _s), s in zip(written, seats) if m == s), len(seats))
-    beats = _banter_beat_plan(str(plan.get("sheet") or ""), len(seats), seats)
-    said = [opening]
-    for i in range(1, len(written)):
-        text = " ".join(str(written[i][1]).split())
-        fault = _s3_chapter_reply_fault(said[-2:] + [opening], text,
-                                        str((beats[i] if i < len(beats) else {}).get("work") or ""))
-        if fault:
-            return None, "turn %d %s: %s" % (i + 1, fault, text[:80])
-        said.append(text)
-    written[0] = (written[0][0], str(e.get("opening") or ""))
+
+    def accept(draft: list[tuple[str, str]], cands: list[tuple[str, str]]) -> tuple[list[tuple[str, str]], str]:
+        why = ""
+        for marker, cand in cands:
+            k = len(draft) + 1
+            if k >= len(seats):
+                break
+            text = " ".join(str(cand or "").split())
+            if key(text) == key(opening) or any(key(text) == key(t) for _m, t in draft):
+                continue                                   # the transcript handed back, not a turn
+            if str(marker) != seats[k]:
+                why = "turn %d went to seat %s, not %s" % (k + 1, marker, seats[k])
+                break
+            said = [opening] + [t for _m, t in draft]
+            fault = _s3_chapter_reply_fault(said[-2:] + [opening], text,
+                                            str((beats[k] if k < len(beats) else {}).get("work") or ""), known)
+            if fault:
+                why = "turn %d %s: %s" % (k + 1, fault, text[:80])
+                break
+            draft.append((seats[k], text))
+        if not why and len(draft) < len(seats) - 1:
+            why = "the writer stopped at turn %d of %d" % (len(draft) + 1, len(seats))
+        return draft, why
+
+    draft = [(str(m), str(t)) for m, t in (e.get("draft") or [])]
+    why = str(e.get("draft_why") or "")
+    if not draft:
+        script = await _banter_beats(context, sheet, len(seats), seats, seed_text=opening, verbatim_seed=True)
+        # The source is turn one exactly as recorded - never re-parsed (a "Skip:" or
+        # "host:" inside an advert's own words would split it): only the replies are.
+        head, _nl, rest = str(script or "").partition("\n")
+        if key(head.split(":", 1)[-1]) != key(opening):
+            return None, "the writer changed the source"
+        draft, why = accept([], list(banter_turns(rest)))
+    visits = 0
+    while len(draft) < len(seats) - 1 and visits < S3_CHAPTER_REPAIR_VISITS:
+        visits += 1
+        e["draft"], e["draft_why"] = [list(x) for x in draft], why
+        _s3_chapter_save()
+        k = len(draft) + 1
+        rows = beats[k:]
+        recent = "\n".join("%s has just said - %s" % (m, t)
+                           for m, t in ([(seats[0], opening)] + draft)[-3:])
+        order = "\n".join("%d  %s  - %s" % (row["turn"], row["seat"], row["work"]) for row in rows)
+        prompt = (context + "\n\nCOMPLETED TRANSCRIPT - these lines are immutable:\n" + recent
+                  + "\n\nWRITE ONLY THESE NEXT TURNS:\n" + order
+                  + ("\nYOUR LAST DRAFT FAILED: %s. Write turn %d again as a NEW line that answers the line "
+                     "immediately above it." % (why, k + 1) if why else "")
+                  + "\nOutput exactly one line per listed turn using only the listed A:/B:/C:/D: marker. "
+                    "No preface, labels, markdown or stage directions.")
+        raw = await ask_model(prompt, limit=min(2800, max(900, 450 * len(rows))), spice=0.45, num_ctx=16384,
+                              mark={"kind": "chapter repair", "turn": k + 1, "visit": visits})
+        draft, why = accept(draft, list(banter_turns(raw or "")))
+        e["repairs"] = int(e.get("repairs") or 0) + 1
+    if len(draft) == len(seats) - 1 and not any(_s3_chapter_links([opening] + [t for _m, t in draft[:i]], t)
+                                                 for i, (_m, t) in enumerate(draft)):
+        # every reply only pointed back: the exchange never names what was said
+        why, draft = "no reply names anything that was said - the replies are written again", []
+    e["draft"], e["draft_why"] = [list(x) for x in draft], why
+    if len(draft) < len(seats) - 1:
+        return None, why or "the writer stopped short"
+    written = [(seats[0], str(e.get("opening") or ""))] + draft
     rows = globals()["system3_line_chapter"](e["stamp"], written)
+    e["draft"], e["draft_why"] = [], ""
     if not rows:
         return None, "it missed its roulette contract (>= 3 turns, >= 2 voices, every turn bound)"
     return rows, ""
@@ -36523,10 +36609,39 @@ async def _s3_chapter_take(e: dict[str, Any], lend: bool = False) -> dict[str, A
     return e
 
 
+def _s3_chapter_superseded(e: dict[str, Any]) -> bool:
+    """[s3-chain2] ONE WAITING EXCHANGE PER ROAD. A newer source on a road whose
+    earlier exchange still waits is filed as superseded - recorded on its
+    conversation and on the drop log, never silent - and the earlier one airs in
+    this slot (the keeper is told now). It was being prepared ahead of this
+    slot; a pile of waiting sources would only ever air late and out of turn.
+    An earlier one that has failed three times gives way instead (expired).
+    PINE_S3_CHAPTER_ONE_PER_ROAD=0 switches this off (every source waits)."""
+    if e.get("by_hand") or os.getenv("PINE_S3_CHAPTER_ONE_PER_ROAD", "1") == "0":
+        return False
+    now = time.time()
+    for old in sorted(_s3_chapter_shelf().values(), key=lambda x: float(x.get("created") or 0)):
+        if (old is e or old.get("by_hand") or old.get("state") not in ("pending", "prepared")
+                or old.get("road") != e.get("road") or old.get("road_fn") != e.get("road_fn")):
+            continue
+        if old.get("state") == "pending" and int(old.get("attempts") or 0) >= 3:
+            _s3_chapter_note(old, "expired", "a newer %s source replaces it after %d failed attempts (%s)"
+                             % (e.get("road"), int(old.get("attempts") or 0), str(old.get("why") or "")[:120]),
+                             drop=True)
+            continue
+        old["next_air"] = min(float(old.get("next_air") or now), now)
+        e["superseded_by"] = old.get("key")
+        _s3_chapter_note(e, "superseded", "the %s road's earlier exchange (%s, %s) airs in this slot"
+                         % (e.get("road"), old.get("key"), old.get("state")), drop=True)
+        _s3_chapter_keeper_start()
+        return True
+    return False
+
+
 async def _s3_line_chapter_admit(stamp: dict[str, Any], spoken: str, kind: str, who: str = "dj",
                                  name: str = "", first_clip: Any = None, sid: str = "",
                                  bound: Any = None, bound_part: str = "", round_as: str = "",
-                                 voice: str = "") -> dict[str, Any] | None:
+                                 voice: str = "", by_hand: bool = False) -> dict[str, Any] | None:
     """[s3-chain] dj_speak's door: the line's chapter, ready - or a wait."""
     chapter = globals().get("system3_line_chapter")
     if not callable(chapter):
@@ -36544,7 +36659,9 @@ async def _s3_line_chapter_admit(stamp: dict[str, Any], spoken: str, kind: str, 
             first_clip=(dict(first_clip) if isinstance(first_clip, dict) and first_clip.get("path") else None),
             bound=bound if isinstance(bound, dict) else None, bound_part=str(bound_part or ""),
             source_is="a %s line spoken by %s" % (kind, name or who),
-            context=str(spoken)[:400])
+            context=str(spoken)[:400], by_hand=bool(by_hand))
+        if _s3_chapter_superseded(e):                            # [s3-chain2]
+            return None
     return await _s3_chapter_take(e, lend=True)
 
 
@@ -36565,6 +36682,8 @@ async def _s3_source_chapter(key: str, road: str, kind: str, who: str, opening: 
                             first_clip=dict(first_clip or {}, source=True) if first_clip else None,
                             context=context, road_fn=road_fn, replay=dict(replay or {}),
                             source_is=source_is or "a %s" % kind, sid="")
+        if _s3_chapter_superseded(e):                            # [s3-chain2]
+            return None
     got = await _s3_chapter_take(e, lend=True)
     if got and not got.get("sid"):
         got["sid"] = str((got.get("stamp") or {}).get("conversation_id") or "")[:12]
@@ -36619,11 +36738,44 @@ async def _s3_chapter_air_rest(e: dict[str, Any], track: Any = None, round_as: s
                 return False
             i += 1
             e["done"] = i
+            # [s3-chain2] the row's own line id, so "aired" means HEARD, not handed over
+            for _c in reversed((_RADIO.get("chat") or [])[-40:]):
+                if str(_c.get("who") or "") == str(row.get("who") or "") and str(_c.get("text") or "") == str(got):
+                    e.setdefault("line_ids", {})[str(i - 1)] = str(_c.get("id") or "")
+                    break
             _s3_chapter_save()
-        _s3_chapter_note(e, "aired", "%d turns under sid %s" % (len(rows), e.get("sid")))
+        e["published_at"] = time.time()
+        _s3_chapter_note(e, "published", "%d turns handed to the air under sid %s - aired when every reply is heard"
+                         % (len(rows), e.get("sid")))
+        # the page pays for its airtime before the floor frees (#1146): nothing else is
+        # published into the middle of an exchange the listener has not heard yet
+        await _paged_settle(float(_PAGE_AIR_UNTIL[0] or 0))
+        _s3_chapter_heard(e)
         return True
     finally:
         _S3_CHAPTER_ROW.reset(tok)
+
+
+def _s3_chapter_heard(e: dict[str, Any]) -> None:
+    """[s3-chain2] A published exchange is AIRED once every reply's line id has a
+    heard receipt (the page's listener ack or the box's audible receipt). One
+    that is never fully heard is recorded as such (unheard) with the turns it
+    lost - it is never re-aired, and never called aired."""
+    ids = {k: v for k, v in (e.get("line_ids") or {}).items() if v}
+    missing = sorted(int(k) for k, v in ids.items() if v not in _PAGE_ACKED_LINES)
+    if not ids:
+        e["aired_at"] = time.time()
+        _s3_chapter_note(e, "aired", "%d turns handed over under sid %s - no line ids to check a receipt against"
+                         % (len(e.get("rows") or []), e.get("sid")))
+    elif not missing:
+        e["aired_at"] = time.time()
+        _s3_chapter_note(e, "aired", "%d turns heard under sid %s (%d s after hand-over)"
+                         % (len(e.get("rows") or []), e.get("sid"),
+                            int(e["aired_at"] - float(e.get("published_at") or e["aired_at"]))))
+    elif time.time() - float(e.get("published_at") or time.time()) > S3_CHAPTER_HEARD_WAIT:
+        _s3_chapter_note(e, "unheard", "handed over %d min ago and turn(s) %s were never heard"
+                         % (int(S3_CHAPTER_HEARD_WAIT // 60), ",".join(str(m) for m in missing) or "?"),
+                         drop=True)
 
 
 def _s3_chapter_opener_missed(e: dict[str, Any], who: str = "", text: str = "") -> None:
@@ -36679,6 +36831,8 @@ async def _s3_chapter_keep_once() -> None:
             e["next_air"] = now
             _s3_chapter_note(e, "partial" if int(e.get("done") or 0) >= 1 else "prepared",
                              "its airing stopped without a verdict")
+    for e in [x for x in _s3_chapter_shelf().values() if x.get("state") == "published"]:
+        _s3_chapter_heard(e)                                     # [s3-chain2] cheap, every sweep
     on_air = bool(_RADIO.get("on")) and not radio_paused()
     for e in live:
         if e["state"] == "partial" and on_air and float(e.get("next_air") or 0) <= now:
@@ -37150,7 +37304,8 @@ async def _dj_speak_floorless(kind: str, track: dict[str, Any] | None = None,
             and isinstance(system3, dict) and system3.get("mode") == "active"):
         _chapter = await _s3_line_chapter_admit(
             system3, spoken, kind, who=who, name=name, first_clip=clip, sid=sid,
-            bound=bound, bound_part=bound_part, round_as=round_as, voice=forced or "")
+            bound=bound, bound_part=bound_part, round_as=round_as, voice=forced or "",
+            by_hand=by_hand)
         if _chapter is None:
             # [s3-chain] it WAITS on the prepared shelf - written, voiced and aired
             # whole by the keeper - never a one-line fragment, never dropped
@@ -87855,6 +88010,43 @@ def _sfx_cadence_pictures(rows, starts_at: float) -> None:
 
 
 
+# [vidmiss] ONE TUBE. Every set shows one picture at a time; a sting's
+# picture booked on top of another waits behind it and, past the set's
+# LATE (8 s), is thrown away with its sound. GAP: the set's CRT collapse
+# (0.64 s) and the tablet's measured 1.5-2.5 s from hand-over to picture.
+SFX_TUBE_GAP_S = float(os.getenv("SFX_TUBE_GAP_S", "1.0"))
+SFX_TUBE_WAIT_MOST = float(os.getenv("SFX_TUBE_WAIT_MOST", "20.0"))
+
+
+def sfx_tube_free_at(now: float | None = None) -> float:
+    """[vidmiss] When the picture tube is free: the end of the latest SFX
+    picture on the ring (a sting's own MP4, a board clip's silent picture,
+    a pad's cut) whose span has not run out. 0.0 when nothing is on or
+    booked. The endless cycle keeps its own plan (#1417) and is not read.
+    A delivery the page reports ended, or refused, holds nothing."""
+    now = time.time() if now is None else float(now)
+    free = 0.0
+    cut_ms = int(_RADIO.get("voice_cut_ms") or 0)
+    for clip in list(_RADIO.get("voice_clips") or []):
+        if (not isinstance(clip, dict) or not clip.get("video")
+                or clip.get("endless")):
+            continue
+        try:
+            if cut_ms and clip.get("ts") and int(clip["ts"]) <= cut_ms:
+                continue
+            did = str(clip.get("delivery_id") or "")
+            if did and str((_PAGE_DELIVERIES.get(did) or {}).get("state")
+                           or "") in ("ended", "error"):
+                continue
+            start = float(clip.get("broadcast_ms") or 0) / 1000.0
+            span = float(clip.get("length") or clip.get("seconds") or 0)
+        except (TypeError, ValueError):
+            continue
+        if start > 0 and span > 0 and start + span > now:
+            free = max(free, start + span)
+    return free
+
+
 def sfx_video_share() -> int:
     """#1366: what share of the SFX Guy's clips should carry a picture.
 
@@ -90852,6 +91044,31 @@ async def dj_sting(to_box: bool, after: str = "", who: str = "",
                 sample, who, _sting_why) else "")            # [#1251]
         if time.time() < float(_SFX_CYCLE.get("until") or 0):
             return ""
+    # [vidmiss] ...AND OUTSIDE IT THE TUBE IS STILL ONE TUBE. A picture
+    # booked on top of the one showing waits behind it on every set and,
+    # past the set's LATE, is thrown away with its sound (measured
+    # 2026-09-28: c2d58d05 3045.3-3076.4 and b667d23c booked at 3061.5).
+    # So he does it after, as #1417 says; booked too far ahead, he lets the
+    # slot go rather than punctuate a line long gone.
+    _tube_at_ms = 0
+    if is_video:
+        try:
+            _tube_free = sfx_tube_free_at()
+            _tube_now = time.time() + VOICE_BROADCAST_LEAD_MS / 1000.0
+            _tube_natural = max(_tube_now, float(_PAGE_AIR_UNTIL[0] or 0))
+            _tube_want = _tube_free + SFX_TUBE_GAP_S if _tube_free else 0.0
+            if _tube_want > _tube_natural:
+                if _tube_want - _tube_natural > SFX_TUBE_WAIT_MOST:
+                    pipeline_log(
+                        "drop",
+                        "an SFX picture was not rung: the tube is booked "
+                        "%.0f s past its moment ([vidmiss])"
+                        % (_tube_want - _tube_natural),
+                        extra=str(sample)[:300])
+                    return ""
+                _tube_at_ms = int(_tube_want * 1000)
+        except Exception:  # noqa: BLE001 - the tube check never costs the sting
+            _tube_at_ms = 0
     # The index already measured every playable clip. Read that local value
     # on the SFX executor instead of stat/ffprobe on the network path from
     # the event loop. The latter was an observed eight-second station stall.
@@ -90874,7 +91091,9 @@ async def dj_sting(to_box: bool, after: str = "", who: str = "",
     # exactly like one that did. It is stamped now, and the branch below
     # that already knows it was dropped corrects it.
     _sting_row = {
-        "ts": int(time.time()), "air_at": time.time(),
+        "ts": int(time.time()),
+        "air_at": (_tube_at_ms / 1000.0 if _tube_at_ms   # [vidmiss]
+                   else time.time()),
         "who": "board", "kind": "sfx",
         "text": sample.stem, "sfx": key,
         "sfx_dir": sample.parent.name or "sfx",
@@ -90954,6 +91173,8 @@ async def dj_sting(to_box: bool, after: str = "", who: str = "",
             # instead of guessing from a text that is empty.
             "video": is_video,
             "seconds": round(_sample_seconds, 2),
+            # [vidmiss] after the picture already on the tube
+            **({"broadcast_ms": _tube_at_ms} if _tube_at_ms else {}),
         })
     # A sting is MEANT to land over the DJ's own line it punctuates, so the
     # show's own just-finished announce tail must not block it (#559: "the
@@ -91001,7 +91222,8 @@ async def dj_sting(to_box: bool, after: str = "", who: str = "",
         # now" in red for the rest of the night.
         try:
             _sting_row["aired"] = "box" if to_box else "page"
-            air_at_set(_sting_row, time.time())             # #1288
+            air_at_set(_sting_row, max(time.time(),         # #1288
+                                       _tube_at_ms / 1000.0))   # [vidmiss]
         except Exception:  # noqa: BLE001
             pass
     else:
