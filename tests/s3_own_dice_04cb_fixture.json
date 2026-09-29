@@ -1,0 +1,714 @@
+{
+ "about": "conversation 04cbacf906fa4445 (manager road, hour-18 'Message from upstairs', 2026-09-28): the real ledger rows of the round's bursts and the round's four node dice, captured read-only from data/script_ledger.jsonl for [s3-own-dice]",
+ "conversation_id": "04cbacf906fa4445",
+ "sid": "dcef8ca292f3",
+ "turns": [
+  {
+   "turn_id": "04cbacf906fa4445:t00",
+   "index": 0,
+   "speaker": "A",
+   "text": "Told my friend stick it up his fucking head! Since the players are looking to beat the casino, the dealers are watching the players. The box men are watching the dealers. If they did, they would have been better off making fucking no venus. What the hell's going on? You gotta go back out there. Well, then from now on, i'm gonna start keeping records. Now this place was off limits. Now that suitcase was going straight to one place, right to kansas city, which was as close to las vegas as the midwest bosses could go without getting themselves arrested. Now this old mormon fuck here, he had to fly in with suitcases once a month. for cash i hired an old casino pal billy sherbert as my manager and i went Huh? Do you? You fucking faggot! You're telling him to go fuck himself? I'm sorry, but it's really. All right, ace. Nice, pal. You took your boots off. DGX Spark is the machine this station runs on. Memory is 52.2 gigabytes used of 121.7 gigabytes, and the CPU load average is 13.79 over the last five minutes."
+  },
+  {
+   "turn_id": "04cbacf906fa4445:t01",
+   "index": 1,
+   "speaker": "B",
+   "text": "You are talking about some kind of bizarre transaction involving a casino and some shady travel, but honestly, that sounds like something you’d hear in a bad fever dream. It makes me wonder what kind of secrets are actually being kept hidden behind all this noise we're broadcasting. I don't buy that the whole setup is some grand conspiracy; it just feels like someone trying too hard to make sense of utter nonsense."
+  },
+  {
+   "turn_id": "04cbacf906fa4445:t02",
+   "index": 2,
+   "speaker": "A",
+   "text": "You are missing the point entirely, Skip; it is about accountability and the sheer absurdity of the situation you are describing. It is not a simple transaction; it is about power dynamics and how people evade responsibility when things go sideways. The whole thing reeks of something deeply wrong that needs to be exposed, which is why we need to keep these records."
+  },
+  {
+   "turn_id": "04cbacf906fa4445:t03",
+   "index": 3,
+   "speaker": "B",
+   "text": "But exposing it just leads to more noise, doesn't it? All this insistence on finding some grand meaning behind a simple story feels like you are chasing shadows instead of listening to what is actually happening right now. I just don't see how all those details connect into anything meaningful for the listener."
+  }
+ ],
+ "dice_by_turn": {
+  "04cbacf906fa4445:t00": {
+   "roll": null,
+   "hard": null,
+   "axis": "emotion",
+   "lean": null,
+   "text": "enthusiasm",
+   "answers": null,
+   "band": [
+    0.0,
+    1.0
+   ],
+   "s3": {
+    "conversation_id": "04cbacf906fa4445",
+    "turn_id": "04cbacf906fa4445:t00",
+    "bundle_id": "04cbacf906fa4445:t00:becf03a0b",
+    "revision": 1,
+    "phase": "OPEN",
+    "step": "start",
+    "es": "enthusiasm",
+    "intensity": 0.58,
+    "acts": [
+     {
+      "family": "CTS",
+      "id": "OBLIGATED",
+      "label": "the road's own subject: speakerbox"
+     },
+     {
+      "family": "MEMORY",
+      "id": "clock+last_segment",
+      "label": "The segment is nearly up; It went off as planned"
+     },
+     {
+      "family": "FAV",
+      "id": "fav_4b9382be4c",
+      "label": "Irony twists it—teenagers film the standoff for the network to see; And post it to the ver"
+     }
+    ],
+    "perf": {
+     "dims": {
+      "amusement": 0.545,
+      "excitement": 0.545,
+      "confusion": 0.0,
+      "irritation": 0.0,
+      "fatigue": 0.0,
+      "nervousness": 0.0
+     },
+     "pace": 1.052,
+     "pause_style": "clipped",
+     "voice": {
+      "tempo": 1.0575,
+      "pitch": 0.8722,
+      "range": 1.2437,
+      "energy": 0.3998,
+      "pause": 0.8886,
+      "temp": 0.0363
+     }
+    },
+    "speakerbox": [],
+    "sfx": {
+     "play": true,
+     "placement": "after",
+     "intent": [
+      "enthusiasm",
+      "gigabytes",
+      "other",
+      "fucking",
+      "going"
+     ],
+     "event_id": "04cbacf906fa4445:0072"
+    },
+    "sfxguy": {
+     "speak": true,
+     "kind": "reaction",
+     "order": [
+      "reaction",
+      "quip",
+      "news"
+     ],
+     "event_id": "04cbacf906fa4445:0073"
+    },
+    "tint": {
+     "rhyme": null,
+     "event_id": null
+    },
+    "round": {
+     "favorite": true
+    }
+   }
+  },
+  "04cbacf906fa4445:t01": {
+   "roll": 0.937025,
+   "hard": 0.776,
+   "axis": "stance",
+   "lean": 0,
+   "text": "deflects it onto something else",
+   "answers": 1,
+   "band": [
+    0.0,
+    1.0
+   ],
+   "s3": {
+    "conversation_id": "04cbacf906fa4445",
+    "turn_id": "04cbacf906fa4445:t01",
+    "bundle_id": "04cbacf906fa4445:t01:b8732e023",
+    "revision": 1,
+    "phase": "DEVELOP",
+    "step": "reply_a",
+    "es": "suspicion",
+    "intensity": 0.776,
+    "acts": [
+     {
+      "family": "SHOCK",
+      "id": "in_disbelief",
+      "label": "openly in disbelief"
+     },
+     {
+      "family": "RS",
+      "id": "deflect",
+      "label": "Deflect"
+     }
+    ],
+    "perf": {
+     "dims": {
+      "amusement": 0.0,
+      "excitement": 0.385,
+      "confusion": 0.085,
+      "irritation": 0.0,
+      "fatigue": 0.0,
+      "nervousness": 0.0
+     },
+     "pace": 1.0,
+     "pause_style": "natural",
+     "voice": {
+      "tempo": 0.9571,
+      "pitch": -0.3418,
+      "range": 1.0849,
+      "energy": 0.0,
+      "pause": 1.1269,
+      "temp": 0.0
+     }
+    },
+    "speakerbox": [],
+    "sfx": {
+     "play": true,
+     "placement": "before",
+     "intent": [
+      "suspicion",
+      "deflect",
+      "gigabytes",
+      "other",
+      "fucking",
+      "going"
+     ],
+     "event_id": "04cbacf906fa4445:0079"
+    },
+    "sfxguy": {
+     "speak": true,
+     "kind": "quip",
+     "order": [
+      "quip",
+      "reaction",
+      "news"
+     ],
+     "event_id": "04cbacf906fa4445:0080"
+    },
+    "tint": {
+     "rhyme": null,
+     "event_id": null
+    },
+    "round": {
+     "shock": true
+    }
+   }
+  },
+  "04cbacf906fa4445:t02": {
+   "roll": 0.002974,
+   "hard": 0.386,
+   "axis": "rebuttal",
+   "lean": -1,
+   "text": "pushes back against the responses and holds the argument position",
+   "answers": 2,
+   "band": [
+    0.0,
+    1.0
+   ],
+   "s3": {
+    "conversation_id": "04cbacf906fa4445",
+    "turn_id": "04cbacf906fa4445:t02",
+    "bundle_id": "04cbacf906fa4445:t02:b67ed41f1",
+    "revision": 1,
+    "phase": "EXPLORE",
+    "step": "rebuttal",
+    "es": "attentiveness",
+    "intensity": 0.386,
+    "acts": [
+     {
+      "family": "IRS",
+      "id": "maintain",
+      "label": "Push back against the responses maintaining the argument position"
+     }
+    ],
+    "perf": {
+     "dims": {
+      "amusement": 0.0,
+      "excitement": 0.27,
+      "confusion": 0.06,
+      "irritation": 0.0,
+      "fatigue": 0.0,
+      "nervousness": 0.0
+     },
+     "pace": 1.0,
+     "pause_style": "natural",
+     "voice": {
+      "tempo": 1.0,
+      "pitch": 0.1202,
+      "range": 1.0298,
+      "energy": 0.0301,
+      "pause": 1.0,
+      "temp": 0.018
+     }
+    },
+    "speakerbox": [],
+    "sfx": {
+     "play": true,
+     "placement": "after",
+     "intent": [
+      "attentiveness",
+      "push",
+      "back",
+      "against",
+      "responses",
+      "maintaining",
+      "argument",
+      "position"
+     ],
+     "event_id": "04cbacf906fa4445:0084"
+    },
+    "sfxguy": {
+     "speak": true,
+     "kind": "news",
+     "order": [
+      "news",
+      "quip",
+      "reaction"
+     ],
+     "event_id": "04cbacf906fa4445:0085"
+    },
+    "tint": {
+     "rhyme": null,
+     "event_id": null
+    },
+    "round": {}
+   }
+  },
+  "04cbacf906fa4445:t03": {
+   "roll": 0.598966,
+   "hard": 0.472,
+   "axis": "stance",
+   "lean": -1,
+   "text": "rebuts it with the facts as they know them",
+   "answers": 3,
+   "band": [
+    0.0,
+    1.0
+   ],
+   "s3": {
+    "conversation_id": "04cbacf906fa4445",
+    "turn_id": "04cbacf906fa4445:t03",
+    "bundle_id": "04cbacf906fa4445:t03:be92f7af0",
+    "revision": 1,
+    "phase": "SEGUE",
+    "step": "answer_a",
+    "es": "confusion",
+    "intensity": 0.472,
+    "acts": [
+     {
+      "family": "RS",
+      "id": "llm_rebuttal",
+      "label": "Response based on online research / LLM query for rebuttal"
+     },
+     {
+      "family": "FL",
+      "id": "segue",
+      "label": "Segue"
+     }
+    ],
+    "perf": {
+     "dims": {
+      "amusement": 0.0,
+      "excitement": 0.46,
+      "confusion": 0.23,
+      "irritation": 0.0,
+      "fatigue": 0.0,
+      "nervousness": 0.0
+     },
+     "pace": 1.039,
+     "pause_style": "clipped",
+     "voice": {
+      "tempo": 0.9602,
+      "pitch": 0.2628,
+      "range": 1.0962,
+      "energy": 0.0,
+      "pause": 1.1273,
+      "temp": 0.0131
+     }
+    },
+    "speakerbox": [],
+    "sfx": {
+     "play": false,
+     "placement": "after",
+     "intent": [
+      "confusion",
+      "response",
+      "based",
+      "online",
+      "research",
+      "query",
+      "rebuttal",
+      "segue"
+     ],
+     "event_id": "04cbacf906fa4445:0092"
+    },
+    "sfxguy": {
+     "speak": true,
+     "kind": "quip",
+     "order": [
+      "quip",
+      "reaction",
+      "news"
+     ],
+     "event_id": "04cbacf906fa4445:0093"
+    },
+    "tint": {
+     "rhyme": null,
+     "event_id": null
+    },
+    "round": {}
+   }
+  }
+ },
+ "bursts": [
+  {
+   "block": 35646,
+   "rows": [
+    {
+     "ord": 0,
+     "line_id": "356f125ff0c1422f8989823caac36ccd",
+     "who": "dj",
+     "kind": "dialogue",
+     "text": "Told my friend stick it up his fucking head! Since the players are looking to beat the casino, the dealers are watching the players.",
+     "turn": 0,
+     "dice_turn_id": "04cbacf906fa4445:t00",
+     "system3_turn_id": "04cbacf906fa4445:t00"
+    },
+    {
+     "ord": 1,
+     "line_id": "a1280acc268947009fbc975559eb03b2",
+     "who": "board",
+     "kind": "sfx",
+     "text": "🔊 24 clip-26",
+     "turn": -1,
+     "dice_turn_id": null,
+     "system3_turn_id": ""
+    },
+    {
+     "ord": 2,
+     "line_id": "1efea24e3d894bcb929a89a10c8f11a8",
+     "who": "dj",
+     "kind": "dialogue",
+     "text": "The box men are watching the dealers. If they did, they would have been better off making fucking no venus. What the hell's going on? You gotta go back out there.",
+     "turn": 1,
+     "dice_turn_id": "04cbacf906fa4445:t01",
+     "system3_turn_id": "04cbacf906fa4445:t00"
+    },
+    {
+     "ord": 3,
+     "line_id": "6b0f191a1567413b9563a9ea490311ec",
+     "who": "board",
+     "kind": "sfx",
+     "text": "🔊 384 clip-1",
+     "turn": -1,
+     "dice_turn_id": null,
+     "system3_turn_id": ""
+    },
+    {
+     "ord": 4,
+     "line_id": "0dcb48d87b5148c59e453482c05fe143",
+     "who": "drop",
+     "kind": "sfxguy",
+     "text": "I stole those assets for my own gain.",
+     "turn": -1,
+     "dice_turn_id": null,
+     "system3_turn_id": "04cbacf906fa4445:t00"
+    }
+   ]
+  },
+  {
+   "block": 35649,
+   "rows": [
+    {
+     "ord": 0,
+     "line_id": "7fbd903028bb4b84aeff8e022f632e65",
+     "who": "cohost",
+     "kind": "dialogue",
+     "text": "Carry on.",
+     "turn": 0,
+     "dice_turn_id": null,
+     "system3_turn_id": "04cbacf906fa4445:t00"
+    },
+    {
+     "ord": 1,
+     "line_id": "7a977477eea942598d69dccf8d87f6df",
+     "who": "dj",
+     "kind": "dialogue",
+     "text": "Well, then from now on, i'm gonna start keeping records. Now this place was off limits.",
+     "turn": 1,
+     "dice_turn_id": "04cbacf906fa4445:t01",
+     "system3_turn_id": "04cbacf906fa4445:t00"
+    },
+    {
+     "ord": 2,
+     "line_id": "ab33487754dd436192aeabb1962cc3ea",
+     "who": "board",
+     "kind": "sfx",
+     "text": "🔊 18 quietly singing",
+     "turn": -1,
+     "dice_turn_id": null,
+     "system3_turn_id": ""
+    },
+    {
+     "ord": 3,
+     "line_id": "f3d74a9528be4791b73cc250e6cbf3ab",
+     "who": "dj",
+     "kind": "dialogue",
+     "text": "Now that suitcase was going straight to one place, right to kansas city, which was as close to las vegas as the midwest bosses could go without getting themselves",
+     "turn": 2,
+     "dice_turn_id": "04cbacf906fa4445:t02",
+     "system3_turn_id": "04cbacf906fa4445:t00"
+    },
+    {
+     "ord": 4,
+     "line_id": "e230151b2c2a42599667077d3ebc58a9",
+     "who": "cohost",
+     "kind": "dialogue",
+     "text": "Point taken.",
+     "turn": 3,
+     "dice_turn_id": null,
+     "system3_turn_id": "04cbacf906fa4445:t00"
+    },
+    {
+     "ord": 5,
+     "line_id": "ab18b3b52e914538ae48536b13e7dfa5",
+     "who": "board",
+     "kind": "sfx",
+     "text": "🔊 23 the clown that'",
+     "turn": -1,
+     "dice_turn_id": null,
+     "system3_turn_id": ""
+    }
+   ]
+  },
+  {
+   "block": 35660,
+   "rows": [
+    {
+     "ord": 0,
+     "line_id": "46a7195af9fa4b138bc8bd38091d2add",
+     "who": "dj",
+     "kind": "dialogue",
+     "text": "arrested. Now this old mormon fuck here, he had to fly in with suitcases once a month. for cash i hired an old casino pal billy sherbert as my manager and i went Huh?",
+     "turn": 0,
+     "dice_turn_id": "04cbacf906fa4445:t00",
+     "system3_turn_id": "04cbacf906fa4445:t00"
+    },
+    {
+     "ord": 1,
+     "line_id": "89b5a684b7b441a4a3a70d496207636a",
+     "who": "dj",
+     "kind": "dialogue",
+     "text": "Do you? You fucking faggot! You're telling him to go fuck himself? I'm sorry, but it's really. All right, ace. Nice, pal. You took your boots off.",
+     "turn": 1,
+     "dice_turn_id": "04cbacf906fa4445:t01",
+     "system3_turn_id": "04cbacf906fa4445:t00"
+    },
+    {
+     "ord": 2,
+     "line_id": "f1f469090a244755b57ffece944e43df",
+     "who": "board",
+     "kind": "sfx",
+     "text": "🔊 975 clip",
+     "turn": -1,
+     "dice_turn_id": null,
+     "system3_turn_id": ""
+    },
+    {
+     "ord": 3,
+     "line_id": "bf6af69696fe43eaafe20a6292410afc",
+     "who": "cohost",
+     "kind": "dialogue",
+     "text": "I'm still here.",
+     "turn": 2,
+     "dice_turn_id": null,
+     "system3_turn_id": "04cbacf906fa4445:t00"
+    },
+    {
+     "ord": 4,
+     "line_id": "aa2c126560d34c5d9d545248f618c009",
+     "who": "dj",
+     "kind": "dialogue",
+     "text": "DGX Spark is the machine this station runs on. Memory is 52.2 gigabytes used of 121.7 gigabytes, and the CPU load average is 13.79 over the last five minutes.",
+     "turn": 3,
+     "dice_turn_id": "04cbacf906fa4445:t03",
+     "system3_turn_id": "04cbacf906fa4445:t00"
+    },
+    {
+     "ord": 5,
+     "line_id": "12341ee74f954844941d7d0fce1ff4bd",
+     "who": "board",
+     "kind": "sfx",
+     "text": "🔊 33 sorry, that's a",
+     "turn": -1,
+     "dice_turn_id": null,
+     "system3_turn_id": ""
+    },
+    {
+     "ord": 6,
+     "line_id": "f56ceda0be7b416d87676c6ac2aff330",
+     "who": "cohost",
+     "kind": "dialogue",
+     "text": "You are talking about some kind of bizarre transaction involving a casino and some shady travel, but honestly, that sounds like something you’d hear in a bad fever",
+     "turn": 4,
+     "dice_turn_id": null,
+     "system3_turn_id": "04cbacf906fa4445:t01"
+    },
+    {
+     "ord": 7,
+     "line_id": "b8bb33f75a074122b7c43dafa4b65e1e",
+     "who": "cohost",
+     "kind": "dialogue",
+     "text": "dream. It makes me wonder what kind of secrets are actually being kept hidden behind all this noise we're broadcasting.",
+     "turn": 5,
+     "dice_turn_id": null,
+     "system3_turn_id": "04cbacf906fa4445:t01"
+    },
+    {
+     "ord": 8,
+     "line_id": "c1e4a4e6b2ff41ff8f0a43323d6f2e44",
+     "who": "board",
+     "kind": "sfx",
+     "text": "🔊 80 They're dirty, why do you have them",
+     "turn": -1,
+     "dice_turn_id": null,
+     "system3_turn_id": ""
+    },
+    {
+     "ord": 9,
+     "line_id": "f54950aac2ac4a12bc444d6a5844f359",
+     "who": "drop",
+     "kind": "sfxguy",
+     "text": "Wait a minute. Say that again.",
+     "turn": -1,
+     "dice_turn_id": null,
+     "system3_turn_id": "04cbacf906fa4445:t01"
+    },
+    {
+     "ord": 10,
+     "line_id": "16184ac9e71f4073b2ffad66dec5d823",
+     "who": "cohost",
+     "kind": "dialogue",
+     "text": "I don't buy that the whole setup is some grand conspiracy; it just feels like someone trying too hard to make sense of utter nonsense.",
+     "turn": 6,
+     "dice_turn_id": null,
+     "system3_turn_id": "04cbacf906fa4445:t01"
+    },
+    {
+     "ord": 11,
+     "line_id": "b4f8126c294840dcaae5bb6bb4ad600b",
+     "who": "dj",
+     "kind": "dialogue",
+     "text": "You are missing the point entirely, Skip; it is about accountability and the sheer absurdity of the situation you are describing. It is not a simple transaction;",
+     "turn": 7,
+     "dice_turn_id": null,
+     "system3_turn_id": "04cbacf906fa4445:t02"
+    }
+   ]
+  },
+  {
+   "block": 35662,
+   "rows": [
+    {
+     "ord": 0,
+     "line_id": "7af2134376a645f582bbba5f0f168bf3",
+     "who": "dj",
+     "kind": "dialogue",
+     "text": "it is about power dynamics and how people evade responsibility when things go sideways.",
+     "turn": 0,
+     "dice_turn_id": "04cbacf906fa4445:t00",
+     "system3_turn_id": "04cbacf906fa4445:t02"
+    },
+    {
+     "ord": 1,
+     "line_id": "b21924f8b77e439d82ba54466d5ed251",
+     "who": "board",
+     "kind": "sfx",
+     "text": "🔊 107 whoa, whoa",
+     "turn": -1,
+     "dice_turn_id": null,
+     "system3_turn_id": ""
+    },
+    {
+     "ord": 2,
+     "line_id": "128e2fb6f3164daba3b8cedaf2d42010",
+     "who": "drop",
+     "kind": "sfxguy",
+     "text": "I heard what you said. Go ahead.",
+     "turn": -1,
+     "dice_turn_id": null,
+     "system3_turn_id": "04cbacf906fa4445:t02"
+    },
+    {
+     "ord": 3,
+     "line_id": "829b6724c95b4016a067cb60e1fa3f50",
+     "who": "dj",
+     "kind": "dialogue",
+     "text": "The whole thing reeks of something deeply wrong that needs to be exposed, which is why we need to keep these records.",
+     "turn": 1,
+     "dice_turn_id": "04cbacf906fa4445:t01",
+     "system3_turn_id": "04cbacf906fa4445:t02"
+    },
+    {
+     "ord": 4,
+     "line_id": "fd56b0cb82fb4077858f7ac0fc4e09d0",
+     "who": "cohost",
+     "kind": "dialogue",
+     "text": "But exposing it just leads to more noise, doesn't it?",
+     "turn": 2,
+     "dice_turn_id": "04cbacf906fa4445:t02",
+     "system3_turn_id": "04cbacf906fa4445:t03"
+    },
+    {
+     "ord": 5,
+     "line_id": "b9757c2f05794d0ab0f2495cead796a8",
+     "who": "board",
+     "kind": "sfx",
+     "text": "🔊 134 many. Stand by",
+     "turn": -1,
+     "dice_turn_id": null,
+     "system3_turn_id": ""
+    },
+    {
+     "ord": 6,
+     "line_id": "f63a9648722248708b3985ca36ca756c",
+     "who": "cohost",
+     "kind": "dialogue",
+     "text": "All this insistence on finding some grand meaning behind a simple story feels like you are chasing shadows instead of listening to what is actually happening right now.",
+     "turn": 3,
+     "dice_turn_id": "04cbacf906fa4445:t03",
+     "system3_turn_id": "04cbacf906fa4445:t03"
+    },
+    {
+     "ord": 7,
+     "line_id": "33b137675cad48e994ac1d5d904f7352",
+     "who": "cohost",
+     "kind": "dialogue",
+     "text": "I just don't see how all those details connect into anything meaningful for the listener.",
+     "turn": 4,
+     "dice_turn_id": null,
+     "system3_turn_id": "04cbacf906fa4445:t03"
+    },
+    {
+     "ord": 8,
+     "line_id": "c633031531b9430f95f95610052489ee",
+     "who": "board",
+     "kind": "sfx",
+     "text": "🔊 551 guy Won't the",
+     "turn": -1,
+     "dice_turn_id": null,
+     "system3_turn_id": ""
+    }
+   ]
+  }
+ ]
+}

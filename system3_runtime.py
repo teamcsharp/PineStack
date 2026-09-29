@@ -3517,6 +3517,114 @@ class System3Runtime:
         except Exception as exc:  # noqa: BLE001
             self.fail("ledger link", exc)
 
+    # --- [s3-inject] THE HONEST FORCED CARD ------------------------------------------
+    #
+    # "FORCED INJECTORS (dead-air rescue, boot recovery, level-gate cover) =
+    #  honest forced-node cards ("forced: no roll - injected by <system>
+    #  because <reason>") with the timeline injection point; never fake
+    #  dice" - and the ONE TREE rule: "any interjections are just additional
+    #  nodes being added in there ... injected as part of that same broadcast
+    #  node tree for that segment" (the operator, 2026-09-28).  One door for
+    #  everything the station forces onto the air without a roll: the
+    #  injection is recorded as an INJECT observation event (no rng, no
+    #  stages) ON the conversation executing at that point of the timeline,
+    #  so every view of the segment renders it inside the executed tree,
+    #  never as an orphan - and no view ever has to invent dice for it.
+    INJECT_STANDING_REST = 1800.0    # a standing surface (Pine Cam) says so once per spell
+
+    def injected_node(self, by, why, kind="", line_id="", text="", at=None,
+                      conversation_id="", turn_id="", standing=False, extra=None):
+        """Record one forced (no-roll) injection on the executed tree.
+
+        Files "forced: no roll - injected by <by> because <why>" as an
+        INJECT observation on `conversation_id` when given, else on the
+        conversation of `line_id` (the ledger link), else of the line on
+        air (_SPEAKING_NOW -> the ledger link / the line hook's stamp),
+        else the newest conversation the runtime holds - the tree the
+        injection lands in.  `standing=True` is a fixed surface's card
+        (GAP 11): written once per spell, deduped for
+        INJECT_STANDING_REST seconds.  Returns True when the write was
+        queued.  Never raises into an air path; never rolls anything."""
+        try:
+            if self.store is None:
+                return False
+            by = " ".join(str(by or "the station").split())[:120]
+            why = " ".join(str(why or "").split())[:400] or "no reason was recorded"
+            when = float(at or time.time())
+            if standing:
+                with self.lock:
+                    stood = self.__dict__.setdefault("_inject_stood", {})
+                    key = (by, str(kind or ""))
+                    if when - float(stood.get(key) or 0.0) < self.INJECT_STANDING_REST:
+                        return False
+                    stood[key] = when
+            sp = getattr(self.host, "_SPEAKING_NOW", None)
+            sp = dict(sp) if isinstance(sp, dict) else {}
+            held = getattr(self.host, "_S3_LINE_BY_ID", None)
+            held = dict(held) if isinstance(held, dict) else {}
+            body = {"stage": "injected", "by": by, "why": why,
+                    "card": "forced: no roll - injected by %s because %s" % (by, why),
+                    "kind": str(kind or ""), "line_id": str(line_id or ""),
+                    "text": " ".join(str(text or "").split())[:300],
+                    "authority": "forced", "at": when}
+            if standing:
+                body["standing"] = True
+            if isinstance(extra, dict):
+                for k, v in list(extra.items())[:8]:
+                    body.setdefault(str(k)[:40], v)
+            want_cid, want_tid = str(conversation_id or ""), str(turn_id or "")
+
+            def job():
+                cid, tid, how = want_cid, want_tid, "the caller named the round"
+                try:
+                    def link_of(lid):
+                        if not lid:
+                            return None
+                        got = held.get(lid)
+                        if not (isinstance(got, dict) and got.get("conversation_id")):
+                            try:
+                                got = self.store.line(lid)
+                            except Exception:  # noqa: BLE001
+                                got = None
+                        return got if isinstance(got, dict) and got.get("conversation_id") else None
+                    if not cid:
+                        stamp = link_of(str(line_id or ""))
+                        if stamp:
+                            cid = str(stamp["conversation_id"])
+                            tid = str(stamp.get("turn_id") or "")
+                            how = "its own line's link"
+                    if not cid:
+                        stamp = link_of(str(sp.get("id") or ""))
+                        if stamp:
+                            cid = str(stamp["conversation_id"])
+                            tid = str(stamp.get("turn_id") or "")
+                            how = "the line on air"
+                    if not cid:
+                        with self.lock:
+                            cid = next(reversed(self.recent), "") if self.recent else ""
+                        how = "the newest round the runtime holds"
+                    if not cid:
+                        rows = self.store.conversations(limit=1)
+                        cid = str(((rows or [{}])[0] or {}).get("conversation_id") or "")
+                        how = "the newest round in the store"
+                    if not cid:
+                        with self.lock:
+                            self.metrics["inject_dropped"] = self.metrics.get("inject_dropped", 0) + 1
+                        return
+                    body["anchored"] = how
+                    if tid:
+                        body["turn_id"] = tid   # the card sits ON its turn in every view
+                    self.store.add_observation(cid, "INJECT", body, tid)
+                    with self.lock:
+                        self.metrics["injected"] = self.metrics.get("injected", 0) + 1
+                except Exception as exc:  # noqa: BLE001
+                    self.fail("injected node", exc)
+            _STORE_POOL.submit(job)
+            return True
+        except Exception as exc:  # noqa: BLE001
+            self.fail("injected node", exc)
+            return False
+
     # --- [s3-segment] the scheduled segments the air goes through ----------------------
     #
     # "every conversation should be chained as the "segment" per the station that is
@@ -4236,6 +4344,7 @@ def install(app, namespace):
     namespace["system3_writing_for"] = _S3_WRITE
     namespace["system3_split_line"] = rt.split_line                    # [s3-split]
     namespace["system3_note_pace"] = rt.note_pace
+    namespace["system3_injected_node"] = rt.injected_node          # [s3-inject] the honest forced card
     namespace["_system3"] = lambda: rt
 
     @app.on_event("startup")

@@ -1012,7 +1012,10 @@ async def continuity_roulette(voices: Any, said_at: Any) -> tuple[list[Any], int
      r'''        # [s3-banks-roll] ONLY BARS MINTED FROM SYSTEM 3 TURNS: while System 3
         # owns the dialogue a bar with no turn behind it is stock made outside
         # the roulette, and it stays in the bank (gold_source)
-        if _s3_active():
+        if _s3_active() or _s3_dice_live():   # [s3-cover-b] GAP 9
+            # The stamp keys on the DICE being live (gold_air_stamp), so
+            # the source gate must too: under active_selected_roads a bar
+            # with no System 3 turn behind it used to slip out unstamped.
             pool = [r for r in pool if gold_source(r)]
         while pool:
             least = min(int(r.get("fired") or 0) for r in pool)
@@ -1067,9 +1070,7 @@ async def continuity_roulette(voices: Any, said_at: Any) -> tuple[list[Any], int
 ''',
      r'''                              round_as="gold",
                               # [s3-banks-roll] the bar is its source turn's node on the air
-                              system3=(gold_air_stamp(bar, "" if bars else "gold.run",
-                                                      _t_run, _t_pick)
-                                       if _s3_dice_live() else None))
+                              system3=_bar_stamp)
 ''', 1),
     ('gold-in-round-node',
      r'''                            line_ids.append(uuid.uuid4().hex)           # #1277

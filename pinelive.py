@@ -1412,6 +1412,9 @@ class PineLive:
             self._set_phase("stopping")
         if was_live:
             self._give_air("stop")
+            self._s3_inject("MX Live", "the operator ended the set (%s) - the "
+                            "station's own playout has the air again" % why,
+                            kind="set-stop")   # [s3-inject]
         if self.recorder is not None and not rehearse:
             self.recorder.end()
         if not rehearse:
@@ -1502,6 +1505,20 @@ class PineLive:
                 "album": "PineLive", "seconds": PSEUDO_SECONDS, "live": True,
                 "pinelive": True, "path": "", "ext": "mp3"}
 
+    def _s3_inject(self, by: str, why: str, kind: str = "") -> None:
+        """[s3-inject] The honest forced card: a hand-over of the air that no
+        roulette decided - the set taking the air, the level gate's cover, the
+        stop control - is an injected node on the segment's executed tree
+        ("forced: no roll - injected by <system> because <reason>"), through
+        System 3's one shared door.  Never raises; a station without System 3
+        simply keeps its events.jsonl and the gap ledger."""
+        try:
+            inject = _app("system3_injected_node")
+            if callable(inject):
+                inject(by=by, why=why, kind=kind or "pinelive")
+        except Exception:  # noqa: BLE001
+            pass
+
     def _take_air(self, why: str) -> None:
         """Arming/fallback -> live: the record goes back to the head of the
         queue and the loop drops the set in its place, at once."""
@@ -1541,6 +1558,10 @@ class PineLive:
                 skip()
             self.note("live", "the set has the air (%s)%s" % (
                 why, (" - %s waits at the head of the queue" % held) if held else ""))
+            self._s3_inject("MX Live", "the set has the air (%s) - the operator's "
+                            "live input plays as the record%s"
+                            % (why, (" while %s waits at the head of the queue" % held)
+                               if held else ""), kind="set-start")   # [s3-inject]
         self.on_loop(_on_loop)
 
     def _give_air(self, why: str) -> None:
@@ -1570,6 +1591,9 @@ class PineLive:
             if self.event is not None:
                 self.event["fallbacks"] = int(self.event.get("fallbacks") or 0) + 1
         self._give_air(code)
+        self._s3_inject("the level gate",
+                        say + " - the station's own playout covers the set",
+                        kind="cover")   # [s3-inject]
         self.error(code, say)
 
     # -- the supervisor (a thread: a stalled loop cannot stall the decision) --------------

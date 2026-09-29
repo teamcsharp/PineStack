@@ -30194,6 +30194,18 @@ async def page_recovery_start() -> None:
                 producer="page_recovery_start")
             delivery = page_feed_append(clip)
             page_recovery_chat_rows(clip, delivery)
+        # [s3-inject] the honest forced card: a restart, not a roll, put
+        # these back on the air.
+        _inject = globals().get("system3_injected_node")
+        if callable(_inject) and saved:
+            _inject(by="boot recovery",
+                    why="the restart cut the page feed - %d preserved "
+                        "deliver%s republished in the queued order"
+                        % (len(saved), "y" if len(saved) == 1 else "ies"),
+                    kind="boot",
+                    line_id=str((saved[0] or {}).get("row_id")
+                                or (saved[0] or {}).get("delivery_id") or ""),
+                    extra={"deliveries": len(saved)})
         await _paged_settle(float(_PAGE_AIR_UNTIL[0] or 0))
     finally:
         _floor_drop(owned)
@@ -33076,14 +33088,33 @@ def radio_fill(station: str) -> list[dict[str, Any]]:
                          f"{_focus.get('value')} - the focus is ignored for "
                          "now rather than taking the air off (#984)")
     _deal = random.Random(int(s3_roll("records.rotation_deal", "the order the rotation is dealt in (one roll deals the whole shuffle, #984)") * (1 << 53)))   # [s3-dice-door]
+    # [s3-cover-b] ONE roll deals the whole shuffle: keep its record, so
+    # every spin off this queue can name the roll it joins - and the loved
+    # bias is a desk row (records.loved_bias) the operator can rest.
+    _loved_w = 0.3
+    if loved and _s3_dice_live():
+        try:
+            if not s3_chance("records.loved_bias", 1.0,
+                             "a thumbs-up pulls a record toward the front "
+                             "of the shuffle (weight 0.3 while it holds)"):
+                _loved_w = 1.0
+        except Exception:  # noqa: BLE001
+            _loved_w = 0.3
+    try:
+        _RADIO["rotation_deal_s3"] = {
+            "at": round(time.time(), 3), "dealt": len(tracks),
+            "loved": len(loved or ()), "loved_weight": _loved_w,
+            **_s3_spin_roll("records.rotation_deal")}
+    except Exception:  # noqa: BLE001
+        pass
     _deal.shuffle(tracks)
-    if loved:
+    if loved and _loved_w < 1.0:
         # Scaling a random sort key biases a loved track toward the front of
         # the queue, so it comes round often without ever being queued twice.
         # ponytail: a bias, not a weighted rotation — swap in a real weighted
         # shuffle if you want a guaranteed ratio.
         tracks.sort(key=lambda t: _deal.random()   # [s3-dice-door] the same deal
-                    * (0.3 if t["id"] in loved else 1.0))
+                    * (_loved_w if t["id"] in loved else 1.0))   # [s3-cover-b]
     return tracks
 
 
@@ -33092,7 +33123,8 @@ def radio_next_track() -> dict[str, Any] | None:
         _RADIO["queue"] = radio_fill(_RADIO["station"])
     if not _RADIO["queue"]:
         return None
-    track = _RADIO["queue"].pop(0)
+    track = _spin_stamp(_RADIO["queue"].pop(0), "rotation",   # [s3-cover-b]
+                        position=1, of=len(_RADIO["queue"]) + 1)
     _RADIO["now"] = track
     _RADIO["started"] = time.time()
     # Moods cool one notch per record — a caller who left furious is
@@ -38680,6 +38712,97 @@ def dj_skip() -> None:
             pass
 
 
+# --- [s3-cover-b] GAP 2: EVERY SPIN IS A RECORDED ROLL ------------------------
+#
+# "MUSIC SPINS, the operator's decided FULL ROULETTE ON THE DESK." The picker
+# that owns the decision is dj_next_track; each lane leaves through
+# _spin_stamp with the roll that chose it (the desk's records.* rows, made
+# through the [s3-dice-door]) or an honest forced note per the ONE TREE rule
+# (a FIFO request, MX Live holding the air). _music_log_append writes the
+# stamp on the spin's own row, so a spin joins its roll at the air door too.
+
+
+def _s3_spin_roll(key: str, within: float = 60.0) -> dict[str, Any]:
+    """The dice-door roll this thread last recorded under `key`, thinned for
+    a spin row. {} when the station rolled its own (dice off)."""
+    fn = globals().get("system3_last_roll")
+    try:
+        rec = fn(key) if fn else None
+    except Exception:  # noqa: BLE001
+        rec = None
+    if (not isinstance(rec, dict)
+            or time.time() - float(rec.get("at") or 0) > float(within)):
+        return {}
+    return {k: rec.get(k) for k in ("kind", "key", "label", "odds", "hit",
+                                    "dice", "u", "index", "of", "picked")
+            if rec.get(k) is not None}
+
+
+def _spin_stamp(track: Any, lane: str, roll: str = "",
+                note: str = "", **facts: Any) -> Any:
+    """A COPY of `track` carrying its spin's record: the lane, the roll that
+    let it out (read back off the dice door, never re-derived), the deal it
+    joins for a rotation spin, or the honest forced note. Never raises and
+    never mutates the library's own row."""
+    if not isinstance(track, dict) or not track:
+        return track
+    out = dict(track)
+    spin: dict[str, Any] = {"lane": str(lane), "at": round(time.time(), 3)}
+    try:
+        if roll:
+            rec = _s3_spin_roll(roll)
+            if rec:
+                spin["roll"] = rec
+        for k, v in facts.items():
+            if isinstance(v, dict):
+                v = {a: b for a, b in v.items() if b is not None}
+            if v not in (None, "", {}):
+                spin[k] = v
+        if lane == "rotation":
+            deal = _RADIO.get("rotation_deal_s3")
+            if isinstance(deal, dict):
+                spin["deal"] = {k: deal.get(k) for k in
+                                ("key", "dice", "u", "at", "dealt", "loved",
+                                 "loved_weight") if deal.get(k) is not None}
+        if note:
+            spin["why"] = str(note)[:200]
+        if "roll" not in spin and "deal" not in spin and "due" not in spin:
+            # the ONE TREE rule: truly unrolled = an honest forced note
+            spin["forced"] = True
+            spin.setdefault("why", "no roll owns this lane")
+    except Exception:  # noqa: BLE001
+        pass
+    out["s3_spin"] = spin
+    return out
+
+
+def _spin_requested_by(track: Any) -> str:
+    """What the station knows of who asked: the request book's last words."""
+    try:
+        row = read_requests().get(str((track or {}).get("id") or "")) or {}
+        return str(row.get("asked_last") or "")[:120] or "a listener"
+    except Exception:  # noqa: BLE001
+        return "a listener"
+
+
+def _spin_request_jump() -> bool:
+    """The desk row over the request lane. The station's own odds are 1.0 -
+    a request jumping the queue IS the request line - rolled only while the
+    dice are live, so the desk can hold requests back; with the dice off the
+    lane is exactly as it always was (no draw is spent)."""
+    if not _s3_dice_live():
+        return True
+    try:
+        if s3_chance("records.request_jump", 1.0,
+                     "a request jumps the queue (the request line's whole point)"):
+            return True
+        pipeline_log("air", "[s3-cover-b] the desk held the request back this "
+                            "spin - the rotation plays and the request stays queued")
+        return False
+    except Exception:  # noqa: BLE001
+        return True
+
+
 def dj_next_track() -> dict[str, Any] | None:
     """Requests jump the queue; that is the whole point of a request line.
 
@@ -38693,7 +38816,8 @@ def dj_next_track() -> dict[str, Any] | None:
     # [pinelive] MX Live: while the set has the air, it IS the record.
     _live_set = pinelive.live_track()
     if _live_set:
-        return _live_set
+        return _spin_stamp(_live_set, "live",   # [s3-cover-b]
+                           note="MX Live owns the air: the set IS the record")
     dj = dj_settings()
     # Paused air still carries music, but it must not spend a record whose
     # exact intro/outro is being banked for the booth. If the pause landed
@@ -38714,16 +38838,28 @@ def dj_next_track() -> dict[str, Any] | None:
             pass
     # Every Nth song the mail arrives: the next thing on air is a tape from
     # the mysterious Ehm Eckx, not whatever the queue had in mind (#239).
-    if (dj["mixtape_every"]
-            and _RADIO.get("since_tape", 0) >= dj["mixtape_every"]):
+    # [s3-cover-b] the cadence is a desk row while the dice are live: the
+    # station's own odds are the counter's verdict (1.0 when due), so the
+    # show is unchanged until the operator edits the row down.
+    _tape_due = bool(dj["mixtape_every"]
+                     and _RADIO.get("since_tape", 0) >= dj["mixtape_every"])
+    if _tape_due and _s3_dice_live():
+        _tape_due = bool(s3_chance(
+            "records.mixtape_due", 1.0,
+            "the mail arrives: every Nth record is a tape from Ehm Eckx (#239)"))
+    if _tape_due:
         tape = mixtape_pick()
         if tape:
             _RADIO["since_tape"] = 0
+            tape = _spin_stamp(tape, "mixtape", roll="mixtape.pick",   # [s3-cover-b]
+                               due=_s3_spin_roll("records.mixtape_due"))
             _RADIO["coming"] = tape
             return tape
-    if _RADIO["requests"]:
-        track = _RADIO["requests"].pop(0)
-        track = {**track, "requested": True}
+    if _RADIO["requests"] and _spin_request_jump():   # [s3-cover-b]
+        track = {**_RADIO["requests"].pop(0), "requested": True}
+        track = _spin_stamp(track, "request", roll="records.request_jump",   # [s3-cover-b]
+                            requested_by=_spin_requested_by(track),
+                            note="requests jump the queue (FIFO front)")
     else:
         if not _RADIO["queue"]:
             _RADIO["queue"] = radio_fill(_RADIO["station"])
@@ -38743,7 +38879,9 @@ def dj_next_track() -> dict[str, Any] | None:
                             not in _TRACK_TALK), -1)
             if take_at < 0:
                 return None
-        track = _RADIO["queue"].pop(take_at)
+        track = _spin_stamp(_RADIO["queue"].pop(take_at), "rotation",   # [s3-cover-b]
+                            position=take_at + 1,
+                            of=len(_RADIO["queue"]) + 1)
         # #1156: when the share crawls, a record already on the local
         # shelf outranks one that is not - unless this one owns banked
         # talk, which was written for it and would be stranded.
@@ -38757,6 +38895,7 @@ def dj_next_track() -> dict[str, Any] | None:
                     -1)
                 _alt = (_RADIO["queue"].pop(_alt_at) if _alt_at >= 0
                         else _hot_shelf_pick())
+                _alt_roll = "records.hot_shelf" if _alt_at < 0 else ""   # [s3-cover-b]
                 if _alt:
                     _RADIO["queue"].insert(0, track)
                     pipeline_log(
@@ -38765,7 +38904,10 @@ def dj_next_track() -> dict[str, Any] | None:
                         f"{_alt.get('title') or 'a record'} plays from "
                         f"the local shelf; {track.get('title') or 'the pick'} "
                         "goes back to the top (#1156)")
-                    track = _alt
+                    track = _spin_stamp(   # [s3-cover-b]
+                        _alt, "hot_shelf", roll=_alt_roll,
+                        note="the library is crawling - a record already "
+                             "on the local shelf outranks the pick (#1156)")
         except Exception:  # noqa: BLE001
             pass
     _RADIO["coming"] = track
@@ -60051,6 +60193,18 @@ async def dead_air_rescue(quiet: float) -> str:
                                 "round, off the shelf, out of turn - the "
                                 "cupboard is for exactly this"
                          % (len(said), kind))
+            # [s3-inject] the honest forced card, on the tree it joined:
+            # nothing rolled this round in - the silence did.
+            _inject = globals().get("system3_injected_node")
+            if callable(_inject):
+                _inject(by="the dead-air rescue",
+                        why=("the show ran out of things to say"
+                             if quiet <= 0 else
+                             "the room was quiet %d s" % int(quiet))
+                        + " - a finished %s round went out off the shelf, "
+                          "out of turn (%d line(s))" % (kind, len(said)),
+                        kind="rescue", at=now,
+                        extra={"road": kind, "lines": len(said)})
             return kind
     pipeline_log("air", "the room has been quiet %ds; the cupboard holds %s "
                         "but nothing would go out - falling back to the sting"
@@ -73481,6 +73635,22 @@ async def dj_upstairs_page(row: dict[str, Any] | None = None) -> bool:
         return False
     air_at = (float(page_clip.get("broadcast_ms") or 0) / 1000.0
               if delivery_id else started) or started
+    # [s3-cover-b] GAP 5: a page written before its road was System 3's
+    # (the older book, the verbatim memo) airs with a node planned HERE -
+    # the same stamping dj_upstairs_write gives a fresh page - and the
+    # stamp is kept on the page row so its reruns name the same node.
+    if not isinstance(made.get("system3"), dict):
+        _page_stamp = await _s3_door_line(
+            "upstairs", who="manager", seat="C", name=boss,
+            context=str(made.get("gripe") or "a memo from upstairs"),
+            text=spoken)
+        if _page_stamp:
+            made["system3"] = dict(_page_stamp)
+            try:
+                upstairs_update(str(made.get("id") or ""),
+                                system3=dict(_page_stamp))
+            except Exception:  # noqa: BLE001
+                pass
     entry = {
         "id": line_id, "ts": int(started), "air_at": air_at,
         "who": "manager", "name": boss, "kind": "manager",
@@ -73717,6 +73887,8 @@ def _music_log_append(track: dict[str, Any] | None,
                     "tape": bool(track.get("tape")),
                     "to": _RADIO.get("music_to") or "here",
                 }
+                if isinstance(track.get("s3_spin"), dict):   # [s3-cover-b]
+                    row["s3"] = dict(track["s3_spin"])
             with MUSIC_LOG_PATH.open("a") as handle:
                 handle.write(json.dumps(row) + "\n")
             if MUSIC_LOG_PATH.stat().st_size > 1_000_000:
@@ -74306,11 +74478,19 @@ async def dj_music_ad(product: str, remember: bool = True) -> dict[str, Any]:
     # happened; the airings ledger never saw it either. It files its own
     # listing now, the same shape as every other ad, carrying the mixed
     # clip so the tile can play it and keep it.
-    ad_booth_row(line, product,
-                 ad_id=str((entry or {}).get("id") or ""),
-                 media=str((play or {}).get("path") or ""),
-                 sig=str((play or {}).get("sig") or ""),
-                 voice=forced or "", air_at=_ad_at)
+    _bed_row = ad_booth_row(line, product,   # [s3-cover-b] GAP 4
+                            ad_id=str((entry or {}).get("id") or ""),
+                            media=str((play or {}).get("path") or ""),
+                            sig=str((play or {}).get("sig") or ""),
+                            voice=forced or "", air_at=_ad_at)
+    # [s3-cover-b] the music-bed spot never passes dj_speak, so its row
+    # is stamped here, at its own door, on the ad_spot road.
+    if isinstance(_bed_row, dict) and not _bed_row.get("system3"):
+        _bed_stamp = await _s3_door_line(
+            "ad_spot", who="dj",
+            context="a music-bed spot: " + str(product or ""), text=line)
+        if _bed_stamp:
+            _bed_row["system3"] = _bed_stamp
     try:
         ad_aired(entry or {"product": product, "text": line},
                  _RADIO.get("voice_to") or "box")                  # #743
@@ -74658,6 +74838,19 @@ async def _air_produced_ad(entry: dict[str, Any], on_handoff: Any = None) -> boo
     # credit a temporary label identity and then credit the row again later.
     if isinstance(entry.get("system3"), dict):               # [s3-roads]
         booth_row["system3"] = dict(entry["system3"])
+    else:                                                    # [s3-cover-b] GAP 4
+        # A produced spot that reaches the air without a node gets one AT
+        # THE DOOR: the read planned on the ad_spot road, the task's fresh
+        # rolls (which spot, the rerun, the cupboard break) absorbed onto
+        # it, and the stamp lands on this very ledger row (census id
+        # bd161f's shape: kind=ad, round='', no s3).
+        _door_stamp = await _s3_door_line(
+            "ad_spot", who="dj",
+            context=("a produced spot: "
+                     + str(entry.get("product") or "a produced spot")),
+            text=str(entry.get("text") or label))
+        if _door_stamp:
+            booth_row["system3"] = _door_stamp
     page_delivery = ""
     box_played = False
     box_dispatched = False
@@ -88249,9 +88442,14 @@ def sting_due(after: str = "") -> Path | None:   # [#1251] the line it follows
     if _unheard and len(_unheard) >= STING_SUBPOOL_MIN and s3_chance("sting.unheard_first", SFX_UNHEARD_SHARE, "the sting is one nobody has heard yet (#1251)"):   # [#1188] [s3-dice-door]
         _pool = [n for n in names_pool if n in _unheard]
         _pick = (unrepeated(_pool, "sting",
-                            keep=sting_keep(len(set(_pool))))
+                            keep=sting_keep(len(set(_pool))),
+                            director=_S3ClipDice("sfx.sampler", "which clip the sampler drops (never-heard first)"))   # [s3-cover-b]
                  if _pool else None)                             # #1223
         if _pick:
+            _sfx_roll_note(_pick, "sampler",   # [s3-cover-b]
+                           {"label": Path(_pick).parent.name,
+                            "by": "the never-heard-first road (#1251)"},
+                           _s3_sfx_rolled("sfx.sampler", Path(_pick).stem), 1)
             try:
                 _STING_DRAW_MEMO.get("unheard", set()).discard(_pick)   # [#1188] drawn = heard
             except Exception:  # noqa: BLE001
@@ -88263,7 +88461,13 @@ def sting_due(after: str = "") -> Path | None:   # [#1251] the line it follows
     if fresh and len(fresh) >= STING_SUBPOOL_MIN and s3_chance("sting.fresh_first", SFX_FRESH_SHARE, "the sting is a newly added sample, ahead of the rotation (#1062)"):   # [#1188] [s3-dice-door]
         fresh_pool = [n for n in names_pool if n in fresh] or sorted(fresh)
         names = unrepeated(fresh_pool, "sting",
-                           keep=sting_keep(len(set(fresh_pool))))  # #1223
+                           keep=sting_keep(len(set(fresh_pool))),
+                           director=_S3ClipDice("sfx.sampler", "which clip the sampler drops (a fresh one first)"))  # #1223 [s3-cover-b]
+        if names:   # [s3-cover-b]
+            _sfx_roll_note(names, "sampler",
+                           {"label": Path(names).parent.name,
+                            "by": "the fresh-first road (#1062)"},
+                           _s3_sfx_rolled("sfx.sampler", Path(names).stem), 1)
         if names:
             try:
                 _STING_DRAW_MEMO.get("fresh", set()).discard(names)     # [#1188] drawn = not fresh
@@ -88275,7 +88479,13 @@ def sting_due(after: str = "") -> Path | None:   # [#1251] the line it follows
                          f"({len(fresh)} fresh of {len(pool)} in the pool)")
             return Path(names)
     names = unrepeated(names_pool, "sting",
-                       keep=sting_keep(len(set(names_pool))))      # #1223
+                       keep=sting_keep(len(set(names_pool))),
+                       director=_S3ClipDice("sfx.sampler", "which clip the sampler drops (the rotation)"))      # #1223 [s3-cover-b]
+    if names:   # [s3-cover-b]
+        _sfx_roll_note(names, "sampler",
+                       {"label": Path(names).parent.name,
+                        "by": "the sampler's rotation (#1223)"},
+                       _s3_sfx_rolled("sfx.sampler", Path(names).stem), 1)
     return Path(names) if names else None
 
 
@@ -89643,6 +89853,83 @@ def sfx_gap_status() -> dict[str, Any]:
                     % (sfx_gap_notice(), sfx_gap_burst(), sfx_gap_rest()))}
 
 
+async def _s3_door_line(road: str, who: str = "dj", seat: str = "",
+                        name: str = "", context: str = "", text: str = "",
+                        bank: bool = True) -> dict[str, Any] | None:
+    """[s3-cover-b] GAPs 3/4/5: a node planned AT AN AIRING DOOR for a thing
+    that reaches the air without one - a produced spot, a music-bed spot, an
+    older page from upstairs, a loose board clip. The road's plan absorbs the
+    task's fresh rolls, the words are bound, and the stamp is returned for
+    the ledger row. None while System 3 does not answer: the row then stays
+    honestly unstamped rather than wearing an invented one."""
+    direct = globals().get("system3_direct_line")
+    if not direct:
+        return None
+    # The node is planned for words ALREADY written: it must not become the
+    # conversation a later prompt on this task records its blocks on.
+    _writing = globals().get("system3_writing_for")
+    try:
+        _was = _writing.get() if _writing is not None else None
+    except Exception:  # noqa: BLE001
+        _writing = _was = None
+    try:
+        kw: dict[str, Any] = {"road": road, "who": who, "dj": dj_settings(),
+                              "context": str(context or "")[:400],
+                              "text": str(text or "")[:600],
+                              "bank": bool(bank)}
+        if seat:
+            kw["seat"] = seat
+        if name:
+            kw["name"] = name
+        _h = await direct(**kw)
+        if _h is None or not (getattr(_h, "stamp", None) or {}).get("conversation_id"):
+            return None
+        bind = globals().get("system3_bind_line")
+        if bind and text:
+            try:
+                bind(_h, str(text))
+            except Exception:  # noqa: BLE001
+                pass
+        return dict(_h.stamp)
+    except Exception as _exc:  # noqa: BLE001
+        pipeline_log("system3", "a door line could not be planned on the "
+                     "%s road - the row airs unstamped, and says so" % road,
+                     extra=("%s: %s" % (type(_exc).__name__, _exc))[:200])
+        return None
+    finally:
+        if _writing is not None:
+            try:
+                _writing.set(_was)
+            except Exception:  # noqa: BLE001
+                pass
+
+
+async def _s3_loose_board_stamp(row: dict[str, Any], sample: Any) -> None:
+    """[s3-cover-b] GAPs 3/10: a board clip aired outside any round (the
+    dead-air sampler, the forced door, the cycle) gets a node of its own on
+    the interject road, seat D, carrying the sampler's rolls - so its ledger
+    row names a conversation like every other airing."""
+    try:
+        if not _s3_dice_live():
+            return
+        got = row.get("system3")
+        if isinstance(got, dict) and got.get("conversation_id"):
+            return
+        stamp = await _s3_door_line(
+            "interject", who="board", seat="D", name="The SFX board",
+            context=("the board punctuates outside a round: "
+                     + str(row.get("text") or Path(str(sample)).stem))[:300])
+        if not stamp:
+            return
+        if isinstance(row.get("sfx_roll"), dict):
+            stamp["sfx_roll"] = dict(row["sfx_roll"])
+        if row.get("poster"):
+            stamp["poster"] = str(row["poster"])
+        row["system3"] = stamp
+    except Exception:  # noqa: BLE001
+        pass
+
+
 async def dj_sting(to_box: bool, after: str = "", who: str = "",
                    force: bool = False,
                    sample: Path | None = None) -> str:
@@ -89819,6 +90106,8 @@ async def dj_sting(to_box: bool, after: str = "", who: str = "",
         **({"match_why": _sting_why, "match_score": _sting_score}
            if _sting_why else {}),
     }
+    _sfx_roll_carry(_sting_row, sample)                    # [s3-cover-b] GAP 3
+    await _s3_loose_board_stamp(_sting_row, sample)        # [s3-cover-b] GAP 10
     _RADIO["chat"].append(_sting_row)
     del _RADIO["chat"][:-RADIO_CHAT_KEEP]
     note_activity("sting", sample.stem)
@@ -91066,7 +91355,10 @@ def gold_pick(exclude_who: str = "", min_rest: float | None = None) -> dict[str,
         # [s3-banks-roll] ONLY BARS MINTED FROM SYSTEM 3 TURNS: while System 3
         # owns the dialogue a bar with no turn behind it is stock made outside
         # the roulette, and it stays in the bank (gold_source)
-        if _s3_active():
+        if _s3_active() or _s3_dice_live():   # [s3-cover-b] GAP 9
+            # The stamp keys on the DICE being live (gold_air_stamp), so
+            # the source gate must too: under active_selected_roads a bar
+            # with no System 3 turn behind it used to slip out unstamped.
             pool = [r for r in pool if gold_source(r)]
         while pool:
             least = min(int(r.get("fired") or 0) for r in pool)
@@ -91240,6 +91532,23 @@ async def gold_fill_gap(why: str = "", floorless: bool = False,
                 "seconds": float(bar.get("seconds") or 0)}
         text = str(bar.get("text") or "")
         _door = _dj_speak_floorless if floorless else dj_speak
+        # [s3-cover-b] GAP 9: while the dice are live a bar either airs
+        # with its stamp (the desk chance, gold.pick, its source turn) or
+        # it does not air - an unstampable bar is refused per the gate and
+        # rested, and the run ends there (the gap goes to the next rung -
+        # never a hot loop on the event loop).
+        _bar_stamp = (gold_air_stamp(bar, "" if bars else "gold.run",
+                                     _t_run, _t_pick)
+                      if _s3_dice_live() else None)
+        if _s3_dice_live() and not _bar_stamp:
+            pipeline_log("air", "[s3-cover-b] a gold bar with no System 3 "
+                                "turn behind it was refused at the door: "
+                         + str(bar.get("text") or "")[:70])
+            try:
+                bar["last"] = time.time()      # rested, so the pick moves on
+            except Exception:  # noqa: BLE001
+                pass
+            break
         try:
             # #1237: a bar off the bank is the BANK filling a hole, not
             # the round whose window the hole is in.
@@ -91248,9 +91557,7 @@ async def gold_fill_gap(why: str = "", floorless: bool = False,
                               checked=True, sting=False, clip=clip,
                               round_as="gold",
                               # [s3-banks-roll] the bar is its source turn's node on the air
-                              system3=(gold_air_stamp(bar, "" if bars else "gold.run",
-                                                      _t_run, _t_pick)
-                                       if _s3_dice_live() else None))
+                              system3=_bar_stamp)
         except Exception as exc:  # noqa: BLE001
             pipeline_log("air", "a gold bar could not fill the air: "
                          f"{type(exc).__name__}: {exc}"[:160])
@@ -108482,10 +108789,63 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                 _pass = [d for d in (passage_source or [])
                          if isinstance(d, dict) and d.get("file") and d.get("text")]
 
+                # [s3-own-dice] A System 3 round's dice belong to its NODES.
+                # `turn_ix` counts the audio chunks this burst aired, not the
+                # script's turns, so the dice looked up by it handed a turn
+                # aired in several chunks the NEXT turns' dice: 2026-09-28,
+                # conversation 04cbacf906fa4445's t00 aired in four chunks
+                # over two bursts and two different chunks wore t01's stamp
+                # (dice 0.937025) while t01's own lines wore none. A row now
+                # takes the dice of the node its WORDS belong to - the very
+                # link its system3 stamp carries - and a chunk continuing a
+                # node already begun says so ("cont": the same node's roll,
+                # not a second one). A round without node dice is untouched.
+                _s3_dice_nodes = {
+                    str(_d["s3"]["turn_id"]): _d
+                    for _d in (turn_dice or {}).values()
+                    if isinstance(_d, dict) and isinstance(_d.get("s3"), dict)
+                    and _d["s3"].get("turn_id")}
+                _s3_said_of: dict[str, str] = {}
+
+                def _s3_cont_of(_row_at: int, _tid: str) -> bool:
+                    # a live-written round names only a turn's FIRST chunk
+                    # with turn_text; a prepared round's takes each carry
+                    # their own, so there the words decide: a chunk that
+                    # does not open its turn continues it
+                    try:
+                        _ti0 = (turn_ix[_row_at]
+                                if _row_at < len(turn_ix) else -1)
+                        if ready_takes is None:
+                            return bool(0 <= _ti0 < len(aired_items)
+                                        and not aired_items[_ti0].get("turn_text"))
+                        if not _s3_said_of:
+                            _ids = ((ready_meta.get("system3") or {}).get("turns") or {})
+                            for _i, (_m, _said) in enumerate(banter_turns(
+                                    str(ready_meta.get("script") or ""),
+                                    str(ready_meta.get("caller_name") or ""),
+                                    str(ready_meta.get("caller2_name") or ""))):
+                                if _ids.get(str(_i)):
+                                    _s3_said_of[str(_ids[str(_i)])] = " ".join(
+                                        str(_said or "").lower().split())
+                            _s3_said_of.setdefault("", "")
+                        _probe = " ".join(str(transcript[_row_at][1] or "")
+                                          .lower().split())[:400]
+                        return (len(_probe) >= 4
+                                and (_s3_said_of.get(_tid) or "").find(_probe) > 0)
+                    except Exception:  # noqa: BLE001
+                        return False
+
                 def _td_of(_row_at: int) -> dict[str, Any]:
                     _t = (turn_ix[_row_at]
                           if _row_at < len(turn_ix) else -1)
                     _got = (turn_dice or {}).get(_t)
+                    if _t >= 0 and _s3_dice_nodes:            # [s3-own-dice]
+                        _st = _s3_row_bare(_row_at)
+                        if _st.get("conversation_id"):
+                            _tid = str(_st.get("turn_id") or "")
+                            _got = _s3_dice_nodes.get(_tid) if _tid else None
+                            if isinstance(_got, dict) and _s3_cont_of(_row_at, _tid):
+                                _got = dict(_got, cont=True)
                     return _got if isinstance(_got, dict) else {}
 
                 def _ts_of(_row_at: int) -> str:
@@ -131525,6 +131885,74 @@ async def dj_requests_api(
     return request_history()
 
 
+@app.get("/api/music/spins/{track_id}")
+async def music_spins_api(
+    track_id: str,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """[s3-cover-b] GAP 2: one record's spins, each with the roll it joined -
+    the album popup's data road (the full breakdown card can come later)."""
+    require_read_auth(authorization)
+    want = str(track_id or "")
+
+    def _read() -> list[dict[str, Any]]:
+        try:
+            lines = MUSIC_LOG_PATH.read_text().splitlines()
+        except Exception:  # noqa: BLE001
+            return []
+        out: list[dict[str, Any]] = []
+        for line in lines[-4000:]:
+            try:
+                row = json.loads(line)
+            except Exception:  # noqa: BLE001
+                continue
+            if row.get("stop") or str(row.get("id") or "") != want:
+                continue
+            out.append({k: row.get(k) for k in
+                        ("at", "id", "title", "artist", "tape", "to", "s3")
+                        if row.get(k) is not None})
+        return out[-200:]
+
+    rows = await asyncio.to_thread(_read)
+    lanes: dict[str, int] = {}
+    for r in rows:
+        lane = str((r.get("s3") or {}).get("lane") or "untraced")
+        lanes[lane] = lanes.get(lane, 0) + 1
+    return {"id": want, "spins": rows, "count": len(rows), "lanes": lanes}
+
+
+@app.get("/api/music/spins")
+async def music_spins_recent_api(
+    limit: int = 60,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """[s3-cover-b] the latest spins with their rolls, oldest first."""
+    require_read_auth(authorization)
+    most = max(1, min(500, int(limit or 60)))
+
+    def _read() -> list[dict[str, Any]]:
+        try:
+            lines = MUSIC_LOG_PATH.read_text().splitlines()
+        except Exception:  # noqa: BLE001
+            return []
+        out: list[dict[str, Any]] = []
+        for line in lines[-(most * 3):]:
+            try:
+                row = json.loads(line)
+            except Exception:  # noqa: BLE001
+                continue
+            if row.get("stop"):
+                continue
+            out.append({k: row.get(k) for k in
+                        ("at", "id", "title", "artist", "tape", "to", "s3")
+                        if row.get(k) is not None})
+        return out[-most:]
+
+    rows = await asyncio.to_thread(_read)
+    traced = sum(1 for r in rows if isinstance(r.get("s3"), dict))
+    return {"spins": rows, "count": len(rows), "traced": traced}
+
+
 @app.post("/api/dj/requests/forget")
 async def dj_requests_forget(
     request: Request,
@@ -134264,6 +134692,82 @@ def _slideshow_thumb_blocking(name: str, width: int) -> tuple[bytes, str] | None
         return None
 
 
+# [s3-visuals] "roulette where they rotate": the slideshow's shuffle and its
+# transitions are System 3's deals, on the records.rotation_deal pattern -
+# ONE recorded roll deals a page's whole order (slideshow.deal), one more
+# deals each served row the transition it enters with, from the POOLS1-tabled
+# pool slideshow.transition the desk can weight or retire. The client brings
+# no seed on its first ask, keeps the dealt one, and nothing about pacing or
+# paging changes - only the randomness source moves, and is recorded.
+SLIDESHOW_TRANSITION_LABEL = ("which transition each slideshow advance enters with "
+                              "(one roll deals the served rows' transitions from the tabled pool)")
+
+
+def _slideshow_last_roll(key: str) -> dict[str, Any]:
+    """The roll System 3 just recorded under `key`, compact - {} when the
+    station rolled its own (the answer then simply carries no dice)."""
+    fn = globals().get("system3_last_roll")
+    try:
+        rec = fn(key) if fn else None
+    except Exception:  # noqa: BLE001
+        rec = None
+    if not (isinstance(rec, dict) and time.time() - float(rec.get("at") or 0) <= 60):
+        return {}
+    return {k: rec[k] for k in ("kind", "key", "label", "dice", "u") if rec.get(k) is not None}
+
+
+def _slideshow_transition_weights(pool: list[str]) -> list[float]:
+    """Each pooled transition's weight on System 3's desk (POOLS1
+    slideshow.transition); 1.0 for one the desk has not seen."""
+    getter = globals().get("_system3")
+    try:
+        config = getter().config if callable(getter) else {}
+    except Exception:  # noqa: BLE001
+        config = {}
+    desk: dict[str, float] = {}
+    for table in (config or {}).get("tables") or []:
+        if not isinstance(table, dict) or table.get("family") != "POOL" or table.get("enabled") is False:
+            continue
+        for cat in table.get("categories") or []:
+            if not (isinstance(cat, dict) and cat.get("id") == "slideshow.transition"):
+                continue
+            for item in cat.get("items") or []:
+                if not isinstance(item, dict):
+                    continue
+                text = " ".join(str(item.get("text") or "").split())
+                try:
+                    desk[text] = 0.0 if item.get("enabled") is False else max(0.0, float(item.get("weight", 1.0) or 0))
+                except (TypeError, ValueError):
+                    desk[text] = 1.0
+    out = [desk.get(t, 1.0) for t in pool]
+    return out if sum(out) > 0 else [1.0] * len(pool)
+
+
+def _slideshow_deal_transitions(page: list[dict[str, Any]]) -> dict[str, Any]:
+    """[s3-visuals] Deal each served row the transition it enters with: the
+    pool is tabled (POOLS1 slideshow.transition), ONE recorded roll seeds the
+    whole deal, and the client's 'all' setting consumes row["transition"] - a
+    fixed transition setting ignores it, exactly as before. Returns the deal's
+    record for the answer; a failed deal never costs the playlist."""
+    if not page:
+        return {}
+    try:
+        concrete = [t for t in SLIDESHOW_TRANSITIONS if t != "all"]
+        pool = [t for t in (s3_pool("slideshow.transition", concrete, SLIDESHOW_TRANSITION_LABEL) or concrete)
+                if t in concrete] or concrete
+        weights = _slideshow_transition_weights(pool)
+        u = s3_roll("slideshow.transition", SLIDESHOW_TRANSITION_LABEL)
+        dealer = random.Random(1 + int(float(u) * float((1 << 53) - 2)))
+        for row in page:
+            row["transition"] = dealer.choices(pool, weights=weights, k=1)[0]
+        rec = _slideshow_last_roll("slideshow.transition")
+        if not rec:
+            return {}                # the station dealt its own: no record is claimed
+        return dict(rec, pool=pool[:24], weights=[round(w, 3) for w in weights[:24]])
+    except Exception:  # noqa: BLE001
+        return {}
+
+
 @app.get("/api/slideshow/playlist")
 async def slideshow_playlist_api(
     request: Request,
@@ -134304,6 +134808,8 @@ async def slideshow_playlist_api(
 
     if since > 0:
         fresh = [r for r in rows if r["at"] > since]
+        if fresh:
+            _slideshow_deal_transitions(fresh[:200])   # [s3-visuals] a new render's entrance is dealt too
         return {"ok": bool(scan.get("ok")), "at": time.time(),
                 "fresh": fresh[:200], "total": scan.get("total", 0),
                 "newest_at": scan.get("newest", 0.0),
@@ -134318,18 +134824,31 @@ async def slideshow_playlist_api(
         rows = [r for r in rows if r["fav"]]
 
     want_order = (order or "shuffle").strip().lower()
+    _deal_seed = max(0, int(seed))                # [s3-visuals] 0: the station deals
+    _deal_roll: dict[str, Any] = {}
     if want_order == "old":
         rows.sort(key=lambda r: r["at"])
     elif want_order == "name":
         rows.sort(key=lambda r: r["file"].lower())
     elif want_order == "shuffle":
-        random.Random(int(seed) or 1).shuffle(rows)
+        # [s3-visuals] the deal is the station's, on the records.rotation_deal
+        # pattern: an ask that brings no seed rolls slideshow.deal ONCE, the
+        # roll deals the page's whole order and the dealt seed rides the
+        # answer - the client keeps it, so page two and every later ask
+        # continue the same deal with no new roll.
+        if not _deal_seed:
+            _deal_u = s3_roll("slideshow.deal",
+                              "the order the slideshow's rotation is dealt in (one roll deals the page's shuffle; the client keeps the dealt seed)")
+            _deal_seed = 1 + int(float(_deal_u) * float((1 << 53) - 2))
+            _deal_roll = _slideshow_last_roll("slideshow.deal")
+        random.Random(_deal_seed).shuffle(rows)
     # "new" is the scan's own order, already newest-first.
 
     total = len(rows)
     start = max(0, int(offset))
     want = max(1, min(int(limit or 200), 500))
     page = rows[start:start + want]
+    _deal_t = _slideshow_deal_transitions(page)   # [s3-visuals] each row's entrance, from the tabled pool
     return {
         "ok": bool(scan.get("ok")),
         "at": time.time(),
@@ -134341,7 +134860,9 @@ async def slideshow_playlist_api(
         "newest_at": scan.get("newest", 0.0),
         "favorites": len(favourite_names),
         "order": want_order,
-        "seed": int(seed) or 1,
+        "seed": _deal_seed or 1,
+        "deal": ({k: v for k, v in (("roll", _deal_roll or None), ("transition", _deal_t or None)) if v}
+                 or None),                        # [s3-visuals] the recorded dice behind this page
         "transitions": SLIDESHOW_TRANSITIONS,
         # The bytes door, so the page never builds this prefix itself.
         "url": "/api/slideshow/media/",
@@ -141268,6 +141789,7 @@ async def pinelink_look_api(
     saw = await asyncio.to_thread(pinelink_scan, bool(fresh))
     got = pinelink_state()
     linked = bool(got.get("state") == "live" and got.get("fresh"))
+    _s3_cam_standing(bool(linked and pinelink_on_air()))   # [s3-inject] GAP 11
     return {
         "seen": bool(saw.get("seen")), "signal": int(saw.get("signal") or 0),
         "ssid": PINELINK_SSID, "linked": linked,
@@ -141397,6 +141919,31 @@ def pinelink_on_air() -> bool:
         return True
 
 
+_PINELINK_S3_STAND = {"was": False}
+
+
+def _s3_cam_standing(on_now: bool) -> None:
+    """[s3-inject] GAP 11: the Pine Cam is a fixed surface - the moment it
+    (re)takes the air is a standing node on the executed tree, honest about
+    having no dice ("fixed surface ... no roll by design").  Only the
+    rising edge writes, and the shared helper rests a standing card half
+    an hour, so the pollers cost nothing.  Never raises."""
+    was = bool(_PINELINK_S3_STAND.get("was"))
+    _PINELINK_S3_STAND["was"] = bool(on_now)
+    if not on_now or was:
+        return
+    _inject = globals().get("system3_injected_node")
+    if callable(_inject):
+        try:
+            _inject(by="Pine Cam",
+                    why="fixed surface: Pine Cam, live camera - no roll by "
+                        "design; the live picture takes the gallery's place "
+                        "on the air while the link is up",
+                    kind="surface", standing=True)
+        except Exception:  # noqa: BLE001
+            pass
+
+
 @app.post("/api/pinelink/on-air")
 async def pinelink_on_air_api(
     request: Request,
@@ -141427,6 +141974,12 @@ async def pinelink_on_air_api(
     except Exception as err:  # noqa: BLE001
         return {"ok": False, "say": "could not remember that: "
                 + str(err)[:160]}
+    try:
+        _got_cam = pinelink_state()
+        _s3_cam_standing(bool(want and _got_cam.get("state") == "live"
+                              and _got_cam.get("fresh")))   # [s3-inject] GAP 11
+    except Exception:  # noqa: BLE001
+        pass
     return {"ok": True, "on_air": want,
             "say": ("a live camera takes the gallery's place on air"
                     if want else
@@ -178902,6 +179455,7 @@ async def h3_hourly_ad_clock() -> None:
                                  (source, str(message)[:180], "" if job else " (not queued)"))
                     h3_hourly_save({"last_at": time.time(), "last_message": str(message)[:200],
                                     "last_source": source, "last_marker": marker})
+                    h3_hourly_airing_note(marker, source, message, job)      # [s3-visuals]
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -178940,7 +179494,18 @@ def h3_hourly_fresh_pick(keys: list[str], what: str) -> str:
         used = h3_hourly_used()
         fresh = [k for k in keys if k not in used]
         if fresh:
-            pick = random.choice(fresh)
+            # [s3-visuals] the never-repeat rotation is System 3's roulette:
+            # drawn on its dice and recorded, uniform over what is left
+            # (h3.hourly_fresh); the station's own uniform choice only when
+            # the dice are off or this runs outside the station.
+            _draw = globals().get("s3_weighted")
+            _k = _draw("h3.hourly_fresh", fresh, [1.0] * len(fresh),
+                       "which unused source the hourly H3 stinger takes (the fresh rotation, %s)" % what) if _draw else None
+            pick = fresh[_k] if isinstance(_k, int) and 0 <= _k < len(fresh) else random.choice(fresh)
+            _read = globals().get("_s3_sfx_rolled")
+            _rec = _read("h3.hourly_fresh", pick, _k) if _read and isinstance(_k, int) else {}
+            _H3_FRESH_ROLL[0] = dict(_rec, kind="pick", key="h3.hourly_fresh",
+                                     picked=pick, at=time.time()) if _rec else None
         elif keys:
             pick = min(keys, key=lambda k: used.get(k, 0.0))
             pipeline_log("ads", "hourly H3: every one of the %d %s has been used once; the one used "
@@ -178994,8 +179559,112 @@ def h3_hourly_window(clip: dict[str, Any]) -> tuple[float, float]:
     """[h3-fresh] A random ten-second window of the clip (all of a short one)."""
     whole = float(clip.get("seconds") or 0.0)
     span = min(H3_HOURLY_WINDOW_S, whole)
-    start = round(random.uniform(0.0, max(0.0, whole - span)), 2)
+    # [s3-visuals] where the window's markers land on the clip is System 3's
+    # roll: one number in [0, 1) over the clip's spare room, recorded
+    # (h3.hourly_marker). The same uniform the station always rolled.
+    _draw = globals().get("s3_roll")
+    _u = _draw("h3.hourly_marker",
+               "where the ten-second window's markers land on the hourly clip (0 = its start, 1 = its end)") if _draw else random.random()
+    start = round(float(_u) * max(0.0, whole - span), 2)
     return start, round(min(whole, start + span), 2)
+
+
+# --- [s3-visuals] THE DOOR'S ROLLS, KEPT FOR THE HOUR'S RECORD ----------------
+#
+# "VISUALS = roulette where they rotate" (operator, 2026-09-28): every pick the
+# hourly door makes is one of System 3's recorded draws, and the door writes
+# what it rolled onto the hour's record (the presets history ad-viewer reads),
+# onto every render row's h3_prompts record, and - one line per hourly render -
+# into data/h3_hourly_airings.jsonl, the durable record that joins a render to
+# its rolls. {} when the station rolled its own (System 3 off): never fake dice.
+_H3_AIRINGS_FILE = DATA_DIR / "h3_hourly_airings.jsonl"
+_H3_HOURLY_ROLLS: dict[str, Any] = {}
+_H3_HOURLY_ROLLS_LAST: list[Any] = [None]
+_H3_FRESH_ROLL: list[Any] = [None]
+H3_HOURLY_SOURCE_LABEL = ("which source road the hourly H3 stinger takes "
+                          "(gallery_share percent of hours start from a gallery picture, the rest from a dialogue clip)")
+
+
+def h3_hourly_fresh_roll() -> dict[str, Any]:
+    """[s3-visuals] The roll that made the last fresh pick. The pick may run in
+    a worker thread (asyncio.to_thread), where System 3's per-thread read-back
+    cannot be seen from the loop - so the pick leaves its record here."""
+    rec, _H3_FRESH_ROLL[0] = _H3_FRESH_ROLL[0], None
+    if isinstance(rec, dict) and time.time() - float(rec.get("at") or 0) <= 120:
+        return {k: v for k, v in rec.items() if k != "at"}
+    return {}
+
+
+def h3_hourly_roll_note(name: str, key: str, rec: Any = None) -> None:
+    """[s3-visuals] Keep the roll the door just made under `key` (or the record
+    handed in), compact, for the hour's record and the airing log."""
+    if rec is None:
+        fn = globals().get("system3_last_roll")
+        try:
+            rec = fn(key) if fn else None
+        except Exception:  # noqa: BLE001
+            rec = None
+        if isinstance(rec, dict) and time.time() - float(rec.get("at") or 0) > 120:
+            rec = None
+    got = {}
+    if isinstance(rec, dict) and rec:
+        got = {k: rec[k] for k in ("kind", "key", "label", "odds", "hit", "dice", "u", "index", "of", "picked")
+               if rec.get(k) is not None}
+        got.setdefault("key", key)
+    _H3_HOURLY_ROLLS[name] = got
+
+
+def h3_hourly_rolls_bind(goal: str) -> dict[str, Any]:
+    """[s3-visuals] The door's rolls, onto the hour's record - the entry the
+    presets history keeps and every render row's h3_prompts record reads -
+    and left for the clock's airing line. Called once per road, right before
+    the render is queued or made."""
+    rolls = {k: v for k, v in _H3_HOURLY_ROLLS.items() if v}
+    _H3_HOURLY_ROLLS.clear()
+    entry = None
+    find = globals().get("h3_prompts_hour_for")
+    try:
+        entry = find(goal, exact=True) if find else None
+    except Exception:  # noqa: BLE001
+        entry = None
+    if isinstance(entry, dict) and entry.get("hour"):
+        if isinstance(entry.get("roll"), dict):
+            rolls = dict(rolls, preset={k: entry["roll"][k]
+                                        for k in ("by", "key", "picked", "index", "of", "dice", "u")
+                                        if entry["roll"].get(k) is not None})
+        if rolls:
+            entry["rolls"] = rolls
+            try:
+                _h3_prompts_offloop(h3_prompts_commit_hour, dict(entry))
+            except Exception:  # noqa: BLE001 - the memory entry still carries them
+                pass
+    _H3_HOURLY_ROLLS_LAST[0] = {"at": time.time(), "hour": str((entry or {}).get("hour") or ""), "rolls": rolls}
+    return rolls
+
+
+def h3_hourly_airing_note(marker: Any, source: Any, message: Any, job: Any) -> None:
+    """[s3-visuals] One durable line per hourly render: the hour, its marker,
+    the source road, the job and the rolls that picked everything - what the
+    census joins (data/h3_hourly_airings.jsonl <-> h3_prompt_presets.json
+    history by `hour`, <-> h3_hourly.json by `marker`)."""
+    bound, _H3_HOURLY_ROLLS_LAST[0] = _H3_HOURLY_ROLLS_LAST[0], None
+    if not (isinstance(bound, dict) and time.time() - float(bound.get("at") or 0) <= 600):
+        bound = {}
+    row = {"at": round(time.time(), 3), "marker": str(marker or ""), "source": str(source or ""),
+           "hour": str(bound.get("hour") or ""), "rolls": bound.get("rolls") or {},
+           "message": str(message or "")[:200],
+           "job": str(job.get("id") or "") if isinstance(job, dict) else ""}
+
+    def write() -> None:
+        try:
+            with _H3_AIRINGS_FILE.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(row) + "\n")
+        except Exception as exc:  # noqa: BLE001
+            pipeline_log("ads", "hourly H3: the airing record was not written (%s)" % type(exc).__name__)
+    try:
+        _h3_prompts_offloop(write)
+    except Exception:  # noqa: BLE001 - a test namespace without the section
+        write()
 
 
 async def h3_hourly_render(state: dict[str, Any]) -> tuple[str, Any, str]:
@@ -179015,7 +179684,14 @@ async def h3_hourly_render(state: dict[str, Any]) -> tuple[str, Any, str]:
             host_share = max(0, min(100, int(state.get("host_share", 0) or 0)))
         except (TypeError, ValueError):
             host_share = 0
-        if host_share and random.randint(1, 100) <= host_share:
+        _h3_host_hit = bool(host_share) and s3_chance(
+            "h3.hourly_host", host_share / 100.0,
+            "whether the host's cast LoRA presents this hourly H3 stinger (host_share percent of hours)",
+            dial="host_share (the H3 door's own dial)")                      # [s3-visuals]
+        if host_share:
+            h3_hourly_roll_note("host", "h3.hourly_host")
+        if _h3_host_hit:
+            h3_hourly_rolls_bind(goal)                                       # [s3-visuals]
             payload = {"mode": "text", "purpose": "parody_stinger", "source": "", "source_type": "",
                        "speech": voice_ad_spoken_copy(goal),
                        "prompt": ("The Pine Box host presents a Pine Box FM stinger at the station's desk, "
@@ -179024,7 +179700,20 @@ async def h3_hourly_render(state: dict[str, Any]) -> tuple[str, Any, str]:
             queued = _parody_stinger_queue().add(payload)
             _parody_stinger_wake.set()
             return ("queued a host stinger (the cast LoRA, %s)" % comfy_workshop.CAST.get("lora"), queued, "host")
-    if share and random.randint(1, 100) <= share:
+    _h3_gallery = False
+    if share:
+        # [s3-visuals] which source road this hour takes is System 3's pick
+        # from the tabled pool (POOLS1 h3.hourly_source - the desk can retire
+        # a road), weighted by the operator's own gallery_share dial: the
+        # same share/100 odds randint(1, 100) <= share always rolled.
+        _h3_srcs = ["gallery picture", "dialogue clip"]
+        _h3_pool = [s for s in (s3_pool("h3.hourly_source", _h3_srcs, H3_HOURLY_SOURCE_LABEL) or _h3_srcs)
+                    if s in _h3_srcs] or _h3_srcs
+        _h3_w = {"gallery picture": float(share), "dialogue clip": float(100 - share)}
+        _h3_k = s3_weighted("h3.hourly_source", _h3_pool, [_h3_w[s] for s in _h3_pool], H3_HOURLY_SOURCE_LABEL)
+        _h3_gallery = _h3_pool[_h3_k if isinstance(_h3_k, int) and 0 <= _h3_k < len(_h3_pool) else 0] == "gallery picture"
+        h3_hourly_roll_note("source", "h3.hourly_source")
+    if _h3_gallery:
         try:
             # [h3-fresh] every picture on the wall, not only the last thirty renders
             images = [p.name for p in await asyncio.to_thread(gallery_files, 600)
@@ -179033,6 +179722,8 @@ async def h3_hourly_render(state: dict[str, Any]) -> tuple[str, Any, str]:
             images = []
         file = (await asyncio.to_thread(h3_hourly_fresh_image, images)) if images else ""
         if file:
+            h3_hourly_roll_note("fresh", "h3.hourly_fresh", rec=h3_hourly_fresh_roll())   # [s3-visuals]
+            h3_hourly_rolls_bind(goal)
             payload = {"mode": "reference", "purpose": "parody_stinger", "source": file,
                        "source_type": "gallery", "speech": voice_ad_spoken_copy(goal),
                        "prompt": "Create a Pine Box FM stinger using the supplied image. Natural motion and "
@@ -179046,9 +179737,14 @@ async def h3_hourly_render(state: dict[str, Any]) -> tuple[str, Any, str]:
     fresh = await asyncio.to_thread(h3_hourly_fresh_clip)
     if fresh.get("id"):
         trim_in, trim_out = h3_hourly_window(fresh)
+        h3_hourly_roll_note("fresh", "h3.hourly_fresh", rec=h3_hourly_fresh_roll())       # [s3-visuals]
+        h3_hourly_roll_note("marker", "h3.hourly_marker")
+        h3_hourly_rolls_bind(goal)
         message, job = await voice_ad_render(goal, reference_clip=fresh, hourly=True,
                                              trim_in_s=trim_in, trim_out_s=trim_out)
         return (message, job, "clip")
+    h3_hourly_roll_note("fresh", "h3.hourly_fresh", rec=h3_hourly_fresh_roll())          # [s3-visuals]
+    h3_hourly_rolls_bind(goal)
     message, job = await voice_ad_render(goal, hourly=True)      # [h3-cinematic]
     return (message, job, "clip")
 
@@ -179580,6 +180276,7 @@ def h3_prompts_words(hour: dict[str, Any], road: str, speech: str = "") -> dict[
     line = h3_prompts_fill(fields["speech"], **values) if fields["speech"] else str(speech or "")
     return {"hour": str(hour.get("hour") or ""), "marker": hour.get("marker"), "at": hour.get("at"),
             "how": hour.get("how"), "preset": dict(hour.get("preset") or {}), "roll": hour.get("roll"),
+            "rolls": hour.get("rolls") if isinstance(hour.get("rolls"), dict) else None,   # [s3-visuals] the door's dice
             "road": road, "fields": fields, "conversation": values["conversation"],
             "record": values["record"], "goal": values["goal"],
             "direction": h3_prompts_fill(fields[road], **values)[:1800] or values["goal"],
@@ -179646,6 +180343,7 @@ def _h3_prompts_hour_view(entry: dict[str, Any]) -> dict[str, Any]:
     return {"hour": entry.get("hour"), "at": entry.get("at"), "marker": entry.get("marker"),
             "how": entry.get("how"), "how_words": h3_prompts_how(entry), "preset": entry.get("preset") or {},
             "roll": entry.get("roll"), "goal": str(entry.get("goal") or "")[:1200],
+            "rolls": entry.get("rolls") if isinstance(entry.get("rolls"), dict) else None,   # [s3-visuals]
             "conversation": str(entry.get("conversation") or "")[:600],
             "fields": entry.get("fields") if isinstance(entry.get("fields"), dict) else {}}
 

@@ -36,6 +36,29 @@
     }
     return 'the active preset';
   }
+  function usedRolls(rolls) {
+    /* [s3-visuals] the hourly door's own dice (h3.hourly_source / _fresh /
+       _marker / _host), recorded with the hour and carried on the row's
+       h3_prompts record - worded only when a roll was actually made
+       (never fake dice; an empty record stays silent). */
+    if (!rolls || typeof rolls !== 'object') return '';
+    var bits = [];
+    function one(name, rec) {
+      if (!rec || typeof rec !== 'object' || rec.dice == null) return;
+      if (rec.kind === 'chance') {
+        bits.push(name + ': ' + (rec.hit ? 'yes' : 'no') + ' (d100 ' + rec.dice
+          + ' against ' + Math.round((rec.odds || 0) * 100) + '%)');
+      } else if (rec.index != null && rec.of != null) {
+        bits.push(name + ': ' + String(rec.picked || rec.label || '') + ' (d100 ' + rec.dice
+          + ', ' + rec.index + ' of ' + rec.of + ')');
+      } else {
+        bits.push(name + ': d100 ' + rec.dice);
+      }
+    }
+    one('host', rolls.host); one('source', rolls.source);
+    one('fresh pick', rolls.fresh); one('window marker', rolls.marker);
+    return bits.join('  -  ');
+  }
   function usedWords(row) {
     row = row || {};
     var rec = row.h3_prompts && typeof row.h3_prompts === 'object' ? row.h3_prompts : null;
@@ -51,6 +74,7 @@
       add('Style', rec.style, 'style');
       add('Audio direction', rec.audio_direction, 'audio_direction');
       add('Constraints', rec.constraints, 'constraints');
+      add('Hourly rolls', usedRolls(rec.rolls), 'rolls');   /* [s3-visuals] the door's dice, when they rolled */
       add('Final H3 prompt', row.tags, 'tags');
       var name = rec.preset && rec.preset.name ? String(rec.preset.name) : 'a preset';
       return {recorded: true, hourly: true, preset: name, how: usedHow(rec), road: USED_ROADS[rec.road] || '',

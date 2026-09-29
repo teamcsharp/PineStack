@@ -9,7 +9,7 @@
  * die shows no number until it lands on the one that was rolled. Nothing
  * here invents a roll for effect.
  */
-const FAM = {CTS: 'var(--cts)', ES: 'var(--es)', RS: 'var(--rs)', IRS: 'var(--irs)', FL: 'var(--fl)', TRACK_TALK: 'var(--topic)',
+const FAM = {INJECT: 'var(--obs)', CTS: 'var(--cts)', ES: 'var(--es)', RS: 'var(--rs)', IRS: 'var(--irs)', FL: 'var(--fl)', TRACK_TALK: 'var(--topic)',
   SPEAKERBOX: 'var(--sb)', SFX: 'var(--sfx)', TOPIC: 'var(--topic)', SFXGUY: 'var(--sfxguy)', LINE: 'var(--line)',
   COMMIT: 'var(--obs)', REPAIR: 'var(--repair)', TINT: 'var(--tint)', ROOM: 'var(--room)',   /* [s3-rewrite] */
   FAV: 'var(--fav)', DIRECTIVE: 'var(--directive)', EVENT: 'var(--repair)', STATION: 'var(--obs)',   /* [s3-cast] [s3-events] [s3-dice-door] */
@@ -133,6 +133,8 @@ function observationLine(o) {
   }
   if (fam === 'SPEAKERBOX') return {fam, dice: null,
     text: `door ${o.door}: ${o.applies === false ? 'did not apply' : `roll ${num(o.roll, 3)} vs ${num((o.rate || 0) + (o.lift || 0), 2)} → ${o.hit ? 'HIT ' + (o.file || '') : 'miss'}`} (${o.rolled_by})`};
+  if (fam === 'INJECT') return {fam, dice: null,
+    text: o.card || ('forced: no roll - injected by ' + (o.by || 'the station') + ' because ' + (o.why || 'no reason was recorded'))};   /* [s3-inject] */
   if (fam === 'COMMIT') return {fam, dice: null, text: `script ledger block ${o.block} · ${(o.lines || []).length} line(s) frozen`};
   if (fam === 'REPAIR') return {fam, dice: null, text: 'repair requested: ' + (o.why || '')};
   return {fam, dice: null, text: o.stage || fam};
@@ -617,6 +619,10 @@ Object.assign(FAMILY_WHAT, {   /* [s3-split] */
     'Whether a long read on a node whose split box is ticked is shared out among the studio. The rule decides it with no dice: the read\'s characters over the voice\'s pace, against the threshold in Config > split (45 s), cut at sentence ends into the fewest parts that fit - up to the node\'s 1 to 3 splits, never inside a sentence. Then one roll per part after the first picks who carries it on: the studio as it is now, never the one reading, never the same voice twice in a row, at the split section\'s weights.'],
   IL: ['Insertion list (IL1)',
     'How the voice the split roll picked takes the read over: the way (grabs the sheet, finishes the sentence, cuts in, picks up where they trailed off, politely, heckles) and the few words said on the way in, before the read carries straight on. Edited in Tables > IL1; a way already used on this read weighs a quarter.']});
+Object.assign(FAMILY_WHAT, {   /* [s3-inject] the honest forced card */
+  INJECT: ['Forced onto the air (no roll)',
+    'Something the station forced onto the air with no dice: the dead-air rescue putting a finished round out of turn, boot recovery republishing what a restart cut off, the level gate covering a live set that dropped out, MX Live taking or giving back the air, or a fixed surface (the Pine Cam) standing on the wall. The card says who injected it and why, at its point in the timeline - an injected node in the segment\'s executed tree, never an orphan, and never a faked roll.'],
+});
 const DIAL_FOR = {ES: ['emotional_volatility'], RS: ['disagreement', 'escalation', 'tangent', 'callback', 'novelty'],
   IRS: ['disagreement', 'escalation'], FL: ['tangent', 'callback', 'novelty', 'closure_aggressiveness', 'escalation'],
   SPEAKERBOX: ['speakerbox_density'], SFX: ['sfx_aggression'], CTS: ['novelty'], TOPIC: ['topics'],
@@ -3116,6 +3122,34 @@ function makeViews({request, onSelect, details = false} = {}) {
         r.label ? el('span', {class: 's3-rl-pick', text: String(r.label).slice(0, 48)}) : null,
         r.of ? el('span', {class: 's3-muted', text: 'of ' + r.of}) : null);
     });
+    /* [s3-inject][gap1] A clip with no roll of its own: a board clip welded
+       as punctuation (line id "<parent>-punct-N" - app.py's _sfx_single_clip
+       stamp) or one played without a stamp. Its dice EXIST - on the turn it
+       punctuates - so the card borrows that turn's SFX-family rolls and says
+       where they live, never a dice-less shrug. */
+    let parentNote = null;
+    if (!dice.length) {
+      const pid = String(line.line_id || '').replace(/-punct-\d+$/, '');
+      let pt = t;
+      if (pid && pid !== String(line.line_id || '')) {
+        const pl = (conv.lines || []).find(x => x && x.line_id === pid && x.turn_id);
+        if (pl) pt = (conv.turns || []).find(x => x.turn_id === pl.turn_id) || t;
+      }
+      const pevs = turnEvents(conv, pt).filter(e => e.family === 'SFX' && e.kind !== 'observation' && !e.stage);
+      for (const ev of pevs) {
+        const ln = eventLine(ev, conv);
+        const face = die(ln.dice);
+        faces.push(face);
+        dice.push(el('span', {class: 's3-rl-chip', style: '--fam:var(--sfx)', role: 'button', tabindex: '0',
+          title: "the punctuated turn's SFX roll - tap for how it was decided",
+          onclick: e => { e.stopPropagation(); openDecision(conv, ev, pt, v.api); },
+          onkeydown: e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); e.currentTarget.click(); } }},
+          face, el('b', {text: 'SFX'}),
+          el('span', {class: 's3-rl-pick', text: String(ln.text || '').slice(0, 48)})));
+      }
+      if (pevs.length) parentNote = el('div', {class: 's3-sfx-why s3-sfx-parent',
+        text: 'no roll of its own - the dice live on the turn it punctuates (turn ' + (pt.index + 1) + ')'});
+    }
     const name = boardName(line);
     const played = pair && pair.played;
     const quips = pair ? ((pair.obs.sfx_guy || []).map(q => q && q.text).filter(Boolean)) : [];
@@ -3137,6 +3171,7 @@ function makeViews({request, onSelect, details = false} = {}) {
       el('div', 'who', sfxAvatar(), el('b', {text: 'SFX'}), el('span', {text: `a sting after turn ${t.index + 1}`})),
       el('div', 's3-bubble s3-sfx-bubble' + (upcoming ? ' s3-roulette' : ''),
         rlDice,
+        parentNote,
         upcoming ? el('span', {class: 's3-rl-hint', text: dice.length ? 'picked - waiting its turn' : 'a sting - waiting its turn'}) : null,
         media || (!upcoming && played ? sfxClipCard(played, v) : null),
         !upcoming && name ? el('div', {class: 's3-clip-name', text: name}) : null,
@@ -5908,10 +5943,35 @@ export async function mountLineStory(root, {request, lineId = '', prompt = '', o
   } else {
     try { got = await request('/api/system3/line?line_id=' + encodeURIComponent(lineId)); } catch (e) { got = null; }
   }
+  /* [s3-inject][gap1] a board clip welded as punctuation carries no stamp of
+     its own - its dice live on the line it punctuates. Strip the "-punct-N"
+     the station welds onto the parent's id and ask again. */
+  let punctOf = '';
+  if ((!got || !got.conversation) && /-punct-\d+$/.test(String(lineId || ''))) {
+    const pid = String(lineId).replace(/-punct-\d+$/, '');
+    try {
+      const p = await request('/api/system3/line?line_id=' + encodeURIComponent(pid));
+      if (p && p.conversation) { got = p; punctOf = pid; }
+    } catch (e) { /* the parent is not stamped either - the plain words below say so */ }
+  }
   if (got && got.conversation && !conv) {
     try { conv = await request('/api/system3/conversation/' + encodeURIComponent(got.conversation.conversation_id)); } catch (e) { conv = null; }
   }
-  const t = conv && got.turn ? (conv.turns || []).find(x => x.turn_id === got.turn.turn_id) : null;
+  let t = conv && got.turn ? (conv.turns || []).find(x => x.turn_id === got.turn.turn_id) : null;
+  /* [s3-inject][gap1] a round's board row: the dice live on the turn it
+     punctuates - resolve that turn (the sting's slot in the ledger's order)
+     and tell the whole story on it, never a one-sentence deflection. */
+  let boardNote = punctOf ? 'a board clip welded as punctuation of line ' + punctOf.slice(0, 8) + '\u2026 - the dice below live on the turn it punctuates' : '';
+  if (conv && !t && String(((got || {}).line || {}).who || '') === 'board') {
+    const bid = String(((got || {}).line || {}).line_id || lineId || '');
+    for (const [tid, slot] of boardPlan(conv)) {
+      if ([...slot.before, ...slot.after].some(l => l && l.line_id === bid)) {
+        t = (conv.turns || []).find(x => x.turn_id === tid) || null;
+        if (t) boardNote = 'a board clip - the dice below live on the turn it punctuates (turn ' + (t.index + 1) + ')';
+        break;
+      }
+    }
+  }
   const tell = (directed, why) => { try { if (typeof onResolved === 'function') onResolved({directed, why, got, conv, turn: t}); } catch (e) { /* the host's own */ } };
   if (conv && got && got.sfxguy) {
     /* [s3-link] the SFX Guy's row: his node and the draw that chose it */
@@ -5953,6 +6013,7 @@ export async function mountLineStory(root, {request, lineId = '', prompt = '', o
       + (got.healed ? ' - ' + got.healed : '')}),
     again);
 
+  if (boardNote) head.append(el('div', {class: 's3-muted s3-story-why', text: boardNote}));   /* [s3-inject][gap1] */
   const rolls = el('div', 's3-story-rolls');
   for (const ev of evs) {
     const row = esTwoStageReel(ev, conv);                  /* [s3-es-reel] */
@@ -9774,6 +9835,14 @@ function sgSting(line) {
 
 /* The air, for the lines a turn has in this segment: heard, withdrawn (and
    why), waiting, or no receipt yet. Filled when the receipts arrive. */
+/* [s3-inject] A forced node on the segment's spine: no die - nothing rolled
+   it onto the air; the card says who injected it, why, and when. */
+function sgInject(o) {
+  return sgNode({fam: 'INJECT', label: o.standing ? 'STANDING' : 'FORCED',
+    text: o.card || ('forced: no roll - injected by ' + (o.by || 'the station') + ' because ' + (o.why || 'no reason was recorded')),
+    sub: [o.at ? 'at ' + clock(Number(o.at)) : '', o.anchored ? 'filed on ' + o.anchored : ''].filter(Boolean).join(' \u00b7 '),
+    cls: 's3-sgn-inset s3-sgn-inject'});
+}
 function sgAirWord(lines, air) {
   if (!lines.length) return {word: 'no line of it in this segment', cls: ''};
   const got = airOfLines(lines, air);
@@ -9836,6 +9905,7 @@ function sgTurn(ctx, conv, t, here, elsewhere) {
       sub: [l.replay_of ? 'first aired as ' + l.replay_of : '', l.gold && typeof l.gold === 'object' ? 'from ' + (l.gold.conversation_id || '') + ' ' + (l.gold.turn_id || '') : ''].filter(Boolean).join(' · '),
       cls: 's3-sgn-inset'}));
   }
+  for (const o of (conv.observations_air || []).filter(o => o.family === 'INJECT' && o.turn_id === t.turn_id)) group.append(sgInject(o));   /* [s3-inject] */
   const airNode = sgNode({fam: 'COMMIT', label: 'AIR', text: lines.length ? 'reading the receipts...' : sgAirWord(lines, ctx.air).word, cls: 's3-sgn-air'});
   airNode.dataset.lines = lines.map(l => l.line_id).join(',');
   group.append(airNode);
@@ -9906,6 +9976,10 @@ function sgConversation(ctx, c) {
   const here = new Set(c.line_ids || []);
   const elsewhere = new Set((conv.lines || []).filter(l => l.turn_id && !here.has(l.line_id)).map(l => l.turn_id));
   for (const t of conv.turns || []) box.append(sgTurn(ctx, conv, t, here, elsewhere.has(t.turn_id)));
+  {   /* [s3-inject] a forced node that names no turn of this round joins it after the turns */
+    const tids = new Set((conv.turns || []).map(t => t.turn_id));
+    for (const o of (conv.observations_air || []).filter(o => o.family === 'INJECT' && !tids.has(o.turn_id))) box.append(sgInject(o));
+  }
   const val = conv.validation || {};
   if (val.verdict) {
     box.append(sgNode({fam: 'REPAIR', label: 'CHECKED', text: `${val.verdict} ${num(val.score)}`,

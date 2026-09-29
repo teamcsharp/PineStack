@@ -97,7 +97,14 @@ HOST_ROAD = r'''    # [h3-cast] the host's own hours: the text road with the cas
             host_share = max(0, min(100, int(state.get("host_share", 0) or 0)))
         except (TypeError, ValueError):
             host_share = 0
-        if host_share and random.randint(1, 100) <= host_share:
+        _h3_host_hit = bool(host_share) and s3_chance(
+            "h3.hourly_host", host_share / 100.0,
+            "whether the host's cast LoRA presents this hourly H3 stinger (host_share percent of hours)",
+            dial="host_share (the H3 door's own dial)")                      # [s3-visuals]
+        if host_share:
+            h3_hourly_roll_note("host", "h3.hourly_host")
+        if _h3_host_hit:
+            h3_hourly_rolls_bind(goal)                                       # [s3-visuals]
             payload = {"mode": "text", "purpose": "parody_stinger", "source": "", "source_type": "",
                        "speech": voice_ad_spoken_copy(goal),
                        "prompt": ("The Pine Box host presents a Pine Box FM stinger at the station's desk, "
@@ -106,6 +113,28 @@ HOST_ROAD = r'''    # [h3-cast] the host's own hours: the text road with the cas
             queued = _parody_stinger_queue().add(payload)
             _parody_stinger_wake.set()
             return ("queued a host stinger (the cast LoRA, %s)" % comfy_workshop.CAST.get("lora"), queued, "host")
+'''
+
+# [s3-visuals] 2026-09-28: the source gate the host road hands over to is
+# System 3's pick now (tools/s3_visuals_patch.py). This tool's stored text was
+# re-anchored by hand - its old anchor (the bare randint gate) is what a FRESH
+# app.py still holds, and applying here writes the final, dice-door text, so
+# the s3_visuals edits then read as applied. Chain order on a fresh file:
+# h3_cast -> h3_fresh -> h3_prompt_presets -> s3_visuals.
+SOURCE_ROAD = r'''    _h3_gallery = False
+    if share:
+        # [s3-visuals] which source road this hour takes is System 3's pick
+        # from the tabled pool (POOLS1 h3.hourly_source - the desk can retire
+        # a road), weighted by the operator's own gallery_share dial: the
+        # same share/100 odds randint(1, 100) <= share always rolled.
+        _h3_srcs = ["gallery picture", "dialogue clip"]
+        _h3_pool = [s for s in (s3_pool("h3.hourly_source", _h3_srcs, H3_HOURLY_SOURCE_LABEL) or _h3_srcs)
+                    if s in _h3_srcs] or _h3_srcs
+        _h3_w = {"gallery picture": float(share), "dialogue clip": float(100 - share)}
+        _h3_k = s3_weighted("h3.hourly_source", _h3_pool, [_h3_w[s] for s in _h3_pool], H3_HOURLY_SOURCE_LABEL)
+        _h3_gallery = _h3_pool[_h3_k if isinstance(_h3_k, int) and 0 <= _h3_k < len(_h3_pool) else 0] == "gallery picture"
+        h3_hourly_roll_note("source", "h3.hourly_source")
+    if _h3_gallery:
 '''
 
 EDITS = [
@@ -150,7 +179,7 @@ EDITS = [
      '    return (message, job, "clip")\n', 1),
     ("the-host-has-hours",
      '    if share and random.randint(1, 100) <= share:\n',
-     HOST_ROAD + '    if share and random.randint(1, 100) <= share:\n', 1),
+     HOST_ROAD + SOURCE_ROAD, 1),
     ("the-cast-loads-with-the-switch",
      '                                                    "last_source", "last_marker", "quality", "brief") if k in got})\n',
      '                                                    "last_source", "last_marker", "quality", "brief",\n'

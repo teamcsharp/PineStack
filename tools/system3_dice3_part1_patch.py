@@ -80,8 +80,27 @@ EDITS = [
     if loved:
 ''',
      r'''    _deal = random.Random(int(s3_roll("records.rotation_deal", "the order the rotation is dealt in (one roll deals the whole shuffle, #984)") * (1 << 53)))   # [s3-dice-door]
+    # [s3-cover-b] ONE roll deals the whole shuffle: keep its record, so
+    # every spin off this queue can name the roll it joins - and the loved
+    # bias is a desk row (records.loved_bias) the operator can rest.
+    _loved_w = 0.3
+    if loved and _s3_dice_live():
+        try:
+            if not s3_chance("records.loved_bias", 1.0,
+                             "a thumbs-up pulls a record toward the front "
+                             "of the shuffle (weight 0.3 while it holds)"):
+                _loved_w = 1.0
+        except Exception:  # noqa: BLE001
+            _loved_w = 0.3
+    try:
+        _RADIO["rotation_deal_s3"] = {
+            "at": round(time.time(), 3), "dealt": len(tracks),
+            "loved": len(loved or ()), "loved_weight": _loved_w,
+            **_s3_spin_roll("records.rotation_deal")}
+    except Exception:  # noqa: BLE001
+        pass
     _deal.shuffle(tracks)
-    if loved:
+    if loved and _loved_w < 1.0:
 ''', 1),
     ("rotation-deal-loved",
      r'''        tracks.sort(key=lambda t: random.random()
