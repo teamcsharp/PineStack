@@ -724,13 +724,255 @@
     }, 3100);
   }
 
+  /* ================================================== [pltray] the desk's tools */
+  /* The desk's status bar carries Crystals, Add sample and Go LIVE; the tablet
+   * never had that footer. On a screen without #statusBar they ride the base
+   * bar beside the mic, on the desk's own station calls. */
+  function trayIcon(name, fallback) {
+    var span = make('span', 'pl-tray-ico');
+    var markup = icon(name, '');
+    if (markup) span.innerHTML = markup; else span.textContent = fallback;
+    return span;
+  }
+
+  function trayButton(cls, iconName, fallback, title, onClick) {
+    var b = make('button', 'pl-tray-b ' + cls);
+    b.type = 'button';
+    b.title = title;
+    b.setAttribute('aria-label', title);
+    b.appendChild(trayIcon(iconName, fallback));
+    b.addEventListener('click', function (e) {
+      /* the bar opens its audit list on any click it does not know */
+      e.stopPropagation();
+      e.preventDefault();
+      onClick();
+    });
+    return b;
+  }
+
+  function attachTray(bar) {
+    if (!bar || bar.querySelector('.pl-tray')) return;
+    if (document.getElementById('statusBar')) return;       /* the desk has its own */
+    var tray = make('span', 'pl-tray');
+    tray.appendChild(trayButton('gem', 'c:gem', 'C', 'Crystals - the station\'s crystal cabinet', function () {
+      if (typeof root.crystalOpen === 'function') root.crystalOpen();
+    }));
+    tray.appendChild(trayButton('sample', 'm:movie', 'S', 'Add sample - paste a link, cut moments into the DJs\' rotation', openSampleSheet));
+    tray.appendChild(trayButton('golive', 'c:satellite', 'L', 'Go LIVE - the public listen link', openShareSheet));
+    var after = bar.querySelector('.pine-console-live');
+    bar.insertBefore(tray, after ? after.nextSibling : (bar.firstChild || null));
+  }
+
+  function traySheet(title) {
+    var old = document.getElementById('plTraySheet');
+    if (old && old.parentNode) old.parentNode.removeChild(old);
+    var back = make('div', 'pl-tray-back');
+    back.id = 'plTraySheet';
+    var sheet = make('div', 'pl-tray-sheet');
+    sheet.setAttribute('role', 'dialog');
+    sheet.setAttribute('aria-label', title);
+    var head = make('div', 'pl-tray-head');
+    head.appendChild(make('span', '', title));
+    var x = btn('', '', 'c:close', 'Close');
+    if (!x.textContent && !x.querySelector('svg')) x.textContent = 'X';
+    head.appendChild(x);
+    sheet.appendChild(head);
+    var body = make('div', 'pl-tray-body');
+    sheet.appendChild(body);
+    back.appendChild(sheet);
+    var close = function () { if (back.parentNode) back.parentNode.removeChild(back); if (back.__onclose) back.__onclose(); };
+    x.addEventListener('click', function (e) { e.stopPropagation(); close(); });
+    back.addEventListener('click', function (e) { if (e.target === back) close(); });
+    sheet.addEventListener('click', function (e) { e.stopPropagation(); });
+    document.body.appendChild(back);
+    return {back: back, body: body, close: close};
+  }
+
+  function copyText(text) {
+    try { if (root.navigator && root.navigator.clipboard) return root.navigator.clipboard.writeText(text); } catch (err) { /* fall through */ }
+    try {
+      var t = make('textarea', '');
+      t.value = text;
+      document.body.appendChild(t);
+      t.select();
+      document.execCommand('copy');
+      document.body.removeChild(t);
+    } catch (err) { /* nothing more to try */ }
+    return Promise.resolve();
+  }
+
+  function openShareSheet() {
+    var s = traySheet('Go LIVE - the public listen link');
+    var line = make('p', 'pl-muted', 'Checking for a public link...');
+    var link = make('input', 'pl-tray-input');
+    link.readOnly = true;
+    link.hidden = true;
+    var row = make('div', 'pl-actions');
+    var makeB = btn('', 'Make a public listen link', 'c:satellite');
+    var copyB = btn('', 'Copy the link', 'c:copy');
+    var endB = btn('', 'End the public broadcast', 'c:close');
+    [makeB, copyB, endB].forEach(function (b) { b.hidden = true; row.appendChild(b); });
+    s.body.appendChild(line);
+    s.body.appendChild(link);
+    s.body.appendChild(row);
+    var show = function (url) {
+      link.value = url || '';
+      link.hidden = !url;
+      copyB.hidden = endB.hidden = !url;
+      makeB.hidden = !!url;
+      line.textContent = url ? 'The station is public - anyone with this link can listen.' : 'No public listen link is out.';
+    };
+    get('/api/share').then(function (r) {
+      var l = ((r && r.links) || [])[0];
+      show((l && l.url) || '');
+    }, function (err) { line.textContent = 'The station did not answer: ' + (err && err.message || err); makeB.hidden = false; });
+    makeB.addEventListener('click', function () {
+      makeB.disabled = true;
+      post('/api/share', {scope: 'listen'}).then(function (m) {
+        var u = (m && (m.url || (m.urls && m.urls[0] && m.urls[0].url))) || '';
+        show(u);
+        if (u) copyText(u);
+        makeB.disabled = false;
+      }, function (err) { line.textContent = 'No link: ' + (err && err.message || err); makeB.disabled = false; });
+    });
+    copyB.addEventListener('click', function () {
+      copyText(link.value);
+      line.textContent = 'Copied - the link is on the clipboard.';
+    });
+    endB.addEventListener('click', function () {
+      confirmTap('shareEnd', endB, 'Tap again to end the public broadcast - every listen link stops', function () {
+        post('/api/share/revoke', {all: true}).then(function () { show(''); }, function (err) { line.textContent = err && err.message || String(err); });
+      });
+    });
+  }
+
+  function openSampleSheet() {
+    var s = traySheet('Add sample - cut moments into the DJs\' rotation');
+    var url = make('input', 'pl-tray-input');
+    url.placeholder = 'Paste a link - a video or a clip page';
+    var fetchB = btn('', 'Fetch', 'c:download');
+    var status = make('p', 'pl-muted', '');
+    var audio = make('audio', 'pl-tray-audio');
+    audio.controls = true;
+    audio.hidden = true;
+    var marks = make('div', 'pl-actions');
+    var inB = btn('', 'Mark IN', 'c:skip-back');
+    var outB = btn('', 'Mark OUT', 'c:skip-forward');
+    var cutB = btn('', 'Extract all', 'c:cut');
+    marks.appendChild(inB);
+    marks.appendChild(outB);
+    marks.appendChild(cutB);
+    marks.hidden = true;
+    var ranges = make('div', 'pl-tray-list');
+    var staged = make('div', 'pl-tray-list');
+    var folder = make('input', 'pl-tray-input');
+    folder.hidden = true;
+    try { folder.value = root.localStorage.getItem('pineSampleFolder') || 'Samples'; } catch (err) { folder.value = 'Samples'; }
+    var saveB = btn('', 'Save the batch', 'c:save');
+    saveB.hidden = true;
+    [url, fetchB, status, audio, marks, ranges, staged, folder, saveB].forEach(function (n) { s.body.appendChild(n); });
+    var job = '', a = -1, list = [], timer = 0, t0 = 0;
+    s.back.__onclose = function () { if (timer) root.clearTimeout(timer); try { audio.pause(); } catch (err) { /* gone */ } };
+    var fmt = function (x) { return (Math.round(x * 10) / 10).toFixed(1) + ' s'; };
+    var paintRanges = function () {
+      ranges.innerHTML = '';
+      list.forEach(function (r, i) {
+        var row = make('div', 'pl-tray-row');
+        row.appendChild(make('span', '', 'Moment ' + (i + 1) + ': ' + fmt(r.a) + ' - ' + fmt(r.b)));
+        var x = btn('', 'Drop', '');
+        x.addEventListener('click', function () { list.splice(i, 1); paintRanges(); });
+        row.appendChild(x);
+        ranges.appendChild(row);
+      });
+      cutB.disabled = !list.length;
+    };
+    var poll = function () {
+      timer = 0;
+      if (Date.now() - t0 > 900000) { status.textContent = 'The fetch took too long - try again.'; return; }
+      get('/api/samples/job/' + encodeURIComponent(job)).then(function (st) {
+        st = st || {};
+        if (st.stage === 'done' && st.audio) {
+          audio.src = st.audio;
+          audio.hidden = false;
+          marks.hidden = false;
+          paintRanges();
+          status.textContent = (st.title || 'Ready') + ' - play it, Mark IN and Mark OUT round each moment, then Extract all.';
+        } else if (st.error || st.stage === 'error' || st.stage === 'failed') {
+          status.textContent = 'Could not fetch it: ' + (st.error || st.stage);
+          fetchB.disabled = false;
+        } else {
+          status.textContent = 'Fetching... ' + (st.stage || '');
+          timer = root.setTimeout(poll, 2500);
+        }
+      }, function () { timer = root.setTimeout(poll, 2500); });
+    };
+    fetchB.addEventListener('click', function () {
+      var u = url.value.trim();
+      if (!u) { status.textContent = 'Paste a link first.'; return; }
+      fetchB.disabled = true;
+      status.textContent = 'Fetching...';
+      post('/api/samples/fetch', {url: u}).then(function (r) {
+        job = (r && r.job_id) || '';
+        if (!job) { status.textContent = 'The station gave no job for that link.'; fetchB.disabled = false; return; }
+        t0 = Date.now();
+        timer = root.setTimeout(poll, 2500);
+      }, function (err) { status.textContent = 'Could not start: ' + (err && err.message || err); fetchB.disabled = false; });
+    });
+    inB.addEventListener('click', function () { a = audio.currentTime || 0; status.textContent = 'IN at ' + fmt(a) + ' - now Mark OUT.'; });
+    outB.addEventListener('click', function () {
+      var b = audio.currentTime || 0;
+      if (a < 0 || b <= a) { status.textContent = 'Mark IN first, then Mark OUT after it.'; return; }
+      list.push({a: a, b: b});
+      a = -1;
+      paintRanges();
+      status.textContent = list.length + ' moment(s) marked - Extract all when you are done.';
+    });
+    cutB.addEventListener('click', function () {
+      if (!list.length) return;
+      cutB.disabled = true;
+      status.textContent = 'Cutting and naming...';
+      post('/api/samples/extract', {job_id: job, ranges: list, stage_only: true}).then(function (got) {
+        var rows = (got && got.staged) || [];
+        list = [];
+        paintRanges();
+        staged.innerHTML = '';
+        rows.forEach(function (r) {
+          var row = make('div', 'pl-tray-row');
+          row.dataset.id = r.id;
+          var name = make('input', 'pl-tray-input');
+          name.value = r.name || '';
+          row.appendChild(name);
+          staged.appendChild(row);
+        });
+        folder.hidden = saveB.hidden = !rows.length;
+        status.textContent = rows.length + ' cut(s) staged - name them, then Save the batch.';
+      }, function (err) { status.textContent = err && err.message || String(err); cutB.disabled = false; });
+    });
+    saveB.addEventListener('click', function () {
+      var items = [].map.call(staged.querySelectorAll('.pl-tray-row'), function (row) {
+        return {id: row.dataset.id, name: row.querySelector('input').value.trim()};
+      });
+      if (!items.length) return;
+      var f = folder.value.trim() || 'Samples';
+      try { root.localStorage.setItem('pineSampleFolder', f); } catch (err) { /* per screen only */ }
+      saveB.disabled = true;
+      post('/api/samples/commit', {items: items, folder: f}).then(function (got) {
+        var saved = (got && got.saved) || [];
+        status.textContent = saved.length + ' sample(s) saved into ' + ((got && got.folder) || f) + ' - the DJs have them in rotation now.';
+        staged.innerHTML = '';
+        folder.hidden = saveB.hidden = true;
+        saveB.disabled = false;
+      }, function (err) { status.textContent = err && err.message || String(err); saveB.disabled = false; });
+    });
+  }
+
   /* ================================================== the status-bar mic */
 
   function attachBadge() {
     var bar = document.getElementById('pineConsoleLine');
     if (!bar) return false;
     var have = bar.querySelector('.pine-console-live');
-    if (have) { ui.badge = have; return true; }
+    if (have) { ui.badge = have; try { attachTray(bar); } catch (err) { /* [pltray] */ } return true; }
     var b = make('button', 'pine-console-live');
     b.type = 'button';
     b.setAttribute('aria-haspopup', 'dialog');
@@ -747,6 +989,7 @@
     var before = bar.querySelector('.pine-console-gallery') || bar.querySelector('.pine-console-viewport');
     bar.insertBefore(b, before || null);
     ui.badge = b;
+    try { attachTray(bar); } catch (err) { /* [pltray] */ }
     ui.badgeState = '';
     paintBadge();
     return true;

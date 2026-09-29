@@ -522,3 +522,23 @@
 .pl-countdown-offer button { height: 24px; padding: 0 10px; border-radius: 5px; font-size: 12px;
   border: 1px solid rgba(255, 255, 255, 0.35); background: rgba(0, 0, 0, 0.45); color: #fff; cursor: pointer; }
 .pl-countdown-offer .pl-countdown-end { border-color: #e0786d; }
+
+/* [pltray] the desk's three tools on the tablet's base bar, and their sheets */
+.pl-tray { display: inline-flex; gap: 3px; align-items: center; margin: 0 4px; flex: 0 0 auto; }
+.pl-tray-b { width: 30px; height: 26px; display: inline-flex; align-items: center; justify-content: center;
+  padding: 0; border: 1px solid #3a4b55; border-radius: 5px; background: rgba(255, 255, 255, 0.04);
+  color: #d6ece6; font: 600 12px/1 system-ui; cursor: pointer; }
+.pl-tray-b.gem { border-color: #8a6cf0; }
+.pl-tray-b.golive { border-color: #c9544a; }
+.pl-tray-b svg { width: 16px; height: 16px; }
+.pl-tray-back { position: fixed; inset: 0; z-index: 2147483040; display: flex; align-items: center;
+  justify-content: center; background: rgba(0, 0, 0, 0.45); }
+.pl-tray-sheet { box-sizing: border-box; width: min(560px, calc(100vw - 32px)); max-height: calc(100vh - 60px);
+  overflow: auto; padding: 14px 16px; border: 1px solid #2f4450; border-radius: 10px; background: #10181d;
+  color: #dfeee9; font: 14px/1.4 system-ui; }
+.pl-tray-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; font-weight: 600; }
+.pl-tray-input { box-sizing: border-box; width: 100%; margin: 6px 0; padding: 8px 10px; border: 1px solid #2f4450;
+  border-radius: 6px; background: #0a1014; color: #e6f2ee; font: inherit; }
+.pl-tray-audio { width: 100%; margin: 8px 0; }
+.pl-tray-row { display: flex; gap: 8px; align-items: center; margin: 4px 0; }
+.pl-tray-sheet [hidden] { display: none !important; }
