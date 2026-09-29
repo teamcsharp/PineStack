@@ -410,8 +410,188 @@
     try { if (root.PineSfxTv) root.PineSfxTv.viewChanged(); } catch (err) { /* no wall */ }
   }
 
+  /* [s3-account] THE UNTRACED ALARM. An item that airs with no System 3 origin
+     airs (the air is never held) and lands on the Untraced list; this button
+     before the gallery shows while the list is not empty (24 h) and opens it:
+     the code paths that aired them, each item's origin chain on tap, and the
+     24 h coverage by road. Polls /api/system3/untraced every 30 s. */
+  var UNTRACED_POLL_MS = 30000;
+  var untraced = {count: 0, total: 0, items: [], by: [], timer: null, busy: false};
+
+  function untracedStyle() {
+    if (typeof document === 'undefined' || document.getElementById('pineUntracedStyle')) return;
+    var s = document.createElement('style');
+    s.id = 'pineUntracedStyle';
+    s.textContent = '.pine-console-untraced{display:inline-flex;align-items:center;gap:3px;color:#e8a33d;'
+      + 'background:none;border:0;padding:0 6px;cursor:pointer;font:600 11px/1 system-ui,sans-serif}'
+      + '.pine-console-untraced[hidden]{display:none}.pine-console-untraced svg{width:14px;height:14px}'
+      + '#pineUntracedList .pine-untraced-sum{padding:6px 10px;opacity:.85}'
+      + '#pineUntracedList .pine-untraced-row{display:block;width:100%;text-align:left;padding:6px 10px;'
+      + 'border:0;border-top:1px solid rgba(127,127,127,.25);background:none;color:inherit;font:inherit;cursor:pointer}'
+      + '#pineUntracedList .pine-untraced-row b{margin-right:6px}'
+      + '#pineUntracedList .pine-untraced-chain{padding:4px 10px 8px 22px;font-size:12px;opacity:.9}'
+      + '#pineUntracedList .pine-untraced-chain div{padding:1px 0}';
+    (document.head || document.body).appendChild(s);
+  }
+
+  function untracedButton(bar) {
+    bar = bar || el();
+    if (!bar || !bar.querySelector) return null;
+    var b = bar.querySelector('.pine-console-untraced');
+    if (b) return b;
+    untracedStyle();
+    b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'pine-console-untraced';
+    b.hidden = true;
+    b.innerHTML = (icon('c:warning--alt', 'Untraced air') || '!') + '<span class="pine-console-untraced-n"></span>';
+    b.addEventListener('click', function (event) {
+      event.stopPropagation();
+      event.preventDefault();
+      untracedOpen(bar);
+    });
+    bar.insertBefore(b, bar.querySelector('.pine-console-gallery') || bar.firstChild);
+    untracedPaint();
+    return b;
+  }
+
+  function untracedPaint() {
+    var b = untracedButton();
+    if (!b) return;
+    b.hidden = !(untraced.count > 0);
+    var n = b.querySelector('.pine-console-untraced-n');
+    if (n) n.textContent = untraced.count > 99 ? '99+' : String(untraced.count || '');
+    var t = untraced.count + ' item' + (untraced.count === 1 ? '' : 's')
+      + ' aired in the last 24 h with no System 3 origin - open the Untraced list';
+    if (b.title !== t) { b.title = t; b.setAttribute('aria-label', t); }
+  }
+
+  function untracedPoll() {
+    if (untraced.busy) return Promise.resolve();
+    untraced.busy = true;
+    var done = function () { untraced.busy = false; };
+    return flowGet('/api/system3/untraced?hours=24&limit=60').then(function (got) {
+      got = got || {};
+      untraced.count = Number(got.count) || 0;
+      untraced.total = Number(got.items_total) || 0;
+      untraced.items = got.items || [];
+      untraced.by = got.by_path || [];
+      untracedPaint();
+      var list = document.getElementById('pineUntracedList');
+      if (list) untracedRender(list);
+    }).then(done, done);
+  }
+
+  function untracedLine(text, cls) {
+    var d = document.createElement('div');
+    if (cls) d.className = cls;
+    d.textContent = text;
+    return d;
+  }
+
+  function untracedChainText(n) {
+    var keys = {air: ['aired', 'seconds'], script: ['block', 'ord', 'sid'], road: ['label', 'who'],
+      conversation: ['conversation_id', 'turn_id'], roll: ['table', 'picked', 'dice', 'of'],
+      store: ['kind', 'folder', 'db', 'pool', 'product', 'key', 'file'],
+      forced: ['road', 'trigger', 'by'], rogue: ['producer', 'why', 'path']}[n.node] || [];
+    var out = [];
+    keys.forEach(function (k) { if (n[k] !== undefined && n[k] !== null && n[k] !== '') out.push(String(n[k])); });
+    return (n.node || '') + ': ' + out.join(' - ');
+  }
+
+  function untracedRender(list) {
+    var body = list.querySelector('.pine-console-list-body');
+    var count = list.querySelector('.pine-console-list-count');
+    if (count) count.textContent = untraced.count + ' of ' + untraced.total + ' in 24 h';
+    if (!body) return;
+    body.textContent = '';
+    var sum = untracedLine(untraced.count
+      ? 'These aired with no System 3 origin. Each is a road to bring under System 3.'
+      : 'Nothing untraced in the last 24 hours: every item traced to a roll or a named forced node.',
+      'pine-untraced-sum');
+    body.appendChild(sum);
+    untraced.by.slice(0, 6).forEach(function (p) {
+      body.appendChild(untracedLine(p.count + ' x ' + (p.producer || 'unknown') + ' (' + (p.road || '') + ')', 'pine-untraced-sum'));
+    });
+    var cov = untracedLine('coverage: reading...', 'pine-untraced-sum');
+    body.appendChild(cov);
+    flowGet('/api/system3/coverage?hours=24').then(function (rep) {
+      var t = (rep && rep.totals) || {};
+      cov.textContent = 'coverage 24 h: ' + (t.traced_pct == null ? '-' : t.traced_pct + '%') + ' traced - '
+        + (t.rolled || 0) + ' rolled, ' + (t.forced || 0) + ' forced, ' + (t.rogue || 0) + ' rogue of '
+        + (t.items || 0) + ' items. The daily report: /system3-coverage';
+    }, function () { cov.textContent = 'coverage: not available'; });
+    untraced.items.forEach(function (it) {
+      var row = document.createElement('button');
+      row.type = 'button';
+      row.className = 'pine-untraced-row';
+      var when = '';
+      try { when = new Date(Number(it.air_at) * 1000).toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'}); }
+      catch (err) { when = ''; }
+      var b = document.createElement('b');
+      b.textContent = when + ' ' + (it.road || '');
+      row.appendChild(b);
+      row.appendChild(document.createTextNode((it.producer || 'unknown') + ' - ' + String(it.text || '').slice(0, 120)));
+      row.addEventListener('click', function (event) {
+        event.stopPropagation();
+        var open = row.nextSibling && row.nextSibling.className === 'pine-untraced-chain' ? row.nextSibling : null;
+        if (open) { open.remove(); return; }
+        var chain = document.createElement('div');
+        chain.className = 'pine-untraced-chain';
+        chain.textContent = 'reading the origin ledger...';
+        body.insertBefore(chain, row.nextSibling);
+        flowGet('/api/system3/origin/' + encodeURIComponent(it.line_id)).then(function (got) {
+          chain.textContent = '';
+          chain.appendChild(untracedLine((got && got.verdict || '') + ' - ' + (got && got.why || '')));
+          var rounds = 0;
+          ((got && got.nodes) || []).forEach(function (n) {
+            if (n.node === 'roll' && n.scope === 'round') { rounds += 1; return; }
+            chain.appendChild(untracedLine(untracedChainText(n)));
+          });
+          if (rounds) chain.appendChild(untracedLine(rounds + ' roll(s) on the round - open the line in System 3 for them'));
+        }, function () { chain.textContent = 'no origin record for ' + it.line_id; });
+      });
+      body.appendChild(row);
+    });
+  }
+
+  function untracedOpen(bar) {
+    if (typeof document === 'undefined') return;
+    var old = document.getElementById('pineUntracedList');
+    if (old) { old.remove(); return; }
+    var list = document.createElement('div');
+    list.id = 'pineUntracedList';
+    list.className = 'pine-console-list';
+    list.setAttribute('role', 'dialog');
+    list.setAttribute('aria-label', 'Untraced air');
+    list.setAttribute('data-pine-drag', '');
+    list.innerHTML = '<div class="pine-console-list-head" data-pine-drag-handle>'
+      + '<b>Untraced air</b><span class="pine-console-list-count"></span>'
+      + '<button type="button" class="pine-console-list-close" aria-label="Close" title="Close">x</button>'
+      + '</div><div class="pine-console-list-body"></div>';
+    list.querySelector('.pine-console-list-close').addEventListener('click', function (event) {
+      event.stopPropagation();
+      list.remove();
+    });
+    document.body.appendChild(list);
+    untracedRender(list);
+    untracedPoll();
+    if (root.PineDismiss) root.PineDismiss.watch(list, function () { list.remove(); }, [bar || el()]);
+  }
+
+  function untracedStart() {
+    if (typeof document === 'undefined') return;
+    untracedButton();
+    untracedPoll();
+    if (!untraced.timer) {
+      untraced.timer = root.setInterval(function () { untracedButton(); untracedPoll(); }, UNTRACED_POLL_MS);
+      if (untraced.timer && typeof untraced.timer.unref === 'function') untraced.timer.unref();
+    }
+  }
+
   function start() {
     mount();
+    untracedStart();                                   /* [s3-account] */
     syncFlow(true);
     if (!flowTimer) {
       flowTimer = root.setInterval(function () { syncFlow(false); }, FLOW_POLL_MS);
@@ -429,6 +609,7 @@
   root.PineConsoleLine = {start: start, paint: paint, latest: latest,
     mount: mount, history: history, sync: syncFlow, open: openList,
     speed: function () { return speed; }, refreshOrchestrator: paintOrchestratorButton,
-    refreshTalkRestore: paintTalkRestoreButton};
+    refreshTalkRestore: paintTalkRestoreButton,
+    untraced: function () { return untracedOpen(el()); }};   /* [s3-account] */
   if (typeof module !== 'undefined' && module.exports) module.exports = root.PineConsoleLine;
 })(typeof window !== 'undefined' ? window : globalThis);

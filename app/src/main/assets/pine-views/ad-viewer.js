@@ -57,7 +57,35 @@
     }
     one('host', rolls.host); one('source', rolls.source);
     one('fresh pick', rolls.fresh); one('window marker', rolls.marker);
+    /* [h3-speak] the H3SPEAK node: what kind of aired talk, which line, the
+       Speakerbox document (no aired line passed), how many sentences, which ones */
+    one('dialogue kind', rolls.speak_lean); one('line said on air', rolls.speak_line);
+    one('speakerbox document', rolls.speak_doc); one('sentences to take', rolls.speak_count);
+    one('sentences', rolls.speak_sentences); one('forced line', rolls.speak_forced);
     return bits.join('  -  ');
+  }
+  function usedSpeak(sp) {
+    /* [h3-speak] the H3SPEAK node's record: rolled from a line a person was
+       heard saying (who, when, the feeling System 3 rolled for it), from a
+       Speakerbox document, or FORCED and why. */
+    if (!sp || typeof sp !== 'object') return '';
+    var took = sp.count && sp.count.took ? sp.count.took + ' of ' + (sp.count.rolled || sp.count.took)
+      + ' sentence' + (sp.count.took === 1 ? '' : 's') : '';
+    if (sp.verdict === 'forced') {
+      return 'FORCED - ' + String(sp.forced_by || 'the forced line') + (sp.why ? ' (' + sp.why + ')' : '');
+    }
+    if (sp.source === 'speakerbox') {
+      return 'rolled from the Speakerbox document ' + String(sp.doc || '?') + (took ? ': ' + took : '')
+        + (sp.why ? ' - no aired line passed' : '');
+    }
+    var s = sp.said || {};
+    var at = s.at ? new Date(Number(s.at) * 1000) : null;
+    var when = at && !isNaN(at) ? ' at ' + String(at.getHours()).padStart(2, '0') + ':'
+      + String(at.getMinutes()).padStart(2, '0') : '';
+    var feel = s.emotion ? ', feeling ' + s.emotion + (s.intensity != null ? ' ' + Number(s.intensity).toFixed(2) : '') : '';
+    return 'rolled from what ' + String(s.name || s.who || 'a voice') + ' said on air' + when
+      + (s.round ? ' (' + s.round + (s.turns > 1 ? ', a monologue of ' + s.turns + ' turns' : '') + ')' : '')
+      + feel + (took ? ': ' + took : '');
   }
   function usedWords(row) {
     row = row || {};
@@ -75,6 +103,7 @@
       add('Audio direction', rec.audio_direction, 'audio_direction');
       add('Constraints', rec.constraints, 'constraints');
       add('Hourly rolls', usedRolls(rec.rolls), 'rolls');   /* [s3-visuals] the door's dice, when they rolled */
+      add('Dialogue (H3SPEAK)', usedSpeak(rec.speak), 'speak');   /* [h3-speak] where the words came from */
       add('Final H3 prompt', row.tags, 'tags');
       var name = rec.preset && rec.preset.name ? String(rec.preset.name) : 'a preset';
       return {recorded: true, hourly: true, preset: name, how: usedHow(rec), road: USED_ROADS[rec.road] || '',

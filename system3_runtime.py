@@ -2474,7 +2474,8 @@ class System3Runtime:
             handle.perf = ({d: float(dims.get(d) or 0) for d in system3.EMOTION_DIMS}
                            if dims and handle.active else None)
             # [s3-es-voice] and how the feeling sounds
-            handle.voice = (dict(perf["voice"]) if isinstance(perf.get("voice"), dict) and handle.active else None)
+            handle.voice = (dict(perf["voice"], row=system3.es_row(first) or {})   # [es-roads] and which row
+                            if isinstance(perf.get("voice"), dict) and handle.active else None)
             conv["plan"] = {"sheet": handle.sheet, "plan_ms": handle.plan_ms, "active": handle.active,
                             "line": handle.line, "choice": handle.choice}
             self._ema("plan_ms_ema", handle.plan_ms)
@@ -3573,6 +3574,41 @@ class System3Runtime:
             self.fail("performance", exc)
             return None
 
+    def perf_of_stamp(self, stamp, who="", disk=False):
+        """[es-roads] ES -> the voice for a road that holds a STAMP, not the round
+        entry or the line handle: the turn it names, as {"dims": the state for
+        performance_vector(state=), "voice": the ES row's voice block with its
+        "row"}. A split part inherits the turn it was cut from. The conversation
+        is read from memory; `disk` reads the store when it has aged out (a
+        banked shelf row) - call that off the event loop. None: no such active
+        turn, or no feeling on it."""
+        try:
+            if not isinstance(stamp, dict) or not stamp.get("conversation_id") or not stamp.get("turn_id"):
+                return None
+            cid = str(stamp["conversation_id"])
+            conv = self.recent.get(cid)
+            if conv is None and disk:
+                conv = self.store.conversation(cid, with_events=False)
+            if not conv or (conv.get("mode") or stamp.get("mode")) != "active":
+                return None
+            turns = {str(t.get("turn_id")): t for t in conv.get("turns") or []}
+            t = turns.get(str(stamp["turn_id"]))
+            perf = (t or {}).get("performance") or {}
+            if not perf.get("dims") and not perf.get("voice"):
+                t = turns.get(str(((stamp.get("split") or {}).get("of_turn")) or (t or {}).get("split_of") or ""))
+                perf = (t or {}).get("performance") or {}
+            dims = perf.get("dims") if isinstance(perf.get("dims"), dict) else None
+            voice = perf.get("voice") if isinstance(perf.get("voice"), dict) else None
+            if not dims and voice is None:
+                return None
+            with self.lock:
+                self.metrics["stamp_perf"] = int(self.metrics.get("stamp_perf") or 0) + 1
+            return {"dims": ({d: float(dims.get(d) or 0) for d in system3.EMOTION_DIMS} if dims else None),
+                    "voice": (dict(voice, row=system3.es_row(t) or {}) if voice is not None else None)}
+        except Exception as exc:  # noqa: BLE001
+            self.fail("stamp performance", exc)
+            return None
+
     def perf_voice(self, entry, turns, text, who=""):
         """[s3-es-voice] ES -> the recording: the voice block this turn's stamp
         carries (the ES row's `voice` at the turn's intensity), for
@@ -3590,7 +3626,13 @@ class System3Runtime:
                 return None
             with self.lock:
                 self.metrics["voice_applied"] = int(self.metrics.get("voice_applied") or 0) + 1
-            return dict(got)
+            # [es-roads] and which ES row it is, for the air record (a stamp from
+            # before the row rode it names the feeling and its intensity only)
+            row = (stamp.get("perf") or {}).get("row")
+            if not isinstance(row, dict):
+                row = {k: v for k, v in (("label", stamp.get("es")), ("intensity", stamp.get("intensity")))
+                       if v is not None}
+            return dict(got, row=dict(row))
         except Exception as exc:  # noqa: BLE001
             self.fail("voice", exc)
             return None
@@ -4565,6 +4607,7 @@ def install(app, namespace):
     namespace["system3_bind_entry"] = rt.bind_entry
     namespace["system3_perf_state"] = rt.perf_state
     namespace["system3_perf_voice"] = rt.perf_voice                  # [s3-es-voice]
+    namespace["system3_perf_of_stamp"] = rt.perf_of_stamp            # [es-roads]
     namespace["system3_sfx_direction"] = rt.sfx_direction
     namespace["system3_sfx_observe"] = rt.sfx_observe
     # [s3-roads] the SFX Guy's node at air, and the single-voice roads

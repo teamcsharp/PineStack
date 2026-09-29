@@ -244,18 +244,19 @@
   /* The desk's page is file: - every call goes through the desk bridge (it
    * holds the key, and keeps these out of the WebView's six-socket pool on
    * the tablet). A page with no bridge fetches directly with the key. */
-  function request(method, path, body) {
+  function request(method, path, body, ms) {
+    var bound = ms > 0 ? ms : REQUEST_MS;   /* [va-strips] a longer bound on request */
     var b = bridge();
     var fn = b && (method === 'GET' ? b.get : method === 'POST' ? b.post
       : method === 'PUT' ? b.put : b.del);
-    if (fn) return withTimeout(fn.call(b, path, method === 'GET' ? undefined : (body || {})), REQUEST_MS, path);
+    if (fn) return withTimeout(fn.call(b, path, method === 'GET' ? undefined : (body || {})), bound, path);
     if (typeof root.fetch !== 'function') return Promise.reject(new Error('no road to the station on this screen'));
     var headers = {};
     var key = stationKey();
     if (key) headers.Authorization = 'Bearer ' + key;
     if (method !== 'GET') headers['Content-Type'] = 'application/json';
     var ctl = typeof root.AbortController === 'function' ? new root.AbortController() : null;
-    var timer = ctl ? root.setTimeout(function () { try { ctl.abort(); } catch (err) { /* done */ } }, REQUEST_MS) : 0;
+    var timer = ctl ? root.setTimeout(function () { try { ctl.abort(); } catch (err) { /* done */ } }, bound) : 0;
     return root.fetch(stationUrl(path), {method: method, headers: headers, cache: 'no-store',
       body: method === 'GET' ? undefined : JSON.stringify(body || {}), signal: ctl ? ctl.signal : undefined})
       .then(function (res) {
@@ -270,7 +271,7 @@
           return data;
         });
       }, function (err) {
-        throw new Error(err && err.name === 'AbortError' ? path + ' took longer than ' + Math.round(REQUEST_MS / 1000) + ' s' : String((err && err.message) || err));
+        throw new Error(err && err.name === 'AbortError' ? path + ' took longer than ' + Math.round(bound / 1000) + ' s' : String((err && err.message) || err));
       })
       .then(function (v) { if (timer) root.clearTimeout(timer); return v; },
         function (e) { if (timer) root.clearTimeout(timer); throw e; });
@@ -1098,6 +1099,10 @@
         side.appendChild(pickR);
         seat.appendChild(side);
       }
+      if (ui.stripDef) {                       /* [va-strips] the profile strip under this seat */
+        try { ui.stripDef.seat(seat, row, stripCtx()); }
+        catch (err) { if (root.console) root.console.error('[voice-actor] strip failed:', err); }
+      }
       host.appendChild(seat);
     });
   }
@@ -1755,6 +1760,36 @@
     };
   }
 
+  /* [va-strips] The profile strips' context (voice-actor-strips.js). */
+  function stripCtx() {
+    return {
+      request: request,                    /* (method, path, body, ms?) -> Promise<json> */
+      stationUrl: stationUrl,
+      icon: icon,
+      say: say,
+      isTablet: isTablet(),
+      actors: function () { return (model.voices || []).slice(); },
+      engines: function () { return model.engines ? JSON.parse(JSON.stringify(model.engines)) : null; },
+      callers: function () { return ((model.callers && model.callers.callers) || []).slice(); },
+      /* the cast's own road: POST /api/voice-actor/seat (#820's cut included) */
+      setSeat: function (seat, vid) { return setSeatVoice(seat, vid); },
+      /* the Callers card's own road: the caller's pinned clone */
+      setCallerVoice: function (cid, vid) {
+        return request('PUT', '/api/dj/callers/' + encodeURIComponent(cid), {voice_id: String(vid || '')})
+          .then(function (ans) { refreshCast(); return ans; });
+      },
+      pop: function () { return ui.pop || null; }
+    };
+  }
+
+  /** The profile strips module's one registration door: def.seat(el, row, ctx). */
+  function registerStrips(def) {
+    if (!def || typeof def.seat !== 'function') return false;
+    ui.stripDef = def;
+    if (ui.visible) paint(true);
+    return true;
+  }
+
   function isTablet() {
     try {
       if (root.__pineViewsBooted) return true;             /* the kiosk's bundle */
@@ -1838,6 +1873,7 @@
     layers: function () { return ui.layers.map(function (l) { return String(l.node.className || ''); }); },
     openExtraction: openExtract,
     registerExtraction: registerExtraction,
+    registerStrips: registerStrips,         /* [va-strips] */
     actors: function () { return model.voices || []; },
     refresh: refreshAll,
     /* pure helpers, for the tests */

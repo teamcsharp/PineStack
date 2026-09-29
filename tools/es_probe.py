@@ -148,7 +148,7 @@ def _mean(rows):
 
 # --- the DSP pass (runs now) ---------------------------------------------------------
 
-def dsp_pass(takes_dir, app_path):
+def dsp_pass(takes_dir, app_path, levels=()):   # [es-roads] + the live intensities
     import system3
     import system3_tables
     st = station(app_path)
@@ -162,7 +162,7 @@ def dsp_pass(takes_dir, app_path):
     for ed, table in editions.items():
         for cat in table["categories"]:
             cid = cat["id"]
-            for level in (1.0, 0.5):
+            for level in sorted(set((1.0, 0.5) + tuple(levels)), reverse=True):   # [es-roads]
                 block = system3.voice_intent(cat["voice"], level)
                 vec = {"pace": block.get("tempo", 1.0), "range": block.get("range", 1.0),
                        "energy": block.get("energy", 0.0), "pause_scale": block.get("pause", 1.0),
@@ -247,9 +247,10 @@ def main(argv):
     ap.add_argument("--app", default=str(ROOT / "app.py"))
     ap.add_argument("--data", default=str(ROOT / "data"))
     ap.add_argument("--json")
+    ap.add_argument("--levels", default="", help="[es-roads] more intensities for --dsp, e.g. the live p10,median,p90")
     a = ap.parse_args(argv)
     if a.dsp:
-        got = dsp_pass(a.dsp, a.app)
+        got = dsp_pass(a.dsp, a.app, tuple(float(x) for x in a.levels.split(",") if x.strip()))   # [es-roads]
     elif a.render:
         if not a.window:
             raise SystemExit("the render pass runs only at the declared window (--window)")

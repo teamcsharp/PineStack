@@ -516,6 +516,7 @@ class Recorder:
         self.last_frame_at = 0.0
         self.frames_total = 0
         self.why = ""
+        self.held = False                      # [pltoggle] album off: frames are not written
         self._thread = threading.Thread(target=self._run, name="pinelive-cuts", daemon=True)
         self._thread.start()
 
@@ -534,6 +535,14 @@ class Recorder:
         self.active = False
         done = threading.Event()
         self.q.put(("end", done))
+        done.wait(20.0)
+
+    def suspend(self) -> None:
+        """[pltoggle] Album recording off mid-set: close the running track
+        cleanly and write nothing more until the next begin()."""
+        self.active = False
+        done = threading.Event()
+        self.q.put(("suspend", done))
         done.wait(20.0)
 
     def next_track(self) -> None:
@@ -559,6 +568,14 @@ class Recorder:
                     self.frames = 0
                     self.quiet_frames = 0                      # [plsplit]
                     self.split_waiting = False
+                    self.held = False                  # [pltoggle] recording again
+                    continue
+                if item and item[0] == "suspend":      # [pltoggle] album off: close cleanly
+                    self._close_pair(final=False, drop_short=True)
+                    self.quiet_frames = 0
+                    self.split_waiting = False
+                    self.held = True
+                    item[1].set()
                     continue
                 if item and item[0] == "end":
                     self._close_pair(final=True)
@@ -571,7 +588,7 @@ class Recorder:
                     self.frames_per_cut = max(10, int(round(float(item[1]) * 1000 / FRAME_MS)))
                     continue
                 frame, live, t = item
-                if self.folder is None:
+                if self.folder is None or getattr(self, "held", False):   # [pltoggle]
                     continue
                 # [plsplit] tracks split on silence, not the clock
                 loud = self._loud(live)
@@ -624,7 +641,7 @@ class Recorder:
         self.mix = _Wav(self.folder / b)
         self.frames = 0
 
-    def _close_pair(self, final: bool) -> None:
+    def _close_pair(self, final: bool, drop_short: bool = False) -> None:   # [pltoggle]
         if self.inp is None or self.mix is None:
             self.inp = self.mix = None
             return
@@ -632,7 +649,7 @@ class Recorder:
         self.inp = self.mix = None
         inp.close()
         mix.close()
-        if final and frames < 10:              # under a second: not a cut
+        if (final or drop_short) and frames < 10:   # under a second: not a cut [pltoggle]
             for w in (inp, mix):
                 try:
                     w.path.unlink()
@@ -1170,11 +1187,51 @@ class PineLive:
             self.recorder.set_cut_seconds(new["cut_seconds"])
         if self.armed():
             self.write_control()
+        if bool(old.get("record", True)) != bool(new.get("record", True)):   # [pltoggle]
+            self._album_flip(bool(new.get("record", True)))
         if old.get("tailscale_video") != new.get("tailscale_video"):
             self.note("tailscale_video", "public video %s" % (
                 "ON: listeners on the tailnet see the picture" if new["tailscale_video"]
                 else "OFF: the public side stops showing video now"))
         return new, refused
+
+    def _album_start(self) -> None:
+        """[pltoggle] Album recording begins: the set's folder at the next
+        free index; a track opens with the next sound."""
+        if self.recorder is None or self.event is None or self.event.get("rehearse"):
+            return
+        folder_name = str(self.event.get("folder") or self.event_id())
+        folder = self.cuts_root / folder_name
+        first = 1
+        try:
+            got = [int(m.group(1)) for p in folder.glob("*_c*_mix.*")
+                   for m in [re.search(r"_c(\d+)_mix\.", p.name)] if m]
+            first = max(got) + 1 if got else 1
+        except Exception:  # noqa: BLE001
+            first = 1
+        if self.recorder.folder == folder:
+            first = max(first, int(self.recorder.index) + 1)
+        self.recorder.begin(folder, folder_name, float(self.settings["cut_seconds"]),
+                            str(self.settings["format"]), first)
+
+    def _album_flip(self, on: bool) -> None:
+        """[pltoggle] The album switch. The choice is settings.record, so it is
+        remembered and the next set starts with it; mid-set it starts or
+        suspends the recording from this moment - the set airs either way."""
+        if not self.armed() or bool((self.event or {}).get("rehearse")):
+            self.note("album", "album recording %s - remembered for the next set"
+                      % ("ON" if on else "OFF"))
+            return
+        if self.event is not None:
+            self.event["album"] = on
+        if on:
+            self._album_start()
+            self.note("album", "album recording ON mid-set - a track opens with the next sound")
+        elif self.recorder is not None:
+            self.recorder.suspend()
+            self.note("album", "album recording OFF mid-set - the running track closed; "
+                      "the set plays on and nothing more is written")
+        self._save_event()
 
     def _live_params(self) -> None:
         s, live = self.settings, self.live
@@ -1196,7 +1253,8 @@ class PineLive:
                   "channel_pair": list(s["channel_pair"]),
                   "channel_mode": s["channel_mode"], "silence_db": s["silence_db"],
                   "token": self.token,
-                  "master": not bool((self.event or {}).get("rehearse"))})   # [plair]
+                  "master": (not bool((self.event or {}).get("rehearse"))   # [plair]
+                             and bool(s.get("record", True)))})   # [pltoggle] album off: no master
         c.update(extra)
         self.control = c
         try:
@@ -1334,7 +1392,8 @@ class PineLive:
             self.event = {"id": ("mxlive-test-" if rehearse else "mxlive-") + stamp,
                           "name": EVENT_NAME, "started_at": now,
                           "folder": "%s_%s" % (stamp, EVENT_SLUG), "armed": True,
-                          "fallbacks": 0, "rehearse": rehearse}
+                          "fallbacks": 0, "rehearse": rehearse,
+                          "album": bool(s.get("record", True)) and not rehearse}   # [pltoggle]
             self.source_kind = source
             self.device = device
             self.token = secrets.token_hex(16)
@@ -1350,10 +1409,14 @@ class PineLive:
             return {"ok": True, "code": "", "say": "on-air test - the %s replaces the record "
                     "as soon as it sounds, DJs and all; tap End test to stop" %
                     ("K.O. II" if source == "usb" else "sender")}
+        album = bool(s.get("record", True))                        # [pltoggle]
         self.note("start", "MX Live armed (%s%s) - the music keeps playing until the "
-                  "input is heard" % (source, (" " + device) if device else ""))
+                  "input is heard; album recording %s" % (
+                      source, (" " + device) if device else "", "on" if album else "off"))
         return {"ok": True, "code": "", "say": "MX Live is armed - waiting for the "
-                "first sound from the %s" % ("K.O. II" if source == "usb" else "sender")}
+                "first sound from the %s; album recording %s" % (
+                    "K.O. II" if source == "usb" else "sender",
+                    "on" if album else "off (the set airs, nothing is written)")}
 
     def _arm_runtime(self, resume: bool) -> None:
         """Everything an armed event runs: the host told, the input opened,
@@ -1775,7 +1838,8 @@ class PineLive:
                       "fallbacks": int(self.event.get("fallbacks") or 0)}
             rec = None
             if self.recorder is not None and self.armed():
-                rec = {"cut_index": self.recorder.index, "cuts": len(self.recorder.cuts)}
+                rec = {"cut_index": self.recorder.index, "cuts": len(self.recorder.cuts),
+                       "album": bool(self.settings.get("record", True))}   # [pltoggle]
             return {"enabled": bool(self.settings.get("enabled", True)),
                     "armed": self.armed(), "live": self.phase == "live",
                     "phase": self.phase, "event": ev, "source_kind": self.source_kind
@@ -1871,7 +1935,9 @@ class PineLive:
                        "folder": folder} if self.event is not None else None),
             "source": src,
             "recording": {
-                "on": bool(armed and s.get("record", True)),
+                "on": bool(armed and s.get("record", True)
+                           and not (self.event or {}).get("rehearse")),     # [pltoggle]
+                "album": bool(s.get("record", True)),      # [pltoggle] the remembered choice
                 "cut_seconds": s["cut_seconds"], "format": s["format"],
                 "dir": ("data/pinelive/cuts/" + folder) if folder else "",
                 "dest": self.dest_folder(folder) if folder else self.dest_folder("").rstrip("\\"),

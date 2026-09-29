@@ -190,6 +190,9 @@ EDITS = [
      '    percent of hours (a frame stinger through the durable parody queue, the\n'
      '    road the gallery\'s own "Render H3 video" takes; newspaper pages\n'
      '    excluded), else from a speech-indexed clip through voice_ad_render."""\n'
+     '    _h3_gather = globals().get("h3_speak_gather")                 # [h3-speak] the dialogue\'s pool:\n'
+     "    if _h3_gather:                                                # the hour's preset rolls over it\n"
+     '        _H3_SPEAK_POOL[0] = await _h3_gather()\n'
      '    goal = h3_hourly_ad_prompt()\n'
      '    try:\n'
      '        share = max(0, min(100, int(state.get("gallery_share", 20) or 0)))\n'

@@ -6112,6 +6112,78 @@ function sfxGuyStory(conv, sg, v) {
   return box;
 }
 
+/* [s3-account] THE ORIGIN LEDGER ON EVERY ITEM. "trace its origin for each and
+   every thing down to either a table that is accessed via a roulette option or
+   whatever system is needing to encompass the rogue element" (the operator).
+   /api/system3/origin/<id> answers for any aired item of any age: rolled (the
+   tables and the dice), forced (the named road and its trigger - no dice), or
+   rogue (the code path that aired it, on the Untraced list). */
+const ORIGIN_WORD = {rolled: 'Rolled by System 3', forced: 'A forced node', rogue: 'Rogue - aired with no System 3 origin'};
+const ORIGIN_TONE = {rolled: 'var(--s3-good, #2e7d4f)', forced: 'var(--s3-warn, #8a6d1a)', rogue: 'var(--s3-bad, #b3261e)'};
+function originLabel(n) {
+  return ({air: 'On air', script: 'In the script', road: 'The road', conversation: 'System 3',
+    roll: n.scope === 'round' ? 'A round roll' : 'A roll', store: 'Drawn from', forced: 'Forced by',
+    rogue: 'Aired by'})[n.node] || String(n.node || '');
+}
+function originText(n) {
+  const bits = [];
+  const add = (v, pre) => { if (v !== undefined && v !== null && v !== '' && !(Array.isArray(v) && !v.length)) bits.push((pre || '') + (Array.isArray(v) ? v.join(' - ') : String(v))); };
+  if (n.node === 'air') {
+    add(n.at ? new Date(Number(n.at) * 1000).toLocaleString([], {weekday: 'short', hour: '2-digit', minute: '2-digit', second: '2-digit'}) : '');
+    add(n.aired, 'published: '); add(n.heard_at ? 'heard' : ''); add(n.seconds ? Number(n.seconds).toFixed(1) + ' s' : '');
+  } else if (n.node === 'script') {
+    add(n.block != null ? 'block ' + n.block + (n.ord != null ? '.' + n.ord : '') : ''); add(n.sid, 'round '); add(n.segment, 'segment ');
+  } else if (n.node === 'road') {
+    add(n.label); add(n.who, 'seat ');
+  } else if (n.node === 'conversation') {
+    add(n.conversation_id, 'conversation '); add(n.turn_id, 'turn '); add(n.road, 'road '); add(n.via);
+  } else if (n.node === 'roll') {
+    add(n.table); add(n.path); add(n.picked || n.label);
+    add(n.dice != null ? 'd100 ' + n.dice : ''); add(n.index != null && n.of ? n.index + ' of ' + n.of : '');
+    add(n.odds != null ? 'odds ' + Math.round(Number(n.odds) * 100) + '%' : '');
+  } else if (n.node === 'store') {
+    add(n.kind); add(n.folder, 'folder '); add(n.db, 'db '); add(n.pool, 'pool '); add(n.product);
+    add(n.key, 'key '); add(n.file, 'file '); add(n.index != null && n.of ? n.index + ' of ' + n.of : '');
+  } else if (n.node === 'forced') {
+    add(n.road); add(n.trigger); add(n.detail); add(n.by, 'by '); add(n.how);
+  } else if (n.node === 'rogue') {
+    add(n.producer); add(n.why); add(n.path, 'path ');
+  }
+  return bits.join(' - ');
+}
+function originNodes(got) {
+  const v = String((got && got.verdict) || '');
+  const head = el('div', {class: 's3-origin-head s3-origin-' + v, style: 'margin:4px 0 6px;color:' + (ORIGIN_TONE[v] || 'inherit')},
+    el('b', {text: ORIGIN_WORD[v] || v || 'Unknown'}), (got && got.why) ? ' - ' + got.why : '');
+  const mk = n => el('div', {class: 's3-origin-node s3-origin-' + String(n.node || ''),
+    style: 'padding:2px 0 2px 10px;border-left:2px solid ' + (n.node === 'rogue' ? ORIGIN_TONE.rogue : n.node === 'forced' ? ORIGIN_TONE.forced : 'rgba(127,127,127,.35)')},
+    el('b', {text: originLabel(n) + ': '}), originText(n));
+  const all = (got && got.nodes) || [];
+  const round = all.filter(n => n.node === 'roll' && n.scope === 'round');
+  const rows = all.filter(n => !(n.node === 'roll' && n.scope === 'round')).map(mk);
+  /* the conversation's own rolls (the station's dice door, the round's shape) are
+     many and shared by every line of the round: folded, never hidden */
+  const folded = round.length ? el('details', {class: 's3-origin-round'},
+    el('summary', {text: round.length + ' roll' + (round.length === 1 ? '' : 's') + ' on the round (its conversation)'}),
+    ...round.map(mk)) : null;
+  const kept = (got && got.retention) ? para('Kept: ' + got.retention + (got.settled === false ? ' - still settling' : ''), 's3-muted') : null;
+  return [head, ...rows, folded, kept];
+}
+function originSection(request, lineId) {
+  const box = el('div', 's3-origin', para('Reading the origin ledger...', 's3-muted'));
+  if (!lineId) { fill(box, para('No line id - nothing to trace.', 's3-muted')); return box; }
+  Promise.resolve().then(() => request('/api/system3/origin/' + encodeURIComponent(lineId))).then(
+    got => fill(box, ...originNodes(got)),
+    () => fill(box, para('The origin ledger holds no record of this line yet - it writes each item within a minute or two of the air.', 's3-muted')));
+  return box;
+}
+export function mountOrigin(root, {request, lineId = ''} = {}) {
+  request ||= defaultRequest();
+  root.classList.add('s3');
+  fill(root, originSection(request, lineId));
+  return {dispose() { fill(root); }};
+}
+
 export async function mountLineStory(root, {request, lineId = '', prompt = '', onResolved = null, conv: given = null, turn: givenTurn = null} = {}) {
   request ||= defaultRequest();
   root.classList.add('s3', 's3-story');
@@ -6160,7 +6232,8 @@ export async function mountLineStory(root, {request, lineId = '', prompt = '', o
     /* [s3-link] the SFX Guy's row: his node and the draw that chose it */
     const v = makeViews({request});
     v.conv = conv;
-    fill(root, sfxGuyStory(conv, got.sfxguy, v));
+    fill(root, sfxGuyStory(conv, got.sfxguy, v),
+      sectionOf('Where it came from - the origin ledger', originSection(request, lineId)));   /* [s3-account] */
     tell(true, 'the SFX Guy\'s node on the turn he followed');
     return {dispose() { fill(root); }};
   }
@@ -6173,6 +6246,7 @@ export async function mountLineStory(root, {request, lineId = '', prompt = '', o
           : 'the SFX Guy\'s line; its draw was not recorded on this row.')
         : who === 'board' ? 'a board clip. The dice for the clip are on the turn it punctuates.'
         : 'a line the station put into the round at air - a passage dealt in front by the old door, a caller\'s hello - which no node made. The dice for the round are on its turns.'));
+    root.append(sectionOf('Where it came from - the origin ledger', originSection(request, lineId)));   /* [s3-account] */
     tell(false, 'in a System 3 round, but not one of its turns');
     return {dispose() { fill(root); }};
   }
@@ -6180,6 +6254,7 @@ export async function mountLineStory(root, {request, lineId = '', prompt = '', o
     say('Not directed by System 3. This line came from a road System 3 does not run yet - a gold bar replayed as filler, '
       + 'a punctuation row on a single line - or from a round written before it was switched on. Nothing '
       + 'was rolled for it, and nothing in its prompt came from the Rolodex.');
+    root.append(sectionOf('Where it came from - the origin ledger', originSection(request, lineId)));   /* [s3-account] */
     tell(false, 'not directed by System 3');
     return {dispose() { fill(root); }};
   }
@@ -6248,7 +6323,8 @@ export async function mountLineStory(root, {request, lineId = '', prompt = '', o
     sectionOf('What System 3 told the writer for this line', told),
     sectionOf('Where it sits in the prompt the writer was given', inPrompt),
     canCompose(conv, t) ? sectionOf('The line as it came back', composeLine(conv, t, v.api)) : null,
-    sectionOf('The checks on this turn', verdict));
+    sectionOf('The checks on this turn', verdict),
+    sectionOf('Where it came from - the origin ledger', originSection(request, lineId)));   /* [s3-account] */
   // the tile builds itself again as the section opens: the dice, then the words
   const first = tile.querySelector('.s3-msg');
   if (first && !reduced()) setTimeout(() => { if (first.isConnected) v.rebuildTurn(first, conv, t); }, 250);

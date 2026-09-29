@@ -182,6 +182,28 @@ class StateAndDoors(unittest.TestCase):
             pl.settings["tailscale_video"] = True
             self.assertFalse(pl.public_video_blocked())
 
+    def test_album_choice_in_state_and_control(self):
+        """[pltoggle] the album switch is settings.record: state shows it,
+        a rehearsal never records, and the host's master follows it."""
+        import json
+        with tempfile.TemporaryDirectory() as td:
+            pl = self._pl(td)
+            self.assertTrue(pl.state()["recording"]["album"])      # default on
+            pl.event = {"id": "e", "folder": "f"}
+            pl.phase = "live"
+            pl.write_control()
+            self.assertTrue(json.loads(pl.control_path.read_text())["master"])
+            self.assertTrue(pl.state()["recording"]["on"])
+            pl.settings["record"] = False
+            pl.write_control()
+            self.assertFalse(json.loads(pl.control_path.read_text())["master"])
+            st = pl.state()
+            self.assertFalse(st["recording"]["on"])
+            self.assertFalse(st["recording"]["album"])
+            pl.settings["record"] = True
+            pl.event["rehearse"] = True
+            self.assertFalse(pl.state()["recording"]["on"])         # a test is never recorded
+
     def test_troubleshoot_first_fail_walks_the_chain(self):
         with tempfile.TemporaryDirectory() as td:
             pl = self._pl(td)

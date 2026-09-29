@@ -456,14 +456,29 @@ def es_voice(config, spec):
     return out
 
 
+# [es-floor] the smallest step a listener hears, per key, off neutral (es_probe
+# --dsp at the live intensities: under these the categories measured inaudible)
+ES_VOICE_FLOOR = {"tempo": 0.05, "pitch": 0.8, "energy": 0.25, "pause": 0.08}
+ES_VOICE_NEUTRAL = {"tempo": 1.0, "pitch": 0.0, "range": 1.0, "energy": 0.0, "pause": 1.0, "temp": 0.0}
+
+
 def voice_intent(block, intensity):
     """[s3-es-voice] A voice block at a turn's intensity. The table is the full
     send; intensity i gets s = 0.35 + 0.65 i of it (the dims' own curve):
     tempo, range and pause as v ** s, pitch, energy and temp as v * s."""
-    s = 0.35 + 0.65 * clamp(float(intensity or 0.0))
+    i = clamp(float(intensity or 0.0))
+    s = 0.35 + 0.65 * i
     out = {}
     for k, v in (clean_es_voice(block) or {}).items():
         out[k] = round(v ** s if k in ES_VOICE_MULT else v * s, 4)
+        # [es-floor] a key the row moves is heard: at least floor + (full - floor) i
+        # off neutral, its sign kept, never past the full send (i = 1, as before)
+        n, step = ES_VOICE_NEUTRAL[k], ES_VOICE_FLOOR.get(k)
+        full = abs(v - n)
+        if step is None or full <= 0.004:
+            continue
+        want = min(full, max(abs(out[k] - n), step + (full - step) * i))
+        out[k] = round(n + (want if v > n else -want), 4)
     return out
 
 
@@ -5368,6 +5383,16 @@ def turn_ref(conv, t):
             "bundle_id": t.get("decision_bundle_id"), "revision": conv["identity"]["revision"]}
 
 
+def es_row(turn):
+    """[es-roads] Which ES row shaped a turn - table, category, item, label and
+    the intensity it was rolled at - for the air record. None: no feeling rolled."""
+    for d in (turn or {}).get("decisions") or []:
+        if d.get("family") == "ES" and d.get("item"):
+            return {k: d.get(k) for k in ("table", "category", "item", "label", "intensity")
+                    if d.get(k) is not None}
+    return None
+
+
 def turn_stamp(conv, t):
     """What rides a script line: the chain that produced it, compactly."""
     acts = [d for d in t["decisions"] if d.get("item")]
@@ -5378,7 +5403,8 @@ def turn_stamp(conv, t):
                      if d["family"] != "ES"],
             "perf": {"dims": perf.get("dims") or {}, "pace": perf.get("pace"),
                      "pause_style": perf.get("pause_style"),
-                     **({"voice": perf["voice"]} if perf.get("voice") is not None else {})},   # [s3-es-voice]
+                     **({"voice": perf["voice"]} if perf.get("voice") is not None else {}),   # [s3-es-voice]
+                     **({"row": es_row(t)} if es_row(t) else {})},   # [es-roads] which row, how hard
             "speakerbox": [sb["mode"] for sb in t.get("speakerbox") or [] if sb["mode"] != "NONE"],
             "sfx": {k: (t.get("sfx") or {}).get(k) for k in ("play", "placement", "intent", "event_id")},
             # [s3-roads] his node: whether he speaks after this line and how

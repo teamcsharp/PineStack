@@ -60,6 +60,9 @@ object ViewAssets {
         // Voice Actor extraction: the signature-making pane behind
         // the panel's New actor button (registers with the shell).
         "voice-actor-extract.js",
+        // Voice Actor strips: the last eight profiles under each seat
+        // (tap assigns, hold auditions a never-aired sample + meter).
+        "voice-actor-strips.js",
         "changelog.js",           // Git-backed task history from the audit footer
         "console-trace.js",       // tap that line: where the work came from
         "audio-law.js",           // ONE door to every level and route
@@ -163,6 +166,7 @@ object ViewAssets {
         "voice-actor.css",        // the person badge and the cast subpanel
         "voice-actor-viz.css",    // the extraction tiles and their 4-line readout
         "voice-actor-extract.css", // the extraction pane: link, library, cart, jobs
+        "voice-actor-strips.css",  // the profile strips and the audition sheet
         // #1191/#1202: the glass, its triangles and its headline number. Same
         // finding as the script above - the file was in assets and in no
         // list, so on the tablet the pop-up would have opened unstyled if

@@ -1517,6 +1517,14 @@ ROAD_REGISTER = [
     {"id": "ad_spot", "label": "Produced advert", "shape": "line",
      "writer": "dj_ad_break: ad_pick", "hook": "system3_direct_line (LINE draw over the book)",
      "what": "a stored or produced spot: the ad book's rows are the Rolodex, the pick is a recorded draw"},
+    # [h3-speak] the words the people in the hourly H3 video say
+    {"id": "h3_speak", "label": "H3 video dialogue (H3SPEAK)", "shape": "node",
+     "writer": "h3_hourly_render -> h3_speak_gather / h3_speak_take (app.py)",
+     "hook": "the dice door: POOLS1 h3.speak_lean / h3.speak_count / h3.speak_forced; "
+             "picks h3.speak_line / h3.speak_sentences / h3.speak_doc",
+     "what": "the hourly H3 video's spoken line: a line or monologue a person was heard saying on air "
+             "(leaned on by its feeling), then 1-3 whole sentences of it that fit the clip - a Speakerbox "
+             "document when no aired line passes, the FORCED line when nothing does"},
 ]
 ROAD_IDS = tuple(r["id"] for r in ROAD_REGISTER)
 

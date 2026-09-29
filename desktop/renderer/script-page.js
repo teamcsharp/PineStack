@@ -6126,14 +6126,18 @@
   }
   function mvProv(lid) {
     if (!lid || !hourKey) return Promise.resolve(null);
-    var ask = function (key) {
+    var ask = function (key, origin) {
       return Promise.resolve().then(function () {
-        return api().get('/api/screenplay/' + encodeURIComponent(key) + '/line/' + encodeURIComponent(lid));
+        return api().get('/api/screenplay/' + encodeURIComponent(key) + '/line/' + encodeURIComponent(lid)
+          + (origin ? '?origin=1' : ''));   /* [s3-account] */
       }).then(function (got) { return (got && got.provenance) || null; }, function () { return null; });
     };
     return ask(hourKey).then(function (p) {
       var back = mvHourBefore(hourKey);
       return p || !back ? p : ask(back);
+    }).then(function (p) {
+      /* [s3-account] a line older than the hour tree: the origin ledger answers */
+      return p || ask(hourKey, 1);
     });
   }
   function mvStores(item, ans, prov) {
@@ -6156,6 +6160,13 @@
       }
       if (prov.voice && prov.voice.shelf) put('pantry', 'the pantry: a finished take, not rendered for this airing');
       if (prov.air && prov.air.replay) put('reair', 're-aired: a line already heard, played again');
+      /* [s3-account] the origin ledger names the store for a line of any age */
+      ((prov.origin && prov.origin.nodes) || []).forEach(function (n) {
+        if (!n || n.node !== 'store' || !n.kind) return;
+        put('ledger:' + String(n.kind), 'the ' + String(n.kind)
+          + (n.folder ? ' - ' + String(n.folder) : '') + (n.db ? ' - ' + String(n.db) : '')
+          + (n.product ? ' - ' + String(n.product) : '') + (n.key ? ' (' + String(n.key).slice(0, 40) + ')' : ''));
+      });
     }
     if (row.replay) put('reair', row.source === 'reel' ? 'the resume reel: banked lines played back' : 're-aired from the line log' + (row.replay_of ? ' (' + String(row.replay_of).slice(0, 8) + ')' : ''));
     if (s3.replay && typeof s3.replay === 'object') {
