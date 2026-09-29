@@ -1042,6 +1042,11 @@ class System3Runtime:
             missing += [t for t in system3_mgrtopics.default_tables() if t["id"] not in have and t["id"] not in seen]
         if system3_gold is not None:                                        # [s3-gold:tables] GOLD1, once
             missing += [t for t in system3_gold.default_tables() if t["id"] not in have and t["id"] not in seen]
+        try:                                                                # [outl-tables] the meter's six, once
+            import outlandish as _outl
+            missing += [t for t in _outl.default_tables() if t["id"] not in have and t["id"] not in seen]
+        except Exception as exc:  # noqa: BLE001
+            self.fail("outlandish tables", exc)
         if not missing:
             return []
         new = copy.deepcopy(config)
@@ -2464,6 +2469,12 @@ class System3Runtime:
             _graph = ((system3.road_structure(config, road) or {}).get("graph") or {})   # [nodeplan]
             _chapter = bool(_graph.get("enabled") and _graph.get("nodes")
                             and not any(n.get("type") == "protocol" for n in _graph["nodes"]))
+            if _chapter and (who == "board" or ctx.get("one_line")):             # [outl-oneline]
+                # a board clip is a sound and a bumper or a holding line is a one-liner:
+                # no exchange is planned on it (the one-turn interject "rounds" were these)
+                _chapter = False
+                inputs["one_line"] = ("a board clip is a sound, not a line" if who == "board"
+                                      else str(ctx.get("one_line")))
             if _chapter:
                 # [nodeplan] no one-line segments: the studio answers the line,
                 # the chapter graph plans the exchange (the operator turned it on)
@@ -2480,7 +2491,14 @@ class System3Runtime:
             self._absorb_rolls(conv)                                            # [s3-dice-door]
             conv["identity"]["segment"] = dict((conv.get("inputs") or {}).get("segment") or {})   # [s3-segment]
             if _chapter:
-                system3.plan_graph(conv, config, _graph, inputs=inputs, road=road)   # [nodeplan]
+                _mini = None
+                if road == "interject":                                     # [outl-mini] reply, rebuttal, exit roll
+                    try:
+                        import outlandish as _outl
+                        _mini = _outl.miniround_until(conv, config)
+                    except Exception as _mexc:  # noqa: BLE001
+                        self.fail("mini-round", _mexc)
+                system3.plan_graph(conv, config, _graph, inputs=inputs, road=road, until=_mini)   # [nodeplan]
             else:
                 system3.plan_line(conv, config, inputs)
             self._mark_split_nodes(conv, config, road)                          # [s3-split]
@@ -4457,6 +4475,10 @@ class System3Runtime:
             if turn is None and not tid and conv and len(conv.get("turns") or []) == 1:
                 tid = conv["turns"][0]["turn_id"]
                 turn = comp["turns"].get(tid)
+            if conv is not None:                                             # [outl-feed] the meter, the reaction
+                for o in conv.get("observations_air") or []:
+                    if o.get("family") in ("MEASURE", "SFXREACT", "HOLD") and lid in (o.get("lines") or []):
+                        air.append(self._compact_roll(o))
             out[lid] = {"system3": True, "conversation_id": cid, "turn_id": tid, "who": who,
                         "road": comp["road"], "mode": comp["mode"], "topic": comp["topic"],
                         "turn": turn, "air": air}
@@ -5205,7 +5227,13 @@ def install(app, namespace):
             ids.add(((turn.get("sfxguy") or {}).get("event_id")))
         return {"line": got, "turn": turn, "healed": healed, "sfxguy": sfxguy,
                 "engine": conv.get("engine"), "planned_at": conv.get("created"),
-                "decisions": [e for e in conv["decision_events"] if e["event_id"] in ids],
+                "decisions": [e for e in conv["decision_events"] if e["event_id"] in ids]
+                + [o for o in conv.get("observations_air") or []                  # [outl-tile]
+                   if o.get("family") in ("MEASURE", "SFXREACT", "HOLD") and o.get("stages")
+                   and (got["line_id"] in (o.get("lines") or [])
+                        or (turn is not None and not o.get("lines") and o.get("turn_id") == turn.get("turn_id")))
+                   and not (o.get("family") == "MEASURE" and any(
+                       e.get("family") == "MEASURE" and e["event_id"] in ids for e in conv["decision_events"]))],
                 "observations": [o for o in conv.get("observations_air") or []
                                  if (turn and o.get("turn_id") == turn.get("turn_id"))
                                  or (got.get("turn_id") and o.get("turn_id") == got["turn_id"])

@@ -35724,6 +35724,7 @@ async def dj_line(kind: str, track: dict[str, Any] | None = None,
         "station_id": dj["station_ids"],
         "interject": dj["interject_phrases"],
         "media": dj["interject_phrases"],
+        "aside": dj["interject_phrases"],   # [outl-aside-bank]
     }.get(kind, dj["intro_phrases"])
     fallback = _dj_fill(s3_choice("line.stock_phrase", bank, "which stock phrase the line falls back on", tabled=False)   # [s3-dice-door]
                         if bank else "{title}", track)   # [s3-dice-door]
@@ -35750,6 +35751,7 @@ async def dj_line(kind: str, track: dict[str, Any] | None = None,
         "media": f"react to what the host just showed you: {extra}",
         "ad": f"read a short, enthusiastic advert for: {extra}",
         "reply": f"reply to what the host just said to you: {extra}",
+        "aside": (extra or "say one short, standalone thing, in character"),   # [outl-aside-ask]
     }
     task = asks.get(kind, asks["intro"])
     # A title in characters the pair cannot say is not translated any more
@@ -37066,6 +37068,13 @@ async def _s3_line_chapter_admit(stamp: dict[str, Any], spoken: str, kind: str, 
             context=str(spoken)[:400], by_hand=bool(by_hand))
         if _s3_chapter_superseded(e):                            # [s3-chain2]
             return None
+    _outl_prime = globals().get("outlandish_prime_chapter")                  # [outl-prime]
+    if _outl_prime is not None and not e.get("outl_primed"):
+        e["outl_primed"] = True        # the replies re-rolled once the opener's words are known
+        try:
+            _outl_prime(e.get("stamp") or stamp, str(e.get("opening") or spoken))
+        except Exception:  # noqa: BLE001
+            pass
     return await _s3_chapter_take(e, lend=True)
 
 
@@ -37108,6 +37117,14 @@ async def _s3_chapter_air_rest(e: dict[str, Any], track: Any = None, round_as: s
     ("partial") and the keeper resumes it - never a one-line broadcast."""
     rows, clips = list(e.get("rows") or []), list(e.get("clips") or [])
     i = max(1, int(e.get("done") or 0))
+    if i == 1 and not e.get("outl_reacted"):                                 # [outl-react-chapter]
+        e["outl_reacted"] = True       # the SFX Guy's reaction: after the opener, before the reply
+        _outl_between = globals().get("outlandish_react_between")
+        if _outl_between is not None:
+            try:
+                await _outl_between(e, track)
+            except Exception:  # noqa: BLE001
+                pass
     e["state"], e["done"] = "airing", i
     _s3_chapter_save()
     tok = _S3_CHAPTER_ROW.set("row")
@@ -37506,12 +37523,20 @@ async def _dj_speak_floorless(kind: str, track: dict[str, Any] | None = None,
                     "open" if kind == "open" else
                     "aside" if kind == "aside" else
                     "interject")
+        if kind == "interject" and round_as == "ad":                          # [outl-bumper-road]
+            try:
+                import system3 as _s3m
+                if _s3m.road_mode(globals()["_system3"]().settings, "ad_spot") != "off":
+                    _s3_road = "ad_spot"   # the ad's out-bumper is the ad road's, traced with the ad
+            except Exception:  # noqa: BLE001
+                pass
         try:
             _s3_spoken_handle = await system3_direct_line(
                 road=_s3_road, who=who, dj=dj_settings(),
                 context=(str(extra or line or note or
                              (track or {}).get("title") or kind)[:400]),
-                text=str(line or "")[:600], bank=bool(clip))
+                text=str(line or "")[:600], bank=bool(clip),
+                one_line=("the ad's out-bumper" if round_as == "ad" else ""))   # [outl-oneline]
         except Exception as _s3_exc:  # noqa: BLE001
             pipeline_log("system3", "single-line planning failed",
                          extra=("%s: %s" % (type(_s3_exc).__name__, _s3_exc))[:200])
@@ -74437,7 +74462,7 @@ async def dj_ad(product: str, remember: bool = True,
     back = ""
     if _RADIO["on"] and _RADIO.get("now"):
         back = await dj_speak(
-            "interject", _RADIO["now"],
+            "interject", _RADIO["now"], round_as="ad",   # [outl-bumper] the ad road's closing turn
             # #901: drawn, not hardcoded — see AD_HANDOFFS.
             line=_dj_fill(s3_unrepeated("ad.handoff",   # [s3-dice-door]
                 list(AD_HANDOFFS), "ad_handoff", "the line that hands back after an advert",   # [s3-dice-door]
@@ -98778,6 +98803,12 @@ async def continuity_air(reason: str = "") -> bool:
     # recorded pairs are the same lines every time; under the 24-hour rule the
     # emergency answer is the gap filler's: a rolled record, then rolled SFX.
     if norepeat_on():
+        _outl_hold = globals().get("outlandish_hold_roll")                  # [outl-hold] HOLDBANTER1
+        if _outl_hold is not None:
+            try:
+                _outl_hold(reason or "the emergency reserve was reached")
+            except Exception:  # noqa: BLE001
+                pass
         _went = await sfx_fill_gap(reason or "the emergency reserve was reached")
         if _went:
             _CONTINUITY_STATE.update(last_air=time.time(),
@@ -111639,6 +111670,16 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                     # the tube, so resting is honest, and that dj_sting has always
                     # stamped before its own #1417 gate.
                     _sting = "" if _keep_mic else sting_due()
+                    # [outl-react] a line at the meter's react threshold: the SFX Guy's reaction,
+                    # rolled on SFXREACT1, drops between it and the next turn (before the reply)
+                    _outl_rx = globals().get("outlandish_react_clip")
+                    if not _keep_mic and _outl_rx is not None and item["who"] not in ("board", "drop"):
+                        try:
+                            _rx_clip = _outl_rx(spoken_text(item["chunk"]), item["who"], ready_meta, "round")
+                        except Exception:  # noqa: BLE001
+                            _rx_clip = None
+                        if _rx_clip:
+                            _sting = _rx_clip
                     _sting_tube = sfx_soundboard_hand_off(_sting, "round") if _sting else ""
                     if _sting_tube:
                         _sting = ""
@@ -153514,6 +153555,16 @@ try:
 except Exception as _system3_exc:  # noqa: BLE001
     _SYSTEM3_RUNTIME = None
     print("system3 did not install: %s: %s" % (type(_system3_exc).__name__, _system3_exc))
+# [outl-install] THE OUTLANDISH METER (outlandish.py, outlandish_runtime.py, sfx_repertoire.py):
+# every aired line measured 0-100 (never filtered), the audit log, the dispute odds, the
+# interjection's mini-round and the SFX Guy's reaction. Its hooks are reached through
+# globals().get(), so an install that fails leaves the station exactly as it was.
+try:
+    from outlandish_runtime import install as install_outlandish
+    _OUTLANDISH_RUNTIME = install_outlandish(app, globals())
+except Exception as _outl_exc:  # noqa: BLE001
+    _OUTLANDISH_RUNTIME = None
+    print("the outlandish meter did not install: %s: %s" % (type(_outl_exc).__name__, _outl_exc))
 # [sfx-vectors] the SFX Guy's vector section (docs/SFX_vector_reuse.md): clips
 # and his dialogue indexed by lexical, semantic and anchored facets, kept by
 # his own keeper, queryable by outside applications, backed up as one file.
@@ -187342,6 +187393,9 @@ def airlog_write_rows(rows: list[dict[str, Any]]) -> int:
                         and row.get("who") not in ("board", "analysis")):
                     norepeat_note_line(row.get("text"), str(row.get("kind") or row.get("round") or ""),
                                        str(row.get("id") or ""), row.get("air_at"))
+                _outl_note = globals().get("outlandish_note_row")          # [outl-air] the meter, off the loop
+                if _outl_note is not None and (row.get("aired") in NOREPEAT_SOUNDED or row.get(HEARD_STAMP)):
+                    _outl_note(row)
                 if (row.get("who") in AIRLOG_CAST
                         and row.get("aired") in AIRLOG_AIRED
                         and row.get("kind") not in AIRLOG_QUIET_KINDS):

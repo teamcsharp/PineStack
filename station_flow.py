@@ -35,6 +35,7 @@ NODE_SPEC = [
     ("watchdog", "Talk watchdog", "pulse", "feedback", "Measures acknowledged speech gaps and requests prepared cover when the target is missed."),
     ("reflection", "Reflection", "brain", "feedback", "The station reviews outcomes and adapts subsequent writing and preparation."),
     ("repeat", "Repetition judge", "repeat", "judge", "Checks repeated lines and phrases against the acknowledged broadcast history."),
+    ("outlandish", "OUTLANDISH meter", "gauge", "judge", "Measures every aired line for outlandish, appalling or inappropriate content and never filters it: a high score goes to the audit log, raises the next seat's dispute odds and wakes the SFX Guy's reaction."),  # [outl-flow]
     ("gazette", "Gazette desks", "news", "paper", "Source material, the station and gallery become newspaper stories."),
     ("paper_tint", "Paragraph tint", "gem", "paper", "Each eligible paragraph records attempts, evaluated changes and coverage."),
     ("edition", "Published edition", "book", "paper", "The edition carries per-story tint badges and an honest edition coverage result."),

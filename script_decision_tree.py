@@ -247,6 +247,8 @@ def build_round(conv: dict[str, Any], aired: dict[str, dict[str, Any]] | None = 
             continue
         round_rolls.append(receipt(e))
     interject_ev = next((e for e in events if e.get("family") == "INTERJECT"), None)
+    cutin_at = {str((e.get("meta") or {}).get("cutin_turn")): e for e in events       # [outl-cutin-tree]
+                if e.get("family") == "CUTIN" and (e.get("meta") or {}).get("cutin_turn")}
     elements: list[dict[str, Any]] = []
     gi = 0
     interject_placed = False
@@ -306,6 +308,11 @@ def build_round(conv: dict[str, Any], aired: dict[str, dict[str, Any]] | None = 
                       "table": "INTERJECT", "cycle": t.get("cycle")})
             elements.append(d)
             interject_placed = True
+        if str(t.get("turn_id") or "") in cutin_at:                           # [outl-cutin-diamond]
+            d = diamond(cutin_at[str(t.get("turn_id"))], labels)
+            d.update({"kind": "chance", "node": "cutin", "node_label": "Cut-in", "table": "CUTIN1",
+                      "cycle": t.get("cycle")})
+            elements.append(d)
         elements.append(stage_of(t))
     while gi < len(gates):
         elements.append(diamond(gates[gi], labels))

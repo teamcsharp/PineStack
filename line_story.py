@@ -305,6 +305,27 @@ def _s3(data: Path, lid: str) -> dict[str, Any]:
                 out["conversation"] = {"id": r[0], "road": cv[0], "mode": cv[1], "status": cv[2], "seed": cv[3],
                                        "verdict": cv[4], "created": cv[6], "topic": summ.get("topic"),
                                        "turns": summ.get("turns"), "events": summ.get("events")}
+            try:                                                              # [outl-why-read] the meter
+                import zlib
+                meas = []
+                for fam, blob in c.execute("SELECT family, body FROM events WHERE conversation_id=? AND "
+                                           "kind='observation' AND family IN ('MEASURE','SFXREACT','HOLD')",
+                                           (r[0],)).fetchall():
+                    try:
+                        b = json.loads(zlib.decompress(blob).decode("utf-8"))
+                    except Exception:  # noqa: BLE001
+                        continue
+                    if lid in (b.get("lines") or []) or (not b.get("lines") and b.get("turn_id") == r[1]):
+                        sel = b.get("selected") or {}
+                        cues = [str(x.get("label")) + ": " + str(x.get("match"))
+                                for x in ((b.get("measure") or {}).get("cues") or [])][:6]
+                        meas.append({"family": fam, "at": b.get("at"), "label": sel.get("label"),
+                                     "score": sel.get("score"), "tags": sel.get("tags"), "cues": cues,
+                                     "clip": sel.get("clip")})
+                if meas:
+                    out["outlandish"] = meas
+            except sqlite3.Error:
+                pass
     except sqlite3.Error as exc:
         out["error"] = str(exc)
     finally:
@@ -430,6 +451,10 @@ def story(data: Any, query: Any, ring: Iterable[dict[str, Any]] = (), now: float
     # -- System 3: the line row, its conversation, the origin record
     s3db = _s3(data, lid)
     out["system3"] = s3db
+    for _m in s3db.get("outlandish") or []:                                  # [outl-why-life]
+        add(_m.get("at"), "measured" if _m.get("family") == "MEASURE" else "reacted",
+            str(_m.get("label") or _m.get("family")),
+            **{k: v for k, v in (("cues", _m.get("cues")), ("clip", _m.get("clip"))) if v})
     if s3db.get("conversation"):
         cv = s3db["conversation"]
         add(cv.get("created"), "planned", "System 3 conversation %s on the %s road (%s, %s)" % (
