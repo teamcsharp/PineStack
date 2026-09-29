@@ -579,6 +579,65 @@
   object-fit: contain;
   background: #000;
 }
+
+/* [cambattery] the camera's battery, top-left of every picture. A drawn
+   gauge (Carbon has no battery glyph in the vendored set), the camera's
+   word for its level, and the time left once it has been measured. */
+.pine-cam-pip { position: relative; }
+.pine-cam-batt {
+  position: absolute;
+  left: 6px;
+  top: 6px;
+  z-index: 3;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 7px 2px 5px;
+  border-radius: 6px;
+  background: rgba(5, 8, 10, .64);
+  color: #e6eef1;
+  font: 600 11px/16px system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  letter-spacing: .02em;
+  white-space: nowrap;
+  cursor: default;
+}
+.pine-cam-batt[hidden] { display: none !important; }
+.pine-cam-batt-cell {
+  position: relative;
+  display: inline-flex;
+  gap: 1px;
+  width: 21px;
+  height: 11px;
+  padding: 1.5px;
+  margin-right: 2px;
+  box-sizing: border-box;
+  border: 1.5px solid currentColor;
+  border-radius: 2.5px;
+}
+.pine-cam-batt-cell::after {
+  content: '';
+  position: absolute;
+  right: -4.5px;
+  top: 2.5px;
+  width: 2.5px;
+  height: 3.5px;
+  border-radius: 0 1px 1px 0;
+  background: currentColor;
+}
+.pine-cam-batt-cell i { flex: 1; border-radius: .5px; background: currentColor; opacity: .16; }
+.pine-cam-batt-cell i.on { opacity: 1; }
+.pine-cam-batt--charging .pine-cam-batt-cell { width: auto; height: auto; padding: 0; margin: 0; border: 0; }
+.pine-cam-batt--charging .pine-cam-batt-cell::after { display: none; }
+.pine-cam-batt-cell svg { width: 13px; height: 13px; display: block; fill: currentColor; }
+.pine-cam-batt--charging { color: #8fe3b0; }
+.pine-cam-batt--amber { color: #f5a524; }
+.pine-cam-batt--red { color: #ff5a5f; }
+.pine-cam-batt--stale { color: #99a3a8; background: rgba(5, 8, 10, .46); }
+.pine-cam-batt--pulse { animation: pine-cam-batt-pulse 2.4s ease-in-out infinite; }
+@keyframes pine-cam-batt-pulse { 0%, 100% { opacity: 1; } 50% { opacity: .42; } }
+@media (prefers-reduced-motion: reduce) { .pine-cam-batt--pulse { animation: none; } }
+.pine-cam-box.pine-cam-round .pine-cam-batt { display: none !important; }
+.pine-cam-pip .pine-cam-batt { font-size: 10px; left: 4px; top: 4px; }
 .pv-row.pine-cam-keptrow { position: relative; padding-right: 54px; }
 .pine-cam-rowbtn {
   position: absolute;

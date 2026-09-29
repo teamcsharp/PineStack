@@ -277,7 +277,9 @@
       + '<button type="button" class="pine-cam-x" '
       + 'aria-label="Close the camera view" title="Close the camera view">×</button>'
       + '</div>'
-      + '<img id="pineCamImg" alt="The Pine Cam, live">';
+      + '<img id="pineCamImg" alt="The Pine Cam, live">'
+      /* [cambattery] the camera's battery, over the picture's top-left */
+      + '<div class="pine-cam-batt" id="pineCamBatt" hidden></div>';
     document.body.appendChild(box);
     place(box);
     /* The whole box is the handle; a tap on the folded circle unfolds it. */
@@ -505,6 +507,7 @@
     if (!box) return;
     bare = !!on;
     box.classList.toggle('pine-cam-bare', bare);
+    battPlace();                           /* [cambattery] */
     var b = document.getElementById('pineCamHdr');
     if (b) b.setAttribute('aria-expanded', bare ? 'false' : 'true');
     lastBoxKey = '';
@@ -550,6 +553,8 @@
       setFrameTimer(NATIVE_POSTER_MS);
       posterShown(false);
       nativeBox();                         /* the box may have moved while asked */
+      battNativeKey = '';                  /* [cambattery] a new surface: tell it again */
+      paintBatteryNative(battModel(batt));
     }, function () { nativeAsked = false; });
   }
 
@@ -1024,6 +1029,127 @@
 
   /* ---------------------------------------------------------- the ask */
 
+  /* [cambattery] THE CAMERA'S BATTERY, TOP-LEFT OF EVERY PICTURE.
+   *
+   * "display a battery meter indicating the battery amount in the top left
+   * corner of the pine cam ... so I can see how much battery's in the
+   * camera at all times and know how long I have left in the stream."
+   *
+   * The station asks the camera (Novatek cmd 3019) every 45 s while the
+   * link is live and hands the reading on as /api/pinelink/state
+   * `battery`. The camera reports a LEVEL - full, half, low, last bar,
+   * empty, or charging - never a percentage, so the meter fills bars of
+   * four and says the word; the time left appears only once the station
+   * has watched a whole level go by, and is never guessed before that.
+   * Amber at low (~30%), red on the last bar (~15%), a gentle pulse at
+   * empty (10% and under). Older than three minutes it greys and says
+   * "stale". The title carries the exact reading and its age.
+   *
+   * Three pictures carry it: the box (an element over the <img>'s top-
+   * left), the card's pip on the desktop, and the tablet's NATIVE surface
+   * - which no page element can paint over (the media-overlay SurfaceView
+   * is composited ABOVE the WebView), so the same reading is handed to
+   * the kiosk as pineCam('battery', ...) and PineCamWall draws it in the
+   * surface's own top-left. A kiosk without the verb answers "no such
+   * pineCam verb" and nothing else happens. Carbon has no battery glyph
+   * in the vendored set, so the gauge is drawn (like the signal bars) and
+   * charging wears c:lightning. */
+  var BATT_STALE_S = 180;
+  var batt = null;             /* the last reading, stamped with this page's clock */
+  var battNativeKey = '';
+
+  function battAge(b) {
+    if (!b || !b.ok) return Infinity;
+    var since = b._got ? Math.max(0, (Date.now() - b._got) / 1000) : 0;
+    return Number(b.age_s || 0) + since;
+  }
+
+  function battAgeSay(s) {
+    if (!isFinite(s)) return 'never';
+    if (s < 90) return Math.round(s) + ' s';
+    if (s < 5400) return Math.round(s / 60) + ' min';
+    return (s / 3600).toFixed(1) + ' h';
+  }
+
+  function battModel(b) {
+    if (!b || !b.ok) return null;
+    var age = battAge(b);
+    var stale = age > BATT_STALE_S;
+    var text = b.charging ? 'charging' : String(b.word || '?');
+    if (!b.charging && b.left_say && !stale) {
+      text += ' · ' + (Number(b.left_s) < 120 ? 'any minute' : '~' + b.left_say);
+    }
+    if (stale) text += ' · stale';
+    var title = String(b.what || b.say || 'Pine Cam battery')
+      + '. Read ' + battAgeSay(age) + ' ago'
+      + (stale ? ' - STALE: the camera has not answered since' + (b.error ? ' (' + b.error + ')' : '') : '')
+      + '.';
+    return {text: text, title: title,
+            bars: b.charging ? -1 : Math.max(0, Math.min(4, Number(b.bars) || 0)),
+            tone: stale ? 'stale' : String(b.tone || 'ok'),
+            pulse: !!b.pulse && !stale, stale: stale, charging: !!b.charging};
+  }
+
+  function battHtml(m) {
+    var cells = '';
+    for (var i = 0; i < 4; i++) cells += '<i' + (i < m.bars ? ' class="on"' : '') + '></i>';
+    return '<span class="pine-cam-batt-cell" aria-hidden="true">'
+      + (m.charging ? icon('c:lightning', 'Charging', '') : cells) + '</span>'
+      + '<span class="pine-cam-batt-text">' + esc(m.text) + '</span>';
+  }
+
+  function battPaintInto(el, m) {
+    if (!el) return;
+    if (!m) { el.hidden = true; return; }
+    var key = m.text + '|' + m.bars + '|' + m.tone + '|' + m.pulse;
+    if (el.__battKey !== key) {
+      el.__battKey = key;
+      el.innerHTML = battHtml(m);
+      el.className = 'pine-cam-batt pine-cam-batt--' + m.tone
+        + (m.pulse ? ' pine-cam-batt--pulse' : '')
+        + (m.charging ? ' pine-cam-batt--charging' : '');
+    }
+    el.title = m.title;
+    el.setAttribute('aria-label', m.title);
+    el.hidden = false;
+  }
+
+  /* The picture's top-left moves when the header folds; the meter goes
+   * with it. */
+  function battPlace() {
+    var el = document.getElementById('pineCamBatt');
+    var img = document.getElementById('pineCamImg');
+    if (!el || !img) return;
+    el.style.left = (img.offsetLeft + 6) + 'px';
+    el.style.top = (img.offsetTop + 6) + 'px';
+  }
+
+  function paintBatteryNative(m) {
+    if (!nativeOn) return;
+    var arg = m ? {on: true, text: m.text, bars: m.bars, tone: m.tone,
+                   pulse: m.pulse, stale: m.stale, charging: m.charging}
+                : {on: false};
+    var key = JSON.stringify(arg);
+    if (key === battNativeKey) return;
+    battNativeKey = key;
+    nativeAsk('battery', arg);
+  }
+
+  function paintBattery(b, isLive) {
+    if (b && b.ok && !b._got) b._got = Date.now();
+    batt = b || null;
+    var m = (isLive === false) ? null : battModel(batt);
+    battPaintInto(document.getElementById('pineCamBatt'), m);
+    battPlace();
+    if (pip) {
+      var pe = pip.querySelector('.pine-cam-batt');
+      if (!pe && m) { pe = document.createElement('div'); pip.appendChild(pe); }
+      battPaintInto(pe, m);
+    }
+    paintBatteryNative(m);
+    return m;
+  }
+
   function look() {
     Promise.resolve(ask('/api/pinelink/state')).then(function (got) {
       var was = live;
@@ -1095,6 +1221,7 @@
           : (got.state === 'live' && !got.fresh) ? 'stale' : String(got.state || '');   /* #1387 */
       }
       paintRow(got, live);
+      paintBattery(got && got.battery, live);   /* [cambattery] after the pip exists */
       railTabs();                          /* 2026-09-14: the rail entries */
       /* If it goes while the view is open, say so rather than freezing on
        * the last frame - a still picture of a camera that has gone is the
@@ -2496,7 +2623,9 @@
     /* #1118: the sheets, reachable from a console or another view. */
     ladder: openLadder, prefs: openPrefs, folder: showFolder,
     crop: cropDrawOpen, cropMenu: holdAt,                 /* [pincrop] */
-    announce: function () { return post('/api/pinelink/announce', {}); }};
+    announce: function () { return post('/api/pinelink/announce', {}); },
+    /* [cambattery] paint a reading (a /api/pinelink/state `battery`), or read the last */
+    battery: function (b, isLive) { return b === undefined ? batt : paintBattery(b, isLive); }};
 
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', start);
