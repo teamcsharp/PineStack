@@ -8284,7 +8284,8 @@
     [].slice.call(twin).forEach(function (n) { if (!mv.pin || mv.pin.cur.node !== n) n.parentNode.removeChild(n); });
     mvObserve(node);
     var kids = stage.querySelectorAll('.sp-mv-item');
-    for (var i = 0; i < kids.length - MV_KEEP; i += 1) {
+    var keep = Math.min(MV_KEEP, MV_HIST_MAX || MV_KEEP);   /* [mvkeep] the operator's history preference */
+    for (var i = 0; i < kids.length - keep; i += 1) {
       if (mv.pin && mv.pin.cur.node === kids[i]) continue;
       if (mv.io) { try { mv.io.unobserve(kids[i]); } catch (e) { /* gone */ } }   /* [memdiet-views] */
       stage.removeChild(kids[i]);
