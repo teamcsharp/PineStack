@@ -1874,7 +1874,9 @@
     find.type = 'search';
     find.placeholder = 'find a word said on air';
     find.title = 'Every time this word was said on the air in the last two days, and why it keeps being said';
+    find.title += ' - or a message code (#3c4782) to open that message';   /* [msgid] */
     find.addEventListener('keydown', function (ev) {
+      if (ev.key === 'Enter' && root.PineMsgId && root.PineMsgId.find(find.value)) { ev.preventDefault(); return; }   /* [msgid] #3c4782 opens that message */
       if (ev.key === 'Enter') { ev.preventDefault(); findOpen(find.value); }
     });
 
@@ -6822,6 +6824,7 @@
     node.appendChild(acc);
     var bubble = make('div', 'sp-mv-bubble');
     mvOriginWire(bubble, item);               /* [msgorigin] double tap: the origin; hold: the sheet */
+    if (root.PineMsgId) { try { if (item.lid) bubble.appendChild(root.PineMsgId.chip(item.lid, 'corner')); } catch (e) { /* [msgid] the view stands without it */ } }
     var head = make('div', 'sp-mv-who');
     head.appendChild(mvGlyph(mvKindIcon(item)));
     head.appendChild(make('b', '', item.name || ''));
@@ -17760,6 +17763,472 @@
     return sheet;
   }
 
+  /* [rounds-tree] THE SEGMENT'S DECISION TREE. "When I click this, I want a
+     popup window showing me a vertical flowchart of the decision tree for
+     the entire flow that is scripted through consecutive roulette per the
+     System 3 vertical node table ... with the intermediate roulette rounds
+     as diamonds in between." (the operator, 2026-09-29)
+
+     A tap on a segment's status block ("written: 19/18 lines ...") asks
+     GET /api/script/segment/<occurrence>/decision-tree and draws each round
+     top to bottom: solid cards (the Message view's Digital bubble) for the
+     stages that happened, each with its speaker die and its roll receipt
+     (table, category, the indented sub result); diamonds between them for
+     the graph's gates with their odds and the die that came up; dashed,
+     dimmed cards for the branches a gate offered and did not take; grey
+     cards for rejected turns. A card with a script row opens the line's
+     own sheet (PineLineActions); a diamond opens its whole roll: seed,
+     draw, every face with its weight, the one that landed. History the
+     ledger never recorded says "not recorded" - nothing is guessed.
+     Native scrolling only: nothing here ever moves the reader. */
+  var RTREE = {pop: null, unwatch: null, opener: null, gen: 0, esc: null};
+  var RTREE_ROLE = {start: 'spine', initiator: 'spine', rebuttal: 'spine', topic_change: 'spine',
+    end: 'spine', open: 'spine'};
+  var RTREE_STATE = {aired: 'aired', scripted: 'on the script', written: 'written',
+    planned: 'planned, never written', rejected: 'rejected'};
+  var RTREE_CSS = [
+    '.rtree-pop{position:fixed;inset:18px;z-index:2147483000;display:flex;flex-direction:column;',
+    'background:#0b1117;color:#edf3f5;border:1px solid #3a4a57;border-radius:14px;',
+    'box-shadow:0 18px 60px rgba(0,0,0,.6);font:13px Inter,Segoe UI,system-ui,sans-serif;overflow:hidden}',
+    '.rtree-head{flex:none;display:flex;flex-direction:column;gap:3px;padding:12px 64px 10px 16px;border-bottom:1px solid #26333d}',
+    '.rtree-head h2{margin:0;font-size:15px;letter-spacing:.04em;display:flex;align-items:center;gap:8px}',
+    '.rtree-head .rtree-say{color:#8fa0ad;font-size:12px}',
+    '.rtree-x{position:absolute;top:8px;right:8px;width:40px;height:40px;border:0;border-radius:8px;',
+    'background:transparent;color:#cfe3ea;cursor:pointer;display:flex;align-items:center;justify-content:center}',
+    '.rtree-x:hover{background:#1b2630}',
+    '.rtree-body{flex:1;min-height:0;overflow-y:auto;overscroll-behavior:contain;-webkit-overflow-scrolling:touch;padding:10px 16px 40px}',
+    '.rtree-ico{display:inline-flex;width:15px;height:15px}.rtree-ico svg{width:100%;height:100%}',
+    '.rtree-note{margin:6px 0;color:#8fa0ad;font-size:12px}',
+    '.rtree-round{margin:14px 0 22px}',
+    '.rtree-rh{display:flex;flex-wrap:wrap;align-items:baseline;gap:6px 10px;padding:8px 10px;border:1px solid #2e3d49;',
+    'border-radius:10px;background:#111a21}',
+    '.rtree-rh b{font-size:13px;letter-spacing:.05em}.rtree-rh span{color:#8fa0ad;font-size:12px}',
+    '.rtree-rolls{display:flex;flex-direction:column;gap:3px;margin:6px 0 0;max-width:620px}',
+    '.rtree-rr{margin:5px 0 0;font-size:12px;color:#8fa0ad}.rtree-rr summary{cursor:pointer;padding:3px 2px}',
+    '.rtree-chain{position:relative;padding:6px 0 0 30px}',
+    '.rtree-chain::before{content:"";position:absolute;left:14px;top:0;bottom:12px;border-left:2px solid #3a4a57}',
+    '.rtree-cyc{margin:10px 0 4px -30px;padding:3px 8px;display:inline-block;border:1px solid #3a4a57;border-radius:12px;',
+    'font-size:11px;letter-spacing:.06em;color:#9be15d;background:#0b1117;position:relative}',
+    '.rtree-step{position:relative;margin:8px 0}',
+    '.rtree-step::before{content:"";position:absolute;left:-16px;top:22px;width:14px;border-top:2px solid #3a4a57}',
+    '.rtree-step.rtree-in{margin-left:54px}',
+    '.rtree-step.rtree-in::before{left:-70px;width:68px}',
+    '.rtree-flat .rtree-step.rtree-in{margin-left:0}.rtree-flat .rtree-step.rtree-in::before{left:-16px;width:14px}',
+    '.rtree-step .sp-mv-item{max-width:min(620px,100%);width:min(620px,100%)}',
+    '.rtree-step .sp-mv-bubble{border-radius:14px;cursor:pointer}',
+    '.rtree-step[data-state="aired"] .sp-mv-bubble{border-color:#65c7da}',
+    '.rtree-step[data-state="planned"] .sp-mv-bubble{border-style:dashed;opacity:.62}',
+    '.rtree-step[data-state="rejected"] .sp-mv-bubble{border-color:#3b4249;background:#14181c;color:#7d878f;filter:grayscale(1)}',
+    '.rtree-step[data-state="rejected"] .rtree-words{text-decoration:line-through;text-decoration-color:#59636b}',
+    '.rtree-label{padding:0 6px;border:1px solid #3a4a57;border-radius:9px;font-size:10.5px;color:#cfe3ea}',
+    '.rtree-state{margin-left:auto;font-size:10.5px;letter-spacing:.05em;color:#8fa0ad}',
+    '.rtree-step[data-state="aired"] .rtree-state{color:#65c7da}',
+    '.rtree-die{display:inline-flex;align-items:center;gap:3px;padding:0 5px;border:1px solid #4b5b67;border-radius:5px;',
+    'font:700 11px ui-monospace,Consolas,monospace;color:#fff;text-transform:none}',
+    '.rtree-words{margin:5px 0 6px;font-size:14px;line-height:1.35;white-space:pre-wrap}',
+    '.rtree-words.rtree-none{color:#6f7d88;font-style:italic;font-size:12px}',
+    '.rtree-rec{display:flex;flex-direction:column;gap:3px}',
+    '.rtree-rec .sp-mv-resrow{cursor:inherit;min-height:24px;padding:3px 8px}',
+    '.rtree-rec .rtree-sub{margin-left:22px}',
+    '.rtree-odds{color:#8fa0ad;font:11px ui-monospace,Consolas,monospace}',
+    '.rtree-row{display:flex;align-items:center;gap:6px;color:#8fa0ad;font-size:11px}',
+    '.rtree-tools{display:flex;gap:6px;margin-top:6px}',
+    '.rtree-tools button{display:inline-flex;align-items:center;gap:5px;min-height:30px;padding:0 10px;border:1px solid #3a4a57;',
+    'border-radius:8px;background:#111a21;color:#cfe3ea;font-size:12px;cursor:pointer}',
+    '.rtree-say2{margin-top:4px;font-size:11px;color:#8fa0ad}',
+    '.rtree-replay{margin-top:8px}',
+    '.rtree-gate{position:relative;display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin:6px 0 6px -30px;min-height:34px}',
+    '.rtree-dia{flex:none;position:relative;width:30px;height:30px;border:0;padding:0;background:transparent;cursor:pointer}',
+    '.rtree-dia::before{content:"";position:absolute;inset:4px;transform:rotate(45deg);border:2px solid #9be15d;',
+    'background:#0f1a12;border-radius:3px}',
+    '.rtree-gate[data-kind="exit"] .rtree-dia::before{border-color:#ffb86b;background:#1c140b}',
+    '.rtree-gate[data-kind="chance"] .rtree-dia::before{border-color:#87bfff;background:#0c1520}',
+    '.rtree-dia b{position:relative;font:700 10px ui-monospace,Consolas,monospace;color:#fff}',
+    '.rtree-gate-l{font-size:12px;color:#d6e3e9}.rtree-gate-l i{font-style:normal;color:#8fa0ad}',
+    '.rtree-ghost{padding:3px 9px;border:1px dashed #56636d;border-radius:10px;color:#7f8c96;font-size:12px;opacity:.75}',
+    '.rtree-full{flex-basis:100%;margin:2px 0 4px 36px;padding:8px 10px;border:1px solid #2e3d49;border-radius:10px;',
+    'background:#0e151b;font-size:12px}',
+    '.rtree-full table{border-collapse:collapse;width:100%;max-width:560px}',
+    '.rtree-full td,.rtree-full th{padding:3px 6px;border-bottom:1px solid #1d2830;text-align:left;vertical-align:top}',
+    '.rtree-full tr.rtree-hit td{color:#9be15d;font-weight:700}',
+    '.rtree-full .rtree-why{color:#6f7d88;font-size:11px}',
+    '[data-rtree-open]{cursor:pointer}',
+    '@media (max-width:760px){.rtree-pop{inset:0;border-radius:0}.rtree-step.rtree-in{margin-left:26px}',
+    '.rtree-step.rtree-in::before{left:-42px;width:40px}}'
+  ].join('\n');
+  function rtreeIco(name, label) {
+    try { return typeof root.pineIcon === 'function' ? (root.pineIcon(name, label) || '') : ''; }
+    catch (e) { return ''; }
+  }
+  function rtreeGlyph(name, cls) {
+    var s = make('span', 'rtree-ico' + (cls ? ' ' + cls : ''));
+    s.innerHTML = rtreeIco(name);
+    return s;
+  }
+  function rtreeStyle() {
+    if (document.getElementById('rtreeCss')) return;
+    var st = document.createElement('style');
+    st.id = 'rtreeCss';
+    st.textContent = RTREE_CSS;
+    (document.head || document.documentElement).appendChild(st);
+  }
+  function rtreeFam(fam) {
+    try { return (typeof MV_FAM === 'object' && MV_FAM && MV_FAM[fam]) || '#68ced9'; }
+    catch (e) { return '#68ced9'; }
+  }
+  function rtreePick(p) {
+    if (!p) return '';
+    return String(p.label || '') + (p.of > 1 && p.index ? ' (' + p.index + ' of ' + p.of + ')' : '');
+  }
+  /* One roll, as the roll tile reads it: TABLE  die  category, then the sub
+     result indented under it. Same markup as the Message view's result rows
+     (sp-mv-resrow / sp-mv-resd / sp-mv-resl, --fam), so the roll-replay
+     tile can stand in for it later. */
+  function rtreeReceipt(x) {
+    var box = make('div', 'rtree-recset');
+    var fam = String(x.family || '');
+    var row = make('div', 'sp-mv-resrow');
+    row.style.setProperty('--fam', rtreeFam(fam));
+    var tname = String(x.table || '');
+    row.appendChild(make('b', '', (tname && tname.indexOf(fam) === 0 ? tname
+      : (fam + (tname ? ' ' + tname : ''))).trim() || 'ROLL'));
+    if (x.missing) {
+      row.appendChild(make('span', 'sp-mv-resl', String(x.label || '') + ' - roll ' + x.missing));
+      box.appendChild(row);
+      return box;
+    }
+    var top = x.category || x.sub || null;
+    var sub = x.category ? (x.sub || null) : null;
+    row.appendChild(make('span', 'sp-mv-resd', top && top.dice != null ? String(top.dice) : '-'));
+    row.appendChild(make('span', 'sp-mv-resl', top ? rtreePick(top) : String(x.label || '')));
+    if (top && top.odds) row.appendChild(make('span', 'rtree-odds', top.odds));
+    row.title = fam + (x.table ? ' - table ' + x.table : '') + (x.text ? '\n' + x.text : '')
+      + (x.seed ? '\nseed ' + x.seed : '');
+    box.appendChild(row);
+    if (sub) {
+      var srow = make('div', 'sp-mv-resrow rtree-sub');
+      srow.style.setProperty('--fam', rtreeFam(fam));
+      srow.appendChild(make('span', 'sp-mv-resd', sub.dice != null ? String(sub.dice) : '-'));
+      srow.appendChild(make('span', 'sp-mv-resl', rtreePick(sub)));
+      if (sub.odds) srow.appendChild(make('span', 'rtree-odds', sub.odds));
+      box.appendChild(srow);
+    }
+    return box;
+  }
+  function rtreeLineOpen(s, node) {
+    var la = root.PineLineActions;
+    var lid = s.line && s.line.line_id ? String(s.line.line_id) : '';
+    if (!lid) return false;
+    if (!la || typeof la.open !== 'function') return false;
+    try { la.open({id: lid, said: String(s.text || ''), node: node}); return true; }
+    catch (err) { return false; }
+  }
+  function rtreeStage(s) {
+    var wrap = make('div', 'rtree-step' + (RTREE_ROLE[s.node] ? '' : ' rtree-in'));
+    wrap.dataset.state = String(s.state || '');
+    wrap.dataset.node = String(s.node || '');
+    var item = make('div', 'sp-mv-item sp-mv-digital sp-mv-left');
+    var bubble = make('div', 'sp-mv-bubble');
+    bubble.setAttribute('role', 'button');
+    bubble.setAttribute('tabindex', '0');
+    var head = make('div', 'sp-mv-who');
+    head.appendChild(rtreeGlyph('c:user--speaker'));
+    head.appendChild(make('b', '', String(s.name || s.speaker || '?')));
+    head.appendChild(make('span', 'rtree-label', String(s.label || s.node || '')));
+    var w = s.who_roll;
+    if (w && w.dice != null) {
+      var die = make('span', 'rtree-die');
+      die.appendChild(rtreeGlyph('c:cube'));
+      die.appendChild(document.createTextNode(String(w.dice) + (w.odds ? '  ' + w.odds : '')));
+      die.title = 'The speaker was rolled: d100 ' + w.dice + ' picked ' + (w.label || '?')
+        + (w.of ? ' (' + w.index + ' of ' + w.of + ')' : '') + (w.odds ? ', odds ' + w.odds : '');
+      head.appendChild(die);
+    }
+    head.appendChild(make('span', 'rtree-state', RTREE_STATE[s.state] || String(s.state || '')));
+    bubble.appendChild(head);
+    var said = String(s.text || '');
+    bubble.appendChild(make('div', 'rtree-words' + (said ? '' : ' rtree-none'),
+      said || (s.state === 'planned' ? 'the roll planned this turn; nothing was written for it'
+        : (s.state === 'rejected' ? 'no words: ' + String(s.why || 'rejected') : 'no words recorded'))));
+    var rec = make('div', 'rtree-rec');
+    (s.rolls || []).concat(s.node_rolls || []).forEach(function (x) { rec.appendChild(rtreeReceipt(x)); });
+    if (!(s.rolls || []).length && !(s.node_rolls || []).length) {
+      rec.appendChild(make('div', 'rtree-note', 'rolls: not recorded'));
+    }
+    bubble.appendChild(rec);
+    var lineBits = [];
+    if (s.line) {
+      lineBits.push('script row ' + s.line.block + '.' + s.line.ord);
+      if (s.line.air_at) lineBits.push('aired ' + new Date(Number(s.line.air_at) * 1000).toTimeString().slice(0, 8));
+    } else if (s.script_index !== null && s.script_index !== undefined) {
+      lineBits.push('draft line ' + (Number(s.script_index) + 1));
+    }
+    if (s.why) lineBits.push(String(s.why));
+    bubble.appendChild(make('div', 'rtree-say2', lineBits.join('  ·  ')));
+    var tools = make('div', 'rtree-tools');
+    var replayBox = null;
+    if (s.line && s.line.line_id && root.PineRollTag && typeof root.PineRollTag.mount === 'function') {
+      var replay = make('button', '', '');
+      replay.type = 'button';
+      replay.appendChild(rtreeGlyph('c:repeat'));
+      replay.appendChild(document.createTextNode('Replay the roll'));
+      replay.title = 'Replay the roulette that made this line';
+      replay.addEventListener('click', function (ev) {
+        ev.stopPropagation();
+        if (!replayBox) {
+          replayBox = make('div', 'rtree-replay');
+          bubble.appendChild(replayBox);
+        }
+        replayBox.replaceChildren();
+        try { root.PineRollTag.mount(replayBox, {id: String(s.line.line_id)}, {}); }
+        catch (err) { replayBox.textContent = 'the roll tile would not play: ' + String((err && err.message) || err); }
+      });
+      tools.appendChild(replay);
+    }
+    if (tools.children.length) bubble.appendChild(tools);
+    var open = function (ev) {
+      if (ev && ev.target && ev.target.closest && ev.target.closest('.rtree-tools, .rtree-replay')) return;
+      if (!rtreeLineOpen(s, bubble)) {
+        bubble.title = s.line ? 'This surface has no line sheet loaded'
+          : 'Not on the script yet: this turn has no script row to open';
+      }
+    };
+    bubble.addEventListener('click', open);
+    bubble.addEventListener('keydown', function (ev) {
+      if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); open(ev); }
+    });
+    bubble.title = s.line ? 'Open this line (script row ' + s.line.block + '.' + s.line.ord + ')'
+      : 'Not on the script yet: this turn has no script row to open';
+    item.appendChild(bubble);
+    wrap.appendChild(item);
+    return wrap;
+  }
+  function rtreeFull(d) {
+    var box = make('div', 'rtree-full');
+    box.appendChild(make('div', '', (d.table || d.family || 'GRAPH') + '  ·  ' + (d.stage || '')
+      + (d.fixed ? '  ·  fixed by the operator (no die)' : '')));
+    box.appendChild(make('div', 'rtree-why', 'seed ' + (d.seed || NOT_REC()) + '  ·  draw ' + (d.draw || '-')
+      + (d.n != null ? ' #' + d.n : '') + '  ·  u ' + (d.u != null ? d.u : '-') + '  ·  d' + (d.sides || 100)
+      + ' = ' + (d.dice != null ? d.dice : '-') + (d.total != null ? '  ·  total weight ' + d.total : '')));
+    var table = document.createElement('table');
+    var hd = document.createElement('tr');
+    ['face', 'weight', 'odds', 'why'].forEach(function (h) { hd.appendChild(make('th', '', h)); });
+    table.appendChild(hd);
+    var faces = d.faces || [];
+    faces.forEach(function (f) {
+      var tr = document.createElement('tr');
+      if (f.taken) tr.className = 'rtree-hit';
+      var name = make('td', '', '');
+      if (f.taken) name.appendChild(rtreeGlyph('c:checkmark'));
+      name.appendChild(document.createTextNode(' ' + String(f.label || f.id)));
+      tr.appendChild(name);
+      tr.appendChild(make('td', '', f.weight != null ? String(f.weight) : '-'));
+      tr.appendChild(make('td', '', (f.odds || '-') + (f.p != null ? ' (' + Math.round(f.p * 1000) / 10 + '%)' : '')));
+      tr.appendChild(make('td', 'rtree-why', (f.why || []).join('; ')));
+      table.appendChild(tr);
+    });
+    if (!faces.length) box.appendChild(make('div', 'rtree-note', 'faces: not recorded'));
+    else box.appendChild(table);
+    return box;
+  }
+  function NOT_REC() { return 'not recorded'; }
+  function rtreeDiamond(d) {
+    var gate = make('div', 'rtree-gate');
+    gate.dataset.kind = String(d.kind || d.stage || '');
+    var dia = make('button', 'rtree-dia', '');
+    dia.type = 'button';
+    dia.appendChild(make('b', '', d.dice != null ? String(d.dice) : '?'));
+    dia.title = 'Show the whole roll: seed, every face, its weight and the one that landed';
+    dia.setAttribute('aria-label', dia.title);
+    dia.setAttribute('aria-expanded', 'false');
+    gate.appendChild(dia);
+    var taken = d.taken || {};
+    var lab = make('span', 'rtree-gate-l', '');
+    var head = d.stage === 'chance'
+      ? (d.node_label || d.node) + ': ' + (taken.label || '?')
+      : (taken.label || '?');
+    lab.appendChild(document.createTextNode((d.odds ? '(' + d.odds + ') ' : '') + head));
+    lab.appendChild(make('i', '', '  ·  ' + (d.node_label || d.node || d.table || '') + '  d' + (d.sides || 100)
+      + ' ' + (d.dice != null ? d.dice : '-')));
+    gate.appendChild(lab);
+    (d.branches || []).forEach(function (b) {
+      if (b.taken) return;
+      var g = make('span', 'rtree-ghost', (b.odds ? '(' + b.odds + ') ' : '') + String(b.label || ''));
+      g.title = 'Offered by this roll and not taken';
+      gate.appendChild(g);
+    });
+    var full = null;
+    dia.addEventListener('click', function (ev) {
+      ev.stopPropagation();
+      if (full) { full.remove(); full = null; dia.setAttribute('aria-expanded', 'false'); return; }
+      full = rtreeFull(d);
+      gate.appendChild(full);
+      dia.setAttribute('aria-expanded', 'true');
+    });
+    return gate;
+  }
+  function rtreeRound(r, n) {
+    var box = make('section', 'rtree-round');
+    var rh = make('div', 'rtree-rh');
+    rh.appendChild(make('b', '', 'ROUND ' + n + '  ·  ' + String(r.road || '?').toUpperCase()));
+    var src = String(r.source || '');
+    rh.appendChild(make('span', '', src === 'aired' ? 'went out in this segment'
+      : (src === 'draft' ? 'draft ' + (r.candidate || '') + (r.selected ? ' (the one shown)' : '')
+        : (src === 'allocated' ? 'allocated ' + (r.candidate || '') : src))));
+    rh.appendChild(make('span', '', 'status ' + String(r.status || '-')
+      + (r.verdict ? '  ·  verdict ' + r.verdict : '') + (r.match != null ? '  ·  words matched '
+        + Math.round(Number(r.match) * 100) + '%' : '')));
+    if (r.topic) rh.appendChild(make('span', '', String(r.topic).slice(0, 160)));
+    rh.appendChild(make('span', '', String(r.conversation_id || '') + (r.engine ? '  ·  ' + r.engine : '')
+      + (r.seed ? '  ·  seed ' + r.seed : '')));
+    box.appendChild(rh);
+    /* the round's own rolls (LENGTH, TOPIC, CARRY, TEMPER ...) fold under the
+       header; the prompt blocks and station rolls are counted, not drawn */
+    var all = r.round_rolls || [];
+    var dice = all.filter(function (x) { return x.family !== 'BLOCK'; });
+    var blocks = all.length - dice.length;
+    if (all.length || r.station_rolls) {
+      var det = document.createElement('details');
+      det.className = 'rtree-rr';
+      det.appendChild(make('summary', '', 'The round’s own rolls (' + dice.length + ')'
+        + (blocks ? '  ·  ' + blocks + ' prompt blocks' : '')
+        + (r.station_rolls ? '  ·  ' + r.station_rolls + ' station rolls' : '') + ':  '
+        + dice.slice(0, 9).map(function (x) {
+          var top = x.category || x.sub || {};
+          return x.family + ' ' + (top.dice != null ? top.dice : '-');
+        }).join('  ·  ')));
+      var drawn = false;
+      det.addEventListener('toggle', function () {
+        if (!det.open || drawn) return;
+        drawn = true;
+        var rolls = make('div', 'rtree-rolls rtree-rec');
+        dice.forEach(function (x) { rolls.appendChild(rtreeReceipt(x)); });
+        det.appendChild(rolls);
+      });
+      box.appendChild(det);
+    }
+    (r.notes || []).forEach(function (t) { box.appendChild(make('div', 'rtree-note', String(t))); });
+    if (r.gone) return box;
+    var chain = make('div', 'rtree-chain' + ((r.recorded || {}).graph ? '' : ' rtree-flat'));
+    var cycle = null;
+    (r.elements || []).forEach(function (e) {
+      if (e.cycle !== null && e.cycle !== undefined && e.cycle !== cycle) {
+        if (cycle !== null) chain.appendChild(make('div', 'rtree-cyc', 'TOPIC CHANGE  ·  CYCLE ' + (Number(e.cycle) + 1)));
+        cycle = e.cycle;
+      }
+      chain.appendChild(e.type === 'diamond' ? rtreeDiamond(e) : rtreeStage(e));
+    });
+    if (!(r.elements || []).length) chain.appendChild(make('div', 'rtree-note', 'no turns recorded for this round'));
+    box.appendChild(chain);
+    return box;
+  }
+  function rtreePaint(body, data) {
+    body.replaceChildren();
+    var rounds = data.rounds || [];
+    if (!rounds.length) {
+      body.appendChild(make('div', 'rtree-note', data.registered
+        ? 'System 3 directed nothing in this segment.'
+        : 'Nothing of this segment has reached System 3 yet: no round was planned or written for it.'));
+    }
+    rounds.forEach(function (r, i) { body.appendChild(rtreeRound(r, i + 1)); });
+    (data.unmatched || []).forEach(function (u) {
+      body.appendChild(make('div', 'rtree-note', 'Script ' + (u.candidate || '') + ' (' + (u.source || '')
+        + '): ' + (u.why || 'no roll found') + ' - its rolls are not recorded.'));
+    });
+    if (data.more) body.appendChild(make('div', 'rtree-note', data.more + ' more round(s) are not drawn here.'));
+  }
+  function rtreeClose() {
+    var pop = RTREE.pop;
+    RTREE.pop = null;
+    RTREE.gen += 1;
+    if (RTREE.unwatch) { try { RTREE.unwatch(); } catch (e) { /* gone */ } RTREE.unwatch = null; }
+    if (RTREE.esc) { document.removeEventListener('keydown', RTREE.esc, true); RTREE.esc = null; }
+    if (pop && pop.parentNode) pop.parentNode.removeChild(pop);
+    var back = RTREE.opener;
+    RTREE.opener = null;
+    if (back && back.isConnected && typeof back.focus === 'function') {
+      try { back.focus({preventScroll: true}); } catch (e) { /* fine */ }
+    }
+  }
+  function rtreeOpen(seg, opener) {
+    seg = seg || {};
+    var occ = String(seg.occurrence || '');
+    if (!occ) return;
+    rtreeClose();
+    rtreeStyle();
+    var gen = RTREE.gen;
+    var pop = make('div', 'rtree-pop');
+    pop.setAttribute('role', 'dialog');
+    pop.setAttribute('aria-modal', 'true');
+    pop.setAttribute('aria-label', 'Decision tree for ' + (seg.title || occ));
+    var head = make('div', 'rtree-head');
+    var h2 = make('h2', '', '');
+    h2.appendChild(rtreeGlyph('c:chart--network'));
+    h2.appendChild(document.createTextNode('DECISION TREE  ·  ' + String(seg.title || occ)));
+    head.appendChild(h2);
+    head.appendChild(make('div', 'rtree-say', String(seg.say || '')));
+    var sum = make('div', 'rtree-say', '');
+    head.appendChild(sum);
+    pop.appendChild(head);
+    var body = make('div', 'rtree-body');
+    body.appendChild(make('div', 'rtree-note', 'Asking System 3 for every roll this segment took...'));
+    pop.appendChild(body);
+    /* the way out: the shared X where it is loaded, our own otherwise */
+    var shared = null;
+    if (typeof root.pineCloseX === 'function') {
+      try { shared = root.pineCloseX(pop, rtreeClose, {label: 'Close the decision tree'}); } catch (e) { shared = null; }
+    }
+    if (!shared) {
+      var x = make('button', 'rtree-x', '');
+      x.type = 'button';
+      x.innerHTML = rtreeIco('c:close--filled');
+      x.title = 'Close the decision tree';
+      x.setAttribute('aria-label', x.title);
+      x.addEventListener('click', function (ev) { ev.stopPropagation(); rtreeClose(); });
+      pop.appendChild(x);
+    }
+    document.body.appendChild(pop);
+    RTREE.pop = pop;
+    RTREE.opener = opener || null;
+    if (root.PineDismiss && typeof root.PineDismiss.watch === 'function') {
+      /* a sheet this tree opened (the line's hold sheet, its inspector) sits
+         above it: a tap in there is not a tap away from the tree */
+      var above = {contains: function (t) {
+        var d = t && t.closest ? t.closest('[role="dialog"], [aria-modal="true"], .la-sheet, .lr-sheet') : null;
+        return !!(d && d !== RTREE.pop);
+      }};
+      try { RTREE.unwatch = root.PineDismiss.watch(pop, rtreeClose, opener ? [opener, above] : [above]); }
+      catch (e) { /* esc below */ }
+    }
+    if (!RTREE.unwatch) {
+      RTREE.esc = function (ev) {
+        if (ev.key === 'Escape' && RTREE.pop && !document.querySelector('.la-sheet')) { ev.stopPropagation(); rtreeClose(); }
+      };
+      document.addEventListener('keydown', RTREE.esc, true);
+    }
+    api().get('/api/script/segment/' + encodeURIComponent(occ) + '/decision-tree').then(function (data) {
+      if (gen !== RTREE.gen || !pop.isConnected) return;
+      data = data || {};
+      var rounds = data.rounds || [];
+      var dia = 0, st = 0, aired = 0;
+      rounds.forEach(function (r) {
+        (r.elements || []).forEach(function (e) {
+          if (e.type === 'diamond') dia += 1;
+          else { st += 1; if (e.state === 'aired') aired += 1; }
+        });
+      });
+      sum.textContent = rounds.length + ' round' + (rounds.length === 1 ? '' : 's') + '  ·  ' + st + ' stages ('
+        + aired + ' aired)  ·  ' + dia + ' roulette gates  ·  solid = what happened, dashed = offered and not taken,'
+        + ' grey = rejected';
+      rtreePaint(body, data);
+    }, function (err) {
+      if (gen !== RTREE.gen || !pop.isConnected) return;
+      body.replaceChildren(make('div', 'rtree-note', 'The station could not answer: '
+        + String((err && err.message) || err)));
+    });
+  }
+  root.PineRoundsTree = {open: rtreeOpen, close: rtreeClose};
+
   function paintPlan() {
     var box = el('spPlan');
     if (!box) return;
@@ -17849,6 +18318,28 @@
             'Lines: ' + (have.lines || 0) + '/' + (target.lines || 0),
             'Events: ' + (have.events || 0) + '/' + (target.events || 0)
           ].join('\n');
+          /* [rounds-tree] a tap on the status block opens the segment's decision
+             tree: every roll its rounds took, top to bottom */
+          orchNode.pineRtree = {occurrence: String(e.occurrence || ''),
+            title: (clock ? clock + '  ' : '') + String(e.label || e.kind || 'segment').toUpperCase(),
+            say: orchText};
+          if (!orchNode.pineRtreeWired) {
+            orchNode.pineRtreeWired = true;
+            if (typeof rtreeStyle === 'function') rtreeStyle();
+            orchNode.setAttribute('data-rtree-open', '');
+            orchNode.setAttribute('role', 'button');
+            orchNode.setAttribute('tabindex', '0');
+            orchNode.addEventListener('click', function (ev) {
+              ev.stopPropagation();
+              if (root.PineRoundsTree) root.PineRoundsTree.open(this.pineRtree, this);
+            });
+            orchNode.addEventListener('keydown', function (ev) {
+              if (ev.key !== 'Enter' && ev.key !== ' ') return;
+              ev.preventDefault();
+              if (root.PineRoundsTree) root.PineRoundsTree.open(this.pineRtree, this);
+            });
+          }
+          orchNode.title += '\nTap: the decision tree - every roll this segment\'s rounds took';
           wanted[orchKey] = 1;
           order.push(orchNode);
         }
@@ -20309,6 +20800,7 @@
     box.replaceChildren();
 
     box.appendChild(make('b', 'sp-detail-who', item.name || item.who || item.tag || 'the station'));
+    if (root.PineMsgId) { try { var msgId = String(item.line || String(item.id || '').replace(/^(ln|ac)-/, '') || ''); if (msgId) box.appendChild(root.PineMsgId.chip(msgId, 'head')); } catch (e) { /* [msgid] the view stands without it */ } }
     /* [s3-line-tabs] "when i tap a message, I want this popup to have tabs":
        Line (the words, the note, the buttons) / System 3 / Node / Prompt /
        Tables. The four are served by the System 3 module, so they change

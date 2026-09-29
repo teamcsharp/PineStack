@@ -291,6 +291,7 @@
     var head = make('div', 'la-head');
     var headRow = make('div', 'la-head-row');
     headRow.appendChild(make('b', '', 'What would you like to do with this?'));
+    if (root.PineMsgId && line.id) { try { headRow.appendChild(root.PineMsgId.chip(line.id, 'head')); } catch (e) { /* [msgid] the sheet stands without its code */ } }
     var votes = make('div', 'la-votes');
     /* [#1200] THE TRASH CAN, for a sound effect only - left of the
      * thumbs, where the finger was pointed. See sfxOf() below. */

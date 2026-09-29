@@ -39485,13 +39485,30 @@ def speaking_now() -> dict[str, Any] | None:
     return None
 
 
+def _mint_line_id() -> str:
+    """[msgid] A NEW message's code: 8 hex, re-rolled while it collides with a
+    row still in the ring or in the 48 h air-log index. 6 hex (16.7 M) gave
+    about 14 colliding pairs in every 48 h at ~450 ids an hour, and a
+    collision is not cosmetic: the air-log index, its hourly compaction and
+    the origin ledger (PRIMARY KEY line_id, kept forever) each keep only one
+    of the two. Old 6-hex and 32-hex ids stay exactly as they are."""
+    held = globals().get("_AIRLOG_INDEX") or {}
+    ring = _RADIO.get("chat") or []
+    for _ in range(12):
+        code = uuid.uuid4().hex[:8]
+        if code in held or any(isinstance(m, dict) and m.get("id") == code for m in ring):
+            continue
+        return code
+    return uuid.uuid4().hex[:12]
+
+
 def _ensure_chat_ids() -> None:
     """Every message carries a short stable code the operator can copy to
     point us back at that exact line (#469), or right-click to delete from a
     DJ's data crystal (#484). Assigned lazily and kept on the entry."""
     for _m in _RADIO.get("chat") or []:
         if not _m.get("id"):
-            _m["id"] = uuid.uuid4().hex[:6]
+            _m["id"] = _mint_line_id()  # [msgid] 8 hex, unique in the window
 
 
 # #1209: when THIS process started, in ms. It rides the state both pages
@@ -41822,7 +41839,7 @@ async def _replay_held(clip: dict[str, Any]) -> bool:
     line_id = str(clip.get("id") or "")
     rows = [r for r in (clip.get("rows") or []) if isinstance(r, dict)]
     length = float(clip.get("length") or 0.0)
-    live_id = line_id or uuid.uuid4().hex[:6]
+    live_id = line_id or _mint_line_id()  # [msgid] 8 hex, unique in the window
     if rows:
         # #830: publish the window WITHOUT stamping — a failed replay
         # used to drag every row to "now" on each knock, reshuffling
@@ -52135,7 +52152,7 @@ async def reel_tick() -> None:
             for at, ln in enumerate(lines):
                 real = concat_real_seconds(
                     ln["seconds"], beats[at] if at < len(beats) else 0.0)
-                rows.append({"id": uuid.uuid4().hex[:6],
+                rows.append({"id": _mint_line_id(),  # [msgid] 8 hex, unique in the window
                              "who": ln["who"], "kind": "banter",
                              "text": ln["text"],
                              "remember_text": ln["text"],
@@ -74250,7 +74267,7 @@ def ad_booth_row(text: str, product: str = "", who: str = "dj",
         if aired not in ("airing", "held", "published", "never", "box", "stream"):
             aired = "box"
         row: dict[str, Any] = {
-            "id": uuid.uuid4().hex[:6],
+            "id": _mint_line_id(),  # [msgid] 8 hex, unique in the window
             "ts": int(time.time()),
             "air_at": float(air_at or time.time()),
             "who": str(who or "dj"),
@@ -76828,7 +76845,7 @@ def song_analysis_ready(track: dict[str, Any], analysis: str) -> None:
     _RADIO["song_analysis_id"] = track_id
     _proc = _notes_read().get(track_id) or {}
     _RADIO["chat"].append({
-        "id": uuid.uuid4().hex[:6], "ts": int(time.time()),
+        "id": _mint_line_id(), "ts": int(time.time()),  # [msgid] 8 hex, unique in the window
         "air_at": time.time(), "who": "analysis", "kind": "song_analysis",
         "text": f"Song analysis complete: {track.get('title') or track_id}",
         "analysis": text,
@@ -77557,7 +77574,7 @@ def image_analysis_ready(name: str, analysis: str, model: str = "",
     _RADIO["image_analysis_id"] = key
     now = time.time()
     row = {
-        "id": uuid.uuid4().hex[:6], "ts": int(now),
+        "id": _mint_line_id(), "ts": int(now),  # [msgid] 8 hex, unique in the window
         "air_at": now, "who": "analysis", "kind": "image_analysis",
         "text": f"Image analysis complete: {name}", "analysis": text,
         "image": name, "model": model, "ms": int(ms or 0),
@@ -91753,7 +91770,7 @@ async def dj_sting(to_box: bool, after: str = "", who: str = "",
     }
     _sfx_roll_carry(_sting_row, sample)                    # [s3-cover-b] GAP 3
     await _s3_loose_board_stamp(_sting_row, sample)        # [s3-cover-b] GAP 10
-    _sting_row.setdefault("id", uuid.uuid4().hex[:6])      # [sfxseen] its line id, now
+    _sting_row.setdefault("id", _mint_line_id())      # [sfxseen] its line id, now [msgid] 8 hex
     _RADIO["chat"].append(_sting_row)
     del _RADIO["chat"][:-RADIO_CHAT_KEEP]
     note_activity("sting", sample.stem)
@@ -100160,7 +100177,7 @@ async def _news_once(hourly: bool = False,
                     # The booth is told what went out WHEN it goes out,
                     # never when it was written - the recap reads this.
                     try:
-                        _nm_id = uuid.uuid4().hex[:6]      # #1036 (G1)
+                        _nm_id = _mint_line_id()      # #1036 (G1)  # [msgid] 8 hex, unique in the window
                         _RADIO["chat"].append({
                             "id": _nm_id,
                             "ts": int(time.time()), "who": "host",
@@ -100304,7 +100321,7 @@ async def _news_once(hourly: bool = False,
     # - or the recap on the hour would be reading an hour that had not
     # happened yet.
     if bank_to is None:
-        _nm_id = uuid.uuid4().hex[:6]                      # #1036 (G1)
+        _nm_id = _mint_line_id()                      # #1036 (G1)  # [msgid] 8 hex, unique in the window
         _RADIO["chat"].append({
             "id": _nm_id,
             "ts": int(time.time()), "who": "host", "kind": "news",
@@ -105095,7 +105112,7 @@ async def call_rerun_take(track: dict[str, Any] | None = None) -> list[str]:
         at = 0.0
         for t in transcript:
             span = length * len(str(t.get("text") or "")) / total
-            rows.append({"id": uuid.uuid4().hex[:6],
+            rows.append({"id": _mint_line_id(),  # [msgid] 8 hex, unique in the window
                          "who": str(t.get("who") or "caller"),
                          "kind": "call", "text": str(t.get("text") or ""),
                          "remember_text": str(t.get("text") or ""),
@@ -151756,6 +151773,24 @@ try:
 except Exception as _sfxd_exc:  # noqa: BLE001
     _SFX_DISPLAY_RUNTIME = None
     print("the SFX display receipts did not install: %s: %s" % (type(_sfxd_exc).__name__, _sfxd_exc))
+# [msgid] WHY THIS LINE: GET /api/why/{code} - one message's life story
+# across every store, read-only (line_story.py; tools/why_line.py is the
+# same reader on the command line). ?brief=1 is the find box's resolver.
+try:
+    import line_story as _line_story
+    _line_story.install(app, globals())
+except Exception as _ls_exc:  # noqa: BLE001
+    print("the line story door did not install: %s: %s" % (type(_ls_exc).__name__, _ls_exc))
+# [rounds-tree] THE SEGMENT'S DECISION TREE (script_decision_tree.py): a
+# segment's rounds as System 3's graph walked them - the stages with their
+# roll receipts and the roulette diamonds between them - for the Script
+# view's status block. GET /api/script/segment/{id}/decision-tree, read only.
+try:
+    import script_decision_tree as _rounds_tree
+    _ROUNDS_TREE = _rounds_tree.install(app, globals())
+except Exception as _rtree_exc:  # noqa: BLE001
+    _ROUNDS_TREE = None
+    print("the decision tree did not install: %s: %s" % (type(_rtree_exc).__name__, _rtree_exc))
 
 
 # =====================================================================
