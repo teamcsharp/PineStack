@@ -181,126 +181,9 @@
     return (db >= 0 ? '+' : '') + db.toFixed(1);
   }
 
-  /* ------------------------------------------------------------- the view */
-
-  function make(tag, cls, text) {
-    var node = document.createElement(tag);
-    if (cls) node.className = cls;
-    if (text !== undefined && text !== null) node.textContent = text;
-    return node;
-  }
-
-  /**
-   * Build the audiograph into `host`. Answers a controller:
-   *   push(frame)       - a frame from the levels stream (or the 1 s state)
-   *   resume() / pause()
-   *   note(text, kind)  - the one line over the picture ('' clears it)
-   *   clear()
-   *   stats()           - {frames, drawn, dropped, lastAt}
-   */
-  function mount(host, opts) {
-    opts = opts || {};
-    var dpr = Math.min(1.25, Number(root.devicePixelRatio) || 1);
-    var W = BANDS * COLS_PER_BAND;
-    var H = ROWS;
-
-    host.classList.add('pl-scope');
-    var wrap = make('div', 'pl-scope-wrap');
-    var fall = make('div', 'pl-fall');
-    var canvas = make('canvas', 'pl-fall-canvas');
-    canvas.width = W;
-    canvas.height = H;
-    canvas.setAttribute('aria-label', 'Falling audiograph of the live input: low notes left, high notes right, newest at the top');
-    canvas.setAttribute('role', 'img');
-    fall.appendChild(canvas);
-
-    var axis = make('div', 'pl-fall-axis');
-    axisMarks().forEach(function (m) {
-      var tick = make('span', '', m.label);
-      tick.style.left = (m.x * 100).toFixed(2) + '%';
-      axis.appendChild(tick);
-    });
-    fall.appendChild(axis);
-    var overlay = make('div', 'pl-fall-note');
-    overlay.hidden = true;
-    fall.appendChild(overlay);
-
-    var meterBox = make('div', 'pl-meter');
-    var meter = make('canvas', 'pl-meter-canvas');
-    meterBox.appendChild(meter);
-    var scale = make('div', 'pl-meter-scale');
-    [0, -6, -12, -18, -24, -36, -48].forEach(function (db) {
-      var mark = make('span', '', String(db));
-      mark.style.bottom = (dbToFrac(db) * 100).toFixed(2) + '%';
-      scale.appendChild(mark);
-    });
-    meterBox.appendChild(scale);
-
-    /* [plviz] the visualizer takes the big area; the waterfall steps into the
-     * narrow box beside the meter. A tap cycles the style (kept per screen). */
-    var vizBox = make('div', 'pl-viz');
-    var viz = make('canvas', 'pl-viz-canvas');
-    viz.setAttribute('role', 'img');
-    viz.setAttribute('aria-label', 'Spectrum of the live input - tap to change the style');
-    vizBox.appendChild(viz);
-    var vizName = make('span', 'pl-viz-name', '');
-    vizBox.appendChild(vizName);
-    var vctx = viz.getContext('2d');
-    var vz = {style: 0, level: [], hold: [], holdAt: [], at: 0, named: 0};
-    try { vz.style = (parseInt(root.localStorage.getItem('pineLive.viz') || '0', 10) || 0) % VIZ_STYLES.length; } catch (err) { vz.style = 0; }
-    vizBox.addEventListener('click', function (e) {
-      e.stopPropagation();
-      vz.style = (vz.style + 1) % VIZ_STYLES.length;
-      vz.named = Date.now();
-      try { root.localStorage.setItem('pineLive.viz', String(vz.style)); } catch (err) { /* per screen only */ }
-      if (state.lastFrame) drawViz(state.lastFrame.__bands, Date.now());
-    });
-    wrap.appendChild(vizBox);
-    wrap.appendChild(fall);
-    wrap.appendChild(meterBox);
-    host.appendChild(wrap);
-
-    /* The readout: fixed cells, written at most READOUT_MS apart. */
-    var readout = make('div', 'pl-readout');
-    var cells = {};
-    [['rms', 'RMS'], ['peak', 'PEAK'], ['l', 'L'], ['r', 'R'], ['duck', 'DUCK'], ['clip', '']].forEach(function (c) {
-      var cell = make('span', 'pl-readout-' + c[0]);
-      if (c[1]) cell.appendChild(make('small', '', c[1]));
-      var val = make('b', '', c[0] === 'clip' ? 'CLIP' : '--');
-      cell.appendChild(val);
-      readout.appendChild(cell);
-      cells[c[0]] = val;
-    });
-    host.appendChild(readout);
-
-    var ctx = canvas.getContext('2d', {alpha: false});
-    var mctx = meter.getContext('2d');
-    var row = ctx ? ctx.createImageData(W, 1) : null;
-    if (ctx) { ctx.fillStyle = '#080d11'; ctx.fillRect(0, 0, W, H); }
-
-    var state = {
-      running: false, pending: [], raf: 0, frames: 0, drawn: 0, dropped: 0,
-      lastAt: 0, lastSecond: -1,
-      peak: [METER_MIN_DB, METER_MIN_DB], peakAt: [0, 0], peakShown: [METER_MIN_DB, METER_MIN_DB],
-      clipAt: 0, lastFrame: null, readAt: 0, meterW: 0, meterH: 0, staleTimer: 0
-    };
-
-    function sizeMeter() {
-      var box = meter.getBoundingClientRect();
-      var w = Math.max(24, Math.round(box.width * dpr));
-      var h = Math.max(40, Math.round(box.height * dpr));
-      if (w !== state.meterW || h !== state.meterH) {
-        state.meterW = meter.width = w;
-        state.meterH = meter.height = h;
-        drawMeter(Date.now());
-      }
-    }
-    var ro = null;
-    if (typeof root.ResizeObserver === 'function') {
-      ro = new root.ResizeObserver(function () { if (state.running) sizeMeter(); });
-      ro.observe(meterBox);
-    }
-
+  /* [msgviz] THE VISUALIZER, SHARED: drawVizMore and drawViz's painting half,
+     lifted verbatim out of mount() so any canvas can draw a style. */
+  function vizPainter(vctx, vz, dpr) {
     /* [plviz2] the other eleven styles, all drawn about the middle line: a
      * wide low-alpha pass is the glow, then the core, then every band's
      * peak cap at its held height. Answers false for the first five kinds. */
@@ -428,24 +311,8 @@
       vctx.fillStyle = st.color;
       return true;
     }
-
-    /* [plviz] one frame of the visualizer: bars ease down, each band's peak
-     * cap holds VIZ_HOLD_MS then falls at VIZ_FALL_PER_S. */
-    function drawViz(bands, now) {
-      if (!vctx || !bands || !bands.length) return;
-      var cw = Math.max(1, Math.round(vizBox.clientWidth * dpr));
-      var ch = Math.max(1, Math.round(vizBox.clientHeight * dpr));
-      if (viz.width !== cw || viz.height !== ch) { viz.width = cw; viz.height = ch; }
-      var st = VIZ_STYLES[vz.style] || VIZ_STYLES[0];
-      var n = bands.length, i, c, v, h, x;
-      var dt = vz.at ? Math.min(0.25, (now - vz.at) / 1000) : 0;
-      vz.at = now;
-      for (i = 0; i < n; i += 1) {
-        v = clamp((bands[i] - FLOOR) / (CEIL - FLOOR), 0, 1);
-        vz.level[i] = Math.max(v, (vz.level[i] || 0) - dt * VIZ_BAR_FALL_PER_S);
-        if (v >= (vz.hold[i] || 0)) { vz.hold[i] = v; vz.holdAt[i] = now; }
-        else if (now - (vz.holdAt[i] || 0) > VIZ_HOLD_MS) vz.hold[i] = Math.max(v, vz.hold[i] - dt * VIZ_FALL_PER_S);
-      }
+    function vizBody(st, cw, ch, n, now) {
+      var i, c, v, h, x;
       vctx.globalAlpha = 1;
       vctx.fillStyle = '#05080b';
       vctx.fillRect(0, 0, cw, ch);
@@ -507,6 +374,177 @@
           }
         }
       }
+    }
+    return {more: drawVizMore, body: vizBody};
+  }
+
+  /* [msgviz] One frame of a style onto any 2d context: levels 0..1 (any band
+     count), the bars easing down, every band's cap held VIZ_HOLD_MS then
+     falling - the state object carries both between frames. */
+  function vizDraw(ctx, w, h, levels, state, styleIndex) {
+    if (!ctx || !levels || !levels.length) return null;
+    state = state || {};
+    var vz = state.vz || (state.vz = {style: 0, level: [], hold: [], holdAt: [], at: 0, named: 0});
+    if (!state.painter || state.ctx !== ctx) {
+      state.painter = vizPainter(ctx, vz, Number(state.dpr) || 1);
+      state.ctx = ctx;
+    }
+    var now = Date.now(), n = levels.length;
+    var dt = vz.at ? Math.min(0.25, (now - vz.at) / 1000) : 0;
+    vz.at = now;
+    for (var i = 0; i < n; i += 1) {
+      var v = clamp(Number(levels[i]) || 0, 0, 1);
+      vz.level[i] = Math.max(v, (vz.level[i] || 0) - dt * VIZ_BAR_FALL_PER_S);
+      if (v >= (vz.hold[i] || 0)) { vz.hold[i] = v; vz.holdAt[i] = now; }
+      else if (now - (vz.holdAt[i] || 0) > VIZ_HOLD_MS) vz.hold[i] = Math.max(v, vz.hold[i] - dt * VIZ_FALL_PER_S);
+    }
+    var L = VIZ_STYLES.length;
+    var st = VIZ_STYLES[((Math.floor(Number(styleIndex) || 0) % L) + L) % L];
+    state.painter.body(st, Math.max(1, Math.round(w)), Math.max(1, Math.round(h)), n, now);
+    return st;
+  }
+
+  /* ------------------------------------------------------------- the view */
+
+  function make(tag, cls, text) {
+    var node = document.createElement(tag);
+    if (cls) node.className = cls;
+    if (text !== undefined && text !== null) node.textContent = text;
+    return node;
+  }
+
+  /**
+   * Build the audiograph into `host`. Answers a controller:
+   *   push(frame)       - a frame from the levels stream (or the 1 s state)
+   *   resume() / pause()
+   *   note(text, kind)  - the one line over the picture ('' clears it)
+   *   clear()
+   *   stats()           - {frames, drawn, dropped, lastAt}
+   */
+  function mount(host, opts) {
+    opts = opts || {};
+    var dpr = Math.min(1.25, Number(root.devicePixelRatio) || 1);
+    var W = BANDS * COLS_PER_BAND;
+    var H = ROWS;
+
+    host.classList.add('pl-scope');
+    var wrap = make('div', 'pl-scope-wrap');
+    var fall = make('div', 'pl-fall');
+    var canvas = make('canvas', 'pl-fall-canvas');
+    canvas.width = W;
+    canvas.height = H;
+    canvas.setAttribute('aria-label', 'Falling audiograph of the live input: low notes left, high notes right, newest at the top');
+    canvas.setAttribute('role', 'img');
+    fall.appendChild(canvas);
+
+    var axis = make('div', 'pl-fall-axis');
+    axisMarks().forEach(function (m) {
+      var tick = make('span', '', m.label);
+      tick.style.left = (m.x * 100).toFixed(2) + '%';
+      axis.appendChild(tick);
+    });
+    fall.appendChild(axis);
+    var overlay = make('div', 'pl-fall-note');
+    overlay.hidden = true;
+    fall.appendChild(overlay);
+
+    var meterBox = make('div', 'pl-meter');
+    var meter = make('canvas', 'pl-meter-canvas');
+    meterBox.appendChild(meter);
+    var scale = make('div', 'pl-meter-scale');
+    [0, -6, -12, -18, -24, -36, -48].forEach(function (db) {
+      var mark = make('span', '', String(db));
+      mark.style.bottom = (dbToFrac(db) * 100).toFixed(2) + '%';
+      scale.appendChild(mark);
+    });
+    meterBox.appendChild(scale);
+
+    /* [plviz] the visualizer takes the big area; the waterfall steps into the
+     * narrow box beside the meter. A tap cycles the style (kept per screen). */
+    var vizBox = make('div', 'pl-viz');
+    var viz = make('canvas', 'pl-viz-canvas');
+    viz.setAttribute('role', 'img');
+    viz.setAttribute('aria-label', 'Spectrum of the live input - tap to change the style');
+    vizBox.appendChild(viz);
+    var vizName = make('span', 'pl-viz-name', '');
+    vizBox.appendChild(vizName);
+    var vctx = viz.getContext('2d');
+    var vz = {style: 0, level: [], hold: [], holdAt: [], at: 0, named: 0};
+    var painter = vizPainter(vctx, vz, dpr);   /* [msgviz] */
+    var drawVizMore = painter.more;
+    try { vz.style = (parseInt(root.localStorage.getItem('pineLive.viz') || '0', 10) || 0) % VIZ_STYLES.length; } catch (err) { vz.style = 0; }
+    vizBox.addEventListener('click', function (e) {
+      e.stopPropagation();
+      vz.style = (vz.style + 1) % VIZ_STYLES.length;
+      vz.named = Date.now();
+      try { root.localStorage.setItem('pineLive.viz', String(vz.style)); } catch (err) { /* per screen only */ }
+      if (state.lastFrame) drawViz(state.lastFrame.__bands, Date.now());
+    });
+    wrap.appendChild(vizBox);
+    wrap.appendChild(fall);
+    wrap.appendChild(meterBox);
+    host.appendChild(wrap);
+
+    /* The readout: fixed cells, written at most READOUT_MS apart. */
+    var readout = make('div', 'pl-readout');
+    var cells = {};
+    [['rms', 'RMS'], ['peak', 'PEAK'], ['l', 'L'], ['r', 'R'], ['duck', 'DUCK'], ['clip', '']].forEach(function (c) {
+      var cell = make('span', 'pl-readout-' + c[0]);
+      if (c[1]) cell.appendChild(make('small', '', c[1]));
+      var val = make('b', '', c[0] === 'clip' ? 'CLIP' : '--');
+      cell.appendChild(val);
+      readout.appendChild(cell);
+      cells[c[0]] = val;
+    });
+    host.appendChild(readout);
+
+    var ctx = canvas.getContext('2d', {alpha: false});
+    var mctx = meter.getContext('2d');
+    var row = ctx ? ctx.createImageData(W, 1) : null;
+    if (ctx) { ctx.fillStyle = '#080d11'; ctx.fillRect(0, 0, W, H); }
+
+    var state = {
+      running: false, pending: [], raf: 0, frames: 0, drawn: 0, dropped: 0,
+      lastAt: 0, lastSecond: -1,
+      peak: [METER_MIN_DB, METER_MIN_DB], peakAt: [0, 0], peakShown: [METER_MIN_DB, METER_MIN_DB],
+      clipAt: 0, lastFrame: null, readAt: 0, meterW: 0, meterH: 0, staleTimer: 0
+    };
+
+    function sizeMeter() {
+      var box = meter.getBoundingClientRect();
+      var w = Math.max(24, Math.round(box.width * dpr));
+      var h = Math.max(40, Math.round(box.height * dpr));
+      if (w !== state.meterW || h !== state.meterH) {
+        state.meterW = meter.width = w;
+        state.meterH = meter.height = h;
+        drawMeter(Date.now());
+      }
+    }
+    var ro = null;
+    if (typeof root.ResizeObserver === 'function') {
+      ro = new root.ResizeObserver(function () { if (state.running) sizeMeter(); });
+      ro.observe(meterBox);
+    }
+
+
+    /* [plviz] one frame of the visualizer: bars ease down, each band's peak
+     * cap holds VIZ_HOLD_MS then falls at VIZ_FALL_PER_S. */
+    function drawViz(bands, now) {
+      if (!vctx || !bands || !bands.length) return;
+      var cw = Math.max(1, Math.round(vizBox.clientWidth * dpr));
+      var ch = Math.max(1, Math.round(vizBox.clientHeight * dpr));
+      if (viz.width !== cw || viz.height !== ch) { viz.width = cw; viz.height = ch; }
+      var st = VIZ_STYLES[vz.style] || VIZ_STYLES[0];
+      var n = bands.length, i, c, v, h, x;
+      var dt = vz.at ? Math.min(0.25, (now - vz.at) / 1000) : 0;
+      vz.at = now;
+      for (i = 0; i < n; i += 1) {
+        v = clamp((bands[i] - FLOOR) / (CEIL - FLOOR), 0, 1);
+        vz.level[i] = Math.max(v, (vz.level[i] || 0) - dt * VIZ_BAR_FALL_PER_S);
+        if (v >= (vz.hold[i] || 0)) { vz.hold[i] = v; vz.holdAt[i] = now; }
+        else if (now - (vz.holdAt[i] || 0) > VIZ_HOLD_MS) vz.hold[i] = Math.max(v, vz.hold[i] - dt * VIZ_FALL_PER_S);
+      }
+      painter.body(st, cw, ch, n, now);   /* [msgviz] the shared painter */
       if (vizName.textContent !== st.name) vizName.textContent = st.name;
       vizName.style.opacity = now - vz.named < 1500 ? '1' : '0';
     }
@@ -713,7 +751,9 @@
 
   var api = {mount: mount, decodeBands: decodeBands, bandHz: bandHz, hzToX: hzToX,
     dbToFrac: dbToFrac, byteToIndex: byteToIndex, paintRow: paintRow, axisMarks: axisMarks,
-    fmtDb: fmtDb, ramp: RAMP, BANDS: BANDS, ROWS: ROWS};
+    fmtDb: fmtDb, ramp: RAMP, BANDS: BANDS, ROWS: ROWS,
+    vizDraw: vizDraw,                                   /* [msgviz] */
+    VIZ_STYLES: VIZ_STYLES.map(function (s) { return {name: s.name, kind: s.kind}; })};
   root.PineLiveScope = api;
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
 })(typeof window !== 'undefined' ? window : globalThis);
