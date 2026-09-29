@@ -60483,8 +60483,9 @@ async def _torrent_talk() -> None:
                     # makes "incessant" physically possible.  Ask the rooms
                     # for a replacement and put banked banter on meanwhile.
                     _max_talk = talk_is_incessant(dj)
-                    aired = bool(await dj_caller(
-                        track, shelf_only=_max_talk))
+                    _va_row = voice_actor_pin_take("scheduled")   # [voice-actor] the Scheduled caller seat
+                    aired = (await voice_actor_ring(_va_row, "scheduled") if _va_row
+                             else bool(await dj_caller(track, shelf_only=_max_talk)))
                     if not aired:
                         # #1004: "Make sure that the coordinator is
                         # scheduling phone calls to happen inside a phone
@@ -67358,7 +67359,9 @@ async def schedule_extra_round(kind: str, track: dict[str, Any] | None,
             # shelf.  This route used to ignore it and commission a live
             # generated call, creating the measured minute-plus holes while
             # completed, tinted calls sat unused.  Air the bank first.
-            held = await dj_caller(track, shelf_only=True)
+            _va_row = voice_actor_pin_take("scheduled")   # [voice-actor] the Scheduled caller seat
+            held = (await voice_actor_ring(_va_row, "scheduled") if _va_row
+                    else await dj_caller(track, shelf_only=True))
             if held:
                 station_flow_event(
                     "schedule", "ok", "The caller road used a prepared call",
@@ -105900,6 +105903,10 @@ async def dj_call_generated(caller: dict[str, Any] | None = None,
     if _tkey and _tkey in _recent_t and not _pline:
         topic, seed = await caller_topic()
         _tkey = " ".join((topic or "").split()).lower()
+    _va_topic = voice_actor_topic_take(caller)   # [voice-actor] a dispatched call's own subject
+    if _va_topic:
+        topic, seed = _va_topic, {}
+        _tkey = " ".join(topic.split()).lower()
     if _tkey:
         _recent_t.append(_tkey)
         del _recent_t[:-8]
@@ -107029,13 +107036,25 @@ async def caller_clock() -> None:
                 # earlier answers first; the generated road stays the
                 # fallback it always was.
                 _banked: list[str] = []
+                # [voice-actor] THE RANDOM CALLER SEAT: the caller the operator
+                # pinned answers this ring instead of the shelf - once.
+                _va_rang = False
                 try:
-                    _banked = list(await dj_caller(_RADIO.get("now"),
+                    _va_pin = voice_actor_pin_take("random")
+                    if _va_pin:
+                        _va_rang = await voice_actor_ring(_va_pin, "random")
+                except Exception:  # noqa: BLE001
+                    _va_rang = False
+                try:
+                    _banked = ([] if _va_rang else list(await dj_caller(_RADIO.get("now"),
                                                    shelf_only=True,
-                                                   fresh_only=True) or [])
+                                                   fresh_only=True) or []))
                 except Exception:  # noqa: BLE001
                     _banked = []
-                if _banked:
+                if _va_rang:
+                    pipeline_log("call", "the phone clock rang and the caller the "
+                                 "operator pinned answered (voice actor)")
+                elif _banked:
                     pipeline_log("call", "the phone clock rang and a call "
                                  "recorded earlier answered - no live "
                                  "write, no live render (#1155)")
@@ -112718,6 +112737,7 @@ async def dj_banter(track: dict[str, Any] | None = None,
             + (f", 'D: ...' for {dj['third_name']}" if third else "")
             + (f", and 'C: ...' for {caller_name} on the phone"
                if caller_name else "")
+            + voice_actor_format_clause(_s3, caller_name)   # [voice-actor] C, when a diamond took a call
             + f".{seat_away_clause()}"           # #1034: the empty chair
             f"{playing}{only_song}{aside}"
             f"{show_memory(own_material=own_material, system3=_s3_active())}{call_flow}"
@@ -113760,6 +113780,12 @@ async def dj_banter(track: dict[str, Any] | None = None,
         # from cannot be judged, and cannot be sent back.
         "desk": _desk_paper(script, _desk_at),
     }
+    _va_round = voice_actor_round_interjection(_s3, caller_name)   # [voice-actor] C speaks as the caller
+    if _va_round and not caller_name:
+        entry["caller_name"] = str(_va_round.get("name") or "")[:80]
+        entry["caller_voice"] = str(_va_round.get("voice_id") or "")   # _banter_air redraws a dead one (#913)
+        entry["voice_actor"] = {"dispatch": str(_va_round.get("id") or ""), "road": "now",
+                                "node": str(_va_round.get("node") or "")}
     if globals().get("system2_stamp_entry"):
         system2_stamp_entry(entry)
     if _system2_budget:
@@ -129935,6 +129961,587 @@ async def voicelab_upload(
                                "range": "", "started": time.time(),
                                "engine": engine}                # #1476
     return {"job_id": job_id}
+
+
+# --- [voice-actor-extract] THE SIGNATURE-MAKING PANE: CART JOIN, LINK SPECIFICS, CLIP BOOK BROWSE ---
+# The voice actor subpanel's "New actor" layer (desktop/renderer/
+# voice-actor-extract.js). Everything here rides the Voice Studio's pipeline:
+# the lab's /ingest, _voicelab_start, the harvest on GET /api/voicelab/jobs/{id}
+# (voicelab_job, called as it is) and the #1476 cut per engine. New: a cart of
+# clips joined on the station into ONE lab job, a link's specifics kept and
+# written onto the voice, the clip book browsed off the loop, and listener
+# uploads (samples_grabbed/user) marked user-submitted with a credit. The whole
+# account is in tools/voice_actor_extract_patch.py.
+VOICE_ACTOR_X_PATH = data_path("voice_actor_extract.json")
+VOICE_ACTOR_X_LOCK = RLock()
+VOICE_ACTOR_X_MEMO: dict[str, Any] = {"book": None}
+VOICE_ACTOR_X_TASKS: dict[str, Any] = {}          # vx -> the station-side task while it runs
+VOICE_ACTOR_X_ID = re.compile(r"^vx_[a-f0-9]{10}\Z")
+VOICE_ACTOR_X_SID = re.compile(r"^[a-f0-9]{16}\Z")
+VOICE_ACTOR_X_KEEP = 200
+VOICE_ACTOR_X_CLIPS_MAX = 12                      # the merge road's own ceiling
+VOICE_ACTOR_X_JOIN_MOST_S = 900.0                 # one lab job, CPU whisper: keep it a sample
+VOICE_ACTOR_X_JOIN_LEAST_S = 3.0                  # under this whisper has nothing to hear
+VOICE_ACTOR_X_GAP_S = 0.4                         # silence between joined clips
+VOICE_ACTOR_X_CLIP_BYTES = 300 * 1024 * 1024
+VOICE_ACTOR_X_RATE = 24000                        # what the lab converts to anyway
+VOICE_ACTOR_X_USER = ("samples_grabbed", "user")  # the upload courier's folder on the share
+VOICE_ACTOR_X_STAGES = ("download", "extract_audio", "transcribe", "diarize",
+                        "analyze_pitch", "analyze_cadence", "build_signature",
+                        "extract_reference", "cleanup")   # voice-lab STAGES, mirrored
+_VOICE_ACTOR_X_WHO = re.compile(r"^(\d{4}-\d{2}-\d{2})_(\d{2})-(\d{2})-(\d{2})_([^_]+)_(.+)$")
+
+
+def voice_actor_x_read() -> dict[str, Any]:
+    with VOICE_ACTOR_X_LOCK:
+        if VOICE_ACTOR_X_MEMO["book"] is None:
+            book: dict[str, Any] = {"jobs": {}}
+            try:
+                got = json.loads(VOICE_ACTOR_X_PATH.read_text())
+                if isinstance(got, dict) and isinstance(got.get("jobs"), dict):
+                    book = {"jobs": got["jobs"]}
+            except Exception:  # noqa: BLE001 - a missing or torn ledger starts empty
+                pass
+            VOICE_ACTOR_X_MEMO["book"] = book
+        return VOICE_ACTOR_X_MEMO["book"]
+
+
+def voice_actor_x_save() -> None:
+    with VOICE_ACTOR_X_LOCK:
+        jobs = voice_actor_x_read()["jobs"]
+        if len(jobs) > VOICE_ACTOR_X_KEEP:
+            for old in sorted(jobs, key=lambda k: float(jobs[k].get("created") or 0))[:len(jobs) - VOICE_ACTOR_X_KEEP]:
+                jobs.pop(old, None)
+        try:
+            VOICE_ACTOR_X_PATH.parent.mkdir(parents=True, exist_ok=True)
+            tmp = VOICE_ACTOR_X_PATH.with_suffix(".tmp")
+            tmp.write_text(json.dumps({"jobs": jobs}))
+            tmp.replace(VOICE_ACTOR_X_PATH)
+        except Exception as exc:  # noqa: BLE001
+            pipeline_log("voice", f"[voice-actor-extract] ledger not written: {exc}"[:200])
+
+
+def voice_actor_x_row(vx: str) -> dict[str, Any] | None:
+    with VOICE_ACTOR_X_LOCK:
+        row = voice_actor_x_read()["jobs"].get(vx)
+        return json.loads(json.dumps(row)) if isinstance(row, dict) else None
+
+
+def voice_actor_x_update(vx: str, save: bool = True, **fields: Any) -> None:
+    with VOICE_ACTOR_X_LOCK:
+        row = voice_actor_x_read()["jobs"].get(vx)
+        if not isinstance(row, dict):
+            return
+        row.update(fields)
+        row["updated"] = time.time()
+        if save:
+            voice_actor_x_save()
+
+
+def voice_actor_x_user_root() -> str:
+    return SFX_ROOT.joinpath(*VOICE_ACTOR_X_USER).as_posix()
+
+
+def voice_actor_x_is_user(path: Any) -> bool:
+    """A clip the listener courier delivered (samples_grabbed/user)."""
+    p = "/" + str(path or "").replace("\\", "/").strip("/").lower() + "/"
+    return ("/" + "/".join(VOICE_ACTOR_X_USER) + "/") in p
+
+
+def voice_actor_x_credit(path: Any) -> dict[str, Any]:
+    """Who sent it, as far as the file name the courier gave it says
+    (listener_uploads.upload_name: <date>_<time>_<who>_<name>.<ext>)."""
+    name = Path(str(path or "")).name
+    got = _VOICE_ACTOR_X_WHO.match(name)
+    if not got:
+        return {"file": name, "who": "", "sent": "",
+                "from": "a listener upload (the file name carries no sender)"}
+    return {"file": name, "who": got.group(5)[:40],
+            "sent": "%s %s:%s" % (got.group(1), got.group(2), got.group(3)),
+            "from": "the name the upload courier gave the file"}
+
+
+def voice_actor_x_where(path: Any) -> str:
+    raw = str(path or "")
+    for root, label in ((SFX_ROOT, "samples"), (SFX_LOCAL_ROOT, "station samples")):
+        try:
+            return "%s/%s" % (label, Path(raw).relative_to(root))
+        except Exception:  # noqa: BLE001
+            continue
+    return raw
+
+
+def voice_actor_x_clip(r: Any) -> dict[str, Any] | None:
+    """One clip-book row as the pane draws it; urls signed as the SFX desk
+    signs them (the pane uses them verbatim and never builds t=)."""
+    sid = str(r["sid"] or "")
+    if not VOICE_ACTOR_X_SID.match(sid):
+        return None
+    path = str(r["path"] or "")
+    video = bool(r["video"])
+    t = media_sign(sid)
+    said = ""
+    try:
+        said = str(r["said"] or "")[:160]
+    except Exception:  # noqa: BLE001 - the column arrives with the first listen
+        said = ""
+    return {"id": sid, "name": str(r["name"] or Path(path).stem)[:120], "video": video,
+            "seconds": round(float(r["seconds"] or 0), 2),
+            "folder": path.rsplit("/", 1)[0], "where": voice_actor_x_where(path),
+            "url": f"/sfx/{sid}?t={t}",
+            "poster_url": f"/api/sfx/poster/{sid}?t={t}" if video else "",
+            "spec_url": f"/api/sfx/spec/{sid}?t={t}",
+            "user": voice_actor_x_is_user(path), "said": said}
+
+
+def voice_actor_x_browse(folder: str, q: str, video: str, offset: int, limit: int) -> dict[str, Any]:
+    """A page of the clip book: one folder (a primary-key range, never a walk
+    of the share) or a search. Runs in a thread."""
+    con = sfx_db_reader()
+    cols = "rowid, path, sid, name, video, seconds, said"
+    vid_sql = {"1": " AND video = 1", "0": " AND video = 0"}.get(video, "")
+    vid_flag = {"1": True, "0": False}.get(video)
+    if folder == "user":
+        folder = voice_actor_x_user_root()
+    folder = folder.rstrip("/")
+    rows: list[Any] = []
+    total = -1
+    how = "folder"
+    say = ""
+    if q:
+        if sfx_match_ready():
+            how = "index"
+            cands = sfx_match_score(q, "", video=vid_flag, limit=min(400, offset + limit + 1))
+            ids = [int(c.rowid) for c in list(cands or [])[offset:offset + limit + 1]]
+            if ids:
+                marks = ",".join("?" * len(ids))
+                try:
+                    got = con.execute("SELECT %s FROM clips WHERE rowid IN (%s)" % (cols, marks), ids).fetchall()
+                except Exception:  # noqa: BLE001
+                    got = con.execute("SELECT rowid, path, sid, name, video, seconds FROM clips "
+                                      "WHERE rowid IN (%s)" % marks, ids).fetchall()
+                by = {int(r["rowid"]): r for r in got}
+                rows = [by[i] for i in ids if i in by]
+            say = "the clip index: names, what is said, what is seen"
+        else:
+            how = "names"
+            like = "%" + q.replace("%", "").replace("_", "") + "%"
+            try:
+                rows = con.execute("SELECT %s FROM clips WHERE playable = 1%s AND (name LIKE ? OR said LIKE ?) "
+                                   "ORDER BY name LIMIT ? OFFSET ?" % (cols, vid_sql),
+                                   (like, like, limit + 1, offset)).fetchall()
+            except Exception:  # noqa: BLE001
+                rows = con.execute("SELECT rowid, path, sid, name, video, seconds FROM clips WHERE playable = 1%s "
+                                   "AND name LIKE ? ORDER BY name LIMIT ? OFFSET ?" % vid_sql,
+                                   (like, limit + 1, offset)).fetchall()
+            say = "the clip index is still being built - searched names and what is said only"
+        if folder:
+            rows = [r for r in rows if str(r["path"] or "").startswith(folder + "/")]
+    elif folder:
+        lo, hi = folder + "/", folder + "0"      # '0' sorts right after '/': the folder's own key range
+        where = "path >= ? AND path < ? AND playable = 1 AND instr(substr(path, ?), '/') = 0" + vid_sql
+        args = (lo, hi, len(lo) + 1)
+        try:
+            rows = con.execute("SELECT %s FROM clips WHERE %s ORDER BY name COLLATE NOCASE LIMIT ? OFFSET ?"
+                               % (cols, where), args + (limit + 1, offset)).fetchall()
+        except Exception:  # noqa: BLE001
+            rows = con.execute("SELECT rowid, path, sid, name, video, seconds FROM clips WHERE %s "
+                               "ORDER BY name COLLATE NOCASE LIMIT ? OFFSET ?" % where,
+                               args + (limit + 1, offset)).fetchall()
+        total = int(con.execute("SELECT COUNT(*) FROM clips WHERE %s" % where, args).fetchone()[0])
+    more = len(rows) > limit
+    out = [c for c in (voice_actor_x_clip(r) for r in rows[:limit]) if c]
+    if folder == voice_actor_x_user_root() and not out and not q:
+        say = "nothing from listeners is in the clip book yet (samples_grabbed/user)"
+    return {"ok": True, "folder": folder, "q": q, "how": how, "total": total, "offset": offset,
+            "clips": out, "more": more, "user_root": voice_actor_x_user_root(), "say": say}
+
+
+def voice_actor_x_join(vx: str, clips: list[dict[str, Any]]) -> tuple[bytes, dict[str, Any]]:
+    """Cut each clip to its own in/out, mono 24 kHz, and join them with a short
+    silence: ONE file for ONE lab job. Runs in a thread; parts live in a temp
+    dir that is gone before this returns; the clips themselves are only read."""
+    import subprocess
+    import tempfile
+    import imageio_ffmpeg
+    exe = imageio_ffmpeg.get_ffmpeg_exe()
+    nice = ["nice", "-n", "10"] if shutil.which("nice") else []
+    parts: list[bytes] = []
+    lengths: list[float] = []
+    with tempfile.TemporaryDirectory(prefix="vx_") as tmp:
+        for i, clip in enumerate(clips):
+            voice_actor_x_update(vx, save=False, progress=round(i / max(1, len(clips)), 3),
+                                 note="cutting clip %d of %d (%s)" % (i + 1, len(clips), clip.get("name") or ""))
+            src = Path(str(clip["path"]))
+            if src.stat().st_size > VOICE_ACTOR_X_CLIP_BYTES:
+                raise ValueError("%s is over 300 MB - cut it smaller first" % src.name)
+            out = Path(tmp) / ("p%02d.wav" % i)
+            cmd = nice + [exe, "-nostdin", "-hide_banner", "-loglevel", "error", "-y"]
+            if clip.get("start") is not None:
+                cmd += ["-ss", "%.3f" % float(clip["start"])]
+            if clip.get("end") is not None:
+                cmd += ["-to", "%.3f" % float(clip["end"])]
+            cmd += ["-i", str(src), "-vn", "-ac", "1", "-ar", str(VOICE_ACTOR_X_RATE),
+                    "-c:a", "pcm_s16le", str(out)]
+            run = subprocess.run(cmd, capture_output=True, timeout=300)
+            if run.returncode != 0 or not out.is_file():
+                raise ValueError("%s would not decode: %s" % (
+                    src.name, run.stderr.decode(errors="ignore").strip()[-160:] or "no audio"))
+            with wave.open(str(out), "rb") as w:
+                frames = w.readframes(w.getnframes())
+            if len(frames) < VOICE_ACTOR_X_RATE // 10:      # under 0.05 s: nothing there
+                continue
+            parts.append(frames)
+            lengths.append(len(frames) / 2.0 / VOICE_ACTOR_X_RATE)
+    speech = sum(lengths)
+    if speech < VOICE_ACTOR_X_JOIN_LEAST_S:
+        raise ValueError("the clips hold %.1f s of audio between them - the lab needs more than %.0f s "
+                         "(and 10 s of clean speech for a clone that is not rough)" % (speech, VOICE_ACTOR_X_JOIN_LEAST_S))
+    if speech > VOICE_ACTOR_X_JOIN_MOST_S:
+        raise ValueError("the clips join to %.0f s - one job takes at most %.0f s; trim their in/out points"
+                         % (speech, VOICE_ACTOR_X_JOIN_MOST_S))
+    gap = b"\x00\x00" * int(VOICE_ACTOR_X_RATE * VOICE_ACTOR_X_GAP_S)
+    pcm = gap.join(parts)
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(VOICE_ACTOR_X_RATE)
+        w.writeframes(pcm)
+    joined = {"clips": len(parts), "seconds": round(len(pcm) / 2.0 / VOICE_ACTOR_X_RATE, 1),
+              "speech_seconds": round(speech, 1), "gap_s": VOICE_ACTOR_X_GAP_S,
+              "lengths": [round(x, 1) for x in lengths]}
+    return buf.getvalue(), joined
+
+
+async def voice_actor_x_run(vx: str) -> None:
+    """The station-side part of one submission, then the lab takes over."""
+    row = voice_actor_x_row(vx) or {}
+    engine = capture_engine(row.get("engine"))
+    try:
+        if row.get("kind") == "link":
+            voice_actor_x_update(vx, stage="handoff", progress=0.0,
+                                 note="handing the link to the voice lab")
+            body = {"url": str(row.get("url") or ""), "start": row.get("start"), "end": row.get("end"),
+                    "speaker": str(row.get("speaker") or ""), "mode": "both"}
+            job_id = await _voicelab_start(body, name=str(row.get("name") or ""), engine=engine)
+        else:
+            voice_actor_x_update(vx, stage="join", progress=0.0, note="joining the cart on the station")
+            blob, joined = await asyncio.to_thread(voice_actor_x_join, vx, list(row.get("clips_in") or []))
+            voice_actor_x_update(vx, stage="handoff", progress=0.0, joined=joined,
+                                 note="sending the joined %.1f s to the voice lab" % joined["seconds"])
+            params: dict[str, Any] = {"filename": "cart_%s.wav" % vx, "mode": "both", **capture_params(engine)}
+            if row.get("speaker"):
+                params["speaker"] = str(row["speaker"])
+            try:
+                async with httpx.AsyncClient(timeout=300) as client:
+                    got = await client.post(f"{VOICE_LAB_URL}/ingest", params=params, content=blob,
+                                            headers={"Content-Type": "application/octet-stream"})
+            except Exception as exc:
+                raise HTTPException(status_code=503, detail="voice-lab is down - is the voice-lab container "
+                                                            "running? (docker compose up -d voice-lab)") from exc
+            if got.status_code != 200:
+                detail = ""
+                try:
+                    detail = str((got.json() or {}).get("detail") or "")
+                except Exception:  # noqa: BLE001
+                    detail = got.text[:200]
+                raise HTTPException(status_code=502, detail=f"voice-lab refused: {detail}")
+            job_id = str((got.json() or {}).get("job_id") or "")
+            with _VOICE_JOBS_LOCK:                         # as /api/voicelab/upload registers one
+                _VOICE_JOBS[job_id] = {"name": str(row.get("name") or ""), "caller_id": "",
+                                       "update_voice": "", "range": "", "started": time.time(),
+                                       "engine": engine}
+        if not job_id:
+            raise HTTPException(status_code=502, detail="voice-lab answered without a job id")
+        voice_actor_x_update(vx, state="lab", lab_job=job_id, stage="queued", progress=0.0, note="",
+                             error="", error_kind="")
+    except HTTPException as exc:
+        voice_actor_x_update(vx, state="error", stage="error", error=str(exc.detail)[:300],
+                             error_kind="LAB_REFUSED" if exc.status_code == 502 else "LAB_DOWN")
+    except Exception as exc:  # noqa: BLE001
+        voice_actor_x_update(vx, state="error", stage="error", error=str(exc)[:300], error_kind="JOIN_FAILED")
+    finally:
+        VOICE_ACTOR_X_TASKS.pop(vx, None)
+
+
+def voice_actor_x_launch(vx: str) -> None:
+    VOICE_ACTOR_X_TASKS[vx] = asyncio.create_task(voice_actor_x_run(vx))
+
+
+def voice_actor_x_public(row: dict[str, Any]) -> dict[str, Any]:
+    """What the pane is told about a submission, beside the lab's own fields."""
+    clips = [{k: c.get(k) for k in ("id", "name", "video", "user", "seconds", "start", "end", "where")}
+             for c in (row.get("clips_in") or [])]
+    return {"vx": row.get("id"), "kind": row.get("kind"), "name": row.get("name") or "",
+            "who": row.get("who") or "", "notes": row.get("notes") or "",
+            "engine": row.get("engine") or "", "twin": row.get("twin") or "",
+            "url": row.get("url") or "", "range": row.get("range") or "",
+            "clips": clips, "user_submitted": bool(row.get("user_submitted")),
+            "credits": row.get("credits") or [], "joined": row.get("joined"),
+            "lab_job": row.get("lab_job") or "", "created": row.get("created") or 0}
+
+
+def voice_actor_x_stamp(vx: str, row: dict[str, Any], status: dict[str, Any]) -> bool:
+    """The harvested voice learns where it came from: source (the link and its
+    range, or the clips), user_submitted + credits, and the specifics."""
+    vid = str(status.get("voice_id") or "")
+    meta = voice_meta(vid) if VOICE_ID_SHAPE.match(vid) else None
+    if not meta:
+        return False
+    if row.get("kind") == "link":
+        source = {"type": "url", "url": str(row.get("url") or ""), "range": str(row.get("range") or "")}
+    else:
+        source = {"type": "sfx", "url": "", "range": "",
+                  "clips": [{k: c.get(k) for k in ("id", "name", "where", "start", "end", "user")}
+                            for c in (row.get("clips_in") or [])]}
+    source["user_submitted"] = bool(row.get("user_submitted"))
+    if row.get("credits"):
+        source["credit"] = row["credits"]
+    twin = voice_actor_x_row(str(row.get("twin") or "")) or {}
+    prov = dict(meta.get("provenance") or {})
+    prov["extract"] = {"road": "voice actor extraction pane", "vx": vx, "lab_job": row.get("lab_job") or "",
+                       "who": row.get("who") or "", "notes": row.get("notes") or "",
+                       "engine": row.get("engine") or "", "joined": row.get("joined"),
+                       "twin": row.get("twin") or "", "twin_voice": twin.get("voice_id") or "",
+                       "at": time.time()}
+    meta["source"] = source
+    meta["provenance"] = prov
+    if row.get("name"):
+        meta["name"] = str(row["name"])[:80]
+    voice_save(meta)
+    if twin.get("voice_id"):                              # the other engine's capture learns its twin
+        other = voice_meta(str(twin["voice_id"]))
+        if other:
+            oprov = dict(other.get("provenance") or {})
+            ext = dict(oprov.get("extract") or {})
+            ext["twin_voice"] = vid
+            oprov["extract"] = ext
+            other["provenance"] = oprov
+            voice_save(other)
+    return True
+
+
+def _voice_actor_x_text(value: Any, most: int) -> str:
+    return " ".join(str(value or "").split())[:most]
+
+
+def _voice_actor_x_secs(value: Any) -> float | None:
+    """90, "90.5", "1:30", "1:04:30.2" -> seconds (the lab's parse_ts)."""
+    if value in (None, ""):
+        return None
+    try:
+        parts = [float(p) for p in str(value).strip().split(":")]
+    except ValueError:
+        raise HTTPException(status_code=400, detail="a time reads 90, 1:30 or 1:04:30")
+    while len(parts) < 3:
+        parts.insert(0, 0.0)
+    got = parts[0] * 3600 + parts[1] * 60 + parts[2]
+    if got < 0:
+        raise HTTPException(status_code=400, detail="a time cannot be negative")
+    return round(got, 3)
+
+
+def _voice_actor_x_new(kind: str, body: dict[str, Any]) -> dict[str, Any]:
+    engine = str(body.get("engine") or "").lower()
+    if engine not in ("xtts", "f5"):
+        raise HTTPException(status_code=400, detail="engine is xtts or f5 - the reference is cut for one of them")
+    twin = str(body.get("twin") or "")
+    if twin and not (VOICE_ACTOR_X_ID.match(twin) and voice_actor_x_row(twin)):
+        twin = ""
+    return {"id": "vx_" + uuid.uuid4().hex[:10], "kind": kind, "state": "station", "stage": "queued",
+            "progress": 0.0, "note": "", "created": time.time(), "updated": time.time(),
+            "name": _voice_actor_x_text(body.get("name"), 80), "who": _voice_actor_x_text(body.get("who"), 200),
+            "notes": str(body.get("notes") or "").strip()[:600], "engine": engine, "twin": twin,
+            "speaker": _voice_actor_x_text(body.get("speaker"), 40), "lab_job": "", "voice_id": "",
+            "error": "", "error_kind": ""}
+
+
+def _voice_actor_x_enter(row: dict[str, Any]) -> None:
+    with VOICE_ACTOR_X_LOCK:
+        jobs = voice_actor_x_read()["jobs"]
+        jobs[row["id"]] = row
+        if row.get("twin") and isinstance(jobs.get(row["twin"]), dict):
+            jobs[row["twin"]]["twin"] = row["id"]
+        voice_actor_x_save()
+    voice_actor_x_launch(row["id"])
+
+
+@app.get("/api/voice-actor/extract/health")
+async def voice_actor_x_health_api(authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    """What the pane may say about the road: the reference each engine listens
+    to (ENGINE_REGISTRY ref_s), the lab's clean-speech floor, the cart limits."""
+    require_read_auth(authorization)
+    refs = {k: {"ref_s": (ENGINE_REGISTRY.get(k) or {}).get("ref_s"),
+                "label": (ENGINE_REGISTRY.get(k) or {}).get("label") or k} for k in ("xtts", "f5")}
+    return {"ok": True, "v": 1, "engines": refs, "ref_min_s": 10.0,
+            "clips_max": VOICE_ACTOR_X_CLIPS_MAX, "join_most_s": VOICE_ACTOR_X_JOIN_MOST_S,
+            "join_least_s": VOICE_ACTOR_X_JOIN_LEAST_S, "gap_s": VOICE_ACTOR_X_GAP_S,
+            "user_root": voice_actor_x_user_root(), "stages": list(VOICE_ACTOR_X_STAGES)}
+
+
+@app.get("/api/voice-actor/extract/sfx")
+async def voice_actor_x_sfx_api(
+    folder: str = "", q: str = "", video: str = "", offset: int = 0, limit: int = 40,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """A page of the clip book for the pane's browser - off the loop."""
+    require_read_auth(authorization)
+    folder = str(folder or "").strip()[:400]
+    q = " ".join(str(q or "").split())[:120]
+    if not folder and not q:
+        raise HTTPException(status_code=400, detail="name a folder or type something to search for")
+    try:
+        return await asyncio.to_thread(voice_actor_x_browse, folder, q, str(video or ""),
+                                       max(0, min(100000, int(offset))), max(1, min(80, int(limit))))
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=503, detail=f"the clip book could not be read: {exc}"[:200]) from exc
+
+
+@app.post("/api/voice-actor/extract/link")
+async def voice_actor_x_link_api(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """{url, start?, end?, name, who?, notes?, engine: xtts|f5, speaker?, twin?} - the
+    studio's link road with the pane's in/out and specifics."""
+    require_auth(authorization)
+    body = await request.json()
+    body = body if isinstance(body, dict) else {}
+    url = str(body.get("url") or "").strip()[:2000]
+    if not url:
+        raise HTTPException(status_code=400, detail="Paste the address of a video, a post, or an audio file.")
+    start, end = _voice_actor_x_secs(body.get("start")), _voice_actor_x_secs(body.get("end"))
+    if start is not None and end is not None and end - start < 1.0:
+        raise HTTPException(status_code=400, detail="the out point has to come at least a second after the in point")
+    row = _voice_actor_x_new("link", body)
+    row.update({"url": url, "start": start, "end": end,
+                "range": "-".join("%g" % x for x in (start, end) if x is not None),
+                "user_submitted": False, "credits": []})
+    _voice_actor_x_enter(row)
+    return {"ok": True, **voice_actor_x_public(row)}
+
+
+@app.post("/api/voice-actor/extract/clips")
+async def voice_actor_x_clips_api(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """{clips: [{id, start?, end?}] (1-12), name, who?, notes?, engine, speaker?, twin?} -
+    the bin cart as ONE signature job: joined on the station, one lab job."""
+    require_auth(authorization)
+    body = await request.json()
+    body = body if isinstance(body, dict) else {}
+    asked = body.get("clips") if isinstance(body.get("clips"), list) else []
+    if not 1 <= len(asked) <= VOICE_ACTOR_X_CLIPS_MAX:
+        raise HTTPException(status_code=400, detail="a cart holds 1 to %d clips" % VOICE_ACTOR_X_CLIPS_MAX)
+    clips: list[dict[str, Any]] = []
+    for item in asked:
+        item = item if isinstance(item, dict) else {"id": item}
+        sid = str(item.get("id") or "")
+        if not VOICE_ACTOR_X_SID.match(sid):
+            raise HTTPException(status_code=400, detail="not a clip id: %s" % sid[:40])
+        path = await asyncio.to_thread(sfx_by_id, sid)
+        if path is None:
+            raise HTTPException(status_code=404, detail="clip %s is not in the library any more" % sid)
+        start, end = _voice_actor_x_secs(item.get("start")), _voice_actor_x_secs(item.get("end"))
+        if start is not None and end is not None and end - start < 0.2:
+            raise HTTPException(status_code=400, detail="%s: the out point comes before the in point" % path.stem)
+        clips.append({"id": sid, "path": str(path), "name": path.stem[:120], "video": sfx_is_video(path),
+                      "user": voice_actor_x_is_user(path), "where": voice_actor_x_where(path),
+                      "start": start, "end": end,
+                      "seconds": round(float(item.get("seconds") or 0), 2) or None})
+    row = _voice_actor_x_new("cart", body)
+    if not row["name"]:
+        row["name"] = clips[0]["name"][:80]
+    users = [c for c in clips if c["user"]]
+    row.update({"clips_in": clips, "user_submitted": bool(users),
+                "credits": [voice_actor_x_credit(c["path"]) for c in users]})
+    _voice_actor_x_enter(row)
+    return {"ok": True, **voice_actor_x_public(row)}
+
+
+@app.get("/api/voice-actor/extract/jobs")
+async def voice_actor_x_jobs_api(authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    """The recent submissions, newest first - so a second glass sees them too."""
+    require_read_auth(authorization)
+    with VOICE_ACTOR_X_LOCK:
+        rows = sorted(voice_actor_x_read()["jobs"].values(), key=lambda r: -float(r.get("created") or 0))[:40]
+        rows = json.loads(json.dumps(rows))
+    return {"ok": True, "jobs": [{**voice_actor_x_public(r), "state": r.get("state"), "stage": r.get("stage"),
+                                  "voice_id": r.get("voice_id") or "", "error": r.get("error") or ""}
+                                 for r in rows]}
+
+
+@app.get("/api/voice-actor/extract/jobs/{vx}")
+async def voice_actor_x_job_api(vx: str, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    """One submission. On the station (join / handoff) it answers itself; in the
+    lab it asks voicelab_job() - the harvest happens THERE, as it always has -
+    and stamps the voice once it lands."""
+    require_read_auth(authorization)
+    if not VOICE_ACTOR_X_ID.match(vx or ""):
+        raise HTTPException(status_code=404, detail="No such job")
+    row = voice_actor_x_row(vx)
+    if row is None:
+        raise HTTPException(status_code=404, detail="No such job")
+    base = voice_actor_x_public(row)
+    state = row.get("state")
+    if state == "station":
+        if vx not in VOICE_ACTOR_X_TASKS:
+            voice_actor_x_update(vx, state="error", stage="error", error_kind="STATION_RESTARTED",
+                                 error="The station restarted before the lab had it - retry and it runs again "
+                                       "from the kept link or clips.")
+            row = voice_actor_x_row(vx) or row
+            state = "error"
+        else:
+            return {**base, "stage": row.get("stage") or "queued", "progress": float(row.get("progress") or 0),
+                    "note": row.get("note") or "", "station": True, "harvested": False, "stages_done": []}
+    if state == "error":
+        return {**base, "stage": "error", "progress": 0.0, "harvested": False,
+                "error": row.get("error") or "", "error_kind": row.get("error_kind") or "",
+                "stages_done": row.get("stages_done") or []}
+    if state == "done":
+        return {**base, **(row.get("last") or {}), "stage": "done", "progress": 1.0, "harvested": True,
+                "voice_id": row.get("voice_id") or "", "stamped": True}
+    try:
+        status = await voicelab_job(str(row.get("lab_job") or ""), authorization)
+    except HTTPException as exc:
+        if exc.status_code != 404:
+            raise
+        voice_actor_x_update(vx, state="error", stage="error", error_kind="LAB_GONE",
+                             error="The lab no longer has this job - retry and it runs again from the kept "
+                                   "link or clips.")
+        return await voice_actor_x_job_api(vx, authorization)
+    keep = {k: status.get(k) for k in ("stages_done", "note", "title", "diarize_note", "speakers",
+                                       "speaker_used", "extra_speakers", "signature_note") if status.get(k)}
+    if status.get("stage") == "error":
+        voice_actor_x_update(vx, state="error", stage="error", error=str(status.get("error") or "")[:300],
+                             error_kind=str(status.get("error_kind") or "LAB_ERROR"), stages_done=keep.get("stages_done") or [])
+        return {**status, **base, "stage": "error"}
+    stamped = False
+    if status.get("harvested") and status.get("voice_id"):
+        stamped = voice_actor_x_stamp(vx, row, status)
+        voice_actor_x_update(vx, state="done", stage="done", voice_id=str(status["voice_id"]),
+                             last={**keep, "stages_done": list(VOICE_ACTOR_X_STAGES)})
+    return {**status, **base, "stamped": stamped}
+
+
+@app.post("/api/voice-actor/extract/jobs/{vx}/retry")
+async def voice_actor_x_retry_api(vx: str, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    """Run a failed submission again from what was kept (the link and range, or
+    the clips and their in/out) - a fresh lab job under the same vx."""
+    require_auth(authorization)
+    row = voice_actor_x_row(vx) if VOICE_ACTOR_X_ID.match(vx or "") else None
+    if row is None:
+        raise HTTPException(status_code=404, detail="No such job")
+    if row.get("state") != "error" or vx in VOICE_ACTOR_X_TASKS:
+        raise HTTPException(status_code=409, detail="only a failed job is retried")
+    voice_actor_x_update(vx, state="station", stage="queued", progress=0.0, note="", error="",
+                         error_kind="", lab_job="", joined=None)
+    voice_actor_x_launch(vx)
+    return {"ok": True, **voice_actor_x_public(voice_actor_x_row(vx) or row)}
 
 
 @app.post("/api/voicelab/chapters")
@@ -163624,6 +164231,627 @@ async def dj_callers_names(
     except OSError:
         pass
     return {"names": names or list(CALLER_NAME_SEED)}
+
+
+# --- [voice-actor] THE VOICE ACTOR SUBPANEL: COMBOS, PREFERENCES, SEATS, DISPATCH ---
+# The person on the status bar (desktop/renderer/voice-actor.js) opens the cast:
+# every seat's voice actor, the guest star, the callers, the one engine. What
+# existed is driven as it is (api_put_settings for seat voices - #820's cut
+# included - set_guest, the caller list, the Host menu's engine switch); this
+# is the one new store: named combos, each actor's recorded preferred engine,
+# the Scheduled / Random caller seats, and the dispatch ledger. The whole
+# account is in tools/voice_actor_backend_patch.py.
+VOICE_ACTOR_PATH = data_path("voice_actor.json")
+VOICE_ACTOR_LOCK = RLock()
+VOICE_ACTOR_MEMO: dict[str, Any] = {"state": None, "heard_at": 0.0}
+VOICE_ACTOR_TOPICS: dict[str, str] = {}          # caller id -> a dispatched call's own subject
+VOICE_ACTOR_COMBOS_MAX = 40
+VOICE_ACTOR_DISPATCH_KEEP = 60
+VOICE_ACTOR_ARM_TTL = 1800.0          # an armed interjection waits half an hour for a diamond
+VOICE_ACTOR_HEARD_TTL = 900.0         # planned, and not one line heard in 15 min: lost
+VOICE_ACTOR_QUEUE_TTL = 1800.0        # "queue next" waits this long for the line and the air
+VOICE_ACTOR_ENGINES = ("xtts", "f5")
+VOICE_ACTOR_SEAT_KEYS = {"host": "voice", "cohost": "cohost_voice", "third": "third_voice"}
+_VOICE_ACTOR_NAME = re.compile(r"^[\w .:+-]{1,100}\Z")
+
+
+def voice_actor_blank() -> dict[str, Any]:
+    return {"combos": [], "prefs": {}, "seats": {"scheduled": {}, "random": {}},
+            "dispatch": []}
+
+
+def voice_actor_read() -> dict[str, Any]:
+    """[voice-actor] The store, loaded once and kept in memory (the file is
+    written through). Anything that changes it holds VOICE_ACTOR_LOCK."""
+    with VOICE_ACTOR_LOCK:
+        if VOICE_ACTOR_MEMO["state"] is None:
+            state = voice_actor_blank()
+            try:
+                raw = json.loads(VOICE_ACTOR_PATH.read_text("utf-8"))
+                if isinstance(raw, dict):
+                    for key, blank in voice_actor_blank().items():
+                        if isinstance(raw.get(key), type(blank)):
+                            state[key] = raw[key]
+            except (OSError, ValueError, TypeError):
+                pass
+            for seat in ("scheduled", "random"):
+                if not isinstance(state["seats"].get(seat), dict):
+                    state["seats"][seat] = {}
+            VOICE_ACTOR_MEMO["state"] = state
+        return VOICE_ACTOR_MEMO["state"]
+
+
+def voice_actor_save() -> None:
+    with VOICE_ACTOR_LOCK:
+        state = voice_actor_read()
+        state["dispatch"] = list(state.get("dispatch") or [])[-VOICE_ACTOR_DISPATCH_KEEP:]
+        state["combos"] = list(state.get("combos") or [])[:VOICE_ACTOR_COMBOS_MAX]
+        try:
+            VOICE_ACTOR_PATH.parent.mkdir(parents=True, exist_ok=True)
+            tmp = VOICE_ACTOR_PATH.with_suffix(".tmp")
+            tmp.write_text(json.dumps(state, ensure_ascii=False, indent=1), "utf-8")
+            tmp.replace(VOICE_ACTOR_PATH)
+        except OSError as exc:
+            pipeline_log("drop", "the voice actor store could not be written",
+                         extra=f"{type(exc).__name__}: {exc}"[:200])
+
+
+def voice_actor_voice_ok(vid: Any) -> bool:
+    """A seat may hold a library voice that exists, a stock voice name, or
+    nothing (the station draws)."""
+    vid = str(vid or "")
+    if not vid:
+        return True
+    if VOICE_ID_SHAPE.match(vid):
+        return voice_meta(vid) is not None
+    return bool(_VOICE_ACTOR_NAME.match(vid)) and ".." not in vid
+
+
+def voice_actor_caller(caller_id: Any) -> dict[str, Any] | None:
+    cid = str(caller_id or "")
+    if not cid:
+        return None
+    return next((dict(r) for r in read_callers() if str(r.get("id") or "") == cid), None)
+
+
+def voice_actor_row(did: str) -> dict[str, Any] | None:
+    with VOICE_ACTOR_LOCK:
+        return next((r for r in voice_actor_read()["dispatch"] if r.get("id") == did), None)
+
+
+def voice_actor_update(did: str, **fields: Any) -> None:
+    with VOICE_ACTOR_LOCK:
+        row = voice_actor_row(did)
+        if row is None:
+            return
+        row.update(fields)
+        row["changed_at"] = time.time()
+        voice_actor_save()
+
+
+def voice_actor_new_dispatch(caller: dict[str, Any], road: str, topic: str = "") -> dict[str, Any]:
+    """[voice-actor] One dispatched call on the ledger. The caller's persona and
+    goal are copied in: the round that takes it reads the row, not the list."""
+    try:
+        seg = segment_on_air() or {}
+    except Exception:  # noqa: BLE001
+        seg = {}
+    row = {"id": "d_" + uuid.uuid4().hex[:10], "caller_id": str(caller.get("id") or "")[:40],
+           "caller": " ".join(str(caller.get("name") or "a caller").split())[:80],
+           "persona": " ".join(str(caller.get("persona") or "").split())[:400],
+           "goal": " ".join(str(caller.get("goal") or "").split())[:300],
+           "voice_id": str(caller.get("voice_id") or "")[:40],
+           "road": road, "topic": " ".join(str(topic or "").split())[:300],
+           "state": "queued", "why": "", "at": time.time(),
+           "segment_id": str(seg.get("id") or "")[:80], "segment": str(seg.get("label") or "")[:120],
+           "conversation_id": "", "planned_at": 0.0, "aired_at": 0.0, "last_air_at": 0.0}
+    with VOICE_ACTOR_LOCK:
+        voice_actor_read()["dispatch"].append(row)
+        voice_actor_save()
+    return dict(row)
+
+
+# --- the runtime's hooks ("call in now") -------------------------------------
+def voice_actor_interjection_pending(road: str = "", segment_id: str = "") -> dict[str, Any] | None:
+    """[voice-actor] The armed "call in now" interjection, for the round System 3
+    plans next (system3_runtime _voice_actor_arm) - or None. ONE TREE PER
+    SEGMENT: a call armed in a segment that has since ended is retired as
+    missed, never carried into the next one."""
+    now = time.time()
+    with VOICE_ACTOR_LOCK:
+        row = next((r for r in voice_actor_read()["dispatch"]
+                    if r.get("road") == "now" and r.get("state") == "queued"), None)
+        if row is None:
+            return None
+        if now - float(row.get("at") or 0) > VOICE_ACTOR_ARM_TTL:
+            row.update(state="missed", changed_at=now,
+                       why="no diamond took the call within %d minutes" % int(VOICE_ACTOR_ARM_TTL / 60))
+            voice_actor_save()
+            return None
+        seg = str(row.get("segment_id") or "")
+        if seg and segment_id and seg != str(segment_id):
+            row.update(state="missed", changed_at=now,
+                       why="the segment it was dispatched into ended before a diamond took the call")
+            voice_actor_save()
+            return None
+        return {"id": row["id"], "caller_id": row.get("caller_id", ""), "name": row.get("caller", ""),
+                "persona": row.get("persona", ""), "goal": row.get("goal", ""),
+                "topic": row.get("topic", ""), "voice_id": row.get("voice_id", ""),
+                "segment_id": seg}
+
+
+def voice_actor_interjection_taken(did: str, conversation_id: str, turn_ids: Any = None,
+                                   node: str = "") -> None:
+    """[voice-actor] System 3's graph took the armed call at a diamond: the
+    dispatch is planned into that conversation (its C turns named)."""
+    voice_actor_update(str(did or ""), state="planned", planned_at=time.time(),
+                       conversation_id=str(conversation_id or "")[:40],
+                       turns=[str(t)[:40] for t in (turn_ids or [])][:12], node=str(node or "")[:60],
+                       why="taken at the diamond %s of conversation %s" % (node or "?", conversation_id))
+    pipeline_log("call", "voice actor: a dispatched caller was taken at a diamond (call in now)",
+                 extra="%s -> %s" % (did, conversation_id))
+
+
+def voice_actor_round_interjection(handle: Any, caller_name: str = "") -> dict[str, Any] | None:
+    """[voice-actor] dj_banter's question: did THIS round's plan take the
+    dispatched caller? Their name and held voice, or None."""
+    if caller_name or handle is None or not getattr(handle, "active", False):
+        return None
+    got = getattr(handle, "interjection", None)
+    if not isinstance(got, dict) or not str(got.get("name") or "").strip():
+        return None
+    return dict(got)
+
+
+def voice_actor_format_clause(handle: Any, caller_name: str = "") -> str:
+    """[voice-actor] The writer's FORMAT line names C when this round's plan
+    took the dispatched caller at a diamond; "" otherwise (every other round
+    reads exactly as before)."""
+    got = voice_actor_round_interjection(handle, caller_name)
+    if not got:
+        return ""
+    return (", and 'C: ...' for %s, a caller who rings in where the running order puts them"
+            % " ".join(str(got.get("name") or "the caller").split())[:80])
+
+
+def voice_actor_topic_take(caller: dict[str, Any] | None) -> str:
+    """[voice-actor] A dispatched call's own subject, once (dj_call_generated)."""
+    cid = str((caller or {}).get("id") or "")
+    return VOICE_ACTOR_TOPICS.pop(cid, "") if cid else ""
+
+
+# --- the seats and the rings --------------------------------------------------
+def voice_actor_pin_take(seat: str) -> dict[str, Any] | None:
+    """[voice-actor] The caller armed in the Scheduled / Random seat, taken ONCE
+    - or None. A busy line or a paused station leaves it armed for the next
+    ring; a caller since deleted from the list clears the seat."""
+    with VOICE_ACTOR_LOCK:
+        pin = dict((voice_actor_read()["seats"].get(seat) or {}))
+    if not pin.get("caller_id"):
+        return None
+    try:
+        if radio_paused() or call_line_busy():
+            return None
+    except Exception:  # noqa: BLE001
+        return None
+    caller = voice_actor_caller(pin.get("caller_id"))
+    with VOICE_ACTOR_LOCK:
+        voice_actor_read()["seats"][seat] = {}
+        voice_actor_save()
+    if caller is None:
+        pipeline_log("call", "voice actor: the %s caller seat named a caller no longer on the list" % seat)
+        return None
+    return caller
+
+
+async def voice_actor_ring(caller: dict[str, Any] | None, road: str, did: str = "") -> bool:
+    """[voice-actor] Put ONE listed caller on the line - dj_call_generated with
+    force (the operator asked for this caller, so the 25-minute rest is theirs
+    to waive) - and keep the ledger honest. True when the call went to air."""
+    if not caller:
+        return False
+    if not did:
+        did = voice_actor_new_dispatch(caller, road)["id"]
+    voice_actor_update(did, state="writing", why="the call is being written and recorded")
+    try:
+        got = await dj_call_generated(caller, force=True)
+    except Exception as exc:  # noqa: BLE001
+        voice_actor_update(did, state="failed", why=f"{type(exc).__name__}: {exc}"[:200])
+        pipeline_log("drop", "voice actor: a dispatched call failed",
+                     extra=f"{type(exc).__name__}: {exc}"[:300])
+        return False
+    got = got if isinstance(got, dict) else {}
+    if got.get("lines"):
+        now = time.time()
+        voice_actor_update(did, state="aired", aired_at=now, last_air_at=now, planned_at=now,
+                           why="the call went to the air")
+        pipeline_log("call", "voice actor: %s rang (%s)" % (caller.get("name") or "a caller", road))
+        return True
+    if str(got.get("state") or "") in ("deferred", "banking"):
+        voice_actor_update(did, state="queued", why=str(got.get("why") or got.get("state"))[:200])
+        return False
+    voice_actor_update(did, state="failed",
+                       why=str(got.get("why") or "the call road came back with no lines")[:200])
+    return False
+
+
+async def voice_actor_queue_runner(did: str) -> None:
+    """[voice-actor] "Queue next": the call chapter is planned as soon as the
+    line is free and the station is on air - never over another caller, never
+    into a pause - for up to half an hour."""
+    deadline = time.time() + VOICE_ACTOR_QUEUE_TTL
+    while time.time() < deadline:
+        row = voice_actor_row(did)
+        if not row or row.get("state") not in ("queued", "held"):
+            return
+        try:
+            if radio_paused():
+                voice_actor_update(did, state="held", why="the station is paused - the call waits for the air")
+                await asyncio.sleep(20)
+                continue
+            busy = call_line_busy()
+        except Exception:  # noqa: BLE001
+            busy = ""
+        if busy:
+            voice_actor_update(did, state="queued", why=f"{busy} is on the line - this call is next")
+            await asyncio.sleep(15)
+            continue
+        caller = voice_actor_caller(row.get("caller_id"))
+        if caller is None:
+            voice_actor_update(did, state="failed", why="the caller is no longer on the list")
+            return
+        if row.get("topic"):
+            VOICE_ACTOR_TOPICS[str(caller.get("id") or "")] = str(row["topic"])
+        if await voice_actor_ring(caller, "next", did):
+            return
+        VOICE_ACTOR_TOPICS.pop(str(caller.get("id") or ""), None)
+        if (voice_actor_row(did) or {}).get("state") != "queued":
+            return
+        await asyncio.sleep(15)
+    if (voice_actor_row(did) or {}).get("state") in ("queued", "held"):
+        voice_actor_update(did, state="missed", why="waited %d minutes for the line and the air"
+                           % int(VOICE_ACTOR_QUEUE_TTL / 60))
+
+
+def voice_actor_heard() -> None:
+    """[voice-actor] What the air says about the open dispatches: a caller row
+    under that name heard since the call was planned is 'aired' (the latest
+    one dates it); planned and never heard within 15 minutes is 'lost'. Reads
+    the air log's in-memory index, at most every 5 s."""
+    now = time.time()
+    if now - float(VOICE_ACTOR_MEMO.get("heard_at") or 0) < 5.0:
+        return
+    VOICE_ACTOR_MEMO["heard_at"] = now
+    with VOICE_ACTOR_LOCK:
+        want = [r for r in voice_actor_read()["dispatch"]
+                if r.get("state") in ("planned", "aired") and now - float(r.get("at") or 0) < 7200]
+    if not want:
+        return
+    index = globals().get("_AIRLOG_INDEX")
+    lock = globals().get("_AIRLOG_LOCK")
+    if not isinstance(index, dict):
+        return
+    try:
+        if lock is not None:
+            with lock:
+                aired = list(index.values())
+        else:
+            aired = list(index.values())
+    except Exception:  # noqa: BLE001
+        return
+    aired_kinds = set(globals().get("AIRLOG_AIRED") or ("box", "stream", "both"))
+    changed = False
+    with VOICE_ACTOR_LOCK:
+        for row in want:
+            since = float(row.get("planned_at") or row.get("at") or 0) - 5.0
+            name = " ".join(str(row.get("caller") or "").split()).lower()
+            heard = [float(a.get("air_at") or 0) for a in aired
+                     if isinstance(a, dict) and str(a.get("who") or "") in ("caller", "caller2")
+                     and " ".join(str(a.get("name") or "").split()).lower() == name
+                     and str(a.get("aired") or "") in aired_kinds
+                     and float(a.get("air_at") or 0) >= since]
+            if heard:
+                last = max(heard)
+                if row.get("state") != "aired" or float(row.get("last_air_at") or 0) < last:
+                    row["state"] = "aired"
+                    row["aired_at"] = float(row.get("aired_at") or 0) or min(heard)
+                    row["last_air_at"] = last
+                    row["why"] = "heard on the air"
+                    changed = True
+            elif row.get("state") == "planned" and now - since > VOICE_ACTOR_HEARD_TTL:
+                row["state"] = "lost"
+                row["why"] = ("planned into conversation %s, but no line of theirs was heard within %d minutes"
+                              % (row.get("conversation_id") or "?", int(VOICE_ACTOR_HEARD_TTL / 60)))
+                changed = True
+        if changed:
+            voice_actor_save()
+
+
+def voice_actor_state_view() -> dict[str, Any]:
+    """[voice-actor] GET /api/voice-actor/state: the store as the panel reads it."""
+    try:
+        voice_actor_heard()
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        voice_actor_interjection_pending("", "")     # retires an armed call past its half hour
+    except Exception:  # noqa: BLE001
+        pass
+    with VOICE_ACTOR_LOCK:
+        state = copy.deepcopy(voice_actor_read())
+    armed = next((r for r in state["dispatch"] if r.get("road") == "now" and r.get("state") == "queued"), None)
+    return {"combos": state["combos"], "prefs": state["prefs"],
+            "scheduled": state["seats"].get("scheduled") or {},
+            "random_pin": state["seats"].get("random") or {},
+            "dispatch": state["dispatch"], "interjection": armed,
+            "engines": list(VOICE_ACTOR_ENGINES), "now": time.time()}
+
+
+class _VoiceActorBody:
+    """api_put_settings reads its body with `await request.json()`; the seat
+    road hands it the stored settings with the one change made."""
+
+    def __init__(self, payload: dict[str, Any]) -> None:
+        self._payload = payload
+
+    async def json(self) -> dict[str, Any]:
+        return self._payload
+
+
+async def voice_actor_put_seats(changes: dict[str, str], authorization: str | None) -> dict[str, Any]:
+    """[voice-actor] Seat voices through the voice desk's own road: the STORED
+    settings (never a browser's copy, so no level is put back) with these dj
+    keys changed, through api_put_settings - #820's cut included."""
+    payload = copy.deepcopy(load_settings())
+    payload.setdefault("dj", {}).update({k: str(v or "")[:100] for k, v in changes.items()})
+    return await api_put_settings(_VoiceActorBody(payload), authorization=authorization)
+
+
+def _voice_actor_body_dict(payload: Any) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="expected a JSON object")
+    return payload
+
+
+@app.get("/api/voice-actor/state")
+async def voice_actor_state_api(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_read_auth(authorization)
+    return await asyncio.to_thread(voice_actor_state_view)
+
+
+@app.post("/api/voice-actor/seat")
+async def voice_actor_seat_api(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """{seat: host|cohost|third, voice_id} - one seat's voice actor."""
+    require_auth(authorization)
+    body = _voice_actor_body_dict(await request.json())
+    key = VOICE_ACTOR_SEAT_KEYS.get(str(body.get("seat") or ""))
+    vid = str(body.get("voice_id") or "")
+    if not key:
+        raise HTTPException(status_code=400, detail="seat is host, cohost or third")
+    if not voice_actor_voice_ok(vid):
+        raise HTTPException(status_code=400, detail="no such voice in the library")
+    await voice_actor_put_seats({key: vid}, authorization)
+    return {"ok": True, "seat": body.get("seat"), "voice_id": vid,
+            "say": "Saved - the cast change cuts to the new voice at the next turn boundary (#820)."}
+
+
+@app.post("/api/voice-actor/combos")
+async def voice_actor_combo_save_api(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """{name, seats: {host, cohost, guest_id | third_voice}} - a named pairing."""
+    require_auth(authorization)
+    body = _voice_actor_body_dict(await request.json())
+    name = " ".join(str(body.get("name") or "").split())[:60]
+    raw = body.get("seats") if isinstance(body.get("seats"), dict) else {}
+    seats = {k: str(raw.get(k) or "")[:100] for k in ("host", "cohost", "third_voice", "guest_id")
+             if str(raw.get(k) or "")}
+    if not name:
+        raise HTTPException(status_code=400, detail="a combo needs a name")
+    if not (seats.get("host") or seats.get("cohost")):
+        raise HTTPException(status_code=400, detail="a combo seats at least the host or the co-host")
+    for k in ("host", "cohost", "third_voice"):
+        if not voice_actor_voice_ok(seats.get(k)):
+            raise HTTPException(status_code=400, detail="no such voice in the library: " + seats[k])
+    if seats.get("guest_id") and not any(g.get("id") == seats["guest_id"] for g in read_guests()):
+        raise HTTPException(status_code=400, detail="no such guest")
+    if seats.get("guest_id"):
+        seats.pop("third_voice", None)          # a guest brings their own voice
+    with VOICE_ACTOR_LOCK:
+        combos = voice_actor_read()["combos"]
+        row = next((c for c in combos if c.get("id") == str(body.get("id") or "")), None)
+        if row is None:
+            if len(combos) >= VOICE_ACTOR_COMBOS_MAX:
+                raise HTTPException(status_code=400,
+                                    detail="%d combos is the most kept" % VOICE_ACTOR_COMBOS_MAX)
+            row = {"id": "c_" + uuid.uuid4().hex[:8], "created": time.time()}
+            combos.append(row)
+        row.update(name=name, seats=seats, at=time.time())
+        voice_actor_save()
+        out = dict(row)
+    return {"ok": True, "combo": out, "say": "Saved \"%s\"." % name}
+
+
+@app.delete("/api/voice-actor/combos/{combo_id}")
+async def voice_actor_combo_delete_api(
+    combo_id: str,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_auth(authorization)
+    with VOICE_ACTOR_LOCK:
+        state = voice_actor_read()
+        before = len(state["combos"])
+        state["combos"] = [c for c in state["combos"] if c.get("id") != combo_id]
+        if len(state["combos"]) == before:
+            raise HTTPException(status_code=404, detail="no such combo")
+        voice_actor_save()
+    return {"ok": True}
+
+
+@app.post("/api/voice-actor/combos/{combo_id}/apply")
+async def voice_actor_combo_apply_api(
+    combo_id: str,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Seat a saved pairing in one tap: the voices through api_put_settings
+    (#820's cut), then the guest star through set_guest (the activate road)."""
+    require_auth(authorization)
+    with VOICE_ACTOR_LOCK:
+        combo = copy.deepcopy(next((c for c in voice_actor_read()["combos"]
+                                    if c.get("id") == combo_id), None))
+    if combo is None:
+        raise HTTPException(status_code=404, detail="no such combo")
+    seats = combo.get("seats") or {}
+    guest = None
+    if seats.get("guest_id"):
+        guest = next((g for g in read_guests() if g.get("id") == seats["guest_id"]), None)
+        if guest is None:
+            raise HTTPException(status_code=409, detail="the combo's guest star is no longer on the guest list")
+    changes = {}
+    if seats.get("host"):
+        changes["voice"] = seats["host"]
+    if seats.get("cohost"):
+        changes["cohost_voice"] = seats["cohost"]
+    if seats.get("third_voice") and not guest:
+        changes["third_voice"] = seats["third_voice"]
+    for vid in changes.values():
+        if not voice_actor_voice_ok(vid):
+            raise HTTPException(status_code=409, detail="the combo's voice is no longer in the library: " + vid)
+    if changes:
+        await voice_actor_put_seats(changes, authorization)
+    if guest is not None:
+        set_guest(guest)
+    return {"ok": True, "combo": combo.get("name") or combo_id,
+            "say": "\"%s\" is seated - the cast change cuts in at the next turn boundary (#820)."
+                   % (combo.get("name") or "combo")}
+
+
+@app.post("/api/voice-actor/prefs")
+async def voice_actor_prefs_api(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """{voice_id, preferred: xtts|f5|""} - the actor's RECORDED preferred engine.
+    The air always speaks through the one active engine (#1476); this never
+    touches a seat, a pin or a level."""
+    require_auth(authorization)
+    body = _voice_actor_body_dict(await request.json())
+    vid = str(body.get("voice_id") or "")
+    pref = str(body.get("preferred") or "").lower()
+    if not VOICE_ID_SHAPE.match(vid) or voice_meta(vid) is None:
+        raise HTTPException(status_code=400, detail="no such voice in the library")
+    if pref and pref not in VOICE_ACTOR_ENGINES:
+        raise HTTPException(status_code=400, detail="preferred is xtts or f5")
+    with VOICE_ACTOR_LOCK:
+        prefs = voice_actor_read()["prefs"]
+        if pref:
+            prefs[vid] = {"preferred": pref, "at": time.time()}
+        else:
+            prefs.pop(vid, None)
+        voice_actor_save()
+    return {"ok": True, "voice_id": vid, "preferred": pref}
+
+
+async def _voice_actor_seat_pin(seat: str, request: Request, authorization: str | None) -> dict[str, Any]:
+    require_auth(authorization)
+    body = _voice_actor_body_dict(await request.json())
+    cid = str(body.get("caller_id") or "")
+    caller = voice_actor_caller(cid) if cid else None
+    if cid and caller is None:
+        raise HTTPException(status_code=404, detail="no such caller")
+    with VOICE_ACTOR_LOCK:
+        voice_actor_read()["seats"][seat] = ({"caller_id": cid, "caller": str(caller.get("name") or ""),
+                                              "at": time.time()} if caller else {})
+        voice_actor_save()
+    word = "the next scheduled call" if seat == "scheduled" else "the phone clock's next ring"
+    return {"ok": True, "seat": seat, "caller_id": cid,
+            "say": ("%s takes %s, once." % (caller.get("name"), word)) if caller
+                   else "The %s caller seat is back to the station's own draw." % seat}
+
+
+@app.post("/api/voice-actor/scheduled")
+async def voice_actor_scheduled_api(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """{caller_id} - who takes the next scheduled call entry ("" clears)."""
+    return await _voice_actor_seat_pin("scheduled", request, authorization)
+
+
+@app.post("/api/voice-actor/random-pin")
+async def voice_actor_random_api(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """{caller_id} - who answers the phone clock's next ring ("" clears)."""
+    return await _voice_actor_seat_pin("random", request, authorization)
+
+
+@app.post("/api/voice-actor/dispatch")
+async def voice_actor_dispatch_api(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """{caller_id, road: now|next, topic} - put a listed caller through.
+
+    now:  armed for the NEXT diamond of the round System 3 plans in the
+          current segment - a call node in that segment's tree.
+    next: a full call chapter, planned as soon as the line is free."""
+    require_auth(authorization)
+    body = _voice_actor_body_dict(await request.json())
+    road = str(body.get("road") or "")
+    if road not in ("now", "next"):
+        raise HTTPException(status_code=400, detail="road is now or next")
+    caller = voice_actor_caller(body.get("caller_id"))
+    if caller is None:
+        raise HTTPException(status_code=404, detail="no such caller")
+    topic = " ".join(str(body.get("topic") or "").split())[:300]
+    if road == "now":
+        if not _s3_active():
+            return {"ok": False, "say": "System 3 is not directing rounds right now, so no diamond can "
+                                        "take a call - use Queue next."}
+        with VOICE_ACTOR_LOCK:
+            armed = next((dict(r) for r in voice_actor_read()["dispatch"]
+                          if r.get("road") == "now" and r.get("state") == "queued"), None)
+        if armed:
+            return {"ok": False, "row": armed,
+                    "say": "%s is already waiting for the next diamond - cancel that first."
+                           % (armed.get("caller") or "A caller")}
+    row = voice_actor_new_dispatch(caller, road, topic)
+    pipeline_log("call", "voice actor: %s dispatched (%s)" % (
+        row["caller"], "call in now - the next diamond" if road == "now"
+        else "queue next - a full call chapter"))
+    if road == "next":
+        fire_and_forget(voice_actor_queue_runner(row["id"]))
+        return {"ok": True, "row": row,
+                "say": "%s is queued - a full call chapter plans as soon as the line is free." % row["caller"]}
+    return {"ok": True, "row": row,
+            "say": "%s is armed - the next diamond System 3 reaches in this segment takes the call."
+                   % row["caller"]}
+
+
+@app.post("/api/voice-actor/dispatch/{dispatch_id}/cancel")
+async def voice_actor_dispatch_cancel_api(
+    dispatch_id: str,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_auth(authorization)
+    with VOICE_ACTOR_LOCK:
+        row = voice_actor_row(dispatch_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="no such dispatch")
+        if row.get("state") not in ("queued", "held"):
+            return {"ok": False, "row": dict(row),
+                    "say": "Too late to cancel - the call is already %s." % row.get("state")}
+        row.update(state="cancelled", why="cancelled from the voice actor panel", changed_at=time.time())
+        voice_actor_save()
+        return {"ok": True, "row": dict(row)}
 
 
 @app.post("/api/dj/callers/ring")

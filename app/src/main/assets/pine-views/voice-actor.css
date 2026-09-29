@@ -1,0 +1,281 @@
+/* VOICE ACTOR - the person badge on the status bar, and the cast subpanel.
+ *
+ * Colours are the panel's own (pinelive.css, changelog.css): night #10191f,
+ * rules #35414c, text #dbe7eb, muted #8fa0ad, cyan #65c7da, gold #e3be63,
+ * green #54d18b, red #ef6f5e. Every class starts va- (or is the status
+ * bar's own pine-console-*), so nothing here reaches another view.
+ *
+ * Two glasses, one file: the desk chrome and the tablet's 1154x690 panel.
+ * Touch targets keep 40px on every control that matters.
+ */
+
+/* ------------------------------------------------------------ the badge */
+.pine-console-actor {
+  position: relative;
+  flex: 0 0 auto; min-width: 26px; height: 20px; padding: 0 5px;
+  display: inline-flex; align-items: center; justify-content: center; gap: 4px;
+  border: 0; border-right: 1px solid #35414c; border-radius: 0;
+  background: transparent; color: #8fd6df; cursor: pointer;
+  font: 700 9px/1 Inter, Segoe UI, system-ui, sans-serif; letter-spacing: .06em;
+  -webkit-tap-highlight-color: transparent;
+}
+.pine-console-actor .va-badge-ico { display: inline-grid; place-items: center; width: 15px; height: 15px; }
+.pine-console-actor .va-badge-ico > .pi-icon { width: 15px; height: 15px; }
+.pine-console-actor .va-badge-word:empty { display: none; }
+.pine-console-actor:hover, .pine-console-actor:focus-visible, .pine-console-actor.open {
+  color: #edf3f5; background: #24323c; outline: 1px solid #65c7da; outline-offset: -1px;
+}
+
+/* ------------------------------------------------------------- the popup */
+.va-pop {
+  position: fixed; z-index: 2147483066;
+  left: max(12px, calc(50vw - 470px)); right: max(40px, calc(50vw - 470px));
+  top: max(10px, calc(50vh - 370px)); bottom: max(34px, calc(50vh - 370px));
+  display: flex; flex-direction: column; overflow: hidden;
+  border: 1px solid #3a5360; border-radius: 8px; background: #10191f; color: #dbe7eb;
+  box-shadow: 0 22px 70px rgba(0, 0, 0, .7);
+  font: 13px/1.42 Inter, Segoe UI, system-ui, sans-serif;
+}
+.va-pop[hidden] { display: none; }
+.va-pop button { font: inherit; }
+.va-ico { display: inline-grid; place-items: center; flex: none; }
+.va-ico .pi-icon { width: 16px; height: 16px; }
+
+.va-head {
+  flex: 0 0 auto; display: flex; align-items: center; gap: 10px;
+  min-height: 50px; padding: 0 8px 0 14px; border-bottom: 1px solid #35414c; background: #0d151a;
+}
+.va-head-mark { width: 30px; height: 30px; border-radius: 50%; display: grid; place-items: center; background: #1a2c34; color: #65c7da; flex: none; }
+.va-head-mark .pi-icon { width: 17px; height: 17px; }
+.va-head-titles { display: grid; line-height: 1.15; min-width: 0; }
+.va-head-titles b { color: #65c7da; font-size: 15px; }
+.va-head-titles span { color: #8fa0ad; font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.va-close {
+  width: 40px; height: 40px; padding: 0; display: grid; place-items: center; flex: none;
+  border: 1px solid #35414c; border-radius: 6px; background: #1a252d; color: #dbe7eb; cursor: pointer;
+  margin-left: auto;
+}
+.va-close .pi-icon { width: 20px; height: 20px; }
+.va-close:hover, .va-close:focus-visible { border-color: #65c7da; color: #fff; }
+
+.va-say { flex: 0 0 auto; padding: 6px 14px; border-bottom: 1px solid #293a44; background: #13222a; color: #cfe3e8; font-size: 12px; }
+.va-say.bad { background: #2a1714; color: #f2a497; }
+.va-say[hidden] { display: none; }
+
+/* ----------------------------------------------- the active engine strip */
+.va-engine-strip {
+  flex: 0 0 auto; display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  min-height: 46px; padding: 5px 14px; border-bottom: 1px solid #293a44; background: #0f1a20;
+}
+.va-engine-strip > small { color: #8fa0ad; font-size: 10px; letter-spacing: .08em; text-transform: uppercase; }
+.va-engine-seg { display: inline-flex; border: 1px solid #35414c; border-radius: 6px; overflow: hidden; }
+.va-engine-seg button {
+  min-height: 36px; min-width: 96px; padding: 0 12px; border: 0; border-left: 1px solid #35414c;
+  background: #1a252d; color: #b9ccd3; font-size: 12.5px; cursor: pointer;
+  display: inline-flex; align-items: center; gap: 7px; justify-content: center;
+}
+.va-engine-seg button:first-child { border-left: 0; }
+.va-engine-seg button[aria-checked="true"] { background: #1f4652; color: #fff; box-shadow: inset 0 -2px 0 #65c7da; cursor: default; }
+.va-engine-seg button:disabled { opacity: .6; cursor: default; }
+.va-dot { width: 8px; height: 8px; border-radius: 50%; background: #6f8793; flex: none; }
+.va-dot.ok { background: #54d18b; }
+.va-dot.bad { background: #ef6f5e; }
+.va-dot.warm { background: #e3be63; animation: vaBreathe 1.4s ease-in-out infinite; }
+.va-engine-note { min-width: 0; flex: 1 1 auto; color: #8298a2; font-size: 11.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.va-engine-note.warn { color: #e3be63; }
+@keyframes vaBreathe { 0%, 100% { opacity: 1; } 50% { opacity: .45; } }
+
+/* the confirm bar that replaces the strip while a switch is being decided */
+.va-engine-confirm { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.va-engine-confirm p { margin: 0; color: #e8d9ab; font-size: 12px; flex: 1 1 260px; min-width: 0; }
+
+.va-body {
+  flex: 1 1 auto; min-height: 0; overflow-y: auto; overflow-x: hidden;
+  overscroll-behavior: contain; -webkit-overflow-scrolling: touch;
+  overflow-anchor: none;
+}
+
+/* ------------------------------------------------------------- the cards */
+.va-panel { border-bottom: 1px solid #293a44; }
+.va-panel-head {
+  width: 100%; min-height: 44px; display: flex; align-items: center; gap: 9px;
+  padding: 0 14px; border: 0; background: #121e25; color: #dbe7eb; text-align: left; cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+.va-panel-head:hover, .va-panel-head:focus-visible { background: #172731; }
+.va-panel-head > .va-ico:first-child .pi-icon { width: 13px; height: 13px; color: #65c7da; transition: transform .15s ease; }
+.va-panel.open > .va-panel-head > .va-ico:first-child .pi-icon { transform: rotate(90deg); }
+.va-panel-head > .va-ico:nth-child(2) { color: #8fd6df; }
+.va-panel-head b { font-size: 13.5px; font-weight: 650; }
+.va-panel-sum { min-width: 0; flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #8298a2; font-size: 12px; text-align: right; }
+.va-panel-body { padding: 10px 14px 14px; }
+.va-panel-body[hidden] { display: none; }
+
+.va-chip {
+  display: inline-block; padding: 2px 7px; border: 1px solid #395563; border-radius: 999px;
+  color: #9bcfdc; font-size: 10.5px; white-space: nowrap; text-transform: uppercase; letter-spacing: .04em;
+}
+.va-chip-ok { border-color: #2f6b4d; color: #7fe0a8; }
+.va-chip-warn { border-color: #90723a; color: #e3be63; }
+.va-chip-bad { border-color: #8a3b33; color: #f2a497; }
+.va-chip-mute { border-color: #34424c; color: #8298a2; }
+.va-chip-live { border-color: #ff6b5e; color: #ffb3a8; }
+
+.va-btn {
+  min-height: 40px; padding: 0 12px; display: inline-flex; align-items: center; gap: 7px;
+  border: 1px solid #365965; border-radius: 6px; background: #1a2c34; color: #cfe8ee; cursor: pointer;
+  font-size: 12.5px;
+}
+.va-btn:hover, .va-btn:focus-visible { border-color: #65c7da; color: #fff; }
+.va-btn:disabled { opacity: .5; cursor: default; }
+.va-btn.busy { opacity: .6; }
+.va-btn.on { background: #1f4652; border-color: #65c7da; color: #fff; }
+.va-btn.va-danger { border-color: #8a3b33; color: #f2a497; }
+.va-btn.va-danger:hover { border-color: #ef6f5e; color: #fff; }
+.va-mini { min-height: 32px; padding: 0 9px; font-size: 11.5px; }
+.va-muted { color: #8298a2; }
+.va-note { margin: 4px 0 8px; color: #8fa0ad; font-size: 12px; }
+
+.va-input, .va-select select {
+  min-height: 38px; padding: 0 9px; border: 1px solid #35414c; border-radius: 5px;
+  background: #0b1217; color: #edf3f5; font: 12.5px/1.2 Inter, Segoe UI, system-ui, sans-serif;
+}
+.va-input::placeholder { color: #58707c; }
+
+/* ------------------------------------------------------------ seat rows */
+.va-seats { display: grid; gap: 8px; }
+.va-seat {
+  display: grid; grid-template-columns: 158px minmax(0, 1fr) auto; gap: 10px; align-items: center;
+  min-height: 54px; padding: 6px 10px; border: 1px solid #293a44; border-radius: 6px; background: #121e25;
+}
+.va-seat-role { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.va-seat-role .va-ico { color: #8fd6df; }
+.va-seat-role div { display: grid; line-height: 1.2; min-width: 0; }
+.va-seat-role b { color: #edf3f5; font-size: 12.5px; }
+.va-seat-role small { color: #8fa0ad; font-size: 10.5px; }
+.va-seat-actor { min-width: 0; display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
+.va-seat-actor > b { color: #dcebee; font-size: 12.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 100%; }
+.va-seat-actor > b.va-empty { color: #58707c; font-weight: 400; }
+.va-seat-side { display: inline-flex; align-items: center; gap: 6px; }
+.va-seat.va-on { border-color: #2f6b4d; }
+
+.va-switch {
+  position: relative; flex: none; width: 50px; height: 28px; padding: 0;
+  border: 1px solid #3a5360; border-radius: 999px; background: #1a252d; cursor: pointer;
+}
+.va-switch i { position: absolute; left: 3px; top: 3px; width: 20px; height: 20px; border-radius: 50%; background: #8fa0ad; transition: transform .15s ease, background .15s ease; }
+.va-switch[aria-checked="true"] { background: #1d4b3a; border-color: #54d18b; }
+.va-switch[aria-checked="true"] i { transform: translateX(22px); background: #54d18b; }
+.va-switch:disabled { cursor: default; opacity: .5; }
+
+/* ------------------------------------------------------------ combo rows */
+.va-combos { display: grid; gap: 6px; }
+.va-combo {
+  display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 8px; align-items: center;
+  min-height: 46px; padding: 4px 8px; border: 1px solid #293a44; border-radius: 6px; background: #121e25;
+}
+.va-combo-text { display: grid; min-width: 0; line-height: 1.25; }
+.va-combo-text b { color: #edf3f5; font-size: 12.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.va-combo-text small { color: #8fa0ad; font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.va-combo-save { display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
+.va-combo-save .va-input { flex: 1 1 180px; min-width: 0; }
+
+/* ----------------------------------------------------------- caller rows */
+.va-callers { display: grid; gap: 6px; }
+.va-caller {
+  display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; align-items: center;
+  min-height: 46px; padding: 5px 9px; border: 1px solid #293a44; border-radius: 6px; background: #121e25;
+  cursor: pointer;
+}
+.va-caller.sel { border-color: #65c7da; box-shadow: inset 3px 0 0 #65c7da; }
+.va-caller-text { display: grid; min-width: 0; line-height: 1.25; }
+.va-caller-text b { color: #edf3f5; font-size: 12.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.va-caller-text small { color: #8fa0ad; font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.va-caller-side { display: inline-flex; align-items: center; gap: 6px; }
+.va-caller-detail {
+  margin: 2px 0 6px; padding: 9px 10px; border: 1px solid #365965; border-radius: 6px; background: #0f1a20;
+  display: grid; gap: 8px;
+}
+.va-caller-detail p { margin: 0; color: #b9ccd3; font-size: 12px; }
+.va-dispatch-row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+.va-dispatch-row .va-input { flex: 1 1 200px; min-width: 0; }
+.va-dispatch-last { gap: 6px; }
+.va-dispatch-last .va-muted { flex: 1 1 200px; min-width: 0; font-size: 11.5px; }
+.va-armed {
+  display: flex; align-items: center; gap: 10px; margin: 0 0 8px; padding: 7px 10px;
+  border: 1px solid #90723a; border-radius: 6px; background: #221d10; color: #e8d9ab;
+}
+.va-armed[hidden] { display: none; }
+.va-armed > .va-ico { color: #e3be63; }
+.va-armed-words { display: grid; min-width: 0; flex: 1 1 auto; line-height: 1.25; }
+.va-armed-words b { font-size: 12.5px; color: #f3e3b3; }
+.va-armed-words small { font-size: 11px; color: #cdbb8a; overflow: hidden; text-overflow: ellipsis; }
+.va-create { margin-top: 10px; padding-top: 10px; border-top: 1px solid #1d2c35; display: grid; gap: 8px; }
+.va-create-grid { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; }
+.va-create textarea { min-height: 54px; padding: 7px 9px; border: 1px solid #35414c; border-radius: 5px; background: #0b1217; color: #edf3f5; font: 12.5px/1.35 Inter, Segoe UI, system-ui, sans-serif; resize: vertical; }
+
+/* -------------------------------------------------------------- layers */
+.va-layer {
+  /* no z-index of its own: it paints above the body by DOM order, and BACK
+   * (PineDismiss.back picks the highest stacking z, the later on a tie) then
+   * sees the popup's z for it and asks the popup's probe - the topmost layer */
+  position: absolute; inset: 0; display: flex; flex-direction: column;
+  background: #0b1217; border-radius: 8px;
+}
+.va-layer[hidden] { display: none; }
+.va-layer-head {
+  flex: 0 0 auto; display: flex; align-items: center; gap: 10px; min-height: 50px;
+  padding: 0 8px 0 14px; border-bottom: 1px solid #35414c; background: #0d151a;
+}
+.va-layer-head b { color: #65c7da; font-size: 14px; }
+.va-layer-head .va-input { flex: 1 1 auto; min-width: 60px; }
+.va-layer-body { flex: 1 1 auto; min-height: 0; overflow-y: auto; overscroll-behavior: contain; -webkit-overflow-scrolling: touch; padding: 10px 14px 14px; overflow-anchor: none; }
+
+.va-actors { display: grid; gap: 6px; }
+.va-actor {
+  display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; align-items: center;
+  min-height: 50px; padding: 5px 9px; border: 1px solid #293a44; border-radius: 6px; background: #121e25;
+  cursor: pointer; text-align: left; color: inherit;
+}
+.va-actor:hover, .va-actor:focus-visible { border-color: #65c7da; }
+.va-actor.current { border-color: #65c7da; box-shadow: inset 3px 0 0 #65c7da; }
+.va-actor-text { display: grid; min-width: 0; line-height: 1.25; }
+.va-actor-text b { color: #edf3f5; font-size: 12.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.va-actor-text small { color: #8fa0ad; font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.va-actor-side { display: inline-flex; align-items: center; gap: 5px; }
+.va-pref { display: inline-flex; border: 1px solid #35414c; border-radius: 999px; overflow: hidden; }
+.va-pref button {
+  min-height: 30px; min-width: 44px; padding: 0 8px; border: 0; border-left: 1px solid #35414c;
+  background: #1a252d; color: #8298a2; font-size: 10.5px; cursor: pointer; letter-spacing: .04em;
+}
+.va-pref button:first-child { border-left: 0; }
+.va-pref button[aria-checked="true"] { background: #1f4652; color: #fff; }
+
+/* the extraction area a sibling module fills */
+.va-extract-body { display: flex; flex-direction: column; gap: 10px; min-height: 0; }
+#vaTileRail {
+  flex: 0 0 auto; display: flex; gap: 10px; overflow-x: auto; overflow-y: hidden;
+  min-height: 0; padding-bottom: 4px; -webkit-overflow-scrolling: touch;
+}
+#vaTileRail:empty { display: none; }
+#vaExtractionMount { flex: 1 1 auto; min-height: 200px; display: grid; }
+.va-extract-empty {
+  margin: auto; max-width: 460px; padding: 18px; border: 1px dashed #35414c; border-radius: 8px;
+  color: #8fa0ad; font-size: 12.5px; text-align: center; display: grid; gap: 8px; justify-items: center;
+}
+.va-extract-empty .va-ico { color: #58707c; }
+.va-extract-empty .va-ico .pi-icon { width: 26px; height: 26px; }
+.va-extract-empty b { color: #b9ccd3; }
+
+/* ------------------------------------------------------------- narrow */
+@media (max-width: 900px) {
+  .va-seat { grid-template-columns: 120px minmax(0, 1fr) auto; }
+  .va-engine-note { flex-basis: 100%; }
+}
+@media (max-width: 1200px), (max-height: 760px) {
+  .va-pop { left: 8px; right: 32px; top: 8px; bottom: 30px; }
+}
+@media (max-width: 620px) {
+  .va-seat { grid-template-columns: minmax(0, 1fr) auto; }
+  .va-seat-role { grid-column: 1 / -1; }
+}

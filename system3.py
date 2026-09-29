@@ -3176,6 +3176,42 @@ def decide_blocks(names, config, seed, conv=None, tint_on=False, dial=None, at=N
     return out
 
 
+def voice_actor_diamond(conv, inputs, outgoing, by_id, current):
+    """[voice-actor] "Call in now": the operator dispatched a caller into this
+    segment's tree, and the FIRST diamond with an edge into a call node takes
+    the call. Returns the reason the wheel was set (it is recorded on the
+    draw), or "" when this diamond rolls as the graph says. The conversation
+    is marked where the call was taken, so it is taken once."""
+    ij = inputs.get("call_interjection") if isinstance(inputs, dict) else None
+    if not isinstance(ij, dict) or not ij.get("id") or conv.get("call_interjection"):
+        return ""
+    if not any((by_id.get(edge["to"]) or {}).get("type") == "call" for edge in outgoing):
+        return ""
+    name = " ".join(str(ij.get("name") or "a caller").split())[:80]
+    conv["call_interjection"] = {"id": str(ij.get("id") or "")[:40], "node": str(current),
+                                 "caller": name, "at_turn": len(conv.get("turns") or [])}
+    return "operator dispatch - call in now: %s joins at this diamond" % name
+
+
+def voice_actor_call_brief(conv, inputs):
+    """[voice-actor] Who the dispatched caller is, for the writer, on the call
+    nodes of the conversation that took them; "" anywhere else."""
+    took = conv.get("call_interjection")
+    ij = inputs.get("call_interjection") if isinstance(inputs, dict) else None
+    if (not isinstance(took, dict) or not isinstance(ij, dict)
+            or str(ij.get("id") or "")[:40] != took.get("id")):
+        return ""
+    said = lambda key, most: " ".join(str(ij.get(key) or "").split())[:most].rstrip(". ")
+    out = " This caller is %s, put through by the operator." % json.dumps(said("name", 80) or "the caller")
+    if said("persona", 300):
+        out += " Who they are: %s." % said("persona", 300)
+    if said("goal", 300):
+        out += " What they want: %s." % said("goal", 300)
+    if said("topic", 300):
+        out += " They ring about: %s." % said("topic", 300)
+    return out
+
+
 def plan_graph(conv, config, graph_raw, until=None, inputs=None, road="banter"):
     """Follow an editable conversation graph through System 3's own dice ledger.
 
@@ -3421,6 +3457,7 @@ def plan_graph(conv, config, graph_raw, until=None, inputs=None, road="banter"):
                     turn["protocol"] += (" The caller joins a live discussion of %s after hearing %s."
                                          " Their point must connect to that discussion."
                                          % (json.dumps(topic), ", ".join(heard) or "the hosts"))
+                    turn["protocol"] += voice_actor_call_brief(conv, inputs)   # [voice-actor] who rang
                     if node.get("call_leg") == "open" and not conv.get("callend"):
                         # [nodeplan] a call nested at a diamond ends like a real
                         # call: the caller's wheel (RESOLVE), its own stream,
@@ -3473,11 +3510,20 @@ def plan_graph(conv, config, graph_raw, until=None, inputs=None, road="banter"):
                 outgoing = [edge for edge in outgoing if edge is not ending]
             draw = stream.next("GRAPH:%s:branch:%d" % (current, visits[current]))
             weights = [edge["weight"] for edge in outgoing]
+            # [voice-actor] "call in now": a caller the operator dispatched into
+            # this segment takes the first diamond with a way into a call. Still
+            # ONE recorded draw - every edge on the wheel, its flow weight the base,
+            # the dispatch the effective weight, and the reason on the draw.
+            _va_why = voice_actor_diamond(conv, inputs, outgoing, by_id, current)
+            if _va_why:
+                weights = [1.0 if by_id[edge["to"]]["type"] == "call" else 0.0 for edge in outgoing]
             pick = pick_index(weights, draw["u"])
             rows = [{"id": edge["to"], "label": edge["label"] or by_id[edge["to"]]["label"],
-                     "base": edge["weight"], "weight": edge["weight"], "why": ["outgoing flow weight"]}
-                    for edge in outgoing]
-            record("branch", rows, pick, draw, {"node": current})
+                     "base": edge["weight"], "weight": weights[i],
+                     "why": ["outgoing flow weight"] + ([_va_why] if _va_why else [])}
+                    for i, edge in enumerate(outgoing)]
+            record("branch", rows, pick, draw, {"node": current, **({"dispatch": conv["call_interjection"]["id"]}
+                                                                   if _va_why else {})})
             chosen = outgoing[pick]
         current = chosen["to"]
         cur["graph_node"] = current

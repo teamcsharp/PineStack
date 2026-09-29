@@ -1693,6 +1693,51 @@ class System3Runtime:
             **self.memory_inputs(road, ctx, topic),
         }
 
+    def _voice_actor_arm(self, ctx, inputs, road, mode):
+        """[voice-actor] The write side of ctx["call_interjection"]: the caller
+        the operator dispatched with "call in now", for a live active round
+        planned in the segment it was dispatched into. Never raises."""
+        if (mode != "active" or ctx.get("bank") or ctx.get("caller_name")
+                or ctx.get("whole") or road == "caller"):
+            return
+        try:
+            pending = self.host.voice_actor_interjection_pending(
+                road, str((inputs.get("segment") or {}).get("id") or ""))
+        except AttributeError:
+            return                          # the station has no voice actor store
+        except Exception as exc:  # noqa: BLE001
+            self.fail("voice actor arm", exc)
+            return
+        if not isinstance(pending, dict) or not str(pending.get("name") or "").strip():
+            return
+        ij = {k: " ".join(str(pending.get(k) or "").split())[:400]
+              for k in ("id", "caller_id", "name", "persona", "goal", "topic", "voice_id", "segment_id")}
+        ij["name"] = ij["name"][:80]
+        ctx["call_interjection"] = dict(ij)
+        inputs["call_interjection"] = dict(ij)
+        inputs["graph_caller_available"] = True
+        inputs.setdefault("names", {})["C"] = ij["name"]
+
+    def _voice_actor_taken(self, handle, inputs):
+        """[voice-actor] Did this plan take the armed call at a diamond? Then the
+        dispatch is planned (its conversation and C turns recorded) and the
+        handle carries the caller for dj_banter. Never raises."""
+        ij = inputs.get("call_interjection") if isinstance(inputs, dict) else None
+        if not isinstance(ij, dict) or not handle or not handle.active:
+            return
+        conv = handle.conv
+        took = conv.get("call_interjection")
+        c_turns = [t for t in conv.get("turns") or [] if t.get("speaker") == "C"]
+        if not isinstance(took, dict) or took.get("id") != ij.get("id") or not c_turns:
+            return
+        handle.interjection = dict(ij, node=str(took.get("node") or ""))
+        try:
+            self.host.voice_actor_interjection_taken(
+                ij["id"], handle.id, [str(t.get("turn_id") or "") for t in c_turns],
+                str(took.get("node") or ""))
+        except Exception as exc:  # noqa: BLE001
+            self.fail("voice actor taken", exc)
+
     def _carry_for(self, ctx):
         """[s3-carry] The previous round's ending state, aged, for THIS round's
         inputs. Only a round whose words are written for the air it will get -
@@ -2222,6 +2267,7 @@ class System3Runtime:
             return None
         try:
             inputs = self._inputs(ctx)
+            self._voice_actor_arm(ctx, inputs, road, mode)       # [voice-actor] "call in now"
             config = self.config
             started = time.perf_counter()
             conv = system3.new_conversation(inputs, config, self.settings)
@@ -2274,6 +2320,7 @@ class System3Runtime:
                 system3.plan_legs(conv, config, inputs, road, structure=_st)
             else:
                 system3.plan_more(conv, config)
+            self._voice_actor_taken(handle, inputs)             # [voice-actor] the diamond took it
             handle.plan_ms = round((time.perf_counter() - started) * 1000, 2)
             if conv.get("length_roll"):
                 handle.turns = int(conv["length_roll"].get("turns") or 0)     # [s3-glass]
