@@ -184,6 +184,7 @@ class ToolAndChecks(unittest.TestCase):
     def test_both_tools_are_applied(self):
         for name, target in (("system3_exchange_chain_patch", "app.py"),
                              ("system3_exchange_chain2_patch", "app.py"),
+                             ("system3_exchange_chain3_patch", "app.py"),
                              ("system3_chain_runtime_patch", "system3_runtime.py")):
             mod = load_tool(name)
             text = (ROOT / target).read_text(encoding="utf-8")

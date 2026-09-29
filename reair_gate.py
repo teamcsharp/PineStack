@@ -242,6 +242,57 @@ def turnchain_refusal(record: Any) -> str:
     return ""
 
 
+# [s3-reair-copy] the copy gate new rounds pass, asked of a stored round
+COPY_GATE_UNIT_MIN = 8      # words: a sentence shorter than this is not weighed alone
+RETIRE_HOOK = None          # the station's recorder: (mark keys, why), called once per refused round
+COPY_GATE_SHINGLE = 4       # a pair is asked only when it shares a run of this many words
+_SENTENCE_SPLIT = re.compile(r"(?<=[.!?;])\s+")
+
+
+def _shingles(words: list[str]) -> set:
+    n = COPY_GATE_SHINGLE
+    return {" ".join(words[i:i + n]) for i in range(max(0, len(words) - n + 1))}
+
+
+def copy_gate_refusal(turns: list[tuple[str, str]]) -> str:
+    """Why the round fails System 3's copy gate (system3.gate_check), or "".
+    Every turn is weighed against the turns before it, and every sentence of a
+    turn against the turns and sentences before it - a sentence copied inside a
+    longer turn, or said twice in one turn, is a copy as surely as a turn."""
+    try:
+        import system3                                  # the gate new rounds pass
+        check, words_of = system3.gate_check, system3.gate_words
+    except Exception:  # noqa: BLE001 - no engine, no verdict
+        return ""
+    units: list[tuple[str, str, set, int]] = []          # (label, text, shingles, turn)
+    for i, (_who, text) in enumerate(turns):
+        said = str(text or "")
+        pieces = [s for s in _SENTENCE_SPLIT.split(said) if s.strip()]
+        asked = [("turn %d" % (i + 1), said, True)]
+        if len(pieces) > 1:
+            asked += [("a sentence of turn %d" % (i + 1), s, False) for s in pieces]
+        mine: list[tuple[str, str, set, int]] = []
+        for label, piece, whole in asked:
+            w = words_of(piece)
+            if len(w) < COPY_GATE_UNIT_MIN:
+                continue
+            sh = _shingles(w)
+            earlier = [(lab, txt) for lab, txt, osh, turn in units if sh & osh]
+            if not whole:
+                earlier += [(lab, txt) for lab, txt, osh, _t in mine if sh & osh]
+            if earlier:
+                got = check({}, None, piece, earlier=earlier, sources=[])
+                if got and got.get("rule") == "copy":
+                    return "the copy gate: %s %s" % (label, got.get("why") or "repeats an earlier line")
+            if not whole:
+                mine.append((label, piece, sh, i))
+        units.extend(mine)
+        w = words_of(said)
+        if len(w) >= COPY_GATE_UNIT_MIN:
+            units.append(("turn %d" % (i + 1), said, _shingles(w), i))
+    return ""
+
+
 def _words_key(row: Any) -> tuple:
     """A cheap identity for the round's words: its script string's own
     (cached) hash and length - no parse - or, for a round with no script,
@@ -320,6 +371,13 @@ def content_refusal(row: Any) -> str:
             why = "copied turns - %d of its %d turns copy an earlier turn (%s)" % (
                 len(copies), len(turns),
                 ", ".join("turn %d = turn %d" % (i + 1, j + 1) for i, j in copies[:4]))
+    if not why and turns:
+        why = copy_gate_refusal(turns)                          # [s3-reair-copy]
+        if why and callable(RETIRE_HOOK):                       # the station records the retirement
+            try:
+                RETIRE_HOOK(mark_keys(row), why)
+            except Exception:  # noqa: BLE001
+                pass
     with _MEMO_LOCK:
         _MEMO[key] = why
         while len(_MEMO) > MEMO_MOST:
@@ -346,6 +404,8 @@ def refusal(row: Any, marks: dict[str, Any] | None = None, cid: str = "") -> str
     """Why this stored round may never go out again, or "" when it may (the
     roulette still decides whether it does)."""
     got = mark_of(row, marks, cid)
+    if isinstance(got, dict) and got.get("allow"):
+        return ""                        # [s3-reair-copy] the operator restored it: the roulette decides
     if got:
         why = got.get("why") if isinstance(got, dict) else got
         return "marked ineligible by the sweep%s" % (": " + str(why) if why else "")

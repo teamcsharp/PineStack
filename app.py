@@ -36554,8 +36554,9 @@ async def _s3_chapter_write(e: dict[str, Any], plan: dict[str, Any]) -> tuple[li
                   + "\n\nWRITE ONLY THESE NEXT TURNS:\n" + order
                   + ("\nYOUR LAST DRAFT FAILED: %s. Write turn %d again as a NEW line that answers the line "
                      "immediately above it." % (why, k + 1) if why else "")
-                  + "\nOutput exactly one line per listed turn using only the listed A:/B:/C:/D: marker. "
-                    "No preface, labels, markdown or stage directions.")
+                  + "\nOutput exactly one line per listed turn. Start each line with its speaker's letter and "
+                    "a colon, once - A: then the words, B: then the words - never two markers together. "
+                    "No preface, labels, markdown or stage directions.")   # [s3-slash] one marker at a time
         raw = await ask_model(prompt, limit=min(2800, max(900, 450 * len(rows))), spice=0.45, num_ctx=16384,
                               mark={"kind": "chapter repair", "turn": k + 1, "visit": visits})
         draft, why = accept(draft, list(banter_turns(raw or "")))
@@ -92670,6 +92671,50 @@ _BLOCK_RECENT: list[int] = []
 REPEAT_WINDOW_MIN_HOURS = 3.0
 REPEAT_WINDOW_MAX_HOURS = 5.0
 REPEAT_WINDOW_HOURS = 4.0          # the middle of the band he named
+
+
+_REAIR_COPY_RETIRED: set[str] = set()
+_REAIR_COPY_LOCK = RLock()
+
+
+def _reair_copy_retire(keys: list[str], why: str) -> None:
+    """[s3-reair-copy] A banked round the copy gate refused when it was drawn for
+    re-air is RETIRED: one mark in data/reair_ineligible.json (who retired it,
+    why, when), written off the loop, once per round. The round stays in its
+    store untouched; set "allow": true on the mark to restore it to the roulette.
+    reair_gate.content_refusal calls this (RETIRE_HOOK) the first time it refuses."""
+    key = next((str(k) for k in keys or () if ":" in str(k)), "")
+    if not key or key in _REAIR_COPY_RETIRED:
+        return
+    _REAIR_COPY_RETIRED.add(key)
+
+    def job() -> None:
+        try:
+            import reair_gate
+            with _REAIR_COPY_LOCK:
+                marks = reair_gate.load_marks(REAIR_MARKS_PATH)
+                if key in marks:
+                    return
+                marks[key] = {"why": str(why)[:300], "by": "the copy gate at re-air [s3-reair-copy]",
+                              "at": round(time.time(), 3),
+                              "restore": "set \"allow\": true on this mark to put it back on the roulette"}
+                reair_gate.save_marks(REAIR_MARKS_PATH, marks, by="app.py [s3-reair-copy]")
+            pipeline_log("air", ("a banked round was RETIRED at re-air - %s" % why)[:200], extra=key)
+        except Exception as exc:  # noqa: BLE001 - the refusal stands; only the record failed
+            pipeline_log("air", "a re-air retirement could not be recorded",
+                         extra=("%s %s: %s" % (key, type(exc).__name__, exc))[:200])
+    try:
+        asyncio.get_running_loop()
+        fire_and_forget(asyncio.to_thread(job))
+    except RuntimeError:
+        job()
+
+
+try:                                                    # [s3-reair-copy] the gate reports its retirements
+    import reair_gate as _reair_gate_mod
+    _reair_gate_mod.RETIRE_HOOK = _reair_copy_retire
+except Exception:  # noqa: BLE001 - no gate module, nothing to retire
+    pass
 
 
 def repeat_window() -> float:
