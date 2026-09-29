@@ -755,7 +755,13 @@
     if (document.getElementById('statusBar')) return;       /* the desk has its own */
     var tray = make('span', 'pl-tray');
     tray.appendChild(trayButton('gem', 'c:gem', 'C', 'Crystals - the station\'s crystal cabinet', function () {
-      if (typeof root.crystalOpen === 'function') root.crystalOpen();
+      if (typeof root.crystalOpen !== 'function') return;
+      /* [pltray2] the station builds the crystal box at z 146 - under the full-screen
+       * view host (z 2147483000); lift it just above, below the base bar */
+      Promise.resolve(root.crystalOpen()).then(function () {
+        var box = document.getElementById('crystalBox');
+        if (box) box.style.zIndex = '2147483001';
+      }, function () {});
     }));
     tray.appendChild(trayButton('sample', 'm:movie', 'S', 'Add sample - paste a link, cut moments into the DJs\' rotation', openSampleSheet));
     tray.appendChild(trayButton('golive', 'c:satellite', 'L', 'Go LIVE - the public listen link', openShareSheet));
