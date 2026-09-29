@@ -3512,7 +3512,7 @@
     for (var i = 0; i < 64; i += 1) {
       var p = i * (n - 1) / 63, a = Math.floor(p), b = Math.min(n - 1, a + 1), t = p - a;
       var byte = raw.charCodeAt(a) * (1 - t) + raw.charCodeAt(b) * t;
-      var v = Math.max(0, Math.min(1, (byte + shift - 10) / 86));
+      var v = Math.max(0, Math.min(1, (byte - 10) / 86)) * Math.max(0, Math.min(1, g));   /* [plmeter2] */
       bars.push(v);
       if (v > peak) peak = v;
     }

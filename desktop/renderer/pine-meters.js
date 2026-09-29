@@ -171,7 +171,7 @@
         var dropV = -20 * Math.log(Math.max(0.0001, applied)) / Math.LN10 / 70 * lift;
         peak = 0;
         for (var q = 0; q < bins; q += 1) {
-          out[q] = Math.max(0, out[q] - dropV);
+          out[q] = out[q] * Math.max(0, applied);         /* [plmeter2] scale with the slider */
           if (out[q] > peak) peak = out[q];
         }
       }
