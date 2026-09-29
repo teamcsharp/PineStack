@@ -214,6 +214,13 @@ function drum(candidates, selectedId) {
     list.style.transition = 'none'; render(labels, target);
     list.style.transform = `translateY(${-target * 22}px)`;
   };
+  /* [msgview] parked: the reel at the top of its real candidates, no pick
+     shown, until its turn in landInOrder comes */
+  box.park = () => {
+    if (labels.length < 2 || reduced()) return;
+    list.style.transition = 'none'; render(labels, -1);
+    list.style.transform = 'translateY(0)';
+  };
   return box;
 }
 
@@ -475,6 +482,8 @@ const DIE_STEP = 400, DICE_CAP = 2000, DICE_HOLD_MS = 1500, DIE_HURRY = 90;
 function landPiece(chip, face, reel) {
   return {
     rolls: !!(face && face.rolls) || !!reel,
+    face, reel, chip,                                   /* [msgview] the phases land each part */
+    sub: !!(chip && chip.classList && chip.classList.contains('s3-rl-es-item')),
     spin(ms) {
       chip.classList.remove('s3-landed');
       chip.classList.add('s3-spinning');
@@ -490,7 +499,7 @@ function landPiece(chip, face, reel) {
     },
   };
 }
-function landInOrder(pieces) {
+function landInOrderOne(pieces) {       /* [msgview] the one-phase original, kept, unused */
   const list = (pieces || []).filter(p => p && p.rolls);
   const step = list.length ? Math.min(DIE_STEP, DICE_CAP / list.length) : 0;
   const t0 = performance.now();
@@ -525,6 +534,86 @@ function landInOrder(pieces) {
     tick();
   };
   list.forEach((p, i) => p.spin(at[i] - t0));
+  tick();
+  return done;
+}
+/* [msgview] THE DICE FIRST, THEN THE ROLODEX, THEN THE SUB-RESULT. "With every
+   message ... I want to see the RNG dice rolls first, where they each stop in
+   succession one, two, three, four, five, so on. Then the roulette system
+   rolling through the roller deck for the result, and then the roll of deck's
+   rolling for the sub result for each item" (operator, 2026-09-28). One clock,
+   three phases: every die tumbles from the start and they stop one after
+   another (DIE_STEP apart, inside DICE_CAP) while the reels stand parked at
+   the top of their real candidates; then, table by table, each reel scrolls
+   through its real candidates and lands on the recorded pick - a table's
+   result, then its sub-result (the ES item under its category) - REEL_STEP
+   apart inside REEL_CAP; then everything holds DICE_HOLD_MS. hurry() brings
+   the rest down fast, still in order, and cuts the hold. Frames AND timers
+   drive it (a tablet WebView can stall either). done.total is the whole run. */
+const REEL_STEP = 650, REEL_CAP = 3200, REEL_GAP = 220;
+function landInOrder(pieces) {
+  const list = (pieces || []).filter(p => p && p.rolls);
+  const dice = list.filter(p => p.face && p.face.rolls);
+  const reels = list.filter(p => p.reel && typeof p.reel.spin === 'function');
+  const stepD = dice.length ? Math.min(DIE_STEP, DICE_CAP / dice.length) : 0;
+  const stepR = reels.length ? Math.min(REEL_STEP, REEL_CAP / reels.length) : 0;
+  const t0 = performance.now();
+  const dEnd = t0 + dice.length * stepD + (dice.length && reels.length ? REEL_GAP : 0);
+  const parts = new Map(list.map(p => [p, (p.face && p.face.rolls ? 1 : 0) + (reels.includes(p) ? 1 : 0)]));
+  const partDone = p => {
+    const left = (parts.get(p) || 1) - 1;
+    parts.set(p, left);
+    if (left > 0 || !p.chip) return;
+    p.chip.classList.remove('s3-spinning');
+    p.chip.classList.add('s3-landed');
+    setTimeout(() => p.chip.classList.remove('s3-landed'), 700);
+  };
+  const steps = [];
+  dice.forEach((p, i) => steps.push({at: t0 + (i + 1) * stepD, go: () => { p.face.land(); partDone(p); }}));
+  reels.forEach((p, j) => {
+    const from = dEnd + j * stepR;
+    steps.push({at: from, spin: true, go: () => p.reel.spin(Math.max(120, stepR - 60))});
+    steps.push({at: from + stepR, go: () => { p.reel.land(); partDone(p); }});
+  });
+  let next = 0, hurried = false, over = false, restAt = 0, raf = 0, timer = 0, settle = null;
+  const done = new Promise(resolve => { settle = resolve; });
+  const tick = () => {
+    if (over) return;
+    const now = performance.now();
+    while (next < steps.length && now >= steps[next].at - 4) { steps[next].go(); next += 1; }
+    if (next >= steps.length) {
+      if (!restAt) restAt = list.length && !hurried ? now + DICE_HOLD_MS : now;
+      if (now >= restAt - 4) {
+        over = true;
+        cancelAnimationFrame(raf); clearTimeout(timer);
+        settle();
+        return;
+      }
+    }
+    cancelAnimationFrame(raf); clearTimeout(timer);
+    raf = requestAnimationFrame(tick);
+    timer = setTimeout(tick, Math.max(12, (next < steps.length ? steps[next].at : restAt) - now));
+  };
+  done.count = list.length;
+  done.step = stepD;
+  done.total = (steps.length ? steps[steps.length - 1].at - t0 : 0) + DICE_HOLD_MS;
+  done.hurry = () => {
+    if (hurried || over) return;
+    hurried = true;
+    const now = performance.now();
+    let k = 0;
+    for (let i = next; i < steps.length; i += 1) {
+      if (!steps[i].spin) k += 1;
+      steps[i].at = Math.min(steps[i].at, now + k * DIE_HURRY);
+    }
+    if (restAt) restAt = Math.min(restAt, now);
+    tick();
+  };
+  list.forEach(p => {
+    if (p.chip) { p.chip.classList.remove('s3-landed'); p.chip.classList.add('s3-spinning'); }
+    if (p.face && p.face.spin) p.face.spin();
+    if (p.reel && typeof p.reel.park === 'function') p.reel.park();
+  });
   tick();
   return done;
 }
@@ -3294,7 +3383,7 @@ function makeViews({request, onSelect, details = false} = {}) {
     card.classList.remove('s3-popin'); void card.offsetWidth; card.classList.add('s3-popin');
     const seq = typeof card.roll === 'function' ? card.roll() : landInOrder([]);
     const n = seq.count || 0;
-    const done = n ? Promise.race([seq, frameSleep(n * DIE_STEP + DICE_HOLD_MS + 1500)])
+    const done = n ? Promise.race([seq, frameSleep((seq.total || n * DIE_STEP + DICE_HOLD_MS) + 1500)])   /* [msgview] */
       : hold ? frameSleep(DICE_HOLD_MS) : Promise.resolve();
     return {seq, done};
   };
@@ -3338,6 +3427,23 @@ function makeViews({request, onSelect, details = false} = {}) {
       settleItem(cur);
       if (typeof v.onAssembled === 'function') v.onAssembled(key, cur);
     }
+  };
+  /* [msgview] A NEW MESSAGE, IN AIR ORDER - the one entry the [msgorder]
+     hook calls (key, node). The item on air is left to its own reveal
+     (startReveal: dice, Rolodex, sub-result, then its words on the audio's
+     clock); any other newly arrived message comes together ONCE, the
+     assembly its play button runs (card, the dice stopping one after another,
+     the Rolodex, the sub-result, the words typed). A key plays once: history
+     drawn again on a scroll or a repaint is never replayed. */
+  v.arrivedSeen = new Set();
+  v.arrived = (key, node) => {
+    key = String(key || v.itemKey(node) || '');
+    if (!key || !node || !node.isConnected || v.arrivedSeen.has(key)) return Promise.resolve(false);
+    v.arrivedSeen.add(key);
+    if (v.arrivedSeen.size > 800) v.arrivedSeen.delete(v.arrivedSeen.values().next().value);
+    const stg = node.dataset ? node.dataset.stage : '';
+    if (stg === 'live' || stg === 'upcoming' || (node.dataset && node.dataset.replaying) || reduced()) return Promise.resolve(false);
+    return v.assemble(node);
   };
   /* the recorded decisions behind an item, in the order they were drawn, as the long version's cards */
   v.decisionsOf = (key, node) => {

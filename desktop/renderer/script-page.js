@@ -5187,6 +5187,7 @@
     if (techOn) { techGrip(); techPlace(); }
     var flip = document.querySelector('.sp-feedflip');
     if (flip) flip.textContent = techOn ? 'feed' : 'technical';
+    mvTechShown(techOn);                     /* [msgview] */
     var name = document.querySelector('.sp-feedhead b');
     if (name) name.textContent = techOn ? 'Technical' : 'Feed';
     var why = document.querySelector('.sp-feedwhy');
@@ -5228,6 +5229,1183 @@
     });
   }
   root.PineTechnical = {trace: technicalTrace, toggle: technicalToggle};
+
+  /* ------------------------------------------ [msgview] THE VIEW MENU + MESSAGE VIEW
+   *
+   * "if i tap this button, I now want to bring up a menu to change this view
+   *  and expanded view into any of the 3js experiences offered in the 3js
+   *  window. I want to be able to also have it show a live roulette display
+   *  and messenger view of the active message being spoken as a view. It
+   *  want to call it message view." (the operator, 2026-09-28)
+   *
+   * THE MENU. The button beside "full width" opens one list: Feed,
+   * Technical, Message view, then every scene PineThreeFull.list() finds in
+   * the panel's own PINE_3JS register (the 3JS window's list, not a copy).
+   * The current one is ticked. A scene is opened by the 3JS window's own
+   * road (PineThreeFull.show) and then DOCKED into this pane: on the tablet
+   * the promoted element is moved into the pane; on the desk, where the
+   * scene lives in the controlFrame webview, the lifted carrier is sized to
+   * the pane's rectangle (drop() restores every property it stashed).
+   * Leaving a scene closes it through PineThreeFull.close(), runs the
+   * panel's own pine3JSAllOff() and loses every WebGL context the scene
+   * held, so nothing stays resident on a memory-tight tablet.
+   *
+   * MESSAGE VIEW. The element on air as a messenger bubble. It reads what
+   * the Script view already reads - the live strip's line (sayingLineId /
+   * sayingSaid), the timeline's sounding element (tlNow), stream_now, the
+   * station state and the player - and asks ONE thing per new line:
+   * /api/system3/line?line_id=<id>, whose decisions carry every stage's
+   * REAL candidates, weights and d100. Classic: the seed dice roll, then a
+   * typewriter synced to the audio with a loading bar. Digital (the
+   * operator's drawing): die -> number -> Rolodex through the table's real
+   * options landing on the rolled category -> sub number -> sub Rolodex
+   * landing on the item, per rolled table; collapse into a Result tab; the
+   * access indicator scrolls the source icons and lands on the main source
+   * with the other feeds small beside it; then the typewriter.
+   * ES5; animation on requestAnimationFrame only while the pane is seen;
+   * no scrolling of anything; no emoji (Carbon through pineIcon). */
+  var MV_EVERY = (Number(root.PINE_PACE) > 1) ? 1 : 2;
+  var MV_ROW_H = 22;
+  var MV_SRC = {
+    speakerbox: ['c:document', 'Speakerbox'], sfx: ['c:volume--up--filled', 'SFX'],
+    topic: ['c:password', 'Topic'], memory: ['c:cognitive', 'Memory'],
+    internet: ['c:laptop', 'Internet'], manager: ['c:car', 'Manager'],
+    ads: ['c:money', 'Ads'], products: ['c:box', 'Products']
+  };
+  var MV_SRC_ORDER = ['speakerbox', 'sfx', 'topic', 'memory', 'internet', 'manager', 'ads', 'products'];
+  var MV_FAM = {CTS: '#8ac6ac', ES: '#f0a6ca', RS: '#87bfff', IRS: '#ffb86b', FL: '#c4a1ee',
+    SPEAKERBOX: '#e7bf78', SFX: '#7fe0d6', TOPIC: '#9be15d', SFXGUY: '#ffd479', LINE: '#b8c4ff',
+    MEMORY: '#d9c9a3', STATION: '#9aa9ab', GRAPH: '#9be15d'};
+  var mv = {
+    view: 'feed', style: 'digital', flip: null, left: null, pane: null, stage: null,
+    sceneBox: null, scene: null, sceneGen: 0, sceneRO: null, menu: null, menuOff: null,
+    raf: 0, frameN: 0, seenAt: 0, seen: false, detectAt: 0, item: null, cur: null,
+    answers: Object.create(null), answerOrder: [], convs: Object.create(null)
+  };
+  try { mv.style = localStorage.getItem('sp.mv.style') === 'classic' ? 'classic' : 'digital'; }
+  catch (e) { mv.style = 'digital'; }
+
+  function mvIcon(name) {
+    try { return typeof root.pineIcon === 'function' ? (root.pineIcon(name) || '') : ''; }
+    catch (e) { return ''; }
+  }
+  function mvGlyph(name, cls) {
+    var s = make('span', 'sp-mv-ico' + (cls ? ' ' + cls : ''));
+    s.innerHTML = mvIcon(name);
+    return s;
+  }
+  /* The feed's words can start with a pictograph ("🔊 230 are
+     somehow"); none of that is drawn here. */
+  function mvPlain(text) {
+    var s = String(text || '');
+    var i = 0;
+    while (i < s.length) {
+      var c = typeof s.codePointAt === 'function' ? s.codePointAt(i) : s.charCodeAt(i);
+      if (!((c >= 0x2000 && c <= 0x3300) || c >= 0x1F000 || c === 0xFE0F || c === 0x200D
+        || c === 32 || c === 9 || c === 160)) break;
+      i += c > 0xFFFF ? 2 : 1;
+    }
+    return s.slice(i).replace(/\s+/g, ' ').trim();
+  }
+
+  /* ------------------------------------------------------------ the menu */
+  function mvName(view) {
+    if (view === 'technical') return 'Technical';
+    if (view === 'message') return 'Message view';
+    if (view.indexOf('scene:') === 0) return (mv.scene && mv.scene.label) || mv.sceneLabel || '3JS';
+    return 'Feed';
+  }
+  function mvFlipPaint() {
+    var flip = mv.flip;
+    if (!flip) return;
+    var want = mvName(mv.view) + '|' + (techOn ? 1 : 0);
+    if (flip.pineMv === want) return;
+    flip.pineMv = want;
+    flip.textContent = '';
+    flip.appendChild(make('span', 'sp-mv-flipname', mvName(mv.view)));
+    flip.appendChild(mvGlyph('c:chevron--down', 'sp-mv-chev'));
+    flip.title = 'Change this view: Feed, Technical, Message view or any 3JS scene';
+    flip.setAttribute('aria-haspopup', 'menu');
+  }
+  function mvHead(name, why) {
+    var b = document.querySelector('.sp-feedhead b');
+    if (b) b.textContent = name;
+    var w = document.querySelector('.sp-feedwhy');
+    if (w) w.textContent = why;
+  }
+  function mvMenuClose() {
+    if (mv.menu && mv.menu.parentNode) mv.menu.parentNode.removeChild(mv.menu);
+    mv.menu = null;
+    if (mv.menuOff) {
+      document.removeEventListener('pointerdown', mv.menuOff, true);
+      document.removeEventListener('keydown', mv.menuOff, true);
+    }
+    mv.menuOff = null;
+    if (mv.flip) mv.flip.setAttribute('aria-expanded', 'false');
+  }
+  function mvMenuItem(list, view, label, icon) {
+    var b = make('button', 'sp-mv-mi');
+    b.type = 'button';
+    b.setAttribute('role', 'menuitemradio');
+    var on = mv.view === view;
+    b.setAttribute('aria-checked', on ? 'true' : 'false');
+    b.appendChild(mvGlyph(icon));
+    b.appendChild(make('span', 'sp-mv-mil', label));
+    var tick = mvGlyph('c:checkmark', 'sp-mv-tick');
+    if (!on) tick.style.visibility = 'hidden';
+    b.appendChild(tick);
+    b.addEventListener('click', function (ev) {
+      ev.stopPropagation();
+      mvMenuClose();
+      mvShow(view, label);
+    });
+    list.appendChild(b);
+    return b;
+  }
+  function mvMenuToggle(flip, ev) {
+    if (ev) ev.stopPropagation();
+    if (mv.menu) { mvMenuClose(); return; }
+    mv.flip = flip || mv.flip;
+    var menu = make('div', 'sp-mv-menu');
+    menu.setAttribute('role', 'menu');
+    menu.setAttribute('aria-label', 'Views for this pane');
+    mvMenuItem(menu, 'feed', 'Feed', 'c:notebook');
+    mvMenuItem(menu, 'technical', 'Technical', 'c:chart--network');
+    mvMenuItem(menu, 'message', 'Message view', 'c:chat');
+    menu.appendChild(make('div', 'sp-mv-msep', '3JS scenes'));
+    var wait = make('div', 'sp-mv-mnote', 'asking the panel for its scenes...');
+    menu.appendChild(wait);
+    /* below the button when there is room, else above it (the tablet's
+       button sits low); a long scene list scrolls inside the menu only */
+    var r = mv.flip.getBoundingClientRect();
+    var tall = root.innerHeight || 690;
+    var below = tall - r.bottom - 12, above = r.top - 12;
+    menu.style.left = Math.max(8, Math.min(Math.round(r.left), (root.innerWidth || 1154) - 330)) + 'px';
+    if (below >= 300 || below >= above) {
+      menu.style.top = Math.round(r.bottom + 4) + 'px';
+      menu.style.maxHeight = Math.max(120, Math.round(below)) + 'px';
+    } else {
+      menu.style.bottom = Math.round(tall - r.top + 4) + 'px';
+      menu.style.maxHeight = Math.max(120, Math.round(above)) + 'px';
+    }
+    /* on the body: above the view host AND above a docked scene's lifted
+       carrier (the desk's controlFrame, z 2147483002) */
+    document.body.appendChild(menu);
+    mv.menu = menu;
+    mv.flip.setAttribute('aria-expanded', 'true');
+    mv.menuOff = function (e) {
+      if (e.type === 'keydown') { if (e.key === 'Escape') { e.stopPropagation(); mvMenuClose(); } return; }
+      if (mv.menu && !mv.menu.contains(e.target) && !(mv.flip && mv.flip.contains(e.target))) mvMenuClose();
+    };
+    document.addEventListener('pointerdown', mv.menuOff, true);
+    document.addEventListener('keydown', mv.menuOff, true);
+    var three = root.PineThreeFull;
+    if (!three || typeof three.list !== 'function') {
+      wait.textContent = 'the 3JS module is not loaded in this window';
+      return;
+    }
+    Promise.resolve(three.list()).then(function (got) {
+      if (mv.menu !== menu) return;
+      var rows = (got && got.rows) || [];
+      if (!got || !got.ok || !rows.length) {
+        wait.textContent = (got && got.why) || 'the panel has registered no scenes yet';
+        return;
+      }
+      menu.removeChild(wait);
+      rows.forEach(function (row) {
+        mvMenuItem(menu, 'scene:' + row.key, String(row.label || row.key), 'c:cube');
+      });
+    }, function () { if (mv.menu === menu) wait.textContent = 'the panel did not answer'; });
+  }
+
+  /* ------------------------------------------------------ switching views */
+  function mvPanes() {
+    if (mv.pane || !mv.left) return;
+    var feed = document.getElementById('spFeed');
+    var pane = make('div', 'sp-mv');
+    pane.id = 'spMsgView';
+    pane.style.display = 'none';
+    /* the Classic / Digital switch rides the pane's own header row (beside
+       the menu button), so the bubble keeps every pixel of a short pane */
+    var seg = make('div', 'sp-mv-seg');
+    seg.style.display = 'none';
+    seg.setAttribute('role', 'group');
+    seg.setAttribute('aria-label', 'Bubble style');
+    ['classic', 'digital'].forEach(function (style) {
+      var b = make('button', 'sp-mv-style', style === 'classic' ? 'Classic' : 'Digital');
+      b.type = 'button';
+      b.dataset.style = style;
+      b.setAttribute('aria-pressed', mv.style === style ? 'true' : 'false');
+      b.addEventListener('click', function (ev) {
+        ev.stopPropagation();
+        mvStyleSet(style);
+      });
+      seg.appendChild(b);
+    });
+    var head = mv.left.querySelector('.sp-feedhead');
+    if (head && mv.flip && mv.flip.parentNode === head) head.insertBefore(seg, mv.flip);
+    else pane.appendChild(seg);
+    mv.seg = seg;
+    mv.stage = make('div', 'sp-mv-stage');
+    pane.appendChild(mv.stage);
+    var scene = make('div', 'sp-mv-scene');
+    scene.id = 'spSceneHost';
+    scene.style.display = 'none';
+    scene.appendChild(make('div', 'sp-mv-scenenote', ''));
+    var anchor = feed || null;
+    mv.left.insertBefore(pane, anchor ? anchor.nextSibling : null);
+    mv.left.insertBefore(scene, pane.nextSibling);
+    mv.pane = pane;
+    mv.sceneBox = scene;
+  }
+  function mvStyleSet(style) {
+    mv.style = style === 'classic' ? 'classic' : 'digital';
+    try { localStorage.setItem('sp.mv.style', mv.style); } catch (e) { /* this session only */ }
+    if (mv.seg) {
+      var bs = mv.seg.querySelectorAll('.sp-mv-style');
+      for (var i = 0; i < bs.length; i += 1) {
+        bs[i].setAttribute('aria-pressed', bs[i].dataset.style === mv.style ? 'true' : 'false');
+      }
+    }
+    /* the item on air is drawn again in the chosen style, from its start */
+    if (mv.cur) mvBubbleStart(mv.cur.item, true);
+  }
+  function mvSet(el2, show) {
+    if (el2) el2.style.display = show ? '' : 'none';
+    if (el2 && el2 === mv.pane && mv.seg) mv.seg.style.display = show ? '' : 'none';
+  }
+  function mvShow(view, label) {
+    var was = mv.view;
+    if (was === view && (view.indexOf('scene:') !== 0 || mv.scene)) { if (mv.scene) mvSceneFit(); mvFlipPaint(); return; }
+    mvPanes();
+    if (was.indexOf('scene:') === 0 && was !== view) mvSceneDispose();
+    if (view === 'technical') {
+      mv.view = 'technical';
+      mvSet(mv.pane, false); mvSet(mv.sceneBox, false);
+      if (!techOn) technicalToggle();
+      mvFlipPaint();
+      return;
+    }
+    if (techOn) technicalToggle();          /* the technical face goes, by its own road */
+    mv.view = view;
+    var feed = document.getElementById('spFeed');
+    try { localStorage.setItem('sp.mv.view', view === 'message' ? 'message' : 'feed'); }
+    catch (e) { /* remembered this session only */ }
+    if (view === 'feed') {
+      mvSet(mv.pane, false); mvSet(mv.sceneBox, false); mvSet(feed, true);
+      mvHead('Feed', 'everything the station is doing');
+    } else if (view === 'message') {
+      mvSet(feed, false); mvSet(mv.sceneBox, false); mvSet(mv.pane, true);
+      mvHead('Message view', 'the element on air, as the roll made it');
+      mv.seenAt = 0;
+      mv.detectAt = 0;
+      mvKick();
+    } else {
+      mvSet(feed, false); mvSet(mv.pane, false); mvSet(mv.sceneBox, true);
+      mv.sceneLabel = label || view.slice(6);
+      mvHead(mv.sceneLabel, 'a 3JS scene, in this pane - the menu takes it down');
+      mvSceneOpen(view.slice(6), mv.sceneLabel);
+    }
+    mvFlipPaint();
+  }
+  /* Called from techShowFace: a name tapped in the script traces its line
+     here whatever the pane was showing, so the other faces step aside. */
+  function mvTechShown(on) {
+    if (mv.flip) mv.flip.pineMv = '';      /* techShowFace just wrote its own word on it */
+    if (on) {
+      if (mv.view.indexOf('scene:') === 0) mvSceneDispose();
+      mv.view = 'technical';
+      mvSet(mv.pane, false); mvSet(mv.sceneBox, false);
+    } else if (mv.view === 'technical') {
+      mv.view = 'feed';
+    }
+    mvFlipPaint();
+  }
+  function mvAttach(left, flip) {
+    if (mv.pane && !left.contains(mv.pane)) {   /* a fresh mount: the old panes went with the old page */
+      if (mv.scene) mvSceneDispose();
+      if (mv.seg && mv.seg.parentNode) mv.seg.parentNode.removeChild(mv.seg);
+      mv.pane = null; mv.stage = null; mv.sceneBox = null; mv.seg = null; mv.cur = null; mv.view = 'feed';
+    }
+    mv.left = left;
+    mv.flip = flip;
+    mvPanes();
+    mvFlipPaint();
+    var want = '';
+    try { want = localStorage.getItem('sp.mv.view') || ''; } catch (e) { want = ''; }
+    if (want === 'message') mvShow('message');
+  }
+
+  /* ------------------------------------------------------ 3JS in the pane */
+  function mvSceneNote(text) {
+    var n = mv.sceneBox && mv.sceneBox.querySelector('.sp-mv-scenenote');
+    if (n) n.textContent = text;
+  }
+  function mvSceneOpen(key, label) {
+    var three = root.PineThreeFull;
+    mv.sceneGen += 1;
+    var gen = mv.sceneGen;
+    if (!three || typeof three.show !== 'function') {
+      mvSceneNote('the 3JS module is not loaded in this window');
+      return;
+    }
+    mvSceneNote('opening ' + label + '...');
+    /* one scene at a time: the last one is closed and its WebGL lost first */
+    Promise.resolve(mv.disposing).then(function () {
+      if (gen !== mv.sceneGen) return null;
+      return three.show(key);
+    }).then(function (said) {
+      if (said === null) return;
+      var ok = String(said) === String(key);
+      if (gen !== mv.sceneGen || mv.view !== 'scene:' + key) {
+        if (ok) mvSceneClose({key: key, local: mvLocal(three), el: null});
+        return;
+      }
+      if (!ok) { mvSceneNote(String(said || 'the scene did not open')); return; }
+      mv.scene = {key: key, label: label, local: mvLocal(three), el: null, parent: null, next: null};
+      mvSceneNote(label + ' - if the scene closed itself, pick it again from the menu');
+      mvSceneDock();
+    });
+  }
+  function mvLocal(three) {
+    try { return !!(three._registerIsHere && three._registerIsHere()); } catch (e) { return false; }
+  }
+  function mvCarrier() {
+    var three = root.PineThreeFull;
+    var frame = null;
+    try { frame = three && three._frame ? three._frame() : null; } catch (e) { frame = null; }
+    var node = frame ? frame.parentNode : null;
+    while (node && node.classList) {
+      if (node.classList.contains('view')) return node;
+      node = node.parentNode;
+    }
+    return frame;
+  }
+  function mvSceneFit() {
+    var s = mv.scene;
+    if (!s || !mv.sceneBox) return;
+    var r = mv.sceneBox.getBoundingClientRect();
+    var seen = r.width > 20 && r.height > 20;
+    if (s.local) {
+      try { root.dispatchEvent(new Event('resize')); } catch (e) { /* old engine */ }
+      return;
+    }
+    var three = root.PineThreeFull;
+    if (!three || !three._lifted || !three._lifted()) return;   /* the X closed it over there */
+    var c = mvCarrier();
+    if (!c || !c.style) return;
+    c.style.display = seen ? 'block' : 'none';
+    if (!seen) return;
+    c.style.left = Math.round(r.left) + 'px';
+    c.style.top = Math.round(r.top) + 'px';
+    c.style.width = Math.round(r.width) + 'px';
+    c.style.height = Math.round(r.height) + 'px';
+    c.style.right = 'auto';
+    c.style.bottom = 'auto';
+  }
+  function mvSceneDock() {
+    var s = mv.scene;
+    if (!s || !mv.sceneBox) return;
+    if (s.local) {
+      var n = document.querySelector('.p3-full');
+      if (n) {
+        s.el = n;
+        s.parent = n.parentNode;
+        s.next = n.nextSibling;
+        n.classList.add('sp-scene-docked');
+        mv.sceneBox.appendChild(n);
+      }
+      document.body.classList.remove('p3-on');
+      document.body.classList.add('sp-scene-on');
+    }
+    var fit = 0;
+    var later = function () {
+      if (fit) return;
+      fit = root.requestAnimationFrame(function () { fit = 0; mvSceneFit(); });
+    };
+    if (typeof root.ResizeObserver === 'function') {
+      mv.sceneRO = new root.ResizeObserver(later);
+      mv.sceneRO.observe(mv.sceneBox);
+    }
+    s.onWin = later;
+    root.addEventListener('resize', later);
+    mvSceneFit();
+  }
+  function mvLoseGL(list) {
+    var n = 0;
+    (list || []).forEach(function (cv) {
+      try {
+        var g = cv.getContext('webgl2') || cv.getContext('webgl');
+        var x = g && g.getExtension('WEBGL_lose_context');
+        if (x) { x.loseContext(); n += 1; }
+      } catch (e) { /* a 2d canvas, or already gone */ }
+    });
+    return n;
+  }
+  function mvSceneDispose() {
+    var s = mv.scene;
+    mv.scene = null;
+    mv.sceneGen += 1;
+    if (mv.sceneRO) { try { mv.sceneRO.disconnect(); } catch (e) { /* gone */ } }
+    mv.sceneRO = null;
+    if (s && s.onWin) root.removeEventListener('resize', s.onWin);
+    mvSceneNote('');
+    /* still opening (s null): the open's own .then() closes it when it lands */
+    if (s) {
+      var going = mv.disposing = mvSceneClose(s).then(null, function () { return ''; });
+      going.then(function () { if (mv.disposing === going) mv.disposing = null; });
+    }
+    return mv.disposing;
+  }
+  function mvSceneClose(s) {
+    var three = root.PineThreeFull;
+    if (!three) return Promise.resolve('');
+    if (s.local) {
+      var el2 = s.el || document.querySelector('.p3-full');
+      var cans = el2 ? [].slice.call(el2.querySelectorAll('canvas')) : [];
+      return Promise.resolve(three.close()).then(null, function () { return ''; }).then(function () {
+        if (el2) {
+          el2.classList.remove('sp-scene-docked');
+          if (mv.sceneBox && el2.parentNode === mv.sceneBox) {
+            if (s.parent && s.parent.isConnected) {
+              s.parent.insertBefore(el2, s.next && s.next.parentNode === s.parent ? s.next : null);
+            } else { mv.sceneBox.removeChild(el2); }
+          }
+        }
+        try { if (typeof root.pine3JSAllOff === 'function') root.pine3JSAllOff(); } catch (e) { /* the panel's own */ }
+        document.body.classList.remove('sp-scene-on');
+        mv.lostGL = mvLoseGL(cans);
+        return 'closed';
+      });
+    }
+    var frame = null;
+    try { frame = three._frame ? three._frame() : null; } catch (e) { frame = null; }
+    var run = function (src) {
+      try { return frame && frame.executeJavaScript ? Promise.resolve(frame.executeJavaScript(src)) : Promise.resolve(null); }
+      catch (e) { return Promise.resolve(null); }
+    };
+    var grab = '(function(){var n=document.querySelector(".p3-full");window.__spSceneC='
+      + 'n?[].slice.call(n.querySelectorAll("canvas")):[];return window.__spSceneC.length;})()';
+    var lose = '(function(){try{if(typeof pine3JSAllOff==="function")pine3JSAllOff();}catch(e){}'
+      + 'var c=window.__spSceneC||[];window.__spSceneC=null;var n=0;c.forEach(function(x){try{'
+      + 'var g=x.getContext("webgl2")||x.getContext("webgl");var l=g&&g.getExtension("WEBGL_lose_context");'
+      + 'if(l){l.loseContext();n+=1;}}catch(e){}});return n;})()';
+    return run(grab).then(null, function () { return null; }).then(function () {
+      return Promise.resolve(three.close()).then(null, function () { return ''; });
+    }).then(function () { return run(lose); }).then(function (n) {
+      mv.lostGL = Number(n) || 0;
+      return 'closed';
+    }, function () { return 'closed'; });
+  }
+
+  /* ------------------------------------------------------ what is on air */
+  function mvState() {
+    try { return (root.PineStationFeed && root.PineStationFeed.state && root.PineStationFeed.state()) || null; }
+    catch (e) { return null; }
+  }
+  /* the feed's own row for a line: it carries the system3 stamp, sfx_roll,
+     product and round that the screenplay's element does not */
+  function mvFeedRow(lid) {
+    var rows = [];
+    try { rows = (root.PineStationFeed && root.PineStationFeed.rows && root.PineStationFeed.rows()) || []; }
+    catch (e) { rows = []; }
+    for (var i = rows.length - 1; i >= 0; i -= 1) {
+      if (rows[i] && String(rows[i].id || rows[i].line || '') === lid) return rows[i];
+    }
+    return null;
+  }
+  function mvMerge(a, b) {
+    var out = {}, k;
+    for (k in (a || {})) if (Object.prototype.hasOwnProperty.call(a, k)) out[k] = a[k];
+    for (k in (b || {})) if (Object.prototype.hasOwnProperty.call(b, k) && b[k] != null && b[k] !== '') out[k] = b[k];
+    return out;
+  }
+  function mvDetect() {
+    var lid = String(sayingLineId || '');
+    var said = String(sayingSaid || '').split('\u0001');
+    var name = said[0] || '';
+    var body = said.length > 1 ? said.slice(1).join(' ') : '';
+    var st = mvState() || {};
+    if (lid) {
+      var node = lineNode(lid);
+      var src = mvMerge(sayingSource({id: lid}, node) || {}, mvFeedRow(lid));
+      var who = String(src.who || '').toLowerCase();
+      var kind = String(src.kind || '').toLowerCase();
+      var dialogue = !!(node && /sp-dialogue/.test(node.className || ''));
+      var clip = !dialogue && (who === 'board' || /^(sfx|sting|clip|music)$/.test(kind) || !!node);
+      return {key: 'l:' + lid, kind: clip ? 'clip' : 'speech', lid: lid, row: src,
+        who: who, name: clip ? 'CLIP' : (name || String(src.name || who || 'ON AIR')),
+        text: mvPlain(body || src.text || ''), round: String(src.round || ''), kindOf: kind};
+    }
+    var live = null;
+    try { live = root.PineLive && root.PineLive.state ? root.PineLive.state() : null; } catch (e) { live = null; }
+    if (live && live.live) {
+      return {key: 'live', kind: 'live', name: 'LIVE SET', text: String(live.title || 'the live set on air')};
+    }
+    var now = st.now || {};
+    if (st.playing && now.title) {
+      return {key: 'r:' + String(now.id || now.title), kind: 'record', name: 'RECORD',
+        text: String(now.title) + (now.artist ? ' / ' + String(now.artist) : '')};
+    }
+    return {key: 'idle:' + name, kind: 'idle', name: name || '', text: mvPlain(body) || 'The room is quiet.'};
+  }
+  function mvProgress(item) {
+    if (!item) return null;
+    if (item.kind === 'speech' || item.kind === 'clip') {
+      var f = null;
+      var at = null, rows = null;
+      if (tlNow && tlNow.src) { at = Number(tlNow.src.at); rows = tlNow.rows || []; }
+      var find = function (list, pos) {
+        for (var i = 0; i < (list || []).length; i += 1) {
+          var r = list[i] || {};
+          if (String(r.id || r.line_id || '') !== item.lid) continue;
+          var from = Number(r.from), until = Number(r.until);
+          if (isFinite(from) && isFinite(until) && until > from) return (pos - from) / (until - from);
+        }
+        return null;
+      };
+      if (rows) f = find(rows, at);
+      if (f === null && tlNow && tlNow.model && tlNow.model.total && !(rows && rows.length)) f = tlNow.model.fraction;
+      if (f === null && liveStream && liveStream.rows) {
+        f = find(liveStream.rows, (Date.now() + skewMs) / 1000 - Number(liveStream.at || 0));
+      }
+      return f === null ? null : Math.max(0, Math.min(1, f));
+    }
+    if (item.kind === 'record') {
+      var p = el('musicPlayer');
+      if (p && isFinite(p.duration) && p.duration > 0) {
+        item.clock = clock(p.currentTime) + ' / ' + clock(p.duration);
+        return Math.max(0, Math.min(1, p.currentTime / p.duration));
+      }
+      var seek = el('spSeek');
+      if (seek && seek.value) {
+        var a = el('spAt'), b = el('spLen');
+        item.clock = (a && b && a.textContent) ? a.textContent + ' / ' + b.textContent : '';
+        return Math.max(0, Math.min(1, Number(seek.value) / 1000));
+      }
+    }
+    return null;
+  }
+
+  /* ------------------------------------------------------ System 3's record */
+  function mvStageOf(ev, name) {
+    var st = (ev && ev.stages) || [];
+    for (var i = 0; i < st.length; i += 1) if (st[i] && st[i].stage === name) return st[i];
+    return null;
+  }
+  function mvReel(stg, fallbackDice) {
+    var cands = (stg && stg.candidates) || [];
+    var opts = [], hit = 0;
+    for (var i = 0; i < cands.length; i += 1) {
+      var c = cands[i] || {};
+      opts.push(String(c.label || c.id || ''));
+      if (String(c.id) === String(stg.selected)) hit = i;
+    }
+    return {dice: stg && stg.draw && stg.draw.dice != null ? stg.draw.dice : fallbackDice,
+      opts: opts, hit: hit, label: opts[hit] || String((stg && stg.selected) || ''),
+      of: opts.length, stage: String((stg && stg.stage) || '')};
+  }
+  function mvDecisionRow(ev) {
+    var st = (ev && ev.stages) || [];
+    var reels = [], drawn = null, i;
+    for (i = 0; i < st.length; i += 1) {
+      var s = st[i] || {};
+      if (s.draw && s.draw.dice != null && !drawn) drawn = s;
+      if (s.stage !== 'table' && (s.candidates || []).length > 1 && s.selected != null) reels.push(s);
+    }
+    var rng = ev && ev.rng && ev.rng.dice != null ? ev.rng.dice : null;
+    if (!drawn && rng === null) return null;                /* decided by a rule: not a roll */
+    var dice = drawn ? drawn.draw.dice : rng;
+    var cat = mvStageOf(ev, 'category');
+    var item = mvStageOf(ev, 'item');
+    var main = null, sub = null;
+    if (cat && (cat.candidates || []).length > 1) { main = cat; sub = item && (item.candidates || []).length > 1 ? item : null; }
+    else if (item && (item.candidates || []).length > 1) {
+      main = item;
+      var k = reels.indexOf(item);
+      sub = k >= 0 && reels[k + 1] ? reels[k + 1] : null;
+    } else { main = reels[0] || null; sub = reels[1] || null; }
+    var sel = (ev && ev.selected) || {};
+    var landed = String(sel.label || sel.id || (drawn && drawn.selected) || '');
+    return {fam: String(ev.family || ''), table: String(sel.table || ev.family || ''),
+      event: String(ev.event_id || ''),
+      main: main ? mvReel(main, dice) : {dice: dice, opts: [landed], hit: 0, label: landed, of: 1, stage: ''},
+      sub: sub ? mvReel(sub, null) : null};
+  }
+  function mvCounted(fam, table, one, two) {
+    var mk = function (x) {
+      if (!x) return null;
+      return {dice: x.dice != null ? x.dice : null, opts: [String(x.label || '')], hit: 0,
+        label: String(x.label || ''), index: Number(x.index) || 0, of: Number(x.of) || 0, counted: true};
+    };
+    return {fam: fam, table: table, event: '', main: mk(one), sub: mk(two)};
+  }
+  function mvRowsOf(item, ans, decisions) {
+    var rows = [], i;
+    var lid = item.lid;
+    var media = null;
+    var obs = (ans && ans.observations) || [];
+    for (i = 0; i < obs.length; i += 1) {
+      var m = obs[i] && obs[i].media;
+      if (m && m[lid]) { media = m[lid]; break; }
+    }
+    var sfx = (item.row && item.row.sfx_roll) || (media && media.sfx_roll) || null;
+    if (sfx && (sfx.category || sfx.clip)) {
+      /* the clip's roll: only label, index and "of" were recorded - the
+         reel counts through the positions, it does not invent names */
+      rows.push(mvCounted('SFX', String(sfx.road || 'SFX'), sfx.category, sfx.clip));
+      return rows;
+    }
+    var listen = media && media.listening;
+    if (listen && listen.pick) {
+      var cands = [];
+      for (i = 0; i < obs.length; i += 1) {
+        if (obs[i] && obs[i].key === 'listen.pick' && obs[i].candidates) { cands = obs[i].candidates; break; }
+      }
+      var seam = listen.seam || {};
+      rows.push({fam: 'STATION', table: 'listen', event: '',
+        main: {dice: seam.dice, opts: ['the turn runs on', 'a listening response'], hit: seam.hit ? 1 : 0,
+          label: seam.hit ? 'a listening response' : 'the turn runs on', of: 2},
+        sub: {dice: listen.pick.dice, opts: cands.length ? cands.map(String) : [String(listen.pick.picked || '')],
+          hit: Math.max(0, (Number(listen.pick.index) || 1) - 1), label: String(listen.pick.picked || ''),
+          of: Number(listen.pick.of) || cands.length}});
+      return rows;
+    }
+    var only = ans && ans.sfxguy ? 'SFXGUY' : '';
+    for (i = 0; i < (decisions || []).length; i += 1) {
+      var ev = decisions[i];
+      if (!ev || (only && ev.family !== only)) continue;
+      var r = mvDecisionRow(ev);
+      if (r) rows.push(r);
+    }
+    rows.sort(function (a, b) { return (a.fam === 'ES' ? 0 : 1) - (b.fam === 'ES' ? 0 : 1); });
+    return rows;
+  }
+  function mvSources(item, ans, turn, decisions) {
+    var got = Object.create(null);
+    var row = item.row || {};
+    var st = mvState() || {};
+    var subject = (turn && turn.state_before && turn.state_before.subject) || {};
+    var cat = String(subject.category || '');
+    var i;
+    if (cat === 'speakerbox') got.speakerbox = (subject.sources || []).join(', ') || 'the seed passage';
+    var sb = (turn && turn.speakerbox) || [];
+    for (i = 0; i < sb.length; i += 1) {
+      if (sb[i] && sb[i].hit && sb[i].material) got.speakerbox = String(sb[i].material.file || 'a passage');
+    }
+    if (item.kind === 'clip' || item.who === 'sfxguy' || row.sfx_roll || (turn && turn.sfx && turn.sfx.play)) got.sfx = 'a clip';
+    if (cat === 'angle' || cat === 'free' || cat === 'own_material' || subject.active_angle) got.topic = String(subject.active_angle || subject.topic || 'the topic').slice(0, 80);
+    if (cat === 'internet_news') got.internet = 'the news wire';
+    for (i = 0; i < (decisions || []).length; i += 1) {
+      var ev = decisions[i] || {};
+      var sel = ev.selected || {};
+      if (ev.family === 'TOPIC') got.topic = String(sel.label || 'the topics board');
+      if (ev.family === 'MEMORY' && sel.id) {
+        got.memory = String(sel.label || 'memory');
+        if (/manager/.test(String(sel.id))) got.manager = 'the manager\'s last word';
+      }
+      if (ev.family === 'SFXGUY' && ans && ans.sfxguy && sel.kind === 'news') got.internet = 'a story off the wire';
+    }
+    if (item.round === 'manager' || row.kind === 'manager') got.manager = 'a message from upstairs';
+    if (item.round === 'ad' || row.kind === 'ad' || row.ad_id) got.ads = 'the ad break';
+    if (row.product) got.products = String(row.product).slice(0, 80);
+    else if (got.ads && st.selling_now && (st.selling_now.kind === 'ad' || st.selling_now.kind === 'hawk')) {
+      got.products = String(st.selling_now.title || 'the piece on sale');
+    }
+    var main = '';
+    /* the MAIN source: the road that sells, else what seeded the subject,
+       else the road itself, else the first that fed it */
+    var road = String((ans && ans.conversation && ans.conversation.road) || '');
+    var pref = got.ads ? 'ads' : got.products && row.kind === 'hawk' ? 'products'
+      : item.kind === 'clip' && got.sfx ? 'sfx' : cat === 'internet_news' && got.internet ? 'internet'
+      : cat === 'speakerbox' && got.speakerbox ? 'speakerbox'
+      : got.manager && (road === 'manager' || item.round === 'manager') ? 'manager' : '';
+    if (pref) main = pref;
+    else {
+      for (i = 0; i < MV_SRC_ORDER.length; i += 1) if (got[MV_SRC_ORDER[i]]) { main = MV_SRC_ORDER[i]; break; }
+    }
+    var others = [];
+    for (i = 0; i < MV_SRC_ORDER.length; i += 1) {
+      var k = MV_SRC_ORDER[i];
+      if (got[k] && k !== main) others.push(k);
+    }
+    return {main: main, others: others, why: got};
+  }
+  function mvAsk(item) {
+    var lid = item.lid;
+    if (!lid) return Promise.resolve(null);
+    var have = mv.answers[lid];
+    if (have) return have;
+    var p = Promise.resolve().then(function () {
+      return s3Request('/api/system3/line?line_id=' + encodeURIComponent(lid));
+    }).then(null, function () { return null; }).then(function (ans) {
+      var turn = ans && ans.turn || null;
+      var decisions = (ans && ans.decisions) || [];
+      /* cover_a's finding: a ledger row may carry a neighbour's dice; the
+         line's own system3 stamp names its turn, and wins. */
+      var stamp = String((item.row && item.row.system3 && item.row.system3.turn_id) || '');
+      var told = String((turn && turn.turn_id) || (ans && ans.line && ans.line.turn_id) || '');
+      var cid = String((item.row && item.row.system3 && item.row.system3.conversation_id)
+        || (ans && ans.line && ans.line.conversation_id) || '');
+      if (!stamp || !told || stamp === told || !cid) return {ans: ans, turn: turn, decisions: decisions};
+      var conv = mv.convs[cid] || (mv.convs = Object.create(null), mv.convs[cid] = Promise.resolve().then(function () {
+        return s3Request('/api/system3/conversation/' + encodeURIComponent(cid));
+      }).then(null, function () { return null; }));
+      return conv.then(function (c) {
+        if (!c) return {ans: ans, turn: turn, decisions: decisions};
+        var t = null, evs = [];
+        (c.turns || []).forEach(function (x) { if (x && x.turn_id === stamp) t = x; });
+        (c.decision_events || []).forEach(function (e) { if (e && e.turn_id === stamp) evs.push(e); });
+        return {ans: ans, turn: t || turn, decisions: evs.length ? evs : decisions, restamped: told};
+      });
+    }).then(function (got) {
+      var ans = got && got.ans;
+      var out = {rows: mvRowsOf(item, ans, got && got.decisions),
+        sources: mvSources(item, ans, got && got.turn, got && got.decisions),
+        cid: String((ans && ans.line && ans.line.conversation_id) || ''),
+        tid: String((got && got.turn && got.turn.turn_id) || ''), restamped: got && got.restamped || ''};
+      return out;
+    });
+    mv.answers[lid] = p;
+    mv.answerOrder.push(lid);
+    while (mv.answerOrder.length > 24) delete mv.answers[mv.answerOrder.shift()];
+    return p;
+  }
+
+  /* ------------------------------------------------------ the bubble */
+  function mvSide(item) {
+    if (item.kind === 'record' || item.kind === 'live' || item.kind === 'idle' || item.kind === 'clip') return 'mid';
+    return /^(cohost|caller|caller2|guest)$/.test(item.who || '') ? 'right' : 'left';
+  }
+  function mvKindIcon(item) {
+    if (item.kind === 'record') return 'c:music';
+    if (item.kind === 'live') return 'c:audio-console';
+    if (item.kind === 'clip') return 'c:volume--up--filled';
+    if (item.who === 'sfxguy') return 'c:bot';
+    if (/call/.test(item.kindOf || '') || /^caller/.test(item.who || '')) return 'c:phone';
+    return 'c:microphone';
+  }
+  function mvDex(reel) {
+    var box = make('span', 'sp-mv-dex');
+    var list = make('span', 'sp-mv-dexreel');
+    box.appendChild(list);
+    var rolled = [];
+    if (reel.counted) {
+      list.appendChild(make('span', 'sp-mv-dexi', reel.label));
+    } else {
+      var o = reel.opts.length ? reel.opts : [reel.label];
+      var passes = o.length > 40 ? 1 : 2;
+      for (var p = 0; p < passes; p += 1) rolled = rolled.concat(o);
+      rolled = rolled.concat(o.slice(0, reel.hit + 1));
+      rolled.forEach(function (t, i) {
+        list.appendChild(make('span', 'sp-mv-dexi' + (i === rolled.length - 1 ? ' hit' : ''), t));
+      });
+    }
+    box.reelN = Math.max(1, rolled.length || 1);
+    box.list = list;
+    box.reel = reel;
+    return box;
+  }
+  function mvRowDom(r) {
+    var fam = MV_FAM[r.fam] || '#68ced9';
+    var wrap = make('div', 'sp-mv-rowset');
+    wrap.style.setProperty('--fam', fam);
+    var row = make('div', 'sp-mv-row');
+    var die = make('span', 'sp-mv-die');
+    die.appendChild(mvGlyph('c:cube'));
+    row.appendChild(die);
+    var num = make('span', 'sp-mv-num', '#');
+    num.title = r.fam + (r.main.dice != null ? ' - d100 ' + r.main.dice + ' (recorded)' : ' - no random number');
+    row.appendChild(num);
+    var dex = mvDex(r.main);
+    row.appendChild(dex);
+    var ok = mvGlyph('c:checkmark', 'sp-mv-ok');
+    row.appendChild(ok);
+    var tag = make('span', 'sp-mv-tag', r.table || r.fam);
+    row.appendChild(tag);
+    wrap.appendChild(row);
+    var parts = {wrap: wrap, row: row, die: die, num: num, dex: dex, ok: ok, r: r};
+    if (r.sub) {
+      var sub = make('div', 'sp-mv-row sp-mv-sub');
+      var snum = make('span', 'sp-mv-num', '#');
+      sub.appendChild(snum);
+      var sdex = mvDex(r.sub);
+      sub.appendChild(sdex);
+      wrap.appendChild(sub);
+      parts.sub = sub; parts.snum = snum; parts.sdex = sdex;
+    }
+    return parts;
+  }
+  function mvStatic(r) {
+    var line = make('button', 'sp-mv-resrow');
+    line.type = 'button';
+    line.style.setProperty('--fam', MV_FAM[r.fam] || '#68ced9');
+    line.appendChild(make('b', '', r.table || r.fam));
+    line.appendChild(make('span', 'sp-mv-resd', r.main.dice != null ? String(r.main.dice) : '-'));
+    line.appendChild(make('span', 'sp-mv-resl', r.main.label + (r.main.of > 1 ? ' (' + (r.main.hit + 1) + ' of ' + r.main.of + ')' : '')));
+    if (r.sub) {
+      line.appendChild(make('span', 'sp-mv-resd', r.sub.dice != null ? String(r.sub.dice) : '-'));
+      line.appendChild(make('span', 'sp-mv-resl', r.sub.label));
+    }
+    return line;
+  }
+  function mvBubbleStart(item, redraw) {
+    var stage = mv.stage;
+    if (!stage) return;
+    if (mv.cur && !redraw) mvRetire(mv.cur);
+    if (redraw && mv.cur && mv.cur.node && mv.cur.node.parentNode) mv.cur.node.parentNode.removeChild(mv.cur.node);
+    var style = mv.style;
+    var node = make('div', 'sp-mv-item sp-mv-' + mvSide(item) + ' sp-mv-' + style + ' sp-mv-k-' + item.kind);
+    var acc = make('div', 'sp-mv-acc');
+    acc.hidden = true;
+    var accRing = make('span', 'sp-mv-accring');
+    var accReel = make('span', 'sp-mv-accreel');
+    accRing.appendChild(accReel);
+    acc.appendChild(accRing);
+    var accSmall = make('span', 'sp-mv-accsmall');
+    acc.appendChild(accSmall);
+    node.appendChild(acc);
+    var bubble = make('div', 'sp-mv-bubble');
+    var head = make('div', 'sp-mv-who');
+    head.appendChild(mvGlyph(mvKindIcon(item)));
+    head.appendChild(make('b', '', item.name || ''));
+    var tail = make('i', 'sp-mv-clock', '');
+    head.appendChild(tail);
+    bubble.appendChild(head);
+    var rolls = make('div', 'sp-mv-rolls');
+    bubble.appendChild(rolls);
+    var textBox = make('div', 'sp-mv-text');
+    var text = make('span', 'sp-mv-words', '');
+    textBox.appendChild(text);
+    bubble.appendChild(textBox);
+    var bar = make('div', 'sp-mv-load');
+    var fill = make('i', '', '');
+    bar.appendChild(fill);
+    bubble.appendChild(bar);
+    node.appendChild(bubble);
+    var tab = make('button', 'sp-mv-result');
+    tab.type = 'button';
+    tab.hidden = true;
+    tab.appendChild(make('span', '', 'Result'));
+    tab.appendChild(mvGlyph('c:chevron--down', 'sp-mv-chev'));
+    var all = make('div', 'sp-mv-all');
+    all.hidden = true;
+    tab.addEventListener('click', function (ev) {
+      ev.stopPropagation();
+      all.hidden = !all.hidden;
+      tab.classList.toggle('open', !all.hidden);
+    });
+    node.appendChild(tab);
+    node.appendChild(all);
+    stage.appendChild(node);
+    var cur = {item: item, node: node, style: style, t0: 0, data: null, parts: [], plan: null,
+      acc: acc, accReel: accReel, accSmall: accSmall, rolls: rolls, text: text, fill: fill,
+      tab: tab, all: all, clock: tail, typed: -1, phase: 'wait', began: Date.now(), f0: null};
+    mv.cur = cur;
+    var still = false;
+    try { still = !!(root.matchMedia && root.matchMedia('(prefers-reduced-motion: reduce)').matches); } catch (e) { still = false; }
+    cur.still = still;
+    if (item.kind === 'speech' || item.kind === 'clip') {
+      /* waiting for System 3: the dice tumble with no number until the record lands */
+      var wait = make('div', 'sp-mv-waiting');
+      wait.appendChild(mvGlyph('c:cube', 'sp-mv-spin'));
+      wait.appendChild(make('span', '', 'asking System 3 how this was rolled...'));
+      rolls.appendChild(wait);
+      cur.waitDie = wait.firstChild;
+      mvAsk(item).then(function (data) { if (mv.cur === cur) mvPlan(cur, data || {rows: [], sources: {main: '', others: []}}); });
+    } else {
+      mvPlan(cur, {rows: [], sources: {main: '', others: []}});
+    }
+    /* history: two finished bubbles stay above, the rest leave */
+    var kids = stage.querySelectorAll('.sp-mv-item');
+    for (var i = 0; i < kids.length - 3; i += 1) stage.removeChild(kids[i]);
+  }
+  function mvRetire(cur) {
+    if (!cur || !cur.node) return;
+    cur.node.classList.add('sp-mv-past');
+    if (cur.item.kind === 'speech') cur.text.textContent = cur.item.text;
+    cur.text.classList.remove('typing');
+    cur.fill.style.width = '100%';
+    cur.phase = 'done';
+  }
+  function mvPlan(cur, data) {
+    cur.data = data;
+    cur.rolls.textContent = '';
+    var rows = (data.rows || []).slice(0, 6);
+    var shown = [];
+    if (cur.style === 'digital') {
+      rows.forEach(function (r) {
+        var parts = mvRowDom(r);
+        parts.wrap.style.display = 'none';
+        cur.rolls.appendChild(parts.wrap);
+        shown.push(parts);
+      });
+    } else {
+      var strip = make('div', 'sp-mv-seed');
+      rows.forEach(function (r) {
+        var d = make('span', 'sp-mv-sdie');
+        d.style.setProperty('--fam', MV_FAM[r.fam] || '#68ced9');
+        var n = make('b', '', '#');
+        d.appendChild(n);
+        d.appendChild(make('i', '', r.table || r.fam));
+        d.title = r.fam + ' - ' + r.main.label + (r.sub ? ' / ' + r.sub.label : '')
+          + (r.main.dice != null ? ' - d100 ' + r.main.dice : '');
+        strip.appendChild(d);
+        shown.push({die: d, num: n, r: r});
+      });
+      if (rows.length) cur.rolls.appendChild(strip);
+    }
+    (data.rows || []).forEach(function (r) {
+      var line = mvStatic(r);
+      if (r.event && data.cid) {
+        line.addEventListener('click', function (ev) {
+          ev.stopPropagation();
+          feedDiceOpen({conversation_id: data.cid, turn_id: data.tid}, {event_id: r.event}, cur.item.lid);
+        });
+      }
+      cur.all.appendChild(line);
+    });
+    if (data.restamped) cur.all.appendChild(make('p', 'sp-mv-note', 'the line\'s own System 3 stamp named its turn; the ledger row said ' + data.restamped));
+    if (!(data.rows || []).length && (cur.item.kind === 'speech' || cur.item.kind === 'clip')) {
+      cur.all.appendChild(make('p', 'sp-mv-note', 'no System 3 table was rolled for this line'));
+    }
+    cur.parts = shown;
+    /* a short pane (the tablet's is ~160 px): as many tables as fit stay in
+       the bubble while it rolls, and the words keep their newest lines */
+    var room = (mv.stage && mv.stage.clientHeight) || 300;
+    cur.fit = Math.max(1, Math.min(3, Math.floor((room - 80) / 64)));
+    cur.node.style.setProperty('--mv-lines', String(Math.max(2, Math.min(8, Math.floor((room - 110) / 22)))));
+    /* THE PLAN, in ms from the start: fast - a few seconds - then the air */
+    /* fast: the whole roll inside ~40% of the item (1.4 - 3.4 s), so the
+       words still have the audio to follow */
+    var t = 0, plan = [];
+    var durMs = (tlNow && tlNow.model && tlNow.model.total) ? tlNow.model.total * 1000 : 0;
+    var budget = durMs ? Math.max(1400, Math.min(3400, durMs * 0.4)) : 3000;
+    var perRow = cur.style === 'digital' ? 1700 : 0;
+    var scale = 1;
+    if (cur.style === 'digital' && rows.length) scale = Math.min(1, (budget * 0.7) / (rows.length * perRow));
+    shown.forEach(function (p, i) {
+      if (cur.style === 'digital') {
+        var d1 = 300 * scale, d2 = 650 * scale, d3 = 250 * scale, d4 = 500 * scale;
+        plan.push({p: p, at: t, d1: d1, d2: d2, d3: p.sub ? d3 : 0, d4: p.sub ? d4 : 0});
+        t += d1 + d2 + (p.sub ? d3 + d4 : 0) + 60 * scale;
+      } else {
+        var gap = Math.min(140, (budget * 0.5 - 450) / Math.max(1, shown.length));
+        plan.push({p: p, at: i * gap, d1: 450});
+        t = Math.max(t, i * gap + 450);
+      }
+    });
+    cur.rollEnd = t;
+    cur.collapseEnd = t + (cur.style === 'digital' && rows.length ? Math.round(budget * 0.08) : 150);
+    var src = data.sources || {main: '', others: []};
+    cur.src = src;
+    cur.accEnd = cur.collapseEnd + (cur.style === 'digital' && src.main ? Math.round(budget * 0.22) : 0);
+    cur.plan = plan;
+    if (cur.style === 'digital' && src.main) {
+      var ring = MV_SRC_ORDER.concat(MV_SRC_ORDER);
+      var stop = MV_SRC_ORDER.indexOf(src.main);
+      ring = ring.concat(MV_SRC_ORDER.slice(0, stop + 1));
+      ring.forEach(function (k, i) {
+        var cell = mvGlyph(MV_SRC[k][0], 'sp-mv-acccell' + (i === ring.length - 1 ? ' hit' : ''));
+        cur.accReel.appendChild(cell);
+      });
+      cur.accN = ring.length;
+      src.others.forEach(function (k) {
+        var s = mvGlyph(MV_SRC[k][0], 'sp-mv-accmini');
+        s.title = MV_SRC[k][1] + ': ' + String(src.why[k] || '');
+        cur.accSmall.appendChild(s);
+      });
+      cur.acc.title = 'Main source: ' + MV_SRC[src.main][1] + ' - ' + String(src.why[src.main] || '')
+        + (src.others.length ? '. Also fed by: ' + src.others.map(function (k) { return MV_SRC[k][1]; }).join(', ') : '');
+      cur.acc.setAttribute('aria-label', cur.acc.title);
+    }
+    /* joined late (the line is well under way): land everything now */
+    var f = mvProgress(cur.item);
+    if (cur.still || (f !== null && f > 0.35)) cur.skip = true;
+    cur.t0 = 0;
+    cur.phase = 'roll';
+  }
+  function mvEase(x) { x = Math.max(0, Math.min(1, x)); return 1 - Math.pow(1 - x, 3); }
+  function mvFace(r, k) { return String(1 + ((Number(r.dice || 0) * 37 + k * 53) % 100)); }
+  function mvDexAt(dex, x) {
+    var reel = dex.reel;
+    if (reel.counted) {
+      var n = x >= 1 ? reel.label : (reel.of ? Math.max(1, Math.round(mvEase(x) * reel.index)) + ' of ' + reel.of : reel.label);
+      if (dex.list.firstChild && dex.list.firstChild.textContent !== n) dex.list.firstChild.textContent = n;
+      return;
+    }
+    var y = -Math.round(mvEase(x) * (dex.reelN - 1) * MV_ROW_H);
+    var tr = 'translateY(' + y + 'px)';
+    if (dex.list.style.transform !== tr) dex.list.style.transform = tr;
+  }
+  function mvNum(numEl, r, x) {
+    var v = r.dice == null ? '-' : (x >= 1 ? String(r.dice) : mvFace(r, Math.floor(x * 9)));
+    if (numEl.textContent !== v) numEl.textContent = v;
+  }
+  function mvRollAt(cur, ms) {
+    var skip = !!cur.skip;
+    cur.plan.forEach(function (s) {
+      var p = s.p;
+      var e = skip ? 1e9 : ms - s.at;
+      if (cur.style !== 'digital') {
+        var x = e / s.d1;
+        if (e < 0) return;
+        p.die.classList.toggle('rolling', x < 1);
+        p.die.style.transform = x < 1 ? 'rotate(' + Math.round(x * 720) + 'deg)' : '';
+        mvNum(p.num, p.r.main, x);
+        return;
+      }
+      if (e < 0) return;
+      if (p.wrap.style.display === 'none' && !p.folded) p.wrap.style.display = '';
+      /* listing as it goes: the three newest tables stay in the bubble, the
+         older ones fold away (the Result tab keeps every one) */
+      var k = cur.plan.indexOf(s);
+      if (k >= cur.fit && !skip) {
+        var old = cur.plan[k - cur.fit].p;
+        if (!old.folded) { old.folded = true; old.wrap.style.display = 'none'; }
+      }
+      var a = e / s.d1;
+      p.die.style.transform = a < 1 ? 'rotate(' + Math.round(a * 540) + 'deg)' : '';
+      mvNum(p.num, p.r.main, a);
+      mvDexAt(p.dex, (e - s.d1) / s.d2);
+      var landed = e >= s.d1 + s.d2;
+      p.ok.style.opacity = landed ? '1' : '0';
+      if (p.sub) {
+        var e2 = e - s.d1 - s.d2;
+        p.sub.style.opacity = e2 >= 0 ? '1' : '0';
+        mvNum(p.snum, p.r.sub, e2 / s.d3);
+        mvDexAt(p.sdex, (e2 - s.d3) / s.d4);
+      }
+    });
+  }
+  function mvFrameItem(cur, now) {
+    if (!cur.plan) {                                    /* still asking */
+      if (cur.waitDie) cur.waitDie.style.transform = 'rotate(' + Math.round((now % 900) / 900 * 360) + 'deg)';
+      return;
+    }
+    if (!cur.t0) cur.t0 = now;
+    var ms = now - cur.t0;
+    if (cur.skip) ms = cur.accEnd + 1;
+    var item = cur.item;
+    var f = mvProgress(item);
+    if (f === null && (item.kind === 'speech')) {
+      /* nothing sounding to read here: the words at a speaking pace */
+      f = Math.min(1, Math.max(0, (Date.now() - cur.began - cur.accEnd) / Math.max(1500, item.text.length * 66)));
+    }
+    if (ms < cur.rollEnd + 1 || !cur.rolledOnce) {
+      mvRollAt(cur, ms);
+      if (ms >= cur.rollEnd) cur.rolledOnce = true;
+    }
+    if (cur.style === 'digital' && cur.parts.length) {
+      var c = (ms - cur.rollEnd) / Math.max(1, cur.collapseEnd - cur.rollEnd);
+      if (c >= 0 && !cur.collapsed) {
+        /* collapse: every row folds into the first; the Result tab keeps them all */
+        cur.parts.forEach(function (p, i) {
+          if (i === 0) { p.wrap.style.display = ''; p.wrap.style.opacity = String(Math.min(1, 0.4 + c)); return; }
+          p.wrap.style.display = (c >= 1 || p.folded) ? 'none' : '';
+          if (c < 1) p.wrap.style.opacity = String(1 - c);
+        });
+        if (c >= 1) { cur.collapsed = true; cur.tab.hidden = false; }
+      }
+    } else if (ms >= cur.collapseEnd && cur.tab.hidden && cur.all.childNodes.length) {
+      cur.tab.hidden = cur.style !== 'digital';
+    }
+    if (cur.style === 'digital' && cur.src && cur.src.main) {
+      var a = (ms - cur.collapseEnd) / Math.max(1, cur.accEnd - cur.collapseEnd);
+      if (a >= 0) {
+        if (cur.acc.hidden) cur.acc.hidden = false;
+        var y = -Math.round(mvEase(a) * (cur.accN - 1) * 30);
+        var tr = 'translateY(' + y + 'px)';
+        if (cur.accReel.style.transform !== tr) cur.accReel.style.transform = tr;
+        cur.accSmall.style.opacity = a >= 1 ? '1' : '0';
+      }
+    }
+    if (ms >= cur.accEnd) {
+      if (cur.phase !== 'air') {
+        cur.phase = 'air';
+        cur.node.classList.add('sp-mv-onair');
+        /* "then we can clear this out and have the text up here" */
+        if (cur.style === 'digital') cur.rolls.style.display = 'none';
+      }
+      if (item.kind === 'speech') {
+        var n = Math.floor((f === null ? 1 : f) * item.text.length + 0.0001);
+        if (n < cur.typed) n = cur.typed;
+        /* behind the audio (the roll took its seconds): type up to it, eased
+           over a few frames - never a jump */
+        if (n - Math.max(0, cur.typed) > 3) n = Math.max(0, cur.typed) + Math.ceil((n - Math.max(0, cur.typed)) * 0.3);
+        if (n !== cur.typed) {
+          cur.typed = n;
+          cur.text.textContent = item.text.slice(0, n);
+          cur.text.classList.toggle('typing', n < item.text.length);
+        }
+      } else if (cur.typed < 0) {
+        cur.typed = 0;
+        var title = item.text;
+        if (item.kind === 'clip' && cur.data && cur.data.rows && cur.data.rows[0] && cur.data.rows[0].sub) {
+          title = cur.data.rows[0].sub.label || title;
+        }
+        cur.text.textContent = title;
+        cur.text.classList.add('sp-mv-title');
+      }
+    }
+    var w = f === null ? (item.kind === 'live' ? ((now % 2400) / 2400 * 100) : 0) : f * 100;
+    var ws = w.toFixed(1) + '%';
+    if (cur.fill.style.width !== ws) cur.fill.style.width = ws;
+    var ck = item.clock || '';
+    if (cur.clock.textContent !== ck) cur.clock.textContent = ck;
+  }
+  function mvVisible(now) {
+    if (now - mv.seenAt > 1000) {
+      mv.seenAt = now;
+      mv.seen = !!(mv.pane && mv.view === 'message' && mv.pane.isConnected
+        && scriptVisible(host, document.hidden) && mv.pane.offsetParent !== null);
+    }
+    return mv.seen;
+  }
+  function mvLoop() {
+    mv.raf = 0;
+    var now = Date.now();
+    if (mv.view !== 'message' || !mvVisible(now)) return;   /* stops itself; tick() wakes it */
+    mv.raf = root.requestAnimationFrame(mvLoop);
+    mv.frameN = (mv.frameN + 1) % MV_EVERY;
+    if (mv.frameN) return;
+    if (now - mv.detectAt > 200) {
+      mv.detectAt = now;
+      var item = mvDetect();
+      if (!mv.cur || mv.cur.item.key !== item.key) mvBubbleStart(item, false);
+      else if (item.text && item.text !== mv.cur.item.text && mv.cur.item.kind === 'speech'
+        && item.text.length >= mv.cur.item.text.length) mv.cur.item.text = item.text;
+    }
+    if (mv.cur) mvFrameItem(mv.cur, now);
+  }
+  function mvKick() {
+    if (mv.raf || mv.view !== 'message') return;
+    mv.seenAt = 0;
+    mv.raf = root.requestAnimationFrame(mvLoop);
+  }
+  function mvClose() {
+    mvMenuClose();
+    if (mv.raf) root.cancelAnimationFrame(mv.raf);
+    mv.raf = 0;
+    if (mv.view.indexOf('scene:') === 0) { mvSceneDispose(); mv.view = 'feed'; }
+    mv.cur = null;
+    if (mv.stage) mv.stage.textContent = '';
+  }
+  root.PineMessageView = {
+    show: function (view) { mvShow(String(view || 'feed')); },
+    view: function () { return mv.view; },
+    style: function (s) { if (s) mvStyleSet(s); return mv.style; },
+    menu: function () { mvMenuToggle(mv.flip, null); },
+    current: function () {
+      var c = mv.cur;
+      return c ? {key: c.item.key, kind: c.item.kind, phase: c.phase, typed: c.typed,
+        text: c.item.text, rows: c.data ? c.data.rows.length : -1,
+        source: c.src ? c.src.main : '', others: c.src ? c.src.others.slice() : [],
+        lostGL: mv.lostGL || 0} : null;
+    },
+    scene: function () { return mv.scene ? {key: mv.scene.key, local: mv.scene.local, docked: !!mv.scene.el} : null; },
+    _rowsOf: mvRowsOf, _sources: mvSources, _decisionRow: mvDecisionRow
+  };
 
   /* [#1386] ANY NAME, ANY TITLE, ANY SECTION.
    *
@@ -17420,6 +18598,7 @@
   }
 
   function tick() {
+    mvKick();                                /* [msgview] the beat wakes the Message view */
     if (!scriptVisible(host, document.hidden)) return;
     rejectionStep();
     if (!rejectionSelection && Date.now() - rejectionHeadAt > REJECTION_REFRESH_MS) {
@@ -17851,8 +19030,8 @@
     var feedFlip = make('button', 'sp-feedflip', 'technical');
     feedFlip.title = 'Trace where any of this came from. Tap a name in the '
       + 'script to trace that line.';
-    feedFlip.addEventListener('click', function () {
-      technicalToggle();
+    feedFlip.addEventListener('click', function (ev) {
+      mvMenuToggle(feedFlip, ev);            /* [msgview] the view menu */
     });
     feedHead.appendChild(feedFlip);
     var wideFlip = make('button', 'sp-feedflip sp-techwide',
@@ -17872,6 +19051,7 @@
       feedStick = feed.scrollTop + feed.clientHeight >= feed.scrollHeight - 30;
     });
     left.appendChild(feed);
+    mvAttach(left, feedFlip);                /* [msgview] the menu's panes */
 
     var right = make('div', 'sp-right');     /* 7 */
     var top = make('div', 'sp-script-top');
@@ -18507,6 +19687,7 @@
       segPromptClose();
       itineraryClose();                               /* [#1235] */
       feedCrawlStop();
+      mvClose();                              /* [msgview] */
       if (stop) stop();
       stop = null;
       if (beat) clearInterval(beat);
