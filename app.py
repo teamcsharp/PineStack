@@ -125,6 +125,7 @@ from sfx_cadence import SfxCadence, due_after as sfx_due_after
 # station_stream.py carries why the tune page cannot do this in a car.
 from station_stream import HLS_START_SEGMENTS, StationStream, icy_block
 import pinelive                         # [pinelive] MX Live: the event, its roads, its doors
+import pinestream                       # [pinestream] the PineTab / Pine app screen as a PiP for listeners
 import library
 import library_extract
 # What the prompts may no longer carry - see prompt_cuts.py for why a cut is
@@ -145837,6 +145838,8 @@ async def pinelink_mine_api(
             "low": low,                                     # [#1475]
             "small": small,                                 # [#1475]
             "switch": _vcr_switch(t),                       # [vcrfx]
+            "pinestream": pinestream.mine_for(               # [pinestream] rides this poll
+                t, request.headers.get("x-pinebox-public") == "1"),
             "why": ("" if show else
                     "the camera is not being shared with you right now")}
 
@@ -163180,6 +163183,12 @@ STATION_STREAM = StationStream(_stream_snapshot, bitrate=STREAM_BITRATE)
 # [pinelive] the /api/pinelive routes and the event's boot. Everything the
 # module needs from this file it looks up in globals() when it needs it.
 pinelive.install(app, globals())
+pinestream.install(app, globals())      # [pinestream] /api/pinestream/*: one frame in memory, no encoder
+# [pinestream] the viewers' two routes check the tune-in token themselves
+# (frame.jpg refuses a tokenless request on the door, like the camera's);
+# pine-closex.js draws the PiP's corner X.
+_PUBLIC_GET |= {"/api/pinestream/mine", "/api/pinestream/frame.jpg",
+                "/spark/asset/pine-closex.js"}
 _filemgr.install(app, globals())          # [filemgr] /api/filemgr/groups|plan|run|jobs|restore
 
 
@@ -267357,6 +267366,7 @@ RADIO_PAGE_HTML = r"""<!doctype html>
 <!-- [autoscroll-rule] the feed follows only a reader at its end; its way
      back is a Carbon jump button (pine-icons.js draws the icon). -->
 <script src="/icons/pine-icons.js"></script>
+<script src="/spark/asset/pine-closex.js"></script><!-- [pinestream] the PiP's corner X -->
 <script src="/spark/asset/pine-stick.js"></script>
 <style>
   :root { color-scheme: dark; }
@@ -267582,6 +267592,63 @@ RADIO_PAGE_HTML = r"""<!doctype html>
   .pinecam.folded video { display: none; }
   @media (max-width: 520px) {
     .pinecam { right: 8px; bottom: 8px; width: min(240px, 62vw); }
+  }
+  /* [pinestream] PineStream: the station's own screen (the PineTab or the
+     Pine app) in a small window over the show - the other bottom corner
+     from the Pine Cam, above the uploads plus, dragged by its bar, hidden by its X on this page
+     only; the chip brings it back while the operator's switch is on. */
+  .pinestream {
+    position: fixed; left: 14px; bottom: calc(max(14px, env(safe-area-inset-bottom)) + 70px);
+    width: min(300px, 44vw);
+    background: #070b12; border: 1px solid #3a1d22; border-radius: 12px;
+    overflow: hidden; z-index: 41; display: none;
+    box-shadow: 0 10px 30px rgba(0,0,0,.55);
+  }
+  .pinestream.show { display: block; }
+  .pinestream.dragging { opacity: .92; }
+  .pinestream-bar {
+    display: flex; align-items: center; gap: 8px; min-height: 48px;
+    padding: 6px 50px 6px 10px; background: #0b111b;
+    border-bottom: 1px solid #1b2735; font-size: 12px; color: #9fb0c4;
+    cursor: grab; touch-action: none; user-select: none; -webkit-user-select: none;
+  }
+  .pinestream.dragging .pinestream-bar { cursor: grabbing; }
+  .pinestream-dot {
+    width: 7px; height: 7px; border-radius: 50%; background: #ff4d5e; flex: 0 0 auto;
+  }
+  .pinestream-bar b { color: #dce8f5; font-weight: 600; }
+  .pinestream-what { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+  .pinestream img {
+    display: block; width: 100%; aspect-ratio: 67/40;
+    object-fit: contain; background: #04060b;
+  }
+  .pinestream.private img { visibility: hidden; }
+  .pinestream-veil {
+    position: absolute; left: 0; right: 0; top: 49px; bottom: 0;
+    display: flex; align-items: center; justify-content: center; text-align: center;
+    padding: 10px; font-size: 12px; color: #c7d3e0; background: rgba(4,6,11,.78);
+  }
+  .pinestream-veil[hidden] { display: none; }
+  .pinestream-x {
+    position: absolute; top: 4px; right: 4px; width: 40px; height: 40px;
+    display: inline-flex; align-items: center; justify-content: center;
+    border-radius: 10px; border: 1px solid rgba(255,255,255,.16);
+    background: rgba(10,14,20,.78); color: #e6eef4; cursor: pointer; padding: 0;
+  }
+  .pinestream-x svg { width: 22px; height: 22px; fill: currentColor; }
+  .pinestream-chip {
+    position: fixed; left: 14px; z-index: 41;
+    bottom: calc(max(14px, env(safe-area-inset-bottom)) + 70px);
+    display: inline-flex; align-items: center; gap: 6px; height: 34px;
+    padding: 0 12px; border-radius: 17px; border: 1px solid #3a1d22;
+    background: #0b111b; color: #dce8f5; font: 600 12px/1 system-ui, sans-serif;
+    cursor: pointer; box-shadow: 0 6px 18px rgba(0,0,0,.45);
+  }
+  .pinestream-chip[hidden] { display: none; }
+  .pinestream-chip svg { width: 16px; height: 16px; fill: currentColor; }
+  @media (max-width: 520px) {
+    .pinestream { left: 8px; width: min(220px, 58vw); }
+    .pinestream-chip { left: 8px; }
   }
 </style>
 </head>
@@ -270785,6 +270852,8 @@ setTimeout(clockLoop, 1500);
   async function ask() {
     try {
       var got = await api("/api/pinelink/mine");
+      try { if (window.PineStreamTune) window.PineStreamTune.news(got && got.pinestream); }   /* [pinestream] */
+      catch (e) { /* PineStream never breaks the camera */ }
       var want = !!(got && got.show);
       frameUrl = String((got && got.frame) || "");
       /* #1475: on the stream road ask for the small frame (424 px, a
@@ -270849,6 +270918,267 @@ setTimeout(clockLoop, 1500);
   });
   drawLoop();                              /* 2026-09-14: paced, not fixed */
   setTimeout(loop, 1200);
+})();
+</script>
+<script>
+/* [pinestream] PINESTREAM - THE PINETAB'S OR THE PINE APP'S OWN SCREEN, IN A
+ * SMALL WINDOW OVER THE SHOW.
+ *
+ * The operator's switch is the master and this page never argues with it: the
+ * station says show:false and the window goes, whatever this page wanted. What
+ * a listener decides is only whether it is on THEIR screen - the X hides it
+ * here (remembered in this browser), the chip brings it back. Neither reaches
+ * the station.
+ *
+ * It rides the Pine Cam's own poll: /api/pinelink/mine carries a `pinestream`
+ * block, handed here by news(), so PineStream adds no request to this page
+ * while the switch is off. If that poll ever stops arriving, a slow fallback
+ * asks /api/pinestream/mine itself.
+ *
+ * It comes on and goes off like the Pine Cam window: PineVcr, each switch flip
+ * the station counted since the last answer replayed (PineVcr.flip), so a
+ * listener sees every flip the operator made. The last frame is kept (hidden)
+ * so a replayed opening shows a picture, not a hole.
+ *
+ * The picture is one JPEG in flight at a time, decoded offscreen, paced to the
+ * operator's rate in the house and to one every two seconds or slower on the
+ * car stream and the Funnel - never a queue behind the audio. A hidden tab, a
+ * hidden window or a switched-off stream fetches nothing.
+ */
+(function () {
+  var POS_KEY = "pbfm.pinestream.pos";
+  var HIDE_KEY = "pbfm.pinestream.hidden";
+  var box = null, bar = null, shot = null, veil = null, chip = null, what = null;
+  var on = false;                 /* the station's word, for this viewer */
+  var hidden = false;             /* this viewer's own choice */
+  var state = "off", fps = 2, frameUrl = "", sourceName = "the PineTab", why = "";
+  var lastFlips = null, newsAt = 0, pending = false, paceMs = 500, drawn = 0;
+  try { hidden = localStorage.getItem(HIDE_KEY) === "1"; } catch (e) { hidden = false; }
+
+  function icon(name) {
+    try { return window.pineIcon ? (window.pineIcon(name) || "") : ""; } catch (e) { return ""; }
+  }
+  function onRoad() {
+    var road = "house";
+    try { road = currentRoad(); } catch (e) { road = "house"; }
+    var car = false;
+    try { car = (typeof streamMode !== "undefined") && !!streamMode; } catch (e) { car = false; }
+    return car || road === "funnel";
+  }
+  function paceFloor() {
+    var every = Math.round(1000 / Math.max(1, Math.min(5, fps || 2)));
+    return onRoad() ? Math.max(2000, every) : every;
+  }
+  function stamp(url) {
+    return url + (url.indexOf("?") >= 0 ? "&" : "?") + "_=" + Date.now();
+  }
+
+  function clampTo(x, y) {
+    if (!box) return;
+    var w = box.offsetWidth || 300, h = box.offsetHeight || 200;
+    var vw = window.innerWidth || 800, vh = window.innerHeight || 600;
+    x = Math.max(4, Math.min(vw - w - 4, x));
+    y = Math.max(4, Math.min(vh - h - 4, y));
+    box.style.left = Math.round(x) + "px";
+    box.style.top = Math.round(y) + "px";
+    box.style.bottom = "auto";
+  }
+  function restorePos() {
+    var p = null;
+    try { p = JSON.parse(localStorage.getItem(POS_KEY) || "null"); } catch (e) { p = null; }
+    if (p && isFinite(p.x) && isFinite(p.y)) clampTo(p.x, p.y);
+  }
+  function drag() {
+    var start = null;
+    bar.addEventListener("pointerdown", function (ev) {
+      if (ev.target && ev.target.closest && ev.target.closest("button")) return;
+      var r = box.getBoundingClientRect();
+      start = {id: ev.pointerId, dx: ev.clientX - r.left, dy: ev.clientY - r.top};
+      try { bar.setPointerCapture(ev.pointerId); } catch (e) {}
+      box.classList.add("dragging");
+      ev.preventDefault();
+    });
+    bar.addEventListener("pointermove", function (ev) {
+      if (!start || ev.pointerId !== start.id) return;
+      clampTo(ev.clientX - start.dx, ev.clientY - start.dy);
+    });
+    function end(ev) {
+      if (!start || ev.pointerId !== start.id) return;
+      start = null;
+      box.classList.remove("dragging");
+      try {
+        var r = box.getBoundingClientRect();
+        localStorage.setItem(POS_KEY, JSON.stringify({x: Math.round(r.left), y: Math.round(r.top)}));
+      } catch (e) {}
+    }
+    bar.addEventListener("pointerup", end);
+    bar.addEventListener("pointercancel", end);
+    window.addEventListener("resize", function () {
+      if (!box || !box.style.left) return;
+      var r = box.getBoundingClientRect();
+      clampTo(r.left, r.top);
+    });
+  }
+
+  function build() {
+    if (box) return;
+    box = document.createElement("div");
+    box.className = "pinestream";
+    box.setAttribute("role", "region");
+    box.setAttribute("aria-label", "PineStream - the station's screen, live");
+    bar = document.createElement("div");
+    bar.className = "pinestream-bar";
+    bar.title = "Drag to move PineStream";
+    var dot = document.createElement("span");
+    dot.className = "pinestream-dot";
+    var name = document.createElement("b");
+    name.textContent = "PineStream";
+    what = document.createElement("span");
+    what.className = "pinestream-what";
+    bar.appendChild(dot);
+    bar.appendChild(name);
+    bar.appendChild(what);
+    shot = document.createElement("img");
+    shot.alt = "PineStream - the station's screen";
+    veil = document.createElement("div");
+    veil.className = "pinestream-veil";
+    box.appendChild(bar);
+    box.appendChild(shot);
+    box.appendChild(veil);
+    document.body.appendChild(box);
+    /* the corner X: the house one where it loaded, the same Carbon X if not */
+    var x = null;
+    try { if (typeof window.pineCloseX === "function") x = window.pineCloseX(box, hide, {label: "Hide PineStream on this screen"}); } catch (e) { x = null; }
+    if (!x) {
+      x = document.createElement("button");
+      x.type = "button";
+      x.className = "pinestream-x";
+      x.title = "Hide PineStream on this screen";
+      x.setAttribute("aria-label", x.title);
+      x.innerHTML = icon("c:close--filled") || "&times;";
+      x.addEventListener("click", function (ev) { ev.stopPropagation(); hide(); });
+      box.appendChild(x);
+    }
+    chip = document.createElement("button");
+    chip.type = "button";
+    chip.className = "pinestream-chip";
+    chip.title = "Show PineStream - the station's screen, live";
+    chip.setAttribute("aria-label", chip.title);
+    chip.innerHTML = (icon("c:screen") || "") + "<span>PineStream</span>";
+    chip.hidden = true;
+    chip.addEventListener("click", function (ev) { ev.stopPropagation(); show(); });
+    document.body.appendChild(chip);
+    drag();
+    restorePos();
+  }
+
+  function vcr(want, burst) {
+    if (want) build();
+    if (!box) return;
+    var V = window.PineVcr;
+    var o = {
+      show: function () { box.classList.add("show"); draw(); },
+      hide: function () { if (!(on && !hidden)) box.classList.remove("show"); }
+    };
+    if (!V) { if (want) o.show(); else box.classList.remove("show"); return; }
+    if (burst > 0) V.flip(box, want, burst, o); else V.set(box, want, o);
+  }
+  function paint() {
+    if (!box) return;
+    what.textContent = sourceName ? "· " + sourceName : "";
+    var words = "";
+    if (state === "waiting") words = "Waiting for the picture from " + sourceName + "...";
+    else if (state === "private") words = "Private screen" + (why ? " - " + why : "") + ". Back in a moment.";
+    veil.textContent = words;
+    veil.hidden = !words;
+    box.classList.toggle("private", state === "private");
+    if (chip) chip.hidden = !(on && hidden);
+  }
+  function hide() {
+    hidden = true;
+    try { localStorage.setItem(HIDE_KEY, "1"); } catch (e) {}
+    vcr(false, 0);
+    paint();
+  }
+  function show() {
+    hidden = false;
+    try { localStorage.removeItem(HIDE_KEY); } catch (e) {}
+    if (on) vcr(true, 0);
+    paint();
+  }
+
+  function draw() {
+    if (!on || hidden || !frameUrl || state !== "live" || !shot) return;
+    if (document.hidden || pending) return;
+    pending = true;
+    var t0 = Date.now();
+    var img = new Image();
+    img.onload = function () {
+      pending = false;
+      var took = Date.now() - t0;
+      paceMs = Math.max(paceFloor(), Math.min(6000, Math.round(paceMs * 0.5 + took * 0.8)));
+      if (shot && on && !hidden) { shot.src = img.src; drawn += 1; }
+    };
+    img.onerror = function () {
+      pending = false;
+      paceMs = Math.min(6000, paceMs * 2);      /* back off; the last frame stays */
+    };
+    img.src = stamp(frameUrl);
+  }
+  function drawLoop() {
+    try { draw(); } catch (e) { pending = false; }
+    setTimeout(drawLoop, Math.max(paceFloor(), paceMs));
+  }
+
+  /* One answer from the station: the pinestream block of /api/pinelink/mine,
+   * or of /api/pinestream/mine when the fallback asked. */
+  function news(got) {
+    newsAt = Date.now();
+    if (!got || typeof got !== "object") return;
+    var want = !!got.show;
+    state = String(got.state || (want ? "waiting" : "off"));
+    fps = Number(got.fps) || 2;
+    frameUrl = String(got.frame || "");
+    sourceName = String(got.source_name || "the PineTab");
+    why = String(got.why || "");
+    var sw = got.switch || null;
+    var flips = sw ? Number(sw.flips || 0) : 0;
+    var burst = (sw && sw.yours && lastFlips !== null && flips > lastFlips) ? flips - lastFlips : 0;
+    if (sw) lastFlips = flips;
+    if (want !== on || burst) {
+      on = want;
+      if (!hidden) vcr(on, burst);
+    }
+    if (on) build();
+    paint();
+    if (on && !hidden && state === "live") draw();
+  }
+  async function fallback() {
+    if (Date.now() - newsAt < 12000) return;
+    try {
+      news(await api("/api/pinestream/mine"));
+    } catch (e) {
+      newsAt = Date.now();
+      if (on) { on = false; vcr(false, 0); paint(); }
+    }
+  }
+  function fallbackLoop() {
+    try { fallback(); } catch (e) {}
+    setTimeout(fallbackLoop, document.hidden ? 30000 : 6000);
+  }
+  document.addEventListener("visibilitychange", function () {
+    if (!document.hidden) { try { draw(); } catch (e) {} }
+  });
+  window.PineStreamTune = {
+    news: news, show: show, hide: hide,
+    state: function () {
+      return {on: on, hidden: hidden, picture: state, fps: fps, drawn: drawn, paceMs: paceMs,
+              vcr: (box && window.PineVcr) ? window.PineVcr.state(box) : (box ? "none" : "unbuilt"),
+              chip: !!(chip && !chip.hidden)};
+    }
+  };
+  drawLoop();
+  setTimeout(fallbackLoop, 15000);
 })();
 </script>
 <!-- #1471: one tap in the car captures what the phone, the player and

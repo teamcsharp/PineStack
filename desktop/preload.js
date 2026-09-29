@@ -81,6 +81,8 @@ contextBridge.exposeInMainWorld("pineDesktop", pineSpeakPlainly({
   put: (route, body) => ipcRenderer.invoke("agent:put", route, body),
   del: (route, body) => ipcRenderer.invoke("agent:del", route, body),
   openExternal: (url) => ipcRenderer.invoke("open:external", url),
+  /* [pinestream] run | stop | state - see desktop/pinestream-push.cjs */
+  pineStream: (verb, opts) => ipcRenderer.invoke("pinestream:push", verb, opts),
   /* #1356: pull a still or a cut clip off the camera and put a Save As
      in front of it. The route is checked on the other side. */
   camSave: (opts) => ipcRenderer.invoke("cam:save", opts),

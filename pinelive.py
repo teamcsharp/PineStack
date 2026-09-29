@@ -124,6 +124,11 @@ DEFAULTS: dict[str, Any] = {
     "dest": "\\\\10.89.1.125\\QuickSwap\\PineBoxRecordings\\Live Events",
     "picture_mode": "cam",
     "tailscale_video": False,
+    "stream_on": False,                                # [pinestream] off by default; the master
+    "stream_source": "pinetab",                        # [pinestream] pinetab | pineapp
+    "stream_fps": 2,                                   # [pinestream] 1..5 a second
+    "stream_width": 640,                               # [pinestream] 320..960 px
+    "stream_quality": 60,                              # [pinestream] JPEG 30..90
     "device": "",
     "device_label": "",
     "channel_pair": [1, 2],
@@ -147,6 +152,8 @@ _RANGES: dict[str, tuple[float, float]] = {
     "silence_seconds": (2.0, 300.0), "silence_db": (-90.0, -20.0),
     "return_seconds": (0.2, 30.0), "arm_timeout": (3.0, 300.0),
 }
+_RANGES.update({"stream_fps": (1, 5), "stream_width": (320, 960),   # [pinestream]
+                "stream_quality": (30, 90)})
 
 
 # ---------------------------------------------------------------------------
@@ -204,7 +211,7 @@ def clean_settings(raw: Any, base: dict[str, Any] | None = None) -> tuple[dict[s
             refused.append("%s (unknown)" % key)
             continue
         try:
-            if key in ("enabled", "record", "tailscale_video"):
+            if key in ("enabled", "record", "tailscale_video", "stream_on"):   # [pinestream]
                 out[key] = bool(value)
             elif key in _RANGES:
                 lo, hi = _RANGES[key]
@@ -219,6 +226,10 @@ def clean_settings(raw: Any, base: dict[str, Any] | None = None) -> tuple[dict[s
                 out[key] = str(value)
             elif key == "picture_mode":
                 if str(value) not in ("cam", "ads"):
+                    raise ValueError
+                out[key] = str(value)
+            elif key == "stream_source":                       # [pinestream]
+                if str(value) not in ("pinetab", "pineapp"):
                     raise ValueError
                 out[key] = str(value)
             elif key == "channel_mode":
@@ -1194,6 +1205,12 @@ class PineLive:
             self.note("tailscale_video", "public video %s" % (
                 "ON: listeners on the tailnet see the picture" if new["tailscale_video"]
                 else "OFF: the public side stops showing video now"))
+        if bool(old.get("stream_on")) != bool(new.get("stream_on")):          # [pinestream]
+            self.stream_flips = int(getattr(self, "stream_flips", 0)) + 1
+            self.note("pinestream", "PineStream %s" % (
+                ("ON: listeners see " + ("the Pine app" if new.get("stream_source") == "pineapp"
+                                          else "the PineTab"))
+                if new.get("stream_on") else "OFF: nothing is captured or served"))
         return new, refused
 
     def _album_start(self) -> None:
@@ -1852,6 +1869,25 @@ class PineLive:
     def public_video_blocked(self) -> bool:
         return self.armed() and not bool(self.settings.get("tailscale_video"))
 
+    def stream_state(self) -> dict[str, Any]:
+        """[pinestream] PineStream for the panel: the switch and the choices
+        (settings), and - when the station module is loaded - what is
+        arriving and who is watching (pinestream.status())."""
+        s = self.settings
+        out: dict[str, Any] = {
+            "on": bool(s.get("stream_on")), "source": str(s.get("stream_source") or "pinetab"),
+            "fps": s.get("stream_fps"), "width": s.get("stream_width"),
+            "quality": s.get("stream_quality"), "flips": int(getattr(self, "stream_flips", 0)),
+            "picture": "off" if not s.get("stream_on") else "waiting"}
+        try:
+            import sys
+            ps = sys.modules.get("pinestream")
+            if ps is not None and hasattr(ps, "status"):
+                out.update(ps.status())
+        except Exception:  # noqa: BLE001
+            pass
+        return out
+
     def video_switch(self) -> dict[str, Any]:
         """[vcrfx] PineCam to live as a viewer's page needs it: whether it is
         on, how many times it has been flipped since the station started, and
@@ -1962,6 +1998,7 @@ class PineLive:
                 "cuts": len([c for c in (rec.cuts if rec else []) if c.get("event") == self.event_id()]),
                 "courier": self.courier_stats(),
                 "why": rec.why if rec is not None else ""},
+            "stream": self.stream_state(),                  # [pinestream]
             "picture": {"mode": s["picture_mode"], "tailscale_video": bool(s["tailscale_video"]),
                         "cam_live": cam_live,
                         "showing": self.picture.kind if armed else "none",

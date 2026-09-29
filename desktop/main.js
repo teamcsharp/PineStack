@@ -4907,6 +4907,16 @@ ipcMain.handle("agent:del", (_event, route, body) => fetchJson(`${readConfig().b
   body: JSON.stringify(body || {})
 }));
 ipcMain.handle("open:external", (_event, url) => shell.openExternal(url));
+/* [pinestream] PineStream: this window, a few JPEGs a second, to the station -
+ * only while renderer/pinestream.js keeps saying `run` and the station keeps
+ * answering keep. See pinestream-push.cjs. */
+const { PineStreamPush } = require("./pinestream-push.cjs");
+const pineStreamPush = new PineStreamPush({
+  getWin: () => win,
+  baseUrl: () => readConfig().baseUrl,
+  headers: () => authHeaders(),
+});
+ipcMain.handle("pinestream:push", (_event, verb, opts) => pineStreamPush.verb(String(verb || "state"), opts || {}));
 
 // #1052: only the desktop chrome owns the physical LCD producer. Embedded
 // newspaper/article pages cannot obtain a device-control IPC surface.

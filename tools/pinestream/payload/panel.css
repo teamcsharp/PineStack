@@ -1,0 +1,28 @@
+/* ------------------------------ [pinestream] the header's PineStream switch */
+/* Beside PineCam to live: the switch turns red while it is LIVE to listeners,
+ * and the two stacked icon buttons pick the screen (PineTab / Pine app). */
+.pl-pop .pl-hsw-stream { min-width: 72px; }
+.pl-hsw-stream[data-live="true"] { color: #ffb3a8; }
+.pl-hsw-stream[data-live="true"] .pl-hsw-track { background: #3a1715; border-color: #ff6b5e; }
+.pl-hsw-stream[data-live="true"] .pl-hsw-track i { background: #ff6b5e; }
+.pl-pop .pl-hsw-src { display: inline-grid; gap: 2px; flex: none; margin-left: -2px; }
+.pl-pop .pl-hsw-src button {
+  width: 26px; height: 19px; padding: 0; margin: 0; display: inline-flex; align-items: center; justify-content: center;
+  border: 1px solid #35414c; border-radius: 4px; background: transparent; color: #8fa0ad; cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+.pl-pop .pl-hsw-src button[aria-checked="true"] { background: #1f4652; color: #fff; border-color: #65c7da; }
+.pl-pop .pl-hsw-src button:disabled { opacity: .5; cursor: default; }
+.pl-pop .pl-hsw-src .pi-icon { width: 13px; height: 13px; }
+/* the panel: its LIVE line, its chip in the head, its preview */
+.pl-stream-live {
+  display: flex; align-items: center; gap: 6px; margin: 0 0 8px; padding: 6px 10px;
+  border: 1px solid #ff6b5e; border-radius: 6px; background: #3a1715; color: #ffd9d4; font-size: 12px;
+}
+.pl-stream-live[hidden] { display: none; }
+.pl-stream-live .pl-ico { color: #ff6b5e; }
+.pl-stream-live .pl-ico .pi-icon { width: 10px; height: 10px; }
+.pl-panel-stream .pl-panel-chip.pl-chip-live { color: #ffd9d4; background: #3a1715; border-color: #ff6b5e; }
+.pl-stream-prev img { width: min(320px, 100%); aspect-ratio: 67 / 40; object-fit: contain; background: #05080b;
+  border: 1px solid #293a44; border-radius: 4px; }
+
