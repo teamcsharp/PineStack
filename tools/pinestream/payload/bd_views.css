@@ -1,0 +1,32 @@
+/* ------------------------------ [camgrey] PineCam to live while the camera is offline */
+/* greyed, not disabled: the switch still takes a tap and keeps the preference */
+.pl-pop .pl-hsw.pl-cam-offline { filter: grayscale(1); opacity: .5; }
+.pl-pop .pl-hsw.pl-cam-offline:hover, .pl-pop .pl-hsw.pl-cam-offline:focus-visible { opacity: .72; }
+.pl-row.pl-cam-offline .pl-switch, .pl-row.pl-cam-offline .pl-row-text { filter: grayscale(1); opacity: .5; }
+
+/* ------------------------------ [pinestream-choose] the source picker off, and the chooser */
+.pl-pop .pl-hsw-src[data-off="true"] button { filter: grayscale(1); opacity: .28; cursor: default; pointer-events: none; }
+.pl-pop .pl-hsw-src[data-off="true"] button[aria-checked="true"] { opacity: .5; background: transparent; box-shadow: none; }
+.pl-panel-stream .pl-seg button:disabled { filter: grayscale(1); }
+.pl-pop .pl-choose-back { position: absolute; inset: 0; z-index: 60; background: rgba(4, 8, 11, .35); }
+.pl-pop .pl-choose {
+  position: absolute; top: 56px; left: 120px; width: min(380px, calc(100% - 16px)); box-sizing: border-box;
+  padding: 12px 12px 12px; border: 1px solid #ff6b5e; border-radius: 10px; background: #10181d; color: #dfeee9;
+  box-shadow: 0 12px 34px rgba(0, 0, 0, .6); display: grid; gap: 6px;
+}
+.pl-pop .pl-choose-title { font-size: 14px; padding-right: 44px; }
+.pl-pop .pl-choose-sub { color: #8fa0ad; font-size: 11px; padding-right: 44px; }
+.pl-pop .pl-choose-row { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 4px; }
+.pl-pop .pl-choose-btn {
+  display: grid; justify-items: center; align-content: center; gap: 5px; min-height: 96px; padding: 10px 6px;
+  border: 1px solid #35414c; border-radius: 8px; background: #142029; color: #dbe7eb; cursor: pointer;
+  font: 600 13px/1.2 Inter, Segoe UI, system-ui, sans-serif; -webkit-tap-highlight-color: transparent;
+}
+.pl-pop .pl-choose-btn .pi-icon { width: 30px; height: 30px; }
+.pl-pop .pl-choose-btn:hover, .pl-pop .pl-choose-btn:focus-visible { border-color: #65c7da; background: #1a2a33; }
+.pl-pop .pl-choose-btn.pre { border-color: #ff6b5e; box-shadow: inset 0 0 0 1px #ff6b5e; }
+.pl-pop .pl-choose-btn.unready { color: #b9a37a; }
+.pl-pop .pl-choose-note { color: #8fa0ad; font: 400 10.5px/1.3 system-ui, sans-serif; text-align: center; }
+.pl-pop .pl-choose-btn.unready .pl-choose-note { color: #e3be63; }
+.pl-pop .pl-choose-x { position: absolute; top: 6px; right: 6px; }
+

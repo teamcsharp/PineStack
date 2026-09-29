@@ -54,6 +54,7 @@ except Exception:  # noqa: BLE001  (a test without fastapi still imports the log
 FRESH_S = 6.0            # a frame older than this is not live any more
 MAX_BYTES = 700_000      # one JPEG; a 960 px screen at q90 is ~250 kB
 VIEWER_S = 12.0          # a viewer who fetched within this is watching
+CHECKIN_S = 20.0         # [pinestream-choose] a screen whose agent asked within this is there
 SOURCES = {"pinetab": "the PineTab", "pineapp": "the Pine app"}
 LIMITS = {"stream_fps": (1, 5, 2), "stream_width": (320, 960, 640),
           "stream_quality": (30, 90, 60)}
@@ -252,6 +253,38 @@ class PineStream:
                 "why": self.why if state == "private" else "",
                 "switch": {"on": c["on"], "flips": self.flips(), "yours": bool(may)}}
 
+    def checkin(self, surface: str, awake: bool = True) -> None:
+        """[pinestream-choose] a screen's agent asking the state: it is there."""
+        if surface not in SOURCES:
+            return
+        with self.lock:
+            if not hasattr(self, "checkins"):
+                self.checkins = {}
+            self.checkins[surface] = (self.clock(), bool(awake))
+
+    def sources(self) -> dict[str, Any]:
+        """[pinestream-choose] can each screen stream now? From the check-ins
+        its agent makes every few seconds (6 s while off, 3 s while on)."""
+        now = self.clock()
+        out: dict[str, Any] = {}
+        with self.lock:
+            seen = dict(getattr(self, "checkins", {}) or {})
+        for key, name in SOURCES.items():
+            at, awake = seen.get(key, (0.0, False))
+            ago = round(now - at, 1) if at else None
+            if ago is None:
+                why = ("the Pine app is not open" if key == "pineapp"
+                       else "the PineTab has not checked in")
+            elif ago > CHECKIN_S:
+                why = "%s has not checked in for %d s - asleep, closed or offline" % (name, ago)
+            elif not awake:
+                why = ("the Pine app is minimised or hidden" if key == "pineapp"
+                       else "the PineTab's screen is asleep")
+            else:
+                why = ""
+            out[key] = {"ok": not why, "why": why, "seen_ago": ago}
+        return out
+
     def status(self) -> dict[str, Any]:
         """The panel's picture of it (house only)."""
         c = self.choice()
@@ -271,6 +304,7 @@ class PineStream:
                    "agent": self.agent if fresh else "",
                    "since": self.started if fresh else 0}
         out["watching"] = self.watching()
+        out["sources"] = self.sources()                  # [pinestream-choose]
         sig = ""
         try:
             sig = self.sign(PREVIEW_KEY)
@@ -351,8 +385,11 @@ def install(app: Any, app_globals: dict[str, Any]) -> None:
         return JSONResponse(ans, status_code=code, headers=no_store)
 
     @app.get("/api/pinestream/state")
-    async def pinestream_state_api(authorization: str | None = Header(default=None)) -> Any:
+    async def pinestream_state_api(request: Request,
+                                   authorization: str | None = Header(default=None)) -> Any:
         auth(authorization)
+        # [pinestream-choose] the screen's agent says which it is and whether it is awake
+        PS.checkin(request.query_params.get("from", ""), request.query_params.get("awake", "1") != "0")
         return JSONResponse(PS.status(), headers=no_store)
 
     @app.get("/api/pinestream/mine")

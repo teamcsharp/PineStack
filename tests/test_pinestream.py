@@ -263,12 +263,34 @@ class PineLiveCarriesTheSwitch(unittest.TestCase):
         self.assertIn(st["picture"], ("waiting", "live", "private"))
         self.assertIn("flips", st)
 
-    def test_remembered_across_a_restart(self):
-        self.pl.set_settings({"stream_on": True, "stream_source": "pineapp"})
+    def test_a_restart_comes_back_off(self):
+        """The operator's rule: after any station restart stream_on is false until
+        he flips it again; the source, rate, width and quality are remembered, and
+        a screen still pushing is told keep:false."""
+        self.pl.set_settings({"stream_on": True, "stream_source": "pineapp",
+                              "stream_fps": 3, "stream_width": 800, "stream_quality": 75})
         again = pinelive.PineLive(data_dir=Path(self._td.name))
         again.boot()
+        self.assertFalse(again.settings["stream_on"])
+        self.assertEqual((again.settings["stream_source"], again.settings["stream_fps"],
+                          again.settings["stream_width"], again.settings["stream_quality"]),
+                         ("pineapp", 3, 800, 75))
+        import json
+        on_disk = json.loads(again.settings_path.read_text())
+        self.assertFalse(on_disk["stream_on"])       # the file says what the station does
+        ps = pinestream.PineStream(settings=lambda: again.settings)
+        code, ans = ps.accept("pineapp", JPEG)
+        self.assertFalse(ans["keep"])                 # the desk still pushing is stopped
+        self.assertEqual(ps.frame(), (None, "off"))
+        third = pinelive.PineLive(data_dir=Path(self._td.name))
+        third.boot()                                  # a second restart: still off
+        self.assertFalse(third.settings["stream_on"])
+
+    def test_on_after_a_restart_only_when_flipped(self):
+        again = pinelive.PineLive(data_dir=Path(self._td.name))
+        again.boot()
+        again.set_settings({"stream_on": True})
         self.assertTrue(again.settings["stream_on"])
-        self.assertEqual(again.settings["stream_source"], "pineapp")
 
 
 class AppWiring(unittest.TestCase):
@@ -301,6 +323,113 @@ class AppWiring(unittest.TestCase):
                     '<script src="/spark/asset/pine-closex.js">', "pbfm.pinestream.hidden",
                     "V.flip(box, want, burst, o)"):
             self.assertIn(bit, page)
+
+
+class ShareLinksAreVeiled(unittest.TestCase):
+    """Every surface that shows a tune-in link carries data-pine-private, so
+    PineStream shows 'Private screen' while it is open (read, not run)."""
+
+    def test_the_panel_remote_modal(self):
+        src = (ROOT / "app.py").read_text(encoding="utf-8")
+        i = src.index("async function remotePanel()")
+        body = src[i:src.index("document.body.appendChild(shade);", i)]
+        self.assertIn('shade.setAttribute("data-pine-private"', body)
+        for bit in ('api("/api/share")', 'api("/api/share/car"'):     # the list and the car link live in it
+            j = src.index(bit, i)
+            self.assertLess(j, src.index("async function artistReadPanel()", i))
+
+    def test_the_desk_drawer_and_the_cam_viewers(self):
+        html = (ROOT / "desktop" / "renderer" / "index.html").read_text(encoding="utf-8")
+        self.assertIn('<section data-pine-private="a tune-in link is on the screen">\n        <h3>Public broadcast</h3>', html)
+        self.assertRegex(html, r'id="pineCamViewers"[^>]*data-pine-private=')
+
+    def test_the_go_live_sheet_on_both_screens(self):
+        desk = (ROOT / "desktop" / "renderer" / "pinelive.js").read_text(encoding="utf-8")
+        tab = (ROOT / "app" / "src" / "main" / "assets" / "pine-views" / "pinelive.js").read_text(encoding="utf-8")
+        self.assertEqual(desk, tab)
+        i = desk.index("function openShareSheet()")
+        self.assertIn("s.back.setAttribute('data-pine-private'", desk[i:i + 400])
+
+    def test_the_agent_reads_the_attribute(self):
+        js = (ROOT / "desktop" / "renderer" / "pinestream.js").read_text(encoding="utf-8")
+        self.assertIn("querySelectorAll('[data-pine-private]')", js)
+
+
+class ChooserAndCamGrey(unittest.TestCase):
+    """[pinestream-choose] the screens' check-ins; [camgrey] the camera's words."""
+
+    def test_a_screen_that_checks_in_can_stream(self):
+        ps, box, clock = make()
+        src = ps.sources()
+        self.assertFalse(src["pinetab"]["ok"])
+        self.assertEqual(src["pineapp"]["why"], "the Pine app is not open")
+        ps.checkin("pinetab", True)
+        ps.checkin("pineapp", False)
+        ps.checkin("bogus", True)
+        src = ps.sources()
+        self.assertEqual(sorted(src), ["pineapp", "pinetab"])
+        self.assertTrue(src["pinetab"]["ok"])
+        self.assertEqual(src["pineapp"]["why"], "the Pine app is minimised or hidden")
+        clock.t += pinestream.CHECKIN_S + 1
+        self.assertIn("has not checked in for", ps.sources()["pinetab"]["why"])
+        self.assertIn("sources", ps.status())
+
+    def test_the_state_route_takes_the_check_in(self):
+        try:
+            from fastapi import FastAPI
+            from fastapi.testclient import TestClient
+        except Exception as err:  # noqa: BLE001
+            self.skipTest(str(err))
+        saved = (pinestream.PS, pinestream._G)
+
+        def restore():
+            pinestream.PS, pinestream._G = saved
+        self.addCleanup(restore)
+        pinestream.PS = make()[0]
+        app = FastAPI()
+        pinestream.install(app, {"require_auth": lambda a: None, "require_read_auth": lambda a: None})
+        c = TestClient(app)
+        got = c.get("/api/pinestream/state?from=pinetab&awake=0").json()
+        self.assertEqual(got["sources"]["pinetab"]["why"], "the PineTab's screen is asleep")
+        got = c.get("/api/pinestream/state?from=pinetab&awake=1").json()
+        self.assertTrue(got["sources"]["pinetab"]["ok"])
+
+    def test_the_picture_block_names_why_the_camera_is_off(self):
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        saved = (pinelive.PineLive._supervise, pinelive._G)
+
+        def restore():
+            pinelive.PineLive._supervise, pinelive._G = saved
+        self.addCleanup(restore)
+        pinelive.PineLive._supervise = lambda self: None
+        link = {"state": "no-link", "fresh": True,
+                "why": "the camera's network is not being broadcast, or the join failed"}
+        pinelive._G = {"pinelink_state": lambda: dict(link)}
+        pl = pinelive.PineLive(data_dir=Path(td.name))
+        pl.boot()
+        pic = pl.state()["picture"]
+        self.assertEqual((pic["cam_live"], pic["cam_state"], pic["cam_seen_ago"]), (False, "no-link", None))
+        self.assertIn("not being broadcast", pic["cam_why"])
+        link.update(state="live", why="")
+        self.assertTrue(pl.state()["picture"]["cam_live"])
+        link.update(state="no-link")
+        pic = pl.state()["picture"]
+        self.assertFalse(pic["cam_live"])
+        self.assertIsNotNone(pic["cam_seen_ago"])     # last seen, since this station started
+        link.update(state="live", fresh=False)          # a stale claim is not live
+        self.assertFalse(pl.state()["picture"]["cam_live"])
+
+    def test_the_views_carry_the_greying_and_the_chooser(self):
+        desk = (ROOT / "desktop" / "renderer" / "pinelive.js").read_text(encoding="utf-8")
+        tab = (ROOT / "app" / "src" / "main" / "assets" / "pine-views" / "pinelive.js").read_text(encoding="utf-8")
+        self.assertEqual(desk, tab)
+        for bit in ("paintCamGrey(h.cam.root", "paintCamGrey(p.parts.ts.root", "function openChooser(anchor)",
+                    "if (next) { openChooser(node);", "paintStreamPicker(h.streamSrc, src, on)",
+                    "if (ui.chooser) closeChooser();"):
+            self.assertIn(bit, desk)
+        agent = (ROOT / "desktop" / "renderer" / "pinestream.js").read_text(encoding="utf-8")
+        self.assertIn("'/api/pinestream/state?from='", agent)
 
 
 if __name__ == "__main__":

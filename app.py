@@ -233206,6 +233206,9 @@ async function remotePanel() {
   if (gone) { gone.remove(); return; }
   const shade = el("div", "", "");
   shade.id = "remoteModal";
+  /* [pinestream-veil] tune-in links, the car link and its QR: PineStream shows
+   * "Private screen" while this is open (pinestream.js reads the attribute) */
+  shade.setAttribute("data-pine-private", "a tune-in link is on the screen");
   shade.style.cssText = "position:fixed;inset:0;background:#020409e6;"
     + "z-index:179;display:flex;align-items:center;justify-content:center";
   shade.onclick = (e) => { if (e.target === shade) shade.remove(); };

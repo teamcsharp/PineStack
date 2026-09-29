@@ -138,7 +138,8 @@ DEFAULTS: dict[str, Any] = {
     "duck_attack_ms": 180,
     "duck_release_ms": 180,
     "dropout_seconds": 3.0,
-    "silence_seconds": 15.0,
+    "silence_seconds": 45.0,                           # [plquiet] hand the air back after this much silence
+    "split_seconds": 15.0,                             # [plquiet] a new album track after this much silence
     "silence_db": -60.0,
     "return_seconds": 2.0,
     "arm_timeout": 20.0,
@@ -149,7 +150,8 @@ _RANGES: dict[str, tuple[float, float]] = {
     "cut_seconds": (30, 3600), "live_gain_db": (-24.0, 12.0),
     "duck_db": (-30.0, 0.0), "duck_attack_ms": (10, 2000),
     "duck_release_ms": (10, 5000), "dropout_seconds": (0.5, 30.0),
-    "silence_seconds": (2.0, 300.0), "silence_db": (-90.0, -20.0),
+    "silence_seconds": (10.0, 180.0), "silence_db": (-90.0, -20.0),   # [plquiet]
+    "split_seconds": (5.0, 120.0),
     "return_seconds": (0.2, 30.0), "arm_timeout": (3.0, 300.0),
 }
 _RANGES.update({"stream_fps": (1, 5), "stream_width": (320, 960),   # [pinestream]
@@ -250,6 +252,14 @@ def clean_settings(raw: Any, base: dict[str, Any] | None = None) -> tuple[dict[s
                 out[key] = str(value or "").strip()[:120]
         except Exception:  # noqa: BLE001
             refused.append(key)
+    # [plquiet] a new album track has to come BEFORE the hand-back: past the
+    # hand-back the DJ already has the air, so the split follows it down.
+    try:
+        hand = float(out.get("silence_seconds") or DEFAULTS["silence_seconds"])
+        if float(out.get("split_seconds") or 0) >= hand:
+            out["split_seconds"] = max(_RANGES["split_seconds"][0], round(hand - 1.0, 2))
+    except Exception:  # noqa: BLE001
+        pass
     return out, refused
 
 
@@ -466,7 +476,11 @@ def wav_header(data_bytes: int) -> bytes:
 # [plair] the on-air test ends itself after this long (seconds).
 REHEARSE_MAX_S = 600
 # [plsplit] a set's tracks split on this much unbroken silence ...
-SPLIT_SILENCE_S = 10.0
+SPLIT_SILENCE_S = 15.0          # [plquiet] the default; settings.split_seconds rules
+# [plquiet] a split keeps this much of the silence as the track's ring-out
+# (the rest is cut off the file); a new track opens with this much lead-in.
+SPLIT_TAIL_S = 2.0
+SPLIT_PREROLL_S = 0.5
 # ... and a single track is still cut at this length, as a safety net.
 SPLIT_CAP_S = 3600.0
 
@@ -490,6 +504,14 @@ class _Wav:
         self.bytes += len(data)
         if time.time() - self.fixed_at > 30.0:
             self.fix()
+
+    def cut_to(self, nbytes: int) -> None:
+        """[plquiet] Drop everything written after `nbytes` of audio."""
+        nbytes = max(0, min(int(nbytes), self.bytes))
+        self.fh.seek(len(wav_header(0)) + nbytes)
+        self.fh.truncate()
+        self.bytes = nbytes
+        self.fix()
 
     def fix(self) -> None:
         here = self.fh.tell()
@@ -606,15 +628,28 @@ class Recorder:
                 self.quiet_frames = 0 if loud else getattr(self, "quiet_frames", 0) + 1
                 if self.inp is None:
                     if not loud:
+                        self._lead_keep(frame, live, t)   # [plquiet] the lead-in
                         continue                      # between tracks: nothing is recorded
-                    self._open_pair(t)
+                    lead = self._lead_take(t)            # [plquiet]
+                    self._open_pair(lead[0][2] if lead else t)
                     self.split_waiting = False
+                    self.tail_mark = None
+                    for f0, l0, _t0 in lead:
+                        self.inp.write(l0 if l0 else SILENCE)
+                        self.mix.write(f0 if f0 else SILENCE)
+                        self.frames += 1
+                        self.frames_total += 1
                 self.inp.write(live if live else SILENCE)
                 self.mix.write(frame if frame else SILENCE)
                 self.frames += 1
                 self.frames_total += 1
                 self.last_frame_at = time.time()
-                if self.quiet_frames >= int(SPLIT_SILENCE_S * 1000 / FRAME_MS):   # [plsplit]
+                if loud:                                  # [plquiet] where the tail ends
+                    self.tail_mark = None
+                elif self.quiet_frames == max(1, int(SPLIT_TAIL_S * 1000 / FRAME_MS)):
+                    self.tail_mark = (self.inp.bytes, self.mix.bytes, self.frames)
+                if self.quiet_frames >= self._split_frames():   # [plsplit] [plquiet] the slider
+                    self._trim_tail()
                     self._close_pair(final=False)
                     self.split_waiting = True
                     try:
@@ -627,6 +662,38 @@ class Recorder:
                 self.why = "cut_write: %s" % exc
                 self.owner.error("cut_write", "a cut could not be written: %s" % exc)
                 self.inp = self.mix = None
+
+    def _split_frames(self) -> int:
+        """[plquiet] settings.split_seconds in frames, read live (no restart)."""
+        try:
+            secs = float(self.owner.settings.get("split_seconds", SPLIT_SILENCE_S))
+        except Exception:  # noqa: BLE001
+            secs = SPLIT_SILENCE_S
+        return max(10, int(round(secs * 1000 / FRAME_MS)))
+
+    def _trim_tail(self) -> None:
+        """[plquiet] A silence split keeps SPLIT_TAIL_S of the quiet as the
+        ring-out; the rest of the silence is cut off both files."""
+        mark = getattr(self, "tail_mark", None)
+        self.tail_mark = None
+        if not mark or self.inp is None or self.mix is None:
+            return
+        self.inp.cut_to(mark[0])
+        self.mix.cut_to(mark[1])
+        self.frames = int(mark[2])
+
+    def _lead_keep(self, frame: bytes | None, live: bytes | None, t: float) -> None:
+        """[plquiet] Between tracks: hold the last SPLIT_PREROLL_S of input."""
+        lead = getattr(self, "lead", None)
+        if lead is None:
+            lead = self.lead = []
+        lead.append((frame, live, float(t)))
+        del lead[:-max(1, int(SPLIT_PREROLL_S * 1000 / FRAME_MS))]
+
+    def _lead_take(self, t: float) -> list:
+        """[plquiet] The held lead-in, only if it is the moment just before `t`."""
+        lead, self.lead = list(getattr(self, "lead", None) or []), []
+        return [x for x in lead if t - SPLIT_PREROLL_S - 0.15 <= x[2] < t]
 
     def _loud(self, live: bytes | None) -> bool:
         """[plsplit] Is this input frame above the set's silence level?"""
@@ -1098,8 +1165,29 @@ class PineLive:
         try:
             got = json.loads(self.settings_path.read_text())
             self.settings, _ = clean_settings(got)
+            if isinstance(got, dict) and "split_seconds" not in got:
+                # [plquiet] once: a settings file from before the silence sliders
+                # takes the operator's hand-back default (45 s) and the split
+                self.settings["silence_seconds"] = DEFAULTS["silence_seconds"]
+                self.settings, _ = clean_settings({}, self.settings)
+                try:
+                    _atomic_write(self.settings_path, json.dumps(self.settings, indent=1))
+                except Exception:  # noqa: BLE001
+                    pass
         except Exception:  # noqa: BLE001
             self.settings = dict(DEFAULTS)
+        # [pinestream] PineStream always comes back OFF after a restart (the
+        # operator's rule, 2026-09-29): the source, rate, width and quality stay
+        # remembered; only the on-state resets, written so the file says what
+        # the station does. A screen still pushing is answered keep:false.
+        if self.settings.get("stream_on"):
+            self.settings["stream_on"] = False
+            try:
+                _atomic_write(self.settings_path, json.dumps(self.settings, indent=1))
+            except Exception:  # noqa: BLE001
+                pass
+            self.note("pinestream", "PineStream starts OFF after a restart - "
+                      "flip it on to stream again")
         try:
             self.control = json.loads(self.control_path.read_text())
         except Exception:  # noqa: BLE001
@@ -1538,7 +1626,8 @@ class PineLive:
             self.event["track"] = n
         self._save_event()
         self.note("track", "silence %d s - track %d recorded; track %d starts with the "
-                  "next sound" % (int(SPLIT_SILENCE_S), n - 1, n))
+                  "next sound" % (int(float(self.settings.get("split_seconds", SPLIT_SILENCE_S))),   # [plquiet]
+                                 n - 1, n))
 
     def next_track(self) -> dict[str, Any]:
         """[pltrack] The operator's next-track during a set: the recording
@@ -1896,6 +1985,24 @@ class PineLive:
                 "flips": int(getattr(self, "video_flips", 0)),
                 "armed": bool(self.armed())}
 
+    def _quiet(self) -> dict[str, Any]:
+        """[plquiet] The status row's readout: how long the input has been
+        silent and the two thresholds it counts toward (both read live)."""
+        s = self.settings
+        live = self.live
+        out: dict[str, Any] = {
+            "handoff_s": float(s.get("silence_seconds") or DEFAULTS["silence_seconds"]),
+            "split_s": float(s.get("split_seconds") or SPLIT_SILENCE_S),
+            "dropout_s": float(s.get("dropout_seconds") or 3.0),
+            "silent_s": None, "phase": self.phase,
+            "album": bool(self.armed() and s.get("record", True)
+                          and not (self.event or {}).get("rehearse"))}
+        if self.armed() and live is not None and self.phase in ("live", "fallback"):
+            at = float(getattr(live, "signal_at", 0) or 0)
+            if at:
+                out["silent_s"] = round(max(0.0, time.time() - at), 1)
+        return out
+
     def _failover(self) -> dict[str, Any] | None:
         """[plcount] How close a live set is to handing the air back."""
         live = self.live
@@ -1952,9 +2059,14 @@ class PineLive:
         radio = _app("_RADIO") or {}
         pl_state = _app("pinelink_state")
         cam_live = False
+        cam_state, cam_why = "", ""                       # [camgrey]
         try:
             got = pl_state() if callable(pl_state) else {}
             cam_live = bool(got.get("state") == "live" and got.get("fresh"))
+            cam_state = str(got.get("state") or "")          # [camgrey]
+            cam_why = str(got.get("why") or "")[:200]
+            if cam_live:
+                self.cam_seen_at = time.time()
         except Exception:  # noqa: BLE001
             pass
         host_addr = (net.get("bound") or ["10.89.1.246"])[0]
@@ -1972,6 +2084,7 @@ class PineLive:
             "enabled": bool(s.get("enabled", True)),
             "phase": self.phase, "live": self.phase == "live", "armed": armed,
             "failover": self._failover(),                          # [plcount]
+            "quiet": self._quiet(),                                # [plquiet]
             "event": ({"id": self.event_id(), "name": EVENT_NAME,
                        "started_at": float(self.event.get("started_at") or 0),
                        "live_seconds": round(self.live_seconds(), 1),
@@ -1987,7 +2100,7 @@ class PineLive:
                 "dir": ("data/pinelive/cuts/" + folder) if folder else "",
                 "dest": self.dest_folder(folder) if folder else self.dest_folder("").rstrip("\\"),
                 "split": ({"quiet_s": round(getattr(rec, "quiet_frames", 0) * FRAME_MS / 1000.0, 1),
-                           "after_s": SPLIT_SILENCE_S,
+                           "after_s": float(s.get("split_seconds", SPLIT_SILENCE_S)),   # [plquiet]
                            "waiting": bool(getattr(rec, "split_waiting", False)),
                            "track": int((self.event or {}).get("track") or 1)}
                           if (rec is not None and armed) else None),     # [plsplit]
@@ -2001,6 +2114,9 @@ class PineLive:
             "stream": self.stream_state(),                  # [pinestream]
             "picture": {"mode": s["picture_mode"], "tailscale_video": bool(s["tailscale_video"]),
                         "cam_live": cam_live,
+                        "cam_state": cam_state, "cam_why": cam_why,     # [camgrey]
+                        "cam_seen_ago": (round(time.time() - self.cam_seen_at, 1)
+                                         if getattr(self, "cam_seen_at", 0) else None),
                         "showing": self.picture.kind if armed else "none",
                         "ads": len(self.picture._ads)},
             "music_paused": self.phase == "live",

@@ -111,8 +111,10 @@ class CutsAndWav(unittest.TestCase):
             rows = sorted(owner.closed, key=lambda r: r["index"])
             self.assertEqual(owner.splits, 1)
             self.assertEqual([r["index"] for r in rows], [1, 2])
-            self.assertAlmostEqual(rows[0]["seconds"], (20 + split) * pinelive.FRAME_MS / 1000.0)
-            self.assertAlmostEqual(rows[1]["seconds"], 15 * pinelive.FRAME_MS / 1000.0)
+            tail = int(pinelive.SPLIT_TAIL_S * 1000 / pinelive.FRAME_MS)       # [plquiet] ring-out kept
+            pre = int(pinelive.SPLIT_PREROLL_S * 1000 / pinelive.FRAME_MS)     # [plquiet] lead-in
+            self.assertAlmostEqual(rows[0]["seconds"], (20 + tail) * pinelive.FRAME_MS / 1000.0)
+            self.assertAlmostEqual(rows[1]["seconds"], (pre + 15) * pinelive.FRAME_MS / 1000.0)
             for row in rows:
                 self.assertEqual(row["courier"], ["c1", "c2"])
                 for key in ("input", "mix"):

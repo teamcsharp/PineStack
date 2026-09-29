@@ -99,6 +99,37 @@
 .pl-say.bad { background: #2a1714; color: #f2a497; }
 .pl-say[hidden] { display: none; }
 
+/* [plquiet] the status row: the say line, then the two silence sliders and
+ * the "silent N s" readout. The row is always there; the say line only
+ * when it has something to say. */
+.pl-sayrow {
+  flex: 0 0 auto; display: flex; flex-wrap: wrap; align-items: center; gap: 4px 14px;
+  padding: 5px 14px; border-bottom: 1px solid #293a44; background: #13222a; color: #cfe3e8; font-size: 12px;
+}
+.pl-sayrow .pl-say { flex: 1 1 220px; min-width: 0; padding: 0; border-bottom: 0; background: transparent; }
+.pl-sayrow .pl-say.bad { background: transparent; color: #f2a497; }
+.pl-quiet { flex: 0 1 auto; margin-left: auto; display: flex; flex-wrap: wrap; align-items: center; gap: 4px 16px; min-width: 0; }
+.pl-quiet-one { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; cursor: default; }
+.pl-quiet-lead { color: #cfe3e8; }
+.pl-quiet-tail { color: #8fa0ad; }
+.pl-quiet-one input[type=range] { width: 110px; height: 22px; margin: 0; accent-color: #65c7da; cursor: pointer; }
+.pl-quiet-out { min-width: 34px; color: #edf3f5; font: 600 12px/1 ui-monospace, Consolas, monospace; text-align: left; font-variant-numeric: tabular-nums; }
+.pl-quiet-one.capped .pl-quiet-out { color: #e3be63; }
+.pl-quiet-one.off { opacity: .55; }
+.pl-quiet-now {
+  display: inline-flex; align-items: center; gap: 5px; padding: 2px 8px; border-radius: 10px;
+  border: 1px solid #35414c; background: #10191f; color: #dbe7eb; white-space: nowrap; font-variant-numeric: tabular-nums;
+}
+.pl-quiet-now .pl-ico .pi-icon { width: 13px; height: 13px; }
+.pl-quiet-now.near { border-color: #e3be63; color: #e3be63; }
+.pl-quiet-now.gone { border-color: #ef6f5e; color: #ef6f5e; }
+.pl-quiet-now[hidden] { display: none; }
+@media (max-width: 720px) {
+  .pl-quiet { margin-left: 0; }
+  .pl-quiet-one { white-space: normal; flex-wrap: wrap; }
+  .pl-quiet-now { white-space: normal; }
+}
+
 .pl-body {
   flex: 1 1 auto; min-height: 0; overflow-y: auto; overflow-x: hidden;
   overscroll-behavior: contain; -webkit-overflow-scrolling: touch;
@@ -556,6 +587,38 @@
 .pl-panel-stream .pl-panel-chip.pl-chip-live { color: #ffd9d4; background: #3a1715; border-color: #ff6b5e; }
 .pl-stream-prev img { width: min(320px, 100%); aspect-ratio: 67 / 40; object-fit: contain; background: #05080b;
   border: 1px solid #293a44; border-radius: 4px; }
+
+/* ------------------------------ [camgrey] PineCam to live while the camera is offline */
+/* greyed, not disabled: the switch still takes a tap and keeps the preference */
+.pl-pop .pl-hsw.pl-cam-offline { filter: grayscale(1); opacity: .5; }
+.pl-pop .pl-hsw.pl-cam-offline:hover, .pl-pop .pl-hsw.pl-cam-offline:focus-visible { opacity: .72; }
+.pl-row.pl-cam-offline .pl-switch, .pl-row.pl-cam-offline .pl-row-text { filter: grayscale(1); opacity: .5; }
+
+/* ------------------------------ [pinestream-choose] the source picker off, and the chooser */
+.pl-pop .pl-hsw-src[data-off="true"] button { filter: grayscale(1); opacity: .28; cursor: default; pointer-events: none; }
+.pl-pop .pl-hsw-src[data-off="true"] button[aria-checked="true"] { opacity: .5; background: transparent; box-shadow: none; }
+.pl-panel-stream .pl-seg button:disabled { filter: grayscale(1); }
+.pl-pop .pl-choose-back { position: absolute; inset: 0; z-index: 60; background: rgba(4, 8, 11, .35); }
+.pl-pop .pl-choose {
+  position: absolute; top: 56px; left: 120px; width: min(380px, calc(100% - 16px)); box-sizing: border-box;
+  padding: 12px 12px 12px; border: 1px solid #ff6b5e; border-radius: 10px; background: #10181d; color: #dfeee9;
+  box-shadow: 0 12px 34px rgba(0, 0, 0, .6); display: grid; gap: 6px;
+}
+.pl-pop .pl-choose-title { font-size: 14px; padding-right: 44px; }
+.pl-pop .pl-choose-sub { color: #8fa0ad; font-size: 11px; padding-right: 44px; }
+.pl-pop .pl-choose-row { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 4px; }
+.pl-pop .pl-choose-btn {
+  display: grid; justify-items: center; align-content: center; gap: 5px; min-height: 96px; padding: 10px 6px;
+  border: 1px solid #35414c; border-radius: 8px; background: #142029; color: #dbe7eb; cursor: pointer;
+  font: 600 13px/1.2 Inter, Segoe UI, system-ui, sans-serif; -webkit-tap-highlight-color: transparent;
+}
+.pl-pop .pl-choose-btn .pi-icon { width: 30px; height: 30px; }
+.pl-pop .pl-choose-btn:hover, .pl-pop .pl-choose-btn:focus-visible { border-color: #65c7da; background: #1a2a33; }
+.pl-pop .pl-choose-btn.pre { border-color: #ff6b5e; box-shadow: inset 0 0 0 1px #ff6b5e; }
+.pl-pop .pl-choose-btn.unready { color: #b9a37a; }
+.pl-pop .pl-choose-note { color: #8fa0ad; font: 400 10.5px/1.3 system-ui, sans-serif; text-align: center; }
+.pl-pop .pl-choose-btn.unready .pl-choose-note { color: #e3be63; }
+.pl-pop .pl-choose-x { position: absolute; top: 6px; right: 6px; }
 
 /* [plcount] the failover countdown over the Script view's player */
 .pl-countdown { position: relative; height: 18px; margin: 0 0 6px; border-radius: 6px;

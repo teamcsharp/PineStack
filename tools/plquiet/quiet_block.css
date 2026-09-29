@@ -1,0 +1,31 @@
+
+/* [plquiet] the status row: the say line, then the two silence sliders and
+ * the "silent N s" readout. The row is always there; the say line only
+ * when it has something to say. */
+.pl-sayrow {
+  flex: 0 0 auto; display: flex; flex-wrap: wrap; align-items: center; gap: 4px 14px;
+  padding: 5px 14px; border-bottom: 1px solid #293a44; background: #13222a; color: #cfe3e8; font-size: 12px;
+}
+.pl-sayrow .pl-say { flex: 1 1 220px; min-width: 0; padding: 0; border-bottom: 0; background: transparent; }
+.pl-sayrow .pl-say.bad { background: transparent; color: #f2a497; }
+.pl-quiet { flex: 0 1 auto; margin-left: auto; display: flex; flex-wrap: wrap; align-items: center; gap: 4px 16px; min-width: 0; }
+.pl-quiet-one { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; cursor: default; }
+.pl-quiet-lead { color: #cfe3e8; }
+.pl-quiet-tail { color: #8fa0ad; }
+.pl-quiet-one input[type=range] { width: 110px; height: 22px; margin: 0; accent-color: #65c7da; cursor: pointer; }
+.pl-quiet-out { min-width: 34px; color: #edf3f5; font: 600 12px/1 ui-monospace, Consolas, monospace; text-align: left; font-variant-numeric: tabular-nums; }
+.pl-quiet-one.capped .pl-quiet-out { color: #e3be63; }
+.pl-quiet-one.off { opacity: .55; }
+.pl-quiet-now {
+  display: inline-flex; align-items: center; gap: 5px; padding: 2px 8px; border-radius: 10px;
+  border: 1px solid #35414c; background: #10191f; color: #dbe7eb; white-space: nowrap; font-variant-numeric: tabular-nums;
+}
+.pl-quiet-now .pl-ico .pi-icon { width: 13px; height: 13px; }
+.pl-quiet-now.near { border-color: #e3be63; color: #e3be63; }
+.pl-quiet-now.gone { border-color: #ef6f5e; color: #ef6f5e; }
+.pl-quiet-now[hidden] { display: none; }
+@media (max-width: 720px) {
+  .pl-quiet { margin-left: 0; }
+  .pl-quiet-one { white-space: normal; flex-wrap: wrap; }
+  .pl-quiet-now { white-space: normal; }
+}

@@ -273,7 +273,7 @@
               <button type="button" data-mode="all">Anyone with a
                 link</button>
             </div>
-            <div id="pineCamViewers" class="pine-cam-viewers"></div>
+            <div id="pineCamViewers" class="pine-cam-viewers" data-pine-private="the list of tune-in links is on the screen"></div>
             <div id="pineCamShareSay" class="pine-cam-say"></div>
           </div>
           <pre id="pineCamDoc" class="pine-cam-doc" hidden></pre>
@@ -734,7 +734,8 @@
           <button id="sparkRefresh" title="Refresh" aria-label="Refresh">↻</button>
         </div>
       </section>
-      <section>
+      <!-- [pinestream-veil] the public link: PineStream shows "Private screen" while this is on the glass -->
+      <section data-pine-private="a tune-in link is on the screen">
         <h3>Public broadcast</h3>
         <p id="pubStatus" class="muted">checking…</p>
         <div class="drawer-row">

@@ -227,7 +227,11 @@
     var b = bridge();
     if (!b) { schedule(POLL_ERR_MS); return; }
     state.polls += 1;
-    Promise.resolve(b.get('/api/pinestream/state')).then(function (info) {
+    /* [pinestream-choose] which screen asks, and whether it is awake: the
+     * station's chooser says so when one is asleep or closed */
+    var awake = true;
+    try { awake = !doc.hidden; } catch (err) { awake = true; }
+    Promise.resolve(b.get('/api/pinestream/state?from=' + state.surface + '&awake=' + (awake ? 1 : 0))).then(function (info) {
       info = info || {};
       state.info = info;
       state.lastError = '';
