@@ -50,8 +50,23 @@
     {name: 'Neon mirror', kind: 'mirror', color: '#29b6ff'},
     {name: 'LED', kind: 'led', color: '#39e36b'},
     {name: 'LED mirror', kind: 'ledmirror', color: '#ff2e7a'},
-    {name: 'Glow wave', kind: 'wave', color: '#2ee6e6'}
+    {name: 'Glow wave', kind: 'wave', color: '#2ee6e6'},
+    /* [plviz2] the rest of the sheet, row by row; env shapes the height
+     * across the bands (centre = taller middle, tri = a diamond) */
+    {name: 'Neon sine', kind: 'sine', color: '#3dff7a'},
+    {name: 'Violet line', kind: 'line', color: '#b35cff'},
+    {name: 'Red matrix', kind: 'dotmatrix', color: '#ff3b3b', env: 'centre'},
+    {name: 'Blue needles', kind: 'needles', color: '#3d8bff'},
+    {name: 'Gold line', kind: 'osc', color: '#ffc53d'},
+    {name: 'Violet cloud', kind: 'cloud', color: '#a45cff'},
+    {name: 'Sky mirror', kind: 'taper', color: '#5ec8ff', env: 'centre'},
+    {name: 'Lime slats', kind: 'gapbars', color: '#a6ff2e'},
+    {name: 'Ember cloud', kind: 'cloud', color: '#ff8a1f'},
+    {name: 'Blue diamond', kind: 'diamond', color: '#3b7bff', env: 'tri'},
+    {name: 'Violet thin', kind: 'thin', color: '#c04dff', env: 'centre'}
   ];
+  var VIZ_MORE = {sine: 1, line: 1, dotmatrix: 1, needles: 1, osc: 1, cloud: 1,
+    taper: 1, gapbars: 1, diamond: 1, thin: 1};   /* [plviz2] drawn by drawVizMore */
   var VIZ_HOLD_MS = 700;           /* a peak cap holds this long ... */
   var VIZ_FALL_PER_S = 0.55;       /* ... then falls this much of the height a second */
   var VIZ_BAR_FALL_PER_S = 2.2;    /* the bars themselves ease down */
@@ -286,6 +301,134 @@
       ro.observe(meterBox);
     }
 
+    /* [plviz2] the other eleven styles, all drawn about the middle line: a
+     * wide low-alpha pass is the glow, then the core, then every band's
+     * peak cap at its held height. Answers false for the first five kinds. */
+    function vizHash(a) { a = Math.sin(a * 12.9898) * 43758.5453; return a - Math.floor(a); }
+    function drawVizMore(st, cw, ch, n, slot, mid, cap, now) {
+      var k = st.kind;
+      if (!VIZ_MORE[k]) return false;
+      var span = Math.max(1, mid - cap - 1), lw = Math.max(1, dpr);
+      var i, j, c, x, y, h, w, t, pass, on, pts;
+      var env = new Array(n);
+      for (i = 0; i < n; i += 1) {
+        t = (i + 0.5) / n;
+        env[i] = st.env === 'centre' ? 0.3 + 0.7 * Math.sin(Math.PI * t)
+          : (st.env === 'tri' ? 1 - 0.8 * Math.abs(2 * t - 1) : 1);
+      }
+      function lv(p) {   /* the eased level at a fractional band, shaped */
+        var a = clamp(Math.floor(p), 0, n - 1), b = Math.min(n - 1, a + 1), f = clamp(p - a, 0, 1);
+        return (vz.level[a] || 0) * env[a] * (1 - f) + (vz.level[b] || 0) * env[b] * f;
+      }
+      vctx.lineJoin = 'round';
+      if (k === 'sine') {                 /* a mirrored lobe every two bands */
+        for (pass = 0; pass < 2; pass += 1) {
+          vctx.beginPath();
+          vctx.moveTo(0, mid);
+          for (i = 0; i < n; i += 2) {
+            h = Math.max(lv(i), lv(i + 1)) * span;
+            vctx.quadraticCurveTo((i + 1) * slot, mid - 2 * h, Math.min(cw, (i + 2) * slot), mid);
+          }
+          for (i = n - 2 + (n % 2); i >= 0; i -= 2) {
+            h = Math.max(lv(i), lv(i + 1)) * span;
+            vctx.quadraticCurveTo((i + 1) * slot, mid + 2 * h, i * slot, mid);
+          }
+          vctx.closePath();
+          if (pass) { vctx.globalAlpha = 1; vctx.lineWidth = lw * 1.6; vctx.stroke(); }
+          else { vctx.globalAlpha = 0.2; vctx.fill(); vctx.lineWidth = lw * 7; vctx.stroke(); }
+        }
+      } else if (k === 'line' || k === 'osc') {
+        pts = [[0, mid]];
+        if (k === 'line') {                 /* one smooth swing a band, alternate sides */
+          for (i = 0; i < n; i += 1) pts.push([(i + 0.5) * slot, mid - (i % 2 ? -1 : 1) * lv(i) * span]);
+          pts.push([cw, mid]);
+        } else {                             /* a carrier whose swing is the spectrum */
+          t = now / 1000 * 7;
+          for (j = 1; j <= n * 4; j += 1) pts.push([j * slot / 4, mid - lv(j / 4 - 0.5) * span * Math.sin(j * 1.9 + t)]);
+        }
+        for (pass = 0; pass < 2; pass += 1) {
+          vctx.globalAlpha = pass ? 1 : 0.22;
+          vctx.lineWidth = pass ? lw * 1.8 : lw * 6;
+          vctx.beginPath();
+          vctx.moveTo(pts[0][0], pts[0][1]);
+          for (j = 1; j < pts.length - 1; j += 1) {
+            if (k === 'line') vctx.quadraticCurveTo(pts[j][0], pts[j][1], (pts[j][0] + pts[j + 1][0]) / 2, (pts[j][1] + pts[j + 1][1]) / 2);
+            else vctx.lineTo(pts[j][0], pts[j][1]);
+          }
+          vctx.lineTo(pts[pts.length - 1][0], pts[pts.length - 1][1]);
+          vctx.stroke();
+        }
+      } else if (k === 'taper' || k === 'gapbars' || k === 'thin') {
+        var frac = k === 'thin' ? 0.28 : (k === 'taper' ? 0.8 : 0.7);
+        for (pass = 0; pass < 2; pass += 1) {
+          vctx.globalAlpha = pass ? 1 : 0.22;
+          w = Math.max(1, Math.min(slot, slot * frac * (pass ? 1 : 1.8)));
+          for (i = 0; i < n; i += 1) {
+            h = lv(i) * span;
+            vctx.fillRect((i + 0.5) * slot - w / 2, mid - h, w, Math.max(1, 2 * h));
+          }
+        }
+        if (k === 'gapbars') {                /* the fine slats: background lines across */
+          var gap = Math.max(1, Math.round(dpr)), pitch = Math.max(3, Math.round(4 * dpr));
+          vctx.globalAlpha = 1;
+          vctx.fillStyle = '#05080b';
+          for (y = mid - gap / 2 - pitch * Math.floor(mid / pitch); y < ch; y += pitch) vctx.fillRect(0, y, cw, gap);
+        }
+      } else if (k === 'needles' || k === 'cloud') {
+        var sub = k === 'cloud' ? 6 : 3, seed = Math.floor(now / 60) % 997;
+        for (pass = 0; pass < 2; pass += 1) {
+          vctx.globalAlpha = pass ? 1 : 0.2;
+          vctx.lineWidth = pass ? lw : lw * 2.5;
+          vctx.beginPath();
+          for (j = 0; j < n * sub; j += 1) {
+            h = lv((j + 0.5) / sub - 0.5) * span;
+            h *= k === 'cloud' ? 0.25 + 0.75 * vizHash(j * 1.37 + seed * 7.1) : 0.8 + 0.2 * vizHash(j);
+            x = (j + 0.5) * slot / sub;
+            vctx.moveTo(x, mid - h);
+            vctx.lineTo(x, mid + h);
+          }
+          vctx.stroke();
+        }
+      } else {                                  /* dotmatrix, diamond: a mirrored dot grid */
+        var dm = k === 'dotmatrix';
+        var pch = Math.max(2 * dpr, Math.min(cw / (n * (dm ? 2 : 1)), mid / (dm ? 12 : 8)));
+        var cols = Math.max(1, Math.floor(cw / pch)), x0 = (cw - cols * pch) / 2;
+        var rows = Math.max(3, Math.floor(span / pch)), dot = pch * (dm ? 0.72 : 0.62);
+        var lit = new Array(cols);
+        for (j = 0; j < cols; j += 1) lit[j] = Math.round(lv((j + 0.5) / cols * n - 0.5) * rows);
+        vctx.globalAlpha = 0.16;              /* the glow: one soft column per lit column */
+        for (j = 0; j < cols; j += 1) if (lit[j]) vctx.fillRect(x0 + j * pch, mid - lit[j] * pch, pch, 2 * lit[j] * pch);
+        vctx.globalAlpha = 1;
+        vctx.beginPath();
+        for (j = 0; j < cols; j += 1) {
+          x = x0 + (j + 0.5) * pch;
+          on = lit[j];
+          for (c = 0; c < on; c += 1) {
+            y = (c + 0.5) * pch;
+            if (dm) { vctx.rect(x - dot / 2, mid - y - dot / 2, dot, dot); vctx.rect(x - dot / 2, mid + y - dot / 2, dot, dot); }
+            else {
+              vctx.moveTo(x + dot / 2, mid - y); vctx.arc(x, mid - y, dot / 2, 0, 2 * Math.PI);
+              vctx.moveTo(x + dot / 2, mid + y); vctx.arc(x, mid + y, dot / 2, 0, 2 * Math.PI);
+            }
+          }
+        }
+        vctx.fill();
+      }
+      /* every band's peak cap, held then falling (drawViz moved vz.hold) */
+      vctx.globalAlpha = 1;
+      vctx.fillStyle = '#ffffff';
+      w = Math.max(1, slot * (k === 'thin' ? 0.3 : 0.6));
+      for (i = 0; i < n; i += 1) {
+        h = (vz.hold[i] || 0) * env[i] * span;
+        x = (i + 0.5) * slot - w / 2;
+        if (k === 'line') { vctx.fillRect(x, i % 2 ? mid + h : mid - h - cap, w, cap); continue; }
+        vctx.fillRect(x, mid - h - cap, w, cap);
+        vctx.fillRect(x, mid + h, w, cap);
+      }
+      vctx.fillStyle = st.color;
+      return true;
+    }
+
     /* [plviz] one frame of the visualizer: bars ease down, each band's peak
      * cap holds VIZ_HOLD_MS then falls at VIZ_FALL_PER_S. */
     function drawViz(bands, now) {
@@ -309,7 +452,8 @@
       var slot = cw / n, bw = Math.max(1, slot * 0.62), mid = ch / 2, cap = Math.max(2, Math.round(2 * dpr));
       vctx.fillStyle = st.color;
       vctx.strokeStyle = st.color;
-      if (st.kind === 'wave') {
+      if (drawVizMore(st, cw, ch, n, slot, mid, cap, now)) { /* [plviz2] drawn */ }
+      else if (st.kind === 'wave') {
         for (var pass = 0; pass < 2; pass += 1) {
           vctx.globalAlpha = pass ? 0.9 : 0.28;
           vctx.beginPath();

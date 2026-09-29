@@ -1535,20 +1535,36 @@ class PineLive:
             held = ""
             if now_track.get("id") and not now_track.get("pinelive"):
                 self.held_record = {k: now_track.get(k) for k in ("id", "title", "artist")}
-                # [plhold] a cut record comes back only if it had barely started
-                # (it restarts from the top) and never twice in an hour: every
+                # [plhold] a cut record comes back never twice in an hour: every
                 # handoff used to re-queue it, so a flapping input or two tests
                 # aired the same record from the top again and again.
+                # [plresume] and it comes back WHERE IT WAS CUT ("music
+                # pauses"): the re-queued copy carries resume_s and dj_on_air
+                # back-dates `started` by it. The position is the station's own
+                # _RADIO["started"] (a track dict never carries "started", so
+                # the old test read 0 and every record restarted from the top).
+                # A record with under 20 s left is not owed.
                 _t = time.time()
-                _in = _t - float(now_track.get("started") or _t)
+                _in = max(0.0, _t - float(radio.get("started") or _t))
+                try:
+                    _len = float(now_track.get("seconds") or 0)
+                except (TypeError, ValueError):
+                    _len = 0.0
                 _memo = {k: v for k, v in getattr(self, "_held_memo", {}).items()
                          if _t - v < 3600.0}
-                if _in < 60.0 and str(now_track.get("id")) not in _memo:
+                if ((not _len or _in < _len - 20.0)
+                        and str(now_track.get("id")) not in _memo):
                     _memo[str(now_track.get("id"))] = _t
+                    _back = {k: v for k, v in now_track.items() if k != "resumed_from_s"}
+                    _back["resume_s"] = round(_in, 1) if _in >= 3.0 else 0.0
                     held = str(now_track.get("title") or "the record")
+                    if _back["resume_s"]:
+                        held += " (from %d:%02d)" % (int(_in) // 60, int(_in) % 60)
                     q = radio.setdefault("queue", [])
-                    if not q or (q[0] or {}).get("id") != now_track.get("id"):
-                        q.insert(0, now_track)
+                    if q and (q[0] or {}).get("id") == now_track.get("id"):
+                        q[0] = _back
+                    else:
+                        q.insert(0, _back)
                 else:
                     self.held_record = None
                 self._held_memo = _memo
@@ -1938,7 +1954,8 @@ class PineLive:
                         "art": art if show else ""}}}
         if (track or {}).get("pinelive"):
             out["live"] = True
-            out["art"] = art if show else ""            # [pltrack] the cover follows the track
+            if not show:               # [pltrack3] the house keeps dj_state's art ([pltrack2] tags it)
+                out["art"] = ""
         return out
 
 

@@ -29698,6 +29698,7 @@ async def music_play_on_box(track: dict[str, Any]) -> str:
         # Nabu has two pipelines but one shared physical volume. Render the
         # music gain into its own stream; the user's dial remains the master.
         fire_and_forget_speech(_nabu_music_dispatch(dict(track), _NABU_MUSIC_EPOCH[0],
+            resume=bool(track.get("resumed_from_s")),   # [plresume]
             expected_started=float(_RADIO.get("started") or 0)))
         return player
     url = music_url(track)
@@ -39324,6 +39325,21 @@ def dj_on_air(track: dict[str, Any]) -> None:
         del _RADIO["history"][:-40]
     _RADIO["now"] = track
     _RADIO["started"] = time.time()
+    # [plresume] a record a live set cut comes back WHERE IT WAS CUT:
+    # `started` is back-dated by its position, so the loop waits only what
+    # is left and every road that follows `started` (the stream decoder,
+    # the panel and tablet followers, the Nabu resume) seeks there. Popped,
+    # so it resumes once; a record with under 5 s left plays from the top.
+    try:
+        _resume = float(track.pop("resume_s", 0) or 0)
+        _len = float(track.get("seconds") or 0)
+        if _resume > 0 and (not _len or _resume < _len - 5.0):
+            _RADIO["started"] -= _resume
+            track["resumed_from_s"] = round(_resume, 1)
+        else:
+            track.pop("resumed_from_s", None)
+    except (TypeError, ValueError, AttributeError):
+        pass
     _RADIO["coming"] = None
     remember_played(track)
     _music_log_append(track)          # which record, when — for the mix (#633)
@@ -39735,6 +39751,9 @@ async def _dj_loop() -> None:
                 if (_RADIO.get("music_to") or "here") in ("box", "both"):
                     await music_play_on_box(track)
                 length = max(20.0, float(track.get("seconds") or 210))
+                if track.get("resumed_from_s"):          # [plresume] what is left
+                    length = max(0.0, length - max(0.0, time.time() - float(
+                        _RADIO.get("started") or time.time())))
                 try:
                     await asyncio.wait_for(skip.wait(), timeout=length + 1.5)
                     skip.clear()
@@ -40077,7 +40096,7 @@ async def _dj_loop() -> None:
             # beside it this is now only the handful of milliseconds it took
             # to spawn — but the subtraction is what keeps it honest if
             # anything ever blocks here again.
-            if spin_first:
+            if spin_first or track.get("resumed_from_s"):   # [plresume]
                 spent = max(0.0, time.time()
                             - float(_RADIO.get("started") or time.time()))
                 length = max(0.0, length - spent)

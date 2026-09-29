@@ -64,10 +64,18 @@ class CutsAndWav(unittest.TestCase):
         self.assertEqual(struct.unpack("<H", h[22:24])[0], 2)          # stereo
         self.assertEqual(struct.unpack("<I", h[24:28])[0], 44100)
 
-    def test_recorder_cuts_on_the_frame_clock(self):
+    def test_recorder_splits_on_silence(self):
+        """[pltrack3] [plsplit]/[plmp3]: a track closes after SPLIT_SILENCE_S of
+        quiet input, nothing records between tracks, the next opens on sound,
+        and each pair is decanted (MP3 unless flac)."""
+        import threading
+
         class Owner:
+            settings = {"silence_db": -60.0}
+
             def __init__(self):
                 self.closed = []
+                self.splits = 0
 
             def event_id(self):
                 return "ev-test"
@@ -78,32 +86,39 @@ class CutsAndWav(unittest.TestCase):
             def cut_closed(self, row):
                 self.closed.append(row)
 
+            def track_split(self):
+                self.splits += 1
+
             def error(self, code, say):
                 raise AssertionError("%s: %s" % (code, say))
 
         owner = Owner()
         rec = pinelive.Recorder(owner)
+        split = int(pinelive.SPLIT_SILENCE_S * 1000 / pinelive.FRAME_MS)
         with tempfile.TemporaryDirectory() as td:
             folder = Path(td) / "ev"
-            rec.begin(folder, "ev", 1.0, "wav", 1)         # 1 s = 10 frames
+            rec.begin(folder, "ev", 210.0, "wav", 1)
             frame = b"\x01\x02" * (pinelive.FRAME_BYTES // 2)
-            live = b"\x03\x04" * (pinelive.FRAME_BYTES // 2)
+            loud = b"\x03\x04" * (pinelive.FRAME_BYTES // 2)      # about -30 dBFS
+            quiet = b"\x00\x00" * (pinelive.FRAME_BYTES // 2)
             t0 = 1790000000.0
-            for i in range(25):                            # 2 full cuts + 5 frames
+            seq = [loud] * 20 + [quiet] * (split + 5) + [loud] * 15
+            for i, live in enumerate(seq):
                 rec.tap(frame, live, {"t": t0 + i * 0.1})
-            rec.end()                                      # closes the short final cut
-            rows = owner.closed
-            self.assertEqual(len(rows), 2)                 # 5 frames < 10: not a cut
-            self.assertEqual(rows[0]["seconds"], 1.0)
-            self.assertEqual(rows[0]["index"], 1)
-            self.assertEqual(rows[1]["index"], 2)
-            self.assertEqual(rows[0]["courier"], ["c1", "c2"])
+            rec.end()                                      # closes the second track
+            for th in [x for x in threading.enumerate() if x.name == "pinelive-decant"]:
+                th.join(120)
+            rows = sorted(owner.closed, key=lambda r: r["index"])
+            self.assertEqual(owner.splits, 1)
+            self.assertEqual([r["index"] for r in rows], [1, 2])
+            self.assertAlmostEqual(rows[0]["seconds"], (20 + split) * pinelive.FRAME_MS / 1000.0)
+            self.assertAlmostEqual(rows[1]["seconds"], 15 * pinelive.FRAME_MS / 1000.0)
             for row in rows:
+                self.assertEqual(row["courier"], ["c1", "c2"])
                 for key in ("input", "mix"):
                     p = folder / row[key]
                     self.assertTrue(p.is_file(), p)
-                    size = p.stat().st_size
-                    self.assertEqual(size, 44 + 10 * pinelive.FRAME_BYTES)
+                    self.assertIn(p.suffix, (".mp3", ".wav"))   # .wav only without ffmpeg
 
 
 class LiveSourceFrames(unittest.TestCase):
