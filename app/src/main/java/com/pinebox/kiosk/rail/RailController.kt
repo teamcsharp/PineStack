@@ -192,6 +192,20 @@ class RailController(
     /** Who is on the broadcast, from the last time the drawer was opened. */
     private var roster = AirOwners.Roster()
 
+    /* [airplayers:fields] the receivers switch, when the station has it
+     * (GET/POST /api/air/receivers); null on a station that predates it,
+     * and the old roster rows are drawn instead. */
+    private var receivers: AirReceivers.State? = null
+
+    /** Receiver ids with a write in flight: no read may repaint them. */
+    private val receiversPending = mutableSetOf<String>()
+
+    /** A refusal or a failure, said on the row it belongs to. */
+    private var receiversFault: Pair<String, String>? = null
+
+    /** The BROADCAST chip tapped and not yet confirmed by the station. */
+    private var destinationPending = ""
+
     /** The durable destination, which distinguishes PineTab from PineApp. */
     private var destination = ""
 
@@ -403,6 +417,19 @@ class RailController(
      * the ride so a row can say "PineTab" instead of "pbnvgdtefn".
      */
     private fun readPlayers() {
+        /* [airplayers:read] the receivers switch first; the old roster
+         * only for a station that does not have it yet. */
+        scope.launch {
+            val got = try {
+                AirReceivers.read(JSONObject(client.get(AirReceivers.ROUTE)))
+            } catch (err: Exception) {
+                null
+            }
+            if (got != null) adoptReceivers(got, fromWrite = false) else readRoster()
+        }
+    }
+
+    private fun readRoster() {
         scope.launch {
             try {
                 val listeners = JSONObject(client.get("/api/radio/listeners"))
@@ -446,6 +473,10 @@ class RailController(
      * case where soloing one would silence the other.
      */
     private fun reconcileAir(settings: JSONObject?) {
+        /* [airplayers:reconcile] the station resolves the air itself now
+         * that several receivers may be on; a tablet re-pointing the
+         * exclusive at the table's one device would undo the operator. */
+        if (receivers != null) return
         val want = AirOwners.shouldOwn(roster, settings)
         if (want.isBlank() || want == roster.owner) return
         scope.launch {
@@ -623,6 +654,10 @@ class RailController(
     private fun fmtVolts(v: Double) = String.format("%.2f", v)
 
     private fun paintPlayers() {
+        if (receivers != null) {           // [airplayers:paint]
+            paintReceivers()
+            return
+        }
         val inflater = android.view.LayoutInflater.from(rail.context)
         playerList.removeAllViews()
         for (player in roster.players) {
@@ -666,6 +701,134 @@ class RailController(
                 roster = was                      /* put the tick back */
                 paintPlayers()
                 noteError(err.message ?: err.javaClass.simpleName)
+            }
+        }
+    }
+
+    /* ---- [airplayers:rows] Playing it: the receivers switch ----------------
+     *
+     * "i want the buttons to redirect audio to be responsive. i want to be
+     * able to enable and disable streams from there as well by enabling them
+     * from receiving a broadcast."
+     *
+     * The old rows felt dead for four measured reasons: the row holding the
+     * air was never drawn differently (chip.xml has no selected state); a
+     * REFUSED hand-over (/api/radio/solo answers 200 with `refused`) was
+     * painted as a success and the tick bounced back; what a tap did was
+     * written in the BROADCAST card, not here; and the list was read only
+     * when the drawer opened. Now: the row is pressed on touch, switched
+     * and marked "switching..." in the same frame as the tap, repainted from
+     * the station's answer, and a refusal or failure is said ON THE ROW. */
+
+    private fun adoptReceivers(next: AirReceivers.State, fromWrite: Boolean) {
+        val was = receivers
+        receivers = if (fromWrite || was == null || receiversPending.isEmpty()) next
+        else next.copy(receivers = next.receivers.map { r ->
+            if (r.id in receiversPending) was.of(r.id) ?: r else r
+        })
+        paintReceivers()
+    }
+
+    private fun paintReceivers() {
+        val st = receivers ?: return
+        val inflater = android.view.LayoutInflater.from(rail.context)
+        /* ROWS ARE UPDATED IN PLACE when the list is the same receivers in
+         * the same order - which is every paint but the first. Rebuilding
+         * detached the row under a finger that was already down (the drawer
+         * open fires a read, and the old code a solo answer, ~100-300 ms
+         * apart), so the release landed on a new view and the tap was lost.
+         * Measured the same way in the web harness: one tap in a few. */
+        val same = playerList.childCount == st.receivers.size &&
+            st.receivers.indices.all { playerList.getChildAt(it).tag == st.receivers[it].id }
+        if (!same) playerList.removeAllViews()
+        val fault = receiversFault
+        for ((index, r) in st.receivers.withIndex()) {
+            val row = if (same) playerList.getChildAt(index)
+            else inflater.inflate(R.layout.rail_player, playerList, false)
+            row.tag = r.id
+            val pending = r.id in receiversPending
+            row.findViewById<View>(R.id.playerTick).visibility = View.GONE
+            val sw = row.findViewById<SwitchCompat>(R.id.playerSwitch)
+            sw.visibility = View.VISIBLE
+            sw.isChecked = r.audible
+            row.findViewById<TextView>(R.id.playerName).text = r.label
+            row.findViewById<View>(R.id.playerBadge).visibility =
+                if (r.active) View.VISIBLE else View.GONE
+            val err = if (fault != null && fault.first == r.id) fault.second else ""
+            val detail = row.findViewById<TextView>(R.id.playerDetail)
+            detail.text = listOf(AirReceivers.detail(r, pending), err)
+                .filter { it.isNotBlank() }.joinToString(NEWLINE)
+            detail.setTextColor(rail.resources.getColor(when {
+                err.isNotBlank() -> R.color.pine_bad
+                pending -> R.color.pine_amber
+                else -> R.color.pine_dim
+            }, null))
+            row.isSelected = r.active
+            row.alpha = if (r.kind == "page" && !r.present) 0.62f else 1f
+            row.contentDescription = r.label + if (r.audible)
+                " is audible - tap to switch it off" else " is off - tap to let it sound"
+            row.setOnClickListener { flipReceiver(r) }
+            val only = row.findViewById<Button>(R.id.playerOnly)
+            only.visibility = View.VISIBLE
+            only.contentDescription = "Make " + r.label + " the only one sounding in the house"
+            only.tooltipText = only.contentDescription
+            only.setOnClickListener { onlyReceiver(r) }
+            if (!same) playerList.addView(row)
+        }
+        playerNote.text = fault?.second ?: AirReceivers.note(st)
+        playerNote.setTextColor(rail.resources.getColor(
+            if (fault != null || st.refused.isNotBlank()) R.color.pine_bad else R.color.pine_dim,
+            null,
+        ))
+    }
+
+    private fun flipReceiver(r: AirReceivers.Receiver) {
+        if (r.id in receiversPending) return
+        val want = !r.audible
+        writeReceivers(setOf(r.id), AirReceivers.flip(r.id, want),
+            "switching " + r.label + if (want) " on" else " off") {
+            AirReceivers.optimistic(it, r.id, want)
+        }
+    }
+
+    private fun onlyReceiver(r: AirReceivers.Receiver) {
+        val st = receivers ?: return
+        if (receiversPending.isNotEmpty()) return
+        writeReceivers(AirReceivers.touched(st, r.id, true), AirReceivers.only(r.id),
+            "only " + r.label) { AirReceivers.optimisticOnly(it, r.id) }
+    }
+
+    /** One write: painted before the network, repainted from the answer. */
+    private fun writeReceivers(
+        ids: Set<String>, body: String, saying: String,
+        guess: (AirReceivers.State) -> AirReceivers.State,
+    ) {
+        val was = receivers ?: return
+        receiversFault = null
+        receiversPending.addAll(ids)
+        receivers = guess(was)
+        paintReceivers()
+        playerNote.text = saying + "…"
+        val t0 = android.os.SystemClock.uptimeMillis()
+        scope.launch {
+            try {
+                val answer = AirReceivers.read(JSONObject(client.post(AirReceivers.ROUTE, body)))
+                    ?: throw IllegalStateException("the station gave no answer")
+                receiversPending.removeAll(ids)
+                if (answer.refused.isNotBlank()) {
+                    receiversFault = ids.first() to AirReceivers.note(answer)
+                }
+                adoptReceivers(answer, fromWrite = true)
+                Log.i(TAG, "playing it: " + saying + " confirmed in "
+                    + (android.os.SystemClock.uptimeMillis() - t0) + " ms: "
+                    + AirReceivers.summary(answer))
+            } catch (err: Exception) {
+                receiversPending.removeAll(ids)
+                receivers = was
+                receiversFault = ids.first() to ("not changed - could not reach the station: "
+                    + (err.message ?: err.javaClass.simpleName))
+                paintReceivers()
+                Log.w(TAG, "playing it: $saying failed", err)
             }
         }
     }
@@ -1061,6 +1224,15 @@ class RailController(
      */
     private fun selectDestination(key: String) {
         val preset = DjOutput.PRESETS[key] ?: return
+        /* [airplayers:chip] ANSWER THE THUMB FIRST. This used to light
+         * nothing and say nothing until six round trips had finished (two
+         * reads, the solo, the routes, a 21 KB settings PUT and another
+         * read) - and a feed paint in between repainted the old chip. The
+         * chip lights now and the line says "sending"; the station's answer
+         * (or its refusal, in words) replaces both. */
+        destinationPending = key
+        for ((k, chip) in presetChips) chip.isActivated = k == key
+        paintNote()
         scope.launch {
             try {
                 val settings = JSONObject(client.get("/api/settings"))
@@ -1097,14 +1269,18 @@ class RailController(
                 client.put("/api/settings", settings.toString())
 
                 destination = key
+                destinationPending = ""          // [airplayers:chip-ok]
                 state = state.patched(routed)
                 roster = AirOwners.read(
                     JSONObject(client.get("/api/radio/listeners")), settings,
                 )
                 paint()
                 noteOk("broadcast -> " + preset.label)
+                readPlayers()                    // [airplayers:chip-done] Playing it follows
             } catch (err: Exception) {
                 Log.w(TAG, "could not select broadcast destination", err)
+                destinationPending = ""          // [airplayers:chip-fail]
+                paint()
                 noteError(err.message ?: err.javaClass.simpleName)
             }
         }
@@ -1268,6 +1444,12 @@ class RailController(
      * still read "routing unknown" because nothing but a tap ever wrote it.
      */
     private fun paintNote() {
+        if (destinationPending.isNotBlank()) {          // [airplayers:note]
+            routeNote.text = "sending: broadcast -> " +
+                (DjOutput.PRESETS[destinationPending]?.label ?: destinationPending) + "…"
+            routeNote.setTextColor(rail.resources.getColor(R.color.pine_amber, null))
+            return
+        }
         val fault = this.fault
         if (fault != null) {
             routeNote.text = fault
@@ -1320,7 +1502,9 @@ class RailController(
          * describeRouting() names the three separately in that case. */
         val presets = s.presets
         for ((key, chip) in presetChips) {
-            chip.isActivated = if (destination in presetChips) {
+            chip.isActivated = if (destinationPending.isNotBlank()) {
+                key == destinationPending        // [airplayers:pending] the tap, until answered
+            } else if (destination in presetChips) {
                 key == destination && key in presets
             } else {
                 key in presets
