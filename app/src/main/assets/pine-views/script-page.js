@@ -5871,6 +5871,8 @@
           of: Number(listen.pick.of) || cands.length}});
       return rows;
     }
+    var gold = mvGoldRow(item, ans);          /* [msgdb] a banked gold bar: its run and its pick */
+    if (gold) rows.push(gold);
     var only = ans && ans.sfxguy ? 'SFXGUY' : '';
     for (i = 0; i < (decisions || []).length; i += 1) {
       var ev = decisions[i];
@@ -5931,14 +5933,124 @@
     }
     return {main: main, others: others, why: got};
   }
+  /* [msgdb] WHERE A BUBBLE'S CONTENT WAS STORED - read off the record only
+     (see edit_msgdb_script_page.py): the provenance tree, the feed row's own
+     flags, System 3's observations, the station state. */
+  function mvHourBefore(key) {
+    var m = /^(\d{4})-(\d\d)-(\d\d)T(\d\d)$/.exec(String(key || ''));
+    if (!m) return '';
+    var d = new Date(Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4]) - 3600000);
+    var two = function (n) { return (n < 10 ? '0' : '') + n; };
+    return d.getUTCFullYear() + '-' + two(d.getUTCMonth() + 1) + '-' + two(d.getUTCDate()) + 'T' + two(d.getUTCHours());
+  }
+  function mvProv(lid) {
+    if (!lid || !hourKey) return Promise.resolve(null);
+    var ask = function (key) {
+      return Promise.resolve().then(function () {
+        return api().get('/api/screenplay/' + encodeURIComponent(key) + '/line/' + encodeURIComponent(lid));
+      }).then(function (got) { return (got && got.provenance) || null; }, function () { return null; });
+    };
+    return ask(hourKey).then(function (p) {
+      var back = mvHourBefore(hourKey);
+      return p || !back ? p : ask(back);
+    });
+  }
+  function mvStores(item, ans, prov) {
+    var list = [];
+    var put = function (db, why) {
+      for (var i = 0; i < list.length; i += 1) if (list[i].db === db) return;
+      list.push({db: db, why: why});
+    };
+    var row = (item && item.row) || {};
+    var s3 = row.system3 || {};
+    var clock2 = function (t) {
+      try { return new Date(Number(t) * 1000).toLocaleString([], {weekday: 'short', hour: '2-digit', minute: '2-digit'}); }
+      catch (e) { return ''; }
+    };
+    if (prov) {
+      var rnd = prov.round || {};
+      if (Number(rnd.banked_at) > 0) {
+        put('shelf', 'the shelf: a ' + String(rnd.kind || 'round') + ' round banked ' + clock2(rnd.banked_at)
+          + (rnd.frozen ? ', kept' : '') + (rnd.source ? ' (' + String(rnd.source) + ')' : ''));
+      }
+      if (prov.voice && prov.voice.shelf) put('pantry', 'the pantry: a finished take, not rendered for this airing');
+      if (prov.air && prov.air.replay) put('reair', 're-aired: a line already heard, played again');
+    }
+    if (row.replay) put('reair', row.source === 'reel' ? 'the resume reel: banked lines played back' : 're-aired from the line log' + (row.replay_of ? ' (' + String(row.replay_of).slice(0, 8) + ')' : ''));
+    if (s3.replay && typeof s3.replay === 'object') {
+      put('reair', String(s3.replay.label || 're-aired') + (s3.replay.decided_by ? ' - ' + String(s3.replay.decided_by) : ''));
+    }
+    if (item && item.kindOf === 'emergency_host') put('reserve', 'the emergency host\'s reserve: recorded stock lines');
+    var obs = (ans && ans.observations) || [];
+    var said = String((item && item.text) || '').slice(0, 60);
+    var i;
+    for (i = 0; i < obs.length; i += 1) {
+      var o = obs[i] || {};
+      if (o.key === 'gold.pick' && said && String(o.picked || '').slice(0, 60) === said) {
+        put('gold', 'the gold bars: a banked bar (' + (o.index || '?') + ' of ' + (o.of || '?') + ')');
+      }
+      var m = o.media && item && o.media[item.lid];
+      if (m && m.listening) put('stock', 'the stock listening responses');
+    }
+    var guy = ans && ans.sfxguy && ans.sfxguy.line;
+    if (guy && /bank/i.test(String(guy.how || ''))) {
+      var pools = (guy.draws || []).map(function (d) { return d && d.pool; }).filter(Boolean);
+      put('speechbank', 'the SFX Guy\'s speech bank' + (pools.length ? ' (' + pools.join(', ') + ')' : ''));
+    }
+    if (item && item.kind === 'clip') {
+      put('sfxlib', 'the SFX library' + (row.sfx_dir ? ' - ' + String(row.sfx_dir) : '')
+        + (row.match_why ? ' - ' + String(row.match_why) : ''));
+    }
+    if (item && item.kind === 'record') {
+      var st = mvState() || {};
+      var now = st.now || {};
+      put('music', 'the music library' + (now.station ? ' - ' + String(now.station) : ''));
+    }
+    return {list: list, names: list.map(function (x) { return x.db; }),
+      title: list.length ? 'From a store: ' + list.map(function (x) { return x.why; }).join('; ') : ''};
+  }
+  function mvGoldRow(item, ans) {
+    var obs = (ans && ans.observations) || [];
+    var said = String((item && item.text) || '').slice(0, 60);
+    var run = null, pick = null;
+    for (var i = 0; i < obs.length; i += 1) {
+      var o = obs[i] || {};
+      if (o.key === 'gold.run') run = o;
+      if (o.key === 'gold.pick' && said && String(o.picked || '').slice(0, 60) === said) { pick = o; break; }
+    }
+    if (!pick) return null;
+    var cands = (pick.candidates || []).map(String);
+    return {fam: 'STATION', table: 'gold', event: '',
+      main: {dice: run ? run.dice : null, opts: ['the next rung', 'a gold run'], hit: run && run.hit ? 1 : 0,
+        label: run && run.hit ? 'a gold run' : 'the next rung', of: 2},
+      sub: {dice: pick.dice, opts: cands.length ? cands : [String(pick.picked || '')],
+        hit: Math.max(0, (Number(pick.index) || 1) - 1), label: String(pick.picked || '').slice(0, 80),
+        of: Number(pick.of) || cands.length}};
+  }
+  function mvBadge(cur, stores) {
+    if (!cur || !cur.node || !stores || !stores.list.length) return;
+    var bubble = cur.node.querySelector('.sp-mv-bubble');
+    if (!bubble || bubble.querySelector('.sp-mv-db')) return;
+    var b = mvGlyph('c:archive', 'sp-mv-db');
+    b.title = stores.title;
+    b.setAttribute('role', 'img');
+    b.setAttribute('aria-label', stores.title);
+    bubble.appendChild(b);
+    cur.node.classList.add('sp-mv-stored');
+    var note = make('p', 'sp-mv-note sp-mv-dbnote', stores.title);
+    cur.all.appendChild(note);
+  }
   function mvAsk(item) {
     var lid = item.lid;
     if (!lid) return Promise.resolve(null);
     var have = mv.answers[lid];
     if (have) return have;
-    var p = Promise.resolve().then(function () {
+    var prov = null;                         /* [msgdb] the provenance tree, asked beside it */
+    var p = Promise.all([Promise.resolve().then(function () {
       return s3Request('/api/system3/line?line_id=' + encodeURIComponent(lid));
-    }).then(null, function () { return null; }).then(function (ans) {
+    }).then(null, function () { return null; }), mvProv(lid)]).then(function (two) {
+      var ans = two[0];
+      prov = two[1];
       var turn = ans && ans.turn || null;
       var decisions = (ans && ans.decisions) || [];
       /* cover_a's finding: a ledger row may carry a neighbour's dice; the
@@ -5963,7 +6075,8 @@
       var out = {rows: mvRowsOf(item, ans, got && got.decisions),
         sources: mvSources(item, ans, got && got.turn, got && got.decisions),
         cid: String((ans && ans.line && ans.line.conversation_id) || ''),
-        tid: String((got && got.turn && got.turn.turn_id) || ''), restamped: got && got.restamped || ''};
+        tid: String((got && got.turn && got.turn.turn_id) || ''), restamped: got && got.restamped || '',
+        stores: mvStores(item, ans, prov)};    /* [msgdb] */
       return out;
     });
     mv.answers[lid] = p;
@@ -6130,6 +6243,7 @@
   }
   function mvPlan(cur, data) {
     cur.data = data;
+    if (!data.stores) data.stores = mvStores(cur.item, null, null);   /* [msgdb] a record, a live set */
     cur.rolls.textContent = '';
     var rows = (data.rows || []).slice(0, 6);
     var shown = [];
@@ -6165,6 +6279,7 @@
       }
       cur.all.appendChild(line);
     });
+    mvBadge(cur, data.stores);                /* [msgdb] the filing cabinet, over the corner */
     if (data.restamped) cur.all.appendChild(make('p', 'sp-mv-note', 'the line\'s own System 3 stamp named its turn; the ledger row said ' + data.restamped));
     if (!(data.rows || []).length && (cur.item.kind === 'speech' || cur.item.kind === 'clip')) {
       cur.all.appendChild(make('p', 'sp-mv-note', 'no System 3 table was rolled for this line'));
@@ -6401,7 +6516,9 @@
       return c ? {key: c.item.key, kind: c.item.kind, phase: c.phase, typed: c.typed,
         text: c.item.text, rows: c.data ? c.data.rows.length : -1,
         source: c.src ? c.src.main : '', others: c.src ? c.src.others.slice() : [],
-        lostGL: mv.lostGL || 0} : null;
+        lostGL: mv.lostGL || 0,
+        stores: c.data && c.data.stores ? c.data.stores.names.slice() : [],   /* [msgdb] */
+        storeTitle: c.data && c.data.stores ? c.data.stores.title : ''} : null;
     },
     scene: function () { return mv.scene ? {key: mv.scene.key, local: mv.scene.local, docked: !!mv.scene.el} : null; },
     _rowsOf: mvRowsOf, _sources: mvSources, _decisionRow: mvDecisionRow
