@@ -508,3 +508,8 @@
 .pl-scope-wrap > .pl-fall .pl-fall-axis span { display: none; }
 .pl-scope-wrap > .pl-fall .pl-fall-axis span:first-child,
 .pl-scope-wrap > .pl-fall .pl-fall-axis span:last-child { display: inline; }
+
+/* [plsplit] the track split strip under the countdown */
+.pl-countdown-split { position: absolute; left: 0; bottom: 0; height: 4px; width: 0;
+  background: #7fb2ff; transition: width 1s linear; }
+.pl-countdown.splitting .pl-countdown-words { color: #e6f0ff; }

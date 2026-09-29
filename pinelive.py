@@ -454,6 +454,10 @@ def wav_header(data_bytes: int) -> bytes:
 
 # [plair] the on-air test ends itself after this long (seconds).
 REHEARSE_MAX_S = 600
+# [plsplit] a set's tracks split on this much unbroken silence ...
+SPLIT_SILENCE_S = 10.0
+# ... and a single track is still cut at this length, as a safety net.
+SPLIT_CAP_S = 3600.0
 
 
 def cut_names(start: float, index: int) -> tuple[str, str]:
@@ -553,6 +557,8 @@ class Recorder:
                     self.fmt = fmt
                     self.index = int(first) - 1
                     self.frames = 0
+                    self.quiet_frames = 0                      # [plsplit]
+                    self.split_waiting = False
                     continue
                 if item and item[0] == "end":
                     self._close_pair(final=True)
@@ -567,19 +573,48 @@ class Recorder:
                 frame, live, t = item
                 if self.folder is None:
                     continue
+                # [plsplit] tracks split on silence, not the clock
+                loud = self._loud(live)
+                self.quiet_frames = 0 if loud else getattr(self, "quiet_frames", 0) + 1
                 if self.inp is None:
+                    if not loud:
+                        continue                      # between tracks: nothing is recorded
                     self._open_pair(t)
+                    self.split_waiting = False
                 self.inp.write(live if live else SILENCE)
                 self.mix.write(frame if frame else SILENCE)
                 self.frames += 1
                 self.frames_total += 1
                 self.last_frame_at = time.time()
-                if self.frames >= self.frames_per_cut:
+                if self.quiet_frames >= int(SPLIT_SILENCE_S * 1000 / FRAME_MS):   # [plsplit]
+                    self._close_pair(final=False)
+                    self.split_waiting = True
+                    try:
+                        self.owner.track_split()
+                    except Exception:  # noqa: BLE001
+                        pass
+                elif self.frames >= int(SPLIT_CAP_S * 1000 / FRAME_MS):
                     self._close_pair(final=False)
             except Exception as exc:  # noqa: BLE001
                 self.why = "cut_write: %s" % exc
                 self.owner.error("cut_write", "a cut could not be written: %s" % exc)
                 self.inp = self.mix = None
+
+    def _loud(self, live: bytes | None) -> bool:
+        """[plsplit] Is this input frame above the set's silence level?"""
+        if np is None:
+            return True                  # cannot measure: never split on silence
+        if not live:
+            return False
+        x = np.frombuffer(live[:len(live) - len(live) % 2], dtype="<i2").astype(np.float32)
+        if not x.size:
+            return False
+        x /= 32768.0
+        try:
+            floor = float(self.owner.settings.get("silence_db", -60.0))
+        except Exception:  # noqa: BLE001
+            floor = -60.0
+        return _db(float(np.sqrt(np.mean(x * x)))) > floor
 
     def _open_pair(self, t: float) -> None:
         self.index += 1
@@ -1384,12 +1419,27 @@ class PineLive:
             event_row=ev)
         return {"ok": True, "code": "", "say": "MX Live ended - the music is back"}
 
+    def track_split(self) -> None:
+        """[plsplit] The recorder closed a track on silence: the set steps on."""
+        with self.lock:
+            if self.event is None:
+                return
+            n = int(self.event.get("track") or 1) + 1
+            self.event["track"] = n
+        self._save_event()
+        self.note("track", "silence %d s - track %d recorded; track %d starts with the "
+                  "next sound" % (int(SPLIT_SILENCE_S), n - 1, n))
+
     def next_track(self) -> dict[str, Any]:
         """[pltrack] The operator's next-track during a set: the recording
         cuts here into a new pair and the set's cover re-rolls."""
         with self.lock:
             if not self.armed() or self.event is None:
                 return self.refuse("not_live", "no set is running")
+            if self.recorder is not None and getattr(self.recorder, "split_waiting", False):
+                # [plsplit] already between tracks: the new one starts with the sound
+                return {"ok": True, "code": "", "say": "track %d starts with the next sound"
+                        % int(self.event.get("track") or 1)}
             n = int(self.event.get("track") or 1) + 1
             self.event["track"] = n
             rehearse = bool(self.event.get("rehearse"))
@@ -1759,6 +1809,11 @@ class PineLive:
                 "cut_seconds": s["cut_seconds"], "format": s["format"],
                 "dir": ("data/pinelive/cuts/" + folder) if folder else "",
                 "dest": self.dest_folder(folder) if folder else self.dest_folder("").rstrip("\\"),
+                "split": ({"quiet_s": round(getattr(rec, "quiet_frames", 0) * FRAME_MS / 1000.0, 1),
+                           "after_s": SPLIT_SILENCE_S,
+                           "waiting": bool(getattr(rec, "split_waiting", False)),
+                           "track": int((self.event or {}).get("track") or 1)}
+                          if (rec is not None and armed) else None),     # [plsplit]
                 "cut_index": rec.index if (rec is not None and armed) else 0,
                 "cut_elapsed": round(rec.frames * FRAME_MS / 1000.0, 1) if (rec is not None and armed) else 0.0,
                 "last_cut": ({k: last.get(k) for k in ("index", "start", "seconds", "input", "mix")}
