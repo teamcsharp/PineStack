@@ -116,8 +116,46 @@
       x.classList.add('pcx-abs');
       if (x.parentNode !== pop) pop.appendChild(x);
     }
+    soon(entry);   /* [closex:clear] */
     return true;
   }
+
+  /* [closex:clear] nothing sits under the X: a control whose box the X
+   * covers gets its row padded clear of it, so the row's controls move
+   * left (operator 2026-09-29: the thumbs sat under the X). */
+  function clear(entry) {
+    var pop = entry.node, x = entry.button;
+    if (!pop.isConnected || !x.isConnected) return;
+    var xr = x.getBoundingClientRect();
+    if (!xr.width || !xr.height) return;
+    var list = pop.querySelectorAll('button, a[href], input, select, textarea, [role="button"], .pcx-avoid');
+    for (var i = 0; i < list.length; i += 1) {
+      var el = list[i];
+      if (el === x || x.contains(el) || el.contains(x)) continue;
+      var r = el.getBoundingClientRect();
+      if (!r.width || r.bottom <= xr.top + 2 || r.top >= xr.bottom - 2 || r.right <= xr.left + 2 || r.left >= xr.right - 2) continue;
+      var row = el.parentElement && el.parentElement !== pop ? el.parentElement : el;
+      var had = 0;
+      try { had = parseFloat(root.getComputedStyle(row).paddingRight) || 0; } catch (e) { had = 0; }
+      row.style.paddingRight = Math.ceil(had + (r.right - xr.left) + 6) + 'px';
+      row.setAttribute('data-pcx-clear', '');
+    }
+  }
+  function soon(entry) {
+    if (entry.clearing) return;
+    entry.clearing = true;
+    var go = function () { try { clear(entry); } catch (e) { /* the X stands without it */ } };
+    (root.requestAnimationFrame || root.setTimeout)(function () { entry.clearing = false; go(); });
+    root.setTimeout(go, 350);    /* icons and fonts settle */
+    root.setTimeout(go, 1200);
+    if (!clearWired) {
+      clearWired = true;
+      root.addEventListener('resize', function () {
+        for (var i = 0; i < entries.length; i += 1) { try { clear(entries[i]); } catch (e) { /* next */ } }
+      });
+    }
+  }
+  var clearWired = false;
 
   function reserve(pop, side) {
     if (side === 'top') pop.style.paddingTop = 'max(44px, ' + (pop.style.paddingTop || '0px') + ')';
