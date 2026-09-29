@@ -1385,6 +1385,9 @@ class System2Runtime:
                                if float(row.get("at") or 0) >= hour_start][-12:]
                     observed = [{k: row.get(k) for k in ("text", "who", "kind", "air_at")} for row in list(h._RADIO.get("chat") or [])
                                 if row.get("aired") in ("box", "stream", "both") and float(row.get("air_at") or 0) >= hour_start][-30:]
+                    for _o in observed:   # [num-leak] a board clip is its words, never its library index
+                        if _o.get("who") == "board" and callable(getattr(h, "prompt_sfx_label", None)):
+                            _o["text"] = h.prompt_sfx_label(str(_o.get("text") or ""), True)
                     work["observed_hour"] = {"records": history, "dialogue": observed, "as_of": time.time()}
                     await h.dj_banter(None, angle=brief + "\nRecap only these observed events SO FAR; do not invent the remaining minutes.\n" +
                                       json.dumps(work["observed_hour"], ensure_ascii=False),

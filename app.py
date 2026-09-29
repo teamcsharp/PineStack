@@ -21032,6 +21032,11 @@ def gallery_turns(script: str) -> list[str]:
     is how #977's caller counter read zero on every call the station had
     ever written."""
     text = str(script or "")
+    try:                                        # [num-leak] a row number is not a word
+        import bookkeeping_numbers as _bn
+        text = _bn.row_numbers_cut(text)[0]
+    except ImportError:
+        pass
     parts = _GALLERY_MARKER.split(text)
     if len(parts) < 3:
         return [text.strip()] if text.strip() else []
@@ -36014,9 +36019,80 @@ def spoken_text(line: str) -> str:
     clean = re.sub(r"\s{2,}", " ", clean).strip()
     # [s3-rownum] belt and braces: a running-order row number left after the last
     # sentence ("...in here. 11") is never said, whichever road wrote the line
-    clean = re.sub(r"(?<=[.!?\u2026\"\u201d'\u2019)\]])\s+\d{1,2}\s*$", "", clean).strip()
+    # [num-leak] ...and every other bookkeeping number: a clip label, a clip's index in
+    # front of its words, the running order's turn numbers. Recorded, never silent.
+    clean = num_leak_gate(clean)
     # #870: the English rule, at the one door every spoken line uses.
     return english_only(clean)
+
+
+# [num-leak] THE LAST GATE FOR BOOKKEEPING NUMBERS (bookkeeping_numbers.py says why).
+# Every cut is written down - the drop log and a technical line-review row, once per
+# line - so a number taken out of a spoken line is never a silent edit.
+_NUM_LEAK_SEEN: dict[str, float] = {}
+
+
+def prompt_sfx_label(text: Any, board: bool = False) -> str:
+    """[num-leak] A board clip as a writer may be told of it: its words, never its
+    library index or file name ("a sound clip from the board ("dental plan in")").
+    Any other text is itself. `board`: known to be a clip label without the glyph."""
+    try:
+        import bookkeeping_numbers as _bn
+        return _bn.sfx_label_for_prompt(text, board)
+    except Exception:  # noqa: BLE001
+        return str(text or "")
+
+
+def prompt_last_said(spoken: Any) -> str:
+    """[num-leak] The last thing a PERSON said in a round's "who: text" list - never
+    a board clip's label. "" when nobody spoke."""
+    try:
+        import bookkeeping_numbers as _bn
+        return _bn.last_said(spoken)
+    except Exception:  # noqa: BLE001
+        items = list(spoken or [])
+        return str(items[-1]) if items else ""
+
+
+def num_leak_gate(text: Any) -> str:
+    """[num-leak] `text` without the bookkeeping numbers a writer left in it."""
+    text = str(text or "")
+    try:
+        import bookkeeping_numbers as _bn
+    except Exception:  # noqa: BLE001
+        return re.sub(r"(?<=[.!?\u2026\"\u201d'\u2019)\]])\s+\d{1,2}\s*$", "", text).strip()
+    if not re.search(r"\d|turn", text, re.I):
+        return text
+    labels: list[str] = []
+    if re.search(r"\d", text):
+        try:
+            _chat = _RADIO.get("chat") or []
+            _tail = [_chat[i] for i in range(max(0, len(_chat) - 120), len(_chat))]
+            labels = [str(r.get("text") or "") for r in _tail
+                      if isinstance(r, dict) and r.get("who") == "board"]
+        except Exception:  # noqa: BLE001
+            labels = []
+    out, hits = _bn.spoken_gate(text, labels)
+    if not hits:
+        return text
+    key = hashlib.sha1(text.encode("utf-8", "ignore")).hexdigest()[:16]
+    if key not in _NUM_LEAK_SEEN:
+        _NUM_LEAK_SEEN[key] = time.time()
+        if len(_NUM_LEAK_SEEN) > 512:
+            for old in sorted(_NUM_LEAK_SEEN, key=_NUM_LEAK_SEEN.get)[:256]:
+                _NUM_LEAK_SEEN.pop(old, None)
+        try:
+            pipeline_log("drop", "[num-leak] a bookkeeping number was cut from a spoken line: "
+                         + "; ".join(hits)[:200], extra=("%s -> %s" % (text, out))[:400])
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            line_review_capture("bookkeeping_number", text, out, reasons=hits,
+                                context={"kind": "spoken", "stage": "last_gate"},
+                                technical=True, disposition="rewrite")
+        except Exception:  # noqa: BLE001
+            pass
+    return out
 
 
 # Why the last line did not reach the box. A silent speaker and a working
@@ -36702,7 +36778,7 @@ async def _s3_chapter_write(e: dict[str, Any], plan: dict[str, Any]) -> tuple[li
                "TIME: the replies together run about %d seconds on air (about %d words in all).\n"
                "WHAT IT IS ABOUT: %s"
                % (e.get("kind") or "line", str(e.get("source_is") or "a line"), cast, int(budget),
-                  int(budget * S3_CHAPTER_WORDS_PER_SECOND), str(e.get("context") or opening)[:600]))
+                  int(budget * S3_CHAPTER_WORDS_PER_SECOND), prompt_sfx_label(str(e.get("context") or opening))[:600]))  # [num-leak]
     beats = _banter_beat_plan(sheet, len(seats), seats)
     known = [n for n in names.values() if n]
 
@@ -36749,7 +36825,7 @@ async def _s3_chapter_write(e: dict[str, Any], plan: dict[str, Any]) -> tuple[li
         _s3_chapter_save()
         k = len(draft) + 1
         rows = beats[k:]
-        recent = "\n".join("%s has just said - %s" % (m, t)
+        recent = "\n".join("%s has just said - %s" % (m, prompt_sfx_label(t))   # [num-leak]
                            for m, t in ([(seats[0], opening)] + draft)[-3:])
         order = "\n".join("%d  %s  - %s" % (row["turn"], row["seat"], row["work"]) for row in rows)
         prompt = (context + "\n\nCOMPLETED TRANSCRIPT - these lines are immutable:\n" + recent
@@ -36757,7 +36833,9 @@ async def _s3_chapter_write(e: dict[str, Any], plan: dict[str, Any]) -> tuple[li
                   + ("\nYOUR LAST DRAFT FAILED: %s. Write turn %d again as a NEW line that answers the line "
                      "immediately above it." % (why, k + 1) if why else "")
                   + "\nOutput exactly one line per listed turn. Start each line with its speaker's letter and "
-                    "a colon, once - A: then the words, B: then the words - never two markers together. "
+                    "a colon, once - A: then the words, B: then the words - never two markers together, and "
+                    "no number before the letter - a turn's number is the running order's, never a "
+                    "word to say (no 'turn 2' in anybody's mouth). "
                     "No preface, labels, markdown or stage directions.")   # [s3-slash] one marker at a time
         raw = await ask_model(prompt, limit=min(2800, max(900, 450 * len(rows))), spice=0.45, num_ctx=16384,
                               mark={"kind": "chapter repair", "turn": k + 1, "visit": visits})
@@ -50765,6 +50843,14 @@ def orch_scan() -> dict[str, Any]:
         # question behind it. Measured: an hour_ballast ask sat open
         # eighty-three minutes while the shortfall it described went
         # unfixed, and would not have been raised again for six hours.
+        # [orch-s3] his System 3 survey runs whatever the ask board says
+        # (a worker thread, at most every five minutes; never waited for).
+        _s3desk = globals().get("_ORCH_S3_DESK")
+        if _s3desk is not None:
+            try:
+                _s3desk.maybe_survey()
+            except Exception:  # noqa: BLE001
+                pass
         if orch_open():
             orch_decide_alone()
             return out                  # one at a time; answer that first
@@ -51129,6 +51215,20 @@ def orch_scan() -> dict[str, Any]:
                      ]},
                 ])
             return out
+
+        # [orch-s3] 3b. SYSTEM 3. The worst finding on his System 3 desk
+        # (a rogue or untraced line, an MP3 leak, overlap, dead air, a
+        # stale script, an undecodable clip) not asked about in half a
+        # day. The desk surveys off the loop; this reads its memo. The
+        # first option is always one the station may take alone.
+        _s3ask = globals().get("orch_s3_ask")
+        if callable(_s3ask):
+            try:
+                out = _s3ask() or {}
+            except Exception:  # noqa: BLE001
+                out = {}
+            if out:
+                return out
 
         # 4. NOTHING IS WRONG - but six hours is six hours.
         if now - float(_ORCH.get("last") or 0) >= ORCH_ASK_EVERY:
@@ -52694,6 +52794,13 @@ def orch_apply(does: str, alone: bool = False) -> str:
                     "nothing springs a topic by itself" if _want else
                     "the station springs topics by itself again (banter, callers, the "
                     "manager's memo, the SFX Guy)")
+        elif verb in ("s3note", "s3file", "s3fix", "s3undo", "s3hold"):
+            # [orch-s3] System 3's desk: note or file a finding; confirm,
+            # undo or hold a proposal. Answering alone, the station may
+            # confirm only what the desk marked station_may.
+            _s3v = globals().get("orch_s3_verb")
+            said = (_s3v(verb, arg, alone=bool(alone)) if callable(_s3v)
+                    else "the System 3 desk is not installed")
         elif verb == "thin":
             _ORCH["policy"]["thin_road"] = {
                 "value": str(arg), "at": time.time()}
@@ -91896,7 +92003,7 @@ async def _s3_loose_board_stamp(row: dict[str, Any], sample: Any) -> None:
         stamp = await _s3_door_line(
             "interject", who="board", seat="D", name="The SFX board",
             context=("the board punctuates outside a round: "
-                     + str(row.get("text") or Path(str(sample)).stem))[:300])
+                     + prompt_sfx_label(str(row.get("text") or Path(str(sample)).stem), True))[:300])  # [num-leak]
         if not stamp:
             return
         if isinstance(row.get("sfx_roll"), dict):
@@ -108898,6 +109005,15 @@ def banter_turns(script: str, caller_name: str = "",
     # colon FIRST and only for a genuine uppercase marker; the split
     # itself then wants a colon, which no article can supply.
     script = re.sub(r"(^|\s)([ABCDE])\s*-\s*", r"\1\2: ", script)
+    # [num-leak] The running order's row numbers in front of the markers ("4 B: ...
+    # 5 A: ...", folded onto one line by ask_model) are not words: cut here, where
+    # they still stand before a marker, or each one ends the turn before it
+    # ("...just plain wrong 5" AIRED 2026-09-29 - no full stop, so [s3-rownum] missed it).
+    try:
+        import bookkeeping_numbers as _bn
+        script = _bn.row_numbers_cut(script)[0]
+    except ImportError:
+        pass
     # [s3-slash] " /B:" is a marker too: a slash before it no longer hides it
     parts = re.split(r"(?:^|\s)[/\\|]*([ABCDE])\s*:\s*", " " + script,
                      flags=re.I)
@@ -112375,7 +112491,7 @@ async def _banter_beats(context: str, sheet: str, lines: int,
     async def write(rows: list[dict[str, Any]], retry: bool = False
                     ) -> tuple[str, list[tuple[str, str]], bool]:
         recent = "\n".join(
-            "%s has just said - %s" % (marker, text)
+            "%s has just said - %s" % (marker, prompt_sfx_label(text))   # [num-leak]
             for marker, text in made[-2:]) or "Nothing has been said yet."
         order = "\n".join(
             "%d  %s  - %s" % (row["turn"], row["seat"], row["work"])
@@ -112393,7 +112509,8 @@ async def _banter_beats(context: str, sheet: str, lines: int,
             + "\n\nWRITE ONLY THIS NEXT BEAT:\n" + order + correction
             + "\nEvery turn reacts to the line immediately above it before adding "
               "anything new. Output exactly one line per listed turn using only "
-              "the listed marker (A:, B:, C: or D:), once, at the start of the line. "   # [s3-slash]
+              "the listed marker (A:, B:, C: or D:), once, at the start of the line, with no number "
+              "before it - a turn's number is the running order's, never a word to say. "   # [s3-slash]
               "No preface, labels, markdown, stage "
               "directions, or lines from earlier beats. The words after each "
               "dash say HOW that turn behaves; they are never words to say."
@@ -115935,7 +116052,11 @@ async def _banter_air(entry: dict[str, Any],
         pipeline_log("call", "scenario air review could not start: "
                      + type(exc).__name__)
     if ready_takes is None and entry.get("seek_verdict") and spoken:
-        asyncio.create_task(_sfx_verdict(spoken[-1]))
+        # [num-leak] about the last thing a PERSON said: spoken[-1] was the board's
+        # "board: 🔊 26 clip-40", and the SFX guy said "26 clip-40." on air (2026-09-29)
+        _verdict_about = prompt_last_said(spoken)
+        if _verdict_about:
+            asyncio.create_task(_sfx_verdict(_verdict_about))
     if spoken:
         stats = _RADIO.setdefault("session_stats", {"calls": 0, "rounds": 0})
         stats["rounds"] = int(stats.get("rounds") or 0) + 1
@@ -152154,6 +152275,15 @@ try:
 except Exception as _rtree_exc:  # noqa: BLE001
     _ROUNDS_TREE = None
     print("the decision tree did not install: %s: %s" % (type(_rtree_exc).__name__, _rtree_exc))
+# [orch-s3] THE ORCHESTRATOR'S SYSTEM 3 DESK (orchestrator_s3.py): his read
+# faculties over every System 3 door, the triage playbook, and proposals
+# with review -> confirm -> undo. GET /api/orchestrator/system3.
+try:
+    import orchestrator_s3 as _orch_s3
+    _ORCH_S3_DESK = _orch_s3.install(app, globals())
+except Exception as _os3_exc:  # noqa: BLE001
+    _ORCH_S3_DESK = None
+    print("the orchestrator's System 3 desk did not install: %s: %s" % (type(_os3_exc).__name__, _os3_exc))
 
 
 # =====================================================================
@@ -152487,6 +152617,12 @@ async def api_orch_glass(
         state["rooms_window_seconds"] = int(extra["window_seconds"])
     if isinstance(extra.get("commands"), list):
         state["commands"] = extra["commands"]
+    try:  # [orch-s3] his System 3 desk, read off its memo
+        _s3f = globals().get("orch_s3_face")
+        if callable(_s3f):
+            state["system3"] = _s3f()
+    except Exception:  # noqa: BLE001
+        pass
     return state
 
 
@@ -152554,6 +152690,15 @@ ORCH_COMMAND_VERBS: tuple[tuple[str, str], ...] = (            # [#1211]
     ("hear <id>", "put that cupboard round on the air now, out of turn"),
     ("retire <id>", "take that round out of the cupboard"),
     ("why <road>", "why that road has nothing behind it"),
+    ("why #<code>", "one message's life story across every store"),   # [orch-s3]
+    ("s3 [know|playbook|survey|findings|untraced|coverage|mp4|display|receivers|tables|"
+     "cupboard|files|tree <segment>|proposals|faculties]",
+     "System 3's desk: what it is made of, what is wrong with it, where I may act"),
+    ("s3 table <ID> set <path>=<value> | s3 section <name> set <path>=<value> | "
+     "s3 cupboard <id> cue|uncue|finish|retire|remove",
+     "propose a System 3 change - it is shown, not made"),
+    ("s3 confirm <proposal> | s3 undo <proposal> | s3 hold <proposal>",
+     "make a proposal, take it back, or leave it waiting"),
 )
 
 
@@ -152615,6 +152760,18 @@ async def orch_command_run(text: str) -> dict[str, Any]:       # [#1211]
         say = str(said or "the dial did not move")
         lines = ["the factor for %s is now %.2f"
                  % (arg.split(" ")[0], coord_judgment_factor(arg.split(" ")[0]))]
+    elif (head == "why" and arg and callable(globals().get("orch_s3_command"))
+          and re.match(r"^#?[0-9a-f]{6,32}(-p\d+)?$", arg.split(" ")[0].lower())):
+        # [orch-s3] a message code, not a road: its life story (/api/why)
+        ok, say, lines = await globals()["orch_s3_command"](
+            "why " + arg.split(" ")[0].lstrip("#"))
+    elif head in ("s3", "sys3", "system3"):
+        # [orch-s3] System 3's desk - read, propose, confirm, undo
+        _s3c = globals().get("orch_s3_command")
+        if callable(_s3c):
+            ok, say, lines = await _s3c(arg)
+        else:
+            ok, say = False, "the System 3 desk is not installed"
     elif head == "why" and arg:
         got = await asyncio.to_thread(director_why, arg.split(" ")[0])
         say = str((got or {}).get("say") or "that road said nothing")
@@ -175063,6 +175220,17 @@ async def cupboard_judge(kind: str, row: dict[str, Any]) -> dict[str, Any]:
            why.get("label") or kind, float(why.get("seconds") or 0),
            int(why.get("aired") or 0), int(why.get("innings") or 1),
            script, stops, practice_say))
+    # [orch-s3] what System 3 says about this round: scripted by it, or
+    # legacy stock that would air Untraced on a road it now directs.
+    try:
+        _s3j = globals().get("orch_s3_judge_note")
+        _s3say = _s3j(kind, row) if callable(_s3j) else ""
+        if _s3say:
+            prompt = prompt.replace(
+                "Judge it. Answer",
+                "WHAT SYSTEM 3 SAYS ABOUT IT:\n%s\n\nJudge it. Answer" % _s3say, 1)
+    except Exception:  # noqa: BLE001
+        pass
     said = ""
     try:
         said = await ask_model(prompt, limit=220, spice=0.1,
