@@ -272,7 +272,8 @@ def _app(*heads, **ns):
     return space
 
 
-CLEAN_HEADS = ("_ROW_NUMBER_TAIL = ", "_ROW_NUMBER_LINE = ", "_HEADING_OPEN = ", "_HEADING_CLOSE = ",
+CLEAN_HEADS = ("_TURN_EDGE = ", "_TURN_EDGE_SLASH = ", "def turn_edge_clean(",   # [s3-slash-tests]
+               "_ROW_NUMBER_TAIL = ", "_ROW_NUMBER_LINE = ", "_HEADING_OPEN = ", "_HEADING_CLOSE = ",
                "_HEADING_SEP = ", "_HEADING_NEXT = ", "_HEADING_NOT = ", "_HEADING_RX", "def writer_headings(",
                "def _heading_cut(", "def writer_turn_clean(")
 

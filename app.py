@@ -25647,6 +25647,9 @@ async def voice_generate(text: str, voice: str, engine: str,
     # way off the end of the clip (#377). The audio gets a held ellipsis
     # instead; the script keeps its dash.
     text = re.sub(r"[—–-]+\s*$", "…", text)
+    # [s3-slash] ...and never a slash or a speaker marker on its front: whatever
+    # road the words came by, the engine is not handed "/B: every pause ..."
+    text = turn_edge_clean(text) or text
     # The gate is per-engine: Piper voices against the live catalog, clones
     # against the library, Voxtral against its preset list. Same doctrine
     # throughout — the server-side check is the real check.
@@ -35716,6 +35719,53 @@ def english_only(line: str) -> str:
     return ""
 
 
+# [s3-slash] A SLASH OR A SPEAKER MARKER AT THE FRONT OF A TURN IS NOT A WORD.
+# 2026-09-28/29: 104 aired lines in 48 h opened on "/" - "/Out of hand? Are you
+# kidding me?", "/B: every pause is a calculated opportunity ..." - on the manager,
+# recap, news, banter, gallery, gold and ad roads. The writer had been TOLD the
+# marker was "A:/B:" ("Return only A:/B: dialogue", "the listed A:/B:/C:/D:
+# marker") and the small model copied it - "A:/B: text", "B:/text" - or doubled a
+# marker - "A: A: text". The split took "A:" and left "/B: text" (a "/" is not the
+# white space a marker needs before it, and in "A: A:" the first marker eats it),
+# and XTTS's sanitiser drops the "/" but reads the "B". The EDGE of a turn - never
+# its middle - loses every slash, pipe or backslash and every marker it opens on.
+_TURN_EDGE = re.compile(r"^(?:\s*[/\\|]+|\s*[ABCDE]\s*:(?!\d))+\s*")
+_TURN_EDGE_SLASH = re.compile(r"^\s*(?:[/\\|]+\s*(?:[ABCDE]\s*:(?!\d)\s*)?)+")
+TURN_EDGE_SEATS = ("dj", "cohost", "third", "caller", "caller2", "guest")
+
+
+def turn_edge_clean(text: Any, markers: bool = True) -> str:
+    """[s3-slash] One turn or one line without the stray edge on its front: a run
+    of slashes / pipes / backslashes and (`markers`) the speaker markers the writer
+    left there ("A:/B: ", "/B: ", "A: A: "). markers=False takes a marker only
+    where a slash stands before it - for text that may still be a whole script."""
+    s = str(text or "")
+    m = (_TURN_EDGE if markers else _TURN_EDGE_SLASH).match(s)
+    return s[m.end():] if m and m.end() else s
+
+
+def turn_edge_row_text(row: Any) -> str:
+    """[s3-slash] A script / feed row's words: a speaking seat's line without its
+    edge (a clip label, a board cue or a marker row is written as it is)."""
+    text = str((row or {}).get("text") or "")
+    if str((row or {}).get("who") or "") not in TURN_EDGE_SEATS:
+        return text
+    return turn_edge_clean(text) or text
+
+
+def turn_edge_rows(rows: Any) -> Any:
+    """[s3-slash] Script rows as they are written down: a speaking seat's row
+    whose line opens on an edge is copied without it; every other row is itself."""
+    out = []
+    for row in rows or []:
+        if isinstance(row, dict) and row.get("text"):
+            text = turn_edge_row_text(row)
+            if text != row.get("text"):
+                row = dict(row, text=text)
+        out.append(row)
+    return out
+
+
 def spoken_text(line: str) -> str:
     """Everything here is read aloud, and a model that is told not to use
     markdown still does. Asterisks become audible pauses and bracketed stage
@@ -35736,6 +35786,8 @@ def spoken_text(line: str) -> str:
     # written would hand the TTS private-use characters and a block's name
     clean = SPOKEN_NOISE.sub(" ", _pb_unmark(str(line or "")))
     clean = re.sub(r"https?://\S+", "", clean)
+    # [s3-slash] a slash (and a marker behind it) on the front is never said
+    clean = turn_edge_clean(clean, markers=False)
     # Strip the breathy filler OPENERS the model keeps writing (#598): "Whew…",
     # "Haah…", "Hmm…", "Mm—", "Ah…", "Ooh", "Ugh" and friends read out as
     # unnatural ooos-and-ahs — the DJs "sound atrocious". Drop a leading run of
@@ -107813,10 +107865,13 @@ def banter_turns(script: str, caller_name: str = "",
     # colon FIRST and only for a genuine uppercase marker; the split
     # itself then wants a colon, which no article can supply.
     script = re.sub(r"(^|\s)([ABCDE])\s*-\s*", r"\1\2: ", script)
-    parts = re.split(r"(?:^|\s)([ABCDE])\s*:\s*", " " + script,
+    # [s3-slash] " /B:" is a marker too: a slash before it no longer hides it
+    parts = re.split(r"(?:^|\s)[/\\|]*([ABCDE])\s*:\s*", " " + script,
                      flags=re.I)
     turns = [(parts[i].upper(), writer_turn_clean(parts[i + 1]))   # [s3-rownum]
              for i in range(1, len(parts) - 1, 2)]
+    # [s3-slash] the edge of every turn: "/B: ...", "A: A: ...", "B:/..." is the words
+    turns = [(m, turn_edge_clean(x).strip()) for m, x in turns]
     # A model's repeated A is still A's text. Responses are explicit separate
     # turns, and an absent actor or unfinished draft belongs to planning and
     # validation, never to a parser silently changing words or ownership.
@@ -111292,7 +111347,8 @@ async def _banter_beats(context: str, sheet: str, lines: int,
             + "\n\nWRITE ONLY THIS NEXT BEAT:\n" + order + correction
             + "\nEvery turn reacts to the line immediately above it before adding "
               "anything new. Output exactly one line per listed turn using only "
-              "the listed A:/B:/C:/D: marker. No preface, labels, markdown, stage "
+              "the listed marker (A:, B:, C: or D:), once, at the start of the line. "   # [s3-slash]
+              "No preface, labels, markdown, stage "
               "directions, or lines from earlier beats. The words after each "
               "dash say HOW that turn behaves; they are never words to say."
         )
@@ -113089,8 +113145,8 @@ async def dj_banter(track: dict[str, Any] | None = None,
             rewritten = await ask_model(
                 "Rewrite the following Pine Box FM draft as a coherent, "
                 + ("complete short exchange. " if _system2_budget else "long-form exchange. ")
-                + "Return only A:/B"
-                + ("/C" if caller_name else "/D" if _system2_budget and dj.get("third_name") else "") + ": dialogue. Keep its "
+                + "Return only dialogue lines, each opening on ONE speaker marker - A: or B:"   # [s3-slash]
+                + (" or C:" if caller_name else " or D:" if _system2_budget and dj.get("third_name") else "") + ". Keep its "
                 "subject and every verbatim quotation. "
                 + (f"Write {lines} alternating turns. " + _pb("turn_rules", system2_turn_instruction(_system2_budget))   # [s3-blocks]
                    if _system2_budget else f"Write {lines} alternating turns. "
@@ -183328,7 +183384,7 @@ def airlog_row_from(entry: dict[str, Any]) -> dict[str, Any]:
         "round": str(entry.get("round") or "")
                  or ("caller" if who in ("caller", "caller2") else "")
                  or (kind if kind in AIRLOG_TURN_ROUNDS else "banter"),
-        "text": " ".join(str(entry.get("text") or "").split())[:600],
+        "text": " ".join(turn_edge_row_text(entry).split())[:600],      # [s3-slash]
         "repeat_text_key": line_repeat.fingerprint(entry.get("text") or ""),
         "aired": str(entry.get("aired") or ""),
         # 2026-09-15 (#1422c): AND THE HEARING STAMP, BESIDE IT.
@@ -184806,6 +184862,9 @@ def script_ledger_commit(sid: str, rows: list[dict[str, Any]],
         _system_at_write = {}
         _settings_revision = ""
     out: list[str] = []
+    # [s3-slash] a speaking seat's line is written down without a slash or a speaker
+    # marker on its front, whichever road it came by (System 3's register too)
+    rows = turn_edge_rows(rows)
     for ord_, row in enumerate(rows):
         out.append(json.dumps({
             "block": block, "ord": int(row.get("_ord", ord_)), "at": at,  # [air-order] _ord
