@@ -513,3 +513,12 @@
 .pl-countdown-split { position: absolute; left: 0; bottom: 0; height: 4px; width: 0;
   background: #7fb2ff; transition: width 1s linear; }
 .pl-countdown.splitting .pl-countdown-words { color: #e6f0ff; }
+
+/* [plend] the end-the-set offer on the countdown bar */
+.pl-countdown.offer { height: 32px; }
+.pl-countdown.offer .pl-countdown-words { line-height: 32px; padding-right: 210px; }
+.pl-countdown-offer { position: absolute; right: 4px; top: 4px; display: flex; gap: 6px; }
+.pl-countdown-offer[hidden] { display: none; }
+.pl-countdown-offer button { height: 24px; padding: 0 10px; border-radius: 5px; font-size: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.35); background: rgba(0, 0, 0, 0.45); color: #fff; cursor: pointer; }
+.pl-countdown-offer .pl-countdown-end { border-color: #e0786d; }

@@ -1345,6 +1345,33 @@
         + (st.phase === 'live' && f && f.after_s ? '; the records take the air in '
           + Math.max(0, Math.ceil(f.after_s - Number(f.quiet_s || 0))) + ' s' : '');
     }
+    /* [plend] 30 s of silence: offer to end the set (never without the tap) */
+    var quietAll = sp ? (Number(sp.quiet_s) || 0) : 0;
+    if (quietAll < 30) ui.endOfferDismissed = false;
+    var showOffer = !!(sp && quietAll >= 30 && !ui.endOfferDismissed);
+    var offer = bar.querySelector('.pl-countdown-offer');
+    if (showOffer && !offer) {
+      offer = make('span', 'pl-countdown-offer');
+      var endB = make('button', 'pl-countdown-end', 'End the set');
+      endB.type = 'button';
+      endB.addEventListener('click', function (e) {
+        e.stopPropagation();
+        act('/api/pinelive/stop', {}, endB).then(function () { try { paintCountdown(); } catch (err) { /* next poll */ } });
+      });
+      var keepB = make('button', 'pl-countdown-keep', 'Keep going');
+      keepB.type = 'button';
+      keepB.addEventListener('click', function (e) {
+        e.stopPropagation();
+        ui.endOfferDismissed = true;
+        try { paintCountdown(); } catch (err) { /* next poll */ }
+      });
+      offer.appendChild(endB);
+      offer.appendChild(keepB);
+      bar.insertBefore(offer, bar.querySelector('.pl-countdown-words'));
+    }
+    if (offer) offer.hidden = !showOffer;
+    setClass(bar, 'offer', showOffer);
+    if (showOffer) text = 'Silent ' + Math.round(quietAll) + ' s - end the set, its stream and its recording?';
     if (strip) strip.style.width = (sfrac * 100).toFixed(1) + '%';
     setClass(bar, 'splitting', sfrac > 0);
     bar.firstChild.style.width = (frac * 100).toFixed(1) + '%';
