@@ -192,6 +192,11 @@ class TheRoadsThatMustStayAudible(unittest.TestCase):
         self.audio = self.root / "heard.mp3"
         for one in (self.video, self.audio):
             one.write_bytes(b"x" * 64)
+        # [mp4only-test] audible below the switch; at MP4 only the dead-air
+        # road draws a sounding picture (test_mp4only_2026_09_29).
+        _mp4 = mock.patch.object(app, "sfx_mp4_only", return_value=False)
+        _mp4.start()
+        self.addCleanup(_mp4.stop)
 
     def test_the_dead_air_road_never_draws_a_picture(self):
         """sfx_fill_gap goes through _sfx_any, and its whole job is that
@@ -377,7 +382,8 @@ class TheStingWithAPicture(unittest.IsolatedAsyncioTestCase):
         await app.dj_sting(True, sample=self.sample)
         row = self.radio["chat"][-1]
         self.assertTrue(row["video"])
-        self.assertEqual(row["aired"], "page")
+        # [mp4only-test] published until a player's own receipt says heard
+        self.assertEqual(row["aired"], "published")
 
     async def test_a_video_is_never_staged_into_the_episode(self):
         """The episode is one concat graph mapping ONE audio output: an

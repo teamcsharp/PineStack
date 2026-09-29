@@ -701,7 +701,15 @@ def install(app: Any, namespace: dict[str, Any]) -> ReceiptStore | None:
             raise HTTPException(status_code=400, detail="a JSON body is required") from exc
         import asyncio
         addr = str(getattr(request.client, "host", "") or "")
-        return await asyncio.to_thread(store.append, body, addr)
+        got = await asyncio.to_thread(store.append, body, addr)
+        # [mp4only-undecodable] a clip no player could open is quarantined
+        hook = namespace.get("sfx_quarantine_receipts")
+        if callable(hook):
+            try:
+                await asyncio.to_thread(hook, body)
+            except Exception:  # noqa: BLE001
+                pass
+        return got
 
     @app.get("/api/sfx/display-audit")
     async def sfx_display_audit_api(hours: float = 1.0, line: str = "", text: int = 0,

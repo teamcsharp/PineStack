@@ -210,10 +210,14 @@ class SfxStreamCadenceTests(unittest.IsolatedAsyncioTestCase):
         self.patch('sfx_soundboard_hold_cadence', mock.Mock(return_value=False))
         self.patch('sfx_match_on', mock.Mock(return_value=False))
         got = await app._sfx_cadence_additions_inner('dj', 'a line', 2, 20)
-        self.assertEqual(got[0]['who'], 'board')
-        self.assertEqual(Path(got[0]['path']).name, 'scratch.wav')
+        # [mp4only-test] the switch at 100 is MP4 ONLY: a picture miss leaves
+        # the optional slot empty and no MP3 is welded in its place (#1462
+        # fell back to audio; the operator: "the roulette should only be
+        # offering mp4s").
+        self.assertFalse([r for r in got if r.get('who') == 'board'])
         app._sfx_cadence_video_pick.assert_called_once_with('a line')
-        app._sfx_cadence_pick.assert_called()
+        app._sfx_cadence_pick.assert_not_called()
+        self.assertIn('MP4 only', app._SFX_CADENCE_STATUS['omit_why'])
 
     async def test_default_sfx_cadence_is_every_two_dialogue_units(self):
         self.assertEqual(app.DEFAULT_DJ['sfx_every_units'], 2)
