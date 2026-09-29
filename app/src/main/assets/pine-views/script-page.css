@@ -4343,7 +4343,7 @@ html.pine-tech-wide .sp-tech.sp-tech-wide .wc-strip {
 }
 .sp-mv-stage.sp-mv-scroll > .sp-mv-item { flex: none; }
 .sp-mv-stage.sp-mv-scroll > .sp-mv-item:first-child { margin-top: auto; }
-.sp-mv-hist .sp-mv-rolls { display: none; }
+.sp-mv-hist:not(.sp-mv-pinned) .sp-mv-rolls { display: none; }   /* [rollkeep] the pinned one rolls in view */
 .sp-mv-newchip {
   position: absolute; left: 50%; bottom: 12px; z-index: 6; transform: translateX(-50%);
   display: inline-flex; align-items: center; gap: 6px; min-height: 30px; padding: 0 12px 0 14px;
@@ -4373,3 +4373,13 @@ html.pine-tech-wide .sp-tech.sp-tech-wide .wc-strip {
 .sp-mv-stage.sp-mv-pinlist { overflow-anchor: none; }
 .sp-mv-frozen, .sp-mv-frozen * { animation-play-state: paused !important; }
 .rt-tag .sp-mv-all[hidden], .sp-mv-hist .sp-mv-all[hidden] { display: none; }
+
+/* [rollkeep] the rolls stay expanded and indented after the rollout; the
+   result types underneath them */
+.sp-rr.sp-rr-keep .sp-rr-t.folded { opacity: 1; }
+.sp-rr.sp-rr-keep .sp-rr-t { flex: none; }
+.sp-mv-rolls + .sp-mv-text { margin-top: 6px; }
+.rt-tag .sp-mv-text { max-height: none; }
+.la-roll-box { overflow-x: hidden; }
+.rt-tag .rt-stage > .sp-mv-item { box-sizing: border-box; max-width: calc(100% - 20px); }
+.rt-tag .rt-stage > .sp-mv-item.sp-mv-digital { width: calc(100% - 20px); }

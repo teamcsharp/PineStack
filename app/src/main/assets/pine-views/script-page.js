@@ -7544,7 +7544,7 @@
       if (laterStarted) {
         /* folded to one line; only the last folded one stays in view */
         done += 1;
-        var keep = i === sheet.tables.length - 1 || !(sheet.tables[i + 2] && (skip || ms >= sheet.tables[i + 2].at));
+        var keep = sheet.keep || i === sheet.tables.length - 1 || !(sheet.tables[i + 2] && (skip || ms >= sheet.tables[i + 2].at));   /* [rollkeep] */
         T.el.style.display = keep ? '' : 'none';
         T.el.classList.add('folded');
         mvRrQuiet(T);
@@ -7586,7 +7586,7 @@
       mvRrResults(cur.sheet);
       if (cur.seedStrip) cur.seedStrip.style.display = 'none';
     } else if (cur.phase === 'air' || cur.phase === 'done') {
-      if (cur.item.kind === 'clip') { /* a clip's roll stays in view [msgthumb] */ }
+      if (cur.item.kind === 'clip' || cur.keepRolls) { /* a clip's roll stays in view [msgthumb] [rollkeep] */ }
       else if (cur.style === 'digital') cur.rolls.style.display = 'none';
       else { cur.sheet.box.style.display = 'none'; if (cur.seedStrip) cur.seedStrip.style.display = ''; }
     }
@@ -7709,10 +7709,10 @@
         cur.phase = 'air';
         cur.node.classList.add('sp-mv-onair');
         /* "then we can clear this out and have the text up here" */
-        if (item.kind === 'clip') { /* [msgthumb] a clip keeps its roll in view, over its picture */ }
+        if (item.kind === 'clip' || cur.keepRolls) { /* [msgthumb] a clip keeps its roll in view; [rollkeep] so does a tile */ }
         else if (cur.style === 'digital') cur.rolls.style.display = 'none';
         else if (cur.creel) cur.creel.style.display = 'none';   /* [msgmedia] the roulette becomes the message */
-        if (cur.sheet && item.kind === 'clip') mvRrResults(cur.sheet);   /* [msgroll] a clip keeps its roll in view */
+        if (cur.sheet && (item.kind === 'clip' || cur.keepRolls)) mvRrResults(cur.sheet);   /* [msgroll] [rollkeep] the roll stays */
         else if (cur.sheet) { cur.sheet.box.style.display = 'none'; if (cur.seedStrip) cur.seedStrip.style.display = ''; }   /* [msgroll] */
       }
       if (item.kind === 'speech') {
@@ -8308,6 +8308,8 @@
     cur.text.classList.remove('typing');
     cur.fill.style.width = '100%';
     if (cur.plan) cur.skip = true;
+    cur.keepRolls = false;                     /* [rollkeep] */
+    if (cur.sheet) { cur.sheet.keep = false; cur.sheet.box.classList.remove('sp-rr-keep'); }
     if (cur !== mv.cur) cur.node.classList.add('sp-mv-past');
     mv.pinEnded = (mv.pinEnded || 0) + 1;
     mv.detectAt = 0;
@@ -8340,6 +8342,8 @@
     cur.phase = 'wait';
     rtOffAir(function () { mvPlan(cur, cur.data); });
     cur.skip = false;
+    rtKeep(cur);                              /* [rollkeep] */
+    P.clipText = '';
     if (cur.sheet) {
       /* a. the roll; b. the Rolodex turns to its source; c. 3 s on the
          finished roll; then d. the words */
@@ -8381,7 +8385,8 @@
       if (now - P.doneAt >= MV_PIN_HOLD) { P.cycles += 1; mvPinRun(P, now); }   /* e. -> f. again, from the dice */
     } else {
       rtOffAir(function () { mvFrameItem(cur, now); });
-      if (cur.phase === 'air' && (cur.item.kind !== 'speech' || cur.typed >= cur.item.text.length)) {
+      var pinTyped = rtClipType(P, cur, now);   /* [rollkeep] */
+      if (cur.phase === 'air' && (cur.item.kind !== 'speech' ? pinTyped : cur.typed >= cur.item.text.length)) {
         P.doneAt = now;
         cur.fill.style.width = '100%';
         cur.text.classList.remove('typing');
@@ -8549,6 +8554,8 @@
     rtOffAir(function () { mvPlan(cur, st.data); });
     cur.skip = false;                        /* asked for: it rolls, whatever the motion setting */
     cur.fit = 3;
+    rtKeep(cur);                             /* [rollkeep] the rolls stay; the result types under them */
+    st.clipText = '';
     var hold = Number(st.opts.hold);
     if (cur.sheet && hold > 0) {
       /* the hang on the finished roulette is the caller's (the hold menu: 2 s);
@@ -8571,6 +8578,42 @@
     st.frameN = 0;
     st.raf = root.requestAnimationFrame(function () { rtFrame(st, gen); });
   }
+  /* [rollkeep] "whenever this expands, I want to see it reflected expanded
+     for each section on the rollout. I like that indented look. I want to see
+     that roll out. And stay after rollout. Then the result typewriters
+     underneath so I can see how it built and also what the result is." (the
+     operator, 2026-09-29). In every PineRollTag home and in the Result pin
+     loop the rolls stay: each finished table keeps its two-level indented
+     rows in view as the next one rolls, nothing folds away or is replaced,
+     and after the hang the result types UNDER them - the spoken line, or for
+     a clip its name and the line it answered. */
+  function rtKeep(cur) {
+    cur.keepRolls = true;
+    if (cur.sheet) { cur.sheet.keep = true; cur.sheet.box.classList.add('sp-rr-keep'); }
+  }
+  function rtClipResult(item) {
+    var ci = mvClipInfo(item);
+    var name = String(ci.name || item.text || '').trim();
+    var m = item.match || null;
+    var line = String((m && m.line) || (item.row && (item.row.match_line || item.row.sfx_line)) || '').trim();
+    return line && line !== name ? name + '\n“' + line + '”' : name;
+  }
+  /* a clip's result, typed like the spoken line (mvFrameItem sets a clip's
+     title whole): true once it is all there */
+  function rtClipType(st, cur, now) {
+    if (cur.item.kind !== 'clip') return true;
+    if (cur.phase !== 'air') return false;
+    if (!st.clipText) { st.clipText = rtClipResult(cur.item); st.clipAt = now; }
+    var all = st.clipText;
+    var n = Math.min(all.length, Math.floor((now - st.clipAt) / 38));
+    var shown = all.slice(0, n);
+    if (cur.text.textContent !== shown) cur.text.textContent = shown;
+    cur.text.classList.add('sp-mv-title');
+    cur.text.classList.toggle('typing', n < all.length);
+    var w = (all.length ? n / all.length * 100 : 100).toFixed(1) + '%';
+    if (cur.fill.style.width !== w) cur.fill.style.width = w;
+    return n >= all.length;
+  }
   function rtFrame(st, gen) {
     st.raf = 0;
     if (gen !== st.gen || !st.cur) return;
@@ -8581,7 +8624,8 @@
     var cur = st.cur;
     var now = Date.now();
     rtOffAir(function () { mvFrameItem(cur, now); });
-    if (cur.phase === 'air' && (cur.item.kind !== 'speech' || cur.typed >= cur.item.text.length)) {
+    var clipTyped = rtClipType(st, cur, now);   /* [rollkeep] */
+    if (cur.phase === 'air' && (cur.item.kind !== 'speech' ? clipTyped : cur.typed >= cur.item.text.length)) {
       root.cancelAnimationFrame(st.raf);
       st.raf = 0;
       st.done = true;
@@ -15327,6 +15371,91 @@
     }
   }
 
+  /* [meter1-agc] begin - ROW 1 GROWS WHENEVER SOMETHING PLAYS; THE LEVEL IS
+   * ITS CEILING.
+   *
+   * "Even though the audio level of the music is low, I still need it to
+   *  increase vertically like number two below ... adjusting the volume
+   *  level should continuously adjust the limits of how far it comes out on
+   *  the Y axis ... The only time the bar should be thin and gone is if I
+   *  lower the volume all the way to zero."
+   *
+   * The green bar drew PineMeters.read('musicPlayer', 'music'): the spectrum
+   * multiplied by the gain applied AFTER the analyser (Music level x the duck
+   * x the element volume). A record mixed under talking hosts is ducked, so
+   * the bars were multiplied down to a 1.5 px dashed line while the music was
+   * plainly audible. Visual only - nothing here touches a gain:
+   *   - the signal is the RAW reading (the one [msgthumb] uses), shaped by an
+   *     adaptive peak normaliser: a peak envelope (fast attack, ~3 s release)
+   *     with a floor, so ordinary activity fills ~90% of the height and quiet
+   *     but present audio still grows; under the gate it is silence and the
+   *     row stays the thin line;
+   *   - the CEILING is the operator's own control for this row: the Music
+   *     level on the bus (this bar is its slider; the mixer dot moves the same
+   *     number), clamped at 100%, times this terminal's HERE volume on the
+   *     element. 100% may reach full height, 50% half, 0 is the thin line.
+   *     The duck is deliberately NOT in it - that is the mix, not a hand;
+   *   - each bar breathes: attack ~35 ms, release ~220 ms, time-based so the
+   *     SCOPE_EVERY frame skip does not change the feel. Nothing here reads
+   *     layout; it rides the card's existing rAF tick, which already stands
+   *     still while the card is hidden.
+   * Row 2 (the amber DJ voices) is untouched. */
+  var M1_TARGET = 0.9;      /* ordinary activity fills this much of the height */
+  var M1_FLOOR = 0.18;      /* the envelope never sinks below this (max gain 5x) */
+  var M1_GATE = 0.035;      /* a raw peak under this is silence */
+  var M1_ENV_UP = 0.06;     /* s - envelope attack */
+  var M1_ENV_DOWN = 3.0;    /* s - envelope release */
+  var M1_ATTACK = 0.035;    /* s - bar attack */
+  var M1_RELEASE = 0.22;    /* s - bar release */
+  var m1 = {env: M1_FLOOR, bars: null, at: 0};
+
+  function meterOneCap() {
+    var lv = levelNow('music');
+    var cap = lv === null ? 1 : Math.max(0, Math.min(1, lv));
+    try {
+      var p = el('musicPlayer');
+      var vol = p ? Number(p.volume) : 1;
+      if (p) cap *= p.muted ? 0 : (isFinite(vol) ? Math.max(0, Math.min(1, vol)) : 1);
+    } catch (err) { /* no player here: the level alone */ }
+    return cap;
+  }
+
+  function meterOneShape(state, reading, cap, nowMs) {
+    var raw = reading && reading.bars ? reading.bars : null;
+    var n = raw ? raw.length : (state.bars ? state.bars.length : 64);
+    var i;
+    if (!state.bars || state.bars.length !== n) {
+      state.bars = new Array(n);
+      for (i = 0; i < n; i += 1) state.bars[i] = 0;
+    }
+    var dt = state.at ? Math.min(0.25, Math.max(0.001, (nowMs - state.at) / 1000)) : 0.033;
+    state.at = nowMs;
+    var peak = raw ? (Number(reading.peak) || 0) : 0;
+    cap = Math.max(0, Math.min(1, Number(cap) || 0));
+    var live = !!raw && peak >= M1_GATE && cap > 0;
+    if (live) {
+      state.env += (peak - state.env)
+        * (1 - Math.exp(-dt / (peak > state.env ? M1_ENV_UP : M1_ENV_DOWN)));
+    }
+    if (!(state.env >= M1_FLOOR)) state.env = M1_FLOOR;
+    var gain = M1_TARGET / state.env;
+    var kA = 1 - Math.exp(-dt / M1_ATTACK);
+    var kR = 1 - Math.exp(-dt / M1_RELEASE);
+    var out = new Array(n);
+    var top = 0;
+    for (i = 0; i < n; i += 1) {
+      var t = live ? Math.min(1, (Number(raw[i]) || 0) * gain) * cap : 0;
+      var d = state.bars[i];
+      d += (t - d) * (t > d ? kA : kR);
+      if (d < 0.004) d = 0;
+      state.bars[i] = d;
+      out[i] = d;
+      if (d > top) top = d;
+    }
+    return {bars: out, peak: top};
+  }
+  /* [meter1-agc] end */
+
   /* THE PLAYHEAD IS A REAL SCRUB, and it moves THIS terminal's player.
    *
    * The station owns the broadcast clock; there is no route to move it, and
@@ -15413,7 +15542,8 @@
         meters.attach(['musicPlayer', 'djVoiceAudio0', 'djVoiceAudio1']);
         /* [plbars] a live set draws its real input, not the page's element */
         var liveRead = root.PineLive && root.PineLive.liveBars ? root.PineLive.liveBars() : null;
-        meters.draw(spectrum, liveRead || meters.read('musicPlayer', 'music'), '#54d18b');
+        meters.draw(spectrum, meterOneShape(m1,                      /* [meter1-agc] */
+          liveRead || meters.read('musicPlayer', 'raw'), meterOneCap(), nowMs), '#54d18b');
         meters.draw(el('spVoice'),
           meters.readLoudest(['djVoiceAudio0', 'djVoiceAudio1'], 'voice'), '#e3be63');
         levelMark(spectrum, 'music');                             /* [#1198] */
@@ -16731,6 +16861,12 @@
     }
     node.dataset.slot = slot.label ? String(slot.entry || slot.id || '') : (slot.none ? 'none' : '');
     words.appendChild(title);
+    if (slot.aired_in && slot.aired_in.label) {                 /* [seg-aired-in] */
+      var airedIn = make('small', 'sp-segment-airedin', 'went out in ' + slot.aired_in.label);
+      airedIn.title = 'The running order had ' + slot.aired_in.label + ' on air when this was heard';
+      airedIn.style.cssText = 'display:block;opacity:.8;font-style:italic';
+      words.appendChild(airedIn);
+    }
     words.appendChild(make('small', 'sp-segment-place',
       slot.label ? road + ' \u00b7 Pine Box FM' : 'Pine Box FM / The Booth'));
     node.appendChild(words);
@@ -19379,6 +19515,9 @@
       box.appendChild(det);
     }
     (r.notes || []).forEach(function (t) { box.appendChild(make('div', 'rtree-note', String(t))); });
+    if (r.filed_elsewhere) {                                   /* [tree-heard] */
+      box.appendChild(make('div', 'rtree-note', 'Written while an earlier entry was on air; it went out in this one.'));
+    }
     if (r.gone) return box;
     var chain = make('div', 'rtree-chain' + ((r.recorded || {}).graph ? '' : ' rtree-flat'));
     var cycle = null;
@@ -19402,6 +19541,14 @@
         : 'Nothing of this segment has reached System 3 yet: no round was planned or written for it.'));
     }
     rounds.forEach(function (r, i) { body.appendChild(rtreeRound(r, i + 1)); });
+    /* [tree-heard] rounds written while this entry was on air that went out in
+       another one: named, so the tree accounts for every round it touched */
+    (data.went_elsewhere || []).forEach(function (w) {
+      var when = Number(w.heard_from) ? new Date(Number(w.heard_from) * 1000)
+        .toLocaleTimeString([], {hour: 'numeric', minute: '2-digit'}) : '';
+      body.appendChild(make('div', 'rtree-note', 'Round ' + String(w.conversation_id || '').slice(0, 8)
+        + ': ' + String(w.why || 'it went out in another entry') + (when ? ' (heard ' + when + ')' : '') + '.'));
+    });
     (data.unmatched || []).forEach(function (u) {
       body.appendChild(make('div', 'rtree-note', 'Script ' + (u.candidate || '') + ' (' + (u.source || '')
         + '): ' + (u.why || 'no roll found') + ' - its rolls are not recorded.'));
@@ -20257,7 +20404,8 @@
     function isLineId(id) { return LINE_ID.test(String(id || '')); }
 
     /* Every name a row answers to, folded to identities. */
-    var NAMED = ['clip_media', 'media', 'sfx', 'url', 'clip', 'audio_url', 'clip_url'];
+    var NAMED = ['clip_media', 'media', 'sfx', 'url', 'clip', 'audio_url', 'clip_url',
+      'ad_audio'];                                  /* [ad-audio-named] an advert's own file */
     function identities(row) {
       var out = [];
       if (!row || typeof row !== 'object') return out;
