@@ -119,8 +119,11 @@
       favoritesOnly: false,
       /* One seed for the life of this mount, like the desktop's single
        * random.Random - so page two of the playlist continues the same
-       * deal rather than re-shuffling the deck. */
-      seed: Math.floor(Math.random() * 1000000) + 1,
+       * deal rather than re-shuffling the deck. [s3-visuals] The station
+       * deals it now: 0 asks the playlist door to roll the deal through
+       * System 3 (slideshow.deal, recorded on its desk) and the dealt
+       * seed rides the answer; this view keeps it for the mount. */
+      seed: 0,
       /* #1357: is there a camera on the air, and has the operator sent
        * it away? Two separate answers - the station decides the first
        * and only the person looking at this screen decides the second. */
@@ -420,6 +423,7 @@
         order: 'shuffle', seed: S.seed
       }).then(function (body) {
         backoff = 0;
+        if (body && body.seed) S.seed = body.seed;   /* [s3-visuals] the dealt seed, kept */
         S.items = (body && body.rows) || [];
         S.newest = (body && body.newest_at) || 0;
         S.index = S.items.length ? 0 : -1;
@@ -509,12 +513,17 @@
       var next = S.index + direction;
       if (next < 0) next = S.items.length - 1;
       if (next >= S.items.length) next = 0;
-      show(next, pick());
+      show(next, pick(S.items[next]));
     }
 
-    function pick() {
+    function pick(row) {
       if (S.transition !== 'all') return S.transition;
-      return CONCRETE[Math.floor(Math.random() * CONCRETE.length)];
+      /* [s3-visuals] the station deals each row the transition it enters
+       * with (the tabled pool slideshow.transition, rolled with the
+       * playlist); an older station that dealt nothing gets a plain
+       * rotation - never this page's own dice. */
+      if (row && row.transition && CONCRETE.indexOf(row.transition) >= 0) return row.transition;
+      return CONCRETE[S.shown % CONCRETE.length];
     }
 
     function show(index, transition) {
@@ -748,12 +757,22 @@
       })();
     }
 
+    /* [s3-visuals] the shard scatter without the page's own dice: a
+     * tiny 32-bit LCG walked from the dealt seed and the advance count -
+     * cosmetic jitter, deterministic for the same deal, so no undealt
+     * randomness is left anywhere in this view. */
+    var jitterState = 1;
+    function jitter() {
+      jitterState = (Math.imul(jitterState, 1664525) + 1013904223) | 0;
+      return ((jitterState >>> 8) & 0xffffff) / 0x1000000;
+    }
     /* SHATTER: eight real shards of the outgoing frame, each clipped and
      * thrown. Eight rather than the desktop's many, because every shard is
      * a composited layer and this is a MediaTek GPU. */
     function shatter(from, to, done) {
       var img = from.querySelector('img');
       if (!img) { to.style.display = 'block'; done(); return; }
+      jitterState = (((S.seed || 1) + S.shown * 8191 + 1) | 0);
       var shards = document.createDocumentFragment();
       for (var i = 0; i < 8; i += 1) {
         var piece = img.cloneNode(false);
@@ -764,11 +783,11 @@
           + (x + 25) + '% ' + y + '%, ' + (x + 25) + '% ' + (y + 50) + '%, '
           + x + '% ' + (y + 50) + '%)';
         piece.style.setProperty('--sl-fly-x',
-          ((x - 37) * (2 + Math.random() * 3)) + '%');
+          ((x - 37) * (2 + jitter() * 3)) + '%');
         piece.style.setProperty('--sl-fly-y',
-          ((y - 25) * (2 + Math.random() * 3)) + '%');
+          ((y - 25) * (2 + jitter() * 3)) + '%');
         piece.style.setProperty('--sl-spin',
-          (Math.random() * 120 - 60) + 'deg');
+          (jitter() * 120 - 60) + 'deg');
         shards.appendChild(piece);
       }
       from.innerHTML = '';
@@ -808,7 +827,7 @@
           cell.addEventListener('click', function (event) {
             event.stopPropagation();
             wake();
-            show(index, pick());
+            show(index, pick(S.items[index]));
           });
         })(at);
         strip.appendChild(cell);
