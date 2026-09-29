@@ -39,6 +39,7 @@ object ViewAssets {
 
     /** Evaluated in this order: models first, then the views that read them. */
     private val SCRIPTS = listOf(
+        "pine-memory.js",          // [memdiet-kiosk] the decoder budget, before anything makes a <video>
         "pine-vcr.js",             // [vcrfx] the one picture on/off effect (the SFX TV's CRT)
         "pine-logo.js",           // the mark, inline - origins forbid a URL
         "boot-splash.js",         // the logo assembling itself at startup

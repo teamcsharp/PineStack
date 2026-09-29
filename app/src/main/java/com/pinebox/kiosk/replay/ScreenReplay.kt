@@ -141,6 +141,7 @@ class ScreenReplay(private val context: Context) {
                 setInteger(MediaFormat.KEY_CAPTURE_RATE, FPS)
                 setInteger(MediaFormat.KEY_REPEAT_PREVIOUS_FRAME_AFTER, 1_000_000 / FPS)
             }
+            try { ReplayPrefs.load(context) } catch (e: Exception) { /* [memprefs] keep the default */ }
             ring.size(BITRATE)
             /* THE CACHE FROM BEFORE THE RESTART, taken in once. The ring is
              * only empty on a genuinely fresh start - a screen waking up

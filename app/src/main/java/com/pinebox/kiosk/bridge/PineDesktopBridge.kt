@@ -123,6 +123,7 @@ class PineDesktopBridge(
             "pineCam",
             /* [pinestream] this screen on the listeners' page - replay/PineStreamPush.kt */
             "pineStream",
+            "memPrefs",   // [memprefs]
             /* #1148: "Whenever I access the screen capture to follow
              * report, I also want to be able to scrub between the last
              * five seconds of the broadcast to find the right frame." */
@@ -1470,6 +1471,18 @@ class PineDesktopBridge(
 
         /* [pinestream] run (every few seconds, and the dead man's handle), stop,
          * state. The answer is always the pusher's own state. */
+        /* [memprefs] the operator's replay-ring ceiling (MB, 16-100). It takes
+         * effect the next time the recorder starts (the screen waking). */
+        "memPrefs" -> {
+            val a = args.optJSONObject(0)
+            if (a != null && a.has("replayMb")) {
+                com.pinebox.kiosk.replay.ReplayPrefs.save(context, a.optInt("replayMb", 48))
+            }
+            BridgeEnvelope.ok(id, org.json.JSONObject()
+                .put("ok", true)
+                .put("replayMb", com.pinebox.kiosk.replay.ReplayPrefs.capBytes / (1024 * 1024)).toString())
+        }
+
         "pineStream" -> {
             val push = pineStreamPush
             val opts = args.optJSONObject(1)

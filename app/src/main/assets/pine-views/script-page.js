@@ -6600,27 +6600,66 @@
       slice();
     });
   }
+  /* [memdiet-levels] ONE DECODE AT A TIME, AND ONLY THE FIRST TWO MINUTES.
+     Every audio bubble (and each of the twenty a history fill builds) used to
+     fetch its whole clip and decodeAudioData() it at once, unqueued. On the
+     tablet's WebView each decode is a MediaCodec in the browser process plus
+     the whole PCM in the renderer; twenty at launch was the lowmemorykiller
+     kill of 2026-09-29. Now: a queue, one at a time, newest first (the live
+     bubble), three waiting at most (a dropped ask is forgotten, so a later one
+     is taken), and at most MV_LV_MAX_BYTES asked for - mvLevelsCompute reads
+     only 120 s. A longer body is never read: the meter falls back to the live
+     analyser, as it does for any clip it cannot measure. */
+  var MV_LV_MAX_BYTES = 2000000, MV_LV_WAITING = 3;
   function mvLevelsAsk(sid, url) {
     mv.levels = mv.levels || Object.create(null);
     mv.levelOrder = mv.levelOrder || [];
+    mv.levelQ = mv.levelQ || [];
     if (!sid || !url || mv.levels[sid]) return;
     var L = mv.levels[sid] = {ready: false, failed: ''};
     mv.levelOrder.push(sid);
     while (mv.levelOrder.length > 8) delete mv.levels[mv.levelOrder.shift()];
+    mv.levelQ.push({sid: sid, url: url, L: L});
+    while (mv.levelQ.length > MV_LV_WAITING) {
+      var old = mv.levelQ.shift();
+      if (mv.levels[old.sid] === old.L) delete mv.levels[old.sid];
+    }
+    if (!mv.levelKick) mv.levelKick = setTimeout(mvLevelsNext, 0);
+  }
+  function mvLevelsNext() {
+    mv.levelKick = 0;
+    if (mv.levelBusy || !mv.levelQ || !mv.levelQ.length) return;
+    var job = mv.levelQ.pop();                 /* newest first: the live bubble */
+    var L = job.L;
+    mv.levelBusy = job;
+    var done = function () {
+      if (mv.levelBusy !== job) return;        /* the guard already moved on */
+      mv.levelBusy = null;
+      if (mv.levelQ.length && !mv.levelKick) mv.levelKick = setTimeout(mvLevelsNext, 250);
+    };
+    setTimeout(function () {                   /* a fetch that never answers holds nothing up */
+      if (mv.levelBusy === job) { if (!L.ready) L.failed = L.failed || 'timed out'; done(); }
+    }, 30000);
     var Off = root.OfflineAudioContext || root.webkitOfflineAudioContext;
-    if (typeof root.fetch !== 'function' || !Off) { L.failed = 'no decoder here'; return; }
-    root.fetch(stationUrl(url)).then(function (r) {
+    if (typeof root.fetch !== 'function' || !Off) { L.failed = 'no decoder here'; done(); return; }
+    root.fetch(stationUrl(job.url), {headers: {Range: 'bytes=0-' + (MV_LV_MAX_BYTES - 1)}}).then(function (r) {
       if (!r.ok) throw new Error('http ' + r.status);
+      var len = Number((r.headers && r.headers.get('content-length')) || 0);
+      if (r.status !== 206 && len > MV_LV_MAX_BYTES) {
+        try { if (r.body && r.body.cancel) r.body.cancel(); } catch (e) { /* not streamed */ }
+        throw new Error('too long to measure here');
+      }
       return r.arrayBuffer();
     }).then(function (buf) {
-      if (!buf || buf.byteLength > 16000000) throw new Error('too large to measure');
+      if (!buf || buf.byteLength > MV_LV_MAX_BYTES + 65536) throw new Error('too long to measure here');
       var ctx = new Off(1, 1, 22050);
       return new Promise(function (ok, bad) {
         var p = ctx.decodeAudioData(buf, ok, bad);
         if (p && typeof p.then === 'function') p.then(ok, bad);
       });
-    }).then(function (ab) { return mvLevelsCompute(L, ab); }).then(null, function (e) {
+    }).then(function (ab) { return mvLevelsCompute(L, ab); }).then(done, function (e) {
       L.failed = String((e && e.message) || e || 'undecodable');
+      done();
     });
   }
   function mvLevelsAt(L, t) {
@@ -8115,6 +8154,10 @@
      nothing (IntersectionObserver). Every frame rides mvLoop's own rAF, so
      unpinning leaves no timer behind. */
   var MV_PAGE = 20, MV_KEEP = 120, MV_PIN_HOLD = 3000;
+  var MV_HIST_MAX = (function () {   /* [memprefs] the operator's history limit, default 50 */
+    try { var v = parseInt(root.localStorage.getItem('pine.mem.history'), 10); return v >= 20 && v <= 300 ? v : 50; }
+    catch (e) { return 50; }
+  })();   /* [memdiet-views] the history pages back this far, and no further */
   function mvRectOf(n) { var r = n.getBoundingClientRect(); return [Math.round(r.left), Math.round(r.top), Math.round(r.width), Math.round(r.height)]; }
   function mvHistRows() {
     var rows = [];
@@ -8216,6 +8259,7 @@
   function mvHistoryMore(first) {
     var stage = mv.stage, rows = mv.histRows;
     if (!stage || !rows || mv.histAt <= 0 || mv.histBusy) return;
+    if (stage.querySelectorAll('.sp-mv-item').length >= MV_HIST_MAX) return;   /* [memdiet-views] */
     mv.histBusy = true;
     var from = Math.max(0, mv.histAt - MV_PAGE);
     var h0 = stage.scrollHeight, t0 = stage.scrollTop;
@@ -8240,8 +8284,10 @@
     [].slice.call(twin).forEach(function (n) { if (!mv.pin || mv.pin.cur.node !== n) n.parentNode.removeChild(n); });
     mvObserve(node);
     var kids = stage.querySelectorAll('.sp-mv-item');
-    for (var i = 0; i < kids.length - MV_KEEP; i += 1) {
+    var keep = Math.min(MV_KEEP, MV_HIST_MAX || MV_KEEP);   /* [mvkeep] the operator's history preference */
+    for (var i = 0; i < kids.length - keep; i += 1) {
       if (mv.pin && mv.pin.cur.node === kids[i]) continue;
+      if (mv.io) { try { mv.io.unobserve(kids[i]); } catch (e) { /* gone */ } }   /* [memdiet-views] */
       stage.removeChild(kids[i]);
     }
     if (mv.follow || !stage.classList.contains('sp-mv-scroll')) stage.scrollTop = stage.scrollHeight;

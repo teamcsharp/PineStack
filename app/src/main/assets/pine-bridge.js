@@ -153,6 +153,7 @@
        without it answers {ok:false,on:false} and the page keeps its poll. */
     pineCam: promised("pineCam"),
     pineStream: promised("pineStream"),   // [pinestream] run | stop | state
+    memPrefs: promised("memPrefs"),       // [memprefs] {replayMb} - the replay ring's ceiling
     /* #1427: the rolling screen recorder's switch. */
     replayRun: promised("replayRun"),
 

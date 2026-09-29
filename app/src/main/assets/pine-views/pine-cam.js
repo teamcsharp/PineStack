@@ -279,7 +279,9 @@
       + '</div>'
       + '<img id="pineCamImg" alt="The Pine Cam, live">'
       /* [cambattery] the camera's battery, over the picture's top-left */
-      + '<div class="pine-cam-batt" id="pineCamBatt" hidden></div>';
+      + '<div class="pine-cam-batt" id="pineCamBatt" hidden></div>'
+      /* [tabrelay] the camera's road, over the picture's bottom-left */
+      + '<div class="pine-cam-path" id="pineCamPath" hidden></div>';
     document.body.appendChild(box);
     place(box);
     /* The whole box is the handle; a tap on the folded circle unfolds it. */
@@ -1206,6 +1208,7 @@
        * avoid. Both, or it is not there. */
       live = !!(got && got.state === 'live' && got.fresh);
       cropOn = !!(got && got.crop && got.crop.on);    /* [pincrop] */
+      pathPaint(got);                                 /* [tabrelay] */
       showButton(live);
       /* #1470: the supervisor's TS door, when it is up. `ok` is its own
        * heartbeat (a datagram in the last five seconds); a door that has
@@ -2025,6 +2028,17 @@
       + '<label class="pine-cam-pref pcp-carry" for="pineCamPrefCarry">'
       + '<input id="pineCamPrefCarry" type="checkbox">'
       + '<span>Carry every kept clip there automatically</span></label>'
+      /* [tabrelay] which road reaches the camera */
+      + '<div class="pcp-h pcp-relay-h">' + icon('c:network--4', '', '')
+      + '<span>Relay through the PineTab</span></div>'
+      + '<div class="pcp-row pcp-relay" id="pineCamRelay" role="radiogroup" '
+      + 'aria-label="Relay through the PineTab" title="Relay through the PineTab: the tablet '
+      + 'joins the camera as a second, local-only Wi-Fi link and passes the picture on">'
+      + relayBtn('auto', 'Auto: the PineTab carries the camera when it can join it; otherwise the Spark\'s dongle')
+      + relayBtn('always', 'Always: read the camera through the PineTab only - the dongle stays off')
+      + relayBtn('never', 'Never: the Spark\'s dongle only, as before')
+      + '</div>'
+      + '<div class="pcp-hint" id="pineCamRelaySay"></div>'
       + '<div class="pcp-row pcp-foot"><button type="button" id="pineCamPrefSave">'
       + icon('c:checkmark--filled', '', '') + '<span>Save</span></button>'
       + '<span id="pineCamPrefSay" class="pcp-say"></span></div>'
@@ -2036,7 +2050,72 @@
     prefsEl.querySelector('.pine-cam-x').addEventListener('click', closePrefs);
     document.getElementById('pineCamPrefPick').addEventListener('click', choosePrefFolder);
     document.getElementById('pineCamPrefSave').addEventListener('click', savePrefs);
+    [].forEach.call(prefsEl.querySelectorAll('.pcp-relay button'), function (b) {   /* [tabrelay] */
+      b.addEventListener('click', function (ev) { ev.stopPropagation(); relaySet(b.getAttribute('data-pref')); });
+    });
     return prefsEl;
+  }
+
+  /* [tabrelay] THE CAMERA'S ROAD, IN ONE LINE. tools/pinelink.py reads the
+   * camera through the Spark's dongle or through the PineTab (a local-only
+   * second Wi-Fi link, relayed on TacoNet) and says which in state.json
+   * `source`; this line says it back over the picture. No `source` (a
+   * supervisor without the relay) draws nothing, exactly as before. */
+  function pathSay(src) {
+    if (!src || !src.use) return '';
+    if (src.use === 'tablet') {
+      var sig = Number(src.tablet_signal) || 0;
+      return 'via PineTab' + (sig > 0 ? ' · camera signal ' + Math.round(sig) + '%' : '');
+    }
+    if (src.use === 'wait') return 'switching to the PineTab…';
+    return 'via the Spark’s dongle';
+  }
+
+  function pathPaint(got) {
+    var el = document.getElementById('pineCamPath');
+    if (!el) return;
+    var src = got && got.source;
+    var text = live ? pathSay(src) : '';
+    el.hidden = !text;
+    el.textContent = text;
+    el.title = text ? String((src && src.why) || text) : '';
+  }
+
+  /* [tabrelay] "Relay through the PineTab: auto / always / never". */
+  function relayBtn(pref, tip) {
+    return '<button type="button" role="radio" aria-checked="false" data-pref="'
+      + pref + '" title="' + esc(tip) + '"><span>' + pref + '</span></button>';
+  }
+
+  function relayPaint(v) {
+    var row = document.getElementById('pineCamRelay');
+    if (!row || !v) return;
+    [].forEach.call(row.querySelectorAll('button'), function (b) {
+      var on = b.getAttribute('data-pref') === v.pref;
+      b.classList.toggle('on', on);
+      b.setAttribute('aria-checked', on ? 'true' : 'false');
+    });
+    var say = document.getElementById('pineCamRelaySay');
+    if (!say) return;
+    var bits = [];
+    if (v.say) bits.push(String(v.say));
+    if (v.source && v.source.why) bits.push('now: ' + String(v.source.why));
+    else if (!v.report || !v.report.at) bits.push('the PineTab has not reported');
+    say.textContent = bits.join(' - ');
+  }
+
+  function relayRead() {
+    return Promise.resolve(ask('/api/pinelink/relay'))
+      .then(function (v) { relayPaint(v); return v; }, function () { return null; });
+  }
+
+  function relaySet(pref) {
+    var say = document.getElementById('pineCamRelaySay');
+    if (say) say.textContent = 'saving…';
+    Promise.resolve(post('/api/pinelink/relay', {pref: pref})).then(function (v) {
+      if (!v) { if (say) say.textContent = 'the station did not answer'; return; }
+      relayPaint(v);
+    }, function () { if (say) say.textContent = 'the station did not answer'; });
   }
 
   function openPrefs() {
@@ -2044,6 +2123,7 @@
     prefsEl.hidden = false;
     nativeMenu(true);                      /* #1470: a sheet over the surface */
     psay('reading…');
+    relayRead();                           /* [tabrelay] */
     readPrefs().then(function (p) {
       if (!p) { psay('the station did not answer'); return; }
       paintPrefs(p);

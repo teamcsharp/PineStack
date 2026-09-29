@@ -53,6 +53,11 @@ class PineApp : Application() {
     val client: StationClient by lazy { StationClient(configStore) }
     val feed: StationFeed by lazy { StationFeed(client, scope) }
 
+    /** [tabrelay] the PineTab as the Pine Cam's relay - the station decides when. */
+    val camRelay: com.pinebox.kiosk.camlink.CamRelayController by lazy {
+        com.pinebox.kiosk.camlink.CamRelayController(this, client, configStore, scope)
+    }
+
     /** The gallery on the home screen and the keyguard, every five minutes. */
     val wallpaper: com.pinebox.kiosk.gallery.WallpaperWatch by lazy {
         com.pinebox.kiosk.gallery.WallpaperWatch(this, client, feed, scope)
@@ -76,6 +81,10 @@ class PineApp : Application() {
          * showing the piece on the block. Started from the activity it would
          * stop at the moment it starts mattering. */
         wallpaper.start()
+        /* [tabrelay] one request every 30 s while not wanted; nothing joins
+         * unless the station asks AND this tablet can hold a local-only
+         * second link (CamLink reports "unsupported" otherwise). */
+        camRelay.start()
 
         /* #1182T: THE CAMERA'S DOOR, ON THE APPLICATION.
          *

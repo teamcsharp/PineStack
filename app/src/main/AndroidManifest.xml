@@ -138,6 +138,12 @@
          unreadable and the "why is the panel blank" banner cannot say
          "no network" as opposed to "station down". -->
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <!-- [tabrelay] the camera side-link: WifiNetworkSpecifier needs CHANGE_WIFI_STATE;
+         NETWORK_SETTINGS (signature, granted by the platform key) lets the exact
+         SSID+BSSID request skip the approval dialog. -->
+    <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
+    <uses-permission android:name="android.permission.NETWORK_SETTINGS"
+        tools:ignore="ProtectedPermissions" />
     <!-- Local speech entry points use this permission to capture a clip. The
          station transcribes it through /api/listen/transcribe. -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />

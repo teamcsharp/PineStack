@@ -85,6 +85,21 @@ class MainActivity : AppCompatActivity() {
      *  after the first frame - see standUpTheRest. */
     private lateinit var railHost: ViewGroup
     private lateinit var webView: WebView
+
+    /* [memdiet-kiosk] THE TABLET IS RUNNING SHORT: THE PAGE LETS GO FIRST.
+     * 2026-09-29 the lowmemorykiller took this process (the top app) at
+     * launch. Android says so before it kills; the page's PineMemory
+     * releases the decoders of every muted loop that is not in view
+     * (RUNNING_CRITICAL and above: every one that is not kept). */
+    override fun onTrimMemory(level: Int) {
+        super.onTrimMemory(level)
+        if (level < android.content.ComponentCallbacks2.TRIM_MEMORY_RUNNING_MODERATE) return
+        if (!::webView.isInitialized) return
+        runCatching {
+            webView.evaluateJavascript("window.PineMemory&&window.PineMemory.trim($level)", null)
+        }
+        android.util.Log.i("PineMemory", "onTrimMemory $level -> the page lets its loops go")
+    }
     private lateinit var statusPanel: View
     private lateinit var statusText: TextView
     private lateinit var statusRetry: Button
