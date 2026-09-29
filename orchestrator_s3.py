@@ -75,6 +75,14 @@ SEVERITY = {"high": 3, "medium": 2, "low": 1, "info": 0}
 RECOVERY = ("page_recovery", "resume", "replay", "recover", "reel")
 UNDECODABLE = re.compile(r"decod|unsupported|media_err|src_not|codec|format", re.I)
 SECTIONS = ("speakerbox", "sfx", "personalities", "sfxguy", "blocks", "split")
+# [orch-s3b] OVERLAP IS ONLY AMONG THE EXCLUSIVE RECEIVERS (the operator,
+# 2026-09-29: "a web page sounding at the same time as the PineTab is
+# NORMAL"). Still overlap - any two of these sounding at once: PineTab +
+# this app, PineTab + the Pine Box speaker, this app + the Pine Box speaker.
+# Never overlap: web pages, the car (its own switch, #1253), Nabu.
+EXCLUSIVE_RECEIVERS = ("pinetab", "desktop", "box")
+# [orch-s3b] "page join" is not dead air for the station to fix (the operator).
+IGNORED_GAP_CAUSES = ("page join",)
 
 # --------------------------------------------------------------- knowledge
 
@@ -126,7 +134,8 @@ ELEMENTS: tuple[dict[str, str], ...] = (
     {"key": "mp4", "name": "The MP4-only switch and the quarantine",
      "what": "picture share at 100 = MP4 only; what the filter refused, swapped, left empty; clips no player decodes",
      "see": "GET /api/sfx/mp4-only; command `s3 mp4`",
-     "act": "quarantine is ONE-WAY (the book row goes playable=0) - operator only", "classes": "mp3 leak, undecodable"},
+     "act": "quarantine, and its RELEASE (POST /api/sfx/quarantine/release: the clip is re-checked - on the "
+            "share, decodes with ffmpeg - before it airs) - both operator-confirm only; `s3 release <sid|folder>`", "classes": "mp3 leak, undecodable"},
     {"key": "receivers", "name": "Playing it - the receivers",
      "what": "every receiver of the broadcast and its out-loud switch (pinetab, desktop, web, car, nabu, box)",
      "see": "GET /api/air/receivers; command `s3 receivers`",
@@ -164,13 +173,15 @@ PLAYBOOK: dict[str, dict[str, Any]] = {
         "resolve": ["file the road that drew it (the MP4 filter missed a door)", "note it"],
         "never": "never turn the switch off to hide it"},
     "overlap": {
-        "signal": "more than one house receiver sounding at once",
+        "signal": "two of the exclusive receivers (PineTab, this app, the Pine Box speaker) sounding at once; "
+                  "web pages, the car and Nabu never count",
         "identify": ["`s3 receivers` - which are sounding and which owns the air"],
         "triage": "high: the room hears the station twice",
         "resolve": ["tell the operator which switch on Playing it to turn off - receivers are the operator's"],
         "never": "never switch a receiver from the station"},
     "dead_air": {
-        "signal": "heard gaps of 30 s or more in the last hour (data/gap_log.jsonl, by cause), or no receiver sounding on air",
+        "signal": "heard gaps of 30 s or more in the last hour (data/gap_log.jsonl, by cause; 'page join' is "
+                  "not dead air), or no receiver sounding on air",
         "identify": ["the gap's cause (event-loop stall, round turnover, ...) and its prev/next codes"],
         "triage": "high over 120 s in one gap or 180 s in the hour; a stall is the loop, not stock",
         "resolve": ["cause 'round turnover': the cupboard's ready stock and the unheard sweep (existing verbs unheard:on)",
@@ -188,7 +199,9 @@ PLAYBOOK: dict[str, dict[str, Any]] = {
         "identify": ["`s3 mp4` - the quarantine list and folders gone", "`s3 display` - not-shown reasons"],
         "triage": "low when already quarantined (the receipt hook does it); medium when still drawn",
         "resolve": ["the quarantine list is the transcode job's work list - file it once",
-                    "quarantine a named clip only with the operator's confirm (one-way)"],
+                    "quarantine a named clip only with the operator's confirm",
+                    "a folder back on the share: propose its release (operator confirm; every clip "
+                    "re-checked before it airs, a failed check stays quarantined with its reason)"],
         "never": "never delete the file; quarantine is the door"},
     "tables_added": {
         "signal": "System 3's config moved - tables added, changed or removed, sections saved",
@@ -370,12 +383,18 @@ def sense_mp4(mp4: dict[str, Any], display_summary: dict[str, Any] | None) -> li
                             "undecodable", identify=["s3 mp4", "s3 display"],
                             evidence={"not_shown": bad, "quarantined_total": q.get("clips"),
                                       "recent": recent_q[:5], "list": q.get("list")}))
+    back = list(q.get("folders_back") or [])   # [orch-s3b]
+    if back:
+        out.append(_finding("undecodable", "medium",
+                            "%d quarantined folder(s) are back on the share: %s" % (len(back), ", ".join(back)[:200]),
+                            "folders_back|" + ",".join(sorted(back)), identify=["s3 mp4"],
+                            evidence={"folders_back": back, "list": q.get("list")}))
     return out
 
 
 def sense_receivers(rx: dict[str, Any], on_air: bool) -> list[dict[str, Any]]:
     rows = [r for r in (rx or {}).get("receivers") or [] if isinstance(r, dict)]
-    house = [r for r in rows if r.get("id") != "car" and r.get("sounding")]
+    house = [r for r in rows if str(r.get("id")) in EXCLUSIVE_RECEIVERS and r.get("sounding")]
     out: list[dict[str, Any]] = []
     if len(house) > 1:
         out.append(_finding("overlap", "high", "%d receivers are sounding in the house at once: %s"
@@ -392,7 +411,8 @@ def sense_receivers(rx: dict[str, Any], on_air: bool) -> list[dict[str, Any]]:
 
 
 def sense_gaps(rows: list[dict[str, Any]], now: float) -> list[dict[str, Any]]:
-    recent = [r for r in rows or [] if _f(r.get("until")) >= now - DEAD_WINDOW_S
+    recent = [r for r in rows or [] if str(r.get("cause") or "") not in IGNORED_GAP_CAUSES
+              and _f(r.get("until")) >= now - DEAD_WINDOW_S
               and _f(r.get("seconds")) - _f(r.get("paused_seconds")) >= DEAD_S]
     if not recent:
         return []
@@ -586,6 +606,14 @@ class Desk:
             except OSError:
                 pass
         out["quarantine_recent"] = recent[-20:]
+        back = []                           # [orch-s3b] a gone folder that has come back
+        for f in out["quarantine"].get("folders_gone") or []:
+            try:
+                if Path(f).is_dir():
+                    back.append(f)
+            except OSError:
+                pass
+        out["quarantine"]["folders_back"] = back
         return out
 
     def read_display(self, hours: float = 1.0) -> dict[str, Any]:
@@ -786,6 +814,11 @@ class Desk:
                                    finding=f["id"], before="in the cupboard", after="asked about at the retirement desk",
                                    extra={"kind": kind, "why": f["title"]}, needs_operator=False, station_may=True)
                 out.append(p["id"])
+        if f["class"] == "undecodable":      # [orch-s3b] propose, never release
+            for folder in (f.get("evidence") or {}).get("folders_back") or []:
+                p = self.propose_release(folder=folder, why="the folder is back on the share",
+                                         by="orchestrator")
+                out.append(p["id"])
         if f["class"] in ("dead_air", "stale_script"):
             rung = "triangulate"
             p = self._proposal("rung", rung, "run the '%s' rung of the broadcast ladder" % rung, finding=f["id"],
@@ -836,6 +869,20 @@ class Desk:
     def propose_quarantine(self, sid: str, path: str, why: str, by: str = "operator") -> dict[str, Any]:
         return self._proposal("quarantine", sid, "quarantine clip %s (one-way: its book row goes playable=0)" % sid,
                               before="drawable", after="quarantined", extra={"path": path, "why": why},
+                              reversible=False, needs_operator=True, by=by)
+
+    def propose_release(self, sid: str = "", folder: str = "", why: str = "",
+                        by: str = "operator") -> dict[str, Any]:
+        """[orch-s3b] A release from the SFX quarantine is the operator's to
+        confirm; he may only propose it. The station re-checks the clip (on
+        the share, decodes with ffmpeg) before it may air again."""
+        target = str(sid or folder or "").strip()
+        if not target:
+            raise ValueError("name a clip (sid) or a folder")
+        return self._proposal("release", target, "release %s %s from the SFX quarantine (re-checked before "
+                              "it airs)" % ("clip" if sid else "folder", target), before="quarantined",
+                              after="released if it passes the check",
+                              extra={"sid": str(sid or ""), "folder": str(folder or ""), "why": why},
                               reversible=False, needs_operator=True, by=by)
 
     def _live_hash(self) -> str:
@@ -937,6 +984,16 @@ class Desk:
                                                  by="orchestrator")
                 changed = bool(ok)
                 say = "clip %s is quarantined" % target if ok else "the quarantine refused it (outside the library, or already in)"
+            elif door == "release":         # [orch-s3b] operator only (needs_operator)
+                got = self._get("sfx_quarantine_release")(
+                    str(p.get("sid") or ""), str(p.get("folder") or ""),
+                    "the orchestrator (%s, operator confirmed)" % p["id"], str(p.get("why") or ""))
+                say = str(got.get("say") or "")
+                if not got.get("ok"):
+                    p.update(state="kept", result=say)
+                    self.mark("act:release", False, error=say)
+                    self.save()
+                    return {"ok": False, "say": say, "results": got.get("results")}
             elif door == "rung":
                 return {"ok": False, "say": "a rung runs on the loop: type `run %s`" % target, "rung": target}
             else:
@@ -1042,7 +1099,7 @@ class Desk:
             if p is None:
                 return "no proposal %s" % arg
             fn = self.confirm if verb == "s3fix" else self.undo
-            if p.get("door") in ("table", "section"):
+            if p.get("door") in ("table", "section", "release"):
                 ff = self._get("fire_and_forget")
                 if callable(ff):
                     try:
@@ -1248,6 +1305,11 @@ class Desk:
                     "%s: %d rows, %d stamped, %d unaired, %d legacy unaired" % (
                         k, v["rows"], v["stamped"], v["unaired"], v["unstamped_unaired"])
                     for k, v in sorted(c["roads"].items())]
+            if head == "release" and rest:  # [orch-s3b] a proposal; the operator confirms
+                t = " ".join(rest)
+                p = self.propose_release(folder=t) if "/" in t else self.propose_release(sid=t)
+                return True, "proposal %s: %s" % (p["id"], p["title"]), [
+                    "confirm: s3 confirm %s   (operator only; it is re-checked first)" % p["id"]]
             if head == "files":
                 fm = self._get("_FILEMGR")
                 if fm is None:
@@ -1288,7 +1350,7 @@ class Desk:
             return False, "%s: %s" % (type(exc).__name__, str(exc)[:200]), []
         return False, ("s3 knows: know, playbook, survey, findings, why <code>, untraced, coverage, mp4, display, "
                        "receivers, tables [id], table <id> set k=v, section <name> set k=v, cupboard [road|<id> "
-                       "cue|uncue|finish|retire|remove], files, tree <segment>, proposals, confirm/undo/hold <id>, "
+                       "cue|uncue|finish|retire|remove], release <sid|folder>, files, tree <segment>, proposals, confirm/undo/hold <id>, "
                        "faculties"), []
 
 
