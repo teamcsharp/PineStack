@@ -325,6 +325,36 @@
     ui.qList.hidden = true;
     qs.appendChild(ui.qList);
     foot.appendChild(qs);
+    /* [memprefs] the tablet's memory limits, as preferences */
+    var ms = make('div', 'fm-restore fm-memprefs');
+    var mh = make('div', 'fm-restore-head');
+    mh.appendChild(ico('c:save', ''));
+    mh.appendChild(make('span', '', 'Memory (this device) - applies the next time the app starts'));
+    ms.appendChild(mh);
+    var memPref = function (key, def) {
+      try { var v = parseInt(root.localStorage.getItem(key), 10); return isNaN(v) ? def : v; } catch (e) { return def; }
+    };
+    var memRow = function (label, key, def, lo, hi, step, unit, after) {
+      var row = make('label', 'fm-memrow');
+      row.appendChild(make('span', 'fm-memlabel', label));
+      var inp = make('input', ''); inp.type = 'range'; inp.min = lo; inp.max = hi; inp.step = step;
+      inp.value = memPref(key, def); inp.title = label + ' (default ' + def + unit + ')';
+      var val = make('span', 'fm-memval', inp.value + unit);
+      inp.addEventListener('input', function () { val.textContent = inp.value + unit; });
+      inp.addEventListener('change', function () {
+        try { root.localStorage.setItem(key, String(inp.value)); } catch (e) { /* private window */ }
+        if (after) { try { after(parseInt(inp.value, 10)); } catch (e) { /* no bridge */ } }
+      });
+      row.appendChild(inp); row.appendChild(val);
+      ms.appendChild(row);
+    };
+    memRow('Message history', 'pine.mem.history', 50, 20, 300, 10, ' bubbles');
+    memRow('Playing muted loops (plus a pinned one)', 'pine.mem.loops', 2, 1, 6, 1, '');
+    memRow('Screen replay ring', 'pine.mem.replay', 48, 16, 100, 4, ' MB', function (mb) {
+      var b = root.pineDesktop;
+      if (b && typeof b.memPrefs === 'function') b.memPrefs({replayMb: mb});
+    });
+    foot.appendChild(ms);
     pop.appendChild(foot);
 
     document.body.appendChild(pop);
