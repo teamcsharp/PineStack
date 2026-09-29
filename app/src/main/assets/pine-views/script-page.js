@@ -7544,7 +7544,7 @@
       if (laterStarted) {
         /* folded to one line; only the last folded one stays in view */
         done += 1;
-        var keep = i === sheet.tables.length - 1 || !(sheet.tables[i + 2] && (skip || ms >= sheet.tables[i + 2].at));
+        var keep = sheet.keep || i === sheet.tables.length - 1 || !(sheet.tables[i + 2] && (skip || ms >= sheet.tables[i + 2].at));   /* [rollkeep] */
         T.el.style.display = keep ? '' : 'none';
         T.el.classList.add('folded');
         mvRrQuiet(T);
@@ -7586,7 +7586,7 @@
       mvRrResults(cur.sheet);
       if (cur.seedStrip) cur.seedStrip.style.display = 'none';
     } else if (cur.phase === 'air' || cur.phase === 'done') {
-      if (cur.item.kind === 'clip') { /* a clip's roll stays in view [msgthumb] */ }
+      if (cur.item.kind === 'clip' || cur.keepRolls) { /* a clip's roll stays in view [msgthumb] [rollkeep] */ }
       else if (cur.style === 'digital') cur.rolls.style.display = 'none';
       else { cur.sheet.box.style.display = 'none'; if (cur.seedStrip) cur.seedStrip.style.display = ''; }
     }
@@ -7709,10 +7709,10 @@
         cur.phase = 'air';
         cur.node.classList.add('sp-mv-onair');
         /* "then we can clear this out and have the text up here" */
-        if (item.kind === 'clip') { /* [msgthumb] a clip keeps its roll in view, over its picture */ }
+        if (item.kind === 'clip' || cur.keepRolls) { /* [msgthumb] a clip keeps its roll in view; [rollkeep] so does a tile */ }
         else if (cur.style === 'digital') cur.rolls.style.display = 'none';
         else if (cur.creel) cur.creel.style.display = 'none';   /* [msgmedia] the roulette becomes the message */
-        if (cur.sheet && item.kind === 'clip') mvRrResults(cur.sheet);   /* [msgroll] a clip keeps its roll in view */
+        if (cur.sheet && (item.kind === 'clip' || cur.keepRolls)) mvRrResults(cur.sheet);   /* [msgroll] [rollkeep] the roll stays */
         else if (cur.sheet) { cur.sheet.box.style.display = 'none'; if (cur.seedStrip) cur.seedStrip.style.display = ''; }   /* [msgroll] */
       }
       if (item.kind === 'speech') {
@@ -8308,6 +8308,8 @@
     cur.text.classList.remove('typing');
     cur.fill.style.width = '100%';
     if (cur.plan) cur.skip = true;
+    cur.keepRolls = false;                     /* [rollkeep] */
+    if (cur.sheet) { cur.sheet.keep = false; cur.sheet.box.classList.remove('sp-rr-keep'); }
     if (cur !== mv.cur) cur.node.classList.add('sp-mv-past');
     mv.pinEnded = (mv.pinEnded || 0) + 1;
     mv.detectAt = 0;
@@ -8340,6 +8342,8 @@
     cur.phase = 'wait';
     rtOffAir(function () { mvPlan(cur, cur.data); });
     cur.skip = false;
+    rtKeep(cur);                              /* [rollkeep] */
+    P.clipText = '';
     if (cur.sheet) {
       /* a. the roll; b. the Rolodex turns to its source; c. 3 s on the
          finished roll; then d. the words */
@@ -8381,7 +8385,8 @@
       if (now - P.doneAt >= MV_PIN_HOLD) { P.cycles += 1; mvPinRun(P, now); }   /* e. -> f. again, from the dice */
     } else {
       rtOffAir(function () { mvFrameItem(cur, now); });
-      if (cur.phase === 'air' && (cur.item.kind !== 'speech' || cur.typed >= cur.item.text.length)) {
+      var pinTyped = rtClipType(P, cur, now);   /* [rollkeep] */
+      if (cur.phase === 'air' && (cur.item.kind !== 'speech' ? pinTyped : cur.typed >= cur.item.text.length)) {
         P.doneAt = now;
         cur.fill.style.width = '100%';
         cur.text.classList.remove('typing');
@@ -8549,6 +8554,8 @@
     rtOffAir(function () { mvPlan(cur, st.data); });
     cur.skip = false;                        /* asked for: it rolls, whatever the motion setting */
     cur.fit = 3;
+    rtKeep(cur);                             /* [rollkeep] the rolls stay; the result types under them */
+    st.clipText = '';
     var hold = Number(st.opts.hold);
     if (cur.sheet && hold > 0) {
       /* the hang on the finished roulette is the caller's (the hold menu: 2 s);
@@ -8571,6 +8578,42 @@
     st.frameN = 0;
     st.raf = root.requestAnimationFrame(function () { rtFrame(st, gen); });
   }
+  /* [rollkeep] "whenever this expands, I want to see it reflected expanded
+     for each section on the rollout. I like that indented look. I want to see
+     that roll out. And stay after rollout. Then the result typewriters
+     underneath so I can see how it built and also what the result is." (the
+     operator, 2026-09-29). In every PineRollTag home and in the Result pin
+     loop the rolls stay: each finished table keeps its two-level indented
+     rows in view as the next one rolls, nothing folds away or is replaced,
+     and after the hang the result types UNDER them - the spoken line, or for
+     a clip its name and the line it answered. */
+  function rtKeep(cur) {
+    cur.keepRolls = true;
+    if (cur.sheet) { cur.sheet.keep = true; cur.sheet.box.classList.add('sp-rr-keep'); }
+  }
+  function rtClipResult(item) {
+    var ci = mvClipInfo(item);
+    var name = String(ci.name || item.text || '').trim();
+    var m = item.match || null;
+    var line = String((m && m.line) || (item.row && (item.row.match_line || item.row.sfx_line)) || '').trim();
+    return line && line !== name ? name + '\n“' + line + '”' : name;
+  }
+  /* a clip's result, typed like the spoken line (mvFrameItem sets a clip's
+     title whole): true once it is all there */
+  function rtClipType(st, cur, now) {
+    if (cur.item.kind !== 'clip') return true;
+    if (cur.phase !== 'air') return false;
+    if (!st.clipText) { st.clipText = rtClipResult(cur.item); st.clipAt = now; }
+    var all = st.clipText;
+    var n = Math.min(all.length, Math.floor((now - st.clipAt) / 38));
+    var shown = all.slice(0, n);
+    if (cur.text.textContent !== shown) cur.text.textContent = shown;
+    cur.text.classList.add('sp-mv-title');
+    cur.text.classList.toggle('typing', n < all.length);
+    var w = (all.length ? n / all.length * 100 : 100).toFixed(1) + '%';
+    if (cur.fill.style.width !== w) cur.fill.style.width = w;
+    return n >= all.length;
+  }
   function rtFrame(st, gen) {
     st.raf = 0;
     if (gen !== st.gen || !st.cur) return;
@@ -8581,7 +8624,8 @@
     var cur = st.cur;
     var now = Date.now();
     rtOffAir(function () { mvFrameItem(cur, now); });
-    if (cur.phase === 'air' && (cur.item.kind !== 'speech' || cur.typed >= cur.item.text.length)) {
+    var clipTyped = rtClipType(st, cur, now);   /* [rollkeep] */
+    if (cur.phase === 'air' && (cur.item.kind !== 'speech' ? clipTyped : cur.typed >= cur.item.text.length)) {
       root.cancelAnimationFrame(st.raf);
       st.raf = 0;
       st.done = true;

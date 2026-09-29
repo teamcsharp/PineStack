@@ -134,12 +134,33 @@
       if (el === x || x.contains(el) || el.contains(x)) continue;
       var r = el.getBoundingClientRect();
       if (!r.width || r.bottom <= xr.top + 2 || r.top >= xr.bottom - 2 || r.right <= xr.left + 2 || r.left >= xr.right - 2) continue;
-      var row = el.parentElement && el.parentElement !== pop ? el.parentElement : el;
-      var had = 0;
-      try { had = parseFloat(root.getComputedStyle(row).paddingRight) || 0; } catch (e) { had = 0; }
-      row.style.paddingRight = Math.ceil(had + (r.right - xr.left) + 6) + 'px';
+      /* [closex:clear-once] the ROW that carries the control across the
+       * popup (a flex or grid line as wide as most of it), never a button
+       * or the icon group inside it; padded ONCE from its own first
+       * padding to exactly the X's width plus 6 px, so a resize or a
+       * re-measure never adds to it. */
+      var row = rowOf(el, pop);
+      if (!row) continue;
+      var base = row.getAttribute('data-pcx-base');
+      if (base === null) {
+        var had = 0;
+        try { had = parseFloat(root.getComputedStyle(row).paddingRight) || 0; } catch (e) { had = 0; }
+        base = String(had);
+        row.setAttribute('data-pcx-base', base);
+      }
+      var want = Math.ceil((parseFloat(base) || 0) + xr.width + 6) + 'px';
+      if (row.style.paddingRight !== want) row.style.paddingRight = want;
       row.setAttribute('data-pcx-clear', '');
     }
+  }
+  function rowOf(el, pop) {                 /* [closex:clear-once] */
+    var pw = pop.getBoundingClientRect().width || 1;
+    for (var n = el.parentElement; n && n !== pop; n = n.parentElement) {
+      var d = '';
+      try { d = root.getComputedStyle(n).display || ''; } catch (e) { d = ''; }
+      if (/(flex|grid)/.test(d) && n.getBoundingClientRect().width >= pw * 0.6) return n;
+    }
+    return el.parentElement && el.parentElement !== pop ? el.parentElement : null;
   }
   function soon(entry) {
     if (entry.clearing) return;

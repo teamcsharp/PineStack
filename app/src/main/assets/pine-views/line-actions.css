@@ -1113,3 +1113,17 @@
   .ld-edit-area { max-height: 170px; }
   .ld-said { max-height: 72px; }
 }
+
+/* [rollkeep] TWO FIT FIXES, measured on the desk at 1340x800 (2026-09-29).
+   1. The option rows lost 2-9 px of their second line once the roll band
+      sat above the list: the list is a height-limited grid, and a grid's
+      auto rows start at each row's min-height (44 px) and only grow into
+      free space - there was none. Rows are sized to their content now and
+      the list scrolls instead.
+   2. The header icons sat 4 px right and 4 px down in their square buttons:
+      `.la-ico { grid-area: ico }` (meant for the rows' icon column) named an
+      area the 36 px buttons do not have, so the grid made an implicit track
+      before the icon. A button's icon takes the button's one cell. */
+.la-sheet .la-list { grid-auto-rows: max-content; align-content: start; }
+.la-sheet .la-choice { flex-shrink: 0; }
+.la-vote > .la-ico { grid-area: auto; }
