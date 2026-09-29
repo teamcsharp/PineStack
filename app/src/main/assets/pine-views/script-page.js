@@ -5480,6 +5480,7 @@
     mvPanes();
     if (was.indexOf('scene:') === 0 && was !== view) mvSceneDispose();
     if (view === 'technical') {
+      mvSplit(false);                           /* [msgsplit] technical */
       mv.view = 'technical';
       mvSet(mv.pane, false); mvSet(mv.sceneBox, false);
       if (!techOn) technicalToggle();
@@ -5492,15 +5493,18 @@
     try { localStorage.setItem('sp.mv.view', view === 'message' ? 'message' : 'feed'); }
     catch (e) { /* remembered this session only */ }
     if (view === 'feed') {
+      mvSplit(false);                           /* [msgsplit] feed view */
       mvSet(mv.pane, false); mvSet(mv.sceneBox, false); mvSet(feed, true);
       mvHead('Feed', 'everything the station is doing');
     } else if (view === 'message') {
-      mvSet(feed, false); mvSet(mv.sceneBox, false); mvSet(mv.pane, true);
+      mvSet(feed, true); mvSet(mv.sceneBox, false); mvSet(mv.pane, true);
+      mvSplit(true);                            /* [msgsplit] the feed stays, above */
       mvHead('Message view', 'the element on air, as the roll made it');
       mv.seenAt = 0;
       mv.detectAt = 0;
       mvKick();
     } else {
+      mvSplit(false);                           /* [msgsplit] a scene */
       mvSet(feed, false); mvSet(mv.pane, false); mvSet(mv.sceneBox, true);
       mv.sceneLabel = label || view.slice(6);
       mvHead(mv.sceneLabel, 'a 3JS scene, in this pane - the menu takes it down');
@@ -5515,6 +5519,7 @@
     if (on) {
       if (mv.view.indexOf('scene:') === 0) mvSceneDispose();
       mv.view = 'technical';
+      mvSplit(false);                           /* [msgsplit] a name traced */
       mvSet(mv.pane, false); mvSet(mv.sceneBox, false);
     } else if (mv.view === 'technical') {
       mv.view = 'feed';
@@ -5526,6 +5531,7 @@
       if (mv.scene) mvSceneDispose();
       if (mv.seg && mv.seg.parentNode) mv.seg.parentNode.removeChild(mv.seg);
       mv.pane = null; mv.stage = null; mv.sceneBox = null; mv.seg = null; mv.cur = null; mv.view = 'feed';
+      mv.split = null;                          /* [msgsplit] it went with the old page */
     }
     mv.left = left;
     mv.flip = flip;
@@ -5534,6 +5540,174 @@
     var want = '';
     try { want = localStorage.getItem('sp.mv.view') || ''; } catch (e) { want = ''; }
     if (want === 'message') mvShow('message');
+  }
+
+  /* [msgsplit] THE FEED ABOVE THE MESSAGES. "the classic feed that's getting
+     compressed out of existence, let's actually expand that and keep that
+     where that's above the classic and digital feed" (operator, 2026-09-28).
+     In Message view the pane is split: the station's own feed (#spFeed,
+     moved, never copied - its scroll kept) on top, a grip, the bubbles
+     below. The share is dragged and remembered per screen; neither half
+     moves the other's scroll. The column on the tablet leaves ~150 px for
+     both, so the split also takes the "full width" band across the bottom
+     of the page (the technical view's own road: the same button, the rail
+     sliding away) - by the operator's choice, remembered, or on its own
+     when the column is too short for three feed rows and a bubble.
+     Leaving Message view puts every node back where it was. */
+  var mvSplitF = 0.4;
+  try {
+    var mvSplitKept = parseFloat(localStorage.getItem('sp.mv.split'));
+    if (mvSplitKept >= 0.12 && mvSplitKept <= 0.88) mvSplitF = mvSplitKept;
+  } catch (e) { /* the default share */ }
+  function mvSplitSet() {
+    if (!mv.split) return;
+    mv.split.style.setProperty('--mv-feed', (mvSplitF * 100).toFixed(1) + '%');
+    /* never under three of the feed's own rows (measured, not assumed) */
+    var row = mv.split.querySelector('#spFeed .sp-msg');
+    var rh = row ? Math.round(row.getBoundingClientRect().height) : 0;
+    if (rh > 20) mv.split.style.setProperty('--mv-feed-min', (rh * 3 + 16) + 'px');
+  }
+  function mvWideLabel() {
+    var flip = document.querySelector('.sp-techwide');
+    if (!flip) return;
+    var wide = mv.split ? !!mv.wide : techWide;
+    flip.textContent = wide ? 'in column' : 'full width';
+    flip.title = mv.split
+      ? (wide ? 'Put the feed and the messages back in the column' : 'Take the feed and the messages across the bottom of the window')
+      : (techWide ? 'Put the technical view back in the feed column' : 'Take the technical view across the whole bottom of the window');
+  }
+  function mvWidePlace() {
+    var box = mv.split;
+    if (!box) return;
+    var page = techPage();
+    var head = mv.splitHead || (mv.splitHead = mv.left && mv.left.querySelector('.sp-feedhead'));
+    if (mv.wide) {
+      box.classList.add('sp-mv-wide');
+      if (head && head.parentNode !== box) box.insertBefore(head, box.firstChild);   /* its buttons ride with it */
+      var tall = 0;
+      try { tall = parseInt(localStorage.getItem('sp.mv.tall') || '0', 10); } catch (e) { tall = 0; }
+      mvSplitSet();
+      var need = (parseInt(box.style.getPropertyValue('--mv-feed-min'), 10) || 150) + 230;   /* three feed rows and a bubble */
+      var pageH = page.clientHeight || 690;
+      box.style.height = (tall >= 200 ? tall : Math.min(pageH - 90, Math.max(Math.round(pageH * 0.55), need))) + 'px';
+      if (box.parentNode !== page) page.appendChild(box);
+    } else {
+      box.classList.remove('sp-mv-wide');
+      box.style.height = '';
+      if (head && head.parentNode === box && mv.splitHome && mv.splitHome.parentNode) mv.splitHome.parentNode.insertBefore(head, mv.splitHome);
+      if (mv.splitHome && mv.splitHome.parentNode && box.parentNode !== mv.splitHome.parentNode) {
+        mv.splitHome.parentNode.insertBefore(box, mv.splitHome.nextSibling);
+      }
+    }
+    try { document.documentElement.classList.toggle('pine-tech-wide', !!mv.wide || (techOn && techWide)); } catch (e) { /* no root */ }
+    mvSplitSet();
+    mvWideLabel();
+  }
+  function mvWide(on, chosen) {
+    mv.wide = !!on;
+    if (chosen) { try { localStorage.setItem('sp.mv.wide', mv.wide ? '1' : '0'); } catch (e) { /* this session */ } }
+    mvWidePlace();
+  }
+  function mvSplit(on) {
+    var feed = document.getElementById('spFeed');
+    if (!on) {
+      var box = mv.split;
+      mv.split = null;
+      if (!box) { mvWideLabel(); return; }
+      var home = mv.splitHome;
+      mv.splitHome = null;
+      var head0 = mv.splitHead;
+      mv.splitHead = null;
+      if (head0 && home && home.parentNode && head0.parentNode === box) home.parentNode.insertBefore(head0, home);
+      var keep = feed ? feed.scrollTop : 0;
+      if (home && home.parentNode) {
+        [].slice.call(box.childNodes).forEach(function (k) {
+          if (!(k.classList && (k.classList.contains('sp-mv-grip') || k.classList.contains('sp-mv-bandgrip')))) home.parentNode.insertBefore(k, home);
+        });
+        home.parentNode.removeChild(home);
+      }
+      if (box.parentNode) box.parentNode.removeChild(box);
+      if (feed) feed.scrollTop = keep;
+      if (mv.wide) {
+        try { if (!(techOn && techWide)) document.documentElement.classList.remove('pine-tech-wide'); } catch (e) { /* no root */ }
+      }
+      mvWideLabel();
+      return;
+    }
+    if (!feed || !mv.pane || !feed.parentNode || (mv.split && mv.split.isConnected)) return;
+    var keep2 = feed.scrollTop;
+    var split = make('div', 'sp-mv-split');
+    var homeMark = document.createComment('msgsplit');
+    feed.parentNode.insertBefore(homeMark, feed);
+    feed.parentNode.insertBefore(split, feed);
+    split.appendChild(feed);
+    var grip = make('div', 'sp-mv-grip');
+    grip.setAttribute('role', 'separator');
+    grip.setAttribute('aria-orientation', 'horizontal');
+    grip.title = 'Drag to share the pane between the feed and the messages';
+    split.appendChild(grip);
+    split.appendChild(mv.pane);
+    var band = make('div', 'sp-mv-bandgrip');
+    band.title = 'Drag to resize the band; double tap to put it back';
+    split.appendChild(band);
+    mv.split = split;
+    mv.splitHome = homeMark;
+    mvSplitSet();
+    feed.scrollTop = keep2;
+    var drag = null;
+    grip.addEventListener('pointerdown', function (ev) {
+      ev.preventDefault();
+      var r = split.getBoundingClientRect();
+      var pad = mv.wide ? 10 : 0;
+      drag = {top: r.top + pad, h: Math.max(1, r.height - grip.offsetHeight - pad)};
+      try { grip.setPointerCapture(ev.pointerId); } catch (e) { /* older engine */ }
+      grip.classList.add('on');
+    });
+    grip.addEventListener('pointermove', function (ev) {
+      if (!drag) return;
+      var most = Math.max(0.12, Math.min(0.88, (drag.h - 150) / drag.h));   /* the bubbles keep 150 px */
+      mvSplitF = Math.max(0.12, Math.min(most, (ev.clientY - drag.top) / drag.h));
+      mvSplitSet();
+    });
+    var up = function () {
+      if (!drag) return;
+      drag = null;
+      grip.classList.remove('on');
+      try { localStorage.setItem('sp.mv.split', mvSplitF.toFixed(3)); } catch (e) { /* this session only */ }
+    };
+    grip.addEventListener('pointerup', up);
+    grip.addEventListener('pointercancel', up);
+    var bandDrag = null;
+    band.addEventListener('pointerdown', function (ev) {
+      if (!mv.wide) return;
+      ev.preventDefault();
+      bandDrag = {y: ev.clientY, h: split.clientHeight};
+      try { band.setPointerCapture(ev.pointerId); } catch (e) { /* older engine */ }
+    });
+    band.addEventListener('pointermove', function (ev) {
+      if (!bandDrag) return;
+      var page = techPage();
+      split.style.height = Math.max(200, Math.min((page.clientHeight || 690) - 100, bandDrag.h + (bandDrag.y - ev.clientY))) + 'px';
+    });
+    var bandUp = function () {
+      if (!bandDrag) return;
+      bandDrag = null;
+      try { localStorage.setItem('sp.mv.tall', String(parseInt(split.style.height, 10) || 0)); } catch (e) { /* this session */ }
+    };
+    band.addEventListener('pointerup', bandUp);
+    band.addEventListener('pointercancel', bandUp);
+    band.addEventListener('dblclick', function () {
+      try { localStorage.removeItem('sp.mv.tall'); } catch (e) { /* fine */ }
+      mvWidePlace();
+    });
+    /* wide by the operator's own choice, else on its own when the column
+       cannot hold three feed rows and a bubble */
+    var chosen = '';
+    try { chosen = localStorage.getItem('sp.mv.wide') || ''; } catch (e) { chosen = ''; }
+    mvSplitSet();
+    var fitNeed = (parseInt(split.style.getPropertyValue('--mv-feed-min'), 10) || 150) + 14 + 190;   /* three feed rows, the grip, a bubble */
+    mv.wide = chosen ? chosen === '1' : split.clientHeight < fitNeed;
+    mvWidePlace();
   }
 
   /* ------------------------------------------------------ 3JS in the pane */
@@ -5849,6 +6023,10 @@
       var m = obs[i] && obs[i].media;
       if (m && m[lid]) { media = m[lid]; break; }
     }
+    if (item.kind === 'clip') {              /* [msgmedia] a clip's own roll only - never the host turn's */
+      if (media && media.sfx_roll && !(item.row && item.row.sfx_roll)) item.row = mvMerge(item.row, {sfx_roll: media.sfx_roll});
+      return mvClipRows(item) || [];
+    }
     var sfx = (item.row && item.row.sfx_roll) || (media && media.sfx_roll) || null;
     if (sfx && (sfx.category || sfx.clip)) {
       /* the clip's roll: only label, index and "of" were recorded - the
@@ -6040,6 +6218,181 @@
     var note = make('p', 'sp-mv-note sp-mv-dbnote', stores.title);
     cur.all.appendChild(note);
   }
+  /* [msgmedia] A CLIP'S OWN RECORD: its name, its folder, what it matched, its
+     media roads (the row's signed url / poster / spectrogram) and its roll. */
+  var MV_TOKEN = /[?&]t=([0-9a-f]+)/;
+  function mvFolders() {
+    if (mv.folderAsk) return mv.folderAsk;
+    mv.folderAsk = Promise.resolve().then(function () { return api().get('/api/sfx/folders'); }).then(function (got) {
+      mv.folderNames = ((got && got.folders) || []).map(function (f) { return String((f && f.name) || ''); })
+        .filter(function (n) { return !!n; });
+      return mv.folderNames;
+    }, function () { mv.folderAsk = null; return null; });
+    return mv.folderAsk;
+  }
+  function mvClipInfo(item) {
+    var row = (item && item.row) || {};
+    var roll = row.sfx_roll || (row.system3 && row.system3.sfx_roll) || null;
+    var cat = (roll && roll.category) || {};
+    var sid = String(row.sfx || row.sfx_sample_id || '');
+    var url = String(row.url || '');
+    var tok = (MV_TOKEN.exec(url) || MV_TOKEN.exec(String(row.poster || '')) || [])[1] || '';
+    var thumb = roll && roll.thumb ? String(roll.thumb) : '';
+    return {
+      sid: sid, url: url, video: !!row.video, roll: roll, seconds: Number(row.seconds) || 0,
+      name: mvPlain((roll && roll.clip && roll.clip.label) || row.text || (item && item.text) || ''),
+      folder: String(row.sfx_dir || cat.label || ''),
+      why: String(row.match_why || row.sfx_match_why || cat.by || ''),
+      poster: String(row.poster || (roll && roll.thumb_kind === 'frame' ? thumb : '') || ''),
+      spec: roll && roll.thumb_kind === 'spectrogram' ? thumb : (sid && tok ? '/api/sfx/spec/' + sid + '?t=' + tok : '')
+    };
+  }
+  function mvClipRows(item) {
+    var c = mvClipInfo(item);
+    var roll = c.roll;
+    if (!roll && !c.folder) return null;
+    var cat = (roll && roll.category) || {};
+    var names = mv.folderNames || [];
+    var at = c.folder ? names.indexOf(c.folder) : -1;
+    var catDice = cat.dice != null ? cat.dice : null;
+    var main = at >= 0
+      ? {dice: catDice, opts: names.slice(), hit: at, label: c.folder, of: names.length}
+      : {dice: catDice, opts: [c.folder || String(cat.label || '')], hit: 0, label: c.folder || String(cat.label || ''), of: 1};
+    var clip = roll && roll.clip;
+    var of = clip ? Number(clip.of) || 0 : 0;
+    var sub = clip
+      ? {dice: clip.dice != null ? clip.dice : null, opts: [c.name], hit: 0, label: c.name,
+         index: Number(clip.index) || 0, of: of, counted: of > 1}
+      : {dice: null, opts: [c.name], hit: 0, label: c.name, of: 1};
+    return [{fam: 'SFX', table: roll && roll.road ? String(roll.road) : 'SFX', event: '', main: main, sub: sub,
+      match: !!((roll && roll.road === 'match') || (item.row && (item.row.match_why || item.row.sfx_match_why))),
+      why: [roll ? 'the ' + String(roll.road || '') + ' road' : '', c.why].filter(function (x) { return !!x; }).join(' - ')}];
+  }
+  function mvVideoRelease() {
+    var m = mv.video;
+    mv.video = null;
+    if (!m || !m.video) return;
+    var v = m.video;
+    m.video = null;
+    try { v.pause(); v.removeAttribute('src'); v.load(); } catch (e) { /* already gone */ }
+    if (v.parentNode) v.parentNode.removeChild(v);
+    if (m.img) m.img.style.visibility = '';
+  }
+  function mvMediaBox(item, bubble) {
+    var c = mvClipInfo(item);
+    var box = make('div', 'sp-mv-media ' + (c.video ? 'is-video' : 'is-audio'));
+    var why = make('div', 'sp-mv-clipwhy', '');
+    var out = {box: box, why: why, info: c, video: null, img: null, canvas: null, head: null, note: null, live: false, col: 0};
+    if (c.video && c.url) {
+      if (c.poster) {
+        var img = document.createElement('img');
+        img.className = 'sp-mv-poster';
+        img.alt = '';
+        img.addEventListener('error', function () { img.style.display = 'none'; });
+        img.src = stationUrl(c.poster);
+        box.appendChild(img);
+        out.img = img;
+      }
+      mvVideoRelease();                        /* one video element at a time */
+      var v = document.createElement('video');
+      v.className = 'sp-mv-video';
+      v.muted = true;
+      v.setAttribute('muted', '');
+      v.setAttribute('playsinline', '');
+      v.preload = 'auto';
+      v.style.visibility = 'hidden';
+      videoFirstFrame(v, function () {
+        v.style.visibility = 'visible';
+        if (out.img) out.img.style.visibility = 'hidden';
+      }, function () {
+        v.style.visibility = 'hidden';
+        if (out.img) out.img.style.visibility = '';
+      });
+      v.addEventListener('error', function () { if (mv.video === out) mvVideoRelease(); });
+      v.src = stationUrl(c.url);
+      box.appendChild(v);
+      out.video = v;
+      mv.video = out;
+      box.title = 'the clip itself, muted - the air carries its sound';
+    } else {
+      var cv = document.createElement('canvas');
+      cv.className = 'sp-mv-spec';
+      box.appendChild(cv);
+      out.canvas = cv;
+      if (c.spec) {
+        var si = document.createElement('img');
+        si.className = 'sp-mv-specimg';
+        si.alt = '';
+        si.addEventListener('error', function () { si.style.display = 'none'; out.img = null; });
+        si.src = stationUrl(c.spec);
+        box.appendChild(si);
+        out.img = si;
+      }
+      out.head = make('i', 'sp-mv-head', '');
+      box.appendChild(out.head);
+      out.note = make('span', 'sp-mv-specnote', '');
+      box.appendChild(out.note);
+    }
+    bubble.appendChild(box);
+    bubble.appendChild(why);
+    return out;
+  }
+  function mvMediaFrame(cur, f) {
+    var m = cur.media;
+    if (!m) return;
+    if (m.video) {
+      var v = m.video;
+      var span = isFinite(v.duration) && v.duration > 0 ? v.duration : m.info.seconds;
+      if (v.paused && !v.ended) { try { var pr = v.play(); if (pr && pr.catch) pr.catch(function () { /* poster stays */ }); } catch (e) { /* poster stays */ } }
+      if (f !== null && span && v.readyState >= 1) {
+        var want = Math.min(f * span, Math.max(0, span - 0.05));
+        if (Math.abs((Number(v.currentTime) || 0) - want) > 0.45) { try { v.currentTime = want; } catch (e) { /* not seekable yet */ } }
+      }
+      return;
+    }
+    if (!m.canvas) return;
+    var reading = null;
+    try {
+      reading = root.PineMeters && root.PineMeters.readLoudest
+        ? root.PineMeters.readLoudest(['djVoiceAudio0', 'djVoiceAudio1'], 'voice') : null;
+    } catch (e) { reading = null; }
+    if (reading && reading.peak > 0.02 && cur.phase !== 'done') {
+      var cv = m.canvas;
+      if (!m.live) {
+        m.live = true;
+        cv.width = Math.max(60, Math.round(cv.clientWidth || 300));
+        cv.height = Math.max(24, Math.round(cv.clientHeight || 56));
+        m.box.classList.add('is-live');
+        m.box.title = 'the clip on air, live - the station\'s own analyser';
+      }
+      var g = cv.getContext('2d');
+      if (g) {
+        var w = cv.width, h = cv.height, bars = reading.bars || [];
+        g.drawImage(cv, -2, 0);
+        g.fillStyle = '#070b10';
+        g.fillRect(w - 2, 0, 2, h);
+        var cell = h / Math.max(1, bars.length);
+        for (var b = 0; b < bars.length; b += 1) {
+          var val = Math.max(0, Math.min(1, bars[b]));
+          if (val < 0.04) continue;
+          g.fillStyle = 'hsl(' + Math.round(200 - val * 160) + ',80%,' + Math.round(18 + val * 50) + '%)';
+          g.fillRect(w - 2, h - (b + 1) * cell, 2, Math.ceil(cell));
+        }
+      }
+    } else if (!m.live) {
+      m.box.title = m.img
+        ? 'the station\'s spectrogram of this clip - no analyser reaches its sound in this window'
+        : '';
+      var say = m.img ? '' : 'no analyser reaches this sound here, and the station has no spectrogram for it';
+      if (m.note.textContent !== say) m.note.textContent = say;
+    }
+    if (m.head) {
+      var k = f === null ? 0 : Math.max(0, Math.min(1, f));
+      var ws = ((1 - k) * 100).toFixed(1) + '%';
+      if (m.head.style.width !== ws) m.head.style.width = ws;
+      m.head.style.display = m.live ? 'none' : '';
+    }
+  }
   function mvAsk(item) {
     var lid = item.lid;
     if (!lid) return Promise.resolve(null);
@@ -6048,7 +6401,7 @@
     var prov = null;                         /* [msgdb] the provenance tree, asked beside it */
     var p = Promise.all([Promise.resolve().then(function () {
       return s3Request('/api/system3/line?line_id=' + encodeURIComponent(lid));
-    }).then(null, function () { return null; }), mvProv(lid)]).then(function (two) {
+    }).then(null, function () { return null; }), mvProv(lid), item.kind === 'clip' ? mvFolders() : null]).then(function (two) {   /* [msgmedia] the folder list */
       var ans = two[0];
       prov = two[1];
       var turn = ans && ans.turn || null;
@@ -6166,6 +6519,7 @@
     var stage = mv.stage;
     if (!stage) return;
     if (mv.cur && !redraw) mvRetire(mv.cur);
+    if (redraw) mvVideoRelease();              /* [msgmedia] */
     if (redraw && mv.cur && mv.cur.node && mv.cur.node.parentNode) mv.cur.node.parentNode.removeChild(mv.cur.node);
     var style = mv.style;
     var node = make('div', 'sp-mv-item sp-mv-' + mvSide(item) + ' sp-mv-' + style + ' sp-mv-k-' + item.kind);
@@ -6179,6 +6533,7 @@
     acc.appendChild(accSmall);
     node.appendChild(acc);
     var bubble = make('div', 'sp-mv-bubble');
+    mvOriginWire(bubble, item);               /* [msgorigin] double tap: the origin; hold: the sheet */
     var head = make('div', 'sp-mv-who');
     head.appendChild(mvGlyph(mvKindIcon(item)));
     head.appendChild(make('b', '', item.name || ''));
@@ -6191,6 +6546,7 @@
     var text = make('span', 'sp-mv-words', '');
     textBox.appendChild(text);
     bubble.appendChild(textBox);
+    var media = item.kind === 'clip' ? mvMediaBox(item, bubble) : null;   /* [msgmedia] */
     var bar = make('div', 'sp-mv-load');
     var fill = make('i', '', '');
     bar.appendChild(fill);
@@ -6215,6 +6571,8 @@
       acc: acc, accReel: accReel, accSmall: accSmall, rolls: rolls, text: text, fill: fill,
       tab: tab, all: all, clock: tail, typed: -1, phase: 'wait', began: Date.now(), f0: null};
     mv.cur = cur;
+    cur.media = media;                         /* [msgmedia] */
+    if (item.kind === 'record' || item.kind === 'live') mvVizBuild(cur);   /* [msgviz] */
     var still = false;
     try { still = !!(root.matchMedia && root.matchMedia('(prefers-reduced-motion: reduce)').matches); } catch (e) { still = false; }
     cur.still = still;
@@ -6236,6 +6594,7 @@
   function mvRetire(cur) {
     if (!cur || !cur.node) return;
     cur.node.classList.add('sp-mv-past');
+    if (cur.media && cur.media.video) mvVideoRelease();   /* [msgmedia] the history keeps the poster */
     if (cur.item.kind === 'speech') cur.text.textContent = cur.item.text;
     cur.text.classList.remove('typing');
     cur.fill.style.width = '100%';
@@ -6250,6 +6609,7 @@
     if (cur.style === 'digital') {
       rows.forEach(function (r) {
         var parts = mvRowDom(r);
+        if (r.match) mvMatchChip(parts.row, cur);  /* [msgmatch] */
         parts.wrap.style.display = 'none';
         cur.rolls.appendChild(parts.wrap);
         shown.push(parts);
@@ -6265,12 +6625,33 @@
         d.title = r.fam + ' - ' + r.main.label + (r.sub ? ' / ' + r.sub.label : '')
           + (r.main.dice != null ? ' - d100 ' + r.main.dice : '');
         strip.appendChild(d);
+        if (r.match) mvMatchChip(d, cur);          /* [msgmatch] the clip's roll chip */
         shown.push({die: d, num: n, r: r});
       });
       if (rows.length) cur.rolls.appendChild(strip);
+      /* [msgmedia] after the dice: element by element, the category's Rolodex, then its sub-result's */
+      var creel = make('div', 'sp-mv-creel');
+      shown.forEach(function (p) {
+        var line = make('div', 'sp-mv-cline');
+        line.style.setProperty('--fam', MV_FAM[p.r.fam] || '#68ced9');
+        line.appendChild(make('b', 'sp-mv-ctag', p.r.table || p.r.fam));
+        p.dex = mvDex(p.r.main);
+        line.appendChild(p.dex);
+        if (p.r.sub) {
+          line.appendChild(mvGlyph('c:caret--right', 'sp-mv-carrow'));
+          p.sdex = mvDex(p.r.sub);
+          line.appendChild(p.sdex);
+        }
+        line.style.display = 'none';
+        p.line = line;
+        creel.appendChild(line);
+      });
+      if (shown.length) cur.rolls.appendChild(creel);
+      cur.creel = creel;
     }
     (data.rows || []).forEach(function (r) {
       var line = mvStatic(r);
+      if (r.match) mvMatchChip(line, cur);       /* [msgmatch] */
       if (r.event && data.cid) {
         line.addEventListener('click', function (ev) {
           ev.stopPropagation();
@@ -6280,6 +6661,7 @@
       cur.all.appendChild(line);
     });
     mvBadge(cur, data.stores);                /* [msgdb] the filing cabinet, over the corner */
+    if (cur.media && (data.rows || []).some(function (r) { return r.match; })) mvMatchChip(cur.media.why, cur);   /* [msgmatch] */
     if (data.restamped) cur.all.appendChild(make('p', 'sp-mv-note', 'the line\'s own System 3 stamp named its turn; the ledger row said ' + data.restamped));
     if (!(data.rows || []).length && (cur.item.kind === 'speech' || cur.item.kind === 'clip')) {
       cur.all.appendChild(make('p', 'sp-mv-note', 'no System 3 table was rolled for this line'));
@@ -6310,6 +6692,18 @@
         t = Math.max(t, i * gap + 450);
       }
     });
+    if (cur.style !== 'digital' && plan.length) {   /* [msgmedia] the Rolodexes follow the dice */
+      var rAt = t + 120;
+      var per = Math.max(420, Math.min(1000, (budget * 1.4 - rAt) / plan.length));
+      plan.forEach(function (s) {
+        var two = !!s.p.r.sub;
+        s.r0 = rAt;
+        s.rm = two ? per * 0.55 : per * 0.9;
+        s.rs = two ? per * 0.45 : 0;
+        rAt += per;
+      });
+      t = rAt;
+    }
     cur.rollEnd = t;
     cur.collapseEnd = t + (cur.style === 'digital' && rows.length ? Math.round(budget * 0.08) : 150);
     var src = data.sources || {main: '', others: []};
@@ -6340,6 +6734,290 @@
     cur.t0 = 0;
     cur.phase = 'roll';
   }
+  /* [msgviz] THE RECORD ON AIR, VISUALIZED. "for this area on the actively
+     playing song use a peak-hold indicators animated peak falloff from the
+     database we used for the pine live audiograph area. Choose it at random
+     based on the track" (operator, 2026-09-28). PineLive's own drawer
+     (PineLiveScope.vizDraw: its 16 styles, per-band peak caps held then
+     falling) on one canvas in the on-air record bubble; the style seeded by
+     the track (the same song, the same style); the music element's reading
+     (PineMeters.read('musicPlayer', 'music') - it follows the Music level
+     and the duck) resampled to 32 bands; a live set draws PineLive.liveBars().
+     Drawn only for the item on air, on the view's own frame; a bubble gone
+     to history keeps its last frame. */
+  function mvVizStyle(key, count) {
+    var h = 2166136261, s = String(key || '');
+    for (var i = 0; i < s.length; i += 1) {
+      h ^= s.charCodeAt(i);
+      h = (typeof Math.imul === 'function') ? Math.imul(h, 16777619) : ((h * 16777619) | 0);
+    }
+    return (h >>> 0) % Math.max(1, count || 16);
+  }
+  function mvVizBuild(cur) {
+    var scope = root.PineLiveScope;
+    var bubble = cur.node && cur.node.querySelector('.sp-mv-bubble');
+    if (!bubble || !scope || typeof scope.vizDraw !== 'function') return;
+    var styles = scope.VIZ_STYLES || [];
+    var cv = document.createElement('canvas');
+    cv.className = 'sp-mv-viz';
+    bubble.appendChild(cv);
+    var style = mvVizStyle(cur.item.key, styles.length || 16);
+    cv.title = 'PineLive visualizer - ' + String((styles[style] && styles[style].name) || style) + ' (chosen for this track)';
+    cv.setAttribute('role', 'img');
+    cv.setAttribute('aria-label', cv.title);
+    cur.node.classList.add('sp-mv-has-viz');
+    cur.viz = {canvas: cv, ctx: cv.getContext('2d'), style: style, state: {dpr: 1}, drawn: 0};
+  }
+  function mvVizFrame(cur) {
+    var z = cur.viz;
+    if (!z || !z.ctx || cur.phase === 'done') return;
+    var reading = null;
+    try {
+      reading = cur.item.kind === 'live'
+        ? (root.PineLive && root.PineLive.liveBars ? root.PineLive.liveBars() : null)
+        : (root.PineMeters && root.PineMeters.read ? root.PineMeters.read('musicPlayer', 'music') : null);
+    } catch (e) { reading = null; }
+    var bars = (reading && reading.bars) || [];
+    var n = 32, levels = new Array(n);
+    for (var i = 0; i < n; i += 1) {
+      var a = Math.floor(i * bars.length / n), b = Math.max(a + 1, Math.floor((i + 1) * bars.length / n)), sum = 0;
+      for (var k = a; k < b; k += 1) sum += Number(bars[k]) || 0;
+      levels[i] = bars.length ? sum / (b - a) : 0;
+    }
+    var dpr = Math.min(2, root.devicePixelRatio || 1);
+    var w = Math.max(20, Math.round((z.canvas.clientWidth || 120) * dpr));
+    var h = Math.max(12, Math.round((z.canvas.clientHeight || 34) * dpr));
+    if (z.canvas.width !== w || z.canvas.height !== h) { z.canvas.width = w; z.canvas.height = h; }
+    z.state.dpr = dpr;
+    z.name = root.PineLiveScope.vizDraw(z.ctx, w, h, levels, z.state, z.style);
+    z.drawn += 1;
+    z.peak = reading ? reading.peak : 0;
+  }
+  /* [msgmatch] HOW A CLIP WAS MATCHED TO THE DIALOGUE. "If I tap on a matched
+     icon, then show a pop-up illustrating how it was matched to the dialogue
+     and what systems were used to match it to the dialogue and how it was
+     done." (operator, 2026-09-28)
+     Only the record: the clip's own row (match_why, match_score, sfx_dir,
+     sfx_roll - the matcher's peers and System 3's clip roll), the station's
+     match ring (GET /api/sfx/match: `recent` holds the line each pick was
+     matched to, and the index it searched), and the host turn's own SFX
+     decision off /api/system3/line (placement, intent words, its dice).
+     What the station does not keep is said so, in the popup. Movable; X,
+     Escape or a tap away closes it (PineDismiss); nothing scrolls. */
+  function mvMatchWords(why) {
+    var out = {line: [], topic: [], folder: [], folderName: ''};
+    var s = String(why || '');
+    var grab = function (part) {
+      var got = [], m, re = /'([^']+)'/g;
+      while ((m = re.exec(part))) got.push(m[1]);
+      return got;
+    };
+    var viaAt = s.search(/\bvia the |matched the [^ ]+ folder/);
+    var topicAt = s.indexOf('the topic ');
+    var head = s.slice(0, [topicAt, viaAt].filter(function (x) { return x >= 0; }).sort(function (a, b) { return a - b; })[0] || s.length);
+    if (/^matched '/.test(head)) out.line = grab(head);
+    if (topicAt >= 0) out.topic = grab(s.slice(topicAt, viaAt > topicAt ? viaAt : s.length));
+    if (viaAt >= 0) {
+      var fm = /(?:via|matched) the (\S+) folder \(([^)]*)\)/.exec(s.slice(viaAt));
+      if (fm) { out.folderName = fm[1]; out.folder = grab(fm[2]); }
+    }
+    return out;
+  }
+  function mvMatchLine(into, line, words) {
+    var lower = String(line || '');
+    var marks = [];
+    words.forEach(function (w) {
+      var re = new RegExp('\\b' + String(w).replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\w*', 'ig'), m;
+      while ((m = re.exec(lower))) marks.push([m.index, m.index + m[0].length]);
+    });
+    marks.sort(function (a, b) { return a[0] - b[0]; });
+    var at = 0;
+    marks.forEach(function (r) {
+      if (r[0] < at) return;
+      if (r[0] > at) into.appendChild(document.createTextNode(lower.slice(at, r[0])));
+      into.appendChild(make('mark', 'sp-mm-hit', lower.slice(r[0], r[1])));
+      at = r[1];
+    });
+    if (at < lower.length) into.appendChild(document.createTextNode(lower.slice(at)));
+  }
+  function mvMatchClose() {
+    var m = mv.match;
+    mv.match = null;
+    if (!m) return;
+    if (m.unwatch) { try { m.unwatch(); } catch (e) { /* gone */ } }
+    document.removeEventListener('keydown', m.key, true);
+    if (m.node && m.node.parentNode) m.node.parentNode.removeChild(m.node);
+  }
+  function mvMatchOpen(item, opener) {
+    mvMatchClose();
+    var row = (item && item.row) || {};
+    var c = mvClipInfo(item);
+    var roll = c.roll || {};
+    var box = make('div', 'sp-mm');
+    box.setAttribute('role', 'dialog');
+    box.setAttribute('aria-label', 'How this clip was matched to the dialogue');
+    var head = make('div', 'sp-mm-head');
+    head.appendChild(mvGlyph('c:search'));
+    head.appendChild(make('b', '', 'How this clip was matched'));
+    var x = make('button', 'sp-mm-x');
+    x.type = 'button';
+    x.setAttribute('aria-label', 'Close');
+    x.title = 'Close';
+    x.appendChild(mvGlyph('c:close--filled'));
+    head.appendChild(x);
+    box.appendChild(head);
+    var body = make('div', 'sp-mm-body');
+    box.appendChild(body);
+    var sect = function (title) {
+      var s = make('section', 'sp-mm-sect');
+      s.appendChild(make('h4', '', title));
+      body.appendChild(s);
+      return s;
+    };
+    var kv = function (into, k, v) {
+      var r = make('div', 'sp-mm-kv');
+      r.appendChild(make('span', 'sp-mm-k', k));
+      r.appendChild(make('span', 'sp-mm-v', v));
+      into.appendChild(r);
+      return r;
+    };
+    var clip = sect('The clip');
+    kv(clip, 'name', c.name || '-');
+    kv(clip, 'folder', c.folder || '-');
+    if (row.match_score != null) kv(clip, 'match score', String(Math.round(Number(row.match_score) * 100) / 100));
+    kv(clip, 'why (the row\'s record)', String(row.match_why || row.sfx_match_why || '(no match reason recorded on the row)'));
+    var words = mvMatchWords(row.match_why || row.sfx_match_why || '');
+    var said = sect('The dialogue it was matched to');
+    var saidLine = make('p', 'sp-mm-line', 'asking the station\'s match ring...');
+    said.appendChild(saidLine);
+    var how = sect('How it was done, in order');
+    var steps = make('ol', 'sp-mm-steps');
+    how.appendChild(steps);
+    var step = function (title, text) {
+      var li = make('li', '');
+      li.appendChild(make('b', '', title));
+      li.appendChild(make('span', '', text));
+      steps.appendChild(li);
+      return li;
+    };
+    var sIndex = step('The SFX matcher (#1251)', 'one postings index over every clip\'s name, its transcript (the renamer\'s _retroname.jsonl), its thumbnail tags and WordNet senses - asked...');
+    step('The words it matched', [
+      words.line.length ? 'in the LINE: ' + words.line.join(', ') : 'no words from the line itself',
+      words.topic.length ? 'in the TOPIC (the context, half weight): ' + words.topic.join(', ') : '',
+      words.folder.length ? 'through the ' + (words.folderName || c.folder) + ' folder\'s keywords: ' + words.folder.join(', ') : ''
+    ].filter(function (t) { return !!t; }).join('; '));
+    var sFloor = step('The floor', 'a clip has to score over the floor to be a candidate; the peers tied at the top go on');
+    step('The filters', 'banned clips, clips weighed all the way down, anything heard lately (the station\'s recency ring) and a video still cooling down are taken out');
+    var cl = roll.clip || {};
+    step('System 3\'s clip roll', roll.road
+      ? ('the ' + String(roll.road) + ' road: ' + (cl.dice != null ? 'd100 ' + cl.dice + ' picked ' : 'picked ')
+        + (cl.index ? cl.index + ' of ' + (cl.of || '?') : 'this clip') + (cat(roll).by ? ' - the category by ' + cat(roll).by : ''))
+      : 'no clip roll recorded on the row');
+    function cat(r) { return (r && r.category) || {}; }
+    var sTurn = step('The turn\'s own SFX roll', 'asking System 3...');
+    var won = sect('Why this clip won');
+    var wonText = make('p', '', '');
+    won.appendChild(wonText);
+    var missing = sect('Not recorded by the station');
+    var miss = make('ul', 'sp-mm-miss');
+    ['the candidate clips and their scores for this pick (only the matcher\'s counts for its LAST pick live in memory)',
+      'how many clips cleared the floor and how many the filters removed, for this pick',
+      'which of the four roads (name, transcript, thumbnail tags, senses) supplied each matched word'
+    ].forEach(function (t) { miss.appendChild(make('li', '', t)); });
+    missing.appendChild(miss);
+    (host || document.body).appendChild(box);
+    /* placed beside the Message view, inside the window; the header moves it */
+    var r0 = (mv.pane && mv.pane.getBoundingClientRect()) || {left: 20, top: 20, width: 400};
+    var vw = root.innerWidth || 1154, vh = root.innerHeight || 690;
+    var bw = Math.min(460, vw - 24);
+    box.style.width = bw + 'px';
+    box.style.left = Math.max(8, Math.min(vw - bw - 8, Math.round(r0.left + r0.width + 8 > vw - bw ? r0.left : r0.left + r0.width + 8))) + 'px';
+    box.style.top = Math.max(8, Math.min(vh - 260, Math.round((r0.top || 60) - 40))) + 'px';
+    box.style.maxHeight = (vh - 16 - Math.max(8, parseInt(box.style.top, 10) || 8)) + 'px';
+    var drag = null;
+    head.addEventListener('pointerdown', function (ev) {
+      if (ev.target.closest && ev.target.closest('button')) return;
+      drag = {x: ev.clientX, y: ev.clientY, l: parseInt(box.style.left, 10) || 0, t: parseInt(box.style.top, 10) || 0};
+      try { head.setPointerCapture(ev.pointerId); } catch (e) { /* older engine */ }
+    });
+    head.addEventListener('pointermove', function (ev) {
+      if (!drag) return;
+      box.style.left = Math.max(0, Math.min(vw - 60, drag.l + ev.clientX - drag.x)) + 'px';
+      box.style.top = Math.max(0, Math.min(vh - 40, drag.t + ev.clientY - drag.y)) + 'px';
+    });
+    head.addEventListener('pointerup', function () { drag = null; });
+    x.addEventListener('click', function (ev) { ev.stopPropagation(); mvMatchClose(); });
+    var m = mv.match = {node: box, unwatch: null, key: function (ev) {
+      if (ev.key === 'Escape') { ev.stopPropagation(); mvMatchClose(); }
+    }};
+    document.addEventListener('keydown', m.key, true);
+    if (root.PineDismiss && typeof root.PineDismiss.watch === 'function') {
+      m.unwatch = root.PineDismiss.watch(box, mvMatchClose, opener ? [opener] : []);
+    }
+    /* the station's match ring: the line this pick was matched to, and the index */
+    Promise.resolve().then(function () { return api().get('/api/sfx/match'); }).then(function (st) {
+      if (mv.match !== m) return;
+      st = st || {};
+      sIndex.lastChild.textContent = 'one postings index over every clip\'s name, its transcript (the renamer\'s _retroname.jsonl), its thumbnail tags and WordNet senses: '
+        + (st.clips ? st.clips + ' clips indexed, ' + st.wordy + ' of them carrying words, ' + st.words + ' words, over ' + st.folders + ' folders' : 'the index did not answer');
+      if (st.floor != null) {
+        sFloor.lastChild.textContent = 'a clip has to score over the floor to be a candidate (floor ' + st.floor + ', the strength dial at '
+          + st.strength + '%; the endless set\'s ' + st.video_floor + ' at ' + st.video_strength + '%); the peers tied at the top go on';
+      }
+      var ring = st.recent || [];
+      var mine = null, best = 1e12, at = Number(row.air_at || row.ts || 0);
+      ring.forEach(function (p) {
+        if (!p || String(p.sting || '') !== String(row.text || c.name || '')) return;
+        var d = Math.abs(Number(p.at || 0) - at);
+        if (d < best) { best = d; mine = p; }
+      });
+      saidLine.textContent = '';
+      if (mine && mine.line) {
+        mvMatchLine(saidLine, mine.line, words.line.concat(words.topic));
+        said.appendChild(make('p', 'sp-mm-note', 'from the station\'s match ring (it keeps the last few picks)'));
+      } else {
+        saidLine.textContent = 'the station\'s match ring no longer holds this pick (it keeps only the last few), and the line is not on the clip\'s own record';
+        said.classList.add('sp-mm-none');
+      }
+      var score = row.match_score != null ? Math.round(Number(row.match_score) * 100) / 100 : (mine ? mine.score : null);
+      wonText.textContent = (score != null && st.floor != null
+        ? 'it scored ' + score + ' against a floor of ' + st.floor + ' on the words above; '
+        : 'it cleared the matcher\'s floor on the words above; ')
+        + (cl.of === 1 || cl.of === '1' ? 'it was the only peer left after the filters, so System 3\'s roll had one to land on'
+          : (cl.index ? 'System 3\'s roll landed on it, ' + cl.index + ' of ' + (cl.of || '?') + ' peers' : 'System 3 recorded no clip roll for it'));
+    }, function () {
+      if (mv.match !== m) return;
+      saidLine.textContent = 'the station\'s match ring did not answer';
+    });
+    /* the host turn's own SFX decision: whether it called for a clip, where, and on which words */
+    var ask = item.lid ? mv.answers[item.lid] : null;
+    Promise.resolve(item.lid ? s3Request('/api/system3/line?line_id=' + encodeURIComponent(item.lid)) : null).then(function (ans) {
+      if (mv.match !== m) return;
+      var t = ans && ans.turn;
+      var sfx = t && t.sfx;
+      if (!sfx) { sTurn.lastChild.textContent = 'System 3 recorded no SFX decision on the turn this clip followed'; return; }
+      sTurn.lastChild.textContent = (sfx.play ? 'the turn called for a clip' : 'the turn\'s own roll passed (no clip) - this clip came by another road')
+        + (sfx.placement ? ', placed ' + sfx.placement : '')
+        + (sfx.p != null ? ', at odds ' + Math.round(Number(sfx.p) * 100) + '%' : '')
+        + (sfx.intent && sfx.intent.length ? '; intent words: ' + sfx.intent.join(', ') : '')
+        + (sfx.reason ? ' (' + sfx.reason + ')' : '');
+    }, function () { if (mv.match === m) sTurn.lastChild.textContent = 'System 3 did not answer for this line'; });
+    return ask;
+  }
+  function mvMatchChip(el, cur) {
+    if (!el || el.pineMatch) return;
+    el.pineMatch = true;
+    el.classList.add('sp-mv-matchable');
+    el.setAttribute('role', 'button');
+    el.setAttribute('tabindex', '0');
+    el.title = 'How this clip was matched to the dialogue';
+    el.addEventListener('pointerup', function (ev) { ev.stopPropagation(); });   /* not a tap on the bubble */
+    el.addEventListener('click', function (ev) { ev.stopPropagation(); mvMatchOpen(cur.item, el); });
+    el.addEventListener('keydown', function (ev) {
+      if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); mvMatchOpen(cur.item, el); }
+    });
+  }
+
   function mvEase(x) { x = Math.max(0, Math.min(1, x)); return 1 - Math.pow(1 - x, 3); }
   function mvFace(r, k) { return String(1 + ((Number(r.dice || 0) * 37 + k * 53) % 100)); }
   function mvDexAt(dex, x) {
@@ -6368,6 +7046,21 @@
         p.die.classList.toggle('rolling', x < 1);
         p.die.style.transform = x < 1 ? 'rotate(' + Math.round(x * 720) + 'deg)' : '';
         mvNum(p.num, p.r.main, x);
+        if (p.line && s.r0 != null) {           /* [msgmedia] category, then sub-result */
+          var e3 = skip ? 1e9 : ms - s.r0;
+          if (e3 >= 0) {
+            if (cur.cline !== p.line) {
+              if (cur.cline) cur.cline.style.display = 'none';
+              p.line.style.display = '';
+              cur.cline = p.line;
+            }
+            mvDexAt(p.dex, e3 / s.rm);
+            if (p.sdex) {
+              p.sdex.style.opacity = e3 >= s.rm ? '1' : '.3';
+              mvDexAt(p.sdex, (e3 - s.rm) / s.rs);
+            }
+          }
+        }
         return;
       }
       if (e < 0) return;
@@ -6441,6 +7134,7 @@
         cur.node.classList.add('sp-mv-onair');
         /* "then we can clear this out and have the text up here" */
         if (cur.style === 'digital') cur.rolls.style.display = 'none';
+        else if (cur.creel) cur.creel.style.display = 'none';   /* [msgmedia] the roulette becomes the message */
       }
       if (item.kind === 'speech') {
         var n = Math.floor((f === null ? 1 : f) * item.text.length + 0.0001);
@@ -6456,8 +7150,11 @@
       } else if (cur.typed < 0) {
         cur.typed = 0;
         var title = item.text;
-        if (item.kind === 'clip' && cur.data && cur.data.rows && cur.data.rows[0] && cur.data.rows[0].sub) {
-          title = cur.data.rows[0].sub.label || title;
+        if (item.kind === 'clip') {             /* [msgmedia] the clip's own name, and what it matched */
+          var ci = mvClipInfo(item);
+          title = ci.name || title;
+          var said = [ci.folder ? 'from ' + ci.folder : '', ci.why].filter(function (x) { return !!x; }).join(' - ');
+          if (cur.media && cur.media.why.textContent !== said) cur.media.why.textContent = said;
         }
         cur.text.textContent = title;
         cur.text.classList.add('sp-mv-title');
@@ -6466,8 +7163,100 @@
     var w = f === null ? (item.kind === 'live' ? ((now % 2400) / 2400 * 100) : 0) : f * 100;
     var ws = w.toFixed(1) + '%';
     if (cur.fill.style.width !== ws) cur.fill.style.width = ws;
+    if (cur.media) mvMediaFrame(cur, f);      /* [msgmedia] the video on the playhead, the spectrogram */
+    if (cur.viz) mvVizFrame(cur);             /* [msgviz] the record's visualizer */
     var ck = item.clock || '';
     if (cur.clock.textContent !== ck) cur.clock.textContent = ck;
+  }
+  /* [msgorigin] A BUBBLE, TAPPED TWICE: THE ORIGIN; HELD: THE SHEET.
+     "if i double Tap on a message in either classic or digital mode on the
+     message itself, I want to turn the script view into a System three
+     preview window showing detailed information on the origin of the message
+     ... If i tap and hold bring up the what do i want to do menu for the
+     item." (operator, 2026-09-28)
+     The bubble carries data-line / data-said, so the station's own hold
+     sheet (line-actions.js, PineLineActions) answers a hold on it exactly as
+     it does on a script or feed line. A double tap - two quick taps read off
+     the pointer timestamps, no timers - opens System 3's focus window
+     (openSystem3Focus: the origin, the Visual Prompt, the tables that built
+     it, its segment tree, the prompts and memory inserts) docked over the
+     script pane; its own Back / Escape / the tablet's BACK closes it and the
+     script is exactly where it was (nothing under it moved). A single tap
+     does what it did before (nothing). */
+  function mvOriginWire(bubble, item) {
+    if (item.lid) {
+      bubble.setAttribute('data-line', item.lid);
+      bubble.setAttribute('data-said', String(item.text || '').slice(0, 400));
+      bubble.setAttribute('data-spoken', item.kind === 'speech' ? 'true' : 'false');
+    }
+    var down = null, last = null;
+    bubble.addEventListener('pointerdown', function (ev) {
+      down = {t: ev.timeStamp, x: ev.clientX, y: ev.clientY};
+    });
+    bubble.addEventListener('pointerup', function (ev) {
+      var d = down;
+      down = null;
+      var t = ev.target;
+      if (!d || (t && t.closest && t.closest('button, a, input, .sp-mv-all, .sp-mv-result'))) { last = null; return; }
+      if (ev.timeStamp - d.t > 420 || Math.abs(ev.clientX - d.x) > 14 || Math.abs(ev.clientY - d.y) > 14) {
+        last = null;                          /* a hold or a drag, not a tap */
+        return;
+      }
+      if (last && ev.timeStamp - last.t < 400 && Math.abs(ev.clientX - last.x) < 36 && Math.abs(ev.clientY - last.y) < 36) {
+        last = null;
+        mvOrigin(item);
+        return;
+      }
+      last = {t: ev.timeStamp, x: ev.clientX, y: ev.clientY};
+    });
+  }
+  function mvOriginGone(gen) {
+    var o = mv.origin;
+    if (!o || o.gen !== gen) return;
+    mv.origin = null;
+    if (o.ro) { try { o.ro.disconnect(); } catch (e) { /* gone */ } }
+    if (o.fit) root.removeEventListener('resize', o.fit);
+  }
+  function mvOrigin(item) {
+    var right = host && host.querySelector('.sp-right');
+    if (!item || !item.lid || !right) return;
+    if (mv.origin) { try { mv.origin.close(); } catch (e) { /* already gone */ } }
+    mv.originGen = (mv.originGen || 0) + 1;
+    var gen = mv.originGen;
+    if (!document.getElementById('spS3Style')) {
+      var style = document.createElement('link');
+      style.id = 'spS3Style';
+      style.rel = 'stylesheet';
+      style.href = techUrl('/system3/system3.css?v=7');
+      document.head.appendChild(style);
+    }
+    import(techUrl('/system3/system3.js?v=9')).then(function (mod) {
+      if (gen !== mv.originGen || !mod || typeof mod.openSystem3Focus !== 'function') return null;
+      return mod.openSystem3Focus({request: s3Request, lineId: item.lid, said: item.text || '', tab: 'focus',
+        onBack: function () { mvOriginGone(gen); }});
+    }).then(function (got) {
+      if (!got) return;
+      if (gen !== mv.originGen) { try { got.close(); } catch (e) { /* gone */ } return; }
+      var o = mv.origin = {el: got.element, close: got.close, gen: gen, ro: null, fit: null, line: item.lid};
+      o.el.classList.add('sp-mv-origin');
+      o.fit = function () {
+        var r = right.getBoundingClientRect();
+        var s = o.el.style;
+        if (!r.width || !r.height) { s.display = 'none'; return; }
+        s.display = '';
+        s.left = Math.round(r.left) + 'px';
+        s.top = Math.round(r.top) + 'px';
+        s.width = Math.round(r.width) + 'px';
+        s.height = Math.round(r.height) + 'px';
+        s.right = 'auto';
+        s.bottom = 'auto';
+      };
+      o.fit();
+      if (typeof root.ResizeObserver === 'function') { o.ro = new root.ResizeObserver(o.fit); o.ro.observe(right); }
+      root.addEventListener('resize', o.fit);
+    }).catch(function (err) {
+      try { console.warn('the origin window could not open', err); } catch (e) { /* no console */ }
+    });
   }
   function mvVisible(now) {
     if (now - mv.seenAt > 1000) {
@@ -6480,7 +7269,7 @@
   function mvLoop() {
     mv.raf = 0;
     var now = Date.now();
-    if (mv.view !== 'message' || !mvVisible(now)) return;   /* stops itself; tick() wakes it */
+    if (mv.view !== 'message' || !mvVisible(now)) { mvVideoRelease(); return; }   /* stops itself; tick() wakes it [msgmedia] */
     mv.raf = root.requestAnimationFrame(mvLoop);
     mv.frameN = (mv.frameN + 1) % MV_EVERY;
     if (mv.frameN) return;
@@ -6500,9 +7289,12 @@
   }
   function mvClose() {
     mvMenuClose();
+    mvMatchClose();                            /* [msgmatch] */
+    if (mv.origin) { try { mv.origin.close(); } catch (e) { /* gone */ } }   /* [msgorigin] */
     if (mv.raf) root.cancelAnimationFrame(mv.raf);
     mv.raf = 0;
     if (mv.view.indexOf('scene:') === 0) { mvSceneDispose(); mv.view = 'feed'; }
+    mvVideoRelease();                          /* [msgmedia] */
     mv.cur = null;
     if (mv.stage) mv.stage.textContent = '';
   }
@@ -6521,6 +7313,8 @@
         storeTitle: c.data && c.data.stores ? c.data.stores.title : ''} : null;
     },
     scene: function () { return mv.scene ? {key: mv.scene.key, local: mv.scene.local, docked: !!mv.scene.el} : null; },
+    origin: function () { return mv.origin ? {line: mv.origin.line} : null; },   /* [msgorigin] */
+    viz: function () { var z = mv.cur && mv.cur.viz; return z ? {style: z.style, name: z.name && z.name.name, drawn: z.drawn, peak: z.peak || 0} : null; },   /* [msgviz] */
     _rowsOf: mvRowsOf, _sources: mvSources, _decisionRow: mvDecisionRow
   };
 
@@ -19154,6 +19948,7 @@
     var wideFlip = make('button', 'sp-feedflip sp-techwide',
       techWide ? 'in column' : 'full width');
     wideFlip.addEventListener('click', function () {
+      if (mv.split) { mvWide(!mv.wide, true); return; }   /* [msgsplit] Message view's own band */
       /* Pressing this is also asking to SEE it - going wide with the pane
          still shut would look like a button that does nothing. */
       if (!techOn) { technicalToggle(); }

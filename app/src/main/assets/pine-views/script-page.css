@@ -4025,3 +4025,88 @@ html.pine-tech-wide .sp-tech.sp-tech-wide .wc-strip {
 .sp-mv-bubble .sp-mv-db svg { width: 13px; height: 13px; }
 .sp-mv-past .sp-mv-db { opacity: .7; }
 .sp-mv-dbnote { color: #e6c46f; }
+
+/* [msgmedia] THE CLIP IN ITS BUBBLE: the MP4 itself (muted), its poster until
+   frames arrive; a live spectrogram, or the station's own; and Classic's
+   Rolodex line - category, then sub-result - after the dice. */
+.sp-mv-media {
+  position: relative; margin-top: 6px; overflow: hidden; border-radius: 10px;
+  background: #05080c; border: 1px solid #2a3945;
+}
+.sp-mv-media.is-video { height: 118px; }
+.sp-mv-media.is-audio { height: 46px; }
+.sp-mv-media .sp-mv-poster, .sp-mv-media .sp-mv-video, .sp-mv-media .sp-mv-specimg, .sp-mv-media .sp-mv-spec {
+  position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; display: block;
+}
+.sp-mv-media .sp-mv-specimg { object-fit: fill; opacity: .9; }
+.sp-mv-media.is-live .sp-mv-specimg { display: none; }
+.sp-mv-media .sp-mv-head {
+  position: absolute; top: 0; right: 0; bottom: 0; width: 100%;
+  background: rgba(5, 8, 12, .62); border-left: 2px solid var(--sp-on, #65c7da);
+}
+.sp-mv-media .sp-mv-specnote {
+  position: absolute; left: 8px; right: 8px; top: 50%; transform: translateY(-50%);
+  font-size: 10.5px; color: var(--sp-muted, #8fa0ad); text-align: center;
+}
+.sp-mv-clipwhy { margin-top: 3px; font-size: 11px; color: var(--sp-muted, #8fa0ad); overflow-wrap: anywhere; }
+.sp-mv-clipwhy:empty { display: none; }
+.sp-mv-past .sp-mv-media.is-video { height: 64px; }
+.sp-mv-past .sp-mv-media.is-audio { height: 26px; }
+.sp-mv-creel { margin-top: 6px; }
+.sp-mv-cline { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.sp-mv-ctag { flex: none; font-size: 9.5px; letter-spacing: .06em; color: var(--fam, #68ced9); }
+.sp-mv-cline .sp-mv-dex { min-width: 70px; border-color: var(--fam, #4b5b67); }
+.sp-mv-carrow { width: 12px; height: 12px; color: var(--sp-muted, #8fa0ad); }
+
+/* [msgsplit] the station's feed above the bubbles, a grip between */
+.sp-mv-split { display: flex; flex-direction: column; min-height: 0; overflow: hidden; }
+.sp-mv-split > .sp-feed { flex: 0 1 var(--mv-feed, 40%); min-height: min(var(--mv-feed-min, 150px), 46%); box-sizing: border-box; }
+.sp-mv-split.sp-mv-wide > .sp-feed { min-height: min(var(--mv-feed-min, 150px), 62%); }
+.sp-mv-split > .sp-mv { flex: 1 1 0; min-height: min(150px, 50%); }
+.sp-mv-grip { flex: 0 0 14px; position: relative; cursor: row-resize; touch-action: none; }
+.sp-mv-grip::after {
+  content: ''; position: absolute; left: 50%; top: 5px; width: 44px; height: 4px; margin-left: -22px;
+  border-radius: 2px; background: #3a4a57;
+}
+.sp-mv-grip.on::after, .sp-mv-grip:hover::after { background: var(--sp-on, #65c7da); }
+.sp-mv-split.sp-mv-wide {
+  position: absolute; left: 0; right: 0; bottom: 0; z-index: 40; box-sizing: border-box;
+  padding: 12px 46px 8px 12px; gap: 6px; background: #0b0f14;
+  border-top: 1px solid rgba(101, 199, 218, .45); box-shadow: 0 -14px 40px rgba(0, 0, 0, .6);
+}
+.sp-mv-bandgrip { display: none; }
+.sp-mv-wide > .sp-mv-bandgrip { display: block; position: absolute; left: 0; right: 0; top: 0; height: 10px; cursor: row-resize; touch-action: none; }
+.sp-mv-wide > .sp-mv-bandgrip::after { content: ''; position: absolute; left: 50%; top: 3px; width: 44px; height: 3px; margin-left: -22px; border-radius: 2px; background: rgba(101, 199, 218, .55); }
+.sp-mv-wide > .sp-feedhead { flex: none; }
+/* [msgorigin] System 3's origin window, docked over the script pane */
+.s3-backdrop.sp-mv-origin { padding: 0; background: #0b0f14; place-items: stretch; overflow: hidden; }
+.s3-backdrop.sp-mv-origin > .s3 { width: 100%; height: 100%; max-height: none; border-radius: 10px; box-sizing: border-box; }
+.sp-mv-bubble[data-line] { -webkit-touch-callout: none; user-select: none; }
+/* [msgviz] the record on air, visualized, right of its title */
+.sp-mv-has-viz .sp-mv-bubble { min-width: min(430px, 100%); padding-right: 160px; }
+.sp-mv-viz { position: absolute; right: 14px; top: 8px; width: 138px; height: 40px; border-radius: 6px; background: #05080b; }
+/* [msgmatch] the matched clip's chip, and how it was matched */
+.sp-mv-matchable { cursor: pointer; }
+.sp-mv-matchable:hover, .sp-mv-matchable:focus-visible { filter: brightness(1.25); outline: 1px dashed rgba(227, 190, 99, .7); outline-offset: 2px; }
+.sp-mm {
+  position: fixed; z-index: 2147483045; display: flex; flex-direction: column; overflow: hidden; box-sizing: border-box;
+  background: #0f171d; color: var(--sp-text, #edf3f5); border: 1px solid #3a4a57; border-radius: 12px;
+  box-shadow: 0 18px 44px rgba(0, 0, 0, .6); font: 13px/1.45 Inter, Segoe UI, system-ui, sans-serif;
+}
+.sp-mm-head { display: flex; align-items: center; gap: 8px; padding: 6px 6px 6px 12px; border-bottom: 1px solid #2a3945; cursor: move; touch-action: none; color: #e6c46f; }
+.sp-mm-head b { color: #edf3f5; }
+.sp-mm-x { margin-left: auto; min-width: 40px; min-height: 40px; display: grid; place-items: center; border: 0; border-radius: 8px; background: transparent; color: #cfe3ea; cursor: pointer; }
+.sp-mm-x:hover { background: rgba(255, 255, 255, .06); }
+.sp-mm-body { overflow-y: auto; overscroll-behavior: contain; padding: 6px 12px 12px; }
+.sp-mm-sect h4 { margin: 10px 0 4px; font-size: 10.5px; letter-spacing: .08em; text-transform: uppercase; color: var(--sp-muted, #8fa0ad); }
+.sp-mm-kv { display: flex; gap: 8px; }
+.sp-mm-k { flex: 0 0 120px; color: var(--sp-muted, #8fa0ad); }
+.sp-mm-v { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.sp-mm-line { margin: 2px 0; padding: 8px 10px; border-left: 3px solid #e6c46f; background: #121e26; border-radius: 6px; font-size: 14px; }
+.sp-mm-hit { background: rgba(227, 190, 99, .38); color: #fff; border-radius: 3px; padding: 0 2px; }
+.sp-mm-none .sp-mm-line { border-left-color: #6b5a3a; color: var(--sp-muted, #8fa0ad); }
+.sp-mm-note { margin: 2px 0; font-size: 11px; color: var(--sp-muted, #8fa0ad); }
+.sp-mm-steps { margin: 0; padding-left: 20px; }
+.sp-mm-steps li { margin: 4px 0; }
+.sp-mm-steps li b { display: block; color: #cfe3ea; font-size: 12px; }
+.sp-mm-miss { margin: 0; padding-left: 18px; color: #e6c46f; font-size: 12px; }
