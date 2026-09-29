@@ -255,7 +255,9 @@
           var gap = Math.max(1, Math.round(dpr)), pitch = Math.max(3, Math.round(4 * dpr));
           vctx.globalAlpha = 1;
           vctx.fillStyle = '#05080b';
+          if (vz.clear) vctx.globalCompositeOperation = 'destination-out';   /* [msgthumb] slats cut, not painted */
           for (y = mid - gap / 2 - pitch * Math.floor(mid / pitch); y < ch; y += pitch) vctx.fillRect(0, y, cw, gap);
+          vctx.globalCompositeOperation = 'source-over';
         }
       } else if (k === 'needles' || k === 'cloud') {
         var sub = k === 'cloud' ? 6 : 3, seed = Math.floor(now / 60) % 997;
@@ -314,8 +316,8 @@
     function vizBody(st, cw, ch, n, now) {
       var i, c, v, h, x;
       vctx.globalAlpha = 1;
-      vctx.fillStyle = '#05080b';
-      vctx.fillRect(0, 0, cw, ch);
+      if (vz.clear) vctx.clearRect(0, 0, cw, ch);   /* [msgthumb] the marks only */
+      else { vctx.fillStyle = '#05080b'; vctx.fillRect(0, 0, cw, ch); }
       var slot = cw / n, bw = Math.max(1, slot * 0.62), mid = ch / 2, cap = Math.max(2, Math.round(2 * dpr));
       vctx.fillStyle = st.color;
       vctx.strokeStyle = st.color;
@@ -385,6 +387,7 @@
     if (!ctx || !levels || !levels.length) return null;
     state = state || {};
     var vz = state.vz || (state.vz = {style: 0, level: [], hold: [], holdAt: [], at: 0, named: 0});
+    vz.clear = !!state.transparent;   /* [msgthumb] a caller's transparent canvas */
     if (!state.painter || state.ctx !== ctx) {
       state.painter = vizPainter(ctx, vz, Number(state.dpr) || 1);
       state.ctx = ctx;
