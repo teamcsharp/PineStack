@@ -33296,6 +33296,15 @@ def radio_next_track() -> dict[str, Any] | None:
         _RADIO["queue"] = radio_fill(_RADIO["station"])
     if not _RADIO["queue"]:
         return None
+    if norepeat_on():                                                   # [no-repeat-24h:solo]
+        _nr_at = norepeat_record_take(_RADIO["queue"], 0, road="solo")
+        if _nr_at < 0:
+            _RADIO["queue"] = radio_fill(_RADIO["station"])
+            _nr_at = norepeat_record_take(_RADIO["queue"], 0, road="solo")
+        if _nr_at < 0:
+            return None
+        if _nr_at:
+            _RADIO["queue"].insert(0, _RADIO["queue"].pop(_nr_at))
     track = _spin_stamp(_RADIO["queue"].pop(0), "rotation",   # [s3-cover-b]
                         position=1, of=len(_RADIO["queue"]) + 1)
     _RADIO["now"] = track
@@ -37698,6 +37707,11 @@ async def _dj_speak_floorless(kind: str, track: dict[str, Any] | None = None,
     # engine takes a station off the air. They are still RECORDED — the
     # window catches them wherever they are varied instead, which is
     # what fixes the hand-off.
+    # [no-repeat-24h:dj_speak] the last gate for a single line - every kind,
+    # the advert and the station ID too: no line twice inside a day. A chunk
+    # speak_turns hands over (`checked`) was gated there, as its whole turn.
+    if not by_hand and not checked and norepeat_line_gate(spoken, who, kind, road=kind or "line"):
+        return ""
     if not by_hand and not checked \
             and kind not in ("station_id", "ad", "reply", "call"):
         _win = air_repeat_check(spoken, who, kind)
@@ -40410,6 +40424,18 @@ def dj_next_track() -> dict[str, Any] | None:
                             not in _TRACK_TALK), -1)
             if take_at < 0:
                 return None
+        if norepeat_on():                                               # [no-repeat-24h:rotation]
+            _nr_owned = bool(radio_paused() and _TRACK_TALK)
+            _nr_at = norepeat_record_take(_RADIO["queue"], take_at, _nr_owned)
+            if _nr_at < 0:
+                _RADIO["queue"] = radio_fill(_RADIO["station"])
+                track_talk_restore_queue()
+                _nr_at = norepeat_record_take(_RADIO["queue"], 0, _nr_owned)
+            if _nr_at < 0:
+                norepeat_refuse("record", "", "rotation", why="every record the rotation holds was heard "
+                                "inside the day - the needle waits rather than repeat one")
+                return None
+            take_at = _nr_at
         track = _spin_stamp(_RADIO["queue"].pop(take_at), "rotation",   # [s3-cover-b]
                             position=take_at + 1,
                             of=len(_RADIO["queue"]) + 1)
@@ -40471,6 +40497,8 @@ def remember_played(track: dict[str, Any]) -> None:
         return
     row = {k: track.get(k) for k in
            ("id", "title", "artist", "album", "seconds")}
+    norepeat_note_record(track.get("id"), str((track.get("s3_spin") or {}).get("lane") or "record"),   # [no-repeat-24h:played]
+                         str(track.get("title") or ""))
     with _PLAYED_LOCK:
         rows = [r for r in read_played() if r.get("id") != row["id"]]
         rows.insert(0, {**row, "at": int(time.time())})
@@ -75210,7 +75238,8 @@ async def dj_upstairs_render(row: dict[str, Any]) -> dict[str, Any] | None:
     names = [c for c in sorted(VOCODER_CHARACTERS)
              if c not in ("plain", "autotune", "choir")]
     character = str(row.get("vocode") or "") or (
-        unrepeated(names, "upstairs-vocode") if names else "megaphone")
+        s3_unrepeated("upstairs.vocoder", names, "upstairs-vocode",   # [everything-rolls:upstairs-voc]
+                      "the manager memo's vocoder character") if names else "megaphone")
     try:
         voice = caller_voice_for(
             "the manager upstairs",
@@ -76286,6 +76315,9 @@ async def dj_ad_break(zero_work_only: bool = False, on_handoff: Any = None) -> s
         _RADIO["last_ad"] = time.time()    # live roads still share this clock
     dj = dj_settings()
     stored = await _s3_ad_pick()                              # [s3-roads]
+    if stored and norepeat_text_used(stored.get("text")):              # [no-repeat-24h:ad-pick]
+        norepeat_select_refuse("line", "", "ad", text=stored.get("text"), ref=str(stored.get("id") or ""))
+        stored = None
 
     async def handoff_produced(entry: dict[str, Any], shelf_row: Any = None) -> str:
         committed = False
@@ -76562,6 +76594,8 @@ async def _air_produced_ad_floorless(entry: dict[str, Any], on_handoff: Any = No
     page publication is distinct from the audible receipt that credits it."""
     name = str(entry.get("audio") or "")
     if not name or not (PRODUCED_ADS_DIR / name).is_file():
+        return False
+    if norepeat_line_gate(entry.get("text"), "dj", "ad", road="ad_spot"):   # [no-repeat-24h:produced-ad]
         return False
     prepared = None
     if _s3_active():
@@ -78823,6 +78857,339 @@ def s3_weighted(key: str, labels: list[str], weights: list[float], label: str = 
     behaviour deck): System 3's number, those weights, recorded.
     [s3-sfx-roll] `media`: the picture of what it lands on, for the record."""
     return _S3Dice(key, label, list(weights), media).pick(key, list(labels))
+
+
+# --- [no-repeat-24h] NOTHING AIRS TWICE INSIDE A DAY ------------------------------
+# "No repeats within 24 hours" of dialogue lines (any seat, a banked turn
+# re-aired under a NEW id included), SFX clips and music records; "when nothing
+# new is ready, a ROLLED music record first, then ROLLED SFX ... never a
+# re-aired line" (operator, 2026-09-29). air_norepeat.Book is the one memory,
+# keyed by fingerprint: a line's normalised words and each of its sentences, a
+# clip's id, a track's id - a new id cannot escape it. The selectors ask it
+# BEFORE they roll, so a refusal at the last gate is rare; the last gate before
+# air asks again; every refusal is recorded - why, which road, which stage -
+# in data/norepeat_refusals.jsonl and GET /api/norepeat. NOREPEAT_HOURS=0
+# switches the rule off; NOREPEAT_EXEMPT_KINDS (comma list) names spoken kinds
+# the operator exempts (none by default).
+import air_norepeat as _air_norepeat                                  # [no-repeat-24h:helpers]
+
+NOREPEAT_HOURS = float(os.getenv("NOREPEAT_HOURS", "24"))
+NOREPEAT_EXEMPT_KINDS = frozenset(k.strip() for k in os.getenv("NOREPEAT_EXEMPT_KINDS", "").split(",") if k.strip())
+NOREPEAT_QUIET_KINDS = frozenset({"marker", "chat", "image_analysis", "song_analysis", "hangup", "sfx"})
+NOREPEAT_SOUNDED = ("stream", "box", "both", "page")    # publication is not playback
+GAP_RECORD_SHORTLIST = int(os.getenv("GAP_RECORD_SHORTLIST", "8"))
+_NOREPEAT_SAID: dict[str, float] = {}
+_GAP_RECORD_ROLL: dict[str, dict[str, Any]] = {}
+
+
+def _norepeat_seed():
+    """The book's first memory, when it has no file: what the ledgers say
+    went out inside the window (the air log, the spins, the clip history)."""
+    since = time.time() - max(1.0, NOREPEAT_HOURS * 3600.0)
+    return _air_norepeat.seed_rows(globals().get("AIR_LOG_PATH"), globals().get("MUSIC_LOG_PATH"),
+                                   globals().get("SFX_HISTORY_ARCHIVE_PATH"), since,
+                                   register_db=data_path("system3.sqlite3"))
+
+
+NOREPEAT = _air_norepeat.Book(data_path("norepeat_book.json"), data_path("norepeat_refusals.jsonl"),
+                              window=max(1.0, NOREPEAT_HOURS * 3600.0), seed=_norepeat_seed)
+
+
+def norepeat_on() -> bool:
+    return NOREPEAT_HOURS > 0
+
+
+def _norepeat_save_soon() -> None:
+    try:
+        if not NOREPEAT.save_due():
+            return
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            NOREPEAT.save()
+            return
+        fire_and_forget(asyncio.to_thread(NOREPEAT.save))
+    except Exception:  # noqa: BLE001 - a book that will not write is still a memory
+        pass
+
+
+def norepeat_note_line(text: Any, road: str = "", ref: str = "", at: Any = None) -> None:
+    if not norepeat_on():
+        return
+    try:
+        NOREPEAT.note_text(text, road, ref, float(at) if at else None)
+        _norepeat_save_soon()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def norepeat_note_sfx(ident: Any, road: str = "", ref: str = "") -> None:
+    if not norepeat_on() or not ident:
+        return
+    try:
+        NOREPEAT.note("sfx", _air_norepeat.sfx_key(ident), road, ref)
+        _norepeat_save_soon()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def norepeat_note_record(track_id: Any, road: str = "", ref: str = "") -> None:
+    if not norepeat_on() or not track_id:
+        return
+    try:
+        NOREPEAT.note("record", _air_norepeat.record_key(track_id), road, ref)
+        _norepeat_save_soon()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def norepeat_text_used(text: Any) -> bool:
+    try:
+        return bool(norepeat_on() and NOREPEAT.used_text(text))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def norepeat_sfx_used(ident: Any) -> bool:
+    try:
+        return bool(norepeat_on() and ident and NOREPEAT.used("sfx", _air_norepeat.sfx_key(ident)))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def norepeat_record_used(track_id: Any) -> bool:
+    try:
+        return bool(norepeat_on() and track_id and NOREPEAT.used("record", _air_norepeat.record_key(track_id)))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def norepeat_refuse(kind: str, key: str, road: str, text: Any = "", why: str = "",
+                    stage: str = "air", ref: str = "", say: bool = True) -> dict[str, Any]:
+    """A refusal, recorded (the ring, the ledger) and said in the pipeline log."""
+    try:
+        row = NOREPEAT.refuse(kind, key, road, why, text, ref, stage)
+    except Exception:  # noqa: BLE001
+        row = {"why": why or "heard inside the day"}
+    if say:
+        pipeline_log("air", ("no repeats inside a day - a %s refused on the %s road (%s): %s"
+                             % (kind, road or "?", stage, row.get("why") or ""))[:220],
+                     extra=" ".join(str(text or ref or key).split())[:160])
+    return row
+
+
+def norepeat_select_refuse(kind: str, key: str, road: str, text: Any = "", ref: str = "") -> None:
+    """A selector struck a candidate BEFORE it rolled: recorded once an hour
+    per candidate and road, so a scan does not flood the ring."""
+    k = "%s|%s|%s" % (kind, key or ref, road)
+    now = time.time()
+    if now - float(_NOREPEAT_SAID.get(k) or 0) < 3600:
+        return
+    _NOREPEAT_SAID[k] = now
+    while len(_NOREPEAT_SAID) > 4000:
+        _NOREPEAT_SAID.pop(next(iter(_NOREPEAT_SAID)))
+    norepeat_refuse(kind, key, road, text=text, ref=ref, stage="select", say=False)
+
+
+def _norepeat_road(who: str = "", kind: str = "") -> str:
+    try:
+        return str(airlog_round_now(who, kind) or kind or "round")
+    except Exception:  # noqa: BLE001
+        return str(kind or "round")
+
+
+def norepeat_line_gate(text: Any, who: str = "", kind: str = "", road: str = "",
+                       by_hand: bool = False) -> str:
+    """THE LAST GATE BEFORE AIR for a spoken line: "" when it may air, else
+    why it may not (recorded). Only a line the operator typed is exempt, and a
+    kind the operator named in NOREPEAT_EXEMPT_KINDS."""
+    if not norepeat_on() or by_hand or not str(text or "").strip():
+        return ""
+    if str(kind or "") in NOREPEAT_EXEMPT_KINDS:
+        return ""
+    try:
+        seen = NOREPEAT.text_seen(text)
+    except Exception:  # noqa: BLE001
+        return ""
+    if not seen:
+        return ""
+    return str(norepeat_refuse("line", str(seen.get("key") or ""), road or kind or who,
+                               text=text).get("why") or "heard inside the day")
+
+
+def _norepeat_row_texts(row: Any) -> list[str]:
+    """The spoken lines of a banked round (its script's turns), else its text."""
+    out: list[str] = []
+    try:
+        entry = row.get("entry") if isinstance(row.get("entry"), dict) else row
+        script = str(entry.get("script") or row.get("script") or "")
+        for ln in script.splitlines():
+            m = re.match(r"^\s*[A-Za-z][A-Za-z0-9 ._'-]{0,39}?\s*:\s+(.*\S)\s*$", ln)
+            if m:
+                out.append(m.group(1))
+        if not out and (row.get("text") or entry.get("text")):
+            out.append(str(row.get("text") or entry.get("text")))
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
+def norepeat_round_refusal(road: str, row: Any) -> str:
+    """[bank_reair_refusal's 24-hour leg] A banked round that went out inside
+    the day, or half of whose lines did, is not a candidate - struck before any
+    roll is made, on every replay road."""
+    if not norepeat_on() or not isinstance(row, dict):
+        return ""
+    try:
+        entry = row.get("entry") if isinstance(row.get("entry"), dict) else {}
+        last = max(float(row.get("aired_at") or 0), float(entry.get("aired_at") or 0),
+                   float(row.get("heard_at") or 0), float(row.get("last") or 0))
+        texts = _norepeat_row_texts(row)
+        why = ""
+        if last and time.time() - last < NOREPEAT.window:
+            why = "it went out %d min ago - no repeats inside a day" % int((time.time() - last) / 60)
+        else:
+            keyed = [t for t in texts if _air_norepeat.line_key(t, NOREPEAT.min_words)]
+            heard = [t for t in keyed if NOREPEAT.used_text(t)]
+            if keyed and len(heard) * 2 >= len(keyed):
+                why = "%d of its %d lines were on air inside the day" % (len(heard), len(keyed))
+        if why:
+            norepeat_select_refuse("line", _air_norepeat.line_key((texts or [""])[0], 1), str(road or "bank"),
+                                   text=(texts or [""])[0], ref=str(row.get("sid") or row.get("id") or ""))
+        return why
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def norepeat_fresh_clips(paths: Any, road: str) -> list[Any]:
+    """The clips not heard inside the day - asked before a pick rolls. A pool
+    with nothing fresh is empty: the road's next option answers, never a repeat."""
+    paths = list(paths or [])
+    if not norepeat_on() or not paths:
+        return paths
+    out = []
+    for p in paths:
+        try:
+            sid = sfx_id(Path(str(p)))
+        except Exception:  # noqa: BLE001
+            sid = ""
+        if sid and NOREPEAT.used("sfx", sid):
+            norepeat_select_refuse("sfx", sid, road, ref=Path(str(p)).name)
+            continue
+        out.append(p)
+    return out
+
+
+def norepeat_roll_clip(paths: Any, key: str, question: str, road: str = "gap") -> Path | None:
+    """A gap clip: the day's heard clips struck first, then System 3 rolls
+    among the rest (`key` on the desk; through the sting ring, so a clip does
+    not come straight back either), and the roll rides the clip to its row
+    (_sfx_roll_note -> the sting's _sfx_roll_carry -> the origin ledger)."""
+    fresh = norepeat_fresh_clips(paths, road)
+    if not fresh:
+        return None
+    name = unrepeated([str(p) for p in fresh], "sting", keep=sting_keep(len(fresh)),
+                      director=_S3ClipDice(key, question))
+    if not name:
+        return None
+    path = Path(name)
+    try:
+        _sfx_roll_note(path, road, {"label": path.parent.name}, _s3_sfx_rolled(key, path.stem), 1)
+    except Exception:  # noqa: BLE001
+        pass
+    return path
+
+
+def norepeat_record_take(queue: Any, start: int = 0, owned_skip: bool = False,
+                         road: str = "rotation") -> int:
+    """The first place at or after `start` whose record was not heard inside
+    the day (and, with `owned_skip`, owns no banked talk), or -1."""
+    q = list(queue or [])
+    for i in range(max(0, int(start)), len(q)):
+        row = q[i] if isinstance(q[i], dict) else {}
+        tid = str(row.get("id") or "")
+        if owned_skip and tid in _TRACK_TALK:
+            continue
+        if tid and norepeat_record_used(tid):
+            norepeat_select_refuse("record", tid, road, text=str(row.get("title") or ""))
+            continue
+        return i
+    return -1
+
+
+def norepeat_gap_record(why: str = "") -> dict[str, Any] | None:
+    """THE GAP'S FIRST ANSWER: a record, ROLLED. System 3 picks among the next
+    fresh records of the rotation (gap.record: never one heard inside the day,
+    never one that owns banked talk), the pick goes to the head of the queue
+    and the needle drops - the road the dead-air watch's needle drop already
+    takes. The roll rides the spin (s3_spin.gap -> the music log -> rec: in
+    why_line). None when no record can answer (music off, paused, nothing fresh)."""
+    try:
+        if not (_RADIO.get("on") and _RADIO.get("station")) or radio_paused():
+            return None
+        q = _RADIO.get("queue")
+        if not isinstance(q, list) or not q:
+            return None
+        cands: list[tuple[int, dict[str, Any]]] = []
+        for i, t in enumerate(q):
+            if len(cands) >= max(1, GAP_RECORD_SHORTLIST):
+                break
+            tid = str((t or {}).get("id") or "") if isinstance(t, dict) else ""
+            if not tid or tid in _TRACK_TALK:
+                continue
+            if norepeat_record_used(tid):
+                norepeat_select_refuse("record", tid, "gap", text=str(t.get("title") or ""))
+                continue
+            cands.append((i, t))
+        if not cands:
+            return None
+        # the operator's order is a desk row (STATION1 gap.record, odds 1.0): walk
+        # it down and the gap goes straight to its rolled SFX
+        if not s3_chance("gap.record", 1.0, "the gap's first answer is a rolled record "
+                                            "(otherwise straight to rolled SFX)"):
+            return None
+        labels = [("%s - %s" % (t.get("title") or "a record", t.get("artist") or "?"))[:120] for _i, t in cands]
+        k = _S3Dice("gap.record_pick", "which record fills the gap (the next fresh records in the rotation)").pick(
+            "gap.record_pick", labels)
+        k = k if 0 <= k < len(cands) else 0
+        at, track = cands[k]
+        q.insert(0, q.pop(at))
+        roll = _s3_spin_roll("gap.record_pick") or {"key": "gap.record_pick", "index": k + 1, "of": len(cands),
+                                                    "picked": labels[k], "own": "the station's own draw (dice off)"}
+        roll = dict(roll, why=str(why or "dead air")[:120], at=round(time.time(), 3))
+        _GAP_RECORD_ROLL[str(track.get("id") or "")] = roll
+        while len(_GAP_RECORD_ROLL) > 16:
+            _GAP_RECORD_ROLL.pop(next(iter(_GAP_RECORD_ROLL)))
+        track["s3_gap"] = dict(roll)    # rides the queue row into its spin copy
+        # the roll, into the origin ledger now - the record's own rec: note follows when it airs
+        _origin_note({"id": "gap:%s:%d" % (str(track.get("id") or "")[:40], int(time.time())),
+                      "kind": "gap_record", "who": "deck", "aired": "rolled", "air_at": time.time(),
+                      "track_id": str(track.get("id") or "")[:80], "text": labels[k][:200],
+                      "s3_roll": dict(roll), "origin_path": "norepeat_gap_record"})
+        _RADIO["now"] = None            # a pinned needle is let go, as the needle drop does
+        dj_skip()
+        pipeline_log("air", ("the gap is a rolled record: %s (%s of %s, gap.record)%s"
+                             % (labels[k], k + 1, len(cands), (" - " + why) if why else ""))[:220])
+        return track
+    except Exception as exc:  # noqa: BLE001
+        pipeline_log("air", "the gap's record roll failed: %s: %s" % (type(exc).__name__, str(exc)[:120]))
+        return None
+
+
+@app.on_event("startup")
+async def _norepeat_warm() -> None:
+    """Read (or, the first time, seed) the book off the loop."""
+    if norepeat_on():
+        fire_and_forget(asyncio.to_thread(NOREPEAT.load))
+
+
+@app.get("/api/norepeat")
+async def norepeat_api(most: int = 40, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    """[no-repeat-24h] The day's memory: how much it holds, and every refusal -
+    kind, road, stage (select = struck before a roll, air = the last gate), why."""
+    require_read_auth(authorization)
+    got = await asyncio.to_thread(NOREPEAT.state, max(1, min(400, int(most or 40))))
+    return dict(got, on=norepeat_on(), exempt=sorted(NOREPEAT_EXEMPT_KINDS))
 
 
 # --- [s3-sfx-roll] THE BOARD'S CLIP IS TWO OF SYSTEM 3'S ROLLS ----------------
@@ -84190,7 +84557,12 @@ def sfxguy_line(voice: str, context: str = "", director: Any = None) -> str:
         said = _sfxguy_said()
         now = time.time()
         pool = [r for r in rows
-                if now - float(said.get(_sfxguy_key(r)) or 0) > 3600]
+                if now - float(said.get(_sfxguy_key(r)) or 0) > 3600
+                and not norepeat_text_used(r)]                                # [everything-rolls:sfxguy-quip]
+        if not pool and norepeat_on():
+            norepeat_refuse("line", "", "sfxguy", why="every quip on his shelf was heard inside the day "
+                            "(or this hour) - he stays quiet rather than repeat one", stage="select", say=False)
+            return ""
         if pool and director is not None:
             _qi = director.pick("quip", pool)
             line = pool[_qi if 0 <= _qi < len(pool) else 0]
@@ -87251,6 +87623,7 @@ def sfx_history_add(path: Path, who: str = "") -> None:
                 rows = []
             row = {"ts": int(time.time()), "id": sfx_id(path),
                    "name": path.name, "who": who[:24]}
+            norepeat_note_sfx(row["id"], who[:24] or "sfx", path.name)   # [no-repeat-24h:sfx-hist]
             rows.append(row)
             # [#1224] The tail stays at 2,000 because it is rewritten
             # whole on every sting and json holds the GIL.  The DEPTH the
@@ -88299,6 +88672,7 @@ def _sfx_cadence_pick() -> Path | None:
             and sfx_id(Path(p)) not in banned
             and not sfx_is_video(Path(p))
             and weights.get(sfx_id(Path(p)), 1.0) > 0.05]
+    pool = norepeat_fresh_clips(pool, "board")                           # [no-repeat-24h:cadence]
     # 2026-09-16 (#1224): BOARD1224_RING - a memory, not a single name.
     #
     # This held `last` - ONE clip - so it refused only what it had just played
@@ -88523,7 +88897,10 @@ async def _sfx_cadence_additions_inner(who: str, text: str, completed: int,
         share = sfx_video_share() / 100.0
         direction = choose_due_cue(
             (CueCandidate("video", 1.0, True), CueCandidate("audio", 1.0, False)),
-            max_seconds=max(1.0, sfx_cap_seconds()), random_float=random.random,
+            max_seconds=max(1.0, sfx_cap_seconds()),
+            random_float=lambda: s3_roll("sfx.cadence_picture",                # [everything-rolls:cadence-cue]
+                                         "whether a due SFX slot reaches for a picture (MP4) "
+                                         "before a sound, against the video share dial"),
             pick=lambda keys: keys[0], video_share=share)
         # #1462: the two-line cadence is a promise to put a clip in the
         # welded round. 100% picture share means "try MP4 first", but an MP4
@@ -89970,6 +90347,8 @@ def sfx_video_on_cooldown(key: str) -> bool:
     """Has this clip already been spent in the current shuffled book?"""
     if not key:
         return False
+    if norepeat_sfx_used(key):                                          # [no-repeat-24h:video-cool]
+        return True
     # Keep the former crash-tail guarantee independently of the deck memo:
     # the last few history rows may not have reached either durable file yet.
     _sfx_video_played_load()
@@ -90008,6 +90387,7 @@ def sfx_video_note_played(key: str, folder: str = "") -> None:
     """This clip is on the air now; spend it in the durable deck."""
     if not key:
         return
+    norepeat_note_sfx(key, "video", folder)                            # [no-repeat-24h:video-note]
     _sfx_video_played_load()
     with _SFX_VIDEO_PLAYED_LOCK:
         _SFX_VIDEO_PLAYED[str(key)] = time.time()
@@ -91182,9 +91562,8 @@ def _sfx_any_audio() -> Path | None:
             if not sfx_is_video(p) and sfx_short(p) and sfx_id(p) not in banned]
     if not pool:
         return None
-    names = unrepeated([str(p) for p in pool], "sting",
-                       keep=sting_keep(len(pool)))                 # #1223
-    return Path(names) if names else None
+    # [everything-rolls:gap-audio] the day's heard clips struck, then System 3 rolls (sfx.gap_audio)
+    return norepeat_roll_clip(pool, "sfx.gap_audio", "which sound clip answers the gap (the walked pool)")
 
 
 # #1303c: the airable video clips, built once per pool version.
@@ -91420,9 +91799,9 @@ def _sfx_any_video() -> Path | None:
             if not sfx_video_on_cooldown(sfx_id(path))]
     if not pool:
         return None
-    got = unrepeated([str(p) for p in pool], "sting",
-                     keep=sting_keep(len(pool)))                   # #1223
-    return Path(got) if got else None
+    # [everything-rolls:gap-video] the day's heard clips struck, then System 3
+    # rolls (sfx.gap_video) - the roll rides the clip to its sting row
+    return norepeat_roll_clip(pool, "sfx.gap_video", "which picture clip answers the gap (the airable video pool)")
 
 
 async def _sting_over_record(track: dict[str, Any] | None) -> None:
@@ -92190,6 +92569,16 @@ async def sfx_fill_gap(why: str = "", under_floor: bool = False,
         # because a HOLE should be filled until it closes; a record is
         # not a hole, and burying it under verse every eleven seconds is
         # the opposite of punctuating it.
+        # [no-repeat-24h:gap-record] THE GAP IS A ROLLED RECORD, THEN ROLLED SFX.
+        # With no record turning and the floor free, the first answer is a
+        # record System 3 rolls among the next fresh ones (gap.record); the
+        # clips below are the second. Gold stands down (gold_fill_gap): a bar
+        # is a re-aired line, and gold now airs only as a rolled reply.
+        if norepeat_on() and not clips_only and not floor_held and not now_really_playing():
+            if norepeat_gap_record(why):
+                _SFX_GAP["went"] = "record"
+                _SFX_GAP["why"] = str(why)[:120]
+                return "record"
         went = "" if clips_only else await gold_fill_gap(
             why, floorless=floor_held,
             ahead=GOLD_RUN_AHEAD_HELD if floor_held else GOLD_RUN_AHEAD)
@@ -92554,6 +92943,11 @@ async def dj_sting(to_box: bool, after: str = "", who: str = "",
     # The index already measured every playable clip. Read that local value
     # on the SFX executor instead of stat/ffprobe on the network path from
     # the event loop. The latter was an observed eight-second station stall.
+    # [no-repeat-24h:sting] THE LAST GATE for a clip: never one heard inside the
+    # day (the operator's own button excepted). The road that asked moves on.
+    if str(who or "") != "operator" and norepeat_sfx_used(sfx_id(sample)):
+        norepeat_refuse("sfx", sfx_id(sample), str(who or "sting"), ref=sample.name)
+        return ""
     _sample_seconds = await sfx_db_seconds_async(sample)
     _sample_seconds = max(0.0, float(_sample_seconds or 0.0))
     # [#1477-pick] NO RAW CLIP ON THE AIR: levelled HERE, the moment it is
@@ -93661,6 +94055,52 @@ async def continuity_roulette(voices: Any, said_at: Any) -> tuple[list[Any], int
 # The dial ships at the old constant, so this change alone moves
 # nothing; walking it down is a separate, watchable act. The starvation
 # test is the station's own, already used by dj_banter.
+# [no-repeat-24h:reair] THE RE-AIR GATE'S 24-HOUR LEG. A banked round heard
+# inside the day - or half of whose lines were - is struck before any roll, on
+# every replay road, dice on or off. (A wrapper, so the gate's own text stands.)
+_bank_reair_refusal_gate = bank_reair_refusal
+
+
+def bank_reair_refusal(road: str, row: Any, cid: str = "") -> str:
+    return _bank_reair_refusal_gate(road, row, cid) or norepeat_round_refusal(road, row)
+
+
+# --- [s3-gold] GOLD IS A REPLY THE ROULETTE CAN LAND ON ------------------------
+# "made into an option for the roulette to access as a reply possibility. By
+# chance the people in the booth should roll a dice for a chance to say a gold
+# line" (operator, 2026-09-29). system3_gold rolls it on a host's reply turn
+# (GOLD1 in Tables); this is the bank it rolls over. While GOLD_REPLY is on (the
+# default) the forced roads stand down: no bar is dropped into a live round
+# (gold_in_round_due) and no run is poured into a gap (gold_fill_gap).
+GOLD_REPLY_ROADS_OFF = frozenset({"news", "ad", "ad_spot", "station_id", "track_talk"})
+
+
+def gold_reply_on() -> bool:
+    return os.getenv("GOLD_REPLY", "1") != "0"
+
+
+def system3_gold_bank(road: str = "", ctx: Any = None) -> list[dict[str, Any]]:
+    """[s3-gold:bank] The gold lines System 3 may roll as a host's reply: minted
+    from System 3 turns (gold_source), no gone names, none heard inside the day
+    (the same text key as the dialogue gate - struck BEFORE the roll)."""
+    if not gold_reply_on() or str(road or "") in GOLD_REPLY_ROADS_OFF:
+        return []
+    out: list[dict[str, Any]] = []
+    try:
+        for r in _gold_rows():
+            text = " ".join(str(r.get("text") or "").split())
+            if len(text) < 12 or not gold_source(r) or cast_names_line_stale(r):
+                continue
+            if norepeat_text_used(text):
+                continue
+            out.append({"id": (str(r.get("key") or "") or hashlib.sha1(text.encode("utf-8")).hexdigest())[:40],
+                        "text": text[:400], "who": str(r.get("who") or ""),
+                        "fired": int(r.get("fired") or 0)})
+    except Exception:  # noqa: BLE001
+        return out
+    return out[:80]
+
+
 def gold_in_round_rate() -> float:
     try:
         got = dj_settings().get("gold_in_round_rate")
@@ -93680,6 +94120,8 @@ def gold_in_round_due() -> bool:
     rate = gold_in_round_rate()
     if rate <= 0:
         return False
+    if gold_reply_on():                                                   # [s3-gold:in-round]
+        return False     # gold airs as System 3's rolled reply (GOLD1), never dropped into a live round
     if not s3_chance("gold.in_round", rate, "a banked gold bar fires again inside the round, sting to follow", dial="gold_in_round_rate"):   # [s3-dice-door]
         return False
     # At the historical setting this is the old behaviour exactly: the
@@ -93846,6 +94288,7 @@ def gold_pick(exclude_who: str = "", min_rest: float | None = None) -> dict[str,
                 if str(r.get("who") or "") != str(exclude_who or "")
                 and now - float(r.get("last") or 0) >= rest
                 and not cast_names_line_stale(r)]   # [cast-names] no gone names
+        pool = [r for r in pool if not norepeat_text_used(r.get("text"))]   # [no-repeat-24h:gold-pick]
         # [s3-banks-roll] ONLY BARS MINTED FROM SYSTEM 3 TURNS: while System 3
         # owns the dialogue a bar with no turn behind it is stock made outside
         # the roulette, and it stays in the bank (gold_source)
@@ -93972,10 +94415,17 @@ async def gold_fill_gap(why: str = "", floorless: bool = False,
     talking to himself - and the loop stands down the moment the station
     pauses or goes off air. Nothing here renders or calls a model, so a
     run costs the preparer nothing it needed."""
+    # [no-repeat-24h:gold-gap] A GOLD RUN IS A RE-AIR: "never a re-aired line"
+    # in a gap. The gap is a rolled record, then rolled SFX (sfx_fill_gap); gold
+    # reaches the air as System 3's rolled reply (the GOLD roll), not forced here.
+    if norepeat_on():
+        return ""
     want = float(ahead) if ahead else GOLD_RUN_AHEAD
     # [s3-account] the gap this run fills: the gold bar's forced node names it
     _ORIGIN_GOLD_WHY.update(why=str(why or "dead air")[:200], at=time.time())
     want = max(0.0, min(want, GOLD_RUN_SECONDS))
+    if gold_reply_on():                                                   # [s3-gold:gap]
+        return ""        # a run of bars is a forced re-air; gold is a rolled reply now
     laid = 0.0
     bars = 0
     went = ""
@@ -98309,6 +98759,16 @@ async def continuity_air(reason: str = "") -> bool:
             or talk_quiet_for() < talk_quiet_limit()
             or time.time() - float(_CONTINUITY_STATE.get("last_air") or 0) < 60):
         return False
+    # [no-repeat-24h:continuity] THE RESERVE IS NOT RE-AIRED ANY MORE. Its
+    # recorded pairs are the same lines every time; under the 24-hour rule the
+    # emergency answer is the gap filler's: a rolled record, then rolled SFX.
+    if norepeat_on():
+        _went = await sfx_fill_gap(reason or "the emergency reserve was reached")
+        if _went:
+            _CONTINUITY_STATE.update(last_air=time.time(),
+                                     why="the gap filler covered it (%s) - no recorded pair re-aired "
+                                         "[no-repeat-24h]" % _went)
+        return bool(_went)
     # #1175: THE GOLD GOES FIRST. There are twenty-eight continuity lines
     # and 1,416 gold bars, of which 138 have never fired and not one has
     # fired twice. Measured over 48 hours, this road put 919 airings
@@ -98719,8 +99179,11 @@ async def cover_the_gap(blocked: str = "dj", why: str = "") -> bool:
         # floor without taking it.
         if talk_quiet_for() < FLOOR_QUIET_SECONDS:
             return False
-        if await gold_fill_gap(why or "the floor is held for a render and "
-                                      "nobody has spoken", floorless=True):
+        if await (sfx_fill_gap(why or "the floor is held for a render and nobody has spoken",
+                               under_floor=True, clips_only=True)      # [no-repeat-24h:cover-held]
+                  if norepeat_on() else
+                  gold_fill_gap(why or "the floor is held for a render and "
+                                       "nobody has spoken", floorless=True)):
             _COVER_AT[0] = time.time()
             return True
         return False
@@ -99215,10 +99678,23 @@ def call_beat_sheet(lines: int, caller_name: str, cohost_name: str = "",
     # of that band and the easiest thing to ask for plainly.
     caller_turns = max(3, int(want * 0.38))
     out: list[str] = []
+    # [s3-line-no:answer] the example greeting is a roll off the desk
+    # (call.answer_example) and the host answers in their own words - one
+    # fixed greeting said word for word could air only once a day.
+    try:
+        _ans = s3_choice("call.answer_example", (
+            "the request line is ringing, you're live, go ahead",
+            "we've got a line lit up - you're on the air",
+            "phones are going, you're live on the request line",
+            "caller, you're on, talk to me",
+            "line's open and you're live - go",
+            "the board's lit up, you're on the air, speak up",
+        ), "the example greeting a host is shown for answering the request line (said in their own words)")
+    except Exception:  # noqa: BLE001
+        _ans = "the request line is ringing, you're live, go ahead"
     out.append(" 1  A  - ANSWER THE RINGING LINE. Say the word \"line\" or "
-               "\"call\" out loud - \"the request line is ringing, you're "
-               "live, go ahead\". You do NOT know who this is: do not say "
-               "any name.")
+               "\"call\" out loud, in your own words - something like \"%s\". "
+               "You do NOT know who this is: do not say any name." % _ans)
     out.append(" 2  C  - %s INTRODUCES THEMSELF and nothing more. Say "
                "\"I'm %s\" or \"%s here\". Under thirty words. Do NOT "
                "start the story yet." % (first.upper(), first, first))
@@ -102784,6 +103260,57 @@ CALL_LINES = 98837
 def call_line_no() -> int:
     """Which line this caller came in on. 1 to 98,837, uniformly."""
     return 1 + min(CALL_LINES - 1, int(s3_roll("call.line_number", "which line the caller is on") * CALL_LINES))   # [s3-dice-door]
+
+
+# [s3-line-no] THE SWITCHBOARD IS A TABLE. Its rows are bands ("a-b") or single
+# numbers ("n"); POOLS1 call.line_number, tabled the first time a call rings,
+# weighted and switchable on the desk. One recorded pick chooses the row, one
+# recorded roll the number inside it.
+_call_line_no_flat = call_line_no
+CALL_LINE_BANDS = ("1-9", "10-99", "100-999", "1000-9999", "10000-%d" % CALL_LINES)
+CALL_LINE_LABEL = "which switchboard band (or number) a caller rings in on - add a number, weight a band"
+_CALL_LINE_LAST: dict[str, Any] = {}
+
+
+def _call_band(row: Any) -> tuple[int, int]:
+    """A desk row as a range: "a-b", "n", or anything else -> the whole board."""
+    try:
+        s = "".join(str(row or "").replace(",", "").split())
+        if "-" in s:
+            a, b = s.split("-", 1)
+            lo, hi = int(a), int(b)
+        else:
+            lo = hi = int(s)
+        lo, hi = max(1, min(lo, hi)), max(1, max(lo, hi))
+        return lo, hi
+    except (TypeError, ValueError):
+        return 1, CALL_LINES
+
+
+def call_line_no() -> int:
+    """Which line this caller came in on: a row of the switchboard table
+    (call.line_number, a recorded pick), then the number inside it
+    (call.line_in_band, a recorded roll). [s3-line-no]"""
+    try:
+        rows = s3_pool("call.line_number", CALL_LINE_BANDS, CALL_LINE_LABEL) or list(CALL_LINE_BANDS)
+        k = _S3Dice("call.line_number", CALL_LINE_LABEL).pick("call.line_number", rows)
+        row = rows[k if 0 <= k < len(rows) else 0]
+        lo, hi = _call_band(row)
+        u = s3_roll("call.line_in_band", "which line inside the switchboard band the caller is on")
+        n = lo + min(hi - lo, int(float(u) * (hi - lo + 1)))
+        _CALL_LINE_LAST.clear()
+        _CALL_LINE_LAST.update(n=n, row=str(row), at=round(time.time(), 3),
+                               band=_s3_spin_roll("call.line_number"), inside=_s3_spin_roll("call.line_in_band"))
+        return n
+    except Exception:  # noqa: BLE001 - the phone still rings
+        return _call_line_no_flat()
+
+
+def _prep_line_said(call: Any) -> str:
+    """[s3-line-no] The line a PREPARED call was written on (its host names it
+    in the recording), else a fresh roll."""
+    got = str((call or {}).get("line") or "") if isinstance(call, dict) else ""
+    return got or call_line_say(call_line_no())
 
 
 def call_line_say(number: int) -> str:
@@ -110338,6 +110865,17 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
         #
         # Inside a call every seat is exempt. A repeat is let through or
         # dropped; it is never answered with something off the shelf.
+        # [no-repeat-24h:turns] THE LAST GATE BEFORE AIR for rounds: every seat,
+        # every road through here, banked replays and recorded takes included -
+        # a turn re-aired under a new id is the same words. Only a line the
+        # operator typed is exempt. A refused turn is dropped (never swapped for
+        # shelf material) and the refusal is recorded with its road.
+        if not by_hand:
+            _nr_why = norepeat_line_gate(text, who, "call" if caller_name else "",
+                                         road=_norepeat_road(who))
+            if _nr_why:
+                note_drop(who, text, "no repeats inside a day - " + _nr_why)
+                continue
         # [s3-turnchain] not a line just said - this round's or the one before it
         _s3_td = (turn_dice or {}).get(turn_index) or (turn_dice or {}).get(str(turn_index)) or {}
         if not by_hand and not allow_repeat and _s3_said_copy(
@@ -117682,7 +118220,7 @@ async def dj_caller(track: dict[str, Any] | None = None,
                         {"ts": int(time.time()), "who": "host",
                          "kind": "call", "round": "caller",
                          "repeat": bool(_prep_again),
-                         "text": f"On {call_line_say(call_line_no())}: "
+                         "text": f"On {_prep_line_said(_prep_meta)}: "   # [s3-line-no:card]
                                  f"{_prep_who}"
                                  + (" - back on the line from earlier "
                                     "tonight (a repeat)" if _prep_again
@@ -117707,7 +118245,7 @@ async def dj_caller(track: dict[str, Any] | None = None,
                 try:
                     call_ended(str(_prep_entry.get("prep_name")
                                    or "the caller on the request line"),
-                               call_line_say(call_line_no()), _prep_began,
+                               _prep_line_said(_prep_entry.get("call")), _prep_began,   # [s3-line-no:ended]
                                _prep_entry.get("prep_rule") or {},
                                len(_prep_said))
                 except Exception:  # noqa: BLE001
@@ -177046,7 +177584,125 @@ def sfx_db_pick_short_video(max_seconds: float,
         return None
 
 
-def sfx_db_pick_rotation_row(video: bool = True) -> tuple[Path, float] | None:
+# [no-repeat-24h:book-roll] the clip book's short-video draw, never a clip
+# heard inside the day: refused, recorded, rolled again (at most six times).
+_sfx_db_pick_short_video_rolls = sfx_db_pick_short_video
+
+
+def sfx_db_pick_short_video(max_seconds: float,
+                            rolled: dict | None = None) -> tuple[Path, float] | None:
+    for _try in range(6):
+        got = _sfx_db_pick_short_video_rolls(max_seconds, rolled)
+        if not got or not norepeat_sfx_used(sfx_id(got[0])):
+            return got
+        norepeat_select_refuse("sfx", sfx_id(got[0]), "clip book", ref=got[0].name)
+    return None
+
+
+def s3_offer(key: str, options: Any, label: str = "") -> list[str]:
+    """[s3-offer] What the desk offers of `options` right now: the ones its
+    POOLS1 row keeps switched on (weight above 0), plus any the row has never
+    listed - a new member joins at even odds until the desk says otherwise.
+    The row is tabled the first time (s3_pool). Dice off: every option."""
+    opts = [" ".join(str(o).split()) for o in (options or []) if str(o or "").strip()]
+    if not opts:
+        return []
+    try:
+        s3_pool(key, opts, label)
+    except Exception:  # noqa: BLE001
+        pass
+    fn = globals().get("system3_pool_items")
+    try:
+        items = fn(key) if fn else None
+    except Exception:  # noqa: BLE001
+        items = None
+    if not items:
+        return opts
+    listed: dict[str, bool] = {}
+    for it in items:
+        text = " ".join(str(it.get("text") or "").split())
+        if text:
+            try:
+                listed[text] = bool(it.get("enabled") is not False and float(it.get("weight", 1.0) or 0) > 0)
+            except (TypeError, ValueError):
+                listed[text] = True
+    return [o for o in opts if listed.get(o, True)]
+
+
+# --- [s3-wall-folder] THE ENDLESS SET'S FOLDER IS ROLLED, THEN ITS CLIP -----------
+# "the FOLDER must be rolled on a System 3 table, not just labelled, as well as
+# the clip" (operator, 2026-09-29). The desk row sfxtv.wall_folder (POOLS1)
+# holds the folders and their weights; the roll is among the folders with
+# unspent clips (recently used ones held back while others remain), then the
+# clip roll (sfxtv.deck_clip) is made inside the folder, and both ride the
+# clip's origin record.
+_WALL_FOLDER_ROLL: dict[str, Any] = {}
+WALL_FOLDER_LABEL = "which folder the endless set's next clip comes from"
+
+
+def _wall_folder_roll(con: Any, cycle: int, want: int, pin: str, recent: Any, exclude: Any = ()) -> str:
+    """The folder, rolled (or "" - the whole deck, as before). `exclude`:
+    folders already rolled this pick that gave no clip."""
+    _WALL_FOLDER_ROLL.clear()
+    try:
+        where = "playable = 1 AND video = ? AND deck_cycle < ?"
+        args: tuple[Any, ...] = (want, cycle)
+        if pin:
+            where += " AND path LIKE ?"
+            args += (pin.replace("%", "%%") + "%",)
+        rows = con.execute("SELECT folder, COUNT(*) AS n FROM clips WHERE " + where
+                           + " GROUP BY folder", args).fetchall()
+        gone = set(str(x) for x in (exclude or ()))
+        have = {str(r[0] or ""): int(r[1] or 0) for r in rows
+                if str(r[0] or "") and int(r[1] or 0) > 0 and str(r[0] or "") not in gone}
+        if not have:
+            return ""
+        offered = s3_offer("sfxtv.wall_folder", sorted(have), WALL_FOLDER_LABEL)
+        held = set(str(x) for x in (recent or []))
+        fresh = [f for f in offered if f not in held] or offered
+        if not fresh:
+            return ""
+        k = _S3Dice("sfxtv.wall_folder", WALL_FOLDER_LABEL).pick("sfxtv.wall_folder", fresh)
+        k = k if 0 <= k < len(fresh) else 0
+        folder = fresh[k]
+        rec = _s3_sfx_rolled("sfxtv.wall_folder", folder, k)
+        # System 3's own record, or nothing: the station's own draw (dice off)
+        # notes no dice, as the clip roll does not
+        _WALL_FOLDER_ROLL.update(folder=folder, roll=dict(rec), rolled=bool(rec), at=time.time(),
+                                 clips=have.get(folder, 0), offered=len(fresh))
+        return folder
+    except Exception:  # noqa: BLE001 - a folder roll never costs the set its clip
+        _WALL_FOLDER_ROLL.clear()
+        return ""
+
+
+def _wall_folder_carry(path: Any) -> None:
+    """The folder roll joins the clip's noted roll (_SFX_ROLLED, which the
+    set's origin record carries): its category is the folder, rolled. Only
+    when System 3 rolled the folder - its own draw notes nothing."""
+    try:
+        if not _WALL_FOLDER_ROLL.get("rolled"):
+            return
+        with _SFX_ROLLED_LOCK:
+            got = _SFX_ROLLED.get(str(path))
+            if isinstance(got, dict):
+                got["category"] = _wall_folder_category(path)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _wall_folder_category(path: Any) -> dict[str, Any]:
+    """The clip's category for its origin record: the folder roll that chose
+    it (fresh, and this clip's), else the plain folder label."""
+    got = dict(_WALL_FOLDER_ROLL)
+    if got.get("folder") and got.get("rolled") and time.time() - float(got.get("at") or 0) < 60:
+        return dict(got.get("roll") or {}, label=str(got["folder"]), key="sfxtv.wall_folder",
+                    clips=got.get("clips"), offered=got.get("offered"))
+    return {"label": Path(str(path)).parent.name}
+
+
+def sfx_db_pick_rotation_row(video: bool = True, _unrolled: bool = False,
+                             _tried: tuple = ()) -> tuple[Path, float] | None:   # [s3-wall-folder:def]
     """One uniform random row from the unspent part of the video deck.
 
     This is still COUNT/OFFSET over a covering local index, never
@@ -177067,10 +177723,20 @@ def sfx_db_pick_rotation_row(video: bool = True) -> tuple[Path, float] | None:
         windows = ([(aim * 0.6, aim * 1.6)] if aim > 0 else []) + [None]
         pin = sfx_pin_prefix()
         recent = sfx_video_recent_folders() if video else []
+        _fold = ""                                                        # [s3-wall-folder:roll]
+        if video and not _unrolled:
+            try:
+                _fold = str((globals().get("_wall_folder_roll") or (lambda *a, **k: ""))(
+                    con, cycle, want, pin, recent, exclude=_tried) or "")
+            except Exception:  # noqa: BLE001 - a folder roll never costs the set its clip
+                _fold = ""
         for win in windows:
             for avoid in ([recent, []] if recent else [[]]):
                 where = "playable = 1 AND video = ? AND deck_cycle < ?"
                 args: tuple[Any, ...] = (want, cycle)
+                if _fold:                                                 # [s3-wall-folder:where]
+                    where += " AND folder = ?"
+                    args += (_fold,)
                 if win:
                     where += " AND seconds BETWEEN ? AND ?"
                     args += (win[0], win[1])
@@ -177093,10 +177759,35 @@ def sfx_db_pick_rotation_row(video: bool = True) -> tuple[Path, float] | None:
                     args + (min(count - 1, int((_wall_u := s3_roll("sfxtv.deck_clip", "which unspent clip of the video deck comes next")) * count)),)).fetchone()   # [s3-dice-door] [s3-account-wall] the number is kept
                 if row is None:
                     continue
+                _nr_used = globals().get("norepeat_sfx_used")               # [s3-wall-folder:norepeat]
+                _nr_sid = globals().get("sfx_id")
+                _nr_try = 0
+                while (row is not None and _nr_used and _nr_sid
+                       and _nr_used(_nr_sid(Path(str(row["path"]))))):
+                    _nr_ref = globals().get("norepeat_select_refuse")
+                    if _nr_ref:
+                        _nr_ref("sfx", _nr_sid(Path(str(row["path"]))), "wall", ref=Path(str(row["path"])).name)
+                    _nr_try += 1
+                    if _nr_try > 6:
+                        row = None
+                        break
+                    _wall_u = s3_roll("sfxtv.deck_clip", "which unspent clip of the video deck comes next")
+                    row = con.execute(
+                        "SELECT path, seconds FROM clips WHERE " + where + " LIMIT 1 OFFSET ?",
+                        args + (min(count - 1, int(_wall_u * count)),)).fetchone()
+                if row is None:
+                    continue
                 _sfx_wall_roll_note(row, _wall_u, count)   # [s3-account-wall] the clip carries its dice
+                if _fold and globals().get("_wall_folder_carry"):          # [s3-wall-folder:carry]
+                    globals()["_wall_folder_carry"](Path(str(row["path"])))
                 with _SFX_VIDEO_ROTATION_LOCK:
                     _SFX_VIDEO_ROTATION["why"] = ""
                 return (Path(str(row["path"])), float(row["seconds"] or 0.0))
+        if _fold:                                                         # [s3-wall-folder:fallback]
+            (globals().get("_WALL_FOLDER_ROLL") or {}).clear()
+            if len(_tried) < 2:
+                return sfx_db_pick_rotation_row(video, False, tuple(_tried) + (_fold,))
+            return sfx_db_pick_rotation_row(video, True)
         with _SFX_VIDEO_ROTATION_LOCK:
             _SFX_VIDEO_ROTATION["why"] = "exhausted"
         return None
@@ -186631,6 +187322,11 @@ def airlog_write_rows(rows: list[dict[str, Any]]) -> int:
                 _AIRLOG_SEEN[row["id"]] = digest
                 _AIRLOG_INDEX[row["id"]] = row
                 wrote += 1
+                if ((row.get("aired") in NOREPEAT_SOUNDED or row.get(HEARD_STAMP))   # [no-repeat-24h:airlog]
+                        and str(row.get("kind") or "") not in NOREPEAT_QUIET_KINDS
+                        and row.get("who") not in ("board", "analysis")):
+                    norepeat_note_line(row.get("text"), str(row.get("kind") or row.get("round") or ""),
+                                       str(row.get("id") or ""), row.get("air_at"))
                 if (row.get("who") in AIRLOG_CAST
                         and row.get("aired") in AIRLOG_AIRED
                         and row.get("kind") not in AIRLOG_QUIET_KINDS):

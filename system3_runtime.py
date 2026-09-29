@@ -47,6 +47,10 @@ try:                                      # [s3-mgrtopics] the manager's topic r
     import system3_mgrtopics
 except ImportError:  # pragma: no cover - a host without the module runs as before
     system3_mgrtopics = None
+try:                                      # [s3-gold] gold lines as a rolled reply
+    import system3_gold
+except ImportError:  # pragma: no cover - a host without the module rolls no gold
+    system3_gold = None
 
 # One writer and one reader of the ledger, never the default executor:
 # #1311c / #1320 are the standing lesson that a long job on the shared pool
@@ -511,6 +515,18 @@ class System3Runtime:
             return (live or opts) + self._pool_event_rows(key)   # [s3-live-event]
         except Exception as exc:  # noqa: BLE001
             self.fail("station pool", exc)
+            return None
+
+    def pool_items(self, key):
+        """[s3-offer] The desk's POOLS1 category for `key` as the desk holds it -
+        every item, switched on or off, with its weight - or None (not tabled)."""
+        try:
+            cat = self._find("POOL", str(key)[:60])
+            if not cat:
+                return None
+            return [dict(i) for i in cat.get("items") or [] if isinstance(i, dict)]
+        except Exception as exc:  # noqa: BLE001
+            self.fail("station pool items", exc)
             return None
 
     def pick(self, key, candidates, label="", weights=None, media=None):
@@ -1024,6 +1040,8 @@ class System3Runtime:
                    if t["id"] not in have and t["id"] not in seen]
         if system3_mgrtopics is not None:                                   # [s3-mgrtopics] his two tables, once
             missing += [t for t in system3_mgrtopics.default_tables() if t["id"] not in have and t["id"] not in seen]
+        if system3_gold is not None:                                        # [s3-gold:tables] GOLD1, once
+            missing += [t for t in system3_gold.default_tables() if t["id"] not in have and t["id"] not in seen]
         if not missing:
             return []
         new = copy.deepcopy(config)
@@ -1646,6 +1664,7 @@ class System3Runtime:
             # its words the opening turn read out (frontend composeLine).
             "seed_text": " ".join(seed_text.split())[:1500],
             "topic_bank": topic_bank,
+            "gold_bank": self._gold_bank(ctx, road),                          # [s3-gold:input]
             # [s3-calls] what a call needs to be built from System 3's structure
             "call": call_of,
             "graph_caller_available": bool(ctx.get("caller_name") or ctx.get("graph_caller_available")
@@ -2167,6 +2186,21 @@ class System3Runtime:
             return ""
         self.config = new
         return note
+
+    def _gold_bank(self, ctx, road):
+        """[s3-gold:bank] The kept lines a host may roll as a reply this round -
+        the station's (system3_gold_bank): minted from System 3 turns, none heard
+        inside the day. Empty (nothing is rolled) on the operator's own exchange,
+        a road the station keeps gold off, or a host without the module."""
+        if system3_gold is None or _exchange_of(ctx).get("opener"):
+            return []
+        fn = getattr(self.host, "system3_gold_bank", None)
+        try:
+            rows = fn(road, ctx) if callable(fn) else []
+        except Exception as exc:  # noqa: BLE001
+            self.fail("gold bank", exc)
+            return []
+        return [dict(r) for r in rows or [] if isinstance(r, dict)][:system3_gold.BANK_MOST]
 
     def _topic_bank(self, ctx):
         """[rng-topics] The board, least-sprung first, as System 3's TOPIC
@@ -4676,6 +4710,7 @@ def install(app, namespace):
     namespace["system3_pinned_source"] = rt.pinned_source              # [s3-source]
     namespace["system3_chance"] = rt.chance                            # [s3-dice-door]
     namespace["system3_pool"] = rt.pool
+    namespace["system3_pool_items"] = rt.pool_items                    # [s3-offer]
     namespace["system3_pick"] = rt.pick
     namespace["system3_roll"] = rt.roll
     namespace["system3_last_roll"] = rt.last_roll                      # [s3-sfx-roll]

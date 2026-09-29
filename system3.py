@@ -64,6 +64,7 @@ FAMILIES = ("CTS", "ES", "RS", "IRS", "FL", "SPEAKERBOX", "SFX", "TOPIC", "SFXGU
             "BLOCK")                                                     # [s3-blocks]
 FAMILIES = FAMILIES + ("MEMORY",)                                    # [s3-memory] rules, then roulette
 FAMILIES = FAMILIES + ("GRAPH",)
+FAMILIES = FAMILIES + ("GOLD",)                                      # [s3-gold] a kept line, rolled as a reply
 PHASES = ("OPEN", "ESTABLISH", "DEVELOP", "ESCALATE", "EXPLORE", "WILDCARD",
           "RESOLVE", "WRAP", "SEGUE")
 SPEAKERBOX_MODES = ("NONE", "PREPEND", "APPEND", "FULL_SWATH", "REFERENCE",
@@ -1640,6 +1641,14 @@ def _decide_turn(conv, config, settings, stream, step, speaker, want, inputs, cl
     elif tp.get("id") and tp.get("reply") and tp.get("turn_index") == idx - 1:
         turn["bank_topic_reply"] = tp["reply"]
     _attach_round_plans(conv, turn, idx, want, speaker)                      # [s3-rounds]
+    try:                                                                      # [s3-gold:decide]
+        import sys as _sys
+        import system3_gold
+        system3_gold.decide(_sys.modules[__name__], conv, config, turn, idx, want, inputs, closing)
+    except ImportError:
+        pass
+    except Exception as _gexc:  # noqa: BLE001 - a gold fault never costs the round; it is kept on it
+        conv.setdefault("faults", []).append({"where": "gold roll", "error": repr(_gexc)[:200]})
     if str(step.get("topic") or "").strip():                                  # [s3-flow] the operator's own topic
         turn["topic_override"] = " ".join(str(step["topic"]).split())[:400]
         if idx == 0:
@@ -5036,6 +5045,11 @@ def _row_work(turn, conv):
         else direction_block(turn, conv)
     if _dir:
         feel = ""
+    # [s3-gold:sheet] a gold reply the roulette landed on: the words are the kept
+    # line, fixed; the direction rolled above still governs how it is delivered
+    _gold_txt = str((turn.get("gold") or {}).get("text") or "") if (replying and not answer_text) else ""
+    if _gold_txt:
+        answer_text, answer_line = _gold_txt, True
     if answer_line:
         desc = ("answers %s with these exact words, as written: %s" % (prev_name, json.dumps(answer_text))
                 + (" - feeling %s about it" % feel if feel else ""))
@@ -5047,6 +5061,9 @@ def _row_work(turn, conv):
         desc = "answers what %s just said%s" % (prev_name, _what) + (", feeling %s about it" % feel if feel else "")
     else:
         desc = ("in %s" % feel) if feel else ""
+    if _gold_txt:                                                             # [s3-gold:desc]
+        desc = ("answers %s with a line the station kept - a callback, these exact words, as written: %s"
+                % (prev_name, json.dumps(_gold_txt)))
     acts = "; then ".join(x["text"] for x in turn["directions"] if x["family"] in ("RS", "IRS"))
     if acts and not answer_line:
         desc = (desc + ": " if desc else "") + acts

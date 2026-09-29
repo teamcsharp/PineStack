@@ -1,0 +1,75 @@
+{
+ "id": "GOLD1",
+ "family": "POOL",
+ "label": "Gold lines as replies (the booth rolls for a kept line)",
+ "version": 1,
+ "enabled": true,
+ "weight": 1.0,
+ "description": "On a host's reply turn System 3 rolls gold.reply: the 'gold' weight against the 'own words' weight is the chance the seat answers with a line the station kept, word for word. On a hit it rolls which one, weighted by gold.seat and gold.topic. Lines heard in the last 24 hours are never offered. Switch the table off and no gold line is rolled.",
+ "most": 1,
+ "categories": [
+  {
+   "id": "gold.reply",
+   "label": "Does the seat reply with a gold line?",
+   "weight": 1.0,
+   "items": [
+    {
+     "id": "gold",
+     "label": "a gold line, as the reply",
+     "text": "a gold line, as the reply",
+     "weight": 8.0,
+     "enabled": true
+    },
+    {
+     "id": "own",
+     "label": "their own words",
+     "text": "their own words",
+     "weight": 92.0,
+     "enabled": true
+    }
+   ]
+  },
+  {
+   "id": "gold.seat",
+   "label": "Whose gold line",
+   "weight": 1.0,
+   "items": [
+    {
+     "id": "same_seat",
+     "label": "a line this seat said itself",
+     "text": "a line this seat said itself",
+     "weight": 2.0,
+     "enabled": true
+    },
+    {
+     "id": "other_seat",
+     "label": "a line another seat said",
+     "text": "a line another seat said",
+     "weight": 1.0,
+     "enabled": true
+    }
+   ]
+  },
+  {
+   "id": "gold.topic",
+   "label": "Relevance to this exchange",
+   "weight": 1.0,
+   "items": [
+    {
+     "id": "on_subject",
+     "label": "shares words with this exchange",
+     "text": "shares words with this exchange",
+     "weight": 4.0,
+     "enabled": true
+    },
+    {
+     "id": "off_subject",
+     "label": "about something else",
+     "text": "about something else",
+     "weight": 1.0,
+     "enabled": true
+    }
+   ]
+  }
+ ]
+}
