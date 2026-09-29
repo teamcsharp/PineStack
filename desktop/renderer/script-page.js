@@ -5665,8 +5665,9 @@
     });
     grip.addEventListener('pointermove', function (ev) {
       if (!drag) return;
-      var most = Math.max(0.12, Math.min(0.88, (drag.h - 150) / drag.h));   /* the bubbles keep 150 px */
-      mvSplitF = Math.max(0.12, Math.min(most, (ev.clientY - drag.top) / drag.h));
+      /* [msgsplit2] the same floors as the CSS: each half keeps min(150 px, 22%) */
+      var most = Math.max(0.22, Math.min(0.88, (drag.h - Math.min(150, drag.h * 0.22)) / drag.h));
+      mvSplitF = Math.max(0.22, Math.min(most, (ev.clientY - drag.top) / drag.h));
       mvSplitSet();
     });
     var up = function () {
@@ -7276,7 +7277,14 @@
     if (now - mv.detectAt > 200) {
       mv.detectAt = now;
       var item = mvDetect();
-      if (!mv.cur || mv.cur.item.key !== item.key) mvBubbleStart(item, false);
+      /* [msgonce] a record is bubbled once, when its spin starts; the gaps
+         between lines after that leave the last message where it is */
+      if (item.kind === 'record') {
+        if (mv.cur && mv.recOnce === item.key) item = null;
+        else mv.recOnce = item.key;
+      }
+      if (!item) { /* the record already had its bubble */ }
+      else if (!mv.cur || mv.cur.item.key !== item.key) mvBubbleStart(item, false);
       else if (item.text && item.text !== mv.cur.item.text && mv.cur.item.kind === 'speech'
         && item.text.length >= mv.cur.item.text.length) mv.cur.item.text = item.text;
     }
