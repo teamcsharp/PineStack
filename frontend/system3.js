@@ -4740,46 +4740,62 @@ export async function mountEmbedded(root, {request, view = 'conversation', onSel
     if (s && s.obs) return v.obsKey(n.classList.contains('s3-sfxguy-line') ? 'guy' : 'clip', s.obs, s.t, s.played);   /* [s3-imsg] one key, makeViews' */
     return '';
   }
-  /* The ledger's place of each item of a round: [tier, a, b] - tier 0 in the
-     script ([block, ord]), tier 1 not yet ([planned at, turn]). */
+  /* [msgorder] THE LEDGER'S PLACE OF EACH ITEM, AND ONLY THE LEDGER'S:
+     [block, ord, sub] - sub orders what shares a line: -1 hangs before it
+     (a plan the turn's placement puts before it), 0 is the line's own
+     message, 1 hangs after it, 2 a sting drawn off it. A spoken turn stands
+     at its first spoken line; a later run or a sting at its own row; a turn
+     the SFX board speaks airs as a board row stamped with its turn - that
+     sting IS its message, so the turn card itself has no place, and what
+     hangs off it hangs off the sting. null = the ledger has no place for it
+     yet (planned, not written - most of an interject round's turns never
+     are): it is not in the correspondence. The made-up places that stood
+     here (a planned turn "after its round's last line", which is history)
+     are what put roulette cards in the middle of what already aired. */
   const PLACES = new WeakMap();
   function placesOf(conv) {
     if (PLACES.has(conv)) return PLACES.get(conv);
     const lines = (conv.lines || []).filter(l => Number(l.block) > 0).sort(byLedger);
-    const first = new Map(), rows = new Map();
+    const first = new Map(), rows = new Map(), board = new Map();
     for (const l of lines) {
-      const at = [0, Number(l.block), Number(l.ord) || 0];
+      const at = [Number(l.block), Number(l.ord) || 0, 0];
       if (isSpoken(l)) { if (!first.has(l.turn_id)) first.set(l.turn_id, at); }
-      else if (l.line_id) rows.set('sfx:' + l.line_id, at);
+      else if (l.line_id) {
+        rows.set('sfx:' + l.line_id, at);
+        if (isBoard(l) && l.turn_id && !board.has(l.turn_id)) board.set(l.turn_id, at);
+      }
     }
     /* [s3-imsg] a later run of a turn stands at its own first line */
     for (const t of conv.turns || []) {
       for (const part of (v.partsOf(conv, t) || []).slice(1)) {
         const l = part.lines[0];
-        rows.set(part.key, [0, Number(l.block), Number(l.ord) || 0]);
+        rows.set(part.key, [Number(l.block), Number(l.ord) || 0, 0]);
       }
     }
-    const end = lines[lines.length - 1];
-    const out = {first, rows, last: end ? [0, Number(end.block), Number(end.ord) || 0] : null, created: convTime(conv),
-      turns: new Map((conv.turns || []).map(t => [t.turn_id, t]))};
+    const out = {first, rows, board, turns: new Map((conv.turns || []).map(t => [t.turn_id, t]))};
     PLACES.set(conv, out);
     return out;
   }
+  /* where a turn's message stands: its first spoken line, else (a board turn) its sting; null when unwritten */
   function turnPlace(conv, turnId) {
     const p = placesOf(conv);
-    if (p.first.has(turnId)) return p.first.get(turnId);
-    const i = Number((p.turns.get(turnId) || {}).index) || 0;
-    return p.last ? [0, p.last[1], p.last[2] + 0.5 + i / 1000] : [1, p.created, i];
+    return p.first.get(turnId) || p.board.get(turnId) || null;
   }
   function placeOf(entry, key, n) {
     const conv = entry.conv, p = placesOf(conv), turnId = n.dataset.turn || '';
     if ((key.startsWith('sfx:') || key.startsWith('part:')) && p.rows.has(key)) return p.rows.get(key);
-    if (p.turns.has(key)) return turnPlace(conv, key);
+    if (p.turns.has(key)) return p.first.get(key) || null;                 /* a board turn: its sting is its message */
     const host = turnPlace(conv, turnId), t = p.turns.get(turnId);
+    if (!host) return null;
     const before = key.startsWith('plan:') && t && t.sfx && t.sfx.placement === 'before';
-    return [host[0], host[1], host[2] + (key.startsWith('sfx:') ? 0.6 : before ? -0.3 : 0.3)];
+    return [host[0], host[1], key.startsWith('sfx:') ? 2 : before ? -1 : 1];
   }
   const cmpPlace = (x, y) => (x[0] - y[0]) || (x[1] - y[1]) || (x[2] - y[2]);
+  /* [msgorder] out of sight while it has no place - kept, never removed, so it comes back as it was */
+  function unplaced(n, off) {
+    if (off) { if (n.dataset.unplaced !== '1') { n.dataset.unplaced = '1'; n.style.display = 'none'; } }
+    else if (n.dataset.unplaced) { delete n.dataset.unplaced; n.style.display = ''; }
+  }
   /* every item of the rounds in the thread, in the ledger's order */
   function collect() {
     const rows = [], seen = new Set();
@@ -4791,7 +4807,9 @@ export async function mountEmbedded(root, {request, view = 'conversation', onSel
           if (!k) continue;
           if (seen.has(k)) { n.remove(); continue; }  /* one node per item */
           seen.add(k);
-          rows.push({key: k, entry, node: n, place: placeOf(entry, k, n), i: rows.length});
+          const place = placeOf(entry, k, n);
+          unplaced(n, !place);                         /* [msgorder] no place in the ledger: not in the thread */
+          if (place) rows.push({key: k, entry, node: n, place, i: rows.length});
         }
       }
     }
@@ -4873,6 +4891,7 @@ export async function mountEmbedded(root, {request, view = 'conversation', onSel
     }
     for (const e of feed.values()) {
       const n = used.get(e) || 0;
+      unplaced(e.section, !n && !e.building);      /* [msgorder] nothing of it written yet: out of sight */
       while (e.runs.length > Math.max(0, n - 1)) e.runs.pop().section.remove();
     }
     /* heads of stretches the thread no longer has, node views of segments no longer on show */
@@ -4884,8 +4903,20 @@ export async function mountEmbedded(root, {request, view = 'conversation', onSel
   function liveEdge() {
     let best = '', at = -1;
     for (const k of [airKey, shownKey, airHead]) { const i = k ? thread.indexOf(k) : -1; if (i > at) { at = i; best = k; } }
+    /* [msgorder] and the last message on show that has aired, when that is
+       further down: the air is often on a record or an ad no round owns, and
+       a sting fetched after it aired must land under what is already there,
+       never inside it (the feed filled at mount is drawn in the ledger's order) */
+    if (!seeding) {
+      for (let i = thread.length - 1; i > at; i -= 1) {
+        const n = nodes.get(thread[i]);
+        if (n && AIRED_STAGES.has(n.dataset.stage)) { at = i; best = thread[i]; break; }
+      }
+    }
     return best;
   }
+  const AIRED_STAGES = new Set(['past', 'written', 'skipped', 'live']);
+  let seeding = false;
   /* the thread worked out again and the DOM brought to it */
   function relayout() {
     if (replaying) return;                       /* a round building again where it stands: after it */
@@ -4979,7 +5010,8 @@ export async function mountEmbedded(root, {request, view = 'conversation', onSel
     const conv = await fetchRound(id);
     if (feed.has(id) || queue.some(j => j.conv.identity.conversation_id === id)) return;
     if (!inChain(conv)) { if (NEVER.has(String(conv.status || ''))) outside.add(id); return; }   /* [s3-imsg] never to air: not in the thread */
-    if (animate && !reduced()) { queue.push({conv}); pump(); return; }
+    /* [msgorder] built in front of the operator only when every turn has its place in the air's order */
+    if (animate && !reduced() && (conv.turns || []).every(t => turnPlace(conv, t.turn_id))) { queue.push({conv}); pump(); return; }
     const entry = mountRound(conv);
     paintRound(entry);
     relayout();
@@ -5060,8 +5092,21 @@ export async function mountEmbedded(root, {request, view = 'conversation', onSel
      dropped, and a round the operator holds (a pick, an open line) is kept.
      [s3-imsg] Only a round wholly at the top of the thread, and not while
      the operator is looking at it. */
+  const UNPLACED_MAX = 12;         /* [msgorder] rounds with nothing written yet, kept out of sight */
   function trim() {
-    while (feed.size > FEED_MAX) {
+    /* [msgorder] a round with nothing in the thread waits out of sight: not
+       counted, and only the newest UNPLACED_MAX are kept (the oldest were
+       planned and never written) */
+    const placed = new Set(thread.map(k => ownerOf.get(k)));
+    const waiting = [...feed.values()].filter(e => !e.building && !placed.has(e.conv.identity.conversation_id))
+      .sort((a, b) => convTime(a.conv) - convTime(b.conv));
+    while (waiting.length > UNPLACED_MAX) {
+      const e = waiting.shift(), id = e.conv.identity.conversation_id;
+      for (const s of [e.section, ...e.runs.map(r => r.section)]) s.remove();
+      feed.delete(id);
+      v.forget(id);
+    }
+    while (feed.size - waiting.length > FEED_MAX) {
       const edge = liveEdge(), h = edge ? thread.indexOf(edge) : thread.length;
       const held = e => e.building || e.conv.turns.some(t => t.turn_id === v.sel.turn || v.open.has(t.turn_id) ||
         (typeof v.dropOpen === 'function' && v.dropOpen(t.turn_id)));
@@ -5089,6 +5134,7 @@ export async function mountEmbedded(root, {request, view = 'conversation', onSel
   }
 
   async function seed() {
+    seeding = true;                                /* [msgorder] the first fill: the ledger's order, whole */
     await Promise.race([readSegs(true), sleep(2500)]);   /* [s3-segment-feed] the segments' names before the first section */
     let rows = [];
     try { rows = (await request('/api/system3/conversations?limit=4')).conversations || []; } catch (e) { rows = []; }
@@ -5097,6 +5143,7 @@ export async function mountEmbedded(root, {request, view = 'conversation', onSel
       try { await addRound(row.conversation_id); } catch (e) { /* that round is skipped */ }
     }
     if (cid && !feed.has(cid)) { try { await addRound(cid); } catch (e) { /* keep going */ } }
+    seeding = false;                               /* [msgorder] from here on, what arrives lands under what is there */
     paintHead();
     if (follow) toAnchor(false);                   /* [s3-imsg] synced: the latest message; not, nothing moves */
   }
@@ -5639,6 +5686,12 @@ export async function mountEmbedded(root, {request, view = 'conversation', onSel
   function shownIndex() {
     const pos = seqPos();
     if (shownKey && pos.has(shownKey)) return pos.get(shownKey);
+    /* [msgorder] once the air has been seen, the air decides: the station's
+       receipt says 'published' before a line is heard, and read as "shown"
+       it left nothing ever due - no message ever appeared, the feed was
+       drawn written in one go. The one on air comes in next; what follows it
+       is still to come. */
+    if (airKey && pos.has(airKey)) return pos.get(airKey) - 1;
     for (let i = thread.length - 1; i >= 0; i -= 1) {
       const it = itemAt(thread[i]);
       if (it && it.t && v.airStage(thread[i], it.conv, it.t) !== 'upcoming') return i;
@@ -5688,14 +5741,28 @@ export async function mountEmbedded(root, {request, view = 'conversation', onSel
     const n = itemNode(key);
     if (n && rhythm()) { n.classList.remove('s3-enter'); void n.offsetWidth; n.classList.add('s3-enter'); setTimeout(() => n.classList.remove('s3-enter'), ENTER_MS + 80); }
     glide();
+    const came = arrive(key);                      /* [msgorder] the one hook: a new message, in air order */
     if (rhythm()) await wait(ENTER_MS);
+    if (came && rhythm() && dueIndex() <= shownIndex()) await Promise.race([came, wait(ARRIVE_CAP_MS)]);   /* nothing else due: it plays out before the next */
     announce(key, 'past', 'end', grace);
+  }
+  /* [msgorder] A NEW MESSAGE ARRIVED, IN AIR ORDER. Called once per message
+     as release() lets it appear - the thread's order, one at a time - with
+     its node where it stands. The builder of the arrival ([msgview]:
+     v.arrived) decides how it comes together; the order is never its
+     business. A promise (or nothing). */
+  const ARRIVE_CAP_MS = 9000;
+  function arrive(key) {
+    const n = itemNode(key);
+    if (!n || typeof v.arrived !== 'function') return null;
+    try { return Promise.resolve(v.arrived(key, n)).catch(() => false); } catch (e) { return null; }
   }
   /* the one the air is on: its dice, the hold, then its words start */
   async function enterLive(key, grace) {
     finishReveal();
     shownKey = key;
     announce(key, 'live', 'start', grace);
+    arrive(key);                                   /* [msgorder] the one hook; on air, the reveal is its arrival */
     await startReveal(key);
     announce(key, 'live', 'end', grace);
   }
