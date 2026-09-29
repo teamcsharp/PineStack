@@ -2253,6 +2253,47 @@
     return null;
   }
 
+  /* [hcprev] "Swipe up from the bottom right plays the previous clip that
+   * played." The SFX TV's own play ring is the truth: PineSfxTv.played(),
+   * newest last, noted when the picture actually moved. The chat ring is a
+   * PUBLISH log (cadence samples that never reach the set, rows published
+   * minutes before their air_at, rows dropped as missed) and in ARRAY order
+   * - measured 2026-09-29 it named "68 shark things" while the set showed
+   * "707 Look who we". It is only the fallback where the set has played
+   * nothing, and then only rows that have AIRED, newest by air time.
+   * A clip that went up less than graceMs ago is the set rolling on as the
+   * finger moved: the one before it is what he meant. */
+  var PREV_GRACE_MS = 3000;
+  function previousClip(tvPlayed, chat, nowMs, graceMs) {
+    var grace = graceMs == null ? PREV_GRACE_MS : Number(graceMs) || 0;
+    var t = Number(nowMs) || now();
+    var tv = (Array.isArray(tvPlayed) ? tvPlayed : []).filter(function (r) {
+      return r && r.url;
+    });
+    if (tv.length) {
+      var newest = tv[tv.length - 1];
+      if (tv.length > 1 && t - (Number(newest.at) || 0) < grace) newest = tv[tv.length - 2];
+      return {from: 'tv', row: newest};
+    }
+    var best = null, bestAt = -1;
+    var nowSec = t / 1000;
+    (chat || []).forEach(function (r) {
+      if (!r || String(r.kind || '') !== 'sfx') return;
+      if (!(r.url || replaySampleId(r))) return;
+      var at = Number(r.air_at) || Number(r.ts) || 0;
+      if (at > nowSec) return;                 /* published, not yet aired */
+      if (at >= bestAt) { best = r; bestAt = at; }
+    });
+    return best ? {from: 'chat', row: best} : null;
+  }
+
+  function tvPlayed() {
+    try {
+      var tv = root.PineSfxTv;
+      return tv && typeof tv.played === 'function' ? (tv.played() || []) : [];
+    } catch (e) { return []; }
+  }
+
   var playing = null;
 
   function stopAudio() {
@@ -2557,49 +2598,63 @@
 
   function replaySfx() {
     toast('finding the last clip…');
+    /* [hcprev] the set's own play ring first - no station round trip. */
+    var fromTv = previousClip(tvPlayed(), [], now());
+    if (fromTv) { replayRow(fromTv); return; }
     station().then(function (got) {
-      var row = lastSfx((got && got.chat) || []);
-      if (!row) { toast('no SFX clip has played yet', true); return; }
-      var key = replaySampleId(row);
-      /* The station prefixes a cadence sample's text with the speaker
-       * glyph (U+1F50A, written as its surrogate pair here); the name is
-       * what follows it. */
-      var name = String(row.text || key || 'the clip').replace(/^\uD83D\uDD0A\s*/, '');
-      /* Do not trust row.url here. It may be an old unsigned /sfx key; the
-       * replay-source road returns the same signed, levelled bytes that the
-       * station itself can play, including MP4 metadata for the SFX set. */
-      var source = key ? stationGet('/api/sfx/' + encodeURIComponent(key) + '/replay-source')
-        : Promise.resolve({url: row.url, video: !!row.video, seconds: row.seconds || 0});
-      source.then(function (gotSource) {
-        var source = gotSource || {};
-        var replayKey = String(source.id || key || '');
-        var replayName = String(source.name || name || 'the clip');
-        var url = String(source.url || row.url || '');
-        if (!url) { toast('the station has no playable source for ' + replayName, true); return; }
-        /* A clip with a picture goes back on the SFX set, through the same
-         * cut() the sampler's pads use - on THIS glass only (no ring), which
-         * is what a replay is. cut() answers false where no set is mounted
-         * and the audio road below takes over. */
-        if (source.video && root.PineSfxTv && typeof root.PineSfxTv.cut === 'function') {
-          var shown = false;
-          try {
-            shown = !!root.PineSfxTv.cut({id: replayKey, url: url, sting: replayName,
-              seconds: Number(source.seconds) || 0, video: true, ts: row.ts}, {ring: false});
-          } catch (e) { shown = false; }
-          if (shown) {
-            toast('replaying ' + replayName + ' on the set');
-            offerReplayStinger(replayKey, replayName, source);
-            return;
-          }
-        }
-        playAudio(stationUrl(url), replayName, function () {
-          offerReplayStinger(replayKey, replayName, source);
-        });
-      }, function (err) {
-        toast('could not load the replay source: ' + String((err && err.message) || err), true);
-      });
+      var pick = previousClip([], (got && got.chat) || [], now());
+      if (!pick) { toast('no SFX clip has played yet', true); return; }
+      replayRow(pick);
     }, function (err) {
       toast(String((err && err.message) || err), true);
+    });
+  }
+
+  /* [hcprev] One clip, from either ring. A TV row carries the url the set
+   * played, its sfx id and name; a chat row carries sfx_sample_id and text.
+   * Either way a 16-hex id asks replay-source for fresh signed bytes. The
+   * replay does NOT open the H3 stinger sheet any more: "replay" means play
+   * it again, and the maker keeps its own door (the set's hold menu,
+   * "Generate parody"; PineHotCorners.stinger for an explicit caller). */
+  function replayRow(pick) {
+    var row = pick.row || {};
+    var key = pick.from === 'tv'
+      ? replaySampleId({sfx_sample_id: row.sample, sfx_id: row.id})
+      : replaySampleId(row);
+    /* The station prefixes a cadence sample's text with the speaker
+     * glyph (U+1F50A, written as its surrogate pair here); the name is
+     * what follows it. */
+    var name = String(row.sting || row.text || key || 'the clip').replace(/^🔊\s*/, '');
+    /* Do not trust row.url here. It may be an old unsigned /sfx key; the
+     * replay-source road returns the same signed, levelled bytes that the
+     * station itself can play, including MP4 metadata for the SFX set. */
+    var source = key ? stationGet('/api/sfx/' + encodeURIComponent(key) + '/replay-source')
+      : Promise.resolve({url: row.url, video: !!row.video, seconds: row.seconds || 0});
+    source.then(function (gotSource) {
+      var source = gotSource || {};
+      var replayKey = String(source.id || key || '');
+      var replayName = String(source.name || name || 'the clip');
+      var url = String(source.url || row.url || '');
+      if (!url) { toast('the station has no playable source for ' + replayName, true); return; }
+      /* A clip with a picture goes back on the SFX set, through the same
+       * cut() the sampler's pads use - on THIS glass only (no ring), which
+       * is what a replay is. cut() answers false where no set is mounted
+       * and the audio road below takes over. */
+      var video = source.video != null ? !!source.video : !!row.video;
+      if (video && root.PineSfxTv && typeof root.PineSfxTv.cut === 'function') {
+        var shown = false;
+        try {
+          shown = !!root.PineSfxTv.cut({id: replayKey, url: url, sting: replayName,
+            seconds: Number(source.seconds) || Number(row.seconds) || 0, video: true, ts: row.ts}, {ring: false});
+        } catch (e) { shown = false; }
+        if (shown) {
+          toast('replaying ' + replayName + ' on the set');
+          return;
+        }
+      }
+      playAudio(stationUrl(url), replayName);
+    }, function (err) {
+      toast('could not load the replay source: ' + String((err && err.message) || err), true);
     });
   }
 
@@ -2772,6 +2827,8 @@
     _stepTable: stepTable,
     _heardRow: heardRow,
     _lastSfx: lastSfx,
+    _previousClip: previousClip,                           /* [hcprev] */
+    stinger: offerReplayStinger,                           /* [hcprev] explicit door only */
     _replaySampleId: replaySampleId,
     _stationUrl: stationUrl,
     _editorPath: editorPath,

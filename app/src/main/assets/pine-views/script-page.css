@@ -4060,9 +4060,10 @@ html.pine-tech-wide .sp-tech.sp-tech-wide .wc-strip {
 
 /* [msgsplit] the station's feed above the bubbles, a grip between */
 .sp-mv-split { display: flex; flex-direction: column; min-height: 0; overflow: hidden; }
-.sp-mv-split > .sp-feed { flex: 0 1 var(--mv-feed, 40%); min-height: min(var(--mv-feed-min, 150px), 46%); box-sizing: border-box; }
-.sp-mv-split.sp-mv-wide > .sp-feed { min-height: min(var(--mv-feed-min, 150px), 62%); }
-.sp-mv-split > .sp-mv { flex: 1 1 0; min-height: min(150px, 50%); }
+/* [msgsplit2] each half's floor is at most 22% of the pane, so the grip always has room to move */
+.sp-mv-split > .sp-feed { flex: 0 1 var(--mv-feed, 40%); min-height: min(var(--mv-feed-min, 150px), 22%); box-sizing: border-box; }
+.sp-mv-split.sp-mv-wide > .sp-feed { min-height: min(var(--mv-feed-min, 150px), 22%); }
+.sp-mv-split > .sp-mv { flex: 1 1 0; min-height: min(150px, 22%); }
 .sp-mv-grip { flex: 0 0 14px; position: relative; cursor: row-resize; touch-action: none; }
 .sp-mv-grip::after {
   content: ''; position: absolute; left: 50%; top: 5px; width: 44px; height: 4px; margin-left: -22px;
@@ -4085,6 +4086,73 @@ html.pine-tech-wide .sp-tech.sp-tech-wide .wc-strip {
 /* [msgviz] the record on air, visualized, right of its title */
 .sp-mv-has-viz .sp-mv-bubble { min-width: min(430px, 100%); padding-right: 160px; }
 .sp-mv-viz { position: absolute; right: 14px; top: 8px; width: 138px; height: 40px; border-radius: 6px; background: #05080b; }
+/* [msgroll] THE ROLL, TABLE BY TABLE: the table rolls in, the category die and its
+   wheel, the indented sub-result die and its wheel, pop, next; the results screen
+   the Result tab flips any bubble back to. */
+.sp-rr { display: flex; flex-direction: column; gap: 4px; margin: 6px 0 2px; }
+.sp-rr-t { display: flex; flex-direction: column; gap: 3px; padding: 4px 6px; border-left: 3px solid var(--fam, #68ced9); border-radius: 6px; background: rgba(255, 255, 255, .03); }
+.sp-rr-t.arriving { transform: translateY(4px); }
+.sp-rr-head { display: flex; align-items: baseline; gap: 8px; font-size: 11px; letter-spacing: .05em; }
+.sp-rr-head b { color: var(--fam, #68ced9); }
+.sp-rr-head span { color: var(--sp-muted, #8fa0ad); letter-spacing: 0; }
+.sp-rr-step { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.sp-rr-sub { margin-left: 18px; padding-left: 8px; border-left: 2px solid var(--fam, #68ced9); }
+.sp-rr-die {
+  flex: none; min-width: 32px; height: 24px; display: inline-grid; place-items: center; box-sizing: border-box;
+  border: 2px solid var(--fam, #68ced9); border-radius: 6px; font: 700 12px ui-monospace, Consolas, monospace; color: #fff; background: #0c1318;
+}
+.sp-rr-die.rolling { transform: rotate(-8deg); }
+.sp-rr-wheel {
+  position: relative; flex: 1; min-width: 90px; height: 24px; overflow: hidden; box-sizing: border-box;
+  border: 2px solid #4b5b67; border-radius: 6px; background: #0c1318;
+}
+.sp-rr-wheel::after { content: ''; position: absolute; left: 0; right: 0; top: 50%; height: 1px; background: rgba(255, 255, 255, .12); }
+.sp-rr-wheel.spinning { border-color: var(--fam, #68ced9); }
+.sp-rr-wheel.pop { transform: scale(1.06); border-color: #fff; box-shadow: 0 0 0 2px var(--fam, #68ced9); }
+.sp-rr-list { position: absolute; left: 0; right: 0; top: 0; will-change: transform; }
+.sp-rr-cell { display: block; padding: 0 8px; box-sizing: border-box; font-size: 12px; color: #b9c9d2; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; border-bottom: 1px solid rgba(255, 255, 255, .05); }
+.sp-rr-cell.hit { color: #fff; font-weight: 700; }
+.sp-rr-of { flex: none; font-style: normal; font-size: 10.5px; color: var(--sp-muted, #8fa0ad); }
+.sp-rr-line { display: none; font-size: 11.5px; color: #cfe3ea; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.sp-rr-t.folded { opacity: .65; }
+.sp-rr-t.folded .sp-rr-step, .sp-rr-t.folded .sp-rr-head { display: none !important; }
+.sp-rr-t.folded .sp-rr-line { display: block; }
+.sp-rr-line { align-items: baseline; gap: 6px; }
+.sp-rr-t.folded .sp-rr-line { display: flex; }
+.sp-rr-line b { color: var(--fam, #68ced9); font-size: 10.5px; letter-spacing: .05em; }
+.sp-rr-line i { font-style: normal; color: var(--sp-muted, #8fa0ad); }
+.sp-rr-ld { font: 700 10.5px ui-monospace, Consolas, monospace; color: #fff; border: 1px solid #4b5b67; border-radius: 4px; padding: 0 4px; }
+.sp-rr.results .sp-rr-t { opacity: 1; padding: 2px 6px; }
+.sp-mv-results .sp-mv-text, .sp-mv-results .sp-mv-media, .sp-mv-results .sp-mv-clipwhy, .sp-mv-results .sp-mv-load, .sp-mv-results .sp-mv-seed { display: none !important; }
+.sp-mv-past.sp-mv-results { opacity: 1; }
+.sp-mv-past.sp-mv-results .sp-mv-rolls { display: flex !important; }
+/* [msgthumb] THE CLIP'S PICTURE AND THE RECORD'S. An MP4: its thumbnail, then
+   the clip itself muted and looping, in the bubble. An MP3: the LED meter on
+   the bubble itself - no box, no black. The record: album art at the left,
+   inside the bubble; its visualizer a transparent row under the title,
+   inside the bubble's content box (no longer an absolute black box). */
+.sp-mv-media.is-video { height: 132px; }
+.sp-mv-media.is-probe { height: 44px; background: transparent; border-color: transparent; }
+.sp-mv-media.is-audio { height: 44px; background: transparent; border-color: transparent; border-radius: 0; overflow: hidden; }
+.sp-mv-media .sp-mv-led { position: absolute; inset: 0; width: 100%; height: 100%; display: block; background: transparent; }
+.sp-mv-past .sp-mv-media.is-video { height: 72px; }
+.sp-mv-past .sp-mv-media.is-audio { height: 22px; opacity: .8; }
+/* a short pane: the thumbnail / video as a tile at the bubble's left, beside the roll */
+.sp-mv-bubble.sp-mv-side { min-width: min(440px, 100%); padding-left: 178px; min-height: 108px; }
+.sp-mv-side > .sp-mv-media.is-video, .sp-mv-side > .sp-mv-media.is-probe {
+  position: absolute; left: 10px; top: 10px; bottom: 10px; width: 158px; height: auto; margin: 0; border-radius: 12px;
+}
+.sp-mv-side > .sp-mv-media.is-audio { height: 30px; }
+.sp-mv-past .sp-mv-bubble.sp-mv-side { padding-left: 96px; min-height: 58px; }
+.sp-mv-past .sp-mv-side > .sp-mv-media.is-video { width: 76px; height: auto; }
+.sp-mv-has-viz .sp-mv-bubble { padding-right: 13px; }
+.sp-mv-vizrow { position: relative; display: block; width: 100%; height: 40px; margin-top: 6px; overflow: hidden; background: transparent; }
+.sp-mv-vizrow .sp-mv-viz { position: static; display: block; width: 100%; height: 100%; border-radius: 0; background: transparent; }
+.sp-mv-past .sp-mv-vizrow { height: 22px; opacity: .8; }
+.sp-mv-has-art .sp-mv-bubble { padding-left: 88px; min-height: 88px; }
+.sp-mv-art { position: absolute; left: 12px; top: 12px; width: 64px; height: 64px; object-fit: cover; border-radius: 10px; background: #0c1318; }
+.sp-mv-past .sp-mv-art { left: 10px; top: 8px; width: 34px; height: 34px; border-radius: 7px; }
+.sp-mv-past.sp-mv-has-art .sp-mv-bubble { padding-left: 54px; min-height: 50px; }
 /* [msgmatch] the matched clip's chip, and how it was matched */
 .sp-mv-matchable { cursor: pointer; }
 .sp-mv-matchable:hover, .sp-mv-matchable:focus-visible { filter: brightness(1.25); outline: 1px dashed rgba(227, 190, 99, .7); outline-offset: 2px; }
