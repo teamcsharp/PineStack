@@ -120,7 +120,7 @@ DEFAULTS: dict[str, Any] = {
     "enabled": True,
     "cut_seconds": 210,
     "record": True,
-    "format": "wav",
+    "format": "mp3",                                   # [plmp3] never wav
     "dest": "\\\\10.89.1.125\\QuickSwap\\PineBoxRecordings\\Live Events",
     "picture_mode": "cam",
     "tailscale_video": False,
@@ -214,7 +214,7 @@ def clean_settings(raw: Any, base: dict[str, Any] | None = None) -> tuple[dict[s
                 num = min(hi, max(lo, num))
                 out[key] = int(round(num)) if isinstance(DEFAULTS[key], int) else round(num, 2)
             elif key == "format":
-                if str(value) not in ("wav", "flac"):
+                if str(value) not in ("mp3", "wav", "flac"):   # [plmp3]
                     raise ValueError
                 out[key] = str(value)
             elif key == "picture_mode":
@@ -640,17 +640,43 @@ class Recorder:
                     pass
             self.index -= 1
             return
+        # [plmp3] decant on its own thread: MP3 (flac only when asked), then
+        # the courier - a long track's encode never stalls the frame queue.
         paths = [inp.path, mix.path]
-        if self.fmt == "flac":
-            paths = [to_flac(p) or p for p in paths]
-        row = {"event": self.owner.event_id(), "index": self.index,
-               "start": round(self.start_t, 3), "seconds": frames * FRAME_MS / 1000.0,
-               "input": paths[0].name, "mix": paths[1].name,
-               "folder": self.folder_name, "final": bool(final), "at": time.time()}
-        row["courier"] = self.owner.courier_hand(paths, self.folder_name)
-        self.cuts.append(row)
-        del self.cuts[:-400]
-        self.owner.cut_closed(row)
+        fmt = self.fmt
+        base = {"event": self.owner.event_id(), "index": self.index,
+                "start": round(self.start_t, 3), "seconds": frames * FRAME_MS / 1000.0,
+                "folder": self.folder_name, "final": bool(final)}
+        folder_name = self.folder_name
+
+        def _decant() -> None:
+            got = [(to_flac(p) if fmt == "flac" else to_mp3(p)) or p for p in paths]
+            row = dict(base, input=got[0].name, mix=got[1].name, at=time.time())
+            try:
+                row["courier"] = self.owner.courier_hand(got, folder_name)
+            except Exception as exc:  # noqa: BLE001
+                row["courier"] = []
+                self.owner.error("courier_stale", "the courier could not take the track: %s" % exc)
+            self.cuts.append(row)
+            del self.cuts[:-400]
+            self.owner.cut_closed(row)
+
+        threading.Thread(target=_decant, name="pinelive-decant", daemon=True).start()
+
+
+def to_mp3(path: Path) -> Path | None:
+    """[plmp3] The decanted track as a 320 kb/s MP3; the WAV goes once it exists."""
+    out = path.with_suffix(".mp3")
+    try:
+        subprocess.run([_ffmpeg(), "-hide_banner", "-loglevel", "error", "-nostdin",
+                        "-y", "-i", str(path), "-c:a", "libmp3lame", "-b:a", "320k",
+                        str(out)], check=True, timeout=900, capture_output=True)
+        if out.exists() and out.stat().st_size > 0:
+            path.unlink()
+            return out
+        return None
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def to_flac(path: Path) -> Path | None:
