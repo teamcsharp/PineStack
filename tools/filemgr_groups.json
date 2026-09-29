@@ -1,0 +1,836 @@
+{
+ "generated": "2026-09-29 03:01",
+ "data_dir_host": "/home/ehm_eckx/pinevoice-stack/spark-agent/data",
+ "data_dir_container": "/app/data",
+ "classified_against": "/tmp/akdry (wave AK)",
+ "script": "wipe_cleanslate.sh",
+ "groups": [
+  {
+   "id": "lines.shelves",
+   "label": "Cupboard, larder and prepared shelf",
+   "description": "Banked rounds and prepared segments (pre-System-3 ready dialogue) that air without a new roll.",
+   "tier": "lines",
+   "in_this_wipe": true,
+   "clear": "cold",
+   "clear_why": "_PANTRY/_SHELF/_LARDER live in memory and _pantry_flush_worker/_larder_flush_worker (app.py ~42160/42415) re-save the in-memory copy over a deleted file; _cupboard_finish_load and _FINISH_QUEUE likewise. Hot road: POST /api/cache/purge {areas:[pantry,shelf,larder,takes]} drops the memory, then the files.",
+   "reset": "absent",
+   "hot_road": "POST /api/cache/purge {\"areas\":[\"pantry\",\"shelf\",\"larder\",\"takes\"]}",
+   "script_flag": null,
+   "paths": [
+    "pantry.json",
+    "prep_shelf.json",
+    "larder.json",
+    "cupboard_finish.json",
+    "withdrawn_rounds.jsonl",
+    "page_delivery_recovery.json",
+    "render_backlog.json",
+    "box_hold.json (if present)"
+   ],
+   "empty_forms": [
+    {
+     "path": "pantry.json",
+     "empty": {},
+     "missing_is_empty": true
+    },
+    {
+     "path": "prep_shelf.json",
+     "empty": {},
+     "missing_is_empty": true
+    },
+    {
+     "path": "larder.json",
+     "empty": [],
+     "missing_is_empty": true
+    },
+    {
+     "path": "cupboard_finish.json",
+     "empty": {},
+     "missing_is_empty": true
+    },
+    {
+     "path": "render_backlog.json",
+     "empty": [],
+     "missing_is_empty": true
+    }
+   ]
+  },
+  {
+   "id": "lines.gold",
+   "label": "Gold bars",
+   "description": "Rhymed lines kept to be fired again (gap filler, interject openings).",
+   "tier": "lines",
+   "in_this_wipe": true,
+   "clear": "cold",
+   "clear_why": "_gold_rows() memoises the file once per process (_GOLD['loaded']) and _gold_save() rewrites it from memory (app.py ~92568).",
+   "reset": "absent",
+   "hot_road": null,
+   "script_flag": null,
+   "paths": [
+    "gold_bars.json",
+    "gold_burnt.json"
+   ],
+   "empty_forms": [
+    {
+     "path": "gold_bars.json",
+     "empty": [],
+     "missing_is_empty": true
+    },
+    {
+     "path": "gold_burnt.json",
+     "empty": [],
+     "missing_is_empty": true
+    }
+   ]
+  },
+  {
+   "id": "lines.reserves",
+   "label": "Response bank, continuity reserve, SFX Guy speech bank",
+   "description": "Pre-recorded cover lines: listening responses, the emergency continuity reserve, the SFX Guy's prepared liners.",
+   "tier": "lines",
+   "in_this_wipe": true,
+   "clear": "cold",
+   "clear_why": "ResponseBank(_RESPONSES, app.py 1105), SfxSpeechBank(_SFX_READY_BANK, 82491) and _CONTINUITY_BANK (continuity_load, 96951) hold the rows in memory and re-save them.",
+   "reset": "absent",
+   "hot_road": null,
+   "script_flag": null,
+   "paths": [
+    "continuity_reserve.json",
+    "response_bank.json",
+    "response_bank.catalog.json",
+    "response_bank.retired.json",
+    "response_bank.retries.json",
+    "sfxguy_speech.json"
+   ],
+   "empty_forms": [
+    {
+     "path": "continuity_reserve.json",
+     "empty": {},
+     "missing_is_empty": true
+    }
+   ]
+  },
+  {
+   "id": "lines.upstairs",
+   "label": "Manager memos and upstairs pages",
+   "description": "Memos from upstairs and the voiced pages (text + mp3) that air as the manager road's material.",
+   "tier": "lines",
+   "in_this_wipe": true,
+   "clear": "hot",
+   "clear_why": "Read from disk on every call (_manager_memos_read 74403, upstairs_list 74312); writers re-read before writing, so a deleted file is simply empty. In-flight chapter-shelf entries may still name a page until they expire.",
+   "reset": "absent",
+   "hot_road": null,
+   "script_flag": null,
+   "paths": [
+    "manager_memos.json",
+    "upstairs_pages.json",
+    "upstairs_audio/**  (contents; folder kept)"
+   ],
+   "empty_forms": [
+    {
+     "path": "manager_memos.json",
+     "empty": [],
+     "missing_is_empty": true
+    },
+    {
+     "path": "upstairs_pages.json",
+     "empty": [],
+     "missing_is_empty": true
+    }
+   ]
+  },
+  {
+   "id": "lines.ads",
+   "label": "Produced adverts",
+   "description": "Written ad reads and their produced audio (ads_audio/).",
+   "tier": "lines",
+   "in_this_wipe": true,
+   "clear": "hot",
+   "clear_why": "ad_list() (63873) reads the file every call; coord_spot_ready checks the mp3 exists. A deleted file reads as no ads.",
+   "reset": "absent",
+   "hot_road": null,
+   "script_flag": null,
+   "paths": [
+    "ad_reads.json",
+    "ads_audio/**  (contents; folder kept)"
+   ],
+   "empty_forms": [
+    {
+     "path": "ad_reads.json",
+     "empty": [],
+     "missing_is_empty": true
+    }
+   ]
+  },
+  {
+   "id": "lines.track_talk",
+   "label": "Record intros/outros queue",
+   "description": "Tinted record-bound talk waiting for its record.",
+   "tier": "lines",
+   "in_this_wipe": true,
+   "clear": "cold",
+   "clear_why": "track_talk_load() restores into memory once (_TRACK_TALK_LOADED) and track_talk_save(force) rewrites it (45829-46031).",
+   "reset": "absent",
+   "hot_road": null,
+   "script_flag": null,
+   "paths": [
+    "track_talk_queue.json",
+    "track_reads.json"
+   ],
+   "empty_forms": [
+    {
+     "path": "track_talk_queue.json",
+     "empty": {},
+     "missing_is_empty": true
+    },
+    {
+     "path": "track_reads.json",
+     "empty": {},
+     "missing_is_empty": true
+    }
+   ]
+  },
+  {
+   "id": "lines.calls",
+   "label": "Recorded calls and the call log",
+   "description": "The call log (1,419 calls) and the re-air road's finished call mp3s (radio_cache/calls).",
+   "tier": "lines",
+   "in_this_wipe": true,
+   "clear": "cold",
+   "clear_why": "_RADIO['call_log'] ring in memory; call_log_read memo keyed on mtime (103694); _call_log_write_now rewrites the file.",
+   "reset": "absent",
+   "hot_road": null,
+   "script_flag": null,
+   "paths": [
+    "call_log.json",
+    "call_reruns.json"
+   ],
+   "empty_forms": [
+    {
+     "path": "call_log.json",
+     "empty": [],
+     "missing_is_empty": true
+    },
+    {
+     "path": "call_reruns.json",
+     "empty": {},
+     "missing_is_empty": true
+    }
+   ]
+  },
+  {
+   "id": "lines.chapter_shelf",
+   "label": "System 3 chapter shelf (in-flight exchanges)",
+   "description": "System 3's prepared exchanges around a pre-System-3 opening (gold bar / ad read / page / station ID); <=4 h old, the loader drops non-live rows after 6 h anyway.",
+   "tier": "system3",
+   "in_this_wipe": true,
+   "clear": "cold",
+   "clear_why": "_s3_chapter_shelf() reads the file once per process (_S3_CHAPTER_STATE['loaded'], app.py ~36372) and _s3_chapter_save() rewrites it on every state change.",
+   "reset": "absent",
+   "hot_road": null,
+   "script_flag": "--keep-chapter-shelf",
+   "paths": [
+    "system3_chapter_shelf.json"
+   ],
+   "empty_forms": [
+    {
+     "path": "system3_chapter_shelf.json",
+     "empty": {},
+     "missing_is_empty": true
+    }
+   ]
+  },
+  {
+   "id": "lines.system2",
+   "label": "System 2 hour plans, candidates and receipts",
+   "description": "System 2's running-order DB: hours/slots/jobs, 319 candidates and 2,879 reservations carrying 1,754 voice_media takes, 2,169 heard fingerprints, plus its traces and audit archives.",
+   "tier": "lines",
+   "in_this_wipe": true,
+   "clear": "cold",
+   "clear_why": "system2.System2Store keeps an open sqlite connection (CREATE TABLE IF NOT EXISTS, system2.py 142-152); deleting under an open handle leaves the process writing to an unlinked inode.",
+   "reset": "absent (schema recreated by system2.py on open)",
+   "hot_road": null,
+   "script_flag": "--keep-system2",
+   "paths": [
+    "system2.sqlite3",
+    "system2.sqlite3-shm",
+    "system2.sqlite3-wal",
+    "system2-traces/**  (contents; folder kept)",
+    "system2-audit/**  (contents; folder kept)"
+   ],
+   "empty_forms": []
+  },
+  {
+   "id": "lines.production",
+   "label": "Production queue and script manifests",
+   "description": "script_production's frozen rounds and manifest_store's per-revision scripts/takes/cuts (109k files).",
+   "tier": "lines",
+   "in_this_wipe": true,
+   "clear": "cold",
+   "clear_why": "script_production.py opens ManifestStore(data_root/'manifests') and replays rounds.jsonl; in-memory queue.",
+   "reset": "absent",
+   "hot_road": null,
+   "script_flag": null,
+   "paths": [
+    "manifests/**  (contents; folder kept)",
+    "script_production/rounds.jsonl"
+   ],
+   "empty_forms": []
+  },
+  {
+   "id": "cache.takes",
+   "label": "Rendered takes (voice_media clips)",
+   "description": "Every voiced line on disk (voice_media/*.wav|mp3), its low-rate transcodes (voice_media/lo) and the render-replay index that re-serves an old take for identical text.",
+   "tier": "cache",
+   "in_this_wipe": true,
+   "clear": "cold",
+   "clear_why": "_protected_media_keys (24133) protects takes named by the pantry/banks; render_replay is memoised once (_replay_cache 25574). voice_media/sfx (levelled SFX), tapes/ and spec/ are NOT takes and are kept.",
+   "reset": "absent",
+   "hot_road": null,
+   "script_flag": null,
+   "paths": [
+    "voice_media/*.wav",
+    "voice_media/*.mp3",
+    "voice_media/lo/*",
+    "render_replay.json"
+   ],
+   "empty_forms": [
+    {
+     "path": "render_replay.json",
+     "empty": {},
+     "missing_is_empty": true
+    }
+   ]
+  },
+  {
+   "id": "cache.radio",
+   "label": "Radio recordings cache",
+   "description": "radio_cache: recorded episodes, full broadcast mixes, cuts, staging, thumbnails, the music log.",
+   "tier": "cache",
+   "in_this_wipe": true,
+   "clear": "cold",
+   "clear_why": "Episode/broadcast welders write here continuously (_EPISODE_STAGE 75215, _bmix 160516); delete only with the station stopped. Directory skeleton kept.",
+   "reset": "absent",
+   "hot_road": null,
+   "script_flag": null,
+   "paths": [
+    "radio_cache/**  (contents; folder kept)"
+   ],
+   "empty_forms": []
+  },
+  {
+   "id": "history.air",
+   "label": "Aired-line history and repetition memory",
+   "description": "What aired and when: air log, airings, said lines, screenplay, script ledger, prints, picks, news said, re-air marks, running-order position.",
+   "tier": "history",
+   "in_this_wipe": true,
+   "clear": "cold",
+   "clear_why": "Several are in-memory rings re-saved by their writers (recent_picks RECENT_SAVE_EVERY, line/phrase prints, said lines, coordinator _GAPS, entry ledger _ENTRY_LEDGER); the append-only jsonl ledgers (air_log, airings, script_ledger) would be recreated by the next append and are safe hot.",
+   "reset": "absent",
+   "hot_road": null,
+   "script_flag": null,
+   "paths": [
+    "air_log.jsonl",
+    "airings.jsonl",
+    "said_lines.json",
+    "screenplay_lines.jsonl",
+    "screenplay_rounds.jsonl",
+    "script_ledger.jsonl",
+    "script_ledger_reserved.jsonl",
+    "line_prints.json",
+    "phrase_prints.json",
+    "recent_picks.json",
+    "reair_ineligible.json",
+    "retire_ledger.json",
+    "trail.json",
+    "plot_beats.jsonl",
+    "modifier_rides.jsonl",
+    "continuity_said.json",
+    "chunk_ledger.json",
+    "speakbox_heard.json",
+    "played.json",
+    "news_said.jsonl",
+    "news_covered.json",
+    "repeat_calls.jsonl",
+    "ad_airings.json",
+    "voice_airtime.json",
+    "entry_ledger.json",
+    "coordinator.json",
+    "arrears.json",
+    "sched_pos.json",
+    "broadcast_admission/state.json",
+    "broadcast_admission/ledger.jsonl",
+    "playout/state.json",
+    "playout/events.jsonl"
+   ],
+   "empty_forms": [
+    {
+     "path": "said_lines.json",
+     "empty": [],
+     "missing_is_empty": true
+    },
+    {
+     "path": "recent_picks.json",
+     "empty": {},
+     "missing_is_empty": true
+    },
+    {
+     "path": "played.json",
+     "empty": [],
+     "missing_is_empty": true
+    },
+    {
+     "path": "coordinator.json",
+     "empty": {},
+     "missing_is_empty": true
+    },
+    {
+     "path": "arrears.json",
+     "empty": {},
+     "missing_is_empty": true
+    }
+   ]
+  },
+  {
+   "id": "history.sfx",
+   "label": "SFX / H3 play history",
+   "description": "What the SFX Guy and the H3 hourly door played, and what he said.",
+   "tier": "history",
+   "in_this_wipe": true,
+   "clear": "cold",
+   "clear_why": "sfx_history/sfx_plays/sfx_video_played are held in memory and re-saved (86681-88669); h3_hourly_used via _H3_FRESH_FILE.",
+   "reset": "absent",
+   "hot_road": null,
+   "script_flag": null,
+   "paths": [
+    "sfx_history.json",
+    "sfx_history.jsonl",
+    "sfx_plays.json",
+    "sfx_video_played.json",
+    "sfxguy_said.json",
+    "h3_hourly_used.json",
+    "h3_hourly_airings.jsonl"
+   ],
+   "empty_forms": []
+  },
+  {
+   "id": "backups",
+   "label": "Backup and leftover files",
+   "description": "*.bak*, *.pre<N>*, *.prev.*, schedule_before_*, dated response-bank snapshots, write probes, orphaned *.tmp.",
+   "tier": "backups",
+   "in_this_wipe": true,
+   "clear": "hot",
+   "clear_why": "Nothing reads them (0 code references).",
+   "reset": "absent",
+   "hot_road": null,
+   "script_flag": null,
+   "paths": [
+    "caller_themes.json.bak-1253",
+    "caller_voices.json.bak-1256",
+    "comfy_video_workflow.json.bak-1285out",
+    "comfy_workflow.json.bak-20260914",
+    "gold_bars.json.bak-freshstart-20260922-045756",
+    "gold_bars.json.bak-slash-20260929-051152",
+    "gold_burnt.json.bak-slash-20260929-051152",
+    "larder.json.bak-freshstart-20260922-045756",
+    "larder.json.bak-slash-20260929-051152",
+    "manager_memos.json.bak-slash-20260929-051152",
+    "pantry.json.bak-slash-20260929-051152",
+    "prep_shelf.json.bak-freshstart-20260922-045756",
+    "prep_shelf.json.bak-slash-20260929-051152",
+    "said_lines.json.bak-slash-20260929-051152",
+    "system3_chapter_shelf.json.bak-slash-20260929-051152",
+    "retire_rules.json.pre1157.003552",
+    "pine_requests.prev.md",
+    "schedule_before_1090.json",
+    "response_bank_reviewed_seeds_20260906.json",
+    "response_bank_review_retire_20260906.json",
+    ".codex-write-probe.tmp",
+    "speakbox_vectors.tmp",
+    "*.bak*",
+    "*.pre<digit>*",
+    "*.prev.*",
+    "schedule_before_*.json",
+    "response_bank_*_20YYMMDD.json",
+    ".codex-write-probe.tmp",
+    "speakbox_vectors.tmp",
+    "larder.pre_long_form_*.json",
+    "<switch dir>/*.bak-*  (e.g. review_queue/mode.bak-1391)"
+   ],
+   "empty_forms": []
+  },
+  {
+   "id": "backups.voice",
+   "label": "Voice signature backups and voice trash",
+   "description": "voices/*/reference.wav.pre-rebuild / .bak-garble and voices_trash/: older copies of voice-actor signatures.",
+   "tier": "backups",
+   "in_this_wipe": false,
+   "clear": "hot",
+   "clear_why": "Nothing reads them, but they are voice-actor media (KEEP rule) - excluded by default.",
+   "reset": "absent",
+   "hot_road": null,
+   "script_flag": "--include-voice-backups",
+   "paths": [
+    "voices_trash/**  (contents; folder kept)",
+    "voices/*/reference.wav.pre-rebuild",
+    "voices/*/*.bak-*"
+   ],
+   "empty_forms": []
+  },
+  {
+   "id": "keep.settings",
+   "label": "Station settings",
+   "description": "settings.json - every dial.",
+   "tier": "settings",
+   "in_this_wipe": false,
+   "clear": "hot",
+   "clear_why": "load_settings() (3251) re-reads after SETTINGS_STAT_REST; change it through save_settings / the Settings page, not by deleting the file.",
+   "reset": "absent -> code defaults (DEFAULT settings in load_settings)",
+   "hot_road": null,
+   "script_flag": null,
+   "paths": [
+    "settings.json"
+   ],
+   "empty_forms": [
+    {
+     "path": "settings.json",
+     "empty": "absent",
+     "note": "load_settings() falls back to the code defaults"
+    }
+   ]
+  },
+  {
+   "id": "keep.configs",
+   "label": "Stored configs and switches",
+   "description": "Routing, workflows, hourly door, orchestrator policy, storage caps, modifiers, prompt books, personas, cast, schedule, one-word mode switches.",
+   "tier": "configs",
+   "in_this_wipe": false,
+   "clear": "cold",
+   "clear_why": "Mostly memoised per process; mode switches are re-read every ~3 s (hot).",
+   "reset": "absent",
+   "hot_road": null,
+   "script_flag": null,
+   "paths": [
+    "script_production/mode",
+    "broadcast_admission/mode",
+    "playout/mode",
+    "routing.json",
+    "routing_operator.json",
+    "system2-config.json",
+    "comfy_idle.json",
+    "comfy_video_workflow.json",
+    "comfy_workflow.json",
+    "h3_hourly.json",
+    "h3_prompt_presets.json",
+    "orchestrator_policy.json",
+    "orchestrator_asks.json",
+    "storage_caps.json",
+    "storage_keep.json",
+    "modifiers.json",
+    "banter_dice.json",
+    "rap_battle.json",
+    "hangup_rules.json",
+    "pinelink_pref.json",
+    "doc_lock.json",
+    "sfx_folder_pin.json",
+    "sfx_weights.json",
+    "seat_away.json",
+    "phone_ring.json",
+    "slideshow_state.json",
+    "voice_flags.json",
+    "voice_ledger.json",
+    "personas.json",
+    "cast.json",
+    "schedule.json",
+    "prompt_book.json",
+    "prompt_cuts.json",
+    "vision_prompts.json",
+    "director_notes.json",
+    "director_scripts.json",
+    "event_roads_prepare",
+    "air_stall/",
+    "brief_prompts/",
+    "call_gate/",
+    "finished_work/",
+    "horizon/",
+    "modifiers/",
+    "pantry_orders/",
+    "record_talk/",
+    "review_queue/",
+    "sfx_soundboard/",
+    "voice_engine/",
+    "parody_stinger_queue.sqlite3"
+   ],
+   "empty_forms": []
+  },
+  {
+   "id": "keep.lists",
+   "label": "Lists and books",
+   "description": "Topics, callers, guests, plotlines, bans, rhyme families, crystals, quips, votes, saved banter.",
+   "tier": "lists",
+   "in_this_wipe": false,
+   "clear": "cold",
+   "clear_why": "Each list's desk keeps a memo; edit through its desk/System 3 LIST family.",
+   "reset": "absent",
+   "hot_road": null,
+   "script_flag": null,
+   "paths": [
+    "banned_words.json",
+    "banter_binned.json",
+    "banter_topics.json",
+    "banter_topics.trash.json",
+    "caller_cases.json",
+    "caller_faces.json",
+    "caller_name_book.json",
+    "callers.json",
+    "caller_stories.json",
+    "caller_themes.json",
+    "caller_voices.json",
+    "cast_names_history.json",
+    "guests.json",
+    "plotlines.json",
+    "topic_sets.json",
+    "topic_pen.json",
+    "phrase_sets.json",
+    "converse_seeds.json",
+    "requests.json",
+    "crystal_notes.json",
+    "crystals.json",
+    "rhyme_families.json",
+    "heat_lines.json",
+    "pushed_sections.json",
+    "sfx_bans.json",
+    "sfx_deleted.json",
+    "sfx_keywords.json",
+    "sfx_glue.json",
+    "title_translations.json",
+    "line_votes.json",
+    "track_votes.json",
+    "approaches.json",
+    "sfxguy_quips/",
+    "banter_saved.json"
+   ],
+   "empty_forms": []
+  },
+  {
+   "id": "keep.system3",
+   "label": "System 3 history",
+   "description": "system3.sqlite3 (conversations, lines, events, configs, settings, graph presets), origin ledger, cast airings, manager-topic history, list edits.",
+   "tier": "system3",
+   "in_this_wipe": false,
+   "clear": "cold",
+   "clear_why": "System3Store holds an open sqlite connection (system3_runtime.py 215); System 3 config lives INSIDE system3.sqlite3 (tables configs/settings) - reset through the System 3 config API, never by deleting the DB.",
+   "reset": "absent",
+   "hot_road": null,
+   "script_flag": null,
+   "paths": [
+    "system3.sqlite3",
+    "system3.sqlite3-shm",
+    "system3.sqlite3-wal",
+    "system3_cast.json",
+    "system3_mgrtopics.json",
+    "system3_origin.sqlite3*",
+    "system3_origin_reports/",
+    "system3_list_edits.jsonl"
+   ],
+   "empty_forms": []
+  },
+  {
+   "id": "keep.labs",
+   "label": "Labs",
+   "description": "rejection_lab, line_review, prompt_history/learning, station_flow, rhyme_assistance, sfx_cadence, audits and benches.",
+   "tier": "labs",
+   "in_this_wipe": false,
+   "clear": "cold",
+   "clear_why": "Open sqlite handles; store_retention.py trims them.",
+   "reset": "absent",
+   "hot_road": null,
+   "script_flag": null,
+   "paths": [
+    "line_review.sqlite3",
+    "rejection_lab.sqlite3",
+    "prompt_history.sqlite3",
+    "prompt_learning.sqlite3",
+    "station_flow.sqlite3",
+    "rhyme_assistance.sqlite3",
+    "rhyme_assistance.sqlite3-shm",
+    "rhyme_assistance.sqlite3-wal",
+    "sfx_cadence.sqlite3",
+    "rejection_followup_audit/",
+    "bench/",
+    "h3_ab/",
+    "paper_verification/",
+    "hf-mf-doom/",
+    "judgment_ledger.json",
+    "orchestrator_reflections.json",
+    "repair_learned.json",
+    "repair_stamps.json"
+   ],
+   "empty_forms": []
+  },
+  {
+   "id": "keep.telemetry",
+   "label": "Telemetry logs",
+   "description": "Boot, heat, loop stalls, gaps, model calls, notifications, keeper, pause log.",
+   "tier": "telemetry",
+   "in_this_wipe": false,
+   "clear": "hot",
+   "clear_why": "Append-only; not read to make air.",
+   "reset": "absent",
+   "hot_road": null,
+   "script_flag": null,
+   "paths": [
+    "air_fixes.jsonl",
+    "air_last_restart",
+    "boot_log.jsonl",
+    "gap_log.jsonl",
+    "gen_ad_sends.jsonl",
+    "generations.jsonl",
+    "heat_ring.json",
+    "keeper.jsonl",
+    "loop_stalls.json",
+    "model_calls.jsonl",
+    "notifications.jsonl",
+    "pause_log.jsonl",
+    "resource_history.json",
+    "task_costs.json",
+    "hls_ledger.jsonl",
+    "hls_lanes.json",
+    "te_feed.jsonl",
+    "h3_ad.log",
+    "h3_ask.log",
+    "h3_ref2va.log",
+    "unfroze_pinned_stock",
+    "car_reports/",
+    "car_sessions/",
+    "script_reports/",
+    "feedback.jsonl",
+    "word_cause_edits.jsonl"
+   ],
+   "empty_forms": []
+  },
+  {
+   "id": "keep.caches",
+   "label": "Derived caches (regenerable)",
+   "description": "Music transcodes, Nabu device audio, levelled SFX, tape transcodes, thumbnails, vectors, research notes.",
+   "tier": "cache",
+   "in_this_wipe": false,
+   "clear": "cold",
+   "clear_why": "Rebuilt on demand at CPU/GPU cost (heat).",
+   "reset": "absent",
+   "hot_road": null,
+   "script_flag": null,
+   "paths": [
+    "voice_media/sfx/",
+    "voice_media/tapes/",
+    "voice_media/spec/",
+    "music_hot/",
+    "music_lo/",
+    "nabu_audio/",
+    "sample_cache/",
+    "slideshow_thumbs/",
+    "news_read/",
+    "hls_spool/",
+    "changelog_cache.json",
+    "changelog_cache.json.lock",
+    "changelog_git_cache.json",
+    "changelog_tasks.json",
+    "decision_vectors.json",
+    "speakbox_vectors.json",
+    "speakbox_vectors.meta.json",
+    "track_notes.json",
+    "speakbox_gems.json",
+    "speakbox_harvest_bad.json"
+   ],
+   "empty_forms": []
+  },
+  {
+   "id": "keep.media",
+   "label": "Libraries and media",
+   "description": "Music/SFX indexes, art, library, minds, manuals, voices, H3 cast, PineLive, Pine Cam, uploads, exports, speakbox vault.",
+   "tier": "media",
+   "in_this_wipe": false,
+   "clear": "cold",
+   "clear_why": "Source material.",
+   "reset": "absent",
+   "hot_road": null,
+   "script_flag": null,
+   "paths": [
+    "sfx_seen.json",
+    "tapes_seen.json",
+    "music_index.json",
+    "music_index.stamp",
+    "sfx_clips.db",
+    "sfx_clips.db-shm",
+    "sfx_clips.db-wal",
+    "sfx_lengths.json",
+    "sfx_levels.json",
+    "sfx_retroname_at.json",
+    "sfx_posters/",
+    "sfx_specs/",
+    "sfx_vectors/",
+    "sfx/",
+    "samples/",
+    "art/",
+    "library/",
+    "minds/",
+    "te/",
+    "paper/",
+    "paper_plates.json",
+    "lyrics/",
+    "lyric_jobs.json",
+    "track_lyrics.json",
+    "suno_lyrics.json",
+    "vendor/",
+    "crystals/",
+    "cheats/",
+    "h3_cast/",
+    "voices/",
+    "voice_characters/",
+    "pinelink/",
+    "pinelive/",
+    "pine_uploads/",
+    "uploads/",
+    "video_edits/",
+    "export/",
+    "exports/",
+    "speakbox/",
+    "speakbox_vault/",
+    "speakbox_evicted/",
+    "decisions/",
+    "pinebox-recovery.pdf"
+   ],
+   "empty_forms": []
+  },
+  {
+   "id": "keep.state",
+   "label": "Station state and credentials",
+   "description": "on/paused switches, share links, HA token, inbox, sequence counters.",
+   "tier": "configs",
+   "in_this_wipe": false,
+   "clear": "cold",
+   "clear_why": "Small state files.",
+   "reset": "absent",
+   "hot_road": null,
+   "script_flag": null,
+   "paths": [
+    "script_ledger_seq.json",
+    "pine_seq",
+    "radio_on.json",
+    "paused.json",
+    "shares.json",
+    "ha_token",
+    "openwebui_chat.json",
+    "conversations.jsonl",
+    "memories.jsonl",
+    "pine_requests.md",
+    "pine_completed.md",
+    "pine_journal/",
+    "tunes.jsonl",
+    "export_courier.json",
+    "inbox_resolution_notes_20260906.json",
+    "yt_probe.py"
+   ],
+   "empty_forms": []
+  }
+ ]
+}

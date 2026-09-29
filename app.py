@@ -37,6 +37,8 @@ from urllib.parse import quote, urlparse
 from starlette.background import BackgroundTask
 
 import httpx
+import filemgr as _filemgr                # [filemgr] the disk on the base bar: a pending COLD clear
+_filemgr.boot_run_pending()               # [filemgr] runs HERE, before any module loads a store
 from station_flow import FlowJournal
 from script_report_store import ScriptReportStore, REPORT_NAME as SCRIPT_REPORT_NAME
 from sfx_cue import CueCandidate, choose_due_cue
@@ -161533,6 +161535,7 @@ STATION_STREAM = StationStream(_stream_snapshot, bitrate=STREAM_BITRATE)
 # [pinelive] the /api/pinelive routes and the event's boot. Everything the
 # module needs from this file it looks up in globals() when it needs it.
 pinelive.install(app, globals())
+_filemgr.install(app, globals())          # [filemgr] /api/filemgr/groups|plan|run|jobs|restore
 
 
 STREAM_KEEP_WARM = os.getenv("STREAM_KEEP_WARM", "true").lower() in (

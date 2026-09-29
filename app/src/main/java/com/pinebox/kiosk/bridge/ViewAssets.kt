@@ -60,6 +60,7 @@ object ViewAssets {
         // Voice Actor extraction: the signature-making pane behind
         // the panel's New actor button (registers with the shell).
         "voice-actor-extract.js",
+        "filemgr.js",           // the file manager: the disk in the base bar
         // Voice Actor strips: the last eight profiles under each seat
         // (tap assigns, hold auditions a never-aired sample + meter).
         "voice-actor-strips.js",
@@ -166,6 +167,7 @@ object ViewAssets {
         "voice-actor.css",        // the person badge and the cast subpanel
         "voice-actor-viz.css",    // the extraction tiles and their 4-line readout
         "voice-actor-extract.css", // the extraction pane: link, library, cart, jobs
+        "filemgr.css",          // the file manager popup
         "voice-actor-strips.css",  // the profile strips and the audition sheet
         // #1191/#1202: the glass, its triangles and its headline number. Same
         // finding as the script above - the file was in assets and in no
