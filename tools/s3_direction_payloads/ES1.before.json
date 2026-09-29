@@ -1,0 +1,1253 @@
+{
+ "id": "ES1",
+ "family": "ES",
+ "label": "Emotional Set 1",
+ "version": 2,
+ "enabled": true,
+ "weight": 1.0,
+ "description": "The emotion each turn is spoken in: guides the wording and the voice.",
+ "categories": [
+  {
+   "id": "surprise",
+   "label": "SURPRISE",
+   "weight": 1.0,
+   "valence": 0.15,
+   "arousal": 0.75,
+   "dims": {
+    "excitement": 0.7,
+    "confusion": 0.35
+   },
+   "modifiers": {
+    "tension": 0.2
+   },
+   "after_lean": {
+    "-1": 1.1,
+    "0": 1.1
+   },
+   "items": [
+    {
+     "id": "surprise.surprise",
+     "label": "surprise",
+     "text": "{name} processes this as {feeling}: play it to REACT - quick short phrases, one big late accent on the news-word, and let the end lift and float, unresolved.",
+     "weight": 1.0
+    },
+    {
+     "id": "surprise.shock",
+     "label": "shock",
+     "arousal": 0.9,
+     "emoji": "⚡",
+     "text": "{name} processes this as {feeling}: play it to REACT - quick short phrases, one big late accent on the news-word, and let the end lift and float, unresolved.",
+     "voice": {
+      "tempo": 1.08,
+      "pitch": 1.8,
+      "range": 1.45,
+      "energy": 0.45,
+      "pause": 0.8
+     },
+     "weight": 1.0
+    },
+    {
+     "id": "surprise.astonishment",
+     "label": "astonishment",
+     "emoji": "😲",
+     "text": "{name} processes this as {feeling}: play it to REACT - quick short phrases, one big late accent on the news-word, and let the end lift and float, unresolved.",
+     "voice": {
+      "pitch": 1.8,
+      "range": 1.45
+     },
+     "weight": 1.0
+    },
+    {
+     "id": "surprise.amazement",
+     "label": "amazement",
+     "valence": 0.4,
+     "emoji": "🤯",
+     "text": "{name} processes this as {feeling}: play it to REACT - quick short phrases, one big late accent on the news-word, and let the end lift and float, unresolved.",
+     "voice": {
+      "pitch": 1.4,
+      "energy": 0.35
+     },
+     "weight": 1.0
+    },
+    {
+     "id": "surprise.disbelief",
+     "label": "disbelief",
+     "emoji": "⁉️",
+     "text": "{name} processes this as {feeling}: play it to REACT - quick short phrases, one big late accent on the news-word, and let the end lift and float, unresolved.",
+     "voice": {
+      "tempo": 0.98,
+      "pitch": 1.0,
+      "pause": 1.05
+     },
+     "weight": 1.0
+    },
+    {
+     "id": "surprise.bewilderment",
+     "label": "bewilderment",
+     "emoji": "😵‍💫",
+     "text": "{name} processes this as {feeling}: play it to REACT - quick short phrases, one big late accent on the news-word, and let the end lift and float, unresolved.",
+     "voice": {
+      "tempo": 0.95,
+      "pitch": 0.6,
+      "range": 1.2,
+      "energy": 0.05,
+      "pause": 1.15
+     },
+     "weight": 1.0
+    },
+    {
+     "id": "surprise.confusion",
+     "label": "confusion",
+     "emoji": "😕",
+     "text": "{name} processes this as {feeling}: play it to REACT - quick short phrases, one big late accent on the news-word, and let the end lift and float, unresolved.",
+     "voice": {
+      "tempo": 0.94,
+      "pitch": 0.4,
+      "range": 1.15,
+      "energy": 0.0,
+      "pause": 1.2,
+      "temp": 0.02
+     },
+     "weight": 1.0
+    },
+    {
+     "id": "surprise.curiosity",
+     "label": "curiosity",
+     "arousal": 0.45,
+     "valence": 0.4,
+     "emoji": "🧐",
+     "text": "{name} processes this as {feeling}: play it to REACT - quick short phrases, one big late accent on the news-word, and let the end lift and float, unresolved.",
+     "voice": {
+      "tempo": 1.0,
+      "pitch": 0.6,
+      "range": 1.2,
+      "energy": 0.1,
+      "pause": 0.95,
+      "temp": 0.03
+     },
+     "weight": 1.0
+    },
+    {
+     "id": "surprise.intrigue",
+     "label": "intrigue",
+     "arousal": 0.45,
+     "emoji": "👀",
+     "text": "{name} processes this as {feeling}: play it to REACT - quick short phrases, one big late accent on the news-word, and let the end lift and float, unresolved.",
+     "voice": {
+      "tempo": 0.98,
+      "pitch": 0.4,
+      "range": 1.15,
+      "energy": 0.05,
+      "pause": 1.0,
+      "temp": 0.02
+     },
+     "weight": 1.0
+    }
+   ],
+   "emoji": "😮",
+   "voice": {
+    "tempo": 1.05,
+    "pitch": 1.6,
+    "range": 1.4,
+    "energy": 0.3,
+    "pause": 0.85,
+    "temp": 0.06
+   }
+  },
+  {
+   "id": "anger",
+   "label": "ANGER",
+   "weight": 1.0,
+   "valence": -0.7,
+   "arousal": 0.85,
+   "dims": {
+    "irritation": 0.95,
+    "excitement": 0.3
+   },
+   "modifiers": {
+    "tension": 1.4,
+    "agreement": -1.2
+   },
+   "after_lean": {
+    "-1": 1.5,
+    "1": 0.7
+   },
+   "items": [
+    {
+     "id": "anger.annoyance",
+     "label": "annoyance",
+     "arousal": 0.45,
+     "emoji": "🙄",
+     "text": "{name} processes this as {feeling}: play it to CONFRONT - short hard words in one run-on push with no room to breathe, lean on the word that offends, and land the end with a hard fall.",
+     "voice": {
+      "tempo": 1.02,
+      "pitch": 0.2,
+      "range": 1.1,
+      "energy": 0.25,
+      "pause": 0.95,
+      "temp": 0.02
+     },
+     "weight": 1.0
+    },
+    {
+     "id": "anger.irritation",
+     "label": "irritation",
+     "arousal": 0.55,
+     "emoji": "💢",
+     "text": "{name} processes this as {feeling}: play it to CONFRONT - short hard words in one run-on push with no room to breathe, lean on the word that offends, and land the end with a hard fall.",
+     "voice": {
+      "tempo": 1.04,
+      "pitch": 0.3,
+      "range": 1.15,
+      "energy": 0.35,
+      "pause": 0.9
+     },
+     "weight": 1.0
+    },
+    {
+     "id": "anger.frustration",
+     "label": "frustration",
+     "emoji": "😖",
+     "text": "{name} processes this as {feeling}: play it to CONFRONT - short hard words in one run-on push with no room to breathe, lean on the word that offends, and land the end with a hard fall.",
+     "voice": {
+      "tempo": 1.04,
+      "pitch": 0.5,
+      "range": 1.2,
+      "energy": 0.4,
+      "pause": 0.92
+     },
+     "weight": 1.0
+    },
+    {
+     "id": "anger.indignation",
+     "label": "indignation",
+     "emoji": "😤",
+     "text": "{name} processes this as {feeling}: play it to CONFRONT - short hard words in one run-on push with no room to breathe, lean on the word that offends, and land the end with a hard fall.",
+     "voice": {
+      "range": 1.3,
+      "energy": 0.5
+     },
+     "weight": 1.0
+    },
+    {
+     "id": "anger.anger",
+     "label": "anger",
+     "text": "{name} processes this as {feeling}: play it to CONFRONT - short hard words in one run-on push with no room to breathe, lean on the word that offends, and land the end with a hard fall.",
+     "weight": 1.0
+    },
+    {
+     "id": "anger.outrage",
+     "label": "outrage",
+     "arousal": 0.92,
+     "emoji": "🤬",
+     "text": "{name} processes this as {feeling}: play it to THREATEN, boiling - hit every stressed word, no pauses at all, and slam each end down.",
+     "voice": {
+      "tempo": 1.1,
+      "pitch": 1.2,
+      "range": 1.4,
+      "energy": 0.7,
+      "pause": 0.75,
+      "temp": 0.06
+     },
+     "weight": 1.0
+    },
+    {
+     "id": "anger.fury",
+     "label": "fury",
+     "arousal": 0.98,
+     "emoji": "😡",
+     "text": "{name} processes this as {feeling}: play it to THREATEN, boiling - hit every stressed word, no pauses at all, and slam each end down.",
+     "voice": {
+      "tempo": 1.12,
+      "pitch": 1.4,
+      "range": 1.45,
+      "energy": 0.8,
+      "pause": 0.72,
+      "temp": 0.07
+     },
+     "weight": 1.0
+    },
+    {
+     "id": "anger.resentment",
+     "label": "resentment",
+     "arousal": 0.55,
+     "emoji": "😒",
+     "text": "{name} processes this as {feeling}: play it to NEEDLE - controlled and precise, the grievance under every word, and a low flat end.",
+     "voice": {
+      "tempo": 1.0,
+      "pitch": -0.2,
+      "range": 1.15,
+      "energy": 0.3,
+      "pause": 1.0,
+      "temp": 0.0
+     },
+     "weight": 1.0
+    },
+    {
+     "id": "anger.contempt",
+     "label": "contempt",
+     "arousal": 0.6,
+     "emoji": "😏",
+     "text": "{name} processes this as {feeling}: play it to DISMISS, icy - controlled, over-precise words, nothing raised, and a low flat end.",
+     "voice": {
+      "tempo": 0.95,
+      "pitch": -1.2,
+      "range": 1.1,
+      "energy": -0.2,
+      "pause": 1.1,
+      "temp": 0.0
+     },
+     "weight": 1.0
+    },
+    {
+     "id": "anger.disgust",
+     "label": "disgust",
+     "emoji": "🤢",
+     "text": "{name} processes this as {feeling}: play it to CONFRONT - short hard words in one run-on push with no room to breathe, lean on the word that offends, and land the end with a hard fall.",
+     "voice": {
+      "tempo": 0.95,
+      "pitch": -0.5,
+      "range": 1.15,
+      "energy": 0.1,
+      "pause": 1.05
+     },
+     "weight": 1.0
+    }
+   ],
+   "emoji": "😠",
+   "voice": {
+    "tempo": 1.1,
+    "pitch": 1.0,
+    "range": 1.35,
+    "energy": 0.6,
+    "pause": 0.78,
+    "temp": 0.05
+   }
+  },
+  {
+   "id": "fear",
+   "label": "FEAR",
+   "weight": 1.0,
+   "valence": -0.6,
+   "arousal": 0.7,
+   "dims": {
+    "nervousness": 0.95,
+    "confusion": 0.2
+   },
+   "modifiers": {
+    "tension": 0.6
+   },
+   "after_lean": {},
+   "items": [
+    {
+     "id": "fear.unease",
+     "label": "unease",
+     "arousal": 0.4,
+     "emoji": "😟",
+     "text": "{name} processes this as {feeling}: play it to WORRY aloud - soft and even, a hesitation before the point, and a mid, unresolved end.",
+     "voice": {
+      "tempo": 1.02,
+      "pitch": -0.2,
+      "range": 0.85,
+      "energy": -0.1,
+      "pause": 1.1,
+      "temp": 0.02
+     },
+     "weight": 1.0
+    },
+    {
+     "id": "fear.apprehension",
+     "label": "apprehension",
+     "arousal": 0.5,
+     "emoji": "😬",
+     "text": "{name} processes this as {feeling}: play it to WARN - quick broken phrases, a question left hanging, the voice climbing, and leave the end high and open, never settled.",
+     "voice": {
+      "tempo": 1.04,
+      "pitch": -0.2,
+      "range": 0.85,
+      "energy": 0.0,
+      "pause": 1.05
+     },
+     "weight": 1.0
+    },
+    {
+     "id": "fear.anxiety",
+     "label": "anxiety",
+     "emoji": "😰",
+     "text": "{name} processes this as {feeling}: play it to WORRY aloud - soft and even, a hesitation before the point, and a mid, unresolved end.",
+     "voice": {
+      "tempo": 1.04,
+      "pitch": -0.6,
+      "range": 0.7,
+      "energy": -0.25,
+      "pause": 1.15,
+      "temp": 0.0
+     },
+     "weight": 1.0
+    },
+    {
+     "id": "fear.alarm",
+     "label": "alarm",
+     "emoji": "🚨",
+     "text": "{name} processes this as {feeling}: play it to WARN - quick broken phrases, a question left hanging, the voice climbing, and leave the end high and open, never settled.",
+     "voice": {
+      "tempo": 1.1,
+      "pitch": 1.4,
+      "range": 0.95,
+      "energy": 0.4,
+      "pause": 1.05
+     },
+     "weight": 1.0
+    },
+    {
+     "id": "fear.fear",
+     "label": "fear",
+     "text": "{name} processes this as {feeling}: play it to WARN - quick broken phrases, a question left hanging, the voice climbing, and leave the end high and open, never settled.",
+     "weight": 1.0
+    },
+    {
+     "id": "fear.dread",
+     "label": "dread",
+     "emoji": "😧",
+     "text": "{name} processes this as {feeling}: play it to WORRY aloud - slow and low, a hesitation before the point, and an end that hangs.",
+     "voice": {
+      "tempo": 0.98,
+      "pitch": -0.4,
+      "range": 0.7,
+      "energy": -0.2,
+      "pause": 1.25,
+      "temp": -0.02
+     },
+     "weight": 1.0
+    },
+    {
+     "id": "fear.panic",
+     "label": "panic",
+     "arousal": 0.97,
+     "emoji": "😱",
+     "text": "{name} processes this as {feeling}: play it to RAISE THE ALARM - rapid fragments with breath-grabbing breaks, and the end high with no fall.",
+     "voice": {
+      "tempo": 1.14,
+      "pitch": 1.8,
+      "range": 0.95,
+      "energy": 0.5,
+      "pause": 1.1,
+      "temp": 0.07
+     },
+     "weight": 1.0
+    },
+    {
+     "id": "fear.horror",
+     "label": "horror",
+     "arousal": 0.92,
+     "emoji": "💀",
+     "text": "{name} processes this as {feeling}: play it to WARN - quick broken phrases, a question left hanging, the voice climbing, and leave the end high and open, never settled.",
+     "voice": {
+      "tempo": 1.04,
+      "pitch": 1.2,
+      "range": 1.0,
+      "energy": 0.35,
+      "pause": 1.1
+     },
+     "weight": 1.0
+    }
+   ],
+   "emoji": "😨",
+   "voice": {
+    "tempo": 1.1,
+    "pitch": 1.2,
+    "range": 0.9,
+    "energy": 0.25,
+    "pause": 1.08,
+    "temp": 0.05
+   }
+  },
+  {
+   "id": "sadness",
+   "label": "SADNESS",
+   "weight": 1.0,
+   "valence": -0.6,
+   "arousal": 0.25,
+   "dims": {
+    "fatigue": 0.7,
+    "nervousness": 0.15
+   },
+   "modifiers": {
+    "energy": -0.8
+   },
+   "after_lean": {},
+   "items": [
+    {
+     "id": "sadness.disappointment",
+     "label": "disappointment",
+     "emoji": "😞",
+     "text": "{name} processes this as {feeling}: play it to CONFIDE - short, plain, fragmented clauses with room between them, soft words, and let each end fall short and quiet.",
+     "voice": {
+      "tempo": 0.92,
+      "pitch": -0.6,
+      "range": 0.8,
+      "energy": -0.3,
+      "pause": 1.2
+     },
+     "weight": 1.0
+    },
+    {
+     "id": "sadness.discouragement",
+     "label": "discouragement",
+     "emoji": "😔",
+     "text": "{name} processes this as {feeling}: play it to CONFIDE - short, plain, fragmented clauses with room between them, soft words, and let each end fall short and quiet.",
+     "voice": {
+      "tempo": 0.9,
+      "pitch": -0.8,
+      "range": 0.75,
+      "energy": -0.4,
+      "pause": 1.25
+     },
+     "weight": 1.0
+    },
+    {
+     "id": "sadness.sadness",
+     "label": "sadness",
+     "text": "{name} processes this as {feeling}: play it to CONFIDE - short, plain, fragmented clauses with room between them, soft words, and let each end fall short and quiet.",
+     "weight": 1.0
+    },
+    {
+     "id": "sadness.grief",
+     "label": "grief",
+     "arousal": 0.35,
+     "emoji": "😭",
+     "text": "{name} processes this as {feeling}: play it to GRIEVE quietly - very plain words, short fragments with long gaps, and a shallow, late-falling end.",
+     "voice": {
+      "tempo": 0.86,
+      "pitch": -0.6,
+      "range": 0.85,
+      "energy": -0.4,
+      "pause": 1.45,
+      "temp": 0.02
+     },
+     "weight": 1.0
+    },
+    {
+     "id": "sadness.despair",
+     "label": "despair",
+     "arousal": 0.3,
+     "emoji": "😩",
+     "text": "{name} processes this as {feeling}: play it to PLEAD - broken, reaching phrases that go back over the same point, strained and pitched up, the end falling away.",
+     "voice": {
+      "tempo": 0.9,
+      "pitch": 1.0,
+      "range": 0.8,
+      "energy": 0.35,
+      "pause": 1.3,
+      "temp": 0.03
+     },
+     "weight": 1.0
+    },
+    {
+     "id": "sadness.melancholy",
+     "label": "melancholy",
+     "emoji": "🥀",
+     "text": "{name} processes this as {feeling}: play it to CONFIDE - short, plain, fragmented clauses with room between them, soft words, and let each end fall short and quiet.",
+     "voice": {
+      "pitch": -0.8,
+      "energy": -0.45
+     },
+     "weight": 1.0
+    },
+    {
+     "id": "sadness.sympathy",
+     "label": "sympathy",
+     "valence": 0.1,
+     "emoji": "🫂",
+     "text": "{name} processes this as {feeling}: play it to CONFIDE - short, plain, fragmented clauses with room between them, soft words, and let each end fall short and quiet.",
+     "voice": {
+      "tempo": 0.94,
+      "pitch": -0.3,
+      "range": 0.9,
+      "energy": -0.3,
+      "pause": 1.15,
+      "temp": -0.02
+     },
+     "weight": 1.0
+    },
+    {
+     "id": "sadness.pity",
+     "label": "pity",
+     "emoji": "🥺",
+     "text": "{name} processes this as {feeling}: play it to CONFIDE - short, plain, fragmented clauses with room between them, soft words, and let each end fall short and quiet.",
+     "voice": {
+      "tempo": 0.94,
+      "pitch": -0.2,
+      "range": 0.95,
+      "energy": -0.25,
+      "pause": 1.15
+     },
+     "weight": 1.0
+    }
+   ],
+   "emoji": "😢",
+   "voice": {
+    "tempo": 0.86,
+    "pitch": -1.0,
+    "range": 0.7,
+    "energy": -0.5,
+    "pause": 1.4,
+    "temp": -0.05
+   }
+  },
+  {
+   "id": "joy",
+   "label": "JOY",
+   "weight": 1.0,
+   "valence": 0.8,
+   "arousal": 0.65,
+   "dims": {
+    "amusement": 0.75,
+    "excitement": 0.6
+   },
+   "modifiers": {
+    "agreement": 0.9,
+    "tension": -0.8
+   },
+   "after_lean": {
+    "1": 1.4,
+    "-1": 0.7
+   },
+   "items": [
+    {
+     "id": "joy.pleasure",
+     "label": "pleasure",
+     "emoji": "😊",
+     "text": "{name} processes this as {feeling}: play it to SAVOUR - easy, warm, unhurried words, gentle accents, and a soft settled end.",
+     "voice": {
+      "tempo": 0.98,
+      "pitch": 0.0,
+      "range": 1.2,
+      "energy": -0.1,
+      "pause": 1.0
+     },
+     "weight": 1.0
+    },
+    {
+     "id": "joy.happiness",
+     "label": "happiness",
+     "text": "{name} processes this as {feeling}: play it to CELEBRATE - bright, warm, generous words, lift the word that delights, keep it moving, and ride a long smooth fall at the end.",
+     "voice": {
+      "tempo": 1.0,
+      "pitch": 0.2,
+      "range": 1.25,
+      "energy": 0.05,
+      "pause": 0.98
+     },
+     "weight": 1.0
+    },
+    {
+     "id": "joy.delight",
+     "label": "delight",
+     "emoji": "😁",
+     "text": "{name} processes this as {feeling}: play it to CELEBRATE - bright, warm, generous words, lift the word that delights, keep it moving, and ride a long smooth fall at the end.",
+     "voice": {
+      "pitch": 1.4,
+      "range": 1.4,
+      "energy": 0.45
+     },
+     "weight": 1.0
+    },
+    {
+     "id": "joy.excitement",
+     "label": "excitement",
+     "arousal": 0.85,
+     "emoji": "🎉",
+     "text": "{name} processes this as {feeling}: play it to ENTHUSE - fast, bright, run-together words, a lift on every good thing, and a long smooth fall at the end.",
+     "voice": {
+      "tempo": 1.1,
+      "pitch": 1.6,
+      "range": 1.4,
+      "energy": 0.6,
+      "pause": 0.82,
+      "temp": 0.06
+     },
+     "weight": 1.0
+    },
+    {
+     "id": "joy.enthusiasm",
+     "label": "enthusiasm",
+     "arousal": 0.8,
+     "emoji": "🙌",
+     "text": "{name} processes this as {feeling}: play it to CELEBRATE - bright, warm, generous words, lift the word that delights, keep it moving, and ride a long smooth fall at the end.",
+     "voice": {
+      "tempo": 1.08,
+      "range": 1.35,
+      "energy": 0.55,
+      "pause": 0.85
+     },
+     "weight": 1.0
+    },
+    {
+     "id": "joy.amusement",
+     "label": "amusement",
+     "emoji": "😂",
+     "text": "{name} processes this as {feeling}: play it to CELEBRATE - bright, warm, generous words, lift the word that delights, keep it moving, and ride a long smooth fall at the end.",
+     "voice": {
+      "tempo": 1.04,
+      "pitch": 1.0,
+      "range": 1.4,
+      "energy": 0.3,
+      "pause": 0.95
+     },
+     "weight": 1.0
+    },
+    {
+     "id": "joy.relief",
+     "label": "relief",
+     "arousal": 0.35,
+     "valence": 0.6,
+     "emoji": "😌",
+     "text": "{name} processes this as {feeling}: play it to SAVOUR - easy, warm, unhurried words, a breath of release, and a soft settled end.",
+     "voice": {
+      "tempo": 0.94,
+      "pitch": -0.2,
+      "range": 1.1,
+      "energy": -0.1,
+      "pause": 1.15,
+      "temp": 0.0
+     },
+     "weight": 1.0
+    },
+    {
+     "id": "joy.satisfaction",
+     "label": "satisfaction",
+     "arousal": 0.35,
+     "emoji": "👌",
+     "text": "{name} processes this as {feeling}: play it to SAVOUR - easy, warm, unhurried words, gentle accents, and a soft settled end.",
+     "voice": {
+      "tempo": 0.96,
+      "pitch": -0.5,
+      "range": 1.1,
+      "energy": -0.25,
+      "pause": 1.1,
+      "temp": 0.0
+     },
+     "weight": 1.0
+    }
+   ],
+   "emoji": "😄",
+   "voice": {
+    "tempo": 1.08,
+    "pitch": 1.2,
+    "range": 1.35,
+    "energy": 0.4,
+    "pause": 0.9,
+    "temp": 0.05
+   }
+  },
+  {
+   "id": "disgust",
+   "label": "DISGUST",
+   "weight": 1.0,
+   "valence": -0.6,
+   "arousal": 0.55,
+   "dims": {
+    "irritation": 0.7
+   },
+   "modifiers": {
+    "tension": 0.8,
+    "agreement": -0.6
+   },
+   "after_lean": {
+    "-1": 1.25
+   },
+   "items": [
+    {
+     "id": "disgust.distaste",
+     "label": "distaste",
+     "emoji": "🙁",
+     "text": "{name} processes this as {feeling}: play it to DISMISS - clipped, flat, withholding words, slow down on the word that repels, and drop the end to the floor.",
+     "voice": {
+      "tempo": 0.95,
+      "pitch": -0.5,
+      "range": 1.05,
+      "energy": -0.15,
+      "pause": 1.1
+     },
+     "weight": 1.0
+    },
+    {
+     "id": "disgust.aversion",
+     "label": "aversion",
+     "emoji": "🙅",
+     "text": "{name} processes this as {feeling}: play it to DISMISS - clipped, flat, withholding words, slow down on the word that repels, and drop the end to the floor.",
+     "weight": 1.0
+    },
+    {
+     "id": "disgust.disgust",
+     "label": "disgust",
+     "text": "{name} processes this as {feeling}: play it to DISMISS - clipped, flat, withholding words, slow down on the word that repels, and drop the end to the floor.",
+     "weight": 1.0
+    },
+    {
+     "id": "disgust.revulsion",
+     "label": "revulsion",
+     "emoji": "🤮",
+     "text": "{name} processes this as {feeling}: play it to DISMISS - clipped, flat, withholding words, slow down on the word that repels, and drop the end to the floor.",
+     "voice": {
+      "tempo": 0.9,
+      "pitch": -1.0,
+      "range": 1.25,
+      "energy": -0.1,
+      "pause": 1.2
+     },
+     "weight": 1.0
+    },
+    {
+     "id": "disgust.repulsion",
+     "label": "repulsion",
+     "emoji": "✋",
+     "text": "{name} processes this as {feeling}: play it to DISMISS - clipped, flat, withholding words, slow down on the word that repels, and drop the end to the floor.",
+     "voice": {
+      "tempo": 0.91,
+      "pitch": -0.9,
+      "range": 1.2,
+      "energy": -0.1,
+      "pause": 1.18
+     },
+     "weight": 1.0
+    },
+    {
+     "id": "disgust.moral_disgust",
+     "label": "moral disgust",
+     "emoji": "👎",
+     "text": "{name} processes this as {feeling}: play it to DISMISS - clipped, flat, withholding words, slow down on the word that repels, and drop the end to the floor.",
+     "voice": {
+      "tempo": 0.94,
+      "pitch": -0.6,
+      "range": 1.2,
+      "energy": -0.1,
+      "pause": 1.1
+     },
+     "weight": 1.0
+    }
+   ],
+   "emoji": "🤢",
+   "voice": {
+    "tempo": 0.9,
+    "pitch": -0.8,
+    "range": 1.15,
+    "energy": -0.25,
+    "pause": 1.15,
+    "temp": -0.02
+   }
+  },
+  {
+   "id": "interest",
+   "label": "INTEREST",
+   "weight": 1.0,
+   "valence": 0.3,
+   "arousal": 0.5,
+   "dims": {
+    "excitement": 0.45,
+    "confusion": 0.1
+   },
+   "modifiers": {
+    "novelty": 0.6
+   },
+   "after_lean": {
+    "0": 1.2
+   },
+   "items": [
+    {
+     "id": "interest.curiosity",
+     "label": "curiosity",
+     "arousal": 0.45,
+     "valence": 0.4,
+     "emoji": "🧐",
+     "text": "{name} processes this as {feeling}: play it to PROBE - brisk and precise, a pointed follow-up, light accents on the facts, and keep the end rising so the floor stays open.",
+     "voice": {
+      "tempo": 1.0,
+      "pitch": 0.6,
+      "range": 1.2,
+      "energy": 0.1,
+      "pause": 0.95,
+      "temp": 0.03
+     },
+     "weight": 1.0
+    },
+    {
+     "id": "interest.fascination",
+     "label": "fascination",
+     "emoji": "🤩",
+     "text": "{name} processes this as {feeling}: play it to PROBE - brisk and precise, a pointed follow-up, light accents on the facts, and keep the end rising so the floor stays open.",
+     "voice": {
+      "tempo": 1.02,
+      "pitch": 0.4,
+      "range": 1.3,
+      "energy": 0.2
+     },
+     "weight": 1.0
+    },
+    {
+     "id": "interest.intrigue",
+     "label": "intrigue",
+     "arousal": 0.45,
+     "emoji": "👀",
+     "text": "{name} processes this as {feeling}: play it to PROBE - brisk and precise, a pointed follow-up, light accents on the facts, and keep the end rising so the floor stays open.",
+     "voice": {
+      "tempo": 0.98,
+      "pitch": 0.4,
+      "range": 1.15,
+      "energy": 0.05,
+      "pause": 1.0,
+      "temp": 0.02
+     },
+     "weight": 1.0
+    },
+    {
+     "id": "interest.attentiveness",
+     "label": "attentiveness",
+     "emoji": "👂",
+     "text": "{name} processes this as {feeling}: play it to PROBE - brisk and precise, a pointed follow-up, light accents on the facts, and keep the end rising so the floor stays open.",
+     "voice": {
+      "tempo": 1.02,
+      "pitch": 0.2,
+      "range": 1.05,
+      "energy": 0.05,
+      "pause": 1.0
+     },
+     "weight": 1.0
+    },
+    {
+     "id": "interest.skepticism",
+     "label": "skepticism",
+     "valence": -0.1,
+     "emoji": "🤨",
+     "text": "{name} processes this as {feeling}: play it to PROBE - brisk and precise, a pointed follow-up, light accents on the facts, and keep the end rising so the floor stays open.",
+     "voice": {
+      "tempo": 0.96,
+      "pitch": -0.2,
+      "range": 1.25,
+      "energy": 0.05,
+      "pause": 1.1,
+      "temp": 0.0
+     },
+     "weight": 1.0
+    },
+    {
+     "id": "interest.suspicion",
+     "label": "suspicion",
+     "valence": -0.3,
+     "emoji": "🕵️",
+     "text": "{name} processes this as {feeling}: play it to PROBE - brisk and precise, a pointed follow-up, light accents on the facts, and keep the end rising so the floor stays open.",
+     "voice": {
+      "tempo": 0.95,
+      "pitch": -0.4,
+      "range": 1.1,
+      "energy": 0.0,
+      "pause": 1.15,
+      "temp": 0.0
+     },
+     "weight": 1.0
+    },
+    {
+     "id": "interest.uncertainty",
+     "label": "uncertainty",
+     "emoji": "🤷",
+     "text": "{name} processes this as {feeling}: play it to PROBE - brisk and precise, a pointed follow-up, light accents on the facts, and keep the end rising so the floor stays open.",
+     "voice": {
+      "tempo": 0.95,
+      "pitch": 0.2,
+      "range": 0.95,
+      "energy": -0.1,
+      "pause": 1.2,
+      "temp": 0.0
+     },
+     "weight": 1.0
+    }
+   ],
+   "emoji": "🤔",
+   "voice": {
+    "tempo": 1.06,
+    "pitch": 0.0,
+    "range": 1.2,
+    "energy": 0.25,
+    "pause": 0.92,
+    "temp": 0.03
+   }
+  },
+  {
+   "id": "social",
+   "label": "SOCIAL / SELF-CONSCIOUS",
+   "weight": 1.0,
+   "valence": -0.15,
+   "arousal": 0.5,
+   "dims": {
+    "nervousness": 0.7,
+    "amusement": 0.1
+   },
+   "modifiers": {},
+   "after_lean": {
+    "-1": 1.3
+   },
+   "items": [
+    {
+     "id": "social.embarrassment",
+     "label": "embarrassment",
+     "text": "{name} processes this as {feeling}: play it to SAVE FACE - hedged, self-aware words, a small qualifier or two, and a soft, unresolved end.",
+     "weight": 1.0
+    },
+    {
+     "id": "social.awkwardness",
+     "label": "awkwardness",
+     "emoji": "😅",
+     "text": "{name} processes this as {feeling}: play it to SAVE FACE - hedged, self-aware words, a small qualifier or two, and a soft, unresolved end.",
+     "voice": {
+      "tempo": 0.92,
+      "pitch": 0.8,
+      "range": 0.95,
+      "energy": -0.1,
+      "pause": 1.2,
+      "temp": 0.02
+     },
+     "weight": 1.0
+    },
+    {
+     "id": "social.shame",
+     "label": "shame",
+     "emoji": "🙈",
+     "text": "{name} processes this as {feeling}: play it to SAVE FACE - hedged, self-aware words, a small qualifier or two, and a soft, unresolved end.",
+     "voice": {
+      "tempo": 0.9,
+      "pitch": -0.8,
+      "range": 0.75,
+      "energy": -0.4,
+      "pause": 1.25
+     },
+     "weight": 1.0
+    },
+    {
+     "id": "social.guilt",
+     "label": "guilt",
+     "emoji": "😓",
+     "text": "{name} processes this as {feeling}: play it to SAVE FACE - hedged, self-aware words, a small qualifier or two, and a soft, unresolved end.",
+     "voice": {
+      "tempo": 0.92,
+      "pitch": -0.8,
+      "range": 0.8,
+      "energy": -0.3,
+      "pause": 1.2
+     },
+     "weight": 1.0
+    },
+    {
+     "id": "social.pride",
+     "label": "pride",
+     "arousal": 0.6,
+     "valence": 0.5,
+     "emoji": "😎",
+     "text": "{name} processes this as {feeling}: play it to SAVE FACE - hedged, self-aware words, a small qualifier or two, and a soft, unresolved end.",
+     "voice": {
+      "tempo": 1.08,
+      "pitch": -0.8,
+      "range": 1.15,
+      "energy": 0.0,
+      "pause": 1.05,
+      "temp": 0.01
+     },
+     "weight": 1.0
+    },
+    {
+     "id": "social.admiration",
+     "label": "admiration",
+     "valence": 0.6,
+     "emoji": "😍",
+     "text": "{name} processes this as {feeling}: play it to SAVE FACE - hedged, self-aware words, a small qualifier or two, and a soft, unresolved end.",
+     "voice": {
+      "tempo": 1.0,
+      "pitch": 0.8,
+      "range": 1.2,
+      "energy": 0.15,
+      "pause": 1.0,
+      "temp": 0.02
+     },
+     "weight": 1.0
+    },
+    {
+     "id": "social.envy",
+     "label": "envy",
+     "emoji": "💚",
+     "text": "{name} processes this as {feeling}: play it to SAVE FACE - hedged, self-aware words, a small qualifier or two, and a soft, unresolved end.",
+     "voice": {
+      "pitch": -0.8,
+      "range": 1.0,
+      "energy": 0.1,
+      "pause": 1.1
+     },
+     "weight": 1.0
+    },
+    {
+     "id": "social.jealousy",
+     "label": "jealousy",
+     "emoji": "😾",
+     "text": "{name} processes this as {feeling}: play it to SAVE FACE - hedged, self-aware words, a small qualifier or two, and a soft, unresolved end.",
+     "voice": {
+      "tempo": 1.08,
+      "pitch": 0.8,
+      "range": 1.1,
+      "energy": 0.25,
+      "pause": 1.0,
+      "temp": 0.02
+     },
+     "weight": 1.0
+    },
+    {
+     "id": "social.defensiveness",
+     "label": "defensiveness",
+     "arousal": 0.65,
+     "emoji": "🛡️",
+     "text": "{name} processes this as {feeling}: play it to SAVE FACE - hedged, self-aware words, a small qualifier or two, and a soft, unresolved end.",
+     "voice": {
+      "tempo": 1.08,
+      "pitch": 0.8,
+      "range": 1.15,
+      "energy": 0.4,
+      "pause": 0.88,
+      "temp": 0.03
+     },
+     "weight": 1.0
+    }
+   ],
+   "emoji": "😳",
+   "voice": {
+    "tempo": 0.92,
+    "pitch": -0.8,
+    "range": 0.9,
+    "energy": -0.25,
+    "pause": 1.15,
+    "temp": 0.0
+   }
+  },
+  {
+   "id": "low_arousal",
+   "label": "LOW-AROUSAL / DETACHED",
+   "weight": 1.0,
+   "valence": 0.0,
+   "arousal": 0.15,
+   "dims": {
+    "fatigue": 0.85
+   },
+   "modifiers": {
+    "energy": -1.2,
+    "closure_pressure": 0.8
+   },
+   "after_lean": {
+    "1": 1.2
+   },
+   "items": [
+    {
+     "id": "low_arousal.indifference",
+     "label": "indifference",
+     "emoji": "😑",
+     "text": "{name} processes this as {feeling}: play it to SHRUG IT OFF - few, flat, unhurried words, nothing exclaimed, and let every end sink to the floor.",
+     "voice": {
+      "tempo": 0.92,
+      "pitch": -0.6,
+      "energy": -0.45,
+      "pause": 1.2
+     },
+     "weight": 1.0
+    },
+    {
+     "id": "low_arousal.boredom",
+     "label": "boredom",
+     "emoji": "🥱",
+     "text": "{name} processes this as {feeling}: play it to ENDURE - as few words as will do, drawn out and flat, and a steady fall to the floor at the end.",
+     "voice": {
+      "range": 0.6
+     },
+     "weight": 1.0
+    },
+    {
+     "id": "low_arousal.apathy",
+     "label": "apathy",
+     "emoji": "😶",
+     "text": "{name} processes this as {feeling}: play it to SHRUG IT OFF - few, flat, unhurried words, nothing exclaimed, and let every end sink to the floor.",
+     "voice": {
+      "pitch": -1.0,
+      "range": 0.6,
+      "energy": -0.6
+     },
+     "weight": 1.0
+    },
+    {
+     "id": "low_arousal.resignation",
+     "label": "resignation",
+     "emoji": "😮‍💨",
+     "text": "{name} processes this as {feeling}: play it to SHRUG IT OFF - few, flat, unhurried words, nothing exclaimed, and let every end sink to the floor.",
+     "voice": {
+      "tempo": 0.9,
+      "range": 0.7,
+      "energy": -0.45,
+      "pause": 1.3
+     },
+     "weight": 1.0
+    },
+    {
+     "id": "low_arousal.exhaustion",
+     "label": "exhaustion",
+     "arousal": 0.1,
+     "emoji": "😫",
+     "text": "{name} processes this as {feeling}: play it to SHRUG IT OFF - few, flat, unhurried words, nothing exclaimed, and let every end sink to the floor.",
+     "voice": {
+      "tempo": 0.85,
+      "pitch": -1.0,
+      "energy": -0.65,
+      "pause": 1.45,
+      "temp": -0.08
+     },
+     "weight": 1.0
+    },
+    {
+     "id": "low_arousal.calm",
+     "label": "calm",
+     "arousal": 0.08,
+     "valence": 0.3,
+     "emoji": "🧘",
+     "text": "{name} processes this as {feeling}: play it to SOOTHE - slow, soft, even words, no contrast between them, and a gentle downward end.",
+     "voice": {
+      "tempo": 0.94,
+      "pitch": -0.4,
+      "range": 0.85,
+      "energy": -0.3,
+      "pause": 1.15,
+      "temp": -0.05
+     },
+     "weight": 1.0
+    },
+    {
+     "id": "low_arousal.acceptance",
+     "label": "acceptance",
+     "valence": 0.3,
+     "emoji": "🙂",
+     "text": "{name} processes this as {feeling}: play it to SHRUG IT OFF - few, flat, unhurried words, nothing exclaimed, and let every end sink to the floor.",
+     "voice": {
+      "tempo": 0.95,
+      "pitch": -0.2,
+      "range": 0.9,
+      "energy": -0.2,
+      "pause": 1.1,
+      "temp": -0.03
+     },
+     "weight": 1.0
+    }
+   ],
+   "emoji": "😐",
+   "voice": {
+    "tempo": 0.87,
+    "pitch": -1.0,
+    "range": 0.65,
+    "energy": -0.55,
+    "pause": 1.35,
+    "temp": -0.07
+   }
+  }
+ ]
+}

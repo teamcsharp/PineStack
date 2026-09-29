@@ -1,0 +1,2158 @@
+{
+ "id": "ES1",
+ "family": "ES",
+ "label": "Emotional Set 1",
+ "version": 2,
+ "enabled": true,
+ "weight": 1.0,
+ "description": "The emotion each turn is spoken in: guides the wording (DIRECTION FOR THIS LINE: act, first words, lexicon, what they want) and the voice. v3: played over the top.",
+ "categories": [
+  {
+   "id": "surprise",
+   "label": "SURPRISE",
+   "weight": 1.0,
+   "valence": 0.15,
+   "arousal": 0.75,
+   "dims": {
+    "excitement": 0.7,
+    "confusion": 0.35
+   },
+   "modifiers": {
+    "tension": 0.2
+   },
+   "after_lean": {
+    "-1": 1.1,
+    "0": 1.1
+   },
+   "items": [
+    {
+     "id": "surprise.surprise",
+     "label": "surprise",
+     "text": "{name} processes this as {feeling}: REACT out loud - it hits them mid-breath: a blurted exclamation first, then quick short fragments, questions stacked on questions, the news-word hit in CAPS.",
+     "weight": 1.0
+    },
+    {
+     "id": "surprise.shock",
+     "label": "shock",
+     "arousal": 0.9,
+     "emoji": "⚡",
+     "text": "{name} processes this as {feeling}: REEL - stopped dead: 'What?!' first, a broken restart, the key word repeated in CAPS.",
+     "voice": {
+      "tempo": 1.112,
+      "pitch": 2.0,
+      "range": 1.5,
+      "energy": 0.63,
+      "pause": 0.72
+     },
+     "weight": 1.0,
+     "acting": {
+      "act": "REEL - stopped dead: 'What?!' first, a broken restart, the key word repeated in CAPS",
+      "blurts": [
+       "WHAT?!",
+       "Excuse me?!",
+       "Say that again!"
+      ]
+     }
+    },
+    {
+     "id": "surprise.astonishment",
+     "label": "astonishment",
+     "emoji": "😲",
+     "text": "{name} processes this as {feeling}: REACT out loud - it hits them mid-breath: a blurted exclamation first, then quick short fragments, questions stacked on questions, the news-word hit in CAPS.",
+     "voice": {
+      "pitch": 2.0,
+      "range": 1.5
+     },
+     "weight": 1.0,
+     "acting": {
+      "blurts": [
+       "Oh my God!",
+       "Are you serious?!",
+       "Unbelievable!"
+      ],
+      "says": [
+       "incredible",
+       "unreal",
+       "insane",
+       "never in my life"
+      ]
+     }
+    },
+    {
+     "id": "surprise.amazement",
+     "label": "amazement",
+     "valence": 0.4,
+     "emoji": "🤯",
+     "text": "{name} processes this as {feeling}: REACT out loud - it hits them mid-breath: a blurted exclamation first, then quick short fragments, questions stacked on questions, the news-word hit in CAPS.",
+     "voice": {
+      "pitch": 1.96,
+      "energy": 0.49
+     },
+     "weight": 1.0,
+     "acting": {
+      "blurts": [
+       "Oh my God!",
+       "That's INSANE!",
+       "Get out of here!"
+      ],
+      "says": [
+       "incredible",
+       "unreal",
+       "insane",
+       "never in my life"
+      ]
+     }
+    },
+    {
+     "id": "surprise.disbelief",
+     "label": "disbelief",
+     "emoji": "⁉️",
+     "text": "{name} processes this as {feeling}: REFUSE TO BUY IT - scoffing, their claim repeated back as a mocking question, 'come ON' energy.",
+     "voice": {
+      "tempo": 0.972,
+      "pitch": 1.4,
+      "pause": 1.07
+     },
+     "weight": 1.0,
+     "acting": {
+      "act": "REFUSE TO BUY IT - scoffing, their claim repeated back as a mocking question, 'come ON' energy",
+      "blurts": [
+       "Oh, come ON.",
+       "You cannot be serious!",
+       "Get out of here!"
+      ],
+      "wants": "to make them admit they made it up"
+     }
+    },
+    {
+     "id": "surprise.bewilderment",
+     "label": "bewilderment",
+     "emoji": "😵‍💫",
+     "text": "{name} processes this as {feeling}: FLOUNDER - lost and loud about it: half-sentences that restart, questions that go nowhere, 'what does that even MEAN'.",
+     "voice": {
+      "tempo": 0.93,
+      "pitch": 0.84,
+      "range": 1.28,
+      "energy": 0.07,
+      "pause": 1.21
+     },
+     "weight": 1.0,
+     "acting": {
+      "act": "FLOUNDER - lost and loud about it: half-sentences that restart, questions that go nowhere, 'what does that even MEAN'",
+      "blurts": [
+       "I'm sorry, what?",
+       "Hang on, I'm lost!",
+       "What does that even MEAN?"
+      ],
+      "wants": "for somebody, anybody, to make it make sense"
+     }
+    },
+    {
+     "id": "surprise.confusion",
+     "label": "confusion",
+     "emoji": "😕",
+     "text": "{name} processes this as {feeling}: FLOUNDER - lost and loud about it: half-sentences that restart, questions that go nowhere, 'what does that even MEAN'.",
+     "voice": {
+      "tempo": 0.916,
+      "pitch": 0.56,
+      "range": 1.21,
+      "energy": 0.0,
+      "pause": 1.28,
+      "temp": 0.028
+     },
+     "weight": 1.0,
+     "acting": {
+      "act": "FLOUNDER - lost and loud about it: half-sentences that restart, questions that go nowhere, 'what does that even MEAN'",
+      "blurts": [
+       "I'm sorry, what?",
+       "Hang on, I'm lost!",
+       "What does that even MEAN?"
+      ],
+      "wants": "for somebody, anybody, to make it make sense"
+     }
+    },
+    {
+     "id": "surprise.curiosity",
+     "label": "curiosity",
+     "arousal": 0.45,
+     "valence": 0.4,
+     "emoji": "🧐",
+     "text": "{name} processes this as {feeling}: LEAN IN - hungry: rapid-fire questions, 'tell me more' energy, one word in CAPS.",
+     "voice": {
+      "tempo": 1.0,
+      "pitch": 0.84,
+      "range": 1.28,
+      "energy": 0.14,
+      "pause": 0.93,
+      "temp": 0.042
+     },
+     "weight": 1.0,
+     "acting": {
+      "act": "LEAN IN - hungry: rapid-fire questions, 'tell me more' energy, one word in CAPS",
+      "blurts": [
+       "Oh, wait!",
+       "Hold on, tell me more!",
+       "Okay, now I NEED to know!"
+      ],
+      "wants": "to pry the juicy detail out of them",
+      "says": [
+       "tell me more",
+       "wait, what",
+       "how",
+       "and then what"
+      ]
+     }
+    },
+    {
+     "id": "surprise.intrigue",
+     "label": "intrigue",
+     "arousal": 0.45,
+     "emoji": "👀",
+     "text": "{name} processes this as {feeling}: LEAN IN - hungry: rapid-fire questions, 'tell me more' energy, one word in CAPS.",
+     "voice": {
+      "tempo": 0.972,
+      "pitch": 0.56,
+      "range": 1.21,
+      "energy": 0.07,
+      "pause": 1.0,
+      "temp": 0.028
+     },
+     "weight": 1.0,
+     "acting": {
+      "act": "LEAN IN - hungry: rapid-fire questions, 'tell me more' energy, one word in CAPS",
+      "blurts": [
+       "Oh, wait!",
+       "Hold on, tell me more!",
+       "Okay, now I NEED to know!"
+      ],
+      "wants": "to pry the juicy detail out of them",
+      "says": [
+       "tell me more",
+       "wait, what",
+       "how",
+       "and then what"
+      ]
+     }
+    }
+   ],
+   "emoji": "😮",
+   "voice": {
+    "tempo": 1.07,
+    "pitch": 2.0,
+    "range": 1.5,
+    "energy": 0.42,
+    "pause": 0.79,
+    "temp": 0.084
+   },
+   "acting": {
+    "act": "REACT out loud - it hits them mid-breath: a blurted exclamation first, then quick short fragments, questions stacked on questions, the news-word hit in CAPS",
+    "blurts": [
+     "Wait, WHAT?",
+     "No way!",
+     "Hold on, hold on!",
+     "You're kidding me!"
+    ],
+    "says": [
+     "seriously",
+     "since when",
+     "hold on",
+     "no way",
+     "are you telling me"
+    ],
+    "wants": "to hear it again and drag the whole story out of them, right now"
+   }
+  },
+  {
+   "id": "anger",
+   "label": "ANGER",
+   "weight": 1.0,
+   "valence": -0.7,
+   "arousal": 0.85,
+   "dims": {
+    "irritation": 0.95,
+    "excitement": 0.3
+   },
+   "modifiers": {
+    "tension": 1.4,
+    "agreement": -1.2
+   },
+   "after_lean": {
+    "-1": 1.5,
+    "1": 0.7
+   },
+   "items": [
+    {
+     "id": "anger.annoyance",
+     "label": "annoyance",
+     "arousal": 0.45,
+     "emoji": "🙄",
+     "text": "{name} processes this as {feeling}: SNAP - clipped, testy, exasperated: one sharp jab and an eye-roll you can hear.",
+     "voice": {
+      "tempo": 1.028,
+      "pitch": 0.28,
+      "range": 1.14,
+      "energy": 0.35,
+      "pause": 0.93,
+      "temp": 0.028
+     },
+     "weight": 1.0,
+     "acting": {
+      "act": "SNAP - clipped, testy, exasperated: one sharp jab and an eye-roll you can hear",
+      "blurts": [
+       "Oh, for crying out loud!",
+       "Seriously?!",
+       "Here we go again!"
+      ],
+      "wants": "to shut this down so it stops getting on their nerves",
+      "says": [
+       "seriously",
+       "for crying out loud",
+       "again",
+       "enough"
+      ]
+     }
+    },
+    {
+     "id": "anger.irritation",
+     "label": "irritation",
+     "arousal": 0.55,
+     "emoji": "💢",
+     "text": "{name} processes this as {feeling}: SNAP - clipped, testy, exasperated: one sharp jab and an eye-roll you can hear.",
+     "voice": {
+      "tempo": 1.056,
+      "pitch": 0.42,
+      "range": 1.21,
+      "energy": 0.49,
+      "pause": 0.86
+     },
+     "weight": 1.0,
+     "acting": {
+      "act": "SNAP - clipped, testy, exasperated: one sharp jab and an eye-roll you can hear",
+      "blurts": [
+       "Oh, for crying out loud!",
+       "Seriously?!",
+       "Here we go again!"
+      ],
+      "wants": "to shut this down so it stops getting on their nerves",
+      "says": [
+       "seriously",
+       "for crying out loud",
+       "again",
+       "enough"
+      ]
+     }
+    },
+    {
+     "id": "anger.frustration",
+     "label": "frustration",
+     "emoji": "😖",
+     "text": "{name} processes this as {feeling}: VENT - exasperated: the same point hammered twice, 'how many TIMES' energy.",
+     "voice": {
+      "tempo": 1.056,
+      "pitch": 0.7,
+      "range": 1.28,
+      "energy": 0.56,
+      "pause": 0.888
+     },
+     "weight": 1.0,
+     "acting": {
+      "act": "VENT - exasperated: the same point hammered twice, 'how many TIMES' energy",
+      "blurts": [
+       "How many TIMES?!",
+       "I swear to God!",
+       "Unbelievable!"
+      ]
+     }
+    },
+    {
+     "id": "anger.indignation",
+     "label": "indignation",
+     "emoji": "😤",
+     "text": "{name} processes this as {feeling}: TAKE OFFENCE - personally insulted: 'excuse me?!', demanding respect.",
+     "voice": {
+      "range": 1.42,
+      "energy": 0.7
+     },
+     "weight": 1.0,
+     "acting": {
+      "act": "TAKE OFFENCE - personally insulted: 'excuse me?!', demanding respect",
+      "blurts": [
+       "Excuse me?!",
+       "How DARE you!",
+       "Oh, I don't think so!"
+      ],
+      "wants": "an apology, out loud, on air"
+     }
+    },
+    {
+     "id": "anger.anger",
+     "label": "anger",
+     "text": "{name} processes this as {feeling}: BLOW UP at them - hot, short, slammed sentences, the offending word thrown back in CAPS, at least one '!', swearing at the situation is fine, and never cooling down inside the line.",
+     "weight": 1.0
+    },
+    {
+     "id": "anger.outrage",
+     "label": "outrage",
+     "arousal": 0.92,
+     "emoji": "🤬",
+     "text": "{name} processes this as {feeling}: EXPLODE - full-volume rage on the page: short slammed sentences, CAPS on the worst word, several '!', swearing at the situation, the offending word thrown back at them.",
+     "voice": {
+      "tempo": 1.14,
+      "pitch": 1.68,
+      "range": 1.5,
+      "energy": 0.8,
+      "pause": 0.7,
+      "temp": 0.084
+     },
+     "weight": 1.0,
+     "acting": {
+      "act": "EXPLODE - full-volume rage on the page: short slammed sentences, CAPS on the worst word, several '!', swearing at the situation, the offending word thrown back at them",
+      "blurts": [
+       "Are you out of your MIND?!",
+       "Oh, HELL no!",
+       "That is it, I'm DONE!"
+      ],
+      "says": [
+       "disgrace",
+       "insane",
+       "outrageous",
+       "unacceptable"
+      ],
+      "wants": "to put them in their place so hard the room goes quiet"
+     }
+    },
+    {
+     "id": "anger.fury",
+     "label": "fury",
+     "arousal": 0.98,
+     "emoji": "😡",
+     "text": "{name} processes this as {feeling}: EXPLODE - full-volume rage on the page: short slammed sentences, CAPS on the worst word, several '!', swearing at the situation, the offending word thrown back at them.",
+     "voice": {
+      "tempo": 1.15,
+      "pitch": 1.96,
+      "range": 1.5,
+      "energy": 0.8,
+      "pause": 0.7,
+      "temp": 0.098
+     },
+     "weight": 1.0,
+     "acting": {
+      "act": "EXPLODE - full-volume rage on the page: short slammed sentences, CAPS on the worst word, several '!', swearing at the situation, the offending word thrown back at them",
+      "blurts": [
+       "Are you out of your MIND?!",
+       "Oh, HELL no!",
+       "That is it, I'm DONE!"
+      ],
+      "says": [
+       "disgrace",
+       "insane",
+       "outrageous",
+       "unacceptable"
+      ],
+      "wants": "to put them in their place so hard the room goes quiet"
+     }
+    },
+    {
+     "id": "anger.resentment",
+     "label": "resentment",
+     "arousal": 0.55,
+     "emoji": "😒",
+     "text": "{name} processes this as {feeling}: SEETHE - bitter and needling: every word a dig, old grievances dragged back in.",
+     "voice": {
+      "tempo": 1.0,
+      "pitch": -0.28,
+      "range": 1.21,
+      "energy": 0.42,
+      "pause": 1.0,
+      "temp": 0.0
+     },
+     "weight": 1.0,
+     "acting": {
+      "act": "SEETHE - bitter and needling: every word a dig, old grievances dragged back in",
+      "blurts": [
+       "Oh, sure. Of COURSE.",
+       "Typical!",
+       "Here it comes!"
+      ],
+      "wants": "to make them feel every slight they have ever dealt out",
+      "says": [
+       "typical",
+       "of course",
+       "as usual",
+       "again"
+      ]
+     }
+    },
+    {
+     "id": "anger.contempt",
+     "label": "contempt",
+     "arousal": 0.6,
+     "emoji": "😏",
+     "text": "{name} processes this as {feeling}: SNEER - icy superiority: cutting sarcasm, a mock-polite 'oh, how cute' before the knife.",
+     "voice": {
+      "tempo": 0.93,
+      "pitch": -1.68,
+      "range": 1.14,
+      "energy": -0.28,
+      "pause": 1.14,
+      "temp": 0.0
+     },
+     "weight": 1.0,
+     "acting": {
+      "act": "SNEER - icy superiority: cutting sarcasm, a mock-polite 'oh, how cute' before the knife",
+      "blurts": [
+       "Oh, how adorable.",
+       "Wow. Just wow.",
+       "Please."
+      ],
+      "wants": "to make them feel small",
+      "says": [
+       "how cute",
+       "adorable",
+       "please",
+       "bless"
+      ]
+     }
+    },
+    {
+     "id": "anger.disgust",
+     "label": "disgust",
+     "emoji": "🤢",
+     "text": "{name} processes this as {feeling}: BLOW UP at them - hot, short, slammed sentences, the offending word thrown back in CAPS, at least one '!', swearing at the situation is fine, and never cooling down inside the line.",
+     "voice": {
+      "tempo": 0.93,
+      "pitch": -0.7,
+      "range": 1.21,
+      "energy": 0.14,
+      "pause": 1.07
+     },
+     "weight": 1.0
+    }
+   ],
+   "emoji": "😠",
+   "voice": {
+    "tempo": 1.14,
+    "pitch": 1.4,
+    "range": 1.49,
+    "energy": 0.8,
+    "pause": 0.7,
+    "temp": 0.07
+   },
+   "acting": {
+    "act": "BLOW UP at them - hot, short, slammed sentences, the offending word thrown back in CAPS, at least one '!', swearing at the situation is fine, and never cooling down inside the line",
+    "blurts": [
+     "Oh, come ON!",
+     "Are you KIDDING me?!",
+     "No. No, no, no!",
+     "Enough!"
+    ],
+    "says": [
+     "ridiculous",
+     "unbelievable",
+     "garbage",
+     "how dare",
+     "I am done"
+    ],
+    "wants": "to make them back down and admit they are wrong, on air, right now"
+   }
+  },
+  {
+   "id": "fear",
+   "label": "FEAR",
+   "weight": 1.0,
+   "valence": -0.6,
+   "arousal": 0.7,
+   "dims": {
+    "nervousness": 0.95,
+    "confusion": 0.2
+   },
+   "modifiers": {
+    "tension": 0.6
+   },
+   "after_lean": {},
+   "items": [
+    {
+     "id": "fear.unease",
+     "label": "unease",
+     "arousal": 0.4,
+     "emoji": "😟",
+     "text": "{name} processes this as {feeling}: SWEAT IT - nervous and jittery: second-guessing out loud, 'okay, but what if', a nervous laugh in the words.",
+     "voice": {
+      "tempo": 1.028,
+      "pitch": -0.28,
+      "range": 0.79,
+      "energy": -0.14,
+      "pause": 1.14,
+      "temp": 0.028
+     },
+     "weight": 1.0,
+     "acting": {
+      "act": "SWEAT IT - nervous and jittery: second-guessing out loud, 'okay, but what if', a nervous laugh in the words",
+      "blurts": [
+       "Okay, that's... that's not great.",
+       "Guys? Guys.",
+       "I do NOT like this."
+      ],
+      "wants": "to be told it is going to be fine",
+      "says": [
+       "what if",
+       "I don't like this",
+       "okay, but",
+       "guys"
+      ]
+     }
+    },
+    {
+     "id": "fear.apprehension",
+     "label": "apprehension",
+     "arousal": 0.5,
+     "emoji": "😬",
+     "text": "{name} processes this as {feeling}: SWEAT IT - nervous and jittery: second-guessing out loud, 'okay, but what if', a nervous laugh in the words.",
+     "voice": {
+      "tempo": 1.056,
+      "pitch": -0.28,
+      "range": 0.79,
+      "energy": 0.0,
+      "pause": 1.07
+     },
+     "weight": 1.0,
+     "acting": {
+      "act": "SWEAT IT - nervous and jittery: second-guessing out loud, 'okay, but what if', a nervous laugh in the words",
+      "blurts": [
+       "Okay, that's... that's not great.",
+       "Guys? Guys.",
+       "I do NOT like this."
+      ],
+      "wants": "to be told it is going to be fine",
+      "says": [
+       "what if",
+       "I don't like this",
+       "okay, but",
+       "guys"
+      ]
+     }
+    },
+    {
+     "id": "fear.anxiety",
+     "label": "anxiety",
+     "emoji": "😰",
+     "text": "{name} processes this as {feeling}: SWEAT IT - nervous and jittery: second-guessing out loud, 'okay, but what if', a nervous laugh in the words.",
+     "voice": {
+      "tempo": 1.056,
+      "pitch": -0.84,
+      "range": 0.6,
+      "energy": -0.35,
+      "pause": 1.21,
+      "temp": 0.0
+     },
+     "weight": 1.0,
+     "acting": {
+      "act": "SWEAT IT - nervous and jittery: second-guessing out loud, 'okay, but what if', a nervous laugh in the words",
+      "blurts": [
+       "Okay, that's... that's not great.",
+       "Guys? Guys.",
+       "I do NOT like this."
+      ],
+      "wants": "to be told it is going to be fine",
+      "says": [
+       "what if",
+       "I don't like this",
+       "okay, but",
+       "guys"
+      ]
+     }
+    },
+    {
+     "id": "fear.alarm",
+     "label": "alarm",
+     "emoji": "🚨",
+     "text": "{name} processes this as {feeling}: RAISE THE ALARM - screaming on the page: rapid broken fragments, CAPS, '!' after every bit, begging for action.",
+     "voice": {
+      "tempo": 1.14,
+      "pitch": 1.96,
+      "range": 0.93,
+      "energy": 0.56,
+      "pause": 1.07
+     },
+     "weight": 1.0,
+     "acting": {
+      "act": "RAISE THE ALARM - screaming on the page: rapid broken fragments, CAPS, '!' after every bit, begging for action",
+      "blurts": [
+       "Oh my GOD!",
+       "Somebody DO something!",
+       "No, no, NO!"
+      ]
+     }
+    },
+    {
+     "id": "fear.fear",
+     "label": "fear",
+     "text": "{name} processes this as {feeling}: PANIC ON THE PAGE - breathless fragments, questions tumbling out, '?!' together, the scary word said twice, begging somebody to do something.",
+     "weight": 1.0
+    },
+    {
+     "id": "fear.dread",
+     "label": "dread",
+     "emoji": "😧",
+     "text": "{name} processes this as {feeling}: DOOM - grim, heavy certainty it is all about to go wrong, 'this is how it ends' energy.",
+     "voice": {
+      "tempo": 0.972,
+      "pitch": -0.56,
+      "range": 0.6,
+      "energy": -0.28,
+      "pause": 1.35,
+      "temp": -0.028
+     },
+     "weight": 1.0,
+     "acting": {
+      "act": "DOOM - grim, heavy certainty it is all about to go wrong, 'this is how it ends' energy",
+      "blurts": [
+       "Oh, this is bad.",
+       "We're finished.",
+       "I KNEW it."
+      ],
+      "says": [
+       "doomed",
+       "this is it",
+       "I knew it",
+       "we're finished"
+      ]
+     }
+    },
+    {
+     "id": "fear.panic",
+     "label": "panic",
+     "arousal": 0.97,
+     "emoji": "😱",
+     "text": "{name} processes this as {feeling}: RAISE THE ALARM - screaming on the page: rapid broken fragments, CAPS, '!' after every bit, begging for action.",
+     "voice": {
+      "tempo": 1.15,
+      "pitch": 2.0,
+      "range": 0.93,
+      "energy": 0.7,
+      "pause": 1.14,
+      "temp": 0.098
+     },
+     "weight": 1.0,
+     "acting": {
+      "act": "RAISE THE ALARM - screaming on the page: rapid broken fragments, CAPS, '!' after every bit, begging for action",
+      "blurts": [
+       "Oh my GOD!",
+       "Somebody DO something!",
+       "No, no, NO!"
+      ]
+     }
+    },
+    {
+     "id": "fear.horror",
+     "label": "horror",
+     "arousal": 0.92,
+     "emoji": "💀",
+     "text": "{name} processes this as {feeling}: RECOIL IN HORROR - appalled and scared at once: 'that is the worst thing I have ever heard', graphic words.",
+     "voice": {
+      "tempo": 1.056,
+      "pitch": 1.68,
+      "range": 1.0,
+      "energy": 0.49,
+      "pause": 1.14
+     },
+     "weight": 1.0,
+     "acting": {
+      "act": "RECOIL IN HORROR - appalled and scared at once: 'that is the worst thing I have ever heard', graphic words",
+      "blurts": [
+       "Oh God, NO!",
+       "That's horrifying!",
+       "Stop, stop, STOP!"
+      ]
+     }
+    }
+   ],
+   "emoji": "😨",
+   "voice": {
+    "tempo": 1.14,
+    "pitch": 1.68,
+    "range": 0.86,
+    "energy": 0.35,
+    "pause": 1.112,
+    "temp": 0.07
+   },
+   "acting": {
+    "act": "PANIC ON THE PAGE - breathless fragments, questions tumbling out, '?!' together, the scary word said twice, begging somebody to do something",
+    "blurts": [
+     "Oh no. Oh no, no, no!",
+     "Wait, wait, WAIT!",
+     "Are you hearing this?!"
+    ],
+    "says": [
+     "what if",
+     "we have to",
+     "this is bad",
+     "right now",
+     "I am not okay"
+    ],
+    "wants": "for somebody to take this seriously and fix it before it is too late"
+   }
+  },
+  {
+   "id": "sadness",
+   "label": "SADNESS",
+   "weight": 1.0,
+   "valence": -0.6,
+   "arousal": 0.25,
+   "dims": {
+    "fatigue": 0.7,
+    "nervousness": 0.15
+   },
+   "modifiers": {
+    "energy": -0.8
+   },
+   "after_lean": {},
+   "items": [
+    {
+     "id": "sadness.disappointment",
+     "label": "disappointment",
+     "emoji": "😞",
+     "text": "{name} processes this as {feeling}: DEFLATE - the air goes right out of them: 'wow... okay', letdown words, a bitter little laugh.",
+     "voice": {
+      "tempo": 0.888,
+      "pitch": -0.84,
+      "range": 0.72,
+      "energy": -0.42,
+      "pause": 1.28
+     },
+     "weight": 1.0,
+     "acting": {
+      "act": "DEFLATE - the air goes right out of them: 'wow... okay', letdown words, a bitter little laugh",
+      "blurts": [
+       "Wow. Okay.",
+       "Great. Just great.",
+       "I really thought..."
+      ],
+      "says": [
+       "great, just great",
+       "figures",
+       "of course",
+       "I really thought"
+      ]
+     }
+    },
+    {
+     "id": "sadness.discouragement",
+     "label": "discouragement",
+     "emoji": "😔",
+     "text": "{name} processes this as {feeling}: DEFLATE - the air goes right out of them: 'wow... okay', letdown words, a bitter little laugh.",
+     "voice": {
+      "tempo": 0.86,
+      "pitch": -1.12,
+      "range": 0.65,
+      "energy": -0.56,
+      "pause": 1.35
+     },
+     "weight": 1.0,
+     "acting": {
+      "act": "DEFLATE - the air goes right out of them: 'wow... okay', letdown words, a bitter little laugh",
+      "blurts": [
+       "Wow. Okay.",
+       "Great. Just great.",
+       "I really thought..."
+      ],
+      "says": [
+       "great, just great",
+       "figures",
+       "what's the use",
+       "I really thought"
+      ]
+     }
+    },
+    {
+     "id": "sadness.sadness",
+     "label": "sadness",
+     "text": "{name} processes this as {feeling}: BREAK DOWN - openly heartbroken: short trembling fragments, a sentence that trails off and starts again, the sad word said twice, nothing hidden.",
+     "weight": 1.0
+    },
+    {
+     "id": "sadness.grief",
+     "label": "grief",
+     "arousal": 0.35,
+     "emoji": "😭",
+     "text": "{name} processes this as {feeling}: GRIEVE OUT LOUD - raw and halting: the loss named plainly, the words breaking.",
+     "voice": {
+      "tempo": 0.85,
+      "pitch": -0.84,
+      "range": 0.79,
+      "energy": -0.56,
+      "pause": 1.5,
+      "temp": 0.028
+     },
+     "weight": 1.0,
+     "acting": {
+      "act": "GRIEVE OUT LOUD - raw and halting: the loss named plainly, the words breaking",
+      "blurts": [
+       "I can't... I can't do this.",
+       "Oh God.",
+       "It's gone. It's just gone."
+      ],
+      "says": [
+       "gone",
+       "I can't",
+       "it hurts",
+       "never again"
+      ]
+     }
+    },
+    {
+     "id": "sadness.despair",
+     "label": "despair",
+     "arousal": 0.3,
+     "emoji": "😩",
+     "text": "{name} processes this as {feeling}: PLEAD WITH THE UNIVERSE - hopeless: 'what is the POINT', the same question asked twice, reaching for anybody.",
+     "voice": {
+      "tempo": 0.86,
+      "pitch": 1.4,
+      "range": 0.72,
+      "energy": 0.49,
+      "pause": 1.42,
+      "temp": 0.042
+     },
+     "weight": 1.0,
+     "acting": {
+      "act": "PLEAD WITH THE UNIVERSE - hopeless: 'what is the POINT', the same question asked twice, reaching for anybody",
+      "blurts": [
+       "What's the POINT?",
+       "Why does this keep happening?!",
+       "I give up!"
+      ],
+      "says": [
+       "what's the point",
+       "why",
+       "I give up",
+       "nothing works"
+      ]
+     }
+    },
+    {
+     "id": "sadness.melancholy",
+     "label": "melancholy",
+     "emoji": "🥀",
+     "text": "{name} processes this as {feeling}: ACHE - wistful, a long look back, 'remember when' words, a sigh in the sentence.",
+     "voice": {
+      "pitch": -1.12,
+      "energy": -0.63
+     },
+     "weight": 1.0,
+     "acting": {
+      "act": "ACHE - wistful, a long look back, 'remember when' words, a sigh in the sentence",
+      "blurts": [
+       "Remember when...",
+       "God, I miss that.",
+       "It was never going to last."
+      ],
+      "says": [
+       "remember when",
+       "back then",
+       "I miss it",
+       "gone"
+      ]
+     }
+    },
+    {
+     "id": "sadness.sympathy",
+     "label": "sympathy",
+     "valence": 0.1,
+     "emoji": "🫂",
+     "text": "{name} processes this as {feeling}: POUR IT OUT - gushing sympathy: 'oh, you poor thing', over-the-top tenderness.",
+     "voice": {
+      "tempo": 0.916,
+      "pitch": -0.42,
+      "range": 0.86,
+      "energy": -0.42,
+      "pause": 1.21,
+      "temp": -0.028
+     },
+     "weight": 1.0,
+     "acting": {
+      "act": "POUR IT OUT - gushing sympathy: 'oh, you poor thing', over-the-top tenderness",
+      "blurts": [
+       "Oh, you poor thing!",
+       "Oh no, honey.",
+       "That's awful, I'm so sorry!"
+      ],
+      "wants": "to wrap them up and make it better",
+      "says": [
+       "poor thing",
+       "oh, honey",
+       "I'm so sorry",
+       "that's awful"
+      ]
+     }
+    },
+    {
+     "id": "sadness.pity",
+     "label": "pity",
+     "emoji": "🥺",
+     "text": "{name} processes this as {feeling}: POUR IT OUT - gushing, slightly condescending pity: 'oh, bless your heart'.",
+     "voice": {
+      "tempo": 0.916,
+      "pitch": -0.28,
+      "range": 0.93,
+      "energy": -0.35,
+      "pause": 1.21
+     },
+     "weight": 1.0,
+     "acting": {
+      "act": "POUR IT OUT - gushing, slightly condescending pity: 'oh, bless your heart'",
+      "blurts": [
+       "Oh, bless your heart.",
+       "Oh, you poor, poor thing.",
+       "Aw, sweetie. No."
+      ],
+      "wants": "to make it very clear how sorry they feel for them",
+      "says": [
+       "poor thing",
+       "bless your heart",
+       "oh, sweetie",
+       "how sad"
+      ]
+     }
+    }
+   ],
+   "emoji": "😢",
+   "voice": {
+    "tempo": 0.85,
+    "pitch": -1.4,
+    "range": 0.6,
+    "energy": -0.7,
+    "pause": 1.5,
+    "temp": -0.07
+   },
+   "acting": {
+    "act": "BREAK DOWN - openly heartbroken: short trembling fragments, a sentence that trails off and starts again, the sad word said twice, nothing hidden",
+    "blurts": [
+     "Oh, man...",
+     "That just... that kills me.",
+     "No... no."
+    ],
+    "says": [
+     "it hurts",
+     "I can't",
+     "gone",
+     "for nothing",
+     "why"
+    ],
+    "wants": "comfort - for somebody to tell them it was not all for nothing"
+   }
+  },
+  {
+   "id": "joy",
+   "label": "JOY",
+   "weight": 1.0,
+   "valence": 0.8,
+   "arousal": 0.65,
+   "dims": {
+    "amusement": 0.75,
+    "excitement": 0.6
+   },
+   "modifiers": {
+    "agreement": 0.9,
+    "tension": -0.8
+   },
+   "after_lean": {
+    "1": 1.4,
+    "-1": 0.7
+   },
+   "items": [
+    {
+     "id": "joy.pleasure",
+     "label": "pleasure",
+     "emoji": "😊",
+     "text": "{name} processes this as {feeling}: SAVOUR IT SHAMELESSLY - luxurious, smug contentment: 'oh, that's the stuff'.",
+     "voice": {
+      "tempo": 0.972,
+      "pitch": 0.0,
+      "range": 1.28,
+      "energy": -0.14,
+      "pause": 1.0
+     },
+     "weight": 1.0,
+     "acting": {
+      "act": "SAVOUR IT SHAMELESSLY - luxurious, smug contentment: 'oh, that's the stuff'",
+      "blurts": [
+       "Oh, that is BEAUTIFUL.",
+       "Now THAT's what I'm talking about.",
+       "Oh, yes."
+      ],
+      "says": [
+       "beautiful",
+       "that's the stuff",
+       "perfect",
+       "oh, yes"
+      ]
+     }
+    },
+    {
+     "id": "joy.happiness",
+     "label": "happiness",
+     "text": "{name} processes this as {feeling}: CELEBRATE - bursting with it: stacked exclamations, gushing superlatives, laughing words, one word in CAPS, talking over themselves with glee.",
+     "voice": {
+      "tempo": 1.0,
+      "pitch": 0.28,
+      "range": 1.35,
+      "energy": 0.07,
+      "pause": 0.972
+     },
+     "weight": 1.0
+    },
+    {
+     "id": "joy.delight",
+     "label": "delight",
+     "emoji": "😁",
+     "text": "{name} processes this as {feeling}: GO NUTS - over the moon: stacked exclamations, 'oh my God, oh my God', CAPS, rushing ahead.",
+     "voice": {
+      "pitch": 1.96,
+      "range": 1.5,
+      "energy": 0.63
+     },
+     "weight": 1.0,
+     "acting": {
+      "act": "GO NUTS - over the moon: stacked exclamations, 'oh my God, oh my God', CAPS, rushing ahead",
+      "blurts": [
+       "Oh my God, YES!",
+       "No WAY! That's incredible!",
+       "I can't even!"
+      ]
+     }
+    },
+    {
+     "id": "joy.excitement",
+     "label": "excitement",
+     "arousal": 0.85,
+     "emoji": "🎉",
+     "text": "{name} processes this as {feeling}: GO NUTS - over the moon: stacked exclamations, 'oh my God, oh my God', CAPS, rushing ahead.",
+     "voice": {
+      "tempo": 1.14,
+      "pitch": 2.0,
+      "range": 1.5,
+      "energy": 0.8,
+      "pause": 0.748,
+      "temp": 0.084
+     },
+     "weight": 1.0,
+     "acting": {
+      "act": "GO NUTS - over the moon: stacked exclamations, 'oh my God, oh my God', CAPS, rushing ahead",
+      "blurts": [
+       "Oh my God, YES!",
+       "No WAY! That's incredible!",
+       "I can't even!"
+      ]
+     }
+    },
+    {
+     "id": "joy.enthusiasm",
+     "label": "enthusiasm",
+     "arousal": 0.8,
+     "emoji": "🙌",
+     "text": "{name} processes this as {feeling}: GO NUTS - over the moon: stacked exclamations, CAPS, rushing ahead, selling it hard.",
+     "voice": {
+      "tempo": 1.112,
+      "range": 1.49,
+      "energy": 0.77,
+      "pause": 0.79
+     },
+     "weight": 1.0,
+     "acting": {
+      "act": "GO NUTS - over the moon: stacked exclamations, CAPS, rushing ahead, selling it hard",
+      "blurts": [
+       "Oh, I am SO in!",
+       "Let's GO!",
+       "That's the best idea I've ever heard!"
+      ]
+     }
+    },
+    {
+     "id": "joy.amusement",
+     "label": "amusement",
+     "emoji": "😂",
+     "text": "{name} processes this as {feeling}: CRACK UP - laughing through the line: the funny bit repeated back, can barely get the words out.",
+     "voice": {
+      "tempo": 1.056,
+      "pitch": 1.4,
+      "range": 1.5,
+      "energy": 0.42,
+      "pause": 0.93
+     },
+     "weight": 1.0,
+     "acting": {
+      "act": "CRACK UP - laughing through the line: the funny bit repeated back, can barely get the words out",
+      "blurts": [
+       "Oh, that's HILARIOUS!",
+       "Stop, I can't breathe!",
+       "No, you did NOT!"
+      ],
+      "says": [
+       "hilarious",
+       "I'm dying",
+       "stop it",
+       "oh my God"
+      ]
+     }
+    },
+    {
+     "id": "joy.relief",
+     "label": "relief",
+     "arousal": 0.35,
+     "valence": 0.6,
+     "emoji": "😌",
+     "text": "{name} processes this as {feeling}: SAG WITH RELIEF - a huge exhale on the page: 'oh, thank God', gushing gratitude.",
+     "voice": {
+      "tempo": 0.916,
+      "pitch": -0.28,
+      "range": 1.14,
+      "energy": -0.14,
+      "pause": 1.21,
+      "temp": 0.0
+     },
+     "weight": 1.0,
+     "acting": {
+      "act": "SAG WITH RELIEF - a huge exhale on the page: 'oh, thank God', gushing gratitude",
+      "blurts": [
+       "Oh, thank GOD!",
+       "Oh, finally!",
+       "Oh, what a relief!"
+      ],
+      "says": [
+       "thank God",
+       "finally",
+       "what a relief",
+       "phew, okay"
+      ]
+     }
+    },
+    {
+     "id": "joy.satisfaction",
+     "label": "satisfaction",
+     "arousal": 0.35,
+     "emoji": "👌",
+     "text": "{name} processes this as {feeling}: SAVOUR IT SHAMELESSLY - luxurious, smug contentment: 'oh, that's the stuff'.",
+     "voice": {
+      "tempo": 0.944,
+      "pitch": -0.7,
+      "range": 1.14,
+      "energy": -0.35,
+      "pause": 1.14,
+      "temp": 0.0
+     },
+     "weight": 1.0,
+     "acting": {
+      "act": "SAVOUR IT SHAMELESSLY - luxurious, smug contentment: 'oh, that's the stuff'",
+      "blurts": [
+       "Oh, that is BEAUTIFUL.",
+       "Now THAT's what I'm talking about.",
+       "Oh, yes."
+      ],
+      "says": [
+       "beautiful",
+       "that's the stuff",
+       "perfect",
+       "nailed it"
+      ]
+     }
+    }
+   ],
+   "emoji": "😄",
+   "voice": {
+    "tempo": 1.112,
+    "pitch": 1.68,
+    "range": 1.49,
+    "energy": 0.56,
+    "pause": 0.86,
+    "temp": 0.07
+   },
+   "acting": {
+    "act": "CELEBRATE - bursting with it: stacked exclamations, gushing superlatives, laughing words, one word in CAPS, talking over themselves with glee",
+    "blurts": [
+     "YES!",
+     "Oh, I LOVE this!",
+     "Are you kidding? That's amazing!"
+    ],
+    "says": [
+     "amazing",
+     "the best thing",
+     "love it",
+     "incredible",
+     "come on!"
+    ],
+    "wants": "everybody in the room as thrilled as they are"
+   }
+  },
+  {
+   "id": "disgust",
+   "label": "DISGUST",
+   "weight": 1.0,
+   "valence": -0.6,
+   "arousal": 0.55,
+   "dims": {
+    "irritation": 0.7
+   },
+   "modifiers": {
+    "tension": 0.8,
+    "agreement": -0.6
+   },
+   "after_lean": {
+    "-1": 1.25
+   },
+   "items": [
+    {
+     "id": "disgust.distaste",
+     "label": "distaste",
+     "emoji": "🙁",
+     "text": "{name} processes this as {feeling}: WRINKLE THE NOSE - snooty and dismissive, 'no thank you' disdain.",
+     "voice": {
+      "tempo": 0.93,
+      "pitch": -0.7,
+      "range": 1.07,
+      "energy": -0.21,
+      "pause": 1.14
+     },
+     "weight": 1.0,
+     "acting": {
+      "act": "WRINKLE THE NOSE - snooty and dismissive, 'no thank you' disdain",
+      "blurts": [
+       "No thank you.",
+       "Hard pass!",
+       "Oh, please."
+      ],
+      "says": [
+       "no thank you",
+       "hard pass",
+       "please",
+       "not for me"
+      ]
+     }
+    },
+    {
+     "id": "disgust.aversion",
+     "label": "aversion",
+     "emoji": "🙅",
+     "text": "{name} processes this as {feeling}: WRINKLE THE NOSE - snooty and dismissive, 'no thank you' disdain.",
+     "weight": 1.0,
+     "acting": {
+      "act": "WRINKLE THE NOSE - snooty and dismissive, 'no thank you' disdain",
+      "blurts": [
+       "No thank you.",
+       "Hard pass!",
+       "Oh, please."
+      ],
+      "says": [
+       "no thank you",
+       "hard pass",
+       "please",
+       "not for me"
+      ]
+     }
+    },
+    {
+     "id": "disgust.disgust",
+     "label": "disgust",
+     "text": "{name} processes this as {feeling}: RECOIL - grossed out and loud about it: 'that is DISGUSTING', graphic words for the gross part, refusing to go anywhere near it.",
+     "weight": 1.0
+    },
+    {
+     "id": "disgust.revulsion",
+     "label": "revulsion",
+     "emoji": "🤮",
+     "text": "{name} processes this as {feeling}: RECOIL - grossed out and loud about it: 'that is DISGUSTING', graphic words for the gross part, refusing to go anywhere near it.",
+     "voice": {
+      "tempo": 0.86,
+      "pitch": -1.4,
+      "range": 1.35,
+      "energy": -0.14,
+      "pause": 1.28
+     },
+     "weight": 1.0
+    },
+    {
+     "id": "disgust.repulsion",
+     "label": "repulsion",
+     "emoji": "✋",
+     "text": "{name} processes this as {feeling}: RECOIL - grossed out and loud about it: 'that is DISGUSTING', graphic words for the gross part, refusing to go anywhere near it.",
+     "voice": {
+      "tempo": 0.874,
+      "pitch": -1.26,
+      "range": 1.28,
+      "energy": -0.14,
+      "pause": 1.252
+     },
+     "weight": 1.0
+    },
+    {
+     "id": "disgust.moral_disgust",
+     "label": "moral disgust",
+     "emoji": "👎",
+     "text": "{name} processes this as {feeling}: CONDEMN - righteous and appalled: 'that is WRONG', preaching at them.",
+     "voice": {
+      "tempo": 0.916,
+      "pitch": -0.84,
+      "range": 1.28,
+      "energy": -0.14,
+      "pause": 1.14
+     },
+     "weight": 1.0,
+     "acting": {
+      "act": "CONDEMN - righteous and appalled: 'that is WRONG', preaching at them",
+      "blurts": [
+       "That is just WRONG!",
+       "Shame on you!",
+       "Have you no decency?!"
+      ],
+      "wants": "to make them ashamed of themselves",
+      "says": [
+       "wrong",
+       "shameful",
+       "disgrace",
+       "decency"
+      ]
+     }
+    }
+   ],
+   "emoji": "🤢",
+   "voice": {
+    "tempo": 0.86,
+    "pitch": -1.12,
+    "range": 1.21,
+    "energy": -0.35,
+    "pause": 1.21,
+    "temp": -0.028
+   },
+   "acting": {
+    "act": "RECOIL - grossed out and loud about it: 'that is DISGUSTING', graphic words for the gross part, refusing to go anywhere near it",
+    "blurts": [
+     "Oh, that's DISGUSTING!",
+     "Ew, no. Absolutely not.",
+     "Why would you SAY that?!"
+    ],
+    "says": [
+     "gross",
+     "vile",
+     "nasty",
+     "revolting",
+     "sick"
+    ],
+    "wants": "for them to stop talking about it this second"
+   }
+  },
+  {
+   "id": "interest",
+   "label": "INTEREST",
+   "weight": 1.0,
+   "valence": 0.3,
+   "arousal": 0.5,
+   "dims": {
+    "excitement": 0.45,
+    "confusion": 0.1
+   },
+   "modifiers": {
+    "novelty": 0.6
+   },
+   "after_lean": {
+    "0": 1.2
+   },
+   "items": [
+    {
+     "id": "interest.curiosity",
+     "label": "curiosity",
+     "arousal": 0.45,
+     "valence": 0.4,
+     "emoji": "🧐",
+     "text": "{name} processes this as {feeling}: LEAN IN - hungry: rapid-fire questions, 'tell me more' energy, one word in CAPS.",
+     "voice": {
+      "tempo": 1.0,
+      "pitch": 0.84,
+      "range": 1.28,
+      "energy": 0.14,
+      "pause": 0.93,
+      "temp": 0.042
+     },
+     "weight": 1.0,
+     "acting": {
+      "act": "LEAN IN - hungry: rapid-fire questions, 'tell me more' energy, one word in CAPS",
+      "blurts": [
+       "Oh, wait!",
+       "Hold on, tell me more!",
+       "Okay, now I NEED to know!"
+      ],
+      "wants": "to pry the juicy detail out of them",
+      "says": [
+       "tell me more",
+       "wait, what",
+       "how",
+       "and then what"
+      ]
+     }
+    },
+    {
+     "id": "interest.fascination",
+     "label": "fascination",
+     "emoji": "🤩",
+     "text": "{name} processes this as {feeling}: GEEK OUT - enthralled, gushing about the detail: 'that is SO cool'.",
+     "voice": {
+      "tempo": 1.028,
+      "pitch": 0.56,
+      "range": 1.42,
+      "energy": 0.28
+     },
+     "weight": 1.0,
+     "acting": {
+      "act": "GEEK OUT - enthralled, gushing about the detail: 'that is SO cool'",
+      "blurts": [
+       "Oh, that is SO cool!",
+       "Wait, that's fascinating!",
+       "Tell me EVERYTHING."
+      ]
+     }
+    },
+    {
+     "id": "interest.intrigue",
+     "label": "intrigue",
+     "arousal": 0.45,
+     "emoji": "👀",
+     "text": "{name} processes this as {feeling}: LEAN IN - hungry: rapid-fire questions, 'tell me more' energy, one word in CAPS.",
+     "voice": {
+      "tempo": 0.972,
+      "pitch": 0.56,
+      "range": 1.21,
+      "energy": 0.07,
+      "pause": 1.0,
+      "temp": 0.028
+     },
+     "weight": 1.0,
+     "acting": {
+      "act": "LEAN IN - hungry: rapid-fire questions, 'tell me more' energy, one word in CAPS",
+      "blurts": [
+       "Oh, wait!",
+       "Hold on, tell me more!",
+       "Okay, now I NEED to know!"
+      ],
+      "wants": "to pry the juicy detail out of them",
+      "says": [
+       "tell me more",
+       "wait, what",
+       "how",
+       "and then what"
+      ]
+     }
+    },
+    {
+     "id": "interest.attentiveness",
+     "label": "attentiveness",
+     "emoji": "👂",
+     "text": "{name} processes this as {feeling}: INTERROGATE - leaning right in: rapid pointed questions, 'wait, go back', the key word repeated in CAPS, not letting it drop.",
+     "voice": {
+      "tempo": 1.028,
+      "pitch": 0.28,
+      "range": 1.07,
+      "energy": 0.07,
+      "pause": 1.0
+     },
+     "weight": 1.0
+    },
+    {
+     "id": "interest.skepticism",
+     "label": "skepticism",
+     "valence": -0.1,
+     "emoji": "🤨",
+     "text": "{name} processes this as {feeling}: SMELL A RAT - narrow-eyed: 'oh, sure, SURE', poking holes, their claim repeated back as a mocking question.",
+     "voice": {
+      "tempo": 0.944,
+      "pitch": -0.28,
+      "range": 1.35,
+      "energy": 0.07,
+      "pause": 1.14,
+      "temp": 0.0
+     },
+     "weight": 1.0,
+     "acting": {
+      "act": "SMELL A RAT - narrow-eyed: 'oh, sure, SURE', poking holes, their claim repeated back as a mocking question",
+      "blurts": [
+       "Oh, sure. SURE.",
+       "Oh, REALLY?",
+       "Nice story. Now tell the true one."
+      ],
+      "wants": "to catch them in the lie"
+     }
+    },
+    {
+     "id": "interest.suspicion",
+     "label": "suspicion",
+     "valence": -0.3,
+     "emoji": "🕵️",
+     "text": "{name} processes this as {feeling}: SMELL A RAT - narrow-eyed: 'oh, sure, SURE', poking holes, their claim repeated back as a mocking question.",
+     "voice": {
+      "tempo": 0.93,
+      "pitch": -0.56,
+      "range": 1.14,
+      "energy": 0.0,
+      "pause": 1.21,
+      "temp": 0.0
+     },
+     "weight": 1.0,
+     "acting": {
+      "act": "SMELL A RAT - narrow-eyed: 'oh, sure, SURE', poking holes, their claim repeated back as a mocking question",
+      "blurts": [
+       "Oh, sure. SURE.",
+       "Oh, REALLY?",
+       "Nice story. Now tell the true one."
+      ],
+      "wants": "to catch them in the lie"
+     }
+    },
+    {
+     "id": "interest.uncertainty",
+     "label": "uncertainty",
+     "emoji": "🤷",
+     "text": "{name} processes this as {feeling}: WAFFLE DRAMATICALLY - torn in two: 'I mean... but then again', flip-flopping mid-line.",
+     "voice": {
+      "tempo": 0.93,
+      "pitch": 0.28,
+      "range": 0.93,
+      "energy": -0.14,
+      "pause": 1.28,
+      "temp": 0.0
+     },
+     "weight": 1.0,
+     "acting": {
+      "act": "WAFFLE DRAMATICALLY - torn in two: 'I mean... but then again', flip-flopping mid-line",
+      "blurts": [
+       "I mean... I don't know!",
+       "Okay, but then again...",
+       "Wait, no, maybe?"
+      ],
+      "says": [
+       "I mean",
+       "maybe",
+       "then again",
+       "I don't know"
+      ]
+     }
+    }
+   ],
+   "emoji": "🤔",
+   "voice": {
+    "tempo": 1.084,
+    "pitch": 0.0,
+    "range": 1.28,
+    "energy": 0.35,
+    "pause": 0.888,
+    "temp": 0.042
+   },
+   "acting": {
+    "act": "INTERROGATE - leaning right in: rapid pointed questions, 'wait, go back', the key word repeated in CAPS, not letting it drop",
+    "blurts": [
+     "Wait, go back!",
+     "Hold on, say that again!",
+     "Okay, now I'm interested!"
+    ],
+    "says": [
+     "how exactly",
+     "why",
+     "prove it",
+     "walk me through it",
+     "and then what"
+    ],
+    "wants": "to get the one detail they are hiding"
+   }
+  },
+  {
+   "id": "social",
+   "label": "SOCIAL / SELF-CONSCIOUS",
+   "weight": 1.0,
+   "valence": -0.15,
+   "arousal": 0.5,
+   "dims": {
+    "nervousness": 0.7,
+    "amusement": 0.1
+   },
+   "modifiers": {},
+   "after_lean": {
+    "-1": 1.3
+   },
+   "items": [
+    {
+     "id": "social.embarrassment",
+     "label": "embarrassment",
+     "text": "{name} processes this as {feeling}: SQUIRM - mortified: stammered restarts ('I- I mean'), over-explaining, begging them to drop it.",
+     "weight": 1.0,
+     "acting": {
+      "act": "SQUIRM - mortified: stammered restarts ('I- I mean'), over-explaining, begging them to drop it",
+      "blurts": [
+       "Oh no. Oh, no, no.",
+       "Okay, can we NOT?",
+       "I want to crawl under the desk!"
+      ]
+     }
+    },
+    {
+     "id": "social.awkwardness",
+     "label": "awkwardness",
+     "emoji": "😅",
+     "text": "{name} processes this as {feeling}: SQUIRM - mortified: stammered restarts ('I- I mean'), over-explaining, begging them to drop it.",
+     "voice": {
+      "tempo": 0.888,
+      "pitch": 1.12,
+      "range": 0.93,
+      "energy": -0.14,
+      "pause": 1.28,
+      "temp": 0.028
+     },
+     "weight": 1.0,
+     "acting": {
+      "act": "SQUIRM - mortified: stammered restarts ('I- I mean'), over-explaining, begging them to drop it",
+      "blurts": [
+       "Oh no. Oh, no, no.",
+       "Okay, can we NOT?",
+       "Well, THIS is awkward!"
+      ]
+     }
+    },
+    {
+     "id": "social.shame",
+     "label": "shame",
+     "emoji": "🙈",
+     "text": "{name} processes this as {feeling}: SQUIRM - mortified: stammered restarts ('I- I mean'), over-explaining, begging them to drop it.",
+     "voice": {
+      "tempo": 0.86,
+      "pitch": -1.12,
+      "range": 0.65,
+      "energy": -0.56,
+      "pause": 1.35
+     },
+     "weight": 1.0,
+     "acting": {
+      "act": "SQUIRM - mortified: stammered restarts ('I- I mean'), over-explaining, begging them to drop it",
+      "blurts": [
+       "Oh no. Oh, no, no.",
+       "Okay, can we NOT?",
+       "I want to crawl under the desk!"
+      ]
+     }
+    },
+    {
+     "id": "social.guilt",
+     "label": "guilt",
+     "emoji": "😓",
+     "text": "{name} processes this as {feeling}: CONFESS - guilt pouring out: 'okay, FINE, it was me', over-apologising.",
+     "voice": {
+      "tempo": 0.888,
+      "pitch": -1.12,
+      "range": 0.72,
+      "energy": -0.42,
+      "pause": 1.28
+     },
+     "weight": 1.0,
+     "acting": {
+      "act": "CONFESS - guilt pouring out: 'okay, FINE, it was me', over-apologising",
+      "blurts": [
+       "Okay, FINE, it was me!",
+       "I'm sorry, okay?!",
+       "I know, I KNOW!"
+      ],
+      "wants": "to be forgiven before anybody else finds out",
+      "says": [
+       "my fault",
+       "I'm sorry",
+       "I know, I know",
+       "okay, fine"
+      ]
+     }
+    },
+    {
+     "id": "social.pride",
+     "label": "pride",
+     "arousal": 0.6,
+     "valence": 0.5,
+     "emoji": "😎",
+     "text": "{name} processes this as {feeling}: BRAG - chest puffed out: 'that's RIGHT', taking all the credit, a victory lap in words.",
+     "voice": {
+      "tempo": 1.112,
+      "pitch": -1.12,
+      "range": 1.21,
+      "energy": 0.0,
+      "pause": 1.07,
+      "temp": 0.014
+     },
+     "weight": 1.0,
+     "acting": {
+      "act": "BRAG - chest puffed out: 'that's RIGHT', taking all the credit, a victory lap in words",
+      "blurts": [
+       "That's RIGHT!",
+       "You're welcome!",
+       "Who called it? ME."
+      ],
+      "wants": "for everybody to admit how brilliant they are",
+      "says": [
+       "that's right",
+       "nailed it",
+       "you're welcome",
+       "called it"
+      ]
+     }
+    },
+    {
+     "id": "social.admiration",
+     "label": "admiration",
+     "valence": 0.6,
+     "emoji": "😍",
+     "text": "{name} processes this as {feeling}: GUSH - starstruck: over-the-top praise, superlatives, 'you're a GENIUS'.",
+     "voice": {
+      "tempo": 1.0,
+      "pitch": 1.12,
+      "range": 1.28,
+      "energy": 0.21,
+      "pause": 1.0,
+      "temp": 0.028
+     },
+     "weight": 1.0,
+     "acting": {
+      "act": "GUSH - starstruck: over-the-top praise, superlatives, 'you're a GENIUS'",
+      "blurts": [
+       "You are a GENIUS!",
+       "Oh, that's brilliant!",
+       "I bow down!"
+      ],
+      "wants": "for the other one to know they are in awe",
+      "says": [
+       "genius",
+       "brilliant",
+       "legend",
+       "I bow down"
+      ]
+     }
+    },
+    {
+     "id": "social.envy",
+     "label": "envy",
+     "emoji": "💚",
+     "text": "{name} processes this as {feeling}: GREEN WITH IT - bitter and petty: 'must be NICE', backhanded compliments.",
+     "voice": {
+      "pitch": -1.12,
+      "range": 1.0,
+      "energy": 0.14,
+      "pause": 1.14
+     },
+     "weight": 1.0,
+     "acting": {
+      "act": "GREEN WITH IT - bitter and petty: 'must be NICE', backhanded compliments",
+      "blurts": [
+       "Oh, must be NICE!",
+       "Well, la-di-da!",
+       "Good for YOU."
+      ],
+      "wants": "to knock them down a peg",
+      "says": [
+       "must be nice",
+       "lucky you",
+       "good for you",
+       "la-di-da"
+      ]
+     }
+    },
+    {
+     "id": "social.jealousy",
+     "label": "jealousy",
+     "emoji": "😾",
+     "text": "{name} processes this as {feeling}: GREEN WITH IT - bitter and petty: 'must be NICE', backhanded compliments.",
+     "voice": {
+      "tempo": 1.112,
+      "pitch": 1.12,
+      "range": 1.14,
+      "energy": 0.35,
+      "pause": 1.0,
+      "temp": 0.028
+     },
+     "weight": 1.0,
+     "acting": {
+      "act": "GREEN WITH IT - bitter and petty: 'must be NICE', backhanded compliments",
+      "blurts": [
+       "Oh, must be NICE!",
+       "Well, la-di-da!",
+       "Good for YOU."
+      ],
+      "wants": "to knock them down a peg",
+      "says": [
+       "must be nice",
+       "lucky you",
+       "good for you",
+       "la-di-da"
+      ]
+     }
+    },
+    {
+     "id": "social.defensiveness",
+     "label": "defensiveness",
+     "arousal": 0.65,
+     "emoji": "🛡️",
+     "text": "{name} processes this as {feeling}: BRISTLE - hackles up: 'whoa, whoa, hold on', denying hard, turning it back on them.",
+     "voice": {
+      "tempo": 1.112,
+      "pitch": 1.12,
+      "range": 1.21,
+      "energy": 0.56,
+      "pause": 0.832,
+      "temp": 0.042
+     },
+     "weight": 1.0,
+     "acting": {
+      "act": "BRISTLE - hackles up: 'whoa, whoa, hold on', denying hard, turning it back on them",
+      "blurts": [
+       "Whoa, whoa, WHOA!",
+       "Excuse me?!",
+       "Don't you put that on me!"
+      ],
+      "wants": "to win the point back",
+      "says": [
+       "hold on",
+       "that's not fair",
+       "don't you dare",
+       "I never said that"
+      ]
+     }
+    }
+   ],
+   "emoji": "😳",
+   "voice": {
+    "tempo": 0.888,
+    "pitch": -1.12,
+    "range": 0.86,
+    "energy": -0.35,
+    "pause": 1.21,
+    "temp": 0.0
+   },
+   "acting": {
+    "act": "SQUIRM - painfully self-conscious and loud about it: 'oh God, okay', a stammered restart, over-explaining, laughing at themselves, one word in CAPS",
+    "blurts": [
+     "Oh God. Okay.",
+     "Well, THIS is awkward!",
+     "Can we not? Please?"
+    ],
+    "says": [
+     "I mean",
+     "look",
+     "honestly",
+     "it's not what it sounds like"
+    ],
+    "wants": "to get out of the spotlight without losing face"
+   }
+  },
+  {
+   "id": "low_arousal",
+   "label": "LOW-AROUSAL / DETACHED",
+   "weight": 1.0,
+   "valence": 0.0,
+   "arousal": 0.15,
+   "dims": {
+    "fatigue": 0.85
+   },
+   "modifiers": {
+    "energy": -1.2,
+    "closure_pressure": 0.8
+   },
+   "after_lean": {
+    "1": 1.2
+   },
+   "items": [
+    {
+     "id": "low_arousal.indifference",
+     "label": "indifference",
+     "emoji": "😑",
+     "text": "{name} processes this as {feeling}: CHECK OUT, theatrically - an enormous verbal shrug: deadpan, one-word answers, 'whatever', dripping with not caring so everybody notices.",
+     "voice": {
+      "tempo": 0.888,
+      "pitch": -0.84,
+      "energy": -0.63,
+      "pause": 1.28
+     },
+     "weight": 1.0
+    },
+    {
+     "id": "low_arousal.boredom",
+     "label": "boredom",
+     "emoji": "🥱",
+     "text": "{name} processes this as {feeling}: YAWN AT THEM - exaggerated boredom: 'are we done?', 'riveting', sarcasm dripping.",
+     "voice": {
+      "range": 0.6
+     },
+     "weight": 1.0,
+     "acting": {
+      "act": "YAWN AT THEM - exaggerated boredom: 'are we done?', 'riveting', sarcasm dripping",
+      "blurts": [
+       "Riveting.",
+       "Are we done yet?",
+       "Wow. Thrilling stuff."
+      ],
+      "says": [
+       "riveting",
+       "thrilling",
+       "wake me",
+       "are we done"
+      ]
+     }
+    },
+    {
+     "id": "low_arousal.apathy",
+     "label": "apathy",
+     "emoji": "😶",
+     "text": "{name} processes this as {feeling}: CHECK OUT, theatrically - an enormous verbal shrug: deadpan, one-word answers, 'whatever', dripping with not caring so everybody notices.",
+     "voice": {
+      "pitch": -1.4,
+      "range": 0.6,
+      "energy": -0.8
+     },
+     "weight": 1.0
+    },
+    {
+     "id": "low_arousal.resignation",
+     "label": "resignation",
+     "emoji": "😮‍💨",
+     "text": "{name} processes this as {feeling}: COLLAPSE - wrung out: 'fine, whatever, you win', giving up on the argument out loud.",
+     "voice": {
+      "tempo": 0.86,
+      "range": 0.6,
+      "energy": -0.63,
+      "pause": 1.42
+     },
+     "weight": 1.0,
+     "acting": {
+      "act": "COLLAPSE - wrung out: 'fine, whatever, you win', giving up on the argument out loud",
+      "blurts": [
+       "Fine. You win.",
+       "Sure. Why not.",
+       "I'm too tired for this."
+      ],
+      "says": [
+       "fine",
+       "whatever you say",
+       "you win",
+       "I'm done"
+      ]
+     }
+    },
+    {
+     "id": "low_arousal.exhaustion",
+     "label": "exhaustion",
+     "arousal": 0.1,
+     "emoji": "😫",
+     "text": "{name} processes this as {feeling}: COLLAPSE - wrung out: 'I can't. I just can't.', giving up on the argument out loud.",
+     "voice": {
+      "tempo": 0.85,
+      "pitch": -1.4,
+      "energy": -0.8,
+      "pause": 1.5,
+      "temp": -0.1
+     },
+     "weight": 1.0,
+     "acting": {
+      "act": "COLLAPSE - wrung out: 'I can't. I just can't.', giving up on the argument out loud",
+      "blurts": [
+       "I can't. I just can't.",
+       "Fine. You win.",
+       "I'm too tired for this."
+      ],
+      "says": [
+       "I can't",
+       "fine",
+       "whatever you say",
+       "I'm done"
+      ]
+     }
+    },
+    {
+     "id": "low_arousal.calm",
+     "label": "calm",
+     "arousal": 0.08,
+     "valence": 0.3,
+     "emoji": "🧘",
+     "text": "{name} processes this as {feeling}: BE THE ZEN MASTER - absurdly, smugly serene: slow soothing words that clearly wind the others up.",
+     "voice": {
+      "tempo": 0.916,
+      "pitch": -0.56,
+      "range": 0.79,
+      "energy": -0.42,
+      "pause": 1.21,
+      "temp": -0.07
+     },
+     "weight": 1.0,
+     "acting": {
+      "act": "BE THE ZEN MASTER - absurdly, smugly serene: slow soothing words that clearly wind the others up",
+      "blurts": [
+       "Everybody breathe.",
+       "It's fine. It's ALL fine.",
+       "Let it go, man."
+      ],
+      "wants": "to be the calmest person in the room and make sure everybody notices",
+      "says": [
+       "breathe",
+       "it's all good",
+       "let it go",
+       "relax"
+      ]
+     }
+    },
+    {
+     "id": "low_arousal.acceptance",
+     "label": "acceptance",
+     "valence": 0.3,
+     "emoji": "🙂",
+     "text": "{name} processes this as {feeling}: BE THE ZEN MASTER - absurdly, smugly serene: slow soothing words that clearly wind the others up.",
+     "voice": {
+      "tempo": 0.93,
+      "pitch": -0.28,
+      "range": 0.86,
+      "energy": -0.28,
+      "pause": 1.14,
+      "temp": -0.042
+     },
+     "weight": 1.0,
+     "acting": {
+      "act": "BE THE ZEN MASTER - absurdly, smugly serene: slow soothing words that clearly wind the others up",
+      "blurts": [
+       "It is what it is.",
+       "It's fine. It's ALL fine.",
+       "Let it go, man."
+      ],
+      "wants": "to be the calmest person in the room and make sure everybody notices",
+      "says": [
+       "it is what it is",
+       "it's all good",
+       "let it go",
+       "relax"
+      ]
+     }
+    }
+   ],
+   "emoji": "😐",
+   "voice": {
+    "tempo": 0.85,
+    "pitch": -1.4,
+    "range": 0.6,
+    "energy": -0.77,
+    "pause": 1.49,
+    "temp": -0.098
+   },
+   "acting": {
+    "act": "CHECK OUT, theatrically - an enormous verbal shrug: deadpan, one-word answers, 'whatever', dripping with not caring so everybody notices",
+    "blurts": [
+     "Whatever.",
+     "Cool. Great. Anyway.",
+     "Wake me up when it's over."
+    ],
+    "says": [
+     "whatever",
+     "sure",
+     "fine",
+     "who cares",
+     "riveting"
+    ],
+    "wants": "to make it painfully obvious they could not care less"
+   }
+  }
+ ]
+}

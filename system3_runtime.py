@@ -3511,6 +3511,38 @@ class System3Runtime:
             return cid, mine[0]
         return cid, (hits[0] if len(hits) == 1 else (mine or hits or [None])[0])
 
+    def _turn_of_loose(self, meta, text, who=""):
+        """[s3-direction] The script index of a chunk whose exact words are not in
+        the round's script (the air path reworded it): the seat's turn whose words
+        it shares most, at least 60% of the chunk's words, else None. For the
+        voice only - the ledger link keeps the exact match."""
+        try:
+            s3 = (meta or {}).get("system3") or {}
+            cid = s3.get("conversation_id")
+            if not cid:
+                return None
+            script = str(meta.get("script") or "")
+            key = cid + ":" + hashlib.md5(script.encode("utf-8")).hexdigest()[:10]
+            if self.turns_cache.get(key) is None:
+                self._turn_of(meta, text, who)                                # it fills the cache
+            turns = self.turns_cache.get(key) or []
+            words = re.findall(r"[a-z0-9']+", str(text or "").lower())
+            if len(words) < 3:
+                return None
+            seat = _SEAT_OF.get(str(who or ""), "")
+            best, best_i = 0.0, None
+            for i, (m, said) in enumerate(turns):
+                if seat and str(m)[:1] != seat:
+                    continue
+                have = set(re.findall(r"[a-z0-9']+", str(said or "").lower()))
+                share = sum(1 for w in words if w in have) / float(len(words))
+                if share > best:
+                    best, best_i = share, i
+            return best_i if best >= 0.6 else None
+        except Exception as exc:  # noqa: BLE001
+            self.fail("loose turn", exc)
+            return None
+
     def turn_id_for(self, meta, text, who=""):
         """[s3-link] The planned turn a spoken chunk belongs to, BY ITS WORDS.
         The ledger numbered rows by spoken order and looked the turn up by
@@ -3539,6 +3571,8 @@ class System3Runtime:
             if ((entry or {}).get("system3") or {}).get("mode") != "active":
                 return None
             _cid, i = self._turn_of(entry, text, who)
+            if i is None:
+                i = self._turn_of_loose(entry, text, who)                     # [s3-direction] reworded on the way
             if i is None:
                 return None
             stamp = (((entry.get("turn_dice") or {}).get(str(i)) or {}).get("s3") or {})
@@ -3618,6 +3652,8 @@ class System3Runtime:
             if ((entry or {}).get("system3") or {}).get("mode") != "active":
                 return None
             _cid, i = self._turn_of(entry, text, who)
+            if i is None:
+                i = self._turn_of_loose(entry, text, who)                     # [s3-direction] its voice too
             if i is None:
                 return None
             stamp = (((entry.get("turn_dice") or {}).get(str(i)) or {}).get("s3") or {})

@@ -377,6 +377,47 @@ def es_direction(config, spec, name=""):
     return text.replace("{feeling}", feeling).replace("{name}", who)[:400]
 
 
+# --- [s3-direction] DIRECTION FOR THIS LINE ----------------------------------------
+# The operator, 2026-09-29: "the roulette results are used as direction for the
+# prompt ... the characters lists then categories and grabbing advanced randomized
+# direction" and "I want the emotional acting to be over the top and exaggerated".
+# An ES row may carry `acting` - act (the playable verb, in writing terms), blurts
+# (first words out, quoted), says (its lexicon), wants (intention and goal) - on
+# the category, with the item's own keys over it (the Tables tab).
+DIRECTION_LABEL = "DIRECTION FOR THIS LINE"
+ACTING_KEYS = ("act", "blurts", "says", "wants")
+
+
+def es_acting(config, spec):
+    """[s3-direction] The acting of an ES pick: the item's `acting` over its
+    category's, cleaned ({act, blurts, says, wants}); {} when neither row has
+    one. Nothing is drawn."""
+    cat, item = _es_row(config, spec)
+    out = {}
+    for row in (cat, item):
+        got = (row or {}).get("acting")
+        if not isinstance(got, dict):
+            continue
+        for k in ACTING_KEYS:
+            v = got.get(k)
+            if k in ("blurts", "says"):
+                v = [" ".join(str(x).split())[:60] for x in (v if isinstance(v, list) else [])
+                     if str(x).strip()][:5]
+                if v:
+                    out[k] = v
+            elif str(v or "").strip():
+                out[k] = " ".join(str(v).split())[:240]
+    return out
+
+
+def acting_scale(intensity):
+    """[s3-direction] How big a line is played, by its ES intensity."""
+    x = float(intensity or 0)
+    return ("ALL THE WAY UP, over the top and bigger than life" if x >= 0.72
+            else "BIG, broad and unmistakable" if x >= 0.4
+            else "OUT LOUD, it shows in every word")
+
+
 def _es_base_arousal(config, spec):
     """[s3-es-dir] The arousal of the category an ES pick was drawn from, or None."""
     cat, _item = _es_row(config, spec)
@@ -1638,6 +1679,7 @@ def _decide_turn(conv, config, settings, stream, step, speaker, want, inputs, cl
             dec["emoji"] = es_emoji(config, spec)
             # [s3-es-dir] what the writer is told for this feeling: the item's own words
             dec["direction"] = es_direction(config, spec, turn["name"])
+            dec["acting"] = es_acting(config, spec)                           # [s3-direction] how it is played
             dec["text"] = ev["selected"]["text"] = dec["direction"]
             es_spec = spec
             ctx["speaker_emotion_cat"] = spec["category"]
@@ -3444,9 +3486,10 @@ def plan_graph(conv, config, graph_raw, until=None, inputs=None, road="banter"):
                     rebuttal = next((old for old in reversed(conv["turns"][:-1])
                                      if old.get("graph_type") == "rebuttal"), None)
                     if original and rebuttal:
-                        turn["protocol"] += (" Return to your point in turn %d and answer the initiator's"
-                                             " rebuttal in turn %d directly."
-                                             % (original["index"] + 1, rebuttal["index"] + 1))
+                        # [s3-direction] never a turn number: the writer said "the point I made in turn two"
+                        turn["protocol"] += (" Return to the point you made earlier and answer %s's rebuttal"
+                                             " directly." % str(rebuttal.get("name") or rebuttal.get("speaker")
+                                                                or "the initiator"))
                 if kind == "topic_change":
                     turn["topic_change"] = True
                     if node["topic"]:
@@ -3710,8 +3753,9 @@ def annotate_protocol(conv, sheet):
             acts = [x["text"] for x in t["directions"] if x["family"] == "RS"]
             if acts:
                 add += "; while doing it, " + acts[0]
-            if _es_line(t):                                                   # [s3-es-dir]
-                add += ". " + _es_line(t).rstrip(".")
+            _d = direction_block(t, conv) or _es_line(t)                      # [s3-direction] protocol sheets
+            if _d:                                                            # [s3-es-dir]
+                add += ". " + _d.rstrip(".")
             add += ".]"
         topic = t.get("bank_topic") or {}                                 # [rng-topics]
         if topic.get("text"):
@@ -4587,6 +4631,9 @@ def render_call_sheet(conv):
     text = "\n\n" + head + _tempers_line(conv) + "\n" + "\n".join(rows) + "\n" + tail   # [s3-rounds] [s3-events]
     if call.get("scenario_clause"):
         text += "\n" + str(call["scenario_clause"])
+        if any(direction_block(t) for t in turns):                           # [s3-direction] the roll outranks it
+            text += (" Where a turn's DIRECTION FOR THIS LINE rolls a feeling, that feeling outranks the "
+                     "register and the heat named here.")
     return text
 
 
@@ -4605,7 +4652,8 @@ def _leg_row_add(t):
         if flow:
             add += "; and " + flow[-1]
         # [s3-es-dir] the feeling's own words - not on a drawn stock line (its words are fixed)
-        _es = "" if any(x.get("family") == "LINE" for x in t.get("decisions") or []) else _es_line(t)
+        _es = "" if any(x.get("family") == "LINE" for x in t.get("decisions") or []) \
+            else (direction_block(t) or _es_line(t))                          # [s3-direction] legs, calls, lines
         if _es:
             add += ". " + _es.rstrip(".")
         add += ".]"
@@ -4884,6 +4932,50 @@ def _carry_lead(conv):
     return "picks straight up from where the last exchange landed - %s said: %s - and" % (who, quoted)
 
 
+def direction_block(turn, conv=None):
+    """[s3-direction] The rolls on this turn as the writer's DIRECTION FOR THIS
+    LINE, in roll order: the character, the ES family, the feeling and how hard,
+    how big to play it, the item's direction, then its acting - the first words
+    (quoted: saying one is never a direction's echo), the lexicon, what they
+    want - the temper under it and the shock beat over it. "" when no feeling
+    was rolled."""
+    es = next((d for d in turn.get("decisions") or [] if d.get("family") == "ES" and d.get("item")), None)
+    if not es:
+        return ""
+    name = " ".join(str(turn.get("name") or turn.get("speaker") or "the speaker").split())
+    perf = turn.get("performance") or {}
+    inten = float(perf.get("intensity") if perf.get("intensity") is not None else (es.get("intensity") or 0))
+    feeling = str(es.get("label") or perf.get("emotion") or es.get("item"))
+    fam = str(es.get("category") or perf.get("family") or "").replace("_", " ").upper()
+    turns = (conv or {}).get("turns") or []
+    i = int(turn.get("index") or 0)
+    prev = turns[i - 1] if 0 < i <= len(turns) else None
+    prev_name = str((prev or {}).get("name") or (prev or {}).get("speaker") or "")
+    out = "%s (%s): %sfeeling %s (%s)%s - PLAY IT %s." % (
+        DIRECTION_LABEL, name, (fam + " > ") if fam else "", feeling, _intensity_word(inten),
+        (" about %s's line" % prev_name) if prev_name else "", acting_scale(inten))
+    said = " ".join(str(es.get("direction") or "").split())
+    if said:
+        out += " " + (said if said.endswith((".", "!", "?")) else said + ".")
+    acting = es.get("acting") if isinstance(es.get("acting"), dict) else {}
+    if acting.get("act") and acting["act"].lower() not in said.lower():
+        out += " " + acting["act"].rstrip(".") + "."
+    if acting.get("blurts"):
+        out += (" First words out, something LIKE %s - a fresh one, never the same twice."
+                % " / ".join(json.dumps(x) for x in acting["blurts"]))
+    if acting.get("says"):
+        out += (" Words they reach for, inside their own sentences and never read out as a list: %s."
+                % ", ".join(json.dumps(x) for x in acting["says"][:3]))
+    if acting.get("wants"):
+        out += " What %s wants: %s." % (name, acting["wants"].rstrip("."))
+    temper = ((conv or {}).get("tempers") or {}).get(turn.get("speaker")) or {}
+    if temper.get("text"):
+        out += " Under it all tonight: %s." % str(temper["text"]).rstrip(".")
+    if (turn.get("shock") or {}).get("text"):
+        out += " Then it BOILS OVER: openly %s." % str(turn["shock"]["text"]).upper()
+    return out
+
+
 def _row_work(turn, conv):
     if turn.get("split_of"):                                                  # [s3-split] a part taken over
         return _split_row_work(turn, conv)
@@ -4939,6 +5031,11 @@ def _row_work(turn, conv):
     answer_text = (exchange.get("reply") if turn["index"] == 1 and exchange.get("reply")
                    else turn.get("bank_topic_reply") or "")
     answer_line = replying and bool(answer_text)
+    # [s3-direction] the rolls close the row; a line whose words are fixed keeps its feeling word only
+    _dir = "" if (answer_line or (turn["index"] == 0 and bool(exchange.get("opener") or conv["subject"].get("seeded")))) \
+        else direction_block(turn, conv)
+    if _dir:
+        feel = ""
     if answer_line:
         desc = ("answers %s with these exact words, as written: %s" % (prev_name, json.dumps(answer_text))
                 + (" - feeling %s about it" % feel if feel else ""))
@@ -4960,17 +5057,19 @@ def _row_work(turn, conv):
         lead = ("%s - on this subject, in their own words: %s" % (lead, json.dumps(turn["topic_override"]))
                 if lead else "brings up this subject, in their own words: %s" % json.dumps(turn["topic_override"]))
     body = " - ".join(x for x in (lead, desc) if x)
+    if _dir:                                                                  # [s3-direction] right after what the turn does
+        body = (body.rstrip(".") + ". " if body else "") + _dir.rstrip(".")
     if turn.get("graph_node") and turn.get("protocol"):
         body += (". " if body else "") + str(turn["protocol"])
     if turn.get("graph_handling"):
         body += (". " if body else "") + "Internally %s" % turn["graph_handling"]
-    if turn.get("graph_intonation"):
+    if turn.get("graph_intonation") and not _dir:                            # [s3-direction] the roll is the intonation
         body += (". " if body else "") + "Deliver this in a %s intonation" % turn["graph_intonation"]
     if turn.get("graph_node") and turn.get("planned_seconds"):
         body += ". Allow about %d seconds for this turn" % round(float(turn["planned_seconds"]))
     # [s3-es-dir] the feeling's own words for this line - not on a line whose words are fixed
     _fixed = answer_line or (turn["index"] == 0 and bool(exchange.get("opener") or conv["subject"].get("seeded")))
-    _es = "" if _fixed else _es_line(turn)
+    _es = "" if (_fixed or _dir) else _es_line(turn)                        # [s3-direction] the block says it
     if _es:
         body = (body + ". " if body else "") + _es.rstrip(".")
     for sb in turn.get("speakerbox") or []:
@@ -5106,7 +5205,8 @@ def scaffold_kit(config=None, conv=None):
     if isinstance(conv, dict):
         sts += [conv.get("road_structure") or {}, conv.get("call_structure") or {}]
     sections = list(SHEET_LABELS)
-    rows = {SUBJECT_LABEL: set(), LEAD_LABEL: {LEAD_WHY}, EVENT_LABEL: set()}
+    rows = {SUBJECT_LABEL: set(), LEAD_LABEL: {LEAD_WHY}, EVENT_LABEL: set(),
+            DIRECTION_LABEL: set()}                                          # [s3-direction]
     for st in sts:
         for key in ("head", "tail", "material"):
             sections.append(_caps_label(st.get(key)))
@@ -5176,6 +5276,28 @@ def find_scaffold(text, kit=None):
     return ""
 
 
+# [s3-direction] a rolled feeling said as a label - "Suspicion: ...", "Disbelief: ...",
+# "In fury, hard: ..." (aired 2026-09-29) - is the direction, not a word: the label goes.
+_FEEL_RX = []
+
+
+def _feel_prefix_rx():
+    """[s3-direction] A line (or a line of a turn) that opens on an ES label with a colon or a dash."""
+    if not _FEEL_RX:
+        labels = set()
+        for table in (getattr(system3_tables, "ES1", None), getattr(system3_tables, "ES1_V2", None)):
+            for cat in (table or {}).get("categories") or []:
+                labels.update((str(cat.get("id") or "").replace("_", " "), str(cat.get("label") or "")))
+                labels.update(str(i.get("label") or "") for i in cat.get("items") or [])
+        alts = sorted({r"[ \t]+".join(re.escape(w) for w in x.split()) for x in labels if x.strip()},
+                      key=len, reverse=True)
+        _FEEL_RX.append(re.compile(
+            r"(?im)^([ \t\x22\u201c']*)(?:(?:in|feeling)[ \t]+)?(?:%s)"
+            r"(?:[ \t]*\((?:mildly|plainly|hard)\)|,[ \t]*(?:mildly|plainly|hard))?"
+            r"[ \t]*(?::|[ \t][-\u2013\u2014])[ \t]*" % "|".join(alts)))
+    return _FEEL_RX[0]
+
+
 def strip_scaffold(text, kit=None):
     """`text` with every echoed prompt header cut to the end of its paragraph,
     and every echoed row label cut with its own direction words."""
@@ -5199,6 +5321,10 @@ def strip_scaffold(text, kit=None):
                     stop = t.end()
                     break
             s = s[:m.start()] + (" " if m.start() and not s[m.start() - 1].isspace() else "") + s[stop:].lstrip(" \t")
+        cut = True
+    _fs = _feel_prefix_rx().sub(lambda m: m.group(1), s)                      # [s3-direction] the label goes
+    if _fs != s:
+        s = re.sub(r"(?m)^([ \t\x22\u201c']*)([a-z])", lambda m: m.group(1) + m.group(2).upper(), _fs)
         cut = True
     if cut:
         # the row number that rode in with it is not a word either
@@ -5351,8 +5477,13 @@ def render_sheet(conv):
     if not rows:
         return ""
     return ("\n\nTHE RUNNING ORDER OF THIS EXCHANGE. Write exactly these turns, in this order, one line "
-            "each, and nothing else. Each line says the feeling to speak in and what the turn does - "
-            "perform both, never name them:" + _tempers_line(conv) + "\n" + "\n".join(rows) +
+            "each, and nothing else. Each row says what the turn does, then gives its DIRECTION FOR THIS "
+            "LINE - who speaks, the feeling family, the feeling and how hard. ACT IT OVER THE TOP: the "
+            "feeling is in the first words out of their mouth, in every word they pick, in the punctuation "
+            "(! and ?! and one word in CAPS when it is big) and in what they are after; a rolled feeling "
+            "outranks anyone's usual manner and any calm, dry or measured register above. Perform both, "
+            "never name them and never read a direction out:"                  # [s3-direction]
+            + _tempers_line(conv) + "\n" + "\n".join(rows) +
             "\nEvery numbered turn answers the turn above it by name or by quoting a word out of it, and "
             "then says something of its own: no turn repeats or echoes a line already said, "
             "not the other seat's and not its own. The feeling on a row is how that speaker feels "

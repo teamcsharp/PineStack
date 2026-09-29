@@ -143,7 +143,7 @@ class Harness(unittest.TestCase):
         pool = GOOD if self.repair_ok else STOCK
         return "\n".join("%s:%s" % (seat, pool[(int(n) - 2) % len(pool)].split(":", 1)[1]) for n, seat in rows)
 
-    async def render(self, text, who, voice):
+    async def render(self, text, who, voice, stamp=None):   # [s3-direction] as the real one: the row's stamp
         self.renders += 1
         name = "take%03d.wav" % self.renders
         (self.dir / "media" / name).write_bytes(b"RIFF")

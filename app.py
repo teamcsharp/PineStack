@@ -32931,7 +32931,7 @@ def performance_vector(who: str, voice: str = "",
 def _perf_directive_raw(vec: dict[str, float]) -> str:   # [s3-blocks] perf_directive() marks it
     """The vector as writing instructions — the channel the language model
     (and through its text, the TTS prosody) actually hears."""
-    if not vec:
+    if not vec or vec.get("es"):   # [s3-direction] a rolled feeling: its DIRECTION FOR THIS LINE says how
         return ""
     notes: list[str] = []
     # The named moods write with attitude (#321), not just with numbers.
@@ -35599,7 +35599,9 @@ def _accent_directive_raw() -> str:     # [s3-blocks] accent_directive() marks i
     return ("\nWrite in PLAIN AMERICAN ENGLISH: everyday American phrasing "
             "and rhythm, no foreign idioms, no transliterated words, no "
             "written-out accents or dialect spellings, and no interjection "
-            "noises — no grunts, moans, hums or throat sounds in the text.\n")
+            "noises — no grunts, moans, hums or throat sounds in the text. "
+            "A spoken exclamation is words, not a noise: 'Oh, come on!', 'What?!', "
+            "'No way!' are fine.\n")                                          # [s3-direction]
 
 
 async def _speakbox_flavor_raw() -> str:   # [s3-blocks] speakbox_flavor() marks it
@@ -36874,7 +36876,8 @@ async def _s3_chapter_voice(e: dict[str, Any]) -> str:
             role = str(row.get("who") or "dj")
             voice = (str(e.get("voice") or "") if i == 0 else "") or configured_radio_voice(
                 role, voices.get(role) or "")
-            clip = await _s3_split_render(str(row.get("text") or ""), role, voice)
+            clip = await _s3_split_render(str(row.get("text") or ""), role, voice,
+                                          stamp=row.get("stamp"))   # [s3-direction] the row's own feeling
             if not _s3_chapter_clip_ok(clip):
                 return "turn %d has no voice take yet" % (i + 1)
         secs = float(clip.get("seconds") or 0)
@@ -113887,8 +113890,10 @@ async def dj_banter(track: dict[str, Any] | None = None,
                "conversation is driven by that. ")
             + "This time: "
             f"{_pb('angle', angle)}. Name the actual thing you are talking about. Play it "   # [s3-blocks]
-            "straight and let the specifics be the joke — mock outrage, "
-            "raised eyebrows, 'can you believe what he asked us for'. "
+            + ("as BIG as each line's DIRECTION FOR THIS LINE says - the rolled feeling, over the top, "
+               "in the words themselves. " if _s3_owns else   # [s3-direction] the roll, not a register
+               "straight and let the specifics be the joke — mock outrage, "
+               "raised eyebrows, 'can you believe what he asked us for'. ") + ""
             # Shock-jock nerve (#479): the pair are uninhibited late-night
             # radio hosts in the Howard Stern mould — when the material is
             # unusual, edgy, taboo or outrageous they LEAN IN and milk it for
