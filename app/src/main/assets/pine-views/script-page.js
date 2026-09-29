@@ -15386,6 +15386,28 @@
     return named.replace(/\bSfx\b/g, 'SFX').replace(/\bFm\b/g, 'FM');
   }
 
+  /* [seg-names] THE ENTRY THE ROUND FILLED, BY THE OPERATOR'S OWN NAME.
+     "these should be named after the segment names I assigned to the
+     station." The server names it from the round's own link (reserved,
+     shelved, on its entry, banked for) - never from the clock. */
+  function sceneSlot(item) {
+    var slot = item && item.slot;
+    if (!slot || typeof slot !== 'object') return {};
+    return slot;
+  }
+
+  function sceneSlotKey(item) {
+    var slot = sceneSlot(item);
+    return slot.label ? 'L' + slot.label : (slot.none ? 'none' : '');
+  }
+
+  var SLOT_HOW = {
+    stacked: 'reserved for this entry',
+    shelf: 'aired from the shelf inside this entry',
+    'on its entry': 'aired while this entry was on',
+    banked: 'written for this entry'
+  };
+
   function dressScene(node, item) {
     if (!node || !item) return;
     node.dataset.heading = String(item.text || '');
@@ -15394,8 +15416,20 @@
     node.replaceChildren();
     node.appendChild(make('time', 'sp-segment-time', sceneClock(item)));
     var words = make('span', 'sp-segment-words');
-    words.appendChild(make('b', 'sp-segment-name', sceneName(item)));
-    words.appendChild(make('small', 'sp-segment-place', 'Pine Box FM / The Booth'));
+    var slot = sceneSlot(item);                               /* [seg-names] */
+    var road = sceneName(item);
+    var title = make('b', 'sp-segment-name', slot.label || road);
+    if (slot.label) {
+      title.title = slot.label + ' - the hour entry this round filled ('
+        + (SLOT_HOW[slot.how] || slot.how || 'linked') + ')';
+    } else if (slot.none) {
+      title.appendChild(make('span', 'sp-segment-noslot', '(no slot)'));
+      title.title = 'No hour entry: ' + String(slot.why || 'nothing links this round to one');
+    }
+    node.dataset.slot = slot.label ? String(slot.entry || slot.id || '') : (slot.none ? 'none' : '');
+    words.appendChild(title);
+    words.appendChild(make('small', 'sp-segment-place',
+      slot.label ? road + ' \u00b7 Pine Box FM' : 'Pine Box FM / The Booth'));
     node.appendChild(words);
     node.appendChild(make('span', 'sp-segment-count', ''));
     node.appendChild(make('span', 'sp-segment-state', ''));
@@ -15771,8 +15805,9 @@
     var key = 'lk-' + line;
     var item = {id: key, type: 'scene', text: String(was.text || ''),
       round: was.round || '', at: rowItem.at || was.at || '', seg: key,
-      stands: String(was.stands || was.seg || ''), derived: true};
-    var print = item.text + SEP + String(item.at);
+      stands: String(was.stands || was.seg || ''), derived: true,
+      slot: was.slot};                                            /* [seg-names] */
+    var print = item.text + SEP + String(item.at) + SEP + sceneSlotKey(item);
     var node = scriptNodes.get(key);
     if (!node) {
       node = scriptBlock(item);
@@ -15866,7 +15901,8 @@
       var print = String(item.text || '') + SEP + String(item.type || '')
         + SEP + String(item.aired || '') + SEP + (item.tinted ? '1' : '0')
         + SEP + String(item.round || '') + SEP + String(item.at || '')
-        + SEP + (item.deleted ? 'D' : '');                        /* [#1200] */
+        + SEP + (item.deleted ? 'D' : '')                         /* [#1200] */
+        + SEP + sceneSlotKey(item);                               /* [seg-names] */
       var node = scriptNodes.get(key);
       if (node && node.pinePrint !== print) {
         var lit = node.classList.contains('sp-now');

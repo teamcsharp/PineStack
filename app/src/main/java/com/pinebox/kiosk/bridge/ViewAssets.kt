@@ -42,6 +42,7 @@ object ViewAssets {
         "pine-logo.js",           // the mark, inline - origins forbid a URL
         "boot-splash.js",         // the logo assembling itself at startup
         "pine-dismiss.js",        // tap away and a panel closes - one rule
+        "sfx-seen.js",            // [sfxseen] display receipts, before sfx-tv.js + script-page.js
         "view-chrome.js",         // the shared bar, tree and transport
         "console-line.js",        // the one-line backend readout, all screens
         // PineLive: the mic badge in that same bottom line, and the popup

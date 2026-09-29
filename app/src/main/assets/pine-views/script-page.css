@@ -4178,3 +4178,11 @@ html.pine-tech-wide .sp-tech.sp-tech-wide .wc-strip {
 .sp-mm-steps li { margin: 4px 0; }
 .sp-mm-steps li b { display: block; color: #cfe3ea; font-size: 12px; }
 .sp-mm-miss { margin: 0; padding-left: 18px; color: #e6c46f; font-size: 12px; }
+
+/* [seg-names] a round with no hour entry keeps its road title, quietly marked */
+.sp-segment-noslot {
+  margin-left: 6px;
+  color: #70828f;
+  font-weight: 400;
+  font-size: 10px;
+}

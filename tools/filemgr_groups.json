@@ -679,6 +679,7 @@
    "hot_road": null,
    "script_flag": null,
    "paths": [
+    "sfx_display_receipts.jsonl",
     "air_fixes.jsonl",
     "air_last_restart",
     "boot_log.jsonl",
