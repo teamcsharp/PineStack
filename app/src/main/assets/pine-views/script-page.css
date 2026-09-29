@@ -4012,3 +4012,16 @@ html.pine-tech-wide .sp-tech.sp-tech-wide .wc-strip {
 .sp-mv-past .sp-mv-rolls, .sp-mv-past .sp-mv-load, .sp-mv-past .sp-mv-all { display: none !important; }
 .sp-mv-past .sp-mv-text { font-size: 12.5px; }
 .sp-mv-k-idle .sp-mv-bubble { border-style: dashed; color: var(--sp-muted, #8fa0ad); }
+
+/* [msgdb] FROM A STORE: a filing cabinet (Carbon c:archive) over the
+   bubble's top-right corner - Classic and Digital - its tooltip naming the
+   store the record names. */
+.sp-mv-bubble .sp-mv-db {
+  position: absolute; top: -9px; right: -9px; z-index: 2; width: 24px; height: 24px;
+  display: grid; place-items: center; box-sizing: border-box;
+  border: 2px solid #d9b25c; border-radius: 50%; background: #1a1507; color: #f0cf7a;
+  box-shadow: 0 0 0 3px #070b10;
+}
+.sp-mv-bubble .sp-mv-db svg { width: 13px; height: 13px; }
+.sp-mv-past .sp-mv-db { opacity: .7; }
+.sp-mv-dbnote { color: #e6c46f; }
