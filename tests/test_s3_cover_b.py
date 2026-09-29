@@ -303,9 +303,9 @@ class DoorTests(CoverBase):
         self.assertIs(system3_runtime._S3_WRITE.get(), sentinel,
                       "the door node never becomes the conversation a later prompt writes for")
         self.assertEqual(app._s3_line_stamp_of(row)["conversation_id"], stamp["conversation_id"])
-        src = inspect.getsource(app._air_produced_ad)
+        src = inspect.getsource(getattr(app, "_air_produced_ad_floorless", app._air_produced_ad))   # [s3-chain-tests]
         self.assertIn('_s3_door_line(\n            "ad_spot"', src)
-        self.assertIn('_s3_door_line(\n            "ad_spot"', inspect.getsource(app.dj_music_ad))
+        self.assertIn('_s3_door_line(\n            "ad_spot"', inspect.getsource(getattr(app, "_dj_music_ad_floorless", app.dj_music_ad)))   # [s3-chain-tests]
         settle()
         self.assertTrue(dice.rt.store.conversation(stamp["conversation_id"]))
 
@@ -315,7 +315,7 @@ class DoorTests(CoverBase):
         stamp = asyncio.run(app._s3_door_line("upstairs", who="manager", seat="C", name="Mr Pine",
                                               context="the coffee", text="Who drank my coffee?"))
         self.assertEqual(stamp["road"], "upstairs")
-        src = inspect.getsource(app.dj_upstairs_page)
+        src = inspect.getsource(getattr(app, "_dj_upstairs_page_floorless", app.dj_upstairs_page))   # [s3-chain-tests]
         self.assertIn('"upstairs", who="manager", seat="C", name=boss', src)
         self.assertIn("upstairs_update(str(made.get(\"id\") or \"\"),\n                                system3=", src)
 

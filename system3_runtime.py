@@ -2527,10 +2527,19 @@ class System3Runtime:
         if not conv or conv.get("mode") != "active":
             return None
         planned = conv.get("turns") or []
-        if not conv.get("graph_structure") or len(planned) < 3:
-            return None
+        road = str((conv.get("identity") or {}).get("road_kind") or "")
+        if (road not in system3_tables.LINE_ROADS or not conv.get("graph_structure")
+                or len(planned) < 3):
+            # [s3-chain] known, and not a chapter: a round's own turn, a line road
+            # whose graph the operator switched off, or a plan under three turns
+            return ({"chapter": False, "road": road, "turns": len(planned)}
+                    if written is None else None)
         if written is None:
-            return {"sheet": str((conv.get("plan") or {}).get("sheet") or ""),
+            return {"chapter": True, "road": road,                                   # [s3-chain]
+                    "turn_ids": [t["turn_id"] for t in planned],
+                    "seconds": [float(t.get("planned_seconds") or 0) for t in planned],
+                    "estimated_seconds": float((conv.get("graph_profile") or {}).get("estimated_seconds") or 0),
+                    "sheet": str((conv.get("plan") or {}).get("sheet") or ""),
                     "turns": len(planned), "seats": [t["speaker"] for t in planned],
                     "roles": dict((conv.get("inputs") or {}).get("roles") or {}),
                     "names": dict((conv.get("inputs") or {}).get("names") or {})}
@@ -2549,8 +2558,28 @@ class System3Runtime:
         self.persist(conv)
         return [{"who": (conv.get("inputs") or {}).get("roles", {}).get(t["speaker"], "dj"),
                  "name": (conv.get("inputs") or {}).get("names", {}).get(t["speaker"], ""),
-                 "text": rows[i][1], "stamp": dict(stamp, turn_id=t["turn_id"])}
+                 "text": rows[i][1],
+                 # [s3-chain] each turn's own stamp: its node and its place
+                 "stamp": dict(stamp, turn_id=t["turn_id"], chapter_turn=i, chapter_of=len(planned))}
                 for i, t in enumerate(planned)]
+
+    def line_chapter_state(self, stamp, state, why="", extra=None):
+        """[s3-chain] Where a line road's exchange stands on the prepared shelf
+        (waiting, prepared, aired, partial, expired), recorded on the
+        conversation: a planned chapter that has not aired says why."""
+        try:
+            conv = self.recent.get(str((stamp or {}).get("conversation_id") or ""))
+            if not conv:
+                return
+            conv["chapter_state"] = dict(extra or {}, state=str(state), why=str(why or "")[:300],
+                                         at=time.time())
+            if state in ("aired", "partial", "expired", "stale"):
+                conv["status"] = "chapter_" + str(state)
+            self.remember(conv)
+            self.persist(conv)
+            self._flow(conv, "chapter %s%s" % (state, (": " + str(why)[:160]) if why else ""))
+        except Exception as exc:  # noqa: BLE001
+            self.fail("chapter state", exc)
 
     # --- [s3-split] THE SPLIT NODE AT THE STATION'S DOORS ---------------------------
     @staticmethod
@@ -4505,6 +4534,7 @@ def install(app, namespace):
     namespace["system3_direct_line"] = system3_direct_line
     namespace["system3_bind_line"] = rt.bind_line
     namespace["system3_line_chapter"] = rt.line_chapter
+    namespace["system3_line_chapter_state"] = rt.line_chapter_state      # [s3-chain]
     namespace["system3_link_line"] = rt.link_spoken                  # [s3-line-link]
     namespace["system3_observe_ledger"] = rt.observe_ledger
     namespace["system3_segment_block"] = rt.segment_block              # [s3-segment]
