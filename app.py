@@ -182949,6 +182949,7 @@ def script_ledger_order() -> dict[str, tuple[int, int]]:
     # What the two rows share is the ROUND id (`sid`) and the text, so a
     # second key is kept for exactly that.
     by_round_text: dict[tuple[str, str], tuple[int, int, bool]] = {}
+    s3_turn: dict[str, str] = {}             # [contd-mark] line -> its System 3 turn
     for r in script_ledger_rows():
         lid = str(r.get("line_id") or "")
         got = (int(r.get("block") or 0), int(r.get("ord") or 0),
@@ -182956,15 +182957,23 @@ def script_ledger_order() -> dict[str, tuple[int, int]]:
         if lid:
             out[lid] = got
         sid = str(r.get("sid") or "")
+        _s3m = r.get("system3")                  # [contd-mark]
+        if lid and isinstance(_s3m, dict) and _s3m.get("turn_id"):
+            s3_turn[lid] = str(_s3m.get("turn_id"))
         if sid and r.get("kind") == "sfx":
             key = (sid, " ".join(str(r.get("text") or "").lower().split()))
             by_round_text.setdefault(key, got)
+    _LEDGER_S3_TURN.clear()                   # [contd-mark]
+    _LEDGER_S3_TURN.update(s3_turn)
     _LEDGER_ROUND_TEXT.clear()
     _LEDGER_ROUND_TEXT.update(by_round_text)
     return out
 
 
 _LEDGER_ROUND_TEXT: dict[tuple[str, str], tuple[int, int, bool]] = {}
+# [contd-mark] line_id -> the System 3 turn stamped on it in the script
+# ledger (system3.turn_id), rebuilt with every script_ledger_order().
+_LEDGER_S3_TURN: dict[str, str] = {}
 
 
 def _ord_of(order: Any, row: Any) -> Any:
@@ -183936,6 +183945,48 @@ def screenplay_when_heard(row: Any) -> float:          # [#1218]
 _HANGER_SLOT: dict[str, float] = {}
 
 
+def screenplay_contd(elements: list[dict[str, Any]], line_id: str,
+                     name: str, pos: Any, cut_in: bool, gap: float) -> str:
+    """[contd-mark] The line this one CONTINUES when its speaker is being
+    named again only because a sting (an action) came between - one turn
+    cut in pieces - else "". The character cue then reads NAME (CONT'D).
+
+    Same turn: both lines' System 3 turn stamps (script ledger
+    system3.turn_id) are equal; with a stamp missing on either, both sit in
+    the same scripted ledger block. Never across a scene, another
+    character, a cut-in or a long pause."""
+    try:
+        if cut_in or (gap and gap > SCREENPLAY_GAP_BLOCK):
+            return ""
+        if not elements or elements[-1].get("type") != "action":
+            return ""
+        prev = None
+        for e in reversed(elements):
+            kind = e.get("type")
+            if kind == "dialogue":
+                prev = e
+                break
+            if kind in ("action", "parenthetical", "note"):
+                continue
+            return ""
+        if not prev or str(prev.get("name") or "") != str(name or ""):
+            return ""
+        a, b = str(prev.get("line") or ""), str(line_id or "")
+        if not a or not b:
+            return ""
+        ta, tb = _LEDGER_S3_TURN.get(a, ""), _LEDGER_S3_TURN.get(b, "")
+        if ta and tb:
+            return a if ta == tb else ""
+        order = pos if isinstance(pos, dict) else {}
+        pa, pb = order.get(a), order.get(b)
+        if (pa and pb and int(pa[0]) == int(pb[0])
+                and (len(pa) < 3 or pa[2]) and (len(pb) < 3 or pb[2])):
+            return a
+    except Exception:  # noqa: BLE001 - a cue is never worth the script
+        return ""
+    return ""
+
+
 def screenplay_compose(since: float, until: float, d: dict[str, Any],
                        notes: list[dict[str, Any]]) -> dict[str, Any]:
     """The hour as a script. Pure - every fact comes off `d`.
@@ -184842,7 +184893,11 @@ def screenplay_compose(since: float, until: float, d: dict[str, Any],
                 or (gap and gap > SCREENPLAY_GAP_BLOCK)
                 or (elements and elements[-1]["type"] == "action")):
             speaker = name
-            push("character", name.upper(), f"ch-{line_id}", at=at,
+            _contd = screenplay_contd(elements, line_id, name,   # [contd-mark]
+                                      _script_pos, cut_in, gap)
+            push("character", name.upper() + (" (CONT'D)" if _contd else ""),
+                 f"ch-{line_id}", at=at,
+                 **({"contd": True, "cont_of": _contd} if _contd else {}),
                  who=str(row.get("who") or ""))
             note = screenplay_parenthetical(row, one)
             if note:

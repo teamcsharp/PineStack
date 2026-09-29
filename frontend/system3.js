@@ -9858,6 +9858,432 @@ function sgAirWord(lines, air) {
   return {word: 'no air receipt yet', cls: ''};
 }
 
+/* [s3graphix] THE CHAIN, EXCHANGE BY EXCHANGE: the gates the walk rolled
+   drawn as forks between the messages (every way out, the taken one lit),
+   the handoff and its raffle between two messages, the same voice twice
+   said why (an EXPANSION edge, or one turn's pieces as NAME (CONT'D)), the
+   copied stamps named for what they are, and the message node that opens
+   in place into the tables that composed it. ES5; no timers; no scrolling. */
+var SGX_TURN_FAMS = {ES: 1, RS: 1, IRS: 1, FL: 1, CTS: 1, SPEAKERBOX: 1, SFX: 1, SFXGUY: 1, SPLIT: 1, IL: 1, TRACK_TALK: 1};
+var SGX_CAST = {initiator: 1, speaker: 1};
+var SGX_GATE = {branch: 1, chance: 1};
+var SGX_WHO_SEAT = {dj: 'A', host: 'A', a: 'A', cohost: 'B', b: 'B', third: 'D', guest: 'D', d: 'D'};
+var SGX_PLAN = new WeakMap();
+function sgxSeq(ev) {
+  var n = parseInt(String((ev && ev.event_id) || '').split(':').pop(), 10);
+  return isNaN(n) ? -1 : n;
+}
+function sgxNorm(s) { return String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim(); }
+function sgxClip(s, n) { return String(s || '').replace(/\s+/g, ' ').trim().slice(0, n || 600); }
+function sgxWordsOf(id) { return String(id || '').replace(/_/g, ' '); }
+function sgxSeatName(conv, seat) {
+  var ts = (conv && conv.turns) || [];
+  for (var i = 0; i < ts.length; i += 1) if (ts[i].speaker === seat && ts[i].name) return String(ts[i].name);
+  return String(seat || '');
+}
+function sgxVoice(who) {
+  var w = String(who || '');
+  return String(castName(w) || w || 'somebody');
+}
+function sgxShare(st, c) {
+  if (c.p != null) return pct(c.p);
+  var total = 0;
+  (st.candidates || []).forEach(function (x) { total += Number(x.weight) || 0; });
+  return total > 0 ? pct((Number(c.weight) || 0) / total) : '-';
+}
+function sgxStageDice(st) { return st && st.draw && st.draw.dice != null ? st.draw.dice : null; }
+/* Where each GRAPH draw sits: between the turn before it and the first turn
+   whose own draws come after it in the round's recorded order. */
+function sgxPlan(conv) {
+  if (SGX_PLAN.has(conv)) return SGX_PLAN.get(conv);
+  var turns = conv.turns || [], evs = conv.decision_events || [];
+  var at = {}, anchor = [], gaps = [], placed = {}, cast = {};
+  var i;
+  for (i = 0; i < turns.length; i += 1) { at[turns[i].turn_id] = i; anchor.push(Infinity); }
+  for (i = 0; i <= turns.length; i += 1) gaps.push([]);
+  evs.forEach(function (e) {
+    if (!e.turn_id || !SGX_TURN_FAMS[e.family] || at[e.turn_id] == null) return;
+    var s = sgxSeq(e);
+    if (s >= 0 && s < anchor[at[e.turn_id]]) anchor[at[e.turn_id]] = s;
+  });
+  evs.forEach(function (e) {
+    if (e.family !== 'GRAPH' || e.turn_id || e.stage || e.kind === 'observation') return;
+    var s = sgxSeq(e), k = turns.length;
+    for (var j = 0; j < turns.length; j += 1) if (anchor[j] !== Infinity && anchor[j] > s) { k = j; break; }
+    gaps[k].push(e);
+    placed[e.event_id] = 1;
+  });
+  gaps.forEach(function (g, k) {
+    g.sort(function (a, b) { return sgxSeq(a) - sgxSeq(b); });
+    if (k >= turns.length) return;
+    g.forEach(function (e) {
+      var st = (e.stages || [])[0] || {};
+      if (SGX_CAST[st.stage]) cast[turns[k].turn_id] = e;
+    });
+  });
+  var plan = {gaps: gaps, placed: placed, cast: cast};
+  SGX_PLAN.set(conv, plan);
+  return plan;
+}
+function sgxPlaced(conv, ev) { return !!(conv && ev && ev.family === 'GRAPH' && sgxPlan(conv).placed[ev.event_id]); }
+
+/* What one way out of a gate does to the loop. */
+function sgxRole(id, gate) {
+  id = String(id || '');
+  if (id === 'end' || id === 'close' || id === 'wrap') return {kind: 'exit', word: 'ends the round'};
+  if (id === 'topic_change') return gate === 'exit_gate' ? {kind: 'ext', word: 'goes round again: a new chapter'} : {kind: 'exit', word: 'ends the chapter'};
+  if (id === 'exit_gate' || id === 'exit') return {kind: 'exit', word: 'ends the chapter'};
+  if (id === 'skip') return {kind: 'exit', word: 'skips this seat'};
+  if (id === 'start') return {kind: 'ext', word: 'another chapter'};
+  if (id === 'speak' || /^(reply|answer|call)/.test(id)) return {kind: 'ext', word: 'extends the exchange'};
+  if (id === 'rebuttal') return {kind: 'ext', word: 'moves on to the rebuttal'};
+  return {kind: 'ext', word: 'goes to ' + sgxWordsOf(id)};
+}
+function sgxEdge(label, share, role, taken, dice, extra) {
+  return el('div', {class: 's3-sgx-edge ' + (taken ? 'taken' : 'not') + ' ' + role.kind, 'data-role': role.kind, title: extra || null},
+    el('span', {class: 's3-sgx-wire', 'aria-hidden': 'true'}),
+    el('b', {class: 's3-sgx-to', text: label}),
+    share ? el('span', {class: 's3-sgx-share', text: share}) : null,
+    el('span', {class: 's3-sgx-role', text: role.word}),
+    taken ? el('span', {class: 's3-sgx-took'}, dice === undefined ? null : die(dice), el('span', {text: dice == null ? 'taken - no roll' : 'taken'}))
+      : el('span', {class: 's3-sgx-took s3-muted', text: 'not taken'}));
+}
+/* A gate the walk rolled: one line per way out. */
+function sgxFork(conv, ev, api) {
+  var st = (ev.stages || [])[0] || {};
+  var gate = String((ev.meta || {}).node || '');
+  var d = sgxStageDice(st);
+  var ends = false;
+  var edges = (st.candidates || []).map(function (c) {
+    var role = sgxRole(c.id, gate);
+    if (role.kind === 'exit') ends = true;
+    return sgxEdge(String(c.label || sgxWordsOf(c.id)), sgxShare(st, c), role, c.id === st.selected, d);
+  });
+  var node = sgNode({fam: 'GRAPH', dice: d, label: 'GRAPH',
+    text: sgxWordsOf(gate || 'gate') + ': ' + (ends ? (gate === 'exit_gate' ? 'the round could end here' : 'the loop could end here') : 'the chain branches here'),
+    sub: st.stage + ' - d100 ' + (d == null ? '-' : d) + ' over the weights - tap for the card',
+    cls: 's3-sgn-roll s3-sgx-fork', onOpen: function () { openDecision(conv, ev, null, api); }},
+    el('div', 's3-sgx-edges', edges));
+  node.dataset.event = ev.event_id || '';
+  node.dataset.gate = gate;
+  return node;
+}
+/* The subject's loop (CTS): carried on, or ended with a new subject drawn. */
+function sgxCtsFork(conv, ev, t, api) {
+  var sel = ev.selected || {};
+  var cont = sel.id === 'CONTINUE' || sel.authority === 'continuing';
+  var d = eventLine(ev, conv).dice;
+  var why = (ev.meta || {}).why || '';
+  var edges = [
+    sgxEdge('the subject carries on', '', {kind: 'ext', word: 'extends the chapter'}, cont, cont ? null : undefined, cont ? why : ''),
+    sgxEdge(cont ? 'a new subject off the table' : 'a new subject: ' + sgxClip(landedWords(ev, conv), 90), '', {kind: 'exit', word: 'ends the chapter'}, !cont, cont ? undefined : d)];
+  var node = sgNode({fam: 'CTS', dice: cont ? undefined : d, label: 'CTS',
+    text: 'turn ' + (t.index + 1) + ': the chapter ' + (cont ? 'carried on' : 'ended - a new subject was drawn'),
+    sub: cont ? (why || 'no roll: the subject continued') : 'd100 ' + (d == null ? '-' : d) + ' - tap for the card',
+    cls: 's3-sgn-roll s3-sgx-fork s3-sgx-ctsfork', onOpen: function () { openDecision(conv, ev, t, api); }},
+    el('div', 's3-sgx-edges', edges));
+  node.dataset.event = ev.event_id || '';
+  node.dataset.gate = 'cts';
+  return node;
+}
+/* The handoff between two messages - or, one voice twice, the EXPANSION. */
+function sgxHand(conv, prev, next, cast, gapEvs, api) {
+  var same = !!prev && prev.speaker === next.speaker;
+  var st = cast ? ((cast.stages || [])[0] || {}) : null;
+  var d = st ? sgxStageDice(st) : null;
+  var name = String(next.name || next.speaker || '?'), was = prev ? String(prev.name || prev.speaker || '?') : '';
+  var pool = st ? (st.candidates || []).map(function (c) { return sgxSeatName(conv, c.id) + ' ' + sgxShare(st, c); }).join(' / ') : '';
+  var how = st ? (st.stage === 'initiator' ? 'opened the round' : 'won the seat') + ': d100 ' + (d == null ? '-' : d) + ' in a pool of ' + pool
+    : "by the structure's seat order - no raffle";
+  var why = '';
+  if (same) {
+    var fork = null;
+    (gapEvs || []).forEach(function (e) {
+      var s = (e.stages || [])[0] || {};
+      if (SGX_GATE[s.stage] && (s.candidates || []).length > 1) fork = e;
+    });
+    var fs = fork ? (fork.stages || [])[0] : null;
+    why = st ? 'cast again: ' + name + ' ' + how
+      : fork ? 'the chain extended at ' + sgxWordsOf((fork.meta || {}).node) + ' (d100 ' + sgxStageDice(fs) + ' -> ' + sgxWordsOf(fs.selected) + ') and the seat stayed with ' + name
+      : 'the running order put ' + name + ' on again: ' + (next.step_label || next.step || 'the next step') + ' - no roll';
+  }
+  var body = el('div', 's3-sgx-handbody',
+    same ? para('Why the same voice again: ' + why + '. This is a new turn of its own - not one turn split in pieces (those read NAME (CONT\'D)).', 's3-sgx-why') : null,
+    st ? stageStory(st, cast, conv, null) : para('No raffle is on the record for this seat: the road\'s structure hands the mic on in its own order.', 's3-muted'),
+    cast ? el('div', 's3-row', btn('The full card', function () { openDecision(conv, cast, next, api); }, {class: 's3-sgx-card'})) : null);
+  var box = el('details', {class: 's3-sgn s3-sgx-hand' + (same ? ' s3-sgx-expand' : ''), style: '--fam:' + (same ? 'var(--fl)' : 'var(--topic)'),
+      'data-from': prev ? prev.turn_id : '', 'data-to': next.turn_id},
+    el('summary', null, el('span', {class: 's3-sgn-dot', 'aria-hidden': 'true'}),
+      st ? die(d) : null,
+      el('b', {class: 's3-sgn-fam', text: same ? 'EXPANSION' : 'HANDOFF'}),
+      el('span', {class: 's3-sgn-text', text: same ? name + ' again - ' + why
+        : (prev ? was + ' held the mic -> ' + name + ' ' : 'the mic opens: ' + name + ' ') + how})),
+    body);
+  return box;
+}
+/* Where the round stopped. */
+function sgxEnd(conv) {
+  var turns = conv.turns || [];
+  if (turns.length < 2) return null;
+  var len = (conv.decision_events || []).filter(function (e) { return e.family === 'LENGTH'; })[0] || null;
+  var last = turns[turns.length - 1], prof = conv.graph_profile || null;
+  var why = len ? 'the length roll set the round: ' + sgxClip(landedWords(len, conv), 80) + ' (d100 ' + (eventLine(len, conv).dice == null ? '-' : eventLine(len, conv).dice) + ')'
+    : last.graph_node ? 'the graph walk stopped at ' + sgxWordsOf(last.graph_node) + (prof && prof.closed === false ? ' before its end node - the time budget' : '')
+    : 'the structure ran out of turns';
+  var node = sgNode({fam: 'COMMIT', label: 'END', text: 'the round ends after ' + turns.length + ' turns', sub: why, cls: 's3-sgx-end'},
+    el('div', 's3-sgx-edges', sgxEdge('ends here', '', {kind: 'exit', word: 'ends the round'}, true, undefined),
+      sgxEdge('another turn', '', {kind: 'ext', word: 'extends the exchange'}, false)));
+  return node;
+}
+/* The spine between turn `prev` and turn `next` (next null: after the last). */
+function sgxGap(ctx, conv, prev, next, evs) {
+  var out = [], cast = null;
+  (evs || []).forEach(function (ev) {
+    var st = (ev.stages || [])[0] || {};
+    if (SGX_GATE[st.stage] && (st.candidates || []).length > 1) out.push(sgxFork(conv, ev, ctx.api));
+    else if (SGX_CAST[st.stage] && next) cast = ev;
+    else out.push(sgRoll(conv, ev, null, ctx.api));
+  });
+  if (next) {
+    turnEvents(conv, next).forEach(function (ev) {
+      var sel = ev.selected || {};
+      if (ev.family === 'CTS' && sel.id !== 'OBLIGATED' && sel.authority !== 'obligated') out.push(sgxCtsFork(conv, ev, next, ctx.api));
+    });
+    if (prev || cast) out.push(sgxHand(conv, prev, next, cast, evs, ctx.api));
+  } else if (prev) {
+    var end = sgxEnd(conv);
+    if (end) out.push(end);
+  }
+  if (!out.length) return null;
+  return el('div', {class: 's3-sgx-gap', 'data-gap': next ? next.turn_id : 'end'}, out);
+}
+/* After the round's turns are on the spine: the gap before each turn goes in
+   front of its group, the round's close right after the last one. */
+function sgxInterleave(ctx, conv, box) {
+  var plan = sgxPlan(conv), turns = conv.turns || [], groups = {}, last = null;
+  for (var c = box.firstElementChild; c; c = c.nextElementSibling) {
+    if (c.classList.contains('s3-sgn-turn') && c.getAttribute('data-turn') && !groups[c.getAttribute('data-turn')]) groups[c.getAttribute('data-turn')] = c;
+  }
+  for (var i = 0; i < turns.length; i += 1) {
+    var node = groups[turns[i].turn_id];
+    if (!node) continue;
+    var g = sgxGap(ctx, conv, i ? turns[i - 1] : null, turns[i], plan.gaps[i]);
+    if (g) box.insertBefore(g, node);
+    last = node;
+  }
+  var tail = last ? sgxGap(ctx, conv, turns[turns.length - 1], null, plan.gaps[turns.length]) : null;
+  if (tail) last.after(tail);
+}
+
+/* One turn's lines in this segment, in ledger order, as pieces: runs of the
+   turn's own words (its seat's voice, words found in the turn as written)
+   cut where a sting or Sam's line came between; lines that only carry the
+   turn's stamp are marked copies. */
+function sgxSameSeat(l, t) {
+  var seat = SGX_WHO_SEAT[String(l.who || '').toLowerCase()];
+  if (seat && t.speaker) return seat === t.speaker;
+  return sgxNorm(sgxVoice(l.who)) === sgxNorm(t.name);
+}
+/* A ledger row written before the stamp fix carries dice copied by AUDIO
+   CHUNK, not by turn: its own dice.s3.turn_id may name another turn while
+   its system3.turn_id (the line's turn_id here) is right. The row stays on
+   its system3 turn; the dice are said to be unreliable, never shown as
+   this turn's roll. */
+function sgxBadDice(l) {
+  var s3 = l && l.dice && l.dice.s3;
+  var other = s3 && s3.turn_id ? String(s3.turn_id) : '';
+  return other && other !== String(l.turn_id || '') ? other : '';
+}
+function sgxTurnRun(ctx, conv, t, here, slot) {
+  var rows = (conv.lines || []).filter(function (l) {
+    return l.turn_id === t.turn_id && here.has(l.line_id) && (isSpoken(l) || l.who === 'drop');
+  });
+  var stings = slot ? slot.before.concat(slot.after).filter(function (l) { return here.has(l.line_id); }) : [];
+  var all = rows.concat(stings).sort(byLedger);
+  var whole = sgxNorm(lineText(conv, t));
+  var parts = [], pending = [], seen = {};
+  all.forEach(function (l) {
+    if (isBoard(l) || l.who === 'drop') { pending.push(l); return; }
+    var words = sgxNorm(l.text);
+    var genuine = sgxSameSeat(l, t) && (l.cont === true || !whole || !words || whole.indexOf(words.slice(0, 48)) >= 0);
+    var last = parts.length ? parts[parts.length - 1] : null;
+    var again = genuine && !!words && !!seen[words];
+    if (last && !pending.length && genuine && last.genuine && !again && !last.again && last.block === l.block && last.who === l.who) {
+      if (!last.badDice) last.badDice = sgxBadDice(l);
+      last.lines.push(l);
+      last.text += ' ' + String(l.text || '');
+      if (words) seen[words] = 1;
+      return;
+    }
+    parts.push({lines: [l], text: String(l.text || ''), who: l.who, block: l.block, genuine: genuine, again: again,
+      cut: pending, blockChanged: !!last && last.block !== l.block, cont: l.cont === true, badDice: sgxBadDice(l)});
+    pending = [];
+    if (genuine && words) seen[words] = 1;
+  });
+  return {parts: parts, drawn: new Set(), split: parts.length > 1};
+}
+function sgxCutWords(p, prev) {
+  if (prev && !prev.genuine) {
+    return 'resumed after ' + sgxVoice(prev.who) + '\'s line that carries the same stamp (a copy)' +
+      (p.cut.length ? ' and ' + sgxCutWords({cut: p.cut, cont: p.cont}, null).replace(/^split around /, '') : '');
+  }
+  var said = p.cut.map(function (l) {
+    return isBoard(l) ? 'a sting (' + (boardName(l) || 'a clip') + ')' : sgxVoice(l.who) + '\'s line ("' + sgxClip(l.text, 60) + '")';
+  });
+  if (said.length) return 'split around ' + said.join(' and ') + (p.cont ? ' (the ledger marks it cont)' : '');
+  if (p.cont) return 'the ledger marks it a continuation (cont)';
+  return p.blockChanged ? 'picked up again in block ' + p.block : 'carried on in the next ledger row';
+}
+/* The message node(s) of a turn: the LINE node as it always was when the
+   turn aired whole; its pieces as one continued turn when it was split. */
+function sgxWords(ctx, conv, t, group, run, lineNode) {
+  if (!run.split) { sgxMsg(ctx, conv, t, lineNode); group.append(lineNode); return; }
+  var first = -1, k;
+  for (k = 0; k < run.parts.length; k += 1) if (run.parts[k].genuine) { first = k; break; }
+  var pieces = run.parts.filter(function (p) { return p.genuine; }).length;
+  if (first < 0) { sgxMsg(ctx, conv, t, lineNode); group.append(lineNode); }
+  var n = 0;
+  run.parts.forEach(function (p, i) {
+    p.cut.forEach(function (l) { if (isBoard(l)) { group.append(sgSting(l)); run.drawn.add(l.line_id); } });
+    var name = sgxVoice(p.who).toUpperCase();
+    if (p.genuine) n += 1;
+    if (i === first) {
+      var tx = lineNode.querySelector('.s3-sgn-text'), sub = lineNode.querySelector('.s3-sgn-sub');
+      if (tx) tx.textContent = sgxClip(p.text, 600);
+      if (sub) sub.textContent = 'piece 1 of ' + pieces + ' of one turn - block ' + p.block +
+        (p.badDice ? ' - the dice on its row name ' + p.badDice + ' (copied by audio chunk): unreliable, not a roll of this turn' : '');
+      lineNode.dataset.piece = '1';
+      sgxMsg(ctx, conv, t, lineNode);
+      group.append(lineNode);
+      return;
+    }
+    if (p.genuine) {
+      group.append(el('div', {class: 's3-sgx-contd-edge', 'data-piece': String(n)},
+        el('span', {class: 's3-sgx-wire', 'aria-hidden': 'true'}),
+        el('b', {text: '(CONT\'D)'}),
+        el('span', {text: 'the same turn, ' + sgxCutWords(p, i ? run.parts[i - 1] : null) + ' - no roll'})));
+      var node = sgNode({fam: 'LINE', label: name + ' (CONT\'D)', text: sgxClip(p.text, 600),
+        sub: (p.again ? 'the same words aired again (block ' + p.block + '): a re-air, not new words - ' : '') + 'piece ' + n + ' of ' + pieces + ' of turn ' + (t.index + 1) +
+          (p.badDice ? ' - the dice on its row name ' + p.badDice + ' (copied by audio chunk): unreliable, not a roll of this turn' : ''),
+        cls: 's3-sgn-words s3-sgx-contd' + (p.again ? ' s3-sgx-again' : '')});
+      node.dataset.piece = String(n);
+      sgxMsg(ctx, conv, t, node);
+      group.append(node);
+      return;
+    }
+    var copy = sgNode({fam: 'LINE', label: name, text: sgxClip(p.text, 600),
+      sub: 'carries turn ' + (t.index + 1) + '\'s stamp, but ' + (sgxSameSeat(p.lines[0], t) ? 'these words are not the turn\'s' : 'not the voice of its seat') +
+        ' - a copied stamp: drawn under the turn it claims, not an exchange of its own (block ' + p.block + ')' +
+        (p.badDice ? '; its own dice name ' + p.badDice + ' (unreliable)' : ''),
+      cls: 's3-sgx-copy'});
+    copy.dataset.line = p.lines[0].line_id || '';
+    group.append(copy);
+  });
+}
+
+/* The message node opens in place: the breakdown goes INSIDE the node, and
+   comes out again leaving the node exactly as it was. */
+function sgxMsg(ctx, conv, t, node) {
+  node.classList.add('s3-sgn-open');
+  node.classList.add('s3-sgx-msg');
+  node.setAttribute('role', 'button');
+  node.setAttribute('tabindex', '0');
+  node.setAttribute('aria-expanded', 'false');
+  node.title = 'Tap to open the tables that composed this message; tap again to fold it back';
+  node.addEventListener('click', function (e) {
+    var hit = e.target && e.target.closest ? e.target.closest('a, button, summary, details, input, select, video, audio, .s3-sgx-exp') : null;
+    /* a control inside the node keeps its own tap - also the fold button,
+       whose own click has already taken the breakdown out of the page */
+    if (hit && hit !== node && (node.contains(hit) || !hit.isConnected)) return;
+    e.stopPropagation();
+    sgxToggle(ctx, conv, t, node);
+  });
+  node.addEventListener('keydown', function (e) {
+    if (e.target !== node || (e.key !== 'Enter' && e.key !== ' ')) return;
+    e.preventDefault();
+    sgxToggle(ctx, conv, t, node);
+  });
+}
+function sgxToggle(ctx, conv, t, node) {
+  var body = node.querySelector('.s3-sgn-body');
+  if (!body) return;
+  if (node.getAttribute('aria-expanded') === 'true') {
+    if (node.sgxBox && node.sgxBox.parentNode) node.sgxBox.parentNode.removeChild(node.sgxBox);
+    node.classList.remove('s3-sgx-open');
+    node.setAttribute('aria-expanded', 'false');
+    return;
+  }
+  if (!node.sgxBox) node.sgxBox = sgxBreakdown(ctx, conv, t, function () { sgxToggle(ctx, conv, t, node); });
+  body.appendChild(node.sgxBox);
+  node.classList.add('s3-sgx-open');
+  node.setAttribute('aria-expanded', 'true');
+}
+/* One draw as the node's breakdown shows it: the family, the table, every
+   stage with the pick and its d100, the weights folded. */
+function sgxDraw(conv, ev, t, api) {
+  var sel = ev.selected || {};
+  var line = eventLine(ev, conv);
+  var what = (FAMILY_WHAT[ev.family] || [ev.family])[0];
+  var steps = [];
+  if (sel.table) steps.push(el('span', {class: 's3-sgx-step'}, el('i', {text: 'table'}), ' ', el('b', {text: String(sel.table)})));
+  (ev.stages || []).forEach(function (st) {
+    if (st.stage === 'table' && sel.table && String(st.selected) === String(sel.table)) return;
+    var c = (st.candidates || []).filter(function (x) { return x.id === st.selected; })[0];
+    var lab = c ? String(c.label || c.id) : (st.selected == null ? '' : String(st.selected));
+    var d = sgxStageDice(st);
+    var of = (st.candidates || []).length;
+    if (steps.length) steps.push(el('span', {class: 's3-sgx-arrow', 'aria-hidden': 'true', text: '->'}));
+    steps.push(el('span', {class: 's3-sgx-step'}, el('i', {text: st.stage}), ' ', el('b', {text: sgxClip(lab, 80)}),
+      of > 1 ? el('span', {class: 's3-muted', text: ' of ' + of}) : null,
+      d != null ? die(d) : el('span', {class: 's3-muted', text: of === 1 ? ' (the only one)' : ' (no roll)'})));
+  });
+  var weighed = (ev.stages || []).filter(function (st) { return (st.candidates || []).length > 1; });
+  var fold = null;
+  if (weighed.length) {
+    var inner = el('div', 's3-sgx-weights-body');
+    fold = el('details', 's3-sgx-weights', el('summary', {text: 'the weights (' + weighed.length + ' table' + (weighed.length === 1 ? '' : 's') + ')'}), inner);
+    fold.addEventListener('toggle', function () {
+      if (fold.open && !inner.childElementCount) {
+        var kids = [];
+        weighed.forEach(function (st) { kids.push(el('div', {class: 's3-muted', text: st.stage})); stageStory(st, ev, conv, t).forEach(function (k) { kids.push(k); }); });
+        fill(inner, kids);
+      }
+    });
+  }
+  var perf = ev.family === 'ES' && t && t.performance ? t.performance : null;
+  return el('div', {class: 's3-sgx-draw', style: '--fam:' + (FAM[ev.family] || 'var(--obs)'), 'data-event': ev.event_id || '', 'data-family': ev.family},
+    el('div', 's3-sgx-drawhead', die(line.dice), el('b', {class: 's3-sgn-fam', text: ev.family}),
+      el('span', {class: 's3-sgx-landed', text: sgxClip(landedWords(ev, conv) || line.text, 160)}),
+      btn('Card', function () { openDecision(conv, ev, t, api); }, {class: 's3-sgx-card', title: 'the full decision card for this draw'})),
+    el('div', {class: 's3-muted', text: what}),
+    steps.length ? el('div', 's3-sgx-path', steps) : para((ev.meta || {}).why || (sel.authority ? 'not drawn: ' + sel.authority : 'decided by a rule, not a roll'), 's3-muted'),
+    perf ? el('div', {class: 's3-sgx-voice s3-muted', text: 'the voice it asked for: pace ' + num(perf.pace) + ', energy ' + num(perf.energy) + ', warmth ' + num(perf.warmth) + ', pauses ' + (perf.pause_style || '-')}) : null,
+    fold);
+}
+function sgxBreakdown(ctx, conv, t, fold) {
+  var cast = sgxPlan(conv).cast[t.turn_id] || null;
+  var cst = cast ? ((cast.stages || [])[0] || {}) : null;
+  var evs = turnEvents(conv, t).slice().sort(function (a, b) {
+    return (a.family === 'ES' ? -1 : 0) - (b.family === 'ES' ? -1 : 0) || sgxSeq(a) - sgxSeq(b);
+  });
+  var who = String(t.name || t.speaker || '?');
+  var rows = [
+    el('div', 's3-sgx-exphead', el('b', {text: 'What composed this message'}),
+      el('span', {class: 's3-muted', text: ['turn ' + (t.index + 1), who, t.step_label || t.step || '', t.phase || '', t.graph_node ? 'node ' + sgxWordsOf(t.graph_node) : ''].filter(Boolean).join(' - ')})),
+    el('div', 's3-sgx-cast', el('b', {class: 's3-sgn-fam', text: 'CAST'}), cst ? die(sgxStageDice(cst)) : null,
+      el('span', {text: cst ? who + ' ' + (cst.stage === 'initiator' ? 'opened the round' : 'won the seat') + ' in a pool of ' +
+        (cst.candidates || []).map(function (c) { return sgxSeatName(conv, c.id) + ' ' + sgxShare(cst, c); }).join(' / ')
+        : who + ' held this seat by the structure\'s order - no raffle on the record'}))];
+  if (!evs.length) rows.push(para('No draw is recorded on this turn.', 's3-muted'));
+  evs.forEach(function (ev) { rows.push(sgxDraw(conv, ev, t, ctx.api)); });
+  var dirs = (t.directions || []).map(function (d) { return d && d.text; }).filter(Boolean);
+  if (dirs.length) rows.push(el('div', 's3-sgx-dirs', el('b', {text: 'What it told the writer: '}), dirs.join('; ')));
+  if (t.protocol) rows.push(el('div', {class: 's3-sgx-dirs s3-muted', text: 'the node\'s protocol: ' + sgxClip(t.protocol, 400)}));
+  if (t.text) rows.push(el('details', 's3-sgx-weights', el('summary', {text: 'the turn as written'}), el('blockquote', {class: 's3-dquote', text: t.text})));
+  rows.push(el('div', 's3-row', btn('Fold back to the message', fold, {class: 's3-sgx-fold'})));
+  return el('div', {class: 's3-sgx-exp', role: 'group', 'aria-label': 'what composed this message'}, rows);
+}
+
 function sgTurn(ctx, conv, t, here, elsewhere) {
   const lines = (conv.lines || []).filter(l => l.turn_id === t.turn_id && here.has(l.line_id));
   const spoken = lines.filter(isSpoken);
@@ -9883,16 +10309,18 @@ function sgTurn(ctx, conv, t, here, elsewhere) {
       sub: String(t.topic_material.text).replace(/\s+/g, ' ').slice(0, 260), cls: 's3-sgn-inset'}));
   }
   const slot = boardPlan(conv).get(t.turn_id);
-  for (const l of slot ? slot.before : []) if (here.has(l.line_id)) group.append(sgSting(l));
+  const sgxRun = sgxTurnRun(ctx, conv, t, here, slot);   /* [s3graphix] */
+  for (const l of slot ? slot.before : []) if (here.has(l.line_id) && !sgxRun.drawn.has(l.line_id)) group.append(sgSting(l));
   const said = idx == null ? [] : (conv.observations_air || []).filter(o => o.family === 'SFXGUY' && o.turn_index === idx);
   /* gold bars, re-airs and anything else that carries a line into this turn with its own stamp */
   const stamped = lines.filter(l => !isSpoken(l) && !isBoard(l) && l.who !== 'drop' &&
     (l.gold || l.replay_of || /gold|replay|re-?air/i.test(String(l.kind || l.who || ''))));
   const words = lineText(conv, t) || spoken.map(l => l.text).join(' ');
-  group.append(sgNode({fam: 'LINE', label: 'LINE', text: words ? String(words).replace(/\s+/g, ' ').slice(0, 600) : 'no words - ' + (t.status || 'planned'),
+  const sgxLine = (sgNode({fam: 'LINE', label: 'LINE', text: words ? String(words).replace(/\s+/g, ' ').slice(0, 600) : 'no words - ' + (t.status || 'planned'),
     sub: spoken.length ? `${spoken.length} line${spoken.length === 1 ? '' : 's'} in the script (block ${spoken[0].block})` : '',
     cls: 's3-sgn-words'}));
-  for (const l of slot ? slot.after : []) if (here.has(l.line_id)) group.append(sgSting(l));
+  sgxWords(ctx, conv, t, group, sgxRun, sgxLine);   /* [s3graphix] the message node(s) */
+  for (const l of slot ? slot.after : []) if (here.has(l.line_id) && !sgxRun.drawn.has(l.line_id)) group.append(sgSting(l));
   for (const o of said) {
     const draws = o.draws || [];
     const last = draws[draws.length - 1] || null;
@@ -9946,7 +10374,7 @@ function sgConversation(ctx, c) {
     return box;
   }
   const evs = (conv.decision_events || []).filter(e => !e.turn_id && !e.stage && e.kind !== 'observation');
-  const own = evs.filter(e => e.family !== 'STATION');
+  const own = evs.filter(e => e.family !== 'STATION' && !sgxPlaced(conv, e));   /* [s3graphix] */
   const station = evs.filter(e => e.family === 'STATION');
   const spont = own.filter(e => SG_SPONTANEITY.has(e.family)).length;
   if (own.length) {
@@ -9985,6 +10413,7 @@ function sgConversation(ctx, c) {
     box.append(sgNode({fam: 'REPAIR', label: 'CHECKED', text: `${val.verdict} ${num(val.score)}`,
       sub: [val.written != null ? `${val.written} of ${val.planned} turns written` : '', val.seat_order != null ? 'seat order ' + pct(val.seat_order) : ''].filter(Boolean).join(' · ')}));
   }
+  sgxInterleave(ctx, conv, box);   /* [s3graphix] forks, handoffs, expansions between the turns */
   return box;
 }
 

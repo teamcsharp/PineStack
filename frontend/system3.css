@@ -1095,6 +1095,63 @@
   .s3-sgn-open:hover { background: var(--panel-2); }
 }
 
+/* [s3graphix] the chain exchange by exchange: the spine between two messages */
+.s3-sgx-gap { display: grid; grid-template-columns: minmax(0, 1fr); gap: 3px; margin: 4px 0 0 10px; min-width: 0; }
+.s3-sgx-edges { display: grid; gap: 3px; margin-top: 4px; min-width: 0; }
+.s3-sgx-edge { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; font-size: 12px; min-width: 0; }
+.s3-sgx-wire { flex: none; width: 34px; height: 0; border-top: 2px solid var(--accent); }
+.s3-sgx-edge.exit .s3-sgx-wire { border-top-color: var(--warn); }
+.s3-sgx-edge.not { opacity: .55; }
+.s3-sgx-edge.not .s3-sgx-wire { border-top-style: dashed; }
+.s3-sgx-edge.taken .s3-sgx-wire { border-top-width: 3px; box-shadow: 0 0 6px var(--accent); }
+.s3-sgx-edge.taken.exit .s3-sgx-wire { box-shadow: 0 0 6px var(--warn); }
+.s3-sgx-edge.taken .s3-sgx-to { color: var(--ink); }
+.s3-sgx-to { color: var(--ink-2); font-weight: 600; overflow-wrap: anywhere; }
+.s3-sgx-share { font: 11px ui-monospace, monospace; color: var(--ink-2); }
+.s3-sgx-role { color: var(--ink-3); font-style: italic; }
+.s3-sgx-edge.exit .s3-sgx-role { color: var(--warn); }
+.s3-sgx-took { display: inline-flex; align-items: center; gap: 5px; margin-left: auto; font-size: 11px; }
+.s3-sgx-took .s3-die, .s3-sgx-hand > summary > .s3-die, .s3-sgx-cast .s3-die, .s3-sgx-drawhead .s3-die, .s3-sgx-step .s3-die {
+  width: 26px; height: 18px; font-size: 10.5px; }
+.s3-sgx-fork { background: #182a2f; }
+.s3 details.s3-sgx-hand { background: transparent; border-style: dashed; padding: 3px 9px; }
+.s3 details.s3-sgx-hand > summary .s3-sgn-text { font-size: 12px; color: var(--ink-2); }
+.s3 details.s3-sgx-expand { border-style: solid; background: #221d33; }
+.s3 details.s3-sgx-expand > summary .s3-sgn-text { color: var(--ink); }
+.s3-sgx-handbody { display: grid; gap: 4px; margin-top: 6px; min-width: 0; }
+.s3-sgx-why { font-size: 12px; color: var(--ink-2); margin: 0; }
+.s3-sgx-end { border-style: dashed; }
+/* one turn in pieces: the continuation reads as the same message carried on */
+.s3-sgx-contd-edge { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; margin: 0 0 0 14px; font-size: 11.5px; color: var(--ink-3); }
+.s3-sgx-contd-edge .s3-sgx-wire { width: 18px; border-top: 2px dotted var(--line); }
+.s3-sgx-contd-edge b { color: var(--line); font: 700 11px ui-monospace, monospace; }
+.s3-sgn.s3-sgx-contd { margin-left: 14px; border-left-style: double; border-left-width: 4px; }
+.s3-sgn.s3-sgx-again { opacity: .8; }
+.s3-sgn.s3-sgx-copy { margin-left: 14px; background: transparent; border-style: dashed; opacity: .7; }
+.s3-sgn.s3-sgx-copy .s3-sgn-text { font-size: 12.5px; color: var(--ink-2); }
+/* the message node open in place */
+.s3-sgn.s3-sgx-open { background: #1d3036; border-color: #4a6466; }
+.s3-sgx-exp { display: grid; gap: 6px; margin-top: 8px; padding-top: 8px; border-top: 1px solid #2b3d42; min-width: 0; cursor: auto;
+  font-family: system-ui, sans-serif; }
+.s3-sgx-exphead { display: flex; flex-wrap: wrap; gap: 4px 10px; align-items: baseline; }
+.s3-sgx-cast, .s3-sgx-drawhead { display: flex; flex-wrap: wrap; gap: 4px 8px; align-items: center; min-width: 0; font-size: 12.5px; }
+.s3-sgx-draw { display: grid; gap: 3px; padding: 5px 8px; border-left: 3px solid var(--fam, var(--obs)); background: #152127; border-radius: 0 6px 6px 0; min-width: 0; }
+.s3-sgx-landed { color: var(--ink); overflow-wrap: anywhere; min-width: 0; }
+.s3 .s3-sgx-card { margin-left: auto; padding: 1px 8px; font-size: 11px; }
+.s3-sgx-path { display: flex; flex-wrap: wrap; gap: 3px 6px; align-items: center; font-size: 12px; min-width: 0; }
+.s3-sgx-step { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 4px; min-width: 0; }
+.s3-sgx-step i { color: var(--ink-3); font-style: normal; font-size: 11px; }
+.s3-sgx-step b { color: var(--ink); font-weight: 600; overflow-wrap: anywhere; }
+.s3-sgx-arrow { color: var(--ink-3); font: 11px ui-monospace, monospace; }
+.s3-sgx-voice, .s3-sgx-dirs { font-size: 12px; overflow-wrap: anywhere; }
+.s3 details.s3-sgx-weights > summary { font-size: 11.5px; }
+.s3-sgx-weights-body { display: grid; gap: 4px; margin-top: 4px; min-width: 0; }
+@media (max-width: 560px) {
+  .s3-sgx-gap { margin-left: 4px; }
+  .s3-sgx-wire { width: 20px; }
+  .s3-sgn.s3-sgx-contd, .s3-sgn.s3-sgx-copy, .s3-sgx-contd-edge { margin-left: 6px; }
+}
+
 /* [s3-segment-feed] The Messenger's sections are the station's scheduled
    segments: a head band per stretch of a segment, every conversation of it
    under it - a round under its own sub-head, a single line (an interjection,
