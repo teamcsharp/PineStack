@@ -759,8 +759,8 @@
     }));
     tray.appendChild(trayButton('sample', 'm:movie', 'S', 'Add sample - paste a link, cut moments into the DJs\' rotation', openSampleSheet));
     tray.appendChild(trayButton('golive', 'c:satellite', 'L', 'Go LIVE - the public listen link', openShareSheet));
-    var after = bar.querySelector('.pine-console-live');
-    bar.insertBefore(tray, after ? after.nextSibling : (bar.firstChild || null));
+    /* [plbar] the right corner, before the terminal button - where the desk keeps them */
+    bar.insertBefore(tray, bar.querySelector('.pine-console-more') || null);
   }
 
   function traySheet(title) {
