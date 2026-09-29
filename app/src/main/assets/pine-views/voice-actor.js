@@ -402,9 +402,9 @@
     });
     /* Beside the PineLive mic: right after it when it is already there,
      * else the same slot the mic itself takes (before the gallery). */
-    var mic = bar.querySelector('.pine-console-live');
-    var before = mic ? mic.nextSibling
-      : (bar.querySelector('.pine-console-gallery') || bar.querySelector('.pine-console-viewport'));
+    /* [vaicon] where the operator marked it: right after the "i" (changelog), before the readout */
+    var info = bar.querySelector('.pine-console-change');
+    var before = info ? info.nextSibling : bar.querySelector('.pine-console-viewport');
     bar.insertBefore(b, before || null);
     ui.badge = b;
     paintBadge();
