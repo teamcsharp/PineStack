@@ -366,17 +366,17 @@ class PineVideoWall(
     // ---------------------------------------------------------------- api
 
     /** Show the wall and keep it fed. Safe to call when already running. */
-    fun start() {
+    fun start(vcr: Boolean = true) {
         if (!running.compareAndSet(false, true)) return
         onMain {
-            refreshVisibility()
+            if (vcr) vcrShow() else refreshVisibility()   // [vcrfx] dot -> line -> picture
             build()
         }
         pump = scope.launch { feed() }
     }
 
     /** Hide it and let everything go. Safe to call when already stopped. */
-    fun stop() {
+    fun stop(vcr: Boolean = true) {
         if (!running.compareAndSet(true, false)) return
         pump?.cancel()
         pump = null
@@ -392,7 +392,7 @@ class PineVideoWall(
             playback = "off"
             held = false; holdUntil = 0L; menuHidden = false
             atIndex = -1; atCount = 0; atPos = -1L; atDuration = -1L
-            visibility = View.GONE
+            if (vcr) vcrGone() else { VcrFx.cancel(this); visibility = View.GONE }   // [vcrfx]
         }
     }
 
@@ -407,14 +407,36 @@ class PineVideoWall(
      * not torn down, so coming back is a change of visibility and not a
      * rebuild.
      */
-    fun veil(on: Boolean) {
+    fun veil(on: Boolean, vcr: Boolean = true) {
         veiled = on
-        onMain { refreshVisibility() }
+        onMain { if (!vcr) refreshVisibility() else if (on) vcrGone() else vcrShow() }   // [vcrfx]
     }
 
     private fun refreshVisibility() {
         visibility = if (running.get() && !veiled && !menuHidden) View.VISIBLE else View.GONE
+        if (visibility == View.VISIBLE) VcrFx.settle(this) else VcrFx.cancel(this)   // [vcrfx] never left collapsed
     }
+
+    /* [vcrfx] THE CRT, ON THE WALL'S OWN FRAME - the same table the page's
+     * PineVcr plays (VcrFx). An on starts from the dot; an off hides the wall
+     * only if nobody wanted it back meanwhile. Main thread only. */
+    private fun vcrWanted(): Boolean = running.get() && !veiled && !menuHidden
+
+    private fun vcrShow() {
+        if (!vcrWanted()) { refreshVisibility(); return }
+        val lit = visibility == View.VISIBLE && !VcrFx.isGoingOff(this)
+        visibility = View.VISIBLE
+        if (!lit) VcrFx.play(this, true)
+    }
+
+    private fun vcrGone() {
+        if (visibility != View.VISIBLE) { refreshVisibility(); return }
+        if (VcrFx.isGoingOff(this)) return
+        VcrFx.play(this, false) { if (!vcrWanted()) visibility = View.GONE }
+    }
+
+    /** [vcrfx] the bridge's `vcr` verb: play the on again (a proof on the glass). */
+    fun vcrReplay() { onMain { if (visibility == View.VISIBLE) VcrFx.play(this, true) } }
 
     private fun wallBounds(): Pair<Int, Int> {
         val parentView = parent as? View
@@ -534,6 +556,7 @@ class PineVideoWall(
         .put("w", width)
         .put("h", height)
         .put("veiled", veiled)
+        .put("vcr", VcrFx.phase(this))                      // [vcrfx] "in", "out" or ""
         .put("queued", aheadCount())
         .put("queued_s", aheadMs() / 1000.0)                // [#1212]
         .put("playing", showing)

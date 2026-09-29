@@ -1383,6 +1383,7 @@
     mine.appendChild(waiting);
 
     document.body.appendChild(mine);
+    if (window.pineCloseX) { window.pineCloseX(mine, function () { if (sheet === mine) { mine.remove(); sheet = null; } }, {label: 'Close the 3JS list'}); }  // [closex:three-chooser]
     if (root.PineDismiss) {
       root.PineDismiss.watch(mine, function () {
         if (sheet === mine) { mine.remove(); sheet = null; }

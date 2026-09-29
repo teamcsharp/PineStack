@@ -89,7 +89,7 @@ if [ -f "$VIEW_CANON/sfx-tv.js" ]; then
     [ "$asset" = talk-dot.js ] && continue
     [ -f "$VIEW_CANON/$asset" ] && cp "$VIEW_CANON/$asset" "$target"
   done
-  for asset in sfx-tv.js sfx-tv.css; do
+  for asset in sfx-tv.js sfx-tv.css pine-vcr.js; do
     [ -f "$VIEW_CANON/$asset" ] && cp "$VIEW_CANON/$asset" "$VIEW_SAMPLER/$asset"
   done
   for asset in sampler-air.js sampler-feed.js sampler.js; do

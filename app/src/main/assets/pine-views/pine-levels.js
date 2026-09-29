@@ -122,6 +122,7 @@
     shut.setAttribute('type', 'button');
     shut.setAttribute('aria-label', 'Close the levels');
     shut.addEventListener('click', close);
+    if (window.pineCloseX) { window.pineCloseX(node, function () { close(); }, {label: 'Close the levels'}); shut.style.display = 'none'; }  // [closex:levels]
     head.appendChild(shut);
     node.appendChild(head);
 

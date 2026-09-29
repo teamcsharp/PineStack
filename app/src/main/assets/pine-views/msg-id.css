@@ -1,0 +1,49 @@
+/* [msgid] The message code: a small monospace chip that copies itself.
+ * 'head' sits in the hold sheet's header gap and the Script line popup's
+ * header; 'corner' is faint, bottom-right in a Digital feed bubble. */
+.pmi-chip {
+  display: inline-flex; align-items: center; gap: 4px; flex: none;
+  margin: 0; padding: 1px 7px; min-height: 22px; box-sizing: border-box;
+  font: 12px/1.4 ui-monospace, "Cascadia Mono", Consolas, "Roboto Mono", monospace;
+  letter-spacing: .02em; color: #9aa4ad; background: transparent;
+  border: 1px solid rgba(154, 164, 173, .35); border-radius: 6px;
+  cursor: copy; -webkit-tap-highlight-color: transparent; user-select: none;
+}
+.pmi-chip:hover, .pmi-chip:focus-visible { color: #e6edf1; border-color: rgba(230, 237, 241, .55); outline: none; }
+.pmi-chip .pmi-ico { display: inline-flex; width: 12px; height: 12px; opacity: .8; }
+.pmi-chip .pmi-ico svg { width: 12px; height: 12px; fill: currentColor; }
+.pmi-chip.pmi-copied { color: #65c7da; border-color: #65c7da; }
+
+/* the hold sheet: between the question and the trash / nodes / thumbs */
+.la-head-row .pmi-chip { margin: 0 auto; }
+
+/* the Script line popup: beside the speaker's name; the older in-tab code
+   ([line-id], script-page.js) steps aside for it */
+.sp-detail > .pmi-chip { margin-left: 8px; vertical-align: 1px; }
+.sp-detail:has(> .pmi-chip) .sp-line-id { display: none; }
+
+/* a Digital bubble: faint, in the bottom-right corner */
+.sp-mv-bubble > .pmi-corner {
+  position: absolute; right: 12px; bottom: 3px; z-index: 1;
+  min-height: 0; padding: 0 4px; border-color: transparent;
+  font-size: 10px; line-height: 1.3; color: rgba(154, 164, 173, .45);
+}
+.sp-mv-bubble > .pmi-corner:hover, .sp-mv-bubble > .pmi-corner.pmi-copied { color: #cfd8de; border-color: rgba(154, 164, 173, .35); }
+.sp-mv-classic .sp-mv-bubble > .pmi-corner { display: none; }
+
+/* found by its code: a brief ring on the line */
+.pmi-flash { outline: 2px solid #65c7da !important; outline-offset: 2px; border-radius: 6px; }
+
+.pmi-toast {
+  position: fixed; left: 50%; bottom: 28px; z-index: 2147483070;
+  display: flex; align-items: center; gap: 6px; max-width: min(520px, 92vw);
+  padding: 7px 12px; border-radius: 8px; box-sizing: border-box;
+  font: 13px/1.35 Inter, "Segoe UI", system-ui, sans-serif; color: #edf3f5;
+  background: #1c2831; border: 1px solid #35505e; box-shadow: 0 6px 24px rgba(0, 0, 0, .45);
+  opacity: 0; transform: translate(-50%, 8px); pointer-events: none;
+  transition: opacity .16s, transform .16s;
+}
+.pmi-toast.up { opacity: 1; transform: translate(-50%, 0); }
+.pmi-toast.bad { border-color: #8a5a3c; }
+.pmi-toast .pmi-ico { display: inline-flex; width: 14px; height: 14px; }
+.pmi-toast .pmi-ico svg { width: 14px; height: 14px; fill: currentColor; }

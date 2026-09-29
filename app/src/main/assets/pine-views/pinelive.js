@@ -306,6 +306,16 @@
   function setHidden(node, hidden) {
     if (node && node.hidden !== !!hidden) node.hidden = !!hidden;
   }
+  /* [vcrfx] setHidden for a picture: PineVcr.set is idempotent per state,
+     so the four-a-second paint costs nothing once the picture has settled. */
+  function vcrHidden(node, hidden) {
+    var V = root.PineVcr;
+    if (!node || !V || typeof V.set !== 'function') { setHidden(node, hidden); return; }
+    V.set(node, !hidden, {
+      show: function (el) { el.hidden = false; },
+      hide: function (el) { el.hidden = true; }
+    });
+  }
 
   function btn(cls, words, iconName, title) {
     var b = make('button', 'pl-btn' + (cls ? ' ' + cls : ''));
@@ -2297,7 +2307,7 @@
     setText(f.cam, pic.cam_live ? 'linked and fresh' : 'not linked');
     setText(f.ads, isFinite(num(pic.ads)) ? String(pic.ads) : '--');
     setText(f.pub, st.armed ? (tv ? 'the live picture' : 'no picture (video off)') : 'the usual art (no set running)');
-    setHidden(p.parts.prev, !st.art_url);
+    vcrHidden(p.parts.prev, !st.art_url);   /* [vcrfx] the picture comes on like the SFX TV */
     setText(p.parts.cap, st.art_url ? 'What the album art shows now (your own view)' : '');
     syncPreview();
   }
@@ -2321,7 +2331,12 @@
     var st = model.state || {};
     var want = ui.visible && ui.open.picture && st.art_url ? stationUrl(st.art_url) : '';
     if (want) { if (img.__src !== want) { img.__src = want; img.src = want; } }
-    else if (img.__src) { img.__src = ''; img.removeAttribute('src'); }
+    else if (img.__src) {
+      img.__src = '';
+      /* [vcrfx: the last frame stays through the collapse] */
+      setTimeout(function () { if (!img.__src) img.removeAttribute('src'); },
+        root.PineVcr ? root.PineVcr.OUT_MS + 80 : 0);
+    }
   }
 
   /* ------------------------------------------------------------ recording */

@@ -491,6 +491,7 @@
     x.setAttribute('type', 'button');
     x.setAttribute('aria-label', 'Close');
     x.addEventListener('click', topicShut);
+    if (window.pineCloseX) { window.pineCloseX(node, function () { x.click(); }, {label: 'Close the topics'}); x.style.display = 'none'; }  // [closex:pseg-topic]
     top.appendChild(x);
     node.appendChild(top);
     node.appendChild(topicsBlock({next: true, history: true}));
@@ -559,6 +560,7 @@
     var x = el('button', 'pseg-x', 'x');
     x.setAttribute('type', 'button');
     x.addEventListener('click', function () { shut(); });
+    if (window.pineCloseX) { window.pineCloseX(node, function () { x.click(); }, {label: 'Close the plot'}); x.style.display = 'none'; }  // [closex:pseg-plot]
     top.appendChild(x);
     node.appendChild(top);
 

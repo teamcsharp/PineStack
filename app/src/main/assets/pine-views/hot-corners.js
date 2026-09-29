@@ -479,7 +479,7 @@
     var ROLES = {button: 1, link: 1, tab: 1, checkbox: 1, radio: 1,
                  slider: 1, menuitem: 1, switch: 1, textbox: 1};
     /* Floating surfaces with gestures of their own, by id or by class. */
-    var OWNED = /(^|\s)(pine-view-tab|pineViewRail|sfx-tv|pine-cam|hc-btn|hc-pick|hc-x|hc-glow|hc-strip|hc-toast)(\s|$)/;
+    var OWNED = /(^|\s)(pine-gestures|pine-view-tab|pineViewRail|sfx-tv|pine-cam|hc-btn|hc-pick|hc-x|hc-glow|hc-strip|hc-toast)(\s|$)/;
     var OWNED_ID = {sfxTv: 1, pineViewRail: 1, pineTalkDot: 1, pineTalkSay: 1,
                     pineReportPad: 1, pineTip: 1};
     try {
@@ -760,6 +760,7 @@
     head.setAttribute('data-pine-drag-handle', '');
     head.appendChild(make('b', '', title));
     var x = make('button', 'hc-x', '×');
+    x.title = "Close"; if (!x.getAttribute("aria-label")) x.setAttribute("aria-label", "Close");  // [closex:tip:hot-corners.js:sheet:x:Close]
     x.type = 'button';
     x.setAttribute('aria-label', 'close');
     head.appendChild(x);

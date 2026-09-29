@@ -1468,6 +1468,7 @@
     const shut = document.createElement("button");
     shut.className = "pb-kits-x";
     shut.textContent = "\u00d7";
+    shut.title = "Close"; if (!shut.getAttribute("aria-label")) shut.setAttribute("aria-label", "Close");  // [closex:tip:sampler.js:openKits:shut:Close]
     shut.addEventListener("click", closeKits);
     head.appendChild(title);
     head.appendChild(shut);
@@ -1639,6 +1640,7 @@
     const shut = document.createElement("button");
     shut.className = "pb-kits-x";
     shut.textContent = "\u00d7";
+    shut.title = "Close"; if (!shut.getAttribute("aria-label")) shut.setAttribute("aria-label", "Close");  // [closex:tip:sampler.js:showDisk:shut:Close]
     shut.addEventListener("click", closeDisk);
     head.appendChild(title);
     head.appendChild(shut);

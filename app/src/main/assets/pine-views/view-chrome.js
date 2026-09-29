@@ -320,6 +320,7 @@
       + 'left edge on the tablet.');
     box.appendChild(note);
     document.body.appendChild(box);
+    if (window.pineCloseX) { window.pineCloseX(box, function () { box.remove(); }, {label: 'Close the menu', reserve: 'top'}); }  // [closex:view-sheet]
   }
 
   var api = {

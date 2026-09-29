@@ -58,6 +58,7 @@ object SamplerAssets {
         // #1310: the SFX guy's little CRT set. A pad that holds a video
         // pops the picture when it is pressed, and this surface is its
         // own page - the set in the views bundle is not loaded here.
+        "pine-vcr.js",         // [vcrfx] the CRT on/off sfx-tv.js plays
         "wall-transition.js",
         "sfx-tv.js",
         // #1317: this surface is its own page and can go deaf too.

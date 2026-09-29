@@ -2867,6 +2867,7 @@
       close();
     });
     head.appendChild(shut);
+    if (window.pineCloseX) { window.pineCloseX(node, function () { shut.click(); }, {label: 'Close the orchestrator'}); shut.style.display = 'none'; }  // [closex:orch-glass]
     node.appendChild(head);
 
     var say = el('div', 'og-say');
