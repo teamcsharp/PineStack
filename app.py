@@ -30124,6 +30124,10 @@ def page_recovery_chat_rows(clip: dict[str, Any], delivery: str) -> None:
                     old = chat.pop(index)
                     break
         row = dict(old or source)
+        if clip.get("recovered_from_row_id"):        # [s3-account-recover] the heard line it replays
+            row["recovered_from"] = str(clip.get("recovered_from_row_id"))
+        if plain and not isinstance(row.get("system3"), dict) and isinstance(clip.get("system3"), dict):
+            row["system3"] = dict(clip["system3"])   # [s3-account-recover] the stamp the delivery kept
         row.update({"id": row_id, "ts": int(time.time()),
                     "aired": "published", "recovery": True,
                     "clip_media": media, "air_at": scheduled + float(source.get("from") or 0)})
@@ -75282,6 +75286,8 @@ async def _dj_upstairs_page_floorless(row: dict[str, Any] | None = None) -> bool
             "remember_text": spoken, "seconds": seconds,
             "voice": str(made.get("voice") or ""), "speech": True,
             "row_id": line_id, "who": "manager", "kind": "manager",
+            **({"system3": dict(made["system3"])}              # [s3-account-recover] survives a restart
+               if isinstance(made.get("system3"), dict) else {}),
             "page_id": str(made.get("id") or ""),
         }
         try:
@@ -78847,6 +78853,28 @@ def _sfx_roll_note(path: Any, road: str, category: dict[str, Any],
         _SFX_ROLLED[str(path)] = got
         while len(_SFX_ROLLED) > 32:
             _SFX_ROLLED.pop(next(iter(_SFX_ROLLED)))
+
+
+def _sfx_wall_roll_note(row: Any, u: Any, count: Any) -> None:
+    """[s3-account-wall] The endless set's clip is the dice door's draw
+    (sfxtv.deck_clip: which unspent clip of the video deck comes next). Read
+    the roll back off System 3's record - never re-derived, and only when it
+    is this draw's number - and note it on the clip, so the set's origin
+    record (_origin_wall_note -> _sfx_roll_carry) carries its dice. System 3
+    off (the station's own random): nothing is noted. Never costs the clip."""
+    try:
+        fn = globals().get("system3_last_roll")
+        rec = fn("sfxtv.deck_clip") if fn else None
+        if (not isinstance(rec, dict) or u is None or rec.get("u") is None
+                or abs(float(rec.get("u")) - float(u)) > 1e-9):
+            return
+        path = Path(str(row["path"]))
+        n = max(1, int(count or 1))
+        _sfx_roll_note(path, "wall", {"label": path.parent.name},
+                       {"label": path.stem[:160], "dice": rec.get("dice"), "u": rec.get("u"),
+                        "index": min(n - 1, int(float(u) * n)) + 1, "of": n}, 1)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _sfx_roll_take(path: Any) -> dict[str, Any]:
@@ -176353,9 +176381,10 @@ def sfx_db_pick_rotation_row(video: bool = True) -> tuple[Path, float] | None:
                 row = con.execute(
                     "SELECT path, seconds FROM clips WHERE " + where
                     + " LIMIT 1 OFFSET ?",
-                    args + (min(count - 1, int(s3_roll("sfxtv.deck_clip", "which unspent clip of the video deck comes next") * count)),)).fetchone()   # [s3-dice-door]
+                    args + (min(count - 1, int((_wall_u := s3_roll("sfxtv.deck_clip", "which unspent clip of the video deck comes next")) * count)),)).fetchone()   # [s3-dice-door] [s3-account-wall] the number is kept
                 if row is None:
                     continue
+                _sfx_wall_roll_note(row, _wall_u, count)   # [s3-account-wall] the clip carries its dice
                 with _SFX_VIDEO_ROTATION_LOCK:
                     _SFX_VIDEO_ROTATION["why"] = ""
                 return (Path(str(row["path"])), float(row["seconds"] or 0.0))

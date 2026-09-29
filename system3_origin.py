@@ -500,6 +500,7 @@ def build(entry: dict[str, Any], ledger: dict[str, Any] | None = None,
         "system3": {k: v for k, v in (("conversation_id", cid), ("turn_id", tid),
                                       ("road", s.get("road")), ("mode", s.get("mode")),
                                       ("config_hash", s.get("config_hash")),
+                                      ("via", s.get("via")),   # [s3-account-p2] how the stamp was known
                                       ("decisions", [d["id"] for d in turn_decisions if d.get("id")]),
                                       ("turn_key", (cid + "|" + tid) if cid and tid and turn_decisions else ""))
                     if v not in (None, "", [])},
@@ -519,7 +520,8 @@ def build(entry: dict[str, Any], ledger: dict[str, Any] | None = None,
         "ledger": {k: v for k, v in led.items() if k != "system_prompts"},
         "stamp": s,
         "match": match_pick(e, context),
-        "observations": [o for o in obs if isinstance(o, dict) and lid and lid in (o.get("lines") or [])][:8],
+        "observations": [o for o in obs if isinstance(o, dict) and lid   # [s3-account-p2] "lines" may be a count
+                         and lid in (o.get("lines") if isinstance(o.get("lines"), (list, tuple)) else ())][:8],
     }
     out = {"compact": compact, "full": full}
     # the turn's decisions and the conversation's, kept ONCE (every line of a turn
@@ -614,6 +616,7 @@ class OriginLedger:
         self._recent: "collections.deque[dict]" = collections.deque(maxlen=400)
         self._memo: "collections.OrderedDict[str, dict]" = collections.OrderedDict()   # built this run
         self._shared: dict[str, int] = {}    # turns / conversations written, by what was known
+        self._recovered: "collections.OrderedDict[str, tuple]" = collections.OrderedDict()   # [s3-account-p2]
         self.metrics = {"ticks": 0, "written": 0, "rogue": 0, "forced": 0, "rolled": 0,
                         "errors": 0, "last_error": "", "compacted": 0, "reports": 0}
 
@@ -748,6 +751,8 @@ class OriginLedger:
                 stamp = got if isinstance(got, dict) and got.get("conversation_id") else None
             except Exception:  # noqa: BLE001
                 stamp = None
+        if stamp is None and not m and not e.get("origin_forced"):   # [s3-account-p2] a row that lost its stamp
+            stamp, e = self._durable_origin(e, lid)
         if stamp is None and m:
             stamp, pforced = self._parent_stamp(e, m.group(1))
             if pforced and not e.get("origin_forced"):
@@ -755,12 +760,72 @@ class OriginLedger:
         conv = self.conversation(str((stamp or {}).get("conversation_id") or ""),
                                  str((stamp or {}).get("turn_id") or "")) if stamp else {}
         rec = build(e, led, stamp, conv, context)
+        if e.get("recovery"):                    # [s3-account-p2] boot recovery put it back on the air
+            rec["compact"]["republished"] = "after a restart, by boot recovery (page_recovery_start)"
+            if e.get("recovered_from"):
+                rec["compact"]["recovered_from"] = str(e["recovered_from"])[:48]
         self._link_label(rec)
         self._memo[lid] = rec["compact"]
         self._memo.move_to_end(lid)
         while len(self._memo) > 3000:
             self._memo.popitem(last=False)
         return rec, led is not None
+
+    def _durable_origin(self, e: dict[str, Any], lid: str) -> tuple[Any, dict[str, Any]]:
+        """[s3-account-p2] A row that reaches the ring WITHOUT its stamp (a
+        preserved delivery republished after a restart, page_recovery_chat_rows;
+        a ring row restored at boot) is still the line System 3 made. Its
+        origin is read back from the two durable records that outlive the
+        process - never guessed: (1) System 3's own line register (the lines
+        table: line -> conversation, turn); (2) this ledger's record of the
+        same line id from before, when that one was traced (rolled: its stamp;
+        forced: its named reason). Neither: the row stands as it is. Returns
+        (stamp or None, the row - with origin_forced when a forced reason came
+        back). Memoised per id; a miss is looked up again after 60 s."""
+        now = time.time()
+        got = self._recovered.get(lid)
+        if got is None or (not got[1] and not got[2] and now - got[0] > 60.0):
+            stamp: dict[str, Any] = {}
+            forced: dict[str, Any] | None = None
+            # the line itself, then the heard line a recovered replay stands in for
+            ids = [lid] + [str(x) for x in (e.get("recovered_from"),) if x and str(x) != lid]
+            s3 = self._s3db()
+            for key in ids:
+                if stamp or s3 is None:
+                    break
+                try:
+                    r = s3.execute("SELECT conversation_id, turn_id FROM lines WHERE line_id=?", (key,)).fetchone()
+                except Exception:  # noqa: BLE001  (an older store with no line register)
+                    r = None
+                if r and r[0]:
+                    stamp = {"conversation_id": str(r[0]), "turn_id": str(r[1] or ""),
+                             "via": "System 3's line register" + ("" if key == lid else " (the line it replays, %s)" % key)}
+            for key in ids:
+                if stamp or forced:
+                    break
+                try:
+                    prior = self.get(key)
+                except Exception:  # noqa: BLE001
+                    prior = None
+                via = ("its origin record from before the restart" if key == lid
+                       else "the origin record of the line it replays (%s)" % key)
+                if isinstance(prior, dict) and not prior.get("announces"):
+                    ps = prior.get("system3") or {}
+                    pf = prior.get("forced") if isinstance(prior.get("forced"), dict) else None
+                    if prior.get("verdict") == "rolled" and ps.get("conversation_id"):
+                        stamp = {"conversation_id": str(ps["conversation_id"]), "turn_id": str(ps.get("turn_id") or ""),
+                                 "via": via}
+                    elif prior.get("verdict") == "forced" and pf and pf.get("road") != "desk label":
+                        forced = dict(pf, how=via)
+            got = (now, stamp, forced)
+            self._recovered[lid] = got
+            self._recovered.move_to_end(lid)
+            while len(self._recovered) > 5000:
+                self._recovered.popitem(last=False)
+        stamp, forced = got[1], got[2]
+        if forced and not e.get("origin_forced"):
+            e = dict(e, origin_forced=dict(forced))
+        return (dict(stamp) if stamp else None), e
 
     def _parent_stamp(self, e: dict[str, Any], parent_id: str) -> tuple[Any, Any]:
         """A clip welded to a line ("<id>-punct-N") is part of that line: its

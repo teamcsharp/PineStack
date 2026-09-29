@@ -3161,6 +3161,7 @@ function makeViews({request, onSelect, details = false} = {}) {
         v.toggle(t, node);
       }},
       el('div', 'who', el('b', {text: t.name || t.speaker}),
+        msgCodeOf(v.linesOf(key, conv, t)),   /* [s3-account-code] the line's code, as every view shows it */
         el('span', {text: `${t.step_label} · turn ${t.index + 1}` + (part ? ` · ${part.index + 1} of ${part.of}` : '')})),
       opts.slot || (open ? composeLine(conv, t, v.api) : body), opts.slot ? null : reacts, opts.slot ? null : chips,
       !opts.slot && cutWhy ? cutNote(cutWhy, v) : null);
@@ -6123,6 +6124,32 @@ function sfxGuyStory(conv, sg, v) {
   }
   if (obs.line) box.append(el('div', 's3-story-row', el('b', {text: 'What he said: '}), obs.line));
   return box;
+}
+
+/* [s3-account-code] A Messenger message wears its line's code - the same
+   "#3c4782" the Script view's feed, the line popup and the hold sheet show
+   (msg-id.js) - so tools/why_line.py and /api/system3/origin/<id> answer for
+   what is on screen. The turn's spoken line (not a welded board clip); a tap
+   copies the code and never plays the message. */
+function msgCodeOf(lines) {
+  const all = (lines || []).filter(l => l && l.line_id);
+  const ln = all.find(l => l.who !== 'board') || all[0];
+  if (!ln) return null;
+  const id = String(ln.line_id).toLowerCase();
+  const short = s => (/^[0-9a-f]{9,}$/.test(s) ? s.slice(0, 8) : s);
+  const pm = /^(.*)-punct-(\d+)$/.exec(id);
+  const code = '#' + (pm ? short(pm[1]) + '-p' + pm[2] : short(id));
+  return el('span', {class: 's3-msgcode', text: code, role: 'button', tabindex: '0',
+    style: 'font:11px ui-monospace,monospace;opacity:.6;margin:0 6px;cursor:copy',
+    title: 'this message\'s code (' + ln.line_id + ') - tap to copy; tools/why_line.py ' + code.slice(1),
+    onclick: e => {
+      e.stopPropagation();
+      try {
+        const M = window.PineMsgId;
+        if (M && M.copy) M.copy(code);
+        else if (navigator.clipboard) navigator.clipboard.writeText(code);
+      } catch (err) { /* the code still shows */ }
+    }});
 }
 
 /* [s3-account] THE ORIGIN LEDGER ON EVERY ITEM. "trace its origin for each and

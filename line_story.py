@@ -35,6 +35,8 @@ from typing import Any, Callable, Iterable, Iterator
 SCHEMA = "line.story/1"
 CODE = re.compile(r"^#?\s*([0-9a-f]{6,32})(?:-p(?:unct-)?(\d{1,3}))?$")
 PUNCT = re.compile(r"^(.*)-punct-(\d+)$")
+# [s3-account-keys] an aired item with no hex id: its origin-ledger key, exact
+ORIGIN_KEY = re.compile(r"^(?:rec|wall|live):[0-9A-Za-z_.\-]+(?::[0-9A-Za-z_.\-]+)*$")
 NEAR_S = 5.0                      # neighbours on air within this
 SAME_S = 1.0                      # "the same second"
 PAST_S = 900.0                    # a row this much older than the target ends a scan
@@ -69,11 +71,14 @@ def parse(query: Any) -> dict[str, Any] | None:
     q = str(query or "").strip().lower().replace(" ", "")
     m = CODE.match(q)
     if not m:
-        return None
+        k = str(query or "").strip()   # [s3-account-keys] a record / wall clip / live set
+        return {"prefix": k, "punct": "", "exact": True} if ORIGIN_KEY.match(k) else None
     return {"prefix": m.group(1), "punct": m.group(2) or ""}
 
 
 def matches(line_id: str, want: dict[str, Any]) -> bool:
+    if want.get("exact"):                 # [s3-account-keys] an origin key names one item
+        return str(line_id or "") == want["prefix"]
     s = str(line_id or "").lower()
     m = PUNCT.match(s)
     if want["punct"]:

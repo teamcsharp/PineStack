@@ -1,0 +1,69 @@
+"""[s3-account-p2] The patch contract shared by the tools/p2_*_patch.py tools.
+
+  python tools/p2_X_patch.py --check <file>   exit 0 = ready, 2 = applied, 1 = anchor missing (named)
+  python tools/p2_X_patch.py --apply <file>   idempotent; asserts every anchor's count; atomic; exit 2
+
+Each edit is an INSERT before/after one narrow anchor, or a REPLACE of one
+line, and never re-creates its own anchor. The tool's marker is in every
+edit, so "marker present" == applied. Matched on LF; a CRLF file is written
+back CRLF; the file mode is kept.
+"""
+from __future__ import annotations
+
+import os
+import sys
+import tempfile
+from pathlib import Path
+
+
+class Edit:
+    def __init__(self, name: str, anchor: str, text: str = "", where: str = "after",
+                 replace: str | None = None):
+        self.name, self.anchor, self.text, self.where, self.replace = name, anchor, text, where, replace
+
+    def apply(self, s: str) -> str:
+        if self.replace is not None:
+            return s.replace(self.anchor, self.replace, 1)
+        if self.where == "before":
+            return s.replace(self.anchor, self.text + self.anchor, 1)
+        return s.replace(self.anchor, self.anchor + self.text, 1)
+
+
+def run(edits: list[Edit], marker: str, argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    mode = "--check"
+    if argv and argv[0] in ("--check", "--apply"):
+        mode = argv.pop(0)
+    if not argv:
+        print("usage: [--check|--apply] <file>")
+        return 1
+    path = Path(argv[0])
+    raw = path.read_bytes().decode("utf-8")
+    crlf = "\r\n" in raw
+    s = raw.replace("\r\n", "\n")
+    if marker in s:
+        print("applied: %s already carries %s" % (path, marker))
+        return 2
+    bad = ["%s (x%d)" % (e.name, s.count(e.anchor)) for e in edits if s.count(e.anchor) != 1]
+    if bad:
+        print("anchors missing or not unique in %s: %s" % (path, ", ".join(bad)))
+        return 1
+    if mode == "--check":
+        print("ready: %s (%d edits)" % (path, len(edits)))
+        return 0
+    for e in edits:
+        s = e.apply(s)
+    if s.count(marker) < len(edits):
+        print("refused: the edits did not leave the marker on every edit")
+        return 1
+    out = s.replace("\n", "\r\n") if crlf else s
+    fd, tmp = tempfile.mkstemp(prefix=".p2-", dir=str(path.parent))
+    with os.fdopen(fd, "wb") as fh:
+        fh.write(out.encode("utf-8"))
+    try:
+        os.chmod(tmp, os.stat(path).st_mode & 0o7777)
+    except OSError:
+        pass
+    os.replace(tmp, path)
+    print("applied: %s (%d edits)" % (path, len(edits)))
+    return 2
