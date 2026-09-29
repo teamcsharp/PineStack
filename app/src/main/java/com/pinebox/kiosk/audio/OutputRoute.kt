@@ -5,6 +5,7 @@ import android.media.AudioDeviceCallback
 import android.media.AudioDeviceInfo
 import android.media.AudioManager
 import android.os.Handler
+import android.util.Log
 
 /**
  * WHERE THE SOUND IS ACTUALLY COMING OUT.
@@ -49,6 +50,7 @@ class OutputRoute(
 
     private val audio = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
     private var last = ""
+    private var lastDevice: AudioDeviceInfo? = null
 
     private val callback = object : AudioDeviceCallback() {
         override fun onAudioDevicesAdded(added: Array<out AudioDeviceInfo>?) = settle()
@@ -68,14 +70,41 @@ class OutputRoute(
     fun current(): String = describe(pick())
 
     private fun settle() {
-        val now = current()
+        val device = pick()
+        val now = describe(device)
         if (now == last) return
         val first = last.isEmpty()
+        val before = lastDevice
         last = now
+        lastDevice = device
         /* Not on the very first read: there is no route CHANGE at startup,
-         * and reopening a stream that was just opened is pure jank. */
-        if (!first) reopen()
+         * and reopening a stream that was just opened is pure jank. The
+         * same goes for the level: a kiosk (re)start or a page reload is
+         * not a move, so the operator's level is never touched there. */
+        if (!first) {
+            holdLevel(before)
+            reopen()
+        }
         onChange(now)
+    }
+
+    /**
+     * 2026-09-29: A MOVE NEVER COMES UP LOUDER. Android keeps a music index
+     * per output, so a new output (USB, Bluetooth, the jack) plays at its
+     * own stored level. If that is above what the previous output was at,
+     * bring it down to it - see LevelCap. Checked twice: at the callback and
+     * again a moment later, in case the policy finished re-routing after
+     * the device list changed.
+     */
+    private fun holdLevel(before: AudioDeviceInfo?) {
+        if (before == null) return
+        val check = Runnable {
+            val said = runCatching { LevelCap.holdAfterMove(audio, before) }
+                .getOrElse { "level check failed: " + it.message }
+            Log.i(TAG, "route moved from " + describe(before) + ": " + said)
+        }
+        check.run()
+        handler.postDelayed(check, SETTLE_RECHECK_MS)
     }
 
     /**
@@ -114,6 +143,9 @@ class OutputRoute(
     }
 
     companion object {
+        private const val TAG = "PineRoute"
+        private const val SETTLE_RECHECK_MS = 400L
+
         /** Android's own precedence for media, highest first. */
         private val RANKS = intArrayOf(
             AudioDeviceInfo.TYPE_WIRED_HEADSET,

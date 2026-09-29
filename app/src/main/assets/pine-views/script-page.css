@@ -4060,9 +4060,10 @@ html.pine-tech-wide .sp-tech.sp-tech-wide .wc-strip {
 
 /* [msgsplit] the station's feed above the bubbles, a grip between */
 .sp-mv-split { display: flex; flex-direction: column; min-height: 0; overflow: hidden; }
-.sp-mv-split > .sp-feed { flex: 0 1 var(--mv-feed, 40%); min-height: min(var(--mv-feed-min, 150px), 46%); box-sizing: border-box; }
-.sp-mv-split.sp-mv-wide > .sp-feed { min-height: min(var(--mv-feed-min, 150px), 62%); }
-.sp-mv-split > .sp-mv { flex: 1 1 0; min-height: min(150px, 50%); }
+/* [msgsplit2] each half's floor is at most 22% of the pane, so the grip always has room to move */
+.sp-mv-split > .sp-feed { flex: 0 1 var(--mv-feed, 40%); min-height: min(var(--mv-feed-min, 150px), 22%); box-sizing: border-box; }
+.sp-mv-split.sp-mv-wide > .sp-feed { min-height: min(var(--mv-feed-min, 150px), 22%); }
+.sp-mv-split > .sp-mv { flex: 1 1 0; min-height: min(150px, 22%); }
 .sp-mv-grip { flex: 0 0 14px; position: relative; cursor: row-resize; touch-action: none; }
 .sp-mv-grip::after {
   content: ''; position: absolute; left: 50%; top: 5px; width: 44px; height: 4px; margin-left: -22px;

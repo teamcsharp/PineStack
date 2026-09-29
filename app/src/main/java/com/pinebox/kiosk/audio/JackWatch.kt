@@ -214,6 +214,8 @@ class JackWatch(
             return
         }
         if (on) lastRepairAtMs = SystemClock.elapsedRealtime()
+        /* NEVER LOUDER ON THE FAR SIDE OF THE MOVE - see LevelCap. */
+        capBeforeMove(manager, on)
         /* This hidden method takes AudioSystem DEVICE_OUT_* bitmasks, not
          * AudioDeviceInfo.TYPE_* enum values. TYPE_WIRED_HEADPHONES happens
          * to be 4, but 4 in AudioSystem means WIRED_HEADSET; a plain aux
@@ -251,6 +253,31 @@ class JackWatch(
             else -> "the call failed: " + (why?.cause?.message ?: why?.message ?: "unknown")
         }
         Log.w(TAG, lastSaid)
+    }
+
+    /**
+     * 2026-09-29: THE ROUTE MOVE MUST NOT RAISE THE LEVEL.
+     *
+     * Android keeps one music index per output, so announcing the cable
+     * moves the operator from (say) speaker 5 to whatever the headphone was
+     * last left at - 20, measured. Before the move, lower the device we are
+     * about to route to so it is no louder than what is playing now. Only
+     * when the announcement actually MOVES the route: the start-up
+     * announcement that merely agrees with the framework (the common case,
+     * "no cable", on every kiosk start) touches nothing.
+     */
+    private fun capBeforeMove(manager: AudioManager, on: Boolean) {
+        val wiredNow = runCatching {
+            manager.getDevices(AudioManager.GET_DEVICES_OUTPUTS).any {
+                it.type == AudioDeviceInfo.TYPE_WIRED_HEADPHONES ||
+                    it.type == AudioDeviceInfo.TYPE_WIRED_HEADSET
+            }
+        }.getOrNull() ?: return
+        if (wiredNow == on) return
+        val level = runCatching { manager.getStreamVolume(AudioManager.STREAM_MUSIC) }.getOrNull() ?: return
+        val target = if (on) AudioDeviceInfo.TYPE_WIRED_HEADPHONES else AudioDeviceInfo.TYPE_BUILTIN_SPEAKER
+        Log.i(TAG, "route about to move (" + (if (on) "to the jack" else "to the speaker") +
+            ") at level $level: " + LevelCap.lowerIdle(manager, target, level))
     }
 
     /** Call whichever setWiredDeviceConnectionState shape this build owns. */

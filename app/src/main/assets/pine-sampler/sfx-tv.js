@@ -300,6 +300,27 @@
   var panel = null;                // the Inspect / Path detail panel, if open
   var heard = [];                  // {id, url, sting} of clips already played
   var HEARD_MOST = 8;              // bounded plain rows; never media elements
+  /* [hcprev] WHAT ACTUALLY PLAYED ON THIS SET, newest last. The bottom-right
+   * hot corner replays the newest of these. `heard` is the endless cycle only
+   * and `playing` is set before the picture is known to move; this is noted
+   * at the first 'playing' event of a play (or when the native wall reports
+   * a clip on screen), so a clip dropped as missed never enters it. Plain
+   * rows only (#1312). */
+  var played = [];
+  var PLAYED_MOST = 12;
+  function playedNote(clip, road) {
+    if (!clip || !clip.url) return;
+    var at = Date.now();
+    var row = {id: clipId(clip), url: String(clip.url), video: clip.video !== false,
+               sting: String(clip.sting || clip.text || clip.name || ''),
+               sample: String(clip.sfx_sample_id || clip.sample_id || ''),
+               seconds: Number(clip.seconds) || 0, ts: Number(clip.ts) || 0,
+               endless: !!clip.endless, road: String(road || ''), at: at};
+    var last = played[played.length - 1];
+    if (last && last.url === row.url && at - last.at < 2000) return;
+    played.push(row);
+    if (played.length > PLAYED_MOST) played.splice(0, played.length - PLAYED_MOST);
+  }
   var STRIP_PAST = 3;              // the last three clips shown in the popup
   var STRIP_NEXT = 2;              // enough future context without crowding it
   /* #1200: SCROLLING BACKWARDS THROUGH EVERYTHING THAT HAS GONE OUT.
@@ -2746,13 +2767,17 @@
       screen.dataset.pineSilentPicture = clip.silent_picture ? '1' : '0';
       screen.muted = !!clip.silent_picture;
       var receiptAt = 0, receiptClosed = false;
+      var playedOnce = false;                            /* [hcprev] */
       function reportVideo(event, error) {
         if (receiptClosed) return;
         if (event === 'ended' || event === 'error') receiptClosed = true;
         videoReceipt(clip, event, screen, error);
       }
       screen.addEventListener('canplay', function () { reportVideo('canplay'); });
-      screen.addEventListener('playing', function () { reportVideo('playing'); });
+      screen.addEventListener('playing', function () {
+        reportVideo('playing');
+        if (!playedOnce) { playedOnce = true; playedNote(clip, 'tube'); }  /* [hcprev] */
+      });
       screen.addEventListener('timeupdate', function () {
         if (!screen.paused && now() - receiptAt > 2000) {
           receiptAt = now(); reportVideo('playing');
@@ -6180,6 +6205,7 @@
     if (row) {
       if (!playing || playing.id !== id) {
         playing = row;
+        playedNote(row, 'wall');                           /* [hcprev] */
         wallSignal(id);
       }
       return Promise.resolve(row);
@@ -6197,6 +6223,7 @@
       ringRemember([info]);
       if (wallShowing === id) {
         playing = info;
+        playedNote(info, 'wall');                          /* [hcprev] */
         wallSignal(id);
       }
       return info;
@@ -7251,6 +7278,8 @@
       catch (err) { showing = false; return false; }
     },
     playing: function () { return playing; },
+    /* [hcprev] what actually played on this set, newest last (copies). */
+    played: function () { return played.map(function (r) { var o = {}; for (var k in r) o[k] = r[k]; return o; }); },
 
     /* [#1441] THE PICTURE IS NATIVE, SO THE TAP ON IT ARRIVES HERE.
      *
