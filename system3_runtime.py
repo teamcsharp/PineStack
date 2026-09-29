@@ -1276,6 +1276,86 @@ class System3Runtime:
         self.config = new
         return filled
 
+    ES_V2_MARK = "ES_V2"               # [es-v2] in defaults_added: ES1's second edition was taken once
+
+    @staticmethod
+    def es_v2_changes(config):
+        """[es-v2] (new config, moved, kept): `config` with every ES row that still
+        holds its v1 default moved to system3_tables.ES1_V2 - the voice of a
+        category or item, the direction of an item. `kept` lists the rows the
+        operator made their own (edited, cleared or removed), left as they are."""
+        v1, v2 = system3_tables.ES1, system3_tables.ES1_V2
+        clean = system3.clean_es_voice
+        v1_cat = {c["id"]: c.get("voice") for c in v1["categories"]}
+        v2_cat = {c["id"]: c.get("voice") for c in v2["categories"]}
+        v1_item = {i["id"]: i for c in v1["categories"] for i in c["items"]}
+        v2_item = {i["id"]: i for c in v2["categories"] for i in c["items"]}
+        new = copy.deepcopy(config if isinstance(config, dict) else {})
+        moved, kept = [], []
+
+        def voice(row, was, now, where):
+            if was is None:                                  # v1 had none: absent is the default
+                if "voice" not in row and now is not None:
+                    row["voice"] = copy.deepcopy(now)
+                    moved.append(where + " voice")
+                elif "voice" in row and clean(row["voice"]) != clean(now):
+                    kept.append(where + " voice")
+                return
+            if "voice" not in row or clean(row["voice"]) != clean(was):
+                if clean(row.get("voice")) != clean(now):
+                    kept.append(where + " voice")
+                return
+            if clean(now) != clean(was):
+                row["voice"] = copy.deepcopy(now)
+                moved.append(where + " voice")
+
+        for t in new.get("tables") or []:
+            if not isinstance(t, dict) or t.get("family") != "ES":
+                continue
+            for c in t.get("categories") or []:
+                if not isinstance(c, dict):
+                    continue
+                cid = str(c.get("id") or "")
+                if cid in v1_cat:
+                    voice(c, v1_cat[cid], v2_cat[cid], "%s:%s" % (t.get("id"), cid))
+                for it in c.get("items") or []:
+                    iid = str((it or {}).get("id") or "") if isinstance(it, dict) else ""
+                    if iid not in v1_item:
+                        continue
+                    where = "%s:%s" % (t.get("id"), iid)
+                    voice(it, v1_item[iid].get("voice"), v2_item[iid].get("voice"), where)
+                    if it.get("text") == v1_item[iid].get("text"):
+                        if v2_item[iid].get("text") != it.get("text"):
+                            it["text"] = v2_item[iid]["text"]
+                            moved.append(where + " direction")
+                    elif it.get("text") != v2_item[iid].get("text"):
+                        kept.append(where + " direction")
+        return new, moved, kept
+
+    def upgrade_es_v2(self, apply=True):
+        """[es-v2] ES1's second edition onto the stored config, once (ES_V2_MARK).
+        apply=False only reports. Returns {moved, kept, done, hash}."""
+        config = self.config if isinstance(self.config, dict) else {}
+        seen = {str(x) for x in (config.get("defaults_added") or [])}
+        new, moved, kept = self.es_v2_changes(config)
+        out = {"moved": moved, "kept": kept, "done": self.ES_V2_MARK in seen,
+               "hash": system3.config_hash(config)}
+        if not apply or out["done"]:
+            return out
+        new["defaults_added"] = sorted(seen | {self.ES_V2_MARK})
+        try:
+            out["hash"] = self.store.save_config(
+                new, "ES1 second edition (es-v2): %d rows moved to the recalibrated voices and actor "
+                     "directions, %d kept as the operator left them" % (len(moved), len(kept)))
+        except Exception as exc:  # noqa: BLE001
+            self.fail("ES v2", exc)
+            return dict(out, error=str(exc))
+        self.config = new
+        out["done"] = True
+        self.log("System 3's ES tables took their second edition (es-v2): %d moved, %d kept"
+                 % (len(moved), len(kept)))
+        return out
+
     ES_TEXT_MARK = "ES_TEXT"           # [s3-es-dir] in defaults_added: the directions were given once
 
     def add_missing_es_text(self):
@@ -4727,6 +4807,13 @@ def install(app, namespace):
     async def reset_config(authorization: str | None = Header(default=None)):
         host.require_auth(authorization)
         return {"hash": await save_config(system3.default_config(), "reset to defaults")}
+
+    @app.post("/api/system3/es-v2")
+    async def es_v2(dry: int = 0, authorization: str | None = Header(default=None)):
+        """[es-v2] ES1's second edition, once: ?dry=1 lists what would move and
+        what stays as the operator left it; without it, it is done."""
+        host.require_auth(authorization)
+        return await asyncio.get_running_loop().run_in_executor(_STORE_POOL, rt.upgrade_es_v2, not dry)
 
     @app.get("/api/system3/conversations")
     async def conversations(limit: int = 40, road: str = "", before: float = 0.0, mode: str = "",

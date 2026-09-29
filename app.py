@@ -13887,7 +13887,7 @@ async def _xtts_synthesize(text: str, voice: str) -> bytes:
     except Exception:  # noqa: BLE001
         rate = 1.0
     payload = {
-        "text": _xtts_sanitize(text)[:XTTS_MAX_CHARS],
+        "text": _es_voice.speakable(text, "xtts", _xtts_sanitize)[:XTTS_MAX_CHARS],   # [es-near]
         "reference_audio": base64.b64encode(ref.read_bytes()).decode(),
         "language": "en",
     }
@@ -14103,9 +14103,7 @@ async def _f5_synthesize(text: str, voice: str) -> bytes:
     # offering a three-bedroom house. A voice can carry a neutral
     # reference_f5.wav cut for exactly this road; XTTS keeps using the
     # richer original.
-    _f5_ref = ref.with_name("reference_f5.wav")
-    if _f5_ref.is_file():
-        ref = _f5_ref
+    ref = voice_ref_for(voice, "f5") or ref                 # [es-near] the one rule, voice_ref_for
     try:
         rate = float(dj_settings().get("speech_rate") or 1.0)
     except Exception:  # noqa: BLE001
@@ -14116,7 +14114,7 @@ async def _f5_synthesize(text: str, voice: str) -> bytes:
     # measured bad calls were 548-688 chars in one piece, while every
     # splitter upstream waits for 800). Sentence-bounded pieces, one
     # call each, stitched with a breath: every tail stays clean.
-    clean = _xtts_sanitize(text)
+    clean = _es_voice.speakable(text, "f5", _xtts_sanitize)   # [es-near] F5 never sees a CAPS word
     pieces = (sentence_chunks(clean, cap=280, most=24)
               if len(clean) > 300 else [clean])
     ref_b64 = base64.b64encode(ref.read_bytes()).decode()
@@ -14172,7 +14170,7 @@ async def _clone_synthesize(engine: str, text: str, voice: str) -> bytes:
     except Exception:  # noqa: BLE001
         rate = 1.0
     payload = {
-        "text": _xtts_sanitize(text)[:XTTS_MAX_CHARS],
+        "text": _es_voice.speakable(text, engine, _xtts_sanitize)[:XTTS_MAX_CHARS],   # [es-near]
         "reference_audio": base64.b64encode(ref.read_bytes()).decode(),
         "language": "en",
         "opts": {"speed": max(0.75, min(1.25, rate))},
@@ -15880,6 +15878,27 @@ async def _es_pantry_perform(clip: dict[str, Any] | None, vec: dict[str, Any] | 
                                    "delta": (got.get("es") or {}).get("reperformed")},
                                   default=str)[:800])
     return got
+
+
+def _es_shelf_ref_ok(clip: dict[str, Any] | None) -> bool:
+    """[es-near] Whether a shelf take was made from the reference its engine
+    would clone from now (voice_ref_variant). A take from another one is a
+    MISS - its performance baseline is not this voice's any more (a
+    reference_f5.wav cut since, or a bank) - and is rendered fresh. A take
+    whose stamp predates the record is a hit, as it always was."""
+    try:
+        baked = _es_voice.baked_ref((clip or {}).get("es"))
+        if baked is None:
+            return True
+        now = voice_ref_variant(str(clip.get("voice") or ""), str(clip.get("engine") or ""))
+        if baked == now:
+            return True
+        pipeline_log("perf", "(es-near) a shelf take was made from %s, the engine now clones from %s"
+                     " - rendered fresh" % (baked or "no reference", now or "no reference"),
+                     extra=str(clip.get("path") or "")[:200])
+        return False
+    except Exception:  # noqa: BLE001
+        return True
 
 
 def _pantry_bytes_of(row: dict[str, Any]) -> int:
@@ -24800,6 +24819,27 @@ def voice_ref_path(vid: str) -> Path | None:
     return ref if ref.exists() else None
 
 
+def voice_ref_for(vid: str, engine: str) -> Path | None:
+    """[es-near] THE reference file `engine` clones library voice `vid` from -
+    one truth for the synthesis roads and for the take's stamp. F5 prefers
+    a neutral reference_f5.wav cut for it (#816: F5 continues its reference,
+    and the library one bled its words onto the air); every other engine
+    the library reference. (The per-emotion banks will choose here.)"""
+    ref = voice_ref_path(vid)
+    if ref is not None and engine == "f5":
+        alt = ref.with_name("reference_f5.wav")
+        if alt.is_file():
+            return alt
+    return ref
+
+
+def voice_ref_variant(vid: str, engine: str) -> str:
+    """[es-near] voice_ref_for's file as a take records it: its stem
+    ("reference", "reference_f5"), "" when the voice has none."""
+    ref = voice_ref_for(vid, engine)
+    return ref.stem if ref is not None else ""
+
+
 def _voice_json(vid: str, name: str) -> dict[str, Any] | None:
     if not VOICE_ID_SHAPE.match(vid or ""):
         return None
@@ -25758,6 +25798,11 @@ async def voice_generate(text: str, voice: str, engine: str,
         "phone": bool((fx or {}).get("phone")),
         "pitch": (fx or {}).get("pitch") or 0,
     }
+    # [es-near] which reference baked this take: what the engine performed
+    # natively, beside its speed and temperature. A shelf road re-performs it
+    # only while the engine would still clone from the same one.
+    if isinstance(_es_block, dict):
+        _es_native = dict(_es_native, ref=voice_ref_variant(voice, engine))
     _clip_out = {
         "path": f"/media/{key}",
         "sig": media_sign(key),
@@ -35682,6 +35727,10 @@ def spoken_text(line: str) -> str:
     #870: and it is where the ENGLISH rule lives, because it is the one
     place every spoken line passes through no matter who wrote it.
     Two of anything stays, as emphasis; the rest is dropped."""
+    # [es-near] the writer's micro-grammar first ([emph]x[/emph] -> CAPS, [beat]
+    # -> a dash) and an *action* dropped whole - the strip below leaves its word
+    # to be read out. Unmarked text is untouched (es_voice.unmark).
+    line = _es_voice.unmark(line)
     # [s3-blocks] a prompt block's marker must never reach a voice: a round's
     # angle carries marked blocks, and a fallback that airs the angle as
     # written would hand the TTS private-use characters and a block's name
@@ -36735,7 +36784,7 @@ async def _dj_speak_floorless(kind: str, track: dict[str, Any] | None = None,
                     engine or voice_engine_for(_prep_voice)))
             except Exception:  # noqa: BLE001
                 _prep_ready = None
-            if _prep_ready:
+            if _prep_ready and _es_shelf_ref_ok(_prep_ready):   # [es-near] same reference, or a miss
                 pipeline_log("lookahead", "off the pantry shelf - no render "
                              f"needed - {kind} (#842)")
                 clip = await _es_pantry_perform(_prep_ready, vec, who)   # [s3-es-voice]
@@ -83772,6 +83821,10 @@ def perf_apply(raw: bytes, vec: dict[str, Any]) -> bytes:
         import wave
         with wave.open(io.BytesIO(raw), "rb") as probe:
             rate = probe.getframerate()
+        # [es-near] the crest the take arrived with: the leveller caps a clip by
+        # its PEAK, so a performance that sharpened the peaks would air quieter
+        # than the plain take - it is handed this crest back at the end
+        _crest_in = _es_voice.crest_db(raw)
         # [s3-es-voice] THE MELODY FIRST (gap 1: pitch_var reached nothing): the
         # middle by the ES pitch, the swing by `range`, on the take's own
         # pulses (es_voice.intonate: TD-PSOLA, duration and formants kept)
@@ -83786,6 +83839,7 @@ def perf_apply(raw: bytes, vec: dict[str, Any]) -> bytes:
         scale = float(vec.get("pause_scale") or 1.0)
         if abs(scale - 1.0) > 0.03:                     # [s3-es-voice] was 0.15 (gap 2)
             raw = perf_pause_stretch(raw, scale)
+        raw = _es_voice.hold_crest(raw, _crest_in)       # [es-near] the plain take's loudness
     except Exception:
         pass
     return raw
@@ -108082,7 +108136,7 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
             # #886: made already, while a record was playing. This is the
             # whole buffer — a hit costs nothing and skips the engine.
             _ready = pantry_get(pantry_key(text, v, engine))
-            if _ready:
+            if _ready and _es_shelf_ref_ok(_ready):             # [es-near] same reference, or a miss
                 pipeline_log("lookahead", "off the pantry shelf - no render "
                              f"needed - {item['who']} (#886)")
                 take_note(item["who"], v, engine, text, _ready, 0, "shelf")
