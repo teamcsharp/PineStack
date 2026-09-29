@@ -137,6 +137,7 @@
     var head = make('div', 'pb-skins-head');
     head.appendChild(make('b', '', 'Background'));
     var shut = make('button', 'pb-skins-x', '×');
+    shut.title = "Close"; if (!shut.getAttribute("aria-label")) shut.setAttribute("aria-label", "Close");  // [closex:tip:sampler-face.js:openPicker:shut:Close]
     shut.addEventListener('click', closePicker);
     head.appendChild(shut);
     picker.appendChild(head);

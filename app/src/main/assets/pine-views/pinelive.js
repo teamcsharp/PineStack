@@ -306,6 +306,16 @@
   function setHidden(node, hidden) {
     if (node && node.hidden !== !!hidden) node.hidden = !!hidden;
   }
+  /* [vcrfx] setHidden for a picture: PineVcr.set is idempotent per state,
+     so the four-a-second paint costs nothing once the picture has settled. */
+  function vcrHidden(node, hidden) {
+    var V = root.PineVcr;
+    if (!node || !V || typeof V.set !== 'function') { setHidden(node, hidden); return; }
+    V.set(node, !hidden, {
+      show: function (el) { el.hidden = false; },
+      hide: function (el) { el.hidden = true; }
+    });
+  }
 
   function btn(cls, words, iconName, title) {
     var b = make('button', 'pl-btn' + (cls ? ' ' + cls : ''));
@@ -724,6 +734,122 @@
     }, 3100);
   }
 
+  /* ================================================== [pltoggle] the header's switches */
+  /* Three switches in the header, each the SAME road as its section twin:
+   *   PineCam to live = Picture, Video to Tailscale listeners (settings.tailscale_video)
+   *   Pine Live       = Event, MX Live event - the [plair] switch IS the set
+   *   Album recording = Recording (settings.record, remembered for the next set)
+   * One model value paints both twins; one function flips both. */
+  function tailscaleOn() {
+    var s = model.settings || {};
+    var pic = (model.state && model.state.picture) || {};
+    return s.tailscale_video !== undefined ? !!s.tailscale_video : !!pic.tailscale_video;
+  }
+
+  function albumOn() {
+    var s = model.settings || {};
+    var r = (model.state && model.state.recording) || {};
+    if (s.record !== undefined) return !!s.record;
+    if (r.album !== undefined) return !!r.album;
+    return r.on !== false;
+  }
+
+  /* immediate: both switches move now, the station stops the public
+   * picture now, and the answer's state puts them right if it refused */
+  function flipTailscale(next, node) {
+    if (!model.settings) model.settings = {};
+    model.settings.tailscale_video = next;
+    if (model.state && model.state.picture) model.state.picture.tailscale_video = next;
+    paint();
+    return act('/api/pinelive/settings', {tailscale_video: next}, node);
+  }
+
+  /* the [plair] road: on arms the set now on the chosen road (event mode -
+   * the interface takes the broadcast as soon as it sounds); off ends it,
+   * and only on a second tap */
+  function flipSet(next, node) {
+    var st = model.state || {};
+    if (!next && st.armed) {
+      confirmTap('disable', node, 'Tap again to end the set and switch MX Live off', function () {
+        act('/api/pinelive/event', {enabled: false}, node);
+      });
+      return;
+    }
+    var road = ui.prefs.road || (st.source && st.source.kind) || 'usb';
+    var body = {enabled: next, source: road};
+    if (road === 'usb' && model.settings && model.settings.device) body.device = model.settings.device;
+    act('/api/pinelive/event', body, node);
+  }
+
+  /* the station remembers it (settings.record); mid-set it starts or
+   * suspends the recording from this moment */
+  function flipAlbum(next) {
+    saveSetting('record', next);
+    paint();
+  }
+
+  function headSwitch(parent, cls, labelText, onFlip) {
+    var b = make('button', 'pl-hsw ' + cls);
+    b.type = 'button';
+    b.setAttribute('role', 'switch');
+    b.setAttribute('aria-checked', 'false');
+    b.setAttribute('aria-label', labelText);
+    var word = make('span', 'pl-hsw-label', labelText);
+    var track = make('span', 'pl-hsw-track');
+    track.appendChild(make('i'));
+    b.appendChild(word);
+    b.appendChild(track);
+    b.addEventListener('click', function (e) {
+      e.stopPropagation();
+      onFlip(b.getAttribute('aria-checked') !== 'true', b);
+    });
+    parent.appendChild(b);
+    return {root: b, label: word, set: function (on) {
+      var v = on ? 'true' : 'false';
+      if (b.getAttribute('aria-checked') !== v) b.setAttribute('aria-checked', v);
+    }};
+  }
+
+  var HSW_PHASE = {arming: 'armed', live: 'LIVE', fallback: 'fallback', stopping: 'ending'};
+  function paintHeadSwitches() {
+    var h = ui.hsw;
+    if (!h) return;
+    var st = model.state;
+    var cam = tailscaleOn();
+    h.cam.set(cam);
+    h.cam.root.title = cam
+      ? 'PineCam to live is ON: Tailscale listeners see the Pine Cam during the set. Tap to stop the public picture at once.'
+      : 'PineCam to live is OFF: the picture stays on your own screens - the camera keeps capturing. Tap to share it on the Tailscale stream.';
+    var rehearse = !!(st && st.armed && st.event && st.event.rehearse);
+    var setOn = !!(st && st.armed) && !rehearse;
+    var phase = setOn ? String(st.phase || 'arming') : 'idle';
+    var confirming = !!(ui.confirmUntil.disable && Date.now() < ui.confirmUntil.disable);
+    h.live.set(setOn);
+    if (h.live.root.getAttribute('data-phase') !== phase) h.live.root.setAttribute('data-phase', phase);
+    setClass(h.live.root, 'confirm', confirming);
+    setText(h.live.label, confirming ? 'Tap again to end' : rehearse ? 'Pine Live · test'
+      : setOn ? 'Pine Live · ' + (HSW_PHASE[phase] || phase) : 'Pine Live');
+    h.live.root.title = setOn
+      ? 'Pine Live is ' + (HSW_PHASE[phase] || phase) + ': the set has the station whenever the interface sounds. Tap twice to end the set.'
+      : 'Pine Live: tap to go live - event mode arms and the interface takes the broadcast as soon as it sounds.';
+    var album = albumOn();
+    h.album.set(album);
+    h.album.root.title = album
+      ? 'Album recording is ON: the set is written as tracks (split on 10 s of silence), MP3, a folder per set in Live Events. Remembered for the next set.'
+      : 'Album recording is OFF: the set still airs and takes the music, nothing is written. Remembered for the next set.';
+    [h.cam, h.live, h.album].forEach(function (x) {
+      if (!x.root.classList.contains('busy')) x.root.disabled = !st;
+    });
+    /* the detection box keeps the middle while the row leaves it room */
+    var head = h.row.parentNode;
+    if (head && ui.visible) {
+      var hr = head.getBoundingClientRect();
+      var end = Math.max(h.row.getBoundingClientRect().right,
+        ui.headClock ? ui.headClock.getBoundingClientRect().right : 0);
+      setClass(head, 'pl-head-crowded', hr.width > 0 && end > hr.left + hr.width / 2 - 32);
+    }
+  }
+
   /* ================================================== [pltray] the desk's tools */
   /* The desk's status bar carries Crystals, Add sample and Go LIVE; the tablet
    * never had that footer. On a screen without #statusBar they ride the base
@@ -1057,6 +1183,13 @@
     head.appendChild(titles);
     ui.phasePill = make('span', 'pl-phase', '...');
     head.appendChild(ui.phasePill);
+    /* [pltoggle] slots 1, 2 and one more: the header's three switches */
+    var hswRow = make('div', 'pl-hsw-row');
+    ui.hsw = {row: hswRow,
+      cam: headSwitch(hswRow, 'pl-hsw-cam', 'PineCam to live', function (next, node) { flipTailscale(next, node); }),
+      live: headSwitch(hswRow, 'pl-hsw-live', 'Pine Live', function (next, node) { flipSet(next, node); }),
+      album: headSwitch(hswRow, 'pl-hsw-album', 'Album recording', function (next) { flipAlbum(next); })};
+    head.appendChild(hswRow);
     ui.headClock = make('span', 'pl-head-clock', '');
     head.appendChild(ui.headClock);
     /* [plpopup] the centred middle slot: the detection wizard's door
@@ -1387,6 +1520,8 @@
     setText(ui.headWarn, warn);
     setHidden(ui.headWarn, !warn);
     paintDetectBtn();         /* [pldetect] the box's tint follows the state */
+    try { paintHeadSwitches(); }   /* [pltoggle] */
+    catch (err) { if (root.console) root.console.error('[pinelive] header switches paint failed:', err); }
     if (ui.detect && ui.detect.open) {
       try { paintDetect(); }
       catch (err) {
@@ -1700,18 +1835,8 @@
   function buildEvent(p) {
     var b = p.body;
     var sw = toggle('MX Live event', 'Off: nothing can start. Switching it off during a set ends the set first.', function (next, node) {
-      if (!next && model.state && model.state.armed) {
-        confirmTap('disable', node, 'Tap again to end the set and switch MX Live off', function () {
-          act('/api/pinelive/event', {enabled: false}, node);
-        });
-        return;
-      }
-      /* [plair] the switch IS the set: on arms it now, on the chosen road */
-      var st0 = model.state || {};
-      var road0 = ui.prefs.road || (st0.source && st0.source.kind) || 'usb';
-      var body0 = {enabled: next, source: road0};
-      if (road0 === 'usb' && model.settings && model.settings.device) body0.device = model.settings.device;
-      act('/api/pinelive/event', body0, node);
+      /* [plair] the switch IS the set; [pltoggle] one owner with the header's Pine Live */
+      flipSet(next, node);
     });
     b.appendChild(sw.root);
 
@@ -2146,13 +2271,9 @@
     b.appendChild(modeRow);
 
     var ts = toggle('Video to Tailscale listeners', 'Off stops the public picture at once. Your own screens always see it.', function (next, node) {
-      /* immediate: the switch moves now, the station stops the picture now,
-       * and the answer's state puts it right if it refused */
+      /* [pltoggle] one owner with the header's PineCam to live */
       ts.set(next);
-      if (!model.settings) model.settings = {};
-      model.settings.tailscale_video = next;
-      if (model.state && model.state.picture) model.state.picture.tailscale_video = next;
-      act('/api/pinelive/settings', {tailscale_video: next}, node);
+      flipTailscale(next, node);
     });
     b.appendChild(ts.root);
 
@@ -2186,7 +2307,7 @@
     setText(f.cam, pic.cam_live ? 'linked and fresh' : 'not linked');
     setText(f.ads, isFinite(num(pic.ads)) ? String(pic.ads) : '--');
     setText(f.pub, st.armed ? (tv ? 'the live picture' : 'no picture (video off)') : 'the usual art (no set running)');
-    setHidden(p.parts.prev, !st.art_url);
+    vcrHidden(p.parts.prev, !st.art_url);   /* [vcrfx] the picture comes on like the SFX TV */
     setText(p.parts.cap, st.art_url ? 'What the album art shows now (your own view)' : '');
     syncPreview();
   }
@@ -2210,15 +2331,20 @@
     var st = model.state || {};
     var want = ui.visible && ui.open.picture && st.art_url ? stationUrl(st.art_url) : '';
     if (want) { if (img.__src !== want) { img.__src = want; img.src = want; } }
-    else if (img.__src) { img.__src = ''; img.removeAttribute('src'); }
+    else if (img.__src) {
+      img.__src = '';
+      /* [vcrfx: the last frame stays through the collapse] */
+      setTimeout(function () { if (!img.__src) img.removeAttribute('src'); },
+        root.PineVcr ? root.PineVcr.OUT_MS + 80 : 0);
+    }
   }
 
   /* ------------------------------------------------------------ recording */
 
   function buildRecording(p) {
     var b = p.body;
-    var rec = toggle('Write the cuts', 'Every cut is two files: the live input alone in stereo, and the full broadcast mix.', function (next) {
-      saveSetting('record', next);
+    var rec = toggle('Album recording', 'Every cut is two files: the live input alone in stereo, and the full broadcast mix. Off: the set still airs and takes the music; nothing is written. Remembered for the next set.', function (next) {
+      flipAlbum(next);                  /* [pltoggle] one owner with the header's Album recording */
       rec.set(next);
     });
     b.appendChild(rec.root);
@@ -2294,7 +2420,7 @@
     var s = model.settings || {};
     var r = st.recording || {};
     var parts = p.parts;
-    parts.rec.set(s.record !== undefined ? !!s.record : r.on !== false);
+    parts.rec.set(albumOn());          /* [pltoggle] */
     var cut = Number(s.cut_seconds || r.cut_seconds || 210);
     parts.presets.set(cut);
     parts.custom.set(cut);
@@ -2305,13 +2431,14 @@
       if (parts.dest.value !== dv) parts.dest.value = dv;
     }
     setText(parts.destCap, r.dest && st.armed ? 'this event goes to ' + r.dest : 'a folder per event is made inside it');
-    if (st.armed && r.cut_index) {
+    if (st.armed && r.cut_index && albumOn()) {   /* [pltoggle] */
       setText(parts.nowWords, 'Cut ' + r.cut_index + ' · ' + fmtDur(r.cut_elapsed) + ' of ' + fmtDur(r.cut_seconds || cut));
       setText(parts.nowMore, (r.cuts || 0) + ' closed this event');
       var frac = Math.max(0, Math.min(1, num(r.cut_elapsed) / Math.max(1, num(r.cut_seconds || cut))));
       parts.fill.style.transform = 'scaleX(' + (isFinite(frac) ? frac.toFixed(3) : 0) + ')';
     } else {
-      setText(parts.nowWords, st.armed ? 'Starting the first cut...' : 'No set running');
+      setText(parts.nowWords, !st.armed ? 'No set running' : albumOn() ? 'Starting the first cut...'
+        : 'Album recording is off - the set airs, nothing is written');   /* [pltoggle] */
       setText(parts.nowMore, r.cuts ? r.cuts + ' closed' : '');
       parts.fill.style.transform = 'scaleX(0)';
     }

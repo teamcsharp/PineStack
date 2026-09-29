@@ -894,6 +894,7 @@
     var external = make('a', 'pine-voice-ad-open', 'Open media'); external.target = '_blank'; external.rel = 'noopener';
     actions.appendChild(external); actions.appendChild(command('Close ad viewer', 'c:close--filled', close)); box.appendChild(actions);
     veil.appendChild(box); document.body.appendChild(veil);
+    if (window.pineCloseX) { window.pineCloseX(box, function () { close(); }, {label: 'Close the ad viewer'}); }  // [closex:ad-viewer]
     if (gallery && root.PineDuck && typeof root.PineDuck.hold === 'function') {
       duckApi = root.PineDuck;
       duckApi.hold('pine-box-gallery', 0.05, veil);
@@ -914,7 +915,15 @@
     function close() {
       gone = true; revision++; clearInterval(crawl); clearInterval(h3Timer);
       clearInterval(pTimer); pBackOff();                               /* [h3-prompts] */
-      clearTimeout(exportTimer); disposeMedia(); veil.remove();
+      clearTimeout(exportTimer);
+      /* [vcrfx: the video goes off the way it came on] */
+      var vcrMedia = stage.querySelector('video.pav-media');
+      if (root.PineVcr && vcrMedia && vcrMedia.style.visibility === 'visible' && vcrMedia.isConnected) {
+        var vcrDispose = disposeMedia;
+        disposeMedia = function () {};
+        try { vcrMedia.pause(); } catch (e) { /* it stops with the veil */ }
+        root.PineVcr.out(vcrMedia).then(function () { vcrDispose(); veil.remove(); });
+      } else { disposeMedia(); veil.remove(); }
       if (duckApi && typeof duckApi.release === 'function') duckApi.release('pine-box-gallery');
       duckApi = null;
       if (posterObserver) posterObserver.disconnect(); posterQueue = [];
@@ -1063,6 +1072,8 @@
       function reveal() {
         if (gone || current !== revision) return;
         clearTimeout(timer); media.style.visibility = 'visible'; background(false); status.textContent = '';
+        /* [vcrfx: an H3 video comes on like the SFX TV] once per picture */
+        if (isVideo && root.PineVcr && !media.__vcrOn) { media.__vcrOn = true; root.PineVcr.in(media); }
       }
       function failed(words) {
         if (gone || current !== revision) return;

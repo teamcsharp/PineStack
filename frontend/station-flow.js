@@ -99,6 +99,7 @@ export async function openStationFlow({request, onClose=()=>{}}={}) {
   title.append(dom("div","sf-kicker","Pine Box / content observatory"),h2,dom("div","sf-subtitle","Every source, decision, rewrite and audible delivery. Select any step to inspect its evidence."));
   const live=dom("span","sf-live","Connecting"), closeBtn=dom("button","","Close ×");
   closeBtn.setAttribute("aria-label","Close station flow");closeBtn.onclick=close;
+  if(window.pineCloseX){window.pineCloseX(dialog,()=>closeBtn.click(),{label:"Close station flow"});closeBtn.style.display="none";}   // [closex:station-flow]
   header.append(title,live,closeBtn);
   const health=dom("div","sf-health"), main=dom("div","sf-main"), left=dom("div","sf-left"), controls=dom("nav","sf-controls");
   controls.setAttribute("aria-label","Flow map controls");

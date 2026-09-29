@@ -2982,6 +2982,7 @@
     var head = make('div', 'sp-find-head');
     head.appendChild(make('b', null, 'Where the clips come from'));
     var x = make('button', 'sp-find-x', '\u00d7');
+    x.title = "Close"; if (!x.getAttribute("aria-label")) x.setAttribute("aria-label", "Close");  // [closex:tip:script-page.js:folderOpen:x:Close]
     x.type = 'button';
     x.setAttribute('aria-label', 'Close');
     x.addEventListener('click', folderClose);
@@ -3195,6 +3196,7 @@
     /* The box pins the folder for the slider's hours; on the folder
        already pinned it clears the pin, so one row is the whole switch. */
     var check = make('button', 'sp-folder-check', '');
+    check.title = "Pin the clips to this folder for a few hours (press again to unpin)"; if (!check.getAttribute("aria-label")) check.setAttribute("aria-label", "Pin the clips to this folder for a few hours (press again to unpin)");  // [closex:tip:script-page.js:folderRow:check:Pin the clip]
     check.type = 'button';
     check.addEventListener('click', function (ev) {
       ev.stopPropagation();
@@ -3507,6 +3509,7 @@
     var head = make('div', 'sp-find-head');
     head.appendChild(make('b', null, title));
     var x = make('button', 'sp-find-x', '\u00d7');
+    x.title = "Close"; if (!x.getAttribute("aria-label")) x.setAttribute("aria-label", "Close");  // [closex:tip:script-page.js:sheetShell:x:Close]
     x.type = 'button';
     x.setAttribute('aria-label', 'Close');
     head.appendChild(x);
@@ -5392,6 +5395,7 @@
        carrier (the desk's controlFrame, z 2147483002) */
     document.body.appendChild(menu);
     mv.menu = menu;
+    if (window.pineCloseX) { window.pineCloseX(menu, function () { mvMenuClose(); }, {label: 'Close the menu', reserve: 'top'}); }  // [closex:sp-view-menu]
     mv.flip.setAttribute('aria-expanded', 'true');
     mv.menuOff = function (e) {
       if (e.type === 'keydown') { if (e.key === 'Escape') { e.stopPropagation(); mvMenuClose(); } return; }
@@ -6347,6 +6351,19 @@
     if (!m || !m.video) return;
     var v = m.video;
     m.video = null;
+    /* [vcrfx: it collapses back onto the thumbnail] - paused at once, its
+       source let go when the collapse is over (a 460 ms overlap with the
+       next clip's element, never two playing). Off-screen: at once. */
+    var V = root.PineVcr;
+    if (V && typeof V.out === 'function' && v.isConnected && v.style.visibility === 'visible') {
+      try { v.pause(); } catch (e) { /* already gone */ }
+      if (m.img) m.img.style.visibility = '';
+      V.out(v).then(function () {
+        try { v.removeAttribute('src'); v.load(); } catch (e) { /* already gone */ }
+        if (v.parentNode) v.parentNode.removeChild(v);
+      });
+      return;
+    }
     try { v.pause(); v.removeAttribute('src'); v.load(); } catch (e) { /* already gone */ }
     if (v.parentNode) v.parentNode.removeChild(v);
     if (m.img) m.img.style.visibility = '';
@@ -6443,7 +6460,13 @@
     v.style.visibility = 'hidden';
     videoFirstFrame(v, function () {
       v.style.visibility = 'visible';
-      if (m.img) m.img.style.visibility = 'hidden';
+      /* [vcrfx: the clip comes on over its thumbnail] */
+      var V = root.PineVcr;
+      if (V && typeof V.in === 'function') {
+        V.in(v).then(function (ok) {
+          if (ok && m.video === v && m.img && v.style.visibility === 'visible') m.img.style.visibility = 'hidden';
+        });
+      } else if (m.img) m.img.style.visibility = 'hidden';
     }, function () {
       v.style.visibility = 'hidden';
       if (m.img) m.img.style.visibility = '';
@@ -12387,6 +12410,7 @@
     var head = make('div', 'sp-segexp-head');
     head.appendChild(make('b', null, title));
     var x = make('button', 'sp-segexp-x', '\u00d7');
+    x.title = "Close"; if (!x.getAttribute("aria-label")) x.setAttribute("aria-label", "Close");  // [closex:tip:script-page.js:segExportToast:x:Close]
     x.type = 'button';
     x.setAttribute('aria-label', 'Close');
     head.appendChild(x);
@@ -12723,6 +12747,7 @@
     head.appendChild(traceBtn);
     head.appendChild(banBtn);
     var x = make('button', 'sp-find-x', '\u00d7');
+    x.title = "Close"; if (!x.getAttribute("aria-label")) x.setAttribute("aria-label", "Close");  // [closex:tip:script-page.js:findOpen:x:Close]
     x.type = 'button';
     x.addEventListener('click', findClose);
     head.appendChild(x);
@@ -13023,6 +13048,7 @@
     var no = make('button', 'sp-find-confirm-no', 'Cancel');
     no.type = 'button';
     no.addEventListener('click', function () { wrap.remove(); });
+    if (window.pineCloseX) { window.pineCloseX(sheet, function () { wrap.remove(); }, {label: 'Cancel (close)'}); }  // [closex:sp-ban-ask]
     var yes = make('button', 'sp-find-confirm-yes',
       (d && d.banned) ? 'Let it be said again' : 'Never say it again');
     yes.type = 'button';
@@ -14190,6 +14216,7 @@
     var reset = make('button', 'sp-mix-reset', 'Reset');
     reset.type = 'button';
     var shut = make('button', 'sp-mix-shut', '\u2715');
+    shut.title = "Close"; if (!shut.getAttribute("aria-label")) shut.setAttribute("aria-label", "Close");  // [closex:tip:script-page.js:mixerOpen:shut:Close]
     shut.type = 'button';
     head.appendChild(reset);
     head.appendChild(shut);
@@ -20363,6 +20390,7 @@
 
     tabs.line.appendChild(row);
     var close = make('button', 'sp-detail-close', '✕');
+    close.title = "Close"; if (!close.getAttribute("aria-label")) close.setAttribute("aria-label", "Close");  // [closex:tip:script-page.js:openLine:close:Close]
     close.addEventListener('click', function () { box.hidden = true; lineTabsDispose(); });
     tabs.strip.appendChild(close);
   }

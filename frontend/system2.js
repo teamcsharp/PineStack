@@ -394,6 +394,7 @@ export async function openSystem2({request, onClose} = {}) {
   document.addEventListener('keydown', key);
   backdrop.addEventListener('click', event => { if (event.target === backdrop) close(); });
   view = await mount(root, {request, onClose: close});
+  if (!closed && window.pineCloseX) window.pineCloseX(root, close, {label: 'Close System2'});   // [closex:s2-window]
   if (closed) view.dispose(); else root.querySelector('button')?.focus();
   return {element: backdrop, close};
 }

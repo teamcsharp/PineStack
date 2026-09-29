@@ -52,6 +52,23 @@
   /* Longer than the .off animation in sfx-tv.css, so the last frame of the
    * collapse is seen rather than cut off by the removal. */
   var OFF_MS = 520;
+  /* [vcrfx] THE SET'S ON AND OFF ARE PineVcr's - pine-vcr.js holds the one
+   * table (the numbers sfx-tv.css kept as sfxTvOn/sfxTvOff) that every
+   * picture in the app, the tablet and the broadcast now shares. The
+   * classes stay as the road for a page that has not loaded pine-vcr.js. */
+  function vcrTubeOn(tube, flash) {
+    var V = root.PineVcr;
+    if (V && typeof V.in === 'function') { V.in(tube, {flash: flash || false}); return; }
+    tube.classList.add('on');
+    if (flash) flash.classList.add('pop');
+  }
+  function vcrTubeOff(tube) {
+    var V = root.PineVcr;
+    if (V && typeof V.out === 'function') { V.out(tube); return; }
+    tube.classList.remove('on');
+    void tube.offsetWidth;            // restart the animation, never resume it
+    tube.classList.add('off');
+  }
   /* Past this many seconds late, the set would be coming on over whatever
    * is airing NOW - which is worse than the clip being missed. */
   var LATE = 8;
@@ -1130,6 +1147,7 @@
     wrap.addEventListener('pointerdown', function (ev) { ev.stopPropagation(); });
     document.body.appendChild(wrap);
     askWrap = wrap;
+    if (window.pineCloseX) { window.pineCloseX(wrap, function () { askDrop(); }, {label: 'Close', reserve: 'top'}); }  // [closex:sfx-ask]
   }
 
   function askDrop() {
@@ -1340,10 +1358,12 @@
     box.appendChild(head); box.appendChild(media); box.appendChild(prompt);
     box.appendChild(actions); box.appendChild(status); shade.appendChild(box);
     shade.addEventListener('click', function (ev) { if (ev.target === shade) shade.remove(); });
+    if (window.pineCloseX) { window.pineCloseX(box, function () { close.click(); }, {label: 'Close'}); close.style.display = 'none'; }  // [closex:sfx-parody-result]
     document.body.appendChild(shade);
   }
 
   function parodyOpen(seed, keepSurfaceDown) {
+    if (root.PineSfxSeen) { try { if (seed && typeof seed === 'object') root.PineSfxSeen.interact('parody', seed); } catch (e) { /* [sfxseen] never in the way of the picture */ } }
     parodyClose();
     if (keepSurfaceDown) {
       surfaceDown(true);
@@ -1451,6 +1471,7 @@
     box.appendChild(fieldWrap); box.appendChild(controls); box.appendChild(status);
     box.appendChild(queuePanel);
     shade.appendChild(box); document.body.appendChild(shade); parodyWrap = shade;
+    if (window.pineCloseX) { window.pineCloseX(box, function () { parodyClose(); }, {label: 'Close the stinger maker'}); close.style.display = 'none'; }  // [closex:sfx-parody]
 
     var queueReading = false;
     var refreshQueue = function () {
@@ -1999,6 +2020,7 @@
     box.appendChild(title); box.appendChild(stage); box.appendChild(help);
     box.appendChild(status); box.appendChild(actions); shade.appendChild(box);
     document.body.appendChild(shade); deleteWrap = shade;
+    if (window.pineCloseX) { window.pineCloseX(box, function () { deleteConfirmClose(true); }, {label: 'Keep it (close)'}); }  // [closex:sfx-delete]
     if (root.PineWallTransition
         && typeof root.PineWallTransition.cover === 'function') {
       root.PineWallTransition.cover(media, {container: stage,
@@ -2059,6 +2081,7 @@
   }
 
   function radialOpen(clip, at) {
+    if (root.PineSfxSeen) { try { if (clip) root.PineSfxSeen.interact('radial', clip); } catch (e) { /* [sfxseen] never in the way of the picture */ } }
     if (!clip) return;
     radialClose(false);
     surfaceDown(true);
@@ -2743,6 +2766,7 @@
     if (!floorClaim('tube')) {
       showing = false;
       videoReceipt(clip, 'error', null, 'Another SFX surface owns playback');
+      if (root.PineSfxSeen) { try { root.PineSfxSeen.drop(clip, 'tube', 'hushed: another SFX surface owns playback'); } catch (e) { /* [sfxseen] never in the way of the picture */ } }
       return;
     }
     /* #1184: whatever was in the tube is now the past, whichever road
@@ -2786,6 +2810,7 @@
       screen.addEventListener('ended', function () { reportVideo('ended'); });
       screen.addEventListener('error', function () { reportVideo('error', 'Video decode or fetch failed'); });
       screen.__pineReceiptClose = function () { reportVideo('error', 'Video player closed before completion'); };
+      if (root.PineSfxSeen) { try { root.PineSfxSeen.track(screen, clip, 'tube'); } catch (e) { /* [sfxseen] never in the way of the picture */ } }
     }
     var glass = tube;
     var done = false;
@@ -2833,9 +2858,7 @@
            right - it is the one that failed. */
       }
       try {
-        glass.classList.remove('on');
-        void glass.offsetWidth;      // restart the animation, never resume it
-        glass.classList.add('off');
+        vcrTubeOff(glass);           /* [vcrfx] picture -> line -> dot */
       } catch (err) {}
       setTimeout(function () { teardown(screen); }, OFF_MS);
     };
@@ -2956,8 +2979,7 @@
       try {
         host.classList.remove('waiting');
         if (!seam) {
-          glass.classList.add('on');   // dot -> line -> picture
-          parts.flash.classList.add('pop');
+          vcrTubeOn(glass, parts.flash);   /* [vcrfx] dot -> line -> picture */
         }
       } catch (err) { /* the picture is there either way */ }
       /* #1184: on a seam the NEXT clip has to be warming already - the
@@ -4692,6 +4714,7 @@
     box.appendChild(frame);
     box.addEventListener('pointerdown', function (ev) { ev.stopPropagation(); });
     document.body.appendChild(box);
+    if (window.pineCloseX) { window.pineCloseX(box, function () { editorClose(); }, {label: 'Close the editor'}); }  // [closex:sfx-editor]
     editorBox = box;
     /* The standing rule: 10% while an editing surface is open. #1172 is in
        this station's history because this very editor was the one surface
@@ -4821,6 +4844,7 @@
 
   var sheetAt = null;
   function sheet(clip, at) {
+    if (root.PineSfxSeen) { try { if (clip) root.PineSfxSeen.interact('sheet', clip); } catch (e) { /* [sfxseen] never in the way of the picture */ } }
     /* [#1441] A WALL SHEET DOES NOT HANG OFF THE SET'S FRAME. When `at`
        is given this is the #1184 sheet, mounted on the BODY further down
        precisely because the set it belongs to may be veiled - or, since
@@ -5679,6 +5703,7 @@
     var clip = queue.shift();
     while (clip && missed(clip)) {                         /* #1173 */
       videoReceipt(clip, 'error', null, 'Video missed its playback window');
+      if (root.PineSfxSeen) { try { root.PineSfxSeen.drop(clip, 'tube', 'missed its playback window (vidmiss drop)'); } catch (e) { /* [sfxseen] never in the way of the picture */ } }
       clip = queue.shift();
     }
     if (!clip) return;
@@ -6166,6 +6191,7 @@
     if (wallFlight && now() - (Number(wallFlight.__pineAt) || 0) < 4000) return wallFlight;
     var flight = bridge.videoWall('state').then(function (got) {
       var st = wallState(got);
+      if (root.PineSfxSeen) { try { if (st) root.PineSfxSeen.wall(st, ringSeen[String(st.playing || '')] || null); } catch (e) { /* [sfxseen] never in the way of the picture */ } }
       var id = st && st.playing;
       /* [#1442b] BEFORE the veiled early-return below: a wall that is
          hidden must still be told when it may come back. */
@@ -7020,6 +7046,7 @@
     box.appendChild(matchRow);                             /* [#1251] */
     box.appendChild(note);
     document.body.appendChild(box);
+    if (window.pineCloseX) { window.pineCloseX(box, function () { endlessSheet(); }, {label: 'Close', reserve: 'top'}); }  // [closex:sfx-endless]
     sheetEl = box;
     api().get('/api/sfx/video/mode').then(function (st) {
       paintSw(!!(st && st.on));
@@ -7196,6 +7223,7 @@
     /* Numbers the operator can look at rather than a claim in a comment. */
     box: readBox,
     waiting: function () { return queue.length; },
+    mounted: function () { return !!mounted; },          /* [sfxseen] the set is running */
     on: function () { return showing; },
     offer: offer,
     /* [#1214] the arbiter, on the desk. The same object as

@@ -760,6 +760,7 @@
     head.setAttribute('data-pine-drag-handle', '');
     head.appendChild(make('b', '', title));
     var x = make('button', 'hc-x', '×');
+    x.title = "Close"; if (!x.getAttribute("aria-label")) x.setAttribute("aria-label", "Close");  // [closex:tip:hot-corners.js:sheet:x:Close]
     x.type = 'button';
     x.setAttribute('aria-label', 'close');
     head.appendChild(x);

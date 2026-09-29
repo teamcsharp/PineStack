@@ -144544,7 +144544,7 @@ def pinelink_picked() -> dict[str, Any]:
     return out
 
 
-def pinelink_viewer_ok(token: str) -> bool:
+def pinelink_viewer_ok(token: str, switch: bool = True) -> bool:
     """May the holder of THIS token see the camera?
 
     Deliberately independent of the in-house on-air preference. That one
@@ -144557,7 +144557,7 @@ def pinelink_viewer_ok(token: str) -> bool:
     What it IS tied to is the camera being linked - there is no point
     telling a viewer they may watch a thing that is not running.
     """
-    if pinelive.public_video_blocked():       # [pinelive] Tailscale video OFF
+    if switch and pinelive.public_video_blocked():   # [pinelive] Tailscale video OFF ([vcrfx] switch=False asks "but for it")
         return False
     mode = pinelink_public_mode()
     if mode == "off":
@@ -144667,6 +144667,18 @@ async def pinelink_viewers_api(
     }
 
 
+def _vcr_switch(t: str) -> dict[str, Any]:
+    """[vcrfx] PineCam to live for a viewer's CRT: on, flips, armed, and
+    `yours` - whether this token is one the switch decides for (it would see
+    the camera if the switch were on). Only then does the page replay flips."""
+    sw = pinelive.video_switch()
+    try:
+        sw["yours"] = bool(t and sw.get("armed") and pinelink_viewer_ok(t, switch=False))
+    except Exception:  # noqa: BLE001
+        sw["yours"] = False
+    return sw
+
+
 @app.get("/api/pinelink/mine")
 async def pinelink_mine_api(
     request: Request,
@@ -144718,6 +144730,7 @@ async def pinelink_mine_api(
             "frame": "/api/pinelink/frame.jpg" + ("?t=" + t if t else ""),
             "low": low,                                     # [#1475]
             "small": small,                                 # [#1475]
+            "switch": _vcr_switch(t),                       # [vcrfx]
             "why": ("" if show else
                     "the camera is not being shared with you right now")}
 
@@ -146784,10 +146797,15 @@ _SPARK_ASSETS = {
     # and the tablet have had all along.
     "sfx-tv.js": "application/javascript; charset=utf-8",
     "sfx-tv.css": "text/css; charset=utf-8",
+    # [vcrfx] the ONE picture on / off effect (the SFX TV's CRT), shared by
+    # the panel, the tune page, the desktop and the tablet.
+    "pine-vcr.js": "application/javascript; charset=utf-8",
     "wall-transition.js": "application/javascript; charset=utf-8",
     # [autoscroll-rule] the one scroll rule: the panel - and the tablet's
     # views, which run inside it - load the desktop's own file from here.
     "pine-stick.js": "application/javascript; charset=utf-8",
+    # [closex:asset] every popup's corner X - one control, one look
+    "pine-closex.js": "application/javascript; charset=utf-8",
     "pinebox.png": "image/png",
 }
 
@@ -161644,6 +161662,7 @@ _PUBLIC_GET = {"/healthz", "/api/dj", "/api/dj/voice", "/api/dj/reacts",
                # contents as it grows.
                "/spark/asset/sfx-tv.js",
                "/spark/asset/sfx-tv.css",
+               "/spark/asset/pine-vcr.js",     # [vcrfx] the CRT on/off
                "/spark/asset/slideshow.css",   # #1415,
                # [autoscroll-rule] the one scroll rule the tune page's
                # feed follows by - public client code, named exactly.
@@ -205747,6 +205766,9 @@ CONTROL_PANEL_HTML = r"""
      below without changing how one letter of text looks. -->
 <link rel="stylesheet" href="/icons/pineicons.css?v=2">
 <script src="/icons/pine-icons.js"></script>
+<!-- [closex:script] the corner X every popup carries (pineCloseX) -->
+<script src="/spark/asset/pine-closex.js"></script>
+<script src="/spark/asset/pine-vcr.js"></script>
 <script src="/spark/asset/wall-transition.js"></script>
 <!-- [autoscroll-rule] one rule for every scroller that follows: it moves only
      for a reader at its latest end who is not examining something there. -->
@@ -211004,6 +211026,7 @@ function pineWin(key, title, opts) {
   shut.title = "Close";
   head.appendChild(max);
   head.appendChild(shut);
+  if (window.pineCloseX) { window.pineCloseX(box, () => shut.click()); shut.remove(); }  // [closex:legacy:pineWin:shut]
   box.appendChild(head);
   const host = el("div", "pine-win-host", "");
   box.appendChild(host);
@@ -211580,6 +211603,7 @@ function pineSlidesBuild() {
   frame.title = "The Pine Box Gazette — the endless press";
   pane.appendChild(grip);
   pane.appendChild(shut);
+  if (window.pineCloseX) { window.pineCloseX(pane, () => shut.click()); shut.remove(); }  // [closex:legacy:pineSlidesBuild:shut]
   pane.appendChild(frame);
   document.body.appendChild(pane);
   return pane;
@@ -212549,6 +212573,7 @@ async function gazHourOpen(hour) {
   x.title = "Close the hour (Esc)";
   x.onclick = gazHourClose;
   head.appendChild(x);
+  if (window.pineCloseX) { window.pineCloseX(shade, () => x.click()); x.remove(); }  // [closex:legacy:gazHourOpen:x]
   const strip = el("div", "gaz-strip", "");
   shade.appendChild(head);
   shade.appendChild(strip);
@@ -213527,6 +213552,8 @@ function showLightbox(file, fallback) {
   wrap.classList.toggle("lb-video", isVid);
   img.style.display = isVid ? "none" : "block";
   vid.style.display = isVid ? "block" : "none";
+  /* [vcrfx: a video comes on like the SFX TV; a still is simply there] */
+  if (window.PineVcr) { if (isVid) window.PineVcr.in(wrap); else window.PineVcr.cancel(wrap); }
   const pane = document.getElementById("lbReferencePane");
   const refImg = document.getElementById("lightboxRefImg");
   const refVid = document.getElementById("lightboxRefVid");
@@ -214018,8 +214045,40 @@ async function exportLightbox() {
   }
 }
 
+// [closex:lightbox] the lightbox card's corner X - static markup, so it is
+// wired once the page is parsed; closeLightbox() with no event closes it.
+(function closexLightbox() {
+  const wire = () => {
+    const card = document.querySelector("#lightbox .lb-card");
+    if (card && window.pineCloseX) window.pineCloseX(card, () => closeLightbox(),
+      {label: "Close the lightbox", sticky: true});
+  };
+  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", wire);
+  else wire();
+})();
 function closeLightbox(event) {
   if (event && event.target !== document.getElementById("lightbox")) return;
+  /* [vcrfx] A VIDEO GOES OFF THE WAY IT CAME ON: paused, collapsed, and
+   * only then closed - unless the lightbox was opened again meanwhile. A
+   * second close during the collapse closes at once. */
+  const vcrWrap = document.getElementById("lbImgWrap");
+  const vcrBox = document.getElementById("lightbox");
+  if (window.PineVcr && !closeLightbox.vcrBusy && vcrWrap && vcrBox
+      && vcrWrap.classList.contains("lb-video") && vcrBox.style.display !== "none") {
+    closeLightbox.vcrBusy = true;
+    const vcrSerial = lightboxOpenSerial;
+    ["lightboxVid", "lightboxRefVid"].forEach((id) => {
+      try { document.getElementById(id).pause(); } catch (e) {}
+    });
+    window.PineVcr.out(vcrWrap).then(() => {
+      if (vcrSerial === lightboxOpenSerial) {
+        closeLightbox();
+        window.PineVcr.cancel(vcrWrap);
+      }
+      closeLightbox.vcrBusy = false;
+    });
+    return;
+  }
   lightboxDuckReset();
   lightboxOpenSerial += 1;
   lightboxReferenceSerial += 1;
@@ -215563,6 +215622,7 @@ async function scriptsOpen() {
   back.style.display = "none";
   const caption = el("span", "dir-load", "");
   const refresh = el("button", "", "↻");
+  refresh.title = "Refresh the list"; if (!refresh.getAttribute("aria-label")) refresh.setAttribute("aria-label", "Refresh the list");  // [closex:tip:app.py:scriptsOpen:refresh:Refresh the ]
   const gap = el("span", "", "");
   gap.style.flex = "1";
   [back, refresh, gap, caption].forEach((n) => bar.appendChild(n));
@@ -216521,6 +216581,7 @@ function directorRow(row) {
   oneShot.forEach((n) => {
     const line = el("div", "dir-note", "");
     const drop = el("button", "", "✕");
+    drop.title = "Retire this note"; if (!drop.getAttribute("aria-label")) drop.setAttribute("aria-label", "Retire this note");  // [closex:tip:app.py:oneShot.forEach((n:drop:Retire this ]
     drop.onclick = async () => {
       drop.disabled = true;
       try {
@@ -217230,6 +217291,10 @@ function cloudPopupOpen() {
   x.style.cssText = "margin-left:auto;cursor:pointer;font-size:18px";
   x.onclick = () => toggleCloud();
   head.appendChild(x);
+  if (window.pineCloseX) {   // [closex:cloud] close, never toggle: a cloud that never mounted must still go
+    window.pineCloseX(box, () => { if (cloud) toggleCloud(); else cloudPopupClose(); }, {label: "Close the word cloud"});
+    x.remove();
+  }
   box.appendChild(head);
   const wrap = el("div", "", "");
   wrap.style.cssText = "flex:1;min-height:0";
@@ -217891,6 +217956,7 @@ async function crystalDetailOpen(slug) {
   note.style.cssText = "font-size:12px;margin-top:8px";
   card.appendChild(note);
 
+  if (window.pineCloseX) window.pineCloseX(card, crystalDetailClose, {label: "Close the crystal"});  // [closex:crystal-detail]
   shade.appendChild(card);
   document.body.appendChild(shade);
 }
@@ -218165,6 +218231,7 @@ async function djGpuAdvisor() {
   shut.style.cssText = "position:absolute;top:8px;right:10px";
   shut.onclick = () => win.remove();
   win.appendChild(shut);
+  if (window.pineCloseX) { window.pineCloseX(win, () => shut.click()); shut.remove(); }  // [closex:legacy2:djGpuAdvisor]
   const bar = document.createElement("div");
   bar.className = "row";
   bar.style.cssText = "gap:6px;margin-top:6px;flex-wrap:wrap";
@@ -218543,6 +218610,7 @@ async function trackCard(id) {
   shut.onclick = trackClose;
   card.appendChild(shut);
 
+  if (window.pineCloseX) window.pineCloseX(card, trackClose, {label: "Close the track card"});  // [closex:track-card]
   shade.appendChild(card);
   document.body.appendChild(shade);
 }
@@ -218715,6 +218783,7 @@ async function boothOpen() {
   const bar = el("div", "", "");
   bar.style.cssText = "position:absolute;top:0;left:0;right:0;display:flex;"
     + "gap:8px;align-items:center;padding:10px 14px;z-index:2;"
+    + "flex-wrap:wrap;padding-right:56px;"   // [closex:booth-bar] wrap, never clip; clear of the X
     + "background:linear-gradient(#02040ae0,transparent)";
   const title = el("b", "", "Pine Box FM · booth");
   title.style.cssText = "flex:1;font-size:14px;cursor:grab";
@@ -218800,6 +218869,11 @@ async function boothOpen() {
   prev.onclick = () => djCall("prev");
   const next = el("button", "", "⏭");
   next.onclick = () => djCall("next");
+  // [closex:booth-tips] every icon button says what it does
+  [[prev, "Previous track"], [next, "Next track"],
+   [banterBtn, "Have the DJs banter now"], [adBtn, "Play an ad now"],
+   [grow, "Fill the screen / restore"], [pop, "Pop out into a floating window"]]
+    .forEach(([b, say]) => { b.title = b.title || say; b.setAttribute("aria-label", say); });
   // Cycle through the 3JS views of the studio (#480): each opens full-screen
   // and closes the others (one-WebGL-context rule), so pressing this walks
   // you through the Mind, the machine Sim and the data crystal in turn.
@@ -218824,10 +218898,18 @@ async function boothOpen() {
       + " ⟳";
     try { v.open(); } catch (e) { boothLog("view: " + e.message); }
   };
-  const shut = el("button", "danger", "✕ Close");
-  shut.onclick = boothClose;
-  [title, onAir, prev, next, banterBtn, adBtn, viewBtn, grow, pop, shut]
+  // [closex:booth] The way out is the corner X (pine-closex.js), not the
+  // last button in a bar that clips: at 620 px "Ad" was already cut and
+  // Close had slid off the edge - the booth could not be closed at all.
+  [title, onAir, prev, next, banterBtn, adBtn, viewBtn, grow, pop]
     .forEach((n) => bar.appendChild(n));
+  if (window.pineCloseX) {
+    window.pineCloseX(shade, boothClose, {label: "Close the booth"});
+  } else {
+    const shut = el("button", "danger", "✕ Close");
+    shut.onclick = boothClose;
+    bar.appendChild(shut);
+  }
   stage.appendChild(bar);
 
   const dock = el("div", "", "");
@@ -218884,6 +218966,8 @@ async function boothOpen() {
   sendBtn.onclick = () => boothSend();
   const reqBtn = el("button", "", "🎵 Request");
   reqBtn.onclick = () => boothSend(true);
+  reqBtn.title = "Request a song by name";   // [closex:booth-reqtip]
+  sendBtn.title = "Say it to the DJ";
   [say, sendBtn, reqBtn].forEach((n) => row.appendChild(n));
   const hint = el("div", "muted", "Drop an image anywhere to have him react "
     + "to it · Shift-drop to make it an ad");
@@ -219618,6 +219702,7 @@ function usbConsole() {
   [guide, flash, shut].forEach((n) => foot.appendChild(n));
   card.appendChild(foot);
 
+  if (window.pineCloseX) window.pineCloseX(card, () => shut.click(), {label: "Close the USB console"});  // [closex:usb-console]
   shade.appendChild(card);
   document.body.appendChild(shade);
 
@@ -219710,6 +219795,7 @@ async function pineDoctor() {
   [guide, pdf, usb, retry, fix, shut].forEach((b) => row.appendChild(b));
   card.appendChild(row);
 
+  if (window.pineCloseX) window.pineCloseX(card, () => shade.remove(), {label: "Close the diagnosis"});  // [closex:pine-doctor]
   shade.appendChild(card);
   document.body.appendChild(shade);
 }
@@ -220196,6 +220282,7 @@ function themeMenu(event) {
   });
 
   document.body.appendChild(menu);
+  if (window.pineCloseX) window.pineCloseX(menu, themeMenuClose, {label: "Close the menu", reserve: "top"});  // [closex:theme-menu]
   menu.style.left = Math.max(8, Math.min(Math.round(anchor.left),
     window.innerWidth - menu.offsetWidth - 8)) + "px";
   // Capture phase, so a click anywhere else closes it before that click acts.
@@ -220929,6 +221016,7 @@ async function albumFocus(host, album) {
   shut.onclick = () => shade.remove();
   head.appendChild(title);
   head.appendChild(shut);
+  if (window.pineCloseX) { window.pineCloseX(list, () => shut.click()); shut.remove(); }  // [closex:legacy:albumFocus:shut]
   list.appendChild(head);
 
   const who = el("div", "muted", album.artist || "");
@@ -221296,6 +221384,7 @@ function djTalkPopup() {
   head.appendChild(wipe);
   head.appendChild(mute);
   head.appendChild(shut);
+  if (window.pineCloseX) { window.pineCloseX(box, () => shut.click()); shut.remove(); }  // [closex:legacy:djTalkPopup:shut]
 
   head.addEventListener("pointerdown", (event) => {
     if (event.target.closest("button")) return;    // the buttons are not a handle
@@ -222241,6 +222330,7 @@ async function callerDossier(name, tab) {
   x.style.cssText = "margin-left:auto;cursor:pointer;font-size:18px";
   x.onclick = () => shade.remove();
   head.appendChild(x);
+  if (window.pineCloseX) { window.pineCloseX(box, () => x.click()); x.remove(); }  // [closex:legacy:callerDossier:x]
   box.appendChild(head);
 
   const tabs = el("div", "row", "");
@@ -222530,6 +222620,7 @@ async function hangupRules(focusId) {
   x.style.cssText = "margin-left:auto;cursor:pointer;font-size:18px";
   x.onclick = () => shade.remove();
   head.appendChild(x);
+  if (window.pineCloseX) { window.pineCloseX(box, () => x.click()); x.remove(); }  // [closex:legacy:hangupRules:x]
   box.appendChild(head);
   const why = el("div", "muted",
     "One of these is drawn for every call — by weight, never the same one "
@@ -222732,6 +222823,7 @@ async function callerCases(focusId) {
   x.style.cssText = "margin-left:auto;cursor:pointer;font-size:18px";
   x.onclick = () => shade.remove();
   head.appendChild(x);
+  if (window.pineCloseX) { window.pineCloseX(box, () => x.click()); x.remove(); }  // [closex:legacy:callerCases:x]
   box.appendChild(head);
   const why = el("div", "muted", "");
   why.style.cssText = "font-size:11.5px;line-height:1.55;margin-bottom:10px";
@@ -223177,6 +223269,7 @@ async function adArchivePopup(focusId) {
   x.style.cssText = "margin-left:auto;cursor:pointer;font-size:18px";
   x.onclick = () => shade.remove();
   head.appendChild(x);
+  if (window.pineCloseX) { window.pineCloseX(box, () => x.click()); x.remove(); }  // [closex:legacy:adArchivePopup:x]
   box.appendChild(head);
   const body = el("div", "muted", "reading the ad book…");
   box.appendChild(body);
@@ -224132,6 +224225,7 @@ function djDossierShow(line, anchorEl) {
   x.style.cssText = "margin-left:auto;cursor:pointer;opacity:.6";
   x.onclick = djDossierClose;
   head.appendChild(x);
+  if (window.pineCloseX) { window.pineCloseX(card, () => x.click()); x.remove(); }  // [closex:legacy:djDossierShow:x]
   card.appendChild(head);
 
   const body = String(line.text || "");
@@ -224325,6 +224419,7 @@ async function djProvenanceShow(line, event) {
   shut.onclick = djProvenanceClose;
   head.appendChild(title);
   head.appendChild(shut);
+  if (window.pineCloseX) { window.pineCloseX(pop, () => shut.click()); shut.remove(); }  // [closex:legacy:djProvenanceShow:shut]
   pop.appendChild(head);
 
   const waiting = el("div", "muted", "reading the paperwork\u2026");
@@ -224671,6 +224766,7 @@ async function pineSheet(line) {
   shut.onclick = pineSheetClose;
   head.appendChild(whoBox);
   head.appendChild(shut);
+  if (window.pineCloseX) { window.pineCloseX(sheet, () => shut.click()); shut.remove(); }  // [closex:legacy:pineSheet:shut]
   sheet.appendChild(head);
 
   /* ---- the tabs ---- */
@@ -225409,6 +225505,7 @@ function boothAnalysisDossier(line) {
   const x = el("button", "", "✕");
   x.onclick = () => pop.remove();
   head.appendChild(t); head.appendChild(x);
+  if (window.pineCloseX) { window.pineCloseX(pop, () => x.click()); x.remove(); }  // [closex:legacy2:boothAnalysisDossier]
   pop.appendChild(head);
   const meta = el("div", "", "");
   meta.style.cssText = "display:flex;flex-wrap:wrap;gap:6px;"
@@ -225557,6 +225654,7 @@ function visionPromptDesk(line, anchor, onResult) {
     shut.title = "Close the desk";
     shut.onclick = () => { clearTimeout(timer); pop.remove(); };
     head.appendChild(title); head.appendChild(shut);
+    if (window.pineCloseX) { window.pineCloseX(pop, () => shut.click()); shut.remove(); }  // [closex:legacy2:visionPromptDesk]
     pop.appendChild(head);
     const blurb = el("div", "muted",
       "Every prompt the station looks through. Edit one, keep it, and send "
@@ -228095,6 +228193,7 @@ function djSayMenu(event) {
   });
 
   document.body.appendChild(menu);
+  if (window.pineCloseX) window.pineCloseX(menu, djSayMenuClose, {label: "Close the menu", reserve: "top"});  // [closex:say-menu]
   document.addEventListener("click", djSayMenuAway, true);
 }
 
@@ -228517,6 +228616,7 @@ function pineMediaSettings() {
   x.style.cssText = "cursor:pointer;opacity:.8";
   x.onclick = () => box.remove();
   bar.appendChild(x);
+  if (window.pineCloseX) { window.pineCloseX(box, () => x.click()); x.remove(); }  // [closex:legacy:pineMediaSettings:x]
   box.appendChild(bar);
   const body = el("div", "", "");
   body.style.cssText = "padding:12px;display:grid;"
@@ -229360,6 +229460,7 @@ async function sfxInspect(sfxId) {
   shut.style.cssText = "cursor:pointer;font-size:18px";
   shut.onclick = () => shade.remove();
   head.appendChild(shut);
+  if (window.pineCloseX) { window.pineCloseX(card, () => shut.click()); shut.remove(); }  // [closex:legacy:sfxInspect:shut]
   card.appendChild(head);
 
   if (info.spec_url) {
@@ -229506,6 +229607,7 @@ async function artFullscreen(name) {
   const shut = el("button", "", "✕");
   shut.onclick = () => ov.remove();
   top.appendChild(title); top.appendChild(shut);
+  if (window.pineCloseX) { window.pineCloseX(card, () => shut.click()); shut.remove(); }  // [closex:legacy2:artFullscreen]
   card.appendChild(top);
 
   const where = el("div", "muted", "looking for the prompt…");
@@ -229615,6 +229717,7 @@ function artHawkMenu(event, name) {
   item("🔍 Open it", "See it full size and read the prompt behind it",
        () => artFullscreen(name));
   document.body.appendChild(menu);
+  if (window.pineCloseX) window.pineCloseX(menu, artHawkClose, {label: "Close the menu", reserve: "top"});  // [closex:hawk-menu]
   const away = () => { artHawkClose(); document.removeEventListener(
     "click", away, true); };
   setTimeout(() => document.addEventListener("click", away, true), 0);
@@ -229643,6 +229746,7 @@ async function artHawkPanel(names) {
   x.style.cssText = "margin-left:auto;cursor:pointer;font-size:18px";
   x.onclick = () => shade.remove();
   head.appendChild(x);
+  if (window.pineCloseX) { window.pineCloseX(box, () => x.click()); x.remove(); }  // [closex:legacy:artHawkPanel:x]
   box.appendChild(head);
   box.appendChild(el("div", "muted",
     "The pair take these off the wall, describe what they can actually see, "
@@ -229771,6 +229875,7 @@ async function sparkQueuePopup(event) {
   x.style.cssText = "margin-left:auto;cursor:pointer;font-size:18px";
   x.onclick = () => shade.remove();
   head.appendChild(x);
+  if (window.pineCloseX) { window.pineCloseX(box, () => x.click()); x.remove(); }  // [closex:legacy:sparkQueuePopup:x]
   box.appendChild(head);
   box.appendChild(el("div", "muted",
     "The next twelve the slideshow will show. Tick any of them and send "
@@ -229860,6 +229965,7 @@ async function pineboxStatus() {
   x.style.cssText = "margin-left:auto;cursor:pointer;font-size:18px";
   x.onclick = () => shade.remove();
   head.appendChild(x);
+  if (window.pineCloseX) { window.pineCloseX(box, () => x.click()); x.remove(); }  // [closex:legacy:pineboxStatus:x]
   box.appendChild(head);
   const body = el("div", "muted", "◐ asking…");
   body.style.cssText = "font-size:12px;line-height:1.6";
@@ -229990,6 +230096,7 @@ async function pineboxInitialize() {
   x.style.cssText = "margin-left:auto;cursor:pointer;font-size:18px";
   x.onclick = () => shade.remove();
   head.appendChild(x);
+  if (window.pineCloseX) { window.pineCloseX(box, () => x.click()); x.remove(); }  // [closex:legacy:pineboxInitialize:x]
   box.appendChild(head);
   const note = el("div", "muted",
     "Working down the chain — the switch, the routing, the link to Home "
@@ -230247,6 +230354,7 @@ function opsTray() {
   x.style.cssText = "margin-left:auto;cursor:pointer;opacity:.7";
   x.onclick = () => box.remove();
   head.appendChild(x);
+  if (window.pineCloseX) { window.pineCloseX(box, () => x.click()); x.remove(); }  // [closex:legacy2:opsTray]
   box.appendChild(head);
   const why = document.createElement("div");
   why.className = "muted";
@@ -230987,6 +231095,7 @@ async function themeDocPick() {
   list.style.cssText = "border:1px solid var(--border);border-radius:8px;"
     + "max-height:46vh;overflow-y:auto";
   card.appendChild(list);
+  if (window.pineCloseX) window.pineCloseX(card, close, {label: "Close the document picker"});  // [closex:theme-doc]
   shade.appendChild(card);
   document.body.appendChild(shade);
 
@@ -231241,6 +231350,7 @@ async function docLockPanel() {
   shut.style.cssText = "cursor:pointer;font-size:18px";
   shut.onclick = close;
   head.appendChild(shut);
+  if (window.pineCloseX) { window.pineCloseX(card, () => shut.click()); shut.remove(); }  // [closex:legacy:docLockPanel:shut]
   card.appendChild(head);
   const body = el("div", "muted", "Reading the folder…");
   body.style.cssText = "font-size:12px;margin-top:8px";
@@ -231548,6 +231658,7 @@ async function remotePanel() {
   shut.style.cssText = "cursor:pointer;font-size:18px";
   shut.onclick = () => shade.remove();
   head.appendChild(shut);
+  if (window.pineCloseX) { window.pineCloseX(card, () => shut.click()); shut.remove(); }  // [closex:legacy:remotePanel:shut]
   card.appendChild(head);
   const body = el("div", "muted", "Looking…");
   body.style.cssText = "font-size:12px;margin-top:8px";
@@ -232123,6 +232234,7 @@ async function artistReadPanel() {
   shut.style.cssText = "cursor:pointer;font-size:18px";
   shut.onclick = () => shade.remove();
   head.appendChild(shut);
+  if (window.pineCloseX) { window.pineCloseX(card, () => shut.click()); shut.remove(); }  // [closex:legacy:artistReadPanel:shut]
   card.appendChild(head);
   card.appendChild(el("div", "muted",
     "Every song they have in the library is transcribed, kept as markdown, "
@@ -232280,6 +232392,7 @@ async function sfxDirPopup(sfxId) {
     };
     row.appendChild(box);
     const play = el("button", "", "▶");
+    play.title = "Play this sample"; if (!play.getAttribute("aria-label")) play.setAttribute("aria-label", "Play this sample");  // [closex:tip:app.py:sfxDirPopup:play:Play this sa]
     play.style.cssText = "background:none;border:0;padding:0;"
       + "cursor:pointer;font-size:12px";
     play.onclick = () => clipToggle(sample.url, play, "▶");   // #706
@@ -232287,6 +232400,7 @@ async function sfxDirPopup(sfxId) {
     row.appendChild(name);
     card.appendChild(row);
   });
+  if (window.pineCloseX) window.pineCloseX(card, () => shade.remove(), {label: "Close the sample folder"});  // [closex:sfx-dir]
   shade.appendChild(card);
   document.body.appendChild(shade);
 }
@@ -232423,6 +232537,7 @@ async function speakboxEdit(name, passage) {
   foot.appendChild(shut);
   card.appendChild(foot);
 
+  if (window.pineCloseX) window.pineCloseX(card, shutAll, {label: "Close the speaker box"});  // [closex:speakbox-edit]
   shade.appendChild(card);
   document.body.appendChild(shade);
 
@@ -232645,6 +232760,7 @@ async function djGuestPanel() {
     + "</h2><span style='flex:1'></span><button onclick=\"document."
     + "getElementById('djGuestOv').remove()\">close</button></div>"
     + "<div id='djGuestBody' class='muted'>loading…</div>";
+  if (window.pineCloseX) window.pineCloseX(card, () => ov.remove(), {label: "Close the studio guest"});  // [closex:guest]
   ov.appendChild(card);
   document.body.appendChild(ov);
   await djGuestRefresh();
@@ -233429,6 +233545,7 @@ async function rhetVecDoc(file) {
     + "getElementById('rhetVecOv').remove()\">close</button></div>"
     + "<div id='rhetVecDocBody' class='muted' style='font-size:13px;"
     + "white-space:pre-wrap;line-height:1.5'>reading…</div>";
+  if (window.pineCloseX) window.pineCloseX(card, () => ov.remove(), {label: "Close the document"});  // [closex:rhet-doc]
   ov.appendChild(card); document.body.appendChild(ov);
   let text = "";
   try { text = (await api("/api/speakbox/" + encodeURIComponent(file))).text
@@ -233470,6 +233587,7 @@ async function rhetWordDetail(word) {
     + "style='font-size:13px'>close</button></div>"
     + "<div id='rhetDetailBody' class='muted' style='font-size:13px'>"
     + "searching the documents…</div>";
+  if (window.pineCloseX) window.pineCloseX(card, () => ov.remove(), {label: "Close the word"});  // [closex:rhet-word]
   ov.appendChild(card);
   document.body.appendChild(ov);
   let hits = [];
@@ -234763,6 +234881,7 @@ function djRepairPopup() {
   const shut = el("button", "", "✕");
   shut.onclick = closeAll;
   head.appendChild(shut);
+  if (window.pineCloseX) { window.pineCloseX(card, () => shut.click()); shut.remove(); }  // [closex:legacy:djRepairPopup:shut]
   card.appendChild(head);
   const grid = el("div", "", "");
   grid.style.cssText = "display:grid;grid-template-columns:repeat(auto-fit,"
@@ -234886,6 +235005,7 @@ function djRepairPopup() {
           x.style.cssText = "position:absolute;top:8px;right:10px";
           x.onclick = () => pop.remove();
           pop.appendChild(x);
+          if (window.pineCloseX) { window.pineCloseX(pop, () => x.click()); x.remove(); }  // [closex:legacy:djRepairPopup:x]
           document.body.appendChild(pop);
   pvFloat(pop);                                             // #877
         };
@@ -235686,8 +235806,8 @@ function djTvShow(clip) {
     win.host.appendChild(glass);
     win.host.appendChild(vignette);
     win.host.appendChild(flash);
-    tube.classList.add("on");              // dot -> line -> picture
-    flash.classList.add("pop");
+    if (window.PineVcr) window.PineVcr.in(tube, {flash: flash});   // [vcrfx] dot -> line -> picture
+    else { tube.classList.add("on"); flash.classList.add("pop"); }
     /* [#1219] "Show a timeline at the bottom while the animation ... is
      * playing." A 4px band along the bottom edge of the picture and a small
      * clock in its corner, driven by the tube's own currentTime on
@@ -235731,9 +235851,12 @@ function djTvShow(clip) {
     finished = true;
     djTvWarmDrop();                                        /* [#1212] */
     try {
-      tube.classList.remove("on");
-      void tube.offsetWidth;             // restart the animation, not resume it
-      tube.classList.add("off");
+      if (window.PineVcr) window.PineVcr.out(tube);                // [vcrfx] picture -> line -> dot
+      else {
+        tube.classList.remove("on");
+        void tube.offsetWidth;             // restart the animation, not resume it
+        tube.classList.add("off");
+      }
     } catch (e) {}
     /* Longer than the animation, so the last frame is seen; the clip is
      * silenced FIRST so a tail cannot outlive the picture. */
@@ -237424,6 +237547,7 @@ async function adStudioOpen() {
           air.textContent = "📻";
         };
         const del = el("button", "", "🗑");
+  del.title = "Delete this spot"; if (!del.getAttribute("aria-label")) del.setAttribute("aria-label", "Delete this spot");  // [closex:tip:app.py:produce:del:Delete this ]
         del.onclick = async () => {
           try {
             await api("/api/dj/ads/" + a.id, {method: "DELETE"});
@@ -237438,6 +237562,7 @@ async function adStudioOpen() {
   };
   adStudioList();
 
+  if (window.pineCloseX) window.pineCloseX(card, () => shade.remove(), {label: "Close the Ad studio"});  // [closex:ad-studio]
   shade.appendChild(card);
   document.body.appendChild(shade);
 }
@@ -237492,6 +237617,7 @@ async function phoneRingStudio() {
   x.style.cssText = "margin-left:auto;cursor:pointer;font-size:18px";
   x.onclick = () => shade.remove();
   head.appendChild(x);
+  if (window.pineCloseX) { window.pineCloseX(box, () => x.click()); x.remove(); }  // [closex:legacy:phoneRingStudio:x]
   box.appendChild(head);
   box.appendChild(el("div", "muted",
     "The ring is made, not sampled — so every part of it is a number you "
@@ -237759,6 +237885,7 @@ function djPathsPanel(anchor) {
   foot.style.cssText = "font-size:10px;margin-top:8px;line-height:1.5";
   pop.appendChild(foot);
   document.body.appendChild(pop);
+  if (window.pineCloseX) window.pineCloseX(pop, () => pop.remove(), {label: "Close the paths"});  // [closex:paths]
   pvFloat(pop);                                             // #877
 
   const FACE = {plot: "🧵", producer: "📻", caller: "☎", track: "💿",
@@ -238099,6 +238226,7 @@ function storagePanel(anchor) {
     shut.style.cssText = "font-size:10.5px;padding:1px 7px";
     shut.onclick = () => pop.remove();
     head.appendChild(title); head.appendChild(again); head.appendChild(shut);
+    if (window.pineCloseX) { window.pineCloseX(pop, () => shut.click()); shut.remove(); }  // [closex:legacy2:storagePanel]
     pop.appendChild(head);
 
     const note = el("div", "muted", "reading the shelves\u2026");
@@ -238597,6 +238725,7 @@ function schedulePanel(anchor) {
       pop.remove();
     };
     head.appendChild(title); head.appendChild(again); head.appendChild(shut);
+    if (window.pineCloseX) { window.pineCloseX(pop, () => shut.click()); shut.remove(); }  // [closex:legacy2:schedulePanel]
     pop.appendChild(head);
 
     const strip = el("div", "sched-strip", "");
@@ -239334,6 +239463,7 @@ function schedulePanel(anchor) {
           + " \u2014 which record");
         t2.style.cssText = "font-weight:700;font-size:12px;flex:1;min-width:0";
         const x2 = el("button", "", "\u2715");
+  x2.title = "Close"; if (!x2.getAttribute("aria-label")) x2.setAttribute("aria-label", "Close");  // [closex:tip:app.py:trackPanel:x2:Close]
         x2.style.cssText = "font-size:10.5px;padding:1px 7px;flex:0 0 auto";
         x2.onclick = () => pop2.remove();
         h2.appendChild(t2); h2.appendChild(x2);
@@ -239483,6 +239613,7 @@ function schedulePanel(anchor) {
           + " \u2014 what it speaks from");
         t2.style.cssText = "font-weight:700;font-size:12px;flex:1;min-width:0";
         const x2 = el("button", "", "\u2715");
+  x2.title = "Close"; if (!x2.getAttribute("aria-label")) x2.setAttribute("aria-label", "Close");  // [closex:tip:app.py:promptPanel:x2:Close]
         x2.style.cssText = "font-size:10.5px;padding:1px 7px;flex:0 0 auto";
         x2.onclick = () => pop2.remove();
         h2.appendChild(t2); h2.appendChild(x2);
@@ -239807,6 +239938,7 @@ function deskPanel(anchor) {
   shut.style.cssText = "font-size:10.5px;padding:1px 7px;flex:0 0 auto";
   shut.onclick = (ev) => { ev.stopPropagation(); pop.remove(); };
   hd.appendChild(shut);
+  if (window.pineCloseX) { window.pineCloseX(pop, () => shut.click()); shut.remove(); }  // [closex:legacy:deskPanel:shut]
   pop.appendChild(hd);
   const sub = el("div", "muted", "Every call the desk has made to the "
     + "model \u2014 what was sent, what was governing it, and what came "
@@ -240020,6 +240152,7 @@ function roomPanel(anchor) {
   body.style.cssText = "font-size:11px;color:var(--muted)";
   pop.appendChild(body);
   document.body.appendChild(pop);
+  if (window.pineCloseX) window.pineCloseX(pop, () => pop.remove(), {label: "Close the room"});  // [closex:room]
   pvFloat(pop);                                             // #877
 
   const draw = async (force) => {
@@ -240532,6 +240665,7 @@ function djTailPanel(anchor) {
   const close = el("button", "", "✕");
   close.onclick = () => { clearTimeout(trayTimer); pop.remove(); };
   row.appendChild(go); row.appendChild(close);
+  if (window.pineCloseX) { window.pineCloseX(pop, () => close.click()); close.remove(); }  // [closex:legacy2:djTailPanel]
   pop.appendChild(lab); pop.appendChild(slide);
   pop.appendChild(kindRow); pop.appendChild(levelNote); pop.appendChild(row);
   pop.appendChild(tray);
@@ -240876,6 +241010,7 @@ async function plotOpen() {
         more.title = "The timetable, what has aired, and the controls";
         more.onclick = () => { open[p.id] = !open[p.id]; plotList(); };
         const del = el("button", "", "🗑");
+  del.title = "Delete this plot"; if (!del.getAttribute("aria-label")) del.setAttribute("aria-label", "Delete this plot");  // [closex:tip:app.py:plotList:del:Delete this ]
         del.onclick = async () => {
           try {
             await api("/api/dj/plots/" + p.id, {method: "DELETE"});
@@ -240890,6 +241025,7 @@ async function plotOpen() {
     } catch (e) { wrap.textContent = e.message; }
   }
   plotList();
+  if (window.pineCloseX) window.pineCloseX(card, () => shade.remove(), {label: "Close the plots"});  // [closex:plot]
   shade.appendChild(card);
   document.body.appendChild(shade);
 }
@@ -240949,6 +241085,7 @@ async function djConverseHistory() {
   shut.style.cssText = "margin-left:auto";
   shut.onclick = () => pop.remove();
   head.appendChild(shut);
+  if (window.pineCloseX) { window.pineCloseX(pop, () => shut.click()); shut.remove(); }  // [closex:legacy:djConverseHistory:shut]
   pop.appendChild(head);
   const seeds = (data.seeds || []);
   if (!seeds.length) pop.appendChild(el("div", "muted", "None saved yet."));
@@ -241577,6 +241714,7 @@ function djTopicsPanel() {
   foot.appendChild(shut);
   card.appendChild(foot);
 
+  if (window.pineCloseX) window.pineCloseX(card, () => shut.click(), {label: "Close the topics"});  // [closex:topics]
   shade.appendChild(card);
   document.body.appendChild(shade);
   field.focus();
@@ -241699,6 +241837,7 @@ function djPromptManage() {
   x.style.cssText = "margin-left:auto;cursor:pointer;font-size:18px";
   x.onclick = () => shade.remove();
   head.appendChild(x);
+  if (window.pineCloseX) { window.pineCloseX(card, () => x.click()); x.remove(); }  // [closex:legacy:djPromptManage:x]
   card.appendChild(head);
   const why = el("div", "muted",
     "The standing instructions over the whole station. The armed one is "
@@ -242983,6 +243122,7 @@ async function cacheTranscript(base, r) {
   x.style.cssText = "margin-left:auto;cursor:pointer;font-size:18px";
   x.onclick = () => { shade.remove(); setTimeout(cacheHoldEnd, 150); };
   head.appendChild(x);
+  if (window.pineCloseX) { window.pineCloseX(box, () => x.click()); x.remove(); }  // [closex:legacy:cacheTranscript:x]
   box.appendChild(head);
   // The player, pinned above the scroll — every line click drives it.
   const audio = document.createElement("audio");
@@ -243105,6 +243245,7 @@ async function stagingDesk() {
   x.style.cssText = "margin-left:auto;cursor:pointer;opacity:.7";
   x.onclick = () => shade.remove();
   head.appendChild(x);
+  if (window.pineCloseX) { window.pineCloseX(box, () => x.click()); x.remove(); }  // [closex:legacy:stagingDesk:x]
   box.appendChild(head);
 
   const sub = el("div", "muted", "Every clip that has aired since the last "
@@ -243304,6 +243445,7 @@ async function callRecordings() {
   x.style.cssText = "margin-left:auto;cursor:pointer;font-size:18px";
   x.onclick = () => { shade.remove(); setTimeout(cacheHoldEnd, 150); };
   head.appendChild(x);
+  if (window.pineCloseX) { window.pineCloseX(box, () => x.click()); x.remove(); }  // [closex:legacy:callRecordings:x]
   box.appendChild(head);
   const list = el("div", "muted", "Loading…");
   box.appendChild(list);
@@ -244070,6 +244212,7 @@ async function callRecordings() {
           + (row.context ? "Written against: " + row.context + "\n\n" : "")
           + words.value));
       const bin = el("button", "danger", "🗑");
+  bin.title = "Delete this page"; if (!bin.getAttribute("aria-label")) bin.setAttribute("aria-label", "Delete this page");  // [closex:tip:app.py:renderUpstairs:bin:Delete this ]
       bin.style.cssText = "font-size:11px;padding:2px 8px";
       bin.onclick = async () => {
         if (!confirm("Delete this page for good?")) return;
@@ -244402,6 +244545,7 @@ function calMenu(e, sec, epochSecs) {
     m.appendChild(b);
   });
   document.body.appendChild(m);
+  if (window.pineCloseX) window.pineCloseX(m, () => m.remove(), {label: "Close the menu", reserve: "top"});  // [closex:cal-menu]
   setTimeout(() => document.addEventListener(
     "click", () => m.remove(), {once: true}), 0);
 }
@@ -244437,10 +244581,12 @@ async function calOpen() {
   });
   head.appendChild(scopeWrap);
   const prev = el("button", "", "◀"); prev.style.fontSize = "12px";
+  prev.title = "Previous"; if (!prev.getAttribute("aria-label")) prev.setAttribute("aria-label", "Previous");  // [closex:tip:app.py:calOpen:prev:Previous]
   const label = el("span", ""); label.id = "calLabel";
   label.style.cssText = "font-size:13px;font-weight:600;min-width:180px;"
     + "text-align:center";
   const next = el("button", "", "▶"); next.style.fontSize = "12px";
+  next.title = "Next"; if (!next.getAttribute("aria-label")) next.setAttribute("aria-label", "Next");  // [closex:tip:app.py:calOpen:next:Next]
   const step = (dir) => {
     const d = new Date(CAL.cursor);
     if (CAL.scope === "day") d.setDate(d.getDate() + dir);
@@ -244455,6 +244601,7 @@ async function calOpen() {
   x.style.cssText = "margin-left:auto;cursor:pointer;font-size:18px";
   x.onclick = () => { shade.remove(); setTimeout(cacheHoldEnd, 150); };
   head.appendChild(x);
+  if (window.pineCloseX) { window.pineCloseX(box, () => x.click()); x.remove(); }  // [closex:legacy:calOpen:x]
   box.appendChild(head);
 
   const body = el("div", "", "");
@@ -244678,8 +244825,10 @@ function calRenderSide() {
   side.appendChild(audio);
   const nav = el("div", "row", ""); nav.style.cssText = "gap:4px;margin:4px 0";
   const pv = el("button", "", "⏮"); pv.style.fontSize = "12px";
+  pv.title = "Previous in the queue"; if (!pv.getAttribute("aria-label")) pv.setAttribute("aria-label", "Previous in the queue");  // [closex:tip:app.py:calRenderSide:pv:Previous in ]
   pv.onclick = () => { if (CAL.qi > 0) { CAL.qi--; calLoad(); } };
   const nx = el("button", "", "⏭"); nx.style.fontSize = "12px";
+  nx.title = "Next in the queue"; if (!nx.getAttribute("aria-label")) nx.setAttribute("aria-label", "Next in the queue");  // [closex:tip:app.py:calRenderSide:nx:Next in the ]
   nx.onclick = () => { if (CAL.qi < CAL.queue.length - 1) { CAL.qi++; calLoad(); } };
   const clr = el("button", "", "Clear"); clr.style.fontSize = "11px";
   clr.onclick = () => { CAL.queue = []; CAL.qi = -1; calRenderSide(); };
@@ -244721,6 +244870,7 @@ async function mixtapeLibrary() {
   x.style.cssText = "margin-left:auto;cursor:pointer;font-size:18px";
   x.onclick = () => shade.remove();
   head.appendChild(x);
+  if (window.pineCloseX) { window.pineCloseX(box, () => x.click()); x.remove(); }  // [closex:legacy:mixtapeLibrary:x]
   box.appendChild(head);
   const list = el("div", "muted", "Loading…");
   box.appendChild(list);
@@ -245013,6 +245163,7 @@ async function djCallersPanel() {
         call.disabled = false;
       };
       const drop = el("button", "danger", "✕");
+      drop.title = "Delete this caller"; if (!drop.getAttribute("aria-label")) drop.setAttribute("aria-label", "Delete this caller");  // [closex:tip:app.py:djCallersPanel:drop:Delete this ]
       drop.onclick = async () => {
         await api("/api/dj/callers/" + caller.id, {method: "DELETE"});
         draw();
@@ -245219,6 +245370,7 @@ async function djCallersPanel() {
   shut.style.marginTop = "10px";
   shut.onclick = () => shade.remove();
   card.appendChild(shut);
+  if (window.pineCloseX) window.pineCloseX(card, () => shut.click(), {label: "Close the callers"});  // [closex:callers]
   shade.appendChild(card);
   document.body.appendChild(shade);
   try { await draw(); } catch (error) { status.textContent = error.message; }
@@ -245268,6 +245420,7 @@ function djGraphPanel() {
   shut.onclick = () => djGraphClose();
   head.appendChild(grow);
   head.appendChild(shut);
+  if (window.pineCloseX) { window.pineCloseX(rail, () => shut.click()); shut.remove(); }  // [closex:legacy:djGraphPanel:shut]
   rail.appendChild(head);
 
   const detail = el("div", "", "Click a node to open it.");
@@ -246250,6 +246403,7 @@ async function mindTopologyOpen() {
   const add = el("button", "", "+ Directive"); add.title="Add a live instruction to the selected cast member"; add.style.cssText="pointer-events:auto"; bar.appendChild(add);
   const closeBtn = el("button", "", "x"); closeBtn.style.cssText="pointer-events:auto;margin-left:auto"; closeBtn.onclick=()=>close(); bar.appendChild(closeBtn);
   card.appendChild(bar); shade.appendChild(card); document.body.appendChild(shade);
+  if (window.pineCloseX) { window.pineCloseX(card, () => closeBtn.click(), {label: "Close the Mind Topology"}); closeBtn.style.display = "none"; }  // [closex:mind-topology]
   shade.onclick=(e)=>{if(e.target===shade)close();};
   const scene=new THREE.Scene(), camera=new THREE.PerspectiveCamera(48,1,.1,300), renderer=new THREE.WebGLRenderer({antialias:true});
   renderer.setPixelRatio(Math.min(2,devicePixelRatio||1)); renderer.setClearColor(0x02060b,1); stage.appendChild(renderer.domElement); camera.position.set(0,3,30);
@@ -246468,6 +246622,7 @@ function mindOpen(opts) {
     + "border:1px solid #4668;border-radius:8px;padding:3px 9px;cursor:pointer";
   shut.onclick = () => mindClose();
   bar.appendChild(shut);
+  if (window.pineCloseX) { window.pineCloseX(stage, () => shut.click()); shut.remove(); }  // [closex:legacy:mindOpen:shut]
   stage.appendChild(bar);
 
   // a faint live caption strip along the bottom
@@ -247486,6 +247641,7 @@ function mindOpen(opts) {
     hd.appendChild(el("b", "", "\u{1F4C4} " + name));
     const gr = el("span", "", ""); gr.style.flex = "1"; hd.appendChild(gr);
     const x = el("button", "", "✕");
+  x.title = "Close"; if (!x.getAttribute("aria-label")) x.setAttribute("aria-label", "Close");  // [closex:tip:app.py:mindReader:x:Close]
     hd.appendChild(x); box.appendChild(hd);
     box.appendChild(el("div", "muted",
       "Select a passage below to push it into the DJs' heads — or send it "
@@ -248134,6 +248290,7 @@ async function djStationPanel() {
   card.appendChild(feet);
   card.appendChild(status);
 
+  if (window.pineCloseX) window.pineCloseX(card, () => shade.remove(), {label: "Close the station settings"});  // [closex:station-panel]
   shade.appendChild(card);
   document.body.appendChild(shade);
   try {
@@ -248540,6 +248697,7 @@ async function djBanterPanel() {
   shut.onclick = () => shade.remove();
   card.appendChild(shut);
 
+  if (window.pineCloseX) window.pineCloseX(card, () => shut.click(), {label: "Close the banter desk"});  // [closex:banter]
   shade.appendChild(card);
   document.body.appendChild(shade);
   try { await draw(); } catch (error) { status.textContent = error.message; }
@@ -248653,6 +248811,7 @@ function djHostEngineMenu(event) {
   note.style.cssText = "font-size:10.5px;line-height:1.45";
   box.appendChild(note);
   document.body.appendChild(box);
+  if (window.pineCloseX) window.pineCloseX(box, () => { box.remove(); document.removeEventListener("pointerdown", away, true); }, {label: "Close the engine menu", reserve: "top"});  // [closex:engine-menu]
 
   let switching = false;
   const paint = (got) => {
@@ -249154,6 +249313,7 @@ async function voiceTestOpen() {
   status.style.cssText = "font-size:12px;margin-top:8px";
   card.appendChild(status);
 
+  if (window.pineCloseX) window.pineCloseX(card, voiceTestClose, {label: "Close the voice test"});  // [closex:voice-test]
   shade.appendChild(card);
   document.body.appendChild(shade);
   input.focus();
@@ -249335,6 +249495,7 @@ async function voiceDeskOpen() {
     "Reading the voice catalogue and probing the engines…"));
   wait.appendChild(waitCard);
   wait.onclick = (event) => { if (event.target === wait) wait.remove(); };
+  if (window.pineCloseX) window.pineCloseX(waitCard, () => wait.remove(), {label: "Close the voice desk"});  // [closex:voice-desk-wait]
   document.body.appendChild(wait);
   let settings = null, engines = null;
   try {
@@ -249501,6 +249662,7 @@ async function voiceDeskOpen() {
   card.appendChild(callerRow);
 
   card.appendChild(status);
+  if (window.pineCloseX) window.pineCloseX(card, () => shade.remove(), {label: "Close the voice desk"});  // [closex:voice-desk]
   shade.appendChild(card);
   document.body.appendChild(shade);
 }
@@ -249582,6 +249744,7 @@ function glassOpen() {
   const shut = el("button", "", "✕");
   shut.onclick = glassClose;
   head.appendChild(shut);
+  if (window.pineCloseX) { window.pineCloseX(box, () => shut.click()); shut.remove(); }  // [closex:legacy:glassOpen:shut]
   box.appendChild(head);
 
   head.addEventListener("pointerdown", (event) => {
@@ -249893,6 +250056,7 @@ async function backlogRefresh() {
       + "4px;border-bottom:1px solid var(--border);opacity:0;"
       + "transform:translateY(-8px);transition:opacity .5s,transform .5s";
     const play = el("button", "bl-play", "▶");
+  play.title = "Play"; if (!play.getAttribute("aria-label")) play.setAttribute("aria-label", "Play");  // [closex:tip:app.py:backlogRefresh:play:Play]
     play.style.cssText = "flex:0 0 auto;background:none;border:1px solid "
       + "var(--border);border-radius:6px;cursor:pointer;font-size:12px;"
       + "width:28px;height:28px";
@@ -249960,6 +250124,7 @@ function backlogOpen() {
   const shut = el("button", "", "✕");
   shut.onclick = backlogClose;
   head.appendChild(shut);
+  if (window.pineCloseX) { window.pineCloseX(box, () => shut.click()); shut.remove(); }  // [closex:legacy:backlogOpen:shut]
   box.appendChild(head);
   head.addEventListener("pointerdown", (event) => {
     if (event.target.closest("button")) return;
@@ -250048,6 +250213,7 @@ function crystalDeleteMenu(row, x, y) {
   rowb.appendChild(cancel);
   m.appendChild(rowb);
   document.body.appendChild(m);
+  if (window.pineCloseX) window.pineCloseX(m, closeMenu, {label: "Close the menu", reserve: "top"});  // [closex:crystal-del-menu]
   setTimeout(() => document.addEventListener("click", onDoc), 40);
 }
 
@@ -250450,6 +250616,7 @@ async function slotOpen() {
   shut.onclick = slotClose;
   shut.style.marginLeft = "auto";
   head.appendChild(shut);
+  if (window.pineCloseX) { window.pineCloseX(box, () => shut.click()); shut.remove(); }  // [closex:legacy:slotOpen:shut]
   box.appendChild(head);
 
   const count = el("div", "muted", "reading\u2026");
@@ -250780,6 +250947,7 @@ async function wedgeToast() {
   card.appendChild(foot);
 
   document.body.appendChild(card);
+  if (window.pineCloseX) window.pineCloseX(card, () => later.click(), {label: "Not now (ask again in ten minutes)", reserve: "top"});  // [closex:wedge-card]
   wedgeCard = card;
 }
 
@@ -250871,6 +251039,7 @@ async function wedgeConsoleOpen() {
     + "border-radius:6px;padding:3px 9px;cursor:pointer";
   shut.onclick = wedgeConsoleClose;
   head.appendChild(shut);
+  if (window.pineCloseX) { window.pineCloseX(box, () => shut.click()); shut.remove(); }  // [closex:legacy:wedgeConsoleOpen:shut]
   box.appendChild(head);
 
   const steps = el("div", "", "");
@@ -251477,6 +251646,7 @@ function fixDrawerBuild() {
     + "border-radius:6px;padding:3px 9px;cursor:pointer";
   shut.onclick = () => fixDrawerOpen(false);
   head.appendChild(shut);
+  if (window.pineCloseX) { window.pineCloseX(box, () => shut.click()); shut.remove(); }  // [closex:legacy:fixDrawerBuild:shut]
   box.appendChild(head);
 
   const say = el("div", "pb-fix-say muted", "reading the station…");
@@ -251730,6 +251900,7 @@ async function orchToast() {
 
   card.onclick = () => orchPlexusOpen();
   document.body.appendChild(card);
+  if (window.pineCloseX) window.pineCloseX(card, () => later.click(), {label: "Not now (ask again in ten minutes)", reserve: "top"});  // [closex:orch-card]
   orchCard = card;
   requestAnimationFrame(() => { card.style.transform = "translateY(0)"; });
   if (row.urgency === "now") {
@@ -251815,6 +251986,7 @@ async function sfxDeskPanel() {
     + "border-radius:6px;padding:3px 9px;cursor:pointer";
   shut.onclick = sfxDeskClose;
   head.appendChild(shut);
+  if (window.pineCloseX) { window.pineCloseX(box, () => shut.click()); shut.remove(); }  // [closex:legacy:sfxDeskPanel:shut]
   box.appendChild(head);
 
   const tabs = el("div", "", "");
@@ -251970,6 +252142,7 @@ async function comfyDoctorPanel() {
   const x = el("button", "", "✕");
   x.onclick = comfyDoctorClose;
   head.appendChild(run); head.appendChild(deep); head.appendChild(x);
+  if (window.pineCloseX) { window.pineCloseX(box, () => x.click()); x.remove(); }  // [closex:legacy2:comfyDoctorPanel]
   box.appendChild(head);
 
   /* [#1196] THE IDLE DIAL. How long ComfyUI may sit loaded, what happens
@@ -252254,6 +252427,7 @@ function paperBellRing(id, headline) {
   shut.style.cssText = "font-size:11px;padding:1px 7px;align-self:flex-start";
   shut.onclick = (e) => { e.stopPropagation(); paperBellMark(id); };
   card.appendChild(mark); card.appendChild(words); card.appendChild(shut);
+  if (window.pineCloseX) { window.pineCloseX(card, () => shut.click()); shut.remove(); }  // [closex:legacy2:paperBellRing]
   card.onclick = async () => {
     paperBellMark(id);
     try {
@@ -253469,6 +253643,7 @@ function paperReadOpen(url, label) {
   shut.onclick = paperReadClose;
   top.appendChild(out);
   top.appendChild(shut);
+  if (window.pineCloseX) { window.pineCloseX(card, () => shut.click()); shut.remove(); }  // [closex:legacy:paperReadOpen:shut]
   const col = el("div", "", "");
   col.style.cssText = "overflow:auto;padding:24px 34px 30px;"
     + "font:15.5px/1.64 Georgia,'Times New Roman',serif;color:#1b1a17";
@@ -253579,6 +253754,7 @@ function threeSheetOpen() {
   head.innerHTML = '<b style="font-size:15px">🧊 3JS, and the papers</b><span style="flex:1"></span>';
   const x = document.createElement("button");
   x.textContent = "×";
+  x.title = "Close"; if (!x.getAttribute("aria-label")) x.setAttribute("aria-label", "Close");  // [closex:tip:app.py:threeSheetOpen:x:Close]
   x.style.cssText = "background:none;border:0;color:var(--muted);font-size:22px;line-height:1;cursor:pointer;min-width:40px;min-height:40px";
   x.onclick = threeSheetClose;
   head.appendChild(x);
@@ -253715,6 +253891,7 @@ async function paperOpen() {
   const x = el("button", "", "✕");
   x.onclick = paperClose;
   [copy, pdf, image, hourly, older, newer, print, open, bin, x].forEach((b) => head.appendChild(b));
+  if (window.pineCloseX) { window.pineCloseX(box, () => x.click()); x.remove(); }  // [closex:legacy:paperOpen:x]
   box.appendChild(head);
 
   paperShelf = el("div", "", "");
@@ -254124,6 +254301,7 @@ async function screenplayOpen() {
   const x = el("button", "", "✕");
   x.onclick = scriptClose;
   [copy, md, pdf, note, again, x].forEach((b) => head.appendChild(b));
+  if (window.pineCloseX) { window.pineCloseX(box, () => x.click()); x.remove(); }  // [closex:legacy:screenplayOpen:x]
   box.appendChild(head);
 
   scriptShelf = el("div", "", "");
@@ -254781,6 +254959,7 @@ async function stewardPanel() {
   const x = el("button", "", "✕");
   x.onclick = stewardClose;
   head.appendChild(check); head.appendChild(fix); head.appendChild(x);
+  if (window.pineCloseX) { window.pineCloseX(box, () => x.click()); x.remove(); }  // [closex:legacy2:stewardPanel]
   box.appendChild(head);
   const term = el("div", "", "");
   term.style.cssText = "flex:1;overflow:auto;padding:12px 14px;"
@@ -254920,6 +255099,7 @@ async function cupboardPanel() {
     + "border-radius:6px;padding:4px 9px;cursor:pointer";
   close.onclick = cupboardClose;
   stage.appendChild(close);
+  if (window.pineCloseX) { window.pineCloseX(shade, () => close.click()); close.remove(); }  // [closex:legacy:cupboardPanel:close]
   const title = el("div", "", "🗄 Cupboard View · every shelf, what is on it, and what is booked for it");
   title.style.cssText = "position:absolute;top:12px;left:16px;z-index:2;"
     + "font:600 13px PineIcons, PineIcons, system-ui;color:#9fd0e3";
@@ -255282,6 +255462,7 @@ async function phonePanel() {
   close.style.cssText = "position:absolute;top:10px;right:10px;z-index:2";
   close.onclick = phoneClose;
   stage.appendChild(close);
+  if (window.pineCloseX) { window.pineCloseX(shade, () => close.click()); close.remove(); }  // [closex:legacy:phonePanel:close]
   const title = el("div", "", "☎ Phone · a card off the deck to a call on the air");
   title.style.cssText = "position:absolute;top:12px;left:16px;z-index:2;"
     + "font:600 13px PineIcons, PineIcons, system-ui;color:#9fd0e3";
@@ -255503,6 +255684,7 @@ async function rapAssemblyPanel() {
   close.style.cssText = "position:absolute;top:10px;right:10px;z-index:2";
   close.onclick = rapAssemblyClose;
   stage.appendChild(close);
+  if (window.pineCloseX) { window.pineCloseX(shade, () => close.click()); close.remove(); }  // [closex:legacy:rapAssemblyPanel:close]
   const title = el("div", "", "🎛 RapAssembly · from a thought to a rhymed line on the air");
   title.style.cssText = "position:absolute;top:12px;left:16px;z-index:2;color:#9de3ef;font-weight:700;font-size:14px;letter-spacing:.04em";
   stage.appendChild(title);
@@ -255822,6 +256004,7 @@ async function orchLogicPanel() {
   close.style.cssText = "position:absolute;top:10px;right:10px;z-index:2";
   close.onclick = orchLogicClose;
   stage.appendChild(close);
+  if (window.pineCloseX) { window.pineCloseX(shade, () => close.click()); close.remove(); }  // [closex:legacy:orchLogicPanel:close]
 
   const canvas = document.createElement("canvas");
   canvas.style.cssText = "position:absolute;inset:0;width:100%;height:100%";
@@ -256330,6 +256513,7 @@ async function orchPlexusOpen() {
   const x = el("button", "", "✕");
   x.onclick = orchPlexusClose;
   bar.appendChild(x);
+  if (window.pineCloseX) { window.pineCloseX(glass, () => x.click()); x.remove(); }  // [closex:legacy:orchPlexusOpen:x]
   glass.appendChild(bar);
 
   const why = el("div", "", row.why || "");
@@ -256627,6 +256811,7 @@ async function orchOpen() {
   shut.onclick = orchClose;
   shut.style.marginLeft = "auto";
   bar.appendChild(shut);
+  if (window.pineCloseX) { window.pineCloseX(box, () => shut.click()); shut.remove(); }  // [closex:legacy:orchOpen:shut]
   box.appendChild(bar);
 
   const head = el("div", "muted", "reading\u2026");
@@ -256689,6 +256874,7 @@ async function chunkOpen() {
   const shut = el("button", "", "\u2715");
   shut.onclick = chunkClose;
   head.appendChild(shut);
+  if (window.pineCloseX) { window.pineCloseX(box, () => shut.click()); shut.remove(); }  // [closex:legacy:chunkOpen:shut]
   box.appendChild(head);
 
   const bar = el("div", "", "");
@@ -256855,6 +257041,7 @@ async function crystalOpen() {
   const shut = el("button", "", "✕");
   shut.onclick = crystalClose;
   head.appendChild(shut);
+  if (window.pineCloseX) { window.pineCloseX(box, () => shut.click()); shut.remove(); }  // [closex:legacy:crystalOpen:shut]
   box.appendChild(head);
 
   head.addEventListener("pointerdown", (event) => {
@@ -257039,6 +257226,7 @@ async function sfxStatsOpen() {
       + "text-overflow:ellipsis;white-space:nowrap";
     row.appendChild(by);
     const play = el("button", "", "▶");
+  play.title = "Play this sample"; if (!play.getAttribute("aria-label")) play.setAttribute("aria-label", "Play this sample");  // [closex:tip:app.py:sfxStatsOpen:play:Play this sa]
     play.style.cssText = "background:none;border:0;cursor:pointer";
     play.onclick = () => clipToggle(sample.url, play, "▶");   // #706
     row.appendChild(play);
@@ -257080,6 +257268,7 @@ async function sfxStatsOpen() {
       .map((entry) => entry.name + " " + entry.plays + "×").join(" · ")));
     card.appendChild(row);
   });
+  if (window.pineCloseX) window.pineCloseX(card, () => shade.remove(), {label: "Close the SFX statistics"});  // [closex:sfx-stats]
   shade.appendChild(card);
   document.body.appendChild(shade);
 }
@@ -257212,6 +257401,7 @@ function winampOpen() {
   shut.style.cssText = chrome + ";width:24px;height:24px;font-size:10px";
   shut.onclick = winampClose;
   bar.appendChild(shut);
+  if (window.pineCloseX) { window.pineCloseX(box, () => shut.click()); shut.remove(); }  // [closex:legacy:winampOpen:shut]
   box.appendChild(bar);
 
   const scope = document.createElement("canvas");
@@ -257613,6 +257803,7 @@ async function studioEngineAB(name, got) {
     box.remove();
   };
   box.appendChild(shut);
+  if (window.pineCloseX) window.pineCloseX(box, () => shut.click(), {label: "Close the engine comparison"});  // [closex:studio-ab]
   document.body.appendChild(box);
 }
 
@@ -257670,6 +257861,7 @@ function studioOpen() {
   const close = el("button", "", "✕");
   close.onclick = (event) => { event.stopPropagation(); studioClose(); };
   title.appendChild(close);
+  if (window.pineCloseX) { window.pineCloseX(win, () => close.click()); close.remove(); }  // [closex:legacy:studioOpen:close]
   win.appendChild(title);
 
   const main = el("div", "studio-main", "");
@@ -258568,6 +258760,7 @@ async function studioCookies() {
   shut.style.cssText = "cursor:pointer;font-size:18px";
   shut.onclick = () => shade.remove();
   head.appendChild(shut);
+  if (window.pineCloseX) { window.pineCloseX(card, () => shut.click()); shut.remove(); }  // [closex:legacy:studioCookies:shut]
   card.appendChild(head);
 
   card.appendChild(el("div", "muted",
@@ -259158,6 +259351,7 @@ function studioSimulacrumWizard(host) {
     };
     line.appendChild(range); line.appendChild(val);
     const drop = el("button", "", "✕");
+  drop.title = "Remove this component"; if (!drop.getAttribute("aria-label")) drop.setAttribute("aria-label", "Remove this component");  // [closex:tip:app.py:studioSimulacrumWizard:drop:Remove this ]
     drop.onclick = () => {
       componentRows.splice(componentRows.indexOf(row), 1);
       line.remove();
@@ -262452,6 +262646,7 @@ async function libOpenDoc(slug, page) {
 
   const bar = el("div", "lb-bar", "");
   const prev = el("button", "", "◀");
+  prev.title = "Previous page"; if (!prev.getAttribute("aria-label")) prev.setAttribute("aria-label", "Previous page");  // [closex:tip:app.py:libOpenDoc:prev:Previous pag]
   const pos = document.createElement("select");
   pos.style.maxWidth = "320px";
   (doc.pages || []).forEach((p) => {
@@ -262462,6 +262657,7 @@ async function libOpenDoc(slug, page) {
     pos.appendChild(o);
   });
   const next = el("button", "", "▶");
+  next.title = "Next page"; if (!next.getAttribute("aria-label")) next.setAttribute("aria-label", "Next page");  // [closex:tip:app.py:libOpenDoc:next:Next page]
   const gap = el("span", "", ""); gap.style.flex = "1";
   const orig = el("button", "", "Open the file");
   orig.title = "The document itself, in the browser's own viewer";
@@ -263591,6 +263787,10 @@ function toggleTray() {
   const panel = document.getElementById("trayPanel");
   const showing = panel.style.display !== "none";
   panel.style.display = showing ? "none" : "block";
+  if (!showing && window.pineCloseX) {   // [closex:tray] the tray's corner X
+    window.pineCloseX(panel, () => { if (panel.style.display !== "none") toggleTray(); },
+      {label: "Close recent pop-ups", reserve: "top"});
+  }
   if (!showing) {
     renderTray();
     document.getElementById("trayCount").textContent = "";
@@ -264477,6 +264677,7 @@ async function pipeOpen(ev) {
   bar.appendChild(ttl);
   const shut = document.createElement("button");
   shut.textContent = "\u2715";
+  shut.title = "Close"; if (!shut.getAttribute("aria-label")) shut.setAttribute("aria-label", "Close");  // [closex:tip:app.py:pipeOpen:shut:Close]
   shut.onclick = pipeClose;
   shut.style.marginLeft = "auto";
   bar.appendChild(shut);
@@ -265721,6 +265922,7 @@ RADIO_PAGE_HTML = r"""<!doctype html>
      a clip arriving down both roads shows once. -->
 <link rel="stylesheet" href="/spark/asset/sfx-tv.css">
 <link rel="stylesheet" href="/spark/asset/slideshow.css">
+<script src="/spark/asset/pine-vcr.js"></script>
 <script src="/spark/asset/sfx-tv.js"></script>
 <!-- [autoscroll-rule] the feed follows only a reader at its end; its way
      back is a Carbon jump button (pine-icons.js draws the icon). -->
@@ -266774,9 +266976,7 @@ function sync(state) {
   const cover = document.getElementById("cover");
   if (cover && cover.dataset.id !== (now.id || "")) {
     cover.dataset.id = now.id || "";
-    cover.onerror = () => { cover.style.display = "none"; };
-    cover.onload = () => { cover.style.display = "block"; };
-    if (now.art) { cover.src = now.art; } else { cover.style.display = "none"; }
+    pineVcrCover(cover, now);                               /* [vcrfx] */
   }
   document.getElementById("at").textContent = clock(state.elapsed);
   document.getElementById("of").textContent = clock(now.seconds);
@@ -266948,6 +267148,79 @@ function retime(now, serverMs, startedMs, seconds) {
  * flight, and whichever landed LAST won - an old answer arriving after a
  * newer one set the clock seconds backward, and the record jumped back
  * and replayed a stretch already heard. */
+/* [vcrfx] THE PINELIVE PICTURE COMES ON AND GOES OFF LIKE THE SFX TV.
+ *
+ * "if a Pine Box live broadcast begins, show that animate in with the same
+ *  V CR effect. And same thing if it goes away ... If a viewer is watching
+ *  the telescale broadcast and I'm toggling the Pine Cam toggle off and on,
+ *  then they should be seeing a video go in and out with the V C R effect
+ *  repeating over and over as I'm flipping the switch over and over."
+ *
+ * The sleeve IS the live picture during a set (the album art shows the
+ * video feed), so: a set beginning brings it on at its first frame, a set
+ * ending collapses it before the next record's sleeve takes the frame, and
+ * PineCam to live - read off the clock this page already polls - collapses
+ * it and brings it back, every flip replayed (`switch.flips`), never faster
+ * than the effect can be seen and always ending where the switch is. */
+function pineVcrCover(cover, now) {
+  const V = window.PineVcr;
+  const wasLive = cover.dataset.live === "1";
+  const live = !!now.live;
+  cover.dataset.live = live ? "1" : "";
+  const id = now.id || "";
+  const put = () => {
+    if (cover.dataset.id !== id) return;          /* a newer record already */
+    cover.onerror = () => { cover.style.display = "none"; };
+    cover.onload = () => {
+      if (live && vcrLiveWant === false) return;   /* switched off: stays down */
+      cover.style.display = "block";
+      if (live && V && cover.dataset.vcrLit !== id) { cover.dataset.vcrLit = id; V.in(cover); }
+    };
+    if (now.art) { cover.src = now.art; } else { cover.style.display = "none"; }
+  };
+  if (wasLive && !live && V && cover.style.display !== "none") {
+    vcrLiveWant = null;
+    V.out(cover).then(() => { V.cancel(cover); put(); });
+    return;
+  }
+  put();
+}
+let vcrLiveWant = null;
+let vcrLiveFlips = null;
+window.pineVcrClock = function (c) {
+  const V = window.PineVcr;
+  const pl = c && c.pinelive;
+  const pic = pl && pl.picture;
+  const sw = pic && pic.switch;
+  if (!V || !pic || !c.live) { vcrLiveWant = null; vcrLiveFlips = null; return; }
+  const flips = sw ? Number(sw.flips || 0) : 0;
+  if (sw && vcrLiveFlips !== null && flips !== vcrLiveFlips && window.pineCamAsk) window.pineCamAsk();
+  const art = String(pic.art || "");
+  const want = !!art;
+  const cover = document.getElementById("cover");
+  if (!cover) return;
+  if (vcrLiveWant === null || vcrLiveFlips === null || flips < vcrLiveFlips) {
+    vcrLiveWant = want; vcrLiveFlips = flips;        /* first sight: no replay */
+    return;
+  }
+  /* in the house the picture never left (only the door hides it), so only a
+     page through the listener door replays the flips */
+  const burst = (typeof AWAY !== "undefined" && AWAY) ? flips - vcrLiveFlips : 0;
+  vcrLiveFlips = flips;
+  if (!burst && want === vcrLiveWant) return;
+  vcrLiveWant = want;
+  const o = {
+    /* a switched-off picture's stream has ended: asked again with a new
+       name for the buster (?t= is the token, never a cache-buster) */
+    show: (el) => {
+      if (art) el.src = art + (art.indexOf("?") >= 0 ? "&" : "?") + "vcr=" + Date.now();
+      el.style.display = "block";
+    },
+    hide: (el) => { if (!vcrLiveWant) el.style.display = "none"; },
+  };
+  if (burst > 0) V.flip(cover, want, burst, o); else V.set(cover, want, o);
+};
+
 let clockLive = 0;
 let clockSeq = 0;
 
@@ -266960,6 +267233,7 @@ async function clockPoll() {
     const c = await api("/api/radio/clock?listener=" + ME);
     if (mine !== clockSeq) return;      // a newer request superseded this
     stateAt = Date.now();
+    try { window.pineVcrClock(c); } catch (e) { /* [vcrfx] the show goes on */ }
     pineSoloGate(c);                                        // #1008
     /* #1138: the station is paused - this listener goes quiet with it. */
     stationPaused = !!c.paused;          // #1147: voiceNext reads this
@@ -267188,6 +267462,20 @@ function tvShow(v, into) {
      * false, volume 0.6. */
     el.muted = streamMode || sfxLevel <= 0;
     el.volume = streamMode ? 0 : Math.max(0, Math.min(1, sfxLevel));
+    if (window.PineVcr) {                 /* [vcrfx: the clip comes on at its first frame] */
+      const V = window.PineVcr, mine = v.url;
+      el.style.visibility = "hidden";
+      let lit = false;
+      const light = () => {
+        if (lit || tvNow !== mine) return;
+        lit = true;
+        el.style.visibility = "";
+        V.in(el);
+      };
+      el.addEventListener("loadeddata", light, {once: true});
+      el.addEventListener("playing", light, {once: true});
+      setTimeout(light, 3000);
+    }
     el.src = v.url;
     el.currentTime = Math.max(0, into);
     el.play().catch(() => { el.muted = true; el.play().catch(() => {}); });
@@ -267223,6 +267511,31 @@ const TUNE_TRANSITIONS = ["slide", "swirl", "rotate", "flip", "fold", "bump",
   "unfold", "liquid"];
 let tvHanding = null;
 
+/* [vcrfx] THE CLIP GOES OFF LIKE THE SFX TV. The artwork is laid back under
+ * it (the #1415 `handing` frame keeps both up) and the picture collapses to
+ * a line and a dot over it. A clip that came on during the collapse keeps
+ * its source; only a stage with nothing on it lets the element go. */
+function tvHideVcr(stage, el) {
+  const V = window.PineVcr;
+  stage.classList.add("handing");
+  stage.classList.remove("tv");
+  el.style.visibility = "";
+  let settled = false;
+  const finish = () => {
+    if (settled) return;
+    settled = true;
+    if (tvHanding === finish) tvHanding = null;
+    stage.classList.remove("handing");
+    if (tvNow === null) {
+      try { el.pause(); el.removeAttribute("src"); el.load(); } catch (e) {}
+      try { V.cancel(el); } catch (e) {}
+    }
+  };
+  tvHanding = finish;
+  V.out(el).then(finish);
+  setTimeout(finish, V.OUT_MS + 400);
+}
+
 function tvHide() {
   const stage = document.getElementById("galleryStage");
   const el = document.getElementById("galleryVideo");
@@ -267232,6 +267545,7 @@ function tvHide() {
   tvStateClip = "";                                          /* [#1244] */
   tvSayState();                                              /* [#1244] */
   if (tvHanding) tvHanding();
+  if (window.PineVcr) { tvHideVcr(stage, el); return; }      /* [vcrfx] */
   const kind = TUNE_TRANSITIONS[Math.floor(Math.random() * TUNE_TRANSITIONS.length)];
   const cls = "sl-t-" + kind;
   stage.classList.add("handing");
@@ -268876,6 +269190,26 @@ setTimeout(clockLoop, 1500);
   var vid = null;
   var lowUrl = "";
   var lowBrokenAt = 0;
+  /* [vcrfx] THE WINDOW COMES ON AND GOES OFF LIKE THE SFX TV, every time
+   * PineCam to live is flipped - each flip the station counted since the
+   * last answer is played (PineVcr.flip), so six fast flips are six
+   * collapses and openings, ending where the switch ended. The last frame
+   * is kept (hidden) so a replayed opening shows a picture, not a hole. */
+  var lastFlips = null;
+  function camVcr(want, burst) {
+    var V = window.PineVcr;
+    if (want) build();
+    if (!box) return;
+    if (!V) {
+      if (want) { box.classList.add("show"); draw(); } else box.classList.remove("show");
+      return;
+    }
+    var o = {
+      show: function () { box.classList.add("show"); draw(); },
+      hide: function () { if (!mayShow) box.classList.remove("show"); }
+    };
+    if (burst > 0) V.flip(box, want, burst, o); else V.set(box, want, o);
+  }
   function paceFloor() {
     return (typeof streamMode !== "undefined" && streamMode) ? 1000 : 250;
   }
@@ -269031,28 +269365,40 @@ setTimeout(clockLoop, 1500);
         frameUrl += (frameUrl.indexOf("?") >= 0 ? "&" : "?") + "w=424";
       }
       lowUrl = String((got && got.low) || "");
-      if (want !== mayShow) {
-        mayShow = want;
-        if (want) { build(); box.classList.add("show"); draw(); }
-        else if (box) {
-          box.classList.remove("show");
-          shot.removeAttribute("src");   /* stop the fetches too */
-        }
+      /* [vcrfx] the switch's flips since the last answer, for this viewer */
+      var sw = (got && got.switch) || null;
+      var flips = sw ? Number(sw.flips || 0) : 0;
+      var burst = (sw && sw.yours && lastFlips !== null && flips > lastFlips) ? flips - lastFlips : 0;
+      /* a flip is news for the live picture too: the clock (15 s apart on
+         the stream road) is asked now rather than at its next beat */
+      if (sw && lastFlips !== null && flips !== lastFlips && typeof clockPoll === "function") {
+        try { clockPoll(); } catch (e) { /* the clock asks again anyway */ }
+      }
+      if (sw) lastFlips = flips;
+      if (want !== mayShow || burst) {
+        mayShow = want;                  /* draw() stops asking when false */
+        camVcr(want, burst);
       }
       if (want && lowWanted()) showVideo();
-      else dropVideo(false);
+      else if (want || !vid) dropVideo(false);
+      else setTimeout(function () { if (!mayShow) dropVideo(false); }, 700);
     } catch (e) {
       /* A station that cannot answer is a station with no camera as far
        * as this page is concerned. It never blocks the broadcast. */
-      if (mayShow && box) { mayShow = false; box.classList.remove("show"); }
+      if (mayShow && box) { mayShow = false; camVcr(false, 0); }     /* [vcrfx] */
       dropVideo(false);                                        /* #1475 */
     }
   }
 
   function loop() {
     try { ask(); } catch (e) {}
-    setTimeout(loop, 15000);
+    /* [vcrfx] a watched page learns the switch within a few seconds (a
+     * 300-byte answer: 0.1 kB/s beside an 8 kB/s audio lane); a hidden tab
+     * keeps the old quarter-minute. */
+    var road = (typeof streamMode !== "undefined" && streamMode) ? 4000 : 2500;
+    setTimeout(loop, document.hidden ? 15000 : road);
   }
+  window.pineCamAsk = function () { try { ask(); } catch (e) {} };   /* [vcrfx] the clock's nudge */
   /* #1476: THE CAMERA FOLLOWS THE ROAD. The page is served once, but a
    * drive moves between roads: Tailscale drops and the phone carries on
    * over the public Funnel, where the H.264 lane is the wrong thing to

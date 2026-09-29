@@ -194,6 +194,7 @@
       box.appendChild(none);
     }
     document.body.appendChild(box);
+    if (window.pineCloseX) { window.pineCloseX(box, function () { closeMicMenu(); }, {label: 'Close the microphones', reserve: 'top'}); }  // [closex:mic-menu]
     /* One dismissal road, attached after this click has finished
      * bubbling or it would close the menu it just opened. */
     setTimeout(function () {
@@ -1507,6 +1508,7 @@
     pad.appendChild(row);
     pad.appendChild(note);
     document.body.appendChild(pad);
+    if (window.pineCloseX) { window.pineCloseX(pad, function () { padClose(); }, {label: 'Close the report', reserve: 'top'}); }  // [closex:report-pad]
     /* 2026-09-14: "Whenever I'm filing a report ... lower the broadcast to
        10%." The hold is tied to the pad: when the pad leaves, so does it. */
     if (root.PineDuck) root.PineDuck.hold('report-pad', root.PineDuck.REPORT, pad);

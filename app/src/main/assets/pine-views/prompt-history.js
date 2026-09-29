@@ -93,7 +93,7 @@
       var popup = make('dialog', 'ph-dice'); popup.setAttribute('aria-label', 'Randomization: ' + n.label); popup.appendChild(make('h3', '', n.label));
       popup.appendChild(make('p', '', n.random.distribution)); popup.appendChild(make('p', '', n.random.min + ': ' + n.random.low)); popup.appendChild(make('p', '', n.random.max + ': ' + n.random.high));
       var customize = make('button', '', 'Customize property'); customize.type = 'button'; customize.addEventListener('click', function () { popup.close(); edit(n); }); popup.appendChild(customize);
-      popup.appendChild(command('Close randomization', 'c:close--filled', function () { popup.close(); })); popup.addEventListener('close', function () { popup.remove(); }); panel.appendChild(popup); popup.showModal();
+      popup.appendChild(command('Close randomization', 'c:close--filled', function () { popup.close(); })); popup.addEventListener('close', function () { popup.remove(); }); panel.appendChild(popup); popup.showModal(); if (window.pineCloseX) window.pineCloseX(popup, function () { popup.close(); }, {label: 'Close randomization'}); /* [closex:ph-random] */
     }
     function edit(n, draft) {
       editor.replaceChildren(); editor.appendChild(make('h3', '', n.label)); var input = make(n.type === 'select' ? 'select' : n.type === 'text' || n.type === 'json' ? 'textarea' : 'input'); input.setAttribute('aria-label', n.label);
@@ -115,7 +115,7 @@
       text.split(/\n\s*\n/).filter(Boolean).forEach(function (part, index) { var head = String(part).split('\n')[0].replace(/[:.].*$/, '').trim(); var block = make('details', 'ph-prompt-section'); block.appendChild(make('summary', '', head && head.length < 54 ? head : 'Prompt section ' + (index + 1))); block.appendChild(make('pre', '', part)); parent.appendChild(block); });
     }
     function pop(title) {
-      var popup = make('dialog', 'ph-inspect'); popup.setAttribute('aria-label', title); popup.appendChild(make('h3', '', title)); popup.appendChild(command('Close inspection', 'c:close--filled', function () { popup.close(); }, 'ph-inspect-close')); popup.addEventListener('close', function () { popup.remove(); }); panel.appendChild(popup); popup.showModal(); return popup;
+      var popup = make('dialog', 'ph-inspect'); popup.setAttribute('aria-label', title); popup.appendChild(make('h3', '', title)); popup.appendChild(command('Close inspection', 'c:close--filled', function () { popup.close(); }, 'ph-inspect-close')); popup.addEventListener('close', function () { popup.remove(); }); panel.appendChild(popup); popup.showModal(); if (window.pineCloseX) { window.pineCloseX(popup, function () { popup.close(); }, {label: 'Close inspection'}); var phOld = popup.querySelector('.ph-inspect-close'); if (phOld) phOld.style.display = 'none'; } /* [closex:ph-pop] */ return popup;
     }
     function matchingNodes(value) {
       var text = String(value || '').toLowerCase(); var matched = nodes.filter(function (node) { return text.includes(String(node.label || '').toLowerCase()) || (typeof node.value === 'string' && node.value && text.includes(node.value.toLowerCase())); }); return matched.length ? matched : nodes.slice(0, 12);

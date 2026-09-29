@@ -1133,6 +1133,7 @@
     var rows = document.createElement('div'); rows.className = 've-escape-rows';
     card.appendChild(head); card.appendChild(said); card.appendChild(kept); card.appendChild(rows); card.appendChild(told);
     box.appendChild(card); document.body.appendChild(box);
+    if (window.pineCloseX) { window.pineCloseX(card, function () { escapeClose(); }, {label: 'Close'}); }  // [closex:ve-escape]
 
     function tell(text, bad) { told.textContent = text; told.hidden = !text; told.classList.toggle('bad', !!bad); }
     function row(label, hint, run) {

@@ -78,9 +78,27 @@
    * should do, and the same thing every desktop app does. */
   function onKey(event) {
     if (event.key !== 'Escape' && event.key !== 'Esc') return;
+    var w = null;
     for (var i = watched.length - 1; i >= 0; i -= 1) {
-      if (showing(watched[i])) { fire(watched[i]); event.stopPropagation(); return; }
+      if (showing(watched[i])) { w = watched[i]; break; }
     }
+    /* [closex:esc] a popup with a corner X (pine-closex.js) answers Escape
+     * too; the higher of the two on screen goes first. An editor inside it
+     * (a textarea, contenteditable) keeps its own Escape. */
+    var cx = closexTop(event);
+    if (cx && (!w || cx.node === w.node || zOf(cx.node) > zOf(w.node))) {
+      try { cx.close(); } catch (err) { /* its own road threw */ }
+      event.stopPropagation();
+      return;
+    }
+    if (w) { fire(w); event.stopPropagation(); }
+  }
+
+  function closexTop(event) {
+    var cx = root.pineCloseX;
+    if (!cx || typeof cx.top !== 'function') return null;
+    if (event && typeof cx.editing === 'function' && cx.editing(event.target)) return null;
+    try { return cx.top(); } catch (err) { return null; }
   }
 
   var wired = false;
@@ -182,6 +200,14 @@
     for (i = 0; i < watched.length; i += 1) {
       if (showing(watched[i])) add(watched[i].node, watched[i].close);
     }
+    /* [closex:back] every popup with a corner X is a BACK candidate too */
+    var cxs = [];
+    try { cxs = root.pineCloseX && typeof root.pineCloseX.open === 'function' ? root.pineCloseX.open() : []; } catch (err) { cxs = []; }
+    for (i = 0; i < cxs.length; i += 1) {
+      var seen = false;
+      for (var s = 0; s < out.length; s += 1) { if (out[s].node === cxs[i].node) { seen = true; break; } }
+      if (!seen) add(cxs[i].node, cxs[i].close);
+    }
     for (i = 0; i < backs.length; i += 1) {
       var got = null;
       try { got = backs[i](); } catch (err) { got = null; }
@@ -223,7 +249,10 @@
 
   var api = {watch: watch, simple: simple, closeAll: closeAll,
     count: function () { return watched.length; },
-    onBack: onBack, back: back};                              /* [#1450c] */
+    onBack: onBack, back: back,
+    /* [closex:aware] Escape for pineCloseX popups is answered here - once
+       its key listener is wired (the first watch() wires it) */
+    closexAware: true, keyWired: function () { return wired; }};                              /* [#1450c] */
   root.PineDismiss = api;
   root.pineBack = function () { try { return back(); } catch (err) { return false; } };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;

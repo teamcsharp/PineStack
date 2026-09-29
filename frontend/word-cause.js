@@ -266,6 +266,7 @@ export function openWordCause(opts) {
   split.appendChild(rail);
   root.appendChild(split);
   host.appendChild(root);
+  if (!embed && window.pineCloseX) { window.pineCloseX(root, () => close(), {label: 'Close'}); shut.style.display = 'none'; }   // [closex:word-cause]
 
   /* [#1387] THE DIVIDER IS HIS. "make sure that the sidebar has elements
      formatted properly ... there's ample room and they're able to fit

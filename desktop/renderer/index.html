@@ -65,6 +65,7 @@
   <link rel="stylesheet" href="./hot-corners.css">
   <!-- The SVG sprite, for icon-only buttons that need a real <svg> with an
        aria-label rather than a bare character. -->
+  <script src="./pine-vcr.js"></script>
   <script src="./pine-icons.js"></script>
   <script src="./pine-vitals.js"></script>
   <!-- [autoscroll-rule] one rule for every scroller that follows: see pine-stick.js -->
@@ -561,7 +562,7 @@
         </div>
       </div>
       <div class="top-actions">
-        <button id="reloadFrameBtn" title="Reload current panel">R</button>
+        <button id="reloadFrameBtn" title="Reload current panel" aria-label="Reload current panel" data-closex="closex:tip:reload-aria">R</button>
         <button id="fullscreenBtn" title="Hide desktop chrome" aria-label="Hide desktop chrome">[]</button>
         <button id="openBrowserBtn" title="Open in browser" aria-label="Open in browser">^</button>
         <button id="refreshBtn" title="Refresh status" aria-label="Refresh status">!</button>
@@ -854,6 +855,7 @@
   <script src="./pine-logo.js"></script>
   <script src="./boot-splash.js"></script>
   <script src="./pine-dismiss.js"></script>
+  <script src="./pine-closex.js"></script>  <!-- [closex:shell] every popup's corner X -->
   <!-- [sfxseen] display receipts: did each SFX picture reach the screen -->
   <script src="./sfx-seen.js"></script>
   <script src="./view-chrome.js"></script>

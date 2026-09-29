@@ -760,6 +760,7 @@
     head.setAttribute('data-pine-drag-handle', '');
     head.appendChild(make('b', '', title));
     var x = make('button', 'hc-x', '×');
+    x.title = "Close"; if (!x.getAttribute("aria-label")) x.setAttribute("aria-label", "Close");  // [closex:tip:hot-corners.js:sheet:x:Close]
     x.type = 'button';
     x.setAttribute('aria-label', 'close');
     head.appendChild(x);
@@ -2641,6 +2642,7 @@
        * is what a replay is. cut() answers false where no set is mounted
        * and the audio road below takes over. */
       var video = source.video != null ? !!source.video : !!row.video;
+      if (root.PineSfxSeen) { try { root.PineSfxSeen.interact('replay', {id: replayKey, url: url, sting: replayName, video: video}); } catch (e) { /* [sfxseen] the replay goes on */ } }
       if (video && root.PineSfxTv && typeof root.PineSfxTv.cut === 'function') {
         var shown = false;
         try {

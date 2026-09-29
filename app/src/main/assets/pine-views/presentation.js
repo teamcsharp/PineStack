@@ -376,6 +376,7 @@
     frame.querySelector("b").textContent =
       (slot.label || slot.kind || slot.id) + " - " + hour.label;
     frame.querySelector("[data-close]").onclick = closePopup;
+    if (window.pineCloseX) { window.pineCloseX(frame, closePopup, {label: 'Close'}); frame.querySelector("[data-close]").style.display = 'none'; }  // [closex:pv-popup]
     document.body.appendChild(frame);
     popup = frame;
 

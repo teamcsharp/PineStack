@@ -917,6 +917,7 @@
       sheet.dataset.kind = which;
 
       var close = el('button', 'sl-sheet-close', '✕');
+    close.title = "Close"; if (!close.getAttribute("aria-label")) close.setAttribute("aria-label", "Close");  // [closex:tip:slideshow.js:openSheet:close:Close]
       close.addEventListener('click', function (event) {
         event.stopPropagation();
         closeSheet();

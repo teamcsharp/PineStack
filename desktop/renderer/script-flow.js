@@ -258,6 +258,7 @@ function chunk(into, spec) {
   twist.type = 'button';
   twist.className = 'twist';
   twist.textContent = '\u25b8';
+  twist.title = "Show or hide this part"; if (!twist.getAttribute("aria-label")) twist.setAttribute("aria-label", "Show or hide this part");  // [closex:tip:script-flow.js:chunk:twist:Show or hide]
   head.appendChild(twist);
 
   const title = document.createElement('span');
@@ -305,6 +306,7 @@ function chunk(into, spec) {
   cut.type = 'button';
   cut.className = 'cut';
   cut.textContent = '\u00d7';
+  cut.title = "Remove this part"; if (!cut.getAttribute("aria-label")) cut.setAttribute("aria-label", "Remove this part");  // [closex:tip:script-flow.js:chunk:cut:Remove this ]
   /* NO PASSAGE, NO CUT - AND SAY SO RATHER THAN PRETEND.
    *
    * Some of what the station records is a NAME and nothing else: a vector hit

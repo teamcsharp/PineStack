@@ -84,6 +84,7 @@
     x.title = 'Close';
     x.addEventListener('click', close);
     bar.appendChild(x);
+    if (window.pineCloseX) { window.pineCloseX(box, function () { x.click(); }, {label: 'Close the clip doctor'}); x.style.display = 'none'; }  // [closex:clip-doctor]
     box.appendChild(bar);
     box.appendChild(el('div', 'cd-verdict'));
     box.appendChild(el('ol', 'cd-steps'));

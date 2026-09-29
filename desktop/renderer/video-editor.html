@@ -33,7 +33,7 @@
     <aside id="toolSidebar" class="editor-tools" aria-label="Editing tools" hidden></aside>
     </div>
     <div class="playback" hidden>
-      <button id="play" class="play" disabled aria-label="Play selection">▶</button>
+      <button id="play" class="play" disabled aria-label="Play selection" title="Play selection" data-closex="closex:tip:ve-play">▶</button>
       <output id="position">0:00.00</output>
       <span id="selection">Select the part to keep</span>
     </div>
@@ -48,8 +48,8 @@
         <img id="spectrogram" class="spectrogram" alt="Audio frequencies over time" hidden>
         <div id="shadeBefore" class="shade before"></div><div id="shadeAfter" class="shade after"></div>
         <div id="trimBand" class="trim-band"></div>
-        <button id="inHandle" class="trim-handle in" aria-label="Trim start" role="slider" aria-valuemin="0" aria-valuemax="0" aria-valuenow="0"><span></span></button>
-        <button id="outHandle" class="trim-handle out" aria-label="Trim end" role="slider" aria-valuemin="0" aria-valuemax="0" aria-valuenow="0"><span></span></button>
+        <button id="inHandle" class="trim-handle in" aria-label="Trim start" title="Trim start (drag)" data-closex="closex:tip:ve-in" role="slider" aria-valuemin="0" aria-valuemax="0" aria-valuenow="0"><span></span></button>
+        <button id="outHandle" class="trim-handle out" aria-label="Trim end" title="Trim end (drag)" data-closex="closex:tip:ve-out" role="slider" aria-valuemin="0" aria-valuemax="0" aria-valuenow="0"><span></span></button>
         <div id="playhead" class="playhead"></div>
       </div>
       <div class="timeline-labels"><span id="startLabel">0:00.00</span><button id="soundView" class="link" disabled>Show frequencies</button><span id="endLabel">0:00.00</span></div>
@@ -229,8 +229,8 @@
       <div class="split-trim" id="splitTrim" aria-label="Selected piece source range">
         <canvas id="splitSourceWave" aria-label="Source waveform"></canvas>
         <div id="splitTrimBand" class="split-trim-band"></div>
-        <button id="splitInHandle" class="split-handle" type="button" disabled role="slider" aria-label="Piece in point" aria-valuemin="0" aria-valuemax="0" aria-valuenow="0"></button>
-        <button id="splitOutHandle" class="split-handle" type="button" disabled role="slider" aria-label="Piece out point" aria-valuemin="0" aria-valuemax="0" aria-valuenow="0"></button>
+        <button id="splitInHandle" class="split-handle" type="button" disabled role="slider" aria-label="Piece in point" title="Piece in point (drag)" data-closex="closex:tip:ve-split-in" aria-valuemin="0" aria-valuemax="0" aria-valuenow="0"></button>
+        <button id="splitOutHandle" class="split-handle" type="button" disabled role="slider" aria-label="Piece out point" title="Piece out point (drag)" data-closex="closex:tip:ve-split-out" aria-valuemin="0" aria-valuemax="0" aria-valuenow="0"></button>
         <div id="splitTrimHead" class="split-trim-head"></div>
       </div>
     </section>

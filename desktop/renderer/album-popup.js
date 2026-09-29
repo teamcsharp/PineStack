@@ -542,6 +542,7 @@
     var shut = make('button', 'pa-close', 'x');
     shut.type = 'button'; shut.title = 'Close album'; shut.setAttribute('aria-label', 'Close album');
     shut.addEventListener('click', close);
+    if (window.pineCloseX) { window.pineCloseX(box, function () { close(); }, {label: 'Close the album'}); shut.style.display = 'none'; }  // [closex:album]
     head.appendChild(shut);
     box.appendChild(head);
 

@@ -1190,6 +1190,7 @@ class PineLive:
         if bool(old.get("record", True)) != bool(new.get("record", True)):   # [pltoggle]
             self._album_flip(bool(new.get("record", True)))
         if old.get("tailscale_video") != new.get("tailscale_video"):
+            self.video_flips = int(getattr(self, "video_flips", 0)) + 1     # [vcrfx]
             self.note("tailscale_video", "public video %s" % (
                 "ON: listeners on the tailnet see the picture" if new["tailscale_video"]
                 else "OFF: the public side stops showing video now"))
@@ -1851,6 +1852,14 @@ class PineLive:
     def public_video_blocked(self) -> bool:
         return self.armed() and not bool(self.settings.get("tailscale_video"))
 
+    def video_switch(self) -> dict[str, Any]:
+        """[vcrfx] PineCam to live as a viewer's page needs it: whether it is
+        on, how many times it has been flipped since the station started, and
+        whether a set is armed (the only time the switch decides anything)."""
+        return {"on": bool(self.settings.get("tailscale_video")),
+                "flips": int(getattr(self, "video_flips", 0)),
+                "armed": bool(self.armed())}
+
     def _failover(self) -> dict[str, Any] | None:
         """[plcount] How close a live set is to handing the air back."""
         live = self.live
@@ -2017,7 +2026,8 @@ class PineLive:
         out: dict[str, Any] = {"pinelive": {
             "phase": self.phase, "event": EVENT_NAME,
             "picture": {"kind": (self.picture.kind if show else "none"),
-                        "art": art if show else ""}}}
+                        "art": art if show else "",
+                        "switch": self.video_switch()}}}                # [vcrfx]
         if (track or {}).get("pinelive"):
             out["live"] = True
             if not show:               # [pltrack3] the house keeps dj_state's art ([pltrack2] tags it)
@@ -2329,6 +2339,14 @@ def public_video_blocked() -> bool:
         return PL.public_video_blocked()
     except Exception:  # noqa: BLE001
         return False
+
+
+def video_switch() -> dict[str, Any]:
+    """[vcrfx] PineCam to live: on, flips, armed (see PineLive.video_switch)."""
+    try:
+        return PL.video_switch()
+    except Exception:  # noqa: BLE001
+        return {"on": False, "flips": 0, "armed": False}
 
 
 def is_live_id(track_id: str) -> bool:

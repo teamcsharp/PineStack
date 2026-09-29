@@ -1551,6 +1551,7 @@ function createDesktopRejectionNotices({request, openReview, storage = localStor
     catch (error) { card.hidden = false; title.textContent = 'Review could not open'; text.textContent = error.message; text.classList.add('error'); }
   }
   review.onclick = () => open(newest); badge.onclick = () => open(null); later.onclick = snooze;
+  if (window.pineCloseX) { window.pineCloseX(card, () => later.click(), {label: 'Not now', reserve: 'top'}); }  // [closex:reject-notice]
   actions.append(review, later); card.append(title, text, actions); root.append(style, card, badge); document.body.append(root);
   function paint() {
     badge.textContent = count ? 'Rejected lines (' + count + ')' : 'Rejected lines';
@@ -1672,6 +1673,7 @@ function createDesktopRetireNotices({request, openDesk, storage = localStorage, 
   open.onclick = () => { try { openDesk(); } catch (_) { /* the page opens in the app or the browser */ } dismiss(); };
   badge.onclick = () => { try { openDesk(); } catch (_) { /* as above */ } };
   later.onclick = dismiss;
+  if (window.pineCloseX) { window.pineCloseX(card, () => later.click(), {label: 'Not now', reserve: 'top'}); }  // [closex:retire-notice]
   actions.append(open, later); card.append(title, text, actions); root.append(style, card, badge); document.body.append(root);
   function paint() {
     badge.hidden = !count; badge.textContent = '⏳ Retirement desk (' + count + ')';
@@ -3569,6 +3571,7 @@ function schedTilePopup() {
   again.style.cssText = "font-size:11px;padding:2px 8px;cursor:pointer";
   again.onclick = () => schedTilePoll(true);
   const x = mk("button", "", "✕");
+  x.title = "Close"; if (!x.getAttribute("aria-label")) x.setAttribute("aria-label", "Close");  // [closex:tip:renderer.js:schedTilePopup:x:Close]
   x.style.cssText = "font-size:11px;padding:2px 8px;cursor:pointer";
   x.onclick = () => d.remove();
   head.append(title, again, x);
@@ -4166,6 +4169,7 @@ function initTriagePopup() {
     const head = mk("div", "tri-head");
     head.appendChild(mk("b", "", "📻 Radio Triage"));
     const x = mk("button", "tri-x", "✕");
+    x.title = "Close"; if (!x.getAttribute("aria-label")) x.setAttribute("aria-label", "Close");  // [closex:tip:renderer.js:pop = mk("div", "t:x:Close]
     x.onclick = close;
     head.appendChild(x);
     pop.appendChild(head);
@@ -4631,6 +4635,7 @@ function initWorksPopup() {
     line.style.cssText = "display:flex;gap:5px;align-items:center;"
       + "font-size:9.5px";
     const tri = mk("button", "", "\u25b8");
+  tri.title = "Show or hide the details"; if (!tri.getAttribute("aria-label")) tri.setAttribute("aria-label", "Show or hide the details");  // [closex:tip:renderer.js:pantryRow:tri:Show or hide]
     tri.style.cssText = "font-size:9px;padding:0 3px;min-width:16px";
     line.appendChild(tri);
     const who = mk("span", "", String(r.name || r.who || r.label || ""));
@@ -5686,6 +5691,7 @@ function initWorksPopup() {
     try { head.appendChild(wkCacheBadge()); }
     catch (e) { /* the flow still opens */ }
     const x = mk("button", "wk-x", "✕");
+    x.title = "Close"; if (!x.getAttribute("aria-label")) x.setAttribute("aria-label", "Close");  // [closex:tip:renderer.js:pop = mk("div", "w:x:Close]
     x.onclick = () => {
       try { if (pop.wkBriefPoll) clearInterval(pop.wkBriefPoll); } catch (e) {}
       close();
@@ -6009,6 +6015,7 @@ function dxLineMenu(ev, item) {
 
   menu.appendChild(note);
   document.body.appendChild(menu);
+  if (window.pineCloseX) { window.pineCloseX(menu, close, {label: 'Close the menu', reserve: 'top'}); }  // [closex:dx-line-menu]
   setTimeout(() => document.addEventListener("click", away, true), 0);
 }
 
@@ -6033,6 +6040,7 @@ async function dxLineTranscript(item) {
   const sub = mk("span", "wk-sub", "reading the paperwork…");
   head.appendChild(sub);
   const x = mk("button", "wk-x", "✕");
+  x.title = "Close"; if (!x.getAttribute("aria-label")) x.setAttribute("aria-label", "Close");  // [closex:tip:renderer.js:dxLineTranscript:x:Close]
   x.onclick = () => pop.remove();
   head.appendChild(x);
   pop.appendChild(head);
@@ -6294,6 +6302,7 @@ function wkPurgePop(anchor) {
     + "read it, or let it go");
   head.appendChild(sub);
   const x = mk("button", "wk-x", "✕");
+  x.title = "Close"; if (!x.getAttribute("aria-label")) x.setAttribute("aria-label", "Close");  // [closex:tip:renderer.js:wkPurgePop:x:Close]
   x.onclick = () => pop.remove();
   head.appendChild(x);
   pop.appendChild(head);
@@ -6742,6 +6751,7 @@ function wkTakeText(take) {
     + Math.round(Number(take.seconds) || 0) + "s"
     + (take.voice ? " · " + take.voice : "")));
   const x = mk("button", "wk-x", "✕");
+  x.title = "Close"; if (!x.getAttribute("aria-label")) x.setAttribute("aria-label", "Close");  // [closex:tip:renderer.js:wkTakeText:x:Close]
   x.onclick = () => pop.remove();
   head.appendChild(x);
   pop.appendChild(head);
@@ -6813,6 +6823,7 @@ function wkRoadPop(road, anchor) {
   const sub = mk("span", "wk-sub", "what is being done about it");
   head.appendChild(sub);
   const x = mk("button", "wk-x", "✕");
+  x.title = "Close"; if (!x.getAttribute("aria-label")) x.setAttribute("aria-label", "Close");  // [closex:tip:renderer.js:wkRoadPop:x:Close]
   x.onclick = () => { clearInterval(tick); pop.remove(); };
   head.appendChild(x);
   pop.appendChild(head);
@@ -7541,6 +7552,7 @@ function worksSchedule(anchorPop) {
   const sub = mk("span", "wk-sub", "");
   head.appendChild(sub);
   const x = mk("button", "wk-x", "✕");
+  x.title = "Close"; if (!x.getAttribute("aria-label")) x.setAttribute("aria-label", "Close");  // [closex:tip:renderer.js:worksSchedule:x:Close]
   x.onclick = () => { clearInterval(tick); pop.remove(); };
   head.appendChild(x);
   /* #917: so The Works can stop this window's clock when it closes the
@@ -7555,9 +7567,11 @@ function worksSchedule(anchorPop) {
   const nav = mk("div", "wk-note", "");
   nav.style.cssText = "display:flex;gap:6px;align-items:center;margin:2px 0 6px";
   const prev = mk("button", "", "‹");
+  prev.title = "Previous"; if (!prev.getAttribute("aria-label")) prev.setAttribute("aria-label", "Previous");  // [closex:tip:renderer.js:worksSchedule:prev:Previous]
   const label = mk("b", "", "");
   label.style.cssText = "flex:1;text-align:center;font-size:11.5px";
   const next = mk("button", "", "›");
+  next.title = "Next"; if (!next.getAttribute("aria-label")) next.setAttribute("aria-label", "Next");  // [closex:tip:renderer.js:worksSchedule:next:Next]
   [prev, next].forEach((b) => {
     b.style.cssText = "font-size:11px;line-height:1;padding:1px 8px";
   });
@@ -8324,6 +8338,7 @@ function worksSchedule(anchorPop) {
     const h = mk("div", "wk-head");
     h.appendChild(mk("b", "", "\u25b6 the record for this entry"));
     const cx = mk("button", "wk-x", "\u2715");
+  cx.title = "Close"; if (!cx.getAttribute("aria-label")) cx.setAttribute("aria-label", "Close");  // [closex:tip:renderer.js:trackPick:cx:Close]
     cx.onclick = () => d.remove();
     h.appendChild(cx);
     d.appendChild(h);
@@ -8548,6 +8563,7 @@ function worksSchedule(anchorPop) {
     h.appendChild(mk("b", "", (how.generate ? "\u270e " : "\ud83d\udcdd ")
       + (slot.label || slot.kind)));
     const cx = mk("button", "wk-x", "\u2715");
+  cx.title = "Close"; if (!cx.getAttribute("aria-label")) cx.setAttribute("aria-label", "Close");  // [closex:tip:renderer.js:promptDesk:cx:Close]
     cx.onclick = () => d.remove();
     h.appendChild(cx);
     d.appendChild(h);
@@ -8856,6 +8872,7 @@ function worksSchedule(anchorPop) {
     h.appendChild(mk("b", "", (SCHED_ICON[slot.kind] || "•") + " "
                               + (slot.label || slot.kind)));
     const cx = mk("button", "wk-x", "✕");
+  cx.title = "Close"; if (!cx.getAttribute("aria-label")) cx.setAttribute("aria-label", "Close");  // [closex:tip:renderer.js:detail:cx:Close]
     cx.onclick = () => d.remove();
     h.appendChild(cx);
     d.appendChild(h);
@@ -9471,6 +9488,7 @@ function wkRoundEdit(r) {
   row.appendChild(status); row.appendChild(shut); row.appendChild(save);
   d.appendChild(row);
   document.body.appendChild(d);
+  if (window.pineCloseX) { window.pineCloseX(d, () => shut.click(), {label: 'Cancel the edit'}); }  // [closex:wk-round-edit]
   try { pvFloatDesk(d); } catch (e) {}
 }
 
@@ -11035,6 +11053,7 @@ function callInPanel() {
   shut.style.cssText = "position:absolute;top:8px;right:10px";
   shut.onclick = () => { callInStop(true); box.remove(); };
   box.appendChild(shut);
+  if (window.pineCloseX) { window.pineCloseX(box, () => shut.click(), {label: 'Close the call-in'}); shut.style.display = 'none'; }  // [closex:call-in]
   document.body.appendChild(box);
 
   const hold = box.querySelector("#callInHold");
@@ -11833,7 +11852,7 @@ function initSamplePopup() {
           + fmt(r.b) + " <input type='text' placeholder='name it — or "
           + "leave blank and it names itself from the words…' "
           + "data-n='" + n + "' value='" + escq(r.name) + "'>"
-          + "<button data-x='" + n + "'>✕</button></div>").join("")
+          + "<button data-x='" + n + "' title='Remove this range' aria-label='Remove this range'>✕</button></div>").join("") /* [closex:tip:renderer.js:range-x] */
           + (b > a ? "<div class='sp-range muted'>working range: "
              + fmt(a) + " → " + fmt(b) + "</div>" : "");
         list.querySelectorAll("input").forEach((inp) => {

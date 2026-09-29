@@ -52,6 +52,23 @@
   /* Longer than the .off animation in sfx-tv.css, so the last frame of the
    * collapse is seen rather than cut off by the removal. */
   var OFF_MS = 520;
+  /* [vcrfx] THE SET'S ON AND OFF ARE PineVcr's - pine-vcr.js holds the one
+   * table (the numbers sfx-tv.css kept as sfxTvOn/sfxTvOff) that every
+   * picture in the app, the tablet and the broadcast now shares. The
+   * classes stay as the road for a page that has not loaded pine-vcr.js. */
+  function vcrTubeOn(tube, flash) {
+    var V = root.PineVcr;
+    if (V && typeof V.in === 'function') { V.in(tube, {flash: flash || false}); return; }
+    tube.classList.add('on');
+    if (flash) flash.classList.add('pop');
+  }
+  function vcrTubeOff(tube) {
+    var V = root.PineVcr;
+    if (V && typeof V.out === 'function') { V.out(tube); return; }
+    tube.classList.remove('on');
+    void tube.offsetWidth;            // restart the animation, never resume it
+    tube.classList.add('off');
+  }
   /* Past this many seconds late, the set would be coming on over whatever
    * is airing NOW - which is worse than the clip being missed. */
   var LATE = 8;
@@ -2808,9 +2825,7 @@
            right - it is the one that failed. */
       }
       try {
-        glass.classList.remove('on');
-        void glass.offsetWidth;      // restart the animation, never resume it
-        glass.classList.add('off');
+        vcrTubeOff(glass);           /* [vcrfx] picture -> line -> dot */
       } catch (err) {}
       setTimeout(function () { teardown(screen); }, OFF_MS);
     };
@@ -2931,8 +2946,7 @@
       try {
         host.classList.remove('waiting');
         if (!seam) {
-          glass.classList.add('on');   // dot -> line -> picture
-          parts.flash.classList.add('pop');
+          vcrTubeOn(glass, parts.flash);   /* [vcrfx] dot -> line -> picture */
         }
       } catch (err) { /* the picture is there either way */ }
       /* #1184: on a seam the NEXT clip has to be warming already - the

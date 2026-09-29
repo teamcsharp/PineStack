@@ -395,6 +395,7 @@
     build();
     shown = true;
     box.hidden = false;
+    vcrBox(true);                          /* [vcrfx] dot -> line -> picture */
     setBare(BARE_DEFAULT);                 /* just the window, until asked */
     paintFrame();
     if (!frameTimer) frameTimer = setInterval(paintFrame, FRAME_MS);
@@ -407,12 +408,26 @@
     cropDrawClose(false);
     nativeStop();                          /* #1470: before the box goes */
     shown = false;
-    if (box) box.hidden = true;
+    if (box) vcrBox(false);                /* [vcrfx] picture -> line -> dot, then hidden */
     if (frameTimer) { clearInterval(frameTimer); frameTimer = 0; }
     repaintPicture();
   }
 
   function toggle() { if (shown) { close(); } else { open(); } }
+
+  /* [vcrfx] THE BOX COMES ON LIKE THE SFX TV. PineVcr.set is a state
+   * machine - the newest wish wins and an open during a close starts from
+   * the dot again - so the box is only ever hidden by an out that nobody
+   * overtook. Without pine-vcr.js on the page it is hidden at once. */
+  function vcrBox(on) {
+    if (!box) return;
+    var V = root.PineVcr;
+    if (!V || typeof V.set !== 'function') { box.hidden = !on; return; }
+    V.set(box, on, {
+      show: function (el) { el.hidden = false; },
+      hide: function (el) { if (!shown) el.hidden = true; }
+    });
+  }
 
   /* ------------------------------------------------ the native picture */
 

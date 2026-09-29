@@ -396,6 +396,7 @@
 
     shadeUp();                                           /* [#1450c] one z under the sheet */
     document.body.appendChild(sheet);
+    if (window.pineCloseX) { window.pineCloseX(sheet, function () { close(); }, {label: 'Close'}); }  // [closex:line-actions]
     if (root.PineDismiss) unwatch = root.PineDismiss.watch(sheet, close, [function () { return shade; }]);
     wallCheck();
     readVote(line);

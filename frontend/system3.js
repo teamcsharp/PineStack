@@ -1194,6 +1194,19 @@ function movableModal(panel) {
   const close = panel.querySelector('.s3-modal-close');
   if (close && close.parentNode === panel) close.after(handle);
   else panel.prepend(handle);
+  /* [closex:s3-modal] Every System 3 card and menu gets the corner X. It
+     presses the card's own Close, or taps its own backdrop - the road
+     PineDismiss's BACK already takes. A header Close steps aside for it;
+     a menu's Close at the foot stays where the list ends. */
+  if (window.pineCloseX) {
+    const own = panel.querySelector('.s3-modal-close');
+    window.pineCloseX(panel, () => {
+      if (own) { own.click(); return; }
+      const back = panel.closest('.s3-modal-back');
+      if (back) back.click();
+    });
+    if (own && own.parentNode === panel) own.style.display = 'none';
+  }
   return panel;
 }
 
@@ -8014,6 +8027,7 @@ export async function mount(root, {request, onClose, tab: startTab = '', table: 
       item('Only ' + (e.family || ''), () => { auditFilter.family = e.family || ''; paintAuditList(); }),
       item('Copy the event id', () => { try { navigator.clipboard.writeText(e.event_id || ''); } catch (_) { /* no clipboard */ } }));
     document.body.append(menuNode);
+    if (window.pineCloseX) window.pineCloseX(menuNode, close, {label: 'Close the menu', reserve: 'top'});   // [closex:s3-audit-menu]
     setTimeout(() => document.addEventListener('pointerdown', away, true), 0);
   }
   function auditRow(e, prev) {
@@ -10433,6 +10447,7 @@ export async function openSystem3({request, onClose, tab = '', table = '', conve
   document.addEventListener('keydown', key);
   backdrop.addEventListener('click', event => { if (event.target === backdrop) close(); });
   view = await mount(root, {request, onClose: close, tab, table, conversationId});
+  if (!closed && window.pineCloseX) window.pineCloseX(root, close, {label: 'Close System 3'});   // [closex:s3-window]
   if (closed) view.dispose(); else { const b = root.querySelector('button'); b && b.focus(); }
   return {element: backdrop, close};
 }
@@ -11582,6 +11597,7 @@ export async function openSystem3Focus({request, lineId = '', said = '', onBack 
   FOCUS_OF.set(root, {lineId: String(lineId || ''), said: String(said || ''), back: close});
   if (window.PineDuck && typeof window.PineDuck.hold === 'function') window.PineDuck.hold('s3-focus', window.PineDuck.REPORT, backdrop);
   view = await mount(root, {request, onClose: close, tab: tab || 'focus'});
+  if (!closed && window.pineCloseX) window.pineCloseX(root, close, {label: 'Close System 3'});   // [closex:s3-focus]
   if (closed) { try { view.dispose(); } catch (e) { /* gone */ } }
   else { const b = root.querySelector('.s3-fx-back'); if (b) b.focus({preventScroll: true}); }
   return {element: backdrop, close};

@@ -756,6 +756,7 @@
     const heading = node('div'); heading.style.cssText = 'display:flex;justify-content:space-between;align-items:center';
     heading.appendChild(node('h2', 'Pine Box LCD'));
     const close = node('button', 'Close'); close.onclick = () => { shade.remove(); panel = null; syncStationFeed(); }; heading.appendChild(close); card.appendChild(heading);
+    if (window.pineCloseX) { window.pineCloseX(card, () => close.click(), {label: 'Close the LCD panel'}); close.style.display = 'none'; }  // [closex:lcd-panel]
     const form = node('div'); form.style.cssText = 'display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:10px';
     const host = node('input'); host.placeholder = 'Display LAN IP, quanta-screen.local or COM8'; host.value = state.config.host;
     host.style.cssText = 'min-width:220px;flex:1'; host.setAttribute('aria-label', 'LCD host'); form.appendChild(host);

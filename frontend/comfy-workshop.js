@@ -144,6 +144,7 @@ export async function openComfyWorkshop({request, onClose=()=>{}}={}) {
               action, jobsTitle, jobs);
   body.append(library, work);
   dialog.append(header, body); shade.append(dialog); document.body.append(shade);
+  if (window.pineCloseX) { window.pineCloseX(dialog, () => closeButton.click(), {label: 'Close Workshop'}); closeButton.style.display = 'none'; }   // [closex:comfy-workshop]
   let lastFocusedField = null;
   const originalParent = shade.parentNode;
   // The gallery can move this open dialog into its window; restore an editor blurred by that move.

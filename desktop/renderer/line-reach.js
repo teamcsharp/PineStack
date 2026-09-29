@@ -125,6 +125,7 @@
     }));
 
     document.body.appendChild(menu);
+    if (window.pineCloseX) { window.pineCloseX(menu, function () { shut(); }, {label: 'Close the menu', reserve: 'top'}); }  // [closex:reach-menu]
     /* Kept on screen - a menu opened near an edge would otherwise open off
      * it, and the feed lists run right to the window edge. */
     const room = document.body.getBoundingClientRect();

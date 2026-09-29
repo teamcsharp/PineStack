@@ -431,6 +431,7 @@
          * still arriving; its frame is not ours to reveal. */
         if (endlessBackdrop) return;
         vid.hidden = false;
+        if (root.PineVcr) root.PineVcr.in(vid);   /* [vcrfx: the backdrop clip comes on like the SFX TV] */
         showPlexus(false);
         if (still) still.style.opacity = "0";
       };
@@ -1775,6 +1776,7 @@
      * nothing downstream can make the overlay unclosable. */
     if (root.PineDismiss) {
       root.PineDismiss.watch(desk, () => open(false), [() => el("plDeskBtn")]);
+      if (window.pineCloseX) { window.pineCloseX(desk, () => open(false), {label: 'Close the levels', reserve: 'top'}); }  // [closex:listen-desk]
     } else {
       desk.addEventListener("click", (event) => event.stopPropagation());
       document.addEventListener("click", () => { if (!desk.hidden) open(false); });

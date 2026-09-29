@@ -63,6 +63,7 @@
     var head = make('div', 'sg-head');
     head.appendChild(make('b', '', 'Put something on pad ' + ((host.pad | 0) + 1)));
     var shut = make('button', 'sg-x', '×');
+    shut.title = "Close"; if (!shut.getAttribute("aria-label")) shut.setAttribute("aria-label", "Close");  // [closex:tip:sampler-grab.js:open:shut:Close]
     shut.type = 'button';
     shut.addEventListener('click', close);
     head.appendChild(shut);
