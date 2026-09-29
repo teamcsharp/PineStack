@@ -304,6 +304,13 @@ def check(text):
     applied, missing = 0, []
     for name, old, new, count in plan(text):
         state = state_of(text, old, new, count)
+        if name == "turnchain-beats-signature" and state != "applied":
+            # The live exchange gate extends this already-applied signature
+            # with a verbatim opening for fixed source material.
+            extended = new.replace("gate: Any = None) -> str:",
+                                   "gate: Any = None,\n                        verbatim_seed: bool = False) -> str:")
+            if extended != new and text.count(extended) == 1:
+                state = "applied"
         if state == "applied":
             applied += 1
         elif state != "ready":

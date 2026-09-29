@@ -1542,7 +1542,8 @@ class System3Runtime:
         line hands nothing on."""
         try:
             road = str((conv.get("identity") or {}).get("road_kind") or "")
-            if road in system3_tables.LINE_ROADS or len(conv.get("turns") or []) < 2:
+            if ((road in system3_tables.LINE_ROADS and not conv.get("graph_structure"))
+                    or len(conv.get("turns") or []) < 2):
                 return None
             names = ((conv.get("inputs") or {}).get("names") or {})
             seats = {}
@@ -2298,18 +2299,20 @@ class System3Runtime:
             conv = handle.conv
             words = " ".join(str(text or "").split())
             if conv["turns"]:
-                # [s3-split] the read's own turn (never a part split off it), with its words whole:
-                # 1,500 characters stood here, and the Messenger showed "There's a certai"
-                t = next((x for x in reversed(conv["turns"]) if not x.get("split_of")), conv["turns"][-1])
+                # The line is the graph's initiator. Binding it to the last
+                # turn silently made a seven-turn chapter look complete while
+                # leaving its six replies unwritten.
+                t = next((x for x in conv["turns"] if not x.get("split_of")), conv["turns"][0])
                 t["text"] = words
                 t["script_index"] = 0 if words else None
                 t["status"] = "generated" if words else "dropped"
-            conv["actual"] = [{"speaker": (conv["turns"][-1]["speaker"] if conv["turns"] else "A"),
+            conv["actual"] = [{"speaker": (conv["turns"][0]["speaker"] if conv["turns"] else "A"),
                                "text": words}]                                  # [s3-split] whole
             conv["identity"]["script_digest"] = hashlib.sha256(words.encode("utf-8")).hexdigest()[:16]
-            conv["bindings"] = [{"turn_id": t["turn_id"], "script_index": 0} for t in conv["turns"][-1:]]
-            conv["status"] = ("bound" if handle.active else "shadowed") if words else "dropped"
-            fav = (conv["turns"][-1].get("favorite") or {}) if conv["turns"] else {}      # [s3-cast]
+            conv["bindings"] = [{"turn_id": conv["turns"][0]["turn_id"], "script_index": 0}] if conv["turns"] else []
+            conv["status"] = ("opening_ready" if handle.active and len(conv["turns"]) > 1
+                              else "bound" if handle.active else "shadowed") if words else "dropped"
+            fav = (conv["turns"][0].get("favorite") or {}) if conv["turns"] else {}      # [s3-cast]
             if words and fav.get("text"):
                 copied = bool(system3.favorite_copied(fav["text"], words))
                 conv["validation"] = {"method": "deterministic/lexical", "favorite_copies": int(copied),
@@ -2323,6 +2326,43 @@ class System3Runtime:
             self.persist(conv)
         except Exception as exc:  # noqa: BLE001
             self.fail("line bind", exc)
+
+    def line_chapter(self, stamp, written=None):
+        """Return a line road's graph plan, or bind a complete spoken exchange.
+
+        A plan is not a broadcast script. Only a written exchange with its
+        planned seats, at least three turns and two voices can be committed.
+        """
+        if not isinstance(stamp, dict) or not stamp.get("conversation_id"):
+            return None
+        conv = self.recent.get(str(stamp["conversation_id"]))
+        if not conv or conv.get("mode") != "active":
+            return None
+        planned = conv.get("turns") or []
+        if not conv.get("graph_structure") or len(planned) < 3:
+            return None
+        if written is None:
+            return {"sheet": str((conv.get("plan") or {}).get("sheet") or ""),
+                    "turns": len(planned), "seats": [t["speaker"] for t in planned],
+                    "roles": dict((conv.get("inputs") or {}).get("roles") or {}),
+                    "names": dict((conv.get("inputs") or {}).get("names") or {})}
+        rows = [(str(m), str(s or "").strip()) for m, s in written]
+        if (len(rows) != len(planned) or len({m for m, _s in rows}) < 2
+                or any(not s or m != t["speaker"] for (m, s), t in zip(rows, planned))):
+            return None
+        mapping, verdict = system3.bind(conv, rows)
+        if len(mapping) != len(planned) or verdict.get("verdict") == "non_compliant":
+            return None
+        conv["actual"] = [{"speaker": m, "text": s} for m, s in rows]
+        conv["identity"]["script_digest"] = hashlib.sha256(
+            "\n".join("%s: %s" % row for row in rows).encode("utf-8")).hexdigest()[:16]
+        conv["status"] = "chapter_ready"
+        self.remember(conv)
+        self.persist(conv)
+        return [{"who": (conv.get("inputs") or {}).get("roles", {}).get(t["speaker"], "dj"),
+                 "name": (conv.get("inputs") or {}).get("names", {}).get(t["speaker"], ""),
+                 "text": rows[i][1], "stamp": dict(stamp, turn_id=t["turn_id"])}
+                for i, t in enumerate(planned)]
 
     # --- [s3-split] THE SPLIT NODE AT THE STATION'S DOORS ---------------------------
     @staticmethod
@@ -4168,6 +4208,7 @@ def install(app, namespace):
     namespace["system3_direction_echo"] = rt.direction_echo                 # [s3-echo]
     namespace["system3_direct_line"] = system3_direct_line
     namespace["system3_bind_line"] = rt.bind_line
+    namespace["system3_line_chapter"] = rt.line_chapter
     namespace["system3_link_line"] = rt.link_spoken                  # [s3-line-link]
     namespace["system3_observe_ledger"] = rt.observe_ledger
     namespace["system3_segment_block"] = rt.segment_block              # [s3-segment]

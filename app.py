@@ -35916,17 +35916,11 @@ async def dj_speak(kind: str, track: dict[str, Any] | None = None,
     the same task and passes straight through. A reply or an
     operator-fired line skips the wait - a person outranks the show
     (#206)."""
-    if kind == "reply" or by_hand:
-        return await _dj_speak_floorless(
-            kind, track, extra=extra, line=line, who=who, voice=voice,
-            source=source, by_hand=by_hand, fx=fx, name=name,
-            source_text=source_text, clip=clip, sting=sting, note=note,
-            checked=checked, remember_text=remember_text, round_as=round_as,
-            sid=sid, bound=bound, bound_part=bound_part,   # [#1237]
-            system3=system3)   # [s3-roads]
-    _owned = await _floor_take(f"a {kind} line from {who}")
+    _owned = (False if kind == "reply" or by_hand else
+              await _floor_take(f"a {kind} line from {who}"))
+    _chapter_sid = sid or (uuid.uuid4().hex[:12] if _s3_active() else "")
     _s3_box: dict[str, Any] = {"parts": [], "claimed": False,                  # [s3-split] the parts after the first
-                               "task": asyncio.current_task()}
+                               "task": asyncio.current_task(), "chapter": None}
     _s3_tok = _S3_SPLIT_TAIL.set(_s3_box)
     try:
         said = await _dj_speak_floorless(
@@ -35934,17 +35928,28 @@ async def dj_speak(kind: str, track: dict[str, Any] | None = None,
             source=source, by_hand=by_hand, fx=fx, name=name,
             source_text=source_text, clip=clip, sting=sting, note=note,
             checked=checked, remember_text=remember_text, round_as=round_as,
-            sid=sid, bound=bound, bound_part=bound_part,   # [#1237]
+            sid=_chapter_sid, bound=bound, bound_part=bound_part,   # [#1237]
             system3=system3)   # [s3-roads]
         if said and _s3_box["parts"]:
             # [s3-split] THE READ GOES ON in the voices the roulette picked: each part a
             # line of its own, in order, under this same floor
-            await _s3_split_speak(kind, track, _s3_box["parts"], sid=sid, round_as=round_as,
+            await _s3_split_speak(kind, track, _s3_box["parts"], sid=_chapter_sid, round_as=round_as,
                                   bound=bound, bound_part=bound_part, sting=sting)
             said = str(_s3_box["parts"][0].get("whole") or said)
         elif _s3_box["parts"]:
             pipeline_log("drop", "[s3-split] the first part of a split %s read did not go out - "
                                  "the parts after it go with it" % kind)
+        if said and _s3_box["chapter"]:
+            prepared = _s3_box["chapter"]
+            for row, take in zip(prepared["rows"][1:], prepared["clips"][1:]):
+                got = await _dj_speak_floorless(
+                    kind, track, line=row["text"], who=row["who"], name=row["name"],
+                    clip=take, checked=True, sting=False, sid=_chapter_sid,
+                    round_as=round_as or kind, system3=row["stamp"])
+                if not got:
+                    pipeline_log("system3", "the prepared chapter stopped during playout",
+                                 extra="%s, turn %s" % (kind, row["stamp"].get("turn_id")))
+                    break
         return said
     finally:
         _S3_SPLIT_TAIL.reset(_s3_tok)                                           # [s3-split]
@@ -36049,6 +36054,57 @@ async def _s3_split_line(kind: str, spoken: str, who: str, forced: Any, stamp: A
                      kind, " / ".join(str(p.get("name") or p.get("who")) for p in parts)),
                  extra=" | ".join("%s: %s" % (p.get("name"), str(p.get("text") or "")[:90]) for p in parts))
     return str(parts[0].get("text") or spoken), dict(parts[0].get("stamp") or stamp), rest
+
+
+async def _s3_prepare_line_chapter(stamp: Any, opening: str, kind: str,
+                                   first_clip: Any = None) -> dict[str, Any] | None:
+    """Write and render a line road's complete graph before its opener airs."""
+    chapter = globals().get("system3_line_chapter")
+    if not callable(chapter) or not isinstance(stamp, dict):
+        return None
+    plan = chapter(stamp)
+    if not plan or plan["turns"] < 3 or len(set(plan["seats"])) < 2:
+        return None
+    try:
+        script = await _banter_beats(
+            "The opening below is fixed source material. The remaining voices must answer "
+            "what was actually said, following the numbered System Three rolls. "
+            "Keep the source intact and write a conversational response chain.\n"
+            "SOURCE ROAD: " + str(kind),
+            plan["sheet"], plan["turns"], plan["seats"], seed_text=opening,
+            verbatim_seed=True)
+        written = banter_turns(script)
+        if (len(written) != plan["turns"]
+                or " ".join(written[0][1].split()) != " ".join(opening.split())
+                or [m for m, _s in written] != plan["seats"]):
+            pipeline_log("system3", "the line chapter was held: its writer missed the graph",
+                         extra=str(kind))
+            return None
+        written[0] = (written[0][0], opening)
+        rows = chapter(stamp, written)
+        if not rows:
+            pipeline_log("system3", "the line chapter was held: it missed its roulette contract",
+                         extra=str(kind))
+            return None
+        voices = await session_voices()
+        clips: list[Any] = []
+        for i, row in enumerate(rows):
+            if i == 0 and first_clip is not None and first_clip.get("path"):
+                clips.append(first_clip)
+                continue
+            role = str(row["who"])
+            voice = configured_radio_voice(role, voices.get(role) or "")
+            made = await _s3_split_render(row["text"], role, voice)
+            if not made or not made.get("path"):
+                pipeline_log("system3", "the line chapter waited for a missing voice take",
+                             extra="%s turn %d" % (kind, i + 1))
+                return None
+            clips.append(made)
+        return {"rows": rows, "clips": clips}
+    except Exception as exc:  # noqa: BLE001
+        pipeline_log("system3", "the line chapter could not be prepared",
+                     extra=("%s: %s %s" % (kind, type(exc).__name__, exc))[:220])
+        return None
 
 
 async def _s3_split_speak(kind: str, track: dict[str, Any] | None, parts: list[dict[str, Any]],
@@ -36443,11 +36499,27 @@ async def _dj_speak_floorless(kind: str, track: dict[str, Any] | None = None,
         _SPEAK_LAST.update({"why": "one-hour dialogue repeat window", "at": time.time()})
         return ""
 
+    # A line road's graph is a real exchange, not seven decisions stapled
+    # to one 166-second read. Prepare every reply and its voice take before
+    # admitting the opener. The wrapper airs those ready turns under one floor.
+    _chapter_box = _S3_SPLIT_TAIL.get()
+    if (_s3_active() and isinstance(_chapter_box, dict)
+            and _chapter_box.get("task") is asyncio.current_task()
+            and _chapter_box.get("chapter") is None
+            and isinstance(system3, dict) and system3.get("mode") == "active"):
+        _chapter = await _s3_prepare_line_chapter(system3, spoken, kind, clip)
+        if not _chapter:
+            pipeline_log("system3", "single line withheld until its graph exchange is ready",
+                         extra="%s from %s" % (kind, who))
+            return ""
+        _chapter_box["chapter"] = _chapter
+        clip = _chapter["clips"][0]
+
     to_box = voice_to in ("box", "both")
     if to_box and box_firmware_down_now():
         to_box = False                  # #1156: route around a dead box
         _route_around_note(f"a {kind} line")
-    if _s3_spoken_handle is not None:
+    if _s3_spoken_handle is not None and not (_chapter_box or {}).get("chapter"):
         system3_bind_line(_s3_spoken_handle, spoken)
     line_id = uuid.uuid4().hex  # durable cadence receipts must not recycle 24-bit IDs
     _s3_line_remember(line_id, system3, who, spoken)         # [s3-roads][s3-line-link]
@@ -74532,6 +74604,24 @@ async def _air_produced_ad(entry: dict[str, Any], on_handoff: Any = None) -> boo
     name = str(entry.get("audio") or "")
     if not name or not (PRODUCED_ADS_DIR / name).is_file():
         return False
+    prepared = None
+    if _s3_active():
+        try:
+            handle = await system3_direct_line(
+                road="ad_spot", who="dj", dj=dj_settings(), bank=True,
+                context=str(entry.get("product") or "a produced advert"),
+                text=str(entry.get("text") or "")[:600])
+            if handle and handle.active:
+                prepared = await _s3_prepare_line_chapter(
+                    dict(handle.stamp), str(entry.get("text") or ""), "ad",
+                    {"path": str(PRODUCED_ADS_DIR / name)})
+                if prepared:
+                    entry["system3"] = dict(prepared["rows"][0]["stamp"])
+        except Exception as exc:  # noqa: BLE001
+            pipeline_log("system3", "the produced advert could not prepare its exchange",
+                         extra=("%s: %s" % (type(exc).__name__, exc))[:180])
+        if not prepared:
+            return False
     _air_at = time.time()                                         # #892
     path, sig = f"/ads-audio/{name}", media_sign(name)
     seconds = await _clip_seconds_async(path)
@@ -74561,6 +74651,9 @@ async def _air_produced_ad(entry: dict[str, Any], on_handoff: Any = None) -> boo
         voice=str(entry.get("voice") or ""),
         aired="held",
         air_at=_air_at)
+    if prepared:
+        booth_row["sid"] = str(prepared["rows"][0]["stamp"]["conversation_id"])[:12]
+        booth_row["turn"] = 0
     # Bind the real booth ID before publishing. A fast page receipt must not
     # credit a temporary label identity and then credit the row again later.
     if isinstance(entry.get("system3"), dict):               # [s3-roads]
@@ -74637,6 +74730,20 @@ async def _air_produced_ad(entry: dict[str, Any], on_handoff: Any = None) -> boo
     if box_played and str(booth_row.get("id") or "") not in _PAGE_ACKED_LINES:
         _produced_ad_ack(entry, "box")
         air_remember(str(entry.get("text") or label), "dj", "ad")
+    if prepared:
+        owned = await _floor_take("a produced advert and its prepared exchange")
+        try:
+            for row, take in zip(prepared["rows"][1:], prepared["clips"][1:]):
+                got = await _dj_speak_floorless(
+                    "ad", _RADIO.get("now"), line=row["text"], who=row["who"],
+                    name=row["name"], clip=take, checked=True, sting=False,
+                    sid=str(booth_row["sid"]), round_as="ad", system3=row["stamp"])
+                if not got:
+                    pipeline_log("system3", "a prepared advert exchange stopped during playout",
+                                 extra=str(row["stamp"].get("turn_id") or ""))
+                    break
+        finally:
+            _floor_drop(owned)
         _PAGE_ACKED_LINES.add(str(booth_row.get("id") or ""))
         talk_said_now("box", str(sig), 1.0)
     # #1136: ...AND THE HOUR CONTRACT IS CREDITED. Every SPOKEN ad rides
@@ -107107,10 +107214,11 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                          extra=str(ready_meta.get("prep_kind") or "banter"))
             return []
         _s3_planned = int(_round_s3.get("planned_turns") or len(_s3_positions))
-        if (_s3_planned > 1
-                and len(_s3_positions) < max(2, (_s3_planned + 1) // 2)):
+        if (_s3_planned < 3 or len(_s3_positions) != _s3_planned
+                or limit < _s3_planned
+                or len({str(turns[i][0]) for i in _s3_positions}) < 2):
             pipeline_log("system3", "incomplete conversation withheld after repair",
-                         extra=f"{len(_s3_positions)} of {_s3_planned} turns")
+                         extra=f"{len(_s3_positions)} of {_s3_planned} turns; limit {limit}")
             return []
         _s3_keep = set(_s3_positions)
         if ready_takes is not None:
@@ -109751,7 +109859,8 @@ async def _s3_copy_gate(script: str, handle: Any, caller_name: str = "",
 async def _banter_beats(context: str, sheet: str, lines: int,
                         seats: list[str], seed_text: str = "",
                         trace: list[dict[str, Any]] | None = None,
-                        director: Any = None, gate: Any = None) -> str:
+                        director: Any = None, gate: Any = None,
+                        verbatim_seed: bool = False) -> str:
     """Write a banked exchange as responsive 3-4-turn calls.
 
     Each visit receives the final two completed turns verbatim. The generated
@@ -109763,7 +109872,8 @@ async def _banter_beats(context: str, sheet: str, lines: int,
     made: list[tuple[str, str]] = []
     first = ""
     if seed_text and plan:
-        first = _verbatim_turn_text(seed_text).strip()
+        first = (" ".join(str(seed_text).split()) if verbatim_seed
+                 else _verbatim_turn_text(seed_text)).strip()
         if first:
             made.append((str(plan[0]["seat"]), first))
     cursor = len(made)
