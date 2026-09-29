@@ -268,6 +268,49 @@
     catch (err) { return false; }
   }
 
+  /* [outl-react-mark] "Mark as a reaction": files this clip in the SFX Guy's
+   * reaction repertoire under one of his SFXREACT1 topics. A thumbs-up on
+   * top of a mark makes it the strongest candidate he has for that reaction;
+   * a thumbs-down weighs it down. The station says what it filed under the
+   * header, like a vote. */
+  var REACTIONS = [['gasp', 'Gasp'], ['boo', 'Boo'], ['record_scratch', 'Record scratch'], ['what', 'What?!'],
+    ['uproar', 'Uproar'], ['sad_trombone', 'Sad trombone'], ['cringe', 'Cringe'], ['laugh', 'Laugh'],
+    ['fail', 'Fail'], ['victory', 'Victory'], ['rimshot', 'Rimshot'], ['crickets', 'Crickets']];
+  function reactionStyle() {
+    if (typeof document === 'undefined' || document.getElementById('laReactStyle')) return;
+    var s = document.createElement('style');
+    s.id = 'laReactStyle';
+    s.textContent = '.la-react{padding:6px 10px}.la-react-head{display:block;font-size:12px;opacity:.8;margin-bottom:4px}'
+      + '.la-react-row{display:flex;flex-wrap:wrap;gap:4px}.la-react-chip{font:inherit;font-size:12px;padding:3px 8px;'
+      + 'border-radius:12px;border:1px solid rgba(127,127,127,.45);background:none;color:inherit;cursor:pointer}'
+      + '.la-react-chip.on{background:#ffd479;color:#222;border-color:#ffd479}';
+    (document.head || document.body).appendChild(s);
+  }
+  function reactionChips(line) {
+    reactionStyle();
+    var box = make('div', 'la-react');
+    box.appendChild(make('b', 'la-react-head', 'Mark as a reaction (the SFX Guy files it)'));
+    var row = make('div', 'la-react-row');
+    REACTIONS.forEach(function (r) {
+      var b = make('button', 'la-react-chip', r[1]);
+      b.type = 'button';
+      b.title = 'File this clip as a "' + r[1] + '" reaction in the SFX Guy\'s repertoire';
+      b.setAttribute('aria-label', b.title);
+      press(b, function () {
+        Promise.resolve().then(function () {
+          return api().post('/api/sfxguy/reactions/mark', {line_id: line.id, category: r[0]});
+        }).then(function (got) {
+          if (got && got.ok === false) throw new Error(String(got.why || 'the station would not take that'));
+          [].slice.call(row.children).forEach(function (x) { x.classList.toggle('on', x === b); });
+          voteSay('Filed as a ' + r[1] + ' reaction' + (got && got.up ? ' - with your upvote, one of his strongest' : ''), false);
+        }).catch(function (err) { voteSay(String((err && err.message) || err || 'the station would not take that'), true); });
+      });
+      row.appendChild(b);
+    });
+    box.appendChild(row);
+    return box;
+  }
+
   function open(line) {
     close();
     sheet = make('div', 'la-sheet');
@@ -406,6 +449,7 @@
       'the next free pad, ready to fire', 'pad', function (stage) {
         return toPad(line, stage);
       });
+    if (sfxRow && !sfxRow.deleted && line.id) list.appendChild(reactionChips(line));   /* [outl-react-chips] */
     if (sfxRow && !sfxRow.deleted) {
       choice(list, 'c:edit', 'Edit and split this sound effect',
         'set in and out points; save separate clips', 'mark', function (stage) {

@@ -5280,7 +5280,8 @@
   var MV_SRC_ORDER = ['speakerbox', 'sfx', 'topic', 'memory', 'internet', 'manager', 'ads', 'products'];
   var MV_FAM = {CTS: '#8ac6ac', ES: '#f0a6ca', RS: '#87bfff', IRS: '#ffb86b', FL: '#c4a1ee',
     SPEAKERBOX: '#e7bf78', SFX: '#7fe0d6', TOPIC: '#9be15d', SFXGUY: '#ffd479', LINE: '#b8c4ff',
-    MEMORY: '#d9c9a3', STATION: '#9aa9ab', GRAPH: '#9be15d'};
+    MEMORY: '#d9c9a3', STATION: '#9aa9ab', GRAPH: '#9be15d',
+    MEASURE: '#ff6b8b', SFXREACT: '#ffd479', CUTIN: '#c4a1ee', MINIROUND: '#87bfff', HOLD: '#d9c9a3'};   /* [outl-fam] */
   var mv = {
     view: 'feed', style: 'digital', flip: null, left: null, pane: null, stage: null,
     sceneBox: null, scene: null, sceneGen: 0, sceneRO: null, menu: null, menuOff: null,
