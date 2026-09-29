@@ -37203,6 +37203,21 @@ def _s3_chapter_opener_missed(e: dict[str, Any], who: str = "", text: str = "") 
 async def _s3_chapter_replay(e: dict[str, Any]) -> bool:
     """[s3-chain] A prepared exchange that waited airs through its own road."""
     fn = str(e.get("road_fn") or "dj_speak")
+    # [norepeat-chapter] an opening that already sounded inside the day is retired,
+    # never re-aired: the keeper can hold an exchange its own road already played.
+    try:
+        _nr_on, _nr_used = globals().get("norepeat_on"), globals().get("norepeat_text_used")
+        _nr_txt = str(e.get("opening") or "")
+        if callable(_nr_on) and callable(_nr_used) and _nr_on() and _nr_txt and _nr_used(_nr_txt):
+            _nr_ref = globals().get("norepeat_refuse")
+            if callable(_nr_ref):
+                _nr_ref("line", str(e.get("key") or ""), "chapter:" + fn, _nr_txt,
+                        why="the prepared exchange's opening already sounded inside the day",
+                        stage="air", ref=str(e.get("key") or ""))
+            _s3_chapter_note(e, "expired", "its opening already sounded inside the day - retired, not re-aired (no repeats)", drop=True)
+            return True
+    except Exception:  # noqa: BLE001
+        pass
     rep = dict(e.get("replay") or {})
     tok = _S3_CHAPTER_ROW.set("replay")
     try:
