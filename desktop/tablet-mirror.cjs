@@ -71,6 +71,9 @@ const FIRST_FRAME_TIMEOUT_MS = 12000;
 const STALLED_FRAME_TIMEOUT_MS = 5000;
 const WATCH_EVERY_MS = 1000;
 const ADB_CONNECT_TIMEOUT_MS = 6000;
+/* [mirror-drop-still] A quiet pipe is asked about before it is killed. */
+const STILL_PROBE_TIMEOUT_MS = 4000;
+const STILL_RECHECK_MS = 5000;
 
 /* THE CAMERA'S KNOWN DOOR.
  *
@@ -114,6 +117,11 @@ class Mirror {
     this.lastRestartReason = '';
     this.connecting = false;
     this.epoch = 0;
+    /* [mirror-drop-nolimit] null = not asked yet; see measure(). */
+    this.unlimited = null;
+    this.still = false;
+    this.stillAt = 0;
+    this.probing = false;
   }
 
   target(args) {
@@ -142,6 +150,17 @@ class Mirror {
    * failing: a mirror at a slightly wrong aspect beats no mirror.
    */
   async measure(run) {
+    /* [mirror-drop-nolimit] screenrecord stops itself after 180 s unless
+     * told otherwise, and every stop is a rebuild the viewer sees as a
+     * two-and-a-half second drop - measured, every 180 s on the dot. A
+     * build that documents --time-limit 0 is asked for exactly that; one
+     * that does not keeps the rebuild-on-end below. */
+    if (typeof run === 'function' && this.unlimited === null) {
+      try {
+        const help = String(await run(this.target(['shell', 'screenrecord --help 2>&1'])) || '');
+        this.unlimited = /set to 0\s+to remove the time limit/i.test(help);
+      } catch (error) { this.unlimited = false; }
+    }
     if (this.measured || typeof run !== 'function') return this.real;
 
     /* The live viewport first. */
@@ -366,6 +385,7 @@ class Mirror {
       'screenrecord --output-format=h264'
         + ' --size ' + width + 'x' + height
         + ' --bit-rate ' + bitrate
+        + (this.unlimited ? ' --time-limit 0' : '')  /* [mirror-drop-limit0] */
         + ' -'
     ]), { windowsHide: true });
 
@@ -460,6 +480,8 @@ class Mirror {
       this.lastFrameAt = Date.now();
       this.failedStarts = 0;
       this.lastError = '';
+      this.still = false;  /* [mirror-drop-moved] */
+      this.stillAt = 0;
       for (const watcher of this.watchers) this.push(watcher, this.latest);
     }
   }
@@ -471,8 +493,44 @@ class Mirror {
     const from = madeFrame ? this.lastFrameAt : this.pipeAt;
     const limit = madeFrame ? STALLED_FRAME_TIMEOUT_MS : FIRST_FRAME_TIMEOUT_MS;
     if (now - from <= limit) return false;
-    this.rebuild(madeFrame ? 'frame pipe stalled' : 'no first frame arrived');
-    return true;
+    if (!madeFrame) {
+      this.rebuild('no first frame arrived');
+      return true;
+    }
+    /* [mirror-drop-probe] NO NEW FRAME IS NOT A DEAD PIPE. screenrecord
+     * encodes changes; a still screen gives it nothing to send, and killing
+     * the pipe for that turned a quiet picture into a real drop - and a
+     * still screen into a rebuild every seven seconds. Ask the tablet
+     * whether the recorder is still running before touching anything. */
+    if (this.probing || (this.still && now - this.stillAt < STILL_RECHECK_MS)) return false;
+    this.probing = true;
+    const epoch = this.epoch;
+    this.recorderAlive().then((alive) => {
+      this.probing = false;
+      /* A frame that arrived meanwhile, or a rebuild, settles it. */
+      if (!this.running || epoch !== this.epoch || this.lastFrameAt > from) return;
+      if (alive) {
+        this.still = true;
+        this.stillAt = Date.now();
+      } else {
+        this.rebuild('frame pipe stalled: the tablet recorder is not answering');
+      }
+    });
+    return false;
+  }
+
+  /* [mirror-drop-probe] Alive = our local adb child is still running AND the
+   * tablet answers, within a few seconds, that screenrecord is running. A
+   * transport that cannot answer that is as good as dead. */
+  recorderAlive() {
+    return new Promise((resolve) => {
+      if (!this.record || this.record.exitCode !== null) return resolve(false);
+      try {
+        this.execFile(this.adb, this.target(['shell', 'pidof screenrecord']),
+          { timeout: STILL_PROBE_TIMEOUT_MS, windowsHide: true },
+          (error, stdout) => resolve(!error && /\d/.test(String(stdout || ''))));
+      } catch (error) { resolve(false); }
+    });
   }
 
   rebuild(why) {
@@ -540,6 +598,12 @@ class Mirror {
       restarts: this.restarts,
       rebuilding: this.rebuilding,
       connecting: this.connecting,
+      /* [mirror-drop-state] what the window may honestly call a reconnect,
+       * and a quiet stream that has been checked and is fine. */
+      reconnecting: !!(this.rebuilding || this.connecting),
+      still: !!this.still,
+      stallMs: STALLED_FRAME_TIMEOUT_MS,
+      noTimeLimit: !!this.unlimited,
       restartReason: this.lastRestartReason,
       sinceFrameMs: still,
       size: this.shape.size,

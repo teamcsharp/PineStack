@@ -1169,6 +1169,34 @@ function hotSelfFiles(source) {
   }
 }
 
+/* [mirror-drop-hotasync] The same two reads, off the main thread's loop.
+ * Synchronous, they held the Electron main process for up to 4.5 s on a slow
+ * share - and the tablet mirror's frames, which are served from this very
+ * process, froze for exactly as long. One await at a time: a slow share then
+ * costs one libuv thread, not the loop and not the pool. */
+async function hotScanAsync(dir) {
+  const out = new Map();
+  for (const entry of await fs.promises.readdir(dir, { withFileTypes: true })) {
+    if (!entry.isFile()) continue;
+    if (!/\.(js|css|html)$/i.test(entry.name)) continue;
+    try {
+      const info = await fs.promises.stat(path.join(dir, entry.name));
+      out.set(entry.name, Math.round(info.mtimeMs) + ":" + info.size);
+    } catch {}
+  }
+  return out;
+}
+
+async function hotSelfFilesAsync(source) {
+  try {
+    return (await fs.promises.readdir(path.join(source, ".."), { withFileTypes: true }))
+      .filter((entry) => entry.isFile() && /\.(js|cjs|ps1)$/i.test(entry.name))
+      .map((entry) => entry.name);
+  } catch {
+    return ["main.js", "preload.js"];
+  }
+}
+
 function watchTheShare() {
   if (hotTimer) return;
   let source;
@@ -1185,12 +1213,12 @@ function watchTheShare() {
     return;
   }
 
-  const tick = () => {
-    hotTimer = null;
+  const tick = async () => {
+    hotTimer = "busy";  /* [mirror-drop-hottick] a pass in flight still counts */
     let wait = HOT_EVERY_MS;
     try {
       const began = Date.now();
-      const now = hotScan(source);
+      const now = await hotScanAsync(source);  /* [mirror-drop-hotscan] */
       const changed = [];
       for (const [name, stamp] of now) {
         if (hotSeen.get(name) !== stamp) changed.push(name);
@@ -1207,10 +1235,10 @@ function watchTheShare() {
        * change to any of those was exactly as invisible as a main.js
        * change, with not even a line in the log to say a relaunch was
        * owed. Same rule as the tree stamp below: no hand-picked list. */
-      for (const name of hotSelfFiles(source)) {
+      for (const name of await hotSelfFilesAsync(source)) {  /* [mirror-drop-hotself] */
         try {
           const at = path.join(source, "..", name);
-          const info = fs.statSync(at);
+          const info = await fs.promises.stat(at);  /* [mirror-drop-hotstat] */
           const stamp = Math.round(info.mtimeMs) + ":" + info.size;
           const key = "^" + name;
           if (hotSelf.has(key) && hotSelf.get(key) !== stamp) hotSayRelaunch(name);

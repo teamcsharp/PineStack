@@ -750,10 +750,41 @@ ontop.addEventListener('click', async function () {
  * wondering why the tablet is frozen. */
 async function watch() {
   let wasLive = null;
+  /* [mirror-drop-veil] The cover means a reconnect is REALLY happening. A
+   * stream that is merely quiet - a still screen, a busy tablet holding a
+   * second or two of frames - keeps its last picture and says so in the
+   * strip. Measured before: 9 covers in 12 minutes, none of them a lost
+   * connection. A main process without the new fields keeps the old rule. */
+  let veiled = false;
+  let reconnected = false;
   for (;;) {
     try {
       const said = await api.mirrorHow();
-      if (said && said.ok) {
+      if (said && said.ok && typeof said.reconnecting === 'boolean') {
+        const shape = said.width + '×' + said.height;
+        const held = Math.round((said.sinceFrameMs || 0) / 1000);
+        how.textContent = said.live
+          ? shape + ' · ' + said.frames + ' frames'
+            + (said.restarts ? ' · ' + said.restarts + ' restarts' : '')
+          : said.frames > 0 && !said.reconnecting
+            ? (said.still ? 'still picture · the tablet screen has not changed for ' + held + ' s'
+              : 'waiting on the tablet · ' + held + ' s')
+            : (said.why || 'waiting for the tablet…');
+        if (!said.live && said.frames > 0 && said.reconnecting) {
+          cover('Reconnecting to the tablet… ' + (said.restartReason || ''), true);
+          veiled = true;
+          reconnected = true;
+        } else if (veiled || said.live) {
+          /* live clears any cover, as it always did (a first-load or an
+           * <img> error note); a quiet stream clears only our own. */
+          cover('');
+          veiled = false;
+        }
+        if (said.live && reconnected) {
+          reconnected = false;
+          bindStream(0);
+        }
+      } else if (said && said.ok) {
         const shape = said.width + '×' + said.height;
         how.textContent = said.live
           ? shape + ' · ' + said.frames + ' frames'
