@@ -31082,6 +31082,51 @@ def dialogue_quiet_for() -> float:
     return waited if waited >= DIALOGUE_FIRST_GRACE else -1.0
 
 
+def _lone_line_now(line_id: str, clip: dict[str, Any], started: float,
+                   body: Any = None) -> bool:
+    """[lone-line-now] A single-media line (a memo, a lone interject or advert,
+    a sting) is audibly playing: publish it as a one-row stream_now so the
+    Script view's ON AIR mark has a place. Never over a round's timeline that
+    is still sounding. True when published."""
+    if not line_id:
+        return False
+    now = time.time()
+    held = _STREAM_NOW.get("rows") or []
+    if held and _STREAM_NOW.get("lone") != line_id and now < (
+            float(_STREAM_NOW.get("at") or 0) + float(_STREAM_NOW.get("length") or 0)):
+        return False
+    row = next((r for r in reversed(_RADIO.get("chat") or [])
+                if str(r.get("id") or "") == line_id), None)
+    if not isinstance(row, dict):
+        return False
+    secs = 0.0
+    for got in ((clip or {}).get("seconds"), (clip or {}).get("duration"),
+                (body or {}).get("duration") if isinstance(body, dict) else None,
+                row.get("seconds")):
+        try:
+            secs = float(got or 0)
+        except (TypeError, ValueError):
+            secs = 0.0
+        if secs > 0:
+            break
+    if secs <= 0:
+        secs = max(2.0, len(str(row.get("text") or "")) / 14.0)
+    _stream_now_set([{"id": line_id, "from": 0.0, "until": secs,
+                      "text": str(row.get("text") or ""), "who": str(row.get("who") or ""),
+                      "name": str(row.get("name") or ""), "kind": str(row.get("kind") or ""),
+                      "voice": str(row.get("voice") or ""), "aired": "airing"}],
+                    secs, stamp=False)
+    _STREAM_NOW["at"] = float(started or now)
+    _STREAM_NOW["lone"] = line_id
+    return True
+
+
+def _lone_line_end(line_id: str) -> None:
+    """[lone-line-now] its player said ended: the place it held is given back."""
+    if line_id and _STREAM_NOW.get("lone") == line_id:
+        _stream_now_clear()
+
+
 def page_playback_ack(payload: Any, addr: str = "",
                       agent: str = "") -> dict[str, Any]:
     """Record one browser media event and promote only audible `playing`.
@@ -31173,6 +31218,11 @@ def page_playback_ack(payload: Any, addr: str = "",
                 _sting_heard(str(clip.get("line")), delivery_id, now - position)
             except Exception:  # noqa: BLE001
                 pass
+            if event == "playing":                       # [lone-line-now]
+                try:
+                    _lone_line_now(str(clip.get("line")), clip, now - position, body)
+                except Exception:  # noqa: BLE001
+                    pass
         if audible > 0 and progressed and delivery.get("speech"):
             try:
                 stream = clip.get("stream") or {}
@@ -31192,6 +31242,10 @@ def page_playback_ack(payload: Any, addr: str = "",
             if _acknowledge_delivery_lines(delivery_id, clip, position, interval):
                 talk_said_now(listener, delivery_id, audible)
     if event == "ended":
+        try:                                             # [lone-line-now]
+            _lone_line_end(str((delivery.get("clip") or {}).get("line") or ""))
+        except Exception:  # noqa: BLE001
+            pass
         delivery["state"] = ("playing" if any(
             p.get("event") == "playing" and now - float(p.get("at") or 0) < 6
             for p in listeners.values()) else "ended")
@@ -186968,7 +187022,8 @@ def _script_ledger_prune() -> None:
         floor = time.time() - SCRIPT_LEDGER_KEEP_S
         keep: list[str] = []
         rows: list[dict[str, Any]] = []
-        for line in SCRIPT_LEDGER_PATH.read_text().splitlines():
+        _lines = [x for x in SCRIPT_LEDGER_PATH.read_text().splitlines() if x.strip()]  # [ledger-prune-atomic]
+        for line in _lines:
             try:
                 row = json.loads(line)
                 if float(row.get("at") or 0) >= floor:
@@ -186976,7 +187031,12 @@ def _script_ledger_prune() -> None:
                     rows.append(row)
             except Exception:  # noqa: BLE001
                 continue
-        SCRIPT_LEDGER_PATH.write_text("\n".join(keep) + "\n")
+        # [ledger-prune-atomic] nothing to drop is nothing to rewrite; a real prune
+        # replaces the file whole, so no reader ever sees it truncated mid-write
+        if len(keep) < len(_lines):
+            _tmp = SCRIPT_LEDGER_PATH.with_name(SCRIPT_LEDGER_PATH.name + ".prune.tmp")
+            _tmp.write_text("\n".join(keep) + "\n")
+            os.replace(_tmp, SCRIPT_LEDGER_PATH)
         rows.sort(key=lambda r: (int(r.get("block") or 0),
                                  int(r.get("ord") or 0)))
         _SCRIPT_LEDGER_MEMO.update({"at": time.time(), "rows": rows})
@@ -188019,6 +188079,24 @@ def screenplay_scene_slot(rnd: Any, round_kind: str, at: float,
         return {"slot": {"none": True,
                          "why": "no entry on the running order runs this road"}}
     return {}
+
+
+def screenplay_scene_aired_in(got: dict[str, Any], at: float) -> dict[str, Any]:
+    """[seg-aired-in] A heading's slot plus the entry that owned the air at its
+    moment, when that is another entry: {"slot": {..., "aired_in": {label, id}}}.
+    The written-for name is the round's own link and stays; this is where it
+    WENT OUT, from the station's own schedule position. Never raises."""
+    try:
+        slot = got.get("slot") if isinstance(got, dict) else None
+        if not isinstance(slot, dict) or not slot or not float(at or 0):
+            return got
+        seg = segment_on_air(float(at))
+        sid = str((seg or {}).get("id") or "")
+        if not sid or not (seg or {}).get("label") or sid == str(slot.get("id") or ""):
+            return got
+        return {"slot": dict(slot, aired_in={"label": str(seg.get("label") or "")[:80], "id": sid})}
+    except Exception:  # noqa: BLE001
+        return got
 
 
 def screenplay_round_open(entry: dict[str, Any]) -> dict[str, Any]:
@@ -189620,8 +189698,9 @@ def screenplay_compose(since: float, until: float, d: dict[str, Any],
             push("scene", slug,
                  f"sc-{_scene_key}", at=at,
                  round=round_kind, seg=seg_now[0],
-                 **screenplay_scene_slot(rnd, round_kind, at,        # [seg-names]
-                                         d.get("open_round")))
+                 **screenplay_scene_aired_in(                          # [seg-aired-in]
+                     screenplay_scene_slot(rnd, round_kind, at,        # [seg-names]
+                                           d.get("open_round")), at))
             push("subheader", label.upper(),
                  f"sh-{_scene_key}", at=at,
                  round=round_kind, seg=seg_now[0])

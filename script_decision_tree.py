@@ -399,6 +399,47 @@ def aired_lookup(origin_path: Path, line_ids: list[str]) -> dict[str, dict[str, 
     return out
 
 
+def heard_where(origin_path: Path, cids: list[str]) -> dict[str, tuple[float, float]]:
+    """[tree-heard] conversation -> (first, last) moment a line of it was HEARD,
+    from the origin ledger. Read only; {} when absent or the columns are not there."""
+    ids = [str(x) for x in dict.fromkeys(cids or []) if x]
+    if not ids or not Path(origin_path).is_file():
+        return {}
+    out: dict[str, tuple[float, float]] = {}
+    db = sqlite3.connect("file:" + Path(origin_path).as_posix() + "?mode=ro", uri=True, timeout=5.0)
+    try:
+        for i in range(0, len(ids), 400):
+            chunk = ids[i:i + 400]
+            for cid, lo, hi in db.execute("SELECT conversation_id, MIN(air_at), MAX(air_at) FROM origin "
+                                          "WHERE conversation_id IN (%s) GROUP BY conversation_id"
+                                          % ",".join("?" * len(chunk)), chunk):
+                if lo is not None:
+                    out[str(cid)] = (float(lo), float(hi))
+    except sqlite3.Error:
+        return {}
+    finally:
+        db.close()
+    return out
+
+
+def heard_in(origin_path: Path, start: float, ends: float) -> list[tuple[str, float, int]]:
+    """[tree-heard] (conversation, first hearing, first block) of every conversation
+    a line of which was HEARD in [start, ends), in the script's order. Read only."""
+    if not (start and ends and ends > start) or not Path(origin_path).is_file():
+        return []
+    db = sqlite3.connect("file:" + Path(origin_path).as_posix() + "?mode=ro", uri=True, timeout=5.0)
+    try:
+        rows = db.execute("SELECT conversation_id, MIN(air_at), MIN(block) FROM origin WHERE air_at>=? AND "
+                          "air_at<? AND conversation_id IS NOT NULL AND conversation_id!='' "
+                          "GROUP BY conversation_id ORDER BY MIN(block), MIN(air_at)",
+                          (float(start), float(ends))).fetchall()
+    except sqlite3.Error:
+        return []
+    finally:
+        db.close()
+    return [(str(c), float(a or 0), int(b or 0)) for c, a, b in rows]
+
+
 def collect(store: Any, seg_id: str, entry: dict[str, Any] | None, origin_path: Path,
             now: float | None = None) -> dict[str, Any]:
     """Reader-thread work: find the segment's rounds, load them, build the tree."""
@@ -412,6 +453,34 @@ def collect(store: Any, seg_id: str, entry: dict[str, Any] | None, origin_path: 
             seen.add(cid)
             picked.append((cid, {"source": "aired", "first_block": mine.get("first_block"),
                                  "blocks": mine.get("blocks") or []}))
+    # [tree-heard] WENT OUT IN = HEARD IN. The register files a block under the
+    # segment on air when it was WRITTEN, a median 51-85 s before it sounds; 30% of
+    # heard lines (09-29) went out in the next entry. The entry's window decides.
+    body_seg = (rec or {}).get("segment") if isinstance((rec or {}).get("segment"), dict) else {}
+    try:
+        w0 = float((entry or {}).get("start") or body_seg.get("start") or 0)
+        w1 = float((entry or {}).get("deadline") or body_seg.get("ends") or 0)
+    except (TypeError, ValueError):
+        w0 = w1 = 0.0
+    went_elsewhere: list[dict[str, Any]] = []
+    if w0 and w1 > w0:
+        spans = heard_where(origin_path, [cid for cid, _h in picked])
+        keep = []
+        for cid, how in picked:
+            sp = spans.get(cid)
+            if sp and not (sp[0] < w1 and sp[1] >= w0):
+                went_elsewhere.append({"conversation_id": cid, "heard_from": sp[0], "heard_until": sp[1],
+                                       "why": "written while this entry was on air; it went out %s it"
+                                              % ("after" if sp[0] >= w1 else "before")})
+                continue
+            keep.append((cid, how))
+        picked = keep
+        for cid, first_at, first_block in heard_in(origin_path, w0, w1):
+            if cid not in seen:
+                seen.add(cid)
+                picked.append((cid, {"source": "aired", "first_block": first_block, "blocks": [],
+                                     "filed_elsewhere": True, "first_heard": first_at}))
+        picked.sort(key=lambda p: (p[1].get("first_block") or 0))
     scripts = scripts_of(entry)
     unmatched = []
     if scripts:
@@ -479,7 +548,9 @@ def collect(store: Any, seg_id: str, entry: dict[str, Any] | None, origin_path: 
         rounds.append(r)
     return {"rounds": rounds, "unmatched": unmatched, "registered": bool(rec),
             "segment": (rec or {}).get("segment") if rec else None,
-            "more": max(0, len(picked) - MAX_ROUNDS)}
+            "more": max(0, len(picked) - MAX_ROUNDS),
+            "went_elsewhere": went_elsewhere,  # [tree-heard]
+            "window": [w0, w1] if w0 and w1 > w0 else None}
 
 
 def entry_brief(entry: dict[str, Any] | None) -> dict[str, Any] | None:

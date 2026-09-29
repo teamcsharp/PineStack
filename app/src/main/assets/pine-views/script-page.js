@@ -16817,6 +16817,12 @@
     }
     node.dataset.slot = slot.label ? String(slot.entry || slot.id || '') : (slot.none ? 'none' : '');
     words.appendChild(title);
+    if (slot.aired_in && slot.aired_in.label) {                 /* [seg-aired-in] */
+      var airedIn = make('small', 'sp-segment-airedin', 'went out in ' + slot.aired_in.label);
+      airedIn.title = 'The running order had ' + slot.aired_in.label + ' on air when this was heard';
+      airedIn.style.cssText = 'display:block;opacity:.8;font-style:italic';
+      words.appendChild(airedIn);
+    }
     words.appendChild(make('small', 'sp-segment-place',
       slot.label ? road + ' \u00b7 Pine Box FM' : 'Pine Box FM / The Booth'));
     node.appendChild(words);
@@ -19465,6 +19471,9 @@
       box.appendChild(det);
     }
     (r.notes || []).forEach(function (t) { box.appendChild(make('div', 'rtree-note', String(t))); });
+    if (r.filed_elsewhere) {                                   /* [tree-heard] */
+      box.appendChild(make('div', 'rtree-note', 'Written while an earlier entry was on air; it went out in this one.'));
+    }
     if (r.gone) return box;
     var chain = make('div', 'rtree-chain' + ((r.recorded || {}).graph ? '' : ' rtree-flat'));
     var cycle = null;
@@ -19488,6 +19497,14 @@
         : 'Nothing of this segment has reached System 3 yet: no round was planned or written for it.'));
     }
     rounds.forEach(function (r, i) { body.appendChild(rtreeRound(r, i + 1)); });
+    /* [tree-heard] rounds written while this entry was on air that went out in
+       another one: named, so the tree accounts for every round it touched */
+    (data.went_elsewhere || []).forEach(function (w) {
+      var when = Number(w.heard_from) ? new Date(Number(w.heard_from) * 1000)
+        .toLocaleTimeString([], {hour: 'numeric', minute: '2-digit'}) : '';
+      body.appendChild(make('div', 'rtree-note', 'Round ' + String(w.conversation_id || '').slice(0, 8)
+        + ': ' + String(w.why || 'it went out in another entry') + (when ? ' (heard ' + when + ')' : '') + '.'));
+    });
     (data.unmatched || []).forEach(function (u) {
       body.appendChild(make('div', 'rtree-note', 'Script ' + (u.candidate || '') + ' (' + (u.source || '')
         + '): ' + (u.why || 'no roll found') + ' - its rolls are not recorded.'));
@@ -20343,7 +20360,8 @@
     function isLineId(id) { return LINE_ID.test(String(id || '')); }
 
     /* Every name a row answers to, folded to identities. */
-    var NAMED = ['clip_media', 'media', 'sfx', 'url', 'clip', 'audio_url', 'clip_url'];
+    var NAMED = ['clip_media', 'media', 'sfx', 'url', 'clip', 'audio_url', 'clip_url',
+      'ad_audio'];                                  /* [ad-audio-named] an advert's own file */
     function identities(row) {
       var out = [];
       if (!row || typeof row !== 'object') return out;
