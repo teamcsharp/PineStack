@@ -152,6 +152,7 @@
     /* The Pine Cam on a native surface, same contract shape: a build
        without it answers {ok:false,on:false} and the page keeps its poll. */
     pineCam: promised("pineCam"),
+    pineStream: promised("pineStream"),   // [pinestream] run | stop | state
     /* #1427: the rolling screen recorder's switch. */
     replayRun: promised("replayRun"),
 

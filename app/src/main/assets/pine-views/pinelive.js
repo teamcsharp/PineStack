@@ -50,8 +50,8 @@
   var PANELS_KEY = 'pineLive.panels.v1';
   var PREFS_KEY = 'pineLive.prefs.v1';
   var S3_DEFAULT_V = '8';
-  var PANEL_ORDER = ['scope', 'event', 'input', 'picture', 'recording', 'system3', 'troubleshoot'];
-  var DEFAULT_OPEN = {scope: true, event: true, input: false, picture: false,
+  var PANEL_ORDER = ['scope', 'event', 'input', 'picture', 'stream', 'recording', 'system3', 'troubleshoot'];   /* [pinestream] */
+  var DEFAULT_OPEN = {scope: true, event: true, input: false, picture: false, stream: false,
     recording: false, system3: false, troubleshoot: false};
   var DEFAULT_DEST = '\\\\10.89.1.125\\QuickSwap\\PineBoxRecordings\\Live Events';
   var CUT_PRESETS = [[60, '1 min'], [120, '2 min'], [210, '3.5 min'], [300, '5 min'], [600, '10 min']];
@@ -788,6 +788,101 @@
     paint();
   }
 
+  /* ================================================== [pinestream] PineStream */
+  /* "add a section here for enabling a pip stream of the pinetab / pineapp to
+   *  be streamed to the stream page. I want users able to enable and disable
+   *  it at will like the pinecam and call it pinestream."
+   * The switch is settings.stream_on on the same road as PineCam to live
+   * (/api/pinelive/settings, remembered by the station); the screen is
+   * settings.stream_source. Off by default, and while it is off nothing is
+   * captured or served anywhere (pinestream.py). One model value paints the
+   * header's switch and the panel's twin; one function flips both. */
+  var STREAM_SOURCES = [
+    {value: 'pinetab', label: 'PineTab', icon: 'c:screen', title: 'PineStream shows the PineTab\'s screen'},
+    {value: 'pineapp', label: 'Pine app', icon: 'c:laptop', title: 'PineStream shows the Pine app\'s window on the desk'}
+  ];
+
+  function streamBlock() { return (model.state && model.state.stream) || {}; }
+
+  function streamOn() {
+    var s = model.settings || {};
+    return s.stream_on !== undefined ? !!s.stream_on : !!streamBlock().on;
+  }
+
+  function streamSource() {
+    var s = model.settings || {};
+    var v = s.stream_source || streamBlock().source || 'pinetab';
+    return v === 'pineapp' ? 'pineapp' : 'pinetab';
+  }
+
+  function streamSourceName(v) { return (v || streamSource()) === 'pineapp' ? 'the Pine app' : 'the PineTab'; }
+
+  /* immediate, like PineCam to live: both twins move now, the station stops
+   * serving now, and the answer's state puts them right if it refused */
+  function flipStream(next, node) {
+    if (!model.settings) model.settings = {};
+    model.settings.stream_on = next;
+    if (model.state && model.state.stream) model.state.stream.on = next;
+    paint();
+    return act('/api/pinelive/settings', {stream_on: next}, node);
+  }
+
+  function pickStreamSource(v) {
+    if (v !== 'pinetab' && v !== 'pineapp') return;
+    saveSetting('stream_source', v);
+    paint();
+  }
+
+  /* two small icon buttons under one another, the header's height */
+  function streamSourcePicker(parent) {
+    var box = make('div', 'pl-hsw-src');
+    box.setAttribute('role', 'radiogroup');
+    box.setAttribute('aria-label', 'Which screen PineStream shows');
+    var buttons = STREAM_SOURCES.map(function (o) {
+      var b = make('button');
+      b.type = 'button';
+      b.setAttribute('role', 'radio');
+      b.setAttribute('aria-checked', 'false');
+      b.title = o.title;
+      b.setAttribute('aria-label', o.title);
+      b.appendChild(iconNode(o.icon));
+      b.__value = o.value;
+      b.addEventListener('click', function (e) { e.stopPropagation(); pickStreamSource(o.value); });
+      box.appendChild(b);
+      return b;
+    });
+    parent.appendChild(box);
+    return {root: box, buttons: buttons, set: function (v) {
+      buttons.forEach(function (b) {
+        var on = b.__value === v ? 'true' : 'false';
+        if (b.getAttribute('aria-checked') !== on) b.setAttribute('aria-checked', on);
+      });
+    }};
+  }
+
+  function paintStreamSwitch(h) {
+    if (!h || !h.stream) return;
+    var on = streamOn();
+    var src = streamSource();
+    h.stream.set(on);
+    var live = on ? 'true' : 'false';
+    if (h.stream.root.getAttribute('data-live') !== live) h.stream.root.setAttribute('data-live', live);
+    setText(h.stream.label, on ? 'PineStream · LIVE' : 'PineStream');
+    h.stream.root.title = on
+      ? 'PineStream is LIVE to listeners: they see ' + streamSourceName(src) + ' in a corner of the stream page. Tap to stop it at once - nothing is captured or served while it is off.'
+      : 'PineStream is OFF: nothing is captured or served. Tap to show ' + streamSourceName(src) + ' to listeners as a picture-in-picture on the stream page.';
+    if (h.streamSrc) {
+      h.streamSrc.set(src);
+      h.streamSrc.buttons.forEach(function (b) { b.disabled = !model.state; });
+    }
+    var p = ui.panels && ui.panels.stream;
+    if (p && p.chip) {
+      setText(p.chip, on ? 'LIVE to listeners' : '');
+      setClass(p.chip, 'pl-chip-live', on);
+      setHidden(p.chip, !on);
+    }
+  }
+
   function headSwitch(parent, cls, labelText, onFlip) {
     var b = make('button', 'pl-hsw ' + cls);
     b.type = 'button';
@@ -837,7 +932,9 @@
     h.album.root.title = album
       ? 'Album recording is ON: the set is written as tracks (split on 10 s of silence), MP3, a folder per set in Live Events. Remembered for the next set.'
       : 'Album recording is OFF: the set still airs and takes the music, nothing is written. Remembered for the next set.';
-    [h.cam, h.live, h.album].forEach(function (x) {
+    try { paintStreamSwitch(h); }                                   /* [pinestream] */
+    catch (err) { if (root.console) root.console.error('[pinelive] PineStream switch paint failed:', err); }
+    [h.cam, h.stream, h.live, h.album].forEach(function (x) {
       if (!x.root.classList.contains('busy')) x.root.disabled = !st;
     });
     /* the detection box keeps the middle while the row leaves it room */
@@ -1187,6 +1284,9 @@
     var hswRow = make('div', 'pl-hsw-row');
     ui.hsw = {row: hswRow,
       cam: headSwitch(hswRow, 'pl-hsw-cam', 'PineCam to live', function (next, node) { flipTailscale(next, node); }),
+      /* [pinestream] beside PineCam to live: the switch, then which screen */
+      stream: headSwitch(hswRow, 'pl-hsw-stream', 'PineStream', function (next, node) { flipStream(next, node); }),
+      streamSrc: streamSourcePicker(hswRow),
       live: headSwitch(hswRow, 'pl-hsw-live', 'Pine Live', function (next, node) { flipSet(next, node); }),
       album: headSwitch(hswRow, 'pl-hsw-album', 'Album recording', function (next) { flipAlbum(next); })};
     head.appendChild(hswRow);
@@ -1467,6 +1567,7 @@
     event: {title: 'Event', icon: 'c:microphone--filled', build: buildEvent, paint: paintEvent, summary: summaryEvent},
     input: {title: 'Input', icon: 'c:plug', build: buildInput, paint: paintInput, summary: summaryInput},
     picture: {title: 'Picture', icon: 'c:image', build: buildPicture, paint: paintPicture, summary: summaryPicture},
+    stream: {title: 'PineStream', icon: 'c:screen', build: buildStream, paint: paintStream, summary: summaryStream},   /* [pinestream] */
     recording: {title: 'Recording', icon: 'c:recording--filled', build: buildRecording, paint: paintRecording, summary: summaryRecording},
     system3: {title: 'System 3', icon: 'c:chat', build: buildSystem3, paint: paintSystem3, summary: summarySystem3},
     troubleshoot: {title: 'Troubleshoot', icon: 'c:stethoscope', build: buildTrouble, paint: paintTrouble, summary: summaryTrouble}
@@ -2326,6 +2427,7 @@
    * and a trickle of frames, so it only runs while the Picture panel is
    * open in a visible popup. */
   function syncPreview() {
+    try { syncStreamPreview(); } catch (err) { /* [pinestream] never breaks the art preview */ }
     var img = ui.previewImg;
     if (!img) return;
     var st = model.state || {};
@@ -2335,6 +2437,152 @@
       img.__src = '';
       /* [vcrfx: the last frame stays through the collapse] */
       setTimeout(function () { if (!img.__src) img.removeAttribute('src'); },
+        root.PineVcr ? root.PineVcr.OUT_MS + 80 : 0);
+    }
+  }
+
+  /* ------------------------------------------------------------ [pinestream] stream */
+
+  var STREAM_FPS = [[1, '1'], [2, '2'], [3, '3'], [5, '5']];
+  var STREAM_WIDTH = [[480, '480'], [640, '640'], [800, '800']];
+  var STREAM_QUALITY = [[45, 'Low'], [60, 'Medium'], [75, 'High']];
+
+  function buildStream(p) {
+    var b = p.body;
+    var live = make('div', 'pl-stream-live');
+    live.setAttribute('role', 'status');
+    live.appendChild(iconNode('c:circle--filled'));
+    live.appendChild(make('b', '', 'LIVE to listeners'));
+    var liveWords = make('span', '', '');
+    live.appendChild(liveWords);
+    live.hidden = true;
+    b.appendChild(live);
+
+    var sw = toggle('Stream to listeners', 'A small picture-in-picture on the stream page, for tailnet and public links. Off: nothing is captured or served. Each listener can hide it on their own page.', function (next, node) {
+      sw.set(next);                    /* one owner with the header's PineStream */
+      flipStream(next, node);
+    });
+    b.appendChild(sw.root);
+
+    var srcRow = make('div', 'pl-row');
+    var srcText = make('div', 'pl-row-text');
+    srcText.appendChild(make('b', '', 'Source'));
+    var srcCap = make('small', '', '');
+    srcText.appendChild(srcCap);
+    srcRow.appendChild(srcText);
+    var src = segmented(STREAM_SOURCES.map(function (o) { return {value: o.value, label: o.label, title: o.title}; }),
+      function (v) { pickStreamSource(v); }, 'Which screen PineStream shows');
+    srcRow.appendChild(src.root);
+    b.appendChild(srcRow);
+
+    function pickRow(label, caption, opts, key, aria) {
+      var row = make('div', 'pl-row');
+      var text = make('div', 'pl-row-text');
+      text.appendChild(make('b', '', label));
+      text.appendChild(make('small', '', caption));
+      row.appendChild(text);
+      var seg = segmented(opts.map(function (o) { return {value: o[0], label: o[1]}; }),
+        function (v) { saveSetting(key, v); paint(); }, aria);
+      row.appendChild(seg.root);
+      b.appendChild(row);
+      return seg;
+    }
+    var fps = pickRow('Frames a second', 'Pictures of a screen, not video: two is plenty. Car and Funnel listeners get one every two seconds or slower.',
+      STREAM_FPS, 'stream_fps', 'PineStream frames a second');
+    var width = pickRow('Width', 'Pixels across, as the screen sends them.', STREAM_WIDTH, 'stream_width', 'PineStream picture width');
+    var quality = pickRow('Quality', 'JPEG quality: higher is sharper and heavier on a phone.', STREAM_QUALITY, 'stream_quality', 'PineStream picture quality');
+
+    var grid = make('div', 'pl-facts');
+    var facts = {picture: fact(grid, 'Listeners see'), frame: fact(grid, 'Last frame'),
+      size: fact(grid, 'Picture'), watching: fact(grid, 'Watching')};
+    b.appendChild(grid);
+
+    var prev = make('figure', 'pl-preview pl-stream-prev');
+    var img = make('img');
+    img.alt = 'What listeners see in the PineStream window';
+    prev.appendChild(img);
+    var cap = make('figcaption', '', '');
+    prev.appendChild(cap);
+    prev.hidden = true;
+    b.appendChild(prev);
+    b.appendChild(make('p', 'pl-muted', 'While it streams, the streamed screen carries a red LIVE badge with a stop button. A key field on that screen veils the picture (listeners read "private screen") until it is gone.'));
+    p.parts = {live: live, liveWords: liveWords, sw: sw, src: src, srcCap: srcCap, fps: fps, width: width,
+      quality: quality, facts: facts, prev: prev, img: img, cap: cap};
+    ui.streamPrev = img;
+  }
+
+  function streamPictureWords(ps, on) {
+    if (!on) return 'nothing (switched off)';
+    var name = streamSourceName(ps.source);
+    var pic = String(ps.picture || 'waiting');
+    if (pic === 'live') return name + ', live';
+    if (pic === 'private') return 'a veil: private screen' + (ps.why ? ' (' + ps.why + ')' : '');
+    return 'a veil: waiting for ' + name;
+  }
+
+  function paintStream(p) {
+    var on = streamOn();
+    var s = model.settings || {};
+    var ps = streamBlock();
+    var src = streamSource();
+    p.parts.sw.set(on);
+    p.parts.sw.sw.disabled = !model.state;
+    p.parts.src.set(src);
+    setText(p.parts.srcCap, src === 'pineapp'
+      ? 'the Pine app\'s window on the desk (the app captures itself while it is open)'
+      : 'the PineTab\'s screen (the tablet captures itself - no prompt)');
+    p.parts.fps.set(Number(s.stream_fps || ps.fps || 2));
+    p.parts.width.set(Number(s.stream_width || ps.width || 640));
+    p.parts.quality.set(Number(s.stream_quality || ps.quality || 60));
+    setHidden(p.parts.live, !on);
+    var watching = num(ps.watching);
+    setText(p.parts.liveWords, on ? ' · ' + streamSourceName(src) + (isFinite(watching) ? ' · ' + watching + ' watching' : '') : '');
+    var f = p.parts.facts;
+    setText(f.picture, streamPictureWords(ps, on));
+    setText(f.frame, on && isFinite(num(ps.frame_age)) ? fmtAgo(ps.frame_age) + (ps.agent ? ' · ' + ps.agent : '') : '--');
+    var sz = Array.isArray(ps.size) && ps.size[0] ? ps.size[0] + '×' + ps.size[1] + (ps.kb ? ' · ' + ps.kb + ' kB' : '') : '--';
+    setText(f.size, on ? sz : '--');
+    setText(f.watching, on && isFinite(watching) ? String(watching) : '--');
+    var showPrev = on && !!ps.preview && ps.picture === 'live';
+    vcrHidden(p.parts.prev, !showPrev);
+    setText(p.parts.cap, showPrev ? 'What listeners see now (once a second while this panel is open)' : '');
+    syncStreamPreview();
+  }
+
+  function summaryStream() {
+    if (!model.state && !model.settings) return '';
+    if (!streamOn()) return 'off';
+    var s = model.settings || {};
+    return (streamSource() === 'pineapp' ? 'Pine app' : 'PineTab') + ' · ' + (s.stream_fps || streamBlock().fps || 2) + ' fps · LIVE';
+  }
+
+  /* The preview is the JPEG the listeners get, asked for once a second
+   * (signed, so the desk's file: page needs no header) - and only while the
+   * PineStream panel is open in a visible popup and the stream is live. */
+  function streamPreviewUrl() {
+    var ps = streamBlock();
+    return ui.visible && ui.open.stream && streamOn() && ps.preview && ps.picture === 'live' ? stationUrl(ps.preview) : '';
+  }
+
+  function syncStreamPreview() {
+    var img = ui.streamPrev;
+    if (!img) return;
+    if (streamPreviewUrl()) {
+      if (ui.streamPrevTimer) return;
+      var tick = function () {
+        ui.streamPrevTimer = 0;
+        var url = streamPreviewUrl();
+        if (!url) return;
+        img.src = url + (url.indexOf('?') >= 0 ? '&' : '?') + '_=' + Date.now();
+        ui.streamPrevTimer = root.setTimeout(tick, 1000);
+      };
+      tick();
+      return;
+    }
+    if (ui.streamPrevTimer) { root.clearTimeout(ui.streamPrevTimer); ui.streamPrevTimer = 0; }
+    if (img.getAttribute('src') && !streamOn()) {
+      /* the last frame stays through the collapse, then goes */
+      root.setTimeout(function () { if (!streamPreviewUrl()) img.removeAttribute('src'); },
         root.PineVcr ? root.PineVcr.OUT_MS + 80 : 0);
     }
   }

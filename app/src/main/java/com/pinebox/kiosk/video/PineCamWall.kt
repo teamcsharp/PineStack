@@ -72,6 +72,12 @@ class PineCamWall(context: Context) : FrameLayout(context) {
      * under this app's own chrome. */
     private val screen = SurfaceView(context).apply { setZOrderMediaOverlay(true) }
 
+    /* [cambattery] the camera's battery in the picture's top-left: a
+     * z-on-top surface, the one layer above a media overlay. The page
+     * sends the reading (bridge verb `battery`); this is its child so it
+     * leaves with the picture. See CamBatteryBadge. */
+    private val badge = CamBatteryBadge(context)
+
     private var player: ExoPlayer? = null
     private val running = AtomicBoolean(false)
     @Volatile private var url: String = ""
@@ -129,6 +135,7 @@ class PineCamWall(context: Context) : FrameLayout(context) {
 
     init {
         addView(screen, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT))
+        addView(badge, LayoutParams(1, 1, Gravity.TOP or Gravity.START))   // [cambattery]
         /* The activity observes taps before dispatch. The wall itself must
          * never own input - see PineVideoWall for why. */
         isClickable = false
@@ -378,6 +385,9 @@ class PineCamWall(context: Context) : FrameLayout(context) {
     }
 
     fun free() = menu(false)
+
+    /** [cambattery] {on, text, bars, tone, pulse, stale, charging} from the page. */
+    fun battery(o: JSONObject) { onMain { badge.show(o) } }
 
     private fun refreshVisibility() {
         visibility = if (running.get() && !hidden && !menuHidden) View.VISIBLE else View.GONE

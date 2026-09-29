@@ -121,6 +121,8 @@ class PineDesktopBridge(
             /* The Pine Cam, played natively off the host's live TS - see
              * video/PineCamWall.kt. */
             "pineCam",
+            /* [pinestream] this screen on the listeners' page - replay/PineStreamPush.kt */
+            "pineStream",
             /* #1148: "Whenever I access the screen capture to follow
              * report, I also want to be able to scrub between the last
              * five seconds of the broadcast to find the right frame." */
@@ -1451,6 +1453,7 @@ class PineDesktopBridge(
                     "vcr" -> cam.vcrReplay()                                    // [vcrfx]
                     "menu" -> cam.menu(arg?.optBoolean("on", true) ?: true)
                     "free" -> cam.free()
+                    "battery" -> cam.battery(arg ?: JSONObject())         // [cambattery]
                     "full" -> cam.showFullScreen()
                     "window" -> cam.showWindowed()
                     "state" -> Unit
@@ -1463,6 +1466,23 @@ class PineDesktopBridge(
                     BridgeEnvelope.ok(id, cam.state().put("ok", true).toString())
                 }
             }
+        }
+
+        /* [pinestream] run (every few seconds, and the dead man's handle), stop,
+         * state. The answer is always the pusher's own state. */
+        "pineStream" -> {
+            val push = pineStreamPush
+            val opts = args.optJSONObject(1)
+            val known = when (args.optString(0, "state")) {
+                "run" -> { push.run(opts); true }
+                "stop" -> {
+                    push.stop(opts?.optString("why", "").orEmpty().ifBlank { "the page said stop" })
+                    true
+                }
+                "state" -> true
+                else -> false
+            }
+            BridgeEnvelope.ok(id, push.state().put("ok", known).toString())
         }
 
         "hotCorners" -> BridgeEnvelope.ok(id, HotCorners.read(configStore).toString())
@@ -1631,6 +1651,12 @@ class PineDesktopBridge(
     /* THE PINE CAM, on its own native surface, for the same reason. Installed
      * by MainActivity beside the wall; null on a build with no root view. */
     @Volatile var pineCam: com.pinebox.kiosk.video.PineCamWall? = null
+
+    /* [pinestream] PineStream's pusher: this screen, to the station, only while
+     * the page keeps saying run and the station keeps answering keep. */
+    private val pineStreamPush by lazy {
+        com.pinebox.kiosk.replay.PineStreamPush(context, client, scope)
+    }
 
     /**
      * WHERE THE CAMERA'S STREAM IS: the HOST of the station base the

@@ -53,6 +53,7 @@ object ViewAssets {
         "pinelive-scope.js",
         "pinelive-guide.js",
         "pinelive.js",
+        "pinestream.js",          // [pinestream] this screen on the listeners' page (reads PineLive's switch)
         // Voice Actor: the person badge beside that mic, and the
         // cast subpanel behind it - same bar, same mount pattern.
         "voice-actor.js",
