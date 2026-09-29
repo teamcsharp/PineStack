@@ -820,6 +820,9 @@
   /* immediate, like PineCam to live: both twins move now, the station stops
    * serving now, and the answer's state puts them right if it refused */
   function flipStream(next, node) {
+    /* [pinestream-choose] ON asks which screen first: nothing streams without a choice */
+    if (next) { openChooser(node); return Promise.resolve({ok: true, say: ''}); }
+    closeChooser();
     if (!model.settings) model.settings = {};
     model.settings.stream_on = next;
     if (model.state && model.state.stream) model.state.stream.on = next;
@@ -871,16 +874,210 @@
     h.stream.root.title = on
       ? 'PineStream is LIVE to listeners: they see ' + streamSourceName(src) + ' in a corner of the stream page. Tap to stop it at once - nothing is captured or served while it is off.'
       : 'PineStream is OFF: nothing is captured or served. Tap to show ' + streamSourceName(src) + ' to listeners as a picture-in-picture on the stream page.';
-    if (h.streamSrc) {
-      h.streamSrc.set(src);
-      h.streamSrc.buttons.forEach(function (b) { b.disabled = !model.state; });
-    }
+    if (h.streamSrc) paintStreamPicker(h.streamSrc, src, on);   /* [pinestream-choose] inert while off */
     var p = ui.panels && ui.panels.stream;
     if (p && p.chip) {
       setText(p.chip, on ? 'LIVE to listeners' : '');
       setClass(p.chip, 'pl-chip-live', on);
       setHidden(p.chip, !on);
     }
+  }
+
+  /* ================================================== [camgrey] PineCam to live, offline */
+  /* "grey this out if the camera's offline." The reading is the one this
+   * popup already polls: /api/pinelive/state's picture block carries the
+   * station's own pinelink_state() - cam_live (state "live" AND fresh, the
+   * rule the Pine Cam box uses), cam_state, cam_why and how long ago it was
+   * last live. No new poll. Greyed is not disabled: a flip still records the
+   * preference and takes effect the moment the camera is back. Unknown (no
+   * state yet) is never greyed on a guess. */
+  var CAM_STATE_WORDS = {
+    'no-link': 'the camera\'s Wi-Fi isn\'t on the air',
+    'never-run': 'the camera link has never run on this station',
+    'linked': 'the camera is joined but no picture is arriving',
+    'joining': 'the camera link is still joining'
+  };
+
+  function camLink() {
+    var pic = (model.state && model.state.picture) || null;
+    if (!pic || pic.cam_live === undefined) return null;
+    return {live: !!pic.cam_live, state: String(pic.cam_state || ''), why: String(pic.cam_why || ''),
+      seenAgo: pic.cam_seen_ago == null ? NaN : num(pic.cam_seen_ago)};
+  }
+
+  function camOfflineWords(c) {
+    var why = c.why || CAM_STATE_WORDS[c.state]
+      || (c.state === 'live' ? 'its last picture is stale' : c.state ? 'the link says "' + c.state + '"' : 'the link is not live');
+    return 'Pine Cam is offline - ' + why + (isFinite(c.seenAgo) ? ' (last seen ' + fmtAgo(c.seenAgo) + ')' : '')
+      + '. The switch is kept and takes effect when it reconnects.';
+  }
+
+  /* grey `node` (and title `tipNode`) while the camera is not live; `base`
+   * is the title it carries when the camera is fine */
+  function paintCamGrey(node, tipNode, base) {
+    if (!node) return;
+    var c = camLink();
+    var off = !!(c && !c.live);
+    setClass(node, 'pl-cam-offline', off);
+    var tip = off ? camOfflineWords(c) + (base ? '\n' + base : '') : (base || '');
+    [node, tipNode].forEach(function (n) {
+      if (n && n.title !== tip) n.title = tip;
+    });
+  }
+
+  /* ================================================== [pinestream-choose] which screen */
+  /* "grayed out and inert if the pine stream is off. But I do want to be
+   * able to select which one I'm streaming whenever I enable the pine
+   * stream." Off: both source buttons are inert, the last-used one marked
+   * faintly. On: a small chooser anchored to the switch - two big buttons,
+   * the last-used preselected and focused; a tap starts streaming that
+   * screen. Its X, Escape, BACK or a tap beside it cancel, and PineStream
+   * stays OFF: nothing streams without a choice, and nothing auto-starts.
+   * No thumbnails: a picture of a screen that is not streaming would mean
+   * capturing it while the switch is off. */
+  var STREAM_OFF_TIP = 'PineStream is off - turn it on to choose a screen';
+
+  function streamHere() {
+    try { var s = root.PineStream && root.PineStream.state(); if (s && s.surface) return s.surface; } catch (err) { /* no agent */ }
+    return httpPage() ? 'pinetab' : 'pineapp';
+  }
+
+  function chooserLabel(v) {
+    var here = streamHere() === v;
+    if (v === 'pineapp') return here ? 'Pine app (this desk)' : 'Pine app (the desk)';
+    return here ? 'PineTab (this tablet)' : 'PineTab';
+  }
+
+  /** {ok, why} for a screen, from the station's check-ins (pinestream.js
+   *  says it is there every few seconds; a missing or asleep one says so). */
+  function streamSourceReady(v) {
+    var src = (streamBlock().sources || {})[v];
+    if (!src) return {ok: true, why: ''};
+    return {ok: src.ok !== false, why: String(src.why || '')};
+  }
+
+  function inertButtons(buttons, on) {
+    (buttons || []).forEach(function (b) {
+      if (b.__title === undefined) b.__title = b.title || '';
+      var dis = !model.state || !on;
+      if (b.disabled !== dis) b.disabled = dis;
+      var tip = on ? b.__title : STREAM_OFF_TIP;
+      if (b.title !== tip) { b.title = tip; b.setAttribute('aria-label', tip); }
+    });
+  }
+
+  function paintStreamPicker(picker, src, on) {
+    picker.set(src);
+    inertButtons(picker.buttons, on);
+    var off = on ? 'false' : 'true';
+    if (picker.root.getAttribute('data-off') !== off) picker.root.setAttribute('data-off', off);
+    try { if (ui.chooser) paintChooser(); } catch (err) { /* the chooser never breaks the header */ }
+  }
+
+  function openChooser(anchor) {
+    closeChooser();
+    var host = ui.pop;
+    if (!host) return;
+    var back = make('div', 'pl-choose-back');
+    var card = make('div', 'pl-choose');
+    card.setAttribute('role', 'dialog');
+    card.setAttribute('aria-label', 'PineStream - which screen');
+    card.appendChild(make('b', 'pl-choose-title', 'Stream which screen?'));
+    card.appendChild(make('small', 'pl-choose-sub', 'Listeners see it in a corner of the stream page. Nothing streams until you pick one.'));
+    var row = make('div', 'pl-choose-row');
+    var buttons = {};
+    STREAM_SOURCES.forEach(function (o) {
+      var b = make('button', 'pl-choose-btn');
+      b.type = 'button';
+      b.setAttribute('data-source', o.value);
+      b.appendChild(iconNode(o.icon));
+      b.appendChild(make('b', '', chooserLabel(o.value)));
+      var note = make('small', 'pl-choose-note', '');
+      b.appendChild(note);
+      b.title = 'Stream ' + streamSourceName(o.value) + ' to listeners now';
+      b.setAttribute('aria-label', b.title);
+      b.addEventListener('click', function (e) { e.stopPropagation(); chooseStream(o.value, b); });
+      row.appendChild(b);
+      buttons[o.value] = {root: b, note: note};
+    });
+    card.appendChild(row);
+    back.appendChild(card);
+    back.addEventListener('click', function (e) { if (e.target === back) { e.stopPropagation(); closeChooser(); } });
+    card.addEventListener('click', function (e) { e.stopPropagation(); });
+    host.appendChild(back);
+    /* anchored under the switch that asked, kept inside the popup */
+    try {
+      var pr = host.getBoundingClientRect();
+      var ar = (anchor || host).getBoundingClientRect();
+      var w = card.offsetWidth || 360;
+      card.style.top = Math.max(8, Math.round(ar.bottom - pr.top + 6)) + 'px';
+      card.style.left = Math.max(8, Math.min(Math.round(ar.left - pr.left - 24), Math.round(pr.width - w - 8))) + 'px';
+    } catch (err) { /* the stylesheet's own spot */ }
+    var x = null;
+    try { if (typeof root.pineCloseX === 'function') x = root.pineCloseX(card, function () { closeChooser(); }, {label: 'Cancel - PineStream stays off'}); } catch (err) { x = null; }
+    if (!x) {
+      x = btn('pl-choose-x', '', 'c:close--filled', 'Cancel - PineStream stays off');
+      x.addEventListener('click', function (e) { e.stopPropagation(); closeChooser(); });
+      card.appendChild(x);
+    }
+    /* Escape is this chooser's before it is the popup's: the window's
+     * capture phase runs ahead of every document listener */
+    var key = function (e) {
+      if (e.key !== 'Escape' && e.key !== 'Esc') return;
+      e.preventDefault();
+      e.stopPropagation();
+      if (e.stopImmediatePropagation) e.stopImmediatePropagation();
+      closeChooser();
+    };
+    root.addEventListener('keydown', key, true);
+    ui.chooser = {back: back, card: card, buttons: buttons, key: key, focused: false};
+    paintChooser();
+    paint();
+  }
+
+  function paintChooser() {
+    var c = ui.chooser;
+    if (!c) return;
+    var last = streamSource();
+    var other = last === 'pinetab' ? 'pineapp' : 'pinetab';
+    var ready = {};
+    STREAM_SOURCES.forEach(function (o) {
+      var r = streamSourceReady(o.value);
+      ready[o.value] = r;
+      var b = c.buttons[o.value];
+      setClass(b.root, 'unready', !r.ok);
+      setText(b.note, r.ok ? (o.value === last ? 'last used' : '') : r.why + ' - you can still pick it');
+    });
+    /* the last-used screen, unless it cannot stream and the other can */
+    var pre = (!ready[last].ok && ready[other].ok) ? other : last;
+    STREAM_SOURCES.forEach(function (o) {
+      var on = o.value === pre;
+      setClass(c.buttons[o.value].root, 'pre', on);
+      c.buttons[o.value].root.setAttribute('aria-pressed', on ? 'true' : 'false');
+    });
+    if (!c.focused) {
+      c.focused = true;
+      try { c.buttons[pre].root.focus({preventScroll: true}); } catch (err) { /* focus is a nicety */ }
+    }
+  }
+
+  function closeChooser() {
+    var c = ui.chooser;
+    if (!c) return;
+    ui.chooser = null;
+    try { root.removeEventListener('keydown', c.key, true); } catch (err) { /* gone */ }
+    if (c.back.parentNode) c.back.parentNode.removeChild(c.back);
+    paint();
+  }
+
+  function chooseStream(v, node) {
+    closeChooser();
+    if (!model.settings) model.settings = {};
+    model.settings.stream_source = v;
+    model.settings.stream_on = true;
+    if (model.state && model.state.stream) { model.state.stream.on = true; model.state.stream.source = v; }
+    paint();
+    return act('/api/pinelive/settings', {stream_source: v, stream_on: true}, node);
   }
 
   function headSwitch(parent, cls, labelText, onFlip) {
@@ -915,6 +1112,8 @@
     h.cam.root.title = cam
       ? 'PineCam to live is ON: Tailscale listeners see the Pine Cam during the set. Tap to stop the public picture at once.'
       : 'PineCam to live is OFF: the picture stays on your own screens - the camera keeps capturing. Tap to share it on the Tailscale stream.';
+    try { paintCamGrey(h.cam.root, h.cam.root, h.cam.root.title); }   /* [camgrey] */
+    catch (err) { if (root.console) root.console.error('[pinelive] camgrey paint failed:', err); }
     var rehearse = !!(st && st.armed && st.event && st.event.rehearse);
     var setOn = !!(st && st.armed) && !rehearse;
     var phase = setOn ? String(st.phase || 'arming') : 'idle';
@@ -930,7 +1129,7 @@
     var album = albumOn();
     h.album.set(album);
     h.album.root.title = album
-      ? 'Album recording is ON: the set is written as tracks (split on 10 s of silence), MP3, a folder per set in Live Events. Remembered for the next set.'
+      ? 'Album recording is ON: the set is written as tracks (split on ' + quietSecs('split_seconds') + ' s of silence), MP3, a folder per set in Live Events. Remembered for the next set.'
       : 'Album recording is OFF: the set still airs and takes the music, nothing is written. Remembered for the next set.';
     try { paintStreamSwitch(h); }                                   /* [pinestream] */
     catch (err) { if (root.console) root.console.error('[pinelive] PineStream switch paint failed:', err); }
@@ -1032,6 +1231,8 @@
 
   function openShareSheet() {
     var s = traySheet('Go LIVE - the public listen link');
+    /* [pinestream-veil] a tune-in link on the glass: PineStream shows "Private screen" */
+    s.back.setAttribute('data-pine-private', 'a tune-in link is on the screen');
     var line = make('p', 'pl-muted', 'Checking for a public link...');
     var link = make('input', 'pl-tray-input');
     link.readOnly = true;
@@ -1316,7 +1517,11 @@
     ui.sayLine = make('div', 'pl-say');
     ui.sayLine.hidden = true;
     ui.sayLine.setAttribute('role', 'status');
-    pop.appendChild(ui.sayLine);
+    /* [plquiet] the status row: the say line, then the two silence sliders */
+    var sayRow = make('div', 'pl-sayrow');
+    sayRow.appendChild(ui.sayLine);
+    sayRow.appendChild(buildQuiet());
+    pop.appendChild(sayRow);
 
     var body = make('div', 'pl-body');
     pop.appendChild(body);
@@ -1383,7 +1588,8 @@
       if (!ui.visible) return null;
       /* [pldetect] BACK unwinds one layer at a time: lightbox, wizard, popup */
       return {node: pop, close: function () {
-        if (ui.lightbox && !ui.lightbox.root.hidden) closeLightbox();
+        if (ui.chooser) closeChooser();   /* [pinestream-choose] the chooser first */
+        else if (ui.lightbox && !ui.lightbox.root.hidden) closeLightbox();
         else if (ui.detect && !ui.detect.root.hidden) closeDetect();
         else closePopup();
       }};
@@ -1547,6 +1753,7 @@
     if (!ui.visible) return;
     closeLightbox();
     closeDetect();            /* [pldetect] no timer may outlive the popup */
+    closeChooser();                 /* [pinestream-choose] cancelled: PineStream stays off */
     ui.visible = false;
     if (ui.pop) ui.pop.hidden = true;
     stopMonitor();
@@ -1630,6 +1837,8 @@
         if (root.console) root.console.error('[pinelive] detect paint failed:', err);
       }
     }
+    try { paintQuiet(); }                                          /* [plquiet] */
+    catch (err) { if (root.console) root.console.error('[pinelive] silence sliders paint failed:', err); }
     PANEL_ORDER.forEach(function (id) {
       var p = ui.panels[id];
       var open = !!ui.open[id];
@@ -1782,6 +1991,147 @@
       if (Math.abs(music.volume - ui.djDucked.set) < 0.01) music.volume = ui.djDucked.was;
       ui.djDucked = null;
     }
+  }
+
+  /* ================================================== [plquiet] the silence sliders
+   * The thin row under the header: how long the set may stay silent before
+   * the DJ gets the music back (settings.silence_seconds), and how much
+   * silence makes the album recorder start a new track (settings.split_seconds).
+   * Both are the station's settings (remembered, read live - no restart), and
+   * a "silent N s" readout counts toward each while the input is quiet. */
+  var QUIET = {
+    handoff: {key: 'silence_seconds', min: 10, max: 180, def: 45},
+    split: {key: 'split_seconds', min: 5, max: 120, def: 15}
+  };
+
+  function quietSecs(key) {
+    var spec = key === 'split_seconds' ? QUIET.split : QUIET.handoff;
+    var v = num(model.settings && model.settings[key]);
+    if (!isFinite(v)) {
+      var q = model.state && model.state.quiet;
+      v = num(q && (key === 'split_seconds' ? q.split_s : q.handoff_s));
+    }
+    if (!isFinite(v)) v = spec.def;
+    return Math.round(Math.max(spec.min, Math.min(spec.max, v)));
+  }
+
+  function quietSlider(box, spec, lead, tip) {
+    var wrap = make('label', 'pl-quiet-one');
+    wrap.title = tip;
+    wrap.appendChild(make('span', 'pl-quiet-lead', lead));
+    var input = guard(make('input'));
+    input.type = 'range';
+    input.min = String(spec.min); input.max = String(spec.max); input.step = '1';
+    input.value = String(spec.def);
+    input.setAttribute('aria-label', lead + ' this many seconds of silence');
+    var out = make('output', 'pl-quiet-out', spec.def + ' s');
+    wrap.appendChild(input);
+    wrap.appendChild(out);
+    wrap.appendChild(make('span', 'pl-quiet-tail', 'of silence'));
+    box.appendChild(wrap);
+    return {root: wrap, input: input, out: out, spec: spec};
+  }
+
+  /* A new track has to come before the hand-back (past it the DJ already has
+   * the air), so the split stays under the hand-back; the station clamps the
+   * same way, this only says so at once. */
+  function quietPick(which, v, final) {
+    var q = ui.quiet;
+    var spec = QUIET[which];
+    v = Math.round(Math.max(spec.min, Math.min(spec.max, Number(v))));
+    var capped = false;
+    if (which === 'split') {
+      var hand = quietSecs('silence_seconds');
+      if (v >= hand) { v = Math.max(QUIET.split.min, hand - 1); capped = true; }
+    }
+    setText(q[which].out, v + ' s');
+    setClass(q[which].root, 'capped', capped);
+    if (!final) return;
+    q[which].input.value = String(v);
+    if (!model.settings) model.settings = {};
+    model.settings[spec.key] = v;
+    var note = '';
+    if (which === 'handoff' && quietSecs('split_seconds') >= v) {
+      model.settings.split_seconds = Math.max(QUIET.split.min, v - 1);
+      note = 'Saved. The new-track split follows the hand-back down to ' + model.settings.split_seconds + ' s - a track has to close before the DJ takes over.';
+    } else if (capped) {
+      note = 'Saved. A new track has to come before the hand-back (' + quietSecs('silence_seconds') + ' s), so the split stops at ' + v + ' s.';
+    }
+    var body = {};
+    body[spec.key] = v;
+    act('/api/pinelive/settings', body).then(function (ans) {
+      if (note && ans && ans.ok !== false) say(note, '');
+    });
+    paintQuiet();
+  }
+
+  function buildQuiet() {
+    var box = make('div', 'pl-quiet');
+    var q = ui.quiet = {box: box};
+    q.handoff = quietSlider(box, QUIET.handoff, 'Hand back to the DJ after',
+      'How long the set may stay silent before the station hands the music back to the DJ (default 45 s, 10-180 s). '
+      + 'Sound before then keeps the set on the air; once the DJ has it, the set takes the air back as soon as you play again. '
+      + 'A cable or sender that stops arriving at all still hands back at once (Event: "No frames for"). '
+      + 'The new-track split below always comes first, so it is kept shorter than this.');
+    q.split = quietSlider(box, QUIET.split, 'New album track after',
+      'With Album recording on: silence longer than this closes the running track, and the next sound starts the next numbered track (default 15 s, 5-120 s). '
+      + 'Shorter silences stay inside the track. The closed track keeps 2 s of the silence as its ring-out and the rest is cut; the new one opens half a second before the sound. '
+      + 'It must be shorter than the hand-back above - past the hand-back the DJ already has the air - so it stops just under it.');
+    q.handoff.input.addEventListener('input', function () { quietPick('handoff', q.handoff.input.value, false); });
+    q.handoff.input.addEventListener('change', function () { quietPick('handoff', q.handoff.input.value, true); });
+    q.split.input.addEventListener('input', function () { quietPick('split', q.split.input.value, false); });
+    q.split.input.addEventListener('change', function () { quietPick('split', q.split.input.value, true); });
+    q.now = make('span', 'pl-quiet-now');
+    q.now.setAttribute('role', 'timer');
+    q.now.title = 'How long the input has been silent, and what happens next';
+    q.now.appendChild(iconNode('c:time'));
+    q.nowWords = make('span', '', '');
+    q.now.appendChild(q.nowWords);
+    q.now.hidden = true;
+    box.appendChild(q.now);
+    return box;
+  }
+
+  function quietReadout(st) {
+    if (!st || !st.armed) return '';
+    var q = st.quiet || {};
+    var f = st.failover || {};
+    var silent = num(q.silent_s);
+    if (!isFinite(silent)) silent = num(f.quiet_s);
+    if (!isFinite(silent) || silent < 1) return '';
+    var hand = quietSecs('silence_seconds'), split = quietSecs('split_seconds');
+    var parts = ['Silent ' + Math.floor(silent) + ' s'];
+    var sp = st.recording && st.recording.split;
+    var album = q.album !== undefined ? !!q.album : !!(st.recording && st.recording.on);
+    if (album) {
+      if (sp && sp.waiting) parts.push('track ' + Math.max(1, (sp.track || 2) - 1) + ' closed');
+      else parts.push('new track in ' + Math.max(0, Math.ceil(split - silent)) + ' s');
+    }
+    if (st.phase === 'fallback') parts.push('the DJ has the music until you play');
+    else parts.push('back to the DJ in ' + Math.max(0, Math.ceil(hand - silent)) + ' s');
+    return parts.join(' · ');
+  }
+
+  function paintQuiet() {
+    var q = ui.quiet;
+    if (!q) return;
+    ['handoff', 'split'].forEach(function (which) {
+      var s = q[which];
+      if (s.input.__editing) return;
+      setClass(s.root, 'capped', false);
+      var v = quietSecs(s.spec.key);
+      if (String(s.input.value) !== String(v)) s.input.value = String(v);
+      setText(s.out, v + ' s');
+    });
+    var st = model.state;
+    var albumOff = !!(model.settings && model.settings.record === false);
+    setClass(q.split.root, 'off', albumOff);
+    var words = quietReadout(st);
+    setText(q.nowWords, words);
+    setHidden(q.now, !words);
+    var silent = st && st.quiet ? num(st.quiet.silent_s) : NaN;
+    setClass(q.now, 'near', isFinite(silent) && silent >= quietSecs('silence_seconds') * 0.67);
+    setClass(q.now, 'gone', !!(st && st.phase === 'fallback'));
   }
 
   function paintCountdown() {
@@ -1996,7 +2346,7 @@
     var fields = {
       dropout_seconds: numberRow({label: 'No frames for', caption: 'cable, device or sender gone - the station takes the air back', min: 0.5, max: 60, step: 0.5, unit: 's'},
         function (v) { saveSetting('dropout_seconds', v); }),
-      silence_seconds: numberRow({label: 'Silence for', caption: 'frames arrive but below the floor', min: 1, max: 600, step: 1, unit: 's'},
+      silence_seconds: numberRow({label: 'Silence for', caption: 'frames arrive but below the floor - then the DJ gets the music back (the slider under the header)', min: 10, max: 180, step: 1, unit: 's'},
         function (v) { saveSetting('silence_seconds', v); }),
       silence_db: numberRow({label: 'Silence floor', caption: 'below this counts as silence', min: -90, max: -20, step: 1, unit: 'dBFS'},
         function (v) { saveSetting('silence_db', v); }),
@@ -2403,6 +2753,7 @@
     var tv = s.tailscale_video !== undefined ? !!s.tailscale_video : !!pic.tailscale_video;
     p.parts.ts.set(tv);
     p.parts.ts.sw.disabled = !model.state;
+    paintCamGrey(p.parts.ts.root, p.parts.ts.sw, '');   /* [camgrey] */
     var f = p.parts.facts;
     setText(f.showing, {cam: 'the Pine Cam', ads: 'the station ads', none: 'nothing', art: 'the record\'s sleeve'}[pic.showing] || (pic.showing || '--'));
     setText(f.cam, pic.cam_live ? 'linked and fresh' : 'not linked');
@@ -2528,6 +2879,7 @@
     p.parts.sw.set(on);
     p.parts.sw.sw.disabled = !model.state;
     p.parts.src.set(src);
+    inertButtons(p.parts.src.buttons, on);   /* [pinestream-choose] */
     setText(p.parts.srcCap, src === 'pineapp'
       ? 'the Pine app\'s window on the desk (the app captures itself while it is open)'
       : 'the PineTab\'s screen (the tablet captures itself - no prompt)');
