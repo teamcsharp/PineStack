@@ -1344,6 +1344,7 @@
   }
 
   function parodyOpen(seed, keepSurfaceDown) {
+    if (root.PineSfxSeen) { try { if (seed && typeof seed === 'object') root.PineSfxSeen.interact('parody', seed); } catch (e) { /* [sfxseen] never in the way of the picture */ } }
     parodyClose();
     if (keepSurfaceDown) {
       surfaceDown(true);
@@ -2059,6 +2060,7 @@
   }
 
   function radialOpen(clip, at) {
+    if (root.PineSfxSeen) { try { if (clip) root.PineSfxSeen.interact('radial', clip); } catch (e) { /* [sfxseen] never in the way of the picture */ } }
     if (!clip) return;
     radialClose(false);
     surfaceDown(true);
@@ -2743,6 +2745,7 @@
     if (!floorClaim('tube')) {
       showing = false;
       videoReceipt(clip, 'error', null, 'Another SFX surface owns playback');
+      if (root.PineSfxSeen) { try { root.PineSfxSeen.drop(clip, 'tube', 'hushed: another SFX surface owns playback'); } catch (e) { /* [sfxseen] never in the way of the picture */ } }
       return;
     }
     /* #1184: whatever was in the tube is now the past, whichever road
@@ -2786,6 +2789,7 @@
       screen.addEventListener('ended', function () { reportVideo('ended'); });
       screen.addEventListener('error', function () { reportVideo('error', 'Video decode or fetch failed'); });
       screen.__pineReceiptClose = function () { reportVideo('error', 'Video player closed before completion'); };
+      if (root.PineSfxSeen) { try { root.PineSfxSeen.track(screen, clip, 'tube'); } catch (e) { /* [sfxseen] never in the way of the picture */ } }
     }
     var glass = tube;
     var done = false;
@@ -4821,6 +4825,7 @@
 
   var sheetAt = null;
   function sheet(clip, at) {
+    if (root.PineSfxSeen) { try { if (clip) root.PineSfxSeen.interact('sheet', clip); } catch (e) { /* [sfxseen] never in the way of the picture */ } }
     /* [#1441] A WALL SHEET DOES NOT HANG OFF THE SET'S FRAME. When `at`
        is given this is the #1184 sheet, mounted on the BODY further down
        precisely because the set it belongs to may be veiled - or, since
@@ -5679,6 +5684,7 @@
     var clip = queue.shift();
     while (clip && missed(clip)) {                         /* #1173 */
       videoReceipt(clip, 'error', null, 'Video missed its playback window');
+      if (root.PineSfxSeen) { try { root.PineSfxSeen.drop(clip, 'tube', 'missed its playback window (vidmiss drop)'); } catch (e) { /* [sfxseen] never in the way of the picture */ } }
       clip = queue.shift();
     }
     if (!clip) return;
@@ -6166,6 +6172,7 @@
     if (wallFlight && now() - (Number(wallFlight.__pineAt) || 0) < 4000) return wallFlight;
     var flight = bridge.videoWall('state').then(function (got) {
       var st = wallState(got);
+      if (root.PineSfxSeen) { try { if (st) root.PineSfxSeen.wall(st, ringSeen[String(st.playing || '')] || null); } catch (e) { /* [sfxseen] never in the way of the picture */ } }
       var id = st && st.playing;
       /* [#1442b] BEFORE the veiled early-return below: a wall that is
          hidden must still be told when it may come back. */
@@ -7196,6 +7203,7 @@
     /* Numbers the operator can look at rather than a claim in a comment. */
     box: readBox,
     waiting: function () { return queue.length; },
+    mounted: function () { return !!mounted; },          /* [sfxseen] the set is running */
     on: function () { return showing; },
     offer: offer,
     /* [#1214] the arbiter, on the desk. The same object as

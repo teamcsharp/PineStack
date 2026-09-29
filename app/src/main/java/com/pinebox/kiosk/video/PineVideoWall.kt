@@ -172,6 +172,39 @@ class PineVideoWall(
     @Volatile private var lastError: String = ""
     @Volatile private var repairs: Int = 0
     @Volatile private var lastRepair: String = ""
+
+    /* [sfxseen] WHAT REACHED THE GLASS. `playing` says which item the
+     * playlist is on, never whether a frame of it was drawn. The page's
+     * display receipt (sfx-seen.js) reads these through state(): the first
+     * frame ExoPlayer rendered for the item, when the item became current,
+     * the decoder's rendered/dropped counts since, and whether anybody could
+     * see it - the surface's own size and visibility, and the display. */
+    @Volatile private var seenSince: Long = 0L
+    @Volatile private var firstFrameId: String = ""
+    @Volatile private var firstFrameAt: Long = 0L
+    @Volatile private var framesRendered: Int = 0
+    @Volatile private var framesDropped: Int = 0
+    private var rendered0 = 0
+    private var dropped0 = 0
+
+    private fun seenMark(p: ExoPlayer) {                      // [sfxseen] main thread
+        seenSince = System.currentTimeMillis()
+        val c = p.videoDecoderCounters
+        rendered0 = c?.renderedOutputBufferCount ?: 0
+        dropped0 = (c?.droppedBufferCount ?: 0) + (c?.skippedOutputBufferCount ?: 0)
+        framesRendered = 0
+        framesDropped = 0
+    }
+
+    private fun seenCount(p: ExoPlayer) {                     // [sfxseen] the watchdog's tick
+        val c = p.videoDecoderCounters ?: return
+        framesRendered = (c.renderedOutputBufferCount - rendered0).coerceAtLeast(0)
+        framesDropped = (c.droppedBufferCount + c.skippedOutputBufferCount - dropped0).coerceAtLeast(0)
+    }
+
+    private fun screenOn(): Boolean = try {                   // [sfxseen]
+        (context.getSystemService(Context.POWER_SERVICE) as? android.os.PowerManager)?.isInteractive ?: true
+    } catch (err: Throwable) { true }
     private val watchdog = object : Runnable {
         override fun run() {
             try { watch() } catch (err: Throwable) { Log.w(TAG, "watch: ${err.message}") }
@@ -522,6 +555,15 @@ class PineVideoWall(
         .put("last_error", lastError)
         .put("repairs", repairs)
         .put("last_repair", lastRepair)
+        .put("shown_since", seenSince)                       // [sfxseen] below: what reached the glass
+        .put("first_frame_id", firstFrameId)
+        .put("first_frame_at", firstFrameAt)
+        .put("frames_rendered", framesRendered)
+        .put("frames_dropped", framesDropped)
+        .put("surface_w", screen.width)
+        .put("surface_h", screen.height)
+        .put("visible", isShown && visibility == View.VISIBLE && screen.width > 1 && screen.height > 1)
+        .put("screen_on", screenOn())
 
     // ------------------------------------------------------- the watchdog
 
@@ -669,6 +711,7 @@ class PineVideoWall(
         playWhenReady = p.playWhenReady
         atCount = p.mediaItemCount
         atDuration = p.duration
+        seenCount(p)                                        // [sfxseen]
         retally()                                           // [#1212]
         val moved = idx != atIndex || pos != atPos
         atIndex = idx
@@ -766,6 +809,7 @@ class PineVideoWall(
             override fun onMediaItemTransition(item: MediaItem?, reason: Int) {
                 val at = p.currentMediaItemIndex
                 showing = listed.getOrNull(at)?.id ?: ""
+                seenMark(p)                                  // [sfxseen]
                 Log.i(TAG, "now showing $showing (item $at of ${p.mediaItemCount})")
                 if (showing.isNotEmpty()) onClipChanged?.invoke(showing)
                 /* [#1212] NOT ON THE FRAME OF THE JOIN.
@@ -782,6 +826,12 @@ class PineVideoWall(
             override fun onPlaybackStateChanged(state: Int) {
                 playback = stateName(state)  // #1440
                 Log.i(TAG, "state ${stateName(state)} at item ${p.currentMediaItemIndex} of ${p.mediaItemCount}")
+            }
+
+            /* [sfxseen] fired per stream change: a frame of THIS item was drawn */
+            override fun onRenderedFirstFrame() {
+                firstFrameAt = System.currentTimeMillis()
+                firstFrameId = listed.getOrNull(p.currentMediaItemIndex)?.id ?: showing
             }
 
             override fun onPlayerError(error: PlaybackException) {
