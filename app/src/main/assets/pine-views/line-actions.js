@@ -293,6 +293,29 @@
     headRow.appendChild(make('b', '', 'What would you like to do with this?'));
     if (root.PineMsgId && line.id) { try { headRow.appendChild(root.PineMsgId.chip(line.id, 'head')); } catch (e) { /* [msgid] the sheet stands without its code */ } }
     var votes = make('div', 'la-votes');
+    /* [rollplay] THE DICE, left of everything: the roll again, from the
+     * dice. The tile itself plays as the menu comes up (below). */
+    var rollDice = null, rollTag = null;
+    if (line.id && root.PineRollTag && typeof root.PineRollTag.mount === 'function') {
+      rollDice = make('button', 'la-vote la-roll');
+      rollDice.type = 'button';
+      rollDice.title = 'Replay how System 3 rolled this line';
+      rollDice.setAttribute('aria-label', rollDice.title);
+      rollDice.appendChild(icon('m:casino'));
+      /* ONE replay per press: press() acts on pointerup AND on the click that
+       * follows it; on a busy tablet that click can land after the de-dupe
+       * window and start a second roll. So a press is named by its
+       * pointerdown and acts once; a keyboard click (no pointer) acts too. */
+      var rollPress = 0, rollActed = -1;
+      rollDice.addEventListener('pointerdown', function () { rollPress += 1; });
+      press(rollDice, function (ev) {
+        var keyboard = ev && ev.type === 'click' && ev.detail === 0;
+        if (!rollTag || (!keyboard && rollActed === rollPress)) return;
+        rollActed = rollPress;
+        rollTag.replay();
+      });
+      votes.appendChild(rollDice);
+    }
     /* [#1200] THE TRASH CAN, for a sound effect only - left of the
      * thumbs, where the finger was pointed. See sfxOf() below. */
     var sfxRow = sfxOf(line);
@@ -329,6 +352,31 @@
     head.appendChild(make('p', 'la-said', line.said.slice(0, 220)));
     head.appendChild(make('p', 'la-vote-say', ''));
     sheet.appendChild(head);
+    /* [rollplay] "If I tap and hold a message here and I bring up this
+     * window, then I want to see the RNG roulette animated message transition
+     * for that correspondence when this comes up ... with a 2 second hang
+     * after the RNG roulette before switching over to the typewriter effect
+     * message construction and icon rolodex" (the operator). The Message
+     * view's tile for this line (PineRollTag, script-page.js) plays in the
+     * quote's place - it types the same words - with how System 3 made it
+     * folded under it. A sound effect gets its picture beside it: drag to
+     * scrub, tap to hear it on a loop (PineRollTag.pip). The rows stay
+     * below and take a tap at any moment of the roll. */
+    if (rollDice) {
+      var band = make('div', 'la-roll-band' + (sfxRow ? ' la-clip-band' : ''));
+      var slot = make('div', 'la-roll-box');
+      band.appendChild(slot);
+      sheet.appendChild(band);               /* under the header, not in it: the header is the drag handle */
+      try {
+        rollTag = root.PineRollTag.mount(slot, line, {autoplay: true, hold: 2000, compact: true, title: '', style: 'digital'});
+        if (rollTag) head.classList.add('la-tiled');
+        if (sfxRow && typeof root.PineRollTag.pip === 'function') {
+          var pipSlot = make('div', 'la-pip-box');
+          band.appendChild(pipSlot);
+          root.PineRollTag.pip(pipSlot, {id: line.id, said: line.said, clip: true});
+        }
+      } catch (err) { band.remove(); head.classList.remove('la-tiled'); }
+    }
 
     var list = make('div', 'la-list');
     /* THE LIKE, IN WORDS, ABOVE EVERYTHING. The thumb in the header says it

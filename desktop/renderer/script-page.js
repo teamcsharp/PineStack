@@ -5454,6 +5454,7 @@
     mv.seg = seg;
     mv.stage = make('div', 'sp-mv-stage');
     pane.appendChild(mv.stage);
+    mvHistoryWire(pane, mv.stage);             /* [rollplay] scroll back freely */
     var scene = make('div', 'sp-mv-scene');
     scene.id = 'spSceneHost';
     scene.style.display = 'none';
@@ -5465,6 +5466,7 @@
     mv.sceneBox = scene;
   }
   function mvStyleSet(style) {
+    mvUnpin();                                 /* [rollplay] a restyle rebuilds the bubble */
     mv.style = style === 'classic' ? 'classic' : 'digital';
     try { localStorage.setItem('sp.mv.style', mv.style); } catch (e) { /* this session only */ }
     if (mv.seg) {
@@ -5509,6 +5511,7 @@
       mv.seenAt = 0;
       mv.detectAt = 0;
       mvKick();
+      mvHistoryFill();                        /* [rollplay] the feed ring backs the list */
     } else {
       mvSplit(false);                           /* [msgsplit] a scene */
       mvSet(feed, false); mvSet(mv.pane, false); mvSet(mv.sceneBox, true);
@@ -5983,7 +5986,8 @@
       mvW.push(Math.max(0, Number(c.weight) || 0));   /* [msgroll] */
       if (String(c.id) === String(stg.selected)) hit = i;
     }
-    return {dice: stg && stg.draw && stg.draw.dice != null ? stg.draw.dice : fallbackDice,
+    var rrRej = mvRrRejOf(stg);                /* [rollplay] the candidates a rule removed: they pop in, then go grey */
+    return {rej: rrRej, dice: stg && stg.draw && stg.draw.dice != null ? stg.draw.dice : fallbackDice,
       opts: opts, hit: hit, label: opts[hit] || String((stg && stg.selected) || ''),
       of: opts.length, stage: String((stg && stg.stage) || ''), weights: mvW};   /* [msgroll] */
   }
@@ -6013,7 +6017,7 @@
     return {fam: String(ev.family || ''), table: String(sel.table || ev.family || ''), tableLabel: rrT0 ? String(rrT0.label || '') : '',
       event: String(ev.event_id || ''),
       main: main ? mvReel(main, dice) : {dice: dice, opts: [landed], hit: 0, label: landed, of: 1, stage: ''},
-      sub: sub ? mvReel(sub, null) : null};
+      sub: sub ? mvReel(sub, null) : null, failed: mvRrFailed(ev), vrej: mvRrVerdicts(ev)};   /* [rollplay] */
   }
   function mvCounted(fam, table, one, two) {
     var mk = function (x) {
@@ -6343,6 +6347,7 @@
       ? {dice: clip.dice != null ? clip.dice : null, opts: [c.name], hit: 0, label: c.name,
          index: Number(clip.index) || 0, of: of, counted: of > 1}
       : {dice: null, opts: [c.name], hit: 0, label: c.name, of: 1};
+    if (item.match) sub.rej = mvRrMatchRej(item.match);   /* [rollplay] the matcher's losers, what each rule removed */
     return [{fam: 'SFX', table: roll && roll.road ? String(roll.road) : 'SFX', event: '', main: main, sub: sub,
       match: !!((roll && roll.road === 'match') || (item.row && (item.row.match_why || item.row.sfx_match_why))),
       why: [roll ? 'the ' + String(roll.road || '') + ' road' : '', c.why].filter(function (x) { return !!x; }).join(' - ')}];
@@ -6451,6 +6456,7 @@
     return out;
   }
   function mvVideoStart(m, f) {
+    if (mv.pip) return;                      /* [rollplay] a popup's clip holds the one video */
     mvVideoRelease();                        /* one video element at a time */
     var v = document.createElement('video');
     v.className = 'sp-mv-video';
@@ -6477,9 +6483,11 @@
     v.addEventListener('loadedmetadata', function () {
       /* it joins the air where the air is, then loops on its own */
       var span = isFinite(v.duration) && v.duration > 0 ? v.duration : 0;
-      if (span && f !== null && f > 0.02) { try { v.currentTime = Math.min(span - 0.05, f * span); } catch (e) { /* not seekable */ } }
+      if (span && f !== null && f > 0.02 && !m.boom) { try { v.currentTime = Math.min(span - 0.05, f * span); } catch (e) { /* not seekable */ } }
     });
-    v.src = stationUrl(m.info.url);
+    var boom = mvBoomAsk(m.info);             /* [rollplay] forward, then back, then forward */
+    m.boom = !!boom;
+    v.src = stationUrl(boom || m.info.url);
     m.box.appendChild(v);
     m.video = v;
     mv.video = m;
@@ -6691,9 +6699,11 @@
     var prov = null;                         /* [msgdb] the provenance tree, asked beside it */
     var p = Promise.all([Promise.resolve().then(function () {
       return s3Request('/api/system3/line?line_id=' + encodeURIComponent(lid));
-    }).then(null, function () { return null; }), mvProv(lid), item.kind === 'clip' ? mvFolders() : null]).then(function (two) {   /* [msgmedia] the folder list */
+    }).then(null, function () { return null; }), mvProv(lid), item.kind === 'clip' ? mvFolders() : null,
+      item.kind === 'clip' ? mvRrOrigin(lid) : null]).then(function (two) {   /* [msgmedia] the folder list; [rollplay] a clip's origin */
       var ans = two[0];
       prov = two[1];
+      if (two[3]) mvRrFromOrigin(item, two[3]);   /* [rollplay] its roll, its matcher's candidates */
       var turn = ans && ans.turn || null;
       var decisions = (ans && ans.decisions) || [];
       /* cover_a's finding: a ledger row may carry a neighbour's dice; the
@@ -6719,7 +6729,7 @@
         sources: mvSources(item, ans, got && got.turn, got && got.decisions),
         cid: String((ans && ans.line && ans.line.conversation_id) || ''),
         tid: String((got && got.turn && got.turn.turn_id) || ''), restamped: got && got.restamped || '',
-        stores: mvStores(item, ans, prov)};    /* [msgdb] */
+        stores: mvStores(item, ans, prov), origin: item.origin || null};    /* [msgdb] [rollplay] */
       return out;
     });
     mv.answers[lid] = p;
@@ -6830,6 +6840,7 @@
     head.appendChild(make('b', '', item.name || ''));
     var tail = make('i', 'sp-mv-clock', '');
     head.appendChild(tail);
+    mvTypePill(item, head);                    /* [rollplay] MP4 / MP3, off the file */
     bubble.appendChild(head);
     var rolls = make('div', 'sp-mv-rolls');
     bubble.appendChild(rolls);
@@ -6852,6 +6863,7 @@
     all.hidden = true;
     tab.addEventListener('click', function (ev) {
       ev.stopPropagation();
+      if (cur && cur.item.lid) { mvPinToggle(cur); return; }   /* [rollplay] pin it, loop its roll */
       if (cur && cur.sheet) { mvResults(cur, !cur.showingResults); return; }   /* [msgroll] the results screen */
       all.hidden = !all.hidden;
       tab.classList.toggle('open', !all.hidden);
@@ -6880,11 +6892,10 @@
     } else {
       mvPlan(cur, {rows: [], sources: {main: '', others: []}});
     }
-    /* history: two finished bubbles stay above, the rest leave */
-    var kids = stage.querySelectorAll('.sp-mv-item');
-    for (var i = 0; i < kids.length - 3; i += 1) stage.removeChild(kids[i]);
+    mvHistoryAfterAppend(stage, node, item);   /* [rollplay] the list keeps its history; follow only at the latest */
   }
   function mvRetire(cur) {
+    if (mv.pin && mv.pin.cur === cur) return;   /* [rollplay] */
     if (!cur || !cur.node) return;
     cur.node.classList.add('sp-mv-past');
     if (cur.media && cur.media.video) mvVideoRelease();   /* [msgmedia] the history keeps the poster */
@@ -6963,7 +6974,7 @@
     (data.rows || []).forEach(function (r) {
       var line = mvStatic(r);
       if (r.match) mvMatchChip(line, cur);       /* [msgmatch] */
-      if (r.event && data.cid) {
+      if (r.event && data.cid && !r.failed) {   /* [rollplay] a failed roll is inert */
         line.addEventListener('click', function (ev) {
           ev.stopPropagation();
           feedDiceOpen({conversation_id: data.cid, turn_id: data.tid}, {event_id: r.event}, cur.item.lid);
@@ -7385,6 +7396,7 @@
     el.appendChild(wheel);
     el.appendChild(of);
     el.style.display = 'none';
+    var rej = mvRrRejChips(el, reel);          /* [rollplay] */
     var opts = (reel && reel.opts && reel.opts.length) ? reel.opts : [String((reel && reel.label) || '')];
     var hit = Math.max(0, Math.min(opts.length - 1, Number(reel && reel.hit) || 0));
     var w = (reel && reel.weights && reel.weights.length === opts.length) ? reel.weights : null;
@@ -7413,7 +7425,7 @@
     });
     var landed = reel && reel.counted && reel.of
       ? (reel.index + ' of ' + reel.of) : (opts.length > 1 ? (hit + 1) + ' of ' + opts.length : 'the only one');
-    return {el: el, die: die, list: list, wheel: wheel, of: of, target: target, reel: reel || {}, landedOf: landed};
+    return {el: el, die: die, list: list, wheel: wheel, of: of, target: target, reel: reel || {}, landedOf: landed, rej: rej};   /* [rollplay] */
   }
   function mvRrSheet(cur, rows, budgetMs) {
     var box = make('div', 'sp-rr');
@@ -7426,19 +7438,28 @@
       head.appendChild(make('b', '', r.table || r.fam));
       if (r.tableLabel && r.tableLabel !== r.table) head.appendChild(make('span', '', r.tableLabel));
       t.appendChild(head);
-      var cat = mvRrStep(r.main, false);
+      var cat = mvRrStep(r.vrej && r.vrej.length ? mvMerge(r.main, {rej: (r.main.rej || []).concat(r.vrej)}) : r.main, false);   /* [rollplay] */
       t.appendChild(cat.el);
       var sub = r.sub ? mvRrStep(r.sub, true) : null;
       if (sub) t.appendChild(sub.el);
-      var line = make('div', 'sp-rr-line');
-      line.appendChild(make('b', '', r.table || r.fam));
-      line.appendChild(make('span', 'sp-rr-ld', r.main && r.main.dice != null ? String(r.main.dice) : '-'));
-      line.appendChild(make('span', '', (r.main && r.main.label) || ''));
+      /* [rollplay] "keep the indented look on the sfx clip when the roulette
+         animation completes instead of putting the items on the same row":
+         the finished table is two rows, the count kept on each */
+      var line = make('div', 'sp-rr-line sp-rr-two');
+      var lc = make('div', 'sp-rr-lc');
+      lc.appendChild(make('b', '', r.table || r.fam));
+      lc.appendChild(make('span', 'sp-rr-ld', r.main && r.main.dice != null ? String(r.main.dice) : '-'));
+      lc.appendChild(make('span', 'sp-rr-ll', (r.main && r.main.label) || ''));
+      if (cat.landedOf && cat.landedOf !== 'the only one') lc.appendChild(make('i', 'sp-rr-lof', cat.landedOf));
+      line.appendChild(lc);
       if (r.sub) {
-        line.appendChild(make('i', '', '›'));
-        line.appendChild(make('span', 'sp-rr-ld', r.sub.dice != null ? String(r.sub.dice) : '-'));
-        line.appendChild(make('span', '', r.sub.label || ''));
+        var ls = make('div', 'sp-rr-ls');
+        ls.appendChild(make('span', 'sp-rr-ld', r.sub.dice != null ? String(r.sub.dice) : '-'));
+        ls.appendChild(make('span', 'sp-rr-ll', r.sub.label || ''));
+        if (sub && sub.landedOf && sub.landedOf !== 'the only one') ls.appendChild(make('i', 'sp-rr-lof', sub.landedOf));
+        line.appendChild(ls);
       }
+      mvRrFoldNote(line, r, cat, sub);            /* [rollplay] the rejected, counted; a failed table's reason */
       t.appendChild(line);
       if (r.match && typeof mvMatchChip === 'function') mvMatchChip(head, cur);
       box.appendChild(t);
@@ -7457,7 +7478,10 @@
       T.dDie2 = two ? per * 0.12 : 0;
       T.dSpin2 = two ? per * 0.27 : 0;
       T.dPop2 = two ? per * 0.06 : 0;
-      T.end = at + T.dIn + T.dDie + T.dSpin + T.dPop + T.dDie2 + T.dSpin2 + T.dPop2;
+      T.dRej = mvRrRejMs(T.cat, per);              /* [rollplay] the rejected pop in, go grey */
+      T.dRej2 = T.sub ? mvRrRejMs(T.sub, per) : 0;
+      T.dFail = T.r.failed ? 420 : 0;
+      T.end = at + T.dIn + T.dRej + T.dDie + T.dSpin + T.dPop + T.dRej2 + T.dDie2 + T.dSpin2 + T.dPop2 + T.dFail;
       at = T.end + 40;
     });
     /* [msgroll] then the whole result, readable, for 1.5 s before the message */
@@ -7498,6 +7522,9 @@
     sheet.box.setAttribute('data-now', 'results');
   }
   function mvRrQuiet(T) {
+    if (T.r && T.r.failed) { T.el.classList.add('sp-rr-failed'); T.el.title = T.r.failed.why; }   /* [rollplay] */
+    mvRrRejAt(T.cat, 1e9, T.dRej || 1);         /* [rollplay] a folded table's rejected rest grey, never mid-pop */
+    if (T.sub) mvRrRejAt(T.sub, 1e9, T.dRej2 || 1);
     [T.cat, T.sub].forEach(function (st) {
       if (!st) return;
       st.die.classList.remove('rolling');
@@ -7526,14 +7553,20 @@
       if (T.el.style.display === 'none') T.el.style.display = '';
       T.el.style.opacity = String(Math.min(1, e / Math.max(1, T.dIn)));
       T.el.classList.toggle('arriving', e < T.dIn);
-      var a = e - T.dIn;
-      var s1 = mvRrStepAt(T.cat, a, T.dDie, a - T.dDie, T.dSpin, a - T.dDie - T.dSpin, T.dPop);
+      var a0 = e - T.dIn;                          /* [rollplay] the rejected first, then the roll that stood */
+      var q1 = mvRrRejAt(T.cat, a0, T.dRej || 0);
+      var a = a0 - (T.dRej || 0);
+      var s1 = q1 === 'rej' ? 'rej' : mvRrStepAt(T.cat, a, T.dDie, a - T.dDie, T.dSpin, a - T.dDie - T.dSpin, T.dPop);
       var s2 = 'none';
       if (T.sub) {
-        var b = a - T.dDie - T.dSpin - T.dPop;
-        s2 = mvRrStepAt(T.sub, b, T.dDie2, b - T.dDie2, T.dSpin2, b - T.dDie2 - T.dSpin2, T.dPop2);
+        var b0 = a - T.dDie - T.dSpin - T.dPop;
+        var q2 = mvRrRejAt(T.sub, b0, T.dRej2 || 0);
+        var b = b0 - (T.dRej2 || 0);
+        s2 = q2 === 'rej' ? 'rej' : (q2 === 'wait' ? 'wait' : mvRrStepAt(T.sub, b, T.dDie2, b - T.dDie2, T.dSpin2, b - T.dDie2 - T.dSpin2, T.dPop2));
       }
-      if (!finished) now = i + ':' + (e < T.dIn ? 'table' : (s2 !== 'none' && s2 !== 'wait' ? 'sub-' + s2 : 'cat-' + s1));
+      var failing = !!T.r.failed && e >= T.end - T.at - (T.dFail || 0);
+      if (T.r.failed) T.el.classList.toggle('sp-rr-failed', failing || finished);
+      if (!finished) now = i + ':' + (e < T.dIn ? 'table' : failing ? 'failed' : (s2 !== 'none' && s2 !== 'wait' ? 'sub-' + s2 : 'cat-' + s1));
     });
     sheet.now = now;
     if (sheet.box.getAttribute('data-now') !== now) sheet.box.setAttribute('data-now', now);
@@ -7660,7 +7693,9 @@
       cur.tab.hidden = false;   /* [msgroll] Classic has its Result tab too */
     }
     if (cur.style === 'digital' && cur.src && cur.src.main) {
-      var a = (ms - cur.collapseEnd) / Math.max(1, cur.accEnd - cur.collapseEnd);
+      var a = cur.accFrom != null   /* [rollplay] the hold menu: the Rolodex turns with the words */
+        ? (ms - cur.accFrom) / Math.max(1, cur.accTo - cur.accFrom)
+        : (ms - cur.collapseEnd) / Math.max(1, cur.accEnd - cur.collapseEnd);
       if (a >= 0) {
         if (cur.acc.hidden) cur.acc.hidden = false;
         var y = -Math.round(mvEase(a) * (cur.accN - 1) * 30);
@@ -7817,6 +7852,7 @@
     mv.raf = root.requestAnimationFrame(mvLoop);
     mv.frameN = (mv.frameN + 1) % MV_EVERY;
     if (mv.frameN) return;
+    if (mv.pin) { mvPinFrame(now); return; }   /* [rollplay] the pinned message owns the view */
     if (now - mv.detectAt > 200) {
       mv.detectAt = now;
       var item = mvDetect();
@@ -7831,7 +7867,8 @@
       else if (item.text && item.text !== mv.cur.item.text && mv.cur.item.kind === 'speech'
         && item.text.length >= mv.cur.item.text.length) mv.cur.item.text = item.text;
     }
-    if (mv.cur) mvFrameItem(mv.cur, now);
+    if (mv.cur && !mv.cur.node.__mvOff) mvFrameItem(mv.cur, now);   /* [rollplay] off-screen runs nothing */
+    mvFollowFrame();
   }
   function mvKick() {
     if (mv.raf || mv.view !== 'message') return;
@@ -7846,9 +7883,1229 @@
     mv.raf = 0;
     if (mv.view.indexOf('scene:') === 0) { mvSceneDispose(); mv.view = 'feed'; }
     mvVideoRelease();                          /* [msgmedia] */
+    mvUnpin();                                 /* [rollplay] */
     mv.cur = null;
     if (mv.stage) mv.stage.textContent = '';
+    mv.histRows = null;
   }
+  /* [rollplay] WHAT FAILED OR WAS REJECTED, GREY AND INERT. "if an item is in
+     the roulette that fails or gets rejected, show it popping in but going
+     grey and inert" (the operator, 2026-09-29). Only what the station
+     RECORDS, never an invented grey item:
+       - a stage's `excluded` candidates (a rule removed them before the
+         draw, each with its why) - they pop in under the step, go grey,
+         and then the roll that stood lands;
+       - a MEMORY stage's verdicts marked not eligible;
+       - a door roll that returned nothing (the decision selected PASS: "no
+         clip") - the table rolls in and lands, then greys;
+       - the SFX matcher's losing candidates and what each rule removed
+         (the origin ledger's full record for the clip: /api/system3/origin
+         /<id>?full=1 -> full.match).
+     Not recorded per line anywhere the page can read, so never shown: the
+     copy gate, the repeat gate, the turn-edge (slash) cleaner, the strict
+     gate and strike re-rolls. Every grey item carries its reason as a
+     title (hover / long-press) and has no action. The Message view, the
+     Roll tab, the hold menu and the diagnostics all share this engine. */
+  var RR_REJ_MAX = 6;
+  function mvRrRejOf(stg) {
+    var out = [];
+    ((stg && stg.excluded) || []).forEach(function (x) {
+      if (!x || out.length >= RR_REJ_MAX) return;
+      out.push({label: String(x.label || x.id || ''), why: 'rejected: ' + String(x.why || 'a rule removed it')});
+    });
+    return out;
+  }
+  function mvRrVerdicts(ev) {
+    var out = [];
+    ((ev && ev.stages) || []).forEach(function (st) {
+      ((st && st.verdicts) || []).forEach(function (v) {
+        if (!v || v.eligible !== false || out.length >= RR_REJ_MAX) return;
+        out.push({label: String(v.label || v.id || ''), why: 'not eligible: ' + String(v.why || 'its rule said no')});
+      });
+    });
+    return out;
+  }
+  function mvRrFailed(ev) {
+    var sel = (ev && ev.selected) || {};
+    var id = String(sel.id || '').toUpperCase();
+    if (id !== 'PASS' && id !== 'NONE') return null;
+    var gate = null;
+    ((ev && ev.stages) || []).forEach(function (st) { if (st && st.threshold != null && !gate) gate = st; });
+    var d = gate && gate.draw ? gate.draw.dice : null;
+    return {why: 'failed: ' + String(sel.label || 'the roll returned nothing')
+      + (gate && gate.rule ? ' - ' + String(gate.rule) : '') + (d != null ? ' (rolled ' + d + ')' : '')};
+  }
+  function mvRrMatchRej(m) {
+    var out = [];
+    if (!m) return out;
+    var removed = m.removed || {};
+    Object.keys(removed).forEach(function (k) {
+      var n = Number(removed[k]) || 0;
+      if (n > 0 && out.length < RR_REJ_MAX) out.push({label: n + ' removed', why: 'rejected by a rule: ' + k + ' (' + n + ' clip' + (n === 1 ? '' : 's') + ')'});
+    });
+    var won = Number(m.score);
+    (m.candidates || []).forEach(function (x) {
+      if (!x || out.length >= RR_REJ_MAX) return;
+      var sc = Number(x.score);
+      if (!(isFinite(won) && isFinite(sc) && sc < won)) return;   /* a tie may be the one drawn: never greyed */
+      var words = [].concat(x.line || [], x.context || [], x.senses || [], x.folder_words || []).slice(0, 3);
+      out.push({label: String(x.folder || 'a clip') + (words.length ? ' - ' + words.join(', ') : ''),
+        why: 'lost: scored ' + sc.toFixed(2) + ', the pick ' + won.toFixed(2)});
+    });
+    var tied = Number(m.tied) || 0;
+    if (tied > 1 && out.length < RR_REJ_MAX) out.push({label: (tied - 1) + ' tied', why: 'tied at ' + (isFinite(won) ? won.toFixed(2) : '?') + ' - not drawn'});
+    return out;
+  }
+  function mvRrOrigin(lid) {
+    if (!lid) return Promise.resolve(null);
+    return Promise.resolve().then(function () {
+      return s3Request('/api/system3/origin/' + encodeURIComponent(lid) + '?full=1');
+    }).then(function (got) { return got && (got.verdict || got.nodes) ? got : null; }, function () { return null; });
+  }
+  /* a clip's roll from its origin record when its row carries none (a script
+     sting, a clip older than the feed): the ledger's own line rolls */
+  function mvRrFromOrigin(item, org) {
+    item.origin = org;
+    item.match = (org.full && org.full.match) || item.match || null;
+    if (item.row && item.row.sfx_roll) return;
+    var cat = null, clip = null, road = '';
+    (org.nodes || []).forEach(function (n) {
+      if (!n || n.node !== 'roll' || n.scope !== 'line') return;
+      var m = /^SFX (category|clip) \(([^)]*)\)/.exec(String(n.table || ''));
+      if (!m) return;
+      road = road || m[2];
+      var x = {label: String(n.label || n.picked || ''), dice: n.dice, index: n.index, of: n.of};
+      if (m[1] === 'category') cat = x; else clip = x;
+    });
+    if (!cat && !clip) return;
+    var sr = {road: road, category: cat || {}, clip: clip || null};
+    item.row = mvMerge(item.row || {}, {sfx_roll: sr});
+  }
+  function mvRrRejChips(el, reel) {
+    var list = (reel && reel.rej) || [];
+    if (!list.length) return [];
+    el.classList.add('sp-rr-has-rej');
+    var box = make('span', 'sp-rr-rej');
+    var out = [];
+    list.forEach(function (x) {
+      var c = make('span', 'sp-rr-rejc', x.label);
+      c.title = x.why;
+      c.setAttribute('aria-disabled', 'true');
+      c.style.display = 'none';
+      box.appendChild(c);
+      out.push(c);
+    });
+    el.appendChild(box);
+    return out;
+  }
+  function mvRrRejMs(step, per) {
+    var n = step && step.rej ? step.rej.length : 0;
+    return n ? Math.min(per * 0.4, 260 * n + 140) : 0;
+  }
+  function mvRrRejAt(step, e, d) {
+    var c = (step && step.rej) || [];
+    if (!c.length || !d) return 'none';
+    if (e < 0) return 'wait';
+    if (step.el.style.display === 'none') step.el.style.display = '';
+    var gap = d / c.length;
+    for (var k = 0; k < c.length; k += 1) {
+      var t = e - k * gap;
+      var on = t >= 0, grey = t >= gap * 0.55;
+      if (c[k].style.display !== (on ? '' : 'none')) c[k].style.display = on ? '' : 'none';
+      c[k].classList.toggle('pop', on && !grey);
+      c[k].classList.toggle('gone', grey);
+    }
+    return e < d ? 'rej' : 'none';
+  }
+  function mvRrFoldNote(line, r, cat, sub) {
+    var n = ((cat && cat.rej) || []).length + ((sub && sub.rej) || []).length;
+    if (n) {
+      var why = [].concat((cat && cat.rej) || [], (sub && sub.rej) || []).map(function (c) { return c.textContent + ' - ' + c.title; });
+      var tag = make('i', 'sp-rr-rejn', n + ' rejected');
+      tag.title = why.join('\n');
+      line.appendChild(tag);
+    }
+    if (r && r.failed) line.title = r.failed.why;
+  }
+
+  /* [rollplay] THE CLIP'S FILE TYPE, off the file itself. "For each clip that
+     plays by the SFX guy, show a bubble here that says if it's an MP3 or an
+     MP4." (the operator). A named file's extension when the row has one;
+     otherwise the served file's own Content-Type, read from one byte of the
+     signed road (Range: bytes=0-0, asked once per sample); unknown -> no pill. */
+  var MV_FTYPE = {'video/mp4': 'MP4', 'video/webm': 'WEBM', 'video/quicktime': 'MOV', 'video/x-matroska': 'MKV',
+    'video/ogg': 'OGV', 'video/x-m4v': 'M4V', 'audio/mpeg': 'MP3', 'audio/mp3': 'MP3', 'audio/wav': 'WAV',
+    'audio/x-wav': 'WAV', 'audio/wave': 'WAV', 'audio/vnd.wave': 'WAV', 'audio/mp4': 'M4A', 'audio/x-m4a': 'M4A',
+    'audio/aac': 'AAC', 'audio/ogg': 'OGG', 'audio/opus': 'OPUS', 'audio/flac': 'FLAC', 'audio/x-flac': 'FLAC', 'audio/webm': 'WEBA'};
+  var MV_FEXT = /\.(mp4|m4v|webm|mov|mkv|ogv|mp3|wav|m4a|aac|ogg|oga|opus|flac)(?=[?#]|$)/i;
+  var MV_FVID = /^(MP4|M4V|WEBM|MOV|MKV|OGV)$/;
+  function mvFileType(item) {
+    var row = (item && item.row) || {};
+    var names = [row.path, row.file, row.filename, row.sfx_path, row.name];
+    for (var i = 0; i < names.length; i += 1) {
+      var m = MV_FEXT.exec(String(names[i] || ''));
+      if (m) { var x = m[1].toUpperCase(); return Promise.resolve({ext: x, video: MV_FVID.test(x), from: 'name'}); }
+    }
+    var c = mvClipInfo(item);
+    var um = MV_FEXT.exec(String(c.url || '').split('?')[0]);
+    if (um) { var y = um[1].toUpperCase(); return Promise.resolve({ext: y, video: MV_FVID.test(y), from: 'url'}); }
+    if (!c.sid || typeof root.fetch !== 'function') return Promise.resolve(null);
+    mv.ftype = mv.ftype || Object.create(null);
+    if (mv.ftype[c.sid]) return mv.ftype[c.sid];
+    mv.ftype[c.sid] = (c.url ? Promise.resolve(c.url) : mvSigned(c.sid)).then(function (u) {
+      if (!u) return null;
+      return root.fetch(stationUrl(u), {headers: {Range: 'bytes=0-0'}}).then(function (r) {
+        var t = String((r && r.headers && r.headers.get('content-type')) || '').split(';')[0].trim().toLowerCase();
+        try { if (r.body && r.body.cancel) r.body.cancel(); } catch (e) { /* drained */ }
+        var ext = r && r.ok ? MV_FTYPE[t] || '' : '';
+        return ext ? {ext: ext, video: /^video\//.test(t), from: 'the file'} : null;
+      });
+    }).then(null, function () { return null; });
+    return mv.ftype[c.sid];
+  }
+  function mvTypePill(item, head) {
+    if (!item || item.kind !== 'clip' || !head) return;
+    var pill = make('span', 'sp-mv-ftype', '');
+    pill.hidden = true;
+    head.appendChild(pill);
+    mvFileType(item).then(function (t) {
+      if (!t || !t.ext) return;
+      pill.textContent = t.ext;
+      pill.classList.add(t.video ? 'is-video' : 'is-audio');
+      pill.title = 'the clip is ' + (/^[AEFHILMNORSX]/.test(t.ext) ? 'an ' : 'a ') + t.ext + (t.video ? ' video' : ' audio') + ' file';
+      pill.hidden = false;
+    });
+  }
+
+  /* [rollplay] THE BOOMERANG THUMBNAIL: the station makes it once (see
+     /api/sfx/boomerang in app.py); until it answers ready the plain forward
+     loop plays. Asked once per clip, again after 30 s while it is making. */
+  function mvBoomAsk(info) {
+    if (!info || !info.sid || !info.tok || info.video === false) return '';
+    mv.boom = mv.boom || Object.create(null);
+    var sid = info.sid, b = mv.boom[sid];
+    if (b && b.url) return b.url;
+    if (b && (b.asking || Date.now() - b.at < 30000)) return '';
+    mv.boom[sid] = {asking: true, at: Date.now(), url: ''};
+    Promise.resolve().then(function () {
+      return api().get('/api/sfx/boomerang/' + encodeURIComponent(sid) + '?t=' + encodeURIComponent(info.tok) + '&probe=1');
+    }).then(function (got) {
+      mv.boom[sid] = {at: Date.now(), url: got && got.ready && /^\/api\/sfx\/boomerang\//.test(String(got.url || '')) ? String(got.url) : ''};
+    }, function () { mv.boom[sid] = {at: Date.now(), url: ''}; });
+    return '';
+  }
+  /* [rollplay] THE MESSAGE VIEW KEEPS ITS HISTORY, AND A RESULT PINS.
+     "if I tap on the result tab, I want to keep it on screen, and I want to
+     see the roulette animation loop for that particular message" / "also
+     show ticks in the corner when i lock a message via expanding the result.
+     Also pulse the active message slightly" / "allow me to scroll up the
+     list to grab previous entries by scrolling the digital feed freely"
+     (the operator, 2026-09-29).
+     THE LIST scrolls both ways; the feed ring backs it (20 at a time, more
+     as the top is reached, the viewport anchored). It follows the newest
+     only while the reader is at the newest; scrolled away, nothing moves it
+     and a chip counts what arrived. THE PIN: a Result tapped keeps that
+     message and loops it - the roll (strictly category, then its indented
+     sub-result, then the next), the access Rolodex, a 3 s hold on the
+     finished roll, the typewriter, a 3 s hold on the message, again - with
+     corner ticks and a slow glow (no scale), until the Result is tapped
+     again or a click lands outside it. While pinned it owns the view (the
+     live bubble waits); one heavy replay at a time; off-screen bubbles run
+     nothing (IntersectionObserver). Every frame rides mvLoop's own rAF, so
+     unpinning leaves no timer behind. */
+  var MV_PAGE = 20, MV_KEEP = 120, MV_PIN_HOLD = 3000;
+  function mvRectOf(n) { var r = n.getBoundingClientRect(); return [Math.round(r.left), Math.round(r.top), Math.round(r.width), Math.round(r.height)]; }
+  function mvHistRows() {
+    var rows = [];
+    try { rows = (root.PineStationFeed && root.PineStationFeed.rows && root.PineStationFeed.rows()) || []; } catch (e) { rows = []; }
+    return rows.filter(function (r) {
+      return r && r.id && String(r.text || '').trim() && !/-punct-\d+$/.test(String(r.id))
+        && !/^(image_analysis|song_analysis|chat|hangup)$/.test(String(r.kind || ''));
+    });
+  }
+  function mvHistItem(row) {
+    var who = String(row.who || '').toLowerCase(), kind = String(row.kind || '').toLowerCase();
+    var clip = who === 'board' || /^(sfx|sting|clip)$/.test(kind);
+    return {key: 'l:' + String(row.id), kind: clip ? 'clip' : 'speech', lid: String(row.id), row: row, who: who,
+      name: clip ? 'CLIP' : String(row.name || who || 'ON AIR'), text: mvPlain(row.text || ''), round: String(row.round || ''), kindOf: kind};
+  }
+  function mvHistBubble(item) {
+    var cur = rtBubbleDom(item, mv.style, function (c) { mvPinToggle(c); });
+    cur.node.classList.add('sp-mv-past', 'sp-mv-hist');
+    cur.node.setAttribute('data-mv-key', item.key);
+    var bubble = cur.node.querySelector('.sp-mv-bubble');
+    mvOriginWire(bubble, item);
+    if (item.kind === 'clip') {
+      var ci = mvClipInfo(item);
+      cur.text.textContent = ci.name || item.text;
+      cur.text.classList.add('sp-mv-title');
+      cur.media = mvMediaBox(item, bubble);    /* its thumbnail; the video only while it is the one playing */
+      mvBoomAsk(ci);                           /* the boomerang asked early, ready by the time it loops */
+    } else cur.text.textContent = item.text;
+    cur.fill.style.width = '100%';
+    cur.phase = 'done';
+    cur.tab.hidden = false;
+    return cur;
+  }
+  function mvObserve(node) {
+    if (!mv.io) {
+      if (typeof root.IntersectionObserver !== 'function' || !mv.stage) return;
+      mv.io = new root.IntersectionObserver(function (list) {
+        list.forEach(function (e) {
+          var n = e.target;
+          n.__mvOff = !e.isIntersecting;
+          n.classList.toggle('sp-mv-frozen', n.__mvOff);   /* off-screen: every CSS animation in it holds still */
+          if (n.__mvOff && mv.cur && mv.cur.node === n && mv.cur.media && mv.cur.media.video) mvVideoRelease();
+          if (mv.pin && mv.pin.cur.node === n) {
+            mv.pin.off = n.__mvOff;
+            if (n.__mvOff && mv.pin.cur.media && mv.pin.cur.media.video) mvVideoRelease();
+          }
+        });
+      }, {root: mv.stage, threshold: 0});
+    }
+    try { mv.io.observe(node); } catch (e) { /* gone */ }
+  }
+  function mvAtLatest(stage) { return stage.scrollTop + stage.clientHeight >= stage.scrollHeight - 12; }
+  function mvChipPaint() {
+    if (!mv.chip) return;
+    mv.chip.hidden = !(mv.fresh > 0) || mv.follow;
+    mv.chipN.textContent = mv.fresh + ' new';
+  }
+  function mvHistoryWire(pane, stage) {
+    stage.classList.add('sp-mv-scroll');
+    mv.follow = true;
+    mv.fresh = 0;
+    var chip = make('button', 'sp-mv-newchip');
+    chip.type = 'button';
+    chip.title = 'New messages below - tap to go to the latest and follow it again';
+    chip.setAttribute('aria-label', chip.title);
+    mv.chipN = make('span', '', '0 new');
+    chip.appendChild(mv.chipN);
+    chip.appendChild(mvGlyph('c:chevron--down'));
+    chip.hidden = true;
+    chip.addEventListener('click', function (ev) {
+      ev.stopPropagation();
+      stage.scrollTop = stage.scrollHeight;
+      mv.follow = true;
+      mv.fresh = 0;
+      mvChipPaint();
+    });
+    pane.appendChild(chip);
+    mv.chip = chip;
+    stage.addEventListener('scroll', function () {
+      mv.follow = mvAtLatest(stage);
+      if (mv.follow) mv.fresh = 0;
+      mvChipPaint();
+      if (stage.scrollTop < 60) mvHistoryMore();
+    }, {passive: true});
+  }
+  function mvHistoryFill() {
+    var stage = mv.stage;
+    if (!stage || mv.histRows) return;
+    var rows = mvHistRows();
+    mv.histRows = rows;
+    mv.histAt = rows.length;
+    var liveKey = mv.cur ? mv.cur.item.key : '';
+    if (liveKey) {
+      for (var i = rows.length - 1; i >= 0; i -= 1) if ('l:' + rows[i].id === liveKey) { mv.histAt = i; break; }
+    }
+    mvHistoryMore(true);
+    stage.scrollTop = stage.scrollHeight;
+  }
+  function mvHistoryMore(first) {
+    var stage = mv.stage, rows = mv.histRows;
+    if (!stage || !rows || mv.histAt <= 0 || mv.histBusy) return;
+    mv.histBusy = true;
+    var from = Math.max(0, mv.histAt - MV_PAGE);
+    var h0 = stage.scrollHeight, t0 = stage.scrollTop;
+    var frag = document.createDocumentFragment();
+    for (var i = from; i < mv.histAt; i += 1) {
+      var item = mvHistItem(rows[i]);
+      if (stage.querySelector('[data-mv-key="' + item.key.replace(/"/g, '') + '"]')) continue;
+      var cur = mvHistBubble(item);
+      frag.appendChild(cur.node);
+    }
+    mv.histAt = from;
+    var firstItem = stage.querySelector('.sp-mv-item');
+    stage.insertBefore(frag, firstItem || null);
+    [].slice.call(stage.querySelectorAll('.sp-mv-hist')).forEach(function (n) { if (!n.__mvSeen) { n.__mvSeen = true; mvObserve(n); } });
+    if (!first) stage.scrollTop = t0 + (stage.scrollHeight - h0);   /* prepended: the viewport stays anchored */
+    mv.histBusy = false;
+  }
+  /* after a live bubble is appended: trim the oldest, follow or count */
+  function mvHistoryAfterAppend(stage, node, item) {
+    node.setAttribute('data-mv-key', item.key);
+    var twin = stage.querySelectorAll('.sp-mv-hist[data-mv-key="' + String(item.key).replace(/"/g, '') + '"]');
+    [].slice.call(twin).forEach(function (n) { if (!mv.pin || mv.pin.cur.node !== n) n.parentNode.removeChild(n); });
+    mvObserve(node);
+    var kids = stage.querySelectorAll('.sp-mv-item');
+    for (var i = 0; i < kids.length - MV_KEEP; i += 1) {
+      if (mv.pin && mv.pin.cur.node === kids[i]) continue;
+      stage.removeChild(kids[i]);
+    }
+    if (mv.follow || !stage.classList.contains('sp-mv-scroll')) stage.scrollTop = stage.scrollHeight;
+    else { mv.fresh = (mv.fresh || 0) + 1; mvChipPaint(); }
+  }
+  function mvFollowFrame() {
+    var s = mv.stage;
+    if (s && mv.follow && s.classList.contains('sp-mv-scroll') && s.scrollTop + s.clientHeight < s.scrollHeight - 2) s.scrollTop = s.scrollHeight;
+  }
+  /* the pin */
+  function mvPinToggle(cur) {
+    if (mv.pin && mv.pin.cur === cur) { mv.pin.why = 'the Result tapped again'; mvUnpin(); return; }
+    mvPin(cur);
+  }
+  function mvPin(cur) {
+    mvUnpin();
+    var bubble = cur.node.querySelector('.sp-mv-bubble');
+    var before = mvRectOf(bubble);
+    var P = mv.pin = {cur: cur, cycles: 0, log: [], phase: '', doneAt: 0, lastNow: 0, off: !!cur.node.__mvOff, frames: 0, ticks: null};
+    mv.pinned = cur;
+    if (mv.stage) mv.stage.classList.add('sp-mv-pinlist');   /* the pinned bubble grows where it sits: nothing re-anchors the list */
+    cur.node.classList.add('sp-mv-pinned');
+    var ticks = make('span', 'sp-mv-ticks');
+    ticks.setAttribute('aria-hidden', 'true');
+    ['tl', 'tr', 'bl', 'br'].forEach(function (k) { ticks.appendChild(make('i', 'sp-mv-tick ' + k)); });
+    bubble.appendChild(ticks);
+    P.ticks = ticks;
+    P.tabTitle = cur.tab.title;
+    cur.tab.classList.add('open', 'sp-mv-pinning');
+    cur.tab.title = 'Replaying the roll — tap to stop';
+    cur.tab.setAttribute('aria-pressed', 'true');
+    P.rect = {before: before, after: mvRectOf(bubble)};
+    P.away = function (ev) {
+      if (mv.pin !== P || (ev.target && cur.node.contains(ev.target))) return;
+      P.why = 'click-away';
+      mvUnpin();
+    };
+    document.addEventListener('click', P.away, true);
+    (cur.data ? Promise.resolve(cur.data) : mvAsk(cur.item).then(null, function () { return null; })).then(function (data) {
+      if (mv.pin !== P) return;
+      cur.data = data || {rows: [], sources: {main: '', others: [], why: {}}};
+      P.armed = true;                          /* the next frame starts the first cycle */
+      mvKick();
+    });
+    mvKick();
+  }
+  function mvUnpin() {
+    var P = mv.pin;
+    if (!P) return;
+    mv.pin = null;
+    mv.pinned = null;
+    document.removeEventListener('click', P.away, true);
+    if (mv.stage) mv.stage.classList.remove('sp-mv-pinlist');
+    mv.pinWhy = P.why || 'unpinned';
+    var cur = P.cur;
+    cur.node.classList.remove('sp-mv-pinned');
+    if (P.ticks && P.ticks.parentNode) P.ticks.parentNode.removeChild(P.ticks);
+    cur.tab.classList.remove('open', 'sp-mv-pinning');
+    cur.tab.title = P.tabTitle || '';
+    cur.tab.removeAttribute('aria-pressed');
+    if (cur.media && cur.media.video) mvVideoRelease();
+    /* the message settles as it ends: its words, finished */
+    if (cur.showingResults) mvResults(cur, false);
+    if (cur.item.kind === 'speech') cur.text.textContent = cur.item.text;
+    cur.text.classList.remove('typing');
+    cur.fill.style.width = '100%';
+    if (cur.plan) cur.skip = true;
+    if (cur !== mv.cur) cur.node.classList.add('sp-mv-past');
+    mv.pinEnded = (mv.pinEnded || 0) + 1;
+    mv.detectAt = 0;
+    mvKick();
+  }
+  /* one cycle: rebuilt from the dice on the bubble in place */
+  function mvPinRun(P, now) {
+    var cur = P.cur;
+    cur.rolls.textContent = '';
+    cur.all.textContent = '';
+    cur.accReel.textContent = '';
+    cur.accSmall.textContent = '';
+    cur.accReel.style.transform = '';
+    cur.acc.hidden = true;
+    cur.text.textContent = '';
+    cur.text.classList.remove('sp-mv-title', 'typing');
+    cur.node.classList.remove('sp-mv-past', 'sp-mv-onair', 'sp-mv-results');
+    cur.rolls.style.display = '';
+    cur.showingResults = false;
+    cur.collapsed = false;
+    cur.rolledOnce = false;
+    cur.parts = [];
+    cur.cline = null;
+    cur.seedStrip = null;
+    cur.creel = null;
+    cur.sheet = null;
+    cur.typed = -1;
+    cur.t0 = 0;
+    cur.began = now;
+    cur.phase = 'wait';
+    rtOffAir(function () { mvPlan(cur, cur.data); });
+    cur.skip = false;
+    if (cur.sheet) {
+      /* a. the roll; b. the Rolodex turns to its source; c. 3 s on the
+         finished roll; then d. the words */
+      var accMs = cur.style === 'digital' && cur.src && cur.src.main ? 660 : 0;   /* only Digital has the Rolodex */
+      cur.accFrom = cur.sheet.rolled;
+      cur.accTo = cur.sheet.rolled + accMs;
+      cur.sheet.total = cur.accTo + MV_PIN_HOLD;
+      cur.rollEnd = cur.collapseEnd = cur.accEnd = cur.sheet.total;
+    }
+    cur.tab.hidden = false;
+    P.doneAt = 0;
+    P.run = (P.run || 0) + 1;
+  }
+  function mvPinPhase(P, cur, ms) {
+    if (P.doneAt) return 'hold2';
+    if (cur.phase === 'air') return 'type';
+    if (!cur.sheet) return 'type';
+    if (ms < cur.sheet.rolled) return 'roll';
+    if (ms < cur.accTo) return 'rolodex';
+    return 'hold1';
+  }
+  function mvPinFrame(now) {
+    var P = mv.pin;
+    if (!P) return;
+    var cur = P.cur;
+    if (!cur.node.isConnected) { P.why = 'the bubble left the list'; mvUnpin(); return; }
+    var gap = P.lastNow ? now - P.lastNow : 0;
+    P.lastNow = now;
+    if (P.off || gap > 400) {                 /* hidden, or scrolled away: time stood still */
+      if (cur.t0) cur.t0 += gap;
+      cur.began += gap;
+      if (P.doneAt) P.doneAt += gap;
+    }
+    if (P.off) return;                        /* off-screen: it runs nothing */
+    if (P.armed) { P.armed = false; mvPinRun(P, now); }
+    if (!cur.plan || !P.run) return;
+    P.frames += 1;
+    if (P.doneAt) {
+      if (now - P.doneAt >= MV_PIN_HOLD) { P.cycles += 1; mvPinRun(P, now); }   /* e. -> f. again, from the dice */
+    } else {
+      rtOffAir(function () { mvFrameItem(cur, now); });
+      if (cur.phase === 'air' && (cur.item.kind !== 'speech' || cur.typed >= cur.item.text.length)) {
+        P.doneAt = now;
+        cur.fill.style.width = '100%';
+        cur.text.classList.remove('typing');
+      }
+    }
+    var ph = mvPinPhase(P, cur, cur.t0 ? now - cur.t0 : 0);
+    if (ph !== P.phase) {
+      P.phase = ph;
+      P.log.push({phase: ph, at: now, run: P.run});
+      if (P.log.length > 40) P.log.shift();
+    }
+  }
+  /* [rollplay] THE ROLL TAG, ANYWHERE. "I want to be able to play the
+     animation of the message view tile with a play button in the section and
+     see how the rolls transpired ... I want to be able to repeat the
+     animation over and over with the play button and see the results of the
+     inspected message in the popup." / "I want that element style system to
+     be reusable in various places and in popups throughout the app." / "I
+     want to be able to tap any message and see in the roll tab, an RNG
+     roulette animated recreation of the roulette that resulted in that
+     message." (the operator, 2026-09-29)
+
+     PineRollTag.mount(container, line, opts) builds the Message view's OWN
+     bubble for any line id in a container of the caller's: mvAsk's record
+     (the line's System 3 stamp and turn), mvPlan's plan, mvRrSheet's roll
+     one table at a time (the table rolls in, the category die and wheel, the
+     indented sub die and wheel, the 1.5 s hold), the access indicator, the
+     message typed in, and the Result tab, which - with a tap on the tally -
+     cycles between the roulette result and the message. It runs OFF THE AIR
+     on its own animation frame: no audio, no timeline (tlNow and liveStream
+     are held back for the length of each call, so a replay never reads the
+     line on air and every replay is the same replay), no media element (the
+     page's one <video> stays the Message view's), no hold wiring. The style
+     is the operator's stored Message view choice (sp.mv.style) unless the
+     caller names one. Under the tile: how System 3 made it - the roulette
+     rolls, the databases it drew on, the lists it was drawn from - from the
+     same record plus the origin ledger (/api/system3/origin/<id>) where the
+     station serves it; a line with no roll says so, with its road. */
+  var RT_LIVE = [];
+  var RT_NONE = {rows: [], sources: {main: '', others: [], why: {}}};
+  function rtOffAir(fn) {
+    var keepT = tlNow, keepL = liveStream;
+    tlNow = null;
+    liveStream = null;
+    try { return fn(); } finally { tlNow = keepT; liveStream = keepL; }
+  }
+  function rtItem(line) {
+    var ln = (line && typeof line === 'object') ? line : {id: line};
+    var lid = String(ln.id || ln.line || ln.line_id || '').replace(/^(ln|ac)-/, '').trim();
+    var node = lid ? lineNode(lid) : null;
+    var src = lid ? mvMerge(mvMerge(sayingSource({id: lid}, node) || {}, mvFeedRow(lid)), ln.row || null) : mvMerge({}, ln.row || null);
+    var who = String(ln.who || src.who || '').toLowerCase();
+    var kind = String(ln.kind || src.kind || '').toLowerCase();
+    var dialogue = !!(node && /sp-dialogue/.test(node.className || ''));
+    var clip = ln.clip === true || (!dialogue && (who === 'board' || /^(sfx|sting|clip)$/.test(kind)));
+    var said = String(src.text || ln.said || ln.text || '');   /* the record's words over a view's label text */
+    return {key: 'rt:' + lid, kind: clip ? 'clip' : 'speech', lid: lid, row: src, who: who,
+      name: clip ? 'CLIP' : String(ln.name || src.name || src.speaker || who || 'ON AIR'),
+      text: mvPlain(said), round: String(ln.round || src.round || ''), kindOf: kind};
+  }
+  function rtOrigin(lid) {
+    if (!lid) return Promise.resolve(null);
+    return Promise.resolve().then(function () {
+      return s3Request('/api/system3/origin/' + encodeURIComponent(lid));
+    }).then(function (got) {
+      return got && (got.verdict || got.nodes) ? got : null;
+    }, function () { return null; });
+  }
+  function rtBubble(st) {
+    var cur = rtBubbleDom(st.item, st.style, null);
+    st.stage.appendChild(cur.node);
+    return cur;
+  }
+  /* the Message view's bubble, built without a stage: the popups' tiles and
+     the Message view's history share it. onTab: what the Result tab does
+     (a popup flips to the roll's results; the Message view pins) */
+  function rtBubbleDom(item, style, onTab) {
+    var st = {style: style};
+    var node = make('div', 'sp-mv-item sp-mv-' + mvSide(item) + ' sp-mv-' + st.style + ' sp-mv-k-' + item.kind);
+    var acc = make('div', 'sp-mv-acc');
+    acc.hidden = true;
+    var accRing = make('span', 'sp-mv-accring');
+    var accReel = make('span', 'sp-mv-accreel');
+    accRing.appendChild(accReel);
+    acc.appendChild(accRing);
+    var accSmall = make('span', 'sp-mv-accsmall');
+    acc.appendChild(accSmall);
+    node.appendChild(acc);
+    var bubble = make('div', 'sp-mv-bubble');
+    var head = make('div', 'sp-mv-who');
+    head.appendChild(mvGlyph(mvKindIcon(item)));
+    head.appendChild(make('b', '', item.name || ''));
+    var tail = make('i', 'sp-mv-clock', '');
+    head.appendChild(tail);
+    mvTypePill(item, head);
+    bubble.appendChild(head);   /* the header, then the rolls */
+    var rolls = make('div', 'sp-mv-rolls');   /* the rolls */
+    var noroll = make('div', 'rt-noroll', '');
+    noroll.hidden = true;
+    bubble.appendChild(noroll);
+    bubble.appendChild(rolls);
+    var textBox = make('div', 'sp-mv-text');
+    var text = make('span', 'sp-mv-words', '');
+    textBox.appendChild(text);
+    bubble.appendChild(textBox);
+    var bar = make('div', 'sp-mv-load');
+    var fill = make('i', '', '');
+    bar.appendChild(fill);
+    bubble.appendChild(bar);
+    node.appendChild(bubble);
+    var tab = make('button', 'sp-mv-result');
+    tab.type = 'button';
+    tab.hidden = true;
+    tab.appendChild(make('span', '', 'Result'));
+    tab.appendChild(mvGlyph('c:chevron--down', 'sp-mv-chev'));
+    var all = make('div', 'sp-mv-all');
+    all.hidden = true;
+    node.appendChild(tab);
+    node.appendChild(all);
+    var cur = {item: item, node: node, style: st.style, t0: 0, data: null, parts: [], plan: null,
+      acc: acc, accReel: accReel, accSmall: accSmall, rolls: rolls, text: text, fill: fill,
+      tab: tab, all: all, clock: tail, typed: -1, phase: 'wait', began: Date.now(), f0: null, noroll: noroll};
+    tab.addEventListener('click', function (ev) {
+      ev.stopPropagation();
+      if (onTab) { onTab(cur); return; }
+      if (cur.sheet) { mvResults(cur, !cur.showingResults); return; }
+      all.hidden = !all.hidden;
+      tab.classList.toggle('open', !all.hidden);
+    });
+    /* the tally, tapped, goes back to the message it made */
+    bubble.addEventListener('click', function (ev) {
+      if (!cur.showingResults) return;
+      ev.stopPropagation();
+      mvResults(cur, false);
+    });
+    return cur;
+  }
+  function rtWait(st) {
+    var wait = make('div', 'sp-mv-waiting rt-wait');
+    wait.appendChild(mvGlyph('c:cube', 'sp-mv-spin'));
+    wait.appendChild(make('span', '', 'asking System 3 how this was rolled...'));
+    st.stage.appendChild(wait);
+  }
+  function rtPlay(st) {
+    st.gen += 1;
+    var gen = st.gen;
+    if (st.raf) root.cancelAnimationFrame(st.raf);
+    st.raf = 0;
+    st.done = false;
+    st.cur = null;
+    st.stage.textContent = '';
+    st.label.textContent = 'Replay';
+    if (!st.data) {
+      st.box.setAttribute('data-state', 'asking');
+      rtWait(st);
+      st.ready.then(function () { if (gen === st.gen) rtPlay(st); });
+      return;
+    }
+    st.style = (st.opts.style === 'classic' || st.opts.style === 'digital') ? st.opts.style : mv.style;
+    st.box.classList.toggle('rt-classic', st.style === 'classic');
+    st.box.classList.toggle('rt-digital', st.style !== 'classic');
+    st.chip.textContent = st.style === 'classic' ? 'Classic' : 'Digital';
+    st.plays += 1;
+    var cur = rtBubble(st);
+    rtOffAir(function () { mvPlan(cur, st.data); });
+    cur.skip = false;                        /* asked for: it rolls, whatever the motion setting */
+    cur.fit = 3;
+    var hold = Number(st.opts.hold);
+    if (cur.sheet && hold > 0) {
+      /* the hang on the finished roulette is the caller's (the hold menu: 2 s);
+         then the words type and the access indicator's Rolodex turns TOGETHER */
+      var accMs = Math.max(0, cur.accEnd - cur.collapseEnd) || (cur.src && cur.src.main ? 660 : 0);
+      cur.sheet.total = cur.sheet.rolled + hold;
+      cur.rollEnd = cur.sheet.total;
+      cur.collapseEnd = cur.sheet.total;
+      cur.accEnd = cur.sheet.total;
+      cur.accFrom = cur.sheet.total;
+      cur.accTo = cur.sheet.total + accMs;
+    }
+    cur.node.style.setProperty('--mv-lines', '8');
+    if (!(st.data.rows || []).length && st.said) {   /* no roll: the tile says so, and names the road */
+      cur.noroll.textContent = st.said;
+      cur.noroll.hidden = false;
+    }
+    st.cur = cur;
+    st.box.setAttribute('data-state', 'rolling');
+    st.frameN = 0;
+    st.raf = root.requestAnimationFrame(function () { rtFrame(st, gen); });
+  }
+  function rtFrame(st, gen) {
+    st.raf = 0;
+    if (gen !== st.gen || !st.cur) return;
+    if (!st.box.isConnected) { rtStop(st); return; }
+    st.raf = root.requestAnimationFrame(function () { rtFrame(st, gen); });
+    st.frameN = (st.frameN + 1) % MV_EVERY;
+    if (st.frameN) return;
+    var cur = st.cur;
+    var now = Date.now();
+    rtOffAir(function () { mvFrameItem(cur, now); });
+    if (cur.phase === 'air' && (cur.item.kind !== 'speech' || cur.typed >= cur.item.text.length)) {
+      root.cancelAnimationFrame(st.raf);
+      st.raf = 0;
+      st.done = true;
+      cur.fill.style.width = '100%';
+      cur.text.classList.remove('typing');
+      if (cur.tab.hidden && (cur.sheet || cur.all.childNodes.length)) cur.tab.hidden = false;
+      st.box.setAttribute('data-state', 'done');
+    }
+  }
+  function rtStop(st) {
+    st.gen += 1;
+    if (st.raf) root.cancelAnimationFrame(st.raf);
+    st.raf = 0;
+    var k = RT_LIVE.indexOf(st);
+    if (k >= 0) RT_LIVE.splice(k, 1);
+  }
+  function rtCell(tr, text, cls) {
+    var td = make('td', cls || '', text == null || text === '' ? '-' : String(text));
+    tr.appendChild(td);
+    return td;
+  }
+  function rtOf(x) {
+    if (!x) return '';
+    return x.of > 1 ? ' (' + ((x.counted ? x.index : x.hit + 1) || '?') + ' of ' + x.of + ')' : '';
+  }
+  function rtHead(into, title, count) {
+    var h = make('h4', 'rt-h', title);
+    if (count != null) h.appendChild(make('i', '', String(count)));
+    into.appendChild(h);
+  }
+  function rtFacts(st) {
+    var box = st.facts;
+    box.textContent = '';
+    var data = st.data || RT_NONE;
+    var org = st.origin;
+    var item = st.item;
+    var rows = data.rows || [];
+    var row = item.row || {};
+    var nodes = (org && org.nodes) || [];
+    var road = String((org && org.road) || item.round || row.round || row.kind || item.who || 'unknown road');
+    var forced = null, rogue = null;
+    nodes.forEach(function (n) { if (n && n.node === 'forced') forced = n; if (n && n.node === 'rogue') rogue = n; });
+    var say = '';
+    var cls = 'rolled';
+    if (org && org.verdict && org.verdict !== 'rolled') {
+      cls = org.verdict;
+      var fr = String((forced && forced.road) || road) + (forced && forced.trigger ? ' - ' + forced.trigger : '');
+      var rp = String((rogue && (rogue.producer || rogue.path)) || org.why || 'code path not captured');
+      say = org.verdict !== 'forced'
+        ? (rows.length ? 'Untraced on the air (rogue): ' + road + ' (' + rp + '). The rolls below are what System 3 recorded for these words.'
+          : 'No roll: rogue - ' + road + ' (' + rp + ')')
+        : rows.length ? 'Forced onto the air: ' + fr + '. The rolls below wrote it.'
+          : 'No roll: forced - ' + fr;
+    } else if (!rows.length && !(org && org.verdict === 'rolled')) {
+      cls = 'none';
+      say = 'No roll: forced / rogue - the ' + road + ' road' + (org ? '' : ' (no System 3 table was rolled for this line)');
+    } else {
+      say = 'Rolled: ' + (org && org.why ? org.why : rows.length + ' table' + (rows.length === 1 ? '' : 's') + ' on the line\'s System 3 record')
+        + (org ? '' : ' - from the line\'s own stamp');
+    }
+    st.said = cls === 'rolled' ? '' : say;
+    if (st.cur && st.cur.noroll && st.said && !(data.rows || []).length) { st.cur.noroll.textContent = st.said; st.cur.noroll.hidden = false; }
+    var v = make('p', 'rt-verdict rt-v-' + cls, say);
+    box.appendChild(v);
+    st.verdict = cls;
+    /* 1. THE ROULETTE ROLLS: one row per table, then any door, road or line roll */
+    var sec = make('div', 'rt-sec rt-rolls');
+    var events = {};
+    var n = 0, nRej = 0, extra = 0;
+    var tbl = make('table', 'rt-table');
+    var hr = make('tr', '');
+    ['Table', 'Die', 'Category', 'Sub-die', 'Item'].forEach(function (t) { hr.appendChild(make('th', '', t)); });
+    tbl.appendChild(hr);
+    rows.forEach(function (r) {
+      if (r.event) events[r.event] = 1;
+      var tr = make('tr', 'rt-roll');
+      tr.style.setProperty('--fam', MV_FAM[r.fam] || '#68ced9');
+      var t = rtCell(tr, r.table || r.fam, 'rt-tb');
+      if (r.tableLabel && r.tableLabel !== r.table) t.appendChild(make('i', '', r.tableLabel));
+      rtCell(tr, r.main && r.main.dice, 'rt-d');
+      rtCell(tr, r.main ? r.main.label + rtOf(r.main) : '');
+      rtCell(tr, r.sub && r.sub.dice, 'rt-d');
+      rtCell(tr, r.sub ? r.sub.label + rtOf(r.sub) : '');
+      if (r.failed) { tr.classList.add('rt-failed'); tr.title = r.failed.why; }
+      tbl.appendChild(tr);
+      n += 1;
+      var rej = [].concat((r.main && r.main.rej) || [], r.vrej || [], (r.sub && r.sub.rej) || []);
+      if (rej.length) {
+        var rr = make('tr', 'rt-rejrow');
+        rr.style.setProperty('--fam', MV_FAM[r.fam] || '#68ced9');
+        var td = make('td', '');
+        td.colSpan = 5;
+        td.appendChild(make('b', '', 'Rejected'));
+        rej.forEach(function (x) { var c = make('span', 'rt-rej', x.label); c.title = x.why; td.appendChild(c); });
+        rr.appendChild(td);
+        tbl.appendChild(rr);
+        nRej += rej.length;
+      }
+    });
+    nodes.forEach(function (x) {
+      if (!x || x.node !== 'roll') return;
+      if (x.scope === 'turn' && x.id && events[x.id]) return;   /* already a row above */
+      if (x.scope === 'round' && (extra += 1) > 8) return;      /* the conversation's own: the first few */
+      var tr = make('tr', 'rt-roll rt-extra');
+      var name = String(x.table || x.key || 'roll');
+      var t = rtCell(tr, name, 'rt-tb');
+      t.appendChild(make('i', '', x.scope === 'round' ? 'door / road' : x.scope === 'line' ? 'the line\'s own' : 'turn'));
+      rtCell(tr, x.dice, 'rt-d');
+      rtCell(tr, String(x.path || x.label || x.picked || '') + (x.of ? ' (' + (x.index != null ? x.index : '?') + ' of ' + x.of + ')' : ''));
+      rtCell(tr, '', 'rt-d');
+      rtCell(tr, x.path && x.picked ? x.picked : '');
+      tbl.appendChild(tr);
+      n += 1;
+    });
+    rtHead(sec, 'Roulette rolls', n);
+    if (extra > 8) sec.appendChild(make('p', 'rt-none', (extra - 8) + ' more rolls of the whole conversation are in the origin ledger.'));
+    sec.appendChild(make('p', 'rt-none rt-unrec', (nRej ? nRej + ' rejected or removed, shown grey. ' : '')
+      + 'Not recorded per line, so never shown: the copy gate, the repeat gate, the turn-edge cleaner, the strict gate, strike re-rolls.'));
+    if (n) sec.appendChild(tbl);
+    else sec.appendChild(make('p', 'rt-none', 'No System 3 table was rolled for this line.'));
+    box.appendChild(sec);
+    /* 2. THE DATABASES it drew on: the access indicator's set */
+    var src = data.sources || RT_NONE.sources;
+    var dsec = make('div', 'rt-sec rt-dbs');
+    var keys = (src.main ? [src.main] : []).concat(src.others || []);
+    rtHead(dsec, 'Databases connected', keys.length);
+    var dl = make('ul', 'rt-list');
+    keys.forEach(function (k) {
+      if (!MV_SRC[k]) return;
+      var li = make('li', k === src.main ? 'rt-main' : '');
+      li.appendChild(mvGlyph(MV_SRC[k][0], 'rt-ico'));
+      li.appendChild(make('b', '', MV_SRC[k][1]));
+      if (k === src.main) li.appendChild(make('em', '', 'main'));
+      li.appendChild(make('span', '', String((src.why || {})[k] || '')));
+      dl.appendChild(li);
+    });
+    if (keys.length) dsec.appendChild(dl);
+    else dsec.appendChild(make('p', 'rt-none', 'No database fed this line on the record.'));
+    box.appendChild(dsec);
+    /* 3. THE LISTS it was drawn from: each table's real candidate lists, the
+       stores, and the origin ledger's store references */
+    var lsec = make('div', 'rt-sec rt-lists');
+    var ll = make('ul', 'rt-list');
+    var seen = {};
+    var put = function (b, rest) {
+      var key = b + '|' + rest;
+      if (seen[key]) return;
+      seen[key] = 1;
+      var li = make('li', '');
+      li.appendChild(make('b', '', b));
+      if (rest) li.appendChild(make('span', '', rest));
+      ll.appendChild(li);
+    };
+    rows.forEach(function (r) {
+      var t = String(r.table || r.fam) + (r.tableLabel && r.tableLabel !== r.table ? ' - ' + r.tableLabel : '');
+      if (r.main && r.main.of) put(t, (r.main.counted ? 'counted positions' : 'categories') + ': ' + r.main.of);
+      if (r.sub && r.sub.of) put(String(r.main && r.main.label || t), (r.sub.counted ? 'counted positions' : 'items') + ': ' + r.sub.of);
+    });
+    ((data.stores && data.stores.list) || []).forEach(function (s) { put(String(s.db), String(s.why || '')); });
+    nodes.forEach(function (x) {
+      if (!x || x.node !== 'store') return;
+      var bits = [];
+      ['folder', 'db', 'pool', 'product', 'key', 'file'].forEach(function (k) {
+        if (x[k]) bits.push(k + ' ' + String(x[k]).slice(0, 60));
+      });
+      if (x.of) bits.push((x.index != null ? x.index : '?') + ' of ' + x.of);
+      if (x.candidates && x.candidates.length) bits.push(x.candidates.length + ' candidates');
+      if (x.cands) bits.push(x.cands + ' candidates');
+      put(String(x.kind || 'store'), bits.join(' - '));
+    });
+    rtHead(lsec, 'Lists accessed', ll.childNodes.length);
+    if (ll.childNodes.length) lsec.appendChild(ll);
+    else lsec.appendChild(make('p', 'rt-none', 'No list or pool was recorded for this line.'));
+    box.appendChild(lsec);
+  }
+  function rtMount(into, line, opts) {
+    if (!into) return null;
+    opts = opts || {};
+    var item = rtItem(line);
+    var box = make('div', 'rt-tag');
+    box.setAttribute('data-line-roll', item.lid);
+    var bar = make('div', 'rt-bar');
+    bar.appendChild(make('b', 'rt-title', opts.title == null ? 'How System 3 made this' : String(opts.title)));
+    var chip = make('span', 'rt-style', '');
+    bar.appendChild(chip);
+    var btn = make('button', 'rt-play');
+    btn.type = 'button';
+    btn.title = 'Play the roll from the dice';
+    btn.setAttribute('aria-label', btn.title);
+    btn.appendChild(mvGlyph('c:play--filled--alt', 'rt-play-ico'));
+    var label = make('span', '', 'Play');
+    btn.appendChild(label);
+    bar.appendChild(btn);
+    var stage = make('div', 'sp-mv-stage rt-stage');
+    var facts = make('div', 'rt-facts');
+    var fold = null;
+    if (opts.compact) {
+      fold = make('details', 'rt-fold');
+      fold.appendChild(make('summary', '', 'How System 3 made this'));
+      fold.appendChild(facts);
+    }
+    box.appendChild(bar);
+    box.appendChild(stage);
+    box.appendChild(fold || facts);
+    into.appendChild(box);
+    var st = {item: item, opts: opts, box: box, stage: stage, facts: facts, chip: chip, label: label, btn: btn,
+      style: mv.style, gen: 0, raf: 0, frameN: 0, plays: 0, done: false, cur: null, data: null, origin: null, verdict: ''};
+    chip.textContent = mv.style === 'classic' ? 'Classic' : 'Digital';
+    btn.addEventListener('click', function (ev) { ev.stopPropagation(); rtPlay(st); });
+    facts.appendChild(make('p', 'rt-none', 'Reading the line\'s System 3 record...'));
+    st.ready = Promise.all([item.lid ? mvAsk(item).then(null, function () { return null; }) : null,
+      item.kind === 'clip' ? null : rtOrigin(item.lid)]).then(function (two) {
+      st.data = two[0] || {rows: [], sources: {main: '', others: [], why: {}}};
+      st.origin = two[1] || (two[0] && two[0].origin) || null;
+      if (!st.data.stores) st.data.stores = mvStores(item, null, null);
+      rtFacts(st);
+    }).then(null, function (err) {
+      st.data = st.data || {rows: [], sources: {main: '', others: [], why: {}}};
+      facts.textContent = '';
+      facts.appendChild(make('p', 'rt-none', 'System 3 could not be read here: ' + String((err && err.message) || err)));
+    });
+    RT_LIVE = RT_LIVE.filter(function (x) { return x.box.isConnected; });
+    RT_LIVE.push(st);
+    var ctl = {
+      element: box,
+      play: function () { rtPlay(st); },
+      replay: function () { rtPlay(st); },
+      dispose: function () { rtStop(st); if (box.parentNode) box.parentNode.removeChild(box); },
+      state: function () { return rtState(st); }
+    };
+    box.pineRollTag = ctl;
+    if (opts.autoplay !== false) rtPlay(st);
+    return ctl;
+  }
+  function rtState(st) {
+    var c = st.cur;
+    return {line: st.item.lid, kind: st.item.kind, style: st.style, plays: st.plays, done: st.done,
+      state: st.box.getAttribute('data-state') || '', phase: c ? c.phase : '', typed: c ? c.typed : -1,
+      text: st.item.text, rollNow: c && c.sheet ? c.sheet.now : '', rows: st.data ? (st.data.rows || []).length : -1,
+      results: !!(c && c.showingResults), verdict: st.verdict, origin: !!st.origin,
+      /* the play's own schedule: every table's start, end, its grey slots, what it landed on, its dice */
+      plan: c && c.sheet ? c.sheet.tables.map(function (T) {
+        return [Math.round(T.at), Math.round(T.end), Math.round(T.dRej || 0), Math.round(T.dRej2 || 0), Math.round(T.dFail || 0),
+          T.cat.landedOf, T.sub ? T.sub.landedOf : '', T.r.main ? T.r.main.dice : '', T.r.sub ? T.r.sub.dice : ''].join('|');
+      }) : [],
+      hang: c && c.sheet ? Math.round(c.accEnd - c.sheet.rolled) : null,
+      source: st.data && st.data.sources ? st.data.sources.main : ''};
+  }
+  /* [rollplay] THE CLIP IN A POPUP. "when looking at an SFX clip in this
+     window also have a pip in this area showing the video allowing it to be
+     played and scrubbed by rubbing my finger back and forth on it to seek it
+     forward and backward. If I tap it, have it play unmuted on a loop."
+     (the operator, 2026-09-29)
+     PineRollTag.pip(container, line): the clip's picture found the way
+     [msgthumb] finds it (the row's url / poster / sfx ids, PineSfxTv.played(),
+     /api/sfx/url?id= - mvClipInfo / mvSigned), the poster first, then the
+     first frame; an audio-only clip gets the [msgthumb] LED meter on its own
+     levels. A horizontal drag seeks in proportion (the whole width is the
+     whole clip), throttled, fastSeek where the engine has it, the time shown
+     while dragging; a tap without a drag plays it WITH SOUND on a loop, and
+     again pauses. Its volume is the operator's own level for the kind (video
+     or sfx, pineLevels), never above the element's 1.0 - nothing is raised,
+     and no gain node is taken from the panel. While it is open it is the
+     page's only video: the Message view's is released and waits (mv.pip),
+     and it is stopped and released the frame its popup goes. */
+  var RT_SEEK_MS = 70;
+  function rtClock(t) {
+    t = Math.max(0, Number(t) || 0);
+    var m = Math.floor(t / 60), s = Math.floor(t % 60), d = Math.floor((t * 10) % 10);
+    return m + ':' + (s < 10 ? '0' : '') + s + '.' + d;
+  }
+  function rtPipLevel(p) {
+    var lv = null;
+    try { lv = root.pineLevels && root.pineLevels.get ? root.pineLevels.get() : null; } catch (e) { lv = null; }
+    var k = p.mode === 'audio' ? 'sfx' : 'video';
+    var v = lv && typeof lv[k] === 'number' ? lv[k] : 1;
+    return Math.max(0, Math.min(1, v));
+  }
+  function rtPipMode(p, mode) {
+    if (p.mode === mode) return;
+    p.mode = mode;
+    p.box.setAttribute('data-mode', mode);
+    if (mode === 'audio') {
+      if (p.img && p.img.parentNode) p.img.parentNode.removeChild(p.img);
+      p.img = null;
+      if (!p.canvas) {
+        var cv = document.createElement('canvas');
+        cv.className = 'rt-pip-led';
+        cv.setAttribute('role', 'img');
+        cv.setAttribute('aria-label', 'the clip\'s levels, falling, with each band\'s peak held');
+        p.face.appendChild(cv);
+        p.canvas = cv;
+      }
+    }
+  }
+  function rtPipFill(p) {
+    var c = p.info;
+    if (!p.mode) rtPipMode(p, c.video === true ? 'video' : (c.video === false ? 'audio' : 'probe'));
+    if (p.mode !== 'audio' && c.poster && !p.img && !p.posterFailed) {
+      var img = document.createElement('img');
+      img.className = 'rt-pip-poster';
+      img.alt = '';
+      img.addEventListener('load', function () { if (p.mode === 'probe') { rtPipMode(p, 'video'); rtPipFill(p); } });
+      img.addEventListener('error', function () {
+        p.posterFailed = true;
+        if (img.parentNode) img.parentNode.removeChild(img);
+        if (p.img === img) p.img = null;
+        if (p.mode === 'probe') { rtPipMode(p, 'audio'); rtPipFill(p); }
+      });
+      img.src = stationUrl(c.poster);
+      p.face.insertBefore(img, p.face.firstChild);
+      p.img = img;
+    }
+    if (p.mode === 'probe' && !c.poster && !c.sid) rtPipMode(p, 'audio');
+    if (p.mode === 'audio' && c.sid && c.url) mvLevelsAsk(c.sid, c.url);
+    if (!p.el && c.url && (p.mode === 'video' || p.mode === 'audio') && !p.dead) {
+      mvVideoRelease();                        /* the page's one video is this one now */
+      var v = document.createElement(p.mode === 'video' ? 'video' : 'audio');
+      v.className = 'rt-pip-media';
+      v.muted = true;
+      v.setAttribute('playsinline', '');
+      v.loop = true;
+      v.preload = 'auto';
+      if (p.mode === 'video') {
+        v.style.visibility = 'hidden';
+        videoFirstFrame(v, function () {
+          v.style.visibility = 'visible';
+          if (p.img) p.img.style.visibility = 'hidden';
+        }, function () {
+          v.style.visibility = 'hidden';
+          if (p.img) p.img.style.visibility = '';
+        });
+      }
+      v.addEventListener('error', function () { p.failed = true; p.box.setAttribute('data-failed', '1'); });
+      v.addEventListener('loadedmetadata', function () {
+        if (!p.boom && p.want >= 0) { try { v.currentTime = Math.min(v.duration - 0.04, p.want); } catch (e) { /* not yet */ } }
+      });
+      var boom = p.mode === 'video' ? mvBoomAsk(c) : '';   /* idle: the boomerang, muted, looping */
+      p.boom = !!boom;
+      v.src = stationUrl(boom || c.url);
+      p.face.appendChild(v);
+      p.el = v;
+      if (p.mode === 'video' && root.PineVcr) { try { root.PineVcr.in(v); } catch (e) { /* [vcrfx] it shows plainly */ } }   /* comes on like the SFX TV */
+      if (boom) rtPipIdle(p);
+    }
+    p.time.textContent = p.info.seconds ? rtClock(p.info.seconds) : '';
+  }
+  function rtPipIdle(p) {
+    var v = p.el;
+    if (!v) return;
+    v.muted = true;
+    v.loop = true;
+    try { var pr = v.play(); if (pr && pr.catch) pr.catch(function () { /* the poster stays */ }); } catch (e) { /* the poster stays */ }
+  }
+  /* a hand on the picture: the forward clip (the boomerang is a picture only) */
+  function rtPipOriginal(p) {
+    p.touched = true;
+    var v = p.el;
+    if (!v || !p.boom) return;
+    p.boom = false;
+    try { v.pause(); } catch (e) { /* gone */ }
+    v.muted = true;
+    v.src = stationUrl(p.info.url);
+    try { v.load(); } catch (e) { /* the next play loads it */ }
+  }
+  function rtPipRelease(p) {
+    if (p.dead) return;
+    p.dead = true;
+    if (p.raf) root.cancelAnimationFrame(p.raf);
+    p.raf = 0;
+    var v = p.el;
+    p.el = null;
+    if (v) {
+      if (root.PineVcr) { try { root.PineVcr.cancel(v); } catch (e) { /* nothing running */ } }
+      try { v.pause(); v.removeAttribute('src'); v.load(); } catch (e) { /* already gone */ }
+      if (v.parentNode) v.parentNode.removeChild(v);
+    }
+    if (mv.pip === p) mv.pip = null;
+  }
+  function rtPipSeek(p, t, force) {
+    var v = p.el;
+    if (!v) return;
+    var span = isFinite(v.duration) && v.duration > 0 ? v.duration : 0;
+    if (!span) return;
+    t = Math.max(0, Math.min(span - 0.04, t));
+    p.want = t;
+    var now = Date.now();
+    if (!force && now - p.seekAt < RT_SEEK_MS) return;
+    p.seekAt = now;
+    try {
+      if (typeof v.fastSeek === 'function' && !force) v.fastSeek(t);
+      else v.currentTime = t;
+    } catch (e) { /* not seekable yet */ }
+    p.seeks += 1;
+  }
+  function rtPipToggle(p) {
+    var v = p.el;
+    if (!v) return;
+    if (!v.paused && !v.muted) { v.pause(); p.box.classList.remove('rt-pip-on'); return; }
+    v.muted = false;
+    v.loop = true;
+    v.volume = rtPipLevel(p);
+    try {
+      var pr = v.play();
+      if (pr && pr.catch) pr.catch(function () { p.box.classList.remove('rt-pip-on'); });
+    } catch (e) { /* the picture stays */ }
+    p.box.classList.add('rt-pip-on');
+  }
+  function rtPipFrame(p) {
+    p.raf = 0;
+    if (p.dead) return;
+    if (!p.box.isConnected) { rtPipRelease(p); return; }
+    p.raf = root.requestAnimationFrame(function () { rtPipFrame(p); });
+    var v = p.el;
+    if (v && !v.paused && !v.muted) v.volume = rtPipLevel(p);   /* follows the operator's level */
+    if (v && !p.touched && !p.boom && p.mode === 'video' && !p.drag) {   /* the boomerang, once it is made */
+      var bu = mvBoomAsk(p.info);
+      if (bu) { p.boom = true; v.src = stationUrl(bu); rtPipIdle(p); }
+    }
+    var span = v && isFinite(v.duration) && v.duration > 0 ? v.duration : 0;
+    var at = p.drag && p.drag.moved && p.want >= 0 ? p.want : (v ? v.currentTime : 0);
+    if (span) {
+      var w = (at / span * 100).toFixed(1) + '%';
+      if (p.fill.style.width !== w) p.fill.style.width = w;
+      var tt = p.drag && p.drag.moved ? rtClock(at) + ' / ' + rtClock(span) : (v && !v.paused ? rtClock(at) : rtClock(span));
+      if (p.time.textContent !== tt) p.time.textContent = tt;
+    }
+    if (p.mode === 'audio' && p.canvas) {
+      var L = p.info.sid && mv.levels ? mv.levels[p.info.sid] : null;
+      var live = v && (!v.paused || (p.drag && p.drag.moved));
+      mvLedDraw(p, live && L && L.ready ? mvLevelsAt(L, at) : null, Date.now());
+    }
+  }
+  function rtPip(into, line, opts) {
+    if (!into) return null;
+    opts = opts || {};
+    var item = rtItem(line);
+    item.kind = 'clip';
+    if (mv.pip) rtPipRelease(mv.pip);
+    var box = make('div', 'rt-pip');
+    box.setAttribute('role', 'group');
+    box.setAttribute('aria-label', 'The clip: drag across it to scrub, tap to play it with sound on a loop, tap again to pause');
+    box.title = box.getAttribute('aria-label');
+    var face = make('div', 'rt-pip-face');
+    var state = make('span', 'rt-pip-state');
+    state.appendChild(mvGlyph('c:play--filled--alt', 'rt-pip-play'));
+    state.appendChild(mvGlyph('c:pause--filled', 'rt-pip-pause'));
+    var time = make('span', 'rt-pip-time', '');
+    var bar = make('div', 'rt-pip-bar');
+    var fill = make('i', '', '');
+    bar.appendChild(fill);
+    box.appendChild(face);
+    box.appendChild(state);
+    box.appendChild(time);
+    box.appendChild(bar);
+    into.appendChild(box);
+    var p = {item: item, box: box, face: face, time: time, fill: fill, info: mvClipInfo(item), mode: '', el: null,
+      img: null, canvas: null, led: null, drawn: 0, sizeAt: 0, dpr: 1, raf: 0, drag: null, seekAt: 0, want: -1,
+      seeks: 0, dead: false, failed: false, posterFailed: false, boom: false, touched: false};
+    mv.pip = p;
+    mvVideoRelease();
+    rtPipFill(p);
+    if (p.info.sid && (!p.info.url || !p.info.poster)) {
+      mvSigned(p.info.sid).then(function () {
+        if (p.dead) return;
+        p.info = mvClipInfo(item);
+        rtPipFill(p);
+      });
+    }
+    box.addEventListener('pointerdown', function (ev) {
+      if (ev.button > 0) return;
+      ev.stopPropagation();
+      try { box.setPointerCapture(ev.pointerId); } catch (e) { /* synthetic */ }
+      rtPipOriginal(p);
+      var v = p.el;
+      p.drag = {id: ev.pointerId, x: ev.clientX, t0: v ? v.currentTime : 0,
+        w: Math.max(1, box.getBoundingClientRect().width), moved: false};
+    });
+    box.addEventListener('pointermove', function (ev) {
+      var d = p.drag;
+      if (!d || ev.pointerId !== d.id) return;
+      var dx = ev.clientX - d.x;
+      if (!d.moved && Math.abs(dx) < 6) return;
+      d.moved = true;
+      box.classList.add('rt-pip-scrub');
+      var v = p.el;
+      var span = v && isFinite(v.duration) && v.duration > 0 ? v.duration : 0;
+      if (span) rtPipSeek(p, d.t0 + dx / d.w * span, false);
+    });
+    var up = function (ev) {
+      var d = p.drag;
+      if (!d || ev.pointerId !== d.id) return;
+      p.drag = null;
+      ev.stopPropagation();
+      box.classList.remove('rt-pip-scrub');
+      if (d.moved) { if (p.want >= 0) rtPipSeek(p, p.want, true); return; }
+      if (ev.type === 'pointerup') rtPipToggle(p);
+    };
+    box.addEventListener('pointerup', up);
+    box.addEventListener('pointercancel', up);
+    box.addEventListener('click', function (ev) { ev.stopPropagation(); });
+    p.raf = root.requestAnimationFrame(function () { rtPipFrame(p); });
+    var pctl = box.pineRollPip = {
+      element: box,
+      dispose: function () { rtPipRelease(p); if (box.parentNode) box.parentNode.removeChild(box); },
+      state: function () {
+        var v = p.el;
+        return {mode: p.mode, url: p.info.url, poster: p.info.poster, sid: p.info.sid, media: v ? v.tagName.toLowerCase() : '',
+          t: v ? v.currentTime : -1, duration: v && isFinite(v.duration) ? v.duration : 0, paused: v ? v.paused : true,
+          muted: v ? v.muted : true, loop: v ? v.loop : false, volume: v ? v.volume : 0, seeks: p.seeks, dead: p.dead,
+          failed: p.failed, drawn: p.drawn, boom: p.boom, src: v ? String(v.currentSrc || v.src || '') : ''};
+      }
+    };
+    return pctl;
+  }
+  root.PineRollTag = {
+    mount: rtMount,
+    pip: rtPip,
+    live: function () {
+      RT_LIVE = RT_LIVE.filter(function (x) { return x.box.isConnected; });
+      return RT_LIVE.map(rtState);
+    }
+  };
+
   root.PineMessageView = {
     show: function (view) { mvShow(String(view || 'feed')); },
     view: function () { return mv.view; },
@@ -7873,6 +9130,20 @@
         lvl: m.led ? m.led.lvl.reduce(function (a, b) { return a + b; }, 0) / MV_LED_COLS : 0,
         pk: m.led ? m.led.pk.reduce(function (a, b) { return a + b; }, 0) / MV_LED_COLS : 0}; },
     viz: function () { var z = mv.cur && mv.cur.viz; return z ? {style: z.style, name: z.name && z.name.name, drawn: z.drawn, peak: z.peak || 0} : null; },   /* [msgviz] */
+    pin: function () {                         /* [rollplay] */
+      var P = mv.pin;
+      return P ? {line: P.cur.item.lid, key: P.cur.item.key, cycles: P.cycles, phase: P.phase, run: P.run || 0,
+        frames: P.frames, off: P.off, log: P.log.slice(), rect: P.rect, rollNow: P.cur.sheet ? P.cur.sheet.now : ''} : null;
+    },
+    unpin: function () { mvUnpin(); },
+    _push: function (row) { if (row && row.id) mvBubbleStart(mvHistItem(row), false); },   /* the proofs: a new arrival */
+    pinEnded: function () { return mv.pinEnded || 0; },
+    pinWhy: function () { return mv.pinWhy || ''; },
+    history: function () {
+      var s = mv.stage;
+      return s ? {items: s.querySelectorAll('.sp-mv-item').length, hist: s.querySelectorAll('.sp-mv-hist').length,
+        top: s.scrollTop, height: s.scrollHeight, client: s.clientHeight, follow: !!mv.follow, fresh: mv.fresh || 0, at: mv.histAt} : null;
+    },
     _rowsOf: mvRowsOf, _sources: mvSources, _decisionRow: mvDecisionRow
   };
 
@@ -20796,6 +22067,7 @@
     node.classList.add('picked');
     var box = el('spDetail');
     if (!box) return;
+    if (box.hidden) lineTab = 'roll';          /* [rollplay] the popup comes up on Roll; walking lines keeps the tab */
     box.hidden = false;
     box.replaceChildren();
 
@@ -20807,7 +22079,21 @@
        without a rebuild; the strip keeps the tab across messages. */
     var tabs = lineTabsStrip(box, item);
     if (root.PineSfxSeen) { try { root.PineSfxSeen.lineStrip(box, item, tabs); } catch (e) { /* [sfxseen] the view stands without it */ } }
-    tabs.line.appendChild(make('p', 'sp-detail-text', item.text || ''));
+    /* [rollplay] "i need that able to do a lookup and reconstruction of the
+       roulette raffle feed message that occured for that digitally": the
+       display-receipt strip and the line's own words open Roll and play the
+       DIGITAL tile for exactly this line */
+    var rollWay = function (ev) { if (ev) ev.stopPropagation(); tabs.show('roll', {style: 'digital', replay: true}); };
+    var rollSeen = box.querySelector('.sfxseen-strip');
+    if (rollSeen) {
+      rollSeen.classList.add('sp-rollway');
+      rollSeen.title = String(rollSeen.title || '') + ' - tap to reconstruct its roll';
+      rollSeen.addEventListener('click', rollWay);
+    }
+    var rollWords = make('p', 'sp-detail-text sp-rollway', item.text || '');
+    rollWords.title = 'Tap to reconstruct how System 3 rolled this line';
+    rollWords.addEventListener('click', rollWay);
+    tabs.line.appendChild(rollWords);
 
     var facts = [];
     if (item.round) facts.push(item.round);
@@ -20891,8 +22177,8 @@
      box as it was; the other four mount the System 3 module's panes on the
      line's id once, then switch between them. The tab chosen stays chosen
      for the next line tapped, so a reader can walk the feed on one tab. */
-  var lineTab = 'line', lineTabs = null, lineTabsPane = null;
-  var LINE_TABS = [['line', 'Line'], ['system3', 'System 3'], ['node', 'Node'], ['prompt', 'Prompt'], ['tables', 'Tables'],
+  var lineTab = 'roll', lineTabs = null, lineTabsPane = null;   /* [rollplay] a popup opens on Roll */
+  var LINE_TABS = [['roll', 'Roll'], ['line', 'Line'], ['system3', 'System 3'], ['node', 'Node'], ['prompt', 'Prompt'], ['tables', 'Tables'],
     ['timing', 'Timing'], ['params', 'Parameters']];   /* [s3-line-tabs] the clocks + profiler; every parameter, folded */
   function lineTabsDispose() {
     if (lineTabs) { try { lineTabs.dispose(); } catch (e) { /* gone */ } }
@@ -20905,11 +22191,28 @@
     var line = make('div', 'sp-detail-line-tab');
     var pane = make('div', 'sp-detail-s3');
     pane.hidden = true;
+    var roll = make('div', 'sp-detail-roll');  /* [rollplay] the Message view tile, replayed for this line */
+    roll.hidden = true;
+    var rollTag = null;
     var buttons = {};
     var id = String(item.line || item.id || '');
-    function show(name) {
+    function show(name, o) {                 /* [rollplay] o: {style, replay} from a way in */
       lineTab = name;
       Object.keys(buttons).forEach(function (k) { buttons[k].setAttribute('aria-pressed', String(k === name)); });
+      roll.hidden = name !== 'roll';           /* [rollplay] */
+      if (name === 'roll') {
+        line.hidden = true;
+        pane.hidden = true;
+        var want = o && o.style;              /* a way in may ask for the Digital tile */
+        if (rollTag && want && rollTag.state().style !== want) { rollTag.dispose(); rollTag = null; }
+        if (!rollTag && root.PineRollTag) {
+          rollTag = root.PineRollTag.mount(roll, {id: id, said: item.text, name: item.name, who: item.who,
+            kind: item.kind, round: item.round, clip: item.tag === 'sting' || !!item.sfx},
+            {autoplay: true, title: '', style: want || ''});
+        } else if (rollTag && o && o.replay) rollTag.replay();
+        if (!rollTag) roll.textContent = 'The roll player is not on this page.';
+        return;
+      }
       line.hidden = name !== 'line';
       pane.hidden = name === 'line';
       if (name === 'line') return;
@@ -20932,7 +22235,7 @@
         if (!view) return;
         if (lineTabsPane !== pane) { try { view.dispose(); } catch (e) { /* gone */ } return; }
         lineTabs = view;
-        if (lineTab !== 'line') view.show(lineTab);
+        if (lineTab !== 'line' && lineTab !== 'roll') view.show(lineTab);   /* [rollplay] */
       }).catch(function (err) {
         if (lineTabsPane === pane) pane.textContent = 'System 3 could not open here: ' + String((err && err.message) || err);
         lineTabsPane = null;
@@ -20947,6 +22250,7 @@
       strip.appendChild(b);
     });
     box.appendChild(strip);
+    box.appendChild(roll);                  /* [rollplay] */
     box.appendChild(line);
     box.appendChild(pane);
     box.classList.add('has-tabs');

@@ -168763,6 +168763,165 @@ async def sfx_spec_api(
                     headers={"Cache-Control": "private, max-age=86400"})
 
 
+# [rollplay] THE BOOMERANG THUMBNAIL. "loop as a BOOMERANG: play forward,
+# then play backward to the start, then forward again" (the operator,
+# 2026-09-29, for the Message view's muted clip thumbnails and the popup
+# PiP when it idles). A <video> cannot run backwards smoothly - a backwards
+# currentTime walk stutters on a long-GOP MP4, worst in the tablet's
+# WebView - so the clip is MADE once: a <= 4 s excerpt from the poster's
+# point (0.5 s, else the start), 240p, video only, forward then reversed
+# ([0:v]trim,split[a][b];[b]reverse[r];[a][r]concat), h264 baseline, a
+# 12-frame GOP, faststart. Kept beside the posters, keyed by the clip id,
+# the file's size and mtime and a version, pruned to SFX_BOOM_KEEP files.
+#
+# THE HEAT RULE. The box overheats (#1285): one job at a time, in ONE
+# worker, under `nice -n 19`, never while ComfyUI has anything running or
+# queued (comfy_idle_live), never in the first SFX_BOOM_BOOT_S of a boot.
+# The first ask answers 202 {"making": true} and queues the clip; the page
+# plays the plain forward loop until a later ask answers the file.
+SFX_BOOM_DIR = data_path("sfx_boomerangs")
+SFX_BOOM_VERSION = 1
+SFX_BOOM_SECONDS = 4.0
+SFX_BOOM_KEEP = 300
+SFX_BOOM_BOOT_S = 180.0
+_SFX_BOOM_BORN = time.time()
+_SFX_BOOM_STATE: dict[str, str] = {}          # sid -> queued | making | failed
+_SFX_BOOM_QUEUE: list[tuple[str, Path, Path]] = []
+_SFX_BOOM_TASK: list[Any] = [None]
+
+
+def _boom_json(obj: Any, status_code: int = 200, headers: Any = None) -> Response:
+    return Response(json.dumps(obj), status_code=status_code, headers=headers or {}, media_type="application/json")
+
+
+def _sfx_boom_path(sid: str, sample: Path) -> Path:
+    st = sample.stat()
+    return SFX_BOOM_DIR / f"{sid}-{int(st.st_mtime)}-{st.st_size}-v{SFX_BOOM_VERSION}.mp4"
+
+
+def _render_boomerang(source: Path, out: Path, seconds: float = SFX_BOOM_SECONDS) -> bool:
+    """[rollplay] The forward-then-reversed excerpt, video only (see above)."""
+    import shutil as _shutil
+    import subprocess
+
+    import imageio_ffmpeg
+    exe = imageio_ffmpeg.get_ffmpeg_exe()
+    nice = ["nice", "-n", "19"] if _shutil.which("nice") else []
+    part = out.with_suffix(".part.mp4")
+    graph = ("[0:v]trim=duration=%.2f,setpts=PTS-STARTPTS,fps=24,scale=-2:240:flags=bicubic,"
+             "format=yuv420p,split[a][b];[b]reverse[r];[a][r]concat=n=2:v=1:a=0[v]" % seconds)
+    for seek in ("0.5", "0"):
+        try:
+            subprocess.run(
+                nice + [exe, "-nostdin", "-loglevel", "error", "-y", "-ss", seek, "-i", str(source),
+                        "-filter_complex", graph, "-map", "[v]", "-an",
+                        "-c:v", "libx264", "-profile:v", "baseline", "-level", "3.0", "-preset", "veryfast",
+                        "-crf", "30", "-g", "12", "-keyint_min", "12", "-sc_threshold", "0",
+                        "-movflags", "+faststart", str(part)],
+                check=True, timeout=90)
+        except Exception:
+            part.unlink(missing_ok=True)
+            continue
+        try:
+            made = part.exists() and part.stat().st_size > 1024
+        except OSError:
+            made = False
+        if made:
+            part.replace(out)
+            return True
+        part.unlink(missing_ok=True)
+    return False
+
+
+def _sfx_boom_prune() -> None:
+    try:
+        files = sorted(SFX_BOOM_DIR.glob("*.mp4"), key=lambda p: p.stat().st_mtime)
+    except OSError:
+        return
+    for old in files[:-SFX_BOOM_KEEP] if len(files) > SFX_BOOM_KEEP else []:
+        try:
+            old.unlink()
+        except OSError:
+            pass
+
+
+async def _sfx_boom_worker() -> None:
+    """ONE worker; it waits out a busy ComfyUI and the boot window."""
+    try:
+        while _SFX_BOOM_QUEUE:
+            if time.time() - _SFX_BOOM_BORN < SFX_BOOM_BOOT_S:
+                await asyncio.sleep(15)
+                continue
+            try:
+                busy = bool((await comfy_idle_live()).get("busy"))
+            except Exception:  # noqa: BLE001
+                busy = False
+            if busy:
+                await asyncio.sleep(20)
+                continue
+            sid, sample, out = _SFX_BOOM_QUEUE.pop(0)
+            _SFX_BOOM_STATE[sid] = "making"
+            try:
+                SFX_BOOM_DIR.mkdir(parents=True, exist_ok=True)
+                ok = await asyncio.to_thread(_render_boomerang, sample, out)
+                await asyncio.to_thread(_sfx_boom_prune)
+            except Exception:  # noqa: BLE001
+                ok = False
+            if ok:
+                _SFX_BOOM_STATE.pop(sid, None)
+            else:
+                _SFX_BOOM_STATE[sid] = "failed"
+    finally:
+        _SFX_BOOM_TASK[0] = None
+
+
+@app.get("/api/sfx/boomerang/{sid}")
+async def sfx_boomerang_api(
+    sid: str,
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> Response:
+    """[rollplay] The clip's boomerang thumbnail, made lazily (see above).
+    ?probe=1 answers JSON only: {ready, url} or {making}."""
+    cors = {"Access-Control-Allow-Origin": "*", "X-Content-Type-Options": "nosniff"}
+    if not re.match(r"^[a-f0-9]{16}\Z", sid or ""):
+        return Response(status_code=404, headers=cors)
+    signature = str(request.query_params.get("t") or "")
+    expected = media_sign(sid)
+    if not (expected and hmac.compare_digest(signature, expected)):
+        require_read_auth(authorization)
+    sample = await asyncio.to_thread(sfx_by_id, sid)
+    if sample is None or not sfx_is_video(sample):
+        return _boom_json({"ready": False, "why": "not a video"}, status_code=404, headers=cors)
+    out = await asyncio.to_thread(_sfx_boom_path, sid, sample)
+    if not out.exists():
+        state = _SFX_BOOM_STATE.get(sid)
+        if state == "failed":
+            return _boom_json({"ready": False, "why": "could not be made"}, status_code=404, headers=cors)
+        if not state and len(_SFX_BOOM_QUEUE) < 40:
+            _SFX_BOOM_STATE[sid] = "queued"
+            _SFX_BOOM_QUEUE.append((sid, sample, out))
+        if _SFX_BOOM_TASK[0] is None and _SFX_BOOM_QUEUE:
+            _SFX_BOOM_TASK[0] = asyncio.create_task(_sfx_boom_worker())
+        return _boom_json({"ready": False, "making": True, "state": _SFX_BOOM_STATE.get(sid) or "queued"},
+                            status_code=202, headers=cors)
+    url = f"/api/sfx/boomerang/{sid}?t={expected}"
+    if request.query_params.get("probe"):
+        return _boom_json({"ready": True, "url": url}, headers=cors)
+    size = await asyncio.to_thread(lambda: out.stat().st_size)
+    headers = dict(cors, **{"Accept-Ranges": "bytes", "Cache-Control": "private, max-age=86400"})
+    window = _range_slice(str(request.headers.get("range") or ""), size)
+    if window == (-1, -1):
+        headers["Content-Range"] = f"bytes */{size}"
+        return Response(status_code=416, headers=headers)
+    if window:
+        start, end = window
+        headers["Content-Range"] = f"bytes {start}-{end}/{size}"
+        return Response(await _range_once(out, start, end), status_code=206, headers=headers, media_type="video/mp4")
+    return Response(await asyncio.to_thread(out.read_bytes), headers=headers, media_type="video/mp4")
+
+
+
 @app.get("/api/sfx/ring")
 async def sfx_ring_get(
     authorization: str | None = Header(default=None),

@@ -4186,3 +4186,190 @@ html.pine-tech-wide .sp-tech.sp-tech-wide .wc-strip {
   font-weight: 400;
   font-size: 10px;
 }
+
+/* [rollplay] THE ROLL TAG, ANYWHERE: the Message view's bubble replayed for
+   one line in any popup (PineRollTag.mount in script-page.js) - the hold
+   menu's dice section, the repeat diagnostics' top section, the Script
+   popup's Roll tab. The bubble keeps every .sp-mv-* / .sp-rr-* rule above;
+   these only seat it in a popup and lay out what System 3 made it from.
+   The popups' own `button` rules are out-ranked here so the tile's Result
+   tab and tally rows look as they do in Message view. */
+.rt-tag {
+  display: flex; flex-direction: column; gap: 8px; min-width: 0;
+  color: var(--sp-text, #edf3f5); font: 13px/1.4 Inter, "Segoe UI", system-ui, sans-serif; text-align: left;
+}
+.rt-bar { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.rt-title { flex: 1; min-width: 0; font-size: 14px; font-weight: 650; }
+.rt-style {
+  flex: none; padding: 2px 8px; border: 1px solid #35414c; border-radius: 999px;
+  font: 600 10.5px Inter, "Segoe UI", system-ui, sans-serif; letter-spacing: .06em; text-transform: uppercase; color: var(--sp-muted, #8fa0ad);
+}
+.rt-tag button.rt-play {
+  flex: none; display: inline-flex; align-items: center; gap: 6px; min-height: 34px; padding: 0 14px 0 11px; margin: 0;
+  border: 1px solid var(--sp-on, #65c7da); border-radius: 999px; background: rgba(101, 199, 218, .12);
+  color: var(--sp-on, #65c7da); font: 700 12.5px Inter, "Segoe UI", system-ui, sans-serif; cursor: pointer;
+}
+.rt-tag button.rt-play:hover { background: rgba(101, 199, 218, .22); }
+.rt-play-ico, .rt-play-ico svg { width: 15px; height: 15px; fill: currentColor; display: inline-flex; }
+.rt-tag .rt-stage {
+  position: relative; flex: none; min-height: 132px; overflow: visible;
+  justify-content: flex-start; gap: 0; padding: 18px 2px 4px;
+  border: 1px solid #26313a; border-radius: 12px; background: #0b1117;
+}
+.rt-tag .rt-stage > .sp-mv-item { max-width: 100%; }
+.rt-tag .rt-stage > .sp-mv-item.sp-mv-digital { width: min(460px, 100%); }
+.rt-tag .rt-stage > .sp-mv-left { margin-left: 10px; }
+.rt-tag .rt-stage > .sp-mv-right { margin-right: 10px; }
+.rt-tag .rt-stage .sp-mv-all { position: static; max-height: none; margin-top: 4px; box-shadow: none; }
+.rt-tag .rt-wait { align-self: center; margin: 32px 0; }
+.rt-tag button.sp-mv-result {
+  min-height: 24px; margin-top: -2px; padding: 1px 12px 2px; border: 2px solid #3a4a57; border-top: 0; border-radius: 0 0 10px 10px;
+  background: #121a21; color: #cfe3ea; font: 700 12px Inter, "Segoe UI", system-ui, sans-serif;
+}
+.rt-tag button.sp-mv-resrow {
+  min-height: 30px; padding: 5px 9px; border: 1px solid rgba(53, 65, 76, .8); border-left: 3px solid var(--fam, #68ced9); border-radius: 6px;
+  background: #0e151b; color: #d6e3e9; font: 12px Inter, "Segoe UI", system-ui, sans-serif;
+}
+.rt-tag .sp-mv-results .sp-mv-rolls { cursor: pointer; }
+.rt-facts { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+.rt-verdict { margin: 0; padding: 6px 10px; border-left: 3px solid #54d18b; border-radius: 6px; background: rgba(84, 209, 139, .08); font-size: 12.5px; overflow-wrap: anywhere; }
+.rt-verdict.rt-v-forced { border-left-color: #d9b24c; background: rgba(217, 178, 76, .1); }
+.rt-verdict.rt-v-rogue, .rt-verdict.rt-v-none { border-left-color: #ef7b72; background: rgba(239, 123, 114, .1); }
+.rt-sec { min-width: 0; }
+.rt-tag .rt-h {
+  display: flex; align-items: baseline; gap: 6px; margin: 2px 0 4px;
+  font: 700 10.5px Inter, "Segoe UI", system-ui, sans-serif; letter-spacing: .08em; text-transform: uppercase; color: var(--sp-muted, #8fa0ad);
+}
+.rt-h i { font-style: normal; color: #cfe3ea; }
+.rt-table { width: 100%; border-collapse: separate; border-spacing: 0 3px; font-size: 12px; table-layout: auto; }
+.rt-table th { padding: 0 6px; text-align: left; font: 600 10px Inter, "Segoe UI", system-ui, sans-serif; letter-spacing: .05em; text-transform: uppercase; color: #6f808c; }
+.rt-table td { padding: 3px 6px; background: #0e151b; vertical-align: top; overflow-wrap: anywhere; color: #d6e3e9; }
+.rt-table td:first-child { border-left: 3px solid var(--fam, #68ced9); border-radius: 6px 0 0 6px; }
+.rt-table td:last-child { border-radius: 0 6px 6px 0; }
+.rt-table .rt-tb { color: var(--fam, #68ced9); font-weight: 700; white-space: nowrap; }
+.rt-table .rt-tb i { display: block; font-style: normal; font-weight: 400; font-size: 10.5px; color: #8fa0ad; white-space: normal; }
+.rt-table .rt-d { width: 1%; font: 700 11px ui-monospace, Consolas, monospace; color: #fff; text-align: center; white-space: nowrap; }
+.rt-table .rt-extra td:first-child { border-left-style: dashed; }
+.rt-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 3px; }
+.rt-list li { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px; padding: 3px 8px; border-radius: 6px; background: #0e151b; font-size: 12px; overflow-wrap: anywhere; }
+.rt-list li b { color: #cfe3ea; font-weight: 700; }
+.rt-list li span { color: #9fb0bb; min-width: 0; }
+.rt-list li em { font-style: normal; font-size: 10px; padding: 0 5px; border-radius: 999px; background: rgba(101, 199, 218, .16); color: var(--sp-on, #65c7da); text-transform: uppercase; letter-spacing: .06em; }
+.rt-list .rt-ico, .rt-list .rt-ico svg { width: 14px; height: 14px; fill: currentColor; color: var(--sp-on, #65c7da); align-self: center; display: inline-flex; }
+.rt-none { margin: 0; font-size: 12px; color: var(--sp-muted, #8fa0ad); }
+/* the tile folded to its facts (the hold menu) */
+.rt-fold > summary { cursor: pointer; font: 700 10.5px Inter, "Segoe UI", system-ui, sans-serif; letter-spacing: .08em; text-transform: uppercase; color: var(--sp-muted, #8fa0ad); padding: 2px 0; }
+.rt-fold[open] > summary { margin-bottom: 6px; }
+/* the clip in a popup: drag to scrub, tap to play it with sound on a loop */
+.rt-pip {
+  position: relative; width: 100%; aspect-ratio: 16 / 9; min-height: 96px; overflow: hidden;
+  border: 1px solid #35414c; border-radius: 12px; background: #000; touch-action: none; cursor: ew-resize;
+  -webkit-user-select: none; user-select: none;
+}
+.rt-pip-face, .rt-pip-face > * { position: absolute; inset: 0; width: 100%; height: 100%; }
+.rt-pip-face img, .rt-pip-face video { object-fit: contain; pointer-events: none; }
+.rt-pip-face audio { display: none; }
+.rt-pip-led { background: transparent; pointer-events: none; }
+.rt-pip-state {
+  position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); width: 42px; height: 42px;
+  display: flex; align-items: center; justify-content: center; border-radius: 50%;
+  background: rgba(0, 0, 0, .55); color: #fff; pointer-events: none; transition: opacity .2s;
+}
+.rt-pip-state .sp-mv-ico, .rt-pip-state svg { width: 20px; height: 20px; fill: currentColor; }
+.rt-pip-pause { display: none; }
+.rt-pip.rt-pip-on .rt-pip-state { opacity: 0; }
+.rt-pip.rt-pip-scrub .rt-pip-state { opacity: 0; }
+.rt-pip-time {
+  position: absolute; left: 8px; bottom: 9px; padding: 1px 6px; border-radius: 6px; background: rgba(0, 0, 0, .6);
+  color: #fff; font: 600 11px ui-monospace, Consolas, monospace; pointer-events: none;
+}
+.rt-pip.rt-pip-scrub .rt-pip-time { font-size: 13px; color: var(--sp-on, #65c7da); }
+.rt-pip-bar { position: absolute; left: 0; right: 0; bottom: 0; height: 4px; background: rgba(255, 255, 255, .12); pointer-events: none; }
+.rt-pip-bar i { position: absolute; left: 0; top: 0; bottom: 0; width: 0; background: var(--sp-on, #65c7da); }
+/* the three homes */
+.la-head.la-tiled .la-said { display: none; }
+.la-roll-band { display: flex; gap: 10px; align-items: flex-start; margin: 6px 0 10px; min-width: 0; }
+.la-roll-box { flex: 1 1 auto; min-width: 0; max-height: min(44vh, 400px); overflow-y: auto; overscroll-behavior: contain; padding-right: 2px; }
+.la-clip-band .la-roll-box { flex: 1 1 56%; }
+.la-pip-box { flex: 1 1 44%; min-width: 0; }
+.la-roll-box .rt-tag .rt-stage { min-height: 112px; padding-top: 16px; }
+.la-roll-box .rt-bar { display: none; }
+.lr-section.lr-roll { border-top: 0; }
+.sp-detail-roll[hidden] { display: none; }
+.sp-detail-roll { min-width: 0; max-height: min(56vh, 520px); overflow-y: auto; overscroll-behavior: contain; }
+/* [rollplay] rejected and failed: they pop in, then go grey and inert (reason on hover / long-press) */
+.sp-rr-step.sp-rr-has-rej { flex-wrap: wrap; row-gap: 4px; }
+.sp-rr-rej { flex-basis: 100%; display: flex; flex-wrap: wrap; gap: 4px; padding-left: 34px; min-width: 0; }
+.sp-rr-sub .sp-rr-rej { padding-left: 34px; }
+.sp-rr-rejc {
+  max-width: 100%; padding: 0 7px; border: 1px solid var(--fam, #68ced9); border-radius: 6px;
+  font: 11px/18px Inter, "Segoe UI", system-ui, sans-serif; color: #e8f1f5; background: rgba(255, 255, 255, .05);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; cursor: help;
+  opacity: 0; transform: scale(.6); transition: transform .12s ease-out, opacity .12s linear, filter .25s, color .25s;
+}
+.sp-rr-rejc.pop { opacity: 1; transform: scale(1.08); }
+.sp-rr-rejc.gone { opacity: .5; transform: none; filter: grayscale(1); color: #7d8a93; border-color: #4a5560; text-decoration: line-through; }
+.sp-rr-t.sp-rr-failed { filter: grayscale(1); opacity: .5; cursor: help; }
+.sp-rr-rejn { margin-left: auto; flex: none; font-size: 10px; color: #7d8a93; cursor: help; }
+/* the finished table: the category on its row, the sub-result indented under it */
+.sp-rr-t.folded .sp-rr-line.sp-rr-two { display: flex; flex-direction: column; align-items: stretch; gap: 1px; white-space: normal; }
+.sp-rr-two .sp-rr-lc, .sp-rr-two .sp-rr-ls { display: flex; align-items: baseline; gap: 6px; min-width: 0; white-space: nowrap; overflow: hidden; }
+.sp-rr-two .sp-rr-ls { padding-left: 22px; }
+.sp-rr-two .sp-rr-ll { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.sp-rr-two .sp-rr-lof { margin-left: auto; flex: none; font-size: 10px; }
+/* the clip's file type, off the file: video teal, audio amber */
+.sp-mv-ftype {
+  flex: none; margin-left: 6px; padding: 0 7px; border: 1px solid currentColor; border-radius: 999px;
+  font: 700 10px/16px ui-monospace, Consolas, monospace; letter-spacing: .04em;
+}
+.sp-mv-ftype.is-video { color: #65c7da; background: rgba(101, 199, 218, .12); }
+.sp-mv-ftype.is-audio { color: #f0b35a; background: rgba(240, 179, 90, .12); }
+.sp-mv-stored .sp-mv-who .sp-mv-ftype { margin-right: 24px; }
+/* no roll: said in words, with the road */
+.rt-noroll { margin: 4px 0 2px; padding: 3px 8px; border-left: 3px solid #ef7b72; border-radius: 6px; background: rgba(239, 123, 114, .1); font-size: 12px; color: #f3c7c2; }
+.rt-table tr.rt-failed td { opacity: .5; filter: grayscale(1); }
+.rt-table tr.rt-rejrow td { background: transparent; padding-top: 0; border-left: 0 !important; }
+.rt-table tr.rt-rejrow b { margin-right: 6px; font-size: 10px; letter-spacing: .06em; text-transform: uppercase; color: #7d8a93; }
+.rt-rej { display: inline-block; margin: 0 4px 3px 0; padding: 0 6px; border: 1px solid #4a5560; border-radius: 6px; color: #7d8a93; text-decoration: line-through; filter: grayscale(1); cursor: help; font-size: 11px; }
+.rt-unrec { font-size: 11px; opacity: .8; margin-top: 4px; }
+/* a way into the reconstruction */
+.sp-rollway { cursor: pointer; }
+.sfxseen-strip.sp-rollway:hover, .sp-detail-text.sp-rollway:hover { outline: 1px solid rgba(101, 199, 218, .5); outline-offset: 2px; border-radius: 6px; }
+/* [rollplay] the Message view scrolls back freely; new arrivals are counted, never forced into view */
+.sp-mv { position: relative; }
+.sp-mv-stage.sp-mv-scroll {
+  overflow-x: hidden; overflow-y: auto; justify-content: flex-start; overscroll-behavior: contain;
+  touch-action: pan-y; -webkit-overflow-scrolling: touch; overflow-anchor: auto;
+}
+.sp-mv-stage.sp-mv-scroll > .sp-mv-item { flex: none; }
+.sp-mv-stage.sp-mv-scroll > .sp-mv-item:first-child { margin-top: auto; }
+.sp-mv-hist .sp-mv-rolls { display: none; }
+.sp-mv-newchip {
+  position: absolute; left: 50%; bottom: 12px; z-index: 6; transform: translateX(-50%);
+  display: inline-flex; align-items: center; gap: 6px; min-height: 30px; padding: 0 12px 0 14px;
+  border: 1px solid var(--sp-on, #65c7da); border-radius: 999px; background: #0b1117; color: var(--sp-on, #65c7da);
+  font: 700 12px Inter, "Segoe UI", system-ui, sans-serif; cursor: pointer; box-shadow: 0 6px 18px rgba(0, 0, 0, .5);
+}
+.sp-mv-newchip[hidden] { display: none; }
+.sp-mv-newchip .sp-mv-ico, .sp-mv-newchip svg { width: 14px; height: 14px; fill: currentColor; }
+/* the pin: viewfinder ticks at the corners, a slow glow - never a scale */
+.sp-mv-pinned .sp-mv-bubble { animation: spMvPulse 2s ease-in-out infinite; }
+@keyframes spMvPulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(101, 199, 218, 0); }
+  50% { box-shadow: 0 0 8px 0 rgba(101, 199, 218, .25); }
+}
+.sp-mv-ticks { position: absolute; inset: -7px; pointer-events: none; animation: spMvTicks .15s ease-out both; }
+@keyframes spMvTicks { from { opacity: 0; transform: scale(1.08); } to { opacity: 1; transform: scale(1); } }
+.sp-mv-tick { position: absolute; width: 10px; height: 10px; border: 0 solid var(--sp-on, #65c7da); }
+.sp-mv-tick.tl { left: 0; top: 0; border-left-width: 2px; border-top-width: 2px; border-top-left-radius: 5px; }
+.sp-mv-tick.tr { right: 0; top: 0; border-right-width: 2px; border-top-width: 2px; border-top-right-radius: 5px; }
+.sp-mv-tick.bl { left: 0; bottom: 0; border-left-width: 2px; border-bottom-width: 2px; border-bottom-left-radius: 5px; }
+.sp-mv-tick.br { right: 0; bottom: 0; border-right-width: 2px; border-bottom-width: 2px; border-bottom-right-radius: 5px; }
+.sp-mv-result.sp-mv-pinning { border-color: var(--sp-on, #65c7da); color: var(--sp-on, #65c7da); background: rgba(101, 199, 218, .14); }
+@media (prefers-reduced-motion: reduce) {
+  .sp-mv-pinned .sp-mv-bubble { animation: none; box-shadow: 0 0 6px 0 rgba(101, 199, 218, .22); }
+  .sp-mv-ticks { animation: none; }
+}
+.sp-mv-stage.sp-mv-pinlist { overflow-anchor: none; }
+.sp-mv-frozen, .sp-mv-frozen * { animation-play-state: paused !important; }
+.rt-tag .sp-mv-all[hidden], .sp-mv-hist .sp-mv-all[hidden] { display: none; }
