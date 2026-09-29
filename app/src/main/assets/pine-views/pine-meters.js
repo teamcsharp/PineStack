@@ -156,6 +156,26 @@
       out[b] = v;
       if (v > peak) peak = v;
     }
+    /* [plmeter] the music as heard: the analyser sits BEFORE the level's gain
+     * node (source -> analyser -> gain -> gate), so shift the reading by the
+     * gain actually applied (slider x duck x element volume), in dB over the
+     * analyser's 70 dB span. */
+    if (kind === 'music') {
+      var applied = 1;
+      try {
+        var gf = typeof root.gainFor === 'function' ? root.gainFor(held.el, 'music') : null;
+        if (gf && gf.node && gf.node.gain) applied *= gf.node.gain.value;
+        applied *= held.el.volume;
+      } catch (err) { applied = 1; }
+      if (applied < 0.999) {
+        var dropV = -20 * Math.log(Math.max(0.0001, applied)) / Math.LN10 / 70 * lift;
+        peak = 0;
+        for (var q = 0; q < bins; q += 1) {
+          out[q] = Math.max(0, out[q] - dropV);
+          if (out[q] > peak) peak = out[q];
+        }
+      }
+    }
     /* An element that is paused or silent must read zero, not the last
      * frame the analyser happened to hold. */
     if (held.el.paused || held.el.muted) {
