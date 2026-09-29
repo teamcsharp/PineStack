@@ -1312,6 +1312,7 @@
       bar = make('div', 'pl-countdown');
       bar.id = 'plCountdown';
       bar.appendChild(make('div', 'pl-countdown-fill'));
+      bar.appendChild(make('div', 'pl-countdown-split'));          /* [plsplit] */
       bar.appendChild(make('span', 'pl-countdown-words', ''));
       host.parentNode.insertBefore(bar, host);
     }
@@ -1329,6 +1330,23 @@
     } else {
       text = test + ' - armed, waiting for the first sound';
     }
+    /* [plsplit] the track split: quiet fills a blue strip toward the split */
+    var sp = st.recording && st.recording.split;
+    var strip = bar.querySelector('.pl-countdown-split');
+    var sfrac = 0;
+    if (sp && sp.waiting) {
+      sfrac = 1;
+      text = 'Track ' + Math.max(1, sp.track - 1) + ' recorded - track ' + sp.track + ' starts when you play'
+        + (st.phase === 'fallback' ? ' (the records have the air)' : '');
+    } else if (sp && sp.after_s && Number(sp.quiet_s) >= 1) {
+      sfrac = Math.min(1, Number(sp.quiet_s) / sp.after_s);
+      text = 'Quiet ' + Math.round(sp.quiet_s) + ' s - splitting track ' + sp.track + ' in '
+        + Math.max(0, Math.ceil(sp.after_s - sp.quiet_s)) + ' s'
+        + (st.phase === 'live' && f && f.after_s ? '; the records take the air in '
+          + Math.max(0, Math.ceil(f.after_s - Number(f.quiet_s || 0))) + ' s' : '');
+    }
+    if (strip) strip.style.width = (sfrac * 100).toFixed(1) + '%';
+    setClass(bar, 'splitting', sfrac > 0);
     bar.firstChild.style.width = (frac * 100).toFixed(1) + '%';
     setClass(bar, 'warn', frac > 0 && frac < 0.67);
     setClass(bar, 'down', frac <= 0);
