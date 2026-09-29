@@ -51,6 +51,15 @@ object ViewAssets {
         "pinelive-scope.js",
         "pinelive-guide.js",
         "pinelive.js",
+        // Voice Actor: the person badge beside that mic, and the
+        // cast subpanel behind it - same bar, same mount pattern.
+        "voice-actor.js",
+        // Voice Actor viz: the icosphere-to-folder tiles on the
+        // extraction rail (one shared renderer, DPR 1, 30 fps here).
+        "voice-actor-viz.js",
+        // Voice Actor extraction: the signature-making pane behind
+        // the panel's New actor button (registers with the shell).
+        "voice-actor-extract.js",
         "changelog.js",           // Git-backed task history from the audit footer
         "console-trace.js",       // tap that line: where the work came from
         "audio-law.js",           // ONE door to every level and route
@@ -151,6 +160,9 @@ object ViewAssets {
         "clip-doctor.css",        // #1361b: the doctor's sheet
         "pine-cam.css",           // #1358: the box and the flag
         "pinelive.css",           // the mic badge and the MX Live popup
+        "voice-actor.css",        // the person badge and the cast subpanel
+        "voice-actor-viz.css",    // the extraction tiles and their 4-line readout
+        "voice-actor-extract.css", // the extraction pane: link, library, cart, jobs
         // #1191/#1202: the glass, its triangles and its headline number. Same
         // finding as the script above - the file was in assets and in no
         // list, so on the tablet the pop-up would have opened unstyled if

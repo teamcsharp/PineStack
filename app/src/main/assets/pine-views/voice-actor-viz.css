@@ -1,0 +1,97 @@
+/* VOICE ACTOR - the assimilation tiles on the extraction studio's rail
+ * (voice-actor-viz.js). They live inside #vaTileRail, which the shell
+ * (voice-actor.css) already makes a horizontal, touch-scrollable strip that
+ * hides itself while empty. Nothing here carries a z-index or a dialog
+ * role (SHELL_CONTRACT.md section 3): BACK must keep closing the layer. */
+
+.vaz-tile {
+  flex: 0 0 auto; width: 252px; box-sizing: border-box;
+  display: flex; flex-direction: column;
+  border: 1px solid #293a44; border-radius: 7px; background: #0d161b; color: #dbe7eb;
+  overflow: hidden; font: 12px/1.3 Inter, "Segoe UI", system-ui, sans-serif;
+}
+.vaz-tile[data-stage="done"] { border-color: #6b5a2c; }
+.vaz-tile[data-stage="error"] { border-color: #6a3a33; }
+
+.vaz-head {
+  flex: 0 0 auto; display: flex; align-items: center; gap: 6px; min-height: 30px;
+  padding: 0 2px 0 8px; border-bottom: 1px solid #1f2d35;
+}
+.vaz-ico { flex: 0 0 auto; display: inline-flex; color: #65c7da; }
+.vaz-ico .pi-icon, .vaz-ico svg { width: 14px; height: 14px; }
+.vaz-tile[data-stage="done"] .vaz-head .vaz-ico { color: #e3be63; }
+.vaz-tile[data-stage="error"] .vaz-head .vaz-ico { color: #ef6f5e; }
+.vaz-name {
+  flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-size: 12px; font-weight: 600; color: #dbe7eb;
+}
+.vaz-stage {
+  flex: 0 0 auto; max-width: 96px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  color: #8fa0ad; font-size: 10px; letter-spacing: .06em; text-transform: uppercase;
+}
+.vaz-tile[data-stage="done"] .vaz-stage { color: #54d18b; }
+.vaz-tile[data-stage="error"] .vaz-stage { color: #ef6f5e; }
+.vaz-dismiss {
+  flex: 0 0 auto; width: 30px; height: 30px; min-height: 28px; padding: 0; margin: 0;
+  display: inline-flex; align-items: center; justify-content: center;
+  border: 0; border-radius: 5px; background: transparent; color: #8fa0ad; cursor: pointer;
+}
+.vaz-dismiss[hidden] { display: none; }
+.vaz-dismiss:hover, .vaz-dismiss:focus-visible { background: #1a2830; color: #dbe7eb; outline: none; }
+.vaz-dismiss .pi-icon, .vaz-dismiss svg { width: 15px; height: 15px; }
+
+.vaz-view {
+  position: relative; flex: 0 0 auto; height: 112px;
+  background: radial-gradient(120% 90% at 25% 55%, #13262e 0%, #0b1418 70%);
+}
+.vaz-canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+.vaz-meter { position: absolute; left: 0; right: 0; bottom: 0; height: 2px; background: rgba(53, 65, 76, .7); }
+.vaz-meter i { display: block; height: 100%; width: 0; background: #65c7da; transition: width .35s ease-out; }
+.vaz-tile[data-stage="done"] .vaz-meter i { background: #54d18b; }
+.vaz-tile[data-stage="error"] .vaz-meter i { background: #ef6f5e; }
+
+/* the finished card rides over the empty left half, where the sphere was */
+.vaz-card {
+  position: absolute; left: 8px; top: 8px; bottom: 8px; width: 44%;
+  display: flex; flex-direction: column; justify-content: space-between; gap: 4px;
+  pointer-events: none;
+}
+.vaz-card[hidden] { display: none; }
+.vaz-card-who { display: flex; align-items: center; gap: 5px; min-width: 0; flex-wrap: wrap; }
+.vaz-card-who .vaz-ico { color: #e3be63; }
+.vaz-card-name {
+  min-width: 0; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  color: #e3be63; font-size: 12.5px; font-weight: 700;
+}
+.vaz-card-engine {
+  padding: 0 5px; border: 1px solid #35414c; border-radius: 3px;
+  color: #65c7da; font-size: 9.5px; letter-spacing: .06em; line-height: 15px;
+}
+.vaz-card-note { color: #8fa0ad; font-size: 10.5px; }
+.vaz-sig { display: flex; align-items: flex-end; gap: 3px; height: 30px; }
+.vaz-sig-bar { flex: 1 1 0; height: 100%; display: flex; align-items: flex-end; background: rgba(53, 65, 76, .45); border-radius: 2px; }
+.vaz-sig-bar i { display: block; width: 100%; background: #54d18b; border-radius: 2px; }
+
+/* THE FOUR LINES: a clipped window, never a scroller */
+.vaz-readout { flex: 0 0 auto; padding: 4px 8px 5px; background: #091015; border-top: 1px solid #1f2d35; }
+.vaz-window { position: relative; height: 56px; overflow: hidden; }   /* 4 x LINE_H (14px) */
+.vaz-lines { position: absolute; left: 0; right: 0; bottom: 0; transition: transform .24s ease-out; will-change: transform; }
+.vaz-line {
+  display: flex; gap: 6px; height: 14px; line-height: 14px; white-space: nowrap; overflow: hidden;
+  font: 10px/14px ui-monospace, "Cascadia Mono", Consolas, "Roboto Mono", monospace;
+}
+.vaz-line-tag { flex: 0 0 52px; overflow: hidden; text-overflow: ellipsis; color: #65c7da; }
+.vaz-line-text { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; color: #b9ccd3; }
+.vaz-line-bad .vaz-line-tag, .vaz-line-bad .vaz-line-text { color: #ef6f5e; }
+.vaz-line:last-child .vaz-line-text { color: #dbe7eb; }
+
+@media (prefers-reduced-motion: reduce) {
+  .vaz-lines, .vaz-meter i { transition: none; }
+}
+
+/* the tablet glass (1154x690, touch): a little smaller, larger dismiss */
+@media (pointer: coarse), (max-height: 760px) {
+  .vaz-tile { width: 232px; }
+  .vaz-view { height: 100px; }
+  .vaz-dismiss { width: 36px; height: 30px; }
+}
