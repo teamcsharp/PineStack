@@ -157,7 +157,9 @@
       hidden = !!(root.PineOrchGlass && typeof root.PineOrchGlass.isDotHidden === 'function'
         && root.PineOrchGlass.isDotHidden());
     } catch (err) { hidden = false; }
-    button.hidden = !hidden;
+    button.hidden = false;                      /* [plbar] the face is always there */
+    var t = hidden ? 'Restore the orchestrator control' : 'Open the orchestrator';
+    if (button.title !== t) { button.title = t; button.setAttribute('aria-label', t); }
   }
 
   function paintTalkRestoreButton(bar) {
@@ -226,9 +228,11 @@
         return;
       }
       if (event.target && event.target.closest && event.target.closest('.pine-console-orchestrator')) {
-        if (root.PineOrchGlass && typeof root.PineOrchGlass.undot === 'function') {
-          root.PineOrchGlass.undot();
-        }
+        /* [plbar] tucked away: bring the face back; face up: open the orchestrator */
+        var og = root.PineOrchGlass;
+        if (og && typeof og.isDotHidden === 'function' && !og.isDotHidden()
+            && typeof og.toggle === 'function') og.toggle();
+        else if (og && typeof og.undot === 'function') og.undot();
         paintOrchestratorButton(bar);
         return;
       }
