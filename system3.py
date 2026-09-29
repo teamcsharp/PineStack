@@ -477,6 +477,9 @@ def validate_table(table):
     family = str(table.get("family") or "")
     if family == "MEMORY":                                   # [s3-memory] kinds with rules, how many a round
         return _validate_memory_table(table, tid)
+    if family in ("MGRTOPIC", "MGRSUB"):                  # [s3-mgrtopics] the manager's topics, his sub messages
+        import system3_mgrtopics
+        return system3_mgrtopics.validate_table(table)
     if family not in ("CTS", "ES", "RS", "IRS", "FL", "TEMPER", "SHOCK", "INTERJECT", "FAV", "DIRECTIVE", "EVENT",
                       "CHANCE", "POOL", "SPEAKERBOX", "RESOLVE", "WRAP", "IL",
                       "TRACK_TALK", "ANGLE"):     # [s3-live-event] event-row families
@@ -6694,7 +6697,8 @@ def replay(stored, config):
     for _sp in stored.get("splits") or []:                                     # [s3-split] after the words
         _replay_split(conv, config, _sp)
     a = [(e["family"], (e.get("selected") or {}).get("id"), (e.get("rng") or {}).get("u")) for e in stored["decision_events"]
-         if e["family"] != "STATION"]          # [s3-dice-door] drawn by the road before the plan: recorded, not replayed
+         if e["family"] != "STATION"          # [s3-dice-door] drawn by the road before the plan: recorded, not replayed
+         and not (e.get("meta") or {}).get("road_roll")]   # [s3-mgrtopics] the manager's topic draws, likewise
     b = [(e["family"], (e.get("selected") or {}).get("id"), (e.get("rng") or {}).get("u")) for e in conv["decision_events"]]
     first = next((i for i, (x, y) in enumerate(zip(a, b)) if x != y), None)
     same = a == b

@@ -43,6 +43,10 @@ import time
 import system3
 import system3_tables                     # [s3-calls] road structures
 from system3_store import System3Store
+try:                                      # [s3-mgrtopics] the manager's topic roulette
+    import system3_mgrtopics
+except ImportError:  # pragma: no cover - a host without the module runs as before
+    system3_mgrtopics = None
 
 # One writer and one reader of the ledger, never the default executor:
 # #1311c / #1320 are the standing lesson that a long job on the shared pool
@@ -610,6 +614,101 @@ class System3Runtime:
             self.fail("station roll on a round", exc)
             return {}
 
+    # --- [s3-mgrtopics] the station manager's topic roulette ------------------------
+    def _mgr_path(self):
+        return self.host.data_path("system3_mgrtopics.json")
+
+    def _mgr_hist(self):
+        """His history, newest first: {topics, subs, approaches} (read once)."""
+        hist = self.__dict__.get("mgr_hist")
+        if hist is None:
+            got = {}
+            try:
+                got = json.loads(Path(self._mgr_path()).read_text(encoding="utf-8"))
+            except (OSError, ValueError, TypeError, AttributeError):
+                got = {}
+            hist = system3_mgrtopics.history_note(got if isinstance(got, dict) else {}, None)
+            self.__dict__["mgr_hist"] = hist
+        return hist
+
+    def _mgr_save(self, hist):
+        snap = json.loads(json.dumps(hist))
+
+        def job():
+            try:
+                path = Path(self._mgr_path())
+                tmp = path.with_suffix(".json.tmp")
+                tmp.write_text(json.dumps(snap), encoding="utf-8")
+                tmp.replace(path)
+            except Exception as exc:  # noqa: BLE001
+                self.fail("manager topics history", exc)
+        if threading.current_thread().name.startswith("system3-store"):
+            job()
+        else:
+            _STORE_POOL.submit(job)
+
+    def _mgr_board(self):
+        """The station's topics board (the Topics board list), as the manager's
+        roll sees it: id, words, times sprung."""
+        try:
+            rows = self.host.read_bombshells() or []
+        except Exception:  # noqa: BLE001
+            return []
+        out = []
+        for r in rows:
+            if not isinstance(r, dict) or not r.get("id"):
+                continue
+            text = " ".join(str(r.get("text") or "").split())
+            if 12 <= len(text) <= 400:
+                out.append({"id": str(r["id"]), "text": text, "used": int(r.get("used") or 0)})
+        out.sort(key=lambda r: r["used"])
+        return out[:system3_mgrtopics.BOARD_MOST]
+
+    def manager_topic(self, road="upstairs"):
+        """[s3-mgrtopics] The manager is writing a message downstairs: System 3
+        rolls its main topic (his MGRTOPIC tables and the station's topics
+        board, his recent topics held out or rested), his approach and the
+        sub message (MGRSUB). Rolled on the task's dice and recorded: the
+        round planned next on this task takes the three draws as its events.
+        Returns what the writer is told, or None (System 3 off, nothing to
+        draw, a fault - the road as it was)."""
+        if system3_mgrtopics is None or not self._dice_live():
+            return None
+        try:
+            with self.lock:
+                hist = copy.deepcopy(self._mgr_hist())
+            buf = self._roll_buffer()
+            res = system3_mgrtopics.roll(self.config, buf["stream"], self._mgr_board(), hist["topics"],
+                                         hist["subs"], hist["approaches"][0] if hist["approaches"] else "")
+            if not res:
+                return None
+            new = system3_mgrtopics.history_note(hist, res)
+            with self.lock:
+                self.__dict__["mgr_hist"] = new
+            self._mgr_save(new)
+            last = dict(res["events"][-1]["rng"])
+            small = {"kind": "mgrtopic", "key": system3_mgrtopics.ROLL_KEY, "road": str(road or ""),
+                     "label": ("the manager's message: " + res["topic_text"])[:90],
+                     "u": last["u"], "dice": last["dice"], "at": time.time(),
+                     "picked": " / ".join(x for x in (res["topic_text"], (res.get("approach") or {}).get("id", ""),
+                                                      (res.get("sub") or {}).get("text", "")) if x)[:160],
+                     "draws": [{"family": e["family"], "selected": (e.get("selected") or {}).get("id"),
+                                "dice": (e.get("rng") or {}).get("dice"), "u": (e.get("rng") or {}).get("u"),
+                                "of": (e.get("selected") or {}).get("of")} for e in res["events"]]}
+            buf["rolls"] = (buf["rolls"] + [dict(small, result=res)])[-ROLLS_KEPT:]
+            self.station_rolls.append(small)
+            by_key = getattr(_S3_LAST, "by_key", None)
+            if by_key is None:
+                by_key = _S3_LAST.by_key = {}
+            by_key[small["key"]] = small
+            self.observe_later("station:" + time.strftime("%Y%m%d%H", time.gmtime()), "STATION", small)
+            out = system3_mgrtopics.public(res)
+            out["dice"] = [d["dice"] for d in small["draws"]]
+            return out
+        except Exception as exc:  # noqa: BLE001
+            self.fail("manager topic", exc)
+            return None
+
     def _absorb_rolls(self, conv):
         """The rolls the road made before asking for this round become its first
         events (STATION): recorded with their odds and dice, not replayed."""
@@ -622,6 +721,9 @@ class System3Runtime:
         ctx0 = {"turn_id": "", "turn_index": -1}
         for r in rolls:
             before = system3._snapshot(conv, (conv.get("cursor") or {}).get("initiator"))
+            if r.get("kind") == "mgrtopic" and system3_mgrtopics is not None:   # [s3-mgrtopics] three draws
+                system3_mgrtopics.absorb(conv, r, before, ctx0)
+                continue
             if r.get("kind") == "roll":
                 stages = [{"stage": "roll", "draw": {"u": r["u"], "dice": r["dice"]}, "selected": r["u"],
                            "rule": "a number in [0, 1) the road reads against its own bands"}]
@@ -920,6 +1022,8 @@ class System3Runtime:
         missing = [t for t in system3_tables.default_tables()
                    + system3_tables.default_event_tables()      # [s3-live-event]
                    if t["id"] not in have and t["id"] not in seen]
+        if system3_mgrtopics is not None:                                   # [s3-mgrtopics] his two tables, once
+            missing += [t for t in system3_mgrtopics.default_tables() if t["id"] not in have and t["id"] not in seen]
         if not missing:
             return []
         new = copy.deepcopy(config)
@@ -2311,6 +2415,10 @@ class System3Runtime:
                         break
             first = conv["turns"][0] if conv["turns"] else {}
             handle.sheet = system3.render_legs_sheet(conv) if handle.active else ""
+            if system3_mgrtopics is not None and conv.get("mgr_topic"):     # [s3-mgrtopics]
+                system3_mgrtopics.attach(conv)                            # his turn wears the draws
+                if handle.active:                                          # the replies answer the topic
+                    handle.sheet += system3_mgrtopics.sheet_line(conv)
             handle.stamp = {"conversation_id": conv["identity"]["conversation_id"], "mode": mode,
                             "turn_id": str(first.get("turn_id") or ""), "road": road,
                             "seed": conv["seed"], "config_hash": conv["config_hash"]}
@@ -4421,6 +4529,7 @@ def install(app, namespace):
     namespace["system3_note_prompt"] = rt.note_prompt
     namespace["system3_memory_block"] = rt.memory_block                # [s3-memory]
     namespace["system3_event_facts"] = rt.event_facts_text             # [s3-live-event]
+    namespace["system3_manager_topic"] = rt.manager_topic              # [s3-mgrtopics]
     namespace["system3_writing_for"] = _S3_WRITE
     namespace["system3_split_line"] = rt.split_line                    # [s3-split]
     namespace["system3_note_pace"] = rt.note_pace

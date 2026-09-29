@@ -73321,6 +73321,8 @@ def upstairs_update(page_id: str, **fields: Any) -> dict[str, Any] | None:
                     row[key] = int(value)
                 elif key in ("system3", "split") and isinstance(value, (dict, list)):   # [s3-split] its node, its parts
                     row[key] = copy.deepcopy(value)
+                elif key == "mgr_topic" and isinstance(value, dict):   # [s3-mgrtopics] what the page was rolled
+                    row[key] = copy.deepcopy(value)
             _upstairs_write(rows)
             return row
     return None
@@ -73506,11 +73508,58 @@ def upstairs_context() -> str:
     return "; ".join(bits)[:600]
 
 
+# --- [s3-mgrtopics] THE MANAGER'S TOPIC ROULETTE -------------------------------
+#
+# The operator, 2026-09-28: "have the manager rolling the roulette for saying any
+# topic from the topics list at random in his message to the DJs downstairs ... I
+# dont want him saying the same things over and over ... a topics database of his
+# own ... a sub message based on the topic that he uses to further intimidate /
+# ingratiate / horrify / attempt to discuss with." System 3 rolls it
+# (system3_mgrtopics: MGRTOPIC1 his topics + the station's topics board, MGRSUB1
+# the sub messages by approach, both in the Tables tab); the three draws land on
+# the round planned next on this task - his page's node, or the memo's round.
+def _s3_manager_topic(road: str) -> dict[str, Any] | None:
+    """The manager's topic, approach and sub message, rolled - or None (System
+    3 off, nothing to draw, a fault): the road as it was."""
+    fn = globals().get("system3_manager_topic")
+    if not callable(fn):
+        return None
+    try:
+        got = fn(road=road)
+    except Exception as exc:  # noqa: BLE001
+        pipeline_log("system3", "[s3-mgrtopics] the manager's topic roll failed - the road as it was",
+                     extra=("%s: %s" % (type(exc).__name__, exc))[:200])
+        return None
+    if not isinstance(got, dict) or not got.get("topic_text"):
+        return None
+    pipeline_log("system3", "[s3-mgrtopics] the manager's %s: %s (%s)"
+                 % ("memo" if road == "memo" else "page", str(got["topic_text"])[:90],
+                    str((got.get("approach") or {}).get("id") or "no approach")))
+    return got
+
+
+def _s3_manager_topic_react(made: dict[str, Any]) -> str:
+    """The studio's answer to a page knows what it was about, and how he came at them."""
+    mt = made.get("mgr_topic") if isinstance(made.get("mgr_topic"), dict) else {}
+    if not mt.get("topic_text"):
+        return ""
+    ap = mt.get("approach") if isinstance(mt.get("approach"), dict) else {}
+    return ("(System 3 rolled his message: the topic was %s%s - answer THAT, by name.) "
+            % (str(mt["topic_text"])[:240],
+               ("; he came at you to %s" % str(ap.get("label") or "").lower()) if ap.get("label") else ""))
+
+
 async def dj_upstairs_write() -> dict[str, Any]:
     """Write one page from upstairs, steered by the speakbox and by what is
     actually on air."""
     context = upstairs_context()
-    gripe = s3_unrepeated("manager.page_gripe", list(UPSTAIRS_GRIPES), "upstairs-gripe", "what the page from upstairs is on about")   # [s3-dice-door]
+    # [s3-mgrtopics] the main topic, the approach and the sub message are System
+    # 3's roll (MGRTOPIC1 + the topics board, MGRSUB1); the gripe book only
+    # when there is no roll
+    _mgr = _s3_manager_topic("upstairs")
+    gripe = str((_mgr or {}).get("topic_text") or "")[:300]
+    if not gripe:
+        gripe = s3_unrepeated("manager.page_gripe", list(UPSTAIRS_GRIPES), "upstairs-gripe", "what the page from upstairs is on about")   # [s3-dice-door]
     seed: dict[str, Any] = {}
     try:
         seed = await speakbox_semantic_seed(context or gripe,
@@ -73526,6 +73575,7 @@ async def dj_upstairs_write() -> dict[str, Any]:
         "stage directions — straight at the two of them, and you do not "
         "wait for an answer.\n\n"
         f"What you are on about this time: {gripe}.\n"
+        + str((_mgr or {}).get("direction") or "")               # [s3-mgrtopics] binding
         + (f"What is happening down there right now: {context}.\n"
            if context else "")
         + (f"Work THIS material in — bend it into your own grievance, do "
@@ -73574,6 +73624,14 @@ async def dj_upstairs_write() -> dict[str, Any]:
         try:
             upstairs_update(str(row.get("id") or ""), system3=dict(_s3l.stamp))
             row["system3"] = dict(_s3l.stamp)
+        except Exception:  # noqa: BLE001
+            pass
+    if _mgr and isinstance(row, dict) and row.get("id"):                 # [s3-mgrtopics] what it was rolled
+        _mgr_keep = {k: _mgr[k] for k in ("key", "topic_text", "topic", "group", "approach", "sub", "dice")
+                     if _mgr.get(k) is not None}
+        try:
+            upstairs_update(str(row.get("id") or ""), mgr_topic=_mgr_keep)
+            row["mgr_topic"] = _mgr_keep
         except Exception:  # noqa: BLE001
             pass
     if _s3l is not None and _s3l.active and isinstance(row, dict) and row.get("id"):   # [s3-split] the page, shared out
@@ -73764,6 +73822,7 @@ async def dj_upstairs_page(row: dict[str, Any] | None = None) -> bool:
             "You have both just been made to listen to a page from the "
             "MANAGER UPSTAIRS over the studio intercom. What he said, word "
             f"for word, was: \"{spoken[:900]}\" "
+            + _s3_manager_topic_react(made) +                          # [s3-mgrtopics]
             "Deal with it, live, in front of everybody: one of you takes it "
             "personally and the other one finds it funny, or you both go "
             "quiet and then start arguing about which of you he meant. Do "
@@ -114527,12 +114586,16 @@ async def dj_manager_note(track: dict[str, Any] | None = None,
     # of thirty-four memos on the shelf carried a grievance, because the
     # memo was made of the station's system prompt. The gripe book has
     # three hundred that are personal and this road had never read one.
+    _mgr_memo: dict[str, Any] = {}          # [s3-mgrtopics] the memo's topic, when System 3 rolls it
     _gripe = ""
     try:
         if s3_chance("manager.gripe", float(dj_settings().get(
                 "manager_gripe_pct", MANAGER_GRIPE_PCT)) / 100.0, "the memo is a gripe from upstairs", dial="manager_gripe_pct"):   # [s3-dice-door]
             _rows = [r for r in upstairs_list()
                      if str(r.get("gripe") or "").strip()]
+            _mgr_memo = _s3_manager_topic("memo") or {}          # [s3-mgrtopics] his topic, rolled
+            if _mgr_memo:
+                _gripe, _rows = str(_mgr_memo.get("topic_text") or "")[:200], []
             if _rows:
                 _fewest = min(int(r.get("uses") or 0) for r in _rows)
                 _pick = s3_choice("manager.gripe_pick", [r for r in _rows
@@ -114568,7 +114631,7 @@ async def dj_manager_note(track: dict[str, Any] | None = None,
                 f"\"{_topic}\"\n"
                 "Deal with THAT on air too, and mind that he has clearly "
                 "been listening.\n") if _topic else "")
-            +
+            + str(_mgr_memo.get("memo_direction") or "") +       # [s3-mgrtopics] the approach, the sub message
             "Do not read that back word for word - it is a memo, so say it "
             "the way a memo says it, and then deal with it on air. Take it "
             "personally, because it is personal: defend yourself, blame each "

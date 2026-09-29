@@ -696,6 +696,16 @@ const FAMILY_WHAT = {
   DIRECTIVE: ["Operator's directive (DIRECTIVE1)",
     'One of your directives for this seat, from System 3 > Tables > DIRECTIVE1. Each row has its own odds: 100% is a standing rule (recorded, not drawn), lower is a die. A hit lands on one of that seat\'s turns, drawn here. A row can expire by date or after a number of airings.'],
 };
+/* [s3-mgrtopics] the manager's message downstairs: its main topic, his approach, the sub message */
+Object.assign(FAM, {MGRTOPIC: 'var(--topic)', MGRAPPROACH: 'var(--rs)', MGRSUB: 'var(--irs)'});
+Object.assign(FAMILY_WHAT, {
+  MGRTOPIC: ["The manager's topic (MGRTOPIC1 + the topics board)",
+    "The main topic of the station manager's message downstairs. Two stages: a group of his own topics or the station's topics board (each group's weight), then the topic. A topic he said in his last few messages cannot come up and one said a little longer ago weighs less (the 'rest' knobs on MGRTOPIC1); a row switched off never lands. Edited in Tables > MGRTOPIC1 (the board is the Topics board list)."],
+  MGRAPPROACH: ["The manager's approach (MGRSUB1)",
+    "How he comes at them about the topic: intimidate, ingratiate, horrify or discuss - the categories of MGRSUB1, each weight its odds. The approach he used last time weighs half."],
+  MGRSUB: ["The manager's sub message (MGRSUB1)",
+    "The angle he uses on the topic, inside the approach drawn ({topic} is the topic). A row written for particular topics only comes up for them, and weighs three times as much when it does; one he used in his last few messages is out. Edited in Tables > MGRSUB1."],
+});
 /* [s3-callend] how a call ends: the caller's wheel and the wrap call */
 Object.assign(FAMILY_WHAT, {
   RESOLVE: ["Resolution - the caller's wheel (RESOLVE1)",
@@ -6424,7 +6434,8 @@ export async function mount(root, {request, onClose, tab: startTab = '', table: 
   let tableId = startTable || 'ES1', draft = null;   /* [s3-dice] a card can open on its table */
   let tableDrag = null; const foldedCats = new Set();   /* [s3-window] */
   /* [s3-cast] every family that keeps a table, the round rolls and the two pools included */
-  const TABLE_FAMILIES = ['CTS', 'ES', 'RS', 'IRS', 'FL', 'TEMPER', 'SHOCK', 'INTERJECT', 'SPEAKERBOX', 'FAV', 'DIRECTIVE', 'EVENT', 'CHANCE', 'POOL', 'RESOLVE', 'WRAP', 'IL'];   /* [s3-sb-end] SBEND1 */
+  const TABLE_FAMILIES = ['CTS', 'ES', 'RS', 'IRS', 'FL', 'TEMPER', 'SHOCK', 'INTERJECT', 'SPEAKERBOX', 'FAV', 'DIRECTIVE', 'EVENT', 'CHANCE', 'POOL', 'RESOLVE', 'WRAP', 'IL',
+    'MGRTOPIC', 'MGRSUB'];   /* [s3-sb-end] SBEND1 - [s3-mgrtopics] the manager's topics and sub messages */
   TABLE_FAMILIES.push('MEMORY');   /* [s3-memory] the kinds of memory: each a rule, then the roulette */
   /* [s3-memory] one kind of memory: the numbers and switches its rule decides eligibility by */
   function memoryFields(cat) {
@@ -6524,7 +6535,14 @@ export async function mount(root, {request, onClose, tab: startTab = '', table: 
         onchange: e => { if (e.target.checked) item.speakerbox = 'verbatim'; else delete item.speakerbox; }}), 'said in a speakerbox passage'),
       list('tags', 'tags (the wrap call can follow them: tag:fire)'));
   }
+  function mgrSubFields(item) {   /* [s3-mgrtopics] a sub message kept to some of his topics */
+    return el('div', 's3-row s3-pool', el('label', {class: 's3-muted', text: 'only for topics'}),
+      el('input', {type: 'text', value: (item.topics || []).join(', '), placeholder: 'MGRTOPIC1 row ids, e.g. consultant (blank = any topic)',
+        style: 'min-width:16em', 'aria-label': 'only for these topics',
+        onchange: e => { const got = e.target.value.split(',').map(x => x.trim()).filter(Boolean); if (got.length) item.topics = got; else delete item.topics; }}));
+  }
   function poolFields(item) {
+    if (draft.family === 'MGRSUB') return mgrSubFields(item);   /* [s3-mgrtopics] */
     /* a directive's odds and lifetime; a favourite's origin */
     if (draft.family === 'RESOLVE' || draft.family === 'WRAP') return callendItemFields(item);   /* [s3-callend] */
     if (draft.family === 'DIRECTIVE') {
