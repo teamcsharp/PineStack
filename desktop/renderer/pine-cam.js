@@ -1075,19 +1075,21 @@
     if (!b || !b.ok) return null;
     var age = battAge(b);
     var stale = age > BATT_STALE_S;
-    var text = b.charging ? 'charging' : String(b.word || '?');
-    if (!b.charging && b.left_say && !stale) {
-      text += ' · ' + (Number(b.left_s) < 120 ? 'any minute' : '~' + b.left_say);
-    }
-    if (stale) text += ' · stale';
+    /* [cambattery2] TIME LEFT LEADS. "Instead of saying last bar, I would
+     * like a time estimate of how much time is left in the battery." The
+     * station words it (`label`); the level word is in the title. */
+    var dark = !!b.dark;
+    var text = String(b.label || (b.charging ? 'charging' : (b.word || '?')));
+    if (stale && !dark) text += ' · stale';
     var title = String(b.what || b.say || 'Pine Cam battery')
       + '. Read ' + battAgeSay(age) + ' ago'
       + (stale ? ' - STALE: the camera has not answered since' + (b.error ? ' (' + b.error + ')' : '') : '')
       + '.';
     return {text: text, title: title,
             bars: b.charging ? -1 : Math.max(0, Math.min(4, Number(b.bars) || 0)),
-            tone: stale ? 'stale' : String(b.tone || 'ok'),
-            pulse: !!b.pulse && !stale, stale: stale, charging: !!b.charging};
+            tone: (stale || dark) ? 'stale' : String(b.tone || 'ok'),   /* [cambattery2] */
+            pulse: !!b.pulse && !stale && !dark, stale: stale || dark,
+            charging: !!b.charging, dark: dark};
   }
 
   function battHtml(m) {
@@ -1124,6 +1126,50 @@
     el.style.top = (img.offsetTop + 6) + 'px';
   }
 
+  /* [cambattery2] THE DESK'S ROW, AND THE CARD WHEN THE CAMERA GOES DARK.
+   * The box closes when the link goes (#1387: no still of a gone camera),
+   * so a flat battery is said where it can still be seen: the row reads
+   * it with the last estimate and its age, and one card says it on the
+   * poll that first sees it (never on a page load onto an old one). */
+  var battDarkSeen = null;
+
+  function battRowSay(b) {
+    if (!b || !b.ok) return '—';
+    if (b.dark) {
+      return 'camera went dark – battery likely flat'
+        + (b.dark_was ? ' · was ' + b.dark_was : '')
+        + ', ' + battAgeSay(Number(b.dark_age_s || 0)) + ' ago';
+    }
+    var age = battAge(b);
+    return String(b.label || b.word || '')
+      + (b.charging ? '' : ' (' + String(b.word || '') + ')')
+      + (age > BATT_STALE_S ? ' · stale, read ' + battAgeSay(age) + ' ago' : '');
+  }
+
+  function battDarkTell(b) {
+    var at = (b && b.dark) ? Number(b.dark_at || 0) : 0;
+    if (battDarkSeen === null) { battDarkSeen = at; return; }
+    if (!at) { battDarkSeen = 0; return; }
+    if (at === battDarkSeen) return;
+    battDarkSeen = at;
+    if (!document.body) return;
+    hideToast();
+    toast = document.createElement('div');
+    toast.id = 'pineCamToast';
+    toast.className = 'pine-cam-toast pine-cam-toast--dark';
+    toast.setAttribute('role', 'status');
+    toast.title = String(b.what || '');
+    toast.innerHTML =
+      '<i class="pine-cam-flag-dot"></i>'
+      + '<div class="pine-cam-toast-text"><b>The Pine Cam went dark</b><span>'
+      + 'battery likely flat' + (b.dark_was ? ' · the last estimate was ' + esc(b.dark_was) : '')
+      + '</span></div>'
+      + '<button type="button" class="pine-cam-x" aria-label="Dismiss" title="Dismiss">×</button>';
+    toast.addEventListener('click', function (ev) { ev.stopPropagation(); hideToast(); });
+    document.body.appendChild(toast);
+    toastTimer = setTimeout(hideToast, TOAST_MS);
+  }
+
   function paintBatteryNative(m) {
     if (!nativeOn) return;
     var arg = m ? {on: true, text: m.text, bars: m.bars, tone: m.tone,
@@ -1138,7 +1184,9 @@
   function paintBattery(b, isLive) {
     if (b && b.ok && !b._got) b._got = Date.now();
     batt = b || null;
-    var m = (isLive === false) ? null : battModel(batt);
+    /* [cambattery2] a camera that went dark keeps its greyed meter */
+    var m = (isLive === false && !(batt && batt.dark)) ? null : battModel(batt);
+    battDarkTell(batt);
     battPaintInto(document.getElementById('pineCamBatt'), m);
     battPlace();
     if (pip) {
@@ -1258,6 +1306,9 @@
       : stale ? 'link stale - supervisor silent ' + silentSay
       : seen ? 'on the network - joining'
         : state === 'no-link' ? 'not on the network' : (state || 'looking…');
+    if (!isLive && got.battery && got.battery.dark) {       /* [cambattery2] */
+      brief.textContent = 'camera went dark – battery likely flat';
+    }
     paintBars(isLive, seen, stale, Number(got.signal || 0));
     if (!stats) return;
     var mb = Math.round(Number(got.kept_bytes || 0) / 1048576);
@@ -1270,6 +1321,7 @@
       ['kept', (got.clips || 0) + ' clip(s) · ' + mb + ' MB'],
       ['newest', String(got.newest || '—')]
     ];
+    if (got.battery && got.battery.ok) rows.splice(3, 0, ['battery', battRowSay(got.battery)]);   /* [cambattery2] */
     stats.innerHTML = rows.map(function (r) {
       /* #1120: "Right here put a folder icon that whenever I click it
        * it opens up a file explorer showing me the location where all

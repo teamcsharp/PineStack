@@ -638,6 +638,8 @@
 @media (prefers-reduced-motion: reduce) { .pine-cam-batt--pulse { animation: none; } }
 .pine-cam-box.pine-cam-round .pine-cam-batt { display: none !important; }
 .pine-cam-pip .pine-cam-batt { font-size: 10px; left: 4px; top: 4px; }
+/* [cambattery2] the camera went dark: a still, grey card */
+.pine-cam-toast--dark .pine-cam-flag-dot { background: #99a3a8; box-shadow: none; animation: none; }
 .pv-row.pine-cam-keptrow { position: relative; padding-right: 54px; }
 .pine-cam-rowbtn {
   position: absolute;
