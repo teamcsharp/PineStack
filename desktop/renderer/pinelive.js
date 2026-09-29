@@ -3499,7 +3499,13 @@
     if (!n) return null;
     /* [pllevel] after this terminal's Music level and the DJ duck, in dB */
     var g = 1;
-    try { var mx = root.pineMixer && root.pineMixer.get ? root.pineMixer.get() : null; if (mx && isFinite(mx.music)) g *= Number(mx.music); } catch (err) { g = 1; }
+    /* [plmeter] the gain actually applied (slider x duck), else the slider */
+    try {
+      var mpl = document.getElementById('musicPlayer');
+      var gfn = mpl && typeof root.gainFor === 'function' ? root.gainFor(mpl, 'music') : null;
+      if (gfn && gfn.node && gfn.node.gain) g *= gfn.node.gain.value;
+      else { var mx = root.pineMixer && root.pineMixer.get ? root.pineMixer.get() : null; if (mx && isFinite(mx.music)) g *= Number(mx.music); }
+    } catch (err) { g = 1; }
     try { var mp = document.getElementById('musicPlayer'); if (mp) g *= mp.volume; } catch (err) { /* keep g */ }
     var shift = 20 * Math.log(Math.max(0.001, g)) / Math.LN10;
     var bars = [], peak = 0;
