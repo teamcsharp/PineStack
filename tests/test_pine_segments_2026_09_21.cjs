@@ -208,7 +208,9 @@ test('the tablet scenario sheet uses shared dictation and exposes saved topic ac
     path.join(__dirname, '../desktop/renderer/talk-dot.js'), 'utf8');
   assert.match(src, /history: true/);
   assert.doesNotMatch(src, /pseg-mic|pseg-topic-dictation/);
-  assert.match(talkDot, /button\.className = 'pine-field-mic'/);
+  /* [field-mic-paint] the shared decorator marks every text field, and the
+     field paints its own mic - no per-view button */
+  assert.match(talkDot, /setAttribute\('data-pine-mic', value\)/);
   assert.match(talkDot, /querySelectorAll\('input, textarea, \[contenteditable="true"\]'\)/);
   assert.match(src, /'\/api\/dj\/topics\/' \+ encodeURIComponent\(saved\.id\)/);
   assert.match(src, /actOn\(saved, 'queue'/);

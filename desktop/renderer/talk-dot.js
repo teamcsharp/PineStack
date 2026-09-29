@@ -1989,20 +1989,51 @@
     report: reportOpen,
     state: function () { return state; }
   };
-  /* Field dictation follows each field through nested scrolling. Established
-   * forms use a fixed overlay; popups may opt into a local inline mount. */
+  /* [field-mic-paint] 2026-09-28 THE MIC IS PAINTED BY ITS OWN FIELD.
+   * "The microphone icons for text entries are not integrated with their
+   * text field, so they're getting out of sync whenever I'm scrolling the
+   * board. I need them integrated physically into the text boxes so that
+   * way they stay in sync whenever I scroll." (the operator)
+   * The mic used to be a position:fixed button in a body-level layer, moved
+   * to the field's last known place on each scroll/resize event: it trailed
+   * a touch scroll by frames, stayed behind when a fold, a drag-resize or a
+   * re-render moved the field without a scroll, and painted over windows
+   * that covered its field. Now every text field paints its own mic - two
+   * background layers (the Carbon glyph and its hover/pressed plate,
+   * view-chrome.css) at the right of the field's padding box, inside the
+   * right padding the field reserves - so the mic IS part of the field's
+   * box: it scrolls, folds, resizes, re-renders and hides with it, in every
+   * pane, at every size, with no code running. The DOM is not touched: no
+   * wrapper, no sibling, no layer, so a view's field.nextSibling,
+   * parent.insertBefore(x, field), grid placement and child selectors see
+   * exactly what the view built (system3.js's add-row Enter clicks
+   * e.target.nextSibling - a wrapped field would have clicked the mic).
+   * A press on the mic is recognised from the pointer's place inside the
+   * field (the square the CSS paints) and is consumed there: the field is
+   * not focused, no caret moves, no view handler sees it. The only observer
+   * left decides WHETHER a field has room for the mic and how big the plate
+   * is - never where it is. */
   if (root.document && root.document.addEventListener) {
-    var fieldButtons = new Map();
-    var fieldLayer = root.document.createElement('div');
-    fieldLayer.className = 'pine-field-mics';
+    var MIC_RESERVE = 36;      /* right padding a mic takes: plate 32 + gaps */
+    var MIC_GAP = 2;           /* padding-box right edge to the plate */
+    var MIC_ROOM = 40;         /* text room a field keeps beside its mic */
+    var micState = new WeakMap();
+    var micFields = new Set();
     var micBusy = false;
     var micMonitor = 0;
     var finishWhenReady = false;
     var scanQueued = false;
-    var placeQueued = false;
-    var placeHitTest = false;
-    var visibleFields = new Set();
-    var fieldObserver = null;
+    var sweepQueued = false;
+    var liveField = null;
+    var hoverField = null;
+    var press = null;
+    var swallow = null;
+    var telemetryQueued = false;
+    var telemetryFollowing = false;
+    var refitQueued = false;
+    var refitFields = new Set();
+    var sizeObserver = typeof root.ResizeObserver === 'function'
+      ? new root.ResizeObserver(observed) : null;
     function nextFrame(job) {
       if (typeof root.requestAnimationFrame === 'function') return root.requestAnimationFrame(job);
       if (typeof root.setTimeout === 'function') return root.setTimeout(job, 0);
@@ -2030,42 +2061,209 @@
       return root.visualViewport || {width: root.innerWidth, height: root.innerHeight,
         offsetLeft: 0, offsetTop: 0};
     }
-    function setMicHidden(button, hidden) {
-      if (button.hidden !== hidden) button.hidden = hidden;
+    /* Whether the field has room for the mic, and the plate's size - the old
+       overlay's rule (plate min(32, height - 4); none under 22) plus room for
+       text beside it, so a 3em emoji box or a 4em number box is never
+       padded shut. The room is measured as it would be WITH the mic, so
+       reserving the padding can never flip the answer back. Reads only. */
+    function judge(field, st) {
+      if (!field.isConnected || !textField(field) || field.clientWidth <= 0) return {on: false, size: 0};
+      var size = Math.min(32, field.clientHeight - 2);
+      var room = field.clientWidth - st.padLeft - st.padRight - (st.own ? 0 : MIC_RESERVE);
+      return {on: size >= 22 && room >= MIC_ROOM, size: size};
     }
-    function placeMic(field, button, hitTest) {
-      if (!field.isConnected || !textField(field)) { setMicHidden(button, true); return; }
+    /* Writes only: the reserved padding, the plate size, the on/off mark. */
+    function apply(field, st, verdict) {
+      if (!st.own && verdict.on && !st.reserved) {
+        field.style.setProperty('padding-right', (st.padRight + MIC_RESERVE) + 'px', 'important');
+        st.reserved = true;
+      } else if (!verdict.on && st.reserved) {
+        if (st.inlinePad) field.style.setProperty('padding-right', st.inlinePad, st.inlinePriority);
+        else field.style.removeProperty('padding-right');
+        st.reserved = false;
+      }
+      if (verdict.on && st.size !== verdict.size) {
+        field.style.setProperty('--pine-mic-size', verdict.size + 'px');
+        st.size = verdict.size;
+      }
+      mark(field, verdict.on);
+    }
+    function mark(field, on) {
+      var value = on ? 'on' : 'off';
+      if (field.getAttribute('data-pine-mic') !== value) field.setAttribute('data-pine-mic', value);
+      if (!on && hoverField === field) setHover(null);
+    }
+    /* A field that grew, shrank, appeared or vanished. The plate follows at
+       once (paint only); a change that must add or drop the reserved padding
+       - a layout change - waits for the next frame, so this observer never
+       resizes what it observes (no "ResizeObserver loop" error in any page). */
+    function observed(entries) {
+      for (var i = 0; i < entries.length; i += 1) {
+        var field = entries[i].target;
+        var st = micState.get(field);
+        if (!st) continue;
+        var verdict = judge(field, st);
+        if (!st.own && verdict.on !== st.reserved) {
+          if (!verdict.on) mark(field, false);
+          refitFields.add(field);
+          queueRefit();
+        } else {
+          apply(field, st, verdict);
+        }
+      }
+    }
+    function queueRefit() {
+      if (refitQueued) return;
+      refitQueued = true;
+      nextFrame(function () {
+        refitQueued = false;
+        var list = [];
+        refitFields.forEach(function (field) { if (micState.has(field)) list.push(field); });
+        refitFields.clear();
+        fitAll(list);
+      });
+    }
+    /* Read every field first, then write every field: one layout, however
+       many fields a re-render brings. */
+    function fitAll(list) {
+      var verdicts = [];
+      for (var i = 0; i < list.length; i += 1) verdicts.push(judge(list[i], micState.get(list[i])));
+      for (var j = 0; j < list.length; j += 1) apply(list[j], micState.get(list[j]), verdicts[j]);
+    }
+    function adopt(field) {
+      var st = micState.get(field);
+      if (st) return st;
+      var style = root.getComputedStyle ? root.getComputedStyle(field) : null;
+      var picture = style ? style.backgroundImage : 'none';
+      st = {
+        padLeft: style ? parseFloat(style.paddingLeft) || 0 : 0,
+        padRight: style ? parseFloat(style.paddingRight) || 0 : 0,
+        inlinePad: field.style ? field.style.getPropertyValue('padding-right') : '',
+        inlinePriority: field.style ? field.style.getPropertyPriority('padding-right') : '',
+        own: field.hasAttribute('data-pine-mic-inline'),
+        reserved: false,
+        size: 0,
+        touch: false,
+        layered: false,
+        /* a field that paints its own picture keeps it, under the mic */
+        layers: picture && picture !== 'none' ? {
+          'background-image': picture,
+          'background-position': style.getPropertyValue('background-position'),
+          'background-size': style.getPropertyValue('background-size'),
+          'background-repeat': style.getPropertyValue('background-repeat'),
+          'background-origin': style.getPropertyValue('background-origin'),
+          'background-attachment': style.getPropertyValue('background-attachment')
+        } : null
+      };
+      micState.set(field, st);
+      return st;
+    }
+    var MIC_LAYERS = {
+      'background-image': 'var(--pine-mic-glyph, none), var(--pine-mic-plate, none)',
+      'background-position': 'right calc(2px + (var(--pine-mic-size, 32px) - 17px) / 2) center, right 2px center',
+      'background-size': '17px 17px, var(--pine-mic-size, 32px) var(--pine-mic-size, 32px)',
+      'background-repeat': 'no-repeat, no-repeat',
+      'background-origin': 'padding-box, padding-box',
+      'background-attachment': 'scroll, scroll'
+    };
+    function enlist(field, st) {
+      if (st.layers && !st.layered && field.style) {
+        st.layered = true;
+        Object.keys(MIC_LAYERS).forEach(function (name) {
+          field.style.setProperty(name, MIC_LAYERS[name] + ', ' + st.layers[name], 'important');
+        });
+      }
+      if (micFields.has(field)) return;
+      micFields.add(field);
+      /* Touch: a press that starts on the mic must not scroll the pane,
+         long-press-select the text or become a tap that focuses the field.
+         Only fields carry this non-passive listener, never the document, so
+         scrolling anywhere else is never held for the main thread. */
+      if (!st.touch) {
+        st.touch = true;
+        field.addEventListener('touchstart', function (event) {
+          if (press && press.field === field) event.preventDefault();
+        }, {passive: false});
+      }
+      if (sizeObserver) sizeObserver.observe(field);
+    }
+    /* Adopt a batch of fields: read all their styles, then all their boxes,
+       then write - a re-render of three hundred rows costs one layout. */
+    function decorate(list) {
+      var states = [];
+      var verdicts = [];
+      var i;
+      for (i = 0; i < list.length; i += 1) states.push(adopt(list[i]));
+      for (i = 0; i < list.length; i += 1) verdicts.push(judge(list[i], states[i]));
+      for (i = 0; i < list.length; i += 1) {
+        enlist(list[i], states[i]);
+        apply(list[i], states[i], verdicts[i]);
+      }
+    }
+    function sweep() {
+      sweepQueued = false;
+      micFields.forEach(function (field) {
+        if (field.isConnected) return;
+        micFields.delete(field);
+        if (sizeObserver) sizeObserver.unobserve(field);
+        if (hoverField === field) setHover(null);
+      });
+    }
+    function queueSweep() {
+      if (sweepQueued) return;
+      sweepQueued = true;
+      nextFrame(sweep);
+    }
+    function queueScan() {
+      if (scanQueued) return;
+      scanQueued = true;
+      nextFrame(function () { scanQueued = false; scan(); });
+    }
+    function scan() {
+      var fields = root.document.querySelectorAll
+        ? root.document.querySelectorAll('input, textarea, [contenteditable="true"]') : [];
+      var fresh = [];
+      for (var i = 0; i < fields.length; i += 1) {
+        if (!micFields.has(fields[i]) && textField(fields[i])) fresh.push(fields[i]);
+      }
+      if (fresh.length) decorate(fresh);
+    }
+    /* The square the CSS paints, in the field's own (untransformed) padding
+       box, a little larger for a finger. */
+    function onMic(field, event) {
+      var st = micState.get(field);
+      if (!st || field.getAttribute('data-pine-mic') !== 'on' || !textField(field)) return false;
+      if (field.closest && field.closest('[aria-hidden="true"]')) return false;
       var rect = field.getBoundingClientRect();
-      var view = viewport();
-      var size = Math.min(32, Math.max(0, rect.height - 4), Math.max(0, rect.width - 4));
-      var inline = button.classList.contains('pine-field-mic-inline');
-      var x = rect.right - size - 3;
-      var y = rect.top + Math.max(2, (rect.height - size) / 2);
-      setMicHidden(button, size < 22 || rect.width < 48 || rect.right <= 0
-        || rect.left >= view.width || rect.bottom <= 0 || rect.top >= view.height
-        || !!(field.closest && field.closest('[hidden], [aria-hidden="true"]')));
-      if (inline) {
-        button.style.width = size + 'px';
-        button.style.height = size + 'px';
-        return;
-      }
-      /* An elementFromPoint walks the whole document. Do it on first reveal
-         and focus, not after every live-feed DOM change. The observer below
-         keeps the ordinary placement set to fields that are actually visible. */
-      if (hitTest && !button.hidden && root.document.elementFromPoint) {
-        button.style.pointerEvents = 'none';
-        var hit = root.document.elementFromPoint(
-          Math.max(rect.left + 2, Math.min(rect.right - 2, rect.left + rect.width / 2)),
-          Math.max(rect.top + 2, Math.min(rect.bottom - 2, rect.top + rect.height / 2)));
-        button.style.pointerEvents = '';
-        if (hit !== field && !(field.contains && field.contains(hit))) button.hidden = true;
-      }
-      if (button.hidden) return;
-      button.style.width = size + 'px';
-      button.style.height = size + 'px';
-      button.style.left = x + 'px';
-      button.style.top = y + 'px';
+      if (!rect.width || !rect.height || !field.offsetWidth || !field.offsetHeight) return false;
+      var x = (event.clientX - rect.left) * field.offsetWidth / rect.width - field.clientLeft;
+      var y = (event.clientY - rect.top) * field.offsetHeight / rect.height - field.clientTop;
+      var size = st.size || 32;
+      var slop = event.pointerType === 'touch' ? 6 : 2;
+      var right = field.clientWidth - MIC_GAP;
+      var top = (field.clientHeight - size) / 2;
+      return x >= right - size - slop && x <= field.clientWidth + slop
+        && y >= top - slop && y <= top + size + slop;
     }
+    function micField(node) {
+      while (node && node.nodeType !== 1) node = node.parentNode;
+      var field = node && node.closest ? node.closest('[data-pine-mic="on"]') : null;
+      return field && micState.has(field) ? field : null;
+    }
+    function setHover(field) {
+      if (hoverField === field) return;
+      if (hoverField) hoverField.removeAttribute('data-pine-mic-hover');
+      hoverField = field;
+      if (field) field.setAttribute('data-pine-mic-hover', '');
+    }
+    function setLive(field) {
+      if (liveField && liveField !== field) liveField.removeAttribute('data-pine-mic-live');
+      liveField = field;
+      if (field) field.setAttribute('data-pine-mic-live', '');
+    }
+    /* The telemetry strip beside a dictating field is a short-lived popup,
+       not part of the field: it follows the field only while a capture is
+       live, and nothing listens at all the rest of the time. */
     function placeTelemetry() {
       var telemetry = el('pineTalkTelemetry');
       if (!telemetry || !fieldCapture || !fieldCapture.isConnected) return;
@@ -2082,56 +2280,24 @@
       telemetry.style.width = width + 'px';
       telemetry.style.height = height + 'px';
     }
-    function placeAll(hitTest) {
-      var fields = fieldObserver ? visibleFields : fieldButtons;
-      fields.forEach(function (value, key) {
-        var field = fieldObserver ? value : key;
-        var button = fieldObserver ? fieldButtons.get(field) : value;
-        if (!field || !button || !field.isConnected) {
-          if (button) button.remove();
-          fieldButtons.delete(field);
-          visibleFields.delete(field);
-          return;
-        }
-        placeMic(field, button, hitTest);
+    function queueTelemetry() {
+      if (telemetryQueued || !fieldCapture) return;
+      telemetryQueued = true;
+      nextFrame(function () { telemetryQueued = false; placeTelemetry(); });
+    }
+    function followTelemetry(on) {
+      if (telemetryFollowing === on) return;
+      telemetryFollowing = on;
+      var how = on ? 'addEventListener' : 'removeEventListener';
+      /* a host without the method simply has no strip to follow - finishing
+         a capture must never throw here, or appendWords' caller skips the
+         rest of clearMic */
+      [[root, true], [root.visualViewport, false]].forEach(function (pair) {
+        var target = pair[0];
+        if (!target || typeof target[how] !== 'function') return;
+        target[how]('resize', queueTelemetry);
+        target[how]('scroll', queueTelemetry, pair[1]);
       });
-      placeTelemetry();
-    }
-    function queuePlace(hitTest) {
-      placeHitTest = placeHitTest || !!hitTest;
-      if (placeQueued) return;
-      placeQueued = true;
-      nextFrame(function () {
-        var probe = placeHitTest;
-        placeQueued = false;
-        placeHitTest = false;
-        placeAll(probe);
-      });
-    }
-    function queueScan() {
-      if (scanQueued) return;
-      scanQueued = true;
-      nextFrame(function () { scanQueued = false; scan(); });
-    }
-    function scan() {
-      var fields = root.document.querySelectorAll
-        ? root.document.querySelectorAll('input, textarea, [contenteditable="true"]') : [];
-      var added = false;
-      for (var i = 0; i < fields.length; i += 1) {
-        var field = fields[i];
-        if (!textField(field) || fieldButtons.has(field)) continue;
-        var button = makeMic(field);
-        fieldButtons.set(field, button);
-        added = true;
-        if (fieldObserver) fieldObserver.observe(field);
-      }
-      if (added && !fieldObserver) queuePlace(true);
-    }
-    function reserveSpace(field) {
-      if (!field.style || !field.style.setProperty) return;
-      var style = root.getComputedStyle ? root.getComputedStyle(field) : null;
-      var right = style ? parseFloat(style.paddingRight) || 0 : 0;
-      field.style.setProperty('padding-right', (right + 36) + 'px', 'important');
     }
     function appendWords(field, words) {
       if (!field || !field.isConnected || !words) return;
@@ -2149,17 +2315,19 @@
       micMonitor = 0;
       micBusy = false;
       finishWhenReady = false;
-      fieldButtons.forEach(function (button) { button.setAttribute('aria-pressed', 'false'); });
+      setLive(null);
+      followTelemetry(false);
       fieldCapture = null;
     }
-    function startMic(field, button) {
+    function startMic(field) {
       if (micBusy || state !== IDLE || !textField(field)) return;
       micBusy = true;
       fieldCapture = field;
-      button.setAttribute('aria-pressed', 'true');
+      setLive(field);
       if (root.document && typeof root.document.getElementById === 'function') {
         mount();
         placeTelemetry();
+        followTelemetry(true);
       }
       var started = Date.now();
       root.clearInterval(micMonitor);
@@ -2179,110 +2347,94 @@
       if (root.PineTalkDot.state() === LISTENING) root.PineTalkDot.finish();
       else finishWhenReady = true;
     }
-    function makeMic(field) {
-      var inlineContainer = field.hasAttribute('data-pine-mic-inline')
-        && field.closest && field.closest('[data-pine-mic-container]');
-      if (!inlineContainer) reserveSpace(field);
-      var button = root.document.createElement('button');
-      var pressedAt = 0;
-      var wasListening = false;
-      var holdTimer = 0;
-      var held = false;
-      button.type = 'button';
-      button.className = 'pine-field-mic';
-      if (inlineContainer) button.classList.add('pine-field-mic-inline');
-      button.hidden = true;
-      button.title = 'Tap to dictate or stop; hold to talk and release to transcribe';
-      button.setAttribute('aria-label', button.title);
-      button.setAttribute('aria-pressed', 'false');
-      button.innerHTML = (typeof root.pineIcon === 'function'
-        ? root.pineIcon('c:microphone', 'Dictate') : '') || '&#127908;';
-      button.addEventListener('pointerdown', function (event) {
-        event.preventDefault();
-        pressedAt = Date.now();
-        wasListening = micBusy;
-        held = false;
-        if (micBusy) stopMic(); else startMic(field, button);
-        cancelDelay(holdTimer);
-        holdTimer = afterDelay(function () {
-          holdTimer = 0;
-          held = true;
-        }, 450);
-        try { button.setPointerCapture(event.pointerId); } catch (err) { /* released */ }
-      });
-      button.addEventListener('pointerup', function () {
-        if (holdTimer) cancelDelay(holdTimer);
-        holdTimer = 0;
-        if (pressedAt && !wasListening && (held || Date.now() - pressedAt >= 450)) stopMic();
-        pressedAt = 0;
-        held = false;
-      });
-      button.addEventListener('pointercancel', function () {
-        if (holdTimer) cancelDelay(holdTimer);
-        holdTimer = 0;
-        if (pressedAt && !wasListening) stopMic();
-        pressedAt = 0;
-        held = false;
-      });
-      button.addEventListener('click', function (event) {
-        if (event.detail !== 0) return;
-        if (micBusy) stopMic(); else startMic(field, button);
-      });
-      if (inlineContainer) inlineContainer.appendChild(button);
-      else if (fieldLayer.appendChild) fieldLayer.appendChild(button);
-      return button;
+    /* Tap toggles; hold 450 ms and release to finish (hold-to-talk) - the
+       button's gestures, unchanged, now read off the field's own mic. The
+       press is consumed before any view listener runs (window, capture). */
+    function swallowPress(event) {
+      event.preventDefault();
+      if (event.stopImmediatePropagation) event.stopImmediatePropagation();
+      else event.stopPropagation();
     }
-    (root.document.body || root.document.documentElement).appendChild(fieldLayer);
-    if (typeof root.IntersectionObserver === 'function') {
-      fieldObserver = new root.IntersectionObserver(function (entries) {
-        entries.forEach(function (entry) {
-          var field = entry.target;
-          var button = fieldButtons.get(field);
-          if (!button) return;
-          if (entry.isIntersecting) {
-            visibleFields.add(field);
-            placeMic(field, button, true);
-          } else {
-            visibleFields.delete(field);
-            setMicHidden(button, true);
-          }
-        });
-        placeTelemetry();
-      });
+    root.addEventListener('pointerdown', function (event) {
+      if (event.button > 0) return;
+      var field = micField(event.target);
+      if (!field || !onMic(field, event)) return;
+      swallowPress(event);
+      if (press) cancelDelay(press.timer);
+      press = {field: field, id: event.pointerId, at: Date.now(), was: micBusy, held: false, timer: 0};
+      if (micBusy) stopMic(); else startMic(field);
+      var mine = press;
+      mine.timer = afterDelay(function () { mine.timer = 0; mine.held = true; }, 450);
+      try { field.setPointerCapture(event.pointerId); } catch (err) { /* released */ }
+    }, true);
+    function endPress(event, cancelled) {
+      if (!press || (event.pointerId !== undefined && event.pointerId !== press.id)) return;
+      swallowPress(event);
+      if (press.timer) cancelDelay(press.timer);
+      if (!press.was && (cancelled || press.held || Date.now() - press.at >= 450)) stopMic();
+      swallow = {field: press.field, until: Date.now() + 350};
+      press = null;
     }
+    root.addEventListener('pointerup', function (event) { endPress(event, false); }, true);
+    root.addEventListener('pointercancel', function (event) { endPress(event, true); }, true);
+    /* The rest of the press - mouse compatibility events, the click, a
+       long-press menu - belongs to the mic, not to the field or the view. */
+    ['mousedown', 'mouseup', 'click', 'dblclick', 'contextmenu'].forEach(function (name) {
+      root.addEventListener(name, function (event) {
+        var owner = press ? press.field
+          : swallow && Date.now() <= swallow.until ? swallow.field : null;
+        if (!press && swallow && !owner) swallow = null;
+        var target = event.target;
+        if (!owner || (target !== owner && !(owner.contains && owner.contains(target)))) return;
+        swallowPress(event);
+        if (name === 'click' && !press) swallow = null;
+      }, true);
+    });
+    root.addEventListener('pointermove', function (event) {
+      if (event.pointerType === 'touch') return;
+      var field = micField(event.target);
+      setHover(field && onMic(field, event) ? field : null);
+    }, {capture: true, passive: true});
+    /* Guarded as the old layer's mount was: a document with no root element
+       yet (a bare harness, an early or torn-down document) must never throw
+       out of this block, or PineTalkDot is never exported. */
+    var micRoot = root.document.documentElement || root.document.body;
+    if (micRoot && typeof micRoot.addEventListener === 'function') {
+      micRoot.addEventListener('pointerleave', function () { setHover(null); });
+    }
+    /* The keyboard road the button's Enter used to be: Ctrl+Shift+Space in
+       a field with a mic taps it. */
+    root.document.addEventListener('keydown', function (event) {
+      if (!event.ctrlKey || !event.shiftKey || event.altKey || event.metaKey) return;
+      if (event.code !== 'Space' && event.key !== ' ') return;
+      var field = micField(event.target);
+      if (!field) return;
+      event.preventDefault();
+      if (micBusy) stopMic(); else startMic(field);
+    }, true);
     root.document.addEventListener('focusin', function (event) {
       var field = event.target;
-      if (!textField(field)) return;
-      var button = fieldButtons.get(field);
-      if (!button) {
-        button = makeMic(field);
-        fieldButtons.set(field, button);
-        if (fieldObserver) fieldObserver.observe(field);
-      }
-      visibleFields.add(field);
-      placeMic(field, button, true);
+      if (textField(field) && !micFields.has(field)) decorate([field]);
       queueScan();
     });
-    root.addEventListener('resize', queuePlace);
-    root.addEventListener('scroll', queuePlace, true);
-    if (root.visualViewport) {
-      root.visualViewport.addEventListener('resize', queuePlace);
-      root.visualViewport.addEventListener('scroll', queuePlace);
-    }
-    if (typeof MutationObserver !== 'undefined') {
+    if (typeof MutationObserver !== 'undefined' && (root.document.body || micRoot)) {
       new MutationObserver(function (records) {
+        var scanNeeded = false;
+        var sweepNeeded = false;
         for (var i = 0; i < records.length; i += 1) {
           var nodes = records[i].addedNodes || [];
-          for (var j = 0; j < nodes.length; j += 1) {
+          for (var j = 0; j < nodes.length && !scanNeeded; j += 1) {
             var node = nodes[j];
             if (node && node.nodeType === 1 && (textField(node)
                 || (node.querySelector && node.querySelector('input, textarea, [contenteditable="true"]')))) {
-              queueScan();
-              return;
+              scanNeeded = true;
             }
           }
+          if (!sweepNeeded && records[i].removedNodes && records[i].removedNodes.length) sweepNeeded = true;
         }
-      }).observe(root.document.body || root.document.documentElement,
+        if (scanNeeded) queueScan();
+        if (sweepNeeded && micFields.size) queueSweep();
+      }).observe(root.document.body || micRoot,
         {childList: true, subtree: true});
     }
     scan();

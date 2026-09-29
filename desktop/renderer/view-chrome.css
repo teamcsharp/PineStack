@@ -397,30 +397,46 @@
 .pine-talk-dot.thinking { border-color: #e3be63; }
 .pine-talk-dot.field-capture { display: none; }
 
-.pine-field-mics {
-  position: fixed;
-  inset: 0;
-  z-index: 2147483083;
-  pointer-events: none;
+/* [field-mic-paint] THE MIC IS PAINTED BY ITS FIELD (talk-dot.js). Every
+   text field that can take dictation wears data-pine-mic="on" and paints the
+   mic itself: the Carbon glyph (17px) over its plate (32px, or the field's
+   height - 4 when shorter), at the right of its padding box, in the right
+   padding the field reserves. Being the field's own background it scrolls,
+   folds, resizes and hides with the field - there is no layer to sync.
+   The colours are the old button's: idle #8fcbd2 on nothing; hover and
+   pressed #c4f4f3 on #24424a; pressed adds the 1px #65c7da ring. */
+:root {
+  --pine-mic-glyph-idle: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32' fill='%238fcbd2'%3E%3Cpath d='M23,14v3A7,7,0,0,1,9,17V14H7v3a9,9,0,0,0,8,8.94V28H11v2H21V28H17V25.94A9,9,0,0,0,25,17V14Z'/%3E%3Cpath d='M16,22a5,5,0,0,0,5-5V7A5,5,0,0,0,11,7V17A5,5,0,0,0,16,22ZM13,7a3,3,0,0,1,6,0V17a3,3,0,0,1-6,0Z'/%3E%3C/svg%3E");
+  --pine-mic-glyph-hot: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32' fill='%23c4f4f3'%3E%3Cpath d='M23,14v3A7,7,0,0,1,9,17V14H7v3a9,9,0,0,0,8,8.94V28H11v2H21V28H17V25.94A9,9,0,0,0,25,17V14Z'/%3E%3Cpath d='M16,22a5,5,0,0,0,5-5V7A5,5,0,0,0,11,7V17A5,5,0,0,0,16,22ZM13,7a3,3,0,0,1,6,0V17a3,3,0,0,1-6,0Z'/%3E%3C/svg%3E");
+  --pine-mic-plate-hot: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg'%3E%3Crect width='100%25' height='100%25' rx='3' fill='%2324424a'/%3E%3C/svg%3E");
+  --pine-mic-plate-live: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg'%3E%3Crect width='100%25' height='100%25' rx='3' fill='%2324424a' stroke='%2365c7da' stroke-width='2'/%3E%3C/svg%3E");
 }
-.pine-field-mic {
-  position: fixed;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: 4px;
-  border: 0;
-  border-radius: 3px;
-  background: transparent;
-  color: #8fcbd2;
-  cursor: pointer;
-  pointer-events: auto;
+[data-pine-mic="on"] {
+  --pine-mic-glyph: var(--pine-mic-glyph-idle);
+  --pine-mic-plate: none;
+  background-image: var(--pine-mic-glyph), var(--pine-mic-plate) !important;
+  background-position: right calc(2px + (var(--pine-mic-size, 32px) - 17px) / 2) center, right 2px center !important;
+  background-size: 17px 17px, var(--pine-mic-size, 32px) var(--pine-mic-size, 32px) !important;
+  background-repeat: no-repeat !important;
+  background-origin: padding-box !important;
+  background-attachment: scroll !important;
 }
-.pine-field-mic[hidden] { display: none; }
-.pine-field-mic svg { width: 17px; height: 17px; }
-.pine-field-mic:hover, .pine-field-mic:focus-visible,
-.pine-field-mic[aria-pressed="true"] { color: #c4f4f3; background: #24424a; }
-.pine-field-mic[aria-pressed="true"] { box-shadow: inset 0 0 0 1px #65c7da; }
+[data-pine-mic="on"][data-pine-mic-hover] {
+  --pine-mic-glyph: var(--pine-mic-glyph-hot);
+  --pine-mic-plate: var(--pine-mic-plate-hot);
+  cursor: pointer !important;
+}
+[data-pine-mic="on"][data-pine-mic-live] {
+  --pine-mic-glyph: var(--pine-mic-glyph-hot);
+  --pine-mic-plate: var(--pine-mic-plate-live);
+}
+[data-pine-mic="on"]:read-only,
+[aria-hidden="true"] [data-pine-mic="on"],
+[data-pine-mic="on"][aria-hidden="true"] {
+  --pine-mic-glyph: none;
+  --pine-mic-plate: none;
+  cursor: auto !important;
+}
 
 .pine-talk-telemetry {
   position: fixed;
