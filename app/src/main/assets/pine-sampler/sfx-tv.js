@@ -3090,6 +3090,28 @@
          decoder look identical from here and deserve the same answer. */
       if (screen.paused || !Number(screen.currentTime)) failed();
     }, 12000);
+    /* [vidmiss] THE LAST FRAME THAT NEVER ENDS. Measured on the PineTab
+       2026-09-28: a clip reached 8.7 of its 8.87 s and sat there, playing,
+       for eleven seconds before `ended` fired - the tube was held, the
+       next sting started nine seconds late and the picture after it was
+       thrown away as missed. The watchdog above only asks whether a clip
+       STARTED. A playhead standing within JOIN_TAIL of the end for
+       TAIL_STALL_MS while nothing has paused it is a clip that has ended,
+       and it takes the same road `ended` takes. */
+    var tailAt = -1, tailSince = 0;
+    var tailWatch = setInterval(function () {
+      if (done || video !== screen) { clearInterval(tailWatch); return; }
+      if (over || passed || screen.paused || screen.ended) { tailSince = 0; return; }
+      var len = Number(screen.duration), pos = Number(screen.currentTime);
+      if (!isFinite(len) || len <= 0 || len - pos > JOIN_TAIL) { tailSince = 0; return; }
+      if (!tailSince || pos - tailAt > 0.05) { tailAt = pos; tailSince = now(); return; }
+      if (now() - tailSince >= TAIL_STALL_MS) {
+        clearInterval(tailWatch);
+        passed = true;
+        ended();
+      }
+    }, 500);
+    if (tailWatch && typeof tailWatch.unref === 'function') tailWatch.unref();
     /* [#1214] ONE SFX SOUND AT A TIME ON THIS PAGE - this is the moment
        sound actually starts, so the hush is repeated here (the claim at
        the top of play() can be seconds older on a slow decode). A
@@ -5570,7 +5592,9 @@
    * set's - a sting is punctuation for a line that was spoken, and it
    * belongs at its own first frame or nowhere. */
   function airInto(clip) {
-    if (!clip || !clip.endless) return 0;
+    /* [vidmiss] and a silent picture: its sound is in the round, so the
+       picture belongs where the sound is, not at its own first frame. */
+    if (!clip || !(clip.endless || clip.silent_picture)) return 0;
     var at = Number(clip.at);
     if (!isFinite(at) || at <= 0) return 0;
     var into = (now() - at) / 1000;
@@ -5596,9 +5620,14 @@
   function missed(clip) {
     if (!clip) return false;
     var late = (now() - Number(clip.at || now())) / 1000;
-    if (!clip.endless) return late > LATE;
+    /* [vidmiss] a SILENT picture is the picture of a board clip whose
+       sound is welded into the round and already sounding - it is not
+       punctuation that can be too late, it is late only once that
+       sound has (nearly) run. It is joined where the sound is (airInto). */
+    if (!clip.endless && !clip.silent_picture) return late > LATE;
     var slot = Number(clip.seconds);
     if (!isFinite(slot) || slot <= 0) slot = LATE;
+    if (!clip.endless) return late >= slot - SILENT_TAIL;   /* [vidmiss] */
     return late >= slot;
   }
 
@@ -5621,6 +5650,7 @@
      * broadcast is already at 10% through PineDuck while he reads, which
      * is the rule this station actually holds. */
     if ((reportUp || reportNow()) && !endlessOn) return;
+    queueOrder();                                          /* [vidmiss] */
     var clip = queue.shift();
     while (clip && missed(clip)) {                         /* #1173 */
       videoReceipt(clip, 'error', null, 'Video missed its playback window');
@@ -5700,6 +5730,33 @@
   var QUEUE_AHEAD_S = 30;
   var QUEUE_ROWS_MOST = 24;
 
+  var TAIL_STALL_MS = 1500; /* [vidmiss] a playhead this long at the last frame has ended */
+  /* [vidmiss] THE QUEUE IS AIR ORDER, NOT ARRIVAL ORDER.
+   *
+   * offer() appends whatever the poll hands over, and the station does not
+   * ring in air order: a sting stamped behind the committed round arrives
+   * up to 70 s ahead of its moment, while the board's silent pictures are
+   * rung at their true moment inside the round already being heard.
+   * Measured on the PineTab 2026-09-28: a sting rung for 2980 sat at the
+   * head with its wait timer, the pictures due at 2930.6 and 2954.4 queued
+   * behind it, and both were thrown away as missed when it finished.
+   * Sorted by `at` (stable; a row with no `at` keeps its place behind the
+   * row before it). The endless runway alone is left as it is. */
+  var SILENT_TAIL = 1.0;     /* [vidmiss] less than this of its sound left: not worth the set */
+
+  function queueOrder() {
+    if (queue.length < 2) return;
+    if (!queue.some(function (clip) { return clip && !clip.endless; })) return;
+    var last = -Infinity;
+    var rows = queue.map(function (clip, i) {
+      var at = Number(clip && clip.at);
+      if (isFinite(at) && at > 0) last = at;
+      return {clip: clip, i: i, key: (isFinite(at) && at > 0) ? at : last};
+    });
+    rows.sort(function (a, b) { return (a.key - b.key) || (a.i - b.i); });
+    for (var j = 0; j < rows.length; j += 1) queue[j] = rows[j].clip;
+  }
+
   function queueTrim() {
     /* #1463: A TIMED CUE IS A PLACE IN THE DIALOGUE, NOT RUNWAY.
      *
@@ -5718,6 +5775,7 @@
      * than the next one owed. */
     var timed = queue.some(function (clip) { return clip && !clip.endless; });
     if (timed) {
+      queueOrder();                              /* [vidmiss] the farthest is last */
       while (queue.length > QUEUE_ROWS_MOST) queue.pop();
       return;
     }
