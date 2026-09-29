@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- [airplayers] the "active radio" badge on a Playing it row. -->
+<shape xmlns:android="http://schemas.android.com/apk/res/android"
+    android:shape="rectangle">
+    <solid android:color="@color/pine_amber" />
+    <corners android:radius="8dp" />
+</shape>

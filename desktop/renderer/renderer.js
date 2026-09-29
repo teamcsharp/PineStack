@@ -2364,8 +2364,11 @@ async function pollDesktopRadio() {
      * The clock already carries the owner - the panel reads it from the
      * same field - so the shell only has to answer the same question
      * about itself. */
-    window.__pineGagged = !!(clock && clock.audio_owner)
-      && clock.audio_owner !== desktopListenerId;
+    /* [airplayers:shell] ...and a shell whose receiver is switched off in
+     * Playing it is hushed by the same clock, like the panel beside it. */
+    window.__pineGagged = !!(clock && clock.hushed)
+      || (!!(clock && clock.audio_owner)
+          && clock.audio_owner !== desktopListenerId);
     syncDesktopRadio(clock);
     pollPlayers();
   } catch {

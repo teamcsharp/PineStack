@@ -1,23 +1,40 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- One player on the broadcast. Inflated once per row of
-     /api/radio/listeners.
+<!-- One receiver of the broadcast ([airplayers]). Inflated once per row of
+     /api/air/receivers (or, on a station that predates it, one row per
+     player of /api/radio/listeners, with the old tick).
 
-     The tick is a TextView, not a CheckBox, on purpose: the whole row is the
-     target (48dp, the full width) rather than a 20dp box a thumb misses, and
-     the check has to show a state the station owns, not one the widget
-     remembers for itself. -->
+     The whole row is the target for the AUDIBLE switch (48dp, the full
+     width) rather than a small switch a thumb misses, and the switch is not
+     clickable itself: it shows a state the station owns, never one the
+     widget remembers. "only" is its own target: it makes this receiver the
+     only one sounding in the house. The background is player_row.xml, which
+     draws pressed and selected (the active radio) - chip.xml has no
+     selected state, which is why the old row holding the air looked exactly
+     like the rows that did not. -->
 <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
     android:layout_width="match_parent"
-    android:layout_height="@dimen/tap"
+    android:layout_height="wrap_content"
+    android:minHeight="@dimen/tap"
     android:layout_marginBottom="4dp"
-    android:background="@drawable/chip"
+    android:background="@drawable/player_row"
     android:clickable="true"
     android:focusable="true"
     android:gravity="center_vertical"
     android:orientation="horizontal"
-    android:paddingStart="10dp"
-    android:paddingEnd="10dp">
+    android:paddingStart="8dp"
+    android:paddingEnd="6dp">
 
+    <androidx.appcompat.widget.SwitchCompat
+        android:id="@+id/playerSwitch"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginEnd="6dp"
+        android:clickable="false"
+        android:focusable="false"
+        android:importantForAccessibility="no"
+        android:visibility="gone" />
+
+    <!-- The old tick, for a station without /api/air/receivers. -->
     <TextView
         android:id="@+id/playerTick"
         android:layout_width="22dp"
@@ -29,24 +46,58 @@
         android:layout_width="0dp"
         android:layout_height="wrap_content"
         android:layout_weight="1"
-        android:orientation="vertical">
+        android:orientation="vertical"
+        android:paddingTop="4dp"
+        android:paddingBottom="4dp">
 
-        <TextView
-            android:id="@+id/playerName"
+        <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:ellipsize="end"
-            android:maxLines="1"
-            android:textColor="@color/chip_text"
-            android:textSize="14sp" />
+            android:gravity="center_vertical"
+            android:orientation="horizontal">
+
+            <TextView
+                android:id="@+id/playerName"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:ellipsize="end"
+                android:maxLines="1"
+                android:textColor="@color/chip_text"
+                android:textSize="14sp" />
+
+            <TextView
+                android:id="@+id/playerBadge"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="8dp"
+                android:background="@drawable/player_badge"
+                android:paddingStart="6dp"
+                android:paddingEnd="6dp"
+                android:text="@string/rail_active_radio"
+                android:textColor="@color/pine_ground"
+                android:textSize="10sp"
+                android:visibility="gone" />
+        </LinearLayout>
 
         <TextView
             android:id="@+id/playerDetail"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:ellipsize="end"
-            android:maxLines="1"
+            android:maxLines="2"
             android:textColor="@color/pine_dim"
             android:textSize="10sp" />
     </LinearLayout>
+
+    <Button
+        android:id="@+id/playerOnly"
+        android:layout_width="wrap_content"
+        android:layout_height="40dp"
+        android:minWidth="52dp"
+        android:background="@drawable/chip"
+        android:text="@string/rail_only"
+        android:textAllCaps="false"
+        android:textColor="@color/chip_text"
+        android:textSize="12sp"
+        android:visibility="gone" />
 </LinearLayout>

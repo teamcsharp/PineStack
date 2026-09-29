@@ -34,6 +34,9 @@
     <string name="rail_streams">Streams</string>
     <string name="rail_players">Playing it</string>
     <string name="rail_players_waiting">asking the station who is listening…</string>
+    <!-- [airplayers:strings] -->
+    <string name="rail_active_radio">active radio</string>
+    <string name="rail_only">only</string>
     <string name="rail_music">Music</string>
     <string name="rail_voice">DJs</string>
     <string name="rail_reply">Replies</string>
