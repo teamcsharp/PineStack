@@ -69,6 +69,16 @@
   }
   function paint(body, line, report, current) {
     body.replaceChildren();
+    /* [rollplay] "At the top of dialogue repeat diagnostics show the roulette
+       roles that resulted in this": the Message view tile, replayable, with
+       the rolls, the databases and the lists under it (script-page.js). */
+    if (root.PineRollTag && typeof root.PineRollTag.mount === 'function') {
+      var roll = make('section', 'lr-section lr-roll');
+      body.appendChild(roll);
+      try {
+        root.PineRollTag.mount(roll, {id: report.line_id || line.id, said: report.text || line.said}, {autoplay: true});
+      } catch (err) { roll.remove(); }
+    }
     body.appendChild(make('blockquote', 'lr-quote', report.text));
     var stats = make('div', 'lr-stats');
     [[report.played_24h, 'Confirmed plays / 24h'], [report.occurrences_24h, 'Occurrences / 24h'],
