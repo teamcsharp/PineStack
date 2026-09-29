@@ -92,6 +92,17 @@ def clips_dir() -> Path:
 
 STATION_IF = "wlP9s9"           # holds 10.89.1.246 - never touched
 SPARE_IF = "wlx984827b6b478"
+# [pinelink-radio] data/pinelink_radio.json names the radio when it exists
+# ({"iface": ..., "vendor": ...}); the constants are the fallback.
+def _pinelink_radio() -> dict:
+    try:
+        import json as _json
+        got = _json.loads((Path(__file__).resolve().parent.parent / "data" / "pinelink_radio.json").read_text())
+        return got if isinstance(got, dict) else {}
+    except Exception:  # noqa: BLE001
+        return {}
+_RADIO_CFG = _pinelink_radio()
+SPARE_IF = str(_RADIO_CFG.get("iface") or SPARE_IF)
 # #1388: how long without a new frame before the link is declared gone.
 FRAME_STALL_S = 20.0
 # #1474: the phone's two outputs. One set of numbers, so the ffmpeg
@@ -110,6 +121,7 @@ SMALL_FRESH_S = 5.0
 # radio. Used only to find it on the USB bus for a reset, and matched
 # exactly - never as a prefix.
 ADAPTER_VENDOR = "2357"
+ADAPTER_VENDOR = str(_RADIO_CFG.get("vendor") or ADAPTER_VENDOR)   # [pinelink-radio]
 SSID = "H88_5c8e8bddfab1"
 PSK = "12345678"
 CAMERA = "192.168.1.254"
