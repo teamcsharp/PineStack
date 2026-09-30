@@ -163243,6 +163243,12 @@ def _screen_export_minutes(seconds: float) -> str:
     return "%d seconds" % s if s < 120 else "%.1f minutes" % (s / 60.0)
 
 
+def spoken_folder(path: str) -> str:
+    """[short-say] a place as the Nabu says it: the last folder, never the path."""
+    p = str(path or "").replace("\\", "/").rstrip("/")
+    return p.rsplit("/", 1)[-1] or p
+
+
 def export_cam_request(cmd: dict[str, Any]) -> str:
     """[cam-export] "export the last X minutes of the pine cam": the window cut
     out of the footage the link keeps (the record button's own cut), in the
@@ -163289,19 +163295,14 @@ def export_cam_request(cmd: dict[str, Any]) -> str:
 
     fire_and_forget(_go())
     pipeline_log("air", "spoken: export the last %ss of the Pine Cam (%s)" % (want, name))
-    words = "Exporting the last %s of the Pine Cam's footage. " % mins
-    if asked > want:
-        words += "A cut holds at most %s, so that is what it will take. " % _screen_export_minutes(PINELINK_CUT_MOST)
+    words = "Exporting the last %s of the Pine Cam to %s." % (          # [short-say]
+        mins, spoken_folder(dest) if dest else "its cuts")
     if short:                                               # [cam-rotate]
-        words += ("The Pine Cam only keeps its newest %d files, so it can give about %d minutes. "
-                  % (pinecam_keep_segments(), int((hi - oldest) // 60)))
+        words += " It only keeps about %d minutes." % int((hi - oldest) // 60)
+    elif asked > want:
+        words += " A cut holds at most %s." % _screen_export_minutes(PINELINK_CUT_MOST)
     if stale > 120:
-        words += ("The camera stopped recording %d minutes ago, so it is the last %s before that. "
-                  % (int(stale // 60), mins))
-    if dest:
-        words += "The Pine Box desk carries it to %s as %s." % (dest, name)
-    else:
-        words += "No export folder is set, so it stays with the Pine Cam's cuts."
+        words += " The camera stopped %d minutes ago." % int(stale // 60)
     return words
 
 
@@ -163320,18 +163321,11 @@ def export_screen_request(cmd: dict[str, Any]) -> str:
                                "claimed_by": "", "claimed_at": 0.0, "done": False, "result": None})
     dest = export_desk_dir()
     pipeline_log("air", "spoken: export the last %ss of %s (%s)" % (want, SCREEN_EXPORT_NAMES[target], name))
-    words = "Exporting the last %s of %s%s. " % (
-        _screen_export_minutes(want), SCREEN_EXPORT_NAMES[target],
-        " with its sound" if target == "tab" else "")
+    words = "Exporting the last %s of %s to %s." % (                 # [short-say]
+        _screen_export_minutes(want), "the PineTab" if target == "tab" else "the Pine Box app",
+        spoken_folder(dest) if dest else "the station's exports")
     if asked > hold:
-        words += "It only keeps the last %s, so that is what it will cut. " % _screen_export_minutes(hold)
-    who = "The tablet" if target == "tab" else "The Pine Box app"
-    if dest:
-        words += ("%s cuts it from its replay ring and the Pine Box desk carries it to %s "
-                  "as %s." % (who, dest, name))
-    else:
-        words += ("%s cuts it from its replay ring; no export folder is set, so it stays in "
-                  "data/exports as %s." % (who, name))
+        words += " It only keeps the last %s." % _screen_export_minutes(hold)
     return words
 
 
@@ -164105,7 +164099,8 @@ async def export_command_run(cmd: dict[str, Any],
     for old, row in list(_CUT_JOBS.items()):          # bounded
         if time.time() - float(row.get("at") or 0) > 3600:
             _CUT_JOBS.pop(old, None)
-    where = export_desk_dir() or export_host_words(export_dir_path())   # #1114
+    where = (spoken_folder(export_desk_dir()) if export_desk_dir()      # #1114 [short-say]
+             else export_host_words(export_dir_path()))
     if cmd.get("sentences"):
         n = int(cmd["sentences"])
         label = f"the last {n} sentence{'s' if n != 1 else ''} - spoken order"
@@ -200928,10 +200923,9 @@ def export_near_miss(text: str) -> str:
     heard = re.split(r"(?<=[.!?])\s+", " ".join(str(text).split()))[0]
     if len(heard) > 140:
         heard = heard[:140].rsplit(" ", 1)[0] + " ..."
-    return ("I heard an export order but could not tell what to cut, so nothing was exported. "
-            "I heard: \"%s\". Say \"export the last five minutes of the pine tab\" for the tablet's "
-            "screen, \"... of the pine cam\" for the camera, \"... of the pine app\" for the desk, "
-            "or \"... of the broadcast\" for the audio." % heard)
+    return ("I couldn't tell what to export, so nothing was exported. I heard: \"%s\". "   # [short-say]
+            "Say: export the last five minutes of the pine tab - or the pine cam, the pine app, "
+            "or the broadcast." % heard)
 
 
 def parse_paper_command(text: str) -> str:

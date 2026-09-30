@@ -56,6 +56,13 @@ class ScreenOrders(unittest.TestCase):
                                "I was gonna come and clip in New York and mess it to an audience"),
                          {"seconds": 60, "screen": "tab"})
         self.assertEqual(parse("Export the last 5 minutes of the pine tab display"), {"seconds": 300, "screen": "tab"})
+        self.assertEqual(parse("export the last ten seconds of Pine Tab footage"), {"seconds": 10, "screen": "tab"})
+
+    def test_the_nabu_says_the_last_folder_only(self):
+        # [short-say] never the whole \\host\share\... path, never the file name
+        self.assertIn("spoken_folder(dest) if dest else \"the station's exports\"", SRC)
+        self.assertIn("spoken_folder(export_desk_dir()) if export_desk_dir()", SRC)
+        self.assertNotIn("carries it to %s as %s", SRC)
 
     def test_an_unreadable_order_is_answered_honestly(self):
         # [export-lead] never the chat model's "I'm on it" - it did nothing
