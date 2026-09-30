@@ -594,3 +594,75 @@
   root.PinePopBack = {stack: function () { return up.slice(); }, isPopup: isPopup};
   if (doc.readyState === 'loading') doc.addEventListener('DOMContentLoaded', start); else start();
 })(typeof window !== 'undefined' ? window : globalThis);
+
+/* [aspect-keep] 2026-09-30: "When adjusting a pop-up window or a video window
+ * or the camera window through the corner, always maintain the aspect ratio."
+ * (the operator)
+ *
+ * Most pop-ups here resize with the browser's own corner (CSS resize), which
+ * moves width and height separately. One rule for all of them: a press on the
+ * resize corner of a box whose computed `resize` is not none records its
+ * shape, and while the press lasts every size the corner produces is put back
+ * on that shape - scaled along the diagonal, the way the finger moved. The
+ * video set and the native walls keep their own grips, fixed the same way.
+ */
+(function (root) {
+  'use strict';
+  var doc = root.document;
+  if (!doc || !root.ResizeObserver || root.PineAspectKeep) return;
+  var CORNER = 22;                 /* the corner's reach, px */
+  var live = null;
+
+  function resizable(el) {
+    for (var n = el, i = 0; n && n.nodeType === 1 && i < 6; n = n.parentElement, i += 1) {
+      var r = root.getComputedStyle(n).resize;
+      if (r && r !== 'none') return n;
+    }
+    return null;
+  }
+  function onCorner(box, ev) {
+    var r = box.getBoundingClientRect();
+    return ev.clientX >= r.right - CORNER && ev.clientX <= r.right + 2
+      && ev.clientY >= r.bottom - CORNER && ev.clientY <= r.bottom + 2;
+  }
+  function correct() {
+    if (!live) return;
+    var b = live.box, w0 = live.w, h0 = live.h;
+    var w = b.offsetWidth, h = b.offsetHeight;
+    if (!w || !h) return;
+    var s = (w * w0 + h * h0) / (w0 * w0 + h0 * h0);   /* along the diagonal */
+    var nw = Math.round(w0 * s), nh = Math.round(h0 * s);
+    if (Math.abs(nw - w) < 1 && Math.abs(nh - h) < 1) return;
+    /* the outer box is measured; a content-box width is written without its
+       border and padding */
+    var cs = root.getComputedStyle(b), dw = 0, dh = 0;
+    if (cs.boxSizing !== 'border-box') {
+      dw = w - (parseFloat(cs.width) || w);
+      dh = h - (parseFloat(cs.height) || h);
+    }
+    b.style.width = (nw - dw) + 'px';
+    b.style.height = (nh - dh) + 'px';
+  }
+  var keep = new root.ResizeObserver(correct);
+  doc.addEventListener('pointerdown', function (ev) {
+    var t = ev.target;
+    if (!t || t.nodeType !== 1) return;
+    var box = resizable(t);
+    if (!box || !onCorner(box, ev)) return;
+    live = {box: box, w: box.offsetWidth || 1, h: box.offsetHeight || 1};
+    keep.observe(box);
+  }, true);
+  function stop() {
+    if (!live) return;
+    correct();                               /* the corner's last word, put on the shape */
+    var held = live;
+    try { keep.unobserve(held.box); } catch (e) { /* gone */ }
+    live = null;
+  }
+  /* the browser's own corner reports its moves as mouse moves while pressed */
+  doc.addEventListener('pointermove', function () { if (live) correct(); }, true);
+  doc.addEventListener('mousemove', function () { if (live) root.requestAnimationFrame(correct); }, true);
+  doc.addEventListener('pointerup', stop, true);
+  doc.addEventListener('pointercancel', stop, true);
+  root.PineAspectKeep = {active: function () { return !!live; }};
+})(typeof window !== 'undefined' ? window : globalThis);
