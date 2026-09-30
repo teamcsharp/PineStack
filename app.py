@@ -887,6 +887,12 @@ MUSIC_TYPES = {
 # panel. Deliberately NOT part of MUSIC_ROOTS: the pack tree is 23,000 wavs,
 # and indexing it would turn every one of them into a radio track.
 SFX_ROOT = Path(os.getenv("SFX_ROOT", "/samples"))
+# [listener-lane] listeners' own tracks: a music root of their own (one folder
+# per submitter), a lane in the record roulette, never a sting
+USER_MUSIC_ROOT = SFX_ROOT / "samples_grabbed" / "user"
+if str(USER_MUSIC_ROOT) not in [str(r) for r in MUSIC_ROOTS]:
+    MUSIC_ROOTS.append(USER_MUSIC_ROOT)
+LISTENER_ODDS = float(os.getenv("LISTENER_ODDS", "0.15"))   # about one record in seven
 # What gets used when you have not named a folder, so the feature works out of
 # the box: the pack this was built against, and the record scratches (#216).
 SFX_DEFAULT_FOLDERS = (
@@ -965,6 +971,7 @@ SFX_MAX_FILES = int(os.getenv("SFX_MAX_FILES", "400"))
 # whole would turn every one of them into a sting candidate.
 SFX_DROP_FOLDERS = ("samples_grabbed",)
 SFX_DROP_SUBS = 60                 # subfolders taken from a drop root
+SFX_DROP_SKIP = {"user"}           # [listener-lane] listeners' songs, never stings
 # #835: how often the share is re-read for arrivals, in seconds.
 SFX_RESCAN_SECONDS = 120
 # A sting punctuates a line; anything longer is a pad, and an announce
@@ -40503,6 +40510,57 @@ def _spin_request_jump() -> bool:
         return True
 
 
+LISTENER_WATCH_S = 300.0
+_LISTENER_WATCH = {"at": 0.0}
+
+
+def _listener_watch(known: list[dict[str, Any]]) -> None:
+    """[listener-watch] a submission the library does not know yet asks for one
+    rescan (tags of unchanged files come from the cache)."""
+    now = time.time()
+    if now - _LISTENER_WATCH["at"] < LISTENER_WATCH_S or _MUSIC.get("scanning"):
+        return
+    _LISTENER_WATCH["at"] = now
+    have = {str(t.get("path") or "") for t in known}
+    try:
+        for p in _music_walk(USER_MUSIC_ROOT):
+            if p.suffix.lower() in MUSIC_TYPES and str(p) not in have:
+                pipeline_log("air", "listener lane: %s arrived in the submissions - the library "
+                             "reads it in [listener-watch]" % p.name)
+                music_index(force=True)
+                return
+    except Exception:  # noqa: BLE001
+        return
+
+
+def listener_tracks() -> list[dict[str, Any]]:
+    """[listener-lane] the library records under USER_MUSIC_ROOT."""
+    root = str(USER_MUSIC_ROOT).rstrip("/") + "/"
+    try:
+        got = [t for t in music_index() if str(t.get("path") or "").startswith(root)]
+    except Exception:  # noqa: BLE001
+        return []
+    _listener_watch(got)                                                   # [listener-watch]
+    return got
+
+
+def listener_pick() -> dict[str, Any] | None:
+    """[listener-lane] one submission, System 3's pick among those not heard
+    inside the day, dressed for the request line."""
+    pool = [t for t in listener_tracks()
+            if not (norepeat_on() and norepeat_record_used(t.get("id")))]
+    if not pool:
+        return None
+    by_id = {str(t["id"]): t for t in pool if t.get("id")}
+    got = unrepeated(list(by_id), "listener", keep=max(1, len(by_id) - 1),
+                     director=_S3Dice("records.listener_pick", "which listener submission goes on"))
+    track = by_id.get(str(got))
+    if not track:
+        return None
+    who = str(track.get("artist") or track.get("station") or "a listener")
+    return {**track, "requested": True, "listener": True, "submitted_by": who[:120]}
+
+
 def dj_next_track() -> dict[str, Any] | None:
     """Requests jump the queue; that is the whole point of a request line.
 
@@ -40555,6 +40613,22 @@ def dj_next_track() -> dict[str, Any] | None:
                                due=_s3_spin_roll("records.mixtape_due"))
             _RADIO["coming"] = tape
             return tape
+    # [listener-lane] now and then, a listener's own track - rolled, never forced
+    if (not _RADIO["requests"] and not radio_paused() and listener_tracks()
+            and s3_chance("records.listener_due", LISTENER_ODDS,
+                          "a listener's submission gets its airplay (samples_grabbed/user)")):
+        sub = listener_pick()
+        if sub:
+            sub = _spin_stamp(sub, "listener", roll="records.listener_pick",
+                              due=_s3_spin_roll("records.listener_due"),
+                              requested_by=sub.get("submitted_by"),
+                              note="a listener sent this in for airplay")
+            pipeline_log("air", "listener lane: %s by %s goes on (a submission)"
+                         % (sub.get("title") or "a record", sub.get("submitted_by")))
+            _RADIO["coming"] = sub
+            _music_hot_warm(sub, "coming")
+            _RADIO["since_tape"] = _RADIO.get("since_tape", 0) + 1
+            return sub
     if _RADIO["requests"] and _spin_request_jump():   # [s3-cover-b]
         track = {**_RADIO["requests"].pop(0), "requested": True}
         track = _spin_stamp(track, "request", roll="records.request_jump",   # [s3-cover-b]
@@ -41123,6 +41197,10 @@ async def _record_talk_body(track: dict[str, Any], dj: dict[str, Any],
             notes = ""
     if notes:
         song_analysis_ready(track, notes)
+    if track.get("listener"):                                                 # [listener-lane]
+        notes = ("This record is a listener's own submission - %s sent it in for airplay. Say so, give "
+                 "them a shout-out by name, and say what you actually hear in it: the sound, the mood, "
+                 "the words." % (track.get("submitted_by") or "a listener")) + ((" " + notes) if notes else "")
     # #834: a definition found for the title rides along with the notes,
     # so the record's own introduction can land the did-you-know as well
     # as the round that follows it. Appended AFTER the analysis event so
@@ -85018,7 +85096,8 @@ def sfx_folders() -> list[Path]:
                         or not root.is_dir():
                     continue
                 here = [root] + sorted(
-                    (one for one in root.iterdir() if one.is_dir()),
+                    (one for one in root.iterdir() if one.is_dir()
+                     and one.name.lower() not in SFX_DROP_SKIP),   # [listener-lane]
                     key=lambda one: one.name)[:SFX_DROP_SUBS]
             except Exception:  # noqa: BLE001
                 continue
