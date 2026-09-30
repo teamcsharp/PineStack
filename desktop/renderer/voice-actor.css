@@ -279,3 +279,27 @@
   .va-seat { grid-template-columns: minmax(0, 1fr) auto; }
   .va-seat-role { grid-column: 1 / -1; }
 }
+
+/* [emotion-engine] the Emotion engine card */
+.va-ee-tabs { display: flex; flex-wrap: wrap; gap: 6px; margin: 4px 0 10px; }
+.va-ee-tab.on { border-color: #68ced9; color: #fff; background: rgba(104, 206, 217, .14); }
+.va-ee-content { max-height: 52vh; overflow: auto; }
+.va-ee-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.va-ee-table th, .va-ee-table td { text-align: left; padding: 4px 6px; border-bottom: 1px solid rgba(154, 164, 173, .12); vertical-align: top; }
+.va-ee-table th { color: #9aa4ad; font-weight: 600; position: sticky; top: 0; background: #11161c; }
+.va-ee-bad td { color: #ff8f8f; }
+.va-ee-none { color: #9aa4ad; margin: 6px 0; }
+.va-ee-abrow, .va-ee-prompt { border: 1px solid rgba(154, 164, 173, .18); border-radius: 8px; padding: 8px 10px; margin: 0 0 8px; }
+.va-ee-abhead { color: #9aa4ad; font-size: 11px; margin-bottom: 4px; }
+.va-ee-abtext { margin-bottom: 6px; }
+.va-ee-pair { display: flex; flex-wrap: wrap; gap: 10px; }
+.va-ee-player { display: flex; flex-direction: column; gap: 3px; font-size: 11px; color: #9aa4ad; flex: 1 1 220px; }
+.va-ee-player audio { width: 100%; height: 34px; }
+.va-ee-k { display: block; color: #68ced9; font-size: 11px; margin-top: 4px; }
+.va-ee-pre { white-space: pre-wrap; margin: 2px 0 0; font-size: 12px; color: #d8e0e6; }
+.va-ee-roll { margin: 4px 0; }
+.va-ee-roll > b { font-size: 12px; color: #68ced9; }
+.va-ee-stage { font-size: 12px; padding: 2px 0; }
+.va-ee-sparkrow { display: flex; align-items: center; gap: 10px; margin: 6px 0; color: #9aa4ad; font-size: 11px; }
+.va-ee-sparkrow span { min-width: 170px; }
+.va-ee-spark { width: 260px; height: 44px; color: #54d18b; }

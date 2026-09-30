@@ -57,8 +57,8 @@
   var REQUEST_MS = 9000;
   var ON_AIR_WINDOW_S = 180;
   var PANELS_KEY = 'pineVoiceActor.panels.v1';
-  var PANEL_ORDER = ['cast', 'combos', 'callers'];
-  var DEFAULT_OPEN = {cast: true, combos: false, callers: true};
+  var PANEL_ORDER = ['cast', 'combos', 'callers', 'emotion'];                  /* [emotion-engine] */
+  var DEFAULT_OPEN = {cast: true, combos: false, callers: true, emotion: false};
   var SEAT_KEYS = {host: 'voice', cohost: 'cohost_voice', third: 'third_voice', guestvoice: 'third_voice'};
 
   /* ================================================== pure (and tested) */
@@ -789,8 +789,278 @@
     combos: {title: 'Combos', icon: 'c:save', build: buildCombos, paint: paintCombos, summary: summaryCombos,
       sig: function () { return sigCombos(); }},
     callers: {title: 'Callers', icon: 'c:phone', build: buildCallers, paint: paintCallers, summary: summaryCallers,
-      sig: function () { return sigCallers(); }}
+      sig: function () { return sigCallers(); }},
+    emotion: {title: 'Emotion engine', icon: 'c:chart--line', build: buildEmotion, paint: paintEmotion,   /* [emotion-engine] */
+      summary: summaryEmotion, sig: function () { return [tick()]; }}
   };
+
+  /* ------------------------------------------------ the emotion engine
+   * [emotion-engine] "I want to see the queue of it, tasks performed, audit
+   * log, before and after player of clips, prompt history, resource monitor
+   * and roulette interaction indented result log." One card, seven sub-tabs,
+   * fed by GET /api/emotion/state (the voice door's own record) and, per line,
+   * System 3's record of it (/api/system3/line: the ES roll's stages and the
+   * direction the writer was given). The card polls its own road while it is
+   * open; the Before/After list only ever APPENDS, so a player that is
+   * playing is never rebuilt under the ear. */
+  var EE_TABS = [['queue', 'Queue', 'c:time', 'Every line waiting for voice, in order'],
+    ['tasks', 'Tasks', 'c:document', 'Every line the emotion engine performed'],
+    ['audit', 'Audit log', 'c:document', 'What happened to each line, step by step'],
+    ['ab', 'Before/After', 'c:play', 'The engine\'s raw take beside the emotion-shaped final'],
+    ['prompts', 'Prompts', 'c:chat', 'The direction the writer was given for each line'],
+    ['res', 'Resources', 'c:chart--line', 'GPU, VRAM, box temperature, CPU, RAM, timings, queue depth'],
+    ['rolls', 'Roulette log', 'c:shuffle', 'The roulette rolls behind each line, stage by stage']];
+  var ee = {tab: 'queue', data: null, timer: 0, err: '', s3: {}, asked: {}, abSeen: {}, p: null};
+  function eeClock(t) {
+    var d = new Date(Number(t) * 1000);
+    return isNaN(d) ? '' : d.toTimeString().slice(0, 8);
+  }
+  function eeEs(es) {
+    var out = [];
+    var names = {tempo: 'tempo x', pitch: 'pitch st', range: 'range x', energy: 'energy', pause: 'pause x', temp: 'temp'};
+    Object.keys(es || {}).forEach(function (k) { out.push((names[k] || k) + ' ' + es[k]); });
+    return out.join(' · ') || 'neutral';
+  }
+  function eeTable(head, rows) {
+    var t = make('table', 'va-ee-table');
+    var tr = make('tr', '');
+    head.forEach(function (h) { tr.appendChild(make('th', '', h)); });
+    t.appendChild(tr);
+    rows.forEach(function (r) {
+      var row = make('tr', r.cls || '');
+      r.forEach(function (c) { row.appendChild(make('td', '', c == null ? '' : String(c))); });
+      if (r.title) row.title = r.title;
+      t.appendChild(row);
+    });
+    return t;
+  }
+  function eeNone(words) { return make('p', 'va-ee-none', words); }
+  function eeS3(line) {
+    if (!line) return null;
+    if (ee.s3[line]) return ee.s3[line];
+    if (!ee.asked[line]) {
+      ee.asked[line] = 1;
+      get('/api/system3/line?line_id=' + encodeURIComponent(line)).then(function (d) {
+        ee.s3[line] = d || {};
+        if (ee.tab === 'prompts' || ee.tab === 'rolls') eeRender();
+      }, function () { ee.s3[line] = {missing: true}; });
+    }
+    return null;
+  }
+  function eeDirection(d) {
+    var out = [];
+    var t = (d && d.turn) || {};
+    Object.keys(t).forEach(function (k) {
+      if (/direct|prompt|brief|intent|note|act/i.test(k) && typeof t[k] === 'string' && t[k].trim()) out.push([k, t[k]]);
+    });
+    var line = (d && d.line) || {};
+    Object.keys(line).forEach(function (k) {
+      if (/direct|prompt|brief/i.test(k) && typeof line[k] === 'string' && line[k].trim()) out.push([k, line[k]]);
+    });
+    return out;
+  }
+  function eeRollBlock(d) {
+    var box = make('div', 'va-ee-rolls');
+    var decs = (d && d.decisions) || [];
+    decs.slice().sort(function (a, b) { return (a.family === 'ES' ? -1 : 0) - (b.family === 'ES' ? -1 : 0); })
+      .forEach(function (ev) {
+        var fam = make('div', 'va-ee-roll');
+        var sel = ev.selected || {};
+        fam.appendChild(make('b', '', String(ev.family || '?') + ' ' + String(sel.table || '')));
+        (ev.stages || []).forEach(function (st, depth) {
+          var cands = st.candidates || [];
+          var hit = null;
+          cands.forEach(function (c) { if (String(c.id) === String(st.selected)) hit = c; });
+          var dice = st.draw && st.draw.dice != null ? 'd100 ' + st.draw.dice + ' · ' : '';
+          var row = make('div', 'va-ee-stage');
+          row.style.paddingLeft = (12 + depth * 16) + 'px';
+          row.textContent = '\u21b3 ' + String(st.stage || '') + ': ' + dice
+            + String((hit && (hit.label || hit.id)) || st.selected || '-')
+            + (hit && hit.p != null ? ' (p ' + Number(hit.p).toFixed(3) + ')' : '')
+            + ' - ' + (st.selected_index || '?') + ' of ' + (st.of || cands.length);
+          row.title = cands.map(function (c) { return String(c.label || c.id) + ' ' + (c.p != null ? Number(c.p).toFixed(3) : ''); }).join('\n');
+          fam.appendChild(row);
+        });
+        box.appendChild(fam);
+      });
+    return decs.length ? box : eeNone('System 3 kept no rolls for this line.');
+  }
+  function eeSpark(vals, lo, hi, label) {
+    var w = 260, h = 44;
+    var ns = 'http://www.w3.org/2000/svg';
+    var svg = document.createElementNS(ns, 'svg');
+    svg.setAttribute('viewBox', '0 0 ' + w + ' ' + h);
+    svg.setAttribute('class', 'va-ee-spark');
+    svg.setAttribute('role', 'img');
+    svg.setAttribute('aria-label', label);
+    var pts = vals.map(function (v, i) {
+      var x = vals.length > 1 ? (i / (vals.length - 1)) * w : 0;
+      var y = h - 2 - ((Math.max(lo, Math.min(hi, Number(v) || 0)) - lo) / Math.max(1e-9, hi - lo)) * (h - 4);
+      return x.toFixed(1) + ',' + y.toFixed(1);
+    }).join(' ');
+    var pl = document.createElementNS(ns, 'polyline');
+    pl.setAttribute('points', pts);
+    pl.setAttribute('fill', 'none');
+    pl.setAttribute('stroke', 'currentColor');
+    pl.setAttribute('stroke-width', '1.6');
+    svg.appendChild(pl);
+    var t = document.createElementNS(ns, 'title');
+    t.textContent = label;
+    svg.appendChild(t);
+    return svg;
+  }
+  function eeRender() {
+    /* the reader's place survives every refresh (no-autoscroll-takeover) */
+    var c = ee.p && ee.p.parts.content;
+    var keep = c ? c.scrollTop : 0;
+    try { eeRenderInner(); } finally { if (c && ee.tab !== 'ab') c.scrollTop = keep; }
+  }
+  function eeRenderInner() {
+    var p = ee.p;
+    if (!p) return;
+    var body = p.parts.content;
+    var d = ee.data;
+    EE_TABS.forEach(function (t) { setClass(p.parts.tabs[t[0]], 'on', ee.tab === t[0]); });
+    if (ee.tab !== 'ab') { body.textContent = ''; ee.abSeen = {}; }
+    if (!d) { if (ee.tab !== 'ab') body.appendChild(eeNone(ee.err || 'Reading the emotion engine...')); return; }
+    if (ee.tab === 'queue') {
+      var q = d.queue || [];
+      body.appendChild(q.length ? eeTable(['#', 'speaker', 'engine', 'voice', 'state', 'waited', 'emotion shaping', 'line'],
+        q.map(function (r) { return [r.place, r.speaker, r.engine, r.voice, r.state, r.waited_s + ' s', eeEs(r.es), r.text]; }))
+        : eeNone('Nothing is waiting for voice right now.'));
+    } else if (ee.tab === 'tasks') {
+      body.appendChild((d.tasks || []).length ? eeTable(['at', 'speaker', 'engine', 'state', 'render', 'shaping', 'total', 'runs', 'emotion shaping', 'line'],
+        d.tasks.map(function (r) {
+          var row = [eeClock(r.at), r.speaker, r.engine, r.state, r.synth_ms != null ? r.synth_ms + ' ms' : '',
+            r.dsp_ms != null ? r.dsp_ms + ' ms' : '', r.total_ms != null ? r.total_ms + ' ms' : '',
+            r.seconds != null ? r.seconds + ' s' : '', eeEs(r.es), r.text];
+          row.cls = r.state === 'failed' || r.state === 'lost' ? 'va-ee-bad' : '';
+          row.title = r.why || '';
+          return row;
+        })) : eeNone('No line has passed the voice door since the station started.'));
+    } else if (ee.tab === 'audit') {
+      body.appendChild((d.audit || []).length ? eeTable(['at', 'task', 'what', 'detail'],
+        d.audit.map(function (a) {
+          var extra = [];
+          Object.keys(a).forEach(function (k) {
+            if (k !== 'at' && k !== 'task' && k !== 'what') extra.push(k + ' ' + (typeof a[k] === 'object' ? eeEs(a[k]) : a[k]));
+          });
+          return [eeClock(a.at), a.task, a.what, extra.join(' · ')];
+        })) : eeNone('The audit log is empty.'));
+    } else if (ee.tab === 'ab') {
+      var list = body.querySelector('.va-ee-ab') || (function () { body.textContent = ''; var l = make('div', 'va-ee-ab'); body.appendChild(l); return l; })();
+      var done = (d.tasks || []).filter(function (r) { return r.state === 'done' && r.raw_url && r.final_url; });
+      if (!done.length && !list.children.length) list.appendChild(eeNone('No take with both a raw and a shaped copy yet - they are kept for the last 60 lines.'));
+      done.slice().reverse().forEach(function (r) {
+        if (ee.abSeen[r.id]) return;
+        ee.abSeen[r.id] = 1;
+        var none = list.querySelector('.va-ee-none');
+        if (none) none.remove();
+        var row = make('div', 'va-ee-abrow');
+        row.appendChild(make('div', 'va-ee-abhead', eeClock(r.at) + ' · ' + r.speaker + ' · ' + r.engine + ' · ' + eeEs(r.es)));
+        row.appendChild(make('div', 'va-ee-abtext', r.text));
+        var pair = make('div', 'va-ee-pair');
+        [['Before - the raw take', r.raw_url], ['After - emotion-shaped', r.final_url]].forEach(function (x) {
+          var cell = make('label', 'va-ee-player');
+          cell.appendChild(make('span', '', x[0]));
+          var au = document.createElement('audio');
+          au.controls = true;
+          au.preload = 'none';
+          au.src = stationUrl(x[1]);
+          au.title = x[0];
+          cell.appendChild(au);
+          pair.appendChild(cell);
+        });
+        row.appendChild(pair);
+        list.insertBefore(row, list.firstChild);
+      });
+    } else if (ee.tab === 'prompts') {
+      var rowsP = (d.tasks || []).filter(function (r) { return r.line; }).slice(0, 20);
+      if (!rowsP.length) { body.appendChild(eeNone('No line with a System 3 record yet.')); return; }
+      rowsP.forEach(function (r) {
+        var box = make('div', 'va-ee-prompt');
+        box.appendChild(make('div', 'va-ee-abhead', eeClock(r.at) + ' · ' + r.speaker + ' · ' + r.text));
+        var s3 = eeS3(r.line);
+        if (!s3) box.appendChild(eeNone('reading System 3...'));
+        else {
+          var dir = eeDirection(s3);
+          if (!dir.length) box.appendChild(eeNone(s3.missing ? 'System 3 has no record of this line.' : 'No direction text was kept for this line.'));
+          dir.forEach(function (x) {
+            box.appendChild(make('b', 'va-ee-k', x[0]));
+            box.appendChild(make('pre', 'va-ee-pre', x[1]));
+          });
+        }
+        body.appendChild(box);
+      });
+    } else if (ee.tab === 'res') {
+      var n = d.now || {};
+      body.appendChild(eeTable(['', 'now'], [
+        ['GPU', n.util != null ? n.util + ' %' : '-'],
+        ['VRAM', n.vram_used_mb != null ? Math.round(n.vram_used_mb) + ' / ' + Math.round(n.vram_total_mb || 0) + ' MB' : '-'],
+        ['GPU temperature', n.temp_c != null ? n.temp_c + ' C' : '-'],
+        ['box temperature', n.box_c != null ? n.box_c + ' C' : '-'],
+        ['CPU', n.cpu != null ? n.cpu + ' %' : '-'],
+        ['RAM', n.ram_used_gb != null ? n.ram_used_gb + ' / ' + n.ram_total_gb + ' GB' : '-'],
+        ['waiting for voice', n.depth != null ? n.depth : '-']]));
+      var tm = d.timing || {};
+      body.appendChild(eeTable(['per clip', 'mean', 'worst', 'lines'], [['render', 'synth_ms'], ['emotion shaping', 'dsp_ms'], ['door to stored', 'total_ms']]
+        .map(function (x) { var v = tm[x[1]] || {}; return [x[0], v.mean != null ? v.mean + ' ms' : '-', v.max != null ? v.max + ' ms' : '-', v.n || 0]; })));
+      var h = d.history || [];
+      [['queue depth', 'depth', 0, Math.max(4, Math.max.apply(null, h.map(function (x) { return Number(x.depth) || 0; }).concat([0])))],
+        ['GPU %', 'util', 0, 100], ['box temperature C', 'box_c', 30, 100], ['CPU %', 'cpu', 0, 100]].forEach(function (s) {
+        var wrap = make('div', 'va-ee-sparkrow');
+        wrap.appendChild(make('span', '', s[0] + ' - the last hour'));
+        wrap.appendChild(eeSpark(h.map(function (x) { return x[s[1]]; }), s[2], s[3], s[0] + ' over the last hour'));
+        body.appendChild(wrap);
+      });
+    } else if (ee.tab === 'rolls') {
+      var rowsR = (d.tasks || []).filter(function (r) { return r.line; }).slice(0, 15);
+      if (!rowsR.length) { body.appendChild(eeNone('No line with a System 3 record yet.')); return; }
+      rowsR.forEach(function (r) {
+        var box = make('div', 'va-ee-prompt');
+        box.appendChild(make('div', 'va-ee-abhead', eeClock(r.at) + ' · ' + r.speaker + ' · ' + eeEs(r.es) + ' · ' + r.text));
+        var s3 = eeS3(r.line);
+        box.appendChild(s3 ? eeRollBlock(s3) : eeNone('reading System 3...'));
+        body.appendChild(box);
+      });
+    }
+  }
+  function eePoll() {
+    ee.timer = 0;
+    var open = ui.visible && ui.open && ui.open.emotion;
+    if (!open) return;
+    get('/api/emotion/state?limit=60').then(function (d) { ee.data = d; ee.err = ''; eeRender(); },
+      function (e) { ee.err = 'The emotion engine did not answer: ' + ((e && e.message) || e); if (!ee.data) eeRender(); })
+      .then(function () { if (!ee.timer) ee.timer = root.setTimeout(eePoll, 3000); });
+  }
+  function buildEmotion(p) {
+    ee.p = p;
+    var tabs = make('div', 'va-ee-tabs');
+    tabs.setAttribute('role', 'tablist');
+    p.parts.tabs = {};
+    EE_TABS.forEach(function (t) {
+      var b = btn('va-ee-tab', t[1], t[2], t[3]);
+      b.setAttribute('role', 'tab');
+      b.addEventListener('click', function (e) { e.stopPropagation(); ee.tab = t[0]; ee.abSeen = {}; p.parts.content.textContent = ''; eeRender(); });
+      p.parts.tabs[t[0]] = b;
+      tabs.appendChild(b);
+    });
+    p.parts.content = make('div', 'va-ee-content');
+    p.body.appendChild(tabs);
+    p.body.appendChild(p.parts.content);
+  }
+  function paintEmotion(p) {
+    ee.p = p;
+    if (!ee.timer) eePoll();
+    eeRender();
+  }
+  function summaryEmotion() {
+    var d = ee.data;
+    if (!d) return 'queue, tasks, before/after, resources';
+    var q = (d.queue || []).length;
+    var done = (d.tasks || []).filter(function (r) { return r.state === 'done'; }).length;
+    return (q ? q + ' waiting for voice · ' : 'nothing waiting · ') + done + ' performed';
+  }
 
   function buildPanel(id) {
     var def = PANELS[id];

@@ -91,6 +91,7 @@ from parody_stinger_queue import ParodyQueue
 import clip_senses                      # [#1241] where a phrase comes from, and the ban
 import recast_desk                        # [#1215]: the cupboard recast desk
 import es_voice as _es_voice              # [s3-es-voice] how a feeling sounds: the DSP + the engines' own controls
+import emotion_engine as _emotion           # [emotion-engine] the emotion engine's own window
 from director import (director_add, director_beats, director_beats_clause,
                       director_beats_set, director_clause, director_graph,
                       director_feedback_clause, director_lessons_clause,
@@ -25811,6 +25812,11 @@ async def voice_generate(text: str, voice: str, engine: str,
                           f"{len(text)} chars in",
                  extra=(f"INPUT to {engine} "
                         f"({voice or 'default voice'}), #397:\n{text}"))
+    try:                                                     # [emotion-engine] the line entered the door
+        _ee = _emotion.begin(line, speaker, engine, voice, text,
+                             ((fx or {}).get("perf") or {}).get("es") if isinstance((fx or {}).get("perf"), dict) else None)
+    except Exception:  # noqa: BLE001
+        _ee = ""
     try:
         # [s3-es-voice] the line's ES block asks the engine first (its own speed
         # and temperature); what it did natively is not done again by the DSP
@@ -25821,14 +25827,17 @@ async def voice_generate(text: str, voice: str, engine: str,
                 _es_block, engine, float(dj_settings().get("speech_rate") or 1.0), XTTS_TEMP_BASE)
         _es_scope = _ES_ENGINE_OPTS.set(_es_opts)
         try:
+            _emotion.rendering(_ee)                          # [emotion-engine]
             audio, ext = await synthesize(text, voice, engine)
         finally:
             _ES_ENGINE_OPTS.reset(_es_scope)
-    except HTTPException:
+    except HTTPException as _ee_exc:
         voice_refund(len(text))
+        _emotion.failed(_ee, str(getattr(_ee_exc, "detail", "") or _ee_exc))   # [emotion-engine]
         raise
     except Exception as exc:
         voice_refund(len(text))
+        _emotion.failed(_ee, "synthesis failed - %s" % exc)                      # [emotion-engine]
         raise HTTPException(
             status_code=502, detail=f"Synthesis failed — {exc}"
         ) from exc
@@ -25855,6 +25864,11 @@ async def voice_generate(text: str, voice: str, engine: str,
 
     if fx and _es_native.get("tempo"):                        # [s3-es-voice] the engine's share, done
         fx = dict(fx, perf=dict(fx["perf"], es_native_tempo=float(_es_native["tempo"])))
+    try:
+        _emotion.synthed(_ee, audio, ext)                    # [emotion-engine] the raw take, kept
+    except Exception:  # noqa: BLE001
+        pass
+    _ee_dsp = time.monotonic()
     if fx:
         audio = await asyncio.to_thread(voice_effect_apply, audio, ext, fx)
     elif ext == "wav":
@@ -25872,6 +25886,10 @@ async def voice_generate(text: str, voice: str, engine: str,
 
     took = int((time.monotonic() - started) * 1000)
     length = await _clip_seconds_async(f"/media/{key}")
+    try:
+        _emotion.shaped(_ee, key, int((time.monotonic() - _ee_dsp) * 1000), length)   # [emotion-engine]
+    except Exception:  # noqa: BLE001
+        pass
     service = {"xtts": f"XTTS v2 clone server at {XTTS_URL} (host process, "
                        "CUDA on the GB10)",
                "piper": "wyoming-piper container, Wyoming TCP port 10200",
@@ -154163,6 +154181,10 @@ except Exception as _origin_exc:  # noqa: BLE001
 # [sfxseen] SFX DISPLAY RECEIPTS (sfx_display.py): each player says whether a
 # clip's picture reached its screen (surface, first frame, rect, seconds, the
 # operator's reaction); joined to the script's SFX rows. A KEEP store, 7 days.
+try:                                                        # [emotion-engine] GET /api/emotion/state
+    _emotion.install(app, globals())
+except Exception as _ee_exc:  # noqa: BLE001
+    print("the emotion engine window did not install: %s: %s" % (type(_ee_exc).__name__, _ee_exc))
 try:
     import sfx_display as _sfx_display
     _SFX_DISPLAY_RUNTIME = _sfx_display.install(app, globals())
