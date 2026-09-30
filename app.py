@@ -146988,8 +146988,8 @@ def pinelink_cut_span(lo: float, hi: float) -> dict[str, Any]:
             cover.append((at, f))
     if not cover:
         return {"ok": False,
-                "say": "nothing kept covers that span - the footage only "
-                       "goes back two days"}
+                "say": "nothing kept covers that span - the Pine Cam keeps "
+                       "only its newest %d five-minute files" % pinecam_keep_segments()}   # [cam-rotate]
     first_at = cover[0][0]
     out = PINELINK_CUTS / ("cut_%d_%d.mp4" % (int(lo), int(hi)))
     if out.is_file() and out.stat().st_size >= 1024:    # [cam-fmp4] never a failed one
@@ -147047,7 +147047,7 @@ async def pinelink_cut_api(
     only one.
 
     `from` and `to` are epoch seconds. Both must land inside the footage
-    that is still kept, which is two days.
+    that is still kept - the newest keep_segments five-minute files ([cam-rotate]).
     """
     require_auth(authorization)
     try:
@@ -148698,6 +148698,16 @@ def pinecam_cache_files() -> list[Path]:
     return out
 
 
+def pinecam_keep_segments() -> int:
+    """[cam-rotate] the footage files tools/pinelink.py keeps (its KEEP_SEGMENTS,
+    or pinelink_pref.json keep_segments) - read the same way it reads it."""
+    try:
+        n = int(pinelink_prefs_read().get("keep_segments") or 5)
+    except Exception:  # noqa: BLE001
+        n = 5
+    return max(2, min(n, 576))
+
+
 def pinecam_storage() -> dict[str, Any]:
     def tally(paths: list[Path]) -> dict[str, int]:
         n = size = 0
@@ -148724,7 +148734,11 @@ def pinecam_storage() -> dict[str, Any]:
     return {"ok": True, **rows,
             "files": sum(r["files"] for r in rows.values()),
             "bytes": sum(r["bytes"] for r in rows.values()),
-            "dest": pinecam_export_dest(), "clips_host": share_path_of(pinelink_clips_dir())}
+            "dest": pinecam_export_dest(), "clips_host": share_path_of(pinelink_clips_dir()),
+            "keep_segments": pinecam_keep_segments(),                      # [cam-rotate]
+            "keep_say": "The Pine Cam keeps only its newest %d five-minute files (about %d minutes); "
+                        "older footage is deleted as it records. Export a clip to keep it."
+                        % (pinecam_keep_segments(), 5 * pinecam_keep_segments())}
 
 
 def pinecam_delete(names: list[str]) -> dict[str, Any]:
@@ -163228,6 +163242,12 @@ def export_cam_request(cmd: dict[str, Any]) -> str:
     stale = hi - newest
     if stale > 120:                       # the camera stopped: its last minutes
         hi = newest
+    try:                                                    # [cam-rotate]
+        oldest = min((pinelink_segment_epoch(p.stem) or hi) for p in pinelink_clips_dir().glob("*.mp4")
+                     if _PINECAM_SEGMENT.match(p.name))
+    except Exception:  # noqa: BLE001
+        oldest = hi - want
+    short = hi - oldest < want - 30
     mins = _screen_export_minutes(want)
     name = "pinecam-last-%s-%s.mp4" % (("%dmin" % (want // 60)) if want % 60 == 0 else ("%ds" % want),
                                        time.strftime("%Y%m%d-%H%M%S"))
@@ -163253,6 +163273,9 @@ def export_cam_request(cmd: dict[str, Any]) -> str:
     words = "Exporting the last %s of the Pine Cam's footage. " % mins
     if asked > want:
         words += "A cut holds at most %s, so that is what it will take. " % _screen_export_minutes(PINELINK_CUT_MOST)
+    if short:                                               # [cam-rotate]
+        words += ("The Pine Cam only keeps its newest %d files, so it can give about %d minutes. "
+                  % (pinecam_keep_segments(), int((hi - oldest) // 60)))
     if stale > 120:
         words += ("The camera stopped recording %d minutes ago, so it is the last %s before that. "
                   % (int(stale // 60), mins))

@@ -350,7 +350,10 @@ def source_report() -> dict:
             "plan": plan_source(relay_pref()["pref"], rep, now, mem, camera_wanted(rep, now))}
 
 SEGMENT_SECONDS = 300           # one file per five minutes
-KEEP_HOURS = 48.0               # same as every other ledger here
+KEEP_HOURS = 48.0               # same as every other ledger here (kept clips)
+KEEP_SEGMENTS = 5               # [cam-rotate] the footage: the newest five files
+TRIM_EVERY_S = 30.0             # [cam-rotate] and it rotates while recording
+SEGMENT_NAME = re.compile(r"^\d{4}-\d\d-\d\d_\d\d-\d\d-\d\d\.mp4$")
 RESTART_REST = 5.0
 _LAST_SEEN: dict = {"seen": False, "signal": 0}
 
@@ -822,16 +825,46 @@ def camera_awake() -> bool:
     return code == 0
 
 
+def keep_segments() -> int:
+    """[cam-rotate] how many five-minute footage files are kept: the newest N,
+    the one being written among them. data/pinelink_pref.json `keep_segments`
+    names it; KEEP_SEGMENTS otherwise."""
+    try:
+        n = int(json.loads(PREF.read_text()).get("keep_segments") or KEEP_SEGMENTS)
+    except Exception:  # noqa: BLE001
+        n = KEEP_SEGMENTS
+    return max(2, min(n, 576))
+
+
 def trim_old() -> int:
-    """Two days of clips, like every other ledger on this box.
+    """[cam-rotate] The footage is a rotating stock: the newest
+    keep_segments() five-minute files and no more. 2026-09-30, the operator:
+    "a rotating stock of five that are being recorded. And then I'll just
+    extract the clip if I want it, or tell it to export it ... Otherwise the
+    rest of them get cold and deleted." A window wanted for keeps is cut out
+    (the record button, a spoken export, an album cut) and those never live
+    under the segment name, so they are not counted: what the record button
+    kept (rec_*) still keeps two days, like every other ledger on this box.
+
+    Runs at every start AND every TRIM_EVERY_S while recording - at the start
+    alone, a long-lived stream never rotated at all.
 
     Clips ONLY. live/ and low/ (#1474) are HLS windows that ffmpeg
     trims itself with delete_segments; nothing here may touch them."""
     gone = 0
     floor = time.time() - KEEP_HOURS * 3600.0
     try:
+        segs = sorted((f for f in CLIPS.glob("*.mp4") if SEGMENT_NAME.match(f.name)),
+                      key=lambda f: f.name, reverse=True)      # the name IS the start time
+        for f in segs[keep_segments():]:
+            f.unlink()
+            gone += 1
+            try:
+                (OUT / "thumbs" / (f.stem + ".jpg")).unlink()   # the station's thumbnail of it
+            except OSError:
+                pass
         for f in CLIPS.glob("*.mp4"):
-            if f.stat().st_mtime < floor:
+            if not SEGMENT_NAME.match(f.name) and f.stat().st_mtime < floor:
                 f.unlink()
                 gone += 1
     except Exception:  # noqa: BLE001
@@ -1792,9 +1825,13 @@ def supervise(once: bool = False) -> None:
         err = ""
         last_frame = time.time()
         stalled = False
+        trimmed_at = time.time()                              # [cam-rotate]
         try:
             while proc.poll() is None:
                 time.sleep(2.5)
+                if time.time() - trimmed_at >= TRIM_EVERY_S:  # [cam-rotate]
+                    trimmed_at = time.time()
+                    trim_old()
                 try:
                     m = (OUT / "frame.jpg").stat().st_mtime
                     if m > last_frame:
