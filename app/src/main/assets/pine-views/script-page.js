@@ -23590,6 +23590,12 @@
     gapUi.sw.title = swTip;
     gapUi.sw.setAttribute('aria-label', swTip);
     gapUi.sw.setAttribute('aria-checked', s.roll ? 'true' : 'false');
+    if (gapUi.ic) {                                          /* [reply-gap:ictoggle] the hourglass IS the switch */
+      gapUi.ic.title = swTip;
+      gapUi.ic.setAttribute('aria-label', swTip);
+      gapUi.ic.setAttribute('aria-checked', s.roll ? 'true' : 'false');
+      gapUi.ic.classList.toggle('sp-gap-ic-on', !!s.roll);
+    }
     gapUi.wrap.classList.toggle('sp-gap-on', !!s.roll);
     var dieTip = !s.roll ? 'The dice: the roulette is off. Turn it on and each reply\'s pause is rolled here.'
       : gapLast ? 'Last roll: d100 ' + gapLast.dice + ' - ' + gapFmt(gapLast.s) + ' before the next reply (range '
@@ -24119,6 +24125,20 @@
       sw: sw, die: die, reel: reel, count: count, rowbar: rowbar};
     gapDualWire(track, a, b);
     gapBigWire(dual);                                        /* [reply-gap:big] */
+    /* [reply-gap:ictoggle] "Make it where tapping on this icon does the job of
+       this switch. So we can just remove the switch" - the hourglass toggles
+       the roulette; the switch stays only as the road it forwards to. */
+    ic.removeAttribute('aria-hidden');
+    ic.classList.add('sp-gap-ictoggle');
+    ic.setAttribute('role', 'switch');
+    ic.setAttribute('tabindex', '0');
+    gapUi.ic = ic;
+    ic.addEventListener('pointerdown', function (ev) { ev.stopPropagation(); });
+    ic.addEventListener('dblclick', function (ev) { ev.stopPropagation(); });
+    ic.addEventListener('click', function (ev) { ev.stopPropagation(); sw.click(); });
+    ic.addEventListener('keydown', function (ev) {
+      if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); sw.click(); }
+    });
     if (!gapCueWired) {
       gapCueWired = true;
       root.addEventListener('pine-reply-gap', gapOnCue);
