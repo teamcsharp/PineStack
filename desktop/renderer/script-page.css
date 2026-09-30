@@ -4314,7 +4314,11 @@ html.pine-tech-wide .sp-tech.sp-tech-wide .wc-strip {
 /* the finished table: the category on its row, the sub-result indented under it */
 .sp-rr-t.folded .sp-rr-line.sp-rr-two { display: flex; flex-direction: column; align-items: stretch; gap: 1px; white-space: normal; }
 .sp-rr-two .sp-rr-lc, .sp-rr-two .sp-rr-ls { display: flex; align-items: baseline; gap: 6px; min-width: 0; white-space: nowrap; overflow: hidden; }
-.sp-rr-two .sp-rr-ls { padding-left: 22px; }
+/* [rr-indent] the table tag holds a fixed column, so the sub-result's number
+   always starts PAST the category's number - with 22px it sat left of it
+   under "ES1 31 FEAR" and read as a sibling, not a sub-category */
+.sp-rr-two .sp-rr-lc > b { flex: none; min-width: 3.6em; }
+.sp-rr-two .sp-rr-ls { padding-left: calc(3.6em + 6px + 1.6em); }
 .sp-rr-two .sp-rr-ll { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .sp-rr-two .sp-rr-lof { margin-left: auto; flex: none; font-size: 10px; }
 /* the clip's file type, off the file: video teal, audio amber */
