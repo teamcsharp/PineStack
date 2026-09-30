@@ -290,8 +290,30 @@
    *      tablet's WebView, where #appVolume does not exist.
    *   3. Nothing: no desk here. Say so rather than pretend the knob works.
    */
+  /* [levels-one] THE SLEEP FADE IS A HOLD. It lowers the sound on THIS
+   * surface only; the station's master - every other screen's - never moves,
+   * and nothing is left stored at a faded value. */
+  function fadeHold(level) {
+    const bus = root.pineLevels;
+    if (bus && typeof bus.hold === "function") { bus.hold("master", Math.max(0, Math.min(1, level))); return; }
+    applyVolume(level);
+  }
+  function fadeRelease() {
+    const bus = root.pineLevels;
+    if (bus && typeof bus.release === "function") { bus.release("master"); return; }
+    applyVolume(volume);
+  }
+
   function applyVolume(level) {
     const want = Math.max(0, Math.min(1, Number(level) || 0));
+    /* [levels-one] THE MASTER. "one master ... the Listen view volume, sleep
+     * fade and the desk app volume become that master": one level, on the
+     * station, that every other level is multiplied by. */
+    const bus = root.pineLevels;
+    if (bus && typeof bus.apply === "function" && bus.CEIL && bus.CEIL.master !== undefined) {
+      bus.apply("master", want);
+      return "master";
+    }
     const slider = el("appVolume");
     if (slider) {
       slider.value = String(Math.round(want * 100));
@@ -1396,7 +1418,7 @@
      * about twenty, and no ear can hear the difference. */
     if (tick.state === "fading") {
       const step = Math.round(volume * tick.gain * 20) / 20;
-      if (step !== fadedTo) { fadedTo = step; applyVolume(step); }
+      if (step !== fadedTo) { fadedTo = step; fadeHold(step); }   /* [levels-one] */
     }
     if (tick.state === "done") {
       sleep = null;
@@ -1407,7 +1429,7 @@
        * nothing on screen to say why. Mute is a lever with an obvious
        * opposite; a zeroed slider looks like a setting. */
       silence(true);
-      applyVolume(volume);
+      fadeRelease();                                          /* [levels-one] */
       document.querySelectorAll(".pl-sleep button")
         .forEach((b) => b.classList.remove("on"));
       note("Asleep. The station is still on air - this terminal is not. "
@@ -1677,6 +1699,19 @@
         const saved = Number(localStorage.getItem("pineListenVolume"));
         if (Number.isFinite(saved) && saved > 0) volume = Math.min(1, saved);
       } catch (err) { /* a locked store must not stop the radio */ }
+      try {                                                   /* [levels-one] the master */
+        const bus = root.pineLevels;
+        if (bus && bus.get && bus.CEIL && bus.CEIL.master !== undefined) {
+          volume = Math.max(0, Math.min(1, Number(bus.get().master)));
+          if (typeof bus.onApply === "function") {
+            bus.onApply((m) => {
+              if (document.activeElement === vol || sleep) return;
+              const v = Math.max(0, Math.min(1, Number(m && m.master)));
+              if (Number.isFinite(v)) { volume = v; vol.value = String(Math.round(v * 100)); }
+            });
+          }
+        }
+      } catch (err) { /* the saved level stands */ }
       vol.value = String(Math.round(volume * 100));
       vol.addEventListener("input", () => {
         volume = Number(vol.value) / 100;
@@ -1700,7 +1735,7 @@
            * the mute AND the faded level - or the radio stays silent and
            * looks broken with a full slider. */
           silence(false);
-          applyVolume(volume);
+          fadeRelease();                                      /* [levels-one] */
           note("Sleep timer off.");
           return;
         }

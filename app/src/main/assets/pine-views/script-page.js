@@ -16297,7 +16297,8 @@
    * The levels are the same canonical listener values exposed in the native
    * drawer, Listen, and the global Levels sheet. */
   var MIXER_ROWS = [
-    ['voice', 'Voices'], ['music', 'Music'], ['sfx', 'SFX'], ['video', 'Videos']
+    ['master', 'Master'],                                     /* [levels-one] everything follows it */
+    ['voice', 'Voices'], ['music', 'Music'], ['sfx', 'SFX'], ['video', 'Videos'], ['pads', 'Pads']
   ];
   function mixerRead() {
     var m = null;
@@ -16306,7 +16307,7 @@
     var out = {};
     MIXER_ROWS.forEach(function (row) {
       var v = Number(m && m[row[0]]);
-      out[row[0]] = isFinite(v) ? Math.max(0, Math.min(2, v)) : 1;
+      out[row[0]] = isFinite(v) ? Math.max(0, Math.min(row[0] === 'master' ? 1 : 2, v)) : 1;
     });
     return out;
   }
@@ -16353,7 +16354,7 @@
       line.appendChild(make('span', 'sp-mix-name', row[1]));
       var range = document.createElement('input');
       range.type = 'range'; range.min = '0';
-      range.max = '200';
+      range.max = row[0] === 'master' ? '100' : '200';            /* [levels-one] */
       range.step = '1';
       range.value = String(Math.round(levels[row[0]] * 100));
       range.className = 'sp-mix-range';
@@ -16369,7 +16370,8 @@
       box.appendChild(line);
     });
     box.appendChild(make('div', 'sp-mix-note',
-      'Remembered on this device. On top of the station\u2019s own levels, '
+      'One set for the whole station - a move here moves every screen; the sound is each level times the master. '
+      + 'Remembered on the station. On top of the station\u2019s own levels, '
       + 'and they take effect as you drag \u2014 on what is playing now and '
       + 'on everything after it.'));                               /* [#1192] */
     reset.addEventListener('click', function () {
@@ -17563,13 +17565,39 @@
     banked: 'written for this entry'
   };
 
+  function segIdOf(item) {                              /* [seg-id] */
+    var own = String((item && (item.round || item.conversation_id || (item.system3 && item.system3.conversation_id))) || '')
+      .toLowerCase().replace(/[^0-9a-f]/g, '');
+    if (own.length >= 6) return own;
+    var s = String((item && item.text) || '') + '|' + String((item && (item.at || item.air_at)) || '');
+    var h = 0x811c9dc5;
+    for (var i = 0; i < s.length; i += 1) { h ^= s.charCodeAt(i); h = (h * 0x01000193) >>> 0; }
+    return ('00000000' + h.toString(16)).slice(-8);
+  }
+
   function dressScene(node, item) {
     if (!node || !item) return;
     node.dataset.heading = String(item.text || '');
     node.dataset.at = String(Number(item.at || item.air_at) || '');
     node.dataset.round = String(item.round || '');
     node.replaceChildren();
-    node.appendChild(make('time', 'sp-segment-time', sceneClock(item)));
+    /* [seg-id] "make sure each segment gets a unique hex identifier so you can
+       identify it": its round's id (or its System 3 conversation's), else a
+       stable hash of its heading and air time - the same chip the messages
+       wear, tap to copy. */
+    var clockCol = make('span', 'sp-segment-clock');
+    clockCol.appendChild(make('time', 'sp-segment-time', sceneClock(item)));
+    var segHex = segIdOf(item);
+    node.dataset.segId = segHex;
+    if (root.PineMsgId && segHex) {
+      try {
+        var segChip = root.PineMsgId.chip(segHex, 'head');
+        segChip.classList.add('sp-segment-id');
+        segChip.title = 'Segment id #' + root.PineMsgId.code(segHex) + ' - tap to copy';
+        clockCol.appendChild(segChip);
+      } catch (e) { /* [seg-id] the card stands without it */ }
+    }
+    node.appendChild(clockCol);
     var words = make('span', 'sp-segment-words');
     var slot = sceneSlot(item);                               /* [seg-names] */
     var road = sceneName(item);
