@@ -24350,4 +24350,63 @@
     }
   };
   if (typeof module !== 'undefined' && module.exports) module.exports = root.PineScriptPage;
+
+  /* [pine-tips] "make sure that every element in this application and in
+   * general has a tool tip that shows when I hover a mouse over it." One
+   * provider for the whole document, installed once: when a MOUSE comes to
+   * rest on something with no tooltip of its own (none on it or on the two
+   * elements above it), it is given one - its own label (aria-label, alt,
+   * placeholder, data-title), a slider's name and value, its short visible
+   * words, or what it is (the element's own name, read off its class). A
+   * tooltip somebody wrote is never replaced; SVG parts give theirs to the
+   * nearest HTML element, where a browser shows it. */
+  (function pineTips(win) {
+    if (!win || !win.document || win.__pineTips) return;
+    win.__pineTips = true;
+    var doc = win.document;
+    var PREFIX = /^(sp|va|pine|pv|s3|sfx|pl|rt|mv|pmi|pav|gs|tf|cf|lb)-/;
+    function named(el) {
+      var raw = el.getAttribute && (el.getAttribute('class') || '');
+      var first = String(raw || '').split(/\s+/).filter(function (c) { return c && !/^(on|open|active|hidden|is-|has-)/.test(c); })[0]
+        || el.id || String(el.tagName || '').toLowerCase();
+      var w = String(first).replace(PREFIX, '').replace(/([a-z])([A-Z])/g, '$1 $2').replace(/[-_]+/g, ' ').trim();
+      return w ? w.charAt(0).toUpperCase() + w.slice(1) : '';
+    }
+    function words(el) {
+      var t = el.getAttribute('aria-label') || el.getAttribute('alt') || el.getAttribute('placeholder')
+        || el.getAttribute('data-title') || el.getAttribute('aria-valuetext') || '';
+      if (!t && el.tagName === 'INPUT' && (el.type === 'range' || el.type === 'number')) {
+        t = (el.getAttribute('name') || el.id || 'slider').replace(/[-_]+/g, ' ') + ': ' + el.value;
+      }
+      if (!t && el.tagName === 'SELECT' && el.selectedOptions && el.selectedOptions[0]) t = 'Choose - now ' + el.selectedOptions[0].text;
+      if (!t) {
+        var x = String(el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
+        if (x && x.length <= 120) t = x;
+        else if (x) t = x.slice(0, 117) + '...';
+      }
+      if (!t) t = named(el);
+      return t;
+    }
+    function titled(el) {
+      for (var n = el, i = 0; n && n.nodeType === 1 && i < 3; n = n.parentElement, i += 1) {
+        var v = n.getAttribute && n.getAttribute('title');
+        if (v && v.trim()) return true;
+        if (n.tagName === 'svg' || n.tagName === 'SVG') continue;
+      }
+      return false;
+    }
+    doc.addEventListener('pointerover', function (ev) {
+      if (ev.pointerType && ev.pointerType !== 'mouse') return;
+      var el = ev.target;
+      if (!el || el.nodeType !== 1) return;
+      while (el && el.namespaceURI && el.namespaceURI !== 'http://www.w3.org/1999/xhtml' && el.parentElement) el = el.parentElement;
+      if (!el || el === doc.body || el === doc.documentElement) return;
+      var mine = el.__pineTip && el.getAttribute('title') === el.__pineTip;
+      if (!mine && titled(el)) return;              /* somebody wrote one: it stands */
+      var t = words(el);                            /* ours is re-read each hover: values move */
+      if (t && t !== el.getAttribute('title')) {
+        try { el.setAttribute('title', t); el.__pineTip = t; } catch (e) { /* a read-only node */ }
+      }
+    }, true);
+  }(root));
 })(typeof window !== 'undefined' ? window : globalThis);
