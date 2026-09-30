@@ -386,7 +386,8 @@ RS1 = {
               "cue": "disagree", "requires": ["research"],
               "text": "argues back with what people online are saying about it"},
              {"id": "llm_rebuttal", "label": "Response based on online research / LLM query for rebuttal",
-              "cue": "disagree", "text": "rebuts it with the facts as they know them"},
+              "cue": "disagree", "requires": ["research"],   # [research-pop] it said research and did none
+              "text": "rebuts it with the facts as they know them, from what the research turned up"},
          ])},
         {"id": "push_back", "label": "Push back", "weight": 1.0, "lean": -1, "tags": ["disagreement"],
          "emotions": {"interest": 1.4, "anger": 1.3},

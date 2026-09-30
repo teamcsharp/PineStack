@@ -1846,7 +1846,8 @@ def _material_mark(ev, spec, inputs):
     kind, got = _material_for(spec, inputs)
     if got:
         ev["selected"]["material"] = {"kind": kind, "label": label_cut(got.get("label") or kind),
-                                      "text": label_cut(got["text"]), "ref": str(got.get("ref") or "")[:120]}
+                                      "text": label_cut(got["text"]), "ref": str(got.get("ref") or "")[:120],
+                                      "key": str(got.get("key") or "")[:140]}   # [research-pop] the search it used
 
 
 def _cts(conv, config, ctx, stream, turn, idx):

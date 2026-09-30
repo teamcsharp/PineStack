@@ -6042,7 +6042,8 @@
     return {fam: String(ev.family || ''), table: String(sel.table || ev.family || ''), tableLabel: rrT0 ? String(rrT0.label || '') : '',
       event: String(ev.event_id || ''),
       main: main ? mvReel(main, dice) : {dice: dice, opts: [landed], hit: 0, label: landed, of: 1, stage: ''},
-      sub: sub ? mvReel(sub, null) : null, failed: mvRrFailed(ev), vrej: mvRrVerdicts(ev)};   /* [rollplay] */
+      sub: sub ? mvReel(sub, null) : null, failed: mvRrFailed(ev), vrej: mvRrVerdicts(ev),   /* [rollplay] */
+      material: sel.material || null};                                      /* [research-pop] */
   }
   function mvCounted(fam, table, one, two) {
     var mk = function (x) {
@@ -7902,6 +7903,65 @@
     });
     return t;
   }
+  /* [research-pop] "a pop up whenever I tap on it that shows the top five
+     results and how it acted on them. Also allow me to tap on those entries
+     and choose how they are affected by it in the future." (the operator) */
+  function mvRrResearch(box, mat) {
+    var sec = make('div', 'sp-rrp-research');
+    sec.appendChild(make('h4', '', 'What the research found'));
+    var note = make('p', 'sp-rrp-none', 'reading the search…');
+    sec.appendChild(note);
+    box.appendChild(sec);
+    if (!mat.key || !api() || !api().get) {
+      note.textContent = 'The host was handed: ' + String(mat.text || '') + (mat.ref ? ' (' + mat.ref + ')' : '');
+      return sec;
+    }
+    api().get('/api/system3/research?key=' + encodeURIComponent(mat.key)).then(function (got) {
+      if (!got || !got.ok) { note.textContent = (got && got.say) || 'that search is no longer kept'; return; }
+      var res = got.results || [];
+      note.textContent = 'Searched "' + String(got.query || mat.key) + '" - ' + (got.found || res.length)
+        + ' results. The top ' + res.length + ', and what became of each. Tap one to choose how its site is treated from now on.';
+      res.forEach(function (x) { sec.appendChild(mvRrResearchRow(x)); });
+      if (got.handed) sec.appendChild(make('p', 'sp-rrp-hand', 'The host was handed: ' + got.handed));
+    }, function (e) { note.textContent = 'the station did not answer: ' + String((e && e.message) || e); });
+    return sec;
+  }
+  var MV_RES_PREF = [['prefer', 'Prefer this site'], ['normal', 'Normal'], ['never', 'Never use this site']];
+  function mvRrResearchRow(x) {
+    var row = make('div', 'sp-rrp-res sp-rrp-res-' + String(x.verdict || ''));
+    var top = make('button', 'sp-rrp-res-head');
+    top.type = 'button';
+    top.title = 'Choose how ' + x.domain + ' is treated from now on';
+    top.appendChild(make('b', '', x.n + '. ' + String(x.title || x.domain || x.url)));
+    var dom = make('span', 'sp-rrp-res-dom', '');
+    var paintDom = function () { dom.textContent = x.domain + (x.pref && x.pref !== 'normal' ? ' - you: ' + x.pref : ''); };
+    paintDom();
+    top.appendChild(dom);
+    row.appendChild(top);
+    if (x.snippet) row.appendChild(make('p', 'sp-rrp-res-snip', x.snippet));
+    row.appendChild(make('p', 'sp-rrp-res-why', String(x.why || '')));
+    var choose = make('div', 'sp-rrp-res-choose');
+    choose.hidden = true;
+    var say = make('p', 'sp-rrp-res-say', '');
+    MV_RES_PREF.forEach(function (c) {
+      var b = make('button', 'sp-rrp-res-opt' + (String(x.pref || 'normal') === c[0] ? ' on' : ''), c[1]);
+      b.type = 'button';
+      b.addEventListener('click', function (ev) {
+        ev.stopPropagation();
+        api().post('/api/system3/research/pref', {domain: x.domain, pref: c[0]}).then(function (got) {
+          x.pref = c[0];
+          [].forEach.call(choose.querySelectorAll('.sp-rrp-res-opt'), function (o) { o.classList.toggle('on', o === b); });
+          say.textContent = (got && got.say) || 'saved';
+          paintDom();
+        }, function (e) { say.textContent = 'not saved: ' + String((e && e.message) || e); });
+      });
+      choose.appendChild(b);
+    });
+    choose.appendChild(say);
+    row.appendChild(choose);
+    top.addEventListener('click', function (ev) { ev.stopPropagation(); choose.hidden = !choose.hidden; });
+    return row;
+  }
   function mvRrPopOpen(rows, i, which) {
     var old = document.getElementById('spRrPop');
     if (old) old.remove();
@@ -7922,6 +7982,8 @@
     shut.setAttribute('aria-label', 'Close');
     head.appendChild(shut);
     box.appendChild(head);
+    /* [research-pop] a landed entry that used online research shows it first */
+    if (r.material && r.material.kind === 'research') mvRrResearch(box, r.material);
     /* 1. every entry this roulette held */
     var opts = s.opts || [], w = s.weights || [], sum = 0;
     w.forEach(function (x) { sum += Math.max(0, Number(x) || 0); });
