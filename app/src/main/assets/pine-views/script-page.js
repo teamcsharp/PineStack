@@ -7941,13 +7941,31 @@
       return [mvRrStepName(c.r, c.which), x.label || '-', x.dice != null ? x.dice : '-',
         x.of ? ((Number(x.hit) || 0) + 1) + ' of ' + x.of : ''];
     };
-    var before = at > 0 ? chain.slice(0, at).map(line) : [];
-    var after = at >= 0 ? chain.slice(at + 1).map(line) : [];
+    /* [rr-chainpick] "If I tap on one of these items bring up a table showing
+       the list of items": each roll before and after opens its own roulette */
+    var picked = function (c) {
+      var row = line(c);
+      row.cls = 'sp-rrp-go';
+      row.title = 'Every entry of this roll, and what led up to it and came after';
+      return row;
+    };
+    var wireRows = function (t, list) {
+      [].slice.call(t.querySelectorAll('tr.sp-rrp-go')).forEach(function (tr, k) {
+        tr.addEventListener('click', function (ev) {
+          ev.stopPropagation();
+          close();
+          mvRrPopOpen(rows, list[k].i, list[k].which);
+        });
+      });
+      return t;
+    };
+    var beforeC = at > 0 ? chain.slice(0, at) : [];
+    var afterC = at >= 0 ? chain.slice(at + 1) : [];
     box.appendChild(make('h4', '', 'What led up to it'));
-    box.appendChild(before.length ? mvRrPopTable(['roll', 'landed', 'd100', 'of'], before)
+    box.appendChild(beforeC.length ? wireRows(mvRrPopTable(['roll', 'landed', 'd100', 'of'], beforeC.map(picked)), beforeC)
       : make('p', 'sp-rrp-none', 'Nothing - this was the first roll on the card.'));
     box.appendChild(make('h4', '', 'What came after it'));
-    box.appendChild(after.length ? mvRrPopTable(['roll', 'landed', 'd100', 'of'], after)
+    box.appendChild(afterC.length ? wireRows(mvRrPopTable(['roll', 'landed', 'd100', 'of'], afterC.map(picked)), afterC)
       : make('p', 'sp-rrp-none', 'Nothing - this was the last roll on the card.'));
     var close = function () { back.remove(); document.removeEventListener('keydown', esc, true); };
     var esc = function (ev) { if (ev.key === 'Escape') close(); };
