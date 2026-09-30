@@ -200548,7 +200548,7 @@ def export_number(words: str) -> float | None:
 # the desk ("pine app", "the desktop app"). None = the audio cut (#1025).
 _EXPORT_SCREEN_RX = re.compile(
     r"\b(?:of|from|on|off)\s+(?:the\s+|my\s+|this\s+)?(?P<t>"
-    r"pine\s*tab(?:let)?|pinetab|tablet|"
+    r"pine\s*ta[bp](?:let)?|pineta[bp]|tablet|"   # [screen-export-claim] "tap": the Nabu's ear
     r"(?:visual|video|picture)\s+(?:broadcast|show|radio|air)|"
     r"broadcast(?:'?s)?\s+(?:video|picture|visuals?)|"
     r"pine\s*(?:box\s+)?app|pinebox\s+app|desk(?:top)?(?:\s+app)?)"
@@ -238459,7 +238459,11 @@ async function screenExportWatch(state) {
   if (order.target !== mine) return;
   screenExportSeen = order.id;
   let claim = null;
-  try { claim = await api("/api/export/screen/claim", {id: order.id, device: mine}); } catch (e) { return; }
+  // [screen-export-claim] this page's api() takes fetch options, not a body
+  try {
+    claim = await api("/api/export/screen/claim", {method: "POST",
+      body: JSON.stringify({id: order.id, device: mine})});
+  } catch (e) { return; }
   if (!claim || !claim.go) return;
   let got = null, why = "";
   try { got = await desk.replayExport({seconds: claim.seconds, upload: true, name: claim.name}); }
@@ -238467,8 +238471,9 @@ async function screenExportWatch(state) {
   const up = got && got.uploaded;
   const ok = !!(got && got.ok !== false && up && up.ok !== false);
   try {
-    await api("/api/export/screen/done", {id: order.id, device: mine, ok: ok,
-      result: got || {}, detail: why || (up && up.detail) || (got && got.detail) || ""});
+    await api("/api/export/screen/done", {method: "POST", body: JSON.stringify({
+      id: order.id, device: mine, ok: ok, result: got || {},
+      detail: why || (up && up.detail) || (got && got.detail) || ""})});
   } catch (e) { /* the station hears nothing; the order expires */ }
 }
 

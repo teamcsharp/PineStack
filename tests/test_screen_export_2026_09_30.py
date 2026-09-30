@@ -37,6 +37,11 @@ class ScreenOrders(unittest.TestCase):
         self.assertEqual(parse("Export the last two minutes of the PineTab."), {"seconds": 120, "screen": "tab"})
         self.assertEqual(parse("export the last ten minutes of the tablet's screen"), {"seconds": 600, "screen": "tab"})
 
+    def test_the_nabu_hears_pine_tap(self):
+        # [screen-export-claim] 06:47 "Export the last minute of the Pine Tap broadcast." became an audio cut
+        self.assertEqual(parse("Export the last minute of the Pine Tap broadcast."), {"seconds": 60, "screen": "tab"})
+        self.assertEqual(parse("export the last 5 minutes of pinetap"), {"seconds": 300, "screen": "tab"})
+
     def test_the_pine_app(self):
         self.assertEqual(parse("export the last 3 minutes of the pine app"), {"seconds": 180, "screen": "app"})
         self.assertEqual(parse("export the last five minutes of the pine box app"), {"seconds": 300, "screen": "app"})
@@ -65,6 +70,16 @@ class TheRoad(unittest.TestCase):
         self.assertIn("try { screenExportWatch(state); }", SRC)
         self.assertIn("desk.replayExport({seconds: claim.seconds, upload: true, name: claim.name})", SRC)
         self.assertIn('if cmd.get("screen"):', SRC)
+
+    def test_the_claim_and_the_report_are_posts(self):
+        # [screen-export-claim] the main panel's api(path, options) takes fetch
+        # options: a bare {id, device} went out as a GET, 405, and the tablet
+        # never claimed an order.
+        for route in ("/api/export/screen/claim", "/api/export/screen/done"):
+            calls = re.findall(r'api\("' + re.escape(route) + r'", (\{[^\n]*\n?[^\n]*)', SRC)
+            self.assertTrue(calls, route)
+            for call in calls:
+                self.assertRegex(call, r'^\{method: "POST",\s+body: JSON\.stringify\(', route)
 
 
 if __name__ == "__main__":
