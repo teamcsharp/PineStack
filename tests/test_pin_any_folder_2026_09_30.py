@@ -27,5 +27,17 @@ class ThePin(unittest.TestCase):
             self.assertEqual(got, want, folder)
 
 
+class TheTakeover(unittest.TestCase):
+    def test_the_video_door_names_the_pin(self):
+        # [pin-takeover] the tablet's larder filled in from every folder
+        self.assertIn('"pin": sfx_pin_public(),', SRC)
+        self.assertIn("def sfx_pin_public() -> dict[str, Any] | None:", SRC)
+
+    def test_one_tap_brings_listen_back(self):
+        # [tap-out] a bare Listen picture ignored single taps: stuck full screen
+        js = (ROOT / "desktop" / "renderer" / "listen.js").read_text(encoding="utf-8")
+        self.assertIn("if (bare) { toggleBare(); tapAt = 0; stir(); return true; }", js)
+
+
 if __name__ == "__main__":
     unittest.main()

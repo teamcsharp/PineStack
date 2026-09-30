@@ -1126,6 +1126,12 @@
     const py = Number(y) || 0;
     const near = Math.abs(px - tapX) <= DOUBLE_TAP_PX
       && Math.abs(py - tapY) <= DOUBLE_TAP_PX;
+    /* [tap-out] 2026-09-30, the operator: "the video UI isn't showing up on
+     * the video when I tap the screen in order to adjust it, so now I'm
+     * stuck in full screen with the video." Three single taps, 3-4 s apart,
+     * all consumed. The way OUT of bare is one tap (#1152: the show is never
+     * gated); going bare stays a double tap. */
+    if (bare) { toggleBare(); tapAt = 0; stir(); return true; }
     if (at - tapAt <= DOUBLE_TAP_MS && near) toggleBare();
     tapAt = at;
     tapX = px;

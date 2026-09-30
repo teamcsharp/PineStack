@@ -85583,6 +85583,34 @@ def sfx_pin_folder_known(path: str) -> bool:
         return False
 
 
+PIN_IDS_MOST = 3000
+_SFX_PIN_IDS_MEMO: dict[str, Any] = {"key": "", "at": 0.0, "ids": None}
+
+
+def sfx_pin_public() -> dict[str, Any] | None:
+    """[pin-takeover] the pin as the video set needs it: the folder and, when it
+    is not huge, every playable video id in it (memoised for a minute - the
+    set polls this door)."""
+    prefix = sfx_pin_prefix()
+    if not prefix:
+        return None
+    now = time.time()
+    memo = _SFX_PIN_IDS_MEMO
+    if memo["key"] != prefix or now - float(memo["at"]) > 60:
+        ids: list[str] | None = None
+        try:
+            con = sfx_db_reader()
+            rows = con.execute("SELECT sid FROM clips WHERE playable = 1 AND video = 1 "
+                               "AND substr(path, 1, ?) = ? LIMIT ?",
+                               (len(prefix), prefix, PIN_IDS_MOST + 1)).fetchall()
+            got = [str(r[0]) for r in rows]
+            ids = got if len(got) <= PIN_IDS_MOST else None
+        except Exception:  # noqa: BLE001
+            ids = None
+        memo.update({"key": prefix, "at": now, "ids": ids})
+    return {"path": prefix.rstrip("/"), "ids": memo["ids"]}
+
+
 def sfx_pin_set(path: str, hours: float) -> dict[str, Any]:
     SFX_PIN_PATH.parent.mkdir(parents=True, exist_ok=True)
     if not path:
@@ -134992,6 +135020,7 @@ async def dj_video_api(
             "withdrawn": [r["id"] for r in
                           sfx_deleted_recent(12, SFX_DELETED_WITHDRAW_S)],
             "endless": sfx_video_mode_on(),         # 2026-09-14
+            "pin": sfx_pin_public(),                # [pin-takeover] the folder owns the set
             # 2026-09-15 (#1184): the hand-over style, on the poll the set
             # already makes. The station does nothing with this; it is the
             # tube's behaviour, kept here so both surfaces agree.
