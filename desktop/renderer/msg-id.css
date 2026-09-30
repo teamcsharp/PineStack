@@ -30,6 +30,12 @@
 }
 .sp-mv-bubble > .pmi-corner:hover, .sp-mv-bubble > .pmi-corner.pmi-copied { color: #cfd8de; border-color: rgba(154, 164, 173, .35); }
 .sp-mv-classic .sp-mv-bubble > .pmi-corner { display: none; }
+/* [msgid-lift] "Move the hex code text up so it doesn't interfere with the loading
+   bar": the code sat across the bar (.sp-mv-load, 4 px, 9.6 px above the edge).
+   Above it there is no room - 6 px to the words, which run the full width - so
+   lifting it covered the text, and a taller bubble would shift the feed. The
+   bar ends short of the code instead: side by side on the bar's own row. */
+.sp-mv-bubble:has(> .pmi-corner) > .sp-mv-load { margin-right: 116px; }   /* the widest code chip is 98 px + 12 px inset */
 
 /* found by its code: a brief ring on the line */
 .pmi-flash { outline: 2px solid #65c7da !important; outline-offset: 2px; border-radius: 6px; }

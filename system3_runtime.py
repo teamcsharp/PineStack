@@ -96,6 +96,14 @@ _SEAT_OF = {"dj": "A", "host": "A", "cohost": "B", "third": "D", "caller": "C",
             "caller2": "E"}
 
 
+
+def _s3_lines(o):
+    """[s3-lines] the line ids an observation covers. `lines` is a list of ids;
+    a writer that put a count there (the dead-air rescue's INJECT card did) must
+    not turn one card into a 500 for every line of its conversation."""
+    got = o.get("lines") if isinstance(o, dict) else None
+    return got if isinstance(got, (list, tuple, set)) else ()
+
 class Handle:
     """One road call's System 3 conversation, carried through dj_banter."""
 
@@ -4477,7 +4485,7 @@ class System3Runtime:
                 turn = comp["turns"].get(tid)
             if conv is not None:                                             # [outl-feed] the meter, the reaction
                 for o in conv.get("observations_air") or []:
-                    if o.get("family") in ("MEASURE", "SFXREACT", "HOLD") and lid in (o.get("lines") or []):
+                    if o.get("family") in ("MEASURE", "SFXREACT", "HOLD") and lid in _s3_lines(o):   # [s3-lines]
                         air.append(self._compact_roll(o))
             out[lid] = {"system3": True, "conversation_id": cid, "turn_id": tid, "who": who,
                         "road": comp["road"], "mode": comp["mode"], "topic": comp["topic"],
@@ -5230,14 +5238,14 @@ def install(app, namespace):
                 "decisions": [e for e in conv["decision_events"] if e["event_id"] in ids]
                 + [o for o in conv.get("observations_air") or []                  # [outl-tile]
                    if o.get("family") in ("MEASURE", "SFXREACT", "HOLD") and o.get("stages")
-                   and (got["line_id"] in (o.get("lines") or [])
+                   and (got["line_id"] in _s3_lines(o)   # [s3-lines]
                         or (turn is not None and not o.get("lines") and o.get("turn_id") == turn.get("turn_id")))
                    and not (o.get("family") == "MEASURE" and any(
                        e.get("family") == "MEASURE" and e["event_id"] in ids for e in conv["decision_events"]))],
                 "observations": [o for o in conv.get("observations_air") or []
                                  if (turn and o.get("turn_id") == turn.get("turn_id"))
                                  or (got.get("turn_id") and o.get("turn_id") == got["turn_id"])
-                                 or got["line_id"] in (o.get("lines") or [])],
+                                 or got["line_id"] in _s3_lines(o)],   # [s3-lines]
                 "conversation": system3.summary(conv)}
 
     @app.get("/api/system3/segments")

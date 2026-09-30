@@ -61980,7 +61980,7 @@ async def dead_air_rescue(quiet: float, why: str = "") -> str:
                         + " - a finished %s round went out off the shelf, "
                           "out of turn (%d line(s))" % (kind, len(said)),
                         kind="rescue", at=now,
-                        extra={"road": kind, "lines": len(said)})
+                        extra={"road": kind, "line_count": len(said)})   # [s3-linecount] a count is not an observation's `lines` (the ids); it made /api/system3/line 500
             return kind
     pipeline_log("air", "the room has been quiet %ds; the cupboard holds %s "
                         "but nothing would go out - falling back to the sting"
