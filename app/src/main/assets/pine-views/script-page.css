@@ -142,6 +142,60 @@
   background: #16302a; }
 .sp-band-reopen { flex: 0 0 28px; }
 
+/* [reply-gap] THE PAUSE BETWEEN REPLIES on the toolbar, right of the chat
+   icon: two sliders, the roulette switch and the dice square. Every size is
+   pinned: the page's touch-target rule (button min-height) blows buttons up
+   to 38 px, which this 28 px row cannot hold. Fits the PineTab's ~1154 CSS px
+   (the right column is ~560 px; the seven icons take 226). */
+.sp-gap { flex: 1 1 250px; min-width: 0; display: flex; align-items: center; gap: 4px; margin-left: 3px; }
+.sp-gap-slider {
+  flex: 1.4 1 0; min-width: 0; height: 28px; box-sizing: border-box;
+  display: flex; align-items: center; gap: 3px; padding: 0 5px;
+  border: 1px solid var(--sp-line); border-radius: 4px; background: var(--sp-panel);
+  color: var(--sp-muted); cursor: pointer;
+}
+.sp-gap-slider.sp-gap-two { flex: 1 1 0; }
+.sp-gap-slider:focus-within { border-color: var(--sp-on); color: var(--sp-on); }
+.sp-gap-ic { flex: none; display: inline-flex; width: 14px; height: 14px; }
+.sp-gap-ic svg { width: 14px; height: 14px; }
+.sp-gap-slider input[type="range"] {
+  flex: 1 1 auto; min-width: 24px; width: 100%; height: 18px; min-height: 18px;
+  margin: 0; padding: 0; background: transparent; accent-color: var(--sp-on, #68ced9);
+}
+.sp-gap-val {
+  flex: none; min-width: 3.4ch; text-align: right; color: #dfe6e4;
+  font: 600 10.5px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+.sp-gap:not(.sp-gap-on) .sp-gap-two { opacity: .55; }
+.sp-gap.sp-gap-unsaved .sp-gap-slider { border-style: dashed; }
+.sp-gap-switch {
+  flex: none; position: relative; box-sizing: border-box;
+  width: 32px; min-width: 32px; height: 18px; min-height: 18px; max-height: 18px;
+  padding: 0; margin: 0; border-radius: 9px; cursor: pointer;
+  border: 1px solid var(--sp-line); background: #0b1215;
+}
+.sp-gap-switch::after {
+  content: ""; position: absolute; top: 2px; left: 2px; width: 12px; height: 12px;
+  border-radius: 50%; background: var(--sp-muted); transition: transform .15s ease, background .15s ease;
+}
+.sp-gap-switch[aria-checked="true"] { border-color: var(--sp-on); background: #16302a; }
+.sp-gap-switch[aria-checked="true"]::after { transform: translateX(14px); background: var(--sp-on); }
+.sp-gap-switch:focus-visible, .sp-gap-die:focus-visible { outline: 2px solid var(--sp-on); outline-offset: 1px; }
+.sp-gap .sp-gap-die {
+  flex: none; box-sizing: border-box; width: 30px; min-width: 30px; height: 28px;
+  min-height: 28px; max-height: 28px; border-radius: 5px; --fam: #68ced9;
+  font: 700 11px/26px ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+.sp-gap .sp-gap-die .sp-die-reel > span { height: 26px; line-height: 26px; }
+.sp-gap-idle { position: absolute; inset: 0; display: none; place-items: center; color: var(--sp-muted); }
+.sp-gap-idle svg { width: 15px; height: 15px; }
+.sp-gap .sp-gap-die.sp-gap-fresh .sp-die-reel, .sp-gap:not(.sp-gap-on) .sp-gap-die .sp-die-reel { display: none; }
+.sp-gap .sp-gap-die.sp-gap-fresh .sp-gap-idle, .sp-gap:not(.sp-gap-on) .sp-gap-die .sp-gap-idle { display: grid; }
+.sp-gap:not(.sp-gap-on) .sp-gap-die { opacity: .5; cursor: default; box-shadow: none; }
+@media (prefers-reduced-motion: reduce) {
+  .sp-gap-switch::after { transition: none; }
+}
+
 /* ---------------------------------------------------------------- 1 2 3 */
 
 .sp-bar { display: flex; gap: 6px; align-items: center; }
