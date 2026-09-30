@@ -6878,7 +6878,7 @@
     }
     return line;
   }
-  function mvBubbleStart(item, redraw) {
+  function mvBubbleStart(item, redraw, pre) {        /* [reply-gap:buildup] pre: its buildup window */
     var stage = mv.stage;
     if (!stage) return;
     if (mv.cur && !redraw) mvRetire(mv.cur);
@@ -6938,6 +6938,13 @@
       acc: acc, accReel: accReel, accSmall: accSmall, rolls: rolls, text: text, fill: fill,
       tab: tab, all: all, clock: tail, typed: -1, phase: 'wait', began: Date.now(), f0: null};
     mv.cur = cur;
+    if (pre && pre.ms > 0) {                   /* [reply-gap:buildup] it builds, then its words play */
+      cur.preroll = {audioAt: pre.audioAt, ms: pre.ms};
+      cur.buildFit = {ms: pre.ms, from: 0};
+      cur.t0 = pre.audioAt - pre.ms;
+      cur.keepRolls = true;                    /* the tally stays under the words: nothing jumps */
+      node.classList.add('sp-mv-preroll');
+    }
     node.__mvCur = cur;                        /* [onecard-moment] the card, off its node: the moment finds its mates */
     cur.media = media;                         /* [msgmedia] */
     if (item.kind === 'record' || item.kind === 'live') mvVizBuild(cur);   /* [msgviz] */
@@ -7106,7 +7113,10 @@
     });
     /* ONE sheet on the moment's card: what it rolled, landed and kept, then
        the new tables rolling after them; the tally stays in view after */
+    var hostFit = host.buildFit;                    /* [reply-gap:buildup] */
+    host.buildFit = cur.preroll ? {ms: cur.preroll.ms, from: from} : null;
     var sheet = mvRrSheet(host, m.rows, Math.max(1100, 3000 / fresh.length) * m.rows.length);
+    host.buildFit = hostFit;
     sheet.keep = true;
     sheet.box.classList.add('sp-rr-keep');
     host.rolls.textContent = '';
@@ -7117,7 +7127,8 @@
     host.node.classList.add('sp-mv-joined');
     var at0 = sheet.tables[from] ? sheet.tables[from].at : 0;
     if (cur.still || host.still) { mvRrAt(sheet, 0, true); mvRrResults(sheet); return; }
-    var t0 = Date.now();
+    var t0 = cur.preroll ? cur.preroll.audioAt - cur.preroll.ms : Date.now();   /* [reply-gap:buildup] */
+    mvRrReserve(sheet);
     (function step() {
       if (!host.node.isConnected || host.sheet !== sheet) return;
       if (mvRrAt(sheet, at0 + Date.now() - t0, false) === 'results') return;
@@ -7260,6 +7271,7 @@
     var rrDur = (tlNow && tlNow.model && tlNow.model.total) ? tlNow.model.total * 1000 : 0;
     cur.sheet = rows.length ? mvRrSheet(cur, rows, rrDur ? Math.max(3000, Math.min(9000, rrDur * 0.7)) : 6000) : null;
     if (cur.sheet) cur.rolls.appendChild(cur.sheet.box);
+    if (cur.sheet) mvRrReserve(cur.sheet);          /* [reply-gap:buildup] no jump as tables land */
     /* [onecard-moment] every table stays on the card as the next one rolls:
        nothing folds away, not while it rolls, not when it lands late */
     if (cur.sheet) { cur.sheet.keep = true; cur.sheet.box.classList.add('sp-rr-keep'); }
@@ -7337,6 +7349,11 @@
       var rrAcc = cur.accEnd - cur.collapseEnd;
       cur.collapseEnd = cur.sheet.rolled;
       cur.accEnd = Math.max(cur.rollEnd, cur.collapseEnd + rrAcc);
+    }
+    if (cur.preroll) {                              /* [reply-gap:buildup] the words start with the audio */
+      cur.rollEnd = Math.max(cur.rollEnd, cur.preroll.ms);
+      cur.collapseEnd = Math.max(cur.collapseEnd, cur.preroll.ms);
+      cur.accEnd = Math.max(cur.accEnd, cur.preroll.ms);
     }
     cur.plan = plan;
     if (cur.style === 'digital' && src.main) {
@@ -7728,6 +7745,61 @@
       ? (reel.index + ' of ' + reel.of) : (opts.length > 1 ? (hit + 1) + ' of ' + opts.length : 'the only one');
     return {el: el, die: die, list: list, wheel: wheel, of: of, target: target, reel: reel || {}, landedOf: landed, rej: rej};   /* [rollplay] */
   }
+  /* [reply-gap:buildup] THE TIMING CONTRACT - reply_gap.py BUILD_* (the
+   * station schedules a card's buildup from these very numbers; the test
+   * holds the two equal). A card with a scheduled buildup rolls at `per` and
+   * is fitted to exactly the scheduled ms. */
+  var MV_BUILD = {per: 1800, one: [0.08, 0.18, 0.60, 0.06], two: [0.08, 0.12, 0.27, 0.06, 0.12, 0.27, 0.06],
+    rejEach: 260, rejBase: 140, rejCap: 0.4, rejMax: 6, fail: 420, between: 40, hold: 1500};
+  /* the fresh tables (from `from` on) laid out again to end exactly `ms`
+     after the first of them starts, the 1.5 s hold included */
+  function mvBuildFit(tables, from, ms, at) {
+    var fresh = tables.slice(from || 0);
+    if (!fresh.length || !(ms > 0)) return at;
+    var start = fresh[0].at;
+    var gaps = MV_BUILD.between * fresh.length;
+    var span = at - start - gaps;
+    var want = ms - MV_BUILD.hold - gaps;
+    if (!(span > 0) || !(want > 0)) return at;
+    var k = want / span;
+    if (Math.abs(k - 1) < 0.002) return at;
+    var a = start;
+    fresh.forEach(function (T) {
+      ['dIn', 'dRej', 'dDie', 'dSpin', 'dPop', 'dRej2', 'dDie2', 'dSpin2', 'dPop2', 'dFail'].forEach(function (f) {
+        T[f] = (T[f] || 0) * k;
+      });
+      T.at = a;
+      T.end = a + T.dIn + T.dRej + T.dDie + T.dSpin + T.dPop + T.dRej2 + T.dDie2 + T.dSpin2 + T.dPop2 + T.dFail;
+      a = T.end + MV_BUILD.between;
+    });
+    return a;
+  }
+  /* the card's final height, reserved before a table lands: a hidden copy
+     of the sheet, measured as the results and as its last table rolling */
+  function mvRrReserve(sheet) {
+    try {
+      var box = sheet && sheet.box;
+      if (!box || !box.parentNode || !sheet.tables.length) return;
+      var ghost = box.cloneNode(true);
+      ghost.style.cssText = 'position:absolute;visibility:hidden;pointer-events:none;left:0;top:0;min-height:0;width:'
+        + Math.round(box.getBoundingClientRect().width || box.parentNode.getBoundingClientRect().width) + 'px';
+      ghost.classList.add('results');
+      var ts = ghost.querySelectorAll('.sp-rr-t');
+      [].forEach.call(ts, function (t) { t.style.display = ''; t.style.opacity = '1'; t.classList.add('folded'); });
+      box.parentNode.appendChild(ghost);
+      var h2 = ghost.offsetHeight;
+      ghost.classList.remove('results');
+      var lastT = ts[ts.length - 1];
+      if (lastT) {
+        lastT.classList.remove('folded');
+        [].forEach.call(lastT.children, function (c) { c.style.display = ''; });
+      }
+      var h1 = ghost.offsetHeight;
+      ghost.parentNode.removeChild(ghost);
+      var h = Math.max(h1, h2);
+      if (h > 0) box.style.minHeight = Math.ceil(h) + 'px';
+    } catch (e) { /* a card that cannot be measured still plays */ }
+  }
   function mvRrSheet(cur, rows, budgetMs) {
     var box = make('div', 'sp-rr');
     var tables = [];
@@ -7768,6 +7840,8 @@
     });
     var n = Math.max(1, tables.length);
     var per = Math.max(1100, Math.min(2400, budgetMs / n));
+    var fit = cur && cur.buildFit;                  /* [reply-gap:buildup] the contract's pace */
+    if (fit && fit.ms > 0) per = MV_BUILD.per;
     var at = 0;
     tables.forEach(function (T) {
       var two = !!T.sub;
@@ -7786,6 +7860,7 @@
       at = T.end + 40;
     });
     /* [msgroll] then the whole result, readable, for 1.5 s before the message */
+    if (fit && fit.ms > 0) at = mvBuildFit(tables, fit.from || 0, fit.ms, at);   /* [reply-gap:buildup] */
     return {box: box, tables: tables, rolled: at, total: at + 1500, now: ''};
   }
   function mvRrOut(x) { x = Math.max(0, Math.min(1, x)); return 1 - Math.pow(1 - x, 3.2); }
@@ -8154,7 +8229,10 @@
     mv.frameN = (mv.frameN + 1) % MV_EVERY;
     if (mv.frameN) return;
     if (mv.pin) { mvPinFrame(now); return; }   /* [rollplay] the pinned message owns the view */
-    if (now - mv.detectAt > 200) {
+    var mvUp = mvUpcomingNow(now);                  /* [reply-gap:buildup] the next card builds first */
+    if (mvUp) {
+      if (!mv.cur || mv.cur.item.key !== mvUp.item.key) mvBubbleStart(mvUp.item, false, mvUp);
+    } else if (now - mv.detectAt > 200) {
       mv.detectAt = now;
       var item = mvDetect();
       /* [msgonce] a record is bubbled once, when its spin starts; the gaps
@@ -23322,21 +23400,28 @@
    *  as .2 seconds ... a 2nd slider for a roulette RNG roll after each reply
    *  ... a toggle to enable roulette rolls ... Show the rolling dice here."
    *
-   * Slider one is the pause after every reply on air (0.2 - 10 s, default
-   * 1). Slider two is the roll's other end: with the toggle on, each pause
-   * is a System 3 roll, uniform BETWEEN the two sliders (0.2 - 10 s)
-   * [reply-gap:between]. The station keeps the setting (/api/reply-gap), rolls
-   * at the seam, and stamps each reply's pause on its stream_now row; the
-   * square rolls when that reply ends in the audio this panel is hearing. */
+   * [reply-gap:dual] "I want these two bars shared together ... just two
+   * buttons can drag on it." ONE track, TWO thumbs: thumb A is the pause
+   * after every reply (0.2 - 10 s, default 1; with the roulette off, every
+   * pause is thumb A), thumb B the roll's other end - with the toggle on each
+   * pause is a System 3 roll landing BETWEEN the two thumbs, either way round
+   * [reply-gap:between]. The station keeps the setting (/api/reply-gap).
+   *
+   * [reply-gap:buildup] Pause, then the card's whole Rolodex, then the words:
+   * the dice count down the pause; the next card starts building exactly its
+   * scheduled buildup before its words (the cue, or the sounding round's next
+   * row, says which card and when). */
   var GAP_MIN = 0.2, GAP_MAX = 10, GAP_RANGE_MIN = 0.2, GAP_RANGE_MAX = 10;   /* [reply-gap:between] */
   var gapState = {gap: 1, range: 1, roll: false};
   var gapUi = null;
   var gapLoadedAt = 0;
   var gapSendTimer = 0;
-  var gapHeldUntil = 0;             /* a hand on a slider: a poll does not move it */
+  var gapHeldUntil = 0;             /* a hand on a thumb: a poll does not move it */
   var gapFired = Object.create(null);
   var gapLast = null;               /* the last pause rolled on this panel */
   var gapCueWired = false;          /* [reply-gap:dice] the player's cue, heard once */
+  var gapPumpOn = false;            /* [reply-gap:buildup] the 120 ms watch */
+  var mvUpcoming = null;            /* [reply-gap:buildup] the next card, before its words */
 
   function gapNum(v, d) { v = Number(v); return isFinite(v) ? v : d; }
   function gapClamp(v, lo, hi, d) {
@@ -23345,31 +23430,43 @@
   }
   function gapWindow(g, r) {
     /* [reply-gap:between] "the dice should only be rolling values between
-       slider 1 and slider 2" - the two sliders are the roll's two ends */
+       slider 1 and slider 2" - the two thumbs are the roll's two ends */
     return [Math.min(g, r), Math.max(g, r)];
   }
   function gapFmt(s) { return gapNum(s, 0).toFixed(1) + ' s'; }
+  function gapPct(v) { return (gapClamp(v, GAP_MIN, GAP_MAX, 1) - GAP_MIN) / (GAP_MAX - GAP_MIN) * 100; }
+  /* the value under a point of the track, on the 0.1 s step */
+  function gapValAt(x, left, width) {
+    var f = width > 0 ? (x - left) / width : 0;
+    return gapClamp(GAP_MIN + Math.max(0, Math.min(1, f)) * (GAP_MAX - GAP_MIN), GAP_MIN, GAP_MAX, 1);
+  }
 
-  function gapPaint(moveSliders) {
+  function gapPaint() {
     if (!gapUi) return;
     var s = gapState;
     var w = gapWindow(s.gap, s.range);
-    if (moveSliders) {
-      gapUi.one.value = String(s.gap);
-      gapUi.two.value = String(s.range);
-    }
-    gapUi.oneVal.textContent = s.gap.toFixed(1) + 's';
-    gapUi.twoVal.textContent = s.range.toFixed(1) + 's';
-    var oneTip = 'Pause between replies: ' + gapFmt(s.gap) + ' (0.2 - 10 s). The silence after '
-      + 'every reply on air - DJ to DJ, DJ to the SFX Guy, the SFX Guy to a DJ. Station-wide; '
-      + 'the running order budgets it into every segment. Station-wide - every listener hears this.';
-    var twoTip = 'Roulette range: ' + gapFmt(s.range) + ' (0.2 - 10 s). With the roll on, each '
-      + 'pause is a System 3 roll landing between the two sliders (now ' + w[0].toFixed(1) + ' - '
-      + w[1].toFixed(1) + ' s). Station-wide - every listener hears this.';   /* [reply-gap:between] */
-    gapUi.oneBox.title = oneTip;
-    gapUi.one.setAttribute('aria-valuetext', gapFmt(s.gap));
-    gapUi.twoBox.title = twoTip;
-    gapUi.two.setAttribute('aria-valuetext', gapFmt(s.range));
+    var a = gapPct(s.gap), b = gapPct(s.range);
+    gapUi.a.style.left = a.toFixed(2) + '%';
+    gapUi.b.style.left = b.toFixed(2) + '%';
+    gapUi.span.style.left = Math.min(a, b).toFixed(2) + '%';
+    gapUi.span.style.width = Math.abs(b - a).toFixed(2) + '%';
+    gapUi.val.textContent = s.gap.toFixed(1) + 's – ' + s.range.toFixed(1) + 's';
+    var aTip = 'Thumb A - the pause between replies: ' + gapFmt(s.gap) + ' (0.2 - 10 s). The silence after '
+      + 'every reply on air - DJ to DJ, DJ to the SFX Guy, the SFX Guy to a DJ; with the roulette off every '
+      + 'pause is this one. Station-wide - every listener hears this.';
+    var bTip = 'Thumb B - the roulette\'s other end: ' + gapFmt(s.range) + ' (0.2 - 10 s). With the roll on, '
+      + 'each pause is a System 3 roll landing between the two thumbs (now ' + w[0].toFixed(1) + ' - '
+      + w[1].toFixed(1) + ' s). Station-wide - every listener hears this.';
+    gapUi.a.title = aTip;
+    gapUi.a.setAttribute('aria-label', 'Pause between replies');
+    gapUi.a.setAttribute('aria-valuenow', s.gap.toFixed(1));
+    gapUi.a.setAttribute('aria-valuetext', gapFmt(s.gap));
+    gapUi.b.title = bTip;
+    gapUi.b.setAttribute('aria-label', 'Roulette range end');
+    gapUi.b.setAttribute('aria-valuenow', s.range.toFixed(1));
+    gapUi.b.setAttribute('aria-valuetext', gapFmt(s.range));
+    gapUi.dual.title = 'Drag thumb A (the pause) or thumb B (the roulette\'s other end): now '
+      + gapFmt(s.gap) + ' and ' + gapFmt(s.range) + '.';
     var swTip = 'Roulette after each reply: ' + (s.roll ? 'ON - a System 3 roll picks each pause in '
       + w[0].toFixed(1) + ' - ' + w[1].toFixed(1) + ' s' : 'OFF - every pause is the fixed '
       + gapFmt(s.gap)) + '. Station-wide - every listener hears this. Tap to turn it '
@@ -23396,7 +23493,7 @@
     /* [reply-gap:dice] the square lands only on a pause this panel saw roll -
        a receipt from another road, painted still, read as a dead die */
     if (!gapState.roll) { gapCountStop(); gapIdle(); }
-    gapPaint(true);
+    gapPaint();
   }
 
   function gapLoad(force) {
@@ -23460,13 +23557,13 @@
   function gapRoll(g) {
     gapLast = g;
     gapFace(g, false);
-    gapPaint(false);
+    gapPaint();
   }
 
   /* [reply-gap:dice] THE COUNTDOWN. Two bars - under the square, and along
-   * the whole toolbar row - drain from full to empty over the pause, off
-   * the air's own clock: the page player's timer target for the next clip,
-   * or the sounding clip's playhead inside a welded round. */
+   * the whole toolbar row - drain from full to empty over the PAUSE, off the
+   * air's own clock: the page player's timer target for the next clip less
+   * the next card's buildup, or the sounding clip's playhead inside a round. */
   var gapCount = null;
   var gapCountArmed = 0;
   function gapBars(frac) {
@@ -23521,15 +23618,48 @@
     if (visible && root.requestAnimationFrame) gapCountArmed = root.requestAnimationFrame(gapCountTick);
     else gapCountArmed = setTimeout(gapCountTick, 100);
   }
+  /* [reply-gap:buildup] the next card, before its words: which line, and the
+     window (audioAt - ms .. audioAt) its whole buildup plays in */
+  function mvUpcomingSet(u) {
+    if (!u || !u.lid || !(u.ms > 0) || !(u.audioAt > 0)) return;
+    if (mvUpcoming && mvUpcoming.lid === u.lid && Math.abs(mvUpcoming.audioAt - u.audioAt) < 400) return;
+    u.item = mvUpItem(u);
+    mvUpcoming = u;
+    try { mvAsk(u.item); } catch (e) { /* asked again when the card starts */ }   /* its rows, fetched during the pause */
+  }
+  function mvUpItem(u) {
+    var row = {};
+    try { row = mvFeedRow(u.lid) || {}; } catch (e) { row = {}; }
+    var who = String(row.who || u.who || '').toLowerCase();
+    var kind = String(row.kind || '').toLowerCase();
+    var clip = !!u.sting || who === 'board' || /^(sfx|sting|clip|music)$/.test(kind);
+    return {key: 'l:' + u.lid, kind: clip ? 'clip' : 'speech', lid: u.lid, row: row, who: who,
+      name: clip ? 'CLIP' : String(u.name || row.name || who || 'ON AIR'),
+      text: mvPlain(u.text || row.text || ''), round: String(row.round || ''), kindOf: kind};
+  }
+  function mvUpcomingNow(now) {
+    var u = mvUpcoming;
+    if (!u) return null;
+    if (now > u.audioAt + 2500) { mvUpcoming = null; return null; }
+    return now >= u.audioAt - u.ms ? u : null;
+  }
   /* A message ended on this page's player: its pause, and when the next
-     message starts - the moment the player's own timer will start it. */
+     message starts - the moment the player's own timer will start it. The
+     pause runs to that moment less the next card's buildup. */
   function gapOnCue(ev) {
     var d = ev && ev.detail;
-    if (!gapUi || !gapState.roll || !d || !d.rolled) return;
-    gapRoll({s: d.s, dice: d.dice, lo: d.lo, hi: d.hi, id: d.id, rolled: true});
+    if (!d) return;
     var to = gapNum(d.startsAt, 0);
-    if (to - Date.now() > 30) {
-      gapCount = {from: Date.now(), to: to};
+    var bms = Math.max(0, gapNum(d.buildup_ms, 0));
+    if (bms > 0 && d.lid) {
+      mvUpcomingSet({lid: String(d.lid), who: String(d.who || ''), name: String(d.name || ''),
+        text: String(d.text || ''), sting: !!d.sting, audioAt: to, ms: bms});
+    }
+    if (!gapUi || !gapState.roll || !d.rolled) return;
+    gapRoll({s: d.s, dice: d.dice, lo: d.lo, hi: d.hi, id: d.id, rolled: true});
+    var pauseEnd = to - bms;
+    if (pauseEnd - Date.now() > 30) {
+      gapCount = {from: Date.now(), to: pauseEnd};
       gapBars(1);
       gapCountKick();
     } else {
@@ -23537,11 +23667,12 @@
     }
   }
 
-  /* Called on every feed tick: when the reply a rolled pause follows ends
-     in the audio this panel is hearing, the square rolls - once. */
+  /* Every 120 ms, and on every feed tick: when a reply ends inside the round
+     this panel is hearing, the square rolls - once - and the next row's card
+     is told when to start building. */
   function gapWatch() {
     gapLoad(false);
-    if (!gapUi || !gapState.roll) return;
+    if (!gapUi) return;
     /* [reply-gap:dice] the SOUNDING clip's rows first (this page's player,
        exact), the station's stream_now only when nothing here is sounding */
     var here = gapHere();
@@ -23550,7 +23681,7 @@
     var rows = here.rows;
     for (var i = 0; i < rows.length; i += 1) {
       var g = rows[i] && rows[i].gap;
-      if (!g || !g.rolled) continue;
+      if (!g) continue;
       var inside = gapNum(g.inside, 0);
       if (!(inside > 0)) continue;
       var start = gapNum(rows[i].until, 0) - inside;
@@ -23558,15 +23689,75 @@
       if (gapFired[key]) continue;
       if (t >= start - 0.1 && t < start + Math.max(0.6, inside)) {
         gapFired[key] = 1;
-        gapRoll(g);
-        gapCount = {file: here.key, end: start + inside, total: inside};
-        gapBars(1);
-        gapCountKick();
+        var bms = Math.max(0, gapNum(g.buildup_ms, 0));
+        var pause = Math.max(0, inside - bms / 1000);
+        var nx = rows[i + 1];
+        if (bms > 0 && nx && nx.id) {
+          mvUpcomingSet({lid: String(nx.id), who: String(nx.who || ''), name: String(nx.name || ''),
+            text: String(nx.text || ''), sting: String(nx.who || '') === 'board',
+            audioAt: Date.now() + (gapNum(nx.from, start + inside) - t) * 1000, ms: bms});
+        }
+        if (gapState.roll && g.rolled) {
+          gapRoll(g);
+          gapCount = {file: here.key, end: start + pause, total: pause};
+          gapBars(1);
+          gapCountKick();
+        }
         break;
       }
     }
     var keys = Object.keys(gapFired);
     if (keys.length > 400) keys.slice(0, 200).forEach(function (k) { delete gapFired[k]; });
+  }
+
+  /* [reply-gap:dual] one track, two thumbs: a finger lands on the nearer
+     thumb (or the one it touched) and drags it; the keys step it */
+  function gapDualWire(track, a, b) {
+    var drag = null;
+    function set(which, v, final) {
+      gapHeldUntil = Date.now() + 4000;
+      if (which === 'a') gapState.gap = v; else gapState.range = v;
+      gapPaint();
+      gapSend(final);
+    }
+    track.addEventListener('pointerdown', function (ev) {
+      var r = track.getBoundingClientRect();
+      var v = gapValAt(ev.clientX, r.left, r.width);
+      var which = ev.target === a ? 'a' : ev.target === b ? 'b'
+        : (Math.abs(v - gapState.gap) <= Math.abs(v - gapState.range) ? 'a' : 'b');
+      drag = {which: which, id: ev.pointerId};
+      try { track.setPointerCapture(ev.pointerId); } catch (e) { /* the drag still follows */ }
+      (which === 'a' ? a : b).classList.add('grab');
+      set(which, v, false);
+      if (ev.cancelable) ev.preventDefault();
+    });
+    track.addEventListener('pointermove', function (ev) {
+      if (!drag || ev.pointerId !== drag.id) return;
+      var r = track.getBoundingClientRect();
+      set(drag.which, gapValAt(ev.clientX, r.left, r.width), false);
+    });
+    var end = function (ev) {
+      if (!drag || (ev && ev.pointerId !== drag.id)) return;
+      var w = drag.which;
+      drag = null;
+      a.classList.remove('grab');
+      b.classList.remove('grab');
+      set(w, w === 'a' ? gapState.gap : gapState.range, true);
+    };
+    track.addEventListener('pointerup', end);
+    track.addEventListener('pointercancel', end);
+    [a, b].forEach(function (th) {
+      th.addEventListener('keydown', function (ev) {
+        var which = th === a ? 'a' : 'b';
+        var cur = which === 'a' ? gapState.gap : gapState.range;
+        var step = {ArrowRight: 0.1, ArrowUp: 0.1, ArrowLeft: -0.1, ArrowDown: -0.1, PageUp: 1, PageDown: -1}[ev.key];
+        if (ev.key === 'Home') step = GAP_MIN - cur;
+        if (ev.key === 'End') step = GAP_MAX - cur;
+        if (step === undefined) return;
+        ev.preventDefault();
+        set(which, gapClamp(cur + step, GAP_MIN, GAP_MAX, 1), true);
+      });
+    });
   }
 
   function gapBar() {
@@ -23577,27 +23768,36 @@
     ['click', 'dblclick', 'pointerdown', 'touchstart', 'wheel'].forEach(function (name) {
       wrap.addEventListener(name, function (ev) { ev.stopPropagation(); }, {passive: true});
     });
-    function slider(cls, icon, label, min, max, value) {
-      var box = make('label', 'sp-gap-slider ' + cls);
-      var ic = make('span', 'sp-gap-ic');
-      ic.innerHTML = folderIcon(icon, '') || '';
-      ic.setAttribute('aria-hidden', 'true');
-      var input = document.createElement('input');
-      input.type = 'range';
-      input.min = String(min);
-      input.max = String(max);
-      input.step = '0.1';
-      input.value = String(value);
-      input.setAttribute('aria-label', label);
-      var val = make('span', 'sp-gap-val', value.toFixed(1) + 's');
-      val.setAttribute('aria-hidden', 'true');
-      box.appendChild(ic);
-      box.appendChild(input);
-      box.appendChild(val);
-      return {box: box, input: input, val: val};
-    }
-    var one = slider('sp-gap-one', 'c:hourglass', 'Pause between replies', GAP_MIN, GAP_MAX, gapState.gap);
-    var two = slider('sp-gap-two', 'c:shuffle', 'Roulette range', GAP_RANGE_MIN, GAP_RANGE_MAX, gapState.range);
+    /* [reply-gap:dual] the pause and the roulette's other end, on one track */
+    var dual = make('div', 'sp-gap-dual');
+    var ic = make('span', 'sp-gap-ic');
+    ic.innerHTML = folderIcon('c:hourglass', '') || '';
+    ic.setAttribute('aria-hidden', 'true');
+    var track = make('div', 'sp-gap-track');
+    var rail = make('span', 'sp-gap-rail');
+    rail.setAttribute('aria-hidden', 'true');
+    var span = make('span', 'sp-gap-span');
+    span.setAttribute('aria-hidden', 'true');
+    var thumb = function (cls, label) {
+      var th = make('span', 'sp-gap-thumb ' + cls);
+      th.setAttribute('role', 'slider');
+      th.setAttribute('tabindex', '0');
+      th.setAttribute('aria-label', label);
+      th.setAttribute('aria-valuemin', String(GAP_MIN));
+      th.setAttribute('aria-valuemax', String(GAP_MAX));
+      return th;
+    };
+    var a = thumb('sp-gap-a', 'Pause between replies');
+    var b = thumb('sp-gap-b', 'Roulette range end');
+    track.appendChild(rail);
+    track.appendChild(span);
+    track.appendChild(a);
+    track.appendChild(b);
+    var val = make('span', 'sp-gap-val sp-gap-vals', '');
+    val.setAttribute('aria-hidden', 'true');
+    dual.appendChild(ic);
+    dual.appendChild(track);
+    dual.appendChild(val);
     var sw = make('button', 'sp-gap-switch');
     sw.type = 'button';
     sw.setAttribute('role', 'switch');
@@ -23621,42 +23821,32 @@
     diebox.appendChild(well);
     var rowbar = make('span', 'sp-gap-rowbar');
     rowbar.setAttribute('aria-hidden', 'true');
-    wrap.appendChild(one.box);
-    wrap.appendChild(two.box);
+    wrap.appendChild(dual);
     wrap.appendChild(sw);
     wrap.appendChild(diebox);
     wrap.appendChild(rowbar);
-    gapUi = {wrap: wrap, oneBox: one.box, one: one.input, oneVal: one.val,
-      twoBox: two.box, two: two.input, twoVal: two.val, sw: sw, die: die, reel: reel,
-      count: count, rowbar: rowbar};
+    gapUi = {wrap: wrap, dual: dual, track: track, span: span, a: a, b: b, val: val,
+      sw: sw, die: die, reel: reel, count: count, rowbar: rowbar};
+    gapDualWire(track, a, b);
     if (!gapCueWired) {
       gapCueWired = true;
       root.addEventListener('pine-reply-gap', gapOnCue);
     }
-    var moved = function (which, final) {
-      return function () {
-        gapHeldUntil = Date.now() + 4000;
-        if (which === 'gap') gapState.gap = gapClamp(one.input.value, GAP_MIN, GAP_MAX, 1);
-        else gapState.range = gapClamp(two.input.value, GAP_RANGE_MIN, GAP_RANGE_MAX, 1);
-        gapPaint(false);
-        gapSend(final);
-      };
-    };
-    one.input.addEventListener('input', moved('gap', false));
-    one.input.addEventListener('change', moved('gap', true));
-    two.input.addEventListener('input', moved('range', false));
-    two.input.addEventListener('change', moved('range', true));
+    if (!gapPumpOn) {                                   /* [reply-gap:buildup] every seam, in time */
+      gapPumpOn = true;
+      setInterval(function () { if (mounted) gapWatch(); }, 120);
+    }
     sw.addEventListener('click', function () {
       gapHeldUntil = Date.now() + 4000;
       gapState.roll = !gapState.roll;
       if (!gapState.roll) { gapCountStop(); gapIdle(); }
-      gapPaint(false);
+      gapPaint();
       gapSend(true);
     });
     die.addEventListener('click', function () {
       if (gapState.roll && gapLast) gapFace(gapLast, false);
     });
-    gapPaint(true);
+    gapPaint();
     return wrap;
   }
 
