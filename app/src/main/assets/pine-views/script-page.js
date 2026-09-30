@@ -23323,12 +23323,12 @@
    *  ... a toggle to enable roulette rolls ... Show the rolling dice here."
    *
    * Slider one is the pause after every reply on air (0.2 - 10 s, default
-   * 1). Slider two is how far a roll may move it: with the toggle on, each
-   * pause is a System 3 roll, uniform in [gap - range, gap + range] kept
-   * inside 0.2 - 10 s. The station keeps the setting (/api/reply-gap), rolls
+   * 1). Slider two is the roll's other end: with the toggle on, each pause
+   * is a System 3 roll, uniform BETWEEN the two sliders (0.2 - 10 s)
+   * [reply-gap:between]. The station keeps the setting (/api/reply-gap), rolls
    * at the seam, and stamps each reply's pause on its stream_now row; the
    * square rolls when that reply ends in the audio this panel is hearing. */
-  var GAP_MIN = 0.2, GAP_MAX = 10, GAP_RANGE_MIN = 0.1, GAP_RANGE_MAX = 10;
+  var GAP_MIN = 0.2, GAP_MAX = 10, GAP_RANGE_MIN = 0.2, GAP_RANGE_MAX = 10;   /* [reply-gap:between] */
   var gapState = {gap: 1, range: 1, roll: false};
   var gapUi = null;
   var gapLoadedAt = 0;
@@ -23344,9 +23344,9 @@
     return Math.min(hi, Math.max(lo, v));
   }
   function gapWindow(g, r) {
-    var lo = Math.max(GAP_MIN, Math.round((g - r) * 10) / 10);
-    var hi = Math.min(GAP_MAX, Math.round((g + r) * 10) / 10);
-    return [lo, Math.max(lo, hi)];
+    /* [reply-gap:between] "the dice should only be rolling values between
+       slider 1 and slider 2" - the two sliders are the roll's two ends */
+    return [Math.min(g, r), Math.max(g, r)];
   }
   function gapFmt(s) { return gapNum(s, 0).toFixed(1) + ' s'; }
 
@@ -23363,10 +23363,9 @@
     var oneTip = 'Pause between replies: ' + gapFmt(s.gap) + ' (0.2 - 10 s). The silence after '
       + 'every reply on air - DJ to DJ, DJ to the SFX Guy, the SFX Guy to a DJ. Station-wide; '
       + 'the running order budgets it into every segment. Station-wide - every listener hears this.';
-    var twoTip = 'Roulette range: ' + gapFmt(s.range) + '. With the roll on, each pause is a '
-      + 'System 3 roll, uniform between the pause minus this and the pause plus this, kept '
-      + 'inside 0.2 - 10 s (now ' + w[0].toFixed(1) + ' - ' + w[1].toFixed(1) + ' s). '
-      + 'Station-wide - every listener hears this.';
+    var twoTip = 'Roulette range: ' + gapFmt(s.range) + ' (0.2 - 10 s). With the roll on, each '
+      + 'pause is a System 3 roll landing between the two sliders (now ' + w[0].toFixed(1) + ' - '
+      + w[1].toFixed(1) + ' s). Station-wide - every listener hears this.';   /* [reply-gap:between] */
     gapUi.oneBox.title = oneTip;
     gapUi.one.setAttribute('aria-valuetext', gapFmt(s.gap));
     gapUi.twoBox.title = twoTip;
