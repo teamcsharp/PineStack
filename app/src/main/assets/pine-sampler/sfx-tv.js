@@ -5405,6 +5405,10 @@
   var CACHE_MOST = 10;                  // clips held at once
   var CACHE_BYTES_MOST = 48 * 1048576;  // and never more memory than this
   var CACHE_FILE_MOST = 24 * 1048576;   // a clip past this streams, as before
+  /* [tv-stream] a long clip streams: pulling 17.5 MB whole held a 130 s
+     sting's first frame back 13 s on the tablet's link */
+  var STREAM_OVER = 6 * 1048576;
+  var aborts = Object.create(null);     // url -> AbortController of its whole-file pull
   var cache = [];                       // [{url, href, bytes, at}]
   var fetching = Object.create(null);   // url -> promise; asked once only
 
@@ -5454,10 +5458,16 @@
     var got = cacheFind(url);
     if (got) return Promise.resolve(got.href);
     if (fetching[url]) return fetching[url];
-    var job = fetch(url, {credentials: 'omit'}).then(function (res) {
+    var ctl = null;
+    try { ctl = typeof AbortController === 'function' ? new AbortController() : null; } catch (err) { ctl = null; }
+    if (ctl) aborts[url] = ctl;
+    var job = fetch(url, ctl ? {credentials: 'omit', signal: ctl.signal} : {credentials: 'omit'}).then(function (res) {
       if (!res.ok) throw new Error('HTTP ' + res.status);
       var len = Number(res.headers.get('content-length'));
-      if (isFinite(len) && len > CACHE_FILE_MOST) throw new Error('too big');
+      if (isFinite(len) && len > Math.min(CACHE_FILE_MOST, STREAM_OVER)) {   /* [tv-stream] */
+        try { if (ctl) ctl.abort(); } catch (err) { /* the body is simply not read */ }
+        throw new Error('streams');
+      }
       return res.blob();
     }).then(function (blob) {
       if (!blob || !blob.size) throw new Error('empty');
@@ -5466,9 +5476,11 @@
       cache.push({url: url, href: href, bytes: blob.size, at: now()});
       cacheTrim();
       delete fetching[url];
+      delete aborts[url];
       return href;
     })['catch'](function () {
       delete fetching[url];
+      delete aborts[url];
       return null;                      /* the station's URL still works */
     });
     fetching[url] = job;
@@ -5480,6 +5492,10 @@
   function heldSrc(clip) {
     var url = srcOf(clip);
     var got = cacheFind(url);
+    if (!got && aborts[url]) {          /* [tv-stream] streaming it now: the whole-file pull steps aside */
+      try { aborts[url].abort(); } catch (err) { /* it finishes on its own */ }
+      delete aborts[url];
+    }
     return (got && got.href) || url;
   }
 
