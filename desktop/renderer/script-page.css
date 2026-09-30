@@ -4597,3 +4597,7 @@ html.pine-tech-wide .sp-tech.sp-tech-wide .wc-strip {
 .sp-mv-media.is-video .sp-mv-h3 { display: flex; }
 .sp-mv-media .sp-mv-h3:hover { background: rgba(22, 52, 59, .9); border-color: #65c7da; }
 .sp-mv-media .sp-mv-h3 svg { width: 15px; height: 15px; fill: currentColor; }
+
+/* [seg-id] the segment's hex id, under its time */
+.sp-segment-clock { display: inline-flex; flex-direction: column; align-items: flex-start; gap: 2px; }
+.sp-segment-clock .sp-segment-id { font-size: 10px; padding: 0 5px; line-height: 16px; opacity: .8; }
