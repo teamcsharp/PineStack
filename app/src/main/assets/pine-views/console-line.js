@@ -172,6 +172,80 @@
       && typeof talk.collapsed === 'function' && talk.collapsed());
   }
 
+  /* [station-pulse] "a small loading bar above the base status bar showing the
+     health of the station and how much of it is being grabbed out of the bank
+     database versus being rendered in real time ... relaxing ... more full ...
+     a single line scrolling marquee giving up to date status information on the
+     current status of the station and how the orchestrator is handing the rooms
+     and the tasks with the broadcast." /api/station/pulse every five seconds:
+     the fill is the pressure (empty = the hour is in the bank, full = everything
+     made live and locked up), eased so it visibly relaxes and tightens; the
+     marquee is the station's own lines, swapped in only when a pass ends so it
+     never jumps under the eye. */
+  var PULSE_ID = 'pinePulse';
+  var pulseTimer = 0, pulseText = '', pulseNext = '';
+  function pulseMount() {
+    if (document.getElementById(PULSE_ID)) return;
+    var p = document.createElement('div');
+    p.id = PULSE_ID;
+    p.className = 'pine-pulse';
+    p.innerHTML = '<div class="pine-pulse-bar" role="meter" aria-valuemin="0" aria-valuemax="100"'
+      + ' aria-label="Station pressure: the bank against rendering live"><i class="pine-pulse-fill"></i></div>'
+      + '<div class="pine-pulse-line"><div class="pine-pulse-track"></div></div>';
+    document.body.appendChild(p);
+    pulseSeat(p);
+    var track = p.querySelector('.pine-pulse-track');
+    track.addEventListener('animationiteration', function () {
+      if (pulseNext && pulseNext !== pulseText) pulsePaintText(track, pulseNext);
+    });
+    pulseRead();
+    if (!pulseTimer) pulseTimer = root.setInterval(function () {
+      try { if (document.hidden) return; } catch (err) { /* read anyway */ }
+      pulseRead();
+    }, 5000);
+  }
+  function pulseSeat(p) {                      /* on top of the strip, however tall it is */
+    var cb = el();
+    if (p && cb && cb.offsetHeight) p.style.bottom = cb.offsetHeight + 'px';
+  }
+  function pulsePaintText(track, text) {
+    pulseText = text;
+    track.textContent = '';
+    for (var k = 0; k < 2; k += 1) {                 /* two copies: the loop has no seam */
+      var s = document.createElement('span');
+      s.textContent = text + '     \u2022     ';
+      track.appendChild(s);
+    }
+    var secs = Math.max(30, Math.round(text.length / 7));
+    track.style.animationDuration = secs + 's';
+  }
+  function pulseRead() {
+    Promise.resolve(flowGet('/api/station/pulse')).then(function (v) {
+      var p = document.getElementById(PULSE_ID);
+      if (!p || !v || typeof v.pressure !== 'number') return;
+      pulseSeat(p);
+      var pct = Math.round(Math.max(0, Math.min(1, v.pressure)) * 100);
+      var bar = p.querySelector('.pine-pulse-bar');
+      var fill = p.querySelector('.pine-pulse-fill');
+      fill.style.width = Math.max(2, pct) + '%';
+      p.setAttribute('data-state', String(v.state || ''));
+      bar.setAttribute('aria-valuenow', String(pct));
+      var parts = v.parts || {};
+      var n = v.numbers || {};
+      bar.title = 'Station pressure ' + pct + '% - ' + (v.state || '') + '. '
+        + Math.round((v.banked || 0) * 100) + '% of the next hour is in the bank. '
+        + 'Still to make: ' + Math.round((parts.bank || 0) * 100) + '% of the hour; '
+        + 'made live: ' + Math.round((parts.live || 0) * 100) + '% of its lines; '
+        + (n.voice_queue || 0) + ' line(s) waiting for a voice; '
+        + (n.writers_waiting || 0) + ' writer(s) waiting, ' + (n.deferred || 0) + ' deferred.';
+      var text = (v.marquee || []).join('     \u2022     ');
+      var track = p.querySelector('.pine-pulse-track');
+      if (!pulseText) pulsePaintText(track, text);
+      else pulseNext = text;
+      p.querySelector('.pine-pulse-line').title = (v.marquee || []).join('\n');
+    }, function () { /* the next read */ });
+  }
+
   function mount() {
     if (el()) return el();
     var bar = document.createElement('div');
@@ -197,6 +271,7 @@
       + ' aria-label="Open the last 300 audit events">'
       + (icon('c:terminal', 'Open audit terminal') || '&gt;_') + '</button>';
     document.body.appendChild(bar);
+    pulseMount();                              /* [station-pulse] the bar and the marquee above it */
     wireSpeed(bar);
     paintTalkRestoreButton(bar);
     if (root.addEventListener && !bar.__pineTalkRestoreWired) {
