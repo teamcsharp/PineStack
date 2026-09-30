@@ -475,31 +475,45 @@
     x.parentNode.insertBefore(b, x);
     beside(b, x);
   }
-  /* An X pinned to its corner (position absolute/fixed) carried the back
-     button to the same spot - "these buttons are overlapping". Pinned the
-     same way, one button-width (and a gap) further in. */
+  /* [popback] NEVER ON TOP OF THE X. "These buttons are overlapping. I don't
+     want any overlapping buttons." (the operator, twice: a corner-pinned X,
+     then pineCloseX's sticky one.) The back button drops the X's own
+     placement classes; if it still touches the X wherever it landed, it is
+     set just left of the X in the same box - and set again when that box
+     scrolls or the window changes size. */
+  function hits(a, b) {
+    var p = a.getBoundingClientRect(), q = b.getBoundingClientRect();
+    return !(p.right <= q.left || p.left >= q.right || p.bottom <= q.top || p.top >= q.bottom);
+  }
   function beside(b, x) {
-    var cs = root.getComputedStyle(x);
-    if (cs.position !== 'absolute' && cs.position !== 'fixed') return;
-    var w = x.offsetWidth || 32, gap = 6;
-    b.style.position = cs.position;
-    b.style.top = cs.top;
-    b.style.bottom = cs.bottom;
-    b.style.marginRight = '0';
-    if (cs.right !== 'auto') {
-      var right = (parseFloat(cs.right) || 0) + w + gap;
-      b.style.right = right + 'px';
-      b.style.left = 'auto';
-      /* and the heading beside them keeps clear of both */
-      var head = x.parentNode;
-      var pad = right + (b.offsetWidth || w) + gap;
-      if (head && head.style && (parseFloat(root.getComputedStyle(head).paddingRight) || 0) < pad) {
-        head.style.paddingRight = pad + 'px';
-      }
-    } else {
-      b.style.left = ((parseFloat(cs.left) || 0) - w - gap) + 'px';
+    b.classList.remove('pcx-stick', 'pcx-flex', 'pcx-abs');
+    var pinned = /^(absolute|fixed)$/.test(root.getComputedStyle(x).position);
+    var place = function () {
+      if (!b.isConnected || !x.isConnected) return;
+      if (!b.__pineBeside && !hits(b, x)) return;
+      b.__pineBeside = true;
+      var gap = 6, w = b.offsetWidth || 32;
+      b.style.position = 'absolute';
+      b.style.margin = '0';
       b.style.right = 'auto';
-    }
+      b.style.bottom = 'auto';
+      b.style.float = 'none';
+      b.style.zIndex = root.getComputedStyle(x).zIndex === 'auto' ? '' : root.getComputedStyle(x).zIndex;
+      b.style.left = Math.round(x.offsetLeft - w - gap) + 'px';
+      b.style.top = Math.round(x.offsetTop) + 'px';
+      /* a heading beside a corner-pinned pair keeps clear of both */
+      var head = x.parentNode;
+      if (pinned && head && head.style) {
+        var need = Math.round(head.getBoundingClientRect().right - b.getBoundingClientRect().left + gap);
+        if ((parseFloat(root.getComputedStyle(head).paddingRight) || 0) < need) head.style.paddingRight = need + 'px';
+      }
+    };
+    place();
+    root.requestAnimationFrame(place);
+    var host = b.closest('[role="dialog"]') || b.parentNode;
+    var again = function () { if (b.__pineBeside) place(); };
+    try { host.addEventListener('scroll', again, true); } catch (e) { /* nothing scrolls */ }
+    root.addEventListener('resize', again);
   }
   function goBack(el, prev) {
     var x = closer(el);
@@ -515,13 +529,25 @@
       if (p.style && p.style.display === 'none') p.style.display = '';
     }, 60);
   }
+  /* [popback] a TRANSITION is a tap in the pop-up it came from. A pop-up that
+     opens by itself ("Your Pine Box ad is ready") over another one did not
+     come from it and gets no way back to it. */
+  var tap = {target: null, at: 0};
+  doc.addEventListener('pointerdown', function (ev) { tap = {target: ev.target, at: Date.now()}; }, true);
+  doc.addEventListener('keydown', function (ev) {
+    if (ev.key === 'Enter' || ev.key === ' ') tap = {target: ev.target, at: Date.now()};
+  }, true);
+  function tappedIn(node) {
+    return !!(node && tap.target && Date.now() - tap.at <= HANDOVER_MS && node.contains(tap.target));
+  }
   function appeared(el) {
     for (var k = 0; k < up.length; k += 1) if (up[k].el === el) return;   /* already known: a drag, a restyle */
     if (!isPopup(el) || !visible(el)) return;
     up = up.filter(function (r) { return visible(r.el); });
-    var below = up.length ? up[up.length - 1] : null;
+    var below = null;
+    for (var j = up.length - 1; j >= 0; j -= 1) if (tappedIn(up[j].el)) { below = up[j]; break; }
     var prev = below ? {el: below.el, parent: null, next: null, hidden: false, label: below.label}
-      : (gone && Date.now() - gone.at <= HANDOVER_MS && gone.el !== el ? gone : null);
+      : (gone && Date.now() - gone.at <= HANDOVER_MS && gone.el !== el && tappedIn(gone.el) ? gone : null);
     up.push({el: el, label: labelOf(el)});
     if (prev) giveBack(el, prev);
   }
