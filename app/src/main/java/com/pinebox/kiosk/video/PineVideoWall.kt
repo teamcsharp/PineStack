@@ -122,6 +122,19 @@ class PineVideoWall(
     @Volatile private var held = false
     @Volatile private var holdUntil = 0L
     private var pump: Job? = null
+    /* [pin-takeover] 2026-09-30, the operator: "make it where when i set the
+     * folder, it takes over fully and properly." Measured with sfx_ads pinned:
+     * the station's set drew 165 of 165 from the folder, and the tablet still
+     * showed samples_grabbed/bart - the larder below holds every folder, and
+     * a 219-clip folder soon has nothing the rung list has not seen, so the
+     * larder took over. The station now names the pin on /api/dj/video
+     * (path, and the folder's ids when it is not huge); while it stands:
+     * the larder offers only the folder's clips, the folder may repeat
+     * rather than reach outside it, and a new pin drops what is queued
+     * from anywhere else. */
+    @Volatile private var pinPath = ""
+    @Volatile private var pinIds: Set<String>? = null
+
     /** At most one network refill. The local larder never waits behind it. */
     private var fresh: Job? = null
     /** Operator shuffle owns the runway until its requested batch lands. */
@@ -1160,8 +1173,14 @@ class PineVideoWall(
                         delay(120)          // let the main thread's tally land
                     } else {
                         val cached = withContext(Dispatchers.IO) { fromLarder() }
+                        /* [pin-takeover] a pinned folder repeats before anything
+                         * from outside it plays */
+                        val again = if (cached == null && pinPath.isNotEmpty()) nextRingClip(repeat = true) else null
                         if (cached != null) {
                             offer(cached)
+                            delay(120)
+                        } else if (again != null) {
+                            offer(again)
                             delay(120)
                         } else {
                             delay(1_200)
@@ -1238,7 +1257,7 @@ class PineVideoWall(
     private fun aheadRows(): Int = aheadRowsTally
 
     /** The next fresh clip off the ring. The caller owns the larder fallback. */
-    private suspend fun nextRingClip(): Clip? = withContext(Dispatchers.IO) {
+    private suspend fun nextRingClip(repeat: Boolean = false): Clip? = withContext(Dispatchers.IO) {
         val base = client.config().base
         val text = try {
             client.getMediaText("$base/api/dj/video")
@@ -1246,7 +1265,9 @@ class PineVideoWall(
             Log.w(TAG, "ring: ${err.message}")
             return@withContext null
         }
-        val rows = JSONObject(text).optJSONArray("clips")
+        val root = JSONObject(text)
+        readPin(root)                                          // [pin-takeover]
+        val rows = root.optJSONArray("clips")
         if (rows != null) {
             for (i in 0 until rows.length()) {
                 val row = rows.optJSONObject(i) ?: continue
@@ -1254,7 +1275,8 @@ class PineVideoWall(
                 val url = row.optString("url")
                 if (id.isBlank() || url.isBlank()) continue
                 if (row.optBoolean("silent_picture", false)) continue
-                if (rung.contains(id) || listed.any { it.id == id }) continue
+                if (!pinAllows(id)) continue                       // [pin-takeover]
+                if ((!repeat && rung.contains(id)) || listed.any { it.id == id }) continue
                 val secs = row.optDouble("length", row.optDouble("seconds", 0.0))
                 val file = pull(base + url, id)
                 /* Remembered either way: a clip the station cannot give us
@@ -1283,6 +1305,7 @@ class PineVideoWall(
         val held = try {
             den.listFiles()?.filter {
                 it.isFile && it.length() > MIN_BYTES && it.name.endsWith(".mp4")
+                    && pinAllows(it.nameWithoutExtension, larder = true)   // [pin-takeover]
                     && it.nameWithoutExtension != now
                     && !rung.contains(it.nameWithoutExtension)
                     && listed.none { c -> c.id == it.nameWithoutExtension }
@@ -1293,6 +1316,57 @@ class PineVideoWall(
         val pick = held.minByOrNull { it.lastModified() } ?: return null
         try { pick.setLastModified(System.currentTimeMillis()) } catch (err: Throwable) { }
         return Clip(pick.nameWithoutExtension, pick)
+    }
+
+    /** [pin-takeover] may this clip play under the pin? No pin: anything. A pin
+     *  with its ids: only those. A pin too big to list: the ring's own rows
+     *  (the station already draws them from the folder), never the larder. */
+    private fun pinAllows(id: String, larder: Boolean = false): Boolean {
+        if (pinPath.isEmpty()) return true
+        val ids = pinIds ?: return !larder
+        return ids.contains(id)
+    }
+
+    /** [pin-takeover] read the station's pin off a /api/dj/video answer. */
+    private fun readPin(root: JSONObject) {
+        val pin = root.optJSONObject("pin")
+        val path = pin?.optString("path").orEmpty()
+        val ids = pin?.optJSONArray("ids")?.let { arr ->
+            HashSet<String>(arr.length()).apply { for (i in 0 until arr.length()) add(arr.optString(i)) }
+        }
+        if (path == pinPath && (ids?.size ?: -1) == (pinIds?.size ?: -1)) return
+        val changed = path != pinPath
+        pinPath = path
+        pinIds = if (path.isEmpty()) null else ids
+        if (changed && path.isNotEmpty()) {
+            Log.i(TAG, "pin: $path (${ids?.size ?: "unlisted"} clips) - the set takes it over")
+            onMain { dropUnpinned() }
+        }
+    }
+
+    /** [pin-takeover] a new pin: what is queued from elsewhere goes, and the
+     *  clip on the tube gives way if a pinned one is ready behind it. */
+    private fun dropUnpinned() {
+        val p = player ?: return
+        if (pinPath.isEmpty()) return
+        val at = p.currentMediaItemIndex.coerceAtLeast(0)
+        try {
+            var i = listed.size - 1
+            while (i > at) {
+                if (!pinAllows(listed[i].id)) {
+                    p.removeMediaItem(i)
+                    listed.removeAt(i)
+                }
+                i -= 1
+            }
+            val onTube = listed.getOrNull(at)?.id
+            if (onTube != null && !pinAllows(onTube) && p.mediaItemCount > at + 1) p.seekToNextMediaItem()
+            retally()
+            lastKick = "${stamp()} a folder pin took the set over"
+        } catch (err: Throwable) {
+            lastError = "${stamp()} pin: ${err.message}"
+            Log.w(TAG, "pin: ${err.message}")
+        }
     }
 
     /** This id is spent - played, or refused - and is not asked for again. */
