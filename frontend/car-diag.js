@@ -57,7 +57,7 @@
   var SAMPLE_MS = 5000;
   var STORE_KEY = 'pbfm.cardiag.ring';
   var RES_KEEP_MS = 15 * 60 * 1000;
-  var GLYPH = '🩺';       // U+1FA7A stethoscope -> c:stethoscope in PineIcons
+  var GLYPH = '🐛';       // U+1F41B bug -> c:debug in PineIcons (the operator asked for a bug)
 
   /* #1476: the black box's own keys and bounds. */
   var EV_KEY = 'pbfm.cardiag.events';   // sessionStorage: the event log survives a reload

@@ -164281,7 +164281,7 @@ _HLS_LISTENER_MIX: dict[str, tuple[tuple[int, int, int], float]] = {}
 HLS_LISTENER_MIX_KEEP_S = 6 * 3600.0
 
 
-def _hls_mix_move(token: str, request: Request, mix: Any) -> None:
+def _hls_mix_move(token: str, request: Request, mix: Any, tab: str = "") -> None:
     """[mix-lane] This listener asked for `mix`; if it was on another personal
     mix a moment ago, that lane goes NOW - unless another listener is on it.
     Called before the new lane is admitted, so the slot it frees is the one
@@ -164295,6 +164295,11 @@ def _hls_mix_move(token: str, request: Request, mix: Any) -> None:
         except Exception:  # noqa: BLE001
             addr = ""
         who = "%s|%s" % (str(token or "")[-12:], addr)
+        # [mix-tab] a page names its own tab: two tabs, or two people behind
+        # one router on one link, are two listeners - never one
+        tab = re.sub(r"[^A-Za-z0-9_-]", "", str(tab or ""))[:40]
+        if tab:
+            who = "%s|tab:%s" % (str(token or "")[-12:], tab)
         now = time.time()
         prev = _HLS_LISTENER_MIX.get(who)
         _HLS_LISTENER_MIX[who] = (want, now)
@@ -164540,6 +164545,7 @@ async def station_stream_hls(
     br: str = "",
     mix: str = "",
     abr: str = "",                                          # [#1475]
+    who: str = "",                                          # [mix-tab]
     authorization: str | None = Header(default=None),
 ) -> Response:
     """The broadcast as HLS. This is the road an iPhone should take.
@@ -164567,7 +164573,7 @@ async def station_stream_hls(
     from station_stream import listener_mix
     personal_mix = listener_mix(mix)
     _t0 = time.monotonic()
-    _hls_mix_move(t, request, personal_mix)                 # [mix-lane]
+    _hls_mix_move(t, request, personal_mix, who)            # [mix-lane] [mix-tab]
     # #1475: THE MASTER, WHEN THE STREAM MODULE HAS ONE. Four AAC rates
     # with aligned segments out of this listener's own lane (keyed by mix);
     # the player picks and switches on its own and starts thirty seconds
@@ -272143,6 +272149,22 @@ function refreshPersonalMix() {
       });
   }, 700);   /* [mix-prime] one lane per listener bounds the encoders now */
 }
+/* [mix-tab] this tab's own name for the station: its personal-mix lane is
+ * released when THIS tab moves on, never when another tab on the same link
+ * and address does. */
+function tuneTab() {
+  try {
+    let id = sessionStorage.getItem("pbfmTuneTab");
+    if (!id) {
+      id = Math.random().toString(36).slice(2, 12);
+      sessionStorage.setItem("pbfmTuneTab", id);
+    }
+    return id;
+  } catch (e) {
+    if (!window.__pbfmTuneTab) window.__pbfmTuneTab = Math.random().toString(36).slice(2, 12);
+    return window.__pbfmTuneTab;
+  }
+}
 function mixNotApplied(why) {
   const note = document.getElementById("note");
   if (note) note.textContent = why + " - still playing your last mix; move a slider to try again";
@@ -272155,6 +272177,7 @@ function streamUrl() {
   const road = wantsHls() ? "/stream.m3u8" : "/stream.mp3";
   let url = road + "?_=" + Date.now();
   if (GUEST) url += "&t=" + encodeURIComponent(KEY);
+  if (wantsHls()) url += "&who=" + encodeURIComponent(tuneTab());   /* [mix-tab] */
   /* #1475: not on HLS - the station answers a named rate with that one
    * variant, and without one with the ABR master, where the player picks
    * among 48-128k by what the road can carry. */
