@@ -23525,7 +23525,7 @@
 
   /* The square's face: a reel of pauses that ends on the one rolled. */
   function gapFace(g, still) {
-    if (!gapUi) return;
+    if (!gapUi || gapPreviewOn) return;     /* [reply-gap:preview] a hand on a thumb owns the face */
     var die = gapUi.die, reel = gapUi.reel;
     try { if (root.matchMedia && root.matchMedia('(prefers-reduced-motion: reduce)').matches) still = true; } catch (e) { still = true; }
     if (document.visibilityState && document.visibilityState !== 'visible') still = true;
@@ -23552,6 +23552,31 @@
       die.classList.remove('rolling');
       die.classList.add('landed');
     }, ms);
+  }
+
+  /* [reply-gap:preview] "any time that I adjust the sliders show the value
+     that I'm setting the slider to on the dice and just have the dice rolling
+     as I'm adjusting the slider ... and then change it back whenever I release
+     the slider. That way the slider can take up that whole area." While a
+     thumb is held the square shows that thumb's value, wobbling; on release
+     it goes back to the last roll (or idle with the roulette off). A roll that
+     lands meanwhile is kept in gapLast and shown on release. */
+  var gapPreviewOn = false;
+  function gapPreview(v) {
+    if (!gapUi) return;
+    gapPreviewOn = true;
+    var die = gapUi.die, reel = gapUi.reel;
+    reel.textContent = '';
+    reel.appendChild(make('span', '', gapNum(v, 0).toFixed(1)));
+    reel.style.setProperty('--reel-end', '0px');
+    die.classList.remove('rolling', 'sp-gap-fresh');
+    die.classList.add('landed', 'sp-gap-preview');
+  }
+  function gapPreviewEnd() {
+    if (!gapUi || !gapPreviewOn) return;
+    gapPreviewOn = false;
+    gapUi.die.classList.remove('sp-gap-preview');
+    if (gapState.roll && gapLast) gapFace(gapLast, true); else gapIdle();
   }
 
   function gapRoll(g) {
@@ -23719,6 +23744,7 @@
       if (which === 'a') gapState.gap = v; else gapState.range = v;
       gapPaint();
       gapSend(final);
+      if (final) gapPreviewEnd(); else gapPreview(v);      /* [reply-gap:preview] */
     }
     track.addEventListener('pointerdown', function (ev) {
       var r = track.getBoundingClientRect();
