@@ -215,6 +215,39 @@ def sentence_cut(text, cap):
     return head[:space if space > 0 else cap].rstrip()
 
 
+LABEL_CHARS = 400                                                    # [whole-words]
+
+
+def label_cut(text, cap=LABEL_CHARS):
+    """[whole-words] a roll's label as the cards and popups show it: whole
+    sentences (sentence_cut), never stopped where a character count fell -
+    "its important people never get cut off in the middle of sentences"."""
+    return sentence_cut(text, cap)
+
+
+def whole_cut(text, cap):
+    """[whole-words:hosts] `text` as it is when it fits in `cap`; past it, cut
+    where a sentence ends (failing that a clause, failing that a word). Unlike
+    sentence_cut it keeps the text's own line breaks - for prompts laid out."""
+    s = str(text or "")
+    cap = int(cap or 0)
+    if cap <= 0 or len(s) <= cap:
+        return s
+    head = s[:cap + 1]
+    floor = int(cap * 0.25)
+    best = -1
+    for m in _SENTENCE_END.finditer(head):
+        if m.end() - 1 <= cap:
+            best = m.end() - 1
+    if best >= floor:
+        return head[:best].rstrip()
+    clause = max(head.rfind(", ", 0, cap), head.rfind("; ", 0, cap), head.rfind(": ", 0, cap))
+    if clause >= floor:
+        return head[:clause].rstrip(",;: ")
+    space = max(head.rfind(" ", 0, cap), head.rfind("\n", 0, cap))
+    return head[:space if space > 0 else cap].rstrip()
+
+
 def canonical(value):
     return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
 
@@ -709,13 +742,13 @@ def new_conversation(inputs, config, settings, seed=None, conversation_id=None):
                    "turn_seconds": float(inputs.get("turn_seconds") or 0),
                    "elapsed_estimated": 0.0, "elapsed_rendered": 0.0,
                    "remaining": target},
-        "subject": {"topic": str(subject.get("topic") or "")[:400],
+        "subject": {"topic": whole_cut(subject.get("topic"), 400),
                     "authority": str(subject.get("authority") or "obligated"),
                     "category": str(subject.get("category") or ""),
                     "sources": list(subject.get("sources") or []),
                     "seeded": bool(subject.get("seeded")),
                     "keywords": list(subject.get("keywords") or [])[:12],
-                    "active_angle": str(subject.get("angle") or "")[:300],
+                    "active_angle": whole_cut(subject.get("angle"), 300),
                     # the operator's numbered exchange, word for word (row 1, row 2)
                     "exchange": dict(subject.get("exchange") or {}),
                     "topic_exhaustion": 0.0, "unresolved_points": []},
@@ -777,7 +810,7 @@ def _apply_carry(conv, carry):
                      "age": round(float(carry.get("age") or 0), 1), "factor": round(f, 3),
                      "seats": carried,
                      "landing": {"who": str(landing.get("who") or ""), "name": str(landing.get("name") or ""),
-                                 "text": " ".join(str(landing.get("text") or "").split())[:400]},
+                                 "text": sentence_cut(landing.get("text"), 400)},
                      "tempers": [str(x) for x in (carry.get("tempers") or [])][-6:],
                      "unresolved": len(conv["subject"]["unresolved_points"])}
 
@@ -1649,7 +1682,7 @@ def _decide_turn(conv, config, settings, stream, step, speaker, want, inputs, cl
     if tp.get("id") and tp.get("turn_index") == idx:
         turn["bank_topic"] = {"id": tp["id"], "text": tp.get("text", ""), "reply": tp.get("reply", "")}
         turn["decisions"].append({"family": "TOPIC", "event_id": tp.get("event_id", ""),
-                                  "item": tp["id"], "label": tp.get("text", "")[:90]})
+                                  "item": tp["id"], "label": label_cut(tp.get("text", ""))})
         for _ev in conv["decision_events"]:
             if _ev["event_id"] == tp.get("event_id"):
                 _ev["turn_id"], _ev["turn_index"] = turn_id, idx
@@ -1665,7 +1698,7 @@ def _decide_turn(conv, config, settings, stream, step, speaker, want, inputs, cl
     except Exception as _gexc:  # noqa: BLE001 - a gold fault never costs the round; it is kept on it
         conv.setdefault("faults", []).append({"where": "gold roll", "error": repr(_gexc)[:200]})
     if str(step.get("topic") or "").strip():                                  # [s3-flow] the operator's own topic
-        turn["topic_override"] = " ".join(str(step["topic"]).split())[:400]
+        turn["topic_override"] = sentence_cut(step["topic"], 400)
         if idx == 0:
             conv["subject"]["topic"] = turn["topic_override"]
             conv["subject"]["authority"] = "operator"
@@ -1812,8 +1845,8 @@ def _direction_text(spec, inputs):
 def _material_mark(ev, spec, inputs):
     kind, got = _material_for(spec, inputs)
     if got:
-        ev["selected"]["material"] = {"kind": kind, "label": str(got.get("label") or kind)[:80],
-                                      "text": str(got["text"])[:200], "ref": str(got.get("ref") or "")[:120]}
+        ev["selected"]["material"] = {"kind": kind, "label": label_cut(got.get("label") or kind),
+                                      "text": label_cut(got["text"]), "ref": str(got.get("ref") or "")[:120]}
 
 
 def _cts(conv, config, ctx, stream, turn, idx):
@@ -1827,7 +1860,7 @@ def _cts(conv, config, ctx, stream, turn, idx):
         why = ("the road's own subject: %s" % (conv["subject"]["category"] or "the round's material")) if idx == 0 \
             else "the subject carries on (no frame cancelled it)"
         ev = _event(conv, ctx, "CTS", [], {"id": "OBLIGATED" if idx == 0 else "CONTINUE",
-                                          "label": conv["subject"]["topic"][:120] or why,
+                                          "label": label_cut(conv["subject"]["topic"]) or why,
                                           "authority": conv["subject"]["authority"] if idx == 0 else "continuing"},
                     before, meta={"why": why, "drawn": False})
         ev["state_after"] = before
@@ -1865,7 +1898,7 @@ def _cts(conv, config, ctx, stream, turn, idx):
                  if isinstance(t, dict) and t.get("id") and str(t["id"]) not in _used]
         if _bank:
             _d = stream.next("CTS:topic")
-            _rows = [{"id": str(t["id"]), "label": " ".join(str(t["text"]).split())[:90], "base": 1.0,
+            _rows = [{"id": str(t["id"]), "label": label_cut(t["text"]), "base": 1.0,
                       "weight": round(1.0 / (1 + max(0, int(t.get("used") or 0))), 4),
                       "why": ["sprung %d time(s)" % int(t.get("used") or 0)]} for t in _bank]
             _k = pick_index([r["weight"] for r in _rows], _d["u"])
@@ -1873,9 +1906,9 @@ def _cts(conv, config, ctx, stream, turn, idx):
             _t = _bank[_k]
             # no "file": the station stamps turns with a document's name and
             # remembers it as a heard passage, and a board entry is neither
-            turn["topic_material"] = {"text": " ".join(str(_t["text"]).split())[:400],
+            turn["topic_material"] = {"text": sentence_cut(_t["text"], 400),
                                       "file": "", "source": "the topics board", "topic_id": str(_t["id"])}
-            ev["selected"]["topic"] = {"id": str(_t["id"]), "text": turn["topic_material"]["text"][:120]}
+            ev["selected"]["topic"] = {"id": str(_t["id"]), "text": label_cut(turn["topic_material"]["text"])}
             conv.setdefault("topics_used", []).append(str(_t["id"]))
     if spec.get("resolver") == "speakbox":
         req = {"request_id": "%s:topic" % turn["turn_id"], "kind": "speakbox", "turn_id": turn["turn_id"],
@@ -1927,13 +1960,13 @@ def _topic_decision(conv, settings, stream, inputs, want, open_turns=None, repli
         return _event(conv, ctx, "TOPIC", stages, {"id": "NONE", "label": "nothing off the board this round"},
                       before, meta=dict(meta, why=why) if why else meta, rng=d)
     d2 = stream.next("TOPIC:item")
-    trows = [{"id": str(t["id"]), "label": " ".join(str(t["text"]).split())[:90], "base": 1.0,
+    trows = [{"id": str(t["id"]), "label": label_cut(t["text"]), "base": 1.0,
               "weight": round(1.0 / (1 + max(0, int(t.get("used") or 0))), 4),
               "why": ["sprung %d time(s)" % int(t.get("used") or 0)]} for t in bank]
     tpick = pick_index([r["weight"] for r in trows], d2["u"])
     stages.append(_stage("item", trows, tpick, d2))
     chosen = bank[tpick]
-    reply = " ".join(str(chosen.get("reply") or "").split())[:400] if replies else ""
+    reply = sentence_cut(chosen.get("reply") or "", 400) if replies else ""
     if reply:
         slots = [i for i in slots if i + 1 < want] or slots
     d3 = stream.next("TOPIC:turn")
@@ -1941,9 +1974,9 @@ def _topic_decision(conv, settings, stream, inputs, want, open_turns=None, repli
              for i in slots]
     spick = pick_index([r["weight"] for r in srows], d3["u"])
     stages.append(_stage("turn", srows, spick, d3))
-    plan = {"id": str(chosen["id"]), "text": " ".join(str(chosen["text"]).split())[:400],
+    plan = {"id": str(chosen["id"]), "text": sentence_cut(chosen["text"], 400),
             "reply": reply, "turn_index": slots[spick]}
-    ev = _event(conv, ctx, "TOPIC", stages, {"id": plan["id"], "label": plan["text"][:90]}, before,
+    ev = _event(conv, ctx, "TOPIC", stages, {"id": plan["id"], "label": label_cut(plan["text"])}, before,
                 meta=dict(meta, turn_index=plan["turn_index"], reply=bool(reply)), rng=d2)
     plan["event_id"] = ev["event_id"]
     conv["topic_plan"] = plan
@@ -2554,7 +2587,7 @@ def _cast_rolls(conv, config, settings, inputs):
                 if rid in recent:
                     w = round(w * FAV_REST, 4)
                     why.append("came up lately x%.2f" % FAV_REST)
-                cands.append({"id": rid, "label": r["text"][:90], "base": r["weight"], "weight": w, "why": why, "row": r})
+                cands.append({"id": rid, "label": label_cut(r["text"]), "base": r["weight"], "weight": w, "why": why, "row": r})
             d2 = stream.next("FAV:item")
             k = pick_index([c["weight"] for c in cands], d2["u"])
             if k >= 0:
@@ -2569,7 +2602,7 @@ def _cast_rolls(conv, config, settings, inputs):
                         "said_by": str(row["item"].get("name") or names.get(said) or row["item"].get("who") or ""),
                         "line_id": str(row["item"].get("line_id") or ""), "turn_index": t["index"]}
                 conv["fav_plan"] = plan
-                sel = {"id": plan["id"], "label": plan["text"][:90], "table": plan["table"], "turn_index": t["index"],
+                sel = {"id": plan["id"], "label": label_cut(plan["text"]), "table": plan["table"], "turn_index": t["index"],
                        "said_by": plan["said_by"], "index": k + 1, "of": len(cands)}
                 meta["turn_index"] = t["index"]
         ev = _event(conv, ctx0, "FAV", stages, sel, before, meta=meta, rng=d1)
@@ -2607,7 +2640,7 @@ def _cast_rolls(conv, config, settings, inputs):
             rng = stream.next("DIRECTIVE:dice")
             st, hit = _dice_stage("IN", "the directive comes up", odds, rng, "its own odds, %.0f%%" % (odds * 100))
             stages.append(st)
-        sel = {"id": "NONE", "label": "not this time: " + r["text"][:80], "row": rid, "seat": seat}
+        sel = {"id": "NONE", "label": "not this time: " + label_cut(r["text"]), "row": rid, "seat": seat}
         plan = None
         if hit:
             j = 0
@@ -2619,7 +2652,7 @@ def _cast_rolls(conv, config, settings, inputs):
             t = mine[j]
             plan = {"id": rid, "text": r["text"][:400], "table": r["table"], "seat": seat, "for": who,
                     "turn_index": t["index"]}
-            sel = {"id": rid, "label": r["text"][:90], "table": r["table"], "turn_index": t["index"], "seat": seat}
+            sel = {"id": rid, "label": label_cut(r["text"]), "table": r["table"], "turn_index": t["index"], "seat": seat}
             plans.append(plan)
         ev = _event(conv, ctx0, "DIRECTIVE", stages, sel, before,
                     meta={"seat": seat, "for": who, "odds": odds, "until": until, "airings": budget, "aired": used},
@@ -2654,7 +2687,7 @@ def _cast_attach(conv):
         if t:
             t["favorite"] = {k: fav.get(k) for k in ("id", "text", "seat", "said_by", "line_id", "event_id")}
             t["decisions"].append({"family": "FAV", "event_id": fav.get("event_id", ""), "item": fav.get("id"),
-                                   "label": str(fav.get("text") or "")[:90]})
+                                   "label": label_cut(fav.get("text") or "")})
             ev = events.get(fav.get("event_id"))
             if ev:
                 ev["turn_id"], ev["turn_index"] = t["turn_id"], t["index"]
@@ -2664,7 +2697,7 @@ def _cast_attach(conv):
             continue
         t.setdefault("directives", []).append({k: plan.get(k) for k in ("id", "text", "seat", "event_id")})
         t["decisions"].append({"family": "DIRECTIVE", "event_id": plan.get("event_id", ""), "item": plan.get("id"),
-                               "label": str(plan.get("text") or "")[:90]})
+                               "label": label_cut(plan.get("text") or "")})
         ev = events.get(plan.get("event_id"))
         if ev:
             ev["turn_id"], ev["turn_index"] = t["turn_id"], t["index"]
@@ -2804,7 +2837,7 @@ def _event_rolls(conv, config, settings, inputs, road, slots, allow_end=True):
                     plan = {"table": table["id"], "kind": cat["id"], "kind_label": str(cat.get("label") or cat["id"]),
                             "event": str(table.get("event") or ""),      # [s3-live-event]
                             "id": str(item.get("id")), "label": str(item.get("label") or item.get("id")),
-                            "text": _legs_words(item.get("text"), inputs)[:400],
+                            "text": whole_cut(_legs_words(item.get("text"), inputs), 400),
                             "after": _legs_words(item.get("after") or cat.get("after") or "", inputs)[:300],
                             "ends": bool(cat.get("ends")), "turn_index": at, "seat": seat,
                             "emotions": dict(item.get("emotions") or cat.get("emotions") or {}),
@@ -3612,7 +3645,7 @@ def plan_graph(conv, config, graph_raw, until=None, inputs=None, road="banter"):
                         turn["graph_" + field] = choices[pick]
                 if kind == "reply":
                     cur.setdefault("graph_reply_speakers", {})[current] = speaker
-                turn["protocol"] = (_legs_words(node["prompt"], inputs)[:600] if node["prompt"] else {
+                turn["protocol"] = (whole_cut(_legs_words(node["prompt"], inputs), 600) if node["prompt"] else {
                     "initiator": "Opens this chapter with a concrete point.",
                     "reply": "Answers the preceding point and the replies already made in this chain.",
                     "rebuttal": "Answers the replies to their opening point, including each speaker's argument.",
@@ -3671,7 +3704,7 @@ def plan_graph(conv, config, graph_raw, until=None, inputs=None, road="banter"):
                     turn["topic_change"] = True
                     if node["topic"]:
                         cur["graph_topic"] = node["topic"]
-                    options = graph["topic_options"] or [str(item.get("text") or "")[:120]
+                    options = graph["topic_options"] or [sentence_cut(item.get("text") or "", 400)
                         for item in (inputs.get("topic_bank") or []) if isinstance(item, dict) and item.get("text")]
                     if options and not node["topic"]:
                         draw = stream.next("GRAPH:%s:topic:%d" % (current, visits[current]))
@@ -3937,7 +3970,7 @@ def annotate_protocol(conv, sheet):
         topic = t.get("bank_topic") or {}                                 # [rng-topics]
         if topic.get("text"):
             add += (" [It puts them in mind of something off the operator's topics board, and "
-                    "they bring it up in their own words: %s.]" % json.dumps(sentence_cut(topic["text"], 300)))
+                    "they bring it up in their own words: %s.]" % json.dumps(sentence_cut(topic["text"], 400)))
         return match.group(0) + add
     return re.sub(r"(?m)^\s*(\d+)\s+[ABCDE]\s+[-–—].*$", row, sheet)
 
@@ -4768,8 +4801,8 @@ def plan_call(conv, config, inputs=None):
                           not in system3_tables.CALLEND_FAMILIES] or [{"family": "ES"}]}
         turn = _decide_turn(conv, config, conv["settings"], stream, step, seat, want, inputs)
         _end = _callend_role(leg)
-        turn["protocol"] = (_call_words(leg.get("act"), call, _callend_words(conv, _end, seat))[:700] if _end
-                            else _call_words(leg.get("act"), call)[:400])
+        turn["protocol"] = (whole_cut(_call_words(leg.get("act"), call, _callend_words(conv, _end, seat)), 700) if _end
+                            else whole_cut(_call_words(leg.get("act"), call), 400))
         if _end:
             turn["callend"] = {"role": _end}
         turn["leg"] = leg.get("id")
@@ -4837,7 +4870,7 @@ def _leg_row_add(t):
     topic = t.get("bank_topic") or {}
     if topic.get("text"):
         add += (" [It puts them in mind of something off the operator's topics board, and they "
-                "bring it up in their own words: %s.]" % json.dumps(sentence_cut(topic["text"], 300)))
+                "bring it up in their own words: %s.]" % json.dumps(sentence_cut(topic["text"], 400)))
     if any(t.get(k) for k in ("shock", "mention", "favorite", "directives", "events", "after_end")):   # [s3-rounds] [s3-cast] [s3-events]
         add += " [" + _round_adds(t, "the other").lstrip(". ") + ".]"
     return add
@@ -4981,7 +5014,7 @@ def plan_legs(conv, config, inputs=None, road=None, structure=None):
         step = {"id": leg.get("id"), "label": leg.get("label") or leg.get("id"),
                 "draws": leg.get("draws") or [{"family": "ES"}]}
         turn = _decide_turn(conv, config, conv["settings"], stream, step, seat, want, inputs)
-        turn["protocol"] = _legs_words(leg.get("act"), inputs)[:400]
+        turn["protocol"] = whole_cut(_legs_words(leg.get("act"), inputs), 400)
         turn["leg"] = leg.get("id")
         turn["place"] = leg.get("place")
     conv["draws"] = stream.n
@@ -5017,7 +5050,7 @@ def _line_draw(conv, stream, inputs, road, turn):
     rows = []
     for i, c in enumerate(cands[:200]):
         w = float(c.get("weight", 1.0) or 0)
-        rows.append({"id": str(c.get("id") or i), "label": str(c.get("text") or "")[:90], "base": w,
+        rows.append({"id": str(c.get("id") or i), "label": label_cut(c.get("text") or ""), "base": w,
                      "weight": max(0.0, w), "why": list(c.get("why") or [])})
     live = [r for r in rows if r["weight"] > 0] or rows
     draw = stream.next("LINE:item")
@@ -5072,7 +5105,7 @@ def plan_line(conv, config, inputs=None):
         step = {"id": leg.get("id"), "label": leg.get("label") or leg.get("id"),
                 "draws": leg.get("draws") or [{"family": "ES"}]}
         turn = _decide_turn(conv, config, conv["settings"], stream, step, seat, want, inputs)
-        turn["protocol"] = _legs_words(leg.get("act"), inputs)[:400]
+        turn["protocol"] = whole_cut(_legs_words(leg.get("act"), inputs), 400)
         turn["leg"] = leg.get("id")
         turn["place"] = leg.get("place")
     cands = _line_draw(conv, stream, inputs, road, conv["turns"][-1] if conv["turns"] else None)
@@ -5286,7 +5319,7 @@ def _row_work(turn, conv):
                  % json.dumps(topic["text"]))
     elif topic.get("text"):
         body += (". It puts them in mind of something off the operator's topics board, and they "
-                 "bring it up in their own words: %s" % json.dumps(sentence_cut(topic["text"], 300)))
+                 "bring it up in their own words: %s" % json.dumps(sentence_cut(topic["text"], 400)))
     return body.strip().rstrip(".") + "."
 
 
@@ -7103,7 +7136,7 @@ def summary(conv):
             "road": conv["identity"]["road_kind"], "mode": conv["mode"], "status": conv.get("status"),
             "created": conv.get("created"), "turns": len(conv["turns"]),
             "events": len(conv["decision_events"]), "seed": conv["seed"],
-            "revision": conv["identity"]["revision"], "topic": conv["subject"]["topic"][:120],
+            "revision": conv["identity"]["revision"], "topic": label_cut(conv["subject"]["topic"], 120),
             "verdict": val.get("verdict"), "score": val.get("score"),
             "shadow": (conv.get("comparison") or {}).get("seat_similarity"),
             "system2_slot_id": conv["identity"]["system2_slot_id"],

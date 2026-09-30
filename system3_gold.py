@@ -203,7 +203,7 @@ def decide(s3: Any, conv: dict[str, Any], config: dict[str, Any], turn: dict[str
                                       else "about something else", TOPIC_KEY, tw)]
             if fired:
                 why.append("fired %d time(s) before" % fired)
-            rows.append({"id": str(g["id"]), "label": " ".join(str(g["text"]).split())[:90],
+            rows.append({"id": str(g["id"]), "label": s3.label_cut(g["text"]),
                          "base": 1.0, "weight": round(max(0.0, w), 6), "why": why})
         if rows and sum(r["weight"] for r in rows) > 0:
             d2 = own.next("GOLD:item")
@@ -217,7 +217,7 @@ def decide(s3: Any, conv: dict[str, Any], config: dict[str, Any], turn: dict[str
     conv["gold_draws"] = own.n
     if picked is not None:
         sel = {"id": str(picked["id"]), "label": "rolled gold %d of %d: %s" % (k + 1, len(rows),
-                                                                               " ".join(str(picked["text"]).split())[:90]),
+                                                                               s3.label_cut(picked["text"])),
                "index": k + 1, "of": len(rows)}
     else:
         sel = {"id": "OWN" if not hit else "NONE",

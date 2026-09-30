@@ -216,8 +216,8 @@ def _exchange_of(ctx):
     """The operator's numbered exchange ("1. ... 2. ..." on the topic desk):
     the line a round opens on and the answer to it, both word for word."""
     ex = ctx.get("exchange") if isinstance(ctx.get("exchange"), dict) else {}
-    opener = " ".join(str(ex.get("opener") or "").split())[:400]
-    reply = " ".join(str(ex.get("reply") or "").split())[:400]
+    opener = system3.sentence_cut(ex.get("opener"), 400)
+    reply = system3.sentence_cut(ex.get("reply"), 400)
     return {"opener": opener, "reply": reply} if opener and reply else {}
 
 
@@ -483,7 +483,7 @@ class System3Runtime:
             station_odds = round(system3.clamp(odds), 4)
             row = self._find("CHANCE", key)
             if row is None:
-                self._queue_row("chance", key, {"id": key, "label": str(label or key)[:90], "text": str(label or key)[:300],
+                self._queue_row("chance", key, {"id": key, "label": system3.label_cut(label or key), "text": system3.label_cut(label or key),
                                                 "odds": station_odds, "dial": str(dial or ""), "weight": 1.0})
                 use, why = station_odds, "the station's own odds (the row is being added to STATION1)"
             elif row.get("enabled") is False:
@@ -494,7 +494,7 @@ class System3Runtime:
                 use, why = round(system3.clamp(row.get("odds", station_odds)), 4), "the desk's odds (STATION1)"
             d = self._roll_buffer()["stream"].next("CHANCE:" + key)
             hit = bool(d["u"] < use)
-            self._record_roll({"kind": "chance", "key": key, "label": str((row or {}).get("label") or label or key)[:90],
+            self._record_roll({"kind": "chance", "key": key, "label": system3.label_cut((row or {}).get("label") or label or key),
                                "odds": use, "u": d["u"], "dice": d["dice"], "hit": hit, "why": why})
             return hit
         except Exception as exc:  # noqa: BLE001
@@ -513,7 +513,7 @@ class System3Runtime:
             cat = self._find("POOL", key)
             if cat is None:
                 if opts:
-                    self._queue_row("pool", key, {"id": key, "label": str(label or key)[:90], "weight": 1.0,
+                    self._queue_row("pool", key, {"id": key, "label": system3.label_cut(label or key), "weight": 1.0,
                                                   "items": [{"id": "o%d" % i, "label": o[:60], "text": o, "weight": 1.0}
                                                             for i, o in enumerate(opts[:200])]})
                 return opts + self._pool_event_rows(key)         # [s3-live-event]
@@ -565,7 +565,7 @@ class System3Runtime:
             d = self._roll_buffer()["stream"].next("PICK:" + key)
             k = system3.pick_index(w, d["u"])
             k = k if 0 <= k < len(cands) else 0
-            rec = {"kind": "pick", "key": key, "label": str(cat.get("label") or label or key)[:90],
+            rec = {"kind": "pick", "key": key, "label": system3.label_cut(cat.get("label") or label or key),
                    "of": len(cands), "index": k + 1, "picked": cands[k][:160], "u": d["u"], "dice": d["dice"],
                    "candidates": [c[:80] for c in cands[:12]]}
             if media is not None:                                                # [s3-sfx-roll]
@@ -592,7 +592,7 @@ class System3Runtime:
         try:
             key = str(key)[:60]
             d = self._roll_buffer()["stream"].next("ROLL:" + key)
-            self._record_roll({"kind": "roll", "key": key, "label": str(label or key)[:90], "u": d["u"], "dice": d["dice"]})
+            self._record_roll({"kind": "roll", "key": key, "label": system3.label_cut(label or key), "u": d["u"], "dice": d["dice"]})
             return float(d["u"])
         except Exception as exc:  # noqa: BLE001
             self.fail("station roll", exc)
@@ -712,7 +712,7 @@ class System3Runtime:
             self._mgr_save(new)
             last = dict(res["events"][-1]["rng"])
             small = {"kind": "mgrtopic", "key": system3_mgrtopics.ROLL_KEY, "road": str(road or ""),
-                     "label": ("the manager's message: " + res["topic_text"])[:90],
+                     "label": system3.label_cut("the manager's message: " + res["topic_text"]),
                      "u": last["u"], "dice": last["dice"], "at": time.time(),
                      "picked": " / ".join(x for x in (res["topic_text"], (res.get("approach") or {}).get("id", ""),
                                                       (res.get("sub") or {}).get("text", "")) if x)[:160],
@@ -763,7 +763,7 @@ class System3Runtime:
                            "selected_index": r.get("index"), "of": r.get("of"), "candidates": [
                                {"id": str(i), "label": c, "base": 1.0, "weight": 1.0, "p": round(1.0 / max(1, r.get("of") or 1), 4),
                                 "why": []} for i, c in enumerate(r.get("candidates") or [])]}]
-                sel = {"id": str(r.get("index")), "label": "%s: %s" % (r["label"], str(r.get("picked") or "")[:90]),
+                sel = {"id": str(r.get("index")), "label": "%s: %s" % (r["label"], system3.label_cut(r.get("picked") or "")),
                        "key": r["key"], "index": r.get("index"), "of": r.get("of")}
             meta = {"key": r["key"], "road_roll": True,
                     "why": "the station road rolled this before the round was planned; "
@@ -931,7 +931,7 @@ class System3Runtime:
         favourites, drawn by the FAV roll, never stapled to a prompt; a
         thumbs-down (or a cleared vote) takes it out. Saved as a config
         version with a note, like any edit from the desk."""
-        words = " ".join(str(text or "").split())[:400]
+        words = system3.sentence_cut(text, 400)
         lid = str(line_id or "")
         key = self._norm_words(words)
         config = copy.deepcopy(self.config)
@@ -1006,11 +1006,11 @@ class System3Runtime:
                     continue
                 m = self._LIKED_NOTE.match(text)
                 if m:
-                    line = " ".join(m.group("line").split())[:400]
+                    line = system3.sentence_cut(m.group("line"), 400)
                     if any(self._norm_words(it.get("text")) == self._norm_words(line) for it in liked["items"]):
                         continue
                     liked["items"].append({"id": "fav_" + hashlib.sha1(self._norm_words(line).encode("utf-8")).hexdigest()[:10],
-                                           "label": line[:60], "text": line, "weight": 1.0,
+                                           "label": system3.label_cut(line), "text": line, "weight": 1.0,
                                            "seat": _SEAT_OF.get(who, ""), "who": who, "name": str(names.get(who) or ""),
                                            "line_id": str(row.get("liked_line") or ""), "at": float(row.get("at") or 0),
                                            "source": "the Mind desk's note book"})
@@ -1019,7 +1019,7 @@ class System3Runtime:
                     cat = cats[seat_cat[who]]
                     cat.setdefault("items", []).append({
                         "id": "dir_" + hashlib.sha1((who + text).encode("utf-8")).hexdigest()[:10],
-                        "label": text[:60], "text": text[:500], "weight": 1.0, "odds": 1.0, "until": 0, "airings": 0,
+                        "label": system3.label_cut(text), "text": system3.whole_cut(text, 500), "weight": 1.0, "odds": 1.0, "until": 0, "airings": 0,
                         "source": "the Mind desk's note book"})
                     done.append("directive (%s): %s" % (who, text[:40]))
                 else:
@@ -1615,7 +1615,7 @@ class System3Runtime:
         own = bool(ctx.get("own_material"))
         category = ("speakerbox" if seed_text else "internet_news" if news else
                     "own_material" if own else "angle" if angle else "free")
-        topic = (angle or seed_text or news)[:400]
+        topic = system3.whole_cut(angle or seed_text or news, 400)
         words = [w for w in re.findall(r"[a-z]{5,}", (angle + " " + seed_text[:600]).lower())
                  if w not in system3._STOP]
         keywords = [w for w, _ in collections.Counter(words).most_common(8)]
@@ -1664,7 +1664,7 @@ class System3Runtime:
             "subject": {"topic": topic, "category": category, "seeded": bool(seed_text),
                         "authority": "obligated" if (seed_text or angle or news or own or s2) else "free",
                         "sources": [x for x in [str(ctx.get("seed_file") or "")] if x],
-                        "keywords": keywords, "angle": angle[:300],
+                        "keywords": keywords, "angle": system3.whole_cut(angle, 300),
                         "exchange": _exchange_of(ctx)},
             "availability": availability,
             "material": material,                                             # [s3-material]
@@ -1675,7 +1675,7 @@ class System3Runtime:
             "seed_file": str(ctx.get("seed_file") or ""),
             # The seed passage itself, so an opened line can show which of
             # its words the opening turn read out (frontend composeLine).
-            "seed_text": " ".join(seed_text.split())[:1500],
+            "seed_text": system3.sentence_cut(seed_text, 1500),
             "topic_bank": topic_bank,
             "gold_bank": self._gold_bank(ctx, road),                          # [s3-gold:input]
             # [s3-calls] what a call needs to be built from System 3's structure
@@ -1820,7 +1820,7 @@ class System3Runtime:
                 who = str(row.get("who") or "")
                 text = " ".join(str(row.get("text") or "").split())
                 if who in ("dj", "host", "cohost", "third") and text:
-                    landing = {"who": who, "name": str(names.get(_SEAT_OF.get(who, ""), "") or who), "text": text[:400]}
+                    landing = {"who": who, "name": str(names.get(_SEAT_OF.get(who, ""), "") or who), "text": system3.whole_cut(text, 400)}
                     break
             tempers = [str(t.get("id")) for t in (conv.get("tempers") or {}).values() if t.get("id")]
             dyn = conv.get("dynamics") or {}
@@ -1978,7 +1978,7 @@ class System3Runtime:
                 return {"topic": topic[:400], "keywords": sorted(system3._memory_keywords(topic))[:12],
                         "at": float(carry.get("at") or 0), "road": str(carry.get("road") or ""),
                         "from": str(carry.get("from") or ""),
-                        "landing": " ".join(str(landing.get("text") or "").split())[:400],
+                        "landing": system3.sentence_cut(landing.get("text"), 400),
                         "landing_who": str(landing.get("name") or landing.get("who") or "")[:60],
                         "source": "System 3's record of the last round on air"}
         st = station if isinstance(station, dict) else {}
@@ -2047,7 +2047,7 @@ class System3Runtime:
         out = {}
         for kind, val in (got or {}).items():
             if isinstance(val, dict) and str(val.get("text") or "").strip():
-                out[str(kind)] = {"text": str(val["text"])[:1200], "label": str(val.get("label") or kind)[:80],
+                out[str(kind)] = {"text": system3.sentence_cut(val["text"], 1200), "label": system3.label_cut(val.get("label") or kind),
                                   "ref": str(val.get("ref") or "")[:160]}
         return out
 
@@ -2067,7 +2067,7 @@ class System3Runtime:
             except Exception:  # noqa: BLE001
                 clause = ""
         return {"name": name, "first": name.split()[0], "other": str(dj.get("cohost_name") or ""),
-                "topic": str(meta.get("topic") or "")[:400],
+                "topic": system3.whole_cut(meta.get("topic"), 400),
                 # [s3-cut] at a sentence end, never where a count fell
                 "speakerbox": system3.sentence_cut(str(meta.get("speakerbox_text") or ctx.get("seed_text") or ""), 600),
                 "story": bool(meta.get("story")), "scenario_clause": clause[:1500],
@@ -2234,7 +2234,7 @@ class System3Runtime:
             if not 12 <= len(text) <= 400:
                 continue
             out.append({"id": str(r["id"]), "text": text, "used": int(r.get("used") or 0),
-                        "reply": " ".join(str(r.get("reply") or "").split())[:400]})
+                        "reply": system3.sentence_cut(r.get("reply"), 400)})
         out.sort(key=lambda r: r["used"])
         return out[:60]
 
@@ -2464,11 +2464,11 @@ class System3Runtime:
                 "turns": 1, "target_seconds": 0.0, "words_per_turn": 40.0,
                 "schedule_occurrence_id": str(ctx.get("sid") or segment.get("id") or ""),   # [s3-segment]
                 "segment": segment,
-                "subject": {"topic": context[:400], "category": "own_material", "seeded": False,
+                "subject": {"topic": system3.whole_cut(context, 400), "category": "own_material", "seeded": False,
                             "authority": "obligated", "sources": [], "keywords": [], "angle": ""},
                 "availability": {}, "speakerbox_rates": {}, "bank": bool(ctx.get("bank")),
                 "candidates": cands, "candidates_from": str(ctx.get("candidates_from") or ""),
-                "line_text": " ".join(str(ctx.get("text") or "").split())[:600],
+                "line_text": system3.sentence_cut(ctx.get("text"), 600),
                 "sfxguy": {"voice": False},
                 **self.cast_inputs(),                                        # [s3-cast]
                 **self.memory_inputs(road, ctx, context),                    # [s3-memory]
@@ -3481,7 +3481,7 @@ class System3Runtime:
                         if not mat.get("text"):
                             continue
                         entry.setdefault("passage_source", []).append(
-                            {"file": mat["file"], "text": mat["text"][:600], "door": "system3:" + sb["mode"].lower()})
+                            {"file": mat["file"], "text": system3.whole_cut(mat["text"], 600), "door": "system3:" + sb["mode"].lower()})
                         if sb["mode"] in ("PREPEND", "APPEND", "FULL_SWATH") and t.get("script_index") is not None:
                             entry.setdefault("dealt", []).append(["system3", t["speaker"], mat["text"]])
                         try:
@@ -3495,7 +3495,7 @@ class System3Runtime:
             else:
                 mapping = system3.align(conv, turns)
                 conv["comparison"] = system3.compare_shadow(conv, turns)
-                conv["actual"] = [{"speaker": m, "text": str(x)[:600]} for m, x in turns]
+                conv["actual"] = [{"speaker": m, "text": system3.whole_cut(x, 600)} for m, x in turns]
                 # Which written line each planned turn lines up with, so the
                 # Script page can show a shadow plan beside the words that
                 # actually aired on that seat.
@@ -4115,7 +4115,7 @@ class System3Runtime:
                 s = summ.get(c["conversation_id"]) or {}
                 c.update({"road": s.get("road"), "mode": s.get("mode"), "status": s.get("status"),
                           "created": s.get("created"), "turns": s.get("turns"), "verdict": s.get("verdict"),
-                          "topic": str(s.get("topic") or "")[:120], "single": self._single(s.get("road")),
+                          "topic": system3.label_cut(s.get("topic") or "", 120), "single": self._single(s.get("road")),
                           "lines": len(c.get("line_ids") or []), "held": bool(s)})
                 c.pop("line_ids", None)
             r["rounds"] = sum(1 for c in r["conversations"] if c.get("held") and not c["single"])
@@ -4149,7 +4149,7 @@ class System3Runtime:
             turns.append(ct)
         out = {"conversation_id": ident.get("conversation_id"), "road": road, "mode": conv.get("mode"),
                "status": conv.get("status"), "created": conv.get("created"), "single": self._single(road),
-               "topic": str((conv.get("subject") or {}).get("topic") or "")[:240],
+               "topic": system3.label_cut((conv.get("subject") or {}).get("topic") or "", 240),
                "planned_in": ident.get("segment") or {}, "prepared_for": ident.get("system2_slot_id") or "",
                "bank": bool(inputs.get("bank")),
                "structure": {"id": st.get("id") or ("banter_cycle" if road == "banter" else road),
@@ -4304,7 +4304,7 @@ class System3Runtime:
             reel = [str(dice.get("selected") or "")]
         return {"family": ev.get("family"), "dice": draw.get("dice"), "event_id": ev.get("event_id"),   # [s3-dice]
                 "table": str(sel.get("table") or "")[:40],
-                "label": str(sel.get("label") or sel.get("id") or "")[:80],
+                "label": system3.label_cut(sel.get("label") or sel.get("id") or ""),
                 "category": str(sel.get("category_label") or "")[:60],
                 "index": (item or {}).get("selected_index"), "of": (item or {}).get("of"),
                 "reel": reel, "intensity": sel.get("intensity"),
@@ -4331,7 +4331,7 @@ class System3Runtime:
                                for sb in t.get("speakerbox") or [] if sb.get("mode") not in (None, "NONE")],
                 "sfx": {k: (t.get("sfx") or {}).get(k) for k in ("play", "placement", "intent")}}
         return {"conversation_id": conv["identity"]["conversation_id"], "mode": conv.get("mode"),
-                "road": conv["identity"].get("road_kind"), "topic": str(conv["subject"].get("topic") or "")[:160],
+                "road": conv["identity"].get("road_kind"), "topic": system3.label_cut(conv["subject"].get("topic") or "", 160),
                 "turns": turns}
 
     # [public-door] THE LISTENER DOOR'S CUT OF A ROUND. /api/system3/public/lines
@@ -4573,7 +4573,7 @@ class System3Runtime:
                 # [s3-carry] what the next live round starts from
                 "carry": ({"from": carry.get("from"), "road": carry.get("road"), "age": carry.get("age"),
                            "factor": carry.get("factor"), "seats": sorted((carry.get("seats") or {}).keys()),
-                           "landing": (carry.get("landing") or {}).get("text", "")[:120],
+                           "landing": system3.label_cut((carry.get("landing") or {}).get("text", "")),
                            "tempers": carry.get("tempers")} if carry else None),
                 "open_rounds": open_rounds,                                    # [s3-withhold]
                 "cast": self.cast_view(),                                       # [s3-cast]
