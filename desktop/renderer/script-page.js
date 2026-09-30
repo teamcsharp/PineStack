@@ -5278,6 +5278,19 @@
     ads: ['c:money', 'Ads'], products: ['c:box', 'Products']
   };
   var MV_SRC_ORDER = ['speakerbox', 'sfx', 'topic', 'memory', 'internet', 'manager', 'ads', 'products'];
+  var MV_SRC_RULE = {                             /* [src-popup] mvSources' own order of claims */
+    ads: 'the line sits in an ad break, and the road that sells always leads',
+    products: 'a hawk is selling a product on this line, so the product leads',
+    sfx: 'the line is a clip, so the SFX shelf leads',
+    internet: 'the subject was seeded by the news wire, so the Internet leads',
+    speakerbox: 'the subject was seeded by a Speakerbox passage, so the Speakerbox leads',
+    manager: 'this is the manager\'s road, so the manager leads'
+  };
+  var MV_CAT_SAY = {
+    speakerbox: 'a Speakerbox passage seeded it', internet_news: 'news headlines seeded it',
+    own_material: 'the show\'s own material seeded it', angle: 'an angle it was handed seeded it',
+    free: 'nothing seeded it - a free round'
+  };
   var MV_FAM = {CTS: '#8ac6ac', ES: '#f0a6ca', RS: '#87bfff', IRS: '#ffb86b', FL: '#c4a1ee',
     SPEAKERBOX: '#e7bf78', SFX: '#7fe0d6', TOPIC: '#9be15d', SFXGUY: '#ffd479', LINE: '#b8c4ff',
     MEMORY: '#d9c9a3', STATION: '#9aa9ab', GRAPH: '#9be15d',
@@ -6090,7 +6103,7 @@
       if (sb[i] && sb[i].hit && sb[i].material) got.speakerbox = String(sb[i].material.file || 'a passage');
     }
     if (item.kind === 'clip' || item.who === 'sfxguy' || row.sfx_roll || (turn && turn.sfx && turn.sfx.play)) got.sfx = 'a clip';
-    if (cat === 'angle' || cat === 'free' || cat === 'own_material' || subject.active_angle) got.topic = String(subject.active_angle || subject.topic || 'the topic').slice(0, 80);
+    if (cat === 'angle' || cat === 'free' || cat === 'own_material' || subject.active_angle) got.topic = String(subject.active_angle || subject.topic || 'the topic');
     if (cat === 'internet_news') got.internet = 'the news wire';
     for (i = 0; i < (decisions || []).length; i += 1) {
       var ev = decisions[i] || {};
@@ -6104,7 +6117,7 @@
     }
     if (item.round === 'manager' || row.kind === 'manager') got.manager = 'a message from upstairs';
     if (item.round === 'ad' || row.kind === 'ad' || row.ad_id) got.ads = 'the ad break';
-    if (row.product) got.products = String(row.product).slice(0, 80);
+    if (row.product) got.products = String(row.product);
     else if (got.ads && st.selling_now && (st.selling_now.kind === 'ad' || st.selling_now.kind === 'hawk')) {
       got.products = String(st.selling_now.title || 'the piece on sale');
     }
@@ -6120,12 +6133,17 @@
     else {
       for (i = 0; i < MV_SRC_ORDER.length; i += 1) if (got[MV_SRC_ORDER[i]]) { main = MV_SRC_ORDER[i]; break; }
     }
+    /* [src-popup] the rule that chose it, said the way the popup says it */
+    var rule = pref ? MV_SRC_RULE[pref]
+      : main ? 'no road claimed the line, so the first source that fed it leads, in the order '
+        + MV_SRC_ORDER.map(function (k) { return MV_SRC[k][1]; }).join(', ')
+        : 'nothing on the record fed this line';
     var others = [];
     for (i = 0; i < MV_SRC_ORDER.length; i += 1) {
       var k = MV_SRC_ORDER[i];
       if (got[k] && k !== main) others.push(k);
     }
-    return {main: main, others: others, why: got};
+    return {main: main, others: others, why: got, rule: rule, cat: cat, topic: String(subject.topic || '')};
   }
   /* [msgdb] WHERE A BUBBLE'S CONTENT WAS STORED - read off the record only
      (see edit_msgdb_script_page.py): the provenance tree, the feed row's own
@@ -6229,7 +6247,7 @@
       main: {dice: run ? run.dice : null, opts: ['the next rung', 'a gold run'], hit: run && run.hit ? 1 : 0,
         label: run && run.hit ? 'a gold run' : 'the next rung', of: 2},
       sub: {dice: pick.dice, opts: cands.length ? cands : [String(pick.picked || '')],
-        hit: Math.max(0, (Number(pick.index) || 1) - 1), label: String(pick.picked || '').slice(0, 80),
+        hit: Math.max(0, (Number(pick.index) || 1) - 1), label: String(pick.picked || ''),
         of: Number(pick.of) || cands.length}};
   }
   function mvBadge(cur, stores) {
@@ -7373,6 +7391,8 @@
       cur.acc.title = 'Main source: ' + MV_SRC[src.main][1] + ' - ' + String(src.why[src.main] || '')
         + (src.others.length ? '. Also fed by: ' + src.others.map(function (k) { return MV_SRC[k][1]; }).join(', ') : '');
       cur.acc.setAttribute('aria-label', cur.acc.title);
+      cur.acc.title += ' - tap for every source, how it got here and the rolls after';
+      mvSrcPopWire(cur.acc, src, rows);          /* [src-popup] */
     }
     /* joined late (the line is well under way): land everything now */
     var f = mvProgress(cur.item);
@@ -7903,6 +7923,104 @@
     box.appendChild(make('h4', '', 'What came after it'));
     box.appendChild(after.length ? mvRrPopTable(['roll', 'landed', 'd100', 'of'], after)
       : make('p', 'sp-rrp-none', 'Nothing - this was the last roll on the card.'));
+    var close = function () { back.remove(); document.removeEventListener('keydown', esc, true); };
+    var esc = function (ev) { if (ev.key === 'Escape') close(); };
+    shut.addEventListener('click', function (ev) { ev.stopPropagation(); close(); });
+    back.addEventListener('click', function (ev) { if (ev.target === back) close(); });
+    box.addEventListener('click', function (ev) { ev.stopPropagation(); });
+    document.addEventListener('keydown', esc, true);
+    back.appendChild(box);
+    document.body.appendChild(back);
+  }
+
+  /* [src-popup] "If I tap on this, bring up a window showing me all of the
+   * options available for this and how it came to this one and show me what
+   * options were selected for this and the subsequent roulette rolls that
+   * happened afterwards." The source badge is not a roll: mvSources reads it
+   * off the record (the subject's category, the turn's decisions, the feed
+   * row) and a fixed order of claims picks the main one. So the window says
+   * exactly that - every source and what fed it, the subject's seed (itself
+   * fixed by what the round was handed, not rolled), the claim that won, what
+   * was selected, and the card's rolls in the order they came, each opening
+   * its own roulette. */
+  function mvSrcPopWire(el, src, rows) {
+    if (!el || !src || !src.main) return;
+    el.__srcPop = {src: src, rows: rows || []};
+    if (el.__srcWired) return;
+    el.__srcWired = true;
+    el.classList.add('sp-rr-pickable');
+    el.setAttribute('role', 'button');
+    el.setAttribute('tabindex', '0');
+    var go = function (ev) {
+      if (ev) { ev.stopPropagation(); ev.preventDefault(); }
+      if (el.__srcPop) mvSrcPopOpen(el.__srcPop.src, el.__srcPop.rows);
+    };
+    el.addEventListener('click', go);
+    el.addEventListener('keydown', function (ev) { if (ev.key === 'Enter' || ev.key === ' ') go(ev); });
+  }
+  function mvSrcPopOpen(src, rows) {
+    var old = document.getElementById('spRrPop');
+    if (old) old.remove();
+    var name = function (k) { return (MV_SRC[k] && MV_SRC[k][1]) || k; };
+    var back = make('div', 'sp-rrp-back');
+    back.id = 'spRrPop';
+    var box = make('section', 'sp-rrp');
+    box.setAttribute('role', 'dialog');
+    box.setAttribute('aria-label', 'Source: ' + name(src.main));
+    var head = make('div', 'sp-rrp-head');
+    head.appendChild(make('b', '', 'SOURCE'));
+    head.appendChild(make('span', 'sp-rrp-landed', 'landed on ' + name(src.main)));
+    var shut = make('button', 'sp-rrp-x', '\u2715');
+    shut.type = 'button';
+    shut.title = 'Close';
+    shut.setAttribute('aria-label', 'Close');
+    head.appendChild(shut);
+    box.appendChild(head);
+    var why = src.why || {};
+    /* 1. every source there is */
+    box.appendChild(make('h4', '', 'Every source this line could have come from (' + MV_SRC_ORDER.length + ')'));
+    box.appendChild(mvRrPopTable(['#', 'source', '', 'what fed it', ''], MV_SRC_ORDER.map(function (k, n) {
+      var row = [n + 1, name(k), why[k] ? 'fed it' : '-', why[k] || '', k === src.main ? 'MAIN' : ''];
+      row.cls = k === src.main ? 'sp-rrp-hit' : why[k] ? '' : 'sp-rrp-off';
+      return row;
+    })));
+    /* 2. how it came to this one */
+    box.appendChild(make('h4', '', 'How it came to this one'));
+    box.appendChild(make('p', 'sp-rrp-p', 'The subject: ' + (MV_CAT_SAY[src.cat] || 'no subject was on the record')
+      + (src.topic ? ' - "' + src.topic + '"' : '') + '. That is fixed by what the round was handed, in this order: '
+      + 'a Speakerbox passage, then news headlines, then the show\'s own material, then an angle. It is not rolled.'));
+    box.appendChild(make('p', 'sp-rrp-p', 'The main source: ' + String(src.rule || 'the first source that fed it') + '.'));
+    /* 3. what was selected */
+    box.appendChild(make('h4', '', 'What was selected'));
+    var picked = [src.main].concat(src.others || []).map(function (k) {
+      var row = [name(k), why[k] || '', k === src.main ? 'MAIN' : 'also fed it'];
+      row.cls = k === src.main ? 'sp-rrp-hit' : '';
+      return row;
+    });
+    box.appendChild(mvRrPopTable(['source', 'what', ''], picked));
+    /* 4. the rolls on this card, in the order they came */
+    box.appendChild(make('h4', '', 'The rolls on this card, in order'));
+    var chain = mvRrChain(rows || []);
+    if (chain.length) {
+      var t = mvRrPopTable(['roll', 'landed', 'd100', 'of'], chain.map(function (c) {
+        var x = (c.which === 'sub' ? c.r.sub : c.r.main) || {};
+        var row = [mvRrStepName(c.r, c.which), x.label || '-', x.dice != null ? x.dice : '-',
+          x.of ? ((Number(x.hit) || 0) + 1) + ' of ' + x.of : ''];
+        row.cls = 'sp-rrp-go';
+        row.title = 'Every entry of this roll, and what led up to it and came after';
+        return row;
+      }));
+      [].slice.call(t.querySelectorAll('tr.sp-rrp-go')).forEach(function (tr, k) {
+        tr.addEventListener('click', function (ev) {
+          ev.stopPropagation();
+          close();
+          mvRrPopOpen(rows, chain[k].i, chain[k].which);
+        });
+      });
+      box.appendChild(t);
+    } else {
+      box.appendChild(make('p', 'sp-rrp-none', 'No roll was recorded on this card.'));
+    }
     var close = function () { back.remove(); document.removeEventListener('keydown', esc, true); };
     var esc = function (ev) { if (ev.key === 'Escape') close(); };
     shut.addEventListener('click', function (ev) { ev.stopPropagation(); close(); });
