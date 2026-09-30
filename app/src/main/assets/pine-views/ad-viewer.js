@@ -62,7 +62,65 @@
     one('dialogue kind', rolls.speak_lean); one('line said on air', rolls.speak_line);
     one('speakerbox document', rolls.speak_doc); one('sentences to take', rolls.speak_count);
     one('sentences', rolls.speak_sentences); one('forced line', rolls.speak_forced);
+    /* [h3-slot-roll] a {speakerbox} or {a|b|c} in the prompt: the document, the sentence, the option */
+    one('{speakerbox} document', rolls.slot_doc); one('{speakerbox} sentence', rolls.slot_sentence);
+    one('{choice}', rolls.slot_choice);
     return bits.join('  -  ');
+  }
+  /* [h3-slot-roll] "I want to see a rolodex roll for the doc and then the
+     sentence used" (the operator): each slot roll the hour recorded with its
+     options spins through them and stops on what landed, one after another. */
+  function slotReels(rolls) {
+    if (!rolls || typeof rolls !== 'object') return [];
+    var out = [];
+    [['slot_doc', '{speakerbox} - the document'], ['slot_sentence', '{speakerbox} - the sentence'],
+     ['slot_choice', '{choice} - the option']].forEach(function (k) {
+      var r = rolls[k[0]];
+      if (!r || !r.picked || !Array.isArray(r.opts) || !r.opts.length) return;
+      out.push({name: k[1], picked: String(r.picked), opts: r.opts.map(String), dice: r.dice,
+        index: r.index, of: r.of});
+    });
+    return out;
+  }
+  function roloStyle() {
+    if (document.getElementById('pavRoloStyle')) return;
+    var st = document.createElement('style');
+    st.id = 'pavRoloStyle';
+    st.textContent = '.pav-rolo{display:flex;flex-direction:column;gap:10px;margin:4px 0 2px}'
+      + '.pav-rolo-name{display:block;font-size:11.5px;color:#8ea0ad;margin-bottom:3px}'
+      + '.pav-rolo-win{height:30px;overflow:hidden;border:1px solid #35505c;border-radius:6px;background:#081013;'
+      + 'position:relative;box-shadow:inset 0 8px 8px -8px #000,inset 0 -8px 8px -8px #000}'
+      + '.pav-rolo-card{height:30px;line-height:30px;padding:0 10px;white-space:nowrap;overflow:hidden;'
+      + 'text-overflow:ellipsis;color:#b9c6ce;font-size:12.5px}'
+      + '.pav-rolo-card.hit{color:#edf3f5;font-weight:600;background:rgba(101,199,218,.16)}'
+      + '.pav-rolo-picked{margin:4px 0 0;font-size:12.5px;color:#edf3f5;opacity:0;transition:opacity .4s}'
+      + '.pav-rolo-picked.on{opacity:1}';
+    document.head.appendChild(st);
+  }
+  function rolodex(reels) {
+    roloStyle();
+    var box = make('div', 'pav-rolo'), H = 30, SPIN = 1600, GAP = 400;
+    reels.forEach(function (r, n) {
+      var row = make('div', 'pav-rolo-row');
+      row.appendChild(make('span', 'pav-rolo-name', r.name + (r.dice != null ? ' - d100 ' + r.dice : '')
+        + (r.index != null && r.of != null ? ', ' + r.index + ' of ' + r.of : '')));
+      var opts = r.opts.slice(), at = opts.indexOf(r.picked);
+      if (at < 0) { opts.push(r.picked); at = opts.length - 1; }
+      var list = opts.length > 1 ? opts.concat(opts) : opts, land = opts.length > 1 ? opts.length + at : at;
+      var win = make('div', 'pav-rolo-win'), strip = make('div', 'pav-rolo-strip');
+      list.forEach(function (o, i) { strip.appendChild(make('div', 'pav-rolo-card' + (i === land ? ' hit' : ''), o)); });
+      win.appendChild(strip);
+      row.appendChild(win);
+      var picked = make('p', 'pav-rolo-picked', r.picked);
+      row.appendChild(picked);
+      box.appendChild(row);
+      root.setTimeout(function () {
+        strip.style.transition = 'transform ' + SPIN + 'ms cubic-bezier(.12,.7,.18,1)';
+        strip.style.transform = 'translateY(' + (-land * H) + 'px)';
+        root.setTimeout(function () { picked.classList.add('on'); }, SPIN);
+      }, 120 + n * (SPIN + GAP));
+    });
+    return box;
   }
   function usedSpeak(sp) {
     /* [h3-speak] the H3SPEAK node's record: rolled from a line a person was
@@ -103,6 +161,9 @@
       add('Audio direction', rec.audio_direction, 'audio_direction');
       add('Constraints', rec.constraints, 'constraints');
       add('Hourly rolls', usedRolls(rec.rolls), 'rolls');   /* [s3-visuals] the door's dice, when they rolled */
+      var reels = slotReels(rec.rolls);                     /* [h3-slot-roll] the slots' rolodex */
+      if (reels.length) items.push({label: 'Rolled slots', key: 'slots', reels: reels,
+        text: reels.map(function (r) { return r.name + ': ' + r.picked; }).join('\n')});
       add('Dialogue (H3SPEAK)', usedSpeak(rec.speak), 'speak');   /* [h3-speak] where the words came from */
       add('Final H3 prompt', row.tags, 'tags');
       var name = rec.preset && rec.preset.name ? String(rec.preset.name) : 'a preset';
@@ -760,7 +821,9 @@
             function () { usedSay('Could not copy - select the words instead.'); });
         });
         label.append(make('span', '', item.label), copy);
-        cell.append(label, make('pre', 'pav-used-text', item.text)); usedBody.appendChild(cell);
+        if (item.reels) cell.append(label, rolodex(item.reels));   /* [h3-slot-roll] */
+        else cell.append(label, make('pre', 'pav-used-text', item.text));
+        usedBody.appendChild(cell);
       });
       if (w.reusable && usedRow && usedRow.prompt_id) {
         var pid = usedRow.prompt_id, acts = make('div', 'pav-used-actions'), naming = make('div', 'pav-used-name');
