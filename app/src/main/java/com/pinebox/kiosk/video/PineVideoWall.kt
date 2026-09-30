@@ -1,17 +1,20 @@
 package com.pinebox.kiosk.video
 
 import android.content.Context
+import android.graphics.Color
 import android.media.AudioManager
 import android.media.audiofx.LoudnessEnhancer
 import android.net.Uri
 import android.os.Looper
 import android.util.Log
+import android.view.Gravity
 import android.view.SurfaceView
 import android.view.View
 import android.widget.FrameLayout
 import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
+import androidx.media3.common.VideoSize
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.DefaultLoadControl   // [#1212]
@@ -217,7 +220,8 @@ class PineVideoWall(
     }
 
     init {
-        addView(screen, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT))
+        addView(screen, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT, Gravity.CENTER))
+        setBackgroundColor(Color.BLACK)                           // [fit-video] the borders
         /* The activity observes taps before dispatch. The wall itself must
          * never own input: a missing box can legitimately make it full-screen,
          * and consuming that surface strands the operator outside the panel. */
@@ -793,6 +797,40 @@ class PineVideoWall(
 
     // -------------------------------------------------------- the player
 
+    /* [fit-video] 2026-09-30, the operator: "if a video is outside of the aspect
+     * ratio of the video window, then scale it down to fit it one to one so it
+     * stays, but it just has black borders. All videos needs to be
+     * proportionally scaled to fit the pip." The surface filled the window
+     * (MATCH_PARENT), so a tall phone clip was stretched wide. Now the surface
+     * is the largest box of the clip's own shape that fits the window,
+     * centred; the wall behind it is black, so the rest reads as borders.
+     * 0 = not known yet: fill, as before. Main thread only. */
+    @Volatile private var videoAspect = 0f
+
+    private fun fitScreen() {
+        val w = width
+        val h = height
+        if (w <= 0 || h <= 0) return
+        val lp = screen.layoutParams as? LayoutParams ?: return
+        var sw = LayoutParams.MATCH_PARENT
+        var sh = LayoutParams.MATCH_PARENT
+        val a = videoAspect
+        if (a > 0f) {
+            if (w.toFloat() / h > a) { sh = h; sw = (h * a).roundToInt().coerceIn(1, w) }
+            else { sw = w; sh = (w / a).roundToInt().coerceIn(1, h) }
+        }
+        if (lp.width == sw && lp.height == sh && lp.gravity == Gravity.CENTER) return
+        lp.width = sw
+        lp.height = sh
+        lp.gravity = Gravity.CENTER
+        screen.layoutParams = lp
+    }
+
+    override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
+        super.onSizeChanged(w, h, oldw, oldh)
+        post { fitScreen() }                                  // [fit-video] a new box, the same shape
+    }
+
     /** Everything ExoPlayer is told must be told on the main thread. */
     private fun onMain(work: () -> Unit) {
         if (Looper.myLooper() == Looper.getMainLooper()) work() else post(work)
@@ -849,6 +887,13 @@ class PineVideoWall(
             override fun onPlaybackStateChanged(state: Int) {
                 playback = stateName(state)  // #1440
                 Log.i(TAG, "state ${stateName(state)} at item ${p.currentMediaItemIndex} of ${p.mediaItemCount}")
+            }
+
+            /* [fit-video] every clip keeps its own shape inside the window */
+            override fun onVideoSizeChanged(videoSize: VideoSize) {
+                if (videoSize.width <= 0 || videoSize.height <= 0) return
+                videoAspect = videoSize.width * videoSize.pixelWidthHeightRatio / videoSize.height
+                onMain { fitScreen() }
             }
 
             /* [sfxseen] fired per stream change: a frame of THIS item was drawn */
