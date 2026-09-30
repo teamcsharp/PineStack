@@ -148682,6 +148682,132 @@ async def pinecam_export_api(
         return {"ok": False, "say": "could not export it: %s" % str(exc)[:160]}
 
 
+# [cam-files] File management's Pine Cam videos: what they hold on the Spark,
+# a delete, and a cache clear. The cache is only what the footage can make
+# again - thumbnails, re-encoded copies, window cuts - never the footage, the
+# kept clips, an album cut, or a pinned H3 reference (h3_*).
+def pinecam_cache_files() -> list[Path]:
+    out: list[Path] = []
+    for folder, keep in ((PINECAM_THUMBS, lambda n: True),
+                         (PINECAM_EXPORTS, lambda n: not n.startswith("h3_")),
+                         (PINELINK_CUTS, lambda n: n.startswith(("cut_", "list_")))):
+        try:
+            out.extend(p for p in folder.iterdir() if p.is_file() and keep(p.name))
+        except OSError:
+            pass
+    return out
+
+
+def pinecam_storage() -> dict[str, Any]:
+    def tally(paths: list[Path]) -> dict[str, int]:
+        n = size = 0
+        for p in paths:
+            try:
+                size += p.stat().st_size
+                n += 1
+            except OSError:
+                pass
+        return {"files": n, "bytes": size}
+
+    try:
+        clips = [p for p in pinelink_clips_dir().glob("*.mp4") if p.is_file()]
+    except OSError:
+        clips = []
+    try:
+        albums = [p for p in PINELINK_CUTS.glob("album_*.mp4") if p.is_file()]
+    except OSError:
+        albums = []
+    rows = {"footage": tally([p for p in clips if _PINECAM_SEGMENT.match(p.name)]),
+            "kept": tally([p for p in clips if not _PINECAM_SEGMENT.match(p.name)]),
+            "album": tally(albums),
+            "cache": tally(pinecam_cache_files())}
+    return {"ok": True, **rows,
+            "files": sum(r["files"] for r in rows.values()),
+            "bytes": sum(r["bytes"] for r in rows.values()),
+            "dest": pinecam_export_dest(), "clips_host": share_path_of(pinelink_clips_dir())}
+
+
+def pinecam_delete(names: list[str]) -> dict[str, Any]:
+    clips = pinelink_clips_dir()
+    try:
+        newest = max((p for p in clips.glob("*.mp4") if _PINECAM_SEGMENT.match(p.name)),
+                     key=_pinecam_at, default=None)
+    except OSError:
+        newest = None
+    gone: list[str] = []
+    refused: list[dict[str, str]] = []
+    freed = 0
+    for name in names[:500]:
+        p = pinecam_path_of(name)
+        if p is None:
+            refused.append({"name": name, "why": "no longer kept"})
+            continue
+        if newest is not None and p == newest and time.time() - p.stat().st_mtime < 30:
+            refused.append({"name": name, "why": "still being recorded"})
+            continue
+        try:
+            size = p.stat().st_size
+            p.unlink()
+        except OSError as exc:
+            refused.append({"name": name, "why": str(exc)[:120]})
+            continue
+        freed += size
+        gone.append(name)
+        try:
+            (PINECAM_THUMBS / (p.stem + ".jpg")).unlink()
+        except OSError:
+            pass
+    _PINELINK_CENSUS["at"] = 0.0
+    say = "deleted %d video%s (%.1f MB)" % (len(gone), "" if len(gone) == 1 else "s", freed / 1e6)
+    if refused:
+        say += "; kept %d: %s" % (len(refused), refused[0]["why"])
+    if gone:
+        note_action("Pine Cam: " + say + " [cam-files]")
+    return {"ok": bool(gone) or not refused, "deleted": gone, "refused": refused,
+            "bytes": freed, "say": say}
+
+
+def pinecam_clear_cache() -> dict[str, Any]:
+    n = freed = 0
+    for p in pinecam_cache_files():
+        try:
+            size = p.stat().st_size
+            p.unlink()
+        except OSError:
+            continue
+        n += 1
+        freed += size
+    say = "cleared the Pine Cam cache: %d file%s, %.1f MB" % (n, "" if n == 1 else "s", freed / 1e6)
+    note_action(say + " [cam-files]")
+    return {"ok": True, "files": n, "bytes": freed, "say": say}
+
+
+@app.get("/api/pinecam/storage")
+async def pinecam_storage_api(authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    require_read_auth(authorization)
+    return await asyncio.to_thread(pinecam_storage)
+
+
+@app.post("/api/pinecam/delete")
+async def pinecam_delete_api(request: Request,
+                             authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    require_auth(authorization)
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        body = {}
+    names = [str(n) for n in ((body or {}).get("names") or []) if n]
+    if not names:
+        return {"ok": False, "say": "name the videos to delete"}
+    return await asyncio.to_thread(pinecam_delete, names)
+
+
+@app.post("/api/pinecam/clear-cache")
+async def pinecam_clear_cache_api(authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    require_auth(authorization)
+    return await asyncio.to_thread(pinecam_clear_cache)
+
+
 @app.get("/api/pinecam/file/{name}")
 async def pinecam_file_api(name: str, authorization: str | None = Header(default=None)) -> Response:
     """[h3-anyfootage] any recording by name (kept, cut, export, screen), seekable."""
@@ -163084,6 +163210,59 @@ def _screen_export_minutes(seconds: float) -> str:
     return "%d seconds" % s if s < 120 else "%.1f minutes" % (s / 60.0)
 
 
+def export_cam_request(cmd: dict[str, Any]) -> str:
+    """[cam-export] "export the last X minutes of the pine cam": the window cut
+    out of the footage the link keeps (the record button's own cut), in the
+    recordings preset, carried to PineBoxRecordings\\PineCam like the
+    Recordings tab's export. The cut runs behind the reply (#1153 pattern)."""
+    asked = int(cmd.get("seconds") or 60)
+    want = int(max(10, min(asked, PINELINK_CUT_MOST)))
+    hi = time.time()
+    try:
+        newest = max((p.stat().st_mtime for p in pinelink_clips_dir().glob("*.mp4")
+                      if _PINECAM_SEGMENT.match(p.name)), default=0.0)
+    except Exception:  # noqa: BLE001
+        newest = 0.0
+    if not newest:
+        return "The Pine Cam has no footage kept, so there is nothing to export."
+    stale = hi - newest
+    if stale > 120:                       # the camera stopped: its last minutes
+        hi = newest
+    mins = _screen_export_minutes(want)
+    name = "pinecam-last-%s-%s.mp4" % (("%dmin" % (want // 60)) if want % 60 == 0 else ("%ds" % want),
+                                       time.strftime("%Y%m%d-%H%M%S"))
+    dest = pinecam_export_dest()
+
+    async def _go() -> None:
+        try:
+            got = await asyncio.to_thread(pinelink_cut_span, hi - want, hi)
+            if not got.get("ok"):
+                note_action("the Pine Cam export did not finish: %s" % (got.get("say") or "no reason given"))
+                return
+            path = await asyncio.to_thread(pinecam_encode, PINELINK_CUTS / got["name"])
+            if dest:
+                await asyncio.to_thread(courier_add, path, dest, "pinecam", name=name)
+                note_action("exported %s of the Pine Cam as %s - the desk carries it to %s" % (mins, name, dest))
+            else:
+                note_action("exported %s of the Pine Cam - no export folder, kept as %s" % (mins, path.name))
+        except Exception as exc:  # noqa: BLE001
+            note_action("the Pine Cam export did not finish: %s" % str(exc)[:160])
+
+    fire_and_forget(_go())
+    pipeline_log("air", "spoken: export the last %ss of the Pine Cam (%s)" % (want, name))
+    words = "Exporting the last %s of the Pine Cam's footage. " % mins
+    if asked > want:
+        words += "A cut holds at most %s, so that is what it will take. " % _screen_export_minutes(PINELINK_CUT_MOST)
+    if stale > 120:
+        words += ("The camera stopped recording %d minutes ago, so it is the last %s before that. "
+                  % (int(stale // 60), mins))
+    if dest:
+        words += "The Pine Box desk carries it to %s as %s." % (dest, name)
+    else:
+        words += "No export folder is set, so it stays with the Pine Cam's cuts."
+    return words
+
+
 def export_screen_request(cmd: dict[str, Any]) -> str:
     target = "app" if cmd.get("screen") == "app" else "tab"
     asked = int(cmd.get("seconds") or 60)
@@ -163835,6 +164014,8 @@ async def export_command_run(cmd: dict[str, Any],
                              settings: dict[str, Any]) -> str:
     """#1025: act on parse_export_command's verdict and return what the
     box SAYS. The cut runs behind the reply (#1153 pattern)."""
+    if cmd.get("screen") == "cam":                           # [cam-export]
+        return export_cam_request(cmd)
     if cmd.get("screen"):                                    # [screen-export]
         return export_screen_request(cmd)
     if cmd.get("dir"):
@@ -200549,6 +200730,7 @@ def export_number(words: str) -> float | None:
 _EXPORT_SCREEN_RX = re.compile(
     r"\b(?:of|from|on|off)\s+(?:the\s+|my\s+|this\s+)?(?P<t>"
     r"pine\s*ta[bp](?:let)?|pineta[bp]|tablet|"   # [screen-export-claim] "tap": the Nabu's ear
+    r"pine\s*(?:cam(?:era)?|can)|pinecam|camera|cam|"   # [cam-export] the Pine Cam's footage
     r"(?:visual|video|picture)\s+(?:broadcast|show|radio|air)|"
     r"broadcast(?:'?s)?\s+(?:video|picture|visuals?)|"
     r"pine\s*(?:box\s+)?app|pinebox\s+app|desk(?:top)?(?:\s+app)?)"
@@ -200561,6 +200743,8 @@ def export_screen_target(lowered: str) -> str:
     if not got:
         return ""
     said = got.group("t")
+    if re.search(r"cam|\bcan\b", said):                  # [cam-export]
+        return "cam"
     return "app" if re.search(r"\bapp\b|desk", said) else "tab"
 
 

@@ -42,6 +42,16 @@ class ScreenOrders(unittest.TestCase):
         self.assertEqual(parse("Export the last minute of the Pine Tap broadcast."), {"seconds": 60, "screen": "tab"})
         self.assertEqual(parse("export the last 5 minutes of pinetap"), {"seconds": 300, "screen": "tab"})
 
+    def test_the_pine_cam(self):
+        # [cam-export] "... of the pine cam" was an audio talk cut
+        for said in ("export the last 5 minutes of the pine cam",
+                     "Export the last five minutes of the PineCam.",
+                     "export the last 5 minutes of the camera",
+                     "export the last 5 minutes of the pine cam footage",
+                     "export the last 5 minutes of the pine can"):
+            self.assertEqual(parse(said), {"seconds": 300, "screen": "cam"}, said)
+        self.assertEqual(parse("export the last 5 minutes of the pine tab"), {"seconds": 300, "screen": "tab"})
+
     def test_the_pine_app(self):
         self.assertEqual(parse("export the last 3 minutes of the pine app"), {"seconds": 180, "screen": "app"})
         self.assertEqual(parse("export the last five minutes of the pine box app"), {"seconds": 300, "screen": "app"})
@@ -70,6 +80,11 @@ class TheRoad(unittest.TestCase):
         self.assertIn("try { screenExportWatch(state); }", SRC)
         self.assertIn("desk.replayExport({seconds: claim.seconds, upload: true, name: claim.name})", SRC)
         self.assertIn('if cmd.get("screen"):', SRC)
+
+    def test_the_cam_order_has_its_own_runner(self):
+        self.assertIn('if cmd.get("screen") == "cam":', SRC)
+        self.assertIn("def export_cam_request(cmd: dict[str, Any]) -> str:", SRC)
+        self.assertIn('courier_add, path, dest, "pinecam", name=name', SRC)
 
     def test_the_claim_and_the_report_are_posts(self):
         # [screen-export-claim] the main panel's api(path, options) takes fetch
