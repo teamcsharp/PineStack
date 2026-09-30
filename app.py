@@ -107555,6 +107555,23 @@ def caller_voice_for(name: str, taken: set[str],
         # caller we have not heard before takes the least-aired voice in the
         # library — so a voice you added five minutes ago is the very next
         # one out of the phone.
+        # [call-voice-roll] "roll every call but keep it on the same model.
+        # Dont switch engines without me doing it manually": the roulette is
+        # every voice of the engine the operator set - and only those.
+        try:
+            _set = host_clone_engine()
+            _same = [v for v in usable if _engine_now(voice_meta(v) or {}) == _set]
+        except Exception:  # noqa: BLE001
+            _set, _same = "", list(usable)
+        if _same:
+            _air = voice_airtime()
+            _w = [1.0 / (1.0 + float((_air.get(v) or {}).get("airings") or 0)) for v in _same]
+            _i = s3_weighted("call.voice_model", _same, _w,
+                             "which voice model of the %s engine this caller rings in with (every call; "
+                             "the least-aired weigh most)" % (_set or "set"))
+            pick = _same[int(_i)] if 0 <= int(_i) < len(_same) else _same[0]
+            _caller_voice_remember(name, pick)
+            return pick
         book = _caller_voice_book()
         held = book.get(name)
         if held and held in usable:
