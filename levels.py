@@ -116,7 +116,10 @@ def adopt(path: Path, values: Any, by: str = "") -> dict[str, Any]:
                           "by": ("seeded by " + str(by or "a surface"))[:60]})
             return dict(state(path), seeded=True, lowered=[])
         lv = dict(cur["levels"])
-        lowered = [k for k, v in have.items() if v < lv.get(k, NEUTRAL) - 1e-6]
+        # the MASTER is never pulled down by a surface joining: a screen muted on its
+        # own (the desk's app volume at 0) is that screen's, not the station's -
+        # measured 2026-09-30: the desk seeded master 0 and every screen went quiet
+        lowered = [k for k, v in have.items() if k != "master" and v < lv.get(k, NEUTRAL) - 1e-6]
         for k in lowered:
             lv[k] = have[k]
         if lowered:

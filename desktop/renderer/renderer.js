@@ -266,32 +266,7 @@ function desktopVoiceGain() {
   return Math.max(0, Math.min(1, appVolume * share));
 }
 
-/* [levels-one] THE DESK'S APP VOLUME IS THE STATION'S MASTER. The bus folds
- * the master into every level it hands this shell (mixerLevels), so the old
- * app-volume factor stays at 1 and the slider shows - and moves - the master. */
-function deskMasterBus() {
-  const bus = window.pineLevels;
-  return bus && typeof bus.apply === "function" && bus.CEIL && bus.CEIL.master !== undefined ? bus : null;
-}
-function deskMasterPaint(v) {
-  const slider = $("appVolume");
-  const label = $("appVolumeValue");
-  const pct = Math.round(Math.max(0, Math.min(1, Number(v))) * 100);
-  if (slider && document.activeElement !== slider && Number(slider.value) !== pct) slider.value = String(pct);
-  if (label) label.textContent = `${pct}%`;
-}
 function setAppVolume(value, persist = true) {
-  const bus = deskMasterBus();
-  if (bus) {
-    const want = Math.max(0, Math.min(1, Number(value)));
-    if (persist && Number.isFinite(want)) bus.apply("master", want);
-    appVolume = 1;
-    deskMasterPaint(Number(bus.get().master));
-    const player = $("desktopRadioPlayer");
-    if (player) { player.volume = desktopMusicGain(); player.muted = desktopMusicGain() <= 0; }
-    applyAppVolume();
-    return;
-  }
   const raw = Number(value);
   appVolume = Math.max(0, Math.min(1, Number.isFinite(raw) ? raw : 0.35));
   const player = $("desktopRadioPlayer");
@@ -959,22 +934,6 @@ function applyAppVolume() {
 function initAppVolume() {
   const savedRaw = localStorage.getItem("pineDesktopAppVolume");
   const saved = savedRaw === null ? 0.35 : Number(savedRaw);
-  /* [levels-one] joining the one set: this desk's own app volume is the master
-   * it brings (the station keeps the quieter, so nothing gets louder), and from
-   * then on the slider is the station's master. */
-  const join = (tries) => {
-    const bus = deskMasterBus();
-    if (!bus) {                         /* audio-law.js loads after this file: wait for it */
-      if (tries > 0) setTimeout(() => join(tries - 1), 250);
-      return;
-    }
-    let adopted = false;
-    try { adopted = localStorage.getItem("pineLevelsAdopted") === "1"; } catch (err) { adopted = false; }
-    if (!adopted && Number.isFinite(saved)) bus.applyAll({master: Math.max(0, Math.min(1, saved))}, {quiet: true});
-    if (typeof bus.onApply === "function") bus.onApply((m) => deskMasterPaint(m && m.master));
-    setAppVolume(Number.isFinite(saved) ? saved : 0.35, false);
-  };
-  join(40);
   setAppVolume(Number.isFinite(saved) ? saved : 0.35, false);
   const player = $("desktopRadioPlayer");
   if (player) {
@@ -996,8 +955,7 @@ function initAppVolume() {
       if (Math.abs(player.volume - want) > 0.01) {
         const share = (streamVolumes && streamVolumes.music > 0)
           ? streamVolumes.music : 1;
-        if (deskMasterBus()) { const m = Number(deskMasterBus().get().master) || 1; deskMasterBus().apply("master", Math.min(1, m * player.volume / Math.max(0.01, desktopMusicGain()))); }   /* [levels-one] */
-        else setAppVolume(player.volume / share);
+        setAppVolume(player.volume / share);
       }
       if (player.muted && desktopMusicGain() > 0) player.muted = false;
     });

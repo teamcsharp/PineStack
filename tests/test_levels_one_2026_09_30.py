@@ -28,11 +28,11 @@ class LevelsOne(unittest.TestCase):
 
     def test_a_later_surface_only_ever_lowers(self):
         levels.adopt(self.path, {"music": 0.3, "voice": 1.0, "master": 1.0}, "PineTab")
-        got = levels.adopt(self.path, {"music": 0.5, "voice": 0.6, "master": 0.35}, "desk")
-        self.assertEqual(got["lowered"], ["voice", "master"])
+        got = levels.adopt(self.path, {"music": 0.5, "voice": 0.6, "master": 0.0}, "desk")
+        self.assertEqual(got["lowered"], ["voice"])
         self.assertEqual(got["levels"]["music"], 0.3)       # never raised to 0.5
         self.assertEqual(got["levels"]["voice"], 0.6)
-        self.assertEqual(got["levels"]["master"], 0.35)
+        self.assertEqual(got["levels"]["master"], 1.0)      # a screen's own mute is not the station's
 
     def test_adopt_with_nothing_quieter_changes_nothing(self):
         levels.adopt(self.path, {"music": 0.3}, "a")
