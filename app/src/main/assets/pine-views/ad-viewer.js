@@ -232,8 +232,17 @@
        short of room (comfy_workshop.quality_for_box). */
     var qualityPanel = make('div', 'pav-quality'); qualityPanel.hidden = true;
     var h3Gear = command('H3 quality settings', 'c:settings', function () {
-      qualityPanel.hidden = !qualityPanel.hidden;
-      if (!qualityPanel.hidden) { paintQuality(h3State); loadH3(); }
+      /* [gear-works] "make sure this button works" (the operator, from the
+         Hourly prompts screen): that screen hides everything but its own
+         (.pav-on-prompts), so the panel opened unseen. The gear leaves the
+         prompts first, then shows the panel where it can be seen. */
+      if (pScreen && !pScreen.hidden) { showPrompts(false); qualityPanel.hidden = false; }
+      else qualityPanel.hidden = !qualityPanel.hidden;
+      h3Gear.setAttribute('aria-expanded', String(!qualityPanel.hidden));
+      if (!qualityPanel.hidden) {
+        paintQuality(h3State); loadH3();
+        try { qualityPanel.scrollIntoView({block: 'nearest'}); } catch (e) { /* older engine */ }
+      }
     });
     h3Bar.appendChild(h3Gear);
     /* [h3-prompts] "Put an option here of a P for prompt and whenever I click it
@@ -290,14 +299,50 @@
       ['style', 'Style', 'input', 'one style term - blank: the gear\'s brief, else a polished broadcast commercial'],
       ['audio_direction', 'Audio direction', 'input', 'blank: the gear\'s brief'],
       ['constraints', 'Constraints', 'input', 'blank: the gear\'s brief']];
-    var pInputs = {};
+    var pInputs = {}, pLabels = {};
     P_FIELDS.forEach(function (f) {
       var label = make('label', 'pav-pr-field'), input = make(f[2]);
       if (f[2] === 'textarea') input.rows = f[0] === 'goal' ? 3 : 2; else input.type = 'text';
       input.maxLength = f[0] === 'name' ? 60 : f[0] === 'goal' ? 1200 : f[2] === 'textarea' ? 1800 : f[0] === 'speech' ? 700 : f[0] === 'style' ? 120 : 400;
       input.setAttribute('aria-label', f[1]); input.addEventListener('input', paintEditState);
-      label.append(make('span', '', f[1]), make('i', '', f[3]), input); pForm.appendChild(label); pInputs[f[0]] = input;
+      var span = make('span', '', f[1]), hint = make('i', '', f[3]);
+      label.append(span, hint, input); pForm.appendChild(label); pInputs[f[0]] = input;
+      pLabels[f[0]] = {label: label, span: span, hint: hint, input: input};
     });
+    /* [prompt-simple] "a simple toggle ... instead of having eight lines to do a
+       prompt ... Basically I want to just type in what I want them to say and
+       describe what I want them to do." (the operator) SIMPLE shows two boxes -
+       what they say (the line spoken) and what they do (the brief); ADVANCED
+       shows every field, as before. Hidden fields keep their words and are
+       saved as they are. The choice is remembered on this screen. */
+    var P_SIMPLE = {
+      speech: ['What they say', 'the words spoken, exactly as written - {station} is the station\'s name'],
+      goal: ['What they do', 'describe the action, the scene and the mood - {station} works here too']};
+    var pMode = 'simple';
+    try { pMode = root.localStorage.getItem('pinePromptMode') === 'advanced' ? 'advanced' : 'simple'; } catch (e) { /* default */ }
+    var pModeBtn = pBtn('', 'c:settings--adjust', '', function () { setPromptMode(pMode === 'simple' ? 'advanced' : 'simple'); });
+    pModeBtn.classList.add('pav-pr-mode');
+    function setPromptMode(mode) {
+      pMode = mode === 'advanced' ? 'advanced' : 'simple';
+      try { root.localStorage.setItem('pinePromptMode', pMode); } catch (e) { /* this screen only */ }
+      var simple = pMode === 'simple';
+      P_FIELDS.forEach(function (f) {
+        var L = pLabels[f[0]], s = simple && P_SIMPLE[f[0]];
+        L.label.style.display = simple && !s ? 'none' : '';
+        L.label.style.order = simple ? (f[0] === 'speech' ? '1' : '2') : '';
+        L.span.textContent = s ? s[0] : f[1];
+        L.hint.textContent = s ? s[1] : f[3];
+        L.input.setAttribute('aria-label', s ? s[0] : f[1]);
+        if (f[0] === 'goal') L.input.rows = simple ? 4 : 3;
+      });
+      pModeBtn.lastChild.textContent = simple ? 'Simple' : 'Advanced';
+      pModeBtn.title = simple ? 'Simple - just what they say and what they do. Tap for every field (Advanced)'
+        : 'Advanced - every field. Tap for just what they say and what they do (Simple)';
+      pModeBtn.setAttribute('aria-label', pModeBtn.title);
+      pModeBtn.setAttribute('aria-pressed', String(!simple));
+    }
+    pTop.insertBefore(pModeBtn, pDiceBig);
+    setPromptMode(pMode);
     pForm.addEventListener('submit', function (e) { e.preventDefault(); savePreset(); });
     var pActions = make('div', 'pav-pr-actions');
     var pSave = pBtn('Save these words to this preset', 'c:save', 'Save', savePreset);
