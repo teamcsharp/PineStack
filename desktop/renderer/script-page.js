@@ -8498,13 +8498,31 @@
     });
     pane.appendChild(chip);
     mv.chip = chip;
+    /* [follow-hand] ONLY A HAND LEAVES THE LATEST. "Unless I scroll away
+       from the latest entry, always bring up the latest entry into feed."
+       Every scroll event used to re-decide the follow - including the ones
+       nobody made: the oldest card trimmed off the top, a card above growing,
+       history prepended and re-anchored, the follow's own scroll landing a
+       frame after the newest card had grown. Any of those with the list 12 px
+       taller than the view turned the follow off, raised "2 new", and nothing
+       but a hand could turn it back on (measured on the tablet: not pinned,
+       358 px above the bottom, the operator had not touched it). A scroll now
+       leaves the latest only within MV_HAND_MS of a touch, wheel, pointer or
+       key on the feed; any other scroll while following goes back to it. */
+    var hand = 0;
+    var handNow = function () { hand = Date.now(); };
+    ['wheel', 'touchstart', 'touchmove', 'pointerdown', 'keydown'].forEach(function (n) {
+      stage.addEventListener(n, handNow, {passive: true});
+    });
     stage.addEventListener('scroll', function () {
-      mv.follow = mvAtLatest(stage);
-      if (mv.follow) mv.fresh = 0;
+      if (mvAtLatest(stage)) { mv.follow = true; mv.fresh = 0; }
+      else if (Date.now() - hand < MV_HAND_MS) mv.follow = false;
+      else if (mv.follow) stage.scrollTop = stage.scrollHeight;
       mvChipPaint();
       if (stage.scrollTop < 60) mvHistoryMore();
     }, {passive: true});
   }
+  var MV_HAND_MS = 1200;   /* [follow-hand] how long after a hand a scroll is still its own */
   function mvHistoryFill() {
     var stage = mv.stage;
     if (!stage || mv.histRows) return;
