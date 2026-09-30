@@ -3752,6 +3752,37 @@ function makeViews({request, onSelect, details = false} = {}) {
         return el('span', null, `${k} ${num(a[k])}`, Math.abs(d) > 0.0005 ? el('b', {class: d > 0 ? 'up' : 'down', text: ` ${d > 0 ? '+' : ''}${num(d, 3)}`}) : '', '  '); }));
   };
 
+  /* [s3-feedentry] "for each entry show the feed entry for it allowing it to be
+     expanded and every roulette roll examined": the message card (speaker, the
+     words that aired, its id, and a line of what each roll landed on), open by
+     default, holding the turn's Rolodex cards - each with How it got here and
+     its candidates, weights and state. */
+  v.feedEntry = (t, evs, conv) => {
+    let st = {};
+    try { st = v.turnStatus(t, conv) || {}; } catch (err) { st = {}; }
+    const words = (st.line && st.line.text) || t.text || '';
+    const lid = (st.line && st.line.line_id) || '';
+    const landed = evs.map(ev => {
+      let res = '';
+      try { res = eventLine(ev, conv).text; } catch (err) { res = ''; }
+      return `${ev.family || '?'} ${res}`.trim();
+    }).filter(Boolean);
+    const box = el('details', {class: 's3-feedentry', open: true, onclick: e => e.stopPropagation()});
+    const sum = el('summary', {class: 's3-fe-sum', title: 'The feed entry for this turn - tap to fold or open its rolls'},
+      el('div', 's3-fe-top',
+        el('b', {class: 's3-fe-who', text: String(t.name || t.speaker || '').toUpperCase()}),
+        el('span', {class: 's3-fe-count', text: `${evs.length} roll${evs.length === 1 ? '' : 's'}`}),
+        lid ? el('span', {class: 's3-fe-id', text: '#' + lid.slice(0, 8), title: 'line ' + lid}) : null),
+      el('div', {class: 's3-fe-words', text: words || '(no words - ' + (t.status || 'planned') + ')'}),
+      landed.length ? el('div', {class: 's3-fe-landed', text: landed.join('  ·  '), title: landed.join('\n')}) : null);
+    box.append(sum);
+    const body = el('div', 's3-fe-body');
+    for (const ev of evs) body.append(v.eventCard(ev, t));
+    if (!evs.length) body.append(el('div', 's3-muted', 'No roll was recorded for this turn.'));
+    box.append(body);
+    return box;
+  };
+
   v.paintRolodex = () => {
     const conv = v.conv;
     const out = [el('h2', null, 'Technical / RNG Rolodex', el('span', {class: 's3-muted', text: conv ? `${(conv.decision_events || []).length} recorded decisions` : ''}))];
@@ -3761,8 +3792,10 @@ function makeViews({request, onSelect, details = false} = {}) {
     if (pre.length) out.push(el('div', 's3-turnhead', 'BEFORE THE FIRST TURN'), ...pre.map(e => v.eventCard(e)));
     for (const t of v.turnsInOrder(conv)) {
       out.push(el('div', {class: 's3-turnhead', 'data-turn': t.turn_id, text: `SYSTEM 3 — TURN ${String(t.index + 1).padStart(4, '0')} · ${t.speaker} ${t.name || ''} · ${t.step_label} · ${t.phase}`}));
-      for (const ev of turnEvents(conv, t)) out.push(v.eventCard(ev, t));
-      for (const o of (conv.observations_air || []).filter(o => o.turn_id === t.turn_id || ((o.family === 'SFX' || o.family === 'SFXGUY') && t.script_index != null && o.turn_index === t.script_index))) out.push(v.eventCard(o, t));
+      /* [s3-feedentry] the turn as the feed shows it, with every roll inside */
+      const evs = [...turnEvents(conv, t),
+        ...(conv.observations_air || []).filter(o => o.turn_id === t.turn_id || ((o.family === 'SFX' || o.family === 'SFXGUY') && t.script_index != null && o.turn_index === t.script_index))];
+      out.push(v.feedEntry(t, evs, conv));
     }
     const late = (conv.observations_air || []).filter(o => !o.turn_id && !((o.family === 'SFX' || o.family === 'SFXGUY') && o.turn_index != null));
     if (late.length) out.push(el('div', 's3-turnhead', 'OBSERVED AFTER THE PLAN (doors, commits, repairs)'), ...late.map(o => v.eventCard(o)));

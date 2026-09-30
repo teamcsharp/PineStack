@@ -964,13 +964,13 @@
     if (!document.querySelector('link[data-pine-s3]')) {
       var link = document.createElement('link');
       link.rel = 'stylesheet';
-      link.href = s3Url('/system3/system3.css?v=4');
+      link.href = s3Url('/system3/system3.css?v=6');
       link.setAttribute('data-pine-s3', '');
       document.head.appendChild(link);
     }
     var prov = (all && all.prov) || {};
     var prompt = String(((prov.written || {}).prompt) || prov.prompt || '');
-    (s3Load = s3Load || import(s3Url('/system3/system3.js?v=6'))).then(function (mod) {
+    (s3Load = s3Load || import(s3Url('/system3/system3.js?v=8'))).then(function (mod) {
       if (!node.isConnected) return null;
       return mod.mountLineStory(node, {request: function (path) { return api().get(path); },
         lineId: String((line && line.id) || ''), prompt: prompt});
@@ -1007,11 +1007,11 @@
     if (!document.querySelector('link[data-pine-s3]')) {
       var link = document.createElement('link');
       link.rel = 'stylesheet';
-      link.href = s3Url('/system3/system3.css?v=4');
+      link.href = s3Url('/system3/system3.css?v=6');
       link.setAttribute('data-pine-s3', '');
       document.head.appendChild(link);
     }
-    (s3Load = s3Load || import(s3Url('/system3/system3.js?v=6'))).then(function (mod) {
+    (s3Load = s3Load || import(s3Url('/system3/system3.js?v=8'))).then(function (mod) {
       loaded = true;
       if (typeof mod.openSystem3Focus !== 'function') {
         throw new Error('this station\u2019s System 3 has no focused view yet');

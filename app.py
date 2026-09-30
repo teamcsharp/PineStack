@@ -250116,10 +250116,10 @@ async function system3Open(tab) {                       /* [s3-window] tab: tabl
   if (system3View) return;
   if (!document.getElementById("system3Style")) {
     const style = document.createElement("link"); style.id = "system3Style"; style.rel = "stylesheet";
-    style.href = "/system3/system3.css?v=5"; document.head.append(style);   /* [pine-graph] */
+    style.href = "/system3/system3.css?v=6"; document.head.append(style);   /* [pine-graph] */
   }
   try {
-    const module = await import("/system3/system3.js?v=7");   // [s3-banks-roll] replay / gold / listening chips on the turn
+    const module = await import("/system3/system3.js?v=8");   // [s3-banks-roll] replay / gold / listening chips on the turn
     system3View = await module.openSystem3({request: (path, options) => api(path, options),
       tab: typeof tab === "string" ? tab : "",
       onClose: () => { system3View = null; }});

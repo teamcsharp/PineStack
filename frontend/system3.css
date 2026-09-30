@@ -1402,3 +1402,16 @@
 .s3-sys3-conv { border-left: 2px solid var(--line); padding-left: 8px; margin: 6px 0; }
 @media (max-width: 700px) { .s3-sys3-side { width: 92%; } .s3-sys3.s3-side-open .s3-sys3-now { display: none; } }
 /* [/s3-scene-nav] */
+
+/* [s3-feedentry] each turn as its feed entry, the rolls inside */
+.s3-feedentry { margin: 4px 0 12px; border: 1px solid rgba(104, 206, 217, .28); border-radius: 12px; background: rgba(17, 22, 28, .6); }
+.s3-fe-sum { cursor: pointer; list-style: none; padding: 8px 12px; }
+.s3-fe-sum::-webkit-details-marker { display: none; }
+.s3-fe-top { display: flex; align-items: baseline; gap: 10px; }
+.s3-fe-who { letter-spacing: .06em; font-size: 12px; }
+.s3-fe-count { color: #9aa4ad; font-size: 11px; }
+.s3-fe-id { margin-left: auto; color: rgba(154, 164, 173, .6); font-size: 10px; font-family: ui-monospace, monospace; }
+.s3-fe-words { margin: 4px 0 2px; }
+.s3-fe-landed { color: #9aa4ad; font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.s3-feedentry:not([open]) .s3-fe-sum { opacity: .85; }
+.s3-fe-body { padding: 0 10px 8px 22px; border-top: 1px solid rgba(154, 164, 173, .12); }
