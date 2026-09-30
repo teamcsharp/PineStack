@@ -222,6 +222,7 @@ def state(recent: int = 12) -> dict[str, Any]:
             "rule": "rolling: uniform between the two sliders, [min(gap, range), max(gap, range)]",
             "key": ROLL_KEY,
             "buildup": contract(),                                  # [reply-gap:buildup]
+            "buildup_misses": dict(BUILD_MISSES),                   # [reply-gap:buildup-real]
             "recent": list(_ROLLS)[-max(0, int(recent)):] if recent else []}
 
 
@@ -684,9 +685,36 @@ def _measured(ms: int) -> None:
     _BUILD_STATS["mean"] += (float(ms) - _BUILD_STATS["mean"]) / n
 
 
+# [reply-gap:buildup-real] remembered buildups, and why a line had none
+_BUILD_MEMO: dict[str, int] = {}
+BUILD_MISSES: dict[str, int] = {}
+
+
+def _build_miss(why: str) -> int:
+    """A line System 3 made but whose tables could not be read: the contract's
+    own estimate, never 0 (the page fits the real card to it)."""
+    BUILD_MISSES[why] = BUILD_MISSES.get(why, 0) + 1
+    try:
+        active = _door("_s3_active")
+        if not (callable(active) and active()):   # only while System 3 is making the lines
+            return 0
+        return int(round(expected_buildup_s() * 1000))
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def _build_memo(key: str, ms: int | None = None) -> int | None:
+    if ms is None:
+        return _BUILD_MEMO.get(key)
+    _BUILD_MEMO[key] = int(ms)
+    while len(_BUILD_MEMO) > 600:
+        _BUILD_MEMO.pop(next(iter(_BUILD_MEMO)))
+    return int(ms)
+
+
 def buildup_of_line(meta: Any, who: str, text: str) -> int:
     """A burst row's buildup: a sting off the board is its clip's table; a
-    line is its turn's fresh tables. 0 when System 3 did not make it."""
+    line is its turn's fresh tables; 0 only when System 3 is not making lines."""
     try:
         if str(who or "") == "board":
             return buildup_ms([CLIP_TABLE])
@@ -695,14 +723,22 @@ def buildup_of_line(meta: Any, who: str, text: str) -> int:
         cid = str((s3 or {}).get("conversation_id") or "")
         conv = _conv(cid)
         if conv is None:
-            return 0
+            return _build_miss("no conversation for the round" if cid else "the round has no System 3 id")
         find = _door("system3_turn_id_for")
         tid = str(find(meta, str(text or ""), str(who or "")) or "") if find and text else ""
+        if not tid:
+            return _build_miss("no turn for the words" if find else "system3_turn_id_for is missing")
+        key = "%s|%s|%s" % (cid, tid, who)
+        got = _build_memo(key)
+        if got is not None:
+            return got
         ms = buildup_ms(turn_spec(conv, tid, who))
+        if ms <= 0:
+            return _build_memo(key, _build_miss("the turn had no tables"))
         _measured(ms)
-        return ms
+        return _build_memo(key, ms)
     except Exception:  # noqa: BLE001
-        return 0
+        return _build_miss("the lookup raised")
 
 
 def buildup_of_clip(clip: Any) -> int:
@@ -725,16 +761,24 @@ def buildup_of_clip(clip: Any) -> int:
             return 0
         conv = _conv(str(stamp["conversation_id"]))
         if conv is None:
-            return 0
+            return _build_miss("no conversation for the line")
         tid = str(stamp.get("turn_id") or "")
         if not tid:
             turns = conv.get("turns") or []
             tid = str((turns[0] or {}).get("turn_id") or "") if len(turns) == 1 else ""
+        if not tid:
+            return _build_miss("no turn for the line")
+        key = "%s|%s|%s" % (stamp["conversation_id"], tid, clip.get("who") or "")
+        got = _build_memo(key)
+        if got is not None:
+            return got
         ms = buildup_ms(turn_spec(conv, tid, str(clip.get("who") or "")))
+        if ms <= 0:
+            return _build_memo(key, _build_miss("the turn had no tables"))
         _measured(ms)
-        return ms
+        return _build_memo(key, ms)
     except Exception:  # noqa: BLE001
-        return 0
+        return _build_miss("the lookup raised")
 
 
 def expected_buildup_s() -> float:
