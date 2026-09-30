@@ -1782,7 +1782,9 @@ def _decide_turn(conv, config, settings, stream, step, speaker, want, inputs, cl
         turn["decisions"].append(dec)
         _material_mark(ev, spec, inputs)                                      # [s3-material]
         if family != "ES":
-            turn["directions"].append({"family": family, "text": _direction_text(spec, inputs), "label": spec["label"]})
+            _said = _direction_text(spec, inputs)
+            ev["selected"]["prompt"] = _said                                  # [prompt-share] its words for the writer
+            turn["directions"].append({"family": family, "text": _said, "label": spec["label"]})
     turn["speakerbox"] = _speakerbox_marks(conv, config, settings, ctx, stream, step, turn, inputs)
     turn["speakerbox"] += _speakerbox_acts(conv, config, ctx, turn, acts, inputs)
     turn["sfx"] = _sfx_decision(conv, config, settings, ctx, stream, turn, es_spec, acts)
@@ -1885,7 +1887,9 @@ def _cts(conv, config, ctx, stream, turn, idx):
         dec["event"] = str(spec["event"])
     turn["decisions"].append(dec)
     _material_mark(ev, spec, conv["inputs"])                                  # [s3-material]
-    turn["directions"].append({"family": "CTS", "text": _direction_text(spec, conv["inputs"]), "label": spec["label"]})
+    _said = _direction_text(spec, conv["inputs"])
+    ev["selected"]["prompt"] = _said                                          # [prompt-share]
+    turn["directions"].append({"family": "CTS", "text": _said, "label": spec["label"]})
     turn["topic_change"] = True
     if spec.get("category") == "topic":
         # [rng-topics] THE TOPICS DATABASE, RESOLVED. CTS1's "From Topics
@@ -5034,6 +5038,10 @@ def render_legs_sheet(conv):
         return ""
     rows = ["%2d  %s  - %s%s" % (t["index"] + 1, t["speaker"], t.get("protocol") or "keeps it going.",
                                  _leg_row_add(t)) for t in turns]
+    try:
+        prompt_mark(conv, rows)                                               # [prompt-share]
+    except Exception:  # noqa: BLE001
+        pass
     who, quoted = _carry_landing(conv)                                        # [s3-carry]
     carry_line = ("\nIt follows straight on from the last exchange, which landed on %s's words: %s - turn 1 picks up "
                   "from there." % (who, quoted)) if quoted else ""
@@ -5686,6 +5694,40 @@ def _tempers_line(conv):
             "each of them chooses to react to, underneath each turn's own feeling. Never named out loud.")
 
 
+def _prompt_needle(text):
+    return " ".join(str(text or "").lower().split())[:48].rstrip(" .,;:")
+
+
+def prompt_mark(conv, rows):
+    """[prompt-share] what each roll put into the writer's prompt.
+
+    2026-09-30, the operator: "For any of these pop up windows, the first entry
+    should show what this result in the roulette contributed to the system
+    prompt." Every roll event on a turn is stamped with the row the writer was
+    handed for that turn (`prompt_row`), its own words (`prompt`), and whether
+    those words are in the row (`in_prompt`) - a line whose words are fixed, or
+    a roll that decides something other than words (a clip, a length), is
+    honestly marked as adding nothing."""
+    by_turn = {}
+    for t, row in zip(conv.get("turns") or [], rows):
+        by_turn[t.get("index")] = row
+    for ev in conv.get("decision_events") or []:
+        row = by_turn.get(ev.get("turn_index"))
+        if row is None:
+            continue
+        sel = ev.setdefault("selected", {})
+        words = str(sel.get("prompt") or "")
+        if not words and ev.get("family") == "ES":
+            words = str(sel.get("text") or "")
+        needle = _prompt_needle(words)
+        label = _prompt_needle(sel.get("label") or "")
+        low = " ".join(str(row).lower().split())
+        sel["prompt_row"] = row
+        sel["prompt"] = words
+        sel["in_prompt"] = bool((needle and needle in low)
+                                or (ev.get("family") == "ES" and label and ("feeling " + label) in low))
+
+
 def render_sheet(conv):
     """The plan as the numbered running order the writer already follows.
 
@@ -5695,6 +5737,10 @@ def render_sheet(conv):
     rows = ["%2d  %s  - %s" % (t["index"] + 1, t["speaker"], _row_work(t, conv)) for t in conv["turns"]]
     if not rows:
         return ""
+    try:
+        prompt_mark(conv, rows)                                               # [prompt-share]
+    except Exception:  # noqa: BLE001 - a note about the prompt never costs the prompt
+        pass
     return ("\n\nTHE RUNNING ORDER OF THIS EXCHANGE. Write exactly these turns, in this order, one line "
             "each, and nothing else. Each row says what the turn does, then gives its DIRECTION FOR THIS "
             "LINE - who speaks, the feeling family, the feeling and how hard. ACT IT OVER THE TOP: the "

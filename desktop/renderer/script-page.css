@@ -4629,3 +4629,12 @@ html.pine-tech-wide .sp-tech.sp-tech-wide .wc-strip {
 .sp-rrp-res-opt.on { border-color: #65c7da; color: #65c7da; font-weight: 600; }
 .sp-rrp-res-say { flex-basis: 100%; margin: 2px 0 0; font-size: 11px; color: #65c7da; }
 .sp-rrp-hand { margin: 6px 0 0; font-size: 12px; color: #dfe7ee; }
+
+/* [prompt-share] what this roll added to the writer's prompt - first in every roulette popup */
+.sp-rrp-prompt { margin: 4px 0 10px; padding: 8px 10px; border: 1px solid #35505c; border-radius: 8px; background: #0f1a20; }
+.sp-rrp-prompt h4 { margin-top: 0; }
+.sp-rrp-prompt-lead { margin: 4px 0 2px; font-size: 12px; color: #8ea0ad; }
+.sp-rrp-prompt-words { margin: 2px 0 6px; padding: 6px 10px; border-left: 3px solid #65c7da; background: #0b1318; color: #edf3f5; font-size: 13px; white-space: pre-wrap; }
+.sp-rrp-prompt-unused { border-left-color: #6f8291; color: #b9c6ce; }
+.sp-rrp-prompt-row { margin: 2px 0 0; padding: 6px 10px; background: #0b1116; color: #b9c6ce; font: 12px/1.5 ui-monospace, Consolas, monospace; white-space: pre-wrap; max-height: 30vh; overflow-y: auto; }
+.sp-rrp-prompt-row mark { background: rgba(101, 199, 218, .28); color: #edf3f5; border-radius: 2px; }

@@ -6043,7 +6043,9 @@
       event: String(ev.event_id || ''),
       main: main ? mvReel(main, dice) : {dice: dice, opts: [landed], hit: 0, label: landed, of: 1, stage: ''},
       sub: sub ? mvReel(sub, null) : null, failed: mvRrFailed(ev), vrej: mvRrVerdicts(ev),   /* [rollplay] */
-      material: sel.material || null};                                      /* [research-pop] */
+      material: sel.material || null,                                       /* [research-pop] */
+      prompt: sel.prompt_row != null ? {words: String(sel.prompt || ''), row: String(sel.prompt_row || ''),
+        used: !!sel.in_prompt} : null};                                     /* [prompt-share] */
   }
   function mvCounted(fam, table, one, two) {
     var mk = function (x) {
@@ -7926,6 +7928,48 @@
     }, function (e) { note.textContent = 'the station did not answer: ' + String((e && e.message) || e); });
     return sec;
   }
+  /* [prompt-share] "at the top have a section saying exactly what this has
+     contributed to the system prompt or the prompt that dictates the
+     response" (the operator). The station stamps each roll with its own
+     words, the row the writer got for that turn, and whether they are in it. */
+  function mvRrPromptShare(box, r) {
+    var sec = make('div', 'sp-rrp-prompt');
+    sec.appendChild(make('h4', '', 'What this added to the prompt'));
+    var p = r && r.prompt;
+    if (!p) {
+      sec.appendChild(make('p', 'sp-rrp-none',
+        'Not recorded for this line - it was planned before the station kept what each roll added to the prompt.'));
+      box.appendChild(sec);
+      return sec;
+    }
+    if (p.words && p.used) {
+      sec.appendChild(make('p', 'sp-rrp-prompt-lead', 'These words went into the writer\'s prompt:'));
+      sec.appendChild(make('blockquote', 'sp-rrp-prompt-words', p.words));
+    } else if (p.words) {
+      sec.appendChild(make('p', 'sp-rrp-prompt-lead',
+        'Its words were ready, but this turn\'s row does not carry them - the line\'s words were fixed, or another direction took their place:'));
+      sec.appendChild(make('blockquote', 'sp-rrp-prompt-words sp-rrp-prompt-unused', p.words));
+    } else {
+      sec.appendChild(make('p', 'sp-rrp-prompt-lead',
+        'Nothing - this roll decides something other than the words (a clip, a length, a timing), so the writer is not told about it.'));
+    }
+    if (p.row) {
+      sec.appendChild(make('p', 'sp-rrp-prompt-lead', 'The whole row the writer was handed for this turn:'));
+      var row = make('p', 'sp-rrp-prompt-row', '');
+      var at = p.used && p.words ? p.row.toLowerCase().indexOf(p.words.toLowerCase().slice(0, 48)) : -1;
+      if (at >= 0) {
+        var end = Math.min(p.row.length, at + p.words.length);
+        row.appendChild(document.createTextNode(p.row.slice(0, at)));
+        row.appendChild(make('mark', '', p.row.slice(at, end)));
+        row.appendChild(document.createTextNode(p.row.slice(end)));
+      } else {
+        row.textContent = p.row;
+      }
+      sec.appendChild(row);
+    }
+    box.appendChild(sec);
+    return sec;
+  }
   var MV_RES_PREF = [['prefer', 'Prefer this site'], ['normal', 'Normal'], ['never', 'Never use this site']];
   function mvRrResearchRow(x) {
     var row = make('div', 'sp-rrp-res sp-rrp-res-' + String(x.verdict || ''));
@@ -7982,7 +8026,9 @@
     shut.setAttribute('aria-label', 'Close');
     head.appendChild(shut);
     box.appendChild(head);
-    /* [research-pop] a landed entry that used online research shows it first */
+    /* [prompt-share] FIRST, what this roll put into the writer's prompt */
+    mvRrPromptShare(box, r);
+    /* [research-pop] a landed entry that used online research shows it next */
     if (r.material && r.material.kind === 'research') mvRrResearch(box, r.material);
     /* 1. every entry this roulette held */
     var opts = s.opts || [], w = s.weights || [], sum = 0;
