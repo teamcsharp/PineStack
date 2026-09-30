@@ -19,11 +19,13 @@ reply, not the space between two of them.
 
 THE SETTINGS (station-wide, `data/reply_gap.json`, GET/POST /api/reply-gap):
   gap    0.2 - 10 s, default 1.0   the pause after every reply
-  range  0.1 - 10 s, default 1.0   how far a roll may move it, either way
+  range  0.2 - 10 s, default 1.0   the roll's other end ([reply-gap:between])
   roll   off by default            on: each pause is ROLLED
 
-THE ROLL. With `roll` on, each reply's pause is uniform in
-  [max(0.2, gap - range), min(10, gap + range)]
+THE ROLL. With `roll` on, each reply's pause is uniform BETWEEN THE TWO SLIDERS:
+  [min(gap, range), max(gap, range)]
+  ("the dice should only be rolling values between slider 1 and slider 2";
+  it was gap +/- range, so 1.0 and 1.9 rolled 0.4.)
 and it is a System 3 roll (`s3_roll("reply.gap")`, the station's dice door),
 recorded on the round it shaped under the turn that just ended (`_s3_roll_on`
 -> roll_to -> a STATION observation in the Rolodex, the receipt the roulette
@@ -59,7 +61,7 @@ except ImportError:  # the pure tests need none of it
 GAP_MIN = 0.2
 GAP_MAX = 10.0
 GAP_DEFAULT = 1.0
-RANGE_MIN = 0.1
+RANGE_MIN = 0.2                  # [reply-gap:between] a time, like the gap
 RANGE_MAX = 10.0
 RANGE_DEFAULT = 1.0
 STEP = 0.1                       # the sliders' step; a rolled pause lands on it too
@@ -104,7 +106,7 @@ def clamp_gap(value: Any) -> float:
 
 
 def clamp_range(value: Any) -> float:
-    """How far a roll may move it, on the step, inside 0.1 - 10 s."""
+    """The roll's other end, on the step, inside 0.2 - 10 s."""
     return min(RANGE_MAX, max(RANGE_MIN, _step(_num(value, RANGE_DEFAULT))))
 
 
@@ -122,17 +124,18 @@ def normalise(raw: Any) -> dict[str, Any]:
 
 
 def window(settings: Any) -> tuple[float, float]:
-    """Where a roll may land: gap +/- range, kept inside 0.2 - 10 s."""
+    """Where a roll may land: BETWEEN the two sliders, either way round.
+    [reply-gap:between] "the dice should only be rolling values between
+    slider 1 and slider 2" - never gap +/- range."""
     s = normalise(settings)
-    lo = max(GAP_MIN, round(s["gap"] - s["range"], 1))
-    hi = min(GAP_MAX, round(s["gap"] + s["range"], 1))
-    return lo, max(lo, hi)
+    lo = min(s["gap"], s["range"])
+    hi = max(s["gap"], s["range"])
+    return lo, hi
 
 
 def expected(settings: Any) -> float:
     """What one pause costs the air on average: the gap, or - rolling - the
-    middle of the window (uniform), which moves off the gap only where a
-    bound clips it (gap 0.5, range 2 -> 0.2..2.5 -> 1.35)."""
+    middle of the window (uniform): gap 1.0 and 1.9 -> 1.0..1.9 -> 1.45."""
     s = normalise(settings)
     if not s["roll"]:
         return s["gap"]
@@ -216,7 +219,7 @@ def state(recent: int = 12) -> dict[str, Any]:
             "bounds": {"gap": [GAP_MIN, GAP_MAX], "range": [RANGE_MIN, RANGE_MAX],
                        "step": STEP, "gap_default": GAP_DEFAULT,
                        "range_default": RANGE_DEFAULT},
-            "rule": "rolling: uniform in [max(0.2, gap - range), min(10, gap + range)]",
+            "rule": "rolling: uniform between the two sliders, [min(gap, range), max(gap, range)]",
             "key": ROLL_KEY,
             "recent": list(_ROLLS)[-max(0, int(recent)):] if recent else []}
 

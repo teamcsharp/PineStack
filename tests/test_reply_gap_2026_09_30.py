@@ -34,7 +34,7 @@ class Bounds(unittest.TestCase):
         self.assertEqual(rg.clamp_gap(1.73), 1.7)        # the slider's step
 
     def test_range_bounds(self):
-        self.assertEqual(rg.clamp_range(0), 0.1)
+        self.assertEqual(rg.clamp_range(0), 0.2)   # [reply-gap:between] a time, like the gap
         self.assertEqual(rg.clamp_range(50), 10.0)
         self.assertEqual(rg.clamp_range(None), 1.0)
 
@@ -45,21 +45,23 @@ class Bounds(unittest.TestCase):
 
 
 class TheRoll(unittest.TestCase):
-    def test_window_is_gap_plus_minus_range_inside_the_bounds(self):
-        self.assertEqual(rg.window({"gap": 1, "range": 1}), (0.2, 2.0))
-        self.assertEqual(rg.window({"gap": 5, "range": 2}), (3.0, 7.0))
-        self.assertEqual(rg.window({"gap": 9.5, "range": 3}), (6.5, 10.0))
-        self.assertEqual(rg.window({"gap": 0.2, "range": 0.1}), (0.2, 0.3))
+    def test_window_is_between_the_two_sliders(self):
+        # [reply-gap:between] "only rolling values between slider 1 and slider 2"
+        self.assertEqual(rg.window({"gap": 1, "range": 1.9}), (1.0, 1.9))
+        self.assertEqual(rg.window({"gap": 5, "range": 2}), (2.0, 5.0))    # either way round
+        self.assertEqual(rg.window({"gap": 1, "range": 1}), (1.0, 1.0))    # equal: no spread
+        self.assertEqual(rg.window({"gap": 0.2, "range": 0.1}), (0.2, 0.2))  # 0.1 clamps to 0.2
+        self.assertEqual(rg.window({"gap": 9.5, "range": 12}), (9.5, 10.0))
 
     def test_expected_is_the_gap_or_the_window_middle(self):
         self.assertEqual(rg.expected({"gap": 3, "range": 1, "roll": False}), 3.0)
-        self.assertEqual(rg.expected({"gap": 5, "range": 2, "roll": True}), 5.0)
-        self.assertEqual(rg.expected({"gap": 1, "range": 1, "roll": True}), 1.1)
+        self.assertEqual(rg.expected({"gap": 5, "range": 2, "roll": True}), 3.5)
+        self.assertEqual(rg.expected({"gap": 1, "range": 1.9, "roll": True}), 1.45)
 
     def test_every_roll_lands_inside_the_window_on_the_step(self):
         with tempfile.TemporaryDirectory() as tmp:
             rg.use_path(Path(tmp) / "reply_gap.json")
-            rg.save({"gap": 1.0, "range": 1.0, "roll": True})
+            rg.save({"gap": 0.2, "range": 2.0, "roll": True})   # [reply-gap:between]
             rng = random.Random(7)
             seen = set()
             for _ in range(500):
@@ -71,8 +73,9 @@ class TheRoll(unittest.TestCase):
                 seen.add(got["s"])
             self.assertGreater(len(seen), 12, "a roll that never varies is not a roll")
             self.assertIn(0.2, seen)
+            self.assertIn(2.0, seen)
             rg.save({"roll": False})
-            self.assertEqual(rg.draw(rng=rng), {"s": 1.0, "rolled": False})
+            self.assertEqual(rg.draw(rng=rng), {"s": 0.2, "rolled": False})   # roll off: slider one
             self.assertTrue(rg.recent(3), "each roll leaves a receipt")
             rg.use_path(None)
 
@@ -96,7 +99,7 @@ class Persistence(unittest.TestCase):
             got = rg.state()
             self.assertEqual((got["gap"], got["range"], got["roll"]), (3.3, 10.0, True))
             self.assertEqual(got["bounds"]["gap"], [0.2, 10.0])
-            self.assertEqual((got["lo"], got["hi"]), (0.2, 10.0))
+            self.assertEqual((got["lo"], got["hi"]), (3.3, 10.0))
             rg.save({"gap": 0.5})                                 # a partial POST keeps the rest
             self.assertEqual(rg.settings()["range"], 10.0)
             rg.use_path(None)

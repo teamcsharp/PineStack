@@ -32,7 +32,7 @@ assert(src.includes("api().get('/api/reply-gap?recent=1')"), 'reads the station 
 assert(src.includes("api().post('/api/reply-gap', body)"), 'writes the station setting');
 
 // 2. The bounds.
-assert(/var GAP_MIN = 0\.2, GAP_MAX = 10, GAP_RANGE_MIN = 0\.1, GAP_RANGE_MAX = 10;/.test(src), 'slider bounds');
+assert(/var GAP_MIN = 0\.2, GAP_MAX = 10, GAP_RANGE_MIN = 0\.2, GAP_RANGE_MAX = 10;/.test(src), 'slider bounds');
 assert(src.includes("var gapState = {gap: 1, range: 1, roll: false};"), 'default 1 s, roulette off');
 assert(src.includes("input.step = '0.1';"), 'a tenth of a second a step');
 
@@ -59,8 +59,8 @@ const f = new Function('GAP_MIN', 'GAP_MAX', 'env', 'gapLoad', 'gapRoll', 'gapCo
   + 'return o;')(
   0.2, 10, env, () => {}, g => env.rolled.push(g), () => { env.kicks += 1; }, () => env.player);
 const watch = () => { f.sync(); f.gapWatch(); };
-assert.deepStrictEqual(f.gapWindow(1, 1), [0.2, 2], 'gap 1 +/- 1 is 0.2 - 2.0');
-assert.deepStrictEqual(f.gapWindow(9, 3), [6, 10]);
+assert.deepStrictEqual(f.gapWindow(1, 1.9), [1, 1.9], '[reply-gap:between] rolls land between the two sliders');
+assert.deepStrictEqual(f.gapWindow(9, 3), [3, 9], 'either way round');
 assert.strictEqual(f.gapClamp(0, 0.2, 10, 1), 0.2);
 assert.strictEqual(f.gapClamp(42, 0.2, 10, 1), 10);
 assert.strictEqual(f.gapClamp('x', 0.2, 10, 1), 1);
