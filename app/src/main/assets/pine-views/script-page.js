@@ -23647,7 +23647,8 @@
      window (audioAt - ms .. audioAt) its whole buildup plays in */
   function mvUpcomingSet(u) {
     if (!u || !u.lid || !(u.ms > 0) || !(u.audioAt > 0)) return;
-    if (mvUpcoming && mvUpcoming.lid === u.lid && Math.abs(mvUpcoming.audioAt - u.audioAt) < 400) return;
+    if (mvUpcoming && mvUpcoming.lid === u.lid
+        && (mvUpcoming.early || Math.abs(mvUpcoming.audioAt - u.audioAt) < 400)) return;   /* [reply-gap:sting-overlap] a card building during the sting is never restarted */
     u.item = mvUpItem(u);
     mvUpcoming = u;
     try { mvAsk(u.item); } catch (e) { /* asked again when the card starts */ }   /* its rows, fetched during the pause */
@@ -23678,11 +23679,12 @@
     var bms = Math.max(0, gapNum(d.buildup_ms, 0));
     if (bms > 0 && d.lid) {
       mvUpcomingSet({lid: String(d.lid), who: String(d.who || ''), name: String(d.name || ''),
-        text: String(d.text || ''), sting: !!d.sting, audioAt: to, ms: bms});
+        text: String(d.text || ''), sting: !!d.sting, audioAt: to, ms: bms, early: !!d.early});
     }
+    if (d.early) return;            /* [reply-gap:sting-overlap] the card builds during the sting; the dice wait */
     if (!gapUi || !gapState.roll || !d.rolled) return;
     gapRoll({s: d.s, dice: d.dice, lo: d.lo, hi: d.hi, id: d.id, rolled: true});
-    var pauseEnd = to - bms;
+    var pauseEnd = to - Math.max(0, bms - Math.max(0, gapNum(d.overlap_ms, 0)));
     if (pauseEnd - Date.now() > 30) {
       gapCount = {from: Date.now(), to: pauseEnd};
       gapBars(1);
