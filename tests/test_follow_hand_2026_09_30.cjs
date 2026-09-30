@@ -37,6 +37,7 @@ function harness() {
     mv, make, () => ({}), () => {}, {now: () => now});
   fns.mvHistoryWire(pane, stage);
   stage.scrollTop = stage.scrollHeight - stage.clientHeight;   // at the latest
+  stage.fire('scroll');                  // a browser fires one for that move too
   return {stage, mv, tick: ms => { now += ms; }};
 }
 
@@ -77,6 +78,26 @@ function harness() {
   h.stage.scrollTop = h.stage.scrollHeight - h.stage.clientHeight;
   h.stage.fire('scroll');
   assert.strictEqual(h.mv.follow, true, 'back at the latest follows again');
+}
+
+// 4. [follow-up] a TAP on a card, then the oldest card trimmed off the top: still following
+{
+  const h = harness();
+  h.stage.fire('pointerdown');
+  h.stage.scrollHeight -= 180;           // the trim: the height and the top move together
+  h.stage.scrollTop -= 180;
+  h.stage.fire('scroll');
+  assert.strictEqual(h.mv.follow, true, 'a tap and a trim never leave the latest');
+}
+
+// 5. [follow-up] a wheel AT the bottom, then the newest card grows: still following
+{
+  const h = harness();
+  h.stage.fire('wheel');
+  h.stage.scrollHeight += 240;           // the card grew below; the top did not move
+  h.stage.fire('scroll');
+  assert.strictEqual(h.mv.follow, true, 'nothing moved up: the follow stays');
+  assert.strictEqual(h.stage.scrollTop, h.stage.scrollHeight, 'and the view returns to the latest');
 }
 
 console.log('follow-hand ok');

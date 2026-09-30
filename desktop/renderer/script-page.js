@@ -8869,10 +8869,26 @@
     ['wheel', 'touchstart', 'touchmove', 'pointerdown', 'keydown'].forEach(function (n) {
       stage.addEventListener(n, handNow, {passive: true});
     });
+    /* [follow-up] "make sure the feed stays current if i have it scrolled to
+       current". A hand near the feed was enough to end the follow: a tap on a
+       card (a pointerdown), or a wheel at the bottom, and then a scroll the feed
+       made itself inside the next 1.2 s - the oldest card trimmed off the top,
+       a card growing - read as the hand leaving. Now the follow ends only when
+       the view MOVED UP THE LIST: the top went up AND the distance to the bottom
+       grew, within MV_HAND_MS of a hand. A trim moves both the top and the
+       height by the same amount (the distance to the bottom is unchanged); a
+       card growing moves neither; a tap moves nothing. */
+    var lastTop = stage.scrollTop;
+    var gapOf = function () { return stage.scrollHeight - stage.clientHeight - stage.scrollTop; };
+    var lastGap = gapOf();
     stage.addEventListener('scroll', function () {
+      var gap = gapOf();
+      var wentUp = stage.scrollTop < lastTop - 1 && gap > lastGap + 4;
       if (mvAtLatest(stage)) { mv.follow = true; mv.fresh = 0; }
-      else if (Date.now() - hand < MV_HAND_MS) mv.follow = false;
+      else if (wentUp && Date.now() - hand < MV_HAND_MS) mv.follow = false;
       else if (mv.follow) stage.scrollTop = stage.scrollHeight;
+      lastTop = stage.scrollTop;
+      lastGap = gapOf();
       mvChipPaint();
       if (stage.scrollTop < 60) mvHistoryMore();
     }, {passive: true});
