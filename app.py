@@ -85569,6 +85569,20 @@ def sfx_pin_prefix() -> str:
     return str(got["path"]).rstrip("/") + "/"
 
 
+def sfx_pin_folder_known(path: str) -> bool:
+    """[pin-any-folder] a folder is in the SFX collection when the clip book
+    holds a playable clip under it - the same book the folder sheet lists
+    and every pinned road filters (sfx_ads under COMFY_OUTPUT was listed and
+    refused). substr, not LIKE: folder names carry '_' and '%'."""
+    prefix = str(path).rstrip("/") + "/"
+    try:
+        con = sfx_db_reader()
+        return con.execute("SELECT 1 FROM clips WHERE playable = 1 AND substr(path, 1, ?) = ? LIMIT 1",
+                           (len(prefix), prefix)).fetchone() is not None
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def sfx_pin_set(path: str, hours: float) -> dict[str, Any]:
     SFX_PIN_PATH.parent.mkdir(parents=True, exist_ok=True)
     if not path:
@@ -85664,6 +85678,8 @@ async def sfx_folder_pin_api(
         return {"ok": True, "pin": None, "say": "every folder again - the pin is cleared"}
     root_ok = any(path == str(r).rstrip("/") or path.startswith(str(r).rstrip("/") + "/")
                   for r in (SFX_ROOT, SFX_MADE_DIR))
+    if not root_ok and ".." not in path:                   # [pin-any-folder]
+        root_ok = await asyncio.to_thread(sfx_pin_folder_known, path)
     if not root_ok or ".." in path:
         raise HTTPException(status_code=400, detail="that is not a folder in the SFX collection")
     hours = float(body.get("hours") or 1)
