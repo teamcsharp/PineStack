@@ -1880,6 +1880,16 @@ class PineLive:
             pass
         self.note("cut", "cut %d closed: %s + %s (%.1f s)" % (
             row["index"], row["input"], row["mix"], row["seconds"]))
+        # [pinecam-config] "have the cam export an mp4 to pine box recordings
+        # when an album is being cut": the Pine Cam's footage of the same span
+        # goes to the set's own folder, beside the track (on by default)
+        hook = _app("pinecam_album_cut")
+        if callable(hook):
+            try:
+                dest = self.dest_folder(str(row.get("folder") or ""))
+            except Exception:  # noqa: BLE001
+                dest = ""
+            threading.Thread(target=hook, args=(dict(row), dest), name="pinecam-album", daemon=True).start()
 
     def courier_stats(self) -> dict[str, Any]:
         now = time.time()

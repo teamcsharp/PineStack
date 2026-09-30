@@ -910,3 +910,51 @@
 .pcp-relay-h svg { width: 14px; height: 14px; fill: currentColor; }
 .pcp-relay button { flex: 1 1 0; justify-content: center; text-transform: capitalize; }
 .pcp-relay button.on { background: #1d4c58; border-color: #65c7da; color: #fff; }
+
+/* [pinecam-config] press and hold CAM: every setting, the recordings, H3 */
+.pine-cam-cfg { position: fixed; z-index: 2147483040; max-height: 88vh; display: flex; flex-direction: column;
+  background: #0b0f11; color: #d8e2e6; border: 1px solid #24323a; border-radius: 12px;
+  box-shadow: 0 18px 46px rgba(0, 0, 0, .62); font: 12px/1.4 system-ui, sans-serif; overflow: hidden; }
+.pine-cam-cfg[hidden] { display: none !important; }
+.pine-cam-cfg .pine-cam-x { margin-left: auto; font-size: 18px; }
+.pcc-tabs { display: flex; gap: 4px; margin-left: 10px; }
+.pcc-tabs button, .pcc-btn, .pcc-chip { display: inline-flex; align-items: center; gap: 5px; padding: 4px 9px;
+  background: #111a1e; color: #cfe0e6; border: 1px solid #24323a; border-radius: 7px; cursor: pointer; font: inherit; }
+.pcc-tabs button.on, .pcc-chip.on { background: #16343b; border-color: #65c7da; color: #fff; }
+.pcc-btn:disabled { opacity: .45; cursor: default; }
+.pcc-tabs svg, .pcc-btn svg, .pcc-sec-h svg, .pcc-drop svg, .pcc-ph svg { width: 14px; height: 14px; fill: currentColor; flex: none; }
+.pcc-body { overflow: auto; padding: 10px 12px; flex: 1 1 auto; min-height: 0; }
+.pcc-body[hidden] { display: none; }
+.pcc-foot { padding: 6px 12px; border-top: 1px solid #1b262c; min-height: 18px; color: #9fb4bd; }
+.pcc-sec { padding: 8px 0 10px; border-bottom: 1px solid #1b262c; }
+.pcc-sec:last-child { border-bottom: 0; }
+.pcc-sec-h { display: flex; align-items: center; gap: 6px; color: #65c7da; letter-spacing: .05em; text-transform: uppercase; font-size: 11px; }
+.pcc-row { display: flex; align-items: center; gap: 8px; margin-top: 6px; }
+.pcc-lab { min-width: 92px; color: #9fb4bd; }
+.pcc-row select { flex: 1 1 auto; min-width: 0; background: #111a1e; color: #e6eef1; border: 1px solid #24323a; border-radius: 6px; padding: 3px 6px; font: inherit; }
+.pcc-switch { cursor: pointer; }
+.pcc-btns { flex-wrap: wrap; }
+.pcc-drop { display: flex; align-items: center; gap: 10px; padding: 10px 12px; border: 1px dashed #3b5560; border-radius: 10px; color: #cfe0e6; }
+.pcc-drop svg { width: 22px; height: 22px; }
+.pcc-drop div { display: flex; flex-direction: column; min-width: 0; }
+.pcc-drop span { color: #8fa3ab; overflow-wrap: anywhere; }
+.pcc-drop.over { border-color: #65c7da; background: rgba(101, 199, 218, .1); }
+.pcc-chips { flex-wrap: wrap; }
+.pcc-list { margin-top: 8px; max-height: 46vh; overflow: auto; }
+.pcc-rec { display: flex; align-items: center; gap: 10px; padding: 6px 4px; border-bottom: 1px solid #16211f; cursor: grab; }
+.pcc-rec.writing { opacity: .55; cursor: default; }
+.pcc-thumb { width: 96px; height: 54px; object-fit: cover; border-radius: 5px; background: #05080a; flex: none; }
+.pcc-words { display: flex; flex-direction: column; min-width: 0; flex: 1 1 auto; }
+.pcc-words span { color: #8fa3ab; overflow-wrap: anywhere; }
+.pcc-rbtns { display: flex; gap: 4px; flex: none; }
+.pcc-rbtns .pcc-btn { padding: 5px 7px; }
+.pcc-more { margin: 8px auto; }
+.pcc-player, .pcc-h3 { margin-top: 8px; padding: 8px; border: 1px solid #24323a; border-radius: 10px; background: #0e1417; }
+.pcc-player[hidden], .pcc-h3[hidden] { display: none; }
+.pcc-player video { display: block; width: 100%; max-height: 40vh; background: #000; border-radius: 6px; margin-top: 6px; }
+.pcc-ph { margin-top: 0; }
+.pcc-ph .pine-cam-x { margin-left: auto; }
+.pcc-h3 textarea { width: 100%; box-sizing: border-box; margin-top: 6px; background: #111a1e; color: #e6eef1;
+  border: 1px solid #24323a; border-radius: 6px; padding: 6px; font: inherit; resize: vertical; }
+.pcc-h3 input[type=range] { flex: 1 1 auto; }
+.pcc-pv { min-width: 3em; text-align: right; color: #9fb4bd; }

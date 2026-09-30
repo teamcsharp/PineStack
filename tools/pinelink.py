@@ -480,6 +480,8 @@ def say(state: str, **more) -> None:
             # other reading, so no surface has to ask a second door.
             **_LAST_SEEN, "stream": dict(_STREAM), "ts": ts, **lanes,
             "crop": crop,                                   # [pincrop]
+            # [seg-tz] the clock the segment names are written in
+            "tz_offset": int(time.localtime().tm_gmtoff),
             "source": source_view(),                        # [tabrelay]
             **more},
             indent=2))
@@ -1132,7 +1134,9 @@ def ffmpeg_cmd_cropped(box: dict) -> list[str]:
          ":hls_segment_filename=%s]%s"
          % (_tee_value(str(LIVE / "seg%05d.ts")),
             _tee_name(str(LIVE / "index.m3u8")))),
-        ("[f=segment:segment_time=%d:reset_timestamps=1:strftime=1]%s"
+        # [cam-fmp4] fragmented: readable while written, and after any kill
+        ("[f=segment:segment_time=%d:reset_timestamps=1:strftime=1"
+         ":segment_format_options=movflags=+frag_keyframe+empty_moov+default_base_moof]%s"
          % (SEGMENT_SECONDS,
             _tee_name(str(CLIPS / "%Y-%m-%d_%H-%M-%S.mp4")))),
         ("[f=mpegts:mpegts_flags=+resend_headers:pat_period=0.1:max_delay=0"
@@ -1224,6 +1228,7 @@ def ffmpeg_cmd(crop: dict | None = None) -> list[str]:
         "-map", "0:v", "-c", "copy",
         "-f", "segment", "-segment_time", str(SEGMENT_SECONDS),
         "-reset_timestamps", "1", "-strftime", "1",
+        "-segment_format_options", "movflags=+frag_keyframe+empty_moov+default_base_moof",   # [cam-fmp4]
         str(CLIPS / "%Y-%m-%d_%H-%M-%S.mp4"),
         # ...and a still, four times a second, for the picture in
         # picture. HLS would be the better picture and Chromium cannot
@@ -1583,10 +1588,23 @@ class _TsHandler(BaseHTTPRequestHandler):
         door's own TS, gone when the viewer is."""
         addr = (list(door.addrs) or ["127.0.0.1"])[0]
         src = "http://%s:%d/live.ts" % (addr, door.port)
+        # [pinecam-config] the desk picture's presets ride the viewer's own URL
+        # (?fps=&q=&w=), clamped here; nothing else changes for anyone else
+        from urllib.parse import parse_qs, urlsplit
+        qs = parse_qs(urlsplit(self.path).query)
+
+        def _num(key: str, lo: int, hi: int, dflt: int) -> int:
+            try:
+                return max(lo, min(hi, int((qs.get(key) or [dflt])[0])))
+            except (TypeError, ValueError):
+                return dflt
+
+        fps, qv, width = _num("fps", 5, 30, MJPEG_FPS), _num("q", 2, 31, MJPEG_Q), _num("w", 0, 1280, 0)
+        vf = "fps=%d" % fps + ((",scale=%d:-2" % width) if width >= 160 else "")
         cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin",
                "-fflags", "nobuffer", "-flags", "low_delay", "-probesize", "500000",
                "-analyzeduration", "0", "-i", src, "-an",
-               "-vf", "fps=%d" % MJPEG_FPS, "-q:v", str(MJPEG_Q),
+               "-vf", vf, "-q:v", str(qv),
                "-f", "mpjpeg", "-boundary_tag", "pineframe", "pipe:1"]
         try:
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
