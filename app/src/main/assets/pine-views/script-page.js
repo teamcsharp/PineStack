@@ -7800,6 +7800,119 @@
       if (h > 0) box.style.minHeight = Math.ceil(h) + 'px';
     } catch (e) { /* a card that cannot be measured still plays */ }
   }
+  /* [rr-popup] "If I click on a roulette wheel entry, then show a pop-up listing
+   * all of the entries in that roulette ... a table of all the potential
+   * alternative entries that could have been reached and also ... a table of
+   * what entries led up to that and what entries came after that."
+   * Everything is already on the card: each roll keeps its options, weights,
+   * the one it hit and the ones a rule removed (mvReel), and the card's rows
+   * are in the order they rolled. */
+  function mvRrPopWire(el, rows, i, which) {
+    if (!el || i < 0) return;
+    el.classList.add('sp-rr-pickable');
+    el.setAttribute('role', 'button');
+    el.setAttribute('tabindex', '0');
+    el.title = 'Every entry this roulette could have landed on, and what led up to it and came after';
+    var go = function (ev) {
+      if (ev) { ev.stopPropagation(); ev.preventDefault(); }
+      mvRrPopOpen(rows, i, which);
+    };
+    el.addEventListener('click', go);
+    el.addEventListener('keydown', function (ev) { if (ev.key === 'Enter' || ev.key === ' ') go(ev); });
+  }
+  function mvRrStepName(r, which) {
+    var s = which === 'sub' ? r.sub : r.main;
+    var st = String((s && s.stage) || (which === 'sub' ? 'item' : 'category'));
+    return String(r.table || r.fam || '') + ' - ' + st;
+  }
+  function mvRrChain(rows) {
+    var out = [];
+    rows.forEach(function (r, i) {
+      if (r && r.main) out.push({i: i, which: 'main', r: r});
+      if (r && r.sub) out.push({i: i, which: 'sub', r: r});
+    });
+    return out;
+  }
+  function mvRrPopTable(head, body) {
+    var t = make('table', 'sp-rrp-table');
+    var th = make('tr', '');
+    head.forEach(function (h) { th.appendChild(make('th', '', h)); });
+    t.appendChild(th);
+    body.forEach(function (cells) {
+      var tr = make('tr', cells.cls || '');
+      cells.forEach(function (c) { tr.appendChild(make('td', '', c == null ? '' : String(c))); });
+      if (cells.title) tr.title = cells.title;
+      t.appendChild(tr);
+    });
+    return t;
+  }
+  function mvRrPopOpen(rows, i, which) {
+    var old = document.getElementById('spRrPop');
+    if (old) old.remove();
+    var r = rows[i] || {};
+    var s = (which === 'sub' ? r.sub : r.main) || {};
+    var back = make('div', 'sp-rrp-back');
+    back.id = 'spRrPop';
+    var box = make('section', 'sp-rrp');
+    box.setAttribute('role', 'dialog');
+    box.setAttribute('aria-label', 'Roulette: ' + mvRrStepName(r, which));
+    var head = make('div', 'sp-rrp-head');
+    head.appendChild(make('b', '', mvRrStepName(r, which)));
+    head.appendChild(make('span', 'sp-rrp-landed',
+      'landed on ' + String(s.label || '-') + (s.dice != null ? ' - d100 ' + s.dice : '')));
+    var shut = make('button', 'sp-rrp-x', '\u2715');
+    shut.type = 'button';
+    shut.title = 'Close';
+    shut.setAttribute('aria-label', 'Close');
+    head.appendChild(shut);
+    box.appendChild(head);
+    /* 1. every entry this roulette held */
+    var opts = s.opts || [], w = s.weights || [], sum = 0;
+    w.forEach(function (x) { sum += Math.max(0, Number(x) || 0); });
+    var rejected = {};
+    (s.rej || []).forEach(function (x) { rejected[String((x && (x.label || x.id)) || x)] = String((x && x.why) || 'removed by a rule'); });
+    var all = opts.map(function (o, k) {
+      var wt = Math.max(0, Number(w[k]) || 0);
+      var row = [k + 1, o, w.length ? wt.toFixed(2) : '', (w.length && sum) ? (100 * wt / sum).toFixed(1) + '%' : '',
+        k === s.hit ? 'LANDED' : ''];
+      row.cls = k === s.hit ? 'sp-rrp-hit' : '';
+      return row;
+    });
+    Object.keys(rejected).forEach(function (o) {
+      var row = ['-', o, '', '', 'removed: ' + rejected[o]];
+      row.cls = 'sp-rrp-rej';
+      all.push(row);
+    });
+    box.appendChild(make('h4', '', 'Every entry in this roulette (' + opts.length + ')'));
+    box.appendChild(all.length ? mvRrPopTable(['#', 'entry', 'weight', 'chance', ''], all)
+      : make('p', 'sp-rrp-none', 'This roll kept no list of its entries.'));
+    /* 2 and 3. the chain on this card, in the order it rolled */
+    var chain = mvRrChain(rows);
+    var at = -1;
+    chain.forEach(function (c, k) { if (c.i === i && c.which === which) at = k; });
+    var line = function (c) {
+      var x = (c.which === 'sub' ? c.r.sub : c.r.main) || {};
+      return [mvRrStepName(c.r, c.which), x.label || '-', x.dice != null ? x.dice : '-',
+        x.of ? ((Number(x.hit) || 0) + 1) + ' of ' + x.of : ''];
+    };
+    var before = at > 0 ? chain.slice(0, at).map(line) : [];
+    var after = at >= 0 ? chain.slice(at + 1).map(line) : [];
+    box.appendChild(make('h4', '', 'What led up to it'));
+    box.appendChild(before.length ? mvRrPopTable(['roll', 'landed', 'd100', 'of'], before)
+      : make('p', 'sp-rrp-none', 'Nothing - this was the first roll on the card.'));
+    box.appendChild(make('h4', '', 'What came after it'));
+    box.appendChild(after.length ? mvRrPopTable(['roll', 'landed', 'd100', 'of'], after)
+      : make('p', 'sp-rrp-none', 'Nothing - this was the last roll on the card.'));
+    var close = function () { back.remove(); document.removeEventListener('keydown', esc, true); };
+    var esc = function (ev) { if (ev.key === 'Escape') close(); };
+    shut.addEventListener('click', function (ev) { ev.stopPropagation(); close(); });
+    back.addEventListener('click', function (ev) { if (ev.target === back) close(); });
+    box.addEventListener('click', function (ev) { ev.stopPropagation(); });
+    document.addEventListener('keydown', esc, true);
+    back.appendChild(box);
+    document.body.appendChild(back);
+  }
+
   function mvRrSheet(cur, rows, budgetMs) {
     var box = make('div', 'sp-rr');
     var tables = [];
@@ -7824,12 +7937,14 @@
       lc.appendChild(make('span', 'sp-rr-ld', r.main && r.main.dice != null ? String(r.main.dice) : '-'));
       lc.appendChild(make('span', 'sp-rr-ll', (r.main && r.main.label) || ''));
       if (cat.landedOf && cat.landedOf !== 'the only one') lc.appendChild(make('i', 'sp-rr-lof', cat.landedOf));
+      mvRrPopWire(lc, rows, rows.indexOf(r), 'main');                       /* [rr-popup] */
       line.appendChild(lc);
       if (r.sub) {
         var ls = make('div', 'sp-rr-ls');
         ls.appendChild(make('span', 'sp-rr-ld', r.sub.dice != null ? String(r.sub.dice) : '-'));
         ls.appendChild(make('span', 'sp-rr-ll', r.sub.label || ''));
         if (sub && sub.landedOf && sub.landedOf !== 'the only one') ls.appendChild(make('i', 'sp-rr-lof', sub.landedOf));
+        mvRrPopWire(ls, rows, rows.indexOf(r), 'sub');                     /* [rr-popup] */
         line.appendChild(ls);
       }
       mvRrFoldNote(line, r, cat, sub);            /* [rollplay] the rejected, counted; a failed table's reason */
