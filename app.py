@@ -121817,6 +121817,9 @@ async def generate_answer(
         feature_meta["export_command"] = True
         said = await export_command_run(export_cmd, settings)
         return said, {**feature_meta, "model": "cutter"}
+    elif export_near_miss(user_text):                        # [export-lead] never the chat model
+        feature_meta["export_command"] = True
+        return export_near_miss(user_text), {**feature_meta, "model": "cutter"}
     elif directive_cmd:
         # #1027: a standing order in the operator's words - written into
         # the policy file, moved on the dial when it names a road and a
@@ -200768,7 +200771,7 @@ def export_number(words: str) -> float | None:
 # the desk ("pine app", "the desktop app"). None = the audio cut (#1025).
 _EXPORT_SCREEN_RX = re.compile(
     r"\b(?:of|from|on|off)\s+(?:the\s+|my\s+|this\s+)?(?P<t>"
-    r"pine\s*ta[bp](?:let)?|pineta[bp]|tablet|"   # [screen-export-claim] "tap": the Nabu's ear
+    r"(?:pine|kind|pint|pain|paint|pie|part|find|mind|fine)[\s-]*(?:ta[bp]|tub|time)(?:let)?|tablet|"   # [export-lead] "Pine Tap", "KindTab", "part-time"
     r"pine\s*(?:cam(?:era)?|can)|pinecam|camera|cam|"   # [cam-export] the Pine Cam's footage
     r"(?:visual|video|picture)\s+(?:broadcast|show|radio|air)|"
     r"broadcast(?:'?s)?\s+(?:video|picture|visuals?)|"
@@ -200878,7 +200881,13 @@ def parse_export_command(text: str) -> dict[str, Any] | None:
     residue = re.sub(r"[^a-z ]+", " ", residue)
     left = [w for w in residue.split() if w not in _EXPORT_FILLER]
     if len(left) > 3:
-        return None
+        # [export-lead] the Nabu hears the air after the order: a screen order
+        # that LEADS the utterance, the screen named right after the window,
+        # is the operator's whatever follows it.
+        _scr = _EXPORT_SCREEN_RX.search(lowered, got.end())
+        _lead = [w for w in re.findall(r"[a-z']+", lowered[:got.start()]) if w not in _EXPORT_FILLER]
+        if not (_scr and _scr.start() - got.end() <= 3 and not _lead):
+            return None
     if unit.startswith(("sentence", "line", "piece", "bit", "exchange",
                         "turn")):                                  # #1114
         n = int(round(count))
@@ -200901,6 +200910,28 @@ def parse_export_command(text: str) -> dict[str, Any] | None:
                                    r"show)\b", lowered))
             else "talk")
     return {"seconds": seconds, "kind": kind}
+
+
+# [export-lead] an utterance that OPENS as an export order but cannot be read.
+# It must never reach the chat model, which answers "I'm on it" and does nothing.
+_EXPORT_NEAR_RX = re.compile(
+    r"^\W*(?:(?:please|hey|ok|okay|yo|so|can you|could you|would you)\W+)*"
+    r"(?:export|save out|save|cut|clip|grab|record out)\b.{0,40}?\b(?:last|past|previous)\b"
+    r".{0,30}?\b(?:seconds?|secs?|minutes?|mins?|hours?)\b")
+
+
+def export_near_miss(text: str) -> str:
+    """[export-lead] what to SAY when an export order could not be read, or ''."""
+    lowered = " ".join(str(text or "").lower().split())
+    if not lowered or not _EXPORT_NEAR_RX.search(lowered) or parse_export_command(text):
+        return ""
+    heard = re.split(r"(?<=[.!?])\s+", " ".join(str(text).split()))[0]
+    if len(heard) > 140:
+        heard = heard[:140].rsplit(" ", 1)[0] + " ..."
+    return ("I heard an export order but could not tell what to cut, so nothing was exported. "
+            "I heard: \"%s\". Say \"export the last five minutes of the pine tab\" for the tablet's "
+            "screen, \"... of the pine cam\" for the camera, \"... of the pine app\" for the desk, "
+            "or \"... of the broadcast\" for the audio." % heard)
 
 
 def parse_paper_command(text: str) -> str:

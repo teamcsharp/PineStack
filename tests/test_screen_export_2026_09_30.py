@@ -9,7 +9,8 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = (ROOT / "app.py").read_text(encoding="utf-8")
-WANT = {"export_number", "parse_export_command", "export_screen_target", "export_dir_shaped"}
+WANT = {"export_number", "parse_export_command", "export_screen_target", "export_dir_shaped",
+        "export_near_miss"}
 
 
 def _parser():
@@ -25,7 +26,11 @@ def _parser():
                 keep.append(node)
     ns = {"re": re, "Any": Any}
     exec(compile(ast.Module(keep, []), "app.py", "exec"), ns)
+    _NS.update(ns)
     return ns["parse_export_command"]
+
+
+_NS: dict = {}
 
 
 parse = _parser()
@@ -41,6 +46,29 @@ class ScreenOrders(unittest.TestCase):
         # [screen-export-claim] 06:47 "Export the last minute of the Pine Tap broadcast." became an audio cut
         self.assertEqual(parse("Export the last minute of the Pine Tap broadcast."), {"seconds": 60, "screen": "tab"})
         self.assertEqual(parse("export the last 5 minutes of pinetap"), {"seconds": 300, "screen": "tab"})
+
+    def test_what_the_nabu_really_delivered(self):
+        # [export-lead] 09:26 / 09:36 / 09:38: the ears, and the air heard after the order
+        self.assertEqual(parse("export the last three minutes of KindTab"), {"seconds": 180, "screen": "tab"})
+        self.assertEqual(parse("Export the last three minutes of Pine Tab Radio.  I heard what you said. "
+                               "Go ahead. The image announces complete."), {"seconds": 180, "screen": "tab"})
+        self.assertEqual(parse("export the last minute of part-time broadcast  I'm still big for a big now, "
+                               "I was gonna come and clip in New York and mess it to an audience"),
+                         {"seconds": 60, "screen": "tab"})
+        self.assertEqual(parse("Export the last 5 minutes of the pine tab display"), {"seconds": 300, "screen": "tab"})
+
+    def test_an_unreadable_order_is_answered_honestly(self):
+        # [export-lead] never the chat model's "I'm on it" - it did nothing
+        near = _NS["export_near_miss"]
+        said = near("export the last 5 minutes of the zork. and then some more words from the radio here")
+        self.assertIn("nothing was exported", said)
+        self.assertIn("pine tab", said)
+        self.assertEqual(near("export the last 5 minutes of the pine tab"), "")      # a real order
+        self.assertEqual(near("the last five minutes were great"), "")               # not an order
+
+    def test_the_air_still_cannot_order_an_export(self):
+        # #1154 holds: words BEFORE the verb are somebody else's sentence
+        self.assertIsNone(parse("we should export the last five minutes of the pine tab and put it on the wall"))
 
     def test_the_pine_cam(self):
         # [cam-export] "... of the pine cam" was an audio talk cut

@@ -2041,7 +2041,19 @@
      * cut carries the broadcast, ticking this is the difference between
      * sound and none - so it says that. */
     videoOnlyRow.appendChild(make('span', '', 'Record the picture only - no broadcast audio'));
-    body.appendChild(big);
+    /* [direct-export] 2026-09-30, the operator: "Put a button here for direct
+     * export. So whatever I have the slider set to export it to the folder at
+     * that time range. So I don't even go into the editor." The same road the
+     * editor-less surfaces always took (replayExport, upload: true -> the
+     * courier -> the recordings folder), beside the span it will cut. */
+    var bigRow = make('div', 'hc-bigrow');
+    bigRow.appendChild(big);
+    var direct = null;
+    if (has('replayExport')) {
+      direct = button('hc-btn hc-direct', '', 'c:export');
+      bigRow.appendChild(direct);
+    }
+    body.appendChild(bigRow);
     body.appendChild(range);
     body.appendChild(ticks);
     body.appendChild(holds);
@@ -2060,6 +2072,11 @@
         ticks.appendChild(t);
       }
       big.textContent = 'the last ' + fmtSeconds(STEPS[Number(range.value)]);
+      if (direct) {                                        /* [direct-export] */
+        direct.title = 'Export the last ' + fmtSeconds(STEPS[Number(range.value)])
+          + ' straight to the recordings folder - no editor';
+        direct.setAttribute('aria-label', direct.title);
+      }
     }
     range.addEventListener('input', paintTicks);
     range.addEventListener('change', paintTicks);
@@ -2144,9 +2161,24 @@
         });
         return;
       }
-      toast('saving the last ' + fmtSeconds(seconds) + '…');
-      Promise.resolve(bridge().replayExport({seconds: seconds, upload: true})).then(function (got) {
-        save.disabled = false;
+      directExport(seconds, save);
+    });
+    if (direct) {
+      direct.addEventListener('click', function () {
+        if (captureBusy) { toast('Preparing the captured video…'); return; }
+        directExport(STEPS[Number(range.value)] || STEPS[0], direct);
+      });
+    }
+
+    /* [direct-export] cut the ring's last `seconds` and carry it to the folder */
+    function directExport(seconds, btn) {
+      btn.disabled = true;
+      if (direct) direct.disabled = true;
+      toast('exporting the last ' + fmtSeconds(seconds) + '…');
+      Promise.resolve(bridge().replayExport({seconds: seconds, upload: true,
+        video_only: !!(canEdit && videoOnly.checked)})).then(function (got) {
+        btn.disabled = false;
+        if (direct) direct.disabled = false;
         if (!got || !got.ok) {
           toast(String((got && got.detail) || 'it could not be saved'), true);
           return;
@@ -2159,10 +2191,11 @@
         toast(said);
         s.close();
       }, function (err) {
-        save.disabled = false;
+        btn.disabled = false;
+        if (direct) direct.disabled = false;
         toast(String((err && err.message) || err), true);
       });
-    });
+    }
   }
 
   /* --------------------------------------- "inspect": the line inspector */
