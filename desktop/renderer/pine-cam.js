@@ -414,19 +414,47 @@
       return host ? 'http://' + host + ':' + tsInfo.port + '/live.mjpg' : '';
     } catch (e) { return ''; }
   }
+  /* [cam-open] "the cam window's actually popping up a little weirder now
+     whenever I pop it open and close it": the stream was cut by taking the
+     src away, so the box went black before its VCR out, and every open began
+     from an empty box and waited ~1 s for the stream to connect. Now the
+     stream is cut by pointing the <img> at a fresh still - a browser keeps the
+     last frame up until the still has arrived, so the picture never blanks -
+     and an open shows a fresh still first (it lands during the VCR dot), with
+     the stream taking over behind it. */
+  function stillUrl() { return base() + '/api/pinelink/frame.jpg?c=' + Date.now(); }
   function mjpegStop(img) {
-    if (img && img.__mjpeg) { img.__mjpeg = ''; try { img.removeAttribute('src'); } catch (e) { /* gone */ } }
+    if (img && (img.__mjpeg || img.__mjpegNext)) {
+      img.__mjpeg = ''; img.__mjpegNext = ''; img.onerror = null;
+      try { img.src = stillUrl(); } catch (e) { /* gone */ }
+    }
+  }
+  function mjpegStart(img, m) {
+    img.__mjpegNext = m;
+    img.onerror = null;                      /* a still that fails is not the stream failing */
+    var done = false;
+    function go() {
+      if (done) return;
+      done = true;
+      img.removeEventListener('load', go);
+      img.removeEventListener('error', go);
+      if (!shown || img.__mjpegNext !== m) return;
+      img.__mjpegNext = '';
+      img.__mjpeg = m;
+      img.onerror = function () { mjpegFailedAt = Date.now(); img.__mjpeg = ''; };
+      img.src = m + '?c=' + Date.now();
+    }
+    img.addEventListener('load', go);
+    img.addEventListener('error', go);
+    setTimeout(go, 1500);                    /* a still that never lands does not hold the stream back */
+    img.src = stillUrl();
   }
   function paintFrame() {
     var img = document.getElementById('pineCamImg');
     if (!img || !shown) return;
     var m = mjpegUrl();
     if (m && Date.now() - mjpegFailedAt > 5000) {
-      if (img.__mjpeg !== m) {
-        img.__mjpeg = m;
-        img.onerror = function () { mjpegFailedAt = Date.now(); img.__mjpeg = ''; };
-        img.src = m + '?c=' + Date.now();
-      }
+      if (img.__mjpeg !== m && img.__mjpegNext !== m) mjpegStart(img, m);
       return;                                /* the stream paints itself */
     }
     img.__mjpeg = '';
