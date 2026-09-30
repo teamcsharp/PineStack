@@ -387,9 +387,36 @@
    * 'the camera is not being shared with you' - measured from the PC.
    * The tablet never saw it only because its loopback door needs no
    * token. The buster is `?c=` now, on both pictures. */
+  /* [cam-mjpeg] "I want it also high FPS like the tablet": a page with no
+     native surface (the desk) plays the door's multipart JPEG stream in the
+     same <img>, once - it paints itself at the stream's rate. The JPEG poll
+     stands in when the door is down or the stream fails (retried after 5 s). */
+  var mjpegFailedAt = 0;
+  function mjpegUrl() {
+    if (nativeOn || !tsInfo) return '';
+    var u = String(tsInfo.url || '');
+    if (/\/live\.ts/.test(u)) return u.replace(/\/live\.ts.*$/, '/live.mjpg');
+    try {
+      var host = new URL(base() || root.location.href).hostname;
+      return host ? 'http://' + host + ':' + tsInfo.port + '/live.mjpg' : '';
+    } catch (e) { return ''; }
+  }
+  function mjpegStop(img) {
+    if (img && img.__mjpeg) { img.__mjpeg = ''; try { img.removeAttribute('src'); } catch (e) { /* gone */ } }
+  }
   function paintFrame() {
     var img = document.getElementById('pineCamImg');
     if (!img || !shown) return;
+    var m = mjpegUrl();
+    if (m && Date.now() - mjpegFailedAt > 5000) {
+      if (img.__mjpeg !== m) {
+        img.__mjpeg = m;
+        img.onerror = function () { mjpegFailedAt = Date.now(); img.__mjpeg = ''; };
+        img.src = m + '?c=' + Date.now();
+      }
+      return;                                /* the stream paints itself */
+    }
+    img.__mjpeg = '';
     /* A cache-buster, because the frame is one URL that keeps changing and
      * every layer between here and the disk would happily hold on to it. */
     img.src = base() + '/api/pinelink/frame.jpg?c=' + Date.now();
@@ -435,6 +462,7 @@
     cropDrawClose(false);
     nativeStop();                          /* #1470: before the box goes */
     shown = false;
+    mjpegStop(document.getElementById('pineCamImg'));   /* [cam-mjpeg] the stream goes with the box */
     if (box) vcrBox(false);                /* [vcrfx] picture -> line -> dot, then hidden */
     if (frameTimer) { clearInterval(frameTimer); frameTimer = 0; }
     repaintPicture();
