@@ -23558,6 +23558,7 @@
 
   function gapPaint() {
     if (!gapUi) return;
+    if (gapBig) gapBigPaint();                               /* [reply-gap:big] */
     var s = gapState;
     var w = gapWindow(s.gap, s.range);
     var a = gapPct(s.gap), b = gapPct(s.range);
@@ -23903,6 +23904,152 @@
     });
   }
 
+  /* [reply-gap:big] "If I double tap the slider area, show a large pop-up with
+   * the slider in it ... if I double tap or if I tap and hold on it." A tap on
+   * the track moves the nearer thumb, so the popup's opener first puts back
+   * what the values were before the gesture began - opening it never changes
+   * the pause. Inside, the same two thumbs on a long track (gapDualWire), the
+   * same preview on the dice and the same station-wide POST. */
+  var gapBig = null;
+  function gapPct(v) { return ((gapNum(v, GAP_MIN) - GAP_MIN) / (GAP_MAX - GAP_MIN)) * 100; }
+  function gapBigPaint() {
+    if (!gapBig) return;
+    var a = gapPct(gapState.gap), b = gapPct(gapState.range);
+    gapBig.a.style.left = a.toFixed(2) + '%';
+    gapBig.b.style.left = b.toFixed(2) + '%';
+    gapBig.span.style.left = Math.min(a, b).toFixed(2) + '%';
+    gapBig.span.style.width = Math.abs(b - a).toFixed(2) + '%';
+    gapBig.av.textContent = gapFmt(gapState.gap);
+    gapBig.bv.textContent = gapFmt(gapState.range);
+    gapBig.av.style.left = a.toFixed(2) + '%';
+    gapBig.bv.style.left = b.toFixed(2) + '%';
+    var lo = Math.min(gapState.gap, gapState.range), hi = Math.max(gapState.gap, gapState.range);
+    gapBig.say.textContent = gapState.roll
+      ? 'Each pause is rolled between ' + gapFmt(lo) + ' and ' + gapFmt(hi) + '.'
+      : 'The roulette is off: every pause is ' + gapFmt(gapState.gap) + '.';
+  }
+  function gapBigClose() {
+    if (!gapBig) return;
+    try { gapBig.back.remove(); } catch (e) { /* gone */ }
+    document.removeEventListener('keydown', gapBig.esc, true);
+    gapBig = null;
+    gapPreviewEnd();
+  }
+  function gapBigOpen() {
+    if (gapBig) return;
+    var back = make('div', 'sp-gapbig-back');
+    var box = make('section', 'sp-gapbig');
+    box.setAttribute('role', 'dialog');
+    box.setAttribute('aria-label', 'The pause between replies');
+    var head = make('div', 'sp-gapbig-head');
+    head.appendChild(make('b', '', 'Pause between replies'));
+    head.appendChild(make('span', 'sp-gapbig-note', 'station-wide - every listener hears this'));
+    var shut = make('button', 'sp-gapbig-x', '\u2715');
+    shut.type = 'button';
+    shut.title = 'Close';
+    shut.setAttribute('aria-label', 'Close');
+    head.appendChild(shut);
+    box.appendChild(head);
+    var track = make('div', 'sp-gap-track sp-gapbig-track');
+    var rail = make('span', 'sp-gap-rail');
+    var span = make('span', 'sp-gap-span');
+    var mk = function (cls, label) {
+      var th = make('span', 'sp-gap-thumb ' + cls);
+      th.setAttribute('role', 'slider');
+      th.setAttribute('tabindex', '0');
+      th.setAttribute('aria-label', label);
+      th.setAttribute('aria-valuemin', String(GAP_MIN));
+      th.setAttribute('aria-valuemax', String(GAP_MAX));
+      th.title = label + ' - drag, or use the arrow keys';
+      return th;
+    };
+    var a = mk('sp-gap-a', 'Pause between replies');
+    var b = mk('sp-gap-b', 'Roulette range end');
+    track.appendChild(rail);
+    track.appendChild(span);
+    track.appendChild(a);
+    track.appendChild(b);
+    var vals = make('div', 'sp-gapbig-vals');
+    var av = make('span', 'sp-gapbig-v sp-gapbig-va', '');
+    var bv = make('span', 'sp-gapbig-v sp-gapbig-vb', '');
+    vals.appendChild(av);
+    vals.appendChild(bv);
+    var scale = make('div', 'sp-gapbig-scale');
+    scale.appendChild(make('span', '', gapFmt(GAP_MIN)));
+    scale.appendChild(make('span', '', gapFmt(GAP_MAX)));
+    var say = make('p', 'sp-gapbig-say', '');
+    box.appendChild(vals);
+    box.appendChild(track);
+    box.appendChild(scale);
+    box.appendChild(say);
+    back.appendChild(box);
+    ['click', 'dblclick', 'pointerdown', 'touchstart', 'wheel'].forEach(function (name) {
+      box.addEventListener(name, function (ev) { ev.stopPropagation(); }, {passive: true});
+    });
+    var esc = function (ev) { if (ev.key === 'Escape') gapBigClose(); };
+    gapBig = {back: back, a: a, b: b, span: span, av: av, bv: bv, say: say, esc: esc};
+    shut.addEventListener('click', function (ev) { ev.stopPropagation(); gapBigClose(); });
+    back.addEventListener('click', function (ev) { if (ev.target === back) gapBigClose(); });
+    document.addEventListener('keydown', esc, true);
+    gapDualWire(track, a, b);
+    document.body.appendChild(back);
+    gapBigPaint();
+  }
+  function gapBigWire(area) {
+    var held = null, holdT = 0, lastUp = 0, lastXY = null, before = null;
+    var restore = function (v) {
+      if (!v) return;
+      gapState.gap = v.gap;
+      gapState.range = v.range;
+      gapPaint();
+      gapSend(true);
+      gapPreviewEnd();
+    };
+    var cancelTrack = function (pid) {
+      try { area.querySelector('.sp-gap-track').dispatchEvent(new PointerEvent('pointercancel', {pointerId: pid})); }
+      catch (e) { /* the drag ends at its own pointerup */ }
+    };
+    area.addEventListener('pointerdown', function (ev) {
+      var now = Date.now();
+      var again = now - lastUp < 350 && lastXY && Math.abs(ev.clientX - lastXY[0]) < 30 && Math.abs(ev.clientY - lastXY[1]) < 30;
+      if (!again) before = {gap: gapState.gap, range: gapState.range};
+      held = {id: ev.pointerId, x: ev.clientX, y: ev.clientY};
+      clearTimeout(holdT);
+      if (again) {
+        held = null;
+        var pid = ev.pointerId;
+        setTimeout(function () { cancelTrack(pid); restore(before); gapBigOpen(); }, 0);
+        return;
+      }
+      holdT = setTimeout(function () {
+        if (!held) return;
+        cancelTrack(held.id);
+        held = null;
+        restore(before);
+        gapBigOpen();
+      }, 550);
+    }, true);
+    area.addEventListener('pointermove', function (ev) {
+      if (held && (Math.abs(ev.clientX - held.x) > 8 || Math.abs(ev.clientY - held.y) > 8)) {
+        held = null;
+        clearTimeout(holdT);
+      }
+    }, true);
+    var up = function (ev) {
+      clearTimeout(holdT);
+      held = null;
+      lastUp = Date.now();
+      lastXY = [ev.clientX, ev.clientY];
+    };
+    area.addEventListener('pointerup', up, true);
+    area.addEventListener('pointercancel', function () { clearTimeout(holdT); held = null; }, true);
+    area.addEventListener('dblclick', function (ev) {
+      ev.stopPropagation();
+      if (!gapBig) { restore(before); gapBigOpen(); }
+    });
+    area.title = 'Drag a thumb; double-tap or press and hold for a large slider';
+  }
+
   function gapBar() {
     var wrap = make('div', 'sp-gap sp-band-always');
     wrap.setAttribute('role', 'group');
@@ -23971,6 +24118,7 @@
     gapUi = {wrap: wrap, dual: dual, track: track, span: span, a: a, b: b, val: val,
       sw: sw, die: die, reel: reel, count: count, rowbar: rowbar};
     gapDualWire(track, a, b);
+    gapBigWire(dual);                                        /* [reply-gap:big] */
     if (!gapCueWired) {
       gapCueWired = true;
       root.addEventListener('pine-reply-gap', gapOnCue);
