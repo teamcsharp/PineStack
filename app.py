@@ -16378,6 +16378,78 @@ def dialogue_audio_ready(kind: str, row: Any) -> bool:
         return False
 
 
+# [boot-dj] THE BOOTH'S SYSTEM 3 GATE, READ AHEAD OF THE BOOTH.
+#
+# While System 3 is active, _speak_turns_floorless withholds a round whose
+# bound roulette turns do not make a complete conversation - and it is the
+# LAST door, reached after the rescue or the standing consumer has already
+# chosen the round, taken the floor and spent its turn. Measured 2026-09-30
+# at boot: 107 of the 130 unheard dialogue rounds on the open roads failed
+# it ("incomplete conversation withheld after repair", "9 of 11 turns;
+# limit 9"), all of them counted READY, so the cupboard said 240 rounds
+# stood ready while the consumer aired nothing and a reboot opened on a
+# record. This asks exactly what the booth asks, of the entry the booth is
+# handed (_ready_air_entry: `script`, `lines`, `system3`, `turn_dice`), so
+# dialogue_row_ready stops calling a round ready that can never air.
+# tests/test_boot_dj_2026_09_30.py runs the real booth on the same fixtures.
+#
+# banter_turns costs ~300 us a round and this rides every readiness walk,
+# so the answer is kept per entry until its words, lines or binding change.
+_S3_BIND_MEMO: dict[int, tuple[Any, str]] = {}
+
+
+def s3_binding_withheld(entry: Any) -> str:
+    """[boot-dj] "" when System 3 would let this round through the booth,
+    else the booth's own words for why it withholds it."""
+    try:
+        if not isinstance(entry, dict):
+            return ""
+        _active = globals().get("_s3_active")
+        if not (callable(_active) and _active()):
+            return ""
+        s3 = entry.get("system3")
+        if not isinstance(s3, dict) or s3.get("mode") != "active":
+            return "round withheld without an active System 3 conversation"
+        ids = s3.get("turns") or {}
+        dice_raw = entry.get("turn_dice")
+        script = str(entry.get("script") or "")
+        sig = (script, entry.get("caller_name"), entry.get("caller2_name"),
+               entry.get("lines"), s3.get("planned_turns"),
+               id(ids), len(ids) if isinstance(ids, dict) else -1,
+               id(dice_raw), len(dice_raw) if isinstance(dice_raw, dict) else -1)
+        held = _S3_BIND_MEMO.get(id(entry))
+        if held is not None and held[0] == sig:
+            return held[1]
+        turns = banter_turns(script, str(entry.get("caller_name") or ""),
+                             str(entry.get("caller2_name") or ""))
+        dice = _turn_dice_map(entry)
+        if not isinstance(ids, dict):
+            ids = {}
+        positions = [i for i in range(len(turns))
+                     if str(ids.get(str(i)) or "")
+                     and str((dice.get(i, {}).get("s3") or {}).get("turn_id") or "")
+                     == str(ids.get(str(i)))]
+        why = ""
+        if not positions:
+            why = "round withheld without bound roulette turns"
+        else:
+            planned = int(s3.get("planned_turns") or len(positions))
+            try:
+                limit = int(entry.get("lines"))
+            except (TypeError, ValueError):
+                limit = 0
+            if (planned < 3 or len(positions) != planned or limit < planned
+                    or len({str(turns[i][0]) for i in positions}) < 2):
+                why = ("incomplete conversation withheld after repair "
+                       "(%d of %d turns; limit %d)" % (len(positions), planned, limit))
+        if len(_S3_BIND_MEMO) > 8192:
+            _S3_BIND_MEMO.clear()
+        _S3_BIND_MEMO[id(entry)] = (sig, why)
+        return why
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def dialogue_row_ready(kind: str, row: Any) -> bool:
     """One authoritative zero-work-to-air predicate for scheduled stock."""
     try:
@@ -16418,6 +16490,10 @@ def dialogue_row_ready(kind: str, row: Any) -> bool:
             if (content_gate_enabled("call_contract") and str(kind) == "caller"
                     and callable(_call_gate)
                     and not _call_gate(entry)):
+                return False
+            # [boot-dj] ...and a round System 3's booth gate would withhold
+            # is not zero-work-to-air either: it never reaches the air at all.
+            if s3_binding_withheld(entry):
                 return False
         return (dialogue_tint_ready(kind, row)
                 and dialogue_audio_ready(kind, row))
@@ -61826,7 +61902,7 @@ def dead_air_stock() -> dict[str, int]:
     return out
 
 
-async def dead_air_rescue(quiet: float) -> str:
+async def dead_air_rescue(quiet: float, why: str = "") -> str:
     """Put a finished SEGMENT on the air rather than a noise.
 
     Returns the road that answered, or "" when the cupboard had nothing -
@@ -61873,8 +61949,8 @@ async def dead_air_rescue(quiet: float) -> str:
         if said:
             repair_note("%s - a finished %s round was taken out of the "
                         "cupboard and put on the air (%d line(s))"
-                        % ("the show ran out of things to say" if quiet <= 0
-                           else "dead air %ds" % int(quiet),
+                        % (why or ("the show ran out of things to say" if quiet <= 0   # [boot-dj]
+                                   else "dead air %ds" % int(quiet)),
                            kind, len(said)))
             pipeline_log("air", "SILENCE FILLED: %d line(s) of a ready %s "
                                 "round, off the shelf, out of turn - the "
@@ -61885,9 +61961,9 @@ async def dead_air_rescue(quiet: float) -> str:
             _inject = globals().get("system3_injected_node")
             if callable(_inject):
                 _inject(by="the dead-air rescue",
-                        why=("the show ran out of things to say"
-                             if quiet <= 0 else
-                             "the room was quiet %d s" % int(quiet))
+                        why=(why or ("the show ran out of things to say"   # [boot-dj]
+                                     if quiet <= 0 else
+                                     "the room was quiet %d s" % int(quiet)))
                         + " - a finished %s round went out off the shelf, "
                           "out of turn (%d line(s))" % (kind, len(said)),
                         kind="rescue", at=now,
@@ -63344,12 +63420,32 @@ async def resume_radio() -> None:
     await asyncio.sleep(5)            # let the music index load first
     # #824: a respin never opens with silence — an off-the-shelf line airs
     # NOW, before the first model write or long render.
+    #
+    # [boot-dj] THE FIRST THING ON AIR AFTER A REBOOT IS A BANKED DJ ROUND.
+    # The operator, 2026-09-30: "DJs talk right away - the first thing on
+    # air is a banked, ready DJ round, then the music continues. No
+    # minutes-long wait for the DJs." This called cover_the_gap alone, and
+    # at 100% talk that ladder asks only the banter larder and then rolls a
+    # record - so a reboot with 240 finished rounds in the cupboard opened on
+    # a record and the first DJ line came 92 s later. The cupboard's own
+    # out-of-turn door answers first now: dead_air_rescue(0) takes the
+    # readiest finished round of the entry on air, else manager, gallery,
+    # caller, news, through _ready_shelf_air - which stamps it heard at the
+    # hand-off and keeps the repeat check, so no reboot can open on a round
+    # an earlier one already aired. Only when the cupboard holds nothing
+    # that will air does the old cover (a rolled record, then SFX) go.
     async def _instant_open() -> None:
+        try:
+            if await dead_air_rescue(
+                    0.0, "the station came back on air after a restart - the "
+                         "first thing it says is a banked round (#824)"):
+                return
+        except Exception:  # noqa: BLE001
+            pass
         try:
             await cover_the_gap("dj", "the station is respinning (#824)")
         except Exception:
             pass
-    fire_and_forget(_instant_open())
     try:
         # A restart mid-announce leaves the satellite stuck "responding"
         # (#391): heal BEFORE the show opens its mouth, not two minutes
@@ -63365,6 +63461,11 @@ async def resume_radio() -> None:
         dj_start(dj_best_station(str(want.get("station") or "")))
     except Exception:
         pass
+    # [boot-dj] ...and it opens once the station IS on: dj_start is what
+    # turns the show on and loads the larder, the pantry and the shelf the
+    # banked round is taken from. Fired above it, the open ran before them
+    # whenever the satellite heal awaited, and found nothing to air.
+    fire_and_forget(_instant_open())       # [boot-dj] after dj_start
 
 
 def radio_owned_models() -> list[str]:
@@ -158788,6 +158889,9 @@ def dialogue_row_ready_why(kind: str, row: Any) -> str:
             if (str(kind) == "caller" and callable(_call_gate)
                     and not _call_gate(entry)):
                 return "the phone-call contract does not hold"
+            _s3_withheld = s3_binding_withheld(entry)          # [boot-dj]
+            if _s3_withheld:
+                return "System 3 would withhold it at the booth: " + _s3_withheld
         if not dialogue_tint_ready(str(kind), row):
             return "the tinted version is not the active one"
         if not dialogue_audio_ready(str(kind), row):
