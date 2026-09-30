@@ -1108,6 +1108,9 @@
     var dark = !!b.dark;
     var text = String(b.label || (b.charging ? 'charging' : (b.word || '?')));
     if (stale && !dark) text += ' · stale';
+    /* [camcharge-icon] "whenever it's charging, just show the logo for charging,
+       don't show the text" - the bolt alone (the title still says it) */
+    if (b.charging && !stale && !dark) text = '';
     var title = String(b.what || b.say || 'Pine Cam battery')
       + '. Read ' + battAgeSay(age) + ' ago'
       + (stale ? ' - STALE: the camera has not answered since' + (b.error ? ' (' + b.error + ')' : '') : '')
