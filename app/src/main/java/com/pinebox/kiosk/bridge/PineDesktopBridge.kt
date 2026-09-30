@@ -66,6 +66,9 @@ class PineDesktopBridge(
         /* The Pine Cam relay's door on the station host - see camUrl(). */
         private const val CAM_PORT = 8098
         private const val CAM_PATH = "/live.ts"
+        /* [bridge-take] answers longer than this are pulled, not spliced */
+        private const val TAKE_OVER = 16 * 1024
+        private const val TAKE_KEEP = 24
 
         /* Why the LCD and the provisioner are refused here rather than
          * forwarded. Both drive hardware attached to the BOX: the LCD is a
@@ -1920,10 +1923,40 @@ class PineDesktopBridge(
         .put("abi", Build.SUPPORTED_ABIS.firstOrNull() ?: "")
         .put("fingerprint", Build.FINGERPRINT)
 
+    /* [bridge-take] A BIG ANSWER IS NOT SCRIPT SOURCE.
+     *
+     * Measured on the tablet 2026-09-30: the bridge settled 16 MB a minute,
+     * 9 MB of it /api/dj (609 kB every 4 s), each one spliced into an
+     * evaluateJavascript() call as a string literal. V8 parses and compiles
+     * every such script and keeps it in its compilation cache; a 2-minute
+     * sampling heap profile had 51.6 MB still alive under (PARSER) - the
+     * largest live allocator in the renderer, which then grew to 885 MB and
+     * went on to take the tablet down with it (lowmemorykiller, 23:42,
+     * 23:48, 00:11). So an answer over TAKE_OVER characters waits here and
+     * the script carries only its id; the shim pulls the JSON string back
+     * through take() - a plain string across the interface, parsed once by
+     * JSON.parse, never by the JavaScript parser. Small answers keep the old
+     * road. A page that reloads never takes what it was owed, so the parked
+     * answers are capped at TAKE_KEEP, oldest out first. */
+    private val parked = object : LinkedHashMap<String, String>(16, 0.75f, false) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, String>?): Boolean =
+            size > TAKE_KEEP
+    }
+
+    /** The shim's half of [bridge-take]: the parked answer for [id], once. */
+    @JavascriptInterface
+    fun take(id: String?): String? = synchronized(parked) { parked.remove(id ?: "") }
+
     /** Deliver a settlement to the shim. Must run on the WebView's thread. */
     private fun settle(id: String, envelopeJson: String) {
-        val script = "window.__pineBridgeSettle && window.__pineBridgeSettle(" +
-            BridgeEnvelope.quote(id) + "," + BridgeEnvelope.quote(envelopeJson) + ");"
+        val script = if (envelopeJson.length > TAKE_OVER) {
+            synchronized(parked) { parked[id] = envelopeJson }
+            "window.__pineBridgeSettle && window.__pineBridgeSettle(" +
+                BridgeEnvelope.quote(id) + ",null,1);"
+        } else {
+            "window.__pineBridgeSettle && window.__pineBridgeSettle(" +
+                BridgeEnvelope.quote(id) + "," + BridgeEnvelope.quote(envelopeJson) + ");"
+        }
         webView.post {
             try {
                 webView.evaluateJavascript(script, null)
