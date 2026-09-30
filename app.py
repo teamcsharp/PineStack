@@ -164274,6 +164274,56 @@ def _hls_mix_call(fn: Any, mix: Any, *args: Any) -> Any:
         return fn(*args)
 
 
+# [mix-lane] ONE LANE PER LISTENER. Who is on which personal mix, keyed by
+# the token's tail and the address (a share link is often passed to several
+# people, so the token alone is not a listener).
+_HLS_LISTENER_MIX: dict[str, tuple[tuple[int, int, int], float]] = {}
+HLS_LISTENER_MIX_KEEP_S = 6 * 3600.0
+
+
+def _hls_mix_move(token: str, request: Request, mix: Any) -> None:
+    """[mix-lane] This listener asked for `mix`; if it was on another personal
+    mix a moment ago, that lane goes NOW - unless another listener is on it.
+    Called before the new lane is admitted, so the slot it frees is the one
+    the new lane takes. Never raises: a failure here must not cost the stream."""
+    try:
+        want = tuple(int(x) for x in mix)
+        addr = ""
+        try:
+            addr = str(request.headers.get("x-forwarded-for") or "").split(",")[0].strip()
+            addr = addr or str(getattr(request.client, "host", "") or "")
+        except Exception:  # noqa: BLE001
+            addr = ""
+        who = "%s|%s" % (str(token or "")[-12:], addr)
+        now = time.time()
+        prev = _HLS_LISTENER_MIX.get(who)
+        _HLS_LISTENER_MIX[who] = (want, now)
+        if len(_HLS_LISTENER_MIX) > 512:
+            for k, (_m, at) in list(_HLS_LISTENER_MIX.items()):
+                if now - at > HLS_LISTENER_MIX_KEEP_S:
+                    _HLS_LISTENER_MIX.pop(k, None)
+        if not prev or prev[0] == want:
+            return
+        old = prev[0]
+        for k, (m, at) in _HLS_LISTENER_MIX.items():
+            if k != who and m == old and now - at < HLS_LISTENER_MIX_KEEP_S:
+                return                      # somebody else is on that mix
+        fn = getattr(STATION_STREAM, "hls_release", None)
+        if callable(fn):
+            fn(mix=old)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _hls_refused(enc: Any) -> str:
+    """[mix-lane] Why this lane was refused, or "". A refused lane is retired
+    before it starts; waiting on it is fifteen seconds of nothing."""
+    lane = getattr(enc, "lane", None)
+    if lane is not None and getattr(lane, "retired", False):
+        return str(getattr(lane, "last_error", "") or "the station is full")
+    return ""
+
+
 def _hls_query(token: str, mix: Any = None) -> str:
     """#1475: `?t=<token>[&mix=a,b,c]` - the mix only when it is not the
     station's own, so the default lane's URLs stay short."""
@@ -164517,6 +164567,7 @@ async def station_stream_hls(
     from station_stream import listener_mix
     personal_mix = listener_mix(mix)
     _t0 = time.monotonic()
+    _hls_mix_move(t, request, personal_mix)                 # [mix-lane]
     # #1475: THE MASTER, WHEN THE STREAM MODULE HAS ONE. Four AAC rates
     # with aligned segments out of this listener's own lane (keyed by mix);
     # the player picks and switches on its own and starts thirty seconds
@@ -164535,15 +164586,20 @@ async def station_stream_hls(
         # waits for runway. A live media playlist is re-read from its own
         # URL, so this URL must not answer media now and a master later.
         master_path = None
+        _refused = ""
         try:
-            STATION_STREAM.hls(br, mix=personal_mix)
-            for _ in range(60):
+            _refused = _hls_refused(STATION_STREAM.hls(br, mix=personal_mix))
+            for _ in range(0 if _refused else 60):             # [mix-lane]
                 master_path = _hls_mix_call(_master_fn, personal_mix)
                 if master_path is not None:
                     break
                 await asyncio.sleep(0.25)
         except Exception:  # noqa: BLE001
             master_path = None
+        if _refused:                                         # [mix-lane]
+            raise HTTPException(
+                status_code=503, headers={"Retry-After": "5"},
+                detail="that mix could not start: " + _refused)
         master_raw = ""
         if master_path is not None:
             try:
@@ -164576,6 +164632,10 @@ async def station_stream_hls(
                 headers={"Cache-Control": "no-store, no-cache, must-revalidate",
                          "X-Content-Type-Options": "nosniff"})
     enc = STATION_STREAM.hls(br, mix=personal_mix)
+    if _hls_refused(enc):                                    # [mix-lane]
+        raise HTTPException(
+            status_code=503, headers={"Retry-After": "5"},
+            detail="that mix could not start: " + _hls_refused(enc))
     # Wait for a modest initial HLS runway rather than handing a phone a
     # one-segment live edge. The separate segment requests then carry it
     # smoothly across a tower handoff or a momentary server stall.
@@ -272060,8 +272120,32 @@ function refreshPersonalMix() {
   mixRestart = setTimeout(() => {
     mixRestart = null;
     if (!streamMode || !playing || mixWanted === streamMixApplied) return;
-    startStream();
+    /* [mix-lane] ASK FOR THE NEW LANE FIRST. startStream() empties the
+     * player; doing that before the new lane exists was a cut on every
+     * slider move, and silence when the station could not start it. The
+     * current mix keeps playing until the station has answered; a refusal
+     * keeps it playing and says so. */
+    const want = mixWanted;
+    const ctl = (typeof AbortController === "function") ? new AbortController() : null;
+    const guard = setTimeout(() => { try { ctl && ctl.abort(); } catch (e) {} }, 20000);
+    fetch(streamUrl(), {cache: "no-store", signal: ctl ? ctl.signal : undefined})
+      .then((r) => {
+        clearTimeout(guard);
+        if (!streamMode || !playing || personalMix() !== want) return;
+        if (r.ok) { startStream(); return; }
+        mixNotApplied("the station could not start that mix (" + r.status + ")");
+      })
+      .catch(() => {
+        clearTimeout(guard);
+        if (streamMode && playing && personalMix() === want) {
+          mixNotApplied("the station did not answer");
+        }
+      });
   }, 1500);
+}
+function mixNotApplied(why) {
+  const note = document.getElementById("note");
+  if (note) note.textContent = why + " - still playing your last mix; move a slider to try again";
 }
 
 function streamUrl() {

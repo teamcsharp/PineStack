@@ -2395,6 +2395,24 @@ class StationStream:
         lane = self.hls_lane(split, mix, bitrate)
         return lane.handle(bitrate if bitrate is not None else self.bitrate)
 
+    def hls_release(self, mix: Any = None, split: bool = False,
+                    why: str = "its listener moved to another mix") -> bool:
+        """[mix-lane] Retire the lane a listener has just LEFT for another mix.
+
+        Left alone it stays "busy" for HLS_LANE_BUSY_S and held for ten
+        minutes, so a thumb dragging a slider fills HLS_MAX_LANES with lanes
+        nobody is on and the next mix is refused. Never the default lane,
+        never a warm one. True when a lane went."""
+        key = self._hls_key(split, mix)
+        if key == _DEFAULT_LANE:
+            return False
+        with self._lock:
+            lane = self._hls.get(key)
+            if lane is None or lane.warm:
+                return False
+            self._hls_retire(key, lane, time.time(), why)
+        return True
+
     def hls_existing(self, bitrate: Any, mix: Any = None,
                      split: bool = False) -> "_HlsVariant | None":
         """The variant at this rate if its lane already exists.
