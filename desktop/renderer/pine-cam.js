@@ -2879,7 +2879,7 @@
   var cfgShown = 120;
   var cfgThumbIO = null;
   var deskMjpeg = null;          /* {fps, q, w}: the desk picture's presets, from the station */
-  var CFG_KIND = {album: 'Album cut', cut: 'Cut', kept: 'Kept', footage: 'Footage'};
+  var CFG_KIND = {album: 'Album cut', cut: 'Cut', kept: 'Kept', footage: 'Footage', screen: 'Screen'};   /* [h3-anyfootage] */
 
   function cfgQuery() {
     if (!deskMjpeg) return '';
@@ -3193,7 +3193,7 @@
     });
     host.appendChild(drop);
     var bar = cfgMake('div', 'pcc-row pcc-chips');
-    [['all', 'All'], ['album', 'Album cuts'], ['cut', 'Cuts'], ['kept', 'Kept'], ['footage', 'Footage']].forEach(function (f) {
+    [['all', 'All'], ['album', 'Album cuts'], ['cut', 'Cuts'], ['kept', 'Kept'], ['footage', 'Footage'], ['screen', 'Screen']].forEach(function (f) {
       var b = cfgMake('button', 'pcc-chip' + (cfgFilter === f[0] ? ' on' : ''), f[1]);
       b.type = 'button';
       b.title = 'Show ' + f[1].toLowerCase();
@@ -3328,7 +3328,30 @@
     }, function () { cfgSay('the station did not answer'); });
   }
 
+  /* [h3-anyfootage] "For any footage or recording, I want an option to send it
+     to H3 and have it used as a reference for a stinger": the station's ONE
+     stinger window is the SFX TV's (dictation, In/Out trim, the queue). The
+     recording is pinned first so it cannot roll off while its stinger waits,
+     and the window opens on it. The small form below stands in only where the
+     SFX TV is not loaded. */
   function recsH3(x) {
+    var P = root.PineSfxTv;
+    if (P && typeof P.openParody === 'function') {
+      cfgSay('pinning ' + x.name + ' as the reference…');
+      Promise.resolve(post('/api/pinecam/h3-ref', {name: x.name})).then(function (seed) {
+        if (!seed || !seed.ok) { cfgSay(seed && seed.say ? seed.say : 'the station did not answer'); return; }
+        closeConfig();
+        try {
+          P.openParody({id: seed.id, url: seed.url, video: true, seconds: seed.seconds,
+            sting: (CFG_KIND[x.kind] || x.kind) + ' ' + recsWhen(x.at), source_type: seed.source_type});
+        } catch (e) { openConfig('recordings'); recsH3Form(x); }
+      }, function () { cfgSay('the station did not answer'); });
+      return;
+    }
+    recsH3Form(x);
+  }
+
+  function recsH3Form(x) {
     var f = document.getElementById('pineCamCfgH3');
     if (!f) return;
     f.textContent = '';

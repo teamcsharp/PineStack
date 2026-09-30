@@ -4589,3 +4589,11 @@ html.pine-tech-wide .sp-tech.sp-tech-wide .wc-strip {
 .sp-rrp-p { margin: 2px 0 6px; color: #cfd8de; line-height: 1.45; }
 .sp-rrp-table tr.sp-rrp-go { cursor: pointer; }
 .sp-rrp-table tr.sp-rrp-go:hover td { background: rgba(104, 206, 217, .08); }
+
+/* [h3-anyfootage] a video bubble's H3 stinger button */
+.sp-mv-media .sp-mv-h3 { display: none; position: absolute; top: 6px; right: 6px; z-index: 3; width: 28px; height: 28px;
+  align-items: center; justify-content: center; padding: 0; border-radius: 8px; border: 1px solid rgba(255, 255, 255, .25);
+  background: rgba(5, 8, 12, .72); color: #e8f3f6; cursor: pointer; }
+.sp-mv-media.is-video .sp-mv-h3 { display: flex; }
+.sp-mv-media .sp-mv-h3:hover { background: rgba(22, 52, 59, .9); border-color: #65c7da; }
+.sp-mv-media .sp-mv-h3 svg { width: 15px; height: 15px; fill: currentColor; }

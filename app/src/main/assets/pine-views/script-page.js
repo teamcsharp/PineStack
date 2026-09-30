@@ -6456,6 +6456,31 @@
     if (m.mode === 'probe' && !c.poster && !c.sid) mvMediaMode(m, 'audio');
     if (m.mode === 'audio' && c.sid && c.url) mvLevelsAsk(c.sid, c.url);
   }
+  /* [h3-anyfootage] "For any footage or recording, I want an option to send it
+     to H3 and have it used as a reference for a stinger." A video bubble carries
+     the SFX TV's own stinger window, opened on its clip: dictation, the In/Out
+     trim, the queue. Shown on a video only (CSS: .sp-mv-media.is-video). */
+  function mvH3Button(box, item) {
+    var P = root.PineSfxTv;
+    if (!P || typeof P.openParody !== 'function') return;
+    var b = make('button', 'sp-mv-h3');
+    b.type = 'button';
+    b.title = 'Send this clip to H3 as the reference video of a stinger';
+    b.setAttribute('aria-label', b.title);
+    b.innerHTML = mvIcon('c:magic-wand--filled');
+    b.addEventListener('pointerdown', function (ev) { ev.stopPropagation(); });   /* not a hold on the bubble */
+    b.addEventListener('click', function (ev) {
+      ev.stopPropagation();
+      ev.preventDefault();
+      var c = mvClipInfo(item);
+      if (!c.sid) return;
+      try {
+        P.openParody({id: c.sid, url: c.url || '', video: true, source_type: 'clip',
+          sting: String((item && (item.label || item.text)) || c.sid).slice(0, 120)});
+      } catch (e) { /* the bubble stands without it */ }
+    });
+    box.appendChild(b);
+  }
   function mvMediaBox(item, bubble) {
     var c = mvClipInfo(item);
     var box = make('div', 'sp-mv-media');
@@ -6465,6 +6490,7 @@
       side: ((mv.stage && mv.stage.clientHeight) || 400) < 340};
     bubble.appendChild(box);
     bubble.appendChild(why);
+    mvH3Button(box, item);                   /* [h3-anyfootage] */
     mvMediaMode(out, c.video === true ? 'video' : (c.video === false ? 'audio' : 'probe'));
     mvMediaFill(out);
     if (c.sid && (!c.url || !c.poster)) {
