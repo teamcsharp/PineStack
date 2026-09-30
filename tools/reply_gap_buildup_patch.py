@@ -52,31 +52,6 @@ function pineReplyGapBuild(clip) {
   const b = Number(clip && clip.buildup_ms);
   return (isFinite(b) && b > 0) ? b : 0;
 }
-function pineReplyGapFloor(clip) {
-  const g = clip && clip.gap_before;
-  if (!g || !pineReplyGapEndAt) return 0;
-  const s = Number(g.s);
-  return (isFinite(s) && s >= 0) ? pineReplyGapEndAt + s * 1000 + pineReplyGapBuild(clip) : 0;
-}
-function pineReplyGapCue(clip, waitMs) {
-  const g = (clip && clip.gap_before) || null;
-  if ((!g && !pineReplyGapBuild(clip)) || clip.pineGapCued) return;
-  clip.pineGapCued = true;
-  const head = ((clip.stream && clip.stream.rows) || [])[0] || {};
-  try {
-    window.dispatchEvent(new CustomEvent("pine-reply-gap", {detail: {
-      s: g ? (Number(g.s) || 0) : 0, rolled: !!(g && g.rolled), dice: g ? g.dice : null,
-      lo: g ? g.lo : null, hi: g ? g.hi : null,
-      id: String((g && g.id) || ""), at: Date.now(),
-      startsAt: Date.now() + Math.max(0, Number(waitMs) || 0),
-      buildup_ms: pineReplyGapBuild(clip),
-      lid: String(clip.row_id || clip.line || head.id || ""),
-      who: String(clip.who || head.who || ""),
-      name: String(head.name || ""),
-      sting: !!clip.sting || String(clip.url || "").indexOf("/sfx/") === 0,
-      text: String(head.text || clip.text || "").slice(0, 400)}}));
-  } catch (e) { /* a view that cannot hear it never costs the air */ }
-}
 '''
 
 WORDS_OLD = '''  if (next && next.gap_before) pineReplyGapCue(next, pineReplyGapDue(next) - Date.now());

@@ -844,7 +844,8 @@ def door(clip: Any, air_until: float, earliest: float, tail_of: Any = None,
         note = draw(clip.get("ready_round") if isinstance(clip.get("ready_round"), dict) else None,
                     str(clip.get("who") or ""), str(clip.get("text") or "")[:200], "",
                     "page", rng=rng)
-        floor = words_end + float(note["s"]) + build / 1000.0
+        over_ms = sting_overlap_ms(clip, build, words_end) if mine else 0   # [reply-gap:sting-overlap]
+        floor = words_end + float(note["s"]) + (build - over_ms) / 1000.0
         if own <= air + 0.05:
             # it was only waiting for the air: the pause decides, into the
             # last clip's silent tail when the pause is shorter than it
@@ -854,7 +855,7 @@ def door(clip: Any, air_until: float, earliest: float, tail_of: Any = None,
         clip["gap_before"] = dict({k: note[k] for k in ("s", "rolled", "dice", "lo", "hi", "by", "id")
                                    if k in note},
                                   after=round(words_end, 3), tail=round(prev_tail, 3),
-                                  buildup_ms=build,
+                                  buildup_ms=build, overlap_build_ms=over_ms,
                                   overlap=round(max(0.0, air - start), 3))
         _LAST_DOOR["start"] = float(start)
         return start
@@ -880,8 +881,36 @@ def booked(clip: Any, until: float) -> None:
         if float(until) >= float(_BOOKED.get("until") or 0) - 1e-6:
             _BOOKED["until"] = float(until)
             _BOOKED["tail"] = float((clip or {}).get("tail_s") or 0) if isinstance(clip, dict) else 0.0
+            # [reply-gap:sting-overlap] does the air end on a sting, and when did it begin
+            c = clip if isinstance(clip, dict) else {}
+            _BOOKED["sting"] = 1.0 if is_sting(c) else 0.0
+            secs = _num(c.get("seconds") or c.get("length"), 0.0)
+            _BOOKED["from"] = float(until) - secs if secs > 0 else float(until)
     except Exception:  # noqa: BLE001
         pass
+
+
+def is_sting(clip: Any) -> bool:
+    """[reply-gap:sting-overlap] a clip off the board (an MP4 sting / SFX)."""
+    c = clip if isinstance(clip, dict) else {}
+    who = str(c.get("who") or "")
+    return bool(who in ("board", "drop") or c.get("sting") or c.get("video")
+                or str(c.get("url") or "").startswith("/sfx/"))
+
+
+def sting_overlap_ms(clip: Any, build: int, words_end: float) -> int:
+    """How much of a dialogue card's buildup can run inside the sting the air
+    ends on: all of it when the sting is long enough, the sting's length when
+    it is not; 0 when the air does not end on a sting or this is not a line."""
+    try:
+        if build <= 0 or not float(_BOOKED.get("sting") or 0):
+            return 0
+        if is_sting(clip) or str((clip or {}).get("who") or "") not in HOST_SEATS:
+            return 0
+        began = float(_BOOKED.get("from") or words_end)
+        return int(max(0.0, min(build / 1000.0, words_end - began)) * 1000)
+    except Exception:  # noqa: BLE001
+        return 0
 
 
 def overlap(clip: Any) -> float:

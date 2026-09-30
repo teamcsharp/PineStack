@@ -240092,16 +240092,38 @@ function pineReplyGapFloor(clip) {
   const g = clip && clip.gap_before;
   if (!g || !pineReplyGapEndAt) return 0;
   const s = Number(g.s);
-  return (isFinite(s) && s >= 0) ? pineReplyGapEndAt + s * 1000 + pineReplyGapBuild(clip) : 0;
+  return (isFinite(s) && s >= 0)
+    ? pineReplyGapEndAt + s * 1000 + pineReplyGapBuild(clip) - pineReplyGapOverlap(clip) : 0;
 }
-function pineReplyGapCue(clip, waitMs) {
+/* [reply-gap:sting-overlap] the part of this card's buildup that runs during
+ * the sting before it (the station stamped it; the words do not wait for it) */
+function pineReplyGapOverlap(clip) {
+  const o = Number(clip && clip.gap_before && clip.gap_before.overlap_build_ms);
+  return (isFinite(o) && o > 0) ? Math.min(o, pineReplyGapBuild(clip)) : 0;
+}
+/* While a sting plays, the next card is announced at once, so the view builds
+ * its whole Rolodex during the MP4; the dice still wait for the words' end. */
+function pineReplyGapBuildAhead(clip, el, queue) {
+  const next = queue && queue[0];
+  if (!next || next.pineBuildAhead || !pineReplyGapOverlap(next)) return;
+  if (!el || !isFinite(el.duration)) return;
+  next.pineBuildAhead = true;
+  const tail = Math.max(0, Number((clip && clip.tail_s) || 0));
+  const wordsIn = Math.max(0, (el.duration - tail - Number(el.currentTime || 0)) * 1000);
+  const g = next.gap_before || {};
+  const wait = wordsIn + (Number(g.s) || 0) * 1000 + pineReplyGapBuild(next) - pineReplyGapOverlap(next);
+  pineReplyGapCue(next, wait, true);
+}
+function pineReplyGapCue(clip, waitMs, early) {
   const g = (clip && clip.gap_before) || null;
-  if ((!g && !pineReplyGapBuild(clip)) || clip.pineGapCued) return;
-  clip.pineGapCued = true;
+  if (!g && !pineReplyGapBuild(clip)) return;
+  if (early) { if (clip.pineGapEarly) return; clip.pineGapEarly = true; }   /* [reply-gap:sting-overlap] */
+  else { if (clip.pineGapCued) return; clip.pineGapCued = true; }
   const head = ((clip.stream && clip.stream.rows) || [])[0] || {};
   try {
     window.dispatchEvent(new CustomEvent("pine-reply-gap", {detail: {
-      s: g ? (Number(g.s) || 0) : 0, rolled: !!(g && g.rolled), dice: g ? g.dice : null,
+      early: !!early, overlap_ms: pineReplyGapOverlap(clip),
+      s: g ? (Number(g.s) || 0) : 0, rolled: !early && !!(g && g.rolled), dice: g ? g.dice : null,
       lo: g ? g.lo : null, hi: g ? g.hi : null,
       id: String((g && g.id) || ""), at: Date.now(),
       startsAt: Date.now() + Math.max(0, Number(waitMs) || 0),
@@ -240136,6 +240158,7 @@ function pineReplyGapWordsEnded(clip, el, queue) {
   }
 }
 function pineReplyGapEarly(clip, el, queue) {
+  try { pineReplyGapBuildAhead(clip, el, queue); } catch (e) { /* [reply-gap:sting-overlap] */ }
   const tail = Number((clip && clip.tail_s) || 0);
   if (!(tail > 0.05) || !el || !isFinite(el.duration)) return false;
   if (Number(el.currentTime || 0) < el.duration - tail) return false;
@@ -272699,16 +272722,38 @@ function pineReplyGapFloor(clip) {
   const g = clip && clip.gap_before;
   if (!g || !pineReplyGapEndAt) return 0;
   const s = Number(g.s);
-  return (isFinite(s) && s >= 0) ? pineReplyGapEndAt + s * 1000 + pineReplyGapBuild(clip) : 0;
+  return (isFinite(s) && s >= 0)
+    ? pineReplyGapEndAt + s * 1000 + pineReplyGapBuild(clip) - pineReplyGapOverlap(clip) : 0;
 }
-function pineReplyGapCue(clip, waitMs) {
+/* [reply-gap:sting-overlap] the part of this card's buildup that runs during
+ * the sting before it (the station stamped it; the words do not wait for it) */
+function pineReplyGapOverlap(clip) {
+  const o = Number(clip && clip.gap_before && clip.gap_before.overlap_build_ms);
+  return (isFinite(o) && o > 0) ? Math.min(o, pineReplyGapBuild(clip)) : 0;
+}
+/* While a sting plays, the next card is announced at once, so the view builds
+ * its whole Rolodex during the MP4; the dice still wait for the words' end. */
+function pineReplyGapBuildAhead(clip, el, queue) {
+  const next = queue && queue[0];
+  if (!next || next.pineBuildAhead || !pineReplyGapOverlap(next)) return;
+  if (!el || !isFinite(el.duration)) return;
+  next.pineBuildAhead = true;
+  const tail = Math.max(0, Number((clip && clip.tail_s) || 0));
+  const wordsIn = Math.max(0, (el.duration - tail - Number(el.currentTime || 0)) * 1000);
+  const g = next.gap_before || {};
+  const wait = wordsIn + (Number(g.s) || 0) * 1000 + pineReplyGapBuild(next) - pineReplyGapOverlap(next);
+  pineReplyGapCue(next, wait, true);
+}
+function pineReplyGapCue(clip, waitMs, early) {
   const g = (clip && clip.gap_before) || null;
-  if ((!g && !pineReplyGapBuild(clip)) || clip.pineGapCued) return;
-  clip.pineGapCued = true;
+  if (!g && !pineReplyGapBuild(clip)) return;
+  if (early) { if (clip.pineGapEarly) return; clip.pineGapEarly = true; }   /* [reply-gap:sting-overlap] */
+  else { if (clip.pineGapCued) return; clip.pineGapCued = true; }
   const head = ((clip.stream && clip.stream.rows) || [])[0] || {};
   try {
     window.dispatchEvent(new CustomEvent("pine-reply-gap", {detail: {
-      s: g ? (Number(g.s) || 0) : 0, rolled: !!(g && g.rolled), dice: g ? g.dice : null,
+      early: !!early, overlap_ms: pineReplyGapOverlap(clip),
+      s: g ? (Number(g.s) || 0) : 0, rolled: !early && !!(g && g.rolled), dice: g ? g.dice : null,
       lo: g ? g.lo : null, hi: g ? g.hi : null,
       id: String((g && g.id) || ""), at: Date.now(),
       startsAt: Date.now() + Math.max(0, Number(waitMs) || 0),
@@ -272743,6 +272788,7 @@ function pineReplyGapWordsEnded(clip, el, queue) {
   }
 }
 function pineReplyGapEarly(clip, el, queue) {
+  try { pineReplyGapBuildAhead(clip, el, queue); } catch (e) { /* [reply-gap:sting-overlap] */ }
   const tail = Number((clip && clip.tail_s) || 0);
   if (!(tail > 0.05) || !el || !isFinite(el.duration)) return false;
   if (Number(el.currentTime || 0) < el.duration - tail) return false;
