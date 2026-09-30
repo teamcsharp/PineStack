@@ -4514,3 +4514,14 @@ html.pine-tech-wide .sp-tech.sp-tech-wide .wc-strip {
 .la-roll-box { overflow-x: hidden; }
 .rt-tag .rt-stage > .sp-mv-item { box-sizing: border-box; max-width: calc(100% - 20px); }
 .rt-tag .rt-stage > .sp-mv-item.sp-mv-digital { width: calc(100% - 20px); }
+
+/* [reply-gap:preview] the values live on the dice while a thumb is held, so
+   the track takes the label's room */
+.sp-gap-vals { display: none; }
+.sp-gap-die.sp-gap-preview { animation: spGapPreview .3s ease-in-out infinite alternate; }
+@keyframes spGapPreview { from { transform: rotate(-7deg) scale(1.04); } to { transform: rotate(7deg) scale(1.04); } }
+@media (prefers-reduced-motion: reduce) { .sp-gap-die.sp-gap-preview { animation: none; } }
+/* [camclear] "Move these icons over so they're not having the cam tab
+   overlapping on them": the fixed CAM badge (#pineCamFlag, ~63 px at the top
+   right) sat over the header's caution buttons */
+.sp-title-tools { padding-right: 56px; }
