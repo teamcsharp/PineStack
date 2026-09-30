@@ -180,7 +180,10 @@ class CopyGateAtTheBind(unittest.TestCase):
 class ModeBBeats(unittest.TestCase):
     NAMES = {"_BANTER_BEAT_ROW", "_BANTER_BEAT_STOCK", "_BANTER_BEAT_STOP", "WritingDeferred",
              "_beat_content_words", "_beat_answers", "_beat_sequence_answers", "_banter_beat_plan",
-             "_beat_fresh_only", "_beat_speaks_direction", "_banter_beats"}
+             "_beat_fresh_only", "_beat_speaks_direction", "_banter_beats",
+             # [num-leak] the beat writer names a board clip by its words - without it
+             # every beat died on a NameError and the chain was two seed lines long
+             "prompt_sfx_label"}
 
     def setUp(self):
         self.st = Station(self)
