@@ -1330,6 +1330,8 @@ def ffmpeg_cmd(crop: dict | None = None) -> list[str]:
 # accident, and a bind to every interface is how that would happen.
 # ---------------------------------------------------------------------------
 TS_UDP_HOST, TS_UDP_PORT = "127.0.0.1", 18081
+MJPEG_FPS = int(os.environ.get("PINELINK_MJPEG_FPS", "25"))     # [cam-mjpeg] the desk's picture rate
+MJPEG_Q = int(os.environ.get("PINELINK_MJPEG_Q", "4"))          # ffmpeg -q:v, 2 (best) .. 31
 TS_HTTP_PORT = 8098
 TS_HTTP_ADDRS = ("10.89.1.246", "100.74.95.59")   # LAN, tailnet; never 0.0.0.0
 TS_RING_PACKETS = 7500      # ~3 s at 2,500 pkt/s; this stream is ~1,100 pkt/s
@@ -1564,6 +1566,8 @@ class _TsHandler(BaseHTTPRequestHandler):
             self._reply(503, b"no door\n")
         elif path == "/live.ts":
             self._live(door)
+        elif path == "/live.mjpg":                          # [cam-mjpeg]
+            self._mjpeg(door)
         elif path == "/state":
             self._reply(200, json.dumps(door.stats()).encode() + b"\n",
                         "application/json")
@@ -1572,6 +1576,48 @@ class _TsHandler(BaseHTTPRequestHandler):
             self._reply(200 if ok else 503, b"ok\n" if ok else b"no stream\n")
         else:
             self._reply(404, b"not found\n")
+
+    def _mjpeg(self, door: TsDoor) -> None:
+        """[cam-mjpeg] the picture as multipart JPEG at full rate, for a page
+        with no native player (the desk): one ffmpeg per viewer, reading this
+        door's own TS, gone when the viewer is."""
+        addr = (list(door.addrs) or ["127.0.0.1"])[0]
+        src = "http://%s:%d/live.ts" % (addr, door.port)
+        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin",
+               "-fflags", "nobuffer", "-flags", "low_delay", "-probesize", "500000",
+               "-analyzeduration", "0", "-i", src, "-an",
+               "-vf", "fps=%d" % MJPEG_FPS, "-q:v", str(MJPEG_Q),
+               "-f", "mpjpeg", "-boundary_tag", "pineframe", "pipe:1"]
+        try:
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        except OSError:
+            self._reply(503, b"no ffmpeg\n")
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=pineframe")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        who = "%s:%d" % self.client_address[:2]
+        _ts_log("mjpeg client %s joined" % who)
+        try:
+            read = getattr(proc.stdout, "read1", proc.stdout.read)
+            while True:
+                chunk = read(65536)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
+        finally:
+            try:
+                proc.kill()
+                proc.wait(timeout=3)
+            except Exception:  # noqa: BLE001
+                pass
+            _ts_log("mjpeg client %s left" % who)
 
     def _live(self, door: TsDoor) -> None:
         cur = door.start_cursor(TS_KEY_WAIT_S)
