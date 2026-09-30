@@ -93,6 +93,7 @@ import recast_desk                        # [#1215]: the cupboard recast desk
 import es_voice as _es_voice              # [s3-es-voice] how a feeling sounds: the DSP + the engines' own controls
 import emotion_engine as _emotion           # [emotion-engine] the emotion engine's own window
 import levels as _levels                   # [levels-one] the one set of levels, on the station
+import station_pulse as _pulse             # [station-pulse] the pressure bar and the marquee
 from director import (director_add, director_beats, director_beats_clause,
                       director_beats_set, director_clause, director_graph,
                       director_feedback_clause, director_lessons_clause,
@@ -148920,6 +148921,35 @@ async def levels_adopt_api(request: Request, authorization: str | None = Header(
         pipeline_log("air", "levels: %s joined quieter on %s - the station follows it down [levels-one]" % (
             by or "a surface", ", ".join(got["lowered"])))
     return levels_view(got)
+
+
+# --- [station-pulse] THE STATION'S PRESSURE AND WHAT IT IS DOING, ONE READ ---------
+# The bank's read-ahead ledger, the writers' rooms and the voice queue, folded by
+# station_pulse.pulse(); memoised two seconds (every screen reads it every five).
+_PULSE_MEMO: dict[str, Any] = {"at": 0.0, "got": None}
+
+
+@app.get("/api/station/pulse")
+async def station_pulse_api(authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    require_read_auth(authorization)
+    now = time.time()
+    if now - float(_PULSE_MEMO["at"]) < 2.0 and _PULSE_MEMO["got"]:
+        return _PULSE_MEMO["got"]
+    try:
+        bank = await api_bank(minutes=60, authorization=authorization)
+    except Exception:  # noqa: BLE001
+        bank = {}
+    try:
+        cup = cupboard_state()
+    except Exception:  # noqa: BLE001
+        cup = {}
+    try:
+        vq = _emotion.queue_rows()
+    except Exception:  # noqa: BLE001
+        vq = []
+    got = _pulse.pulse(bank, cup, vq, now)
+    _PULSE_MEMO.update({"at": now, "got": got})
+    return got
 
 
 @app.get("/api/slideshow/media/{filename}")

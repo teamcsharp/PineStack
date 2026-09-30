@@ -766,3 +766,28 @@ body.pine-splice-open > :not(.lb-editor-overlay) * { animation-play-state:paused
 .pav-used-actions, .pav-used-name { display:flex; flex-wrap:wrap; align-items:center; gap:8px; }
 .pav-used-name[hidden] { display:none; }
 .pav-used-name input { flex:1 1 200px; min-width:0; min-height:32px; padding:4px 8px; border:1px solid #43545c; border-radius:4px; background:#0c1418; color:#e3edf0; }
+
+/* [station-pulse] the pressure bar and the status marquee, above the strip */
+.pine-pulse {
+  position: fixed; left: 0; right: 28px; bottom: 23px; z-index: 2147483001;
+  background: rgba(10, 14, 18, .88); border-top: 1px solid #26313a;
+  font: 10.5px/1.5 Inter, Segoe UI, system-ui, sans-serif; color: #8fa0ad;
+  pointer-events: auto;
+}
+.pine-pulse-bar { height: 3px; background: rgba(255, 255, 255, .06); overflow: hidden; cursor: help; }
+.pine-pulse-fill {
+  display: block; height: 100%; width: 2%;
+  background: linear-gradient(90deg, #54d18b, #d8c25a 60%, #e0664f);
+  background-size: 400px 100%;
+  transition: width 2.4s cubic-bezier(.4, 0, .2, 1), filter 1s;
+}
+.pine-pulse[data-state="relaxed"] .pine-pulse-fill { filter: saturate(.8); }
+.pine-pulse[data-state="locked up"] .pine-pulse-fill { animation: pinePulseStrain 1.6s ease-in-out infinite; }
+@keyframes pinePulseStrain { 50% { filter: brightness(1.45); } }
+.pine-pulse-line { height: 16px; overflow: hidden; white-space: nowrap; }
+.pine-pulse-track { display: inline-block; padding-left: 8px; animation: pineConsoleMarquee 60s linear infinite; }
+.pine-pulse-track span { display: inline-block; }
+@media (max-width: 720px) { .pine-pulse { right: 24px; } }
+/* the views make room for both strips */
+.pine-view-host, #sampler { padding-bottom: 46px; }
+.pine-talk-dot { bottom: 54px; }
