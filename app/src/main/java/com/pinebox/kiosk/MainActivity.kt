@@ -1117,6 +1117,43 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    /**
+     * [smart-reinit] The terminal's half of "Get the broadcast back": the
+     * objects this activity owns, handed to the drawer's doctor. Reads the
+     * route and the audio dumps; its cures re-open or let go of what THIS APP
+     * holds (the replay capture, media focus, standby) - never a level, a
+     * volume or a route.
+     */
+    private fun doctorHooks(): com.pinebox.kiosk.rail.DoctorHooks =
+        object : com.pinebox.kiosk.rail.DoctorHooks {
+            override fun route(): String = outputRoute?.current() ?: "the output"
+
+            override fun audio(): com.pinebox.kiosk.audio.AudioHealth.Reading? =
+                com.pinebox.kiosk.audio.AudioHealth.read(applicationContext, route())
+
+            override fun focusHeld(): Boolean = mediaFocus?.holding() ?: false
+
+            override fun refocus(): Boolean {
+                val focus = mediaFocus ?: return false
+                /* Give it back and ask again: a grant the platform has
+                 * quietly dropped still reads held here. */
+                focus.release()
+                return focus.hold()
+            }
+
+            override fun standby(): Boolean = com.pinebox.kiosk.kiosk.Standby.active
+
+            override fun leaveStandby() =
+                com.pinebox.kiosk.kiosk.Standby.leave(applicationContext, "the Get the broadcast back button")
+
+            override fun reopenCapture(): String = app.replay.reopenAudio()
+
+            override fun releaseCapture(): String = app.replay.releaseAudio()
+
+            override fun restartApp(why: String): Boolean =
+                com.pinebox.kiosk.net.Revive.now(applicationContext, why)
+        }
+
     private fun installRail() {
         drawer.setScrimColor(resources.getColor(R.color.pine_scrim, null))
         /* LOCKED_CLOSED would kill the edge drag; UNLOCKED is the default and
@@ -1143,6 +1180,7 @@ class MainActivity : AppCompatActivity() {
             },
             openBluetooth = ::openBluetoothSettings,
             exitToSystem = ::exitToSystem,
+            doctor = doctorHooks(),
         )
         rail = built
         built.bind()

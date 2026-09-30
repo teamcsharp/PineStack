@@ -72,6 +72,24 @@ internal class ReplayAudioCapture(private val context: Context, private val ring
         if (state != "unavailable") state = "stopped"
     }
 
+    /**
+     * [smart-reinit] CLOSE THE PLAYBACK CAPTURE AND OPEN IT AGAIN.
+     *
+     * Measured 2026-09-30: after the headphones went in, this capture's
+     * render-and-loopback mix left the kiosk's streams going ONLY to the
+     * remote submix - captured, never rendered - and a kiosk restart (which
+     * re-registers the policy) brought the headphone path back. This is that
+     * re-registration without the restart: stop() closes the loopback, which
+     * unregisters its AudioPolicy; start() registers a fresh one on the
+     * current route. The ring keeps everything it held.
+     */
+    @Synchronized fun reopen(): String {
+        stop()
+        if (worker?.isAlive == true) return "the old capture is still closing - not re-opened yet"
+        start()
+        return "re-opened"
+    }
+
     fun status(): JSONObject = JSONObject().put("source", "android-playback-mix")
         .put("source_scope", "eligible-device-media").put("device_volume_applied", false)
         .put("state", if (state == "capturing" && signalFrames == 0L) "captured_silence" else state)

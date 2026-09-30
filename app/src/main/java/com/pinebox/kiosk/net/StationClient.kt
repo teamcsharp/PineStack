@@ -158,6 +158,10 @@ class StationClient(private val configStore: ConfigStore) {
             || r.contains("/v1/audio/speech")
             || r.contains("/api/listen/transcribe")
             || r.contains("/api/dj/callin/voice")
+            // [smart-reinit] the ladder's rungs wait for their work (stock
+            // 25 s, bank 40 s, deep a minute); an 8 s call timeout made each
+            // of them read as a failure while the station was still curing
+            || r.contains("/api/broadcast/fix/")
         return if (slow) patient else http
     }
 
