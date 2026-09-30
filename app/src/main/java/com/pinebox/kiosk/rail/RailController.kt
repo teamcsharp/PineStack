@@ -309,6 +309,7 @@ class RailController(
             val want = !state.paused
             call(if (want) "going off air" else "back on air") {
                 JSONObject(client.post("/api/radio/pause", JSONObject().put("paused", want).toString()))
+                    .also { pageCatchUp() }                     // [radio-tap] sound on the tap
             }
         }
 
@@ -765,9 +766,17 @@ class RailController(
             }, null))
             row.isSelected = r.active
             row.alpha = if (r.kind == "page" && !r.present) 0.62f else 1f
-            row.contentDescription = r.label + if (r.audible)
-                " is audible - tap to switch it off" else " is off - tap to let it sound"
-            row.setOnClickListener { flipReceiver(r) }
+            /* [radio-tap] The row makes this receiver THE RADIO - on, holding
+             * the air, sounding now - and never switches it off: the
+             * operator's "make the PineTab the radio" tap on a tablet that
+             * was already on used to be the audible toggle, and silenced it.
+             * Off is the switch's own job. */
+            row.contentDescription = "Make " + r.label + " the radio"
+            row.setOnClickListener { makeRadio(r) }
+            sw.isClickable = true
+            sw.contentDescription = r.label + if (r.audible)
+                " is audible - switch it off" else " is off - let it sound"
+            sw.setOnClickListener { flipReceiver(r) }
             val only = row.findViewById<Button>(R.id.playerOnly)
             only.visibility = View.VISIBLE
             only.contentDescription = "Make " + r.label + " the only one sounding in the house"
@@ -788,6 +797,33 @@ class RailController(
         writeReceivers(setOf(r.id), AirReceivers.flip(r.id, want),
             "switching " + r.label + if (want) " on" else " off") {
             AirReceivers.optimistic(it, r.id, want)
+        }
+    }
+
+    /** [radio-tap] On and the radio. Already both: just make the page catch
+     *  up now rather than on its next poll. */
+    private fun makeRadio(r: AirReceivers.Receiver) {
+        if (r.id in receiversPending) return
+        if (r.audible && r.active) {
+            pageCatchUp()
+            playerNote.text = r.label + " is the radio"
+            return
+        }
+        writeReceivers(setOf(r.id), AirReceivers.radio(r.id),
+            "making " + r.label + " the radio") { AirReceivers.optimisticRadio(it, r.id) }
+    }
+
+    /**
+     * [radio-tap] THE PAGE HEARS IT NOW. A receiver switch or a return to air
+     * reaches this page's audio on its own clock poll (1.5 s) and its DJ feed
+     * poll (4 s); asking both the moment the station has said yes is the
+     * difference between sound on the tap and sound a few seconds later.
+     * Posted to the main thread: the WebView takes script from nowhere else.
+     */
+    private fun pageCatchUp() {
+        rail.post {
+            runScript("(function(){try{radioClockPoll()}catch(e){}"
+                + "try{pollDJ()}catch(e){}return 'ok'})()") { }
         }
     }
 
@@ -819,6 +855,7 @@ class RailController(
                     receiversFault = ids.first() to AirReceivers.note(answer)
                 }
                 adoptReceivers(answer, fromWrite = true)
+                pageCatchUp()                                   // [radio-tap]
                 Log.i(TAG, "playing it: " + saying + " confirmed in "
                     + (android.os.SystemClock.uptimeMillis() - t0) + " ms: "
                     + AirReceivers.summary(answer))
@@ -1194,6 +1231,19 @@ class RailController(
         endlessBanking = answer.optBoolean("banking", false)
         endlessKnown = true
         paintEndlessVideo()
+        /* [radio-tap] Turning the set off RESUMES a pause the set made, but
+         * the air button used to learn that only on the next four-second
+         * poll - so the operator's next tap ("back on air") could land on a
+         * button that had flipped to "Off air" and take the station straight
+         * back off. The answer carries the station's word; paint it now. */
+        if (answer.has("off_air")) {
+            val paused = answer.optBoolean("off_air", state.paused)
+            if (paused != state.paused) {
+                state = state.copy(paused = paused)
+                paintAir()
+            }
+            if (!paused) pageCatchUp()
+        }
     }
 
     private fun paintEndlessVideo(error: String? = null) {

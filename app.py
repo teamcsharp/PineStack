@@ -133731,7 +133731,8 @@ async def air_receivers_set_api(
     request: Request,
     authorization: str | None = Header(default=None),
 ) -> dict[str, Any]:
-    """[airplayers] {"id": "<receiver>", "audible": true|false} switches one;
+    """[airplayers] {"id": "<receiver>", "audible": true|false} switches one
+    ([radio-tap] with "radio": true a switch-on also hands it the air);
     {"only": "<receiver>"} makes it the only one sounding in the house (the
     car keeps its own switch - it is not in the room, #1253). Answers with
     the fresh state, so a client paints the station's word, not its wish."""
@@ -133813,6 +133814,19 @@ async def air_receivers_set_api(
             _AUDIO_OWNER.update({"who": best, "at": time.time()})
     elif only:
         _AUDIO_OWNER.clear()
+    # [radio-tap] the tablet's row tap: this receiver on AND the radio. The
+    # exclusive comes to it only when ANOTHER page holds it - with nobody
+    # holding it every receiver switched on already sounds - and nothing
+    # else is switched off (that is what "only" is for).
+    if (not only and rid in ("pinetab", "desktop", "web")
+            and body.get("radio") is True and body.get("audible") is True):
+        ids = air_present().get(rid) or []
+        best = max(ids, default="", key=lambda w: float(
+            (_LISTENER_SEEN.get(w) or {}).get("at") or 0))
+        held = str(_AUDIO_OWNER.get("who") or "")
+        if best and held and held not in ids and not _owner_resting(best):
+            _AUDIO_OWNER.clear()
+            _AUDIO_OWNER.update({"who": best, "at": time.time()})
     routed = []
     for sid in AIR_SPEAKERS:
         v = want_speaker.get(sid)
