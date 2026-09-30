@@ -481,16 +481,24 @@
     try { v = JSON.parse(localStorage.getItem(VIEW_KEY) || 'null'); } catch (e) { v = null; }
     if (!v || !v.open || shown) return;
     viewRestoring = true;
-    try { open(); if (v.bare === false) setBare(false); }
+    try { open(v.bare === false ? false : undefined); }    /* [cam-pop] the shape before the pop */
     finally { viewRestoring = false; }
   }
 
-  function open() {
+  function open(wantBare) {
     build();
     shown = true;
     box.hidden = false;
+    /* [cam-pop] "whenever I bring up the pinecam's screen, it actually shows
+       two little mini windows flashing up": the header was folded away AFTER
+       the VCR in had begun, and the in lays its white pop over the box as it
+       stands at that moment - filmed in headless Edge, the pop was 392x258
+       over a picture of 392x223, a grey pane hanging 35 px past it while the
+       line opened inside. The box takes its final shape first, then comes
+       on; a restore hands its own header state in rather than changing it a
+       moment later. */
+    setBare(typeof wantBare === 'boolean' ? wantBare : BARE_DEFAULT);   /* just the window, until asked */
     vcrBox(true);                          /* [vcrfx] dot -> line -> picture */
-    setBare(BARE_DEFAULT);                 /* just the window, until asked */
     paintFrame();
     if (!frameTimer) frameTimer = setInterval(paintFrame, FRAME_MS);
     nativeStart();                         /* #1470: the surface, where there is one */
