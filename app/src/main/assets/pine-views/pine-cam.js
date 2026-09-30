@@ -395,6 +395,28 @@
     img.src = base() + '/api/pinelink/frame.jpg?c=' + Date.now();
   }
 
+  /* [cam-restore] the window's own state survives a reload: out or not, and
+     expanded or bare. Written on every open, close and header toggle; read
+     once, on the first live reading after the page starts. */
+  var VIEW_KEY = 'pineCamView';
+  var viewRestored = false;
+  var viewRestoring = false;
+  function viewSave() {
+    if (viewRestoring) return;
+    try { localStorage.setItem(VIEW_KEY, JSON.stringify({open: !!shown, bare: !!bare, at: Date.now()})); }
+    catch (e) { /* private mode: it opens as it always did */ }
+  }
+  function viewRestore() {
+    if (viewRestored || !live) return;
+    viewRestored = true;
+    var v = null;
+    try { v = JSON.parse(localStorage.getItem(VIEW_KEY) || 'null'); } catch (e) { v = null; }
+    if (!v || !v.open || shown) return;
+    viewRestoring = true;
+    try { open(); if (v.bare === false) setBare(false); }
+    finally { viewRestoring = false; }
+  }
+
   function open() {
     build();
     shown = true;
@@ -405,6 +427,7 @@
     if (!frameTimer) frameTimer = setInterval(paintFrame, FRAME_MS);
     nativeStart();                         /* #1470: the surface, where there is one */
     repaintPicture();                      /* #1118: the ladder's last rung is this box */
+    viewSave();                            /* [cam-restore] */
   }
 
   function close() {
@@ -415,6 +438,7 @@
     if (box) vcrBox(false);                /* [vcrfx] picture -> line -> dot, then hidden */
     if (frameTimer) { clearInterval(frameTimer); frameTimer = 0; }
     repaintPicture();
+    viewSave();                            /* [cam-restore] */
   }
 
   function toggle() { if (shown) { close(); } else { open(); } }
@@ -514,6 +538,7 @@
     if (b) b.setAttribute('aria-expanded', bare ? 'false' : 'true');
     lastBoxKey = '';
     nativeBoxSoon();
+    if (shown) viewSave();                 /* [cam-restore] */
   }
 
   /* One tap or two. A second tap inside 350 ms is a double tap and toggles
@@ -1207,6 +1232,7 @@
        * and a stale one claiming "live" is exactly the lie this has to
        * avoid. Both, or it is not there. */
       live = !!(got && got.state === 'live' && got.fresh);
+      if (live && !viewRestored) setTimeout(viewRestore, 0);   /* [cam-restore] */
       cropOn = !!(got && got.crop && got.crop.on);    /* [pincrop] */
       pathPaint(got);                                 /* [tabrelay] */
       showButton(live);
