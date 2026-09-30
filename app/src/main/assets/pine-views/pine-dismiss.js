@@ -381,3 +381,190 @@
 
   root.PineDrag = {roots: ROOTS, freeze: freeze};
 })(typeof window !== 'undefined' ? window : globalThis);
+
+/* [popback] 2026-09-30: A WAY BACK FROM EVERY POP-UP THAT CAME FROM ANOTHER.
+ * "If I click on a option inside of a pop up to go to another pop up, always
+ * offer a back button to go back to the original pop up so that way I don't
+ * lose it. And that's just universal in the application in general. Anytime
+ * I transition between pop-ups, offer a back button." (the operator)
+ *
+ * One rule, not a button per sheet. Every pop-up here carries a close X (the
+ * [closex] rule), so a pop-up is: a fixed overlay at the top of the page that
+ * holds a close control. When one appears while another is up - or just after
+ * another went away, which is how a sheet HANDS OVER to the next - it gets a
+ * back button beside its X. Back closes it through its own X (its own
+ * teardown runs) and brings the one it came from back exactly as it was: the
+ * node is kept, so a sheet that removed itself is put back where it stood.
+ */
+(function (root) {
+  'use strict';
+  var doc = root.document;
+  if (!doc || !root.MutationObserver || root.PinePopBack) return;
+  var CLOSE = '[aria-label^="close" i], [title^="close" i], .pcx-btn, .pcx, [data-pine-close]';
+  /* windows that live on the screen rather than pop over it: the camera, the
+     video set, the console strip - never a pop-up anyone came FROM */
+  var SKIP = '#pineCamBox, .pine-cam-box, .sfx-tv, .pine-cam, .pine-cam-wall, #pineConsoleLine, '
+    + '.s3-backdrop, .pine-rail, .hc-toast';
+  var HANDOVER_MS = 2500;
+  var up = [];          /* pop-ups on screen, oldest first: {el, label} */
+  var gone = null;      /* the one that just went: {el, parent, next, hidden, label, at} */
+
+  function visible(el) {
+    if (!el || !el.isConnected || el.hidden) return false;
+    var cs = root.getComputedStyle(el);
+    if (cs.display === 'none' || cs.visibility === 'hidden') return false;
+    return el.getClientRects().length > 0;
+  }
+  function fixedBox(el) {
+    var cs = root.getComputedStyle(el);
+    if (cs.position === 'fixed') return true;
+    var kid = el.firstElementChild;
+    return !!(kid && root.getComputedStyle(kid).position === 'fixed');
+  }
+  function closer(el) {
+    var list = el.querySelectorAll(CLOSE);
+    for (var i = 0; i < list.length; i += 1) {
+      var b = list[i];
+      if (!b.classList.contains('pine-popback') && /^(BUTTON|A|SPAN|I|DIV)$/.test(b.tagName)) return b;
+    }
+    return null;
+  }
+  function isPopup(el) {
+    if (!el || el.nodeType !== 1 || el.id === 'pinePopBackStyle') return false;
+    if (/^(SCRIPT|STYLE|LINK|TEMPLATE|IFRAME|VIDEO|AUDIO|CANVAS)$/.test(el.tagName)) return false;
+    try { if (el.matches(SKIP) || el.querySelector(SKIP)) return false; } catch (e) { return false; }
+    return fixedBox(el) && !!closer(el);
+  }
+  function labelOf(el) {
+    var d = el.matches('[role="dialog"]') ? el : el.querySelector('[role="dialog"]');
+    var t = (d && d.getAttribute('aria-label')) || '';
+    if (!t) {
+      var h = el.querySelector('h1, h2, h3, h4, header b, [class*="head"] b, [class*="title"], b, strong');
+      t = h ? h.textContent : '';
+    }
+    t = String(t || '').replace(/\s+/g, ' ').trim();
+    if (t.length > 44) t = t.slice(0, 44).replace(/\s+\S*$/, '') + '…';
+    return t || 'the last window';
+  }
+  function style() {
+    if (doc.getElementById('pinePopBackStyle')) return;
+    var s = doc.createElement('style');
+    s.id = 'pinePopBackStyle';
+    s.textContent = '.pine-popback{display:inline-grid;place-items:center;min-width:32px;min-height:32px;'
+      + 'margin-right:6px;cursor:pointer}.pine-popback .pi-icon,.pine-popback svg{width:18px;height:18px}';
+    doc.head.appendChild(s);
+  }
+  function giveBack(el, prev) {
+    if (el.querySelector('.pine-popback')) return;
+    var x = closer(el);
+    if (!x || !x.parentNode) return;
+    style();
+    var b = doc.createElement('button');
+    b.type = 'button';
+    b.className = String(x.className || '') + ' pine-popback';
+    var mark = '';
+    try { mark = root.pineIcon ? root.pineIcon('c:arrow--left', '') : ''; } catch (e) { mark = ''; }
+    if (mark) b.innerHTML = mark; else b.textContent = '‹';
+    b.title = 'Back to ' + prev.label;
+    b.setAttribute('aria-label', b.title);
+    b.addEventListener('click', function (ev) {
+      ev.preventDefault();
+      ev.stopPropagation();
+      goBack(el, prev);
+    });
+    x.parentNode.insertBefore(b, x);
+    beside(b, x);
+  }
+  /* An X pinned to its corner (position absolute/fixed) carried the back
+     button to the same spot - "these buttons are overlapping". Pinned the
+     same way, one button-width (and a gap) further in. */
+  function beside(b, x) {
+    var cs = root.getComputedStyle(x);
+    if (cs.position !== 'absolute' && cs.position !== 'fixed') return;
+    var w = x.offsetWidth || 32, gap = 6;
+    b.style.position = cs.position;
+    b.style.top = cs.top;
+    b.style.bottom = cs.bottom;
+    b.style.marginRight = '0';
+    if (cs.right !== 'auto') {
+      var right = (parseFloat(cs.right) || 0) + w + gap;
+      b.style.right = right + 'px';
+      b.style.left = 'auto';
+      /* and the heading beside them keeps clear of both */
+      var head = x.parentNode;
+      var pad = right + (b.offsetWidth || w) + gap;
+      if (head && head.style && (parseFloat(root.getComputedStyle(head).paddingRight) || 0) < pad) {
+        head.style.paddingRight = pad + 'px';
+      }
+    } else {
+      b.style.left = ((parseFloat(cs.left) || 0) - w - gap) + 'px';
+      b.style.right = 'auto';
+    }
+  }
+  function goBack(el, prev) {
+    var x = closer(el);
+    try { if (x) x.click(); } catch (e) { /* removed below */ }
+    root.setTimeout(function () {
+      if (visible(el)) { try { el.remove(); } catch (e) { /* gone */ } }
+      var p = prev.el;
+      if (!p.isConnected && prev.parent && prev.parent.isConnected) {
+        var next = prev.next && prev.next.parentNode === prev.parent ? prev.next : null;
+        prev.parent.insertBefore(p, next);
+      }
+      if (prev.hidden) p.hidden = false;
+      if (p.style && p.style.display === 'none') p.style.display = '';
+    }, 60);
+  }
+  function appeared(el) {
+    for (var k = 0; k < up.length; k += 1) if (up[k].el === el) return;   /* already known: a drag, a restyle */
+    if (!isPopup(el) || !visible(el)) return;
+    up = up.filter(function (r) { return visible(r.el); });
+    var below = up.length ? up[up.length - 1] : null;
+    var prev = below ? {el: below.el, parent: null, next: null, hidden: false, label: below.label}
+      : (gone && Date.now() - gone.at <= HANDOVER_MS && gone.el !== el ? gone : null);
+    up.push({el: el, label: labelOf(el)});
+    if (prev) giveBack(el, prev);
+  }
+  function left(el, parent, next, hidden) {
+    var had = null;
+    for (var i = 0; i < up.length; i += 1) if (up[i].el === el) had = up[i];
+    if (!had) return;
+    up = up.filter(function (r) { return r.el !== el; });
+    gone = {el: el, parent: parent, next: next, hidden: hidden, label: had.label, at: Date.now()};
+  }
+  /* Only the page's top level is watched - each child on its own, for being
+     shown or hidden - never the whole tree: the feed and the players restyle
+     themselves many times a second. */
+  var kidWatch = new root.MutationObserver(function (records) {
+    records.forEach(function (m) {
+      var el = m.target;
+      if (visible(el)) appeared(el);
+      else left(el, el.parentNode, el.nextSibling, true);
+    });
+  });
+  function watchKid(el) {
+    if (el.nodeType !== 1 || el.__pinePopWatch) return;
+    el.__pinePopWatch = true;
+    kidWatch.observe(el, {attributes: true, attributeFilter: ['hidden', 'style', 'class']});
+  }
+  function start() {
+    var body = doc.body;
+    if (!body) return;
+    [].forEach.call(body.children, function (el) {
+      watchKid(el);
+      if (isPopup(el) && visible(el)) up.push({el: el, label: labelOf(el)});
+    });
+    new root.MutationObserver(function (records) {
+      records.forEach(function (m) {
+        [].forEach.call(m.removedNodes, function (n) { if (n.nodeType === 1) left(n, m.target, m.nextSibling, false); });
+        [].forEach.call(m.addedNodes, function (n) {
+          if (n.nodeType !== 1) return;
+          watchKid(n);
+          root.setTimeout(function () { appeared(n); }, 0);
+        });
+      });
+    }).observe(body, {childList: true});
+  }
+  root.PinePopBack = {stack: function () { return up.slice(); }, isPopup: isPopup};
+  if (doc.readyState === 'loading') doc.addEventListener('DOMContentLoaded', start); else start();
+})(typeof window !== 'undefined' ? window : globalThis);
