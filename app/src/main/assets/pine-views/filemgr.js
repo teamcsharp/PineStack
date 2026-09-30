@@ -1007,7 +1007,7 @@
       sum.appendChild(make('span', 'fm-dim', [part('footage', s.footage), part('kept', s.kept),
         part('album cuts', s.album), part('cache', s.cache)].filter(Boolean).join(' - ') || 'Nothing kept.'));
       sum.appendChild(make('span', 'fm-dim', 'Exports go to ' + (s.dest || 'no folder yet')
-        + '. The footage rolls off by itself after two days.'));
+        + '. ' + (s.keep_say || 'The footage rolls off by itself.')));   /* [cam-rotate] the station says how much */
       var cache = camHold('c:trash-can', 'Hold to clear the cache (' + bytes((s.cache && s.cache.bytes) || 0) + ')',
         'Thumbnails, re-encoded copies and window cuts - all made again from the footage when asked',
         'fm-restore-btn', function (b) {
