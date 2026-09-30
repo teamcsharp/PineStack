@@ -4567,3 +4567,14 @@ html.pine-tech-wide .sp-tech.sp-tech-wide .wc-strip {
 .sp-gapbig-track .sp-gap-thumb { width: 44px !important; height: 44px !important; }
 .sp-gapbig-scale { display: flex; justify-content: space-between; margin: 4px 18px 0; color: #9aa4ad; font-size: 12px; }
 .sp-gapbig-say { margin: 12px 18px 0; color: #9aa4ad; }
+
+/* [reply-gap:ictoggle] the hourglass is the roulette's switch; the separate
+   switch and the bar under the dice are gone ("The other loading bar will
+   suffice") */
+.sp-gap-switch { display: none !important; }
+.sp-gap-countwell { display: none !important; }
+.sp-gap-ic.sp-gap-ictoggle { width: 28px; height: 28px; align-items: center; justify-content: center;
+  border-radius: 7px; border: 1px solid rgba(154, 164, 173, .3); color: #9aa4ad; cursor: pointer; }
+.sp-gap-ic.sp-gap-ictoggle svg { width: 16px; height: 16px; }
+.sp-gap-ic.sp-gap-ic-on { color: var(--sp-on, #54d18b); border-color: var(--sp-on, #54d18b); background: #16302a; }
+.sp-gap-ic.sp-gap-ictoggle:focus-visible { outline: 2px solid var(--sp-on, #54d18b); outline-offset: 1px; }
