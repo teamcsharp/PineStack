@@ -4375,6 +4375,9 @@ html.pine-tech-wide .sp-tech.sp-tech-wide .wc-strip {
   .sp-mv-ticks { animation: none; }
 }
 .sp-mv-stage.sp-mv-pinlist { overflow-anchor: none; }
+/* [onecard-moment] the moment's card keeps the moment's tally in view once a
+   later member's rolls have landed on it - in the past and in the history */
+.sp-mv-past.sp-mv-joined .sp-mv-rolls { display: flex !important; }
 .sp-mv-frozen, .sp-mv-frozen * { animation-play-state: paused !important; }
 .rt-tag .sp-mv-all[hidden], .sp-mv-hist .sp-mv-all[hidden] { display: none; }
 
