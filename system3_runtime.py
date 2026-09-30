@@ -3633,12 +3633,18 @@ class System3Runtime:
             _cid, i = self._turn_of(entry, text, who)
             if i is None:
                 i = self._turn_of_loose(entry, text, who)                     # [s3-direction] reworded on the way
-            if i is None:
-                return None
-            stamp = (((entry.get("turn_dice") or {}).get(str(i)) or {}).get("s3") or {})
-            dims = (stamp.get("perf") or {}).get("dims")
+            dims = None
+            if i is not None:
+                stamp = (((entry.get("turn_dice") or {}).get(str(i)) or {}).get("s3") or {})
+                dims = (stamp.get("perf") or {}).get("dims")
             if not isinstance(dims, dict) or not dims:
-                return None
+                # [es-every-turn] the seat's current feeling, as perf_voice does
+                if _cid is None:
+                    _cid = ((entry or {}).get("system3") or {}).get("conversation_id")
+                feel = self._seat_feel(_cid, who)
+                dims = (feel or {}).get("dims")
+                if not isinstance(dims, dict) or not dims:
+                    return None
             with self.lock:
                 self.metrics["perf_applied"] += 1
             out = {d: float(dims.get(d) or 0) for d in system3.EMOTION_DIMS}
@@ -3703,6 +3709,38 @@ class System3Runtime:
             self.fail("stamp performance", exc)
             return None
 
+    def _seat_feel(self, cid, who):
+        """[es-every-turn] the seat's current feeling as System 3 holds it:
+        {"voice", "dims", "row"} or None. Nothing is drawn."""
+        seat = _SEAT_OF.get(str(who or ""), "")
+        if not cid or not seat:
+            return None
+        conv = self.recent.get(str(cid))
+        if conv is None:
+            try:
+                conv = self.store.conversation(str(cid))
+            except Exception:  # noqa: BLE001
+                conv = None
+        if not isinstance(conv, dict) or not isinstance(conv.get("participants"), list):
+            return None
+        p = system3.participant(conv, seat) or {}
+        emo = p.get("emotion") if isinstance(p.get("emotion"), dict) else {}
+        if not emo.get("table") or not emo.get("category"):
+            return None
+        spec = {"table": emo["table"], "category": emo["category"], "id": emo.get("id"),
+                "label": emo.get("label")}
+        block = system3.es_voice(self.config, spec)
+        intensity = float(emo.get("intensity") or 0.5)
+        return {"voice": system3.voice_intent(block, intensity) if block else None,
+                "dims": emo.get("dims") if isinstance(emo.get("dims"), dict) else {},
+                "row": {"table": emo["table"], "category": emo["category"], "item": emo.get("id"),
+                        "label": emo.get("label"), "intensity": round(intensity, 3),
+                        "source": "the seat's current feeling"}}
+
+    def _voice_miss(self, why):
+        with self.lock:
+            self.metrics[why] = int(self.metrics.get(why) or 0) + 1
+
     def perf_voice(self, entry, turns, text, who=""):
         """[s3-es-voice] ES -> the recording: the voice block this turn's stamp
         carries (the ES row's `voice` at the turn's intensity), for
@@ -3714,12 +3752,21 @@ class System3Runtime:
             _cid, i = self._turn_of(entry, text, who)
             if i is None:
                 i = self._turn_of_loose(entry, text, who)                     # [s3-direction] its voice too
-            if i is None:
-                return None
-            stamp = (((entry.get("turn_dice") or {}).get(str(i)) or {}).get("s3") or {})
-            got = (stamp.get("perf") or {}).get("voice")
+            got = None
+            stamp = {}
+            if i is not None:
+                stamp = (((entry.get("turn_dice") or {}).get(str(i)) or {}).get("s3") or {})
+                got = (stamp.get("perf") or {}).get("voice")
             if not isinstance(got, dict):
-                return None
+                # [es-every-turn] no voice of its own: the seat's current feeling
+                self._voice_miss("voice_miss_noturn" if i is None else "voice_miss_novoice")
+                if _cid is None:
+                    _cid = ((entry or {}).get("system3") or {}).get("conversation_id")
+                feel = self._seat_feel(_cid, who)
+                if not feel or not isinstance(feel.get("voice"), dict):
+                    return None
+                self._voice_miss("voice_seat")
+                return dict(feel["voice"], row=dict(feel["row"]))
             with self.lock:
                 self.metrics["voice_applied"] = int(self.metrics.get("voice_applied") or 0) + 1
             # [es-roads] and which ES row it is, for the air record (a stamp from
