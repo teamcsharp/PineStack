@@ -159,6 +159,7 @@
     own.innerHTML = '<i class="pine-cam-flag-dot"></i><span>CAM</span>';
     own.addEventListener('click', toggle);
     own.__pineCamWired = true;
+    holdWire(own);                          /* [pinecam-config] */
     document.body.appendChild(own);
     return own;
   }
@@ -408,10 +409,10 @@
   function mjpegUrl() {
     if (nativeOn || !tsInfo) return '';
     var u = String(tsInfo.url || '');
-    if (/\/live\.ts/.test(u)) return u.replace(/\/live\.ts.*$/, '/live.mjpg');
+    if (/\/live\.ts/.test(u)) return u.replace(/\/live\.ts.*$/, '/live.mjpg') + cfgQuery();   /* [pinecam-config] */
     try {
       var host = new URL(base() || root.location.href).hostname;
-      return host ? 'http://' + host + ':' + tsInfo.port + '/live.mjpg' : '';
+      return host ? 'http://' + host + ':' + tsInfo.port + '/live.mjpg' + cfgQuery() : '';
     } catch (e) { return ''; }
   }
   /* [cam-open] "the cam window's actually popping up a little weirder now
@@ -442,7 +443,7 @@
       img.__mjpegNext = '';
       img.__mjpeg = m;
       img.onerror = function () { mjpegFailedAt = Date.now(); img.__mjpeg = ''; };
-      img.src = m + '?c=' + Date.now();
+      img.src = m + (m.indexOf('?') < 0 ? '?' : '&') + 'c=' + Date.now();
     }
     img.addEventListener('load', go);
     img.addEventListener('error', go);
@@ -2640,6 +2641,7 @@
       cam.textContent = 'CAM';
       cam.title = 'The Pine Cam is here - tap for the picture';
       cam.addEventListener('click', function (ev) { ev.stopPropagation(); toggle(); });
+      holdWire(cam);                        /* [pinecam-config] */
       rail.appendChild(cam);
       var find = document.createElement('button');
       find.id = 'pineViewTab-camfind';
@@ -2839,6 +2841,8 @@
       b.__pineCamWired = true;
       b.addEventListener('click', toggle);
     }
+    holdWire(b);                            /* [pinecam-config] hold: the settings */
+    cfgRead();                              /* [pinecam-config] the desk picture's presets */
     /* #1470: the lock screen and a backgrounded document must cover the
      * native picture, which no z-index can reach. */
     document.addEventListener('visibilitychange', nativeCover);
@@ -2852,7 +2856,530 @@
     if (!timer) timer = setInterval(look, POLL_MS);
   }
 
+  /* [pinecam-config] PRESS AND HOLD THE CAM TAB: EVERY PINE CAM SETTING, ITS
+   * RECORDINGS, AND H3. "if i press and hold on the cam tab show a popup for
+   * configuring the pine cam and its broadcast. offer quality settings, a crop
+   * panel, resolution presets, and wifi adaptor conneciton dropdowns... enable
+   * to cam for live and have the cam export an mp4 to pine box recordings when
+   * an album is being cut on a toggle ... (enabled by default). Show any and
+   * all pineCam settings in this popup allowing for adjustment and save the
+   * preferences for reuse and reload. I also want a tab to access previous
+   * pine cam recordings ... drag and drop them to the pinebox recordings folder
+   * and export footage for H3 ... For any footage or recording, I want an
+   * option to send it to H3 and have it used as a reference for a stinger."
+   * Every control saves the moment it changes, to the station that owns it
+   * (/api/pinecam/config, /api/pinelive/settings, /api/pinelink/relay and
+   * /crop), and the popup is painted from the station's answer - so what it
+   * shows is what is kept, on every surface, after any reload. A hold is
+   * HOLD_MS (the crop's own) and never also a tap; a right click is a hold. */
+  var cfgEl = null;
+  var cfgTab = 'settings';
+  var cfgFilter = 'all';
+  var cfgItems = [];
+  var cfgShown = 120;
+  var cfgThumbIO = null;
+  var deskMjpeg = null;          /* {fps, q, w}: the desk picture's presets, from the station */
+  var CFG_KIND = {album: 'Album cut', cut: 'Cut', kept: 'Kept', footage: 'Footage'};
+
+  function cfgQuery() {
+    if (!deskMjpeg) return '';
+    return '?fps=' + (Number(deskMjpeg.fps) || 25) + '&q=' + (Number(deskMjpeg.q) || 5)
+      + (Number(deskMjpeg.w) ? '&w=' + Number(deskMjpeg.w) : '');
+  }
+  function cfgRead() {
+    return Promise.resolve(ask('/api/pinecam/config')).then(function (v) {
+      if (v && v.desk_mjpeg) deskMjpeg = v.desk_mjpeg;
+      return v;
+    }, function () { return null; });
+  }
+
+  function holdWire(el) {
+    if (!el || el.__pineCamHold) return;
+    el.__pineCamHold = true;
+    var t = 0, at = null, fired = 0;
+    var clear = function () { if (t) { clearTimeout(t); t = 0; } };
+    if (el.title && el.title.indexOf('hold') < 0) el.title += ' - hold for its settings and recordings';
+    el.addEventListener('pointerdown', function (ev) {
+      if (ev.button !== 0 && ev.pointerType === 'mouse') return;
+      at = {x: ev.clientX, y: ev.clientY};
+      clear();
+      t = setTimeout(function () { t = 0; fired = Date.now(); openConfig(); }, HOLD_MS);
+    });
+    el.addEventListener('pointermove', function (ev) {
+      if (t && at && (Math.abs(ev.clientX - at.x) > 10 || Math.abs(ev.clientY - at.y) > 10)) clear();
+    });
+    ['pointerup', 'pointercancel', 'pointerleave'].forEach(function (n) { el.addEventListener(n, clear); });
+    /* the release after a hold is not a tap: the box does not toggle */
+    el.addEventListener('click', function (ev) {
+      if (fired && Date.now() - fired < 1500) { fired = 0; ev.stopImmediatePropagation(); ev.preventDefault(); }
+    }, true);
+    el.addEventListener('contextmenu', function (ev) {
+      ev.preventDefault();
+      clear();
+      fired = Date.now();
+      openConfig();
+    });
+  }
+
+  function cfgMake(tag, cls, text) {
+    var n = document.createElement(tag);
+    if (cls) n.className = cls;
+    if (text != null) n.textContent = text;
+    return n;
+  }
+  function cfgBtn(ref, words, title, fn) {
+    var b = cfgMake('button', 'pcc-btn');
+    b.type = 'button';
+    b.innerHTML = icon(ref, '', '') + (words ? '<span>' + esc(words) + '</span>' : '');
+    b.title = title;
+    b.setAttribute('aria-label', title);
+    b.addEventListener('click', function (ev) { ev.stopPropagation(); fn(b, ev); });
+    return b;
+  }
+  function cfgSay(text) {
+    var s = document.getElementById('pineCamCfgSay');
+    if (s) s.textContent = text || '';
+  }
+  function cfgSection(host, ref, title, hint) {
+    var sec = cfgMake('section', 'pcc-sec');
+    var h = cfgMake('div', 'pcc-sec-h');
+    h.innerHTML = icon(ref, '', '') + '<b>' + esc(title) + '</b>';
+    sec.appendChild(h);
+    if (hint) sec.appendChild(cfgMake('div', 'pcp-hint', hint));
+    host.appendChild(sec);
+    return sec;
+  }
+  function cfgSwitch(sec, label, on, title, fn) {
+    var row = cfgMake('label', 'pcc-row pcc-switch');
+    row.title = title;
+    var box = document.createElement('input');
+    box.type = 'checkbox';
+    box.checked = !!on;
+    box.addEventListener('change', function () { fn(box.checked, box); });
+    row.appendChild(box);
+    row.appendChild(cfgMake('span', '', label));
+    sec.appendChild(row);
+    return box;
+  }
+  function cfgSelect(sec, label, opts, cur, title, fn) {
+    var row = cfgMake('label', 'pcc-row');
+    row.title = title;
+    row.appendChild(cfgMake('span', 'pcc-lab', label));
+    var sel = document.createElement('select');
+    sel.title = title;
+    opts.forEach(function (o) {
+      var op = document.createElement('option');
+      op.value = String(o[0]);
+      op.textContent = o[1];
+      if (o[2]) op.disabled = true;
+      if (String(o[0]) === String(cur)) op.selected = true;
+      sel.appendChild(op);
+    });
+    sel.addEventListener('change', function () { fn(sel.value, sel); });
+    row.appendChild(sel);
+    sec.appendChild(row);
+    return sel;
+  }
+
+  function buildConfig() {
+    if (cfgEl) return cfgEl;
+    cfgEl = document.createElement('div');
+    cfgEl.id = 'pineCamCfg';
+    cfgEl.className = 'pine-cam-cfg';
+    cfgEl.setAttribute('role', 'dialog');
+    cfgEl.setAttribute('aria-label', 'Pine Cam settings and recordings');
+    cfgEl.innerHTML =
+      '<div class="pine-cam-bar pcc-head"><b>PINE CAM</b>'
+      + '<span class="pcc-tabs" role="tablist">'
+      + '<button type="button" role="tab" data-tab="settings" title="Every Pine Cam setting, saved as you change it">'
+      + icon('c:settings', '', '') + '<span>Settings</span></button>'
+      + '<button type="button" role="tab" data-tab="recordings" title="The Pine Cam recordings kept on the Spark">'
+      + icon('m:movie', '', '') + '<span>Recordings</span></button></span><i></i>'
+      + '<button type="button" class="pine-cam-x" aria-label="Close" title="Close">×</button></div>'
+      + '<div class="pcc-body" data-pane="settings"></div>'
+      + '<div class="pcc-body" data-pane="recordings" hidden></div>'
+      + '<div class="pcc-foot"><span id="pineCamCfgSay" class="pcp-say"></span></div>';
+    document.body.appendChild(cfgEl);
+    var w = Math.min(640, window.innerWidth - 24);
+    cfgEl.style.width = w + 'px';
+    cfgEl.style.left = Math.max(8, Math.round((window.innerWidth - w) / 2)) + 'px';
+    cfgEl.style.top = Math.max(8, Math.round(window.innerHeight * 0.06)) + 'px';
+    drag(cfgEl, cfgEl.querySelector('.pcc-head'), false);
+    cfgEl.querySelector('.pine-cam-x').addEventListener('click', function (ev) { ev.stopPropagation(); closeConfig(); });
+    [].forEach.call(cfgEl.querySelectorAll('.pcc-tabs button'), function (b) {
+      b.addEventListener('click', function (ev) { ev.stopPropagation(); cfgShowTab(b.getAttribute('data-tab')); });
+    });
+    document.addEventListener('keydown', function (ev) {
+      if (ev.key === 'Escape' && cfgEl && !cfgEl.hidden) closeConfig();
+    });
+    return cfgEl;
+  }
+
+  function cfgShowTab(tab) {
+    cfgTab = tab === 'recordings' ? 'recordings' : 'settings';
+    [].forEach.call(cfgEl.querySelectorAll('.pcc-tabs button'), function (b) {
+      var on = b.getAttribute('data-tab') === cfgTab;
+      b.classList.toggle('on', on);
+      b.setAttribute('aria-selected', on ? 'true' : 'false');
+    });
+    [].forEach.call(cfgEl.querySelectorAll('.pcc-body'), function (p) {
+      p.hidden = p.getAttribute('data-pane') !== cfgTab;
+    });
+    if (cfgTab === 'recordings') recsLoad(); else cfgLoad();
+  }
+
+  function openConfig(tab) {
+    buildConfig();
+    cfgEl.hidden = false;
+    nativeMenu(true);                      /* #1470: a sheet over the surface */
+    cfgShowTab(tab || cfgTab);
+  }
+
+  function closeConfig() {
+    if (!cfgEl) return;
+    cfgEl.hidden = true;
+    recsPlayStop();
+    nativeMenu(false);
+  }
+
+  /* ------------------------------------------------------ the Settings tab */
+  function cfgLoad() {
+    cfgSay('reading the station…');
+    Promise.all([
+      cfgRead(),
+      Promise.resolve(ask('/api/pinelive/settings')).then(null, function () { return null; }),
+      Promise.resolve(ask('/api/pinelink/relay')).then(null, function () { return null; }),
+      Promise.resolve(ask('/api/pinelink/crop')).then(null, function () { return null; })
+    ]).then(function (got) {
+      if (!got[0]) { cfgSay('the station did not answer'); return; }
+      cfgPaint(got[0], got[1], got[2], got[3]);
+      cfgSay(got[0].say || 'every change is saved as you make it');
+    });
+  }
+
+  function cfgPost(body, node) {
+    if (node) node.disabled = true;
+    cfgSay('saving…');
+    return Promise.resolve(post('/api/pinecam/config', body)).then(function (v) {
+      if (node) node.disabled = false;
+      if (!v) { cfgSay('the station did not answer'); return null; }
+      if (v.desk_mjpeg) deskMjpeg = v.desk_mjpeg;
+      cfgSay(v.say || 'saved');
+      paintFrame();                        /* a new desk preset takes the picture over now */
+      return v;
+    }, function () { if (node) node.disabled = false; cfgSay('the station did not answer'); return null; });
+  }
+
+  function cfgPaint(v, pl, relay, crop) {
+    var host = cfgEl.querySelector('[data-pane="settings"]');
+    var keep = host.scrollTop;
+    host.textContent = '';
+    var c = v.config || {};
+    var s = (pl && pl.settings) || {};
+    /* 1. the broadcast */
+    var b = cfgSection(host, 'm:radio', 'Broadcast', 'Where the picture goes while the camera is live.');
+    cfgSwitch(b, 'PineCam to live - Tailscale listeners see the Pine Cam', !!s.tailscale_video,
+      'PineCam to live: the listeners on the Tailscale stream see the camera during the set (PineLive\'s own switch)',
+      function (on, box) {
+        box.disabled = true;
+        Promise.resolve(post('/api/pinelive/settings', {tailscale_video: on})).then(function () {
+          box.disabled = false;
+          cfgSay('PineCam to live is ' + (on ? 'ON' : 'OFF'));
+        }, function () { box.disabled = false; box.checked = !on; cfgSay('the station did not answer'); });
+      });
+    if (relay && relay.prefs) {
+      cfgSelect(b, 'Relay through the PineTab', relay.prefs.map(function (p) {
+        return [p, p === 'auto' ? 'Auto - the PineTab when it can join the camera' : p === 'always'
+          ? 'Always - through the PineTab only' : 'Never - the Spark\'s dongle only'];
+      }), relay.pref, 'Which road reaches the camera: the PineTab as a local-only second link, or the Spark\'s own adaptor',
+      function (val, sel) {
+        sel.disabled = true;
+        Promise.resolve(post('/api/pinelink/relay', {pref: val})).then(function (r) {
+          sel.disabled = false;
+          cfgSay(r && r.say ? r.say : 'relay: ' + val);
+        }, function () { sel.disabled = false; cfgSay('the station did not answer'); });
+      });
+    }
+    /* 2. the album cut */
+    var a = cfgSection(host, 'm:album', 'Album recording',
+      'With PineLive\'s Album recording on, every track the K.O. Sidekick set cuts brings the Pine Cam\'s footage of the same span, as an mp4 in the set\'s own folder in PineBoxRecordings, beside the track.');
+    cfgSwitch(a, 'Export an mp4 of the Pine Cam with every album cut', c.album_mp4 !== false,
+      'On by default: an mp4 of the camera goes with every album cut', function (on, box) { cfgPost({album_mp4: on}, box); });
+    /* 3. the desk picture */
+    var d = cfgSection(host, 'c:screen', 'Desk picture',
+      'How this computer shows the camera. The PineTab plays the camera natively, and the listeners\' feed keeps the camera\'s own picture.');
+    cfgSelect(d, 'Frame rate', [[10, '10 fps'], [15, '15 fps'], [25, '25 fps'], [30, '30 fps - the camera\'s own']], c.desk_fps,
+      'Frames a second on the desk picture', function (val, sel) { cfgPost({desk_fps: Number(val)}, sel); });
+    cfgSelect(d, 'Quality', [['high', 'High'], ['standard', 'Standard'], ['low', 'Low - lightest on the network']], c.desk_q,
+      'The desk picture\'s JPEG quality', function (val, sel) { cfgPost({desk_q: val}, sel); });
+    cfgSelect(d, 'Size', [[0, 'The camera\'s own - 848 x 480'], [640, '640 x 360'], [480, '480 x 270']], c.desk_w,
+      'The desk picture\'s resolution', function (val, sel) { cfgPost({desk_w: Number(val)}, sel); });
+    /* 4. the recordings */
+    var r = cfgSection(host, 'c:recording--filled', 'Recordings',
+      'The size of a recording when it is exported or cut for an album. The camera\'s original is copied as it is - no re-encode, nothing lost.');
+    cfgSelect(r, 'Size', [['source', 'The camera\'s original - 848 x 480'], ['640', '640 x 360'], ['480', '480 x 270']], c.rec_size,
+      'The resolution a recording is exported at', function (val, sel) { cfgPost({rec_size: val}, sel).then(function () { cfgLoad(); }); });
+    var q = cfgSelect(r, 'Quality', [['high', 'High'], ['standard', 'Standard'], ['small', 'Small files']], c.rec_quality,
+      'The quality of a re-encoded recording', function (val, sel) { cfgPost({rec_quality: val}, sel); });
+    if (c.rec_size === 'source') { q.disabled = true; q.title = 'The camera\'s original is copied as it is - there is no quality to choose'; }
+    /* 5. the crop */
+    var k = cfgSection(host, 'c:cut', 'Crop', crop && crop.say ? crop.say : 'What part of the picture goes out.');
+    var kr = cfgMake('div', 'pcc-row pcc-btns');
+    kr.appendChild(cfgBtn('c:cut', 'Crop the picture…', 'Draw the part of the picture that goes out', function () {
+      closeConfig();
+      cropDrawOpen();
+    }));
+    kr.appendChild(cfgBtn('c:renew', 'Whole picture', 'Reset the crop: the whole picture goes out', function (btn) {
+      btn.disabled = true;
+      Promise.resolve(post('/api/pinelink/crop', {reset: true})).then(function (x) {
+        btn.disabled = false;
+        cfgSay(x && x.say ? x.say : 'the crop is reset');
+      }, function () { btn.disabled = false; cfgSay('the station did not answer'); });
+    }));
+    k.appendChild(kr);
+    /* 6. the adaptor */
+    var radio = v.radio || {};
+    var w = cfgSection(host, 'c:network--4', 'Wi-Fi adaptor',
+      'Which of the Spark\'s radios joins the camera' + (radio.camera ? ' (' + radio.camera + (radio.signal != null ? ', signal ' + radio.signal + '%' : '') + ')' : '')
+      + '. Choosing another restarts the link on it - about twenty seconds without the picture.');
+    var pick = cfgSelect(w, 'Adaptor', (radio.adaptors || []).map(function (x) {
+      return [x.iface, x.iface + (x.product ? ' - ' + x.product : '') + ' - ' + x.state
+        + (x.current ? ' - holds the camera' : '') + (x.station ? ' - holds the station' : ''), x.station];
+    }), radio.current, 'The radio the camera link uses', function () { /* chosen with the button */ });
+    var wr = cfgMake('div', 'pcc-row pcc-btns');
+    wr.appendChild(cfgBtn('c:checkmark--filled', 'Use this adaptor', 'Restart the camera link on the chosen radio', function (btn) {
+      if (pick.value === radio.current) { cfgSay(pick.value + ' already holds the camera'); return; }
+      cfgPost({adaptor: pick.value}, btn).then(function (x) { if (x) cfgPaint(x, pl, relay, crop); });
+    }));
+    w.appendChild(wr);
+    /* 7. the folders */
+    var f = cfgSection(host, 'c:folder', 'Folders',
+      'Recordings are exported to ' + (v.dest || 'no folder yet') + '.');
+    var fr = cfgMake('div', 'pcc-row pcc-btns');
+    fr.appendChild(cfgBtn('c:folder', 'Change folders…', 'Where the clips are kept and where they are exported to', function () { openPrefs(); }));
+    f.appendChild(fr);
+    host.scrollTop = keep;
+  }
+
+  /* ---------------------------------------------------- the Recordings tab */
+  function recsLoad() {
+    var host = cfgEl.querySelector('[data-pane="recordings"]');
+    if (!host.firstChild) recsFrame(host);
+    cfgSay('reading the recordings…');
+    Promise.resolve(ask('/api/pinecam/recordings')).then(function (v) {
+      if (!v) { cfgSay('the station did not answer'); return; }
+      cfgItems = v.items || [];
+      var dz = document.getElementById('pineCamCfgDropTo');
+      if (dz) dz.textContent = v.dest || 'no export folder is set';
+      cfgShown = 120;
+      recsPaint();
+      cfgSay(cfgItems.length + ' recording' + (cfgItems.length === 1 ? '' : 's') + ' on the Spark');
+    }, function () { cfgSay('the station did not answer'); });
+  }
+
+  function recsFrame(host) {
+    var drop = cfgMake('div', 'pcc-drop');
+    drop.title = 'Drop a recording here to carry it to PineBoxRecordings';
+    drop.innerHTML = icon('c:folder', '', '') + '<div><b>Drop here to copy to PineBoxRecordings</b>'
+      + '<span id="pineCamCfgDropTo"></span></div>';
+    drop.addEventListener('dragover', function (ev) { ev.preventDefault(); drop.classList.add('over'); });
+    drop.addEventListener('dragleave', function () { drop.classList.remove('over'); });
+    drop.addEventListener('drop', function (ev) {
+      ev.preventDefault();
+      drop.classList.remove('over');
+      var name = '';
+      try { name = ev.dataTransfer.getData('text/x-pinecam') || ev.dataTransfer.getData('text/plain'); } catch (e) { name = ''; }
+      if (name) recsExport(name);
+    });
+    host.appendChild(drop);
+    var bar = cfgMake('div', 'pcc-row pcc-chips');
+    [['all', 'All'], ['album', 'Album cuts'], ['cut', 'Cuts'], ['kept', 'Kept'], ['footage', 'Footage']].forEach(function (f) {
+      var b = cfgMake('button', 'pcc-chip' + (cfgFilter === f[0] ? ' on' : ''), f[1]);
+      b.type = 'button';
+      b.title = 'Show ' + f[1].toLowerCase();
+      b.setAttribute('data-f', f[0]);
+      b.addEventListener('click', function (ev) {
+        ev.stopPropagation();
+        cfgFilter = f[0];
+        [].forEach.call(bar.querySelectorAll('.pcc-chip'), function (x) { x.classList.toggle('on', x === b); });
+        cfgShown = 120;
+        recsPaint();
+      });
+      bar.appendChild(b);
+    });
+    bar.appendChild(cfgBtn('c:renew', '', 'Read the recordings again', function () { recsLoad(); }));
+    host.appendChild(bar);
+    var player = cfgMake('div', 'pcc-player');
+    player.id = 'pineCamCfgPlayer';
+    player.hidden = true;
+    host.appendChild(player);
+    var form = cfgMake('div', 'pcc-h3');
+    form.id = 'pineCamCfgH3';
+    form.hidden = true;
+    host.appendChild(form);
+    var list = cfgMake('div', 'pcc-list');
+    list.id = 'pineCamCfgList';
+    host.appendChild(list);
+  }
+
+  function recsWhen(t) {
+    var d = new Date((Number(t) || 0) * 1000);
+    var two = function (n) { return (n < 10 ? '0' : '') + n; };
+    var M = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+    return M[d.getMonth()] + ' ' + d.getDate() + ' ' + two(d.getHours()) + ':' + two(d.getMinutes()) + ':' + two(d.getSeconds());
+  }
+
+  function recsPaint() {
+    var list = document.getElementById('pineCamCfgList');
+    if (!list) return;
+    list.textContent = '';
+    if (cfgThumbIO) { try { cfgThumbIO.disconnect(); } catch (e) { /* gone */ } }
+    cfgThumbIO = root.IntersectionObserver ? new root.IntersectionObserver(function (ents) {
+      ents.forEach(function (en) {
+        if (en.isIntersecting && en.target.getAttribute('data-src')) {
+          en.target.src = en.target.getAttribute('data-src');
+          en.target.removeAttribute('data-src');
+          cfgThumbIO.unobserve(en.target);
+        }
+      });
+    }, {root: list}) : null;
+    var rows = cfgItems.filter(function (x) { return cfgFilter === 'all' || x.kind === cfgFilter; });
+    if (!rows.length) { list.appendChild(cfgMake('div', 'pcp-hint', 'Nothing here yet.')); return; }
+    rows.slice(0, cfgShown).forEach(function (x) { list.appendChild(recsRow(x)); });
+    if (rows.length > cfgShown) {
+      var more = cfgBtn('c:add', 'Show ' + Math.min(120, rows.length - cfgShown) + ' more', 'Show more recordings', function () {
+        cfgShown += 120;
+        recsPaint();
+      });
+      more.classList.add('pcc-more');
+      list.appendChild(more);
+    }
+  }
+
+  function recsRow(x) {
+    var off = !!(x.writing || x.broken);      /* [cam-broken] */
+    var row = cfgMake('div', 'pcc-rec' + (off ? ' writing' : ''));
+    row.draggable = !off;
+    row.title = x.broken ? x.name + ' - unreadable: the link restarted while it was being written, before recordings were made crash-proof'
+      : x.writing ? x.name + ' - still being written; it can be used once it closes'
+        : x.name + ' - drag it onto the folder above to copy it to PineBoxRecordings';
+    row.addEventListener('dragstart', function (ev) {
+      try { ev.dataTransfer.setData('text/x-pinecam', x.name); ev.dataTransfer.setData('text/plain', x.name); } catch (e) { /* no data */ }
+    });
+    var th = document.createElement('img');
+    th.className = 'pcc-thumb';
+    th.alt = '';
+    if (!off) {
+      var src = base() + '/api/pinecam/thumb/' + encodeURIComponent(x.name);
+      if (cfgThumbIO) { th.setAttribute('data-src', src); cfgThumbIO.observe(th); } else th.src = src;
+    }
+    th.onerror = function () { th.style.visibility = 'hidden'; };
+    row.appendChild(th);
+    var words = cfgMake('div', 'pcc-words');
+    words.appendChild(cfgMake('b', '', (CFG_KIND[x.kind] || x.kind) + ' - ' + recsWhen(x.at)));
+    words.appendChild(cfgMake('span', '', x.name + ' - ' + (Math.round((Number(x.bytes) || 0) / 1e5) / 10) + ' MB'
+      + (x.writing ? ' - recording now' : x.broken ? ' - unreadable (cut short by a restart)' : '')));
+    row.appendChild(words);
+    var btns = cfgMake('div', 'pcc-rbtns');
+    var play = cfgBtn('c:play--filled--alt', '', 'Play it here', function () { recsPlay(x); });
+    var exp = cfgBtn('c:export', '', 'Copy it to PineBoxRecordings', function () { recsExport(x.name); });
+    var h3 = cfgBtn('c:magic-wand--filled', '', 'Send it to H3 as the reference video of a stinger', function () { recsH3(x); });
+    [play, exp, h3].forEach(function (b) { b.disabled = off; btns.appendChild(b); });
+    row.appendChild(btns);
+    return row;
+  }
+
+  function recsPlayStop() {
+    var p = document.getElementById('pineCamCfgPlayer');
+    if (!p) return;
+    var v = p.querySelector('video');
+    if (v) { try { v.pause(); v.removeAttribute('src'); v.load(); } catch (e) { /* gone */ } }
+    p.textContent = '';
+    p.hidden = true;
+  }
+
+  function recsPlay(x) {
+    var p = document.getElementById('pineCamCfgPlayer');
+    if (!p) return;
+    recsPlayStop();
+    var head = cfgMake('div', 'pcc-row pcc-ph');
+    head.appendChild(cfgMake('b', '', (CFG_KIND[x.kind] || x.kind) + ' - ' + recsWhen(x.at)));
+    var shut = cfgMake('button', 'pine-cam-x', '×');
+    shut.type = 'button';
+    shut.title = 'Close the player';
+    shut.setAttribute('aria-label', 'Close the player');
+    shut.addEventListener('click', function (ev) { ev.stopPropagation(); recsPlayStop(); });
+    head.appendChild(shut);
+    p.appendChild(head);
+    var v = document.createElement('video');
+    v.controls = true;
+    v.playsInline = true;
+    v.preload = 'metadata';
+    v.src = base() + x.url;
+    p.appendChild(v);
+    p.hidden = false;
+    try { v.play(); } catch (e) { /* the controls are there */ }
+  }
+
+  function recsExport(name) {
+    cfgSay('handing ' + name + ' to the courier…');
+    Promise.resolve(post('/api/pinecam/export', {name: name})).then(function (r) {
+      cfgSay(r ? (r.say || (r.ok ? 'on its way' : 'it did not go')) : 'the station did not answer');
+    }, function () { cfgSay('the station did not answer'); });
+  }
+
+  function recsH3(x) {
+    var f = document.getElementById('pineCamCfgH3');
+    if (!f) return;
+    f.textContent = '';
+    var head = cfgMake('div', 'pcc-row pcc-ph');
+    head.innerHTML = icon('c:magic-wand--filled', '', '') + '<b>' + esc('H3 stinger from ' + x.name) + '</b>';
+    var shut = cfgMake('button', 'pine-cam-x', '×');
+    shut.type = 'button';
+    shut.title = 'Close';
+    shut.setAttribute('aria-label', 'Close');
+    shut.addEventListener('click', function (ev) { ev.stopPropagation(); f.hidden = true; });
+    head.appendChild(shut);
+    f.appendChild(head);
+    f.appendChild(cfgMake('div', 'pcp-hint', 'The recording is the stinger\'s reference video: H3 takes a 2 to 5 second window of it, around the point you choose.'));
+    var ta = document.createElement('textarea');
+    ta.rows = 3;
+    ta.placeholder = 'What should the stinger be? For example: the Pine Box logo slams in over this desk, neon, a bass drop';
+    ta.title = 'The direction for the stinger';
+    f.appendChild(ta);
+    var pos = cfgMake('label', 'pcc-row');
+    pos.title = 'Where in the recording the reference window sits';
+    pos.appendChild(cfgMake('span', 'pcc-lab', 'Where'));
+    var rng = document.createElement('input');
+    rng.type = 'range';
+    rng.min = '0';
+    rng.max = '100';
+    rng.value = '50';
+    rng.title = 'Where in the recording the reference window sits';
+    var pv = cfgMake('span', 'pcc-pv', '50%');
+    rng.addEventListener('input', function () { pv.textContent = rng.value + '%'; });
+    pos.appendChild(rng);
+    pos.appendChild(pv);
+    f.appendChild(pos);
+    var go = cfgMake('div', 'pcc-row pcc-btns');
+    go.appendChild(cfgBtn('c:magic-wand--filled', 'Queue the stinger', 'Queue it for H3 - one render at a time', function (btn) {
+      var prompt = String(ta.value || '').trim();
+      if (!prompt) { cfgSay('say what the stinger should be'); ta.focus(); return; }
+      btn.disabled = true;
+      Promise.resolve(post('/api/pinecam/h3', {name: x.name, prompt: prompt, at_share: Number(rng.value) / 100})).then(function (r) {
+        btn.disabled = false;
+        cfgSay(r ? (r.say || (r.ok ? 'queued' : 'it was not queued')) : 'the station did not answer');
+        if (r && r.ok) f.hidden = true;
+      }, function () { btn.disabled = false; cfgSay('the station did not answer'); });
+    }));
+    f.appendChild(go);
+    f.hidden = false;
+    try { f.scrollIntoView({block: 'nearest'}); } catch (e) { /* older engine */ }
+    ta.focus();
+  }
+
   root.PineCam = {start: start, open: open, close: close,
+    settings: openConfig, recordings: function () { openConfig('recordings'); },   /* [pinecam-config] */
     toggle: toggle, isLive: function () { return live; },
     /* #1470: the native picture's callbacks and a reading of it. */
     tapPicture: tapPicture, wallBoxChanged: wallBoxChanged, bare: setBare,
