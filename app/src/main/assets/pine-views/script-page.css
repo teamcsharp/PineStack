@@ -4578,3 +4578,14 @@ html.pine-tech-wide .sp-tech.sp-tech-wide .wc-strip {
 .sp-gap-ic.sp-gap-ictoggle svg { width: 16px; height: 16px; }
 .sp-gap-ic.sp-gap-ic-on { color: var(--sp-on, #54d18b); border-color: var(--sp-on, #54d18b); background: #16302a; }
 .sp-gap-ic.sp-gap-ictoggle:focus-visible { outline: 2px solid var(--sp-on, #54d18b); outline-offset: 1px; }
+
+/* [whole-words] a landed entry on the card is shown whole - it wraps; no ellipsis */
+.sp-rr-t.folded .sp-rr-line { white-space: normal; overflow: visible; text-overflow: clip; }
+.sp-rr-two .sp-rr-lc, .sp-rr-two .sp-rr-ls { white-space: normal; overflow: visible; }
+.sp-rr-two .sp-rr-ll { flex: 0 1 auto; overflow: visible; text-overflow: clip; overflow-wrap: anywhere; }
+/* [src-popup] the source badge opens its window */
+.sp-mv-acc.sp-rr-pickable { cursor: pointer; }
+.sp-rrp-off td { color: #6c757d; }
+.sp-rrp-p { margin: 2px 0 6px; color: #cfd8de; line-height: 1.45; }
+.sp-rrp-table tr.sp-rrp-go { cursor: pointer; }
+.sp-rrp-table tr.sp-rrp-go:hover td { background: rgba(104, 206, 217, .08); }
