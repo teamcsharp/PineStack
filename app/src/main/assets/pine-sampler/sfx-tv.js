@@ -910,8 +910,15 @@
     var dx = (Number(e.clientX) || 0) - g.x;
     var dy = (Number(e.clientY) || 0) - g.y;
     if (g.kind === 'size') {
-      g.box.width = Math.max(MIN.w, Math.min(W - g.box.left - 4, g.from.width + dx));
-      g.box.height = Math.max(MIN.h, Math.min(H - g.box.top - 4, g.from.height + dy));
+      /* [aspect-keep] "through the corner, always maintain the aspect ratio":
+         the grip scales the set along its own diagonal - never its shape. */
+      var w0 = Math.max(1, g.from.width), h0 = Math.max(1, g.from.height);
+      var s = 1 + (dx * w0 + dy * h0) / (w0 * w0 + h0 * h0);
+      var sMax = Math.min((W - g.box.left - 4) / w0, (H - g.box.top - 4) / h0);
+      var sMin = Math.min(sMax, Math.max(MIN.w / w0, MIN.h / h0));
+      s = Math.max(sMin, Math.min(sMax, s));
+      g.box.width = w0 * s;
+      g.box.height = h0 * s;
     } else {
       /* Clamped so the title bar can never leave the window: a set
        * dragged off the top edge is one nothing can bring back. */
