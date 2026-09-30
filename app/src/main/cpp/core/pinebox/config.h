@@ -46,6 +46,26 @@ constexpr double kDuckAttackSeconds  = 0.020;
 constexpr double kDuckHoldSeconds    = 0.350;
 constexpr double kDuckReleaseSeconds = 0.250;
 
+/* [levels-one] The master: one gain over the WHOLE sampler, after every pad
+ * has been mixed and before the block leaves for the device. It is what the
+ * page's one level bus (pineLevels, kind `pads`) drives, so the pads answer
+ * to the same slider law as the music, the voice and the video instead of
+ * being the one thing on the tablet with no level of its own.
+ *
+ * 0..2, not 0..1: the bus lets every kind go to 200%, and the pads are cut
+ * quiet enough that the operator does reach for the top half. Above 1 is a
+ * boost, so render() clamps the block to [-1, 1] whenever the master is not
+ * sitting at exactly unity - there is no limiter in this engine, and a
+ * boosted stab that wraps in the HAL is a crack, not a loud stab.
+ *
+ * The glide is how long a move takes to get most of the way there (95%, a
+ * one-pole with a time constant of a third of this). Twenty milliseconds is
+ * inaudible as a fade and long enough that a slider dragged at finger speed
+ * never steps - a gain that jumps in one sample is a click on anything that
+ * is ringing. */
+constexpr float  kMaxMasterGain      = 2.0f;
+constexpr double kMasterGlideSeconds = 0.020;
+
 /* peaks() refuses to build an envelope longer than this; the trim view is a
  * few hundred pixels wide and asking for a million buckets is a mistake, not
  * a request. Mirrors the Math.min(4096, ...) in the JS. */

@@ -66,6 +66,21 @@ object PineSampler {
 
     private var duck: DuckController? = null
 
+    /**
+     * [levels-one] The last master the page asked for, 0..2.
+     *
+     * Held HERE, in the singleton, and not only in the engine, because the
+     * engine does not outlive a [detach] and the page does not re-send a level
+     * it believes is already set. [attach] and [warm] both push it back down,
+     * so a stream that was given back and reopened - which happens every time
+     * the sampler view is left and returned to - comes back at the level the
+     * slider still shows rather than at unity.
+     */
+    private var lastMasterGain: Float = 1f
+
+    /** [levels-one] The ceiling. Must match kMaxMasterGain in config.h. */
+    private const val MAX_MASTER_GAIN = 2f
+
     /** "oboe" here, "webaudio" on the desktop. The UI may report it; it must not branch on it. */
     const val BACKEND = "oboe"
 
@@ -113,6 +128,7 @@ object PineSampler {
         scratchDir = context.cacheDir.absolutePath
         handle = nativeCreate()
         duck = DuckController(context.applicationContext)
+        pushMaster()
         return true
     }
 
@@ -127,6 +143,10 @@ object PineSampler {
     @Synchronized
     fun warm(): Boolean {
         if (handle == 0L) return false
+        /* [levels-one] Before the stream opens, so its first block is already
+         * at the page's level. The core holds it across a stop and start,
+         * so this is belt and braces for a handle that was rebuilt. */
+        pushMaster()
         val ok = nativeStart(handle)
         started.set(ok)
         return ok
@@ -417,6 +437,43 @@ object PineSampler {
         if (handle != 0L) nativeSetDuckDepth(handle, depth)
     }
 
+    /**
+     * [levels-one] The master over the whole sampler, 0..2 - what the page's
+     * one level bus drives for the pads. Above 1 is a boost; the engine
+     * clamps its output to full scale while it is off unity.
+     *
+     * Remembered even with no engine attached, and re-applied when one is
+     * (see [lastMasterGain]). A NaN is ignored rather than taken as silence: a
+     * bad number off a slider must not quietly mute the instrument. Returns
+     * the value now in force.
+     */
+    @Synchronized
+    fun setMasterGain(gain: Float): Float {
+        if (gain.isNaN()) return lastMasterGain
+        lastMasterGain = gain.coerceIn(0f, MAX_MASTER_GAIN)
+        pushMaster()
+        return lastMasterGain
+    }
+
+    /** [levels-one] The master the page last set (the target, not the glide). */
+    fun masterGain(): Float = lastMasterGain
+
+    /**
+     * [levels-one] Hand the remembered master to the engine, if there is one.
+     *
+     * The UnsatisfiedLinkError is a library older than this file - the same
+     * pairing levels() guards against. A level that cannot be applied is not
+     * worth taking the sampler down for; the pads simply play at unity.
+     */
+    private fun pushMaster() {
+        if (handle == 0L) return
+        try {
+            nativeSetMasterGain(handle, lastMasterGain)
+        } catch (stale: UnsatisfiedLinkError) {
+            /* no master in this .so */
+        }
+    }
+
     /** Where the host hangs its own player, so a pad hit can push it down. */
     fun onDuck(listener: ((Float) -> Unit)?) {
         duck?.listener = listener
@@ -465,5 +522,6 @@ object PineSampler {
     private external fun nativeLevelPads(handle: Long): Array<String>
     private external fun nativeDuckGain(handle: Long): Float
     private external fun nativeSetDuckDepth(handle: Long, depth: Float)
+    private external fun nativeSetMasterGain(handle: Long, gain: Float): Float
     private external fun nativeSixteenPitch(padIndex: Int): Double
 }

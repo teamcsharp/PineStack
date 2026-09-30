@@ -725,11 +725,13 @@
   /* "everything created later" true without a second mechanism.         */
   /* ================================================================== */
 
-  var LEVEL_KINDS = ['voice', 'music', 'sfx', 'video'];
+  /* [levels-one] + the sampler PADS and the MASTER every other kind follows */
+  var LEVEL_KINDS = ['voice', 'music', 'sfx', 'video', 'pads', 'master'];
+  var LEVEL_OUT = ['voice', 'music', 'sfx', 'video', 'pads'];   /* what the master multiplies */
   /* One public contract on every surface. Values above unity are carried by
      the page's gain stages and, for the native wall, Android's loudness
      stage. No control may advertise travel that its output silently clips. */
-  var LEVEL_CEIL = {voice: 2, music: 2, sfx: 2, video: 2};
+  var LEVEL_CEIL = {voice: 2, music: 2, sfx: 2, video: 2, pads: 2, master: 1};
   var LEVEL_KEY = 'pineListenerLevels';
   var LEGACY_LEVEL_KEY = 'pineMixer';
 
@@ -828,6 +830,46 @@
     catch (err) { /* private mode: this session still works */ }
   }
 
+  /* [levels-one] THE SOUND IS LEVEL x MASTER.  The store keeps what the
+     operator set on each row; every output stage below is handed the product,
+     so the master moves everything and a row still reads its own number. A HOLD
+     is a temporary owner (the Listen view's sleep fade): it moves the sound on
+     this surface only and is never stored or sent to the station. */
+  var lvlHolds = {};
+  function lvlHeld(m) {
+    var out = {};
+    for (var k in m) if (Object.prototype.hasOwnProperty.call(m, k)) out[k] = m[k];
+    for (var h in lvlHolds) if (Object.prototype.hasOwnProperty.call(lvlHolds, h)) out[h] = lvlHolds[h];
+    return out;
+  }
+  function lvlEffective(m, only) {
+    var master = lvlNum('master', m.master === undefined ? 1 : m.master);
+    var out = {};
+    for (var i = 0; i < LEVEL_OUT.length; i += 1) {
+      var k = LEVEL_OUT[i];
+      if (only && !only[k]) continue;
+      out[k] = lvlNum(k, (m[k] === undefined || m[k] === null ? 1 : m[k]) * master);
+    }
+    return out;
+  }
+  function lvlOnly(asked) {
+    var only = {};
+    if (asked.master !== undefined) {
+      for (var i = 0; i < LEVEL_OUT.length; i += 1) only[LEVEL_OUT[i]] = true;
+    }
+    for (var k in asked) if (Object.prototype.hasOwnProperty.call(asked, k) && k !== 'master') only[k] = true;
+    return only;
+  }
+  /* The pads: the native Oboe engine on the tablet, the Web Audio one on the
+     desk - both answer pineSampler.master(v). */
+  function lvlPads(v) {
+    var s = root.pineSampler;
+    try {
+      if (s && typeof s.master === 'function') { s.master(lvlNum('pads', v)); return true; }
+    } catch (err) { /* the pads keep their last level */ }
+    return false;
+  }
+
   /* Everything in THIS document, now, with no promise in the way.  Only
      called where this document owns its own element volume - i.e. NOT in the
      shell, where applyAppVolume is the single owner (#1147) and a write from
@@ -838,6 +880,7 @@
     var gains = {};
     for (var key in m) {
       if (!Object.prototype.hasOwnProperty.call(m, key)) continue;
+      if (key === 'pads' || key === 'master') continue;       /* [levels-one] their own roads */
       if (key === 'voice' || key === 'music') {
         mixer[key] = m[key] <= 1 ? m[key] : 1;
         gains[key] = Math.round((m[key] <= 1 ? 1 : m[key]) * 100);
@@ -874,7 +917,7 @@
               if (levelsGet().music <= 0) player.pause();
             });
           }
-          if (m.music <= 0) {
+          if (m.music <= 0 && levelsGet().music <= 0) {       /* [levels-one] a row at 0, not a master fade */
             if (!player.paused) player.pause();
           } else {
             if (Math.abs(Number(player.volume) - 1) > 0.001) player.volume = 1;
@@ -909,6 +952,7 @@
         }
       } catch (err) { /* no tube up */ }
     }
+    if (typeof m.pads === 'number' && lvlPads(m.pads)) touched = true;   /* [levels-one] */
     return touched;
   }
 
@@ -965,6 +1009,7 @@
          'shell' and nothing else. */
       try { if (lvlMixerSetRaw) lvlMixerSetRaw(want); }
       catch (err) { /* the drawer label already moved */ }
+      if (typeof want.pads === 'number') lvlPads(want.pads);   /* [levels-one] the desk's pads */
       return;
     }
     if (typeof want.video === 'number') lvlWall(want.video);
@@ -997,8 +1042,10 @@
     return levelsApplyAll(one);
   }
 
-  /** Several at once - one store write, one crossing. */
-  function levelsApplyAll(values) {
+  /** Several at once - one store write, one crossing.
+      [levels-one] opts.quiet: a re-apply (boot, repair, the station's own
+      answer) - the sound moves, nothing is sent to the station. */
+  function levelsApplyAll(values, opts) {
     var m = levelsGet();
     var asked = {};
     for (var k in values) {
@@ -1008,20 +1055,125 @@
     }
     if (!Object.keys(asked).length) return '';
     levelsStore(m);
+    if (!(opts && opts.quiet)) lvlSyncOut(asked);
+    return lvlSound(m, lvlOnly(asked));
+  }
+
+  /* [levels-one] the output stages, handed level x master for the kinds that moved */
+  function lvlSound(m, only) {
+    var out = lvlEffective(lvlHeld(m), only);
     var roads = [];
     if (lvlShellDoc()) {
-      lvlBook(asked);
+      lvlBook(out);
       roads.push('shell');
     } else {
-      if (lvlLocalNow(asked)) roads.push('local');
-      if (typeof asked.video === 'number'
+      if (lvlLocalNow(out)) roads.push('local');
+      if (typeof out.video === 'number'
           && root.pineDesktop && typeof root.pineDesktop.videoWall === 'function') {
-        lvlBook({video: asked.video});
+        lvlBook({video: out.video});
         roads.push('wall');
       }
     }
     lvlTell(m, roads);
     return roads.join('+');
+  }
+
+  /* [levels-one] A TEMPORARY OWNER: the sound moves here, the store does not. */
+  function levelsHold(kind, value) {
+    if (LEVEL_CEIL[kind] === undefined) return '';
+    lvlHolds[kind] = lvlNum(kind, value);
+    var one = {};
+    one[kind] = true;
+    return lvlSound(levelsGet(), lvlOnly(one));
+  }
+  function levelsRelease(kind) {
+    if (!Object.prototype.hasOwnProperty.call(lvlHolds, kind)) return '';
+    delete lvlHolds[kind];
+    var one = {};
+    one[kind] = true;
+    return lvlSound(levelsGet(), lvlOnly(one));
+  }
+
+  /* [levels-one] ONE SET, STATION-WIDE. The station holds the numbers
+     (GET/POST /api/levels); this surface is one of its hands. It joins by
+     ADOPTING - its own levels seed an empty store, and pull a kind down where
+     it had that kind quieter (the station never raises anything in a merge) -
+     then sends each move it makes and takes every move another surface made,
+     read every 2.5 s. A move of its own in flight is never overwritten by the
+     answer to an older read. */
+  var LVL_ADOPT_KEY = 'pineLevelsAdopted';
+  var lvlSync = {rev: -1, pending: null, timer: 0, lastLocal: 0, started: false, polling: 0};
+  function lvlWho() {
+    if (root.pineDesktop && typeof root.pineDesktop.videoWall === 'function') return 'the PineTab';
+    return lvlShellDoc() ? 'the Pine Box app' : 'a browser';
+  }
+  function lvlHttp(method, path, body) {
+    var b = root.pineDesktop;
+    try {
+      if (b && method === 'GET' && typeof b.get === 'function') return Promise.resolve(b.get(path));
+      if (b && method === 'POST' && typeof b.post === 'function') return Promise.resolve(b.post(path, body));
+    } catch (err) { /* the plain road below */ }
+    var proto = '';
+    try { proto = String(root.location && root.location.protocol || ''); } catch (err2) { proto = ''; }
+    if (!/^https?:$/.test(proto) || typeof root.fetch !== 'function') {
+      return Promise.reject(new Error('no road to the station'));
+    }
+    return root.fetch(path, {method: method, cache: 'no-store',
+      headers: {'Content-Type': 'application/json'}, body: body ? JSON.stringify(body) : undefined})
+      .then(function (r) { return r.ok ? r.json() : null; });
+  }
+  function lvlSyncOut(asked) {
+    lvlSync.lastLocal = Date.now();
+    lvlSync.pending = lvlSync.pending || {};
+    for (var k in asked) if (Object.prototype.hasOwnProperty.call(asked, k)) lvlSync.pending[k] = asked[k];
+    if (lvlSync.timer) return;
+    lvlSync.timer = setTimeout(function () {
+      lvlSync.timer = 0;
+      var send = lvlSync.pending;
+      lvlSync.pending = null;
+      if (!send) return;
+      lvlHttp('POST', '/api/levels', {levels: send, by: lvlWho()}).then(function (v) {
+        if (v && typeof v.rev === 'number') lvlSync.rev = Math.max(lvlSync.rev, v.rev);
+      }, function () { /* the next move, or the next read, carries it */ });
+    }, 250);
+  }
+  function lvlSyncIn(v) {
+    if (!v || !v.levels || typeof v.rev !== 'number') return;
+    if (v.rev <= lvlSync.rev) return;
+    if (lvlSync.pending || lvlSync.timer || Date.now() - lvlSync.lastLocal < 1500) return;
+    lvlSync.rev = v.rev;
+    var mine = levelsGet();
+    var diff = {};
+    var any = false;
+    for (var i = 0; i < LEVEL_KINDS.length; i += 1) {
+      var k = LEVEL_KINDS[i];
+      var s = Number(v.levels[k]);
+      if (isFinite(s) && Math.abs(s - Number(mine[k])) > 0.0001) { diff[k] = s; any = true; }
+    }
+    if (any) levelsApplyAll(diff, {quiet: true});
+  }
+  function lvlSyncStart() {
+    if (lvlSync.started) return;
+    lvlSync.started = true;
+    var adopted = false;
+    try { adopted = root.localStorage.getItem(LVL_ADOPT_KEY) === '1'; } catch (err) { adopted = false; }
+    lvlHttp('GET', '/api/levels').then(function (v) {
+      if (v && v.levels && adopted) { lvlSyncIn(v); return null; }
+      return lvlHttp('POST', '/api/levels/adopt', {levels: levelsGet(), by: lvlWho()}).then(function (a) {
+        if (a && a.levels) {
+          try { root.localStorage.setItem(LVL_ADOPT_KEY, '1'); } catch (err2) { /* asks again next boot */ }
+          lvlSync.rev = -1;
+          lvlSyncIn(a);
+        }
+      });
+    }).then(null, function () { /* no station yet: the next read tries */ lvlSync.started = false; });
+    if (!lvlSync.polling) {
+      lvlSync.polling = setInterval(function () {
+        if (!lvlSync.started) { lvlSyncStart(); return; }
+        try { if (document.hidden) return; } catch (err3) { /* read anyway */ }
+        lvlHttp('GET', '/api/levels').then(lvlSyncIn, function () { /* next round */ });
+      }, 2500);
+    }
   }
 
   /** What apply() WILL reach from this document, asked as a question. */
@@ -1030,6 +1182,7 @@
     if (LEVEL_CEIL[kind] === undefined) return out;
     if (lvlShellDoc()) { out.push('shell'); return out; }
     try { if (root.pineMixer && root.pineMixer.set) out.push('local'); } catch (err) { /* none */ }
+    if (kind === 'pads' && root.pineSampler && typeof root.pineSampler.master === 'function') out.push('pads');   /* [levels-one] */
     if (kind === 'video') {
       try {
         if (root.PineSfxTv && root.PineSfxTv.level
@@ -1056,9 +1209,10 @@
      output latches to move. */
   function levelsRefresh(kind) {
     var all = levelsGet();
-    var values = {};
-    if (LEVEL_CEIL[kind] !== undefined) values[kind] = all[kind];
-    else values = all;
+    var ask = {};                                        /* [levels-one] the sound, level x master */
+    if (LEVEL_CEIL[kind] !== undefined) ask[kind] = true;
+    else for (var a = 0; a < LEVEL_KINDS.length; a += 1) ask[LEVEL_KINDS[a]] = true;
+    var values = lvlEffective(lvlHeld(all), lvlOnly(ask));
     if (kind === 'video' || !kind) lvlWallSent = null;
     var roads = [];
     if (lvlShellDoc()) {
@@ -1090,6 +1244,12 @@
       KINDS: LEVEL_KINDS,
       CEIL: LEVEL_CEIL,
       get: levelsGet,
+      /* [levels-one] the sound: every output kind at level x master (and any hold) */
+      effective: function () { return lvlEffective(lvlHeld(levelsGet())); },
+      OUT: LEVEL_OUT,
+      hold: levelsHold,
+      release: levelsRelease,
+      sync: function () { return {rev: lvlSync.rev, pending: !!lvlSync.pending, started: lvlSync.started}; },
       apply: levelsApply,
       applyAll: levelsApplyAll,
       refresh: levelsRefresh,
@@ -1112,7 +1272,7 @@
       return levelsGet();
     };
     root.pineMixer.apply = function () {
-      levelsApplyAll(levelsGet());
+      levelsApplyAll(levelsGet(), {quiet: true});        /* [levels-one] a re-apply, not a move */
       if (lvlMixerApplyRaw) {
         try { lvlMixerApplyRaw(); } catch (err) { /* canonical apply already ran */ }
       }
@@ -1121,7 +1281,9 @@
   }
   /* Apply the migrated or persisted law once the panel has mounted. Every
      later control reads and writes the same state through the public bus. */
-  soon(function () { try { levelsApplyAll(levelsGet()); } catch (err) { /* boot continues */ } });
+  soon(function () { try { levelsApplyAll(levelsGet(), {quiet: true}); } catch (err) { /* boot continues */ } });
+  /* [levels-one] then join the one set on the station */
+  setTimeout(function () { try { lvlSyncStart(); } catch (err) { /* the poll retries */ } }, 1200);
 
   root.PineAudioLaw = {
     localMix: localMix,

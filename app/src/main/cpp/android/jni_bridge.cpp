@@ -517,6 +517,18 @@ Java_fm_pinebox_kiosk_audio_PineSampler_nativeSetDuckDepth(JNIEnv*, jobject,
   if (engine != nullptr) engine->core.setDuckDepth(depth);
 }
 
+/* [levels-one] The master over the whole sampler, 0..2. Returns what the core
+ * actually stored after its clamp, or -1 with no engine behind the handle so
+ * the Kotlin side can tell "applied 0" from "nothing to apply it to". */
+JNIEXPORT jfloat JNICALL
+Java_fm_pinebox_kiosk_audio_PineSampler_nativeSetMasterGain(JNIEnv*, jobject,
+                                                            jlong handle,
+                                                            jfloat gain) {
+  Engine* engine = engineOf(handle);
+  if (engine == nullptr) return -1.0f;
+  return engine->core.setMasterGain(static_cast<float>(gain));
+}
+
 /* 16 Level, Tune. Kept on this side of the bridge so the ratio the tablet
  * plays is the ratio the engine tested, rather than a second copy of the
  * formula in Kotlin that could drift. */

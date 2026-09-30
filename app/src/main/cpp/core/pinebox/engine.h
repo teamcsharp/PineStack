@@ -194,6 +194,18 @@ class SamplerCore {
   }
   void setDuckDepth(float depth);
 
+  /* [levels-one] The master gain over the whole sampler, 0..kMaxMasterGain.
+   * Any thread; one relaxed atomic store, which the audio thread picks up at
+   * the top of its next block and glides to (see render()). NaN and
+   * negatives land on 0, anything past the ceiling on the ceiling. Returns
+   * the value that was actually stored, so the caller can report it. */
+  float setMasterGain(float gain);
+  /* The TARGET, not the gain this very sample is at - what the slider says,
+   * which is what anything reading it back wants to show. */
+  float masterGain() const {
+    return masterTarget_.load(std::memory_order_relaxed);
+  }
+
   int engineRate() const { return engineRate_; }
   int outChannels() const { return outChannels_; }
 
@@ -233,6 +245,16 @@ class SamplerCore {
   DuckBus duck_;
   std::atomic<float> duckGain_{1.0f};
   std::atomic<int> ringing_{0};
+
+  /* [levels-one] The master. The target is written by the control thread and
+   * only READ on the audio thread; the gain this sample is actually at
+   * belongs to the audio thread alone and is a plain float for that reason.
+   * The coefficient is fixed by the engine rate at construction. */
+  std::atomic<float> masterTarget_{1.0f};
+  float masterNow_ = 1.0f;
+  float masterCoeff_ = 1.0f;
+  /* Audio thread. Applies (and glides) the master over a mixed block. */
+  void applyMaster(float* out, int frames);
 
   std::atomic<int> streamState_{0};
   std::atomic<double> baseLatency_{0.0};

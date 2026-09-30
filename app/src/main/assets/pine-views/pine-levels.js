@@ -82,6 +82,47 @@
 
   function videoLevel() { return levelOf('video'); }
 
+  /* [levels-one] THE BOX ROUTE: the Pine Box / Nabu speaker's own levels
+     (/api/dj/output - the station's, set for the speaker, not for a screen),
+     shown here so one sheet holds every level there is. Read off /api/levels'
+     `box`, written through PineAudioLaw.setLevel, a drag coalesced to one
+     write every 150 ms and the last position always sent. */
+  var boxState = null, boxBusy = {};
+  function boxFetch() {
+    var b = root.pineDesktop;
+    var got = null;
+    try {
+      if (b && typeof b.get === 'function') got = Promise.resolve(b.get('/api/levels'));
+      else if (typeof root.fetch === 'function') got = root.fetch('/api/levels', {cache: 'no-store'}).then(function (r) { return r.ok ? r.json() : null; });
+    } catch (err) { got = null; }
+    if (!got) return;
+    got.then(function (v) { if (v && v.box) boxState = v.box; }, function () { /* next beat */ });
+  }
+  function boxRead(stream) {
+    var law = root.PineAudioLaw;
+    if (!law || !boxState) return 0;
+    var got = law.levelOf(boxState, stream);
+    return got && got.level !== null ? Math.round(got.level * 100) : 0;
+  }
+  function boxWrite(stream, pct) {
+    var law = root.PineAudioLaw;
+    if (!law || typeof law.setLevel !== 'function') return;
+    var v = Math.max(0, Math.min(100, Number(pct) || 0)) / 100;
+    boxState = boxState || {};
+    boxState[stream + '_level'] = v;
+    boxState['nabu_' + stream + '_level'] = v;
+    var s = boxBusy[stream] || (boxBusy[stream] = {t: 0, want: null});
+    s.want = v;
+    if (s.t) return;
+    s.t = root.setTimeout(function () {
+      s.t = 0;
+      var send = s.want;
+      s.want = null;
+      if (send === null) return;
+      law.setLevel(stream, send).then(null, function () { /* the next drag */ });
+    }, 150);
+  }
+
   function row(host, key, label, most, read, write, hint) {
     var wrap = el('div', 'plv-row');
     var head = el('div', 'plv-head');
@@ -117,7 +158,7 @@
     if (sheet) return sheet;
     var node = el('div', 'plv-sheet');
     var head = el('div', 'plv-title');
-    head.appendChild(el('span', 'plv-title-t', 'Levels on this terminal'));
+    head.appendChild(el('span', 'plv-title-t', 'Levels - one set for the whole station'));   /* [levels-one] */
     var shut = el('button', 'plv-x', 'x');
     shut.setAttribute('type', 'button');
     shut.setAttribute('aria-label', 'Close the levels');
@@ -127,6 +168,10 @@
     node.appendChild(head);
 
     var refreshers = [];
+    refreshers.push(row(node, 'master', 'Master', 100,                        /* [levels-one] */
+      function () { return levelOf('master'); },
+      function (v) { setLevel('master', v); },
+      'Everything below follows it - on every screen of the station.'));
     refreshers.push(row(node, 'voice', 'The DJs', 200,
       function () { return levelOf('voice'); },
       function (v) { setLevel('voice', v); },
@@ -140,10 +185,22 @@
     refreshers.push(row(node, 'video', 'Videos', 200,
       videoLevel, setVideo,
       'Above 100% uses the playback gain stage.'));
+    refreshers.push(row(node, 'pads', 'Pads', 200,                            /* [levels-one] */
+      function () { return levelOf('pads'); },
+      function (v) { setLevel('pads', v); },
+      'The sampler pads, as one instrument.'));
+    node.appendChild(el('div', 'plv-sec', 'The Pine Box speaker'));
+    ['music', 'voice', 'reply'].forEach(function (s) {
+      refreshers.push(row(node, 'box-' + s, s === 'music' ? 'Box - music' : s === 'voice' ? 'Box - DJs' : 'Box - replies', 100,
+        function () { return boxRead(s); },
+        function (v) { boxWrite(s, v); },
+        s === 'music' ? 'The speaker\'s own levels - set for the room, not for a screen.' : ''));
+    });
+    boxFetch();
 
     node.appendChild(el('div', 'plv-foot',
-      'One remembered level per source on this terminal. This is the final '
-      + 'listener gain; playback transitions do not rewrite it.'));
+      'One set of levels for the whole station: a move here moves every '
+      + 'screen. The sound is each level times the master.'));          /* [levels-one] */
 
     root.document.body.appendChild(node);
     sheet = node;
@@ -158,6 +215,7 @@
        while he has hold of one of these. */
     beat = root.setInterval(function () {
       if (!sheet) return;
+      boxFetch();                                                    /* [levels-one] */
       for (var i = 0; i < refreshers.length; i += 1) refreshers[i]();
     }, 1500);
     try { if (beat && typeof beat.unref === 'function') beat.unref(); }
