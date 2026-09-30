@@ -163,6 +163,19 @@
 .fm-snap-words { flex: 1; min-width: 0; display: flex; flex-direction: column; font-size: 11.5px; }
 .fm-restore-btn { min-width: 150px; padding: 5px 10px; font-size: 11.5px; }
 
+/* [cam-files] the Pine Cam's videos */
+.fm-cam-sum { display: flex; flex-direction: column; align-items: flex-start; gap: 4px; padding: 4px 0 8px; font-size: 11.5px; }
+.fm-cam-player { margin: 4px 0 8px; border: 1px solid #2c404b; border-radius: 6px; background: #081013; overflow: hidden; }
+.fm-cam-player[hidden] { display: none; }
+.fm-cam-player video { display: block; width: 100%; max-height: 34vh; background: #000; }
+.fm-cam-ph { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 4px 6px 4px 10px; font-size: 11.5px; color: #edf3f5; }
+.fm-cam-thumb { width: 72px; height: 41px; flex: none; object-fit: cover; border-radius: 4px; background: #142129; }
+.fm-cam-btns { display: flex; gap: 6px; flex: none; }
+.fm-cam-btns .fm-iconbtn:disabled { opacity: .4; cursor: default; }
+.fm-cam-del { min-width: 30px; width: 30px; height: 30px; padding: 0; }
+.fm-cam-say { flex-basis: 100%; font-size: 11px; padding-left: 80px; }
+.fm-cam-more { justify-content: center; }
+
 /* the tablet's short glass: the list gives way first */
 @media (max-height: 720px) {
   .fm-pop { max-height: calc(100vh - 40px); top: calc(50% - 12px); }
