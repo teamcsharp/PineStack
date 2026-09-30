@@ -135,7 +135,12 @@ class Seams(unittest.TestCase):
                      {"who": "cohost", "turn_end": True}]
             transcript = [("dj", "a", 3), ("dj", "b", 3), ("drop", "boom", 1), ("cohost", "c", 3)]
             beats = [0.1, 0.1, 0.1, 0.0]
+            self.assertTrue(rg.CARRY_BY_DOOR, "the page door owns the pause into the next page")
             out, notes = rg.burst(beats, [0, 1, 2, 3], [0, 1, -1, 2], transcript, items, carry=True)
+            self.assertNotIn("carry", notes, "no second pause: the door seams the next page")
+            rg.CARRY_BY_DOOR = False
+            out, notes = rg.burst(beats, [0, 1, 2, 3], [0, 1, -1, 2], transcript, items, carry=True)
+            rg.CARRY_BY_DOOR = True
             self.assertEqual(out, [0.1, 2.5, 2.5, 0.0])
             self.assertEqual(notes["carry"]["s"], 2.5, "the pause into the next page")
             rows = [{"until": 3.1}, {"until": 8.6}, {"until": 12.1}, {"until": 15.1}]
@@ -150,6 +155,121 @@ class Seams(unittest.TestCase):
             self.assertEqual(out[-1], 0.0, "the file's last segment never gets a beat")
             self.assertEqual(rg.plain(3), [2.5, 2.5, 0.0])
             rg.use_path(None)
+
+
+class PageDoor(unittest.TestCase):
+    """[reply-gap:door] the pause before every message on the page feed."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        rg.use_path(Path(self.tmp.name) / "g.json")
+        rg._BOOKED.update(until=0.0, tail=0.0)
+
+    def tearDown(self):
+        rg.use_path(None)
+        self.tmp.cleanup()
+
+    def clip(self, **kw):
+        base = {"url": "/media/" + "a" * 32 + ".wav", "text": "a line", "speech": True}
+        base.update(kw)
+        return base
+
+    def test_what_is_a_message(self):
+        self.assertTrue(rg.is_message(self.clip()))
+        self.assertTrue(rg.is_message({"url": "/sfx/abc", "sting": True}), "the SFX Guy's sting")
+        self.assertFalse(rg.is_message(self.clip(kind="reply")), "a person's reply is exempt (#206)")
+        self.assertFalse(rg.is_message(self.clip(picture_only=True)))
+        self.assertFalse(rg.is_message({"text": "no audio"}))
+
+    def test_the_pause_follows_the_words_not_the_tail(self):
+        rg.save({"gap": 2.0, "roll": False})
+        prev = self.clip()
+        rg.booked(dict(prev, tail_s=0.9), 100.0)            # the air ends at 100, 0.9 s of it silence
+        nxt = self.clip(broadcast_ms=100000)
+        start = rg.door(nxt, 100.0, 95.0, tail_of=lambda c: 0.8)
+        self.assertAlmostEqual(start, 99.1 + 2.0, places=6)
+        self.assertEqual(nxt["gap_before"]["s"], 2.0)
+        self.assertEqual(nxt["tail_s"], 0.8)
+        self.assertEqual(rg.overlap(nxt), 0.0)
+
+    def test_a_short_pause_starts_inside_the_silent_tail(self):
+        rg.save({"gap": 0.2, "roll": False})
+        rg.booked(dict(self.clip(), tail_s=0.9), 100.0)
+        nxt = self.clip(broadcast_ms=100000)
+        start = rg.door(nxt, 100.0, 95.0)
+        self.assertAlmostEqual(start, 99.3, places=6)
+        self.assertAlmostEqual(rg.overlap(nxt), 0.7, places=6)
+
+    def test_a_tail_that_is_not_the_cursors_is_not_trusted(self):
+        rg.save({"gap": 0.2, "roll": False})
+        rg.booked(dict(self.clip(), tail_s=0.9), 80.0)       # some other clip's end
+        nxt = self.clip(broadcast_ms=100000)
+        self.assertAlmostEqual(rg.door(nxt, 100.0, 95.0), 100.2, places=6)
+
+    def test_a_quiet_air_has_no_seam_and_rolls_nothing(self):
+        rg.save({"gap": 1.0, "range": 1.0, "roll": True})
+        before = len(rg.recent(500))
+        nxt = self.clip(broadcast_ms=200000)
+        self.assertEqual(rg.door(nxt, 100.0, 200.0, rng=random.Random(1)), 200.0)
+        self.assertNotIn("gap_before", nxt)
+        self.assertEqual(len(rg.recent(500)), before)
+
+    def test_a_clip_held_later_by_its_maker_is_never_moved_earlier(self):
+        rg.save({"gap": 1.0, "roll": False})
+        nxt = self.clip(broadcast_ms=130000)                 # the sequencer said 130
+        self.assertEqual(rg.door(nxt, 100.0, 95.0), 130.0)
+
+    def test_rolling_every_message_gets_its_own_receipted_roll(self):
+        rg.save({"gap": 1.0, "range": 1.9, "roll": True})
+        rng = random.Random(3)
+        air = 100.0
+        seen = []
+        for i in range(40):
+            clip = self.clip(broadcast_ms=int(air * 1000))
+            start = rg.door(clip, air, air - 5, rng=rng)
+            g = clip["gap_before"]
+            self.assertTrue(g["rolled"])
+            self.assertTrue(0.2 <= g["s"] <= 2.9)
+            self.assertAlmostEqual(start, air + g["s"], places=6)
+            seen.append(g["s"])
+            air = start + 4.0
+            rg.booked(clip, air)
+        self.assertGreater(len(set(seen)), 8)
+
+    def test_the_pages_own_floor_is_free_air(self):
+        """Nothing booked: the cursor is the page's floor (now + lead), not
+        the end of a message - no seam, no roll."""
+        rg.save({"gap": 1.0, "range": 1.9, "roll": True})
+        nxt = self.clip(broadcast_ms=107000)
+        self.assertEqual(rg.door(nxt, 107.0, 107.0, rng=random.Random(2)), 107.0)
+        self.assertNotIn("gap_before", nxt)
+
+    def test_a_paged_round_books_its_end_from_the_doors_start(self):
+        rg.save({"gap": 3.0, "roll": False})
+        rg.booked(dict(self.clip(), tail_s=0.9), 100.0)
+        rows = [{"id": "r"}]
+        burst = self.clip(broadcast_ms=100000, stream={"rows": rows, "length": 30})
+        start = rg.door(burst, 100.0, 95.0)
+        self.assertAlmostEqual(rg.started(rows, 100.0), start)
+        self.assertEqual(rg.started([{"id": "other"}], 100.0), 100.0)
+
+    def test_a_recovered_clip_keeps_its_pause(self):
+        nxt = self.clip(broadcast_ms=100000, gap_before={"s": 3.0})
+        self.assertIsNone(rg.door(nxt, 100.0, 95.0))
+        self.assertEqual(nxt["gap_before"], {"s": 3.0})
+
+
+class StreamMixer(unittest.TestCase):
+    def test_a_voice_knows_its_tail(self):
+        try:
+            import station_stream as ss
+        except Exception as exc:  # noqa: BLE001 - numpy etc. live in the container
+            self.skipTest("station_stream not importable here: %s" % exc)
+        v = ss._Voice("k", 1.0, "/x.wav", 0.0, False, 0.9, 4.2)
+        self.assertEqual((v.tail, v.seconds, v.played), (0.9, 4.2, 0.0))
+        self.assertEqual(ss._Voice("k", 1.0, "/x.wav", 0.0).tail, 0.0)
+        src = (ROOT / "station_stream.py").read_text(encoding="utf-8")
+        self.assertIn("airing.played >= airing.seconds - airing.tail", src)
 
 
 class ProducedRound(unittest.TestCase):
@@ -236,6 +356,23 @@ class Planner(unittest.TestCase):
         got = subprocess.run([sys.executable, str(ROOT / "tools" / "reply_gap_patch.py"),
                               "--check", str(ROOT / "app.py")], capture_output=True, text=True)
         self.assertEqual(got.returncode, 2, got.stdout + got.stderr)
+
+    def test_the_door_patch_reports_applied(self):
+        got = subprocess.run([sys.executable, str(ROOT / "tools" / "reply_gap_door_patch.py"),
+                              "--check", str(ROOT / "app.py"), str(ROOT / "station_stream.py")],
+                             capture_output=True, text=True)
+        self.assertEqual(got.returncode, 2, got.stdout + got.stderr)
+
+    def test_the_door_is_in_page_feed_append(self):
+        m = re.search(r"\ndef page_feed_append\(clip.*?(?=\n\n\n)", self.text, re.S)
+        self.assertTrue(m)
+        body = m.group(0)
+        self.assertIn("_rg_start = reply_gap_door(clip, _rg_air, time.time() + lead)", body)
+        self.assertIn("reply_gap_booked(clip,", body)
+        self.assertIn("cursor = max(cursor - reply_gap_overlap(clip), start) + duration", self.text)
+        for needle in ("pineReplyGapFloor(clip)) - Date.now();", "pineReplyGapEarly(clip, player, djVoiceQueue)",
+                       "pineReplyGapEarly(clip, voice, voiceQueue)", "pineReplyGapWordsEnded(clip, null, djVoiceQueue)"):
+            self.assertEqual(self.text.count(needle), 1 if "Floor" not in needle else 2, needle)
 
 
 if __name__ == "__main__":

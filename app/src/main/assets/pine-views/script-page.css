@@ -196,6 +196,24 @@
   .sp-gap-switch::after { transition: none; }
 }
 
+/* [reply-gap:dice] the countdown: a 3 px bar under the square and a 2 px bar
+   along the whole toolbar row, both drained by the air's own clock. The
+   square gives the row 4 px for its bar. Idle (roulette off): no bars. */
+.sp-band-restore { position: relative; }
+.sp-gap-diebox { flex: none; display: flex; flex-direction: column; justify-content: space-between;
+  width: 30px; height: 28px; }
+.sp-gap .sp-gap-diebox .sp-gap-die { height: 24px; min-height: 24px; max-height: 24px; line-height: 22px; }
+.sp-gap .sp-gap-diebox .sp-gap-die .sp-die-reel > span { height: 22px; line-height: 22px; }
+.sp-gap-countwell { display: block; height: 3px; border-radius: 2px; overflow: hidden; background: #1b262b; }
+.sp-gap-count, .sp-gap-rowbar {
+  display: block; transform-origin: left center; transform: scaleX(0);
+  background: var(--sp-on, #68ced9); pointer-events: none;
+}
+.sp-gap-count { height: 100%; }
+.sp-gap-rowbar { position: absolute; left: 0; right: 0; bottom: -4px; height: 2px; border-radius: 1px; opacity: .85; }
+.sp-gap:not(.sp-gap-on) .sp-gap-countwell { opacity: .35; }
+.sp-gap:not(.sp-gap-on) .sp-gap-count, .sp-gap:not(.sp-gap-on) .sp-gap-rowbar { display: none; }
+
 /* ---------------------------------------------------------------- 1 2 3 */
 
 .sp-bar { display: flex; gap: 6px; align-items: center; }

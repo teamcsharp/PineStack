@@ -326,12 +326,20 @@ def _read(path: Path) -> str:
     return raw
 
 
+# An insertion a later patch extends in place ([reply-gap:door] adds its
+# helpers inside this block) is recognised by one line of its own.
+SENTINELS = {"helpers": "def reply_gap_seam() -> float:",
+             "page carry": "+ reply_gap_carry(_rg_notes, length, rows))"}
+
+
 def _state(text: str, edits) -> tuple[int, list[str]]:
     """0 ready, 2 applied, 1 broken (with the names)."""
     applied, missing, ready = [], [], []
     for name, old, new in edits:
         n_old, n_new = text.count(old), text.count(new)
-        if n_new == 1 and (n_old == 0 or new.find(old) >= 0 and n_old == 1):
+        if name in SENTINELS and text.count(SENTINELS[name]) == 1:
+            applied.append(name)
+        elif n_new == 1 and (n_old == 0 or new.find(old) >= 0 and n_old == 1):
             applied.append(name)
         elif n_old == 1:
             ready.append(name)

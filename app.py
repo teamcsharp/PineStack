@@ -16378,78 +16378,6 @@ def dialogue_audio_ready(kind: str, row: Any) -> bool:
         return False
 
 
-# [boot-dj] THE BOOTH'S SYSTEM 3 GATE, READ AHEAD OF THE BOOTH.
-#
-# While System 3 is active, _speak_turns_floorless withholds a round whose
-# bound roulette turns do not make a complete conversation - and it is the
-# LAST door, reached after the rescue or the standing consumer has already
-# chosen the round, taken the floor and spent its turn. Measured 2026-09-30
-# at boot: 107 of the 130 unheard dialogue rounds on the open roads failed
-# it ("incomplete conversation withheld after repair", "9 of 11 turns;
-# limit 9"), all of them counted READY, so the cupboard said 240 rounds
-# stood ready while the consumer aired nothing and a reboot opened on a
-# record. This asks exactly what the booth asks, of the entry the booth is
-# handed (_ready_air_entry: `script`, `lines`, `system3`, `turn_dice`), so
-# dialogue_row_ready stops calling a round ready that can never air.
-# tests/test_boot_dj_2026_09_30.py runs the real booth on the same fixtures.
-#
-# banter_turns costs ~300 us a round and this rides every readiness walk,
-# so the answer is kept per entry until its words, lines or binding change.
-_S3_BIND_MEMO: dict[int, tuple[Any, str]] = {}
-
-
-def s3_binding_withheld(entry: Any) -> str:
-    """[boot-dj] "" when System 3 would let this round through the booth,
-    else the booth's own words for why it withholds it."""
-    try:
-        if not isinstance(entry, dict):
-            return ""
-        _active = globals().get("_s3_active")
-        if not (callable(_active) and _active()):
-            return ""
-        s3 = entry.get("system3")
-        if not isinstance(s3, dict) or s3.get("mode") != "active":
-            return "round withheld without an active System 3 conversation"
-        ids = s3.get("turns") or {}
-        dice_raw = entry.get("turn_dice")
-        script = str(entry.get("script") or "")
-        sig = (script, entry.get("caller_name"), entry.get("caller2_name"),
-               entry.get("lines"), s3.get("planned_turns"),
-               id(ids), len(ids) if isinstance(ids, dict) else -1,
-               id(dice_raw), len(dice_raw) if isinstance(dice_raw, dict) else -1)
-        held = _S3_BIND_MEMO.get(id(entry))
-        if held is not None and held[0] == sig:
-            return held[1]
-        turns = banter_turns(script, str(entry.get("caller_name") or ""),
-                             str(entry.get("caller2_name") or ""))
-        dice = _turn_dice_map(entry)
-        if not isinstance(ids, dict):
-            ids = {}
-        positions = [i for i in range(len(turns))
-                     if str(ids.get(str(i)) or "")
-                     and str((dice.get(i, {}).get("s3") or {}).get("turn_id") or "")
-                     == str(ids.get(str(i)))]
-        why = ""
-        if not positions:
-            why = "round withheld without bound roulette turns"
-        else:
-            planned = int(s3.get("planned_turns") or len(positions))
-            try:
-                limit = int(entry.get("lines"))
-            except (TypeError, ValueError):
-                limit = 0
-            if (planned < 3 or len(positions) != planned or limit < planned
-                    or len({str(turns[i][0]) for i in positions}) < 2):
-                why = ("incomplete conversation withheld after repair "
-                       "(%d of %d turns; limit %d)" % (len(positions), planned, limit))
-        if len(_S3_BIND_MEMO) > 8192:
-            _S3_BIND_MEMO.clear()
-        _S3_BIND_MEMO[id(entry)] = (sig, why)
-        return why
-    except Exception:  # noqa: BLE001
-        return ""
-
-
 def dialogue_row_ready(kind: str, row: Any) -> bool:
     """One authoritative zero-work-to-air predicate for scheduled stock."""
     try:
@@ -16490,10 +16418,6 @@ def dialogue_row_ready(kind: str, row: Any) -> bool:
             if (content_gate_enabled("call_contract") and str(kind) == "caller"
                     and callable(_call_gate)
                     and not _call_gate(entry)):
-                return False
-            # [boot-dj] ...and a round System 3's booth gate would withhold
-            # is not zero-work-to-air either: it never reaches the air at all.
-            if s3_binding_withheld(entry):
                 return False
         return (dialogue_tint_ready(kind, row)
                 and dialogue_audio_ready(kind, row))
@@ -30309,7 +30233,10 @@ def page_reservation_repair() -> list[dict[str, Any]]:
         # [#1460] the page plays unstarted clips one after another, so
         # each occupies its own length behind the last - a clip stamped
         # inside air already booked used to add nothing to the cursor.
-        cursor = max(cursor, start) + duration
+        # [reply-gap:door] a clip stamped into the last one's silent tail
+        # starts that much before the cursor; chaining the whole tail would
+        # grow every later pause
+        cursor = max(cursor - reply_gap_overlap(clip), start) + duration
         pending.append(clip)
     _PAGE_AIR_UNTIL[0] = cursor
     if changed:
@@ -30446,11 +30373,21 @@ def page_feed_append(clip: dict[str, Any]) -> str:
         # timed streams. Otherwise an ordinary line can land inside a stream
         # and a long take can be overtaken after the old 40-second estimate.
         if str(clip.get("kind") or "") != "reply":
-            clip["broadcast_ms"] = max(int(clip["broadcast_ms"]),
-                                        int(float(_PAGE_AIR_UNTIL[0] or 0) * 1000))
+            # [reply-gap:door] THE PAUSE BEFORE THIS MESSAGE: the operator's
+            # gap, or a System 3 roll, after the last message's WORDS end -
+            # into its measured silent tail when the pause is shorter. Every
+            # road's clip passes here, so every message gets it; a quiet air
+            # has no seam and rolls nothing.
+            _rg_air = float(_PAGE_AIR_UNTIL[0] or 0)
+            _rg_start = reply_gap_door(clip, _rg_air, time.time() + lead)
+            clip["broadcast_ms"] = (int(_rg_start * 1000) if _rg_start is not None
+                                    else max(int(clip["broadcast_ms"]),
+                                             int(_rg_air * 1000)))
             duration = page_clip_seconds(clip)
+            clip.setdefault("air_seconds", round(float(duration or 0), 3))
             _PAGE_AIR_UNTIL[0] = max(float(_PAGE_AIR_UNTIL[0] or 0),
                 clip["broadcast_ms"] / 1000.0 + duration)
+            reply_gap_booked(clip, clip["broadcast_ms"] / 1000.0 + duration)
         _RADIO.setdefault("voice_clips", []).append(clip)
         del _RADIO["voice_clips"][:-VOICE_CLIP_FEED_KEEP]
         _PAGE_DELIVERIES[delivery_id] = {
@@ -61902,7 +61839,7 @@ def dead_air_stock() -> dict[str, int]:
     return out
 
 
-async def dead_air_rescue(quiet: float, why: str = "") -> str:
+async def dead_air_rescue(quiet: float) -> str:
     """Put a finished SEGMENT on the air rather than a noise.
 
     Returns the road that answered, or "" when the cupboard had nothing -
@@ -61949,8 +61886,8 @@ async def dead_air_rescue(quiet: float, why: str = "") -> str:
         if said:
             repair_note("%s - a finished %s round was taken out of the "
                         "cupboard and put on the air (%d line(s))"
-                        % (why or ("the show ran out of things to say" if quiet <= 0   # [boot-dj]
-                                   else "dead air %ds" % int(quiet)),
+                        % ("the show ran out of things to say" if quiet <= 0
+                           else "dead air %ds" % int(quiet),
                            kind, len(said)))
             pipeline_log("air", "SILENCE FILLED: %d line(s) of a ready %s "
                                 "round, off the shelf, out of turn - the "
@@ -61961,9 +61898,9 @@ async def dead_air_rescue(quiet: float, why: str = "") -> str:
             _inject = globals().get("system3_injected_node")
             if callable(_inject):
                 _inject(by="the dead-air rescue",
-                        why=(why or ("the show ran out of things to say"   # [boot-dj]
-                                     if quiet <= 0 else
-                                     "the room was quiet %d s" % int(quiet)))
+                        why=("the show ran out of things to say"
+                             if quiet <= 0 else
+                             "the room was quiet %d s" % int(quiet))
                         + " - a finished %s round went out off the shelf, "
                           "out of turn (%d line(s))" % (kind, len(said)),
                         kind="rescue", at=now,
@@ -63420,32 +63357,12 @@ async def resume_radio() -> None:
     await asyncio.sleep(5)            # let the music index load first
     # #824: a respin never opens with silence — an off-the-shelf line airs
     # NOW, before the first model write or long render.
-    #
-    # [boot-dj] THE FIRST THING ON AIR AFTER A REBOOT IS A BANKED DJ ROUND.
-    # The operator, 2026-09-30: "DJs talk right away - the first thing on
-    # air is a banked, ready DJ round, then the music continues. No
-    # minutes-long wait for the DJs." This called cover_the_gap alone, and
-    # at 100% talk that ladder asks only the banter larder and then rolls a
-    # record - so a reboot with 240 finished rounds in the cupboard opened on
-    # a record and the first DJ line came 92 s later. The cupboard's own
-    # out-of-turn door answers first now: dead_air_rescue(0) takes the
-    # readiest finished round of the entry on air, else manager, gallery,
-    # caller, news, through _ready_shelf_air - which stamps it heard at the
-    # hand-off and keeps the repeat check, so no reboot can open on a round
-    # an earlier one already aired. Only when the cupboard holds nothing
-    # that will air does the old cover (a rolled record, then SFX) go.
     async def _instant_open() -> None:
-        try:
-            if await dead_air_rescue(
-                    0.0, "the station came back on air after a restart - the "
-                         "first thing it says is a banked round (#824)"):
-                return
-        except Exception:  # noqa: BLE001
-            pass
         try:
             await cover_the_gap("dj", "the station is respinning (#824)")
         except Exception:
             pass
+    fire_and_forget(_instant_open())
     try:
         # A restart mid-announce leaves the satellite stuck "responding"
         # (#391): heal BEFORE the show opens its mouth, not two minutes
@@ -63461,11 +63378,6 @@ async def resume_radio() -> None:
         dj_start(dj_best_station(str(want.get("station") or "")))
     except Exception:
         pass
-    # [boot-dj] ...and it opens once the station IS on: dj_start is what
-    # turns the show on and loads the larder, the pantry and the shelf the
-    # banked round is taken from. Fired above it, the open ran before them
-    # whenever the satellite heal awaited, and found nothing to air.
-    fire_and_forget(_instant_open())       # [boot-dj] after dj_start
 
 
 def radio_owned_models() -> list[str]:
@@ -109654,6 +109566,54 @@ def reply_gap_carry(notes: Any, length: Any, rows: list) -> float:
     return 0.0
 
 
+# [reply-gap:door] THE PAUSE BEFORE EVERY MESSAGE (reply_gap.door): stamped in
+# page_feed_append, the one door every road's clip passes.
+def reply_gap_tail_of(clip: dict[str, Any]) -> float:
+    """The measured silence on the end of a spoken clip (a /media/ wav: the
+    mixer's own reading, memoised); 0 for anything else - a sting off the
+    sample shelf carries none, and nothing on CIFS is touched from here."""
+    try:
+        url = str((clip or {}).get("url") or "").split("?", 1)[0]
+        if not url.startswith("/media/") or not url.lower().endswith(".wav"):
+            return 0.0
+        path = _stream_clip_path(url)
+        got = seg_tails_for([path])[0] if path else -1.0
+        return max(0.0, float(got)) if got is not None and got >= 0 else 0.0
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
+def reply_gap_door(clip: dict[str, Any], air_until: float, earliest: float) -> float | None:
+    """[reply-gap:door] When this message starts, its pause stamped on it; None
+    leaves the door's old rule (not a message, or the module is missing)."""
+    if _reply_gap is None:
+        return None
+    try:
+        return _reply_gap.door(clip, air_until, earliest, tail_of=reply_gap_tail_of)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def reply_gap_booked(clip: dict[str, Any], until: float) -> None:
+    if _reply_gap is not None:
+        _reply_gap.booked(clip, until)
+
+
+def reply_gap_overlap(clip: dict[str, Any]) -> float:
+    try:
+        return float(_reply_gap.overlap(clip)) if _reply_gap is not None else 0.0
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
+def reply_gap_started(rows: Any, default: float) -> float:
+    """[reply-gap:door] where the door started the burst carrying `rows`."""
+    try:
+        return float(_reply_gap.started(rows, default)) if _reply_gap is not None else float(default)
+    except Exception:  # noqa: BLE001
+        return float(default)
+
+
 # #1205: the mixer's own reading of "how much silence is on the end of
 # this". Named beside CONCAT_TAIL because that constant is the guess this
 # replaces, and the two must never drift apart again: this is the number
@@ -112847,7 +112807,8 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                         on_handoff()
                     for _entry in _entries:
                         page_delivery_apply(_entry, page_delivery)
-                    _paged_until = (_pstart + max(0.0, float(length or 0))
+                    _paged_until = (reply_gap_started(rows, _pstart)   # [reply-gap:door] the door's start
+                                    + max(0.0, float(length or 0))
                                     # [reply-gap] the pause into the next page
                                     + reply_gap_carry(_rg_notes, length, rows))
                     # #1147: publish how far the air is sold, so every
@@ -158889,9 +158850,6 @@ def dialogue_row_ready_why(kind: str, row: Any) -> str:
             if (str(kind) == "caller" and callable(_call_gate)
                     and not _call_gate(entry)):
                 return "the phone-call contract does not hold"
-            _s3_withheld = s3_binding_withheld(entry)          # [boot-dj]
-            if _s3_withheld:
-                return "System 3 would withhold it at the booth: " + _s3_withheld
         if not dialogue_tint_ready(str(kind), row):
             return "the tinted version is not the active one"
         if not dialogue_audio_ready(str(kind), row):
@@ -164421,7 +164379,10 @@ def _stream_snapshot() -> dict[str, Any]:
                           # so a hot sample cannot out-shout the show
                           # (the same intent as sfx_levelled on the
                           # HTTP road, without its decode-to-wav).
-                          "sfx": _u.startswith("/sfx/")})
+                          "sfx": _u.startswith("/sfx/"),
+                          # [reply-gap:door] the words' end, for the hand-over
+                          "tail": float(clip.get("tail_s") or 0),
+                          "seconds": float(clip.get("air_seconds") or 0)})
 
         # [pause-bed] off air, the endless set is what the house hears - so
         # it is what the road hears too, not a held socket full of silence.
@@ -239569,6 +239530,61 @@ function djVoiceEl(slot) {
   return djVoiceEls[slot];
 }
 
+/* [reply-gap:door] THE PAUSE BETWEEN MESSAGES, ON THIS PAGE. The station
+ * stamps every message with the pause before it (gap_before: the operator's
+ * gap, or the System 3 roll) and with its own measured silent tail (tail_s).
+ * The page keeps that pause even when it runs behind its stamps, hands over
+ * at the words' end when the next message is due inside that tail, and
+ * tells the views the moment a message ends and exactly when the next one
+ * starts ("pine-reply-gap": the player's own timer, not a second clock). */
+let pineReplyGapEndAt = 0;
+function pineReplyGapFloor(clip) {
+  const g = clip && clip.gap_before;
+  if (!g || !pineReplyGapEndAt) return 0;
+  const s = Number(g.s);
+  return (isFinite(s) && s >= 0) ? pineReplyGapEndAt + s * 1000 : 0;
+}
+function pineReplyGapCue(clip, waitMs) {
+  const g = clip && clip.gap_before;
+  if (!g || clip.pineGapCued) return;
+  clip.pineGapCued = true;
+  try {
+    window.dispatchEvent(new CustomEvent("pine-reply-gap", {detail: {
+      s: Number(g.s) || 0, rolled: !!g.rolled, dice: g.dice, lo: g.lo, hi: g.hi,
+      id: String(g.id || ""), at: Date.now(),
+      startsAt: Date.now() + Math.max(0, Number(waitMs) || 0),
+      text: String(clip.text || "").slice(0, 80)}}));
+  } catch (e) { /* a view that cannot hear it never costs the air */ }
+}
+function pineReplyGapDue(next) {
+  return Math.max(Number(next.broadcastAt || 0), Number(next.retryAt || 0),
+                  pineReplyGapFloor(next));
+}
+/* The moment the words end - the clip's end less its silent tail - is the
+ * moment the pause begins, and the moment the views are told. */
+function pineReplyGapWordsEnded(clip, el, queue) {
+  if (!clip || clip.pineWordsEnded) return;
+  clip.pineWordsEnded = true;
+  const tail = Math.max(0, Number(clip.tail_s || 0));
+  let over = 0;
+  if (el && isFinite(el.duration)) {
+    over = Math.max(0, Number(el.currentTime || 0) - Math.max(0, el.duration - tail));
+  } else {
+    over = tail;
+  }
+  pineReplyGapEndAt = Date.now() - over * 1000;
+  const next = queue && queue[0];
+  if (next && next.gap_before) pineReplyGapCue(next, pineReplyGapDue(next) - Date.now());
+}
+function pineReplyGapEarly(clip, el, queue) {
+  const tail = Number((clip && clip.tail_s) || 0);
+  if (!(tail > 0.05) || !el || !isFinite(el.duration)) return false;
+  if (Number(el.currentTime || 0) < el.duration - tail) return false;
+  pineReplyGapWordsEnded(clip, el, queue);
+  const next = queue && queue[0];
+  if (!next || !next.gap_before) return false;
+  return pineReplyGapDue(next) - Date.now() <= 120;
+}
 function djVoiceNext() {
   // A recording is playing in the cache popup and the mute switch is on:
   // hold the live talk (queue intact) so the DJs don't overlap the episode.
@@ -239633,7 +239649,10 @@ function djVoiceNext() {
     return;
   }
   const broadcastAt = Number(clip.broadcastAt || Date.now());
-  const waitForAir = Math.max(broadcastAt, Number(clip.retryAt || 0)) - Date.now();
+  /* [reply-gap:door] ...and never sooner than the pause after the last words */
+  const waitForAir = Math.max(broadcastAt, Number(clip.retryAt || 0),
+                              pineReplyGapFloor(clip)) - Date.now();
+  pineReplyGapCue(clip, waitForAir);
   if (waitForAir > 25) {
     /* #1147: one deduped timer, no queue mutation, no slot flip - and
      * the music is not held ducked through a 45-second announce lead. */
@@ -239796,6 +239815,14 @@ function djVoiceNext() {
   player.ontimeupdate = () => {
     if (started && !staleEpoch() && !player.paused) {
       djVoiceAck(clip, "playing", player);
+      /* [reply-gap:door] the words are over and the next message is due
+       * inside this clip's silent tail: silence it and hand over */
+      if (pineReplyGapEarly(clip, player, djVoiceQueue)) {
+        try { player.pause(); } catch (e) { /* it is silence either way */ }
+        djVoiceAck(clip, "ended", player);
+        done();
+        return;
+      }
       const position = Number(player.currentTime || 0);
       if (position > progressPosition + 0.02) {
         progressPosition = position;
@@ -239808,7 +239835,10 @@ function djVoiceNext() {
       clip.ackAt = 0; djVoiceAck(clip, "playing", player);
     }
   };
-  player.onended = () => { djVoiceAck(clip, "ended", player); done(); };
+  player.onended = () => {
+    pineReplyGapWordsEnded(clip, null, djVoiceQueue);   /* [reply-gap:door] */
+    djVoiceAck(clip, "ended", player); done();
+  };
   player.onerror = retry;
   /* #776: two watchdogs, because djVoiceBusy had none and the metadata timer
    * below is skipped in three ordinary cases (overlap at zero, a sting next,
@@ -272092,6 +272122,61 @@ function voiceHoldLate(clip, lateNow) {                       /* [#1184] */
   } catch (e) { /* the clip still plays */ }
 }
 
+/* [reply-gap:door] THE PAUSE BETWEEN MESSAGES, ON THIS PAGE. The station
+ * stamps every message with the pause before it (gap_before: the operator's
+ * gap, or the System 3 roll) and with its own measured silent tail (tail_s).
+ * The page keeps that pause even when it runs behind its stamps, hands over
+ * at the words' end when the next message is due inside that tail, and
+ * tells the views the moment a message ends and exactly when the next one
+ * starts ("pine-reply-gap": the player's own timer, not a second clock). */
+let pineReplyGapEndAt = 0;
+function pineReplyGapFloor(clip) {
+  const g = clip && clip.gap_before;
+  if (!g || !pineReplyGapEndAt) return 0;
+  const s = Number(g.s);
+  return (isFinite(s) && s >= 0) ? pineReplyGapEndAt + s * 1000 : 0;
+}
+function pineReplyGapCue(clip, waitMs) {
+  const g = clip && clip.gap_before;
+  if (!g || clip.pineGapCued) return;
+  clip.pineGapCued = true;
+  try {
+    window.dispatchEvent(new CustomEvent("pine-reply-gap", {detail: {
+      s: Number(g.s) || 0, rolled: !!g.rolled, dice: g.dice, lo: g.lo, hi: g.hi,
+      id: String(g.id || ""), at: Date.now(),
+      startsAt: Date.now() + Math.max(0, Number(waitMs) || 0),
+      text: String(clip.text || "").slice(0, 80)}}));
+  } catch (e) { /* a view that cannot hear it never costs the air */ }
+}
+function pineReplyGapDue(next) {
+  return Math.max(Number(next.broadcastAt || 0), Number(next.retryAt || 0),
+                  pineReplyGapFloor(next));
+}
+/* The moment the words end - the clip's end less its silent tail - is the
+ * moment the pause begins, and the moment the views are told. */
+function pineReplyGapWordsEnded(clip, el, queue) {
+  if (!clip || clip.pineWordsEnded) return;
+  clip.pineWordsEnded = true;
+  const tail = Math.max(0, Number(clip.tail_s || 0));
+  let over = 0;
+  if (el && isFinite(el.duration)) {
+    over = Math.max(0, Number(el.currentTime || 0) - Math.max(0, el.duration - tail));
+  } else {
+    over = tail;
+  }
+  pineReplyGapEndAt = Date.now() - over * 1000;
+  const next = queue && queue[0];
+  if (next && next.gap_before) pineReplyGapCue(next, pineReplyGapDue(next) - Date.now());
+}
+function pineReplyGapEarly(clip, el, queue) {
+  const tail = Number((clip && clip.tail_s) || 0);
+  if (!(tail > 0.05) || !el || !isFinite(el.duration)) return false;
+  if (Number(el.currentTime || 0) < el.duration - tail) return false;
+  pineReplyGapWordsEnded(clip, el, queue);
+  const next = queue && queue[0];
+  if (!next || !next.gap_before) return false;
+  return pineReplyGapDue(next) - Date.now() <= 120;
+}
 function voiceNext() {
   /* #1253: in stream mode the mix arrives already made. Letting this
    * road run as well is the show played twice, a few seconds apart. */
@@ -272145,7 +272230,10 @@ function voiceNext() {
     voicePrefetch(voiceQueue[i].url);
   }
   const broadcastAt = Number(clip.broadcastAt || Date.now());
-  const waitForAir = Math.max(broadcastAt, Number(clip.retryAt || 0)) - Date.now();
+  /* [reply-gap:door] ...and never sooner than the pause after the last words */
+  const waitForAir = Math.max(broadcastAt, Number(clip.retryAt || 0),
+                              pineReplyGapFloor(clip)) - Date.now();
+  pineReplyGapCue(clip, waitForAir);
   if (waitForAir > 25) {
     if (voiceTimer) clearTimeout(voiceTimer);
     voiceTimer = setTimeout(() => { voiceTimer = null; voiceNext(); },
@@ -272239,6 +272327,13 @@ function voiceNext() {
   voice.ontimeupdate = () => {
     if (!finished && !stale() && !voice.paused) {
       voiceAck(clip, "playing");
+      /* [reply-gap:door] the words are over and the next message is due */
+      if (pineReplyGapEarly(clip, voice, voiceQueue)) {
+        try { voice.pause(); } catch (e) { /* it is silence either way */ }
+        voiceAck(clip, "ended");
+        finish();
+        return;
+      }
       const position = Number(voice.currentTime || 0);
       if (position > progressPosition + 0.02) {
         progressPosition = position; armProgressGuard();
@@ -272248,7 +272343,10 @@ function voiceNext() {
   voice.onvolumechange = () => {
     if (!finished && !voice.paused) { clip.ackAt = 0; voiceAck(clip, "playing"); }
   };
-  voice.onended = () => { voiceAck(clip, "ended"); finish(); };
+  voice.onended = () => {
+    pineReplyGapWordsEnded(clip, null, voiceQueue);     /* [reply-gap:door] */
+    voiceAck(clip, "ended"); finish();
+  };
   voice.onerror = (event) => {
     retry((event && event.error) || "media element error");
   };

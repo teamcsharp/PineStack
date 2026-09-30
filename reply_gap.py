@@ -69,6 +69,9 @@ ROLLS_NAME = "reply_gap_rolls.jsonl"
 ROLLS_KEPT = 200                 # receipts in memory, for the panel
 ROLLS_FILE_MOST = 4 * 1024 * 1024
 HOST_SEATS = ("dj", "cohost", "third", "host", "caller", "caller2", "guest")
+# [reply-gap:door] the pause into a paged round's next page is the page door's,
+# like the pause before every other clip; the burst no longer carries its own.
+CARRY_BY_DOOR = True
 
 _NS: dict[str, Any] = {"ns": {}}       # the station's namespace, read at call time
 _LOCK = threading.RLock()
@@ -388,6 +391,8 @@ def burst(beats: list, seg_ix: list, turn_ix: list, transcript: list, items: lis
     out = [float(b or 0) for b in (beats or [])]
     notes: dict[Any, dict[str, Any]] = {}
     count = len(out)
+    if CARRY_BY_DOOR:
+        carry = False          # [reply-gap:door] the page door seams every clip, pages included
     flags = reply_seams(count, seg_ix, list(turn_ix or []), list(items or []))
     for r, slot in enumerate(list(seg_ix or [])):
         slot = int(slot)
@@ -473,6 +478,118 @@ def carry_seconds(notes: dict, length: Any, rows: list) -> float:
     except (TypeError, ValueError, AttributeError):
         tail = 0.0
     return round(max(0.0, float(note.get("s") or 0) - tail), 3)
+
+
+# ------------------------------------------------------------- the page door
+#
+# [reply-gap:door] EVERY MESSAGE, NOT ONLY A ROUND'S. Most of the air is not a
+# welded round: a caller's line, an aside, a station id, an ad's lines, the
+# SFX Guy's stings and dj_speak's single lines each go out as their own clip,
+# and every one of them passes page_feed_append (#1147's one door). The pause
+# between two of them is decided THERE: the clip is stamped to start the
+# operator's pause (or the roll) after the last message's WORDS ended - the
+# measured silent tail of that clip (tail_s) is given up to a shorter pause,
+# and the players hand over at the words' end when the next is due.
+
+_BOOKED: dict[str, float] = {"until": 0.0, "tail": 0.0}
+_LAST_DOOR: dict[str, Any] = {"rows": None, "start": 0.0}
+BOOKED_MATCH_S = 0.25            # the air cursor must be THAT clip's end to trust its tail
+
+
+def is_message(clip: Any) -> bool:
+    """A clip on the page feed that is a message: sounds, and is not a
+    person's reply (#206: a person outranks the show) or a picture."""
+    if not isinstance(clip, dict) or not clip.get("url"):
+        return False
+    if str(clip.get("kind") or "") == "reply":
+        return False
+    if clip.get("picture_only") or clip.get("silent_picture") or clip.get("endless"):
+        return False
+    return bool(str(clip.get("text") or "").strip() or clip.get("speech") or clip.get("sting"))
+
+
+def door(clip: Any, air_until: float, earliest: float, tail_of: Any = None,
+         rng: Any = None) -> float | None:
+    """When this message may start (seconds), with its pause stamped on it
+    (`gap_before`) - or None: not a message, or already seamed (a recovered
+    clip keeps what it had), and the door's old rule stands.
+
+    `air_until` is the page's sold air (_PAGE_AIR_UNTIL); `earliest` is now
+    plus the publication lead. The last message's words end its measured
+    tail before `air_until`. When the air has been quiet longer than any
+    pause could be, there is no seam and nothing is rolled."""
+    try:
+        if not is_message(clip):
+            return None
+        try:
+            clip["tail_s"] = round(max(0.0, float(tail_of(clip) if tail_of else 0.0)), 3)
+        except Exception:  # noqa: BLE001
+            clip["tail_s"] = 0.0
+        if isinstance(clip.get("gap_before"), dict):
+            return None
+        own = float(clip.get("broadcast_ms") or 0) / 1000.0
+        air = float(air_until or 0)
+        mine = abs(float(_BOOKED.get("until") or 0) - air) <= BOOKED_MATCH_S
+        prev_tail = float(_BOOKED.get("tail") or 0) if mine else 0.0
+        words_end = air - prev_tail
+        s = settings()
+        reach = window(s)[1] if s["roll"] else s["gap"]
+        # A seam needs a message that ends there: the cursor is the end of the
+        # clip booked last, or clips are booked past the earliest start. The
+        # page's own floor (now + lead, nothing booked) is free air.
+        booked_ahead = mine or air > float(earliest) + 0.01
+        if not booked_ahead or words_end + reach <= float(earliest):
+            return max(own, air)                 # the air is quiet: no seam
+        _LAST_DOOR.update(rows=id(((clip.get("stream") or {}).get("rows")) or clip), start=0.0)
+        note = draw(clip.get("ready_round") if isinstance(clip.get("ready_round"), dict) else None,
+                    str(clip.get("who") or ""), str(clip.get("text") or "")[:200], "",
+                    "page", rng=rng)
+        floor = words_end + float(note["s"])
+        if own <= air + 0.05:
+            # it was only waiting for the air: the pause decides, into the
+            # last clip's silent tail when the pause is shorter than it
+            start = max(float(earliest), floor)
+        else:
+            start = max(own, floor)              # held later by its own maker: never earlier
+        clip["gap_before"] = dict({k: note[k] for k in ("s", "rolled", "dice", "lo", "hi", "by", "id")
+                                   if k in note},
+                                  after=round(words_end, 3), tail=round(prev_tail, 3),
+                                  overlap=round(max(0.0, air - start), 3))
+        _LAST_DOOR["start"] = float(start)
+        return start
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def started(rows: Any, default: float) -> float:
+    """Where the door started the clip carrying `rows` (a paged round asks
+    right after publishing it, to book its own end from the same moment),
+    or `default` when the door did not seam it."""
+    try:
+        if rows is not None and _LAST_DOOR.get("rows") == id(rows) and _LAST_DOOR.get("start"):
+            return float(_LAST_DOOR["start"])
+    except Exception:  # noqa: BLE001
+        pass
+    return float(default)
+
+
+def booked(clip: Any, until: float) -> None:
+    """The air now ends at `until`: remember whose end it is, and its tail."""
+    try:
+        if float(until) >= float(_BOOKED.get("until") or 0) - 1e-6:
+            _BOOKED["until"] = float(until)
+            _BOOKED["tail"] = float((clip or {}).get("tail_s") or 0) if isinstance(clip, dict) else 0.0
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def overlap(clip: Any) -> float:
+    """How far this clip was stamped into the last one's silent tail (for
+    the page's own cursor, which would otherwise chain the whole tail)."""
+    try:
+        return max(0.0, float(((clip or {}).get("gap_before") or {}).get("overlap") or 0))
+    except Exception:  # noqa: BLE001
+        return 0.0
 
 
 # ------------------------------------------------------------- a produced round

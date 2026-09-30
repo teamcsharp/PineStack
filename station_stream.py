@@ -901,10 +901,12 @@ def _live_bed(raw: bytes, src: Any, talking: bool,
 class _Voice:
     """A DJ clip waiting for, or sitting on, its air moment."""
 
-    __slots__ = ("key", "air_at", "path", "length", "sfx", "decoder", "started")
+    __slots__ = ("key", "air_at", "path", "length", "sfx", "decoder", "started",
+                 "tail", "seconds", "played")
 
     def __init__(self, key: str, air_at: float, path: str,
-                 length: float, sfx: bool = False) -> None:
+                 length: float, sfx: bool = False, tail: float = 0.0,
+                 seconds: float = 0.0) -> None:
         self.key = key
         self.air_at = float(air_at)
         self.path = path
@@ -912,6 +914,12 @@ class _Voice:
         self.sfx = bool(sfx)
         self.decoder: _Decoder | None = None
         self.started = False
+        # [reply-gap:door] the clip's measured silent tail and its length:
+        # once `played` reaches the words' end and the next message is due,
+        # the tail gives way (the operator's pause may be shorter than it)
+        self.tail = max(0.0, float(tail or 0))
+        self.seconds = max(0.0, float(seconds or 0))
+        self.played = 0.0
 
 
 class _Encoder:
@@ -2849,7 +2857,9 @@ class StationStream:
                             continue
                         voice = _Voice(key, air_at, path,
                                        float(row.get("length") or 0),
-                                       bool(row.get("sfx")))
+                                       bool(row.get("sfx")),
+                                       float(row.get("tail") or 0),     # [reply-gap:door]
+                                       float(row.get("seconds") or 0))
                         # Decode AHEAD of the air moment, not at it.
                         voice.decoder = _Decoder(path)
                         voice.decoder.start()
@@ -2903,6 +2913,14 @@ class StationStream:
                     if airing.decoder.finished:
                         airing.decoder.close()
                         airing = None
+                # [reply-gap:door] the words are over, the rest is the clip's
+                # silent tail, and the next message is due: it gives way.
+                if (airing is not None and pending and airing.tail > 0.05
+                        and airing.seconds > 0 and now >= pending[0].air_at
+                        and airing.played >= airing.seconds - airing.tail):
+                    if airing.decoder is not None:
+                        airing.decoder.close()
+                    airing = None
                 if airing is None and on_air and pending:
                     head = pending[0]
                     if now >= head.air_at:
@@ -2990,6 +3008,7 @@ class StationStream:
                         raw, live = airing.decoder.read_frame()
                         if live:
                             voice_pcm = _centered_pcm(raw)
+                            airing.played += FRAME_MS / 1000.0   # [reply-gap:door]
                         else:
                             airing.decoder.close()
                             airing = None
