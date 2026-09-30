@@ -27,6 +27,7 @@
 #
 #   ./deploy.sh            build, sign, install, verify
 #   ./deploy.sh --no-build just re-sign and install what is already built
+#   ./deploy.sh --build-only sync assets and build, without signing or ADB
 #
 # Before installation, tools/kiosk-preflight.sh reports the exact ADB target,
 # package versions, device-owner status, and lock-task state. It is read-only:
@@ -40,6 +41,11 @@ ADB="$SDK/platform-tools/adb.exe"
 GRADLE=${GRADLE:-/c/_tools/gradle/bin/gradle.bat}
 DEV=${PINE_TAB:-10.89.1.154:5555}
 PKG=com.pinebox.kiosk
+MODE=${1:-}
+case "$MODE" in
+  ''|--no-build|--build-only) ;;
+  *) echo "usage: $0 [--no-build|--build-only]" >&2; exit 2 ;;
+esac
 
 # JAVA. apksigner is a java program and Git Bash inherits no JAVA_HOME here,
 # which is what stopped this script the first time it ran. The JDK is pinned
@@ -65,38 +71,51 @@ PREFLIGHT="$HERE/tools/kiosk-preflight.sh"
 
 say() { printf '\n== %s\n' "$1"; }
 
-[ -f "$KEY" ] || { echo "no platform key at $KEY - the jack cannot work without it"; exit 1; }
+if [ "$MODE" != "--build-only" ]; then
+  [ -f "$KEY" ] || { echo "no platform key at $KEY - the jack cannot work without it"; exit 1; }
+fi
 
 # The renderer is the official copy of every shared tablet view. The APK
 # carries the video controller twice because the panel and sampler are
 # separate injected pages; silently building any stale view recreates bugs
 # already fixed on the desktop. Sync when the canonical workspace is mounted,
 # then refuse an internal video split on every machine.
-VIEW_CANON=${PINE_VIEW_CANON:-//10.89.1.246/ehm_eckx/pinevoice-stack/spark-agent/desktop/renderer}
+VIEW_CANON=${PINE_VIEW_CANON:-}
+if [ -z "$VIEW_CANON" ]; then
+  if [ -f "$HERE/desktop/renderer/sfx-tv.js" ]; then
+    VIEW_CANON="$HERE/desktop/renderer"
+  else
+    # The standalone Android checkout has no co-located renderer.
+    VIEW_CANON=//10.89.1.246/ehm_eckx/pinevoice-stack/spark-agent/desktop/renderer
+  fi
+fi
 VIEW_PANEL="$HERE/app/src/main/assets/pine-views"
 VIEW_SAMPLER="$HERE/app/src/main/assets/pine-sampler"
-if [ -f "$VIEW_CANON/sfx-tv.js" ]; then
-  say "syncing canonical shared views"
+[ -f "$VIEW_CANON/sfx-tv.js" ] || {
+  echo "REFUSING: canonical renderer is unavailable at $VIEW_CANON." >&2
+  echo "Set PINE_VIEW_CANON to the desktop/renderer directory." >&2
+  exit 1
+}
+say "syncing canonical shared views"
   # Every file already carried by pine-views is a declared injection asset.
   # Sync the intersection instead of maintaining a second hand-written list:
   # that list omitted boot-splash.js and line-actions.js and quietly shipped
   # stale startup and dialogue behavior in otherwise current APKs.
-  for target in "$VIEW_PANEL"/*; do
+for target in "$VIEW_PANEL"/*; do
     [ -f "$target" ] || continue
     asset=${target##*/}
     # Android owns the field microphone's focus/append handling here. A
     # renderer sync would replace it just before packaging the APK.
     [ "$asset" = talk-dot.js ] && continue
     [ -f "$VIEW_CANON/$asset" ] && cp "$VIEW_CANON/$asset" "$target"
-  done
-  for asset in sfx-tv.js sfx-tv.css pine-vcr.js; do
+done
+for asset in sfx-tv.js sfx-tv.css; do
     [ -f "$VIEW_CANON/$asset" ] && cp "$VIEW_CANON/$asset" "$VIEW_SAMPLER/$asset"
-  done
-  for asset in sampler-air.js sampler-feed.js sampler.js; do
+done
+for asset in sampler-air.js sampler-feed.js sampler.js; do
     [ -f "$VIEW_CANON/$asset" ] && [ -f "$VIEW_SAMPLER/$asset" ] && \
       cp "$VIEW_CANON/$asset" "$VIEW_SAMPLER/$asset"
-  done
-fi
+done
 cmp -s "$VIEW_PANEL/sfx-tv.js" "$VIEW_SAMPLER/sfx-tv.js" || {
   echo "REFUSING: the panel and sampler have different sfx-tv.js copies."
   echo "Run with PINE_VIEW_CANON pointing at desktop/renderer."
@@ -108,14 +127,75 @@ cmp -s "$VIEW_PANEL/sfx-tv.css" "$VIEW_SAMPLER/sfx-tv.css" || {
   exit 1
 }
 
-if [ "${1:-}" != "--no-build" ]; then
+if [ "$MODE" != "--no-build" ]; then
   say "building"
   # There is NO gradle wrapper in this project - the distribution at
   # /c/_tools/gradle is used directly, with its cache pinned to
   # /c/_tools/_gradlehome so a build does not go looking on the slow share.
-  (cd "$HERE" && GRADLE_USER_HOME=${GRADLE_USER_HOME:-/c/_tools/_gradlehome}     "$GRADLE" --console=plain assembleDebug)
+  GRADLE_USER_HOME=${GRADLE_USER_HOME:-/c/_tools/_gradlehome}
+  export GRADLE_USER_HOME
+  case "$HERE" in
+    //*)
+      # Native CMake/Ninja also invoke cmd.exe from the build directory;
+      # passing a UNC project via Gradle -p is insufficient for that step.
+      command -v cygpath >/dev/null 2>&1 || {
+        echo "REFUSING: cygpath is needed to build a UNC checkout." >&2
+        exit 1
+      }
+      HERE_WIN=$(cygpath -w "$HERE")
+      GRADLE_WIN=$(cygpath -w "$GRADLE")
+      # SMB reports the generated Oboe clone as owned by the server SID.
+      # Limit this exception to the build's child processes; never write a
+      # global safe.directory rule for the operator's Git installation.
+      GIT_CONFIG_COUNT=1
+      GIT_CONFIG_KEY_0=safe.directory
+      GIT_CONFIG_VALUE_0='*'
+      export GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0
+      MSYS_NO_PATHCONV=1 \
+      JAVA_HOME="$(cygpath -w "$JAVA_HOME")" \
+      ANDROID_HOME="$(cygpath -w "$ANDROID_HOME")" \
+      ANDROID_SDK_ROOT="$(cygpath -w "$ANDROID_SDK_ROOT")" \
+      GRADLE_USER_HOME="$(cygpath -w "$GRADLE_USER_HOME")" \
+      cmd.exe /d /c \
+        "pushd $HERE_WIN && call $GRADLE_WIN --console=plain assembleDebug && popd"
+      ;;
+    *) (cd "$HERE" && "$GRADLE" --console=plain assembleDebug) ;;
+  esac
 fi
 [ -f "$DEBUG" ] || { echo "no $DEBUG"; exit 1; }
+command -v unzip >/dev/null 2>&1 || {
+  echo "REFUSING: unzip is required to verify APK assets." >&2
+  exit 1
+}
+for dir in pine-views pine-sampler; do
+  for target in "$HERE/app/src/main/assets/$dir"/*; do
+    [ -f "$target" ] || continue
+    asset=${target##*/}
+    source=
+    if [ "$dir" = pine-views ] && [ "$asset" != talk-dot.js ]; then
+      [ -f "$VIEW_CANON/$asset" ] && source="$VIEW_CANON/$asset"
+    elif [ "$dir" = pine-sampler ]; then
+      case "$asset" in
+        sfx-tv.js|sfx-tv.css|sampler-air.js|sampler-feed.js|sampler.js)
+          [ -f "$VIEW_CANON/$asset" ] && source="$VIEW_CANON/$asset"
+          ;;
+      esac
+    fi
+    if [ -n "$source" ] && ! cmp -s "$source" "$target"; then
+      echo "REFUSING: canonical $asset changed during the build." >&2
+      exit 1
+    fi
+    if ! unzip -p "$DEBUG" "assets/$dir/$asset" 2>/dev/null | cmp -s - "$target"; then
+      echo "REFUSING: APK has stale or missing $dir/$asset." >&2
+      echo "Rebuild after syncing the current assets; --no-build cannot package changes." >&2
+      exit 1
+    fi
+  done
+done
+if [ "$MODE" = "--build-only" ]; then
+  say "build-only complete; no APK signed or installed"
+  exit 0
+fi
 
 say "platform-signing"
 rm -f "$SIGNED"
