@@ -36202,7 +36202,7 @@ async def _sfx_single_clip(clip: dict[str, Any], text: str, who: str,
         if not additions:
             return clip, fallback
         paths = [str(path)] + [row["path"] for row in additions]
-        beats = concat_beats(len(paths))
+        beats = reply_gap_beats(len(paths), road="punctuation")   # [reply-gap] a line and its stings
         raw = await asyncio.wait_for(asyncio.to_thread(
             _call_concat_blocking, paths, False, beats), timeout=3.0)
         if not raw:
@@ -40167,6 +40167,9 @@ def dj_state() -> dict[str, Any]:
                       "name": str(r.get("name") or ""),
                       "kind": str(r.get("kind") or ""),
                       "voice": str(r.get("voice") or ""),
+                      # [reply-gap] the pause after this reply, for the dice
+                      "gap": (r.get("gap") if isinstance(r.get("gap"), dict)
+                              else None),
                       "aired": "airing"}
                      for r in (_STREAM_NOW.get("rows") or [])],
         } if _STREAM_NOW else None),
@@ -49761,6 +49764,8 @@ def dialogue_stock_seconds(kind: str, row: Any,
             "seconds") or 0) for key in keys)
         if not keys and row.get("produced"):
             actual = float(row.get("seconds") or 0)
+        # [reply-gap] a finished round airs its lines AND the pauses between them
+        actual = max(0.0, actual + reply_gap_stock_extra(len(keys)))
         if not projected:
             return round(max(0.0, actual), 3)
         target = dialogue_entry(row) or row
@@ -49770,6 +49775,9 @@ def dialogue_stock_seconds(kind: str, row: Any,
         # characters per second. Keep a measured per-road gain as the floor:
         # a terse script should not be mistaken for a two-second segment.
         estimate = len(script) / 14.0 if script else 0.0
+        if script:                          # [reply-gap] ...and the pauses between its lines
+            estimate += max(0, sum(1 for _ln in script.splitlines()
+                                   if _ln.strip()) - 1) * reply_gap_seam()
         try:
             estimate = max(estimate, float(task_gain(str(kind)) or 0))
         except Exception:  # noqa: BLE001
@@ -52378,7 +52386,7 @@ async def reel_tick() -> None:
                               "seconds": secs})
             if len(paths) < 2:
                 return
-            beats = concat_beats(len(paths))
+            beats = reply_gap_beats(len(paths), road="reel")   # [reply-gap] whole lines, one after another
             mixed = await asyncio.to_thread(
                 _call_concat_blocking, paths,
                 bool(dj_settings().get("stream_texture")), beats)
@@ -55274,7 +55282,7 @@ def scheduled_ready_claim(slot: dict[str, Any]) -> bool:
                 or not candidate.get("eligible") or candidate.get("blocked_reasons")
                 or not lines or seconds <= 0):
             continue
-        duration = (seconds + max(0, len(lines) - 1) * max(CONCAT_BEAT)
+        duration = (seconds + max(0, len(lines) - 1) * reply_gap_seam()   # [reply-gap]
                     + max(0.0, float(os.getenv("BOX_TAIL_MS", "900"))) / 1000.0)
         planned_start = float(allocation.get("planned_start") or 0)
         expires = float(candidate.get("expires_at") or 0)
@@ -88892,8 +88900,8 @@ async def _sfx_cadence_additions_inner(who: str, text: str, completed: int,
     meta = ready_meta or {}
 
     def fits(extra: float) -> bool:
-        total = float(seconds) + sum(float(r["seconds"]) + max(CONCAT_BEAT) for r in additions)
-        total += float(extra) + max(CONCAT_BEAT)
+        total = float(seconds) + sum(float(r["seconds"]) + reply_gap_seam() for r in additions)   # [reply-gap]
+        total += float(extra) + reply_gap_seam()
         if ready_takes is not None:
             return _ready_round_fits(str(meta.get("prep_kind") or ""), ready_takes,
                                     meta.get("_ready_slot"), seconds=total,
@@ -97408,7 +97416,7 @@ def _ready_round_fits(kind: str, takes: list[dict[str, Any]],
                     return False
                 duration += longest  # positions, including repeated keys
             # Never assume the recorded tail contains removable silence.
-            duration += (max(0, len(takes) - 1) * max(CONCAT_BEAT)
+            duration += (max(0, len(takes) - 1) * reply_gap_seam()   # [reply-gap]
                          + max(0.0, float(os.getenv("BOX_TAIL_MS", "900"))) / 1000.0)
         else:
             duration = float(seconds)
@@ -102004,7 +102012,14 @@ def segment_budget(kind: str, minutes: float = 0.0,
     share = SEGMENT_TALK_SHARE.get(kind, SEGMENT_TALK_SHARE_ELSE)
     talk = max(0.0, want * share)
     per = max(1.5, mean_turn_seconds(kind))
-    turns = int(talk // per)
+    # [reply-gap] THE PAUSES ARE PART OF THE SEGMENT. N replies take their
+    # speech plus (N - 1) of the operator's pauses (the expected one when it
+    # rolls). `per` is the ledger's clip length, welded tail included, so the
+    # tail comes off before the pause goes on: 1 s between replies costs
+    # about what the old beat and tail did, 10 s costs ten seconds a turn.
+    seam = reply_gap_seam()
+    speech = max(1.0, per - max(0.0, CONCAT_TAIL - CONCAT_KEEP))
+    turns = int((talk + seam) // (speech + seam))
     cycles = max(1, -(-turns // TURNS_PER_CYCLE)) if turns > 0 else 1
     # A cycle is the shape; the turn count the writer is given is the
     # cycles rounded back up, so a round always lands on a cycle boundary
@@ -102019,10 +102034,12 @@ def segment_budget(kind: str, minutes: float = 0.0,
             "planned_seconds": round(want, 1),
             "talk_seconds": round(talk, 1), "share": share,
             "turn_seconds": round(per, 2), "turns": turns,
+            "reply_gap": round(seam, 2),                        # [reply-gap]
+            "turn_air_seconds": round(speech + seam, 2),
             "cycles": cycles, "lines": lines, "planned_lines": lines,
-            "say": ("%s owns %.0fs, about %.0fs of it talk at %.1fs a turn - "
-                    "%d cycle(s), %d turns"
-                    % (kind or "the segment", want, talk, per, cycles,
+            "say": ("%s owns %.0fs, about %.0fs of it talk at %.1fs a turn "
+                    "and %.1fs between replies - %d cycle(s), %d turns"
+                    % (kind or "the segment", want, talk, per, seam, cycles,
                        lines))}
 
 
@@ -109442,6 +109459,100 @@ def concat_real_seconds(measured: float, beat: float) -> float:
     return max(0.25, measured - CONCAT_TAIL + CONCAT_KEEP + max(0.0, beat))
 
 
+# [reply-gap] THE PAUSE BETWEEN REPLIES (reply_gap.py). The operator's two
+# sliders and roulette toggle on the Script view: the silence after every
+# reply - DJ to DJ, DJ to the SFX Guy, the SFX Guy to a DJ - is `gap` (0.2 -
+# 10 s, default 1), or, rolling, a System 3 roll in gap +/- range. It enters
+# where the pause is decided: the beats drawn for the mixer (#778). A chunk of
+# one speaker's turn and a listening response keep CONCAT_BEAT - that is a
+# breath inside a reply, not the space between two. The planners ask
+# reply_gap_seam(), the expected pause, so the segment is budgeted as its
+# lines plus (N - 1) pauses.
+try:
+    import reply_gap as _reply_gap
+    _reply_gap.bind(globals())
+except Exception as _rg_exc:  # noqa: BLE001
+    _reply_gap = None
+    print("the reply gap did not load: %s: %s" % (type(_rg_exc).__name__, _rg_exc))
+
+
+def reply_gap_seam() -> float:
+    """[reply-gap] What one seam between two replies costs the air: the
+    operator's pause (the expected one when it rolls), never under the beat."""
+    try:
+        if _reply_gap is not None:
+            return max(max(CONCAT_BEAT), float(_reply_gap.expected_gap()))
+    except Exception:  # noqa: BLE001
+        pass
+    return max(CONCAT_BEAT)
+
+
+def reply_gap_stock_extra(clips: int) -> float:
+    """[reply-gap] A finished round is priced off its clips as they sit on
+    disk, welded tail and all (CONCAT_TAIL); on air each seam is the trimmed
+    sliver plus the pause. This is the difference, for `clips` joined clips."""
+    n = max(0, int(clips or 0))
+    if n < 2:
+        return 0.0
+    return (n - 1) * (reply_gap_seam() - max(0.0, CONCAT_TAIL - CONCAT_KEEP))
+
+
+def reply_gap_beats(count: int, meta: Any = None, road: str = "") -> list[float]:
+    """[reply-gap] Beats for a join where every seam is a reply (a line and the
+    stings answering it; the resume reel of whole lines)."""
+    beats = concat_beats(count)
+    if _reply_gap is None:
+        return beats
+    try:
+        return _reply_gap.plain(count, meta=meta, road=road, base=beats)
+    except Exception:  # noqa: BLE001
+        return beats
+
+
+def reply_gap_burst(beats: list[float], seg_ix: list[int], turn_ix: list[int],
+                    transcript: list, items: list, meta: Any = None,
+                    carry: bool = False) -> tuple[list[float], dict[Any, Any]]:
+    """[reply-gap] A burst's beats with every reply seam set to its pause
+    (rolled once each when the roulette is on, a System 3 roll with its
+    receipt), and a produced round's measured cue map moved to match, so
+    #1337 still adopts it. Returns (beats, notes); notes feed the rows the
+    panel's dice read and the wait into the next page."""
+    if _reply_gap is None:
+        return beats, {}
+    try:
+        got, notes = _reply_gap.burst(beats, seg_ix, turn_ix, transcript, items,
+                                      meta=meta, carry=bool(carry))
+        _reply_gap.retime_for_burst(meta, got, seg_ix, turn_ix, items)
+        return got, notes
+    except Exception as exc:  # noqa: BLE001
+        try:
+            pipeline_log("drop", "the reply gap could not set this round's pauses - "
+                         "its own beats stand", extra="%r" % (exc,))
+        except Exception:  # noqa: BLE001
+            pass
+        return beats, {}
+
+
+def reply_gap_rows(rows: list, seg_ix: list[int], notes: Any) -> None:
+    """[reply-gap] Each row a pause follows carries it (`gap`), for the dice."""
+    try:
+        if _reply_gap is not None and notes:
+            _reply_gap.stamp_rows(rows, seg_ix, notes)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def reply_gap_carry(notes: Any, length: Any, rows: list) -> float:
+    """[reply-gap] How much longer a paged round's next page waits, so the
+    pause into it is the pause that was picked."""
+    try:
+        if _reply_gap is not None and notes:
+            return float(_reply_gap.carry_seconds(notes, length, rows))
+    except Exception:  # noqa: BLE001
+        pass
+    return 0.0
+
+
 # #1205: the mixer's own reading of "how much silence is on the end of
 # this". Named beside CONCAT_TAIL because that constant is the guess this
 # replaces, and the two must never drift apart again: this is the number
@@ -111539,7 +111650,7 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                       for c in batch]
             _sfx_core_seconds = (sum(_clip_seconds(c["path"]) for c in batch
                                      if c and c.get("path")) + ring_secs
-                                 + max(CONCAT_BEAT) * max(0, len(batch) - 1)
+                                 + reply_gap_seam() * max(0, len(batch) - 1)   # [reply-gap]
                                  + (3.0 if caller_name and last_batch else 0.0))
             for idx, (item, clip) in enumerate(
                     zip(playlist[_lo:_hi], batch), start=_lo):
@@ -111648,7 +111759,7 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                         seg_ix.append(len(seg) - 1)
                         turn_ix.append(-1)
                         line_ids.append(uuid.uuid4().hex)               # #1277
-                        _sfx_extra_seconds += _extra["seconds"] + max(CONCAT_BEAT)
+                        _sfx_extra_seconds += _extra["seconds"] + reply_gap_seam()   # [reply-gap]
                     # #1185: THE TUBE IS THE STING, AND THE SEGMENT IS NOT.
                     #
                     # "Have the video be the singular SFX track when enabled. ... have
@@ -111833,6 +111944,14 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
             # different file, and the cue map below would refuse it.
             beats = (production_cue_beats(ready_meta, seg_ix, len(seg))
                      or concat_beats(len(seg)))
+            # [reply-gap] EVERY SEAM THAT ENDS A REPLY IS THE OPERATOR'S PAUSE -
+            # drawn (or rolled, a System 3 roll with its receipt) HERE, so the
+            # mixer, the timeline and a produced round's cue map are all built
+            # out of the same numbers. A paged round's last line rolls the
+            # pause into the next page too ("carry"; waited out below).
+            beats, _rg_notes = reply_gap_burst(beats, seg_ix, turn_ix, transcript,
+                                               aired_items, ready_meta,
+                                               not last_batch)
             try:
                 mixed = (await asyncio.to_thread(
                             _call_concat_blocking, seg,
@@ -112369,6 +112488,7 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                     for _r2, _e2 in zip(rows, _entries):
                         air_at_set(                             # #1288
                             _e2, _est0 + float(_r2.get("from") or 0))
+                reply_gap_rows(rows, seg_ix, _rg_notes)      # [reply-gap] the panel's dice
                 # #908: WHERE EACH TURN'S AUDIO ACTUALLY IS. The burst
                 # is ONE welded file, and `rows` above already holds the
                 # exact window every turn occupies inside it - the
@@ -112626,7 +112746,9 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                         on_handoff()
                     for _entry in _entries:
                         page_delivery_apply(_entry, page_delivery)
-                    _paged_until = _pstart + max(0.0, float(length or 0))
+                    _paged_until = (_pstart + max(0.0, float(length or 0))
+                                    # [reply-gap] the pause into the next page
+                                    + reply_gap_carry(_rg_notes, length, rows))
                     # #1147: publish how far the air is sold, so every
                     # OTHER page producer (replies, stings, upstairs)
                     # stamps itself after this round instead of inside it.
@@ -153888,6 +154010,14 @@ try:
     _line_story.install(app, globals())
 except Exception as _ls_exc:  # noqa: BLE001
     print("the line story door did not install: %s: %s" % (type(_ls_exc).__name__, _ls_exc))
+# [reply-gap] THE PAUSE BETWEEN REPLIES: GET/POST /api/reply-gap (reply_gap.py),
+# station-wide in data/reply_gap.json - the Script view's sliders, its roulette
+# toggle and its dice read and write it, so the desk and the tablet agree.
+try:
+    if _reply_gap is not None:
+        _reply_gap.install(app, globals())
+except Exception as _rgi_exc:  # noqa: BLE001
+    print("the reply gap door did not install: %s: %s" % (type(_rgi_exc).__name__, _rgi_exc))
 # [rounds-tree] THE SEGMENT'S DECISION TREE (script_decision_tree.py): a
 # segment's rounds as System 3's graph walked them - the stages with their
 # roll receipts and the roulette diamonds between them - for the Script
@@ -155225,14 +155355,18 @@ def _director_script_seconds(script: dict[str, Any],
     except Exception:  # noqa: BLE001
         pass
     words = 0
+    lines = 0                               # [reply-gap]
     try:
         for row in (turns if turns is not None else _director_script_lines(script)):
             words += len(re.findall(r"\w+", str((row or {}).get("text") or "")))
+            lines += 1
     except Exception:  # noqa: BLE001
         words = 0
     # Broadcast speech on this station normally lands around 145-175 wpm.
     # Use the slower end so warnings appear before a short script reaches air.
-    return round(words / 2.4, 1) if words else 0.0
+    # [reply-gap] ...and the operator's pause sits between every two lines.
+    return (round(words / 2.4 + max(0, lines - 1) * reply_gap_seam(), 1)
+            if words else 0.0)
 
 
 def director_orchestration(kind: str, label: str, owns_seconds: float,
