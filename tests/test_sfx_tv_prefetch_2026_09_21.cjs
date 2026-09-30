@@ -63,6 +63,7 @@ const JOIN_MIN = num('JOIN_MIN');
 const CACHE_MOST = num('CACHE_MOST');
 const CACHE_BYTES_MOST = num('CACHE_BYTES_MOST');
 const CACHE_FILE_MOST = num('CACHE_FILE_MOST');
+const STREAM_OVER = num('STREAM_OVER');   // [tv-stream]
 
 /* One sandbox holding the real function text and stubs for everything it
    reaches outside itself. */
@@ -76,11 +77,13 @@ function sandbox(opts) {
     mounted: true,
     cache: [],
     fetching: Object.create(null),
+    aborts: Object.create(null),          // [tv-stream]
+    AbortController: undefined,
     revoked: [],
     made: 0,
     asked: [],
     SLIP_MAX, SLIP_SHARE, JOIN_MIN,
-    CACHE_MOST, CACHE_BYTES_MOST, CACHE_FILE_MOST,
+    CACHE_MOST, CACHE_BYTES_MOST, CACHE_FILE_MOST, STREAM_OVER,
   };
   box.URL = {
     createObjectURL(blob) {
@@ -197,6 +200,13 @@ test('every way it can fail hands back the station URL', async () => {
   const huge = sandbox({bytes: CACHE_FILE_MOST + 1});
   assert.equal(await huge.preFetch(clip('ccc')), null);
   assert.equal(huge.heldSrc(clip('ccc')), url);
+
+  /* [tv-stream] A long clip streams too: a 130 s, 17.5 MB sting pulled whole
+     held its first frame back 13 s on the tablet's link. */
+  const long = sandbox({bytes: STREAM_OVER + 1});
+  assert.equal(await long.preFetch(clip('ccc')), null, 'a clip over STREAM_OVER is never pulled whole');
+  assert.equal(long.heldSrc(clip('ccc')), url, 'it plays off the station');
+  assert.equal(long.box.cache.length, 0);
 
   /* And a failed clip is not remembered as in-flight for ever. */
   assert.deepEqual(Object.keys(thrown.box.fetching), []);

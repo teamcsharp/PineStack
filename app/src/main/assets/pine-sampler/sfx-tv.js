@@ -317,6 +317,27 @@
   var panel = null;                // the Inspect / Path detail panel, if open
   var heard = [];                  // {id, url, sting} of clips already played
   var HEARD_MOST = 8;              // bounded plain rows; never media elements
+  /* [hcprev] WHAT ACTUALLY PLAYED ON THIS SET, newest last. The bottom-right
+   * hot corner replays the newest of these. `heard` is the endless cycle only
+   * and `playing` is set before the picture is known to move; this is noted
+   * at the first 'playing' event of a play (or when the native wall reports
+   * a clip on screen), so a clip dropped as missed never enters it. Plain
+   * rows only (#1312). */
+  var played = [];
+  var PLAYED_MOST = 12;
+  function playedNote(clip, road) {
+    if (!clip || !clip.url) return;
+    var at = Date.now();
+    var row = {id: clipId(clip), url: String(clip.url), video: clip.video !== false,
+               sting: String(clip.sting || clip.text || clip.name || ''),
+               sample: String(clip.sfx_sample_id || clip.sample_id || ''),
+               seconds: Number(clip.seconds) || 0, ts: Number(clip.ts) || 0,
+               endless: !!clip.endless, road: String(road || ''), at: at};
+    var last = played[played.length - 1];
+    if (last && last.url === row.url && at - last.at < 2000) return;
+    played.push(row);
+    if (played.length > PLAYED_MOST) played.splice(0, played.length - PLAYED_MOST);
+  }
   var STRIP_PAST = 3;              // the last three clips shown in the popup
   var STRIP_NEXT = 2;              // enough future context without crowding it
   /* #1200: SCROLLING BACKWARDS THROUGH EVERYTHING THAT HAS GONE OUT.
@@ -1126,6 +1147,7 @@
     wrap.addEventListener('pointerdown', function (ev) { ev.stopPropagation(); });
     document.body.appendChild(wrap);
     askWrap = wrap;
+    if (window.pineCloseX) { window.pineCloseX(wrap, function () { askDrop(); }, {label: 'Close', reserve: 'top'}); }  // [closex:sfx-ask]
   }
 
   function askDrop() {
@@ -1336,10 +1358,12 @@
     box.appendChild(head); box.appendChild(media); box.appendChild(prompt);
     box.appendChild(actions); box.appendChild(status); shade.appendChild(box);
     shade.addEventListener('click', function (ev) { if (ev.target === shade) shade.remove(); });
+    if (window.pineCloseX) { window.pineCloseX(box, function () { close.click(); }, {label: 'Close'}); close.style.display = 'none'; }  // [closex:sfx-parody-result]
     document.body.appendChild(shade);
   }
 
   function parodyOpen(seed, keepSurfaceDown) {
+    if (root.PineSfxSeen) { try { if (seed && typeof seed === 'object') root.PineSfxSeen.interact('parody', seed); } catch (e) { /* [sfxseen] never in the way of the picture */ } }
     parodyClose();
     if (keepSurfaceDown) {
       surfaceDown(true);
@@ -1447,6 +1471,7 @@
     box.appendChild(fieldWrap); box.appendChild(controls); box.appendChild(status);
     box.appendChild(queuePanel);
     shade.appendChild(box); document.body.appendChild(shade); parodyWrap = shade;
+    if (window.pineCloseX) { window.pineCloseX(box, function () { parodyClose(); }, {label: 'Close the stinger maker'}); close.style.display = 'none'; }  // [closex:sfx-parody]
 
     var queueReading = false;
     var refreshQueue = function () {
@@ -1995,6 +2020,7 @@
     box.appendChild(title); box.appendChild(stage); box.appendChild(help);
     box.appendChild(status); box.appendChild(actions); shade.appendChild(box);
     document.body.appendChild(shade); deleteWrap = shade;
+    if (window.pineCloseX) { window.pineCloseX(box, function () { deleteConfirmClose(true); }, {label: 'Keep it (close)'}); }  // [closex:sfx-delete]
     if (root.PineWallTransition
         && typeof root.PineWallTransition.cover === 'function') {
       root.PineWallTransition.cover(media, {container: stage,
@@ -2055,6 +2081,7 @@
   }
 
   function radialOpen(clip, at) {
+    if (root.PineSfxSeen) { try { if (clip) root.PineSfxSeen.interact('radial', clip); } catch (e) { /* [sfxseen] never in the way of the picture */ } }
     if (!clip) return;
     radialClose(false);
     surfaceDown(true);
@@ -2739,6 +2766,7 @@
     if (!floorClaim('tube')) {
       showing = false;
       videoReceipt(clip, 'error', null, 'Another SFX surface owns playback');
+      if (root.PineSfxSeen) { try { root.PineSfxSeen.drop(clip, 'tube', 'hushed: another SFX surface owns playback'); } catch (e) { /* [sfxseen] never in the way of the picture */ } }
       return;
     }
     /* #1184: whatever was in the tube is now the past, whichever road
@@ -2763,13 +2791,17 @@
       screen.dataset.pineSilentPicture = clip.silent_picture ? '1' : '0';
       screen.muted = !!clip.silent_picture;
       var receiptAt = 0, receiptClosed = false;
+      var playedOnce = false;                            /* [hcprev] */
       function reportVideo(event, error) {
         if (receiptClosed) return;
         if (event === 'ended' || event === 'error') receiptClosed = true;
         videoReceipt(clip, event, screen, error);
       }
       screen.addEventListener('canplay', function () { reportVideo('canplay'); });
-      screen.addEventListener('playing', function () { reportVideo('playing'); });
+      screen.addEventListener('playing', function () {
+        reportVideo('playing');
+        if (!playedOnce) { playedOnce = true; playedNote(clip, 'tube'); }  /* [hcprev] */
+      });
       screen.addEventListener('timeupdate', function () {
         if (!screen.paused && now() - receiptAt > 2000) {
           receiptAt = now(); reportVideo('playing');
@@ -2778,6 +2810,7 @@
       screen.addEventListener('ended', function () { reportVideo('ended'); });
       screen.addEventListener('error', function () { reportVideo('error', 'Video decode or fetch failed'); });
       screen.__pineReceiptClose = function () { reportVideo('error', 'Video player closed before completion'); };
+      if (root.PineSfxSeen) { try { root.PineSfxSeen.track(screen, clip, 'tube'); } catch (e) { /* [sfxseen] never in the way of the picture */ } }
     }
     var glass = tube;
     var done = false;
@@ -4681,6 +4714,7 @@
     box.appendChild(frame);
     box.addEventListener('pointerdown', function (ev) { ev.stopPropagation(); });
     document.body.appendChild(box);
+    if (window.pineCloseX) { window.pineCloseX(box, function () { editorClose(); }, {label: 'Close the editor'}); }  // [closex:sfx-editor]
     editorBox = box;
     /* The standing rule: 10% while an editing surface is open. #1172 is in
        this station's history because this very editor was the one surface
@@ -4810,6 +4844,7 @@
 
   var sheetAt = null;
   function sheet(clip, at) {
+    if (root.PineSfxSeen) { try { if (clip) root.PineSfxSeen.interact('sheet', clip); } catch (e) { /* [sfxseen] never in the way of the picture */ } }
     /* [#1441] A WALL SHEET DOES NOT HANG OFF THE SET'S FRAME. When `at`
        is given this is the #1184 sheet, mounted on the BODY further down
        precisely because the set it belongs to may be veiled - or, since
@@ -5370,6 +5405,10 @@
   var CACHE_MOST = 10;                  // clips held at once
   var CACHE_BYTES_MOST = 48 * 1048576;  // and never more memory than this
   var CACHE_FILE_MOST = 24 * 1048576;   // a clip past this streams, as before
+  /* [tv-stream] a long clip streams: pulling 17.5 MB whole held a 130 s
+     sting's first frame back 13 s on the tablet's link */
+  var STREAM_OVER = 6 * 1048576;
+  var aborts = Object.create(null);     // url -> AbortController of its whole-file pull
   var cache = [];                       // [{url, href, bytes, at}]
   var fetching = Object.create(null);   // url -> promise; asked once only
 
@@ -5419,10 +5458,16 @@
     var got = cacheFind(url);
     if (got) return Promise.resolve(got.href);
     if (fetching[url]) return fetching[url];
-    var job = fetch(url, {credentials: 'omit'}).then(function (res) {
+    var ctl = null;
+    try { ctl = typeof AbortController === 'function' ? new AbortController() : null; } catch (err) { ctl = null; }
+    if (ctl) aborts[url] = ctl;
+    var job = fetch(url, ctl ? {credentials: 'omit', signal: ctl.signal} : {credentials: 'omit'}).then(function (res) {
       if (!res.ok) throw new Error('HTTP ' + res.status);
       var len = Number(res.headers.get('content-length'));
-      if (isFinite(len) && len > CACHE_FILE_MOST) throw new Error('too big');
+      if (isFinite(len) && len > Math.min(CACHE_FILE_MOST, STREAM_OVER)) {   /* [tv-stream] */
+        try { if (ctl) ctl.abort(); } catch (err) { /* the body is simply not read */ }
+        throw new Error('streams');
+      }
       return res.blob();
     }).then(function (blob) {
       if (!blob || !blob.size) throw new Error('empty');
@@ -5431,9 +5476,11 @@
       cache.push({url: url, href: href, bytes: blob.size, at: now()});
       cacheTrim();
       delete fetching[url];
+      delete aborts[url];
       return href;
     })['catch'](function () {
       delete fetching[url];
+      delete aborts[url];
       return null;                      /* the station's URL still works */
     });
     fetching[url] = job;
@@ -5445,6 +5492,10 @@
   function heldSrc(clip) {
     var url = srcOf(clip);
     var got = cacheFind(url);
+    if (!got && aborts[url]) {          /* [tv-stream] streaming it now: the whole-file pull steps aside */
+      try { aborts[url].abort(); } catch (err) { /* it finishes on its own */ }
+      delete aborts[url];
+    }
     return (got && got.href) || url;
   }
 
@@ -5668,6 +5719,7 @@
     var clip = queue.shift();
     while (clip && missed(clip)) {                         /* #1173 */
       videoReceipt(clip, 'error', null, 'Video missed its playback window');
+      if (root.PineSfxSeen) { try { root.PineSfxSeen.drop(clip, 'tube', 'missed its playback window (vidmiss drop)'); } catch (e) { /* [sfxseen] never in the way of the picture */ } }
       clip = queue.shift();
     }
     if (!clip) return;
@@ -6155,6 +6207,7 @@
     if (wallFlight && now() - (Number(wallFlight.__pineAt) || 0) < 4000) return wallFlight;
     var flight = bridge.videoWall('state').then(function (got) {
       var st = wallState(got);
+      if (root.PineSfxSeen) { try { if (st) root.PineSfxSeen.wall(st, ringSeen[String(st.playing || '')] || null); } catch (e) { /* [sfxseen] never in the way of the picture */ } }
       var id = st && st.playing;
       /* [#1442b] BEFORE the veiled early-return below: a wall that is
          hidden must still be told when it may come back. */
@@ -6194,6 +6247,7 @@
     if (row) {
       if (!playing || playing.id !== id) {
         playing = row;
+        playedNote(row, 'wall');                           /* [hcprev] */
         wallSignal(id);
       }
       return Promise.resolve(row);
@@ -6211,6 +6265,7 @@
       ringRemember([info]);
       if (wallShowing === id) {
         playing = info;
+        playedNote(info, 'wall');                          /* [hcprev] */
         wallSignal(id);
       }
       return info;
@@ -7007,6 +7062,7 @@
     box.appendChild(matchRow);                             /* [#1251] */
     box.appendChild(note);
     document.body.appendChild(box);
+    if (window.pineCloseX) { window.pineCloseX(box, function () { endlessSheet(); }, {label: 'Close', reserve: 'top'}); }  // [closex:sfx-endless]
     sheetEl = box;
     api().get('/api/sfx/video/mode').then(function (st) {
       paintSw(!!(st && st.on));
@@ -7183,6 +7239,7 @@
     /* Numbers the operator can look at rather than a claim in a comment. */
     box: readBox,
     waiting: function () { return queue.length; },
+    mounted: function () { return !!mounted; },          /* [sfxseen] the set is running */
     on: function () { return showing; },
     offer: offer,
     /* [#1214] the arbiter, on the desk. The same object as
@@ -7265,6 +7322,8 @@
       catch (err) { showing = false; return false; }
     },
     playing: function () { return playing; },
+    /* [hcprev] what actually played on this set, newest last (copies). */
+    played: function () { return played.map(function (r) { var o = {}; for (var k in r) o[k] = r[k]; return o; }); },
 
     /* [#1441] THE PICTURE IS NATIVE, SO THE TAP ON IT ARRIVES HERE.
      *
