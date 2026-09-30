@@ -66,6 +66,9 @@ class PineDesktopBridge(
         /* The Pine Cam relay's door on the station host - see camUrl(). */
         private const val CAM_PORT = 8098
         private const val CAM_PATH = "/live.ts"
+        /* [bridge-take] answers longer than this are pulled, not spliced */
+        private const val TAKE_OVER = 16 * 1024
+        private const val TAKE_KEEP = 24
 
         /* Why the LCD and the provisioner are refused here rather than
          * forwarded. Both drive hardware attached to the BOX: the LCD is a
@@ -121,6 +124,9 @@ class PineDesktopBridge(
             /* The Pine Cam, played natively off the host's live TS - see
              * video/PineCamWall.kt. */
             "pineCam",
+            /* [pinestream] this screen on the listeners' page - replay/PineStreamPush.kt */
+            "pineStream",
+            "memPrefs",   // [memprefs]
             /* #1148: "Whenever I access the screen capture to follow
              * report, I also want to be able to scrub between the last
              * five seconds of the broadcast to find the right frame." */
@@ -1359,12 +1365,16 @@ class PineDesktopBridge(
                     }
                 }
                 when (want) {
-                    "on" -> { wall.veil(false); wall.start() }
-                    "off" -> wall.stop()
+                    "on" -> {
+                        val vcr = args.optJSONObject(1)?.optBoolean("vcr", true) ?: true   // [vcrfx] the CRT, natively
+                        wall.veil(false, vcr); wall.start(vcr)
+                    }
+                    "off" -> wall.stop(args.optJSONObject(1)?.optBoolean("vcr", true) ?: true)
                     /* #1434: veiling is not stopping - the playlist keeps
                      * running and only the surface leaves the screen. */
-                    "hide" -> wall.veil(true)
-                    "show" -> wall.veil(false)
+                    "hide" -> wall.veil(true, args.optJSONObject(1)?.optBoolean("vcr", true) ?: true)
+                    "show" -> wall.veil(false, args.optJSONObject(1)?.optBoolean("vcr", true) ?: true)
+                    "vcr" -> wall.vcrReplay()                                   // [vcrfx]
                     /* [#1386] HOLD is not HIDE. The operator has a menu
                      * open over this clip and is deciding what to do with
                      * it: the picture must stay exactly where it is and
@@ -1438,14 +1448,16 @@ class PineDesktopBridge(
                         boxOf(arg)
                         val url = arg?.optString("url", "")?.trim().orEmpty()
                             .ifEmpty { camUrl(arg) }
-                        cam.play(url)
+                        cam.play(url, arg?.optBoolean("vcr", true) ?: true)   // [vcrfx] pops in
                     }
                     "box" -> boxOf(arg)
-                    "off" -> cam.stop()
-                    "hide" -> cam.hide()
-                    "show" -> cam.show()
+                    "off" -> cam.stop(arg?.optBoolean("vcr", true) ?: true)
+                    "hide" -> cam.hide(arg?.optBoolean("vcr", true) ?: true)
+                    "show" -> cam.show(arg?.optBoolean("vcr", true) ?: true)
+                    "vcr" -> cam.vcrReplay()                                    // [vcrfx]
                     "menu" -> cam.menu(arg?.optBoolean("on", true) ?: true)
                     "free" -> cam.free()
+                    "battery" -> cam.battery(arg ?: JSONObject())         // [cambattery]
                     "full" -> cam.showFullScreen()
                     "window" -> cam.showWindowed()
                     "state" -> Unit
@@ -1458,6 +1470,35 @@ class PineDesktopBridge(
                     BridgeEnvelope.ok(id, cam.state().put("ok", true).toString())
                 }
             }
+        }
+
+        /* [pinestream] run (every few seconds, and the dead man's handle), stop,
+         * state. The answer is always the pusher's own state. */
+        /* [memprefs] the operator's replay-ring ceiling (MB, 16-100). It takes
+         * effect the next time the recorder starts (the screen waking). */
+        "memPrefs" -> {
+            val a = args.optJSONObject(0)
+            if (a != null && a.has("replayMb")) {
+                com.pinebox.kiosk.replay.ReplayPrefs.save(context, a.optInt("replayMb", 48))
+            }
+            BridgeEnvelope.ok(id, org.json.JSONObject()
+                .put("ok", true)
+                .put("replayMb", com.pinebox.kiosk.replay.ReplayPrefs.capBytes / (1024 * 1024)).toString())
+        }
+
+        "pineStream" -> {
+            val push = pineStreamPush
+            val opts = args.optJSONObject(1)
+            val known = when (args.optString(0, "state")) {
+                "run" -> { push.run(opts); true }
+                "stop" -> {
+                    push.stop(opts?.optString("why", "").orEmpty().ifBlank { "the page said stop" })
+                    true
+                }
+                "state" -> true
+                else -> false
+            }
+            BridgeEnvelope.ok(id, push.state().put("ok", known).toString())
         }
 
         "hotCorners" -> BridgeEnvelope.ok(id, HotCorners.read(configStore).toString())
@@ -1626,6 +1667,12 @@ class PineDesktopBridge(
     /* THE PINE CAM, on its own native surface, for the same reason. Installed
      * by MainActivity beside the wall; null on a build with no root view. */
     @Volatile var pineCam: com.pinebox.kiosk.video.PineCamWall? = null
+
+    /* [pinestream] PineStream's pusher: this screen, to the station, only while
+     * the page keeps saying run and the station keeps answering keep. */
+    private val pineStreamPush by lazy {
+        com.pinebox.kiosk.replay.PineStreamPush(context, client, scope)
+    }
 
     /**
      * WHERE THE CAMERA'S STREAM IS: the HOST of the station base the
@@ -1876,10 +1923,40 @@ class PineDesktopBridge(
         .put("abi", Build.SUPPORTED_ABIS.firstOrNull() ?: "")
         .put("fingerprint", Build.FINGERPRINT)
 
+    /* [bridge-take] A BIG ANSWER IS NOT SCRIPT SOURCE.
+     *
+     * Measured on the tablet 2026-09-30: the bridge settled 16 MB a minute,
+     * 9 MB of it /api/dj (609 kB every 4 s), each one spliced into an
+     * evaluateJavascript() call as a string literal. V8 parses and compiles
+     * every such script and keeps it in its compilation cache; a 2-minute
+     * sampling heap profile had 51.6 MB still alive under (PARSER) - the
+     * largest live allocator in the renderer, which then grew to 885 MB and
+     * went on to take the tablet down with it (lowmemorykiller, 23:42,
+     * 23:48, 00:11). So an answer over TAKE_OVER characters waits here and
+     * the script carries only its id; the shim pulls the JSON string back
+     * through take() - a plain string across the interface, parsed once by
+     * JSON.parse, never by the JavaScript parser. Small answers keep the old
+     * road. A page that reloads never takes what it was owed, so the parked
+     * answers are capped at TAKE_KEEP, oldest out first. */
+    private val parked = object : LinkedHashMap<String, String>(16, 0.75f, false) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, String>?): Boolean =
+            size > TAKE_KEEP
+    }
+
+    /** The shim's half of [bridge-take]: the parked answer for [id], once. */
+    @JavascriptInterface
+    fun take(id: String?): String? = synchronized(parked) { parked.remove(id ?: "") }
+
     /** Deliver a settlement to the shim. Must run on the WebView's thread. */
     private fun settle(id: String, envelopeJson: String) {
-        val script = "window.__pineBridgeSettle && window.__pineBridgeSettle(" +
-            BridgeEnvelope.quote(id) + "," + BridgeEnvelope.quote(envelopeJson) + ");"
+        val script = if (envelopeJson.length > TAKE_OVER) {
+            synchronized(parked) { parked[id] = envelopeJson }
+            "window.__pineBridgeSettle && window.__pineBridgeSettle(" +
+                BridgeEnvelope.quote(id) + ",null,1);"
+        } else {
+            "window.__pineBridgeSettle && window.__pineBridgeSettle(" +
+                BridgeEnvelope.quote(id) + "," + BridgeEnvelope.quote(envelopeJson) + ");"
+        }
         webView.post {
             try {
                 webView.evaluateJavascript(script, null)

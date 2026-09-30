@@ -1,17 +1,20 @@
 package com.pinebox.kiosk.video
 
 import android.content.Context
+import android.graphics.Color
 import android.media.AudioManager
 import android.media.audiofx.LoudnessEnhancer
 import android.net.Uri
 import android.os.Looper
 import android.util.Log
+import android.view.Gravity
 import android.view.SurfaceView
 import android.view.View
 import android.widget.FrameLayout
 import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
+import androidx.media3.common.VideoSize
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.DefaultLoadControl   // [#1212]
@@ -119,6 +122,19 @@ class PineVideoWall(
     @Volatile private var held = false
     @Volatile private var holdUntil = 0L
     private var pump: Job? = null
+    /* [pin-takeover] 2026-09-30, the operator: "make it where when i set the
+     * folder, it takes over fully and properly." Measured with sfx_ads pinned:
+     * the station's set drew 165 of 165 from the folder, and the tablet still
+     * showed samples_grabbed/bart - the larder below holds every folder, and
+     * a 219-clip folder soon has nothing the rung list has not seen, so the
+     * larder took over. The station now names the pin on /api/dj/video
+     * (path, and the folder's ids when it is not huge); while it stands:
+     * the larder offers only the folder's clips, the folder may repeat
+     * rather than reach outside it, and a new pin drops what is queued
+     * from anywhere else. */
+    @Volatile private var pinPath = ""
+    @Volatile private var pinIds: Set<String>? = null
+
     /** At most one network refill. The local larder never waits behind it. */
     private var fresh: Job? = null
     /** Operator shuffle owns the runway until its requested batch lands. */
@@ -172,6 +188,39 @@ class PineVideoWall(
     @Volatile private var lastError: String = ""
     @Volatile private var repairs: Int = 0
     @Volatile private var lastRepair: String = ""
+
+    /* [sfxseen] WHAT REACHED THE GLASS. `playing` says which item the
+     * playlist is on, never whether a frame of it was drawn. The page's
+     * display receipt (sfx-seen.js) reads these through state(): the first
+     * frame ExoPlayer rendered for the item, when the item became current,
+     * the decoder's rendered/dropped counts since, and whether anybody could
+     * see it - the surface's own size and visibility, and the display. */
+    @Volatile private var seenSince: Long = 0L
+    @Volatile private var firstFrameId: String = ""
+    @Volatile private var firstFrameAt: Long = 0L
+    @Volatile private var framesRendered: Int = 0
+    @Volatile private var framesDropped: Int = 0
+    private var rendered0 = 0
+    private var dropped0 = 0
+
+    private fun seenMark(p: ExoPlayer) {                      // [sfxseen] main thread
+        seenSince = System.currentTimeMillis()
+        val c = p.videoDecoderCounters
+        rendered0 = c?.renderedOutputBufferCount ?: 0
+        dropped0 = (c?.droppedBufferCount ?: 0) + (c?.skippedOutputBufferCount ?: 0)
+        framesRendered = 0
+        framesDropped = 0
+    }
+
+    private fun seenCount(p: ExoPlayer) {                     // [sfxseen] the watchdog's tick
+        val c = p.videoDecoderCounters ?: return
+        framesRendered = (c.renderedOutputBufferCount - rendered0).coerceAtLeast(0)
+        framesDropped = (c.droppedBufferCount + c.skippedOutputBufferCount - dropped0).coerceAtLeast(0)
+    }
+
+    private fun screenOn(): Boolean = try {                   // [sfxseen]
+        (context.getSystemService(Context.POWER_SERVICE) as? android.os.PowerManager)?.isInteractive ?: true
+    } catch (err: Throwable) { true }
     private val watchdog = object : Runnable {
         override fun run() {
             try { watch() } catch (err: Throwable) { Log.w(TAG, "watch: ${err.message}") }
@@ -184,7 +233,8 @@ class PineVideoWall(
     }
 
     init {
-        addView(screen, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT))
+        addView(screen, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT, Gravity.CENTER))
+        setBackgroundColor(Color.BLACK)                           // [fit-video] the borders
         /* The activity observes taps before dispatch. The wall itself must
          * never own input: a missing box can legitimately make it full-screen,
          * and consuming that surface strands the operator outside the panel. */
@@ -333,17 +383,17 @@ class PineVideoWall(
     // ---------------------------------------------------------------- api
 
     /** Show the wall and keep it fed. Safe to call when already running. */
-    fun start() {
+    fun start(vcr: Boolean = true) {
         if (!running.compareAndSet(false, true)) return
         onMain {
-            refreshVisibility()
+            if (vcr) vcrShow() else refreshVisibility()   // [vcrfx] dot -> line -> picture
             build()
         }
         pump = scope.launch { feed() }
     }
 
     /** Hide it and let everything go. Safe to call when already stopped. */
-    fun stop() {
+    fun stop(vcr: Boolean = true) {
         if (!running.compareAndSet(true, false)) return
         pump?.cancel()
         pump = null
@@ -359,7 +409,7 @@ class PineVideoWall(
             playback = "off"
             held = false; holdUntil = 0L; menuHidden = false
             atIndex = -1; atCount = 0; atPos = -1L; atDuration = -1L
-            visibility = View.GONE
+            if (vcr) vcrGone() else { VcrFx.cancel(this); visibility = View.GONE }   // [vcrfx]
         }
     }
 
@@ -374,14 +424,36 @@ class PineVideoWall(
      * not torn down, so coming back is a change of visibility and not a
      * rebuild.
      */
-    fun veil(on: Boolean) {
+    fun veil(on: Boolean, vcr: Boolean = true) {
         veiled = on
-        onMain { refreshVisibility() }
+        onMain { if (!vcr) refreshVisibility() else if (on) vcrGone() else vcrShow() }   // [vcrfx]
     }
 
     private fun refreshVisibility() {
         visibility = if (running.get() && !veiled && !menuHidden) View.VISIBLE else View.GONE
+        if (visibility == View.VISIBLE) VcrFx.settle(this) else VcrFx.cancel(this)   // [vcrfx] never left collapsed
     }
+
+    /* [vcrfx] THE CRT, ON THE WALL'S OWN FRAME - the same table the page's
+     * PineVcr plays (VcrFx). An on starts from the dot; an off hides the wall
+     * only if nobody wanted it back meanwhile. Main thread only. */
+    private fun vcrWanted(): Boolean = running.get() && !veiled && !menuHidden
+
+    private fun vcrShow() {
+        if (!vcrWanted()) { refreshVisibility(); return }
+        val lit = visibility == View.VISIBLE && !VcrFx.isGoingOff(this)
+        visibility = View.VISIBLE
+        if (!lit) VcrFx.play(this, true)
+    }
+
+    private fun vcrGone() {
+        if (visibility != View.VISIBLE) { refreshVisibility(); return }
+        if (VcrFx.isGoingOff(this)) return
+        VcrFx.play(this, false) { if (!vcrWanted()) visibility = View.GONE }
+    }
+
+    /** [vcrfx] the bridge's `vcr` verb: play the on again (a proof on the glass). */
+    fun vcrReplay() { onMain { if (visibility == View.VISIBLE) VcrFx.play(this, true) } }
 
     private fun wallBounds(): Pair<Int, Int> {
         val parentView = parent as? View
@@ -501,6 +573,7 @@ class PineVideoWall(
         .put("w", width)
         .put("h", height)
         .put("veiled", veiled)
+        .put("vcr", VcrFx.phase(this))                      // [vcrfx] "in", "out" or ""
         .put("queued", aheadCount())
         .put("queued_s", aheadMs() / 1000.0)                // [#1212]
         .put("playing", showing)
@@ -522,6 +595,15 @@ class PineVideoWall(
         .put("last_error", lastError)
         .put("repairs", repairs)
         .put("last_repair", lastRepair)
+        .put("shown_since", seenSince)                       // [sfxseen] below: what reached the glass
+        .put("first_frame_id", firstFrameId)
+        .put("first_frame_at", firstFrameAt)
+        .put("frames_rendered", framesRendered)
+        .put("frames_dropped", framesDropped)
+        .put("surface_w", screen.width)
+        .put("surface_h", screen.height)
+        .put("visible", isShown && visibility == View.VISIBLE && screen.width > 1 && screen.height > 1)
+        .put("screen_on", screenOn())
 
     // ------------------------------------------------------- the watchdog
 
@@ -669,6 +751,7 @@ class PineVideoWall(
         playWhenReady = p.playWhenReady
         atCount = p.mediaItemCount
         atDuration = p.duration
+        seenCount(p)                                        // [sfxseen]
         retally()                                           // [#1212]
         val moved = idx != atIndex || pos != atPos
         atIndex = idx
@@ -727,6 +810,40 @@ class PineVideoWall(
 
     // -------------------------------------------------------- the player
 
+    /* [fit-video] 2026-09-30, the operator: "if a video is outside of the aspect
+     * ratio of the video window, then scale it down to fit it one to one so it
+     * stays, but it just has black borders. All videos needs to be
+     * proportionally scaled to fit the pip." The surface filled the window
+     * (MATCH_PARENT), so a tall phone clip was stretched wide. Now the surface
+     * is the largest box of the clip's own shape that fits the window,
+     * centred; the wall behind it is black, so the rest reads as borders.
+     * 0 = not known yet: fill, as before. Main thread only. */
+    @Volatile private var videoAspect = 0f
+
+    private fun fitScreen() {
+        val w = width
+        val h = height
+        if (w <= 0 || h <= 0) return
+        val lp = screen.layoutParams as? LayoutParams ?: return
+        var sw = LayoutParams.MATCH_PARENT
+        var sh = LayoutParams.MATCH_PARENT
+        val a = videoAspect
+        if (a > 0f) {
+            if (w.toFloat() / h > a) { sh = h; sw = (h * a).roundToInt().coerceIn(1, w) }
+            else { sw = w; sh = (w / a).roundToInt().coerceIn(1, h) }
+        }
+        if (lp.width == sw && lp.height == sh && lp.gravity == Gravity.CENTER) return
+        lp.width = sw
+        lp.height = sh
+        lp.gravity = Gravity.CENTER
+        screen.layoutParams = lp
+    }
+
+    override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
+        super.onSizeChanged(w, h, oldw, oldh)
+        post { fitScreen() }                                  // [fit-video] a new box, the same shape
+    }
+
     /** Everything ExoPlayer is told must be told on the main thread. */
     private fun onMain(work: () -> Unit) {
         if (Looper.myLooper() == Looper.getMainLooper()) work() else post(work)
@@ -766,6 +883,7 @@ class PineVideoWall(
             override fun onMediaItemTransition(item: MediaItem?, reason: Int) {
                 val at = p.currentMediaItemIndex
                 showing = listed.getOrNull(at)?.id ?: ""
+                seenMark(p)                                  // [sfxseen]
                 Log.i(TAG, "now showing $showing (item $at of ${p.mediaItemCount})")
                 if (showing.isNotEmpty()) onClipChanged?.invoke(showing)
                 /* [#1212] NOT ON THE FRAME OF THE JOIN.
@@ -782,6 +900,19 @@ class PineVideoWall(
             override fun onPlaybackStateChanged(state: Int) {
                 playback = stateName(state)  // #1440
                 Log.i(TAG, "state ${stateName(state)} at item ${p.currentMediaItemIndex} of ${p.mediaItemCount}")
+            }
+
+            /* [fit-video] every clip keeps its own shape inside the window */
+            override fun onVideoSizeChanged(videoSize: VideoSize) {
+                if (videoSize.width <= 0 || videoSize.height <= 0) return
+                videoAspect = videoSize.width * videoSize.pixelWidthHeightRatio / videoSize.height
+                onMain { fitScreen() }
+            }
+
+            /* [sfxseen] fired per stream change: a frame of THIS item was drawn */
+            override fun onRenderedFirstFrame() {
+                firstFrameAt = System.currentTimeMillis()
+                firstFrameId = listed.getOrNull(p.currentMediaItemIndex)?.id ?: showing
             }
 
             override fun onPlayerError(error: PlaybackException) {
@@ -1042,8 +1173,14 @@ class PineVideoWall(
                         delay(120)          // let the main thread's tally land
                     } else {
                         val cached = withContext(Dispatchers.IO) { fromLarder() }
+                        /* [pin-takeover] a pinned folder repeats before anything
+                         * from outside it plays */
+                        val again = if (cached == null && pinPath.isNotEmpty()) nextRingClip(repeat = true) else null
                         if (cached != null) {
                             offer(cached)
+                            delay(120)
+                        } else if (again != null) {
+                            offer(again)
                             delay(120)
                         } else {
                             delay(1_200)
@@ -1120,7 +1257,7 @@ class PineVideoWall(
     private fun aheadRows(): Int = aheadRowsTally
 
     /** The next fresh clip off the ring. The caller owns the larder fallback. */
-    private suspend fun nextRingClip(): Clip? = withContext(Dispatchers.IO) {
+    private suspend fun nextRingClip(repeat: Boolean = false): Clip? = withContext(Dispatchers.IO) {
         val base = client.config().base
         val text = try {
             client.getMediaText("$base/api/dj/video")
@@ -1128,7 +1265,9 @@ class PineVideoWall(
             Log.w(TAG, "ring: ${err.message}")
             return@withContext null
         }
-        val rows = JSONObject(text).optJSONArray("clips")
+        val root = JSONObject(text)
+        readPin(root)                                          // [pin-takeover]
+        val rows = root.optJSONArray("clips")
         if (rows != null) {
             for (i in 0 until rows.length()) {
                 val row = rows.optJSONObject(i) ?: continue
@@ -1136,7 +1275,8 @@ class PineVideoWall(
                 val url = row.optString("url")
                 if (id.isBlank() || url.isBlank()) continue
                 if (row.optBoolean("silent_picture", false)) continue
-                if (rung.contains(id) || listed.any { it.id == id }) continue
+                if (!pinAllows(id)) continue                       // [pin-takeover]
+                if ((!repeat && rung.contains(id)) || listed.any { it.id == id }) continue
                 val secs = row.optDouble("length", row.optDouble("seconds", 0.0))
                 val file = pull(base + url, id)
                 /* Remembered either way: a clip the station cannot give us
@@ -1165,6 +1305,7 @@ class PineVideoWall(
         val held = try {
             den.listFiles()?.filter {
                 it.isFile && it.length() > MIN_BYTES && it.name.endsWith(".mp4")
+                    && pinAllows(it.nameWithoutExtension, larder = true)   // [pin-takeover]
                     && it.nameWithoutExtension != now
                     && !rung.contains(it.nameWithoutExtension)
                     && listed.none { c -> c.id == it.nameWithoutExtension }
@@ -1175,6 +1316,57 @@ class PineVideoWall(
         val pick = held.minByOrNull { it.lastModified() } ?: return null
         try { pick.setLastModified(System.currentTimeMillis()) } catch (err: Throwable) { }
         return Clip(pick.nameWithoutExtension, pick)
+    }
+
+    /** [pin-takeover] may this clip play under the pin? No pin: anything. A pin
+     *  with its ids: only those. A pin too big to list: the ring's own rows
+     *  (the station already draws them from the folder), never the larder. */
+    private fun pinAllows(id: String, larder: Boolean = false): Boolean {
+        if (pinPath.isEmpty()) return true
+        val ids = pinIds ?: return !larder
+        return ids.contains(id)
+    }
+
+    /** [pin-takeover] read the station's pin off a /api/dj/video answer. */
+    private fun readPin(root: JSONObject) {
+        val pin = root.optJSONObject("pin")
+        val path = pin?.optString("path").orEmpty()
+        val ids = pin?.optJSONArray("ids")?.let { arr ->
+            HashSet<String>(arr.length()).apply { for (i in 0 until arr.length()) add(arr.optString(i)) }
+        }
+        if (path == pinPath && (ids?.size ?: -1) == (pinIds?.size ?: -1)) return
+        val changed = path != pinPath
+        pinPath = path
+        pinIds = if (path.isEmpty()) null else ids
+        if (changed && path.isNotEmpty()) {
+            Log.i(TAG, "pin: $path (${ids?.size ?: "unlisted"} clips) - the set takes it over")
+            onMain { dropUnpinned() }
+        }
+    }
+
+    /** [pin-takeover] a new pin: what is queued from elsewhere goes, and the
+     *  clip on the tube gives way if a pinned one is ready behind it. */
+    private fun dropUnpinned() {
+        val p = player ?: return
+        if (pinPath.isEmpty()) return
+        val at = p.currentMediaItemIndex.coerceAtLeast(0)
+        try {
+            var i = listed.size - 1
+            while (i > at) {
+                if (!pinAllows(listed[i].id)) {
+                    p.removeMediaItem(i)
+                    listed.removeAt(i)
+                }
+                i -= 1
+            }
+            val onTube = listed.getOrNull(at)?.id
+            if (onTube != null && !pinAllows(onTube) && p.mediaItemCount > at + 1) p.seekToNextMediaItem()
+            retally()
+            lastKick = "${stamp()} a folder pin took the set over"
+        } catch (err: Throwable) {
+            lastError = "${stamp()} pin: ${err.message}"
+            Log.w(TAG, "pin: ${err.message}")
+        }
     }
 
     /** This id is spent - played, or refused - and is not asked for again. */

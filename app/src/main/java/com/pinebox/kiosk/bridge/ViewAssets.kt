@@ -39,6 +39,8 @@ object ViewAssets {
 
     /** Evaluated in this order: models first, then the views that read them. */
     private val SCRIPTS = listOf(
+        "pine-memory.js",          // [memdiet-kiosk] the decoder budget, before anything makes a <video>
+        "pine-vcr.js",             // [vcrfx] the one picture on/off effect (the SFX TV's CRT)
         "pine-logo.js",           // the mark, inline - origins forbid a URL
         "boot-splash.js",         // the logo assembling itself at startup
         "pine-dismiss.js",        // tap away and a panel closes - one rule
@@ -52,6 +54,7 @@ object ViewAssets {
         "pinelive-scope.js",
         "pinelive-guide.js",
         "pinelive.js",
+        "pinestream.js",          // [pinestream] this screen on the listeners' page (reads PineLive's switch)
         // Voice Actor: the person badge beside that mic, and the
         // cast subpanel behind it - same bar, same mount pattern.
         "voice-actor.js",
@@ -125,6 +128,7 @@ object ViewAssets {
         "ad-viewer.js",           // Pine Box Gallery carousel and signed playback
         "prompt-history.js",      // prompt records and fullscreen controls
         "line-actions.js",        // hold a line: pad, keep, or examine
+        "msg-id.js",              // [msgid] the message code chip, copy, find by code
         "sfx-tv.js",              // #1306b: the SFX guy's little CRT set
         "clip-doctor.js",         // #1361b: why the video button gave nothing
         "pine-cam.js",            // #1358: the Pine Cam, self-hosted here
@@ -159,6 +163,7 @@ object ViewAssets {
         "lock.css",               // the locked screen
         "vote-arrows.css",        // the up and down arrows
         "line-actions.css",       // the hold sheet and the examination
+        "msg-id.css",             // [msgid] the code chip and its toast
         "line-repeat.css",        // the repeat sheet; its own <link> needs a script URL the bundle has not got
         "prompt-history.css",     // prompt history and fullscreen top bar
         "sfx-tv.css",             // #1306b: the set, its glass and its sheet

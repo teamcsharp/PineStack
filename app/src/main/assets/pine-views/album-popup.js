@@ -252,6 +252,41 @@
     if (box.__votes && box.__votes.paint) box.__votes.paint();
   }
 
+  function readSpinDice(box, track) {
+    // [s3-cover-b] GAP 2: the record's spins with the roll each joined - the
+    // data road for the roulette card (the full breakdown card comes later).
+    if (!track || !track.id) return;
+    var serial = (box.__spinSerial || 0) + 1;
+    box.__spinSerial = serial;
+    api().get('/api/music/spins/' + encodeURIComponent(track.id)).then(function (got) {
+      if (!back || !box.isConnected || serial !== box.__spinSerial) return;
+      box.__spinDice = got || {};
+      paintSpinDice(box, got || {});
+    }, function () { /* no spins on the log yet is a fine answer */ });
+  }
+
+  function paintSpinDice(box, got) {
+    var line = box.querySelector('.pa-spin-dice');
+    if (!line) {
+      var detail = box.querySelector('.pa-album-detail');
+      if (!detail || !detail.parentNode) return;
+      line = make('p', 'pa-spin-dice');
+      detail.parentNode.insertBefore(line, detail.nextSibling);
+    }
+    var n = (got && got.count) || 0;
+    if (!n) { line.textContent = ''; line.hidden = true; return; }
+    var lanes = (got && got.lanes) || {};
+    var bits = Object.keys(lanes).map(function (k) { return lanes[k] + ' ' + k; });
+    var spins = (got && got.spins) || [];
+    var s3 = (spins[spins.length - 1] || {}).s3 || {};
+    var tail = s3.lane ? (' - last: ' + s3.lane
+      + (s3.roll && s3.roll.dice != null ? ', dice ' + s3.roll.dice : '')
+      + (s3.deal && s3.deal.dice != null ? ', deal dice ' + s3.deal.dice : '')) : '';
+    line.hidden = false;
+    line.textContent = 'Roulette: ' + n + ' spin' + (n === 1 ? '' : 's') + ' on the log ('
+      + bits.join(', ') + ')' + tail;
+  }
+
   function readHeroDetails(box, track, data) {
     if (!track || !track.id) return;
     var serial = (box.__detailSerial || 0) + 1;
@@ -260,6 +295,7 @@
       if (!back || serial !== box.__detailSerial) return;
       updateHero(box, Object.assign({}, track, full || {}), data);
     }, function () { /* the album index still has enough to remain useful */ });
+    readSpinDice(box, track);   // [s3-cover-b]
   }
 
   function paintAlbum(box, seed, data) {

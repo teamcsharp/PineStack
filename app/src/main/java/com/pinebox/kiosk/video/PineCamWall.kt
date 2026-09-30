@@ -72,6 +72,12 @@ class PineCamWall(context: Context) : FrameLayout(context) {
      * under this app's own chrome. */
     private val screen = SurfaceView(context).apply { setZOrderMediaOverlay(true) }
 
+    /* [cambattery] the camera's battery in the picture's top-left: a
+     * z-on-top surface, the one layer above a media overlay. The page
+     * sends the reading (bridge verb `battery`); this is its child so it
+     * leaves with the picture. See CamBatteryBadge. */
+    private val badge = CamBatteryBadge(context)
+
     private var player: ExoPlayer? = null
     private val running = AtomicBoolean(false)
     @Volatile private var url: String = ""
@@ -129,6 +135,7 @@ class PineCamWall(context: Context) : FrameLayout(context) {
 
     init {
         addView(screen, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT))
+        addView(badge, LayoutParams(1, 1, Gravity.TOP or Gravity.START))   // [cambattery]
         /* The activity observes taps before dispatch. The wall itself must
          * never own input - see PineVideoWall for why. */
         isClickable = false
@@ -314,7 +321,7 @@ class PineCamWall(context: Context) : FrameLayout(context) {
      * the page asks on every layout, and a restart per layout would be a
      * keyframe wait per layout.
      */
-    fun play(streamUrl: String) {
+    fun play(streamUrl: String, vcr: Boolean = true) {
         val wanted = streamUrl.trim()
         if (wanted.isEmpty()) return
         onMain {
@@ -324,14 +331,14 @@ class PineCamWall(context: Context) : FrameLayout(context) {
             running.set(true)
             build()
             hidden = false
-            refreshVisibility()
+            if (vcr) vcrShow() else refreshVisibility()   // [vcrfx] the cam pops in
             if (same) return@onMain
             open("play")
         }
     }
 
     /** Take the picture down and let the stream go. Safe when already stopped. */
-    fun stop() {
+    fun stop(vcr: Boolean = true) {
         if (!running.compareAndSet(true, false)) return
         onMain {
             removeCallbacks(watchdog)
@@ -344,19 +351,19 @@ class PineCamWall(context: Context) : FrameLayout(context) {
             laggingTicks = 0; healthyTicks = 0; errorPending = false
             backoffMs = BACKOFF_MIN_MS; notBefore = 0L
             menuHidden = false
-            visibility = View.GONE
+            if (vcr) vcrGone() else { VcrFx.cancel(this); visibility = View.GONE }   // [vcrfx]
         }
     }
 
     fun isRunning(): Boolean = running.get()
 
     /** Off the glass, still playing - coming back is a visibility change. */
-    fun hide() { hidden = true; onMain { refreshVisibility() } }
+    fun hide(vcr: Boolean = true) { hidden = true; onMain { if (vcr) vcrGone() else refreshVisibility() } }   // [vcrfx]
 
-    fun show() {
+    fun show(vcr: Boolean = true) {
         hidden = false
         onMain {
-            refreshVisibility()
+            if (vcr) vcrShow() else refreshVisibility()   // [vcrfx]
             /* Nothing was measured while the surface was away. */
             stillSince = 0L
         }
@@ -379,9 +386,35 @@ class PineCamWall(context: Context) : FrameLayout(context) {
 
     fun free() = menu(false)
 
+    /** [cambattery] {on, text, bars, tone, pulse, stale, charging} from the page. */
+    fun battery(o: JSONObject) { onMain { badge.show(o) } }
+
     private fun refreshVisibility() {
         visibility = if (running.get() && !hidden && !menuHidden) View.VISIBLE else View.GONE
+        if (visibility == View.VISIBLE) VcrFx.settle(this) else VcrFx.cancel(this)   // [vcrfx] never left collapsed
     }
+
+    /* [vcrfx] THE CRT, ON THE CAM'S OWN FRAME - the table the page's PineVcr
+     * plays on the JPEG box (VcrFx). "if I enable the Pine recording and I
+     * activate the Pine Cam, then I want the cam to pop in with the V CR
+     * effect." Main thread only. */
+    private fun vcrWanted(): Boolean = running.get() && !hidden && !menuHidden
+
+    private fun vcrShow() {
+        if (!vcrWanted()) { refreshVisibility(); return }
+        val lit = visibility == View.VISIBLE && !VcrFx.isGoingOff(this)
+        visibility = View.VISIBLE
+        if (!lit) VcrFx.play(this, true)
+    }
+
+    private fun vcrGone() {
+        if (visibility != View.VISIBLE) { refreshVisibility(); return }
+        if (VcrFx.isGoingOff(this)) return
+        VcrFx.play(this, false) { if (!vcrWanted()) visibility = View.GONE }
+    }
+
+    /** [vcrfx] the bridge's `vcr` verb: play the on again (a proof on the glass). */
+    fun vcrReplay() { onMain { if (visibility == View.VISIBLE) VcrFx.play(this, true) } }
 
     private fun wallBounds(): Pair<Int, Int> {
         val parentView = parent as? View
@@ -475,6 +508,7 @@ class PineCamWall(context: Context) : FrameLayout(context) {
         .put("h", height)
         .put("full", fullScreen)
         .put("hidden", hidden)
+        .put("vcr", VcrFx.phase(this))                      // [vcrfx] "in", "out" or ""
         .put("menu_hidden", menuHidden)
         .put("lag_ms", lagMs)
         .put("buffered_ms", bufferedMs)

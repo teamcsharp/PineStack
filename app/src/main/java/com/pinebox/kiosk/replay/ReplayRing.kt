@@ -41,6 +41,23 @@ import org.json.JSONObject
  * which is why the encoder is asked for a keyframe every second: a longer
  * interval would be cheaper and would make the start of the clip vaguer.
  */
+/** [memprefs] The replay ring's memory ceiling, the operator's preference
+ *  (SharedPreferences "pine_mem" / "replay_cap_mb", default 48, 16-100). */
+object ReplayPrefs {
+    @Volatile var capBytes: Int = 48 * 1024 * 1024
+
+    fun load(context: android.content.Context) {
+        val mb = context.getSharedPreferences("pine_mem", 0).getInt("replay_cap_mb", 48)
+        capBytes = mb.coerceIn(16, 100) * 1024 * 1024
+    }
+
+    fun save(context: android.content.Context, mb: Int) {
+        val v = mb.coerceIn(16, 100)
+        context.getSharedPreferences("pine_mem", 0).edit().putInt("replay_cap_mb", v).apply()
+        capBytes = v * 1024 * 1024
+    }
+}
+
 class ReplayRing(private val holdSeconds: Int = 60) {
 
     private companion object {
@@ -121,7 +138,10 @@ class ReplayRing(private val holdSeconds: Int = 60) {
          * 1,398 s, which is the twenty minutes with a sixth to spare at
          * the design ceiling and far more on the mostly-static panel this
          * actually records. */
-        val want = bytes.coerceIn(2 * 1024 * 1024, 100 * 1024 * 1024)
+        /* [memprefs] the operator's ceiling: 48 MB by default (about half an
+         * hour at the measured rate), settable 16-100 MB in the file manager. */
+        val want = bytes.coerceIn(2 * 1024 * 1024,
+            ReplayPrefs.capBytes.coerceIn(16 * 1024 * 1024, 100 * 1024 * 1024))
         if (blob.size == want && marks.isNotEmpty()) {
             /* Already the right shape: keep every packet in it. */
             joinClock()
