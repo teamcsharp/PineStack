@@ -142,6 +142,58 @@
   background: #16302a; }
 .sp-band-reopen { flex: 0 0 28px; }
 
+/* [reply-gap:square] the seven toolbar icons are squares: the row is
+   stretched (46 px on the PineTab) and the buttons stretched with it -
+   28 x 46 measured. Centred, 34 x 34, pinned against the touch-target rule. */
+.sp-band-restore { align-items: center; }
+.sp-band-restore > .sp-band-reopen {
+  flex: 0 0 34px; width: 34px; min-width: 34px; height: 34px; min-height: 34px; max-height: 34px;
+  box-sizing: border-box;
+}
+.sp-band-restore > .sp-band-reopen svg { width: 18px; height: 18px; }
+
+/* [reply-gap:dual] one track, two thumbs, the span between them shaded */
+.sp-gap-dual {
+  flex: 1 1 0; min-width: 0; height: 34px; box-sizing: border-box;
+  display: flex; align-items: center; gap: 4px; padding: 0 6px;
+  border: 1px solid var(--sp-line); border-radius: 4px; background: var(--sp-panel); color: var(--sp-muted);
+}
+.sp-gap-dual .sp-gap-ic { flex: none; }
+.sp-gap-track {
+  position: relative; flex: 1 1 auto; min-width: 60px; height: 30px; margin: 0 14px;
+  touch-action: none; cursor: pointer; -webkit-user-select: none; user-select: none;
+}
+.sp-gap-rail {
+  position: absolute; left: 0; right: 0; top: 50%; height: 4px; margin-top: -2px;
+  border-radius: 2px; background: #2b3a42; pointer-events: none;
+}
+.sp-gap-span {
+  position: absolute; top: 50%; height: 6px; margin-top: -3px; border-radius: 3px;
+  background: var(--sp-on, #68ced9); opacity: .55; pointer-events: none;
+}
+.sp-gap:not(.sp-gap-on) .sp-gap-span { opacity: .18; }
+.sp-gap-thumb {
+  position: absolute; top: 50%; width: 30px; height: 30px; margin: -15px 0 0 -15px;
+  border-radius: 50%; touch-action: none; cursor: grab; outline: none; z-index: 1;
+}
+.sp-gap-thumb::after {
+  content: ""; position: absolute; left: 7px; top: 7px; width: 16px; height: 16px; box-sizing: border-box;
+  border-radius: 50%; background: var(--sp-on, #68ced9); border: 2px solid #0b1215;
+  box-shadow: 0 0 0 1px var(--sp-on, #68ced9);
+}
+.sp-gap-thumb.sp-gap-b::after { background: #0b1215; border-color: var(--sp-on, #68ced9); }
+.sp-gap:not(.sp-gap-on) .sp-gap-thumb.sp-gap-b::after { opacity: .45; }
+.sp-gap-thumb.grab { cursor: grabbing; z-index: 2; }
+.sp-gap-thumb.grab::after { transform: scale(1.15); }
+.sp-gap-thumb:focus-visible::after { box-shadow: 0 0 0 3px var(--sp-on, #68ced9); }
+.sp-gap-vals { min-width: 9.5ch; }
+.sp-gap .sp-gap-diebox { height: 34px; }
+.sp-gap .sp-gap-diebox .sp-gap-die { height: 30px; min-height: 30px; max-height: 30px; line-height: 28px; }
+.sp-gap .sp-gap-diebox .sp-gap-die .sp-die-reel > span { height: 28px; line-height: 28px; }
+@media (prefers-reduced-motion: reduce) {
+  .sp-gap-thumb.grab::after { transform: none; }
+}
+
 /* [reply-gap] THE PAUSE BETWEEN REPLIES on the toolbar, right of the chat
    icon: two sliders, the roulette switch and the dice square. Every size is
    pinned: the page's touch-target rule (button min-height) blows buttons up

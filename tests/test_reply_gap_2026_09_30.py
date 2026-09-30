@@ -11,6 +11,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -260,6 +261,115 @@ class PageDoor(unittest.TestCase):
         nxt = self.clip(broadcast_ms=100000, gap_before={"s": 3.0})
         self.assertIsNone(rg.door(nxt, 100.0, 95.0))
         self.assertEqual(nxt["gap_before"], {"s": 3.0})
+
+
+class Buildup(unittest.TestCase):
+    """[reply-gap:buildup] pause, then the card's whole Rolodex, then the words."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        rg.use_path(Path(self.tmp.name) / "g.json")
+        rg._BOOKED.update(until=0.0, tail=0.0)
+        self._line = rg.buildup_of_line
+
+    def tearDown(self):
+        rg.buildup_of_line = self._line
+        rg.use_path(None)
+        self.tmp.cleanup()
+
+    def test_the_contract_arithmetic(self):
+        self.assertEqual(rg.buildup_ms([]), 0, "no tables, no buildup")
+        self.assertEqual(rg.buildup_ms([{"sub": False}]), round(1800 * 0.92 + 40 + 1500))
+        two = {"sub": True, "rej": 2}
+        self.assertEqual(rg.buildup_ms([two]), round(1800 * 0.98 + min(720, 260 * 2 + 140) + 40 + 1500))
+        self.assertEqual(rg.buildup_ms([{"sub": False, "rej": 9}]), round(1800 * 0.92 + 720 + 40 + 1500),
+                         "rejected rolls cap at 40% of a table")
+        self.assertEqual(rg.buildup_ms([{"sub": False, "failed": True}]), round(1800 * 0.92 + 420 + 40 + 1500))
+
+    def test_a_moments_tables_roll_once(self):
+        fixture = json.loads((ROOT / "tests" / "fixtures_reply_gap_buildup.json").read_text(encoding="utf-8"))
+        conv = max(fixture, key=lambda c: len(c["decision_events"]))
+        tid = next(t["turn_id"] for t in conv["turns"] if rg.turn_spec(conv, t["turn_id"], "dj", claim=False))
+        first = rg.turn_spec(conv, tid, "dj")
+        self.assertTrue(first)
+        self.assertEqual(rg.turn_spec(conv, tid, "dj"), [], "the turn's second clip brings no tables of its own")
+
+    def test_the_door_schedules_pause_then_buildup(self):
+        rg.save({"gap": 2.0, "roll": False})
+        air = time.time() + 30.0                             # a message booked to end in 30 s
+        rg.booked({"tail_s": 0.9}, air)
+        nxt = {"url": "/media/" + "b" * 32 + ".wav", "text": "next", "speech": True,
+               "broadcast_ms": int(air * 1000)}
+        start = rg.door(nxt, air, air - 20.0, build_of=lambda c: 6000)
+        self.assertAlmostEqual(start, air - 0.9 + 2.0 + 6.0, places=2)
+        self.assertEqual(nxt["buildup_ms"], 6000)
+        self.assertEqual(nxt["gap_before"]["buildup_ms"], 6000)
+
+    def test_the_page_learns_of_a_card_in_time(self):
+        rg.save({"gap": 0.2, "roll": False})
+        now = time.time()
+        rg.booked({"tail_s": 0.0}, now + 1.0)
+        nxt = {"url": "/media/" + "c" * 32 + ".wav", "text": "x", "speech": True,
+               "broadcast_ms": int((now + 1.0) * 1000)}
+        start = rg.door(nxt, now + 1.0, now + 0.5, build_of=lambda c: 8000)
+        self.assertGreaterEqual(start, now + 8.0 + rg.PAGE_LEARN_S - 0.05,
+                                "the whole buildup can play on a page that heard of it late")
+
+    def test_every_message_rolls_even_after_the_air_went_quiet(self):
+        rg.save({"gap": 1.0, "range": 3.1, "roll": True})
+        now = time.time()
+        rg.booked({"tail_s": 0.0}, now - 5.0)                # the last words ended 5 s ago
+        nxt = {"url": "/media/" + "d" * 32 + ".wav", "text": "late", "speech": True,
+               "broadcast_ms": int((now + 7) * 1000)}
+        rg.door(nxt, now + 7, now + 7, rng=random.Random(4), build_of=lambda c: 0)
+        self.assertIn("gap_before", nxt, "a clip that arrives after the words ended still rolls its pause")
+        self.assertTrue(nxt["gap_before"]["rolled"])
+
+    def test_a_round_carries_each_cards_buildup_in_its_seams(self):
+        rg.save({"gap": 1.0, "roll": False})
+        rg.buildup_of_line = lambda meta, who, text: {"a": 3000, "b": 5000, "c": 0}.get(text, 0)
+        items = [{"who": "dj", "turn_end": True}, {"who": "cohost", "turn_end": True},
+                 {"who": "third", "turn_end": True}]
+        transcript = [("dj", "a", 3), ("cohost", "b", 3), ("third", "c", 3)]
+        out, notes = rg.burst([0.1, 0.1, 0.0], [0, 1, 2], [0, 1, 2], transcript, items)
+        self.assertEqual(out, [6.0, 1.0, 0.0], "pause + the next card's buildup, in the file")
+        self.assertEqual(notes["first_buildup"]["buildup_ms"], 3000)
+        rows = [{"id": "a", "until": 9.0}, {"id": "b", "from": 9.0, "until": 13.0},
+                {"id": "c", "from": 13.0, "until": 16.0}]
+        rg.stamp_rows(rows, [0, 1, 2], notes)
+        self.assertEqual(rows[0]["buildup_ms"], 3000, "the first card builds before the file")
+        self.assertEqual(rows[0]["gap"]["inside"], 6.0)
+        self.assertEqual(rows[0]["gap"]["buildup_ms"], 5000)
+        self.assertEqual(rows[1]["buildup_ms"], 5000)
+        self.assertEqual(rows[2]["buildup_ms"], 0)
+
+    def test_the_planner_counts_the_buildup(self):
+        rg.save({"gap": 1.0, "roll": False})
+        ns = {"_s3_active": lambda: True}
+        old = rg._NS.get("ns")
+        try:
+            rg._NS["ns"] = ns
+            rg._BUILD_STATS.update(n=0.0, mean=0.0)
+            guess = rg.buildup_ms([{"sub": False}] * rg.BUILD_DEFAULT_TABLES) / 1000.0
+            self.assertAlmostEqual(rg.planner_seam(), 1.0 + guess, places=3)
+            for ms in (6000, 8000, 10000):
+                rg._measured(ms)
+            self.assertAlmostEqual(rg.planner_seam(), 1.0 + 8.0, places=3,
+                                   msg="the measured mean, once there is one")
+            ns["_s3_active"] = lambda: False
+            self.assertAlmostEqual(rg.planner_seam(), 1.0, places=3, msg="System 3 off: no cards, no buildup")
+        finally:
+            rg._NS["ns"] = old
+            rg._BUILD_STATS.update(n=0.0, mean=0.0)
+
+    def test_the_planner_seam_is_what_app_py_budgets_with(self):
+        text = (ROOT / "app.py").read_text(encoding="utf-8")
+        if "[reply-gap:buildup]" not in text:
+            self.skipTest("app.py is not patched here")
+        self.assertEqual(text.count("return max(max(CONCAT_BEAT), float(_reply_gap.planner_seam()))"), 1)
+        got = subprocess.run([sys.executable, str(ROOT / "tools" / "reply_gap_buildup_patch.py"),
+                              "--check", str(ROOT / "app.py")], capture_output=True, text=True)
+        self.assertEqual(got.returncode, 2, got.stdout + got.stderr)
 
 
 class StreamMixer(unittest.TestCase):

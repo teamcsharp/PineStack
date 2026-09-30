@@ -221,6 +221,7 @@ def state(recent: int = 12) -> dict[str, Any]:
                        "range_default": RANGE_DEFAULT},
             "rule": "rolling: uniform between the two sliders, [min(gap, range), max(gap, range)]",
             "key": ROLL_KEY,
+            "buildup": contract(),                                  # [reply-gap:buildup]
             "recent": list(_ROLLS)[-max(0, int(recent)):] if recent else []}
 
 
@@ -397,6 +398,14 @@ def burst(beats: list, seg_ix: list, turn_ix: list, transcript: list, items: lis
     if CARRY_BY_DOOR:
         carry = False          # [reply-gap:door] the page door seams every clip, pages included
     flags = reply_seams(count, seg_ix, list(turn_ix or []), list(items or []))
+    # [reply-gap:buildup] the first line's card builds before the file starts
+    # (the page door holds the clip that long); every later reply's inside
+    # the seam before it, after the pause
+    try:
+        notes["first_buildup"] = {"buildup_ms": buildup_of_line(
+            meta, str(transcript[0][0] or ""), str(transcript[0][1] or ""))} if transcript else {"buildup_ms": 0}
+    except (IndexError, TypeError):
+        notes["first_buildup"] = {"buildup_ms": 0}
     for r, slot in enumerate(list(seg_ix or [])):
         slot = int(slot)
         if not flags.get(slot):
@@ -428,7 +437,14 @@ def burst(beats: list, seg_ix: list, turn_ix: list, transcript: list, items: lis
         if last:
             notes["carry"] = dict(note, carry=True)
         else:
-            out[slot] = float(note["s"])
+            nb = 0
+            if r + 1 < len(transcript) and r + 1 < len(seg_ix) and int(seg_ix[r + 1]) == slot + 1:
+                try:
+                    nb = buildup_of_line(meta, nxt, str(transcript[r + 1][1] or ""))
+                except (IndexError, TypeError):
+                    nb = 0
+            note["buildup_ms"] = int(nb)
+            out[slot] = round(float(note["s"]) + nb / 1000.0, 3)
             notes[slot] = note
     return out, notes
 
@@ -453,6 +469,9 @@ def stamp_rows(rows: list, seg_ix: list, notes: dict) -> None:
     into the next burst is waited out on the ledger, so none of it is)."""
     if not notes or not rows:
         return
+    first = notes.get("first_buildup")
+    if isinstance(first, dict) and isinstance(rows[0], dict):
+        rows[0]["buildup_ms"] = int(first.get("buildup_ms") or 0)   # [reply-gap:buildup]
     for r, row in enumerate(rows):
         try:
             slot = int(seg_ix[r])
@@ -464,9 +483,14 @@ def stamp_rows(rows: list, seg_ix: list, notes: dict) -> None:
             note, inside = notes["carry"], False
         if not isinstance(note, dict) or not isinstance(row, dict):
             continue
-        row["gap"] = {k: note[k] for k in ("s", "rolled", "dice", "lo", "hi", "by", "id")
+        row["gap"] = {k: note[k] for k in ("s", "rolled", "dice", "lo", "hi", "by", "id", "buildup_ms")
                       if k in note}
-        row["gap"]["inside"] = float(note["s"]) if inside else 0.0
+        nb = int(note.get("buildup_ms") or 0)
+        # [reply-gap:buildup] the seam in the file is the pause AND the next
+        # card's buildup; the next row says how long its card builds
+        row["gap"]["inside"] = round(float(note["s"]) + nb / 1000.0, 3) if inside else 0.0
+        if inside and r + 1 < len(rows) and isinstance(rows[r + 1], dict):
+            rows[r + 1]["buildup_ms"] = nb
 
 
 def carry_seconds(notes: dict, length: Any, rows: list) -> float:
@@ -481,6 +505,266 @@ def carry_seconds(notes: dict, length: Any, rows: list) -> float:
     except (TypeError, ValueError, AttributeError):
         tail = 0.0
     return round(max(0.0, float(note.get("s") or 0) - tail), 3)
+
+
+# ------------------------------------------------------------- the buildup
+#
+# [reply-gap:buildup] PAUSE, THEN THE CARD'S WHOLE ROLODEX, THEN THE WORDS.
+# "i want to be able to see every RNG rolodex roulette buildup for each card.
+#  The whole point of the timer was to allow these to play and be analyzed
+#  without them rushing or skipping animations" (operator, 2026-09-30).
+#
+# THE TIMING CONTRACT. One set of numbers, here and in script-page.js
+# (MV_BUILD - tests/test_reply_gap_buildup_2026_09_30.cjs holds them equal).
+# A card's roll sheet is its tables in turn, each at BUILD_PER_MS:
+#   one-stage table  per * (in .08 + die .18 + spin .60 + pop .06) = .92 per
+#   two-stage table  per * (in .08 + die .12 + spin .27 + pop .06
+#                           + die2 .12 + spin2 .27 + pop2 .06)   = .98 per
+#   + its rejected candidates: min(.4 per, 260 ms each + 140) per stage
+#   + 420 ms when the table failed (PASS / NONE)
+#   + 40 ms before the next table; then the whole result held 1500 ms.
+# The station computes a message's buildup from the same System 3 record the
+# card is drawn from (the turn's decisions, as /api/system3/line gives them,
+# read off the runtime's memory - never a store read on the event loop), puts
+# it into the schedule every listener's copy is built from, and publishes it
+# on the clip (`buildup_ms`) and on each row. The page plays its sheet at the
+# contract's pace and fits it to exactly that many ms.
+#
+# A MOMENT'S TABLES ROLL ONCE: the card engine keeps every roll of a turn on
+# the turn's first card ([onecard]), so the second clip of the same turn
+# brings only the tables it adds (none, for a chunk; the clip's own roll, for
+# a sting). The station keeps the same ledger (claimed events per turn).
+
+BUILD_PER_MS = 1800.0
+BUILD_ONE = (0.08, 0.18, 0.60, 0.06)
+BUILD_TWO = (0.08, 0.12, 0.27, 0.06, 0.12, 0.27, 0.06)
+BUILD_REJ_EACH_MS = 260.0
+BUILD_REJ_BASE_MS = 140.0
+BUILD_REJ_CAP = 0.4
+BUILD_REJ_MAX = 6
+BUILD_FAIL_MS = 420.0
+BUILD_BETWEEN_MS = 40.0
+BUILD_HOLD_MS = 1500.0
+BUILD_DEFAULT_TABLES = 5          # the planner's guess until lines have been measured
+PAGE_LEARN_S = 3.0                # the page must hold a clip this long before its card starts
+SEAM_MEMORY_S = 120.0             # a message this recent still owns the pause before the next
+_CLAIMED: Any = None             # an OrderedDict "cid|tid" -> the events its cards rolled
+_BUILD_STATS: dict[str, float] = {"n": 0.0, "mean": 0.0}
+
+
+def _rej_ms(n: int, per: float = BUILD_PER_MS) -> float:
+    n = max(0, int(n or 0))
+    return min(per * BUILD_REJ_CAP, BUILD_REJ_EACH_MS * n + BUILD_REJ_BASE_MS) if n else 0.0
+
+
+def table_ms(t: Any, per: float = BUILD_PER_MS) -> float:
+    """One table of a card's roll sheet, rejected rolls and failure included."""
+    t = t if isinstance(t, dict) else {}
+    two = bool(t.get("sub"))
+    base = per * sum(BUILD_TWO if two else BUILD_ONE)
+    return (base + _rej_ms(t.get("rej", 0), per) + (_rej_ms(t.get("rej2", 0), per) if two else 0.0)
+            + (BUILD_FAIL_MS if t.get("failed") else 0.0))
+
+
+def buildup_ms(spec: Any, per: float = BUILD_PER_MS) -> int:
+    """A card's whole buildup, from its tables: each table, 40 ms after it,
+    and the result held 1500 ms. No tables, no buildup."""
+    tables = [t for t in (spec or []) if isinstance(t, dict)]
+    if not tables:
+        return 0
+    return int(round(sum(table_ms(t, per) + BUILD_BETWEEN_MS for t in tables) + BUILD_HOLD_MS))
+
+
+def _stage(ev: dict, name: str) -> Any:
+    for s in ev.get("stages") or []:
+        if isinstance(s, dict) and s.get("stage") == name:
+            return s
+    return None
+
+
+def _cands(s: Any) -> list:
+    return list((s or {}).get("candidates") or []) if isinstance(s, dict) else []
+
+
+def spec_of_event(ev: Any) -> dict | None:
+    """One decision as the card draws it (script-page.js mvDecisionRow):
+    None when a rule decided it (no dice), else its shape - a sub-result?,
+    how many rejected candidates on each stage, failed?"""
+    if not isinstance(ev, dict):
+        return None
+    st = [s for s in (ev.get("stages") or []) if isinstance(s, dict)]
+    drawn = next((s for s in st if isinstance(s.get("draw"), dict) and s["draw"].get("dice") is not None), None)
+    rng = (ev.get("rng") or {}).get("dice") if isinstance(ev.get("rng"), dict) else None
+    if drawn is None and rng is None:
+        return None
+    reels = [s for s in st if s.get("stage") != "table" and len(_cands(s)) > 1 and s.get("selected") is not None]
+    cat, item = _stage(ev, "category"), _stage(ev, "item")
+    if cat is not None and len(_cands(cat)) > 1:
+        main, sub = cat, (item if item is not None and len(_cands(item)) > 1 else None)
+    elif item is not None and len(_cands(item)) > 1:
+        main = item
+        k = next((i for i, s in enumerate(reels) if s is item), -1)
+        sub = reels[k + 1] if k >= 0 and k + 1 < len(reels) else None
+    else:
+        main = reels[0] if reels else None
+        sub = reels[1] if len(reels) > 1 else None
+    vrej = sum(1 for s in st for v in (s.get("verdicts") or [])
+               if isinstance(v, dict) and v.get("eligible") is False)
+    rej = (min(BUILD_REJ_MAX, len((main or {}).get("excluded") or [])) if main else 0) + min(BUILD_REJ_MAX, vrej)
+    rej2 = min(BUILD_REJ_MAX, len((sub or {}).get("excluded") or [])) if sub else 0
+    sel = ev.get("selected") if isinstance(ev.get("selected"), dict) else {}
+    failed = str(sel.get("id") or "").upper() in ("PASS", "NONE")
+    return {"sub": sub is not None, "rej": rej, "rej2": rej2, "failed": failed,
+            "event": str(ev.get("event_id") or ""), "family": str(ev.get("family") or "")}
+
+
+CLIP_TABLE = {"sub": True, "rej": 0, "rej2": 0, "failed": False}
+
+
+def _runtime() -> Any:
+    fn = _door("system3_roll")
+    return getattr(fn, "__self__", None)
+
+
+def _conv(cid: str) -> Any:
+    try:
+        rt = _runtime()
+        return (rt.recent.get(str(cid)) if rt is not None and cid else None)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _claimed(key: str) -> set:
+    global _CLAIMED
+    if _CLAIMED is None:
+        from collections import OrderedDict
+        _CLAIMED = OrderedDict()
+    got = _CLAIMED.get(key)
+    if got is None:
+        got = _CLAIMED[key] = set()
+        while len(_CLAIMED) > 400:
+            _CLAIMED.popitem(last=False)
+    return got
+
+
+def turn_spec(conv: Any, turn_id: str, who: str = "", claim: bool = True) -> list[dict]:
+    """The tables a line of `turn_id` brings to its card: the turn's decisions
+    (and its speakerbox, sting and SFX Guy nodes, as /api/system3/line joins
+    them), the SFX Guy's own family only for his line - less every event a
+    card of this turn already rolled."""
+    if not isinstance(conv, dict) or not turn_id:
+        return []
+    turn = next((t for t in conv.get("turns") or [] if isinstance(t, dict) and t.get("turn_id") == turn_id), None)
+    if turn is None:
+        return []
+    ids = {d.get("event_id") for d in turn.get("decisions") or [] if isinstance(d, dict)}
+    ids |= {sb.get("event_id") for sb in turn.get("speakerbox") or [] if isinstance(sb, dict)}
+    ids.add((turn.get("sfx") or {}).get("event_id") if isinstance(turn.get("sfx"), dict) else None)
+    ids.add((turn.get("sfxguy") or {}).get("event_id") if isinstance(turn.get("sfxguy"), dict) else None)
+    ids.discard(None)
+    cid = str(((conv.get("identity") or {}).get("conversation_id")) or "")
+    seen = _claimed(cid + "|" + str(turn_id))
+    out = []
+    for ev in conv.get("decision_events") or []:
+        if not isinstance(ev, dict) or ev.get("event_id") not in ids:
+            continue
+        if str(who or "") == "drop" and str(ev.get("family") or "") != "SFXGUY":
+            continue
+        t = spec_of_event(ev)
+        if t is None or t["event"] in seen:
+            continue
+        out.append(t)
+    if claim:
+        seen.update(t["event"] for t in out)
+    return out
+
+
+def _measured(ms: int) -> None:
+    n = _BUILD_STATS["n"] = min(200.0, _BUILD_STATS["n"] + 1.0)
+    _BUILD_STATS["mean"] += (float(ms) - _BUILD_STATS["mean"]) / n
+
+
+def buildup_of_line(meta: Any, who: str, text: str) -> int:
+    """A burst row's buildup: a sting off the board is its clip's table; a
+    line is its turn's fresh tables. 0 when System 3 did not make it."""
+    try:
+        if str(who or "") == "board":
+            return buildup_ms([CLIP_TABLE])
+        fn = _door("bank_s3_of")
+        s3 = fn(meta) if fn else {}
+        cid = str((s3 or {}).get("conversation_id") or "")
+        conv = _conv(cid)
+        if conv is None:
+            return 0
+        find = _door("system3_turn_id_for")
+        tid = str(find(meta, str(text or ""), str(who or "")) or "") if find and text else ""
+        ms = buildup_ms(turn_spec(conv, tid, who))
+        _measured(ms)
+        return ms
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def buildup_of_clip(clip: Any) -> int:
+    """A clip's buildup: a round's is its first line's (the burst worked it
+    out); a sting's is its clip's table; a single line's is its node's."""
+    try:
+        if not isinstance(clip, dict):
+            return 0
+        rows = (clip.get("stream") or {}).get("rows") if isinstance(clip.get("stream"), dict) else None
+        if rows:
+            return int(_num((rows[0] or {}).get("buildup_ms"), 0))
+        url = str(clip.get("url") or "")
+        if clip.get("sting") or url.startswith("/sfx/"):
+            return buildup_ms([CLIP_TABLE])
+        stamp = clip.get("system3") if isinstance(clip.get("system3"), dict) else None
+        if not stamp:
+            book = _door("_S3_LINE_BY_ID") or {}
+            stamp = book.get(str(clip.get("row_id") or clip.get("line") or "")) if isinstance(book, dict) else None
+        if not isinstance(stamp, dict) or not stamp.get("conversation_id"):
+            return 0
+        conv = _conv(str(stamp["conversation_id"]))
+        if conv is None:
+            return 0
+        tid = str(stamp.get("turn_id") or "")
+        if not tid:
+            turns = conv.get("turns") or []
+            tid = str((turns[0] or {}).get("turn_id") or "") if len(turns) == 1 else ""
+        ms = buildup_ms(turn_spec(conv, tid, str(clip.get("who") or "")))
+        _measured(ms)
+        return ms
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def expected_buildup_s() -> float:
+    """The planner's buildup per line: the measured mean, the contract's
+    guess of BUILD_DEFAULT_TABLES plain tables before anything is measured,
+    none while System 3 is not making the lines."""
+    try:
+        active = _door("_s3_active")
+        if callable(active) and not active():
+            return 0.0
+    except Exception:  # noqa: BLE001
+        return 0.0
+    if _BUILD_STATS["n"] >= 3:
+        return round(_BUILD_STATS["mean"] / 1000.0, 3)
+    return round(buildup_ms([{"sub": False}] * BUILD_DEFAULT_TABLES) / 1000.0, 3)
+
+
+def planner_seam() -> float:
+    """One seam between two messages as the air runs it: the pause (the
+    expected one when it rolls) and the next card's buildup."""
+    return round(expected_gap() + expected_buildup_s(), 3)
+
+
+def contract() -> dict[str, Any]:
+    """The timing contract, as GET /api/reply-gap publishes it."""
+    return {"per_ms": BUILD_PER_MS, "one": list(BUILD_ONE), "two": list(BUILD_TWO),
+            "rej_each_ms": BUILD_REJ_EACH_MS, "rej_base_ms": BUILD_REJ_BASE_MS,
+            "rej_cap": BUILD_REJ_CAP, "rej_max": BUILD_REJ_MAX, "fail_ms": BUILD_FAIL_MS,
+            "between_ms": BUILD_BETWEEN_MS, "hold_ms": BUILD_HOLD_MS,
+            "expected_buildup_s": expected_buildup_s(), "planner_seam_s": planner_seam()}
 
 
 # ------------------------------------------------------------- the page door
@@ -512,7 +796,7 @@ def is_message(clip: Any) -> bool:
 
 
 def door(clip: Any, air_until: float, earliest: float, tail_of: Any = None,
-         rng: Any = None) -> float | None:
+         rng: Any = None, build_of: Any = None) -> float | None:
     """When this message may start (seconds), with its pause stamped on it
     (`gap_before`) - or None: not a message, or already seamed (a recovered
     clip keeps what it had), and the door's old rule stands.
@@ -532,31 +816,45 @@ def door(clip: Any, air_until: float, earliest: float, tail_of: Any = None,
             return None
         own = float(clip.get("broadcast_ms") or 0) / 1000.0
         air = float(air_until or 0)
+        now = time.time()
         mine = abs(float(_BOOKED.get("until") or 0) - air) <= BOOKED_MATCH_S
         prev_tail = float(_BOOKED.get("tail") or 0) if mine else 0.0
         words_end = air - prev_tail
-        s = settings()
-        reach = window(s)[1] if s["roll"] else s["gap"]
-        # A seam needs a message that ends there: the cursor is the end of the
-        # clip booked last, or clips are booked past the earliest start. The
-        # page's own floor (now + lead, nothing booked) is free air.
-        booked_ahead = mine or air > float(earliest) + 0.01
-        if not booked_ahead or words_end + reach <= float(earliest):
-            return max(own, air)                 # the air is quiet: no seam
+        # [reply-gap:buildup] the card's whole Rolodex plays before the words:
+        # its length is in the schedule, and the page learns of the clip in
+        # time to play all of it
+        build = int(buildup_of_clip(clip)) if build_of is None else int(build_of(clip) or 0)
+        clip["buildup_ms"] = build
+        learn = (now + build / 1000.0 + PAGE_LEARN_S) if build else 0.0
         _LAST_DOOR.update(rows=id(((clip.get("stream") or {}).get("rows")) or clip), start=0.0)
+        # A seam needs a message that ends there: the cursor is the end of the
+        # clip booked last, or clips are booked past the earliest start - or
+        # the last message ended moments ago and the air has only just gone
+        # quiet: EVERY message rolls ("I am seeing it skip rolling between
+        # replies"). Nothing said for SEAM_MEMORY_S: the air is quiet.
+        booked_ahead = mine or air > float(earliest) + 0.01
+        last_end = float(_BOOKED.get("until") or 0)
+        if not booked_ahead and last_end > now - SEAM_MEMORY_S:
+            booked_ahead = True
+            words_end = last_end - float(_BOOKED.get("tail") or 0)
+        if not booked_ahead:
+            start = max(own, air, learn)         # the air is quiet: no seam, no roll
+            _LAST_DOOR["start"] = float(start)
+            return start
         note = draw(clip.get("ready_round") if isinstance(clip.get("ready_round"), dict) else None,
                     str(clip.get("who") or ""), str(clip.get("text") or "")[:200], "",
                     "page", rng=rng)
-        floor = words_end + float(note["s"])
+        floor = words_end + float(note["s"]) + build / 1000.0
         if own <= air + 0.05:
             # it was only waiting for the air: the pause decides, into the
             # last clip's silent tail when the pause is shorter than it
-            start = max(float(earliest), floor)
+            start = max(float(earliest), floor, learn)
         else:
-            start = max(own, floor)              # held later by its own maker: never earlier
+            start = max(own, floor, learn)       # held later by its own maker: never earlier
         clip["gap_before"] = dict({k: note[k] for k in ("s", "rolled", "dice", "lo", "hi", "by", "id")
                                    if k in note},
                                   after=round(words_end, 3), tail=round(prev_tail, 3),
+                                  buildup_ms=build,
                                   overlap=round(max(0.0, air - start), 3))
         _LAST_DOOR["start"] = float(start)
         return start

@@ -379,6 +379,17 @@ def _read(path: Path) -> str:
     return raw
 
 
+# An insertion a later patch rewrites in place ([reply-gap:buildup] rewrites
+# the page helpers) is recognised by its header: never inserted twice.
+HELPER_HEAD = "/* [reply-gap:door] THE PAUSE BETWEEN MESSAGES, ON THIS PAGE."
+SENTINELS = {"panel helpers": (HELPER_HEAD, 1), "tune helpers": (HELPER_HEAD, 2)}
+
+
+def _sentinel(text: str, name: str) -> bool:
+    got = SENTINELS.get(name)
+    return bool(got) and text.count(got[0]) >= got[1]
+
+
 def _state(text: str, edits) -> tuple[int, list[str]]:
     # In order, as --apply would: a later edit may anchor on text an earlier
     # one inserts (the burst's start helper sits beside the door helpers).
@@ -386,7 +397,9 @@ def _state(text: str, edits) -> tuple[int, list[str]]:
     sim = text
     for name, old, new in edits:
         n_old, n_new = sim.count(old), sim.count(new)
-        if n_new == 1 and (n_old == 0 or (new.find(old) >= 0 and n_old == 1)):
+        if _sentinel(sim, name):
+            applied.append(name)
+        elif n_new == 1 and (n_old == 0 or (new.find(old) >= 0 and n_old == 1)):
             applied.append(name)
         elif n_old == 1:
             ready.append(name)
@@ -432,7 +445,7 @@ def main(argv: list[str]) -> int:
             return 1
         done = 0
         for name, old, new in edits:
-            if _is_applied(text, old, new):
+            if _sentinel(text, name) or _is_applied(text, old, new):
                 continue
             if text.count(old) != 1:
                 raise SystemExit("anchor %s: found %d times" % (name, text.count(old)))
