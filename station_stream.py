@@ -815,6 +815,13 @@ def _pause_set_open(row: dict[str, Any], offset: float) -> "_Voice | None":
     return voice
 
 
+def _stem16(pcm: Any) -> "np.ndarray | None":
+    """[mix-prime] A stem kept for the backlog: int16, clipped, a copy."""
+    if pcm is None:
+        return None
+    return np.clip(pcm, -32768, 32767).astype(np.int16)
+
+
 def _mixed_program(bed: np.ndarray, voice: np.ndarray | None,
                    voice_is_sfx: bool, mix: Any = None) -> bytes:
     """Mix one centred stereo programme frame for one listener's settings."""
@@ -1929,6 +1936,10 @@ class StationStream:
 
         self._pcm_burst: deque[bytes] = deque(
             maxlen=max(1, int(JOIN_BURST_SECONDS * 1000 / FRAME_MS)))
+        # [mix-prime] the same half-minute as STEMS: (frame, bed, voice,
+        # voice-is-a-sting) per entry, int16, so a personal-mix lane can be
+        # primed in its own balance. One ring, so frame and stems never drift.
+        self._stem_burst: deque = deque(maxlen=self._pcm_burst.maxlen)
 
         # What is on, for ICY metadata and /api/stream/state.
         self.now_title = ""
@@ -2014,6 +2025,31 @@ class StationStream:
     @staticmethod
     def _hls_key(split: Any, mix: Any) -> tuple[bool, tuple[int, int, int]]:
         return (bool(split), listener_mix(mix))
+
+    def _bank(self, frame: bytes, bed: Any, voice: Any, is_sfx: bool) -> None:
+        """[mix-prime] One frame of real programme into both backlogs."""
+        self._pcm_burst.append(frame)
+        self._stem_burst.append((frame, _stem16(bed), _stem16(voice), bool(is_sfx)))
+
+    def _burst_for(self, key: tuple[bool, tuple[int, int, int]]) -> list[bytes]:
+        """[mix-prime] The backlog in THIS lane's balance: the default lane's
+        frames as banked, a personal or split lane's re-mixed from the stems
+        (a frame banked without stems is handed over as it was)."""
+        if key == _DEFAULT_LANE:
+            return self._burst_copy()
+        split, mix = key
+        try:
+            stems = list(self._stem_burst)
+        except RuntimeError:
+            stems = list(self._stem_burst)
+        make = _split_program if split else _mixed_program
+        out: list[bytes] = []
+        for frame, bed, voice, is_sfx in stems:
+            if bed is None:
+                out.append(frame)
+            else:
+                out.append(make(bed, voice, is_sfx, mix))
+        return out
 
     def _burst_copy(self) -> list[bytes]:
         """The PCM backlog, copied. The mixer appends without our lock;
@@ -2126,7 +2162,7 @@ class StationStream:
                 f"hls lane {_lane_name(key)} refused: {refused}")
             return lane
         lane = _HlsEncoder(self._hls_root, key[1], key[0], bitrate)
-        lane.backlog = self._burst_copy
+        lane.backlog = lambda: self._burst_for(key)          # [mix-prime]
         if asked_at is not None:
             lane.asked_at = float(asked_at)
         # Measured BEFORE start(): the frames since this folder's newest
@@ -2143,7 +2179,7 @@ class StationStream:
         # frame and re-primes it in the right order, and a
         # restart racing it from the event loop could not.
         if lane.start():
-            backlog = self._burst_copy()
+            backlog = self._burst_for(key)                   # [mix-prime]
             if lost is not None and lane.start_info.get("how") == "resume":
                 backlog = backlog[-lost:] if lost > 0 else []
             lane.prime = backlog
@@ -3008,7 +3044,8 @@ class StationStream:
                 # nothing, which reads as broken. Off air, or on air with
                 # no record open yet, simply does not go in the bank.
                 if made_sound:
-                    self._pcm_burst.append(frame)
+                    self._bank(frame, bed, voice_pcm,           # [mix-prime]
+                               bool(airing is not None and airing.sfx))
                 # [pinelive] the recorder's tap: every frame, on air or
                 # off, with the input frame that went into it.
                 if self._taps:

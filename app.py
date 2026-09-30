@@ -272141,7 +272141,7 @@ function refreshPersonalMix() {
           mixNotApplied("the station did not answer");
         }
       });
-  }, 1500);
+  }, 700);   /* [mix-prime] one lane per listener bounds the encoders now */
 }
 function mixNotApplied(why) {
   const note = document.getElementById("note");
