@@ -256,6 +256,14 @@ class PineSamplerBridge(private val webView: WebView) {
     @JavascriptInterface
     fun sixteenLevelPitch(padIndex: Int): Double = PineSampler.sixteenLevelPitch(padIndex)
 
+    /** [levels-one] The Pads row of the one level system: the whole sampler's
+     *  master, 0..2 (pineLevels 'pads' x master). Returns the value in force. */
+    @JavascriptInterface
+    fun master(gain: Double): Double = PineSampler.setMasterGain(gain.toFloat()).toDouble()
+
+    @JavascriptInterface
+    fun masterLevel(): Double = PineSampler.masterGain().toDouble()
+
     @JavascriptInterface
     fun footprint(): String {
         val footprint = PineSampler.footprint()
@@ -745,6 +753,10 @@ class PineSamplerBridge(private val webView: WebView) {
      * itself. Exposed here so the tablet plays the ratio the engine tested
      * rather than a second copy of the formula. */
     sixteenLevelPitch: function (padIndex) { return native.sixteenLevelPitch(padIndex | 0); },
+
+    /* [levels-one] the Pads row of pineLevels, x the master */
+    master: function (v) { var n = Number(v); return native.master(isFinite(n) ? n : 1); },
+    masterLevel: function () { return native.masterLevel(); },
 
     footprint: function () { return JSON.parse(native.footprint()); },
     levels: function () { return JSON.parse(native.levels()); },

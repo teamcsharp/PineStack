@@ -188,6 +188,8 @@ class RailController(
         "voice" to rail.findViewById(R.id.vol_voice),
         "sfx" to rail.findViewById(R.id.vol_reply),
         "video" to rail.findViewById(R.id.vol_video),
+        "master" to rail.findViewById(R.id.vol_master),   // [levels-one]
+        "pads" to rail.findViewById(R.id.vol_pads),
     )
 
     private val volumeLabels: Map<String, TextView> = mapOf(
@@ -195,6 +197,8 @@ class RailController(
         "voice" to rail.findViewById(R.id.vol_voice_value),
         "sfx" to rail.findViewById(R.id.vol_reply_value),
         "video" to rail.findViewById(R.id.vol_video_value),
+        "master" to rail.findViewById(R.id.vol_master_value),   // [levels-one]
+        "pads" to rail.findViewById(R.id.vol_pads_value),
     )
 
     /** The last snapshot, painted or not. */
@@ -244,6 +248,7 @@ class RailController(
      *  station does not report a level for. See RailState.musicLevel. */
     private val localLevel = mutableMapOf(
         "music" to 100, "voice" to 100, "sfx" to 100, "video" to 100,
+        "master" to 100, "pads" to 100,   // [levels-one]
     )
 
     fun bind() {
@@ -1556,12 +1561,12 @@ class RailController(
         runScript(
             "(function(){try{" +
                 "var b=window.pineLevels,m=b&&b.get?b.get():{};" +
-                "return [m.music,m.voice,m.sfx,m.video];" +
+                "return [m.music,m.voice,m.sfx,m.video,m.master,m.pads];" +
             "}catch(e){return [];}})()",
         ) { answer ->
             try {
                 val values = org.json.JSONArray(answer)
-                val names = listOf("music", "voice", "sfx", "video")
+                val names = listOf("music", "voice", "sfx", "video", "master", "pads")   // [levels-one]
                 for (i in names.indices) {
                     val n = values.optDouble(i, Double.NaN)
                     if (!n.isNaN()) localLevel[names[i]] = Math.round(n * 100).toInt()
@@ -1959,6 +1964,8 @@ class RailController(
         "reply" -> "Replies"
         "sfx" -> "Clips / SFX"
         "video" -> "Videos"
+        "master" -> "Master"   // [levels-one]
+        "pads" -> "Pads"
         else -> value.ifBlank { "unknown" }
     }
 

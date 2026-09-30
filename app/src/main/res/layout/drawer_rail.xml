@@ -451,6 +451,41 @@
             android:layout_marginBottom="6dp"
             android:text="@string/rail_music_off" />
 
+    <!-- [levels-one] the MASTER every level follows - one set, station-wide -->
+    <LinearLayout style="@style/PineCard">
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Master"
+            android:textColor="@color/pine_ink"
+            android:textSize="14sp" />
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:gravity="center_vertical"
+            android:orientation="horizontal">
+
+            <SeekBar
+                android:id="@+id/vol_master"
+                android:layout_width="0dp"
+                android:layout_height="@dimen/tap"
+                android:layout_weight="1"
+                android:max="100"
+                android:progress="100" />
+
+            <TextView
+                android:id="@+id/vol_master_value"
+                android:layout_width="44dp"
+                android:layout_height="wrap_content"
+                android:gravity="end"
+                android:textColor="@color/pine_dim"
+                android:textSize="12sp"
+                tools:text="100%" />
+        </LinearLayout>
+    </LinearLayout>
+
     <LinearLayout style="@style/PineCard">
 
         <LinearLayout
@@ -705,6 +740,41 @@
 
             <TextView
                 android:id="@+id/vol_video_value"
+                android:layout_width="44dp"
+                android:layout_height="wrap_content"
+                android:gravity="end"
+                android:textColor="@color/pine_dim"
+                android:textSize="12sp"
+                tools:text="100%" />
+        </LinearLayout>
+    </LinearLayout>
+
+    <!-- [levels-one] the native sampler pads (the Oboe engine master) -->
+    <LinearLayout style="@style/PineCard">
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Pads"
+            android:textColor="@color/pine_ink"
+            android:textSize="14sp" />
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:gravity="center_vertical"
+            android:orientation="horizontal">
+
+            <SeekBar
+                android:id="@+id/vol_pads"
+                android:layout_width="0dp"
+                android:layout_height="@dimen/tap"
+                android:layout_weight="1"
+                android:max="200"
+                android:progress="100" />
+
+            <TextView
+                android:id="@+id/vol_pads_value"
                 android:layout_width="44dp"
                 android:layout_height="wrap_content"
                 android:gravity="end"

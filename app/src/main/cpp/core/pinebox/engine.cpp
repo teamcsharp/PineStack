@@ -1,6 +1,7 @@
 #include "pinebox/engine.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <set>
 
@@ -31,7 +32,15 @@ std::uint64_t parseVoiceId(const std::string& id) {
 SamplerCore::SamplerCore(int engineRate, int outChannels)
     : engineRate_(engineRate > 0 ? engineRate : kEngineRate),
       outChannels_(outChannels > 0 ? outChannels : kEngineChannels),
-      duck_(engineRate > 0 ? engineRate : kEngineRate) {}
+      duck_(engineRate > 0 ? engineRate : kEngineRate) {
+  /* [levels-one] One pole, per sample, time constant a third of the glide so
+   * a move is 95% of the way there in kMasterGlideSeconds. Worked out once
+   * here rather than per block because exp() has no business on the audio
+   * thread. */
+  const double tau = kMasterGlideSeconds / 3.0;
+  masterCoeff_ = static_cast<float>(
+      1.0 - std::exp(-1.0 / (tau * static_cast<double>(engineRate_))));
+}
 
 /* ---- pads ------------------------------------------------------------- */
 
@@ -464,6 +473,54 @@ void SamplerCore::timeStarts() {
 
 void SamplerCore::setDuckDepth(float depth) { duck_.setDepth(depth); }
 
+/* [levels-one] The one knob the page's level bus turns for the pads. A store
+ * and nothing else: the audio thread reads it at the top of its next block,
+ * so a slider dragged at sixty events a second costs sixty relaxed stores. */
+float SamplerCore::setMasterGain(float gain) {
+  float clean = gain;
+  if (!(clean >= 0.0f)) clean = 0.0f;   /* NaN fails every comparison */
+  if (clean > kMaxMasterGain) clean = kMaxMasterGain;
+  masterTarget_.store(clean, std::memory_order_relaxed);
+  return clean;
+}
+
+/* THE AUDIO THREAD. No allocation, no lock.
+ *
+ * At unity and settled - which is where the instrument sits unless somebody
+ * moved the slider - the block is not touched at all, so the pads sound
+ * exactly as they did before there was a master. Anywhere else every sample
+ * is scaled and clamped to [-1, 1]: this engine has no limiter, and a boost
+ * past full scale has to stop somewhere better than the HAL's wrap.
+ *
+ * While the gain is moving it moves PER SAMPLE, not per block. A block-wise
+ * step at a 4 ms burst is a 250 Hz zipper on a held pad; a one-pole per frame
+ * is a multiply and an add. The glide ends by snapping onto the target once
+ * it is within a ten-thousandth of it, so the settled test above is exact
+ * and a stopped slider stops costing anything but the clamp. */
+void SamplerCore::applyMaster(float* out, int frames) {
+  const float target = masterTarget_.load(std::memory_order_relaxed);
+  float gain = masterNow_;
+  if (gain == target && target == 1.0f) return;
+  const int channels = outChannels_;
+  if (gain == target) {
+    const int samples = frames * channels;
+    for (int i = 0; i < samples; ++i) {
+      out[i] = std::min(1.0f, std::max(-1.0f, out[i] * gain));
+    }
+    return;
+  }
+  const float coeff = masterCoeff_;
+  for (int f = 0; f < frames; ++f) {
+    gain += (target - gain) * coeff;
+    float* frame = out + static_cast<long>(f) * channels;
+    for (int c = 0; c < channels; ++c) {
+      frame[c] = std::min(1.0f, std::max(-1.0f, frame[c] * gain));
+    }
+  }
+  if (std::fabs(target - gain) < 1.0e-4f) gain = target;
+  masterNow_ = gain;
+}
+
 /* ---- the callback ------------------------------------------------------ */
 
 void SamplerCore::render(float* out, int frames) {
@@ -474,6 +531,9 @@ void SamplerCore::render(float* out, int frames) {
   const int ringing =
       renderBlock(rt_, kMaxVoices, out, frames, outChannels_, engineRate_);
   ringing_.store(ringing, std::memory_order_relaxed);
+  /* [levels-one] After the pad mix, before the block leaves: the master is
+   * the last thing between the pads and the device. */
+  applyMaster(out, frames);
   duckGain_.store(duck_.advance(ringing, frames), std::memory_order_relaxed);
 }
 
