@@ -325,6 +325,27 @@
     ui.qList.hidden = true;
     qs.appendChild(ui.qList);
     foot.appendChild(qs);
+    /* [cam-files] the Pine Cam's videos kept on the Spark: play one here, copy
+       it to the recordings folder, delete it, or clear what the footage can
+       make again (thumbnails, re-encodes, window cuts). */
+    var cs = make('div', 'fm-restore fm-cam');
+    var ch = make('button', 'fm-restore-head');
+    ch.type = 'button';
+    ch.title = 'The videos the Pine Cam recorded, kept on the Spark';
+    ch.appendChild(ico('c:recording--filled', ''));
+    ch.appendChild(make('span', '', 'Pine Cam videos'));
+    ui.camCount = make('span', 'fm-restore-n', '');
+    ch.appendChild(ui.camCount);
+    ch.addEventListener('click', function () {
+      ui.camOpen = !ui.camOpen;
+      paintCam();
+      if (ui.camOpen) loadCam(true);
+    });
+    cs.appendChild(ch);
+    ui.camList = make('div', 'fm-restore-list fm-cam-list');
+    ui.camList.hidden = true;
+    cs.appendChild(ui.camList);
+    foot.appendChild(cs);
     /* [memprefs] the tablet's memory limits, as preferences */
     var ms = make('div', 'fm-restore fm-memprefs');
     var mh = make('div', 'fm-restore-head');
@@ -391,12 +412,14 @@
     loadGroups(false);
     loadJobs();
     loadQuarantine();     /* [qrelease] */
+    loadCam(ui.camOpen);  /* [cam-files] */
   }
   function closePopup() {
     if (!ui.pop) return;
     ui.visible = false;
     ui.pop.hidden = true;
     cancelHold();
+    camStop();            /* [cam-files] a closed popup plays nothing */
     var j = ui.jobs && ui.jobs.jobs && ui.jobs.jobs[0];
     if (j && (j.state === 'done' || j.state === 'failed') && load(JOB_KEY) === j.id) store(JOB_KEY, null);
     paintBadge();
@@ -834,6 +857,186 @@
     });
     if (clips.length > 80) {
       ui.qList.appendChild(make('div', 'fm-dim', '... and ' + (clips.length - 80) + ' more - release their folder'));
+    }
+  }
+
+  /* ================================================== [cam-files] Pine Cam videos */
+
+  var CAM_KIND = {footage: 'Footage', kept: 'Kept', cut: 'Cut', album: 'Album cut', screen: 'Screen'};
+  var CAM_PAGE = 40;
+
+  function loadCam(withList) {
+    var jobs = [get('/api/pinecam/storage')];
+    if (withList) jobs.push(get('/api/pinecam/recordings'));
+    return Promise.all(jobs).then(function (got) {
+      ui.camStore = got[0] || {};
+      if (withList) { ui.camItems = (got[1] && got[1].items) || []; ui.camShown = CAM_PAGE; }
+      ui.camError = '';
+      paintCam();
+    }, function (e) {
+      ui.camError = e.message;
+      paintCam();
+    });
+  }
+  function camStop() {
+    if (!ui.camPlayer) return;
+    var v = ui.camPlayer.querySelector('video');
+    if (v) { try { v.pause(); v.removeAttribute('src'); v.load(); } catch (err) { /* gone */ } }
+    ui.camPlayer.textContent = '';
+    ui.camPlayer.hidden = true;
+    ui.camPlaying = '';
+  }
+  function camPlay(x) {
+    camStop();
+    var head = make('div', 'fm-cam-ph');
+    head.appendChild(make('b', '', (CAM_KIND[x.kind] || x.kind) + ' - ' + when(x.at)));
+    var shut = make('button', 'fm-iconbtn');
+    shut.type = 'button';
+    shut.title = 'Close the player';
+    shut.setAttribute('aria-label', 'Close the player');
+    shut.appendChild(ico('c:close--filled', 'X'));
+    shut.addEventListener('click', camStop);
+    head.appendChild(shut);
+    ui.camPlayer.appendChild(head);
+    var v = document.createElement('video');
+    v.controls = true;
+    v.playsInline = true;
+    v.preload = 'metadata';
+    v.src = stationUrl(x.url);
+    ui.camPlayer.appendChild(v);
+    ui.camPlayer.hidden = false;
+    ui.camPlaying = x.name;
+    try { v.play(); } catch (err) { /* the controls are there */ }
+  }
+  function camSay(row, text, bad) {
+    var old = row.querySelector('.fm-cam-say');
+    if (old) old.remove();
+    row.appendChild(make('div', 'fm-cam-say ' + (bad ? 'fm-sum-refuse' : 'fm-dim'), text));
+  }
+  function camButton(mark, fallback, title, fn) {
+    var b = make('button', 'fm-iconbtn');
+    b.type = 'button';
+    b.title = title;
+    b.setAttribute('aria-label', title);
+    b.appendChild(ico(mark, fallback));
+    b.addEventListener('click', function (e) { e.stopPropagation(); fn(b); });
+    return b;
+  }
+  function camHold(mark, word, title, cls, fire) {
+    var b = make('button', 'fm-exec fm-danger ' + cls);
+    b.type = 'button';
+    b.title = title;
+    b.setAttribute('aria-label', title);
+    b.appendChild(make('span', 'fm-exec-fill'));
+    b.appendChild(ico(mark, ''));
+    if (word) b.appendChild(make('span', 'fm-exec-word', word));
+    wireHold(b, fire);
+    return b;
+  }
+  function camRow(x) {
+    var off = !!(x.writing || x.broken);
+    var row = make('div', 'fm-snap fm-cam-row');
+    var th = document.createElement('img');
+    th.className = 'fm-cam-thumb';
+    th.alt = '';
+    th.loading = 'lazy';
+    if (!off) th.src = stationUrl('/api/pinecam/thumb/' + encodeURIComponent(x.name));
+    th.onerror = function () { th.style.visibility = 'hidden'; };
+    row.appendChild(th);
+    var words = make('div', 'fm-snap-words');
+    words.appendChild(make('b', '', (CAM_KIND[x.kind] || x.kind) + ' - ' + when(x.at)));
+    words.appendChild(make('span', 'fm-dim', x.name + ' - ' + bytes(x.bytes)
+      + (x.writing ? ' - recording now' : x.broken ? ' - unreadable (cut short by a restart)' : '')));
+    row.appendChild(words);
+    var btns = make('div', 'fm-cam-btns');
+    var play = camButton('c:play--filled--alt', '>', 'Play it here', function () { camPlay(x); });
+    var exp = camButton('c:export', 'E', 'Copy it to ' + ((ui.camStore && ui.camStore.dest) || 'the recordings folder'),
+      function (b) {
+        b.disabled = true;
+        camSay(row, 'Handing it to the courier...');
+        post('/api/pinecam/export', {name: x.name}).then(function (r) {
+          camSay(row, (r && r.say) || (r && r.ok ? 'On its way' : 'It did not go'), !(r && r.ok));
+          b.disabled = false;
+        }, function (e) { camSay(row, 'Refused: ' + e.message, true); b.disabled = false; });
+      });
+    var del = camHold('c:trash-can', '', 'Hold to delete it from the Spark', 'fm-cam-del', function (b) {
+      b.disabled = true;
+      post('/api/pinecam/delete', {names: [x.name]}).then(function (r) {
+        if (r && r.deleted && r.deleted.length) {
+          if (ui.camPlaying === x.name) camStop();
+          ui.camItems = (ui.camItems || []).filter(function (y) { return y.name !== x.name; });
+          loadCam(false);
+          return;
+        }
+        camSay(row, (r && r.say) || 'It was not deleted', true);
+        b.disabled = false;
+      }, function (e) { camSay(row, 'Refused: ' + e.message, true); b.disabled = false; });
+    });
+    play.disabled = off;
+    exp.disabled = off;
+    del.disabled = !!x.writing;
+    btns.appendChild(play);
+    btns.appendChild(exp);
+    btns.appendChild(del);
+    row.appendChild(btns);
+    return row;
+  }
+  function paintCam() {
+    if (!ui.camList) return;
+    var s = ui.camStore;
+    ui.camCount.textContent = ui.camError ? '?' : (s ? count(s.files - ((s.cache && s.cache.files) || 0), 'video')
+      + ' - ' + bytes(s.bytes) : '');
+    ui.camList.hidden = !ui.camOpen;
+    if (!ui.camOpen) return;
+    var playing = ui.camPlayer && !ui.camPlayer.hidden;
+    if (!playing) {
+      ui.camList.textContent = '';
+      ui.camPlayer = null;
+    } else {
+      /* keep the player that is showing; repaint everything under it */
+      while (ui.camPlayer.nextSibling) ui.camList.removeChild(ui.camPlayer.nextSibling);
+      while (ui.camList.firstChild !== ui.camPlayer) ui.camList.removeChild(ui.camList.firstChild);
+    }
+    if (ui.camError) {
+      ui.camList.appendChild(make('div', 'fm-sum-refuse', 'Could not read the Pine Cam videos: ' + ui.camError));
+      return;
+    }
+    if (s) {
+      var sum = make('div', 'fm-cam-sum');
+      var part = function (label, r) { return r && r.files ? label + ' ' + count(r.files, 'file') + ', ' + bytes(r.bytes) : ''; };
+      sum.appendChild(make('span', 'fm-dim', [part('footage', s.footage), part('kept', s.kept),
+        part('album cuts', s.album), part('cache', s.cache)].filter(Boolean).join(' - ') || 'Nothing kept.'));
+      sum.appendChild(make('span', 'fm-dim', 'Exports go to ' + (s.dest || 'no folder yet')
+        + '. The footage rolls off by itself after two days.'));
+      var cache = camHold('c:trash-can', 'Hold to clear the cache (' + bytes((s.cache && s.cache.bytes) || 0) + ')',
+        'Thumbnails, re-encoded copies and window cuts - all made again from the footage when asked',
+        'fm-restore-btn', function (b) {
+          b.disabled = true;
+          post('/api/pinecam/clear-cache', {}).then(function (r) {
+            sum.appendChild(make('div', 'fm-dim', (r && r.say) || 'Cleared'));
+            root.setTimeout(function () { loadCam(false); }, 1200);
+          }, function (e) { sum.appendChild(make('div', 'fm-sum-refuse', 'Refused: ' + e.message)); b.disabled = false; });
+        });
+      cache.disabled = !(s.cache && s.cache.files);
+      sum.appendChild(cache);
+      ui.camList.appendChild(sum);
+    }
+    if (!ui.camPlayer) {
+      ui.camPlayer = make('div', 'fm-cam-player');
+      ui.camPlayer.hidden = true;
+      ui.camList.appendChild(ui.camPlayer);
+    } else {
+      ui.camList.insertBefore(ui.camList.lastChild, ui.camPlayer);   /* the summary above the player */
+    }
+    var items = ui.camItems;
+    if (!items) { ui.camList.appendChild(make('div', 'fm-dim', 'Reading the videos...')); return; }
+    if (!items.length) { ui.camList.appendChild(make('div', 'fm-dim', 'The Pine Cam has nothing kept.')); return; }
+    items.slice(0, ui.camShown || CAM_PAGE).forEach(function (x) { ui.camList.appendChild(camRow(x)); });
+    if (items.length > (ui.camShown || CAM_PAGE)) {
+      var more = make('button', 'fm-restore-head fm-cam-more', 'Show ' + Math.min(CAM_PAGE, items.length - ui.camShown) + ' more');
+      more.type = 'button';
+      more.addEventListener('click', function () { ui.camShown += CAM_PAGE; paintCam(); });
+      ui.camList.appendChild(more);
     }
   }
 
