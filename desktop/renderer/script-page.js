@@ -114,6 +114,15 @@
   var selfScrollUntil = 0;          /* a scroll WE started, not the operator */
   var adrift = 0;                   /* #1282: consecutive off-screen reads */
   var handAt = 0;                   /* [autoscroll-rule] the last wheel/touch/key on it */
+  /* [reader-hold] "if I'm scrolling the view and I'm looking at an area of the
+     view, don't reset the view. I'm over here trying to read these elements and
+     it's resetting the view." A hand that MOVES the pane holds it: no follow and
+     no stick-to-end moves it again - not even with the line on air still in
+     view (reading the round around the live line re-armed the follow, and the
+     next line re-seated the pane under the reader). Only the operator's own
+     "Back to the line on air" - the jump button, the readout - lets go. */
+  var readerHeld = false;
+  var readerTop = 0;
   var folded = Object.create(null);   /* #1285: seg id -> folded? */
   var byHand = Object.create(null);   /* #1285: the operator said so */
   var liveSeg = '';                   /* #1285: the segment on air */
@@ -1942,6 +1951,7 @@
      too; the prompt history, when it is open and can say which request
      wrote that line, goes to it (PinePromptHistory.jumpTo). */
   function airJump(reason) {
+    readerHeld = false;                                   /* [reader-hold] asked for: follow again */
     var done = resumeAirFollow(reason);
     if (s3Mode !== 'script' && s3View && typeof s3View.jumpToAir === 'function') {
       /* [tablet-perf] THE LINE ON THE CARD, not the views' focus line -
@@ -18308,7 +18318,7 @@
        lit line brought back - never moves the pane under an operator who is
        examining something in it. Restores, folds and the operator's own
        jumps still run: they keep a place, or were asked for. */
-    if ((reason === 'end' || /^follow/.test(String(reason))) && scriptExamining(box)) {
+    if ((reason === 'end' || /^follow/.test(String(reason))) && (readerHeld || scriptExamining(box))) {   /* [reader-hold] */
       scrollLog.push({at: Date.now(), why: 'held:' + reason, top: Math.round(box.scrollTop)});
       if (scrollLog.length > 40) scrollLog.shift();
       return false;
@@ -22895,6 +22905,7 @@
    * competing crawl, reopen the live segment, center the current admitted
    * line, and leave following armed for every line after it. */
   function resumeAirFollow(reason) {
+    readerHeld = false;                /* [reader-hold] every caller is the operator asking for the air */
     if (crawlStop) crawlStop();
     follow = true;
     adrift = 0;
@@ -23469,6 +23480,12 @@
       var hand = Date.now() - handAt < 600;
       if (Date.now() < selfScrollUntil && !hand) return;   /* our own scroll, in flight */
       stick = script.scrollTop + script.clientHeight >= script.scrollHeight - 40;
+      /* [reader-hold] a hand that moved the pane holds it where it put it */
+      if (hand && Math.abs(script.scrollTop - readerTop) > 2) {
+        if (!readerHeld) { readerHeld = true; scriptJumpNote(); }
+        follow = false;
+      }
+      readerTop = script.scrollTop;
       /* Scrolling by hand means "let me read"; following would yank the
          page back every quarter second. Tapping the readout resumes it. */
       /* #1282: TWICE, NOT ONCE. Following used to end the first time
@@ -23482,7 +23499,7 @@
         var box = script.getBoundingClientRect();
         var seat = node.getBoundingClientRect();
         var here = seat.bottom > box.top && seat.top < box.bottom;
-        if (here) { adrift = 0; follow = true; scriptJumpClear(); }   // [autoscroll-rule]
+        if (here && !readerHeld) { adrift = 0; follow = true; scriptJumpClear(); }   // [autoscroll-rule] [reader-hold]
         else if ((adrift += 1) >= 2 || hand) { follow = false; }
       } else if (nowLineId === '') {
         /* #1270 leaves this empty while the line has not arrived. The
