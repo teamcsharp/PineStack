@@ -95,6 +95,10 @@ object AirReceivers {
     /** The body for "only this one". */
     fun only(id: String): String = JSONObject().put("only", id).toString()
 
+    /** [radio-tap] The row tap: this one on AND the radio, nothing else off. */
+    fun radio(id: String): String =
+        JSONObject().put("id", id).put("audible", true).put("radio", true).toString()
+
     /**
      * What a tap looks like THE MOMENT it lands, before the station answers:
      * the switch moved and the row marked pending. The station's answer then
@@ -113,6 +117,14 @@ object AirReceivers {
                 it.id == "car" -> it.copy(active = false)
                 else -> it.copy(audible = false, active = false)
             }
+        })
+
+    /** [radio-tap] the row tap: on and the active radio; the others keep
+     *  their switches, only the badge moves. */
+    fun optimisticRadio(state: State, id: String): State =
+        state.copy(active = id, receivers = state.receivers.map {
+            if (it.id == id) it.copy(audible = true, active = true)
+            else it.copy(active = false)
         })
 
     /** The ids a write is waiting on, so no poll repaints them meanwhile. */
