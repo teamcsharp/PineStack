@@ -779,6 +779,42 @@ def listener_mix(raw: Any = None) -> tuple[int, int, int]:
         return (100, 100, 100)
 
 
+def _pause_set_pick(rows: list[dict[str, Any]], now: float
+                    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """[pause-bed] (the set clip whose slot holds `now`, the next one due
+    within two seconds). The latest start wins, so a re-planned set that
+    rings a new clip over a withdrawn one is followed, not the old plan."""
+    cur = nxt = None
+    for row in rows:
+        try:
+            at = float(row.get("air_at") or 0)
+            span = float(row.get("slot") or row.get("length") or 0)
+        except (TypeError, ValueError):
+            continue
+        if not at:
+            continue
+        if at <= now and (span <= 0 or now < at + span):
+            if cur is None or at >= float(cur["air_at"]):
+                cur = row
+        elif now < at <= now + 2.0:
+            if nxt is None or at < float(nxt["air_at"]):
+                nxt = row
+    return cur, nxt
+
+
+def _pause_set_open(row: dict[str, Any], offset: float) -> "_Voice | None":
+    """[pause-bed] a started decoder for one set clip, or None."""
+    path = str(row.get("path") or "")
+    if not path or not Path(path).is_file():
+        return None
+    voice = _Voice(str(row.get("key") or ""), float(row.get("air_at") or 0),
+                   path, float(row.get("length") or 0), True)
+    voice.decoder = _Decoder(path, offset)
+    if not voice.decoder.start():
+        return None
+    return voice
+
+
 def _mixed_program(bed: np.ndarray, voice: np.ndarray | None,
                    voice_is_sfx: bool, mix: Any = None) -> bytes:
     """Mix one centred stereo programme frame for one listener's settings."""
@@ -2627,6 +2663,12 @@ class StationStream:
         music: _Decoder | None = None
         music_id = ""
         pending: list[_Voice] = []
+        # [pause-bed] the endless set's clips while off air: the one sounding,
+        # the next one opened ahead, and the last key tried (never reopened).
+        set_rows: list[dict[str, Any]] = []
+        set_air: _Voice | None = None
+        set_next: _Voice | None = None
+        set_tried = ""
         airing: _Voice | None = None
         duck = 0.0                      # 0 = bed up, 1 = fully ducked
         lduck = 0.0                     # [pinelive] the live set's own duck
@@ -2759,6 +2801,8 @@ class StationStream:
                         voice.decoder.start()
                         pending.append(voice)
                     pending.sort(key=lambda v: v.air_at)
+                    set_rows = [r for r in (state.get("pause_set") or [])
+                                if isinstance(r, dict)]
 
                 paused = bool(state.get("paused"))
                 on_air = bool(state.get("on", True)) and not paused
@@ -2846,7 +2890,47 @@ class StationStream:
                         airing.decoder and airing.decoder.close()
                         airing = None
                     duck = 0.0
+                    # [pause-bed] ...unless the endless set is running: then
+                    # its clip is the bed, joined at the tube's own offset,
+                    # the next one opened a moment early so the seam is tight.
+                    cur_row, nxt_row = _pause_set_pick(set_rows, now)
+                    cur_key = str((cur_row or {}).get("key") or "")
+                    if set_air is not None and set_air.key != cur_key:
+                        set_air.decoder and set_air.decoder.close()
+                        set_air = None
+                    if (set_air is None and set_next is not None
+                            and set_next.key == cur_key):
+                        set_air, set_next = set_next, None
+                        set_tried = cur_key
+                    if set_air is None and cur_key and cur_key != set_tried:
+                        set_tried = cur_key
+                        set_air = _pause_set_open(
+                            cur_row, max(0.0, now - float(cur_row["air_at"])))
+                    nxt_key = str((nxt_row or {}).get("key") or "")
+                    if set_next is not None and set_next.key != nxt_key:
+                        set_next.decoder and set_next.decoder.close()
+                        set_next = None
+                    if set_next is None and nxt_key:
+                        set_next = _pause_set_open(nxt_row, 0.0)
+                    if set_air is not None and set_air.decoder is not None:
+                        raw, live = set_air.decoder.read_frame()
+                        if live:
+                            bed = _centered_pcm(raw)
+                            frame = _mixed_program(bed, None, False)
+                            made_sound = True
+                            self.stats["pause_set_frames"] = int(
+                                self.stats.get("pause_set_frames") or 0) + 1
+                        elif set_air.decoder.finished:
+                            set_air.decoder.close()
+                            set_air = None
+                    self.stats["pause_set"] = set_air.key if set_air else ""
                 else:
+                    if set_air is not None or set_next is not None:
+                        for _sv in (set_air, set_next):
+                            if _sv is not None and _sv.decoder is not None:
+                                _sv.decoder.close()
+                        set_air = set_next = None
+                        self.stats["pause_set"] = ""
                     voice_pcm = None
                     if airing is not None and airing.decoder is not None:
                         raw, live = airing.decoder.read_frame()
@@ -2940,7 +3024,7 @@ class StationStream:
                         self.stats["encoder_restarts"] += 1
                 is_sfx = bool(airing is not None and airing.sfx)
                 for hls in hlses:
-                    if not on_air or bed is None:
+                    if bed is None:        # [pause-bed] off air with a set = a bed
                         hshaped = frame
                     elif hls.split:
                         hshaped = _split_program(bed, voice_pcm, is_sfx,

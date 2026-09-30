@@ -90674,9 +90674,10 @@ async def sfx_video_cycle() -> None:
             # instead of racing it with a second ffmpeg; bounded as #1423
             # says and by SFX_LEVEL_WAIT, and the job finishes regardless.
             _lv_how = "raw"
+            _lv_path = pick                  # [pause-bed] the file the tube gets
             try:
-                _lv_how = (await sfx_level_for_air(
-                    pick, max(1.5, min(SFX_LEVEL_WAIT, room))))[1]
+                _lv_path, _lv_how = await sfx_level_for_air(
+                    pick, max(1.5, min(SFX_LEVEL_WAIT, room)))
             except asyncio.CancelledError:
                 raise
             except Exception:  # noqa: BLE001
@@ -90697,6 +90698,14 @@ async def sfx_video_cycle() -> None:
                 at_ms=int(start * 1000))
             plan.append({"sting": pick.stem, "start": start,
                          "end": start + seconds, "id": key})   # [#1200]
+            # [pause-bed] the set's own sound, kept where the stream can see
+            # it: while the station is paused the broadcast airs the clip the
+            # tube is showing instead of silence (_stream_snapshot).
+            _set_air = _SFX_CYCLE.setdefault("air", [])
+            _set_air.append({"key": "set|%s|%d" % (key, int(start * 1000)),
+                             "air_at": start, "slot": seconds, "length": real,
+                             "path": str(_lv_path)})
+            del _set_air[:-12]
             # #1433: EVERY clip the cycle rings, not only the SFX guy's.
             # _sfx_cycle_note below runs `if asked_who`, so the set's own
             # picks - almost all of them - were going out unrecorded, and a
@@ -164162,8 +164171,17 @@ def _stream_snapshot() -> dict[str, Any]:
                           # HTTP road, without its decode-to-wav).
                           "sfx": _u.startswith("/sfx/")})
 
-        return {"on": bool(_RADIO.get("on")), "paused": radio_paused(),
-                "music": music, "clips": clips,
+        # [pause-bed] off air, the endless set is what the house hears - so
+        # it is what the road hears too, not a held socket full of silence.
+        paused = radio_paused()
+        on = bool(_RADIO.get("on"))
+        pause_set: list[dict[str, Any]] = []
+        if (paused or not on) and sfx_video_mode_on():
+            for row in list(_SFX_CYCLE.get("air") or []):
+                if isinstance(row, dict) and row.get("path"):
+                    pause_set.append(dict(row))
+        return {"on": on, "paused": paused,
+                "music": music, "clips": clips, "pause_set": pause_set,
                 **pinelive.snapshot_extra()}     # [pinelive] the set, as the bed
     except Exception:  # noqa: BLE001
         # A broken snapshot must degrade to silence-on-a-held-socket,
