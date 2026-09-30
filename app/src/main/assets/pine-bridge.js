@@ -51,10 +51,21 @@
 
   /* Called by Kotlin via evaluateJavascript once the work is done. The
    * envelope is {id, ok:true, value} or {id, ok:false, error}. */
-  win.__pineBridgeSettle = function (id, envelopeJson) {
+  win.__pineBridgeSettle = function (id, envelopeJson, parked) {
+    /* [bridge-take] a big answer is parked natively and pulled here as a
+     * string, so it is never JavaScript SOURCE (see PineDesktopBridge.settle).
+     * Taken before the slot check: a late reply must still free its copy. */
+    if (parked) {
+      try { envelopeJson = typeof native.take === "function" ? native.take(id) : null; }
+      catch (err) { envelopeJson = null; }
+    }
     var slot = pending.get(id);
     if (!slot) return false;            /* already settled, or a late reply */
     pending["delete"](id);
+    if (parked && typeof envelopeJson !== "string") {
+      slot.reject(new Error("the bridge lost a large answer before the page took it"));
+      return true;
+    }
     var env;
     try {
       env = JSON.parse(envelopeJson);

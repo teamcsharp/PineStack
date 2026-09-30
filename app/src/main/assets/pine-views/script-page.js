@@ -6466,9 +6466,27 @@
     v.muted = true;
     v.setAttribute('muted', '');
     v.setAttribute('playsinline', '');
-    v.loop = true;
+    /* [bubble-once] NOT a loop. "It was a pine box ad stinger that was
+       looping in the background" - the receipts (data/sfx_display_receipts
+       .jsonl, surface "bubble") had PineBox-H3_00190_, a 10 s clip, up for
+       57 s, and 2-3 s stings for 79-159 s: the bubble looped for as long as
+       its line stayed the newest, which is however long the station took to
+       air the next thing - not the clip's own air. A pass that ends replays
+       only while the air still carries the clip (m.onAir, from the same
+       fraction the fill bar draws); otherwise the thumbnail comes back. */
+    v.loop = false;
     v.preload = 'auto';
     v.style.visibility = 'hidden';
+    v.addEventListener('ended', function () {
+      if (m.video !== v) return;
+      if (m.onAir) {
+        try { v.currentTime = 0; var again = v.play(); if (again && again.catch) again.catch(function () { /* the thumbnail stays */ }); }
+        catch (e) { /* the thumbnail stays */ }
+        return;
+      }
+      m.aired = true;
+      if (mv.video === m) mvVideoRelease();
+    });
     videoFirstFrame(v, function () {
       v.style.visibility = 'visible';
       /* [vcrfx: the clip comes on over its thumbnail] */
@@ -6495,16 +6513,19 @@
     m.video = v;
     mv.video = m;
     if (root.PineSfxSeen) { try { root.PineSfxSeen.track(v, {url: m.info.url, id: m.info.sid, sfx: m.info.sid, video: true, line: String((m.item && (m.item.line || m.item.id)) || ''), sting: String((m.item && (m.item.text || m.item.name)) || '')}, 'bubble'); } catch (e) { /* [sfxseen] the view stands without it */ } }
-    m.box.title = 'the clip itself, muted and looping - the air carries its sound';
+    m.box.title = 'the clip itself, muted, for as long as it is on the air - the air carries its sound';   /* [bubble-once] */
   }
   function mvMediaFrame(cur, f) {
     var m = cur.media;
     if (!m) return;
     if (m.mode === 'video') {
+      if (cur.phase !== 'air') m.aired = false;   /* [bubble-once] a pinned re-run is a new airing */
       if (cur.phase !== 'air' || !m.info.url || m.failed) return;
+      m.onAir = f !== null && f < 1;             /* [bubble-once] null: the air cannot say - one pass */
+      if (m.aired) return;
       if (!m.video) mvVideoStart(m, f);
       var v = m.video;
-      if (v && v.paused) { try { var pr = v.play(); if (pr && pr.catch) pr.catch(function () { /* the thumbnail stays */ }); } catch (e) { /* the thumbnail stays */ } }
+      if (v && v.paused && !v.ended) { try { var pr = v.play(); if (pr && pr.catch) pr.catch(function () { /* the thumbnail stays */ }); } catch (e) { /* the thumbnail stays */ } }
       return;
     }
     if (m.mode === 'audio' && cur.phase !== 'done') mvLedFrame(cur, m, f);
@@ -15691,8 +15712,19 @@
    *   - the CEILING is the operator's own control for this row: the Music
    *     level on the bus (this bar is its slider; the mixer dot moves the same
    *     number), clamped at 100%, times this terminal's HERE volume on the
-   *     element. 100% may reach full height, 50% half, 0 is the thin line.
+   *     element. 100% may reach full height, 0 is the thin line.
    *     The duck is deliberately NOT in it - that is the mix, not a hand;
+   *   - [meter1-db] the ceiling follows the level as it is HEARD, in dB, not
+   *     as a raw gain. "This element isn't increasing in vertical scale to
+   *     show the audio playing for music ... the amount that it goes out is
+   *     based on exactly the level I have the volume set." Measured on the
+   *     tablet 2026-09-30: Music at 0.0875 (a plainly audible record) capped
+   *     the row at 8.75% of 22 px - under 2 px, the dashed line - while the
+   *     raw reading peaked 0.40-0.51. A gain of 0.0875 is -21 dB; every
+   *     meter reads that as a bit over halfway, not as nothing. So the cap is
+   *     1 + dB/M1_CAP_DB (100% full, 50% ~0.87, 9% ~0.56, 1% ~0.17), never
+   *     under M1_CAP_MIN while the level is above zero, and 0 only at 0 -
+   *     monotonic, so every nudge of the slider still moves the ceiling;
    *   - each bar breathes: attack ~35 ms, release ~220 ms, time-based so the
    *     SCOPE_EVERY frame skip does not change the feel. Nothing here reads
    *     layout; it rides the card's existing rAF tick, which already stands
@@ -15705,6 +15737,8 @@
   var M1_ENV_DOWN = 3.0;    /* s - envelope release */
   var M1_ATTACK = 0.035;    /* s - bar attack */
   var M1_RELEASE = 0.22;    /* s - bar release */
+  var M1_CAP_DB = 48;       /* [meter1-db] dB below 100% where the ceiling reaches the floor */
+  var M1_CAP_MIN = 0.1;     /* [meter1-db] the ceiling of any level above zero */
   var m1 = {env: M1_FLOOR, bars: null, at: 0};
 
   function meterOneCap() {
@@ -15715,7 +15749,8 @@
       var vol = p ? Number(p.volume) : 1;
       if (p) cap *= p.muted ? 0 : (isFinite(vol) ? Math.max(0, Math.min(1, vol)) : 1);
     } catch (err) { /* no player here: the level alone */ }
-    return cap;
+    if (!(cap > 0)) return 0;                                    /* [meter1-db] */
+    return Math.max(M1_CAP_MIN, Math.min(1, 1 + (20 * Math.log(cap) / Math.LN10) / M1_CAP_DB));
   }
 
   function meterOneShape(state, reading, cap, nowMs) {
