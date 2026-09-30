@@ -6849,9 +6849,14 @@
         sources: mvSources(item, ans, got && got.turn, got && got.decisions),
         cid: String((ans && ans.line && ans.line.conversation_id) || ''),
         tid: String((got && got.turn && got.turn.turn_id) || ''), restamped: got && got.restamped || '',
-        stores: mvStores(item, ans, prov), origin: item.origin || null};    /* [msgdb] [rollplay] */
+        stores: mvStores(item, ans, prov), origin: item.origin || null,    /* [msgdb] [rollplay] */
+        answered: !!ans};                                                 /* [link-now] */
       return out;
     });
+    /* [link-now] "not directed by System 3" can mean "not filed YET": a line
+       reaches the feed before its link is written. That answer is never kept -
+       the next look asks again. */
+    p.then(function (o) { if (o && !o.answered && mv.answers[lid] === p) delete mv.answers[lid]; });
     mv.answers[lid] = p;
     mv.answerOrder.push(lid);
     while (mv.answerOrder.length > 24) delete mv.answers[mv.answerOrder.shift()];

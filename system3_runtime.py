@@ -265,6 +265,9 @@ class System3Runtime:
         # [s3-flow] the items recent rounds used (FAMILY:item), and what went to air lately
         self.recent_items = collections.deque(maxlen=80)
         self.recent_air = collections.deque(maxlen=300)
+        # [link-now] a committed round's line links, known the moment it commits;
+        # the store's single writer can be a minute behind the roll events
+        self.pending_links = collections.OrderedDict()
         # [s3-cast] the favourites that came up lately (they weigh a quarter at the
         # next draw) and each directive's airings; kept in data/system3_cast.json
         self.cast = {"fav_recent": [], "directive_spent": {}, "counted": []}
@@ -3935,6 +3938,17 @@ class System3Runtime:
                     **{k: s3[k] for k in _LINE_KEEPS if s3.get(k)}))        # [s3-sfx-roll] [s3-banks-roll]
             if not links:
                 return
+            # [link-now] 2026-09-30, the operator: "Why was no system three table
+            # roll for this item?" The manager's line was committed at :23 and
+            # linked at 1:11 - 48 s behind ~15 roll events a second on the one
+            # store thread - and a card that asked in between was told "not
+            # directed by System 3". The links are known now; the store catches up.
+            with self.lock:
+                for lines in links.values():
+                    for x in lines:
+                        self.pending_links[x["line_id"]] = x
+                while len(self.pending_links) > 600:
+                    self.pending_links.popitem(last=False)
             for cid, lines in links.items():
                 with self.lock:
                     self.metrics["lines_linked"] += len(lines)
@@ -4770,9 +4784,9 @@ def install(app, namespace):
     namespace["system3_direction_echo"] = rt.direction_echo                 # [s3-echo]
     namespace["system3_direct_line"] = system3_direct_line
     namespace["system3_bind_line"] = rt.bind_line
+    namespace["system3_link_line"] = rt.link_spoken                  # [s3-line-link]
     namespace["system3_line_chapter"] = rt.line_chapter
     namespace["system3_line_chapter_state"] = rt.line_chapter_state      # [s3-chain]
-    namespace["system3_link_line"] = rt.link_spoken                  # [s3-line-link]
     namespace["system3_observe_ledger"] = rt.observe_ledger
     namespace["system3_segment_block"] = rt.segment_block              # [s3-segment]
     namespace["system3_withhold"] = rt.withhold                        # [s3-withhold]
@@ -5243,8 +5257,22 @@ def install(app, namespace):
         host.require_read_auth(authorization)
         got = await rt.read(rt.store.line, line_id)
         if not got:
+            with rt.lock:                                                      # [link-now]
+                held = rt.pending_links.get(line_id)
+            got = dict(held) if held else None
+        if not got:
+            # [link-now] the station's own record, made the moment the line was
+            # spoken (_s3_line_remember) - the store's copy may still be queued
+            stamp = (namespace.get("_S3_LINE_BY_ID") or {}).get(str(line_id))
+            if isinstance(stamp, dict) and stamp.get("conversation_id"):
+                got = {"line_id": str(line_id), "conversation_id": stamp["conversation_id"],
+                       "turn_id": stamp.get("turn_id") or None, "who": "", "text": ""}
+        if not got:
             raise HTTPException(404, "line %s was not directed by System 3" % line_id)
         conv = await rt.read(rt.store.conversation, got["conversation_id"])
+        if not conv:
+            with rt.lock:                                                      # [link-now] not written yet
+                conv = rt.recent.get(got["conversation_id"])
         if not conv:
             raise HTTPException(404, "its conversation is past retention")
         turn = (next((t for t in conv["turns"] if t["turn_id"] == got["turn_id"]), None)
