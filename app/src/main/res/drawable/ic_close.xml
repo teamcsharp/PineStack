@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- [smart-reinit] Carbon "close" (IBM Carbon icons, close/32, Apache-2.0),
+     the same glyph pineIcon('c:close') draws on the page. House rule: every
+     popup has a close X in its top-right corner. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="20dp"
+    android:height="20dp"
+    android:viewportWidth="32"
+    android:viewportHeight="32">
+    <path
+        android:fillColor="@color/pine_ink"
+        android:pathData="M17.4141,16L24,9.4141 22.5859,8 16,14.5859 9.4143,8 8,9.4141 14.5859,16 8,22.5859 9.4143,24 16,17.4141 22.5859,24 24,22.5859 17.4141,16z" />
+</vector>

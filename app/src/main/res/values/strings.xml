@@ -18,7 +18,15 @@
     <string name="rail_music_back">Music back on</string>
     <string name="rail_fix">Reinitialise</string>
     <string name="rail_fix_go">↻   Get the broadcast back</string>
-    <string name="rail_fix_idle">one tap runs every fix we know</string>
+    <string name="rail_fix_idle">one tap finds what is wrong, fixes only that, then asks you</string>
+    <!-- [smart-reinit] the question after every cure -->
+    <string name="rail_fix_ask">Is the broadcast working now?</string>
+    <string name="rail_fix_yes">Yes</string>
+    <string name="rail_fix_no_music">No music</string>
+    <string name="rail_fix_no_djs">No DJs</string>
+    <string name="rail_fix_nothing">No sound at all</string>
+    <string name="rail_fix_other">Other</string>
+    <string name="rail_fix_close">Close - stop the repair here</string>
     <string name="rail_device">Device</string>
     <string name="rail_bluetooth">Bluetooth</string>
     <string name="rail_exit">Exit app</string>

@@ -114,6 +114,18 @@ class ScreenReplay(private val context: Context) {
         })
     }
 
+    /** [smart-reinit] Re-register the playback capture's policy (see
+     *  ReplayAudioCapture.reopen). The picture is not touched. */
+    fun reopenAudio(): String = audioCapture.reopen()
+
+    /** [smart-reinit] Let the playback capture go entirely: its policy is
+     *  unregistered, so nothing can hold the tablet's sound on the remote
+     *  submix. prime() - every onResume - starts it again. */
+    fun releaseAudio(): String {
+        audioCapture.stop()
+        return "released until the app next resumes"
+    }
+
     @Synchronized
     fun start(): String? {
         if (running.get()) { audioCapture.start(); return null }

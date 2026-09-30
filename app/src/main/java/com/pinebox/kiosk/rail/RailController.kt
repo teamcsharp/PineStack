@@ -22,8 +22,13 @@ import com.pinebox.kiosk.replay.ScreenReplay
 import com.pinebox.kiosk.net.StationClient
 import com.pinebox.kiosk.power.PowerWatch
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
+import kotlin.coroutines.resume
 import org.json.JSONObject
 
 /**
@@ -59,6 +64,8 @@ class RailController(
     private val repairAudioRoute: () -> String,
     private val openBluetooth: () -> Unit,
     private val exitToSystem: () -> Unit,
+    /** [smart-reinit] the terminal's own half of the doctor; null = none. */
+    private val doctor: DoctorHooks? = null,
 ) {
 
     private val conn: TextView = rail.findViewById(R.id.railConn)
@@ -95,6 +102,17 @@ class RailController(
     private val fixGo: Button = rail.findViewById(R.id.fixGo)
     private val fixNote: TextView = rail.findViewById(R.id.fixNote)
     private var fixRunning = false
+    /* [smart-reinit] the question after every cure */
+    private val fixAsk: View = rail.findViewById(R.id.fixAsk)
+    private val fixAskClose: View = rail.findViewById(R.id.fixAskClose)
+    private val fixOffer: Button = rail.findViewById(R.id.fixOffer)
+    private val fixAnswers: Map<String, View> = mapOf(
+        "yes" to rail.findViewById(R.id.fixYes),
+        "no_music" to rail.findViewById(R.id.fixNoMusic),
+        "no_djs" to rail.findViewById(R.id.fixNoDjs),
+        "nothing" to rail.findViewById(R.id.fixNothing),
+        "other" to rail.findViewById(R.id.fixOther),
+    )
 
     /* Native system routes stay available when the WebView itself is not. */
     private val bluetooth: Button = rail.findViewById(R.id.deviceBluetooth)
@@ -302,6 +320,10 @@ class RailController(
         }
 
         fixGo.setOnClickListener { reinitialise() }
+        for ((answer, chip) in fixAnswers) chip.setOnClickListener { doctorAnswer(answer) }
+        fixAskClose.setOnClickListener { doctorAnswer("stopped") }
+        fixOffer.setOnClickListener { doctorOffer() }
+        doctorResume()
         bluetooth.setOnClickListener { openBluetooth() }
         leaveApp.setOnClickListener { exitToSystem() }
 
@@ -923,272 +945,450 @@ class RailController(
         }
     }
 
-    /** A write that returns a dj_state object; its routing is adopted at once. */
     /**
-     * #1212/#1213: GET THE BROADCAST BACK, whatever it takes.
+     * #1212/#1213, rebuilt as [smart-reinit]: GET THE BROADCAST BACK.
      *
-     * Over 2026-09-11/12 every cure was found by hand and applied by hand,
-     * and the commonest of them - reload the page - had to be asked for in
-     * words four times, because THE ONE THING NO SERVER CAN DO IS RELOAD
-     * THIS WEBVIEW. A stale pause flag, a player holding a slot nothing
-     * will clear, a page running yesterday's code: all of them live on
-     * this side of the glass, and restarting the station reaches none of
-     * them.
+     * "Whenever I bring up the broadcast and I can't hear the music or the
+     *  DJs, I just click this button. So I need this button to intelligently
+     *  be able to tell what's needing to be done so it does that and doesn't
+     *  reinitialize things that don't need to be reinitialized ... and then
+     *  query me and ask me if the broadcast is working suitably and then from
+     *  there into troubleshooting before advancing to more advanced and
+     *  intense of steps." (the operator, 2026-09-30)
      *
-     * So the ladder runs from here, cheapest first, and stops the moment
-     * anybody reports hearing something. The station half of each rung is
-     * the same one the wedge console and the unattended watchdog press -
-     * one ladder, three ways in, so a cure can never exist in only one of
-     * them (see POST /api/broadcast/fix/{step}).
+     * It used to run every rung whatever the symptom - including restarting
+     * this app, which restarts the audio. Now one press:
+     *
+     *   1. LOOKS before touching anything: the station names what it can see
+     *      (GET /api/broadcast/diagnose), the page reports its own players
+     *      twice, a second and a half apart, and the tablet reads its own
+     *      audio routing (AudioHealth). BroadcastDoctor turns that into
+     *      findings in plain words.
+     *   2. CURES only what was named, each with its own smallest cure. The
+     *      operator's levels, volume and routing are reported, never changed.
+     *   3. ASKS "Is the broadcast working now?" - Yes / No music / No DJs /
+     *      No sound at all / Other - and the answer steers the next look.
+     *   4. Only then, with nothing named left to cure, climbs the existing
+     *      ladder (BroadcastDoctor.RUNGS), one rung per answer, gentlest first.
+     *
+     * Every step and every answer goes to the station's run log
+     * (POST /api/broadcast/reinit/log -> data/air_fixes.jsonl), so a fault
+     * that keeps coming back says so ("seen in 3 earlier runs this week").
      */
     private fun reinitialise() {
         if (fixRunning) return
+        doctorRun = DoctorRun("r" + java.lang.Long.toString(System.currentTimeMillis(), 36))
+        doctorStep(BroadcastDoctor.Hint.NONE, answered = false)
+    }
+
+    private class DoctorRun(
+        val id: String,
+        var step: Int = 0,
+        val tried: MutableSet<String> = mutableSetOf(),
+        var nextRung: Int = 0,
+        var hint: String = "",
+        var captureReopened: Boolean = false,
+        var device: String = "",
+        var listener: String = "",
+        var offer: String = "",
+        val lines: MutableList<String> = mutableListOf(),
+    )
+
+    private var doctorRun: DoctorRun? = null
+
+    private fun fixSay(line: String) {
+        val lines = doctorRun?.lines ?: mutableListOf()
+        lines.add(line)
+        while (lines.size > FIX_LINES) lines.removeAt(0)
+        fixNote.text = lines.joinToString(NEWLINE)
+    }
+
+    private fun doctorStep(hint: BroadcastDoctor.Hint, answered: Boolean) {
+        val r = doctorRun ?: return
+        if (fixRunning) return
         fixRunning = true
         fixGo.isEnabled = false
-        val said = StringBuilder()
-        fun say(line: String) {
-            if (said.isNotEmpty()) said.appendLine()
-            said.append(line)
-            fixNote.text = said.toString()
-        }
+        hideAsk()
         scope.launch {
+            var ask = true
             try {
-                say("looking…")
-                say("audio route: " + repairAudioRoute())
-                val address = pageLocation()
-                if (!address.startsWith("http://") && !address.startsWith("https://")) {
-                    say("the station page is gone ($address) - reopening it")
-                    restorePage()
-                    delay(4000)
-                    say("page: " + pageLocation())
+                r.step += 1
+                r.hint = hint.key
+                fixSay(if (answered) "- looking again: you said " + hint.label.lowercase() + " -"
+                       else "looking before touching anything…")
+                val found = doctorExamine(hint, r)
+                for (line in BroadcastDoctor.describe(found)) fixSay("found  $line")
+                val plan = BroadcastDoctor.plan(found, r.tried, hint, answered, r.nextRung)
+                val did = mutableListOf<String>()
+                val cures = mutableListOf<String>()
+                for ((_, cure) in plan.cures) {
+                    r.tried.add(cure)
+                    cures.add(cure)
+                    val said = doctorCure(cure, r)
+                    did.add(said)
+                    fixSay("did    $said")
                 }
-                var health = JSONObject(client.get("/api/broadcast/health"))
-                if (broadcastHealthy(health, 25.0)) {
-                    say("the broadcast is being heard; the jack and page have been checked")
+                val rung = plan.rung
+                if (plan.cures.isEmpty() && rung != null) {
+                    r.nextRung = plan.rungIndex + 1
+                    cures.add("rung:" + rung.key)
+                    fixSay("nothing named is left to cure, so the next step (" + (plan.rungIndex + 1)
+                        + " of " + BroadcastDoctor.RUNGS.size + "): " + rung.say)
+                    did.add(doctorRung(rung, r))
+                } else if (plan.cures.isEmpty() && answered && plan.offers.isEmpty()) {
+                    fixSay("every step the software has is spent and it is still not right.")
+                    fixSay("what is left needs hands: close this app fully and open it again;")
+                    fixSay("check the box is powered and on the network; power-cycle the speaker.")
+                    doctorLog(r, found, "", "the ladder is spent", "")
+                    ask = false
+                    doctorFinish()
                     return@launch
                 }
-
-                if (health.optBoolean("paused", false)) {
-                    say("1 the station was paused - lifting it")
-                    client.post("/api/broadcast/fix/onair", "{}")
-                } else {
-                    say("1 not paused")
+                if (did.isEmpty()) {
+                    fixSay(if (plan.offers.isNotEmpty()) "that needs your say-so - see the button below"
+                           else if (found.any { it.fault }) "nothing I can fix from here for that"
+                           else "nothing needed doing, so nothing was touched")
                 }
-
-                /* The local half, and the reason this button is on the
-                 * tablet rather than only on the station. */
-                say("2 clearing this page's own flags")
-                runScript(
-                    "(function(){try{" +
-                        "if(typeof fixUngag==='function'){" +
-                            "var d=fixUngag();return d.length?d.join('; '):'nothing held';}" +
-                        "if(typeof pineAirPause==='function'){pineAirPause(false);return 'pause lifted';}" +
-                    "}catch(e){}return 'nothing to clear';})()"
-                ) { got -> say("  " + got.trim('"')) }
-
-                /* #1318: A DUCK THAT NEVER LIFTED SOUNDS EXACTLY LIKE A
-                 * DEAD STATION. Pads duck the broadcast and release it
-                 * when nothing is sounding; if that release is missed,
-                 * every element reports "playing" at volume 1 and the
-                 * room is silent. Cheap to undo, and free when there was
-                 * nothing to undo. */
-                say("3 lifting any duck left on the broadcast")
-                runScript(
-                    "(function(){try{" +
-                        "var a=window.PineAir;if(!a)return 'no mixer here';" +
-                        "if(a.releaseAll)a.releaseAll();" +
-                        "else if(a.release){a.release('pad');a.release('clip');}" +
-                        "var d=a.duckState?a.duckState():null;" +
-                        "return d?('music gain '+d.musicGain):'lifted';" +
-                    "}catch(e){return 'mixer would not answer';}})()"
-                ) { got -> say("  " + got.trim('"')) }
-
-                say("4 dropping what the page was stuck on")
-                client.post("/api/broadcast/fix/flush", "{}")
-
-                health = JSONObject(client.get("/api/broadcast/health"))
-                if (health.optBoolean("gagged", false)
-                    || health.optString("holding_the_air").isBlank()) {
-                    say("5 releasing the exclusive")
-                    client.post("/api/broadcast/fix/release", "{}")
-                }
-
-                /* [#1388] THE FAULT WITH NO SOUND OF ITS OWN.
-                 *
-                 * "make sure this button is able to fix any and every
-                 *  issue that stops the dialogue and broadcast from
-                 *  happening. I need that dialogue always able to be
-                 *  repaired and restored."
-                 *
-                 * Measured on the station 2026-09-22: the pair went
-                 * unheard for 3h24m while every rung above would have
-                 * reported itself healthy. Nothing was gagged, nothing
-                 * was stuck, the page was fine, listeners were connected
-                 * and something was sounding every single second - the
-                 * board was filling the hole with 822 clips in thirty
-                 * minutes. The dialogue SHELF was empty, so every round
-                 * had to be written AND rendered live into its own
-                 * four-minute hole, and no rung on this ladder had ever
-                 * looked at the shelf.
-                 *
-                 * It goes HERE, before the rungs that cost a page reload
-                 * or a restart, because it is cheap and because a restart
-                 * does not fix it - a restarted station has an empty
-                 * shelf too. /api/broadcast/health now carries `bank` on
-                 * every branch, so this asks before it acts. */
-                val bank = health.optJSONObject("bank")
-                if (bank != null) {
-                    say("4b the dialogue bank")
-                    say("  " + bank.optString("say"))
-                    if (bank.optBoolean("bare", false)
-                        || bank.optInt("keeper_failures", 0) > 0) {
-                        val out = client.post("/api/broadcast/fix/bank", "{}")
-                        try {
-                            val lines = JSONObject(out).optJSONArray("lines")
-                            if (lines != null) {
-                                for (i in 0 until lines.length()) {
-                                    val line = lines.optString(i).trim()
-                                    if (line.isNotEmpty()) say("  " + line)
-                                }
-                            }
-                        } catch (err: Exception) {
-                            say("  asked for a round to be banked")
-                        }
-                    } else {
-                        say("  the shelf is stocked - not the cause here")
-                    }
-                }
-
-                say("listening for eight seconds…")
-                delay(8000)
-                health = JSONObject(client.get("/api/broadcast/health"))
-                if (broadcastHealthy(health, 12.0)) {
-                    say("sound is back - stopping here")
-                    return@launch
-                }
-
-                /* #1318: IS THIS TERMINAL DEAF?
-                 *
-                 * Chromium's network stack inside the WebView can die
-                 * while everything else stays up - the bridge answers,
-                 * the feed updates, every view paints, and not one
-                 * fetch, <audio> or <video> works. The panel looks alive
-                 * and the station is inaudible.
-                 *
-                 * A RELOAD DOES NOT CURE IT, measured: the network
-                 * service lives in the app process, so the same dead
-                 * stack is handed to the new page. Only a fresh process
-                 * brings it back.
-                 *
-                 * This button arrived here over the BRIDGE, which is the
-                 * app's own HTTP client. So if the page cannot do what
-                 * the app just did, the page is the broken half - and no
-                 * amount of ordinary dead air can produce that. */
-                say("6 can this page still reach the station?")
-                runScript(
-                    "(function(){try{" +
-                        "window.__pineFixProbe='asking';" +
-                        "var t=setTimeout(function(){" +
-                            "if(window.__pineFixProbe==='asking')" +
-                                "window.__pineFixProbe='web-timeout';},12000);" +
-                        "fetch('/api/dj/sections',{cache:'no-store'}).then(" +
-                            "function(r){clearTimeout(t);" +
-                                "window.__pineFixProbe=r.status>0?'web-ok':'web-bad';}," +
-                            "function(){clearTimeout(t);" +
-                                "window.__pineFixProbe='web-dead';});" +
-                        "return 'asked';" +
-                    "}catch(e){window.__pineFixProbe='web-threw';return 'threw';}})()"
-                ) { }
-                delay(13000)
-                var verdict = "unknown"
-                runScript("(function(){return window.__pineFixProbe||'unknown';})()") {
-                    got -> verdict = got.trim('"')
-                }
-                delay(400)
-
-                if (verdict == "web-dead" || verdict == "web-timeout"
-                    || verdict == "web-threw") {
-                    say("  no - the app can reach it and this page cannot")
-                    say("7 bringing the terminal round; it comes back by itself")
-                    val went = com.pinebox.kiosk.net.Revive.now(
-                        rail.context, "the repair button: the page is deaf")
-                    if (!went) {
-                        say("  too soon since the last one - reloading instead")
-                        runScript("location.reload()") { }
-                        delay(9000)
-                    }
-                } else {
-                    say("  yes (" + verdict + ") - reloading this page")
-                    runScript("location.reload()") { }
-                    delay(9000)
-                }
-
-                health = JSONObject(client.get("/api/broadcast/health"))
-                if (broadcastHealthy(health, 15.0)) {
-                    say("sound is back")
-                    return@launch
-                }
-
-                /* #1318: AND THE CABLE. The wired-device announcement
-                 * outlives the app, so a stale one points the whole
-                 * broadcast at a socket with nothing in it - silence that
-                 * every other check here would call healthy. */
-                say("8 checking the audio is pointed at something")
-                try {
-                    runScript(
-                        "(function(){try{" +
-                            "if(window.pineDesktop&&pineDesktop.jack){" +
-                                "pineDesktop.jack();return 'asked the jack to report';}" +
-                            "return 'no jack door on this build';" +
-                        "}catch(e){return 'the jack would not answer';}})()"
-                    ) { got -> say("  " + got.trim('"')) }
-                    delay(1200)
-                } catch (err: Exception) {
-                    say("  could not ask: " + (err.message ?: ""))
-                }
-
-                say("9 repairing the live feed without restarting the station")
-                client.post("/api/broadcast/fix/floor", "{}")
-                client.post("/api/broadcast/fix/handover", "{}")
-                client.post("/api/broadcast/fix/repair", "{}")
-                val talkCeiling = if ((localLevel["music"] ?: 100) <= 0) 30.0 else 180.0
-                if (health.optDouble("dialogue_quiet", 0.0) >= talkCeiling) {
-                    say("  DJs have been quiet; sending a finished round")
-                    client.post("/api/broadcast/fix/stock", "{}")
-                }
-                delay(5000)
-                health = JSONObject(client.get("/api/broadcast/health"))
-                if (broadcastHealthy(health, 15.0)) {
-                    say("sound is back - the station stayed up")
-                } else {
-                    say("the station answers, but playback is still not confirmed")
-                    say("the server was left running; check the page and output route above")
+                r.offer = plan.offers.firstOrNull()?.cure.orEmpty()
+                doctorLog(r, found, cures.joinToString(","), did.joinToString("; "), "")
+                if (did.isNotEmpty()) {
+                    fixSay("listening for a few seconds…")
+                    delay(6000)
                 }
             } catch (err: Exception) {
-                Log.w(TAG, "reinitialise failed", err)
-                say("the station would not answer: "
-                    + (err.message ?: err.javaClass.simpleName))
-                say("what is left needs hands: close and reopen this app,")
-                say("or check the box is powered and on the network.")
+                Log.w(TAG, "get the broadcast back failed", err)
+                fixSay("that step failed: " + (err.message ?: err.javaClass.simpleName))
             } finally {
                 fixRunning = false
                 fixGo.isEnabled = true
+                if (ask && doctorRun === r) showAsk(r)
             }
         }
     }
 
-    /** Has anybody reported AUDIBLE sound inside the last [within] seconds? */
-    private fun heardWithin(health: JSONObject, within: Double): Boolean {
-        if (health.isNull("heard_seconds_ago")) return false
-        return health.optDouble("heard_seconds_ago", 1.0e9) <= within
+    /** Everything the three sources say, turned into findings. */
+    private suspend fun doctorExamine(
+        hint: BroadcastDoctor.Hint, r: DoctorRun,
+    ): List<BroadcastDoctor.Finding> {
+        val address = pageLocation()
+        if (!address.startsWith("http://") && !address.startsWith("https://")) {
+            return listOf(BroadcastDoctor.Finding("page_gone", "fault",
+                "The station page is not open (" + address.ifBlank { "nothing loaded" } + ").",
+                "reopen_page", "tablet"))
+        }
+        val t0 = android.os.SystemClock.uptimeMillis()
+        val a = pageProbe()
+        val listener = a?.optString("listener").orEmpty().ifBlank { r.listener }
+        r.listener = listener
+        val station = stationDiagnosis(listener, hint)
+        r.device = station?.optJSONObject("snapshot")?.optString("device").orEmpty()
+            .ifBlank { r.device.ifBlank { "pinetab" } }
+        val hooks = doctor
+        val reading = if (hooks == null) null else withContext(Dispatchers.IO) {
+            runCatching { hooks.audio() }.getOrNull()
+        }
+        if (reading != null) fixSay("tablet " + reading.say)
+        val waited = android.os.SystemClock.uptimeMillis() - t0
+        if (waited < 1500) delay(1500 - waited)
+        val b = pageProbe()
+        var net = b?.optString("net").orEmpty()
+        var polls = 0
+        while (net == "asking" && polls < 4) {
+            delay(1500)
+            net = pageProbe()?.optString("net") ?: net
+            polls += 1
+        }
+        val device = BroadcastDoctor.Device(
+            verdict = reading?.verdict?.name.orEmpty(),
+            verdictSay = reading?.say.orEmpty(),
+            route = hooks?.route().orEmpty(),
+            musicIndex = reading?.musicIndex ?: -1,
+            musicMuted = reading?.musicMuted ?: false,
+            focusHeld = hooks?.focusHeld() ?: true,
+            standby = hooks?.standby() ?: false,
+            captureReopened = r.captureReopened,
+        )
+        return BroadcastDoctor.diagnose(station, BroadcastDoctor.Page(a, b, net), device, hint)
     }
 
-    private fun broadcastHealthy(health: JSONObject, within: Double): Boolean {
-        if (!heardWithin(health, within)) return false
-        return (localLevel["music"] ?: 100) > 0
-            || health.optDouble("dialogue_quiet", 1.0e9) < maxOf(30.0, within)
+    /** The station's own diagnosis; its health on a station that predates it. */
+    private suspend fun stationDiagnosis(listener: String, hint: BroadcastDoctor.Hint): JSONObject? {
+        val route = "/api/broadcast/diagnose?listener=" + java.net.URLEncoder.encode(listener, "UTF-8") +
+            "&hint=" + hint.key
+        try {
+            return JSONObject(client.get(route))
+        } catch (err: Exception) {
+            fixSay("the station's diagnosis did not answer (" + (err.message ?: "?").take(80) +
+                ") - reading its health instead")
+        }
+        return try {
+            val health = JSONObject(client.get("/api/broadcast/health"))
+            val paused = health.optBoolean("paused", false)
+            val rows = org.json.JSONArray()
+            if (paused) rows.put(JSONObject().put("key", "paused").put("kind", "fault")
+                .put("say", "The station is paused: " + health.optString("say")).put("cure", "onair"))
+            JSONObject().put("findings", rows)
+                .put("snapshot", JSONObject().put("on", true).put("paused", paused).put("playing", false))
+        } catch (err: Exception) {
+            JSONObject().put("findings", org.json.JSONArray().put(JSONObject()
+                .put("key", "station_unreachable").put("kind", "fault")
+                .put("say", "The station does not answer this tablet (" +
+                    (err.message ?: err.javaClass.simpleName).take(80) + ").")
+                .put("cure", "")))
+        }
     }
 
+    /** Ask the page something and wait for the answer, or give up. */
+    private suspend fun pageAsk(script: String, ms: Long = 4000L): String? = withTimeoutOrNull(ms) {
+        suspendCancellableCoroutine<String?> { cont ->
+            rail.post {
+                try {
+                    runScript(script) { got -> if (cont.isActive) cont.resume(got) }
+                } catch (err: Exception) {
+                    if (cont.isActive) cont.resume(null)
+                }
+            }
+        }
+    }
+
+    private suspend fun pageProbe(): JSONObject? {
+        val got = pageAsk(BroadcastDoctor.PAGE_PROBE) ?: return null
+        return runCatching { JSONObject(got) }.getOrNull()
+    }
+
+    private fun firstLine(answer: String): String = try {
+        val lines = JSONObject(answer).optJSONArray("lines")
+        val line = (1 until (lines?.length() ?: 0)).map { lines!!.optString(it).trim() }
+            .firstOrNull { it.isNotEmpty() }
+        if (line.isNullOrBlank()) "" else " - " + line.take(140)
+    } catch (err: Exception) { "" }
+
+    private suspend fun fixStep(step: String): String = try {
+        firstLine(client.post("/api/broadcast/fix/$step", "{}"))
+    } catch (err: Exception) {
+        " - the station did not confirm (" + (err.message ?: err.javaClass.simpleName).take(80) +
+            "); it keeps working on it"
+    }
+
+    /** One named cure, and the words for what it did. */
+    private suspend fun doctorCure(cure: String, r: DoctorRun): String {
+        val words = BroadcastDoctor.CURES[cure] ?: cure
+        val hooks = doctor
+        return try {
+            when (cure) {
+                "onair", "relieve", "stock", "bank", "flush" -> words + fixStep(cure)
+                "solo" -> {
+                    val out = JSONObject(client.post("/api/radio/solo",
+                        JSONObject().put("listener", r.listener).toString()))
+                    pageCatchUp()
+                    if (out.optString("refused").isNotBlank())
+                        "the station would not give this tablet the air: " + out.optString("why")
+                    else words
+                }
+                "reopen_capture" -> {
+                    r.captureReopened = true
+                    if (hooks == null) "this build cannot reach the capture"
+                    else words + ": " + withContext(Dispatchers.IO) { hooks.reopenCapture() }
+                }
+                "release_capture" ->
+                    if (hooks == null) "this build cannot reach the capture"
+                    else words + ": " + withContext(Dispatchers.IO) { hooks.releaseCapture() }
+                "refocus" ->
+                    if (hooks?.refocus() == true) words else "asked Android for media focus and it refused"
+                "leave_standby" -> { hooks?.leaveStandby(); words }
+                "resume_ctx" -> words + ": " + (pageAsk(RESUME_CTX) ?: "no answer").trim('"')
+                "catch_up" -> { pageCatchUp(); words }
+                "ungag" -> words + ": " + (pageAsk(UNGAG) ?: "no answer").trim('"')
+                "lift_duck" -> words + ": " + (pageAsk(LIFT_DUCK) ?: "no answer").trim('"')
+                "resume_music" -> words + ": " + (pageAsk(RESUME_MUSIC) ?: "no answer").trim('"')
+                "reload_page" -> {
+                    rail.post { runScript("location.reload()") { } }
+                    delay(9000)
+                    words
+                }
+                "reopen_page" -> { restorePage(); delay(4000); words }
+                "make_radio" -> {
+                    val answer = AirReceivers.read(JSONObject(client.post(AirReceivers.ROUTE,
+                        AirReceivers.radio(r.device.ifBlank { "pinetab" }))))
+                    if (answer != null) adoptReceivers(answer, fromWrite = true)
+                    pageCatchUp()
+                    if (answer != null && answer.refused.isNotBlank()) AirReceivers.note(answer) else words
+                }
+                "restart_app" -> doctorRestartApp(r)
+                else -> "no cure is called $cure"
+            }
+        } catch (err: Exception) {
+            words + " - it failed: " + (err.message ?: err.javaClass.simpleName).take(100)
+        }
+    }
+
+    /** A rung of the old ladder, run whole, and one line for what it did. */
+    private suspend fun doctorRung(rung: BroadcastDoctor.Rung, r: DoctorRun): String {
+        val said = mutableListOf<String>()
+        for (cure in rung.local) {
+            r.tried.add(cure)
+            val line = doctorCure(cure, r)
+            fixSay("did    $line")
+            said.add(line)
+        }
+        for (step in rung.station) {
+            val line = step + fixStep(step)
+            fixSay("did    $line")
+            said.add(line)
+            if (step == "reload_pages") delay(9000)
+            if (step == "restart") {
+                fixSay("the station is restarting - asking you again in half a minute")
+                delay(30000)
+            }
+        }
+        return rung.key + ": " + said.joinToString("; ").take(300)
+    }
+
+    /** Restart this app. Saved first: this process ends, and the question
+     *  is asked again by the next one (doctorResume). */
+    private suspend fun doctorRestartApp(r: DoctorRun): String {
+        val hooks = doctor ?: return "this build cannot restart itself"
+        r.tried.add("restart_app")
+        fixSay("restarting this app - the sound restarts with it; I will ask again when it is back")
+        doctorLog(r, emptyList(), "restart_app", "restarting this app", "")
+        doctorSave()
+        delay(800)
+        if (hooks.restartApp("the Get the broadcast back button")) {
+            delay(15000)
+            return "asked Android to restart this app, and it is still here"
+        }
+        doctorForget()
+        fixSay("the app restarted itself too recently to do it again - reloading this page instead")
+        rail.post { runScript("location.reload()") { } }
+        delay(9000)
+        return "the restart was declined (too soon since the last one); reloaded this page instead"
+    }
+
+    private fun hideAsk() {
+        fixAsk.visibility = View.GONE
+        fixOffer.visibility = View.GONE
+    }
+
+    private fun showAsk(r: DoctorRun) {
+        fixAsk.visibility = View.VISIBLE
+        val offer = r.offer
+        if (offer.isNotBlank() && offer !in r.tried) {
+            val words = BroadcastDoctor.CURES[offer] ?: offer
+            fixOffer.text = when (offer) {
+                "make_radio" -> "Make this tablet the radio (turns its out-loud switch on)"
+                "restart_app" -> "Restart this app - the sound restarts with it"
+                else -> words.replaceFirstChar { it.uppercase() }
+            }
+            fixOffer.contentDescription = fixOffer.text
+            fixOffer.tooltipText = fixOffer.text
+            fixOffer.visibility = View.VISIBLE
+        } else {
+            fixOffer.visibility = View.GONE
+        }
+    }
+
+    /** The operator's answer: record it, then stop or look again. */
+    private fun doctorAnswer(answer: String) {
+        val r = doctorRun ?: run { hideAsk(); return }
+        if (fixRunning) return
+        hideAsk()
+        scope.launch { doctorLog(r, emptyList(), "", "", answer) }
+        when (answer) {
+            "yes" -> {
+                fixSay("good - stopping here.")
+                doctorFinish()
+            }
+            "stopped" -> {
+                fixSay("stopped - nothing more will be touched.")
+                doctorFinish()
+            }
+            else -> doctorStep(BroadcastDoctor.Hint.of(answer), answered = true)
+        }
+    }
+
+    /** The one cure that waits for the operator's own tap. */
+    private fun doctorOffer() {
+        val r = doctorRun ?: return
+        val cure = r.offer
+        if (cure.isBlank() || fixRunning) return
+        fixRunning = true
+        fixGo.isEnabled = false
+        hideAsk()
+        scope.launch {
+            try {
+                r.tried.add(cure)
+                val said = doctorCure(cure, r)
+                fixSay("did    $said")
+                doctorLog(r, emptyList(), cure, said, "")
+                delay(4000)
+            } finally {
+                fixRunning = false
+                fixGo.isEnabled = true
+                r.offer = ""
+                if (doctorRun === r) showAsk(r)
+            }
+        }
+    }
+
+    private fun doctorFinish() {
+        hideAsk()
+        doctorForget()
+        doctorRun = null
+    }
+
+    /** One row of the station's run log. Never fails the run. */
+    private suspend fun doctorLog(
+        r: DoctorRun, found: List<BroadcastDoctor.Finding>, cure: String, did: String, answer: String,
+    ) {
+        try {
+            client.post("/api/broadcast/reinit/log", JSONObject()
+                .put("run", r.id).put("step", r.step).put("device", r.device)
+                .put("listener", r.listener).put("hint", r.hint)
+                .put("findings", BroadcastDoctor.keys(found, faults = true))
+                .put("notes", BroadcastDoctor.keys(found, faults = false))
+                .put("cure", cure).put("did", did.take(400)).put("answer", answer)
+                .toString())
+        } catch (err: Exception) {
+            Log.i(TAG, "the run log did not take this step: " + err.message)
+        }
+    }
+
+    private fun doctorPrefs() = rail.context.applicationContext
+        .getSharedPreferences(DOCTOR_PREFS, android.content.Context.MODE_PRIVATE)
+
+    /** Written before this app restarts itself, so the next process asks. */
+    private fun doctorSave() {
+        val r = doctorRun ?: return
+        val json = JSONObject().put("id", r.id).put("step", r.step).put("next", r.nextRung)
+            .put("hint", r.hint).put("capture", r.captureReopened).put("device", r.device)
+            .put("listener", r.listener).put("tried", org.json.JSONArray(r.tried.toList()))
+            .put("lines", org.json.JSONArray(r.lines)).put("at", System.currentTimeMillis())
+        doctorPrefs().edit().putString("run", json.toString()).commit()
+    }
+
+    private fun doctorForget() {
+        doctorPrefs().edit().remove("run").apply()
+    }
+
+    /** After this app restarted itself mid-run: carry on asking. */
+    private fun doctorResume() {
+        val raw = doctorPrefs().getString("run", null) ?: return
+        doctorPrefs().edit().remove("run").apply()
+        val saved = runCatching { JSONObject(raw) }.getOrNull() ?: return
+        if (System.currentTimeMillis() - saved.optLong("at", 0L) > DOCTOR_RESUME_MS) return
+        val r = DoctorRun(saved.optString("id"), step = saved.optInt("step"),
+            nextRung = saved.optInt("next"), hint = saved.optString("hint"),
+            captureReopened = saved.optBoolean("capture"), device = saved.optString("device"),
+            listener = saved.optString("listener"))
+        saved.optJSONArray("tried")?.let { for (i in 0 until it.length()) r.tried.add(it.optString(i)) }
+        saved.optJSONArray("lines")?.let { for (i in 0 until it.length()) r.lines.add(it.optString(i)) }
+        doctorRun = r
+        fixSay("this app has restarted.")
+        showAsk(r)
+        rail.postDelayed({ drawer.openDrawer(rail) }, 2500)
+    }
+
+    /** A write that returns a dj_state object; its routing is adopted at once. */
     private fun send(note: String?, body: () -> String) {
         call(note) { JSONObject(client.post("/api/dj/output", body())) }
     }
@@ -1803,5 +2003,40 @@ class RailController(
         """
 
         private const val TAG = "PineRail"
+
+        /* [smart-reinit] */
+        private const val FIX_LINES = 40
+        private const val DOCTOR_PREFS = "pine.doctor"
+        private const val DOCTOR_RESUME_MS = 10 * 60 * 1000L
+
+        /** #1211/#1207: the page's own flags - its pause, a held player slot. */
+        private const val UNGAG = "(function(){try{" +
+            "if(typeof fixUngag==='function'){var d=fixUngag();return d.length?d.join('; '):'nothing held';}" +
+            "if(typeof pineAirPause==='function'){pineAirPause(false);return 'pause lifted';}" +
+            "}catch(e){}return 'nothing to clear';})()"
+
+        /** #1318: a duck that never lifted sounds like a dead station. */
+        private const val LIFT_DUCK = "(function(){try{" +
+            "var a=window.PineAir;if(!a)return 'no mixer here';" +
+            "if(a.releaseAll)a.releaseAll();" +
+            "else if(a.release){a.release('pad');a.release('clip');}" +
+            "return 'lifted';" +
+            "}catch(e){return 'mixer would not answer';}})()"
+
+        /** The page's AudioContext: every player runs through it. */
+        private const val RESUME_CTX = "(function(){try{" +
+            "var c=window.pineAudioCtx;if(!c)return 'no audio engine';" +
+            "var was=String(c.state);if(was!=='running'){var p=c.resume();if(p&&p.catch)p.catch(function(){});}" +
+            "return was+', resume asked';" +
+            "}catch(e){return 'would not resume: '+e.message;}})()"
+
+        /** The record follows the clock: re-read it, then play() if still paused. */
+        private const val RESUME_MUSIC = "(function(){try{" +
+            "try{radioClockPoll()}catch(e){}" +
+            "var m=window.musicPlayer||musicPlayer;if(!m)return 'no music player';" +
+            "if(m.paused&&(m.currentSrc||m.src)){var p=m.play();if(p&&p.catch)p.catch(function(){});" +
+            "return 'the clock re-read, play() asked';}" +
+            "return 'the clock re-read';" +
+            "}catch(e){return 'would not resume: '+e.message;}})()"
     }
 }
