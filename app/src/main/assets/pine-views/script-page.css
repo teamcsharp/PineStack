@@ -4525,3 +4525,25 @@ html.pine-tech-wide .sp-tech.sp-tech-wide .wc-strip {
    overlapping on them": the fixed CAM badge (#pineCamFlag, ~63 px at the top
    right) sat over the header's caution buttons */
 .sp-title-tools { padding-right: 56px; }
+
+/* [rr-popup] a roulette entry opens its whole roulette */
+.sp-rr-pickable { cursor: pointer; border-radius: 6px; }
+.sp-rr-pickable:hover, .sp-rr-pickable:focus-visible { background: rgba(104, 206, 217, .12); outline: none; }
+.sp-rrp-back { position: fixed; inset: 0; z-index: 2147483300; background: rgba(4, 7, 10, .55);
+  display: flex; align-items: center; justify-content: center; }
+.sp-rrp { position: relative; width: min(560px, 94vw); max-height: 86vh; overflow: auto; padding: 14px 16px 16px;
+  background: #11161c; color: #d8e0e6; border: 1px solid rgba(104, 206, 217, .35); border-radius: 12px;
+  box-shadow: 0 18px 48px rgba(0, 0, 0, .55); font-size: 13px; }
+.sp-rrp-head { display: flex; align-items: baseline; gap: 10px; padding-right: 34px; margin-bottom: 6px; }
+.sp-rrp-head b { font-size: 14px; letter-spacing: .04em; }
+.sp-rrp-landed { color: #9aa4ad; }
+.sp-rrp-x { position: absolute; top: 8px; right: 8px; width: 28px; height: 28px; border-radius: 8px;
+  border: 1px solid rgba(154, 164, 173, .35); background: transparent; color: #cfd8de; cursor: pointer; }
+.sp-rrp h4 { margin: 12px 0 4px; font-size: 12px; color: #68ced9; text-transform: uppercase; letter-spacing: .06em; }
+.sp-rrp-table { width: 100%; border-collapse: collapse; }
+.sp-rrp-table th, .sp-rrp-table td { text-align: left; padding: 4px 6px; border-bottom: 1px solid rgba(154, 164, 173, .12); }
+.sp-rrp-table th { color: #9aa4ad; font-weight: 600; font-size: 11px; }
+.sp-rrp-hit td { color: #fff; background: rgba(104, 206, 217, .16); font-weight: 600; }
+.sp-rrp-rej td { color: #6c757d; text-decoration: line-through; }
+.sp-rrp-rej td:last-child { text-decoration: none; }
+.sp-rrp-none { color: #9aa4ad; margin: 2px 0; }
