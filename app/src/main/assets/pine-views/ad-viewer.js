@@ -316,6 +316,8 @@
        shows every field, as before. Hidden fields keep their words and are
        saved as they are. The choice is remembered on this screen. */
     var P_SIMPLE = {
+      /* [prompt-simple] "allow me to name the preset that I'm saving" */
+      name: ['Preset name', 'what this preset is called - type a new name, then Save as new to keep it as its own preset'],
       speech: ['What they say', 'the words spoken, exactly as written - {station} is the station\'s name'],
       goal: ['What they do', 'describe the action, the scene and the mood - {station} works here too']};
     var pMode = 'simple';
@@ -329,7 +331,7 @@
       P_FIELDS.forEach(function (f) {
         var L = pLabels[f[0]], s = simple && P_SIMPLE[f[0]];
         L.label.style.display = simple && !s ? 'none' : '';
-        L.label.style.order = simple ? (f[0] === 'speech' ? '1' : '2') : '';
+        L.label.style.order = simple ? (f[0] === 'name' ? '0' : f[0] === 'speech' ? '1' : '2') : '';
         L.span.textContent = s ? s[0] : f[1];
         L.hint.textContent = s ? s[1] : f[3];
         L.input.setAttribute('aria-label', s ? s[0] : f[1]);
