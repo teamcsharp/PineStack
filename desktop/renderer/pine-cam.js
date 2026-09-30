@@ -297,7 +297,20 @@
      * there a rectangle to hand the surface; a resize or a drag moves it. */
     var img0 = box.querySelector('#pineCamImg');
     if (img0) {
-      img0.addEventListener('load', function () { if (nativeOn) nativeBoxSoon(); else nativeStart(); });
+      img0.addEventListener('load', function () {
+        /* [cam-shape] the frame's own shape, kept for the next open */
+        try {
+          if (img0.naturalWidth > 0 && img0.naturalHeight > 0) {
+            var ar = img0.naturalWidth + ' / ' + img0.naturalHeight;
+            if (localStorage.getItem('pineCamAspect') !== ar) localStorage.setItem('pineCamAspect', ar);
+          }
+        } catch (e) { /* the default shape stands */ }
+        if (nativeOn) nativeBoxSoon(); else nativeStart();
+      });
+      try {                                               /* [cam-shape] the last shape, before any frame */
+        var ar0 = localStorage.getItem('pineCamAspect');
+        if (ar0 && /^\d+ \/ \d+$/.test(ar0)) img0.style.setProperty('--pine-cam-aspect', ar0);
+      } catch (e) { /* 848 / 480 */ }
       try {
         if (root.ResizeObserver) new ResizeObserver(function () { nativeBoxSoon(); }).observe(img0);
       } catch (e) { /* no observer: the load hook and the drag still send it */ }

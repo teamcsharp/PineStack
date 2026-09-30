@@ -72,10 +72,13 @@
   display: block;
   width: 100%;
   height: auto;
-  /* A frame that has not arrived yet leaves the element at zero height and
-     the box collapses to its bar, which reads as broken. A floor keeps the
-     shape while the first picture is on its way. */
-  min-height: 120px;
+  /* [cam-shape] The box opens at the PICTURE's shape, not a 120 px floor:
+     "any time I load up the pine cam it does a slight double flash because
+     it loads the crop and then it expands". The floor showed a strip of the
+     frame until the first JPEG set the height, then the box grew to full.
+     aspect-ratio holds the last known shape (848 x 480 before any is known);
+     `auto` hands over to the frame's own once it has arrived. */
+  aspect-ratio: auto var(--pine-cam-aspect, 848 / 480);
   background: #05080a;
 }
 
