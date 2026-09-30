@@ -35,6 +35,7 @@
 
   let ctx = null;
   let master = null;
+  let masterLevel = 1;                        /* [levels-one] pineLevels' Pads row, x master */
   let voiceSeq = 0;
 
   const pads = new Map();    /* padId -> pad record                     */
@@ -47,7 +48,7 @@
       /* interactive = the smallest buffer the platform will give us. */
       ctx = new Ctor({ latencyHint: "interactive" });
       master = ctx.createGain();
-      master.gain.value = 1;
+      master.gain.value = masterLevel;        /* [levels-one] the Pads row */
       master.connect(ctx.destination);
     }
     /* Autoplay policy parks the context until a gesture. Every fire()
@@ -475,7 +476,17 @@
       return out;
     },
 
-    backend: "webaudio"
+    backend: "webaudio",
+
+    /* [levels-one] the Pads row of the one level system (0..2): the whole
+     * engine's output, ramped so a drag never clicks. */
+    master(v) {
+      const n = Number(v);
+      masterLevel = Number.isFinite(n) ? Math.max(0, Math.min(2, n)) : 1;
+      if (master && ctx) master.gain.setTargetAtTime(masterLevel, ctx.currentTime, 0.02);
+      return masterLevel;
+    },
+    masterLevel() { return masterLevel; }
   };
 
   if (typeof module !== "undefined" && module.exports) module.exports = engine;

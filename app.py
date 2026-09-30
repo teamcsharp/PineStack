@@ -92,6 +92,7 @@ import clip_senses                      # [#1241] where a phrase comes from, and
 import recast_desk                        # [#1215]: the cupboard recast desk
 import es_voice as _es_voice              # [s3-es-voice] how a feeling sounds: the DSP + the engines' own controls
 import emotion_engine as _emotion           # [emotion-engine] the emotion engine's own window
+import levels as _levels                   # [levels-one] the one set of levels, on the station
 from director import (director_add, director_beats, director_beats_clause,
                       director_beats_set, director_clause, director_graph,
                       director_feedback_clause, director_lessons_clause,
@@ -148849,6 +148850,78 @@ def pinecam_album_cut(row: dict[str, Any], dest: str) -> dict[str, Any]:
     return out
 
 
+# --- [levels-one] THE ONE SET OF LEVELS, ON THE STATION ---------------------------
+# "the goal with the audio is to unify and have it all controlled by a single
+# unified system." One set, station-wide; a master everything follows; the pads
+# their own row; the Pine Box speaker a Box route beside them (its levels stay
+# /api/dj/output's, shown here so one popup holds everything). levels.py.
+LEVELS_PATH = data_path("levels.json")
+
+
+def levels_box() -> dict[str, Any]:
+    """The Pine Box / Nabu speaker's own levels, in the shape PineAudioLaw.levelOf reads."""
+    s = dj_settings()
+    return {"voice_device": _RADIO.get("voice_device") or "nabu",
+            "music_to": _RADIO.get("music_to") or "here", "voice_to": _RADIO.get("voice_to") or "box",
+            "reply_to": _RADIO.get("reply_to") or "box",
+            "music_level": round(music_box_level(), 3),
+            "nabu_music_level": float(s.get("nabu_music_level", music_box_level())),
+            "nabu_voice_level": float(s.get("nabu_voice_level", 0.5)),
+            "nabu_reply_level": float(s.get("nabu_reply_level", 0.5))}
+
+
+def levels_view(got: dict[str, Any]) -> dict[str, Any]:
+    out = dict(got)
+    out.update({"ok": True, "kinds": list(_levels.KINDS), "ceil": dict(_levels.CEIL)})
+    try:
+        out["box"] = levels_box()
+    except Exception:  # noqa: BLE001
+        out["box"] = {}
+    return out
+
+
+@app.get("/api/levels")
+async def levels_get_api(authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    require_read_auth(authorization)
+    return levels_view(await asyncio.to_thread(_levels.state, LEVELS_PATH))
+
+
+async def _levels_body(request: Request) -> tuple[dict[str, Any], str]:
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        body = {}
+    body = body if isinstance(body, dict) else {}
+    vals = body.get("levels") if isinstance(body.get("levels"), dict) else {}
+    return vals, str(body.get("by") or "")[:40]
+
+
+@app.post("/api/levels")
+async def levels_set_api(request: Request, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    require_auth(authorization)
+    vals, by = await _levels_body(request)
+    got = await asyncio.to_thread(_levels.write, LEVELS_PATH, vals, by)
+    if got.get("changed"):
+        pipeline_log("air", "levels: %s from %s (rev %d) [levels-one]" % (
+            ", ".join("%s %d%%" % (k, round(got["levels"][k] * 100)) for k in got["changed"]),
+            by or "a surface", got["rev"]))
+    return levels_view(got)
+
+
+@app.post("/api/levels/adopt")
+async def levels_adopt_api(request: Request, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    require_auth(authorization)
+    vals, by = await _levels_body(request)
+    got = await asyncio.to_thread(_levels.adopt, LEVELS_PATH, vals, by)
+    if got.get("seeded"):
+        pipeline_log("air", "levels: the one set seeded by %s: %s [levels-one]" % (
+            by or "a surface", ", ".join("%s %d%%" % (k, round(v * 100)) for k, v in got["levels"].items())))
+    elif got.get("lowered"):
+        pipeline_log("air", "levels: %s joined quieter on %s - the station follows it down [levels-one]" % (
+            by or "a surface", ", ".join(got["lowered"])))
+    return levels_view(got)
+
+
 @app.get("/api/slideshow/media/{filename}")
 async def slideshow_media_api(
     filename: str,
@@ -214991,7 +215064,7 @@ function pineLevelStored(kind) {
   try {
     const bus = window.pineLevels;
     if (bus && typeof bus.get === "function") {
-      const v = Number((bus.get() || {})[kind]);
+      const v = Number(((typeof bus.effective === "function" ? bus.effective() : bus.get()) || {})[kind]);   /* [levels-one] */
       if (Number.isFinite(v)) return clamp(v);
     }
   } catch (e) { /* the store below */ }
@@ -233005,6 +233078,9 @@ function djGainUser(which, event) {
 function djApplyGain(transientOnly) {
   const sharedLevels = window.pineLevels && window.pineLevels.get
     ? window.pineLevels.get() : null;
+  /* [levels-one] the sliders show the level; the SOUND is level x master */
+  const effLevels = sharedLevels && typeof window.pineLevels.effective === "function"
+    ? window.pineLevels.effective() : sharedLevels;
   if (sharedLevels && !transientOnly) {
     for (const [stream, id] of [["music", "djGainMusic"], ["voice", "djGainVoice"]]) {
       const input = document.getElementById(id);
@@ -233038,7 +233114,7 @@ function djApplyGain(transientOnly) {
     // #744: an ad preview ducks the music exactly the way the DJs do,
     // at the operator's own duck depth and with the same click-free ramp.
     const unified = !!sharedLevels;
-    const shared = unified ? Number(sharedLevels.music) : NaN;
+    const shared = unified ? Number(effLevels.music) : NaN;
     const chosen = Number.isFinite(shared)
       ? shared : level.music * pineMixerRead().music;
     if (chosen <= 0 && musicPlayer && !musicPlayer.paused) musicPlayer.pause();
@@ -233068,7 +233144,7 @@ function djApplyGain(transientOnly) {
    * panel slider look dead. One owner: the shell when present, this
    * slider in a plain browser. */
   if (typeof djVoiceEls !== "undefined") {
-    const shared = sharedLevels;
+    const shared = effLevels;
     djVoiceEls.forEach((a, ix) => {
       if (!a) return;
       const sting = !!(a.dataset && a.dataset.pineSting === "1");
@@ -241031,7 +241107,12 @@ function djVoiceNext() {
    * element's volume (the shell does inside the desktop app). */
   try {
     if (window.__pineDesktopVolume === undefined && typeof djLevels === "function") {
-      player.volume = pineMixerVoiceLevel(player, Math.max(0, Math.min(1, djLevels().voice)));
+      const _eff = window.pineLevels && typeof window.pineLevels.effective === "function"
+        ? window.pineLevels.effective() : null;                       /* [levels-one] one bus */
+      const _sting = !!(player.dataset && player.dataset.pineSting === "1");
+      player.volume = _eff
+        ? (Math.max(0, Math.min(1, Number(_eff[_sting ? "sfx" : "voice"]))) || 0)
+        : pineMixerVoiceLevel(player, Math.max(0, Math.min(1, djLevels().voice)));
     }
   } catch (e) { /* the clip still plays */ }
   djVoiceSlot = 1 - djVoiceSlot;
