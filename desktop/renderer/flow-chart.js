@@ -246,7 +246,7 @@
   function roleOf(t) {
     var a = String(t.asked || t.leg || '').toLowerCase();
     if (/opens this chapter|opens the subject|initiat/.test(a)) return 'initiator';
-    if (/answers the replies to their opening|rebuttal/.test(a)) return 'rebuttal';
+    if (/answers the replies to their opening|^rebut/.test(a)) return 'rebuttal';
     if (/segues|next discussion point|topic change|new topic/.test(a)) return 'topic';
     return 'reply';
   }
@@ -313,7 +313,7 @@
     if (start) chart.appendChild(make('div', 'fd-title', cut([start.road, start.topic].filter(Boolean).join(' · '), 200)));
     var chapter = 0, replyN = 0, chain = null;
     turns.forEach(function (t, k) {
-      var role = roleOf(t);
+      var role = k === 0 ? 'initiator' : roleOf(t);       /* a chain always opens on its Initiator */
       if (role === 'initiator' || !chain) {
         chapter += 1; replyN = 0;
         chain = make('section', 'fd-chain');
@@ -348,7 +348,7 @@
     var r = ui.nowRow && ui.nowRow.isConnected && !ui.nowRow.hidden ? ui.nowRow : lastRow();
     if (!r || !r.scrollIntoView) return;
     ui.autoAt = Date.now();                                  /* our own scroll, not the operator's */
-    try { r.scrollIntoView({block: 'center', behavior: 'smooth'}); } catch (e) { r.scrollIntoView(); }
+    try { r.scrollIntoView({block: 'center'}); } catch (e) { r.scrollIntoView(); }   /* instant: a smooth glide outlived the guard and read as the operator scrolling away */
     r.classList.add('fc-flash');
     root.setTimeout(function () { r.classList.remove('fc-flash'); }, 1400);
   }
