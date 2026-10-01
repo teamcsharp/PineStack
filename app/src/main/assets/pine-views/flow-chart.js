@@ -228,16 +228,40 @@
     r.classList.add('fc-flash');
     root.setTimeout(function () { r.classList.remove('fc-flash'); }, 1400);
   }
-  function jumpLive() {
+  function jumpLive(lid) {
     if (!ui.on) return false;
     if (!ui.live) {
       ui.live = true; ui.flowKey = ''; ui.nowRow = null;
       if (ui.liveBtn) ui.liveBtn.setAttribute('aria-pressed', 'true');
     }
+    ui.jumpLid = /^[0-9a-f]{6,32}$/i.test(String(lid || '')) ? String(lid).toLowerCase() : '';
+    ui.fallbackFor = '';
     ui.wantJump = true;
     scrollNow();
     tick();
     return true;
+  }
+  /* [air-jump-any] "its blank atm": what is on air has no System 3 conversation (a
+     board clip, a record), so Live showed nothing. Live now shows, in order: the
+     conversation of the line the strip was tapped on (by its line code, with that
+     line's turn marked), the last conversation that aired live, the newest one. */
+  function fallbackShow(why) {
+    var keys = [ui.jumpLid, ui.lastLive, ui.recentFirst].filter(function (k, i, a) { return k && a.indexOf(k) === i; });
+    var want = keys.join('|');
+    if (ui.flowKey && ui.fallbackFor === want) return;            /* already showing it */
+    ui.fallbackFor = want;
+    (function tryNext(i) {
+      if (i >= keys.length) { if (!ui.flowKey) say(why); return; }
+      get('/api/flow/' + encodeURIComponent(keys[i])).then(function (f) {
+        if (!ui.on || !ui.live) return;
+        if (!(f && f.nodes)) { tryNext(i + 1); return; }
+        var which = keys[i] === ui.jumpLid ? 'the conversation of the line in the strip'
+          : keys[i] === ui.lastLive ? 'the last conversation that aired' : 'the newest conversation';
+        paint(f);
+        say(why + ' - showing ' + which + ' (#' + f.key + ')');
+        ui.jumpLid = '';
+      }, function () { tryNext(i + 1); });
+    }(0));
   }
 
   function tick() {
@@ -247,8 +271,8 @@
     get(path).then(function (d) {
       if (!ui.on) return;
       if (ui.live) {
-        if (d && d.live && d.flow) paint(d.flow);
-        else if (!ui.flowKey) say(d && d.why ? d.why : 'waiting for a System 3 line on air');
+        if (d && d.live && d.flow) { ui.lastLive = d.flow.key; ui.fallbackFor = ''; paint(d.flow); }
+        else fallbackShow(d && d.why ? d.why : 'nothing is on air');
       } else if (d && d.nodes) {
         paint(d);
       }
@@ -264,6 +288,7 @@
       ((d && d.conversations) || []).forEach(function (c) {
         var cid = String(c.conversation_id || c.id || '');
         if (!cid) return;
+        if (!ui.recentFirst) ui.recentFirst = cid;                         /* [air-jump-any] Live's last resort */
         var o = make('option', '', cid + ' · ' + (c.road || '') + (c.topic ? ' · ' + cut(c.topic, 40) : ''));
         o.value = cid;
         ui.recent.appendChild(o);
