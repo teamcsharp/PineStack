@@ -189032,6 +189032,15 @@ async def h3_hourly_render(state: dict[str, Any]) -> tuple[str, Any, str]:
     _h3_gather = globals().get("h3_speak_gather")                 # [h3-speak] the dialogue's pool:
     if _h3_gather:                                                # the hour's preset rolls over it
         _H3_SPEAK_POOL[0] = await _h3_gather()
+    # [h3-overview] the hour's preset is picked first: a technical overview
+    # needs its pitch written (awaited, off the loop) before the hour resolves
+    try:
+        _H3_PICKED[0] = h3_prompts_pick()
+        if h3_prompts_fields(_H3_PICKED[0]["preset"]).get("kind") == "overview":
+            await h3_overview_prepare(_H3_PICKED[0]["preset"])
+    except Exception as exc:  # noqa: BLE001 - the hour picks its own, as before
+        pipeline_log("ads", "hourly H3: the preset pick failed early (%s)" % type(exc).__name__)
+        _H3_PICKED[0] = None
     goal = h3_hourly_ad_prompt()
     try:
         share = max(0, min(100, int(state.get("gallery_share", 20) or 0)))
@@ -189685,6 +189694,192 @@ def h3_speak_gate(prompt: str, speech: str, payload: dict[str, Any]) -> str:
     return why
 
 
+# --- [h3-overview] THE TECHNICAL OVERVIEW: A FEATURE, SOLD AT A WHITEBOARD ------
+#
+# "a special preset called technical overview ... the person coming out giving a
+#  technical presentation on a whiteboard presenting one of the features
+#  mentioned in the release log" (the operator, 2026-10-01). A preset whose kind
+# is "overview" is prepared here before the hour is resolved: System 3 rolls the
+# changelog feature (h3.overview_feature), the presenter (h3.overview_presenter),
+# how many actions (h3.overview_action_count) and which (h3.overview_action),
+# and each action's prop; the system prompt is rolled from the segment-prompt
+# book's alternatives (kind h3_overview, h3.overview_system); the model writes
+# the pitch. Every pool is tabled, so the desk edits, weighs and retires them.
+# Pure parts in h3_overview.py. No model, no pitch: the hour falls back to the
+# feature's own subject - the render is never lost to it.
+import h3_overview                         # [h3-overview] the pure half
+
+_H3_OVERVIEW: list[Any] = [None]
+H3_OVERVIEW_SECONDS = 10.0
+H3_OVERVIEW_FEATURE_LABEL = "which tagged changelog feature the technical-overview H3 video presents"
+H3_OVERVIEW_PRESENTER_LABEL = "who presents the technical-overview H3 video at the whiteboard"
+H3_OVERVIEW_COUNT_LABEL = "how many gestures and actions the technical-overview presenter does"
+H3_OVERVIEW_ACTION_LABEL = "a gesture or action the technical-overview presenter does"
+H3_OVERVIEW_SYSTEM_LABEL = "which system prompt writes the technical-overview pitch"
+
+
+def h3_overview_take() -> dict[str, Any] | None:
+    """The pitch the hourly door just prepared, once; None when stale or spent."""
+    got, _H3_OVERVIEW[0] = _H3_OVERVIEW[0], None
+    if isinstance(got, dict) and time.time() - float(got.get("at") or 0) <= 900 and got.get("say"):
+        return got
+    return None
+
+
+def h3_overview_seed_prompts() -> None:
+    """The book's first system prompts for kind h3_overview, once, rolled at
+    random among themselves; the operator edits them in the segment-prompt book."""
+    if segment_prompts.entry(h3_overview.PROMPT_KIND):
+        return
+    for name, text in h3_overview.SYSTEM_PROMPTS:
+        segment_prompts.put_alternative(h3_overview.PROMPT_KIND, {"name": name, "text": text, "weight": 1, "on": True})
+    try:
+        segment_prompts.set_mode(h3_overview.PROMPT_KIND, "random")
+    except (KeyError, ValueError):
+        pass
+
+
+def h3_overview_system() -> tuple[str, str]:
+    """(name, text) of the system prompt this pitch is written under: the
+    book's fixed one when the operator fixed it, else System 3's weighted roll
+    over the ones switched on; the built-in first when the book has none."""
+    try:
+        h3_overview_seed_prompts()
+        row = segment_prompts.entry(h3_overview.PROMPT_KIND) or {}
+    except Exception:  # noqa: BLE001
+        row = {}
+    alts = [a for a in row.get("alternatives") or [] if a.get("on") and str(a.get("text") or "").strip()]
+    if not alts:
+        return h3_overview.SYSTEM_PROMPTS[0]
+    mode = str(row.get("mode") or "")
+    if mode.startswith("fixed:"):
+        one = next((a for a in alts if a.get("id") == mode[6:]), alts[0])
+        return str(one.get("name") or ""), str(one["text"])
+    names = [str(a.get("name") or a.get("id") or "?") for a in alts]
+    k = s3_weighted("h3.overview_system", names, [max(1, int(a.get("weight") or 1)) for a in alts],
+                    H3_OVERVIEW_SYSTEM_LABEL)
+    k = k if isinstance(k, int) and 0 <= k < len(alts) else 0
+    h3_hourly_roll_note("ov_system", "h3.overview_system")
+    return names[k], str(alts[k]["text"])
+
+
+def h3_overview_dialogue() -> list[str]:
+    """Lines the DJs said on air lately, for the dialogue billboard."""
+    out = []
+    for row in reversed(list(_RADIO.get("chat") or [])):
+        row = row if isinstance(row, dict) else {}
+        if str(row.get("kind") or "") in ("request", "played", "marker", "sfx", "hangup", "image_analysis",
+                                          "song_analysis"):
+            continue
+        text = " ".join(str(row.get("text") or "").split())
+        if 12 <= len(text) <= 180:
+            who = str(row.get("name") or row.get("who") or "").strip()
+            out.append(('%s: "%s"' % (who, text)) if who else '"%s"' % text)
+        if len(out) >= 24:
+            break
+    return out
+
+
+async def h3_overview_props(feature: dict[str, Any], actions: list[str]) -> dict[str, str]:
+    """What the rolled actions carry, each rolled only when an action needs it."""
+    props: dict[str, str] = {}
+    want = " ".join(actions)
+    if "{gallery}" in want:
+        try:
+            pics = [p.name for p in await asyncio.to_thread(gallery_files, 600)
+                    if re.search(r"\.(png|jpe?g|webp)$", p.name, re.I) and not gallery_paper_file(p.name)]
+        except Exception:  # noqa: BLE001
+            pics = []
+        if pics:
+            props["gallery"] = re.sub(r"[_-]+", " ", Path(s3_choice(
+                "h3.overview_gallery", pics[:200], "which gallery picture the technical-overview presenter carries",
+                tabled=False)).stem)[:80]
+            h3_hourly_roll_note("ov_gallery", "h3.overview_gallery")
+    if "{gitlog}" in want:
+        props["gitlog"] = "; ".join("%s %s" % (c.get("commit"), c.get("subject"))
+                                    for c in (feature.get("commits") or [])[:3])[:240]
+    if "{dialogue}" in want:
+        lines = h3_overview_dialogue()
+        if lines:
+            props["dialogue"] = s3_choice("h3.overview_dialogue", lines,
+                                          "which DJ line the technical-overview billboard shows", tabled=False)
+            h3_hourly_roll_note("ov_dialogue", "h3.overview_dialogue")
+    return props
+
+
+async def h3_overview_prepare(preset: Any = None) -> dict[str, Any] | None:
+    """[h3-overview] The technical overview for this hour, left for
+    h3_prompts_hour to take. A fault is logged and the hour falls back."""
+    try:
+        got = await _h3_overview_prepare()
+    except Exception as exc:  # noqa: BLE001
+        pipeline_log("ads", "hourly H3 technical overview: not prepared (%s)" % type(exc).__name__)
+        got = None
+    _H3_OVERVIEW[0] = got
+    return got
+
+
+async def _h3_overview_prepare() -> dict[str, Any] | None:
+    page = _CHANGELOG.memory_page(300)
+    feats = h3_overview.features(page.get("entries") or [])
+    if not feats:
+        page = await asyncio.wait_for(asyncio.to_thread(_CHANGELOG.page, 300), timeout=5.0)
+        feats = h3_overview.features(page.get("entries") or [])
+    if not feats:
+        pipeline_log("ads", "hourly H3 technical overview: the changelog has no tagged features yet")
+        return None
+    tags = list(feats)
+    labels = [h3_overview.feature_label(feats[t]) for t in tags]
+    k = s3_weighted("h3.overview_feature", labels, [1.0] * len(labels), H3_OVERVIEW_FEATURE_LABEL)
+    feature = feats[tags[k if isinstance(k, int) and 0 <= k < len(tags) else 0]]
+    h3_hourly_roll_note("ov_feature", "h3.overview_feature")
+    presenter = str(s3_choice("h3.overview_presenter", h3_overview.PRESENTERS, H3_OVERVIEW_PRESENTER_LABEL))
+    h3_hourly_roll_note("ov_presenter", "h3.overview_presenter")
+    try:
+        count = max(1, int(str(s3_choice("h3.overview_action_count", h3_overview.ACTION_COUNTS,
+                                          H3_OVERVIEW_COUNT_LABEL)).strip() or 1))
+    except ValueError:
+        count = 1
+    h3_hourly_roll_note("ov_count", "h3.overview_action_count")
+    raw = [str(a) for a in s3_sample("h3.overview_action", h3_overview.ACTIONS, count, H3_OVERVIEW_ACTION_LABEL)]
+    h3_hourly_roll_note("ov_action", "h3.overview_action")
+    props = await h3_overview_props(feature, raw)
+    actions = [a for a in (h3_overview.fill_action(r, props) for r in raw) if a]
+    system_name, system = h3_overview_system()
+    words = h3_speak.word_cap(H3_OVERVIEW_SECONDS)
+    out = {"at": time.time(), "feature": h3_overview.feature_label(feature), "tag": feature.get("tag"),
+           "commits": [c.get("commit") for c in (feature.get("commits") or [])][:12], "presenter": presenter,
+           "actions": actions, "system": system_name, "by": "model", "why": ""}
+    reply = ""
+    try:
+        result = await call_ollama(model=dj_settings()["model"],
+                                   messages=h3_overview.messages(system, h3_overview.brief(feature), presenter,
+                                                                 actions, words),
+                                   temperature=0.9, max_tokens=420, num_ctx=model_ctx(), repeat_penalty=1.1,
+                                   purpose="h3:overview")
+        reply = str(((result or {}).get("message") or {}).get("content") or "")
+    except Exception as exc:  # noqa: BLE001
+        out["why"] = "the model did not answer (%s)" % type(exc).__name__
+    got = h3_overview.parse(reply, words)
+    if got.get("say") and h3_speak.speech_why(got["say"]):      # a short punchline goes, the rest stays
+        got["say"] = h3_overview.keep_whole(got["say"], h3_speak.speech_why)
+    why = h3_speak.speech_why(got["say"]) if got.get("say") else "no pitch in the reply"
+    if why:
+        got = {"say": h3_overview.fallback_say(h3_speak_station(), feature, words), "do": ""}
+        out.update(by="fallback", why=out["why"] or str(why))
+    out["say"] = got["say"]
+    out["scene"] = h3_overview.scene(presenter, feature, got.get("do") or "", actions)
+    note = globals().get("_production_feed")
+    if note is not None:
+        try:
+            note.note("h3", "h3_overview", "technical overview: %s - %s" % (out["feature"], out["say"][:120]))
+        except Exception:  # noqa: BLE001
+            pass
+    pipeline_log("ads", "hourly H3 technical overview: %s by %s (%s, %s)%s" % (
+        out["feature"][:80], presenter[:40], system_name, out["by"], (" - " + out["why"]) if out["why"] else ""))
+    return out
+
+
 # --- [h3-prompts] THE HOURLY PROMPTS: PRESETS THE OPERATOR SAVES, CYCLES, ROLLS --
 #
 # "Put an option here of a P for prompt and whenever I click it or tap it it
@@ -189718,10 +189913,12 @@ _H3_PROMPTS_LOCK = RLock()                      # worker threads only - never on
 _H3_PROMPTS_MEM: list[Any] = [None]             # the store as last read or written, swapped whole
 _H3_PROMPTS_HOURS: list[dict[str, Any]] = []    # the hours this process resolved, newest last
 _H3_PROMPTS_DRESSED: dict[str, list[float]] = {}   # hour -> [renders dressed, when last]
-H3_PROMPTS_FIELDS = ("goal", "clip", "gallery", "host", "speech", "style", "constraints", "audio_direction")
+H3_PROMPTS_FIELDS = ("goal", "clip", "gallery", "host", "speech", "style", "constraints", "audio_direction",
+                     "kind")                     # [h3-overview] "" = these words; "overview" = the whiteboard
 H3_PROMPTS_ROADS = ("clip", "gallery", "host")
 H3_PROMPTS_LIMITS = {"name": 60, "goal": 1200, "clip": 1800, "gallery": 1800, "host": 1800,
-                     "speech": 700, "style": 120, "constraints": 400, "audio_direction": 400}
+                     "speech": 700, "style": 120, "constraints": 400, "audio_direction": 400, "kind": 20}
+H3_PROMPTS_KINDS = ("", "overview")
 H3_PROMPTS_DEFAULT = {
     "goal": ("Make a short, funny but professional Pine Box FM sponsor stinger "
              "that naturally follows this hour's conversation: {conversation}"),
@@ -189733,7 +189930,7 @@ H3_PROMPTS_DEFAULT = {
                 "synchronized spoken dialogue. No captions or logos. {goal}"),
     "host": ("The Pine Box host presents a Pine Box FM stinger at the station's desk, "
              "direct to camera, in warm late-night studio light. {goal}"),
-    "speech": "", "style": "", "constraints": "", "audio_direction": ""}
+    "speech": "", "style": "", "constraints": "", "audio_direction": "", "kind": ""}
 H3_PROMPTS_MOST = 60                  # saved presets
 H3_PROMPTS_HISTORY_KEEP = 168         # a week of hours
 H3_PROMPTS_FIND_S = 86400.0           # a queued hourly render finds its hour within a day
@@ -189747,7 +189944,7 @@ def _h3_prompts_text(value: Any, field: str) -> str:
     name and the one-line fields are one line; a brief or a direction keeps
     its line breaks (compose_prompt joins them)."""
     text = str(value if value is not None else "")
-    if field in ("name", "speech", "style", "constraints", "audio_direction"):
+    if field in ("name", "speech", "style", "constraints", "audio_direction", "kind"):
         text = " ".join(text.split())
     else:
         text = "\n".join(" ".join(line.split()) for line in text.replace("\r", "").split("\n")).strip()
@@ -189762,6 +189959,9 @@ def h3_prompts_fields(preset: Any) -> dict[str, str]:
     for field in ("goal",) + H3_PROMPTS_ROADS:
         if not out[field]:
             out[field] = H3_PROMPTS_DEFAULT[field]
+    # [h3-overview] the kind is one of the known few; anything naming the
+    # technical overview is it, the rest is the plain words preset
+    out["kind"] = "overview" if "overview" in out["kind"].lower() else ""
     return out
 
 
@@ -189842,6 +190042,7 @@ def _h3_prompts_normalise(got: Any) -> dict[str, Any]:
     store["dice"] = bool(got.get("dice"))
     store["next"] = _h3_prompts_pin(got.get("next"))
     store["history"] = [h for h in list(got.get("history") or []) if isinstance(h, dict)][-H3_PROMPTS_HISTORY_KEEP:]
+    store["seeded"] = [str(x)[:40] for x in list(got.get("seeded") or []) if x][:60]     # [h3-base]
     try:
         store["rev"] = max(0, int(got.get("rev") or 0))
     except (TypeError, ValueError):
@@ -189983,12 +190184,13 @@ def h3_prompts_how(entry: Any) -> str:
     return "the active preset"
 
 
-def h3_prompts_hour(conversation: str, record: str = "", speak: Any = None) -> dict[str, Any]:
-    """[h3-prompts] This hour's preset, and its brief filled: the one pinned for
-    the next hour, else the dice's roll (the gallery's dice on), else the active
-    one. The hourly render calls this on the event loop (h3_hourly_ad_prompt):
-    it reads the store from memory and never takes the lock; the hour's record
-    is written off the loop."""
+_H3_PICKED: list[Any] = [None]        # [h3-overview] the hour's pick, made by the door before it writes
+
+
+def h3_prompts_pick() -> dict[str, Any]:
+    """[h3-prompts] Which preset this hour is told: the one pinned for the next
+    hour, else the dice's roll (the gallery's dice on), else the active one.
+    Memory only, never the lock: the hourly door calls it on the loop."""
     store = _H3_PROMPTS_MEM[0] if isinstance(_H3_PROMPTS_MEM[0], dict) else None
     if store is None:              # the startup load has not landed: never read the disk on the loop
         pipeline_log("ads", "hourly H3 prompts: the presets are not loaded yet - the Default preset's words")
@@ -190006,12 +190208,42 @@ def h3_prompts_hour(conversation: str, record: str = "", speak: Any = None) -> d
         preset, roll = h3_prompts_roll(presets, active)
     else:
         how, preset = "active", active
+    return {"at": time.time(), "how": how, "preset": preset, "roll": roll, "pin": pin}
+
+
+def h3_prompts_picked_take() -> dict[str, Any] | None:
+    """[h3-overview] The pick the hourly door made a moment ago, once - so the
+    hour it resolves is the preset it prepared for (one roll, never two)."""
+    got, _H3_PICKED[0] = _H3_PICKED[0], None
+    if isinstance(got, dict) and time.time() - float(got.get("at") or 0) <= 900:
+        return got
+    return None
+
+
+def h3_prompts_hour(conversation: str, record: str = "", speak: Any = None) -> dict[str, Any]:
+    """[h3-prompts] This hour's preset, and its brief filled: the one pinned for
+    the next hour, else the dice's roll (the gallery's dice on), else the active
+    one. The hourly render calls this on the event loop (h3_hourly_ad_prompt):
+    it reads the store from memory and never takes the lock; the hour's record
+    is written off the loop."""
+    picked = h3_prompts_picked_take() or h3_prompts_pick()
+    how, preset, roll, pin = picked["how"], picked["preset"], picked["roll"], picked["pin"]
     fields = h3_prompts_fields(preset)
+    # [h3-overview] a technical-overview hour speaks the pitch its door wrote
+    # (h3_overview_prepare, awaited before this): the whiteboard scene is the
+    # brief and the pitch the line; the dialogue pool is spent unused
+    _ov = h3_overview_take() if fields.get("kind") == "overview" and globals().get("h3_overview_take") else None
+    if _ov:
+        fields["goal"], fields["speech"] = _ov["scene"], _ov["say"]
+        conversation = _ov["say"]
+        if speak is None and globals().get("h3_speak_pool_take"):
+            h3_speak_pool_take()
+        speak = None
     # [h3-speak] the H3SPEAK node rolls the hour's dialogue over the pool: its
     # sentences are the {conversation}, its line the words spoken; {station}
     # and {hour} are filled and a slot no road fills is taken out
     _take, _fill = globals().get("h3_speak_take"), globals().get("h3_speak_fill") or h3_prompts_fill
-    if speak is None and globals().get("h3_speak_pool_take"):
+    if speak is None and globals().get("h3_speak_pool_take") and not _ov:
         speak = h3_speak_pool_take()          # the pool the hourly door just gathered, once
     _speak = _take(speak, fields.get("speech") or "") if speak is not None and _take else None
     if _speak is not None:
@@ -190024,6 +190256,9 @@ def h3_prompts_hour(conversation: str, record: str = "", speak: Any = None) -> d
              "roll": roll, "pin": str((pin or {}).get("id") or "") if how == "next" else "",
              "fields": fields, "conversation": str(conversation or "")[:600], "record": str(record or "")[:200],
              "goal": goal, "speak": _speak}                   # [h3-speak] the node, its dice and origin
+    if _ov:
+        entry["overview"] = {k: _ov.get(k) for k in ("feature", "tag", "commits", "presenter", "actions",
+                                                      "system", "by", "why")}
     _H3_PROMPTS_HOURS.append(entry)
     del _H3_PROMPTS_HOURS[:-24]
     _h3_prompts_offloop(h3_prompts_commit_hour, dict(entry))
@@ -190510,11 +190745,49 @@ async def h3_prompts_delete_api(pid: str, authorization: str | None = Header(def
     return await asyncio.to_thread(h3_prompts_delete, pid[:40])
 
 
+# [h3-base] THE BASE PRESETS. Each joins the saved presets ONCE (its id is
+# written down in the store's "seeded"), so a preset the operator edits keeps
+# the edit and one deleted stays deleted. The words are ordinary preset words;
+# the {slots} in them are rolled at render time like any other.
+H3_PROMPTS_BASE = (
+    {"id": "base-overview", "name": "Technical overview", "kind": "overview",
+     "speech": "",
+     # what an hour says when the changelog or the model gives nothing; a
+     # prepared overview replaces it with the rolled whiteboard scene
+     "goal": ("A technical presentation at a whiteboard: a presenter sells one of {station}'s new software "
+              "features to camera, animated and full of energy, drawing diagrams and arrows as they talk.")},
+)
+
+
+def h3_prompts_seed_base(store: dict[str, Any]) -> list[str]:
+    """[h3-base] The base presets this store has never had, added; their ids."""
+    seeded = list(store.get("seeded") or [])
+    presets = list(store.get("presets") or [])
+    added = []
+    for base in H3_PROMPTS_BASE:
+        if base["id"] in seeded:
+            continue
+        seeded.append(base["id"])
+        if len(presets) >= H3_PROMPTS_MOST or any(p.get("id") == base["id"] for p in presets):
+            continue
+        names = {str(p.get("name") or "").lower() for p in presets}
+        raw = dict(base)
+        if raw["name"].lower() in names:
+            raw["name"] = (raw["name"] + " (base)")[:H3_PROMPTS_LIMITS["name"]]
+        presets.append(_h3_prompts_preset(raw, base["id"]))
+        added.append(base["id"])
+    store["presets"], store["seeded"] = presets, seeded
+    return added
+
+
 @app.on_event("startup")
 async def _h3_prompts_start() -> None:
     """[h3-prompts] The store into memory before the first hour - off the loop."""
     try:
         await asyncio.to_thread(h3_prompts_load)
+        store = _H3_PROMPTS_MEM[0] or {}
+        if any(b["id"] not in (store.get("seeded") or []) for b in H3_PROMPTS_BASE):
+            await asyncio.to_thread(h3_prompts_change, h3_prompts_seed_base)        # [h3-base]
     except Exception as exc:  # noqa: BLE001
         pipeline_log("ads", "hourly H3 prompt presets not loaded (%s)" % type(exc).__name__)
 

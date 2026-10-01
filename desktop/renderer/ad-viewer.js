@@ -92,7 +92,11 @@
   var ROLL_ROWS = [['host', 'host'], ['source', 'source'], ['fresh', 'fresh pick'], ['marker', 'window marker'],
     ['speak_lean', 'dialogue kind'], ['speak_line', 'line said on air'], ['speak_doc', 'speakerbox document'],
     ['speak_count', 'sentences to take'], ['speak_sentences', 'sentences'], ['speak_forced', 'forced line'],
-    ['slot_doc', '{speakerbox} document'], ['slot_sentence', '{speakerbox} sentence'], ['slot_choice', '{choice}']];
+    ['slot_doc', '{speakerbox} document'], ['slot_sentence', '{speakerbox} sentence'], ['slot_choice', '{choice}'],
+    /* [h3-overview] the technical overview's own dice */
+    ['ov_feature', 'feature presented'], ['ov_presenter', 'presenter'], ['ov_count', 'how many actions'],
+    ['ov_action', 'actions'], ['ov_gallery', 'gallery picture carried'], ['ov_dialogue', 'DJ line on the billboard'],
+    ['ov_system', 'system prompt']];
   function rollRow(table, r) {
     if (!r || typeof r !== 'object' || r.dice == null) return null;
     var main;
@@ -354,12 +358,14 @@
       ['speech', 'Line spoken', 'input', 'blank: pulled out of the brief, as before'],
       ['style', 'Style', 'input', 'one style term - blank: the gear\'s brief, else a polished broadcast commercial'],
       ['audio_direction', 'Audio direction', 'input', 'blank: the gear\'s brief'],
-      ['constraints', 'Constraints', 'input', 'blank: the gear\'s brief']];
+      ['constraints', 'Constraints', 'input', 'blank: the gear\'s brief'],
+      /* [h3-overview] */
+      ['kind', 'Kind', 'input', 'blank: these words. overview: a technical overview at a whiteboard - a rolled changelog feature, pitched by the model']];
     var pInputs = {}, pLabels = {};
     P_FIELDS.forEach(function (f) {
       var label = make('label', 'pav-pr-field'), input = make(f[2]);
       if (f[2] === 'textarea') input.rows = f[0] === 'goal' ? 3 : 2; else input.type = 'text';
-      input.maxLength = f[0] === 'name' ? 60 : f[0] === 'goal' ? 1200 : f[2] === 'textarea' ? 1800 : f[0] === 'speech' ? 700 : f[0] === 'style' ? 120 : 400;
+      input.maxLength = f[0] === 'kind' ? 20 : f[0] === 'name' ? 60 : f[0] === 'goal' ? 1200 : f[2] === 'textarea' ? 1800 : f[0] === 'speech' ? 700 : f[0] === 'style' ? 120 : 400;
       input.setAttribute('aria-label', f[1]); input.addEventListener('input', paintEditState);
       var span = make('span', '', f[1]), hint = make('i', '', f[3]);
       label.append(span, hint, input); pForm.appendChild(label); pInputs[f[0]] = input;
@@ -375,7 +381,8 @@
       /* [prompt-simple] "allow me to name the preset that I'm saving" */
       name: ['Preset name', 'what this preset is called - type a new name, then Save as new to keep it as its own preset'],
       speech: ['What they say', 'the words spoken, exactly as written - {station} is the station\'s name'],
-      goal: ['What they do', 'describe the action, the scene and the mood - {station} works here too']};
+      goal: ['What they do', 'describe the action, the scene and the mood - {station} works here too'],
+      kind: ['Kind', 'blank: what you typed above. overview: a technical overview - the model pitches a rolled changelog feature at a whiteboard']};
     var pMode = 'simple';
     try { pMode = root.localStorage.getItem('pinePromptMode') === 'advanced' ? 'advanced' : 'simple'; } catch (e) { /* default */ }
     var pModeBtn = pBtn('', 'c:settings--adjust', '', function () { setPromptMode(pMode === 'simple' ? 'advanced' : 'simple'); });
@@ -387,7 +394,7 @@
       P_FIELDS.forEach(function (f) {
         var L = pLabels[f[0]], s = simple && P_SIMPLE[f[0]];
         L.label.style.display = simple && !s ? 'none' : '';
-        L.label.style.order = simple ? (f[0] === 'name' ? '0' : f[0] === 'speech' ? '1' : '2') : '';
+        L.label.style.order = simple ? (f[0] === 'name' ? '0' : f[0] === 'speech' ? '1' : f[0] === 'kind' ? '3' : '2') : '';
         L.span.textContent = s ? s[0] : f[1];
         L.hint.textContent = s ? s[1] : f[3];
         L.input.setAttribute('aria-label', s ? s[0] : f[1]);
