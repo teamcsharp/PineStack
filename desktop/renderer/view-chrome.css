@@ -788,6 +788,32 @@ body.pine-splice-open > :not(.lb-editor-overlay) * { animation-play-state:paused
 .pine-pulse-track { display: inline-block; padding-left: 8px; animation: pineConsoleMarquee 60s linear infinite; }
 .pine-pulse-track span { display: inline-block; }
 @media (max-width: 720px) { .pine-pulse { right: 24px; } }
+/* [tip-marquee] a hover tip takes the marquee's line; a tap opens all of it */
+.pine-pulse-tip {
+  position: absolute; left: 0; right: 0; top: 3px; height: 16px;
+  display: flex; align-items: center; gap: 6px; padding: 0 8px; margin: 0;
+  border: 0; border-radius: 0; background: #0f2230; color: #dbe6f0;
+  font: inherit; text-align: left; cursor: pointer; overflow: hidden;
+}
+.pine-pulse-tip[hidden] { display: none; }
+.pine-pulse-tip em { flex: none; font-style: normal; font-weight: 700; color: #65c7da; letter-spacing: .06em; }
+.pine-pulse-tip-view { flex: 1 1 auto; min-width: 0; overflow: hidden; white-space: nowrap; }
+.pine-pulse-tip-track { display: inline-block; }
+.pine-pulse-tip-track.pine-pulse-tip-run { animation: pineConsoleMarquee 20s linear infinite; }
+.pine-pulse-tip-track span { display: inline-block; }
+.pine-pulse-tip:hover .pine-pulse-tip-track { animation-play-state: paused; }
+.pine-tip-pop {
+  position: fixed; left: 50%; bottom: calc(var(--pine-chrome-bottom, 46px) + 10px); transform: translateX(-50%);
+  z-index: 2147483003; width: min(560px, calc(100vw - 32px)); max-height: 60vh; overflow: auto;
+  box-sizing: border-box; padding: 14px 44px 14px 16px; border-radius: 8px;
+  background: #0b1520; border: 1px solid #2a4257; color: #dbe6f0; box-shadow: 0 14px 40px #000c;
+  font: 13px/1.5 Inter, Segoe UI, system-ui, sans-serif;
+}
+.pine-tip-pop b { display: block; margin-bottom: 6px; color: #65c7da; }
+.pine-tip-pop p { margin: 0 0 8px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.pine-tip-pop-full { color: #b9c8d2; border-left: 2px solid #2a4257; padding-left: 8px; }
+.pine-tip-pop-facts { display: block; margin-bottom: 10px; color: #8fa0ad; font-size: 11.5px; font-style: normal; }
+.pine-tip-pop-go { min-height: 30px; padding: 4px 12px; border: 1px solid #43545c; border-radius: 4px; background: #13222c; color: #e3edf0; cursor: pointer; }
 /* the views make room for both strips */
-.pine-view-host, #sampler { padding-bottom: 46px; }
+.pine-view-host, #sampler { padding-bottom: var(--pine-chrome-bottom, 46px); }
 .pine-talk-dot { bottom: 54px; }

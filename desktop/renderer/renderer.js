@@ -10834,9 +10834,14 @@ function pineTipBubble() {
 function pineTipHide() {
   if (pineTipTimer) { clearTimeout(pineTipTimer); pineTipTimer = null; }
   if (pineTipEl) pineTipEl.style.opacity = "0";
+  if (window.PinePulseTip) window.PinePulseTip.release();     // [tip-marquee]
 }
 
 function pineTipShow(el, text) {
+  // [tip-marquee] "it is covering the UI": the tip goes to the status
+  // marquee, scrolls there, and a tap on it opens the whole of it. The
+  // bubble is only for a window with no marquee.
+  if (window.PinePulseTip && window.PinePulseTip.show(text, el)) return;
   const b = pineTipBubble();
   b.textContent = text;
   b.style.opacity = "0";
@@ -10865,6 +10870,7 @@ function pineTipsInstall() {
     const target = ev.target && ev.target.closest
       ? ev.target.closest("[title],[data-tip]") : null;
     if (!target) return;
+    if (target.closest(".pine-pulse-tip, .pine-tip-pop")) return;   // [tip-marquee] the tip is not its own subject
     /* Take the native tip away the first time we see this element. Under
      * 400ms we leave `title` alone and the browser does its own thing. */
     if (pineTipDelay >= 400 && target.hasAttribute("title")) {

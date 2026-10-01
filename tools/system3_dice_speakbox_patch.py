@@ -172,8 +172,15 @@ EDITS = [
              if floor else random.randrange(last))
 ''',
      r'''    _lo = min(floor, last - 1)          # randrange(_lo, last); 0 at rest   # [s3-dice-door]
-    start = min(last - 1, _lo + int(s3_roll("speakbox.swath_start", "where in the document the swath starts")   # [s3-dice-door]
-                                    * (last - _lo)))   # [s3-dice-door]
+    # [line-roll] the start is a roll over the document's own lines
+    _starts = list(range(_lo, last))
+    if len(_starts) > 120:
+        _step = len(_starts) / 120.0
+        _starts = [_starts[int(i * _step)] for i in range(120)]
+    start = _starts[s3_weighted("speakbox.swath_start",
+                                [str(pool[i])[:140] for i in _starts],
+                                [1.0] * len(_starts),
+                                "which line of the document the swath starts on")]
 ''', 1),
     # --- the pair's material --------------------------------------------------
     ("material-turns",

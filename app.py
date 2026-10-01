@@ -31029,6 +31029,22 @@ def page_delivery_apply(entry: dict[str, Any], delivery_id: str) -> None:
         air_at_set(entry,                                   # #1288
                    float(delivery.get("playing_at") or time.time()))
     elif str(entry.get("aired") or "") not in ("box", "held"):
+        # [publish-stamp] the clip's honest start plus the line's window in it,
+        # taken before `published` freezes the render estimate (#1288)
+        try:
+            _ps_clip = delivery.get("clip") or {}
+            _ps_ms = float(_ps_clip.get("broadcast_ms") or 0)
+            _ps_rows = list((_ps_clip.get("stream") or {}).get("rows") or [])
+            if entry.get("clip_from") is not None:
+                _ps_off = float(entry.get("clip_from") or 0)
+            elif len(_ps_rows) <= 1:
+                _ps_off = 0.0
+            else:
+                _ps_off = None
+            if _ps_ms > 0 and _ps_off is not None:
+                air_at_set(entry, _ps_ms / 1000.0 + _ps_off)
+        except Exception:  # noqa: BLE001
+            pass
         entry["aired"] = "published"
 
 
@@ -83084,10 +83100,26 @@ def speakbox_swath_lines(pool: list[str], most: int = 9,
     last = max(1, len(pool) - max(1, int(most)) + 1)
     floor = int(last * 0.55 * deep)             # 0 at rest — unchanged
     _lo = min(floor, last - 1)          # randrange(_lo, last); 0 at rest   # [s3-dice-door]
-    start = min(last - 1, _lo + int(s3_roll("speakbox.swath_start", "where in the document the swath starts")   # [s3-dice-door]
-                                    * (last - _lo)))   # [s3-dice-door]
+    # [line-roll] the start is a roll over the document's own lines
+    _starts = list(range(_lo, last))
+    if len(_starts) > 120:
+        _step = len(_starts) / 120.0
+        _starts = [_starts[int(i * _step)] for i in range(120)]
+    start = _starts[s3_weighted("speakbox.swath_start",
+                                [str(pool[i])[:140] for i in _starts],
+                                [1.0] * len(_starts),
+                                "which line of the document the swath starts on")]
     swath = [pool[start]]
-    for line in pool[start + 1:start + most]:
+    at = start
+    # [line-roll] ...and so is every line after it: forward only, the next
+    # line likeliest, one or two further on now and then
+    while len(swath) < max(1, int(most)) and at + 1 < len(pool):
+        _ahead = list(range(at + 1, min(len(pool), at + 4)))
+        at = _ahead[s3_weighted("speakbox.swath_line",
+                                [str(pool[i])[:140] for i in _ahead],
+                                [8.0, 2.0, 1.0][:len(_ahead)],
+                                "which line the swath rolls on to (the next is likeliest)")]
+        line = pool[at]
         if len(" ".join(swath)) + len(line) + 1 > cap:
             break
         swath.append(line)

@@ -207,6 +207,12 @@
   function pulseSeat(p) {                      /* on top of the strip, however tall it is */
     var cb = el();
     if (p && cb && cb.offsetHeight) p.style.bottom = cb.offsetHeight + 'px';
+    /* [chrome-bottom] "the last item in the list ... is being cut off": the
+       views that set their own padding (Script, Listen, Presentation) kept
+       the strip's old 26px and the marquee covered their last row. Both
+       strips' real height, for every view to pad by. */
+    var tall = (cb ? cb.offsetHeight : 0) + (p ? p.offsetHeight : 0);
+    if (tall) document.documentElement.style.setProperty('--pine-chrome-bottom', tall + 'px');
   }
   function pulsePaintText(track, text) {
     pulseText = text;
@@ -245,6 +251,125 @@
       p.querySelector('.pine-pulse-line').title = (v.marquee || []).join('\n');
     }, function () { /* the next read */ });
   }
+
+  /* [tip-marquee] "This text should be scrolling in the marquee as well. And
+     I should be able to tap on it to bring up a pop up to see additional
+     information on it ... But also it is covering the UI." A hover tip is not
+     a box over the page any more: it takes the status marquee's line (TIP),
+     scrolls there when it is longer than the line, stays fifteen seconds
+     after the pointer leaves so it can be reached, and a tap opens the whole
+     of it - its full words, what the thing is, where it lives, its line id -
+     with a way to open the thing itself. renderer.js hands its tips here. */
+  var TIP_KEEP_MS = 15000;
+  var tipNow = {text: '', el: null, timer: 0};
+  function tipLane() {
+    var p = document.getElementById(PULSE_ID);
+    if (!p) return null;
+    var tip = p.querySelector('.pine-pulse-tip');
+    if (tip) return tip;
+    tip = document.createElement('button');
+    tip.type = 'button';
+    tip.className = 'pine-pulse-tip';
+    tip.hidden = true;
+    tip.setAttribute('aria-label', 'Tip - tap for the whole of it');
+    tip.innerHTML = '<em>TIP</em><span class="pine-pulse-tip-view"><span class="pine-pulse-tip-track"></span></span>';
+    tip.addEventListener('click', function (ev) { ev.stopPropagation(); tipOpen(); });
+    p.appendChild(tip);
+    return tip;
+  }
+  function tipShow(text, target) {
+    var tip = tipLane();
+    if (!tip) return false;
+    text = String(text || '').replace(/\s+/g, ' ').trim();
+    if (!text) return false;
+    if (tipNow.timer) { root.clearTimeout(tipNow.timer); tipNow.timer = 0; }
+    tipNow.text = text;
+    tipNow.el = target || null;
+    var view = tip.querySelector('.pine-pulse-tip-view');
+    var track = tip.querySelector('.pine-pulse-tip-track');
+    track.classList.remove('pine-pulse-tip-run');
+    track.textContent = text;
+    tip.hidden = false;
+    if (track.scrollWidth > view.clientWidth + 4) {          /* longer than the line: it scrolls */
+      track.textContent = '';
+      for (var k = 0; k < 2; k += 1) {
+        var s = document.createElement('span');
+        s.textContent = text + '     •     ';
+        track.appendChild(s);
+      }
+      track.style.animationDuration = Math.max(8, Math.round(text.length / 9)) + 's';
+      track.classList.add('pine-pulse-tip-run');
+    }
+    return true;
+  }
+  function tipRelease() {                        /* the pointer left: keep it long enough to reach */
+    if (!tipNow.text || tipNow.timer) return;
+    tipNow.timer = root.setTimeout(function () {
+      tipNow.timer = 0;
+      var tip = tipLane();
+      if (tip && !tip.matches(':hover') && !document.querySelector('.pine-tip-pop')) tip.hidden = true;
+      else tipRelease();
+    }, TIP_KEEP_MS);
+  }
+  function tipWhat(el) {
+    var raw = String((el.getAttribute && el.getAttribute('class')) || '').split(/\s+/)[0] || el.id || el.tagName || '';
+    var w = String(raw).replace(/^(sp|va|pine|pv|s3|sfx|pl|rt|mv|pmi|pav|gs|tf|cf|lb)-/, '')
+      .replace(/([a-z])([A-Z])/g, '$1 $2').replace(/[-_]+/g, ' ').trim().toLowerCase();
+    return w ? w.charAt(0).toUpperCase() + w.slice(1) : '';
+  }
+  function tipOpen() {
+    var old = document.querySelector('.pine-tip-pop');
+    if (old) old.remove();
+    var el = tipNow.el;
+    var live = !!(el && document.body.contains(el));
+    var pop = document.createElement('div');
+    pop.className = 'pine-tip-pop';
+    pop.setAttribute('role', 'dialog');
+    pop.setAttribute('aria-label', 'About this');
+    var head = document.createElement('b');
+    head.textContent = live ? (tipWhat(el) || 'About this') : 'About this';
+    pop.appendChild(head);
+    var said = document.createElement('p');
+    said.className = 'pine-tip-pop-text';
+    said.textContent = tipNow.text;
+    pop.appendChild(said);
+    if (live) {
+      var full = String(el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
+      if (full && full !== tipNow.text && full.length > 3) {
+        var all = document.createElement('p');
+        all.className = 'pine-tip-pop-full';
+        all.textContent = full;
+        pop.appendChild(all);
+      }
+      var facts = [];
+      var lineAt = el.closest && el.closest('[data-line]');
+      if (lineAt) facts.push('line #' + String(lineAt.getAttribute('data-line')).slice(0, 12));
+      var host = el.closest && el.closest('.pine-view-host, [id]');
+      if (host && host !== el && host.id) facts.push('in ' + host.id);
+      if (el.id) facts.push('#' + el.id);
+      if (facts.length) {
+        var f = document.createElement('i');
+        f.className = 'pine-tip-pop-facts';
+        f.textContent = facts.join('  ·  ');
+        pop.appendChild(f);
+      }
+      var go = document.createElement('button');
+      go.type = 'button';
+      go.className = 'pine-tip-pop-go';
+      go.textContent = 'Open it';
+      go.title = 'Do what tapping it would do';
+      go.addEventListener('click', function () {
+        pop.remove();
+        try { el.click(); } catch (err) { /* it has gone */ }
+      });
+      pop.appendChild(go);
+    }
+    document.body.appendChild(pop);
+    if (typeof root.pineCloseX === 'function') {
+      try { root.pineCloseX(pop, function () { pop.remove(); }, {label: 'Close'}); } catch (err) { /* Escape still closes */ }
+    }
+  }
+  root.PinePulseTip = {show: tipShow, release: tipRelease, open: tipOpen};
 
   function mount() {
     if (el()) return el();

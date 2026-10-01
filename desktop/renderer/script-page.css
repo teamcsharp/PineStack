@@ -53,9 +53,10 @@
      is a THREE-class one, so the shorthand silently erased it. Measured on
      the tablet in all three orientations: .sp-right, .sp-scripthead and
      #spScript each ran 22px (34 - 12) underneath the rail. 12 of breathing
-     room INSIDE the 34 of rail, then, rather than instead of it. The 30 at
-     the bottom already covers the 26px console strip the same way. */
-  padding: 12px 46px 30px 12px;
+     room INSIDE the 34 of rail, then, rather than instead of it. The bottom
+     covers the console strip AND the station-pulse marquee above it
+     ([chrome-bottom]: their measured height, set by console-line.js). */
+  padding: 12px 46px calc(var(--pine-chrome-bottom, 46px) + 4px) 12px;
   height: 100%;
   box-sizing: border-box;
   background: var(--sp-bg);

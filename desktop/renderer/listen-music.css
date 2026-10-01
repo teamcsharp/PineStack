@@ -367,7 +367,7 @@
 .view.pb-music.active { padding: 12px; position: relative; }
 /* 12px of breathing room INSIDE the 34px rail gutter and the 26px console
    strip, rather than instead of them. */
-.pine-view-host.open.pb-music { padding: 12px 46px 38px 12px; }
+.pine-view-host.open.pb-music { padding: 12px 46px calc(var(--pine-chrome-bottom, 46px) + 12px) 12px; }
 
 .mu-col {
   display: grid;
