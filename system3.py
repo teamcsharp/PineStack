@@ -4728,6 +4728,8 @@ def callend_mark(conv):
         "arc": dict(conv.get("callarc") or {}), "detour": dict(conv.get("callshift") or {}),     # [s3-callarc]
         # the detour's turns, by index: off topic on purpose, so the topic contract leaves them out
         "detour_turns": [i for i, t in enumerate(turns) if _is_detour_leg(t.get("leg"))],
+        # [call-prod] every turn's leg and seat, so a banked call can be produced take by take
+        "legs": [str(t.get("leg") or "") for t in turns], "seats": [str(t.get("speaker") or "") for t in turns],
     }
 
 

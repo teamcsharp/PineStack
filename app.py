@@ -93,6 +93,7 @@ import recast_desk                        # [#1215]: the cupboard recast desk
 import es_voice as _es_voice              # [s3-es-voice] how a feeling sounds: the DSP + the engines' own controls
 import emotion_engine as _emotion           # [emotion-engine] the emotion engine's own window
 import production_feed as _production_feed  # [prod-feed] the pause, as a feed
+import call_producer as _call_producer      # [call-prod] produced calls, mixed while paused
 import levels as _levels                   # [levels-one] the one set of levels, on the station
 import station_pulse as _pulse             # [station-pulse] the pressure bar and the marquee
 from director import (director_add, director_beats, director_beats_clause,
@@ -2142,6 +2143,9 @@ DEFAULT_DJ = {
     # every other road keeps, and the paused planner builds them first.
     "bank_ahead_hours": 72,
     "bank_ahead_roads": "caller,manager",
+    # [call-prod] while paused, banked calls are produced: the line's own sounds, the
+    # caller's background, hits on the beats and a bed under a win, mixed into new takes
+    "produced_calls": True,
     # #1034: THE SEAT WATCH. When one presenter has carried a swath alone
     # - the other seat silent for this many aired lines, or this many
     # minutes - the silent one says where they went (restroom, coffee,
@@ -3081,6 +3085,8 @@ def validate_settings(data: Any) -> dict[str, Any]:
         "pause_bank_rounds": max(0, min(60, int(                  # #1022
             raw_dj.get("pause_bank_rounds",
                        DEFAULT_DJ["pause_bank_rounds"]) or 0))),
+        "produced_calls": bool(raw_dj.get("produced_calls",         # [call-prod]
+                                         DEFAULT_DJ["produced_calls"])),
         "bank_ahead_hours": max(0.0, min(168.0, float(            # [bank-ahead]
             raw_dj.get("bank_ahead_hours",
                        DEFAULT_DJ["bank_ahead_hours"]) or 0))),
@@ -118310,6 +118316,155 @@ def manager_call_name() -> str:
                 or "the manager upstairs")
     except Exception:  # noqa: BLE001
         return "the manager upstairs"
+
+
+# --- [call-prod] PRODUCED CALLS (call_producer.py) --------------------------------------
+CALL_PRODUCE_EVERY = 25.0
+CALL_AMBIENCES = ("a dog barking in another room", "a kettle coming to the boil", "traffic outside a window",
+                  "a television on in the background", "rain on a window", "a busy kitchen",
+                  "a crowd at a bar", "wind outside", "a baby crying somewhere", "a lawnmower outside")
+CALL_HITS = {"hit:tension": ("dramatic sting", "tension hit", "record scratch", "suspense sting"),
+             "hit:win": ("fanfare", "crowd cheering", "applause", "victory jingle"),
+             "hit:lose": ("sad trombone", "crowd gasp", "boo", "wah wah")}
+_CALL_PROD: dict[str, Any] = {"made": 0, "failed": 0, "skipped": 0, "last": "", "at": 0.0}
+
+
+async def _call_prod_asset(name: str) -> tuple[str, str]:
+    """A file for one of the produced call's symbolic sounds, rolled through the dice
+    doors and found in the station's own SFX library (or, for the bed, its music) -
+    (path, what was asked for); ("", why) when nothing fits."""
+    if name == "bed:win":
+        bed = _music_bed_track()
+        return (str((bed or {}).get("path") or ""), "a favourite record under the win")
+    if name == "ambience":
+        ask = s3_choice("call.produced_ambience", CALL_AMBIENCES,
+                        "the caller's background in a produced call [call-prod]")
+        most = 60.0
+    else:
+        ask = s3_choice("call.produced_" + name.split(":", 1)[-1], CALL_HITS.get(name) or ("sting",),
+                        "the %s in a produced call [call-prod]" % name.replace(":", " "))
+        most = 8.0
+    finder = globals().get("sfx_vectors_suggest_async")
+    if not callable(finder):
+        return "", "the SFX library is not open"
+    try:
+        got = await finder(str(ask), 8, False)
+    except Exception as exc:  # noqa: BLE001
+        return "", "the SFX library could not be asked: %s" % type(exc).__name__
+    for r in (got or {}).get("results") or []:
+        path = str(r.get("path") or "")
+        secs = float(r.get("seconds") or 0)
+        if path and (secs <= 0 or secs <= most) and Path(path).is_file():
+            return path, str(ask)
+    return "", "nothing in the library sounded like %s" % ask
+
+
+async def call_produce_tick() -> str:
+    """[call-prod] Produce ONE ready, unheard banked call - only while paused. Its takes
+    are mixed into NEW files under NEW pantry keys; the row then points at them. A call
+    whose plan and takes do not line up is marked and left dry. Returns what it did."""
+    try:
+        if not radio_paused() or not dj_settings().get("produced_calls", True):
+            return ""
+    except Exception:  # noqa: BLE001
+        return ""
+    row = entry = None
+    for r in list(shelf_rows("caller")):
+        e = dialogue_entry(r) if isinstance(r, dict) else None
+        if not e or e.get("produced") or not row_unaired(r) or not dialogue_row_ready("caller", r):
+            continue
+        mark = (e.get("call") or {}).get("callend") if isinstance(e.get("call"), dict) else None
+        if isinstance(mark, dict) and mark.get("legs"):
+            row, entry = r, e
+            break
+    if entry is None:
+        return ""
+    mark = entry["call"]["callend"]
+    plan = _call_producer.plan_production(mark.get("legs") or [], mark.get("seats") or [], mark)
+    takes = sorted([t for t in entry.get("takes") or [] if isinstance(t, dict)], key=lambda t: int(t.get("i", -1)))
+    if len(takes) != len(mark.get("legs") or []):
+        entry["produced"] = {"at": time.time(), "skipped": "the call's plan and its takes do not line up "
+                             "(%d legs, %d takes)" % (len(mark.get("legs") or []), len(takes))}
+        _CALL_PROD["skipped"] = int(_CALL_PROD["skipped"]) + 1
+        return "skipped"
+    wanted = sorted({a for ops in plan.values() for a in (ops["pre"] + ops["post"] + ops["under"])
+                     if a in ("ambience", "bed:win") or a.startswith("hit:")})
+    assets: dict[str, str] = {}
+    asked: dict[str, str] = {}
+    for a in wanted:
+        path, why = await _call_prod_asset(a)
+        asked[a] = why
+        if path:
+            assets[a] = path
+    done = 0
+    for i, ops in sorted(plan.items()):
+        take = takes[i] if 0 <= i < len(takes) else None
+        if take is None:
+            continue
+        old_key = str(take.get("key") or "")
+        saved = _PANTRY.get(old_key) or {}
+        clip = dict(saved.get("clip") or {})
+        name = str(clip.get("path") or "").rsplit("/", 1)[-1].split("?", 1)[0]
+        src = VOICE_MEDIA_DIR / name if name else None
+        if not src or not src.is_file():
+            continue
+        new_key = _call_producer.production_key(old_key, ops, assets)
+        out_name = new_key + ".mp3"
+        out = VOICE_MEDIA_DIR / out_name
+        ok = await asyncio.to_thread(_call_producer.mix_take, src, out, ops, assets)
+        if not ok:
+            continue
+        secs = await asyncio.to_thread(_call_producer.seconds_of, out)
+        if secs <= 0:
+            continue
+        clip.update(path=f"/media/{out_name}", sig=media_sign(out_name), seconds=secs,
+                    bytes=out.stat().st_size, produced=True, produced_from=old_key)
+        pantry_put(new_key, clip, text=str(take.get("text") or saved.get("text") or ""),
+                   voice=str(take.get("voice") or saved.get("voice") or ""),
+                   who=str(take.get("who") or saved.get("who") or ""), kind="caller")
+        take["key"] = new_key
+        keys = entry.get("keys")
+        if isinstance(keys, list):
+            entry["keys"] = [new_key if k == old_key else k for k in keys]
+        done += 1
+    entry["produced"] = {"at": time.time(), "takes": done, "of": len(takes),
+                         "assets": {a: Path(p).name for a, p in assets.items()}, "asked": asked,
+                         "plan": {str(i): {k: v for k, v in ops.items()} for i, ops in plan.items()}}
+    try:
+        entry["seconds"] = round(sum(float(((_PANTRY.get(str(t.get("key") or "")) or {}).get("clip") or {})
+                                           .get("seconds") or 0) for t in takes), 2)
+        row["seconds"] = entry["seconds"]
+    except Exception:  # noqa: BLE001
+        pass
+    _CALL_PROD.update(made=int(_CALL_PROD["made"]) + (1 if done else 0),
+                      failed=int(_CALL_PROD["failed"]) + (0 if done else 1),
+                      last=str(entry.get("prep_name") or ""), at=time.time())
+    _pantry_save(True)
+    try:
+        _production_feed.note("produced", "caller",
+                              "; ".join("%s: %s" % (i, ", ".join(ops.get("why") or [])) for i, ops in sorted(plan.items())),
+                              label="a produced call", caller=str(entry.get("prep_name") or "") or None,
+                              made=done, lines=len(takes), seconds=entry.get("seconds"),
+                              assets=", ".join("%s=%s" % (a, asked.get(a, "")) for a in wanted) or None)
+    except Exception:  # noqa: BLE001
+        pass
+    pipeline_log("lookahead", "[call-prod] a banked call was produced while paused: %d of %d takes mixed "
+                 "(%s)" % (done, len(takes), ", ".join(sorted(assets)) or "the phone's own sounds only"))
+    return "produced" if done else "failed"
+
+
+@app.on_event("startup")
+async def _call_producer_start() -> None:
+    async def loop() -> None:
+        while True:
+            await asyncio.sleep(CALL_PRODUCE_EVERY)
+            try:
+                await call_produce_tick()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                pipeline_log("drop", "[call-prod] the call producer stumbled: %s" % type(exc).__name__)
+    asyncio.create_task(loop())
 
 
 _CALL_BACKGROUND: dict[str, Any] = {"at": 0.0, "value": {}}
