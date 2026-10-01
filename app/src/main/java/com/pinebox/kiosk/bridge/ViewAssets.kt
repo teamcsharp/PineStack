@@ -65,6 +65,7 @@ object ViewAssets {
         // the panel's New actor button (registers with the shell).
         "voice-actor-extract.js",
         "filemgr.js",           // the file manager: the disk in the base bar
+        "sfx-db.js",            // [sfx-library] the SFX database window (opened from the file manager)
         // Voice Actor strips: the last eight profiles under each seat
         // (tap assigns, hold auditions a never-aired sample + meter).
         "voice-actor-strips.js",
@@ -174,6 +175,7 @@ object ViewAssets {
         "voice-actor-viz.css",    // the extraction tiles and their 4-line readout
         "voice-actor-extract.css", // the extraction pane: link, library, cart, jobs
         "filemgr.css",          // the file manager popup
+        "sfx-db.css",           // [sfx-library] the SFX database window
         "voice-actor-strips.css",  // the profile strips and the audition sheet
         // #1191/#1202: the glass, its triangles and its headline number. Same
         // finding as the script above - the file was in assets and in no

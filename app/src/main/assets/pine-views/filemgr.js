@@ -346,6 +346,19 @@
     ui.camList.hidden = true;
     cs.appendChild(ui.camList);
     foot.appendChild(cs);
+    /* [sfx-library] the SFX Guy's database: every clip, its thumbnail, its
+       tags and what he knows about it - searchable, editable, exportable */
+    var ds = make('div', 'fm-restore fm-sfxdb');
+    var dh = make('button', 'fm-restore-head');
+    dh.type = 'button';
+    dh.title = 'Search and edit the SFX Guy\'s clip database';
+    dh.appendChild(ico('c:archive', ''));
+    dh.appendChild(make('span', '', 'SFX database'));
+    dh.addEventListener('click', function () {
+      if (root.PineSfxDb && typeof root.PineSfxDb.open === 'function') root.PineSfxDb.open();
+    });
+    ds.appendChild(dh);
+    foot.appendChild(ds);
     /* [memprefs] the tablet's memory limits, as preferences */
     var ms = make('div', 'fm-restore fm-memprefs');
     var mh = make('div', 'fm-restore-head');

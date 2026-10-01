@@ -155599,6 +155599,13 @@ try:
 except Exception as _sfxv_exc:  # noqa: BLE001
     _SFX_VECTORS_RUNTIME = None
     print("sfx vectors did not install: %s: %s" % (type(_sfxv_exc).__name__, _sfxv_exc))
+# [sfx-library] his database as a table: search with suggestions, one entry,
+# edits (words, operator tags), export - sfx_library.py
+try:
+    from sfx_library import install as install_sfx_library
+    install_sfx_library(app, globals())
+except Exception as _sfxl_exc:  # noqa: BLE001
+    print("sfx library did not install: %s: %s" % (type(_sfxl_exc).__name__, _sfxl_exc))
 # [s3-account] THE ORIGIN LEDGER (system3_origin.py): every aired item traced
 # to a table roll, a named forced node, or flagged rogue with its code path;
 # 7 days full, compacted forever; the Untraced list and the daily coverage.

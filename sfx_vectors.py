@@ -421,10 +421,12 @@ class Store:
                          same_text, same_text))
             if not same_text:
                 cur.execute("delete from clip_vec where sid=?", (sid,))
-                cur.execute("delete from facet_tags where sid=?", (sid,))
+                # [sfx-library] a tag the operator wrote outlives a change of the words
+                cur.execute("delete from facet_tags where sid=? and coalesce(how,'') <> 'operator'", (sid,))
+                kept = " ".join(t for (t,) in cur.execute("select tag from facet_tags where sid=?", (sid,)))
                 cur.execute("delete from clips_fts where sid=?", (sid,))
                 cur.execute("insert into clips_fts(sid, name, said, seen_desc, tags) values(?,?,?,?,?)",
-                            (sid, name, said, seen, ""))
+                            (sid, name, said, seen, kept))
                 self._matrix = None
             n += 1
         self.con.commit()
@@ -518,11 +520,14 @@ class Store:
                 for s, tag in scored:
                     if s >= floor:
                         tags.append((facet, tag, round(s, 4)))
-            cur.execute("delete from facet_tags where sid=?", (sid,))
+            # [sfx-library] the keeper re-tags its own; the operator's tags stand
+            cur.execute("delete from facet_tags where sid=? and coalesce(how,'') <> 'operator'", (sid,))
             for facet, tag, w in tags:
-                cur.execute("insert or replace into facet_tags(sid, facet, tag, weight, how) values(?,?,?,?,?)",
+                cur.execute("insert into facet_tags(sid, facet, tag, weight, how) values(?,?,?,?,?) "
+                            "on conflict(sid, facet, tag) do nothing",
                             (sid, facet, tag, w, "anchor cosine"))
-            cur.execute("update clips_fts set tags=? where sid=?", (" ".join(t for _f, t, _w in tags), sid))
+            every = " ".join(t for (t,) in cur.execute("select tag from facet_tags where sid=?", (sid,)))
+            cur.execute("update clips_fts set tags=? where sid=?", (every, sid))
             cur.execute("update clips set tagged_at=? where sid=?", (now, sid))
             n += 1
         self.con.commit()
