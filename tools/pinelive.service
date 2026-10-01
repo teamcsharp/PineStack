@@ -1,5 +1,5 @@
 [Unit]
-Description=PineLive host - the live input (K.O. II / network sender), held on the host for MX Live
+Description=PineLive host - the live input (K.O. Sidekick / network sender), held on the host for MX Live
 After=sound.target network-online.target
 Wants=network-online.target
 

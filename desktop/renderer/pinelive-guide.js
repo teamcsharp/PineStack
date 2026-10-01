@@ -126,7 +126,10 @@
       }
     }
   };
-  var DEFAULT_PROFILE = 'ep-133';
+  /* [plsidekick] The operator's interface is the K.O. Sidekick (EP-136,
+   * USB 2367:9420), not the K.O. II sampler (2026-10-01): a bare
+   * Teenage Engineering id falls to its pages. */
+  var DEFAULT_PROFILE = 'ep-136';
 
   /** Which profile a detected device (or a label) belongs to. The USB name
    *  wins over the station's friendly label: the label is a setting, the
@@ -191,7 +194,7 @@
   }
 
   /** The station's friendly label and the USB descriptor can disagree (the
-   *  host labels 2367:9420 "EP-133 K.O. II"; the descriptor says
+   *  host labelled 2367:9420 "EP-133 K.O. II" until [plsidekick]; the descriptor says
    *  "Teenage Engineering EP-136"). One honest paragraph; '' when there is
    *  nothing to say. `shownProfile` is the profile whose pages are on
    *  screen. */

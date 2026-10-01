@@ -168,7 +168,7 @@
     var i;
     if (want) for (i = 0; i < list.length; i += 1) if (list[i].id === want) return list[i];
     /* [plair] nothing chosen: the instrument by its USB descriptor, not the
-     * first ready row (a keyboard dongle's 8 kHz mic sits ahead of the K.O. II) */
+     * first ready row (a keyboard dongle's 8 kHz mic sits ahead of the K.O. Sidekick) */
     var G = root.PineLiveGuide;
     if (G && G.pickInstrument) { var inst = G.pickInstrument(devices); if (inst) return inst; }
     for (i = 0; i < list.length; i += 1) if (list[i].capture && list[i].status === 'ready') return list[i];
@@ -667,9 +667,35 @@
     }, delay || 0);
   }
 
-  function goLive(unpause) {
+  /* [plroad] WHICH ROAD THE SOUND TAKES. "the spark is unable to detect my
+   * interface" (the operator, 2026-10-01) - the third time a remembered
+   * Network choice (this screen's prefs, or the last set's source on the
+   * server) sent every start and every Detect down the network road while
+   * the K.O. Sidekick sat on the USB list, ready, and nothing opened it.
+   * The hardware outranks the memory: on the network road with NO sender
+   * connected, a ready instrument on USB takes the USB road - and the
+   * switch says so, because the pref is moved to match. A connected sender
+   * keeps the network road; so does a bus with no instrument on it, and so
+   * does Network picked on this screen since it opened - only a REMEMBERED
+   * choice is overruled, never one just made. */
+  function liveRoad() {
     var st = model.state || {};
     var road = ui.prefs.road || (st.source && st.source.kind) || 'usb';
+    if (road !== 'network') return 'usb';
+    if (ui.roadPicked) return 'network';
+    var net = (model.devices && model.devices.network) || {};
+    if (net.sender) return 'network';
+    var G = root.PineLiveGuide;
+    var inst = G && G.pickInstrument ? G.pickInstrument(model.devices) : null;
+    if (!inst || inst.status !== 'ready') return 'network';
+    ui.prefs.road = 'usb';
+    writePrefs();
+    return 'usb';
+  }
+
+  function goLive(unpause) {
+    var st = model.state || {};
+    var road = liveRoad();
     var body = {source: road};
     if (road === 'usb') {
       var dev = (model.settings && model.settings.device) || '';
@@ -694,7 +720,7 @@
   function airTest() {
     var st = model.state || {};
     if (st.armed && st.event && st.event.rehearse) return act('/api/pinelive/stop', {}, null);
-    var road = ui.prefs.road || (st.source && st.source.kind) || 'usb';
+    var road = liveRoad();
     var body = {source: road, rehearse: true};
     if (road === 'usb' && model.settings && model.settings.device) body.device = model.settings.device;
     return act('/api/pinelive/start', body, null);
@@ -775,7 +801,7 @@
       });
       return;
     }
-    var road = ui.prefs.road || (st.source && st.source.kind) || 'usb';
+    var road = liveRoad();
     var body = {enabled: next, source: road};
     if (road === 'usb' && model.settings && model.settings.device) body.device = model.settings.device;
     act('/api/pinelive/event', body, node);
@@ -1944,7 +1970,7 @@
   function monitorLease() {
     var st = model.state || {};
     var src = st.source || {};
-    var road = (ui.prefs && ui.prefs.road) || src.kind || 'usb';
+    var road = liveRoad();
     if (!(ui.visible && ui.open.scope && ui.scopeSeen)) return;
     if (road !== 'usb' || st.armed || model.testing) return;
     var now = Date.now();
@@ -1965,7 +1991,7 @@
   /* [plduck] while a set holds the air and a DJ line plays, the set's own
    * player drops to LIVE_DUCK (-10.8 dB, the station mix's duck) - the
    * terminal that owns the air plays the set directly, so the mix's duck
-   * never reached it and the DJs were buried under the K.O. II. */
+   * never reached it and the DJs were buried under the K.O. Sidekick. */
   var LIVE_DUCK = 0.29;
   function djDuckSync() {
     var st = model.state || {};
@@ -2300,7 +2326,7 @@
     var road = segmented([
       {value: 'usb', label: 'USB into the DGX', title: 'The instrument plugged into the DGX Spark by USB - the main road'},
       {value: 'network', label: 'Network', title: 'A sender page on another machine, over Wi-Fi or the tailnet'}
-    ], function (v) { ui.prefs.road = v; writePrefs(); paint(); }, 'Where the sound comes from');
+    ], function (v) { ui.prefs.road = v; ui.roadPicked = true; writePrefs(); paint(); }, 'Where the sound comes from');
     roadRow.appendChild(road.root);
     b.appendChild(roadRow);
 
@@ -2376,7 +2402,7 @@
     if (ui.confirmUntil.disable && Date.now() < ui.confirmUntil.disable) sub = 'Tap the switch again to end the set and switch MX Live off.';
     setText(parts.sw.caption, sub);
 
-    var road = ui.prefs.road || (st.source && st.source.kind) || 'usb';
+    var road = liveRoad();
     parts.road.set(road);
     var dev = chosenDevice(model.devices, model.settings, st);
     setText(parts.roadCap, road === 'usb'
@@ -3233,7 +3259,7 @@
 
   function currentProfile() {
     var G = root.PineLiveGuide;
-    if (!G) return 'ep-133';
+    if (!G) return 'ep-136';
     var dev = chosenDevice(model.devices, model.settings, model.state);
     var detected = G.profileFor(dev);
     var pick = ui.prefs.profile || 'auto';
@@ -3672,13 +3698,12 @@
   }
 
   function detectRoad() {
-    var road = ui.prefs.road || (model.state && model.state.source && model.state.source.kind) || 'usb';
-    return road === 'network' ? 'network' : 'usb';
+    return liveRoad();
   }
 
   function detectProfile(pick) {
     var G = root.PineLiveGuide;
-    if (!G) return 'ep-133';
+    if (!G) return 'ep-136';
     /* the USB descriptor first: the host's friendly label can disagree
      * with what the hardware says it is */
     var p = pick ? (G.profileFor(String(pick.usb_name || '')) || G.profileFor(pick)) : null;
@@ -4037,7 +4062,7 @@
       {value: 'usb', label: 'USB into the DGX', title: 'The instrument on a USB cable into the DGX Spark - the road in use now'},
       {value: 'network', label: 'Network / desktop app', title: 'A sender on another machine, over Wi-Fi or the tailnet'}
     ], function (v) {
-      ui.prefs.road = v; writePrefs();
+      ui.prefs.road = v; ui.roadPicked = true; writePrefs();
       buildDetectSkeleton(); paintDetect(); detectProbe();
     }, 'Which road the music takes');
     dz.roadSeg.set(road);

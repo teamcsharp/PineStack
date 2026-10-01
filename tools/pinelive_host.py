@@ -2,7 +2,7 @@
 """PineLive host: the live input, held on the host and handed to the station.
 
 MX Live puts the operator's instrument on the air. The instrument is a
-Teenage Engineering K.O. II (USB id 2367:9420, ALSA card "EP136") plugged
+Teenage Engineering K.O. Sidekick (USB id 2367:9420, ALSA card "EP136") plugged
 straight into the DGX; the secondary road is a sender on another machine
 streaming PCM over the LAN or the tailnet. Either way the audio arrives HERE,
 on the host, and not inside the station's container, for four measured
@@ -95,7 +95,7 @@ CAPTURE_REST_S = 3.0
 SCAN_EVERY_S = 10.0
 STATE_EVERY_S = 0.5
 SILENCE_DB = -60.0
-KNOWN_NAMES = {"2367:9420": "EP-133 K.O. II"}         # the operator's name for it
+KNOWN_NAMES = {"2367:9420": "EP-136 K.O. Sidekick"}   # the operator's interface [plsidekick]; not the EP-133 sampler
 WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
 ALSA_TO_FFMPEG = {"S16_LE": "s16le", "S24_3LE": "s24le", "S32_LE": "s32le",
@@ -717,7 +717,7 @@ class Runner:
 class UsbRunner(Runner):
     """arecord (exact hardware parameters, through plughw only for the sample
     format) into the normaliser. arecord rather than ffmpeg's alsa input:
-    its hardware negotiation is explicit, and the K.O. II offers exactly one
+    its hardware negotiation is explicit, and the K.O. Sidekick offers exactly one
     shape (S32_LE, 8 channels, 48 kHz)."""
 
     kind = "usb"
@@ -906,7 +906,7 @@ class Host:
                     return d
             return None
         ready = [d for d in rows if d.get("status") == "ready"]
-        # [plpick] Card order is enumeration luck: the operator's K.O. II
+        # [plpick] Card order is enumeration luck: the operator's K.O. Sidekick
         # sat at card 2 behind a keyboard dongle's 8 kHz mono endpoint at
         # card 1, and first-ready-card armed the dongle. Rank instead:
         # the known interface (KNOWN_NAMES) first, then real audio

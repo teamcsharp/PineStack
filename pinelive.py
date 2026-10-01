@@ -9,7 +9,7 @@
 HOW THE PIECES FIT (contract: pinelive/CONTRACT.md, v2)
 ---------------------------------------------------------
 * THE INPUT lives on the HOST (tools/pinelive_host.py, a systemd service):
-  the K.O. II over ALSA, or a network sender. It hands the station one
+  the K.O. Sidekick over ALSA, or a network sender. It hands the station one
   normalised stream (s16le / 44.1k / stereo) on 127.0.0.1:18095, and its
   state in data/pinelive/host_state.json. This module tells it what to do in
   data/pinelive/control.json. Why the host and not the container is written
@@ -1472,7 +1472,7 @@ class PineLive:
                 if pick is None and not device:
                     ready = [d for d in rows if d.get("status") == "ready"]
                     # [plair] the instrument first, as the host ranks it ([plpick]):
-                    # card order put a keyboard dongle's 8 kHz mic ahead of the K.O. II.
+                    # card order put a keyboard dongle's 8 kHz mic ahead of the K.O. Sidekick.
                     def _rank(d: dict[str, Any]) -> tuple[int, int, int]:
                         te = 0 if str(d.get("usb_id") or "").startswith("2367:") else 1
                         try:
@@ -1488,7 +1488,7 @@ class PineLive:
                     pick = (sorted(ready, key=_rank) or sorted(rows, key=_rank) or [None])[0]
                 if pick is None:
                     return self.refuse("no_device", "no USB capture device %s- plug the "
-                                       "K.O. II in, then look at Devices" %
+                                       "K.O. Sidekick in, then look at Devices" %
                                        (("named %s " % device) if device else ""))
                 if pick.get("status") == "busy":
                     return self.refuse("device_busy", pick.get("hint") or "the device is busy")
@@ -1514,14 +1514,14 @@ class PineLive:
                       % (source, (" " + device) if device else "", REHEARSE_MAX_S // 60))
             return {"ok": True, "code": "", "say": "on-air test - the %s replaces the record "
                     "as soon as it sounds, DJs and all; tap End test to stop" %
-                    ("K.O. II" if source == "usb" else "sender")}
+                    ("K.O. Sidekick" if source == "usb" else "sender")}
         album = bool(s.get("record", True))                        # [pltoggle]
         self.note("start", "MX Live armed (%s%s) - the music keeps playing until the "
                   "input is heard; album recording %s" % (
                       source, (" " + device) if device else "", "on" if album else "off"))
         return {"ok": True, "code": "", "say": "MX Live is armed - waiting for the "
                 "first sound from the %s; album recording %s" % (
-                    "K.O. II" if source == "usb" else "sender",
+                    "K.O. Sidekick" if source == "usb" else "sender",
                     "on" if album else "off (the set airs, nothing is written)")}
 
     def _arm_runtime(self, resume: bool) -> None:
@@ -1595,6 +1595,10 @@ class PineLive:
             self.live_since = 0.0
             self.event = None
             self.token = ""
+            # [plroad] an ended set leaves NO road behind: the last set's
+            # "network" outlived it and sent every later start and Detect down
+            # the network road with the K.O. Sidekick ready on USB (2026-10-01).
+            self.source_kind = None
             self.write_control(test_until=0)
             if self.live is not None:
                 self.live.close()
@@ -1662,7 +1666,7 @@ class PineLive:
             self.token = secrets.token_hex(16)
         self.write_control(test_until=time.time() + seconds)
         return {"ok": True, "code": "", "say": "listening to the %s for %d seconds - "
-                "nothing goes on air" % ("K.O. II" if source == "usb" else "sender",
+                "nothing goes on air" % ("K.O. Sidekick" if source == "usb" else "sender",
                                           seconds)}
 
     # -- the air -------------------------------------------------------------------------
@@ -1813,7 +1817,7 @@ class PineLive:
                     self._set_phase("fallback")
                 self.error("no_signal", "no sound from the %s in %d s - the station keeps "
                            "the air; the set takes it the moment it is heard" % (
-                               "K.O. II" if self.source_kind == "usb" else "sender",
+                               "K.O. Sidekick" if self.source_kind == "usb" else "sender",
                                int(s["arm_timeout"])))
         elif self.phase == "live":
             if rx_ago is None or rx_ago > float(s["dropout_seconds"]):
@@ -2233,7 +2237,7 @@ def troubleshoot(pl: PineLive, device: str = "") -> dict[str, Any]:
         else:
             usb_r, ev = "fail", "no USB audio device (lsusb sees %d devices)" % len(lsusb)
         checks.append(_check("usb", "USB device enumerated", usb_r, ev,
-                             "" if usb_r != "fail" else "plug the K.O. II straight into the DGX "
+                             "" if usb_r != "fail" else "plug the K.O. Sidekick straight into the DGX "
                              "with a data cable, and switch it on"))
         if dev is None:
             for cid, label in (("alsa", "ALSA capture device present"),
@@ -2264,7 +2268,7 @@ def troubleshoot(pl: PineLive, device: str = "") -> dict[str, Any]:
         else:
             cap_r, ev = "unknown", "not tried yet"
         checks.append(_check("capture", "Capture opens", cap_r, ev,
-                             {"fail": "unplug and replug the K.O. II; if it persists, "
+                             {"fail": "unplug and replug the K.O. Sidekick; if it persists, "
                                       "check `arecord -l` on the DGX",
                               "unknown": "press Test"}.get(cap_r, "")))
     else:
@@ -2301,15 +2305,15 @@ def troubleshoot(pl: PineLive, device: str = "") -> dict[str, Any]:
     else:
         sig_r, ev = "unknown", "not listening yet"
     checks.append(_check("signal", "Signal present", sig_r, ev,
-                         "turn the K.O. II's master volume up and play something; check its "
+                         "turn the K.O. Sidekick's master volume up and play something; check its "
                          "USB audio output is on" if sig_r == "fail" else ""))
     if peak is None and test.get("max_peak_db") is not None:
         peak = float(test["max_peak_db"])
     if lv.get("clipping") or test.get("clipped"):
-        lvl_r, ev, fix = "fail", "clipping (peak %s dBFS)" % peak, "turn the K.O. II down a little"
+        lvl_r, ev, fix = "fail", "clipping (peak %s dBFS)" % peak, "turn the K.O. Sidekick down a little"
     elif peak is not None and float(peak) > -120 and float(peak) < -30:
         lvl_r, ev, fix = "fail", "very quiet (peak %.1f dBFS)" % float(peak), \
-            "turn the K.O. II up, or raise live gain in PineLive settings"
+            "turn the K.O. Sidekick up, or raise live gain in PineLive settings"
     elif peak is not None and float(peak) > -120:
         lvl_r, ev, fix = "pass", "peak %.1f dBFS" % float(peak), ""
     else:
