@@ -119,3 +119,10 @@
 .fc-inspect-dl dt { color: #8ea0ad; }
 .fc-inspect-dl dd { margin: 0; overflow-wrap: anywhere; }
 .fc-row .fc-node, .fd-box, .fd-diarow { -webkit-user-select: none; user-select: none; }
+/* [fc-oneway] the bar fits on one row in the script's narrow cell */
+.fc-bar { gap: 4px; padding: 8px 8px; }
+.fc-bar > .fc-btn { padding: 0 8px; }
+.fc-bar > .fc-mode { min-width: 0; }
+.fc-bar > .fc-title { margin-right: 2px; }
+.fc-key { min-width: 56px; }
+.fc-recent { min-width: 64px; }

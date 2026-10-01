@@ -163,15 +163,55 @@
     var e = (flow.edges || []).filter(function (x) { return x.to === id; })[0];
     return e ? e.label : '';
   }
+  /* [fc-oneway] "a flow chart should only flow one direction ... System 3 is
+     intended to be one linear direction" (the operator, 2026-10-01). The station
+     sends every roll of the whole plan first, then the turns, then the gates and
+     steps as they were recorded - so the chart ran down through the rolls, back up
+     to turn 1 and down again. Ordered here, one way: the round's own rolls, then
+     each turn's rolls, the turn, and what the gates and steps did to it; the end. */
+  function ordered(flow) {
+    var nodes = flow.nodes || [];
+    if (flow.__ordered && flow.__orderedOf === nodes) return flow.__ordered;
+    var firstAt = {};                       /* turn index -> when its first roll was drawn */
+    nodes.forEach(function (n) {
+      if (n.type === 'decision' && n.turn_index >= 0 && n.at && (firstAt[n.turn_index] == null || n.at < firstAt[n.turn_index])) {
+        firstAt[n.turn_index] = n.at;
+      }
+    });
+    var turnsAt = Object.keys(firstAt).map(Number).sort(function (a, b) { return a - b; });
+    function groupOf(n) {
+      if (n.type === 'start') return -2;
+      if (n.type === 'end') return 1e9;
+      if (n.type === 'decision') return n.turn_index >= 0 ? n.turn_index : -1;
+      if (n.type === 'turn') return n.index;
+      var m = /\bturn (\d+)\b/i.exec(String(n.text || '') + ' ' + String(n.label || ''));
+      if (m) return Math.max(0, Number(m[1]) - 1);
+      var g = -1;
+      turnsAt.forEach(function (t) { if (n.at && firstAt[t] <= n.at) g = t; });
+      return g;
+    }
+    function rankOf(n) { return n.type === 'start' ? 0 : n.type === 'decision' ? 1 : n.type === 'turn' ? 2 : n.type === 'end' ? 4 : 3; }
+    var out = nodes.map(function (n, i) { return {n: n, g: groupOf(n), r: rankOf(n), s: n.type === 'decision' ? (n.seq || 0) : (n.at || 0), i: i}; });
+    out.sort(function (a, b) { return a.g - b.g || a.r - b.r || a.s - b.s || a.i - b.i; });
+    flow.__ordered = out.map(function (x) { return x.n; });
+    flow.__orderedOf = nodes;
+    return flow.__ordered;
+  }
   function revealUpTo(flow) {
     /* live: up to the turn going out now (and what comes straight after it); otherwise all */
-    var nodes = flow.nodes || [];
+    var nodes = ordered(flow);
     if (!ui.live || !flow.now_turn) return nodes.length;
     var at = -1;
     for (var i = 0; i < nodes.length; i += 1) if (nodes[i].type === 'turn' && nodes[i].now) at = i;
     if (at < 0) return nodes.length;
-    for (var j = at + 1; j < nodes.length && nodes[j].type === 'gate'; j += 1) at = j;
+    for (var j = at + 1; j < nodes.length && (nodes[j].type === 'gate' || nodes[j].type === 'step'); j += 1) at = j;
     return at + 1;
+  }
+  /* [fc-oneway] what the chart follows: the turn on air, else the last turn that
+     aired - never the "planned - not aired yet" end, which is where it kept jumping */
+  function followTarget() {
+    if (ui.nowRow && ui.nowRow.isConnected && !ui.nowRow.hidden) return ui.nowRow;
+    return ui.airedRow && ui.airedRow.isConnected && !ui.airedRow.hidden ? ui.airedRow : null;
   }
   /* [fc-design] one door for both styles; the last flow is kept to repaint a mode switch */
   function paint(flow) {
@@ -199,10 +239,10 @@
       ui.shown = {};
       ui.flowKey = flow.key;
       ui.paintedMode = 'technical';
-      ui.nowRow = null;
+      ui.nowRow = null; ui.airedRow = null;
       ui.prevSig = ''; ui.prevRow = null;                                 /* [fc-inspect] */
     }
-    var nodes = flow.nodes || [];
+    var nodes = ordered(flow);                                           /* [fc-oneway] */
     var upto = revealUpTo(flow);
     var news = 0;
     nodes.forEach(function (n, i) { if (i < upto && !ui.shown[n.id]) news += 1; });
@@ -211,6 +251,7 @@
       var had = ui.shown[n.id];
       if (i >= upto) { if (had) had.hidden = true; return; }
       if (had && n.type === 'turn' && n.now) ui.nowRow = had;            /* [air-jump-any] */
+      if (had && n.type === 'turn' && (n.said || n.aired_at)) ui.airedRow = had;   /* [fc-oneway] */
       if (had) {
         had.hidden = false;
         if (n.type === 'turn') {
@@ -245,6 +286,7 @@
       row.__node = n;                                                     /* [fc-inspect] */
       ui.prevSig = sig; ui.prevRow = row;
       if (n.type === 'turn' && n.now) ui.nowRow = row;                    /* [air-jump-any] */
+      if (n.type === 'turn' && (n.said || n.aired_at)) ui.airedRow = row;   /* [fc-oneway] */
       fresh += 1;
     });
     return fresh;
@@ -404,7 +446,7 @@
     return box;
   }
   function paintDesign(flow) {
-    var nodes = flow.nodes || [];
+    var nodes = ordered(flow);                                           /* [fc-oneway] */
     var upto = revealUpTo(flow);
     var turns = [], byTurn = {};
     nodes.forEach(function (n, i) {
@@ -422,7 +464,7 @@
     ui.flowKey = flow.key;
     ui.paintedMode = 'design';
     ui.shown = {};
-    ui.nowRow = null;
+    ui.nowRow = null; ui.airedRow = null;
     var keep = ui.body.scrollTop;
     ui.body.textContent = '';
     var chart = make('div', 'fd-chart');
@@ -445,6 +487,7 @@
       if (sameFlow && k >= before) box.classList.add('fc-enter');
       chain.appendChild(box);
       if (t.now) ui.nowRow = box;
+      if (t.said || t.aired_at) ui.airedRow = box;                       /* [fc-oneway] */
     });
     var end = nodes[nodes.length - 1];
     if (end && end.type === 'end') chart.appendChild(make('div', 'fd-end', end.label));
@@ -463,7 +506,7 @@
     return all.length ? all[all.length - 1] : ui.body.lastElementChild;
   }
   function scrollNow() {
-    var r = ui.nowRow && ui.nowRow.isConnected && !ui.nowRow.hidden ? ui.nowRow : lastRow();
+    var r = followTarget() || (ui.body && ui.body.firstElementChild);   /* [fc-oneway] the latest aired turn; nothing aired: the top */
     if (!r || !r.scrollIntoView) return;
     ui.autoAt = Date.now();                                  /* our own scroll, not the operator's */
     try { r.scrollIntoView({block: 'center'}); } catch (e) { r.scrollIntoView(); }   /* instant: a smooth glide outlived the guard and read as the operator scrolling away */
@@ -479,7 +522,7 @@
     if (Date.now() - ui.autoAt < 900) return;
     var b = ui.body;
     var atEnd = b.scrollHeight - b.scrollTop - b.clientHeight < 140;
-    var act = ui.nowRow && ui.nowRow.isConnected ? ui.nowRow : null;
+    var act = followTarget();                                  /* [fc-oneway] */
     var seeAct = false;
     if (act) {
       var br = b.getBoundingClientRect(), ar = act.getBoundingClientRect();
@@ -628,7 +671,7 @@
   }
   function paintMode() {
     if (!ui.modeBtn) return;
-    ui.modeBtn.textContent = ui.mode === 'design' ? 'Design' : 'Technical';
+    ui.modeBtn.textContent = ui.mode === 'design' ? 'Design' : 'Tech';
     ui.modeBtn.title = ui.mode === 'design'
       ? 'Design flowchart: the chain as the NodePlan draws it - tap for the Technical flowchart (every draw)'
       : 'Technical flowchart: every draw as it was made - tap for the Design flowchart (the NodePlan chain)';
