@@ -118380,8 +118380,16 @@ async def call_produce_tick() -> str:
     if entry is None:
         return ""
     mark = entry["call"]["callend"]
-    plan = _call_producer.plan_production(mark.get("legs") or [], mark.get("seats") or [], mark)
+    # [no-wedge] every sound is a System 3 roll: the plan offers doors, the dice decide
+    doors = _call_producer.plan_production(mark.get("legs") or [], mark.get("seats") or [], mark)
+    plan, rolled = _call_producer.resolve_plan(
+        doors, lambda key, odds, label: s3_chance(key, odds, label + " [call-prod]"),
+        lambda key, options, weights, label: s3_weighted(key, options, weights, label + " [call-prod]"))
     takes = sorted([t for t in entry.get("takes") or [] if isinstance(t, dict)], key=lambda t: int(t.get("i", -1)))
+    if not plan:
+        entry["produced"] = {"at": time.time(), "takes": 0, "of": len(takes), "rolled": rolled,
+                             "dry": "every door rolled no - this call airs as it was recorded"}
+        return "dry"
     if len(takes) != len(mark.get("legs") or []):
         entry["produced"] = {"at": time.time(), "skipped": "the call's plan and its takes do not line up "
                              "(%d legs, %d takes)" % (len(mark.get("legs") or []), len(takes))}
@@ -118427,7 +118435,7 @@ async def call_produce_tick() -> str:
         if isinstance(keys, list):
             entry["keys"] = [new_key if k == old_key else k for k in keys]
         done += 1
-    entry["produced"] = {"at": time.time(), "takes": done, "of": len(takes),
+    entry["produced"] = {"at": time.time(), "takes": done, "of": len(takes), "rolled": rolled,
                          "assets": {a: Path(p).name for a, p in assets.items()}, "asked": asked,
                          "plan": {str(i): {k: v for k, v in ops.items()} for i, ops in plan.items()}}
     try:
@@ -118501,14 +118509,16 @@ def system3_call_background() -> dict[str, Any]:
         pass
     try:
         heads = [h for h in (_DRUDGE_CACHE.get("headlines") or []) if isinstance(h, dict) and h.get("title")]
-        if heads:
-            out["news"] = str(random.choice(heads[:12]).get("title") or "")[:200]
+        if heads:                                               # [no-wedge] a dice door, not random()
+            out["news"] = str(s3_choice("call.background_news", [str(h.get("title") or "") for h in heads[:12]],
+                                        "the headline a caller may bring up [s3-callarc]", tabled=False))[:200]
     except Exception:  # noqa: BLE001
         pass
     try:
         pile = [p for p in hawk_unsold() if isinstance(p, dict) and p.get("name")]
-        if pile:
-            got = random.choice(pile)
+        if pile:                                                # [no-wedge] a dice door, not random()
+            got = pile[s3_weighted("call.background_unsold", [str(p.get("name")) for p in pile], [1.0] * len(pile),
+                                   "the unsold painting a caller may win [s3-callarc]")]
             out["unsold"] = {"name": str(got.get("name")), "title": str(got.get("name")).rsplit("/", 1)[-1]
                              .rsplit(".", 1)[0].replace("_", " "),
                              "price": got.get("price"), "desc": str(got.get("desc") or "")[:200]}

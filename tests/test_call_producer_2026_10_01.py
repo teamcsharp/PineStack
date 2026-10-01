@@ -19,32 +19,69 @@ LEGS = ["answer", "introduce", "greet", "arc_raises", "arc_fuels", "arc_boils", 
 SEATS = ["A", "C", "A", "C", "B", "C", "A", "C", "C", "A"]
 
 
+def always(key, odds, label):
+    return True
+
+
+def never(key, odds, label):
+    return False
+
+
+def heaviest(key, options, weights, label):
+    return max(range(len(weights)), key=lambda i: weights[i])
+
+
 class Plan(unittest.TestCase):
-    def test_where_each_sound_goes(self):
-        plan = cp.plan_production(LEGS, SEATS, {"resolve": {"tags": ["won", "prize"]}, "wrap": {"polite": True}})
+    """[no-wedge] the plan offers doors; only the dice put a sound in."""
+
+    def test_every_sound_is_a_door_with_odds(self):
+        doors = cp.plan_production(LEGS, SEATS, {"resolve": {"tags": ["won"]}, "wrap": {"polite": True}})
+        keys = [d["key"] for d in doors]
+        for k in ("call.produced.ring", "call.produced.hiss", "call.produced.background", "call.produced.peak_hit",
+                  "call.produced.reaction", "call.produced.hangup"):
+            self.assertIn(k, keys)
+        for d in doors:
+            self.assertIn(d["kind"], ("chance", "choice"))
+            if d["kind"] == "chance":
+                self.assertTrue(0 < d["odds"] < 1, d)          # never certain: it is a roll
+            else:
+                self.assertTrue(all(w > 0 for w in d["weights"]), d)   # every option can come up
+
+    def test_all_doors_open(self):
+        plan, rolled = cp.resolve_plan(cp.plan_production(
+            LEGS, SEATS, {"resolve": {"tags": ["won", "prize"]}, "wrap": {"polite": True}}), always, heaviest)
         self.assertEqual(plan[0]["pre"], ["ring", "pickup"])
         for i, seat in enumerate(SEATS):
             under = (plan.get(i) or {}).get("under") or []
             self.assertEqual("ambience" in under, seat == "C", (i, seat))
         self.assertIn("hit:tension", plan[LEGS.index("arc_boils")]["post"])
         self.assertIn("bed:win", plan[LEGS.index("reaction")]["under"])
-        self.assertIn("hit:win", plan[LEGS.index("reaction")]["post"])
         self.assertEqual(plan[len(LEGS) - 1]["post"], ["hangup_click"])
+        self.assertEqual(len(rolled), 6)
 
-    def test_the_hang_up_matches_the_ending(self):
-        refused = cp.plan_production(LEGS, SEATS, {"resolve": {"tags": ["refused"]}})
-        self.assertEqual(refused[9]["post"], ["hangup_slam"])
-        self.assertIn("hit:lose", refused[7]["post"])
+    def test_all_doors_shut_leave_only_the_picks(self):
+        plan, rolled = cp.resolve_plan(cp.plan_production(LEGS, SEATS, {"resolve": {"tags": ["refused"]}}),
+                                       never, heaviest)
+        self.assertNotIn(0, plan)
+        self.assertEqual(plan[7]["post"], ["hit:lose"])          # the outcome leans, the pick is still a pick
+        self.assertEqual(plan[9]["post"], ["hangup_slam"])
+        self.assertTrue(all(r.get("hit") is False for r in rolled if "hit" in r))
+
+    def test_the_outcome_leans_but_never_decides(self):
         dead = cp.plan_production(LEGS, SEATS, {"wrap": {"dead_line": True}})
-        self.assertEqual(dead[9]["post"], ["busy"])
+        hang = next(d for d in dead if d["key"] == "call.produced.hangup")
+        self.assertEqual(hang["options"][hang["weights"].index(max(hang["weights"]))], "the busy tone")
+        plan, _ = cp.resolve_plan(dead, never, lambda key, o, w, l: 0)     # the dice land on the click anyway
+        self.assertEqual(plan[9]["post"], ["hangup_click"])
 
-    def test_the_manager_gets_the_intercom(self):
+    def test_the_manager_gets_the_intercom_door(self):
         legs = LEGS[:7] + ["manager_cuts_in"] + LEGS[7:]
         seats = SEATS[:7] + ["E"] + SEATS[7:]
-        plan = cp.plan_production(legs, seats, {"resolve": {"manager_act": "x", "tags": ["manager"]}})
-        at = legs.index("manager_cuts_in")
-        self.assertEqual(plan[at]["pre"], ["intercom"])
-        self.assertNotIn("ambience", plan[at]["under"])
+        doors = cp.plan_production(legs, seats, {"resolve": {"manager_act": "x", "tags": ["manager"]}})
+        door = next(d for d in doors if d["key"] == "call.produced.intercom")
+        self.assertEqual(door["at"], [legs.index("manager_cuts_in")])
+        bg = next(d for d in doors if d["key"] == "call.produced.background")
+        self.assertNotIn(legs.index("manager_cuts_in"), bg["at"])
 
     def test_keys_are_new_and_stable(self):
         a = cp.production_key("k1", {"pre": ["ring"]}, {"ambience": "/x.wav"})
@@ -116,6 +153,8 @@ class Station(unittest.TestCase):
                 mock.patch.object(app, "dialogue_row_ready", lambda k, r: True), \
                 mock.patch.object(app, "row_unaired", lambda r: True), \
                 mock.patch.object(app, "_call_prod_asset", asset), \
+                mock.patch.object(app, "s3_chance", lambda *a, **k: True), \
+                mock.patch.object(app, "s3_weighted", lambda key, o, w, l="", **k: 0), \
                 mock.patch.object(app, "_pantry_save", lambda *a, **k: None), \
                 mock.patch.object(app, "station_flow_event", lambda *a, **k: None):
             got = asyncio.run(app.call_produce_tick())
@@ -130,6 +169,7 @@ class Station(unittest.TestCase):
             self.assertEqual(entry["keys"], [t["key"] for t in entry["takes"]])
             self.assertGreater(entry["seconds"], 8.0)              # the ring, the hit and the hang-up were added
             self.assertEqual(asyncio.run(app.call_produce_tick()), "")   # produced once
+            self.assertTrue(entry["produced"]["rolled"])                 # every door's roll is on the record
 
 
 if __name__ == "__main__":

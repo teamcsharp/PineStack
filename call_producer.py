@@ -20,7 +20,9 @@ keyed on words and voice, is never written over):
   the last take       the hang-up, by how the call ended: a click and the
                       dial tone, a slam, or the busy tone of a dead line
 
-plan_production() is pure (legs, seats and the call's end in, a plan out);
+plan_production() is pure and decides NOTHING: it offers dice doors (each
+sound's odds, the outcome only leaning the weights); the station rolls them
+through System 3 and resolve_plan() turns the rolls into per-take ops;
 mix_take() is ffmpeg. The phone's own sounds are SYNTHESISED here, so they
 never depend on what is in the sample library; the hits, the ambience and
 the bed are found by the station (its SFX library and its music) and handed
@@ -67,14 +69,19 @@ def _seat_of(seats: list[str], i: int) -> str:
 
 
 def plan_production(legs: Iterable[Any], seats: Iterable[Any], callend: dict[str, Any] | None,
-                    manager_seat: str = "E") -> dict[int, dict[str, Any]]:
-    """What each take gets, by turn index. Pure: the station decides the assets.
+                    manager_seat: str = "E") -> list[dict[str, Any]]:
+    """The produced call as DICE DOORS - nothing here is decided, only offered.
 
-    `legs` and `seats` are the call's planned legs and speakers in order;
-    `callend` is its mark (resolve tags, wrap, the detour). Returns
-    {index: {"pre": [..], "post": [..], "under": [..], "why": [..]}} with
-    symbolic assets: ring, pickup, intercom, hangup_click, hangup_slam, busy,
-    hiss, ambience, bed:win, hit:tension, hit:win, hit:lose."""
+    "the point of system 3 is to unify everything under a procedural node based
+    system. So i want no wedging. I need it all happening by chance."
+                                                        - the operator, 2026-10-01
+    Each door is a roll the station makes through System 3 (s3_chance /
+    s3_weighted), so every sound in a produced call is a recorded draw: a
+    `chance` door ({key, odds}) puts its asset in or leaves it out; a `choice`
+    door ({key, options, weights}) picks one - the call's own outcome LEANS the
+    weights (a win leans the fanfare, a refusal the slam) but never decides.
+    Every door names the take(s) it acts on (`at`), the slot (pre/post/under)
+    and why. resolve_plan() turns the rolled doors into per-take ops."""
     legs = [str(x or "") for x in legs or []]
     seats = [str(x or "") for x in seats or []]
     ce = callend if isinstance(callend, dict) else {}
@@ -82,48 +89,78 @@ def plan_production(legs: Iterable[Any], seats: Iterable[Any], callend: dict[str
     tags = {str(t) for t in res.get("tags") or []}
     wrap = ce.get("wrap") if isinstance(ce.get("wrap"), dict) else {}
     n = len(legs)
-    plan: dict[int, dict[str, Any]] = {}
-
-    def at(i: int) -> dict[str, Any]:
-        return plan.setdefault(i, {"pre": [], "post": [], "under": [], "why": []})
-
     if n == 0:
-        return plan
-    at(0)["pre"] += ["ring", "pickup"]
-    at(0)["why"].append("the line rings and is picked up")
-    has_manager = bool(res.get("manager_act")) or "manager_cuts_in" in legs
-    for i, seat in enumerate(seats[:n]):
-        if seat in CALLER_SEATS and not (has_manager and seat == manager_seat and legs[i] == "manager_cuts_in"):
-            at(i)["under"] += ["hiss", "ambience"]
-            at(i)["why"].append("the caller is on a phone line, with their own room behind them")
+        return []
+    doors: list[dict[str, Any]] = []
+    callers = [i for i, seat in enumerate(seats[:n])
+               if seat in CALLER_SEATS and legs[i] != "manager_cuts_in"]
+    doors.append({"kind": "chance", "key": "call.produced.ring", "odds": 0.9, "at": [0], "slot": "pre",
+                  "assets": ["ring", "pickup"], "label": "the line rings and is picked up before the host speaks"})
+    if callers:
+        doors.append({"kind": "chance", "key": "call.produced.hiss", "odds": 0.85, "at": callers, "slot": "under",
+                      "assets": ["hiss"], "label": "the caller's line hisses"})
+        doors.append({"kind": "chance", "key": "call.produced.background", "odds": 0.7, "at": callers,
+                      "slot": "under", "assets": ["ambience"], "label": "the caller has a room behind them"})
     if "manager_cuts_in" in legs:
-        i = legs.index("manager_cuts_in")
-        at(i)["pre"].append("intercom")
-        at(i)["under"].append("hiss")
-        at(i)["why"].append("the manager cuts in over the intercom")
+        doors.append({"kind": "chance", "key": "call.produced.intercom", "odds": 0.9,
+                      "at": [legs.index("manager_cuts_in")], "slot": "pre", "assets": ["intercom"],
+                      "label": "the intercom chimes before the manager cuts in"})
     peaks = [i for i, leg in enumerate(legs) if leg in PEAK_BEATS]
     if peaks:
-        at(peaks[0])["post"].append("hit:tension")
-        at(peaks[0])["why"].append("the arc peaks here")
+        doors.append({"kind": "chance", "key": "call.produced.peak_hit", "odds": 0.6, "at": [peaks[0]],
+                      "slot": "post", "assets": ["hit:tension"], "label": "a hit where the arc peaks"})
     if "reaction" in legs:
-        i = legs.index("reaction")
-        if tags & {"won", "sale", "prize", "painting", "honour", "granted"}:
-            at(i)["under"].append("bed:win")
-            at(i)["post"].append("hit:win")
-            at(i)["why"].append("they won: a bed under it and a fanfare")
-        elif tags & {"refused", "short", "fire", "disagree"}:
-            at(i)["post"].append("hit:lose")
-            at(i)["why"].append("it went against them")
-    last = n - 1
-    if wrap.get("dead_line") or ce.get("ended"):
-        hang, why = "busy", "the line went dead"
-    elif tags & {"refused", "fire"} or not wrap.get("polite", True):
-        hang, why = "hangup_slam", "the phone goes down hard"
-    else:
-        hang, why = "hangup_click", "the call is hung up"
-    at(last)["post"].append(hang)
-    at(last)["why"].append(why)
-    return plan
+        won = bool(tags & {"won", "sale", "prize", "painting", "honour", "granted"})
+        lost = bool(tags & {"refused", "short", "fire", "disagree"})
+        doors.append({"kind": "choice", "key": "call.produced.reaction", "at": [legs.index("reaction")],
+                      "label": "what sounds under and after the caller's reaction",
+                      "options": ["a bed and a fanfare", "a losing hit", "nothing"],
+                      "weights": [4.0 if won else 0.6, 3.0 if lost else 0.6, 1.0],
+                      "ops": [{"under": ["bed:win"], "post": ["hit:win"]}, {"post": ["hit:lose"]}, {}]})
+    dead = bool(wrap.get("dead_line") or ce.get("ended"))
+    angry = bool(tags & {"refused", "fire"}) or wrap.get("polite") is False
+    doors.append({"kind": "choice", "key": "call.produced.hangup", "at": [n - 1],
+                  "label": "how the phone goes down",
+                  "options": ["a click and the dial tone", "a slam", "the busy tone"],
+                  "weights": [0.3 if dead else (1.0 if angry else 4.0), 0.3 if dead else (4.0 if angry else 1.0),
+                              6.0 if dead else 0.3],
+                  "ops": [{"post": ["hangup_click"]}, {"post": ["hangup_slam"]}, {"post": ["busy"]}]})
+    return doors
+
+
+def resolve_plan(doors: Iterable[dict[str, Any]], chance: Any, weighted: Any) -> tuple[dict[int, dict[str, Any]],
+                                                                                    list[dict[str, Any]]]:
+    """Roll every door - `chance(key, odds, label) -> bool`, `weighted(key, options,
+    weights, label) -> index` (the station passes System 3's s3_chance and
+    s3_weighted) - into {take index: {pre, post, under, why}} and the record of
+    what each door rolled."""
+    plan: dict[int, dict[str, Any]] = {}
+    rolled: list[dict[str, Any]] = []
+
+    def at(i: int) -> dict[str, Any]:
+        return plan.setdefault(int(i), {"pre": [], "post": [], "under": [], "why": []})
+
+    for d in doors or []:
+        if d.get("kind") == "chance":
+            hit = bool(chance(d["key"], float(d.get("odds") or 0), d.get("label") or d["key"]))
+            rolled.append({"key": d["key"], "odds": d.get("odds"), "hit": hit, "label": d.get("label")})
+            if hit:
+                for i in d.get("at") or []:
+                    at(i)[d.get("slot") or "post"] += list(d.get("assets") or [])
+                    at(i)["why"].append(str(d.get("label") or d["key"]))
+        elif d.get("kind") == "choice":
+            k = int(weighted(d["key"], list(d.get("options") or []), list(d.get("weights") or []),
+                             d.get("label") or d["key"]))
+            k = k if 0 <= k < len(d.get("options") or []) else 0
+            rolled.append({"key": d["key"], "picked": (d.get("options") or [""])[k], "label": d.get("label"),
+                           "weights": d.get("weights")})
+            ops = (d.get("ops") or [{}])[k] if k < len(d.get("ops") or []) else {}
+            for i in d.get("at") or []:
+                for slot in ("pre", "post", "under"):
+                    at(i)[slot] += list(ops.get(slot) or [])
+                if ops:
+                    at(i)["why"].append("%s: %s" % (d.get("label") or d["key"], (d.get("options") or [""])[k]))
+    return {i: ops for i, ops in plan.items() if ops["pre"] or ops["post"] or ops["under"]}, rolled
 
 
 def production_key(key: str, ops: dict[str, Any], assets: dict[str, str]) -> str:
