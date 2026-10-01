@@ -18363,6 +18363,40 @@ CUPBOARD_UNHEARD_EVERY = float(os.getenv("PINE_UNHEARD_EVERY", "420"))
 _UNHEARD_AT = [0.0]
 _UNHEARD_LOG: list[dict[str, Any]] = []
 _UNHEARD_REFUSED: dict[int, float] = {}
+# [road-backoff] 2026-10-01: a ROAD the booth keeps refusing stands aside.
+# Measured: 55 rescue walks, 53 of them "an advert refused: the booth did
+# not put it out", 0 airings - each refused ad stood aside for five
+# minutes, the next-oldest ad (139 unheard) was picked instead, and the
+# finished DJ rounds behind them were never reached while the room sat
+# silent. Two refusals in a row and the whole road sits out a while.
+UNHEARD_ROAD_STRIKES = 2
+UNHEARD_ROAD_REST = float(os.getenv("PINE_UNHEARD_ROAD_REST", "600"))
+_UNHEARD_ROAD_OUT: dict[str, dict[str, Any]] = {}
+
+
+def unheard_road_out(kind: str, now: float | None = None) -> bool:
+    """[road-backoff] is this road sitting out of the cupboard rescue?"""
+    held = _UNHEARD_ROAD_OUT.get(str(kind)) or {}
+    return float(held.get("until") or 0) > (time.time() if now is None else now)
+
+
+def unheard_road_refused(kind: str, why: str) -> None:
+    """[road-backoff] one more booth refusal on this road, in a row."""
+    held = _UNHEARD_ROAD_OUT.setdefault(str(kind), {"n": 0, "until": 0.0})
+    held["n"] = int(held.get("n") or 0) + 1
+    if held["n"] >= UNHEARD_ROAD_STRIKES and not unheard_road_out(kind):
+        held["until"] = time.time() + UNHEARD_ROAD_REST
+        try:
+            pipeline_log("drop", "[road-backoff] the %s road was refused %d times in a row at "
+                         "the booth (%s) - the silence rescue skips it for %d min and "
+                         "tries the other roads" % (kind, held["n"], why or "no reason given",
+                                                    int(UNHEARD_ROAD_REST // 60)))
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def unheard_road_aired(kind: str) -> None:
+    _UNHEARD_ROAD_OUT.pop(str(kind), None)
 _UNHEARD_PENDING_HANDOFFS: set[asyncio.Event] = set()
 UNHEARD_HANDOFF_TIMEOUT = 60.0
 # #1265: this walks every shelf and the larder, and it rides in
@@ -18993,6 +19027,8 @@ def unheard_pick() -> tuple[str, dict[str, Any] | None, float]:
         pass
     try:
         for kind in RESCUE_ROADS_OPEN:
+            if unheard_road_out(kind, now):                  # [road-backoff]
+                continue
             for row in shelf_rows(kind):
                 if not isinstance(row, dict) or not row_unaired(row):
                     continue
@@ -19684,6 +19720,7 @@ async def unheard_stock_air(force: bool = False) -> str:
         if accounted:
             return
         accounted = True
+        unheard_road_aired(kind)                             # [road-backoff]
         _RESCUE_AT[0] = time.time()
         _UNHEARD_SWEEP.update({
             "at": time.time(), "why": "aired",
@@ -19740,6 +19777,7 @@ async def unheard_stock_air(force: bool = False) -> str:
         # sat in the cupboard. Pacing a walk is worth an interval;
         # failing once is not.
         _UNHEARD_AT[0] = min(now, now - rest + UNHEARD_RETRY_EVERY)
+        unheard_road_refused(kind, door)                     # [road-backoff]
         return _unheard_no(
             ("%s refused: %s" % (SHELF_LABEL.get(kind, kind), door)) if door
             else "the air's own door refused the row it picked")
@@ -117508,7 +117546,9 @@ async def _banter_air(entry: dict[str, Any],
     if script_has_forgotten_line(str(entry.get("script") or ""),
                                  str(entry.get("caller_name") or ""),
                                  str(entry.get("caller2_name") or "")):
-        return []
+        # [road-backoff] the last refusal here that said nothing: the
+        # cupboard logged "the booth did not put it out" with no reason
+        return _banter_no("a line in it is on the forgotten-lines list")
     _scheduled_window = None
     if ready_takes is None and entry.get("prep_kind") and not entry.get("_ready_free"):
         _scheduled_window = (entry.get("_ready_slot")
