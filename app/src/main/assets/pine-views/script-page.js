@@ -23693,6 +23693,10 @@
       flowBtn.setAttribute('aria-pressed', String(on));
       if (root.PineFlowChart) root.PineFlowChart.show(flowPane, on);
       else if (on) flowPane.textContent = 'The flowchart did not load.';
+      /* [fc-design] "The moment I jump into flowchart view, put it on the latest message" */
+      if (on && root.PineFlowChart && typeof root.PineFlowChart.jumpLive === 'function') {
+        try { root.PineFlowChart.jumpLive(String(sayingLineId || nowLineId || '')); } catch (e) { /* the chart is loading */ }
+      }
     });
     /* System 3's views, over the script in the script's own cell. */
     var s3Pane = make('div', 'sp-s3');

@@ -940,3 +940,9 @@ body.pine-splice-open > :not(.lb-editor-overlay) * { animation-play-state:paused
 .pine-rollpop-table b { color: #c8d4d9; font-size: 12px; }
 .pine-rollpop-table ul { margin: 2px 0 0; padding: 0; list-style: none; }
 .pine-rollpop-say { margin: 8px 0 0; min-height: 16px; color: #e5c778; font-size: 12px; }
+/* [ad-band] the H3 group holds its own controls (P, the dice, the gear): it may not be
+   squeezed under them - they lay on top of "+" and the count. Its meter shrinks instead. */
+.pine-voice-ad-card .pav-head .pav-h3 { flex: 1 1 auto; min-width: auto; }
+.pine-voice-ad-card .pav-head .pav-h3 > * { flex-shrink: 0; }
+.pine-voice-ad-card .pav-head .pav-h3 > .pav-h3-meter { flex: 1 1 40px; min-width: 24px; flex-shrink: 1; }
+.pine-voice-ad-card .pav-head .pav-position { flex: 0 0 auto; }

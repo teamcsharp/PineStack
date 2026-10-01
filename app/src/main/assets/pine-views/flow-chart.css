@@ -67,3 +67,41 @@
 .sp-script[hidden] { display: none; }
 .fc-bar > .fc-title, .fc-bar > .fc-btn { flex: 0 0 auto; white-space: nowrap; }
 .fc-row.fc-flash { outline: 2px solid #8de1ed; outline-offset: 4px; border-radius: 10px; transition: outline-color .4s; }
+/* [fc-design] the mode toggle and Follow */
+.fc-bar > .fc-mode { min-width: 84px; }
+.fc-bar > .fc-follow { border-color: #e5c778; color: #e5c778; }
+.fc-bar > .fc-follow[hidden] { display: none; }
+/* [fc-design] THE DESIGN FLOWCHART - docs/NodePlan/NODE_img.png: a spine, the
+   Initiator, Replies hanging off it, the Rebuttal back on the spine, the Topic
+   Change, dice diamonds between, the electee mark, planned turns dashed */
+.fd-chart { display: grid; gap: 18px; padding: 6px 4px 30px; }
+.fd-title { color: #8ea0ad; font-size: 12px; }
+.fd-chain { position: relative; display: grid; gap: 8px; padding-left: 22px; }
+.fd-chain::before { content: ''; position: absolute; left: 9px; top: 26px; bottom: 6px; width: 2px; background: #3d5560; border-radius: 1px; }
+.fd-chapter { color: #8de1ed; font: 600 11px/1.4 Inter, Segoe UI, system-ui, sans-serif; letter-spacing: .12em; text-transform: uppercase; margin-left: -22px; }
+.fd-box { position: relative; max-width: 560px; padding: 8px 12px; border: 2px solid #c8d4d9; border-radius: 6px; background: #0f1a20; }
+.fd-box::before { content: ''; position: absolute; left: -15px; top: 18px; width: 13px; height: 2px; background: #3d5560; }
+.fd-box.fd-reply { margin-left: 38px; }
+.fd-box.fd-reply::before { left: -53px; width: 51px; }
+.fd-box.fd-initiator, .fd-box.fd-rebuttal, .fd-box.fd-topic { margin-left: 0; }
+.fd-box.fd-topic { border-color: #e5c778; }
+.fd-box.fd-rebuttal { border-color: #8de1ed; }
+.fd-box.planned { border-style: dashed; border-color: #6f8590; background: transparent; }
+.fd-box.now { box-shadow: 0 0 0 2px #8de1ed, 0 0 18px #8de1ed55; }
+.fd-box-head { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+.fd-box-head > b { color: #f3f8fa; font: 600 15px/1.2 Inter, Segoe UI, system-ui, sans-serif; }
+.fd-who { color: #9fb4c0; font-size: 12px; }
+.fd-said { margin: 6px 0 0; color: #e7f0f3; font-size: 13px; line-height: 1.45; }
+.fd-asked { margin: 6px 0 0; color: #8ea0ad; font-size: 12.5px; font-style: italic; }
+/* the electee: a circle holding a dot and a diamond - picked from the cast by the raffle */
+.fd-elect { display: inline-flex; align-items: center; justify-content: center; gap: 2px; width: 26px; height: 22px;
+  border: 2px solid #c8d4d9; border-radius: 50%; }
+.fd-elect-dot { width: 5px; height: 5px; border-radius: 50%; background: #c8d4d9; }
+.fd-elect-dia { width: 6px; height: 6px; border: 1.5px solid #c8d4d9; transform: rotate(45deg); }
+.fd-diarow { display: flex; align-items: center; gap: 8px; margin-left: 8px; color: #c8d4d9; font-size: 12px; }
+.fd-dia { display: inline-grid; place-items: center; width: 22px; height: 22px; border: 2px solid #e5c778; transform: rotate(45deg); background: #13222c; }
+.fd-dia-in { transform: rotate(-45deg); font: 600 9px/1 ui-monospace, Consolas, monospace; color: #e5c778; }
+.fd-dia-odds { color: #e5c778; font: 600 12px/1 ui-monospace, Consolas, monospace; min-width: 40px; }
+.fd-dia-label { color: #9fb4c0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fd-end { color: #8ea0ad; font-style: italic; font-size: 12px; }
+.fd-box.fc-flash { outline: 2px solid #8de1ed; outline-offset: 4px; }

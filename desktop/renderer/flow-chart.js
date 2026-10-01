@@ -20,8 +20,11 @@
 
   var POLL_MS = 2000;
   var STAGGER_MS = 110;
+  var BG_MS = 10000;          /* [fc-design] off screen, the latest conversation is still fetched and kept */
   var ui = {pane: null, on: false, live: true, key: '', flowKey: '', timer: 0, busy: false,
-            shown: {}, body: null, status: null, keyBox: null, liveBtn: null, recent: null, reveal: -1};
+            shown: {}, body: null, status: null, keyBox: null, liveBtn: null, recent: null, reveal: -1,
+            mode: 'technical', follow: true, cache: {}, lastFlow: null, autoAt: 0, modeBtn: null, followBtn: null};
+  try { if (root.localStorage && root.localStorage.getItem('pine.fc.mode') === 'design') ui.mode = 'design'; } catch (e) { /* no storage */ }
 
   /* ------------------------------------------------------------ roads */
   function bridge() { var b = root.pineDesktop; return b && typeof b.get === 'function' ? b : null; }
@@ -170,15 +173,38 @@
     for (var j = at + 1; j < nodes.length && nodes[j].type === 'gate'; j += 1) at = j;
     return at + 1;
   }
+  /* [fc-design] one door for both styles; the last flow is kept to repaint a mode switch */
   function paint(flow) {
-    if (!ui.body) return;
-    if (flow.key !== ui.flowKey) {
+    if (!ui.body || !flow) return;
+    ui.lastFlow = flow;
+    if (flow.key) ui.cache[flow.key] = flow;
+    var fresh = ui.mode === 'design' ? paintDesign(flow) : paintTech(flow);
+    var c = flow.counts || {};
+    say('#' + flow.key + ' · ' + (flow.road || '') + ' · ' + (c.decisions || 0) + ' draws · ' + (c.turns || 0)
+      + ' turns (' + (c.aired || 0) + ' aired) · ' + (c.candidates_lost || 0) + ' candidates beaten'
+      + (ui.follow ? '' : ' · not following - tap Follow'));
+    if (ui.wantJump || (fresh && ui.follow)) {
+      ui.wantJump = false;
+      root.setTimeout(scrollNow, Math.min(fresh, ANIMATE_LAST) * STAGGER_MS + 40);
+    }
+  }
+  /* [fc-design] "its blank atm": a conversation is hundreds of draws, and every new
+     row waited 110 ms behind the one before - the last appeared a minute later, and
+     the jump to the bottom landed on rows still invisible. Only the last few new
+     rows animate now; the rest are there at once. */
+  var ANIMATE_LAST = 8;
+  function paintTech(flow) {
+    if (flow.key !== ui.flowKey || ui.paintedMode !== 'technical') {
       ui.body.textContent = '';
       ui.shown = {};
       ui.flowKey = flow.key;
+      ui.paintedMode = 'technical';
+      ui.nowRow = null;
     }
     var nodes = flow.nodes || [];
     var upto = revealUpTo(flow);
+    var news = 0;
+    nodes.forEach(function (n, i) { if (i < upto && !ui.shown[n.id]) news += 1; });
     var fresh = 0;
     nodes.forEach(function (n, i) {
       var had = ui.shown[n.id];
@@ -192,41 +218,163 @@
         }
         return;
       }
-      var delay = fresh * STAGGER_MS;
+      var k = fresh - (news - ANIMATE_LAST);
+      var delay = k > 0 ? k * STAGGER_MS : 0;
       var row = make('div', 'fc-row fc-row-' + n.type);
       var lab = i ? edgeLabel(flow, n.id) : '';
       if (i) row.appendChild(make('div', 'fc-edge', lab ? '▼ ' + lab : '▼'));
-      var node = nodeFor(n, delay);
-      row.appendChild(node);
-      row.classList.add('fc-enter');
-      row.style.animationDelay = delay + 'ms';
+      row.appendChild(nodeFor(n, delay));
+      if (k >= 0) {
+        row.classList.add('fc-enter');
+        row.style.animationDelay = delay + 'ms';
+      }
       ui.body.appendChild(row);
       ui.shown[n.id] = row;
       if (n.type === 'turn' && n.now) ui.nowRow = row;                    /* [air-jump-any] */
       fresh += 1;
     });
-    if (ui.wantJump) {                                                    /* [air-jump-any] */
-      ui.wantJump = false;
-      root.setTimeout(scrollNow, fresh * STAGGER_MS + 30);
-      return;
+    return fresh;
+  }
+
+  /* [fc-design] THE DESIGN FLOWCHART, the operator's NodePlan drawn from the record
+     (docs/NodePlan/NODE_img.png, nodeplan.md): the chain's spine - Initiator, its
+     Replies hanging off it, the Rebuttal back on the spine, the Topic Change that
+     segues to the next chapter - with the dice that steered it as diamonds between
+     the boxes (their odds as 1:N, the d100 they landed), the raffle's electee mark on
+     every speaker, and planned turns not yet spoken as dashed boxes. */
+  var DESIGN_DICE = {GRAPH: 1, CUTIN: 1, FL: 1, TOPIC: 1, LENGTH: 1, TEMPER: 1, SHOCK: 1};
+  function roleOf(t) {
+    var a = String(t.asked || t.leg || '').toLowerCase();
+    if (/opens this chapter|opens the subject|initiat/.test(a)) return 'initiator';
+    if (/answers the replies to their opening|rebuttal/.test(a)) return 'rebuttal';
+    if (/segues|next discussion point|topic change|new topic/.test(a)) return 'topic';
+    return 'reply';
+  }
+  function odds(n) {
+    if (n.odds != null && Number(n.odds) > 0) {
+      var p = Number(n.odds);
+      return p >= 0.95 ? 'sure' : (p <= 0.5 && Math.abs(1 / p - Math.round(1 / p)) < 0.08 ? '1:' + Math.round(1 / p) : Math.round(p * 100) + '%');
     }
-    var c = flow.counts || {};
-    say('#' + flow.key + ' · ' + (flow.road || '') + ' · ' + (c.decisions || 0) + ' draws · ' + (c.turns || 0)
-      + ' turns (' + (c.aired || 0) + ' aired) · ' + (c.candidates_lost || 0) + ' candidates beaten');
-    if (fresh && ui.live) {
-      var last = ui.body.lastElementChild;
-      if (last && last.scrollIntoView) root.setTimeout(function () { try { last.scrollIntoView({block: 'end', behavior: 'smooth'}); } catch (e) { /* old engine */ } }, fresh * STAGGER_MS);
-    }
+    return n.of > 1 ? '1:' + n.of : '';
+  }
+  function designDiamond(n) {
+    var row = make('div', 'fd-diarow');
+    var dia = make('span', 'fd-dia');
+    dia.appendChild(make('span', 'fd-dia-in', n.dice == null ? '–' : String(n.dice)));
+    row.appendChild(dia);
+    var o = odds(n);
+    row.appendChild(make('span', 'fd-dia-odds', o ? '(' + o + ')' : ''));
+    var w = n.winner ? n.winner.label : (n.path || []).slice(-1)[0] || n.label;
+    row.appendChild(make('span', 'fd-dia-label', (n.family || 'roll') + ': ' + cut(w, 80)));
+    row.title = (n.path || []).join(' › ') + (n.of ? '  ·  ' + n.of + ' in the drum' : '')
+      + ((n.losers || []).length ? '\nbeat: ' + n.losers.map(function (l) { return l.label + (l.p != null ? ' ' + pct(l.p) : ''); }).join(' | ') : '');
+    return row;
+  }
+  function designBox(t, label, role) {
+    var spoken = !!(t.said || t.aired_at);
+    var box = make('div', 'fd-box fd-' + role + (spoken ? '' : ' planned') + (t.now ? ' now' : ''));
+    var head = make('div', 'fd-box-head');
+    head.appendChild(make('b', '', label));
+    var elect = make('span', 'fd-elect');
+    elect.title = (t.who || t.seat) + ' - elected from the cast for this place (the raffle)';
+    elect.appendChild(make('i', 'fd-elect-dot'));
+    elect.appendChild(make('i', 'fd-elect-dia'));
+    head.appendChild(elect);
+    head.appendChild(make('span', 'fd-who', (t.who || t.seat || '') + (t.feeling ? ' · ' + t.feeling : '')));
+    (t.codes || []).forEach(function (c) { head.appendChild(codeChip(c)); });
+    box.appendChild(head);
+    box.appendChild(make('p', spoken && t.said ? 'fd-said' : 'fd-asked', spoken && t.said ? '“' + cut(t.said, 300) + '”' : cut(t.asked, 220)));
+    return box;
+  }
+  function paintDesign(flow) {
+    var nodes = flow.nodes || [];
+    var upto = revealUpTo(flow);
+    var turns = [], byTurn = {};
+    nodes.forEach(function (n, i) {
+      if (i >= upto) return;
+      if (n.type === 'turn') turns.push(n);
+      else if (n.type === 'decision' && DESIGN_DICE[n.family] && n.turn_index >= 0) {
+        (byTurn[n.turn_index] = byTurn[n.turn_index] || []).push(n);
+      }
+    });
+    var sig = flow.key + '|' + turns.map(function (t) { return t.index + (t.said ? 's' : '') + (t.now ? 'n' : ''); }).join(',');
+    if (sig === ui.designSig && ui.paintedMode === 'design') return 0;
+    var before = ui.designCount || 0;
+    var sameFlow = ui.flowKey === flow.key && ui.paintedMode === 'design';
+    ui.designSig = sig;
+    ui.flowKey = flow.key;
+    ui.paintedMode = 'design';
+    ui.shown = {};
+    ui.nowRow = null;
+    var keep = ui.body.scrollTop;
+    ui.body.textContent = '';
+    var chart = make('div', 'fd-chart');
+    var start = nodes[0] && nodes[0].type === 'start' ? nodes[0] : null;
+    if (start) chart.appendChild(make('div', 'fd-title', cut([start.road, start.topic].filter(Boolean).join(' · '), 200)));
+    var chapter = 0, replyN = 0, chain = null;
+    turns.forEach(function (t, k) {
+      var role = roleOf(t);
+      if (role === 'initiator' || !chain) {
+        chapter += 1; replyN = 0;
+        chain = make('section', 'fd-chain');
+        chain.appendChild(make('div', 'fd-chapter', 'Chapter ' + chapter));
+        chart.appendChild(chain);
+      }
+      (byTurn[t.index] || []).forEach(function (d) { chain.appendChild(designDiamond(d)); });
+      var label = role === 'initiator' ? 'Initiator' : role === 'rebuttal' ? 'Rebuttal'
+        : role === 'topic' ? 'Topic Change' : 'Reply ' + String.fromCharCode(65 + (replyN++ % 26));
+      var box = designBox(t, label, role);
+      if (sameFlow && k >= before) box.classList.add('fc-enter');
+      chain.appendChild(box);
+      if (t.now) ui.nowRow = box;
+    });
+    var end = nodes[nodes.length - 1];
+    if (end && end.type === 'end') chart.appendChild(make('div', 'fd-end', end.label));
+    ui.body.appendChild(chart);
+    if (sameFlow) ui.body.scrollTop = keep;
+    var fresh = sameFlow ? Math.max(0, turns.length - before) : turns.length;
+    ui.designCount = turns.length;
+    return fresh;
   }
 
   /* [air-jump-any] the strip's tap while the chart is up: back to Live, and to the
      turn going out now (the last shown node when the chart names none). */
+  function lastRow() {
+    if (!ui.body) return null;
+    var all = ui.body.querySelectorAll('.fc-row:not([hidden]), .fd-box');
+    return all.length ? all[all.length - 1] : ui.body.lastElementChild;
+  }
   function scrollNow() {
-    var r = ui.nowRow && ui.nowRow.isConnected && !ui.nowRow.hidden ? ui.nowRow : (ui.body && ui.body.lastElementChild);
+    var r = ui.nowRow && ui.nowRow.isConnected && !ui.nowRow.hidden ? ui.nowRow : lastRow();
     if (!r || !r.scrollIntoView) return;
+    ui.autoAt = Date.now();                                  /* our own scroll, not the operator's */
     try { r.scrollIntoView({block: 'center', behavior: 'smooth'}); } catch (e) { r.scrollIntoView(); }
     r.classList.add('fc-flash');
     root.setTimeout(function () { r.classList.remove('fc-flash'); }, 1400);
+  }
+  /* [fc-design] "If i am on the latest message, have it scroll to the next flowchart
+     items and continue to follow it unless I scroll away from the active" (the
+     operator, 2026-10-01). A hand scroll that leaves the active node and the end
+     stops the following; scrolling back to either, Follow, Live or the strip's tap
+     starts it again. Never a timed re-follow. */
+  function onScroll() {
+    if (Date.now() - ui.autoAt < 900) return;
+    var b = ui.body;
+    var atEnd = b.scrollHeight - b.scrollTop - b.clientHeight < 140;
+    var act = ui.nowRow && ui.nowRow.isConnected ? ui.nowRow : null;
+    var seeAct = false;
+    if (act) {
+      var br = b.getBoundingClientRect(), ar = act.getBoundingClientRect();
+      seeAct = ar.bottom > br.top && ar.top < br.bottom;
+    }
+    setFollow(atEnd || seeAct);
+  }
+  function setFollow(on) {
+    if (ui.follow === !!on) return;
+    ui.follow = !!on;
+    if (ui.followBtn) {
+      ui.followBtn.hidden = ui.follow;
+    }
   }
   function jumpLive(lid) {
     if (!ui.on) return false;
@@ -237,6 +385,7 @@
     ui.jumpLid = /^[0-9a-f]{6,32}$/i.test(String(lid || '')) ? String(lid).toLowerCase() : '';
     ui.fallbackFor = '';
     ui.wantJump = true;
+    setFollow(true);
     scrollNow();
     tick();
     return true;
@@ -337,12 +486,45 @@
     rep.title = 'Copy this conversation\'s key and the report address, to hand over for a diagnosis';
     rep.addEventListener('click', function () { if (ui.flowKey) copy(ui.flowKey + '  /api/flow/' + ui.flowKey + '?text=1'); });
     bar.appendChild(rep);
+    /* [fc-design] "Technical and Design flowchart mode": the draws as they were made, or
+       the NodePlan chain (Initiator, Replies, Rebuttal, Topic Change) */
+    ui.modeBtn = make('button', 'fc-btn fc-mode', '');
+    ui.modeBtn.type = 'button';
+    ui.modeBtn.addEventListener('click', function () { setMode(ui.mode === 'design' ? 'technical' : 'design'); });
+    bar.appendChild(ui.modeBtn);
+    ui.followBtn = make('button', 'fc-btn fc-follow', 'Follow');
+    ui.followBtn.type = 'button';
+    ui.followBtn.title = 'Go back to the active node and follow it again';
+    ui.followBtn.hidden = ui.follow;
+    ui.followBtn.addEventListener('click', function () { setFollow(true); scrollNow(); });
+    bar.appendChild(ui.followBtn);
     pane.appendChild(bar);
     ui.status = make('div', 'fc-status', 'reading…');
     pane.appendChild(ui.status);
     ui.body = make('div', 'fc-body');
+    ui.body.addEventListener('scroll', onScroll, {passive: true});
     pane.appendChild(ui.body);
     ui.pane = pane;
+    paintMode();
+  }
+  function paintMode() {
+    if (!ui.modeBtn) return;
+    ui.modeBtn.textContent = ui.mode === 'design' ? 'Design' : 'Technical';
+    ui.modeBtn.title = ui.mode === 'design'
+      ? 'Design flowchart: the chain as the NodePlan draws it - tap for the Technical flowchart (every draw)'
+      : 'Technical flowchart: every draw as it was made - tap for the Design flowchart (the NodePlan chain)';
+    ui.modeBtn.setAttribute('aria-pressed', String(ui.mode === 'design'));
+    if (ui.pane) ui.pane.classList.toggle('fc-design', ui.mode === 'design');
+  }
+  function setMode(mode) {
+    ui.mode = mode === 'design' ? 'design' : 'technical';
+    try { if (root.localStorage) root.localStorage.setItem('pine.fc.mode', ui.mode); } catch (e) { /* no storage */ }
+    paintMode();
+    ui.paintedMode = '';
+    ui.designSig = '';
+    ui.wantJump = true;
+    setFollow(true);
+    if (ui.lastFlow) paint(ui.lastFlow);
   }
 
   function show(pane, on) {
@@ -352,10 +534,25 @@
     if (ui.timer) { root.clearInterval(ui.timer); ui.timer = 0; }
     if (on) {
       loadRecent();
+      /* [fc-design] the moment the chart is opened: the latest conversation the
+         background kept, at once, then the live read */
+      if (ui.live && ui.bgFlow && ui.body && !ui.body.childElementCount) { ui.wantJump = true; paint(ui.bgFlow); }
       tick();
       ui.timer = root.setInterval(tick, POLL_MS);
     }
   }
+  /* [fc-design] "the flowchart system needs to be auto generating and perpetual": off
+     screen, the live conversation is read every BG_MS and kept, so the chart opens on
+     the latest one already built. */
+  function background() {
+    if (ui.on) return;
+    try { if (root.document && root.document.hidden) return; } catch (e) { /* read anyway */ }
+    get('/api/flow/now').then(function (d) {
+      if (d && d.live && d.flow) { ui.bgFlow = d.flow; ui.lastLive = d.flow.key; ui.cache[d.flow.key] = d.flow; }
+    }, function () { /* the next pass tries again */ });
+  }
+  root.setInterval(background, BG_MS);
+  root.setTimeout(background, 1500);
 
   root.PineFlowChart = {show: show, open: openKey, isOn: function () { return ui.on; }, jumpLive: jumpLive,
     _paint: paint};
