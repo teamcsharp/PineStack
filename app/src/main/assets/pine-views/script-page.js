@@ -1953,11 +1953,40 @@
   function airJump(reason) {
     readerHeld = false;                                   /* [reader-hold] asked for: follow again */
     var done = resumeAirFollow(reason);
-    if (s3Mode !== 'script' && s3View && typeof s3View.jumpToAir === 'function') {
-      /* [tablet-perf] THE LINE ON THE CARD, not the views' focus line -
-         that follows a line tapped in the script while its card is open. */
-      try { done = s3View.jumpToAir(String(sayingLineId || nowLineId || '')) || done; }
-      catch (e) { /* the view is closing */ }
+    /* [air-jump-any] "Clicking the button to jump to the current message should work
+       no matter what view is up in the script view" and, in the flowchart, "jump to
+       the active flow chart item" (the operator, 2026-10-01). No System 3 view had a
+       jumpToAir and the flowchart was not asked at all, so the tap moved only the
+       hidden script. Now: the flowchart goes to its live node; a view goes to the
+       line by its own jump, else by the line's element in it, else the script is
+       brought up on the line. */
+    var airLid = String(sayingLineId || nowLineId || '');
+    var fcApi = root.PineFlowChart;
+    var flowEl = document.getElementById('spFlow');
+    if (fcApi && typeof fcApi.jumpLive === 'function' && flowEl && !flowEl.hidden
+        && typeof fcApi.isOn === 'function' && fcApi.isOn()) {
+      try { done = fcApi.jumpLive(airLid) || done; } catch (e) { /* the chart is closing */ }
+    } else if (s3Mode !== 'script' && s3View) {
+      var shown = false;
+      if (typeof s3View.jumpToAir === 'function') {
+        /* [tablet-perf] THE LINE ON THE CARD, not the views' focus line -
+           that follows a line tapped in the script while its card is open. */
+        try { shown = !!s3View.jumpToAir(airLid); } catch (e) { /* the view is closing */ }
+      }
+      var s3El = document.getElementById('spS3');
+      var hit = !shown && airLid && s3El
+        ? s3El.querySelector('[data-line="' + airLid + '"], [data-line-id="' + airLid + '"], [data-lid="' + airLid + '"]') : null;
+      if (hit && hit.scrollIntoView) {
+        hit.scrollIntoView({block: 'center', behavior: 'smooth'});
+        hit.classList.add('flash');
+        setTimeout(function () { hit.classList.remove('flash'); }, 1200);
+        shown = true;
+      }
+      if (!shown && airLid) {
+        s3SetMode('script');                       /* the line lives in the script: show it there */
+        done = resumeAirFollow(reason) || done;
+      }
+      done = shown || done;
     }
     var ph = root.PinePromptHistory;
     var open = host && host.querySelector('.sp-right.ph-active');

@@ -183,6 +183,7 @@
     nodes.forEach(function (n, i) {
       var had = ui.shown[n.id];
       if (i >= upto) { if (had) had.hidden = true; return; }
+      if (had && n.type === 'turn' && n.now) ui.nowRow = had;            /* [air-jump-any] */
       if (had) {
         had.hidden = false;
         if (n.type === 'turn') {
@@ -201,8 +202,14 @@
       row.style.animationDelay = delay + 'ms';
       ui.body.appendChild(row);
       ui.shown[n.id] = row;
+      if (n.type === 'turn' && n.now) ui.nowRow = row;                    /* [air-jump-any] */
       fresh += 1;
     });
+    if (ui.wantJump) {                                                    /* [air-jump-any] */
+      ui.wantJump = false;
+      root.setTimeout(scrollNow, fresh * STAGGER_MS + 30);
+      return;
+    }
     var c = flow.counts || {};
     say('#' + flow.key + ' · ' + (flow.road || '') + ' · ' + (c.decisions || 0) + ' draws · ' + (c.turns || 0)
       + ' turns (' + (c.aired || 0) + ' aired) · ' + (c.candidates_lost || 0) + ' candidates beaten');
@@ -210,6 +217,27 @@
       var last = ui.body.lastElementChild;
       if (last && last.scrollIntoView) root.setTimeout(function () { try { last.scrollIntoView({block: 'end', behavior: 'smooth'}); } catch (e) { /* old engine */ } }, fresh * STAGGER_MS);
     }
+  }
+
+  /* [air-jump-any] the strip's tap while the chart is up: back to Live, and to the
+     turn going out now (the last shown node when the chart names none). */
+  function scrollNow() {
+    var r = ui.nowRow && ui.nowRow.isConnected && !ui.nowRow.hidden ? ui.nowRow : (ui.body && ui.body.lastElementChild);
+    if (!r || !r.scrollIntoView) return;
+    try { r.scrollIntoView({block: 'center', behavior: 'smooth'}); } catch (e) { r.scrollIntoView(); }
+    r.classList.add('fc-flash');
+    root.setTimeout(function () { r.classList.remove('fc-flash'); }, 1400);
+  }
+  function jumpLive() {
+    if (!ui.on) return false;
+    if (!ui.live) {
+      ui.live = true; ui.flowKey = ''; ui.nowRow = null;
+      if (ui.liveBtn) ui.liveBtn.setAttribute('aria-pressed', 'true');
+    }
+    ui.wantJump = true;
+    scrollNow();
+    tick();
+    return true;
   }
 
   function tick() {
@@ -304,6 +332,6 @@
     }
   }
 
-  root.PineFlowChart = {show: show, open: openKey, isOn: function () { return ui.on; },
+  root.PineFlowChart = {show: show, open: openKey, isOn: function () { return ui.on; }, jumpLive: jumpLive,
     _paint: paint};
 })(typeof window !== 'undefined' ? window : globalThis);
