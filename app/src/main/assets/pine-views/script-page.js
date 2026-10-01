@@ -23862,7 +23862,8 @@
    * the dice count down the pause; the next card starts building exactly its
    * scheduled buildup before its words (the cue, or the sounding round's next
    * row, says which card and when). */
-  var GAP_MIN = 0.2, GAP_MAX = 10, GAP_RANGE_MIN = 0.2, GAP_RANGE_MAX = 10;   /* [reply-gap:between] */
+  /* [reply-gap:instant] 0 is allowed: replies back to back, no seam */
+  var GAP_MIN = 0, GAP_MAX = 10, GAP_RANGE_MIN = 0, GAP_RANGE_MAX = 10;   /* [reply-gap:between] */
   var gapState = {gap: 1, range: 1, roll: false};
   var gapUi = null;
   var gapLoadedAt = 0;
@@ -24268,7 +24269,9 @@
     var lo = Math.min(gapState.gap, gapState.range), hi = Math.max(gapState.gap, gapState.range);
     gapBig.say.textContent = gapState.roll
       ? 'Each pause is rolled between ' + gapFmt(lo) + ' and ' + gapFmt(hi) + '.'
-      : 'The roulette is off: every pause is ' + gapFmt(gapState.gap) + '.';
+      : (Number(gapState.gap) <= 0
+        ? 'Instant: every reply follows the last one back to back - the cards build under the line before.'
+        : 'The roulette is off: every pause is ' + gapFmt(gapState.gap) + '.');
   }
   function gapBigClose() {
     if (!gapBig) return;

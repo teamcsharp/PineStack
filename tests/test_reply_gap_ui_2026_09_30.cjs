@@ -32,7 +32,7 @@ assert(src.includes("api().get('/api/reply-gap?recent=1')"), 'reads the station 
 assert(src.includes("api().post('/api/reply-gap', body)"), 'writes the station setting');
 
 // 2. The bounds.
-assert(/var GAP_MIN = 0\.2, GAP_MAX = 10, GAP_RANGE_MIN = 0\.2, GAP_RANGE_MAX = 10;/.test(src), 'slider bounds');
+assert(/var GAP_MIN = 0, GAP_MAX = 10, GAP_RANGE_MIN = 0, GAP_RANGE_MAX = 10;/.test(src), 'slider bounds');   // [reply-gap:instant]
 assert(src.includes("var gapState = {gap: 1, range: 1, roll: false};"), 'default 1 s, roulette off');
 // [reply-gap:dual] one track, two thumbs, on the 0.1 s step
 assert(src.includes("th.setAttribute('role', 'slider');"), 'the thumbs are sliders');

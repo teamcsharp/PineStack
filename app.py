@@ -110310,7 +110310,8 @@ def _call_concat_blocking(paths: list[str],
             # the line inside a round.
             _beat = (beats[i] if beats is not None and i < len(beats)
                      else round(random.uniform(*CONCAT_BEAT), 3))
-            _leg += f",apad=pad_dur={_beat}"
+            if float(_beat or 0) > 0:      # [reply-gap:instant] 0 = no seam at all
+                _leg += f",apad=pad_dur={_beat}"
         _pre.append(f"{_leg}[a{i}];")
     pre = "".join(_pre)
     chain = "".join(f"[a{i}]" for i in range(len(files)))

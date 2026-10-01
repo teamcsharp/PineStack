@@ -18,9 +18,17 @@ listening response keep the short varied beat: that is a breath inside a
 reply, not the space between two of them.
 
 THE SETTINGS (station-wide, `data/reply_gap.json`, GET/POST /api/reply-gap):
-  gap    0.2 - 10 s, default 1.0   the pause after every reply
-  range  0.2 - 10 s, default 1.0   the roll's other end ([reply-gap:between])
+  gap    0 - 10 s, default 1.0     the pause after every reply
+  range  0 - 10 s, default 1.0     the roll's other end ([reply-gap:between])
   roll   off by default            on: each pause is ROLLED
+
+[reply-gap:instant] "Allow me to be able to set the pause between replies as
+low as zero, which causes it to be instant message reply SFX clip reply reply
+... back to back seamless" (2026-09-30). A pause of 0 is INSTANT: no silence
+at the seam (the mixer lays no pad), and the next card's buildup is not
+charged to the air either - its Rolodex builds while the line before it is
+still sounding, and the words start where the last words ended. The planner
+prices an instant seam at 0, so the hour is booked with the lines it now holds.
 
 THE ROLL. With `roll` on, each reply's pause is uniform BETWEEN THE TWO SLIDERS:
   [min(gap, range), max(gap, range)]
@@ -58,10 +66,10 @@ try:    # module level: FastAPI resolves the routes' string annotations here
 except ImportError:  # the pure tests need none of it
     Header = HTTPException = Request = None  # type: ignore[assignment,misc]
 
-GAP_MIN = 0.2
+GAP_MIN = 0.0                    # [reply-gap:instant] 0 = back to back
 GAP_MAX = 10.0
 GAP_DEFAULT = 1.0
-RANGE_MIN = 0.2                  # [reply-gap:between] a time, like the gap
+RANGE_MIN = 0.0                  # [reply-gap:between] a time, like the gap
 RANGE_MAX = 10.0
 RANGE_DEFAULT = 1.0
 STEP = 0.1                       # the sliders' step; a rolled pause lands on it too
@@ -101,12 +109,12 @@ def _step(value: float) -> float:
 
 
 def clamp_gap(value: Any) -> float:
-    """The pause, on the slider's step, inside 0.2 - 10 s."""
+    """The pause, on the slider's step, inside 0 - 10 s."""
     return min(GAP_MAX, max(GAP_MIN, _step(_num(value, GAP_DEFAULT))))
 
 
 def clamp_range(value: Any) -> float:
-    """The roll's other end, on the step, inside 0.2 - 10 s."""
+    """The roll's other end, on the step, inside 0 - 10 s."""
     return min(RANGE_MAX, max(RANGE_MIN, _step(_num(value, RANGE_DEFAULT))))
 
 
@@ -445,7 +453,9 @@ def burst(beats: list, seg_ix: list, turn_ix: list, transcript: list, items: lis
                 except (IndexError, TypeError):
                     nb = 0
             note["buildup_ms"] = int(nb)
-            out[slot] = round(float(note["s"]) + nb / 1000.0, 3)
+            # [reply-gap:instant] a 0 pause: the card builds under the line
+            # before it, and the seam is no seam at all
+            out[slot] = round(float(note["s"]) + (nb / 1000.0 if float(note["s"]) > 0 else 0.0), 3)
             notes[slot] = note
     return out, notes
 
@@ -817,8 +827,12 @@ def expected_buildup_s() -> float:
 
 def planner_seam() -> float:
     """One seam between two messages as the air runs it: the pause (the
-    expected one when it rolls) and the next card's buildup."""
-    return round(expected_gap() + expected_buildup_s(), 3)
+    expected one when it rolls) and the next card's buildup. [reply-gap:instant]
+    An instant seam costs nothing: the buildup runs under the line before."""
+    gap = expected_gap()
+    if gap <= 0:
+        return 0.0
+    return round(gap + expected_buildup_s(), 3)
 
 
 def contract() -> dict[str, Any]:
@@ -909,6 +923,8 @@ def door(clip: Any, air_until: float, earliest: float, tail_of: Any = None,
                     "page", rng=rng)
         over_ms = sting_overlap_ms(clip, build, words_end) if mine else 0   # [reply-gap:sting-overlap]
         floor = words_end + float(note["s"]) + (build - over_ms) / 1000.0
+        if float(note["s"]) <= 0:              # [reply-gap:instant] words on words
+            floor = words_end
         if own <= air + 0.05:
             # it was only waiting for the air: the pause decides, into the
             # last clip's silent tail when the pause is shorter than it

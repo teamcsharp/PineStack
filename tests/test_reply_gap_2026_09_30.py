@@ -21,12 +21,13 @@ import reply_gap as rg  # noqa: E402
 
 
 class Bounds(unittest.TestCase):
-    def test_gap_is_point_two_to_ten_default_one(self):
-        self.assertEqual(rg.GAP_MIN, 0.2)
+    def test_gap_is_zero_to_ten_default_one(self):
+        # [reply-gap:instant] 0 is allowed: replies back to back
+        self.assertEqual(rg.GAP_MIN, 0.0)
         self.assertEqual(rg.GAP_MAX, 10.0)
         self.assertEqual(rg.GAP_DEFAULT, 1.0)
-        self.assertEqual(rg.clamp_gap(0), 0.2)
-        self.assertEqual(rg.clamp_gap(-5), 0.2)
+        self.assertEqual(rg.clamp_gap(0), 0.0)
+        self.assertEqual(rg.clamp_gap(-5), 0.0)
         self.assertEqual(rg.clamp_gap(0.2), 0.2)
         self.assertEqual(rg.clamp_gap(10), 10.0)
         self.assertEqual(rg.clamp_gap(99), 10.0)
@@ -35,7 +36,8 @@ class Bounds(unittest.TestCase):
         self.assertEqual(rg.clamp_gap(1.73), 1.7)        # the slider's step
 
     def test_range_bounds(self):
-        self.assertEqual(rg.clamp_range(0), 0.2)   # [reply-gap:between] a time, like the gap
+        self.assertEqual(rg.clamp_range(0), 0.0)   # [reply-gap:between] a time, like the gap
+        self.assertEqual(rg.clamp_range(-1), 0.0)
         self.assertEqual(rg.clamp_range(50), 10.0)
         self.assertEqual(rg.clamp_range(None), 1.0)
 
@@ -51,7 +53,8 @@ class TheRoll(unittest.TestCase):
         self.assertEqual(rg.window({"gap": 1, "range": 1.9}), (1.0, 1.9))
         self.assertEqual(rg.window({"gap": 5, "range": 2}), (2.0, 5.0))    # either way round
         self.assertEqual(rg.window({"gap": 1, "range": 1}), (1.0, 1.0))    # equal: no spread
-        self.assertEqual(rg.window({"gap": 0.2, "range": 0.1}), (0.2, 0.2))  # 0.1 clamps to 0.2
+        self.assertEqual(rg.window({"gap": 0.2, "range": 0.1}), (0.1, 0.2))  # [reply-gap:instant] no 0.2 floor
+        self.assertEqual(rg.window({"gap": 0, "range": -3}), (0.0, 0.0))
         self.assertEqual(rg.window({"gap": 9.5, "range": 12}), (9.5, 10.0))
 
     def test_expected_is_the_gap_or_the_window_middle(self):
@@ -99,7 +102,7 @@ class Persistence(unittest.TestCase):
             rg.use_path(path)                                     # a fresh process
             got = rg.state()
             self.assertEqual((got["gap"], got["range"], got["roll"]), (3.3, 10.0, True))
-            self.assertEqual(got["bounds"]["gap"], [0.2, 10.0])
+            self.assertEqual(got["bounds"]["gap"], [0.0, 10.0])
             self.assertEqual((got["lo"], got["hi"]), (3.3, 10.0))
             rg.save({"gap": 0.5})                                 # a partial POST keeps the rest
             self.assertEqual(rg.settings()["range"], 10.0)
@@ -486,6 +489,55 @@ class Planner(unittest.TestCase):
         for needle in ("pineReplyGapFloor(clip)) - Date.now();", "pineReplyGapEarly(clip, player, djVoiceQueue)",
                        "pineReplyGapEarly(clip, voice, voiceQueue)", "pineReplyGapWordsEnded(clip, null, djVoiceQueue)"):
             self.assertEqual(self.text.count(needle), 1 if "Floor" not in needle else 2, needle)
+
+
+
+class Instant(unittest.TestCase):
+    """[reply-gap:instant] "as low as zero ... back to back seamless": a 0 pause
+    is no seam - no silence, and the card's buildup runs under the line before."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        rg.use_path(Path(self.tmp.name) / "g.json")
+        rg._BOOKED.update(until=0.0, tail=0.0)
+        self._line = rg.buildup_of_line
+
+    def tearDown(self):
+        rg.buildup_of_line = self._line
+        rg.use_path(None)
+        self.tmp.cleanup()
+
+    def test_zero_is_kept(self):
+        rg.save({"gap": 0, "roll": False})
+        self.assertEqual(rg.settings()["gap"], 0.0)
+        self.assertEqual(rg.draw(), {"s": 0.0, "rolled": False})
+        self.assertEqual(rg.expected_gap(), 0.0)
+
+    def test_the_door_starts_on_the_last_words(self):
+        rg.save({"gap": 0, "roll": False})
+        air = time.time() + 30.0
+        rg.booked({"tail_s": 0.9}, air)
+        nxt = {"url": "/media/" + "e" * 32 + ".wav", "text": "next", "speech": True,
+               "broadcast_ms": int(air * 1000)}
+        start = rg.door(nxt, air, air - 20.0, build_of=lambda c: 6000)
+        self.assertAlmostEqual(start, air - 0.9, places=2)
+        self.assertEqual(nxt["buildup_ms"], 6000, "the card still builds - under the line before")
+
+    def test_a_burst_has_no_seams(self):
+        rg.save({"gap": 0, "roll": False})
+        rg.buildup_of_line = lambda meta, who, text: 4000
+        items = [{"who": "dj", "turn_end": True}, {"who": "cohost", "turn_end": True},
+                 {"who": "dj", "turn_end": True}]
+        transcript = [("dj", "a", 3), ("cohost", "b", 3), ("dj", "c", 3)]
+        out, notes = rg.burst([0.1, 0.1, 0.0], [0, 1, 2], [0, 1, 2], transcript, items)
+        self.assertEqual(out, [0.0, 0.0, 0.0])
+        self.assertEqual(notes[0]["buildup_ms"], 4000)
+
+    def test_the_planner_prices_an_instant_seam_at_nothing(self):
+        rg.save({"gap": 0, "roll": False})
+        self.assertEqual(rg.planner_seam(), 0.0)
+        rg.save({"gap": 1.0, "roll": False})
+        self.assertGreaterEqual(rg.planner_seam(), 1.0)
 
 
 if __name__ == "__main__":
