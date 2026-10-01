@@ -1080,6 +1080,13 @@ def _stage(name, rows, pick, draw, excluded=None):
             "of": len(rows)}
 
 
+# [roll-override] "tap on the roulette result and bring up a roulette pop-up that allows me to
+# override the roulette result ... choose the roulette result from the roulette results that we
+# have in the database" (the operator, 2026-10-01). A roll already made has already been written
+# and spoken; the override is the NEXT draw of that family: {family: "table:item"}, taken once.
+OPERATOR_NEXT: dict = {}
+
+
 def weighted_decision(conv, config, ctx, stream, family, tables=None, closes=False, fixed=None, category=None):
     """Draw one outcome from a family: table -> category -> item.
 
@@ -1096,6 +1103,9 @@ def weighted_decision(conv, config, ctx, stream, family, tables=None, closes=Fal
     ctx["closes"] = closes
     before = _snapshot(conv, ctx.get("speaker"))
     stages = []
+    _op = None if fixed else OPERATOR_NEXT.pop(str(family), None)       # [roll-override] taken once
+    if _op:
+        fixed = _op
     if fixed:
         want = str(fixed)
         for table in _tables_for(config, family, None):
@@ -1105,15 +1115,18 @@ def weighted_decision(conv, config, ctx, stream, family, tables=None, closes=Fal
                         continue
                     spec = _spec(table, cat, item)
                     row = {"id": item["id"], "label": spec["label"], "base": 1.0, "weight": 1.0, "p": 1.0,
-                           "why": ["pinned by the operator in the segment editor - the roulette is off for this draw"]}
+                           "why": [("set by the operator from the roulette popup - this draw lands where they chose"
+                                    if _op else "pinned by the operator in the segment editor - the roulette is off for this draw")]}
                     stages.append({"stage": "fixed", "candidates": [row], "excluded": [], "total": 1.0,
                                    "selected": item["id"], "selected_index": 1, "of": 1, "draw": None})
                     selected = {"table": table["id"], "category": cat["id"],
                                 "category_label": cat.get("label") or cat["id"], "id": spec["id"],
                                 "label": spec["label"], "text": spec.get("text", ""), "index": k + 1,
-                                "of": len(cat.get("items") or []), "authority": "fixed"}
+                                "of": len(cat.get("items") or []), "authority": "operator" if _op else "fixed"}
                     ev = _event(conv, ctx, family, stages, selected, before,
-                                meta={"authority": "fixed", "why": "pinned to %s in the segment editor: not a draw" % want})
+                                meta={"authority": "operator" if _op else "fixed",
+                                      "why": ("set to %s by the operator from the roulette popup" % want) if _op
+                                      else "pinned to %s in the segment editor: not a draw" % want})
                     return spec, ev
         # a pin that names nothing on the tables falls through to the roll, and says so
         ctx["fixed_missing"] = want

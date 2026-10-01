@@ -850,13 +850,14 @@ body.pine-splice-open > :not(.lb-editor-overlay) * { animation-play-state:paused
 .pine-pulse[data-state="relaxed"] .pine-pulse-fill { filter: saturate(.8); }
 .pine-pulse[data-state="locked up"] .pine-pulse-fill { animation: pinePulseStrain 1.6s ease-in-out infinite; }
 @keyframes pinePulseStrain { 50% { filter: brightness(1.45); } }
-.pine-pulse-line { height: 16px; overflow: hidden; white-space: nowrap; }
+.pine-pulse-line { height: 16px; overflow: hidden; white-space: nowrap; display: flex; align-items: center; }
+.pine-pulse-run { flex: 1 1 auto; min-width: 0; overflow: hidden; white-space: nowrap; }
 .pine-pulse-track { display: inline-block; padding-left: 8px; animation: pineConsoleMarquee 60s linear infinite; }
 .pine-pulse-track span { display: inline-block; }
 @media (max-width: 720px) { .pine-pulse { right: 24px; } }
 /* [tip-marquee] a hover tip takes the marquee's line; a tap opens all of it */
 .pine-pulse-tip {
-  position: absolute; left: 0; right: 0; top: 3px; height: 16px;
+  position: absolute; left: 34px; right: 0; top: 3px; height: 16px;   /* [roll-dice] clear of the dice */
   display: flex; align-items: center; gap: 6px; padding: 0 8px; margin: 0;
   border: 0; border-radius: 0; background: #0f2230; color: #dbe6f0;
   font: inherit; text-align: left; cursor: pointer; overflow: hidden;
@@ -883,3 +884,59 @@ body.pine-splice-open > :not(.lb-editor-overlay) * { animation-play-state:paused
 /* the views make room for both strips */
 .pine-view-host, #sampler { padding-bottom: var(--pine-chrome-bottom, 46px); }
 .pine-talk-dot { bottom: 54px; }
+/* [roll-dice] the dice at the front of the marquee: it tumbles whenever System 3 plans
+   or the station rolls, and opens the roulette behind what is on air */
+.pine-pulse-dice { flex: 0 0 auto; display: inline-flex; align-items: center; gap: 2px; height: 16px; margin: 0;
+  padding: 0 4px; border: 0; border-right: 1px solid #26313a; background: transparent; color: #8de1ed; cursor: pointer; }
+.pine-pulse-dice svg { width: 13px; height: 13px; fill: currentColor; }
+.pine-pulse-dice-face { min-width: 14px; font: 600 9.5px/1 ui-monospace, Consolas, monospace; color: #e5c778; }
+.pine-pulse-dice.rolling svg { animation: pineDiceTumble .28s linear infinite; }
+.pine-pulse-dice.landed svg { animation: pineDiceLand .3s ease-out; }
+.pine-pulse-dice.pinned { color: #e5c778; }
+.pine-pulse-dice:hover, .pine-pulse-dice:focus-visible { background: #12303a; outline: none; }
+@keyframes pineDiceTumble { 0% { transform: rotate(0) scale(1); } 50% { transform: rotate(180deg) scale(1.25); } 100% { transform: rotate(360deg) scale(1); } }
+@keyframes pineDiceLand { from { transform: scale(1.5); } to { transform: none; } }
+@media (prefers-reduced-motion: reduce) { .pine-pulse-dice.rolling svg, .pine-pulse-dice.landed svg { animation: none; } }
+.pine-rollpop { position: fixed; left: 50%; top: 50%; transform: translate(-50%, -50%); z-index: 2147483095;
+  width: min(680px, calc(100vw - 32px)); max-height: 86vh; overflow: auto; box-sizing: border-box;
+  padding: 14px 48px 14px 18px; border: 1px solid #2a4257; border-radius: 10px; background: #0b1520; color: #dbe6f0;
+  box-shadow: 0 18px 50px #000c; font: 13px/1.5 Inter, Segoe UI, system-ui, sans-serif; }
+.pine-rollpop-x { position: absolute; top: 10px; right: 10px; width: 30px; height: 30px; display: grid; place-items: center;
+  border: 1px solid #36515c; border-radius: 6px; background: #17252d; color: #e7f1f4; cursor: pointer; }
+.pine-rollpop-x svg, .pine-rollpop-nav svg { width: 18px; height: 18px; fill: currentColor; }
+.pine-rollpop-head { display: flex; align-items: center; gap: 10px; margin-bottom: 6px; }
+.pine-rollpop-head b { color: #8de1ed; font-size: 15px; }
+.pine-rollpop-nav { width: 34px; height: 30px; display: grid; place-items: center; border: 1px solid #36515c; border-radius: 6px;
+  background: #17252d; color: #e7f1f4; cursor: pointer; }
+.pine-rollpop-nav:disabled { opacity: .35; cursor: default; }
+.pine-rollpop-line { margin: 2px 0; color: #c8d4d9; }
+.pine-rollpop-room { margin: 2px 0 8px; color: #e5c778; font-size: 12px; }
+.pine-rollpop-card { display: grid; gap: 2px; padding: 10px 12px; border: 1px solid #35505c; border-radius: 8px; background: #081013; }
+.pine-rollpop-fam { color: #8ea0ad; font-size: 12px; }
+.pine-rollpop-landed { color: #f3f8fa; font-size: 18px; }
+.pine-rollpop-d { color: #e5c778; font: 12px/1.4 ui-monospace, Consolas, monospace; }
+.pine-rollpop-trail, .pine-rollpop-means, .pine-rollpop-purpose { margin: 6px 0; font-size: 12.5px; color: #c8d4d9; overflow-wrap: anywhere; }
+.pine-rollpop h4 { margin: 12px 0 4px; color: #8de1ed; font-size: 12px; letter-spacing: .05em; text-transform: uppercase; }
+.pine-rollpop-list { margin: 0; padding: 0; list-style: none; display: grid; gap: 3px; }
+.pine-rollpop-list li, .pine-rollpop-table li { display: flex; align-items: center; gap: 8px; padding: 2px 6px; border-radius: 6px; }
+.pine-rollpop-list li.landed, .pine-rollpop-table li.landed { background: rgba(101, 199, 218, .16); }
+.pine-rollpop-entry { flex: 1 1 auto; min-width: 0; text-align: left; padding: 4px 6px; border: 0; background: transparent;
+  color: #eef4f6; font: inherit; cursor: pointer; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pine-rollpop-entry:hover:not(:disabled) { text-decoration: underline; }
+.pine-rollpop-entry:disabled { cursor: default; color: #c8d4d9; }
+.pine-rollpop-p { color: #e5c778; font: 11.5px/1 ui-monospace, Consolas, monospace; min-width: 48px; text-align: right; }
+.pine-rollpop-land, .pine-rollpop-back, .pine-rollpop-edit button { padding: 4px 9px; border: 1px solid #3b777d; border-radius: 5px;
+  background: #12292e; color: #d8edf0; font: 11.5px/1.2 Inter, Segoe UI, system-ui, sans-serif; cursor: pointer; }
+.pine-rollpop-etitle { margin: 8px 0 4px; color: #f3f8fa; font-size: 15px; }
+.pine-rollpop-does { display: grid; grid-template-columns: max-content 1fr; gap: 2px 10px; margin: 0; font-size: 12px; }
+.pine-rollpop-does dt { color: #8ea0ad; }
+.pine-rollpop-does dd { margin: 0; overflow-wrap: anywhere; }
+.pine-rollpop-edit { display: grid; gap: 6px; }
+.pine-rollpop-edit label { display: grid; gap: 3px; font-size: 12px; color: #8ea0ad; }
+.pine-rollpop-edit input, .pine-rollpop-edit textarea { box-sizing: border-box; width: 100%; padding: 6px 8px; border: 1px solid #43545c;
+  border-radius: 5px; background: #0c1418; color: #e3edf0; font: 13px/1.4 Inter, Segoe UI, system-ui, sans-serif; }
+.pine-rollpop-edit textarea { min-height: 64px; resize: vertical; }
+.pine-rollpop-table { display: grid; gap: 8px; }
+.pine-rollpop-table b { color: #c8d4d9; font-size: 12px; }
+.pine-rollpop-table ul { margin: 2px 0 0; padding: 0; list-style: none; }
+.pine-rollpop-say { margin: 8px 0 0; min-height: 16px; color: #e5c778; font-size: 12px; }

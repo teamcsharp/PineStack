@@ -4896,6 +4896,84 @@ def install(app, namespace):
         out["store"] = await rt.read(rt.store.counts)
         return out
 
+    # [roll-override] the marquee's dice, the roulette popup and the entry screen
+    def _entry_find(table_id, item_id, category_id=""):
+        t = next((x for x in rt.config.get("tables") or [] if str(x.get("id")) == str(table_id)), None)
+        if t is None:
+            raise HTTPException(404, "no table %s" % table_id)
+        for c in t.get("categories") or []:
+            if category_id and str(c.get("id")) != str(category_id):
+                continue
+            items = c.get("items") or []
+            for k, i in enumerate(items):
+                if str(i.get("id")) == str(item_id) or str(i.get("label") or "") == str(item_id):
+                    return t, c, i, k, len(items)
+        raise HTTPException(404, "no entry %s in %s" % (item_id, table_id))
+
+    @app.get("/api/system3/pulse-dice")
+    async def pulse_dice(authorization: str | None = Header(default=None)):
+        """The dice's signal: changes whenever System 3 plans or the station rolls."""
+        host.require_read_auth(authorization)
+        rolls = list(getattr(rt, "station_rolls", None) or [])[-3:]
+        m = rt.metrics
+        return {"planned": int(m.get("planned") or 0), "lines": int(m.get("lines_planned") or 0),
+                "last_at": float((rolls[-1] or {}).get("at") or 0) if rolls else 0.0,
+                "last": [{k: r.get(k) for k in ("kind", "key", "label", "picked", "dice", "at")} for r in rolls],
+                "overrides": dict(system3.OPERATOR_NEXT)}
+
+    @app.get("/api/system3/entry")
+    async def roll_entry(table: str = "", item: str = "", category: str = "",
+                         authorization: str | None = Header(default=None)):
+        """One roulette entry: what it adds to the writer's prompt, what it does to the
+        conversation if it lands, its category, and its place in the table."""
+        host.require_read_auth(authorization)
+        t, c, i, k, n = _entry_find(table, item, category)
+        spec = json.loads(json.dumps(system3._spec(t, c, i), default=str))
+        fam = str(t.get("family") or "")
+        does = {key: spec[key] for key in ("effects", "modifiers", "emotions", "requires", "requires_state",
+                                          "phases", "not_phases", "min_turns_left", "lean", "resolves",
+                                          "keeps_unresolved", "new_topic", "keep_initiator", "tags", "material")
+                if key in spec}
+        cats = [{"id": x.get("id"), "label": x.get("label") or x.get("id"), "weight": x.get("weight", 1.0),
+                 "items": [{"id": y.get("id"), "label": y.get("label") or y.get("id"), "weight": y.get("weight", 1.0)}
+                           for y in x.get("items") or []]} for x in t.get("categories") or []]
+        return {"table": {"id": t.get("id"), "family": fam, "label": t.get("label") or t.get("name") or t.get("id"),
+                          "description": t.get("description") or t.get("note") or "", "categories": cats},
+                "category": {"id": c.get("id"), "label": c.get("label") or c.get("id"), "weight": c.get("weight", 1.0)},
+                "item": json.loads(json.dumps(i, default=str)), "index": k + 1, "of": n, "spec": spec,
+                "adds_prompt": "" if fam == "ES" else str(spec.get("text") or ""),
+                "voice": spec.get("emotions") or spec.get("performance") or {} if fam == "ES" else {},
+                "does": does,
+                "purpose": str(i.get("why") or i.get("purpose") or i.get("note") or i.get("description")
+                               or c.get("why") or c.get("description") or ""),
+                "pinned": system3.OPERATOR_NEXT.get(fam) == "%s:%s" % (t.get("id"), i.get("id"))}
+
+    @app.get("/api/system3/override")
+    async def overrides_get(authorization: str | None = Header(default=None)):
+        host.require_read_auth(authorization)
+        return {"overrides": dict(system3.OPERATOR_NEXT)}
+
+    @app.post("/api/system3/override")
+    async def override_set(request: Request, authorization: str | None = Header(default=None)):
+        """The next draw of this entry's family lands on it - once."""
+        host.require_auth(authorization)
+        raw = body_json(await request.body())
+        t, c, i, _k, _n = _entry_find(raw.get("table"), raw.get("item"), raw.get("category") or "")
+        fam = str(t.get("family") or "")
+        system3.OPERATOR_NEXT[fam] = "%s:%s" % (t["id"], i["id"])
+        say = "the next %s roll lands on \"%s\" (%s)" % (fam, i.get("label") or i.get("id"), t["id"])
+        try:
+            host.pipeline_log("system3", "[roll-override] " + say)
+        except Exception:  # noqa: BLE001
+            pass
+        return {"overrides": dict(system3.OPERATOR_NEXT), "say": say}
+
+    @app.delete("/api/system3/override/{family}")
+    async def override_clear(family: str, authorization: str | None = Header(default=None)):
+        host.require_auth(authorization)
+        system3.OPERATOR_NEXT.pop(str(family), None)
+        return {"overrides": dict(system3.OPERATOR_NEXT)}
+
     @app.get("/api/system3/prompt-blocks")
     async def prompt_blocks(digest: str = "", authorization: str | None = Header(default=None)):
         """[s3-blocks] What System 3 decided for each block of one prompt (by the

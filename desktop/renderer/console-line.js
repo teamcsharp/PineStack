@@ -191,8 +191,10 @@
     p.className = 'pine-pulse';
     p.innerHTML = '<div class="pine-pulse-bar" role="meter" aria-valuemin="0" aria-valuemax="100"'
       + ' aria-label="Station pressure: the bank against rendering live"><i class="pine-pulse-fill"></i></div>'
-      + '<div class="pine-pulse-line"><div class="pine-pulse-track"></div></div>';
+      + '<div class="pine-pulse-line"><button class="pine-pulse-dice" type="button"></button>'
+      + '<div class="pine-pulse-run"><div class="pine-pulse-track"></div></div></div>';
     document.body.appendChild(p);
+    diceMount(p);                                /* [roll-dice] the dice at the front */
     pulseSeat(p);
     var track = p.querySelector('.pine-pulse-track');
     track.addEventListener('animationiteration', function () {
@@ -204,6 +206,292 @@
       pulseRead();
     }, 5000);
   }
+  /* [roll-dice] "At the front of the marquee bar put an icon of a dice. When clicked
+     bring up the current roulette RNG result for the current result. I want arrows at
+     the top to go to the next roulette roll ... say if it has been sent through one of
+     the four rooms and which room ... tap on the roulette result and bring up a
+     roulette pop-up that allows me to override the roulette result ... have it roll any
+     time that the roulette system is being used ... in the background" and "When I tap
+     on one of the entries in a roulette, I want it to tell me what it did ... what that
+     entry does to the result and what it adds to the system prompt and what its purpose
+     is ... view it, edit it, and see it in the table" (the operator, 2026-10-01).
+     The dice reads /api/system3/pulse-dice (System 3's plans and the station's dice
+     doors) and tumbles whenever it moves. The popup reads the line on air
+     (/api/system3/now, /api/system3/line), steps through its rolls, and opens an
+     entry (/api/system3/entry); an entry can be edited (PUT /api/system3/tables/<id>)
+     or chosen for the NEXT roll of its roulette (POST /api/system3/override) - a roll
+     already made has already been written and spoken. */
+  var DICE_MS = 1500;
+  var dice = {btn: null, face: null, sig: '', timer: 0, spin: 0};
+  function diceMount(p) {
+    var b = p.querySelector('.pine-pulse-dice');
+    if (!b) return;
+    dice.btn = b;
+    b.title = 'The roulette behind what is on air - tap to step through its rolls';
+    b.setAttribute('aria-label', b.title);
+    b.innerHTML = icon('m:casino', '') || '⚄';
+    dice.face = document.createElement('b');
+    dice.face.className = 'pine-pulse-dice-face';
+    b.appendChild(dice.face);
+    b.addEventListener('click', function (ev) { ev.stopPropagation(); rollPopOpen(); });
+    diceRead();
+    if (!dice.timer) dice.timer = root.setInterval(function () {
+      try { if (document.hidden) return; } catch (err) { /* read anyway */ }
+      diceRead();
+    }, DICE_MS);
+  }
+  function diceRead() {
+    Promise.resolve(flowGet('/api/system3/pulse-dice')).then(function (v) {
+      if (!v) return;
+      var sig = [v.planned, v.lines, v.last_at].join(':');
+      var last = (v.last || [])[(v.last || []).length - 1] || {};
+      if (dice.sig && sig !== dice.sig) diceRoll(last.dice);
+      dice.sig = sig;
+      if (dice.btn) dice.btn.classList.toggle('pinned', !!(v.overrides && Object.keys(v.overrides).length));
+    }, function () { /* the next read tries again */ });
+  }
+  function diceRoll(land) {
+    var b = dice.btn;
+    if (!b || dice.spin) return;
+    b.classList.remove('landed');
+    b.classList.add('rolling');
+    var n = 0;
+    dice.spin = root.setInterval(function () {
+      n += 1;
+      dice.face.textContent = String(1 + Math.floor(Math.random() * 100));
+      if (n < 12) return;
+      root.clearInterval(dice.spin); dice.spin = 0;
+      if (land != null) dice.face.textContent = String(land);
+      b.classList.remove('rolling');
+      b.classList.add('landed');
+    }, 70);
+  }
+
+  function flowSend(method, path, body) {
+    var api = root.pineDesktop;
+    var m = method === 'PUT' ? 'put' : method === 'DELETE' ? 'del' : 'post';
+    try {
+      if (api && typeof api[m] === 'function') return Promise.resolve(api[m](path, body || {}));
+    } catch (err) { /* same-origin fallback */ }
+    var headers = {'Content-Type': 'application/json'};
+    try {
+      var key = root.__PINE_VIDEO_EDITOR_KEY || root.PINE_KEY || '';
+      if (key) headers.Authorization = 'Bearer ' + key;
+    } catch (err) { /* keyless */ }
+    return root.fetch(path, {method: method, headers: headers, body: JSON.stringify(body || {})}).then(function (res) {
+      if (!res.ok) throw new Error(method + ' ' + path + ' ' + res.status);
+      return res.json();
+    });
+  }
+  function mk(tag, cls, text) {
+    var n = document.createElement(tag);
+    if (cls) n.className = cls;
+    if (text != null) n.textContent = String(text);
+    return n;
+  }
+  var RP = {pop: null, body: null, rolls: [], at: 0, line: null, room: '', say: null};
+  function rollPopClose() { if (RP.pop) RP.pop.remove(); RP.pop = null; }
+  function rollPopOpen() {
+    rollPopClose();
+    var pop = mk('section', 'pine-rollpop');
+    pop.setAttribute('role', 'dialog');
+    pop.setAttribute('aria-label', 'The roulette behind what is on air');
+    var x = mk('button', 'pine-rollpop-x');
+    x.type = 'button'; x.title = 'Close'; x.setAttribute('aria-label', 'Close');
+    x.innerHTML = icon('c:close', '') || '×';
+    x.addEventListener('click', rollPopClose);
+    RP.body = mk('div', 'pine-rollpop-body', 'reading the roulette…');
+    RP.say = mk('p', 'pine-rollpop-say', '');
+    pop.append(x, RP.body, RP.say);
+    document.body.appendChild(pop);
+    RP.pop = pop;
+    document.addEventListener('keydown', function esc(ev) {
+      if (ev.key === 'Escape') { rollPopClose(); document.removeEventListener('keydown', esc); }
+    });
+    rollLoad();
+  }
+  function rollsFromDecisions(decisions) {
+    return (decisions || []).filter(function (d) { return d && d.selected; }).map(function (d) {
+      var sel = d.selected || {}, stages = d.stages || [];
+      var item = stages.filter(function (s) { return s.stage === 'item' || s.stage === 'fixed'; }).pop()
+        || stages[stages.length - 1] || {};
+      return {family: d.family || '', table: sel.table || '', category: sel.category || '',
+        categoryLabel: sel.category_label || '', id: sel.id, label: sel.label || sel.id || '',
+        dice: (d.rng && d.rng.dice != null) ? d.rng.dice : ((item.draw || {}).dice),
+        index: sel.index, of: sel.of, authority: sel.authority || '', prompt: sel.prompt || '',
+        why: (d.meta && d.meta.why) || '', stages: stages, cands: item.candidates || [], openable: !!sel.table};
+    });
+  }
+  function rollsFromStation(rows) {
+    return (rows || []).slice().reverse().map(function (r) {
+      var cands = (r.candidates || []).map(function (c) { return {label: typeof c === 'string' ? c : (c.label || c.id), p: c.p}; });
+      return {family: 'STATION', table: '', category: '', categoryLabel: r.key || '', id: '', openable: false,
+        label: r.picked != null ? r.picked : (r.kind === 'chance' ? (r.hit ? 'yes' : 'no') : (r.u != null ? 'lands at ' + Number(r.u).toFixed(2) : '')),
+        dice: r.dice, index: r.index, of: r.of, authority: 'dice door', prompt: r.label || '', why: '', stages: [], cands: cands};
+    });
+  }
+  function rollLoad() {
+    Promise.resolve(flowGet('/api/system3/now')).then(function (now) {
+      RP.line = (now && now.line) || null;
+      var id = RP.line && RP.line.id;
+      if (!id) throw new Error('nothing with a System 3 node on air');
+      return Promise.resolve(flowGet('/api/system3/line?line_id=' + encodeURIComponent(id))).then(function (got) {
+        var conv = (got && got.conversation) || {};
+        var bank = !!((conv.inputs || {}).bank || (conv.identity || {}).bank || ((now.system3 || {}).bank));
+        RP.room = bank
+          ? 'Banked: written at the writing desk, kept in the reserve, voiced in the recording room, served from the pantry.'
+          : 'Live: written at the writing desk and voiced straight to the air - it skipped the reserve and the pantry.';
+        RP.rolls = rollsFromDecisions(got && got.decisions);
+        if (!RP.rolls.length) throw new Error('this line has no rolls recorded');
+      });
+    }).catch(function (err) {
+      RP.room = 'Nothing on air carries a System 3 node right now (' + String((err && err.message) || err)
+        + ') - these are the station\'s latest dice-door rolls.';
+      return Promise.resolve(flowGet('/api/system3/station?limit=40')).then(function (st) {
+        RP.rolls = rollsFromStation(st && st.rolls);
+      });
+    }).then(function () {
+      RP.at = 0;
+      rollPaint();
+    }, function (err) {
+      if (RP.body) RP.body.textContent = 'The roulette could not be read: ' + String((err && err.message) || err);
+    });
+  }
+  function rollPaint() {
+    if (!RP.body) return;
+    var b = RP.body;
+    b.textContent = '';
+    var head = mk('header', 'pine-rollpop-head');
+    var prev = mk('button', 'pine-rollpop-nav'); prev.type = 'button';
+    prev.title = 'The roll before'; prev.setAttribute('aria-label', prev.title);
+    prev.innerHTML = icon('c:caret--left', '') || '‹';
+    var next = mk('button', 'pine-rollpop-nav'); next.type = 'button';
+    next.title = 'The next roll'; next.setAttribute('aria-label', next.title);
+    next.innerHTML = icon('c:caret--right', '') || '›';
+    prev.disabled = RP.at <= 0; next.disabled = RP.at >= RP.rolls.length - 1;
+    prev.addEventListener('click', function () { RP.at = Math.max(0, RP.at - 1); rollPaint(); });
+    next.addEventListener('click', function () { RP.at = Math.min(RP.rolls.length - 1, RP.at + 1); rollPaint(); });
+    head.append(prev, mk('b', '', 'Roll ' + (RP.at + 1) + ' of ' + RP.rolls.length), next);
+    b.appendChild(head);
+    if (RP.line) b.appendChild(mk('p', 'pine-rollpop-line', (RP.line.name || RP.line.who || '') + ': ' + (RP.line.text || '')));
+    b.appendChild(mk('p', 'pine-rollpop-room', RP.room));
+    var r = RP.rolls[RP.at];
+    if (!r) { b.appendChild(mk('p', '', 'No rolls to show.')); return; }
+    var card = mk('div', 'pine-rollpop-card');
+    card.append(mk('span', 'pine-rollpop-fam', r.family + (r.table ? ' · ' + r.table : '') + (r.categoryLabel ? ' · ' + r.categoryLabel : '')),
+      mk('strong', 'pine-rollpop-landed', r.label || '-'),
+      mk('span', 'pine-rollpop-d', (r.dice != null ? 'd100 ' + r.dice : 'no die') + (r.of ? ' · ' + (r.index || '?') + ' of ' + r.of : '')
+        + (r.authority && r.authority !== 'roll' ? ' · ' + r.authority : '')));
+    b.appendChild(card);
+    if (r.stages.length) {
+      b.appendChild(mk('p', 'pine-rollpop-trail', 'Where it staged: ' + r.stages.map(function (s) {
+        var pick = (s.candidates || []).filter(function (c) { return c.id === s.selected; })[0];
+        return s.stage + ' → ' + ((pick && pick.label) || s.selected || '?');
+      }).join('   |   ')));
+    }
+    b.appendChild(mk('p', 'pine-rollpop-means', 'What it means for this result: '
+      + (r.prompt ? '"' + r.prompt + '" went into the writer\'s prompt.' : r.family === 'ES' ? 'it set the feeling the line is voiced in.' : (r.why || 'no words of its own reached the prompt.'))));
+    var list = mk('ol', 'pine-rollpop-list');
+    var total = r.cands.reduce(function (s, c) { return s + (Number(c.p) || 0); }, 0);
+    r.cands.forEach(function (c) {
+      var li = mk('li', String(c.id) === String(r.id) || c.label === r.label ? 'landed' : '');
+      var pick = mk('button', 'pine-rollpop-entry', c.label || c.id); pick.type = 'button';
+      pick.disabled = !r.openable;
+      pick.title = r.openable ? 'What this entry does, what it adds to the prompt - view, edit, see it in its table' : 'A station dice door: its options are not table entries';
+      pick.addEventListener('click', function () { entryOpen(r.table, r.category, c.id); });
+      li.append(pick, mk('span', 'pine-rollpop-p', c.p != null ? (total > 0 ? (100 * c.p / total).toFixed(1) : Number(c.p).toFixed(1)) + '%' : ''));
+      if (r.openable) {
+        var land = mk('button', 'pine-rollpop-land', 'Land here next'); land.type = 'button';
+        land.title = 'The next roll of this roulette lands on "' + (c.label || c.id) + '" - once';
+        land.addEventListener('click', function () { overrideSet(r.table, r.category, c.id); });
+        li.appendChild(land);
+      }
+      list.appendChild(li);
+    });
+    b.append(mk('h4', '', 'Every entry in this roulette (' + r.cands.length + ') - tap one for what it does'), list);
+  }
+  function overrideSet(table, category, item) {
+    Promise.resolve(flowSend('POST', '/api/system3/override', {table: table, category: category, item: item})).then(function (got) {
+      if (RP.say) RP.say.textContent = 'Set: ' + ((got && got.say) || 'the next roll of this roulette lands there');
+      diceRead();
+    }, function (err) { if (RP.say) RP.say.textContent = 'Could not set it: ' + String((err && err.message) || err); });
+  }
+  function entryOpen(table, category, item) {
+    if (!RP.body) return;
+    var b = RP.body;
+    b.textContent = 'reading the entry…';
+    Promise.resolve(flowGet('/api/system3/entry?table=' + encodeURIComponent(table) + '&category='
+      + encodeURIComponent(category || '') + '&item=' + encodeURIComponent(item))).then(function (e) {
+      b.textContent = '';
+      var back = mk('button', 'pine-rollpop-back', 'Back to the roll'); back.type = 'button';
+      back.addEventListener('click', rollPaint);
+      b.appendChild(back);
+      var it = e.item || {};
+      b.appendChild(mk('h3', 'pine-rollpop-etitle', (it.label || it.id) + '  ·  ' + e.table.family + ' ' + e.table.id
+        + ' · ' + e.category.label + ' · ' + e.index + ' of ' + e.of));
+      if (e.purpose) b.appendChild(mk('p', 'pine-rollpop-purpose', 'Its purpose: ' + e.purpose));
+      b.appendChild(mk('p', 'pine-rollpop-means', e.adds_prompt
+        ? 'If it lands, the writer is told: "' + e.adds_prompt + '"'
+        : (e.table.family === 'ES' ? 'If it lands, it sets the feeling the line is voiced in: ' + JSON.stringify(e.voice || {})
+          : 'If it lands, it adds no words of its own to the prompt.')));
+      var does = Object.keys(e.does || {});
+      if (does.length) {
+        var dl = mk('dl', 'pine-rollpop-does');
+        does.forEach(function (k) { dl.append(mk('dt', '', k), mk('dd', '', typeof e.does[k] === 'object' ? JSON.stringify(e.does[k]) : String(e.does[k]))); });
+        b.append(mk('h4', '', 'What it does to the conversation'), dl);
+      }
+      var form = mk('form', 'pine-rollpop-edit');
+      var fields = [['label', 'Name', it.label || ''], ['text', 'Words given to the writer', it.text || ''], ['weight', 'Weight', it.weight != null ? it.weight : 1]];
+      var inputs = {};
+      fields.forEach(function (f) {
+        var lab = mk('label', '', f[1]);
+        var inp = mk(f[0] === 'text' ? 'textarea' : 'input');
+        if (f[0] === 'weight') { inp.type = 'number'; inp.step = '0.05'; inp.min = '0'; }
+        inp.value = f[2];
+        lab.appendChild(inp); form.appendChild(lab); inputs[f[0]] = inp;
+      });
+      var save = mk('button', '', 'Save the entry'); save.type = 'submit';
+      var land = mk('button', '', 'Land here next'); land.type = 'button';
+      land.addEventListener('click', function () { overrideSet(e.table.id, e.category.id, it.id); });
+      form.append(save, land);
+      form.addEventListener('submit', function (ev) {
+        ev.preventDefault();
+        Promise.resolve(flowGet('/api/system3/config')).then(function (cfg) {
+          var t = ((cfg && cfg.config && cfg.config.tables) || []).filter(function (x) { return x.id === e.table.id; })[0];
+          if (!t) throw new Error('the table is gone');
+          var cat = (t.categories || []).filter(function (c) { return c.id === e.category.id; })[0];
+          var row = cat && (cat.items || []).filter(function (y) { return String(y.id) === String(it.id); })[0];
+          if (!row) throw new Error('the entry is gone');
+          row.label = inputs.label.value.trim() || row.label;
+          row.text = inputs.text.value.trim();
+          row.weight = Math.max(0, Number(inputs.weight.value) || 0);
+          return flowSend('PUT', '/api/system3/tables/' + encodeURIComponent(t.id), t);
+        }).then(function () {
+          if (RP.say) RP.say.textContent = 'Saved "' + inputs.label.value + '" in ' + e.table.id + '.';
+        }, function (err) { if (RP.say) RP.say.textContent = 'Not saved: ' + String((err && err.message) || err); });
+      });
+      b.append(mk('h4', '', 'View and edit'), form);
+      var tableBox = mk('div', 'pine-rollpop-table');
+      (e.table.categories || []).forEach(function (c) {
+        var sec = mk('section', '');
+        sec.appendChild(mk('b', '', c.label + '  (weight ' + c.weight + ')'));
+        var ul = mk('ul', '');
+        (c.items || []).forEach(function (y) {
+          var li = mk('li', String(y.id) === String(it.id) ? 'landed' : '');
+          var go = mk('button', 'pine-rollpop-entry', y.label + '  ·  ' + y.weight); go.type = 'button';
+          go.addEventListener('click', function () { entryOpen(e.table.id, c.id, y.id); });
+          li.appendChild(go); ul.appendChild(li);
+        });
+        sec.appendChild(ul); tableBox.appendChild(sec);
+      });
+      b.append(mk('h4', '', 'In its table: ' + e.table.label), tableBox);
+    }, function (err) {
+      b.textContent = 'That entry could not be read: ' + String((err && err.message) || err);
+      var back = mk('button', 'pine-rollpop-back', 'Back to the roll'); back.type = 'button';
+      back.addEventListener('click', rollPaint); b.appendChild(back);
+    });
+  }
+
   function pulseSeat(p) {                      /* on top of the strip, however tall it is */
     var cb = el();
     if (p && cb && cb.offsetHeight) p.style.bottom = cb.offsetHeight + 'px';
