@@ -75,6 +75,13 @@ contextBridge.exposeInMainWorld("pineDesktop", pineSpeakPlainly({
   backendLog: () => ipcRenderer.invoke("backend:log"),
   onBackendLog: (callback) => ipcRenderer.on("backend-log", (_event, line) => callback(line)),
   onSupportProgress: (callback) => ipcRenderer.on("support-progress", (_event, data) => callback(data)),
+  /* [pinetab-update] the tablet button */
+  pinetabCheck: (opts) => ipcRenderer.invoke("pinetab:check", opts || {}),
+  pinetabUpdate: (mode) => ipcRenderer.invoke("pinetab:update", mode || "update"),
+  pinetabPreflight: () => ipcRenderer.invoke("pinetab:preflight"),
+  pinetabAction: (name) => ipcRenderer.invoke("pinetab:action", name),
+  pinetabJob: () => ipcRenderer.invoke("pinetab:job"),
+  onPinetabProgress: (callback) => ipcRenderer.on("pinetab-progress", (_event, data) => callback(data)),
   discoverKey: () => ipcRenderer.invoke("agent:discover-key"),
   get: (route) => ipcRenderer.invoke("agent:get", route),
   post: (route, body) => ipcRenderer.invoke("agent:post", route, body),

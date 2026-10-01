@@ -1674,6 +1674,26 @@ ipcMain.handle("desktop:build", () => {
  * makes lives in terminal.cjs / firmware.cjs / gsi.cjs, which are
  * tested without hardware. */
 const terminalHost = new TerminalHost({ readConfig, writeConfig }).install(ipcMain);
+/* [pinetab-update] the tablet button: out of date? find it, build it (deploy.sh,
+ * platform-signed), install it, look after it - with the stamp checked after. */
+const { PinetabUpdate } = require("./pinetab-update.cjs");
+const pinetabUpdate = new PinetabUpdate({
+  agentRoot,
+  readConfig,
+  getJson: (route) => fetchJson(`${readConfig().baseUrl}${route}`),
+  postJson: (route, body) => fetchJson(`${readConfig().baseUrl}${route}`, {
+    method: "POST", body: JSON.stringify(body || {})
+  }),
+  send: (channel, data) => { if (win && !win.isDestroyed()) win.webContents.send(channel, data); },
+  glassStop: async () => {
+    try { require("./terminal-glass.cjs").stopPull(true); } catch (error) { /* no pull running */ }
+    try { await (await terminalHost.glass()).stopRecording(); } catch (error) { /* nothing recording */ }
+  },
+  wake: async () => (await terminalHost.glass()).wake(),
+  adbFallback: () => {
+    try { return require("./terminal-host.cjs").findTools(readConfig().platformTools).adb; } catch (error) { return ""; }
+  }
+}).install(ipcMain);
 
 /* THREE BUTTONS THAT REACH THE TABLET'S GLASS.
  *

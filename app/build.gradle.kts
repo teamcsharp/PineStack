@@ -32,8 +32,11 @@ android {
          * (WindowInsetsController) with no compat branch. */
         minSdk = 30
         targetSdk = 34
-        versionCode = 1
-        versionName = "1.0.0"
+        // [pinetab-stamp] deploy.sh passes what the APK is built from (a hash of
+        // app/src and this file, after the view sync) and the build minute; the
+        // kiosk says the name in its user agent and the desk compares it.
+        versionCode = (project.findProperty("pineCode") as String?)?.toIntOrNull() ?: 1
+        versionName = (project.findProperty("pineStamp") as String?)?.let { "1.0.0+$it" } ?: "1.0.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 

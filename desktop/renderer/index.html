@@ -82,7 +82,15 @@
 <body class="agent-down">
   <aside id="techRail" class="rail" aria-label="Pine Box Tech controls">
     <div class="brand">
+      <span class="mark-col">
       <button id="panicBtn" class="mark" title="Deploy the newest app.py to the box, then collapse, rebuild and relaunch this app on the newest source (#1044)"><img src="../assets/pinebox.png" alt="Pine Box"></button>
+      <!-- [pinetab-update] the tablet: pulses when the PineTab runs an older build than
+           the source; a press finds it, builds, signs and installs (deploy.sh), and
+           holds every tablet repair in one panel. pinetab-button.js wires it. -->
+      <button id="pinetabBtn" class="tab-btn" type="button" title="The PineTab: checking its build..." aria-label="The PineTab: update and look after the tablet">
+        <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><rect x="5" y="2.5" width="14" height="19" rx="2.2" fill="none" stroke="currentColor" stroke-width="1.8"/><circle cx="12" cy="18.3" r="1.1" fill="currentColor"/><path d="M12 6.5v6.2M9.4 10.2 12 12.8l2.6-2.6" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </button>
+      </span>
       <div>
         <!-- 2026-09-15 (#1178): THE WORDS ARE THE AUDIO-RECOVERY LADDER.
              "I just want to be able to click the Pine box text and it does
@@ -958,6 +966,7 @@
   <script src="./hot-corners.js"></script>
   <script src="./pine-cam.js"></script>
   <script src="./tablet-doctor.js"></script>
+  <script src="./pinetab-button.js"></script>  <!-- [pinetab-update] the tablet button -->
   <!-- #1361b: the clip doctor opens from the SCRIPT view here as it does on the tablet -->
   <script src="./clip-doctor.js"></script>
   <!-- 2026-09-15 (#1178): click "Pine Box" and get the sound back. Last,
