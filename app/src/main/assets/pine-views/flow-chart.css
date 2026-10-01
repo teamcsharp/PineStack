@@ -126,3 +126,5 @@
 .fc-bar > .fc-title { margin-right: 2px; }
 .fc-key { min-width: 56px; }
 .fc-recent { min-width: 64px; }
+/* [fc-line] the line card's buttons */
+.fc-line-acts { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }

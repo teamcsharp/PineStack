@@ -84,12 +84,55 @@
     d.title = value == null ? 'no random number: a pinned or single-choice draw' : 'd100 ' + final;
     return d;
   }
-  function codeChip(code) {
+  /* [fc-line] "On my tablet it brings up this" - a tap copied the code, and Android
+     answers every copy with its clipboard preview. A tap now opens the line itself:
+     who said it, its words, the rolls that made it, Open its conversation; copying is
+     a button of its own. */
+  function codeChip(code, turn) {
     var c = make('button', 'fc-code', '#' + code.slice(0, 8));
     c.type = 'button';
-    c.title = 'Copy this line\'s code - paste it to ask about this line';
-    c.addEventListener('click', function (e) { e.stopPropagation(); copy(code.slice(0, 8)); });
+    c.title = 'This line: who said it, its words and the rolls behind it';
+    c.addEventListener('click', function (e) { e.stopPropagation(); openLine(code, turn); });
     return c;
+  }
+  function openLine(code, turn) {
+    closeInspect();
+    var pop = make('section', 'fc-inspect');
+    pop.setAttribute('role', 'dialog');
+    pop.setAttribute('aria-label', 'This line');
+    var x = make('button', 'fc-inspect-x', '×');
+    x.type = 'button'; x.title = 'Close'; x.setAttribute('aria-label', 'Close');
+    x.addEventListener('click', closeInspect);
+    pop.append(x, make('h3', '', 'Line #' + code.slice(0, 8)));
+    var dl = make('dl', 'fc-inspect-dl');
+    function row(k, v) { if (v) dl.append(make('dt', '', k), make('dd', '', String(v))); }
+    if (turn) {
+      row('speaker', (turn.who || '') + (turn.seat ? '  (seat ' + turn.seat + ')' : ''));
+      row('turn', (turn.index + 1) + (turn.__role ? ' - ' + turn.__role : ''));
+      row('feeling', turn.feeling);
+      var of = (turn.codes || []).indexOf(code);
+      if ((turn.codes || []).length > 1) row('part', (of + 1) + ' of ' + turn.codes.length
+        + ' lines this turn went out as (a long turn is voiced and aired in pieces)');
+    }
+    pop.appendChild(dl);
+    var said = make('p', 'fc-inspect-kind', 'reading the line…');
+    pop.appendChild(said);
+    var acts = make('div', 'fc-line-acts');
+    var open = make('button', 'fc-btn', 'Open its conversation'); open.type = 'button';
+    open.addEventListener('click', function () { closeInspect(); openKey(code); });
+    var cp = make('button', 'fc-btn', 'Copy code'); cp.type = 'button';
+    cp.addEventListener('click', function () { copy(code.slice(0, 8)); });
+    acts.append(open, cp);
+    pop.appendChild(acts);
+    (ui.pane || document.body).appendChild(pop);
+    ui.inspect = pop;
+    get('/api/system3/line?line_id=' + encodeURIComponent(code)).then(function (d) {
+      if (ui.inspect !== pop) return;
+      var ln = (d && d.line) || {};
+      said.textContent = ln.text ? '“' + cut(ln.text, 600) + '”' : 'The station keeps no words for this line.';
+      row('rolls behind it', (d && d.decisions ? d.decisions.length : 0) + ' recorded draws');
+      row('aired', ln.at ? new Date(Number(ln.at) * 1000).toLocaleTimeString() : '');
+    }, function () { if (ui.inspect === pop) said.textContent = turn && turn.said ? '“' + cut(turn.said, 600) + '”' : 'The line could not be read.'; });
   }
   function startNode(n) {
     var box = make('div', 'fc-node fc-start');
@@ -135,7 +178,7 @@
     var top = make('div', 'fc-turn-top');
     top.appendChild(make('b', '', n.who || n.seat));
     top.appendChild(make('span', 'fc-sub', (n.index + 1) + ' · ' + (n.leg || n.place || '') + (n.feeling ? ' · ' + n.feeling : '')));
-    (n.codes || []).forEach(function (c) { top.appendChild(codeChip(c)); });
+    (n.codes || []).forEach(function (c) { top.appendChild(codeChip(c, n)); });
     box.appendChild(top);
     box.appendChild(make('p', n.said ? 'fc-said' : 'fc-asked', n.said ? '“' + cut(n.said, 320) + '”' : cut(n.asked, 260)));
     return box;
@@ -440,7 +483,7 @@
     elect.appendChild(make('i', 'fd-elect-dia'));
     head.appendChild(elect);
     head.appendChild(make('span', 'fd-who', (t.who || t.seat || '') + (t.feeling ? ' · ' + t.feeling : '')));
-    (t.codes || []).forEach(function (c) { head.appendChild(codeChip(c)); });
+    (t.codes || []).forEach(function (c) { head.appendChild(codeChip(c, t)); });
     box.appendChild(head);
     box.appendChild(make('p', spoken && t.said ? 'fd-said' : 'fd-asked', spoken && t.said ? '“' + cut(t.said, 300) + '”' : cut(t.asked, 220)));
     return box;
