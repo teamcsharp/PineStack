@@ -86,6 +86,7 @@ import prompt_history
 import word_cause_edits
 import clip_speech
 import comfy_workshop
+import h3_slots                          # [h3-slots] {mxtape} {fordtape} {videos} {sfxclip} {convograph} {gazette} {arena}
 import h3_speak                          # [h3-speak] the hourly video's dialogue: whole sentences, rolled
 from parody_stinger_queue import ParodyQueue
 import clip_senses                      # [#1241] where a phrase comes from, and the ban
@@ -1783,6 +1784,7 @@ DEFAULT_DJ = {
     # "bumper" behaviour where a high talk dial truncates every song.
     "records_whole": True,
     "mixtape_folder": "_music by me",
+    "fordtape_folder": "_general ford",       # [h3-slots] General Ford's tapes, for {fordtape}
     # Let the active system prompt colour the pair's mood, so switching
     # prompts swings the disposition of the show. Off by default: the DJ
     # persona is its own thing until you say otherwise.
@@ -2948,6 +2950,9 @@ def validate_settings(data: Any) -> dict[str, Any]:
         "mixtape_folder": (str(raw_dj.get("mixtape_folder")
                                or DEFAULT_DJ["mixtape_folder"])
                            .strip().strip("/")[:200]),
+        "fordtape_folder": (str(raw_dj.get("fordtape_folder")             # [h3-slots]
+                                or DEFAULT_DJ["fordtape_folder"])
+                            .strip().strip("/")[:200]),
         "follow_prompt": bool(raw_dj.get("follow_prompt", False)),
         "overlap": max(0, min(100, int(
             raw_dj.get("overlap", DEFAULT_DJ["overlap"]) or 0))),
@@ -189041,6 +189046,14 @@ async def h3_hourly_render(state: dict[str, Any]) -> tuple[str, Any, str]:
     except Exception as exc:  # noqa: BLE001 - the hour picks its own, as before
         pipeline_log("ads", "hourly H3: the preset pick failed early (%s)" % type(exc).__name__)
         _H3_PICKED[0] = None
+    # [h3-slots] the preset's named slots - tapes, screens, the gazette,
+    # arenas, graphs - rolled now, off the loop, for the hour to fill
+    if _H3_PICKED[0] and globals().get("h3_slots_preroll"):
+        try:
+            _pf = h3_prompts_fields(_H3_PICKED[0]["preset"])
+            await h3_slots_preroll(*[_pf.get(f) for f in ("goal", "speech") + H3_PROMPTS_ROADS])
+        except Exception as exc:  # noqa: BLE001
+            pipeline_log("ads", "hourly H3: the named slots were not pre-rolled (%s)" % type(exc).__name__)
     goal = h3_hourly_ad_prompt()
     try:
         share = max(0, min(100, int(state.get("gallery_share", 20) or 0)))
@@ -189302,7 +189315,8 @@ def h3_speak_normalize(text: Any) -> str:
 
 
 # [h3-slot-roll] {speakerbox} and {a|b|c} in an hourly prompt are ROLLS
-H3_SLOT_RX = re.compile(r"\{(speakerbox|[^{}|\n]+(?:\|[^{}|\n]+)+)\}")
+H3_SLOT_NAMES = r"(?:mxtape|fordtape|videos|sfxclip|convograph|gazette|arena)\d?"   # [h3-slots] = h3_slots.NAMED
+H3_SLOT_RX = re.compile(r"\{(speakerbox|" + H3_SLOT_NAMES + r"|[^{}|\n]+(?:\|[^{}|\n]+)+)\}")
 H3_SLOT_KEEP_S = 1800.0
 H3_SLOT_OPTS = 40
 _H3_SLOT_MEMO: dict[str, Any] = {"at": 0.0, "vals": {}}
@@ -189390,13 +189404,220 @@ def h3_slots_roll(template: Any) -> str:
         vals = _H3_SLOT_MEMO["vals"]
         if tok not in vals:
             try:
-                vals[tok] = _h3_slot_speakerbox() if tok == "speakerbox" else _h3_slot_choice(tok)
+                vals[tok] = (_h3_slot_speakerbox() if tok == "speakerbox"
+                             else h3_slot_named_sync(tok) if re.fullmatch(H3_SLOT_NAMES, tok)
+                             else _h3_slot_choice(tok))
             except Exception as exc:  # noqa: BLE001
                 pipeline_log("ads", "hourly H3 prompts: {%s} could not be rolled (%s)" % (tok[:40], type(exc).__name__))
                 vals[tok] = ""
         return vals[tok]
 
     return H3_SLOT_RX.sub(one, text)
+
+
+# --- [h3-slots] THE NAMED SLOTS: TAPES, SCREENS, THE GAZETTE, ARENAS, GRAPHS ----
+#
+# {mxtape} {fordtape} {videos} {sfxclip} {convograph} {gazette} {arena} (each
+# may carry one digit - {arena2} is a second roll) become words through two
+# halves: the SHELF, read off the loop (a folder, the clip book, the gallery,
+# the press, System 3's store), then the ROLL, on the loop, through System 3's
+# dice (h3.slot_<name>), recorded on the hour's rolodex as slot_<token>. A clip
+# or a video plays on a rolled screen (h3.slot_screen - a tabled pool the desk
+# edits). The hourly door rolls every named slot of the hour's preset before
+# the hour resolves (h3_slots_preroll); anything it did not reach is rolled
+# where it is filled (h3_slot_named_sync), {convograph} excepted (it reads
+# System 3's store, which only the async door may).
+H3_SLOT_SHELF_MOST = 400
+H3_SLOT_LABELS = {
+    "mxtape": "which MX mixtape an hourly H3 prompt's {mxtape} plays",
+    "fordtape": "which General Ford tape an hourly H3 prompt's {fordtape} plays",
+    "videos": "which Pine Box gallery video an hourly H3 prompt's {videos} shows",
+    "sfxclip": "where in the clip book an hourly H3 prompt's {sfxclip} lands (0 = first clip, 1 = last)",
+    "convograph": "which real conversation's flowchart an hourly H3 prompt's {convograph} presents",
+    "gazette": "which recent Pine Box Gazette edition an hourly H3 prompt's {gazette} brings in",
+    "arena": "which Pine Box gallery picture an hourly H3 prompt's {arena} is built from",
+}
+H3_SLOT_SCREEN_LABEL = "what screen in the scene shows an hourly H3 prompt's {videos} or {sfxclip}"
+
+
+def _h3_slot_audio_titles(folder: Path, titler: Any) -> list[str]:
+    try:
+        found = sorted(p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in MIXTAPE_TYPES)
+    except OSError:
+        return []
+    by_stem: dict[str, Path] = {}
+    for p in found:
+        by_stem.setdefault(p.stem, p)
+    return [titler(p) for p in by_stem.values()][:H3_SLOT_SHELF_MOST]
+
+
+def h3_slot_shelf(name: str) -> Any:
+    """[h3-slots] What a named slot rolls over - blocking reads, so a worker
+    thread's. {sfxclip}'s shelf is the clip book's size."""
+    if name == "mxtape":
+        return [mixtape_title(p) for p in mixtape_files()][:H3_SLOT_SHELF_MOST]
+    if name == "fordtape":
+        folder = SFX_ROOT / str(dj_settings().get("fordtape_folder") or "_general ford")
+        return _h3_slot_audio_titles(folder, lambda p: h3_slots.tidy(p.stem))
+    if name == "videos":
+        found = []
+        for p in COMFY_OUTPUT.rglob("*"):
+            if p.suffix.lower() in (".mp4", ".webm") and p.is_file():
+                try:
+                    found.append((p.stat().st_mtime, p.name))
+                except OSError:
+                    continue
+        return [n for _t, n in sorted(found, reverse=True)][:H3_SLOT_SHELF_MOST]
+    if name == "arena":
+        return [p.name for p in gallery_files(600)
+                if re.search(r"\.(png|jpe?g|webp)$", p.name, re.I) and not gallery_paper_file(p.name)
+                ][:H3_SLOT_SHELF_MOST]
+    if name == "gazette":
+        return [{"id": e.get("id"), "headline": e.get("headline"), "deck": e.get("deck")}
+                for e in paper_editions()[:8] if e.get("headline")]
+    if name == "sfxclip":
+        con = sfx_db_reader()
+        with _SFX_DB_LOCK:
+            return int(con.execute("SELECT COUNT(*) FROM clips WHERE playable=1").fetchone()[0] or 0)
+    return []
+
+
+def h3_slot_sfx_row(u: float, total: int) -> dict[str, Any]:
+    """The clip at `u` of the playable book, with what it shows or says. A worker thread's."""
+    con = sfx_db_reader()
+    at = max(0, min(total - 1, int(float(u) * total)))
+    with _SFX_DB_LOCK:
+        try:
+            r = con.execute("SELECT sid, name, COALESCE(seen_desc,''), COALESCE(said,'') FROM clips "
+                            "WHERE playable=1 LIMIT 1 OFFSET ?", (at,)).fetchone()
+        except Exception:  # noqa: BLE001 - a book without the vision and speech columns
+            r = con.execute("SELECT sid, name, '', '' FROM clips WHERE playable=1 LIMIT 1 OFFSET ?", (at,)).fetchone()
+    return {"sid": str(r[0] or ""), "name": str(r[1] or ""), "seen_desc": str(r[2] or ""),
+            "said": str(r[3] or "")} if r else {}
+
+
+def h3_slot_screen(tok: str) -> str:
+    screen = str(s3_choice("h3.slot_screen", h3_slots.SCREENS, H3_SLOT_SCREEN_LABEL))
+    _h3_slot_note("slot_screen_" + tok, "h3.slot_screen", list(h3_slots.SCREENS), screen)
+    return screen
+
+
+def h3_slot_pick(tok: str, shelf: Any) -> str:
+    """[h3-slots] One named slot rolled over its shelf, on the loop - the words
+    it becomes, or "" when the shelf is empty (logged)."""
+    name = h3_slots.base(tok)
+    key = "h3.slot_" + name
+    if name == "sfxclip" or not shelf:
+        if not shelf:
+            pipeline_log("ads", "hourly H3 prompts: {%s} - nothing on its shelf, taken out" % tok)
+        return ""
+    if name == "gazette":
+        labels = [str(e.get("headline") or "")[:120] for e in shelf]
+    else:
+        labels = [str(x) for x in shelf]
+    k = s3_weighted(key, labels, [1.0] * len(labels), H3_SLOT_LABELS[name])
+    k = k if isinstance(k, int) and 0 <= k < len(labels) else 0
+    _h3_slot_note("slot_" + tok, key, labels, labels[k])
+    got = shelf[k]
+    if name == "mxtape":
+        return h3_slots.mxtape(got)
+    if name == "fordtape":
+        return h3_slots.fordtape(got)
+    if name == "videos":
+        return h3_slots.video(h3_slot_screen(tok), got)
+    if name == "arena":
+        return h3_slots.arena(got)
+    if name == "gazette":
+        return h3_slots.gazette(got)
+    return ""
+
+
+async def h3_slot_sfxclip(tok: str) -> str:
+    total = await asyncio.to_thread(h3_slot_shelf, "sfxclip")
+    if not total:
+        pipeline_log("ads", "hourly H3 prompts: {%s} - the clip book is empty, taken out" % tok)
+        return ""
+    u = s3_roll("h3.slot_sfxclip", H3_SLOT_LABELS["sfxclip"])
+    h3_hourly_roll_note("slot_" + tok, "h3.slot_sfxclip")
+    row = await asyncio.to_thread(h3_slot_sfx_row, float(u), int(total))
+    if not row:
+        return ""
+    got = _H3_HOURLY_ROLLS.get("slot_" + tok)
+    if isinstance(got, dict):
+        got["picked"] = str(row.get("name") or "")[:300]
+    return h3_slots.sfxclip(h3_slot_screen(tok), row)
+
+
+async def h3_slot_convograph(tok: str) -> str:
+    rt = globals().get("_SYSTEM3_RUNTIME")
+    if rt is not None and not hasattr(rt, "store") and callable(rt):
+        rt = rt()
+    if rt is None or not hasattr(rt, "store"):
+        pipeline_log("ads", "hourly H3 prompts: {%s} - System 3 is not running, taken out" % tok)
+        return ""
+    rows = [r for r in (await rt.read(rt.store.conversations, 40, "")) or []
+            if isinstance(r, dict) and r.get("conversation_id") and int(r.get("events") or 0) > 0]
+    if not rows:
+        pipeline_log("ads", "hourly H3 prompts: {%s} - no conversation with dice yet, taken out" % tok)
+        return ""
+    labels = ["#%s %s: %s" % (str(r["conversation_id"])[:8], r.get("road") or "", r.get("topic") or "")
+              for r in rows]
+    k = s3_weighted("h3.slot_convograph", [x[:120] for x in labels], [1.0] * len(rows), H3_SLOT_LABELS["convograph"])
+    k = k if isinstance(k, int) and 0 <= k < len(rows) else 0
+    _h3_slot_note("slot_" + tok, "h3.slot_convograph", labels, labels[k])
+    conv = await rt.read(rt.store.conversation, str(rows[k]["conversation_id"]))
+    if not conv:
+        return ""
+    import flow_chart as _fc
+    flow = await asyncio.to_thread(_fc.build_flow, conv)
+    return h3_slots.convograph(flow)
+
+
+async def h3_slots_preroll(*texts: Any) -> dict[str, str]:
+    """[h3-slots] Every named slot in the texts, rolled before the hour is
+    resolved, into the memo h3_slots_roll fills from. A slot that faults is
+    logged and taken out - the render is never lost to it."""
+    now = time.time()
+    if now - float(_H3_SLOT_MEMO["at"]) > H3_SLOT_KEEP_S:
+        _H3_SLOT_MEMO.update(at=now, vals={})
+    vals = _H3_SLOT_MEMO["vals"]
+    done: dict[str, str] = {}
+    for tok in h3_slots.tokens(*texts):
+        if tok in vals:
+            continue
+        name = h3_slots.base(tok)
+        try:
+            if name == "sfxclip":
+                got = await h3_slot_sfxclip(tok)
+            elif name == "convograph":
+                got = await h3_slot_convograph(tok)
+            else:
+                got = h3_slot_pick(tok, await asyncio.to_thread(h3_slot_shelf, name))
+        except Exception as exc:  # noqa: BLE001
+            pipeline_log("ads", "hourly H3 prompts: {%s} could not be rolled (%s)" % (tok, type(exc).__name__))
+            got = ""
+        vals[tok] = done[tok] = got
+        if got:
+            pipeline_log("ads", "hourly H3 prompts: {%s} rolled - %s [h3-slots]" % (tok, got[:120]))
+    return done
+
+
+def h3_slot_named_sync(tok: str) -> str:
+    """[h3-slots] A named slot the door did not pre-roll, rolled where it is
+    filled (blocking reads; small). {convograph} needs the door."""
+    name = h3_slots.base(tok)
+    if name == "convograph":
+        pipeline_log("ads", "hourly H3 prompts: {%s} is rolled by the hourly door only - taken out here" % tok)
+        return ""
+    if name == "sfxclip":
+        total = int(h3_slot_shelf("sfxclip") or 0)
+        if not total:
+            return ""
+        u = s3_roll("h3.slot_sfxclip", H3_SLOT_LABELS["sfxclip"])
+        h3_hourly_roll_note("slot_" + tok, "h3.slot_sfxclip")
+        row = h3_slot_sfx_row(float(u), total)
+        return h3_slots.sfxclip(h3_slot_screen(tok), row) if row else ""
+    return h3_slot_pick(tok, h3_slot_shelf(name))
 
 
 def h3_speak_fill(template: Any, quiet: bool = False, **values: Any) -> str:
@@ -190488,6 +190709,7 @@ def h3_prompts_view(summary: bool = False) -> dict[str, Any]:
         "fields": list(H3_PROMPTS_FIELDS), "limits": dict(H3_PROMPTS_LIMITS), "most": H3_PROMPTS_MOST,
         "placeholders": {"conversation": "the hour's talk - the last lines said on air",
                          "record": "the record on air", "goal": "the brief, filled"},
+        "slots": h3_slots.catalogue() if globals().get("h3_slots") else [],     # [h3-slots] the { dropdown
         "hours": [_h3_prompts_hour_view(h) for h in hours[-12:]][::-1]})
     return out
 
@@ -190756,6 +190978,19 @@ H3_PROMPTS_BASE = (
      # prepared overview replaces it with the rolled whiteboard scene
      "goal": ("A technical presentation at a whiteboard: a presenter sells one of {station}'s new software "
               "features to camera, animated and full of energy, drawing diagrams and arrows as they talk.")},
+    # [h3-slots] the operator's three, 2026-10-01: a concert to an MX tape, a
+    # performance of a General Ford tape, a battle across two gallery arenas
+    {"id": "base-mx-concert", "name": "MX mixtape concert", "speech": "",
+     "goal": ("{station} puts on a packed live concert with {mxtape} playing as the music: the crowd sways, "
+              "lights sweep the stage and the performers sell the show to camera, {funny|euphoric|chaotic} "
+              "and loud. {conversation}")},
+    {"id": "base-ford-performance", "name": "General Ford tape performance", "speech": "",
+     "goal": ("Performers act out {fordtape} like it is the greatest stage show on earth: dramatic poses, "
+              "a spotlight, a {tiny|roaring|baffled} audience, and {videos} in the background. {conversation}")},
+    {"id": "base-arena-battle", "name": "Arena battle", "speech": "",
+     "goal": ("Two fighters battle it out, each in a different arena: one in {arena}, the other in {arena2}. "
+              "They trade blows across the split screen, trash-talk to camera and {sfxclip} plays on the side. "
+              "{conversation}")},
 )
 
 
