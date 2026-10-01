@@ -61791,6 +61791,19 @@ async def _torrent_talk() -> None:
                 except Exception:  # noqa: BLE001
                     pass        # a short segment is not a broken station
             if not aired:
+                # [door-why] SAY WHICH DOOR REFUSED. At 100% talk the
+                # road's own turn is the cupboard alone; 32 finished
+                # memos stood "simply waiting to be asked for" while the
+                # log said only "manager produced nothing", and the
+                # reason sat in _READY_SHELF_WHY for thirty seconds and
+                # was never written down (2026-10-01).
+                try:
+                    if (str(_READY_SHELF_WHY.get("kind") or "") == str(kind)
+                            and time.time() - float(_READY_SHELF_WHY.get("at") or 0) < 120):
+                        pipeline_log("drop", f"the {kind} road's turn aired nothing - its "
+                                     f"cupboard said: {_READY_SHELF_WHY.get('why')}"[:200])
+                except Exception:  # noqa: BLE001
+                    pass
                 _cover_outcome: dict[str, Any] = {}
                 aired = await torrent_force_banter(
                     track, f"{kind} produced nothing", outcome=_cover_outcome)
