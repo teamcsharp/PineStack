@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- [tablet-update-ask] Carbon "download" (IBM Carbon icons, download/32, Apache-2.0),
+     the same glyph pineIcon('c:download') draws on the page: the newest PineTab app,
+     built on the desk and brought down to this tablet. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="22dp"
+    android:height="22dp"
+    android:viewportWidth="32"
+    android:viewportHeight="32">
+    <path
+        android:fillColor="@color/pine_ink"
+        android:pathData="M26,24v4H6V24H4v4H4a2,2,0,0,0,2,2H26a2,2,0,0,0,2-2h0V24Z" />
+    <path
+        android:fillColor="@color/pine_ink"
+        android:pathData="M26 14 24.59 12.59 17 20.17 17 2 15 2 15 20.17 7.41 12.59 6 14 16 24 26 14z" />
+</vector>

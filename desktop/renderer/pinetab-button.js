@@ -37,7 +37,7 @@
     btn.classList.toggle('gone', !ui.running && !c.busy && !c.stale && c.host && !c.on_network);
     var tip = ui.running ? 'The PineTab is being updated - click to watch'
       : (c.say || 'The PineTab') + (c.host ? ' (' + c.host + ')' : '')
-        + '\nClick to update it and for every tablet repair.';
+        + '\nClick to build, sign and install the newest PineTab app now (the repairs are in the panel).';
     btn.title = tip;
     btn.setAttribute('aria-label', tip);
     paintState();
@@ -90,19 +90,71 @@
     String(text || '').split(/\r?\n/).slice(0, 200).forEach(function (l) { if (l.trim()) logLine({line: l}); });
   }
 
-  function update(mode) {
+  /* [tablet-update-ask] the station, for the tablet's own "update me" ask. */
+  var cfgP = null;
+  function station(route, body) {
+    cfgP = cfgP || Promise.resolve(typeof api.readConfig === 'function' ? api.readConfig() : null);
+    return cfgP.then(function (cfg) {
+      cfg = cfg || {};
+      var head = {'Content-Type': 'application/json'};
+      if (cfg.apiKey) head.Authorization = 'Bearer ' + cfg.apiKey;
+      var url = String(cfg.baseUrl || '').replace(/\/+$/, '') + route;
+      return fetch(url, body ? {method: 'POST', headers: head, body: JSON.stringify(body)} : {headers: head});
+    }).then(function (r) { return r.ok ? r.json() : null; }, function () { return null; });
+  }
+
+  /* The ask being served, so its progress goes back to the tablet. */
+  var serving = null;
+  function report(state, line) {
+    if (!serving) return;
+    station('/api/tablet/update-ask', {ask_at: serving, state: state, line: String(line || '').slice(0, 240)});
+  }
+
+  function update(mode, ask) {
     ui.running = true;
+    serving = ask || null;
     paintButton();
-    logLine({state: 'step', line: mode === 'resign' ? 're-sign and install' : 'update the tablet'});
+    logLine({state: 'step', line: (mode === 'resign' ? 're-sign and install' : 'build, sign and install the newest PineTab app')
+      + (ask ? ' - the tablet asked for it' : '')});
+    report('running', 'the desk is building the newest PineTab app');
     Promise.resolve(api.pinetabUpdate(mode)).then(function (r) {
-      ui.running = false;
-      logLine({state: r && r.ok ? 'ok' : 'fail', line: r && r.ok ? (r.skipped ? 'nothing to do - it was current'
-        : 'done: the tablet runs ' + (r.after || '?')) : 'not done: ' + ((r && r.why) || 'see above')});
-      return check(true);
+      var ok = !!(r && r.ok);
+      var said = ok ? (r.skipped ? 'nothing to do - it was current' : 'done: the tablet runs ' + (r.after || '?'))
+        : 'not done: ' + ((r && r.why) || 'see above');
+      logLine({state: ok ? 'ok' : 'fail', line: said});
+      /* a desk whose main process predates the relaunch step: open the app here */
+      var opened = ok && !r.skipped && !r.relaunched
+        ? Promise.resolve(api.pinetabAction('restart-app')).then(function () { logLine({state: 'ok', line: 'the PineBox app is open on the tablet again'}); })
+        : Promise.resolve();
+      return opened.then(function () {
+        report(ok ? 'done' : 'failed', said);
+        serving = null;
+        ui.running = false;
+        return check(true);
+      });
     }, function (e) {
+      report('failed', String((e && e.message) || e));
+      serving = null;
       ui.running = false;
       logLine({state: 'fail', line: String((e && e.message) || e)});
       paintButton();
+    });
+  }
+
+  /* The tablet's Reinitialise card asks through the station; the desk takes the ask
+   * once, runs the same update, and the tablet reads the progress back. */
+  var ASK_MS = 5000;
+  var takenAsk = 0;
+  function watchAsks() {
+    if (ui.running) return;
+    station('/api/tablet/update-ask').then(function (v) {
+      if (!v || !v.open || v.state !== 'asked' || !(v.ask_at > takenAsk) || ui.running) return;
+      takenAsk = v.ask_at;
+      serving = v.ask_at;
+      report('taken', 'the desk took it - building now');
+      var p = ui.panel || build();
+      p.hidden = false;
+      update('force', v.ask_at);
     });
   }
 
@@ -172,20 +224,32 @@
     return p;
   }
 
+  /* [tablet-update-ask] "When I click this button, I want to make and export and
+   * upload and install the latest version of PineTab to the Pine tab" (the operator,
+   * 2026-10-01). A press builds, signs, installs and reopens it at once; while that
+   * runs, a press shows or hides the panel. The repairs stay in the panel. */
   btn.addEventListener('click', function (e) {
     e.stopPropagation();
     var p = ui.panel || build();
-    p.hidden = !p.hidden;
-    if (!p.hidden) {
-      Promise.resolve(api.pinetabJob && api.pinetabJob()).then(function (job) {
-        if (job && job.log && !ui.log.childNodes.length) job.log.forEach(logLine);
-        if (job && job.running) { ui.running = true; paintButton(); }
-      });
-      check(true);
-    }
+    Promise.resolve(api.pinetabJob && api.pinetabJob()).then(function (job) {
+      if (job && job.log && !ui.log.childNodes.length) job.log.forEach(logLine);
+      if (job && job.running) { ui.running = true; paintButton(); }
+      if (ui.running) {
+        p.hidden = !p.hidden;
+        return;
+      }
+      p.hidden = false;
+      update('force');
+    });
   });
-  if (typeof api.onPinetabProgress === 'function') api.onPinetabProgress(function (ev) { logLine(ev); });
+  var SHOWN = {step: 1, ok: 1, fail: 1, warn: 1};
+  if (typeof api.onPinetabProgress === 'function') api.onPinetabProgress(function (ev) {
+    logLine(ev);
+    if (serving && ev && SHOWN[ev.state]) report('running', ev.line);
+  });
 
   check(false);
   root.setInterval(function () { if (!ui.running) check(false); }, CHECK_MS);
+  root.setInterval(watchAsks, ASK_MS);
+  watchAsks();
 })(typeof window !== 'undefined' ? window : globalThis);

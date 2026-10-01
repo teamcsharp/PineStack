@@ -75,13 +75,36 @@
 
             <TextView style="@style/PineCaption" android:text="@string/rail_fix" />
 
-            <Button
-                android:id="@+id/fixGo"
-                style="@style/PineChip"
+            <!-- [tablet-update-ask] the tablet's own update: it asks the desk (the
+                 Pine Box app on the computer) to build, sign and install the newest
+                 PineTab app, and fixNote below shows how far it has got. -->
+            <LinearLayout
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:layout_marginTop="4dp"
-                android:text="@string/rail_fix_go" />
+                android:gravity="center_vertical"
+                android:orientation="horizontal">
+
+                <ImageButton
+                    android:id="@+id/fixUpdate"
+                    style="@style/PineChip"
+                    android:layout_width="44dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="0"
+                    android:minHeight="40dp"
+                    android:contentDescription="@string/rail_update"
+                    android:tooltipText="@string/rail_update"
+                    android:src="@drawable/ic_tablet_update" />
+
+                <Button
+                    android:id="@+id/fixGo"
+                    style="@style/PineChip"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:layout_marginEnd="0dp"
+                    android:text="@string/rail_fix_go" />
+            </LinearLayout>
 
             <TextView
                 android:id="@+id/fixNote"

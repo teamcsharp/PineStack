@@ -65,8 +65,16 @@ export ANDROID_HOME ANDROID_SDK_ROOT
 
 DEBUG="$HERE/app/build/outputs/apk/debug/app-debug.apk"
 SIGNED="$HERE/app/build/outputs/apk/debug/app-platform.apk"
-KEY="$HERE/keys/platform.pk8"
-CERT="$HERE/keys/platform.x509.pem"
+# The platform key is never in the checkout on the share: keys/ is gitignored and the
+# repo is public. It lives on the build PC, so look there when the checkout has none
+# (PINE_PLATFORM_KEYS overrides both). The desk's tablet button runs this script from
+# the share and stopped at "no platform key" every time before this (2026-10-01).
+KEYS=${PINE_PLATFORM_KEYS:-$HERE/keys}
+if [ ! -f "$KEYS/platform.pk8" ] && [ -f /c/_tools/pinebox-android/PineBoxKiosk/keys/platform.pk8 ]; then
+  KEYS=/c/_tools/pinebox-android/PineBoxKiosk/keys
+fi
+KEY="$KEYS/platform.pk8"
+CERT="$KEYS/platform.x509.pem"
 PREFLIGHT="$HERE/tools/kiosk-preflight.sh"
 
 say() { printf '\n== %s\n' "$1"; }
@@ -142,6 +150,11 @@ if [ "$MODE" != "--no-build" ]; then
   # /c/_tools/_gradlehome so a build does not go looking on the slow share.
   GRADLE_USER_HOME=${GRADLE_USER_HOME:-/c/_tools/_gradlehome}
   export GRADLE_USER_HOME
+  # [tablet-update-ask] Gradle's file-system watching misses sources edited from
+  # another machine over the share: it reported :app:packageDebug UP-TO-DATE with
+  # a changed source and shipped the old code (2026-09-21). A one-press "build the
+  # newest" must read the disk, so the watch is off for every build here.
+  VFS=-Dorg.gradle.vfs.watch=false
   case "$HERE" in
     //*)
       # Native CMake/Ninja also invoke cmd.exe from the build directory;
@@ -165,9 +178,9 @@ if [ "$MODE" != "--no-build" ]; then
       ANDROID_SDK_ROOT="$(cygpath -w "$ANDROID_SDK_ROOT")" \
       GRADLE_USER_HOME="$(cygpath -w "$GRADLE_USER_HOME")" \
       cmd.exe /d /c \
-        "pushd $HERE_WIN && call $GRADLE_WIN --console=plain -PpineStamp=$STAMP -PpineCode=$CODE assembleDebug && popd"
+        "pushd $HERE_WIN && call $GRADLE_WIN $VFS --console=plain -PpineStamp=$STAMP -PpineCode=$CODE assembleDebug && popd"
       ;;
-    *) (cd "$HERE" && "$GRADLE" --console=plain -PpineStamp="$STAMP" -PpineCode="$CODE" assembleDebug) ;;
+    *) (cd "$HERE" && "$GRADLE" "$VFS" --console=plain -PpineStamp="$STAMP" -PpineCode="$CODE" assembleDebug) ;;
   esac
 fi
 [ -f "$DEBUG" ] || { echo "no $DEBUG"; exit 1; }

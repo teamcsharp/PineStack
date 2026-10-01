@@ -101,6 +101,9 @@ class RailController(
     /* ---- #1212/#1213: the reinitialise card ---- */
     private val fixGo: Button = rail.findViewById(R.id.fixGo)
     private val fixNote: TextView = rail.findViewById(R.id.fixNote)
+    /* [tablet-update-ask] the download icon: ask the desk for the newest app */
+    private val fixUpdate: View = rail.findViewById(R.id.fixUpdate)
+    private var updateWatch: kotlinx.coroutines.Job? = null
     private var fixRunning = false
     /* [smart-reinit] the question after every cure */
     private val fixAsk: View = rail.findViewById(R.id.fixAsk)
@@ -325,6 +328,8 @@ class RailController(
         }
 
         fixGo.setOnClickListener { reinitialise() }
+        fixUpdate.setOnClickListener { askDeskUpdate() }
+        updateResume()
         for ((answer, chip) in fixAnswers) chip.setOnClickListener { doctorAnswer(answer) }
         fixAskClose.setOnClickListener { doctorAnswer("stopped") }
         fixOffer.setOnClickListener { doctorOffer() }
@@ -1000,6 +1005,94 @@ class RailController(
     )
 
     private var doctorRun: DoctorRun? = null
+
+    /* ---- [tablet-update-ask] THE TABLET'S OWN UPDATE ----
+     * "On the tablet put an icon here that allows me to connect with the desktop
+     * client and download, build, and install the latest version of the Pine tab"
+     * (the operator, 2026-10-01). The tablet cannot build itself: it asks the
+     * station (POST /api/tablet/update-ask), the desk's tablet button takes the ask,
+     * runs deploy.sh, and reports each step back to the same route. The install
+     * restarts this app, so the record lives on the station and updateResume()
+     * picks the progress up again when the app comes back.
+     *
+     * Not a standing poller (see the class comment): it reads every UPDATE_POLL_MS
+     * only while an update is in flight, and stops when it is done or gone. */
+    private fun askDeskUpdate() {
+        if (updateWatch?.isActive == true) {
+            fixNote.text = "an update is already under way - its progress shows here"
+            return
+        }
+        fixNote.text = "asking the desk to build the newest PineTab app…"
+        scope.launch {
+            try {
+                val v = JSONObject(client.post(UPDATE_ROUTE, JSONObject().put("by", "the PineTab").toString()))
+                fixNote.text = updateLine(v, 0L)
+                watchUpdate(v.optDouble("ask_at", 0.0))
+            } catch (err: Exception) {
+                Log.w(TAG, "update ask failed", err)
+                fixNote.text = "could not ask the desk: " + (err.message ?: err.javaClass.simpleName)
+            }
+        }
+    }
+
+    private fun updateResume() {
+        scope.launch {
+            try {
+                val v = JSONObject(client.get(UPDATE_ROUTE))
+                val st = v.optString("state")
+                val age = v.optDouble("now", 0.0) - v.optDouble("at", 0.0)
+                if (v.optBoolean("open", false)) {
+                    fixNote.text = updateLine(v, 0L)
+                    watchUpdate(v.optDouble("ask_at", 0.0))
+                } else if ((st == "done" || st == "failed") && age in 0.0..600.0) {
+                    fixNote.text = updateLine(v, 0L)
+                }
+            } catch (err: Exception) {
+                Log.w(TAG, "update resume failed", err)
+            }
+        }
+    }
+
+    private fun watchUpdate(askAt: Double) {
+        if (askAt <= 0.0) return
+        updateWatch?.cancel()
+        updateWatch = scope.launch {
+            val began = System.currentTimeMillis()
+            var last = ""
+            while (System.currentTimeMillis() - began < UPDATE_WATCH_MS) {
+                delay(UPDATE_POLL_MS)
+                val v = try {
+                    JSONObject(client.get(UPDATE_ROUTE))
+                } catch (err: Exception) {
+                    continue
+                }
+                if (Math.abs(v.optDouble("ask_at", 0.0) - askAt) > 0.001) return@launch
+                val said = updateLine(v, System.currentTimeMillis() - began)
+                if (said != last) {
+                    fixNote.text = said
+                    last = said
+                }
+                val st = v.optString("state")
+                if (st == "done" || st == "failed") return@launch
+            }
+        }
+    }
+
+    private fun updateLine(v: JSONObject, waitedMs: Long): String {
+        val st = v.optString("state")
+        if (st == "asked" && waitedMs > UPDATE_UNTAKEN_MS) {
+            return "the desk has not taken it yet - is the Pine Box app open on the computer?"
+        }
+        val head = when (st) {
+            "asked" -> "asked the desk"
+            "taken", "running" -> "the desk is updating this tablet"
+            "done" -> "updated"
+            "failed" -> "the update did not finish"
+            else -> st
+        }
+        val line = v.optString("line")
+        return if (line.isNotEmpty()) "$head - $line" else head
+    }
 
     private fun fixSay(line: String) {
         val lines = doctorRun?.lines ?: mutableListOf()
@@ -2013,6 +2106,11 @@ class RailController(
 
         /* [smart-reinit] */
         private const val FIX_LINES = 40
+        /* [tablet-update-ask] */
+        private const val UPDATE_ROUTE = "/api/tablet/update-ask"
+        private const val UPDATE_POLL_MS = 5000L
+        private const val UPDATE_WATCH_MS = 20L * 60_000L
+        private const val UPDATE_UNTAKEN_MS = 60_000L
         private const val DOCTOR_PREFS = "pine.doctor"
         private const val DOCTOR_RESUME_MS = 10 * 60 * 1000L
 

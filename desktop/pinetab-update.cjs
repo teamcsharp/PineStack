@@ -83,6 +83,12 @@ class PinetabUpdate {
   emit(step, line, state) {
     const ev = { at: Date.now(), step: String(step || ''), line: String(line || ''), state: state || 'run' };
     if (this.job) this.job.log.push(ev);
+    /* [tablet-update-ask] on disk too: the panel's log dies with the window, and a
+     * build that stops after fifteen seconds has to be readable afterwards. */
+    try {
+      fs.appendFileSync(path.join(os.tmpdir(), 'pinetab-update.log'),
+        new Date(ev.at).toISOString() + ' [' + ev.state + '] ' + ev.step + ': ' + ev.line + '\n');
+    } catch (e) { /* a log is never worth failing the update for */ }
     try { this.d.send('pinetab-progress', ev); } catch (e) { /* the window may be gone */ }
   }
 
@@ -196,6 +202,38 @@ class PinetabUpdate {
     });
   }
 
+  /* The media stream's volume, or -1 when it cannot be read. */
+  async volume(dev) {
+    const got = await run(this.adb(), ['-s', dev, 'shell', 'cmd', 'media_session', 'volume', '--stream', '3', '--get'], 15000);
+    const m = /volume is (\d+)/.exec(got.text);
+    return m ? Number(m[1]) : -1;
+  }
+
+  async relaunch(dev) {
+    this.emit('relaunch', 'opening the PineBox app on the tablet again');
+    const got = await run(this.adb(), ['-s', dev, 'shell', 'am', 'start', '-n', PKG + '/.MainActivity'], 20000);
+    this.emit('relaunch', got.ok ? 'the app is open - it rejoins the broadcast by itself' : 'could not open it: ' + got.text.trim(),
+      got.ok ? 'ok' : 'warn');
+  }
+
+  /* The operator's level is theirs: never raise it. Only a level the install raised is
+   * brought back DOWN, with volume-down presses (`--set` does nothing on this GSI). */
+  async volumeNotRaised(dev, before) {
+    if (before < 0) return;
+    await new Promise((r) => setTimeout(r, 4000));
+    for (let round = 0; round < 3; round += 1) {
+      const now = await this.volume(dev);
+      if (now < 0 || now <= before) {
+        if (round) this.emit('volume', 'the volume is back to ' + now, 'ok');
+        return;
+      }
+      this.emit('volume', 'the install raised the volume ' + before + ' -> ' + now + ' - pressing it back down', 'warn');
+      for (let i = 0; i < now - before; i += 1) {
+        await run(this.adb(), ['-s', dev, 'shell', 'input', 'keyevent', '25'], 10000);
+      }
+    }
+  }
+
   /* mode: "update" (only if out of date), "force" (build and install regardless),
    * "resign" (re-sign and install the APK already built) */
   async update(mode) {
@@ -216,6 +254,8 @@ class PinetabUpdate {
         result.skipped = true;
         return result;
       }
+      const volBefore = await this.volume(dev);
+      if (volBefore >= 0) this.emit('check', 'the tablet\'s media volume is ' + volBefore + ' - the install must not raise it');
       this.emit('release', 'stopping the desk mirror\'s screenrecord before the install (two encoders crash the tablet)');
       try { await this.d.glassStop(); } catch (e) { /* nothing was recording */ }
       if (!(await this.deploy(dev, this.job.mode))) {
@@ -228,6 +268,12 @@ class PinetabUpdate {
       this.emit('verify', 'the tablet now has ' + (after.name || 'nothing') + (good ? '' : ' - not the build that was wanted'),
         good ? 'ok' : 'warn');
       try { await this.d.wake(); } catch (e) { /* the script woke it already */ }
+      /* [tablet-update-ask] deploy.sh installs and stops: the install killed the kiosk
+       * and nothing opened it again, so the tablet sat on its home screen with the air
+       * untaken. Open it, then make sure the install did not raise the volume. */
+      await this.relaunch(dev);
+      result.relaunched = true;
+      await this.volumeNotRaised(dev, volBefore);
       result.ok = good;
       this.emit('done', good ? 'the tablet is up to date' : 'finished, but the stamp does not match', good ? 'ok' : 'warn');
       return result;
