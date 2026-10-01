@@ -92,6 +92,7 @@ import clip_senses                      # [#1241] where a phrase comes from, and
 import recast_desk                        # [#1215]: the cupboard recast desk
 import es_voice as _es_voice              # [s3-es-voice] how a feeling sounds: the DSP + the engines' own controls
 import emotion_engine as _emotion           # [emotion-engine] the emotion engine's own window
+import production_feed as _production_feed  # [prod-feed] the pause, as a feed
 import levels as _levels                   # [levels-one] the one set of levels, on the station
 import station_pulse as _pulse             # [station-pulse] the pressure bar and the marquee
 from director import (director_add, director_beats, director_beats_clause,
@@ -21723,6 +21724,21 @@ def shelf_put(kind: str, row: dict[str, Any]) -> None:
         except Exception:  # noqa: BLE001
             pass
         rows.append(row)
+        try:                                                     # [prod-feed]
+            _pe = row.get("entry") if isinstance(row.get("entry"), dict) else row
+            _pscript = str((_pe or {}).get("script") or row.get("text") or "")
+            _production_feed.note(
+                "banked", str(kind), _pscript,
+                label=SHELF_LABEL.get(str(kind), str(kind)),
+                seconds=round(float(row.get("seconds") or (_pe or {}).get("seconds") or 0), 1),
+                lines=int((_pe or {}).get("chunks") or 0) or None,
+                made=int((_pe or {}).get("made") or 0) or None,
+                off_brief=bool(row.get("off_brief")) or None,
+                outcome=((_pe or {}).get("call_outcome") or {}).get("label") or None,
+                conversation=str(((_pe or {}).get("system3") or {}).get("conversation_id") or "") or None,
+                shelf=len(rows))
+        except Exception:  # noqa: BLE001
+            pass
         try:
             _INVENTORY_PLAN["at"] = 0.0
             _COMMITS["at"] = 0.0
@@ -46446,6 +46462,14 @@ async def prep_round(kind: str) -> bool:
         return False                    # nothing to say from that road
     entry = pile[0]
     entry["prep_kind"] = str(kind)
+    try:                                                         # [prod-feed]
+        _production_feed.note(
+            "written", str(kind), str(entry.get("script") or ""),
+            label=SHELF_LABEL.get(str(kind), str(kind)),
+            conversation=str((entry.get("system3") or {}).get("conversation_id") or "") or None,
+            caller=str(entry.get("prep_name") or "") or None)
+    except Exception:  # noqa: BLE001
+        pass
     if kind == "caller":
         try:
             entry["call_outcome"] = call_outcome_of(entry)       # [bank-ahead]
@@ -46455,6 +46479,15 @@ async def prep_round(kind: str) -> bool:
     # it on a later visit, and any line that never got made simply
     # renders on air the way it always would have.
     await larder_prepare(entry)
+    try:                                                         # [prod-feed]
+        _production_feed.note(
+            "recorded", str(kind),
+            "%s of %s lines voiced, %ss of finished audio"
+            % (entry.get("made") or 0, entry.get("chunks") or 0, entry.get("seconds") or 0),
+            label=SHELF_LABEL.get(str(kind), str(kind)),
+            discarded=bool(entry.get("discarded")) or None)
+    except Exception:  # noqa: BLE001
+        pass
     if kind == "caller" and entry.get("discarded"):
         return False
     shelf_put(kind, {"entry": entry,
@@ -155866,6 +155899,10 @@ except Exception as _origin_exc:  # noqa: BLE001
 # [sfxseen] SFX DISPLAY RECEIPTS (sfx_display.py): each player says whether a
 # clip's picture reached its screen (surface, first frame, rect, seconds, the
 # operator's reaction); joined to the script's SFX rows. A KEEP store, 7 days.
+try:                                                        # [prod-feed] GET /api/production/feed
+    _production_feed.install(app, globals())
+except Exception as _pf_exc:  # noqa: BLE001
+    print("the production feed did not install: %s: %s" % (type(_pf_exc).__name__, _pf_exc))
 try:                                                        # [emotion-engine] GET /api/emotion/state
     _emotion.install(app, globals())
 except Exception as _ee_exc:  # noqa: BLE001

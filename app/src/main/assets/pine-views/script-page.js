@@ -24535,6 +24535,9 @@
           flow.talk_next_in = state.talk_next_in;
         }
         stationPaused = !!state.paused;
+        /* [prod-feed] while paused, the panel above the feed shows what the
+           backend is banking: System 3's rolls, the emotion engine, each step */
+        try { if (root.PineProductionFeed) root.PineProductionFeed.paused(stationPaused); } catch (e) { /* optional */ }
         /* #1336: THE COMMITTED SEQUENCE. `admission` is the playout
            controller's own record of what it admitted, in the order it
            admitted it. Absent on a station that has not been patched yet,

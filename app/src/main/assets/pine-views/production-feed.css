@@ -1,0 +1,57 @@
+/* [prod-feed] the pause, as a feed - above the script feed while paused */
+.pf-panel { display: flex; flex-direction: column; gap: 8px; margin: 0 0 10px; padding: 10px; border: 1px solid #2c404b;
+  border-radius: 8px; background: #0b1317; color: #dbe6f0; font-size: 12.5px; max-height: 62vh; min-height: 0; }
+.pf-panel[hidden] { display: none; }
+.pf-head { display: flex; flex-direction: column; gap: 6px; }
+.pf-headline { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+.pf-headline b { color: #8de1ed; letter-spacing: .08em; font-size: 12px; }
+.pf-meters { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 4px 12px; }
+.pf-meter { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.pf-bar { flex: 1; height: 6px; border-radius: 3px; background: #1a2a32; overflow: hidden; }
+.pf-fill { display: block; height: 100%; background: linear-gradient(90deg, #3a8fa0, #65c7da); }
+.pf-waste, .pf-ends, .pf-refuse { display: flex; flex-wrap: wrap; gap: 6px 12px; color: #9fb4bd; }
+.pf-warn { color: #e3be63; }
+.pf-chip { padding: 1px 7px; border-radius: 10px; background: #142129; border: 1px solid #2c404b; color: #c9d6dd; }
+.pf-chip.warn { border-color: #7a5b2a; color: #e3be63; }
+.pf-list { overflow-y: auto; min-height: 120px; display: flex; flex-direction: column; gap: 6px; padding-right: 4px; }
+.pf-row { padding: 6px 8px; border-radius: 6px; background: #101b21; border-left: 3px solid #2c404b; }
+.pf-roll { border-left-color: #b98cf0; }
+.pf-stage { border-left-color: #65c7da; }
+.pf-banked { border-left-color: #6fcf8f; }
+.pf-emote { border-left-color: #f0a06a; }
+.pf-gate { border-left-color: #e3be63; }
+.pf-note { background: transparent; border-left-color: #1f2f37; color: #8ea0ad; padding: 2px 8px; }
+.pf-top { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; min-width: 0; }
+.pf-time { color: #6c7f8a; font-variant-numeric: tabular-nums; font-size: 11px; }
+.pf-road { color: #8de1ed; font-size: 10.5px; letter-spacing: .08em; font-weight: 600; }
+.pf-title { color: #edf3f5; font-weight: 600; }
+.pf-text { color: inherit; overflow-wrap: anywhere; }
+.pf-dim { color: #7f929b; margin: 0; }
+.pf-rollline { display: flex; gap: 10px; align-items: flex-start; margin-top: 5px; }
+.pf-die { flex: none; width: 34px; height: 34px; display: grid; place-items: center; border-radius: 7px; background: #1c1430;
+  border: 1px solid #5b3f8a; color: #e6d8ff; font-weight: 700; font-variant-numeric: tabular-nums;
+  transition: background .3s, box-shadow .3s; }
+.pf-die.landed { background: #2c1d4d; box-shadow: 0 0 0 2px rgba(185,140,240,.35); }
+.pf-rollbody { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+.pf-table { color: #9fb4bd; font-size: 11px; }
+.pf-reel { height: 26px; overflow: hidden; border: 1px solid #35505c; border-radius: 5px; background: #081013;
+  box-shadow: inset 0 7px 7px -7px #000, inset 0 -7px 7px -7px #000; }
+.pf-card { height: 26px; line-height: 26px; padding: 0 9px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: #9fb0ba; }
+.pf-card.hit { color: #fff; font-weight: 600; background: rgba(185,140,240,.18); }
+.pf-verdict { display: flex; flex-wrap: wrap; gap: 4px 10px; font-size: 11.5px; }
+.pf-win { color: #b8f0c8; }
+.pf-lose { color: #8a96a0; text-decoration: line-through; text-decoration-color: rgba(240,120,110,.6); }
+.pf-track { display: inline-flex; gap: 3px; }
+.pf-step { padding: 0 6px; border-radius: 8px; font-size: 10.5px; color: #5d6f79; border: 1px solid #22323a; }
+.pf-step.done { color: #9fd9e3; border-color: #2f5561; }
+.pf-step.now { color: #0b1317; background: #65c7da; border-color: #65c7da; font-weight: 600; }
+.pf-facts { margin-top: 3px; color: #a9bac3; font-size: 11.5px; }
+.pf-script { margin: 5px 0 0; padding: 6px 8px; border-radius: 5px; background: #081013; color: #d4dee5; white-space: pre-wrap;
+  font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; overflow-wrap: anywhere; }
+.pf-said { margin: 4px 0 0; color: #e7d6c8; font-style: italic; }
+.pf-es { display: flex; flex-wrap: wrap; gap: 4px 12px; margin-top: 4px; }
+.pf-esdim { display: inline-flex; align-items: center; gap: 4px; font-size: 10.5px; color: #9fb4bd; }
+.pf-esdim i { font-style: normal; }
+.pf-esbar { width: 54px; height: 5px; border-radius: 3px; background: #2a1d14; overflow: hidden; }
+.pf-esfill { display: block; height: 100%; background: #f0a06a; }
+@media (prefers-reduced-motion: reduce) { .pf-reel .pf-strip { transition: none !important; } }
