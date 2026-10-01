@@ -200,6 +200,7 @@
       ui.flowKey = flow.key;
       ui.paintedMode = 'technical';
       ui.nowRow = null;
+      ui.prevSig = ''; ui.prevRow = null;                                 /* [fc-inspect] */
     }
     var nodes = flow.nodes || [];
     var upto = revealUpTo(flow);
@@ -218,6 +219,17 @@
         }
         return;
       }
+      /* [fc-inspect] the same step or gate again and again ("speakerbox" x3) is
+         one row with a count, not a wall of copies */
+      var sig = (n.type === 'step' || n.type === 'gate') ? n.type + '|' + (n.label || '') + '|' + (n.text || '') : '';
+      if (sig && sig === ui.prevSig && ui.prevRow && ui.prevRow.isConnected) {
+        ui.shown[n.id] = ui.prevRow;
+        ui.prevRow.__count = (ui.prevRow.__count || 1) + 1;
+        var times = ui.prevRow.querySelector('.fc-times') || ui.prevRow.querySelector('.fc-node').appendChild(make('span', 'fc-times'));
+        times.textContent = '×' + ui.prevRow.__count;
+        (ui.prevRow.__nodes = ui.prevRow.__nodes || [ui.prevRow.__node]).push(n);
+        return;
+      }
       var k = fresh - (news - ANIMATE_LAST);
       var delay = k > 0 ? k * STAGGER_MS : 0;
       var row = make('div', 'fc-row fc-row-' + n.type);
@@ -230,10 +242,113 @@
       }
       ui.body.appendChild(row);
       ui.shown[n.id] = row;
+      row.__node = n;                                                     /* [fc-inspect] */
+      ui.prevSig = sig; ui.prevRow = row;
       if (n.type === 'turn' && n.now) ui.nowRow = row;                    /* [air-jump-any] */
       fresh += 1;
     });
     return fresh;
+  }
+
+  /* [fc-inspect] "I need to be able to tap and hold to bring up an inspection panel
+     explaining the origin and details of each node" (the operator, 2026-10-01).
+     Hold (or right-click) any node in either style: what kind of node it is, what
+     made it, and every fact System 3 recorded on it. */
+  var FAMILY = {
+    GRAPH: 'a node of the segment\'s chain graph (the NodePlan): who speaks next, whether the reply chain goes on, how the speaker takes what was said',
+    ES: 'the Emotion Set: the feeling this line is voiced in', SFX: 'the sound effect after the line: whether and which',
+    SFXGUY: 'the SFX Guy: whether he punctuates this line with a clip', STATION: 'a station dice door: a pick the station made through System 3 (a document, a pool, an ad, a slot)',
+    RS: 'the Response Style: how the speaker answers what was said', IRS: 'the Inner Response Style: how the speaker takes it inside',
+    FL: 'the Flow: where the conversation moves next (stay, deepen, change, concede)', CUTIN: 'whether someone cuts in this round',
+    SPEAKERBOX: 'whether a Speakerbox passage is dealt into the turn, and how', GOLD: 'whether a kept gold take is reused',
+    TEMPER: 'the writer\'s temperature for the round', CTS: 'the current topic\'s subject', MEASURE: 'how the round is measured against its time',
+    LENGTH: 'how long the round runs', TOPIC: 'the topic change: what the conversation turns to', REPAIR: 'whether a broken draft is repaired',
+    ROOM: 'which room the round is made in', SHOCK: 'a shock: something outrageous dropped into the round', MEMORY: 'what the cast remembers from earlier',
+    FAV: 'a cast favourite surfacing', MENTION: 'a mention of something the station knows', CALLARC: 'the arc of a phone call',
+    CALLSHIFT: 'a detour in a phone call', EVENT: 'a live station event lending lines', WRAP: 'how the round wraps up', RESOLVE: 'how a planned turn is resolved'};
+  var KIND = {
+    start: 'Where this conversation began: the road that asked for it, the subject System 3 was handed, its running order and the seed every roll is drawn from.',
+    decision: 'A roll System 3 made: a drum of candidates, each with its weight, and a d100 that picked one. The winner steered the conversation; the others are what it beat.',
+    turn: 'A planned turn of the conversation: who was elected to speak, what the plan asked of them, how they feel, and - once written and aired - what they said.',
+    gate: 'A gate: a check System 3 ran on the writing, and what it caught or changed here.',
+    step: 'A step System 3 recorded while building the round (a prompt sent, a gate, a passage placed).',
+    end: 'Where the conversation stands now.'};
+  function inspectRows(n) {
+    var out = [];
+    function add(k, v) { if (v != null && v !== '' && !(Array.isArray(v) && !v.length)) out.push([k, v]); }
+    add('node', n.id);
+    if (n.type === 'decision') {
+      add('family', (n.family || '') + (FAMILY[n.family] ? ' - ' + FAMILY[n.family] : ''));
+      add('drawn from', (n.path || []).join(' › '));
+      add('d100', n.dice == null ? 'no random number (pinned or a single choice)' : n.dice);
+      add('odds', n.odds != null ? pct(n.odds) + ' to happen' : '');
+      add('drum', n.of ? n.of + ' candidates' : '');
+      if (n.winner) add('landed', n.winner.label + (n.winner.p != null ? '  (' + pct(n.winner.p) + ')' : '') + (n.winner.why && n.winner.why.length ? '  - ' + n.winner.why.join('; ') : ''));
+      add('beat', (n.losers || []).map(function (l) { return l.label + (l.p != null ? ' ' + pct(l.p) : ''); }).join('  |  ') + (n.more ? '  |  +' + n.more + ' more' : ''));
+      add('could not come up', n.excluded);
+      add('for turn', n.turn_index >= 0 ? n.turn_index + 1 : 'the round as a whole');
+      add('pinned', n.fixed ? 'yes - the roulette was off for this draw' : '');
+    } else if (n.type === 'turn') {
+      var rl = n.__role || roleOf(n);
+      add('role', rl === 'initiator' ? 'Initiator' : rl === 'rebuttal' ? 'Rebuttal' : rl === 'topic' ? 'Topic Change' : 'Reply');
+      add('speaker', (n.who || '') + (n.seat ? '  (seat ' + n.seat + ')' : ''));
+      add('asked to', n.asked); add('said', n.said); add('feeling', n.feeling);
+      add('leg', [n.leg, n.place].filter(Boolean).join(' / '));
+      add('line codes', (n.codes || []).join(', '));
+      add('aired', n.aired_at ? new Date(n.aired_at * 1000).toLocaleTimeString() : 'not yet - planned');
+      add('on air now', n.now ? 'yes' : '');
+    } else if (n.type === 'start') {
+      add('road', n.road); add('subject', n.topic); add('structure', n.structure); add('seed', n.seed);
+      add('turns planned', n.turns); add('budget', n.budget);
+    } else {
+      add('what', n.label); add('detail', n.text);
+      if (n.facts) Object.keys(n.facts).forEach(function (k) { add(k, n.facts[k]); });
+    }
+    if (n.at) add('recorded at', new Date(n.at * 1000).toLocaleTimeString());
+    return out;
+  }
+  function openInspect(n, many) {
+    closeInspect();
+    var pop = make('section', 'fc-inspect');
+    pop.setAttribute('role', 'dialog');
+    pop.setAttribute('aria-label', 'Inspect this node');
+    var x = make('button', 'fc-inspect-x', '×');
+    x.type = 'button'; x.title = 'Close'; x.setAttribute('aria-label', 'Close');
+    x.addEventListener('click', closeInspect);
+    var title = n.type === 'decision' ? (n.family || 'roll') + ' roll' : n.type === 'turn' ? (n.who || n.seat || 'turn') + ' - turn ' + (n.index + 1)
+      : n.type === 'start' ? 'Conversation #' + String(n.id).split(':')[1] : (n.label || n.type);
+    pop.append(x, make('h3', '', title), make('p', 'fc-inspect-kind', KIND[n.type] || ''));
+    if (many && many.length > 1) pop.appendChild(make('p', 'fc-inspect-kind', 'Recorded ' + many.length + ' times in a row here - shown once.'));
+    var dl = make('dl', 'fc-inspect-dl');
+    inspectRows(n).forEach(function (r) { dl.append(make('dt', '', r[0]), make('dd', '', typeof r[1] === 'object' ? JSON.stringify(r[1]) : String(r[1]))); });
+    pop.appendChild(dl);
+    (ui.pane || document.body).appendChild(pop);
+    ui.inspect = pop;
+  }
+  function closeInspect() { if (ui.inspect) { ui.inspect.remove(); ui.inspect = null; } }
+  function nodeAt(el) {
+    while (el && el !== ui.body) { if (el.__node) return el; el = el.parentNode; }
+    return null;
+  }
+  function wireHold(body) {
+    var timer = 0, sx = 0, sy = 0;
+    function cancel() { if (timer) { root.clearTimeout(timer); timer = 0; } }
+    body.addEventListener('pointerdown', function (ev) {
+      var host = nodeAt(ev.target);
+      if (!host || (ev.button != null && ev.button > 0)) return;
+      sx = ev.clientX; sy = ev.clientY;
+      cancel();
+      timer = root.setTimeout(function () { timer = 0; openInspect(host.__node, host.__nodes); }, 480);
+    });
+    body.addEventListener('pointermove', function (ev) { if (timer && Math.abs(ev.clientX - sx) + Math.abs(ev.clientY - sy) > 10) cancel(); });
+    ['pointerup', 'pointercancel', 'pointerleave', 'scroll'].forEach(function (k) { body.addEventListener(k, cancel, {passive: true}); });
+    body.addEventListener('contextmenu', function (ev) {
+      var host = nodeAt(ev.target);
+      if (!host) return;
+      ev.preventDefault();
+      openInspect(host.__node, host.__nodes);
+    });
+    document.addEventListener('keydown', function (ev) { if (ev.key === 'Escape') closeInspect(); });
   }
 
   /* [fc-design] THE DESIGN FLOWCHART, the operator's NodePlan drawn from the record
@@ -259,6 +374,7 @@
   }
   function designDiamond(n) {
     var row = make('div', 'fd-diarow');
+    row.__node = n;                                                        /* [fc-inspect] */
     var dia = make('span', 'fd-dia');
     dia.appendChild(make('span', 'fd-dia-in', n.dice == null ? '–' : String(n.dice)));
     row.appendChild(dia);
@@ -273,6 +389,7 @@
   function designBox(t, label, role) {
     var spoken = !!(t.said || t.aired_at);
     var box = make('div', 'fd-box fd-' + role + (spoken ? '' : ' planned') + (t.now ? ' now' : ''));
+    box.__node = t;                                                        /* [fc-inspect] */
     var head = make('div', 'fd-box-head');
     head.appendChild(make('b', '', label));
     var elect = make('span', 'fd-elect');
@@ -314,6 +431,7 @@
     var chapter = 0, replyN = 0, chain = null;
     turns.forEach(function (t, k) {
       var role = k === 0 ? 'initiator' : roleOf(t);       /* a chain always opens on its Initiator */
+      t.__role = role;                                     /* [fc-inspect] the panel names the same place */
       if (role === 'initiator' || !chain) {
         chapter += 1; replyN = 0;
         chain = make('section', 'fd-chain');
@@ -503,6 +621,7 @@
     pane.appendChild(ui.status);
     ui.body = make('div', 'fc-body');
     ui.body.addEventListener('scroll', onScroll, {passive: true});
+    wireHold(ui.body);                                                     /* [fc-inspect] */
     pane.appendChild(ui.body);
     ui.pane = pane;
     paintMode();

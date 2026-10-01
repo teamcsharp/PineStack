@@ -105,3 +105,17 @@
 .fd-dia-label { color: #9fb4c0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .fd-end { color: #8ea0ad; font-style: italic; font-size: 12px; }
 .fd-box.fc-flash { outline: 2px solid #8de1ed; outline-offset: 4px; }
+/* [fc-inspect] hold a node: what it is, where it came from, every fact on it */
+.fc-pane { position: relative; }
+.fc-times { margin-left: 8px; padding: 0 6px; border-radius: 8px; background: #13222c; color: #8de1ed; font: 600 11px/1.6 ui-monospace, Consolas, monospace; }
+.fc-inspect { position: absolute; left: 12px; right: 12px; top: 56px; max-height: calc(100% - 72px); overflow: auto; z-index: 20;
+  box-sizing: border-box; padding: 14px 44px 14px 16px; border: 1px solid #65c7da; border-radius: 10px; background: #0b1520f2;
+  color: #dbe6f0; box-shadow: 0 18px 50px #000c; font: 13px/1.5 Inter, Segoe UI, system-ui, sans-serif; }
+.fc-inspect h3 { margin: 0 0 4px; color: #8de1ed; font-size: 15px; }
+.fc-inspect-kind { margin: 0 0 8px; color: #c8d4d9; font-size: 12.5px; }
+.fc-inspect-x { position: absolute; top: 8px; right: 8px; width: 28px; height: 28px; border: 1px solid #36515c; border-radius: 6px;
+  background: #17252d; color: #e7f1f4; font: 18px/1 Inter, sans-serif; cursor: pointer; }
+.fc-inspect-dl { display: grid; grid-template-columns: max-content 1fr; gap: 3px 12px; margin: 0; font-size: 12.5px; }
+.fc-inspect-dl dt { color: #8ea0ad; }
+.fc-inspect-dl dd { margin: 0; overflow-wrap: anywhere; }
+.fc-row .fc-node, .fd-box, .fd-diarow { -webkit-user-select: none; user-select: none; }
