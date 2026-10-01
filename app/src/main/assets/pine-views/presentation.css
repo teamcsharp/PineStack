@@ -60,7 +60,7 @@
 }
 .view.pv-view.active { padding: 10px; }
 /* 10px of margin INSIDE the 34px rail gutter and the 26px console strip. */
-.pine-view-host.open.pv-view { padding: 10px 44px 36px 10px; }
+.pine-view-host.open.pv-view { padding: 10px 44px calc(var(--pine-chrome-bottom, 46px) + 10px) 10px; }
 
 /* THE SHAPE OF THE SCREEN. The transport runs the full width because the
    thing playing is the one fact everything else is about; underneath, the
