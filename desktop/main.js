@@ -2058,9 +2058,26 @@ async function openTabletMirror(options) {
     if (poke) { poke.close(); poke = null; }
     /* The encoder on the tablet stops when nobody is watching. A mirror
      * left running behind a closed window is a battery being spent on a
-     * picture nobody can see. */
-    if (mirror) { mirror.close(); mirror = null; }
+     * picture nobody can see. [mirror-pause] ...and it stops cleanly. */
+    if (mirror) {
+      const going = mirror;
+      mirror = null;
+      Promise.resolve(going.closeGently()).catch(() => going.close());
+    }
   });
+  /* [mirror-pause] minimised or hidden is not watching either: the tablet's
+   * screenrecord stops (SIGINT, its own clean stop) and comes back when the
+   * window does. One encoder on the tablet instead of two whenever the
+   * picture is out of sight - see tablet-mirror.cjs pause(). */
+  const mirrorAway = () => { if (mirror) mirror.pause().catch(() => {}); };
+  const mirrorBack = () => {
+    if (mirror && mirrorWindow && !mirrorWindow.isDestroyed()
+      && !mirrorWindow.isMinimized() && mirrorWindow.isVisible()) mirror.resume();
+  };
+  mirrorWindow.on("minimize", mirrorAway);
+  mirrorWindow.on("hide", mirrorAway);
+  mirrorWindow.on("restore", mirrorBack);
+  mirrorWindow.on("show", mirrorBack);
   mirrorWindow.loadFile(path.join(__dirname, "renderer", "tablet-mirror.html"));
   /* [mirror-pip-refull] A mirror closed fullscreen comes BACK fullscreen,
    * with the remembered windowed bounds waiting underneath - leaving

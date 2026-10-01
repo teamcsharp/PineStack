@@ -568,6 +568,58 @@ class Mirror {
     this.convert = null;
   }
 
+  /* [mirror-pause] THE TABLET'S ENCODER IS NOT SPENT ON A PICTURE NOBODY SEES.
+   *
+   * 2026-09-30: four tablet reboots, every one a kernel panic in its video
+   * encoder (MVA exhausted, devapc BUG) with two H.264 encoders live - the
+   * kiosk's replay ring and this mirror's screenrecord, which ran whenever
+   * the window existed, minimised or buried behind the panel included. The
+   * operator: "have the desk only record the tablet's screen while its
+   * mirror window is actually open". pause() ends the tablet's screenrecord
+   * with SIGINT - its own clean shutdown, the encoder given back rather
+   * than torn down by a broken pipe - and keeps the local server, so the
+   * window's <img> picks the picture up again on resume(). */
+  stopRemote() {
+    return new Promise((resolve) => {
+      try {
+        require('node:child_process').execFile(this.adb,
+          this.target(['shell', 'pkill -INT -f "screenrecord --output-format=h264"']),
+          { timeout: 6000, windowsHide: true }, () => resolve());
+      } catch (error) { resolve(); }
+    });
+  }
+
+  async pause() {
+    if (!this.running) return this.how();
+    this.paused = true;
+    this.running = false;                 // rebuild() stands down
+    clearInterval(this.watchdog);
+    clearTimeout(this.retryTimer);
+    this.watchdog = null;
+    this.retryTimer = null;
+    this.rebuilding = false;
+    await this.stopRemote();
+    await new Promise((r) => setTimeout(r, 400));   // let it finish its own stop
+    this.kill();
+    return this.how();
+  }
+
+  resume() {
+    if (!this.paused || this.running) return this.how();
+    this.paused = false;
+    this.running = true;
+    this.startedAt = Date.now();
+    this.pipe();
+    this.watchdog = setInterval(() => this.health(), WATCH_EVERY_MS);
+    if (this.watchdog.unref) this.watchdog.unref();
+    return this.how();
+  }
+
+  async closeGently() {                     // [mirror-pause] the window closing
+    if (this.running) await this.pause();
+    this.close();
+  }
+
   close() {
     this.running = false;
     clearInterval(this.watchdog);

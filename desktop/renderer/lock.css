@@ -198,6 +198,13 @@ body.pine-locked #pineConsoleLine,
 body.pine-locked #pineViewRail,
 body.pine-locked #pineSamplerTab { display: none !important; }
 body.pine-locked .pine-talk-dot { z-index: 2147483090; }
+/* [lock-stings] "right now im not seeing videos pop up on the tablet"
+   (2026-09-30): the kiosk comes back on this screen after every relaunch and
+   reboot, and every sting's picture played UNDER it - 25 receipts in two
+   windows that night read "occluded by div.lk-grid". This is the station on
+   the locked tablet; its stings belong on it. The tube's z-index is written
+   inline (sfx-tv.js build(): 2147483020), so the lift needs !important. */
+body.pine-locked .sfx-tv { z-index: 2147483060 !important; }
 
 /* Portrait: the picture takes the top, the words stack under it. */
 @media (orientation: portrait) {

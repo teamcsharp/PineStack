@@ -31369,17 +31369,22 @@ def page_playback_ack(payload: Any, addr: str = "",
                 except Exception:  # noqa: BLE001
                     pass
         if audible > 0 and progressed and delivery.get("speech"):
+            try:                                     # [resume-heard] how far the ear got
+                clip["resume_at"] = round(max(float(clip.get("resume_at") or 0),
+                                              float(position) - 0.3), 2)
+            except Exception:  # noqa: BLE001
+                pass
             try:
                 stream = clip.get("stream") or {}
                 if stream.get("rows") and event == "playing":
                     _stream_now_set(list(stream["rows"]),
                                     float(stream.get("length") or 0), stamp=False)
                     _STREAM_NOW["at"] = now - position
-                    if not delivery.get("sfx_pictures_rung"):
+                    if delivery.get("sfx_pictures_rung") != listener:   # [resume-heard] per page
                         pending = [row for row in stream["rows"]
                                    if float(row.get("until") or 0) > position]
                         _sfx_cadence_pictures(pending, now - position)
-                        delivery["sfx_pictures_rung"] = True
+                        delivery["sfx_pictures_rung"] = listener
             except Exception:  # noqa: BLE001
                 pass
             interval = max(float(previous.get("current_time") or position),
@@ -242421,6 +242426,7 @@ async function djVoicePoll(immediate) {
       // alternating voice-element queue, even if an older server leaks one.
       if (clip.video || clip.picture_only) return;
       clip.broadcastAt = Date.now() + Number(clip.broadcast_ms || clip.ts) - serverMs;
+      if (Number(clip.resume_at) > 0 && !clip.resumeAt) clip.resumeAt = Number(clip.resume_at);   // [resume-heard]
       // History can expire at join; speech accepted during listening is owed
       // in full even when a render, download or earlier call makes it late.
       clip.keepWhole = !!(clip.speech || clip.stream) && (djVoicePrimed || immediate
@@ -274341,6 +274347,7 @@ async function pollOnce() {
     (data.clips || []).forEach((clip) => {
       voiceSeen = Math.max(voiceSeen, clip.ts);
       clip.broadcastAt = Date.now() + Number(clip.broadcast_ms || clip.ts) - serverMs;
+      if (Number(clip.resume_at) > 0 && !clip.resumeAt) clip.resumeAt = Number(clip.resume_at);   // [resume-heard]
       clip.keepWhole = !!(clip.speech || clip.stream) && (voicePrimed
         || clip.broadcastAt + Number((clip.stream || {}).length || 15) * 1000 > Date.now());
       if (clip.url) {
