@@ -100,3 +100,27 @@ class Library(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FileState(unittest.TestCase):
+    """[sfx-gone] a clip the book lists but the share does not hold."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name) / "samples"
+        (self.root / "Rest").mkdir(parents=True)
+        self.here = self.root / "Rest" / "a.mp4"
+        self.here.write_bytes(b"x")
+
+    def test_here_gone_and_unreachable(self):
+        self.assertEqual(lib.file_state(self.here, [self.root]), "here")
+        self.assertEqual(lib.file_state(self.root / "Rest" / "b.mp4", [self.root]), "gone")
+        self.assertEqual(lib.file_state(self.root / "Gone" / "b.mp4", [self.root]), "gone")
+
+    def test_an_unmounted_share_never_says_gone(self):
+        away = Path(self.tmp.name) / "unmounted"
+        self.assertEqual(lib.file_state(away / "Rest" / "b.mp4", [away]), "unreachable")
+        away.mkdir()                                  # a mount point with nothing in it
+        self.assertEqual(lib.file_state(away / "Rest" / "b.mp4", [away]), "unreachable")
+        self.assertEqual(lib.file_state("", [self.root]), "unreachable")

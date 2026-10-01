@@ -127,6 +127,14 @@ cmp -s "$VIEW_PANEL/sfx-tv.css" "$VIEW_SAMPLER/sfx-tv.css" || {
   exit 1
 }
 
+# [pinetab-stamp] what this APK is built from, after the sync: the version name
+# carries it (1.0.0+<stamp>) so the desk can tell an out-of-date tablet; the
+# version code is the build minute, so every install is an upgrade.
+. "$HERE/tools/pinetab-stamp.sh"
+STAMP=$(pine_stamp "$HERE")
+CODE=$(( $(date +%s) / 60 ))
+say "stamp $STAMP (version code $CODE)"
+
 if [ "$MODE" != "--no-build" ]; then
   say "building"
   # There is NO gradle wrapper in this project - the distribution at
@@ -157,9 +165,9 @@ if [ "$MODE" != "--no-build" ]; then
       ANDROID_SDK_ROOT="$(cygpath -w "$ANDROID_SDK_ROOT")" \
       GRADLE_USER_HOME="$(cygpath -w "$GRADLE_USER_HOME")" \
       cmd.exe /d /c \
-        "pushd $HERE_WIN && call $GRADLE_WIN --console=plain assembleDebug && popd"
+        "pushd $HERE_WIN && call $GRADLE_WIN --console=plain -PpineStamp=$STAMP -PpineCode=$CODE assembleDebug && popd"
       ;;
-    *) (cd "$HERE" && "$GRADLE" --console=plain assembleDebug) ;;
+    *) (cd "$HERE" && "$GRADLE" --console=plain -PpineStamp="$STAMP" -PpineCode="$CODE" assembleDebug) ;;
   esac
 fi
 [ -f "$DEBUG" ] || { echo "no $DEBUG"; exit 1; }

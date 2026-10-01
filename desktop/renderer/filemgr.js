@@ -223,6 +223,21 @@
     ui.sub = make('span', 'fm-sub', 'reading the station\'s files...');
     t.appendChild(ui.sub);
     head.appendChild(t);
+    /* [sfx-switch] "switch this whole window over to being the SFX database
+       through a button here" - the operator, 2026-10-01. The SFX database
+       has one back to this window in its own header. */
+    var toSfx = make('button', 'fm-switchbtn');
+    toSfx.type = 'button';
+    toSfx.title = 'Switch this window to the SFX database';
+    toSfx.setAttribute('aria-label', 'Switch this window to the SFX database');
+    toSfx.appendChild(ico('c:archive', ''));
+    toSfx.appendChild(make('span', '', 'SFX database'));
+    toSfx.addEventListener('click', function () {
+      if (!(root.PineSfxDb && typeof root.PineSfxDb.open === 'function')) return;
+      closePopup();
+      root.PineSfxDb.open();
+    });
+    head.appendChild(toSfx);
     var refresh = make('button', 'fm-iconbtn');
     refresh.type = 'button';
     refresh.title = 'Measure again';

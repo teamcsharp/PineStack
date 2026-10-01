@@ -86,12 +86,15 @@ import prompt_history
 import word_cause_edits
 import clip_speech
 import comfy_workshop
+import h3_slots                          # [h3-slots] {mxtape} {fordtape} {videos} {sfxclip} {convograph} {gazette} {arena}
 import h3_speak                          # [h3-speak] the hourly video's dialogue: whole sentences, rolled
 from parody_stinger_queue import ParodyQueue
 import clip_senses                      # [#1241] where a phrase comes from, and the ban
 import recast_desk                        # [#1215]: the cupboard recast desk
 import es_voice as _es_voice              # [s3-es-voice] how a feeling sounds: the DSP + the engines' own controls
 import emotion_engine as _emotion           # [emotion-engine] the emotion engine's own window
+import production_feed as _production_feed  # [prod-feed] the pause, as a feed
+import call_producer as _call_producer      # [call-prod] produced calls, mixed while paused
 import levels as _levels                   # [levels-one] the one set of levels, on the station
 import station_pulse as _pulse             # [station-pulse] the pressure bar and the marquee
 from director import (director_add, director_beats, director_beats_clause,
@@ -444,6 +447,61 @@ async def api_content_gates_get(
 ) -> dict[str, Any]:
     require_read_auth(authorization)
     return content_gate_status()
+
+
+# --- [speech-gates] EVERY GATE ON THE STATION'S SPEECH, EDITABLE -----------------
+# speech_gates.py lists the thresholds written into the code that refuse a line
+# whatever the content gates say (nothing twice inside a day, the rerun check,
+# the advert copy check, System 3's copy gate, the hourly video's sentence
+# rules...); the operator's values live in data/speech_gates.json and are set on
+# the running station at boot and on every change. The panel (speech-gates.js)
+# shows them beside the content gates above.
+import speech_gates as _speech_gates
+
+
+def speech_gates_stats(gid: str) -> dict[str, Any]:
+    """What a gate has done lately, where the station already counts it."""
+    if gid == "norepeat" and globals().get("NOREPEAT") is not None:
+        counts = dict(getattr(NOREPEAT, "counts", {}) or {})
+        refused = {k[len("refused:"):]: v for k, v in counts.items() if k.startswith("refused:")}
+        return {"refused": sum(refused.values()), "by_road": dict(sorted(refused.items(), key=lambda kv: -kv[1])[:8]),
+                "since": "boot"}
+    if gid == "rerun" and globals().get("_block_rate"):
+        return {"block_rate": round(_block_rate(), 3), "of_last": len(globals().get("_BLOCK_RECENT") or [])}
+    return {}
+
+
+@app.on_event("startup")
+async def _speech_gates_start() -> None:
+    try:
+        await asyncio.to_thread(_speech_gates.load, data_path("speech_gates.json"))
+        missed = _speech_gates.apply(globals())
+        if missed:
+            pipeline_log("gates", "[speech-gates] not set: %s" % ", ".join("%s (%s)" % kv for kv in missed.items()))
+    except Exception as exc:  # noqa: BLE001
+        pipeline_log("gates", "[speech-gates] not loaded (%s)" % type(exc).__name__)
+
+
+@app.get("/api/speech-gates")
+async def api_speech_gates_get(authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    require_read_auth(authorization)
+    out = _speech_gates.view(globals(), speech_gates_stats)
+    out["content"] = content_gate_status()
+    return out
+
+
+@app.post("/api/speech-gates")
+async def api_speech_gates_post(request: Request, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    """{gate, key, value} | {gate, rule, on} | {gate, reset: true}."""
+    require_auth(authorization)
+    body = await request.json()
+    try:
+        out = await asyncio.to_thread(_speech_gates.change, globals(), body if isinstance(body, dict) else {})
+    except (KeyError, TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc).strip("'")) from exc
+    pipeline_log("gates", "[speech-gates] %s: %s" % (body.get("gate"), {k: v for k, v in body.items() if k != "gate"}))
+    out["content"] = content_gate_status()
+    return out
 
 
 @app.patch("/api/orchestrator/content-gates")
@@ -1781,6 +1839,7 @@ DEFAULT_DJ = {
     # "bumper" behaviour where a high talk dial truncates every song.
     "records_whole": True,
     "mixtape_folder": "_music by me",
+    "fordtape_folder": "samples_grabbed/user/ford",   # [h3-slots] General Ford's tapes (his submissions), for {fordtape}
     # Let the active system prompt colour the pair's mood, so switching
     # prompts swings the disposition of the show. Off by default: the DJ
     # persona is its own thing until you say otherwise.
@@ -2132,6 +2191,18 @@ DEFAULT_DJ = {
     # because the desk read "assigned"; the first minutes after resume
     # must come off the shelf, not the model.
     "pause_bank_rounds": 12,
+    # [bank-ahead] 2026-10-01, the operator: "the goal of pausing the
+    # station is to bank enough quality roulette driven system 3 dialogue
+    # to alleviate the realtime pressure of speech generation ... I want
+    # callers being stored with variable outcomes and manager messages for
+    # days queued up." While paused, these roads are owed this many hours
+    # of finished stock (0 turns it off) instead of the 6-hour ceiling
+    # every other road keeps, and the paused planner builds them first.
+    "bank_ahead_hours": 72,
+    "bank_ahead_roads": "caller,manager",
+    # [call-prod] while paused, banked calls are produced: the line's own sounds, the
+    # caller's background, hits on the beats and a bed under a win, mixed into new takes
+    "produced_calls": True,
     # #1034: THE SEAT WATCH. When one presenter has carried a swath alone
     # - the other seat silent for this many aired lines, or this many
     # minutes - the silent one says where they went (restroom, coffee,
@@ -2934,6 +3005,9 @@ def validate_settings(data: Any) -> dict[str, Any]:
         "mixtape_folder": (str(raw_dj.get("mixtape_folder")
                                or DEFAULT_DJ["mixtape_folder"])
                            .strip().strip("/")[:200]),
+        "fordtape_folder": (str(raw_dj.get("fordtape_folder")             # [h3-slots]
+                                or DEFAULT_DJ["fordtape_folder"])
+                            .strip().strip("/")[:200]),
         "follow_prompt": bool(raw_dj.get("follow_prompt", False)),
         "overlap": max(0, min(100, int(
             raw_dj.get("overlap", DEFAULT_DJ["overlap"]) or 0))),
@@ -3071,6 +3145,16 @@ def validate_settings(data: Any) -> dict[str, Any]:
         "pause_bank_rounds": max(0, min(60, int(                  # #1022
             raw_dj.get("pause_bank_rounds",
                        DEFAULT_DJ["pause_bank_rounds"]) or 0))),
+        "produced_calls": bool(raw_dj.get("produced_calls",         # [call-prod]
+                                         DEFAULT_DJ["produced_calls"])),
+        "bank_ahead_hours": max(0.0, min(168.0, float(            # [bank-ahead]
+            raw_dj.get("bank_ahead_hours",
+                       DEFAULT_DJ["bank_ahead_hours"]) or 0))),
+        "bank_ahead_roads": ",".join(dict.fromkeys(               # [bank-ahead]
+            r for r in (x.strip().lower() for x in str(
+                raw_dj.get("bank_ahead_roads",
+                           DEFAULT_DJ["bank_ahead_roads"]) or "").split(","))
+            if r in BANK_AHEAD_ROADS_KNOWN)),
         # #1034: the seat watch - lines/minutes a seat may sit silent
         # behind the other before it is sent on a break, and how long
         # the break runs. The away span is clamped to the 2..6 minutes
@@ -16984,6 +17068,38 @@ def build_lift() -> float:
         return 1.0
 
 
+# [bank-ahead] the roads a pause may bank days of, and the one-segment-an-hour
+# floor a banked road is owed when the sheet in hand has no entry for it.
+BANK_AHEAD_ROADS_KNOWN = ("caller", "manager", "gallery", "ad", "station_id")
+BANK_AHEAD_SEGMENT_SECONDS = 180.0
+
+
+def bank_ahead_roads() -> tuple[str, ...]:
+    """[bank-ahead] The roads the operator wants banked days ahead."""
+    try:
+        raw = str(dj_settings().get("bank_ahead_roads") or "")
+    except Exception:  # noqa: BLE001
+        return ()
+    return tuple(r for r in (x.strip() for x in raw.split(","))
+                 if r in BANK_AHEAD_ROADS_KNOWN)
+
+
+def bank_ahead_hours(road: str = "") -> float:
+    """[bank-ahead] Hours of finished stock this road is owed WHILE PAUSED.
+
+    0.0 on air, for a road not on the list, or with the dial at 0 - so
+    nothing on air changes: the deep bank is built only in the time the
+    operator set aside for it, and spent on air like any other stock."""
+    try:
+        if not radio_paused():
+            return 0.0
+        if road and str(road) not in bank_ahead_roads():
+            return 0.0
+        return max(0.0, min(168.0, float(dj_settings().get("bank_ahead_hours") or 0)))
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
 SCHEDULE_HORIZON_FLOOR_HOURS = 4.0
 
 
@@ -17054,6 +17170,16 @@ def shelf_cap(kind: str) -> int:
                 want = max(want, min(3, int(round(want * min(2.0, lift)))))
             else:
                 want = int(round(want * lift))
+    except Exception:  # noqa: BLE001
+        pass
+    # [bank-ahead] room on the shelf for the pause's own horizon - half a
+    # base shelf an hour. The pantry's row ceiling makes room above every
+    # held clip and its byte allowance sheds loose cache first, so this
+    # only ever decides how many ROWS may stand, never deletes one.
+    try:
+        _deep = bank_ahead_hours(str(kind))
+        if _deep > 0:
+            want = max(want, int(round(base * _deep / 2.0)))
     except Exception:  # noqa: BLE001
         pass
     return max(1, want)
@@ -18363,6 +18489,40 @@ CUPBOARD_UNHEARD_EVERY = float(os.getenv("PINE_UNHEARD_EVERY", "420"))
 _UNHEARD_AT = [0.0]
 _UNHEARD_LOG: list[dict[str, Any]] = []
 _UNHEARD_REFUSED: dict[int, float] = {}
+# [road-backoff] 2026-10-01: a ROAD the booth keeps refusing stands aside.
+# Measured: 55 rescue walks, 53 of them "an advert refused: the booth did
+# not put it out", 0 airings - each refused ad stood aside for five
+# minutes, the next-oldest ad (139 unheard) was picked instead, and the
+# finished DJ rounds behind them were never reached while the room sat
+# silent. Two refusals in a row and the whole road sits out a while.
+UNHEARD_ROAD_STRIKES = 2
+UNHEARD_ROAD_REST = float(os.getenv("PINE_UNHEARD_ROAD_REST", "600"))
+_UNHEARD_ROAD_OUT: dict[str, dict[str, Any]] = {}
+
+
+def unheard_road_out(kind: str, now: float | None = None) -> bool:
+    """[road-backoff] is this road sitting out of the cupboard rescue?"""
+    held = _UNHEARD_ROAD_OUT.get(str(kind)) or {}
+    return float(held.get("until") or 0) > (time.time() if now is None else now)
+
+
+def unheard_road_refused(kind: str, why: str) -> None:
+    """[road-backoff] one more booth refusal on this road, in a row."""
+    held = _UNHEARD_ROAD_OUT.setdefault(str(kind), {"n": 0, "until": 0.0})
+    held["n"] = int(held.get("n") or 0) + 1
+    if held["n"] >= UNHEARD_ROAD_STRIKES and not unheard_road_out(kind):
+        held["until"] = time.time() + UNHEARD_ROAD_REST
+        try:
+            pipeline_log("drop", "[road-backoff] the %s road was refused %d times in a row at "
+                         "the booth (%s) - the silence rescue skips it for %d min and "
+                         "tries the other roads" % (kind, held["n"], why or "no reason given",
+                                                    int(UNHEARD_ROAD_REST // 60)))
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def unheard_road_aired(kind: str) -> None:
+    _UNHEARD_ROAD_OUT.pop(str(kind), None)
 _UNHEARD_PENDING_HANDOFFS: set[asyncio.Event] = set()
 UNHEARD_HANDOFF_TIMEOUT = 60.0
 # #1265: this walks every shelf and the larder, and it rides in
@@ -18707,6 +18867,20 @@ def cupboard_why_row(kind: str, row: Any) -> dict[str, Any]:
             pass
 
         out["ready"] = bool(dialogue_row_ready(kind, row))
+        if not out["ready"] and not reasons:
+            # [door-why] 2026-10-01: the air said no and nothing above
+            # said why, so the desk called 32 manager rounds "nothing is
+            # wrong with it" while the sweep counted 0 of 72 ready. Ask
+            # the gates by name (System 3's booth gate, the tint, the
+            # audio) - the same order dialogue_row_ready asks them.
+            try:
+                _named = dialogue_row_ready_why(kind, row)
+            except Exception:  # noqa: BLE001
+                _named = ""
+            reasons.append(_cupboard_why(
+                "not_ready", _named or "the ready gate refused it",
+                "this is the air's own gate - the round cannot go out "
+                "until it holds."))
         out["blocked"] = bool(reasons)
 
         # 6. THE DOORS. Nothing above is wrong with the item; these say
@@ -18902,6 +19076,13 @@ def unheard_state() -> dict[str, Any]:
            "every": round(cupboard_unheard_every()), "on": cupboard_unheard_on(),
            "shut_roads": [r["kind"] for r in shut],
            "recent": list(_UNHEARD_LOG[-12:]), "say": said + " - " + said_sweep}
+    try:                                                         # [bank-ahead]
+        out["call_endings"] = caller_outcome_census()
+        out["bank_ahead"] = {"roads": list(bank_ahead_roads()),
+                             "hours_now": bank_ahead_hours(),
+                             "dial_hours": float(dj_settings().get("bank_ahead_hours") or 0)}
+    except Exception:  # noqa: BLE001
+        pass
     _UNHEARD_MEMO.update({"at": now, "value": out})
     return dict(out)
 
@@ -18993,6 +19174,8 @@ def unheard_pick() -> tuple[str, dict[str, Any] | None, float]:
         pass
     try:
         for kind in RESCUE_ROADS_OPEN:
+            if unheard_road_out(kind, now):                  # [road-backoff]
+                continue
             for row in shelf_rows(kind):
                 if not isinstance(row, dict) or not row_unaired(row):
                     continue
@@ -19684,6 +19867,7 @@ async def unheard_stock_air(force: bool = False) -> str:
         if accounted:
             return
         accounted = True
+        unheard_road_aired(kind)                             # [road-backoff]
         _RESCUE_AT[0] = time.time()
         _UNHEARD_SWEEP.update({
             "at": time.time(), "why": "aired",
@@ -19740,6 +19924,7 @@ async def unheard_stock_air(force: bool = False) -> str:
         # sat in the cupboard. Pacing a walk is worth an interval;
         # failing once is not.
         _UNHEARD_AT[0] = min(now, now - rest + UNHEARD_RETRY_EVERY)
+        unheard_road_refused(kind, door)                     # [road-backoff]
         return _unheard_no(
             ("%s refused: %s" % (SHELF_LABEL.get(kind, kind), door)) if door
             else "the air's own door refused the row it picked")
@@ -21605,6 +21790,21 @@ def shelf_put(kind: str, row: dict[str, Any]) -> None:
         except Exception:  # noqa: BLE001
             pass
         rows.append(row)
+        try:                                                     # [prod-feed]
+            _pe = row.get("entry") if isinstance(row.get("entry"), dict) else row
+            _pscript = str((_pe or {}).get("script") or row.get("text") or "")
+            _production_feed.note(
+                "banked", str(kind), _pscript,
+                label=SHELF_LABEL.get(str(kind), str(kind)),
+                seconds=round(float(row.get("seconds") or (_pe or {}).get("seconds") or 0), 1),
+                lines=int((_pe or {}).get("chunks") or 0) or None,
+                made=int((_pe or {}).get("made") or 0) or None,
+                off_brief=bool(row.get("off_brief")) or None,
+                outcome=((_pe or {}).get("call_outcome") or {}).get("label") or None,
+                conversation=str(((_pe or {}).get("system3") or {}).get("conversation_id") or "") or None,
+                shelf=len(rows))
+        except Exception:  # noqa: BLE001
+            pass
         try:
             _INVENTORY_PLAN["at"] = 0.0
             _COMMITS["at"] = 0.0
@@ -23653,7 +23853,12 @@ def prep_plan(skip: Any = None) -> dict[str, Any]:
                     return max(0.0, float(row.get("owed") or 0)
                                - float(row.get("held") or 0))
                 _driven = str(orch_policy("drive_road") or "")
+                # [bank-ahead] the operator's own road first, then the
+                # demanding roads the pause exists to bank (calls and
+                # memos), then whatever is furthest short.
+                _deep = bank_ahead_roads() if bank_ahead_hours() > 0 else ()
                 order.sort(key=lambda k: (0 if k == _driven else 1,
+                                          0 if (k in _deep and _short_of(k) > 0) else 1,
                                           -_short_of(k)))
             except Exception:  # noqa: BLE001
                 pass
@@ -35071,6 +35276,11 @@ def radio_prompt_desk_state() -> dict[str, Any]:
                         # HOURS of finished audio rather than in items.
                         ("prepare_hours", "Hours prepared ahead", "number",
                          0.25, 24, 0.25),
+                        # [bank-ahead] the pause's own horizon, per road
+                        ("bank_ahead_hours", "Hours banked ahead while paused (the roads below)",
+                         "number", 0, 168, 1),
+                        ("bank_ahead_roads", "Roads banked days ahead while paused (caller, manager, gallery, ad)",
+                         "text", 0, 0, 0),
                         ("talk_radio", "Talk-show intensity", "range", 0, 100, 1),
                         ("overlap", "Interruptions", "range", 0, 100, 1)],
         "speakerbox": [("speakbox_rate", "Material grounding", "range", 0, 100, 1),
@@ -45620,6 +45830,72 @@ def prep_air_text(raw: str, kind: str) -> str:
     return text
 
 
+# [es-bank] the System 3 road a prepared single line is recorded on, by its shelf kind
+S3_BANK_LINE_ROADS = {"ad": "ad_spot", "track_talk": "track_talk", "station_id": "station_id"}
+
+# [ad-rolo] "the cupboard storing ads and stingers with emotional intonation where
+# people passionately try to sell things driven by scripted situations seeded by the
+# speakerbox and rolled through a rolodex to randomly give each ad a unique angle and
+# hilarious outcome" (2026-10-01). Three pools, each a System 3 dice door (tabled: the
+# desk edits them in the Tables tab); the speakerbox seed is ad_write_fresh's own.
+AD_ANGLES = (
+    "a tearful testimonial from a customer whose life it ruined and then saved",
+    "a scientific breakthrough announced by someone with no qualifications at all",
+    "an infomercial that keeps being interrupted by the product itself",
+    "a hostage negotiation where the demand is that you buy it",
+    "a courtroom closing argument for the product's innocence",
+    "a nature documentary following the product in the wild",
+    "a sports commentary of somebody using it for the first time",
+    "a wedding toast to the product",
+    "a whispered secret the big companies do not want you to know",
+    "a limited-time offer that runs out during the advert itself",
+    "an attack on a rival product, by name, getting personal",
+    "the product explained very slowly to somebody's grandmother",
+    "a weather forecast where every front is the product",
+    "a cult recruitment pitch, warm and unsettling",
+    "a breakup letter to the seller's old, inferior product",
+    "a movie trailer for the product's origin story",
+)
+AD_OUTCOMES = (
+    "the product works far too well and something has to be evacuated",
+    "the legal disclaimer takes over and reveals it is banned in four states",
+    "a rival seller calls in mid-pitch and it turns into a bidding war",
+    "the price keeps dropping until the station is paying the listener",
+    "the seller breaks down and admits they have never once used it",
+    "a customer complaint is read out live and the seller argues with it",
+    "the jingle gets stuck and will not stop",
+    "it is revealed to be the station's own break-room coffee, relabelled",
+    "the seller accidentally sells their own house in the process",
+    "the manager walks in and confiscates the product",
+    "the product talks back, and it is not on the seller's side",
+    "the seller is so convincing they buy it themselves, twice",
+)
+AD_PASSIONS = (
+    "breathless and evangelical, a convert who has seen the light",
+    "on the verge of tears at how much it means to them",
+    "furious at anyone who has not bought one yet",
+    "whispering urgently, as if being watched",
+    "manic game-show energy, every sentence a prize",
+    "deadly serious, a movie-trailer voice for a very small thing",
+    "a hard-sell auctioneer who cannot slow down",
+    "crushingly sincere, a little too close to the microphone",
+)
+
+
+def ad_rolodex(product: str) -> dict[str, str]:
+    """[ad-rolo] Roll this advert's angle, its hilarious outcome and the seller's
+    passion - three recorded System 3 draws over pools the desk edits - and the
+    brief the writer gets for them, beside the speakerbox seed."""
+    angle = str(s3_choice("ad.angle", AD_ANGLES, "the advert's angle [ad-rolo]"))
+    outcome = str(s3_choice("ad.outcome", AD_OUTCOMES, "how the advert ends, for laughs [ad-rolo]"))
+    passion = str(s3_choice("ad.passion", AD_PASSIONS, "how passionately the seller sells it [ad-rolo]"))
+    brief = (" THE PITCH, AS THE ROLODEX ROLLED IT. Stage this advert as a SCRIPTED SITUATION - a scene, "
+             "built out of the passage quoted above if there is one - not a list of features. The angle: "
+             f"{angle}. The seller sells {product} with total, PASSIONATE conviction: {passion}. It ends, played "
+             f"for laughs, with this: {outcome}. The product is named and sold all the way through.")
+    return {"angle": angle, "outcome": outcome, "passion": passion, "brief": brief}
+
+
 async def prep_render_line(text: str, who: str,
                            voice: str = "",
                            kind: str = "",
@@ -45657,8 +45933,28 @@ async def prep_render_line(text: str, who: str,
     if prep_should_stop():
         return None
     fx = dict(voice_effect_pick())
-    # [es-roads] a shelf row that already has its node is recorded with its
-    # feeling; one without (an ad, a track talk) gets it at air (the re-perform)
+    # [es-bank] "I want banked scheduled and written cupboard footage taken through
+    # the emotion engine" (2026-10-01). A line with no node of its own (an ad, a
+    # track talk) used to be recorded flat and RE-PERFORMED at air - two renders,
+    # the banked one thrown away. Its road's System 3 line is opened here, so the
+    # feeling is rolled now, the take is recorded in it, and the row keeps the stamp.
+    _opened = None
+    if not stamp and kind:
+        _road = S3_BANK_LINE_ROADS.get(str(kind), str(kind))
+        _open = globals().get("system3_direct_line")
+        if callable(_open):
+            try:
+                import system3 as _s3m
+                if _road in _s3m.ROADS:
+                    _h = await _open(road=_road, who=who, dj=dj_settings(), context=text[:300], bank=True)
+                    if _h is not None and getattr(_h, "active", False):
+                        _bind = globals().get("system3_bind_line")
+                        if callable(_bind):
+                            _bind(_h, text)
+                        if isinstance(getattr(_h, "stamp", None), dict) and _h.stamp:
+                            stamp = _opened = dict(_h.stamp)
+            except Exception:  # noqa: BLE001
+                _opened = None
     _es_got = (await _s3_stamp_perf(stamp, who))[0]
     vec = performance_vector(who, voice, state=(_es_got or {}).get("dims"),
                              es=(_es_got or {}).get("voice"))
@@ -45699,7 +45995,8 @@ async def prep_render_line(text: str, who: str,
     pantry_put(key, clip, text=text, voice=voice, who=who,
                kind=str(kind or ""))
     return {"key": key, "voice": voice, "engine": engine,
-            "seconds": float((clip or {}).get("seconds") or 0)}
+            "seconds": float((clip or {}).get("seconds") or 0),
+            **({"system3": _opened} if _opened else {})}         # [es-bank] the row keeps its node
 
 
 _RESPONSE_WARM_LOCK = asyncio.Lock()
@@ -46125,8 +46422,19 @@ async def prep_ad() -> bool:
     # already on the books. Two attempts, not three — this is the cheap
     # road that exists to stop dead air, and it must not become the
     # expensive one. A refusal simply prepares nothing this pass.
+    # [ad-rolo] the angle, the outcome and the seller's passion, rolled first
     try:
-        _mk = await ad_write_fresh(product, tries=2)
+        _rolo = ad_rolodex(str(product))
+    except Exception:  # noqa: BLE001
+        _rolo = {}
+    try:
+        _production_feed.note("rolled", "ad", _rolo.get("brief") or "", label="an advert's rolodex",
+                              angle=_rolo.get("angle"), outcome=_rolo.get("outcome"),
+                              passion=_rolo.get("passion"), product=str(product)[:120])
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        _mk = await ad_write_fresh(product, tries=2, pitch=str(_rolo.get("brief") or ""))
     except Exception:  # noqa: BLE001
         _mk = {}
     text = str(_mk.get("text") or "")
@@ -46135,8 +46443,9 @@ async def prep_ad() -> bool:
     _row = {"text": text, "text_plain": str(_mk.get("text_plain") or ""),
             "tint_ok": bool(_mk.get("tint_ok")),
             "tint": dict(_mk.get("tint") or {}),
-            "product": str(product)[:160]}
-    made = await prep_render_line(text, "dj", kind="ad")   # #978
+            "product": str(product)[:160],
+            **({"rolodex": {k: _rolo[k] for k in ("angle", "outcome", "passion")}} if _rolo else {})}
+    made = await prep_render_line(text, "dj", kind="ad")   # #978 [es-bank] rolls its feeling
     if not made:
         # #904: the WRITE is already paid for. A refused render — the
         # engine busy, the live road wanting it — used to throw the
@@ -46223,6 +46532,65 @@ async def prep_station_id() -> bool:
     return True
 
 
+def call_outcome_of(entry: Any) -> dict[str, Any]:
+    """[bank-ahead] HOW THIS BANKED CALL ENDS, in one place.
+
+    "I want callers being stored with variable outcomes." The ending is
+    already rolled - by System 3's call-end wheel when it is active
+    (entry.call.callend), by the ending shelf (prep_rule) otherwise - and
+    the scenario's conclusion rides in entry.call.scenario. They were three
+    fields in three shapes; this is the one record the cupboard, the
+    census and the operator read."""
+    if not isinstance(entry, dict):
+        return {}
+    call = entry.get("call") if isinstance(entry.get("call"), dict) else {}
+    ce = call.get("callend") if isinstance(call.get("callend"), dict) else {}
+    res = ce.get("resolve") if isinstance(ce.get("resolve"), dict) else {}
+    rule = entry.get("prep_rule") if isinstance(entry.get("prep_rule"), dict) else {}
+    scen = call.get("scenario") if isinstance(call.get("scenario"), dict) else {}
+    concl = scen.get("conclusion")
+    concl = (concl.get("label") or concl.get("id") or concl.get("text")) if isinstance(concl, dict) else concl
+    if res:
+        return {"source": "system3", "id": str(res.get("id") or ""),
+                "label": str(res.get("label") or res.get("category") or ""),
+                "effect": str(res.get("effect") or ""),
+                "prize": str(res.get("prize") or ""),
+                "says": str(ce.get("says") or "")[:240],
+                "conclusion": str(concl or "")[:120],
+                "caller": str(entry.get("prep_name") or "")}
+    if rule:
+        return {"source": "ending_shelf",
+                "id": str(rule.get("id") or rule.get("key") or ""),
+                "label": str(rule.get("label") or rule.get("name")
+                             or rule.get("text") or "")[:120],
+                "effect": "success" if rule.get("success") else "",
+                "prize": str(rule.get("prize") or ""),
+                "says": str(rule.get("text") or "")[:240],
+                "conclusion": str(concl or "")[:120],
+                "caller": str(entry.get("prep_name") or "")}
+    return {}
+
+
+def caller_outcome_census() -> dict[str, Any]:
+    """[bank-ahead] The spread of endings across the UNHEARD banked calls -
+    the operator's check that the bank is varied, not ten of one call."""
+    counts: dict[str, int] = {}
+    rows = 0
+    try:
+        for row in shelf_rows("caller"):
+            if not isinstance(row, dict) or not row_unaired(row):
+                continue
+            rows += 1
+            out = call_outcome_of(dialogue_entry(row) or row.get("entry") or {})
+            label = (out.get("label") or out.get("id") or "no ending recorded")
+            counts[label] = counts.get(label, 0) + 1
+    except Exception:  # noqa: BLE001
+        pass
+    top = max(counts.values()) if counts else 0
+    return {"unheard_calls": rows, "endings": dict(sorted(counts.items(), key=lambda kv: -kv[1])),
+            "distinct": len(counts), "most_common_share": round(top / rows, 2) if rows else 0.0}
+
+
 async def prep_round(kind: str) -> bool:
     """One whole SEGMENT written ahead — a memo from upstairs, or a call
     on the request line — with every line of it rendered into the pantry
@@ -46259,10 +46627,32 @@ async def prep_round(kind: str) -> bool:
         return False                    # nothing to say from that road
     entry = pile[0]
     entry["prep_kind"] = str(kind)
+    try:                                                         # [prod-feed]
+        _production_feed.note(
+            "written", str(kind), str(entry.get("script") or ""),
+            label=SHELF_LABEL.get(str(kind), str(kind)),
+            conversation=str((entry.get("system3") or {}).get("conversation_id") or "") or None,
+            caller=str(entry.get("prep_name") or "") or None)
+    except Exception:  # noqa: BLE001
+        pass
+    if kind == "caller":
+        try:
+            entry["call_outcome"] = call_outcome_of(entry)       # [bank-ahead]
+        except Exception:  # noqa: BLE001
+            pass
     # A partially rendered segment is still shelved: the keeper finishes
     # it on a later visit, and any line that never got made simply
     # renders on air the way it always would have.
     await larder_prepare(entry)
+    try:                                                         # [prod-feed]
+        _production_feed.note(
+            "recorded", str(kind),
+            "%s of %s lines voiced, %ss of finished audio"
+            % (entry.get("made") or 0, entry.get("chunks") or 0, entry.get("seconds") or 0),
+            label=SHELF_LABEL.get(str(kind), str(kind)),
+            discarded=bool(entry.get("discarded")) or None)
+    except Exception:  # noqa: BLE001
+        pass
     if kind == "caller" and entry.get("discarded"):
         return False
     shelf_put(kind, {"entry": entry,
@@ -46296,7 +46686,10 @@ async def prep_round(kind: str) -> bool:
                  "audio waiting (#842)"
                  + (f" - all {entry.get('prep_turns') or 0} turns are bound "
                     "to their stored host/caller voices (#871/#1005)"
-                    if kind == "caller" else ""))
+                    if kind == "caller" else "")
+                 + ((" - it ends: %s" % ((entry.get("call_outcome") or {}).get("label")
+                                         or "no ending recorded"))
+                    if kind == "caller" else ""))                  # [bank-ahead]
     return True
 
 
@@ -51252,7 +51645,7 @@ def orch_scan() -> dict[str, Any]:
                     out = orch_raise(
                         "offline_stock",
                         f"The station is off air and banking. {_name} is "
-                        f"furthest behind the three-hour goal - "
+                        f"furthest behind what this pause should bank - "
                         f"{int(_gap)}s short of the "
                         f"{int(float((_needs.get(_road) or {}).get('owed') or 0))}s "
                         "the hours owe it. I can push it hardest, put "
@@ -60684,7 +61077,16 @@ def hour_needs() -> dict[str, dict[str, float]]:
             # keep.
             row = out.setdefault(road, {"owed": 0.0, "held": 0.0,
                                         "rows": 0.0, "cap": 0.0})
-            row["owed"] += owed * hours
+            # [bank-ahead] a banked road is owed the pause's horizon, not
+            # the six-hour ceiling (0 on air, so nothing else moves)
+            row["owed"] += owed * max(hours, bank_ahead_hours(road))
+        # [bank-ahead] ...and a banked road the sheet in hand has no entry
+        # for is still owed a segment an hour: "manager messages for days".
+        for road in bank_ahead_roads():
+            _deep = bank_ahead_hours(road)
+            if _deep > 0 and road in ALT_PREP_KINDS and road not in out:
+                out[road] = {"owed": BANK_AHEAD_SEGMENT_SECONDS * _deep,
+                             "held": 0.0, "rows": 0.0, "cap": 0.0}
         # #1128: ...AND NEWS IS NOT OWED WHAT IT CANNOT KEEP. #1125 put
         # this clamp inside the slot loop, where it capped ONE entry's
         # 240 seconds against a 480-second ceiling and did nothing at
@@ -61791,6 +62193,19 @@ async def _torrent_talk() -> None:
                 except Exception:  # noqa: BLE001
                     pass        # a short segment is not a broken station
             if not aired:
+                # [door-why] SAY WHICH DOOR REFUSED. At 100% talk the
+                # road's own turn is the cupboard alone; 32 finished
+                # memos stood "simply waiting to be asked for" while the
+                # log said only "manager produced nothing", and the
+                # reason sat in _READY_SHELF_WHY for thirty seconds and
+                # was never written down (2026-10-01).
+                try:
+                    if (str(_READY_SHELF_WHY.get("kind") or "") == str(kind)
+                            and time.time() - float(_READY_SHELF_WHY.get("at") or 0) < 120):
+                        pipeline_log("drop", f"the {kind} road's turn aired nothing - its "
+                                     f"cupboard said: {_READY_SHELF_WHY.get('why')}"[:200])
+                except Exception:  # noqa: BLE001
+                    pass
                 _cover_outcome: dict[str, Any] = {}
                 aired = await torrent_force_banter(
                     track, f"{kind} produced nothing", outcome=_cover_outcome)
@@ -65106,8 +65521,8 @@ async def ad_product_pick() -> str:
     return fallback
 
 
-async def ad_write_fresh(product: str, tries: int = AD_STUDIO_TRIES
-                         ) -> dict[str, Any]:
+async def ad_write_fresh(product: str, tries: int = AD_STUDIO_TRIES,
+                         pitch: str = "") -> dict[str, Any]:
     """Write ONE advert that is not any of the previous adverts (#916b/c).
 
     (c) is the `direct` channel: dj_line() only draws a speakbox swath
@@ -65132,7 +65547,7 @@ async def ad_write_fresh(product: str, tries: int = AD_STUDIO_TRIES
         direct = ""
         if seed.get("text"):
             direct += _pb("aside", speakbox_aside(seed, pair=False))   # [s3-blocks]
-        direct += ad_avoid_note() + _lesson
+        direct += ad_avoid_note() + _lesson + str(pitch or "")      # [ad-rolo] the rolled pitch
         try:
             raw = await dj_line("ad", None, extra=product, direct=direct,
                                 tint=False)
@@ -65615,6 +66030,57 @@ def system3_painting_on_offer(within: float = 1200.0) -> dict[str, Any]:
         return {}
 
 
+# [paint-roulette] WHAT BECAME OF A PAINTING. "Change its fate" (the operator,
+# 2026-10-01): a caller who swore to come and get a painting at any cost, or to
+# destroy it, takes it off the pile, and the station remembers - the pair may
+# bring it back up when they sell the next one (gallery_fates_clause, a dice
+# door). Kept in data/gallery_fates.json, the last 40.
+_GALLERY_FATES_FILE = DATA_DIR / "gallery_fates.json"
+_GALLERY_FATES: list[Any] = [None]
+GALLERY_FATE_WORDS = {"claimed": "a caller swore to come and get it at any cost - it is held for them",
+                      "destroyed": "a caller vowed to come and destroy it at any cost - it is off the wall for good"}
+
+
+def gallery_fates() -> list[dict[str, Any]]:
+    if _GALLERY_FATES[0] is None:
+        try:
+            got = json.loads(_GALLERY_FATES_FILE.read_text(encoding="utf-8"))
+            _GALLERY_FATES[0] = [r for r in got if isinstance(r, dict)] if isinstance(got, list) else []
+        except (OSError, ValueError):
+            _GALLERY_FATES[0] = []
+    return _GALLERY_FATES[0]
+
+
+def gallery_fate_note(effect: str, painting: dict[str, Any], cid: str = "") -> None:
+    rows = gallery_fates()
+    rows.append({"at": int(time.time()), "effect": str(effect), "image": str((painting or {}).get("image") or ""),
+                 "title": str((painting or {}).get("title") or (painting or {}).get("image") or "")[:120],
+                 "desc": str((painting or {}).get("desc") or "")[:200],
+                 "outcome": str((painting or {}).get("outcome") or "")[:80], "conversation": str(cid or "")})
+    del rows[:-40]
+    try:
+        tmp = _GALLERY_FATES_FILE.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(rows, indent=1), encoding="utf-8")
+        tmp.replace(_GALLERY_FATES_FILE)
+    except OSError as exc:
+        pipeline_log("gallery", "[paint-roulette] the fate was not written (%s)" % type(exc).__name__)
+
+
+def gallery_fates_clause() -> str:
+    """One earlier painting's fate the pair may bring back up - a dice door, so
+    it is not every sale (gallery.fate_callback)."""
+    rows = [r for r in gallery_fates() if time.time() - float(r.get("at") or 0) < 7 * 86400]
+    if not rows or not s3_chance("gallery.fate_callback", 0.35,
+                                 "the pair bring up what became of an earlier painting while selling this one"):
+        return ""
+    labels = ["%s: %s" % (r.get("title"), r.get("effect")) for r in rows[-12:]]
+    k = s3_weighted("gallery.fate_which", labels, [1.0 + i * 0.25 for i in range(len(labels))],
+                    "which earlier painting's fate the pair bring up")
+    r = rows[-12:][k if isinstance(k, int) and 0 <= k < len(labels) else -1]
+    return (" EARLIER, \"%s\": %s. One of you brings that up, unprompted, while selling this one."
+            % (r.get("title"), GALLERY_FATE_WORDS.get(str(r.get("effect")), r.get("effect"))))
+
+
 def system3_gallery_outcome(effect: str, painting: dict[str, Any], cid: str = "") -> dict[str, Any]:
     """[s3-callend] What a call's rolled end does to the gallery, where the station keeps
     state: the pile by the desk (`_RADIO["hawk_unsold"]` - offered, not gone; the pair
@@ -65631,7 +66097,9 @@ def system3_gallery_outcome(effect: str, painting: dict[str, Any], cid: str = ""
         if not name:
             return out
         pile = _RADIO.setdefault("hawk_unsold", [])
-        if effect in ("sold", "awarded", "burnt"):
+        if effect in ("claimed", "destroyed"):                                   # [paint-roulette]
+            gallery_fate_note(effect, painting, cid)
+        if effect in ("sold", "awarded", "burnt", "claimed", "destroyed"):
             before = len(pile)
             pile[:] = [p for p in pile if str((p or {}).get("name") or "") != name]
             shown = _RADIO.setdefault("gallery_shown", [])
@@ -65691,6 +66159,13 @@ def s3_callend_topic_turns(turns: Any, call_meta: Any) -> list[Any]:
     rows = list(turns or [])
     try:
         ce = call_meta.get("callend") if isinstance(call_meta, dict) else None
+        # [s3-callarc] ...and without the caller's DETOUR: those turns are off the subject on
+        # purpose (the roulette sent them there), so they are not graded against it
+        skip = {int(i) for i in ((ce or {}).get("detour_turns") or []) if isinstance(i, int)} \
+            if isinstance(ce, dict) else set()
+        if skip and len(rows) > len(skip) + 3:
+            rows = [r for i, r in enumerate(rows) if i not in skip]
+            ce = dict(ce, end_turns=ce.get("end_turns"))
         k = int(ce.get("end_turns") or 0) if isinstance(ce, dict) and ce.get("planned") else 0
         if k > 1 and len(rows) > k + 2:
             return rows[:len(rows) - k] + rows[-1:]
@@ -78398,7 +78873,7 @@ async def dj_gallery_round(bank_to: list[dict[str, Any]] | None = None,
             pass
     seed = await speakbox_quote(most=5, cap=450)
     listing = " ".join(
-        f"PAINTING {i + 1}: \"{desc}\""
+        f"PAINTING {i + 1}: \"{desc}\"" + gallery_sell_attitude("the gallery round, painting %d" % (i + 1))  # [paint-roulette]
         for i, (_, desc) in enumerate(pieces))
     angle = (
         f"The pair go through the station gallery ON AIR — {len(pieces)} "
@@ -78593,6 +79068,110 @@ async def vision_reanalyse_job(job: str, image: str, look: str,
 # the sales floor: pictures YOU chose, pitched at a named disposition, to a
 # person on the line who either buys or refuses — and what does not sell is
 # put aside, out loud, and the show carries on.
+# --- [paint-roulette] HOW THE PAIR FEEL ABOUT SELLING THIS ONE ------------------
+#
+# "whenever the DJs are selling paintings on the station, I need them to be
+#  rolling roulettes that run a chance of them not being happy or pleased with
+#  the painting ... disparage or make fun of the painting ... offended at what
+#  they're having to sell and maybe even offended at the very idea of having to
+#  sell stuff in general ... get existential about the content in the drawing
+#  and to describe it in depth and how it pertains to [death] ... in a
+#  disturbing way ... discuss it against a random selection taken from the
+#  speaker box that's ran through a roulette" (the operator, 2026-10-01; his
+#  answer: mostly off-script). Every sale rolls one attitude through System 3
+#  (gallery.sell_attitude, a tabled pool the desk can thin) by these weights - a
+#  straight sell one time in four; the Speaker Box tangent rolls its document,
+#  then its sentences, on its own dice (gallery.sell_sb_doc / gallery.sell_sb_line).
+GALLERY_SELL_ATTITUDES = (
+    ("straight", 25.0, "THE SELL: sell it straight and well - you like it, and you mean every word of the pitch."),
+    ("disparage", 9.0, "THE SELL: you do NOT like this painting. Sell it anyway, while running it down - its flaws, "
+                       "its nerve, what it gets wrong - and still name the price."),
+    ("mock", 9.0, "THE SELL: you find it ridiculous. Make fun of it - roast it, compare it to things, laugh at it "
+                  "out loud - and still name the price, which makes it funnier."),
+    ("offended_painting", 7.0, "THE SELL: you are OFFENDED by this painting - personally - and by being asked to put "
+                               "your voice behind it. Say why, then sell it through gritted teeth."),
+    ("offended_selling", 7.0, "THE SELL: you are offended at having to SELL anything at all - you are broadcasters, "
+                              "not shopkeepers. The painting becomes the last straw; rant about being made to sell, "
+                              "then sell it, resentfully."),
+    ("existential", 8.0, "THE SELL: it pulls you somewhere existential. Describe what is in it in real depth - every "
+                         "figure, colour and shadow - and what it says about death, how it pertains to dying, to the "
+                         "end of things. Then remember you are meant to sell it."),
+    ("disturbing", 7.0, "THE SELL: describe it in a DISTURBING way - what is wrong in it, what is happening just out "
+                        "of frame, what it would do to a room at night. Unsettling, specific, never gory. Then the "
+                        "price, as if nothing happened."),
+    ("speakerbox", 9.0, "THE SELL: one of you sets the painting against this, from the Speaker Box, read word for "
+                        "word - and the two of you argue what the passage says about the painting, and the painting "
+                        "about the passage: \"{passage}\""),
+    ("split", 6.0, "THE SELL: you are SPLIT - one of you loves it, the other cannot stand it, and the price becomes "
+                   "the battleground."),
+    ("priceless", 5.0, "THE SELL: you have convinced yourselves it is a lost masterpiece - invent its provenance, "
+                       "its history, its thieves - and the price is a steal."),
+    ("cursed", 4.0, "THE SELL: you are sure it is CURSED - say what has happened since it came into the building - "
+                    "and you need it gone tonight."),
+    ("attached", 4.0, "THE SELL: you have grown ATTACHED to it and do not want to sell it - talk the price up, find "
+                      "reasons nobody deserves it, and sell it anyway, heartbroken."),
+)
+GALLERY_SELL_LABEL = "the pair's attitude to the painting they are selling"
+
+
+def gallery_sb_passage() -> str:
+    """A Speaker Box passage for the painting - the document, then a run of
+    one to three of its sentences, each rolled on System 3's dice."""
+    try:
+        files = speakbox_files()
+        weights, uses = mind_weights(""), speakbox_uses("")
+        shelf = [(p, speakbox_weight(p.name, weights, "", uses)) for p in files]
+    except Exception:  # noqa: BLE001
+        shelf = []
+    shelf = [(p, w) for p, w in shelf if w > 0]
+    for _attempt in range(4):
+        if not shelf:
+            return ""
+        k = s3_weighted("gallery.sell_sb_doc", [p.name for p, _ in shelf], [float(w) for _, w in shelf],
+                        "which Speaker Box document a painting is set against")
+        path = shelf.pop(k if isinstance(k, int) and 0 <= k < len(shelf) else 0)[0]
+        said = []
+        for _i, s in _h3_speak_doc_read(path):
+            s = h3_speak_normalize(s)
+            if s and not h3_speak.sentence_why(s):
+                said.append(s)
+            if len(said) >= 80:
+                break
+        if not said:
+            continue
+        n = min(len(said), 1 + int(s3_roll("gallery.sell_sb_count", "how many sentences of it (1-3)") * 3))
+        j = s3_weighted("gallery.sell_sb_line", [s[:80] for s in said[:len(said) - n + 1]],
+                        [1.0] * (len(said) - n + 1), "where in the document the passage starts")
+        j = j if isinstance(j, int) and 0 <= j <= len(said) - n else 0
+        return " ".join(said[j:j + n])[:420]
+    return ""
+
+
+def gallery_sell_attitude(where: str = "") -> str:
+    """[paint-roulette] The attitude this sale is played with, rolled - the words
+    for the brief. A fault reads as no attitude (the brief as it was)."""
+    try:
+        labels = [a[0] for a in GALLERY_SELL_ATTITUDES]
+        pool = [x for x in (s3_pool("gallery.sell_attitude", labels, GALLERY_SELL_LABEL) or labels) if x in labels] \
+            or labels
+        by = {a[0]: a for a in GALLERY_SELL_ATTITUDES}
+        k = s3_weighted("gallery.sell_attitude", pool, [by[x][1] for x in pool], GALLERY_SELL_LABEL)
+        pick = by[pool[k if isinstance(k, int) and 0 <= k < len(pool) else 0]]
+        words = pick[2]
+        if pick[0] == "speakerbox":
+            passage = gallery_sb_passage()
+            if not passage:
+                pick = by["mock"] if "mock" in pool else by["straight"]
+                words = pick[2]
+            else:
+                words = words.replace("{passage}", passage.replace('"', "'"))
+        pipeline_log("gallery", "[paint-roulette] %s: the sell is %s" % (where or "a sale", pick[0]))
+        return " " + words + gallery_fates_clause()
+    except Exception as exc:  # noqa: BLE001
+        pipeline_log("gallery", "[paint-roulette] no attitude rolled (%s)" % type(exc).__name__)
+        return ""
+
+
 HAWK_MOODS = {
     "curious": "genuinely interested and full of questions about it",
     "impressed": "openly impressed, and says so more than once",
@@ -78676,7 +79255,8 @@ async def dj_hawk_round(names: list[str], moods: list[str],
                            "the buyer's mood when the pair hawk art", tabled=False)   # [s3-dice-door]
     mood_text = "; ".join(HAWK_MOODS[m] for m in chosen[:4])
     listing = " ".join(
-        f"PIECE {i + 1}: \"{desc}\"" for i, (_, desc) in enumerate(pieces))
+        f"PIECE {i + 1}: \"{desc}\"" + gallery_sell_attitude("the sales floor, piece %d" % (i + 1))  # [paint-roulette]
+        for i, (_, desc) in enumerate(pieces))
     seed = await speakbox_quote(most=4, cap=380)
     angle = (
         "THE PAIR ARE SELLING ART, LIVE ON AIR. They have taken "
@@ -78975,6 +79555,9 @@ ENGLISH_ACCENTS = set(
     "\u00d9\u00db\u00dc\u00c7\u00d1\u00d8\u00c6\u0152")
 
 
+ENGLISH_DIACRITIC_MAX = 0.04   # [speech-gates] accented-letter share past which a long line is not English
+
+
 def looks_english(text: str) -> bool:
     """#792: the station broadcasts in ENGLISH. A Portuguese lyric swath
     rode a whole turn on air verbatim, so lines are checked: heavy
@@ -79011,7 +79594,7 @@ def looks_english(text: str) -> bool:
                         "\u00cd\u00ce\u00cf\u00d1\u00d2\u00d3\u00d4"
                         "\u00d5\u00d6\u00d8\u00d9\u00da\u00db\u00dc"
                         "\u00dd\u00df" for c in letters)
-        if _dia / len(letters) > 0.04:
+        if _dia / len(letters) > ENGLISH_DIACRITIC_MAX:
             return False
     _en = {"the", "a", "an", "and", "or", "but", "of", "to", "in", "on",
            "at", "is", "are", "was", "were", "be", "been", "it", "that",
@@ -83533,6 +84116,24 @@ def banter_gap(overlap: int) -> float:
     return round(max(0.0, base * random.uniform(0.65, 1.35)), 3)
 
 
+def reply_pause_s(meta: Any = None, who: str = "", text: str = "", road: str = "turns") -> float:
+    """[cards-free] The pause after a spoken turn on the turn-by-turn road (the box,
+    a weld that failed, a replayed line): the operator's reply gap - its roll when
+    the roulette is on - and nothing else. "I need the dialogue able to play at
+    whatever speed and interval we have set it to ... if the pause between replies
+    is instant ... they talk one after another" (2026-10-01). Without the reply-gap
+    module, the old jitter stands."""
+    try:
+        if _reply_gap is not None:
+            return max(0.0, float(_reply_gap.draw(meta, str(who or ""), str(text or "")[:200], "", road)["s"]))
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        return banter_gap(int(dj_settings().get("overlap") or 0))
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
 NEW_VOICE_NAMES = ("Marlowe", "Cass", "Dex", "Rue", "Sal", "Vinny", "Jo",
                    "Kit", "Reggie", "Nadia", "Otis", "Pearl")
 
@@ -87143,6 +87744,205 @@ def _sfx_video_level_prune() -> None:
     _SFX_VIDEO_LEVEL["kept"] = kept
 
 
+# --- [nas-gain] A VIDEO'S LEVEL IS A NUMBER, NOT A COPY --------------------------
+#
+# "I do not want the Pine agent to be copying videos over to the DGX Spark in
+#  order to modify them ... the original video paths need to remain in the same
+#  location" (the operator, 2026-10-01; his answers: store a gain number; delete
+#  the old copies once their original is confirmed on the NAS). A clip with a
+#  picture is measured ONCE where it lives (ebur128 reading the share in place),
+#  and only the gain is kept - data/sfx_gains.json, keyed by the clip's id and
+#  mtime. /sfx/{key} streams the original through ffmpeg with that gain applied
+#  on the fly (picture copied, sound turned and limited at the ceiling); nothing
+#  is written anywhere. The levelled-copy cache (voice_media/sfx/*-lu1-*) is no
+#  longer made, and what it holds is cleared at boot (sfx_gain_cleanup).
+_SFX_GAINS_FILE = DATA_DIR / "sfx_gains.json"
+_SFX_GAINS: dict[str, Any] = {}
+_SFX_GAINS_LOCK = RLock()
+_SFX_GAINS_STATE = {"loaded": False, "dirty": 0, "saved": 0.0}
+SFX_GAIN_STREAM_TYPES = {".mp4": ("mp4", "aac", "video/mp4"), ".m4v": ("mp4", "aac", "video/mp4"),
+                         ".mov": ("mp4", "aac", "video/mp4"), ".webm": ("webm", "libopus", "video/webm")}
+SFX_GAIN_MIN_DB = 0.75          # closer than this to the target, the clip goes out as it is
+
+
+def _sfx_gain_key(path: Path) -> str | None:
+    try:
+        return "%s:%s" % (sfx_id(path), path.stat().st_mtime_ns)
+    except OSError:
+        return None
+
+
+def _sfx_gains_load() -> None:
+    with _SFX_GAINS_LOCK:
+        if _SFX_GAINS_STATE["loaded"]:
+            return
+        try:
+            got = json.loads(_SFX_GAINS_FILE.read_text(encoding="utf-8"))
+            if isinstance(got, dict):
+                _SFX_GAINS.update(got)
+        except (OSError, ValueError):
+            pass
+        _SFX_GAINS_STATE["loaded"] = True
+
+
+def _sfx_gains_save(force: bool = False) -> None:
+    with _SFX_GAINS_LOCK:
+        if not _SFX_GAINS_STATE["dirty"] or (not force and time.time() - _SFX_GAINS_STATE["saved"] < 30):
+            return
+        if len(_SFX_GAINS) > 60000:
+            for k in list(_SFX_GAINS)[:len(_SFX_GAINS) - 50000]:
+                _SFX_GAINS.pop(k, None)
+        try:
+            tmp = _SFX_GAINS_FILE.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(_SFX_GAINS), encoding="utf-8")
+            tmp.replace(_SFX_GAINS_FILE)
+            _SFX_GAINS_STATE.update(dirty=0, saved=time.time())
+        except OSError:
+            pass
+
+
+def sfx_gain_known(path: Path) -> dict[str, Any] | None:
+    """The clip's settled gain {"db": float} or {"asis": why}; None = not measured yet."""
+    _sfx_gains_load()
+    key = _sfx_gain_key(path)
+    got = _SFX_GAINS.get(key) if key else None
+    return got if isinstance(got, dict) else None
+
+
+def sfx_gain_db(heard: dict[str, Any]) -> float:
+    """One linear gain to SFX_TARGET_LUFS; the lift bounded so the true peak lands
+    no higher than the ceiling plus what the limiter on the stream will catch
+    (SFX_LEVEL_TRANSIENT_LU of it)."""
+    level, tp = heard.get("i"), heard.get("tp")
+    gain = float(SFX_TARGET_LUFS) - float(level)
+    if gain > 0 and tp is not None and tp != float("-inf"):
+        gain = min(gain, max(0.0, float(SFX_TP_DB) - float(tp) + float(globals().get("SFX_LEVEL_TRANSIENT_LU", 3.0))))
+    return round(max(-30.0, min(24.0, gain)), 2)
+
+
+def sfx_gain_measure(path: Path) -> dict[str, Any]:
+    """Measure where it lives and remember the number. Blocking (ffmpeg reads the share)."""
+    key = _sfx_gain_key(path)
+    if key is None:
+        return {"asis": "not on the share"}
+    heard = sfx_loudness(path)
+    if heard is None:
+        return {}                                   # no answer this time - nothing kept
+    if heard.get("none") or heard.get("i") is None:
+        got: dict[str, Any] = {"asis": "no measurable sound in it"}
+    else:
+        db = sfx_gain_db(heard)
+        got = {"db": db, "i": heard.get("i"), "tp": heard.get("tp")} if abs(db) >= SFX_GAIN_MIN_DB \
+            else {"asis": "already at the level", "i": heard.get("i")}
+    with _SFX_GAINS_LOCK:
+        _SFX_GAINS[key] = got
+        _SFX_GAINS_STATE["dirty"] += 1
+    _sfx_gains_save()
+    return got
+
+
+def sfx_gain_command(path: Path, db: float) -> list[str] | None:
+    kind = SFX_GAIN_STREAM_TYPES.get(path.suffix.lower())
+    if kind is None:
+        return None
+    fmt, acodec, _mime = kind
+    limit = 10 ** ((float(SFX_TP_DB) - float(globals().get("SFX_TP_MARGIN_DB", 1.0))) / 20.0)
+    cmd = [shutil.which("ffmpeg") or "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin",
+           "-i", str(path), "-map", "0:v?", "-map", "0:a?", "-c:v", "copy",
+           "-af", "volume=%.2fdB,alimiter=limit=%.4f:level=disabled" % (db, max(0.0625, min(1.0, limit))),
+           "-c:a", acodec, "-b:a", "160k"]
+    if fmt == "mp4":
+        cmd += ["-movflags", "frag_keyframe+empty_moov+default_base_moof", "-f", "mp4", "pipe:1"]
+    else:
+        cmd += ["-f", "webm", "pipe:1"]
+    return cmd
+
+
+async def sfx_gain_stream(path: Path, db: float, headers: dict[str, str]) -> Response | None:
+    """The original, read in place, with its gain applied as it streams - None
+    when this container cannot be streamed that way (the caller sends it as is)."""
+    cmd = sfx_gain_command(path, db)
+    if cmd is None:
+        return None
+    try:
+        proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE,
+                                                    stderr=asyncio.subprocess.DEVNULL)
+    except Exception:  # noqa: BLE001
+        return None
+
+    async def body():
+        try:
+            while True:
+                chunk = await proc.stdout.read(65536)
+                if not chunk:
+                    break
+                yield chunk
+        finally:
+            if proc.returncode is None:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+            await proc.wait()
+
+    out = {k: v for k, v in headers.items() if k != "Accept-Ranges"}
+    out["X-Pine-Gain-Db"] = "%.2f" % db
+    return StreamingResponse(body(), media_type=SFX_GAIN_STREAM_TYPES[path.suffix.lower()][2], headers=out)
+
+
+def sfx_gain_cleanup() -> dict[str, Any]:
+    """Once at boot: the levelled-copy cache - full-length copies of share videos
+    on the Spark - deleted, each only when its original is confirmed on the
+    share (the clip book's path for its id, present). Blocking."""
+    got = {"deleted": 0, "freed_mb": 0.0, "kept": 0, "kept_why": []}
+    if not SFX_LEVELLED.exists():
+        return got
+    try:
+        con = sfx_db_reader()
+    except Exception:  # noqa: BLE001
+        con = None
+    for f in SFX_LEVELLED.iterdir():
+        name = f.name
+        if ("-%s-" % SFX_VIDEO_LEVEL_MARK) not in name:
+            continue
+        side = name.endswith((".lu", ".asis"))
+        sid = name.split("-%s-" % SFX_VIDEO_LEVEL_MARK)[0]
+        original = None
+        if con is not None and sid:
+            try:
+                with _SFX_DB_LOCK:
+                    row = con.execute("SELECT path FROM clips WHERE sid=? LIMIT 1", (sid,)).fetchone()
+                original = Path(row[0]) if row and row[0] else None
+            except Exception:  # noqa: BLE001
+                original = None
+        if not side and not (original is not None and original.is_file()):
+            got["kept"] += 1
+            if len(got["kept_why"]) < 20:
+                got["kept_why"].append("%s: its original is not found on the share" % name)
+            continue
+        try:
+            size = f.stat().st_size
+            f.unlink()
+            got["deleted"] += 0 if side else 1
+            got["freed_mb"] += size / 1048576.0
+        except OSError:
+            pass
+    got["freed_mb"] = round(got["freed_mb"], 1)
+    return got
+
+
+@app.on_event("startup")
+async def _sfx_gain_start() -> None:
+    try:
+        got = await asyncio.to_thread(sfx_gain_cleanup)
+        pipeline_log("sfx", "[nas-gain] levelled copies on the Spark: %d deleted (%.1f MB freed), %d kept - "
+                            "their original was not found on the share%s"
+                     % (got["deleted"], got["freed_mb"], got["kept"],
+                        (": " + "; ".join(got["kept_why"][:5])) if got["kept_why"] else ""))
+    except Exception as exc:  # noqa: BLE001
+        pipeline_log("sfx", "[nas-gain] the old copies were not cleared (%s)" % type(exc).__name__)
+
+
 def sfx_video_levelled(path: Path, make: bool = False) -> Path:
     """#1420: the same clip, PICTURE COPIED, sound brought to the level
     every other clip arrives at. The original, untouched, on any miss.
@@ -87152,7 +87952,15 @@ def sfx_video_levelled(path: Path, make: bool = False) -> Path:
     and the keeper, both of which have lead time to spend."""
     if not sfx_is_video(path):
         return path
-    out = sfx_video_levelled_name(path)         # [#1477-name]
+    # [nas-gain] never a copy: the clip is measured where it lives and its gain
+    # kept; /sfx applies it as it streams. The original path, always.
+    if sfx_gain_known(path) is None:
+        if make:
+            sfx_gain_measure(path)
+        else:
+            _sfx_video_level_want(path)
+    return path
+    out = sfx_video_levelled_name(path)         # #1477's copy, no longer made (below unreachable)
     if out is None:
         return path
     if out.exists():
@@ -87567,14 +88375,8 @@ def sfx_level_cached(path: Path) -> Path | None:
     levelled copy, or the clip itself when it was looked at and left alone.
     None = not levelled YET. Never makes or asks for anything. Blocking."""
     if sfx_is_video(path):
-        out = sfx_video_levelled_name(path)
-        if out is None:
-            return path
-        if out.exists():
-            return out
-        if out.with_name(out.name + ".asis").exists():
-            return path
-        return None
+        # [nas-gain] settled = its gain is measured; the file is always the original
+        return path if sfx_gain_known(path) is not None else None
     out = sfx_levelled_name(path)
     if out is None:
         return path
@@ -95080,6 +95882,8 @@ TIER_GATES = (86400.0, 172800.0, 259200.0)  # #824: day-scale rotation
 # Past this share of recent candidates blocked, the gate stands down. An
 # anti-repeat engine that can silence the station is worse than repetition.
 BLOCK_RATE_CAP = 0.35
+RERUN_JACCARD = 0.62        # [speech-gates] rerun_check: near-identical at this 4-word-shingle overlap
+RERUN_CONTAIN = 0.85        # [speech-gates] ...or the smaller line this much inside the other
 _BLOCK_RECENT: list[int] = []
 
 # --- The rejection window (#901) -------------------------------------
@@ -95552,7 +96356,7 @@ def rerun_check(text: str, who: str = "", kind: str = "",
             if not overlap:
                 continue
             union = len(mine | theirs)
-            if union and overlap / union >= 0.62:
+            if union and overlap / union >= RERUN_JACCARD:
                 verdict.update({"block": True,
                                 "why": "near-identical to a line already said",
                                 "hit": str(row.get("key") or "")})
@@ -95563,7 +96367,7 @@ def rerun_check(text: str, who: str = "", kind: str = "",
             # half on a symmetric Jaccard. A line that contains a line already
             # said is a line already said.
             small = min(len(mine), len(theirs))
-            if small >= 6 and overlap / small >= 0.85:
+            if small >= 6 and overlap / small >= RERUN_CONTAIN:
                 verdict.update({"block": True,
                                 "why": "contains a line already said, whole",
                                 "hit": str(row.get("key") or "")})
@@ -111436,7 +112240,7 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                          or _round_s3.get("mode") != "active")):
         pipeline_log("system3", "round withheld without an active System 3 conversation",
                      extra=str(ready_meta.get("prep_kind") or "banter"))
-        return []
+        return _banter_no("System 3 is on and this round has no active System 3 conversation")   # [door-why]
     if _s3_active():
         # A writer can return more turns than the running order dealt.  The
         # binding names only planned script positions; every other line must
@@ -111450,14 +112254,14 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
         if not _s3_positions:
             pipeline_log("system3", "round withheld without bound roulette turns",
                          extra=str(ready_meta.get("prep_kind") or "banter"))
-            return []
+            return _banter_no("System 3 withheld it: no bound roulette turns")   # [door-why]
         _s3_planned = int(_round_s3.get("planned_turns") or len(_s3_positions))
         if (_s3_planned < 3 or len(_s3_positions) != _s3_planned
                 or limit < _s3_planned
                 or len({str(turns[i][0]) for i in _s3_positions}) < 2):
             pipeline_log("system3", "incomplete conversation withheld after repair",
                          extra=f"{len(_s3_positions)} of {_s3_planned} turns; limit {limit}")
-            return []
+            return _banter_no("System 3 withheld it: incomplete conversation after repair")   # [door-why]
         _s3_keep = set(_s3_positions)
         if ready_takes is not None:
             _s3_ready = []
@@ -111473,7 +112277,7 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                     _s3_ready.append(_take)
             if not _s3_ready:
                 pipeline_log("system3", "prepared round withheld without planned takes")
-                return []
+                return _banter_no("System 3 withheld it: no planned takes in the prepared round")   # [door-why]
             if len(_s3_ready) != len(ready_takes):
                 pipeline_log("system3", "unplanned prepared dialogue held from air",
                              extra=str(len(ready_takes) - len(_s3_ready)))
@@ -111490,10 +112294,10 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
     if (any(line_forgotten(str(take.get("text") or "")) for take in (ready_takes or []))
             or any(line_forgotten(text) for _, text in turns)):
         pipeline_log("drop", "a round carrying an operator-forgotten line was withheld")
-        return []
+        return _banter_no("a line in it is on the forgotten-lines list")   # [door-why]
     if ready_takes is None and not await _system2_repeat_rows_async(
             [{"text": spoken_text(text)} for _, text in turns], ready_meta):
-        return []
+        return _banter_no("System 2 counts these lines as already aired - a repeat")   # [door-why]
     if ready_takes is None:
         fresh_pool_top()                    # #no-repeats: stock the shelf off-air
         render_backlog_top()                # #784: anything still owed the air
@@ -111528,7 +112332,7 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
         # Assemble exactly one complete media object before any publication;
         # failure has no live-render or per-turn synthesis escape hatch.
         if not ready_takes:
-            return []
+            return _banter_no("the prepared round has no takes")   # [door-why]
         # --- script production (2026-09-15) ---
         # The frozen occurrence identity for this round, if it has one.
         # `entry["production_lines"]` is written by the producer only in `on`
@@ -111547,7 +112351,7 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
             name = str(clip.get("path") or "").rsplit("/", 1)[-1].split("?", 1)[0]
             if (not name or not (VOICE_MEDIA_DIR / name).is_file()
                     or (VOICE_MEDIA_DIR / name).stat().st_size <= 0):
-                return []
+                return _banter_no("a take's recorded clip is missing from voice_media")   # [door-why]
             # --- script production (2026-09-15) ---
             # PAIRED BY POSITION, THEN CHECKED BY TEXT. The takes are sorted
             # into script order and the production lines were minted from that
@@ -111576,7 +112380,7 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
     if ready_takes is not None and globals().get("_system2"):
         if not await _system2_repeat_allowed_async(
                 [str(t.get("text") or "") for t in ready_takes], ready_meta):
-            return []
+            return _banter_no("System 2's repeat rule refused the prepared lines")   # [door-why]
     tint_eligible = [i for i, (_m, t) in enumerate(turns)
                      if len(str(t or "").strip()) >= TINT_TURN_FLOOR]
     tint_required = (len(tint_eligible) * crystal_coverage_target() + 99) // 100
@@ -111941,7 +112745,7 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
     if tint_failed:
         pipeline_log("crystal", "the complete round is held before synthesis: "
                      "its selected dialogue did not meet the tint contract")
-        return []
+        return _banter_no("its dialogue did not meet the tint contract")   # [door-why]
 
     # #1056: the listener answers in their own voice without taking over the
     # speaker's words. Only finished performances can enter the air queue.
@@ -111957,7 +112761,7 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
     # Includes raw fallback, recorded/manual exchanges, and prepared responses.
     # None may bypass the persistent exact-hour rule through a legacy waiver.
     if not await _system2_repeat_rows_async(playlist, ready_meta):
-        return []
+        return _banter_no("System 2 counts the playlist as already aired - a repeat")   # [door-why]
 
     # The feed receives this at render start, not after the completed clip is
     # published. It can therefore show which person is being rendered and how
@@ -113763,15 +114567,11 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
         if item["turn_end"]:
             if not item.get("listening_response"):
                 content_turns_spoken += 1
-            if item.get("big") and out:
-                # The stunned beat (#320): a whole monologue just landed
-                # and the room sits with it before anyone dares follow.
-                # #769: 2.8 s flat was long enough to read as a fault. Still
-                # a beat, no longer a hole, and never the same twice.
-                await asyncio.sleep(random.uniform(1.05, 1.7))
-            # dj_speak returns only once the line has actually been spoken,
-            # so this is just a beat between turns, not a guess at length.
-            await asyncio.sleep(banter_gap(dj["overlap"]))
+            # [cards-free] the pause between two turns is the operator's reply gap
+            # and nothing else: the stunned beat after a monologue (#320, a
+            # random 1-1.7 s outside System 3) and the overlap jitter (#769) are
+            # gone from this road - the reply gap (and its roll) is the one clock.
+            await asyncio.sleep(reply_pause_s(ready_meta, who, out))
         # A cut only lands between turns (#520): re-arm after each item so
         # the next iteration's guard may fire, but only at a turn boundary.
         # #805: …and NEVER during a live call — this re-arm was quietly
@@ -114897,7 +115697,8 @@ async def dj_banter(track: dict[str, Any] | None = None,
                 "things in the corners nobody would notice. Here is what is "
                 f"actually in it: \"{_pic_desc}\" Be visibly affected — "
                 "unsettled, unable to look away, arguing about what it means "
-                "and what it did to you. Then offer it to the first caller.")
+                "and what it did to you. Then offer it to the first caller."
+                + gallery_sell_attitude("a banter hawk"))                    # [paint-roulette]
     # An hourly on-air tally of how the Pine Box transmitter is holding up
     # (#497) — the running "fires in the background" saga.
     if not angle and s3_chance("banter.box_saga", 0.14, "the transmitter saga takes the round"):   # [s3-dice-door]
@@ -115497,6 +116298,22 @@ async def dj_banter(track: dict[str, Any] | None = None,
                 if _s3 is not None and _s3.active and _s3.sheet:
                     _beat_sheet = _s3.sheet
                     _s3_owns = True
+                    # [s3-callarc] a call is as long as System 3 planned it (its arc and its
+                    # detour) - the booth withholds a round whose limit is under its plan
+                    if int(getattr(_s3, "turns", 0) or 0) > int(lines or 0):
+                        lines = int(_s3.turns)
+                    # ...and when its result is the manager cutting in, seat E is HIM: his
+                    # name and his own voice, bound before a word is written
+                    _ce_mark = (call_meta or {}).get("callend") if isinstance(call_meta, dict) else None
+                    if (isinstance(_ce_mark, dict) and ((_ce_mark.get("resolve") or {}).get("manager_act"))
+                            and not caller2_name):
+                        caller2_name = manager_call_name()
+                        try:
+                            caller2_voice = (await manager_call_voice())[0] or caller2_voice
+                        except Exception:  # noqa: BLE001
+                            pass
+                        pipeline_log("system3", "the manager cuts into this call - %s on seat E, in his own voice"
+                                     % caller2_name)
                 elif _s3_active():
                     pipeline_log("system3", "call withheld because its running order was not directed")
                     return []
@@ -117495,7 +118312,9 @@ async def _banter_air(entry: dict[str, Any],
     if script_has_forgotten_line(str(entry.get("script") or ""),
                                  str(entry.get("caller_name") or ""),
                                  str(entry.get("caller2_name") or "")):
-        return []
+        # [road-backoff] the last refusal here that said nothing: the
+        # cupboard logged "the booth did not put it out" with no reason
+        return _banter_no("a line in it is on the forgotten-lines list")
     _scheduled_window = None
     if ready_takes is None and entry.get("prep_kind") and not entry.get("_ready_free"):
         _scheduled_window = (entry.get("_ready_slot")
@@ -118035,6 +118854,216 @@ def manager_call_name() -> str:
                 or "the manager upstairs")
     except Exception:  # noqa: BLE001
         return "the manager upstairs"
+
+
+# --- [call-prod] PRODUCED CALLS (call_producer.py) --------------------------------------
+CALL_PRODUCE_EVERY = 25.0
+CALL_AMBIENCES = ("a dog barking in another room", "a kettle coming to the boil", "traffic outside a window",
+                  "a television on in the background", "rain on a window", "a busy kitchen",
+                  "a crowd at a bar", "wind outside", "a baby crying somewhere", "a lawnmower outside")
+CALL_HITS = {"hit:tension": ("dramatic sting", "tension hit", "record scratch", "suspense sting"),
+             "hit:win": ("fanfare", "crowd cheering", "applause", "victory jingle"),
+             "hit:lose": ("sad trombone", "crowd gasp", "boo", "wah wah")}
+_CALL_PROD: dict[str, Any] = {"made": 0, "failed": 0, "skipped": 0, "last": "", "at": 0.0}
+
+
+async def _call_prod_asset(name: str) -> tuple[str, str]:
+    """A file for one of the produced call's symbolic sounds, rolled through the dice
+    doors and found in the station's own SFX library (or, for the bed, its music) -
+    (path, what was asked for); ("", why) when nothing fits."""
+    if name == "bed:win":
+        bed = _music_bed_track()
+        return (str((bed or {}).get("path") or ""), "a favourite record under the win")
+    if name == "ambience":
+        ask = s3_choice("call.produced_ambience", CALL_AMBIENCES,
+                        "the caller's background in a produced call [call-prod]")
+        most = 60.0
+    else:
+        ask = s3_choice("call.produced_" + name.split(":", 1)[-1], CALL_HITS.get(name) or ("sting",),
+                        "the %s in a produced call [call-prod]" % name.replace(":", " "))
+        most = 8.0
+    finder = globals().get("sfx_vectors_suggest_async")
+    if not callable(finder):
+        return "", "the SFX library is not open"
+    try:
+        got = await finder(str(ask), 8, False)
+    except Exception as exc:  # noqa: BLE001
+        return "", "the SFX library could not be asked: %s" % type(exc).__name__
+    for r in (got or {}).get("results") or []:
+        path = str(r.get("path") or "")
+        secs = float(r.get("seconds") or 0)
+        if path and (secs <= 0 or secs <= most) and Path(path).is_file():
+            return path, str(ask)
+    return "", "nothing in the library sounded like %s" % ask
+
+
+async def call_produce_tick() -> str:
+    """[call-prod] Produce ONE ready, unheard banked call - only while paused. Its takes
+    are mixed into NEW files under NEW pantry keys; the row then points at them. A call
+    whose plan and takes do not line up is marked and left dry. Returns what it did."""
+    try:
+        if not radio_paused() or not dj_settings().get("produced_calls", True):
+            return ""
+    except Exception:  # noqa: BLE001
+        return ""
+    row = entry = None
+    for r in list(shelf_rows("caller")):
+        e = dialogue_entry(r) if isinstance(r, dict) else None
+        if not e or e.get("produced") or not row_unaired(r) or not dialogue_row_ready("caller", r):
+            continue
+        mark = (e.get("call") or {}).get("callend") if isinstance(e.get("call"), dict) else None
+        if isinstance(mark, dict) and mark.get("legs"):
+            row, entry = r, e
+            break
+    if entry is None:
+        return ""
+    mark = entry["call"]["callend"]
+    # [no-wedge] every sound is a System 3 roll: the plan offers doors, the dice decide
+    doors = _call_producer.plan_production(mark.get("legs") or [], mark.get("seats") or [], mark)
+    plan, rolled = _call_producer.resolve_plan(
+        doors, lambda key, odds, label: s3_chance(key, odds, label + " [call-prod]"),
+        lambda key, options, weights, label: s3_weighted(key, options, weights, label + " [call-prod]"))
+    takes = sorted([t for t in entry.get("takes") or [] if isinstance(t, dict)], key=lambda t: int(t.get("i", -1)))
+    if not plan:
+        entry["produced"] = {"at": time.time(), "takes": 0, "of": len(takes), "rolled": rolled,
+                             "dry": "every door rolled no - this call airs as it was recorded"}
+        return "dry"
+    if len(takes) != len(mark.get("legs") or []):
+        entry["produced"] = {"at": time.time(), "skipped": "the call's plan and its takes do not line up "
+                             "(%d legs, %d takes)" % (len(mark.get("legs") or []), len(takes))}
+        _CALL_PROD["skipped"] = int(_CALL_PROD["skipped"]) + 1
+        return "skipped"
+    wanted = sorted({a for ops in plan.values() for a in (ops["pre"] + ops["post"] + ops["under"])
+                     if a in ("ambience", "bed:win") or a.startswith("hit:")})
+    assets: dict[str, str] = {}
+    asked: dict[str, str] = {}
+    for a in wanted:
+        path, why = await _call_prod_asset(a)
+        asked[a] = why
+        if path:
+            assets[a] = path
+    done = 0
+    for i, ops in sorted(plan.items()):
+        take = takes[i] if 0 <= i < len(takes) else None
+        if take is None:
+            continue
+        old_key = str(take.get("key") or "")
+        saved = _PANTRY.get(old_key) or {}
+        clip = dict(saved.get("clip") or {})
+        name = str(clip.get("path") or "").rsplit("/", 1)[-1].split("?", 1)[0]
+        src = VOICE_MEDIA_DIR / name if name else None
+        if not src or not src.is_file():
+            continue
+        new_key = _call_producer.production_key(old_key, ops, assets)
+        out_name = new_key + ".mp3"
+        out = VOICE_MEDIA_DIR / out_name
+        ok = await asyncio.to_thread(_call_producer.mix_take, src, out, ops, assets)
+        if not ok:
+            continue
+        secs = await asyncio.to_thread(_call_producer.seconds_of, out)
+        if secs <= 0:
+            continue
+        clip.update(path=f"/media/{out_name}", sig=media_sign(out_name), seconds=secs,
+                    bytes=out.stat().st_size, produced=True, produced_from=old_key)
+        pantry_put(new_key, clip, text=str(take.get("text") or saved.get("text") or ""),
+                   voice=str(take.get("voice") or saved.get("voice") or ""),
+                   who=str(take.get("who") or saved.get("who") or ""), kind="caller")
+        take["key"] = new_key
+        keys = entry.get("keys")
+        if isinstance(keys, list):
+            entry["keys"] = [new_key if k == old_key else k for k in keys]
+        done += 1
+    entry["produced"] = {"at": time.time(), "takes": done, "of": len(takes), "rolled": rolled,
+                         "assets": {a: Path(p).name for a, p in assets.items()}, "asked": asked,
+                         "plan": {str(i): {k: v for k, v in ops.items()} for i, ops in plan.items()}}
+    try:
+        entry["seconds"] = round(sum(float(((_PANTRY.get(str(t.get("key") or "")) or {}).get("clip") or {})
+                                           .get("seconds") or 0) for t in takes), 2)
+        row["seconds"] = entry["seconds"]
+    except Exception:  # noqa: BLE001
+        pass
+    _CALL_PROD.update(made=int(_CALL_PROD["made"]) + (1 if done else 0),
+                      failed=int(_CALL_PROD["failed"]) + (0 if done else 1),
+                      last=str(entry.get("prep_name") or ""), at=time.time())
+    _pantry_save(True)
+    try:
+        _production_feed.note("produced", "caller",
+                              "; ".join("%s: %s" % (i, ", ".join(ops.get("why") or [])) for i, ops in sorted(plan.items())),
+                              label="a produced call", caller=str(entry.get("prep_name") or "") or None,
+                              made=done, lines=len(takes), seconds=entry.get("seconds"),
+                              assets=", ".join("%s=%s" % (a, asked.get(a, "")) for a in wanted) or None)
+    except Exception:  # noqa: BLE001
+        pass
+    pipeline_log("lookahead", "[call-prod] a banked call was produced while paused: %d of %d takes mixed "
+                 "(%s)" % (done, len(takes), ", ".join(sorted(assets)) or "the phone's own sounds only"))
+    return "produced" if done else "failed"
+
+
+@app.on_event("startup")
+async def _call_producer_start() -> None:
+    async def loop() -> None:
+        while True:
+            await asyncio.sleep(CALL_PRODUCE_EVERY)
+            try:
+                await call_produce_tick()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                pipeline_log("drop", "[call-prod] the call producer stumbled: %s" % type(exc).__name__)
+    asyncio.create_task(loop())
+
+
+_CALL_BACKGROUND: dict[str, Any] = {"at": 0.0, "value": {}}
+
+
+def _memo_said(text: str) -> str:
+    """A memo round's words without the speaker marks - what was said, cut short."""
+    try:
+        turns = banter_turns(str(text or ""))
+        said = " ".join(t for _w, t in turns) if turns else str(text or "")
+    except Exception:  # noqa: BLE001
+        said = str(text or "")
+    return " ".join(said.split())[:320]
+
+
+def system3_call_background() -> dict[str, Any]:
+    """[s3-callarc] What the station has in play when a call is planned - the manager's
+    latest memo (the newest one that aired, else the newest banked), a headline off the
+    news cache, a painting off the unsold pile and the manager's name - for the call's
+    detour and its result wheel (CALLSHIFT1, RESOLVE2). Read from the station's own
+    records, cached a minute, never a fetch; never raises."""
+    now = time.time()
+    if now - float(_CALL_BACKGROUND["at"] or 0) < 60.0 and _CALL_BACKGROUND["value"]:
+        return dict(_CALL_BACKGROUND["value"])
+    out: dict[str, Any] = {"manager": manager_call_name()}
+    try:
+        memos = [m for m in manager_memos_list() if isinstance(m, dict) and str(m.get("text") or "").strip()]
+        aired = [m for m in memos if int(m.get("uses") or 0) > 0]
+        pick = max(aired or memos, key=lambda m: float(m.get("last") or m.get("ts") or 0), default=None)
+        if pick:
+            out["memo"] = _memo_said(str(pick.get("text") or ""))
+            out["memo_id"] = str(pick.get("id") or "")
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        heads = [h for h in (_DRUDGE_CACHE.get("headlines") or []) if isinstance(h, dict) and h.get("title")]
+        if heads:                                               # [no-wedge] a dice door, not random()
+            out["news"] = str(s3_choice("call.background_news", [str(h.get("title") or "") for h in heads[:12]],
+                                        "the headline a caller may bring up [s3-callarc]", tabled=False))[:200]
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        pile = [p for p in hawk_unsold() if isinstance(p, dict) and p.get("name")]
+        if pile:                                                # [no-wedge] a dice door, not random()
+            got = pile[s3_weighted("call.background_unsold", [str(p.get("name")) for p in pile], [1.0] * len(pile),
+                                   "the unsold painting a caller may win [s3-callarc]")]
+            out["unsold"] = {"name": str(got.get("name")), "title": str(got.get("name")).rsplit("/", 1)[-1]
+                             .rsplit(".", 1)[0].replace("_", " "),
+                             "price": got.get("price"), "desc": str(got.get("desc") or "")[:200]}
+    except Exception:  # noqa: BLE001
+        pass
+    _CALL_BACKGROUND.update(at=now, value=out)
+    return dict(out)
 
 
 async def manager_call_voice() -> tuple[str, bool]:
@@ -155647,6 +156676,15 @@ except Exception as _origin_exc:  # noqa: BLE001
 # [sfxseen] SFX DISPLAY RECEIPTS (sfx_display.py): each player says whether a
 # clip's picture reached its screen (surface, first frame, rect, seconds, the
 # operator's reaction); joined to the script's SFX rows. A KEEP store, 7 days.
+try:                                                        # [flowchart] GET /api/flow/{key|now|recent}
+    import flow_chart as _flow_chart
+    _flow_chart.install(app, globals())
+except Exception as _fc_exc:  # noqa: BLE001
+    print("the flowchart did not install: %s: %s" % (type(_fc_exc).__name__, _fc_exc))
+try:                                                        # [prod-feed] GET /api/production/feed
+    _production_feed.install(app, globals())
+except Exception as _pf_exc:  # noqa: BLE001
+    print("the production feed did not install: %s: %s" % (type(_pf_exc).__name__, _pf_exc))
 try:                                                        # [emotion-engine] GET /api/emotion/state
     _emotion.install(app, globals())
 except Exception as _ee_exc:  # noqa: BLE001
@@ -171715,11 +172753,11 @@ async def _replay_volley(line: str, who: str) -> None:
     so the button comes back the moment the replay itself has aired."""
     try:
         other = "cohost" if who == "dj" else "dj"
-        await asyncio.sleep(banter_gap(dj_settings()["overlap"]))
+        await asyncio.sleep(reply_pause_s(None, who, line, "replay"))      # [cards-free]
         reply = await dj_speak("reply", _RADIO.get("now"), extra=line,
                                who=other, by_hand=True)
         if reply and s3_chance("replay.last_word", 0.5, "the first speaker gets the last word on a replayed line (#266)"):   # [s3-dice-door]
-            await asyncio.sleep(banter_gap(dj_settings()["overlap"]))
+            await asyncio.sleep(reply_pause_s(None, other, reply, "replay"))   # [cards-free]
             await dj_speak("reply", _RADIO.get("now"), extra=reply,
                            who=who, by_hand=True)
     except Exception:
@@ -174329,6 +175367,61 @@ async def dj_pipeline_api(
             "rig": rig}
 
 
+# [why-quiet] the station says why the DJs are quiet: GET /api/dj/why-quiet
+# (?text=1 for the plain report). Memory only - no disk, no probe - so it
+# answers even when the station is struggling. Rules in why_quiet.py.
+import why_quiet as _why_quiet
+
+
+def why_quiet_facts() -> dict[str, Any]:
+    g = globals()
+    facts: dict[str, Any] = {"on": bool(_RADIO.get("on"))}
+    for name, fn in (("paused", "radio_paused"), ("paused_for", "radio_paused_for"), ("playout_mode", "playout_mode")):
+        try:
+            facts[name] = g[fn]()
+        except Exception as exc:  # noqa: BLE001
+            facts[name] = None
+            facts.setdefault("faults", []).append("%s: %s" % (fn, type(exc).__name__))
+    try:
+        seq = playout()
+        facts["playout_verdict"] = seq.verdict() if seq is not None else "off"
+    except Exception as exc:  # noqa: BLE001
+        facts["playout_verdict"] = "unreadable (%s)" % type(exc).__name__
+    facts["engines"] = {"xtts": bool(_XTTS_HEALTH.get("ready")), "voxtral": bool(_VOXTRAL_HEALTH.get("ready"))}
+    now = time.time()
+    facts["roads_out"] = {k: float(v.get("until") or 0) for k, v in (g.get("_UNHEARD_ROAD_OUT") or {}).items()
+                          if float(v.get("until") or 0) > now}
+    facts["sweep"] = dict(g.get("_UNHEARD_SWEEP") or {})
+    last = _why_quiet.last_dj_line(list(_RADIO.get("chat") or []))
+    aired = (g.get("_DIALOGUE_AT") or [0.0])[0]
+    if last is not None or aired:
+        last = dict(last or {})
+        last["ts"] = max(float(last.get("ts") or 0), float(aired or 0))
+    facts["last_dj"] = last
+    try:
+        facts["talk"] = float(dj_settings().get("talk_radio"))
+    except Exception:  # noqa: BLE001
+        facts["talk"] = None
+    try:
+        facts["gates_changed"] = ["%s %s" % (gt["name"], p["label"]) for gt in _speech_gates.view(g)["gates"]
+                                  for p in gt["params"] if p.get("changed")]
+    except Exception:  # noqa: BLE001
+        facts["gates_changed"] = []
+    return facts
+
+
+@app.get("/api/dj/why-quiet", response_model=None)
+async def dj_why_quiet(text: bool = False, authorization: str | None = Header(default=None)) -> Any:
+    """[why-quiet] Why the DJs are quiet, the likeliest cause first, with what to do."""
+    require_read_auth(authorization)
+    facts = why_quiet_facts()
+    found = _why_quiet.findings(facts)
+    said = _why_quiet.reasons(list(_RADIO.get("pipeline") or [])[-400:])
+    if text:
+        return PlainTextResponse(_why_quiet.text(facts, found, said))
+    return {"findings": found, "facts": facts, "reasons": said[-40:]}
+
+
 @app.get("/api/dj/tape")
 async def dj_tape(
     seconds: int = 120,
@@ -174898,6 +175991,14 @@ async def sfx_file(
 
     path = await asyncio.to_thread(sfx_by_id, sfx_key)
     if path is None:
+        # [sfx-gone] sfx_by_id skips a book row whose file is gone, so the
+        # quarantine further down never saw this clip: the book went on
+        # saying playable=1 and the SFX database kept offering a player
+        # that could only 404. Stand it down here too.
+        try:
+            await asyncio.to_thread(_sfx_gone_from_book, sfx_key)
+        except Exception:  # noqa: BLE001
+            pass
         return Response(status_code=404)
     # Levelled on the way out, so a hot sample does not out-shout the DJ who
     # set it up (#220). Both outputs fetch through here, so both get it.
@@ -174958,6 +176059,17 @@ async def sfx_file(
         # would outlive the copy the keeper is about to write, and the
         # next airing would sound exactly as wrong for no reason at all.
         headers["Cache-Control"] = "private, max-age=60"
+    # [nas-gain] a clip with a picture goes out with its measured gain applied as it
+    # streams from the share - no copy anywhere. Not yet measured: as shot.
+    if sfx_is_video(raw):
+        try:
+            _gain = await asyncio.to_thread(sfx_gain_known, raw)
+        except Exception:  # noqa: BLE001
+            _gain = None
+        if _gain and _gain.get("db") is not None:
+            _streamed = await sfx_gain_stream(raw, float(_gain["db"]), headers)
+            if _streamed is not None:
+                return _streamed
     window = _range_slice(str(request.headers.get("range") or ""), size)
     if window == (-1, -1):
         headers["Content-Range"] = f"bytes */{size}"
@@ -182849,6 +183961,23 @@ def sfx_db_path_of(sid: str) -> Path | None:
         return None
 
 
+def _sfx_gone_from_book(sid: str) -> bool:
+    """[sfx-gone] The book's path for this clip, quarantined when the share
+    answers and the file is not on it. Blocking: call it off the loop."""
+    con = sfx_db_reader()
+    if con is None:
+        return False
+    row = con.execute("SELECT path FROM clips WHERE sid = ? AND playable = 1 LIMIT 1",
+                      (str(sid or ""),)).fetchone()
+    if row is None:
+        return False
+    from sfx_library import file_state
+    if file_state(row[0], (SFX_ROOT, SFX_LOCAL_ROOT)) != "gone":
+        return False
+    return sfx_quarantine(sid, "the file is gone from the share (a 404 at /sfx)",
+                          Path(str(row[0])), "the /sfx route")
+
+
 def sfx_db_write_row(path: Path, seconds: float, playable: int = 1) -> bool:
     """Put one clip in the book by hand.
 
@@ -188394,6 +189523,23 @@ async def h3_hourly_render(state: dict[str, Any]) -> tuple[str, Any, str]:
     _h3_gather = globals().get("h3_speak_gather")                 # [h3-speak] the dialogue's pool:
     if _h3_gather:                                                # the hour's preset rolls over it
         _H3_SPEAK_POOL[0] = await _h3_gather()
+    # [h3-overview] the hour's preset is picked first: a technical overview
+    # needs its pitch written (awaited, off the loop) before the hour resolves
+    try:
+        _H3_PICKED[0] = h3_prompts_pick()
+        if h3_prompts_fields(_H3_PICKED[0]["preset"]).get("kind") == "overview":
+            await h3_overview_prepare(_H3_PICKED[0]["preset"])
+    except Exception as exc:  # noqa: BLE001 - the hour picks its own, as before
+        pipeline_log("ads", "hourly H3: the preset pick failed early (%s)" % type(exc).__name__)
+        _H3_PICKED[0] = None
+    # [h3-slots] the preset's named slots - tapes, screens, the gazette,
+    # arenas, graphs - rolled now, off the loop, for the hour to fill
+    if _H3_PICKED[0] and globals().get("h3_slots_preroll"):
+        try:
+            _pf = h3_prompts_fields(_H3_PICKED[0]["preset"])
+            await h3_slots_preroll(*[_pf.get(f) for f in ("goal", "speech") + H3_PROMPTS_ROADS])
+        except Exception as exc:  # noqa: BLE001
+            pipeline_log("ads", "hourly H3: the named slots were not pre-rolled (%s)" % type(exc).__name__)
     goal = h3_hourly_ad_prompt()
     try:
         share = max(0, min(100, int(state.get("gallery_share", 20) or 0)))
@@ -188655,7 +189801,8 @@ def h3_speak_normalize(text: Any) -> str:
 
 
 # [h3-slot-roll] {speakerbox} and {a|b|c} in an hourly prompt are ROLLS
-H3_SLOT_RX = re.compile(r"\{(speakerbox|[^{}|\n]+(?:\|[^{}|\n]+)+)\}")
+H3_SLOT_NAMES = r"(?:mxtape|fordtape|videos|sfxclip|convograph|gazette|arena)\d?"   # [h3-slots] = h3_slots.NAMED
+H3_SLOT_RX = re.compile(r"\{(speakerbox|" + H3_SLOT_NAMES + r"|[^{}|\n]+(?:\|[^{}|\n]+)+)\}")
 H3_SLOT_KEEP_S = 1800.0
 H3_SLOT_OPTS = 40
 _H3_SLOT_MEMO: dict[str, Any] = {"at": 0.0, "vals": {}}
@@ -188743,13 +189890,224 @@ def h3_slots_roll(template: Any) -> str:
         vals = _H3_SLOT_MEMO["vals"]
         if tok not in vals:
             try:
-                vals[tok] = _h3_slot_speakerbox() if tok == "speakerbox" else _h3_slot_choice(tok)
+                vals[tok] = (_h3_slot_speakerbox() if tok == "speakerbox"
+                             else h3_slot_named_sync(tok) if re.fullmatch(H3_SLOT_NAMES, tok)
+                             else _h3_slot_choice(tok))
             except Exception as exc:  # noqa: BLE001
                 pipeline_log("ads", "hourly H3 prompts: {%s} could not be rolled (%s)" % (tok[:40], type(exc).__name__))
                 vals[tok] = ""
         return vals[tok]
 
     return H3_SLOT_RX.sub(one, text)
+
+
+# --- [h3-slots] THE NAMED SLOTS: TAPES, SCREENS, THE GAZETTE, ARENAS, GRAPHS ----
+#
+# {mxtape} {fordtape} {videos} {sfxclip} {convograph} {gazette} {arena} (each
+# may carry one digit - {arena2} is a second roll) become words through two
+# halves: the SHELF, read off the loop (a folder, the clip book, the gallery,
+# the press, System 3's store), then the ROLL, on the loop, through System 3's
+# dice (h3.slot_<name>), recorded on the hour's rolodex as slot_<token>. A clip
+# or a video plays on a rolled screen (h3.slot_screen - a tabled pool the desk
+# edits). The hourly door rolls every named slot of the hour's preset before
+# the hour resolves (h3_slots_preroll); anything it did not reach is rolled
+# where it is filled (h3_slot_named_sync), {convograph} excepted (it reads
+# System 3's store, which only the async door may).
+H3_SLOT_SHELF_MOST = 400
+H3_SLOT_LABELS = {
+    "mxtape": "which MX mixtape an hourly H3 prompt's {mxtape} plays",
+    "fordtape": "which General Ford tape an hourly H3 prompt's {fordtape} plays",
+    "videos": "which Pine Box gallery video an hourly H3 prompt's {videos} shows",
+    "sfxclip": "where in the clip book an hourly H3 prompt's {sfxclip} lands (0 = first clip, 1 = last)",
+    "convograph": "which real conversation's flowchart an hourly H3 prompt's {convograph} presents",
+    "gazette": "which recent Pine Box Gazette edition an hourly H3 prompt's {gazette} brings in",
+    "arena": "which Pine Box gallery picture an hourly H3 prompt's {arena} is built from",
+}
+H3_SLOT_SCREEN_LABEL = "what screen in the scene shows an hourly H3 prompt's {videos} or {sfxclip}"
+
+
+def _h3_slot_audio_titles(folder: Path, titler: Any) -> list[str]:
+    """Every tape under the folder and its subfolders (Fordtime1, ...), read in
+    place, one title each - a copy "(1)" or a second take "_2" is the same tape."""
+    try:
+        found = sorted(p for p in folder.rglob("*") if p.suffix.lower() in MIXTAPE_TYPES and p.is_file())
+    except OSError:
+        return []
+    titles: list[str] = []
+    for p in found:
+        t = titler(p)
+        if t and t not in titles:
+            titles.append(t)
+    return titles[:H3_SLOT_SHELF_MOST]
+
+
+def h3_slot_shelf(name: str) -> Any:
+    """[h3-slots] What a named slot rolls over - blocking reads, so a worker
+    thread's. {sfxclip}'s shelf is the clip book's size."""
+    if name == "mxtape":
+        return [mixtape_title(p) for p in mixtape_files()][:H3_SLOT_SHELF_MOST]
+    if name == "fordtape":
+        folder = SFX_ROOT / str(dj_settings().get("fordtape_folder") or "samples_grabbed/user/ford")
+        return _h3_slot_audio_titles(folder, lambda p: h3_slots.tape_title(p.stem))
+    if name == "videos":
+        found = []
+        for p in COMFY_OUTPUT.rglob("*"):
+            if p.suffix.lower() in (".mp4", ".webm") and p.is_file():
+                try:
+                    found.append((p.stat().st_mtime, p.name))
+                except OSError:
+                    continue
+        return [n for _t, n in sorted(found, reverse=True)][:H3_SLOT_SHELF_MOST]
+    if name == "arena":
+        return [p.name for p in gallery_files(600)
+                if re.search(r"\.(png|jpe?g|webp)$", p.name, re.I) and not gallery_paper_file(p.name)
+                ][:H3_SLOT_SHELF_MOST]
+    if name == "gazette":
+        return [{"id": e.get("id"), "headline": e.get("headline"), "deck": e.get("deck")}
+                for e in paper_editions()[:8] if e.get("headline")]
+    if name == "sfxclip":
+        con = sfx_db_reader()
+        with _SFX_DB_LOCK:
+            return int(con.execute("SELECT COUNT(*) FROM clips WHERE playable=1").fetchone()[0] or 0)
+    return []
+
+
+def h3_slot_sfx_row(u: float, total: int) -> dict[str, Any]:
+    """The clip at `u` of the playable book, with what it shows or says. A worker thread's."""
+    con = sfx_db_reader()
+    at = max(0, min(total - 1, int(float(u) * total)))
+    with _SFX_DB_LOCK:
+        try:
+            r = con.execute("SELECT sid, name, COALESCE(seen_desc,''), COALESCE(said,'') FROM clips "
+                            "WHERE playable=1 LIMIT 1 OFFSET ?", (at,)).fetchone()
+        except Exception:  # noqa: BLE001 - a book without the vision and speech columns
+            r = con.execute("SELECT sid, name, '', '' FROM clips WHERE playable=1 LIMIT 1 OFFSET ?", (at,)).fetchone()
+    return {"sid": str(r[0] or ""), "name": str(r[1] or ""), "seen_desc": str(r[2] or ""),
+            "said": str(r[3] or "")} if r else {}
+
+
+def h3_slot_screen(tok: str) -> str:
+    screen = str(s3_choice("h3.slot_screen", h3_slots.SCREENS, H3_SLOT_SCREEN_LABEL))
+    _h3_slot_note("slot_screen_" + tok, "h3.slot_screen", list(h3_slots.SCREENS), screen)
+    return screen
+
+
+def h3_slot_pick(tok: str, shelf: Any) -> str:
+    """[h3-slots] One named slot rolled over its shelf, on the loop - the words
+    it becomes, or "" when the shelf is empty (logged)."""
+    name = h3_slots.base(tok)
+    key = "h3.slot_" + name
+    if name == "sfxclip" or not shelf:
+        if not shelf:
+            pipeline_log("ads", "hourly H3 prompts: {%s} - nothing on its shelf, taken out" % tok)
+        return ""
+    if name == "gazette":
+        labels = [str(e.get("headline") or "")[:120] for e in shelf]
+    else:
+        labels = [str(x) for x in shelf]
+    k = s3_weighted(key, labels, [1.0] * len(labels), H3_SLOT_LABELS[name])
+    k = k if isinstance(k, int) and 0 <= k < len(labels) else 0
+    _h3_slot_note("slot_" + tok, key, labels, labels[k])
+    got = shelf[k]
+    if name == "mxtape":
+        return h3_slots.mxtape(got)
+    if name == "fordtape":
+        return h3_slots.fordtape(got)
+    if name == "videos":
+        return h3_slots.video(h3_slot_screen(tok), got)
+    if name == "arena":
+        return h3_slots.arena(got)
+    if name == "gazette":
+        return h3_slots.gazette(got)
+    return ""
+
+
+async def h3_slot_sfxclip(tok: str) -> str:
+    total = await asyncio.to_thread(h3_slot_shelf, "sfxclip")
+    if not total:
+        pipeline_log("ads", "hourly H3 prompts: {%s} - the clip book is empty, taken out" % tok)
+        return ""
+    u = s3_roll("h3.slot_sfxclip", H3_SLOT_LABELS["sfxclip"])
+    h3_hourly_roll_note("slot_" + tok, "h3.slot_sfxclip")
+    row = await asyncio.to_thread(h3_slot_sfx_row, float(u), int(total))
+    if not row:
+        return ""
+    got = _H3_HOURLY_ROLLS.get("slot_" + tok)
+    if isinstance(got, dict):
+        got["picked"] = str(row.get("name") or "")[:300]
+    return h3_slots.sfxclip(h3_slot_screen(tok), row)
+
+
+async def h3_slot_convograph(tok: str) -> str:
+    rt = globals().get("_SYSTEM3_RUNTIME")
+    if rt is not None and not hasattr(rt, "store") and callable(rt):
+        rt = rt()
+    if rt is None or not hasattr(rt, "store"):
+        pipeline_log("ads", "hourly H3 prompts: {%s} - System 3 is not running, taken out" % tok)
+        return ""
+    rows = [r for r in (await rt.read(rt.store.conversations, 40, "")) or []
+            if isinstance(r, dict) and r.get("conversation_id") and int(r.get("events") or 0) > 0]
+    if not rows:
+        pipeline_log("ads", "hourly H3 prompts: {%s} - no conversation with dice yet, taken out" % tok)
+        return ""
+    labels = ["#%s %s: %s" % (str(r["conversation_id"])[:8], r.get("road") or "", r.get("topic") or "")
+              for r in rows]
+    k = s3_weighted("h3.slot_convograph", [x[:120] for x in labels], [1.0] * len(rows), H3_SLOT_LABELS["convograph"])
+    k = k if isinstance(k, int) and 0 <= k < len(rows) else 0
+    _h3_slot_note("slot_" + tok, "h3.slot_convograph", labels, labels[k])
+    conv = await rt.read(rt.store.conversation, str(rows[k]["conversation_id"]))
+    if not conv:
+        return ""
+    import flow_chart as _fc
+    flow = await asyncio.to_thread(_fc.build_flow, conv)
+    return h3_slots.convograph(flow)
+
+
+async def h3_slots_preroll(*texts: Any) -> dict[str, str]:
+    """[h3-slots] Every named slot in the texts, rolled before the hour is
+    resolved, into the memo h3_slots_roll fills from. A slot that faults is
+    logged and taken out - the render is never lost to it."""
+    now = time.time()
+    if now - float(_H3_SLOT_MEMO["at"]) > H3_SLOT_KEEP_S:
+        _H3_SLOT_MEMO.update(at=now, vals={})
+    vals = _H3_SLOT_MEMO["vals"]
+    done: dict[str, str] = {}
+    for tok in h3_slots.tokens(*texts):
+        if tok in vals:
+            continue
+        name = h3_slots.base(tok)
+        try:
+            if name == "sfxclip":
+                got = await h3_slot_sfxclip(tok)
+            elif name == "convograph":
+                got = await h3_slot_convograph(tok)
+            else:
+                got = h3_slot_pick(tok, await asyncio.to_thread(h3_slot_shelf, name))
+        except Exception as exc:  # noqa: BLE001
+            pipeline_log("ads", "hourly H3 prompts: {%s} could not be rolled (%s)" % (tok, type(exc).__name__))
+            got = ""
+        vals[tok] = done[tok] = got
+        if got:
+            pipeline_log("ads", "hourly H3 prompts: {%s} rolled - %s [h3-slots]" % (tok, got[:120]))
+    return done
+
+
+def h3_slot_named_sync(tok: str) -> str:
+    """[h3-slots] A named slot the door did not pre-roll, rolled where it is
+    filled (blocking reads; small). {convograph} needs the door."""
+    name = h3_slots.base(tok)
+    if name == "convograph":
+        pipeline_log("ads", "hourly H3 prompts: {%s} is rolled by the hourly door only - taken out here" % tok)
+        return ""
+    if name == "sfxclip":
+        total = int(h3_slot_shelf("sfxclip") or 0)
+        if not total:
+            return ""
+        u = s3_roll("h3.slot_sfxclip", H3_SLOT_LABELS["sfxclip"])
+        h3_hourly_roll_note("slot_" + tok, "h3.slot_sfxclip")
+        row = h3_slot_sfx_row(float(u), total)
+        return h3_slots.sfxclip(h3_slot_screen(tok), row) if row else ""
+    return h3_slot_pick(tok, h3_slot_shelf(name))
 
 
 def h3_speak_fill(template: Any, quiet: bool = False, **values: Any) -> str:
@@ -189047,6 +190405,192 @@ def h3_speak_gate(prompt: str, speech: str, payload: dict[str, Any]) -> str:
     return why
 
 
+# --- [h3-overview] THE TECHNICAL OVERVIEW: A FEATURE, SOLD AT A WHITEBOARD ------
+#
+# "a special preset called technical overview ... the person coming out giving a
+#  technical presentation on a whiteboard presenting one of the features
+#  mentioned in the release log" (the operator, 2026-10-01). A preset whose kind
+# is "overview" is prepared here before the hour is resolved: System 3 rolls the
+# changelog feature (h3.overview_feature), the presenter (h3.overview_presenter),
+# how many actions (h3.overview_action_count) and which (h3.overview_action),
+# and each action's prop; the system prompt is rolled from the segment-prompt
+# book's alternatives (kind h3_overview, h3.overview_system); the model writes
+# the pitch. Every pool is tabled, so the desk edits, weighs and retires them.
+# Pure parts in h3_overview.py. No model, no pitch: the hour falls back to the
+# feature's own subject - the render is never lost to it.
+import h3_overview                         # [h3-overview] the pure half
+
+_H3_OVERVIEW: list[Any] = [None]
+H3_OVERVIEW_SECONDS = 10.0
+H3_OVERVIEW_FEATURE_LABEL = "which tagged changelog feature the technical-overview H3 video presents"
+H3_OVERVIEW_PRESENTER_LABEL = "who presents the technical-overview H3 video at the whiteboard"
+H3_OVERVIEW_COUNT_LABEL = "how many gestures and actions the technical-overview presenter does"
+H3_OVERVIEW_ACTION_LABEL = "a gesture or action the technical-overview presenter does"
+H3_OVERVIEW_SYSTEM_LABEL = "which system prompt writes the technical-overview pitch"
+
+
+def h3_overview_take() -> dict[str, Any] | None:
+    """The pitch the hourly door just prepared, once; None when stale or spent."""
+    got, _H3_OVERVIEW[0] = _H3_OVERVIEW[0], None
+    if isinstance(got, dict) and time.time() - float(got.get("at") or 0) <= 900 and got.get("say"):
+        return got
+    return None
+
+
+def h3_overview_seed_prompts() -> None:
+    """The book's first system prompts for kind h3_overview, once, rolled at
+    random among themselves; the operator edits them in the segment-prompt book."""
+    if segment_prompts.entry(h3_overview.PROMPT_KIND):
+        return
+    for name, text in h3_overview.SYSTEM_PROMPTS:
+        segment_prompts.put_alternative(h3_overview.PROMPT_KIND, {"name": name, "text": text, "weight": 1, "on": True})
+    try:
+        segment_prompts.set_mode(h3_overview.PROMPT_KIND, "random")
+    except (KeyError, ValueError):
+        pass
+
+
+def h3_overview_system() -> tuple[str, str]:
+    """(name, text) of the system prompt this pitch is written under: the
+    book's fixed one when the operator fixed it, else System 3's weighted roll
+    over the ones switched on; the built-in first when the book has none."""
+    try:
+        h3_overview_seed_prompts()
+        row = segment_prompts.entry(h3_overview.PROMPT_KIND) or {}
+    except Exception:  # noqa: BLE001
+        row = {}
+    alts = [a for a in row.get("alternatives") or [] if a.get("on") and str(a.get("text") or "").strip()]
+    if not alts:
+        return h3_overview.SYSTEM_PROMPTS[0]
+    mode = str(row.get("mode") or "")
+    if mode.startswith("fixed:"):
+        one = next((a for a in alts if a.get("id") == mode[6:]), alts[0])
+        return str(one.get("name") or ""), str(one["text"])
+    names = [str(a.get("name") or a.get("id") or "?") for a in alts]
+    k = s3_weighted("h3.overview_system", names, [max(1, int(a.get("weight") or 1)) for a in alts],
+                    H3_OVERVIEW_SYSTEM_LABEL)
+    k = k if isinstance(k, int) and 0 <= k < len(alts) else 0
+    h3_hourly_roll_note("ov_system", "h3.overview_system")
+    return names[k], str(alts[k]["text"])
+
+
+def h3_overview_dialogue() -> list[str]:
+    """Lines the DJs said on air lately, for the dialogue billboard."""
+    out = []
+    for row in reversed(list(_RADIO.get("chat") or [])):
+        row = row if isinstance(row, dict) else {}
+        if str(row.get("kind") or "") in ("request", "played", "marker", "sfx", "hangup", "image_analysis",
+                                          "song_analysis"):
+            continue
+        text = " ".join(str(row.get("text") or "").split())
+        if 12 <= len(text) <= 180:
+            who = str(row.get("name") or row.get("who") or "").strip()
+            out.append(('%s: "%s"' % (who, text)) if who else '"%s"' % text)
+        if len(out) >= 24:
+            break
+    return out
+
+
+async def h3_overview_props(feature: dict[str, Any], actions: list[str]) -> dict[str, str]:
+    """What the rolled actions carry, each rolled only when an action needs it."""
+    props: dict[str, str] = {}
+    want = " ".join(actions)
+    if "{gallery}" in want:
+        try:
+            pics = [p.name for p in await asyncio.to_thread(gallery_files, 600)
+                    if re.search(r"\.(png|jpe?g|webp)$", p.name, re.I) and not gallery_paper_file(p.name)]
+        except Exception:  # noqa: BLE001
+            pics = []
+        if pics:
+            props["gallery"] = re.sub(r"[_-]+", " ", Path(s3_choice(
+                "h3.overview_gallery", pics[:200], "which gallery picture the technical-overview presenter carries",
+                tabled=False)).stem)[:80]
+            h3_hourly_roll_note("ov_gallery", "h3.overview_gallery")
+    if "{gitlog}" in want:
+        props["gitlog"] = "; ".join("%s %s" % (c.get("commit"), c.get("subject"))
+                                    for c in (feature.get("commits") or [])[:3])[:240]
+    if "{dialogue}" in want:
+        lines = h3_overview_dialogue()
+        if lines:
+            props["dialogue"] = s3_choice("h3.overview_dialogue", lines,
+                                          "which DJ line the technical-overview billboard shows", tabled=False)
+            h3_hourly_roll_note("ov_dialogue", "h3.overview_dialogue")
+    return props
+
+
+async def h3_overview_prepare(preset: Any = None) -> dict[str, Any] | None:
+    """[h3-overview] The technical overview for this hour, left for
+    h3_prompts_hour to take. A fault is logged and the hour falls back."""
+    try:
+        got = await _h3_overview_prepare()
+    except Exception as exc:  # noqa: BLE001
+        pipeline_log("ads", "hourly H3 technical overview: not prepared (%s)" % type(exc).__name__)
+        got = None
+    _H3_OVERVIEW[0] = got
+    return got
+
+
+async def _h3_overview_prepare() -> dict[str, Any] | None:
+    page = _CHANGELOG.memory_page(300)
+    feats = h3_overview.features(page.get("entries") or [])
+    if not feats:
+        page = await asyncio.wait_for(asyncio.to_thread(_CHANGELOG.page, 300), timeout=5.0)
+        feats = h3_overview.features(page.get("entries") or [])
+    if not feats:
+        pipeline_log("ads", "hourly H3 technical overview: the changelog has no tagged features yet")
+        return None
+    tags = list(feats)
+    labels = [h3_overview.feature_label(feats[t]) for t in tags]
+    k = s3_weighted("h3.overview_feature", labels, [1.0] * len(labels), H3_OVERVIEW_FEATURE_LABEL)
+    feature = feats[tags[k if isinstance(k, int) and 0 <= k < len(tags) else 0]]
+    h3_hourly_roll_note("ov_feature", "h3.overview_feature")
+    presenter = str(s3_choice("h3.overview_presenter", h3_overview.PRESENTERS, H3_OVERVIEW_PRESENTER_LABEL))
+    h3_hourly_roll_note("ov_presenter", "h3.overview_presenter")
+    try:
+        count = max(1, int(str(s3_choice("h3.overview_action_count", h3_overview.ACTION_COUNTS,
+                                          H3_OVERVIEW_COUNT_LABEL)).strip() or 1))
+    except ValueError:
+        count = 1
+    h3_hourly_roll_note("ov_count", "h3.overview_action_count")
+    raw = [str(a) for a in s3_sample("h3.overview_action", h3_overview.ACTIONS, count, H3_OVERVIEW_ACTION_LABEL)]
+    h3_hourly_roll_note("ov_action", "h3.overview_action")
+    props = await h3_overview_props(feature, raw)
+    actions = [a for a in (h3_overview.fill_action(r, props) for r in raw) if a]
+    system_name, system = h3_overview_system()
+    words = h3_speak.word_cap(H3_OVERVIEW_SECONDS)
+    out = {"at": time.time(), "feature": h3_overview.feature_label(feature), "tag": feature.get("tag"),
+           "commits": [c.get("commit") for c in (feature.get("commits") or [])][:12], "presenter": presenter,
+           "actions": actions, "system": system_name, "by": "model", "why": ""}
+    reply = ""
+    try:
+        result = await call_ollama(model=dj_settings()["model"],
+                                   messages=h3_overview.messages(system, h3_overview.brief(feature), presenter,
+                                                                 actions, words),
+                                   temperature=0.9, max_tokens=420, num_ctx=model_ctx(), repeat_penalty=1.1,
+                                   purpose="h3:overview")
+        reply = str(((result or {}).get("message") or {}).get("content") or "")
+    except Exception as exc:  # noqa: BLE001
+        out["why"] = "the model did not answer (%s)" % type(exc).__name__
+    got = h3_overview.parse(reply, words)
+    if got.get("say") and h3_speak.speech_why(got["say"]):      # a short punchline goes, the rest stays
+        got["say"] = h3_overview.keep_whole(got["say"], h3_speak.speech_why)
+    why = h3_speak.speech_why(got["say"]) if got.get("say") else "no pitch in the reply"
+    if why:
+        got = {"say": h3_overview.fallback_say(h3_speak_station(), feature, words), "do": ""}
+        out.update(by="fallback", why=out["why"] or str(why))
+    out["say"] = got["say"]
+    out["scene"] = h3_overview.scene(presenter, feature, got.get("do") or "", actions)
+    note = globals().get("_production_feed")
+    if note is not None:
+        try:
+            note.note("h3", "h3_overview", "technical overview: %s - %s" % (out["feature"], out["say"][:120]))
+        except Exception:  # noqa: BLE001
+            pass
+    pipeline_log("ads", "hourly H3 technical overview: %s by %s (%s, %s)%s" % (
+        out["feature"][:80], presenter[:40], system_name, out["by"], (" - " + out["why"]) if out["why"] else ""))
+    return out
+
+
 # --- [h3-prompts] THE HOURLY PROMPTS: PRESETS THE OPERATOR SAVES, CYCLES, ROLLS --
 #
 # "Put an option here of a P for prompt and whenever I click it or tap it it
@@ -189080,10 +190624,12 @@ _H3_PROMPTS_LOCK = RLock()                      # worker threads only - never on
 _H3_PROMPTS_MEM: list[Any] = [None]             # the store as last read or written, swapped whole
 _H3_PROMPTS_HOURS: list[dict[str, Any]] = []    # the hours this process resolved, newest last
 _H3_PROMPTS_DRESSED: dict[str, list[float]] = {}   # hour -> [renders dressed, when last]
-H3_PROMPTS_FIELDS = ("goal", "clip", "gallery", "host", "speech", "style", "constraints", "audio_direction")
+H3_PROMPTS_FIELDS = ("goal", "clip", "gallery", "host", "speech", "style", "constraints", "audio_direction",
+                     "kind")                     # [h3-overview] "" = these words; "overview" = the whiteboard
 H3_PROMPTS_ROADS = ("clip", "gallery", "host")
 H3_PROMPTS_LIMITS = {"name": 60, "goal": 1200, "clip": 1800, "gallery": 1800, "host": 1800,
-                     "speech": 700, "style": 120, "constraints": 400, "audio_direction": 400}
+                     "speech": 700, "style": 120, "constraints": 400, "audio_direction": 400, "kind": 20}
+H3_PROMPTS_KINDS = ("", "overview")
 H3_PROMPTS_DEFAULT = {
     "goal": ("Make a short, funny but professional Pine Box FM sponsor stinger "
              "that naturally follows this hour's conversation: {conversation}"),
@@ -189095,7 +190641,7 @@ H3_PROMPTS_DEFAULT = {
                 "synchronized spoken dialogue. No captions or logos. {goal}"),
     "host": ("The Pine Box host presents a Pine Box FM stinger at the station's desk, "
              "direct to camera, in warm late-night studio light. {goal}"),
-    "speech": "", "style": "", "constraints": "", "audio_direction": ""}
+    "speech": "", "style": "", "constraints": "", "audio_direction": "", "kind": ""}
 H3_PROMPTS_MOST = 60                  # saved presets
 H3_PROMPTS_HISTORY_KEEP = 168         # a week of hours
 H3_PROMPTS_FIND_S = 86400.0           # a queued hourly render finds its hour within a day
@@ -189109,7 +190655,7 @@ def _h3_prompts_text(value: Any, field: str) -> str:
     name and the one-line fields are one line; a brief or a direction keeps
     its line breaks (compose_prompt joins them)."""
     text = str(value if value is not None else "")
-    if field in ("name", "speech", "style", "constraints", "audio_direction"):
+    if field in ("name", "speech", "style", "constraints", "audio_direction", "kind"):
         text = " ".join(text.split())
     else:
         text = "\n".join(" ".join(line.split()) for line in text.replace("\r", "").split("\n")).strip()
@@ -189124,6 +190670,9 @@ def h3_prompts_fields(preset: Any) -> dict[str, str]:
     for field in ("goal",) + H3_PROMPTS_ROADS:
         if not out[field]:
             out[field] = H3_PROMPTS_DEFAULT[field]
+    # [h3-overview] the kind is one of the known few; anything naming the
+    # technical overview is it, the rest is the plain words preset
+    out["kind"] = "overview" if "overview" in out["kind"].lower() else ""
     return out
 
 
@@ -189204,6 +190753,7 @@ def _h3_prompts_normalise(got: Any) -> dict[str, Any]:
     store["dice"] = bool(got.get("dice"))
     store["next"] = _h3_prompts_pin(got.get("next"))
     store["history"] = [h for h in list(got.get("history") or []) if isinstance(h, dict)][-H3_PROMPTS_HISTORY_KEEP:]
+    store["seeded"] = [str(x)[:40] for x in list(got.get("seeded") or []) if x][:60]     # [h3-base]
     try:
         store["rev"] = max(0, int(got.get("rev") or 0))
     except (TypeError, ValueError):
@@ -189345,12 +190895,13 @@ def h3_prompts_how(entry: Any) -> str:
     return "the active preset"
 
 
-def h3_prompts_hour(conversation: str, record: str = "", speak: Any = None) -> dict[str, Any]:
-    """[h3-prompts] This hour's preset, and its brief filled: the one pinned for
-    the next hour, else the dice's roll (the gallery's dice on), else the active
-    one. The hourly render calls this on the event loop (h3_hourly_ad_prompt):
-    it reads the store from memory and never takes the lock; the hour's record
-    is written off the loop."""
+_H3_PICKED: list[Any] = [None]        # [h3-overview] the hour's pick, made by the door before it writes
+
+
+def h3_prompts_pick() -> dict[str, Any]:
+    """[h3-prompts] Which preset this hour is told: the one pinned for the next
+    hour, else the dice's roll (the gallery's dice on), else the active one.
+    Memory only, never the lock: the hourly door calls it on the loop."""
     store = _H3_PROMPTS_MEM[0] if isinstance(_H3_PROMPTS_MEM[0], dict) else None
     if store is None:              # the startup load has not landed: never read the disk on the loop
         pipeline_log("ads", "hourly H3 prompts: the presets are not loaded yet - the Default preset's words")
@@ -189368,12 +190919,42 @@ def h3_prompts_hour(conversation: str, record: str = "", speak: Any = None) -> d
         preset, roll = h3_prompts_roll(presets, active)
     else:
         how, preset = "active", active
+    return {"at": time.time(), "how": how, "preset": preset, "roll": roll, "pin": pin}
+
+
+def h3_prompts_picked_take() -> dict[str, Any] | None:
+    """[h3-overview] The pick the hourly door made a moment ago, once - so the
+    hour it resolves is the preset it prepared for (one roll, never two)."""
+    got, _H3_PICKED[0] = _H3_PICKED[0], None
+    if isinstance(got, dict) and time.time() - float(got.get("at") or 0) <= 900:
+        return got
+    return None
+
+
+def h3_prompts_hour(conversation: str, record: str = "", speak: Any = None) -> dict[str, Any]:
+    """[h3-prompts] This hour's preset, and its brief filled: the one pinned for
+    the next hour, else the dice's roll (the gallery's dice on), else the active
+    one. The hourly render calls this on the event loop (h3_hourly_ad_prompt):
+    it reads the store from memory and never takes the lock; the hour's record
+    is written off the loop."""
+    picked = h3_prompts_picked_take() or h3_prompts_pick()
+    how, preset, roll, pin = picked["how"], picked["preset"], picked["roll"], picked["pin"]
     fields = h3_prompts_fields(preset)
+    # [h3-overview] a technical-overview hour speaks the pitch its door wrote
+    # (h3_overview_prepare, awaited before this): the whiteboard scene is the
+    # brief and the pitch the line; the dialogue pool is spent unused
+    _ov = h3_overview_take() if fields.get("kind") == "overview" and globals().get("h3_overview_take") else None
+    if _ov:
+        fields["goal"], fields["speech"] = _ov["scene"], _ov["say"]
+        conversation = _ov["say"]
+        if speak is None and globals().get("h3_speak_pool_take"):
+            h3_speak_pool_take()
+        speak = None
     # [h3-speak] the H3SPEAK node rolls the hour's dialogue over the pool: its
     # sentences are the {conversation}, its line the words spoken; {station}
     # and {hour} are filled and a slot no road fills is taken out
     _take, _fill = globals().get("h3_speak_take"), globals().get("h3_speak_fill") or h3_prompts_fill
-    if speak is None and globals().get("h3_speak_pool_take"):
+    if speak is None and globals().get("h3_speak_pool_take") and not _ov:
         speak = h3_speak_pool_take()          # the pool the hourly door just gathered, once
     _speak = _take(speak, fields.get("speech") or "") if speak is not None and _take else None
     if _speak is not None:
@@ -189386,6 +190967,9 @@ def h3_prompts_hour(conversation: str, record: str = "", speak: Any = None) -> d
              "roll": roll, "pin": str((pin or {}).get("id") or "") if how == "next" else "",
              "fields": fields, "conversation": str(conversation or "")[:600], "record": str(record or "")[:200],
              "goal": goal, "speak": _speak}                   # [h3-speak] the node, its dice and origin
+    if _ov:
+        entry["overview"] = {k: _ov.get(k) for k in ("feature", "tag", "commits", "presenter", "actions",
+                                                      "system", "by", "why")}
     _H3_PROMPTS_HOURS.append(entry)
     del _H3_PROMPTS_HOURS[:-24]
     _h3_prompts_offloop(h3_prompts_commit_hour, dict(entry))
@@ -189615,6 +191199,7 @@ def h3_prompts_view(summary: bool = False) -> dict[str, Any]:
         "fields": list(H3_PROMPTS_FIELDS), "limits": dict(H3_PROMPTS_LIMITS), "most": H3_PROMPTS_MOST,
         "placeholders": {"conversation": "the hour's talk - the last lines said on air",
                          "record": "the record on air", "goal": "the brief, filled"},
+        "slots": h3_slots.catalogue() if globals().get("h3_slots") else [],     # [h3-slots] the { dropdown
         "hours": [_h3_prompts_hour_view(h) for h in hours[-12:]][::-1]})
     return out
 
@@ -189872,11 +191457,62 @@ async def h3_prompts_delete_api(pid: str, authorization: str | None = Header(def
     return await asyncio.to_thread(h3_prompts_delete, pid[:40])
 
 
+# [h3-base] THE BASE PRESETS. Each joins the saved presets ONCE (its id is
+# written down in the store's "seeded"), so a preset the operator edits keeps
+# the edit and one deleted stays deleted. The words are ordinary preset words;
+# the {slots} in them are rolled at render time like any other.
+H3_PROMPTS_BASE = (
+    {"id": "base-overview", "name": "Technical overview", "kind": "overview",
+     "speech": "",
+     # what an hour says when the changelog or the model gives nothing; a
+     # prepared overview replaces it with the rolled whiteboard scene
+     "goal": ("A technical presentation at a whiteboard: a presenter sells one of {station}'s new software "
+              "features to camera, animated and full of energy, drawing diagrams and arrows as they talk.")},
+    # [h3-slots] the operator's three, 2026-10-01: a concert to an MX tape, a
+    # performance of a General Ford tape, a battle across two gallery arenas
+    {"id": "base-mx-concert", "name": "MX mixtape concert", "speech": "",
+     "goal": ("{station} puts on a packed live concert with {mxtape} playing as the music: the crowd sways, "
+              "lights sweep the stage and the performers sell the show to camera, {funny|euphoric|chaotic} "
+              "and loud. {conversation}")},
+    {"id": "base-ford-performance", "name": "General Ford tape performance", "speech": "",
+     "goal": ("Performers act out {fordtape} like it is the greatest stage show on earth: dramatic poses, "
+              "a spotlight, a {tiny|roaring|baffled} audience, and {videos} in the background. {conversation}")},
+    {"id": "base-arena-battle", "name": "Arena battle", "speech": "",
+     "goal": ("Two fighters battle it out, each in a different arena: one in {arena}, the other in {arena2}. "
+              "They trade blows across the split screen, trash-talk to camera and {sfxclip} plays on the side. "
+              "{conversation}")},
+)
+
+
+def h3_prompts_seed_base(store: dict[str, Any]) -> list[str]:
+    """[h3-base] The base presets this store has never had, added; their ids."""
+    seeded = list(store.get("seeded") or [])
+    presets = list(store.get("presets") or [])
+    added = []
+    for base in H3_PROMPTS_BASE:
+        if base["id"] in seeded:
+            continue
+        seeded.append(base["id"])
+        if len(presets) >= H3_PROMPTS_MOST or any(p.get("id") == base["id"] for p in presets):
+            continue
+        names = {str(p.get("name") or "").lower() for p in presets}
+        raw = dict(base)
+        if raw["name"].lower() in names:
+            raw["name"] = (raw["name"] + " (base)")[:H3_PROMPTS_LIMITS["name"]]
+        presets.append(_h3_prompts_preset(raw, base["id"]))
+        added.append(base["id"])
+    store["presets"], store["seeded"] = presets, seeded
+    return added
+
+
 @app.on_event("startup")
 async def _h3_prompts_start() -> None:
     """[h3-prompts] The store into memory before the first hour - off the loop."""
     try:
         await asyncio.to_thread(h3_prompts_load)
+        store = _H3_PROMPTS_MEM[0] or {}
+        if any(b["id"] not in (store.get("seeded") or []) for b in H3_PROMPTS_BASE):
+            await asyncio.to_thread(h3_prompts_change, h3_prompts_seed_base)        # [h3-base]
     except Exception as exc:  # noqa: BLE001
         pipeline_log("ads", "hourly H3 prompt presets not loaded (%s)" % type(exc).__name__)
 
@@ -241887,8 +243523,11 @@ function pineReplyGapFloor(clip) {
   const g = clip && clip.gap_before;
   if (!g || !pineReplyGapEndAt) return 0;
   const s = Number(g.s);
-  return (isFinite(s) && s >= 0)
-    ? pineReplyGapEndAt + s * 1000 + pineReplyGapBuild(clip) - pineReplyGapOverlap(clip) : 0;
+  if (!(isFinite(s) && s >= 0)) return 0;
+  /* [cards-free] an instant pause is words on words, whatever the cards do: the
+   * door already starts it on the last words, and the player must not hold it */
+  if (s <= 0) return pineReplyGapEndAt;
+  return pineReplyGapEndAt + s * 1000 + pineReplyGapBuild(clip) - pineReplyGapOverlap(clip);
 }
 /* [reply-gap:sting-overlap] the part of this card's buildup that runs during
  * the sting before it (the station stamped it; the words do not wait for it) */
@@ -274524,8 +276163,11 @@ function pineReplyGapFloor(clip) {
   const g = clip && clip.gap_before;
   if (!g || !pineReplyGapEndAt) return 0;
   const s = Number(g.s);
-  return (isFinite(s) && s >= 0)
-    ? pineReplyGapEndAt + s * 1000 + pineReplyGapBuild(clip) - pineReplyGapOverlap(clip) : 0;
+  if (!(isFinite(s) && s >= 0)) return 0;
+  /* [cards-free] an instant pause is words on words, whatever the cards do: the
+   * door already starts it on the last words, and the player must not hold it */
+  if (s <= 0) return pineReplyGapEndAt;
+  return pineReplyGapEndAt + s * 1000 + pineReplyGapBuild(clip) - pineReplyGapOverlap(clip);
 }
 /* [reply-gap:sting-overlap] the part of this card's buildup that runs during
  * the sting before it (the station stamped it; the words do not wait for it) */

@@ -63,7 +63,17 @@ def settings(seed):
     return system3.normalise_settings({"mode": "active", "test_seed": seed})
 
 
+def old_middle(cfg):
+    """[s3-callarc] The call's arc and detour switched off: the middle leg fills the budget
+    and the call plans exactly the draws it planned before them."""
+    for t in cfg["tables"]:
+        if t["family"] in ("CALLARC", "CALLSHIFT"):
+            t["enabled"] = False
+    return cfg
+
+
 def no_events(cfg):
+    old_middle(cfg)                     # [s3-callarc] these tests are about the call's END
     for t in cfg["tables"]:
         if t["family"] == "EVENT":
             for c in t["categories"]:
@@ -465,7 +475,7 @@ class RuntimeTests(unittest.TestCase):
         cfg["tables"] = [t for t in cfg["tables"] if t["family"] not in ("RESOLVE", "WRAP")]
         cfg["defaults_added"] = [x for x in cfg.get("defaults_added") or [] if x not in ("RESOLVE1", "WRAP1")]
         rt.config = cfg
-        self.assertEqual(sorted(rt.add_missing_default_tables()), ["RESOLVE1", "WRAP1"])
+        self.assertEqual(sorted(rt.add_missing_default_tables()), ["RESOLVE1", "RESOLVE2", "RESOLVE3", "WRAP1"])   # [paint-roulette] RESOLVE3 joins
 
     def test_the_wiring_is_in_the_desk(self):
         from pathlib import Path

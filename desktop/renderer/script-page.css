@@ -4639,3 +4639,7 @@ html.pine-tech-wide .sp-tech.sp-tech-wide .wc-strip {
 .sp-rrp-prompt-unused { border-left-color: #6f8291; color: #b9c6ce; }
 .sp-rrp-prompt-row { margin: 2px 0 0; padding: 6px 10px; background: #0b1116; color: #b9c6ce; font: 12px/1.5 ui-monospace, Consolas, monospace; white-space: pre-wrap; max-height: 30vh; overflow-y: auto; }
 .sp-rrp-prompt-row mark { background: rgba(101, 199, 218, .28); color: #edf3f5; border-radius: 2px; }
+/* [cards-free] the cards' hold: off (the default) the dialogue runs at the pause alone */
+.sp-gap-hold { flex: none; min-height: 22px; padding: 0 7px; border: 1px solid #35505c; border-radius: 11px; background: transparent;
+  color: #7f929b; font: 11px/1 inherit; cursor: pointer; }
+.sp-gap-hold[aria-pressed="true"] { background: #4a3a14; border-color: #e3be63; color: #f3dfa6; }

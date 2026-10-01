@@ -267,13 +267,15 @@ class PageDoor(unittest.TestCase):
 
 
 class Buildup(unittest.TestCase):
-    """[reply-gap:buildup] pause, then the card's whole Rolodex, then the words."""
+    """[reply-gap:buildup] pause, then the card's whole Rolodex, then the words -
+    [cards-free] now the operator's choice (cards_hold on); off, nothing waits."""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         rg.use_path(Path(self.tmp.name) / "g.json")
         rg._BOOKED.update(until=0.0, tail=0.0)
         self._line = rg.buildup_of_line
+        rg.save({"cards_hold": True})
 
     def tearDown(self):
         rg.buildup_of_line = self._line
@@ -521,7 +523,8 @@ class Instant(unittest.TestCase):
                "broadcast_ms": int(air * 1000)}
         start = rg.door(nxt, air, air - 20.0, build_of=lambda c: 6000)
         self.assertAlmostEqual(start, air - 0.9, places=2)
-        self.assertEqual(nxt["buildup_ms"], 6000, "the card still builds - under the line before")
+        self.assertEqual(nxt["card_ms"], 6000, "the card still builds - under the line before")
+        self.assertEqual(nxt["buildup_ms"], 0, "and the air waits for none of it")
 
     def test_a_burst_has_no_seams(self):
         rg.save({"gap": 0, "roll": False})
@@ -531,7 +534,8 @@ class Instant(unittest.TestCase):
         transcript = [("dj", "a", 3), ("cohost", "b", 3), ("dj", "c", 3)]
         out, notes = rg.burst([0.1, 0.1, 0.0], [0, 1, 2], [0, 1, 2], transcript, items)
         self.assertEqual(out, [0.0, 0.0, 0.0])
-        self.assertEqual(notes[0]["buildup_ms"], 4000)
+        self.assertEqual(notes[0]["card_ms"], 4000)
+        self.assertEqual(notes[0]["buildup_ms"], 0)
 
     def test_the_planner_prices_an_instant_seam_at_nothing(self):
         rg.save({"gap": 0, "roll": False})
@@ -542,3 +546,69 @@ class Instant(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CardsFree(unittest.TestCase):
+    """[cards-free] "I want the feed to play out every animation for every piece of
+    conversation that happens, but I don't want it affecting the actual dialogue ...
+    if the pause between replies is instant ... they talk one after another ... rapid
+    fire." Off by default: the cards play out beside the dialogue, never ahead of it."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        rg.use_path(Path(self.tmp.name) / "g.json")
+        rg._BOOKED.update(until=0.0, tail=0.0)
+        self._line = rg.buildup_of_line
+        rg.buildup_of_line = lambda meta, who, text: 5000
+
+    def tearDown(self):
+        rg.buildup_of_line = self._line
+        rg.use_path(None)
+        self.tmp.cleanup()
+
+    def test_off_by_default(self):
+        self.assertFalse(rg.settings()["cards_hold"])
+        self.assertFalse(rg.cards_hold())
+        self.assertFalse(rg.state()["cards_hold"])
+
+    def test_a_seam_is_the_pause_alone_at_any_setting(self):
+        for gap in (0.0, 0.5, 2.0):
+            rg.save({"gap": gap, "roll": False})
+            items = [{"who": "dj", "turn_end": True}, {"who": "cohost", "turn_end": True}]
+            out, notes = rg.burst([0.1, 0.0], [0, 1], [0, 1], [("dj", "a", 3), ("cohost", "b", 3)], items)
+            self.assertAlmostEqual(out[0], gap)
+            self.assertEqual(notes[0]["card_ms"], 5000)     # the card is still published for the feed
+            self.assertEqual(notes["first_buildup"]["buildup_ms"], 0)
+            self.assertEqual(rg.planner_seam(), gap)
+
+    def test_the_door_never_holds_a_clip_for_its_card(self):
+        rg.save({"gap": 0.5, "roll": False})
+        air = time.time() + 30.0
+        rg.booked({"tail_s": 0.0}, air)
+        nxt = {"url": "/media/" + "f" * 32 + ".wav", "text": "next", "speech": True,
+               "broadcast_ms": int(air * 1000)}
+        start = rg.door(nxt, air, air - 20.0, build_of=lambda c: 8000)
+        self.assertAlmostEqual(start, air + 0.5, places=2)       # the pause, nothing more
+        self.assertEqual(nxt["card_ms"], 8000)
+        self.assertEqual(nxt["buildup_ms"], 0)
+
+    def test_a_quiet_air_starts_now_not_after_the_card(self):
+        rg.save({"gap": 1.0, "roll": False})
+        rg._BOOKED.update(until=0.0, tail=0.0)
+        now = time.time()
+        clip = {"url": "/media/" + "a" * 32 + ".wav", "text": "first", "speech": True,
+                "broadcast_ms": int((now + 0.5) * 1000)}
+        start = rg.door(clip, now - 120.0, now + 0.5, build_of=lambda c: 9000)
+        self.assertLess(start, now + 1.0)                          # no build, no 3 s learn
+
+    def test_turned_on_it_is_yesterdays_hold(self):
+        rg.save({"gap": 1.0, "roll": False, "cards_hold": True})
+        self.assertTrue(rg.cards_hold())
+        was = rg.expected_buildup_s
+        rg.expected_buildup_s = lambda: 2.0          # the measured mean is history; pin it
+        try:
+            self.assertEqual(rg.planner_seam(), 3.0)
+            rg.save({"cards_hold": False})
+            self.assertEqual(rg.planner_seam(), 1.0)
+        finally:
+            rg.expected_buildup_s = was

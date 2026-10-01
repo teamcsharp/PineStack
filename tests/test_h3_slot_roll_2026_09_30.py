@@ -10,10 +10,14 @@ JS = (ROOT / "desktop" / "renderer" / "ad-viewer.js").read_text(encoding="utf-8"
 
 class Slots(unittest.TestCase):
     def test_the_slot_pattern(self):
-        rx = re.compile(r"\{(speakerbox|[^{}|\n]+(?:\|[^{}|\n]+)+)\}")
-        self.assertIn('H3_SLOT_RX = re.compile(r"\\{(speakerbox|[^{}|\\n]+(?:\\|[^{}|\\n]+)+)\\}")', SRC)
-        found = [m.group(1) for m in rx.finditer("tune in {speakerbox} - {red|blue} for {station} and {conversation}")]
-        self.assertEqual(found, ["speakerbox", "red|blue"])          # the station's own slots are left alone
+        # [h3-slots] 2026-10-01: the named slots ({mxtape} ... {arena2}) joined the pattern
+        names = r"(?:mxtape|fordtape|videos|sfxclip|convograph|gazette|arena)\d?"
+        rx = re.compile(r"\{(speakerbox|" + names + r"|[^{}|\n]+(?:\|[^{}|\n]+)+)\}")
+        self.assertIn('H3_SLOT_NAMES = r"' + names + '"', SRC)
+        self.assertIn('H3_SLOT_RX = re.compile(r"\\{(speakerbox|" + H3_SLOT_NAMES + r"|[^{}|\\n]+(?:\\|[^{}|\\n]+)+)\\}")', SRC)
+        found = [m.group(1) for m in rx.finditer("tune in {speakerbox} - {red|blue} for {station} and {conversation} "
+                                                 "in {arena2}")]
+        self.assertEqual(found, ["speakerbox", "red|blue", "arena2"])   # the station's own slots are left alone
 
     def test_the_rolls_are_system3s_and_ride_the_hour(self):
         for key in ('"h3.slot_doc"', '"h3.slot_sentence"', '"h3.slot_choice"'):

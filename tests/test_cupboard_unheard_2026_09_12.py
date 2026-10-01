@@ -72,6 +72,23 @@ class CupboardWhy(unittest.TestCase):
         self.assertIn("no_slot", codes)
         self.assertIn("4d", got["say"] + str(got["waited"]) or "")
 
+    def test_a_row_the_air_refuses_is_never_called_fine(self):
+        """[door-why] 2026-10-01: 32 manager rounds read "nothing is wrong
+        with it" while the sweep counted 0 of 72 ready. When the air's gate
+        says no, the desk names the gate."""
+        r = row(age_h=40.0)
+        with mock.patch.object(app, "dialogue_audio_ready", lambda k, x: True), \
+                mock.patch.object(app, "shelf_rows", lambda k: [r]), \
+                mock.patch.object(app, "s3_binding_withheld",
+                                  lambda e: "round withheld without bound roulette turns"):
+            got = app.cupboard_why_row("manager", r)
+        self.assertFalse(got["ready"])
+        self.assertTrue(got["blocked"])
+        codes = [x["code"] for x in got["reasons"]]
+        self.assertIn("not_ready", codes)
+        self.assertNotIn("never_asked_for", codes)
+        self.assertIn("System 3", got["say"])
+
     def test_off_brief_is_blocked_and_never_says_nobody_asked(self):
         """A row the air will never take must not be described as merely
         unlucky. Both halves matter: the operator decides what to remove
@@ -630,3 +647,44 @@ class ConsumerCadenceReport(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RoadBackoff(unittest.TestCase):
+    """[road-backoff] 2026-10-01: 55 rescue walks, 53 refused adverts, 0
+    airings - one road the booth keeps refusing must not starve the rest."""
+
+    def setUp(self):
+        app._UNHEARD_ROAD_OUT.clear()
+        app._UNHEARD_REFUSED.clear()
+        self.addCleanup(app._UNHEARD_ROAD_OUT.clear)
+
+    def pick(self, shelves):
+        with mock.patch.object(app, "shelf_rows", lambda k: shelves.get(k, [])), \
+                mock.patch.object(app, "dialogue_row_ready", lambda k, r: True), \
+                mock.patch.object(app, "cupboard_cued", lambda: []), \
+                mock.patch.object(app, "cupboard_unheard_after", lambda: 7200.0):
+            return app.unheard_pick()
+
+    def test_two_refusals_in_a_row_stand_the_road_aside(self):
+        ads = [row("ad", age_h=90.0 - i) for i in range(5)]
+        memo = row("manager", age_h=10.0)
+        shelves = {"ad": ads, "manager": [memo]}
+        self.assertEqual(self.pick(shelves)[0], "ad")
+        app.unheard_road_refused("ad", "the booth did not put it out")
+        self.assertFalse(app.unheard_road_out("ad"))        # one is not a pattern
+        app.unheard_road_refused("ad", "the booth did not put it out")
+        self.assertTrue(app.unheard_road_out("ad"))
+        kind, got, _ = self.pick(shelves)
+        self.assertEqual(kind, "manager")
+        self.assertIs(got, memo)
+
+    def test_an_airing_puts_the_road_back(self):
+        app.unheard_road_refused("ad", "x")
+        app.unheard_road_refused("ad", "x")
+        app.unheard_road_aired("ad")
+        self.assertFalse(app.unheard_road_out("ad"))
+
+    def test_the_rest_runs_out(self):
+        app.unheard_road_refused("ad", "x")
+        app.unheard_road_refused("ad", "x")
+        self.assertFalse(app.unheard_road_out("ad", time.time() + app.UNHEARD_ROAD_REST + 1))

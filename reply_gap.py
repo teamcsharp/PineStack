@@ -124,9 +124,16 @@ def normalise(raw: Any) -> dict[str, Any]:
     roll = raw.get("roll", False)
     if isinstance(roll, str):
         roll = roll.strip().lower() in ("1", "true", "on", "yes")
+    hold = raw.get("cards_hold", False)
+    if isinstance(hold, str):
+        hold = hold.strip().lower() in ("1", "true", "on", "yes")
     return {"gap": clamp_gap(raw.get("gap", GAP_DEFAULT)),
             "range": clamp_range(raw.get("range", RANGE_DEFAULT)),
             "roll": bool(roll),
+            # [cards-free] off: the feed's cards never hold the air - the dialogue plays at
+            # the pause alone and every card plays out beside it. On: [reply-gap:buildup]'s
+            # pause, then the card's whole Rolodex, then the words.
+            "cards_hold": bool(hold),
             "at": _num(raw.get("at", 0), 0.0),
             "by": str(raw.get("by") or "")[:40]}
 
@@ -192,7 +199,7 @@ def save(changes: Any, by: str = "") -> dict[str, Any]:
     with _LOCK:
         cur = settings()
         merged = dict(cur)
-        for key in ("gap", "range", "roll"):
+        for key in ("gap", "range", "roll", "cards_hold"):
             if key in changes:
                 merged[key] = changes[key]
         merged["at"] = time.time()
@@ -206,6 +213,23 @@ def save(changes: Any, by: str = "") -> dict[str, Any]:
             tmp.replace(path)
         _STATE["settings"] = got
         return dict(got)
+
+
+def cards_hold() -> bool:
+    """[cards-free] Do the feed's cards hold the air while they build?
+
+    "I want the feed to play out every animation for every piece of
+    conversation that happens, but I don't want it affecting the actual
+    dialogue that's playing. I need the dialogue able to play at whatever
+    speed and interval we have set it to ... if the pause between replies is
+    instant ... they talk one after another ... rapid fire."
+                                                    - the operator, 2026-10-01
+    Off by default: a seam is the pause and nothing else; a card's build time is
+    published as `card_ms` for the feed to play out, never as a hold."""
+    try:
+        return bool(settings().get("cards_hold", False))
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def expected_gap() -> float:
@@ -222,6 +246,7 @@ def state(recent: int = 12) -> dict[str, Any]:
     s = settings()
     lo, hi = window(s)
     return {"ok": True, "gap": s["gap"], "range": s["range"], "roll": s["roll"],
+            "cards_hold": s.get("cards_hold", False),                  # [cards-free]
             "lo": lo, "hi": hi, "expected": expected(s),
             "updated_at": s["at"], "by": s["by"],
             "bounds": {"gap": [GAP_MIN, GAP_MAX], "range": [RANGE_MIN, RANGE_MAX],
@@ -411,10 +436,11 @@ def burst(beats: list, seg_ix: list, turn_ix: list, transcript: list, items: lis
     # (the page door holds the clip that long); every later reply's inside
     # the seam before it, after the pause
     try:
-        notes["first_buildup"] = {"buildup_ms": buildup_of_line(
-            meta, str(transcript[0][0] or ""), str(transcript[0][1] or ""))} if transcript else {"buildup_ms": 0}
+        _fb = buildup_of_line(meta, str(transcript[0][0] or ""), str(transcript[0][1] or "")) if transcript else 0
     except (IndexError, TypeError):
-        notes["first_buildup"] = {"buildup_ms": 0}
+        _fb = 0
+    # [cards-free] the first card is played out beside its words, not before them
+    notes["first_buildup"] = {"buildup_ms": int(_fb) if cards_hold() else 0, "card_ms": int(_fb)}
     for r, slot in enumerate(list(seg_ix or [])):
         slot = int(slot)
         if not flags.get(slot):
@@ -452,10 +478,13 @@ def burst(beats: list, seg_ix: list, turn_ix: list, transcript: list, items: lis
                     nb = buildup_of_line(meta, nxt, str(transcript[r + 1][1] or ""))
                 except (IndexError, TypeError):
                     nb = 0
-            note["buildup_ms"] = int(nb)
+            note["card_ms"] = int(nb)
+            hold = cards_hold()
+            note["buildup_ms"] = int(nb) if hold else 0          # [cards-free] what the air waits for
             # [reply-gap:instant] a 0 pause: the card builds under the line
-            # before it, and the seam is no seam at all
-            out[slot] = round(float(note["s"]) + (nb / 1000.0 if float(note["s"]) > 0 else 0.0), 3)
+            # before it, and the seam is no seam at all; [cards-free] and with the
+            # cards free, a seam is the pause alone at any setting
+            out[slot] = round(float(note["s"]) + (nb / 1000.0 if float(note["s"]) > 0 and hold else 0.0), 3)
             notes[slot] = note
     return out, notes
 
@@ -483,6 +512,7 @@ def stamp_rows(rows: list, seg_ix: list, notes: dict) -> None:
     first = notes.get("first_buildup")
     if isinstance(first, dict) and isinstance(rows[0], dict):
         rows[0]["buildup_ms"] = int(first.get("buildup_ms") or 0)   # [reply-gap:buildup]
+        rows[0]["card_ms"] = int(first.get("card_ms") or first.get("buildup_ms") or 0)   # [cards-free]
     for r, row in enumerate(rows):
         try:
             slot = int(seg_ix[r])
@@ -494,7 +524,7 @@ def stamp_rows(rows: list, seg_ix: list, notes: dict) -> None:
             note, inside = notes["carry"], False
         if not isinstance(note, dict) or not isinstance(row, dict):
             continue
-        row["gap"] = {k: note[k] for k in ("s", "rolled", "dice", "lo", "hi", "by", "id", "buildup_ms")
+        row["gap"] = {k: note[k] for k in ("s", "rolled", "dice", "lo", "hi", "by", "id", "buildup_ms", "card_ms")
                       if k in note}
         nb = int(note.get("buildup_ms") or 0)
         # [reply-gap:buildup] the seam in the file is the pause AND the next
@@ -502,6 +532,7 @@ def stamp_rows(rows: list, seg_ix: list, notes: dict) -> None:
         row["gap"]["inside"] = round(float(note["s"]) + nb / 1000.0, 3) if inside else 0.0
         if inside and r + 1 < len(rows) and isinstance(rows[r + 1], dict):
             rows[r + 1]["buildup_ms"] = nb
+            rows[r + 1]["card_ms"] = int(note.get("card_ms") or nb)          # [cards-free]
 
 
 def carry_seconds(notes: dict, length: Any, rows: list) -> float:
@@ -832,7 +863,7 @@ def planner_seam() -> float:
     gap = expected_gap()
     if gap <= 0:
         return 0.0
-    return round(gap + expected_buildup_s(), 3)
+    return round(gap + (expected_buildup_s() if cards_hold() else 0.0), 3)   # [cards-free]
 
 
 def contract() -> dict[str, Any]:
@@ -900,7 +931,11 @@ def door(clip: Any, air_until: float, earliest: float, tail_of: Any = None,
         # [reply-gap:buildup] the card's whole Rolodex plays before the words:
         # its length is in the schedule, and the page learns of the clip in
         # time to play all of it
-        build = int(buildup_of_clip(clip)) if build_of is None else int(build_of(clip) or 0)
+        card = int(buildup_of_clip(clip)) if build_of is None else int(build_of(clip) or 0)
+        # [cards-free] the card's length rides the clip for the feed (card_ms); the air
+        # waits for it only when the operator turned the cards' hold on
+        build = card if cards_hold() else 0
+        clip["card_ms"] = card
         clip["buildup_ms"] = build
         learn = (now + build / 1000.0 + PAGE_LEARN_S) if build else 0.0
         _LAST_DOOR.update(rows=id(((clip.get("stream") or {}).get("rows")) or clip), start=0.0)

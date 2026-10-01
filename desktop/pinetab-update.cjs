@@ -1,0 +1,297 @@
+/* [pinetab-update] THE TABLET BUTTON: is the PineTab out of date, and one press to
+ * find it, build it, install it and look after it.
+ *
+ * "Put an icon of a tablet here that represents updating the tablet. Have it pulse
+ * if the tablet is out of date ... if I click the button, have it locate the tablet
+ * and update the firmware with the latest version after compiling it, if there's a
+ * version that needs to be pushed ... any and all troubleshooting whenever it comes
+ * to the tablet."                                          - the operator, 2026-10-01
+ *
+ * OUT OF DATE means the APK on the tablet was built from different inputs than the
+ * source would build now: deploy.sh stamps every build (tools/pinetab-stamp.sh, the
+ * versionName 1.0.0+<stamp>), the kiosk says it in its user agent, and
+ * pinetab-stamp.cjs computes the stamp the source would get. The shared views ship
+ * INSIDE the APK, so a renderer change makes the tablet stale too.
+ *
+ * THE UPDATE is deploy.sh and nothing else - it is the only road that platform-signs
+ * (a debug-signed APK silently loses MODIFY_AUDIO_ROUTING and DUMP), verifies every
+ * asset, runs the read-only preflight and releases the replay encoder before the
+ * install ([venc-safe]). This module only finds the tablet, connects adb, stops the
+ * desk's own screenrecord first, runs the script through Git Bash with its output
+ * streamed to the button's panel ("pinetab-progress"), and checks the stamp after.
+ */
+'use strict';
+
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const { spawn, execFile } = require('child_process');
+const { stamp, stampOf } = require('./pinetab-stamp.cjs');
+
+const PKG = 'com.pinebox.kiosk';
+
+function exists(p) { try { return !!p && fs.existsSync(p); } catch (e) { return false; } }
+
+/* A Windows path as Git Bash takes it: \\host\share\x -> //host/share/x, C:\x -> /c/x */
+function bashPath(p) {
+  const s = String(p || '');
+  if (process.platform !== 'win32') return s;
+  if (s.startsWith('\\\\')) return '//' + s.slice(2).replace(/\\/g, '/');
+  const m = /^([A-Za-z]):[\\/](.*)$/.exec(s);
+  return m ? '/' + m[1].toLowerCase() + '/' + m[2].replace(/\\/g, '/') : s.replace(/\\/g, '/');
+}
+
+function findBash(configured) {
+  if (process.platform !== 'win32') return 'bash';
+  const local = process.env.LOCALAPPDATA || '';
+  const pf = process.env.ProgramFiles || 'C:\\Program Files';
+  for (const p of [configured, path.join(pf, 'Git', 'bin', 'bash.exe'), path.join(pf, 'Git', 'usr', 'bin', 'bash.exe'),
+    path.join(local, 'Programs', 'Git', 'bin', 'bash.exe'), 'C:\\_tools\\Git\\bin\\bash.exe']) {
+    if (exists(p)) return p;
+  }
+  return '';
+}
+
+/* deploy.sh's own adb first, so the button and the script talk to one server */
+function findAdb(configured, fallback) {
+  if (process.platform !== 'win32') return configured || 'adb';
+  for (const p of [configured, 'C:\\_tools\\android-sdk\\platform-tools\\adb.exe', fallback]) {
+    if (exists(p)) return p;
+  }
+  return fallback || 'adb.exe';
+}
+
+function run(exe, args, timeout) {
+  return new Promise((resolve) => {
+    execFile(exe, args, { timeout: timeout || 30000, maxBuffer: 16 * 1024 * 1024, windowsHide: true },
+      (error, stdout, stderr) => resolve({ ok: !error, code: error ? (error.code || 1) : 0,
+        text: String(stdout || '') + String(stderr || '') }));
+  });
+}
+
+class PinetabUpdate {
+  /* deps: agentRoot(), getJson(route), postJson(route, body), send(channel, data),
+   * glassStop(), wake(), readConfig(), adbFallback() */
+  constructor(deps) {
+    this.d = deps;
+    this.job = null;
+    this.last = null;
+  }
+
+  cfg() { try { return this.d.readConfig() || {}; } catch (e) { return {}; } }
+  adb() { return findAdb(this.cfg().pinetabAdb, this.d.adbFallback ? this.d.adbFallback() : ''); }
+  emit(step, line, state) {
+    const ev = { at: Date.now(), step: String(step || ''), line: String(line || ''), state: state || 'run' };
+    if (this.job) this.job.log.push(ev);
+    try { this.d.send('pinetab-progress', ev); } catch (e) { /* the window may be gone */ }
+  }
+
+  wanted() {
+    const root = this.d.agentRoot();
+    return stamp(root, path.join(root, 'desktop', 'renderer'));
+  }
+
+  async look() {
+    try { return await this.d.getJson('/api/tablet/look'); } catch (e) { return { why: e.message }; }
+  }
+
+  async installedByAdb(dev) {
+    const got = await run(this.adb(), ['-s', dev, 'shell', 'dumpsys', 'package', PKG], 20000);
+    const m = /versionName=(\S+)/.exec(got.text);
+    return { name: m ? m[1] : '', stamp: stampOf(m ? 'versionName=' + m[1] : '') };
+  }
+
+  /* Is the tablet out of date? Cheap: the station's last sight of the kiosk (its user
+   * agent carries the stamp); adb only when asked. */
+  async check(opts) {
+    const out = { at: Date.now() };
+    try {
+      const w = this.wanted();
+      out.wanted = w.stamp;
+      out.files = w.files;
+    } catch (e) {
+      out.wanted = '';
+      out.why = 'the source could not be read: ' + e.message;
+    }
+    const look = await this.look();
+    out.host = look.host || '';
+    out.port = look.port || 5555;
+    out.on_network = !!look.on_network;
+    out.adb_open = !!(look.adb_port_open || (look.adb && look.adb.open));
+    const agent = (look.seen && look.seen.agent) || '';
+    out.installed = stampOf(agent);
+    out.via = out.installed ? 'its user agent' : '';
+    if (!out.installed && opts && opts.adb && out.host) {
+      const dev = out.host + ':' + out.port;
+      await run(this.adb(), ['connect', dev], 15000);
+      const got = await this.installedByAdb(dev);
+      out.installed = got.stamp;
+      out.installed_name = got.name;
+      out.via = got.name ? 'adb' : '';
+    }
+    out.stale = !!(out.wanted && out.installed !== out.wanted);
+    out.say = !out.wanted ? (out.why || 'cannot read the source')
+      : !out.installed ? 'the tablet\'s build carries no stamp yet - one update brings it in line'
+      : out.stale ? 'the tablet is on ' + out.installed + '; the source builds ' + out.wanted
+      : 'the tablet is up to date (' + out.installed + ')';
+    out.busy = !!(this.job && this.job.running);
+    this.last = out;
+    return out;
+  }
+
+  async locate() {
+    this.emit('locate', 'asking the station where the tablet is');
+    let look = await this.look();
+    if (!look.on_network) {
+      this.emit('locate', 'not where the station last saw it - sweeping the network');
+      try { await this.d.getJson('/api/tablet/find?deep=1'); } catch (e) { /* the look says what it found */ }
+      look = await this.look();
+    }
+    if (!look.host) throw new Error('the station does not know where the tablet is: ' + (look.why || look.verdict || 'no host'));
+    const dev = look.host + ':' + (look.port || 5555);
+    this.emit('locate', 'the tablet is at ' + dev + (look.verdict ? ' - ' + look.verdict : ''), 'ok');
+    this.emit('connect', 'connecting adb to ' + dev);
+    const c = await run(this.adb(), ['connect', dev], 20000);
+    this.emit('connect', c.text.trim() || (c.ok ? 'connected' : 'adb connect failed'));
+    const st = await run(this.adb(), ['-s', dev, 'get-state'], 10000);
+    if (st.text.trim() !== 'device') {
+      throw new Error('adb cannot reach the tablet (' + (st.text.trim() || 'no answer') + '). If it was rebooted, '
+        + 'wireless debugging may need enabling again over USB.');
+    }
+    this.emit('connect', 'adb has the tablet', 'ok');
+    return dev;
+  }
+
+  deploy(dev, mode) {
+    return new Promise((resolve) => {
+      const bash = findBash(this.cfg().gitBash);
+      if (!bash) {
+        this.emit('build', 'Git Bash was not found - deploy.sh needs it (set gitBash in the desk config)', 'fail');
+        return resolve(false);
+      }
+      const root = this.d.agentRoot();
+      const script = bashPath(path.join(root, 'deploy.sh'));
+      const args = [script].concat(mode === 'resign' ? ['--no-build'] : []);
+      this.emit('build', 'running deploy.sh' + (mode === 'resign' ? ' --no-build (re-sign and install)' : '')
+        + ' - building, platform-signing, verifying and installing');
+      const child = spawn(bash, args, { cwd: os.tmpdir(), windowsHide: true,
+        env: Object.assign({}, process.env, { PINE_TAB: dev }) });
+      this.job.child = child;
+      let step = 'build';
+      const take = (buf) => {
+        String(buf).split(/\r?\n/).forEach((line) => {
+          if (!line.trim()) return;
+          const head = /^== (.*)$/.exec(line);
+          if (head) { step = head[1].slice(0, 60); this.emit(step, line.slice(3), 'step'); return; }
+          this.emit(step, line, /REFUSING|FAILED|ERROR/.test(line) ? 'warn' : 'run');
+        });
+      };
+      child.stdout.on('data', take);
+      child.stderr.on('data', take);
+      child.on('error', (e) => { this.emit('build', 'deploy.sh could not start: ' + e.message, 'fail'); resolve(false); });
+      child.on('close', (code) => {
+        this.emit('build', code === 0 ? 'deploy.sh finished' : 'deploy.sh stopped (exit ' + code + ')', code === 0 ? 'ok' : 'fail');
+        resolve(code === 0);
+      });
+    });
+  }
+
+  /* mode: "update" (only if out of date), "force" (build and install regardless),
+   * "resign" (re-sign and install the APK already built) */
+  async update(mode) {
+    if (this.job && this.job.running) return { ok: false, why: 'an update is already running', log: this.job.log };
+    this.job = { running: true, started: Date.now(), log: [], mode: mode || 'update' };
+    const result = { ok: false, mode: this.job.mode };
+    try {
+      const wanted = this.wanted().stamp;
+      result.wanted = wanted;
+      this.emit('check', 'the source builds ' + wanted);
+      const dev = await this.locate();
+      const before = await this.installedByAdb(dev);
+      result.before = before.stamp || before.name;
+      this.emit('check', 'the tablet has ' + (before.name || 'no PineBox app'), 'ok');
+      if (this.job.mode === 'update' && before.stamp && before.stamp === wanted) {
+        this.emit('done', 'already up to date - nothing to build', 'ok');
+        result.ok = true;
+        result.skipped = true;
+        return result;
+      }
+      this.emit('release', 'stopping the desk mirror\'s screenrecord before the install (two encoders crash the tablet)');
+      try { await this.d.glassStop(); } catch (e) { /* nothing was recording */ }
+      if (!(await this.deploy(dev, this.job.mode))) {
+        result.why = 'deploy.sh did not finish - its last lines say why';
+        return result;
+      }
+      const after = await this.installedByAdb(dev);
+      result.after = after.stamp || after.name;
+      const good = this.job.mode === 'resign' ? !!after.name : after.stamp === wanted;
+      this.emit('verify', 'the tablet now has ' + (after.name || 'nothing') + (good ? '' : ' - not the build that was wanted'),
+        good ? 'ok' : 'warn');
+      try { await this.d.wake(); } catch (e) { /* the script woke it already */ }
+      result.ok = good;
+      this.emit('done', good ? 'the tablet is up to date' : 'finished, but the stamp does not match', good ? 'ok' : 'warn');
+      return result;
+    } catch (e) {
+      this.emit('fail', e.message, 'fail');
+      result.why = e.message;
+      return result;
+    } finally {
+      this.job.running = false;
+      this.job.result = result;
+    }
+  }
+
+  async preflight() {
+    const bash = findBash(this.cfg().gitBash);
+    if (!bash) return { ok: false, text: 'Git Bash was not found' };
+    let dev = '';
+    try { dev = await this.locate(); } catch (e) { return { ok: false, text: e.message }; }
+    return new Promise((resolve) => {
+      const script = bashPath(path.join(this.d.agentRoot(), 'tools', 'kiosk-preflight.sh'));
+      execFile(bash, [script], { cwd: os.tmpdir(), timeout: 120000, windowsHide: true,
+        env: Object.assign({}, process.env, { PINE_TAB: dev, ADB: bashPath(this.adb()) }) },
+      (error, stdout, stderr) => resolve({ ok: !error, text: String(stdout || '') + String(stderr || '') }));
+    });
+  }
+
+  /* The troubleshooting ladder, one place: the station's own doctor and adb. */
+  async action(name) {
+    const n = String(name || '');
+    try {
+      if (n === 'look') return { ok: true, look: await this.look() };
+      if (n === 'find') return { ok: true, found: await this.d.getJson('/api/tablet/find?deep=1') };
+      if (['sweep', 'adopt', 'wake-station', 'ping'].indexOf(n) >= 0) {
+        return { ok: true, got: await this.d.postJson('/api/tablet/doctor/' + n.replace('-station', ''), {}) };
+      }
+      if (n === 'connect') return { ok: true, dev: await this.locate() };
+      if (n === 'wake') return await this.d.wake();
+      const dev = await this.locate();
+      if (n === 'reboot') return await run(this.adb(), ['-s', dev, 'reboot'], 20000);
+      if (n === 'restart-app') {
+        await run(this.adb(), ['-s', dev, 'shell', 'am', 'force-stop', PKG], 15000);
+        return await run(this.adb(), ['-s', dev, 'shell', 'monkey', '-p', PKG, '-c', 'android.intent.category.LAUNCHER', '1'], 15000);
+      }
+      if (n === 'grant') {
+        await run(this.adb(), ['-s', dev, 'shell', 'pm', 'grant', PKG, 'android.permission.RECORD_AUDIO'], 15000);
+        await run(this.adb(), ['-s', dev, 'shell', 'pm', 'grant', PKG, 'android.permission.CAMERA'], 15000);
+        return await run(this.adb(), ['-s', dev, 'shell', 'dumpsys', 'package', PKG], 20000);
+      }
+      if (n === 'version') return { ok: true, installed: await this.installedByAdb(dev), wanted: this.wanted().stamp };
+      return { ok: false, why: 'no such action: ' + n };
+    } catch (e) {
+      return { ok: false, why: e.message };
+    }
+  }
+
+  install(ipcMain) {
+    ipcMain.handle('pinetab:check', (_e, opts) => this.check(opts || {}));
+    ipcMain.handle('pinetab:update', (_e, mode) => this.update(mode));
+    ipcMain.handle('pinetab:preflight', () => this.preflight());
+    ipcMain.handle('pinetab:action', (_e, name) => this.action(name));
+    ipcMain.handle('pinetab:job', () => (this.job ? { running: this.job.running, mode: this.job.mode,
+      log: this.job.log.slice(-400), result: this.job.result || null } : null));
+    return this;
+  }
+}
+
+module.exports = { PinetabUpdate, bashPath, findBash, findAdb };

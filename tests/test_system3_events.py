@@ -28,6 +28,9 @@ def event_config(odds=None, roads=None, max_events=None):
         t["roads"] = roads
     if max_events is not None:
         t["max_events"] = max_events
+    for other in cfg["tables"]:                 # [s3-callarc] the events are tested on the old middle
+        if other["family"] in ("CALLARC", "CALLSHIFT"):
+            other["enabled"] = False
     return cfg
 
 

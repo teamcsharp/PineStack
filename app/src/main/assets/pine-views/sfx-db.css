@@ -12,6 +12,7 @@
 .sdb-head > .sdb-ico { width: 20px; height: 20px; }
 .sdb-title { display: flex; align-items: baseline; gap: 10px; min-width: 0; flex-wrap: wrap; }
 .sdb-title b { font-size: 16px; }
+.sdb-head .sdb-switch { margin-left: auto; flex: none; white-space: nowrap; }
 .sdb-count { color: #8fa0ad; font-size: 12px; overflow-wrap: anywhere; }
 
 .sdb-bar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
@@ -87,6 +88,8 @@
 .sdb-detail > td { background: #0a161d; }
 .sdb-entry { display: grid; grid-template-columns: minmax(240px, 360px) 1fr; gap: 16px; padding: 6px 2px 10px; }
 .sdb-media video, .sdb-media audio { width: 100%; border-radius: 6px; background: #000; }
+.sdb-gone { display: flex; flex-direction: column; gap: 6px; padding: 18px; border-radius: 6px; background: #000; color: #f0b3ab; overflow-wrap: anywhere; }
+.sdb-gone span { color: #9aa4ad; font-size: 12px; }
 .sdb-acts { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
 .sdb-weight { display: flex; align-items: center; gap: 8px; width: 100%; color: #8fa0ad; font-size: 12px; }
 .sdb-weight input { flex: 1; }

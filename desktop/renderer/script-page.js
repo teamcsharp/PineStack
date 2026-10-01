@@ -23555,6 +23555,29 @@
       s3Buttons[mode] = b;
       restore.appendChild(b);
     });
+    /* [flowchart] "a button that I can press that toggles between showing the
+       script view and showing the technical flowchart view" - the conversation
+       as a conditional flowchart, growing as it airs (flow-chart.js) */
+    var flowLabel = 'Flowchart view: this conversation\'s dice, roulette and turns as a growing flowchart';
+    var flowBtn = make('button', 'sp-band-reopen sp-band-always sp-flow-toggle');
+    flowBtn.type = 'button';
+    flowBtn.title = flowLabel;
+    flowBtn.setAttribute('aria-label', flowLabel);
+    flowBtn.setAttribute('aria-pressed', 'false');
+    flowBtn.innerHTML = folderIcon('c:decision-tree', flowLabel) || 'F';
+    restore.appendChild(flowBtn);
+    /* [speech-gates] "where is the panel for that? i need to be able to edit any
+       gate for speech by the station" - every gate, one tap from the script */
+    var gatesLabel = 'Speech gates: every check that can refuse the station\'s speech - edit them here';
+    var gatesBtn = make('button', 'sp-band-reopen sp-band-always sp-gates-open');
+    gatesBtn.type = 'button';
+    gatesBtn.title = gatesLabel;
+    gatesBtn.setAttribute('aria-label', gatesLabel);
+    gatesBtn.innerHTML = folderIcon('c:settings--adjust', gatesLabel) || 'G';
+    gatesBtn.addEventListener('click', function () {
+      if (root.PineSpeechGates) root.PineSpeechGates.open();
+    });
+    restore.appendChild(gatesBtn);
     /* [reply-gap] the pause between replies, its roulette and its dice:
        right of the chat icon, across the rest of the row. */
     restore.appendChild(gapBar());
@@ -23628,6 +23651,20 @@
       if (chip) chip.classList.toggle('adrift', !follow);
     });
     right.appendChild(script);
+    /* [flowchart] the pane the toggle swaps in for the script */
+    var flowPane = make('div', 'sp-flow');
+    flowPane.id = 'spFlow';
+    flowPane.hidden = true;
+    right.appendChild(flowPane);
+    flowBtn.addEventListener('click', function () {
+      var on = flowPane.hidden;
+      if (on && s3Mode !== 'script') s3SetMode('script');
+      flowPane.hidden = !on;
+      script.hidden = on;
+      flowBtn.setAttribute('aria-pressed', String(on));
+      if (root.PineFlowChart) root.PineFlowChart.show(flowPane, on);
+      else if (on) flowPane.textContent = 'The flowchart did not load.';
+    });
     /* System 3's views, over the script in the script's own cell. */
     var s3Pane = make('div', 'sp-s3');
     s3Pane.id = 'spS3';
@@ -23937,6 +23974,12 @@
       gapUi.ic.classList.toggle('sp-gap-ic-on', !!s.roll);
     }
     gapUi.wrap.classList.toggle('sp-gap-on', !!s.roll);
+    if (gapUi.hold) {                                  /* [cards-free] */
+      gapUi.hold.setAttribute('aria-pressed', s.cards_hold ? 'true' : 'false');
+      gapUi.hold.title = s.cards_hold
+        ? 'Cards hold the air: each line waits for its card to build first. Tap to let the dialogue run free.'
+        : 'Dialogue runs free: the pause alone sets the pace and every card plays out beside it. Tap to make lines wait for their cards.';
+    }
     var dieTip = !s.roll ? 'The dice: the roulette is off. Turn it on and each reply\'s pause is rolled here.'
       : gapLast ? 'Last roll: d100 ' + gapLast.dice + ' - ' + gapFmt(gapLast.s) + ' before the next reply (range '
         + gapNum(gapLast.lo, w[0]).toFixed(1) + ' - ' + gapNum(gapLast.hi, w[1]).toFixed(1) + ' s). Tap to see it roll again.'
@@ -23951,7 +23994,8 @@
     if (!got || typeof got !== 'object' || got.gap === undefined) return;
     if (Date.now() < gapHeldUntil) return;               /* the hand wins */
     gapState = {gap: gapClamp(got.gap, GAP_MIN, GAP_MAX, 1),
-      range: gapClamp(got.range, GAP_RANGE_MIN, GAP_RANGE_MAX, 1), roll: !!got.roll};
+      range: gapClamp(got.range, GAP_RANGE_MIN, GAP_RANGE_MAX, 1), roll: !!got.roll,
+      cards_hold: !!got.cards_hold};                   /* [cards-free] */
     /* [reply-gap:dice] the square lands only on a pause this panel saw roll -
        a receipt from another road, painted still, read as a dead die */
     if (!gapState.roll) { gapCountStop(); gapIdle(); }
@@ -23973,6 +24017,7 @@
       gapSendTimer = 0;
       if (!api().post) return;
       var body = {gap: gapState.gap, range: gapState.range, roll: !!gapState.roll,
+        cards_hold: !!gapState.cards_hold,            /* [cards-free] */
         by: root.__pineNative ? 'tablet' : 'desk'};
       Promise.resolve(api().post('/api/reply-gap', body)).then(function (got) {
         if (gapUi) gapUi.wrap.classList.remove('sp-gap-unsaved');
@@ -24463,8 +24508,23 @@
     wrap.appendChild(sw);
     wrap.appendChild(diebox);
     wrap.appendChild(rowbar);
+    /* [cards-free] "I want the feed to play out every animation ... but I don't
+       want it affecting the actual dialogue": off, the pause alone paces the
+       dialogue; on, each line waits for its card's whole build first */
+    var hold = make('button', 'sp-gap-hold', 'cards');
+    hold.type = 'button';
+    hold.setAttribute('aria-pressed', 'false');
+    hold.addEventListener('pointerdown', function (ev) { ev.stopPropagation(); });
+    hold.addEventListener('click', function (ev) {
+      ev.stopPropagation();
+      gapHeldUntil = Date.now() + 4000;
+      gapState.cards_hold = !gapState.cards_hold;
+      gapPaint();
+      gapSend(true);
+    });
+    wrap.appendChild(hold);
     gapUi = {wrap: wrap, dual: dual, track: track, span: span, a: a, b: b, val: val,
-      sw: sw, die: die, reel: reel, count: count, rowbar: rowbar};
+      sw: sw, die: die, reel: reel, count: count, rowbar: rowbar, hold: hold};
     gapDualWire(track, a, b);
     gapBigWire(dual);                                        /* [reply-gap:big] */
     /* [reply-gap:ictoggle] "Make it where tapping on this icon does the job of
@@ -24535,6 +24595,9 @@
           flow.talk_next_in = state.talk_next_in;
         }
         stationPaused = !!state.paused;
+        /* [prod-feed] while paused, the panel above the feed shows what the
+           backend is banking: System 3's rolls, the emotion engine, each step */
+        try { if (root.PineProductionFeed) root.PineProductionFeed.paused(stationPaused); } catch (e) { /* optional */ }
         /* #1336: THE COMMITTED SEQUENCE. `admission` is the playout
            controller's own record of what it admitted, in the order it
            admitted it. Absent on a station that has not been patched yet,

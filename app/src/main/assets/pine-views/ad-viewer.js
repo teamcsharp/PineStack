@@ -92,7 +92,11 @@
   var ROLL_ROWS = [['host', 'host'], ['source', 'source'], ['fresh', 'fresh pick'], ['marker', 'window marker'],
     ['speak_lean', 'dialogue kind'], ['speak_line', 'line said on air'], ['speak_doc', 'speakerbox document'],
     ['speak_count', 'sentences to take'], ['speak_sentences', 'sentences'], ['speak_forced', 'forced line'],
-    ['slot_doc', '{speakerbox} document'], ['slot_sentence', '{speakerbox} sentence'], ['slot_choice', '{choice}']];
+    ['slot_doc', '{speakerbox} document'], ['slot_sentence', '{speakerbox} sentence'], ['slot_choice', '{choice}'],
+    /* [h3-overview] the technical overview's own dice */
+    ['ov_feature', 'feature presented'], ['ov_presenter', 'presenter'], ['ov_count', 'how many actions'],
+    ['ov_action', 'actions'], ['ov_gallery', 'gallery picture carried'], ['ov_dialogue', 'DJ line on the billboard'],
+    ['ov_system', 'system prompt']];
   function rollRow(table, r) {
     if (!r || typeof r !== 'object' || r.dice == null) return null;
     var main;
@@ -128,6 +132,12 @@
     }
     var rolls = rec.rolls && typeof rec.rolls === 'object' ? rec.rolls : {};
     ROLL_ROWS.forEach(function (k) { var r = rollRow(k[1], rolls[k[0]]); if (r) rows.push(r); });
+    /* [h3-slots] each named slot's roll ({mxtape}, {arena2}...) and the screen it played on */
+    Object.keys(rolls).forEach(function (k) {
+      var m = /^slot_(screen_)?((mxtape|fordtape|videos|sfxclip|convograph|gazette|arena)\d?)$/.exec(k);
+      if (!m) return;
+      var r = rollRow(m[1] ? 'screen for {' + m[2] + '}' : '{' + m[2] + '}', rolls[k]); if (r) rows.push(r);
+    });
     return rows;
   }
   function roloStyle() {
@@ -354,17 +364,147 @@
       ['speech', 'Line spoken', 'input', 'blank: pulled out of the brief, as before'],
       ['style', 'Style', 'input', 'one style term - blank: the gear\'s brief, else a polished broadcast commercial'],
       ['audio_direction', 'Audio direction', 'input', 'blank: the gear\'s brief'],
-      ['constraints', 'Constraints', 'input', 'blank: the gear\'s brief']];
+      ['constraints', 'Constraints', 'input', 'blank: the gear\'s brief'],
+      /* [h3-overview] */
+      ['kind', 'Kind', 'input', 'blank: these words. overview: a technical overview at a whiteboard - a rolled changelog feature, pitched by the model']];
     var pInputs = {}, pLabels = {};
     P_FIELDS.forEach(function (f) {
       var label = make('label', 'pav-pr-field'), input = make(f[2]);
       if (f[2] === 'textarea') input.rows = f[0] === 'goal' ? 3 : 2; else input.type = 'text';
-      input.maxLength = f[0] === 'name' ? 60 : f[0] === 'goal' ? 1200 : f[2] === 'textarea' ? 1800 : f[0] === 'speech' ? 700 : f[0] === 'style' ? 120 : 400;
+      input.maxLength = f[0] === 'kind' ? 20 : f[0] === 'name' ? 60 : f[0] === 'goal' ? 1200 : f[2] === 'textarea' ? 1800 : f[0] === 'speech' ? 700 : f[0] === 'style' ? 120 : 400;
       input.setAttribute('aria-label', f[1]); input.addEventListener('input', paintEditState);
       var span = make('span', '', f[1]), hint = make('i', '', f[3]);
       label.append(span, hint, input); pForm.appendChild(label); pInputs[f[0]] = input;
       pLabels[f[0]] = {label: label, span: span, hint: hint, input: input};
     });
+    /* [h3-slots] "Whenever I use a bracketed term, I want to see auto correction
+       and suggestion showing potential options ... a drop down of options I can
+       choose from along with showing the tooltip of what that option means"
+       (the operator, 2026-10-01). Typing { opens the slots the station fills,
+       filtered as you type, the highlighted one explained underneath; arrows
+       move, Enter or Tab takes it, Escape closes. A {slot} the station does not
+       know is shown under the field with the nearest one, a tap to correct. */
+    var SLOT_FALLBACK = [
+      {slot: '{conversation}', name: 'conversation', says: 'The hour\'s talk.', example: ''},
+      {slot: '{record}', name: 'record', says: 'The record on air.', example: ''},
+      {slot: '{station}', name: 'station', says: 'The station\'s name.', example: ''}];
+    function slotList() { return (pView && Array.isArray(pView.slots) && pView.slots.length) ? pView.slots : SLOT_FALLBACK; }
+    function slotKnown(name) {
+      if (name.indexOf('|') >= 0) return true;
+      var bare = name.replace(/\d$/, '');
+      return slotList().some(function (s) { return s.name === name || (s.name === bare && /\d$/.test(name) && ['mxtape', 'fordtape', 'videos', 'sfxclip', 'convograph', 'gazette', 'arena'].indexOf(bare) >= 0); });
+    }
+    function slotDistance(a, b) {
+      var m = a.length, n = b.length, d = [], i, j;
+      for (i = 0; i <= m; i++) { d[i] = [i]; }
+      for (j = 1; j <= n; j++) d[0][j] = j;
+      for (i = 1; i <= m; i++) for (j = 1; j <= n; j++) {
+        d[i][j] = Math.min(d[i - 1][j] + 1, d[i][j - 1] + 1, d[i - 1][j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+      }
+      return d[m][n];
+    }
+    function slotNearest(name) {
+      var best = null, bestD = 99;
+      slotList().forEach(function (s) {
+        if (s.name.indexOf('|') >= 0) return;
+        var dd = slotDistance(name.toLowerCase(), s.name);
+        if (s.name.indexOf(name.toLowerCase()) === 0 || name.toLowerCase().indexOf(s.name) === 0) dd = Math.min(dd, 1);
+        if (dd < bestD) { bestD = dd; best = s; }
+      });
+      return best && bestD <= Math.max(2, Math.floor(name.length / 3)) ? best : null;
+    }
+    var slotBox = make('div', 'pav-slot-sug'); slotBox.hidden = true; slotBox.setAttribute('role', 'listbox');
+    var slotList_ = make('div', 'pav-slot-items'), slotTip = make('div', 'pav-slot-tip');
+    slotBox.append(slotList_, slotTip);
+    var slotUi = {input: null, items: [], at: 0, from: -1};
+    function slotHide() { slotBox.hidden = true; slotUi.input = null; slotUi.items = []; }
+    function slotPaintTip() {
+      var s = slotUi.items[slotUi.at];
+      slotTip.replaceChildren();
+      if (!s) return;
+      slotTip.appendChild(make('b', '', s.slot));
+      slotTip.appendChild(make('span', '', ' ' + (s.says || '')));
+      if (s.example) slotTip.appendChild(make('i', '', 'e.g. ' + s.example));
+      Array.prototype.forEach.call(slotList_.children, function (row, k) {
+        row.classList.toggle('on', k === slotUi.at); row.setAttribute('aria-selected', String(k === slotUi.at));
+        if (k === slotUi.at && row.scrollIntoView) row.scrollIntoView({block: 'nearest'});
+      });
+    }
+    function slotTake(k) {
+      var s = slotUi.items[k], input = slotUi.input;
+      if (!s || !input) return;
+      var caret = input.selectionStart, v = input.value;
+      var ins = s.name.indexOf('|') >= 0 ? '{a|b}' : s.slot;
+      input.value = v.slice(0, slotUi.from) + ins + v.slice(caret).replace(/^[A-Za-z0-9_]*\}?/, '');
+      var at = slotUi.from + (s.name.indexOf('|') >= 0 ? 1 : ins.length);
+      input.setSelectionRange(at, s.name.indexOf('|') >= 0 ? at + 3 : at);
+      slotHide(); input.focus();
+      input.dispatchEvent(new Event('input', {bubbles: true}));
+    }
+    function slotOpen(input) {
+      var caret = input.selectionStart == null ? input.value.length : input.selectionStart;
+      var before = input.value.slice(0, caret), m = /\{([A-Za-z0-9_|]*)$/.exec(before);
+      if (!m) { if (slotUi.input === input) slotHide(); return; }
+      var q = m[1].toLowerCase();
+      if (q.indexOf('|') >= 0) { if (slotUi.input === input) slotHide(); return; }   /* writing {a|b|c} options */
+      var items = slotList().filter(function (s) { return !q || s.name.indexOf(q) >= 0 || (s.says || '').toLowerCase().indexOf(q) >= 0; });
+      items.sort(function (a, b) { return (b.name.indexOf(q) === 0) - (a.name.indexOf(q) === 0); });
+      if (!items.length) { var near = slotNearest(q); items = near ? [near] : []; }
+      if (!items.length) { slotHide(); return; }
+      slotUi.input = input; slotUi.items = items; slotUi.at = 0; slotUi.from = caret - m[0].length;
+      slotList_.replaceChildren();
+      items.forEach(function (s, k) {
+        var row = make('div', 'pav-slot-item'); row.setAttribute('role', 'option'); row.title = s.says || '';
+        row.append(make('code', '', s.slot), make('span', '', s.says || ''));
+        row.addEventListener('mousedown', function (e) { e.preventDefault(); slotTake(k); });
+        row.addEventListener('mouseenter', function () { slotUi.at = k; slotPaintTip(); });
+        slotList_.appendChild(row);
+      });
+      input.parentNode.appendChild(slotBox);
+      slotBox.hidden = false; slotPaintTip();
+    }
+    function slotCheck(input) {
+      var fix = input._slotFix; if (!fix) return;
+      fix.replaceChildren();
+      var seen = {}, re = /\{([^{}\n]*)\}/g, m;
+      while ((m = re.exec(input.value))) {
+        var name = m[1];
+        if (!name || seen[name] || slotKnown(name)) continue;
+        seen[name] = 1;
+        var near = slotNearest(name), chip = make('button', 'pav-slot-fix');
+        chip.type = 'button';
+        chip.textContent = near ? '{' + name + '} → ' + near.slot : '{' + name + '} is not a slot the station fills';
+        chip.title = near ? 'Correct it: ' + (near.says || '') : 'Left as written, it is taken out before the prompt is sent.';
+        if (near) chip.addEventListener('click', (function (bad, good) { return function () {
+          input.value = input.value.split('{' + bad + '}').join(good.slot);
+          input.dispatchEvent(new Event('input', {bubbles: true}));
+        }; })(name, near));
+        fix.appendChild(chip);
+      }
+      fix.hidden = !fix.childNodes.length;
+    }
+    function slotAttach(input) {
+      var fix = make('div', 'pav-slot-fixes'); fix.hidden = true; input._slotFix = fix;
+      input.parentNode.appendChild(fix);
+      input.setAttribute('aria-autocomplete', 'list');
+      input.addEventListener('input', function () { slotOpen(input); slotCheck(input); });
+      input.addEventListener('click', function () { slotOpen(input); });
+      input.addEventListener('blur', function () { root.setTimeout(function () { if (slotUi.input === input) slotHide(); }, 120); });
+      input.addEventListener('keydown', function (e) {
+        if (slotUi.input !== input || slotBox.hidden) return;
+        if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+          e.preventDefault();
+          slotUi.at = (slotUi.at + (e.key === 'ArrowDown' ? 1 : -1) + slotUi.items.length) % slotUi.items.length;
+          slotPaintTip();
+        } else if (e.key === 'Enter' || e.key === 'Tab') {
+          e.preventDefault(); slotTake(slotUi.at);
+        } else if (e.key === 'Escape') {
+          e.preventDefault(); e.stopPropagation(); slotHide();
+        }
+      });
+    }
+    ['goal', 'clip', 'gallery', 'host', 'speech', 'audio_direction', 'constraints'].forEach(function (k) { if (pInputs[k]) slotAttach(pInputs[k]); });
+    function slotCheckAll() { Object.keys(pInputs).forEach(function (k) { slotCheck(pInputs[k]); }); }
     /* [prompt-simple] "a simple toggle ... instead of having eight lines to do a
        prompt ... Basically I want to just type in what I want them to say and
        describe what I want them to do." (the operator) SIMPLE shows two boxes -
@@ -375,7 +515,8 @@
       /* [prompt-simple] "allow me to name the preset that I'm saving" */
       name: ['Preset name', 'what this preset is called - type a new name, then Save as new to keep it as its own preset'],
       speech: ['What they say', 'the words spoken, exactly as written - {station} is the station\'s name'],
-      goal: ['What they do', 'describe the action, the scene and the mood - {station} works here too']};
+      goal: ['What they do', 'describe the action, the scene and the mood - {station} works here too'],
+      kind: ['Kind', 'blank: what you typed above. overview: a technical overview - the model pitches a rolled changelog feature at a whiteboard']};
     var pMode = 'simple';
     try { pMode = root.localStorage.getItem('pinePromptMode') === 'advanced' ? 'advanced' : 'simple'; } catch (e) { /* default */ }
     var pModeBtn = pBtn('', 'c:settings--adjust', '', function () { setPromptMode(pMode === 'simple' ? 'advanced' : 'simple'); });
@@ -387,7 +528,7 @@
       P_FIELDS.forEach(function (f) {
         var L = pLabels[f[0]], s = simple && P_SIMPLE[f[0]];
         L.label.style.display = simple && !s ? 'none' : '';
-        L.label.style.order = simple ? (f[0] === 'name' ? '0' : f[0] === 'speech' ? '1' : '2') : '';
+        L.label.style.order = simple ? (f[0] === 'name' ? '0' : f[0] === 'speech' ? '1' : f[0] === 'kind' ? '3' : '2') : '';
         L.span.textContent = s ? s[0] : f[1];
         L.hint.textContent = s ? s[1] : f[3];
         L.input.setAttribute('aria-label', s ? s[0] : f[1]);
@@ -432,10 +573,16 @@
       if (!pView || !pView.presets || !pView.presets.length) return;
       pIndex = (at + pView.presets.length) % pView.presets.length;
       var p = pView.presets[pIndex]; pSelected = p.id; pDeleteArmed = '';
-      pFill(pDrafts[p.id] || p); paintScreen();
+      pFill(pDrafts[p.id] || p); slotCheckAll(); paintScreen();
     }
     function cycle(step) { pStash(); pShow(pIndex + step); }
-    pPick.addEventListener('change', function () { pStash(); pShow(Number(pPick.value) || 0); });
+    pPick.addEventListener('change', function () {
+      /* [h3-slots] "in the dropdown for presets give me an option for Random as
+         the first option" - it turns the dice on: each hour System 3 rolls one
+         of the saved presets. The editor stays on the preset it was showing. */
+      if (pPick.value === 'random') { pPick.value = String(pIndex); if (!(pState && pState.dice)) setDice(true); return; }
+      pStash(); pShow(Number(pPick.value) || 0);
+    });
     function paintEditState() {
       var dirty = pDirty(), p = pCurrent();
       pSave.disabled = pBusy || !dirty; pRevert.disabled = !dirty; pSaveNew.disabled = pBusy;
@@ -443,7 +590,8 @@
       pActive.disabled = pBusy || !p || !!(pState && p && pState.active === p.id);
       pActive.lastChild.textContent = pState && p && pState.active === p.id ? 'Active' : 'Set active';
       pDelete.lastChild.textContent = p && pDeleteArmed === p.id ? 'Tap again to delete' : 'Delete';
-      if (p && pPick.options[pIndex]) pPick.options[pIndex].textContent = presetLabel(p, pIndex) + (dirty ? ' - edited' : '');
+      var pOpt = pPick.querySelector('option[value="' + pIndex + '"]');
+      if (p && pOpt) pOpt.textContent = presetLabel(p, pIndex) + (dirty ? ' - edited' : '');
     }
     function presetLabel(p, at) {
       var odds = ((pView && pView.odds) || [])[at] || {};
@@ -467,6 +615,9 @@
       paintNextLine();
       var presets = (pView && pView.presets) || [];
       pPick.replaceChildren();
+      var rnd = make('option', '', (pState && pState.dice ? '\u2713 ' : '') + 'Random - each hour System 3 rolls a saved preset'
+        + (pState && pState.dice ? ' (on)' : ''));
+      rnd.value = 'random'; pPick.appendChild(rnd);
       presets.forEach(function (p, at) { var o = make('option', '', presetLabel(p, at)); o.value = String(at); pPick.appendChild(o); });
       pPick.value = String(pIndex);
       pCount.textContent = presets.length ? (pIndex + 1) + ' of ' + presets.length : 'no presets';

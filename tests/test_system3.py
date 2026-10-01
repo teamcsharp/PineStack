@@ -424,6 +424,10 @@ class ValidationTests(unittest.TestCase):
                 "speakerbox": "The cat kidnapped somebody from the sewer."}
         base.update(call)
         cfg = config or system3.default_config()
+        if config is None:                      # [s3-callarc] the protocol's own floor, arc and detour off
+            for t in cfg["tables"]:
+                if t["family"] in ("CALLARC", "CALLSHIFT"):
+                    t["enabled"] = False
         conv = system3.new_conversation(inputs(road="caller", seats=["A", "B", "C"], turns=turns, call=base),
                                         cfg, settings(test_seed=seed), conversation_id="c-" + seed)
         return system3.plan_call(conv, cfg)
