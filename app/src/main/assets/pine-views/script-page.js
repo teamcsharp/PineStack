@@ -23962,6 +23962,12 @@
       gapUi.ic.classList.toggle('sp-gap-ic-on', !!s.roll);
     }
     gapUi.wrap.classList.toggle('sp-gap-on', !!s.roll);
+    if (gapUi.hold) {                                  /* [cards-free] */
+      gapUi.hold.setAttribute('aria-pressed', s.cards_hold ? 'true' : 'false');
+      gapUi.hold.title = s.cards_hold
+        ? 'Cards hold the air: each line waits for its card to build first. Tap to let the dialogue run free.'
+        : 'Dialogue runs free: the pause alone sets the pace and every card plays out beside it. Tap to make lines wait for their cards.';
+    }
     var dieTip = !s.roll ? 'The dice: the roulette is off. Turn it on and each reply\'s pause is rolled here.'
       : gapLast ? 'Last roll: d100 ' + gapLast.dice + ' - ' + gapFmt(gapLast.s) + ' before the next reply (range '
         + gapNum(gapLast.lo, w[0]).toFixed(1) + ' - ' + gapNum(gapLast.hi, w[1]).toFixed(1) + ' s). Tap to see it roll again.'
@@ -23976,7 +23982,8 @@
     if (!got || typeof got !== 'object' || got.gap === undefined) return;
     if (Date.now() < gapHeldUntil) return;               /* the hand wins */
     gapState = {gap: gapClamp(got.gap, GAP_MIN, GAP_MAX, 1),
-      range: gapClamp(got.range, GAP_RANGE_MIN, GAP_RANGE_MAX, 1), roll: !!got.roll};
+      range: gapClamp(got.range, GAP_RANGE_MIN, GAP_RANGE_MAX, 1), roll: !!got.roll,
+      cards_hold: !!got.cards_hold};                   /* [cards-free] */
     /* [reply-gap:dice] the square lands only on a pause this panel saw roll -
        a receipt from another road, painted still, read as a dead die */
     if (!gapState.roll) { gapCountStop(); gapIdle(); }
@@ -23998,6 +24005,7 @@
       gapSendTimer = 0;
       if (!api().post) return;
       var body = {gap: gapState.gap, range: gapState.range, roll: !!gapState.roll,
+        cards_hold: !!gapState.cards_hold,            /* [cards-free] */
         by: root.__pineNative ? 'tablet' : 'desk'};
       Promise.resolve(api().post('/api/reply-gap', body)).then(function (got) {
         if (gapUi) gapUi.wrap.classList.remove('sp-gap-unsaved');
@@ -24488,8 +24496,23 @@
     wrap.appendChild(sw);
     wrap.appendChild(diebox);
     wrap.appendChild(rowbar);
+    /* [cards-free] "I want the feed to play out every animation ... but I don't
+       want it affecting the actual dialogue": off, the pause alone paces the
+       dialogue; on, each line waits for its card's whole build first */
+    var hold = make('button', 'sp-gap-hold', 'cards');
+    hold.type = 'button';
+    hold.setAttribute('aria-pressed', 'false');
+    hold.addEventListener('pointerdown', function (ev) { ev.stopPropagation(); });
+    hold.addEventListener('click', function (ev) {
+      ev.stopPropagation();
+      gapHeldUntil = Date.now() + 4000;
+      gapState.cards_hold = !gapState.cards_hold;
+      gapPaint();
+      gapSend(true);
+    });
+    wrap.appendChild(hold);
     gapUi = {wrap: wrap, dual: dual, track: track, span: span, a: a, b: b, val: val,
-      sw: sw, die: die, reel: reel, count: count, rowbar: rowbar};
+      sw: sw, die: die, reel: reel, count: count, rowbar: rowbar, hold: hold};
     gapDualWire(track, a, b);
     gapBigWire(dual);                                        /* [reply-gap:big] */
     /* [reply-gap:ictoggle] "Make it where tapping on this icon does the job of
