@@ -61,7 +61,7 @@ async function begin() {
      * a hundred percent detail". Asked for in the open itself so the pipe
      * starts full rather than opening at half and rebuilding. The Detail
      * buttons and Auto still lower it afterwards, exactly as before. */
-    open = await api.mirrorOpen({ size: "full" });
+    open = await api.mirrorOpen({ size: "full", quality: wantQuality });
   } catch (error) {
     return cover('the tablet mirror would not start: ' + error.message, true);
   }
@@ -69,6 +69,9 @@ async function begin() {
     return cover((open && open.why) || 'the tablet mirror would not start', true);
   }
   shown = open;
+  /* [mirror-quality-tab] Not pushed again here: a mirror already running
+   * holds the newest choice, and the tablet's own slider - asked by the main
+   * process as the mirror opens - outranks this window's memory. */
   paintButtons();
   /* The first frame clears the veil - "running" is not the same as "there
    * are pictures", and covering the gap with a black rectangle would make a
@@ -86,7 +89,60 @@ function paintButtons() {
   for (const button of document.querySelectorAll('.res')) {
     button.classList.toggle('on', !!shown && button.dataset.size === shown.size);
   }
+  paintQuality();
 }
+
+/* ------------------------------------------------------------- quality */
+
+/* [mirror-quality] "Halve the quality and have a slider where I can adjust
+ * that." A fraction of the tablet's encoder bitrate, apart from Detail.
+ * Rests at half; remembered like the other toggles in this window. */
+const qualitySlider = document.getElementById('quality');
+const qualityAt = document.getElementById('qualityAt');
+let wantQuality = 0.5;
+try {
+  const kept = Number(localStorage.getItem('pine-mirror-quality'));
+  if (kept >= 0.1 && kept <= 1) wantQuality = kept;
+} catch (error) { wantQuality = 0.5; }
+
+/* The Mbit figure is the tablet's real budget for the current detail, so
+ * dragging shows what the release will ask for. */
+function paintQuality(dragging) {
+  const q = dragging != null ? dragging : (shown && shown.quality) || wantQuality;
+  if (dragging == null) qualitySlider.value = String(Math.round(q * 100));
+  let words = Math.round(q * 100) + '%';
+  if (shown && shown.bitrate && shown.quality) {
+    words += ' · ' + (shown.bitrate / shown.quality * q / 1e6).toFixed(1) + ' Mbit';
+  }
+  qualityAt.textContent = words;
+}
+
+let qualityDragging = false;
+
+qualitySlider.addEventListener('input', function () {
+  qualityDragging = true;
+  paintQuality(Number(qualitySlider.value) / 100);
+});
+
+/* On release, not per notch: every change rebuilds the tablet's encoder. */
+qualitySlider.addEventListener('change', async function () {
+  qualityDragging = false;
+  wantQuality = Number(qualitySlider.value) / 100;
+  try { localStorage.setItem('pine-mirror-quality', String(wantQuality)); }
+  catch (error) { /* remembered for this window only */ }
+  if (!shown || !api.mirrorQuality) return paintQuality();
+  try {
+    const said = await api.mirrorQuality(wantQuality);
+    if (said && said.ok) {
+      shown = said;
+      cover('Setting the tablet to ' + Math.round(wantQuality * 100) + '% quality…');
+      setTimeout(function () { cover(''); }, 1600);
+    }
+  } catch (error) {
+    cover(error.message, true);
+  }
+  paintQuality();
+});
 
 /* -------------------------------------------------------------- detail */
 
@@ -760,6 +816,17 @@ async function watch() {
   for (;;) {
     try {
       const said = await api.mirrorHow();
+      /* [mirror-quality-tab] The tablet has its own slider; when it moves,
+       * the main process retunes and this strip follows. */
+      if (said && said.ok && said.quality && shown && !qualityDragging
+          && said.quality !== shown.quality) {
+        shown.quality = said.quality;
+        shown.bitrate = said.bitrate;
+        wantQuality = said.quality;
+        try { localStorage.setItem('pine-mirror-quality', String(wantQuality)); }
+        catch (error) { /* remembered for this window only */ }
+        paintQuality();
+      }
       if (said && said.ok && typeof said.reconnecting === 'boolean') {
         const shape = said.width + '×' + said.height;
         const held = Math.round((said.sinceFrameMs || 0) / 1000);

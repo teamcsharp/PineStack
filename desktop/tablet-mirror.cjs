@@ -62,11 +62,28 @@ const SIZES = { quarter: 1 / 4, third: 1 / 3, half: 1 / 2, full: 1 };
  * rather than a fixed budget that looks fine small and smears at full. */
 const BITS_PER_PIXEL = 11;
 
+/* [mirror-quality] "Halve the quality and have a slider where I can adjust
+ * that." QUALITY is a fraction of BITS_PER_PIXEL, separate from detail:
+ * detail is how many pixels, quality is how many bits each one gets.
+ *
+ * Halved by default because on 2026-10-01 the full-detail mirror at 11.8
+ * Mbit, stalled in n_tty_write, held 623 MB in screenrecord plus 947 MB in
+ * the tablet's codec HAL - and screenrecord is oom_score_adj -1000, so the
+ * low-memory killer took the kiosk four times in seven minutes instead. */
+const QUALITY_MIN = 0.1;
+const QUALITY_MAX = 1;
+
+function clampQuality(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return null;
+  return Math.round(Math.min(QUALITY_MAX, Math.max(QUALITY_MIN, n)) * 100) / 100;
+}
+
 /* The tablet's own, until it has been asked. Only a starting guess - see
  * measure(). */
 const ASSUMED = { width: 1340, height: 800 };
 
-const DEFAULTS = { size: 'half', fps: 15 };
+const DEFAULTS = { size: 'half', fps: 15, quality: 0.5 };
 const FIRST_FRAME_TIMEOUT_MS = 12000;
 const STALLED_FRAME_TIMEOUT_MS = 5000;
 const WATCH_EVERY_MS = 1000;
@@ -211,13 +228,15 @@ class Mirror {
     const part = SIZES[name] || SIZES.half;
     const width = Math.max(2, (Math.round(this.real.width * part) >> 1) << 1);
     const height = Math.max(2, (Math.round(this.real.height * part) >> 1) << 1);
+    const quality = clampQuality(this.shape.quality) || DEFAULTS.quality;
     return { width, height,
-      bitrate: Math.max(800000, Math.round(width * height * BITS_PER_PIXEL)) };
+      bitrate: Math.max(400000, Math.round(width * height * BITS_PER_PIXEL * quality)) };
   }
 
   async open(shape) {
     if (this.running) return this.where();
     Object.assign(this.shape, shape || {});
+    this.shape.quality = clampQuality(this.shape.quality) || DEFAULTS.quality;
     await this.listen();
     this.running = true;
     this.startedAt = Date.now();
@@ -242,9 +261,21 @@ class Mirror {
     return this.where();
   }
 
+  /* [mirror-quality] The slider. Same road as retune(): the URL stays, the
+   * tablet's encoder is rebuilt at the new bitrate. */
+  requality(value) {
+    const quality = clampQuality(value);
+    if (quality === null || quality === this.shape.quality) return this.where();
+    this.shape.quality = quality;
+    if (this.running) this.rebuild('capture quality changed');
+    return this.where();
+  }
+
   where() {
     const shape = this.shapeFor(this.shape.size);
     return {
+      quality: this.shape.quality,
+      bitrate: shape.bitrate,
       ok: true,
       url: 'http://127.0.0.1:' + this.port + '/live.mjpg',
       stillUrl: 'http://127.0.0.1:' + this.port + '/frame.jpg',
@@ -659,6 +690,8 @@ class Mirror {
       restartReason: this.lastRestartReason,
       sinceFrameMs: still,
       size: this.shape.size,
+      quality: this.shape.quality,
+      bitrate: this.shapeFor(this.shape.size).bitrate,
       measured: this.measured,
       real: Object.assign({}, this.real),
       /* The honest reading: a stream that has not produced a frame in two

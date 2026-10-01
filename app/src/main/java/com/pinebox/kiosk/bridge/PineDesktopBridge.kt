@@ -1489,7 +1489,9 @@ class PineDesktopBridge(
 
         /* [rec-quality] replayQuality() -> the levels and the one in force;
          * replayQuality({level}) moves the ring there (Standard again after
-         * two hours, or on any restart of the recorder). */
+         * two hours, or on any restart of the recorder).
+         * [rec-quality-pct] replayQuality({quality_pct}) sets the kept share
+         * of the bitrate, live, without starting the ring fresh. */
         "replayQuality" -> {
             val replay = (context.applicationContext as? com.pinebox.kiosk.PineApp)?.replay
             if (replay == null) {
@@ -1497,7 +1499,8 @@ class PineDesktopBridge(
                     .put("ok", false).put("detail", "no recorder on this terminal").toString())
             } else {
                 val a = args.optJSONObject(0)
-                val why = if (a != null && a.has("level")) replay.setQuality(a.optInt("level", 0)) else null
+                val why = if (a != null && a.has("quality_pct")) replay.setQualityPct(a.optInt("quality_pct", 50))
+                    else if (a != null && a.has("level")) replay.setQuality(a.optInt("level", 0)) else null
                 BridgeEnvelope.ok(id, replay.qualityState()
                     .put("ok", why == null).put("detail", why ?: org.json.JSONObject.NULL).toString())
             }

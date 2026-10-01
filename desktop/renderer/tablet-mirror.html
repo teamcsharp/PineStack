@@ -56,6 +56,17 @@
                 title="Match the tablet's detail to the window size on its own. Off by default: the tablet sends full detail until asked.">Auto</button>
       </div>
 
+      <!-- [mirror-quality] Bits per pixel, apart from Detail (how many
+           pixels). Rests at half: the full budget filled the tablet's
+           memory and the kiosk was the one killed for it. -->
+      <div class="group" role="group" aria-label="How many bits the tablet spends on each picture">
+        <span class="tag">Quality</span>
+        <input id="quality" type="range" min="10" max="100" step="5" value="50"
+               aria-label="Picture quality"
+               title="How much the tablet spends encoding the picture.&#10;Lower is lighter on the tablet's memory and encoder; higher is sharper." />
+        <span id="qualityAt" class="dim">50%</span>
+      </div>
+
       <div class="group" role="group" aria-label="How big this window is">
         <span class="tag">Window</span>
         <button class="zoom" data-zoom="0.5" type="button" title="Half size on this desk">50%</button>

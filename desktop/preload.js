@@ -268,6 +268,7 @@ contextBridge.exposeInMainWorld("pineDesktop", pineSpeakPlainly({
   mirrorShow: (options) => ipcRenderer.invoke("mirror:show", options),
   mirrorOpen: (shape) => ipcRenderer.invoke("mirror:open", shape),
   mirrorSize: (size) => ipcRenderer.invoke("mirror:size", size),
+  mirrorQuality: (quality) => ipcRenderer.invoke("mirror:quality", quality),
   mirrorHow: () => ipcRenderer.invoke("mirror:how"),
   mirrorWindow: (shape) => ipcRenderer.invoke("mirror:window", shape),
   mirrorFull: (want) => ipcRenderer.invoke("mirror:full", want),

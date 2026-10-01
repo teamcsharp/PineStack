@@ -2440,16 +2440,78 @@ ipcMain.handle("mirror:show", async (_event, options) => {
 ipcMain.handle("mirror:open", async (_event, shape) => {
   if (!mirror) return { ok: false, why: "the mirror is not set up" };
   try {
-    return await mirror.open(shape || {});
+    const opened = await mirror.open(shape || {});
+    mirrorQualityWatch();
+    return opened;
   } catch (error) {
     return { ok: false, why: error.message };
   }
 });
 
+/* [mirror-quality-tab] THE SAME SLIDER, ON THE TABLET. "I need this on the
+ * pine tablet" (2026-10-01). The tablet keeps its choice in its page's
+ * localStorage (the export sheet's Desk mirror slider); this side asks for it
+ * every ten seconds while the mirror is actually showing, and writes the desk
+ * window's choice back, so the two sliders agree. A stamp, not a comparison
+ * of clocks: whichever side last wrote changes the stamp, and a stamp this
+ * side has not seen yet is a choice made on the tablet. */
+const MIRROR_QUALITY_EVERY_MS = 10000;
+const MIRROR_QUALITY_ASK = "(function () { try { return JSON.stringify({ ok: true,"
+  + " q: Number(localStorage.getItem('pine-mirror-quality')) || 0,"
+  + " at: String(localStorage.getItem('pine-mirror-quality-at') || '') });"
+  + " } catch (e) { return JSON.stringify({ ok: false }); } })()";
+let mirrorQualitySeen = "";
+let mirrorQualityAsking = false;
+let mirrorQualityTimer = null;
+
+async function mirrorQualityFromTablet() {
+  if (mirrorQualityAsking || !mirror || !mirror.running || mirror.paused) return;
+  mirrorQualityAsking = true;
+  try {
+    const said = await (await terminalHost.glass()).say(MIRROR_QUALITY_ASK);
+    if (said && said.ok && said.at && said.at !== mirrorQualitySeen
+        && said.q >= 0.1 && said.q <= 1) {
+      mirrorQualitySeen = said.at;
+      mirror.requality(said.q);
+    }
+  } catch (error) { /* a sleeping tablet keeps the quality in force */ }
+  finally { mirrorQualityAsking = false; }
+}
+
+function mirrorQualityWatch() {
+  mirrorQualityFromTablet();
+  if (mirrorQualityTimer) return;
+  mirrorQualityTimer = setInterval(mirrorQualityFromTablet, MIRROR_QUALITY_EVERY_MS);
+  if (mirrorQualityTimer.unref) mirrorQualityTimer.unref();
+}
+
+async function mirrorQualityToTablet(quality) {
+  const at = "desk-" + Date.now();
+  mirrorQualitySeen = at;
+  try {
+    await (await terminalHost.glass()).say("(function () { try {"
+      + " localStorage.setItem('pine-mirror-quality', " + JSON.stringify(String(quality)) + ");"
+      + " localStorage.setItem('pine-mirror-quality-at', " + JSON.stringify(at) + ");"
+      + " return JSON.stringify({ ok: true }); } catch (e) { return JSON.stringify({ ok: false }); } })()");
+  } catch (error) { /* the tablet hears it next time the desk writes */ }
+}
+
 ipcMain.handle("mirror:size", (_event, size) => {
   if (!mirror) return { ok: false, why: "the mirror is not set up" };
   try {
     return mirror.retune(String(size || ""));
+  } catch (error) {
+    return { ok: false, why: error.message };
+  }
+});
+
+/* [mirror-quality] The window's quality slider: a fraction of the bitrate. */
+ipcMain.handle("mirror:quality", (_event, quality) => {
+  if (!mirror) return { ok: false, why: "the mirror is not set up" };
+  try {
+    const said = mirror.requality(quality);
+    mirrorQualityToTablet(said.quality);
+    return said;
   } catch (error) {
     return { ok: false, why: error.message };
   }

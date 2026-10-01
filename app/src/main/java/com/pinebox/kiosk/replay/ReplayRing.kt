@@ -46,15 +46,29 @@ import org.json.JSONObject
 object ReplayPrefs {
     @Volatile var capBytes: Int = 48 * 1024 * 1024
 
+    /* [rec-quality-pct] "Halve the tablet's recording ... and have a slider"
+     * (the operator, 2026-10-01). A share of every level's bitrate, kept
+     * across restarts ("pine_mem" / "replay_quality_pct", default 50, 10-100).
+     * Detail (frame size, fps) stays the level's; this is bits per frame. */
+    @Volatile var qualityPct: Int = 50
+
     fun load(context: android.content.Context) {
-        val mb = context.getSharedPreferences("pine_mem", 0).getInt("replay_cap_mb", 48)
+        val prefs = context.getSharedPreferences("pine_mem", 0)
+        val mb = prefs.getInt("replay_cap_mb", 48)
         capBytes = mb.coerceIn(16, 100) * 1024 * 1024
+        qualityPct = prefs.getInt("replay_quality_pct", 50).coerceIn(10, 100)
     }
 
     fun save(context: android.content.Context, mb: Int) {
         val v = mb.coerceIn(16, 100)
         context.getSharedPreferences("pine_mem", 0).edit().putInt("replay_cap_mb", v).apply()
         capBytes = v * 1024 * 1024
+    }
+
+    fun saveQuality(context: android.content.Context, pct: Int) {
+        val v = pct.coerceIn(10, 100)
+        context.getSharedPreferences("pine_mem", 0).edit().putInt("replay_quality_pct", v).apply()
+        qualityPct = v
     }
 }
 

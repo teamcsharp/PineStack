@@ -2087,10 +2087,88 @@
       go.type = 'button';
       go.hidden = true;
       box.appendChild(q); box.appendChild(marks); box.appendChild(note); box.appendChild(go);
+
+      /* [rec-quality-pct] "Halve the tablet's recording ... and have a
+       * slider" (the operator, 2026-10-01). A share of the level's bitrate,
+       * kept across restarts. It does NOT start the ring fresh: the running
+       * encoder is told its new bitrate and everything held stays. */
+      var pctHead = make('div', 'hc-quality-head');
+      pctHead.appendChild(make('b', '', 'Recording quality'));
+      var pctNow = make('span', 'hc-quality-now', '');
+      pctHead.appendChild(pctNow);
+      var pct = make('input', 'hc-quality-range');
+      pct.type = 'range'; pct.min = '10'; pct.max = '100'; pct.step = '5'; pct.value = '50';
+      pct.setAttribute('aria-label', 'Recording quality - lower is lighter on the tablet and holds longer');
+      pct.title = 'Lower is lighter on the tablet and holds longer';
+      box.appendChild(pctHead); box.appendChild(pct);
+      var pctDragging = false;
+      function paintPct(v) {
+        if (!state || state.quality_pct == null) return;
+        var kept = Number(state.quality_pct) || 50;
+        var p = v != null ? v : kept;
+        if (v == null && !pctDragging) pct.value = String(p);
+        var cur = (state.levels || [])[Number(state.level)] || {};
+        var kbit = Number(cur.bitrate) ? Math.round(cur.bitrate * p / kept / 1000) : 0;
+        var holds = Number(cur.holds_seconds) ? Math.round(cur.holds_seconds * kept / p) : 0;
+        pctNow.textContent = p + '%' + (kbit ? ' - ' + kbit + ' kbit/s' : '')
+          + (holds ? ', holds about ' + fmtSeconds(holds) : '');
+      }
+      pct.addEventListener('input', function () {
+        pctDragging = true;
+        paintPct(Number(pct.value));
+      });
+      pct.addEventListener('change', function () {
+        pctDragging = false;
+        var want = Number(pct.value);
+        Promise.resolve(bridge().replayQuality({quality_pct: want})).then(function (s) {
+          paint(s);
+          if (s && s.ok === false) toast('the recorder would not take it: ' + (s.detail || ''), true);
+          else toast('Recording quality: ' + want + '%');
+        }, function (err) {
+          toast('could not set the quality: ' + String((err && err.message) || err), true);
+          paintPct();
+        });
+      });
+
+      /* [mirror-quality-tab] "I need this on the pine tablet" (2026-10-01):
+       * the desk mirror's quality slider, here too. Kept in this page's
+       * storage; the desk asks for it every ten seconds while its mirror
+       * window is showing, and writes its own slider back here. */
+      var mHead = make('div', 'hc-quality-head');
+      mHead.appendChild(make('b', '', 'Desk mirror quality'));
+      var mNow = make('span', 'hc-quality-now', '');
+      mHead.appendChild(mNow);
+      var mq = make('input', 'hc-quality-range');
+      mq.type = 'range'; mq.min = '10'; mq.max = '100'; mq.step = '5';
+      mq.setAttribute('aria-label', 'Desk mirror quality');
+      mq.title = 'How sharp this tablet looks in the desk\'s live window';
+      var mNote = make('div', 'hc-quality-note',
+        'How sharp this tablet looks in the desk\'s live window. Lower is lighter on this tablet\'s memory. The desk picks it up within ten seconds.');
+      function mirrorKept() {
+        try {
+          var v = Number(localStorage.getItem('pine-mirror-quality'));
+          return v >= 0.1 && v <= 1 ? v : 0.5;
+        } catch (e) { return 0.5; }
+      }
+      mq.value = String(Math.round(mirrorKept() * 100));
+      mNow.textContent = mq.value + '%';
+      mq.addEventListener('input', function () { mNow.textContent = mq.value + '%'; });
+      mq.addEventListener('change', function () {
+        try {
+          localStorage.setItem('pine-mirror-quality', String(Number(mq.value) / 100));
+          localStorage.setItem('pine-mirror-quality-at', 'tab-' + Date.now());
+          toast('Desk mirror quality: ' + mq.value + '%');
+        } catch (e) {
+          toast('could not keep the mirror quality', true);
+        }
+      });
+      box.appendChild(mHead); box.appendChild(mq); box.appendChild(mNote);
+
       var state = null;
       function paint(s) {
         if (s) state = s;
         if (!state) return;
+        paintPct();
         var lv = state.levels || [];
         if (marks.replaceChildren) marks.replaceChildren(); else marks.innerHTML = '';
         lv.forEach(function (l, i) {

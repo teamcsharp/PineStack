@@ -140,11 +140,14 @@ class ScreenReplay(private val context: Context) {
             val at = q                                  // [rec-quality] the level in force
             val w = ((real.x * at.scale).toInt() / 2) * 2
             val h = ((real.y * at.scale).toInt() / 2) * 2
+            /* [rec-quality-pct] read before the format: the bitrate is the
+             * level's, scaled by the operator's quality share. */
+            try { ReplayPrefs.load(context) } catch (e: Exception) { /* [memprefs] keep the default */ }
 
             val format = MediaFormat.createVideoFormat(MIME, w, h).apply {
                 setInteger(MediaFormat.KEY_COLOR_FORMAT,
                     MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
-                setInteger(MediaFormat.KEY_BIT_RATE, at.bitrate)
+                setInteger(MediaFormat.KEY_BIT_RATE, bitrateFor(at))
                 setInteger(MediaFormat.KEY_FRAME_RATE, at.fps)
                 // KEY_FRAME_RATE alone is a rate-control hint: the mirror
                 // otherwise feeds 30–60 fps while the tablet is animating.
@@ -154,7 +157,9 @@ class ScreenReplay(private val context: Context) {
                 setInteger(MediaFormat.KEY_CAPTURE_RATE, at.fps)
                 setInteger(MediaFormat.KEY_REPEAT_PREVIOUS_FRAME_AFTER, 1_000_000 / at.fps)
             }
-            try { ReplayPrefs.load(context) } catch (e: Exception) { /* [memprefs] keep the default */ }
+            /* Sized from the level's design bitrate, not the scaled one: the
+             * slider then never reshapes (and empties) the ring at the next
+             * screen wake. A lower quality simply holds longer. */
             ring.size(at.bitrate)
             /* THE CACHE FROM BEFORE THE RESTART, taken in once. The ring is
              * only empty on a genuinely fresh start - a screen waking up
@@ -207,7 +212,8 @@ class ScreenReplay(private val context: Context) {
             running.set(true)
             lastError = null
             drain(encoder)
-            Log.i(TAG, "replay running at " + w + "x" + h + " " + at.fps + "fps (" + at.label + "), holding "
+            Log.i(TAG, "replay running at " + w + "x" + h + " " + at.fps + "fps (" + at.label + ", "
+                + ReplayPrefs.qualityPct + "% = " + bitrateFor(at) + " bit/s), holding "
                 + HOLD_SECONDS + "s")
             return null
         } catch (err: Exception) {
@@ -498,15 +504,20 @@ class ScreenReplay(private val context: Context) {
      *  ring holds at it (the design floor - a still screen holds more), the
      *  level in force and when it lapses. */
     fun qualityState(): JSONObject {
+        try { ReplayPrefs.load(context) } catch (e: Exception) { /* keep what is loaded */ }
         val cap = ReplayPrefs.capBytes.toDouble()
         val levels = org.json.JSONArray()
         for (it in QUALITIES) {
+            /* [rec-quality-pct] what it actually encodes at, and so how long
+             * the ring's ceiling holds - no longer capped at the design
+             * twenty minutes, since a halved bitrate really does hold more. */
             levels.put(JSONObject().put("id", it.id).put("label", it.label)
-                .put("width_share", it.scale).put("fps", it.fps).put("bitrate", it.bitrate)
-                .put("holds_seconds", (cap / (it.bitrate / 8.0) / 1.25).toInt()
-                    .coerceAtMost(HOLD_SECONDS)))
+                .put("width_share", it.scale).put("fps", it.fps).put("bitrate", bitrateFor(it))
+                .put("holds_seconds", (cap / (bitrateFor(it) / 8.0) / 1.25).toInt()))
         }
         return JSONObject().put("level", level).put("label", q.label).put("levels", levels)
+            .put("quality_pct", ReplayPrefs.qualityPct)
+            .put("bitrate_now", bitrateFor(q))
             .put("until_ms", levelUntil)
             .put("left_seconds", if (levelUntil > 0) ((levelUntil - System.currentTimeMillis()) / 1000).coerceAtLeast(0) else 0)
             .put("running", running.get())
@@ -543,6 +554,34 @@ class ScreenReplay(private val context: Context) {
         Log.i(TAG, "[rec-quality] " + q.label + " (" + why + ")")
         armRevert()
         return if (was) start() else null
+    }
+
+    /** [rec-quality-pct] The level's bitrate at the operator's share. */
+    private fun bitrateFor(at: Quality): Int =
+        (at.bitrate.toLong() * ReplayPrefs.qualityPct / 100).toInt().coerceAtLeast(100_000)
+
+    /**
+     * [rec-quality-pct] Set the quality share, kept across restarts.
+     *
+     * Unlike setQuality() this does NOT start the ring fresh: the frame size
+     * is unchanged, so the running encoder is simply told its new bitrate
+     * (MediaCodec.PARAMETER_KEY_VIDEO_BITRATE) and everything held stays.
+     * A sleeping recorder picks it up at its next start().
+     */
+    @Synchronized
+    fun setQualityPct(pct: Int): String? {
+        ReplayPrefs.saveQuality(context, pct)
+        val c = codec
+        if (!running.get() || c == null) return null
+        return try {
+            c.setParameters(android.os.Bundle().apply {
+                putInt(MediaCodec.PARAMETER_KEY_VIDEO_BITRATE, bitrateFor(q))
+            })
+            Log.i(TAG, "[rec-quality-pct] " + ReplayPrefs.qualityPct + "% = " + bitrateFor(q) + " bit/s")
+            null
+        } catch (err: Exception) {
+            err.message ?: err.toString()
+        }
     }
 
     private fun armRevert() {

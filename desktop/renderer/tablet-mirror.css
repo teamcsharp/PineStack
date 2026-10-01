@@ -134,6 +134,15 @@ button.on {
 
 .dim { color: #64798a; font-variant-numeric: tabular-nums; }
 
+/* [mirror-quality] The quality slider, in the strip's own colours. */
+#quality {
+  width: 90px;
+  accent-color: #2a7d66;
+  cursor: pointer;
+}
+
+#qualityAt { min-width: 7.5em; }
+
 .pi-icon { width: 14px; height: 14px; }
 
 /* TOUCH IS LIVE, AND IT SAYS SO. This window floats over everything and
