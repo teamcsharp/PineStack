@@ -125,6 +125,7 @@
     acts.append(open, cp);
     pop.appendChild(acts);
     (ui.pane || document.body).appendChild(pop);
+    seatPop(pop);                                                          /* [fc-seat] clear of the tabs */
     ui.inspect = pop;
     get('/api/system3/line?line_id=' + encodeURIComponent(code)).then(function (d) {
       if (ui.inspect !== pop) return;
@@ -408,7 +409,21 @@
     inspectRows(n).forEach(function (r) { dl.append(make('dt', '', r[0]), make('dd', '', typeof r[1] === 'object' ? JSON.stringify(r[1]) : String(r[1]))); });
     pop.appendChild(dl);
     (ui.pane || document.body).appendChild(pop);
+    seatPop(pop);                                                          /* [fc-seat] clear of the tabs */
     ui.inspect = pop;
+  }
+  /* [fc-seat] "I can't close this pop-up because the X is under these tabs": the
+     pane runs under the tablet's rail (#pineViewRail, painted over everything). A
+     popup measures the rail and keeps its right edge - and its X - clear of it. */
+  function seatPop(pop) {
+    try {
+      var rail = document.getElementById('pineViewRail');
+      var host = pop.offsetParent || ui.pane;
+      if (!rail || !host) return;
+      var rr = rail.getBoundingClientRect(), hr = host.getBoundingClientRect();
+      if (!rr.width || rr.left >= hr.right) return;
+      pop.style.right = Math.max(12, Math.round(hr.right - rr.left) + 10) + 'px';
+    } catch (e) { /* the default inset stands */ }
   }
   function closeInspect() { if (ui.inspect) { ui.inspect.remove(); ui.inspect = null; } }
   function nodeAt(el) {
@@ -419,6 +434,7 @@
     var timer = 0, sx = 0, sy = 0;
     function cancel() { if (timer) { root.clearTimeout(timer); timer = 0; } }
     body.addEventListener('pointerdown', function (ev) {
+      if (ui.inspect) closeInspect();                  /* [fc-seat] a tap on the chart closes the popup */
       var host = nodeAt(ev.target);
       if (!host || (ev.button != null && ev.button > 0)) return;
       sx = ev.clientX; sy = ev.clientY;
