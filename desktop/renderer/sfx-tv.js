@@ -3194,14 +3194,22 @@
         }, Math.max(0, atMs + slotMs + SLOT_GRACE_MS - now()));
       }
     }
-    var started = screen.play();
-    if (started && started.catch) {
-      started.catch(function () {
-        /* The picture is still worth having without the sound. */
-        try { screen.muted = true; screen.play().catch(function () {}); }
-        catch (err) { finish(); }
-      });
-    }
+    /* [av-sync] a pre-rolled picture is loaded and waiting; it moves on its
+       sound's moment, not before it */
+    var startNow = function () {
+      if (done || video !== screen) return;
+      var started = screen.play();
+      if (started && started.catch) {
+        started.catch(function () {
+          /* The picture is still worth having without the sound. */
+          try { screen.muted = true; screen.play().catch(function () {}); }
+          catch (err) { finish(); }
+        });
+      }
+    };
+    var syncLead = avsyncAt(clip) ? avsyncAt(clip) - now() : 0;
+    if (syncLead > 30) setTimeout(startNow, syncLead);
+    else startNow();
   }
 
   /* #1306b: THE FOUR THINGS THE OPERATOR WANTS TO DO TO A CLIP.
@@ -5392,6 +5400,25 @@
      left the next one four seconds to arrive and it did not. */
   var WARM_AFTER_MS = 1500;
 
+  /* [av-sync] "the videos are playing out of sync where it plays the audio
+     for the video and then the videos pop up after the video's already
+     played. I need ... video playback on the pine tab and syncing to be 1:1"
+     (the operator, 2026-09-30). A sting's picture is SILENT: its sound is in
+     the broadcast, stamped to clip.at. Measured on the PineTab over two hours
+     (388 receipts): the first frame came a median 0.74 s after the tablet
+     heard the sound, p90 2.6 s - and even a clip asked for on time took
+     0.86 s from play() to its first frame, because the set is built and the
+     decoder stood up only AT the moment. airInto() then put the picture in
+     the right place, but late: the sound had gone by the time it was seen.
+     So a silent picture is PRE-ROLLED - its set is built AVSYNC_PREROLL_MS
+     before its moment and playback is held to clip.at - and airInto() is
+     left to take up whatever is still out. */
+  var AVSYNC_PREROLL_MS = 1100;   /* the tablet's measured start-up, with margin */
+  function avsyncAt(clip) {
+    var at = Number(clip && clip.at);
+    return clip && clip.silent_picture && !clip.endless && isFinite(at) && at > 0 ? at : 0;
+  }
+
   function srcOf(clip) {
     return base.replace(/\/+$/, '') + String((clip && clip.url) || '');
   }
@@ -5732,6 +5759,7 @@
     if (!clip) return;
     warmSync(clip);                                        /* #1411 */
     var wait = Number(clip.at || 0) - now();
+    if (avsyncAt(clip)) wait -= AVSYNC_PREROLL_MS;         /* [av-sync] built before its sound */
     if (wait > 250) {
       /* Early is not late: the station stamps an air moment a lead ahead
        * of delivery, and a picture that jumps the gun lands over the line

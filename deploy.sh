@@ -251,12 +251,28 @@ say "installing"
 # failure consequently left the tablet with no PineBox package at all.
 # Signature migration is an explicit maintenance operation; ordinary deploys
 # either update the known package in place or leave the working copy intact.
+#
+# [venc-safe] AN INSTALL KILLS THE KIOSK, AND WITH IT ITS REPLAY ENCODER.
+# Three kernel panics on 2026-09-30 (09:02, 13:21, 21:31) were the same MTK
+# VENC fault: "no available MVA region" on larb4 VENC_BSDMA, a devapc
+# violation, "Kernel BUG at devapc_violation_irq". The tablet runs two H.264
+# encoders at once - the kiosk's replay ring and the desk mirror's
+# screenrecord - and an encoder torn down abruptly while the other is live is
+# how this driver falls over; the 21:31 one came minutes after a deploy.
+# Screen-off is the recorder's own clean stop (PineAppRecorder.rest():
+# stopVideo() writes the history and gives the encoder back; the audio capture
+# stays up), so the glass goes dark, the ring's encoder is released, and only
+# then does the install take the process. The glass is woken afterwards.
+say "releasing the replay encoder (screen off) before the install"
+"$ADB" -s "$DEV" shell input keyevent 223 || true      # KEYCODE_SLEEP
+sleep 4
 INSTALL_RC=0
 if INSTALL_OUT=$("$ADB" -s "$DEV" install -r "$SIGNED" 2>&1); then
   INSTALL_RC=0
 else
   INSTALL_RC=$?
 fi
+"$ADB" -s "$DEV" shell input keyevent 224 || true      # KEYCODE_WAKEUP [venc-safe]
 printf '%s\n' "$INSTALL_OUT"
 if [ "$INSTALL_RC" -ne 0 ] || ! printf '%s\n' "$INSTALL_OUT" | grep -q '^Success'; then
   echo "DEPLOY FAILED - the installed PineBox app was left untouched." >&2
