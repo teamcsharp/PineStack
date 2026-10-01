@@ -2132,6 +2132,15 @@ DEFAULT_DJ = {
     # because the desk read "assigned"; the first minutes after resume
     # must come off the shelf, not the model.
     "pause_bank_rounds": 12,
+    # [bank-ahead] 2026-10-01, the operator: "the goal of pausing the
+    # station is to bank enough quality roulette driven system 3 dialogue
+    # to alleviate the realtime pressure of speech generation ... I want
+    # callers being stored with variable outcomes and manager messages for
+    # days queued up." While paused, these roads are owed this many hours
+    # of finished stock (0 turns it off) instead of the 6-hour ceiling
+    # every other road keeps, and the paused planner builds them first.
+    "bank_ahead_hours": 72,
+    "bank_ahead_roads": "caller,manager",
     # #1034: THE SEAT WATCH. When one presenter has carried a swath alone
     # - the other seat silent for this many aired lines, or this many
     # minutes - the silent one says where they went (restroom, coffee,
@@ -3071,6 +3080,14 @@ def validate_settings(data: Any) -> dict[str, Any]:
         "pause_bank_rounds": max(0, min(60, int(                  # #1022
             raw_dj.get("pause_bank_rounds",
                        DEFAULT_DJ["pause_bank_rounds"]) or 0))),
+        "bank_ahead_hours": max(0.0, min(168.0, float(            # [bank-ahead]
+            raw_dj.get("bank_ahead_hours",
+                       DEFAULT_DJ["bank_ahead_hours"]) or 0))),
+        "bank_ahead_roads": ",".join(dict.fromkeys(               # [bank-ahead]
+            r for r in (x.strip().lower() for x in str(
+                raw_dj.get("bank_ahead_roads",
+                           DEFAULT_DJ["bank_ahead_roads"]) or "").split(","))
+            if r in BANK_AHEAD_ROADS_KNOWN)),
         # #1034: the seat watch - lines/minutes a seat may sit silent
         # behind the other before it is sent on a break, and how long
         # the break runs. The away span is clamped to the 2..6 minutes
@@ -16984,6 +17001,38 @@ def build_lift() -> float:
         return 1.0
 
 
+# [bank-ahead] the roads a pause may bank days of, and the one-segment-an-hour
+# floor a banked road is owed when the sheet in hand has no entry for it.
+BANK_AHEAD_ROADS_KNOWN = ("caller", "manager", "gallery", "ad", "station_id")
+BANK_AHEAD_SEGMENT_SECONDS = 180.0
+
+
+def bank_ahead_roads() -> tuple[str, ...]:
+    """[bank-ahead] The roads the operator wants banked days ahead."""
+    try:
+        raw = str(dj_settings().get("bank_ahead_roads") or "")
+    except Exception:  # noqa: BLE001
+        return ()
+    return tuple(r for r in (x.strip() for x in raw.split(","))
+                 if r in BANK_AHEAD_ROADS_KNOWN)
+
+
+def bank_ahead_hours(road: str = "") -> float:
+    """[bank-ahead] Hours of finished stock this road is owed WHILE PAUSED.
+
+    0.0 on air, for a road not on the list, or with the dial at 0 - so
+    nothing on air changes: the deep bank is built only in the time the
+    operator set aside for it, and spent on air like any other stock."""
+    try:
+        if not radio_paused():
+            return 0.0
+        if road and str(road) not in bank_ahead_roads():
+            return 0.0
+        return max(0.0, min(168.0, float(dj_settings().get("bank_ahead_hours") or 0)))
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
 SCHEDULE_HORIZON_FLOOR_HOURS = 4.0
 
 
@@ -17054,6 +17103,16 @@ def shelf_cap(kind: str) -> int:
                 want = max(want, min(3, int(round(want * min(2.0, lift)))))
             else:
                 want = int(round(want * lift))
+    except Exception:  # noqa: BLE001
+        pass
+    # [bank-ahead] room on the shelf for the pause's own horizon - half a
+    # base shelf an hour. The pantry's row ceiling makes room above every
+    # held clip and its byte allowance sheds loose cache first, so this
+    # only ever decides how many ROWS may stand, never deletes one.
+    try:
+        _deep = bank_ahead_hours(str(kind))
+        if _deep > 0:
+            want = max(want, int(round(base * _deep / 2.0)))
     except Exception:  # noqa: BLE001
         pass
     return max(1, want)
@@ -18950,6 +19009,13 @@ def unheard_state() -> dict[str, Any]:
            "every": round(cupboard_unheard_every()), "on": cupboard_unheard_on(),
            "shut_roads": [r["kind"] for r in shut],
            "recent": list(_UNHEARD_LOG[-12:]), "say": said + " - " + said_sweep}
+    try:                                                         # [bank-ahead]
+        out["call_endings"] = caller_outcome_census()
+        out["bank_ahead"] = {"roads": list(bank_ahead_roads()),
+                             "hours_now": bank_ahead_hours(),
+                             "dial_hours": float(dj_settings().get("bank_ahead_hours") or 0)}
+    except Exception:  # noqa: BLE001
+        pass
     _UNHEARD_MEMO.update({"at": now, "value": out})
     return dict(out)
 
@@ -23705,7 +23771,12 @@ def prep_plan(skip: Any = None) -> dict[str, Any]:
                     return max(0.0, float(row.get("owed") or 0)
                                - float(row.get("held") or 0))
                 _driven = str(orch_policy("drive_road") or "")
+                # [bank-ahead] the operator's own road first, then the
+                # demanding roads the pause exists to bank (calls and
+                # memos), then whatever is furthest short.
+                _deep = bank_ahead_roads() if bank_ahead_hours() > 0 else ()
                 order.sort(key=lambda k: (0 if k == _driven else 1,
+                                          0 if (k in _deep and _short_of(k) > 0) else 1,
                                           -_short_of(k)))
             except Exception:  # noqa: BLE001
                 pass
@@ -35123,6 +35194,11 @@ def radio_prompt_desk_state() -> dict[str, Any]:
                         # HOURS of finished audio rather than in items.
                         ("prepare_hours", "Hours prepared ahead", "number",
                          0.25, 24, 0.25),
+                        # [bank-ahead] the pause's own horizon, per road
+                        ("bank_ahead_hours", "Hours banked ahead while paused (the roads below)",
+                         "number", 0, 168, 1),
+                        ("bank_ahead_roads", "Roads banked days ahead while paused (caller, manager, gallery, ad)",
+                         "text", 0, 0, 0),
                         ("talk_radio", "Talk-show intensity", "range", 0, 100, 1),
                         ("overlap", "Interruptions", "range", 0, 100, 1)],
         "speakerbox": [("speakbox_rate", "Material grounding", "range", 0, 100, 1),
@@ -46275,6 +46351,65 @@ async def prep_station_id() -> bool:
     return True
 
 
+def call_outcome_of(entry: Any) -> dict[str, Any]:
+    """[bank-ahead] HOW THIS BANKED CALL ENDS, in one place.
+
+    "I want callers being stored with variable outcomes." The ending is
+    already rolled - by System 3's call-end wheel when it is active
+    (entry.call.callend), by the ending shelf (prep_rule) otherwise - and
+    the scenario's conclusion rides in entry.call.scenario. They were three
+    fields in three shapes; this is the one record the cupboard, the
+    census and the operator read."""
+    if not isinstance(entry, dict):
+        return {}
+    call = entry.get("call") if isinstance(entry.get("call"), dict) else {}
+    ce = call.get("callend") if isinstance(call.get("callend"), dict) else {}
+    res = ce.get("resolve") if isinstance(ce.get("resolve"), dict) else {}
+    rule = entry.get("prep_rule") if isinstance(entry.get("prep_rule"), dict) else {}
+    scen = call.get("scenario") if isinstance(call.get("scenario"), dict) else {}
+    concl = scen.get("conclusion")
+    concl = (concl.get("label") or concl.get("id") or concl.get("text")) if isinstance(concl, dict) else concl
+    if res:
+        return {"source": "system3", "id": str(res.get("id") or ""),
+                "label": str(res.get("label") or res.get("category") or ""),
+                "effect": str(res.get("effect") or ""),
+                "prize": str(res.get("prize") or ""),
+                "says": str(ce.get("says") or "")[:240],
+                "conclusion": str(concl or "")[:120],
+                "caller": str(entry.get("prep_name") or "")}
+    if rule:
+        return {"source": "ending_shelf",
+                "id": str(rule.get("id") or rule.get("key") or ""),
+                "label": str(rule.get("label") or rule.get("name")
+                             or rule.get("text") or "")[:120],
+                "effect": "success" if rule.get("success") else "",
+                "prize": str(rule.get("prize") or ""),
+                "says": str(rule.get("text") or "")[:240],
+                "conclusion": str(concl or "")[:120],
+                "caller": str(entry.get("prep_name") or "")}
+    return {}
+
+
+def caller_outcome_census() -> dict[str, Any]:
+    """[bank-ahead] The spread of endings across the UNHEARD banked calls -
+    the operator's check that the bank is varied, not ten of one call."""
+    counts: dict[str, int] = {}
+    rows = 0
+    try:
+        for row in shelf_rows("caller"):
+            if not isinstance(row, dict) or not row_unaired(row):
+                continue
+            rows += 1
+            out = call_outcome_of(dialogue_entry(row) or row.get("entry") or {})
+            label = (out.get("label") or out.get("id") or "no ending recorded")
+            counts[label] = counts.get(label, 0) + 1
+    except Exception:  # noqa: BLE001
+        pass
+    top = max(counts.values()) if counts else 0
+    return {"unheard_calls": rows, "endings": dict(sorted(counts.items(), key=lambda kv: -kv[1])),
+            "distinct": len(counts), "most_common_share": round(top / rows, 2) if rows else 0.0}
+
+
 async def prep_round(kind: str) -> bool:
     """One whole SEGMENT written ahead — a memo from upstairs, or a call
     on the request line — with every line of it rendered into the pantry
@@ -46311,6 +46446,11 @@ async def prep_round(kind: str) -> bool:
         return False                    # nothing to say from that road
     entry = pile[0]
     entry["prep_kind"] = str(kind)
+    if kind == "caller":
+        try:
+            entry["call_outcome"] = call_outcome_of(entry)       # [bank-ahead]
+        except Exception:  # noqa: BLE001
+            pass
     # A partially rendered segment is still shelved: the keeper finishes
     # it on a later visit, and any line that never got made simply
     # renders on air the way it always would have.
@@ -46348,7 +46488,10 @@ async def prep_round(kind: str) -> bool:
                  "audio waiting (#842)"
                  + (f" - all {entry.get('prep_turns') or 0} turns are bound "
                     "to their stored host/caller voices (#871/#1005)"
-                    if kind == "caller" else ""))
+                    if kind == "caller" else "")
+                 + ((" - it ends: %s" % ((entry.get("call_outcome") or {}).get("label")
+                                         or "no ending recorded"))
+                    if kind == "caller" else ""))                  # [bank-ahead]
     return True
 
 
@@ -51304,7 +51447,7 @@ def orch_scan() -> dict[str, Any]:
                     out = orch_raise(
                         "offline_stock",
                         f"The station is off air and banking. {_name} is "
-                        f"furthest behind the three-hour goal - "
+                        f"furthest behind what this pause should bank - "
                         f"{int(_gap)}s short of the "
                         f"{int(float((_needs.get(_road) or {}).get('owed') or 0))}s "
                         "the hours owe it. I can push it hardest, put "
@@ -60736,7 +60879,16 @@ def hour_needs() -> dict[str, dict[str, float]]:
             # keep.
             row = out.setdefault(road, {"owed": 0.0, "held": 0.0,
                                         "rows": 0.0, "cap": 0.0})
-            row["owed"] += owed * hours
+            # [bank-ahead] a banked road is owed the pause's horizon, not
+            # the six-hour ceiling (0 on air, so nothing else moves)
+            row["owed"] += owed * max(hours, bank_ahead_hours(road))
+        # [bank-ahead] ...and a banked road the sheet in hand has no entry
+        # for is still owed a segment an hour: "manager messages for days".
+        for road in bank_ahead_roads():
+            _deep = bank_ahead_hours(road)
+            if _deep > 0 and road in ALT_PREP_KINDS and road not in out:
+                out[road] = {"owed": BANK_AHEAD_SEGMENT_SECONDS * _deep,
+                             "held": 0.0, "rows": 0.0, "cap": 0.0}
         # #1128: ...AND NEWS IS NOT OWED WHAT IT CANNOT KEEP. #1125 put
         # this clamp inside the slot loop, where it capped ONE entry's
         # 240 seconds against a 480-second ceiling and did nothing at
