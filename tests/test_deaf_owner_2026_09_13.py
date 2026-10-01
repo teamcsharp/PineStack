@@ -45,10 +45,18 @@ class OwnerTakesNothing(unittest.TestCase):
         app._OWNER_DEAF.clear()
         self._acks = list(app._PAGE_ACK_EVENTS)
         app._PAGE_ACK_EVENTS.clear()
+        # [owner-fair] every wedge this class pins was a page SENT clips that it
+        # never took; the station had published one in the window (an owner is
+        # never judged deaf to silence - see test_silence_is_not_deafness)
+        self._deliveries = dict(app._PAGE_DELIVERIES)
+        app._PAGE_DELIVERIES.clear()
+        app._PAGE_DELIVERIES["sent-1"] = {"delivery_id": "sent-1", "at": self.now - 30, "state": "published"}
 
     def tearDown(self):
         app._PAGE_ACK_EVENTS.clear()
         app._PAGE_ACK_EVENTS.extend(self._acks)
+        app._PAGE_DELIVERIES.clear()
+        app._PAGE_DELIVERIES.update(self._deliveries)
         app._OWNER_RUN.update({"who": "", "since": 0.0})
         app._OWNER_DEAF.clear()
 
@@ -58,12 +66,21 @@ class OwnerTakesNothing(unittest.TestCase):
 
     def acked(self, who, ago):
         app._PAGE_ACK_EVENTS.append(
-            {"at": self.now - ago, "listener_id": who, "event": "playing"})
+            # a real page's ack carries its volume; #1332e counts only an audible one
+            {"at": self.now - ago, "listener_id": who, "event": "playing", "audible_volume": 1.0})
 
     def ask(self, who, others=("tablet-a",)):
         with mock.patch.object(app, "_listeners_live",
                                return_value=[who] + list(others)):
             return app._owner_takes_nothing(who)
+
+    def test_silence_is_not_deafness(self):
+        # [owner-fair] 2026-09-30: the DJs went quiet, nothing was sent, and the
+        # PineTab - the one device sounding - was dropped as deaf and barred
+        app._PAGE_DELIVERIES.clear()
+        self.hold("tablet-x", app.OWNER_DEAF_SECONDS + 30)
+        self.assertFalse(self.ask("tablet-x"))
+        self.assertNotIn("tablet-x", app._OWNER_DEAF)
 
     # ---------------------------------------------------------------
 

@@ -39080,6 +39080,14 @@ def _owner_takes_nothing(who: str) -> bool:
             except (TypeError, ValueError):
                 continue
             return False          # it is sounding; leave it alone
+        # [owner-fair] nothing was sent to take: an owner cannot be deaf to silence
+        try:
+            sent = any(floor <= float((d or {}).get("at") or 0) <= now - 10
+                       for d in list(_PAGE_DELIVERIES.values()))
+        except Exception:  # noqa: BLE001
+            sent = True
+        if not sent:
+            return False
         others = [w for w in (_listeners_live() or []) if w != who]
         if others:
             _OWNER_RUN.update({"who": "", "since": 0.0})   # the run ends here
