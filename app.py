@@ -121785,6 +121785,10 @@ async def generate_answer(
     if is_radio_rescue(user_text):
         async def _rescue() -> None:
             try:
+                try:
+                    _doc = await show_doctor()                       # [show-doctor:rescue]
+                except Exception:  # noqa: BLE001
+                    _doc = ""
                 got = await _deep_repair("spoken rescue (#827)")
                 if got.get("busy"):
                     line = ("a repair is already running — give it a "
@@ -121797,6 +121801,8 @@ async def generate_answer(
                         verdict + " — " + "; ".join(
                             f"{s['name']}: {s['did']}"
                             for s in fixes[:4]))
+                if _doc and not _doc.startswith("The show is on and being heard"):   # [show-doctor:rescue]
+                    line = _doc + " " + line
                 await home_assistant_say(line[:400], plain=True)
             except Exception:  # noqa: BLE001
                 pass
