@@ -72,6 +72,23 @@ class CupboardWhy(unittest.TestCase):
         self.assertIn("no_slot", codes)
         self.assertIn("4d", got["say"] + str(got["waited"]) or "")
 
+    def test_a_row_the_air_refuses_is_never_called_fine(self):
+        """[door-why] 2026-10-01: 32 manager rounds read "nothing is wrong
+        with it" while the sweep counted 0 of 72 ready. When the air's gate
+        says no, the desk names the gate."""
+        r = row(age_h=40.0)
+        with mock.patch.object(app, "dialogue_audio_ready", lambda k, x: True), \
+                mock.patch.object(app, "shelf_rows", lambda k: [r]), \
+                mock.patch.object(app, "s3_binding_withheld",
+                                  lambda e: "round withheld without bound roulette turns"):
+            got = app.cupboard_why_row("manager", r)
+        self.assertFalse(got["ready"])
+        self.assertTrue(got["blocked"])
+        codes = [x["code"] for x in got["reasons"]]
+        self.assertIn("not_ready", codes)
+        self.assertNotIn("never_asked_for", codes)
+        self.assertIn("System 3", got["say"])
+
     def test_off_brief_is_blocked_and_never_says_nobody_asked(self):
         """A row the air will never take must not be described as merely
         unlucky. Both halves matter: the operator decides what to remove

@@ -18741,6 +18741,20 @@ def cupboard_why_row(kind: str, row: Any) -> dict[str, Any]:
             pass
 
         out["ready"] = bool(dialogue_row_ready(kind, row))
+        if not out["ready"] and not reasons:
+            # [door-why] 2026-10-01: the air said no and nothing above
+            # said why, so the desk called 32 manager rounds "nothing is
+            # wrong with it" while the sweep counted 0 of 72 ready. Ask
+            # the gates by name (System 3's booth gate, the tint, the
+            # audio) - the same order dialogue_row_ready asks them.
+            try:
+                _named = dialogue_row_ready_why(kind, row)
+            except Exception:  # noqa: BLE001
+                _named = ""
+            reasons.append(_cupboard_why(
+                "not_ready", _named or "the ready gate refused it",
+                "this is the air's own gate - the round cannot go out "
+                "until it holds."))
         out["blocked"] = bool(reasons)
 
         # 6. THE DOORS. Nothing above is wrong with the item; these say
@@ -111487,7 +111501,7 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                          or _round_s3.get("mode") != "active")):
         pipeline_log("system3", "round withheld without an active System 3 conversation",
                      extra=str(ready_meta.get("prep_kind") or "banter"))
-        return []
+        return _banter_no("System 3 is on and this round has no active System 3 conversation")   # [door-why]
     if _s3_active():
         # A writer can return more turns than the running order dealt.  The
         # binding names only planned script positions; every other line must
@@ -111501,14 +111515,14 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
         if not _s3_positions:
             pipeline_log("system3", "round withheld without bound roulette turns",
                          extra=str(ready_meta.get("prep_kind") or "banter"))
-            return []
+            return _banter_no("System 3 withheld it: no bound roulette turns")   # [door-why]
         _s3_planned = int(_round_s3.get("planned_turns") or len(_s3_positions))
         if (_s3_planned < 3 or len(_s3_positions) != _s3_planned
                 or limit < _s3_planned
                 or len({str(turns[i][0]) for i in _s3_positions}) < 2):
             pipeline_log("system3", "incomplete conversation withheld after repair",
                          extra=f"{len(_s3_positions)} of {_s3_planned} turns; limit {limit}")
-            return []
+            return _banter_no("System 3 withheld it: incomplete conversation after repair")   # [door-why]
         _s3_keep = set(_s3_positions)
         if ready_takes is not None:
             _s3_ready = []
@@ -111524,7 +111538,7 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                     _s3_ready.append(_take)
             if not _s3_ready:
                 pipeline_log("system3", "prepared round withheld without planned takes")
-                return []
+                return _banter_no("System 3 withheld it: no planned takes in the prepared round")   # [door-why]
             if len(_s3_ready) != len(ready_takes):
                 pipeline_log("system3", "unplanned prepared dialogue held from air",
                              extra=str(len(ready_takes) - len(_s3_ready)))
@@ -111541,10 +111555,10 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
     if (any(line_forgotten(str(take.get("text") or "")) for take in (ready_takes or []))
             or any(line_forgotten(text) for _, text in turns)):
         pipeline_log("drop", "a round carrying an operator-forgotten line was withheld")
-        return []
+        return _banter_no("a line in it is on the forgotten-lines list")   # [door-why]
     if ready_takes is None and not await _system2_repeat_rows_async(
             [{"text": spoken_text(text)} for _, text in turns], ready_meta):
-        return []
+        return _banter_no("System 2 counts these lines as already aired - a repeat")   # [door-why]
     if ready_takes is None:
         fresh_pool_top()                    # #no-repeats: stock the shelf off-air
         render_backlog_top()                # #784: anything still owed the air
@@ -111579,7 +111593,7 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
         # Assemble exactly one complete media object before any publication;
         # failure has no live-render or per-turn synthesis escape hatch.
         if not ready_takes:
-            return []
+            return _banter_no("the prepared round has no takes")   # [door-why]
         # --- script production (2026-09-15) ---
         # The frozen occurrence identity for this round, if it has one.
         # `entry["production_lines"]` is written by the producer only in `on`
@@ -111598,7 +111612,7 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
             name = str(clip.get("path") or "").rsplit("/", 1)[-1].split("?", 1)[0]
             if (not name or not (VOICE_MEDIA_DIR / name).is_file()
                     or (VOICE_MEDIA_DIR / name).stat().st_size <= 0):
-                return []
+                return _banter_no("a take's recorded clip is missing from voice_media")   # [door-why]
             # --- script production (2026-09-15) ---
             # PAIRED BY POSITION, THEN CHECKED BY TEXT. The takes are sorted
             # into script order and the production lines were minted from that
@@ -111627,7 +111641,7 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
     if ready_takes is not None and globals().get("_system2"):
         if not await _system2_repeat_allowed_async(
                 [str(t.get("text") or "") for t in ready_takes], ready_meta):
-            return []
+            return _banter_no("System 2's repeat rule refused the prepared lines")   # [door-why]
     tint_eligible = [i for i, (_m, t) in enumerate(turns)
                      if len(str(t or "").strip()) >= TINT_TURN_FLOOR]
     tint_required = (len(tint_eligible) * crystal_coverage_target() + 99) // 100
@@ -111992,7 +112006,7 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
     if tint_failed:
         pipeline_log("crystal", "the complete round is held before synthesis: "
                      "its selected dialogue did not meet the tint contract")
-        return []
+        return _banter_no("its dialogue did not meet the tint contract")   # [door-why]
 
     # #1056: the listener answers in their own voice without taking over the
     # speaker's words. Only finished performances can enter the air queue.
@@ -112008,7 +112022,7 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
     # Includes raw fallback, recorded/manual exchanges, and prepared responses.
     # None may bypass the persistent exact-hour rule through a legacy waiver.
     if not await _system2_repeat_rows_async(playlist, ready_meta):
-        return []
+        return _banter_no("System 2 counts the playlist as already aired - a repeat")   # [door-why]
 
     # The feed receives this at render start, not after the completed clip is
     # published. It can therefore show which person is being rendered and how
