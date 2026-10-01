@@ -156138,6 +156138,11 @@ except Exception as _origin_exc:  # noqa: BLE001
 # [sfxseen] SFX DISPLAY RECEIPTS (sfx_display.py): each player says whether a
 # clip's picture reached its screen (surface, first frame, rect, seconds, the
 # operator's reaction); joined to the script's SFX rows. A KEEP store, 7 days.
+try:                                                        # [flowchart] GET /api/flow/{key|now|recent}
+    import flow_chart as _flow_chart
+    _flow_chart.install(app, globals())
+except Exception as _fc_exc:  # noqa: BLE001
+    print("the flowchart did not install: %s: %s" % (type(_fc_exc).__name__, _fc_exc))
 try:                                                        # [prod-feed] GET /api/production/feed
     _production_feed.install(app, globals())
 except Exception as _pf_exc:  # noqa: BLE001

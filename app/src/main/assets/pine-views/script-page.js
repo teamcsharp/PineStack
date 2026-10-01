@@ -23555,6 +23555,17 @@
       s3Buttons[mode] = b;
       restore.appendChild(b);
     });
+    /* [flowchart] "a button that I can press that toggles between showing the
+       script view and showing the technical flowchart view" - the conversation
+       as a conditional flowchart, growing as it airs (flow-chart.js) */
+    var flowLabel = 'Flowchart view: this conversation\'s dice, roulette and turns as a growing flowchart';
+    var flowBtn = make('button', 'sp-band-reopen sp-band-always sp-flow-toggle');
+    flowBtn.type = 'button';
+    flowBtn.title = flowLabel;
+    flowBtn.setAttribute('aria-label', flowLabel);
+    flowBtn.setAttribute('aria-pressed', 'false');
+    flowBtn.innerHTML = folderIcon('c:decision-tree', flowLabel) || 'F';
+    restore.appendChild(flowBtn);
     /* [reply-gap] the pause between replies, its roulette and its dice:
        right of the chat icon, across the rest of the row. */
     restore.appendChild(gapBar());
@@ -23628,6 +23639,20 @@
       if (chip) chip.classList.toggle('adrift', !follow);
     });
     right.appendChild(script);
+    /* [flowchart] the pane the toggle swaps in for the script */
+    var flowPane = make('div', 'sp-flow');
+    flowPane.id = 'spFlow';
+    flowPane.hidden = true;
+    right.appendChild(flowPane);
+    flowBtn.addEventListener('click', function () {
+      var on = flowPane.hidden;
+      if (on && s3Mode !== 'script') s3SetMode('script');
+      flowPane.hidden = !on;
+      script.hidden = on;
+      flowBtn.setAttribute('aria-pressed', String(on));
+      if (root.PineFlowChart) root.PineFlowChart.show(flowPane, on);
+      else if (on) flowPane.textContent = 'The flowchart did not load.';
+    });
     /* System 3's views, over the script in the script's own cell. */
     var s3Pane = make('div', 'sp-s3');
     s3Pane.id = 'spS3';
