@@ -23685,6 +23685,10 @@
     flowPane.id = 'spFlow';
     flowPane.hidden = true;
     right.appendChild(flowPane);
+    /* [fc-stay] Live follows the line the strip is playing, not only what /api/flow/now knows */
+    if (root.PineFlowChart && typeof root.PineFlowChart.lineSource === 'function') {
+      root.PineFlowChart.lineSource(function () { return String(sayingLineId || nowLineId || ''); });
+    }
     flowBtn.addEventListener('click', function () {
       var on = flowPane.hidden;
       if (on && s3Mode !== 'script') s3SetMode('script');

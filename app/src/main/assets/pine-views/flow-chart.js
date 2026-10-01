@@ -555,21 +555,68 @@
      board clip, a record), so Live showed nothing. Live now shows, in order: the
      conversation of the line the strip was tapped on (by its line code, with that
      line's turn marked), the last conversation that aired live, the newest one. */
+  /* [fc-stay] "Why does this collapse back instead of stay open and continue going to
+     the next message?" (the operator, 2026-10-01). /api/flow/now knows only a line
+     announced on its own; while a streamed round plays it says "nothing is on air",
+     and every two seconds the chart fell back to the NEWEST conversation - a one-line
+     board clip - dropping the one being heard. Live now follows the line the strip is
+     playing (its conversation, its turn marked, tiles revealed as it advances); a
+     strip line with no conversation (a clip) leaves the open conversation open. The
+     newest conversation is only a first paint, never a replacement. */
+  var NO_FLOW = {}, noFlowN = 0;
+  function stripLine() {
+    var lid = '';
+    try { lid = ui.lineSource ? String(ui.lineSource() || '').toLowerCase() : ''; } catch (e) { lid = ''; }
+    return /^[0-9a-f]{6,32}$/.test(lid) ? lid : '';
+  }
   function fallbackShow(why) {
-    var keys = [ui.jumpLid, ui.lastLive, ui.recentFirst].filter(function (k, i, a) { return k && a.indexOf(k) === i; });
+    var lid = ui.jumpLid || stripLine();
+    if (lid && !NO_FLOW[lid]) {
+      get('/api/flow/' + encodeURIComponent(lid)).then(function (f) {
+        if (!ui.on || !ui.live) return;
+        if (f && f.nodes) {
+          ui.jumpLid = '';
+          paint(f);
+          say(why + ' - following the line in the strip (#' + f.key + ')');
+        } else {
+          markNoFlow(lid); keepShown(why);
+        }
+      }, function () { markNoFlow(lid); keepShown(why); });
+      return;
+    }
+    keepShown(why);
+  }
+  function markNoFlow(lid) {
+    if (noFlowN > 600) { NO_FLOW = {}; noFlowN = 0; }
+    NO_FLOW[lid] = 1; noFlowN += 1;
+    if (ui.jumpLid === lid) ui.jumpLid = '';
+  }
+  function keepShown(why) {
+    if (ui.flowKey) {                                   /* stay: refresh what is open, now and then */
+      if (Date.now() - (ui.keptAt || 0) < 6000) return;
+      ui.keptAt = Date.now();
+      var key = ui.flowKey;
+      get('/api/flow/' + encodeURIComponent(key)).then(function (f) {
+        if (ui.on && ui.live && f && f.nodes && f.key === ui.flowKey) paint(f);
+      }, function () { /* the next pass tries again */ });
+      return;
+    }
+    firstPaint(why);
+  }
+  function firstPaint(why) {
+    var keys = [ui.lastLive, ui.recentFirst].filter(function (k, i, a) { return k && a.indexOf(k) === i; });
     var want = keys.join('|');
-    if (ui.flowKey && ui.fallbackFor === want) return;            /* already showing it */
+    if (ui.fallbackFor === want) return;
     ui.fallbackFor = want;
     (function tryNext(i) {
       if (i >= keys.length) { if (!ui.flowKey) say(why); return; }
       get('/api/flow/' + encodeURIComponent(keys[i])).then(function (f) {
         if (!ui.on || !ui.live) return;
         if (!(f && f.nodes)) { tryNext(i + 1); return; }
-        var which = keys[i] === ui.jumpLid ? 'the conversation of the line in the strip'
-          : keys[i] === ui.lastLive ? 'the last conversation that aired' : 'the newest conversation';
+        if (ui.flowKey) return;                         /* the strip's line got there first */
+        var which = keys[i] === ui.lastLive ? 'the last conversation that aired' : 'the newest conversation';
         paint(f);
         say(why + ' - showing ' + which + ' (#' + f.key + ')');
-        ui.jumpLid = '';
       }, function () { tryNext(i + 1); });
     }(0));
   }
@@ -717,5 +764,6 @@
   root.setTimeout(background, 1500);
 
   root.PineFlowChart = {show: show, open: openKey, isOn: function () { return ui.on; }, jumpLive: jumpLive,
+    lineSource: function (fn) { ui.lineSource = typeof fn === 'function' ? fn : null; },   /* [fc-stay] the strip's line */
     _paint: paint};
 })(typeof window !== 'undefined' ? window : globalThis);
