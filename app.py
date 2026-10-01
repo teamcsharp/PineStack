@@ -175007,6 +175007,61 @@ async def dj_pipeline_api(
             "rig": rig}
 
 
+# [why-quiet] the station says why the DJs are quiet: GET /api/dj/why-quiet
+# (?text=1 for the plain report). Memory only - no disk, no probe - so it
+# answers even when the station is struggling. Rules in why_quiet.py.
+import why_quiet as _why_quiet
+
+
+def why_quiet_facts() -> dict[str, Any]:
+    g = globals()
+    facts: dict[str, Any] = {"on": bool(_RADIO.get("on"))}
+    for name, fn in (("paused", "radio_paused"), ("paused_for", "radio_paused_for"), ("playout_mode", "playout_mode")):
+        try:
+            facts[name] = g[fn]()
+        except Exception as exc:  # noqa: BLE001
+            facts[name] = None
+            facts.setdefault("faults", []).append("%s: %s" % (fn, type(exc).__name__))
+    try:
+        seq = playout()
+        facts["playout_verdict"] = seq.verdict() if seq is not None else "off"
+    except Exception as exc:  # noqa: BLE001
+        facts["playout_verdict"] = "unreadable (%s)" % type(exc).__name__
+    facts["engines"] = {"xtts": bool(_XTTS_HEALTH.get("ready")), "voxtral": bool(_VOXTRAL_HEALTH.get("ready"))}
+    now = time.time()
+    facts["roads_out"] = {k: float(v.get("until") or 0) for k, v in (g.get("_UNHEARD_ROAD_OUT") or {}).items()
+                          if float(v.get("until") or 0) > now}
+    facts["sweep"] = dict(g.get("_UNHEARD_SWEEP") or {})
+    last = _why_quiet.last_dj_line(list(_RADIO.get("chat") or []))
+    aired = (g.get("_DIALOGUE_AT") or [0.0])[0]
+    if last is not None or aired:
+        last = dict(last or {})
+        last["ts"] = max(float(last.get("ts") or 0), float(aired or 0))
+    facts["last_dj"] = last
+    try:
+        facts["talk"] = float(dj_settings().get("talk_radio"))
+    except Exception:  # noqa: BLE001
+        facts["talk"] = None
+    try:
+        facts["gates_changed"] = ["%s %s" % (gt["name"], p["label"]) for gt in _speech_gates.view(g)["gates"]
+                                  for p in gt["params"] if p.get("changed")]
+    except Exception:  # noqa: BLE001
+        facts["gates_changed"] = []
+    return facts
+
+
+@app.get("/api/dj/why-quiet", response_model=None)
+async def dj_why_quiet(text: bool = False, authorization: str | None = Header(default=None)) -> Any:
+    """[why-quiet] Why the DJs are quiet, the likeliest cause first, with what to do."""
+    require_read_auth(authorization)
+    facts = why_quiet_facts()
+    found = _why_quiet.findings(facts)
+    said = _why_quiet.reasons(list(_RADIO.get("pipeline") or [])[-400:])
+    if text:
+        return PlainTextResponse(_why_quiet.text(facts, found, said))
+    return {"findings": found, "facts": facts, "reasons": said[-40:]}
+
+
 @app.get("/api/dj/tape")
 async def dj_tape(
     seconds: int = 120,
