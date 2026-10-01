@@ -127,6 +127,7 @@ class PineDesktopBridge(
             /* [pinestream] this screen on the listeners' page - replay/PineStreamPush.kt */
             "pineStream",
             "memPrefs",   // [memprefs]
+            "replayQuality",   // [rec-quality] the export sheet's opt-in detail
             /* #1148: "Whenever I access the screen capture to follow
              * report, I also want to be able to scrub between the last
              * five seconds of the broadcast to find the right frame." */
@@ -1484,6 +1485,22 @@ class PineDesktopBridge(
             BridgeEnvelope.ok(id, org.json.JSONObject()
                 .put("ok", true)
                 .put("replayMb", com.pinebox.kiosk.replay.ReplayPrefs.capBytes / (1024 * 1024)).toString())
+        }
+
+        /* [rec-quality] replayQuality() -> the levels and the one in force;
+         * replayQuality({level}) moves the ring there (Standard again after
+         * two hours, or on any restart of the recorder). */
+        "replayQuality" -> {
+            val replay = (context.applicationContext as? com.pinebox.kiosk.PineApp)?.replay
+            if (replay == null) {
+                BridgeEnvelope.ok(id, org.json.JSONObject()
+                    .put("ok", false).put("detail", "no recorder on this terminal").toString())
+            } else {
+                val a = args.optJSONObject(0)
+                val why = if (a != null && a.has("level")) replay.setQuality(a.optInt("level", 0)) else null
+                BridgeEnvelope.ok(id, replay.qualityState()
+                    .put("ok", why == null).put("detail", why ?: org.json.JSONObject.NULL).toString())
+            }
         }
 
         "pineStream" -> {

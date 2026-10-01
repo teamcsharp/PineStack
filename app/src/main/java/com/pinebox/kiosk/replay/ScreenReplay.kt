@@ -137,24 +137,25 @@ class ScreenReplay(private val context: Context) {
             /* Even dimensions: the encoder will refuse an odd width, and it
              * says so with a generic configure failure rather than naming it.
              * The same trap the desktop's ffmpeg pass met. */
-            val w = ((real.x * SCALE).toInt() / 2) * 2
-            val h = ((real.y * SCALE).toInt() / 2) * 2
+            val at = q                                  // [rec-quality] the level in force
+            val w = ((real.x * at.scale).toInt() / 2) * 2
+            val h = ((real.y * at.scale).toInt() / 2) * 2
 
             val format = MediaFormat.createVideoFormat(MIME, w, h).apply {
                 setInteger(MediaFormat.KEY_COLOR_FORMAT,
                     MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
-                setInteger(MediaFormat.KEY_BIT_RATE, BITRATE)
-                setInteger(MediaFormat.KEY_FRAME_RATE, FPS)
+                setInteger(MediaFormat.KEY_BIT_RATE, at.bitrate)
+                setInteger(MediaFormat.KEY_FRAME_RATE, at.fps)
                 // KEY_FRAME_RATE alone is a rate-control hint: the mirror
                 // otherwise feeds 30–60 fps while the tablet is animating.
-                setFloat(MediaFormat.KEY_MAX_FPS_TO_ENCODER, FPS.toFloat())
+                setFloat(MediaFormat.KEY_MAX_FPS_TO_ENCODER, at.fps.toFloat())
                 setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
                 setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0)
-                setInteger(MediaFormat.KEY_CAPTURE_RATE, FPS)
-                setInteger(MediaFormat.KEY_REPEAT_PREVIOUS_FRAME_AFTER, 1_000_000 / FPS)
+                setInteger(MediaFormat.KEY_CAPTURE_RATE, at.fps)
+                setInteger(MediaFormat.KEY_REPEAT_PREVIOUS_FRAME_AFTER, 1_000_000 / at.fps)
             }
             try { ReplayPrefs.load(context) } catch (e: Exception) { /* [memprefs] keep the default */ }
-            ring.size(BITRATE)
+            ring.size(at.bitrate)
             /* THE CACHE FROM BEFORE THE RESTART, taken in once. The ring is
              * only empty on a genuinely fresh start - a screen waking up
              * still holds everything from before it slept, and loading over
@@ -206,7 +207,7 @@ class ScreenReplay(private val context: Context) {
             running.set(true)
             lastError = null
             drain(encoder)
-            Log.i(TAG, "replay running at " + w + "x" + h + " " + FPS + "fps, holding "
+            Log.i(TAG, "replay running at " + w + "x" + h + " " + at.fps + "fps (" + at.label + "), holding "
                 + HOLD_SECONDS + "s")
             return null
         } catch (err: Exception) {
@@ -267,7 +268,7 @@ class ScreenReplay(private val context: Context) {
     @Synchronized
     fun prime() {
         if (running.get()) return
-        ring.size(BITRATE)
+        ring.size(q.bitrate)
         if (ring.seconds() <= 0.0) restore()
         /* [#1225] AND THE SOUND STARTS HERE, not when the screen lights
          * up. prime() is what PineAppRecorder calls in onCreate - at
@@ -297,6 +298,10 @@ class ScreenReplay(private val context: Context) {
      */
     @Synchronized
     private fun keep() {
+        /* [rec-quality] only Standard is cached: a cache is restored into a
+         * Standard ring after a restart, and two frame sizes in one ring cut
+         * files a player cannot open. */
+        if (level != 0) return
         val held = ring.seconds()
         if (held < 1.0) return
         val real = cacheFile()
@@ -462,9 +467,92 @@ class ScreenReplay(private val context: Context) {
          */
         const val HOLD_SECONDS = 1200
 
-        /* Half size, twelve frames, 0.6 Mbit - see the note at the top. */
-        private const val SCALE = 0.5
-        private const val FPS = 12
-        private const val BITRATE = 600_000
+        /* [rec-quality] THE LEVELS. Standard is the ring as it always was -
+         * half size, twelve frames, 0.6 Mbit, see the note at the top - and
+         * the one it always comes back to. The others are opted into from
+         * the export sheet for a while and pay for their detail in time
+         * held: the ring's memory ceiling does not move, so at three or
+         * four times the bitrate it holds a third or a quarter as long. */
+        class Quality(val id: Int, val label: String, val scale: Double, val fps: Int, val bitrate: Int)
+
+        val QUALITIES = listOf(
+            Quality(0, "Standard", 0.5, 12, 600_000),
+            Quality(1, "Sharp", 0.75, 15, 1_400_000),
+            Quality(2, "Full detail", 1.0, 15, 2_500_000),
+        )
+
+        /* "I might want to do it for moments and then go back to the
+         * current settings ... a time period that turns off after 2 hours
+         * or resets on rebroadcast" (the operator, 2026-09-30). Held in
+         * memory only, so any restart of the recorder is Standard again. */
+        const val OPT_IN_MS = 2L * 60 * 60 * 1000
+    }
+
+    /* [rec-quality] the level in force, and when an opt-in runs out */
+    @Volatile private var level = 0
+    @Volatile private var levelUntil = 0L
+    private var revert: java.util.Timer? = null
+    private val q: Quality get() = QUALITIES[level.coerceIn(0, QUALITIES.size - 1)]
+
+    /** [rec-quality] What the export sheet shows: every level, how long the
+     *  ring holds at it (the design floor - a still screen holds more), the
+     *  level in force and when it lapses. */
+    fun qualityState(): JSONObject {
+        val cap = ReplayPrefs.capBytes.toDouble()
+        val levels = org.json.JSONArray()
+        for (it in QUALITIES) {
+            levels.put(JSONObject().put("id", it.id).put("label", it.label)
+                .put("width_share", it.scale).put("fps", it.fps).put("bitrate", it.bitrate)
+                .put("holds_seconds", (cap / (it.bitrate / 8.0) / 1.25).toInt()
+                    .coerceAtMost(HOLD_SECONDS)))
+        }
+        return JSONObject().put("level", level).put("label", q.label).put("levels", levels)
+            .put("until_ms", levelUntil)
+            .put("left_seconds", if (levelUntil > 0) ((levelUntil - System.currentTimeMillis()) / 1000).coerceAtLeast(0) else 0)
+            .put("running", running.get())
+    }
+
+    /**
+     * [rec-quality] Move the ring to another level.
+     *
+     * An encoder cannot change its frame size in flight, and a ring that
+     * held two sizes would cut files a player cannot open - so the ring
+     * starts fresh at the new level (the held picture AND sound go; the
+     * export sheet says so before the switch), through the same clean stop
+     * the screen going dark uses ([venc-safe]: the encoder is given back,
+     * never torn down mid-frame). Anything above Standard lapses after
+     * OPT_IN_MS; asking for the level already in force restarts its clock.
+     */
+    @Synchronized
+    fun setQuality(want: Int, why: String = "the export sheet"): String? {
+        val l = want.coerceIn(0, QUALITIES.size - 1)
+        revert?.cancel()
+        revert = null
+        if (l == level) {
+            levelUntil = if (l > 0) System.currentTimeMillis() + OPT_IN_MS else 0L
+            armRevert()
+            return null
+        }
+        val was = running.get()
+        level = 0                                   // keep() writes nothing above Standard
+        stop(keepAudio = true)
+        try { cacheFile().delete() } catch (err: Exception) { /* nothing cached */ }
+        ring.reset()
+        level = l
+        levelUntil = if (l > 0) System.currentTimeMillis() + OPT_IN_MS else 0L
+        Log.i(TAG, "[rec-quality] " + q.label + " (" + why + ")")
+        armRevert()
+        return if (was) start() else null
+    }
+
+    private fun armRevert() {
+        if (level == 0 || levelUntil <= 0L) return
+        val t = java.util.Timer("rec-quality", true)
+        t.schedule(object : java.util.TimerTask() {
+            override fun run() {
+                try { setQuality(0, "two hours are up") } catch (err: Exception) { /* next start is Standard */ }
+            }
+        }, (levelUntil - System.currentTimeMillis()).coerceAtLeast(1000L))
+        revert = t
     }
 }

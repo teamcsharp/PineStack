@@ -478,3 +478,14 @@ html.hc-hushed body > *:not(.hc-ink):not(.hc-toast):not(.hc-sheet):not(#pineRepo
 
 /* [one-bar] the editor's own toolbar is the one bar; the sheet's handle stays for the rig but is not shown */
 .hc-video-editor .hc-grab.hc-host-chrome { display: none; }
+/* [rec-quality] the opt-in recording detail, under Save */
+.hc-quality { margin-top: 14px; padding-top: 12px; border-top: 1px solid rgba(255, 255, 255, .1); display: grid; gap: 6px; }
+.hc-quality-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
+.hc-quality-head b { font-size: 13px; }
+.hc-quality-now { color: #8de1ed; font-size: 12px; }
+.hc-quality-range { width: 100%; }
+.hc-quality-ticks { display: flex; justify-content: space-between; gap: 6px; font-size: 11px; color: #8fa0ad; }
+.hc-quality-ticks span.at { color: #edf3f5; font-weight: 600; }
+.hc-quality-note { font-size: 12px; color: #b9c8d2; }
+.hc-quality-go { justify-self: start; }
+.hc-quality-go[hidden] { display: none; }

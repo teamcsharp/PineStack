@@ -2062,6 +2062,82 @@
       body.appendChild(videoOnlyRow);
     }
     body.appendChild(save);
+    /* [rec-quality] "Add a slider ... allowing me to opt in and set the
+     * quality at the expense of recording time. Dont change any settings or
+     * quality now ... I might want to do it for moments and then go back to
+     * the current settings ... turns off after 2 hours or resets on
+     * rebroadcast" (the operator, 2026-09-30). The tablet's own ring
+     * (ScreenReplay.setQuality): Standard is today's recording; a level is
+     * only taken after its confirm, because the ring starts fresh at it. */
+    if (has('replayQuality')) body.appendChild(qualityBlock());
+    function qualityBlock() {
+      var box = make('div', 'hc-quality');
+      var head = make('div', 'hc-quality-head');
+      head.appendChild(make('b', '', 'Recording detail'));
+      var now = make('span', 'hc-quality-now', 'reading...');
+      head.appendChild(now);
+      box.appendChild(head);
+      var q = make('input', 'hc-quality-range');
+      q.type = 'range'; q.min = '0'; q.max = '2'; q.step = '1'; q.value = '0';
+      q.setAttribute('aria-label', 'Recording detail - more detail holds less time');
+      q.title = 'More detail holds less time';
+      var marks = make('div', 'hc-quality-ticks');
+      var note = make('div', 'hc-quality-note', '');
+      var go = make('button', 'hc-btn hc-quality-go', '');
+      go.type = 'button';
+      go.hidden = true;
+      box.appendChild(q); box.appendChild(marks); box.appendChild(note); box.appendChild(go);
+      var state = null;
+      function paint(s) {
+        if (s) state = s;
+        if (!state) return;
+        var lv = state.levels || [];
+        if (marks.replaceChildren) marks.replaceChildren(); else marks.innerHTML = '';
+        lv.forEach(function (l, i) {
+          marks.appendChild(make('span', i === Number(q.value) ? 'at' : '',
+            l.label + ' - about ' + fmtSeconds(Number(l.holds_seconds) || 0)));
+        });
+        var cur = lv[Number(state.level)] || {};
+        now.textContent = Number(state.level) > 0
+          ? cur.label + ' - back to Standard in ' + fmtSeconds(Number(state.left_seconds) || 0)
+          : 'Standard';
+        var want = Number(q.value), pick = lv[want] || {};
+        if (want === Number(state.level)) {
+          go.hidden = true;
+          note.textContent = Number(state.level) > 0
+            ? 'Recording in ' + cur.label + '. Slide back to Standard to end it now.'
+            : 'Slide right for more detail and less time held. It turns itself back to Standard after 2 hours, or whenever the tablet restarts.';
+        } else {
+          go.hidden = false;
+          go.textContent = 'Switch to ' + pick.label;
+          note.textContent = 'Switching starts the recording fresh at ' + pick.label
+            + ': what the ring holds now - picture and sound - is dropped.';
+        }
+      }
+      q.addEventListener('input', function () { paint(); });
+      q.addEventListener('change', function () { paint(); });
+      go.addEventListener('click', function () {
+        var want = Number(q.value);
+        go.disabled = true;
+        note.textContent = 'switching...';
+        Promise.resolve(bridge().replayQuality({level: want})).then(function (s) {
+          go.disabled = false;
+          q.value = String(Number(s && s.level) || 0);
+          paint(s);
+          if (s && s.ok === false) toast('the recorder would not start: ' + (s.detail || ''), true);
+          else toast('Recording detail: ' + ((s && s.label) || ''));
+        }, function (err) {
+          go.disabled = false;
+          toast('could not switch: ' + String((err && err.message) || err), true);
+          paint();
+        });
+      });
+      Promise.resolve(bridge().replayQuality()).then(function (s) {
+        q.value = String(Number(s && s.level) || 0);
+        paint(s);
+      }, function () { now.textContent = 'unavailable on this surface'; });
+      return box;
+    }
 
     var table = stepTable(0);
     function paintTicks() {

@@ -165,6 +165,7 @@
     pineCam: promised("pineCam"),
     pineStream: promised("pineStream"),   // [pinestream] run | stop | state
     memPrefs: promised("memPrefs"),       // [memprefs] {replayMb} - the replay ring's ceiling
+    replayQuality: promised("replayQuality"),   // [rec-quality] () state | ({level}) opt in
     /* #1427: the rolling screen recorder's switch. */
     replayRun: promised("replayRun"),
 
