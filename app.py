@@ -10384,6 +10384,18 @@ DIALOGUE_STARVED_AFTER = 240.0
 DIALOGUE_STARVED_REST = 300.0          # one starved round at a time
 
 
+# [dialogue-clock] what may reset the quiet clock: a person's dialogue only
+DIALOGUE_NOT_KINDS = frozenset({"station_id", "drop", "sfx", "sting", "sfxguy", "marker", "image_analysis",
+                                "song_analysis", "chat", "record", "hangup"})
+DIALOGUE_NOT_WHO = frozenset({"drop", "board", "analysis", "box", "deck", "outside", "sfxguy"})
+
+
+def dialogue_counts(who: Any = "", kind: Any = "") -> bool:
+    """[dialogue-clock] is this line dialogue - may it reset _DIALOGUE_AT?"""
+    return (str(kind or "") not in DIALOGUE_NOT_KINDS
+            and str(who or "") not in DIALOGUE_NOT_WHO)
+
+
 def dialogue_starved() -> tuple[bool, int]:
     """(is the air starved of dialogue, seconds since the last line)."""
     try:
@@ -30460,8 +30472,8 @@ def page_feed_append(clip: dict[str, Any]) -> str:
         delivery_id = str(clip.get("delivery_id") or uuid.uuid4().hex[:16])
         clip["delivery_id"] = delivery_id
         clip.setdefault("delivery_state", "published")
-        if str(clip.get("text") or "").strip():
-            _DIALOGUE_AT[0] = time.time()       # 2026-09-07: the page counts as air
+        if str(clip.get("text") or "").strip() and dialogue_counts(clip.get("who"), clip.get("kind")):
+            _DIALOGUE_AT[0] = time.time()       # 2026-09-07: the page counts as air [dialogue-clock]
         clip.setdefault("ts", int(time.time() * 1000))
         if not clip.get("broadcast_ms"):
             clip["broadcast_ms"] = int(max(
@@ -38764,7 +38776,8 @@ async def _dj_speak_floorless(kind: str, track: dict[str, Any] | None = None,
     page_delivery_apply(entry, page_delivery)
     _RADIO["chat"].append(entry)
     _RADIO["last_said"] = {**entry, "voice": forced or ""}
-    _DIALOGUE_AT[0] = time.time()                                # 2026-09-07
+    if dialogue_counts(entry.get("who"), entry.get("kind")):          # [dialogue-clock]
+        _DIALOGUE_AT[0] = time.time()                                # 2026-09-07
     # Capture the line into the rolling episode recording (#548).
     if clip and clip.get("path"):
         await _episode_stage(clip["path"],
@@ -121832,6 +121845,15 @@ async def generate_answer(
     # newest script report's verdict and explanation, and the last ten
     # minutes of gaps, said plainly. A question, so it stays under the
     # commands and above the model.
+    if parse_show_doctor(user_text):                                     # [show-doctor]
+        feature_meta["system_status_used"] = True
+        return (await show_doctor()), {
+            **feature_meta,
+            "active_prompt": prompt_entry["name"],
+            "model": "show-doctor",
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+        }
     if parse_what_happened(user_text):
         feature_meta["system_status_used"] = True
         return (await asyncio.to_thread(script_happened_words)), {
@@ -146438,6 +146460,116 @@ def script_happened_words() -> str:
 _HAPPENED_RX = re.compile(
     r"^(?:pine\s*box[, ]+)?(?:so[, ]+)?(?:what|why)\b.{0,40}\b(?:happen|went wrong|go wrong|"
     r"jump|jumped|glitch|broke|broken|erratic|out of order|highlight|script)", re.I)
+
+
+# [show-doctor] "where are the DJs / I'm not hearing the DJs / what happened to
+# the show" - a troubleshooting tree that fixes what the station owns
+_SHOW_DOCTOR_RX = re.compile(
+    r"where (?:are|did|is|have) (?:the |my |our )?(?:djs?|hosts?|show|voices?|dialogue)"
+    r"|(?:not|n't|never|no one|nobody)\b.{0,12}\b(?:hear|hearing)\b.{0,40}\b"
+    r"(?:djs?|hosts?|voices?|talk\w*|dialogue|show|broadcast|them|anyone|anybody)"
+    r"|\bno (?:djs?|dialogue|talking|voices|hosts)\b"
+    r"|what(?:'s| is| has)? (?:happen(?:ed|ing)?|wrong|going on) (?:to|with) (?:the |my |our )?"
+    r"(?:show|broadcast|djs?|station|hosts?|dialogue|voices?|radio)"
+    r"|(?:fix|get back|bring back|restart|troubleshoot|diagnose) (?:the |my )?(?:show|djs?|broadcast|dialogue|hosts?|voices?)"
+    r"|(?:djs?|hosts?|show|broadcast|dialogue|voices?) (?:(?:are|is|went|has gone|have gone) )?"
+    r"(?:quiet|silent|gone|missing|not talking|stopped|dead|off)", re.I)
+
+
+def parse_show_doctor(text: str) -> bool:
+    t = " ".join(str(text or "").lower().split())
+    return bool(t) and len(t) < 220 and bool(_SHOW_DOCTOR_RX.search(t))
+
+
+async def show_doctor() -> str:
+    """[show-doctor] walk the tree, cure what the station owns, say it plainly."""
+    now = time.time()
+    found: list[str] = []
+    did: list[str] = []
+    # 1. on air
+    if not _RADIO.get("on"):
+        say = "The station is switched off, so nobody is talking. Say start the radio to bring the DJs back."
+        pipeline_log("air", "show doctor: the station is off [show-doctor]")
+        return say
+    if radio_paused():
+        mins = int(radio_paused_for() // 60)
+        say = ("The station is paused%s, so the DJs are off air while the rooms work. "
+               "Say resume the show to bring them back." % ((" for %d minutes" % mins) if mins else ""))
+        pipeline_log("air", "show doctor: paused %d min [show-doctor]" % mins)
+        return say
+    # 2. listeners
+    try:
+        roster = listener_roster()
+    except Exception:  # noqa: BLE001
+        roster = []
+    kinds = sorted({str(r.get("what") or r.get("kind") or "a page") for r in roster})
+    tablet_here = any(str(r.get("kind") or "") == "pinetab" for r in roster)
+    if not roster:
+        found.append("no screen or speaker is connected to the station")
+    elif not tablet_here:
+        found.append("the PineTab is not connected")
+    # 3. heard
+    try:
+        chk = unheard_air_check(now)
+    except Exception:  # noqa: BLE001
+        chk = None
+    owner = ""
+    try:
+        owner = audio_owner()
+    except Exception:  # noqa: BLE001
+        pass
+    if chk or (not owner and len(roster) > 1):
+        if chk:
+            found.append("%d lines went out and nobody heard them" % chk["lines"])
+        else:
+            found.append("nobody owned the air while %d screens were listening" % len(roster))
+        try:
+            gave = unheard_air_rescue(chk or {})
+        except Exception:  # noqa: BLE001
+            gave = ""
+        if gave:
+            _UNHEARD["rescued_at"] = now
+            did.append("gave the air to " + gave.split(" (")[0])
+    # 4. talk
+    try:
+        quiet = int(now - float(_DIALOGUE_AT[0] or 0))
+    except Exception:  # noqa: BLE001
+        quiet = 0
+    if quiet >= 150:
+        why = ""
+        for row in reversed(list(_RADIO.get("pipeline") or [])[-80:]):
+            text = str(row.get("text") or "")
+            if any(k in text for k in ("live writing is refused", "cupboard is empty", "BARE ARRIVAL",
+                                       "produced no audio", "withheld")):
+                why = text
+                break
+        found.append("nobody has talked for %d minutes%s" % (max(1, quiet // 60),
+                     (" - " + (why if len(why) <= 120 else why[:120].rsplit(" ", 1)[0] + "...")) if why else ""))
+        _STARVED_WRITE_AT[0] = 0.0
+        _DIALOGUE_AT[0] = min(float(_DIALOGUE_AT[0] or 0), now - DIALOGUE_STARVED_AFTER - 1)
+        did.append("asked the writers for a live round right now")
+    # 5. voices
+    try:
+        tried, done = float(_SYNTH_TRIED[0] or 0), float(_LAST_SYNTH[0] or 0)
+        if tried and now - tried < 300 and now - done > 300:
+            found.append("the voice engine has been asked for voices but has not finished one in five minutes")
+    except Exception:  # noqa: BLE001
+        pass
+    # 6. routing
+    if str(_RADIO.get("voice_to") or "") == "box" and not _RADIO.get("box_audible", True):
+        found.append("the voices are routed to the box alone and the box is not being heard")
+    pipeline_log("air", "show doctor: found %s; did %s; listening: %s [show-doctor]"
+                 % ("; ".join(found) or "nothing wrong", "; ".join(did) or "nothing",
+                    ", ".join(kinds) or "nobody"))
+    if not found:
+        return ("The show is on and being heard on %s, and the DJs are talking. If you still hear nothing, "
+                "check the volume on that screen." % (", ".join(kinds) or "the station"))
+    say = "Here is what I found: " + "; ".join(found[:3]) + "."
+    if did:
+        say += " I " + " and ".join(did) + ", so the DJs should be back within a minute or two."
+    else:
+        say += " That one needs a hand on the device itself."
+    return say
 
 
 def parse_what_happened(text: str) -> bool:
