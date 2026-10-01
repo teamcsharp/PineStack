@@ -604,4 +604,11 @@ class CardsFree(unittest.TestCase):
     def test_turned_on_it_is_yesterdays_hold(self):
         rg.save({"gap": 1.0, "roll": False, "cards_hold": True})
         self.assertTrue(rg.cards_hold())
-        self.assertGreater(rg.planner_seam(), 1.0)
+        was = rg.expected_buildup_s
+        rg.expected_buildup_s = lambda: 2.0          # the measured mean is history; pin it
+        try:
+            self.assertEqual(rg.planner_seam(), 3.0)
+            rg.save({"cards_hold": False})
+            self.assertEqual(rg.planner_seam(), 1.0)
+        finally:
+            rg.expected_buildup_s = was

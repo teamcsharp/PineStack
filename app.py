@@ -83895,6 +83895,24 @@ def banter_gap(overlap: int) -> float:
     return round(max(0.0, base * random.uniform(0.65, 1.35)), 3)
 
 
+def reply_pause_s(meta: Any = None, who: str = "", text: str = "", road: str = "turns") -> float:
+    """[cards-free] The pause after a spoken turn on the turn-by-turn road (the box,
+    a weld that failed, a replayed line): the operator's reply gap - its roll when
+    the roulette is on - and nothing else. "I need the dialogue able to play at
+    whatever speed and interval we have set it to ... if the pause between replies
+    is instant ... they talk one after another" (2026-10-01). Without the reply-gap
+    module, the old jitter stands."""
+    try:
+        if _reply_gap is not None:
+            return max(0.0, float(_reply_gap.draw(meta, str(who or ""), str(text or "")[:200], "", road)["s"]))
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        return banter_gap(int(dj_settings().get("overlap") or 0))
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
 NEW_VOICE_NAMES = ("Marlowe", "Cass", "Dex", "Rue", "Sal", "Vinny", "Jo",
                    "Kit", "Reggie", "Nadia", "Otis", "Pearl")
 
@@ -114125,15 +114143,11 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
         if item["turn_end"]:
             if not item.get("listening_response"):
                 content_turns_spoken += 1
-            if item.get("big") and out:
-                # The stunned beat (#320): a whole monologue just landed
-                # and the room sits with it before anyone dares follow.
-                # #769: 2.8 s flat was long enough to read as a fault. Still
-                # a beat, no longer a hole, and never the same twice.
-                await asyncio.sleep(random.uniform(1.05, 1.7))
-            # dj_speak returns only once the line has actually been spoken,
-            # so this is just a beat between turns, not a guess at length.
-            await asyncio.sleep(banter_gap(dj["overlap"]))
+            # [cards-free] the pause between two turns is the operator's reply gap
+            # and nothing else: the stunned beat after a monologue (#320, a
+            # random 1-1.7 s outside System 3) and the overlap jitter (#769) are
+            # gone from this road - the reply gap (and its roll) is the one clock.
+            await asyncio.sleep(reply_pause_s(ready_meta, who, out))
         # A cut only lands between turns (#520): re-arm after each item so
         # the next iteration's guard may fire, but only at a turn boundary.
         # #805: …and NEVER during a live call — this re-arm was quietly
@@ -172314,11 +172328,11 @@ async def _replay_volley(line: str, who: str) -> None:
     so the button comes back the moment the replay itself has aired."""
     try:
         other = "cohost" if who == "dj" else "dj"
-        await asyncio.sleep(banter_gap(dj_settings()["overlap"]))
+        await asyncio.sleep(reply_pause_s(None, who, line, "replay"))      # [cards-free]
         reply = await dj_speak("reply", _RADIO.get("now"), extra=line,
                                who=other, by_hand=True)
         if reply and s3_chance("replay.last_word", 0.5, "the first speaker gets the last word on a replayed line (#266)"):   # [s3-dice-door]
-            await asyncio.sleep(banter_gap(dj_settings()["overlap"]))
+            await asyncio.sleep(reply_pause_s(None, other, reply, "replay"))   # [cards-free]
             await dj_speak("reply", _RADIO.get("now"), extra=reply,
                            who=who, by_hand=True)
     except Exception:
@@ -242511,8 +242525,11 @@ function pineReplyGapFloor(clip) {
   const g = clip && clip.gap_before;
   if (!g || !pineReplyGapEndAt) return 0;
   const s = Number(g.s);
-  return (isFinite(s) && s >= 0)
-    ? pineReplyGapEndAt + s * 1000 + pineReplyGapBuild(clip) - pineReplyGapOverlap(clip) : 0;
+  if (!(isFinite(s) && s >= 0)) return 0;
+  /* [cards-free] an instant pause is words on words, whatever the cards do: the
+   * door already starts it on the last words, and the player must not hold it */
+  if (s <= 0) return pineReplyGapEndAt;
+  return pineReplyGapEndAt + s * 1000 + pineReplyGapBuild(clip) - pineReplyGapOverlap(clip);
 }
 /* [reply-gap:sting-overlap] the part of this card's buildup that runs during
  * the sting before it (the station stamped it; the words do not wait for it) */
@@ -275148,8 +275165,11 @@ function pineReplyGapFloor(clip) {
   const g = clip && clip.gap_before;
   if (!g || !pineReplyGapEndAt) return 0;
   const s = Number(g.s);
-  return (isFinite(s) && s >= 0)
-    ? pineReplyGapEndAt + s * 1000 + pineReplyGapBuild(clip) - pineReplyGapOverlap(clip) : 0;
+  if (!(isFinite(s) && s >= 0)) return 0;
+  /* [cards-free] an instant pause is words on words, whatever the cards do: the
+   * door already starts it on the last words, and the player must not hold it */
+  if (s <= 0) return pineReplyGapEndAt;
+  return pineReplyGapEndAt + s * 1000 + pineReplyGapBuild(clip) - pineReplyGapOverlap(clip);
 }
 /* [reply-gap:sting-overlap] the part of this card's buildup that runs during
  * the sting before it (the station stamped it; the words do not wait for it) */
