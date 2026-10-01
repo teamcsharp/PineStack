@@ -65941,6 +65941,13 @@ def s3_callend_topic_turns(turns: Any, call_meta: Any) -> list[Any]:
     rows = list(turns or [])
     try:
         ce = call_meta.get("callend") if isinstance(call_meta, dict) else None
+        # [s3-callarc] ...and without the caller's DETOUR: those turns are off the subject on
+        # purpose (the roulette sent them there), so they are not graded against it
+        skip = {int(i) for i in ((ce or {}).get("detour_turns") or []) if isinstance(i, int)} \
+            if isinstance(ce, dict) else set()
+        if skip and len(rows) > len(skip) + 3:
+            rows = [r for i, r in enumerate(rows) if i not in skip]
+            ce = dict(ce, end_turns=ce.get("end_turns"))
         k = int(ce.get("end_turns") or 0) if isinstance(ce, dict) and ce.get("planned") else 0
         if k > 1 and len(rows) > k + 2:
             return rows[:len(rows) - k] + rows[-1:]
@@ -115747,6 +115754,22 @@ async def dj_banter(track: dict[str, Any] | None = None,
                 if _s3 is not None and _s3.active and _s3.sheet:
                     _beat_sheet = _s3.sheet
                     _s3_owns = True
+                    # [s3-callarc] a call is as long as System 3 planned it (its arc and its
+                    # detour) - the booth withholds a round whose limit is under its plan
+                    if int(getattr(_s3, "turns", 0) or 0) > int(lines or 0):
+                        lines = int(_s3.turns)
+                    # ...and when its result is the manager cutting in, seat E is HIM: his
+                    # name and his own voice, bound before a word is written
+                    _ce_mark = (call_meta or {}).get("callend") if isinstance(call_meta, dict) else None
+                    if (isinstance(_ce_mark, dict) and ((_ce_mark.get("resolve") or {}).get("manager_act"))
+                            and not caller2_name):
+                        caller2_name = manager_call_name()
+                        try:
+                            caller2_voice = (await manager_call_voice())[0] or caller2_voice
+                        except Exception:  # noqa: BLE001
+                            pass
+                        pipeline_log("system3", "the manager cuts into this call - %s on seat E, in his own voice"
+                                     % caller2_name)
                 elif _s3_active():
                     pipeline_log("system3", "call withheld because its running order was not directed")
                     return []
@@ -118287,6 +118310,57 @@ def manager_call_name() -> str:
                 or "the manager upstairs")
     except Exception:  # noqa: BLE001
         return "the manager upstairs"
+
+
+_CALL_BACKGROUND: dict[str, Any] = {"at": 0.0, "value": {}}
+
+
+def _memo_said(text: str) -> str:
+    """A memo round's words without the speaker marks - what was said, cut short."""
+    try:
+        turns = banter_turns(str(text or ""))
+        said = " ".join(t for _w, t in turns) if turns else str(text or "")
+    except Exception:  # noqa: BLE001
+        said = str(text or "")
+    return " ".join(said.split())[:320]
+
+
+def system3_call_background() -> dict[str, Any]:
+    """[s3-callarc] What the station has in play when a call is planned - the manager's
+    latest memo (the newest one that aired, else the newest banked), a headline off the
+    news cache, a painting off the unsold pile and the manager's name - for the call's
+    detour and its result wheel (CALLSHIFT1, RESOLVE2). Read from the station's own
+    records, cached a minute, never a fetch; never raises."""
+    now = time.time()
+    if now - float(_CALL_BACKGROUND["at"] or 0) < 60.0 and _CALL_BACKGROUND["value"]:
+        return dict(_CALL_BACKGROUND["value"])
+    out: dict[str, Any] = {"manager": manager_call_name()}
+    try:
+        memos = [m for m in manager_memos_list() if isinstance(m, dict) and str(m.get("text") or "").strip()]
+        aired = [m for m in memos if int(m.get("uses") or 0) > 0]
+        pick = max(aired or memos, key=lambda m: float(m.get("last") or m.get("ts") or 0), default=None)
+        if pick:
+            out["memo"] = _memo_said(str(pick.get("text") or ""))
+            out["memo_id"] = str(pick.get("id") or "")
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        heads = [h for h in (_DRUDGE_CACHE.get("headlines") or []) if isinstance(h, dict) and h.get("title")]
+        if heads:
+            out["news"] = str(random.choice(heads[:12]).get("title") or "")[:200]
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        pile = [p for p in hawk_unsold() if isinstance(p, dict) and p.get("name")]
+        if pile:
+            got = random.choice(pile)
+            out["unsold"] = {"name": str(got.get("name")), "title": str(got.get("name")).rsplit("/", 1)[-1]
+                             .rsplit(".", 1)[0].replace("_", " "),
+                             "price": got.get("price"), "desc": str(got.get("desc") or "")[:200]}
+    except Exception:  # noqa: BLE001
+        pass
+    _CALL_BACKGROUND.update(at=now, value=out)
+    return dict(out)
 
 
 async def manager_call_voice() -> tuple[str, bool]:

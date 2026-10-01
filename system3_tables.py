@@ -1246,6 +1246,203 @@ WRAP1 = {
 }
 DEFAULT_TABLES += [RESOLVE1, WRAP1]                                              # [s3-callend]
 
+# --- [s3-callarc] THE CALL AS RADIO: ITS ARC, ITS DETOUR, ITS RESULT -------------------
+#
+# 2026-10-01, the operator: "whenever they call the calls need to have a resolution or
+# an escalation or an argument or a confrontation and then lead to a result. Like they
+# win a prize, like they get one of the paintings and are enthusiastic about it ...
+# trigger the manager to say something, or say something about the manager or his
+# message or have something to say about the news. Customers should call in and talk
+# about one thing and then change topics to talk about another thing ... a roulette to
+# roll for a topic change ... 80% they should change topic and subsequent rolls should
+# have a graduating chance of rolling a change to say something to drive the customer
+# back on topic and if the roll fails the customer goes even further into their tangent."
+#
+# CALLARC1 - the shape of the call's middle, one roll per call. The category is the arc;
+# its `beats` are the legs it plays between the caller's second detail and the result
+# (C the caller, A the host, B the co-host - a call with no co-host gives B's beats to A).
+# Every arc opens and closes on the caller, so the topic detour fits after its first beat
+# and the result's station seat answers its last. The item is the arc's temperature, said
+# on every beat as `{tone}`. {topic} is what they rang about.
+CALLARC1 = {
+    "id": "CALLARC1", "family": "CALLARC", "label": "Call arc (the shape of the call's middle)", "version": 1,
+    "enabled": True, "weight": 1.0, "roads": ["caller"],
+    "description": "Rolled once per call: how its middle plays out between the caller's story and the result. "
+                   "The category is the arc and its `beats` are the turns it plays (C caller, A host, B co-host); "
+                   "the item is the temperature, said on every beat as {tone}. {topic} is what they rang about.",
+    "categories": [
+        {"id": "resolution", "label": "Resolution - they work it out", "weight": 1.0,
+         "beats": [
+             {"id": "arc_problem", "seat": "C", "label": "Lays out the problem",
+              "act": "{FIRST} LAYS OUT EXACTLY WHAT IS WRONG about {topic} - the real problem, specifically ({tone})."},
+             {"id": "arc_works", "seat": "A", "label": "Works it with them",
+              "act": "WORKS THE PROBLEM WITH {FIRST}: one practical idea, said plainly ({tone})."},
+             {"id": "arc_settles", "seat": "C", "label": "It settles",
+              "act": "{FIRST} TAKES THE IDEA AND IT SETTLES - says what they will do now ({tone})."}],
+         "items": _items([
+             {"id": "warm", "label": "Warm", "tone": "warm, and a little relieved"},
+             {"id": "practical", "label": "Practical", "tone": "brisk and practical"},
+             {"id": "sheepish", "label": "Sheepish", "tone": "sheepish - they knew the answer all along"}])},
+        {"id": "escalation", "label": "Escalation - it gets worse", "weight": 1.0,
+         "beats": [
+             {"id": "arc_raises", "seat": "C", "label": "Raises the stakes",
+              "act": "{FIRST} RAISES THE STAKES on {topic}: it is worse than they first said, and here is how ({tone})."},
+             {"id": "arc_fuels", "seat": "B", "label": "Says the wrong thing",
+              "act": "SAYS THE ONE THING THAT MAKES IT WORSE - an aside that lands badly ({tone})."},
+             {"id": "arc_boils", "seat": "C", "label": "Boils over",
+              "act": "{FIRST} BOILS OVER - louder, faster, and the real grievance under all of it comes out ({tone})."}],
+         "items": _items([
+             {"id": "slow_burn", "label": "Slow burn", "tone": "a slow burn that finally catches"},
+             {"id": "hot", "label": "Hot from the start", "tone": "hot from the first word"},
+             {"id": "comic", "label": "Comic", "tone": "comically out of proportion"}])},
+        {"id": "argument", "label": "Argument - they disagree", "weight": 1.0,
+         "beats": [
+             {"id": "arc_claim", "seat": "C", "label": "Makes a claim",
+              "act": "{FIRST} MAKES A CLAIM about {topic} and stands on it ({tone})."},
+             {"id": "arc_push", "seat": "A", "label": "Pushes back",
+              "act": "PUSHES BACK on that exact claim with a counter of your own ({tone})."},
+             {"id": "arc_digs", "seat": "C", "label": "Digs in",
+              "act": "{FIRST} DIGS IN - says it again, harder, with a new reason ({tone})."},
+             {"id": "arc_counter", "seat": "B", "label": "Joins the fight",
+              "act": "JOINS THE ARGUMENT - takes a side, and it may not be the host's ({tone})."},
+             {"id": "arc_holds", "seat": "C", "label": "Holds the line",
+              "act": "{FIRST} HOLDS THE LINE - or gives one inch and makes a show of it ({tone})."}],
+         "items": _items([
+             {"id": "civil", "label": "Civil", "tone": "civil, but neither will give"},
+             {"id": "petty", "label": "Petty", "tone": "petty, over something small"},
+             {"id": "heated", "label": "Heated", "tone": "heated, talking over each other"}])},
+        {"id": "confrontation", "label": "Confrontation - they come for the station", "weight": 0.8,
+         "beats": [
+             {"id": "arc_accuses", "seat": "C", "label": "Accuses the station",
+              "act": "{FIRST} ACCUSES THE STATION - or one of you by name - of something specific about {topic} ({tone})."},
+             {"id": "arc_deflects", "seat": "A", "label": "Deflects",
+              "act": "DENIES IT OR DEFLECTS, badly ({tone})."},
+             {"id": "arc_corners", "seat": "C", "label": "Corners them",
+              "act": "{FIRST} CORNERS YOU with a detail you cannot dodge ({tone})."},
+             {"id": "arc_owns", "seat": "B", "label": "Faces it",
+              "act": "FACES IT - owns it, or fires straight back ({tone})."},
+             {"id": "arc_demands", "seat": "C", "label": "Makes a demand",
+              "act": "{FIRST} MAKES A DEMAND - what they want done about it, now ({tone})."}],
+         "items": _items([
+             {"id": "icy", "label": "Icy", "tone": "icy and precise"},
+             {"id": "furious", "label": "Furious", "tone": "furious"},
+             {"id": "wounded", "label": "Wounded", "tone": "wounded - they expected better of you"}])},
+    ],
+}
+
+# CALLSHIFT1 - the caller's detour. `first_odds` is the chance a call changes topic at
+# all; after it does, each steer-back roll comes up `back_start` + `back_step` x (the
+# number of rolls before it) - a GRADUATING chance - and a roll that misses sends the
+# caller further down the tangent, at most `most` times. The category is where the new
+# subject comes from: the station's real material where it is in play (`requires`:
+# memo - the manager's latest memo, news - a headline, gallery - a painting on the
+# wall's unsold pile, passage - the call's own speakerbox passage) or the caller's own
+# life; the item is the bridge they cross it on, said as {bridge}. {subject} is the new
+# subject, {topic} what they rang about.
+CALLSHIFT1 = {
+    "id": "CALLSHIFT1", "family": "CALLSHIFT", "label": "Call detour (the caller changes the subject)",
+    "version": 1, "enabled": True, "weight": 1.0, "roads": ["caller"],
+    "first_odds": 0.8, "back_start": 0.35, "back_step": 0.2, "most": 3,
+    "description": "Whether the caller changes the subject (first_odds), where the new subject comes from (the "
+                   "category - the manager's memo, the news, the gallery, the call's passage or their own life) "
+                   "and the bridge they cross it on (the item). After a detour, each steer-back roll's chance "
+                   "rises by back_step from back_start; a miss takes the caller further off topic, at most `most` "
+                   "times.",
+    "categories": [
+        {"id": "memo", "label": "The manager's latest memo", "weight": 1.2, "requires": ["memo"], "source": "memo",
+         "items": _items([
+             {"id": "speaking_of", "label": "Speaking of which", "bridge": "\"speaking of which - that memo\""},
+             {"id": "heard_upstairs", "label": "I heard what upstairs said", "bridge": "\"and while I've got you, I heard what your boss put out\""}])},
+        {"id": "news", "label": "Something in the news", "weight": 1.0, "requires": ["news"], "source": "news",
+         "items": _items([
+             {"id": "did_you_see", "label": "Did you see", "bridge": "\"did you see the news, though?\""},
+             {"id": "reminds_me", "label": "That reminds me", "bridge": "\"that reminds me of this thing I read\""}])},
+        {"id": "gallery", "label": "A painting on the wall", "weight": 0.8, "requires": ["gallery"], "source": "gallery",
+         "items": _items([
+             {"id": "that_painting", "label": "About that painting", "bridge": "\"totally unrelated - that painting you've been on about\""}])},
+        {"id": "passage", "label": "The call's own passage", "weight": 0.6, "requires": ["passage"], "source": "passage",
+         "items": _items([
+             {"id": "read_this", "label": "I read this thing", "bridge": "\"okay, I have to tell you what I read\""}])},
+        {"id": "life", "label": "Their own life", "weight": 1.0, "source": "life",
+         "items": _items([
+             {"id": "neighbour", "label": "The neighbour", "bridge": "\"oh - and my neighbour\"", "subject": "their neighbour, who has done something"},
+             {"id": "car", "label": "The car", "bridge": "\"which, by the way, my car\"", "subject": "what is wrong with their car"},
+             {"id": "cousin", "label": "The cousin", "bridge": "\"this is like my cousin\"", "subject": "a cousin with a scheme"},
+             {"id": "job", "label": "Work", "bridge": "\"you know what this is like? my job\"", "subject": "their boss at work"}])},
+    ],
+}
+
+# RESOLVE2 - the station's own business as the caller's result: the manager cuts into the
+# call in his own voice (seat E, his latest memo in hand), the caller has their say on
+# that memo or on the news, or wins a painting off the unsold pile. A second table so a
+# stored RESOLVE1 is left as the operator edited it; the wheel rolls across both by
+# weight. requires: memo - a memo on the book, news - a headline, unsold - a painting on
+# the pile. {memo}, {news} and {unsold} are those; {manager} his name.
+RESOLVE2 = {
+    "id": "RESOLVE2", "family": "RESOLVE", "label": "Resolution (the station's business: the manager, the news, the pile)",
+    "version": 1, "enabled": True, "weight": 1.0, "roads": ["caller"],
+    "responses": {"1": 2.0, "2": 1.0},
+    "responders": {"A": 1.0, "B": 1.0, "D": 0.6, "S": 0.8},
+    "description": "Results that come out of what the station is doing: the manager cutting into the call in his "
+                   "own voice (seat E) with his latest memo, the caller's say on that memo or on the news, a "
+                   "painting off the unsold pile won outright. Rolled with RESOLVE1 by weight.",
+    "categories": [
+        {"id": "manager", "label": "The manager cuts into the call", "weight": 1.0, "requires": ["memo"],
+         "seat_in": "E", "offer": "hears the line click - the manager is on it",
+         "items": _items([
+             {"id": "scolds", "label": "He scolds the caller", "tags": ["manager"],
+              "manager": "{MANAGER} CUTS INTO THE CALL in his own voice and SCOLDS {first} - by the book, quoting his own memo: {memo}",
+              "text": "{FIRST} ANSWERS THE MANAGER BACK, directly",
+              "respond": "tries to smooth it over with the manager still on the line",
+              "emotions": {"surprise": 2.0, "anger": 1.2}},
+             {"id": "sides", "label": "He sides with the caller", "tags": ["manager"],
+              "manager": "{MANAGER} CUTS INTO THE CALL in his own voice and SIDES WITH {first} against the booth, waving his memo: {memo}",
+              "text": "{FIRST} IS DELIGHTED to have the boss on their side, and rubs it in",
+              "respond": "cannot believe the manager took the caller's side",
+              "emotions": {"joy": 2.0, "surprise": 1.5}},
+             {"id": "offers", "label": "He offers the caller something", "tags": ["manager", "won"],
+              "prize": {"pool": "call.prizes", "defaults": list(CALL_PRIZES)},
+              "manager": "{MANAGER} CUTS INTO THE CALL in his own voice and, grudgingly, OFFERS {first} {prize} - as long as they stop mentioning the memo: {memo}",
+              "text": "{FIRST} TAKES {prize}, and mentions the memo anyway",
+              "respond": "makes the most of the manager giving something away",
+              "emotions": {"joy": 2.2}}])},
+        {"id": "memo_remark", "label": "The caller's say on the manager's memo", "weight": 0.8, "requires": ["memo"],
+         "offer": "asks {first} what they made of the manager's latest memo",
+         "items": _items([
+             {"id": "mocks", "label": "Mocks the memo", "tags": ["memo"],
+              "text": "{FIRST} TAKES THE MEMO APART, line by line: {memo}", "respond": "cannot defend it"},
+             {"id": "agrees", "label": "Agrees with the memo", "tags": ["memo"],
+              "text": "{FIRST} AGREES WITH THE MANAGER, to the hosts' horror: {memo}", "respond": "is betrayed"},
+             {"id": "demands_read", "label": "Demands it be read out", "tags": ["memo"],
+              "text": "{FIRST} DEMANDS THE MEMO BE READ OUT, and reacts to every line of it: {memo}",
+              "respond": "reads one more line of it than they should"}])},
+        {"id": "news_remark", "label": "The caller's take on the news", "weight": 0.8, "requires": ["news"],
+         "offer": "asks {first} what they make of the news",
+         "items": _items([
+             {"id": "hot_take", "label": "A hot take", "tags": ["news"],
+              "text": "{FIRST} GIVES A HOT TAKE on the news - {news} - and will not be moved"},
+             {"id": "conspiracy", "label": "A theory", "tags": ["news"],
+              "text": "{FIRST} HAS A THEORY about the news - {news} - and it connects to the station somehow"},
+             {"id": "personal", "label": "It happened to them", "tags": ["news"],
+              "text": "{FIRST} SAYS THE NEWS HAPPENED TO THEM - {news} - and tells you how"}])},
+        {"id": "unsold", "label": "A painting off the unsold pile", "weight": 1.0, "requires": ["unsold"],
+         "offer": "tells {first} they have WON one of the paintings off the unsold pile - {unsold}",
+         "items": _items([
+             {"id": "wins_painting", "label": "Wins a painting, thrilled", "tags": ["won", "painting"],
+              "effect": "awarded",
+              "text": "{FIRST} IS THRILLED - genuinely, wildly enthusiastic about winning {unsold}, and says where it will hang",
+              "respond": "is moved by how much {first} wanted it",
+              "emotions": {"joy": 3.0, "surprise": 2.0}},
+             {"id": "wins_wrong", "label": "Wins it, wanted the other one", "tags": ["won", "painting"],
+              "effect": "awarded",
+              "text": "{FIRST} IS THRILLED, then asks whether they could have the OTHER one instead",
+              "respond": "explains that is not how winning works",
+              "emotions": {"joy": 2.0}}])},
+    ],
+}
+DEFAULT_TABLES += [CALLARC1, CALLSHIFT1, RESOLVE2]                                # [s3-callarc]
+CALLARC_FAMILIES = ("CALLARC", "CALLSHIFT")
+
 # The call's end as the caller structure's closing legs (DEFAULT_CALL_STRUCTURE ends on
 # them; the runtime puts them on a stored structure that still ends on lands/sign_off,
 # once). {resolution}, {offer}, {outcome}, {respond}, {rebuttal}, {wrapper} and {wrap}

@@ -2069,12 +2069,23 @@ class System3Runtime:
                 clause = str(self.host.call_scenario_clause(meta["scenario"]) or "")
             except Exception:  # noqa: BLE001
                 clause = ""
-        return {"name": name, "first": name.split()[0], "other": str(dj.get("cohost_name") or ""),
-                "topic": system3.whole_cut(meta.get("topic"), 400),
-                # [s3-cut] at a sentence end, never where a count fell
-                "speakerbox": system3.sentence_cut(str(meta.get("speakerbox_text") or ctx.get("seed_text") or ""), 600),
-                "story": bool(meta.get("story")), "scenario_clause": clause[:1500],
-                "painting": self._painting_of(ctx)}                              # [s3-callend] the caller's wheel
+        out = {"name": name, "first": name.split()[0], "other": str(dj.get("cohost_name") or ""),
+               "topic": system3.whole_cut(meta.get("topic"), 400),
+               # [s3-cut] at a sentence end, never where a count fell
+               "speakerbox": system3.sentence_cut(str(meta.get("speakerbox_text") or ctx.get("seed_text") or ""), 600),
+               "story": bool(meta.get("story")), "scenario_clause": clause[:1500],
+               "painting": self._painting_of(ctx)}                              # [s3-callend] the caller's wheel
+        # [s3-callarc] the station's own business, for the detour and the result wheel
+        fn = getattr(self.host, "system3_call_background", None)
+        if callable(fn):
+            try:
+                bg = fn() or {}
+                for k in ("memo", "memo_id", "news", "unsold", "manager"):
+                    if bg.get(k):
+                        out[k] = bg[k]
+            except Exception as exc:  # noqa: BLE001
+                self.log("System 3 could not read the station's background for a call", extra=str(exc)[:300])
+        return out
 
     # --- [s3-callend] how a call ends: the painting in play, the passage, the mark, the effect ---
     CALLEND_MARK = "caller:callend"    # in defaults_added: the end legs were put on the stored structure

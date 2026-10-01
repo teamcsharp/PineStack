@@ -575,9 +575,9 @@ def validate_table(table):
         return outlandish.validate_table(table)
     if family not in ("CTS", "ES", "RS", "IRS", "FL", "TEMPER", "SHOCK", "INTERJECT", "FAV", "DIRECTIVE", "EVENT",
                       "CHANCE", "POOL", "SPEAKERBOX", "RESOLVE", "WRAP", "IL",
-                      "TRACK_TALK", "ANGLE"):     # [s3-live-event] event-row families
+                      "TRACK_TALK", "ANGLE", "CALLARC", "CALLSHIFT"):     # [s3-live-event] [s3-callarc]
         raise ValueError("table family must be one of CTS, ES, RS, IRS, FL, TEMPER, SHOCK, INTERJECT, FAV, DIRECTIVE, "
-                         "EVENT, CHANCE, POOL, SPEAKERBOX, RESOLVE, WRAP, IL, TRACK_TALK, ANGLE")
+                         "EVENT, CHANCE, POOL, SPEAKERBOX, RESOLVE, WRAP, IL, TRACK_TALK, ANGLE, CALLARC, CALLSHIFT")
     pool = family in system3_tables.POOL_FAMILIES          # [s3-cast] may stand empty
     cats = table.get("categories")
     if not isinstance(cats, list) or (not cats and family not in ("CHANCE", "POOL")):   # [s3-dice-door] filled as the station rolls
@@ -4002,6 +4002,7 @@ def annotate_protocol(conv, sheet):
 # tables switched off, plans the call it always planned (the rebuttal leg lands the story,
 # the wrap leg signs off with the words the station's checker listens for) - same dice.
 FAMILIES = FAMILIES + system3_tables.CALLEND_FAMILIES                        # [s3-callend] RESOLVE, WRAP
+FAMILIES = FAMILIES + system3_tables.CALLARC_FAMILIES                        # [s3-callarc] CALLARC, CALLSHIFT
 CALLEND_STATION = ("A", "B", "D", "S")     # the booth: host, co-host, third seat, Sam (where a call has his seat)
 CALLEND_WITHIN = 1200.0                    # a painting on offer this recently is "the last segment"
 CALLEND_SIGN_OFF = ("a spoken sign-off - it must contain one of these words out loud: thanks, thank you, "
@@ -4016,7 +4017,13 @@ CALLEND_TAIL = ("Every one of those is checked after you write it, and a call th
                 "second to last, and the call wrapped on the last turn exactly as the running order rolled it "
                 "(a polite goodbye only where that is what was rolled) are not style notes. They are the call.")
 CALLEND_NEEDS = {"painting": "the last segment did not sell a painting (nothing on offer in the window)",
-                 "dead_line": "the call ran its course - nothing ended it early"}
+                 "dead_line": "the call ran its course - nothing ended it early",
+                 # [s3-callarc] the station's own business, read when the call was planned
+                 "memo": "the manager has no memo on the book",
+                 "news": "no headline is in hand",
+                 "unsold": "the unsold pile is empty",
+                 "gallery": "no painting is on the wall's unsold pile",
+                 "passage": "the call has no speakerbox passage"}
 CALLEND_UNLESS = {"painting": "the last segment was selling a painting - the painting wheel stands",
                   "dead_line": "the line went dead - the dead-line wheel stands"}
 _CALLEND_AT = {"turn_id": "", "turn_index": -1}
@@ -4383,6 +4390,7 @@ def _callend_close(conv, config, inputs, opening, middle, closing, want):
     ce.update(present=present, names={s: names.get(s, s) for s in present})
     painting = call.get("painting") if isinstance(call.get("painting"), dict) and call["painting"].get("image") else None
     avail = {"painting": bool(painting)}
+    avail.update(_callarc_avail(call))                                          # [s3-callarc]
     recent = set(str(x) for x in (inputs.get("recent_items") or []))
     spec, table = None, None
     res_leg = next((leg for leg, r in roles if r == "resolution"), None)
@@ -4418,6 +4426,15 @@ def _callend_close(conv, config, inputs, opening, middle, closing, want):
                 ce["events"].append({"event_id": ev["event_id"], "role": "resolution", "family": "RESOLVE"})
         if spec.get("speakerbox"):
             res["speakerbox"] = str(spec.get("speakerbox"))
+        # [s3-callarc] the manager cuts in on his own seat; a painting off the unsold pile
+        if spec.get("manager"):
+            res["manager_act"] = str(spec.get("manager") or "")
+            res["seat_in"] = str(spec.get("seat_in") or "E")
+        unsold = call.get("unsold") if isinstance(call.get("unsold"), dict) else {}
+        if "unsold" in (spec.get("needs") or []) and unsold.get("name"):
+            res["painting"] = {"image": str(unsold.get("name")), "title": str(unsold.get("title") or unsold.get("name")),
+                               "price": unsold.get("price"), "desc": str(unsold.get("desc") or "")[:200],
+                               "kind": "unsold"}
         ce["resolve"] = res
         if any(r == "response" for _leg, r in roles):
             n_resp, ev = _callend_count(conv, spec.get("responses") if isinstance(spec.get("responses"), dict)
@@ -4458,6 +4475,15 @@ def _callend_close(conv, config, inputs, opening, middle, closing, want):
             seat = str(leg.get("seat") or "A")
         out.append((leg, seat))
         prev = seat
+        if role == "resolution" and (ce.get("resolve") or {}).get("manager_act"):
+            # [s3-callarc] "he cuts into the call": the manager's own turn, on his own seat,
+            # straight after the setup - the caller then plays the outcome out to HIM
+            mseat = str(ce["resolve"].get("seat_in") or "E")
+            out.append(({"id": "manager_cuts_in", "label": "The manager cuts into the call", "place": "close",
+                         "seat": mseat, "act": _callend_words(conv, "", mseat).get("manager_act") or "",
+                         "draws": [{"family": "ES"}]}, mseat))
+            ce["manager"] = {"seat": mseat, "at": len(out) - 1}
+            prev = mseat
     ce["planned"] = bool(spec) or ce.get("planned", False)
     return out, last_mid
 
@@ -4534,6 +4560,7 @@ def _callend_words(conv, role, seat):
     pw = _callend_painting_words(res.get("painting"))
     base = {"resolution": res.get("label") or "", "painting": pw["painting"], "price": pw["price"],
             "terms": pw["terms"], "number": str(res.get("number") or ""), "prize": str(res.get("prize") or "")}
+    base.update(_callarc_words(call))                                           # [s3-callarc]
 
     def fill(text):
         return " ".join(_call_words(text, call, base).split()).rstrip(" .")
@@ -4549,6 +4576,8 @@ def _callend_words(conv, role, seat):
     words["wrap"] = fill(wrap["text"]) if wrap.get("planned") and wrap.get("text") else CALLEND_SIGN_OFF
     names = dict(ce.get("names") or {})
     words["wrapper"] = str(names.get(seat) or ("the host" if seat == "A" else "one of the hosts"))
+    if res.get("manager_act"):
+        words["manager_act"] = fill(res["manager_act"])                         # [s3-callarc]
     return words
 
 
@@ -4687,6 +4716,7 @@ def callend_mark(conv):
                      "table": res.get("table"), "effect": res.get("effect") or "", "tags": list(res.get("tags") or []),
                      "number": res.get("number"), "prize": res.get("prize") or "",
                      "speakerbox": bool(res.get("speakerbox")), "cut": str(res.get("cut") or ""),
+                     "manager_act": str(res.get("manager_act") or ""), "seat_in": str(res.get("seat_in") or ""),  # [s3-callarc]
                      "painting": ({k: painting.get(k) for k in ("image", "title", "price", "kind")
                                    if painting.get(k) not in (None, "")} if painting else {})}
                     if res else {}),
@@ -4695,6 +4725,9 @@ def callend_mark(conv):
                   "turn_id": (wt or {}).get("turn_id", "")}
                  if wrap.get("planned") else {"planned": False}),
         "turns": len(turns), "end_turns": max(0, len(turns) - start), "says": ce.get("says") or callend_says(conv),
+        "arc": dict(conv.get("callarc") or {}), "detour": dict(conv.get("callshift") or {}),     # [s3-callarc]
+        # the detour's turns, by index: off topic on purpose, so the topic contract leaves them out
+        "detour_turns": [i for i, t in enumerate(turns) if _is_detour_leg(t.get("leg"))],
     }
 
 
@@ -4741,6 +4774,183 @@ def _call_words(text, call, extra=None):
     return out
 
 
+# --- [s3-callarc] THE CALL AS RADIO: its arc, its detour (system3_tables CALLARC1, CALLSHIFT1) ---
+
+def _callarc_avail(call):
+    """What the station has in play for a call, as the wheels' `requires` read it."""
+    unsold = call.get("unsold") if isinstance(call.get("unsold"), dict) else {}
+    return {"memo": bool(str(call.get("memo") or "").strip()), "news": bool(str(call.get("news") or "").strip()),
+            "unsold": bool(unsold.get("name")), "gallery": bool(unsold.get("name")),
+            "passage": bool(str(call.get("speakerbox") or "").strip())}
+
+
+def _callarc_words(call):
+    unsold = call.get("unsold") if isinstance(call.get("unsold"), dict) else {}
+    manager = str(call.get("manager") or "the manager")
+    return {"memo": whole_cut(str(call.get("memo") or "his latest memo"), 260).rstrip(" ."),
+            "news": whole_cut(str(call.get("news") or "the news"), 200).rstrip(" ."),
+            "unsold": str(unsold.get("title") or unsold.get("name") or "a painting off the pile"),
+            "manager": manager, "MANAGER": manager.upper(),
+            "topic": whole_cut(str(call.get("topic") or "what they rang about"), 140).rstrip(" .")}
+
+
+def _callarc_chance(conv, family, what, odds, yes, no):
+    """One recorded yes/no roll on its own stream (seed|callarc:<family>:<what>): the
+    odds are the candidates' weights, so the ledger shows the chance it was taken at."""
+    before = _snapshot(conv, (conv.get("cursor") or {}).get("initiator"))
+    p = max(0.0, min(1.0, float(odds)))
+    rows = [{"id": "yes", "label": yes, "base": p, "weight": p, "why": ["%d%% chance" % round(p * 100)]},
+            {"id": "no", "label": no, "base": 1.0 - p, "weight": 1.0 - p, "why": []}]
+    d = DrawStream(str(conv["seed"]) + "|callarc:%s:%s" % (family, what)).next("%s:%s" % (family, what))
+    i = pick_index([r["weight"] for r in rows], d["u"])
+    i = i if i in (0, 1) else 1
+    sel = {"id": rows[i]["id"], "label": rows[i]["label"], "kind": what, "odds": round(p, 4)}
+    ev = _event(conv, dict(_CALLEND_AT), family, [_stage(what, rows, i, d)], sel, before,
+                meta={"kind": what, "odds": round(p, 4)})
+    ev["state_after"] = before
+    return i == 0, ev
+
+
+def _call_detour(conv, config, inputs, call, recent):
+    """The caller's detour: whether they change the subject (first_odds), to what (the
+    source and the bridge, rolled), then the GRADUATING steer-back rolls - each one more
+    likely than the last, a miss taking them further off topic. Legs from a host-ended
+    opening to a host-ended close: C, A, then C / host pairs, the last a host."""
+    tables = _callend_tables(config, "CALLSHIFT")
+    info = {"rolled": False, "events": []}
+    conv["callshift"] = info
+    if not tables:
+        info["why"] = "no CALLSHIFT table is switched on for calls"
+        return []
+    t0 = tables[0]
+    try:
+        first = float(t0.get("first_odds", 0.8))
+        start, step = float(t0.get("back_start", 0.35)), float(t0.get("back_step", 0.2))
+        most = max(1, min(5, int(t0.get("most", 3))))
+    except (TypeError, ValueError):
+        first, start, step, most = 0.8, 0.35, 0.2, 3
+    words = _callarc_words(call)
+    hit, ev = _callarc_chance(conv, "CALLSHIFT", "detour", first, "changes the subject", "stays on topic")
+    info.update(rolled=True, detour=hit, events=[{"event_id": ev["event_id"], "leg": "topic_shift"}])
+    if not hit:
+        return []
+    spec, ev2 = _callend_wheel(conv, tables, "CALLSHIFT", _callarc_avail(call), (), recent, None, "subject")
+    info["events"].append({"event_id": ev2["event_id"], "leg": "topic_shift"})
+    if not spec:
+        info["why"] = "nothing to change the subject to"
+        return []
+    src = str(spec.get("source") or "life")
+    subject = {"memo": "the manager's memo - " + words["memo"], "news": "the news - " + words["news"],
+               "gallery": "the painting " + words["unsold"],
+               "passage": "something they read - " + whole_cut(str(call.get("speakerbox") or ""), 200)
+               }.get(src) or str(spec.get("subject") or "something from their own life")
+    bridge = str(spec.get("bridge") or "\"anyway - \"")
+    info.update(source=src, subject=subject, bridge=bridge, category=spec.get("category_label"))
+    w = dict(words, subject=subject, bridge=bridge)
+
+    def leg(lid, label, seat, act):
+        return {"id": lid, "label": label, "place": "middle", "seat": seat, "callshift": True,
+                "act": _call_words(act, call, w), "draws": [{"family": "ES"}, {"family": "RS"}]}
+
+    legs = [leg("topic_shift", "The caller changes the subject", "C",
+                "{FIRST} CHANGES THE SUBJECT - crosses on a bridge line, {bridge} - and starts on {subject}; "
+                "what they rang about ({topic}) is left behind for now."),
+            leg("steer_1", "A host goes with it, then steers back", "A",
+                "goes with the new subject for one beat, then TRIES TO STEER {first} BACK to {topic}.")]
+    came_back = False
+    rolls = []
+    for k in range(most):
+        p = min(0.95, start + step * k)
+        back, evk = _callarc_chance(conv, "CALLSHIFT", "back_%d" % (k + 1), p,
+                                    "steered back on topic", "goes further off topic")
+        rolls.append({"n": k + 1, "odds": round(p, 4), "back": back})
+        if back:
+            legs.append(leg("back_on_topic", "Back on topic (roll %d at %d%%)" % (k + 1, round(p * 100)), "C",
+                            "{FIRST} COMES BACK TO {topic} - with one thing the detour made them realise."))
+            info["events"].append({"event_id": evk["event_id"], "leg": "back_on_topic"})
+            came_back = True
+            break
+        legs.append(leg("further_%d" % (k + 1), "Further off topic (roll %d at %d%%)" % (k + 1, round(p * 100)), "C",
+                        "{FIRST} GOES EVEN FURTHER OFF TOPIC - from {subject} on to whatever it reminds them of "
+                        "next, and does not notice."))
+        info["events"].append({"event_id": evk["event_id"], "leg": "further_%d" % (k + 1)})
+        if k < most - 1:
+            legs.append(leg("steer_%d" % (k + 2), "Steers again", "B" if k % 2 == 0 else "A",
+                            "TRIES AGAIN to steer {first} back to {topic} - firmer this time."))
+    legs.append(leg("detour_lands", "Back on track" if came_back else "Goes along with it",
+                    "B" if legs[-2]["seat"] == "A" else "A",
+                    "picks up {first}'s point and takes it on" if came_back else
+                    "GIVES UP STEERING - goes along with wherever {first} has ended up."))
+    info.update(came_back=came_back, rolls=rolls)
+    return legs
+
+
+def _is_detour_leg(leg_id):
+    leg_id = str(leg_id or "")
+    return (leg_id in ("topic_shift", "back_on_topic", "detour_lands") or leg_id.startswith("steer_")
+            or leg_id.startswith("further_"))
+
+
+def _call_arc(conv, config, inputs, call, recent):
+    """The call's arc, one roll per call: the category's beats are its legs."""
+    tables = _callend_tables(config, "CALLARC")
+    info = {"rolled": False}
+    conv["callarc"] = info
+    if not tables:
+        info["why"] = "no CALLARC table is switched on for calls"
+        return []
+    spec, ev = _callend_wheel(conv, tables, "CALLARC", _callarc_avail(call), (), recent, None, "arc")
+    info.update(rolled=True, event_id=ev["event_id"])
+    if not spec:
+        info["why"] = "no arc could come up"
+        return []
+    w = dict(_callarc_words(call), tone=str(spec.get("tone") or spec.get("label") or ""))
+    legs = []
+    for b in spec.get("beats") or []:
+        if not isinstance(b, dict) or not b.get("act"):
+            continue
+        legs.append({"id": str(b.get("id") or "arc"), "label": "%s (%s)" % (b.get("label") or b.get("id"),
+                                                                           spec.get("category_label")),
+                     "place": "middle", "seat": str(b.get("seat") or "C"), "arc": spec.get("category"),
+                     "act": _call_words(b["act"], call, w), "draws": [{"family": "ES"}, {"family": "RS"}]})
+    info.update(arc=spec.get("category"), label=spec.get("category_label"), tone=spec.get("label"),
+                beats=[x["id"] for x in legs])
+    return legs
+
+
+def _call_spine(conv, config, inputs, call, last_mid):
+    """[s3-callarc] The middle of a call: the detour after the opening, then the arc - or
+    [] (no tables on), when the middle leg fills the budget as before. The spine ends on
+    `last_mid`, the seat the call's end wants before it."""
+    recent = set(str(x) for x in (inputs.get("recent_items") or []))
+    detour = _call_detour(conv, config, inputs, call, recent)
+    arc = _call_arc(conv, config, inputs, call, recent)
+    spine = detour + arc
+    if spine and str(spine[-1].get("seat") or "") != str(last_mid):
+        spine.append({"id": "arc_turn", "label": "Turns it toward the end", "place": "middle", "seat": last_mid,
+                      "act": "answers the last thing said and turns the call toward how it ends.",
+                      "draws": [{"family": "ES"}, {"family": "RS"}]})
+    return spine
+
+
+def _callarc_attach(conv):
+    """Put the arc's and the detour's events on the turns they made (the Rolodex and the
+    flowchart read turn_index)."""
+    turns = conv.get("turns") or []
+    by_id = {}
+    for t in turns:
+        by_id.setdefault(str(t.get("leg") or ""), t)
+    evs = {e.get("event_id"): e for e in conv.get("decision_events") or []}
+    pairs = list((conv.get("callshift") or {}).get("events") or [])
+    arc = conv.get("callarc") or {}
+    if arc.get("event_id") and arc.get("beats"):
+        pairs.append({"event_id": arc["event_id"], "leg": arc["beats"][0]})
+    for pr in pairs:
+        ev, t = evs.get(pr.get("event_id")), by_id.get(str(pr.get("leg") or ""))
+        if ev is not None and t is not None:
+            ev["turn_index"], ev["turn_id"] = t.get("index"), t.get("turn_id", "")
+
+
 def plan_call(conv, config, inputs=None):
     """[s3-calls] A request-line call, planned from System 3's own call
     structure: the open legs in order, the middle leg repeated to the turn
@@ -4765,8 +4975,12 @@ def plan_call(conv, config, inputs=None):
     want = max(lo, min(int(inputs.get("turns") or 0) or 10, hi))
     # [s3-callend] the call's end is rolled first, on its own streams: how many turns it takes
     closing, _last_mid = _callend_close(conv, config, inputs, opening, middle, closing, want)
-    fill_n = max(0, want - len(opening) - len(closing)) if middle else 0
+    # [s3-callarc] the middle is the call's own arc and detour, rolled; the old middle leg
+    # fills the budget only when neither table is on
+    spine = _call_spine(conv, config, inputs, call, _last_mid)
+    fill_n = 0 if spine else (max(0, want - len(opening) - len(closing)) if middle else 0)
     seq = [(leg, leg.get("seat")) for leg in opening]
+    seq += [(leg, leg.get("seat")) for leg in spine]
     for k in range(fill_n):
         leg = middle[k % len(middle)]
         seq.append((leg, _call_mid_seat(leg, k, fill_n, _last_mid)))
@@ -4816,6 +5030,7 @@ def plan_call(conv, config, inputs=None):
     _events_attach(conv)                                                        # [s3-events]
     _cast_rolls(conv, config, conv["settings"], inputs)                         # [s3-cast]
     _callend_attach(conv, config)                                               # [s3-callend]
+    _callarc_attach(conv)                                                       # [s3-callarc]
     return conv
 
 
