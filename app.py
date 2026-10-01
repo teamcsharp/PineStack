@@ -87744,6 +87744,205 @@ def _sfx_video_level_prune() -> None:
     _SFX_VIDEO_LEVEL["kept"] = kept
 
 
+# --- [nas-gain] A VIDEO'S LEVEL IS A NUMBER, NOT A COPY --------------------------
+#
+# "I do not want the Pine agent to be copying videos over to the DGX Spark in
+#  order to modify them ... the original video paths need to remain in the same
+#  location" (the operator, 2026-10-01; his answers: store a gain number; delete
+#  the old copies once their original is confirmed on the NAS). A clip with a
+#  picture is measured ONCE where it lives (ebur128 reading the share in place),
+#  and only the gain is kept - data/sfx_gains.json, keyed by the clip's id and
+#  mtime. /sfx/{key} streams the original through ffmpeg with that gain applied
+#  on the fly (picture copied, sound turned and limited at the ceiling); nothing
+#  is written anywhere. The levelled-copy cache (voice_media/sfx/*-lu1-*) is no
+#  longer made, and what it holds is cleared at boot (sfx_gain_cleanup).
+_SFX_GAINS_FILE = DATA_DIR / "sfx_gains.json"
+_SFX_GAINS: dict[str, Any] = {}
+_SFX_GAINS_LOCK = RLock()
+_SFX_GAINS_STATE = {"loaded": False, "dirty": 0, "saved": 0.0}
+SFX_GAIN_STREAM_TYPES = {".mp4": ("mp4", "aac", "video/mp4"), ".m4v": ("mp4", "aac", "video/mp4"),
+                         ".mov": ("mp4", "aac", "video/mp4"), ".webm": ("webm", "libopus", "video/webm")}
+SFX_GAIN_MIN_DB = 0.75          # closer than this to the target, the clip goes out as it is
+
+
+def _sfx_gain_key(path: Path) -> str | None:
+    try:
+        return "%s:%s" % (sfx_id(path), path.stat().st_mtime_ns)
+    except OSError:
+        return None
+
+
+def _sfx_gains_load() -> None:
+    with _SFX_GAINS_LOCK:
+        if _SFX_GAINS_STATE["loaded"]:
+            return
+        try:
+            got = json.loads(_SFX_GAINS_FILE.read_text(encoding="utf-8"))
+            if isinstance(got, dict):
+                _SFX_GAINS.update(got)
+        except (OSError, ValueError):
+            pass
+        _SFX_GAINS_STATE["loaded"] = True
+
+
+def _sfx_gains_save(force: bool = False) -> None:
+    with _SFX_GAINS_LOCK:
+        if not _SFX_GAINS_STATE["dirty"] or (not force and time.time() - _SFX_GAINS_STATE["saved"] < 30):
+            return
+        if len(_SFX_GAINS) > 60000:
+            for k in list(_SFX_GAINS)[:len(_SFX_GAINS) - 50000]:
+                _SFX_GAINS.pop(k, None)
+        try:
+            tmp = _SFX_GAINS_FILE.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(_SFX_GAINS), encoding="utf-8")
+            tmp.replace(_SFX_GAINS_FILE)
+            _SFX_GAINS_STATE.update(dirty=0, saved=time.time())
+        except OSError:
+            pass
+
+
+def sfx_gain_known(path: Path) -> dict[str, Any] | None:
+    """The clip's settled gain {"db": float} or {"asis": why}; None = not measured yet."""
+    _sfx_gains_load()
+    key = _sfx_gain_key(path)
+    got = _SFX_GAINS.get(key) if key else None
+    return got if isinstance(got, dict) else None
+
+
+def sfx_gain_db(heard: dict[str, Any]) -> float:
+    """One linear gain to SFX_TARGET_LUFS; the lift bounded so the true peak lands
+    no higher than the ceiling plus what the limiter on the stream will catch
+    (SFX_LEVEL_TRANSIENT_LU of it)."""
+    level, tp = heard.get("i"), heard.get("tp")
+    gain = float(SFX_TARGET_LUFS) - float(level)
+    if gain > 0 and tp is not None and tp != float("-inf"):
+        gain = min(gain, max(0.0, float(SFX_TP_DB) - float(tp) + float(globals().get("SFX_LEVEL_TRANSIENT_LU", 3.0))))
+    return round(max(-30.0, min(24.0, gain)), 2)
+
+
+def sfx_gain_measure(path: Path) -> dict[str, Any]:
+    """Measure where it lives and remember the number. Blocking (ffmpeg reads the share)."""
+    key = _sfx_gain_key(path)
+    if key is None:
+        return {"asis": "not on the share"}
+    heard = sfx_loudness(path)
+    if heard is None:
+        return {}                                   # no answer this time - nothing kept
+    if heard.get("none") or heard.get("i") is None:
+        got: dict[str, Any] = {"asis": "no measurable sound in it"}
+    else:
+        db = sfx_gain_db(heard)
+        got = {"db": db, "i": heard.get("i"), "tp": heard.get("tp")} if abs(db) >= SFX_GAIN_MIN_DB \
+            else {"asis": "already at the level", "i": heard.get("i")}
+    with _SFX_GAINS_LOCK:
+        _SFX_GAINS[key] = got
+        _SFX_GAINS_STATE["dirty"] += 1
+    _sfx_gains_save()
+    return got
+
+
+def sfx_gain_command(path: Path, db: float) -> list[str] | None:
+    kind = SFX_GAIN_STREAM_TYPES.get(path.suffix.lower())
+    if kind is None:
+        return None
+    fmt, acodec, _mime = kind
+    limit = 10 ** ((float(SFX_TP_DB) - float(globals().get("SFX_TP_MARGIN_DB", 1.0))) / 20.0)
+    cmd = [shutil.which("ffmpeg") or "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin",
+           "-i", str(path), "-map", "0:v?", "-map", "0:a?", "-c:v", "copy",
+           "-af", "volume=%.2fdB,alimiter=limit=%.4f:level=disabled" % (db, max(0.0625, min(1.0, limit))),
+           "-c:a", acodec, "-b:a", "160k"]
+    if fmt == "mp4":
+        cmd += ["-movflags", "frag_keyframe+empty_moov+default_base_moof", "-f", "mp4", "pipe:1"]
+    else:
+        cmd += ["-f", "webm", "pipe:1"]
+    return cmd
+
+
+async def sfx_gain_stream(path: Path, db: float, headers: dict[str, str]) -> Response | None:
+    """The original, read in place, with its gain applied as it streams - None
+    when this container cannot be streamed that way (the caller sends it as is)."""
+    cmd = sfx_gain_command(path, db)
+    if cmd is None:
+        return None
+    try:
+        proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE,
+                                                    stderr=asyncio.subprocess.DEVNULL)
+    except Exception:  # noqa: BLE001
+        return None
+
+    async def body():
+        try:
+            while True:
+                chunk = await proc.stdout.read(65536)
+                if not chunk:
+                    break
+                yield chunk
+        finally:
+            if proc.returncode is None:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+            await proc.wait()
+
+    out = {k: v for k, v in headers.items() if k != "Accept-Ranges"}
+    out["X-Pine-Gain-Db"] = "%.2f" % db
+    return StreamingResponse(body(), media_type=SFX_GAIN_STREAM_TYPES[path.suffix.lower()][2], headers=out)
+
+
+def sfx_gain_cleanup() -> dict[str, Any]:
+    """Once at boot: the levelled-copy cache - full-length copies of share videos
+    on the Spark - deleted, each only when its original is confirmed on the
+    share (the clip book's path for its id, present). Blocking."""
+    got = {"deleted": 0, "freed_mb": 0.0, "kept": 0, "kept_why": []}
+    if not SFX_LEVELLED.exists():
+        return got
+    try:
+        con = sfx_db_reader()
+    except Exception:  # noqa: BLE001
+        con = None
+    for f in SFX_LEVELLED.iterdir():
+        name = f.name
+        if ("-%s-" % SFX_VIDEO_LEVEL_MARK) not in name:
+            continue
+        side = name.endswith((".lu", ".asis"))
+        sid = name.split("-%s-" % SFX_VIDEO_LEVEL_MARK)[0]
+        original = None
+        if con is not None and sid:
+            try:
+                with _SFX_DB_LOCK:
+                    row = con.execute("SELECT path FROM clips WHERE sid=? LIMIT 1", (sid,)).fetchone()
+                original = Path(row[0]) if row and row[0] else None
+            except Exception:  # noqa: BLE001
+                original = None
+        if not side and not (original is not None and original.is_file()):
+            got["kept"] += 1
+            if len(got["kept_why"]) < 20:
+                got["kept_why"].append("%s: its original is not found on the share" % name)
+            continue
+        try:
+            size = f.stat().st_size
+            f.unlink()
+            got["deleted"] += 0 if side else 1
+            got["freed_mb"] += size / 1048576.0
+        except OSError:
+            pass
+    got["freed_mb"] = round(got["freed_mb"], 1)
+    return got
+
+
+@app.on_event("startup")
+async def _sfx_gain_start() -> None:
+    try:
+        got = await asyncio.to_thread(sfx_gain_cleanup)
+        pipeline_log("sfx", "[nas-gain] levelled copies on the Spark: %d deleted (%.1f MB freed), %d kept - "
+                            "their original was not found on the share%s"
+                     % (got["deleted"], got["freed_mb"], got["kept"],
+                        (": " + "; ".join(got["kept_why"][:5])) if got["kept_why"] else ""))
+    except Exception as exc:  # noqa: BLE001
+        pipeline_log("sfx", "[nas-gain] the old copies were not cleared (%s)" % type(exc).__name__)
+
+
 def sfx_video_levelled(path: Path, make: bool = False) -> Path:
     """#1420: the same clip, PICTURE COPIED, sound brought to the level
     every other clip arrives at. The original, untouched, on any miss.
@@ -87753,7 +87952,15 @@ def sfx_video_levelled(path: Path, make: bool = False) -> Path:
     and the keeper, both of which have lead time to spend."""
     if not sfx_is_video(path):
         return path
-    out = sfx_video_levelled_name(path)         # [#1477-name]
+    # [nas-gain] never a copy: the clip is measured where it lives and its gain
+    # kept; /sfx applies it as it streams. The original path, always.
+    if sfx_gain_known(path) is None:
+        if make:
+            sfx_gain_measure(path)
+        else:
+            _sfx_video_level_want(path)
+    return path
+    out = sfx_video_levelled_name(path)         # #1477's copy, no longer made (below unreachable)
     if out is None:
         return path
     if out.exists():
@@ -88168,14 +88375,8 @@ def sfx_level_cached(path: Path) -> Path | None:
     levelled copy, or the clip itself when it was looked at and left alone.
     None = not levelled YET. Never makes or asks for anything. Blocking."""
     if sfx_is_video(path):
-        out = sfx_video_levelled_name(path)
-        if out is None:
-            return path
-        if out.exists():
-            return out
-        if out.with_name(out.name + ".asis").exists():
-            return path
-        return None
+        # [nas-gain] settled = its gain is measured; the file is always the original
+        return path if sfx_gain_known(path) is not None else None
     out = sfx_levelled_name(path)
     if out is None:
         return path
@@ -175858,6 +176059,17 @@ async def sfx_file(
         # would outlive the copy the keeper is about to write, and the
         # next airing would sound exactly as wrong for no reason at all.
         headers["Cache-Control"] = "private, max-age=60"
+    # [nas-gain] a clip with a picture goes out with its measured gain applied as it
+    # streams from the share - no copy anywhere. Not yet measured: as shot.
+    if sfx_is_video(raw):
+        try:
+            _gain = await asyncio.to_thread(sfx_gain_known, raw)
+        except Exception:  # noqa: BLE001
+            _gain = None
+        if _gain and _gain.get("db") is not None:
+            _streamed = await sfx_gain_stream(raw, float(_gain["db"]), headers)
+            if _streamed is not None:
+                return _streamed
     window = _range_slice(str(request.headers.get("range") or ""), size)
     if window == (-1, -1):
         headers["Content-Range"] = f"bytes */{size}"
