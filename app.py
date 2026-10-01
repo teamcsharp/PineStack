@@ -45770,6 +45770,72 @@ def prep_air_text(raw: str, kind: str) -> str:
     return text
 
 
+# [es-bank] the System 3 road a prepared single line is recorded on, by its shelf kind
+S3_BANK_LINE_ROADS = {"ad": "ad_spot", "track_talk": "track_talk", "station_id": "station_id"}
+
+# [ad-rolo] "the cupboard storing ads and stingers with emotional intonation where
+# people passionately try to sell things driven by scripted situations seeded by the
+# speakerbox and rolled through a rolodex to randomly give each ad a unique angle and
+# hilarious outcome" (2026-10-01). Three pools, each a System 3 dice door (tabled: the
+# desk edits them in the Tables tab); the speakerbox seed is ad_write_fresh's own.
+AD_ANGLES = (
+    "a tearful testimonial from a customer whose life it ruined and then saved",
+    "a scientific breakthrough announced by someone with no qualifications at all",
+    "an infomercial that keeps being interrupted by the product itself",
+    "a hostage negotiation where the demand is that you buy it",
+    "a courtroom closing argument for the product's innocence",
+    "a nature documentary following the product in the wild",
+    "a sports commentary of somebody using it for the first time",
+    "a wedding toast to the product",
+    "a whispered secret the big companies do not want you to know",
+    "a limited-time offer that runs out during the advert itself",
+    "an attack on a rival product, by name, getting personal",
+    "the product explained very slowly to somebody's grandmother",
+    "a weather forecast where every front is the product",
+    "a cult recruitment pitch, warm and unsettling",
+    "a breakup letter to the seller's old, inferior product",
+    "a movie trailer for the product's origin story",
+)
+AD_OUTCOMES = (
+    "the product works far too well and something has to be evacuated",
+    "the legal disclaimer takes over and reveals it is banned in four states",
+    "a rival seller calls in mid-pitch and it turns into a bidding war",
+    "the price keeps dropping until the station is paying the listener",
+    "the seller breaks down and admits they have never once used it",
+    "a customer complaint is read out live and the seller argues with it",
+    "the jingle gets stuck and will not stop",
+    "it is revealed to be the station's own break-room coffee, relabelled",
+    "the seller accidentally sells their own house in the process",
+    "the manager walks in and confiscates the product",
+    "the product talks back, and it is not on the seller's side",
+    "the seller is so convincing they buy it themselves, twice",
+)
+AD_PASSIONS = (
+    "breathless and evangelical, a convert who has seen the light",
+    "on the verge of tears at how much it means to them",
+    "furious at anyone who has not bought one yet",
+    "whispering urgently, as if being watched",
+    "manic game-show energy, every sentence a prize",
+    "deadly serious, a movie-trailer voice for a very small thing",
+    "a hard-sell auctioneer who cannot slow down",
+    "crushingly sincere, a little too close to the microphone",
+)
+
+
+def ad_rolodex(product: str) -> dict[str, str]:
+    """[ad-rolo] Roll this advert's angle, its hilarious outcome and the seller's
+    passion - three recorded System 3 draws over pools the desk edits - and the
+    brief the writer gets for them, beside the speakerbox seed."""
+    angle = str(s3_choice("ad.angle", AD_ANGLES, "the advert's angle [ad-rolo]"))
+    outcome = str(s3_choice("ad.outcome", AD_OUTCOMES, "how the advert ends, for laughs [ad-rolo]"))
+    passion = str(s3_choice("ad.passion", AD_PASSIONS, "how passionately the seller sells it [ad-rolo]"))
+    brief = (" THE PITCH, AS THE ROLODEX ROLLED IT. Stage this advert as a SCRIPTED SITUATION - a scene, "
+             "built out of the passage quoted above if there is one - not a list of features. The angle: "
+             f"{angle}. The seller sells {product} with total, PASSIONATE conviction: {passion}. It ends, played "
+             f"for laughs, with this: {outcome}. The product is named and sold all the way through.")
+    return {"angle": angle, "outcome": outcome, "passion": passion, "brief": brief}
+
+
 async def prep_render_line(text: str, who: str,
                            voice: str = "",
                            kind: str = "",
@@ -45807,8 +45873,28 @@ async def prep_render_line(text: str, who: str,
     if prep_should_stop():
         return None
     fx = dict(voice_effect_pick())
-    # [es-roads] a shelf row that already has its node is recorded with its
-    # feeling; one without (an ad, a track talk) gets it at air (the re-perform)
+    # [es-bank] "I want banked scheduled and written cupboard footage taken through
+    # the emotion engine" (2026-10-01). A line with no node of its own (an ad, a
+    # track talk) used to be recorded flat and RE-PERFORMED at air - two renders,
+    # the banked one thrown away. Its road's System 3 line is opened here, so the
+    # feeling is rolled now, the take is recorded in it, and the row keeps the stamp.
+    _opened = None
+    if not stamp and kind:
+        _road = S3_BANK_LINE_ROADS.get(str(kind), str(kind))
+        _open = globals().get("system3_direct_line")
+        if callable(_open):
+            try:
+                import system3 as _s3m
+                if _road in _s3m.ROADS:
+                    _h = await _open(road=_road, who=who, dj=dj_settings(), context=text[:300], bank=True)
+                    if _h is not None and getattr(_h, "active", False):
+                        _bind = globals().get("system3_bind_line")
+                        if callable(_bind):
+                            _bind(_h, text)
+                        if isinstance(getattr(_h, "stamp", None), dict) and _h.stamp:
+                            stamp = _opened = dict(_h.stamp)
+            except Exception:  # noqa: BLE001
+                _opened = None
     _es_got = (await _s3_stamp_perf(stamp, who))[0]
     vec = performance_vector(who, voice, state=(_es_got or {}).get("dims"),
                              es=(_es_got or {}).get("voice"))
@@ -45849,7 +45935,8 @@ async def prep_render_line(text: str, who: str,
     pantry_put(key, clip, text=text, voice=voice, who=who,
                kind=str(kind or ""))
     return {"key": key, "voice": voice, "engine": engine,
-            "seconds": float((clip or {}).get("seconds") or 0)}
+            "seconds": float((clip or {}).get("seconds") or 0),
+            **({"system3": _opened} if _opened else {})}         # [es-bank] the row keeps its node
 
 
 _RESPONSE_WARM_LOCK = asyncio.Lock()
@@ -46275,8 +46362,19 @@ async def prep_ad() -> bool:
     # already on the books. Two attempts, not three — this is the cheap
     # road that exists to stop dead air, and it must not become the
     # expensive one. A refusal simply prepares nothing this pass.
+    # [ad-rolo] the angle, the outcome and the seller's passion, rolled first
     try:
-        _mk = await ad_write_fresh(product, tries=2)
+        _rolo = ad_rolodex(str(product))
+    except Exception:  # noqa: BLE001
+        _rolo = {}
+    try:
+        _production_feed.note("rolled", "ad", _rolo.get("brief") or "", label="an advert's rolodex",
+                              angle=_rolo.get("angle"), outcome=_rolo.get("outcome"),
+                              passion=_rolo.get("passion"), product=str(product)[:120])
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        _mk = await ad_write_fresh(product, tries=2, pitch=str(_rolo.get("brief") or ""))
     except Exception:  # noqa: BLE001
         _mk = {}
     text = str(_mk.get("text") or "")
@@ -46285,8 +46383,9 @@ async def prep_ad() -> bool:
     _row = {"text": text, "text_plain": str(_mk.get("text_plain") or ""),
             "tint_ok": bool(_mk.get("tint_ok")),
             "tint": dict(_mk.get("tint") or {}),
-            "product": str(product)[:160]}
-    made = await prep_render_line(text, "dj", kind="ad")   # #978
+            "product": str(product)[:160],
+            **({"rolodex": {k: _rolo[k] for k in ("angle", "outcome", "passion")}} if _rolo else {})}
+    made = await prep_render_line(text, "dj", kind="ad")   # #978 [es-bank] rolls its feeling
     if not made:
         # #904: the WRITE is already paid for. A refused render — the
         # engine busy, the live road wanting it — used to throw the
@@ -65362,8 +65461,8 @@ async def ad_product_pick() -> str:
     return fallback
 
 
-async def ad_write_fresh(product: str, tries: int = AD_STUDIO_TRIES
-                         ) -> dict[str, Any]:
+async def ad_write_fresh(product: str, tries: int = AD_STUDIO_TRIES,
+                         pitch: str = "") -> dict[str, Any]:
     """Write ONE advert that is not any of the previous adverts (#916b/c).
 
     (c) is the `direct` channel: dj_line() only draws a speakbox swath
@@ -65388,7 +65487,7 @@ async def ad_write_fresh(product: str, tries: int = AD_STUDIO_TRIES
         direct = ""
         if seed.get("text"):
             direct += _pb("aside", speakbox_aside(seed, pair=False))   # [s3-blocks]
-        direct += ad_avoid_note() + _lesson
+        direct += ad_avoid_note() + _lesson + str(pitch or "")      # [ad-rolo] the rolled pitch
         try:
             raw = await dj_line("ad", None, extra=product, direct=direct,
                                 tint=False)
