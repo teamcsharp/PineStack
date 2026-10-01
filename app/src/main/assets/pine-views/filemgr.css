@@ -53,6 +53,12 @@
   border: 1px solid #2c404b; border-radius: 6px; background: #142129; color: #9fb4bd; cursor: pointer;
 }
 .fm-iconbtn:hover { color: #edf3f5; border-color: #65c7da; }
+.fm-switchbtn {
+  height: 30px; display: inline-flex; align-items: center; gap: 6px; padding: 0 10px; flex: none;
+  border: 1px solid #2c404b; border-radius: 6px; background: #142129; color: #9fb4bd; cursor: pointer;
+  font-size: 12px; white-space: nowrap;
+}
+.fm-switchbtn:hover { color: #edf3f5; border-color: #65c7da; }
 
 .fm-presets { display: flex; gap: 6px; padding: 8px 12px; border-bottom: 1px solid #1d2c34; flex-wrap: wrap; }
 .fm-preset {

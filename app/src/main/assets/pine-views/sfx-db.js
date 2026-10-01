@@ -124,6 +124,14 @@
     ui.vision = make('span', 'sdb-count sdb-vision', '');   /* [sfx-vision-idle] */
     title.appendChild(ui.vision);
     head.appendChild(title);
+    /* [sfx-switch] and back to the file manager, in the same place */
+    var toFiles = button('File management', 'c:save', function () {
+      if (!(root.PineFileMgr && typeof root.PineFileMgr.open === 'function')) return;
+      close();
+      root.PineFileMgr.open();
+    }, 'sdb-switch');
+    toFiles.title = 'Switch this window back to file management';
+    head.appendChild(toFiles);
     pop.appendChild(head);
 
     /* the search bar, at the top */
@@ -348,7 +356,7 @@
     tr.appendChild(poster(r));
     var nm = make('td', 'sdb-name');
     nm.appendChild(make('b', '', r.name || r.sid));
-    nm.appendChild(make('span', 'sdb-id', '#' + r.sid + (r.banned ? '  -  banned' : '') + (r.playable === false ? '  -  not playable' : '')));
+    nm.appendChild(make('span', 'sdb-id', '#' + r.sid + (r.banned ? '  -  banned' : '') + (r.missing ? '  -  file missing' : r.playable === false ? '  -  not playable' : '')));
     tr.appendChild(nm);
     tr.appendChild(make('td', '', r.folder || '-'));
     tr.appendChild(make('td', '', r.source || '-'));
@@ -402,12 +410,25 @@
   function detail(c, r, tr) {
     var box = make('div', 'sdb-entry');
     var left = make('div', 'sdb-media');
-    var media = c.video ? make('video') : make('audio');
-    media.controls = true;
-    media.preload = 'none';
-    media.src = stationUrl(c.media);
-    if (c.video && c.poster) media.poster = stationUrl(c.poster);
-    left.appendChild(media);
+    if (c.missing || !c.media) {
+      // [sfx-gone] the book lists it, the share does not hold it: say so
+      // instead of a black player that can only ever 404
+      var gone = make('div', 'sdb-gone');
+      gone.appendChild(make('b', '', 'The file is gone from the share'));
+      gone.appendChild(make('span', '', (c.file || c.path || '') + ' - it will not be put on the air again.'));
+      left.appendChild(gone);
+    } else {
+      var media = c.video ? make('video') : make('audio');
+      media.controls = true;
+      media.preload = 'none';
+      media.src = stationUrl(c.media);
+      if (c.video && c.poster) media.poster = stationUrl(c.poster);
+      media.addEventListener('error', function () {
+        var code = media.error && media.error.code;
+        say('Could not play ' + (c.name || c.sid) + (code === 4 ? ': the station has no file for it, or the browser cannot decode it.' : '.'), true);
+      });
+      left.appendChild(media);
+    }
     var acts = make('div', 'sdb-acts');
     acts.appendChild(button(c.banned ? 'Unban' : 'Ban', 'c:misuse', function () {
       post('/api/sfx/ban', {id: c.sid, banned: !c.banned}).then(function (got) {
@@ -452,7 +473,7 @@
     fact(dl, 'Name', c.name); fact(dl, 'Id', c.sid); fact(dl, 'Folder', c.folder); fact(dl, 'Source', c.source);
     fact(dl, 'Path', c.path); fact(dl, 'Kind', c.video ? 'video' : 'sound'); fact(dl, 'Length', secs(c.seconds));
     fact(dl, 'Aired', (c.aired || 0) + ' time' + (c.aired === 1 ? '' : 's') + (c.last_aired ? ', last ' + when(c.last_aired) : ''));
-    fact(dl, 'Playable', c.playable === false ? 'no' : c.playable ? 'yes' : '-');
+    fact(dl, 'Playable', c.missing ? 'no - the file is gone' : c.playable === false ? 'no' : c.playable ? 'yes' : '-');
     fact(dl, 'Size', c.bytes ? (c.bytes / 1048576).toFixed(1) + ' MB' : '-');
     fact(dl, 'Embedded', c.embedded ? 'yes' : 'not yet'); fact(dl, 'Tagged', c.tagged ? 'yes' : 'not yet');
     fact(dl, 'Seen at', when(c.seen_at)); fact(dl, 'Heard at', when(c.said_at));

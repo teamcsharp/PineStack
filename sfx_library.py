@@ -30,6 +30,7 @@ thread (the runtime's rt.run); install() adds the routes.
 """
 from __future__ import annotations
 
+import asyncio
 import csv
 import io
 import json
@@ -318,6 +319,40 @@ def export_text(rows: Iterable[dict[str, Any]], fmt: str = "csv") -> str:
     return buf.getvalue()
 
 
+# ------------------------------------------------------------- is it still there
+
+def file_state(path: Any, roots: Iterable[Any] = ()) -> str:
+    """'here', 'gone' or 'unreachable' for a clip's file on the share.
+
+    [sfx-gone] "the sfx database unable to play videos" - the operator,
+    2026-10-01. The clip book said playable for a file the share no longer
+    held, so the table offered a player that could only ever get a 404 (a
+    <video> reads it as a black box at 0:00). 'gone' is only said when the
+    library root the file lives under answers: an unmounted share is
+    'unreachable', never a reason to stand a clip down."""
+    if not path:
+        return "unreachable"
+    p = Path(str(path))
+    try:
+        if p.is_file():
+            return "here"
+    except OSError:
+        return "unreachable"
+    for root in roots:
+        if not root:
+            continue
+        try:
+            r = Path(str(root))
+            if p.is_relative_to(r):
+                return "gone" if r.is_dir() and any(r.iterdir()) else "unreachable"
+        except OSError:
+            return "unreachable"
+    try:
+        return "gone" if p.parent.parent.is_dir() else "unreachable"
+    except OSError:
+        return "unreachable"
+
+
 # ------------------------------------------------------------------ the routes
 
 def install(app: Any, namespace: dict[str, Any]) -> None:
@@ -354,7 +389,8 @@ def install(app: Any, namespace: dict[str, Any]) -> None:
             pass
         return out
 
-    def dress(rows: list[dict[str, Any]]) -> None:
+    def dress(rows: list[dict[str, Any]], look: bool = True) -> None:
+        """Blocking (sqlite, and one stat per clip when look): off the loop."""
         sign = ns("media_sign")
         bans = set()
         weights: dict[str, float] = {}
@@ -370,14 +406,33 @@ def install(app: Any, namespace: dict[str, Any]) -> None:
         for r in rows:
             b = book.get(r["sid"]) or {}
             r["playable"] = bool(b.get("playable")) if b else None
+            r["missing"] = False
+            if look and b.get("path") and file_state(b["path"], roots()) == "gone":
+                # [sfx-gone] the book lists it, the share does not hold it:
+                # say so, and stand it down the way the /sfx route does
+                r["missing"] = True
+                r["playable"] = False
+                gone(r["sid"], b["path"])
             r["bytes"] = b.get("bytes")
             r["seen_at"] = b.get("seen_desc_at")
             r["said_at"] = b.get("said_at")
             r["banned"] = r["sid"] in bans
             r["weight"] = float(weights.get(r["sid"], 1.0))
             t = sign(r["sid"]) if callable(sign) else ""
-            r["media"] = "/sfx/%s?t=%s" % (r["sid"], t)
-            r["poster"] = ("/api/sfx/poster/%s?t=%s" % (r["sid"], t)) if r.get("video") else ""
+            r["media"] = "" if r["missing"] else "/sfx/%s?t=%s" % (r["sid"], t)
+            r["poster"] = ("/api/sfx/poster/%s?t=%s" % (r["sid"], t)) if r.get("video") and not r["missing"] else ""
+
+    def roots() -> list[Any]:
+        return [ns("SFX_ROOT"), ns("SFX_LOCAL_ROOT")]
+
+    def gone(sid: str, path: Any) -> None:
+        quarantine = ns("sfx_quarantine")
+        if callable(quarantine):
+            try:
+                quarantine(sid, "the file is gone from the share (seen by the SFX database)", path,
+                           "the SFX database")
+            except Exception:  # noqa: BLE001
+                pass
 
     # [sfx-vision-idle] the keeper that studies his clips while the station rests
     try:
@@ -401,7 +456,7 @@ def install(app: Any, namespace: dict[str, Any]) -> None:
         ns("require_read_auth")(authorization)
         rt = runtime()
         got = await rt.run(search, rt.store.con, q, sort, limit, offset)
-        dress(got["rows"])
+        await asyncio.to_thread(dress, got["rows"])
         got["sorts"] = list(SORTS)
         got["facets"] = list(ANCHOR_FACETS)
         return got
@@ -433,8 +488,8 @@ def install(app: Any, namespace: dict[str, Any]) -> None:
                "aired": got.get("aired") or 0, "last_aired": got.get("last_aired"),
                "embedded": got.get("embedded"), "tagged": got.get("tagged"), "tags": tags,
                "dialogue": got.get("dialogue") or []}
-        dress([row])
-        book = book_rows([sid]).get(sid) or {}
+        await asyncio.to_thread(dress, [row])
+        book = await asyncio.to_thread(lambda: book_rows([sid]).get(sid) or {})
         row["book"] = {k: v for k, v in book.items() if k not in ("sid",)}
         frames = ns("sfx_frames_of")
         if callable(frames):
@@ -470,7 +525,6 @@ def install(app: Any, namespace: dict[str, Any]) -> None:
                         writer.execute("UPDATE clips SET said=?, said_at=? WHERE path=?",
                                        (texts["said"][:4000], now, str(path)))
                     writer.commit()
-            import asyncio
             await asyncio.to_thread(write)
             did += sorted(texts)
             kick = ns("sfx_match_kick")
@@ -494,7 +548,8 @@ def install(app: Any, namespace: dict[str, Any]) -> None:
         rt = runtime()
         got = await rt.run(search, rt.store.con, str(body.get("q") or ""), str(body.get("sort") or "name"),
                            5000, 0)
-        dress(got["rows"])
+        # no stat per row: five thousand of them over the share is minutes
+        await asyncio.to_thread(dress, got["rows"], False)
         text = export_text(got["rows"], fmt)
         out_dir = Path(ns("data_path")("exports"))
         out_dir.mkdir(parents=True, exist_ok=True)

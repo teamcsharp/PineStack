@@ -174898,6 +174898,14 @@ async def sfx_file(
 
     path = await asyncio.to_thread(sfx_by_id, sfx_key)
     if path is None:
+        # [sfx-gone] sfx_by_id skips a book row whose file is gone, so the
+        # quarantine further down never saw this clip: the book went on
+        # saying playable=1 and the SFX database kept offering a player
+        # that could only 404. Stand it down here too.
+        try:
+            await asyncio.to_thread(_sfx_gone_from_book, sfx_key)
+        except Exception:  # noqa: BLE001
+            pass
         return Response(status_code=404)
     # Levelled on the way out, so a hot sample does not out-shout the DJ who
     # set it up (#220). Both outputs fetch through here, so both get it.
@@ -182847,6 +182855,23 @@ def sfx_db_path_of(sid: str) -> Path | None:
         return found if found.is_file() else None
     except Exception:  # noqa: BLE001
         return None
+
+
+def _sfx_gone_from_book(sid: str) -> bool:
+    """[sfx-gone] The book's path for this clip, quarantined when the share
+    answers and the file is not on it. Blocking: call it off the loop."""
+    con = sfx_db_reader()
+    if con is None:
+        return False
+    row = con.execute("SELECT path FROM clips WHERE sid = ? AND playable = 1 LIMIT 1",
+                      (str(sid or ""),)).fetchone()
+    if row is None:
+        return False
+    from sfx_library import file_state
+    if file_state(row[0], (SFX_ROOT, SFX_LOCAL_ROOT)) != "gone":
+        return False
+    return sfx_quarantine(sid, "the file is gone from the share (a 404 at /sfx)",
+                          Path(str(row[0])), "the /sfx route")
 
 
 def sfx_db_write_row(path: Path, seconds: float, playable: int = 1) -> bool:
