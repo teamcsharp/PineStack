@@ -2169,7 +2169,7 @@ class System3Runtime:
                 while len(done) > 400:
                     done.popitem(last=False)
             fn = getattr(self.host, "system3_gallery_outcome", None)
-            got = (fn(str(res["effect"]), dict(painting), cid) if callable(fn)
+            got = (fn(str(res["effect"]), dict(painting, outcome=str(res.get("label") or "")), cid) if callable(fn)
                    else {"applied": False, "why": "the station has no gallery hook"})
             self.store.add_observation(cid, "CALLEND", {"stage": "air", "effect": res["effect"],
                                                         "outcome": res.get("id"), "painting": painting.get("image"),

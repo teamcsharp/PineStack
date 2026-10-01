@@ -4409,7 +4409,7 @@ def _callend_close(conv, config, inputs, opening, middle, closing, want):
         res = {"table": spec["table"], "category": spec["category"], "category_label": spec["category_label"],
                "id": spec["id"], "label": spec["label"], "tags": [str(x) for x in spec.get("tags") or []],
                "effect": str(spec.get("effect") or "") if str(spec.get("effect") or "") in (
-                   "sold", "awarded", "burnt", "unsold") else "",
+                   "sold", "awarded", "burnt", "unsold", "claimed", "destroyed") else "",   # [paint-roulette]
                "offer": str(spec.get("offer") or ""), "text": str(spec.get("text") or ""),
                "respond": str(spec.get("respond") or ""), "rebuttal": str(spec.get("rebuttal") or ""),
                "emotions": dict(spec.get("emotions") or {}) if isinstance(spec.get("emotions"), dict) else {},

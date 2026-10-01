@@ -34,7 +34,7 @@ CATALOGUE: tuple[tuple[str, str, str], ...] = (
     ("mxtape", "An MX mixtape by Ehm Eckx, rolled from the tape folder - the music the scene plays to "
                "(a concert, a performance, a dance).", 'the MX mixtape "MX tape · August 4" by Ehm Eckx'),
     ("fordtape", "A tape by General Ford, rolled from the General Ford folder (setting fordtape_folder, "
-                 "default \"_general ford\" in the SFX share).", 'the tape "Night Shift" by General Ford'),
+                 "default samples_grabbed/user/ford on the share, subfolders included).", 'the tape "Night Shift" by General Ford'),
     ("videos", "A Pine Box gallery video, shown on a rolled screen in the scene (a TV, a billboard, a "
                "monitor, a jumbotron...).", 'an old CRT television playing the Pine Box gallery video "lighthouse"'),
     ("sfxclip", "An SFX clip rolled at random from the clip library, shown on a rolled screen in the scene, "
@@ -85,6 +85,17 @@ def tidy(name: Any, most: int = 60) -> str:
     s = re.sub(r"\b\d{4,}\b|\b\d{1,2}\b(?=\s*$)", " ", s)
     s = " ".join(s.split())
     return s[:most].strip() or "untitled"
+
+
+def tape_title(stem: Any) -> str:
+    """A tape's file stem as its title: "26-PHOTON_3(1)" -> "Photon",
+    "SOLARPIZZA_2" -> "Solarpizza", "27-QRHAVOC-02" -> "Qrhavoc"."""
+    s = str(stem or "")
+    s = re.sub(r"\(\d+\)$", "", s).strip()
+    s = re.sub(r"^\d{1,3}[-_ ]+", "", s)
+    s = re.sub(r"[-_ ]+\d{1,3}$", "", s)
+    s = " ".join(re.sub(r"[_\-.]+", " ", s).split())
+    return s.title()[:60]
 
 
 def quote(text: Any, most: int = 80) -> str:

@@ -1443,6 +1443,110 @@ RESOLVE2 = {
 DEFAULT_TABLES += [CALLARC1, CALLSHIFT1, RESOLVE2]                                # [s3-callarc]
 CALLARC_FAMILIES = ("CALLARC", "CALLSHIFT")
 
+# --- [paint-roulette] RESOLVE3: HOW A CALLER TAKES A PAINTING -------------------
+#
+# "when customers call in, they should be running a roulette that dictates
+#  randomly that they either accept a painting, they love the painting, they
+#  hate the painting, they're insulted by it, they're disturbed by it, they're
+#  intimidated by it, they are willing to come get the painting at any cost.
+#  They're willing to come destroy the painting at any cost. I need a roulette
+#  that has heavily varied options to show the variety of the roulette system
+#  ... vary greatly between things randomly while staying in line with the
+#  topic" (the operator, 2026-10-01). Rolled with RESOLVE1 and RESOLVE2 by table
+# weight, over the painting the last segment was selling and over the unsold
+# pile. Two new fates, by his answer "change its fate": `claimed` (they are
+# coming for it - off the pile, held for them) and `destroyed` (they are coming
+# to end it - off the pile, gone); the station remembers both and the pair can
+# bring them back up (app.py gallery_fates).
+_PAINT_REACTIONS = [
+    {"id": "accepts", "label": "Accepts it, plainly", "tags": ["sale"], "effect": "sold",
+     "text": "{FIRST} ACCEPTS IT - calmly, no fuss, says yes at the price and asks how they pay",
+     "respond": "is thrown by how easy that was", "emotions": {"joy": 1.2}},
+    {"id": "loves", "label": "Loves it - truly, deeply", "tags": ["sale", "love"], "effect": "sold",
+     "text": "{FIRST} LOVES IT - genuinely moved, describes exactly what it does to them, and takes it",
+     "respond": "is moved, then embarrassed to be moved", "emotions": {"joy": 3.0, "love": 2.0}},
+    {"id": "hates", "label": "Hates it", "tags": ["refused", "hate"], "effect": "unsold",
+     "text": "{FIRST} HATES IT - says precisely what is wrong with it, detail by detail, and will not have it",
+     "respond": "defends the painting, badly", "emotions": {"anger": 2.0, "disgust": 2.0}},
+    {"id": "insulted", "label": "Is insulted by it", "tags": ["refused", "insulted"], "effect": "unsold",
+     "text": "{FIRST} IS INSULTED - takes the painting as a personal attack, and the offer of it as a worse one",
+     "respond": "apologises, then makes it worse", "emotions": {"anger": 2.5}},
+    {"id": "disturbed", "label": "Is disturbed by it", "tags": ["refused", "disturbed"], "effect": "unsold",
+     "text": "{FIRST} IS DISTURBED BY IT - says what they see in it that nobody else has noticed, and it is not good",
+     "respond": "looks at the painting again and cannot unsee it", "emotions": {"fear": 2.5}},
+    {"id": "intimidated", "label": "Is intimidated by it", "tags": ["refused", "intimidated"], "effect": "unsold",
+     "text": "{FIRST} IS INTIMIDATED BY IT - feels judged by it, would not dare hang it, and lowers their voice",
+     "respond": "agrees the painting has a presence", "emotions": {"fear": 2.0, "surprise": 1.2}},
+    {"id": "claims_any_cost", "label": "Will come and get it at ANY cost", "tags": ["claimed", "obsessed"],
+     "effect": "claimed",
+     "text": "{FIRST} WILL COME AND GET IT AT ANY COST - lists, escalating, what they will sell, cross and endure "
+             "to have it, and says they are leaving now",
+     "respond": "takes it off the market for them, a little frightened", "emotions": {"joy": 2.0, "surprise": 2.5}},
+    {"id": "destroys_any_cost", "label": "Will come and destroy it at ANY cost", "tags": ["destroyed", "vendetta"],
+     "effect": "destroyed",
+     "text": "{FIRST} WILL COME AND DESTROY IT AT ANY COST - says it should not exist, describes how they will "
+             "end it, and that nothing will stop them",
+     "respond": "pulls the painting off sale before they arrive", "emotions": {"anger": 3.0, "fear": 1.5}},
+    {"id": "haunted", "label": "Says it is haunted", "tags": ["refused", "haunted"], "effect": "unsold",
+     "text": "{FIRST} SAYS IT IS HAUNTED - and knows by what, and has proof",
+     "respond": "starts to believe it", "emotions": {"fear": 2.0}},
+    {"id": "its_them", "label": "Is sure it is a painting of them", "tags": ["sale", "portrait"], "effect": "sold",
+     "text": "{FIRST} IS CERTAIN IT IS A PAINTING OF THEM - points out the likeness, feature by feature, and buys "
+             "it to keep it out of the wrong hands",
+     "respond": "cannot see it, then suddenly can", "emotions": {"surprise": 2.5}},
+    {"id": "trades", "label": "Offers a ridiculous trade", "tags": ["trade"], "effect": "unsold",
+     "text": "{FIRST} OFFERS A TRADE INSTEAD OF MONEY - something absurd, oddly specific, and they will not go up",
+     "respond": "seriously considers it, out loud", "emotions": {"surprise": 1.5}},
+    {"id": "weeps", "label": "Weeps", "tags": ["sale", "tears"], "effect": "sold",
+     "text": "{FIRST} BREAKS DOWN - it reminds them of something they lost, they say what, and they buy it",
+     "respond": "goes quiet, then gently takes the money", "emotions": {"sadness": 3.0}},
+    {"id": "critic", "label": "Reviews it like an art critic", "tags": ["refused", "critic"], "effect": "unsold",
+     "text": "{FIRST} REVIEWS IT LIKE A SEVERE ART CRITIC - the composition, the influences, the failure - and "
+             "gives it a score out of ten",
+     "respond": "argues the score", "emotions": {"contempt": 2.0}},
+    {"id": "accuses", "label": "Accuses the hosts of painting it themselves", "tags": ["refused", "accusation"],
+     "effect": "unsold",
+     "text": "{FIRST} ACCUSES THE HOSTS OF PAINTING IT THEMSELVES - and has evidence, from things they have said on air",
+     "respond": "denies it far too hard", "emotions": {"anger": 1.5, "surprise": 1.5}},
+    {"id": "outbids", "label": "Insists on paying MORE", "tags": ["sale", "overpay"], "effect": "sold",
+     "text": "{FIRST} INSISTS ON PAYING MORE THAN THE PRICE - says the price is an insult to the painting and names "
+             "a bigger figure",
+     "respond": "tries, and fails, to talk them down", "emotions": {"joy": 2.0, "surprise": 2.0}},
+    {"id": "knows_place", "label": "Knows exactly where it is", "tags": ["refused", "place"], "effect": "unsold",
+     "text": "{FIRST} KNOWS EXACTLY WHERE THAT IS - names the place, tells what happened there, and wants nothing "
+             "to do with it",
+     "respond": "asks one question too many about the place", "emotions": {"fear": 1.5, "sadness": 1.2}},
+    {"id": "rescue", "label": "Wants to rescue it from the station", "tags": ["claimed", "rescue"],
+     "effect": "claimed",
+     "text": "{FIRST} WANTS TO RESCUE IT - says the station does not deserve it and they are coming to take it "
+             "somewhere it will be understood",
+     "respond": "is offended, and lets it go anyway", "emotions": {"anger": 1.2, "love": 1.5}},
+    {"id": "ritual", "label": "Wants it for a ritual", "tags": ["sale", "ritual"], "effect": "sold",
+     "text": "{FIRST} WANTS IT FOR A RITUAL - will not say which, says only that it is the last piece they need",
+     "respond": "sells it, then asks what the ritual is", "emotions": {"fear": 1.5, "surprise": 1.5}},
+]
+RESOLVE3 = {
+    "id": "RESOLVE3", "family": "RESOLVE", "label": "Resolution (how the caller takes a painting)",
+    "version": 1, "enabled": True, "weight": 1.5, "roads": ["caller"],
+    "responses": {"1": 2.0, "2": 1.0},
+    "responders": {"A": 1.0, "B": 1.0, "D": 0.6, "S": 0.8},
+    "description": "The caller's reaction to a painting - the one the last segment was selling, or one off the unsold "
+                   "pile: accepts, loves, hates, is insulted, disturbed, intimidated, will come and get it or destroy "
+                   "it at any cost, and more. Claimed and destroyed paintings leave the pile and are remembered. "
+                   "Rolled with RESOLVE1 and RESOLVE2 by weight.",
+    "categories": [
+        {"id": "painting", "label": "The painting the last segment was selling", "weight": 1.0,
+         "requires": ["painting"], "within": 1200,
+         "offer": "offers {first} the painting the last segment was selling - {painting} - at {price}",
+         "items": _items([dict(r) for r in _PAINT_REACTIONS])},
+        {"id": "pile", "label": "A painting off the unsold pile", "weight": 0.8, "requires": ["unsold"],
+         "unless": ["painting"],
+         "offer": "offers {first} one of the paintings off the unsold pile - {unsold}",
+         "items": _items([dict(r) for r in _PAINT_REACTIONS])},
+    ],
+}
+DEFAULT_TABLES += [RESOLVE3]                                                       # [paint-roulette]
+
 # The call's end as the caller structure's closing legs (DEFAULT_CALL_STRUCTURE ends on
 # them; the runtime puts them on a stored structure that still ends on lands/sign_off,
 # once). {resolution}, {offer}, {outcome}, {respond}, {rebuttal}, {wrapper} and {wrap}

@@ -475,7 +475,7 @@ class RuntimeTests(unittest.TestCase):
         cfg["tables"] = [t for t in cfg["tables"] if t["family"] not in ("RESOLVE", "WRAP")]
         cfg["defaults_added"] = [x for x in cfg.get("defaults_added") or [] if x not in ("RESOLVE1", "WRAP1")]
         rt.config = cfg
-        self.assertEqual(sorted(rt.add_missing_default_tables()), ["RESOLVE1", "RESOLVE2", "WRAP1"])
+        self.assertEqual(sorted(rt.add_missing_default_tables()), ["RESOLVE1", "RESOLVE2", "RESOLVE3", "WRAP1"])   # [paint-roulette] RESOLVE3 joins
 
     def test_the_wiring_is_in_the_desk(self):
         from pathlib import Path

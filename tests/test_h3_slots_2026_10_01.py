@@ -53,6 +53,11 @@ class Pure(unittest.TestCase):
         m = re.search(r'^H3_SLOT_NAMES = r"\(\?:([a-z|]+)\)', APP_TEXT, re.M)
         self.assertEqual(tuple(m.group(1).split("|")), h3_slots.NAMED)
 
+    def test_ford_tape_titles(self):
+        self.assertEqual(h3_slots.tape_title("26-PHOTON_3(1)"), "Photon")
+        self.assertEqual(h3_slots.tape_title("27-QRHAVOC-02"), "Qrhavoc")
+        self.assertEqual(h3_slots.tape_title("TEALBUNNY"), "Tealbunny")
+
     def test_catalogue_explains_every_named_slot(self):
         names = {r["name"] for r in h3_slots.catalogue()}
         for n in h3_slots.NAMED + ("conversation", "record", "station", "speakerbox"):
@@ -129,7 +134,7 @@ class Wiring(unittest.TestCase):
     def test_wired(self):
         for bit in ("await h3_slots_preroll(", "h3_slot_named_sync(tok) if re.fullmatch(H3_SLOT_NAMES, tok)",
                     '"id": "base-mx-concert"', '"id": "base-ford-performance"', '"id": "base-arena-battle"',
-                    '"slots": h3_slots.catalogue()', '"fordtape_folder": "_general ford"'):
+                    '"slots": h3_slots.catalogue()', '"fordtape_folder": "samples_grabbed/user/ford"'):
             self.assertIn(bit, APP_TEXT)
         js = (ROOT / "desktop" / "renderer" / "ad-viewer.js").read_text(encoding="utf-8")
         for bit in ("rnd.value = 'random'", "function slotOpen(", "function slotCheck(", "slotCheckAll();"):

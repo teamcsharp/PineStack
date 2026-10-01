@@ -1839,7 +1839,7 @@ DEFAULT_DJ = {
     # "bumper" behaviour where a high talk dial truncates every song.
     "records_whole": True,
     "mixtape_folder": "_music by me",
-    "fordtape_folder": "_general ford",       # [h3-slots] General Ford's tapes, for {fordtape}
+    "fordtape_folder": "samples_grabbed/user/ford",   # [h3-slots] General Ford's tapes (his submissions), for {fordtape}
     # Let the active system prompt colour the pair's mood, so switching
     # prompts swings the disposition of the show. Off by default: the DJ
     # persona is its own thing until you say otherwise.
@@ -66030,6 +66030,57 @@ def system3_painting_on_offer(within: float = 1200.0) -> dict[str, Any]:
         return {}
 
 
+# [paint-roulette] WHAT BECAME OF A PAINTING. "Change its fate" (the operator,
+# 2026-10-01): a caller who swore to come and get a painting at any cost, or to
+# destroy it, takes it off the pile, and the station remembers - the pair may
+# bring it back up when they sell the next one (gallery_fates_clause, a dice
+# door). Kept in data/gallery_fates.json, the last 40.
+_GALLERY_FATES_FILE = DATA_DIR / "gallery_fates.json"
+_GALLERY_FATES: list[Any] = [None]
+GALLERY_FATE_WORDS = {"claimed": "a caller swore to come and get it at any cost - it is held for them",
+                      "destroyed": "a caller vowed to come and destroy it at any cost - it is off the wall for good"}
+
+
+def gallery_fates() -> list[dict[str, Any]]:
+    if _GALLERY_FATES[0] is None:
+        try:
+            got = json.loads(_GALLERY_FATES_FILE.read_text(encoding="utf-8"))
+            _GALLERY_FATES[0] = [r for r in got if isinstance(r, dict)] if isinstance(got, list) else []
+        except (OSError, ValueError):
+            _GALLERY_FATES[0] = []
+    return _GALLERY_FATES[0]
+
+
+def gallery_fate_note(effect: str, painting: dict[str, Any], cid: str = "") -> None:
+    rows = gallery_fates()
+    rows.append({"at": int(time.time()), "effect": str(effect), "image": str((painting or {}).get("image") or ""),
+                 "title": str((painting or {}).get("title") or (painting or {}).get("image") or "")[:120],
+                 "desc": str((painting or {}).get("desc") or "")[:200],
+                 "outcome": str((painting or {}).get("outcome") or "")[:80], "conversation": str(cid or "")})
+    del rows[:-40]
+    try:
+        tmp = _GALLERY_FATES_FILE.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(rows, indent=1), encoding="utf-8")
+        tmp.replace(_GALLERY_FATES_FILE)
+    except OSError as exc:
+        pipeline_log("gallery", "[paint-roulette] the fate was not written (%s)" % type(exc).__name__)
+
+
+def gallery_fates_clause() -> str:
+    """One earlier painting's fate the pair may bring back up - a dice door, so
+    it is not every sale (gallery.fate_callback)."""
+    rows = [r for r in gallery_fates() if time.time() - float(r.get("at") or 0) < 7 * 86400]
+    if not rows or not s3_chance("gallery.fate_callback", 0.35,
+                                 "the pair bring up what became of an earlier painting while selling this one"):
+        return ""
+    labels = ["%s: %s" % (r.get("title"), r.get("effect")) for r in rows[-12:]]
+    k = s3_weighted("gallery.fate_which", labels, [1.0 + i * 0.25 for i in range(len(labels))],
+                    "which earlier painting's fate the pair bring up")
+    r = rows[-12:][k if isinstance(k, int) and 0 <= k < len(labels) else -1]
+    return (" EARLIER, \"%s\": %s. One of you brings that up, unprompted, while selling this one."
+            % (r.get("title"), GALLERY_FATE_WORDS.get(str(r.get("effect")), r.get("effect"))))
+
+
 def system3_gallery_outcome(effect: str, painting: dict[str, Any], cid: str = "") -> dict[str, Any]:
     """[s3-callend] What a call's rolled end does to the gallery, where the station keeps
     state: the pile by the desk (`_RADIO["hawk_unsold"]` - offered, not gone; the pair
@@ -66046,7 +66097,9 @@ def system3_gallery_outcome(effect: str, painting: dict[str, Any], cid: str = ""
         if not name:
             return out
         pile = _RADIO.setdefault("hawk_unsold", [])
-        if effect in ("sold", "awarded", "burnt"):
+        if effect in ("claimed", "destroyed"):                                   # [paint-roulette]
+            gallery_fate_note(effect, painting, cid)
+        if effect in ("sold", "awarded", "burnt", "claimed", "destroyed"):
             before = len(pile)
             pile[:] = [p for p in pile if str((p or {}).get("name") or "") != name]
             shown = _RADIO.setdefault("gallery_shown", [])
@@ -78820,7 +78873,7 @@ async def dj_gallery_round(bank_to: list[dict[str, Any]] | None = None,
             pass
     seed = await speakbox_quote(most=5, cap=450)
     listing = " ".join(
-        f"PAINTING {i + 1}: \"{desc}\""
+        f"PAINTING {i + 1}: \"{desc}\"" + gallery_sell_attitude("the gallery round, painting %d" % (i + 1))  # [paint-roulette]
         for i, (_, desc) in enumerate(pieces))
     angle = (
         f"The pair go through the station gallery ON AIR — {len(pieces)} "
@@ -79015,6 +79068,110 @@ async def vision_reanalyse_job(job: str, image: str, look: str,
 # the sales floor: pictures YOU chose, pitched at a named disposition, to a
 # person on the line who either buys or refuses — and what does not sell is
 # put aside, out loud, and the show carries on.
+# --- [paint-roulette] HOW THE PAIR FEEL ABOUT SELLING THIS ONE ------------------
+#
+# "whenever the DJs are selling paintings on the station, I need them to be
+#  rolling roulettes that run a chance of them not being happy or pleased with
+#  the painting ... disparage or make fun of the painting ... offended at what
+#  they're having to sell and maybe even offended at the very idea of having to
+#  sell stuff in general ... get existential about the content in the drawing
+#  and to describe it in depth and how it pertains to [death] ... in a
+#  disturbing way ... discuss it against a random selection taken from the
+#  speaker box that's ran through a roulette" (the operator, 2026-10-01; his
+#  answer: mostly off-script). Every sale rolls one attitude through System 3
+#  (gallery.sell_attitude, a tabled pool the desk can thin) by these weights - a
+#  straight sell one time in four; the Speaker Box tangent rolls its document,
+#  then its sentences, on its own dice (gallery.sell_sb_doc / gallery.sell_sb_line).
+GALLERY_SELL_ATTITUDES = (
+    ("straight", 25.0, "THE SELL: sell it straight and well - you like it, and you mean every word of the pitch."),
+    ("disparage", 9.0, "THE SELL: you do NOT like this painting. Sell it anyway, while running it down - its flaws, "
+                       "its nerve, what it gets wrong - and still name the price."),
+    ("mock", 9.0, "THE SELL: you find it ridiculous. Make fun of it - roast it, compare it to things, laugh at it "
+                  "out loud - and still name the price, which makes it funnier."),
+    ("offended_painting", 7.0, "THE SELL: you are OFFENDED by this painting - personally - and by being asked to put "
+                               "your voice behind it. Say why, then sell it through gritted teeth."),
+    ("offended_selling", 7.0, "THE SELL: you are offended at having to SELL anything at all - you are broadcasters, "
+                              "not shopkeepers. The painting becomes the last straw; rant about being made to sell, "
+                              "then sell it, resentfully."),
+    ("existential", 8.0, "THE SELL: it pulls you somewhere existential. Describe what is in it in real depth - every "
+                         "figure, colour and shadow - and what it says about death, how it pertains to dying, to the "
+                         "end of things. Then remember you are meant to sell it."),
+    ("disturbing", 7.0, "THE SELL: describe it in a DISTURBING way - what is wrong in it, what is happening just out "
+                        "of frame, what it would do to a room at night. Unsettling, specific, never gory. Then the "
+                        "price, as if nothing happened."),
+    ("speakerbox", 9.0, "THE SELL: one of you sets the painting against this, from the Speaker Box, read word for "
+                        "word - and the two of you argue what the passage says about the painting, and the painting "
+                        "about the passage: \"{passage}\""),
+    ("split", 6.0, "THE SELL: you are SPLIT - one of you loves it, the other cannot stand it, and the price becomes "
+                   "the battleground."),
+    ("priceless", 5.0, "THE SELL: you have convinced yourselves it is a lost masterpiece - invent its provenance, "
+                       "its history, its thieves - and the price is a steal."),
+    ("cursed", 4.0, "THE SELL: you are sure it is CURSED - say what has happened since it came into the building - "
+                    "and you need it gone tonight."),
+    ("attached", 4.0, "THE SELL: you have grown ATTACHED to it and do not want to sell it - talk the price up, find "
+                      "reasons nobody deserves it, and sell it anyway, heartbroken."),
+)
+GALLERY_SELL_LABEL = "the pair's attitude to the painting they are selling"
+
+
+def gallery_sb_passage() -> str:
+    """A Speaker Box passage for the painting - the document, then a run of
+    one to three of its sentences, each rolled on System 3's dice."""
+    try:
+        files = speakbox_files()
+        weights, uses = mind_weights(""), speakbox_uses("")
+        shelf = [(p, speakbox_weight(p.name, weights, "", uses)) for p in files]
+    except Exception:  # noqa: BLE001
+        shelf = []
+    shelf = [(p, w) for p, w in shelf if w > 0]
+    for _attempt in range(4):
+        if not shelf:
+            return ""
+        k = s3_weighted("gallery.sell_sb_doc", [p.name for p, _ in shelf], [float(w) for _, w in shelf],
+                        "which Speaker Box document a painting is set against")
+        path = shelf.pop(k if isinstance(k, int) and 0 <= k < len(shelf) else 0)[0]
+        said = []
+        for _i, s in _h3_speak_doc_read(path):
+            s = h3_speak_normalize(s)
+            if s and not h3_speak.sentence_why(s):
+                said.append(s)
+            if len(said) >= 80:
+                break
+        if not said:
+            continue
+        n = min(len(said), 1 + int(s3_roll("gallery.sell_sb_count", "how many sentences of it (1-3)") * 3))
+        j = s3_weighted("gallery.sell_sb_line", [s[:80] for s in said[:len(said) - n + 1]],
+                        [1.0] * (len(said) - n + 1), "where in the document the passage starts")
+        j = j if isinstance(j, int) and 0 <= j <= len(said) - n else 0
+        return " ".join(said[j:j + n])[:420]
+    return ""
+
+
+def gallery_sell_attitude(where: str = "") -> str:
+    """[paint-roulette] The attitude this sale is played with, rolled - the words
+    for the brief. A fault reads as no attitude (the brief as it was)."""
+    try:
+        labels = [a[0] for a in GALLERY_SELL_ATTITUDES]
+        pool = [x for x in (s3_pool("gallery.sell_attitude", labels, GALLERY_SELL_LABEL) or labels) if x in labels] \
+            or labels
+        by = {a[0]: a for a in GALLERY_SELL_ATTITUDES}
+        k = s3_weighted("gallery.sell_attitude", pool, [by[x][1] for x in pool], GALLERY_SELL_LABEL)
+        pick = by[pool[k if isinstance(k, int) and 0 <= k < len(pool) else 0]]
+        words = pick[2]
+        if pick[0] == "speakerbox":
+            passage = gallery_sb_passage()
+            if not passage:
+                pick = by["mock"] if "mock" in pool else by["straight"]
+                words = pick[2]
+            else:
+                words = words.replace("{passage}", passage.replace('"', "'"))
+        pipeline_log("gallery", "[paint-roulette] %s: the sell is %s" % (where or "a sale", pick[0]))
+        return " " + words + gallery_fates_clause()
+    except Exception as exc:  # noqa: BLE001
+        pipeline_log("gallery", "[paint-roulette] no attitude rolled (%s)" % type(exc).__name__)
+        return ""
+
+
 HAWK_MOODS = {
     "curious": "genuinely interested and full of questions about it",
     "impressed": "openly impressed, and says so more than once",
@@ -79098,7 +79255,8 @@ async def dj_hawk_round(names: list[str], moods: list[str],
                            "the buyer's mood when the pair hawk art", tabled=False)   # [s3-dice-door]
     mood_text = "; ".join(HAWK_MOODS[m] for m in chosen[:4])
     listing = " ".join(
-        f"PIECE {i + 1}: \"{desc}\"" for i, (_, desc) in enumerate(pieces))
+        f"PIECE {i + 1}: \"{desc}\"" + gallery_sell_attitude("the sales floor, piece %d" % (i + 1))  # [paint-roulette]
+        for i, (_, desc) in enumerate(pieces))
     seed = await speakbox_quote(most=4, cap=380)
     angle = (
         "THE PAIR ARE SELLING ART, LIVE ON AIR. They have taken "
@@ -115338,7 +115496,8 @@ async def dj_banter(track: dict[str, Any] | None = None,
                 "things in the corners nobody would notice. Here is what is "
                 f"actually in it: \"{_pic_desc}\" Be visibly affected — "
                 "unsettled, unable to look away, arguing about what it means "
-                "and what it did to you. Then offer it to the first caller.")
+                "and what it did to you. Then offer it to the first caller."
+                + gallery_sell_attitude("a banter hawk"))                    # [paint-roulette]
     # An hourly on-air tally of how the Pine Box transmitter is holding up
     # (#497) — the running "fires in the background" saga.
     if not angle and s3_chance("banter.box_saga", 0.14, "the transmitter saga takes the round"):   # [s3-dice-door]
@@ -189556,14 +189715,18 @@ H3_SLOT_SCREEN_LABEL = "what screen in the scene shows an hourly H3 prompt's {vi
 
 
 def _h3_slot_audio_titles(folder: Path, titler: Any) -> list[str]:
+    """Every tape under the folder and its subfolders (Fordtime1, ...), read in
+    place, one title each - a copy "(1)" or a second take "_2" is the same tape."""
     try:
-        found = sorted(p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in MIXTAPE_TYPES)
+        found = sorted(p for p in folder.rglob("*") if p.suffix.lower() in MIXTAPE_TYPES and p.is_file())
     except OSError:
         return []
-    by_stem: dict[str, Path] = {}
+    titles: list[str] = []
     for p in found:
-        by_stem.setdefault(p.stem, p)
-    return [titler(p) for p in by_stem.values()][:H3_SLOT_SHELF_MOST]
+        t = titler(p)
+        if t and t not in titles:
+            titles.append(t)
+    return titles[:H3_SLOT_SHELF_MOST]
 
 
 def h3_slot_shelf(name: str) -> Any:
@@ -189572,8 +189735,8 @@ def h3_slot_shelf(name: str) -> Any:
     if name == "mxtape":
         return [mixtape_title(p) for p in mixtape_files()][:H3_SLOT_SHELF_MOST]
     if name == "fordtape":
-        folder = SFX_ROOT / str(dj_settings().get("fordtape_folder") or "_general ford")
-        return _h3_slot_audio_titles(folder, lambda p: h3_slots.tidy(p.stem))
+        folder = SFX_ROOT / str(dj_settings().get("fordtape_folder") or "samples_grabbed/user/ford")
+        return _h3_slot_audio_titles(folder, lambda p: h3_slots.tape_title(p.stem))
     if name == "videos":
         found = []
         for p in COMFY_OUTPUT.rglob("*"):
