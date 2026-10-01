@@ -121783,12 +121783,14 @@ async def generate_answer(
     # work rides behind it, and the tree itself resumes the show, climbs
     # the link ladder, revives engines and routes around a dark device.
     if is_radio_rescue(user_text):
+        try:
+            _doc_now = await show_doctor()                           # [show-doctor:reply] first, and fast
+        except Exception:  # noqa: BLE001
+            _doc_now = ""
+
         async def _rescue() -> None:
             try:
-                try:
-                    _doc = await show_doctor()                       # [show-doctor:rescue]
-                except Exception:  # noqa: BLE001
-                    _doc = ""
+                _doc = _doc_now                                       # [show-doctor:rescue]
                 got = await _deep_repair("spoken rescue (#827)")
                 if got.get("busy"):
                     line = ("a repair is already running — give it a "
@@ -121808,7 +121810,7 @@ async def generate_answer(
                 pass
         fire_and_forget(_rescue())
         feature_meta["system_status_used"] = True
-        return ("On it. Running the full triage — the show, Home "
+        return ((_doc_now + " ") if _doc_now else "") + ("On it. Running the full triage — the show, Home "
                 "Assistant, the satellite, the music player, the wire, "
                 "the voice director and both engines — and fixing every "
                 "branch that needs it. The verdict follows on this "
