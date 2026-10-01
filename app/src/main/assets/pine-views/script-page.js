@@ -9667,8 +9667,11 @@
     chip.textContent = mv.style === 'classic' ? 'Classic' : 'Digital';
     btn.addEventListener('click', function (ev) { ev.stopPropagation(); rtPlay(st); });
     facts.appendChild(make('p', 'rt-none', 'Reading the line\'s System 3 record...'));
-    st.ready = Promise.all([item.lid ? mvAsk(item).then(null, function () { return null; }) : null,
-      item.kind === 'clip' ? null : rtOrigin(item.lid)]).then(function (two) {
+    /* [ad-roll] a caller with its own record (a Pine Box ad's rolls) hands the
+       rows over: the same stage plays them, nothing is asked of System 3 */
+    st.ready = (opts.data ? Promise.resolve([opts.data, null])
+      : Promise.all([item.lid ? mvAsk(item).then(null, function () { return null; }) : null,
+        item.kind === 'clip' ? null : rtOrigin(item.lid)])).then(function (two) {
       st.data = two[0] || {rows: [], sources: {main: '', others: [], why: {}}};
       st.origin = two[1] || (two[0] && two[0].origin) || null;
       if (!st.data.stores) st.data.stores = mvStores(item, null, null);

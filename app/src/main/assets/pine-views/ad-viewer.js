@@ -82,6 +82,54 @@
     });
     return out;
   }
+  /* [ad-roll] "When showing a Pine box ad that used the speaker box or the
+     roulette system, show the roulette message box animated here ... It should
+     look the same as the feed view. If i click on it, allow me to view the
+     details" (the operator, 2026-09-30). Every roll the hour recorded, as the
+     rows the feed's roll stage (PineRollTag) plays: the preset's roll, the
+     door's own dice, the H3SPEAK node, and the {speakerbox}/{choice} slots.
+     Only rolls actually made - an empty record gives no rows. Pure. */
+  var ROLL_ROWS = [['host', 'host'], ['source', 'source'], ['fresh', 'fresh pick'], ['marker', 'window marker'],
+    ['speak_lean', 'dialogue kind'], ['speak_line', 'line said on air'], ['speak_doc', 'speakerbox document'],
+    ['speak_count', 'sentences to take'], ['speak_sentences', 'sentences'], ['speak_forced', 'forced line'],
+    ['slot_doc', '{speakerbox} document'], ['slot_sentence', '{speakerbox} sentence'], ['slot_choice', '{choice}']];
+  function rollRow(table, r) {
+    if (!r || typeof r !== 'object' || r.dice == null) return null;
+    var main;
+    if (r.kind === 'chance') {
+      main = {dice: r.dice, opts: ['no', 'yes'], hit: r.hit ? 1 : 0, label: r.hit ? 'yes' : 'no', of: 2};
+    } else if (r.picked == null && r.u != null) {
+      /* a plain roll (where the window's markers land): the number itself */
+      var at = 'lands at ' + Number(r.u).toFixed(2);
+      main = {dice: r.dice, opts: [at], hit: 0, label: at, index: 1, of: 1, counted: true};
+    } else if (!(Array.isArray(r.opts) && r.opts.length) && r.index != null && r.of != null) {
+      /* only the landing was recorded, not the list: the reel counts through
+         the positions (the feed's own counted reel) and names nothing it was not told */
+      var named = String(r.picked != null ? r.picked : (r.label || ''));
+      main = {dice: r.dice, opts: [named], hit: 0, label: named, index: Number(r.index) || 0,
+        of: Number(r.of) || 0, counted: true};
+    } else {
+      var label = String(r.picked != null ? r.picked : (r.label != null ? r.label : ''));
+      var opts = Array.isArray(r.opts) && r.opts.length ? r.opts.map(String) : [label];
+      var hit = opts.indexOf(label);
+      if (hit < 0 && r.index != null) hit = Math.min(opts.length - 1, Math.max(0, Number(r.index) - 1));
+      if (hit < 0) { opts.push(label); hit = opts.length - 1; }
+      main = {dice: r.dice, opts: opts, hit: hit, label: label, of: Number(r.of) || opts.length};
+    }
+    return {fam: 'H3', table: table, event: '', main: main};
+  }
+  function rollRows(rec) {
+    if (!rec || typeof rec !== 'object') return [];
+    var rows = [];
+    if (rec.how === 'dice' && rec.roll && rec.roll.dice != null) {
+      var preset = rollRow('the preset', Object.assign({}, rec.roll,
+        {picked: rec.roll.picked || (rec.preset && rec.preset.name) || ''}));
+      if (preset) rows.push(preset);
+    }
+    var rolls = rec.rolls && typeof rec.rolls === 'object' ? rec.rolls : {};
+    ROLL_ROWS.forEach(function (k) { var r = rollRow(k[1], rolls[k[0]]); if (r) rows.push(r); });
+    return rows;
+  }
   function roloStyle() {
     if (document.getElementById('pavRoloStyle')) return;
     var st = document.createElement('style');
@@ -211,6 +259,14 @@
     box.setAttribute('role', 'dialog'); box.setAttribute('aria-modal', 'true');
     box.setAttribute('aria-label', gallery ? 'Pine Box Gallery' : 'Pine Box generated ads');
     var head = make('header', 'pav-head'); head.appendChild(make('b', '', gallery ? 'Pine Box Gallery' : 'Your Pine Box ad is ready'));
+    /* [ad-roll] the ad's roll, played in the header the way the feed plays a
+       line's: the same stage, small. A tap opens how each roll landed. */
+    var rollHead = make('div', 'pav-rollhead'); rollHead.hidden = true;
+    rollHead.setAttribute('role', 'button'); rollHead.tabIndex = 0;
+    rollHead.title = 'How the roulette rolled this ad - tap for the details';
+    rollHead.setAttribute('aria-label', rollHead.title);
+    head.appendChild(rollHead);
+    var rollTag = null, rollRec = null;
     var position = make('span', 'pav-position'); head.appendChild(position);
     var rows = [], signatures = {}, index = 0, revision = 0, gone = false, references = {}, original = false, currentRow = '';
     var pendingRows = [], imageDrafts = {}, imageJobs = {}, splicePending = false;
@@ -851,8 +907,78 @@
       var stem = String(mediaFile(row) || '').replace(/\.[^.]+$/, '');
       return pFreeName(w.recorded ? w.preset + (stem ? ' (' + stem + ')' : ' again') : 'From ' + (stem || 'a video'));
     }
+    function rollStage(into, rec, compact) {
+      var rowsOf = rollRows(rec), speech = String((rec && rec.speech) || '');
+      if (!rowsOf.length) return null;
+      if (root.PineRollTag && typeof root.PineRollTag.mount === 'function') {
+        try {
+          return root.PineRollTag.mount(into, {who: 'dj', name: 'PINE BOX AD', text: speech,
+            row: {text: speech, who: 'dj', kind: 'ad', name: 'PINE BOX AD'}},
+            {title: 'How the roulette rolled this ad', compact: !!compact,
+             data: {rows: rowsOf, sources: {main: '', others: [], why: {}}}});
+        } catch (e) { /* the rolodex below stands in */ }
+      }
+      var reels = rowsOf.map(function (r) {
+        return {name: r.table, picked: r.main.label, opts: r.main.opts, dice: r.main.dice,
+          index: r.main.counted ? r.main.index : r.main.hit + 1, of: r.main.of};
+      });
+      into.appendChild(rolodex(reels));
+      return null;
+    }
+    function paintRollHead(row) {
+      var rec = row && row.h3_prompts && typeof row.h3_prompts === 'object' ? row.h3_prompts : null;
+      if (rec === rollRec && (rollTag || !rollHead.hidden)) return;   /* the same ad: let it play on */
+      rollRec = rec;
+      if (rollTag) { try { rollTag.dispose(); } catch (e) { /* gone already */ } rollTag = null; }
+      rollHead.replaceChildren();
+      rollHead.hidden = !rollRows(rec).length;
+      if (rollHead.hidden) return;
+      var inner = make('div', 'pav-rollhead-in');
+      rollHead.appendChild(inner);
+      rollTag = rollStage(inner, rec, true);
+    }
+    function openRollDetails() {
+      if (!rollRec) return;
+      var old = document.getElementById('pavRollPop');
+      if (old) old.remove();
+      var pop = make('section', 'pav-rollpop'); pop.id = 'pavRollPop';
+      pop.setAttribute('role', 'dialog'); pop.setAttribute('aria-label', 'How the roulette rolled this ad');
+      pop.appendChild(make('b', 'pav-rollpop-title', 'How the roulette rolled this ad'));
+      var w = usedWords(usedRow || {});
+      if (w.recorded) pop.appendChild(make('p', 'pav-used-meta', 'Preset "' + w.preset + '" - ' + w.how
+        + (w.road ? ' - ' + w.road : '') + (w.at ? ' - the hour of ' + usedTime(w.at) : '')));
+      var stageBox = make('div', 'pav-rollpop-stage');
+      pop.appendChild(stageBox);
+      var tag = rollStage(stageBox, rollRec, false);
+      var list = make('div', 'pav-rollpop-rolls');
+      rollRows(rollRec).forEach(function (r) {
+        var m = r.main, line = make('div', 'pav-rollpop-row');
+        line.append(make('span', 'pav-rollpop-name', r.table),
+          make('span', 'pav-rollpop-got', m.label + '  -  d100 ' + m.dice + ', '
+            + (m.counted ? m.index : m.hit + 1) + ' of ' + m.of));
+        if (m.opts.length > 1) line.appendChild(make('span', 'pav-rollpop-opts', 'from: ' + m.opts.join('  |  ')));
+        list.appendChild(line);
+      });
+      pop.appendChild(list);
+      w.items.forEach(function (item) {
+        if (item.reels) return;
+        var cell = make('div', 'pav-used-item');
+        cell.append(make('div', 'pav-used-label', item.label), make('pre', 'pav-used-text', item.text));
+        pop.appendChild(cell);
+      });
+      var close = function () { if (tag) { try { tag.dispose(); } catch (e) { /* gone */ } } pop.remove(); };
+      document.body.appendChild(pop);
+      if (typeof root.pineCloseX === 'function') {
+        try { root.pineCloseX(pop, close, {label: 'Close the roll'}); } catch (e) { /* Escape still closes */ }
+      }
+    }
+    rollHead.addEventListener('click', function (ev) { ev.stopPropagation(); openRollDetails(); });
+    rollHead.addEventListener('keydown', function (ev) {
+      if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); openRollDetails(); }
+    });
     function paintUsed(row) {
       usedRow = row || null; used.hidden = !usedRow;
+      paintRollHead(usedRow);                                       /* [ad-roll] */
       var w = usedWords(usedRow || {});
       usedSum.textContent = w.summary;
       usedTick.setAttribute('aria-expanded', String(usedOpen)); used.classList.toggle('open', usedOpen);
@@ -1026,6 +1152,8 @@
       gone = true; revision++; clearInterval(crawl); clearInterval(h3Timer);
       clearInterval(pTimer); pBackOff();                               /* [h3-prompts] */
       clearTimeout(exportTimer);
+      if (rollTag) { try { rollTag.dispose(); } catch (e) { /* gone */ } rollTag = null; }   /* [ad-roll] */
+      var rollPop = document.getElementById('pavRollPop'); if (rollPop) rollPop.remove();
       /* [vcrfx: the video goes off the way it came on] */
       var vcrMedia = stage.querySelector('video.pav-media');
       if (root.PineVcr && vcrMedia && vcrMedia.style.visibility === 'visible' && vcrMedia.isConnected) {
@@ -1269,6 +1397,7 @@
     }, 40);
   }
   root.PineAdViewer = {open: open, openGallery: function () { open(null, true); }, close: function () { if (opened) opened(); }, mediaFile: mediaFile,
-    usedWords: usedWords};                                             /* [h3-prompts] the words a video was told */
+    usedWords: usedWords,                                              /* [h3-prompts] the words a video was told */
+    rollRows: rollRows};                                               /* [ad-roll] what the header's roll plays */
   if (typeof module !== 'undefined') module.exports = root.PineAdViewer;
 }(typeof window !== 'undefined' ? window : globalThis));

@@ -53288,7 +53288,27 @@ def shelf_cast_stale(row: dict[str, Any]) -> bool:
         was = str(row.get("cast") or "")
         if not was:
             return False                # made before the stamp existed
-        return was != cast_signature()
+        now = cast_signature()
+        if was == now:
+            return False
+        # [cast-seats] only a seat the footage SPEAKS IN can make it stale,
+        # and never while the recast desk is re-recording it (#1215: it airs
+        # as recorded until its replacement is whole)
+        old = dict(p.split("=", 1) for p in was.split("|") if "=" in p)
+        new = dict(p.split("=", 1) for p in str(now).split("|") if "=" in p)
+        changed = {s for s in set(old) | set(new) if old.get(s) != new.get(s)}
+        entry = row.get("entry") if isinstance(row.get("entry"), dict) else row
+        if row.get("recast_needed") or entry.get("recast_needed"):
+            return False
+        takes = [t for t in (entry.get("takes") or []) if isinstance(t, dict)]
+        if takes:
+            seat_of = {"drop": "drop_voice", "manager": "manager_voice",
+                       "news": "news_voice"}
+            used = {seat_of.get(str(t.get("who") or ""), str(t.get("who") or ""))
+                    for t in takes}
+        else:
+            used = set(old) - {"third"}     # a flat read is never the guest's
+        return bool(changed & used)
     except Exception:  # noqa: BLE001
         return False
 
