@@ -162,7 +162,10 @@ class Door(unittest.TestCase):
         msgs = self.asked[0]["messages"]
         self.assertEqual(msgs[0]["content"], h3_overview.SYSTEM_PROMPTS[-1][1])
         self.assertIn("FEATURE TAG: [flowchart]", msgs[1]["content"])
-        self.assertEqual(self.asked[0]["purpose"], "h3:overview")
+        # [h3-overview-model] a live ask: it waits for a writer slot instead of an empty deferral
+        self.assertEqual(self.asked[0]["purpose"], "h3:overview live")
+        # and the model is the station's setting: dj_settings() has no "model" (every pitch was a KeyError)
+        self.assertNotIn('call_ollama(model=dj_settings()["model"]', APP_TEXT)
         # a fixed choice in the book is honoured, no roll
         self.book.modes[h3_overview.PROMPT_KIND] = "fixed:a0"
         self.rolls.clear()

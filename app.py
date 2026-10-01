@@ -190818,11 +190818,11 @@ async def _h3_overview_prepare() -> dict[str, Any] | None:
            "actions": actions, "system": system_name, "by": "model", "why": ""}
     reply = ""
     try:
-        result = await call_ollama(model=dj_settings()["model"],
+        result = await call_ollama(model=str((globals().get("load_settings") or dj_settings)().get("model") or ""),   # [h3-overview-model] dj_settings has no "model": every pitch failed (KeyError)
                                    messages=h3_overview.messages(system, h3_overview.brief(feature), presenter,
                                                                  actions, words),
                                    temperature=0.9, max_tokens=420, num_ctx=model_ctx(), repeat_penalty=1.1,
-                                   purpose="h3:overview")
+                                   purpose="h3:overview live")   # [h3-overview-model] waits for a writer slot (_live_round_waits) instead of an empty deferral
         reply = str(((result or {}).get("message") or {}).get("content") or "")
     except Exception as exc:  # noqa: BLE001
         out["why"] = "the model did not answer (%s)" % type(exc).__name__
@@ -191209,15 +191209,20 @@ def h3_prompts_hour(conversation: str, record: str = "", speak: Any = None) -> d
             fields["speech"] = _ov["say"]
         else:
             fields["goal"], fields["speech"] = _ov["scene"], _ov["say"]
-        conversation = _ov["say"]
-        if speak is None and globals().get("h3_speak_pool_take"):
-            h3_speak_pool_take()
-        speak = None
+        if _ov.get("by") == "model":
+            conversation = _ov["say"]
+            if speak is None and globals().get("h3_speak_pool_take"):
+                h3_speak_pool_take()
+            speak = None
+        else:
+            # [h3-overview-model] no model pitch: the fallback line is a title the last gate refuses
+            # (08:00-11:00 on 2026-10-01 were all cancelled) - the scene stays, the hour speaks its own dialogue
+            fields["speech"] = h3_prompts_fields(preset).get("speech") or ""
     # [h3-speak] the H3SPEAK node rolls the hour's dialogue over the pool: its
     # sentences are the {conversation}, its line the words spoken; {station}
     # and {hour} are filled and a slot no road fills is taken out
     _take, _fill = globals().get("h3_speak_take"), globals().get("h3_speak_fill") or h3_prompts_fill
-    if speak is None and globals().get("h3_speak_pool_take") and not _ov:
+    if speak is None and globals().get("h3_speak_pool_take") and (not _ov or _ov.get("by") != "model"):
         speak = h3_speak_pool_take()          # the pool the hourly door just gathered, once
     _speak = _take(speak, fields.get("speech") or "") if speak is not None and _take else None
     if _speak is not None:
