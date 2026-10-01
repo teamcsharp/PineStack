@@ -13,14 +13,83 @@ import time
 from typing import Any
 
 DJ_KINDS_NOT = ("request", "played", "marker", "sfx", "hangup", "image_analysis", "song_analysis", "chat")
+# [why-quiet-heard] only these SPEAK. A "drop" row ("☎ Deacon Fry ... NEVER MADE
+# AIR") and the "host" call card counted as the last DJ line, so a station whose
+# calls all died read "nothing obviously wrong: a DJ line aired 55 s ago".
+DJ_WHO = ("dj", "cohost", "third", "caller", "manager", "guest")
 QUIET_AFTER_S = 240.0
+UNHEARD_AFTER_S = 150.0
+ROAD_WINDOW_S = 300.0
+# what the roads say when they refuse to talk, counted over ROAD_WINDOW_S
+ROAD_SIGNS = (
+    ("refused", "live writing is refused"),
+    ("no_audio", "produced no audio"),
+    ("incomplete", "incomplete conversation withheld"),
+    ("gate_held", "round withheld by the copy gate"),
+    ("deferred", "admitted station writers"),
+    ("reserve_dry", "[reserve-dry]"),
+)
 
 
 def last_dj_line(chat: list[dict[str, Any]]) -> dict[str, Any] | None:
     for row in reversed(chat or []):
-        if isinstance(row, dict) and str(row.get("kind") or "") not in DJ_KINDS_NOT and str(row.get("text") or "").strip():
+        if (isinstance(row, dict) and str(row.get("who") or "") in DJ_WHO
+                and str(row.get("kind") or "") not in DJ_KINDS_NOT and str(row.get("text") or "").strip()):
             return row
     return None
+
+
+def last_heard(chat: list[dict[str, Any]]) -> float:
+    """[why-quiet-heard] when a listening page last acknowledged PLAYING a DJ line
+    (heard_ack_at) - 0.0 when none in the ring has been heard."""
+    best = 0.0
+    for row in chat or []:
+        if isinstance(row, dict) and str(row.get("who") or "") in DJ_WHO:
+            try:
+                best = max(best, float(row.get("heard_ack_at") or 0))
+            except (TypeError, ValueError):
+                continue
+    return best
+
+
+def calls_lost(chat: list[dict[str, Any]], now: float, window: float = 3600.0) -> dict[str, Any]:
+    """[why-quiet-heard] phone calls in the last hour that NEVER MADE AIR, against
+    the calls that did (a call that aired has caller lines in the ring)."""
+    lost, names = 0, []
+    aired = set()
+    for row in chat or []:
+        if not isinstance(row, dict):
+            continue
+        try:
+            ts = float(row.get("ts") or 0)
+        except (TypeError, ValueError):
+            continue
+        ts = ts / 1000.0 if ts > 1e11 else ts
+        if now - ts > window:
+            continue
+        if str(row.get("who") or "") == "drop" and "NEVER MADE AIR" in str(row.get("text") or ""):
+            lost += 1
+            names.append(str(row.get("name") or "?"))
+        elif str(row.get("who") or "") == "caller":
+            aired.add(str(row.get("name") or ""))
+    return {"lost": lost, "aired": len(aired), "names": names[-6:]}
+
+
+def road_counts(events: list[dict[str, Any]], now: float, window: float = ROAD_WINDOW_S) -> dict[str, int]:
+    """[why-quiet-heard] how often each refusal sign appeared in the last `window` s."""
+    out = {k: 0 for k, _sign in ROAD_SIGNS}
+    for e in events or []:
+        try:
+            ts = float((e or {}).get("ts") or 0) / 1000.0
+        except (TypeError, ValueError):
+            continue
+        if now - ts > window:
+            continue
+        t = str((e or {}).get("text") or "")
+        for k, sign in ROAD_SIGNS:
+            if sign in t:
+                out[k] += 1
+    return out
 
 
 def findings(f: dict[str, Any], now: float | None = None) -> list[dict[str, str]]:
@@ -62,6 +131,33 @@ def findings(f: dict[str, Any], now: float | None = None) -> list[dict[str, str]
         add("warn" if out else "stop",
             "No DJ line has aired %s." % ("since this boot" if age is None else "for %d min" % int(age // 60)),
             "The reasons the roads gave are below ([door-why] and refusals).")
+    # [why-quiet-heard] PUBLISHED IS NOT HEARD: the lines can be going out while no
+    # page plays them (nobody owns the air, a page that stopped acking).
+    heard = float(f.get("heard_at") or 0)
+    heard_age = now - heard if heard else None
+    if ("heard_at" in f and age is not None and age <= QUIET_AFTER_S
+            and (heard_age is None or heard_age > max(UNHEARD_AFTER_S, age + UNHEARD_AFTER_S))):
+        add("stop", "DJ lines are going out but no page has played one %s (the air is %s)."
+            % ("in the chat ring" if heard_age is None else "for %d min" % int(heard_age // 60),
+               ("with " + str(f.get("owner"))) if f.get("owner") else "owned by nobody"),
+            "Give the tablet the air (its Air card), or press Get the broadcast back on it.")
+    lost = f.get("calls_lost") or {}
+    if int(lost.get("lost") or 0) >= 2 and int(lost.get("lost") or 0) > int(lost.get("aired") or 0):
+        add("warn", "%d phone call(s) in the last hour NEVER MADE AIR (%d did): %s - each held the line and left "
+            "a hole." % (int(lost["lost"]), int(lost.get("aired") or 0), ", ".join(lost.get("names") or [])),
+            "Their reasons are the [s3-turnchain] copy gate and 'incomplete conversation' lines below.")
+    roads = f.get("roads") or {}
+    reserve = f.get("reserve") or {}
+    if int(roads.get("refused") or 0) >= 6 and not int(roads.get("reserve_dry") or 0):
+        add("warn", "The 100%% talk road refused to write live %d times in %d min while the reserve 'catches up' "
+            "(%s unaired round(s) on their way, %s that never will air)."
+            % (int(roads["refused"]), int(ROAD_WINDOW_S // 60), reserve.get("coming", "?"), reserve.get("never", "?")),
+            "If nothing is on its way the [reserve-dry] rule writes live; otherwise the recorder is behind.")
+    if int(roads.get("incomplete") or 0) + int(roads.get("gate_held") or 0) >= 3:
+        add("warn", "System 3 withheld %d finished round(s) in %d min (%d incomplete, %d held by the copy gate)."
+            % (int(roads.get("incomplete") or 0) + int(roads.get("gate_held") or 0), int(ROAD_WINDOW_S // 60),
+               int(roads.get("incomplete") or 0), int(roads.get("gate_held") or 0)),
+            "The rounds are written and then refused - see the system3 lines below.")
     sweep = f.get("sweep") or {}
     if sweep.get("why") and (age is None or age > QUIET_AFTER_S):
         add("info", "The silence rescue's last pass: %s (%s walks, %s aired)."
@@ -73,8 +169,8 @@ def findings(f: dict[str, Any], now: float | None = None) -> list[dict[str, str]
         add("info", "Speech gates changed from the station's values: " + ", ".join(changed[:8]) + ".",
             "Reset them in the Speech gates panel if lines are being refused.")
     if not out:
-        add("info", "Nothing obviously wrong: the radio is on, unpaused and a DJ line aired %d s ago."
-            % int(age or 0))
+        add("info", "Nothing obviously wrong: the radio is on, unpaused, a DJ line went out %d s ago%s."
+            % (int(age or 0), "" if heard_age is None else " and a page played one %d s ago" % int(heard_age)))
     order = {"stop": 0, "warn": 1, "info": 2}
     return sorted(out, key=lambda r: order.get(r["level"], 3))
 
@@ -91,6 +187,12 @@ def text(f: dict[str, Any], found: list[dict[str, str]], reasons: list[str]) -> 
         lines.append("last DJ line: %s %s: %s" % (time.strftime("%H:%M:%S", time.localtime(float(last.get("ts") or 0))),
                                                  last.get("name") or last.get("who") or "?",
                                                  str(last.get("text") or "")[:120]))
+    if f.get("heard_at"):
+        lines.append("last line a page PLAYED: %s" % time.strftime("%H:%M:%S", time.localtime(float(f["heard_at"]))))
+    if f.get("roads"):
+        lines.append("roads, last %d min: %s" % (int(ROAD_WINDOW_S // 60),
+                                                 ", ".join("%s %d" % kv for kv in sorted(f["roads"].items()) if kv[1])
+                                                 or "no refusals"))
     if reasons:
         lines += ["", "what the roads said lately (newest last):"] + ["  " + r for r in reasons[-25:]]
     return "\n".join(lines)

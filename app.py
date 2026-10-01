@@ -16504,6 +16504,36 @@ def dialogue_audio_ready(kind: str, row: Any) -> bool:
 _S3_BIND_MEMO: dict[int, tuple[Any, str]] = {}
 
 
+def s3_gate_dropped(s3: Any, ids: Any) -> int:
+    """[gate-accounted] How many planned turns System 3's copy gate dropped on
+    purpose (and are therefore not bound). The gate drops a copy "with the
+    round's shape kept"; the completeness rule below withheld every such round
+    as if the writer had lost the turn - measured live 2026-10-01: "3 caught, 0
+    re-written, 4 dropped" then "incomplete ... 13 of 16 turns". Never raises."""
+    try:
+        gate = (s3 or {}).get("gate") or {}
+        dropped = {str(x) for x in (gate.get("dropped_ids") or []) if str(x or "")}
+        bound = {str(v) for v in (ids.values() if isinstance(ids, dict) else [])}
+        return len(dropped - bound)
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+S3_COVERAGE = 0.66     # [s3-coverage] two thirds of the plan a round must bring to the booth
+
+
+def s3_coverage_ok(bound: int, planned: int) -> bool:
+    """[s3-coverage] Enough of the planned conversation is bound to air: three turns
+    or more and S3_COVERAGE of the plan (after the copy gate's own drops). The
+    all-or-nothing rule withheld nearly every live round for one to seven turns
+    the bind could not align (2026-10-01), and the station went silent."""
+    try:
+        bound, planned = int(bound), int(planned)
+    except (TypeError, ValueError):
+        return False
+    return bound >= 3 and planned > 0 and bound >= -(-S3_COVERAGE * planned // 1)
+
+
 def s3_binding_withheld(entry: Any) -> str:
     """[boot-dj] "" when System 3 would let this round through the booth,
     else the booth's own words for why it withholds it."""
@@ -16540,11 +16570,12 @@ def s3_binding_withheld(entry: Any) -> str:
             why = "round withheld without bound roulette turns"
         else:
             planned = int(s3.get("planned_turns") or len(positions))
+            planned = max(len(positions), planned - s3_gate_dropped(s3, ids))   # [gate-accounted]
             try:
                 limit = int(entry.get("lines"))
             except (TypeError, ValueError):
                 limit = 0
-            if (planned < 3 or len(positions) != planned or limit < planned
+            if (planned < 3 or not s3_coverage_ok(len(positions), planned) or limit < len(positions)
                     or len({str(turns[i][0]) for i in positions}) < 2):
                 why = ("incomplete conversation withheld after repair "
                        "(%d of %d turns; limit %d)" % (len(positions), planned, limit))
@@ -112256,8 +112287,9 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                          extra=str(ready_meta.get("prep_kind") or "banter"))
             return _banter_no("System 3 withheld it: no bound roulette turns")   # [door-why]
         _s3_planned = int(_round_s3.get("planned_turns") or len(_s3_positions))
-        if (_s3_planned < 3 or len(_s3_positions) != _s3_planned
-                or limit < _s3_planned
+        _s3_planned = max(len(_s3_positions), _s3_planned - s3_gate_dropped(_round_s3, _s3_ids))   # [gate-accounted]
+        if (_s3_planned < 3 or not s3_coverage_ok(len(_s3_positions), _s3_planned)
+                or limit < len(_s3_positions)
                 or len({str(turns[i][0]) for i in _s3_positions}) < 2):
             pipeline_log("system3", "incomplete conversation withheld after repair",
                          extra=f"{len(_s3_positions)} of {_s3_planned} turns; limit {limit}")
@@ -115233,6 +115265,37 @@ def banter_bank_plan(lines: int, bank: bool, system2_job: bool = False,
             "lines": generated, "rich": rich, "bootstrap": bootstrap}
 
 
+# [reserve-dry] At 100% talk the live writer is refused "while the reserve
+# catches up" - a rule that never asked whether it was. Measured 2026-10-01: 30
+# of the 45 banter rounds on the larder could never air (the booth withholds
+# them), the torrent asked every six seconds, was refused, and the tablet heard
+# holes of five to eleven minutes. The reserve is catching up only while an
+# unaired round on it can still air once recorded; when none can, one live
+# round is written (still tinted before it airs), at most one per rest.
+_RESERVE_DRY_WRITE_AT = [0.0]
+RESERVE_DRY_REST = 30.0           # seconds between live rounds while the reserve is dry
+RESERVE_COMING_S = 900.0          # an unaired round older than this is not 'on its way'
+
+
+def larder_banter_coming(now: float | None = None) -> tuple[int, int]:
+    """[reserve-dry] (unaired banter rounds on the larder that can still air once
+    recorded, unaired rounds that never will). Never raises."""
+    now = float(now or time.time())
+    coming = held = 0
+    for e in list(globals().get("_LARDER") or []):
+        if not isinstance(e, dict) or e.get("aired_at"):
+            continue
+        try:
+            if (e.get("off_brief") or not _larder_current(e) or s3_binding_withheld(e)
+                    or now - float(e.get("at") or 0) > RESERVE_COMING_S):
+                held += 1
+                continue
+        except Exception:  # noqa: BLE001
+            continue
+        coming += 1
+    return coming, held
+
+
 async def dj_banter(track: dict[str, Any] | None = None,
                     angle: str = "", lines: int = 0,
                     also_name: str = "", force_seed: bool = False,
@@ -115505,9 +115568,17 @@ async def dj_banter(track: dict[str, Any] | None = None,
                          f"and nothing has talked for {_quiet}s - a live "
                          "round is written anyway, tinted before it airs")
         else:
-            pipeline_log("air", "100% talk found no zero-work larder round; "
-                         "live writing is refused while the reserve catches up")
-            return []
+            _coming, _never = larder_banter_coming()
+            if _coming or time.time() - float(_RESERVE_DRY_WRITE_AT[0] or 0) < RESERVE_DRY_REST:
+                pipeline_log("air", "100% talk found no zero-work larder round; "
+                             "live writing is refused while the reserve catches up"
+                             + (" (%d unaired round(s) on their way)" % _coming if _coming
+                                else " (a live round was written moments ago)"))
+                return []
+            _RESERVE_DRY_WRITE_AT[0] = time.time()
+            pipeline_log("air", "100%% talk found no zero-work larder round and the reserve is NOT "
+                         "catching up - none of its unaired banter rounds can air (%d never will) - "
+                         "a live round is written now, tinted before it airs [reserve-dry]" % _never)
     # The pair have weather of their own now (#321): a mood rolls in at
     # the top of a round — one of them arrives bratty, petulant, worked
     # up — colours their pace, pauses and stumbles, and cools off with
@@ -148051,6 +148122,75 @@ async def tablet_doctor_api(
     return await asyncio.to_thread(tablet_step, action, host)
 
 
+# [tablet-update-ask] THE TABLET'S OWN "UPDATE ME" BUTTON (its Reinitialise card).
+# The station never builds: it holds the ask, the desk (pinetab-button.js) takes it,
+# runs deploy.sh and reports each step back here, and the tablet reads the progress -
+# across its own reinstall, because the record lives on this side.
+_PINETAB_UPDATE_ASK: dict[str, Any] = {"ask_at": 0.0, "by": "", "state": "", "line": "",
+                                       "at": 0.0, "lines": []}
+PINETAB_UPDATE_ASK_LIFE = 900.0       # an ask nobody touches for this long is not open
+PINETAB_UPDATE_STATES = ("asked", "taken", "running", "done", "failed")
+
+
+def pinetab_update_ask_view() -> dict[str, Any]:
+    out = dict(_PINETAB_UPDATE_ASK)
+    out["lines"] = list(out.get("lines") or [])[-30:]
+    now = time.time()
+    out["now"] = now
+    out["open"] = bool(out.get("ask_at") and out.get("state") in ("asked", "taken", "running")
+                       and now - float(out.get("at") or out.get("ask_at") or 0) < PINETAB_UPDATE_ASK_LIFE)
+    return out
+
+
+@app.get("/api/tablet/update-ask")
+async def tablet_update_ask_get(authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    """[tablet-update-ask] the ask on file and how far the desk has got."""
+    require_read_auth(authorization)
+    return pinetab_update_ask_view()
+
+
+@app.post("/api/tablet/update-ask")
+async def tablet_update_ask_post(request: Request,
+                                 authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    """[tablet-update-ask] No `state`: a new ask (the tablet). With `state` and the
+    `ask_at` it answers: the desk's report (taken / running / done / failed)."""
+    require_auth(authorization)
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        body = {}
+    body = body if isinstance(body, dict) else {}
+    now = time.time()
+    state = str(body.get("state") or "").strip()
+    if not state:
+        view = pinetab_update_ask_view()
+        if view["open"]:
+            return dict(view, said="an update is already asked for - the desk has it")
+        _PINETAB_UPDATE_ASK.update(ask_at=now, by=str(body.get("by") or "the tablet")[:40], state="asked",
+                                   line="asked - waiting for the Pine Box app on the computer to take it",
+                                   at=now, lines=[])
+        pipeline_log("action", "%s asked the desk to build and install the newest PineTab app "
+                     "[tablet-update-ask]" % _PINETAB_UPDATE_ASK["by"])
+        return pinetab_update_ask_view()
+    if state not in PINETAB_UPDATE_STATES:
+        raise HTTPException(status_code=400, detail="state is one of " + ", ".join(PINETAB_UPDATE_STATES))
+    try:
+        asked = float(body.get("ask_at") or 0)
+    except (TypeError, ValueError):
+        asked = 0.0
+    if not _PINETAB_UPDATE_ASK.get("ask_at") or abs(asked - float(_PINETAB_UPDATE_ASK["ask_at"])) > 0.001:
+        raise HTTPException(status_code=409, detail="that is not the ask on file")
+    line = " ".join(str(body.get("line") or "").split())[:240]
+    _PINETAB_UPDATE_ASK.update(state=state, at=now, line=line or str(_PINETAB_UPDATE_ASK.get("line") or ""))
+    if line:
+        _PINETAB_UPDATE_ASK.setdefault("lines", []).append({"at": now, "state": state, "line": line})
+        del _PINETAB_UPDATE_ASK["lines"][:-60]
+    if state in ("done", "failed"):
+        pipeline_log("action", "the desk %s the PineTab update: %s [tablet-update-ask]"
+                     % ("finished" if state == "done" else "could not finish", line[:160]))
+    return pinetab_update_ask_view()
+
+
 @app.get("/api/tablet/find")
 async def tablet_find_api(
     q: str = "",
@@ -175398,6 +175538,17 @@ def why_quiet_facts() -> dict[str, Any]:
         last = dict(last or {})
         last["ts"] = max(float(last.get("ts") or 0), float(aired or 0))
     facts["last_dj"] = last
+    # [why-quiet-heard] what the house actually HEARD (published is not heard), the
+    # calls that never made air, and what the roads refused lately
+    try:
+        _chat = list(_RADIO.get("chat") or [])
+        facts["heard_at"] = _why_quiet.last_heard(_chat)
+        facts["calls_lost"] = _why_quiet.calls_lost(_chat, now)
+        facts["roads"] = _why_quiet.road_counts(list(_RADIO.get("pipeline") or [])[-400:], now)
+        facts["owner"] = audio_owner()
+        facts["reserve"] = dict(zip(("coming", "never"), larder_banter_coming(now)))
+    except Exception as exc:  # noqa: BLE001
+        facts.setdefault("faults", []).append("heard: %s" % type(exc).__name__)
     try:
         facts["talk"] = float(dj_settings().get("talk_radio"))
     except Exception:  # noqa: BLE001

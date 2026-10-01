@@ -6782,6 +6782,8 @@ GATE_SOURCE_SHARE = 0.6
 GATE_PASSAGE_RUN = 8        # words in a row out of a speaker-box passage, off its door
 GATE_REWRITES = 2           # new tries a caught planned turn gets before it is dropped
 GATE_VISITS = 10            # re-write visits one round may spend; protocol legs are served first
+GATE_LIVE_REWRITES = 1      # [live-legs] a LIVE round re-writes its protocol legs only, once each
+GATE_LIVE_VISITS = 3        # [live-legs] ...and spends at most this many visits doing it
 GATE_CONTEXT = 6            # lines of the conversation so far a re-write is shown
 GATE_FIXED_PLACES = ("open", "close")
 _GATE_ROW_TAIL = re.compile(r"\s+\d{1,3}[.)]?\s*$")
@@ -7021,7 +7023,7 @@ def _gate_label(conv, row):
     return "%s's line (turn %d)" % (_gate_name(conv, row["seat"]), row["at"] + 1)
 
 
-def gate_open(conv, turns, spoken=None, rewrites=GATE_REWRITES, visits=GATE_VISITS):
+def gate_open(conv, turns, spoken=None, rewrites=GATE_REWRITES, visits=GATE_VISITS, legs_only=False):
     """Start the gate over a written round: `turns` [(marker, text)] as the station
     parsed and cleaned them, `spoken` their words as they will be said. Returns
     the run - a plain dict the station drives with gate_next / gate_take and
@@ -7043,6 +7045,7 @@ def gate_open(conv, turns, spoken=None, rewrites=GATE_REWRITES, visits=GATE_VISI
     run = {"rows": rows, "cursor": 0, "rewrites": max(0, int(rewrites)), "visits": max(0, int(visits)),
            "spent": 0, "ask": None, "sources": gate_sources(conv), "events": [], "held": "",
            "counts": {"caught": 0, "rewritten": 0, "dropped": 0, "trimmed": 0}, "reserve": set()}
+    run["legs_only"] = bool(legs_only)     # [live-legs] only the protocol legs are re-written
     # turns written past the running order's closing leg are not the round's
     last = max(mapping) if mapping else None
     if last is not None and last == len(conv["turns"]) - 1 and conv["turns"][last].get("place") == "close":
@@ -7095,6 +7098,8 @@ def _gate_kept_before(run, row):
 
 def _gate_budget(run, row):
     left = run["visits"] - run["spent"]
+    if run.get("legs_only") and not row["fixed"]:     # [live-legs] a live round re-writes its legs only
+        return False
     if left <= 0 or row["turn"] is None or len(row["tries"]) >= run["rewrites"]:
         return False
     if row["fixed"]:
@@ -7180,7 +7185,7 @@ def gate_next(conv, run):
                % catch["why"])
         if r["turn"] is not None and r["tries"]:
             why = "still a copy after %d re-write(s): %s" % (len(r["tries"]), catch["why"])
-        elif r["turn"] is not None and not run["rewrites"]:
+        elif r["turn"] is not None and (not run["rewrites"] or (run.get("legs_only") and not r["fixed"])):
             why = "%s - this round is not re-written (a live round, or repair is off)" % catch["why"]
         elif r["turn"] is not None:
             why = "%s - the round's re-write visits are spent" % catch["why"]
@@ -7244,6 +7249,10 @@ def gate_counts(conv):
         return None
     out = {k: g.get(k) for k in ("caught", "rewritten", "dropped", "trimmed", "visits", "held")}
     out["in_chain"] = (g.get("in_chain") or {}).get("caught", 0)
+    # [gate-accounted] the planned turns the gate dropped ON PURPOSE: the booth
+    # counts them as decided, not as missing
+    out["dropped_ids"] = [str(t.get("turn_id")) for t in (g.get("turns") or [])
+                          if t.get("state") == "dropped" and t.get("turn") is not None and t.get("turn_id")]
     return out
 
 

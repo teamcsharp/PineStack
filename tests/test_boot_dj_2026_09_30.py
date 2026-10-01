@@ -56,6 +56,8 @@ FIXTURES = {
     "no System 3 conversation": _round(LINES, s3=False),
     "no bound roulette turns": _round(LINES, dice_ids={"0": "other", "1": "other"}),
     "dropped turn after repair": _round(LINES, bound=[0, 1, 3], planned=4),
+    # [s3-coverage] completeness is coverage now: 3 of 4 airs, 3 of 6 is a fragment
+    "a fragment of the plan": _round(LINES, bound=[0, 1, 3], planned=6),
 }
 
 
@@ -138,12 +140,19 @@ class ReadyMeansAirable(unittest.TestCase):
         self.assertEqual(why, "")
 
     def test_a_round_the_booth_withholds_is_not_ready_and_says_why(self):
-        for name in ("dropped turn after repair", "no bound roulette turns",
+        for name in ("a fragment of the plan", "no bound roulette turns",
                      "no System 3 conversation", "limit under the plan"):
             with self.subTest(name):
                 ready, why = self._ready(dict(FIXTURES[name]))
                 self.assertFalse(ready)
                 self.assertIn("System 3 would withhold it at the booth", why)
+
+    def test_one_turn_short_of_the_plan_still_airs(self):
+        """[s3-coverage] 2026-10-01: all-or-nothing withheld nearly every live round
+        for one unaligned turn and the DJs went silent."""
+        ready, why = self._ready(dict(FIXTURES["dropped turn after repair"]))
+        self.assertTrue(ready)
+        self.assertEqual(why, "")
 
 
 class TheBootRoadOpensWithABankedRound(unittest.IsolatedAsyncioTestCase):

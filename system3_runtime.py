@@ -3286,9 +3286,17 @@ class System3Runtime:
             return False
         try:
             rewrites = system3.GATE_REWRITES if (prepared and self.settings.get("repair", True)) else 0
+            # [live-legs] a LIVE round's protocol legs get their tries too: holding the
+            # round for one copied greet or sign-off is dead air - 22 of 63 live calls
+            # on 2026-10-01 were held there and never aired. Other copies still drop.
+            legs = bool(not prepared and self.settings.get("repair", True))
+            if legs:
+                rewrites = system3.GATE_LIVE_REWRITES
             handle.gate = system3.gate_open(handle.conv, [(str(m or ""), str(x or "")) for m, x in turns],
                                             None if spoken is None else [str(x or "") for x in spoken],
-                                            rewrites=rewrites, visits=system3.GATE_VISITS if rewrites else 0)
+                                            rewrites=rewrites, legs_only=legs,
+                                            visits=((system3.GATE_LIVE_VISITS if legs else system3.GATE_VISITS)
+                                                    if rewrites else 0))
             handle.gate["prepared"] = bool(prepared)
             self._gate_flush(handle)
             return True
