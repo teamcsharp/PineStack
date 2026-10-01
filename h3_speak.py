@@ -26,6 +26,9 @@ LEAD_S = 1.25                 # ...and its first/last beat
 MIN_WORDS = 4                 # "Yeah." "No idea." are not a line for a stinger
 MAX_WORDS = 24                # one sentence; a caption run with no stops is longer
 COUNTS = (1, 2, 3)
+# [speech-gates] the rules the operator switched off (speech_gates.py fills it);
+# an unfilled {slot} is always refused - it would be read out as written
+OFF: set[str] = set()
 
 PLACEHOLDER = re.compile(r"\{[A-Za-z_][A-Za-z0-9_]*\}")
 _STAMP = re.compile(r"^\s*[\[(]?\d{1,3}:\d{2}(?::\d{2})?[\])]?\s*")
@@ -101,43 +104,43 @@ def sentence_why(sentence: Any) -> str:
         return "empty"
     if PLACEHOLDER.search(s) or "{" in s or "}" in s:
         return "an unfilled placeholder"
-    if _URL.search(s):
+    if "url" not in OFF and _URL.search(s):
         return "a web address"
-    if _FILE.search(s):
+    if "file" not in OFF and _FILE.search(s):
         return "a file name"
-    if _STATUS.search(s) or _LABEL.match(s):
+    if "status" not in OFF and (_STATUS.search(s) or _LABEL.match(s)):
         return "a status line"
-    if _SPEAKER.match(s):
+    if "speaker" not in OFF and _SPEAKER.match(s):
         return "a speaker label"
-    if _CLIPNO.search(s) or _TITLE_RUN.search(s):
+    if "titles" not in OFF and (_CLIPNO.search(s) or _TITLE_RUN.search(s)):
         return "titles glued together"
-    if _MARKUP.search(s):
+    if "markup" not in OFF and _MARKUP.search(s):
         return "markup or an annotation"
-    if _NON_ASCII.search(s):
+    if "nonascii" not in OFF and _NON_ASCII.search(s):
         return "not plain English text"
     words = s.split()
-    if len(words) < MIN_WORDS:
+    if "fragment" not in OFF and len(words) < MIN_WORDS:
         return "a fragment (%d words)" % len(words)
-    if len(words) > MAX_WORDS:
+    if "too_long" not in OFF and len(words) > MAX_WORDS:
         return "too long for one breath (%d words)" % len(words)
-    if not _END.search(s):
+    if "no_end" not in OFF and not _END.search(s):
         return "no sentence end"
-    if _ABBREV.search(s.rstrip("\"')”’")):
+    if "abbrev" not in OFF and _ABBREV.search(s.rstrip("\"')”’")):
         return "cut at an abbreviation"
     first = next((c for c in s if c.isalpha()), "")
-    if not first or not first.isupper() or not (s[0].isalpha() or s[0] in "\"'“‘"):
+    if "mid_sentence" not in OFF and (not first or not first.isupper() or not (s[0].isalpha() or s[0] in "\"'“‘")):
         return "starts mid-sentence"
     alpha = [w for w in words if any(c.isalpha() for c in w)]
-    if len(alpha) < MIN_WORDS:
+    if "numbers" not in OFF and len(alpha) < MIN_WORDS:
         return "numbers, not words"
-    if sum(1 for w in words if any(c.isdigit() for c in w)) * 4 > len(words):
+    if "numbers" not in OFF and sum(1 for w in words if any(c.isdigit() for c in w)) * 4 > len(words):
         return "numbers, not words"
     rest = [w.strip("\"'.,!?;:()") for w in alpha[1:]]
     rest = [w for w in rest if w and w.lower() not in _SMALL and w not in ("I", "I'm", "I'll", "I've", "I'd")]
-    if len(rest) >= 3 and sum(1 for w in rest if w[:1].isupper()) * 10 >= len(rest) * 6:
+    if "title" not in OFF and len(rest) >= 3 and sum(1 for w in rest if w[:1].isupper()) * 10 >= len(rest) * 6:
         return "a title"
     low = [w.lower().strip("\"'.,!?;:") for w in words]
-    if any(low[i] == low[i + 1] == low[i + 2] for i in range(len(low) - 2)):
+    if "stutter" not in OFF and any(low[i] == low[i + 1] == low[i + 2] for i in range(len(low) - 2)):
         return "a stutter"
     return ""
 

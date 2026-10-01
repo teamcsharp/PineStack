@@ -23566,6 +23566,18 @@
     flowBtn.setAttribute('aria-pressed', 'false');
     flowBtn.innerHTML = folderIcon('c:decision-tree', flowLabel) || 'F';
     restore.appendChild(flowBtn);
+    /* [speech-gates] "where is the panel for that? i need to be able to edit any
+       gate for speech by the station" - every gate, one tap from the script */
+    var gatesLabel = 'Speech gates: every check that can refuse the station\'s speech - edit them here';
+    var gatesBtn = make('button', 'sp-band-reopen sp-band-always sp-gates-open');
+    gatesBtn.type = 'button';
+    gatesBtn.title = gatesLabel;
+    gatesBtn.setAttribute('aria-label', gatesLabel);
+    gatesBtn.innerHTML = folderIcon('c:settings--adjust', gatesLabel) || 'G';
+    gatesBtn.addEventListener('click', function () {
+      if (root.PineSpeechGates) root.PineSpeechGates.open();
+    });
+    restore.appendChild(gatesBtn);
     /* [reply-gap] the pause between replies, its roulette and its dice:
        right of the chat icon, across the rest of the row. */
     restore.appendChild(gapBar());

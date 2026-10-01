@@ -449,6 +449,61 @@ async def api_content_gates_get(
     return content_gate_status()
 
 
+# --- [speech-gates] EVERY GATE ON THE STATION'S SPEECH, EDITABLE -----------------
+# speech_gates.py lists the thresholds written into the code that refuse a line
+# whatever the content gates say (nothing twice inside a day, the rerun check,
+# the advert copy check, System 3's copy gate, the hourly video's sentence
+# rules...); the operator's values live in data/speech_gates.json and are set on
+# the running station at boot and on every change. The panel (speech-gates.js)
+# shows them beside the content gates above.
+import speech_gates as _speech_gates
+
+
+def speech_gates_stats(gid: str) -> dict[str, Any]:
+    """What a gate has done lately, where the station already counts it."""
+    if gid == "norepeat" and globals().get("NOREPEAT") is not None:
+        counts = dict(getattr(NOREPEAT, "counts", {}) or {})
+        refused = {k[len("refused:"):]: v for k, v in counts.items() if k.startswith("refused:")}
+        return {"refused": sum(refused.values()), "by_road": dict(sorted(refused.items(), key=lambda kv: -kv[1])[:8]),
+                "since": "boot"}
+    if gid == "rerun" and globals().get("_block_rate"):
+        return {"block_rate": round(_block_rate(), 3), "of_last": len(globals().get("_BLOCK_RECENT") or [])}
+    return {}
+
+
+@app.on_event("startup")
+async def _speech_gates_start() -> None:
+    try:
+        await asyncio.to_thread(_speech_gates.load, data_path("speech_gates.json"))
+        missed = _speech_gates.apply(globals())
+        if missed:
+            pipeline_log("gates", "[speech-gates] not set: %s" % ", ".join("%s (%s)" % kv for kv in missed.items()))
+    except Exception as exc:  # noqa: BLE001
+        pipeline_log("gates", "[speech-gates] not loaded (%s)" % type(exc).__name__)
+
+
+@app.get("/api/speech-gates")
+async def api_speech_gates_get(authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    require_read_auth(authorization)
+    out = _speech_gates.view(globals(), speech_gates_stats)
+    out["content"] = content_gate_status()
+    return out
+
+
+@app.post("/api/speech-gates")
+async def api_speech_gates_post(request: Request, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    """{gate, key, value} | {gate, rule, on} | {gate, reset: true}."""
+    require_auth(authorization)
+    body = await request.json()
+    try:
+        out = await asyncio.to_thread(_speech_gates.change, globals(), body if isinstance(body, dict) else {})
+    except (KeyError, TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc).strip("'")) from exc
+    pipeline_log("gates", "[speech-gates] %s: %s" % (body.get("gate"), {k: v for k, v in body.items() if k != "gate"}))
+    out["content"] = content_gate_status()
+    return out
+
+
 @app.patch("/api/orchestrator/content-gates")
 @app.post("/api/orchestrator/content-gates")
 async def api_content_gates_patch(
@@ -79342,6 +79397,9 @@ ENGLISH_ACCENTS = set(
     "\u00d9\u00db\u00dc\u00c7\u00d1\u00d8\u00c6\u0152")
 
 
+ENGLISH_DIACRITIC_MAX = 0.04   # [speech-gates] accented-letter share past which a long line is not English
+
+
 def looks_english(text: str) -> bool:
     """#792: the station broadcasts in ENGLISH. A Portuguese lyric swath
     rode a whole turn on air verbatim, so lines are checked: heavy
@@ -79378,7 +79436,7 @@ def looks_english(text: str) -> bool:
                         "\u00cd\u00ce\u00cf\u00d1\u00d2\u00d3\u00d4"
                         "\u00d5\u00d6\u00d8\u00d9\u00da\u00db\u00dc"
                         "\u00dd\u00df" for c in letters)
-        if _dia / len(letters) > 0.04:
+        if _dia / len(letters) > ENGLISH_DIACRITIC_MAX:
             return False
     _en = {"the", "a", "an", "and", "or", "but", "of", "to", "in", "on",
            "at", "is", "are", "was", "were", "be", "been", "it", "that",
@@ -95465,6 +95523,8 @@ TIER_GATES = (86400.0, 172800.0, 259200.0)  # #824: day-scale rotation
 # Past this share of recent candidates blocked, the gate stands down. An
 # anti-repeat engine that can silence the station is worse than repetition.
 BLOCK_RATE_CAP = 0.35
+RERUN_JACCARD = 0.62        # [speech-gates] rerun_check: near-identical at this 4-word-shingle overlap
+RERUN_CONTAIN = 0.85        # [speech-gates] ...or the smaller line this much inside the other
 _BLOCK_RECENT: list[int] = []
 
 # --- The rejection window (#901) -------------------------------------
@@ -95937,7 +95997,7 @@ def rerun_check(text: str, who: str = "", kind: str = "",
             if not overlap:
                 continue
             union = len(mine | theirs)
-            if union and overlap / union >= 0.62:
+            if union and overlap / union >= RERUN_JACCARD:
                 verdict.update({"block": True,
                                 "why": "near-identical to a line already said",
                                 "hit": str(row.get("key") or "")})
@@ -95948,7 +96008,7 @@ def rerun_check(text: str, who: str = "", kind: str = "",
             # half on a symmetric Jaccard. A line that contains a line already
             # said is a line already said.
             small = min(len(mine), len(theirs))
-            if small >= 6 and overlap / small >= 0.85:
+            if small >= 6 and overlap / small >= RERUN_CONTAIN:
                 verdict.update({"block": True,
                                 "why": "contains a line already said, whole",
                                 "hit": str(row.get("key") or "")})

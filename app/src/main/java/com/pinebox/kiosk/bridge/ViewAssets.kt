@@ -68,6 +68,7 @@ object ViewAssets {
         "sfx-db.js",            // [sfx-library] the SFX database window (opened from the file manager)
         "production-feed.js",   // [prod-feed] the pause, as a feed, above the script view
         "flow-chart.js",        // [flowchart] the conversation as a growing flowchart (script view toggle)
+        "speech-gates.js",      // [speech-gates] every gate on the station's speech (script view toolbar)
         // Voice Actor strips: the last eight profiles under each seat
         // (tap assigns, hold auditions a never-aired sample + meter).
         "voice-actor-strips.js",
@@ -180,6 +181,7 @@ object ViewAssets {
         "sfx-db.css",           // [sfx-library] the SFX database window
         "production-feed.css",  // [prod-feed] the pause, as a feed
         "flow-chart.css",       // [flowchart] the conversation as a growing flowchart
+        "speech-gates.css",     // [speech-gates] the speech gates panel
         "voice-actor-strips.css",  // the profile strips and the audition sheet
         // #1191/#1202: the glass, its triangles and its headline number. Same
         // finding as the script above - the file was in assets and in no
