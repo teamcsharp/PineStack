@@ -148219,6 +148219,10 @@ async def tablet_update_ask_post(request: Request,
     if not _PINETAB_UPDATE_ASK.get("ask_at") or abs(asked - float(_PINETAB_UPDATE_ASK["ask_at"])) > 0.001:
         raise HTTPException(status_code=409, detail="that is not the ask on file")
     line = " ".join(str(body.get("line") or "").split())[:240]
+    if _PINETAB_UPDATE_ASK.get("state") in ("done", "failed") and state in ("taken", "running"):
+        # [tablet-update-ask] the desk posts its progress asynchronously: a line that
+        # lands after the verdict must not reopen a finished ask (it blocked new asks)
+        return pinetab_update_ask_view()
     _PINETAB_UPDATE_ASK.update(state=state, at=now, line=line or str(_PINETAB_UPDATE_ASK.get("line") or ""))
     if line:
         _PINETAB_UPDATE_ASK.setdefault("lines", []).append({"at": now, "state": state, "line": line})
