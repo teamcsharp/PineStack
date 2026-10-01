@@ -134,7 +134,7 @@
     ROLL_ROWS.forEach(function (k) { var r = rollRow(k[1], rolls[k[0]]); if (r) rows.push(r); });
     /* [h3-slots] each named slot's roll ({mxtape}, {arena2}...) and the screen it played on */
     Object.keys(rolls).forEach(function (k) {
-      var m = /^slot_(screen_)?((mxtape|fordtape|videos|sfxclip|convograph|gazette|arena)\d?)$/.exec(k);
+      var m = /^slot_(screen_)?((mxtape|fordtape|videos|sfxclip|convograph|gazette|arena|feature|releaselog)\d?)$/.exec(k);
       if (!m) return;
       var r = rollRow(m[1] ? 'screen for {' + m[2] + '}' : '{' + m[2] + '}', rolls[k]); if (r) rows.push(r);
     });
@@ -275,7 +275,6 @@
     rollHead.setAttribute('role', 'button'); rollHead.tabIndex = 0;
     rollHead.title = 'How the roulette rolled this ad - tap for the details';
     rollHead.setAttribute('aria-label', rollHead.title);
-    head.appendChild(rollHead);
     var rollTag = null, rollRec = null;
     var position = make('span', 'pav-position'); head.appendChild(position);
     var rows = [], signatures = {}, index = 0, revision = 0, gone = false, references = {}, original = false, currentRow = '';
@@ -366,7 +365,7 @@
       ['audio_direction', 'Audio direction', 'input', 'blank: the gear\'s brief'],
       ['constraints', 'Constraints', 'input', 'blank: the gear\'s brief'],
       /* [h3-overview] */
-      ['kind', 'Kind', 'input', 'blank: these words. overview: a technical overview at a whiteboard - a rolled changelog feature, pitched by the model']];
+      ['kind', 'Kind', 'input', 'blank: these words. overview: a technical overview at a whiteboard - the model pitches the release-log feature {feature} rolls ({releaselog} is its entry)']];
     var pInputs = {}, pLabels = {};
     P_FIELDS.forEach(function (f) {
       var label = make('label', 'pav-pr-field'), input = make(f[2]);
@@ -392,7 +391,7 @@
     function slotKnown(name) {
       if (name.indexOf('|') >= 0) return true;
       var bare = name.replace(/\d$/, '');
-      return slotList().some(function (s) { return s.name === name || (s.name === bare && /\d$/.test(name) && ['mxtape', 'fordtape', 'videos', 'sfxclip', 'convograph', 'gazette', 'arena'].indexOf(bare) >= 0); });
+      return slotList().some(function (s) { return s.name === name || (s.name === bare && /\d$/.test(name) && ['mxtape', 'fordtape', 'videos', 'sfxclip', 'convograph', 'gazette', 'arena', 'feature', 'releaselog'].indexOf(bare) >= 0); });
     }
     function slotDistance(a, b) {
       var m = a.length, n = b.length, d = [], i, j;
@@ -1010,6 +1009,7 @@
     });
     var next = command('Next ad', 'c:caret--right', function () { if (index > 0) { index--; paint(); } });
     head.appendChild(previous); head.appendChild(next); box.appendChild(head);
+    box.appendChild(rollHead);                     /* [ad-band] the ad's rolls, full width under the one row */
     if (gallery) box.appendChild(qualityPanel);                         /* [h3-quality] */
     if (gallery) box.appendChild(pScreen);                              /* [h3-prompts] the P screen */
     var strip = make('div', 'pav-strip'); strip.setAttribute('aria-label', 'Generated media');
@@ -1084,9 +1084,77 @@
       rollHead.replaceChildren();
       rollHead.hidden = !rollRows(rec).length;
       if (rollHead.hidden) return;
-      var inner = make('div', 'pav-rollhead-in');
-      rollHead.appendChild(inner);
-      rollTag = rollStage(inner, rec, true);
+      rollTag = rollBand(rollHead, rollRows(rec));
+    }
+    /* [ad-band] "the Pine Box ad is actually too small for me to be able to read.
+       So what I need it to do is actually show the roulette roll for each entry
+       one by one and then pull back and then show the list of every roulette entry
+       that made up this particular ad" (the operator, 2026-10-01). A full-width
+       band under the one-row header: each roll large, its reel spinning through
+       what it was drawn from and landing on the pick with its d100; then the band
+       pulls back to every roll at once, readable. The replay button plays it again;
+       a tap anywhere else opens how each roll landed. Reduced motion: the list. */
+    function rollBand(into, list) {
+      var token = {dead: false}, timers = [];
+      function later(fn, ms) { timers.push(setTimeout(function () { if (!token.dead) fn(); }, ms)); }
+      var band = make('div', 'pav-band');
+      var top = make('div', 'pav-band-top');
+      var count = make('span', 'pav-band-count', '');
+      var replay = command('Play the rolls again', 'c:renew', function () { play(); });
+      replay.classList.add('pav-band-replay');
+      replay.addEventListener('click', function (ev) { ev.stopPropagation(); });
+      top.append(make('b', '', 'PINE BOX AD'), make('span', 'pav-band-sub', list.length + ' roulette roll'
+        + (list.length === 1 ? '' : 's') + ' made this ad'), count, replay);
+      var one = make('div', 'pav-band-one');
+      var oneTable = make('span', 'pav-band-table', ''), reel = make('div', 'pav-band-reel');
+      var card = make('div', 'pav-band-card', ''), dice = make('span', 'pav-band-dice', '');
+      reel.appendChild(card);
+      one.append(oneTable, reel, dice);
+      var all = make('ol', 'pav-band-list');
+      list.forEach(function (r) {
+        var m = r.main, li = make('li');
+        li.append(make('span', 'pav-band-name', r.table), make('b', '', m.label || '-'),
+          make('i', '', 'd100 ' + m.dice + ' · ' + (m.counted ? m.index : m.hit + 1) + ' of ' + m.of));
+        li.title = r.table + ': ' + m.label + (m.opts.length > 1 ? '\nfrom: ' + m.opts.slice(0, 40).join(' | ') : '');
+        all.appendChild(li);
+      });
+      band.append(top, one, all);
+      into.appendChild(band);
+      function where(r) { return 'd100 ' + r.main.dice + ' · ' + (r.main.counted ? r.main.index : r.main.hit + 1) + ' of ' + r.main.of; }
+      function spin(r, done) {
+        var m = r.main, opts = m.opts.length ? m.opts : [m.label];
+        /* up to 18 faces passing, decelerating, ending on the pick */
+        var faces = [], k;
+        for (k = 0; k < Math.min(17, opts.length > 1 ? 17 : 4); k += 1) faces.push(opts[(m.hit + 1 + k * 7) % opts.length]);
+        faces.push(m.label);
+        var step = 0, wait = 40;
+        card.classList.remove('hit');
+        (function tick() {
+          card.textContent = faces[step];
+          card.classList.remove('roll'); void card.offsetWidth; card.classList.add('roll');
+          step += 1;
+          if (step >= faces.length) { card.classList.add('hit'); dice.textContent = where(r); later(done, 1100); return; }
+          wait = Math.round(wait * 1.16);
+          later(tick, wait);
+        }());
+      }
+      function show(i) {
+        if (i >= list.length) { pull(); return; }
+        band.classList.remove('pulled');
+        count.textContent = (i + 1) + ' of ' + list.length;
+        oneTable.textContent = list[i].table;
+        dice.textContent = '';
+        one.classList.remove('in'); void one.offsetWidth; one.classList.add('in');
+        spin(list[i], function () { show(i + 1); });
+      }
+      function pull() { count.textContent = 'all ' + list.length; band.classList.add('pulled'); }
+      function play() {
+        timers.forEach(clearTimeout); timers = [];
+        var still = root.matchMedia && root.matchMedia('(prefers-reduced-motion: reduce)').matches;
+        if (still || !list.length) pull(); else show(0);
+      }
+      play();
+      return {dispose: function () { token.dead = true; timers.forEach(clearTimeout); }};
     }
     function openRollDetails() {
       if (!rollRec) return;

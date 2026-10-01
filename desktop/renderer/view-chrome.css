@@ -597,7 +597,7 @@
 .pine-talk-say.bad { border-color: #e46b6b; color: #e46b6b; }
 
 .pine-voice-ad-popup { position: fixed; inset: 0; z-index: 2147483085; display: grid; place-items: center; padding: 18px; background: rgba(3, 7, 10, .72); }
-.pine-voice-ad-card { display: flex; flex-direction: column; gap: 10px; width: min(860px, 94vw, calc((100dvh - 270px) * 16 / 9 + 28px)); min-width:min(310px,94vw); max-height:94dvh; overflow:auto; padding:14px; border:1px solid #65c7da; border-radius:8px; background:#151d20; box-shadow:0 24px 70px #000b; box-sizing:border-box; }
+.pine-voice-ad-card { display: flex; flex-direction: column; gap: 10px; width: min(860px, 94vw, calc((100dvh - 350px) * 16 / 9 + 28px)); min-width:min(310px,94vw); max-height:94dvh; overflow:auto; padding:14px; border:1px solid #65c7da; border-radius:8px; background:#151d20; box-shadow:0 24px 70px #000b; box-sizing:border-box; }
 .pine-voice-ad-card > b { color: #8de1ed; font: 600 16px/1.2 Inter, Segoe UI, system-ui, sans-serif; }
 .pine-voice-ad-card > span { color: #c8d4d9; font: 12px/1.4 Inter, Segoe UI, system-ui, sans-serif; overflow-wrap: anywhere; }
 .pav-head { display:flex; flex:0 0 auto; align-items:center; gap:8px; min-width:0; }
@@ -636,7 +636,7 @@ body.pine-splice-open > :not(.lb-editor-overlay) * { animation-play-state:paused
 .pav-reprompt-button{min-height:36px;border:1px solid #3b777d;background:#12292e;color:#d8edf0;padding:6px 10px}
 .pav-reprompt-button:disabled{opacity:.45}
 @media (max-height:600px) { .pine-voice-ad-card { width:min(760px, calc((100dvh - 180px) * 16 / 9)); min-width:min(310px,94vw); } }
-.pine-voice-ad-actions { display:flex; flex:0 0 auto; justify-content:flex-end; gap:8px; position:sticky; bottom:0; background:#151d20; }
+.pine-voice-ad-actions { display:flex; flex:0 0 auto; justify-content:flex-end; gap:8px; position:static; background:#151d20; }   /* [ad-band] was sticky: it rode over the video whenever the card scrolled */
 .pine-voice-ad-actions a, .pine-voice-ad-actions button { min-height: 32px; padding: 0 10px; border: 1px solid #36515c; border-radius: 5px; color: #e7f1f4; background: #17252d; font: 11px/1 Inter, Segoe UI, system-ui, sans-serif; text-decoration: none; }
 .pine-voice-ad-actions a { display: inline-grid; place-items: center; }
 .pine-voice-ad-actions button { cursor: pointer; }
@@ -716,17 +716,50 @@ body.pine-splice-open > :not(.lb-editor-overlay) * { animation-play-state:paused
 .pav-cast-state { flex: 1 1 100%; font-size: 11px; opacity: .8; overflow-wrap: anywhere; }
 /* [h3-prompts] the P and the dice beside the countdown, the hourly prompts screen, and
    the prompts a video was told (under its own bar, above Generated / Original) */
-.pine-voice-ad-card .pav-head { flex-wrap:wrap; row-gap:6px; }
-.pine-voice-ad-card .pav-head > b { flex:1 0 auto; white-space:nowrap; }
-/* [ad-roll] the ad's roll in the header, the feed's own stage made small; a tap opens the details */
-.pine-voice-ad-card .pav-head:has(.pav-rollhead:not([hidden])) > b { flex:0 0 auto; }
-.pine-voice-ad-card .pav-rollhead { flex:1 1 220px; min-width:180px; max-width:380px; height:62px; overflow:hidden;
-  position:relative; border:1px solid #2a3a44; border-radius:10px; background:#0b1117; cursor:pointer; }
+/* [ad-band] "I just want the UI items up here to just be a singular row" (the operator,
+   2026-10-01): the title, H3, its countdown, P, the dice, the gear, more, the count and
+   the arrows on ONE row, clear of the close X; it wraps only on a narrow screen */
+.pine-voice-ad-card .pav-head { flex-wrap:nowrap; gap:6px; padding-right:46px; min-height:38px; }
+.pine-voice-ad-card .pav-head > b { flex:0 1 auto; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.pine-voice-ad-card .pav-head .pav-h3 { flex:1 1 120px; min-width:110px; }
+.pine-voice-ad-card .pav-head .pav-h3-meter { flex:1 1 40px; min-width:30px; }
+.pine-voice-ad-card .pav-head .pav-icon, .pine-voice-ad-card .pav-head .pav-p { flex:0 0 34px; width:34px; height:34px; padding:6px; }
+@media (max-width:640px) { .pine-voice-ad-card .pav-head { flex-wrap:wrap; row-gap:6px; } }
+/* [ad-band] the ad's rolls, full width under the row: each roll large and one at a
+   time, then the band pulls back to every roll at once; a tap opens the details */
+.pine-voice-ad-card .pav-rollhead { flex:0 0 auto; position:relative; border:1px solid #2a3a44; border-radius:10px;
+  background:#0b1117; cursor:pointer; overflow:hidden; }
 .pine-voice-ad-card .pav-rollhead[hidden] { display:none; }
 .pine-voice-ad-card .pav-rollhead:hover, .pine-voice-ad-card .pav-rollhead:focus-visible { border-color:#65c7da; outline:none; }
-.pav-rollhead-in { zoom:.46; pointer-events:none; }
-.pav-rollhead .rt-bar, .pav-rollhead .rt-fold, .pav-rollhead .rt-facts { display:none; }
-.pav-rollhead .rt-tag .rt-stage { border:0; background:transparent; }
+.pav-band { display:grid; gap:6px; padding:8px 10px 10px; font:13px/1.35 Inter, Segoe UI, system-ui, sans-serif; color:#dbe6f0; }
+.pav-band-top { display:flex; align-items:center; gap:10px; min-width:0; }
+.pav-band-top > b { color:#8de1ed; font-size:13px; letter-spacing:.06em; }
+.pav-band-sub { flex:1; min-width:0; color:#8ea0ad; font-size:12px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.pav-band-count { color:#cbd8dc; font:12px/1 ui-monospace,Consolas,monospace; white-space:nowrap; }
+.pine-voice-ad-card .pav-band .pav-band-replay { flex:0 0 28px; width:28px; height:28px; padding:5px; }
+.pav-band-one { display:grid; grid-template-columns:minmax(110px,30%) 1fr auto; align-items:center; gap:12px; min-height:46px; }
+.pav-band-table { color:#9fb4c0; font-size:14px; text-align:right; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.pav-band-reel { height:44px; overflow:hidden; border:1px solid #35505c; border-radius:8px; background:#081013;
+  box-shadow:inset 0 10px 10px -10px #000, inset 0 -10px 10px -10px #000; }
+.pav-band-card { height:44px; line-height:44px; padding:0 14px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+  color:#b9c6ce; font-size:17px; }
+.pav-band-card.roll { animation:pav-band-roll .09s ease-out; }
+.pav-band-card.hit { color:#f3f8fa; font-weight:650; background:rgba(101,199,218,.18); }
+@keyframes pav-band-roll { from { transform:translateY(-60%); opacity:.35; } to { transform:none; opacity:1; } }
+.pav-band-dice { color:#e5c778; font:13px/1 ui-monospace,Consolas,monospace; white-space:nowrap; min-width:118px; }
+.pav-band-one.in { animation:pav-band-in .25s ease-out; }
+@keyframes pav-band-in { from { transform:scale(1.06); opacity:0; } to { transform:none; opacity:1; } }
+.pav-band-list { display:none; margin:0; padding:0; list-style:none; grid-template-columns:repeat(auto-fill, minmax(230px, 1fr));
+  gap:4px 14px; max-height:118px; overflow:auto; }
+.pav-band-list li { display:grid; grid-template-columns:auto 1fr; column-gap:8px; min-width:0; padding:3px 6px;
+  border-left:2px solid #2f6a75; }
+.pav-band-name { color:#8ea0ad; font-size:11.5px; grid-column:1 / -1; }
+.pav-band-list b { color:#eef4f6; font-weight:600; font-size:13px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.pav-band-list i { color:#e5c778; font:11px/1.6 ui-monospace,Consolas,monospace; font-style:normal; white-space:nowrap; }
+.pav-band.pulled .pav-band-one { display:none; }
+.pav-band.pulled .pav-band-list { display:grid; animation:pav-band-pull .45s ease-out; }
+@keyframes pav-band-pull { from { transform:scale(1.12); opacity:0; } to { transform:none; opacity:1; } }
+@media (prefers-reduced-motion: reduce) { .pav-band-card.roll, .pav-band-one.in, .pav-band.pulled .pav-band-list { animation:none; } }
 .pav-rollpop { position:fixed; left:50%; top:50%; transform:translate(-50%,-50%); z-index:2147483090;
   width:min(620px, calc(100vw - 32px)); max-height:84vh; overflow:auto; box-sizing:border-box;
   padding:16px 48px 16px 18px; border:1px solid #2a4257; border-radius:10px; background:#0b1520; color:#dbe6f0;

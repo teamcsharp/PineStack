@@ -215,3 +215,15 @@ def scene(presenter: str, f: dict[str, Any], do: str, actions: list[str]) -> str
     body = (" " + do) if do else ""
     acts = (" During it the presenter " + "; then ".join(actions) + ".") if actions else ""
     return (head + body + acts).strip()
+
+
+def direction(presenter: str, do: str, actions: list[str]) -> str:
+    """[h3-feature] The presenter, what the model's stage direction has them do
+    and the rolled actions - added to a preset whose own words carry the
+    feature ({feature}, {releaselog}) instead of replacing them with scene()."""
+    out = ("The presenter is %s." % presenter) if presenter else ""
+    if do:
+        out += " " + do.strip()
+    if actions:
+        out += " During it the presenter " + "; then ".join(actions) + "."
+    return out.strip()

@@ -46,9 +46,20 @@ CATALOGUE: tuple[tuple[str, str, str], ...] = (
                 "prop or the scene's subject.", 'the Pine Box Gazette, its front page headline reading "..."'),
     ("arena", "An arena built from a rolled Pine Box gallery picture. Use {arena} and {arena2} for two "
               "different arenas.", 'an arena built from the Pine Box gallery picture "neon forest"'),
+    # [h3-feature] "the technical overview prompt to grab a feature randomly from the
+    # release log ... I'm expecting to see {feature} and {releaselog} indicating a
+    # roulette roll" (the operator, 2026-10-01). One roll serves both, and the
+    # technical overview's pitch presents the same feature.
+    ("feature", "A feature of the station, rolled by System 3 from the release log (the changelog's tagged "
+                "features): its name in plain words. A technical-overview hour pitches this same feature. "
+                "{feature2} rolls a second one.",
+     'the Pine Box feature "One press builds, signs, installs and reopens the PineTab" [tablet-update-ask]'),
+    ("releaselog", "The release-log entry of the rolled {feature}: its commits, when they landed, their size and "
+                   "what the first one changed - the nuances to pitch. {releaselog2} goes with {feature2}.",
+     'the release log of [tablet-update-ask] (1 commit, +46/-12 lines): 60e37c0 "One press builds..." - ...'),
     ("a|b|c", "One of the options you write between the bars, rolled.", "{funny|grim|tender}"),
 )
-NAMED = ("mxtape", "fordtape", "videos", "sfxclip", "convograph", "gazette", "arena")
+NAMED = ("mxtape", "fordtape", "videos", "sfxclip", "convograph", "gazette", "arena", "feature", "releaselog")
 SLOT = re.compile(r"\{((%s)(\d?))\}" % "|".join(NAMED))
 
 SCREENS = (
@@ -169,6 +180,55 @@ def convograph(flow: dict[str, Any], most: int = 4) -> str:
         out += "; %d turns" % int(turns)
     if end.get("label"):
         out += ", %s" % end["label"]
+    return out
+
+
+def _feature_subject(f: dict[str, Any]) -> str:
+    first = (f.get("commits") or [{}])[0] if isinstance(f, dict) else {}
+    return quote(first.get("subject") or (f or {}).get("tag") or "something new", 110).rstrip(".")
+
+
+def feature(f: dict[str, Any]) -> str:
+    """[h3-feature] A release-log feature (h3_overview.features), named."""
+    return 'the Pine Box feature "%s" [%s]' % (_feature_subject(f), quote(f.get("tag"), 40))
+
+
+def _first_sentence(body: Any, most: int = 180) -> str:
+    """The commit's first sentence of its own: list bullets taken off, and a
+    paragraph that opens by quoting the operator passed over for the next."""
+    paras = [p for p in re.split(r"\n\s*\n", str(body or "")) if p.strip()]
+    keep = []
+    for p in paras:
+        lines = [re.sub(r"^\s*[-*]\s+", "", ln) for ln in p.splitlines()
+                 if ln.strip() and not re.match(r"\s*(Co-Authored-By|Signed-off-by)\b", ln, re.I)]
+        text = " ".join(" ".join(lines).split())
+        if text and text[0] not in "\"'“‘(":
+            keep = [text]
+            break
+        if text and not keep:
+            keep = [text]
+    text = keep[0] if keep else ""
+    m = re.match(r"(.+?[.!?])(\s|$)", text)
+    out = (m.group(1) if m else text)
+    return out if len(out) <= most else out[:most].rsplit(" ", 1)[0] + "..."
+
+
+def releaselog(f: dict[str, Any], most_commits: int = 3) -> str:
+    """[h3-feature] The release-log entry of a feature: its commits (id, when,
+    subject), its size and the first commit's opening sentence."""
+    commits = list(f.get("commits") or [])
+    head = "the release log of [%s] (%d commit%s, +%d/-%d lines)" % (
+        quote(f.get("tag"), 40), len(commits), "" if len(commits) == 1 else "s",
+        int(f.get("insertions") or 0), int(f.get("deletions") or 0))
+    rows = []
+    for c in commits[:most_commits]:
+        when = quote(c.get("at"), 24)
+        rows.append('%s%s "%s"' % (quote(c.get("commit"), 10), (" " + when) if when else "",
+                                   quote(c.get("subject"), 90).rstrip(".")))
+    out = head + (": " + "; ".join(rows) if rows else "")
+    said = _first_sentence(commits[0].get("body")) if commits else ""
+    if said:
+        out += " - " + quote(said, 180)
     return out
 
 

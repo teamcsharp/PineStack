@@ -10,8 +10,9 @@ JS = (ROOT / "desktop" / "renderer" / "ad-viewer.js").read_text(encoding="utf-8"
 
 class Slots(unittest.TestCase):
     def test_the_slot_pattern(self):
-        # [h3-slots] 2026-10-01: the named slots ({mxtape} ... {arena2}) joined the pattern
-        names = r"(?:mxtape|fordtape|videos|sfxclip|convograph|gazette|arena)\d?"
+        # [h3-slots] 2026-10-01: the named slots ({mxtape} ... {arena2}) joined the pattern,
+        # [h3-feature] then {feature} and {releaselog}
+        names = r"(?:mxtape|fordtape|videos|sfxclip|convograph|gazette|arena|feature|releaselog)\d?"
         rx = re.compile(r"\{(speakerbox|" + names + r"|[^{}|\n]+(?:\|[^{}|\n]+)+)\}")
         self.assertIn('H3_SLOT_NAMES = r"' + names + '"', SRC)
         self.assertIn('H3_SLOT_RX = re.compile(r"\\{(speakerbox|" + H3_SLOT_NAMES + r"|[^{}|\\n]+(?:\\|[^{}|\\n]+)+)\\}")', SRC)

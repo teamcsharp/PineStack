@@ -15861,6 +15861,21 @@ def engine_prep_take(engine: str = "") -> bool:
         return False
 
 
+def engine_prep_free(engine: str = "") -> bool:
+    """[talk-steady] Would engine_prep_take admit a preparation now? The same
+    test, taking nothing - asked before any expensive work is done for a slot."""
+    try:
+        limits = recording_booths()
+        lane = str(engine or "shared")
+        return not (engine_inflight() >= limits["capacity"]
+                    or int(_ENGINE_PREP[0]) >= limits["prep_limit"]
+                    or bool(_ENGINE_PREP_BY.get("shared"))
+                    or (lane == "shared" and int(_ENGINE_PREP[0]) > 0)
+                    or int(_ENGINE_PREP_BY.get(lane) or 0) >= 1)
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def engine_prep_give(engine: str = "") -> None:
     try:
         _ENGINE_PREP[0] = max(0, int(_ENGINE_PREP[0]) - 1)
@@ -45963,6 +45978,11 @@ async def prep_render_line(text: str, who: str,
     # model visit is never spent twice.
     if prep_should_stop():
         return None
+    # [talk-steady] ask for the slot BEFORE planning: the plan below is up to
+    # 1.8 s on the loop, and recast_tick planned and threw away row after row
+    # while the engine was busy - 6.5-9 s freezes of the whole station
+    if not engine_prep_free(engine):
+        return None
     fx = dict(voice_effect_pick())
     # [es-bank] "I want banked scheduled and written cupboard footage taken through
     # the emotion engine" (2026-10-01). A line with no node of its own (an ad, a
@@ -45987,6 +46007,7 @@ async def prep_render_line(text: str, who: str,
             except Exception:  # noqa: BLE001
                 _opened = None
     _es_got = (await _s3_stamp_perf(stamp, who))[0]
+    await asyncio.sleep(0)                      # [talk-steady] the loop breathes after the plan
     vec = performance_vector(who, voice, state=(_es_got or {}).get("dims"),
                              es=(_es_got or {}).get("voice"))
     if vec:
@@ -87878,7 +87899,9 @@ def sfx_gain_command(path: Path, db: float) -> list[str] | None:
         return None
     fmt, acodec, _mime = kind
     limit = 10 ** ((float(SFX_TP_DB) - float(globals().get("SFX_TP_MARGIN_DB", 1.0))) / 20.0)
-    cmd = [shutil.which("ffmpeg") or "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin",
+    # [talk-steady] the box's own ffmpeg (imageio): none is on PATH in the container, so
+    # every gain stream forked the station, failed to exec and went out unlevelled
+    cmd = [_sfx_ffmpeg() or shutil.which("ffmpeg") or "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin",
            "-i", str(path), "-map", "0:v?", "-map", "0:a?", "-c:v", "copy",
            "-af", "volume=%.2fdB,alimiter=limit=%.4f:level=disabled" % (db, max(0.0625, min(1.0, limit))),
            "-c:a", acodec, "-b:a", "160k"]
@@ -87895,26 +87918,41 @@ async def sfx_gain_stream(path: Path, db: float, headers: dict[str, str]) -> Res
     cmd = sfx_gain_command(path, db)
     if cmd is None:
         return None
+    # [talk-steady] NOT asyncio.create_subprocess_exec: the station runs on uvloop,
+    # whose spawn forks this whole 8 GB, 160-thread process in C with the GIL held
+    # (py-spy --gil: 48 s of 10 min, the 1.6-2 s silent stalls). CPython's Popen
+    # posix_spawns (a vfork-style clone, the same cost at any size), on a worker
+    # thread; the pipe is then the loop's to read.
+    import subprocess as _sp
+    loop = asyncio.get_running_loop()
     try:
-        proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE,
-                                                    stderr=asyncio.subprocess.DEVNULL)
+        proc = await asyncio.to_thread(_sp.Popen, cmd, stdin=_sp.DEVNULL, stdout=_sp.PIPE,
+                                       stderr=_sp.DEVNULL, close_fds=False)
     except Exception:  # noqa: BLE001
+        return None
+    try:
+        reader = asyncio.StreamReader(limit=1 << 20)
+        pipe, _proto = await loop.connect_read_pipe(lambda: asyncio.StreamReaderProtocol(reader), proc.stdout)
+    except Exception:  # noqa: BLE001
+        proc.kill()
+        await asyncio.to_thread(proc.wait)
         return None
 
     async def body():
         try:
             while True:
-                chunk = await proc.stdout.read(65536)
+                chunk = await reader.read(65536)
                 if not chunk:
                     break
                 yield chunk
         finally:
-            if proc.returncode is None:
+            pipe.close()
+            if proc.poll() is None:
                 try:
                     proc.kill()
                 except ProcessLookupError:
                     pass
-            await proc.wait()
+            await asyncio.to_thread(proc.wait)
 
     out = {k: v for k, v in headers.items() if k != "Accept-Ranges"}
     out["X-Pine-Gain-Db"] = "%.2f" % db
@@ -189952,7 +189990,7 @@ def h3_speak_normalize(text: Any) -> str:
 
 
 # [h3-slot-roll] {speakerbox} and {a|b|c} in an hourly prompt are ROLLS
-H3_SLOT_NAMES = r"(?:mxtape|fordtape|videos|sfxclip|convograph|gazette|arena)\d?"   # [h3-slots] = h3_slots.NAMED
+H3_SLOT_NAMES = r"(?:mxtape|fordtape|videos|sfxclip|convograph|gazette|arena|feature|releaselog)\d?"   # [h3-slots] = h3_slots.NAMED
 H3_SLOT_RX = re.compile(r"\{(speakerbox|" + H3_SLOT_NAMES + r"|[^{}|\n]+(?:\|[^{}|\n]+)+)\}")
 H3_SLOT_KEEP_S = 1800.0
 H3_SLOT_OPTS = 40
@@ -190073,6 +190111,9 @@ H3_SLOT_LABELS = {
     "convograph": "which real conversation's flowchart an hourly H3 prompt's {convograph} presents",
     "gazette": "which recent Pine Box Gazette edition an hourly H3 prompt's {gazette} brings in",
     "arena": "which Pine Box gallery picture an hourly H3 prompt's {arena} is built from",
+    # [h3-feature] both ride ONE roll - h3.overview_feature, the technical overview's own die
+    "feature": "which tagged release-log feature an hourly H3 prompt's {feature} (and the overview pitch) presents",
+    "releaselog": "the release-log entry of the feature {feature} rolled - the same roll",
 }
 H3_SLOT_SCREEN_LABEL = "what screen in the scene shows an hourly H3 prompt's {videos} or {sfxclip}"
 
@@ -190141,6 +190182,54 @@ def h3_slot_screen(tok: str) -> str:
     screen = str(s3_choice("h3.slot_screen", h3_slots.SCREENS, H3_SLOT_SCREEN_LABEL))
     _h3_slot_note("slot_screen_" + tok, "h3.slot_screen", list(h3_slots.SCREENS), screen)
     return screen
+
+
+# [h3-feature] {feature} and {releaselog}: ONE roll of the release log (the
+# changelog's tagged features, h3_overview.features) per digit, kept with the
+# slot memo for the hour, so the preset's words, its {releaselog} and the
+# technical overview's pitch all present the same feature. System 3's die is
+# the overview's own (h3.overview_feature); the roll rides the rolodex as
+# slot_feature.
+def h3_feature_pool(page: Any = None) -> dict[str, dict[str, Any]]:
+    """The release log's features, from the changelog held in memory (or `page`)."""
+    try:
+        page = page if isinstance(page, dict) else _CHANGELOG.memory_page(300)
+        return h3_overview.features(page.get("entries") or [])
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def h3_feature_take(feats: Any = None, digit: str = "") -> dict[str, Any] | None:
+    """[h3-feature] The feature rolled for this hour's {feature}/{releaselog} (digit
+    "" or "2"...), rolled once and kept; None when the release log has none."""
+    now = time.time()
+    if now - float(_H3_SLOT_MEMO["at"]) > H3_SLOT_KEEP_S:
+        _H3_SLOT_MEMO.update(at=now, vals={})
+    if _H3_SLOT_MEMO.get("features_at") != _H3_SLOT_MEMO["at"]:
+        _H3_SLOT_MEMO.update(features_at=_H3_SLOT_MEMO["at"], features={})
+    kept = _H3_SLOT_MEMO["features"]
+    if digit in kept:
+        return kept[digit]
+    feats = feats if isinstance(feats, dict) and feats else h3_feature_pool()
+    if not feats:
+        pipeline_log("ads", "hourly H3 prompts: {feature} - the release log has no tagged features, taken out")
+        return None
+    tags = list(feats)
+    labels = [h3_overview.feature_label(feats[t]) for t in tags]
+    k = s3_weighted("h3.overview_feature", labels, [1.0] * len(labels), H3_SLOT_LABELS["feature"])
+    k = k if isinstance(k, int) and 0 <= k < len(tags) else 0
+    _h3_slot_note("slot_feature" + digit, "h3.overview_feature", labels, labels[k])
+    kept[digit] = feats[tags[k]]
+    return kept[digit]
+
+
+def h3_slot_feature(tok: str, feats: Any = None) -> str:
+    """[h3-feature] {feature} as its name, {releaselog} as its entry - one roll."""
+    name = h3_slots.base(tok)
+    got = h3_feature_take(feats, tok[len(name):])
+    if not got:
+        return ""
+    return h3_slots.feature(got) if name == "feature" else h3_slots.releaselog(got)
 
 
 def h3_slot_pick(tok: str, shelf: Any) -> str:
@@ -190228,7 +190317,13 @@ async def h3_slots_preroll(*texts: Any) -> dict[str, str]:
             continue
         name = h3_slots.base(tok)
         try:
-            if name == "sfxclip":
+            if name in ("feature", "releaselog"):                         # [h3-feature]
+                feats = h3_feature_pool()
+                if not feats:
+                    feats = h3_feature_pool(await asyncio.wait_for(asyncio.to_thread(_CHANGELOG.page, 300),
+                                                                   timeout=5.0))
+                got = h3_slot_feature(tok, feats)
+            elif name == "sfxclip":
                 got = await h3_slot_sfxclip(tok)
             elif name == "convograph":
                 got = await h3_slot_convograph(tok)
@@ -190250,6 +190345,8 @@ def h3_slot_named_sync(tok: str) -> str:
     if name == "convograph":
         pipeline_log("ads", "hourly H3 prompts: {%s} is rolled by the hourly door only - taken out here" % tok)
         return ""
+    if name in ("feature", "releaselog"):                                 # [h3-feature]
+        return h3_slot_feature(tok)
     if name == "sfxclip":
         total = int(h3_slot_shelf("sfxclip") or 0)
         if not total:
@@ -190690,10 +190787,13 @@ async def _h3_overview_prepare() -> dict[str, Any] | None:
     if not feats:
         pipeline_log("ads", "hourly H3 technical overview: the changelog has no tagged features yet")
         return None
-    tags = list(feats)
-    labels = [h3_overview.feature_label(feats[t]) for t in tags]
-    k = s3_weighted("h3.overview_feature", labels, [1.0] * len(labels), H3_OVERVIEW_FEATURE_LABEL)
-    feature = feats[tags[k if isinstance(k, int) and 0 <= k < len(tags) else 0]]
+    _take = globals().get("h3_feature_take")     # [h3-feature] the roll {feature}/{releaselog} share
+    feature = _take(feats, "") if _take else None
+    if not feature:
+        tags = list(feats)
+        labels = [h3_overview.feature_label(feats[t]) for t in tags]
+        k = s3_weighted("h3.overview_feature", labels, [1.0] * len(labels), H3_OVERVIEW_FEATURE_LABEL)
+        feature = feats[tags[k if isinstance(k, int) and 0 <= k < len(tags) else 0]]
     h3_hourly_roll_note("ov_feature", "h3.overview_feature")
     presenter = str(s3_choice("h3.overview_presenter", h3_overview.PRESENTERS, H3_OVERVIEW_PRESENTER_LABEL))
     h3_hourly_roll_note("ov_presenter", "h3.overview_presenter")
@@ -190731,6 +190831,7 @@ async def _h3_overview_prepare() -> dict[str, Any] | None:
         out.update(by="fallback", why=out["why"] or str(why))
     out["say"] = got["say"]
     out["scene"] = h3_overview.scene(presenter, feature, got.get("do") or "", actions)
+    out["direction"] = h3_overview.direction(presenter, got.get("do") or "", actions)   # [h3-feature]
     note = globals().get("_production_feed")
     if note is not None:
         try:
@@ -190905,6 +191006,7 @@ def _h3_prompts_normalise(got: Any) -> dict[str, Any]:
     store["next"] = _h3_prompts_pin(got.get("next"))
     store["history"] = [h for h in list(got.get("history") or []) if isinstance(h, dict)][-H3_PROMPTS_HISTORY_KEEP:]
     store["seeded"] = [str(x)[:40] for x in list(got.get("seeded") or []) if x][:60]     # [h3-base]
+    store["reworded"] = [str(x)[:40] for x in list(got.get("reworded") or []) if x][:60]   # [h3-feature]
     try:
         store["rev"] = max(0, int(got.get("rev") or 0))
     except (TypeError, ValueError):
@@ -191096,7 +191198,13 @@ def h3_prompts_hour(conversation: str, record: str = "", speak: Any = None) -> d
     # brief and the pitch the line; the dialogue pool is spent unused
     _ov = h3_overview_take() if fields.get("kind") == "overview" and globals().get("h3_overview_take") else None
     if _ov:
-        fields["goal"], fields["speech"] = _ov["scene"], _ov["say"]
+        # [h3-feature] a preset whose words name {feature}/{releaselog} keeps them:
+        # the slots carry the same rolled feature, the pitch's stage direction joins
+        if re.search(r"\{(?:feature|releaselog)\d?\}", fields.get("goal") or ""):
+            fields["goal"] = (fields["goal"].rstrip() + " " + str(_ov.get("direction") or "")).strip()
+            fields["speech"] = _ov["say"]
+        else:
+            fields["goal"], fields["speech"] = _ov["scene"], _ov["say"]
         conversation = _ov["say"]
         if speak is None and globals().get("h3_speak_pool_take"):
             h3_speak_pool_take()
@@ -191617,8 +191725,10 @@ H3_PROMPTS_BASE = (
      "speech": "",
      # what an hour says when the changelog or the model gives nothing; a
      # prepared overview replaces it with the rolled whiteboard scene
-     "goal": ("A technical presentation at a whiteboard: a presenter sells one of {station}'s new software "
-              "features to camera, animated and full of energy, drawing diagrams and arrows as they talk.")},
+     # [h3-feature] the rolled feature and its release-log entry, in the words
+     "goal": ("A technical presentation at a whiteboard: a presenter pitches {feature}, one of {station}'s "
+              "new software features, to camera - animated and full of energy, drawing diagrams and arrows "
+              "as they unpack the nuances in {releaselog}.")},
     # [h3-slots] the operator's three, 2026-10-01: a concert to an MX tape, a
     # performance of a General Ford tape, a battle across two gallery arenas
     {"id": "base-mx-concert", "name": "MX mixtape concert", "speech": "",
@@ -191632,7 +191742,26 @@ H3_PROMPTS_BASE = (
      "goal": ("Two fighters battle it out, each in a different arena: one in {arena}, the other in {arena2}. "
               "They trade blows across the split screen, trash-talk to camera and {sfxclip} plays on the side. "
               "{conversation}")},
+    # [h3-feature] "make sure we have a preset that is utilizing every bracketed term that we have in
+    # some way. I want to be able to split off and make a variant" (the operator, 2026-10-01): every
+    # slot the catalogue lists, once - Save as new splits a variant off it
+    {"id": "base-every-slot", "name": "Every slot", "speech": "{speakerbox}",
+     "goal": ("Live from {station} at {hour}, the whole station in one ad. A presenter at a whiteboard "
+              "pitches {feature}, pointing at {releaselog}, while {mxtape} pumps through the room and "
+              "{fordtape} spins on a second deck. Behind them, {videos}; beside them, {sfxclip}. A stagehand "
+              "holds up {gazette} and a big screen shows {convograph}. Then two rivals settle it, one in "
+              "{arena}, the other in {arena2}, all of it {deadpan|euphoric|unhinged}, while {record} plays "
+              "on air. {conversation}"),
+     "host": ("The Pine Box host presents this at the {station} desk at {hour}, direct to camera, in warm "
+              "late-night studio light: {goal}")},
 )
+# [h3-feature] a base preset's words the operator never touched, re-worded once
+# when the base itself changes: {id: {field: the old words}}
+H3_PROMPTS_BASE_REWORD = {
+    "base-overview": {"goal": ("A technical presentation at a whiteboard: a presenter sells one of "
+                               "{station}'s new software features to camera, animated and full of "
+                               "energy, drawing diagrams and arrows as they talk.")},
+}
 
 
 def h3_prompts_seed_base(store: dict[str, Any]) -> list[str]:
@@ -191653,6 +191782,23 @@ def h3_prompts_seed_base(store: dict[str, Any]) -> list[str]:
         presets.append(_h3_prompts_preset(raw, base["id"]))
         added.append(base["id"])
     store["presets"], store["seeded"] = presets, seeded
+    reworded = list(store.get("reworded") or [])                      # [h3-feature]
+    for rid, olds in H3_PROMPTS_BASE_REWORD.items():
+        if rid in reworded:
+            continue
+        reworded.append(rid)
+        base = next((b for b in H3_PROMPTS_BASE if b["id"] == rid), None)
+        for p in presets if base else []:
+            if p.get("id") != rid:
+                continue
+            hit = [f for f, old in olds.items()
+                   if " ".join(str(p.get(f) or "").split()) == " ".join(str(old).split())]
+            for f in hit:
+                p[f] = _h3_prompts_text(base.get(f, ""), f)
+            if hit:
+                p["updated_at"] = round(time.time(), 3)
+                added.append(rid)
+    store["reworded"] = reworded
     return added
 
 
@@ -191662,7 +191808,8 @@ async def _h3_prompts_start() -> None:
     try:
         await asyncio.to_thread(h3_prompts_load)
         store = _H3_PROMPTS_MEM[0] or {}
-        if any(b["id"] not in (store.get("seeded") or []) for b in H3_PROMPTS_BASE):
+        if (any(b["id"] not in (store.get("seeded") or []) for b in H3_PROMPTS_BASE)
+                or any(r not in (store.get("reworded") or []) for r in H3_PROMPTS_BASE_REWORD)):
             await asyncio.to_thread(h3_prompts_change, h3_prompts_seed_base)        # [h3-base]
     except Exception as exc:  # noqa: BLE001
         pipeline_log("ads", "hourly H3 prompt presets not loaded (%s)" % type(exc).__name__)
