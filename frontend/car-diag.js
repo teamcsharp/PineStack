@@ -52,7 +52,7 @@
   'use strict';
   if (window.PineCarDiag) return;
 
-  var VERSION = '1476.1';
+  var VERSION = '1478.1';
   var RING_MAX = 120;               // 120 x 5 s = ten minutes
   var SAMPLE_MS = 5000;
   var STORE_KEY = 'pbfm.cardiag.ring';
@@ -326,11 +326,23 @@
     // lags until the load algorithm runs.
     try { return el.getAttribute('src') || el.currentSrc || ''; } catch (e) { return ''; }
   }
+  function audioSessionState() {
+    // Optional, passive evidence. The browser cannot identify CarPlay's
+    // physical output; an unavailable session stays explicitly unknown.
+    try {
+      var a = navigator.audioSession;
+      return a && typeof a.state === 'string' ? a.state.slice(0, 40) : null;
+    } catch (e) { return null; }
+  }
   function mstate(el) {
     var o = {};
     try {
       o.ct = round(el.currentTime, 2); o.ahead = bufferedAhead(el);
       o.rs = el.readyState; o.ns = el.networkState;
+      o.paused = !!el.paused; o.ended = !!el.ended;
+      o.rate = round(el.playbackRate, 2);
+      o.intent = pagePlaying(); o.hidden = !!document.hidden;
+      o.audio_session = audioSessionState();
     } catch (e) {}
     return o;
   }
@@ -463,6 +475,8 @@
       s.paused = !!el.paused;
       s.rate = round(el.playbackRate, 2);
       s.ended = !!el.ended;
+      s.intent = pagePlaying();
+      s.audio_session = audioSessionState();
       s.err = el.error ? {code: el.error.code, msg: String(el.error.message || '').slice(0, 120)} : null;
       if (full) {
         s.muted = !!el.muted;
@@ -2106,6 +2120,17 @@
 
   // ---- start ---------------------------------------------------------------------
   function lifecycle() {
+    try {
+      var session = navigator.audioSession;
+      if (session && session.addEventListener) {
+        session.addEventListener('statechange', function () {
+          var el = findAudio();
+          logEvent('audio_session', el ? mstate(el) : {
+            audio_session: audioSessionState(), intent: pagePlaying(), hidden: !!document.hidden
+          });
+        }, false);
+      }
+    } catch (e) {}
     /* #1476: the page's own life is part of the drive: a phone that slept,
      * a tab iOS froze, a network that came and went. */
     try {

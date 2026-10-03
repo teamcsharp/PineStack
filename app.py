@@ -276791,6 +276791,8 @@ let radio = null;
 let streamTries = 0;
 let streamTimer = null;
 let streamSrcAt = 0;            /* #1476: when a src was last handed over */
+let streamPlaySerial = 0;       /* ignore promises from a replaced/stopped play */
+let streamResumeAt = 0;         /* limit automatic output-session resume attempts */
 let streamProbeAt = 0;          /* #1476: the last error probe */
 
 /* #1253: HLS WHERE IT IS NATIVE, mp3 everywhere else.
@@ -277039,6 +277041,9 @@ function setMode() {
 }
 
 function stopEverything() {
+  streamPlaySerial += 1;
+  streamResumeAt = 0;
+  if (streamWatch) { clearInterval(streamWatch); streamWatch = null; }
   try { if (radio) { radio.pause(); radio.removeAttribute("src"); radio.load(); } } catch (e) {}
   if (streamTimer) { clearTimeout(streamTimer); streamTimer = null; }
   try { if (audio) audio.pause(); } catch (e) {}
@@ -277074,7 +277079,13 @@ function streamElement() {
    * rebuilt on a new road. Only the watchdog below may give up, and only
    * after the playhead has genuinely stopped moving. */
   radio.onplaying = () => {
+    if (!playing || !streamMode || radio.paused) return;
     streamTries = 0;
+    /* A recovered socket makes its queued retry obsolete. Leaving that timer
+     * armed replaced a healthy source and aborted the play that had recovered. */
+    if (streamTimer) { clearTimeout(streamTimer); streamTimer = null; }
+    streamAt = Number(radio.currentTime || 0);
+    streamAtSince = Date.now();
     /* [#1244] the socket has started feeding this element. A fresh src
      * (a first tune-in, or a reconnect) resets the playhead, and the
      * station hands out a new burst with it - so the clock this lag is
@@ -277086,14 +277097,80 @@ function streamElement() {
   return radio;
 }
 
+/* A source assignment or pause rejects an earlier play() with AbortError.
+ * Only the current attempt may ask for a reconnect; an audio-session switch
+ * keeps its existing buffered source for the next resume. */
+function requestStreamPlay(el, why) {
+  const mine = ++streamPlaySerial;
+  const src = el.getAttribute("src") || el.currentSrc || "";
+  const failed = (e) => {
+    if (mine !== streamPlaySerial || el !== radio || !playing || !streamMode
+        || src !== (el.getAttribute("src") || el.currentSrc || "")) return;
+    const name = String((e && e.name) || "");
+    carMark("play_rejected", Object.assign(streamPlaybackDetail(why), {
+      name: name, error: String((e && e.message) || e).slice(0, 160)}));
+    if (name === "AbortError" || name === "NotAllowedError") {
+      const note = document.getElementById("note");
+      if (note && name === "NotAllowedError") note.textContent = "Press Play to resume the station";
+      return;
+    }
+    streamRecover(why + ": " + String((e && e.message) || e).slice(0, 160));
+  };
+  try {
+    const pending = el.play();
+    if (pending && typeof pending.catch === "function") pending.catch(failed);
+  } catch (e) { failed(e); }
+}
+
+function streamPlaybackDetail(why) {
+  const d = {why: why};
+  try {
+    const el = radio, at = Number(el.currentTime || 0), b = el.buffered;
+    d.ct = at; d.paused = !!el.paused; d.rs = el.readyState; d.ns = el.networkState;
+    d.ahead = 0;
+    for (let i = 0; b && i < b.length; i++) {
+      if (b.start(i) <= at && at <= b.end(i)) { d.ahead = Math.max(0, b.end(i) - at); break; }
+    }
+  } catch (e) {}
+  return d;
+}
+
+function replaceStreamSource(why) {
+  if (!playing || !streamMode) return;
+  const el = streamElement();
+  streamPlaySerial += 1;        /* invalidate before pause aborts the previous play */
+  try { el.pause(); } catch (e) {}
+  streamSrcAt = Date.now();
+  streamResumeAt = 0;
+  streamAt = -1; streamAtSince = Date.now();
+  el.src = streamUrl();
+  requestStreamPlay(el, why);
+}
+
+function resumeStream(why) {
+  if (!playing || !streamMode || !radio) return false;
+  const el = radio;
+  if (el.error || el.ended || !(el.getAttribute("src") || el.currentSrc)) return false;
+  /* The diagnostic microphone owns the session until its note is finished;
+   * it already restores playback after releasing the microphone. */
+  try {
+    if (window.PineCarDiag && window.PineCarDiag.state().voice.recording) return true;
+  } catch (e) {}
+  if (why !== "wheel_play" && Date.now() - streamResumeAt < 3000) return true;
+  streamResumeAt = Date.now();
+  if (streamTimer) { clearTimeout(streamTimer); streamTimer = null; }
+  carMark("resume", streamPlaybackDetail(why));
+  requestStreamPlay(el, why);
+  return true;
+}
+
 function startStream() {
   const el = streamElement();
   streamTries = 0;
+  if (streamTimer) { clearTimeout(streamTimer); streamTimer = null; }
   streamMixApplied = wantsHls() ? personalMix() : "";
-  streamSrcAt = Date.now();                                /* #1476 */
-  el.src = streamUrl();
   el.volume = 1;
-  el.play().catch((e) => streamRecover("play: " + (e && e.message)));
+  replaceStreamSource("play");
   armStreamWatch();
 }
 
@@ -277103,8 +277180,8 @@ function startStream() {
  * reconnect there is the cure that causes the disease. This watches the
  * PLAYHEAD. If it has not advanced in forty seconds while we believe we
  * are playing, the connection really is dead and a fresh one is the only
- * way back. Forty seconds is longer than the worst stall the box has
- * ever been measured at, so a stall can never trip it.
+ * way back. Forty seconds tolerates short buffering dips while still
+ * giving a genuinely stuck connection a path back to the station.
  */
 let streamWatch = null;
 let streamAt = -1;
@@ -277116,6 +277193,12 @@ function armStreamWatch() {
   streamWatch = setInterval(() => {
     if (!playing || !streamMode || !radio) return;
     const at = Number(radio.currentTime || 0);
+    /* Output-session interruptions can pause a healthy buffered stream. Try
+     * that same source before the dead-connection fallback discards it. */
+    if (radio.paused) {
+      if (!resumeStream("watch: paused")) streamRecover("paused without a usable source");
+      return;
+    }
     /* #1253: SAY WHAT THE BUFFER IS. "it stutters" and "it is fine" are
      * the same sentence without this number, and it is the one number
      * that says whether the burst is arriving and surviving. */
@@ -277157,11 +277240,7 @@ function streamRecover(why) {
   streamTimer = setTimeout(() => {
     streamTimer = null;
     if (!playing || !streamMode) return;
-    const el = streamElement();
-    try { el.pause(); } catch (e) {}
-    streamSrcAt = Date.now();
-    el.src = streamUrl();
-    el.play().catch(() => streamRecover("retry"));
+    replaceStreamSource("retry");
   }, wait);
 }
 
@@ -277195,28 +277274,28 @@ function streamProbe(why) {
   });
 }
 
-/* #1476: THE PAGE WAKES UP LISTENING. iOS stops this page's timers while
- * the phone is locked and its audio is not playing, so a reconnect that
- * was waiting simply never happens - twenty minutes of nothing on the
- * first real drive, until a reload. The moment the page is alive again
- * (unlocked, back online, restored from the back-forward cache) the
- * player is looked at, and a stream that is errored, paused under us,
- * not loaded, or whose playhead has not moved in ten seconds is retried
- * NOW, not after whatever backoff was pending. */
+/* The page wakes with its buffer intact. A paused output session resumes
+ * the existing source; an HLS player waiting for data keeps its cushion.
+ * Only a missing/errored source or the same 40-second playhead watchdog
+ * warrants replacing that source. */
 function streamWake(why) {
   if (!playing || !streamMode) return;
+  const el = radio;
+  if (el && !el.error && !el.ended && el.paused && (el.getAttribute("src") || el.currentSrc)) {
+    resumeStream("wake: " + why);
+    return;
+  }
   if (Date.now() - streamSrcAt < 3000) return;        /* a src just went in */
   let reason = "";
-  const el = radio;
   if (!el) reason = "no player";
   else {
     try {
       if (el.error) reason = "errored (" + el.error.code + ")";
-      else if (el.paused) reason = "paused";
-      else if (Number(el.readyState || 0) < 2) reason = "readyState " + el.readyState;
-      else if (Date.now() - streamAtSince > 10000
+      else if (el.ended) reason = "ended";
+      else if (!(el.getAttribute("src") || el.currentSrc)) reason = "no source";
+      else if (Date.now() - streamAtSince > 40000
                && Number(el.currentTime || 0) <= Math.max(0, streamAt) + 0.05) {
-        reason = "playhead still";
+        reason = "playhead still for 40s";
       }
     } catch (e) { reason = "unreadable"; }
   }
@@ -277226,12 +277305,8 @@ function streamWake(why) {
   carMark("wake_recover", {why: why, reason: reason, road: currentRoad(),
                            online: navigator.onLine});
   const note = document.getElementById("note");
-  if (note) note.textContent = "reconnecting… (" + why + ": " + reason + ")";
-  const p = streamElement();
-  try { p.pause(); } catch (e) {}
-  streamSrcAt = Date.now();
-  p.src = streamUrl();
-  p.play().catch((e) => streamRecover("wake: " + (e && e.message)));
+  if (note) note.textContent = "reconnecting\u2026 (" + why + ": " + reason + ")";
+  replaceStreamSource("wake: " + why);
   armStreamWatch();
 }
 window.addEventListener("online", () => { try { streamWake("online"); } catch (e) {} });
@@ -277269,6 +277344,7 @@ function paintMediaSession(state) {
     navigator.mediaSession.setActionHandler("play", () => {
       carMark("wheel_play", {playing: playing});
       if (!playing) tune();
+      else if (streamMode && !resumeStream("wheel_play")) streamWake("wheel_play");
     });
     navigator.mediaSession.setActionHandler("pause", () => {
       carMark("wheel_pause", {playing: playing});
