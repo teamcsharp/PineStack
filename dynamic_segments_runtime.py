@@ -739,7 +739,8 @@ class DynamicSegments:
                 'source': result['source'], 'coverage': self.book_coverage(due)}
             return bool(new)
         except Exception as exc:
-            self.last[occurrence] = {'state': 'blocked', 'why': str(exc)[:300]}
+            # [supercut-pending] a bounded analysis that ran out of time is still running and keeps its result: ask again next tick
+            self.last[occurrence] = {'state': 'pending' if type(exc).__name__ == 'SourceAnalysisPending' else 'blocked', 'why': str(exc)[:300]}
             self.log('Book Time source preparation waits', exc)
             return False
         finally:
@@ -831,7 +832,7 @@ class DynamicSegments:
             self.last[occurrence] = {'state': 'ready', 'coverage': coverage}
             return row
         except Exception as exc:
-            self.last[occurrence] = {'state': 'blocked', 'why': str(exc)[:300]}
+            self.last[occurrence] = {'state': 'pending' if type(exc).__name__ == 'SourceAnalysisPending' else 'blocked', 'why': str(exc)[:300]}   # [supercut-pending]
             self.log('The source-only supercut waits', exc)
             return None
         finally:

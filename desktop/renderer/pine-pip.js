@@ -119,6 +119,8 @@
       const bands = programLevel > voiceLevel ? programBands : voiceBands, level = Math.max(voiceLevel, programLevel);
       vizProvider.feed({ fft: bands, rms: level, speech: Math.max(voiceLevel > .035 ? Math.min(1, voiceLevel * 2.5) : 0, stale ? 0 : telemetry.speaking * .6), activity: Math.max(level * 1.3, stale ? 0 : telemetry.activity), music: Math.max(programLevel > .05 ? .6 : 0, stale ? 0 : telemetry.music) });
     }
+    /* [viz-note] a background that cannot be had says why, on the panel and in the console, instead of a blank night */
+    function vizNote(text) { try { let note = host.querySelector('.pip-failure'); if (!note) { note = doc.createElement('span'); note.className = 'pip-failure'; host.appendChild(note); } note.textContent = String(text).slice(0, 160); console.error('[pine-pip] ' + text); } catch (_) {} }
     function three() {
       if (w.THREE) return Promise.resolve(w.THREE);
       if (loading) return loading;
@@ -382,9 +384,9 @@
         if (!shell && !viz && !particles) Promise.all([three(), vizLibrary().catch(() => null)]).then(([T]) => {
           if (!enabled || shell) return;
           if (vizFailed) { if (!particles) particles = createParticles(T); return; }
-          return vizLibrary().then(P => { if (enabled && !shell) mountViz(P); }).catch(() => { vizFailed = true; if (enabled && !shell && !particles) particles = createParticles(T); });
-        }).catch(() => {
-          if (!host.querySelector('.pip-failure')) { const note = doc.createElement('span'); note.className = 'pip-failure'; note.textContent = 'Particle visualization unavailable'; host.appendChild(note); }
+          return vizLibrary().then(P => { if (enabled && !shell) mountViz(P); }).catch(err => { vizFailed = true; vizNote('Background unavailable: ' + ((err && err.message) || err)); if (enabled && !shell && !particles) { try { particles = createParticles(T); } catch (e2) { vizNote('Background unavailable: ' + ((e2 && e2.message) || e2)); } } });
+        }).catch(err => {
+          vizNote('Background unavailable: ' + ((err && err.message) || err));   /* [viz-note] */
         });
       } else {
         tiles.forEach(it => { if (it.callback) it.video.cancelVideoFrameCallback?.(it.callback); w.PineVcr?.cancel(it.tile); it.tile.getAnimations().forEach(a => a.cancel()); it.tile.remove(); }); tiles.clear();

@@ -638,7 +638,7 @@ class SupercutRuntime:
             self.catalog_index = _CatalogIndex(store) if hasattr(store, 'db_path') else store
         return function(self.catalog_index)
 
-    async def bounded_catalog(self, label, function, *, timeout=6.0):
+    async def bounded_catalog(self, label, function, *, timeout=30.0):   # [supercut-budget] was 6 s
         """Retain one complete scan across visits, releasing the station producer."""
         saved = self.catalog_future
         if saved is not None and saved[1].done():
@@ -698,7 +698,7 @@ class SupercutRuntime:
                 'archive_migration':dict(self.archive.migration),
                 'say':'Every playable row is scored when composing; untranscribed audio remains pending analysis.'}
 
-    async def bounded_source(self, label, function, *args, timeout=6.0):
+    async def bounded_source(self, label, function, *args, timeout=45.0):   # [supercut-budget] was 6 s
         saved = self.source_future
         if saved is not None and saved[1].done():
             previous_label, future = saved
@@ -742,11 +742,11 @@ class SupercutRuntime:
         writer, guard = self.host.get("sfx_db"), self.host.get("_SFX_DB_LOCK")
         if not callable(call) or not callable(writer) or guard is None:
             return False
-        deadline = deadline or time.monotonic()+16.0
+        deadline = deadline or time.monotonic()+60.0
         for candidate in candidates[:6]:
             remaining=deadline-time.monotonic()
             if remaining<=0:
-                raise SourceAnalysisPending('Station identity analysis reached its 16-second source budget')
+                raise SourceAnalysisPending('Station identity analysis reached its 60-second source budget')
             said = await self.bounded_source('identity:'+str(candidate['sid']),
                 lambda path:call(path,timeout=min(6.0,remaining)),candidate['path'],timeout=min(6.0,remaining))
             if not said:
@@ -773,7 +773,7 @@ class SupercutRuntime:
         wanted = _words(prompt)
         rows.sort(key=lambda row: (-len(_words(str(row.get('candidate_text') or '') + ' ' + str(row.get('name') or '')) & wanted),
             -_number(row.get('mtime')), str(row.get('sid') or '')))
-        deadline = deadline or time.monotonic()+16.
+        deadline = deadline or time.monotonic()+60.
         changed = 0
         for row in rows:
             row['source_seconds'] = _number(row.get('seconds'))
@@ -782,7 +782,7 @@ class SupercutRuntime:
             if not cached and not row.get('said') and analyze and callable(transcriber) and changed < 3:
                 remaining = deadline-time.monotonic()
                 if remaining <= .05:
-                    raise SourceAnalysisPending('Generated H3 source analysis reached its 16 second visit budget')
+                    raise SourceAnalysisPending('Generated H3 source analysis reached its 60 second visit budget')
                 said = await self.bounded_source('h3-asr:'+key, lambda path: transcriber(path, timeout=min(6.,remaining)),
                     row['path'], timeout=min(6.,remaining))
                 cached = {'said': _text(said, 3000), 'at': time.time()}
@@ -833,7 +833,7 @@ class SupercutRuntime:
                         stamp = key+':'+str(offset)+':'+str(start)+':'+str(end)
                         remaining = deadline-time.monotonic()
                         if remaining <= .05:
-                            raise SourceAnalysisPending('Generated H3 cut verification reached its 16 second visit budget')
+                            raise SourceAnalysisPending('Generated H3 cut verification reached its 60 second visit budget')
                         try:
                             proof = await self.bounded_source('h3-window:'+stamp,audition,row,start,end,transcriber,
                                 executable,timeout=min(6.,remaining))
@@ -874,7 +874,7 @@ class SupercutRuntime:
         rt = self.vectors()
         bans, weights, only = self.controls()
         queries = role_queries(cfg, prompt)
-        source_deadline=time.monotonic()+16.0
+        source_deadline=time.monotonic()+60.0
         extra_sources = await self.recorded_station_sources(cfg, analyze=verify, deadline=source_deadline)
         extra_sources += await self.generated_h3_sources(prompt=str(cfg['item'])+' '+prompt, analyze=verify, deadline=source_deadline, max_seconds=6.)
         source_remaining = max(0.0, source_deadline-time.monotonic())
@@ -949,11 +949,11 @@ class SupercutRuntime:
         eligible = [(k, v) for k, v in list(pantry.items()) if isinstance(v, dict) and v.get("kind") == "station_id"
                     and _identity(str(v.get("text") or ""), str(cfg["station"]))]
         eligible.sort(key=lambda kv: ("welcome" not in str(kv[1].get("text") or "").lower(), str(kv[0])))
-        deadline=deadline or time.monotonic()+16.0
+        deadline=deadline or time.monotonic()+60.0
         for key, row in eligible[:40]:
             remaining=deadline-time.monotonic()
             if remaining<=0:
-                raise SourceAnalysisPending('Recorded station source analysis reached its 16-second source budget')
+                raise SourceAnalysisPending('Recorded station source analysis reached its 60-second source budget')
             name = str((row.get("clip") or {}).get("path") or "").split("?")[0].rsplit("/", 1)[-1]
             if not re.fullmatch(r"[a-f0-9]{32}\.wav", name):
                 continue
@@ -966,7 +966,7 @@ class SupercutRuntime:
                         return wav.getnframes()/wav.getframerate()
                 remaining=deadline-time.monotonic()
                 if remaining<=0:
-                    raise SourceAnalysisPending('Recorded station source analysis reached its 16-second source budget')
+                    raise SourceAnalysisPending('Recorded station source analysis reached its 60-second source budget')
                 seconds = await self.bounded_source('station-duration:'+name+':'+str(stat.st_mtime_ns),
                     duration,timeout=min(6.0,remaining))
             except (OSError, wave.Error):
@@ -978,7 +978,7 @@ class SupercutRuntime:
             if not cached and analyze and callable(transcriber) and analyzed < 4:
                 remaining=deadline-time.monotonic()
                 if remaining<=0:
-                    raise SourceAnalysisPending('Recorded station source analysis reached its 16-second source budget')
+                    raise SourceAnalysisPending('Recorded station source analysis reached its 60-second source budget')
                 said = await self.bounded_source('station-asr:'+cache_key,
                     lambda path:transcriber(path,timeout=min(6.0,remaining)),str(source),timeout=min(6.0,remaining))
                 analyzed += 1
@@ -1013,7 +1013,7 @@ class SupercutRuntime:
             transcriber = getattr(self.host.get("clip_speech"), "transcribe_file", None)
             writer, guard = self.host.get("sfx_db"), self.host.get("_SFX_DB_LOCK")
             refreshed = pending = 0
-            deadline = deadline or time.monotonic()+16.0
+            deadline = deadline or time.monotonic()+60.0
             for p in plan["clips"]:
                 remaining = deadline-time.monotonic()
                 if remaining<=0:
