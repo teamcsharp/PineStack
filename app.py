@@ -20008,6 +20008,9 @@ def unheard_out_of_turn(kind: str) -> bool:
 
 def larder_oldest_ready() -> dict[str, Any] | None:
     """[bank-first] The longest-waiting never-aired banter round that can air now."""
+    _owned = globals().get("dynamic_segment_window_owned")               # [book-nodes-4] a segment's window owns the air
+    if callable(_owned) and _owned():
+        return None
     best, age, now = None, -1.0, time.time()
     for e in _LARDER:
         if not isinstance(e, dict) or id(e) in _READY_SHELF_BUSY or not row_unaired(e):
@@ -20182,6 +20185,9 @@ async def unheard_stock_air(force: bool = False) -> str:
         return _unheard_no("somebody has the floor")
     if _UNHEARD_PENDING_HANDOFFS:
         return _unheard_no("waiting for a prior cupboard handoff")
+    _owned = globals().get("dynamic_segment_window_owned")               # [book-nodes-4] Book Time / the supercut
+    if callable(_owned) and _owned():
+        return _unheard_no("a segment's window owns the air: nothing goes out of turn inside it")
     # The clock is spent on the WALK, not on the airing. unheard_pick()
     # reads every row of four shelves through dialogue_row_ready, and this
     # sits in the watchdog pass - charging it only when something actually

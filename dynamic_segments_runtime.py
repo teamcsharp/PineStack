@@ -899,6 +899,30 @@ class DynamicSegments:
         finally:
             self.busy.discard(occurrence)
 
+    def window_owned(self):
+        """[book-nodes-4] Does a segment's window own the air right now? True while the entry on air is a
+        dynamic segment (Book Time, the supercut) that still has a part of its own to put out - a part not
+        yet handed off (ready, or re-makeable at the door), or an earlier episode's carry. The cupboard's
+        out-of-turn doors read this and stand aside: on 10-06 the 15:45 window went to two banked banter
+        rounds the sweep put out of turn (the dial at 15 min), and the segment's own door found the floor
+        busy."""
+        try:
+            due = self.active()
+            kind = str(due.get('kind') or '')
+            if kind not in dynamic_segments.TEMPLATES:
+                return False
+            key = self.occurrence(due)
+            if not key:
+                return False
+            if kind == 'book_time':
+                if any(not row.get('dynamic_handed_off') for row in self.book_rows(key)):
+                    return True
+                return bool(self.book_carry(key)[1])
+            return any(str(row.get('dynamic_occurrence') or '') == key and not row.get('dynamic_handed_off')
+                       for row in self.g.get('_SHELF', {}).get('sfx_supercut', []))
+        except Exception:   # noqa: BLE001 - a window that cannot be read owns nothing
+            return False
+
     async def dispatch(self, kind, track=None, dj=None, occurrence=None):
         due = self.active()
         occurrence = occurrence or due.get('occurrence') or self.call('_schedule_dispatch_occurrence', default='')
@@ -934,8 +958,12 @@ class DynamicSegments:
                 if carry:
                     candidates = carry
                 elif not candidates:
+                    self.log('Book Time window: nothing of the episode is airable yet and nothing can be carried',   # [book-nodes-4]
+                             '%d part(s) on the shelf, %d waiting' % (len(rows), len(waiting)))
                     return False
                 else:
+                    self.log('Book Time window: the episode waits for its welcome - %s is the first part ready'      # [book-nodes-4]
+                             % str(candidates[0].get('book_phase') or '?'))
                     return False                             # an episode opens with its welcome
             self.carry_from = carry_from
             def accepted():
@@ -947,6 +975,8 @@ class DynamicSegments:
                 said = await self.g['_ready_shelf_air']('banter', track, pick=candidates[0], on_handoff=accepted)
             finally:
                 self.carry_from = ''
+            self.log('Book Time window: %s the %s part%s' % ('aired' if said else 'the door refused',   # [book-nodes-4]
+                     str(candidates[0].get('book_phase') or '?'), (' carried from ' + carry_from) if carry_from else ''))
             return bool(said)
         if kind == 'sfx_supercut':
             if not self.call('_schedule_action_pending', kind, occurrence, default=True):
@@ -1143,6 +1173,7 @@ def install(app, g):
     g['DYNAMIC_SEGMENTS_RUNTIME'] = runtime
     g['dynamic_inventory_match'] = runtime.inventory_match
     g['dynamic_segment_dispatch'] = runtime.dispatch
+    g['dynamic_segment_window_owned'] = runtime.window_owned          # [book-nodes-4] the cupboard's doors ask it
     segment_prompts.install(g, g['DATA_DIR'])
     dynamic_segments.ensure_defaults(segment_prompts)
     for name in ('schedule_hour_slots', 'dialogue_row_ready', 'dj_banter', '_ready_shelf_air', 'alt_bank_banter', 'segment_chain_stamp', 'dialogue_stock_items', 'commitment_inventory_plan', 'ensure_entry_tinted'):
