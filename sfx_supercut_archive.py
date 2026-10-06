@@ -67,6 +67,18 @@ def audio_facts(path, *, custom=False):
             'sample_rate': rate, 'seconds': seconds, 'bytes': len(blob)}
 
 
+def poster_frame(video: Path, out: Path, at: float = 1.0, width: int = 480) -> Path:
+    """[supercut-gallery] imageio's bundled ffmpeg writes one scaled frame of the video; tmp + rename."""
+    import subprocess
+    import imageio_ffmpeg
+    tmp = out.with_name(out.stem + '.tmp.jpg')
+    cmd = [imageio_ffmpeg.get_ffmpeg_exe(), '-y', '-loglevel', 'error', '-ss', str(max(0.0, float(at))),
+           '-i', str(video), '-frames:v', '1', '-vf', 'scale=%d:-2' % int(width), '-q:v', '4', str(tmp)]
+    subprocess.run(cmd, check=True, timeout=60, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    tmp.replace(out)
+    return out
+
+
 class SupercutArchive:
     def __init__(self, host: dict[str, Any]):
         self.host = host
@@ -110,6 +122,9 @@ class SupercutArchive:
             value['video_url'] = '/api/sfx/supercut/archive/' + value['id'] + '/video'
             if signature:
                 value['video_url'] += '?t=' + signature
+            value['poster_url'] = '/api/sfx/supercut/archive/' + value['id'] + '/poster'    # [supercut-gallery] the tile's frame
+            if signature:
+                value['poster_url'] += '?t=' + signature
         return value
 
     def record(self, result: Mapping[str, Any]):
@@ -246,6 +261,25 @@ class SupercutArchive:
         if facts['video_sha256'] != row.get('video_sha256'):
             raise ValueError('The archived Super Cut MP4 changed')
         return path
+
+    def poster(self, identifier):
+        """[supercut-gallery] One frame of the archived MP4 as a JPEG, made once and kept beside the archive
+        (posters/<id>.jpg): the studio's tiles are these. A cut with no video has none (ValueError)."""
+        video = self.video(identifier)
+        out = self.root / 'posters' / (self.identity(identifier) + '.jpg')
+        try:
+            if out.is_file() and out.stat().st_size > 0 and out.stat().st_mtime >= video.stat().st_mtime:
+                return out
+        except OSError:
+            pass
+        out.parent.mkdir(parents=True, exist_ok=True)
+        make = self.host.get('poster_make')
+        if not callable(make):
+            make = poster_frame
+        make(video, out)
+        if not (out.is_file() and out.stat().st_size > 0):
+            raise ValueError('The poster frame could not be made')
+        return out
 
     def reuse(self, identifier):
         identifier = self.identity(identifier)

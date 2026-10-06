@@ -1449,6 +1449,21 @@ def install(app: Any, host: dict[str, Any]) -> SupercutRuntime:
         except (OSError, ValueError) as exc:
             raise HTTPException(404, str(exc)) from exc
 
+    @app.get('/api/sfx/supercut/archive/{identifier}/poster')
+    async def archive_poster(identifier: str, request: Request, authorization: str | None = Header(default=None)):
+        """[supercut-gallery] the tile's frame: one JPEG of the archived MP4, made once and kept."""
+        from fastapi.responses import FileResponse
+        sign = host.get('media_sign')
+        signature = str(sign(identifier)) if callable(sign) else ''
+        if not (signature and hmac.compare_digest(str(request.query_params.get('t') or ''), signature)):
+            host['require_read_auth'](authorization)
+        try:
+            path = await asyncio.to_thread(runtime.archive.poster, identifier)
+            return FileResponse(path, media_type='image/jpeg',
+                                headers={'X-Content-Type-Options': 'nosniff', 'Cache-Control': 'private, max-age=86400'})
+        except Exception as exc:   # noqa: BLE001 - a frame that cannot be made is a 404 on the tile, never a 500
+            raise HTTPException(404, str(exc)[:200]) from exc
+
     @app.post('/api/sfx/supercut/archive/{identifier}/reuse')
     async def archive_reuse(identifier: str, authorization: str | None = Header(default=None)):
         host['require_auth'](authorization)
