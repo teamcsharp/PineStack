@@ -89020,8 +89020,11 @@ def _sfx_video_default_target() -> float:
 # [sfx-even] -16, not -20: measured on the air (2026-10-05) the DJs' lines sit at a median of
 # -16.7 LUFS and the welded stings at -13 to -17; a clip aimed at -20 was the quiet one in every
 # round. One level for a clip with a picture, a sting and the people talking around them.
-SFX_TARGET_LUFS = float(os.getenv("SFX_TARGET_LUFS", "-16"))
-SFX_TP_DB = float(os.getenv("SFX_TP_DB", "-6"))
+# [sfx-voices] -14 LUFS and a -2 dBTP ceiling: the DJ renders measure -13.5 LUFS (loudnorm
+# TP -1.5) and the sting slices -12.4; under a -6 dBTP ceiling the clips landed at -17.8,
+# four to five dB under the voices - the "whispers". The ceiling is the voices' own headroom.
+SFX_TARGET_LUFS = float(os.getenv("SFX_TARGET_LUFS", "-14"))
+SFX_TP_DB = float(os.getenv("SFX_TP_DB", "-2"))
 # [sfx-even] a clip the peak rule would leave this many LU under the target is streamed through
 # loudnorm's dynamic mode instead of a plain gain (0 keeps the plain gain for every clip)
 SFX_GAIN_SQUEEZE_LU = float(os.getenv("SFX_GAIN_SQUEEZE_LU", "3"))
@@ -89296,6 +89299,22 @@ def sfx_gain_known(path: Path) -> dict[str, Any] | None:
     key = _sfx_gain_key(path)
     got = _SFX_GAINS.get(key) if key else None
     return got if isinstance(got, dict) else None
+
+
+def sfx_gain_now(got: dict[str, Any] | None) -> dict[str, Any] | None:
+    """[sfx-voices] The entry to stream with: its gain computed NOW from the measurement
+    in the book (i, tp) and the target of this moment. The measurement is the fact and
+    the gain is policy, so a new target reaches every clip already measured without
+    measuring one again; closer than SFX_GAIN_MIN_DB to the target, the clip goes out as
+    it is. An entry without a measurement keeps whatever gain it was given."""
+    if not isinstance(got, dict):
+        return None
+    if got.get("i") is None:
+        return got
+    db = sfx_gain_db(got)
+    out = dict(got)
+    out["db"] = db if abs(db) >= SFX_GAIN_MIN_DB else None
+    return out
 
 
 def sfx_gain_db(heard: dict[str, Any]) -> float:
@@ -90703,11 +90722,16 @@ def _sting_draw_sets() -> tuple:
     weights = sfx_weights()
     sig = (_SFX_POOL_AT[0], len(_SFX_POOL_CACHE),
            _sfx_file_sig(SFX_BANS_PATH), _sfx_file_sig(SFX_WEIGHTS_PATH),
-           _sfx_file_sig(SFX_GLUE_PATH))            # [#1243]
+           _sfx_file_sig(SFX_GLUE_PATH),            # [#1243]
+           sfx_pin_prefix())                        # [pin-sampler] a new pin is a new pool
     if _STING_DRAW_MEMO.get("sig") == sig:
         return (_STING_DRAW_MEMO["pool"], _STING_DRAW_MEMO["names"],
                 _STING_DRAW_MEMO["fresh"])
-    pool = [p for p in _SFX_POOL_CACHE if sfx_id(p) not in banned]
+    # [pin-sampler] the folder pin ("every sting ... comes from X") reaches this road too: the
+    # memo is built from _SFX_POOL_CACHE, the walk of the whole library, and the pin lived only
+    # in sfx_all(), so a pinned hour still drew stings from everywhere (61 of 82 pinned, measured).
+    # _sfx_pinned keeps the pinned subset and falls back to everything when it is empty.
+    pool = _sfx_pinned([p for p in _SFX_POOL_CACHE if sfx_id(p) not in banned])
     if weights:
         weighted: list[str] = []
         for path in pool:
@@ -178500,7 +178524,7 @@ async def sfx_file(
     # streams from the share - no copy anywhere. Not yet measured: as shot.
     if sfx_is_video(raw):
         try:
-            _gain = await asyncio.to_thread(sfx_gain_known, raw)
+            _gain = sfx_gain_now(await asyncio.to_thread(sfx_gain_known, raw))   # [sfx-voices] the gain of this moment
         except Exception:  # noqa: BLE001
             _gain = None
         if _gain and _gain.get("db") is not None:

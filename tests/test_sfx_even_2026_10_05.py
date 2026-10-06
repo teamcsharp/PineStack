@@ -42,7 +42,7 @@ class Even(unittest.TestCase):
         shutil.rmtree(self.dir, ignore_errors=True)
 
     def test_the_station_aims_at_the_level_the_djs_are_heard_at(self):
-        self.assertIn('SFX_TARGET_LUFS = float(os.getenv("SFX_TARGET_LUFS", "-16"))', APP)
+        self.assertIn('SFX_TARGET_LUFS = float(os.getenv("SFX_TARGET_LUFS", "-14"))', APP)   # [sfx-voices]
         self.assertIn('SFX_GAIN_SQUEEZE_LU = float(os.getenv("SFX_GAIN_SQUEEZE_LU", "3"))', APP)
 
     def test_a_clip_the_gain_can_reach_takes_the_plain_gain(self):

@@ -180,6 +180,13 @@
   function measure(el, own) {
     var out = {rect: {x: 0, y: 0, w: 0, h: 0}, frac: 0, occluder: '', why: ''};
     if (!el || !el.isConnected) { out.why = 'the element left the page'; return out; }
+    /* [pip-seen] in Pine PiP the set's host is hidden and the panel draws this element on a tile of its
+       own: the tile's rectangle is where the picture is seen, fully, whatever the element's own box says */
+    try {
+      var pipPanel = root.PinePipPanel;
+      var onTile = pipPanel && typeof pipPanel.showing === 'function' ? pipPanel.showing(el) : null;
+      if (onTile && onTile.w >= 2 && onTile.h >= 2) { out.rect = onTile; out.frac = 1; out.via = 'pip'; return out; }
+    } catch (e) { /* the element's own box, below */ }
     var r = el.getBoundingClientRect();
     out.rect = {x: Math.round(r.left), y: Math.round(r.top), w: Math.round(r.width), h: Math.round(r.height)};
     if (r.width < 2 || r.height < 2) { out.why = 'zero size'; return out; }
@@ -271,6 +278,7 @@
     r.first_frame_lag_ms = r.first_frame_ms - from;
     var m = measure(o.el, o.own);
     r.rect = m.rect;
+    if (m.via) r.via = m.via;                                /* [pip-seen] seen on a PiP tile */
     r.unoccluded = Math.round(m.frac * 100) / 100;
     if (m.occluder) r.occluder = m.occluder;
     askScreen();

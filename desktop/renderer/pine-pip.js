@@ -19,15 +19,20 @@
     let palette = { surface: '8 23 19', text: '#e1f8ea', accent: '#98e9ae', button: '#17382c' };
     const tiles = new Map();
     const previewSelector = 'video.pav-media,#lightboxVid,#lightboxRefVid,.film video,#galleryGrid video';
-    /* [pip-once] every source the tube has shown: when, and whether it has left. A source that
-       comes back inside SHOWN_ONCE_MS is a repeat and is not tiled; a jump back to the start is one too. */
+    /* [pip-once] every source the tube has shown: when, and whether it has left - kept as a record.
+       [pip-tube-rules] it no longer refuses a source: the SFX guy cuts several stings from one clip, and each
+       sting's picture is rightly that clip again (refusing it left the sound playing over an empty tube).
+       What repeatOf() refuses: a `loop` element, the CRT set's warm copy of the next clip (data-pine-warm,
+       parked in the tube at opacity 0) and the script page's bubble thumbnail (.sp-mv-video), which replays
+       itself while its line is newest and is a second copy of the picture already on the tube. */
     const shownSrc = new Map(); const SHOWN_ONCE_MS = 600000;
     function srcOf(v) { return String(v.currentSrc || v.src || (v.srcObject ? 'stream' : '')); }
     function repeatOf(v) {
       if (v.loop) return 'loops';                                        /* a looping element is never program */
-      const key = srcOf(v); if (!key || key === 'stream') return '';
-      const seen = shownSrc.get(key);
-      if (seen && seen.left && Date.now() - seen.left < SHOWN_ONCE_MS) return 'already shown';
+      if (v.dataset && v.dataset.pineWarm === '1') return 'warm copy';   /* [pip-tube-rules] the set's next clip, warming off screen */
+      if (v.classList && v.classList.contains('sp-mv-video')) return 'bubble copy';   /* the script page's thumbnail of the clip already on the tube; it replays itself while its line is newest */
+      /* a source shown before is NOT a repeat: the SFX guy cuts several stings from one clip, and each
+         sting's picture is that clip again, rightly - the ten-minute memory stays only as a record */
       return '';
     }
     function noteShown(v) { const key = srcOf(v); if (key && key !== 'stream') shownSrc.set(key, { at: Date.now(), left: 0 }); if (shownSrc.size > 200) shownSrc.delete(shownSrc.keys().next().value); }
@@ -183,11 +188,7 @@
         stopPreview(video);
         return false;
       }
-      const it = tiles.get(video);
-      if (!it && repeatOf(video)) return false;                           /* [pip-once] a source already shown is not tiled again */
-      /* [pip-tube] a rewind counts only for the SAME source: the set's one element moves on to the next clip with its clock at zero */
-      if (it && it.lastTime != null && it.srcKey === srcOf(video) && video.currentTime + 1 < it.lastTime && video.currentTime < 2) { it.rewound = true; }
-      if (it && it.rewound) return false;
+      if (repeatOf(video)) return false;                                  /* [pip-tube-rules] a loop, a warm copy or a bubble copy is never program; a clock that jumps back is a player re-cueing its clip, which is */
       // A buffering player still owns its last picture. Do not collapse the
       // tile merely because the decoder temporarily has no current frame.
       if (video.paused || video.ended || (!tiles.has(video) && (video.readyState < 2 || !video.videoWidth))) return false;
@@ -336,7 +337,17 @@
           }
         } catch (_) { /* retain last drawable frame */ }
     }
-    w.PinePipPanel = { appearance(next) {
+    w.PinePipPanel = { showing(video) {
+      /* [pip-seen] the tile's rectangle when this element is drawn on one (painted, not leaving), else null -
+         the seen-check (sfx-seen.js) measures the element's own box, which is hidden in Pine PiP */
+      try {
+        const it = video ? tiles.get(video) : null;
+        if (!it || !it.painted || it.leaving || host.style.display === 'none' || !host.isConnected) return null;
+        const r = it.canvas.getBoundingClientRect();
+        if (r.width < 2 || r.height < 2) return null;
+        return { x: Math.round(r.left), y: Math.round(r.top), w: Math.round(r.width), h: Math.round(r.height) };
+      } catch (_) { return null; }
+    }, appearance(next) {
       palette = next;
       for (const key of ['surface', 'text', 'accent', 'button']) host.style.setProperty('--pip-' + key, palette[key]);
       particles?.appearance(palette);
