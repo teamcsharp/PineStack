@@ -286,6 +286,12 @@ def install(app, host):
         async def writer(system, generation, *, product, occurrence):
             schema = {"type": "object", "properties": {"product": {"type": "string"}, "script": {"type": "string"}},
                       "required": ["product", "script"], "additionalProperties": False}
+            note = host.get("supercut_fresh_note")                 # [supercut-fresh] the footage rule rides the brief
+            if callable(note):
+                try:
+                    system = str(system) + "\n\n" + str(note())
+                except Exception:  # noqa: BLE001
+                    pass
             return await host["ask_model"](generation, limit=2000, spice=.35, system_prompt=system,
                 result_contract="json", result_schema=schema,
                 mark={"kind": "supercut_campaign", "occurrence": occurrence, "product": product})
