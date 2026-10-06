@@ -87992,7 +87992,41 @@ def sfx_pin_view() -> dict[str, Any] | None:
             "minutes_left": int(left // 60), "subfolders": True}
 
 
+_SFX_FOLDERS_MEMO: dict[str, Any] = {"at": 0.0, "folders": None, "busy": False}   # [sfx-folders-cache]
+SFX_FOLDERS_KEEP_S = 900.0
+SFX_FOLDERS_RENEW_S = 300.0
+
+
 def sfx_folders_view() -> dict[str, Any]:
+    """[sfx-folders-cache] The folder list, kept: the first call walks the book (slow, the database
+    is on the share); later calls answer from the kept list and renew it in the background once it
+    is five minutes old. The pin is read fresh every time."""
+    now = time.time()
+    memo = _SFX_FOLDERS_MEMO
+    folders = memo.get("folders")
+    if folders is None or now - float(memo.get("at") or 0) > SFX_FOLDERS_KEEP_S:
+        folders = _sfx_folders_scan()
+        memo.update(at=time.time(), folders=folders)
+    elif now - float(memo.get("at") or 0) > SFX_FOLDERS_RENEW_S and not memo.get("busy"):
+        memo["busy"] = True
+
+        def _renew() -> None:
+            try:
+                memo.update(at=time.time(), folders=_sfx_folders_scan())
+            except Exception:  # noqa: BLE001
+                pass
+            finally:
+                memo["busy"] = False
+
+        import threading as _threading                  # app.py keeps no module-level threading name
+        _threading.Thread(target=_renew, name="sfx-folders-renew", daemon=True).start()
+    pin = sfx_pin_view()
+    return {"ok": True, "folders": folders, "pin": pin, "kept_s": round(time.time() - float(memo.get("at") or 0), 1),
+            "say": ("all clips come from %s for another %d min" % (pin["name"], pin["minutes_left"]))
+                   if pin else "every folder - no pin"}
+
+
+def _sfx_folders_scan() -> list[dict[str, Any]]:
     """Every folder the book knows, with counts and a few samples to
     preview - one read of the book, grouped here."""
     out: dict[str, dict[str, Any]] = {}
@@ -88017,11 +88051,7 @@ def sfx_folders_view() -> dict[str, Any]:
             f["samples"].append({"id": sid, "name": str(r["name"] or "")[:60], "video": is_v,
                                  "url": f"/sfx/{sid}?t={media_sign(sid)}",
                                  "seconds": round(float(r["seconds"] or 0), 1)})
-    folders = sorted(out.values(), key=lambda f: f["path"])[:300]
-    pin = sfx_pin_view()
-    return {"ok": True, "folders": folders, "pin": pin,
-            "say": ("all clips come from %s for another %d min" % (pin["name"], pin["minutes_left"]))
-                   if pin else "every folder - no pin"}
+    return sorted(out.values(), key=lambda f: f["path"])[:300]
 
 
 @app.get("/api/sfx/folders")
@@ -89322,7 +89352,10 @@ def sfx_gain_chain(db: float, heard: dict[str, Any] | None = None) -> tuple[str,
     level = heard.get("i") if isinstance(heard, dict) else None
     held = (target - float(level)) - (float(db) + shift) if isinstance(level, (int, float)) else 0.0
     if squeeze > 0 and held >= squeeze:
-        return "loudnorm=I=%.1f:TP=%.1f:LRA=11" % (max(-70.0, min(-5.0, target)), max(-9.0, min(0.0, ceiling))), "squeezed"
+        # [sfx-sync] the FULL wanted gain into the limiter - never loudnorm's dynamic mode, whose three
+        # seconds of lookahead put the sound three seconds behind the picture on a live stream
+        want_db = max(-30.0, min(24.0, target - float(level)))
+        return "volume=%.2fdB,alimiter=limit=%.4f:attack=5:release=120:level=disabled" % (want_db, max(0.0625, min(1.0, limit))), "squeezed"
     return "volume=%.2fdB,alimiter=limit=%.4f:level=disabled" % (float(db) + shift, max(0.0625, min(1.0, limit))), "gain"
 
 

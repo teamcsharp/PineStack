@@ -493,3 +493,25 @@ body.pine-native-tools #pineWin-sphere canvas{display:block;width:100%;height:10
 #pinePipWidgets .pip-rec.mini .pip-rec-meter, #pinePipWidgets .pip-rec.mini .pip-rec-track { display: none; }
 #pinePipWidgets .pip-rec.mini .pip-rec-readout { font-size: 10px; gap: 4px; } #pinePipWidgets .pip-rec.mini .pip-rec-readout output { padding: 1px 4px; }
 #pinePipWidgets .pip-rec.mini .pip-rec-total { font-size: 9px; }
+
+/* [pip-rec-fit] the recorder is a size container: every part is measured in its own width */
+#pinePipWidgets .pip-rec { container-type: inline-size; grid-template-columns: clamp(64px, 26cqw, 220px) minmax(0, 1fr); grid-template-rows: auto minmax(0, auto) auto auto; min-width: 200px; min-height: 0; overflow: hidden; }
+#pinePipWidgets .pip-rec .pip-rec-art { width: clamp(64px, 26cqw, 220px); height: clamp(64px, 26cqw, 220px); }
+#pinePipWidgets .pip-rec .pip-rec-total { font-size: clamp(8px, 2.8cqw, 14px); }
+#pinePipWidgets .pip-rec .pip-rec-main { grid-template-columns: clamp(28px, 11cqw, 64px) minmax(0, 1fr) clamp(24px, 9cqw, 52px) clamp(40px, 17cqw, 120px); column-gap: clamp(4px, 2cqw, 12px); row-gap: clamp(3px, 1.6cqw, 10px); }
+#pinePipWidgets .pip-rec .pip-rec-record { width: clamp(28px, 11cqw, 64px); height: clamp(28px, 11cqw, 64px); }
+#pinePipWidgets .pip-rec .pip-rec-record i { width: clamp(12px, 5cqw, 30px); height: clamp(12px, 5cqw, 30px); }
+#pinePipWidgets .pip-rec .pip-rec-next { width: clamp(24px, 9cqw, 52px); height: clamp(24px, 9cqw, 52px); }
+#pinePipWidgets .pip-rec .pip-rec-next svg { width: clamp(10px, 4.4cqw, 24px); height: clamp(10px, 4.4cqw, 24px); }
+#pinePipWidgets .pip-rec .pip-rec-meter { width: clamp(28px, 11cqw, 64px); height: clamp(12px, 5cqw, 28px); }
+#pinePipWidgets .pip-rec .pip-rec-bar { height: clamp(10px, 4.4cqw, 24px); }
+#pinePipWidgets .pip-rec .pip-rec-bar .pip-rec-range { font-size: clamp(7px, 2.5cqw, 12px); line-height: clamp(8px, 3.6cqw, 20px); }
+#pinePipWidgets .pip-rec .pip-rec-readout { font-size: clamp(8px, 3.3cqw, 18px); gap: clamp(3px, 2cqw, 10px); }
+#pinePipWidgets .pip-rec .pip-rec-readout output { padding: clamp(1px, .5cqw, 3px) clamp(3px, 1.6cqw, 8px); }
+#pinePipWidgets .pip-rec .pip-rec-track { font-size: clamp(28px, 19cqw, 120px); }
+#pinePipWidgets .pip-rec .pip-rec-status { font-size: clamp(8px, 3cqw, 14px); }
+#pinePipWidgets .pip-rec .pip-rec-tools { width: clamp(18px, 6.5cqw, 30px); height: clamp(18px, 6.5cqw, 30px); }
+#pinePipWidgets .pip-rec .pip-rec-notch { width: clamp(36px, 15cqw, 90px); }
+#pinePipWidgets .pip-rec.mini { grid-template-columns: minmax(0, 1fr); min-width: 0; width: 132px; }
+#pinePipWidgets .pip-rec.mini .pip-rec-art { width: 100%; height: auto; aspect-ratio: 1; }
+#pinePipWidgets .pip-rec.mini .pip-rec-main { grid-template-columns: clamp(24px, 26cqw, 48px) minmax(0, 1fr) clamp(20px, 22cqw, 40px); }

@@ -401,21 +401,25 @@
     menuPending = true;
     try {
       const favorites=(root.PinePipPopups?.catalog?.()||[]).map(({id,label})=>({id,label}));
-      const opening = api().pipMenu({...playbackCache,favorites,folders:foldersCache.folders,pin:foldersCache.pin});   /* [pip-video-folder] */
+      /* [pip-video-folder] the first menu waits a moment for the folders; later ones have them already */
+      if (!foldersCache.folders.length) await Promise.race([refreshFolders(), new Promise(resolve => setTimeout(resolve, 2500))]);
+      const opening = api().pipMenu({...playbackCache,favorites,folders:foldersCache.folders,pin:foldersCache.pin,foldersLoading:!foldersCache.folders.length&&!!foldersPending});
       refreshFolders();
       refreshPlayback();
       await opening;
     } finally { menuPending = false; }
   }
   /* [pip-video-folder] every folder of the SFX collection and the hour's pin, for the menu; a minute old at most */
-  let foldersCache = { folders: [], pin: null }, foldersAt = 0, foldersPending = false;
-  function refreshFolders() {
-    if (foldersPending || Date.now() - foldersAt < 60000) return; foldersPending = true;
-    Promise.resolve().then(() => api().get('/api/sfx/folders')).then(got => {
+  let foldersCache = { folders: [], pin: null }, foldersAt = 0, foldersPending = null;
+  function refreshFolders(force) {
+    if (foldersPending) return foldersPending;
+    if (!force && Date.now() - foldersAt < (foldersCache.folders.length ? 300000 : 20000)) return Promise.resolve();
+    foldersPending = Promise.resolve().then(() => api().get('/api/sfx/folders')).then(got => {
       const rows = Array.isArray(got?.folders) ? got.folders : [];
       foldersCache = { folders: rows.map(f => ({ path: String(f.path || ''), name: String(f.name || f.path || ''), video: Number(f.video) || 0, audio: Number(f.audio) || 0 })).sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base', numeric: true })), pin: got?.pin || null };
       foldersAt = Date.now();
-    }).catch(() => {}).finally(() => { foldersPending = false; });
+    }).catch(() => { foldersAt = Date.now() - 280000; }).finally(() => { foldersPending = null; });
+    return foldersPending;
   }
   function refreshPlayback() {
     if(playbackPending || Date.now()-playbackAt<3000)return;playbackPending=true;
@@ -1658,7 +1662,7 @@
     if (action?.type === 'adjust' && action.name) { showAdjust(String(action.name), freeBox(String(action.name))); return; }   /* [pip-free] from the menu's Widget layout */
     if (action?.type === 'video-folder') {   /* [pip-video-folder] the folder owns the clips for an hour */
       const body = action.clear || !action.path ? { clear: true } : { path: String(action.path), hours: 1 };
-      return api().post('/api/sfx/folder-pin', body).then(got => { foldersAt = 0; refreshFolders(); say(got?.say || (body.clear ? 'Every folder again' : 'Clips come from ' + action.path + ' for the next hour'), 7000); }).catch(err => say(err.message));
+      return api().post('/api/sfx/folder-pin', body).then(got => { refreshFolders(true); say(got?.say || (body.clear ? 'Every folder again' : 'Clips come from ' + action.path + ' for the next hour'), 7000); }).catch(err => say(err.message));
     }
     if (action?.type === 'background') {   /* [pip-viz] the menu names a mode, or asks for the next */
       if (!panelReady) { say('The background changes once the station page is ready.'); return; }
@@ -1989,6 +1993,7 @@
     if (next.active) { if (wasUi === false && next.ui !== false && lastPayload) receive(lastPayload); if (next.widgets.dialogue && !diceScene) loadDice().catch(e => say(e.message)); if (next.widgets.cast || next.widgets.voices) loadPortraits(); }
     const synced = syncPanel().catch(e => say('PiP video display: ' + e.message));
     if (next.active && !was) confirmPanel();   /* [pip-panel-ready] and make sure the page really switched */
+    if (next.active && !was) refreshFolders(true);   /* [pip-video-folder] the folders are asked for on entry, not at the menu */
     layoutWidgets(); paintPlaybar();           /* [pip-free] [pip-playbar] */
     /* [pip-shift] The mode changed: the sheet stays down until this layout is
        painted, then lifts. If nobody covered the page first (a shell from

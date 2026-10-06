@@ -58,7 +58,7 @@ test('[pip-video-folder] the Video submenu lists every folder the station handed
   assert.deepEqual(plain(h.sent.at(-1)), ['pip:action', { type: 'video-folder', clear: true }]);
   const h2 = shell(); h2.invoke('menu', {});
   const bare = h2.template().find(item => item.label === 'Video');
-  assert.equal(bare.submenu[0].label, 'Every folder (no pin)'); assert.equal(bare.submenu[0].checked, true); assert.equal(bare.submenu.length, 2, 'no folders yet: only the clear entry');
+  assert.equal(bare.submenu[0].label, 'Every folder (no pin)'); assert.equal(bare.submenu[0].checked, true); assert.equal(bare.submenu.length, 3, 'no folders yet: the clear entry and a word why'); assert.equal(bare.submenu[2].enabled, false); assert.match(bare.submenu[2].label, /not listed its folders yet/);
   const before = h2.template().findIndex(item => item.label === 'Video'), endless = h2.template().findIndex(item => item.label === 'Endless video');
   assert.equal(endless, before + 1, 'Video sits just above Endless video');
 });

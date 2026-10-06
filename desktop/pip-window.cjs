@@ -3,7 +3,7 @@ const { Menu, screen } = require('electron');
 const VOICE_STYLES = ['Cyan bars', 'Green wave', 'Amber equalizer', 'Purple wave', 'Red blocks', 'Blue spikes', 'Green blocks', 'Gold wave', 'Violet spikes', 'Teal filled wave', 'Pink blocks', 'Sky bars', 'Lime bars', 'Orange spikes', 'Cyan dots', 'Violet bars'];
 const WIDGETS = { dialogue: true, task: false, audit: false, production: false, music: false, chat: false, messages: false, cast: false, voices: false, roulette: false, rec: false };   /* [pip-rec] */
 /* [pip-viz] the ten backgrounds of desktop/renderer/pipviz, in their order */
-const BACKGROUNDS = [['smooth-wave', '01 Smooth Wave - flowing ribbons'], ['particle-flow', '02 Particle Flow - luminous matter'], ['line-spectrum', '03 Line Spectrum - contour lines'], ['geometric-space', '04 Geometric Space - floating glass'],
+const BACKGROUNDS = [['classic', '00 Classic - the Pine Box cloud'], ['smooth-wave', '01 Smooth Wave - flowing ribbons'], ['particle-flow', '02 Particle Flow - luminous matter'], ['line-spectrum', '03 Line Spectrum - contour lines'], ['geometric-space', '04 Geometric Space - floating glass'],
   ['speed-lines', '05 Speed Lines - hyperdrive'], ['anime-ink', '06 Anime Ink Wave - hand-drawn seas'], ['audio-bars', '07 Audio Bars - dimensional spectrum'], ['liquid-glass', '08 Liquid Glass - refractive membrane'],
   ['retro-grid', '09 Retro Grid - wireframe landscape'], ['shape-burst', '10 Shape Burst - reactive symbols']];
 const EXPORT_SECONDS = [60,120,180,300,600,900,1800,3600];
@@ -292,6 +292,7 @@ function install({ ipcMain, getWindow, readConfig, writeConfig, troubleshoot, re
       { label: 'Video', submenu: [
         { label: playback?.pin ? ('Every folder (clear: ' + playback.pin.name + ', ' + playback.pin.minutes_left + ' min left)') : 'Every folder (no pin)', type: 'radio', checked: !playback?.pin, click: () => getWindow()?.webContents.send('pip:action', { type: 'video-folder', clear: true }) },
         { type: 'separator' },
+        ...(!(Array.isArray(playback?.folders) && playback.folders.length) ? [{ label: playback?.foldersLoading ? 'Reading the SFX catalog\u2019s folders - open the menu again in a moment' : 'The station has not listed its folders yet - open the menu again', enabled: false }] : []),
         ...(Array.isArray(playback?.folders) ? playback.folders : []).filter(f => f && typeof f.path === 'string').slice(0, 300)
           .map(f => ({ label: (f.name || f.path) + '  (' + (f.video || 0) + ' video, ' + (f.audio || 0) + ' audio)', type: 'radio', checked: !!playback?.pin && playback.pin.path === f.path,
             click: () => getWindow()?.webContents.send('pip:action', { type: 'video-folder', path: f.path }) }))

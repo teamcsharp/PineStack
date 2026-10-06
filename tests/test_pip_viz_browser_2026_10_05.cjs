@@ -76,7 +76,7 @@ app.whenReady().then(async () => {
   at('read the mount'); const mounted = await inFrame(`(()=>{const c=document.querySelector('#pine-pip-panel canvas.pineviz-canvas'),r=c&&c.getBoundingClientRect();const got=window.PinePipPanel.background();return JSON.stringify({canvas:!!c,w:r&&Math.round(r.width),h:r&&Math.round(r.height),mode:got.mode,modes:got.modes.length,particles:!!document.querySelector('#pine-pip-panel .pip-bg canvas:not(.pineviz-canvas)')})})()`);
   const m = JSON.parse(mounted);
   assert.equal(m.canvas, true, '[pip-viz] the background canvas is in the panel: ' + mounted);
-  assert.equal(m.modes, 10, 'ten modes'); assert.ok(m.mode, 'a mode is active: ' + m.mode);
+  assert.equal(m.modes, 11, 'eleven modes: the classic cloud and the ten'); assert.ok(m.mode, 'a mode is active: ' + m.mode);
   assert.ok(m.w >= 600 && m.h >= 380, 'it fills the panel: ' + mounted);
   assert.equal(m.particles, false, 'the old particle cloud gave way');
   assert.equal(bundleHits, 1, 'the bundle came from the station once');
@@ -98,7 +98,7 @@ app.whenReady().then(async () => {
   at('menu'); /* ---- 3. the menu names a mode; the shell's action road sets it ---- */
   await page('pineDesktop.pipMenu({})'); await delay(100);
   const bg = template.find(item => item.label === 'Background');
-  assert.ok(bg, 'the menu has a Background submenu'); assert.equal(bg.submenu.length, 12, 'next, a separator, and the ten');
+  assert.ok(bg, 'the menu has a Background submenu'); assert.equal(bg.submenu.length, 13, 'next, a separator, and the eleven');
   assert.equal(bg.submenu[0].label, 'Next background (click the background)');
   const sent = []; const send = win.webContents.send.bind(win.webContents); win.webContents.send = (...args) => { sent.push(args); return send(...args); };
   bg.submenu.find(item => /Retro Grid/.test(item.label)).click(); await delay(1600);
@@ -139,7 +139,7 @@ app.whenReady().then(async () => {
     assert.ok(lit / n > .01, id + ' draws something: lit ' + (lit / n * 100).toFixed(1) + '% (frames ' + (await look.webContents.executeJavaScript('pineViz.manager.frames')) + ')');
     if (shots) fs.writeFileSync(path.join(shots, 'mode-' + id + '.png'), img.toPNG());
   }
-  assert.ok(sigs.size >= 8, 'the modes look different from one another: ' + sigs.size + ' distinct of 10');
+  assert.ok(sigs.size >= 9, 'the modes look different from one another: ' + sigs.size + ' distinct of 11');
   assert.deepEqual(lookErrors, [], 'no errors on the standalone page');
   look.destroy();
 

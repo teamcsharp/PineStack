@@ -1,6 +1,7 @@
 {
   "_about": "PineViz presets. Each visualizer's adjustable properties; the common eight apply to every mode, the rest are the mode's own. PresetManager.load() takes this shape; the HUD edits it live and keeps the operator's values in localStorage under pineviz.presets.",
   "_common": { "intensity": 1, "speed": 1, "audioSensitivity": 1, "smoothing": 1, "bloom": 0.5, "opacity": 1, "complexity": 1, "motionAmount": 1 },
+  "classic": { "particles": 1800, "size": 1, "bloom": 0.2 },
   "smooth-wave": { "ribbons": 6, "width": 1, "bloom": 0.55 },
   "particle-flow": { "particles": 24000, "size": 1, "bloom": 0.6 },
   "line-spectrum": { "lines": 34, "indicators": 28, "bloom": 0.45 },

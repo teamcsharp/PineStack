@@ -14,7 +14,7 @@ const { execFileSync } = require('node:child_process');
 const ROOT = path.join(__dirname, '..');
 const SRC = path.join(ROOT, 'desktop', 'renderer', 'pipviz');
 const ORDER = ['core/PineViz.js', 'core/Renderer.js', 'core/VisualizerManager.js', 'audio/Providers.js', 'ui/Overlay.js', 'visualizers/_shared.js',
-  'visualizers/01-SmoothWave.js', 'visualizers/02-ParticleFlow.js', 'visualizers/03-LineSpectrum.js', 'visualizers/04-GeometricSpace.js', 'visualizers/05-SpeedLines.js',
+  'visualizers/00-Classic.js', 'visualizers/01-SmoothWave.js', 'visualizers/02-ParticleFlow.js', 'visualizers/03-LineSpectrum.js', 'visualizers/04-GeometricSpace.js', 'visualizers/05-SpeedLines.js',
   'visualizers/06-AnimeInk.js', 'visualizers/07-AudioBars.js', 'visualizers/08-LiquidGlass.js', 'visualizers/09-RetroGrid.js', 'visualizers/10-ShapeBurst.js'];
 
 function load() {
@@ -30,9 +30,9 @@ test('[pip-viz] every source parses, stays ASCII, and the ten modes register in 
   for (const name of ORDER) assert.doesNotMatch(fs.readFileSync(path.join(SRC, name), 'utf8'), /[^\x00-\x7f]/, name + ' is ASCII');
   const modes = PineViz.modes();
   const plain = v => JSON.parse(JSON.stringify(v));   /* values born in the vm context are compared by value */
-  assert.deepEqual(plain(modes.map(m => m.index)), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
-  assert.deepEqual(plain(modes.map(m => m.id)), ['smooth-wave', 'particle-flow', 'line-spectrum', 'geometric-space', 'speed-lines', 'anime-ink', 'audio-bars', 'liquid-glass', 'retro-grid', 'shape-burst']);
-  assert.equal(new Set(modes.map(m => m.name)).size, 10);
+  assert.deepEqual(plain(modes.map(m => m.index)), [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+  assert.deepEqual(plain(modes.map(m => m.id)), ['classic', 'smooth-wave', 'particle-flow', 'line-spectrum', 'geometric-space', 'speed-lines', 'anime-ink', 'audio-bars', 'liquid-glass', 'retro-grid', 'shape-burst']);
+  assert.equal(new Set(modes.map(m => m.name)).size, 11);
   for (const def of PineViz.registry) { assert.equal(typeof def.create, 'function', def.id); assert.ok(def.defaults && typeof def.defaults === 'object', def.id + ' exposes properties'); }
   assert.deepEqual(plain(Object.keys(PineViz.PALETTES)), ['playstation', 'neon', 'mono', 'radioNight']);
   const presets = JSON.parse(fs.readFileSync(path.join(SRC, 'presets.json'), 'utf8'));
@@ -117,12 +117,12 @@ test('[pip-viz] the bundle is current with the sources, parses, and is what the 
   assert.match(bundle, /pineviz-build:[0-9a-f]{12}/);
   const context = { console, setTimeout, clearTimeout, setInterval, clearInterval, requestAnimationFrame: () => 0, cancelAnimationFrame() {}, performance: { now: () => Date.now() } }; context.globalThis = context; vm.createContext(context);
   vm.runInContext(bundle, context, { filename: 'pineviz.bundle.js' });
-  assert.equal(context.PineViz.modes().length, 10);
+  assert.equal(context.PineViz.modes().length, 11);
   const page = fs.readFileSync(path.join(ROOT, 'desktop', 'renderer', 'pine-pip.js'), 'utf8');
   assert.match(page, /tag\.src = '\/vendor\/pineviz\.bundle\.js\?v='/, 'the panel loads the bundle from the station');
   assert.match(page, /vizProvider = new P\.ExternalProvider\(\)/); assert.match(page, /viz = P\.mount\(background, \{ provider: vizProvider/);
   assert.match(page, /background\(mode\) \{/); assert.match(page, /telemetry\(next\) \{/);
   assert.equal(fs.readFileSync(path.join(ROOT, 'desktop', 'renderer', 'pine-pip.js'), 'utf8'), fs.readFileSync(path.join(ROOT, 'app', 'src', 'main', 'assets', 'pine-views', 'pine-pip.js'), 'utf8'), 'the tablet copy is the same file');
   const menu = fs.readFileSync(path.join(ROOT, 'desktop', 'pip-window.cjs'), 'utf8');
-  assert.match(menu, /label: 'Background', submenu: \[/); assert.equal((menu.match(/\['[a-z-]+', '\d\d [A-Za-z ]+ - [a-z -]+'\]/g) || []).length, 10, 'the menu names the ten');
+  assert.match(menu, /label: 'Background', submenu: \[/); assert.equal((menu.match(/\['[a-z-]+', '\d\d [A-Za-z ]+ - [a-zA-Z -]+'\]/g) || []).length, 11, 'the menu names the eleven');
 });

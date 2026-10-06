@@ -277,7 +277,7 @@ test('the music player is its own free player, and the file reads cleanly', () =
   assert.ok(!/\\u00c2|\\u00e2\\u20ac|\\u00e2\\u2013/.test(js), 'and none of the escapes is a mis-read byte');
   for (const glyph of ["'\\u283f'", "'\\u2014'", "' \\u00b7 '", "'   \\u2022   '", "' \\u2192 '"]) assert.ok(js.includes(glyph), glyph);
   assert.ok(js.includes("buildMusic();   /* [pip-music]") && !js.includes("grip(music, 'music')"), 'no grip into a dock');
-  assert.ok(js.includes("if (!['chat', 'voices', 'roulette', 'messages', 'music'].includes(name) && !placedFreely(name))"), 'apply does not dock it');   /* [pip-free] nor any placed widget */
+  assert.ok(js.includes("if (!['chat', 'voices', 'roulette', 'messages', 'music', 'rec'].includes(name) && !placedFreely(name))"), 'apply does not dock it');   /* [pip-free] nor any placed widget; [pip-rec] nor the recorder */
   assert.ok(js.includes('placeSlate(); syncMusic(); syncMessages();'));
   assert.ok(js.includes(".pip-camera, .pip-messages, .pip-music')) expand(); });"), 'a double click on the player is not one on the picture');
   assert.ok(js.includes("'voiceStyles','musicPosition','musicExpanded','musicArtOnly','layout']) out[key] = value[key];"), 'its place travels with the shared settings');   /* [pip-free] and every layout */

@@ -21,7 +21,7 @@ SRC = ROOT / "desktop" / "renderer" / "pipviz"
 OUT = SRC / "dist" / "pineviz.bundle.js"
 ORDER = [
     "core/PineViz.js", "core/Renderer.js", "core/VisualizerManager.js", "audio/Providers.js", "ui/Overlay.js",
-    "visualizers/_shared.js", "visualizers/01-SmoothWave.js", "visualizers/02-ParticleFlow.js", "visualizers/03-LineSpectrum.js",
+    "visualizers/_shared.js", "visualizers/00-Classic.js", "visualizers/01-SmoothWave.js", "visualizers/02-ParticleFlow.js", "visualizers/03-LineSpectrum.js",
     "visualizers/04-GeometricSpace.js", "visualizers/05-SpeedLines.js", "visualizers/06-AnimeInk.js", "visualizers/07-AudioBars.js",
     "visualizers/08-LiquidGlass.js", "visualizers/09-RetroGrid.js", "visualizers/10-ShapeBurst.js",
 ]

@@ -58,7 +58,7 @@ class Even(unittest.TestCase):
         self.assertEqual(db, 0.0)
         chain, how = self.ns["sfx_gain_chain"](db, {"i": -30.0, "tp": -3.0})
         self.assertEqual(how, "squeezed")
-        self.assertEqual(chain, "loudnorm=I=-16.0:TP=-6.0:LRA=11")
+        self.assertEqual(chain, "volume=14.00dB,alimiter=limit=0.4467:attack=5:release=120:level=disabled", "[sfx-sync] the full lift, the limiter holds the bangs; no lookahead")
         # held by less than the squeeze: the plain gain stands
         chain, how = self.ns["sfx_gain_chain"](6.0, {"i": -24.0, "tp": -8.0})
         self.assertEqual(how, "gain")
@@ -69,14 +69,14 @@ class Even(unittest.TestCase):
         self.assertEqual(how, "gain")
         self.assertTrue(chain.startswith("volume=8.08dB,alimiter=limit=0.7147"), chain)   # the ceiling moved with it
         chain, how = self.ns["sfx_gain_chain"](0.0, {"i": -30.0, "tp": -3.0})
-        self.assertEqual((how, chain), ("squeezed", "loudnorm=I=-11.9:TP=-1.9:LRA=11"))
+        self.assertEqual((how, chain), ("squeezed", "volume=18.08dB,alimiter=limit=0.7147:attack=5:release=120:level=disabled"))
         self.ns["box_gain"] = lambda: (_ for _ in ()).throw(RuntimeError("no settings"))
         self.assertEqual(self.ns["sfx_gain_chain"](1.0)[0], "volume=1.00dB,alimiter=limit=0.4467:level=disabled", "a broken knob is unity")
 
     def test_the_command_carries_the_chain_and_still_copies_the_picture(self):
         cmd = self.ns["sfx_gain_command"](Path("/samples/x/clip.mp4"), 0.0, {"i": -30.0, "tp": -3.0})
         self.assertEqual(cmd[cmd.index("-c:v") + 1], "copy")
-        self.assertEqual(cmd[cmd.index("-af") + 1], "loudnorm=I=-16.0:TP=-6.0:LRA=11")
+        self.assertEqual(cmd[cmd.index("-af") + 1], "volume=14.00dB,alimiter=limit=0.4467:attack=5:release=120:level=disabled")
         self.assertEqual(cmd[-1], "pipe:1")
         cmd = self.ns["sfx_gain_command"](Path("/samples/x/clip.mp4"), -4.5)
         self.assertTrue(any(c.startswith("volume=-4.50dB,alimiter=") for c in cmd), "the nas-gain test's contract holds")

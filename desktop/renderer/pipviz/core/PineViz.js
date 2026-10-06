@@ -255,7 +255,7 @@
     if (!def || !def.id || typeof def.create !== 'function') throw new Error('PineViz.register needs {id, create}');
     const have = PineViz.registry.findIndex(d => d.id === def.id);
     if (have >= 0) PineViz.registry[have] = def; else PineViz.registry.push(def);
-    PineViz.registry.sort((a, b) => (a.index || 99) - (b.index || 99));
+    PineViz.registry.sort((a, b) => (a.index ?? 99) - (b.index ?? 99));   /* index 0 is a real place: the classic cloud comes first */
     return def;
   };
   PineViz.modes = () => PineViz.registry.map(d => ({ id: d.id, index: d.index, name: d.name, blurb: d.blurb }));
