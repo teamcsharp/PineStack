@@ -100913,17 +100913,23 @@ def _ready_shelf_row(kind: str, rescue: bool = False,
 
     def eligible(row: Any) -> bool:
         if id(row) in _READY_SHELF_BUSY:
+            _READY_SHELF_REFUSED[0] = "it is busy (another transport holds it)"    # [shelf-why]
             return False
         if (_pantry_lifecycle() and _pantry_lifecycle().enabled
                 and float((row.get("pantry_lifecycle") or {}).get("lease_until") or 0) > time.time()):
+            _READY_SHELF_REFUSED[0] = "the lifecycle holds a lease on it (%ds left)" % int(
+                float((row.get("pantry_lifecycle") or {}).get("lease_until") or 0) - time.time())   # [shelf-why]
             return False
         takes = _ready_round_takes(kind, row)
         if not takes:
+            _READY_SHELF_REFUSED[0] = "it has no takes the door accepts"             # [shelf-why]
             return False
         # #1260: finished radio nobody has heard is not held by a sheet
         # that is not standing on its road.
-        return (rescue or unheard_free(kind, row)
-                or _ready_round_fits(kind, takes, window))
+        if rescue or unheard_free(kind, row) or _ready_round_fits(kind, takes, window):
+            return True
+        _READY_SHELF_REFUSED[0] = "it does not fit the entry on air and may not go out of turn"   # [shelf-why]
+        return False
 
     # [s3-banks-roll] every replay this door could air (the re-air gate's
     # rejects struck out), for the roulette to choose among - the plot
@@ -100939,7 +100945,9 @@ def _ready_shelf_row(kind: str, rescue: bool = False,
     # or recast cannot be resurrected by holding a reference to it.
     if pick is not None:
         if not any(held is pick for held in shelf_rows(kind)):
+            _READY_SHELF_REFUSED[0] = "it is not on this road's shelf"               # [shelf-why]
             return None
+        _READY_SHELF_REFUSED[0] = ""
         return pick if eligible(pick) else None
 
     # #1160: a round written INSIDE the live act goes first. This used to
@@ -100977,6 +100985,7 @@ def _ready_shelf_row(kind: str, rescue: bool = False,
 # explanation - and the number of never-heard rounds climbed to 120
 # behind that sentence.
 _READY_SHELF_WHY: dict[str, Any] = {"at": 0.0, "kind": "", "why": ""}
+_READY_SHELF_REFUSED: list[str] = [""]           # [shelf-why] which test refused the last named row
 
 
 def _shelf_no(kind: str, why: str) -> list[str]:
@@ -101007,7 +101016,8 @@ async def _ready_shelf_air(kind: str, track: dict[str, Any] | None = None,
     row = _ready_shelf_row(kind, rescue, pick)      # #1168/#1260
     if row is None:
         return _shelf_no(kind, "the shelf would not give up the row that "
-                               "was picked")                      # #1304
+                               "was picked"
+                         + ((": " + _READY_SHELF_REFUSED[0]) if pick is not None and _READY_SHELF_REFUSED[0] else ""))   # #1304 [shelf-why]
     # [s3-banks-roll] A ROUND THAT HAS AIRED BEFORE GOES OUT AGAIN ONLY ON THE
     # ROULETTE - and never once the re-air gate has retired it. Every road
     # that reaches the cupboard through this door - the dead-air rescue, the
