@@ -193121,16 +193121,25 @@ def h3_supercut_wanted(rec: Any) -> str:
     return ""
 
 
-def h3_supercut_caption(rec: Any) -> list[str]:
-    """What the bottom of the copy says: the line the render sings (the hour's
-    speech after filling, else the record it sings to) and the station - the
-    station once, so a line that already ends on its name is not doubled."""
+H3_SUPERCUT_CAPTION_WORD = "SUPERCUT"      # [pineex-caption] the first line - "SUPERCUT + the product" (the operator)
+
+
+def h3_supercut_product(rec: Any) -> str:
+    """[pineex-caption] What the hour sold, as the filled direction carries it: the {product} / {offer} roll
+    ('the product "Name" - pitch'), else the rolled feature ('the Pine Box feature "Name"'), else the station."""
     words = rec.get("h3_prompts") if isinstance(rec, dict) and isinstance(rec.get("h3_prompts"), dict) else {}
-    line = " ".join(str(words.get("speech") or (rec or {}).get("speech") or words.get("record") or "").split())
-    out = [line[:160]] if line else []
-    if not line or not line.rstrip(" .!?").lower().endswith(H3_SUPERCUT_STATION.lower()):
-        out.append(H3_SUPERCUT_STATION)
-    return out
+    text = " ".join(str(words.get("direction") or words.get("goal") or (rec or {}).get("prompt") or "").split())
+    for pattern in (r'the product "([^"]{1,80})"', r'the Pine Box feature "([^"]{1,80})"'):
+        found = re.search(pattern, text)
+        if found and found.group(1).strip():
+            return found.group(1).strip()
+    return H3_SUPERCUT_STATION
+
+
+def h3_supercut_caption(rec: Any) -> list[str]:
+    """[pineex-caption] What the bottom of the copy says: SUPERCUT, then the product the hour sold
+    ("SUPERCUT + the product" - the operator, 2026-10-06)."""
+    return [H3_SUPERCUT_CAPTION_WORD, h3_supercut_product(rec)[:80]]
 
 
 def h3_supercut_folder(name: str) -> Path:

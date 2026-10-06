@@ -403,17 +403,17 @@ class SupercutRule(unittest.TestCase):
         self.assertEqual(wanted({"hourly": True, "h3_prompts": {"preset": {"name": "pineEX"}}}), "pineEX",
                          "a record without fields still names its preset")
 
-    def test_the_caption_is_the_sung_line_and_the_station_once(self):
+    def test_the_caption_is_supercut_and_the_product(self):
+        """[pineex-caption] "SUPERCUT + the product" (the operator)."""
         caption = self.ns["h3_supercut_caption"]
-        self.assertEqual(caption(pineex_row()), ["Dance all night to the record. Pine Box FM."],
-                         "a line that ends on the station is not doubled")
-        self.assertEqual(caption(pineex_row(speech="Hello   there,\nlisteners")), ["Hello there, listeners", "Pine Box FM"])
-        row = pineex_row(speech="")
-        row["h3_prompts"]["speech"] = ""
-        self.assertEqual(caption(row), ["Blue Monday", "Pine Box FM"], "no line: the record it sings to")
-        row["h3_prompts"]["record"] = ""
-        self.assertEqual(caption(row), ["Pine Box FM"])
-        self.assertEqual(caption({}), ["Pine Box FM"])
+        row = pineex_row()
+        row["h3_prompts"]["direction"] = ('A music video. What is sold tonight is the product "Pine Box FM Vinyl Record Holder" '
+                                          '- it keeps the records upright. Sing it.')
+        self.assertEqual(caption(row), ["SUPERCUT", "Pine Box FM Vinyl Record Holder"], "the product the hour sold")
+        row["h3_prompts"]["direction"] = 'Tonight it is the Pine Box feature "One press builds the PineTab" [tablet-update-ask] - pitch it.'
+        self.assertEqual(caption(row), ["SUPERCUT", "One press builds the PineTab"], "a feature when the offer rolled one")
+        self.assertEqual(caption(pineex_row()), ["SUPERCUT", "Pine Box FM"], "nothing sold in the words: the station")
+        self.assertEqual(caption({}), ["SUPERCUT", "Pine Box FM"])
 
     def test_the_folder_is_named_for_the_preset_under_the_writable_root(self):
         folder = self.ns["h3_supercut_folder"]
@@ -458,7 +458,7 @@ class SupercutRoad(unittest.TestCase):
         self.assertEqual(target.name, "pineEX-h3-pid1-clip-supercut.mp4")
         self.assertTrue(target.is_file())
         self.assertEqual(self.burns[0][0], self.ads / "h3-pid1-clip.mp4")
-        self.assertEqual(self.burns[0][2], ["Dance all night to the record. Pine Box FM."])
+        self.assertEqual(self.burns[0][2], ["SUPERCUT", "Pine Box FM"])   # [pineex-caption]
         # the clip book, by hand, with the measured length
         self.assertEqual(self.ns["_booked"], [(target, 9.5, 1)])
         self.assertEqual((made["booked"], made["queued"], made["seconds"], made["folder"]), (True, True, 9.5, "pineEX"))
