@@ -90,7 +90,7 @@ class WiringTests(unittest.TestCase):
         # into opens in place with the passages above and below it.
         src = (ROOT / "frontend" / "system3.js").read_text(encoding="utf-8")
         self.assertIn("openDecision(conv, ev, t, v.api)", src)
-        self.assertIn("open ? composeLine(conv, t, v.api) : body", src)
+        self.assertRegex(src, r"open\s*\?\s*composeLine\(conv,\s*t,\s*v\.api\)")   # [wiring-reconcile] the slot form or the plain form
         self.assertIn("v.toggle = (t, node)", src)
         # a lost roll opens to its odds and the dials; its chip is gray and
         # says why; the Messenger is a live feed with SFX Guy in it
