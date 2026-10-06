@@ -2269,6 +2269,39 @@ def split_problems(node, where):
     return out
 
 
+# [hour-flow] MICRO-EXCHANGES on a leg: `inner` is a list of rows, each one more
+# turn planned right after the leg - {seat, act, families} (seat A-E or
+# "alternate"; families among INNER_FAMILIES, ES when none). A leg without
+# `inner` is exactly the leg it was; DEFAULT_ROAD_STRUCTURES carry none.
+INNER_FAMILIES = ("ES", "RS", "IRS", "FL", "CTS", "REACT")
+INNER_MAX = 6
+
+
+def inner_problems(leg, where):
+    """[hour-flow] What is wrong with a leg's micro-exchanges, as a list."""
+    out = []
+    if not isinstance(leg, dict) or leg.get("inner") is None:
+        return out
+    rows = leg.get("inner")
+    if not isinstance(rows, list):
+        return ["%s: inner must be a list of exchanges" % where]
+    if len(rows) > INNER_MAX:
+        out.append("%s: at most %d inner exchanges" % (where, INNER_MAX))
+    for i, row in enumerate(rows):
+        tag = "%s inner %d" % (where, i + 1)
+        if not isinstance(row, dict):
+            out.append("%s: an exchange is an object with seat, act and families" % tag)
+            continue
+        if str(row.get("seat") or "alternate") not in ("A", "B", "C", "D", "E", "alternate"):
+            out.append("%s: seat must be A-E or alternate" % tag)
+        if not str(row.get("act") or "").strip():
+            out.append("%s: needs an act (what the turn does)" % tag)
+        fams = row.get("families")
+        if fams is not None and (not isinstance(fams, list) or any(str(f) not in INNER_FAMILIES for f in fams)):
+            out.append("%s: families must be among %s" % (tag, ", ".join(INNER_FAMILIES)))
+    return out
+
+
 def validate_structure(road, st):
     """A road structure an operator may save: legs with ids, a place, a seat
     and draws of known families. Returns the list of problems."""
@@ -2297,6 +2330,7 @@ def validate_structure(road, st):
             if not isinstance(families, list) or any(f not in call_diversity.INTENT_FAMILIES for f in families):
                 out.append("leg %s: unknown caller diversity family" % leg["id"])
         out.extend(split_problems(leg, "leg %s" % leg["id"]))                  # [s3-split]
+        out.extend(inner_problems(leg, "leg %s" % leg["id"]))                  # [hour-flow] micro-exchanges
     if not [leg for leg in legs if isinstance(leg, dict) and leg.get("place") == "close"]:
         out.append("the %s structure needs a closing leg" % road)
     alt = st.get("alternate_seats")

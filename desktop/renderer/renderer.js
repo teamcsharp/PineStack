@@ -8130,6 +8130,29 @@ function worksSchedule(anchorPop) {
       const mins = mk("span", "wk-note", s.minutes + "m");
       mins.style.cssText = "font-size:10px;opacity:.7";
       top.appendChild(mins);
+      /* [hour-flow] this entry's conversation as a vertical flowchart: its
+       * turns in order, to add, remove, insert, move, extend and deepen -
+       * for THIS entry only or for every entry of its kind (the toggle is
+       * inside). The hour sheet steps aside while it is open and comes
+       * back on Back. A record has no conversation to shape. */
+      if (window.PineHourFlow && s.kind !== "record") {
+        const flow = mk("button", "wk-pill", "flow");
+        flow.title = "Open this entry's conversation as a flowchart: add, "
+          + "remove, move and extend its turns, and give any turn inner "
+          + "exchanges - for this entry only, or for every "
+          + String(s.kind || "such") + " entry";
+        flow.style.cssText = "font-size:9.5px;padding:1px 6px";
+        flow.onclick = (ev) => {
+          ev.stopPropagation();
+          pop.style.display = "none";
+          window.PineHourFlow.open({
+            road: s.kind === "banter_caller" ? "caller" : s.kind, kind: s.kind,
+            slot_id: s.id, label: s.label || s.kind, hour: hour.key,
+            onBack: () => { pop.style.display = ""; },
+          });
+        };
+        top.appendChild(flow);
+      }
       const onoff = mk("button", "wk-icon", s.enabled === false ? "○" : "●");
       onoff.title = s.enabled === false ? "Off — click to run it"
                                         : "On — click to skip it this hour";

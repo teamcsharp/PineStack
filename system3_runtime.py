@@ -1709,6 +1709,9 @@ class System3Runtime:
             # never handed one in: this was empty on every conversation)
             "schedule_occurrence_id": str(ctx.get("sid") or segment.get("id") or ""),
             "segment": segment,
+            # [hour-flow] the running-order entry this round serves: the door's own word
+            # (slot_id) else the sheet's slot on air; an entry's own structure keys on it
+            "slot_id": system3.entry_slot_clean(ctx.get("slot_id") or segment.get("template") or ""),
             "subject": {"topic": topic, "category": category, "seeded": bool(seed_text),
                         "authority": "obligated" if (seed_text or angle or news or own or s2) else "free",
                         "sources": [x for x in [str(ctx.get("seed_file") or "")] if x],
@@ -2536,6 +2539,7 @@ class System3Runtime:
                 "turns": 1, "target_seconds": 0.0, "words_per_turn": 40.0,
                 "schedule_occurrence_id": str(ctx.get("sid") or segment.get("id") or ""),   # [s3-segment]
                 "segment": segment,
+                "slot_id": system3.entry_slot_clean(ctx.get("slot_id") or segment.get("template") or ""),   # [hour-flow]
                 "subject": {"topic": system3.whole_cut(context, 400), "category": "own_material", "seeded": False,
                             "authority": "obligated", "sources": [], "keywords": [], "angle": ""},
                 "availability": {}, "speakerbox_rates": {}, "bank": bool(ctx.get("bank")),
@@ -6025,12 +6029,97 @@ def install(app, namespace):
         return {"hash": await save_config(config, "structure v%d" % structure["version"]),
                 "structure": structure}
 
+    # --- [hour-flow] ONE ENTRY'S OWN STRUCTURE: GET the effective one, PUT / DELETE it ---------
+    ENTRY_FIELDS = ("legs", "label", "head", "tail", "material", "min_turns", "max_turns", "caller_share",
+                    "alternate_seats", "topics")
+
+    def entry_variants_of(held, base):
+        """Every structure standing beside the road's own: its weighted variants
+        (road~vN) and its entries' own (road@slot_id)."""
+        rows = []
+        for key, st in sorted(held.items()):
+            if not isinstance(st, dict) or not st.get("legs"):
+                continue
+            if st.get("variant_of") == base or st.get("entry_of") == base:
+                rows.append({"key": key, "label": str(st.get("label") or key),
+                             "scope": "entry" if st.get("entry") else "variant", "entry": str(st.get("entry") or ""),
+                             "weight": st.get("weight", 1.0), "enabled": st.get("enabled", True) is not False,
+                             "version": st.get("version"), "legs": len(st.get("legs") or []),
+                             "inner": sum(len(x.get("inner") or []) for x in st.get("legs") or [] if isinstance(x, dict))})
+        return rows
+
+    @app.get("/api/system3/structures/{road}")
+    async def get_road_structure(road: str, slot_id: str = "", authorization: str | None = Header(default=None)):
+        """[hour-flow] The structure in force for a road - and, with ?slot_id=, for ONE
+        running-order entry of it: the entry's own (scope "entry") when it has one,
+        else the road's (scope "road"). The road's own and the default ride beside it
+        (the hour view's "back to the road's default"), with every variant and entry
+        structure the road has."""
+        host.require_read_auth(authorization)
+        base = str(road or "").partition("~")[0]
+        config = rt.config
+        held = config.get("structures") or {}
+        default = system3_tables.default_structures().get(base)
+        own = held.get(road) if "~" in road and isinstance(held.get(road), dict) else system3.road_structure(config, base)
+        if not isinstance(own, dict) or not own.get("legs"):
+            raise HTTPException(404, "no road called %s has a structure" % road)
+        slot = system3.entry_slot_clean(slot_id)
+        mine = system3.entry_structure(config, base, slot) if slot else None
+        key = system3.entry_key(base, slot) if slot else ""
+        return {"road": base, "slot_id": slot, "scope": "entry" if mine is not None else "road",
+                "key": key if mine is not None else road,
+                "structure": mine if mine is not None else own, "road_structure": own, "default": default,
+                "entry_held": isinstance(held.get(key), dict) if key else False,
+                "variants": entry_variants_of(held, base),
+                "families": list(system3_tables.INNER_FAMILIES), "line_road": base in system3_tables.LINE_ROADS}
+
+    async def put_entry_structure(road, raw):
+        """[hour-flow] Save ONE running-order entry's own structure (road@slot_id): the
+        body's legs (with their micro-exchanges), label, head, tail and turn bounds over
+        the entry's current structure, else the road's. The legs ARE the entry's shape:
+        a road graph copied off the base would plan instead of them, so none is copied
+        (a body may still carry its own)."""
+        base = str(road or "").partition("~")[0]
+        slot = system3.entry_slot_clean(raw.get("slot_id"))
+        if not slot:
+            raise HTTPException(400, "an entry structure is named by its slot_id (letters, digits, _ . : -)")
+        body = raw.get("structure") if isinstance(raw.get("structure"), dict) else raw
+        problems = system3_tables.validate_structure(base, body)
+        if problems:
+            raise HTTPException(400, "; ".join(problems[:6]))
+        config = copy.deepcopy(rt.config)
+        held = config.setdefault("structures", system3_tables.default_structures())
+        if base not in held and base not in system3.ROADS:
+            raise HTTPException(400, "no road called %s to shape an entry of" % base)
+        key = system3.entry_key(base, slot)
+        fresh = not isinstance(held.get(key), dict)
+        mine = dict(held.get(key) or system3.road_structure(config, base) or {})
+        if fresh:
+            for drop in ("graph", "weight", "variant_of"):
+                mine.pop(drop, None)
+        mine.update({k: body[k] for k in ENTRY_FIELDS if k in body})
+        if "graph" in body:
+            import conversation_graph
+            mine["graph"] = conversation_graph.normalize(body["graph"])
+            graph_problems = conversation_graph.validate(mine["graph"])
+            if graph_problems:
+                raise HTTPException(400, "; ".join(graph_problems))
+        if "enabled" in raw or "enabled" in body:
+            mine["enabled"] = bool(raw.get("enabled", body.get("enabled", True)))
+        mine.update({"id": key, "kind": str(mine.get("kind") or "legs"), "entry_of": base, "entry": slot, "scope": "entry"})
+        mine["version"] = int(mine.get("version") or 1) + 1
+        held[key] = mine
+        return {"hash": await save_config(config, "%s entry structure v%d" % (key, mine["version"])),
+                "structure": mine, "road": base, "slot_id": slot, "scope": "entry", "key": key}
+
     @app.put("/api/system3/structures/{road}")
     async def put_road_structure(road: str, request: Request, authorization: str | None = Header(default=None)):
         """[s3-calls] A road's structure - its legs, their acts, places, seats and
         draws - customised, expanded or altered from the desk."""
         host.require_auth(authorization)
         raw = body_json(await request.body())
+        if isinstance(raw, dict) and str(raw.get("scope") or "") == "entry":   # [hour-flow] this entry only
+            return await put_entry_structure(road, raw)
         # [s3-window] a variant is "<road>~v<n>": a copy of the road's segment with
         # its own legs, a weight against the base and an on/off switch; the
         # engine rolls which one runs (VARIANT) each time the road goes to air.
@@ -6068,10 +6157,26 @@ def install(app, namespace):
                 "structure": mine}
 
     @app.delete("/api/system3/structures/{road}")
-    async def delete_road_structure(road: str, authorization: str | None = Header(default=None)):
+    async def delete_road_structure(road: str, scope: str = "", slot_id: str = "",
+                                    authorization: str | None = Header(default=None)):
         """[s3-window] Drop a variant. A road's own structure cannot be deleted
-        (reset it from the defaults instead)."""
+        (reset it from the defaults instead). [hour-flow] ?scope=entry&slot_id=<id>
+        drops ONE running-order entry's own structure (road@slot_id): that entry
+        goes back to the road's own."""
         host.require_auth(authorization)
+        if str(scope or "") == "entry":
+            slot = system3.entry_slot_clean(slot_id)
+            if not slot:
+                raise HTTPException(400, "an entry structure is named by its slot_id")
+            base = str(road or "").partition("~")[0]
+            key = system3.entry_key(base, slot)
+            config = copy.deepcopy(rt.config)
+            held = config.get("structures") or {}
+            if key not in held:
+                raise HTTPException(404, "the %s entry %s has no structure of its own" % (base, slot))
+            held.pop(key)
+            return {"hash": await save_config(config, "%s entry structure dropped" % key), "deleted": key,
+                    "road": base, "slot_id": slot, "scope": "entry"}
         if "~" not in road:
             raise HTTPException(400, "only a variant (road~vN) can be deleted")
         config = copy.deepcopy(rt.config)

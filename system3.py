@@ -4847,9 +4847,62 @@ def _callend_tail(conv, tail):
     return CALLEND_TAIL if ((conv.get("callend") or {}).get("wrap") or {}).get("planned") else tail
 
 
-def road_structure(config, road):
+# --- [hour-flow] ONE RUNNING-ORDER ENTRY'S OWN STRUCTURE ----------------------------
+#
+# "convert 'the hour' view for a segment into a vertical flowchart ... add, remove,
+# insert, adjust, extend nodes ... select a node to give more inner conversational
+# depth ... micro exchanges" (the operator, 2026-10-06), with the edit scope "Both,
+# with a toggle": an edit applies to THIS entry only, or to every entry of this kind.
+#
+# A structure stored under the key "<road>@<slot_id>" is the one the road runs for
+# the conversations serving THAT entry of the running order. The entry is read off
+# the conversation's inputs: `slot_id` when the door names it, else the scheduled
+# segment's `template` (segment_on_air: the sheet's slot id - what the hour view
+# calls slot.id). With no entry, or no structure for it, nothing here changes a
+# draw: the road's own structure and its weighted variants stand as before.
+ENTRY_SEP = "@"
+
+
+def entry_slot_clean(value):
+    """A slot id as a structure key may carry it: ASCII letters, digits, _ . : -
+    (80 at most); anything else is no entry at all ("")."""
+    text = "".join(str(value or "").split())[:80]
+    if not text or not text.isascii() or not all(c.isalnum() or c in "_.:-" for c in text):
+        return ""
+    return text
+
+
+def entry_key(road, slot_id):
+    """The structures key of one entry's own structure: road@slot_id."""
+    return "%s%s%s" % (str(road or "").partition("~")[0], ENTRY_SEP, entry_slot_clean(slot_id))
+
+
+def entry_slot_of(inputs):
+    """The running-order entry a conversation serves, off its inputs: the door's
+    `slot_id`, else the scheduled segment's template (its slot on the sheet)."""
+    inputs = inputs if isinstance(inputs, dict) else {}
+    seg = inputs.get("segment") if isinstance(inputs.get("segment"), dict) else {}
+    return entry_slot_clean(inputs.get("slot_id") or seg.get("template") or "")
+
+
+def entry_structure(config, road, slot_id):
+    """The entry's own structure when it has one that is switched on, else None."""
+    slot = entry_slot_clean(slot_id)
+    if not slot or not isinstance(config, dict):
+        return None
+    mine = (config.get("structures") or {}).get(entry_key(road, slot))
+    if isinstance(mine, dict) and mine.get("legs") and mine.get("enabled", True) is not False:
+        return mine
+    return None
+
+
+def road_structure(config, road, slot_id=""):
     """[s3-calls] The structure System 3 builds `road` from: the config's own,
-    else the default (a config saved before road structures has none)."""
+    else the default (a config saved before road structures has none).
+    [hour-flow] With `slot_id`, that running-order entry's own structure first."""
+    mine = entry_structure(config, road, slot_id) if slot_id else None
+    if mine is not None:
+        return mine
     got = (config.get("structures") or {}).get(road)
     return got if isinstance(got, dict) and got.get("legs") else system3_tables.default_structures().get(road)
 
@@ -5210,17 +5263,42 @@ def _legs_words(text, inputs):
     return out
 
 
+def _entry_structure_event(conv, road, entry, st):
+    """[hour-flow] THE ENTRY'S OWN STRUCTURE, on the record: a VARIANT pick with no
+    die - the running-order entry this round serves has a structure of its own, so
+    the road runs it, and its weighted variants are not drawn."""
+    key = entry_key(road, entry)
+    label = str(st.get("label") or key)
+    rows = [{"id": key, "label": label, "base": 1.0, "weight": 1.0, "p": 1.0,
+             "why": ["the %s entry %s has a structure of its own" % (road, entry)]}]
+    before = _snapshot(conv, (conv.get("cursor") or {}).get("initiator"))
+    ev = _event(conv, {"turn_id": "", "turn_index": -1}, "VARIANT",
+                [{"stage": "item", "candidates": rows, "excluded": [], "total": 1.0, "selected": key,
+                  "selected_index": 1, "of": 1, "draw": None}],
+                {"table": "structures", "category": road, "category_label": road + " structures",
+                 "id": key, "label": label, "index": 1, "of": 1, "entry": entry},
+                before, meta={"why": "the %s road runs the structure of the running-order entry %s this round "
+                                     "serves - no draw, the entry's own stands" % (road, entry),
+                              "entry": entry, "structure": key})
+    conv["variant_roll"] = {"structure": key, "event_id": ev["event_id"], "of": 1, "entry": entry}
+    return ev
+
+
 def _structure_roll(conv, config, road):
     """[s3-window] WHICH STRUCTURE THIS ROAD RUNS: the road's own, or one of
     its variants - a segment duplicated in the editor and given a weight
     ("duplicate a segment into a variant runnable on the station with
     unique parameters"). One recorded VARIANT draw over the weights. A road
     with no variants draws nothing, so the default trajectory is unchanged."""
+    entry = entry_slot_of(conv.get("inputs"))                                  # [hour-flow] this entry's own first
+    mine = entry_structure(config, road, entry) if entry else None
+    if mine is not None:
+        return mine, _entry_structure_event(conv, road, entry, mine)
     base = road_structure(config, road)
     cands = [(road, base)] if isinstance(base, dict) and base.get("legs") else []
     for key, st in sorted((config.get("structures") or {}).items()):
         if (isinstance(st, dict) and st.get("variant_of") == road and st.get("legs")
-                and st.get("enabled", True) is not False):
+                and st.get("enabled", True) is not False and not st.get("entry")):   # [hour-flow] an entry's own never joins the draw
             cands.append((key, st))
     if len(cands) <= 1:
         return (cands[0][1] if cands else None), None
@@ -5244,6 +5322,52 @@ def _structure_roll(conv, config, road):
                                      "this round runs" % (road, len(cands))}, rng=draw)
     conv["variant_roll"] = {"structure": cands[i][0], "event_id": ev["event_id"], "of": len(cands)}
     return cands[i][1], ev
+
+
+# [hour-flow] MICRO-EXCHANGES: a leg may carry `inner` rows - {seat, act, families} -
+# each one more turn planned right after the leg, in order, drawing from its
+# families as a leg does (ES always, so the turn has a feeling). The structure's
+# max_turns bounds the whole; a leg is never dropped for an exchange - the
+# exchanges nearest the end go first. A leg without `inner` is the leg it was.
+INNER_FAMILIES = ("ES", "RS", "IRS", "FL", "CTS", "REACT")
+
+
+def inner_rows(leg):
+    """A leg's micro-exchanges as planning legs: id <leg>.x<n>, the leg's place,
+    the row's seat ("alternate" until it is seated), its act, its families as draws."""
+    out = []
+    if not isinstance(leg, dict) or not isinstance(leg.get("inner"), list):
+        return out
+    for k, row in enumerate(leg["inner"]):
+        if not isinstance(row, dict):
+            continue
+        act = " ".join(str(row.get("act") or "").split())
+        if not act:
+            continue
+        fams = []
+        for f in row.get("families") or []:
+            if str(f) in INNER_FAMILIES and str(f) not in fams:
+                fams.append(str(f))
+        if "ES" not in fams:
+            fams.insert(0, "ES")
+        out.append({"id": "%s.x%d" % (leg.get("id"), k + 1),
+                    "label": (str(row.get("label") or "").strip()
+                              or "Exchange %d inside %s" % (k + 1, leg.get("label") or leg.get("id"))),
+                    "place": leg.get("place"), "seat": str(row.get("seat") or "alternate"), "act": act,
+                    "draws": [{"family": f} for f in fams], "inner_of": leg.get("id"), "inner_index": k})
+    return out
+
+
+def _inner_trim(seq, hi):
+    """[hour-flow] The planned sequence held to the structure's max_turns: the
+    exchanges nearest the end go first; a leg is never dropped for an exchange."""
+    out = list(seq)
+    while len(out) > hi:
+        drop = next((j for j in range(len(out) - 1, -1, -1) if out[j][0].get("inner_of")), -1)
+        if drop < 0:
+            break
+        del out[drop]
+    return out
 
 
 def plan_legs(conv, config, inputs=None, road=None, structure=None):
@@ -5276,26 +5400,45 @@ def plan_legs(conv, config, inputs=None, road=None, structure=None):
         alt = ["A"]
 
     def build(fill_n):
-        seq = [(leg, str(leg.get("seat") or "A")) for leg in opening]
-        last = seq[-1][1] if seq else ""
+        seq = []
+        state = {"last": ""}
+
+        def put(leg, seat):
+            # [hour-flow] the leg, then its micro-exchanges in order: an exchange seated
+            # "alternate" (or on the voice just heard) takes the next voice, and the
+            # legs after it alternate off the exchange's speaker, not the leg's
+            seq.append((leg, seat))
+            state["last"] = seat
+            for row in inner_rows(leg):
+                s = str(row.get("seat") or "alternate")
+                if s == "alternate" or s == state["last"]:
+                    i = alt.index(state["last"]) if state["last"] in alt else -1
+                    s = alt[(i + 1) % len(alt)]
+                seq.append((dict(row, seat=s), s))
+                state["last"] = s
+
+        for leg in opening:
+            put(leg, str(leg.get("seat") or "A"))
         for k in range(fill_n):
             leg = middle[k % len(middle)]
             seat = str(leg.get("seat") or "alternate")
             if seat == "alternate":
-                i = alt.index(last) if last in alt else -1
+                i = alt.index(state["last"]) if state["last"] in alt else -1
                 seat = alt[(i + 1) % len(alt)]
-            seq.append((leg, seat))
-            last = seat
+            put(leg, seat)
         for leg in closing:
             seat = str(leg.get("seat") or "alternate")
             if seat == "alternate":
-                i = alt.index(last) if last in alt else -1
+                i = alt.index(state["last"]) if state["last"] in alt else -1
                 seat = alt[(i + 1) % len(alt)]
-            seq.append((leg, seat))
-            last = seat
+            put(leg, seat)
         return seq
 
     fill_n = max(0, want - len(opening) - len(closing)) if middle else 0
+    # [hour-flow] the exchanges count against the turn budget: fewer middle passes
+    # while the whole still runs over it and the floor holds
+    while fill_n > 0 and len(build(fill_n)) > want and len(build(fill_n - 1)) >= lo:
+        fill_n -= 1
     seq = build(fill_n)
     # nobody speaks twice in a row (banter_turns' contract): when the
     # alternation lands the last middle turn on the closing seat, one
@@ -5307,6 +5450,7 @@ def plan_legs(conv, config, inputs=None, road=None, structure=None):
             seq = build(fill_n - 1)
         elif len(seq) + 1 <= hi:
             seq = build(fill_n + 1)
+    seq = _inner_trim(seq, hi)                                                  # [hour-flow] held to max_turns
     # [s3-events] what happens in this segment, before its turns
     _ev = _event_rolls(conv, config, conv["settings"], inputs, road,
                        [(i, str(seat or "A"), "fixed" if leg.get("fixed") else str(leg.get("place") or ""))
@@ -5335,8 +5479,10 @@ def plan_legs(conv, config, inputs=None, road=None, structure=None):
                 "draws": leg.get("draws") or [{"family": "ES"}]}
         turn = _decide_turn(conv, config, conv["settings"], stream, step, seat, want, inputs)
         turn["protocol"] = whole_cut(_legs_words(leg.get("act"), inputs), 400)
-        turn["leg"] = leg.get("id")
+        turn["leg"] = leg.get("inner_of") or leg.get("id")                       # [hour-flow] an inner turn names its leg
         turn["place"] = leg.get("place")
+        if leg.get("inner_of"):
+            turn["inner"] = {"of": leg["inner_of"], "index": int(leg.get("inner_index") or 0), "id": leg.get("id")}
     conv["draws"] = stream.n
     _events_attach(conv)                                                        # [s3-events]
     _cast_rolls(conv, config, conv["settings"], inputs)                         # [s3-cast]
