@@ -46642,7 +46642,8 @@ async def larder_prepare(entry: dict[str, Any],
     lifecycle = _pantry_lifecycle()
     if lifecycle and not lifecycle.admit_production(entry):
         return False
-    if entry.get("prepared") and dialogue_row_ready(_pkind, entry):
+    if (entry.get("prepared") and dialogue_tint_ready(_pkind, entry)
+            and dialogue_audio_ready(_pkind, entry)):   # [kitchen-finish] nothing left to make here
         return False
     # #1122: this whole body is one `try: ... except Exception: return
     # False` with no log, so a raise before `entry["chunks"] = len(plan)`
@@ -50757,7 +50758,7 @@ async def pantry_keeper() -> None:
                                 not in _committed_unready):
                             continue
                         if (_e.get("preparing")
-                                or dialogue_row_ready(_kind, _e)):
+                                or dialogue_row_ready(_kind, _row)):   # [kitchen-finish] the ROW the predicate is written for
                             continue
                         if (not dialogue_row_viable(_kind, _e)
                                 or not dialogue_tint_ready(_kind, _e)):
@@ -50802,7 +50803,7 @@ async def pantry_keeper() -> None:
                         break           # the booth gets the rest
                     _shelved = _row.get("entry") or {}
                     if (_shelved.get("preparing")
-                            or dialogue_row_ready(_kind, _shelved)):
+                            or dialogue_row_ready(_kind, _row)):       # [kitchen-finish] the ROW the predicate is written for
                         continue
                     if (not dialogue_row_viable(_kind, _shelved)
                             or not dialogue_tint_ready(_kind, _shelved)):
