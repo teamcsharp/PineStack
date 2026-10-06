@@ -14,7 +14,8 @@ for (const file of copies) {
   const short = path.relative(ROOT, file);
   test(short + ': a loop, a warm copy and a bubble copy are refused', () => {
     assert.match(src, /function repeatOf\(v\) \{\s*if \(v\.loop\) return 'loops';/);
-    assert.ok(src.includes("if (v.dataset && v.dataset.pineWarm === '1') return 'warm copy';"), 'the CRT set\'s warm element is never tiled');
+    assert.ok(src.includes("if (v.style && v.style.opacity === '0' && v.style.pointerEvents === 'none') return 'warm copy';"), 'the CRT set\'s PARKED warm element is never tiled');
+    assert.ok(!src.includes("v.dataset.pineWarm === '1'"), 'never by the data-pine-warm attribute: a clip built the ordinary way keeps it for life');
     assert.ok(src.includes("if (v.classList && v.classList.contains('sp-mv-video')) return 'bubble copy';"), 'the script page\'s bubble thumbnail is never tiled');
   });
   test(short + ': a source shown before, and a clock that jumps back, are program', () => {

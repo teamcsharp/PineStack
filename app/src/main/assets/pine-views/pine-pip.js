@@ -29,7 +29,10 @@
     function srcOf(v) { return String(v.currentSrc || v.src || (v.srcObject ? 'stream' : '')); }
     function repeatOf(v) {
       if (v.loop) return 'loops';                                        /* a looping element is never program */
-      if (v.dataset && v.dataset.pineWarm === '1') return 'warm copy';   /* [pip-tube-rules] the set's next clip, warming off screen */
+      /* [pip-warm-rule] the set's next clip warms PARKED: warmPark's inline style, opacity 0 and no pointer
+         events, which the hand-over strips. Not the data-pine-warm attribute: sfx-tv.js removes that only on
+         the seamless road, and a clip built the ordinary way keeps it for life - refusing on it emptied the tube. */
+      if (v.style && v.style.opacity === '0' && v.style.pointerEvents === 'none') return 'warm copy';
       if (v.classList && v.classList.contains('sp-mv-video')) return 'bubble copy';   /* the script page's thumbnail of the clip already on the tube; it replays itself while its line is newest */
       /* a source shown before is NOT a repeat: the SFX guy cuts several stings from one clip, and each
          sting's picture is that clip again, rightly - the ten-minute memory stays only as a record */
