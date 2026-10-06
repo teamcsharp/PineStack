@@ -205,7 +205,7 @@ test('[cam-words] the popup says what the station knows, with the networks it do
 
 test('[cam-words] the title no longer sits on the text', () => {
   const css = lf(read('desktop/renderer/pine-pip.css'));
-  assert.match(css, /\.pip-camera-status \{ position: absolute; inset: 0; display: grid; place-content: center; padding: 30px 12px 12px;/);
+  assert.match(css, /\.pip-camera-status \{ position: absolute; left: 0; right: 0; top: 28px; bottom: 0; display: grid; place-content: center; padding: 4px 10px 8px;/);   /* [pip-rec] the later rule: below the title */
 });
 
 /* ------------------------------------------------------------------ the page: pine-pip.js */

@@ -2152,6 +2152,7 @@ class PineLive:
             "levels_url": "/api/pinelive/levels?t=" + self.sign("pinelive-levels"),
             "monitor_url": ("/music/%s?t=%s" % (lid, self.sign(lid))) if lid else "",
             "art_url": art,
+            "cover_override": plart_override_view(),           # [plcover]
             "ingest_url": ingest,
             "sender_url": "/api/pinelive/sender?t=" + self.sign("pinelive-sender"),
             "errors": list(self.errors),
@@ -2559,10 +2560,31 @@ PLART_DIR = Path(os.environ.get("PINELIVE_ART_DIR")
                  or "/samples/PineBoxRecordings/Live Events/Album Art")
 _PLART_MEMO: dict[str, tuple[str, bytes]] = {}
 _PLART_LAST: list[Any] = [None]          # [pltrack] the cover just shown
+# [plcover] the operator's chosen cover: {event, kind, data, name}; empty = the rolled covers
+_PLART_OVERRIDE: dict[str, Any] = {}
+
+
+def plart_override_set(kind: str, data: bytes, name: str, event: str) -> dict[str, Any]:
+    """[plcover] The chosen cover, for this set (or the next one when none runs)."""
+    _PLART_OVERRIDE.clear()
+    if data:
+        _PLART_OVERRIDE.update({"event": event, "kind": kind, "data": data, "name": name, "at": time.time()})
+    _PLART_MEMO.clear()
+    return {"name": name, "bytes": len(data), "event": event}
+
+
+def plart_override_view() -> dict[str, Any]:
+    ov = _PLART_OVERRIDE
+    return {"name": str(ov.get("name") or ""), "set": bool(ov.get("data")), "event": str(ov.get("event") or "")}
 
 
 def _plart_cover(event_key: str) -> tuple[str, bytes] | None:
     """(media type, bytes) of this event's cover, or None (then the camera)."""
+    ov = _PLART_OVERRIDE                                   # [plcover] the operator's choice first
+    if ov.get("data") and ov.get("event") in ("", event_key):
+        if ov.get("event") == "":
+            ov["event"] = event_key                        # the next set took it
+        return (str(ov.get("kind") or "image/jpeg"), ov["data"])
     got = _PLART_MEMO.get(event_key)
     if got:
         return got
@@ -2677,6 +2699,75 @@ def install(app: Any, app_globals: dict[str, Any]) -> None:
     async def _pinelive_boot() -> None:
         PL.loop = asyncio.get_running_loop()
         await asyncio.to_thread(PL.boot)
+
+    @app.post("/api/pinelive/cover")
+    async def pinelive_cover_api(request: Request,
+                                 authorization: str | None = Header(default=None)) -> dict[str, Any]:
+        """[plcover] The set's cover, chosen: a clip's picture, a render from the gallery, or cleared."""
+        auth(authorization)
+        body = await body_of(request)
+        if body.get("clear"):
+            plart_override_set("", b"", "", "")
+            PL.note("cover", "the cover goes back to the rolled pictures")
+            return {"ok": True, "say": "the covers roll again", "cover": plart_override_view()}
+
+        def picture() -> tuple[str, bytes, str]:
+            clip = str(body.get("clip_id") or "").strip()
+            gen = str(body.get("generation") or "").strip()
+            render = _app("_render_poster")
+            poster_dir = _app("SFX_POSTER_DIR")
+            if clip:
+                if not re.fullmatch(r"[a-f0-9]{16}", clip):
+                    raise ValueError("that is not a clip identity")
+                by_id = _app("sfx_by_id")
+                sample = by_id(clip) if callable(by_id) else None
+                if sample is None:
+                    raise ValueError("the station has no such clip")
+                is_video = _app("sfx_is_video")
+                if not (callable(is_video) and is_video(sample)):
+                    raise ValueError("that clip has no picture (it is sound only)")
+                if not callable(render) or poster_dir is None:
+                    raise ValueError("the station cannot draw a clip's picture here")
+                out = Path(poster_dir) / f"{clip}.jpg"
+                if not out.exists():
+                    Path(poster_dir).mkdir(parents=True, exist_ok=True)
+                    if not render(sample, out):
+                        raise ValueError("the clip's picture could not be drawn")
+                return "image/jpeg", out.read_bytes(), Path(str(sample)).name
+            if gen:
+                if "/" in gen or ".." in gen or not re.fullmatch(r"[\w.\- ()\[\]]{1,200}", gen):
+                    raise ValueError("that is not a render's filename")
+                find = _app("comfy_output_find")
+                path = find(gen) if callable(find) else None
+                if path is None or not Path(path).is_file():
+                    raise ValueError("that render is not in the gallery any more")
+                is_video = _app("sfx_is_video")
+                if callable(is_video) and is_video(Path(path)):
+                    if not callable(render) or poster_dir is None:
+                        raise ValueError("the station cannot draw a render's picture here")
+                    sid = _app("sfx_id")(Path(path))
+                    out = Path(poster_dir) / f"{sid}.jpg"
+                    if not out.exists():
+                        Path(poster_dir).mkdir(parents=True, exist_ok=True)
+                        if not render(Path(path), out):
+                            raise ValueError("the render's picture could not be drawn")
+                    return "image/jpeg", out.read_bytes(), Path(path).name
+                suffix = Path(path).suffix.lower()
+                kind = {".png": "image/png", ".webp": "image/webp", ".gif": "image/gif"}.get(suffix, "image/jpeg")
+                data = Path(path).read_bytes()
+                if len(data) > 24 * 1024 * 1024:
+                    raise ValueError("that picture is too large for a cover")
+                return kind, data, Path(path).name
+            raise ValueError("name a clip_id or a generation, or clear")
+
+        try:
+            kind, data, name = await asyncio.to_thread(picture)
+        except ValueError as exc:
+            return {"ok": False, "code": "cover", "say": str(exc), "cover": plart_override_view()}
+        event = PL.event_id() if PL.event is not None else ""
+        got = plart_override_set(kind, data, name, event)
+        PL.note("cover", "the cover is %s%s" % (name, " for the running set" if event else " for the next set"))
+        return {"ok": True, "say": "the cover is %s" % name, "cover": plart_override_view(), "bytes": got["bytes"]}
 
     @app.get("/api/pinelive/state")
     async def pinelive_state_api(authorization: str | None = Header(default=None)) -> dict[str, Any]:

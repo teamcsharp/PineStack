@@ -19,6 +19,19 @@
     let palette = { surface: '8 23 19', text: '#e1f8ea', accent: '#98e9ae', button: '#17382c' };
     const tiles = new Map();
     const previewSelector = 'video.pav-media,#lightboxVid,#lightboxRefVid,.film video,#galleryGrid video';
+    /* [pip-once] every source the tube has shown: when, and whether it has left. A source that
+       comes back inside SHOWN_ONCE_MS is a repeat and is not tiled; a jump back to the start is one too. */
+    const shownSrc = new Map(); const SHOWN_ONCE_MS = 600000;
+    function srcOf(v) { return String(v.currentSrc || v.src || (v.srcObject ? 'stream' : '')); }
+    function repeatOf(v) {
+      if (v.loop) return 'loops';                                        /* a looping element is never program */
+      const key = srcOf(v); if (!key || key === 'stream') return '';
+      const seen = shownSrc.get(key);
+      if (seen && seen.left && Date.now() - seen.left < SHOWN_ONCE_MS) return 'already shown';
+      return '';
+    }
+    function noteShown(v) { const key = srcOf(v); if (key && key !== 'stream') shownSrc.set(key, { at: Date.now(), left: 0 }); if (shownSrc.size > 200) shownSrc.delete(shownSrc.keys().next().value); }
+    function noteLeft(v) { const key = srcOf(v); const seen = key ? shownSrc.get(key) : null; if (seen) seen.left = Date.now(); }
     function stopPreview(video) {
       video.autoplay = false; video.loop = false;
       video.muted = true;
@@ -169,6 +182,10 @@
         stopPreview(video);
         return false;
       }
+      if (repeatOf(video)) return false;                                  /* [pip-once] */
+      const it = tiles.get(video);
+      if (it && it.lastTime != null && video.currentTime + 1 < it.lastTime && video.currentTime < 2) { it.rewound = true; }   /* [pip-once] it started over */
+      if (it && it.rewound) return false;
       // A buffering player still owns its last picture. Do not collapse the
       // tile merely because the decoder temporarily has no current frame.
       if (video.paused || video.ended || (!tiles.has(video) && (video.readyState < 2 || !video.videoWidth))) return false;
@@ -225,10 +242,11 @@
         frame.scan = Math.floor(now / 500);
         media = [...doc.querySelectorAll('audio,video')];
         const videos = new Set(media.filter(v => v.tagName === 'VIDEO' && active(v)));
-        videos.forEach(v => { if (!tiles.has(v)) add(v); else if (tiles.get(v).leaving) { tiles.get(v).leaving = false; transition(tiles.get(v).tile, true); } });
+        videos.forEach(v => { if (!tiles.has(v)) { add(v); noteShown(v); } else if (tiles.get(v).leaving) { tiles.get(v).leaving = false; transition(tiles.get(v).tile, true); } });
+        tiles.forEach((it, v) => { if (!it.leaving) it.lastTime = v.currentTime; });   /* [pip-once] where each tube's picture stands */
         tiles.forEach((it, v) => {
           if (!videos.has(v) && !it.leaving) {
-            it.leaving = true;
+            it.leaving = true; noteLeft(v);                               /* [pip-once] */
             transition(it.tile, false).then(() => { if (tiles.get(v) === it && it.leaving) { if (it.callback) v.cancelVideoFrameCallback?.(it.callback); it.tile.remove(); tiles.delete(v); layout(); } });
           }
         });
@@ -383,10 +401,21 @@
     menuPending = true;
     try {
       const favorites=(root.PinePipPopups?.catalog?.()||[]).map(({id,label})=>({id,label}));
-      const opening = api().pipMenu({...playbackCache,favorites});
+      const opening = api().pipMenu({...playbackCache,favorites,folders:foldersCache.folders,pin:foldersCache.pin});   /* [pip-video-folder] */
+      refreshFolders();
       refreshPlayback();
       await opening;
     } finally { menuPending = false; }
+  }
+  /* [pip-video-folder] every folder of the SFX collection and the hour's pin, for the menu; a minute old at most */
+  let foldersCache = { folders: [], pin: null }, foldersAt = 0, foldersPending = false;
+  function refreshFolders() {
+    if (foldersPending || Date.now() - foldersAt < 60000) return; foldersPending = true;
+    Promise.resolve().then(() => api().get('/api/sfx/folders')).then(got => {
+      const rows = Array.isArray(got?.folders) ? got.folders : [];
+      foldersCache = { folders: rows.map(f => ({ path: String(f.path || ''), name: String(f.name || f.path || ''), video: Number(f.video) || 0, audio: Number(f.audio) || 0 })).sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base', numeric: true })), pin: got?.pin || null };
+      foldersAt = Date.now();
+    }).catch(() => {}).finally(() => { foldersPending = false; });
   }
   function refreshPlayback() {
     if(playbackPending || Date.now()-playbackAt<3000)return;playbackPending=true;
@@ -465,12 +494,13 @@
      % of the widget, an opacity). Widgets with a place of their own (the player, the message
      tile, the slate, the camera) keep their own position preferences; the entry adds the rest.
      Docked widgets leave the dock when placed (x,y) and return when docked again or reset. */
-  const DOCK_ZONE = 34, OWN_PLACE = new Set(['music', 'messages', 'roulette', 'camera']), FREE_NAMES = ['dialogue', 'task', 'audit', 'production', 'music', 'chat', 'messages', 'cast', 'voices', 'roulette', 'camera'];
-  const WIDGET_WORDS = { dialogue: 'Dialogue + rolling dice', task: 'Task status marquee', audit: 'Station audit marquee', production: 'Production marquee', music: 'Music player', chat: 'Chat + roulette + SFX feed', messages: 'System3 message tile', cast: 'DJ booth cast portraits', voices: 'Voice bubbles + falling peaks', roulette: 'Roulette slate', camera: 'Pine Cam' };
+  const DOCK_ZONE = 34, OWN_PLACE = new Set(['music', 'messages', 'roulette', 'camera']), FREE_NAMES = ['dialogue', 'task', 'audit', 'production', 'music', 'chat', 'messages', 'cast', 'voices', 'roulette', 'camera', 'rec'];
+  const WIDGET_WORDS = { dialogue: 'Dialogue + rolling dice', task: 'Task status marquee', audit: 'Station audit marquee', production: 'Production marquee', music: 'Music player', chat: 'Chat + roulette + SFX feed', messages: 'System3 message tile', cast: 'DJ booth cast portraits', voices: 'Voice bubbles + falling peaks', roulette: 'Roulette slate', camera: 'Pine Cam', rec: 'Album recorder' };
+  const DEFAULT_LAYOUT = { rec: { x: .3, y: .5 } };   /* [pip-rec] a widget born free sits here until it is moved */
   let layoutSaveTimer = 0, layoutPending = {}, adjustFor = '';
   function freeBox(name) { return name === 'camera' ? camera : widgets[name]; }
-  function layoutOf(name) { const entry = state?.layout?.[name]; return entry && typeof entry === 'object' ? entry : null; }
-  function dockable(name) { return !OWN_PLACE.has(name) && name !== 'chat' && name !== 'voices'; }
+  function layoutOf(name) { const entry = state?.layout?.[name]; return entry && typeof entry === 'object' ? entry : (DEFAULT_LAYOUT[name] || null); }
+  function dockable(name) { return !OWN_PLACE.has(name) && name !== 'chat' && name !== 'voices' && name !== 'rec'; }
   function placedFreely(name) { const l = layoutOf(name); return !!l && !OWN_PLACE.has(name) && Number.isFinite(l.x) && Number.isFinite(l.y); }
   function trimsOf(entry) { return (entry && Array.isArray(entry.t) && entry.t.length === 4 ? entry.t : [0, 0, 0, 0]).map(v => Math.max(0, Math.min(45, Number(v) || 0))); }
   function saveLayout(name, patch, immediate = true) {
@@ -653,9 +683,211 @@
     text.textContent = 'Exporting ' + exportName(note) + (known ? ' - ' + Math.round(note.ratio * 100) + '%' : '...') + (EXPORT_STAGE[note.stage] ? ' - ' + EXPORT_STAGE[note.stage] : '');
     exportQuiet = setTimeout(() => paintExport(null), 180000);   /* an export that says nothing for three minutes has stopped */
   }
-  function grip(widget, name) {
-    const handle = node('button', 'pip-grip', '\u283f'); handle.type = 'button'; handle.title = 'Drag to reorder or dock at top / bottom';
-    handle.setAttribute('aria-label', 'Move ' + name + ' widget'); widget.prepend(handle);
+  /* [pip-rec] ------------------------------------------------------------------------------------
+     THE ALBUM RECORDER. The operator's drawing: album art, total time, the falling-peak meter, the
+     record button that becomes stop, the current track's clock and growing size, the recording bar,
+     the track number large, next track, the move notch (drag anywhere; tap: the mini form). It drives
+     the station's MX Live: the K.O. Sidekick's set, recorded as cut pairs and decanted to MP3 320 kb/s.
+     State comes from /api/pinelive/state once a second while the widget shows; the meter follows the
+     levels stream (Server-Sent Events) when it opens, the state's reading when it does not. */
+  const REC_KBPS = 320, REC_BAR_S = 360, REC_BAR_GROW_S = 120, clamp = (v, lo, hi) => v < lo ? lo : v > hi ? hi : v;
+  let recState = null, recSettings = null, recPoll = 0, recRaf = 0, recLevels = null, recLevelsUrl = '', recFed = 0, recBusy = false, recPop = '', recMini = false, recSheenAt = 0;
+  const recMeter = { level: 0, peak: 0, hold: 0, at: 0 }, recClock = { elapsed: 0, stamp: 0, on: false }, recSession = { total: 0, event: '', live: 0 };
+  function recTime(seconds) {
+    const s = Math.max(0, Number(seconds) || 0), h = Math.floor(s / 3600), m = Math.floor(s / 60) % 60, sec = Math.floor(s) % 60, cs = Math.floor((s - Math.floor(s)) * 100);
+    return [h, m, sec, cs].map(n => String(n).padStart(2, '0')).join(':');
+  }
+  function recShort(seconds) { const s = Math.max(0, Math.round(Number(seconds) || 0)); const h = Math.floor(s / 3600), m = Math.floor(s / 60) % 60, sec = s % 60; return (h ? h + ':' : '') + String(m).padStart(h ? 2 : 1, '0') + ':' + String(sec).padStart(2, '0'); }
+  function recSize(bytes) { const kb = bytes / 1000; return kb < 1000 ? Math.floor(kb) + ' KB' : (kb / 1000).toFixed(2) + ' MB'; }
+  function recDb(db) { const v = Number(db); return Number.isFinite(v) ? clamp((v + 60) / 60, 0, 1) : 0; }
+  function recElapsed() { return recClock.on ? recClock.elapsed + (performance.now() - recClock.stamp) / 1000 : recClock.elapsed; }
+  function buildRecorder() {
+    const box = node('section', 'pip-widget pip-rec'); widgets.rec = box; box.setAttribute('aria-label', 'Album recorder');
+    const notch = node('button', 'pip-grip pip-rec-notch'); notch.type = 'button'; notch.title = 'Drag to move the recorder; tap to fold it to the mini form and back';
+    const art = node('div', 'pip-rec-art'); const img = node('img'); img.alt = 'Album art'; img.draggable = false; img.hidden = true;
+    const blank = node('div', 'pip-rec-blank'); if (typeof root.pineIcon === 'function') blank.innerHTML = root.pineIcon('c:music'); art.append(img, blank, node('div', 'pip-rec-total', 'TOTAL 0:00'));
+    art.title = 'The set\u2019s cover - click to choose a render or a clip\u2019s picture';
+    const main = node('div', 'pip-rec-main');
+    const record = node('button', 'pip-rec-record'); record.type = 'button'; record.title = 'Record'; record.setAttribute('aria-label', 'Record'); record.appendChild(node('i'));
+    const meter = node('canvas', 'pip-rec-meter'); meter.width = 72; meter.height = 30; meter.setAttribute('aria-hidden', 'true');
+    const bar = node('div', 'pip-rec-bar'); bar.append(node('i'), node('span', 'pip-rec-range', '6:00')); bar.setAttribute('role', 'progressbar'); bar.setAttribute('aria-label', 'Recording progress');
+    const next = node('button', 'pip-rec-next'); next.type = 'button'; next.title = 'Next track'; next.setAttribute('aria-label', 'Next track'); musicIcon(next, 'c:skip--forward--filled');
+    const size = node('output', 'pip-rec-size'); size.title = 'The track\u2019s MP3 size so far (320 kb/s)'; const time = node('output', 'pip-rec-time', '00:00:00:00'); time.title = 'Current track HH:MM:SS:FF';
+    const track = node('div', 'pip-rec-track', '1'); track.title = 'Track number';
+    const readout = node('div', 'pip-rec-readout'); readout.append(size, time);
+    main.append(record, meter, bar, next, readout, track);
+    const status = node('div', 'pip-rec-status'); const line = node('span', 'pip-rec-line', 'Connecting to the station...'); const tools = node('button', 'pip-rec-tools'); tools.type = 'button'; tools.title = 'Troubleshoot the connected interface'; tools.setAttribute('aria-label', 'Troubleshoot the connected interface'); musicIcon(tools, 'c:tools');
+    status.append(line, tools);
+    const pop = node('div', 'pip-rec-pop'); pop.hidden = true;
+    box.append(notch, art, main, status, pop);
+    overlay.appendChild(box);
+    grip(notch, 'rec', notch);
+    /* a tap on the notch (no drag) folds the widget; the grip's own drop handler ignores a still pointer for a widget that cannot dock */
+    let press = null;
+    notch.addEventListener('pointerdown', e => { press = { x: e.clientX, y: e.clientY }; });
+    notch.addEventListener('pointerup', e => { if (press && Math.hypot(e.clientX - press.x, e.clientY - press.y) < 4) { recMini = !recMini; try { localStorage.setItem('pinePipRecMini', recMini ? '1' : ''); } catch (_) {} syncRecorder(); } press = null; });
+    record.addEventListener('click', () => recToggle());
+    next.addEventListener('click', () => recNext());
+    tools.addEventListener('click', () => recTroubleshoot());
+    art.addEventListener('click', () => recArtPicker());
+    try { recMini = localStorage.getItem('pinePipRecMini') === '1'; } catch (_) {}
+    try { const saved = JSON.parse(localStorage.getItem('pinePipRecSession') || 'null'); if (saved && Date.now() - (saved.at || 0) < 12 * 3600 * 1000) { recSession.total = Number(saved.total) || 0; recSession.event = String(saved.event || ''); } } catch (_) {}
+  }
+  function recPost(route, body, said) {
+    if (recBusy) return Promise.resolve(); recBusy = true;
+    return api().post(route, body || {}).then(got => { if (got && got.ok === false) say(got.say || got.detail || 'The station declined.', 7000); else if (said) say(typeof said === 'function' ? said(got) : said); if (got?.state) recTake(got.state); return recRefresh(); }).catch(err => say(err.message)).finally(() => { recBusy = false; });
+  }
+  function recToggle() {
+    const st = recState || {};
+    if (st.armed || st.live) return recPost('/api/pinelive/stop', {}, 'The set is stopped; the track is cut and decanted.');
+    const settings = recSettings?.settings || {}, kind = st.source?.kind || (settings.device ? 'usb' : 'usb');
+    const body = { source: kind === 'network' ? 'network' : 'usb' }; if (body.source === 'usb' && settings.device) body.device = settings.device;
+    return recPost('/api/pinelive/start', body, 'Recording - the set is live.');
+  }
+  function recNext() { if (!(recState?.armed || recState?.live)) { say('Start recording first; next track cuts the running track.'); return; } return recPost('/api/dj/next', {}, 'Next track.'); }
+  function recTake(st) {
+    if (!st || typeof st !== 'object') return;
+    recState = st;
+    const on = !!(st.recording && st.recording.on && (st.live || st.armed));
+    recClock.elapsed = Number(st.recording?.cut_elapsed) || 0; recClock.stamp = performance.now(); recClock.on = on;
+    const event = st.event?.id || '';
+    if (event && event !== recSession.event) { recSession.event = event; recSession.live = 0; }
+    if (!event && recSession.event) { recSession.total += recSession.live; recSession.live = 0; recSession.event = ''; }
+    if (event) recSession.live = Number(st.event?.live_seconds) || 0;
+    try { localStorage.setItem('pinePipRecSession', JSON.stringify({ total: recSession.total, event: recSession.event, at: Date.now() })); } catch (_) {}
+    if (!recLevels && Number.isFinite(Number(st.source?.level_db))) { recMeter.level = recDb(st.source.level_db); const p = recDb(st.source.peak_db); if (p >= recMeter.peak) { recMeter.peak = p; recMeter.hold = performance.now() + 700; } }
+    recOpenLevels(st);
+    paintRecorder();
+  }
+  function recRefresh() {
+    if (!state?.active || !state.widgets?.rec || state.ui === false) return Promise.resolve();
+    return api().get('/api/pinelive/state').then(recTake).catch(err => { const line = widgets.rec?.querySelector('.pip-rec-line'); if (line) line.textContent = 'The station is not answering: ' + err.message; });
+  }
+  function recOpenLevels(st) {
+    const want = state?.active && state.widgets?.rec && state.ui !== false && (st.armed || st.live) && st.levels_url && typeof root.EventSource === 'function';
+    const url = want ? (root.pineStationBase?.() || '') + st.levels_url : '';
+    if (!want || url !== recLevelsUrl) { if (recLevels) { try { recLevels.close(); } catch (_) {} recLevels = null; recLevelsUrl = ''; } }
+    if (!want || recLevels) return;
+    try {
+      recLevels = new root.EventSource(url); recLevelsUrl = url;
+      recLevels.addEventListener('frame', e => { try { const f = JSON.parse(e.data); recFed = performance.now(); const lv = recDb(f.rms), pk = recDb(f.peak); recMeter.level = lv; if (pk >= recMeter.peak) { recMeter.peak = pk; recMeter.hold = performance.now() + 700; } } catch (_) {} });
+      recLevels.onerror = () => { try { recLevels.close(); } catch (_) {} recLevels = null; recLevelsUrl = ''; };
+    } catch (_) { recLevels = null; }
+  }
+  function recTick(now) {
+    recRaf = 0;
+    const box = widgets.rec; if (!box || box.hidden || !state?.active) return;
+    recRaf = root.requestAnimationFrame(recTick);
+    const dt = recMeter.at ? Math.min(.1, (now - recMeter.at) / 1000) : 1 / 60; recMeter.at = now;
+    if (now > recMeter.hold) recMeter.peak = Math.max(recMeter.level, recMeter.peak - .55 * dt);   /* held, then falling */
+    if (!recClock.on && !recLevels) recMeter.level = Math.max(0, recMeter.level - 1.6 * dt);
+    const canvas = box.querySelector('.pip-rec-meter'), ctx = canvas.getContext('2d'); const w = canvas.width, h = canvas.height, n = 12, gap = 2, bw = (w - gap * (n - 1)) / n;
+    ctx.clearRect(0, 0, w, h);
+    const accent = getComputedStyle(box).getPropertyValue('--pip-accent').trim() || '#98e9ae';
+    for (let i = 0; i < n; i++) { const f = (i + 1) / n; const lit = recMeter.level >= f - 1 / n / 2; ctx.fillStyle = lit ? (f > .92 ? '#ff5a5a' : f > .75 ? '#ffd166' : accent) : 'rgba(255,255,255,.12)'; const bh = h * (.35 + .65 * f); ctx.fillRect(i * (bw + gap), h - bh, bw, bh); }
+    const px = clamp(Math.round(recMeter.peak * n) - 1, 0, n - 1); if (recMeter.peak > .02) { ctx.fillStyle = '#ffffff'; ctx.fillRect(px * (bw + gap), h - h * (.35 + .65 * (px + 1) / n) - 3, bw, 2); }
+    const elapsed = recElapsed(); let range = REC_BAR_S; while (elapsed > range) range += REC_BAR_GROW_S;   /* six minutes; two more each time it is passed */
+    const bar = box.querySelector('.pip-rec-bar'); bar.firstChild.style.width = (clamp(elapsed / range, 0, 1) * 100).toFixed(2) + '%'; bar.querySelector('.pip-rec-range').textContent = recShort(range); bar.setAttribute('aria-valuenow', String(Math.round(clamp(elapsed / range, 0, 1) * 100)));
+    box.querySelector('.pip-rec-time').textContent = recTime(elapsed);
+    recRolodex(box.querySelector('.pip-rec-size'), recSize(elapsed * REC_KBPS * 1000 / 8));
+    box.querySelector('.pip-rec-total').textContent = 'TOTAL ' + recShort(recSession.total + recSession.live + (recClock.on ? (performance.now() - recClock.stamp) / 1000 : 0));
+    if (recClock.on && now - recSheenAt > 7000) { recSheenAt = now; const a = box.querySelector('.pip-rec-art'); a.classList.remove('sheen'); void a.offsetWidth; a.classList.add('sheen'); }
+  }
+  /* the size as flipping digits: each character that changed turns over */
+  function recRolodex(out, text) {
+    if (out.dataset.text === text) return; out.dataset.text = text;
+    const have = [...out.children];
+    text.split('').forEach((ch, i) => { let cell = have[i]; if (!cell) { cell = node('b'); out.appendChild(cell); } if (cell.textContent !== ch) { cell.textContent = ch; cell.classList.remove('flip'); void cell.offsetWidth; cell.classList.add('flip'); } });
+    while (out.children.length > text.length) out.lastChild.remove();
+  }
+  function paintRecorder() {
+    const box = widgets.rec; if (!box) return; const st = recState || {};
+    const on = !!(st.recording && st.recording.on && (st.live || st.armed)), armed = !!(st.armed || st.live);
+    box.classList.toggle('recording', on); box.classList.toggle('armed', armed); box.classList.toggle('mini', recMini);
+    const record = box.querySelector('.pip-rec-record'); record.title = armed ? 'Stop - cut the track and end the set' : 'Record - start the set and the first track'; record.setAttribute('aria-label', record.title); record.setAttribute('aria-pressed', String(armed));
+    box.querySelector('.pip-rec-track').textContent = String(armed ? (st.event?.track || st.recording?.split?.track || st.recording?.cut_index || 1) : 1);   /* idle: the next set begins at track 1 */
+    const img = box.querySelector('.pip-rec-art img'), blank = box.querySelector('.pip-rec-blank');
+    const art = st.art_url ? (root.pineStationBase?.() || '') + st.art_url : '';
+    if (art && img.dataset.src !== art) { img.dataset.src = art; img.src = art; img.hidden = false; blank.hidden = true; img.onerror = () => { img.hidden = true; blank.hidden = false; }; }
+    if (!art) { img.hidden = true; img.removeAttribute('src'); img.dataset.src = ''; blank.hidden = false; }
+    const src = st.source || {}, host = st.host || {};
+    let words = !host.up ? ('The PineLive host is down' + (host.why ? ': ' + host.why : '')) : !src.kind ? 'No interface chosen - the wrench lists what the station sees' : (src.label || src.device || 'interface') + ' \u00b7 ' + String(src.kind).toUpperCase() + (src.connected ? ' \u00b7 connected' : ' \u00b7 not open') + (Number.isFinite(Number(src.level_db)) ? ' \u00b7 ' + Math.round(src.level_db) + ' dBFS' : '') + (src.clipping ? ' \u00b7 CLIPPING' : '');
+    if (st.recording?.why) words += ' \u00b7 ' + st.recording.why;
+    if (st.cover_override?.set) words += ' \u00b7 cover: ' + st.cover_override.name;
+    if (st.air?.why_not) words += ' \u00b7 ' + st.air.why_not;
+    box.querySelector('.pip-rec-line').textContent = words;
+    box.querySelector('.pip-rec-next').hidden = recMini && !armed;
+  }
+  function syncRecorder() {
+    const box = widgets.rec; if (!box) return;
+    const on = !!(state?.active && state.widgets?.rec && state.ui !== false);
+    if (on) {
+      if (!recPoll) { recPoll = setInterval(recRefresh, 1000); recRefresh(); if (!recSettings) api().get('/api/pinelive/settings').then(got => { recSettings = got || null; }).catch(() => {}); }
+      if (!recRaf) recRaf = root.requestAnimationFrame(recTick);
+      paintRecorder();
+    } else {
+      clearInterval(recPoll); recPoll = 0; root.cancelAnimationFrame(recRaf); recRaf = 0;
+      if (recLevels) { try { recLevels.close(); } catch (_) {} recLevels = null; recLevelsUrl = ''; }
+      recClosePop();
+    }
+  }
+  function recClosePop() { const pop = widgets.rec?.querySelector('.pip-rec-pop'); recPop = ''; if (pop) { pop.hidden = true; pop.replaceChildren(); } }
+  function recOpenPop(kind, title, fill) {
+    const pop = widgets.rec.querySelector('.pip-rec-pop');
+    if (recPop === kind) { recClosePop(); return null; }
+    recPop = kind; pop.replaceChildren(); pop.hidden = false;
+    const head = node('header', '', title), x = node('button', 'pip-rec-pop-x'); x.type = 'button'; x.title = 'Close'; x.setAttribute('aria-label', 'Close ' + title); musicIcon(x, 'c:close--filled');
+    x.addEventListener('click', e => { e.stopPropagation(); recClosePop(); }); head.appendChild(x); pop.appendChild(head);
+    fill(pop); return pop;
+  }
+  /* the wrench: the station's own ordered checks of the connected interface, with what to do */
+  function recTroubleshoot() {
+    recOpenPop('tools', 'The connected interface', pop => {
+      const list = node('ol', 'pip-rec-checks'); list.appendChild(node('li', 'wait', 'Asking the station...')); pop.appendChild(list);
+      const keys = node('div', 'pip-rec-keys'); pop.appendChild(keys);
+      const key = (label, run) => { const b = node('button', '', label); b.type = 'button'; b.addEventListener('click', () => Promise.resolve().then(run).catch(err => say(err.message))); keys.appendChild(b); };
+      key('Check again', () => recTroubleshoot() || recTroubleshoot());
+      key('Rescan USB', () => api().get('/api/pinelive/devices?fresh=1').then(got => { say(((got?.usb || []).length) + ' USB interface(s) seen'); recRefresh(); }));
+      key('Use USB', () => { recSettings = { ...(recSettings || {}), settings: { ...((recSettings || {}).settings || {}), road: 'usb' } }; say('The next recording opens the USB interface'); });
+      key('Use network', () => { recSettings = { ...(recSettings || {}), settings: { ...((recSettings || {}).settings || {}), road: 'network' } }; say('The next recording takes the network sender'); });
+      api().get('/api/pinelive/troubleshoot').then(got => {
+        list.replaceChildren();
+        for (const c of (got?.checks || [])) { const li = node('li', String(c.result || 'unknown')); li.append(node('b', '', c.label || ''), node('span', '', c.evidence || '')); if (c.fix) li.appendChild(node('small', '', c.fix)); list.appendChild(li); }
+        if (got?.say) list.appendChild(node('li', 'say', got.say));
+        if (!(got?.checks || []).length) list.appendChild(node('li', 'unknown', 'The station reported no checks.'));
+      }).catch(err => { list.replaceChildren(node('li', 'fail', 'The troubleshoot road failed: ' + err.message)); });
+    });
+  }
+  /* the art: recent renders from the gallery (H3 / ComfyUI) and the clips' own pictures, as the set's cover */
+  function recArtPicker() {
+    recOpenPop('art', 'The set\u2019s cover', pop => {
+      const grid = node('div', 'pip-rec-grid'); grid.appendChild(node('small', 'pip-rec-note', 'Looking through the gallery and the clips...')); pop.appendChild(grid);
+      const keys = node('div', 'pip-rec-keys'); const clear = node('button', '', 'Rolled covers again'); clear.type = 'button'; clear.addEventListener('click', () => recPost('/api/pinelive/cover', { clear: true }, 'The covers roll again.').then(recClosePop)); keys.appendChild(clear); pop.appendChild(keys);
+      const tile = (label, src, body) => { const b = node('button', 'pip-rec-tile'); b.type = 'button'; b.title = label; const im = node('img'); im.alt = label; im.loading = 'lazy'; im.src = src; im.onerror = () => b.remove(); b.append(im, node('span', '', label)); b.addEventListener('click', () => recPost('/api/pinelive/cover', body, got => 'The cover is ' + (got?.cover?.name || label)).then(recClosePop)); return b; };
+      Promise.all([api().get('/api/generations?limit=24').catch(() => null), api().get('/api/sfx/folders').catch(() => null)]).then(([gens, folders]) => {
+        grid.replaceChildren();
+        const base = root.pineStationBase?.() || '';
+        let count = 0;
+        for (const g of (gens?.generations || [])) {
+          const files = Array.isArray(g.files) ? g.files : []; const file = files.find(f => /\.(png|jpe?g|webp|mp4|webm|mov)$/i.test(String(f))); if (!file) continue;
+          const label = (g.kind === 'video' ? 'Render: ' : 'Image: ') + String(g.request || file).slice(0, 48);
+          if (/\.(mp4|webm|mov)$/i.test(file)) { api().get('/api/generations/poster-url/' + encodeURIComponent(file)).then(p => { if (p?.poster) grid.appendChild(tile(label, base + p.poster, { generation: file })); }).catch(() => {}); }
+          else grid.appendChild(tile(label, safeImage('/api/generations/image/' + encodeURIComponent(file)), { generation: file }));
+          if (++count >= 24) break;
+        }
+        for (const f of (folders?.folders || [])) for (const s of (f.samples || [])) {
+          if (!s.video || !s.id || !s.url) continue;
+          const t = String(s.url).split('t=')[1] || '';
+          grid.appendChild(tile('Clip: ' + (s.name || s.id) + ' (' + f.name + ')', base + '/api/sfx/poster/' + s.id + (t ? '?t=' + t : ''), { clip_id: s.id }));
+          if (++count >= 60) break;
+        }
+        if (!grid.children.length) grid.appendChild(node('small', 'pip-rec-note', 'No finished renders or video clips to choose from yet.'));
+      });
+    });
+  }
+  function grip(widget, name, given) {
+    const handle = given || node('button', 'pip-grip', '\u283f'); handle.type = 'button'; if (!given) handle.title = 'Drag to reorder or dock at top / bottom';
+    handle.setAttribute('aria-label', 'Move ' + name + ' widget'); if (!given) widget.prepend(handle);
     handle.addEventListener('keydown', e => {
       if (placedFreely(name) && e.key.startsWith('Arrow') && !e.ctrlKey && !e.altKey) {   /* [pip-free] a placed widget is nudged; Shift takes bigger steps */
         e.preventDefault(); const step = (e.shiftKey ? 24 : 6), b = freeBox(name) || widget;
@@ -1003,6 +1235,7 @@
       overlay.querySelector('.pip-dock-bottom').appendChild(widget);
     }
     buildMusic();   /* [pip-music] a mini player placed freely, not a strip in the top dock */
+    buildRecorder();   /* [pip-rec] the album recorder, placed freely */
     const chat = node('section', 'pip-widget pip-chat'); widgets.chat = chat;
     const header = node('header', '', 'Live feed \u00b7 roulette \u00b7 SFX'); grip(header, 'chat'); chat.append(header, node('small', 'pip-sfx-slots', 'SFX slot: idle'), node('div', 'pip-chat-list')); overlay.appendChild(chat);
     overlay.addEventListener('contextmenu', e => {
@@ -1423,6 +1656,10 @@
   async function runAction(action) {
     if(action?.type==='favorite')return api().pipToolsOpen({id:action.id});
     if (action?.type === 'adjust' && action.name) { showAdjust(String(action.name), freeBox(String(action.name))); return; }   /* [pip-free] from the menu's Widget layout */
+    if (action?.type === 'video-folder') {   /* [pip-video-folder] the folder owns the clips for an hour */
+      const body = action.clear || !action.path ? { clear: true } : { path: String(action.path), hours: 1 };
+      return api().post('/api/sfx/folder-pin', body).then(got => { foldersAt = 0; refreshFolders(); say(got?.say || (body.clear ? 'Every folder again' : 'Clips come from ' + action.path + ' for the next hour'), 7000); }).catch(err => say(err.message));
+    }
     if (action?.type === 'background') {   /* [pip-viz] the menu names a mode, or asks for the next */
       if (!panelReady) { say('The background changes once the station page is ready.'); return; }
       return frame.executeJavaScript('window.PinePipPanel?.background(' + JSON.stringify(String(action.mode || 'next')) + ')').then(got => { if (got && got.mode) say('Background: ' + got.mode); }).catch(err => say(err.message));
@@ -1730,9 +1967,9 @@
     applyAppearance(next);
     for (const [name, widget] of Object.entries(widgets)) {
       widget.hidden = !next.widgets[name]; widget.style.order = next.order[name]; widget.dataset.dock = next.docks[name];
-      if (!['chat', 'voices', 'roulette', 'messages', 'music'].includes(name) && !placedFreely(name)) overlay.querySelector('.pip-dock-' + next.docks[name]).appendChild(widget);   /* [pip-free] a placed widget leaves the dock */
+      if (!['chat', 'voices', 'roulette', 'messages', 'music', 'rec'].includes(name) && !placedFreely(name)) overlay.querySelector('.pip-dock-' + next.docks[name]).appendChild(widget);   /* [pip-free] a placed widget leaves the dock */
     }
-    placeSlate(); syncMusic(); syncMessages(); syncMessageTileSettings();
+    placeSlate(); syncMusic(); syncMessages(); syncMessageTileSettings(); syncRecorder();   /* [pip-rec] */
     if (next.active && !was) {
       root.PineAdViewer?.close();
       pinePipPanel(root); root.PinePipPanel.appearance(themePalette()); root.PinePipPanel.set(true, '', true);

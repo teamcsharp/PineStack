@@ -1,7 +1,7 @@
 const { Menu, screen } = require('electron');
 
 const VOICE_STYLES = ['Cyan bars', 'Green wave', 'Amber equalizer', 'Purple wave', 'Red blocks', 'Blue spikes', 'Green blocks', 'Gold wave', 'Violet spikes', 'Teal filled wave', 'Pink blocks', 'Sky bars', 'Lime bars', 'Orange spikes', 'Cyan dots', 'Violet bars'];
-const WIDGETS = { dialogue: true, task: false, audit: false, production: false, music: false, chat: false, messages: false, cast: false, voices: false, roulette: false };
+const WIDGETS = { dialogue: true, task: false, audit: false, production: false, music: false, chat: false, messages: false, cast: false, voices: false, roulette: false, rec: false };   /* [pip-rec] */
 /* [pip-viz] the ten backgrounds of desktop/renderer/pipviz, in their order */
 const BACKGROUNDS = [['smooth-wave', '01 Smooth Wave - flowing ribbons'], ['particle-flow', '02 Particle Flow - luminous matter'], ['line-spectrum', '03 Line Spectrum - contour lines'], ['geometric-space', '04 Geometric Space - floating glass'],
   ['speed-lines', '05 Speed Lines - hyperdrive'], ['anime-ink', '06 Anime Ink Wave - hand-drawn seas'], ['audio-bars', '07 Audio Bars - dimensional spectrum'], ['liquid-glass', '08 Liquid Glass - refractive membrane'],
@@ -240,7 +240,7 @@ function install({ ipcMain, getWindow, readConfig, writeConfig, troubleshoot, re
     if (!getWindow()?.__pinePip || activeMenu) return state();
     const s = state();
     const labels = { dialogue: 'Dialogue + rolling dice', task: 'Task status marquee', audit: 'Station audit marquee',
-      production: 'Production / recording / banking / emotion marquee', music: 'Music player', chat: 'Chat + roulette + SFX feed', messages: 'System3 message tile', cast: 'DJ booth cast portraits', voices: 'Voice bubbles + falling peaks', roulette: 'Roulette RNG digital slate' };
+      production: 'Production / recording / banking / emotion marquee', music: 'Music player', chat: 'Chat + roulette + SFX feed', messages: 'System3 message tile', cast: 'DJ booth cast portraits', voices: 'Voice bubbles + falling peaks', roulette: 'Roulette RNG digital slate', rec: 'Album recorder (K.O. Sidekick)' };
     const names=new Map((Array.isArray(playback?.favorites)?playback.favorites:[]).filter(item=>item&&typeof item.id==='string'&&typeof item.label==='string').map(item=>[item.id,item.label.slice(0,120)]));
     const favoriteItems=s.popupFavorites.map(id=>({label:names.get(id)||id.slice(id.indexOf(':')+1).replace(/^Pine/,'').replace(/([a-z])([A-Z])/g,'$1 $2').replace(/[-_]/g,' '),
       click:()=>openTools?openTools({id}):getWindow()?.webContents.send('pip:action',{type:'favorite',id})}))
@@ -288,6 +288,14 @@ function install({ ipcMain, getWindow, readConfig, writeConfig, troubleshoot, re
       { label: 'Color theme', submenu: Object.entries(THEMES).map(([theme, label]) => ({ label, type: 'radio', checked: s.theme === theme, click: () => update({ theme }) })) },
       { label: 'Overlay transparency...', click: () => getWindow()?.webContents.send('pip:action', 'appearance') },
       { label: 'Always on top', type: 'checkbox', checked: s.alwaysOnTop, click: () => update({ alwaysOnTop: !s.alwaysOnTop }) },
+      /* [pip-video-folder] every folder of the SFX collection; the chosen one owns the clips for an hour */
+      { label: 'Video', submenu: [
+        { label: playback?.pin ? ('Every folder (clear: ' + playback.pin.name + ', ' + playback.pin.minutes_left + ' min left)') : 'Every folder (no pin)', type: 'radio', checked: !playback?.pin, click: () => getWindow()?.webContents.send('pip:action', { type: 'video-folder', clear: true }) },
+        { type: 'separator' },
+        ...(Array.isArray(playback?.folders) ? playback.folders : []).filter(f => f && typeof f.path === 'string').slice(0, 300)
+          .map(f => ({ label: (f.name || f.path) + '  (' + (f.video || 0) + ' video, ' + (f.audio || 0) + ' audio)', type: 'radio', checked: !!playback?.pin && playback.pin.path === f.path,
+            click: () => getWindow()?.webContents.send('pip:action', { type: 'video-folder', path: f.path }) }))
+      ] },
       { label: 'Endless video', type: 'checkbox', checked: playback?.on === true,
         click: item => getWindow()?.webContents.send('pip:playback', { on: item.checked }) },
       { label: 'Seamless video', type: 'checkbox', checked: playback?.seamless === true,

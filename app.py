@@ -125886,7 +125886,7 @@ PIP_DEFAULTS: dict[str, Any] = {
     "layout": {},            # [pip-free] one entry per widget: {x,y,w,h,s,t,o}
     "widgets": {"dialogue": True, "task": False, "audit": False, "production": False,
                 "music": False, "chat": False, "messages": False, "cast": False,
-                "voices": False, "roulette": False},
+                "voices": False, "roulette": False, "rec": False},   # [pip-rec] the album recorder
     "docks": {"dialogue": "bottom", "task": "bottom", "audit": "bottom",
               "production": "bottom", "music": "top", "chat": "bottom",
               "messages": "bottom", "cast": "bottom", "voices": "bottom", "roulette": "bottom"},
