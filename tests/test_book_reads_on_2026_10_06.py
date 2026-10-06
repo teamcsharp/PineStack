@@ -1,10 +1,13 @@
-"""[book-reads-on] 2026-10-06: Book Time reads on through its book instead of repeating its welcome.
+"""[book-reads-on] + [book-nodes] 2026-10-06: Book Time reads on; nothing gates it.
 
-Measured: 32 of 74 Book Time parts in the larder refused by the phase gates for wording; the live
-banter road and the segment's door shared one admission, so the opening aired twice; the window
-waited for a completeness it never reached.
+"For book time the segment is looping ... why aren't they reading more lines out of the book."
+"I dont want wedges or gates. I want the node configuration altered to have them able to do more
+book work."
+
+The window airs what the episode has, in order, and carries the last episode's unaired parts; only
+the segment's door takes an episode's parts; the out-of-turn larder doors never take a segment's
+part; and the old phase checks are observations, never refusals.
 """
-import ast
 import asyncio
 import re
 import tempfile
@@ -42,53 +45,30 @@ def _part(occurrence, phase, script, recorded=True, at=None, handed=False):
     return row
 
 
-class Mending(unittest.TestCase):
-    def test_an_opening_without_names_or_title_is_mended_and_passes(self):
+class Observations(unittest.TestCase):
+    def test_a_part_the_old_gate_would_refuse_stands_with_a_note(self):
         rt = _runtime()
-        row = _part("o@1", "opening", "A: Welcome listeners to Book Time on Pine Box FM. We are diving in today.\nB: Yes we are, this one is a treat.")
-        self.assertTrue(rt.phase_error(row), "before: the gate refuses it")
-        fixes = rt.repair_phase(row)
-        self.assertIn("the title", fixes)
-        self.assertIn("A introduces Dill", fixes)
-        self.assertIn("B introduces Skip", fixes)
-        self.assertEqual(rt.phase_error(row), "", "after: the gate lets it through")
-        self.assertIn("I'm Dill.", row["script"])
-        self.assertIn("And I'm Skip.", row["script"])
-        self.assertIn("We are reading Presidential anecdotes.", row["script"])
-        self.assertEqual(row["book_phase_repaired"]["phase"], "opening")
+        row = _part("o@1", "opening", "A: We are diving in today.\nB: Yes we are, this one is a treat.")
+        why = rt.phase_error(row)
+        self.assertTrue(why, "the old check still has an opinion")
+        rt.note_phase(row, why)
+        self.assertEqual(row["book_phase_note"]["phase"], "opening")
+        self.assertIn("welcome", row["book_phase_note"]["why"].lower())
+        valid, structure = rt.book_structure([row, _part("o@1", "discussion", "A: more")])
+        self.assertEqual(len(valid), 2, "every written part stands")
+        self.assertTrue(structure["valid"])
+        self.assertEqual(structure["opening_count"], 1)
+        self.assertFalse(structure["complete"], "complete means an opening and a closing exist, by phase")
+        self.assertEqual(len(structure["errors"]), 1, "the note is kept beside it")
 
-    def test_an_opening_without_a_welcome_gets_one_and_loses_its_sign_off(self):
-        rt = _runtime()
-        row = _part("o@1", "opening", "A: I'm Dill, and we are reading Presidential anecdotes.\nB: And I'm Skip. Thanks for Book Time, back to the music.")
-        self.assertTrue(rt.phase_error(row))
-        fixes = rt.repair_phase(row)
-        self.assertIn("the welcome", fixes)
-        self.assertIn("a sign-off struck from the opening", fixes)
-        self.assertEqual(rt.phase_error(row), "")
-        self.assertTrue(row["script"].startswith("A: Welcome to Book Time on Pine Box FM."))
-
-    def test_a_discussion_that_welcomes_is_struck_not_refused(self):
-        rt = _runtime()
-        row = _part("o@1", "discussion", "A: Welcome back to Book Time on Pine Box FM. The brakes hissed as the train left.\nB: That hiss is the whole point of the passage.")
-        self.assertEqual(rt.phase_error(row), "Discussion must not welcome listeners or close Book Time")
-        self.assertIn("a welcome struck from the discussion", rt.repair_phase(row))
-        self.assertEqual(rt.phase_error(row), "")
-        self.assertNotIn("Welcome", row["script"])
-        self.assertIn("The brakes hissed", row["script"])
-
-    def test_a_closing_without_its_sign_off_gets_one(self):
-        rt = _runtime()
-        row = _part("o@1", "closing", "A: So that is where Coolidge left it.\nB: A fine place to stop.")
-        self.assertTrue(rt.phase_error(row))
-        self.assertIn("the sign-off", rt.repair_phase(row))
-        self.assertEqual(rt.phase_error(row), "")
-        self.assertIn("That is Book Time on Pine Box FM.", row["script"])
-
-    def test_a_part_that_cannot_be_mended_is_still_refused(self):
-        rt = _runtime()
-        row = _part("o@1", "verse", "A: la la")
-        self.assertEqual(rt.repair_phase(row), "")
-        self.assertTrue(rt.phase_error(row))
+    def test_nothing_mends_and_nothing_refuses_any_more(self):
+        self.assertFalse(hasattr(dsr.DynamicSegments, "repair_phase"), "the mend is gone")
+        src = Path(dsr.__file__).read_text(encoding="utf-8")
+        self.assertNotIn("Book Time phase failed after three bounded attempts", src.split("def prepare_book")[1].split("def ", 1)[0]
+                         if "def prepare_book" in src else src, "no episode is blocked by its parts")
+        self.assertIn("has_intro = any(row.get('book_phase') == 'opening' for row in rows)", src, "the next phase is the node's identity")
+        self.assertIn("road=BOOK_ROADS.get(phase, 'book_read')", src, "each phase writes on its own road")
+        self.assertEqual(dsr.BOOK_ROADS, {"opening": "book_open", "discussion": "book_read", "closing": "book_close"})
 
 
 class Admission(unittest.TestCase):

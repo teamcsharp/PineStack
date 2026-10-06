@@ -736,6 +736,8 @@ Object.assign(FAMILY_WHAT, {
     "Who on the station ends the call, and how - in answer to the caller's last word. Two dice: the way (a polite goodbye, cutting them off mid-sentence, hold forever, the dial tone ... - some only after a resolution, like enjoying the ashes after a painting was set on fire; a call a happening cut short draws from the dead-line wheel) and who says it (the desk's weights by seat). The station's checker takes this node as the sign-off whatever its words. Edited in Tables > WRAP1."],
 });
 Object.assign(FAMILY_WHAT, {   /* [supercut-react] the booth's stance on the supercut */
+  BOOK: ['Book work (BK1 manner, BK2 angle, BK3 errand)',
+    'What a host does with the book in hand on the Book Time roads (book_open, book_read, book_close): the manner the next passage is read in, the angle the other host takes on it, and the errand run with the book - rolled per turn, never gated.'],
   REACT: ['Supercut stance (REACT1)',
     'How a host takes the supercut that just played, rolled once per turn on the supercut_react road: loves it, hates it, split, wants it as the jingle, baffled, moved, suspicious, reviews it - each item a direction the host performs and never names. The wheel decides whether they love it or not.'],
 });
@@ -6805,7 +6807,7 @@ export async function mount(root, {request, onClose, tab: startTab = '', table: 
   let tableDrag = null; const foldedCats = new Set();   /* [s3-window] */
   /* [s3-cast] every family that keeps a table, the round rolls and the two pools included */
   const TABLE_FAMILIES = ['CTS', 'ES', 'RS', 'IRS', 'FL', 'TEMPER', 'SHOCK', 'INTERJECT', 'SPEAKERBOX', 'FAV', 'DIRECTIVE', 'EVENT', 'CHANCE', 'POOL', 'RESOLVE', 'WRAP', 'IL',
-    'MGRTOPIC', 'MGRSUB', 'REACT'];   /* [s3-sb-end] SBEND1 - [s3-mgrtopics] the manager's topics and sub messages - [supercut-react] REACT1 */
+    'MGRTOPIC', 'MGRSUB', 'REACT', 'BOOK'];   /* [s3-sb-end] SBEND1 - [s3-mgrtopics] the manager's topics and sub messages - [supercut-react] REACT1 - [book-nodes] BK1-BK3 */
   TABLE_FAMILIES.push('CALLOPEN', 'CALLANGLE', 'CALLSTAKES', 'CALLPROBE', 'CALLSOURCE', 'RW');
   TABLE_FAMILIES.push('MEMORY');   /* [s3-memory] the kinds of memory: each a rule, then the roulette */
   /* [s3-memory] one kind of memory: the numbers and switches its rule decides eligibility by */

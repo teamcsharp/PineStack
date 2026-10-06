@@ -4088,6 +4088,8 @@ def annotate_protocol(conv, sheet):
 FAMILIES = FAMILIES + system3_tables.CALLEND_FAMILIES                        # [s3-callend] RESOLVE, WRAP
 FAMILIES = FAMILIES + ("REACT",)                                              # [supercut-react] the booth's stance
 ROADS = ROADS + ("supercut_react",)                                           # [supercut-react] the road
+FAMILIES = FAMILIES + ("BOOK",)                                               # [book-nodes] the book work: manner, angle, errand
+ROADS = ROADS + ("book_open", "book_read", "book_close")                      # [book-nodes] Book Time's own roads
 FAMILIES = FAMILIES + system3_tables.CALLARC_FAMILIES                        # [s3-callarc] CALLARC, CALLSHIFT
 CALLEND_STATION = ("A", "B", "D", "S")     # the booth: host, co-host, third seat, Sam (where a call has his seat)
 CALLEND_WITHIN = 1200.0                    # a painting on offer this recently is "the last segment"
@@ -5176,6 +5178,9 @@ def _leg_row_add(t):
         react = [x["text"] for x in t.get("directions") or [] if x["family"] == "REACT"]   # [supercut-react]
         if react:
             add += "; the stance: " + react[-1]
+        book = [x["text"] for x in t.get("directions") or [] if x["family"] == "BOOK"]     # [book-nodes]
+        if book:
+            add += "; the book work: " + book[-1]
         # [s3-es-dir] the feeling's own words - not on a drawn stock line (its words are fixed)
         _es = "" if any(x.get("family") == "LINE" for x in t.get("decisions") or []) \
             else (direction_block(t) or _es_line(t))                          # [s3-direction] legs, calls, lines

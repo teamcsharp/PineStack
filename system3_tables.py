@@ -1669,6 +1669,93 @@ REACT1 = {
 }
 DEFAULT_TABLES.append(REACT1)                                                # [supercut-react]
 
+# --- [book-nodes] THE BOOK WORK: what a host does with the book in hand, rolled per turn ---
+# "the node configuration altered to have them able to do more book work" - three offerings
+# the Book Time roads roll: how a passage is read (BK1), the angle the other host takes on it
+# (BK2), and the errand done with the book (BK3). Rolled, never gated: whatever comes up is read.
+BK1 = {
+    "id": "BK1", "family": "BOOK", "label": "Reading manner (how the passage is read)",
+    "version": 1, "enabled": True, "weight": 1.0,
+    "description": "The manner a host reads the next passage of the book in, rolled on the reading legs of the "
+                   "book_open, book_read and book_close roads. The words are the book's; the manner is the wheel's.",
+    "categories": [
+        {"id": "manner", "label": "Manner", "weight": 1.0,
+         "items": _items([
+             {"id": "plain", "label": "Plain", "weight": 1.0,
+              "text": "reads it plain - every word as written, no flourish, and stops where the passage stops"},
+             {"id": "slow", "label": "Slowly", "weight": 0.9,
+              "text": "reads it slowly, savouring the words, a breath between the sentences"},
+             {"id": "narrator", "label": "As the narrator", "weight": 0.8,
+              "text": "reads it as the book's own narrator would, in the book's voice, not the host's"},
+             {"id": "warning", "label": "As a warning", "weight": 0.7,
+              "text": "reads it as a warning to the city - every sentence pointed at somebody listening"},
+             {"id": "comedy", "label": "As the joke the author missed", "weight": 0.7,
+              "text": "reads it as if the author meant it as a joke and only the reader has noticed"},
+             {"id": "twice", "label": "Twice", "weight": 0.6,
+              "text": "reads it once, then reads the one sentence that matters a second time, slower"},
+             {"id": "dare", "label": "As a dare", "weight": 0.6,
+              "text": "reads it as a dare, as though the listener will not believe a word of it"},
+         ])},
+    ],
+}
+BK2 = {
+    "id": "BK2", "family": "BOOK", "label": "The listener's angle (what the other host takes from it)",
+    "version": 1, "enabled": True, "weight": 1.0,
+    "description": "What the other host pulls out of the passage just read, rolled on the take legs of the book "
+                   "roads: one angle per turn, so no two takes on the same page come out the same.",
+    "categories": [
+        {"id": "angle", "label": "Angle", "weight": 1.0,
+         "items": _items([
+             {"id": "word", "label": "The one word", "weight": 1.0,
+              "text": "names the one word in the passage that matters and says why it is that word"},
+             {"id": "street", "label": "This street tonight", "weight": 1.0,
+              "text": "says what the passage would mean on this street tonight, to somebody listening"},
+             {"id": "who", "label": "Who it is about", "weight": 0.9,
+              "text": "says who in the city the passage is really about, by name or by job"},
+             {"id": "unsaid", "label": "The unsaid thing", "weight": 0.8,
+              "text": "names the thing the author is not saying out loud in that passage"},
+             {"id": "lasttime", "label": "Last time", "weight": 0.7,
+              "text": "says how the passage fits what was read last time Book Time was on"},
+             {"id": "callin", "label": "A question for the listener", "weight": 0.8,
+              "text": "puts one question from the passage to the listener, to ring in and answer"},
+             {"id": "wrong", "label": "Where the author is wrong", "weight": 0.7,
+              "text": "says flatly where the author has it wrong, and what the page should have said"},
+             {"id": "personal", "label": "The true thing", "weight": 0.6,
+              "text": "names the one thing in the passage that is true of them, and admits it"},
+         ])},
+    ],
+}
+BK3 = {
+    "id": "BK3", "family": "BOOK", "label": "The errand (what is done with the book in hand)",
+    "version": 1, "enabled": True, "weight": 1.0,
+    "description": "The errand a host runs with the book in hand on the errand leg of the book_read road - the "
+                   "thing that keeps a reading round moving through the pages rather than circling one line.",
+    "categories": [
+        {"id": "errand", "label": "Errand", "weight": 1.0,
+         "items": _items([
+             {"id": "next", "label": "Reads the next sentences", "weight": 1.2,
+              "text": "reads the next sentences of the book word for word and says where they are on the page"},
+             {"id": "page", "label": "Names the page", "weight": 0.7,
+              "text": "names the page and the chapter they are on and why they stopped there"},
+             {"id": "ask", "label": "Hands the book over", "weight": 0.9,
+              "text": "hands the book to the other host and asks them to read the next bit out loud"},
+             {"id": "disagree", "label": "Disagrees", "weight": 0.8,
+              "text": "disagrees with the author in one breath, quoting the words they disagree with"},
+             {"id": "funniest", "label": "The funniest line", "weight": 0.8,
+              "text": "finds the funniest line on the page and reads it, deadpan"},
+             {"id": "sumup", "label": "Sums the chapter up", "weight": 0.7,
+              "text": "sums the chapter up in one breath for anybody who just tuned in"},
+             {"id": "reread", "label": "Re-reads it differently", "weight": 0.6,
+              "text": "re-reads the sentence that was just read, in a different voice, to hear it again"},
+             {"id": "predict", "label": "Predicts the page", "weight": 0.6,
+              "text": "predicts what the next page says, then reads it to check"},
+         ])},
+    ],
+}
+DEFAULT_TABLES.append(BK1)                                                   # [book-nodes]
+DEFAULT_TABLES.append(BK2)                                                   # [book-nodes]
+DEFAULT_TABLES.append(BK3)                                                   # [book-nodes]
+
 # --- The banter cycle (PDF p.3) --------------------------------------------
 #
 # Initial Statement [CTS1] -> Response A [ES1, RS1] -> Response B [ES1, RS1]
@@ -1857,6 +1944,19 @@ ROAD_REGISTER = [
      "writer": "dynamic_segments_runtime.bank_reaction / react -> dj_banter", "hook": "system3_direct_banter",
      "what": "the booth reacts to the supercut that just played: the first word, the other's stance, the landing - "
              "each host's stance rolled on REACT1 (they love it, or they do not)"},
+    # [book-nodes] Book Time is three roads of its own: the nodes do the book work, nothing gates it
+    {"id": "book_open", "label": "Book Time: the opening", "shape": "legs",
+     "writer": "dynamic_segments_runtime.prepare_book (phase opening) -> dj_banter", "hook": "system3_direct_banter",
+     "what": "both hosts welcome the listener to Book Time on the station by name, name the book and the chapter, "
+             "and the first passage is read word for word - the manner a BK1 roll, the first take a BK2 roll"},
+    {"id": "book_read", "label": "Book Time: a reading", "shape": "legs",
+     "writer": "dynamic_segments_runtime.prepare_book (phase discussion) -> dj_banter", "hook": "system3_direct_banter",
+     "what": "a reading round: the next passages read word for word (BK1), the takes from the angle rolled (BK2), "
+             "the errand rolled with the book in hand (BK3), reading on"},
+    {"id": "book_close", "label": "Book Time: the close", "shape": "legs",
+     "writer": "dynamic_segments_runtime.prepare_book (phase closing) -> dj_banter", "hook": "system3_direct_banter",
+     "what": "the last sentence of the book read, each host's takeaway, and the sign-off that thanks the listener "
+             "for Book Time and hands back to the music"},
     {"id": "ad_spot", "label": "Produced advert", "shape": "line",
      "writer": "dj_ad_break: ad_pick", "hook": "system3_direct_line (LINE draw over the book)",
      "what": "a stored or produced spot: the ad book's rows are the Rolodex, the pick is a recorded draw"},
@@ -2028,6 +2128,50 @@ DEFAULT_ROAD_STRUCTURES = {
     # [s3-roads] THE SINGLE-VOICE ROADS: one seat, one leg, the feeling rolled.
     # Where the road hands System 3 a list (the stock lines, the ad book), the
     # LINE draw over that list is the Rolodex where random.choice() was.
+    # [book-nodes] BOOK TIME, AS NODES. The reading legs carry the passage itself ({booksentences},
+    # {booksentence}), filled at the model wire by the book prompt stage like the brief; the manner, the
+    # angle and the errand are BOOK rolls. Nothing here is checked afterwards: what the wheel and the
+    # writer make is what airs.
+    "book_open": _legs_structure("book_open", "Book Time: the opening", 4, 6, [
+        _leg("hello_a", "The welcome", "open", "A",
+             "WELCOMES the listener to Book Time on {stationname} and says their own name - I'm, and the name - "
+             "then names the book, {book}, and the chapter being read tonight, {bookchapter}", "ES"),
+        _leg("hello_b", "The other host", "middle", "B",
+             "says their own name the same way, welcomes the listener too, and says in one line what pulled "
+             "them into this book tonight", "ES", "RS"),
+        _leg("first_read", "The first reading", "middle", "A",
+             "READS the first passage word for word, exactly as the book has it - {booksentences} - in the "
+             "manner rolled, and stops where it stops", "ES", "BOOK"),
+        _leg("first_take", "The first take", "close", "B",
+             "answers what was just read from the angle rolled: one line on the passage, then what they want "
+             "read next", "ES", "RS", "BOOK"),
+    ], "BOOK TIME OPENING"),
+    "book_read": _legs_structure("book_read", "Book Time: a reading", 6, 10, [
+        _leg("read", "A reading", "open", "A",
+             "READS the next passage of {book} word for word - {booksentences} - in the manner rolled, naming "
+             "the page or the chapter once, and stops where it stops", "ES", "BOOK"),
+        _leg("take", "The take", "middle", "alternate",
+             "answers the passage from the angle rolled: one line about what it said, then a question or a "
+             "dare to the other host about it", "ES", "RS", "BOOK"),
+        _leg("errand", "The errand", "middle", "alternate",
+             "does the errand rolled with the book in hand, in the feeling rolled", "ES", "BOOK"),
+        _leg("read_on", "Reading on", "middle", "alternate",
+             "reads on: the next sentences of the book, word for word - {booksentence} - in the manner rolled",
+             "ES", "BOOK"),
+        _leg("turn", "The turn", "close", "alternate",
+             "says what the reading leaves them with, in the feeling rolled, and which part they want read "
+             "when Book Time comes back", "ES", "RS"),
+    ], "BOOK TIME READING"),
+    "book_close": _legs_structure("book_close", "Book Time: the close", 3, 5, [
+        _leg("last_read", "The last line", "open", "A",
+             "reads one last sentence of {book} word for word - {booksentence} - and says what it leaves "
+             "them with", "ES", "BOOK"),
+        _leg("takeaway", "The takeaway", "middle", "B",
+             "their takeaway from tonight's reading, in the feeling rolled, in two lines at most", "ES", "RS"),
+        _leg("signoff", "The sign-off", "close", "alternate",
+             "THANKS the listener for Book Time on {stationname}, names {book} once more, and hands back to "
+             "the music", "ES", "FL2close"),
+    ], "BOOK TIME CLOSE"),
     "supercut_react": _legs_structure("supercut_react", "Supercut reaction", 3, 5, [   # [supercut-react]
         _leg("first", "First word on the supercut", "open", "A",
              "FIRST WORD ON THE SUPERCUT that just played: names one thing it showed or said, and takes the stance "
@@ -2145,7 +2289,7 @@ def validate_structure(road, st):
         if str(leg.get("seat") or "") not in ("A", "B", "C", "D", "E", "alternate"):
             out.append("leg %s: seat must be A-E or alternate" % leg["id"])
         for d in leg.get("draws") or []:
-            if not isinstance(d, dict) or d.get("family") not in ("ES", "RS", "IRS", "FL", "CTS", "REACT"):   # [supercut-react]
+            if not isinstance(d, dict) or d.get("family") not in ("ES", "RS", "IRS", "FL", "CTS", "REACT", "BOOK"):   # [supercut-react] [book-nodes]
                 out.append("leg %s: unknown draw %r" % (leg["id"], d))
         if "diversity_families" in leg:
             import call_diversity

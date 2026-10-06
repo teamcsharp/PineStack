@@ -21,6 +21,9 @@ import segment_prompts
 from segment_contract import (book_time_bookends, book_title_said, build_segment_contract,
                               evaluate_segment_contract, estimated_speech_seconds)
 
+# [book-nodes] each phase is written on its own System 3 road, whose legs do the book work
+BOOK_ROADS = {'opening': 'book_open', 'discussion': 'book_read', 'closing': 'book_close'}
+
 
 class DynamicSegments:
     def __init__(self, g: dict[str, Any]):
@@ -410,95 +413,31 @@ class DynamicSegments:
                 best, best_at, best_rows = occurrence, at, sorted(rows, key=self.book_order)
         return best, best_rows
 
-    def repair_phase(self, row, prior=()):
-        """[book-reads-on] MEND BEFORE REFUSING. The gates turned away 32 of 74 parts in a morning for
-        wording - a welcome without the station's name, a host who said "here's Dill" instead of "I'm
-        Dill", a closing whose sign-off the regex did not know - and three refusals block the episode.
-        What the gate wants is said by construction: the welcome, the title, each host's name, the
-        sign-off; what it forbids is struck. The gate is asked again afterwards; a part that still
-        fails is refused as before. Returns what was mended, or '' when nothing was."""
+    def note_phase(self, row, why):
+        """[book-nodes] What the old gate would have said, kept as a NOTE on the part and in the ledger.
+        The part stands and airs; the note is for the reader of the episode, not for a door."""
         entry = self.source_entry(row)
-        phase = str(entry.get('book_phase') or '')
-        script = str(entry.get('script') or entry.get('script_plain') or '')
-        turns = [[str(seat), ' '.join(str(text).split())]
-                 for seat, text in (self.call('banter_turns', script, default=[]) or [])]
-        if not turns or phase not in ('opening', 'discussion', 'closing'):
-            return ''
-        station = str(entry.get('book_station') or self.station() or '').strip()
-        title = str((entry.get('book_source') or {}).get('title') or '')
-        lead = re.split(r"\s+--\s+|\s+-\s+|:\s+|;\s+|\s+[(\[]", title.strip(), maxsplit=1)[0].strip(' .,;:-') if title else ''
-        fixes = []
-
-        def strike(pattern, label):
-            for turn in turns:
-                pieces = [s for s in re.split(r'(?<=[.!?])\s+', turn[1]) if s]
-                kept = [s for s in pieces if not pattern.search(self._plain(s))]
-                if len(kept) != len(pieces):
-                    turn[1] = ' '.join(kept)
-                    if label not in fixes:
-                        fixes.append(label)
-
-        if phase == 'opening':
-            strike(self.SIGNOFF_RX, 'a sign-off struck from the opening')
-            words = self._plain(' '.join(t[1] for t in turns))
-            if not self.WELCOME_RX.search(words) or (station and self._plain(station) not in words):
-                turns[0][1] = ('Welcome to Book Time on %s. ' % station if station else 'Welcome to Book Time. ') + turns[0][1]
-                fixes.append('the welcome')
-            words = self._plain(' '.join(t[1] for t in turns))
-            if lead and not book_title_said(title, words):
-                turns[0][1] = turns[0][1].rstrip() + ' We are reading %s.' % lead
-                fixes.append('the title')
-            cast = self.host_cast(row)
-            for seat in ('A', 'B'):
-                name = str(cast.get(seat) or '').strip()
-                own = next((t for t in turns if t[0] == seat), None)
-                if not name or own is None:
-                    continue
-                said = re.compile(r"\b(?:i(?:'m| am)|my name is|this is|it(?:'s| is))\s+" + re.escape(name.casefold())
-                                  + r"(?!\w)|(?<!\w)" + re.escape(name.casefold()) + r"\s+(?:here|at the mic|speaking)\b")
-                if not any(t[0] == seat and said.search(self._plain(t[1])) for t in turns):
-                    own[1] = ("I'm %s. " % name if seat == 'A' else "And I'm %s. " % name) + own[1]
-                    fixes.append('%s introduces %s' % (seat, name))
-        elif phase == 'discussion':
-            strike(self.WELCOME_RX, 'a welcome struck from the discussion')
-            strike(self.SIGNOFF_RX, 'a sign-off struck from the discussion')
-        else:
-            strike(self.WELCOME_RX, 'a welcome struck from the closing')
-            evidence = book_time_bookends('\n'.join(t[1] for t in turns), station=station)
-            if not evidence['outro']['written']:
-                turns[-1][1] = turns[-1][1].rstrip() + (
-                    ' That is Book Time on %s. Thank you for listening, and now back to the music.' % station
-                    if station else ' That is Book Time. Thank you for listening, and now back to the music.')
-                fixes.append('the sign-off')
-        if not fixes:
-            return ''
-        mended = '\n'.join('%s: %s' % (seat, text) for seat, text in turns if text.strip())
-        for holder in (row, entry):
-            for field in ('script', 'script_plain', 'script_tinted'):
-                if isinstance(holder, dict) and holder.get(field):
-                    holder[field] = mended
-        entry['book_phase_repaired'] = {'fixes': list(fixes), 'phase': phase, 'at': time.time()}
+        entry['book_phase_note'] = {'why': str(why)[:300], 'phase': entry.get('book_phase'), 'at': time.time()}
         ledger = self.g.get('FLOW_LEDGER')
         if ledger is not None:
             try:
-                ledger.note('round:book_phase_repair', phase + ': ' + ', '.join(fixes), passed=True,
-                            road='banter', text=mended, ref=str(entry.get('sid') or ''))
+                ledger.note('round:book_phase_note', str(entry.get('book_phase') or '') + ': ' + str(why), passed=True,
+                            road='banter', text=str(entry.get('script') or entry.get('script_plain') or ''),
+                            ref=str(entry.get('sid') or ''))
             except Exception:   # noqa: BLE001 - a ledger that cannot write never stops the episode
                 pass
-        return ', '.join(fixes)
 
     def book_structure(self, rows):
-        valid, errors = [], []
+        # [book-nodes] every written part stands; what the old gate would have said is kept beside it
+        valid, notes = list(rows), []
         for row in rows:
-            why = self.phase_error(row, valid)
+            why = self.phase_error(row, [r for r in rows if r is not row])
             if why:
-                errors.append({'id': str(self.source_entry(row).get('sid') or ''), 'why': why})
-            else:
-                valid.append(row)
+                notes.append({'id': str(self.source_entry(row).get('sid') or ''), 'why': why})
         opening = sum(self.source_entry(row).get('book_phase') == 'opening' for row in valid)
         closing = sum(self.source_entry(row).get('book_phase') == 'closing' for row in valid)
-        return valid, {'valid': not errors, 'complete': not errors and opening == 1 and closing == 1,
-                       'opening_count': opening, 'closing_count': closing, 'errors': errors}
+        return valid, {'valid': True, 'complete': opening >= 1 and closing >= 1,
+                       'opening_count': opening, 'closing_count': closing, 'errors': notes}
 
     def reject_phase(self, row, why):
         entry = self.source_entry(row)
@@ -713,10 +652,8 @@ class DynamicSegments:
                 if self.source_entry(row).get('dynamic_occurrence') == occurrence
                 and self.source_entry(row).get('dynamic_phase_rejected')]
             phase_retry = next((row for row in rejected if not row.get('phase_repaired_by')), None)
-            if phase_retry and sum(row.get('book_phase') == phase_retry.get('book_phase') for row in rejected) >= 3:
-                self.last[occurrence] = {'state': 'blocked', 'why': 'Book Time phase failed after three bounded attempts',
-                    'phase': phase_retry.get('book_phase'), 'coverage': self.book_coverage(due, rows)}
-                return False
+            # [book-nodes] no gate: a written part is never refused now, so nothing blocks an episode; a
+            # refusal from before this change is re-asked once through the retry below and then left alone.
             # Retry retained tint/voice work before asking the writer for more
             # words. A failed engine visit must not create an infill loop.
             prepare_existing = self.g.get('larder_prepare')
@@ -750,8 +687,8 @@ class DynamicSegments:
             all_recorded = bool(rows) and all(item['recorded_seconds'] > 0 for item in supplies)
             covered = sum(item['recorded_seconds'] for item in supplies) if all_recorded else prepared
             remainder = max(0.0, target - covered)
-            has_intro = any(self.supply(row)['bookends']['intro']['written'] for row in rows)
-            has_outro = any(self.supply(row)['bookends']['outro']['written'] for row in rows)
+            has_intro = any(row.get('book_phase') == 'opening' for row in rows)     # [book-nodes] the node is the fact
+            has_outro = any(row.get('book_phase') == 'closing' for row in rows)
             replace = None
             quote_repair = False
             prior_repairs = [self.source_entry(row) for row in self.g.get('_LARDER', [])
@@ -823,22 +760,20 @@ class DynamicSegments:
                 build_token = build_var.set(contract)
             new = []
             await self.g['dj_banter'](None, bank=True, bank_to=new, render_stream=True,
-                angle=brief, own_material=True, road='banter', lines=max(8, math.ceil(chunk / 15)))
+                angle=brief, own_material=True, road=BOOK_ROADS.get(phase, 'book_read'),   # [book-nodes]
+                lines=max(8, math.ceil(chunk / 15)))
             accepted = []
             for row in new:
                 self.tag(row, contract)
                 why = self.phase_error(row, rows + accepted)
-                if why and self.repair_phase(row, rows + accepted):             # [book-reads-on] mend before refusing
-                    why = self.phase_error(row, rows + accepted)
                 if why:
-                    self.reject_phase(row, why)
-                else:
-                    accepted.append(row)
-                    if phase_retry:
-                        row['phase_replaces'] = phase_retry['dynamic_rejection_id']
-                        for bad in rejected:
-                            if bad.get('book_phase') == phase_retry.get('book_phase') and not bad.get('phase_repaired_by'):
-                                bad['phase_repaired_by'] = str(row.get('sid') or '') or uuid.uuid4().hex
+                    self.note_phase(row, why)                      # [book-nodes] an observation; the part stands
+                accepted.append(row)
+                if phase_retry:
+                    row['phase_replaces'] = phase_retry['dynamic_rejection_id']
+                    for bad in rejected:
+                        if bad.get('book_phase') == phase_retry.get('book_phase') and not bad.get('phase_repaired_by'):
+                            bad['phase_repaired_by'] = str(row.get('sid') or '') or uuid.uuid4().hex
                 if replace is not None:
                     row['book_repair_type'] = 'quotation' if quote_repair else 'duration'
                     row['book_repair_accepted'] = row in accepted
@@ -1233,13 +1168,8 @@ def install(app, g):
             result = await runtime.original['ensure_entry_tinted'](entry, kind, *a, **kw)
             if result and runtime.source_entry(entry).get('dynamic_kind') == 'book_time':
                 why = runtime.phase_error(entry)
-                if why and runtime.repair_phase(entry):                     # [book-reads-on] the tint may have cut the welcome
-                    why = runtime.phase_error(entry)
                 if why:
-                    runtime.reject_phase(entry, why)
-                    runtime.coverage_cache.clear()
-                    runtime.call('_larder_save')
-                    return False
+                    runtime.note_phase(entry, why)                         # [book-nodes] observed, never refused
             return result
         g['ensure_entry_tinted'] = tinted
     if 'segment_chain_stamp' in runtime.original:
