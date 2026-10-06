@@ -403,6 +403,9 @@ def install(app: Any, namespace: dict[str, Any]) -> None:
         except Exception:  # noqa: BLE001
             pass
         book = book_rows([r["sid"] for r in rows])
+        reach = ns("sfx_reachable")
+        if look and callable(reach) and not reach():
+            look = False                    # [sfx-reach] no look for gone files on a share that is away
         for r in rows:
             b = book.get(r["sid"]) or {}
             r["playable"] = bool(b.get("playable")) if b else None

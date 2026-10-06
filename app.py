@@ -87507,6 +87507,109 @@ async def sfxguy_quips_del(
 # PC), and the rotation reads BOTH roots.
 SFX_LOCAL_ROOT = data_path("samples")
 
+# --- [sfx-reach] IS THE COLLECTION THERE? ---------------------------------------
+# "When I plug it up to the spark, I want the database work to continue and for
+#  it to plug back up seamlessly into the system ... In the intermission, I want
+#  it playing H3 / Supercuts if it finds it has issues getting to the clips or
+#  accessing the SFX collection."                     (operator, 2026-10-06)
+#
+# sfx_reach.py asks the one question - stat + listdir of SFX_ROOT/samples_grabbed
+# on a daemon thread, 3 s, one in flight, memoised 20 s, said once each way. The
+# roads below read the memo and never stat a share that is away: the book's
+# draws narrow to the station's own rows, the endless set plays the
+# intermission shelf, the keepers stand down and resume on their own clocks.
+import sfx_reach as _sfx_reach                                          # [sfx-reach]
+
+_sfx_reach.configure(root=SFX_ROOT, log=lambda text: pipeline_log("air", text))
+SFX_REACH_LIKE = str(SFX_ROOT).rstrip("/") + "/%"      # the book's rows of the collection
+
+
+def sfx_reachable() -> bool:
+    """The collection, as of the last probe (at most 20 s old; a stale memo
+    starts the next probe on its own thread). Never blocks, never raises."""
+    try:
+        return _sfx_reach.reachable()
+    except Exception:  # noqa: BLE001 - a broken probe must never stand the library down
+        return True
+
+
+def sfx_reach_under(path: Any) -> bool:
+    """Is this path the collection's? A string test - never a stat."""
+    return _sfx_reach.under(path)
+
+
+def sfx_reach_ok(path: Any) -> bool:
+    """May this path be stat-ed or read right now? The station's own roots
+    always; the collection only while it answers."""
+    return sfx_reachable() or not _sfx_reach.under(path)
+
+
+def sfx_reach_bases() -> tuple:
+    """The roots a folder name resolves against: the share only while it answers."""
+    return (SFX_ROOT, SFX_LOCAL_ROOT) if sfx_reachable() else (SFX_LOCAL_ROOT,)
+
+
+def sfx_reach_hint(sid: str) -> str | None:
+    """The path a clip id stands for, from memory and the book only - no stat."""
+    try:
+        back = _SFX_ID_REVERSE.get(str(sid or ""))
+        if back:
+            return str(back)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        con = sfx_db_reader()
+        with _SFX_DB_LOCK:
+            row = con.execute("SELECT path FROM clips WHERE sid = ? LIMIT 1", (str(sid or ""),)).fetchone()
+        return str(row[0]) if row is not None else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def sfx_reach_blocks(sid: str) -> bool:
+    """503 material: the collection is away and this id is one of its clips -
+    or an id nobody knows, whose lookup would end in a walk of the share."""
+    if sfx_reachable():
+        return False
+    hint = sfx_reach_hint(sid)
+    return hint is None or _sfx_reach.under(hint)
+
+
+def sfx_reach_narrow(pool: Any, names_pool: Any, fresh: Any) -> tuple:
+    """The sting draw sets without the collection: the station's own clips
+    (the SFX guy's H3 renders in sfx_ads, the glued and edited clips, the cuts)."""
+    return ([p for p in (pool or []) if not _sfx_reach.under(p)],
+            [n for n in (names_pool or []) if not _sfx_reach.under(n)],
+            {n for n in (fresh or ()) if not _sfx_reach.under(n)})
+
+
+def sfx_reach_stood_down(road: str) -> None:
+    try:
+        _sfx_reach.stood_down(road)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def sfx_reach_state() -> dict[str, Any]:
+    try:
+        return _sfx_reach.state()
+    except Exception:  # noqa: BLE001
+        return {"reachable": True, "known": False}
+
+
+def sfx_reach_dress(state: dict[str, Any]) -> dict[str, Any]:
+    """A desk reading (/api/sfx/video/mode) carries the reach, and while the
+    collection is away its say line leads with the intermission."""
+    try:
+        reach = sfx_reach_state()
+        state["reach"] = reach
+        state["intermission"] = globals().get("sfx_intermission_state", lambda: {})()
+        if not reach.get("reachable", True):
+            state["say"] = "%s - %s" % (_sfx_reach.say(), str(state.get("say") or ""))
+    except Exception:  # noqa: BLE001
+        pass
+    return state
+
 
 def sfx_folders() -> list[Path]:
     """The folders in play, only the ones that really exist.
@@ -87518,7 +87621,7 @@ def sfx_folders() -> list[Path]:
     names = dj_settings()["sfx_folders"] or list(SFX_DEFAULT_FOLDERS)
     out: list[Path] = []
     for name in names:
-        for base in (SFX_ROOT, SFX_LOCAL_ROOT):
+        for base in sfx_reach_bases():                 # [sfx-reach] the share only while it answers
             try:
                 folder = (base / name).resolve()
                 # A pasted path from anywhere else on disk is not a
@@ -87548,7 +87651,7 @@ def sfx_folders() -> list[Path]:
         wanted = str(name or "").strip().strip("/")
         if not wanted:
             continue
-        for base in (SFX_ROOT, SFX_LOCAL_ROOT):
+        for base in sfx_reach_bases():                 # [sfx-reach] the share only while it answers
             try:
                 root = (base / wanted).resolve()
                 if not root.is_relative_to(base.resolve()) \
@@ -87947,6 +88050,10 @@ def sfx_stamp(path: Path) -> int:  # [#1315]
     held = _SFX_STAT_MEMO.get(key)
     if held is not None and (now - held[0]) < SFX_STAT_TTL_S:
         return held[1]
+    if not sfx_reach_ok(path):
+        # [sfx-reach] the share is away: 0 is the honest answer (see above) and
+        # it is NOT remembered, so the first ask after the share returns pays
+        return 0
     try:
         info = path.stat()
         stamp = int(info.st_mtime_ns) if (info.st_mode & 0o170000) == 0o100000 else 0
@@ -90778,7 +90885,7 @@ def sfx_by_id(wanted: str) -> Path | None:
         back = _SFX_ID_REVERSE.get(wanted)
         if back:
             known = Path(back)
-            if known.is_file():
+            if sfx_reach_ok(known) and known.is_file():      # [sfx-reach] no stat on a dead share
                 return known
     except Exception:  # noqa: BLE001
         pass
@@ -92665,6 +92772,11 @@ def sfx_quarantine(sid: str, why: str, path: Any = None, by: str = "") -> bool:
             return False
     except Exception:  # noqa: BLE001
         return False
+    if not sfx_reach_ok(path):
+        # [sfx-reach] nothing is quarantined while the collection is away: a
+        # 503 on the tube is not a gone file. The keeper resumes with the share.
+        sfx_reach_stood_down("quarantine")
+        return False
     _sfx_quarantine_load()
     folder, folder_gone = "", False
     if path:
@@ -93061,6 +93173,9 @@ def sfx_quarantine_receipts(body: Any) -> int:
         m = re.search(r"/sfx/([a-f0-9]{16})", url)
         sid = str((row or {}).get("sfx") or (m.group(1) if m else ""))
         if not re.fullmatch(r"[a-f0-9]{16}", sid) or sfx_quarantined(sid):
+            continue
+        if sfx_reach_blocks(sid):
+            sfx_reach_stood_down("receipts")  # [sfx-reach] a 503 is not an undecodable clip
             continue
         path = sfx_by_id(sid)
         who = str((row or {}).get("player") or player or "a player")
@@ -93756,6 +93871,10 @@ async def sfx_study_clip(pick: Any, seconds: float = 0.0) -> dict[str, Any]:
     look at its frames if they were never studied. Each on its own road's worker;
     nothing here touches the event loop for long."""
     out: dict[str, Any] = {"path": str(pick), "heard": False, "seen": False}
+    if not sfx_reach_ok(pick):
+        sfx_reach_stood_down("study")       # [sfx-reach] the clip is on a share that is away
+        out["why"] = "the SFX collection is unreachable"
+        return out
     if int(_SFX_UNSEEN.get("busy") or 0) >= SFX_UNSEEN_STUDY_MOST:
         out["why"] = "the study room is full"
         return out
@@ -93869,6 +93988,179 @@ def sfx_video_hourly_rebuild(now: float | None = None) -> bool:
     return True
 
 
+# --- [sfx-reach] THE INTERMISSION ------------------------------------------------
+# "In the intermission, I want it playing H3 / Supercuts if it finds it has
+#  issues getting to the clips or accessing the SFX collection."
+#
+# While the collection is away the endless set rings from a SHELF that does not
+# live on the share - H3 renders and everything else ComfyUI rendered on this
+# box (COMFY_OUTPUT: the hourly videos, the SFX guy's H3 clips in sfx_ads), the
+# saved supercuts (sfx_ads/supercut-*.mp4) and the gallery's reused supercut
+# videos (PRODUCED_ADS_DIR) - through the SAME door (page_picture_append), the
+# same cooldown and no-repeat notes, the same leveller and origin record. The
+# pick is System 3's (sfx.intermission_pick, through norepeat_roll_clip: the
+# day's heard clips struck first, then the die, through the sting ring). The
+# policy, in order: a clip not heard inside the day; else one off its hour
+# cooldown; else any - the intermission never goes dark while the shelf holds
+# a file. The SFX guy's requests stay in their list until the share is back.
+SFX_INTERMISSION_MEMO_S = 120.0
+SFX_INTERMISSION_MOST = 600
+SFX_INTERMISSION_MIN_BYTES = 10000          # a torn render is not a picture
+SFX_INTERMISSION_WHY = "intermission: the SFX collection is unreachable"
+_SFX_INTERMISSION: dict[str, Any] = {"at": 0.0, "shelf": [], "rung": 0, "last": "",
+                                      "how": "", "why": "", "on": False, "entered": 0.0,
+                                      "entries": 0}
+
+
+def _sfx_intermission_kind(path: Path) -> str:
+    low = path.name.lower()
+    if low.startswith("supercut-") or path.parent.name == "supercuts":
+        return "supercut"
+    if path.parent == SFX_ADS_DIR or "h3" in low:
+        return "h3"
+    return "gallery"
+
+
+def sfx_intermission_shelf(fresh: bool = False) -> list[dict[str, Any]]:
+    """The station's own pictures, newest first. Blocking (a stat per file,
+    local disk): a worker's. Memoised SFX_INTERMISSION_MEMO_S."""
+    now = time.time()
+    if (not fresh and _SFX_INTERMISSION.get("shelf")
+            and now - float(_SFX_INTERMISSION.get("at") or 0) < SFX_INTERMISSION_MEMO_S):
+        return list(_SFX_INTERMISSION["shelf"])
+    found: list[dict[str, Any]] = []
+    for base in (COMFY_OUTPUT, PRODUCED_ADS_DIR):
+        try:
+            for dirpath, dirnames, filenames in os.walk(str(base)):
+                dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+                for name in filenames:
+                    if not name.lower().endswith((".mp4", ".webm", ".m4v", ".mov")):
+                        continue
+                    p = Path(dirpath) / name
+                    try:
+                        st = p.stat()
+                    except OSError:
+                        continue
+                    if st.st_size < SFX_INTERMISSION_MIN_BYTES:
+                        continue
+                    found.append({"path": p, "kind": _sfx_intermission_kind(p),
+                                  "mtime": float(st.st_mtime), "bytes": int(st.st_size)})
+        except OSError:
+            continue
+    found.sort(key=lambda r: -float(r["mtime"]))
+    shelf = found[:SFX_INTERMISSION_MOST]
+    _SFX_INTERMISSION.update({"at": now, "shelf": shelf})
+    return list(shelf)
+
+
+def sfx_intermission_pick(shelf: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """The policy, explicit: fresh (not heard inside the day, System 3's die
+    through the sting ring), else rested (off the hour cooldown), else any."""
+    if not shelf:
+        return None
+    by_path = {str(r["path"]): r for r in shelf}
+    paths = [Path(str(r["path"])) for r in shelf]
+    question = "which of the station's own pictures the intermission shows (H3 renders, supercuts, gallery videos)"
+    pick, how = None, "fresh"
+    try:
+        pick = norepeat_roll_clip(paths, "sfx.intermission_pick", question, road="intermission")
+        if pick is not None and sfx_video_on_cooldown(sfx_id(pick)):
+            pick = None
+    except Exception:  # noqa: BLE001 - a die that fails is not a dark tube
+        pick = None
+    if pick is None:
+        try:
+            rested = [p for p in paths if not sfx_video_on_cooldown(sfx_id(p))]
+        except Exception:  # noqa: BLE001
+            rested = []
+        if rested:
+            pick, how = s3_choice("sfx.intermission_pick", rested, question, tabled=False), "rested"
+    if pick is None:
+        pick, how = s3_choice("sfx.intermission_pick", paths, question, tabled=False), "any"
+    row = dict(by_path.get(str(pick)) or {"path": Path(str(pick)), "kind": _sfx_intermission_kind(Path(str(pick)))})
+    row["how"] = how
+    return row
+
+
+def sfx_intermission_enter() -> None:
+    """The set goes over to the shelf. The collection's clips rung ahead are
+    withdrawn from the ring (the hourly rebuild's own move: future endless
+    rows go, the epoch turns) so the tube is not dark for a runway it cannot
+    fetch; the SFX guy's requests stay in their list for when the share is back."""
+    now_ms = int(time.time() * 1000)
+    ring = _RADIO.setdefault("voice_clips", [])
+    ring[:] = [row for row in ring if not (
+        isinstance(row, dict) and row.get("endless")
+        and int(row.get("broadcast_ms") or row.get("ts") or 0) >= now_ms)]
+    _SFX_CYCLE["shuffle_epoch"] = int(_SFX_CYCLE.get("shuffle_epoch") or 0) + 1
+    _SFX_INTERMISSION.update({"on": True, "entered": time.time(),
+                              "entries": int(_SFX_INTERMISSION.get("entries") or 0) + 1})
+    waiting = len(_SFX_CYCLE.get("requests") or [])
+    for _ in range(waiting):
+        _sfx_reach.defer()
+    pipeline_log("air", "the endless set is in intermission: the station's own pictures (H3 renders, "
+                        "supercuts, gallery videos) until the collection is back%s"
+                        % ((" - %d of the SFX guy's requests wait" % waiting) if waiting else ""))
+
+
+def sfx_intermission_leave() -> None:
+    _SFX_INTERMISSION["on"] = False
+    pipeline_log("air", "the endless set is back on the book - the intermission rang %d clip(s)"
+                 % int(_SFX_INTERMISSION.get("rung") or 0))
+
+
+def sfx_intermission_state() -> dict[str, Any]:
+    return {"on": bool(_SFX_INTERMISSION.get("on")), "rung": int(_SFX_INTERMISSION.get("rung") or 0),
+            "last": str(_SFX_INTERMISSION.get("last") or ""), "how": str(_SFX_INTERMISSION.get("how") or ""),
+            "why": str(_SFX_INTERMISSION.get("why") or ""), "entered": float(_SFX_INTERMISSION.get("entered") or 0),
+            "entries": int(_SFX_INTERMISSION.get("entries") or 0),
+            "shelf": len(_SFX_INTERMISSION.get("shelf") or []),
+            "shelf_at": float(_SFX_INTERMISSION.get("at") or 0),
+            "deferred_requests": len(_SFX_CYCLE.get("requests") or []),
+            "policy": "fresh (not heard inside the day, System 3's die sfx.intermission_pick), "
+                      "else rested (off the hour cooldown), else any - never dark while the shelf has a file"}
+
+
+async def sfx_intermission_turn(now: float, last_end: float) -> dict[str, Any] | None:
+    """One clip of the intermission onto the set's ring: the same door, the
+    same notes, the same leveller - only the shelf differs. The plan entry,
+    or None when nothing has been rendered on this box."""
+    shelf = await asyncio.to_thread(sfx_intermission_shelf)
+    row = (await asyncio.to_thread(sfx_intermission_pick, shelf)) if shelf else None
+    if not row:
+        _SFX_INTERMISSION["why"] = "the shelf is empty - nothing rendered on this box yet"
+        return None
+    pick = Path(str(row["path"]))
+    real = round(float((await asyncio.to_thread(sfx_seconds, pick)) or 0), 2)
+    seconds = sfx_cycle_slot(real)
+    room = max(0.0, last_end - time.time()) - 1.0
+    _lv_path = pick
+    try:
+        _lv_path, _lv_how = await sfx_level_for_air(pick, max(1.5, min(SFX_LEVEL_WAIT, room)))
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001
+        _lv_path = pick
+    key = sfx_id(pick)                    # and the way back: /sfx/<key> serves this file
+    start = max(now, last_end + SFX_CYCLE_GAP)
+    why = "%s - %s" % (SFX_INTERMISSION_WHY, {"h3": "an H3 render", "supercut": "a saved supercut",
+                                             "gallery": "a gallery video"}.get(str(row.get("kind")), "a picture of the station's own"))
+    page_picture_append({
+        "url": "/sfx/%s?t=%s" % (key, media_sign(key)),
+        "sting": pick.stem, "id": key, "seconds": seconds, "length": real,
+        "why": why, "intermission": True, "endless": True},
+        at_ms=int(start * 1000))
+    _set_air = _SFX_CYCLE.setdefault("air", [])
+    _set_air.append({"key": "set|%s|%d" % (key, int(start * 1000)), "air_at": start,
+                     "slot": seconds, "length": real, "path": str(_lv_path)})
+    del _set_air[:-12]
+    sfx_video_note_played(key, pick.parent.name)
+    _origin_wall_note(pick, key, seconds, start, why)
+    _SFX_INTERMISSION.update({"rung": int(_SFX_INTERMISSION.get("rung") or 0) + 1, "last": pick.name,
+                              "how": str(row.get("how") or ""), "why": ""})
+    return {"sting": pick.stem, "start": start, "end": start + seconds, "id": key, "intermission": True}
+
+
 async def sfx_video_cycle() -> None:
     """Keep the set's queue topped up for as long as the mode is on."""
     plan: list[dict[str, Any]] = []          # what has been rung, in order
@@ -93909,6 +94201,29 @@ async def sfx_video_cycle() -> None:
                                    "clip": plan[0]["sting"], "why": ""})
                 await asyncio.sleep(1.0)
                 continue
+            # [sfx-reach] THE INTERMISSION: while the collection is away the set
+            # rings the station's own pictures (see sfx_intermission_turn) and the
+            # SFX guy's requests wait in their list. The book returns on its own.
+            if not sfx_reachable():
+                if not _SFX_INTERMISSION.get("on"):
+                    sfx_intermission_enter()
+                    plan = []
+                    plan_epoch = int(_SFX_CYCLE.get("shuffle_epoch") or 0)
+                    last_end = now
+                _turn = await sfx_intermission_turn(now, last_end)
+                if _turn is None:
+                    _SFX_CYCLE.update({"why": SFX_INTERMISSION_WHY + " and the shelf is empty",
+                                       "queued": len(plan)})
+                    await asyncio.sleep(10.0)
+                    continue
+                plan.append(_turn)
+                _SFX_CYCLE.update({"at": now, "until": plan[-1]["end"],
+                                   "rung": int(_SFX_CYCLE.get("rung") or 0) + 1,
+                                   "clip": plan[0]["sting"], "queued": len(plan),
+                                   "why": SFX_INTERMISSION_WHY})
+                continue
+            if _SFX_INTERMISSION.get("on"):
+                sfx_intermission_leave()
             # #1417: the SFX guy's own clip first, if he has handed one in.
             asked = _SFX_CYCLE.setdefault("requests", [])
             asked_who = ""
@@ -94569,6 +94884,16 @@ def sting_due(after: str = "") -> Path | None:   # [#1251] the line it follows
     pool, names_pool, fresh = _sting_draw_sets()
     if not pool:
         return None
+    if not sfx_reachable():
+        # [sfx-reach] THE STINGS DRAW FROM THE SAME SHELF OR STAND DOWN. The walked
+        # pool still lists the collection for the length of its memo; while the
+        # share is away the draw is the station's own clips - the SFX guy's H3
+        # renders in sfx_ads, the glued and edited clips, the cuts - and when
+        # none is left he is quiet rather than a 503 on the tube.
+        pool, names_pool, fresh = sfx_reach_narrow(pool, names_pool, fresh)
+        if not pool:
+            sfx_reach_stood_down("sting")
+            return None
     # #1366: THE PICTURE SHARE. Before any of the roads below, because
     # this is a question about the POPULATION he draws from, not about
     # which of the three preference roads gets to answer - a fresh clip
@@ -95189,7 +95514,7 @@ def sfx_deck_take() -> Path | None:
         fire_and_forget(asyncio.to_thread(_sfx_deck_fill))
     except Exception:  # noqa: BLE001
         pass
-    if got is not None and got.is_file():
+    if got is not None and sfx_reach_ok(got) and got.is_file():   # [sfx-reach]
         return got
     return None
 
@@ -95206,7 +95531,7 @@ def _sfx_any_video() -> Path | None:
     Unrepeated against the ordinary sting ring, so tapping the button
     twice does not play the same clip twice."""
     pool = [path for path in _sfx_video_pool()
-            if not sfx_video_on_cooldown(sfx_id(path))]
+            if sfx_reach_ok(path) and not sfx_video_on_cooldown(sfx_id(path))]   # [sfx-reach]
     if not pool:
         return None
     # [everything-rolls:gap-video] the day's heard clips struck, then System 3
@@ -178961,6 +179286,16 @@ async def sfx_file(
             str(request.query_params.get("t") or ""), signature)):
         require_auth(authorization)
 
+    # [sfx-reach] NEVER A STAT ON A DEAD SHARE. A clip of the collection - or an
+    # id nobody knows, whose lookup ends in a walk of it - is answered 503 at
+    # once while the collection is away; the station's own clips keep serving.
+    # The surface asks for another on a load error, and the receipt says why.
+    if await asyncio.to_thread(sfx_reach_blocks, sfx_key):
+        sfx_reach_stood_down("sfx-route")
+        return Response(content=_sfx_reach.say().encode("utf-8", "replace"), status_code=503,
+                        media_type="text/plain",
+                        headers={"Retry-After": "20", "Cache-Control": "no-store",
+                                 "X-Pine-Why": "the SFX collection is unreachable"})
     path = await asyncio.to_thread(sfx_by_id, sfx_key)
     if path is None:
         # [sfx-gone] sfx_by_id skips a book row whose file is gone, so the
@@ -183954,7 +184289,8 @@ def sfx_doctor_look() -> dict[str, Any]:
     takes ninety seconds to say the library is still being read is a
     doctor nobody presses twice.
     """
-    share = _sfx_share_facts()
+    share = (_sfx_share_facts() if sfx_reachable()                      # [sfx-reach] no stat on a dead share
+             else {"root": str(SFX_ROOT), "present": None, "unreachable": True, "reach": sfx_reach_state()})
     # #1361c: THE DOCTOR DOES NOT WALK THE SHARE. The first cut counted
     # the files in every named folder with iterdir() + is_file() - a
     # stat per file over CIFS, 82,159 of them - and measured against the
@@ -183987,6 +184323,7 @@ def sfx_doctor_look() -> dict[str, Any]:
         # #1362b: the book is what a tap actually draws from now, so
         # it is the first number worth reading, not the last.
         "book": sfx_db_counts(),
+        "reach": sfx_reach_state(),                                         # [sfx-reach]
         "book_scan": dict(_SFX_DB_SCAN),
     }
 
@@ -183994,6 +184331,18 @@ def sfx_doctor_look() -> dict[str, Any]:
     # #1362b: the book outranks every other reading, because when the
     # book is full the button works whatever the share is doing - and
     # when it is empty, nothing else being healthy will help.
+    if not sfx_reachable():                                                 # [sfx-reach]
+        out["verdict"] = _sfx_reach.say()
+        out["steps"] = [
+            "the clip book is kept as it is - nothing is forgotten, quarantined or re-walked while the collection is away",
+            "the endless set rings the station's own pictures (H3 renders, saved supercuts, gallery videos); "
+            "the stings draw from the SFX guy's own clips or stand down",
+            "on the host: mount | grep samples ; findmnt /home/ehm_eckx/samples ; ls /home/ehm_eckx/samples/samples_grabbed | head",
+            "a mount made under the bind after the container started is not seen inside it: "
+            "docker compose up -d --force-recreate spark-agent (see docs/sfx-migration.md)",
+            "the set returns to the book on its own when the share answers; GET /api/sfx/reach?fresh=1 probes now"]
+        out["cure"] = "mount"
+        return out
     if out["book"].get("video_playable"):
         out["verdict"] = ("the clip book holds %d video clip(s) - taps are instant"
             % out["book"]["video_playable"])
@@ -184446,6 +184795,9 @@ def sfx_db_pick_short_video(max_seconds: float,
         ceiling = max(0.5, min(12.0, float(max_seconds)))
         where = "playable = 1 AND video = 1 AND seconds BETWEEN 0.5 AND ? AND deck_cycle < ?"
         args: tuple[Any, ...] = (ceiling, sfx_video_rotation_cycle())
+        if not sfx_reachable():              # [sfx-reach] the station's own rows while the share is away
+            where += " AND path NOT LIKE ?"
+            args += (SFX_REACH_LIKE,)
         pin = sfx_pin_prefix()
         if pin:
             where += " AND path LIKE ?"
@@ -184640,6 +184992,9 @@ def sfx_db_pick_rotation_row(video: bool = True, _unrolled: bool = False,
             for avoid in ([recent, []] if recent else [[]]):
                 where = "playable = 1 AND video = ? AND deck_cycle < ?"
                 args: tuple[Any, ...] = (want, cycle)
+                if not sfx_reachable():      # [sfx-reach] the station's own rows while the share is away
+                    where += " AND path NOT LIKE ?"
+                    args += (SFX_REACH_LIKE,)
                 if unseen:                                                # [unseen-video] never categorised
                     where += " AND (said_at IS NULL OR seen_desc_at IS NULL)"
                 if _fold:                                                 # [s3-wall-folder:where]
@@ -184819,6 +185174,9 @@ def _sfx_db_pick_any(video: bool = True,
         for win in windows:
             where = "playable = 1 AND video = ?"
             args: tuple = (want,)
+            if not sfx_reachable():          # [sfx-reach] the station's own rows while the share is away
+                where += " AND path NOT LIKE ?"
+                args = args + (SFX_REACH_LIKE,)
             if win:
                 where += " AND seconds BETWEEN ? AND ?"
                 args = (want, win[0], win[1])
@@ -184893,6 +185251,12 @@ def sfx_db_index(limit_seconds: float = 0.0) -> dict[str, Any]:
         banned = sfx_bans() | sfx_superseded()
         for ix, folder in enumerate(folders):
             _SFX_DB_SCAN.update({"folder": folder.name, "done": ix})
+            if not sfx_reach_ok(folder):
+                # [sfx-reach] the walk skips the collection while it is away
+                # (nothing is deleted by a walk; the rows stay as they were)
+                sfx_reach_stood_down("walk")
+                _SFX_DB_SCAN["why"] = "the SFX collection is unreachable - its folders wait for the next walk"
+                continue
             if limit_seconds and time.time() - started > limit_seconds:
                 _SFX_DB_SCAN["why"] = "stopped at the time limit"
                 break
@@ -185224,6 +185588,12 @@ def _sfx_reconcile_scan(most: int = 400000) -> dict[str, Any]:
     row, and the share is slow enough to have caused dead air before."""
     out: dict[str, Any] = {"checked": 0, "gone": [], "arrived": [],
                            "moved": [], "folders_gone": []}
+    if not sfx_reachable():
+        # [sfx-reach] a sweep over a share that is away would call every row
+        # gone. It waits; the operator asks again when the share is back.
+        sfx_reach_stood_down("reconcile")
+        out["why"] = "the SFX collection is unreachable - nothing checked, nothing called gone"
+        return out
     try:
         con = sfx_db_reader()
         rows = con.execute(
@@ -185649,6 +186019,10 @@ def sfx_vision_column() -> bool:
 async def sfx_vision_bite(most: int = 0) -> dict[str, Any]:
     """Look at a few video clips nobody has looked at yet."""
     if not await asyncio.to_thread(sfx_vision_column):
+        return dict(_SFX_VISION)
+    if not sfx_reachable():
+        sfx_reach_stood_down("vision")      # [sfx-reach] the frames live on the share
+        _SFX_VISION["why"] = "the SFX collection is unreachable - the vision pass waits"
         return dict(_SFX_VISION)
     want = int(most or SFX_VISION_BITE)
     try:
@@ -186580,6 +186954,7 @@ async def sfx_db_api(
     scan = dict(_SFX_DB_SCAN)
     return {"counts": counts, "scan": scan,
             "path": str(SFX_DB_PATH),
+            "reach": sfx_reach_state(),                               # [sfx-reach]
             "ready": bool(counts.get("video_playable")),
             "say": ("%d video clip(s) ready to draw instantly"
                     % counts.get("video_playable", 0)
@@ -186587,6 +186962,24 @@ async def sfx_db_api(
                     "the clip book is still being written"
                     if scan.get("running") else
                     "the clip book is empty - press Rebuild")}
+
+
+@app.get("/api/sfx/reach")
+async def sfx_reach_api(
+    fresh: int = 0,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """[sfx-reach] Is the SFX collection there? The memo's answer; `fresh=1`
+    runs a probe now (off the loop, bounded by the probe's own timeout)."""
+    require_read_auth(authorization)
+    if fresh:
+        await asyncio.to_thread(_sfx_reach.probe, True)
+    got = sfx_reach_state()
+    got["intermission"] = sfx_intermission_state()
+    got["policy"] = ("one stat + listdir of %s/samples_grabbed on its own thread, %.0f s, one in flight, "
+                     "memoised %.0f s; late or failed = unreachable; said once each way"
+                     % (SFX_ROOT, float(got.get("timeout_s") or 0), float(got.get("memo_s") or 0)))
+    return got
 
 
 @app.post("/api/sfx/db/rebuild")
@@ -187100,6 +187493,8 @@ def sfx_db_path_of(sid: str) -> Path | None:
         if row is None:
             return None
         found = Path(str(row[0]))
+        if not sfx_reach_ok(found):
+            return None                      # [sfx-reach] the share is away: not a stat, not a verdict
         return found if found.is_file() else None
     except Exception:  # noqa: BLE001
         return None
@@ -187114,6 +187509,9 @@ def _sfx_gone_from_book(sid: str) -> bool:
     row = con.execute("SELECT path FROM clips WHERE sid = ? AND playable = 1 LIMIT 1",
                       (str(sid or ""),)).fetchone()
     if row is None:
+        return False
+    if not sfx_reach_ok(row[0]):
+        sfx_reach_stood_down("sfx-gone")     # [sfx-reach] no verdict on a share that is away
         return False
     from sfx_library import file_state
     if file_state(row[0], (SFX_ROOT, SFX_LOCAL_ROOT)) != "gone":
@@ -188188,7 +188586,7 @@ async def sfx_video_mode_get_api(
     # reads the clip book (sqlite, under its own lock) and the sting
     # history file, 2-5 s on a busy disk, on the loop the mixer rides.
     # Same dict, made on a thread.
-    return await asyncio.to_thread(sfx_video_mode_state)
+    return sfx_reach_dress(await asyncio.to_thread(sfx_video_mode_state))   # [sfx-reach]
 
 
 @app.post("/api/sfx/video/mode")

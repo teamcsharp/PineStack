@@ -163,6 +163,9 @@ def install(app: Any, namespace: dict[str, Any]) -> None:
         gate = ns("_OLLAMA_GATE")
         if gate is not None and gate.locked():
             return "the model is busy"
+        reach = ns("sfx_reachable")
+        if callable(reach) and not reach():
+            return "the SFX collection is unreachable"    # [sfx-reach] the frames live on the share
         return ""
 
     async def look(path: str, seconds: float) -> list[dict[str, Any]]:
