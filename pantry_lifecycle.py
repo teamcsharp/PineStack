@@ -171,12 +171,27 @@ class PantryLifecycle:
         starts = max(self.clock()+5, float((self.host.get("_PAGE_AIR_UNTIL") or [0])[0]), float(self.call("playout_floor", default=0) or 0))
         duration = float(self.call("cupboard_row_seconds",kind,row,default=0) or 0)
         return duration > 0 and starts+duration+5 <= min(float(window.get("deadline") or 0), self.deadline(kind,row))
+    def out_of_turn(self, kind, row):
+        """[bank-first] A never-aired round past the cupboard's dial may go out OUTSIDE its entry on any
+        road the station opens out of turn (RESCUE_ROADS_OPEN) - the sweep's own rule, which this pick
+        had replaced with "inside its entry only": 304 overdue rounds stood while it answered
+        "nothing unheard is past the dial and airable"."""
+        try:
+            if kind not in (self.host.get("RESCUE_ROADS_OPEN") or ()) or self.evergreen(row): return False
+            if int(row.get("aired") or 0) > 0 or float(row.get("aired_at") or 0) > 0: return False
+            after = float(self.call("cupboard_unheard_after", default=7200) or 7200)
+            now = self.clock()
+            if now - float(row.get("at") or entry_of(row).get("at") or now) <= after: return False
+            return self.deadline(kind, row) > now + 30
+        except Exception:
+            return False
     def pick(self):
         now = self.clock(); pool = []
         for kind,row in self.rows():
             m = row.get("pantry_lifecycle") or {}
             if (self.unavailable(kind,row) or self.busy(row) or float(m.get("lease_until") or 0)>now or float(m.get("retry_at") or 0)>now
-                    or not self.call("dialogue_row_ready",kind,row,default=False) or not self.compatible(kind,row)):
+                    or not self.call("dialogue_row_ready",kind,row,default=False)
+                    or not (self.compatible(kind,row) or self.out_of_turn(kind,row))):   # [bank-first]
                 continue
             if not self.evergreen(row) and now-float(row.get("at") or now)<120: continue
             pool.append((kind,row))

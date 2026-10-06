@@ -159,6 +159,24 @@ class GazetteReview:
         pos = (self.g.get("_RADIO") or {}).get("sched_pos") or {}
         return str(pos.get("occurrence") or "") or str(slot.get("id") or "") + "@" + str(pos.get("started") or 0)
 
+    def banked(self, receipt):
+        """[bank-first] A finished review round on the shelf written for this edition, oldest first."""
+        edition = str((receipt or {}).get("edition") or "")
+        ready = self.g.get("dialogue_row_ready")
+        busy = self.g.get("_READY_SHELF_BUSY") or set()
+        best = None
+        for row in list((self.g.get("_SHELF") or {}).get(gazette_review.KIND) or []):
+            if not isinstance(row, dict) or id(row) in busy or row.get("aired_at") or int(row.get("aired") or 0):
+                continue
+            entry = row.get("entry") if isinstance(row.get("entry"), dict) else row
+            if str(((entry.get("gazette_review") or {}).get("edition")) or "") != edition:
+                continue
+            if callable(ready) and not ready(gazette_review.KIND, row):
+                continue
+            if best is None or float(row.get("at") or 0) < float(best.get("at") or 0):
+                best = row
+        return best
+
     async def cast(self, receipt, kw):
         participant = receipt.get("participant")
         if participant == "manager":
@@ -228,6 +246,16 @@ def install(app, g):
             receipt = await asyncio.to_thread(runtime.receipt, occurrence)
             if not receipt:
                 return []
+            if not kw.get("bank"):                      # [bank-first] the kitchen's review of this edition first
+                banked = runtime.banked(receipt)
+                door = g.get("_ready_shelf_air")
+                if banked is not None and door is not None:
+                    try:
+                        said = await door(gazette_review.KIND, (g.get("_RADIO") or {}).get("now"), pick=banked)
+                    except Exception:  # noqa: BLE001
+                        said = []
+                    if said:
+                        return said
             angle = str(kw.get("angle") or "")
             expanded = gazette_review.expand_fields([angle or gazette_review.PROMPT], [], g["s3_weighted"], receipt=receipt)
             kw.update(angle=expanded["texts"][0] + "\n" + gazette_prompt.phrase(receipt["article"]) + "\n" + receipt["prompt"],

@@ -18721,7 +18721,7 @@ def retire_state() -> dict[str, Any]:
 # longer than the dial allows. Content in the cupboard is there to be
 # used; if it is not used it should be replaced, and neither can happen
 # while nothing ever takes it off the shelf.
-CUPBOARD_UNHEARD_HOURS = float(os.getenv("PINE_UNHEARD_HOURS", "2"))
+CUPBOARD_UNHEARD_HOURS = float(os.getenv("PINE_UNHEARD_HOURS", "0.25"))   # [bank-first] a quarter hour, was 2 h
 CUPBOARD_UNHEARD_EVERY = float(os.getenv("PINE_UNHEARD_EVERY", "420"))
 _UNHEARD_AT = [0.0]
 _UNHEARD_LOG: list[dict[str, Any]] = []
@@ -19416,7 +19416,7 @@ def unheard_pick() -> tuple[str, dict[str, Any] | None, float]:
         for kind in RESCUE_ROADS_OPEN:
             if unheard_road_out(kind, now):                  # [road-backoff]
                 continue
-            for row in shelf_rows(kind):
+            for row in road_source(kind):                      # [bank-first] the larder is banter's shelf
                 if not isinstance(row, dict) or not row_unaired(row):
                     continue
                 age = now - float(row.get("at") or now)
@@ -19985,6 +19985,87 @@ async def _unheard_until_handoff(coro: Any,
             waiter.cancel()
 
 
+def unheard_out_of_turn(kind: str) -> bool:
+    """[bank-first] Is a round of this road going out OUTSIDE its own entry? Then it
+    takes the rescue door (no running-order window), lifecycle or not.
+
+    With the lifecycle on, the sweep passed rescue=False so a bound round would
+    honour its occurrence - right inside the entry, wrong for the sweep's own
+    out-of-turn pick, which the window then refused as "standing on somebody
+    else's slot"."""
+    lifecycle = _pantry_lifecycle()
+    if not (lifecycle and lifecycle.enabled):
+        return True
+    try:
+        window = _ready_slot_window(kind) or {}
+        return str(window.get("kind") or "") != str(kind)
+    except Exception:  # noqa: BLE001
+        return True
+
+
+def larder_oldest_ready() -> dict[str, Any] | None:
+    """[bank-first] The longest-waiting never-aired banter round that can air now."""
+    best, age, now = None, -1.0, time.time()
+    for e in _LARDER:
+        if not isinstance(e, dict) or id(e) in _READY_SHELF_BUSY or not row_unaired(e):
+            continue
+        if not dialogue_row_ready("banter", e):
+            continue
+        waited = now - float(e.get("at") or now)
+        if waited > age:
+            best, age = e, waited
+    return best
+
+
+async def larder_round_air(entry: dict[str, Any], track: dict[str, Any] | None = None,
+                           on_handoff: Any = None) -> list[str]:
+    """[bank-first] Put ONE banked banter round on the air out of turn.
+
+    The live banter road serves off the larder with this bookkeeping (aired,
+    innings, retire or rest at the end, save) and then _banter_air; the sweep
+    and the dead-air rescue had no such door - banter is the road with the
+    most material and the only one whose shelf is the larder."""
+    try:
+        at = next(i for i, e in enumerate(_LARDER) if e is entry)
+    except StopIteration:
+        return _banter_no("the larder round left the shelf before it could air")
+    if not dialogue_row_ready("banter", entry):
+        return _banter_no("the larder round is not ready to air")
+    at, replay = larder_reair_gate(at)
+    entry = _LARDER[at] if at >= 0 else None
+    if not isinstance(entry, dict):
+        return _banter_no("the re-air gate kept the larder round off")
+    if replay:
+        entry["_s3_replay"] = replay
+    else:
+        entry.pop("_s3_replay", None)
+    entry["aired_at"] = time.time()
+    entry["aired"] = int(entry.get("aired") or 0) + 1
+    entry["used_by"] = stock_used_by()                                   # #1068
+    entry["expires_at"] = stock_expires_at("banter", entry)
+    if repeat_safe("banter", entry):
+        if (int(entry["aired"]) < row_innings("banter", entry)
+                or not retire_may("banter", entry,
+                                  "its innings are used (%d airings)" % int(entry["aired"]))):
+            _LARDER[:] = _LARDER[:at] + _LARDER[at + 1:] + [entry]
+        else:
+            _LARDER.pop(at)
+    elif retire_may("banter", entry, "not safe to repeat: it names the hour it was made"):
+        _LARDER.pop(at)
+    else:
+        _LARDER[:] = _LARDER[:at] + _LARDER[at + 1:] + [entry]
+    try:
+        _INVENTORY_PLAN["at"] = 0.0
+        _COMMITS["at"] = 0.0
+    except Exception:  # noqa: BLE001
+        pass
+    _larder_save()
+    pipeline_log("air", "a banked banter round goes out of turn off the larder "
+                        "(%d left) [bank-first]" % len(_LARDER))
+    gap_round_flag("banked")                                             # #1022
+    return await _banter_air(entry, track, on_handoff=on_handoff)
+
+
 async def unheard_stock_air(force: bool = False) -> str:
     """#1260: THE STANDING CONSUMER. Put the longest-unheard finished round
     on the air, out of turn, because nothing else ever will.
@@ -20141,10 +20222,15 @@ async def unheard_stock_air(force: bool = False) -> str:
         said = await _unheard_until_handoff(
             _unheard_produced_ad_air(
                 row, force=urgent, on_handoff=account_handoff), handed, row)
+    elif kind == "banter":
+        # [bank-first] the larder's own transport: a banter row handed to the shelf door was refused
+        # ("the shelf would not give up the row that was picked") because its shelf is the larder.
+        said = await _unheard_until_handoff(
+            larder_round_air(row, _RADIO.get("now"), on_handoff=account_handoff), handed, row)
     else:
         said = await _unheard_until_handoff(
             _ready_shelf_air(
-                kind, _RADIO.get("now"), rescue=not bool(_pantry_lifecycle() and _pantry_lifecycle().enabled), pick=row, force=urgent,
+                kind, _RADIO.get("now"), rescue=unheard_out_of_turn(kind), pick=row, force=urgent,
                 on_handoff=account_handoff), handed, row)
     if handed.is_set():
         return kind
@@ -63874,7 +63960,11 @@ DEAD_AIR_RESCUE_REST = 45.0
 # Recap stays shut and the operator agreed: no shelf_take("recap") exists
 # anywhere, and its rows' audio has already been swept.
 RESCUE_ROADS_OPEN = ("manager", "gallery", "news", "caller",
-                     "ad", "station_id")
+                     "ad", "station_id",
+                     # [bank-first] "nothing in the cupboard that sits there and gets no play": the
+                     # gazette review and banter go out of turn too. Not mixtape - its intro belongs to
+                     # the tape that is on - and not supercut_react, which answers one supercut.
+                     "gazette_review", "banter")
 # #1221: THE ARREARS BOOK IS WIDER THAN THE RESCUE.
 #
 # RESCUE_ROADS_OPEN answers "what may interrupt a silence". This answers
@@ -63910,7 +64000,7 @@ def dead_air_stock() -> dict[str, int]:
             # fail the takes test and 126 aired a median of 20 hours ago,
             # it reported 126 available while shelf_take would serve
             # none. That is precisely the over-report #1165 removed.
-            if rows and _ready_shelf_row(kind, rescue=True) is None:
+            if rows and kind != "banter" and _ready_shelf_row(kind, rescue=True) is None:   # [bank-first]
                 continue
             if rows:
                 out[kind] = len(rows)
@@ -63957,8 +64047,12 @@ async def dead_air_rescue(quiet: float, why: str = "") -> str:
         if kind not in stock:
             continue
         try:
-            said = await _ready_shelf_air(kind, _RADIO.get("now"),
-                                          rescue=True)
+            if kind == "banter":                                   # [bank-first] the larder's transport
+                _oldest = larder_oldest_ready()
+                said = await larder_round_air(_oldest, _RADIO.get("now")) if _oldest else []
+            else:
+                said = await _ready_shelf_air(kind, _RADIO.get("now"),
+                                              rescue=True)
         except Exception as exc:  # noqa: BLE001
             pipeline_log("drop", "the %s cupboard refused the rescue: %s"
                          % (kind, type(exc).__name__))
@@ -100557,8 +100651,11 @@ def _ready_slot_window(kind: str) -> dict[str, Any] | None:
             or not schedule_read().get("enabled", True)):
         return None
     slot_id = str(slot.get("id") or "")
-    road = str(SCHED_PREP_KIND.get(str(slot.get("kind") or ""))
-               or slot.get("kind") or "")
+    _slot_kind = str(slot.get("kind") or "")
+    # [bank-first] a shelf keyed by the slot's own kind (gazette_review) is in turn during that slot;
+    # the prep map answered "banter" for it, so its banked rounds were never in turn anywhere.
+    road = (_slot_kind if _slot_kind == str(kind)
+            else str(SCHED_PREP_KIND.get(_slot_kind) or _slot_kind))
     occurrence = str(pos.get("occurrence") or "") or "|".join(
         str(pos.get(field) or "") for field in
         ("preset", "hour", "index", "slot_id", "started"))
@@ -106017,6 +106114,29 @@ def mixtape_as_track(path: Path) -> dict[str, Any]:
     }
 
 
+def mixtape_banked_intro(tape: dict[str, Any] | None) -> dict[str, Any] | None:
+    """[bank-first] A finished mixtape round on the shelf that fits this tape: one
+    whose script names its title, else one that names no tape at all; oldest
+    first. The intro is written around the title ("It is {title} and it goes on
+    RIGHT NOW"), so a banked intro for another tape must not be read over this
+    one."""
+    title = str((tape or {}).get("title") or "")
+    named: list[dict[str, Any]] = []
+    plain: list[dict[str, Any]] = []
+    for row in road_source("mixtape"):
+        if not isinstance(row, dict) or id(row) in _READY_SHELF_BUSY or not row_unaired(row):
+            continue
+        if not dialogue_row_ready("mixtape", row):
+            continue
+        script = str((dialogue_entry(row) or {}).get("script") or "")
+        if title and title in script:
+            named.append(row)
+        elif "MX tape" not in script:
+            plain.append(row)
+    pool = named or plain
+    return min(pool, key=lambda r: float(r.get("at") or 0)) if pool else None
+
+
 def mixtape_pick() -> dict[str, Any] | None:
     """One tape, never the one just played, as a track the show can put on.
 
@@ -106031,6 +106151,12 @@ def mixtape_pick() -> dict[str, Any] | None:
             tape_media(tape)            # warm it for next time
     ready = [p for p in tapes if tape_ready(p)]
     pool = ready or tapes
+    try:                                                     # [bank-first] a tape with a banked intro goes first
+        _with_intro = [p for p in pool if mixtape_banked_intro({"title": mixtape_title(p)}) is not None]
+        if _with_intro:
+            pool = _with_intro
+    except Exception:  # noqa: BLE001
+        pass
     # Cycle through EVERY tape before any repeats (#546): hold back all but
     # one, so the rotation only comes back around once the whole shelf has
     # aired — not after the last six.
@@ -106107,6 +106233,15 @@ async def dj_mixtape_intro(tape: dict[str, Any]) -> list[str]:
 
     Seeded from the speakbox like everything else they adore, and delivered
     glowing — he is the one artist the pair have no cynicism about (#239)."""
+    _banked = mixtape_banked_intro(tape)                   # [bank-first] the kitchen's intro for this tape first
+    if _banked is not None:
+        try:
+            _said = await _ready_shelf_air("mixtape", tape, rescue=True, pick=_banked)
+        except Exception as exc:  # noqa: BLE001
+            pipeline_log("drop", "the mixtape shelf refused its banked intro: %s" % type(exc).__name__)
+            _said = []
+        if _said:
+            return _said
     seed = await speakbox_quote()
     aside = (
         (" Work these lines in WORD FOR WORD as your own while you gush, "
@@ -185262,6 +185397,8 @@ _SFX_MATCH: dict[str, Any] = {
     "rows": 0, "ms": 0, "stats": {}, "kicks": 0,
     "picks": 0, "matched": 0, "fell_back": 0}
 _SFX_MATCH_THREAD: list[Any] = [None]
+_SFX_MATCH_TIMER: list[Any] = [None]                           # [match-coalesce] the one deferred rebuild
+SFX_MATCH_REBUILD_EVERY = float(os.getenv("PINE_SFX_MATCH_REBUILD_EVERY", "900"))   # [match-coalesce]
 _SFX_MATCH_RING: list[dict[str, Any]] = []
 # The reason the last matched sting draw gave. sting_due() returns a
 # Path like it always has - every one of its five callers reads a Path
@@ -185817,6 +185954,22 @@ def sfx_match_kick(force: bool = False) -> bool:
     thread = _SFX_MATCH_THREAD[0]
     if thread is not None and thread.is_alive():
         return False
+    if not force:
+        # [match-coalesce] at most one rebuild a quarter hour: 161 rebuilds in three hours, 4-123 s
+        # of Python each, held the GIL from the loop (the endless cycle froze, the API timed out).
+        # A kick inside the rest is counted and ONE daemon timer rebuilds when the rest ends.
+        _since = time.time() - float(_SFX_MATCH.get("at") or 0)
+        if _since < SFX_MATCH_REBUILD_EVERY:
+            _SFX_MATCH["coalesced"] = int(_SFX_MATCH.get("coalesced") or 0) + 1
+            _SFX_MATCH["wanted_at"] = time.time()
+            _timer = _SFX_MATCH_TIMER[0]
+            if _timer is None or not _timer.is_alive():
+                from threading import Timer as _Timer
+                _timer = _Timer(max(1.0, SFX_MATCH_REBUILD_EVERY - _since), sfx_match_kick)
+                _timer.daemon = True
+                _SFX_MATCH_TIMER[0] = _timer
+                _timer.start()
+            return False
     thread = Thread(target=sfx_match_build, name="sfx-match-index", daemon=True)
     _SFX_MATCH_THREAD[0] = thread
     _SFX_MATCH["kicks"] = int(_SFX_MATCH.get("kicks") or 0) + 1
@@ -186252,6 +186405,8 @@ def sfx_match_state() -> dict[str, Any]:
         "folders": int(stats.get("folders") or 0),
         "folders_named": int(stats.get("folders_with_keywords") or 0),
         "picks": int(_SFX_MATCH.get("picks") or 0),
+        "coalesced": int(_SFX_MATCH.get("coalesced") or 0),   # [match-coalesce] kicks batched into the next rebuild
+        "rebuild_every_s": SFX_MATCH_REBUILD_EVERY,
         "fell_back": int(_SFX_MATCH.get("fell_back") or 0),
         "why": str(_SFX_MATCH.get("why") or ""),
         "recent": list(_SFX_MATCH_RING[-12:]),
