@@ -206897,6 +206897,9 @@ def export_screen_target(lowered: str) -> str:
     return "app" if re.search(r"\bapp\b|desk", said) else "tab"
 
 
+EXPORT_BARE_SECONDS = int(os.getenv("PINE_EXPORT_BARE_SECONDS", "300"))   # [export-bare] "export the broadcast", no window named
+
+
 def parse_export_command(text: str) -> dict[str, Any] | None:
     """#1025: 'save out the last five minutes of rhetoric', 'export the last
     15 minutes', 'grab the last two sentences', 'cut me half an hour of the
@@ -206973,6 +206976,25 @@ def parse_export_command(text: str) -> dict[str, Any] | None:
             if len([w for w in residue.split()
                     if w not in _EXPORT_FILLER]) <= 3:
                 return {"sentences": 6}
+        # [export-bare] "export the broadcast", "export the audio", "export the pine tab broadcast":
+        # no window named. The operator's own meaning - broadcast or audio is the AUDIO of the last
+        # EXPORT_BARE_SECONDS; "<device> broadcast" is that screen's recording of the same span.
+        bare = re.search(
+            _EXPORT_VERB_RX + r"\s+(?:the\s+|my\s+|this\s+|tonight'?s\s+|today'?s\s+)?"
+            r"(?:(?P<device>[a-z][a-z\s-]{0,18}?)\s+)?"
+            r"(?P<subject>broadcast|audio|radio|show|tape|recording|programme|program|"
+            r"rhetoric|dialogue|dialog)\b", lowered)
+        if bare:
+            residue = lowered[:bare.start()] + " " + lowered[bare.end():]
+            residue = re.sub(r"[^a-z ]+", " ", residue)
+            if len([w for w in residue.split()
+                    if w not in _EXPORT_FILLER]) <= 3:
+                device = str(bare.group("device") or "").strip()
+                screen = export_screen_target("of " + device + " " + bare.group("subject")) if device else ""
+                if screen:
+                    return {"seconds": EXPORT_BARE_SECONDS, "screen": screen}
+                if not device or device in ("whole", "full", "entire", "live", "current"):
+                    return {"seconds": EXPORT_BARE_SECONDS, "kind": "talk"}
         return None
     if not got.group("subject") and any(
             str(got.group("verb") or "").startswith(v)
