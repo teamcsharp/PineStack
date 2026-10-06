@@ -1,5 +1,5 @@
-/* PineViz bundle 051505b5c363 - built by tools/pineviz_bundle.py from desktop/renderer/pipviz; edit the sources, not this file. */
-/* pineviz-build:051505b5c363 */
+/* PineViz bundle 91888738b581 - built by tools/pineviz_bundle.py from desktop/renderer/pipviz; edit the sources, not this file. */
+/* pineviz-build:91888738b581 */
 /* ---- core/PineViz.js ---- */
 /* PineViz - the Pine PiP's living background. One telemetry road, ten visual environments.
  *
@@ -1732,10 +1732,14 @@
           : new THREE.MeshPhongMaterial({ color: new THREE.Color(p.secondary), specular: new THREE.Color(p.accent), shininess: 160, transparent: true, opacity: .55, side: THREE.DoubleSide, emissive: new THREE.Color(p.primary), emissiveIntensity: .15 });
         m.onBeforeCompile = shader => {
           Object.assign(shader.uniforms, uniforms);
-          shader.vertexShader = displace + shader.vertexShader.replace('#include <begin_vertex>', `vec3 transformed = pv_displace(position);
+          shader.vertexShader = shader.vertexShader.replace('#include <common>', '#include <common>\n' + displace + '\n').replace('#include <begin_vertex>', `vec3 transformed = pv_displace(position);
             vec3 dx = pv_displace(position + vec3(0.08, 0.0, 0.0)) - transformed; vec3 dy = pv_displace(position + vec3(0.0, 0.08, 0.0)) - transformed;`)
             .replace('#include <beginnormal_vertex>', 'vec3 objectNormal = normal;')
-            .replace('#include <defaultnormal_vertex>', `vec3 pvN = normalize(cross(dx, dy)); vec3 transformedNormal = normalMatrix * pvN; #ifdef FLIP_SIDED transformedNormal = -transformedNormal; #endif`);
+            .replace('#include <defaultnormal_vertex>', `vec3 pvN = normalize(cross(dx, dy)); vec3 transformedNormal = normalMatrix * pvN;
+#ifdef FLIP_SIDED
+            transformedNormal = -transformedNormal;
+#endif
+`);
         };
         m.customProgramCacheKey = () => 'pineviz-liquid-' + (high ? 'hi' : 'lo');
         return m;
@@ -1759,7 +1763,7 @@
           mat = glassMaterial(p, high);
           membrane = new THREE.Mesh(new THREE.PlaneGeometry(34, 3.2, high ? 220 : 120, high ? 16 : 8), mat); membrane.frustumCulled = false; membrane.position.z = -2; scene.add(membrane);
           glow = new THREE.Mesh(new THREE.PlaneGeometry(34, 3.2, 60, 2), new THREE.MeshBasicMaterial({ color: new THREE.Color(p.primary), transparent: true, opacity: .12, blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide }));
-          glow.material.onBeforeCompile = shader => { Object.assign(shader.uniforms, uniforms); shader.vertexShader = displace + shader.vertexShader.replace('#include <begin_vertex>', 'vec3 transformed = pv_displace(position); transformed.z -= 0.4;'); };
+          glow.material.onBeforeCompile = shader => { Object.assign(shader.uniforms, uniforms); shader.vertexShader = shader.vertexShader.replace('#include <common>', '#include <common>\n' + displace + '\n').replace('#include <begin_vertex>', 'vec3 transformed = pv_displace(position); transformed.z -= 0.4;'); };
           glow.material.customProgramCacheKey = () => 'pineviz-liquid-glow'; glow.frustumCulled = false; glow.position.z = -2; scene.add(glow);
           lights = [new THREE.PointLight(new THREE.Color(p.accent), 90, 80), new THREE.PointLight(new THREE.Color(p.secondary), 70, 80), new THREE.PointLight(new THREE.Color('#ff7bd5'), 30, 60), new THREE.AmbientLight(new THREE.Color(p.glow), .35)];
           lights[0].position.set(-9, 6, 6); lights[1].position.set(9, -3, 5); lights[2].position.set(0, 5, -6); lights.forEach(l => scene.add(l));
