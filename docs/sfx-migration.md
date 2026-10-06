@@ -258,3 +258,17 @@ levelled copies, the supercut cues). The tool can rewrite the **clip book only**
 (`--apply --i-understand-sids-change`, with a backup first, container stopped) - and leaves
 everything else behind by design, because rewriting a 3 GB vector section and a dozen ledgers
 from a host script is how a station loses a month of the SFX guy's work. Mount at the same path.
+
+## 9. The operator's choices (2026-10-06)
+
+- **Read-write.** The drive is mounted rw: listener uploads (`samples_grabbed/user`), the renamer and future
+  cuts live on it. Keep `uid=1000,gid=1000` ownership (`chown -R 1000:1000`) so the container's user writes.
+- **Only `samples_grabbed` moves.** The drive carries `samples_grabbed/` at `/home/ehm_eckx/samples/samples_grabbed`
+  so every clip path and id stays the same. The station ALSO reads two things off the share outside it, which
+  must stay reachable or be copied beside it:
+  - `Sample Packs/` (`pixabay scratches`, `lounge - sfx`, `DJ_SAPPO_ROLLING_JUNGLE_&_DnB`) - the DJs' stinger packs
+    (app.py SFX_PACKS, ~1038) and the lounge bed (`SFX_ROOT / "Sample Packs" / "lounge - sfx"`).
+  - the MX mixtape folder (`mixtape_folder()`, the `{mxtape}` slot) when it is under the share.
+  Copy those two folders onto the drive as well (same relative paths), or keep the NAS mounted at another path
+  and bind-mount just those folders into `/home/ehm_eckx/samples/` - never leave them dangling.
+- **pineEX** does not depend on the share: its supercut versions go to `data/samples/pineEX` (SFX_LOCAL_ROOT).

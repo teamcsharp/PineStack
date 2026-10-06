@@ -932,6 +932,9 @@ class DynamicSegments:
         if kind == 'book_time':
             rows = self.book_rows(key)
             started = bool(self.last.get(key, {}).get('started'))
+            door = self.last.setdefault(key, {}).setdefault('door', {})          # [book-nodes-7] the door's own ledger
+            door['asked'] = int(door.get('asked') or 0) + 1
+            door['at'] = time.time()
             # [book-reads-on] NEVER NOTHING. The window waited for the whole episode to be ready, which it
             # seldom was (the gates turned most parts away; the writer ran past the window), so the window
             # aired the opening the banter road had leaked and nothing more. Now the episode airs what it HAS,
@@ -960,10 +963,12 @@ class DynamicSegments:
                 elif not candidates:
                     self.log('Book Time window: nothing of the episode is airable yet and nothing can be carried',   # [book-nodes-4]
                              '%d part(s) on the shelf, %d waiting' % (len(rows), len(waiting)))
+                    door.update(said=False, part='', why='nothing airable yet: %d on the shelf, %d waiting' % (len(rows), len(waiting)))
                     return False
                 else:
                     self.log('Book Time window: the episode waits for its welcome - %s is the first part ready'      # [book-nodes-4]
                              % str(candidates[0].get('book_phase') or '?'))
+                    door.update(said=False, part=str(candidates[0].get('book_phase') or '?'), why='waits for its welcome')
                     return False                             # an episode opens with its welcome
             self.carry_from = carry_from
             def accepted():
@@ -975,8 +980,11 @@ class DynamicSegments:
                 said = await self.g['_ready_shelf_air']('banter', track, pick=candidates[0], on_handoff=accepted)
             finally:
                 self.carry_from = ''
-            self.log('Book Time window: %s the %s part%s' % ('aired' if said else 'the door refused',   # [book-nodes-4]
-                     str(candidates[0].get('book_phase') or '?'), (' carried from ' + carry_from) if carry_from else ''))
+            refused = '' if said else str((self.g.get('_READY_SHELF_REFUSED') or [''])[0] or '')   # [book-nodes-7] [shelf-why]
+            door.update(said=bool(said), part=str(candidates[0].get('book_phase') or '?'), why=refused, carried=carry_from)
+            self.log('Book Time window: %s the %s part%s%s' % ('aired' if said else 'the door refused',   # [book-nodes-4]
+                     str(candidates[0].get('book_phase') or '?'), (' carried from ' + carry_from) if carry_from else '',
+                     (' - ' + refused) if refused else ''))
             return bool(said)
         if kind == 'sfx_supercut':
             if not self.call('_schedule_action_pending', kind, occurrence, default=True):
