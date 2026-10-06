@@ -31,7 +31,7 @@
       return '';
     }
     function noteShown(v) { const key = srcOf(v); if (key && key !== 'stream') shownSrc.set(key, { at: Date.now(), left: 0 }); if (shownSrc.size > 200) shownSrc.delete(shownSrc.keys().next().value); }
-    function noteLeft(v) { const key = srcOf(v); const seen = key ? shownSrc.get(key) : null; if (seen) seen.left = Date.now(); }
+    function noteLeftKey(key) { const seen = key ? shownSrc.get(key) : null; if (seen) seen.left = Date.now(); }
     function stopPreview(video) {
       video.autoplay = false; video.loop = false;
       video.muted = true;
@@ -63,7 +63,8 @@
       + '#pine-pip-panel{position:fixed;inset:0;z-index:2147483600;background:rgb(var(--pip-surface,8 23 19));overflow:hidden;display:none}'
       + '#pine-pip-panel>.pip-bg{position:absolute;inset:0;background:radial-gradient(ellipse at 40% 65%,var(--pip-button,#17382c),rgb(var(--pip-surface,8 23 19)) 75%)}'
       + '#pine-pip-panel .pip-logo{position:absolute;left:50%;top:50%;width:8.4%;transform:translate(-50%,-50%);filter:drop-shadow(0 0 24px color-mix(in srgb,var(--pip-accent,#98e9ae) 35%,transparent))}'
-      + '#pine-pip-panel .pip-tile{position:absolute;overflow:hidden;background:rgb(var(--pip-surface,8 23 19));transform-origin:center}'
+      + '#pine-pip-panel .pip-tile{position:absolute;overflow:hidden;background:transparent;transform-origin:center}'
+      + '#pine-pip-panel .pip-tile.painted{background:rgb(var(--pip-surface,8 23 19))}'
       + '#pine-pip-panel .pip-tile canvas{width:100%;height:100%;object-fit:contain}'
       + '#pine-pip-panel .pip-label{position:absolute;left:6px;top:5px;display:none;font:10px system-ui;color:var(--pip-text,#e1f8ea);background:rgb(var(--pip-surface,8 23 19) / .8);padding:2px 5px;border-radius:3px}'
       + '#pine-pip-panel .pip-failure{position:absolute;bottom:28%;left:12%;right:12%;color:var(--pip-text,#e1f8ea);text-align:center;font:12px system-ui}';
@@ -182,9 +183,10 @@
         stopPreview(video);
         return false;
       }
-      if (repeatOf(video)) return false;                                  /* [pip-once] */
       const it = tiles.get(video);
-      if (it && it.lastTime != null && video.currentTime + 1 < it.lastTime && video.currentTime < 2) { it.rewound = true; }   /* [pip-once] it started over */
+      if (!it && repeatOf(video)) return false;                           /* [pip-once] a source already shown is not tiled again */
+      /* [pip-tube] a rewind counts only for the SAME source: the set's one element moves on to the next clip with its clock at zero */
+      if (it && it.lastTime != null && it.srcKey === srcOf(video) && video.currentTime + 1 < it.lastTime && video.currentTime < 2) { it.rewound = true; }
       if (it && it.rewound) return false;
       // A buffering player still owns its last picture. Do not collapse the
       // tile merely because the decoder temporarily has no current frame.
@@ -219,8 +221,11 @@
       const items = [...tiles.values()], count = items.length + otherCount;
       const cols = Math.ceil(Math.sqrt(count)), rows = Math.ceil(count / Math.max(1, cols));
       items.forEach((it, local) => { const i = local + (shell ? otherCount : 0); Object.assign(it.tile.style, { left: (i % cols * 100 / cols) + '%', top: (Math.floor(i / cols) * 100 / rows) + '%', width: (100 / cols) + '%', height: (100 / rows) + '%' }); });
-      logo.style.display = count || shell ? 'none' : ''; background.style.display = count || shell ? 'none' : '';
-      if (viz) { if (count || shell) viz.stop(); else if (enabled) viz.start(); }   /* [pip-viz] a background under tiles is not drawn */
+      /* [pip-tube] the logo and the background step aside only for a tile that has drawn a picture; the
+         living background keeps running underneath, so a tile without a picture never means a blank tube */
+      const covered = items.some(it => it.painted && !it.leaving) || otherCount > 0;
+      logo.style.display = covered || shell ? 'none' : ''; background.style.display = shell ? 'none' : '';
+      if (viz) { if (shell) viz.stop(); else if (enabled) viz.start(); }
       const slots = items.filter(it => !it.leaving).map(it => ({ label: it.label.textContent,
         width: it.video.videoWidth, height: it.video.videoHeight, poster: it.video.poster || it.thumbnail || '',
         source: (it.video.title || it.video.getAttribute('aria-label') || String(it.video.currentSrc || '').split('/').pop().split('?')[0] || 'Live stream').slice(0, 200) }));
@@ -242,11 +247,16 @@
         frame.scan = Math.floor(now / 500);
         media = [...doc.querySelectorAll('audio,video')];
         const videos = new Set(media.filter(v => v.tagName === 'VIDEO' && active(v)));
-        videos.forEach(v => { if (!tiles.has(v)) { add(v); noteShown(v); } else if (tiles.get(v).leaving) { tiles.get(v).leaving = false; transition(tiles.get(v).tile, true); } });
-        tiles.forEach((it, v) => { if (!it.leaving) it.lastTime = v.currentTime; });   /* [pip-once] where each tube's picture stands */
+        videos.forEach(v => { if (!tiles.has(v)) { add(v); noteShown(v); const made = tiles.get(v); if (made) made.srcKey = srcOf(v); } else if (tiles.get(v).leaving) { tiles.get(v).leaving = false; transition(tiles.get(v).tile, true); } });
+        tiles.forEach((it, v) => {
+          if (it.leaving) return;
+          const key = srcOf(v);
+          if (it.srcKey && key && key !== it.srcKey) { noteLeftKey(it.srcKey); it.srcKey = key; it.painted = false; it.tile.classList.remove('painted'); noteShown(v); it.lastTime = null; }   /* [pip-tube] the element moved on to another clip */
+          it.lastTime = v.currentTime;
+        });
         tiles.forEach((it, v) => {
           if (!videos.has(v) && !it.leaving) {
-            it.leaving = true; noteLeft(v);                               /* [pip-once] */
+            it.leaving = true; noteLeftKey(it.srcKey || srcOf(v));         /* [pip-once] the source this tile was for, not whatever the element holds now */
             transition(it.tile, false).then(() => { if (tiles.get(v) === it && it.leaving) { if (it.callback) v.cancelVideoFrameCallback?.(it.callback); it.tile.remove(); tiles.delete(v); layout(); } });
           }
         });
@@ -319,6 +329,7 @@
         const width = Math.max(1, Math.min(v.videoWidth, 960, Math.ceil(it.tile.clientWidth * Math.min(w.devicePixelRatio || 1, 1.5)))), height = Math.round(width * v.videoHeight / Math.max(1, v.videoWidth));
         if (it.canvas.width !== width || it.canvas.height !== height) { it.canvas.width = width; it.canvas.height = height; }
         try { it.ctx.drawImage(v, 0, 0, width, height);
+          if (!it.painted) { it.painted = true; it.tile.classList.add('painted'); layout(); }   /* [pip-tube] a tile is opaque only once it has a picture */
           if (!it.thumbnail && !v.poster) {
             const preview = doc.createElement('canvas'); preview.width = 80; preview.height = Math.max(1, Math.round(80 * height / width));
             try { preview.getContext('2d').drawImage(it.canvas, 0, 0, preview.width, preview.height); it.thumbnail = preview.toDataURL('image/jpeg', .65); layout(); } catch (_) { it.thumbnail = 'unavailable'; }
