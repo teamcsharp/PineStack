@@ -202,6 +202,27 @@ class System2Runtime:
         writer keeps writing and System2 plans over the common inventory."""
         return self.enabled and not bool(self.config.get("legacy_keepers", True))
 
+    def _off_air(self):
+        """[kitchen] paused OR switched off with the kitchen open - the host's
+        off_air() when it has one, radio_paused() otherwise."""
+        fn = getattr(self.host, "off_air", None)
+        try:
+            if callable(fn):
+                return bool(fn())
+        except Exception:
+            pass
+        return bool(self.host.radio_paused())
+
+    def _rooms_open(self):
+        """[kitchen] the show is on, or the kitchen is open behind a stopped show."""
+        fn = getattr(self.host, "rooms_open", None)
+        try:
+            if callable(fn):
+                return bool(fn())
+        except Exception:
+            pass
+        return bool(self.host._RADIO.get("on"))
+
     def fallback_due(self):
         """#1070: may the legacy chain serve the running occurrence?
 
@@ -1198,7 +1219,7 @@ class System2Runtime:
                     if row.get("kind") == "banter" and row.get("ready")
                     and row.get("eligible") and float(row.get("seconds") or 0) > 0)
         floor = max(1, min(4, int(self.config.get("conversation_reserve_floor") or 2)))
-        prefer = ("banter" in kinds and not self.host.radio_paused()
+        prefer = ("banter" in kinds and not self._off_air()          # [kitchen]
                   and ready < floor and not self._conversation_last_priority)
         if prefer:
             job = await asyncio.to_thread(
@@ -1211,7 +1232,7 @@ class System2Runtime:
         job = await asyncio.to_thread(
             self.store.claim_job, "system2-preparer", kinds=kinds,
             lease_seconds=900, lookahead_seconds=lookahead)
-        if not job and not self.host.radio_paused() and self.config["horizon_hours"] > 1:
+        if not job and not self._off_air() and self.config["horizon_hours"] > 1:   # [kitchen]
             job = await asyncio.to_thread(
                 self.store.claim_job, "system2-preparer",
                 kinds=[k for k in ("ad", "gallery") if k in kinds],
@@ -1227,7 +1248,7 @@ class System2Runtime:
         No global cache-full or old commitment-sheet gate can veto this job.
         The actual model and voice providers still enforce shared admission.
         """
-        if not self.enabled or self._prepare_lock.locked() or not self.host._RADIO.get("on"):
+        if not self.enabled or self._prepare_lock.locked() or not self._rooms_open():   # [kitchen]
             return
         h = self.host
         async with self._prepare_lock:
@@ -1251,7 +1272,7 @@ class System2Runtime:
             # Keep the next hour first. Only evergreen ad/gallery work may
             # use spare on-air capacity farther out; news stays near its slot.
             lookahead = 3600
-            if h.radio_paused():
+            if self._off_air():                                  # [kitchen]
                 lookahead = int(self.config["horizon_hours"]) * 3600
             job = await self._claim_preparation(kinds, lookahead)
             if not job:

@@ -7630,7 +7630,7 @@ def resource_brief(since: float | None = None,
 def resource_engine_protected(engine: str, *, keep_cast: bool = True) -> bool:
     if engine_busy(engine, recording_booths()):
         return True
-    return bool(keep_cast and _RADIO.get("on") and engine == host_clone_engine())
+    return bool(keep_cast and rooms_open() and engine == host_clone_engine())   # [kitchen]
 
 
 async def resource_sample() -> dict[str, Any]:
@@ -15833,7 +15833,7 @@ _ENGINE_PREP_BY: dict[str, int] = {}     # one recording booth per engine
 
 def recording_booths() -> dict[str, Any]:
     """Independent engines may bank together; live rendering keeps two slots."""
-    paused = bool(radio_paused())
+    paused = bool(off_air())                                      # [kitchen]
     capacity = max(1, int(ENGINE_BUDGET))
     return {"capacity": capacity, "paused": paused,
             "prep_limit": capacity if paused else max(1, capacity - 2),
@@ -17296,7 +17296,7 @@ def build_lift() -> float:
     The real governors are untouched: the pantry's six-gigabyte allowance
     and prepared_seconds() against the target still bound everything."""
     try:
-        if radio_paused():
+        if off_air():                                             # [kitchen]
             return 3.0
         return 1.0 + 0.5 * float(surplus() or 0)
     except Exception:  # noqa: BLE001
@@ -17326,7 +17326,7 @@ def bank_ahead_hours(road: str = "") -> float:
     nothing on air changes: the deep bank is built only in the time the
     operator set aside for it, and spent on air like any other stock."""
     try:
-        if not radio_paused():
+        if not off_air():                                         # [kitchen]
             return 0.0
         if road and str(road) not in bank_ahead_roads():
             return 0.0
@@ -22617,7 +22617,7 @@ def prepare_work_target_seconds() -> float:
     ceilings: the six-gigabyte allowance and the shelf caps."""
     try:
         base = float(prepare_target_seconds())
-        return base * (build_lift() if radio_paused() else 1.0)
+        return base * (build_lift() if off_air() else 1.0)       # [kitchen]
     except Exception:  # noqa: BLE001
         return prepare_target_seconds()
 
@@ -23057,7 +23057,7 @@ def prep_room_left() -> float:
         #
         # Sized off the deep-work figure so every road on the board fits
         # with margin: the dearest is a bulletin at about 680s.
-        if radio_paused():
+        if off_air():                                             # [kitchen]
             try:
                 return max(900.0, float(prep_deep_seconds() or 0))
             except Exception:  # noqa: BLE001
@@ -23340,12 +23340,12 @@ async def recording_parallel_sitting(pool: list[dict[str, Any]],
     async def booth(engine: str, voices: list[str], offset: int) -> None:
         async with gate:
             for voice in voices:
-                if not radio_paused():
+                if not off_air():                                 # [kitchen]
                     return                 # live work owns its two slots again
                 remaining = max(15.0, float(slice_seconds))
                 pending = pool[offset:] + pool[:offset]
                 finished_here = 0
-                while pending and remaining > 0 and radio_paused():
+                while pending and remaining > 0 and off_air():    # [kitchen]
                     pending = [entry for entry in pending if not entry.get("prepared")]
                     if not pending:
                         break
@@ -23461,7 +23461,7 @@ async def recording_sitting(entries: list[dict[str, Any]],
     # Most rounds finished first, then most lines - so material starts
     # falling out of the sitting early rather than all at the end.
     order = sorted(wanted, key=lambda v: (-closes.get(v, 0), -wanted[v]))
-    if (radio_paused() and len({voice_engine_for(v) for v in order}) > 1):
+    if (off_air() and len({voice_engine_for(v) for v in order}) > 1):   # [kitchen]
         return await recording_parallel_sitting(pool, order, slice_seconds)
     for voice in order:
         if prep_should_stop():
@@ -24119,7 +24119,7 @@ def prep_plan(skip: Any = None) -> dict[str, Any]:
                 order = [_driven] + [k for k in order if k != _driven]
         except Exception:  # noqa: BLE001
             pass
-        if radio_paused():
+        if off_air():                                             # [kitchen]
             try:
                 _needs = hour_needs_now() or {}
                 def _short_of(k: str) -> float:
@@ -24176,7 +24176,7 @@ def prep_plan(skip: Any = None) -> dict[str, Any]:
         # frozen sheet; on air the commitment ledger keeps its authority.
         try:
             _short_now = (set(hour_short_kinds() or ())
-                          if radio_paused() else set())
+                          if off_air() else set())                    # [kitchen]
         except Exception:  # noqa: BLE001
             _short_now = set()
         for kind in order:
@@ -30548,12 +30548,14 @@ def radio_worker_state() -> dict[str, Any]:
         "expected": len(live),
         "running": sum(row.get("state") == "running" for row in live),
         "degraded": sum(row.get("state") in ("failed", "restarting") for row in live),
+        "kitchen": bool((globals().get("_KITCHEN") or {}).get("on")),      # [kitchen]
+        "kitchen_rooms": sum(1 for row in live if row.get("kitchen")),
         "workers": rows,
     }
 
 
 async def _radio_worker(name: str, factory: Any, generation: int,
-                        persistent: bool = True) -> None:
+                        persistent: bool = True, kitchen: bool = False) -> None:
     """Run one named station worker and recover unexpected exits.
 
     A show restart advances ``_RADIO_RUN`` before cancelling old tasks.  That
@@ -30562,7 +30564,7 @@ async def _radio_worker(name: str, factory: Any, generation: int,
     startup/regrade jobs are observed once and then stay complete.
     """
     row = _RADIO_WORKERS[name]
-    while generation == _RADIO_RUN[0] and _RADIO.get("on"):
+    while generation == _RADIO_RUN[0] and (_RADIO.get("on") or kitchen):   # [kitchen]
         row.update(state="running", started=time.time(), next_at=0.0,
                    generation=generation)
         try:
@@ -30580,7 +30582,7 @@ async def _radio_worker(name: str, factory: Any, generation: int,
         if not persistent:
             row["state"] = "failed" if failed else "complete"
             return
-        if generation != _RADIO_RUN[0] or not _RADIO.get("on"):
+        if generation != _RADIO_RUN[0] or not (_RADIO.get("on") or kitchen):   # [kitchen]
             row["state"] = "stopped"
             return
         row["restarts"] = int(row.get("restarts") or 0) + 1
@@ -30594,20 +30596,151 @@ async def _radio_worker(name: str, factory: Any, generation: int,
 
 
 def radio_worker_start(name: str, factory: Any, *,
-                       persistent: bool = True) -> Any:
-    """Launch and register one coroutine owned by the current show."""
+                       persistent: bool = True, kitchen: bool = False) -> Any:
+    """Launch and register one coroutine owned by the current show - or, with
+    `kitchen`, by the kitchen that stays open behind a stopped show."""
     generation = int(_RADIO_RUN[0])
     _RADIO_WORKERS[name] = {
         "generation": generation, "state": "starting", "started": time.time(),
         "persistent": bool(persistent), "restarts": 0, "last_error": "",
-        "last_exit": 0.0, "next_at": 0.0,
+        "last_exit": 0.0, "next_at": 0.0, "kitchen": bool(kitchen),
     }
     task = asyncio.create_task(
-        _radio_worker(name, factory, generation, persistent),
+        _radio_worker(name, factory, generation, persistent, kitchen),
         name=f"radio:{name}")
     _RADIO_WORKERS[name]["task"] = task
     _RADIO_TASK.append(task)
     return task
+
+
+# --- [kitchen] THE ROOMS THAT BUILD THE SHELVES ----------------------------
+# Everything else on the roster is the show itself - the needle, the torrent,
+# the watchdogs, the consumers, the clocks that AIR - and ends with it. These
+# are the writer, the recording room, the pen, the tint repair, the ad studio,
+# the disk allowance and the SFX Guy's study, and the operator's ask
+# (2026-10-06) is that they keep working while the station is switched off:
+# "banking up and working through rolling rule and building up scripts and
+# stacking the covers so that the next time the broadcast comes up ... [it is
+# not] having to rush and create content."
+KITCHEN_IDLE_OFFLOAD_S = float(os.getenv("PINE_KITCHEN_IDLE_OFFLOAD_S", "900"))
+
+
+def kitchen_roster() -> list[tuple[str, Any]]:
+    """[kitchen] Name -> factory, the rooms the kitchen runs with the show off."""
+    return [
+        ("pantry", pantry_keeper),
+        ("larder", larder_keeper),
+        ("flow_release", flow_release_clock),
+        ("tint_recovery", tint_recovery_clock),
+        ("ad_studio", ad_studio_clock),
+        ("sfx_speech", sfx_speech_clock),
+        ("sfx_arrivals", sfx_arrivals_keeper),
+        ("sfx_levels", sfx_levels_keeper),
+        ("speakerbox_index", speakbox_index_clock),
+        ("storage", storage_keeper),
+        ("kitchen", kitchen_watch),
+    ]
+
+
+def kitchen_has_work() -> bool:
+    """[kitchen] Is anything left to bank? Written rounds without their audio,
+    roads the hours are short of, a larder under the pause floor, or the
+    finished-audio target not yet met. Errs on the side of work."""
+    try:
+        if _pause_unfinished_rows():
+            return True
+        if hour_short_kinds():
+            return True
+        if float(prepared_seconds()) < float(prepare_work_target_seconds()):
+            return True
+        _floor = min(int(larder_cap()), int(gap_pause_bank_rounds(dj_settings())))
+        if int(larder_stock_count()) < _floor:
+            return True
+    except Exception:  # noqa: BLE001
+        return True
+    return False
+
+
+def kitchen_start(why: str = "") -> int:
+    """[kitchen] Open the preparation rooms behind a stopped show. Idempotent: a
+    kitchen already open, or a show that is on, is left as it is. radio_stop()
+    closes it (dj_start's roster then runs the same rooms as the show's)."""
+    if _RADIO.get("on") or kitchen_open():
+        return 0
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return 0                        # no loop: nothing to run the rooms on
+    # The shelves the rooms work. Every loader is idempotent (dj_start calls the
+    # same set on every show start), and a kitchen that opened on a cold boot
+    # without them would write a new larder OVER the banked one.
+    for _load in (_larder_load, _dialogue_recovery_load, _pantry_load,
+                  track_talk_load, track_talk_restore_queue, _box_hold_load,
+                  render_backlog_load):
+        try:
+            _load()
+        except Exception as exc:  # noqa: BLE001
+            pipeline_log("drop", f"[kitchen] {getattr(_load, '__name__', 'a loader')} tripped: "
+                                 f"{type(exc).__name__}: {exc}"[:200])
+    _KITCHEN.update({"on": True, "since": time.time(), "why": str(why or ""),
+                     "idle_since": 0.0, "offloaded": 0.0, "rooms": 0})
+    started = 0
+    for name, factory in kitchen_roster():
+        try:
+            radio_worker_start(name, factory, kitchen=True)
+            started += 1
+        except Exception as exc:  # noqa: BLE001
+            pipeline_log("drop", f"[kitchen] {name} would not start: {type(exc).__name__}: {exc}"[:200])
+    _KITCHEN["rooms"] = started
+    if not started:
+        _KITCHEN["on"] = False
+        return 0
+    try:
+        pipeline_log(
+            "lookahead",
+            f"[kitchen] the station is off and the kitchen is open: {started} room(s) keep banking"
+            + (f" - {why}" if why else ""),
+            extra=("WHAT RUNS WITH THE SHOW OFF ([kitchen])\n\n"
+                   + "\n".join(n for n, _f in kitchen_roster())
+                   + "\n\nEvery paused banking bypass (#1108/#1121/#1131/#1134/#1155/#1261/"
+                     "[bank-ahead]/[call-prod]) reads off_air() now, so a stopped station banks "
+                     "exactly as a paused one does. The air rooms stay down: nothing plays, "
+                     "nothing is published. The engines are handed back (#1114) once the "
+                     "kitchen has had nothing to do for %d minutes." % int(KITCHEN_IDLE_OFFLOAD_S // 60)))
+    except Exception:  # noqa: BLE001
+        pass
+    return started
+
+
+async def kitchen_watch() -> None:
+    """[kitchen] Hands the engines back (#1114, OFF means OFF) once the kitchen
+    has had nothing to bank for KITCHEN_IDLE_OFFLOAD_S. Work appearing again -
+    a dial moved, a shelf aired down on the next show - reloads them on the
+    first write, which is what a cold start costs."""
+    while kitchen_open() and not _RADIO.get("on"):
+        await asyncio.sleep(60)
+        try:
+            now = time.time()
+            if kitchen_has_work():
+                _KITCHEN["idle_since"] = 0.0
+                _KITCHEN["offloaded"] = 0.0
+                continue
+            if not float(_KITCHEN.get("idle_since") or 0):
+                _KITCHEN["idle_since"] = now
+                continue
+            if (now - float(_KITCHEN["idle_since"]) >= KITCHEN_IDLE_OFFLOAD_S
+                    and not float(_KITCHEN.get("offloaded") or 0)):
+                _KITCHEN["offloaded"] = now
+                pipeline_log("lookahead",
+                             "[kitchen] the shelves are full and the kitchen has been idle for "
+                             "%d min - handing the engines back (#1114)" % int(KITCHEN_IDLE_OFFLOAD_S // 60))
+                await _fm_off_offload()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            pipeline_log("drop", f"[kitchen] the watch tripped: {type(exc).__name__}: {exc}"[:200])
+
+
 VOICE_CLIP_FEED_KEEP = int(os.getenv("VOICE_CLIP_FEED_KEEP", "2000"))
 # A shared on-air instant gives each listener time to fetch a clip, then seek
 # into the exact same point if its network delivery was late.
@@ -34079,6 +34212,10 @@ def radio_stop() -> None:
     _RADIO.update({"station": "", "queue": [], "now": None, "started": 0.0,
                    "coming": None, "on": False})
     _RADIO_RUN[0] += 1
+    try:
+        _KITCHEN["on"] = False          # [kitchen] its rooms go with this generation
+    except Exception:  # noqa: BLE001
+        pass
     _stopped = time.time()
     for row in _RADIO_WORKERS.values():
         row.update(state="stopped", stopped=_stopped, next_at=0.0)
@@ -45487,7 +45624,7 @@ async def _dialogue_recovery_repair(item: dict[str, Any]) -> bool:
             _DIALOGUE_RECOVERY[:] = [row for row in _DIALOGUE_RECOVERY
                                      if str(row.get("id") or "") != identifier]
         if pantry_window():
-            scope = _PREP_TASK_DEADLINE.set(time.time() + (120.0 if radio_paused() else 45.0))
+            scope = _PREP_TASK_DEADLINE.set(time.time() + (120.0 if off_air() else 45.0))   # [kitchen]
             try:
                 await larder_prepare(entry)
             finally:
@@ -45900,8 +46037,8 @@ async def tint_recovery_step() -> bool:
     """Repair one owed legacy row without depending on a falsely full shelf."""
     # [tint-off] with flow open the pen is not this step's work, so a station that
     # requires no tint has nothing here to walk every six seconds (#1584)
-    if not _RADIO.get("on") or (not dialogue_tint_required()
-                                and (not _DIALOGUE_RECOVERY or s3_flow_is_open())):
+    if not rooms_open() or (not dialogue_tint_required()          # [kitchen]
+                            and (not _DIALOGUE_RECOVERY or s3_flow_is_open())):
         if not crystal_tint_holds():
             _TINT_RECOVERY_STATE["why"] = (
                 "the tint yields to the air (crystal_tint_hold is off); "
@@ -46003,7 +46140,7 @@ async def tint_recovery_step() -> bool:
         # Changed lines reopen the audio plan; unchanged line hashes still hit
         # the existing pantry. The normal admission and deadline gates apply.
         if okay and dialogue_entry(row) is not None and pantry_window():
-            scope = _PREP_TASK_DEADLINE.set(time.time() + (120.0 if radio_paused() else 45.0))
+            scope = _PREP_TASK_DEADLINE.set(time.time() + (120.0 if off_air() else 45.0))   # [kitchen]
             try:
                 await larder_prepare(entry)
             finally:
@@ -47505,11 +47642,11 @@ async def response_bank_clock() -> None:
     await asyncio.sleep(8)
     while True:
         try:
-            if _RADIO.get("on") or radio_paused():
-                await response_bank_prepare(8 if radio_paused() else 2)
+            if rooms_open():                                     # [kitchen]
+                await response_bank_prepare(8 if off_air() else 2)
         except Exception as exc:
             _RESPONSE_WARM_STATE.update(last_at=time.time(), made=0, why=str(exc)[:200])
-        await asyncio.sleep(20 if radio_paused() else 60)
+        await asyncio.sleep(20 if off_air() else 60)
 
 
 @app.on_event("startup")
@@ -49645,7 +49782,7 @@ async def _prep_one_work(kind: str) -> bool:
         # sheet and refused the very pick the board had just made. The
         # board and the door now apply one rule: while the station banks,
         # the hour's own shortfall outranks a frozen sheet.
-        if (not _new_script and radio_paused()
+        if (not _new_script and off_air()                         # [kitchen]
                 and str(kind) in (hour_short_kinds() or [])):
             _new_script = True
         # #1033: THE CALLER FLOOR. "Call-ins are always waiting." Below
@@ -49896,6 +50033,52 @@ def radio_paused() -> bool:
         return False
 
 
+def off_air() -> bool:
+    """[kitchen] Is nobody listening - paused, or switched off with the kitchen open?
+
+    Two switches take the station off the air: the pause (`_RADIO["paused"]`,
+    the show still running underneath) and the stop (`_RADIO["on"]` false, the
+    show over). Every banking bypass was written for the first - #1108, #1121,
+    #1131, #1134, #1155, #1261, [bank-ahead], [call-prod] - and read
+    radio_paused(), so an operator who switched the station OFF for the night
+    got a kitchen that stood still. Measured 2026-10-06 05:42: every worker room
+    `stopped` at the switch, 481 unheard rounds on the shelves, 37 gazette
+    reviews and 11 mixtape rounds written but never recorded. The rooms ask this
+    instead. The kitchen (not the bare switch) is the second condition so a
+    station that was never started - every test, the first seconds of a boot -
+    answers exactly as it always did."""
+    try:
+        return bool(radio_paused()) or kitchen_open()
+    except Exception:  # noqa: BLE001
+        return False
+
+
+_KITCHEN: dict[str, Any] = {"on": False, "since": 0.0, "why": "",
+                            "idle_since": 0.0, "offloaded": 0.0, "rooms": 0}
+
+# [kitchen] the shelves whose rows are ROUNDS - written by dj_banter with a
+# bank_to pile, finished by the recording rooms a line at a time. The ad and
+# station_id shelves are reads with their own finishing road (prep_voice_pending).
+ROUND_SHELF_KINDS = ("manager", "caller", "gallery", "news", "gazette_review", "mixtape")
+
+
+def kitchen_open() -> bool:
+    """[kitchen] Are the preparation rooms running behind a stopped show?"""
+    try:
+        return bool(_KITCHEN.get("on"))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def rooms_open() -> bool:
+    """[kitchen] May a preparation room keep its loop: the show is on, or the
+    kitchen is open behind a stopped show. The air rooms keep _RADIO["on"]."""
+    try:
+        return bool(_RADIO.get("on")) or kitchen_open()
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def radio_pause_set(on: bool, why: str = "") -> bool:
     """Go off air, or come back. Written down: a station left off air
     overnight that came back by itself would be the opposite of the
@@ -50126,7 +50309,7 @@ def pantry_window() -> str:
     # paused, nobody is waiting on anything. Answered before relief,
     # because relief is about the LIVE road being behind and there is no
     # live road.
-    if radio_paused():
+    if off_air():                                                 # [kitchen]
         return "the station is off air - everything is a window (#1108)"
     if render_relief():
         return "the engine is in relief - writing only"
@@ -50217,13 +50400,13 @@ def _pause_unfinished_rows() -> int:
     that keeps the rooms working. Five-second memo: it walks the whole
     cupboard and is asked every keeper pass (#1142)."""
     try:
-        if not radio_paused():
+        if not off_air():                                         # [kitchen]
             return 0
         _now = time.time()
         if _now - float(_PAUSE_UNFINISHED_MEMO.get("at") or 0) < 5.0:
             return int(_PAUSE_UNFINISHED_MEMO.get("n") or 0)
         n = 0
-        for _k in ("manager", "caller", "gallery", "news"):
+        for _k in ROUND_SHELF_KINDS:                              # [kitchen]
             for _r in list(_SHELF.get(_k) or []):
                 _e = _r.get("entry") if isinstance(_r, dict) else None
                 if not isinstance(_e, dict) or _e.get("preparing"):
@@ -50298,7 +50481,7 @@ async def pantry_keeper() -> None:
             # deadline left standing from a previous pass would read as
             # "already overrun" and stand every future pass down.
             _PREP_DEADLINE[0] = 0.0
-            if not _RADIO.get("on"):
+            if not rooms_open():                                 # [kitchen]
                 continue
             window = pantry_window()
             if not window:
@@ -50333,7 +50516,7 @@ async def pantry_keeper() -> None:
             # a question the station answers alone with option one. The
             # roads still short while banking get the cheap engine for
             # half an hour at a time, renewed while they stay short.
-            if radio_paused() and _hour_short:
+            if off_air() and _hour_short:                        # [kitchen]
                 for _road in _hour_short[:2]:
                     try:
                         if (may_take_on_piper(_road)
@@ -50357,7 +50540,7 @@ async def pantry_keeper() -> None:
             # _pause_unfinished_rows: a paused station holding written
             # rounds without their audio finishes them before it stands
             # still, whatever the desk says about the next four hours.
-            _finish_all = bool(radio_paused() and _pause_unfinished_rows())
+            _finish_all = bool(off_air() and _pause_unfinished_rows())   # [kitchen]
             # #1363: a hand-picked round is never "covered". The four-hour
             # desk being happy is the commonest reason the keeper stands
             # down, and standing down on a full cover is exactly what left
@@ -50529,7 +50712,7 @@ async def pantry_keeper() -> None:
             # everything it made. Rounds accumulate across passes
             # (entry["made"] is read back), so taking turns costs nobody
             # their round; it only stops one road owning the room.
-            _rounds = ("manager", "caller", "gallery", "news")
+            _rounds = ROUND_SHELF_KINDS          # [kitchen] every round-shaped shelf
             _lead = [k for k in _hour_short if k in _rounds]
             # (named apart from the coord_order() further down, which is
             # a different list for a different block in the same scope)
@@ -50556,7 +50739,7 @@ async def pantry_keeper() -> None:
             # visit, "1 of 26 lines made; the rest come next pass" - a
             # round took ~26 passes of tint checks and chunking to finish.
             # Nobody is waiting on a voice: give each visit two minutes.
-            if radio_paused():
+            if off_air():                                        # [kitchen]
                 _slice = max(_slice, 120.0)
             # #1010: ONE ACTOR, EVERY SCRIPT. The rows waiting are pooled
             # and the room works through one performer's whole swath -
@@ -50711,7 +50894,7 @@ async def pantry_keeper() -> None:
             # was permanently true and larder_prepare was never reached.
             _larder_usable = sum(1 for e in _LARDER
                                   if dialogue_row_viable("banter", e))
-            _banter_wait = (bool(_hour_short) and not radio_paused()
+            _banter_wait = (bool(_hour_short) and not off_air()   # [kitchen]
                             and "banter" not in _hour_short
                             and _larder_usable >= _larder_floor)
             if _banter_wait:
@@ -51009,7 +51192,7 @@ async def larder_keeper() -> None:
     shelf goes DEEP (#445): the pair keep writing into the backlog while
     nothing airs, so there is a long stream ready to pour out the moment
     the speaker recovers."""
-    while _RADIO.get("on"):
+    while rooms_open():                                        # [kitchen]
         # Run promptly after a show starts and keep checking while a record or
         # advert is carrying the air. A 15-second polling gap left the reserve
         # empty long after a model slot became available.
@@ -51029,7 +51212,7 @@ async def larder_keeper() -> None:
             # counts air time, not kitchen time).
             if globals().get("_system2") and _system2().owns_preparation:   # #1070
                 continue  # The independent planner commissions the next scene.
-            _paused_hold = radio_paused()
+            _paused_hold = off_air()                               # [kitchen]
             # #1151: the SAME protection on the contract clause. #1150
             # shielded unheard rounds from the AGE prune while paused and
             # left _larder_current unconditional - so a dial moved, a
@@ -51052,7 +51235,7 @@ async def larder_keeper() -> None:
             # station is exactly that, on purpose.
             box_down = (time.time() < float(_BOX_DOWN["until"])
                         or len(_BOX_HOLD) >= 3
-                        or radio_paused())
+                        or off_air())                                  # [kitchen]
             if not dj_settings().get("dialogue_prefill", True):
                 continue
             ad_running = bool(_RADIO.get("ad_now") and time.time()
@@ -51088,8 +51271,8 @@ async def larder_keeper() -> None:
             # twelve rounds and spent the rest of the hour doing nothing
             # with it.
             cap = min(larder_cap(),
-                      (12 if box_down and not radio_paused() else _want)
-                      if not radio_paused() else larder_cap())
+                      (12 if box_down and not off_air() else _want)
+                      if not off_air() else larder_cap())              # [kitchen]
             # 2026-09-08: the resting repertoire is not stock - it must
             # not stop a fresh round being written beside it.
             _stocked = larder_stock_count()
@@ -51180,7 +51363,7 @@ async def larder_keeper() -> None:
             # the bank wants seventy-two rounds and this gate let it write
             # only when fewer than two existed (measured: 261 s of air
             # banked per hour of pause). The lane still bounds the tint.
-            if _OLLAMA_GATE.locked() and _stocked >= 2 and not radio_paused():
+            if _OLLAMA_GATE.locked() and _stocked >= 2 and not off_air():   # [kitchen]
                 continue
             _LARDER_WRITING[0] = True
             _segment_token = None
@@ -54113,7 +54296,7 @@ async def workshop_tick() -> None:
     orch_turn("workshop_tick",
               "improving banter while the station is paused")
     try:
-        if not radio_paused() or not _RADIO.get("on"):
+        if not off_air() or not rooms_open():                    # [kitchen]
             return
         if hour_short_kinds():
             return                      # bank first; polish after
@@ -55462,7 +55645,7 @@ async def retint_shelf() -> str:
         # A recorded row costs its render as well. Only when ahead.
         # #1121: ...or the station is off air, where a stale recording
         # costs nothing to re-cut because nothing is waiting on it.
-        if not free and surplus() <= 0 and not radio_paused():
+        if not free and surplus() <= 0 and not off_air():         # [kitchen]
             return ""
         # #1150: ...but the later pass must not eat a SHORT road's
         # finished audio. A paused station funds the crystal at 0.90 and
@@ -55533,7 +55716,7 @@ async def retint_one() -> str:
             # and this stand-down fired 25 times in 26 minutes of a pause,
             # keeping the plain rounds plain. The pause is exactly when
             # the later pass has the room.
-            urgent = [] if radio_paused() else [
+            urgent = [] if off_air() else [                       # [kitchen]
                 r for r in coord_upcoming(1800.0)
                 if not r.get("cannot")
                 and float(r.get("short_seconds") or 0) > 0]
@@ -65395,8 +65578,12 @@ async def resume_radio() -> None:
     try:
         want = json.loads(RADIO_ON_PATH.read_text())
     except Exception:
+        await asyncio.sleep(8)
+        kitchen_start("the station boots with no switch written down")   # [kitchen]
         return
     if not (isinstance(want, dict) and want.get("on")):
+        await asyncio.sleep(8)
+        kitchen_start("the station boots switched off")                 # [kitchen]
         return
     await asyncio.sleep(5)            # let the music index load first
     # #824: a respin never opens with silence — an off-the-shelf line airs
@@ -65584,7 +65771,9 @@ async def _fm_off_offload() -> None:
 def dj_stop(*, seal_episode: bool = True) -> None:
     _RADIO["on"] = False
     remember_radio(False)
-    fire_and_forget(_fm_off_offload())
+    # [kitchen] OFF means off AIR. #1114's hand-back of the engines waits until
+    # nothing is left to bank (below, after the kitchen opens); kitchen_watch
+    # does it once the shelves are full and quiet.
     # An ordinary stop preserves its last stretch. A clean restart asks us
     # not to mint a final recording immediately before purging the shelf.
     if seal_episode and (_RADIO.get("episode") or {}).get("items"):
@@ -65592,6 +65781,12 @@ def dj_stop(*, seal_episode: bool = True) -> None:
     dj_skip()
     radio_stop()
     _RADIO.update({"requests": [], "history": []})
+    try:
+        kitchen_start("the show stopped")                       # [kitchen]
+        if not kitchen_has_work():
+            fire_and_forget(_fm_off_offload())
+    except Exception:  # noqa: BLE001
+        fire_and_forget(_fm_off_offload())
     # Put back anything the offline-fallback changed, so starting and
     # stopping a show never leaves a setting altered behind your back.
     for axis, value in _OUTPUT_BEFORE.items():
@@ -67148,11 +67343,11 @@ async def ad_studio_clock() -> None:
     because a desk that makes the station late is worse than a thin
     cupboard."""
     wait = 45.0
-    while _RADIO.get("on"):
+    while rooms_open():                                           # [kitchen]
         await asyncio.sleep(wait)
         wait = AD_STUDIO_TICK
         try:
-            if not _RADIO.get("on"):
+            if not rooms_open():                                 # [kitchen]
                 continue
             made = ads_produced_since(3600.0)
             if made >= ADS_PER_HOUR:
@@ -75314,7 +75509,7 @@ def plotline_frozen(row: Any = None) -> bool:
     except Exception:  # noqa: BLE001
         pass
     try:
-        return bool(radio_paused())
+        return bool(off_air())      # [kitchen] the act holds while the station banks, whichever switch
     except Exception:  # noqa: BLE001
         return False
 
@@ -83370,7 +83565,7 @@ async def switchboard_keeper() -> None:
     """Keep a board standing whenever the station is on air."""
     while True:
         try:
-            if _RADIO.get("on"):
+            if rooms_open():                                     # [kitchen]
                 live = switchboard_live()
                 if len(live) < 2:
                     await switchboard_fill()
@@ -84518,7 +84713,7 @@ async def speakbox_index_clock() -> None:
     """Keep the vector index current while the station is on (#566) — new
     markdown is picked up within a couple of minutes, no restart, no click."""
     await asyncio.sleep(5)
-    while _RADIO.get("on"):
+    while rooms_open():                                           # [kitchen]
         # Every mind, not only the one in play (#627): jumping to the other
         # brain should not mean waiting for it to be read. The mtime gate
         # makes an unchanged folder a stat() per file, and each mind is
@@ -86233,7 +86428,7 @@ async def _sfxguy_ready_clock() -> None:
     await asyncio.sleep(12)
     while True:
         try:
-            if _RADIO.get("on"):
+            if rooms_open():                                     # [kitchen]
                 await sfxguy_ready_prepare(1)
         except Exception as exc:
             _SFX_READY_STATE.update(made=0, why=f"Preparation deferred: {type(exc).__name__}")
@@ -91192,7 +91387,7 @@ async def sfx_levels_keeper() -> None:
     while True:
         try:
             await asyncio.sleep(45)
-            if not (_RADIO.get("on") and dj_settings().get("sfx")):
+            if not (rooms_open() and dj_settings().get("sfx")):   # [kitchen]
                 continue
 
             def batch() -> int:
@@ -91259,7 +91454,7 @@ async def sfx_arrivals_keeper() -> None:
     while True:
         try:
             await asyncio.sleep(60)
-            if not (_RADIO.get("on") and dj_settings().get("sfx")):
+            if not (rooms_open() and dj_settings().get("sfx")):   # [kitchen]
                 continue
             if time.time() - _SFX_POOL_AT[0] >= 60:
                 await _sfx_pool_refresh()
@@ -103733,8 +103928,8 @@ async def topic_cook_once() -> int:
     Returns how many went into the bank. Everything that guards the
     other preparation roads guards this one, and it asks for nothing at
     all unless the room is genuinely spare."""
-    if not _RADIO.get("on") or radio_paused():
-        _TOPIC_COOK["why"] = "the station is off air"
+    if not rooms_open():                                          # [kitchen]
+        _TOPIC_COOK["why"] = "the station is off and the kitchen is closed"
         return 0
     if time.time() - float(_TOPIC_COOK.get("at") or 0) < TOPIC_COOK_REST:
         return 0
@@ -120897,7 +121092,7 @@ async def call_produce_tick() -> str:
     are mixed into NEW files under NEW pantry keys; the row then points at them. A call
     whose plan and takes do not line up is marked and left dry. Returns what it did."""
     try:
-        if not radio_paused() or not dj_settings().get("produced_calls", True):
+        if not off_air() or not dj_settings().get("produced_calls", True):   # [kitchen]
             return ""
     except Exception:  # noqa: BLE001
         return ""
@@ -125947,7 +126142,7 @@ PIP_DEFAULTS: dict[str, Any] = {
     "docks": {"dialogue": "bottom", "task": "bottom", "audit": "bottom",
               "production": "bottom", "music": "top", "chat": "bottom",
               "messages": "bottom", "cast": "bottom", "voices": "bottom", "roulette": "bottom"},
-    "order": {name: index for index, name in enumerate(("dialogue", "task", "audit", "production", "music", "chat", "messages", "cast", "voices", "roulette"))},
+    "order": {name: index for index, name in enumerate(("dialogue", "task", "audit", "production", "music", "chat", "messages", "cast", "voices", "roulette", "rec"))},   # [pip-rec-order] every widget has an order
     "voiceStyles": {"host": 0, "cohost": 1, "sfx": 2, "callers": 3},
 }
 
@@ -129905,7 +130100,7 @@ def tint_budget() -> float:
         # still short, the pause bonus stands down and the writing desk
         # keeps its share; once the hours are covered, the crystal gets
         # the whole quiet stretch exactly as #1121 intended.
-        if radio_paused():
+        if off_air():                                             # [kitchen]
             try:
                 _covered = not hour_short_kinds()
             except Exception:  # noqa: BLE001
@@ -130438,7 +130633,7 @@ def tint_should_stop(critical: bool = False) -> str:
     # cupboard-polish allowance is spent. It still yields instantly to an
     # operator interjection above. On air, the ordinary budget remains the
     # guard so tint cannot crowd out the live writer.
-    if critical and radio_paused():
+    if critical and off_air():                                    # [kitchen]
         return ""
     return tint_pressure()                                       # #1045
 
@@ -185303,7 +185498,7 @@ def sfx_speech_bite(most: int = 0) -> dict[str, Any]:
         return dict(_SFX_SPEECH)
     writer = sfx_db()
     for (path,) in rows:
-        if not _RADIO.get("on"):
+        if not rooms_open():                                      # [kitchen]
             break
         try:
             said = clip_speech.transcribe_file(str(path))
@@ -185367,11 +185562,13 @@ async def sfx_speech_clock() -> None:
                                   if j.get("state") == "waiting")
                 except Exception:  # noqa: BLE001
                     waiting = 0
-                if waiting:
+                # [kitchen] off air the writing room's jobs are the kitchen's own and the
+                # transcriber is wyoming's (its own service): nothing to stand aside for
+                if waiting and not off_air():
                     _SFX_SPEECH["why"] = ("idle listening stands aside: %d job(s) waiting in the writing room"
                                           % waiting)
                 else:
-                    paused = bool(radio_paused())
+                    paused = bool(off_air())
                     _SFX_SPEECH.update({"running": True, "why": ""})
                     try:
                         await asyncio.to_thread(sfx_speech_bite, SFX_SPEECH_IDLE_BITE * (4 if paused else 1))
@@ -203753,6 +203950,157 @@ def _desk_banked(m: dict[str, Any]) -> dict[str, Any] | None:
     return {"slug": "what-the-pause-banked", "meta": meta, "body": body}
 
 
+def _desk_rolled(m: dict[str, Any]) -> dict[str, Any] | None:
+    """[kitchen] What the roulette wrote while nothing aired: the rounds System 3
+    rolled and the rooms wrote in this edition's window, by road, with three of
+    their openings and the directions their dice gave. Code only, memory only -
+    the larder and the shelves as they stand."""
+    if not (m.get("paused") or m.get("offline")):
+        return None
+    since = float(m.get("since") or 0)
+    until = float(m.get("until") or time.time())
+    rows: list[tuple[str, dict[str, Any]]] = []
+    try:
+        rows.extend(("banter", e) for e in list(_LARDER) if isinstance(e, dict))
+        for kind, shelf in list(_SHELF.items()):
+            for r in list(shelf or []):
+                if isinstance(r, dict):
+                    e = r.get("entry") if isinstance(r.get("entry"), dict) else r
+                    rows.append((str(kind), e))
+    except Exception:  # noqa: BLE001
+        return None
+    fresh: list[tuple[str, dict[str, Any]]] = []
+    for kind, e in rows:
+        try:
+            at = float(e.get("at") or 0)
+        except Exception:  # noqa: BLE001
+            at = 0.0
+        if since <= at <= until:
+            fresh.append((str(e.get("road") or kind), e))
+    if not fresh:
+        return None
+    by_road: dict[str, dict[str, Any]] = {}
+    for road, e in fresh:
+        row = by_road.setdefault(road, {"written": 0, "rolled": 0, "recorded": 0, "seconds": 0.0})
+        row["written"] += 1
+        if e.get("system3") or e.get("dice") or e.get("turn_dice"):
+            row["rolled"] += 1
+        try:
+            secs = float(e.get("seconds") or 0)
+        except Exception:  # noqa: BLE001
+            secs = 0.0
+        if secs > 0:
+            row["recorded"] += 1
+            row["seconds"] += secs
+    roads = sorted(by_road.items(), key=lambda kv: (-kv[1]["written"], kv[0]))
+    board = ["| Road | Written | Rolled | Recorded | Sec |", "| --- | --- | --- | --- | --- |"]
+    for road, row in roads[:10]:
+        board.append(f"| {_paper_shorten(str(road).replace('_', ' '), 22)} | {row['written']} | "
+                     f"{row['rolled']} | {row['recorded']} | {int(row['seconds'])} |")
+    fresh.sort(key=lambda kv: -float(kv[1].get("at") or 0))
+    openings: list[str] = []
+    for road, e in fresh:
+        if len(openings) >= 3:
+            break
+        text = str(e.get("script_plain") or e.get("script") or "")
+        first = next((ln.strip() for ln in text.split("\n") if ln.strip()), "")
+        if not first:
+            continue
+        dice = [str(d.get("text") or "") for d in (e.get("dice") or [])
+                if isinstance(d, dict) and d.get("text")][:2]
+        openings.append(f"- **{_paper_shorten(str(road).replace('_', ' '), 18)}**: "
+                        f"\"{_paper_shorten(first, 150)}\""
+                        + (f" - the dice said: {'; '.join(_paper_shorten(d, 70) for d in dice)}"
+                           if dice else ""))
+    total = sum(r["written"] for _k, r in roads)
+    rolled = sum(r["rolled"] for _k, r in roads)
+    recorded = sum(r["recorded"] for _k, r in roads)
+    body = (
+        ("The air is stopped, and the kitchen is not. " if m.get("paused") else
+         "The station is switched off, and the kitchen stayed open. ")
+        + f"In this edition's hour the roulette rolled and the rooms wrote {total} round"
+        + ("s" if total != 1 else "")
+        + f" on {len(roads)} road" + ("s" if len(roads) != 1 else "")
+        + f"; {rolled} carry System 3's dice and {recorded} already have their audio. "
+          "Nothing here has been heard yet - it is the stock the next show opens on.\n\n"
+        + "\n".join(board)
+        + ("\n\nThree of the newest, as written:\n\n" + "\n".join(openings) if openings else "")
+    )
+    meta: dict[str, Any] = {
+        "headline": ("What the Roulette Wrote During the Pause" if m.get("paused")
+                     else "What the Roulette Wrote With the Air Off"),
+        "deck": f"{total} rounds rolled and written on {len(roads)} roads while nothing aired",
+        "section": "report", "priority": 2, "page": 2,
+        "byline": "The Orchestrator", "style_hint": "report",
+        "kicker": "THE KITCHEN",
+        "stats": [{"value": str(total), "label": "rounds written"},
+                  {"value": str(rolled), "label": "with dice"},
+                  {"value": str(recorded), "label": "recorded"},
+                  {"value": str(len(roads)), "label": "roads"}],
+    }
+    bars = [(str(road).replace("_", " "), row["written"]) for road, row in roads][:8]
+    if len(bars) >= 2:
+        meta["chart"] = {"kind": "bars", "values": [int(v) for _, v in bars],
+                         "labels": [_paper_shorten(k, 11) for k, _ in bars],
+                         "show_values": True, "min": 0}
+        meta["caption"] = "Rounds written per road in this hour, with the air off."
+    return {"slug": "what-the-roulette-wrote", "meta": meta, "body": body}
+
+
+def _desk_library(m: dict[str, Any]) -> dict[str, Any] | None:
+    """[kitchen] The SFX Guy's study while the air is off: the clips he has
+    listened to this session, the frames he has looked at, the size of the
+    index he reaches into. Memory only - the counters the keepers already keep."""
+    if not (m.get("paused") or m.get("offline")):
+        return None
+    sp = dict(_SFX_SPEECH or {})
+    match = dict(_SFX_MATCH or {})
+    vision: dict[str, Any] = {}
+    try:
+        import sys as _sys
+        _mod = _sys.modules.get("sfx_vision_idle")
+        vision = dict(getattr(_mod, "STATE", {}) or {}) if _mod else {}
+    except Exception:  # noqa: BLE001
+        vision = {}
+    done = int(sp.get("done") or 0)
+    heard = int(sp.get("heard") or 0)
+    empty = int(sp.get("empty") or 0)
+    looked = int(vision.get("looked") or 0)
+    frames = int(vision.get("frames") or 0)
+    indexed = int(match.get("rows") or 0)
+    if not (done or looked or indexed):
+        return None
+    body = (
+        "While nothing airs the SFX Guy studies his own library. "
+        + (f"This session he has listened to {done} clip" + ("s" if done != 1 else "")
+           + f"; {heard} said something he wrote down and {empty} were silent or noise. "
+           if done else "He has not listened to a clip this session. ")
+        + (f"He has looked at {frames} frame" + ("s" if frames != 1 else "")
+           + f" across {looked} video clip" + ("s" if looked != 1 else "")
+           + ", describing what is on the screen so a round can call for it by what it shows. "
+           if looked else "")
+        + (f"The index he reaches into holds {indexed} clips by name, word and picture. "
+           if indexed else "")
+        + ("He is listening right now. " if sp.get("running") else "")
+        + ("He is studying frames right now. " if vision.get("running") else "")
+        + (f"When he stands aside it is because: {sp.get('why')}. "
+           if sp.get("why") and not sp.get("running") else "")
+    )
+    meta: dict[str, Any] = {
+        "headline": "The SFX Guy Studies His Library",
+        "deck": (f"{done} clips listened to, {frames} frames looked at, "
+                 f"{indexed} clips in the index"),
+        "section": "report", "priority": 3, "page": 3,
+        "byline": "The Orchestrator", "style_hint": "report",
+        "kicker": "THE KITCHEN",
+        "stats": [{"value": str(done), "label": "clips listened"},
+                  {"value": str(heard), "label": "said something"},
+                  {"value": str(looked), "label": "videos studied"},
+                  {"value": str(indexed), "label": "in the index"}],
+    }
+    return {"slug": "the-sfx-guy-studies", "meta": meta, "body": body}
+
+
 def _desk_cloud(m: dict[str, Any]) -> dict[str, Any] | None:
     """#1044: the word-cloud data as a board. The cloud itself is drawn
     beside the paused lead on page one; a picture of words with no figures
@@ -205691,6 +206039,8 @@ async def paper_print(reason: str = "", kind: str = "extra") -> dict[str, Any]:
             await _run("cloud", _desk_cloud)
         if paused or offline:
             await _run("banked", _desk_banked)
+            await _run("rolled", _desk_rolled)                   # [kitchen]
+            await _run("library", _desk_library)                 # [kitchen]
         try:
             stories.extend(await paper_editorial_stories(m))
         except Exception as exc:  # noqa: BLE001
@@ -206427,7 +206777,7 @@ def parse_paper_command(text: str) -> str:
 
 def paper_hourly_enabled() -> bool:
     """#1051: automatic editions follow the station and the hourly toggle."""
-    return bool(_RADIO.get("on") and not radio_paused()
+    return bool(((_RADIO.get("on") and not radio_paused()) or kitchen_open())   # [kitchen]
                 and dj_settings().get("paper_hourly", True))
 
 
@@ -214479,7 +214829,7 @@ async def storage_keeper() -> None:
     no cap — which is all of them until you move a slider — are never
     touched. Started beside larder_keeper() so it lives and dies with the
     show, which is the only time any of these folders grow."""
-    while _RADIO.get("on"):
+    while rooms_open():                                           # [kitchen]
         await asyncio.sleep(STORAGE_SWEEP)
         orch_turn("storage_keeper",  # 2026-09-15 (#1191)
                   "holding the disk allowance")
