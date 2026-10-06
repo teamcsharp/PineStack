@@ -179,6 +179,7 @@ class PantryLifecycle:
         try:
             if kind not in (self.host.get("RESCUE_ROADS_OPEN") or ()) or self.evergreen(row): return False
             if int(row.get("aired") or 0) > 0 or float(row.get("aired_at") or 0) > 0: return False
+            if entry_of(row).get("dynamic_kind"): return False          # [bank-first-3] a segment's part airs through its segment
             after = float(self.call("cupboard_unheard_after", default=7200) or 7200)
             now = self.clock()
             if now - float(row.get("at") or entry_of(row).get("at") or now) <= after: return False

@@ -6,6 +6,7 @@ import copy
 import json
 import math
 import re
+import unicodedata
 import uuid
 import shutil
 import time
@@ -17,7 +18,7 @@ from typing import Any
 import book_roulette
 import dynamic_segments
 import segment_prompts
-from segment_contract import (book_time_bookends, build_segment_contract,
+from segment_contract import (book_time_bookends, book_title_said, build_segment_contract,
                               evaluate_segment_contract, estimated_speech_seconds)
 
 
@@ -173,7 +174,13 @@ class DynamicSegments:
         if entry.get('dynamic_handed_off') or entry.get('dynamic_superseded'):
             return False
         if request.get('kind') == 'book_time':
-            return stored == 'book_time' and str(entry.get('dynamic_occurrence') or '') == self.occurrence(request)
+            # [book-reads-on] only the segment's own door (dispatch -> _ready_shelf_air with a pick) may take
+            # an episode's parts. The live banter road in the same window shared this admission, took the
+            # recorded opening as a plain round, and the dispatch handed it over again: one welcome, twice.
+            if not request.get('dispatch'):
+                return False
+            mine = {self.occurrence(request), str(getattr(self, 'carry_from', '') or '')}
+            return stored == 'book_time' and str(entry.get('dynamic_occurrence') or '') in mine
         return not stored
 
     def book_rows(self, occurrence):
@@ -366,6 +373,119 @@ class DynamicSegments:
         else:
             return 'The book part has no valid opening, discussion or closing phase'
         return ''
+
+    WELCOME_RX = re.compile(r"\bwelcome\b.{0,80}\bbook time\b")
+    SIGNOFF_RX = re.compile(r"(?:\b(?:thank|thanks|thank you)\b.{0,100}\bbook time\b|"
+                            r"\b(?:that ends|that wraps|that's|that is|end of)\b.{0,70}\bbook time\b)")
+
+    @staticmethod
+    def _plain(text):
+        return ' '.join(unicodedata.normalize('NFKC', str(text or '')).replace('\u2019', "'").casefold().split())
+
+    @staticmethod
+    def book_order(row):
+        return ({'opening': 0, 'discussion': 1, 'closing': 2}.get(row.get('book_phase'), 1),
+                int(row.get('chain_order') or 0), float(row.get('at') or 0))
+
+    def book_carry(self, key):
+        """[book-reads-on] The latest other episode that still holds recorded parts nobody heard: its
+        occurrence and those parts, in order - so a window with nothing of its own reads on."""
+        ready = self.original.get('dialogue_row_ready') or (lambda kind, row: True)
+        best, best_at, best_rows = '', -1.0, []
+        seen = set()
+        for row in list(self.g.get('_LARDER') or []):
+            entry = self.source_entry(row)
+            occurrence = str(entry.get('dynamic_occurrence') or '')
+            if entry.get('dynamic_kind') != 'book_time' or not occurrence or occurrence == key or occurrence in seen:
+                continue
+            seen.add(occurrence)
+            try:
+                at = float(occurrence.rsplit('@', 1)[-1])
+            except (TypeError, ValueError):
+                at = 0.0
+            if at <= best_at:
+                continue
+            rows = [r for r in self.book_rows(occurrence) if not r.get('dynamic_handed_off') and ready('banter', r)]
+            if rows:
+                best, best_at, best_rows = occurrence, at, sorted(rows, key=self.book_order)
+        return best, best_rows
+
+    def repair_phase(self, row, prior=()):
+        """[book-reads-on] MEND BEFORE REFUSING. The gates turned away 32 of 74 parts in a morning for
+        wording - a welcome without the station's name, a host who said "here's Dill" instead of "I'm
+        Dill", a closing whose sign-off the regex did not know - and three refusals block the episode.
+        What the gate wants is said by construction: the welcome, the title, each host's name, the
+        sign-off; what it forbids is struck. The gate is asked again afterwards; a part that still
+        fails is refused as before. Returns what was mended, or '' when nothing was."""
+        entry = self.source_entry(row)
+        phase = str(entry.get('book_phase') or '')
+        script = str(entry.get('script') or entry.get('script_plain') or '')
+        turns = [[str(seat), ' '.join(str(text).split())]
+                 for seat, text in (self.call('banter_turns', script, default=[]) or [])]
+        if not turns or phase not in ('opening', 'discussion', 'closing'):
+            return ''
+        station = str(entry.get('book_station') or self.station() or '').strip()
+        title = str((entry.get('book_source') or {}).get('title') or '')
+        lead = re.split(r"\s+--\s+|\s+-\s+|:\s+|;\s+|\s+[(\[]", title.strip(), maxsplit=1)[0].strip(' .,;:-') if title else ''
+        fixes = []
+
+        def strike(pattern, label):
+            for turn in turns:
+                pieces = [s for s in re.split(r'(?<=[.!?])\s+', turn[1]) if s]
+                kept = [s for s in pieces if not pattern.search(self._plain(s))]
+                if len(kept) != len(pieces):
+                    turn[1] = ' '.join(kept)
+                    if label not in fixes:
+                        fixes.append(label)
+
+        if phase == 'opening':
+            strike(self.SIGNOFF_RX, 'a sign-off struck from the opening')
+            words = self._plain(' '.join(t[1] for t in turns))
+            if not self.WELCOME_RX.search(words) or (station and self._plain(station) not in words):
+                turns[0][1] = ('Welcome to Book Time on %s. ' % station if station else 'Welcome to Book Time. ') + turns[0][1]
+                fixes.append('the welcome')
+            words = self._plain(' '.join(t[1] for t in turns))
+            if lead and not book_title_said(title, words):
+                turns[0][1] = turns[0][1].rstrip() + ' We are reading %s.' % lead
+                fixes.append('the title')
+            cast = self.host_cast(row)
+            for seat in ('A', 'B'):
+                name = str(cast.get(seat) or '').strip()
+                own = next((t for t in turns if t[0] == seat), None)
+                if not name or own is None:
+                    continue
+                said = re.compile(r"\b(?:i(?:'m| am)|my name is|this is|it(?:'s| is))\s+" + re.escape(name.casefold())
+                                  + r"(?!\w)|(?<!\w)" + re.escape(name.casefold()) + r"\s+(?:here|at the mic|speaking)\b")
+                if not any(t[0] == seat and said.search(self._plain(t[1])) for t in turns):
+                    own[1] = ("I'm %s. " % name if seat == 'A' else "And I'm %s. " % name) + own[1]
+                    fixes.append('%s introduces %s' % (seat, name))
+        elif phase == 'discussion':
+            strike(self.WELCOME_RX, 'a welcome struck from the discussion')
+            strike(self.SIGNOFF_RX, 'a sign-off struck from the discussion')
+        else:
+            strike(self.WELCOME_RX, 'a welcome struck from the closing')
+            evidence = book_time_bookends('\n'.join(t[1] for t in turns), station=station)
+            if not evidence['outro']['written']:
+                turns[-1][1] = turns[-1][1].rstrip() + (
+                    ' That is Book Time on %s. Thank you for listening, and now back to the music.' % station
+                    if station else ' That is Book Time. Thank you for listening, and now back to the music.')
+                fixes.append('the sign-off')
+        if not fixes:
+            return ''
+        mended = '\n'.join('%s: %s' % (seat, text) for seat, text in turns if text.strip())
+        for holder in (row, entry):
+            for field in ('script', 'script_plain', 'script_tinted'):
+                if isinstance(holder, dict) and holder.get(field):
+                    holder[field] = mended
+        entry['book_phase_repaired'] = {'fixes': list(fixes), 'phase': phase, 'at': time.time()}
+        ledger = self.g.get('FLOW_LEDGER')
+        if ledger is not None:
+            try:
+                ledger.note('round:book_phase_repair', phase + ': ' + ', '.join(fixes), passed=True,
+                            road='banter', text=mended, ref=str(entry.get('sid') or ''))
+            except Exception:   # noqa: BLE001 - a ledger that cannot write never stops the episode
+                pass
+        return ', '.join(fixes)
 
     def book_structure(self, rows):
         valid, errors = [], []
@@ -708,6 +828,8 @@ class DynamicSegments:
             for row in new:
                 self.tag(row, contract)
                 why = self.phase_error(row, rows + accepted)
+                if why and self.repair_phase(row, rows + accepted):             # [book-reads-on] mend before refusing
+                    why = self.phase_error(row, rows + accepted)
                 if why:
                     self.reject_phase(row, why)
                 else:
@@ -847,19 +969,34 @@ class DynamicSegments:
             return False
         if kind == 'book_time':
             rows = self.book_rows(key)
-            # The entire segment must be ready before the first part claims it.
-            # Once accepted, remaining parts carry their frozen source and order.
-            if not self.book_coverage(due, rows)['ready'] and not self.last.get(key, {}).get('started'):
-                return False
-            candidates = [row for row in rows if not row.get('dynamic_handed_off')]
-            candidates.sort(key=lambda row: ({'opening': 0, 'discussion': 1, 'closing': 2}.get(row.get('book_phase'), 1),
-                int(row.get('chain_order') or 0), float(row.get('at') or 0)))
-            if not candidates:
-                return True
+            started = bool(self.last.get(key, {}).get('started'))
+            # [book-reads-on] NEVER NOTHING. The window waited for the whole episode to be ready, which it
+            # seldom was (the gates turned most parts away; the writer ran past the window), so the window
+            # aired the opening the banter road had leaked and nothing more. Now the episode airs what it HAS,
+            # in order - the recorded opening first, then every recorded part as it lands - and an earlier
+            # episode's recorded parts nobody heard go out before a new book is opened: the hosts read ON.
+            ready = self.original.get('dialogue_row_ready') or (lambda kind, row: True)
+            candidates = [row for row in rows if not row.get('dynamic_handed_off') and ready('banter', row)]
+            candidates.sort(key=self.book_order)
+            carry_from, carry = '', []
+            if not candidates or (not started and candidates[0].get('book_phase') != 'opening'):
+                carry_from, carry = self.book_carry(key)
+                if carry:
+                    candidates = carry
+                elif not candidates:
+                    return False
+                else:
+                    return False                             # an episode opens with its welcome
+            self.carry_from = carry_from
             def accepted():
                 candidates[0]['dynamic_handed_off'] = True
                 self.last.setdefault(key, {})['started'] = True
-            said = await self.g['_ready_shelf_air']('banter', track, pick=candidates[0], on_handoff=accepted)
+                if carry_from:
+                    self.last.setdefault(key, {})['carried_from'] = carry_from
+            try:
+                said = await self.g['_ready_shelf_air']('banter', track, pick=candidates[0], on_handoff=accepted)
+            finally:
+                self.carry_from = ''
             return bool(said)
         if kind == 'sfx_supercut':
             if not self.call('_schedule_action_pending', kind, occurrence, default=True):
@@ -1077,12 +1214,13 @@ def install(app, g):
     for name in ('dj_banter', '_ready_shelf_air'):
         if name not in runtime.original:
             continue
-        def wrap(original):
+        def wrap(original, door=name):
             async def air(*a, **kw):
                 if kw.get('bank'):
                     return await original(*a, **kw)
                 request = runtime.active()
                 request['named'] = bool(kw.get('named'))
+                request['dispatch'] = door == '_ready_shelf_air' and kw.get('pick') is not None   # [book-reads-on]
                 token = runtime.admission.set(request)
                 try:
                     return await original(*a, **kw)
@@ -1095,6 +1233,8 @@ def install(app, g):
             result = await runtime.original['ensure_entry_tinted'](entry, kind, *a, **kw)
             if result and runtime.source_entry(entry).get('dynamic_kind') == 'book_time':
                 why = runtime.phase_error(entry)
+                if why and runtime.repair_phase(entry):                     # [book-reads-on] the tint may have cut the welcome
+                    why = runtime.phase_error(entry)
                 if why:
                     runtime.reject_phase(entry, why)
                     runtime.coverage_cache.clear()

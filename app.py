@@ -19419,6 +19419,8 @@ def unheard_pick() -> tuple[str, dict[str, Any] | None, float]:
             for row in road_source(kind):                      # [bank-first] the larder is banter's shelf
                 if not isinstance(row, dict) or not row_unaired(row):
                     continue
+                if (dialogue_entry(row) or row).get("dynamic_kind"):      # [bank-first-3] never a segment's part
+                    continue
                 age = now - float(row.get("at") or now)
                 if age <= after or age <= best[2]:
                     continue
@@ -20009,6 +20011,8 @@ def larder_oldest_ready() -> dict[str, Any] | None:
     for e in _LARDER:
         if not isinstance(e, dict) or id(e) in _READY_SHELF_BUSY or not row_unaired(e):
             continue
+        if (dialogue_entry(e) or e).get("dynamic_kind"):                  # [bank-first-3] a segment's part airs through its segment
+            continue
         if not dialogue_row_ready("banter", e):
             continue
         waited = now - float(e.get("at") or now)
@@ -20029,6 +20033,8 @@ async def larder_round_air(entry: dict[str, Any], track: dict[str, Any] | None =
         at = next(i for i, e in enumerate(_LARDER) if e is entry)
     except StopIteration:
         return _banter_no("the larder round left the shelf before it could air")
+    if (dialogue_entry(entry) or entry).get("dynamic_kind"):              # [bank-first-3]
+        return _banter_no("a segment's part airs only through its segment")
     if not dialogue_row_ready("banter", entry):
         return _banter_no("the larder round is not ready to air")
     at, replay = larder_reair_gate(at)
@@ -63998,6 +64004,7 @@ def dead_air_stock() -> dict[str, int]:
             # "nothing would go out" were both true at once.
             rows = [r for r in road_source(kind)
                     if id(r) not in _READY_SHELF_BUSY
+                    and not (dialogue_entry(r) or r).get("dynamic_kind")   # [bank-first-3]
                     and _ready_round_takes(kind, r)]
             # #1238c: ...AND THE DOOR WOULD ACTUALLY OPEN. The takes test
             # says a round is finished; it does not say the road's own
