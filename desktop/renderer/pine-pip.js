@@ -130,6 +130,8 @@
       });
       return loading;
     }
+    /* [viz-eager] start both fetches as soon as the panel exists, so the first PiP entry does not pay for them */
+    try { setTimeout(() => { if (!shell) { three().catch(() => {}); vizLibrary().catch(() => {}); } }, 1500); } catch (_) {}
     function createParticles(T) {
       const renderer = new T.WebGLRenderer({ alpha: true, antialias: true });
       renderer.setPixelRatio(Math.min(w.devicePixelRatio || 1, 1.5));
@@ -375,7 +377,9 @@
         last = 0; lastMeters = 0; voiceLevel = 0; voiceBands.fill(0); raf = w.requestAnimationFrame(frame);
         /* [pip-viz] the living background first; the particle cloud only when the bundle cannot be had */
         if (!shell && viz) viz.start();
-        if (!shell && !viz && !particles) three().then(T => {
+        /* [viz-eager] three.js and the bundle side by side, not one after the other (measured: the bundle tag
+           appeared ~20 s after PiP entry while the page waited for three.min.js first) */
+        if (!shell && !viz && !particles) Promise.all([three(), vizLibrary().catch(() => null)]).then(([T]) => {
           if (!enabled || shell) return;
           if (vizFailed) { if (!particles) particles = createParticles(T); return; }
           return vizLibrary().then(P => { if (enabled && !shell) mountViz(P); }).catch(() => { vizFailed = true; if (enabled && !shell && !particles) particles = createParticles(T); });

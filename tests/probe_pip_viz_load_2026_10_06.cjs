@@ -5,7 +5,7 @@ const { app, BrowserWindow, ipcMain, Menu } = require('electron');
 const fs = require('node:fs'), path = require('node:path'), os = require('node:os');
 const desktop = path.resolve(process.argv[2]), station = process.argv[3];
 app.setPath('userData', fs.mkdtempSync(path.join(os.tmpdir(), 'pine-vizload-')));
-app.commandLine.appendSwitch('use-angle', 'swiftshader'); app.commandLine.appendSwitch('enable-unsafe-swiftshader');
+if (process.env.PINE_PROBE_GPU !== '1') { app.commandLine.appendSwitch('use-angle', 'swiftshader'); app.commandLine.appendSwitch('enable-unsafe-swiftshader'); }
 const delay = ms => new Promise(r => setTimeout(r, ms));
 setTimeout(() => { console.error('timed out'); process.exit(1); }, 150000);
 let win, cfg = {};
@@ -33,6 +33,7 @@ app.whenReady().then(async () => {
     await delay(round === 0 ? 2000 : 5000);
     console.log('t+' + (2 + round * 5) + 's', await inFrame(Q));
   }
+  console.log('webgl caps:', await inFrame(`(() => { try { const c = document.createElement('canvas'); const g = c.getContext('webgl2'); if (!g) return 'no webgl2'; const dbg = g.getExtension('WEBGL_debug_renderer_info'); return JSON.stringify({ renderer: dbg ? g.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : g.getParameter(g.RENDERER), colorBufferFloat: !!g.getExtension('EXT_color_buffer_float'), colorBufferHalfFloat: !!g.getExtension('EXT_color_buffer_half_float'), floatLinear: !!g.getExtension('OES_texture_float_linear') }); } catch (e) { return 'err ' + e.message; } })()`));
   console.log('manual mount:', await inFrame(`(() => { try { const P = window.PineViz; if (!P) return 'no PineViz'; const el = document.createElement('div'); el.style.cssText = 'position:fixed;left:0;top:0;width:320px;height:180px;'; document.body.appendChild(el); const v = P.mount(el, { palette: 'pinepip', quality: 'low', keys: false, click: false }); return 'ok mode=' + v.activeId + ' running=' + v.running; } catch (e) { return 'THROW ' + e.message + ' | ' + String(e.stack || '').split('\\n').slice(0, 4).join(' / ').slice(0, 500); } })()`));
   console.log('frame console since PiP (' + (frameLog.length - mark) + '):');
   frameLog.slice(mark).slice(0, 40).forEach(l => console.log('  ' + l));
