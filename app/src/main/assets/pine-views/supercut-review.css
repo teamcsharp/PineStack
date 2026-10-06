@@ -27,3 +27,18 @@ body.pine-pip .psc-hourly{width:min(270px,calc(100vw - 20px));right:10px;bottom:
 @media(max-width:560px){.pav-tabs{gap:5px}.pav-tabs [role=tab]{font-size:12px}.psc-section-body{padding:0 9px 10px}.psc-panel .psc-actions>.psc-button{flex:1 1 auto}.psc-archive-list{grid-template-columns:repeat(2,minmax(0,1fr))}}
 
 video.psc-audio{aspect-ratio:16/9;max-height:50vh;object-fit:contain;background:#000;}
+
+/* [supercut-marquee] every saved supercut along the top of the studio */
+.psc-marquee{display:flex;flex-direction:column;gap:4px;min-width:0}
+.psc-marquee-track{display:flex;gap:8px;overflow-x:auto;overflow-y:hidden;scrollbar-width:none;padding:2px 2px 6px;-webkit-overflow-scrolling:touch}
+.psc-marquee-track::-webkit-scrollbar{display:none}
+.psc-marquee-card{flex:0 0 auto;display:flex;flex-direction:column;gap:5px;width:188px;padding:8px 10px;border:1px solid #3b5862;border-radius:6px;background:linear-gradient(180deg,#19303a,#101d24)}
+.psc-marquee-card.selected{border-color:#8de1ed;box-shadow:0 0 0 1px #8de1ed inset}
+.psc-marquee-view{all:unset;cursor:pointer;display:flex;flex-direction:column;gap:3px;min-width:0;color:#e6f2f4}
+.psc-marquee-view:focus-visible{outline:1px solid #8de1ed;outline-offset:2px}
+.psc-marquee-view b{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:#8de1ed}
+.psc-marquee-view span{font-size:11px;color:#9eb8c2}
+.psc-marquee-reuse{align-self:flex-start;padding:4px 8px;border:1px solid #45616b;border-radius:4px;background:#20353e;color:#e6f2f4;font:12px system-ui;cursor:pointer}
+.psc-marquee-reuse:hover{border-color:#8de1ed}
+.psc-marquee-note{font-size:12px;color:#9eb8c2}
+body.pine-pip .psc-marquee-card{width:150px}

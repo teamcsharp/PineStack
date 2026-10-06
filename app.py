@@ -20063,7 +20063,14 @@ async def larder_round_air(entry: dict[str, Any], track: dict[str, Any] | None =
     pipeline_log("air", "a banked banter round goes out of turn off the larder "
                         "(%d left) [bank-first]" % len(_LARDER))
     gap_round_flag("banked")                                             # #1022
-    return await _banter_air(entry, track, on_handoff=on_handoff)
+    # [bank-first-2] as a READY round: speak_turns credits on_handoff only when ready_takes is given
+    # (the shelf door's road), and the entry is busy while it airs so no second pick takes it.
+    _takes = _ready_round_takes("banter", entry)
+    _READY_SHELF_BUSY.add(id(entry))
+    try:
+        return await _banter_air(entry, track, ready_takes=_takes or None, on_handoff=on_handoff)
+    finally:
+        _READY_SHELF_BUSY.discard(id(entry))
 
 
 async def unheard_stock_air(force: bool = False) -> str:

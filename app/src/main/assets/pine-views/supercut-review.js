@@ -58,6 +58,51 @@
     var panel = make('section', 'pav-supercut-panel psc-panel'); panel.setAttribute('aria-label', 'Supercut studio'); host.appendChild(panel);
     var intro = make('div', 'psc-intro'); intro.append(make('b', '', 'Supercut studio'), make('p', '', 'Tell the SFX guy what to say. He finds, trims and joins existing audio, including H3 clips.'));
     panel.appendChild(intro);
+    /* [supercut-marquee] every saved supercut, newest first, drifting along the top of the studio: tap one to
+       view it below, or take its prompt into the editor to make another */
+    var marquee = make('div', 'psc-marquee'); marquee.setAttribute('aria-label', 'Saved supercuts'); panel.appendChild(marquee);
+    var marqueeTrack = make('div', 'psc-marquee-track'); marquee.appendChild(marqueeTrack);
+    var marqueeNote = make('span', 'psc-marquee-note', ''); marquee.appendChild(marqueeNote);
+    var marqueeRows = [], marqueeHold = 0, marqueeRaf = 0, marqueeLast = 0, marqueeSelected = '';
+    function marqueeCard(row) {
+      var card = make('div', 'psc-marquee-card'); card.dataset.id = row.id;
+      var view = make('button', 'psc-marquee-view'); view.type = 'button'; view.setAttribute('aria-label', 'View ' + (row.product || row.title || 'supercut'));
+      var when = new Date(Number(row.created_at || 0) * 1000);
+      view.append(make('b', '', row.product || row.title || 'Supercut'),
+        make('span', '', Number(row.seconds || 0).toFixed(1) + 's' + (row.kind === 'video' ? ' video' : ' audio') + ' - ' + when.toLocaleDateString([], {month: 'numeric', day: 'numeric'}) + ' ' + when.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'})));
+      view.addEventListener('click', function () { marqueeSelected = row.id; marqueeMark(); marqueeHold = Date.now() + 12000; loadArchive(row.id); });
+      card.appendChild(view);
+      var reuse = make('button', 'psc-marquee-reuse', 'Reuse prompt'); reuse.type = 'button'; reuse.title = 'Put this supercut\'s product and script into the editor to make another';
+      reuse.addEventListener('click', function (ev) {
+        ev.stopPropagation(); marqueeHold = Date.now() + 12000;
+        get('/api/sfx/supercut/archive/' + encodeURIComponent(row.id)).then(function (full) {
+          if (dead) return; recallPrompt(full);
+          say('The prompt of "' + (full.product || full.title || 'this supercut') + '" is in the editor - change what you like and make another.');
+          try { editor.open = true; editor.scrollIntoView({behavior: 'smooth', block: 'start'}); } catch (e) { /* no scroll here */ }
+        }).catch(function (e) { say(e.message || e); });
+      });
+      card.appendChild(reuse);
+      return card;
+    }
+    function marqueeMark() { Array.prototype.forEach.call(marqueeTrack.children, function (c) { c.classList.toggle('selected', c.dataset.id === marqueeSelected); }); }
+    function marqueeStep(now) {
+      marqueeRaf = root.requestAnimationFrame(marqueeStep);
+      var dt = Math.min(0.1, (now - (marqueeLast || now)) / 1000); marqueeLast = now;
+      if (Date.now() < marqueeHold || marquee.matches(':hover') || !marqueeRows.length) return;
+      var half = marqueeTrack.scrollWidth / 2; if (half <= marqueeTrack.clientWidth) return;
+      marqueeTrack.scrollLeft += 28 * dt; if (marqueeTrack.scrollLeft >= half) marqueeTrack.scrollLeft -= half;
+    }
+    function loadMarquee() {
+      return get('/api/sfx/supercut/archive?summary=true&limit=100&offset=0').then(function (got) {
+        if (dead) return; marqueeRows = got.rows || []; marqueeTrack.replaceChildren();
+        marqueeNote.textContent = marqueeRows.length ? String(got.total || marqueeRows.length) + ' supercuts made so far - tap one to view it, or reuse its prompt' : 'No supercuts made yet - the first one lands here';
+        marqueeRows.forEach(function (row) { marqueeTrack.appendChild(marqueeCard(row)); });
+        if (marqueeRows.length > 2) marqueeRows.forEach(function (row) { marqueeTrack.appendChild(marqueeCard(row)); });   /* laid twice, so the loop is seamless */
+        marqueeMark(); if (!marqueeRaf) marqueeRaf = root.requestAnimationFrame(marqueeStep);
+      }).catch(function (e) { if (!dead) marqueeNote.textContent = 'The saved supercuts could not be read: ' + (e.message || e); });
+    }
+    ['pointerdown', 'touchstart', 'wheel', 'focusin'].forEach(function (ev) { marqueeTrack.addEventListener(ev, function () { marqueeHold = Date.now() + 8000; }, {passive: true}); });
+    loadMarquee();
     var note = make('p', 'psc-status', 'Loading the studio…'); note.setAttribute('role', 'status'); panel.appendChild(note);
     function say(text) { if (!dead) note.textContent = String(text || ''); }
     function run(b, fn) {
@@ -165,7 +210,7 @@
     }
     var library = section(panel, 'SFX ads archive', true); var libraryBar = make('div', 'psc-row'); library.appendChild(libraryBar);
     var search = make('input'); search.type = 'search'; search.placeholder = 'Search supercuts and products'; search.setAttribute('aria-label', 'Search supercut archive'); libraryBar.appendChild(search);
-    button(libraryBar, 'Refresh', function (b) { run(b, function () { archiveOffset = 0; return loadLibrary(); }); });
+    button(libraryBar, 'Refresh', function (b) { run(b, function () { archiveOffset = 0; return Promise.all([loadLibrary(), loadMarquee()]); }); });   /* [supercut-marquee] */
     var archiveList = make('div', 'psc-archive-list'); library.appendChild(archiveList);
     var paging = make('div', 'psc-actions'); library.appendChild(paging);
     var prev = button(paging, 'Previous', function (b) { run(b, function () { archiveOffset = Math.max(0, archiveOffset - 24); return loadLibrary(); }); });
@@ -250,7 +295,7 @@
     pollTimer = root.setInterval(tick, 5000);
     return {panel: panel, select: function (row) { if (row.archive_id || /^sca-/.test(row.id || '')) return loadArchive(row.archive_id || row.id); showJob(row); },
       setActive: function (on) { active = !!on; if (!active) { if (audio) audio.pause(); } else tick(); },
-      dispose: function () { dead = true; root.clearInterval(pollTimer); stop(audio); panel.remove(); }};
+      dispose: function () { dead = true; root.clearInterval(pollTimer); if (marqueeRaf) root.cancelAnimationFrame(marqueeRaf); stop(audio); panel.remove(); }};   /* [supercut-marquee] */
   }
   var seen = readStored('pineSupercutSeen', {}), initialized = false, notice = null, noticeRow = null, noticePolling = false;
   function noticesEnabled() { return readStored('pineSupercutHourlyPopups', true) !== false; }
