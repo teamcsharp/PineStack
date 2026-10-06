@@ -96,6 +96,7 @@ import gazette_editorial
 import gazette_media
 import gazette_review_runtime
 import blocked_book                                          # [blocked-book]
+import llm_commands                                          # [llm-command] the LLM command book
 import h3_slots                          # [h3-slots] {mxtape} {fordtape} {videos} {sfxclip} {convograph} {gazette} {arena}
 import h3_speak                          # [h3-speak] the hourly video's dialogue: whole sentences, rolled
 from parody_stinger_queue import ParodyQueue
@@ -125355,6 +125356,9 @@ async def generate_answer(
 ) -> tuple[str, dict[str, Any]]:
     settings = load_settings()
     user_text = latest_user_text(incoming_messages)
+    # [llm-command] one of the operator's own commands whose "as" names a
+    # sentence the parsers below understand is said to them as that sentence.
+    user_text = llm_commands.rewrite(user_text)[0]
 
     if not user_text:
         raise HTTPException(
@@ -125502,6 +125506,34 @@ async def generate_answer(
     # newest script report's verdict and explanation, and the last ten
     # minutes of gaps, said plainly. A question, so it stays under the
     # commands and above the model.
+    # [llm-command] the operator's own commands, before every built-in detector:
+    # a fixed reply, or a line for the orchestrator's command line (the verbs
+    # of /api/orchestrator/command), spoken back.
+    _llm_said = llm_commands.fixed_reply(user_text)
+    if _llm_said:
+        return _llm_said, {
+            **feature_meta,
+            "active_prompt": prompt_entry["name"],
+            "model": "llm-command",
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+        }
+    _llm_line = llm_commands.orchestrator_line(user_text)
+    if _llm_line:
+        _llm_got = await orch_command_run(_llm_line)
+        _llm_got = _llm_got if isinstance(_llm_got, dict) else {}
+        _llm_say = str(_llm_got.get("say") or _llm_got.get("said") or "done.")
+        _llm_lines = [str(x).strip() for x in (_llm_got.get("lines") or [])[:4]
+                      if str(x).strip()]
+        if _llm_lines:
+            _llm_say = _llm_say.rstrip() + " " + " ".join(_llm_lines)
+        return _llm_say, {
+            **feature_meta,
+            "active_prompt": prompt_entry["name"],
+            "model": "llm-command",
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+        }
     if parse_show_doctor(user_text):                                     # [show-doctor]
         feature_meta["system_status_used"] = True
         return (await show_doctor()), {
@@ -282795,6 +282827,7 @@ import dynamic_segments_system2
 dynamic_segments_system2.install(app, globals())
 gazette_review_runtime.install(app, globals())
 blocked_book.install(app, globals())                         # [blocked-book] GET /api/blocked
+llm_commands.install(app, globals())                         # [llm-command] GET /api/llm-commands; counts the parsers above
 
 # One-click station diagnosis, dialogue recovery, and saved repair reports.
 import station_troubleshoot_runtime

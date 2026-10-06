@@ -264,6 +264,7 @@ function install({ ipcMain, getWindow, readConfig, writeConfig, troubleshoot, re
       { type: 'separator' },
       { label: 'Favorites', submenu: favoriteItems.length?favoriteItems:[{label:'No favorites yet - right-click a tool to add it',enabled:false}] },
       { label: 'Popups, 3JS and orchestra...', click: () => openTools ? openTools() : getWindow()?.webContents.send('pip:action','popups') },
+      { label: 'LLM command...', click: () => openTools ? openTools({ id: 'module:PineLlmCommands' }) : getWindow()?.webContents.send('pip:action', 'popups') },   /* [llm-command] the command book */
       { label: 'Expand Pine', click: exit },
       { label: (s.cameraSource === 'pine' ? 'Pine Cam' : 'PineTab camera') + ' overlay', type: 'checkbox', checked: s.cameraOverlay, enabled: !s.cameraOnly, click: item => update({ cameraOverlay: item.checked }) },
       { label: (s.cameraSource === 'pine' ? 'Pine Cam' : 'PineTab camera') + ' only', type: 'checkbox', checked: s.cameraOnly, click: item => update({ cameraOnly: item.checked }) },
