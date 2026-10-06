@@ -768,6 +768,9 @@
      * mounts into a still-settling document measures the wrong size, which
      * is the fault the portrait pass spent a day on. */
     var last = remembered();
+    /* [rail-start] the operator starts on the tech desk or in the script view, never in another remembered
+       view: a Book View restored at boot sat open behind the PiP for a night and hid the station pane */
+    if (last && last !== 'script') { remember(''); last = ''; }
     if (last) {
       setTimeout(function () {
         for (var i = 0; i < VIEWS.length; i += 1) {

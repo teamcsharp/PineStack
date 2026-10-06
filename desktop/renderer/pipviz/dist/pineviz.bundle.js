@@ -1,5 +1,5 @@
-/* PineViz bundle f71f113dec67 - built by tools/pineviz_bundle.py from desktop/renderer/pipviz; edit the sources, not this file. */
-/* pineviz-build:f71f113dec67 */
+/* PineViz bundle 379e5fb94680 - built by tools/pineviz_bundle.py from desktop/renderer/pipviz; edit the sources, not this file. */
+/* pineviz-build:379e5fb94680 */
 /* ---- core/PineViz.js ---- */
 /* PineViz - the Pine PiP's living background. One telemetry road, ten visual environments.
  *
@@ -513,9 +513,9 @@
     installClick() {
       /* [viz-dblclick] click: true - a click cycles (260 ms wait so a double-click still reaches the surface's owner);
          click: 'double' - a DOUBLE-click cycles and does not reach the owner (the PiP would expand on it); a click is left alone */
-      let timer = 0; const dbl = this.clickMode === 'double';
+      let timer = 0; const dbl = this.clickMode === 'double' || this.clickMode === 'both', single = this.clickMode !== 'double';   /* [viz-click-both] */
       this.canvas.addEventListener('click', e => {
-        if (dbl) return;
+        if (!single) return;
         if (e.detail > 1) { clearTimeout(timer); timer = 0; return; }
         clearTimeout(timer);
         timer = setTimeout(() => { timer = 0; this.next(e.shiftKey ? -1 : 1); }, 260);

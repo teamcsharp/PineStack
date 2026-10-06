@@ -108,7 +108,7 @@
     function mountViz(P) {
       if (viz || !enabled || shell) return;
       vizProvider = new P.ExternalProvider();
-      viz = P.mount(background, { provider: vizProvider, palette: vizPalette(P), quality: 'high', keys: false, click: 'double', modeKey: 'pinePipVizMode', presetKey: 'pinePipVizPresets', transition: 'crossfade' });
+      viz = P.mount(background, { provider: vizProvider, palette: vizPalette(P), quality: 'high', keys: false, click: 'both', modeKey: 'pinePipVizMode', presetKey: 'pinePipVizPresets', transition: 'crossfade' });
       viz.on((kind, value) => { if (kind === 'mode') { vizMode = value; try { w.postMessage({ type: 'pine-pip-background', mode: value }, '*'); } catch (_) {} } });
       vizMode = viz.activeId || '';
       if (particles) { particles.dispose(); particles = null; }
